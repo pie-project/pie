@@ -294,7 +294,7 @@ int run_impl(int argc,
     while (total_pages >= 64) {
         try {
             engine_ptr = std::make_unique<pie_portable_driver::ForwardEngine>(
-                model, total_pages, page_size);
+                model, total_pages, page_size, cfg.batching.kv_cache_dtype);
             break;
         } catch (const std::exception& e) {
             if (total_pages == 64) throw;

@@ -86,6 +86,7 @@ add_library(pie_driver_cuda_lib STATIC
   src/model/mistral3.cpp
   src/model/gpt_oss.cpp
   src/model/qwen3_5.cpp
+  src/kv_cache_format.cpp
   src/kv_cache.cpp
   src/ops/gemm.cpp
   src/ops/attention_naive.cu
@@ -216,12 +217,43 @@ add_executable(test_response_writer
 target_include_directories(test_response_writer PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/src)
 
+add_executable(test_kv_cache_format
+  tests/test_kv_cache_format.cpp
+  src/kv_cache_format.cpp)
+target_include_directories(test_kv_cache_format PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/src)
+
+add_executable(test_kv_cache_quant
+  tests/test_kv_cache_quant.cu
+  src/tensor.cpp
+  src/kv_cache.cpp
+  src/kv_cache_format.cpp
+  src/kernels/kv_paged.cu)
+target_include_directories(test_kv_cache_quant PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_compile_options(test_kv_cache_quant PRIVATE
+  $<$<COMPILE_LANGUAGE:CUDA>: --extended-lambda --expt-relaxed-constexpr >)
+target_link_libraries(test_kv_cache_quant PRIVATE CUDA::cudart)
+
+add_executable(test_swap_pool
+  tests/test_swap_pool.cpp
+  src/tensor.cpp
+  src/kv_cache.cpp
+  src/kv_cache_format.cpp
+  src/swap_pool.cpp)
+target_include_directories(test_swap_pool PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_link_libraries(test_swap_pool PRIVATE CUDA::cudart)
+
 enable_testing()
 add_test(NAME brle COMMAND test_brle)
 add_test(NAME response_writer
   COMMAND test_response_writer
     ${CMAKE_CURRENT_BINARY_DIR}/_response_writer_flat.bin
     ${CMAKE_CURRENT_BINARY_DIR}/_response_writer_msgpack.bin)
+add_test(NAME kv_cache_format COMMAND test_kv_cache_format)
+add_test(NAME kv_cache_quant COMMAND test_kv_cache_quant)
+add_test(NAME swap_pool COMMAND test_swap_pool)
 
 target_link_libraries(pie_driver_cuda_lib PUBLIC
   CLI11::CLI11

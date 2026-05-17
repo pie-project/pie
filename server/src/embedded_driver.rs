@@ -19,11 +19,11 @@
 use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_int, c_void};
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, mpsc};
+use std::sync::{mpsc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{anyhow, Context, Result};
 use serde::Deserialize;
 
 use crate::config::{CudaNativeDriverOptions, DummyDriverOptions, PortableDriverOptions};
@@ -338,6 +338,11 @@ pub fn write_startup_toml(
     insert_int(&mut batching, "max_batch_tokens", options.max_batch_tokens);
     insert_int(&mut batching, "max_batch_size", options.max_batch_size);
     insert_int(&mut batching, "cpu_pages", options.cpu_pages);
+    insert_str(
+        &mut batching,
+        "kv_cache_dtype",
+        options.kv_cache_dtype.clone(),
+    );
     insert_table(&mut doc, "batching", batching);
 
     let mut aux_ipc = toml::Table::new();
@@ -487,6 +492,7 @@ pub(crate) fn write_cuda_startup_toml(
     insert_int(&mut batching, "max_batch_tokens", opts.max_batch_tokens);
     insert_int(&mut batching, "max_batch_size", opts.max_batch_size);
     insert_int(&mut batching, "swap_pool_size", opts.swap_pool_size);
+    insert_str(&mut batching, "kv_cache_dtype", opts.kv_cache_dtype.clone());
     insert_table(&mut doc, "batching", batching);
 
     let mut runtime = toml::Table::new();
@@ -896,6 +902,7 @@ mod tests {
         assert_eq!(val["shmem"]["name"].as_str().unwrap(), "/pie_shmem_g0");
         assert_eq!(val["shmem"]["resp_buf"].as_integer().unwrap(), 4194304);
         assert_eq!(val["batching"]["kv_page_size"].as_integer().unwrap(), 32);
+        assert_eq!(val["batching"]["kv_cache_dtype"].as_str().unwrap(), "auto");
         assert_eq!(
             val["model"]["hf_path"].as_str().unwrap(),
             snap.to_str().unwrap()
@@ -935,6 +942,7 @@ mod tests {
         assert_eq!(val["model"]["dtype"].as_str().unwrap(), "bfloat16");
         assert!(val["model"].get("runtime_quant").is_none()); // omitted when empty
         assert_eq!(val["batching"]["kv_page_size"].as_integer().unwrap(), 32);
+        assert_eq!(val["batching"]["kv_cache_dtype"].as_str().unwrap(), "auto");
         assert_eq!(
             val["batching"]["max_num_kv_pages"].as_integer().unwrap(),
             1024

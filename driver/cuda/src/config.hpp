@@ -7,6 +7,8 @@
 
 #include <toml++/toml.hpp>
 
+#include "kv_cache_format.hpp"
+
 namespace pie_cuda_driver {
 
 struct ShmemConfig {
@@ -38,6 +40,8 @@ struct BatchingConfig {
     std::uint32_t max_batch_size = 512;
     // Pinned host KV slots for swap-out. 0 = swap disabled.
     std::uint32_t swap_pool_size = 0;
+    // KV cache storage format. "auto" preserves the historical bf16 cache.
+    std::string kv_cache_dtype = "auto";
     // Cap for the linear-attention state cache slot count (Qwen3.5/3.6).
     // 0 = "follow max_batch_size" — fine on small/medium models. Bound it
     // explicitly on huge MoE × wide max_batch_size combos to avoid OOM:
@@ -102,6 +106,7 @@ inline Config load_config(const std::filesystem::path& path) {
         c.batching.max_batch_tokens = (*b)["max_batch_tokens"].value_or<int64_t>(c.batching.max_batch_tokens);
         c.batching.max_batch_size   = (*b)["max_batch_size"].value_or<int64_t>(c.batching.max_batch_size);
         c.batching.swap_pool_size   = (*b)["swap_pool_size"].value_or<int64_t>(c.batching.swap_pool_size);
+        c.batching.kv_cache_dtype   = (*b)["kv_cache_dtype"].value_or(c.batching.kv_cache_dtype);
         c.batching.linear_attn_max_slots = (*b)["linear_attn_max_slots"]
             .value_or<int64_t>(c.batching.linear_attn_max_slots);
     }
@@ -132,6 +137,7 @@ inline Config load_config(const std::filesystem::path& path) {
         throw std::runtime_error(
             "config: [distributed].nccl_unique_id_hex required when tp_size > 1");
     }
+    (void)kv_cache_format_from_string(c.batching.kv_cache_dtype, c.model.dtype);
     return c;
 }
 

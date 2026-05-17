@@ -45,6 +45,7 @@ activation_dtype = "bfloat16"
 [model.driver.options]
 gpu_mem_utilization  = 0.85
 kv_page_size         = 32
+kv_cache_dtype       = "auto"
 max_batch_tokens     = 10240
 max_batch_size       = 512
 max_num_kv_pages     = 1024
@@ -60,6 +61,7 @@ shutdown_timeout_s   = 5.0
 | `binary_path` | `""` | Accepted for older config compatibility, ignored by standalone `pie`; the driver is embedded. |
 | `gpu_mem_utilization` | `0.85` | Fraction of free GPU memory the driver claims. |
 | `kv_page_size` | `32` | KV cache page size in tokens. |
+| `kv_cache_dtype` | `"auto"` | KV cache format: `auto`, `bf16`, `bfloat16`, `fp8_e4m3`, `fp8_e5m2`, `int8_per_token_head`, `fp8_per_token_head`, `fp4_e2m1`, or `nvfp4`. |
 | `max_batch_tokens` | `10240` | Cap on tokens per batch. |
 | `max_batch_size` | `512` | Cap on sequences per batch. |
 | `max_num_kv_pages` | `1024` | KV cache page count. KV memory scales linearly. |
@@ -88,6 +90,7 @@ max_num_embeds       = 128
 max_num_adapters     = 32
 max_adapter_rank     = 8
 kv_page_size         = 16
+kv_cache_dtype       = "auto"
 weight_dtype         = "auto"
 cpu_mem_budget_in_gb = 0
 ```
@@ -103,6 +106,7 @@ cpu_mem_budget_in_gb = 0
 | `max_num_adapters` | `32` | Adapter slot capacity. |
 | `max_adapter_rank` | `8` | Maximum LoRA rank. |
 | `kv_page_size` | `16` | KV cache page size in tokens. |
+| `kv_cache_dtype` | `"auto"` | KV cache quantization fallback format: `auto`, `bf16`, `bfloat16`, `fp8_e4m3`, `fp8_e5m2`, `int8_per_token_head`, `fp8_per_token_head`, `fp4_e2m1`, or `nvfp4`. |
 | `weight_dtype` | `"auto"` | `auto`, `float32`, `float16`, `bfloat16`, `int4`, `int8`, or `float8`. |
 | `cpu_mem_budget_in_gb` | `0` | Pinned host pool for KV swap, in GiB. `0` disables swap. |
 
@@ -126,6 +130,11 @@ cpu_mem_budget_in_gb = 0
 Run `pie model list` to see whether cached HuggingFace repos are compatible with your installed drivers.
 
 ## Quantization
+
+KV cache format is controlled by `kv_cache_dtype` under `[model.driver.options]`.
+The default `auto` preserves the native BF16 cache. Set it explicitly to opt into
+`fp8_e4m3`, `fp8_e5m2`, `int8_per_token_head`, `fp8_per_token_head`,
+`fp4_e2m1`, or `nvfp4`.
 
 For `dev`, set `weight_dtype` under `[model.driver.options]`:
 

@@ -251,7 +251,9 @@ int run_parity(const pie_cuda_driver::Config& cfg,
             std::max(total_pages, 1),
             page_size,
             engine.hf_config().num_key_value_heads,
-            engine.hf_config().head_dim);
+            engine.hf_config().head_dim_kernel,
+            pie_cuda_driver::kv_cache_format_from_string(
+                cfg.batching.kv_cache_dtype, cfg.model.dtype));
 
         auto parity_attn_ws = pie_cuda_driver::AttentionWorkspace::allocate();
 
@@ -836,6 +838,8 @@ int run_impl(int argc,
         engine.hf_config(), max_workspace_tokens,
         max_mlp_intermediate, max_Hq, max_Hk);
 
+    const auto kv_format = pie_cuda_driver::kv_cache_format_from_string(
+        cfg.batching.kv_cache_dtype, cfg.model.dtype);
     auto kv_cache =
         is_gemma4_arch
             ? pie_cuda_driver::KvCache::allocate_per_layer(
@@ -844,13 +848,16 @@ int run_impl(int argc,
                   static_cast<int>(cfg.batching.kv_page_size),
                   engine.hf_config().num_key_value_heads,
                   weights_gemma4.per_layer_head_dim,
-                  weights_gemma4.kv_source_layer)
+                  weights_gemma4.kv_source_layer,
+                  weights_gemma4.per_layer_num_kv_heads,
+                  kv_format)
             : pie_cuda_driver::KvCache::allocate(
                   engine.hf_config().num_hidden_layers,
                   static_cast<int>(cfg.batching.max_num_kv_pages),
                   static_cast<int>(cfg.batching.kv_page_size),
                   engine.hf_config().num_key_value_heads,
-                  engine.hf_config().head_dim_kernel);
+                  engine.hf_config().head_dim_kernel,
+                  kv_format);
 
     auto attn_ws = pie_cuda_driver::AttentionWorkspace::allocate();
 
@@ -946,12 +953,8 @@ int run_impl(int argc,
         }
     }
 
-    auto swap_pool = pie_cuda_driver::SwapPool::allocate(
-        engine.hf_config().num_hidden_layers,
-        static_cast<int>(cfg.batching.swap_pool_size),
-        static_cast<int>(cfg.batching.kv_page_size),
-        engine.hf_config().num_key_value_heads,
-        engine.hf_config().head_dim_kernel);
+    auto swap_pool = pie_cuda_driver::SwapPool::allocate_for_cache(
+        kv_cache, static_cast<int>(cfg.batching.swap_pool_size));
 
     pie_cuda_driver::ops::CublasHandle cublas;
 
@@ -974,6 +977,7 @@ int run_impl(int argc,
         std::cerr << "[pie-driver-cuda] kv_cache: "
                   << kv_cache.num_pages() << " pages × "
                   << kv_cache.page_size() << " tokens; "
+                  << "format=" << kv_cache.format().name << "; "
                   << "workspace tokens=" << max_workspace_tokens
                   << "; swap_pool=" << swap_pool.num_pages() << " pages\n";
     }

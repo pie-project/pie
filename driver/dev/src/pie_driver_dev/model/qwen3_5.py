@@ -478,7 +478,7 @@ class ForwardPass:
             rope_theta=cfg.rope_theta,
         )
 
-        ops.append_paged_kv_cache(
+        ops.append_paged_kv_cache_with_format(
             append_key=k,
             append_value=v,
             batch_indices=batch_indices,

@@ -22,6 +22,7 @@
 #include <flashinfer/utils.cuh>
 
 #include "cuda_check.hpp"
+#include "kernels/kv_paged.hpp"
 
 namespace pie_cuda_driver::ops {
 
@@ -108,6 +109,7 @@ struct DecodePlanCache {
     int num_kv_heads = 0;
     int head_dim = 0;
     int page_size = 0;
+    int num_pages_in_batch = 0;
     bool valid = false;
 };
 
@@ -219,6 +221,7 @@ void plan_attention_flashinfer_decode_bf16(
     cache.num_kv_heads = num_kv_heads;
     cache.head_dim     = head_dim;
     cache.page_size    = page_size;
+    cache.num_pages_in_batch = kv_page_indptr_h[num_requests];
     cache.valid        = true;
 }
 
@@ -368,6 +371,32 @@ void dispatch_attention_flashinfer_decode_bf16(
                 std::to_string(cache.head_dim));
     }
     CUDA_CHECK(status);
+}
+
+void dispatch_attention_flashinfer_decode(
+    const DecodePlanCache& cache,
+    const void* q,
+    KvCacheLayerView kv_layer,
+    void* o,
+    const std::uint32_t* kv_page_indices_d,
+    const std::uint32_t* kv_page_indptr_d,
+    const std::uint32_t* kv_last_page_lens_d,
+    AttentionWorkspace& workspace,
+    cudaStream_t stream,
+    int window_left,
+    float logits_soft_cap,
+    float sm_scale,
+    float* lse_out)
+{
+    kernels::launch_dequant_kv_cache_layer_to_bf16_active(
+        kv_layer, kv_page_indices_d, cache.num_pages_in_batch, stream);
+    dispatch_attention_flashinfer_decode_bf16(
+        cache, q,
+        kv_layer.k_bf16_pages,
+        kv_layer.v_bf16_pages,
+        o,
+        kv_page_indices_d, kv_page_indptr_d, kv_last_page_lens_d,
+        workspace, stream, window_left, logits_soft_cap, sm_scale, lse_out);
 }
 
 // ── Prefill ────────────────────────────────────────────────────────────────
@@ -549,6 +578,42 @@ void launch_attention_flashinfer_prefill_bf16(
     CUDA_CHECK(status);
 }
 
+void launch_attention_flashinfer_prefill(
+    const void* q,
+    KvCacheLayerView kv_layer,
+    void* o,
+    const std::uint32_t* qo_indptr_d,
+    const std::uint32_t* kv_page_indices_d,
+    const std::uint32_t* kv_page_indptr_d,
+    const std::uint32_t* kv_last_page_lens_d,
+    const std::uint32_t* qo_indptr_h,
+    const std::uint32_t* kv_page_indptr_h,
+    int total_tokens,
+    int num_requests,
+    int num_q_heads,
+    AttentionWorkspace& workspace,
+    cudaStream_t stream,
+    int window_left,
+    float logits_soft_cap,
+    float sm_scale,
+    float* lse_out)
+{
+    const int num_pages_in_batch = kv_page_indptr_h[num_requests];
+    kernels::launch_dequant_kv_cache_layer_to_bf16_active(
+        kv_layer, kv_page_indices_d, num_pages_in_batch, stream);
+    launch_attention_flashinfer_prefill_bf16(
+        q,
+        kv_layer.k_bf16_pages,
+        kv_layer.v_bf16_pages,
+        o,
+        qo_indptr_d, kv_page_indices_d, kv_page_indptr_d, kv_last_page_lens_d,
+        qo_indptr_h, kv_page_indptr_h,
+        total_tokens, num_requests, num_q_heads, kv_layer.num_kv_heads,
+        kv_layer.head_dim, kv_layer.page_size, workspace, stream,
+        window_left, logits_soft_cap, sm_scale,
+        lse_out);
+}
+
 // ── Prefill with custom mask ───────────────────────────────────────────────
 
 namespace {
@@ -718,6 +783,44 @@ void launch_attention_flashinfer_prefill_custom_bf16(
         status = dispatch(::std::type_identity<AttnVariantCustom>{});
     }
     CUDA_CHECK(status);
+}
+
+void launch_attention_flashinfer_prefill_custom(
+    const void* q,
+    KvCacheLayerView kv_layer,
+    void* o,
+    const std::uint32_t* qo_indptr_d,
+    const std::uint32_t* kv_page_indices_d,
+    const std::uint32_t* kv_page_indptr_d,
+    const std::uint32_t* kv_last_page_lens_d,
+    const std::uint8_t*  mask_d,
+    const std::int32_t*  mask_indptr_d,
+    const std::uint32_t* qo_indptr_h,
+    const std::uint32_t* kv_page_indptr_h,
+    int total_tokens,
+    int num_requests,
+    int num_q_heads,
+    AttentionWorkspace& workspace,
+    cudaStream_t stream,
+    int window_left,
+    float logits_soft_cap,
+    float sm_scale,
+    float* lse_out)
+{
+    const int num_pages_in_batch = kv_page_indptr_h[num_requests];
+    kernels::launch_dequant_kv_cache_layer_to_bf16_active(
+        kv_layer, kv_page_indices_d, num_pages_in_batch, stream);
+    launch_attention_flashinfer_prefill_custom_bf16(
+        q,
+        kv_layer.k_bf16_pages,
+        kv_layer.v_bf16_pages,
+        o,
+        qo_indptr_d, kv_page_indices_d, kv_page_indptr_d, kv_last_page_lens_d,
+        mask_d, mask_indptr_d, qo_indptr_h, kv_page_indptr_h,
+        total_tokens, num_requests, num_q_heads, kv_layer.num_kv_heads,
+        kv_layer.head_dim, kv_layer.page_size, workspace, stream,
+        window_left, logits_soft_cap, sm_scale,
+        lse_out);
 }
 
 }  // namespace pie_cuda_driver::ops

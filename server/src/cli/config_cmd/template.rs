@@ -79,6 +79,7 @@ type = "portable"
 device = ["auto"]
 
 [model.driver.options]
+kv_cache_dtype = "auto"
 max_batch_tokens = 10240
 max_batch_size = 512
 "#;
@@ -93,6 +94,7 @@ activation_dtype = "bfloat16"
 
 [model.driver.options]
 gpu_mem_utilization = 0.85
+kv_cache_dtype = "auto"
 max_batch_tokens = 10240
 max_batch_size = 512
 "#;

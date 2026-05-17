@@ -15,7 +15,7 @@
 
 use std::path::PathBuf;
 
-use anyhow::{Result, bail, ensure};
+use anyhow::{bail, ensure, Result};
 use serde::{Deserialize, Serialize};
 
 // -----------------------------------------------------------------------------
@@ -392,7 +392,7 @@ fn default_restore_pause_at_utilization() -> f64 {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 #[allow(dead_code)] // forwarded to the embedded driver via TOML; not all
-// fields are read on the Rust side yet.
+                    // fields are read on the Rust side yet.
 pub struct DriverConfig {
     /// Driver discriminator. Embedded drivers (`portable`,
     /// `cuda_native`, `dummy`) run in-process; Python drivers (`dev`,
@@ -426,7 +426,7 @@ impl DriverConfig {
         // `crate::subprocess_driver`.
         match self.kind {
             DriverKind::Portable => {
-                let _: PortableDriverOptions = toml::Value::Table(self.options.clone())
+                let opts: PortableDriverOptions = toml::Value::Table(self.options.clone())
                     .try_into()
                     .map_err(|e| {
                         anyhow::anyhow!(
@@ -434,9 +434,10 @@ impl DriverConfig {
                             self.kind,
                         )
                     })?;
+                validate_kv_cache_dtype(&opts.kv_cache_dtype)?;
             }
             DriverKind::CudaNative => {
-                let _: CudaNativeDriverOptions = toml::Value::Table(self.options.clone())
+                let opts: CudaNativeDriverOptions = toml::Value::Table(self.options.clone())
                     .try_into()
                     .map_err(|e| {
                         anyhow::anyhow!(
@@ -444,6 +445,7 @@ impl DriverConfig {
                             self.kind,
                         )
                     })?;
+                validate_kv_cache_dtype(&opts.kv_cache_dtype)?;
             }
             DriverKind::Dummy => {
                 let _: DummyDriverOptions = toml::Value::Table(self.options.clone())
@@ -461,6 +463,27 @@ impl DriverConfig {
         }
         Ok(())
     }
+}
+
+fn validate_kv_cache_dtype(value: &str) -> Result<()> {
+    const VALID: &[&str] = &[
+        "auto",
+        "bf16",
+        "bfloat16",
+        "fp8_e4m3",
+        "fp8_e5m2",
+        "int8_per_token_head",
+        "fp8_per_token_head",
+        "fp4_e2m1",
+        "nvfp4",
+    ];
+    ensure!(
+        VALID.contains(&value),
+        "invalid kv_cache_dtype {:?}; expected one of: {}",
+        value,
+        VALID.join(", ")
+    );
+    Ok(())
 }
 
 fn validate_subprocess_driver_options(options: &toml::Table, kind: DriverKind) -> Result<()> {
@@ -565,6 +588,7 @@ pub struct PortableDriverOptions {
     pub max_batch_tokens: u32,
     pub max_batch_size: u32,
     pub cpu_pages: u32,
+    pub kv_cache_dtype: String,
     #[serde(skip)]
     pub device: String,
     #[serde(skip)]
@@ -584,6 +608,7 @@ impl Default for PortableDriverOptions {
             max_batch_tokens: 10240,
             max_batch_size: 512,
             cpu_pages: 0,
+            kv_cache_dtype: "auto".to_string(),
             device: "auto".to_string(),
             verbose: false,
             ready_timeout_s: 120.0,
@@ -659,6 +684,7 @@ pub struct CudaNativeDriverOptions {
 
     pub gpu_mem_utilization: f64,
     pub kv_page_size: u32,
+    pub kv_cache_dtype: String,
     pub max_batch_tokens: u32,
     pub max_batch_size: u32,
     pub max_num_kv_pages: u32,
@@ -682,6 +708,7 @@ impl Default for CudaNativeDriverOptions {
             binary_path: String::new(),
             gpu_mem_utilization: 0.85,
             kv_page_size: 32,
+            kv_cache_dtype: "auto".to_string(),
             max_batch_tokens: 10240,
             max_batch_size: 512,
             max_num_kv_pages: 1024,
@@ -808,6 +835,7 @@ runtime_quant = "fp8"
         assert_eq!(opts.runtime_quant, "fp8");
         assert_eq!(opts.weight_dtype, "bfloat16"); // default
         assert_eq!(opts.kv_page_size, 32); // default
+        assert_eq!(opts.kv_cache_dtype, "auto"); // default
     }
 
     #[test]
@@ -830,6 +858,28 @@ device = ["cuda:0"]
         assert_eq!(opts.swap_pool_size, 0);
         assert_eq!(opts.gpu_mem_utilization, 0.85);
         assert_eq!(opts.ready_timeout_s, 600.0);
+        assert_eq!(opts.kv_cache_dtype, "auto");
+    }
+
+    #[test]
+    fn rejects_invalid_embedded_kv_cache_dtype() {
+        let bad = r#"
+[[model]]
+name = "default"
+hf_repo = "Qwen/Qwen3-0.6B"
+
+[model.driver]
+type = "cuda_native"
+device = ["cuda:0"]
+
+[model.driver.options]
+kv_cache_dtype = "turboquant"
+"#;
+        let cfg: Config = toml::from_str(bad).unwrap();
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("kv_cache_dtype"), "got: {err}");
+        assert!(err.contains("fp8_e4m3"), "got: {err}");
+        assert!(err.contains("nvfp4"), "got: {err}");
     }
 
     #[test]

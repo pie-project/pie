@@ -11,14 +11,16 @@ KvCachePaged::KvCachePaged(ggml_backend_t backend,
                            std::int32_t head_dim,
                            std::int32_t total_pages,
                            std::int32_t page_size,
-                           ggml_type    dtype)
+                           ggml_type    dtype,
+                           KvCacheQuantFormat quant_format)
     : backend_(backend),
       n_layers_(n_layers),
       n_kv_heads_(n_kv_heads),
       per_layer_head_dim_(n_layers, head_dim),
       total_pages_(total_pages),
       page_size_(page_size),
-      dtype_(dtype) {
+      dtype_(dtype),
+      quant_format_(std::move(quant_format)) {
     allocate_();
 }
 
@@ -27,14 +29,16 @@ KvCachePaged::KvCachePaged(ggml_backend_t backend,
                            std::vector<std::int32_t> per_layer_head_dim,
                            std::int32_t total_pages,
                            std::int32_t page_size,
-                           ggml_type    dtype)
+                           ggml_type    dtype,
+                           KvCacheQuantFormat quant_format)
     : backend_(backend),
       n_layers_(static_cast<std::int32_t>(per_layer_head_dim.size())),
       n_kv_heads_(n_kv_heads),
       per_layer_head_dim_(std::move(per_layer_head_dim)),
       total_pages_(total_pages),
       page_size_(page_size),
-      dtype_(dtype) {
+      dtype_(dtype),
+      quant_format_(std::move(quant_format)) {
     allocate_();
 }
 
@@ -43,7 +47,8 @@ KvCachePaged::KvCachePaged(ggml_backend_t backend,
                            std::vector<std::int32_t> per_layer_head_dim,
                            std::int32_t total_pages,
                            std::int32_t page_size,
-                           ggml_type    dtype)
+                           ggml_type    dtype,
+                           KvCacheQuantFormat quant_format)
     : backend_(backend),
       n_layers_(static_cast<std::int32_t>(per_layer_head_dim.size())),
       n_kv_heads_(per_layer_kv_heads.empty() ? 0 : per_layer_kv_heads[0]),
@@ -51,7 +56,8 @@ KvCachePaged::KvCachePaged(ggml_backend_t backend,
       per_layer_kv_heads_(std::move(per_layer_kv_heads)),
       total_pages_(total_pages),
       page_size_(page_size),
-      dtype_(dtype) {
+      dtype_(dtype),
+      quant_format_(std::move(quant_format)) {
     if (per_layer_kv_heads_.size() != per_layer_head_dim_.size()) {
         throw std::runtime_error(
             "kv_cache: per_layer_kv_heads / per_layer_head_dim size mismatch");
@@ -111,6 +117,13 @@ KvCachePaged::~KvCachePaged() {
 
 std::size_t KvCachePaged::buffer_size() const noexcept {
     return buf_ ? ggml_backend_buffer_get_size(buf_) : 0;
+}
+
+ggml_tensor* KvCachePaged::qdq_for_append(ggml_context* ctx,
+                                          std::int32_t layer,
+                                          ggml_tensor* tensor) const {
+    return qdq_tensor_for_append(ctx, tensor, quant_format_,
+                                 n_kv_heads_at(layer), head_dim_at(layer));
 }
 
 }  // namespace pie_portable_driver

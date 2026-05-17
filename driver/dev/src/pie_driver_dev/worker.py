@@ -632,6 +632,7 @@ def _leader_loop(
         import torch
         gpu_kv = engine.kv_cache_at_layer
         host_kv = engine.kv_cache_at_layer_host
+        handle = getattr(engine, "kv_cache_handle", None)
         phys_ids = kwargs["phys_ids"]
         slots = kwargs["slots"]
         max_gpu = gpu_kv[0].shape[0]
@@ -645,7 +646,9 @@ def _leader_loop(
         src = torch.tensor(phys_ids, dtype=torch.long, device=gpu_kv[0].device)
         dst = torch.tensor(slots, dtype=torch.long)
         for layer_idx in range(len(gpu_kv)):
-            host_kv[layer_idx].index_copy_(0, dst, gpu_kv[layer_idx][src].cpu())
+            tensors = handle.page_tensors(layer_idx) if handle else (gpu_kv[layer_idx],)
+            for tensor in tensors:
+                host_kv[layer_idx].index_copy_(0, dst, tensor[src].cpu())
         #torch.cuda.synchronize() -> we don't need this
 
     def _handle_copy_h2d(**kwargs) -> None:
@@ -657,6 +660,7 @@ def _leader_loop(
         import torch
         gpu_kv = engine.kv_cache_at_layer
         host_kv = engine.kv_cache_at_layer_host
+        handle = getattr(engine, "kv_cache_handle", None)
         phys_ids = kwargs["phys_ids"]
         slots = kwargs["slots"]
         max_gpu = gpu_kv[0].shape[0]
@@ -670,7 +674,9 @@ def _leader_loop(
         dst = torch.tensor(phys_ids, dtype=torch.long, device=gpu_kv[0].device)
         src = torch.tensor(slots, dtype=torch.long)
         for layer_idx in range(len(gpu_kv)):
-            gpu_kv[layer_idx].index_copy_(0, dst, host_kv[layer_idx][src].to(gpu_kv[layer_idx].device))
+            tensors = handle.page_tensors(layer_idx) if handle else (gpu_kv[layer_idx],)
+            for tensor in tensors:
+                tensor.index_copy_(0, dst, host_kv[layer_idx][src].to(tensor.device))
         #torch.cuda.synchronize() -> we don't need this
 
     def _handle_copy_d2d(**kwargs) -> None:
@@ -682,6 +688,7 @@ def _leader_loop(
         """
         import torch
         gpu_kv = engine.kv_cache_at_layer
+        handle = getattr(engine, "kv_cache_handle", None)
         src_ids = kwargs["src_phys_ids"]
         dst_ids = kwargs["dst_phys_ids"]
         max_gpu = gpu_kv[0].shape[0]
@@ -694,7 +701,9 @@ def _leader_loop(
         src = torch.tensor(src_ids, dtype=torch.long, device=gpu_kv[0].device)
         dst = torch.tensor(dst_ids, dtype=torch.long, device=gpu_kv[0].device)
         for layer_idx in range(len(gpu_kv)):
-            gpu_kv[layer_idx].index_copy_(0, dst, gpu_kv[layer_idx][src])
+            tensors = handle.page_tensors(layer_idx) if handle else (gpu_kv[layer_idx],)
+            for tensor in tensors:
+                tensor.index_copy_(0, dst, tensor[src])
         #torch.cuda.synchronize() -> we don't need this
 
     def _handle_copy_h2h(**kwargs) -> None:

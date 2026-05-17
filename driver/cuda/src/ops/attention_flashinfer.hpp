@@ -10,6 +10,7 @@
 #include <cuda_runtime.h>
 
 #include "attention_workspace.hpp"
+#include "kv_cache.hpp"
 
 namespace pie_cuda_driver::ops {
 
@@ -41,6 +42,21 @@ void plan_attention_flashinfer_decode_bf16(
     int page_size,
     AttentionWorkspace& workspace,
     cudaStream_t stream);
+
+inline void plan_attention_flashinfer_decode(
+    DecodePlanCache& cache,
+    const std::uint32_t* kv_page_indptr_h,
+    int num_requests,
+    int num_q_heads,
+    int num_kv_heads,
+    int head_dim,
+    int page_size,
+    AttentionWorkspace& workspace,
+    cudaStream_t stream) {
+    plan_attention_flashinfer_decode_bf16(
+        cache, kv_page_indptr_h, num_requests, num_q_heads, num_kv_heads,
+        head_dim, page_size, workspace, stream);
+}
 
 // Per-layer dispatch reusing the cached plan. `q`/`k_pages`/`v_pages`/`o`
 // vary per layer; everything else comes from the cache + workspace.
@@ -83,6 +99,21 @@ void dispatch_attention_flashinfer_decode_bf16(
     float sm_scale = -1.f,
     float* lse_out = nullptr);
 
+void dispatch_attention_flashinfer_decode(
+    const DecodePlanCache& cache,
+    const void* q,
+    KvCacheLayerView kv_layer,
+    void* o,
+    const std::uint32_t* kv_page_indices_d,
+    const std::uint32_t* kv_page_indptr_d,
+    const std::uint32_t* kv_last_page_lens_d,
+    AttentionWorkspace& workspace,
+    cudaStream_t stream,
+    int window_left = -1,
+    float logits_soft_cap = 0.f,
+    float sm_scale = -1.f,
+    float* lse_out = nullptr);
+
 // Prefill (or mixed prefill+decode): per-request qo_len comes from
 // qo_indptr. Causal mask is hard-wired (DefaultAttention + MaskMode::kCausal).
 // `window_left` mirrors the decode entry point — non-negative enables
@@ -109,6 +140,26 @@ void launch_attention_flashinfer_prefill_bf16(
     float logits_soft_cap = 0.f,
     float sm_scale = -1.f,
     // See decode entry point. [total_tokens, num_q_heads] fp32, nullptr = skip.
+    float* lse_out = nullptr);
+
+void launch_attention_flashinfer_prefill(
+    const void* q,
+    KvCacheLayerView kv_layer,
+    void* o,
+    const std::uint32_t* qo_indptr_d,
+    const std::uint32_t* kv_page_indices_d,
+    const std::uint32_t* kv_page_indptr_d,
+    const std::uint32_t* kv_last_page_lens_d,
+    const std::uint32_t* qo_indptr_h,
+    const std::uint32_t* kv_page_indptr_h,
+    int total_tokens,
+    int num_requests,
+    int num_q_heads,
+    AttentionWorkspace& workspace,
+    cudaStream_t stream,
+    int window_left = -1,
+    float logits_soft_cap = 0.f,
+    float sm_scale = -1.f,
     float* lse_out = nullptr);
 
 // Same prefill, with a custom packed-bit mask per request. `mask_d` is the
@@ -139,6 +190,28 @@ void launch_attention_flashinfer_prefill_custom_bf16(
     float logits_soft_cap = 0.f,
     float sm_scale = -1.f,
     // See decode entry point. [total_tokens, num_q_heads] fp32, nullptr = skip.
+    float* lse_out = nullptr);
+
+void launch_attention_flashinfer_prefill_custom(
+    const void* q,
+    KvCacheLayerView kv_layer,
+    void* o,
+    const std::uint32_t* qo_indptr_d,
+    const std::uint32_t* kv_page_indices_d,
+    const std::uint32_t* kv_page_indptr_d,
+    const std::uint32_t* kv_last_page_lens_d,
+    const std::uint8_t*  mask_d,
+    const std::int32_t*  mask_indptr_d,
+    const std::uint32_t* qo_indptr_h,
+    const std::uint32_t* kv_page_indptr_h,
+    int total_tokens,
+    int num_requests,
+    int num_q_heads,
+    AttentionWorkspace& workspace,
+    cudaStream_t stream,
+    int window_left = -1,
+    float logits_soft_cap = 0.f,
+    float sm_scale = -1.f,
     float* lse_out = nullptr);
 
 }  // namespace pie_cuda_driver::ops

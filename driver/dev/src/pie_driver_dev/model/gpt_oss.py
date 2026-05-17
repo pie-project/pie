@@ -766,7 +766,7 @@ class ForwardPass:
         self._sync_record("attn_rope")
 
         # Append to KV cache (local)
-        ops.append_paged_kv_cache(
+        ops.append_paged_kv_cache_with_format(
             append_key=k,
             append_value=v,
             batch_indices=batch_indices,

@@ -17,6 +17,7 @@ from .loader import ModelLoader
 from .adapter import AdapterSubpass, CmaesAdapter
 from . import model as model_registry
 from . import hf_utils
+from .kv_cache import KvCacheHandle, parse_kv_cache_dtype, register_kv_cache
 from . import telemetry
 
 
@@ -34,6 +35,7 @@ class Engine:
     forward_pass: object  # e.g., llama3.ForwardPass
     model_config: object  # e.g., llama3.ModelConfig
     kv_cache_at_layer: list[torch.Tensor]
+    kv_cache_handle: KvCacheHandle
 
     # CPU swap pool (pinned host memory, mirrors GPU KV cache layout)
     kv_cache_at_layer_host: list[torch.Tensor]  # [pool_size, 2, page_size, kv_heads, dim_head] per layer
@@ -60,11 +62,15 @@ class Engine:
         snapshot_dir: str | None = None,
         kv_cache_at_layer_host: list | None = None,
         swap_pool_size: int = 0,
+        kv_cache_handle: KvCacheHandle | None = None,
     ):
         self.config = config
         self.model_config = model_config
         self.forward_pass = forward_pass
         self.kv_cache_at_layer = kv_cache_at_layer
+        self.kv_cache_handle = kv_cache_handle or register_kv_cache(
+            kv_cache_at_layer, parse_kv_cache_dtype("auto")
+        )
         self.kv_cache_at_layer_host = kv_cache_at_layer_host or []
         self.swap_pool_size = swap_pool_size
         self.adapter_at_layer = adapter_at_layer
@@ -136,6 +142,10 @@ class Engine:
 
         adapter_at_layer = mod.create_adapter_cache(model_config, config)
         kv_cache_at_layer = mod.create_kv_cache(model_config, config)
+        kv_cache_handle = register_kv_cache(
+            kv_cache_at_layer,
+            parse_kv_cache_dtype(config.kv_cache_dtype, config.activation_dtype),
+        )
 
         # Compact weight memory layout for GPU locality (MPS TLB optimization).
         # Must run AFTER KV cache allocation: the CPU roundtrip inside
@@ -160,6 +170,7 @@ class Engine:
             snapshot_dir=snapshot_dir,
             kv_cache_at_layer_host=host_kv,
             swap_pool_size=pool_size,
+            kv_cache_handle=kv_cache_handle,
         )
 
     @classmethod
@@ -203,6 +214,10 @@ class Engine:
 
         forward_pass = DummyForwardPass(model_config, config)
         kv_cache_at_layer = create_kv_cache(model_config, config)
+        kv_cache_handle = register_kv_cache(
+            kv_cache_at_layer,
+            parse_kv_cache_dtype(config.kv_cache_dtype, config.activation_dtype),
+        )
         adapter_at_layer = create_adapter_cache(model_config, config)
 
         info = {
@@ -227,6 +242,7 @@ class Engine:
             snapshot_dir=snapshot_dir,
             kv_cache_at_layer_host=host_kv,
             swap_pool_size=pool_size,
+            kv_cache_handle=kv_cache_handle,
         )
 
     # ========================================================================

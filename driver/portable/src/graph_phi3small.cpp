@@ -109,6 +109,8 @@ GraphResult build_phi3small_graph(ggml_context* ctx,
         // ---- KV cache write ----
         auto* k_2d = ggml_reshape_2d(ctx, ggml_cont(ctx, K), n_embd_gqa, n_total);
         auto* v_2d = ggml_reshape_2d(ctx, ggml_cont(ctx, V), n_embd_gqa, n_total);
+        k_2d = kv.qdq_for_append(ctx, il, k_2d);
+        v_2d = kv.qdq_for_append(ctx, il, v_2d);
         live_k[il] = ggml_set_rows(ctx, kv.k(il), k_2d, in.kv_idxs);
         live_v[il] = ggml_set_rows(ctx, kv.v(il), v_2d, in.kv_idxs);
         auto* k_cached = live_k[il];
