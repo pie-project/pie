@@ -8,8 +8,6 @@
 #include <unordered_map>
 #include <unordered_set>
 
-#include <pie_driver_common/shard_plan.hpp>
-
 #include "tensor.hpp"
 
 namespace pie_cuda_driver {
@@ -100,208 +98,100 @@ const TensorDecl* find_tensor_spec(
     return it == plan.tensors.end() ? nullptr : &it->second;
 }
 
-struct AlgebraBindingRef {
-    std::size_t binding_index = kInvalidStorageId;
-    LayoutExprId root = kInvalidStorageId;
-    const LayoutExpr* root_expr = nullptr;
+struct SourceSlicePlan {
+    std::string raw_name;
+    DType dtype = DType::BF16;
+    std::vector<std::int64_t> shape;
+    std::vector<TensorSlice> slices;
 };
 
-AlgebraBindingRef realize_binding_for_output(
-    const LayoutPlan& plan,
-    const std::string& output_name)
+void apply_source_slice(
+    SourceSlicePlan& plan,
+    int axis,
+    std::int64_t start,
+    std::int64_t length)
 {
-    for (std::size_t i = plan.algebra.bindings.size(); i > 0; --i) {
-        const std::size_t binding_index = i - 1;
-        const auto& binding = plan.algebra.bindings[binding_index];
-        if (binding.runtime_name != output_name ||
-            binding.root >= plan.algebra.exprs.size()) {
-            continue;
-        }
-        const LayoutExpr& root = plan.algebra.exprs[binding.root];
-        if (root.kind == LayoutExprKind::Realize ||
-            root.kind == LayoutExprKind::View) {
-            return AlgebraBindingRef{
-                .binding_index = binding_index,
-                .root = binding.root,
-                .root_expr = &root,
-            };
+    if (axis < 0 || axis >= static_cast<int>(plan.shape.size()) ||
+        start < 0 || length <= 0 ||
+        start + length > plan.shape[static_cast<std::size_t>(axis)]) {
+        throw std::runtime_error(
+            "storage program: invalid algebra source slice for '" +
+            plan.raw_name + "'");
+    }
+    for (auto& slice : plan.slices) {
+        if (slice.axis == axis) {
+            slice.start += start;
+            slice.length = length;
+            plan.shape[static_cast<std::size_t>(axis)] = length;
+            return;
         }
     }
-    return {};
+    plan.slices.push_back(TensorSlice{axis, start, length});
+    plan.shape[static_cast<std::size_t>(axis)] = length;
 }
 
-void attach_algebra_binding(
-    std::vector<ExtentWrite>& writes,
-    const AlgebraBindingRef& binding)
-{
-    if (binding.root_expr == nullptr) return;
-    for (auto& write : writes) {
-        write.expr_id = binding.root;
-        write.binding_index = binding.binding_index;
-    }
-}
-
-bool is_raw_copy_kind(LayoutOpKind kind) noexcept {
-    return kind == LayoutOpKind::Read ||
-           kind == LayoutOpKind::Copy ||
-           kind == LayoutOpKind::Shard ||
-           kind == LayoutOpKind::RowRangeShard;
-}
-
-bool op_allocates_tensor(LayoutOpKind kind) noexcept {
-    return kind != LayoutOpKind::Drop &&
-           kind != LayoutOpKind::View &&
-           kind != LayoutOpKind::Alias &&
-           kind != LayoutOpKind::AttachMetadata;
-}
-
-bool is_raw_copy_cast_drop_sequence(
+bool lower_expr_to_source_slice(
+    LayoutExprId id,
     const LayoutPlan& plan,
-    std::size_t producer_index)
+    const CheckpointSource& metadata,
+    int tp_rank,
+    int tp_size,
+    SourceSlicePlan& out)
 {
-    if (producer_index + 2 >= plan.ops.size()) return false;
-    const LayoutOp& producer = plan.ops[producer_index];
-    const LayoutOp& cast = plan.ops[producer_index + 1];
-    const LayoutOp& drop = plan.ops[producer_index + 2];
-    if (!is_raw_copy_kind(producer.kind) ||
-        cast.kind != LayoutOpKind::Cast ||
-        drop.kind != LayoutOpKind::Drop) {
+    if (id >= plan.algebra.exprs.size()) return false;
+    const LayoutExpr& expr = plan.algebra.exprs[id];
+    switch (expr.kind) {
+    case LayoutExprKind::Source: {
+        const auto& info = metadata.info(expr.raw_name);
+        out.raw_name = expr.raw_name;
+        out.dtype = info.dtype;
+        out.shape = info.shape;
+        out.slices.clear();
+        return true;
+    }
+    case LayoutExprKind::Realize:
+        return expr.inputs.size() == 1 &&
+               lower_expr_to_source_slice(
+                   expr.inputs.front(), plan, metadata, tp_rank, tp_size, out);
+    case LayoutExprKind::Select: {
+        if (expr.inputs.size() != 1 ||
+            !lower_expr_to_source_slice(
+                expr.inputs.front(), plan, metadata, tp_rank, tp_size, out)) {
+            return false;
+        }
+        std::int64_t start = expr.start;
+        std::int64_t length = expr.length;
+        if (tp_size > 1 &&
+            expr.axis >= 0 &&
+            expr.axis < static_cast<int>(expr.decl.shape.size()) &&
+            length % tp_size == 0 &&
+            expr.decl.shape[static_cast<std::size_t>(expr.axis)] ==
+                length / tp_size) {
+            length /= tp_size;
+            start += static_cast<std::int64_t>(tp_rank) * length;
+        }
+        apply_source_slice(out, expr.axis, start, length);
+        return true;
+    }
+    case LayoutExprKind::Partition: {
+        if (expr.inputs.size() != 1 ||
+            !lower_expr_to_source_slice(
+                expr.inputs.front(), plan, metadata, tp_rank, tp_size, out)) {
+            return false;
+        }
+        if (tp_size <= 1 || expr.axis < 0) return true;
+        if (expr.axis >= static_cast<int>(out.shape.size())) return false;
+        const auto axis = static_cast<std::size_t>(expr.axis);
+        if (out.shape[axis] % tp_size != 0) return false;
+        const std::int64_t length = out.shape[axis] / tp_size;
+        const std::int64_t start =
+            static_cast<std::int64_t>(tp_rank) * length;
+        apply_source_slice(out, expr.axis, start, length);
+        return true;
+    }
+    default:
         return false;
     }
-    if (layout_op_inputs(cast).size() != 1 ||
-        layout_op_inputs(cast)[0] != layout_op_output(producer)) {
-        return false;
-    }
-    return std::find(
-        layout_op_inputs(drop).begin(),
-        layout_op_inputs(drop).end(),
-        layout_op_output(producer)) != layout_op_inputs(drop).end();
-}
-
-std::uint64_t leading_tile_scratch_bytes(
-    const TensorDecl& spec,
-    std::uint64_t tile_bytes)
-{
-    if (spec.shape.empty()) return dtype_bytes(spec.dtype);
-    std::vector<std::int64_t> inner_shape(
-        spec.shape.begin() + 1, spec.shape.end());
-    std::uint64_t row_bytes = tensor_nbytes(spec.dtype, inner_shape);
-    if (spec.shape.size() == 1) {
-        row_bytes = static_cast<std::uint64_t>(dtype_bytes(spec.dtype));
-    }
-    const std::int64_t rows_per_tile = std::max<std::int64_t>(
-        1,
-        static_cast<std::int64_t>(
-            tile_bytes / std::max<std::uint64_t>(row_bytes, 1)));
-    const std::int64_t tile_rows = std::min(spec.shape[0], rows_per_tile);
-    return static_cast<std::uint64_t>(tile_rows) * row_bytes;
-}
-
-std::uint64_t transform_scratch_bytes_for_op(
-    const LayoutPlan& plan,
-    std::size_t op_index,
-    std::uint64_t tile_bytes)
-{
-    const LayoutOp& op = plan.ops[op_index];
-    if (op.kind == LayoutOpKind::Cast) {
-        if (op_index > 0 &&
-            is_raw_copy_cast_drop_sequence(plan, op_index - 1)) {
-            return leading_tile_scratch_bytes(
-                tensor_spec_for(plan, layout_op_output(plan.ops[op_index - 1])),
-                tile_bytes);
-        }
-        return 0;
-    }
-    if (op.kind != LayoutOpKind::Dequantize || layout_op_inputs(op).size() < 2) {
-        return 0;
-    }
-
-    const TensorDecl* source = find_tensor_spec(plan, layout_op_inputs(op)[0]);
-    const TensorDecl* scale = find_tensor_spec(plan, layout_op_inputs(op)[1]);
-    if (source == nullptr || scale == nullptr) return 0;
-
-    if ((source->quant.format == QuantFormat::AwqInt4 ||
-         source->quant.format == QuantFormat::GptqInt4) &&
-        scale->dtype != DType::BF16) {
-        return tensor_nbytes(DType::BF16, scale->shape);
-    }
-    if (source->dtype == DType::FP8_E4M3 && scale->dtype == DType::BF16) {
-        return tensor_nbytes(DType::FP32, scale->shape);
-    }
-    return 0;
-}
-
-struct StorageTempUsage {
-    std::uint64_t max_resident_temp_bytes = 0;
-    std::uint64_t max_transform_scratch_bytes = 0;
-    std::uint64_t max_total_temporary_bytes = 0;
-};
-
-StorageTempUsage compute_storage_temp_usage(
-    const LayoutPlan& plan,
-    std::uint64_t tile_bytes)
-{
-    std::unordered_map<std::string, std::uint64_t> temp_bytes;
-    temp_bytes.reserve(plan.tensors.size());
-    for (const auto& [name, spec] : plan.tensors) {
-        if (spec.ownership == TensorOwnershipKind::Temporary) {
-            temp_bytes.emplace(name, tensor_nbytes(spec));
-        }
-    }
-
-    StorageTempUsage usage;
-    std::uint64_t live_temp_bytes = 0;
-    auto add_temp = [&](const std::string& name) {
-        const auto it = temp_bytes.find(name);
-        if (it == temp_bytes.end()) return;
-        live_temp_bytes += it->second;
-        usage.max_resident_temp_bytes =
-            std::max(usage.max_resident_temp_bytes, live_temp_bytes);
-        usage.max_total_temporary_bytes =
-            std::max(usage.max_total_temporary_bytes, live_temp_bytes);
-    };
-    auto release_temp = [&](const std::string& name) {
-        const auto it = temp_bytes.find(name);
-        if (it == temp_bytes.end()) return;
-        live_temp_bytes -= std::min(live_temp_bytes, it->second);
-    };
-    auto account_scratch = [&](std::uint64_t scratch) {
-        usage.max_transform_scratch_bytes =
-            std::max(usage.max_transform_scratch_bytes, scratch);
-        usage.max_total_temporary_bytes =
-            std::max(usage.max_total_temporary_bytes,
-                     live_temp_bytes + scratch);
-    };
-
-    for (std::size_t i = 0; i < plan.ops.size(); ++i) {
-        if (is_raw_copy_cast_drop_sequence(plan, i)) {
-            const LayoutOp& cast = plan.ops[i + 1];
-            add_temp(layout_op_output(cast));
-            add_temp(layout_op_secondary_output(cast));
-            account_scratch(transform_scratch_bytes_for_op(
-                plan, i + 1, tile_bytes));
-            i += 2;
-            continue;
-        }
-
-        const LayoutOp& op = plan.ops[i];
-        if (op_allocates_tensor(op.kind)) {
-            add_temp(layout_op_output(op));
-            add_temp(layout_op_secondary_output(op));
-        }
-        account_scratch(transform_scratch_bytes_for_op(plan, i, tile_bytes));
-
-        if (op.kind == LayoutOpKind::Drop) {
-            if (layout_op_inputs(op).empty()) {
-                release_temp(layout_op_output(op));
-            } else {
-                for (const auto& input : layout_op_inputs(op)) {
-                    release_temp(input);
-                }
-            }
-        }
-    }
-    return usage;
 }
 
 std::uint64_t range_count_for(
@@ -364,325 +254,8 @@ ExtentWrite make_write_record(
     };
 }
 
-ExtentWrite make_write(
-    const LayoutOp& op,
-    std::size_t op_index,
-    const CheckpointSource& metadata,
-    std::string output_name,
-    std::string raw_name,
-    std::vector<TensorSlice> slices,
-    std::vector<std::int64_t> dst_shape,
-    std::uint64_t dst_offset_bytes)
-{
-    return make_write_record(
-        op_index, kInvalidStorageId, kInvalidStorageId,
-        layout_op_kind_name(op.kind), metadata, std::move(output_name),
-        std::move(raw_name), std::move(slices), std::move(dst_shape),
-        dst_offset_bytes);
-}
-
-std::vector<TensorSlice> shard_slices_for(
-    const TensorInfo& info,
-    int shard_axis,
-    int tp_rank,
-    int tp_size,
-    std::vector<std::int64_t>& shape,
-    const std::string& raw_name)
-{
-    shape = info.shape;
-    if (tp_size <= 1 || shard_axis < 0) return {};
-    const auto shard = pie_driver_common::plan_axis_shard(
-        info.shape, shard_axis, tp_rank, tp_size,
-        "storage program shard: " + raw_name);
-    shape = shard.output_shape;
-    return {TensorSlice{shard_axis, shard.offset, shard.shard_dim}};
-}
-
-std::vector<ExtentWrite> lower_raw_like_op(
-    const LayoutOp& op,
-    std::size_t op_index,
-    const LayoutPlan& plan,
-    const CheckpointSource& metadata,
-    int tp_rank,
-    int tp_size)
-{
-    const TensorDecl& out = tensor_spec_for(plan, layout_op_output(op));
-    const auto& info = metadata.info(layout_op_raw_name(op));
-    if (info.dtype != out.dtype) {
-        throw std::runtime_error(
-            "storage program: raw extent write dtype mismatch for '" +
-            out.name + "'");
-    }
-    std::vector<std::int64_t> shape;
-    auto slices = shard_slices_for(
-        info, layout_op_shard_axis(op), tp_rank, tp_size, shape,
-        layout_op_raw_name(op));
-    if (shape != out.shape) {
-        throw std::runtime_error(
-            "storage program: raw extent write shape mismatch for '" +
-            out.name + "'");
-    }
-    return {make_write(
-        op, op_index, metadata, out.name, layout_op_raw_name(op),
-        std::move(slices), out.shape, 0)};
-}
-
-std::vector<ExtentWrite> lower_row_range_shard_op(
-    const LayoutOp& op,
-    std::size_t op_index,
-    const LayoutPlan& plan,
-    const CheckpointSource& metadata,
-    int tp_rank,
-    int tp_size)
-{
-    const TensorDecl& out = tensor_spec_for(plan, layout_op_output(op));
-    const auto& info = metadata.info(layout_op_raw_name(op));
-    std::int64_t rows = layout_op_rows(op);
-    std::int64_t offset = layout_op_row_offset(op);
-    if (rows <= 0) {
-        throw std::runtime_error(
-            "storage program: row-range shard has non-positive rows for '" +
-            layout_op_raw_name(op) + "'");
-    }
-    if (tp_size > 1) {
-        if (rows % tp_size != 0) {
-            throw std::runtime_error(
-                "storage program: row range is not divisible by tp_size for '" +
-                layout_op_raw_name(op) + "'");
-        }
-        rows /= tp_size;
-        offset += static_cast<std::int64_t>(tp_rank) * rows;
-    }
-    std::vector<std::int64_t> shape = info.shape;
-    shape[0] = rows;
-    if (info.dtype != out.dtype || shape != out.shape) {
-        throw std::runtime_error(
-            "storage program: row-range output mismatch for '" +
-            out.name + "'");
-    }
-    return {make_write(
-        op, op_index, metadata, out.name, layout_op_raw_name(op),
-        {TensorSlice{0, offset, rows}}, out.shape, 0)};
-}
-
-std::vector<ExtentWrite> lower_axis_concat_op(
-    const LayoutOp& op,
-    std::size_t op_index,
-    const LayoutPlan& plan,
-    const CheckpointSource& metadata,
-    int tp_rank,
-    int tp_size)
-{
-    const TensorDecl& out = tensor_spec_for(plan, layout_op_output(op));
-    if (out.shape.size() != 2) {
-        throw std::runtime_error(
-            "storage program: AxisConcat output must be 2-D for '" +
-            out.name + "'");
-    }
-
-    std::vector<ExtentWrite> writes;
-    std::uint64_t dst_offset = 0;
-    std::int64_t rows = 0;
-    for (const auto& src : layout_op_sources(op)) {
-        const auto& info = metadata.info(src.raw_name);
-        if (info.dtype != out.dtype || info.shape.size() != 2) {
-            throw std::runtime_error(
-                "storage program: AxisConcat source mismatch for '" +
-                out.name + "'");
-        }
-        std::vector<std::int64_t> shape;
-        auto slices = shard_slices_for(
-            info, layout_op_shard_axis(op), tp_rank, tp_size, shape,
-            src.raw_name);
-        if (shape.size() != 2 || shape[1] != out.shape[1]) {
-            throw std::runtime_error(
-                "storage program: AxisConcat source shape mismatch for '" +
-                src.raw_name + "'");
-        }
-        writes.push_back(make_write(
-            op, op_index, metadata, out.name, src.raw_name,
-            std::move(slices), shape, dst_offset));
-        rows += shape[0];
-        dst_offset += tensor_nbytes(out.dtype, shape);
-    }
-    if (rows != out.shape[0]) {
-        throw std::runtime_error(
-            "storage program: AxisConcat row count mismatch for '" +
-            out.name + "'");
-    }
-    return writes;
-}
-
-std::vector<ExtentWrite> lower_grouped_slice_concat_op(
-    const LayoutOp& op,
-    std::size_t op_index,
-    const LayoutPlan& plan,
-    const CheckpointSource& metadata,
-    int tp_rank,
-    int tp_size)
-{
-    const TensorDecl& out = tensor_spec_for(plan, layout_op_output(op));
-    const auto& info = metadata.info(layout_op_raw_name(op));
-    if (info.dtype != out.dtype || info.shape.size() != 3 ||
-        out.shape.size() != 3) {
-        throw std::runtime_error(
-            "storage program: GroupedSliceConcat expects rank-3 tensors for '" +
-            out.name + "'");
-    }
-    const std::int64_t E = info.shape[0];
-    const std::int64_t two_I = info.shape[1];
-    const std::int64_t H = info.shape[2];
-    if (two_I % 2 != 0 || (two_I / 2) % tp_size != 0) {
-        throw std::runtime_error(
-            "storage program: GroupedSliceConcat intermediate axis mismatch for '" +
-            out.name + "'");
-    }
-    const std::int64_t I = two_I / 2;
-    const std::int64_t I_local = I / tp_size;
-    if (out.shape != std::vector<std::int64_t>{E, 2 * I_local, H}) {
-        throw std::runtime_error(
-            "storage program: GroupedSliceConcat output shape mismatch for '" +
-            out.name + "'");
-    }
-
-    std::vector<ExtentWrite> writes;
-    const std::uint64_t half_bytes =
-        tensor_nbytes(out.dtype, {1, I_local, H});
-    const std::uint64_t expert_bytes = 2 * half_bytes;
-    const std::int64_t gate_start =
-        static_cast<std::int64_t>(tp_rank) * I_local;
-    const std::int64_t up_start = I + gate_start;
-    for (std::int64_t e = 0; e < E; ++e) {
-        const std::uint64_t expert_offset =
-            static_cast<std::uint64_t>(e) * expert_bytes;
-        writes.push_back(make_write(
-            op, op_index, metadata, out.name, layout_op_raw_name(op),
-            {TensorSlice{0, e, 1}, TensorSlice{1, gate_start, I_local}},
-            {1, I_local, H}, expert_offset));
-        writes.push_back(make_write(
-            op, op_index, metadata, out.name, layout_op_raw_name(op),
-            {TensorSlice{0, e, 1}, TensorSlice{1, up_start, I_local}},
-            {1, I_local, H}, expert_offset + half_bytes));
-    }
-    return writes;
-}
-
-std::vector<ExtentWrite> lower_grouped_slice_op(
-    const LayoutOp& op,
-    std::size_t op_index,
-    const LayoutPlan& plan,
-    const CheckpointSource& metadata,
-    int tp_rank,
-    int tp_size)
-{
-    const TensorDecl& out = tensor_spec_for(plan, layout_op_output(op));
-    const auto& info = metadata.info(layout_op_raw_name(op));
-    if (info.dtype != out.dtype || info.shape.size() != 3 ||
-        out.shape.size() != 3) {
-        throw std::runtime_error(
-            "storage program: GroupedSlice expects rank-3 tensors for '" +
-            out.name + "'");
-    }
-    const std::int64_t I = info.shape[2];
-    if (I % tp_size != 0) {
-        throw std::runtime_error(
-            "storage program: GroupedSlice axis mismatch for '" +
-            out.name + "'");
-    }
-    const std::int64_t I_local = I / tp_size;
-    if (out.shape != std::vector<std::int64_t>{info.shape[0], info.shape[1], I_local}) {
-        throw std::runtime_error(
-            "storage program: GroupedSlice output shape mismatch for '" +
-            out.name + "'");
-    }
-    return {make_write(
-        op, op_index, metadata, out.name, layout_op_raw_name(op),
-        {TensorSlice{2, static_cast<std::int64_t>(tp_rank) * I_local, I_local}},
-        out.shape, 0)};
-}
-
-std::vector<ExtentWrite> lower_stack_groups_op(
-    const LayoutOp& op,
-    std::size_t op_index,
-    const LayoutPlan& plan,
-    const CheckpointSource& metadata,
-    int tp_rank,
-    int tp_size)
-{
-    if (layout_op_sources(op).empty()) return {};
-    const TensorDecl& gate_up = tensor_spec_for(plan, layout_op_output(op));
-    const TensorDecl& down = tensor_spec_for(plan, layout_op_secondary_output(op));
-    if (layout_op_sources(op).size() % 3 != 0 ||
-        gate_up.shape.size() != 3 || down.shape.size() != 3) {
-        throw std::runtime_error(
-            "storage program: StackGroups expects expert triples for '" +
-            gate_up.name + "'");
-    }
-    const std::int64_t E =
-        static_cast<std::int64_t>(layout_op_sources(op).size() / 3);
-    const std::int64_t I = gate_up.shape[1] / 2;
-    const std::int64_t H = gate_up.shape[2];
-    const std::int64_t I_down = down.shape[2];
-    if (gate_up.shape != std::vector<std::int64_t>{E, 2 * I, H} ||
-        down.shape != std::vector<std::int64_t>{E, H, I_down}) {
-        throw std::runtime_error(
-            "storage program: StackGroups output shape mismatch for '" +
-            gate_up.name + "'");
-    }
-
-    std::vector<ExtentWrite> writes;
-    const std::uint64_t proj_bytes = tensor_nbytes(gate_up.dtype, {I, H});
-    const std::uint64_t gate_up_expert_bytes = 2 * proj_bytes;
-    const std::uint64_t down_expert_bytes = tensor_nbytes(down.dtype, {H, I_down});
-    for (std::int64_t e = 0; e < E; ++e) {
-        const auto& gate_src = layout_op_sources(op)[static_cast<std::size_t>(e) * 3];
-        const auto& up_src = layout_op_sources(op)[static_cast<std::size_t>(e) * 3 + 1];
-        const auto& down_src = layout_op_sources(op)[static_cast<std::size_t>(e) * 3 + 2];
-        const std::vector<std::int64_t> full_gate_shape{
-            I * static_cast<std::int64_t>(tp_size), H};
-        const std::vector<std::int64_t> full_down_shape{
-            H, I_down * static_cast<std::int64_t>(tp_size)};
-        const auto& gate_info = metadata.info(gate_src.raw_name);
-        const auto& up_info = metadata.info(up_src.raw_name);
-        const auto& down_info = metadata.info(down_src.raw_name);
-        if (gate_info.dtype != gate_up.dtype ||
-            up_info.dtype != gate_up.dtype ||
-            down_info.dtype != down.dtype ||
-            gate_info.shape != full_gate_shape ||
-            up_info.shape != full_gate_shape ||
-            down_info.shape != full_down_shape) {
-            throw std::runtime_error(
-                "storage program: StackGroups source metadata mismatch for '" +
-                gate_up.name + "'");
-        }
-        const std::uint64_t gate_up_offset =
-            static_cast<std::uint64_t>(e) * gate_up_expert_bytes;
-        const std::uint64_t down_offset =
-            static_cast<std::uint64_t>(e) * down_expert_bytes;
-        const std::vector<TensorSlice> gate_slices =
-            tp_size > 1
-                ? std::vector<TensorSlice>{
-                      TensorSlice{0, static_cast<std::int64_t>(tp_rank) * I, I}}
-                : std::vector<TensorSlice>{};
-        const std::vector<TensorSlice> down_slices =
-            tp_size > 1
-                ? std::vector<TensorSlice>{
-                      TensorSlice{1, static_cast<std::int64_t>(tp_rank) * I_down, I_down}}
-                : std::vector<TensorSlice>{};
-        writes.push_back(make_write(
-            op, op_index, metadata, gate_up.name, gate_src.raw_name,
-            gate_slices, {I, H}, gate_up_offset));
-        writes.push_back(make_write(
-            op, op_index, metadata, gate_up.name, up_src.raw_name,
-            gate_slices, {I, H}, gate_up_offset + proj_bytes));
-        writes.push_back(make_write(
-            op, op_index, metadata, down.name, down_src.raw_name,
-            down_slices, {H, I_down}, down_offset));
-    }
-    return writes;
-}
-
 bool lower_source_expr_to_write(
+    LayoutExprId value_id,
     const LayoutExpr& expr,
     std::size_t op_index,
     LayoutExprId expr_id,
@@ -697,58 +270,21 @@ bool lower_source_expr_to_write(
     int tp_size,
     std::vector<ExtentWrite>& writes)
 {
-    if (expr.kind == LayoutExprKind::Source) {
-        const auto& info = metadata.info(expr.raw_name);
-        if (info.dtype != tensor_spec_for(plan, output_name).dtype ||
-            info.shape != output_shape) {
-            return false;
-        }
-        writes.push_back(make_write_record(
-            op_index, expr_id, binding_index, op_kind, metadata,
-            output_name, expr.raw_name, {}, output_shape, dst_offset_bytes));
-        return true;
+    SourceSlicePlan source;
+    (void)expr;
+    if (!lower_expr_to_source_slice(
+            value_id, plan, metadata, tp_rank, tp_size, source)) {
+        return false;
     }
-
-    if ((expr.kind == LayoutExprKind::Partition ||
-         expr.kind == LayoutExprKind::Select) &&
-        expr.inputs.size() == 1 &&
-        expr.inputs.front() < plan.algebra.exprs.size() &&
-        plan.algebra.exprs[expr.inputs.front()].kind == LayoutExprKind::Source) {
-        const LayoutExpr& source = plan.algebra.exprs[expr.inputs.front()];
-        const auto& info = metadata.info(source.raw_name);
-        std::vector<TensorSlice> slices;
-        std::vector<std::int64_t> shape = info.shape;
-        if (expr.kind == LayoutExprKind::Partition) {
-            slices = shard_slices_for(
-                info, expr.axis, tp_rank, tp_size, shape, source.raw_name);
-        } else {
-            if (expr.axis < 0 ||
-                expr.axis >= static_cast<int>(info.shape.size()) ||
-                expr.length <= 0) {
-                return false;
-            }
-            std::int64_t start = expr.start;
-            std::int64_t length = expr.length;
-            if (tp_size > 1 && output_shape.size() == info.shape.size() &&
-                expr.axis == 0 && length % tp_size == 0 &&
-                output_shape[0] == length / tp_size) {
-                length /= tp_size;
-                start += static_cast<std::int64_t>(tp_rank) * length;
-            }
-            shape[static_cast<std::size_t>(expr.axis)] = length;
-            slices.push_back(TensorSlice{expr.axis, start, length});
-        }
-        if (info.dtype != tensor_spec_for(plan, output_name).dtype ||
-            shape != output_shape) {
-            return false;
-        }
-        writes.push_back(make_write_record(
-            op_index, expr_id, binding_index, op_kind, metadata,
-            output_name, source.raw_name, std::move(slices), output_shape,
-            dst_offset_bytes));
-        return true;
+    if (source.dtype != tensor_spec_for(plan, output_name).dtype ||
+        source.shape != output_shape) {
+        return false;
     }
-    return false;
+    writes.push_back(make_write_record(
+        op_index, expr_id, binding_index, op_kind, metadata,
+        output_name, source.raw_name, std::move(source.slices), output_shape,
+        dst_offset_bytes));
+    return true;
 }
 
 bool try_lower_join_expr_to_writes(
@@ -766,78 +302,160 @@ bool try_lower_join_expr_to_writes(
 {
     if (join.kind != LayoutExprKind::Join) return false;
     const TensorDecl& out = tensor_spec_for(plan, output_name);
-    if (join.axis != 0 || out.shape.empty()) return false;
+    if (join.axis < 0 ||
+        join.axis >= static_cast<int>(out.shape.size()) ||
+        out.shape.empty()) {
+        return false;
+    }
 
-    std::uint64_t dst_offset = 0;
     std::vector<std::int64_t> total_shape = out.shape;
-    total_shape[0] = 0;
+    total_shape[static_cast<std::size_t>(join.axis)] = 0;
+    std::int64_t axis_cursor = 0;
+    const std::size_t axis = static_cast<std::size_t>(join.axis);
     for (const auto input_id : join.inputs) {
         if (input_id >= plan.algebra.exprs.size()) return false;
-        const LayoutExpr& child = plan.algebra.exprs[input_id];
-        const LayoutExpr* source = &child;
-        int shard_axis = join.axis;
-        if (child.kind == LayoutExprKind::Partition &&
-            child.inputs.size() == 1 &&
-            child.inputs.front() < plan.algebra.exprs.size()) {
-            source = &plan.algebra.exprs[child.inputs.front()];
-            shard_axis = child.axis;
-        }
-        if (source->kind != LayoutExprKind::Source) return false;
-        const auto& info = metadata.info(source->raw_name);
-        if (info.dtype != out.dtype ||
-            info.shape.size() != out.shape.size()) {
+        SourceSlicePlan source;
+        if (!lower_expr_to_source_slice(
+                input_id, plan, metadata, tp_rank, tp_size, source)) {
             return false;
         }
-        std::vector<std::int64_t> shape;
-        auto slices = shard_slices_for(
-            info, shard_axis, tp_rank, tp_size, shape, source->raw_name);
-        if (shape.size() != out.shape.size()) return false;
-        for (std::size_t axis = 1; axis < shape.size(); ++axis) {
-            if (shape[axis] != out.shape[axis]) return false;
+        if (source.dtype != out.dtype ||
+            source.shape.size() != out.shape.size()) {
+            return false;
         }
-        writes.push_back(make_write_record(
-            op_index, expr_id, binding_index, op_kind, metadata,
-            output_name, source->raw_name, std::move(slices), shape,
-            dst_offset));
-        dst_offset += tensor_nbytes(out.dtype, shape);
-        total_shape[0] += shape[0];
+        for (std::size_t dim = 0; dim < source.shape.size(); ++dim) {
+            if (dim == axis) continue;
+            if (source.shape[dim] != out.shape[dim]) return false;
+        }
+
+        if (axis == 0) {
+            const std::uint64_t dst_offset =
+                tensor_nbytes(out.dtype, total_shape);
+            writes.push_back(make_write_record(
+                op_index, expr_id, binding_index, op_kind, metadata,
+                output_name, source.raw_name, std::move(source.slices),
+                source.shape, dst_offset));
+        } else {
+            std::uint64_t prefix_count = 1;
+            for (std::size_t dim = 0; dim < axis; ++dim) {
+                prefix_count *= static_cast<std::uint64_t>(out.shape[dim]);
+            }
+            std::uint64_t suffix_count = 1;
+            for (std::size_t dim = axis + 1; dim < out.shape.size(); ++dim) {
+                suffix_count *= static_cast<std::uint64_t>(out.shape[dim]);
+            }
+            std::vector<std::int64_t> dst_shape = source.shape;
+            for (std::size_t dim = 0; dim < axis; ++dim) {
+                dst_shape[dim] = 1;
+            }
+            for (std::uint64_t prefix = 0; prefix < prefix_count; ++prefix) {
+                std::uint64_t rem = prefix;
+                auto slices = source.slices;
+                for (std::size_t dim = axis; dim-- > 0;) {
+                    const auto coord = static_cast<std::int64_t>(
+                        rem % static_cast<std::uint64_t>(out.shape[dim]));
+                    rem /= static_cast<std::uint64_t>(out.shape[dim]);
+                    slices.push_back(TensorSlice{
+                        static_cast<int>(dim), coord, 1});
+                }
+                const std::uint64_t element_offset =
+                    (prefix * static_cast<std::uint64_t>(out.shape[axis]) *
+                         suffix_count +
+                     static_cast<std::uint64_t>(axis_cursor) * suffix_count);
+                writes.push_back(make_write_record(
+                    op_index, expr_id, binding_index, op_kind, metadata,
+                    output_name, source.raw_name, std::move(slices),
+                    dst_shape,
+                    element_offset *
+                        static_cast<std::uint64_t>(dtype_bytes(out.dtype))));
+            }
+        }
+
+        total_shape[axis] += source.shape[axis];
+        axis_cursor += source.shape[axis];
     }
     return total_shape == out.shape;
 }
 
-std::vector<ExtentWrite> lower_extent_writes_for_algebra_root(
-    const LayoutOp& op,
+bool try_lower_stack_expr_to_writes(
+    const LayoutExpr& stack,
     std::size_t op_index,
+    LayoutExprId expr_id,
+    std::size_t binding_index,
+    const std::string& op_kind,
     const LayoutPlan& plan,
     const CheckpointSource& metadata,
     int tp_rank,
-    int tp_size)
+    int tp_size,
+    std::vector<ExtentWrite>& writes)
 {
-    const std::string& output_name = layout_op_output(op);
-    if (output_name.empty()) return {};
-    const AlgebraBindingRef binding =
-        realize_binding_for_output(plan, output_name);
-    const LayoutExpr* root = binding.root_expr;
-    if (root == nullptr || root->inputs.size() != 1) return {};
-    const LayoutExpr& value = plan.algebra.exprs[root->inputs.front()];
-    std::vector<ExtentWrite> writes;
-    const std::string op_kind = std::string("Algebra.") +
-        layout_expr_kind_name(root->kind);
-    if (try_lower_join_expr_to_writes(
-            value, op_index, binding.root, binding.binding_index, op_kind,
-            plan, metadata, output_name,
-            tp_rank, tp_size, writes)) {
-        return writes;
+    if (stack.kind != LayoutExprKind::Stack ||
+        stack.secondary_runtime_name.empty() ||
+        stack.inputs.empty() ||
+        stack.inputs.size() % 3 != 0) {
+        return false;
     }
-    writes.clear();
-    if (lower_source_expr_to_write(
-            value, op_index, binding.root, binding.binding_index, op_kind,
-            plan, metadata, output_name,
-            tensor_spec_for(plan, output_name).shape, 0,
-            tp_rank, tp_size, writes)) {
-        return writes;
+    const TensorDecl& gate_up = tensor_spec_for(plan, stack.runtime_name);
+    const TensorDecl& down = tensor_spec_for(plan, stack.secondary_runtime_name);
+    if (gate_up.shape.size() != 3 || down.shape.size() != 3) return false;
+
+    const std::int64_t E = static_cast<std::int64_t>(stack.inputs.size() / 3);
+    const std::int64_t I = gate_up.shape[1] / 2;
+    const std::int64_t H = gate_up.shape[2];
+    const std::int64_t I_down = down.shape[2];
+    if (gate_up.shape != std::vector<std::int64_t>{E, 2 * I, H} ||
+        down.shape != std::vector<std::int64_t>{E, H, I_down}) {
+        return false;
     }
-    return {};
+
+    const std::uint64_t proj_bytes = tensor_nbytes(gate_up.dtype, {I, H});
+    const std::uint64_t gate_up_expert_bytes = 2 * proj_bytes;
+    const std::uint64_t down_expert_bytes =
+        tensor_nbytes(down.dtype, {H, I_down});
+    for (std::int64_t e = 0; e < E; ++e) {
+        SourceSlicePlan gate;
+        SourceSlicePlan up;
+        SourceSlicePlan down_source;
+        if (!lower_expr_to_source_slice(
+                stack.inputs[static_cast<std::size_t>(e) * 3],
+                plan, metadata, tp_rank, tp_size, gate) ||
+            !lower_expr_to_source_slice(
+                stack.inputs[static_cast<std::size_t>(e) * 3 + 1],
+                plan, metadata, tp_rank, tp_size, up) ||
+            !lower_expr_to_source_slice(
+                stack.inputs[static_cast<std::size_t>(e) * 3 + 2],
+                plan, metadata, tp_rank, tp_size, down_source)) {
+            return false;
+        }
+        if (gate.dtype != gate_up.dtype ||
+            up.dtype != gate_up.dtype ||
+            down_source.dtype != down.dtype ||
+            gate.shape != std::vector<std::int64_t>{I, H} ||
+            up.shape != std::vector<std::int64_t>{I, H} ||
+            down_source.shape != std::vector<std::int64_t>{H, I_down}) {
+            return false;
+        }
+        (void)tp_rank;
+        (void)tp_size;
+
+        const std::uint64_t gate_up_offset =
+            static_cast<std::uint64_t>(e) * gate_up_expert_bytes;
+        const std::uint64_t down_offset =
+            static_cast<std::uint64_t>(e) * down_expert_bytes;
+        writes.push_back(make_write_record(
+            op_index, expr_id, binding_index, op_kind, metadata,
+            gate_up.name, gate.raw_name, std::move(gate.slices),
+            {I, H}, gate_up_offset));
+        writes.push_back(make_write_record(
+            op_index, expr_id, binding_index, op_kind, metadata,
+            gate_up.name, up.raw_name, std::move(up.slices),
+            {I, H}, gate_up_offset + proj_bytes));
+        writes.push_back(make_write_record(
+            op_index, expr_id, binding_index, op_kind, metadata,
+            down.name, down_source.raw_name, std::move(down_source.slices),
+            {H, I_down}, down_offset));
+    }
+    return true;
 }
 
 void json_string(std::ostream& out, const std::string& value) {
@@ -932,74 +550,6 @@ void json_payload(std::ostream& out, const StorageInstrPayload& payload)
     out << '}';
 }
 
-StorageActionKind classify_unwritten_op(LayoutOpKind kind) noexcept {
-    switch (kind) {
-    case LayoutOpKind::Cast:
-    case LayoutOpKind::Dequantize:
-        return StorageActionKind::TileMap;
-    case LayoutOpKind::View:
-    case LayoutOpKind::Alias:
-        return StorageActionKind::CreateView;
-    case LayoutOpKind::Drop:
-        return StorageActionKind::Release;
-    case LayoutOpKind::AttachMetadata:
-        return StorageActionKind::Attach;
-    default:
-        return StorageActionKind::Transform;
-    }
-}
-
-StorageTransformKind transform_kind_for_op(LayoutOpKind kind) noexcept
-{
-    switch (kind) {
-    case LayoutOpKind::Slice:
-        return StorageTransformKind::Slice;
-    case LayoutOpKind::Concat:
-        return StorageTransformKind::Concat;
-    case LayoutOpKind::QuantizeRuntime:
-        return StorageTransformKind::Quantize;
-    case LayoutOpKind::Materialize:
-        return StorageTransformKind::Materialize;
-    case LayoutOpKind::Dequantize:
-        return StorageTransformKind::Decode;
-    case LayoutOpKind::Deinterleave:
-        return StorageTransformKind::Deinterleave;
-    case LayoutOpKind::RepackLayout:
-        return StorageTransformKind::Repack;
-    case LayoutOpKind::StackGroups:
-        return StorageTransformKind::Stack;
-    default:
-        return StorageTransformKind::None;
-    }
-}
-
-StorageInstrPayload payload_for_op(const LayoutOp& op)
-{
-    if (op.kind == LayoutOpKind::Slice) {
-        return StorageSlicePayload{
-            .axis = layout_op_slice_axis(op),
-            .start = layout_op_slice_start(op),
-            .length = layout_op_slice_length(op),
-            .shard_axis = layout_op_shard_axis(op),
-        };
-    }
-    if (op.kind == LayoutOpKind::Deinterleave) {
-        return StorageAxisPayload{
-            .shard_axis = layout_op_shard_axis(op),
-        };
-    }
-    if (op.kind == LayoutOpKind::View ||
-        op.kind == LayoutOpKind::Alias) {
-        return StorageViewPayload{
-            .axis = (layout_op_rows(op) > 0 ||
-                     layout_op_row_offset(op) > 0) ? 0 : -1,
-            .start = layout_op_row_offset(op),
-            .length = layout_op_rows(op),
-        };
-    }
-    return std::monostate{};
-}
-
 bool can_coalesce_adjacent_extent_writes(
     const ExtentWrite& a,
     const ExtentWrite& b)
@@ -1055,30 +605,6 @@ void optimize_extent_writes(std::vector<ExtentWrite>& writes)
     writes.swap(optimized);
 }
 
-StorageInstrKind schedule_kind_for_action(
-    StorageActionKind action) noexcept
-{
-    switch (action) {
-    case StorageActionKind::Allocate:
-        return StorageInstrKind::Allocate;
-    case StorageActionKind::ExtentWrite:
-        return StorageInstrKind::ExtentWrite;
-    case StorageActionKind::TileMap:
-        return StorageInstrKind::TileMap;
-    case StorageActionKind::Transform:
-        return StorageInstrKind::Transform;
-    case StorageActionKind::Attach:
-        return StorageInstrKind::Attach;
-    case StorageActionKind::CreateView:
-        return StorageInstrKind::CreateView;
-    case StorageActionKind::Release:
-        return StorageInstrKind::Release;
-    case StorageActionKind::Finalize:
-        return StorageInstrKind::Finalize;
-    }
-    return StorageInstrKind::Transform;
-}
-
 void append_unique(std::vector<std::size_t>& dst, std::size_t value)
 {
     if (std::find(dst.begin(), dst.end(), value) == dst.end()) {
@@ -1104,44 +630,6 @@ void append_producer_dependencies(
     const auto it = producers.find(name);
     if (it == producers.end()) return;
     for (const auto dep : it->second) append_unique(deps, dep);
-}
-
-std::vector<std::string> op_dependency_names(
-    const LayoutPlan& plan,
-    const LayoutOp& op)
-{
-    std::vector<std::string> inputs = layout_op_inputs(op);
-    if (op.kind == LayoutOpKind::Drop && inputs.empty()) {
-        append_unique(inputs, layout_op_output(op));
-    }
-    if (op.kind == LayoutOpKind::AttachMetadata) {
-        append_unique(inputs, layout_op_output(op));
-        const TensorDecl& spec = tensor_spec_for(plan, layout_op_output(op));
-        append_unique(inputs, spec.quant.scale_tensor);
-        append_unique(inputs, spec.quant.zero_point_tensor);
-    }
-    return inputs;
-}
-
-std::vector<std::string> op_output_names(const LayoutOp& op)
-{
-    std::vector<std::string> outputs;
-    if (op.kind != LayoutOpKind::Drop) {
-        append_unique(outputs, layout_op_output(op));
-        append_unique(outputs, layout_op_secondary_output(op));
-    }
-    return outputs;
-}
-
-AlgebraBindingRef binding_for_outputs(
-    const LayoutPlan& plan,
-    const std::vector<std::string>& outputs)
-{
-    for (const auto& output : outputs) {
-        AlgebraBindingRef binding = realize_binding_for_output(plan, output);
-        if (binding.root_expr != nullptr) return binding;
-    }
-    return {};
 }
 
 bool is_extent_write_step(const StorageInstr& step) noexcept
@@ -1229,246 +717,7 @@ std::vector<StorageInstr> schedule_steps_file_ordered(
     return ordered;
 }
 
-void build_storage_schedule(
-    const LayoutPlan& layout_plan,
-    StorageProgram& storage_program)
-{
-    std::vector<std::vector<std::size_t>> writes_by_op(
-        layout_plan.ops.size());
-    for (std::size_t i = 0; i < storage_program.extent_writes.size(); ++i) {
-        const auto op_index = storage_program.extent_writes[i].op_index;
-        if (op_index >= layout_plan.ops.size()) {
-            throw std::runtime_error(
-                "storage program: extent write op index out of range");
-        }
-        writes_by_op[op_index].push_back(i);
-    }
-    std::vector<std::vector<std::size_t>> transforms_by_op(
-        layout_plan.ops.size());
-    for (std::size_t i = 0; i < storage_program.tile_maps.size(); ++i) {
-        const auto op_index = storage_program.tile_maps[i].op_index;
-        if (op_index >= layout_plan.ops.size()) {
-            throw std::runtime_error(
-                "storage program: tile map op index out of range");
-        }
-        transforms_by_op[op_index].push_back(i);
-    }
-
-    std::vector<StorageInstr> steps;
-    std::unordered_map<std::string, std::vector<std::size_t>> producers;
-    auto dependencies_for = [&](const std::vector<std::string>& names) {
-        std::vector<std::size_t> deps;
-        for (const auto& name : names) {
-            append_producer_dependencies(producers, name, deps);
-        }
-        std::sort(deps.begin(), deps.end());
-        return deps;
-    };
-    auto add_step = [&](StorageInstr step) {
-        step.step_index = steps.size();
-        steps.push_back(std::move(step));
-        return steps.back().step_index;
-    };
-
-    for (std::size_t op_index = 0; op_index < layout_plan.ops.size(); ++op_index) {
-        if (is_raw_copy_cast_drop_sequence(layout_plan, op_index)) {
-            const std::size_t cast_index = op_index + 1;
-            const LayoutOp& producer = layout_plan.ops[op_index];
-            if (writes_by_op[op_index].empty() ||
-                transforms_by_op[cast_index].empty()) {
-                throw std::runtime_error(
-                    "storage program: fused raw-cast sequence is missing "
-                    "byte extents or tile map");
-            }
-            auto deps = dependencies_for(
-                op_dependency_names(layout_plan, producer));
-            for (const auto transform_index : transforms_by_op[cast_index]) {
-                const auto& transform =
-                    storage_program.tile_maps[transform_index];
-                const std::size_t step_index = add_step(StorageInstr{
-                    .kind = StorageInstrKind::TileMap,
-                    .transform_kind = StorageTransformKind::None,
-                    .op_index = cast_index,
-                    .expr_id = transform.expr_id,
-                    .binding_index = transform.binding_index,
-                    .extent_write_indices = writes_by_op[op_index],
-                    .tile_map_index = transform_index,
-                    .inputs = transform.inputs,
-                    .outputs = {transform.output_name},
-                    .dependencies = deps,
-                });
-                producers[transform.output_name] = {step_index};
-            }
-            op_index += 2;
-            continue;
-        }
-
-        const LayoutOp& op = layout_plan.ops[op_index];
-        const auto op_inputs = op_dependency_names(layout_plan, op);
-        auto deps = dependencies_for(op_inputs);
-        std::unordered_map<std::string, std::vector<std::size_t>> op_producers;
-
-        if (!writes_by_op[op_index].empty()) {
-            for (const auto write_index : writes_by_op[op_index]) {
-                const auto& write = storage_program.extent_writes[write_index];
-                const std::size_t step_index = add_step(StorageInstr{
-                    .kind = StorageInstrKind::ExtentWrite,
-                    .transform_kind = StorageTransformKind::None,
-                    .op_index = op_index,
-                    .expr_id = write.expr_id,
-                    .binding_index = write.binding_index,
-                    .extent_write_indices = {write_index},
-                    .tile_map_index = kInvalidStorageId,
-                    .inputs = {write.raw_name},
-                    .outputs = {write.output_name},
-                    .dependencies = deps,
-                });
-                op_producers[write.output_name].push_back(step_index);
-            }
-
-            for (auto& [name, produced_by] : op_producers) {
-                std::sort(produced_by.begin(), produced_by.end());
-                producers[name] = std::move(produced_by);
-            }
-
-            if (op.kind == LayoutOpKind::AxisConcat) {
-                std::vector<std::size_t> view_deps;
-                append_producer_dependencies(
-                    producers, layout_op_output(op), view_deps);
-                std::vector<std::string> outputs;
-                for (const auto& source : layout_op_sources(op)) {
-                    append_unique(outputs, source.view_name);
-                }
-                if (!outputs.empty()) {
-                    const AlgebraBindingRef view_binding =
-                        binding_for_outputs(layout_plan, outputs);
-                    const std::size_t view_step = add_step(StorageInstr{
-                        .kind = StorageInstrKind::CreateView,
-                        .transform_kind = StorageTransformKind::None,
-                        .op_index = op_index,
-                        .expr_id = view_binding.root,
-                        .binding_index = view_binding.binding_index,
-                        .extent_write_indices = {},
-                        .tile_map_index = kInvalidStorageId,
-                        .inputs = {layout_op_output(op)},
-                        .outputs = outputs,
-                        .dependencies = view_deps,
-                    });
-                    for (const auto& output : outputs) {
-                        producers[output] = {view_step};
-                    }
-                }
-            }
-            continue;
-        }
-
-        if (!transforms_by_op[op_index].empty()) {
-            for (const auto transform_index : transforms_by_op[op_index]) {
-                const auto& transform =
-                    storage_program.tile_maps[transform_index];
-                const std::size_t step_index = add_step(StorageInstr{
-                    .kind = StorageInstrKind::TileMap,
-                    .transform_kind = StorageTransformKind::None,
-                    .op_index = op_index,
-                    .expr_id = transform.expr_id,
-                    .binding_index = transform.binding_index,
-                    .extent_write_indices = {},
-                    .tile_map_index = transform_index,
-                    .inputs = transform.inputs,
-                    .outputs = {transform.output_name},
-                    .dependencies = deps,
-                });
-                producers[transform.output_name] = {step_index};
-            }
-            continue;
-        }
-
-        const StorageInstrKind kind = schedule_kind_for_action(
-            classify_unwritten_op(op.kind));
-        const std::vector<std::string> outputs = op_output_names(op);
-        const AlgebraBindingRef binding =
-            binding_for_outputs(layout_plan, outputs);
-        const std::size_t step_index = add_step(StorageInstr{
-            .kind = kind,
-            .transform_kind = transform_kind_for_op(op.kind),
-            .op_index = op_index,
-            .expr_id = binding.root,
-            .binding_index = binding.binding_index,
-            .extent_write_indices = {},
-            .tile_map_index = kInvalidStorageId,
-            .inputs = op_inputs,
-            .outputs = outputs,
-            .dependencies = deps,
-            .payload = payload_for_op(op),
-        });
-        if (op.kind == LayoutOpKind::Drop) {
-            if (layout_op_inputs(op).empty()) {
-                producers.erase(layout_op_output(op));
-            } else {
-                for (const auto& input : layout_op_inputs(op)) {
-                    producers.erase(input);
-                }
-            }
-        } else {
-            for (const auto& output : outputs) {
-                producers[output] = {step_index};
-            }
-        }
-    }
-
-    storage_program.schedule =
-        schedule_steps_file_ordered(storage_program, std::move(steps));
-    storage_program.scheduled_extent_writes.clear();
-    storage_program.scheduled_extent_writes.reserve(
-        storage_program.extent_writes.size());
-    for (const auto& step : storage_program.schedule) {
-        if (!is_extent_write_step(step)) continue;
-        for (const auto write_index : step.extent_write_indices) {
-            storage_program.scheduled_extent_writes.push_back(write_index);
-        }
-    }
-    storage_program.memory.scheduled_step_count =
-        static_cast<std::uint64_t>(storage_program.schedule.size());
-    storage_program.memory.file_ordered_extent_write_count =
-        static_cast<std::uint64_t>(
-            storage_program.scheduled_extent_writes.size());
-}
-
 }  // namespace
-
-std::vector<ExtentWrite> lower_extent_writes_for_step(
-    const LayoutOp& op,
-    std::size_t op_index,
-    const LayoutPlan& plan,
-    const CheckpointSource& metadata,
-    int tp_rank,
-    int tp_size)
-{
-    switch (op.kind) {
-    case LayoutOpKind::Read:
-    case LayoutOpKind::Copy:
-    case LayoutOpKind::Shard:
-        return lower_raw_like_op(
-            op, op_index, plan, metadata, tp_rank, tp_size);
-    case LayoutOpKind::RowRangeShard:
-        return lower_row_range_shard_op(
-            op, op_index, plan, metadata, tp_rank, tp_size);
-    case LayoutOpKind::AxisConcat:
-        return lower_axis_concat_op(
-            op, op_index, plan, metadata, tp_rank, tp_size);
-    case LayoutOpKind::GroupedSliceConcat:
-        return lower_grouped_slice_concat_op(
-            op, op_index, plan, metadata, tp_rank, tp_size);
-    case LayoutOpKind::GroupedSlice:
-        return lower_grouped_slice_op(
-            op, op_index, plan, metadata, tp_rank, tp_size);
-    case LayoutOpKind::StackGroups:
-        return lower_stack_groups_op(
-            op, op_index, plan, metadata, tp_rank, tp_size);
-    default:
-        return {};
-    }
-}
 
 StorageProgram build_storage_program_from_algebra_only(
     const LayoutPlan& plan,
@@ -1572,6 +821,15 @@ StorageProgram build_storage_program_from_algebra_only(
         }
     };
 
+    auto write_output_names =
+        [](const std::vector<ExtentWrite>& writes) {
+            std::vector<std::string> names;
+            for (const auto& write : writes) {
+                append_unique(names, write.output_name);
+            }
+            return names;
+        };
+
     auto lower_direct_writes =
         [&](LayoutExprId value_id,
             std::size_t binding_index,
@@ -1588,6 +846,12 @@ StorageProgram build_storage_program_from_algebra_only(
                     binding_index < plan.algebra.bindings.size()
                 ? plan.algebra.bindings[binding_index].root
                 : value_id;
+            if (try_lower_stack_expr_to_writes(
+                    value, kInvalidStorageId, write_expr_id, binding_index,
+                    op_kind, plan, metadata, tp_rank, tp_size, writes)) {
+                return writes;
+            }
+            writes.clear();
             if (try_lower_join_expr_to_writes(
                     value, kInvalidStorageId, write_expr_id, binding_index,
                     op_kind, plan, metadata, output_name,
@@ -1596,7 +860,7 @@ StorageProgram build_storage_program_from_algebra_only(
             }
             writes.clear();
             if (lower_source_expr_to_write(
-                    value, kInvalidStorageId, write_expr_id, binding_index,
+                    value_id, value, kInvalidStorageId, write_expr_id, binding_index,
                     op_kind, plan, metadata, output_name,
                     tensor_spec_for(plan, output_name).shape, 0,
                     tp_rank, tp_size, writes)) {
@@ -1671,9 +935,14 @@ StorageProgram build_storage_program_from_algebra_only(
             if (!requested_name.empty()) {
                 auto writes = lower_direct_writes(id, binding_index, requested_name);
                 if (!writes.empty()) {
+                    const auto outputs = write_output_names(writes);
                     record_writes(std::move(writes), {});
-                    remember_materialized(id, {requested_name});
-                    return requested_name;
+                    remember_materialized(id, outputs);
+                    if (std::find(outputs.begin(), outputs.end(), requested_name) !=
+                        outputs.end()) {
+                        return requested_name;
+                    }
+                    return outputs.empty() ? requested_name : outputs.front();
                 }
             }
 
@@ -1796,6 +1065,11 @@ StorageProgram build_storage_program_from_algebra_only(
                     }
                 }
                 const std::uint64_t scratch = 0;
+                const std::vector<std::string> outputs =
+                    expr.secondary_runtime_name.empty()
+                        ? std::vector<std::string>{output}
+                        : std::vector<std::string>{output,
+                              expr.secondary_runtime_name};
                 const std::size_t tile_index = storage.tile_maps.size();
                 storage.tile_maps.push_back(TileMap{
                     .op_index = kInvalidStorageId,
@@ -1827,11 +1101,11 @@ StorageProgram build_storage_program_from_algebra_only(
                     .extent_write_indices = {},
                     .tile_map_index = tile_index,
                     .inputs = inputs,
-                    .outputs = {output},
+                    .outputs = outputs,
                     .dependencies = deps,
                 });
-                producers[output] = {step_index};
-                remember_materialized(id, {output});
+                for (const auto& name : outputs) producers[name] = {step_index};
+                remember_materialized(id, outputs);
                 return output;
             }
             case LayoutExprKind::Attach:
@@ -1857,7 +1131,13 @@ StorageProgram build_storage_program_from_algebra_only(
     for (LayoutExprId id = 0; id < plan.algebra.exprs.size(); ++id) {
         const auto& expr = plan.algebra.exprs[id];
         if (expr.kind == LayoutExprKind::Attach) {
-            const auto deps = dependencies_for({expr.runtime_name});
+            std::vector<std::string> inputs{expr.runtime_name};
+            if (const auto spec = find_tensor_spec(plan, expr.runtime_name);
+                spec != nullptr) {
+                append_unique(inputs, spec->quant.scale_tensor);
+                append_unique(inputs, spec->quant.zero_point_tensor);
+            }
+            const auto deps = dependencies_for(inputs);
             const std::size_t step_index = add_step(StorageInstr{
                 .kind = StorageInstrKind::Attach,
                 .transform_kind = StorageTransformKind::None,
@@ -1866,7 +1146,7 @@ StorageProgram build_storage_program_from_algebra_only(
                 .binding_index = kInvalidStorageId,
                 .extent_write_indices = {},
                 .tile_map_index = kInvalidStorageId,
-                .inputs = {expr.runtime_name},
+                .inputs = inputs,
                 .outputs = {expr.runtime_name},
                 .dependencies = deps,
             });
@@ -1927,117 +1207,8 @@ StorageProgram build_storage_program(
     StorageOptimizerConfig optimizer)
 {
     validate_layout_plan(plan);
-    if (plan.ops.empty() && !plan.algebra.bindings.empty()) {
-        return build_storage_program_from_algebra_only(
-            plan, metadata, tp_rank, tp_size,
-            transform_tile_bytes, optimizer);
-    }
-    StorageProgram storage;
-    storage.memory.persistent_bytes = plan.memory.persistent_bytes;
-    storage.memory.layout_max_temporary_bytes = plan.memory.max_temporary_bytes;
-
-    for (std::size_t i = 0; i < plan.ops.size(); ++i) {
-        const LayoutOp& op = plan.ops[i];
-        const AlgebraBindingRef op_binding =
-            realize_binding_for_output(plan, layout_op_output(op));
-        auto writes = lower_extent_writes_for_algebra_root(
-            op, i, plan, metadata, tp_rank, tp_size);
-        const bool lowered_from_algebra = !writes.empty();
-        if (writes.empty()) {
-            writes = lower_extent_writes_for_step(
-                op, i, plan, metadata, tp_rank, tp_size);
-            attach_algebra_binding(writes, op_binding);
-        }
-        const std::uint64_t unoptimized_op_write_count =
-            static_cast<std::uint64_t>(writes.size());
-        if (optimizer.enabled && optimizer.coalesce_adjacent) {
-            optimize_extent_writes(writes);
-        }
-        const std::uint64_t op_write_count =
-            static_cast<std::uint64_t>(writes.size());
-        if (unoptimized_op_write_count > op_write_count) {
-            storage.memory.coalesced_extent_write_count +=
-                unoptimized_op_write_count - op_write_count;
-        }
-        for (const auto& write : writes) {
-            storage.memory.checkpoint_read_bytes += write.bytes;
-            storage.memory.device_write_bytes += write.bytes;
-            storage.memory.extent_write_count += 1;
-            if (lowered_from_algebra) {
-                storage.memory.algebra_extent_write_count += 1;
-            } else {
-                storage.memory.planner_extent_write_count += 1;
-            }
-            storage.memory.extent_range_count += write.range_count;
-        }
-        storage.extent_writes.insert(
-            storage.extent_writes.end(),
-            std::make_move_iterator(writes.begin()),
-            std::make_move_iterator(writes.end()));
-
-        if (op.kind == LayoutOpKind::Cast || op.kind == LayoutOpKind::Dequantize) {
-            const TensorDecl& out = tensor_spec_for(plan, layout_op_output(op));
-            std::uint64_t input_bytes = 0;
-            for (const auto& input : layout_op_inputs(op)) {
-                const auto spec_it = plan.tensors.find(input);
-                if (spec_it != plan.tensors.end()) {
-                    input_bytes += tensor_nbytes(spec_it->second);
-                }
-            }
-            const std::uint64_t output_bytes = tensor_nbytes(out);
-            const std::uint64_t scratch = transform_scratch_bytes_for_op(
-                plan, i, transform_tile_bytes);
-            storage.tile_maps.push_back(TileMap{
-                .op_index = i,
-                .expr_id = op_binding.root,
-                .binding_index = op_binding.binding_index,
-                .kind = op.kind == LayoutOpKind::Cast
-                    ? TileMapKind::Cast
-                    : TileMapKind::Decode,
-                .output_name = layout_op_output(op),
-                .inputs = layout_op_inputs(op),
-                .input_bytes = input_bytes,
-                .output_bytes = output_bytes,
-                .tile_bytes = transform_tile_bytes,
-                .scratch_bytes = scratch,
-            });
-            storage.memory.max_transform_scratch_bytes =
-                std::max(storage.memory.max_transform_scratch_bytes, scratch);
-            storage.memory.tile_map_count += 1;
-        }
-
-        StorageOpCoverage coverage{
-            .op_index = i,
-            .expr_id = op_binding.root,
-            .binding_index = op_binding.binding_index,
-            .op_kind = layout_op_kind_name(op.kind),
-            .action = op_write_count > 0
-                ? StorageActionKind::ExtentWrite
-                : classify_unwritten_op(op.kind),
-            .extent_writes = op_write_count,
-            .tile_maps =
-                (op.kind == LayoutOpKind::Cast ||
-                 op.kind == LayoutOpKind::Dequantize)
-                    ? 1u
-                    : 0u,
-        };
-        storage.coverage.push_back(std::move(coverage));
-    }
-
-    storage.memory.optimized_extent_write_count =
-        static_cast<std::uint64_t>(storage.extent_writes.size());
-    const StorageTempUsage temp_usage =
-        compute_storage_temp_usage(plan, transform_tile_bytes);
-    storage.memory.max_extent_temporary_bytes =
-        temp_usage.max_resident_temp_bytes;
-    storage.memory.max_transform_scratch_bytes =
-        temp_usage.max_transform_scratch_bytes;
-    storage.memory.max_temporary_bytes = temp_usage.max_total_temporary_bytes;
-    storage.memory.estimated_peak_bytes =
-        storage.memory.persistent_bytes + storage.memory.max_temporary_bytes;
-    build_storage_schedule(plan, storage);
-    validate_storage_program(plan, storage);
-    return storage;
+    return build_storage_program_from_algebra_only(
+        plan, metadata, tp_rank, tp_size, transform_tile_bytes, optimizer);
 }
 
 const char* storage_action_kind_name(StorageActionKind kind) noexcept {
@@ -2152,80 +1323,17 @@ void validate_storage_program(
             }
         };
 
-    const bool has_layout_ops = !layout_plan.ops.empty();
-    if (has_layout_ops) {
-        if (storage_program.coverage.size() != layout_plan.ops.size()) {
-            throw std::runtime_error(
-                "storage program: coverage table does not match layout op count");
-        }
-        std::unordered_set<std::size_t> covered;
-        covered.reserve(storage_program.coverage.size());
-        for (const auto& coverage : storage_program.coverage) {
-            if (coverage.op_index >= layout_plan.ops.size()) {
-                throw std::runtime_error(
-                    "storage program: coverage op index out of range");
-            }
-            validate_algebra_ref(
-                coverage.expr_id, coverage.binding_index, "coverage");
-            if (!covered.insert(coverage.op_index).second) {
-                throw std::runtime_error(
-                    "storage program: duplicate coverage for op " +
-                    std::to_string(coverage.op_index));
-            }
-            const auto& layout_op = layout_plan.ops[coverage.op_index];
-            if (coverage.op_kind != layout_op_kind_name(layout_op.kind)) {
-                throw std::runtime_error(
-                    "storage program: coverage kind mismatch for op " +
-                    std::to_string(coverage.op_index));
-            }
-            switch (coverage.action) {
-            case StorageActionKind::ExtentWrite:
-                if (coverage.extent_writes == 0) {
-                    throw std::runtime_error(
-                        "storage program: extent-write op has no extent writes");
-                }
-                break;
-            case StorageActionKind::TileMap:
-                if (coverage.tile_maps == 0) {
-                    throw std::runtime_error(
-                        "storage program: tile map op has no transform record");
-                }
-                break;
-            case StorageActionKind::Allocate:
-            case StorageActionKind::Transform:
-            case StorageActionKind::Attach:
-            case StorageActionKind::CreateView:
-            case StorageActionKind::Release:
-            case StorageActionKind::Finalize:
-                break;
-            }
-        }
-    } else if (!storage_program.coverage.empty()) {
-        throw std::runtime_error(
-            "storage program: algebra-only program must not carry planner-op coverage");
-    }
-
     for (const auto& write : storage_program.extent_writes) {
-        if (has_layout_ops) {
-            if (write.op_index >= layout_plan.ops.size()) {
-                throw std::runtime_error(
-                    "storage program: extent write op index out of range");
-            }
-        } else if (write.op_index != kInvalidStorageId) {
+        if (write.op_index != kInvalidStorageId) {
             throw std::runtime_error(
-                "storage program: algebra-only extent write has layout op index");
+                "storage program: algebra extent write has layout op index");
         }
         validate_algebra_ref(write.expr_id, write.binding_index, "extent write");
     }
     for (const auto& tile : storage_program.tile_maps) {
-        if (has_layout_ops) {
-            if (tile.op_index >= layout_plan.ops.size()) {
-                throw std::runtime_error(
-                    "storage program: tile map op index out of range");
-            }
-        } else if (tile.op_index != kInvalidStorageId) {
+        if (tile.op_index != kInvalidStorageId) {
             throw std::runtime_error(
-                "storage program: algebra-only tile map has layout op index");
+                "storage program: algebra tile map has layout op index");
         }
         validate_algebra_ref(tile.expr_id, tile.binding_index, "tile map");
     }
@@ -2253,14 +1361,9 @@ void validate_storage_program(
     std::unordered_set<std::size_t> scheduled_transforms;
     scheduled_transforms.reserve(storage_program.tile_maps.size());
     for (const auto& step : storage_program.schedule) {
-        if (has_layout_ops) {
-            if (step.op_index >= layout_plan.ops.size()) {
-                throw std::runtime_error(
-                    "storage program: schedule op index out of range");
-            }
-        } else if (step.op_index != kInvalidStorageId) {
+        if (step.op_index != kInvalidStorageId) {
             throw std::runtime_error(
-                "storage program: algebra-only schedule has layout op index");
+                "storage program: algebra schedule has layout op index");
         }
         validate_algebra_ref(step.expr_id, step.binding_index, "schedule");
         for (const auto dep : step.dependencies) {
@@ -2350,7 +1453,6 @@ std::string describe_storage_program(const StorageProgram& plan) {
     out << plan.memory.extent_write_count << " extent writes"
         << ", ranges=" << plan.memory.extent_range_count
         << ", algebra_writes=" << plan.memory.algebra_extent_write_count
-        << ", planner_writes=" << plan.memory.planner_extent_write_count
         << ", checkpoint_read="
         << (plan.memory.checkpoint_read_bytes / (1024 * 1024)) << " MiB"
         << ", storage_temp<="
@@ -2397,8 +1499,6 @@ std::string dump_storage_program_json(const StorageProgram& plan) {
         << "\"extent_write_count\":" << plan.memory.extent_write_count << ','
         << "\"algebra_extent_write_count\":"
         << plan.memory.algebra_extent_write_count << ','
-        << "\"planner_extent_write_count\":"
-        << plan.memory.planner_extent_write_count << ','
         << "\"extent_range_count\":" << plan.memory.extent_range_count << ','
         << "\"optimized_extent_write_count\":"
         << plan.memory.optimized_extent_write_count << ','
@@ -2505,21 +1605,6 @@ std::string dump_storage_program_json(const StorageProgram& plan) {
     for (std::size_t i = 0; i < plan.scheduled_extent_writes.size(); ++i) {
         if (i) out << ',';
         out << plan.scheduled_extent_writes[i];
-    }
-    out << "],\"coverage\":[";
-    for (std::size_t i = 0; i < plan.coverage.size(); ++i) {
-        const auto& coverage = plan.coverage[i];
-        if (i) out << ',';
-        out << "{\"op_index\":" << coverage.op_index
-            << ",\"op_kind\":";
-        json_string(out, coverage.op_kind);
-        json_id_field(out, "expr_id", coverage.expr_id);
-        json_id_field(out, "binding_index", coverage.binding_index);
-        out << ",\"action\":";
-        json_string(out, storage_action_kind_name(coverage.action));
-        out << ",\"extent_writes\":" << coverage.extent_writes
-            << ",\"tile_maps\":" << coverage.tile_maps
-            << '}';
     }
     out << "]}";
     return out.str();

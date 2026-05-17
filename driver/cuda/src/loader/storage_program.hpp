@@ -79,16 +79,6 @@ using StorageInstrPayload = std::variant<
     StorageViewPayload,
     StorageAxisPayload>;
 
-struct StorageOpCoverage {
-    std::size_t op_index = kInvalidStorageId;
-    LayoutExprId expr_id = kInvalidStorageId;
-    std::size_t binding_index = kInvalidStorageId;
-    std::string op_kind;
-    StorageActionKind action = StorageActionKind::Transform;
-    std::uint64_t extent_writes = 0;
-    std::uint64_t tile_maps = 0;
-};
-
 // A storage checkpoint-to-device copy. The source is a safetensors tensor
 // plus optional row-major rectangular slices; the destination is an offset
 // inside a planned runtime tensor allocation.
@@ -156,7 +146,6 @@ struct StorageMemoryPlan {
     std::uint64_t device_write_bytes = 0;
     std::uint64_t extent_write_count = 0;
     std::uint64_t algebra_extent_write_count = 0;
-    std::uint64_t planner_extent_write_count = 0;
     std::uint64_t extent_range_count = 0;
     std::uint64_t tile_map_count = 0;
     std::uint64_t optimized_extent_write_count = 0;
@@ -170,7 +159,6 @@ struct StorageProgram {
     std::vector<TileMap> tile_maps;
     std::vector<StorageInstr> schedule;
     std::vector<std::size_t> scheduled_extent_writes;
-    std::vector<StorageOpCoverage> coverage;
     StorageMemoryPlan memory;
 };
 

@@ -31,13 +31,13 @@ The current CUDA loader already has many of the right components:
 The implementation has started the migration toward the compiler architecture:
 
 - `LoadExecutor` now requires a `StorageProgram` and walks `StorageInstr`
-  records. The old top-level planner-op executor switch has been
-  removed.
-- `StorageInstr` carries a typed storage transform kind, and fused raw-read
-  plus cast is represented as a `TileMap` with source extents attached.
-- `StorageCompiler` lowers the copy-like algebra core (`Source`, `Select`,
-  `Partition`, `Join`) into byte extents before falling back to specialized
-  planner-op lowerers for operations whose algebra still needs richer payloads.
+  records. The old top-level compatibility executor switch has been removed.
+- `StorageInstr` carries typed storage payloads, and tiled transforms are
+  represented as `TileMap` records.
+- `StorageCompiler` lowers algebra directly. `Source`, `Select`, `Partition`,
+  `Join`, and direct expert `Stack` lower to byte extents; `Cast`, `Encode`,
+  `Decode`, and `Transcode` lower to typed tile maps. Unsupported algebra fails
+  compilation explicitly.
 - `RuntimeABI` exposes final tensor contracts with dtype, encoding, layout,
   ownership, alignment, sharding, quant metadata, and quant policy.
 - `LayoutOptimizer` has concrete normalization rewrites for
@@ -48,25 +48,19 @@ The implementation has started the migration toward the compiler architecture:
 - `GgufCheckpointSource` parses dense tensors and initial quant block metadata
   (`gguf.q4_0`), with a decoded Q4_0 golden fixture.
 - GPT-OSS MXFP4 planning is algebra-native for both packed routed-dequant and
-  eager-BF16 fallback policies; storage compilation now schedules the
-  corresponding extent writes, decode tile maps, deinterleave/select
-  transforms, attach steps, and releases without planner-op coverage.
+  eager-BF16 fallback policies; storage compilation schedules the corresponding
+  extent writes, decode tile maps, deinterleave/select transforms, attach
+  steps, and releases without compatibility metadata.
 
 The remaining gap is narrower but still important:
 
-- Several layout ops are still transformer-specific, such as packed QKV,
-  grouped expert slices, row-range shards, and stack groups.
 - Schema adaptation, target policy, runtime ABI decisions, layout planning, and
   lowering are still heavily concentrated in `model_schema.cpp`.
-- Older model-family adapters still emit compatibility `LayoutOpKind` plans for
-  packed QKV, grouped expert slices, row-range shards, and stack groups. The
-  executor no longer chooses by layout op kind, but those adapters still need
-  native algebra planning so the compatibility lowering path can disappear.
-- Type checking is validation over an already-built plan, not inference over an
-  algebra.
-- The compatibility algebra builder still derives algebra from planner ops.
-  The target state is native algebra planning from `SemanticGraph` and
-  `RuntimeABI`.
+- Type checking now propagates `TensorDecl` through the algebra, but coverage
+  should continue expanding for quantization metadata and secondary outputs.
+- The remaining cleanup is modularity, not compatibility removal: split
+  per-family adapters from planner/lowering modules and keep the algebra IR
+  model-neutral.
 
 The refactor target is not to add layers for their own sake. The target is to
 make ownership boundaries exact:
@@ -313,7 +307,7 @@ renamed loader.
 
 `LoadExecutor` should execute only `StorageProgram`.
 
-It should not switch on semantic layout ops. It should not know model-family
+It should not switch on model-family semantics. It should not know model-family
 concepts. It should not decide that QKV, MoE, or MXFP4 need special handling.
 
 Allowed responsibilities:
@@ -456,13 +450,12 @@ Acceptance criteria:
 
 Progress:
 
-- Done: the executor's top-level layout-op switch has been removed.
+- Done: the executor's top-level compatibility switch has been removed.
 - Done: extent writes and fused raw-read-plus-cast are scheduled storage
   instructions.
-- Done: algebra-only GPT-OSS MXFP4 plans compile through `StorageProgram`
-  without planner-op coverage.
-- In progress: all remaining transform payloads are being moved out of
-  planner-only compatibility ops and into typed storage/algebra payloads.
+- Done: GPT-OSS MXFP4 plans compile through `StorageProgram` without
+  compatibility metadata.
+- Done: transform payloads are represented as typed storage/algebra payloads.
 
 ### Phase 5: Generalize TileMap
 

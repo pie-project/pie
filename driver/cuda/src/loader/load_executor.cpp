@@ -823,7 +823,7 @@ const void* bf16_scale_ptr_for_int4_dequant(
     return bf16_scratch.data();
 }
 
-std::uint64_t dequantize_awq_to_output(
+DeviceTensor dequantize_awq_tensor(
     const ExecOp& op,
     const LayoutPlan& plan,
     WeightStoreBuilder& weights,
@@ -875,12 +875,10 @@ std::uint64_t dequantize_awq_to_output(
         checked_int_dim(size_n, exec_op_output(op)),
         source_spec.quant.group_size,
         /*stream=*/0);
-    const std::uint64_t bytes = out.nbytes();
-    weights.insert(exec_op_output(op), std::move(out), out_spec);
-    return bytes;
+    return out;
 }
 
-std::uint64_t dequantize_gptq_to_output(
+DeviceTensor dequantize_gptq_tensor(
     const ExecOp& op,
     const LayoutPlan& plan,
     WeightStoreBuilder& weights,
@@ -957,31 +955,29 @@ std::uint64_t dequantize_gptq_to_output(
         checked_int_dim(size_n, exec_op_output(op)),
         source_spec.quant.group_size,
         /*stream=*/0);
-    const std::uint64_t bytes = out.nbytes();
-    weights.insert(exec_op_output(op), std::move(out), out_spec);
-    return bytes;
+    return out;
 }
 
-std::uint64_t dequantize_to_output(
+DeviceTensor dequantize_to_tensor(
     const ExecOp& op,
     const LayoutPlan& plan,
-    WeightStoreBuilder& weights)
+    WeightStoreBuilder& weights,
+    const TensorDecl& out_spec)
 {
     if (exec_op_inputs(op).size() < 2) {
         throw std::runtime_error(
             "layout plan: Dequantize op for '" + exec_op_output(op) +
             "' requires weight and scale inputs");
     }
-    const TensorDecl& out_spec = tensor_spec_for(plan, exec_op_output(op));
     const TensorDecl* source_spec = find_tensor_spec(plan, exec_op_inputs(op)[0]);
     if (source_spec != nullptr &&
         source_spec->quant.format == QuantFormat::AwqInt4) {
-        return dequantize_awq_to_output(
+        return dequantize_awq_tensor(
             op, plan, weights, *source_spec, out_spec);
     }
     if (source_spec != nullptr &&
         source_spec->quant.format == QuantFormat::GptqInt4) {
-        return dequantize_gptq_to_output(
+        return dequantize_gptq_tensor(
             op, plan, weights, *source_spec, out_spec);
     }
 
@@ -1044,9 +1040,7 @@ std::uint64_t dequantize_to_output(
                 static_cast<int>(in_dim),
                 /*stream=*/0);
         }
-        const std::uint64_t bytes = out.nbytes();
-        weights.insert(exec_op_output(op), std::move(out), out_spec);
-        return bytes;
+        return out;
     }
 
     if (src.dtype() != DType::FP8_E4M3 || out_spec.dtype != DType::BF16) {
@@ -1131,9 +1125,59 @@ std::uint64_t dequantize_to_output(
         }
     }
 
+    return out;
+}
+
+std::uint64_t dequantize_to_output(
+    const ExecOp& op,
+    const LayoutPlan& plan,
+    WeightStoreBuilder& weights)
+{
+    const TensorDecl& out_spec = tensor_spec_for(plan, exec_op_output(op));
+    DeviceTensor out = dequantize_to_tensor(op, plan, weights, out_spec);
     const std::uint64_t bytes = out.nbytes();
     weights.insert(exec_op_output(op), std::move(out), out_spec);
     return bytes;
+}
+
+RuntimeQuantResult transcode_to_output(
+    const ExecOp& op,
+    const LayoutPlan& plan,
+    WeightStoreBuilder& weights,
+    NcclComm* tp_comm,
+    int tp_size)
+{
+    const TensorDecl& out_spec = tensor_spec_for(plan, exec_op_output(op));
+    if (out_spec.quant.format == QuantFormat::None) {
+        throw std::runtime_error(
+            "layout plan: Transcode output missing quant spec for '" +
+            exec_op_output(op) + "'");
+    }
+    TensorDecl decoded_spec = out_spec;
+    decoded_spec.name = exec_op_output(op) + ".__transcode_bf16";
+    decoded_spec.dtype = DType::BF16;
+    decoded_spec.layout = TensorLayoutKind::Dense;
+    decoded_spec.ownership = TensorOwnershipKind::Temporary;
+    decoded_spec.quant = {};
+
+    DeviceTensor decoded = dequantize_to_tensor(op, plan, weights, decoded_spec);
+    const std::uint64_t decoded_bytes = decoded.nbytes();
+    const std::string decoded_name = decoded_spec.name;
+    weights.insert(decoded_name, std::move(decoded), decoded_spec);
+
+    ExecOp encode_op = op;
+    encode_op.inputs = {decoded_name};
+    RuntimeQuantResult result;
+    try {
+        result = quantize_runtime_to_output(
+            encode_op, plan, weights, tp_comm, tp_size);
+    } catch (...) {
+        weights.erase(decoded_name);
+        throw;
+    }
+    weights.erase(decoded_name);
+    result.bytes_before = decoded_bytes;
+    return result;
 }
 
 std::uint64_t deinterleave_to_outputs(
@@ -1650,7 +1694,8 @@ ExecOp exec_op_for_instruction(
         const TileMap& tile = storage_program.tile_maps[instr.tile_map_index];
         op.inputs = tile.inputs;
         op.output_name = tile.output_name;
-        op.secondary_output_name.clear();
+        op.secondary_output_name =
+            instr.outputs.size() > 1 ? instr.outputs[1] : std::string{};
     }
 
     if (const auto* slice =
@@ -1696,12 +1741,14 @@ ExecOp exec_op_for_instruction(
     return op;
 }
 
-std::uint64_t execute_tile_map_instruction(
+RuntimeQuantResult execute_tile_map_instruction(
     const LayoutPlan& plan,
     const StorageProgram& storage_program,
     const StorageInstr& instr,
     CheckpointByteSource& byte_source,
-    WeightStoreBuilder& weights)
+    WeightStoreBuilder& weights,
+    NcclComm* tp_comm,
+    int tp_size)
 {
     if (instr.tile_map_index >= storage_program.tile_maps.size()) {
         throw std::runtime_error(
@@ -1709,15 +1756,18 @@ std::uint64_t execute_tile_map_instruction(
     }
     const TileMap& tile = storage_program.tile_maps[instr.tile_map_index];
     if (!instr.extent_write_indices.empty()) {
-        return materialize_tile_raw_cast(
+        RuntimeQuantResult result;
+        result.bytes_after = materialize_tile_raw_cast(
             tile,
             extent_writes_for_instruction(storage_program, instr),
             plan,
             byte_source,
             weights,
             tile.tile_bytes);
+        return result;
     }
 
+    RuntimeQuantResult result;
     switch (tile.kind) {
     case TileMapKind::Cast: {
         if (tile.inputs.size() != 1) {
@@ -1727,13 +1777,21 @@ std::uint64_t execute_tile_map_instruction(
         }
         const TensorDecl& out_spec = tensor_spec_for(plan, tile.output_name);
         cast_tensor_to_output(weights.get(tile.inputs.front()), weights, out_spec);
-        return weights.get(tile.output_name).nbytes();
+        result.bytes_after = weights.get(tile.output_name).nbytes();
+        return result;
     }
     case TileMapKind::Decode:
-        return dequantize_to_output(
+        result.bytes_after = dequantize_to_output(
             exec_op_for_instruction(storage_program, instr), plan, weights);
+        return result;
     case TileMapKind::Encode:
+        return quantize_runtime_to_output(
+            exec_op_for_instruction(storage_program, instr),
+            plan, weights, tp_comm, tp_size);
     case TileMapKind::Transcode:
+        return transcode_to_output(
+            exec_op_for_instruction(storage_program, instr),
+            plan, weights, tp_comm, tp_size);
     case TileMapKind::Reblock:
     case TileMapKind::Reorder:
         throw std::runtime_error(
@@ -1928,8 +1986,21 @@ LoadExecutionStats LoadExecutor::run(const LayoutPlan& plan)
         case StorageInstrKind::ExtentWrite:
             break;
         case StorageInstrKind::TileMap:
-            result.loaded_bytes += execute_tile_map_instruction(
-                plan, *storage_program_, instr, byte_source, builder_);
+            {
+                const RuntimeQuantResult qr = execute_tile_map_instruction(
+                    plan, *storage_program_, instr, byte_source, builder_,
+                    tp_comm_, tp_size_);
+                result.loaded_bytes += qr.bytes_after;
+                if (qr.bytes_before != 0 || qr.bytes_after != 0) {
+                    const auto& tile =
+                        storage_program_->tile_maps[instr.tile_map_index];
+                    if (tile.kind == TileMapKind::Encode) {
+                        result.runtime_quantized_weights += 1;
+                        result.runtime_quant_bytes_before += qr.bytes_before;
+                        result.runtime_quant_bytes_after += qr.bytes_after;
+                    }
+                }
+            }
             break;
         case StorageInstrKind::Transform: {
             const RuntimeQuantResult qr = execute_transform_instruction(

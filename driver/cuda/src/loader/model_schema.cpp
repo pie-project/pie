@@ -150,6 +150,21 @@ LayoutExprId source_expr(
     return add_expr(plan, std::move(expr));
 }
 
+LayoutExprId source_expr_from_info(
+    LayoutPlan& plan,
+    const std::string& raw_name,
+    const TensorInfo& info)
+{
+    TensorDecl decl;
+    decl.name = raw_name;
+    decl.dtype = info.dtype;
+    decl.shape = info.shape;
+    decl.layout = TensorLayoutKind::Dense;
+    decl.ownership = TensorOwnershipKind::Temporary;
+    decl.parallel = TensorParallelKind::Replicated;
+    return source_expr(plan, raw_name, std::move(decl));
+}
+
 LayoutExprId partition_expr(
     LayoutPlan& plan,
     LayoutExprId input,
@@ -213,6 +228,97 @@ LayoutExprId source_realize_expr(
     return realize_expr(plan, output_name, expr, std::move(decl));
 }
 
+LayoutExprId source_realize_expr_from_info(
+    LayoutPlan& plan,
+    const std::string& raw_name,
+    const TensorInfo& info,
+    const std::string& output_name,
+    int shard_axis,
+    int tp_size)
+{
+    TensorDecl decl = tensor_decl_for(plan, output_name);
+    LayoutExprId expr = source_expr_from_info(plan, raw_name, info);
+    expr = partition_expr(plan, expr, decl, shard_axis, tp_size);
+    return realize_expr(plan, output_name, expr, std::move(decl));
+}
+
+LayoutExprId row_range_realize_expr_from_info(
+    LayoutPlan& plan,
+    const std::string& raw_name,
+    const TensorInfo& info,
+    const std::string& output_name,
+    std::int64_t row_offset,
+    std::int64_t rows,
+    int tp_size)
+{
+    TensorDecl output_decl = tensor_decl_for(plan, output_name);
+    LayoutExprId expr = source_expr_from_info(plan, raw_name, info);
+    TensorDecl selected_decl = output_decl;
+    selected_decl.shape[0] = rows;
+    LayoutExpr select = make_expr(LayoutExprKind::Select, selected_decl);
+    select.inputs = {expr};
+    select.axis = 0;
+    select.start = row_offset;
+    select.length = rows;
+    const LayoutExprId selected = add_expr(plan, std::move(select));
+    LayoutExprId value = selected;
+    if (tp_size > 1) {
+        value = partition_expr(
+            plan, selected, output_decl, 0, tp_size);
+    }
+    return realize_expr(plan, output_name, value, std::move(output_decl));
+}
+
+LayoutExprId cast_realize_expr(
+    LayoutPlan& plan,
+    const std::string& output_name,
+    LayoutExprId input)
+{
+    TensorDecl decl = tensor_decl_for(plan, output_name);
+    LayoutExpr cast = make_expr(LayoutExprKind::Cast, decl);
+    cast.inputs = {input};
+    cast.runtime_name = output_name;
+    const LayoutExprId casted = add_expr(plan, std::move(cast));
+    return realize_expr(plan, output_name, casted, std::move(decl));
+}
+
+LayoutExprId encode_realize_expr(
+    LayoutPlan& plan,
+    const std::string& output_name,
+    const std::string& secondary_output_name,
+    LayoutExprId input)
+{
+    TensorDecl decl = tensor_decl_for(plan, output_name);
+    LayoutExpr encode = make_expr(LayoutExprKind::Encode, decl);
+    encode.inputs = {input};
+    encode.runtime_name = output_name;
+    encode.secondary_runtime_name = secondary_output_name;
+    const LayoutExprId encoded = add_expr(plan, std::move(encode));
+    return realize_expr(plan, output_name, encoded, std::move(decl));
+}
+
+LayoutExprId reorder_realize_expr(
+    LayoutPlan& plan,
+    const std::string& output_name,
+    const std::string& secondary_output_name,
+    std::vector<LayoutExprId> inputs,
+    int shard_axis)
+{
+    TensorDecl decl = tensor_decl_for(plan, output_name);
+    LayoutExpr reorder = make_expr(LayoutExprKind::Reorder, decl);
+    reorder.inputs = std::move(inputs);
+    reorder.runtime_name = output_name;
+    reorder.secondary_runtime_name = secondary_output_name;
+    reorder.axis = shard_axis;
+    const LayoutExprId reordered = add_expr(plan, std::move(reorder));
+    realize_expr(plan, output_name, reordered, decl);
+    if (!secondary_output_name.empty()) {
+        TensorDecl secondary_decl = tensor_decl_for(plan, secondary_output_name);
+        realize_expr(plan, secondary_output_name, reordered, std::move(secondary_decl));
+    }
+    return reordered;
+}
+
 LayoutExprId decode_realize_expr(
     LayoutPlan& plan,
     const std::string& output_name,
@@ -266,6 +372,82 @@ void release_expr(LayoutPlan& plan, std::string name, std::vector<LayoutExprId> 
     (void)add_expr(plan, std::move(release));
 }
 
+std::uint64_t tensor_nbytes(
+    DType dtype,
+    const std::vector<std::int64_t>& shape);
+bool normalizes_to_bf16(DType dtype) noexcept;
+void estimate_temporary_bytes(LayoutPlan& plan, std::uint64_t bytes);
+
+LayoutExprId add_owned_source_tensor(
+    LayoutPlan& plan,
+    const std::string& raw_name,
+    const std::string& output_name,
+    const TensorInfo& info,
+    const std::vector<std::int64_t>& shape,
+    TensorLayoutKind layout,
+    TensorParallelKind parallel,
+    int shard_axis,
+    int tp_size)
+{
+    if (!normalizes_to_bf16(info.dtype) || ends_with(output_name, "_scale_inv")) {
+        register_tensor_spec(
+            plan, output_name, info.dtype, shape, layout,
+            TensorOwnershipKind::Owned, parallel);
+        return source_realize_expr_from_info(
+            plan, raw_name, info, output_name, shard_axis, tp_size);
+    }
+
+    const std::string tmp_name = output_name + ".__dtype_source";
+    register_tensor_spec(
+        plan, tmp_name, info.dtype, shape, layout,
+        TensorOwnershipKind::Temporary, parallel);
+    const LayoutExprId tmp = source_realize_expr_from_info(
+        plan, raw_name, info, tmp_name, shard_axis, tp_size);
+
+    register_tensor_spec(
+        plan, output_name, DType::BF16, shape, layout,
+        TensorOwnershipKind::Owned, parallel);
+    const LayoutExprId out = cast_realize_expr(plan, output_name, tmp);
+    release_expr(plan, tmp_name + ".__drop", {tmp});
+    estimate_temporary_bytes(plan, tensor_nbytes(info.dtype, shape));
+    return out;
+}
+
+LayoutExprId add_owned_row_range_tensor(
+    LayoutPlan& plan,
+    const std::string& raw_name,
+    const std::string& output_name,
+    const TensorInfo& info,
+    std::int64_t row_offset,
+    std::int64_t rows,
+    const std::vector<std::int64_t>& shape,
+    TensorLayoutKind layout,
+    TensorParallelKind parallel,
+    int tp_size)
+{
+    if (!normalizes_to_bf16(info.dtype) || ends_with(output_name, "_scale_inv")) {
+        register_tensor_spec(
+            plan, output_name, info.dtype, shape, layout,
+            TensorOwnershipKind::Owned, parallel);
+        return row_range_realize_expr_from_info(
+            plan, raw_name, info, output_name, row_offset, rows, tp_size);
+    }
+
+    const std::string tmp_name = output_name + ".__dtype_source";
+    register_tensor_spec(
+        plan, tmp_name, info.dtype, shape, layout,
+        TensorOwnershipKind::Temporary, parallel);
+    const LayoutExprId tmp = row_range_realize_expr_from_info(
+        plan, raw_name, info, tmp_name, row_offset, rows, tp_size);
+    register_tensor_spec(
+        plan, output_name, DType::BF16, shape, layout,
+        TensorOwnershipKind::Owned, parallel);
+    const LayoutExprId out = cast_realize_expr(plan, output_name, tmp);
+    release_expr(plan, tmp_name + ".__drop", {tmp});
+    estimate_temporary_bytes(plan, tensor_nbytes(info.dtype, shape));
+    return out;
+}
+
 void register_tensor_contract(
     LayoutPlan& plan,
     RuntimeTensorContract contract)
@@ -298,43 +480,6 @@ bool normalizes_to_bf16(DType dtype) noexcept {
     return dtype == DType::FP16 || dtype == DType::FP32;
 }
 
-void add_owned_producer(
-    LayoutPlan& plan,
-    LayoutOp producer,
-    const std::string& output_name,
-    DType source_dtype,
-    const std::vector<std::int64_t>& shape,
-    TensorLayoutKind layout,
-    TensorParallelKind parallel)
-{
-    if (!normalizes_to_bf16(source_dtype) || ends_with(output_name, "_scale_inv")) {
-        set_layout_op_output(producer, output_name);
-        plan.ops.push_back(std::move(producer));
-        register_tensor_spec(
-            plan, output_name, source_dtype, shape, layout,
-            TensorOwnershipKind::Owned, parallel);
-        return;
-    }
-
-    const std::string tmp_name = output_name + ".__dtype_source";
-    set_layout_op_output(producer, tmp_name);
-    plan.ops.push_back(std::move(producer));
-
-    register_tensor_spec(
-        plan, tmp_name, source_dtype, shape, layout,
-        TensorOwnershipKind::Temporary, parallel);
-    register_tensor_spec(
-        plan, output_name, DType::BF16, shape, layout,
-        TensorOwnershipKind::Owned, parallel);
-
-    plan.ops.push_back(make_tensor_op(
-        LayoutOpKind::Cast, output_name, {tmp_name}));
-    plan.ops.push_back(make_tensor_op(
-        LayoutOpKind::Drop, tmp_name + ".__drop", {tmp_name}));
-
-    estimate_temporary_bytes(plan, tensor_nbytes(source_dtype, shape));
-}
-
 bool try_add_packed_axis_group(
     LayoutPlan& plan,
     const CheckpointSource& loader,
@@ -364,22 +509,28 @@ bool try_add_packed_axis_group(
             : RuntimeProjectionPackKind::MlpGateUpRows,
         group.runtime_base);
     const std::string& packed_name = packed.storage_name;
-    std::vector<TensorSourceRef> sources;
-    sources.reserve(expected);
-    for (std::size_t i = 0; i < expected; ++i) {
-        sources.push_back({group.raw_names[i], group.runtime_names[i]});
-    }
-
-    plan.ops.push_back(make_axis_concat_op(
-        packed_name, /*shard_axis=*/0, std::move(sources)));
-    ++plan.axis_concat_groups;
 
     std::int64_t rows = 0;
     std::int64_t cols = -1;
+    std::vector<LayoutExprId> inputs;
+    inputs.reserve(expected);
     for (std::size_t i = 0; i < expected; ++i) {
         const auto& info = loader.info(group.raw_names[i]);
         if (cols < 0) cols = info.shape[1];
-        rows += info.shape[0] / tp_size;
+        const auto local_shape = sharded_shape(
+            info.shape, 0, tp_size, group.raw_names[i]);
+        rows += local_shape[0];
+        TensorDecl local_decl;
+        local_decl.name = group.runtime_names[i];
+        local_decl.dtype = info.dtype;
+        local_decl.shape = local_shape;
+        local_decl.layout = TensorLayoutKind::Dense;
+        local_decl.ownership = TensorOwnershipKind::Owned;
+        local_decl.parallel = TensorParallelKind::Column;
+        LayoutExprId expr = source_expr_from_info(
+            plan, group.raw_names[i], info);
+        expr = partition_expr(plan, expr, local_decl, 0, tp_size);
+        inputs.push_back(expr);
     }
 
     register_tensor_contract(
@@ -391,18 +542,43 @@ bool try_add_packed_axis_group(
             packed.storage_layout,
             TensorOwnershipKind::Owned,
             TensorParallelKind::Column));
+    TensorDecl packed_decl = tensor_decl_for(plan, packed_name);
+    LayoutExpr join = make_expr(LayoutExprKind::Join, packed_decl);
+    join.inputs = std::move(inputs);
+    join.axis = 0;
+    const LayoutExprId joined = add_expr(plan, std::move(join));
+    realize_expr(plan, packed_name, joined, packed_decl);
+
     for (std::size_t i = 0; i < expected; ++i) {
         const auto& info = loader.info(group.raw_names[i]);
+        const auto local_shape = sharded_shape(
+            info.shape, 0, tp_size, group.runtime_names[i]);
         register_tensor_contract(
             plan,
             runtime_abi.view_contract(
                 group.runtime_names[i],
                 info.dtype,
-                {info.shape[0] / tp_size, info.shape[1]},
+                local_shape,
                 packed_name,
                 TensorParallelKind::Column));
+        TensorDecl view_decl = tensor_decl_for(plan, group.runtime_names[i]);
+        LayoutExpr view = make_expr(LayoutExprKind::View, view_decl);
+        view.inputs = {joined};
+        view.runtime_name = group.runtime_names[i];
+        view.axis = 0;
+        view.start = i == 0 ? 0 : 0;
+        for (std::size_t j = 0; j < i; ++j) {
+            view.start += loader.info(group.raw_names[j]).shape[0] / tp_size;
+        }
+        view.length = local_shape[0];
+        const LayoutExprId view_root = add_expr(plan, std::move(view));
+        plan.algebra.bindings.push_back(LayoutBinding{
+            .runtime_name = group.runtime_names[i],
+            .root = view_root,
+        });
         consumed_raw.insert(group.raw_names[i]);
     }
+    ++plan.axis_concat_groups;
     return true;
 }
 
@@ -478,12 +654,10 @@ bool try_add_row_range_split_group(
         }
         const std::string& output_name =
             group_runtime_name_for_role(group, part.role);
-        LayoutOp op = make_row_range_shard_op(
-            /*output_name=*/{}, raw_name, part.offset, part.rows);
-        add_owned_producer(
-            plan, std::move(op), output_name, info.dtype,
+        add_owned_row_range_tensor(
+            plan, raw_name, output_name, info, part.offset, part.rows,
             {part.rows / tp_size, info.shape[1]},
-            TensorLayoutKind::Dense, TensorParallelKind::Column);
+            TensorLayoutKind::Dense, TensorParallelKind::Column, tp_size);
     }
 
     consumed_raw.insert(raw_name);
@@ -494,12 +668,11 @@ void add_copy(LayoutPlan& plan, const std::string& raw_name,
               const std::string& output_name, const TensorInfo& info,
               int shard_axis, int tp_size)
 {
-    LayoutOp op = make_raw_load_op(
-        LayoutOpKind::Copy, /*output_name=*/{}, raw_name, shard_axis);
-    add_owned_producer(
-        plan, std::move(op), output_name, info.dtype,
+    add_owned_source_tensor(
+        plan, raw_name, output_name, info,
         sharded_shape(info.shape, shard_axis, tp_size, output_name),
-        TensorLayoutKind::Dense, parallel_kind_from_axis(shard_axis));
+        TensorLayoutKind::Dense, parallel_kind_from_axis(shard_axis),
+        shard_axis, tp_size);
 }
 
 bool runtime_quant_model_supported(const std::string& mt) {
@@ -566,8 +739,6 @@ void add_runtime_quantized_copy(
 
     const std::string tmp_name =
         semantic.runtime_name + ".__runtime_quant_source";
-    plan.ops.push_back(make_raw_load_op(
-        LayoutOpKind::Copy, tmp_name, semantic.raw_name, shard_axis));
 
     auto final_shape =
         sharded_shape(info.shape, shard_axis, tp_size, semantic.runtime_name);
@@ -584,6 +755,8 @@ void add_runtime_quantized_copy(
         plan, tmp_name, info.dtype, final_shape,
         TensorLayoutKind::Dense, TensorOwnershipKind::Temporary,
         parallel);
+    const LayoutExprId source = source_realize_expr_from_info(
+        plan, semantic.raw_name, info, tmp_name, shard_axis, tp_size);
 
     QuantSpec quant;
     quant.format = q_format;
@@ -601,13 +774,10 @@ void add_runtime_quantized_copy(
         TensorLayoutKind::Dense, TensorOwnershipKind::Owned,
         parallel);
 
-    plan.ops.push_back(make_tensor_op(
-        LayoutOpKind::QuantizeRuntime, semantic.runtime_name,
-        {tmp_name}, scale_name));
-    plan.ops.push_back(make_tensor_op(
-        LayoutOpKind::AttachMetadata, semantic.runtime_name));
-    plan.ops.push_back(make_tensor_op(
-        LayoutOpKind::Drop, tmp_name + ".__drop", {tmp_name}));
+    const LayoutExprId encoded = encode_realize_expr(
+        plan, semantic.runtime_name, scale_name, source);
+    (void)attach_metadata_expr(plan, semantic.runtime_name, encoded);
+    release_expr(plan, tmp_name + ".__drop", {source});
 
     std::uint64_t source_numel = 1;
     for (const auto dim : final_shape) {
@@ -725,50 +895,42 @@ bool try_add_compressed_fp8_weight(
         quant.channel_axis = 0;
         quant.scale_tensor = scale_name;
 
-        plan.ops.push_back(make_raw_load_op(
-            LayoutOpKind::Copy, semantic.runtime_name,
-            semantic.raw_name, shard_axis));
         register_tensor_spec(
             plan, semantic.runtime_name, DType::FP8_E4M3, final_shape,
             TensorLayoutKind::QuantPacked, TensorOwnershipKind::Owned,
             parallel_kind_from_axis(shard_axis),
             /*backing_tensor=*/{}, std::move(quant));
+        const LayoutExprId weight = source_realize_expr_from_info(
+            plan, semantic.raw_name, info, semantic.runtime_name,
+            shard_axis, tp_size);
 
         register_tensor_spec(
             plan, scale_name, DType::FP32, scale_shape,
             TensorLayoutKind::Dense, TensorOwnershipKind::Owned,
             parallel_kind_from_axis(scale_axis));
         if (scale_info.dtype == DType::FP32) {
-            plan.ops.push_back(make_raw_load_op(
-                LayoutOpKind::Copy, scale_name, scale_raw, scale_axis));
+            (void)source_realize_expr_from_info(
+                plan, scale_raw, scale_info, scale_name, scale_axis, tp_size);
         } else {
             const std::string scale_tmp = scale_name + ".__source";
-            plan.ops.push_back(make_raw_load_op(
-                LayoutOpKind::Copy, scale_tmp, scale_raw, scale_axis));
 
             register_tensor_spec(
                 plan, scale_tmp, scale_info.dtype, scale_shape,
                 TensorLayoutKind::Dense, TensorOwnershipKind::Temporary,
                 parallel_kind_from_axis(scale_axis));
+            const LayoutExprId tmp = source_realize_expr_from_info(
+                plan, scale_raw, scale_info, scale_tmp, scale_axis, tp_size);
 
-            plan.ops.push_back(make_tensor_op(
-                LayoutOpKind::Cast, scale_name, {scale_tmp}));
-            plan.ops.push_back(make_tensor_op(
-                LayoutOpKind::Drop, scale_tmp + ".__drop", {scale_tmp}));
+            (void)cast_realize_expr(plan, scale_name, tmp);
+            release_expr(plan, scale_tmp + ".__drop", {tmp});
         }
 
-        plan.ops.push_back(make_tensor_op(
-            LayoutOpKind::AttachMetadata, semantic.runtime_name));
+        (void)attach_metadata_expr(plan, semantic.runtime_name, weight);
     } else {
         const std::string weight_tmp =
             semantic.runtime_name + ".__compressed_fp8_source";
         const std::string scale_tmp =
             semantic.runtime_name + ".__compressed_fp8_scale";
-
-        plan.ops.push_back(make_raw_load_op(
-            LayoutOpKind::Copy, weight_tmp, semantic.raw_name, shard_axis));
-        plan.ops.push_back(make_raw_load_op(
-            LayoutOpKind::Copy, scale_tmp, scale_raw, scale_axis));
 
         register_tensor_spec(
             plan, weight_tmp, DType::FP8_E4M3, final_shape,
@@ -784,13 +946,15 @@ bool try_add_compressed_fp8_weight(
             TensorLayoutKind::Dense, TensorOwnershipKind::Owned,
             parallel_kind_from_axis(shard_axis));
 
-        plan.ops.push_back(make_tensor_op(
-            LayoutOpKind::Dequantize, semantic.runtime_name,
-            {weight_tmp, scale_tmp}));
-        plan.ops.push_back(make_tensor_op(
-            LayoutOpKind::Drop,
-            semantic.runtime_name + ".__compressed_fp8_drop",
-            {weight_tmp, scale_tmp}));
+        const LayoutExprId weight = source_realize_expr_from_info(
+            plan, semantic.raw_name, info, weight_tmp, shard_axis, tp_size);
+        const LayoutExprId scale = source_realize_expr_from_info(
+            plan, scale_raw, scale_info, scale_tmp, scale_axis, tp_size);
+        (void)decode_realize_expr(
+            plan, semantic.runtime_name, {weight, scale});
+        release_expr(
+            plan, semantic.runtime_name + ".__compressed_fp8_drop",
+            {weight, scale});
 
         std::uint64_t source_numel = 1;
         for (const auto dim : final_shape) {
@@ -863,11 +1027,6 @@ bool try_add_fp8_scale_inv_weight(
     const std::string scale_tmp =
         semantic.runtime_name + ".__fp8_scale_inv_scale";
 
-    plan.ops.push_back(make_raw_load_op(
-        LayoutOpKind::Copy, weight_tmp, semantic.raw_name, shard_axis));
-    plan.ops.push_back(make_raw_load_op(
-        LayoutOpKind::Copy, scale_tmp, scale_raw, scale_axis));
-
     register_tensor_spec(
         plan, weight_tmp, DType::FP8_E4M3, final_shape,
         TensorLayoutKind::Dense, TensorOwnershipKind::Temporary,
@@ -881,13 +1040,14 @@ bool try_add_fp8_scale_inv_weight(
         TensorLayoutKind::Dense, TensorOwnershipKind::Owned,
         parallel_kind_from_axis(shard_axis));
 
-    plan.ops.push_back(make_tensor_op(
-        LayoutOpKind::Dequantize, semantic.runtime_name,
-        {weight_tmp, scale_tmp}));
-    plan.ops.push_back(make_tensor_op(
-        LayoutOpKind::Drop,
-        semantic.runtime_name + ".__fp8_scale_inv_drop",
-        {weight_tmp, scale_tmp}));
+    const LayoutExprId weight = source_realize_expr_from_info(
+        plan, semantic.raw_name, info, weight_tmp, shard_axis, tp_size);
+    const LayoutExprId scale = source_realize_expr_from_info(
+        plan, scale_raw, scale_info, scale_tmp, scale_axis, tp_size);
+    (void)decode_realize_expr(plan, semantic.runtime_name, {weight, scale});
+    release_expr(
+        plan, semantic.runtime_name + ".__fp8_scale_inv_drop",
+        {weight, scale});
 
     estimate_temporary_bytes(
         plan,
@@ -967,40 +1127,37 @@ bool try_add_compressed_int8_weight(
     quant.channel_axis = 0;
     quant.scale_tensor = scale_name;
 
-    plan.ops.push_back(make_raw_load_op(
-        LayoutOpKind::Copy, semantic.runtime_name,
-        semantic.raw_name, shard_axis));
     register_tensor_spec(
         plan, semantic.runtime_name, DType::INT8, final_shape,
         TensorLayoutKind::QuantPacked, TensorOwnershipKind::Owned,
         parallel_kind_from_axis(shard_axis),
         /*backing_tensor=*/{}, std::move(quant));
+    const LayoutExprId weight = source_realize_expr_from_info(
+        plan, semantic.raw_name, info, semantic.runtime_name,
+        shard_axis, tp_size);
 
     register_tensor_spec(
         plan, scale_name, DType::FP32, scale_shape,
         TensorLayoutKind::Dense, TensorOwnershipKind::Owned,
         parallel_kind_from_axis(scale_axis));
     if (scale_info.dtype == DType::FP32) {
-        plan.ops.push_back(make_raw_load_op(
-            LayoutOpKind::Copy, scale_name, scale_raw, scale_axis));
+        (void)source_realize_expr_from_info(
+            plan, scale_raw, scale_info, scale_name, scale_axis, tp_size);
     } else {
         const std::string scale_tmp = scale_name + ".__source";
-        plan.ops.push_back(make_raw_load_op(
-            LayoutOpKind::Copy, scale_tmp, scale_raw, scale_axis));
 
         register_tensor_spec(
             plan, scale_tmp, scale_info.dtype, scale_shape,
             TensorLayoutKind::Dense, TensorOwnershipKind::Temporary,
             parallel_kind_from_axis(scale_axis));
+        const LayoutExprId tmp = source_realize_expr_from_info(
+            plan, scale_raw, scale_info, scale_tmp, scale_axis, tp_size);
 
-        plan.ops.push_back(make_tensor_op(
-            LayoutOpKind::Cast, scale_name, {scale_tmp}));
-        plan.ops.push_back(make_tensor_op(
-            LayoutOpKind::Drop, scale_tmp + ".__drop", {scale_tmp}));
+        (void)cast_realize_expr(plan, scale_name, tmp);
+        release_expr(plan, scale_tmp + ".__drop", {tmp});
     }
 
-    plan.ops.push_back(make_tensor_op(
-        LayoutOpKind::AttachMetadata, semantic.runtime_name));
+    (void)attach_metadata_expr(plan, semantic.runtime_name, weight);
     return true;
 }
 
@@ -1143,22 +1300,6 @@ void add_awq_marlin_repack_ops(
     const std::string tmp_qz = canonical_w + ".__awq_qzeros";
     const std::string tmp_scales = canonical_w + ".__awq_scales";
 
-    plan.ops.push_back(make_raw_load_op(
-        LayoutOpKind::Copy, tmp_qw, raw_qweight, shard_plan.qweight_axis));
-    plan.ops.push_back(make_raw_load_op(
-        LayoutOpKind::Copy, tmp_qz, raw_qzeros, shard_plan.qzeros_axis));
-    plan.ops.push_back(make_raw_load_op(
-        LayoutOpKind::Copy, tmp_scales, raw_scales, shard_plan.scale_axis));
-    plan.ops.push_back(make_tensor_op(
-        LayoutOpKind::RepackLayout, canonical_w,
-        {tmp_qw, tmp_qz, tmp_scales}, canonical_s,
-        shard_plan.canonical_axis));
-    plan.ops.push_back(make_tensor_op(
-        LayoutOpKind::AttachMetadata, canonical_w));
-    plan.ops.push_back(make_tensor_op(
-        LayoutOpKind::Drop, canonical_w + ".__drop_awq_sources",
-        {tmp_qw, tmp_qz, tmp_scales}));
-
     register_tensor_spec(
         plan, tmp_qw, qweight_info.dtype, local_qweight_shape,
         TensorLayoutKind::Dense, TensorOwnershipKind::Temporary,
@@ -1194,6 +1335,22 @@ void add_awq_marlin_repack_ops(
         plan, canonical_z, DType::INT32, local_qzeros_shape,
         TensorLayoutKind::Dense, TensorOwnershipKind::Owned,
         shard_plan.parallel);
+    const LayoutExprId qw = source_realize_expr_from_info(
+        plan, raw_qweight, qweight_info, tmp_qw,
+        shard_plan.qweight_axis, tp_size);
+    const LayoutExprId qz = source_realize_expr_from_info(
+        plan, raw_qzeros, qzeros_info, tmp_qz,
+        shard_plan.qzeros_axis, tp_size);
+    const LayoutExprId scales = source_realize_expr_from_info(
+        plan, raw_scales, scale_info, tmp_scales,
+        shard_plan.scale_axis, tp_size);
+    const LayoutExprId packed = reorder_realize_expr(
+        plan, canonical_w, canonical_s, {qw, qz, scales},
+        shard_plan.canonical_axis);
+    (void)attach_metadata_expr(plan, canonical_w, packed);
+    release_expr(
+        plan, canonical_w + ".__drop_awq_sources",
+        {qw, qz, scales});
     estimate_temporary_bytes(
         plan,
         tensor_nbytes(qweight_info.dtype, local_qweight_shape) +
@@ -1336,22 +1493,6 @@ bool try_add_gptq_marlin_repack_weight(
     const std::string tmp_qw = canonical_w + ".__gptq_qweight";
     const std::string tmp_scales = canonical_w + ".__gptq_scales";
 
-    plan.ops.push_back(make_raw_load_op(
-        LayoutOpKind::Copy, tmp_qw, semantic.raw_name,
-        shard_plan.qweight_axis));
-    plan.ops.push_back(make_raw_load_op(
-        LayoutOpKind::Copy, tmp_scales, raw_scales,
-        shard_plan.scale_axis));
-    plan.ops.push_back(make_tensor_op(
-        LayoutOpKind::RepackLayout, canonical_w,
-        {tmp_qw, tmp_scales}, canonical_s,
-        shard_plan.canonical_axis));
-    plan.ops.push_back(make_tensor_op(
-        LayoutOpKind::AttachMetadata, canonical_w));
-    plan.ops.push_back(make_tensor_op(
-        LayoutOpKind::Drop, canonical_w + ".__drop_gptq_sources",
-        {tmp_qw, tmp_scales}));
-
     register_tensor_spec(
         plan, tmp_qw, info.dtype, local_qweight_shape,
         TensorLayoutKind::Dense, TensorOwnershipKind::Temporary,
@@ -1378,6 +1519,19 @@ bool try_add_gptq_marlin_repack_weight(
         plan, canonical_s, DType::BF16, local_scale_shape,
         TensorLayoutKind::Dense, TensorOwnershipKind::Owned,
         shard_plan.parallel);
+    const LayoutExprId qw = source_realize_expr_from_info(
+        plan, semantic.raw_name, info, tmp_qw,
+        shard_plan.qweight_axis, tp_size);
+    const LayoutExprId scales = source_realize_expr_from_info(
+        plan, raw_scales, scale_info, tmp_scales,
+        shard_plan.scale_axis, tp_size);
+    const LayoutExprId packed = reorder_realize_expr(
+        plan, canonical_w, canonical_s, {qw, scales},
+        shard_plan.canonical_axis);
+    (void)attach_metadata_expr(plan, canonical_w, packed);
+    release_expr(
+        plan, canonical_w + ".__drop_gptq_sources",
+        {qw, scales});
     estimate_temporary_bytes(
         plan,
         tensor_nbytes(info.dtype, local_qweight_shape) +
@@ -1475,18 +1629,8 @@ void add_int4_dequant_ops(
     const std::string tmp_gidx =
         canonical_w + ".__" + quant_prefix + "_g_idx";
 
-    plan.ops.push_back(make_raw_load_op(
-        LayoutOpKind::Copy, tmp_qw, raw_qweight,
-        shard_plan.qweight_axis));
-    plan.ops.push_back(make_raw_load_op(
-        LayoutOpKind::Copy, tmp_qz, raw_qzeros,
-        shard_plan.qzeros_axis));
-    plan.ops.push_back(make_raw_load_op(
-        LayoutOpKind::Copy, tmp_scales, raw_scales,
-        shard_plan.scale_axis));
-
-    std::vector<std::string> dequant_inputs = {tmp_qw, tmp_qz, tmp_scales};
-    std::vector<std::string> drop_inputs = dequant_inputs;
+    std::vector<LayoutExprId> dequant_inputs;
+    std::vector<LayoutExprId> drop_inputs;
     if (gidx_info != nullptr) {
         const auto local_gidx_shape = sharded_shape(
             gidx_info->shape, shard_plan.gidx_axis, tp_size, raw_gidx);
@@ -1496,26 +1640,11 @@ void add_int4_dequant_ops(
                 raw_qweight + "'");
         }
 
-        plan.ops.push_back(make_raw_load_op(
-            LayoutOpKind::Copy, tmp_gidx, raw_gidx,
-            shard_plan.gidx_axis));
-        dequant_inputs.push_back(tmp_gidx);
-        drop_inputs.push_back(tmp_gidx);
-
         register_tensor_spec(
             plan, tmp_gidx, gidx_info->dtype, local_gidx_shape,
             TensorLayoutKind::Dense, TensorOwnershipKind::Temporary,
             shard_plan.parallel);
     }
-
-    plan.ops.push_back(make_tensor_op(
-        LayoutOpKind::Dequantize, canonical_w,
-        std::move(dequant_inputs), /*secondary_output_name=*/{},
-        shard_plan.canonical_axis));
-    plan.ops.push_back(make_tensor_op(
-        LayoutOpKind::Drop,
-        canonical_w + ".__drop_" + quant_prefix + "_sources",
-        std::move(drop_inputs)));
 
     QuantSpec source_quant;
     source_quant.format = quant_format;
@@ -1541,6 +1670,30 @@ void add_int4_dequant_ops(
         plan, canonical_w, DType::BF16, {n_local, k_local},
         TensorLayoutKind::Dense, TensorOwnershipKind::Owned,
         shard_plan.parallel);
+
+    const LayoutExprId qw = source_realize_expr_from_info(
+        plan, raw_qweight, qweight_info, tmp_qw,
+        shard_plan.qweight_axis, tp_size);
+    const LayoutExprId qz = source_realize_expr_from_info(
+        plan, raw_qzeros, qzeros_info, tmp_qz,
+        shard_plan.qzeros_axis, tp_size);
+    const LayoutExprId scales = source_realize_expr_from_info(
+        plan, raw_scales, scale_info, tmp_scales,
+        shard_plan.scale_axis, tp_size);
+    dequant_inputs = {qw, qz, scales};
+    drop_inputs = dequant_inputs;
+    if (gidx_info != nullptr) {
+        const LayoutExprId gidx = source_realize_expr_from_info(
+            plan, raw_gidx, *gidx_info, tmp_gidx,
+            shard_plan.gidx_axis, tp_size);
+        dequant_inputs.push_back(gidx);
+        drop_inputs.push_back(gidx);
+    }
+    (void)decode_realize_expr(
+        plan, canonical_w, std::move(dequant_inputs));
+    release_expr(
+        plan, canonical_w + ".__drop_" + quant_prefix + "_sources",
+        std::move(drop_inputs));
 
     const std::uint64_t scale_cast_scratch =
         scale_info.dtype == DType::BF16
@@ -1848,7 +2001,7 @@ bool try_add_per_expert_moe_fusion(
             group.runtime_base + "'");
     }
 
-    std::vector<TensorSourceRef> fuse_sources;
+    std::vector<LayoutExprId> fuse_sources;
     fuse_sources.reserve(static_cast<std::size_t>(expert_count) * 3);
 
     std::vector<std::int64_t> gate_shape0;
@@ -1915,9 +2068,33 @@ bool try_add_per_expert_moe_fusion(
                 "bf16 sources under '" + group.runtime_base + "'");
         }
 
-        fuse_sources.push_back({raw_gate, "gate"});
-        fuse_sources.push_back({raw_up, "up"});
-        fuse_sources.push_back({raw_down, "down"});
+        TensorDecl gate_decl;
+        gate_decl.name = raw_gate;
+        gate_decl.dtype = gate_info.dtype;
+        gate_decl.shape = local_gate_shape;
+        gate_decl.layout = TensorLayoutKind::Dense;
+        gate_decl.ownership = TensorOwnershipKind::Temporary;
+        gate_decl.parallel = TensorParallelKind::Column;
+        LayoutExprId gate = source_expr_from_info(plan, raw_gate, gate_info);
+        gate = partition_expr(plan, gate, gate_decl, 0, tp_size);
+
+        TensorDecl up_decl = gate_decl;
+        up_decl.name = raw_up;
+        LayoutExprId up = source_expr_from_info(plan, raw_up, up_info);
+        up = partition_expr(plan, up, up_decl, 0, tp_size);
+
+        TensorDecl down_decl;
+        down_decl.name = raw_down;
+        down_decl.dtype = down_info.dtype;
+        down_decl.shape = local_down_shape;
+        down_decl.layout = TensorLayoutKind::Dense;
+        down_decl.ownership = TensorOwnershipKind::Temporary;
+        down_decl.parallel = TensorParallelKind::Row;
+        LayoutExprId down = source_expr_from_info(plan, raw_down, down_info);
+        down = partition_expr(plan, down, down_decl, 1, tp_size);
+        fuse_sources.push_back(gate);
+        fuse_sources.push_back(up);
+        fuse_sources.push_back(down);
 
         consumed_raw.insert(raw_gate);
         consumed_raw.insert(raw_up);
@@ -1940,19 +2117,16 @@ bool try_add_per_expert_moe_fusion(
         TensorLayoutKind::Grouped, TensorOwnershipKind::Owned,
         TensorParallelKind::Expert);
 
-    plan.ops.push_back(make_stack_groups_op(
-        gate_up_name, down_name, {}, std::move(fuse_sources)));
-    return true;
-}
-
-bool temporary_tensor_bytes(
-    const std::unordered_map<std::string, std::uint64_t>& bytes,
-    const std::string& name,
-    std::uint64_t& out)
-{
-    const auto it = bytes.find(name);
-    if (it == bytes.end()) return false;
-    out = it->second;
+    TensorDecl gate_up_decl = tensor_decl_for(plan, gate_up_name);
+    LayoutExpr stack = make_expr(LayoutExprKind::Stack, gate_up_decl);
+    stack.inputs = std::move(fuse_sources);
+    stack.runtime_name = gate_up_name;
+    stack.secondary_runtime_name = down_name;
+    stack.axis = 0;
+    const LayoutExprId stacked = add_expr(plan, std::move(stack));
+    realize_expr(plan, gate_up_name, stacked, gate_up_decl);
+    TensorDecl down_decl = tensor_decl_for(plan, down_name);
+    realize_expr(plan, down_name, stacked, std::move(down_decl));
     return true;
 }
 
@@ -1961,58 +2135,20 @@ void finalize_memory_plan(LayoutPlan& plan) {
         plan.memory.max_temporary_bytes;
 
     std::uint64_t persistent_bytes = 0;
-    std::unordered_map<std::string, std::uint64_t> temp_bytes;
-    temp_bytes.reserve(plan.tensors.size());
+    std::uint64_t max_temp_tensor_bytes = 0;
     for (const auto& [name, spec] : plan.tensors) {
+        (void)name;
         if (spec.ownership == TensorOwnershipKind::Owned) {
             persistent_bytes += tensor_nbytes(spec);
         } else if (spec.ownership == TensorOwnershipKind::Temporary) {
-            temp_bytes.emplace(name, tensor_nbytes(spec));
-        }
-    }
-
-    std::unordered_map<std::string, std::size_t> last_use;
-    last_use.reserve(temp_bytes.size());
-    for (std::size_t i = 0; i < plan.ops.size(); ++i) {
-        const LayoutOp& op = plan.ops[i];
-        for (const auto& input : layout_op_inputs(op)) {
-            if (temp_bytes.contains(input)) {
-                last_use[input] = i;
-            }
-        }
-    }
-
-    std::uint64_t live_temp_bytes = 0;
-    std::uint64_t high_water_temp_bytes = 0;
-    auto add_if_temporary = [&](const std::string& name) {
-        std::uint64_t bytes = 0;
-        if (temporary_tensor_bytes(temp_bytes, name, bytes)) {
-            live_temp_bytes += bytes;
-            high_water_temp_bytes =
-                std::max(high_water_temp_bytes, live_temp_bytes);
-        }
-    };
-    auto release_if_last_use = [&](const std::string& name, std::size_t op_idx) {
-        const auto use_it = last_use.find(name);
-        if (use_it == last_use.end() || use_it->second != op_idx) return;
-        std::uint64_t bytes = 0;
-        if (temporary_tensor_bytes(temp_bytes, name, bytes)) {
-            live_temp_bytes -= std::min(live_temp_bytes, bytes);
-        }
-    };
-
-    for (std::size_t i = 0; i < plan.ops.size(); ++i) {
-        const LayoutOp& op = plan.ops[i];
-        add_if_temporary(layout_op_output(op));
-        add_if_temporary(layout_op_secondary_output(op));
-        for (const auto& input : layout_op_inputs(op)) {
-            release_if_last_use(input, i);
+            max_temp_tensor_bytes =
+                std::max(max_temp_tensor_bytes, tensor_nbytes(spec));
         }
     }
 
     plan.memory.persistent_bytes = persistent_bytes;
     plan.memory.max_temporary_bytes =
-        std::max(conservative_temp_floor, high_water_temp_bytes);
+        std::max(conservative_temp_floor, max_temp_tensor_bytes);
     plan.memory.estimated_peak_bytes =
         plan.memory.persistent_bytes + plan.memory.max_temporary_bytes;
 }
@@ -2568,9 +2704,6 @@ LayoutPlan build_model_layout_plan(
 
         if (schema.shard_fused_moe_experts_for_tp &&
             semantic.role == SemanticRole::MoeExpertsGateUp) {
-            LayoutOp op = make_raw_load_op(
-                LayoutOpKind::GroupedSliceConcat, /*output_name=*/{},
-                raw_name);
             const auto& info = loader.info(raw_name);
             auto shape = info.shape;
             if (shape.size() != 3 || shape[1] % (2 * tp_size) != 0) {
@@ -2578,19 +2711,41 @@ LayoutPlan build_model_layout_plan(
                     "load schema: MoE gate/up tensor has unsupported shape: " +
                     name);
             }
+            const std::int64_t full_i = shape[1] / 2;
             shape[1] /= tp_size;
-            add_owned_producer(
-                plan, std::move(op), name, info.dtype, shape,
+            register_tensor_spec(
+                plan, name, info.dtype, shape,
                 TensorLayoutKind::Grouped,
+                TensorOwnershipKind::Owned,
                 TensorParallelKind::Expert);
+            const LayoutExprId source =
+                source_expr_from_info(plan, raw_name, info);
+            TensorDecl half_decl;
+            half_decl.name = name + ".__half";
+            half_decl.dtype = info.dtype;
+            half_decl.shape = {shape[0], full_i, shape[2]};
+            half_decl.layout = TensorLayoutKind::Grouped;
+            half_decl.ownership = TensorOwnershipKind::Temporary;
+            half_decl.parallel = TensorParallelKind::Expert;
+            TensorDecl local_half_decl = half_decl;
+            local_half_decl.shape[1] /= tp_size;
+            LayoutExprId gate = select_expr(
+                plan, source, half_decl, 1, 0, full_i);
+            gate = partition_expr(plan, gate, local_half_decl, 1, tp_size);
+            LayoutExprId up = select_expr(
+                plan, source, half_decl, 1, full_i, full_i);
+            up = partition_expr(plan, up, local_half_decl, 1, tp_size);
+            TensorDecl out_decl = tensor_decl_for(plan, name);
+            LayoutExpr join = make_expr(LayoutExprKind::Join, out_decl);
+            join.inputs = {gate, up};
+            join.axis = 1;
+            const LayoutExprId joined = add_expr(plan, std::move(join));
+            (void)realize_expr(plan, name, joined, std::move(out_decl));
             consumed_raw.insert(raw_name);
             continue;
         }
         if (schema.shard_fused_moe_experts_for_tp &&
             semantic.role == SemanticRole::MoeExpertsDown) {
-            LayoutOp op = make_raw_load_op(
-                LayoutOpKind::GroupedSlice, /*output_name=*/{},
-                raw_name);
             const auto& info = loader.info(raw_name);
             auto shape = info.shape;
             if (shape.size() != 3 || shape[2] % tp_size != 0) {
@@ -2599,10 +2754,16 @@ LayoutPlan build_model_layout_plan(
                     name);
             }
             shape[2] /= tp_size;
-            add_owned_producer(
-                plan, std::move(op), name, info.dtype, shape,
+            register_tensor_spec(
+                plan, name, info.dtype, shape,
                 TensorLayoutKind::Grouped,
+                TensorOwnershipKind::Owned,
                 TensorParallelKind::Expert);
+            TensorDecl out_decl = tensor_decl_for(plan, name);
+            LayoutExprId source =
+                source_expr_from_info(plan, raw_name, info);
+            source = partition_expr(plan, source, out_decl, 2, tp_size);
+            (void)realize_expr(plan, name, source, std::move(out_decl));
             consumed_raw.insert(raw_name);
             continue;
         }
@@ -2726,9 +2887,6 @@ LayoutPlan build_model_layout_plan(
             "scheduled");
     }
     finalize_memory_plan(plan);
-    if (!plan.ops.empty()) {
-        build_layout_algebra_from_ops(plan);
-    }
     (void)optimize_layout_algebra(plan);
     return plan;
 }

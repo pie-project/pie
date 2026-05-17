@@ -797,7 +797,6 @@ Current name             North-star name
 ------------------------------------------------
 LayoutPlan                 LayoutPlan
 LayoutExpr                   LayoutExpr
-LayoutOp                     Planner-only compatibility op
 TensorDecl               TensorDecl
 StorageProgram         StorageProgram
 StorageInstr     StorageInstr
@@ -959,7 +958,7 @@ Last updated: 2026-05-17.
 - Dense Llama-like Qwen/Qwen2/Llama/Mistral/Olmo loading can plan packed QKV
   and packed gate/up tensors.
 - Packed QKV and packed gate/up expose compatibility names as views.
-- `StorageProgram` lowers copy-expressible ops into exact `ExtentWrite`
+- `StorageProgram` lowers copy-expressible algebra into exact `ExtentWrite`
   records with destination tensor, destination offset, compact slice shape,
   byte count, source range count, and concrete checkpoint source path/offset
   metadata.
@@ -973,10 +972,9 @@ Last updated: 2026-05-17.
 - `StorageProgram` now includes a dependency-checked storage schedule. Ready
   extent writes are ordered by checkpoint file location, and plan dumps expose
   `schedule`, `scheduled_extent_writes`, and source offsets for every write.
-- `StorageProgram` records now carry native algebra identity (`expr_id`,
-  `binding_index`) and, for legacy planner paths only, a nullable `LayoutOp`
-  index. Algebra-only plans use `null` op indices; validation checks algebra
-  bindings directly.
+- `StorageProgram` records carry native algebra identity (`expr_id`,
+  `binding_index`). There is no compatibility coverage table or planner-op
+  index in the executable storage plan.
 - `LoadExecutor` consumes compiled storage extent writes when a
   `StorageProgram` is available; it no longer re-lowers an unoptimized byte
   mapping for execution.
@@ -987,25 +985,25 @@ Last updated: 2026-05-17.
 - `StorageWriteExecutor` is the execution abstraction below the load executor.
   The sync executor works with any byte source; the mmap executor can issue
   async stream-pooled copies through the byte-source interface.
-- The storage compiler validates coverage for every layout op. Copy-like
-  ops lower to `ExtentWrite`; `Cast` and `Dequantize` lower to typed
-  `TileMap`; view, lifetime, metadata, and device-transform ops are
-  explicitly classified. Plan construction fails if any layout op lacks a
-  storage action.
+- The storage compiler validates the algebra-to-storage boundary directly.
+  Copy-like algebra lowers to `ExtentWrite`; `Cast`, `Encode`, `Decode`, and
+  `Transcode` lower to typed `TileMap`; view, lifetime, metadata, and
+  device-transform algebra lower to typed `StorageInstr` records. Plan
+  construction fails if unsupported algebra reaches storage compilation.
 - The storage optimizer currently coalesces adjacent compatible extent writes
   and records optimized/coalesced write counts in plan dumps. This is the
   first optimizing compiler pass; the interface is ready for alignment-aware
   GDS batching and transform fusion passes.
-- `AxisConcat` materialization streams sources into final storage rather than
+- `Join(axis)` materialization streams sources into final storage rather than
   keeping all packed inputs alive at once.
-- `StackGroups` can stream per-expert checkpoint rows directly into final
+- `Stack(axis)` can stream per-expert checkpoint rows directly into final
   fused expert tensors instead of staging checkpoint-shaped source tensors.
-- Raw `Copy`, `Shard`, `Read`, `RowRangeShard`, `GroupedSliceConcat`, and
-  `GroupedSlice` ops lower to generic storage extent writes and
-  copy checkpoint bytes directly into final or planned temporary destinations.
+- Raw `Source`, `Select`, `Partition`, and `Join` expressions lower to generic
+  storage extent writes and copy checkpoint bytes directly into final or
+  planned temporary destinations.
   BF16 dense Qwen-style packed plans no longer create full checkpoint-shaped
   device buffers for projection tensors before packing.
-- `raw Copy -> Cast -> Drop` sequences execute through a tiled raw-cast path:
+- `Source -> Cast -> Release` sequences execute through a tiled raw-cast path:
   checkpoint bytes stream through bounded scratch and are cast directly into
   the final runtime tensor, avoiding a full source tensor in the `WeightStore`.
 - FP8 and MXFP4 BF16 fallback dequantization execute the output transform in
@@ -1096,14 +1094,14 @@ Last updated: 2026-05-17.
   capability and should bind to FlashInfer/TRT-LLM, CUTLASS, or Marlin rather
   than an architecture-local custom GEMM.
 - `PIE_CUDA_LAYOUT_PLAN_DUMP=/path/to/plan.json` writes a JSON plan artifact with
-  layout ops, tensor specs, storage extent writes, tile maps, and
+  algebra expressions, tensor specs, storage extent writes, tile maps, and
   semantic/storage memory estimates.
 - `[model].checkpoint_io = "auto" | "mmap" | "gds"` controls checkpoint byte
   source policy. `[model].storage_program_optimizer = true | false` controls
   storage optimizer passes. GPT-OSS MXFP4 policy is expressed as target
   policy through `[model].mxfp4_moe`, not hidden env-var behavior.
 - The planner computes persistent bytes from final owned tensors and computes
-  semantic temporary high-water bytes over the executable op stream.
+  semantic temporary high-water bytes from algebra lifetimes.
 - The storage compiler computes resident temporary high-water from the actual
   load executor lifetime protocol, including `Drop` ops, raw-copy-to-cast
   fusion, and bounded transform scratch.
@@ -1136,16 +1134,15 @@ Last updated: 2026-05-17.
 - The planner accepts a metadata-only tensor source, so layout-plan tests can run
   on synthetic checkpoint metadata without real safetensors files or GPU
   allocation.
-- `LayoutPlanner` is the native semantic-to-algebra migration target. It builds
-  dense algebra-only plans from `SemanticGraph + RuntimeABI` for direct copies
-  and packed QKV/gate-up row groups, and the storage compiler can lower those
-  plans without any compatibility `LayoutOp` stream.
+- `LayoutPlanner` is the native semantic-to-algebra migration target. The
+  production loader now emits algebra directly from semantic tensors/groups and
+  `RuntimeABI`; the storage compiler lowers those plans without a compatibility
+  op stream.
 - Algebra-only packed row-group plans now emit typed `CreateView` schedule
   records for compatibility views. The executor can materialize those views
   from `LayoutExpr::View` metadata without consulting a planner op.
-- Safe dense BF16 production plans for packed Llama-like families now route
-  through the native `LayoutPlanner`; those plans have no compatibility step
-  stream.
+- Dense, quantized, MoE, Phi-3 row-split, GPT-OSS MXFP4, and packed Llama-like
+  production plans now have no compatibility step stream.
 - CPU-only layout-plan tests cover dense Qwen packed QKV/gate-up lowering,
   scheduled runtime INT8 quantization, scheduled FP16/FP32-to-BF16 casts,
   Phi-3 tensor-parallel row-range sharding, symmetric GPTQ lowering into
@@ -1158,16 +1155,14 @@ Last updated: 2026-05-17.
   The Phi-3 test caught and fixed a moved-from `LayoutExpr::output_name` bug in
   row-range spec registration.
 
-### Partially Implemented
+### Remaining Implementation Work
 
-- Production `build_model_layout_plan` still emits planner-only `LayoutOp`
-  records for quantized, MoE, Phi-3 row-split, GPT-OSS MXFP4, and other
-  specialized planner paths, then builds algebra from those ops. The execution
-  path is clean; the remaining cleanup is native algebra planning for those
-  specialized families.
+- Schema adaptation, runtime ABI decisions, and lowering are still concentrated
+  in `model_schema.cpp`; the next cleanup is splitting those into per-family
+  adapters plus reusable planner modules.
 - The IR is typed and broad enough for current layouts, but some less common
   checkpoint quantization sub-modes still need schema coverage before they can
-  lower into scheduled graph ops.
+  lower into scheduled algebra.
 - Compressed-tensors FP8 and symmetric INT8 lowerings are scheduled for the
   variants Pie can bind today; asymmetric INT8, compressed INT4, and other
   compressed-tensors sub-modes still need schema and backend coverage.
@@ -1313,18 +1308,17 @@ Latest verification:
   1/1 with 98.9 ms mean latency. Dumped plan: 171 `Copy`, 56 `AxisConcat`,
   persistent 1,433 MiB, temp 6 MiB, and zero post-load transforms.
 - Qwen3-32B direct CUDA native load after direct-to-final materialization:
-  layout compiler emitted 515 load ops and 835 runtime tensor specs, persistent
+  layout compiler emitted algebra-native bindings and 835 runtime tensor specs, persistent
   62,488 MiB, load-time temp <= 0 MiB, peak ~= 62,488 MiB, and 128
   `AxisConcat` groups. The model loaded 835 tensors in about 5 seconds on the
   RTX PRO 6000 Blackwell Server Edition.
 - Qwen3-32B storage program dump after the byte-plan compiler:
   707 `ExtentWrite` records, 707 source ranges, 62,488 MiB checkpoint
   bytes read, 62,488 MiB device bytes written, storage temp <= 0 MiB, and
-  storage peak ~= 62,488 MiB. The executable layout ops are 387 `Copy` and
-  128 `AxisConcat`.
+  storage peak ~= 62,488 MiB.
 - Synthetic layout-plan tests include Qwen MoE TP expert sharding and GPT-OSS
-  MXFP4 target selection: BF16 fallback emits `Dequantize` /
-  `Deinterleave` / `Slice` ops, while packed-runtime targets emit
+  MXFP4 target selection: BF16 fallback emits `Decode` /
+  `Unzip` / `Select` algebra, while packed-runtime targets emit
   `QuantPacked` MXFP4 tensors with attached scale metadata.
 - Fresh-cache selective download smoke:
   `HF_HOME=.tmp/hf-selective-qwen pie model download Qwen/Qwen3-0.6B`

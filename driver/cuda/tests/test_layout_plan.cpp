@@ -138,13 +138,6 @@ private:
     std::uint64_t next_offset_ = 0;
 };
 
-std::size_t count_ops(const pie_cuda_driver::LayoutPlan& plan,
-                      pie_cuda_driver::LayoutOpKind kind) {
-    return static_cast<std::size_t>(std::count_if(
-        plan.ops.begin(), plan.ops.end(),
-        [kind](const auto& op) { return op.kind == kind; }));
-}
-
 std::size_t count_exprs(const pie_cuda_driver::LayoutPlan& plan,
                         pie_cuda_driver::LayoutExprKind kind) {
     return static_cast<std::size_t>(std::count_if(
@@ -186,26 +179,16 @@ const pie_cuda_driver::TensorDecl* find_spec(
     return it == plan.tensors.end() ? nullptr : &it->second;
 }
 
-bool has_copy_output(const pie_cuda_driver::LayoutPlan& plan,
-                     const std::string& output_name) {
-    return std::any_of(
-        plan.ops.begin(), plan.ops.end(),
-        [&](const auto& op) {
-            return op.kind == pie_cuda_driver::LayoutOpKind::Copy &&
-                   layout_op_output(op) == output_name;
-        });
-}
-
-const pie_cuda_driver::LayoutOp* find_op(
+const pie_cuda_driver::LayoutExpr* find_expr(
     const pie_cuda_driver::LayoutPlan& plan,
-    pie_cuda_driver::LayoutOpKind kind,
-    const std::string& output_name) {
+    pie_cuda_driver::LayoutExprKind kind,
+    const std::string& runtime_name) {
     const auto it = std::find_if(
-        plan.ops.begin(), plan.ops.end(),
-        [&](const auto& op) {
-            return op.kind == kind && layout_op_output(op) == output_name;
+        plan.algebra.exprs.begin(), plan.algebra.exprs.end(),
+        [&](const auto& expr) {
+            return expr.kind == kind && expr.runtime_name == runtime_name;
         });
-    return it == plan.ops.end() ? nullptr : &*it;
+    return it == plan.algebra.exprs.end() ? nullptr : &*it;
 }
 
 bool has_group(const pie_cuda_driver::SemanticGraph& graph,
@@ -374,10 +357,11 @@ void test_gguf_checkpoint_source_reads_q4_0_block_extents_and_decode() {
     const auto decoded =
         pie_cuda_driver::decode_gguf_q4_0_block(block.data(), block.size());
     CHECK_EQ(decoded.size(), std::size_t{32});
-    CHECK(decoded[0] == 7.0f);
-    CHECK(decoded[15] == -8.0f);
-    CHECK(decoded[16] == -8.0f);
-    CHECK(decoded[31] == 7.0f);
+    CHECK((decoded == std::vector<float>{
+        7.0f, 6.0f, 5.0f, 4.0f, 3.0f, 2.0f, 1.0f, 0.0f,
+        -1.0f, -2.0f, -3.0f, -4.0f, -5.0f, -6.0f, -7.0f, -8.0f,
+        -8.0f, -7.0f, -6.0f, -5.0f, -4.0f, -3.0f, -2.0f, -1.0f,
+        0.0f, 1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f, 7.0f}));
     std::filesystem::remove(path);
 }
 
@@ -409,13 +393,8 @@ void test_dense_qwen_plan_packs_projection_groups() {
     pie_cuda_driver::validate_layout_plan(plan);
 
     CHECK_EQ(plan.axis_concat_groups, std::size_t{2});
-    CHECK(plan.ops.empty());
     CHECK_EQ(plan.memory.max_temporary_bytes, std::uint64_t{0});
-    CHECK(!has_copy_output(plan, "model.layers.0.self_attn.q_proj.weight"));
-    CHECK(!has_copy_output(plan, "model.layers.0.self_attn.k_proj.weight"));
-    CHECK(!has_copy_output(plan, "model.layers.0.self_attn.v_proj.weight"));
-    CHECK(!has_copy_output(plan, "model.layers.0.mlp.gate_proj.weight"));
-    CHECK(!has_copy_output(plan, "model.layers.0.mlp.up_proj.weight"));
+    CHECK(!plan.algebra.bindings.empty());
 
     const auto* qkv =
         find_spec(plan, "model.layers.0.self_attn.qkv_proj.fused.weight");
@@ -487,31 +466,17 @@ void test_storage_compiler_covers_every_semantic_expr() {
         plan, meta, /*tp_rank=*/0, /*tp_size=*/1);
     pie_cuda_driver::validate_storage_program(plan, storage);
 
-    CHECK_EQ(storage.coverage.size(), plan.ops.size());
-    CHECK(std::any_of(
-        storage.coverage.begin(), storage.coverage.end(),
-        [](const auto& coverage) {
-            return coverage.action ==
-                   pie_cuda_driver::StorageActionKind::ExtentWrite;
-        }));
-    CHECK(std::any_of(
-        storage.coverage.begin(), storage.coverage.end(),
-        [](const auto& coverage) {
-            return coverage.action ==
-                   pie_cuda_driver::StorageActionKind::Transform;
-        }));
-    CHECK(std::any_of(
-        storage.coverage.begin(), storage.coverage.end(),
-        [](const auto& coverage) {
-            return coverage.action ==
-                   pie_cuda_driver::StorageActionKind::Attach;
-        }));
+    CHECK(storage.memory.extent_write_count > 0);
+    CHECK_EQ(count_tile_maps(storage, pie_cuda_driver::TileMapKind::Encode),
+             std::size_t{7});
+    CHECK_EQ(count_storage_instrs(
+                 storage, pie_cuda_driver::StorageInstrKind::Attach),
+             std::size_t{7});
 
     const std::string dump =
         pie_cuda_driver::dump_layout_plan_json(plan, storage);
-    CHECK(dump.find("\"coverage\"") != std::string::npos);
     CHECK(dump.find("ExtentWrite") != std::string::npos);
-    CHECK(dump.find("Transform") != std::string::npos);
+    CHECK(dump.find("TileMap") != std::string::npos);
     CHECK(dump.find("Attach") != std::string::npos);
 }
 
@@ -537,14 +502,31 @@ void test_storage_schedule_orders_ready_extent_writes_by_file_offset() {
             .dtype = DType::BF16,
             .shape = {2},
         });
-    plan.ops.push_back(pie_cuda_driver::make_raw_load_op(
-        pie_cuda_driver::LayoutOpKind::Copy,
-        "runtime.a",
-        "checkpoint.a"));
-    plan.ops.push_back(pie_cuda_driver::make_raw_load_op(
-        pie_cuda_driver::LayoutOpKind::Copy,
-        "runtime.b",
-        "checkpoint.b"));
+    auto add_source_binding =
+        [&](const std::string& raw_name, const std::string& runtime_name) {
+            const auto decl = plan.tensors.at(runtime_name);
+            pie_cuda_driver::LayoutExpr source;
+            source.kind = pie_cuda_driver::LayoutExprKind::Source;
+            source.raw_name = raw_name;
+            source.decl = decl;
+            source.decl.name = raw_name;
+            source.dtype = decl.dtype;
+            const auto source_id = plan.algebra.exprs.size();
+            plan.algebra.exprs.push_back(std::move(source));
+
+            pie_cuda_driver::LayoutExpr realize;
+            realize.kind = pie_cuda_driver::LayoutExprKind::Realize;
+            realize.inputs = {source_id};
+            realize.decl = decl;
+            realize.runtime_name = runtime_name;
+            realize.dtype = decl.dtype;
+            const auto root = plan.algebra.exprs.size();
+            plan.algebra.exprs.push_back(std::move(realize));
+            plan.algebra.bindings.push_back(
+                pie_cuda_driver::LayoutBinding{runtime_name, root});
+        };
+    add_source_binding("checkpoint.a", "runtime.a");
+    add_source_binding("checkpoint.b", "runtime.b");
 
     const pie_cuda_driver::StorageProgram storage =
         pie_cuda_driver::compile_storage_program(
@@ -604,12 +586,9 @@ void test_storage_compiler_lowers_algebra_only_copy_plan() {
 
     const StorageProgram storage =
         compile_storage_program(plan, meta, /*tp_rank=*/0, /*tp_size=*/1);
-    CHECK(plan.ops.empty());
-    CHECK(storage.coverage.empty());
     CHECK_EQ(storage.extent_writes.size(), std::size_t{1});
     CHECK_EQ(storage.schedule.size(), std::size_t{1});
     CHECK_EQ(storage.memory.algebra_extent_write_count, std::uint64_t{1});
-    CHECK_EQ(storage.memory.planner_extent_write_count, std::uint64_t{0});
     if (!storage.extent_writes.empty()) {
         const auto& write = storage.extent_writes.front();
         CHECK_EQ(write.op_index, kInvalidStorageId);
@@ -640,7 +619,6 @@ void test_native_layout_planner_builds_dense_packed_algebra_plan() {
         graph, meta, /*tp_size=*/1);
     validate_layout_plan(plan);
 
-    CHECK(plan.ops.empty());
     CHECK_EQ(plan.axis_concat_groups, std::size_t{2});
     CHECK(find_spec(
         plan,
@@ -660,8 +638,6 @@ void test_native_layout_planner_builds_dense_packed_algebra_plan() {
 
     const StorageProgram storage =
         compile_storage_program(plan, meta, /*tp_rank=*/0, /*tp_size=*/1);
-    CHECK(storage.coverage.empty());
-    CHECK_EQ(storage.memory.planner_extent_write_count, std::uint64_t{0});
     CHECK_EQ(storage.memory.algebra_extent_write_count, std::uint64_t{12});
     CHECK(std::any_of(
         storage.schedule.begin(), storage.schedule.end(),
@@ -847,11 +823,12 @@ void test_layout_optimizer_covers_proposal_rewrites() {
 
     {
         LayoutPlan plan;
-        const auto q = source(plan, "q", "q.tmp", DType::UINT8, {8, 2});
+        const auto q = source(plan, "q", "q.tmp", DType::FP8_E4M3, {8, 2});
+        const auto scale = source(plan, "q.scale", "q.scale.tmp", DType::FP32, {8});
         TensorDecl decoded{.name = "decoded", .dtype = DType::BF16, .shape = {8, 2}};
         LayoutExpr decode;
         decode.kind = LayoutExprKind::Decode;
-        decode.inputs = {q};
+        decode.inputs = {q, scale};
         decode.decl = decoded;
         decode.dtype = DType::BF16;
         const auto d = add_expr(plan, std::move(decode));
@@ -914,11 +891,13 @@ void test_layout_optimizer_covers_proposal_rewrites() {
 
     {
         LayoutPlan plan;
-        const auto q = source(plan, "raw.q", "q.tmp", DType::UINT8, {8, 2});
+        const auto q = source(plan, "raw.q", "q.tmp", DType::FP8_E4M3, {8, 2});
+        const auto scale = source(
+            plan, "raw.q.scale", "q.scale.tmp", DType::FP32, {8});
         TensorDecl decoded{.name = "decoded", .dtype = DType::BF16, .shape = {8, 2}};
         LayoutExpr decode;
         decode.kind = LayoutExprKind::Decode;
-        decode.inputs = {q};
+        decode.inputs = {q, scale};
         decode.decl = decoded;
         decode.dtype = DType::BF16;
         const auto d = add_expr(plan, std::move(decode));
@@ -927,7 +906,7 @@ void test_layout_optimizer_covers_proposal_rewrites() {
         encoded.quant.scale_tensor = "runtime.q.scale";
         plan.tensors.emplace(
             "runtime.q.scale",
-            TensorDecl{.name = "runtime.q.scale", .dtype = DType::FP32, .shape = {1}});
+            TensorDecl{.name = "runtime.q.scale", .dtype = DType::FP32, .shape = {8}});
         LayoutExpr encode;
         encode.kind = LayoutExprKind::Encode;
         encode.inputs = {d};
@@ -941,7 +920,8 @@ void test_layout_optimizer_covers_proposal_rewrites() {
         CHECK_EQ(count_exprs(plan, LayoutExprKind::Transcode), std::size_t{1});
 
         FakeMetadata meta;
-        meta.add("raw.q", DType::UINT8, {8, 2});
+        meta.add("raw.q", DType::FP8_E4M3, {8, 2});
+        meta.add("raw.q.scale", DType::FP32, {8});
         const auto storage = compile_storage_program(
             plan, meta, /*tp_rank=*/0, /*tp_size=*/1);
         CHECK_EQ(count_tile_maps(storage, TileMapKind::Transcode), std::size_t{1});
@@ -989,7 +969,7 @@ void test_dense_schema_adapters_pack_mistral_olmo_variants() {
             hf, cfg, meta, /*tp_size=*/1, target);
         pie_cuda_driver::validate_layout_plan(plan);
         CHECK_EQ(plan.axis_concat_groups, std::size_t{2});
-        CHECK(plan.ops.empty());
+        CHECK(!plan.algebra.bindings.empty());
     }
 }
 
@@ -1053,11 +1033,11 @@ void test_runtime_int8_lowers_to_scheduled_quant_ops() {
         hf, cfg, meta, /*tp_size=*/1, target);
     pie_cuda_driver::validate_layout_plan(plan);
 
-    CHECK_EQ(count_ops(plan, pie_cuda_driver::LayoutOpKind::QuantizeRuntime),
+    CHECK_EQ(count_exprs(plan, pie_cuda_driver::LayoutExprKind::Encode),
              std::size_t{7});
-    CHECK_EQ(count_ops(plan, pie_cuda_driver::LayoutOpKind::AttachMetadata),
+    CHECK_EQ(count_exprs(plan, pie_cuda_driver::LayoutExprKind::Attach),
              std::size_t{7});
-    CHECK_EQ(count_ops(plan, pie_cuda_driver::LayoutOpKind::Drop),
+    CHECK_EQ(count_exprs(plan, pie_cuda_driver::LayoutExprKind::Release),
              std::size_t{7});
     const auto* q = find_spec(plan, "model.layers.0.self_attn.q_proj.weight");
     CHECK(q != nullptr);
@@ -1084,7 +1064,7 @@ void test_compressed_tensors_int8_lowers_to_quant_packed() {
         hf, cfg, meta, /*tp_size=*/1, target);
     pie_cuda_driver::validate_layout_plan(plan);
 
-    CHECK_EQ(count_ops(plan, pie_cuda_driver::LayoutOpKind::AttachMetadata),
+    CHECK_EQ(count_exprs(plan, pie_cuda_driver::LayoutExprKind::Attach),
              std::size_t{1});
     const auto* q = find_spec(
         plan, "model.layers.0.self_attn.q_proj.weight");
@@ -1112,11 +1092,11 @@ void test_fp16_copy_lowers_to_scheduled_cast() {
         hf, cfg, meta, /*tp_size=*/1, target);
     pie_cuda_driver::validate_layout_plan(plan);
 
-    CHECK_EQ(count_ops(plan, pie_cuda_driver::LayoutOpKind::Copy),
+    CHECK_EQ(count_exprs(plan, pie_cuda_driver::LayoutExprKind::Source),
              std::size_t{1});
-    CHECK_EQ(count_ops(plan, pie_cuda_driver::LayoutOpKind::Cast),
+    CHECK_EQ(count_exprs(plan, pie_cuda_driver::LayoutExprKind::Cast),
              std::size_t{1});
-    CHECK_EQ(count_ops(plan, pie_cuda_driver::LayoutOpKind::Drop),
+    CHECK_EQ(count_exprs(plan, pie_cuda_driver::LayoutExprKind::Release),
              std::size_t{1});
     const auto* source =
         find_spec(plan, "model.norm.weight.__dtype_source");
@@ -1161,10 +1141,10 @@ void test_phi3_tp_uses_row_range_shards_for_fused_tensors() {
         hf, cfg, meta, /*tp_size=*/2, target);
     pie_cuda_driver::validate_layout_plan(plan);
 
-    CHECK_EQ(count_ops(plan, pie_cuda_driver::LayoutOpKind::RowRangeShard),
+    CHECK_EQ(count_exprs(plan, pie_cuda_driver::LayoutExprKind::Select),
              std::size_t{5});
-    CHECK(!has_copy_output(plan, "model.layers.0.self_attn.qkv_proj.weight"));
-    CHECK(!has_copy_output(plan, "model.layers.0.mlp.gate_up_proj.weight"));
+    CHECK(find_spec(plan, "model.layers.0.self_attn.qkv_proj.weight") == nullptr);
+    CHECK(find_spec(plan, "model.layers.0.mlp.gate_up_proj.weight") == nullptr);
 
     const auto* q = find_spec(plan, "model.layers.0.self_attn.q_proj.weight");
     CHECK(q != nullptr);
@@ -1198,9 +1178,9 @@ void test_phi3_fp16_row_range_shards_cast_to_bf16() {
         hf, cfg, meta, /*tp_size=*/2, target);
     pie_cuda_driver::validate_layout_plan(plan);
 
-    CHECK_EQ(count_ops(plan, pie_cuda_driver::LayoutOpKind::RowRangeShard),
+    CHECK_EQ(count_exprs(plan, pie_cuda_driver::LayoutExprKind::Select),
              std::size_t{3});
-    CHECK_EQ(count_ops(plan, pie_cuda_driver::LayoutOpKind::Cast),
+    CHECK_EQ(count_exprs(plan, pie_cuda_driver::LayoutExprKind::Cast),
              std::size_t{3});
     const auto* q =
         find_spec(plan, "model.layers.0.self_attn.q_proj.weight");
@@ -1242,13 +1222,13 @@ void test_gptq_symmetric_lowers_to_repack_layout() {
         hf, cfg, meta, /*tp_size=*/1, target);
     pie_cuda_driver::validate_layout_plan(plan);
 
-    CHECK_EQ(count_ops(plan, pie_cuda_driver::LayoutOpKind::RepackLayout),
+    CHECK_EQ(count_exprs(plan, pie_cuda_driver::LayoutExprKind::Reorder),
              std::size_t{1});
-    CHECK_EQ(count_ops(plan, pie_cuda_driver::LayoutOpKind::AttachMetadata),
+    CHECK_EQ(count_exprs(plan, pie_cuda_driver::LayoutExprKind::Attach),
              std::size_t{1});
-    CHECK_EQ(count_ops(plan, pie_cuda_driver::LayoutOpKind::Drop),
+    CHECK_EQ(count_exprs(plan, pie_cuda_driver::LayoutExprKind::Release),
              std::size_t{1});
-    CHECK(!has_copy_output(plan, "model.layers.0.self_attn.q_proj.qweight"));
+    CHECK(find_spec(plan, "model.layers.0.self_attn.q_proj.qweight") == nullptr);
     CHECK(find_spec(plan, "model.layers.0.self_attn.q_proj.qzeros") == nullptr);
     CHECK(find_spec(plan, "model.layers.0.self_attn.q_proj.g_idx") == nullptr);
 
@@ -1300,7 +1280,7 @@ void test_gptq_symmetric_tp_lowers_to_local_repack_layout() {
         hf, cfg, meta, /*tp_size=*/2, target);
     pie_cuda_driver::validate_layout_plan(plan);
 
-    CHECK_EQ(count_ops(plan, pie_cuda_driver::LayoutOpKind::RepackLayout),
+    CHECK_EQ(count_exprs(plan, pie_cuda_driver::LayoutExprKind::Reorder),
              std::size_t{2});
     const auto* q_tmp =
         find_spec(plan, "model.layers.0.self_attn.q_proj.weight.__gptq_qweight");
@@ -1323,12 +1303,6 @@ void test_gptq_symmetric_tp_lowers_to_local_repack_layout() {
         CHECK((q_weight->shape == std::vector<std::int64_t>{2, 256}));
         CHECK(q_weight->parallel == pie_cuda_driver::TensorParallelKind::Column);
     }
-    const auto* q_copy = find_op(
-        plan, pie_cuda_driver::LayoutOpKind::Copy,
-        "model.layers.0.self_attn.q_proj.weight.__gptq_qweight");
-    CHECK(q_copy != nullptr);
-    if (q_copy != nullptr) CHECK_EQ(layout_op_shard_axis(*q_copy), 1);
-
     const auto* o_tmp =
         find_spec(plan, "model.layers.0.self_attn.o_proj.weight.__gptq_qweight");
     CHECK(o_tmp != nullptr);
@@ -1350,11 +1324,6 @@ void test_gptq_symmetric_tp_lowers_to_local_repack_layout() {
         CHECK((o_weight->shape == std::vector<std::int64_t>{1, 512}));
         CHECK(o_weight->parallel == pie_cuda_driver::TensorParallelKind::Row);
     }
-    const auto* o_copy = find_op(
-        plan, pie_cuda_driver::LayoutOpKind::Copy,
-        "model.layers.0.self_attn.o_proj.weight.__gptq_qweight");
-    CHECK(o_copy != nullptr);
-    if (o_copy != nullptr) CHECK_EQ(layout_op_shard_axis(*o_copy), 0);
 }
 
 void test_gptq_symmetric_without_marlin_lowers_to_dequant() {
@@ -1380,9 +1349,9 @@ void test_gptq_symmetric_without_marlin_lowers_to_dequant() {
         hf, cfg, meta, /*tp_size=*/1, target);
     pie_cuda_driver::validate_layout_plan(plan);
 
-    CHECK_EQ(count_ops(plan, pie_cuda_driver::LayoutOpKind::RepackLayout),
+    CHECK_EQ(count_exprs(plan, pie_cuda_driver::LayoutExprKind::Reorder),
              std::size_t{0});
-    CHECK_EQ(count_ops(plan, pie_cuda_driver::LayoutOpKind::Dequantize),
+    CHECK_EQ(count_exprs(plan, pie_cuda_driver::LayoutExprKind::Decode),
              std::size_t{1});
     const auto* weight =
         find_spec(plan, "model.layers.0.self_attn.q_proj.weight");
@@ -1413,11 +1382,11 @@ void test_awq_lowers_to_scheduled_dequant() {
         hf, cfg, meta, /*tp_size=*/1, target);
     pie_cuda_driver::validate_layout_plan(plan);
 
-    CHECK_EQ(count_ops(plan, pie_cuda_driver::LayoutOpKind::Dequantize),
+    CHECK_EQ(count_exprs(plan, pie_cuda_driver::LayoutExprKind::Decode),
              std::size_t{1});
-    CHECK_EQ(count_ops(plan, pie_cuda_driver::LayoutOpKind::Drop),
+    CHECK_EQ(count_exprs(plan, pie_cuda_driver::LayoutExprKind::Release),
              std::size_t{1});
-    CHECK(!has_copy_output(plan, "model.layers.0.self_attn.q_proj.qweight"));
+    CHECK(find_spec(plan, "model.layers.0.self_attn.q_proj.qweight") == nullptr);
     CHECK(find_spec(plan, "model.layers.0.self_attn.q_proj.qzeros") == nullptr);
 
     const auto* tmp = find_spec(
@@ -1458,9 +1427,9 @@ void test_awq_lowers_to_marlin_repack_when_target_supports_int4() {
         hf, cfg, meta, /*tp_size=*/1, target);
     pie_cuda_driver::validate_layout_plan(plan);
 
-    CHECK_EQ(count_ops(plan, pie_cuda_driver::LayoutOpKind::RepackLayout),
+    CHECK_EQ(count_exprs(plan, pie_cuda_driver::LayoutExprKind::Reorder),
              std::size_t{1});
-    CHECK_EQ(count_ops(plan, pie_cuda_driver::LayoutOpKind::Dequantize),
+    CHECK_EQ(count_exprs(plan, pie_cuda_driver::LayoutExprKind::Decode),
              std::size_t{0});
     const auto* weight =
         find_spec(plan, "model.layers.0.self_attn.q_proj.weight");
@@ -1504,7 +1473,7 @@ void test_awq_tp_lowers_to_local_dequant() {
         hf, cfg, meta, /*tp_size=*/2, target);
     pie_cuda_driver::validate_layout_plan(plan);
 
-    CHECK_EQ(count_ops(plan, pie_cuda_driver::LayoutOpKind::Dequantize),
+    CHECK_EQ(count_exprs(plan, pie_cuda_driver::LayoutExprKind::Decode),
              std::size_t{2});
     const auto* q_tmp = find_spec(
         plan, "model.layers.0.self_attn.q_proj.weight.__awq_qweight");
@@ -1526,12 +1495,6 @@ void test_awq_tp_lowers_to_local_dequant() {
         CHECK((q_weight->shape == std::vector<std::int64_t>{32, 32}));
         CHECK(q_weight->parallel == pie_cuda_driver::TensorParallelKind::Column);
     }
-    const auto* q_copy = find_op(
-        plan, pie_cuda_driver::LayoutOpKind::Copy,
-        "model.layers.0.self_attn.q_proj.weight.__awq_qweight");
-    CHECK(q_copy != nullptr);
-    if (q_copy != nullptr) CHECK_EQ(layout_op_shard_axis(*q_copy), 1);
-
     const auto* o_tmp = find_spec(
         plan, "model.layers.0.self_attn.o_proj.weight.__awq_qweight");
     CHECK(o_tmp != nullptr);
@@ -1552,11 +1515,6 @@ void test_awq_tp_lowers_to_local_dequant() {
         CHECK((o_weight->shape == std::vector<std::int64_t>{64, 16}));
         CHECK(o_weight->parallel == pie_cuda_driver::TensorParallelKind::Row);
     }
-    const auto* o_copy = find_op(
-        plan, pie_cuda_driver::LayoutOpKind::Copy,
-        "model.layers.0.self_attn.o_proj.weight.__awq_qweight");
-    CHECK(o_copy != nullptr);
-    if (o_copy != nullptr) CHECK_EQ(layout_op_shard_axis(*o_copy), 0);
 }
 
 void test_gptq_asymmetric_tp_lowers_to_local_dequant() {
@@ -1584,9 +1542,9 @@ void test_gptq_asymmetric_tp_lowers_to_local_dequant() {
         hf, cfg, meta, /*tp_size=*/2, target);
     pie_cuda_driver::validate_layout_plan(plan);
 
-    CHECK_EQ(count_ops(plan, pie_cuda_driver::LayoutOpKind::Dequantize),
+    CHECK_EQ(count_exprs(plan, pie_cuda_driver::LayoutExprKind::Decode),
              std::size_t{2});
-    CHECK_EQ(count_ops(plan, pie_cuda_driver::LayoutOpKind::RepackLayout),
+    CHECK_EQ(count_exprs(plan, pie_cuda_driver::LayoutExprKind::Reorder),
              std::size_t{0});
     const auto* q_tmp = find_spec(
         plan, "model.layers.0.self_attn.q_proj.weight.__gptq_qweight");
@@ -1655,7 +1613,7 @@ void test_gptq_desc_act_row_tp_keeps_full_group_metadata() {
         hf, cfg, meta, /*tp_size=*/2, target);
     pie_cuda_driver::validate_layout_plan(plan);
 
-    CHECK_EQ(count_ops(plan, pie_cuda_driver::LayoutOpKind::Dequantize),
+    CHECK_EQ(count_exprs(plan, pie_cuda_driver::LayoutExprKind::Decode),
              std::size_t{1});
     const auto* qw = find_spec(
         plan, "model.layers.0.self_attn.o_proj.weight.__gptq_qweight");
@@ -1682,12 +1640,12 @@ void test_gptq_desc_act_row_tp_keeps_full_group_metadata() {
     if (gi != nullptr) {
         CHECK((gi->shape == std::vector<std::int64_t>{16}));
     }
-    const auto* dequant = find_op(
-        plan, pie_cuda_driver::LayoutOpKind::Dequantize,
+    const auto* dequant = find_expr(
+        plan, pie_cuda_driver::LayoutExprKind::Decode,
         "model.layers.0.self_attn.o_proj.weight");
     CHECK(dequant != nullptr);
     if (dequant != nullptr) {
-        CHECK_EQ(layout_op_inputs(*dequant).size(), std::size_t{4});
+        CHECK_EQ(dequant->inputs.size(), std::size_t{4});
     }
 }
 
@@ -1706,12 +1664,12 @@ void test_qwen_moe_tp_uses_expert_shard_ops() {
         hf, cfg, meta, /*tp_size=*/2, target);
     pie_cuda_driver::validate_layout_plan(plan);
 
-    CHECK_EQ(count_ops(plan, pie_cuda_driver::LayoutOpKind::GroupedSliceConcat),
+    CHECK_EQ(count_exprs(plan, pie_cuda_driver::LayoutExprKind::Join),
              std::size_t{1});
-    CHECK_EQ(count_ops(plan, pie_cuda_driver::LayoutOpKind::GroupedSlice),
-             std::size_t{1});
-    CHECK(!has_copy_output(plan, "model.layers.0.mlp.experts.gate_up_proj"));
-    CHECK(!has_copy_output(plan, "model.layers.0.mlp.experts.down_proj"));
+    CHECK_EQ(count_exprs(plan, pie_cuda_driver::LayoutExprKind::Select),
+             std::size_t{2});
+    CHECK(find_spec(plan, "model.layers.0.mlp.experts.gate_up_proj") != nullptr);
+    CHECK(find_spec(plan, "model.layers.0.mlp.experts.down_proj") != nullptr);
 
     const auto* gate_up =
         find_spec(plan, "model.layers.0.mlp.experts.gate_up_proj");
@@ -1754,7 +1712,7 @@ void test_qwen_moe_per_expert_fusion_is_scheduled() {
         hf, cfg, meta, /*tp_size=*/2, target);
     pie_cuda_driver::validate_layout_plan(plan);
 
-    CHECK_EQ(count_ops(plan, pie_cuda_driver::LayoutOpKind::StackGroups),
+    CHECK_EQ(count_exprs(plan, pie_cuda_driver::LayoutExprKind::Stack),
              std::size_t{1});
     const auto* gate_up =
         find_spec(plan, "model.layers.0.mlp.experts.gate_up_proj");
@@ -1774,8 +1732,8 @@ void test_qwen_moe_per_expert_fusion_is_scheduled() {
         CHECK(down->layout ==
               pie_cuda_driver::TensorLayoutKind::Grouped);
     }
-    CHECK(!has_copy_output(
-        plan, "model.layers.0.mlp.experts.0.gate_proj.weight"));
+    CHECK(find_spec(
+        plan, "model.layers.0.mlp.experts.0.gate_proj.weight") == nullptr);
 }
 
 void test_mixtral_schema_adapter_marks_and_shards_expert_weights() {
@@ -1855,10 +1813,10 @@ void test_qwen36_moe_plan_shards_fused_experts() {
     auto plan = pie_cuda_driver::build_model_layout_plan(
         hf, cfg, meta, /*tp_size=*/2, target);
     pie_cuda_driver::validate_layout_plan(plan);
-    CHECK_EQ(count_ops(plan, pie_cuda_driver::LayoutOpKind::GroupedSliceConcat),
+    CHECK_EQ(count_exprs(plan, pie_cuda_driver::LayoutExprKind::Join),
              std::size_t{1});
-    CHECK_EQ(count_ops(plan, pie_cuda_driver::LayoutOpKind::GroupedSlice),
-             std::size_t{1});
+    CHECK_EQ(count_exprs(plan, pie_cuda_driver::LayoutExprKind::Select),
+             std::size_t{2});
 
     const auto* gate_up =
         find_spec(plan, "model.layers.0.mlp.experts.gate_up_proj");
@@ -1986,7 +1944,7 @@ void test_gpt_oss_mxfp4_fallback_emits_dequantized_experts() {
         hf, cfg, meta, /*tp_size=*/2, target);
     pie_cuda_driver::validate_layout_plan(plan);
 
-    CHECK(plan.ops.empty());
+    CHECK(!plan.algebra.bindings.empty());
     CHECK_EQ(count_exprs(plan, pie_cuda_driver::LayoutExprKind::Decode),
              std::size_t{2});
     CHECK_EQ(count_exprs(plan, pie_cuda_driver::LayoutExprKind::Unzip),
@@ -2026,7 +1984,6 @@ void test_gpt_oss_mxfp4_fallback_emits_dequantized_experts() {
     const auto storage = pie_cuda_driver::compile_storage_program(
         plan, meta, /*tp_rank=*/0, /*tp_size=*/2);
     pie_cuda_driver::validate_storage_program(plan, storage);
-    CHECK(storage.coverage.empty());
     CHECK_EQ(count_tile_maps(storage, pie_cuda_driver::TileMapKind::Decode),
              std::size_t{2});
     CHECK_EQ(count_storage_transforms(
@@ -2038,7 +1995,6 @@ void test_gpt_oss_mxfp4_fallback_emits_dequantized_experts() {
     CHECK_EQ(count_storage_instrs(
                  storage, pie_cuda_driver::StorageInstrKind::Release),
              std::size_t{2});
-    CHECK_EQ(storage.memory.planner_extent_write_count, std::uint64_t{0});
     CHECK(storage.memory.algebra_extent_write_count >= 6);
     CHECK(storage.memory.tile_map_count == 2);
 }
@@ -2053,7 +2009,7 @@ void test_gpt_oss_mxfp4_native_emits_quant_packed_experts() {
         hf, cfg, meta, /*tp_size=*/1, target);
     pie_cuda_driver::validate_layout_plan(plan);
 
-    CHECK(plan.ops.empty());
+    CHECK(!plan.algebra.bindings.empty());
     CHECK_EQ(count_exprs(plan, pie_cuda_driver::LayoutExprKind::Decode),
              std::size_t{0});
     CHECK_EQ(count_exprs(plan, pie_cuda_driver::LayoutExprKind::Attach),
@@ -2086,13 +2042,11 @@ void test_gpt_oss_mxfp4_native_emits_quant_packed_experts() {
     const auto storage = pie_cuda_driver::compile_storage_program(
         plan, meta, /*tp_rank=*/0, /*tp_size=*/1);
     pie_cuda_driver::validate_storage_program(plan, storage);
-    CHECK(storage.coverage.empty());
     CHECK_EQ(count_storage_instrs(
                  storage, pie_cuda_driver::StorageInstrKind::Attach),
              std::size_t{2});
     CHECK_EQ(count_tile_maps(storage, pie_cuda_driver::TileMapKind::Decode),
              std::size_t{0});
-    CHECK_EQ(storage.memory.planner_extent_write_count, std::uint64_t{0});
     CHECK(storage.memory.algebra_extent_write_count >= 6);
 }
 
@@ -2123,9 +2077,9 @@ void test_fp8_scale_inv_lowers_to_scheduled_dequant() {
         hf, cfg, meta, /*tp_size=*/1, target);
     pie_cuda_driver::validate_layout_plan(plan);
 
-    CHECK_EQ(count_ops(plan, pie_cuda_driver::LayoutOpKind::Dequantize),
+    CHECK_EQ(count_exprs(plan, pie_cuda_driver::LayoutExprKind::Decode),
              std::size_t{1});
-    CHECK_EQ(count_ops(plan, pie_cuda_driver::LayoutOpKind::Drop),
+    CHECK_EQ(count_exprs(plan, pie_cuda_driver::LayoutExprKind::Release),
              std::size_t{1});
     const auto* weight =
         find_spec(plan, "model.layers.0.self_attn.q_proj.weight");

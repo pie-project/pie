@@ -167,7 +167,7 @@ LayoutExprId push_select_through_decode(
     const LayoutExpr& decode,
     LayoutOptimizerPassStats& stats)
 {
-    if (decode.inputs.size() != 1) {
+    if (decode.inputs.empty()) {
         return add_expr(dst, select);
     }
     const LayoutExprId input_id = decode.inputs.front();
@@ -180,16 +180,35 @@ LayoutExprId push_select_through_decode(
         return add_expr(dst, select);
     }
 
-    const LayoutExprId selected_input = add_expr(
-        dst,
-        make_select_expr(
-            input,
-            input_id,
-            select.axis,
-            select.start,
-            select.length));
+    std::vector<LayoutExprId> selected_inputs;
+    selected_inputs.reserve(decode.inputs.size());
+    for (std::size_t i = 0; i < decode.inputs.size(); ++i) {
+        const LayoutExprId child_id = decode.inputs[i];
+        const LayoutExpr& child = dst.exprs.at(child_id);
+        const bool axis_selectable =
+            select.axis >= 0 &&
+            select.axis < static_cast<int>(child.decl.shape.size()) &&
+            select.start + select.length <= dim_at(child, select.axis);
+        const bool side_tensor_tracks_axis =
+            axis_selectable &&
+            select.axis < static_cast<int>(decode.decl.shape.size()) &&
+            child.decl.shape[static_cast<std::size_t>(select.axis)] ==
+                decode.decl.shape[static_cast<std::size_t>(select.axis)];
+        if (i == 0 || side_tensor_tracks_axis) {
+            selected_inputs.push_back(add_expr(
+                dst,
+                make_select_expr(
+                    child,
+                    child_id,
+                    select.axis,
+                    select.start,
+                    select.length)));
+        } else {
+            selected_inputs.push_back(child_id);
+        }
+    }
     LayoutExpr replacement = decode;
-    replacement.inputs = {selected_input};
+    replacement.inputs = std::move(selected_inputs);
     replacement.decl = select.decl;
     replacement.runtime_name = select.runtime_name;
     replacement.dtype = select.decl.dtype;
