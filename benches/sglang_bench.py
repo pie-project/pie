@@ -79,7 +79,7 @@ def run(args: argparse.Namespace):
         results=results,
         wall_s=wall,
         config={
-            "disable_cuda_graph": True,
+            "disable_cuda_graph": False,
             "disable_radix_cache": True,
             "max_running_requests": args.concurrency if args.mode == "tput" else 1,
             "temperature": args.temperature,

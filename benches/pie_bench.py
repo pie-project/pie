@@ -74,6 +74,10 @@ def build_config(args: argparse.Namespace):
             "max_batch_tokens": args.max_batch_tokens,
             "max_num_kv_pages": args.kv_pages,
         }
+        if args.runtime_quant:
+            driver_options["runtime_quant"] = args.runtime_quant
+        if args.mxfp4_moe:
+            driver_options["mxfp4_moe"] = args.mxfp4_moe
     elif args.driver == "portable":
         driver_options = {
             "max_batch_size": args.max_batch_size,
@@ -392,6 +396,12 @@ def build_parser() -> argparse.ArgumentParser:
         sp.add_argument("--admission-oversubscription-factor", type=float, default=1000.0)
         sp.add_argument("--cpu-mem-budget", type=int, default=0)
         sp.add_argument("--kv-pages", type=int, default=2048)
+        sp.add_argument("--runtime-quant", choices=["fp8", "int8"], default=None)
+        sp.add_argument(
+            "--mxfp4-moe",
+            choices=["auto", "routed_dequant", "packed", "bf16", "dequant", "eager_bf16", "native"],
+            default=None,
+        )
         sp.add_argument("--portable-n-gpu-layers", type=int, default=-1)
         sp.add_argument("--worker-threads", type=int, default=None)
         sp.add_argument(

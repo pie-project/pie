@@ -10,6 +10,7 @@
 #include "device_buffer.hpp"
 #include "kernels/add_bias.hpp"
 #include "kernels/attn_sink.hpp"
+#include "kernels/dequant_fp4.hpp"
 #include "kernels/embed.hpp"
 #include "kernels/gather_rows.hpp"
 #include "kernels/residual_add.hpp"
@@ -384,11 +385,46 @@ void mixtral_forward_paged(
 
             // SwiGLU MLP.
             const auto& expert = layer.experts[e];
+            const void* gate_w = nullptr;
+            const void* up_w = nullptr;
+            const void* down_w = nullptr;
+            if (expert.format == MixtralExpertWeightFormat::Mxfp4RoutedDequant) {
+                if (!expert.w_gate_up || !expert.w_gate_up_scale ||
+                    !expert.w_down_packed || !expert.w_down_scale ||
+                    w.mxfp4_gate_up_bf16_scratch.empty() ||
+                    w.mxfp4_down_bf16_scratch.empty()) {
+                    throw std::runtime_error(
+                        "mixtral/gpt_oss: incomplete MXFP4 expert backend");
+                }
+                kernels::launch_dequant_mxfp4_to_bf16(
+                    static_cast<const std::uint8_t*>(expert.w_gate_up->data()),
+                    static_cast<const std::uint8_t*>(
+                        expert.w_gate_up_scale->data()),
+                    w.mxfp4_gate_up_bf16_scratch.data(),
+                    2 * I, H, stream);
+                kernels::launch_dequant_mxfp4_to_bf16(
+                    static_cast<const std::uint8_t*>(
+                        expert.w_down_packed->data()),
+                    static_cast<const std::uint8_t*>(
+                        expert.w_down_scale->data()),
+                    w.mxfp4_down_bf16_scratch.data(),
+                    H, I, stream);
+                gate_w = w.mxfp4_gate_up_bf16_scratch.data();
+                up_w = static_cast<const std::uint8_t*>(
+                    w.mxfp4_gate_up_bf16_scratch.data()) +
+                    static_cast<std::size_t>(I) *
+                    static_cast<std::size_t>(H) * sizeof(std::uint16_t);
+                down_w = w.mxfp4_down_bf16_scratch.data();
+            } else {
+                gate_w = expert.w_gate->data();
+                up_w = expert.w_up->data();
+                down_w = expert.w_down->data();
+            }
             ops::gemm_act_x_wt_bf16(cublas.handle(),
-                d_expert_in.data(), expert.w_gate->data(),
+                d_expert_in.data(), gate_w,
                 d_expert_gate.data(), Ne, I, H);
             ops::gemm_act_x_wt_bf16(cublas.handle(),
-                d_expert_in.data(), expert.w_up->data(),
+                d_expert_in.data(), up_w,
                 d_expert_up.data(), Ne, I, H);
             if (expert.b_gate) kernels::launch_add_bias_bf16(
                 d_expert_gate.data(), expert.b_gate->data(), Ne, I, stream);
@@ -407,7 +443,7 @@ void mixtral_forward_paged(
                     static_cast<std::size_t>(Ne) * I, stream);
             }
             ops::gemm_act_x_wt_bf16(cublas.handle(),
-                d_expert_gate.data(), expert.w_down->data(),
+                d_expert_gate.data(), down_w,
                 d_expert_out.data(), Ne, H, I);
             // b_down is replicated across ranks; only the leader applies
             // it so the all-reduce sums it once. Plain Mixtral has no

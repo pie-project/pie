@@ -131,6 +131,7 @@ public:
     const std::vector<std::int64_t>&   shape()  const noexcept { return shape_; }
     std::size_t                        numel()  const noexcept { return numel_; }
     std::size_t                        nbytes() const noexcept { return nbytes_; }
+    bool                               owns_memory() const noexcept { return owns_memory_; }
 
     bool empty() const noexcept { return ptr_ == nullptr; }
 

@@ -432,9 +432,9 @@ pub fn write_dummy_startup_toml(
 
 /// Write the cuda driver's startup TOML. Schema mirrors
 /// `driver/cuda/src/config.hpp`: `[model]` with
-/// `hf_repo`/`snapshot_dir`/`device`/`dtype`/optional `runtime_quant`,
-/// `[batching]` with KV-page geometry plus `swap_pool_size`, and
-/// `[runtime]` with the server verbosity flag.
+/// `hf_repo`/`snapshot_dir`/`device`/`dtype`/optional load policy knobs,
+/// `[batching]` with KV-page geometry plus `swap_pool_size`, and `[runtime]`
+/// with the server verbosity flag.
 ///
 /// `[distributed]` is emitted only for TP launches; single-rank uses the
 /// cuda driver's default (`tp_size=1, tp_rank=0`).
@@ -453,6 +453,9 @@ pub(crate) fn write_cuda_startup_toml(
     insert_str(&mut model, "dtype", opts.weight_dtype.clone());
     if !opts.runtime_quant.is_empty() {
         insert_str(&mut model, "runtime_quant", opts.runtime_quant.clone());
+    }
+    if !opts.mxfp4_moe.is_empty() && opts.mxfp4_moe != "auto" {
+        insert_str(&mut model, "mxfp4_moe", opts.mxfp4_moe.clone());
     }
     insert_table(&mut doc, "model", model);
 
@@ -1048,6 +1051,22 @@ mod tests {
         let val: toml::Value = toml::from_str(&text).unwrap();
         assert_eq!(val["model"]["runtime_quant"].as_str().unwrap(), "fp8");
         assert_eq!(val["model"]["device"].as_str().unwrap(), "cuda:1");
+    }
+
+    #[test]
+    fn cuda_startup_toml_emits_mxfp4_policy_when_non_default() {
+        let tmp = tempfile::tempdir().unwrap();
+        let out = tmp.path().join("cuda.toml");
+        let snap = tmp.path().join("snap");
+        let mut opts = CudaNativeDriverOptions::default();
+        opts.device = "cuda:0".to_string();
+        opts.mxfp4_moe = "bf16".to_string();
+
+        write_cuda_startup_toml(&out, &opts, &snap, 0, None).unwrap();
+
+        let text = std::fs::read_to_string(&out).unwrap();
+        let val: toml::Value = toml::from_str(&text).unwrap();
+        assert_eq!(val["model"]["mxfp4_moe"].as_str().unwrap(), "bf16");
     }
 
     #[test]

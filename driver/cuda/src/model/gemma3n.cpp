@@ -41,7 +41,7 @@ constexpr const char* kPrefix = "model.language_model.";
 
 }  // namespace
 
-Gemma3nWeights bind_gemma3n(LoadedModel& engine) {
+Gemma3nWeights bind_gemma3n(const LoadedModel& engine) {
     const auto& cfg = engine.hf_config();
     const int L = cfg.num_hidden_layers;
 
