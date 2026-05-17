@@ -7,10 +7,11 @@
 //   [header_size bytes: JSON object — { name -> {dtype, shape, data_offsets[2]} }]
 //   [tensor data, concatenated]
 //
-// We mmap the file, slice into its header, and copy each tensor straight
-// into a `DeviceTensor` via `cudaMemcpyAsync`. No extra host-side staging,
-// no torch dependency. Sharded models (`model.safetensors.index.json`) are
-// transparently split across files.
+// We mmap the file, slice into its header, and copy checkpoint bytes into
+// caller-owned device storage via cudaMemcpyAsync. Allocation and runtime
+// representation decisions live in the load plan materializer, not here.
+// Sharded models (`model.safetensors.index.json`) are transparently split
+// across files.
 
 #include <cstdint>
 #include <filesystem>
@@ -80,35 +81,39 @@ public:
         return index_.find(name) != index_.end();
     }
 
-    /// Allocate a `DeviceTensor` and copy the weight into it via
-    /// `cudaMemcpyAsync`. Synchronous from the caller's POV (the load path
-    /// is one-shot at boot, not a hot path).
-    DeviceTensor load_to_device(const std::string& name);
+    /// Copy a full checkpoint tensor into caller-owned device storage.
+    void copy_to_device(
+        const std::string& name,
+        void* dst,
+        const std::vector<std::int64_t>& dst_shape);
 
-    /// Load a slice of `name` along `axis`, keeping only this rank's portion
-    /// of the world. Used by tensor-parallel binders to shard linear weights
-    /// at load time so each GPU only allocates its `1 / world_size` share.
+    /// Copy a slice of `name` along `axis`, keeping only this rank's portion
+    /// of the world. Used by load-plan materialization to shard linear weights
+    /// directly into their final runtime allocations.
     ///
     /// - 1-D tensors (biases): `axis` must be 0.
     /// - 2-D tensors (linear weights): `axis ∈ {0, 1}`.
     /// - The sharded dimension must be divisible by `world_size`.
-    /// - `axis < 0` (or `world_size == 1`) falls through to the unsharded
-    ///   `load_to_device` path.
-    DeviceTensor load_to_device_sharded(const std::string& name,
-                                        int axis, int rank, int world_size);
+    /// - `axis < 0` (or `world_size == 1`) falls through to the unsharded copy.
+    void copy_shard_to_device(
+        const std::string& name,
+        int axis,
+        int rank,
+        int world_size,
+        void* dst,
+        const std::vector<std::int64_t>& dst_shape);
 
     /// Copy an arbitrary rectangular slice from the row-major checkpoint
     /// tensor into a compact device tensor. Omitted axes are copied in full.
     /// This is the generic primitive used by architecture lowering for
     /// fused QKV, MoE expert bands, and tensor-parallel local shards.
-    DeviceTensor copy_slice_to_device(
+    void copy_slice_to_device(
         const std::string& name,
         int axis,
         std::int64_t start,
-        std::int64_t length);
-    DeviceTensor copy_strided_to_device(
-        const std::string& name,
-        const std::vector<TensorSlice>& slices);
+        std::int64_t length,
+        void* dst,
+        const std::vector<std::int64_t>& dst_shape);
     void copy_strided_to_device(
         const std::string& name,
         const std::vector<TensorSlice>& slices,

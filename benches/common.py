@@ -191,6 +191,10 @@ def add_common_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--tp-size", type=int, default=1)
     p.add_argument("--gpu-mem-util", type=float, default=0.80)
     p.add_argument("--max-model-len", type=int, default=2048)
+    p.add_argument("--sglang-attention-backend", default=None)
+    p.add_argument("--sglang-sampling-backend", default=None)
+    p.add_argument("--sglang-disable-cuda-graph", action=argparse.BooleanOptionalAction, default=False)
+    p.add_argument("--sglang-disable-piecewise-cuda-graph", action=argparse.BooleanOptionalAction, default=False)
     p.add_argument(
         "--wasm-delay-us",
         type=int,

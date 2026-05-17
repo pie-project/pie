@@ -571,8 +571,9 @@ Last updated: 2026-05-17.
 ### Implemented
 
 - `SafetensorsLoader` parses checkpoint metadata and copies full tensors or
-  generic contiguous/strided tensor slices to device memory. It no longer has
-  MoE-specific copy entry points.
+  generic contiguous/strided tensor slices into caller-owned device memory. It
+  has no allocation-returning API and no MoE-specific copy entry points; all
+  allocation, layout, and lifetime decisions live in the materializer.
 - `ModelSchema` exists as a first explicit schema resolution layer.
 - `LogicalTensorGraph` is a distinct checkpoint-binding stage that records raw
   checkpoint names, runtime names, inferred semantic roles, dtype, and shape
@@ -600,6 +601,10 @@ Last updated: 2026-05-17.
   keeping all packed inputs alive at once.
 - `FuseMoeExperts` can stream per-expert checkpoint rows directly into final
   fused expert tensors instead of staging checkpoint-shaped source tensors.
+- Raw `Copy`, `Shard`, `Read`, `RowRangeShard`, `MoeGateUpShard`, and
+  `MoeDownShard` ops copy checkpoint bytes directly into final or planned
+  temporary destinations. BF16 dense Qwen-style packed plans no longer create
+  full checkpoint-shaped device buffers for projection tensors before packing.
 - `WeightStore` stores `TensorRecord { spec, tensor }`, counts only owned
   resident tensors for memory accounting, and rejects erasing a backing tensor
   while a registered view or alias still depends on it.
@@ -832,6 +837,11 @@ Latest verification:
 - Current-turn verification: Qwen3-0.6B CUDA native one-token smoke completed
   1/1 with 98.9 ms mean latency. Dumped plan: 171 `Copy`, 56 `PackRows`,
   persistent 1,433 MiB, temp 6 MiB, and zero post-load transforms.
+- Qwen3-32B direct CUDA native load after direct-to-final materialization:
+  load compiler emitted 515 load ops and 835 runtime tensor specs, persistent
+  62,488 MiB, load-time temp <= 0 MiB, peak ~= 62,488 MiB, with 64 packed QKV
+  groups and 64 packed gate/up groups. The model loaded 835 tensors in about
+  5 seconds on the RTX PRO 6000 Blackwell Server Edition.
 - Synthetic load-plan tests include Qwen MoE TP expert sharding and GPT-OSS
   MXFP4 target selection: BF16 fallback emits `Dequantize` /
   `SplitInterleaved` / `Slice` ops, while packed-runtime targets emit
@@ -895,6 +905,19 @@ Latest verification:
   - `allenai/Olmo-3-7B-Instruct`
   - `mistralai/Ministral-3-3B-Instruct-2512`
   - `mistralai/Mixtral-8x7B-Instruct-v0.1`
+- Qwen3-32B latency/throughput comparison on the same host, using
+  `max_model_len=1024`, `max_tokens=16`, 3 latency requests with 1 warmup, and
+  16 throughput requests at concurrency 4:
+  - Pie CUDA native: 789.5 ms mean latency, 20.26 output tok/s latency run,
+    76.89 output tok/s throughput run.
+  - vLLM 0.10.2 with Torch 2.8.0+cu128 and Transformers 4.55.4: 747.6 ms mean
+    latency, 21.40 output tok/s latency run, 78.69 output tok/s throughput
+    run.
+  - SGLang local checkout with Torch 2.8.0+cu128, local SM120 `sgl-kernel`,
+    Triton attention, PyTorch sampling, CUDA graphs disabled, piecewise CUDA
+    graphs disabled, FlashInfer arch override `FLASHINFER_CUDA_ARCH_LIST=12.0a`,
+    and PDL disabled for CUDA 12.8/SM120 compatibility: 785.9 ms mean latency,
+    20.36 output tok/s latency run, 73.93 output tok/s throughput run.
 
 ## Paper Framing
 

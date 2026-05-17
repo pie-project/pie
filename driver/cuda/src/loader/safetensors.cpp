@@ -174,28 +174,48 @@ const TensorInfo& SafetensorsLoader::info(const std::string& name) const {
     return it->second;
 }
 
-DeviceTensor SafetensorsLoader::load_to_device(const std::string& name) {
+void SafetensorsLoader::copy_to_device(
+    const std::string& name,
+    void* dst,
+    const std::vector<std::int64_t>& dst_shape)
+{
     const auto& ti = info(name);
+    if (dst == nullptr) {
+        throw std::runtime_error(
+            "safetensors: null destination for tensor '" + name + "'");
+    }
+    if (dst_shape != ti.shape) {
+        throw std::runtime_error(
+            "safetensors: destination shape mismatch for tensor '" + name + "'");
+    }
     auto& shard = shards_[ti.shard_id];
     if (!shard.data) open_shard_(shard);
 
-    auto t = DeviceTensor::allocate(ti.dtype, ti.shape);
-
     const auto* host_src = shard.data + shard.data_section_offset + ti.data_offset;
-    CUDA_CHECK(cudaMemcpy(t.data(), host_src, ti.nbytes, cudaMemcpyHostToDevice));
-    return t;
+    CUDA_CHECK(cudaMemcpy(dst, host_src, ti.nbytes, cudaMemcpyHostToDevice));
 }
 
-DeviceTensor SafetensorsLoader::load_to_device_sharded(
-    const std::string& name, int axis, int rank, int world_size)
+void SafetensorsLoader::copy_shard_to_device(
+    const std::string& name,
+    int axis,
+    int rank,
+    int world_size,
+    void* dst,
+    const std::vector<std::int64_t>& dst_shape)
 {
     if (world_size <= 1 || axis < 0) {
-        return load_to_device(name);
+        copy_to_device(name, dst, dst_shape);
+        return;
     }
 
     const auto& ti = info(name);
     const auto plan = pie_driver_common::plan_axis_shard(
-        ti.shape, axis, rank, world_size, "load_to_device_sharded: " + name);
+        ti.shape, axis, rank, world_size, "copy_shard_to_device: " + name);
+    if (plan.output_shape != dst_shape) {
+        throw std::runtime_error(
+            "safetensors: destination shape mismatch for sharded tensor '" +
+            name + "'");
+    }
     const std::int64_t shard_dim = plan.shard_dim;
 
     auto& shard = shards_[ti.shard_id];
@@ -203,58 +223,42 @@ DeviceTensor SafetensorsLoader::load_to_device_sharded(
     const auto* host_base = shard.data + shard.data_section_offset + ti.data_offset;
     const std::size_t elem = dtype_bytes(ti.dtype);
 
-    auto t = DeviceTensor::allocate(ti.dtype, plan.output_shape);
-
     if (axis == 0) {
         // Contiguous slice along the leading dim: rank `r` owns bytes
         // [r*per_rank, (r+1)*per_rank).
-        const std::size_t per_rank = ti.nbytes / world_size;
-        const auto* host_src = host_base + per_rank * rank;
-        CUDA_CHECK(cudaMemcpy(t.data(), host_src, per_rank,
-                              cudaMemcpyHostToDevice));
+        std::int64_t inner = 1;
+        for (std::size_t i = 1; i < ti.shape.size(); ++i) {
+            inner *= ti.shape[i];
+        }
+        const std::size_t bytes =
+            static_cast<std::size_t>(shard_dim) *
+            static_cast<std::size_t>(inner) * elem;
+        const auto* host_src =
+            host_base + static_cast<std::size_t>(plan.offset) *
+                            static_cast<std::size_t>(inner) * elem;
+        CUDA_CHECK(cudaMemcpy(dst, host_src, bytes, cudaMemcpyHostToDevice));
     } else {
-        // 2-D row-parallel: keep all rows (d0) but only this rank's column
-        // band on the inner dim (d1). Use a 2-D pitched copy: each row is
-        // (d1/world_size) elements wide, source pitch is d1 elements.
-        const std::int64_t d0 = ti.shape[0];
-        const std::int64_t d1 = ti.shape[1];
-        const std::size_t row_bytes = static_cast<std::size_t>(shard_dim) * elem;
-        const std::size_t src_pitch = static_cast<std::size_t>(d1) * elem;
-        const std::size_t dst_pitch = row_bytes;
-        const auto* host_src = host_base + (row_bytes * rank);
-        CUDA_CHECK(cudaMemcpy2D(
-            t.data(), dst_pitch,
-            host_src, src_pitch,
-            row_bytes, static_cast<std::size_t>(d0),
-            cudaMemcpyHostToDevice));
-        (void)d1;
+        copy_strided_to_device(
+            name,
+            {TensorSlice{axis, plan.offset, shard_dim}},
+            dst,
+            dst_shape);
     }
-    return t;
 }
 
-DeviceTensor SafetensorsLoader::copy_slice_to_device(
+void SafetensorsLoader::copy_slice_to_device(
     const std::string& name,
     int axis,
     std::int64_t start,
-    std::int64_t length)
+    std::int64_t length,
+    void* dst,
+    const std::vector<std::int64_t>& dst_shape)
 {
-    return copy_strided_to_device(name, {TensorSlice{axis, start, length}});
-}
-
-DeviceTensor SafetensorsLoader::copy_strided_to_device(
-    const std::string& name,
-    const std::vector<TensorSlice>& slices)
-{
-    const auto& ti = info(name);
-    if (slices.empty()) return load_to_device(name);
-
-    std::vector<std::int64_t> start(ti.shape.size(), 0);
-    const auto shape = normalize_slices(ti, slices, name, start);
-    (void)start;
-
-    DeviceTensor out = DeviceTensor::allocate(ti.dtype, shape);
-    copy_strided_to_device(name, slices, out.data(), shape);
-    return out;
+    copy_strided_to_device(
+        name,
+        {TensorSlice{axis, start, length}},
+        dst,
+        dst_shape);
 }
 
 void SafetensorsLoader::copy_strided_to_device(
@@ -267,6 +271,10 @@ void SafetensorsLoader::copy_strided_to_device(
     if (dst == nullptr) {
         throw std::runtime_error(
             "safetensors: null destination for sliced tensor '" + name + "'");
+    }
+    if (slices.empty()) {
+        copy_to_device(name, dst, dst_shape);
+        return;
     }
 
     std::vector<std::int64_t> start;

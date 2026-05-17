@@ -251,12 +251,6 @@ bool try_add_packed_qkv(
         {v_rows, cols}, TensorLayoutKind::View,
         TensorOwnershipKind::BorrowedView, TensorParallelKind::Column,
         packed_name);
-    estimate_temporary_bytes(
-        plan,
-        std::max({static_cast<std::uint64_t>(q_rows * cols * dtype_bytes(qi.dtype)),
-                  static_cast<std::uint64_t>(k_rows * cols * dtype_bytes(ki.dtype)),
-                  static_cast<std::uint64_t>(v_rows * cols * dtype_bytes(vi.dtype))}));
-
     consumed_raw.insert(raw_q);
     consumed_raw.insert(raw_k);
     consumed_raw.insert(raw_v);
@@ -319,13 +313,6 @@ bool try_add_packed_gate_up(
         {up_rows, cols}, TensorLayoutKind::View,
         TensorOwnershipKind::BorrowedView, TensorParallelKind::Column,
         packed_name);
-    estimate_temporary_bytes(
-        plan,
-        std::max(static_cast<std::uint64_t>(
-                     gate_rows * cols * dtype_bytes(gi.dtype)),
-                 static_cast<std::uint64_t>(
-                     up_rows * cols * dtype_bytes(ui.dtype))));
-
     consumed_raw.insert(raw_gate);
     consumed_raw.insert(raw_up);
     return true;

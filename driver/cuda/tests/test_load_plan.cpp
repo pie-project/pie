@@ -171,6 +171,7 @@ void test_dense_qwen_plan_packs_projection_groups() {
     CHECK_EQ(plan.packed_gate_up_groups, std::size_t{1});
     CHECK_EQ(count_ops(plan, pie_cuda_driver::LoadOpKind::PackRows),
              std::size_t{2});
+    CHECK_EQ(plan.memory.max_temporary_bytes, std::uint64_t{0});
     CHECK(!has_copy_output(plan, "model.layers.0.self_attn.q_proj.weight"));
     CHECK(!has_copy_output(plan, "model.layers.0.self_attn.k_proj.weight"));
     CHECK(!has_copy_output(plan, "model.layers.0.self_attn.v_proj.weight"));

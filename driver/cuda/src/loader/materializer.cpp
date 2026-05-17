@@ -28,26 +28,49 @@ namespace pie_cuda_driver {
 
 namespace {
 
-DeviceTensor load_sharded_or_full(
+const TensorSpec& tensor_spec_for(
+    const LoadPlan& plan,
+    const std::string& name);
+
+std::uint64_t copy_raw_to_output(
+    const LoadOp& op,
+    const LoadPlan& plan,
     SafetensorsLoader& loader,
-    const std::string& raw_name,
-    int axis,
+    WeightStoreBuilder& weights,
     int tp_rank,
     int tp_size)
 {
-    return (tp_size > 1 && axis >= 0)
-        ? loader.load_to_device_sharded(raw_name, axis, tp_rank, tp_size)
-        : loader.load_to_device(raw_name);
+    const TensorSpec& out_spec = tensor_spec_for(plan, load_op_output(op));
+    const TensorInfo& info = loader.info(load_op_raw_name(op));
+    if (info.dtype != out_spec.dtype) {
+        throw std::runtime_error(
+            "load plan: raw copy dtype mismatch for '" + out_spec.name + "'");
+    }
+    DeviceTensor out = DeviceTensor::allocate(out_spec.dtype, out_spec.shape);
+    loader.copy_shard_to_device(
+        load_op_raw_name(op),
+        load_op_shard_axis(op),
+        tp_rank,
+        tp_size,
+        out.data(),
+        out_spec.shape);
+    const std::uint64_t bytes = out.nbytes();
+    weights.insert(out_spec.name, std::move(out), out_spec);
+    return bytes;
 }
 
-DeviceTensor load_row_range_sharded(
+std::uint64_t copy_row_range_to_output(
+    const LoadOp& op,
+    const LoadPlan& plan,
     SafetensorsLoader& loader,
-    const std::string& raw_name,
-    std::int64_t row_offset,
-    std::int64_t rows,
+    WeightStoreBuilder& weights,
     int tp_rank,
     int tp_size)
 {
+    const TensorSpec& out_spec = tensor_spec_for(plan, load_op_output(op));
+    const std::string& raw_name = load_op_raw_name(op);
+    const std::int64_t row_offset = load_op_row_offset(op);
+    const std::int64_t rows = load_op_rows(op);
     if (rows <= 0) {
         throw std::runtime_error(
             "load plan: row-range shard has non-positive row count for '" +
@@ -64,17 +87,25 @@ DeviceTensor load_row_range_sharded(
         local_rows = rows / tp_size;
         local_offset += static_cast<std::int64_t>(tp_rank) * local_rows;
     }
-    return loader.copy_slice_to_device(
-        raw_name, /*axis=*/0, local_offset, local_rows);
+    DeviceTensor out = DeviceTensor::allocate(out_spec.dtype, out_spec.shape);
+    loader.copy_slice_to_device(
+        raw_name, /*axis=*/0, local_offset, local_rows,
+        out.data(), out_spec.shape);
+    const std::uint64_t bytes = out.nbytes();
+    weights.insert(out_spec.name, std::move(out), out_spec);
+    return bytes;
 }
 
-DeviceTensor load_moe_gate_up_sharded(
+std::uint64_t copy_moe_gate_up_to_output(
+    const LoadOp& op,
+    const LoadPlan& plan,
     SafetensorsLoader& loader,
-    const std::string& raw_name,
-    const TensorSpec& out_spec,
+    WeightStoreBuilder& weights,
     int tp_rank,
     int tp_size)
 {
+    const TensorSpec& out_spec = tensor_spec_for(plan, load_op_output(op));
+    const std::string& raw_name = load_op_raw_name(op);
     const TensorInfo& info = loader.info(raw_name);
     if (info.shape.size() != 3 || out_spec.shape.size() != 3) {
         throw std::runtime_error(
@@ -108,31 +139,34 @@ DeviceTensor load_moe_gate_up_sharded(
         static_cast<std::int64_t>(tp_rank) * I_local;
     const std::int64_t up_start = I + gate_start;
     auto* dst = static_cast<std::uint8_t*>(out.data());
+    const std::vector<std::int64_t> slice_shape{1, I_local, H};
     for (std::int64_t e = 0; e < E; ++e) {
-        DeviceTensor gate = loader.copy_strided_to_device(
+        loader.copy_strided_to_device(
             raw_name,
-            {TensorSlice{0, e, 1}, TensorSlice{1, gate_start, I_local}});
-        DeviceTensor up = loader.copy_strided_to_device(
-            raw_name,
-            {TensorSlice{0, e, 1}, TensorSlice{1, up_start, I_local}});
-        CUDA_CHECK(cudaMemcpyAsync(
+            {TensorSlice{0, e, 1}, TensorSlice{1, gate_start, I_local}},
             dst + static_cast<std::size_t>(e) * expert_bytes,
-            gate.data(), expert_half_bytes, cudaMemcpyDeviceToDevice,
-            /*stream=*/0));
-        CUDA_CHECK(cudaMemcpyAsync(
+            slice_shape);
+        loader.copy_strided_to_device(
+            raw_name,
+            {TensorSlice{0, e, 1}, TensorSlice{1, up_start, I_local}},
             dst + static_cast<std::size_t>(e) * expert_bytes + expert_half_bytes,
-            up.data(), expert_half_bytes, cudaMemcpyDeviceToDevice, /*stream=*/0));
+            slice_shape);
     }
-    return out;
+    const std::uint64_t bytes = out.nbytes();
+    weights.insert(out_spec.name, std::move(out), out_spec);
+    return bytes;
 }
 
-DeviceTensor load_moe_down_sharded(
+std::uint64_t copy_moe_down_to_output(
+    const LoadOp& op,
+    const LoadPlan& plan,
     SafetensorsLoader& loader,
-    const std::string& raw_name,
-    const TensorSpec& out_spec,
+    WeightStoreBuilder& weights,
     int tp_rank,
     int tp_size)
 {
+    const TensorSpec& out_spec = tensor_spec_for(plan, load_op_output(op));
+    const std::string& raw_name = load_op_raw_name(op);
     const TensorInfo& info = loader.info(raw_name);
     if (info.shape.size() != 3 || out_spec.shape.size() != 3) {
         throw std::runtime_error(
@@ -151,9 +185,15 @@ DeviceTensor load_moe_down_sharded(
         throw std::runtime_error(
             "load plan: MoE down output spec mismatch for '" + out_spec.name + "'");
     }
-    return loader.copy_strided_to_device(
+    DeviceTensor out = DeviceTensor::allocate(out_spec.dtype, out_spec.shape);
+    loader.copy_strided_to_device(
         raw_name,
-        {TensorSlice{2, static_cast<std::int64_t>(tp_rank) * I_local, I_local}});
+        {TensorSlice{2, static_cast<std::int64_t>(tp_rank) * I_local, I_local}},
+        out.data(),
+        out_spec.shape);
+    const std::uint64_t bytes = out.nbytes();
+    weights.insert(out_spec.name, std::move(out), out_spec);
+    return bytes;
 }
 
 const TensorSpec& tensor_spec_for(
@@ -1499,62 +1539,30 @@ MaterializedLoadPlan Materializer::run(const LoadPlan& plan)
 
     for (const auto& op : plan.ops) {
         switch (op.kind) {
-        case LoadOpKind::Copy: {
-            DeviceTensor t = load_sharded_or_full(
-                loader_, load_op_raw_name(op), load_op_shard_axis(op), tp_rank_, tp_size_);
-            result.loaded_bytes += t.nbytes();
-            builder_.insert(
-                load_op_output(op), std::move(t),
-                tensor_spec_for(plan, load_op_output(op)));
+        case LoadOpKind::Copy:
+            result.loaded_bytes += copy_raw_to_output(
+                op, plan, loader_, builder_, tp_rank_, tp_size_);
             break;
-        }
-        case LoadOpKind::Shard: {
-            DeviceTensor t = load_sharded_or_full(
-                loader_, load_op_raw_name(op), load_op_shard_axis(op), tp_rank_, tp_size_);
-            result.loaded_bytes += t.nbytes();
-            builder_.insert(
-                load_op_output(op), std::move(t),
-                tensor_spec_for(plan, load_op_output(op)));
+        case LoadOpKind::Shard:
+            result.loaded_bytes += copy_raw_to_output(
+                op, plan, loader_, builder_, tp_rank_, tp_size_);
             break;
-        }
-        case LoadOpKind::Read: {
-            DeviceTensor t = loader_.load_to_device(load_op_raw_name(op));
-            result.loaded_bytes += t.nbytes();
-            builder_.insert(
-                load_op_output(op), std::move(t),
-                tensor_spec_for(plan, load_op_output(op)));
+        case LoadOpKind::Read:
+            result.loaded_bytes += copy_raw_to_output(
+                op, plan, loader_, builder_, tp_rank_, tp_size_);
             break;
-        }
-        case LoadOpKind::RowRangeShard: {
-            DeviceTensor t = load_row_range_sharded(
-                loader_, load_op_raw_name(op), load_op_row_offset(op), load_op_rows(op),
-                tp_rank_, tp_size_);
-            result.loaded_bytes += t.nbytes();
-            builder_.insert(
-                load_op_output(op), std::move(t),
-                tensor_spec_for(plan, load_op_output(op)));
+        case LoadOpKind::RowRangeShard:
+            result.loaded_bytes += copy_row_range_to_output(
+                op, plan, loader_, builder_, tp_rank_, tp_size_);
             break;
-        }
-        case LoadOpKind::MoeGateUpShard: {
-            const TensorSpec& out_spec = tensor_spec_for(plan, load_op_output(op));
-            DeviceTensor t = load_moe_gate_up_sharded(
-                loader_, load_op_raw_name(op), out_spec, tp_rank_, tp_size_);
-            result.loaded_bytes += t.nbytes();
-            builder_.insert(
-                load_op_output(op), std::move(t),
-                out_spec);
+        case LoadOpKind::MoeGateUpShard:
+            result.loaded_bytes += copy_moe_gate_up_to_output(
+                op, plan, loader_, builder_, tp_rank_, tp_size_);
             break;
-        }
-        case LoadOpKind::MoeDownShard: {
-            const TensorSpec& out_spec = tensor_spec_for(plan, load_op_output(op));
-            DeviceTensor t = load_moe_down_sharded(
-                loader_, load_op_raw_name(op), out_spec, tp_rank_, tp_size_);
-            result.loaded_bytes += t.nbytes();
-            builder_.insert(
-                load_op_output(op), std::move(t),
-                out_spec);
+        case LoadOpKind::MoeDownShard:
+            result.loaded_bytes += copy_moe_down_to_output(
+                op, plan, loader_, builder_, tp_rank_, tp_size_);
             break;
-        }
         case LoadOpKind::PackRows:
             result.loaded_bytes += materialize_pack_rows(
                 op, plan, loader_, builder_, tp_rank_, tp_size_);
