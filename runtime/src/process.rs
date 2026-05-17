@@ -5,13 +5,17 @@
 //! Direct Addressing.
 
 use std::collections::VecDeque;
-use std::sync::{Arc, LazyLock, OnceLock};
+use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 use std::time::Instant;
 
 use anyhow::{Result, anyhow};
 use tokio::sync::{Semaphore, oneshot};
 use tokio::task::JoinHandle;
 use uuid::Uuid;
+
+/// Shared oneshot sender. Used so that an external Terminate can deliver
+/// the cancellation result if the WASM task is aborted before it can send.
+type SharedResultTx = Arc<Mutex<Option<oneshot::Sender<Result<String, String>>>>>;
 
 use crate::context;
 use crate::linker;
@@ -248,6 +252,9 @@ struct Process {
     output_buffer: VecDeque<ProcessEvent>,
     /// Optional link to the workflow that spawned this process.
     workflow_id: Option<WorkflowId>,
+    /// Shared with the WASM task. Whoever takes it first (the run loop on
+    /// normal completion, or an external terminate) delivers the result.
+    result_tx: SharedResultTx,
 }
 
 impl Process {
@@ -263,6 +270,7 @@ impl Process {
         token_budget: Option<usize>,
     ) -> Self {
         let process_id = Uuid::new_v4();
+        let result_tx: SharedResultTx = Arc::new(Mutex::new(result_tx));
 
         let handle = tokio::spawn(Self::run(
             process_id,
@@ -270,7 +278,7 @@ impl Process {
             program.clone(),
             input.clone(),
             capture_outputs,
-            result_tx,
+            result_tx.clone(),
             token_budget,
         ));
 
@@ -285,6 +293,7 @@ impl Process {
             capture_outputs,
             output_buffer: VecDeque::new(),
             workflow_id,
+            result_tx,
         }
     }
 
@@ -336,7 +345,7 @@ impl Process {
         program: ProgramName,
         input: String,
         capture_outputs: bool,
-        result_tx: Option<oneshot::Sender<Result<String, String>>>,
+        result_tx: SharedResultTx,
         token_budget: Option<usize>,
     ) {
         // Admission control: wait for a permit before instantiating.
@@ -384,8 +393,9 @@ impl Process {
             tracing::info!("Process {process_id} failed: {err}");
         }
 
-        // Fire result channel if a parent is waiting
-        if let Some(tx) = result_tx {
+        // Fire result channel if a parent is waiting (and an external
+        // terminate hasn't already claimed it).
+        if let Some(tx) = result_tx.lock().unwrap().take() {
             let _ = tx.send(result.clone());
         }
 
@@ -395,6 +405,13 @@ impl Process {
     /// Abort the WASM execution task, notify any attached client, and unregister.
     fn terminate(&mut self, result: Result<String, String>) {
         self.handle.abort();
+
+        // Deliver `result` to any parent waiting on the launch handle, if the
+        // run loop didn't already send it (e.g., external Terminate fires
+        // before the WASM task finished). First taker wins.
+        if let Some(tx) = self.result_tx.lock().unwrap().take() {
+            let _ = tx.send(result.clone());
+        }
 
         // Notify attached client / workflow
         match result {
