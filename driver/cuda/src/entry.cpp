@@ -492,10 +492,9 @@ int profile_decode_target(const std::string& profile,
                           const cudaDeviceProp& prop) {
     // Decode throughput has a real knee: below it we leave SMs underfed,
     // above it we often inflate attention/KV pressure without increasing
-    // useful device occupancy. TP halves per-rank matmul work, so TP=2 needs
-    // roughly twice the active request count to hit the same per-rank knee.
-    const int tp = std::max(1, cfg.distributed.tp_size);
-    const int sm_factor = tp == 1 ? 2 : 4;
+    // useful device occupancy. The first-order knee tracks SM count; larger
+    // GPUs need enough independent rows to keep the decode matmuls full.
+    const int sm_factor = 4;
     int target = clamp_pow2_nearest(
         prop.multiProcessorCount * sm_factor, 64, 2048);
     if (profile == "latency") {
@@ -670,13 +669,6 @@ CudaMemoryPlan plan_cuda_memory(
     }
     uniq_clip_desc(Ns, 8192);
     uniq_clip_desc(Rs, 4096);
-    if ((policy_profile == "throughput" || auto_profile) && tp_size == 1) {
-        Rs.erase(
-            std::remove_if(Rs.begin(), Rs.end(),
-                           [decode_target](int r) { return r > decode_target; }),
-            Rs.end());
-    }
-
     for (int kv_page_size : kv_page_sizes) {
         const std::size_t per_page_bytes =
             per_kv_token_bytes * static_cast<std::size_t>(kv_page_size);
