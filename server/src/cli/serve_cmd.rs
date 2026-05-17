@@ -124,7 +124,7 @@ fn display_config_from(cfg: &config::Config) -> Result<DisplayConfig> {
         device: m.driver.device.clone(),
         tensor_parallel_size: m.driver.tensor_parallel_size,
         activation_dtype: m.driver.activation_dtype.clone(),
-        memory_profile: extract_memory_profile(m).unwrap_or_else(|| "balanced".to_string()),
+        memory_profile: extract_memory_profile(m).unwrap_or_else(|| "auto".to_string()),
     })
 }
 

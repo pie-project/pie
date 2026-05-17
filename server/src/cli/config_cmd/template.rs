@@ -68,7 +68,7 @@ hf_repo = "Qwen/Qwen3-0.6B"
 batch_policy = "adaptive"
 request_timeout_secs = 120
 default_endowment_pages = 64
-admission_oversubscription_factor = 4.0
+admission_oversubscription_factor = 1.0
 restore_pause_at_utilization = 0.85
 # Per-context depth of pass-level speculative execution. `0`
 # disables speculation entirely (every submit goes through the

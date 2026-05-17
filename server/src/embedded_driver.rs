@@ -470,6 +470,7 @@ pub(crate) fn write_cuda_startup_toml(
         &mut batching,
         "memory_profile",
         match opts.memory_profile {
+            CudaMemoryProfile::Auto => "auto",
             CudaMemoryProfile::Latency => "latency",
             CudaMemoryProfile::Balanced => "balanced",
             CudaMemoryProfile::Throughput => "throughput",
@@ -1043,10 +1044,7 @@ mod tests {
             val["batching"]["gpu_mem_utilization"].as_float().unwrap(),
             0.90
         );
-        assert_eq!(
-            val["batching"]["memory_profile"].as_str().unwrap(),
-            "balanced"
-        );
+        assert_eq!(val["batching"]["memory_profile"].as_str().unwrap(), "auto");
         assert_eq!(val["batching"].as_table().unwrap().len(), 3);
         assert_eq!(val["batching"]["swap_pool_size"].as_integer().unwrap(), 0);
         assert_eq!(val["runtime"]["verbose"].as_bool().unwrap(), false);

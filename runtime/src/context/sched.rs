@@ -196,13 +196,32 @@ impl ContextManager {
         };
 
         // Admission gate: Σ endowment ≤ total_capacity × admission_oversubscription_factor.
-        // Each endowment unit is a claim on one page of long-run GPU residency;
-        // selling more than capacity × factor would overcommit beyond what
-        // duty-cycle averaging can absorb.
+        // Each endowment unit is a claim on one page of long-run GPU residency.
+        //
+        // Once the pool has denied an admission, avoid trickle-refilling one
+        // replacement process at a time. Wait until enough endowment has
+        // drained to admit a full forward cohort again; otherwise batch
+        // serving devolves into a long tail of tiny decode batches.
         let sigma_e: f64 = self.processes.values().map(|p| p.endowment).sum();
         let total_capacity: f64 = self.gpu_stores.iter().map(|s| s.total_pages() as f64).sum();
         let cap = total_capacity * self.admission_oversubscription_factor;
+        if self.admission_drain_barrier {
+            let cohort_endowment = endowment_pages * self.max_forward_requests as f64;
+            let resume_below = (cap - cohort_endowment).max(0.0);
+            if sigma_e > resume_below {
+                return Err(AdmissionDenied {
+                    endowment_pages,
+                    total_after: sigma_e + endowment_pages,
+                    cap,
+                    total_capacity,
+                    oversubscription_factor: self.admission_oversubscription_factor,
+                }
+                .into());
+            }
+            self.admission_drain_barrier = false;
+        }
         if sigma_e + endowment_pages > cap {
+            self.admission_drain_barrier = true;
             return Err(AdmissionDenied {
                 endowment_pages,
                 total_after: sigma_e + endowment_pages,
@@ -1092,8 +1111,17 @@ mod tests {
         held_pages: usize,
         bid: f64,
     ) -> (ContextManager, ProcessId, ContextId) {
-        let mut mgr =
-            ContextManager::new(0, 16, &[num_pages], &[num_pages], 10, None, 10000.0, 0.85);
+        let mut mgr = ContextManager::new(
+            0,
+            16,
+            &[num_pages],
+            &[num_pages],
+            1,
+            10,
+            None,
+            10000.0,
+            0.85,
+        );
         let pid = ProcessId::new_v4();
         mgr.register_process(pid, Some(160)).unwrap(); // 10 pages at page_size=16
 
@@ -1195,7 +1223,7 @@ mod tests {
     #[test]
     fn rent_redistributes_between_processes_under_contention() {
         // Both processes get large budgets so payment isn't balance-capped.
-        let mut mgr = ContextManager::new(0, 16, &[10], &[10], 10, None, 10000.0, 0.85);
+        let mut mgr = ContextManager::new(0, 16, &[10], &[10], 1, 10, None, 10000.0, 0.85);
 
         let payer_pid = ProcessId::new_v4();
         mgr.register_process(payer_pid, Some(16 * 1000)).unwrap(); // 1000-page budget
@@ -1248,7 +1276,7 @@ mod tests {
     /// ⌈budget / page_size⌉ pages. The two are independent quantities.
     #[test]
     fn register_process_sets_both_wallets() {
-        let mut mgr = ContextManager::new(0, 16, &[100], &[100], 10, None, 10000.0, 0.85);
+        let mut mgr = ContextManager::new(0, 16, &[100], &[100], 1, 10, None, 10000.0, 0.85);
         let pid = ProcessId::new_v4();
         mgr.register_process(pid, Some(1000)).unwrap();
 
@@ -1270,7 +1298,7 @@ mod tests {
     /// which is unlimited (None) by system policy.
     #[test]
     fn register_process_without_budget_is_unlimited() {
-        let mut mgr = ContextManager::new(0, 16, &[100], &[100], 10, None, 10000.0, 0.85);
+        let mut mgr = ContextManager::new(0, 16, &[100], &[100], 1, 10, None, 10000.0, 0.85);
         let pid = ProcessId::new_v4();
         mgr.register_process(pid, None).unwrap();
         assert_eq!(
@@ -1289,7 +1317,7 @@ mod tests {
     /// unlimited wallets untouched.
     #[test]
     fn debit_tokens_is_monotone_and_saturates() {
-        let mut mgr = ContextManager::new(0, 16, &[100], &[100], 10, None, 10000.0, 0.85);
+        let mut mgr = ContextManager::new(0, 16, &[100], &[100], 1, 10, None, 10000.0, 0.85);
         let pid = ProcessId::new_v4();
         mgr.register_process(pid, Some(100)).unwrap();
         assert_eq!(mgr.process_entry(pid).tokens_remaining, Some(100));
@@ -1370,7 +1398,7 @@ mod tests {
     #[test]
     fn conservation_holds_under_default() {
         // Small token budget → small endowment → payer goes under.
-        let mut mgr = ContextManager::new(0, 16, &[10], &[10], 10, None, 10000.0, 0.85);
+        let mut mgr = ContextManager::new(0, 16, &[10], &[10], 1, 10, None, 10000.0, 0.85);
 
         let payer_pid = ProcessId::new_v4();
         mgr.register_process(payer_pid, Some(16)).unwrap(); // endowment = 1 page
@@ -1423,7 +1451,7 @@ mod tests {
     #[test]
     fn admission_gate_at_factor_1_enforces_capacity() {
         // 10 pages total, strict (factor = 1.0).
-        let mut mgr = ContextManager::new(0, 16, &[10], &[10], 1, None, 1.0, 0.85);
+        let mut mgr = ContextManager::new(0, 16, &[10], &[10], 1, 1, None, 1.0, 0.85);
 
         // 10 processes of 1 endowment-page each fit exactly.
         for _ in 0..10 {
@@ -1443,7 +1471,7 @@ mod tests {
     /// At factor = 2.0, the cap is 2× physical capacity.
     #[test]
     fn admission_gate_overbook_factor_scales_cap() {
-        let mut mgr = ContextManager::new(0, 16, &[10], &[10], 1, None, 2.0, 0.85);
+        let mut mgr = ContextManager::new(0, 16, &[10], &[10], 1, 1, None, 2.0, 0.85);
 
         // 20 processes at 1 page each = 20 endowment ≤ 20 cap. All admit.
         for _ in 0..20 {
@@ -1457,7 +1485,7 @@ mod tests {
     /// admission budget and the next admission succeeds.
     #[test]
     fn admission_frees_budget_on_unregister() {
-        let mut mgr = ContextManager::new(0, 16, &[10], &[10], 1, None, 1.0, 0.85);
+        let mut mgr = ContextManager::new(0, 16, &[10], &[10], 1, 1, None, 1.0, 0.85);
 
         let pids: Vec<_> = (0..10)
             .map(|_| {
@@ -1478,11 +1506,40 @@ mod tests {
             .expect("admission should succeed after unregister");
     }
 
+    /// After a saturated cohort has produced waiters, admission waits for
+    /// enough free endowment to admit another full forward cohort. This avoids
+    /// one-at-a-time tail refills that fragment decode batches.
+    #[test]
+    fn admission_denial_drains_until_forward_cohort_fits() {
+        let mut mgr = ContextManager::new(0, 16, &[10], &[10], 4, 1, None, 1.0, 0.85);
+
+        let pids: Vec<_> = (0..10)
+            .map(|_| {
+                let pid = ProcessId::new_v4();
+                mgr.register_process(pid, Some(16)).unwrap();
+                pid
+            })
+            .collect();
+        assert!(mgr.register_process(ProcessId::new_v4(), Some(16)).is_err());
+
+        mgr.unregister_process(pids[0]);
+        assert!(
+            mgr.register_process(ProcessId::new_v4(), Some(16)).is_err(),
+            "one freed slot should not trickle-admit after a saturation denial"
+        );
+
+        for pid in &pids[1..4] {
+            mgr.unregister_process(*pid);
+        }
+        mgr.register_process(ProcessId::new_v4(), Some(16))
+            .expect("admission should resume once a full cohort fits");
+    }
+
     /// Capacity is summed across drivers — endowment competes against the
     /// total GPU pool, not just one driver.
     #[test]
     fn admission_cap_is_sum_across_devices() {
-        let mut mgr = ContextManager::new(0, 16, &[5, 5], &[5, 5], 1, None, 1.0, 0.85);
+        let mut mgr = ContextManager::new(0, 16, &[5, 5], &[5, 5], 1, 1, None, 1.0, 0.85);
         // 10 pages total across 2 drivers.
         for _ in 0..10 {
             mgr.register_process(ProcessId::new_v4(), Some(16)).unwrap();

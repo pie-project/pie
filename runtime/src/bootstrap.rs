@@ -234,11 +234,17 @@ async fn bootstrap_inner(config: Config, listener: Option<TcpListener>) -> Resul
 
         let num_gpu_pages: Vec<usize> = cfg.drivers.iter().map(|d| d.total_pages).collect();
         let num_cpu_pages: Vec<usize> = cfg.drivers.iter().map(|d| d.cpu_pages).collect();
+        let max_forward_requests: usize = cfg
+            .drivers
+            .iter()
+            .map(|d| d.limits.max_forward_requests)
+            .sum();
 
         context::spawn(
             cfg.kv_page_size,
             num_gpu_pages,
             num_cpu_pages,
+            max_forward_requests,
             cfg.scheduler.default_endowment_pages.max(1),
             cfg.scheduler.default_token_limit,
             cfg.scheduler.admission_oversubscription_factor,

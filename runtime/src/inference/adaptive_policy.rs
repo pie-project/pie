@@ -223,18 +223,13 @@ impl SchedulingPolicy for AdaptivePolicy {
         self.in_flight = true;
         // Reset per-batch high-water; next batch starts fresh.
         self.cohort_high_water = 0;
-        // Ratchet the persistent fired-cohort estimate. Once we've
-        // seen a fire at B=R, future fires should aim for at least R
-        // before tripping the cohort cap. This counters the race
-        // described on `fired_high_water` above.
-        let target_size =
-            if fired_size.saturating_mul(4) >= self.max_forward_requests.saturating_mul(3) {
-                self.max_forward_requests
-            } else {
-                fired_size
-            };
-        if target_size > self.fired_high_water {
-            self.fired_high_water = target_size;
+        // Ratchet the persistent fired-cohort estimate to the actual
+        // observed cohort size. Do not round near-full cohorts up to
+        // `max_forward_requests`: admission can legitimately settle at
+        // R=max-1, and rounding would force every later batch to wait for
+        // a request that cannot arrive.
+        if fired_size > self.fired_high_water {
+            self.fired_high_water = fired_size;
         }
     }
 
@@ -267,7 +262,19 @@ impl SchedulingPolicy for AdaptivePolicy {
         //     other 7+ inferlets still finishing their post-fire CPU
         //     step. Without it, `B = pinned_count = 1` at that moment
         //     trips the cap and we fire at B=1.
-        let active = crate::context::pinned_count(self.driver_idx);
+        let pinned = crate::context::pinned_count(self.driver_idx);
+        let (resident_active, resident_pinned) = crate::context::resident_count(self.driver_idx);
+        let resident = resident_active.saturating_add(resident_pinned);
+        let mut active = pinned;
+        // If a dense serving cohort is already mostly assembled, use the
+        // resident count to wait for stragglers. This prevents a first
+        // 440/512 fire from becoming the permanent cohort size, while
+        // sparse agent workloads still fire from the pinned count below.
+        if resident > active
+            && current_forward_requests.saturating_mul(4) >= resident.saturating_mul(3)
+        {
+            active = resident.min(self.max_forward_requests);
+        }
         if active > self.cohort_high_water {
             self.cohort_high_water = active;
         }
@@ -282,11 +289,18 @@ impl SchedulingPolicy for AdaptivePolicy {
             // decide is called (set on first on_arrival).
             return Decision::Fire;
         };
+        let dense_resident_cohort =
+            target >= self.max_forward_requests && resident >= target && target > 0;
+        let wait_bound = if dense_resident_cohort {
+            self.last_latency * 2.0
+        } else {
+            self.last_latency
+        };
         let elapsed = start.elapsed().as_secs_f64();
-        if elapsed >= self.last_latency {
+        if elapsed >= wait_bound {
             return Decision::Fire;
         }
-        Decision::Wait(Duration::from_secs_f64(self.last_latency - elapsed))
+        Decision::Wait(Duration::from_secs_f64(wait_bound - elapsed))
     }
 }
 

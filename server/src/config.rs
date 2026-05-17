@@ -399,7 +399,7 @@ fn default_endowment_pages() -> usize {
     64
 }
 fn default_oversubscription_factor() -> f64 {
-    4.0
+    1.0
 }
 fn default_restore_pause_at_utilization() -> f64 {
     0.85
@@ -1132,7 +1132,7 @@ device = ["cuda:0"]
             cfg.models[0].driver.options.clone().try_into().unwrap();
         assert_eq!(opts.swap_pool_size, 0);
         assert_eq!(opts.gpu_mem_utilization, 0.90);
-        assert_eq!(opts.memory_profile, CudaMemoryProfile::Balanced);
+        assert_eq!(opts.memory_profile, CudaMemoryProfile::Auto);
         assert_eq!(opts.ready_timeout_s, 600.0);
     }
 

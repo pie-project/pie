@@ -49,17 +49,9 @@ def run(args: argparse.Namespace):
             outputs = llm.generate([p], sampling)
             req_wall = time.perf_counter() - req_start
             for out in outputs:
-                latency = req_wall
-                metrics = getattr(out, "metrics", None)
-                if (
-                    metrics
-                    and metrics.finished_time is not None
-                    and metrics.arrival_time is not None
-                ):
-                    latency = metrics.finished_time - metrics.arrival_time
                 results.append(
                     RequestResult(
-                        True, float(latency), len(out.outputs[0].token_ids), prompt_count
+                        True, float(req_wall), len(out.outputs[0].token_ids), prompt_count
                     )
                 )
     else:

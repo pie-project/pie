@@ -15,6 +15,7 @@
 #include <random>
 #include <span>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -45,7 +46,7 @@ namespace {
 struct TpCpuGate {
     std::mutex mu;
     std::condition_variable cv;
-    std::uint64_t seq = 0;
+    std::atomic<std::uint64_t> seq{0};
 };
 
 std::mutex g_tp_cpu_gates_mu;
@@ -259,11 +260,16 @@ std::shared_ptr<TpCpuGate> tp_cpu_gate_for(const std::string& key) {
 void tp_cpu_gate_notify(const std::string& key) {
     if (key.empty()) return;
     auto gate = tp_cpu_gate_for(key);
-    {
-        std::lock_guard<std::mutex> lk(gate->mu);
-        ++gate->seq;
-    }
+    gate->seq.fetch_add(1, std::memory_order_release);
     gate->cv.notify_all();
+}
+
+inline void cpu_relax() noexcept {
+#if defined(__x86_64__) || defined(__i386__)
+    __builtin_ia32_pause();
+#else
+    std::this_thread::yield();
+#endif
 }
 
 void tp_cpu_gate_wait(const std::string& key,
@@ -271,11 +277,24 @@ void tp_cpu_gate_wait(const std::string& key,
                       std::atomic<bool>& stop) {
     if (key.empty()) return;
     auto gate = tp_cpu_gate_for(key);
+    constexpr auto spin_budget = std::chrono::microseconds(2000);
+    const auto start = std::chrono::steady_clock::now();
+    while (!stop.load(std::memory_order_relaxed)) {
+        const std::uint64_t seq = gate->seq.load(std::memory_order_acquire);
+        if (seq != seen) {
+            seen = seq;
+            return;
+        }
+        if (std::chrono::steady_clock::now() - start >= spin_budget) break;
+        cpu_relax();
+    }
+
     std::unique_lock<std::mutex> lk(gate->mu);
     gate->cv.wait(lk, [&] {
-        return stop.load() || gate->seq != seen;
+        return stop.load(std::memory_order_relaxed) ||
+               gate->seq.load(std::memory_order_acquire) != seen;
     });
-    seen = gate->seq;
+    seen = gate->seq.load(std::memory_order_acquire);
 }
 
 // Broadcast header sent from rank 0 → followers before each fire's

@@ -28,7 +28,7 @@ use crate::inference::structured::grammar::Grammar;
 ///
 /// # Example
 /// ```
-/// use pie_grammar::regex::regex_to_grammar;
+/// use pie::inference::structured::regex::regex_to_grammar;
 ///
 /// let grammar = regex_to_grammar("[a-z]+").unwrap();
 /// ```

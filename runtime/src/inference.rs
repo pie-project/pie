@@ -34,6 +34,12 @@ pub use speculator::{
 
 use speculator::StagedEntry;
 
+pub(crate) fn should_use_pass_speculation(driver_idx: usize) -> bool {
+    let pinned = crate::context::pinned_count(driver_idx);
+    let (active, cached_pinned) = crate::context::resident_count(driver_idx);
+    pinned.max(active.saturating_add(cached_pinned)) > 1
+}
+
 /// Aggregated inference stats for a single model (across all drivers).
 #[derive(Debug, Default, serde::Serialize)]
 pub struct InferenceStats {
@@ -365,7 +371,11 @@ impl ServiceHandler for InferenceService {
                 let scheduler_handle = self.schedulers[idx].handle();
                 let staged_batch_arc = self.staged_batch[idx].clone();
                 let request_clone = request.clone();
-                let speculation_depth = self.speculation_depth;
+                let speculation_depth = if crate::context::pinned_count(idx) > 1 {
+                    self.speculation_depth
+                } else {
+                    0
+                };
 
                 if let Some(entry) = staged_entry {
                     // HIT: forward the staged rx; the chain

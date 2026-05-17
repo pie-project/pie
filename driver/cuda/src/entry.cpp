@@ -587,6 +587,10 @@ CudaMemoryPlan plan_cuda_memory(
     const bool auto_profile = is_auto_memory_profile(cfg.batching.memory_profile);
     const std::vector<std::string> policy_profiles =
         planner_policy_profiles(cfg.batching.memory_profile);
+    const int auto_decode_target =
+        profile_decode_target("throughput", cfg, prop);
+    const int auto_prefill_target =
+        profile_prefill_target("throughput", cfg, prop);
     const std::vector<int> kv_page_sizes =
         derive_kv_page_size_candidates(cfg, hf, prop);
 
@@ -753,16 +757,20 @@ CudaMemoryPlan plan_cuda_memory(
                 N,
             };
 
+            const int score_decode_target =
+                auto_profile ? auto_decode_target : decode_target;
+            const int score_prefill_target =
+                auto_profile ? auto_prefill_target : prefill_target;
             const double prefill_score =
-                target_saturation_score(N, prefill_target);
+                target_saturation_score(N, score_prefill_target);
             const double decode_score =
-                target_saturation_score(R, decode_target);
+                target_saturation_score(R, score_decode_target);
             const double decode_shape_penalty =
-                std::abs(log2_ratio(R, decode_target));
+                std::abs(log2_ratio(R, score_decode_target));
             const double prefill_shape_penalty =
-                std::abs(log2_ratio(N, prefill_target));
+                std::abs(log2_ratio(N, score_prefill_target));
             const double prefill_overshoot_penalty =
-                std::max(0.0, log2_ratio(N, prefill_target));
+                std::max(0.0, log2_ratio(N, score_prefill_target));
             const double kv_score =
                 std::log1p(static_cast<double>(kv_tokens) / 65536.0);
             const double kv_headroom =
@@ -794,19 +802,32 @@ CudaMemoryPlan plan_cuda_memory(
             const auto& profile = policy_profile;
             if (auto_profile) {
                 const double cohort_score =
-                    target_saturation_score(R, decode_target);
+                    target_saturation_score(R, score_decode_target);
                 const double kv_residency_score =
                     std::log1p(kv_headroom) +
                     std::log1p(static_cast<double>(kv_tokens) / 131072.0);
                 const double arena_mib =
                     static_cast<double>(arena) /
                     static_cast<double>(1024ull * 1024ull);
+                const bool enough_kv_headroom = kv_headroom >= min_headroom;
                 const double arena_penalty =
-                    arena_mib / 1024.0 + pressure * 0.75;
+                    (tp_size > 1 && enough_kv_headroom)
+                        ? pressure * 0.25
+                        : arena_mib / 1024.0 + pressure * 0.75;
+                const double prefill_weight = tp_size > 1 ? 4.0 : 2.0;
+                const double kv_weight =
+                    (tp_size > 1 && enough_kv_headroom) ? 2.0 : 4.0;
+                const double tp_prefill_bonus =
+                    (tp_size > 1 && enough_kv_headroom &&
+                     N >= score_prefill_target &&
+                     R >= score_decode_target)
+                        ? 1.25
+                        : 0.0;
                 score = cohort_score * 6.0 +
                         decode_score * 4.0 +
-                        prefill_score * 2.0 +
-                        kv_residency_score * 4.0 +
+                        prefill_score * prefill_weight +
+                        kv_residency_score * kv_weight +
+                        tp_prefill_bonus +
                         page_score -
                         decode_shape_penalty * 6.0 -
                         prefill_overshoot_penalty * 0.75 -
@@ -843,7 +864,11 @@ CudaMemoryPlan plan_cuda_memory(
                         kv_headroom_penalty * 3.0 - pressure * 2.0;
             }
             candidates.push_back(Candidate{
-                p, policy_profile, decode_target, prefill_target, score});
+                p,
+                policy_profile,
+                score_decode_target,
+                score_prefill_target,
+                score});
             }
         }
     }
@@ -1637,12 +1662,16 @@ int run_impl(int argc,
         weights_gemma4.kv_source_layer, is_qwen3_5_arch,
         is_qwen3_5_moe_arch, qwen3_5_linear_layers, verbose);
     const int max_workspace_tokens = mem_plan.max_workspace_tokens;
-    const int runtime_kv_pages =
-        mem_plan.kv_pages > 1 ? mem_plan.kv_pages - 1 : mem_plan.kv_pages;
+    // `mem_plan.kv_pages` is the runtime-visible KV capacity. CUDA graph
+    // padding needs one isolated page for synthetic rows when replaying a
+    // bucket larger than the real request count; charge that implementation
+    // detail to the planner's safety headroom instead of reducing the
+    // advertised runtime pool.
+    const int runtime_kv_pages = mem_plan.kv_pages;
     const int physical_kv_pages =
-        mem_plan.kv_pages > 1 ? runtime_kv_pages + 1 : mem_plan.kv_pages;
+        mem_plan.kv_pages > 0 ? mem_plan.kv_pages + 1 : mem_plan.kv_pages;
     const int graph_pad_page =
-        mem_plan.kv_pages > 1 ? runtime_kv_pages : -1;
+        mem_plan.kv_pages > 0 ? runtime_kv_pages : -1;
 
     auto ws = pie_cuda_driver::model::Qwen3Workspace::allocate_full(
         engine.hf_config(), max_workspace_tokens,

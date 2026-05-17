@@ -310,7 +310,15 @@ pub(crate) fn spawn_extend_chain(
                 if next_page_idx < all_pages.len() {
                     let next_pages: Vec<PhysicalPageId> = all_pages[..=next_page_idx].to_vec();
                     let should_extend = match staged_batch_arc.lock() {
-                        Ok(sb) => sb.get(&ctx_id).map_or(0, |d| d.len()) < max_queue_depth,
+                        Ok(sb) => {
+                            let queued = sb.get(&ctx_id).map_or(0, |d| d.len());
+                            // If this stage completed before the inferlet
+                            // claimed it, the current staged entry is still
+                            // sitting in the deque. Keep one future stage
+                            // ahead of that entry; otherwise the chain breaks
+                            // whenever the GPU outruns the WASM loop.
+                            max_queue_depth > 0 && queued <= max_queue_depth
+                        }
                         Err(_) => false,
                     };
                     if should_extend {

@@ -450,7 +450,7 @@ def build_parser() -> argparse.ArgumentParser:
                         choices=["dev", "cuda_native", "portable", "vllm", "sglang", "dummy"])
         sp.add_argument("--default-token-limit", type=int, default=200_000)
         sp.add_argument("--default-endowment-pages", type=int, default=64)
-        sp.add_argument("--admission-oversubscription-factor", type=float, default=4.0)
+        sp.add_argument("--admission-oversubscription-factor", type=float, default=1.0)
         sp.add_argument("--cpu-mem-budget", type=int, default=0)
         sp.add_argument(
             "--memory-profile",

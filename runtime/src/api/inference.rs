@@ -486,8 +486,11 @@ impl pie::core::inference::HostForwardPass for InstanceState {
         // pin/unpin entirely — the staged fire runs on pages from the
         // prior cycle. On miss we pin + submit. The ctx-cached `spec`
         // handle lets us skip the REGISTRY lookup.
+        let driver_idx_hint = context::get_device(model_id, context_id);
+        let use_pass_speculation = inference::should_use_pass_speculation(driver_idx_hint);
         let (was_pinned, submit_result) = if let Some(rx) = spec_handle
             .as_ref()
+            .filter(|_| use_pass_speculation)
             .and_then(|s| inference::try_hit(s, context_id, &req))
         {
             (
