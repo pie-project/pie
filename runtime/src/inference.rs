@@ -340,7 +340,11 @@ impl ServiceHandler for InferenceService {
                 let scheduler_handle = self.schedulers[idx].handle();
                 let staged_batch_arc = self.staged_batch[idx].clone();
                 let request_clone = request.clone();
-                let speculation_depth = self.speculation_depth;
+                let speculation_depth = if request_clone.rs_slot_ids.is_empty() {
+                    self.speculation_depth
+                } else {
+                    0
+                };
 
                 if let Some(entry) = staged_entry {
                     // HIT: forward the staged rx; the chain

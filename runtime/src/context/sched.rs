@@ -24,7 +24,6 @@
 //! At all times: `Σ balance_i = Σ endowment_i − M(t)`, where M(t) is cumulative
 //! make cost. Rent revenue is exactly redistributed as dividends.
 
-use std::cmp::Ordering;
 use std::fmt;
 use std::time::Instant;
 
@@ -32,7 +31,7 @@ use crate::driver::{self, DriverId};
 use crate::process::ProcessId;
 
 use super::pagestore::PhysicalPageId;
-use super::{Context, ContextId, ContextManager, RestoreEntry, State, MARKET};
+use super::{Context, ContextId, ContextManager, MARKET, RestoreEntry, State};
 
 // =============================================================================
 // ProcessEntry — Wallet + Ownership
@@ -120,6 +119,7 @@ pub(crate) struct AuctionResult {
 pub(crate) struct PendingAlloc {
     pub driver: usize,
     pub num_pages: usize,
+    pub needs_rs_slot: bool,
     /// Callback invoked with allocated pages on success.
     pub on_alloc: Box<dyn FnOnce(&mut ContextManager, Vec<PhysicalPageId>) + Send>,
 }
@@ -129,6 +129,7 @@ impl fmt::Debug for PendingAlloc {
         f.debug_struct("PendingAlloc")
             .field("driver", &self.driver)
             .field("num_pages", &self.num_pages)
+            .field("needs_rs_slot", &self.needs_rs_slot)
             .field("on_alloc", &"<closure>")
             .finish()
     }
@@ -223,6 +224,11 @@ impl ContextManager {
             crate::inference::invalidate_speculation_for_ctx(self.model_idx, *ctx_id);
             if let Some(ctx) = self.contexts.remove(ctx_id) {
                 let driver_idx = ctx.driver.unwrap_or(0) as usize;
+                if let Some(slot) = ctx.rs_state.resident_slot() {
+                    if let Some(store) = self.rs_stores.get_mut(driver_idx) {
+                        store.free(slot);
+                    }
+                }
                 if !ctx.committed_hashes.is_empty() && !ctx.is_off_gpu() {
                     self.gpu_stores[driver_idx].release(&ctx.committed_hashes);
                 }
@@ -613,21 +619,49 @@ impl ContextManager {
         num_pages: usize,
         on_alloc: impl FnOnce(&mut ContextManager, Vec<PhysicalPageId>) + Send + 'static,
     ) {
-        // SUSPENSION CHECK: If the context is Suspended, store as deferred op.
-        if let Some(ctx) = self.contexts.get_mut(&ctx_id) {
-            if ctx.is_off_gpu() {
+        self.when_allocated_inner(ctx_id, driver_idx, num_pages, false, on_alloc);
+    }
+
+    /// Variant for operations such as fork/take that can operate from an
+    /// off-GPU source context and replay directly into the destination.
+    pub(crate) fn when_allocated_allow_off_gpu(
+        &mut self,
+        ctx_id: ContextId,
+        driver_idx: usize,
+        num_pages: usize,
+        on_alloc: impl FnOnce(&mut ContextManager, Vec<PhysicalPageId>) + Send + 'static,
+    ) {
+        self.when_allocated_inner(ctx_id, driver_idx, num_pages, true, on_alloc);
+    }
+
+    fn when_allocated_inner(
+        &mut self,
+        ctx_id: ContextId,
+        driver_idx: usize,
+        num_pages: usize,
+        allow_off_gpu: bool,
+        on_alloc: impl FnOnce(&mut ContextManager, Vec<PhysicalPageId>) + Send + 'static,
+    ) {
+        // RESIDENCY/BUSY CHECK: If the context is off GPU or already pinned
+        // by a forward/replay, store the operation and let unpin or
+        // replay_complete fire it once the context is active again.
+        let requester_off_gpu = if let Some(ctx) = self.contexts.get_mut(&ctx_id) {
+            let off_gpu = ctx.is_off_gpu();
+            if (off_gpu && !allow_off_gpu) || ctx.is_pinned() {
                 let pending = PendingAlloc {
                     driver: driver_idx,
                     num_pages,
+                    needs_rs_slot: false,
                     on_alloc: Box::new(on_alloc),
                 };
                 ctx.deferred_ops.push(pending);
                 return;
             }
+            off_gpu
         } else {
             tracing::error!("when_allocated: context not found: {}", ctx_id);
             return;
-        }
+        };
 
         // Short-circuit: no pages needed.
         if num_pages == 0 {
@@ -647,15 +681,20 @@ impl ContextManager {
                 let pending = PendingAlloc {
                     driver: driver_idx,
                     num_pages,
+                    needs_rs_slot: false,
                     on_alloc: Box::new(on_alloc),
                 };
-                self.suspend(ctx_id);
-                self.enqueue_restore(ctx_id);
                 self.contexts
                     .get_mut(&ctx_id)
                     .unwrap()
                     .deferred_ops
                     .push(pending);
+                if requester_off_gpu {
+                    self.alloc_queue.push_back(ctx_id);
+                } else {
+                    self.suspend(ctx_id);
+                    self.enqueue_restore(ctx_id);
+                }
                 self.drain_queues();
                 return;
             }
@@ -721,6 +760,7 @@ impl ContextManager {
             let pending = PendingAlloc {
                 driver: driver_idx,
                 num_pages,
+                needs_rs_slot: false,
                 on_alloc: Box::new(on_alloc),
             };
             self.contexts
@@ -731,6 +771,11 @@ impl ContextManager {
 
             if has_deferred {
                 // Step 5: Deferred pages from Pinned contexts will cover the gap.
+                self.alloc_queue.push_back(ctx_id);
+            } else if requester_off_gpu {
+                // The requester is already off-GPU and this operation knows
+                // how to replay from metadata; wait for capacity without
+                // restoring the source context first.
                 self.alloc_queue.push_back(ctx_id);
             } else {
                 // Step 6: NO VICTIM — requester self-suspends.
@@ -956,6 +1001,11 @@ impl ContextManager {
             _ => return,
         };
 
+        // Recurrent state is volatile GPU residency. Releasing it here
+        // makes rs_cache contention obey the same suspend/restore path
+        // as KV pages; restore will replay lineage into a fresh slot.
+        self.release_rs_slot_for_context(ctx_id);
+
         // Compute total CPU pages needed upfront for a single eviction pass.
         let requester_bid = self.contexts.get(&ctx_id).map(|c| c.bid).unwrap_or(0.0);
         let working_cpu_needed = working.len();
@@ -1066,8 +1116,17 @@ mod tests {
         held_pages: usize,
         bid: f64,
     ) -> (ContextManager, ProcessId, ContextId) {
-        let mut mgr =
-            ContextManager::new(0, 16, &[num_pages], &[num_pages], 10, None, 10000.0, 0.85);
+        let mut mgr = ContextManager::new(
+            0,
+            16,
+            &[num_pages],
+            &[num_pages],
+            &[0],
+            10,
+            None,
+            10000.0,
+            0.85,
+        );
         let pid = ProcessId::new_v4();
         mgr.register_process(pid, Some(160)).unwrap(); // 10 pages at page_size=16
 
@@ -1169,7 +1228,7 @@ mod tests {
     #[test]
     fn rent_redistributes_between_processes_under_contention() {
         // Both processes get large budgets so payment isn't balance-capped.
-        let mut mgr = ContextManager::new(0, 16, &[10], &[10], 10, None, 10000.0, 0.85);
+        let mut mgr = ContextManager::new(0, 16, &[10], &[10], &[0], 10, None, 10000.0, 0.85);
 
         let payer_pid = ProcessId::new_v4();
         mgr.register_process(payer_pid, Some(16 * 1000)).unwrap(); // 1000-page budget
@@ -1222,7 +1281,7 @@ mod tests {
     /// ⌈budget / page_size⌉ pages. The two are independent quantities.
     #[test]
     fn register_process_sets_both_wallets() {
-        let mut mgr = ContextManager::new(0, 16, &[100], &[100], 10, None, 10000.0, 0.85);
+        let mut mgr = ContextManager::new(0, 16, &[100], &[100], &[0], 10, None, 10000.0, 0.85);
         let pid = ProcessId::new_v4();
         mgr.register_process(pid, Some(1000)).unwrap();
 
@@ -1244,7 +1303,7 @@ mod tests {
     /// which is unlimited (None) by system policy.
     #[test]
     fn register_process_without_budget_is_unlimited() {
-        let mut mgr = ContextManager::new(0, 16, &[100], &[100], 10, None, 10000.0, 0.85);
+        let mut mgr = ContextManager::new(0, 16, &[100], &[100], &[0], 10, None, 10000.0, 0.85);
         let pid = ProcessId::new_v4();
         mgr.register_process(pid, None).unwrap();
         assert_eq!(
@@ -1263,7 +1322,7 @@ mod tests {
     /// unlimited wallets untouched.
     #[test]
     fn debit_tokens_is_monotone_and_saturates() {
-        let mut mgr = ContextManager::new(0, 16, &[100], &[100], 10, None, 10000.0, 0.85);
+        let mut mgr = ContextManager::new(0, 16, &[100], &[100], &[0], 10, None, 10000.0, 0.85);
         let pid = ProcessId::new_v4();
         mgr.register_process(pid, Some(100)).unwrap();
         assert_eq!(mgr.process_entry(pid).tokens_remaining, Some(100));
@@ -1344,7 +1403,7 @@ mod tests {
     #[test]
     fn conservation_holds_under_default() {
         // Small token budget → small endowment → payer goes under.
-        let mut mgr = ContextManager::new(0, 16, &[10], &[10], 10, None, 10000.0, 0.85);
+        let mut mgr = ContextManager::new(0, 16, &[10], &[10], &[0], 10, None, 10000.0, 0.85);
 
         let payer_pid = ProcessId::new_v4();
         mgr.register_process(payer_pid, Some(16)).unwrap(); // endowment = 1 page
@@ -1397,7 +1456,7 @@ mod tests {
     #[test]
     fn admission_gate_at_factor_1_enforces_capacity() {
         // 10 pages total, strict (factor = 1.0).
-        let mut mgr = ContextManager::new(0, 16, &[10], &[10], 1, None, 1.0, 0.85);
+        let mut mgr = ContextManager::new(0, 16, &[10], &[10], &[0], 1, None, 1.0, 0.85);
 
         // 10 processes of 1 endowment-page each fit exactly.
         for _ in 0..10 {
@@ -1417,7 +1476,7 @@ mod tests {
     /// At factor = 2.0, the cap is 2× physical capacity.
     #[test]
     fn admission_gate_overbook_factor_scales_cap() {
-        let mut mgr = ContextManager::new(0, 16, &[10], &[10], 1, None, 2.0, 0.85);
+        let mut mgr = ContextManager::new(0, 16, &[10], &[10], &[0], 1, None, 2.0, 0.85);
 
         // 20 processes at 1 page each = 20 endowment ≤ 20 cap. All admit.
         for _ in 0..20 {
@@ -1431,7 +1490,7 @@ mod tests {
     /// admission budget and the next admission succeeds.
     #[test]
     fn admission_frees_budget_on_unregister() {
-        let mut mgr = ContextManager::new(0, 16, &[10], &[10], 1, None, 1.0, 0.85);
+        let mut mgr = ContextManager::new(0, 16, &[10], &[10], &[0], 1, None, 1.0, 0.85);
 
         let pids: Vec<_> = (0..10)
             .map(|_| {
@@ -1456,7 +1515,7 @@ mod tests {
     /// total GPU pool, not just one driver.
     #[test]
     fn admission_cap_is_sum_across_devices() {
-        let mut mgr = ContextManager::new(0, 16, &[5, 5], &[5, 5], 1, None, 1.0, 0.85);
+        let mut mgr = ContextManager::new(0, 16, &[5, 5], &[5, 5], &[0, 0], 1, None, 1.0, 0.85);
         // 10 pages total across 2 drivers.
         for _ in 0..10 {
             mgr.register_process(ProcessId::new_v4(), Some(16)).unwrap();

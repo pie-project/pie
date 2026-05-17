@@ -96,6 +96,10 @@ constexpr std::uint32_t PIE_METHOD_SAVE_ADAPTER         = 6;
 constexpr std::uint32_t PIE_METHOD_ZO_INITIALIZE_ADAPTER = 7;
 constexpr std::uint32_t PIE_METHOD_ZO_UPDATE_ADAPTER    = 8;
 constexpr std::uint32_t PIE_METHOD_HEALTH               = 9;
+constexpr std::uint32_t PIE_METHOD_RS_COPY_D2H          = 10;
+constexpr std::uint32_t PIE_METHOD_RS_COPY_H2D          = 11;
+constexpr std::uint32_t PIE_METHOD_RS_COPY_D2D          = 12;
+constexpr std::uint32_t PIE_METHOD_RS_COPY_H2H          = 13;
 
 // Driver-side sampler IDs (DISTRIBUTION=0, MULTINOMIAL=1, …, ENTROPY=10).
 // The wire schema orders variants differently (`Sampler::Multinomial`
@@ -127,6 +131,8 @@ struct PieForwardRequestView {
     PieSlice<std::uint32_t> kv_page_indptr;
     PieSlice<std::uint32_t> kv_last_page_lens;
     PieSlice<std::uint32_t> qo_indptr;
+    PieSlice<std::uint32_t> rs_slot_ids;
+    PieSlice<std::uint8_t>  rs_slot_flags;
 
     // Attention / logit masks
     PieSlice<std::uint32_t> flattened_masks;
@@ -316,6 +322,8 @@ inline void fill_forward_view(const PieForwardRequestDesc& f,
     out.kv_page_indptr    = slice_from(f.kv_page_indptr_ptr, f.kv_page_indptr_len);
     out.kv_last_page_lens = slice_from(f.kv_last_page_lens_ptr, f.kv_last_page_lens_len);
     out.qo_indptr         = slice_from(f.qo_indptr_ptr, f.qo_indptr_len);
+    out.rs_slot_ids       = slice_from(f.rs_slot_ids_ptr, f.rs_slot_ids_len);
+    out.rs_slot_flags     = slice_from(f.rs_slot_flags_ptr, f.rs_slot_flags_len);
 
     // BRLE masks come over the wire as Vec<Brle>. The driver code path
     // wants a flat run-length buffer plus per-ROW byte offsets. Walk
@@ -482,7 +490,8 @@ inline void build_request_view(const PieFrameDesc& frame,
             const PieCopyRequestDesc& c = frame.payload.copy;
             // CopyDir variant order: D2H=0, H2D=1, D2D=2, H2H=3 →
             // driver methods 1, 2, 3, 4.
-            out.method = PIE_METHOD_COPY_D2H + c.dir;
+            const bool rs = c.resource == PIE_COPY_RESOURCE_RS;
+            out.method = (rs ? PIE_METHOD_RS_COPY_D2H : PIE_METHOD_COPY_D2H) + c.dir;
             out.copy_srcs = slice_from(c.srcs_ptr, c.srcs_len);
             out.copy_dsts = slice_from(c.dsts_ptr, c.dsts_len);
             break;

@@ -767,7 +767,7 @@ int run_parity(const pie_cuda_driver::Config& cfg,
 
         auto parity_attn_ws = pie_cuda_driver::AttentionWorkspace::allocate();
 
-        // qwen3_5 / qwen3_5_moe need their own scratch + state caches.
+        // qwen3_5 / qwen3_5_moe need their own scratch + rs_cache storage.
         pie_cuda_driver::model::Qwen3_5LinearAttnWorkspace q35_la_ws;
         pie_cuda_driver::Qwen3_5StateCache q35_state_cache;
         pie_cuda_driver::model::Qwen3_5MoeMlpWorkspace q35_moe_ws;
@@ -1312,9 +1312,9 @@ int run_impl(int argc,
                   << ")\n";
     }
 
-    // Pre-allocate persistent state for serving. CUDA-native no longer
+    // Pre-allocate persistent rs_cache state for serving. CUDA-native no longer
     // accepts manual batch/KV sizing from public config; after weights are
-    // resident we plan the forward arena, optional linear-attn state cache,
+    // resident we plan the forward arena, optional linear-attn rs_cache,
     // and remaining KV pages from gpu_mem_utilization + memory_profile.
     // Per-arch worst-case workspace dims. Gemma-4 has both
     // `use_double_wide_mlp` (intermediate doubles on shared layers)
@@ -1396,7 +1396,7 @@ int run_impl(int argc,
     // (they share `prepare_qwen3_5_decode_plan`).
     pie_cuda_driver::model::Qwen3_5PlanState qwen3_5_plan_state;
 
-    // Qwen3.5 / Qwen3.6-MoE linear-attention extras: per-layer state cache
+    // Qwen3.5 / Qwen3.6-MoE linear-attention extras: per-layer rs_cache
     // + a per-call workspace. Inert (default-constructed) on every other
     // arch. The MoE arch additionally needs a routed-experts workspace.
     pie_cuda_driver::model::Qwen3_5LinearAttnWorkspace qwen3_5_la_ws;
@@ -1436,7 +1436,7 @@ int run_impl(int argc,
             static_cast<std::size_t>(q35_max_slots) *
             (per_slot_recurrent_bytes + per_slot_conv_bytes);
         if (verbose) {
-            std::cerr << "[pie-driver-cuda] qwen3.5 state cache: "
+            std::cerr << "[pie-driver-cuda] qwen3.5 rs_cache: "
                       << num_linear_layers << " linear layers, "
                       << q35_max_slots << " slots, "
                       << (per_slot_recurrent_bytes + per_slot_conv_bytes)
@@ -1917,21 +1917,13 @@ int run_impl(int argc,
         use_cuda_graphs ? &graph_cache : nullptr,
         /*tp_comm=*/tp_comm_ptr,
         /*tp_cpu_gate_key=*/{},
-        /*slot_alloc=*/{},
+        /*rs_cache=*/((is_qwen3_5_arch || is_qwen3_5_moe_arch) ? &qwen3_5_state_cache : nullptr),
         /*response_builder=*/{},
     };
     executor.tp_cpu_gate_key = cfg.distributed.nccl_unique_id_hex;
     // Speculation lives entirely in the runtime. The driver runs
     // forward passes; the runtime's `scheduler.speculation_depth`
     // toml knob controls per-ctx chain depth.
-    // Size the linear-attn slot allocator only when this arch actually
-    // uses a state cache. Default-constructed (max_slots=0) on every
-    // other arch — handle_fire_batch's `use_slots` predicate stays false
-    // and the body's slot_ids/is_fresh args remain nullptr.
-    if ((is_qwen3_5_arch || is_qwen3_5_moe_arch) &&
-        qwen3_5_state_cache.max_slots() > 0) {
-        executor.slot_alloc.reset(qwen3_5_state_cache.max_slots());
-    }
     if (verbose && use_cuda_graphs) {
         std::cerr << "[pie-driver-cuda] CUDA graphs enabled (experimental)\n";
     }
@@ -1964,10 +1956,24 @@ int run_impl(int argc,
         auto c = engine.capabilities();
         c.total_pages = kv_cache.num_pages();
         c.swap_pool_size = swap_pool.num_pages();
+        const bool rs_cache_required =
+            (is_qwen3_5_arch || is_qwen3_5_moe_arch) &&
+            qwen3_5_state_cache.max_slots() > 0;
+        const std::uint64_t rs_cache_slots = rs_cache_required
+            ? static_cast<std::uint64_t>(qwen3_5_state_cache.max_slots())
+            : 0;
+        const std::uint64_t rs_cache_slot_bytes = rs_cache_required
+            ? static_cast<std::uint64_t>(qwen3_5_linear_layers) *
+                  (qwen3_5_state_cache.conv_slot_stride_bytes() +
+                   qwen3_5_state_cache.recurrent_slot_stride_floats() * sizeof(float))
+            : 0;
         nlohmann::json caps = {
             {"total_pages",            c.total_pages},
             {"kv_page_size",           c.kv_page_size},
             {"swap_pool_size",         c.swap_pool_size},
+            {"rs_cache_required",      rs_cache_required},
+            {"rs_cache_slots",         rs_cache_slots},
+            {"rs_cache_slot_bytes",    rs_cache_slot_bytes},
             {"max_forward_tokens",     mem_plan.capacity.max_forward_tokens},
             {"max_forward_requests",   mem_plan.capacity.max_forward_requests},
             {"max_page_refs",          mem_plan.capacity.max_page_refs},

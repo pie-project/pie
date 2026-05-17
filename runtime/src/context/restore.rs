@@ -23,7 +23,9 @@
 //! re-suspended instead.
 
 use super::pagestore::{PhysicalPageId, compute_last_page_len};
-use super::{ContextId, ContextManager, Record, SERVICES, State};
+use super::rs_cache::RsState;
+use super::{ContextId, ContextManager, Record, ReplayPageRegistration, SERVICES, State};
+use crate::adapter::AdapterId;
 use crate::driver::{self, DriverId};
 use crate::inference;
 
@@ -45,8 +47,9 @@ impl ContextManager {
         let mut required = ctx.suspended_working_count;
 
         // Pages needing replay: check prefix match, count missing suffix
+        let mut prefix_len = 0usize;
         if !ctx.committed_hashes.is_empty() {
-            let prefix_len = self.gpu_stores[driver_idx].prefix_len(&ctx.committed_hashes);
+            prefix_len = self.gpu_stores[driver_idx].prefix_len(&ctx.committed_hashes);
             let replay_pages = ctx.committed_hashes.len().saturating_sub(prefix_len);
             required += replay_pages;
         }
@@ -57,6 +60,15 @@ impl ContextManager {
         let deferred_pages: usize = ctx.deferred_ops.iter().map(|op| op.num_pages).sum();
         required += deferred_pages;
 
+        if ctx.rs_state.is_missing() && self.driver_uses_rs_cache(driver_idx) {
+            // RS replay must walk the full token lineage. Existing GPU
+            // prefix pages may be shared, so replay uses scratch pages for
+            // that prefix and writes only suffix/working pages in place.
+            required += prefix_len;
+            if self.rs_stores[driver_idx].available() == 0 {
+                return false;
+            }
+        }
         if self.gpu_stores[driver_idx].available() < required {
             return false;
         }
@@ -90,6 +102,7 @@ impl ContextManager {
         let working_count = ctx.suspended_working_count;
         let committed_hashes = ctx.committed_hashes.clone();
         let cpu_working_pages = ctx.cpu_working_pages.clone();
+        let rs_missing = ctx.rs_state.is_missing() && self.driver_uses_rs_cache(driver_idx);
 
         // Phase 1: Restore working pages.
         // If CPU-stashed, H2D copy; otherwise allocate fresh for replay.
@@ -128,7 +141,50 @@ impl ContextManager {
         let suffix_count = committed_hashes.len().saturating_sub(prefix_len);
         let suffix_hashes = &committed_hashes[prefix_len..];
 
-        let has_replay = if suffix_count > 0 {
+        let has_replay = if rs_missing {
+            let mut suffix_replay_pages = Vec::with_capacity(suffix_count);
+            if suffix_count > 0 {
+                let suffix_hashes = &committed_hashes[prefix_len..];
+                let cpu_prefix = self.cpu_stores[driver_idx].prefix_len(suffix_hashes);
+                if cpu_prefix > 0 {
+                    let cpu_hashes = &suffix_hashes[..cpu_prefix];
+                    let cpu_phys = self.cpu_stores[driver_idx].physical_ids(cpu_hashes);
+                    let gpu_pages = self.gpu_stores[driver_idx]
+                        .alloc(cpu_prefix)
+                        .ok_or_else(|| anyhow::anyhow!("No GPU pages for CPU-cache restore"))?;
+                    let _ = driver::copy_h2d(driver_idx as DriverId, &gpu_pages, &cpu_phys);
+                    self.cpu_stores[driver_idx].release(cpu_hashes);
+                    suffix_replay_pages.extend_from_slice(&gpu_pages);
+                }
+                let remaining = suffix_count.saturating_sub(suffix_replay_pages.len());
+                if remaining > 0 {
+                    let replay_pages = self.gpu_stores[driver_idx]
+                        .alloc(remaining)
+                        .ok_or_else(|| anyhow::anyhow!("No GPU pages for replay suffix"))?;
+                    suffix_replay_pages.extend_from_slice(&replay_pages);
+                }
+            }
+
+            let scratch_prefix_pages = if prefix_len > 0 {
+                self.gpu_stores[driver_idx]
+                    .alloc(prefix_len)
+                    .ok_or_else(|| anyhow::anyhow!("No GPU pages for rs_cache replay scratch"))?
+            } else {
+                Vec::new()
+            };
+            let slot = self.alloc_rs_slot_now_with_eviction(ctx_id, driver_idx)?;
+            if let Some(ctx) = self.contexts.get_mut(&ctx_id) {
+                ctx.rs_state = RsState::Resident(slot);
+            }
+            self.spawn_full_rs_replay_pass(
+                ctx_id,
+                driver_idx,
+                slot,
+                prefix_len,
+                scratch_prefix_pages,
+                suffix_replay_pages,
+            )?
+        } else if suffix_count > 0 {
             // Check how many suffix pages are on CPU.
             let cpu_prefix = self.cpu_stores[driver_idx].prefix_len(suffix_hashes);
 
@@ -216,6 +272,219 @@ impl ContextManager {
     /// Returns `true` if any passes were spawned.
     ///
     /// All GPU page allocation must be done by the caller.
+    pub(crate) fn spawn_full_rs_replay_pass(
+        &mut self,
+        ctx_id: ContextId,
+        driver_idx: usize,
+        rs_slot: super::rs_cache::RsSlotId,
+        scratch_prefix_len: usize,
+        scratch_prefix_pages: Vec<PhysicalPageId>,
+        suffix_replay_pages: Vec<PhysicalPageId>,
+    ) -> anyhow::Result<bool> {
+        anyhow::ensure!(
+            scratch_prefix_pages.len() == scratch_prefix_len,
+            "rs_cache replay scratch page count mismatch: got {}, need {scratch_prefix_len}",
+            scratch_prefix_pages.len()
+        );
+        let ctx = self
+            .contexts
+            .get(&ctx_id)
+            .ok_or_else(|| anyhow::anyhow!("Context not found"))?;
+        let lineage = ctx.lineage.clone();
+        let committed_hashes = ctx.committed_hashes.clone();
+        let working_page_tokens = ctx.working_page_tokens.clone();
+        let working_pages = ctx.working_pages.clone();
+        let page_size = self.page_size;
+        let suffix_count = committed_hashes.len().saturating_sub(scratch_prefix_len);
+        anyhow::ensure!(
+            suffix_replay_pages.len() == suffix_count,
+            "rs_cache replay suffix page count mismatch: got {}, need {suffix_count}",
+            suffix_replay_pages.len()
+        );
+
+        let mut all_phys = scratch_prefix_pages.clone();
+        all_phys.extend_from_slice(&suffix_replay_pages);
+        all_phys.extend_from_slice(&working_pages);
+        if all_phys.is_empty() {
+            if !scratch_prefix_pages.is_empty() {
+                self.gpu_stores[driver_idx].free(&scratch_prefix_pages);
+            }
+            if !suffix_replay_pages.is_empty() {
+                self.gpu_stores[driver_idx].free(&suffix_replay_pages);
+            }
+            return Ok(false);
+        }
+        let registration = if suffix_replay_pages.is_empty() {
+            None
+        } else {
+            Some(ReplayPageRegistration {
+                driver: driver_idx,
+                prefix: committed_hashes[..scratch_prefix_len].to_vec(),
+                hashes: committed_hashes[scratch_prefix_len..].to_vec(),
+                pages: suffix_replay_pages,
+            })
+        };
+
+        #[derive(Clone)]
+        struct ReplayToken {
+            token: u32,
+            position: u32,
+            mask: pie_bridge::Brle,
+            adapter: Option<AdapterId>,
+            adapter_seed: Option<i64>,
+            forward_id: u64,
+        }
+
+        let total_replay_tokens: usize = lineage
+            .iter()
+            .map(|record| match record {
+                Record::Fill { tokens, .. } => tokens.len(),
+            })
+            .sum::<usize>()
+            + working_page_tokens.len();
+        let mut replay_tokens = Vec::with_capacity(total_replay_tokens);
+        for record in &lineage {
+            match record {
+                Record::Fill {
+                    tokens,
+                    positions,
+                    mask,
+                    adapter,
+                    adapter_seed,
+                    forward_id,
+                } => {
+                    for (i, &token) in tokens.iter().enumerate() {
+                        replay_tokens.push(ReplayToken {
+                            token,
+                            position: positions[i],
+                            mask: mask
+                                .get(i)
+                                .cloned()
+                                .unwrap_or_else(|| pie_bridge::Brle::new(0)),
+                            adapter: *adapter,
+                            adapter_seed: *adapter_seed,
+                            forward_id: *forward_id,
+                        });
+                    }
+                }
+            }
+        }
+        replay_tokens.extend(working_page_tokens.iter().map(|info| ReplayToken {
+            token: info.token,
+            position: info.position,
+            mask: info.mask.clone(),
+            adapter: info.adapter,
+            adapter_seed: info.adapter_seed,
+            forward_id: info.forward_id,
+        }));
+
+        let mut requests: Vec<(pie_bridge::ForwardRequest, Vec<PhysicalPageId>, u32)> = Vec::new();
+        let mut kv_so_far = 0usize;
+        let mut first = true;
+        let mut start = 0usize;
+        while start < replay_tokens.len() {
+            let forward_id = replay_tokens[start].forward_id;
+            let adapter = replay_tokens[start].adapter;
+            let adapter_seed = replay_tokens[start].adapter_seed;
+            let mut end = start + 1;
+            while end < replay_tokens.len()
+                && replay_tokens[end].forward_id == forward_id
+                && replay_tokens[end].adapter == adapter
+                && replay_tokens[end].adapter_seed == adapter_seed
+            {
+                end += 1;
+            }
+            let group = &replay_tokens[start..end];
+            let total_after = kv_so_far + group.len();
+            let pages_needed = total_after.div_ceil(page_size);
+            anyhow::ensure!(
+                pages_needed <= all_phys.len(),
+                "rs_cache replay page table too short: need {pages_needed} pages, have {}",
+                all_phys.len()
+            );
+            if pages_needed > 0 {
+                let tokens = group.iter().map(|info| info.token).collect();
+                let positions = group.iter().map(|info| info.position).collect();
+                let masks = group.iter().map(|info| info.mask.clone()).collect();
+                let last_page_len = compute_last_page_len(
+                    total_after as u32,
+                    pages_needed as u32,
+                    page_size as u32,
+                );
+                let mut fwd_req = crate::inference::request::new_per_request(
+                    ctx_id,
+                    tokens,
+                    positions,
+                    masks,
+                    true,
+                    None,
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                    false,
+                    adapter,
+                    adapter_seed,
+                );
+                fwd_req.rs_slot_ids = vec![rs_slot];
+                fwd_req.rs_slot_flags = vec![if first {
+                    super::rs_cache::RS_FLAG_RESET
+                } else {
+                    0
+                }];
+                first = false;
+                requests.push((fwd_req, all_phys[..pages_needed].to_vec(), last_page_len));
+                kv_so_far = total_after;
+            }
+            start = end;
+        }
+
+        if requests.is_empty() {
+            if !scratch_prefix_pages.is_empty() {
+                self.gpu_stores[driver_idx].free(&scratch_prefix_pages);
+            }
+            if let Some(registration) = &registration {
+                self.gpu_stores[registration.driver].free(&registration.pages);
+            }
+            return Ok(false);
+        }
+
+        let model_idx = self.model_idx;
+        let driver_id = driver_idx;
+        tokio::spawn(async move {
+            for (fwd_req, phys_ids, last_page_len) in requests {
+                let result = inference::submit(
+                    model_idx,
+                    fwd_req,
+                    driver_id,
+                    phys_ids,
+                    Vec::new(),
+                    last_page_len,
+                )
+                .await;
+                if let Err(e) = result {
+                    tracing::error!(
+                        ctx = ctx_id,
+                        driver = driver_id,
+                        "rs_cache replay forward pass failed: {e:#}"
+                    );
+                    break;
+                }
+            }
+            let _ = SERVICES.send(
+                model_idx,
+                super::Message::ReplayComplete {
+                    id: ctx_id,
+                    scratch_driver: driver_id,
+                    scratch_pages: scratch_prefix_pages,
+                    registration,
+                },
+            );
+        });
+
+        Ok(true)
+    }
+
     pub(crate) fn spawn_replay_passes(
         &mut self,
         ctx_id: ContextId,
@@ -279,6 +548,7 @@ impl ContextManager {
                     mask,
                     adapter,
                     adapter_seed,
+                    forward_id: _,
                 } => {
                     let record_end = token_offset + tokens.len();
 
@@ -462,7 +732,15 @@ impl ContextManager {
             }
 
             // Unpin after all chunks complete (or first failure)
-            let _ = SERVICES.send(model_idx, super::Message::ReplayComplete { id: ctx_id });
+            let _ = SERVICES.send(
+                model_idx,
+                super::Message::ReplayComplete {
+                    id: ctx_id,
+                    scratch_driver: driver_id,
+                    scratch_pages: Vec::new(),
+                    registration: None,
+                },
+            );
         });
 
         Ok(true)
@@ -479,6 +757,13 @@ impl ContextManager {
         while !ops.is_empty() {
             let num_pages = ops[0].num_pages;
             let driver_idx = ops[0].driver;
+            if ops[0].needs_rs_slot && self.rs_stores[driver_idx].available() == 0 {
+                if let Some(ctx) = self.contexts.get_mut(&ctx_id) {
+                    ctx.deferred_ops = ops;
+                }
+                self.alloc_queue.push_back(ctx_id);
+                return;
+            }
             if num_pages == 0 {
                 let op = ops.remove(0);
                 (op.on_alloc)(self, Vec::new());

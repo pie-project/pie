@@ -48,9 +48,9 @@ struct PersistentInputs {
     DeviceBuffer<std::uint8_t>  custom_mask;
     DeviceBuffer<std::int32_t>  custom_mask_indptr;
 
-    // Per-request linear-attention state-cache slot ids (Qwen3.5 / 3.6).
+    // Per-request linear-attention rs_cache slot ids (Qwen3.5 / 3.6).
     // Capacity = max_requests. Inert (zero-length writes) on archs that
-    // don't use a state cache. Lives in PersistentInputs so the TP
+    // don't use rs_cache. Lives in PersistentInputs so the TP
     // broadcast from rank 0 reaches followers via the same NCCL op
     // pattern as the rest of the per-fire payload.
     DeviceBuffer<std::int32_t>  slot_ids;

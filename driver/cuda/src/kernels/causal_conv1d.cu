@@ -16,10 +16,11 @@ __device__ __forceinline__ float silu_f(float z) {
 //
 //     y[t, c] = silu( sum_{k=0..K-1} W[c, k] * x[t - K + 1 + k, c]  + bias[c] )
 //
-// where `x[t<0, c] = 0` (causal padding). The trailing K input rows
-// are also written into `state_out[K, C]` (oldest first) so a follow-
-// up decode step can resume from there. If N < K the leading rows of
-// state_out are zero-padded.
+// where `x[t<0, c]` is read from the prior state window. Fresh prompts
+// arrive with a zeroed state window, so this also implements causal
+// padding for first-chunk prefill. The trailing K input rows are written
+// back into `state_out[K, C]` (oldest first) so a follow-up decode or
+// mixed prefill chunk can resume from there.
 __global__ void causal_conv1d_prefill_kernel(
     const __nv_bfloat16* __restrict__ x,
     const __nv_bfloat16* __restrict__ weight,
@@ -43,20 +44,30 @@ __global__ void causal_conv1d_prefill_kernel(
         for (int k = 0; k < 8; ++k) {  // unroll up to 8 (Qwen3.5 uses K=4)
             if (k >= K) break;
             const int src_t = t - (K - 1) + k;
-            if (src_t < 0) continue;
-            const float xv = __bfloat162float(x[src_t * C + c]);
+            float xv = 0.f;
+            if (src_t < 0) {
+                if (state_out) {
+                    xv = __bfloat162float(state_out[(K + src_t) * C + c]);
+                }
+            } else {
+                xv = __bfloat162float(x[src_t * C + c]);
+            }
             const float wv = __bfloat162float(weight[c * K + k]);
             acc += wv * xv;
         }
         y[t * C + c] = __float2bfloat16(silu_f(acc));
     }
 
+    __syncthreads();
+
     // Persist the trailing K input rows into state_out (one thread does
     // this per channel; it's a tiny copy with strided indexing).
     if (state_out && tid == 0) {
         for (int s = 0; s < K; ++s) {
             const int src_t = N - K + s;  // token index for state slot s
-            const float v = (src_t < 0) ? 0.f : __bfloat162float(x[src_t * C + c]);
+            const float v = (src_t < 0)
+                ? __bfloat162float(state_out[(K + src_t) * C + c])
+                : __bfloat162float(x[src_t * C + c]);
             state_out[s * C + c] = __float2bfloat16(v);
         }
     }
@@ -108,8 +119,9 @@ __global__ void causal_conv1d_update_kernel(
 
 // Multi-request batched prefill. Per-(channel, request) block; threads
 // stride through that request's tokens. Same math as the single-request
-// kernel; the (t0_r, Nr_r) window is read from qo_indptr at runtime and
-// the trailing K-window is persisted to the request's state slab.
+// kernel; the (t0_r, Nr_r) window is read from qo_indptr at runtime,
+// source rows before that window are read from the request's existing
+// state slab, and the trailing K-window is persisted back to that slab.
 __global__ void causal_conv1d_prefill_batched_kernel(
     const __nv_bfloat16* __restrict__ x,           // [N_total, C]
     const __nv_bfloat16* __restrict__ weight,      // [C, K]
@@ -145,19 +157,26 @@ __global__ void causal_conv1d_prefill_batched_kernel(
         for (int k = 0; k < 8; ++k) {
             if (k >= K) break;
             const int src_t = t - (K - 1) + k;
-            if (src_t < 0) continue;
-            const float xv = __bfloat162float(x_r[src_t * C + c]);
+            float xv = 0.f;
+            if (src_t < 0) {
+                xv = __bfloat162float(state[(K + src_t) * C + c]);
+            } else {
+                xv = __bfloat162float(x_r[src_t * C + c]);
+            }
             const float wv = __bfloat162float(weight[c * K + k]);
             acc += wv * xv;
         }
         y_r[t * C + c] = __float2bfloat16(silu_f(acc));
     }
 
+    __syncthreads();
+
     if (state_out_base && tid == 0) {
         for (int s = 0; s < K; ++s) {
             const int src_t = Nr - K + s;
-            const float v = (src_t < 0) ? 0.f
-                                        : __bfloat162float(x_r[src_t * C + c]);
+            const float v = (src_t < 0)
+                ? __bfloat162float(state[(K + src_t) * C + c])
+                : __bfloat162float(x_r[src_t * C + c]);
             state[s * C + c] = __float2bfloat16(v);
         }
     }

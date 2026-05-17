@@ -722,7 +722,7 @@ void qwen3_5_moe_forward_paged(
     const std::int32_t* slot_ids_d)
 {
     // Pure-Qwen3-MoE (Qwen3-30B-A3B, model_type == "qwen3_moe") has no
-    // linear-attn layers; the per-slot state cache is unused. Qwen3.5 /
+    // linear-attn layers; the per-slot rs_cache is unused. Qwen3.5 /
     // 3.6-MoE additionally fires the linear-attn body — those layers
     // consume slot_ids_h / is_fresh_h to drive per-request state.
     const bool has_linear_attn_layers = std::any_of(

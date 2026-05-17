@@ -127,7 +127,6 @@ add_library(pie_driver_cuda_lib STATIC
   src/kernels/causal_conv1d.cu
   src/kernels/gated_delta_net.cu
   src/qwen3_5_state_cache.cpp
-  src/slot_allocator.cpp
   src/model/qwen3_5_forward.cpp
   src/model/qwen3_5_moe.cpp
   src/model/qwen3_5_moe_forward.cpp
@@ -209,6 +208,18 @@ target_compile_options(sample_flashinfer_test PRIVATE
   $<$<COMPILE_LANGUAGE:CUDA>: --extended-lambda --expt-relaxed-constexpr >)
 target_link_libraries(sample_flashinfer_test PRIVATE CUDA::cudart)
 
+# Qwen3.5 linear-attention conv-state regression. This catches mixed
+# prefill/decode batches where a continuing T=1 request must consume its
+# existing conv window even when the whole fire is not pure decode.
+add_executable(test_causal_conv1d
+  tests/test_causal_conv1d.cu
+  src/kernels/causal_conv1d.cu)
+target_include_directories(test_causal_conv1d PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_compile_options(test_causal_conv1d PRIVATE
+  $<$<COMPILE_LANGUAGE:CUDA>: --extended-lambda --expt-relaxed-constexpr >)
+target_link_libraries(test_causal_conv1d PRIVATE CUDA::cudart)
+
 # Wire-format unit tests. Pure C++ (no CUDA), short runtime; CTest runs
 # them under `cmake --build build --target test`.
 add_executable(test_brle tests/test_brle.cpp src/brle.cpp)
@@ -223,6 +234,7 @@ target_link_libraries(test_driver_common PRIVATE nlohmann_json::nlohmann_json)
 
 enable_testing()
 add_test(NAME brle COMMAND test_brle)
+add_test(NAME causal_conv1d COMMAND test_causal_conv1d)
 add_test(NAME driver_common COMMAND test_driver_common)
 
 target_link_libraries(pie_driver_cuda_lib PUBLIC

@@ -254,6 +254,8 @@ fn build_cuda() {
     }
 
     let driver_dir = PathBuf::from("../driver/cuda");
+    println!("cargo:rerun-if-changed=../driver/cuda/CMakeLists.txt");
+    println!("cargo:rerun-if-changed=../driver/cuda/src");
 
     let mut cfg = cmake::Config::new(&driver_dir);
     // See `build_portable` — per-flavor out_dir keeps the two CMake

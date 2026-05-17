@@ -30,8 +30,8 @@ use std::sync::{Arc, LazyLock, Mutex};
 use anyhow::Result;
 use tokio::sync::oneshot;
 
-use crate::context::pagestore::PhysicalPageId;
 use crate::context::ContextId;
+use crate::context::pagestore::PhysicalPageId;
 use crate::inference::scheduler::SchedulerHandle;
 
 fn trace_spec_enabled() -> bool {
@@ -450,6 +450,8 @@ pub fn build_next_request(
         kv_page_indptr: vec![0],
         kv_last_page_lens: Vec::new(),
         qo_indptr: vec![0, 1],
+        rs_slot_ids: Vec::new(),
+        rs_slot_flags: Vec::new(),
         masks: vec![causal_mask],
         mask_indptr: vec![0, 1],
         logit_masks: Vec::new(),
@@ -497,6 +499,8 @@ mod tests {
             kv_page_indptr: vec![0],
             kv_last_page_lens: Vec::new(),
             qo_indptr: vec![0, n],
+            rs_slot_ids: Vec::new(),
+            rs_slot_flags: Vec::new(),
             masks: Vec::new(),
             mask_indptr: vec![0, 0],
             logit_masks: Vec::new(),

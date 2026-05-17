@@ -4,8 +4,8 @@
 use pie_bridge::wire::{WireError, encode_request, encode_response, parse_request, parse_response};
 use pie_bridge::{
     AdapterBinding, AdapterOp, AdapterRequest, ArchivedRequestPayload, ArchivedResponsePayload,
-    ArchivedSampler, CopyDir, CopyRequest, ForwardRequest, ForwardResponse, Frame, RequestPayload,
-    ResponseFrame, ResponsePayload, Sampler, StatusResponse,
+    ArchivedSampler, CopyDir, CopyRequest, CopyResource, ForwardRequest, ForwardResponse, Frame,
+    RequestPayload, ResponseFrame, ResponsePayload, Sampler, StatusResponse,
 };
 
 #[test]
@@ -158,6 +158,7 @@ fn copy_request_round_trip() {
             dir: CopyDir::D2H,
             srcs: vec![1, 2, 3],
             dsts: vec![10, 20, 30],
+            resource: CopyResource::Kv,
         }),
     };
     let bytes = encode_request(&f).unwrap();

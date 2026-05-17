@@ -13,6 +13,7 @@
 #include <mutex>
 #include <random>
 #include <span>
+#include <stdexcept>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -213,7 +214,7 @@ struct TpFireHeader {
     std::int32_t mask_indptr_count;
     // 1 = slot_ids[R] (int32) and is_fresh[R] (uint8) follow the
     // existing payload broadcasts. Inert (0) for archs that don't use
-    // a state cache — followers skip those broadcasts.
+    // rs_cache — followers skip those broadcasts.
     std::int32_t has_slot_ids;
 };
 static_assert(sizeof(TpFireHeader) == 8 * sizeof(std::int32_t),
@@ -431,8 +432,8 @@ void handle_fire_batch(
         }
         const auto sidx_view_orig  = view.sampling_indices.as<std::uint32_t>();
         const auto sptr_view_orig  = view.sampling_indptr.as<std::uint32_t>();
-        // Per-request stable context ids — used to drive the linear-attn
-        // state-cache slot allocator below.
+        // Per-request stable context ids. Runtime-managed rs_cache slot
+        // ids below are indexed in this same request order.
         const auto ctx_id_view     = view.context_ids.as<std::uint64_t>();
 
         // Sampler params (per-sampler arrays). Read here (rather than
@@ -611,25 +612,28 @@ void handle_fire_batch(
             }
         }
 
-        // Linear-attention slot allocation. Active only when the
-        // allocator was sized at engine init (max_slots > 0 — i.e.
-        // qwen3.5 / qwen3.6-MoE with any linear-attn layers); a
-        // zero-capacity allocator returns an empty span and the
-        // forward simply ignores the slot args.
+        // Linear-attention rs_cache slots. Runtime owns slot assignment;
+        // RS-capable models must receive one slot id per request.
         std::vector<std::int32_t> slot_ids_h;
         std::vector<std::uint8_t> is_fresh_h;
-        const bool use_slots =
-            executor.slot_alloc.max_slots() > 0 && R > 0 &&
-            ctx_id_view.size() == static_cast<std::size_t>(R);
+        const auto rs_slot_view = view.rs_slot_ids.as<std::uint32_t>();
+        const auto rs_flag_view = view.rs_slot_flags.as<std::uint8_t>();
+        bool use_slots =
+            R > 0 && rs_slot_view.size() == static_cast<std::size_t>(R);
+        if (executor.rs_cache != nullptr && R > 0 && !use_slots) {
+            throw std::runtime_error(
+                "rs_cache forward missing runtime-assigned slot ids");
+        }
         if (use_slots) {
             slot_ids_h.resize(R);
             is_fresh_h.resize(R);
             for (int r = 0; r < R; ++r) {
-                const auto acq = executor.slot_alloc.acquire(ctx_id_view[r]);
-                slot_ids_h[r]  = acq.slot;
-                is_fresh_h[r]  = acq.is_fresh ? 1u : 0u;
+                slot_ids_h[r] = static_cast<std::int32_t>(rs_slot_view[r]);
+                is_fresh_h[r] = (r < static_cast<int>(rs_flag_view.size()) &&
+                                 (rs_flag_view[r] & 1u))
+                                    ? 1u
+                                    : 0u;
             }
-            executor.slot_alloc.end_of_fire();
             pi.slot_ids.copy_from_host(std::span<const std::int32_t>(slot_ids_h));
             pi.is_fresh.copy_from_host(std::span<const std::uint8_t>(is_fresh_h));
         }

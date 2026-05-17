@@ -477,6 +477,11 @@ Executor::BatchPlan Executor::plan_(const pie_driver::PieForwardRequestView& req
 
     const PlanArrays arrays = extract_plan_arrays(req);
     validate_plan_top_level(arrays);
+    if (state_ && arrays.n_request > 0 &&
+        arrays.rs_slot_ids.size() != static_cast<std::size_t>(arrays.n_request)) {
+        throw std::runtime_error(
+            "plan: rs_cache forward missing runtime-assigned slot ids");
+    }
 
     BatchPlan plan;
     plan.total_n_tokens = arrays.total_n_tokens;
@@ -495,6 +500,13 @@ Executor::BatchPlan Executor::plan_(const pie_driver::PieForwardRequestView& req
     const std::int32_t total_pages = kv_.total_pages();
     for (std::int32_t r = 0; r < arrays.n_request; ++r) {
         plan_single_request(arrays, r, page_size, total_pages, spec, plan);
+    }
+    if (state_ && arrays.rs_slot_flags.size() == static_cast<std::size_t>(arrays.n_request)) {
+        for (std::int32_t r = 0; r < arrays.n_request; ++r) {
+            if ((arrays.rs_slot_flags[r] & 1u) != 0 && plan.reqs[r].state_slot >= 0) {
+                state_->zero_slot(plan.reqs[r].state_slot);
+            }
+        }
     }
 
     // M11 packed-decode fast path: all-decode (n_tokens == 1) batches with

@@ -465,6 +465,16 @@ impl pie::core::inference::HostForwardPass for InstanceState {
             let driver_id = pinned.driver;
             let physical_page_ids = pinned.pages;
             let extra_pages = pinned.extra_pages;
+            if let Some(rs_slot) = pinned.rs_slot {
+                if !req.spec_token_ids.is_empty() {
+                    context::unpin(model_id, context_id);
+                    return Ok(Err(
+                        "rs_cache models do not support speculative draft tokens yet".to_string(),
+                    ));
+                }
+                req.rs_slot_ids = vec![rs_slot];
+                req.rs_slot_flags = vec![pinned.rs_flags];
+            }
 
             let num_pages = physical_page_ids.len() as u32;
             let page_size = context::tokens_per_page(model_id);

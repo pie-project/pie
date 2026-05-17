@@ -881,6 +881,11 @@ fn build_chunk_request_for_slots(
     if output_spec_flags.is_empty() {
         output_spec_flags.push(false);
     }
+    let rs_slot_flags = if start == 0 {
+        original.rs_slot_flags.clone()
+    } else {
+        vec![0; original.rs_slot_flags.len()]
+    };
     let sampling_len = sampling_indices.len() as u32;
     let sampler_len = samplers.len() as u32;
     let chunk = pie_bridge::ForwardRequest {
@@ -890,6 +895,8 @@ fn build_chunk_request_for_slots(
         kv_page_indptr: vec![0],
         kv_last_page_lens: Vec::new(),
         qo_indptr: vec![0, chunk_len as u32],
+        rs_slot_ids: original.rs_slot_ids.clone(),
+        rs_slot_flags,
         masks,
         mask_indptr,
         logit_masks,

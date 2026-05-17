@@ -78,6 +78,7 @@
 // commits and dedup correctly, all operations O(depth).
 pub mod pagestore;
 mod restore;
+mod rs_cache;
 pub(crate) mod sched;
 mod snapshot;
 
@@ -89,12 +90,13 @@ use std::time::Instant;
 use tokio::sync::oneshot;
 
 use crate::adapter::AdapterId;
-use crate::driver::{self, DriverId};
+use crate::driver::DriverId;
 use crate::process::ProcessId;
 use crate::service::{ServiceArray, ServiceHandler};
 use pie_bridge::Brle;
 
 use pagestore::{FlatPageStore, PageHash, PageStore, PhysicalPageId};
+use rs_cache::{RS_FLAG_RESET, RsSlotId, RsState, RsStore};
 use sched::{AuctionResult, PendingAlloc, ProcessEntry};
 
 // =============================================================================
@@ -106,6 +108,18 @@ use sched::{AuctionResult, PendingAlloc, ProcessEntry};
 /// this rather than on volatile KV-page indices. Pie-internal — the wire
 /// schema carries it as plain `[uint64]` in `ForwardRequest.context_ids`.
 pub type ContextId = u64;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RsPinSlot {
+    Ready(Option<RsSlotId>, u8),
+    Deferred,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RsSlotAlloc {
+    Ready(RsSlotId),
+    Deferred,
+}
 
 /// Entry in the restore priority queue (BinaryHeap).
 ///
@@ -261,20 +275,23 @@ pub fn spawn(
     page_size: usize,
     num_gpu_pages: Vec<usize>,
     num_cpu_pages: Vec<usize>,
+    num_rs_slots: Vec<usize>,
     default_endowment_pages: usize,
     default_token_limit: Option<usize>,
     admission_oversubscription_factor: f64,
     restore_pause_at_utilization: f64,
 ) -> usize {
+    let model_idx = SERVICES.len();
     PAGE_SIZES.push(page_size);
     MARKET.push(Market::new(default_endowment_pages));
     SERVICES
         .spawn(move || {
             ContextManager::new(
-                SERVICES.len().saturating_sub(1),
+                model_idx,
                 page_size,
                 &num_gpu_pages,
                 &num_cpu_pages,
+                &num_rs_slots,
                 default_endowment_pages,
                 default_token_limit,
                 admission_oversubscription_factor,
@@ -739,6 +756,16 @@ pub struct PinnedContext {
     pub extra_pages: Vec<PhysicalPageId>,
     pub kv_len: u32,
     pub last_page_len: u32,
+    pub rs_slot: Option<RsSlotId>,
+    pub rs_flags: u8,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ReplayPageRegistration {
+    pub driver: usize,
+    pub prefix: Vec<PageHash>,
+    pub hashes: Vec<PageHash>,
+    pub pages: Vec<PhysicalPageId>,
 }
 
 #[derive(Debug, Clone)]
@@ -748,6 +775,7 @@ pub(crate) struct TokenInfo {
     pub mask: Brle,
     pub adapter: Option<AdapterId>,
     pub adapter_seed: Option<i64>,
+    pub forward_id: u64,
 }
 
 // =============================================================================
@@ -762,7 +790,82 @@ pub(crate) enum Record {
         mask: Vec<Brle>,
         adapter: Option<AdapterId>,
         adapter_seed: Option<i64>,
+        /// Original forward-pass id. KV replay may ignore this and merge
+        /// adjacent fills, but rs_cache replay uses it to reconstruct the
+        /// recurrent state with the same forward boundaries.
+        forward_id: u64,
     },
+}
+
+fn record_from_token_infos(infos: &[TokenInfo]) -> Record {
+    let adapter = infos.first().and_then(|t| t.adapter);
+    let adapter_seed = infos.first().and_then(|t| t.adapter_seed);
+    let forward_id = infos.first().map(|t| t.forward_id).unwrap_or(0);
+    Record::Fill {
+        tokens: infos.iter().map(|t| t.token).collect(),
+        positions: infos.iter().map(|t| t.position).collect(),
+        mask: infos.iter().map(|t| t.mask.clone()).collect(),
+        adapter,
+        adapter_seed,
+        forward_id,
+    }
+}
+
+fn append_fill_record(lineage: &mut Vec<Record>, record: Record, allow_merge: bool) {
+    if allow_merge {
+        if let (
+            Some(Record::Fill {
+                tokens: existing_tokens,
+                positions: existing_positions,
+                mask: existing_masks,
+                adapter: existing_adapter,
+                adapter_seed: existing_seed,
+                forward_id: _,
+            }),
+            Record::Fill {
+                tokens,
+                positions,
+                mask,
+                adapter,
+                adapter_seed,
+                forward_id: _,
+            },
+        ) = (lineage.last_mut(), &record)
+        {
+            if *existing_adapter == *adapter && *existing_seed == *adapter_seed {
+                existing_tokens.extend_from_slice(tokens);
+                existing_positions.extend_from_slice(positions);
+                existing_masks.extend_from_slice(mask);
+                return;
+            }
+        }
+    }
+    lineage.push(record);
+}
+
+fn append_token_infos_to_lineage(
+    lineage: &mut Vec<Record>,
+    infos: &[TokenInfo],
+    preserve_forward_boundaries: bool,
+) {
+    if infos.is_empty() {
+        return;
+    }
+    if !preserve_forward_boundaries {
+        append_fill_record(lineage, record_from_token_infos(infos), true);
+        return;
+    }
+
+    let mut start = 0usize;
+    while start < infos.len() {
+        let forward_id = infos[start].forward_id;
+        let mut end = start + 1;
+        while end < infos.len() && infos[end].forward_id == forward_id {
+            end += 1;
+        }
+        append_fill_record(lineage, record_from_token_infos(&infos[start..end]), false);
+        start = end;
+    }
 }
 
 // =============================================================================
@@ -800,9 +903,16 @@ pub(crate) struct Context {
     /// Full token lineage for replay after eviction.
     pub lineage: Vec<Record>,
 
+    /// Runtime-owned recurrent-state cache lifecycle for linear-attention
+    /// models. This is kept as an enum so invalid combinations such as
+    /// "resident and missing" cannot be represented.
+    pub rs_state: RsState,
+
     // Token-level data (previously in ContextTokens / BUFFERS DashMap)
     /// Tokens that have been forwarded but not yet committed to a page.
     pub working_page_tokens: Vec<TokenInfo>,
+    /// Monotonic id for preserving forward-pass boundaries in rs_cache replay.
+    pub next_forward_id: u64,
 
     /// Maximum position value across all committed tokens. Need to check the validity of committed tokens
     pub max_committed_position: Option<u32>,
@@ -842,7 +952,9 @@ impl Context {
             suspended_working_count: 0,
             committed_hashes: Vec::new(),
             lineage: Vec::new(),
+            rs_state: RsState::Unsupported,
             working_page_tokens: Vec::new(),
+            next_forward_id: 0,
             max_committed_position: None,
             state: State::Active,
             pending_suspend: false,
@@ -968,6 +1080,9 @@ pub(crate) struct ContextManager {
     /// Per-driver CPU page stores (flat map). Indexed by driver ordinal.
     /// Holds stashed pages for suspended contexts (D2H copies).
     pub(crate) cpu_stores: Vec<FlatPageStore>,
+    /// Per-driver recurrent-state slot pools. Empty stores mean this
+    /// driver/model does not require rs_cache.
+    pub(crate) rs_stores: Vec<RsStore>,
     /// Tokens per KV-cache page. Used to convert token budgets to credit endowments.
     pub(crate) page_size: usize,
     /// Index of the model this manager serves. Used for routing messages.
@@ -1018,6 +1133,7 @@ impl ContextManager {
         page_size: usize,
         num_gpu_pages: &[usize],
         num_cpu_pages: &[usize],
+        num_rs_slots: &[usize],
         default_endowment_pages: usize,
         default_token_limit: Option<usize>,
         admission_oversubscription_factor: f64,
@@ -1031,9 +1147,11 @@ impl ContextManager {
             .iter()
             .map(|&n| FlatPageStore::new(n))
             .collect();
+        let rs_stores: Vec<_> = num_rs_slots.iter().map(|&n| RsStore::new(n)).collect();
         ContextManager {
             gpu_stores,
             cpu_stores,
+            rs_stores,
             page_size,
             model_idx,
             snapshots: HashMap::new(),
@@ -1180,12 +1298,132 @@ impl ContextManager {
         pick
     }
 
+    fn driver_uses_rs_cache(&self, driver_idx: usize) -> bool {
+        self.rs_stores
+            .get(driver_idx)
+            .map(|s| s.total_slots() > 0)
+            .unwrap_or(false)
+    }
+
+    fn initial_rs_state(&self, driver_idx: usize) -> RsState {
+        if self.driver_uses_rs_cache(driver_idx) {
+            RsState::Empty
+        } else {
+            RsState::Unsupported
+        }
+    }
+
+    fn context_token_len(&self, ctx: &Context) -> usize {
+        ctx.committed_len() * self.page_size + ctx.working_page_tokens.len()
+    }
+
+    fn alloc_rs_slot_with_eviction(
+        &mut self,
+        _ctx_id: ContextId,
+        driver_idx: usize,
+    ) -> Result<RsSlotAlloc> {
+        if let Some(slot) = self.rs_stores[driver_idx].alloc() {
+            return Ok(RsSlotAlloc::Ready(slot));
+        }
+
+        // RS state is compact but not paged/content-addressed like KV. Under
+        // slot-only pressure, preempting an otherwise resident recurrent state
+        // forces full replay and can perturb generation. Keep the slot lease
+        // non-preemptive and let waiters resume when a context is destroyed or
+        // suspended by the normal KV/page contention path.
+        if self.rs_stores[driver_idx].total_slots() > 0 {
+            return Ok(RsSlotAlloc::Deferred);
+        }
+
+        anyhow::bail!(
+            "rs_cache exhausted on driver {driver_idx}: no evictable recurrent-state slot"
+        );
+    }
+
+    fn alloc_rs_slot_now_with_eviction(
+        &mut self,
+        ctx_id: ContextId,
+        driver_idx: usize,
+    ) -> Result<RsSlotId> {
+        match self.alloc_rs_slot_with_eviction(ctx_id, driver_idx)? {
+            RsSlotAlloc::Ready(slot) => Ok(slot),
+            RsSlotAlloc::Deferred => {
+                anyhow::bail!("rs_cache slot unavailable until pinned contexts unpin")
+            }
+        }
+    }
+
+    fn release_rs_slot_for_context(&mut self, ctx_id: ContextId) {
+        let (driver_idx, state, has_state) = match self.contexts.get(&ctx_id) {
+            Some(ctx) => (
+                ctx.driver.unwrap_or(0) as usize,
+                ctx.rs_state,
+                self.context_token_len(ctx) > 0,
+            ),
+            None => return,
+        };
+        if let Some(slot) = state.resident_slot() {
+            if let Some(store) = self.rs_stores.get_mut(driver_idx) {
+                store.free(slot);
+            }
+        }
+        let uses_rs_cache = self.driver_uses_rs_cache(driver_idx);
+        if let Some(ctx) = self.contexts.get_mut(&ctx_id) {
+            ctx.rs_state = if !uses_rs_cache {
+                RsState::Unsupported
+            } else if has_state {
+                RsState::Missing
+            } else {
+                RsState::Empty
+            };
+        }
+    }
+
+    fn ensure_rs_slot_for_pin(
+        &mut self,
+        ctx_id: ContextId,
+        driver_idx: usize,
+    ) -> Result<RsPinSlot> {
+        if !self.driver_uses_rs_cache(driver_idx) {
+            return Ok(RsPinSlot::Ready(None, 0));
+        }
+
+        let (state, token_len) = {
+            let ctx = self
+                .contexts
+                .get(&ctx_id)
+                .ok_or_else(|| anyhow::anyhow!("Context not found"))?;
+            (ctx.rs_state, self.context_token_len(ctx))
+        };
+        match state {
+            RsState::Unsupported => return Ok(RsPinSlot::Ready(None, 0)),
+            RsState::Resident(slot) => return Ok(RsPinSlot::Ready(Some(slot), 0)),
+            RsState::Missing if token_len > 0 => {
+                anyhow::bail!(
+                    "pin: context {ctx_id} has missing rs_cache state; restore must replay it first"
+                );
+            }
+            RsState::Missing | RsState::Empty => {}
+        }
+
+        let slot = match self.alloc_rs_slot_with_eviction(ctx_id, driver_idx)? {
+            RsSlotAlloc::Ready(slot) => slot,
+            RsSlotAlloc::Deferred => return Ok(RsPinSlot::Deferred),
+        };
+        if let Some(ctx) = self.contexts.get_mut(&ctx_id) {
+            ctx.rs_state = RsState::Resident(slot);
+        }
+        Ok(RsPinSlot::Ready(Some(slot), RS_FLAG_RESET))
+    }
+
     // ==================== Core Operations ====================
 
     pub(crate) fn create(&mut self, owner: ProcessId) -> Result<ContextId> {
         let id = self.next_id();
         let mut ctx = Context::new(Some(owner));
-        ctx.driver = Some(self.least_loaded_driver());
+        let driver_idx = self.least_loaded_driver();
+        ctx.driver = Some(driver_idx);
+        ctx.rs_state = self.initial_rs_state(driver_idx);
 
         self.contexts.insert(id, ctx);
 
@@ -1214,6 +1452,12 @@ impl ContextManager {
         self.alloc_queue.retain(|&ctx_id| ctx_id != id);
 
         // restore_queue: lazy deletion — stale entries filtered on pop in drain_queues.
+
+        if let Some(slot) = ctx.rs_state.resident_slot() {
+            if let Some(store) = self.rs_stores.get_mut(driver_idx) {
+                store.free(slot);
+            }
+        }
 
         // Release committed chain (skip if already released during suspension)
         if !ctx.committed_hashes.is_empty() && !ctx.is_off_gpu() {
@@ -1360,10 +1604,11 @@ impl ContextManager {
             .unwrap_or_default();
 
         // Extract token data for the pages being committed.
+        let committed_token_infos = ctx.working_page_tokens[..total_tokens].to_vec();
         let mut tokens = Vec::with_capacity(total_tokens);
         let mut positions = Vec::with_capacity(total_tokens);
         let mut masks = Vec::with_capacity(total_tokens);
-        for info in &ctx.working_page_tokens[..total_tokens] {
+        for info in &committed_token_infos {
             tokens.push(info.token);
             positions.push(info.position);
             masks.push(info.mask.clone());
@@ -1381,8 +1626,7 @@ impl ContextManager {
                 }
             }
         }
-        let lineage_adapter = ctx.working_page_tokens.first().and_then(|t| t.adapter);
-        let lineage_adapter_seed = ctx.working_page_tokens.first().and_then(|t| t.adapter_seed);
+        let lineage_adapter_seed = committed_token_infos.first().and_then(|t| t.adapter_seed);
 
         // Compute content-based hashes (includes adapter_seed so ZO-perturbed
         // pages are not shared with unperturbed or differently-seeded pages).
@@ -1432,37 +1676,14 @@ impl ContextManager {
                 self.gpu_stores[driver_idx].effective_pages(&ctx.committed_hashes);
         }
 
-        // Append to lineage (merge with last record if same adapter AND seed).
-        if let Some(Record::Fill {
-            tokens: t,
-            positions: p,
-            mask: m,
-            adapter: a,
-            adapter_seed: s,
-        }) = ctx.lineage.last_mut()
-        {
-            if *a == lineage_adapter && *s == lineage_adapter_seed {
-                t.extend_from_slice(&tokens);
-                p.extend_from_slice(&positions);
-                m.extend_from_slice(&masks);
-            } else {
-                ctx.lineage.push(Record::Fill {
-                    tokens,
-                    positions,
-                    mask: masks,
-                    adapter: lineage_adapter,
-                    adapter_seed: lineage_adapter_seed,
-                });
-            }
-        } else {
-            ctx.lineage.push(Record::Fill {
-                tokens,
-                positions,
-                mask: masks,
-                adapter: lineage_adapter,
-                adapter_seed: lineage_adapter_seed,
-            });
-        }
+        // KV-only replay can merge adjacent fills. Recurrent-state replay
+        // preserves original forward boundaries to rebuild the same state path.
+        let preserve_forward_boundaries = ctx.rs_state != RsState::Unsupported;
+        append_token_infos_to_lineage(
+            &mut ctx.lineage,
+            &committed_token_infos,
+            preserve_forward_boundaries,
+        );
 
         self.drain_queues();
         self.publish_context_counts(id);
@@ -1480,8 +1701,9 @@ impl ContextManager {
         num_input_tokens: u32,
         response: oneshot::Sender<Result<PinnedContext>>,
     ) {
+        let mut response = Some(response);
         self.when_active(id, move |mgr| {
-            let result = (|| -> Result<PinnedContext> {
+            let result = (|| -> Result<Option<PinnedContext>> {
                 // Token-budget gate: refuse to pin for a forward pass when
                 // the owning process has exhausted its compute budget. The
                 // actual debit happens on append_working_page_tokens after
@@ -1493,14 +1715,41 @@ impl ContextManager {
                     );
                 }
 
+                let driver_idx = {
+                    let ctx = mgr
+                        .contexts
+                        .get(&id)
+                        .ok_or_else(|| anyhow::anyhow!("Context not found"))?;
+                    if ctx.is_off_gpu() {
+                        anyhow::bail!("pin: context is suspended (cannot pin)");
+                    }
+                    ctx.driver.unwrap_or(0) as usize
+                };
+                let (rs_slot, rs_flags) = match mgr.ensure_rs_slot_for_pin(id, driver_idx)? {
+                    RsPinSlot::Ready(slot, flags) => (slot, flags),
+                    RsPinSlot::Deferred => {
+                        let pending_response = response
+                            .take()
+                            .ok_or_else(|| anyhow::anyhow!("pin response already consumed"))?;
+                        let pending = PendingAlloc {
+                            driver: driver_idx,
+                            num_pages: 0,
+                            needs_rs_slot: true,
+                            on_alloc: Box::new(move |mgr, _pages| {
+                                mgr.pin(id, num_input_tokens, pending_response);
+                            }),
+                        };
+                        if let Some(ctx) = mgr.contexts.get_mut(&id) {
+                            ctx.deferred_ops.push(pending);
+                        }
+                        mgr.alloc_queue.push_back(id);
+                        return Ok(None);
+                    }
+                };
                 let ctx = mgr
                     .contexts
                     .get_mut(&id)
                     .ok_or_else(|| anyhow::anyhow!("Context not found"))?;
-                if ctx.is_off_gpu() {
-                    anyhow::bail!("pin: context is suspended (cannot pin)");
-                }
-                let driver_idx = ctx.driver.unwrap_or(0) as usize;
                 let committed_hashes = ctx.committed_hashes.clone();
                 let working = ctx.working_pages.clone();
                 let kv_len =
@@ -1530,15 +1779,27 @@ impl ContextManager {
                 let num_pages = pages.len() as u32;
                 let last_page_len =
                     pagestore::compute_last_page_len(total_kv, num_pages, page_size);
-                Ok(PinnedContext {
+                Ok(Some(PinnedContext {
                     driver: driver_idx as DriverId,
                     pages,
                     extra_pages,
                     kv_len,
                     last_page_len,
-                })
+                    rs_slot,
+                    rs_flags,
+                }))
             })();
-            let _ = response.send(result);
+            if let Some(response) = response.take() {
+                match result {
+                    Ok(Some(pinned)) => {
+                        let _ = response.send(Ok(pinned));
+                    }
+                    Ok(None) => {}
+                    Err(err) => {
+                        let _ = response.send(Err(err));
+                    }
+                }
+            }
         });
     }
 
@@ -1579,6 +1840,8 @@ impl ContextManager {
         if let Some(ctx) = self.contexts.get_mut(&id) {
             ctx.state = State::Active;
         }
+        self.fire_deferred_ops(id);
+        self.drain_queues();
     }
 
     /// Central queue drain: called after any event that frees GPU pages.
@@ -1602,8 +1865,12 @@ impl ContextManager {
                     continue;
                 }
             };
-            let (driver_idx, n) = (front_op.driver, front_op.num_pages);
+            let (driver_idx, n, needs_rs_slot) =
+                (front_op.driver, front_op.num_pages, front_op.needs_rs_slot);
             if n > 0 && self.gpu_stores[driver_idx].available() < n {
+                break;
+            }
+            if needs_rs_slot && self.rs_stores[driver_idx].available() == 0 {
                 break;
             }
             let ctx_id = self.alloc_queue.pop_front().unwrap();
@@ -1749,6 +2016,8 @@ impl ContextManager {
             .get_mut(&id)
             .ok_or_else(|| anyhow::anyhow!("Context not found"))?;
         let owner = ctx.owner;
+        let forward_id = ctx.next_forward_id;
+        ctx.next_forward_id = ctx.next_forward_id.wrapping_add(1);
         for (i, token) in tokens.into_iter().enumerate() {
             ctx.working_page_tokens.push(TokenInfo {
                 token,
@@ -1760,6 +2029,7 @@ impl ContextManager {
                 },
                 adapter,
                 adapter_seed,
+                forward_id,
             });
         }
         // Debit the token wallet for the work just completed. Snapshots
@@ -1843,6 +2113,9 @@ pub(crate) enum Message {
     },
     ReplayComplete {
         id: ContextId,
+        scratch_driver: usize,
+        scratch_pages: Vec<PhysicalPageId>,
+        registration: Option<ReplayPageRegistration>,
     },
     GetStats {
         response: oneshot::Sender<Vec<(usize, usize)>>,
@@ -2011,8 +2284,31 @@ impl ServiceHandler for ContextManager {
                 self.sched_counters.unpin_us += t0.elapsed().as_micros() as u64;
                 self.sched_counters.unpin_count += 1;
             }
-            Message::ReplayComplete { id } => {
+            Message::ReplayComplete {
+                id,
+                scratch_driver,
+                scratch_pages,
+                registration,
+            } => {
                 let t0 = Instant::now();
+                if !scratch_pages.is_empty() {
+                    if let Some(store) = self.gpu_stores.get_mut(scratch_driver) {
+                        store.free(&scratch_pages);
+                    }
+                }
+                if let Some(registration) = registration {
+                    if self.contexts.contains_key(&id) {
+                        if !registration.hashes.is_empty() {
+                            self.gpu_stores[registration.driver].extend(
+                                &registration.prefix,
+                                &registration.hashes,
+                                &registration.pages,
+                            );
+                        }
+                    } else if let Some(store) = self.gpu_stores.get_mut(registration.driver) {
+                        store.free(&registration.pages);
+                    }
+                }
                 self.replay_complete(id);
                 self.sched_counters.replay_us += t0.elapsed().as_micros() as u64;
                 self.sched_counters.replay_count += 1;

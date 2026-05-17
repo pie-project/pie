@@ -14,6 +14,7 @@ use std::time::Instant;
 use anyhow::Result;
 use tokio::sync::oneshot;
 
+use super::rs_cache::RsState;
 use super::{Context, ContextId, ContextManager, State};
 
 use crate::driver::{self, DriverId};
@@ -43,13 +44,25 @@ impl ContextManager {
             Some(ctx) => {
                 let driver_idx = ctx.driver.unwrap_or(0) as usize;
                 let working = ctx.working_pages.len();
+                let prefix = if ctx.is_off_gpu() && !ctx.committed_hashes.is_empty() {
+                    self.gpu_stores[driver_idx].prefix_len(&ctx.committed_hashes)
+                } else {
+                    ctx.committed_hashes.len()
+                };
                 let suffix = if ctx.is_off_gpu() && !ctx.committed_hashes.is_empty() {
-                    let prefix = self.gpu_stores[driver_idx].prefix_len(&ctx.committed_hashes);
                     ctx.committed_hashes.len() - prefix
                 } else {
                     0
                 };
-                (working + suffix, driver_idx)
+                let rs_scratch = if ctx.rs_state.is_missing()
+                    && self.driver_uses_rs_cache(driver_idx)
+                    && self.context_token_len(ctx) > 0
+                {
+                    prefix
+                } else {
+                    0
+                };
+                (working + suffix + rs_scratch, driver_idx)
             }
             None => {
                 let _ = response.send(Err(anyhow::anyhow!("Context not found")));
@@ -60,7 +73,7 @@ impl ContextManager {
         // Create a temporary context ID for the fork operation.
         // We use the source context for contention — the fork inherits
         // the source's scheduling state.
-        self.when_allocated(id, driver_idx, needed, move |mgr, gpu_pages| {
+        self.when_allocated_allow_off_gpu(id, driver_idx, needed, move |mgr, gpu_pages| {
             let result = (|| -> Result<ContextId> {
                 let ctx = mgr
                     .contexts
@@ -75,7 +88,11 @@ impl ContextManager {
                 let max_pos = ctx.max_committed_position;
                 let lineage = ctx.lineage.clone();
                 let forked_tokens = ctx.working_page_tokens.clone();
+                let next_forward_id = ctx.next_forward_id;
                 let src = ctx.working_pages.clone();
+                let src_rs_state = ctx.rs_state;
+                let source_has_state =
+                    ctx.committed_len() * mgr.page_size + ctx.working_page_tokens.len() > 0;
                 let working_count = src.len();
 
                 // Determine committed chain restoration needs.
@@ -87,7 +104,11 @@ impl ContextManager {
                 };
 
                 // Validate pre-allocated page count against actual needs.
-                let total_needed = working_count + suffix_count;
+                let rs_replay_needed = mgr.driver_uses_rs_cache(driver_idx)
+                    && src_rs_state.is_missing()
+                    && source_has_state;
+                let rs_scratch_count = if rs_replay_needed { prefix_len } else { 0 };
+                let total_needed = working_count + suffix_count + rs_scratch_count;
                 if gpu_pages.len() < total_needed {
                     mgr.gpu_stores[driver_idx].free(&gpu_pages);
                     anyhow::bail!(
@@ -96,9 +117,10 @@ impl ContextManager {
                     );
                 }
 
-                // Split pre-allocated pages: working | suffix | surplus.
+                // Split pre-allocated pages: working | suffix | rs scratch | surplus.
                 let working_pages = gpu_pages[..working_count].to_vec();
-                let suffix_pages = gpu_pages[working_count..total_needed].to_vec();
+                let suffix_pages = gpu_pages[working_count..working_count + suffix_count].to_vec();
+                let scratch_pages = gpu_pages[working_count + suffix_count..total_needed].to_vec();
                 let surplus = gpu_pages[total_needed..].to_vec();
                 if !surplus.is_empty() {
                     mgr.gpu_stores[driver_idx].free(&surplus);
@@ -121,6 +143,26 @@ impl ContextManager {
 
                 // Create the child context (state set below after replay check).
                 let new_id = mgr.next_id();
+                let mut child_rs_state = if mgr.driver_uses_rs_cache(driver_idx) {
+                    if let Some(src_slot) = src_rs_state.resident_slot() {
+                        let dst_slot = mgr.alloc_rs_slot_now_with_eviction(id, driver_idx)?;
+                        driver::copy_rs_d2d(driver_id, &[src_slot], &[dst_slot])?;
+                        RsState::Resident(dst_slot)
+                    } else if src_rs_state.is_missing() && source_has_state {
+                        RsState::Missing
+                    } else {
+                        RsState::Empty
+                    }
+                } else {
+                    RsState::Unsupported
+                };
+                let rs_replay_slot = if child_rs_state.is_missing() {
+                    let slot = mgr.alloc_rs_slot_now_with_eviction(id, driver_idx)?;
+                    child_rs_state = RsState::Resident(slot);
+                    Some(slot)
+                } else {
+                    None
+                };
                 mgr.contexts.insert(
                     new_id,
                     Context {
@@ -131,7 +173,9 @@ impl ContextManager {
                         committed_hashes: committed_hashes.clone(),
                         max_committed_position: max_pos,
                         lineage,
+                        rs_state: child_rs_state,
                         working_page_tokens: forked_tokens,
+                        next_forward_id,
                         state: State::Active, // may become Pinned below
                         pending_suspend: false,
                         last_access: Instant::now(),
@@ -145,9 +189,24 @@ impl ContextManager {
                 );
 
                 // Spawn replay for committed suffix if needed.
-                let has_replay = if suffix_count > 0 {
+                let has_replay = if let Some(slot) = rs_replay_slot {
+                    mgr.spawn_full_rs_replay_pass(
+                        new_id,
+                        driver_idx,
+                        slot,
+                        prefix_len,
+                        scratch_pages,
+                        suffix_pages,
+                    )?
+                } else if suffix_count > 0 {
+                    if !scratch_pages.is_empty() {
+                        mgr.gpu_stores[driver_idx].free(&scratch_pages);
+                    }
                     mgr.spawn_replay_passes(new_id, driver_idx, prefix_len, suffix_pages)?
                 } else {
+                    if !scratch_pages.is_empty() {
+                        mgr.gpu_stores[driver_idx].free(&scratch_pages);
+                    }
                     false
                 };
 
@@ -198,6 +257,23 @@ impl ContextManager {
 
         let max_pos = ctx.max_committed_position;
         let snapshot_filled = ctx.working_page_tokens.clone();
+        let next_forward_id = ctx.next_forward_id;
+        let src_rs_state = ctx.rs_state;
+        let source_has_state =
+            ctx.committed_len() * self.page_size + ctx.working_page_tokens.len() > 0;
+
+        let reserved_rs_slot = if self.driver_uses_rs_cache(driver_idx) {
+            if src_rs_state.is_missing() && source_has_state {
+                anyhow::bail!("save: source context has no resident rs_cache state to snapshot");
+            }
+            if src_rs_state.resident_slot().is_some() {
+                Some(self.alloc_rs_slot_now_with_eviction(id, driver_idx)?)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
 
         if !committed_hashes.is_empty() {
             self.gpu_stores[driver_idx].fork(&committed_hashes);
@@ -223,6 +299,23 @@ impl ContextManager {
         };
 
         let snapshot_id = self.next_id();
+        let snapshot_rs_state = if snapshot_state == State::Stashed {
+            if let Some(slot) = reserved_rs_slot {
+                self.rs_stores[driver_idx].free(slot);
+            }
+            if self.driver_uses_rs_cache(driver_idx) && source_has_state {
+                RsState::Missing
+            } else {
+                self.initial_rs_state(driver_idx)
+            }
+        } else if let (Some(src_slot), Some(dst_slot)) =
+            (src_rs_state.resident_slot(), reserved_rs_slot)
+        {
+            driver::copy_rs_d2d(driver_idx as DriverId, &[src_slot], &[dst_slot])?;
+            RsState::Resident(dst_slot)
+        } else {
+            self.initial_rs_state(driver_idx)
+        };
         self.contexts.insert(
             snapshot_id,
             Context {
@@ -232,7 +325,9 @@ impl ContextManager {
                 suspended_working_count: 0,
                 committed_hashes: committed_hashes.clone(),
                 lineage,
+                rs_state: snapshot_rs_state,
                 working_page_tokens: snapshot_filled,
+                next_forward_id,
                 max_committed_position: max_pos,
                 state: snapshot_state,
                 pending_suspend: false,
@@ -265,6 +360,11 @@ impl ContextManager {
 
         if let Some(ctx) = self.contexts.remove(&snapshot_id) {
             let driver_idx = ctx.driver.unwrap_or(0) as usize;
+            if let Some(slot) = ctx.rs_state.resident_slot() {
+                if let Some(store) = self.rs_stores.get_mut(driver_idx) {
+                    store.free(slot);
+                }
+            }
             if !ctx.committed_hashes.is_empty() && !ctx.is_off_gpu() {
                 self.gpu_stores[driver_idx].release(&ctx.committed_hashes);
             }
@@ -304,13 +404,25 @@ impl ContextManager {
                 Some(snap) if snap.is_off_gpu() => {
                     let driver_idx = snap.driver.unwrap_or(0) as usize;
                     let working = snap.working_pages.len();
+                    let prefix = if !snap.committed_hashes.is_empty() {
+                        self.gpu_stores[driver_idx].prefix_len(&snap.committed_hashes)
+                    } else {
+                        0
+                    };
                     let suffix = if !snap.committed_hashes.is_empty() {
-                        let prefix = self.gpu_stores[driver_idx].prefix_len(&snap.committed_hashes);
                         snap.committed_hashes.len() - prefix
                     } else {
                         0
                     };
-                    (working + suffix, driver_idx, snap_id)
+                    let rs_scratch = if snap.rs_state.is_missing()
+                        && self.driver_uses_rs_cache(driver_idx)
+                        && self.context_token_len(snap) > 0
+                    {
+                        prefix
+                    } else {
+                        0
+                    };
+                    (working + suffix + rs_scratch, driver_idx, snap_id)
                 }
                 Some(snap) => (0, snap.driver.unwrap_or(0) as usize, snap_id),
                 None => {
@@ -346,6 +458,7 @@ impl ContextManager {
         let pending = super::sched::PendingAlloc {
             driver: driver_idx,
             num_pages: needed,
+            needs_rs_slot: false,
             on_alloc: Box::new(move |mgr, pages| {
                 let result = mgr.take_inner(username, name, owner, pages);
                 let _ = response.send(result);
@@ -388,7 +501,13 @@ impl ContextManager {
         };
 
         let working_count = snap.working_pages.len();
-        let total_needed = working_count + suffix_count;
+        let snap_rs_state = snap.rs_state;
+        let source_has_state =
+            snap.committed_len() * self.page_size + snap.working_page_tokens.len() > 0;
+        let rs_replay_needed =
+            self.driver_uses_rs_cache(driver_idx) && snap_rs_state.is_missing() && source_has_state;
+        let rs_scratch_count = if rs_replay_needed { prefix_len } else { 0 };
+        let total_needed = working_count + suffix_count + rs_scratch_count;
 
         // Validate pre-allocated page count against actual needs.
         if gpu_pages.len() < total_needed {
@@ -399,14 +518,33 @@ impl ContextManager {
             );
         }
 
+        let new_rs_state = if self.driver_uses_rs_cache(driver_idx) {
+            if let Some(slot) = snap_rs_state.resident_slot() {
+                RsState::Resident(slot)
+            } else if snap_rs_state.is_missing() && source_has_state {
+                let slot = self.alloc_rs_slot_now_with_eviction(snapshot_id, driver_idx)?;
+                RsState::Resident(slot)
+            } else {
+                RsState::Empty
+            }
+        } else {
+            RsState::Unsupported
+        };
+        let rs_replay_slot = if rs_replay_needed {
+            new_rs_state.resident_slot()
+        } else {
+            None
+        };
+
         // Validation passed — consume the snapshot (point of no return).
         let snap = self.contexts.remove(&snapshot_id).unwrap();
         self.snapshots.remove(&key);
 
-        // Split pre-allocated pages: working | suffix | surplus.
+        // Split pre-allocated pages: working | suffix | rs scratch | surplus.
         let (working_gpu, rest) = gpu_pages.split_at(working_count);
         let suffix_pages = rest[..suffix_count].to_vec();
-        let surplus = rest[suffix_count..].to_vec();
+        let scratch_pages = rest[suffix_count..suffix_count + rs_scratch_count].to_vec();
+        let surplus = rest[suffix_count + rs_scratch_count..].to_vec();
         let working_gpu = working_gpu.to_vec();
         if !surplus.is_empty() {
             self.gpu_stores[driver_idx].free(&surplus);
@@ -442,7 +580,9 @@ impl ContextManager {
                 suspended_working_count: 0,
                 committed_hashes: snap.committed_hashes,
                 lineage: snap.lineage,
+                rs_state: new_rs_state,
                 working_page_tokens: snap.working_page_tokens,
+                next_forward_id: snap.next_forward_id,
                 max_committed_position: snap.max_committed_position,
                 state: State::Active,
                 pending_suspend: false,
@@ -457,9 +597,24 @@ impl ContextManager {
         );
 
         // Spawn replay for committed suffix if needed.
-        let has_replay = if suffix_count > 0 {
+        let has_replay = if let Some(slot) = rs_replay_slot {
+            self.spawn_full_rs_replay_pass(
+                new_id,
+                driver_idx,
+                slot,
+                prefix_len,
+                scratch_pages,
+                suffix_pages,
+            )?
+        } else if suffix_count > 0 {
+            if !scratch_pages.is_empty() {
+                self.gpu_stores[driver_idx].free(&scratch_pages);
+            }
             self.spawn_replay_passes(new_id, driver_idx, prefix_len, suffix_pages)?
         } else {
+            if !scratch_pages.is_empty() {
+                self.gpu_stores[driver_idx].free(&scratch_pages);
+            }
             false
         };
 

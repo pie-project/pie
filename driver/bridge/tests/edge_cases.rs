@@ -18,7 +18,7 @@ use std::ptr;
 
 use pie_bridge::wire::{encode_request, encode_response, parse_request};
 use pie_bridge::{
-    AdapterBinding, AdapterOp, AdapterRequest, CopyDir, CopyRequest, ForwardRequest,
+    AdapterBinding, AdapterOp, AdapterRequest, CopyDir, CopyRequest, CopyResource, ForwardRequest,
     ForwardResponse, Frame, PIE_REQUEST_PAYLOAD_FORWARD, PIE_RESPONSE_PAYLOAD_FORWARD,
     PIE_SAMPLER_LOGPROBS, PIE_SAMPLER_MULTINOMIAL, PieFrameDesc, PieResponseFrameDesc,
     PieResponsePayloadDesc, PieStatusResponseDesc, RequestPayload, ResponsePayload, Sampler,
@@ -315,6 +315,7 @@ fn copy_request_with_zero_length_lists() {
             dir: CopyDir::D2H,
             srcs: vec![],
             dsts: vec![],
+            resource: CopyResource::Kv,
         }),
     })
     .unwrap();

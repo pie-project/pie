@@ -79,6 +79,12 @@ class DriverCapabilities:
     # Resolved activation dtype, never "auto". Currently Python-only.
     activation_dtype: str
 
+    # Runtime-managed recurrent-state cache for linear-attention models.
+    # KV-only models report required=False and slots=0.
+    rs_cache_required: bool = False
+    rs_cache_slots: int = 0
+    rs_cache_slot_bytes: int = 0
+
     # ── Feature support ────────────────────────────────────────────────
     # Whether the driver implements user-supplied attention masks (i.e.,
     # respects `req.has_user_mask` from pie's runtime). False means the

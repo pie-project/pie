@@ -69,9 +69,12 @@ def peek_method_tag(payload: bytes) -> int:
         cr = payload_obj.as_copy()
         if cr is None:
             raise ValueError("REQUEST_COPY frame missing payload")
-        # Legacy: COPY_D2H=1, COPY_H2D=2, COPY_D2D=3, COPY_H2H=4 — the
-        # CopyDir variant order matches: D2H=0, H2D=1, D2D=2, H2H=3.
-        return cr.dir.value + 1
+        # Legacy KV copies: COPY_D2H=1, COPY_H2D=2, COPY_D2D=3,
+        # COPY_H2H=4. RS cache copies start at 10.
+        resource = getattr(cr, "resource", None)
+        resource_value = 0 if resource is None else resource.value
+        base = 10 if resource_value == 1 else 1
+        return cr.dir.value + base
     if kind == _pb.REQUEST_ADAPTER:
         ar = payload_obj.as_adapter()
         if ar is None:

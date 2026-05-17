@@ -86,7 +86,7 @@ struct Qwen3_5LayerWeights {
     std::optional<QuantMeta> down_proj_quant;
 
     // KV cache slot for full-attn layers; -1 for linear-attn layers
-    // (their state lives in the recurrent/conv state caches).
+    // (their state lives in the recurrent/conv rs_cache slabs).
     int kv_layer = -1;
 };
 
