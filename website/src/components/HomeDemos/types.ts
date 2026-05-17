@@ -18,6 +18,7 @@ export interface DemoEvent {
 
 export interface DemoPane {
   label: string;
+  note?: string;
   tone: 'warn' | 'good';
   events: DemoEvent[];
 }

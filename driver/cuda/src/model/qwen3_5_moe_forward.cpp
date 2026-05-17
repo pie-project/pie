@@ -425,26 +425,26 @@ void full_attn_body(
         N, num_q_heads_local, num_kv_heads_local,
         d, rotary_dim, cfg.rope_theta, stream);
 
-    kernels::launch_write_kv_to_pages_bf16(
-        cache.k(kv_layer), cache.v(kv_layer), ws.k.data(), ws.v.data(),
+    auto kv_view = cache.layer_view(kv_layer);
+    kernels::launch_write_kv_to_pages(
+        kv_view, ws.k.data(), ws.v.data(),
         qo_indptr, kv_page_indices, kv_page_indptr, kv_last_page_lens,
-        N, R, cache.page_size(), num_kv_heads_local, d, stream);
+        N, R, stream);
 
     // Decode path: pre-planned (graph-friendly). Prefill: includes host
     // work in the launcher (PrefillPlan), so non-graph-capturable.
     if (decode_plan) {
-        ops::dispatch_attention_flashinfer_decode_bf16(
+        ops::dispatch_attention_flashinfer_decode(
             *decode_plan,
-            ws.q.data(), cache.k(kv_layer), cache.v(kv_layer), ws.attn_out.data(),
+            ws.q.data(), kv_view, ws.attn_out.data(),
             kv_page_indices, kv_page_indptr, kv_last_page_lens,
             attn_ws, stream);
     } else {
-        ops::launch_attention_flashinfer_prefill_bf16(
-            ws.q.data(), cache.k(kv_layer), cache.v(kv_layer), ws.attn_out.data(),
+        ops::launch_attention_flashinfer_prefill(
+            ws.q.data(), kv_view, ws.attn_out.data(),
             qo_indptr, kv_page_indices, kv_page_indptr, kv_last_page_lens,
             qo_indptr_h, kv_page_indptr_h,
-            N, R, num_q_heads_local, num_kv_heads_local, d,
-            cache.page_size(), attn_ws, stream);
+            N, R, num_q_heads_local, attn_ws, stream);
     }
 
     if (cfg.attn_output_gate) {

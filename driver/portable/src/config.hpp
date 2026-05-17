@@ -34,6 +34,10 @@ struct BatchingConfig {
     // Host-side swap pool capacity, in pages. 0 = no swap (M7 disabled).
     // The runtime sees `swap_pool_size = cpu_pages` in capabilities.
     std::uint32_t cpu_pages = 0;
+    // Portable ggml graphs keep native F16 cache tensors. Non-native modes
+    // round-trip written rows through the selected qdq format after graph
+    // compute so subsequent cache reads include quantization error.
+    std::string kv_cache_dtype = "auto";
 };
 
 struct Config {
@@ -61,6 +65,7 @@ inline Config load_config(const std::filesystem::path& path) {
             "max_forward_tokens",
             "max_forward_requests",
             "cpu_pages",
+            "kv_cache_dtype",
         };
         for (const auto& [key, _] : *b) {
             const auto name = key.str();
@@ -88,6 +93,8 @@ inline Config load_config(const std::filesystem::path& path) {
                 c.batching.max_forward_requests);
         c.batching.cpu_pages =
             (*b)["cpu_pages"].value_or<int64_t>(c.batching.cpu_pages);
+        c.batching.kv_cache_dtype =
+            (*b)["kv_cache_dtype"].value_or(c.batching.kv_cache_dtype);
     }
     if (auto r = tbl["runtime"].as_table()) {
         c.runtime.verbose = (*r)["verbose"].value_or(c.runtime.verbose);
@@ -95,6 +102,16 @@ inline Config load_config(const std::filesystem::path& path) {
 
     if (c.model.hf_path.empty()) {
         throw std::runtime_error("config: [model].hf_path is required");
+    }
+    const auto& kv = c.batching.kv_cache_dtype;
+    if (!(kv == "auto" || kv == "bf16" || kv == "bfloat16" ||
+          kv == "fp8_e4m3" || kv == "fp8_e5m2" ||
+          kv == "int8_per_token_head" || kv == "fp8_per_token_head" ||
+          kv == "fp4_e2m1" || kv == "nvfp4")) {
+        throw std::runtime_error(
+            "config: invalid [batching].kv_cache_dtype '" + kv +
+            "'; expected one of: auto, bf16, bfloat16, fp8_e4m3, fp8_e5m2, "
+            "int8_per_token_head, fp8_per_token_head, fp4_e2m1, nvfp4");
     }
     return c;
 }

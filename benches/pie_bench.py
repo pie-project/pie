@@ -25,6 +25,17 @@ from common import (
 
 BENCH_INFERLET = "text-completion-bench"
 EMBEDDED_CLI_DRIVERS: set[str] = {"cuda_native", "portable", "dummy", "vllm", "sglang", "dev"}
+KV_CACHE_DTYPES = [
+    "auto",
+    "bf16",
+    "bfloat16",
+    "fp8_e4m3",
+    "fp8_e5m2",
+    "int8_per_token_head",
+    "fp8_per_token_head",
+    "fp4_e2m1",
+    "nvfp4",
+]
 
 
 def bench_inferlet_paths() -> tuple[Path, Path, str]:
@@ -69,17 +80,20 @@ def build_config(args: argparse.Namespace):
             "max_forward_tokens": args.max_forward_tokens,
             "max_forward_requests": args.max_forward_requests,
             "cpu_mem_budget_in_gb": args.cpu_mem_budget,
+            "kv_cache_dtype": args.kv_cache_dtype,
         }
     elif args.driver == "cuda_native":
         driver_options = {
             "gpu_mem_utilization": args.gpu_mem_util,
             "memory_profile": args.memory_profile,
+            "kv_cache_dtype": args.kv_cache_dtype,
         }
     elif args.driver == "portable":
         driver_options = {
             "max_forward_tokens": args.max_forward_tokens,
             "max_forward_requests": args.max_forward_requests,
             "total_pages": args.kv_pages,
+            "kv_cache_dtype": args.kv_cache_dtype,
         }
     elif args.driver == "vllm":
         driver_options = {
@@ -415,6 +429,7 @@ def build_parser() -> argparse.ArgumentParser:
             choices=["latency", "balanced", "throughput", "capacity"],
         )
         sp.add_argument("--kv-pages", type=int, default=2048)
+        sp.add_argument("--kv-cache-dtype", choices=KV_CACHE_DTYPES, default="auto")
         sp.add_argument("--portable-n-gpu-layers", type=int, default=-1)
         sp.add_argument("--worker-threads", type=int, default=None)
         sp.add_argument(

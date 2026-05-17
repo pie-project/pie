@@ -9,6 +9,8 @@
 
 #include <toml++/toml.hpp>
 
+#include "kv_cache_format.hpp"
+
 namespace pie_cuda_driver {
 
 struct ModelConfig {
@@ -30,6 +32,8 @@ struct BatchingConfig {
     std::string memory_profile = "balanced";
     // Pinned host KV slots for swap-out. 0 = swap disabled.
     std::uint32_t swap_pool_size = 0;
+    // KV cache storage format. "auto" preserves the historical bf16 cache.
+    std::string kv_cache_dtype = "auto";
 };
 
 // Tensor-parallel group geometry. Default {1, 0, ""} = single-GPU; nothing
@@ -75,6 +79,7 @@ inline Config load_config(const std::filesystem::path& path) {
             "gpu_mem_utilization",
             "memory_profile",
             "swap_pool_size",
+            "kv_cache_dtype",
         };
         for (const auto& [key, _] : *b) {
             const auto name = key.str();
@@ -112,6 +117,7 @@ inline Config load_config(const std::filesystem::path& path) {
         }
         c.batching.swap_pool_size =
             static_cast<std::uint32_t>(swap_pool_size);
+        c.batching.kv_cache_dtype   = (*b)["kv_cache_dtype"].value_or(c.batching.kv_cache_dtype);
     }
     if (auto d = tbl["distributed"].as_table()) {
         c.distributed.tp_size = static_cast<int>(
@@ -151,6 +157,7 @@ inline Config load_config(const std::filesystem::path& path) {
         throw std::runtime_error(
             "config: [distributed].nccl_unique_id_hex required when tp_size > 1");
     }
+    (void)kv_cache_format_from_string(c.batching.kv_cache_dtype, c.model.dtype);
     return c;
 }
 

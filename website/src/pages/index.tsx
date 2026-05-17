@@ -153,26 +153,26 @@ function ThemeSection({ eyebrow, heading, subtitle, sectionClassName, children }
     );
 }
 
-function ForwardPassTheme() {
-    return (
-        <ThemeSection
-            eyebrow="01"
-            heading="Program the forward pass"
-            subtitle="The decoder loop, sampler, and constraint matcher are exposed to user code. Write your own drafter, sampling rule, or grammar."
-        >
-            <HomeDemos demos={FORWARD_PASS_DEMOS} />
-        </ThemeSection>
-    );
-}
-
 function KvCacheTheme() {
     return (
         <ThemeSection
-            eyebrow="02"
+            eyebrow="01"
             heading="Program the KV cache"
             subtitle="Branch, rewind, persist, and reopen the cache by calling engine APIs from user code."
         >
             <HomeDemos demos={KV_DEMOS} />
+        </ThemeSection>
+    );
+}
+
+function ForwardPassTheme() {
+    return (
+        <ThemeSection
+            eyebrow="02"
+            heading="Program the forward pass"
+            subtitle="The decoder loop, sampler, and constraint matcher are exposed to user code. Write your own drafter, sampling rule, or grammar."
+        >
+            <HomeDemos demos={FORWARD_PASS_DEMOS} />
         </ThemeSection>
     );
 }
@@ -224,8 +224,8 @@ export default function Home(): ReactNode {
             <Hero />
             <main>
                 <ServingLoop />
-                <ForwardPassTheme />
                 <KvCacheTheme />
+                <ForwardPassTheme />
                 <IoTheme />
                 <ClosingCta />
             </main>

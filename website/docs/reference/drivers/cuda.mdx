@@ -46,6 +46,7 @@ activation_dtype = "bfloat16"
 gpu_mem_utilization  = 0.90
 memory_profile       = "balanced"
 kv_page_size         = 32
+kv_cache_dtype       = "auto"
 swap_pool_size       = 0
 weight_dtype         = "bfloat16"
 runtime_quant        = ""
@@ -59,6 +60,7 @@ shutdown_timeout_s   = 5.0
 | `gpu_mem_utilization` | `0.90` | Fraction of total GPU memory the automatic planner may use after weights load, minus safety headroom. |
 | `memory_profile` | `"balanced"` | Planner profile: `"latency"`, `"balanced"`, `"throughput"`, or `"capacity"`. |
 | `kv_page_size` | `32` | KV cache page size in tokens. |
+| `kv_cache_dtype` | `"auto"` | KV cache format: `auto`, `bf16`, `bfloat16`, `fp8_e4m3`, `fp8_e5m2`, `int8_per_token_head`, `fp8_per_token_head`, `fp4_e2m1`, or `nvfp4`. |
 | `swap_pool_size` | `0` | Pinned host KV-page count for swap-out. `0` disables swap. |
 | `weight_dtype` | `"bfloat16"` | Weight precision. |
 | `runtime_quant` | `""` | Empty disables runtime quantization; `"fp8"` enables the current FP8 path where supported. |
@@ -86,6 +88,7 @@ max_num_embeds       = 128
 max_num_adapters     = 32
 max_adapter_rank     = 8
 kv_page_size         = 16
+kv_cache_dtype       = "auto"
 weight_dtype         = "auto"
 cpu_mem_budget_in_gb = 0
 ```
@@ -101,6 +104,7 @@ cpu_mem_budget_in_gb = 0
 | `max_num_adapters` | `32` | Adapter slot capacity. |
 | `max_adapter_rank` | `8` | Maximum LoRA rank. |
 | `kv_page_size` | `16` | KV cache page size in tokens. |
+| `kv_cache_dtype` | `"auto"` | KV cache quantization fallback format: `auto`, `bf16`, `bfloat16`, `fp8_e4m3`, `fp8_e5m2`, `int8_per_token_head`, `fp8_per_token_head`, `fp4_e2m1`, or `nvfp4`. |
 | `weight_dtype` | `"auto"` | `auto`, `float32`, `float16`, `bfloat16`, `int4`, `int8`, or `float8`. |
 | `cpu_mem_budget_in_gb` | `0` | Pinned host pool for KV swap, in GiB. `0` disables swap. |
 
@@ -124,6 +128,11 @@ cpu_mem_budget_in_gb = 0
 Run `pie model list` to see whether cached HuggingFace repos are compatible with your installed drivers.
 
 ## Quantization
+
+KV cache format is controlled by `kv_cache_dtype` under `[model.driver.options]`.
+The default `auto` preserves the native BF16 cache. Set it explicitly to opt into
+`fp8_e4m3`, `fp8_e5m2`, `int8_per_token_head`, `fp8_per_token_head`,
+`fp4_e2m1`, or `nvfp4`.
 
 For `dev`, set `weight_dtype` under `[model.driver.options]`:
 

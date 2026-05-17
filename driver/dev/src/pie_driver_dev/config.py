@@ -20,6 +20,7 @@ from dataclasses import dataclass
 import torch
 
 from ._bridge.config import RuntimeConfig, _resolve_universal_kwargs
+from .kv_cache import parse_kv_cache_dtype
 
 
 # Valid weight dtype categories.
@@ -40,6 +41,7 @@ class NativeRuntimeConfig(RuntimeConfig):
     # Memory + KV layout
     gpu_mem_utilization: float = 0.8
     kv_page_size: int = 16
+    kv_cache_dtype: str = "auto"
 
     # Forward limits the native scheduler / kernels enforce
     max_forward_tokens: int = 10240
@@ -110,6 +112,7 @@ class NativeRuntimeConfig(RuntimeConfig):
         # native-specific
         gpu_mem_utilization: float = 0.8,
         kv_page_size: int = 16,
+        kv_cache_dtype: str = "auto",
         max_forward_tokens: int = 10240,
         max_forward_requests: int = 512,
         max_dist_size: int = 32,
@@ -125,6 +128,7 @@ class NativeRuntimeConfig(RuntimeConfig):
                 f"Invalid weight_dtype: '{weight_dtype}'. "
                 f"Expected one of: {sorted(FLOAT_DTYPES | QUANT_DTYPES)}"
             )
+        parse_kv_cache_dtype(kv_cache_dtype)
 
         # Pre-resolve devices when not explicitly supplied — flavor-side
         # torch probing belongs here, not in bridge.
@@ -149,6 +153,7 @@ class NativeRuntimeConfig(RuntimeConfig):
             **universal,
             gpu_mem_utilization=gpu_mem_utilization,
             kv_page_size=kv_page_size,
+            kv_cache_dtype=kv_cache_dtype,
             max_forward_tokens=max_forward_tokens,
             max_forward_requests=max_forward_requests,
             max_dist_size=max_dist_size,
@@ -179,5 +184,6 @@ class NativeDriverConfig:
     max_num_adapters: int = 32
     max_adapter_rank: int = 8
     kv_page_size: int = 16
+    kv_cache_dtype: str = "auto"
     weight_dtype: str = "auto"
     cpu_mem_budget_in_gb: int = 0

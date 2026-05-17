@@ -291,8 +291,10 @@ LoadedModel LoadedModel::load(const Config& boot_cfg, NcclComm* tp_comm) {
     if (e.hf_.kv_cache_scheme_present) {
         std::cerr << "[pie-driver-cuda] WARNING: ckpt's "
                   << "quantization_config.kv_cache_scheme is non-null but "
-                  << "the driver always uses bf16 KV cache. Generation "
-                  << "may drift slightly from the calibrated reference.\n";
+                  << "runtime-loaded checkpoint KV scales are unsupported. "
+                  << "Configured kv_cache_dtype='" << boot_cfg.batching.kv_cache_dtype
+                  << "' will use default or online dynamic scales, so generation "
+                  << "may drift from the calibrated reference.\n";
     }
 
     const auto t0 = std::chrono::steady_clock::now();

@@ -89,7 +89,7 @@ void prepare_llama_like_decode_plan(
     const int T = (fwd_cfg.tp_size > 0) ? fwd_cfg.tp_size : 1;
     const int num_q_heads_local  = cfg.num_attention_heads / T;
     const int num_kv_heads_local = cfg.num_key_value_heads / T;
-    ops::plan_attention_flashinfer_decode_bf16(
+    ops::plan_attention_flashinfer_decode(
         *state.decode_plan, kv_page_indptr_h, num_requests,
         num_q_heads_local, num_kv_heads_local, cfg.head_dim_kernel,
         cache.page_size(), attn_ws, /*stream=*/nullptr);
@@ -285,11 +285,11 @@ void llama_like_forward_paged(
             attn_out_buf = ws.attn_out_padded.data();
         }
 
-        kernels::launch_write_kv_to_pages_bf16(
-            cache.k(L), cache.v(L),
-            const_cast<void*>(attn_k), const_cast<void*>(attn_v),
+        auto kv_view = cache.layer_view(L);
+        kernels::launch_write_kv_to_pages(
+            kv_view, const_cast<void*>(attn_k), const_cast<void*>(attn_v),
             qo_indptr, kv_page_indices, kv_page_indptr, kv_last_page_lens,
-            N, R, cache.page_size(), num_kv_heads_local, dk, stream);
+            N, R, stream);
 
         // Per-layer sliding-window dispatch (OLMo-3, Mistral). When
         // `per_layer_window_left` is empty we fall back to the global
@@ -302,27 +302,25 @@ void llama_like_forward_paged(
                 : fwd_cfg.sliding_window;
 
         if (use_decode_path) {
-            ops::dispatch_attention_flashinfer_decode_bf16(
+            ops::dispatch_attention_flashinfer_decode(
                 *decode_plan,
-                attn_q, cache.k(L), cache.v(L), attn_out_buf,
+                attn_q, kv_view, attn_out_buf,
                 kv_page_indices, kv_page_indptr, kv_last_page_lens,
                 attn_ws, stream, layer_window_left,
                 /*logits_soft_cap=*/0.f, sm_scale_override);
         } else if (custom_mask_d) {
-            ops::launch_attention_flashinfer_prefill_custom_bf16(
-                attn_q, cache.k(L), cache.v(L), attn_out_buf,
+            ops::launch_attention_flashinfer_prefill_custom(
+                attn_q, kv_view, attn_out_buf,
                 qo_indptr, kv_page_indices, kv_page_indptr, kv_last_page_lens,
                 custom_mask_d, custom_mask_indptr_d,
                 qo_indptr_h, kv_page_indptr_h,
-                N, R, num_q_heads_local, num_kv_heads_local, dk,
-                cache.page_size(), attn_ws, stream);
+                N, R, num_q_heads_local, attn_ws, stream);
         } else {
-            ops::launch_attention_flashinfer_prefill_bf16(
-                attn_q, cache.k(L), cache.v(L), attn_out_buf,
+            ops::launch_attention_flashinfer_prefill(
+                attn_q, kv_view, attn_out_buf,
                 qo_indptr, kv_page_indices, kv_page_indptr, kv_last_page_lens,
                 qo_indptr_h, kv_page_indptr_h,
-                N, R, num_q_heads_local, num_kv_heads_local, dk,
-                cache.page_size(), attn_ws, stream, layer_window_left,
+                N, R, num_q_heads_local, attn_ws, stream, layer_window_left,
                 /*logits_soft_cap=*/0.f, sm_scale_override);
         }
 

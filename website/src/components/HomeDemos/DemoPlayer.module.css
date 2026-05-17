@@ -123,6 +123,10 @@
   padding: 0.55rem 0.85rem;
   border-bottom: 1px solid rgba(255, 255, 255, 0.07);
   background: rgba(0, 0, 0, 0.18);
+  display: flex;
+  align-items: baseline;
+  gap: 0.5rem;
+  flex-wrap: wrap;
 }
 
 .paneLabel {
@@ -132,6 +136,14 @@
   letter-spacing: 0.08em;
   color: #efe6d7;
   text-transform: uppercase;
+}
+
+.paneNote {
+  font-family: var(--pie-font-mono);
+  font-size: var(--pie-text-xs);
+  font-weight: 500;
+  color: #8c8474;
+  letter-spacing: 0;
 }
 
 .pane_warn .paneLabel {

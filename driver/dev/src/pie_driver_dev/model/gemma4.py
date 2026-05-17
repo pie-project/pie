@@ -815,7 +815,7 @@ class ForwardPass:
         k = k.contiguous()
         v = v.contiguous()
 
-        ops.append_paged_kv_cache(
+        ops.append_paged_kv_cache_with_format(
             append_key=k,
             append_value=v,
             batch_indices=batch_indices,

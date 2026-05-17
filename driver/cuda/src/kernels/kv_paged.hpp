@@ -12,6 +12,8 @@
 #include <cstdint>
 #include <cuda_runtime.h>
 
+#include "kv_cache.hpp"
+
 namespace pie_cuda_driver::kernels {
 
 void launch_write_kv_to_pages_bf16(
@@ -28,6 +30,24 @@ void launch_write_kv_to_pages_bf16(
     int page_size,
     int num_kv_heads,
     int head_dim,
+    cudaStream_t stream);
+
+void launch_write_kv_to_pages(
+    KvCacheLayerView layer,
+    const void* k_curr,                            // [total_tokens, h_kv, d]
+    const void* v_curr,
+    const std::uint32_t* qo_indptr,                // [R+1]
+    const std::uint32_t* kv_page_indices,
+    const std::uint32_t* kv_page_indptr,           // [R+1]
+    const std::uint32_t* kv_last_page_lens,        // [R]
+    int total_tokens,
+    int num_requests,
+    cudaStream_t stream);
+
+void launch_dequant_kv_cache_layer_to_bf16_active(
+    KvCacheLayerView layer,
+    const std::uint32_t* kv_page_indices,
+    int num_pages_in_batch,
     cudaStream_t stream);
 
 }  // namespace pie_cuda_driver::kernels

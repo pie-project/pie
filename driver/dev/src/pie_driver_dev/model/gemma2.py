@@ -516,7 +516,7 @@ class ForwardPass(DenseForwardPass):
         )
 
         # 6. Append K, V to cache (local shards to local cache)
-        ops.append_paged_kv_cache(
+        ops.append_paged_kv_cache_with_format(
             append_key=k,
             append_value=v,
             batch_indices=batch_indices,

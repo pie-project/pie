@@ -4,7 +4,8 @@
   "tagline": "In Pie the KV cache supports mid-flight rewind. Run the model, check the answer in user code, and rewind to a checkpoint when the math is wrong. The verifier and the cache live in the same process.",
   "question": "Compute (156 * 32) + (248 * 19). Show each multiplication on its own line, then state the final sum.",
   "naive": {
-    "label": "Naive",
+    "label": "With Stock API",
+    "note": "(via vLLM/SGLang/llama.cpp)",
     "sublabel": "one greedy roll-out, commit and ship",
     "tone": "warn",
     "events": [
@@ -41,7 +42,7 @@
     ]
   },
   "pie": {
-    "label": "Pie",
+    "label": "With Pie",
     "sublabel": "Rust verifier scans each X op Y = Z; Context::fork() rewinds the KV cache",
     "tone": "good",
     "events": [

@@ -23,7 +23,7 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{anyhow, Context, Result};
 
 use crate::config::{
     CudaMemoryProfile, CudaNativeDriverOptions, DummyDriverOptions, PortableDriverOptions,
@@ -343,6 +343,11 @@ pub fn write_startup_toml(
         options.max_forward_requests,
     );
     insert_int(&mut batching, "cpu_pages", options.cpu_pages);
+    insert_str(
+        &mut batching,
+        "kv_cache_dtype",
+        options.kv_cache_dtype.clone(),
+    );
     insert_table(&mut doc, "batching", batching);
 
     let mut runtime = toml::Table::new();
@@ -485,6 +490,7 @@ pub(crate) fn write_cuda_startup_toml(
         },
     );
     insert_int(&mut batching, "swap_pool_size", opts.swap_pool_size);
+    insert_str(&mut batching, "kv_cache_dtype", opts.kv_cache_dtype.clone());
     insert_table(&mut doc, "batching", batching);
 
     let mut runtime = toml::Table::new();
@@ -1012,6 +1018,7 @@ mod tests {
         assert_eq!(val["batching"]["kv_page_size"].as_integer().unwrap(), 32);
         assert_eq!(val["batching"]["total_pages"].as_integer().unwrap(), 1024);
         assert!(val["batching"].get("max_num_kv_pages").is_none());
+        assert_eq!(val["batching"]["kv_cache_dtype"].as_str().unwrap(), "auto");
         assert_eq!(
             val["model"]["hf_path"].as_str().unwrap(),
             snap.to_str().unwrap()
@@ -1047,6 +1054,7 @@ mod tests {
         assert_eq!(val["model"]["dtype"].as_str().unwrap(), "bfloat16");
         assert!(val["model"].get("runtime_quant").is_none()); // omitted when empty
         assert_eq!(val["batching"]["kv_page_size"].as_integer().unwrap(), 32);
+        assert_eq!(val["batching"]["kv_cache_dtype"].as_str().unwrap(), "auto");
         assert_eq!(
             val["batching"]["gpu_mem_utilization"].as_float().unwrap(),
             0.90
@@ -1055,7 +1063,7 @@ mod tests {
             val["batching"]["memory_profile"].as_str().unwrap(),
             "balanced"
         );
-        assert_eq!(val["batching"].as_table().unwrap().len(), 4);
+        assert_eq!(val["batching"].as_table().unwrap().len(), 5);
         assert_eq!(val["batching"]["swap_pool_size"].as_integer().unwrap(), 0);
         assert_eq!(val["runtime"]["verbose"].as_bool().unwrap(), false);
     }

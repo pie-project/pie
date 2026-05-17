@@ -16,6 +16,7 @@
 #include <cstdint>
 #include <memory>
 #include <span>
+#include <string>
 #include <vector>
 
 #include "adapter.hpp"
@@ -32,7 +33,8 @@ class Executor {
 public:
     Executor(Model& model,
              std::int32_t total_pages,
-             std::int32_t page_size);
+             std::int32_t page_size,
+             std::string kv_cache_dtype = "auto");
     ~Executor();
 
     Executor(const Executor&) = delete;

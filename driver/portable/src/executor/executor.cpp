@@ -11,6 +11,7 @@
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include <ggml.h>
@@ -24,6 +25,7 @@
 #include "graph_phi3small.hpp"
 #include "graph_phi3_5moe.hpp"
 #include "graph_qwen3_5.hpp"
+#include "kv_cache_quant.hpp"
 #include "plan.hpp"
 #include "sampler.hpp"
 
@@ -306,8 +308,10 @@ std::vector<SamplerOutput> sample_batch_greedy(const Executor::BatchPlan& plan,
 
 KvCachePaged build_kv_for_(Model& model,
                             std::int32_t total_pages,
-                            std::int32_t page_size) {
+                            std::int32_t page_size,
+                            const std::string& kv_cache_dtype) {
     const auto& h = model.hparams();
+    auto quant_format = kv_cache_quant_format_from_string(kv_cache_dtype);
     if (h.arch == PieArch::Gemma4) {
         // Per-layer head_dim AND kv_heads. Sliding layers carry
         // [num_key_value_heads, head_dim]; full layers carry
@@ -328,14 +332,16 @@ KvCachePaged build_kv_for_(Model& model,
                              std::move(per_layer_kvh),
                              std::move(per_layer_dim),
                              total_pages, page_size,
-                             GGML_TYPE_F16);
+                             GGML_TYPE_F16,
+                             std::move(quant_format));
     }
     return KvCachePaged(model.backend(),
                         h.num_hidden_layers,
                         h.num_key_value_heads,
                         h.head_dim,
                         total_pages, page_size,
-                        GGML_TYPE_F16);
+                        GGML_TYPE_F16,
+                        std::move(quant_format));
 }
 
 }  // namespace
@@ -346,9 +352,10 @@ KvCachePaged build_kv_for_(Model& model,
 
 Executor::Executor(Model& model,
                    std::int32_t total_pages,
-                   std::int32_t page_size)
+                   std::int32_t page_size,
+                   std::string kv_cache_dtype)
     : model_(model),
-      kv_(build_kv_for_(model, total_pages, page_size)),
+      kv_(build_kv_for_(model, total_pages, page_size, kv_cache_dtype)),
       cache_(std::make_unique<GraphCache>()) {
     // Qwen 3.5 / 3.6 needs a recurrent-state cache for its linear-
     // attention layers. Allocate one slot per concurrent context the

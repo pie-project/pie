@@ -90,6 +90,7 @@ ipc_profile = "balanced" # "low_latency", "balanced", or "low_power"
 [model.driver.options]
 max_forward_tokens = 10240
 max_forward_requests = 512
+kv_cache_dtype = "auto"
 "#;
 
 #[cfg(feature = "driver-cuda")]
@@ -104,6 +105,7 @@ ipc_profile = "balanced" # "low_latency", "balanced", or "low_power"
 [model.driver.options]
 gpu_mem_utilization = 0.90
 memory_profile = "balanced"
+kv_cache_dtype = "auto"
 "#;
 
 const DUMMY_DRIVER_BLOCK: &str = r#"
