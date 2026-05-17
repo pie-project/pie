@@ -1025,14 +1025,6 @@ pub(crate) struct ContextManager {
     /// contexts when any driver's page utilization exceeds this fraction.
     /// Prevents the evict→restore→re-evict thrash cascade.
     pub(crate) restore_pause_at_utilization: f64,
-    /// Total driver-reported forward request slots across this model's
-    /// registered drivers. Admission uses this to avoid one-at-a-time tail
-    /// refills after a saturated cohort.
-    pub(crate) max_forward_requests: usize,
-    /// Set after an admission denial caused by a full endowment pool. While
-    /// active, new admissions wait until enough endowment has drained to fit
-    /// a full forward cohort again.
-    pub(crate) admission_drain_barrier: bool,
     /// Diagnostic counters for scheduler health.
     pub(crate) sched_counters: SchedCounters,
     /// Round-robin counter for new-context driver assignment. Used when
@@ -1049,7 +1041,7 @@ impl ContextManager {
         page_size: usize,
         num_gpu_pages: &[usize],
         num_cpu_pages: &[usize],
-        max_forward_requests: usize,
+        _max_forward_requests: usize,
         default_endowment_pages: usize,
         default_token_limit: Option<usize>,
         admission_oversubscription_factor: f64,
@@ -1079,8 +1071,6 @@ impl ContextManager {
             default_token_limit,
             admission_oversubscription_factor,
             restore_pause_at_utilization,
-            max_forward_requests: max_forward_requests.max(1),
-            admission_drain_barrier: false,
             sched_counters: SchedCounters::default(),
             next_driver_rr: 0,
         }

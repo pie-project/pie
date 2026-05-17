@@ -186,9 +186,10 @@ impl ContextManager {
         //     itself is Option<usize> (None = unlimited by default).
         //
         // Credit wallet (balance/endowment): pages entitled under long-run
-        // contention. Derived from the explicit token cap when present
-        // (⌈T / page_size⌉), or from the configured default endowment when
-        // the cap is unlimited.
+        // contention. An explicit token budget is also the caller's declared
+        // future KV footprint, so admission reserves ceil(T / page_size)
+        // credits. This lets short requests fill a large forward cohort while
+        // long requests remain bounded by the available KV page pool.
         let tokens_remaining = token_budget.or(self.default_token_limit);
         let endowment_pages = match token_budget {
             Some(t) => t.div_ceil(self.page_size.max(1)) as f64,
@@ -197,31 +198,13 @@ impl ContextManager {
 
         // Admission gate: Σ endowment ≤ total_capacity × admission_oversubscription_factor.
         // Each endowment unit is a claim on one page of long-run GPU residency.
-        //
-        // Once the pool has denied an admission, avoid trickle-refilling one
-        // replacement process at a time. Wait until enough endowment has
-        // drained to admit a full forward cohort again; otherwise batch
-        // serving devolves into a long tail of tiny decode batches.
+        // A denied launch simply waits until enough endowment is released for
+        // that launch. This keeps memory-bound serving in a rolling-replacement
+        // regime instead of forcing whole-cohort waves.
         let sigma_e: f64 = self.processes.values().map(|p| p.endowment).sum();
         let total_capacity: f64 = self.gpu_stores.iter().map(|s| s.total_pages() as f64).sum();
         let cap = total_capacity * self.admission_oversubscription_factor;
-        if self.admission_drain_barrier {
-            let cohort_endowment = endowment_pages * self.max_forward_requests as f64;
-            let resume_below = (cap - cohort_endowment).max(0.0);
-            if sigma_e > resume_below {
-                return Err(AdmissionDenied {
-                    endowment_pages,
-                    total_after: sigma_e + endowment_pages,
-                    cap,
-                    total_capacity,
-                    oversubscription_factor: self.admission_oversubscription_factor,
-                }
-                .into());
-            }
-            self.admission_drain_barrier = false;
-        }
         if sigma_e + endowment_pages > cap {
-            self.admission_drain_barrier = true;
             return Err(AdmissionDenied {
                 endowment_pages,
                 total_after: sigma_e + endowment_pages,
@@ -1506,11 +1489,11 @@ mod tests {
             .expect("admission should succeed after unregister");
     }
 
-    /// After a saturated cohort has produced waiters, admission waits for
-    /// enough free endowment to admit another full forward cohort. This avoids
-    /// one-at-a-time tail refills that fragment decode batches.
+    /// After saturation, admission resumes as soon as one process's endowment
+    /// fits again. This keeps memory-bound serving in a rolling-replacement
+    /// regime instead of forcing whole-cohort waves.
     #[test]
-    fn admission_denial_drains_until_forward_cohort_fits() {
+    fn admission_denial_resumes_when_one_endowment_fits() {
         let mut mgr = ContextManager::new(0, 16, &[10], &[10], 4, 1, None, 1.0, 0.85);
 
         let pids: Vec<_> = (0..10)
@@ -1523,16 +1506,8 @@ mod tests {
         assert!(mgr.register_process(ProcessId::new_v4(), Some(16)).is_err());
 
         mgr.unregister_process(pids[0]);
-        assert!(
-            mgr.register_process(ProcessId::new_v4(), Some(16)).is_err(),
-            "one freed slot should not trickle-admit after a saturation denial"
-        );
-
-        for pid in &pids[1..4] {
-            mgr.unregister_process(*pid);
-        }
         mgr.register_process(ProcessId::new_v4(), Some(16))
-            .expect("admission should resume once a full cohort fits");
+            .expect("admission should resume once one endowment fits");
     }
 
     /// Capacity is summed across drivers — endowment competes against the

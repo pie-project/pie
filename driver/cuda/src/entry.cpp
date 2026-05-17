@@ -494,7 +494,7 @@ int profile_decode_target(const std::string& profile,
     // above it we often inflate attention/KV pressure without increasing
     // useful device occupancy. The first-order knee tracks SM count; larger
     // GPUs need enough independent rows to keep the decode matmuls full.
-    const int sm_factor = 4;
+    const int sm_factor = profile == "latency" ? 4 : 6;
     int target = clamp_pow2_nearest(
         prop.multiProcessorCount * sm_factor, 64, 2048);
     if (profile == "latency") {
@@ -721,7 +721,10 @@ CudaMemoryPlan plan_cuda_memory(
             const std::size_t kv_tokens =
                 static_cast<std::size_t>(kv_pages) * kv_page_size;
             const double active_kv_horizon =
-                (!auto_profile && policy_profile == "latency") ? 256.0 : 608.0;
+                (auto_profile || policy_profile == "latency" ||
+                 policy_profile == "throughput")
+                    ? 256.0
+                    : 608.0;
             const std::size_t min_kv_tokens = std::max<std::size_t>(
                 32768,
                 static_cast<std::size_t>(
@@ -784,7 +787,9 @@ CudaMemoryPlan plan_cuda_memory(
                 page_score = (kv_page_size == 16) ? 0.20 : -0.20;
             } else if (policy_profile == "throughput" || auto_profile) {
                 page_score =
-                    (tp_size == 1)
+                    (prop.major >= 9)
+                        ? ((kv_page_size == 16) ? 0.30 : 0.0)
+                    : (tp_size == 1)
                         ? ((kv_page_size == 32) ? 0.25 : 0.0)
                         : ((kv_page_size == 16) ? 0.25 : 0.0);
             } else {
