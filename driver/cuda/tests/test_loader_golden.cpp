@@ -14,8 +14,10 @@
 #include <unistd.h>
 
 #include "cuda_check.hpp"
-#include "loader/load_plan.hpp"
-#include "loader/materializer.hpp"
+#include "loader/layout_plan.hpp"
+#include "loader/load_executor.hpp"
+#include "loader/storage_compiler.hpp"
+#include "loader/storage_program.hpp"
 #include "loader/safetensors.hpp"
 #include "model/weight_store.hpp"
 #include "tensor.hpp"
@@ -94,7 +96,7 @@ void write_safetensors(
 }
 
 void register_spec(
-    LoadPlan& plan,
+    LayoutPlan& plan,
     std::string name,
     DType dtype,
     std::vector<std::int64_t> shape,
@@ -104,7 +106,7 @@ void register_spec(
     std::string backing = {},
     QuantSpec quant = {})
 {
-    TensorSpec spec;
+    TensorDecl spec;
     spec.name = std::move(name);
     spec.dtype = dtype;
     spec.shape = std::move(shape);
@@ -126,16 +128,21 @@ std::vector<T> read_tensor(const DeviceTensor& tensor)
     return host;
 }
 
-MaterializedLoadPlan run_plan(
+LoadExecutionStats run_plan(
     const std::filesystem::path& dir,
-    LoadPlan& plan,
+    LayoutPlan& plan,
     WeightStore& weights,
     int tp_rank = 0,
     int tp_size = 1)
 {
-    auto loader = SafetensorsLoader::open(dir);
-    Materializer materializer(loader, weights, tp_rank, tp_size);
-    return materializer.run(plan);
+    auto loader = SafetensorsCheckpointSource::open(dir);
+    auto storage = compile_storage_program(plan, loader, tp_rank, tp_size);
+    LoadExecutor load_executor(
+        loader, weights, tp_rank, tp_size,
+        /*tp_comm=*/nullptr,
+        /*byte_source=*/nullptr,
+        &storage);
+    return load_executor.run(plan);
 }
 
 void test_axis_concat_exact()
@@ -147,7 +154,7 @@ void test_axis_concat_exact()
         {"v", {"BF16", {1, 2}, bytes_of<std::uint16_t>({7, 8})}},
     });
 
-    LoadPlan plan;
+    LayoutPlan plan;
     plan.ops.push_back(make_axis_concat_op(
         "packed", -1, {{"q", "q_view"}, {"k", "k_view"}, {"v", "v_view"}}));
     register_spec(
@@ -185,11 +192,11 @@ void test_grouped_slice_exact()
         {"down", {"BF16", {2, 2, 4}, bytes_of(values)}},
     });
 
-    LoadPlan plan;
+    LayoutPlan plan;
     plan.ops.push_back(make_raw_load_op(
-        LoadOpKind::GroupedSliceConcat, "gate_up_local", "gate_up"));
+        LayoutOpKind::GroupedSliceConcat, "gate_up_local", "gate_up"));
     plan.ops.push_back(make_raw_load_op(
-        LoadOpKind::GroupedSlice, "down_local", "down"));
+        LayoutOpKind::GroupedSlice, "down_local", "down"));
     register_spec(
         plan, "gate_up_local", DType::BF16, {2, 2, 2},
         TensorLayoutKind::Grouped, TensorOwnershipKind::Owned,
@@ -220,7 +227,7 @@ void test_stack_groups_exact()
         {"e1_down", {"BF16", {2, 2}, bytes_of<std::uint16_t>({21, 22, 23, 24})}},
     });
 
-    LoadPlan plan;
+    LayoutPlan plan;
     plan.ops.push_back(make_stack_groups_op(
         "experts.gate_up", "experts.down", {},
         {{"e0_gate", "gate"}, {"e0_up", "up"}, {"e0_down", "down"},
@@ -250,10 +257,10 @@ void test_cast_exact()
         {"fp32", {"F32", {2}, bytes_of<std::uint32_t>({0x00000000u, 0x3f800000u})}},
     });
 
-    LoadPlan plan;
-    plan.ops.push_back(make_raw_load_op(LoadOpKind::Copy, "tmp", "fp32"));
-    plan.ops.push_back(make_tensor_op(LoadOpKind::Cast, "bf16", {"tmp"}));
-    plan.ops.push_back(make_tensor_op(LoadOpKind::Drop, "drop", {"tmp"}));
+    LayoutPlan plan;
+    plan.ops.push_back(make_raw_load_op(LayoutOpKind::Copy, "tmp", "fp32"));
+    plan.ops.push_back(make_tensor_op(LayoutOpKind::Cast, "bf16", {"tmp"}));
+    plan.ops.push_back(make_tensor_op(LayoutOpKind::Drop, "drop", {"tmp"}));
     register_spec(
         plan, "tmp", DType::FP32, {2}, TensorLayoutKind::Dense,
         TensorOwnershipKind::Temporary);
@@ -274,13 +281,13 @@ void test_dequantize_exact()
         {"scale", {"F32", {1}, bytes_of<float>({1.0f})}},
     });
 
-    LoadPlan plan;
-    plan.ops.push_back(make_raw_load_op(LoadOpKind::Copy, "fp8_tmp", "fp8"));
-    plan.ops.push_back(make_raw_load_op(LoadOpKind::Copy, "scale_tmp", "scale"));
+    LayoutPlan plan;
+    plan.ops.push_back(make_raw_load_op(LayoutOpKind::Copy, "fp8_tmp", "fp8"));
+    plan.ops.push_back(make_raw_load_op(LayoutOpKind::Copy, "scale_tmp", "scale"));
     plan.ops.push_back(make_tensor_op(
-        LoadOpKind::Dequantize, "bf16", {"fp8_tmp", "scale_tmp"}));
+        LayoutOpKind::Dequantize, "bf16", {"fp8_tmp", "scale_tmp"}));
     plan.ops.push_back(make_tensor_op(
-        LoadOpKind::Drop, "drop", {"fp8_tmp", "scale_tmp"}));
+        LayoutOpKind::Drop, "drop", {"fp8_tmp", "scale_tmp"}));
     register_spec(
         plan, "fp8_tmp", DType::FP8_E4M3, {2, 2},
         TensorLayoutKind::Dense, TensorOwnershipKind::Temporary);
@@ -304,10 +311,10 @@ void test_bind_metadata_exact()
         {"s", {"F32", {2}, bytes_of<float>({1.0f, 2.0f})}},
     });
 
-    LoadPlan plan;
-    plan.ops.push_back(make_raw_load_op(LoadOpKind::Copy, "w", "w"));
-    plan.ops.push_back(make_raw_load_op(LoadOpKind::Copy, "s", "s"));
-    plan.ops.push_back(make_tensor_op(LoadOpKind::BindMetadata, "w"));
+    LayoutPlan plan;
+    plan.ops.push_back(make_raw_load_op(LayoutOpKind::Copy, "w", "w"));
+    plan.ops.push_back(make_raw_load_op(LayoutOpKind::Copy, "s", "s"));
+    plan.ops.push_back(make_tensor_op(LayoutOpKind::AttachMetadata, "w"));
 
     QuantSpec quant;
     quant.format = QuantFormat::RuntimeInt8;

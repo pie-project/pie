@@ -6,9 +6,9 @@
 #include <variant>
 #include <vector>
 
-namespace pie_cuda_driver {
+#include "tensor.hpp"
 
-enum class DType : std::uint8_t;
+namespace pie_cuda_driver {
 
 enum class TensorLayoutKind {
     Dense,
@@ -61,9 +61,9 @@ struct QuantSpec {
     std::string zero_point_tensor;
 };
 
-struct TensorSpec {
+struct TensorDecl {
     std::string name;
-    DType dtype;
+    DType dtype = DType::BF16;
     std::vector<std::int64_t> shape;
     TensorLayoutKind layout = TensorLayoutKind::Dense;
     TensorOwnershipKind ownership = TensorOwnershipKind::Owned;
@@ -72,13 +72,59 @@ struct TensorSpec {
     std::string backing_tensor;
 };
 
-struct LoadMemoryPlan {
+struct LayoutMemoryPlan {
     std::uint64_t persistent_bytes = 0;
     std::uint64_t max_temporary_bytes = 0;
     std::uint64_t estimated_peak_bytes = 0;
 };
 
-enum class LoadOpKind {
+using LayoutExprId = std::size_t;
+
+enum class LayoutExprKind {
+    Source,
+    Select,
+    Partition,
+    Join,
+    Stack,
+    Unzip,
+    Reorder,
+    View,
+    Cast,
+    Encode,
+    Decode,
+    Transcode,
+    Attach,
+    Release,
+    Realize,
+};
+
+struct LayoutExpr {
+    LayoutExprKind kind = LayoutExprKind::Source;
+    std::vector<LayoutExprId> inputs;
+    TensorDecl decl;
+    std::string raw_name;
+    std::string runtime_name;
+    std::string secondary_runtime_name;
+    int axis = -1;
+    std::int64_t start = 0;
+    std::int64_t length = 0;
+    int partitions = 0;
+    int partition_index = 0;
+    DType dtype;
+    QuantSpec encoding;
+};
+
+struct LayoutBinding {
+    std::string runtime_name;
+    LayoutExprId root = 0;
+};
+
+struct LayoutAlgebra {
+    std::vector<LayoutExpr> exprs;
+    std::vector<LayoutBinding> bindings;
+};
+
+enum class LayoutOpKind {
     Read,
     Copy,
     Slice,
@@ -97,7 +143,7 @@ enum class LoadOpKind {
     Deinterleave,
     RepackLayout,
     StackGroups,
-    BindMetadata,
+    AttachMetadata,
     Materialize,
 };
 
@@ -148,7 +194,7 @@ struct StackGroupsPayload {
     std::vector<TensorSourceRef> sources;
 };
 
-using LoadOpPayload = std::variant<
+using LayoutOpPayload = std::variant<
     RawLoadPayload,
     RowRangeShardPayload,
     TensorOpPayload,
@@ -156,27 +202,28 @@ using LoadOpPayload = std::variant<
     AxisConcatPayload,
     StackGroupsPayload>;
 
-struct LoadOp {
-    LoadOpKind kind = LoadOpKind::Copy;
-    LoadOpPayload payload = RawLoadPayload{};
+struct LayoutOp {
+    LayoutOpKind kind = LayoutOpKind::Copy;
+    LayoutOpPayload payload = RawLoadPayload{};
 };
 
-struct LoadPlan {
-    std::vector<LoadOp> ops;
-    std::unordered_map<std::string, TensorSpec> tensors;
-    LoadMemoryPlan memory;
+struct LayoutPlan {
+    std::vector<LayoutOp> ops;
+    LayoutAlgebra algebra;
+    std::unordered_map<std::string, TensorDecl> tensors;
+    LayoutMemoryPlan memory;
     std::size_t axis_concat_groups = 0;
 };
 
-struct MaterializedLoadPlan {
+struct LoadExecutionStats {
     std::uint64_t loaded_bytes = 0;
     std::size_t axis_concat_groups = 0;
     std::size_t planned_tensor_count = 0;
     std::size_t runtime_quantized_weights = 0;
     std::uint64_t runtime_quant_bytes_before = 0;
     std::uint64_t runtime_quant_bytes_after = 0;
-    std::uint64_t planned_physical_peak_bytes = 0;
-    std::uint64_t planned_physical_temp_bytes = 0;
+    std::uint64_t planned_storage_peak_bytes = 0;
+    std::uint64_t planned_storage_temp_bytes = 0;
     std::uint64_t cuda_total_bytes = 0;
     std::uint64_t cuda_free_before_bytes = 0;
     std::uint64_t cuda_min_free_bytes = 0;
@@ -185,58 +232,60 @@ struct MaterializedLoadPlan {
     std::size_t cuda_memory_samples = 0;
 };
 
-const char* load_op_kind_name(LoadOpKind kind) noexcept;
+const char* layout_op_kind_name(LayoutOpKind kind) noexcept;
+const char* layout_expr_kind_name(LayoutExprKind kind) noexcept;
 const char* tensor_layout_kind_name(TensorLayoutKind kind) noexcept;
 const char* quant_format_name(QuantFormat format) noexcept;
 
-LoadOp make_raw_load_op(
-    LoadOpKind kind,
+LayoutOp make_raw_load_op(
+    LayoutOpKind kind,
     std::string output_name,
     std::string raw_name,
     int shard_axis = -1);
-LoadOp make_row_range_shard_op(
+LayoutOp make_row_range_shard_op(
     std::string output_name,
     std::string raw_name,
     std::int64_t row_offset,
     std::int64_t rows);
-LoadOp make_tensor_op(
-    LoadOpKind kind,
+LayoutOp make_tensor_op(
+    LayoutOpKind kind,
     std::string output_name,
     std::vector<std::string> inputs = {},
     std::string secondary_output_name = {},
     int shard_axis = -1);
-LoadOp make_slice_op(
+LayoutOp make_slice_op(
     std::string output_name,
     std::string input,
     int slice_axis,
     std::int64_t slice_start,
     std::int64_t slice_length,
     int shard_axis = -1);
-LoadOp make_axis_concat_op(
+LayoutOp make_axis_concat_op(
     std::string output_name,
     int shard_axis,
     std::vector<TensorSourceRef> sources);
-LoadOp make_stack_groups_op(
+LayoutOp make_stack_groups_op(
     std::string output_name,
     std::string secondary_output_name,
     std::vector<std::string> inputs,
     std::vector<TensorSourceRef> sources = {});
 
-const std::string& load_op_output(const LoadOp& op);
-const std::string& load_op_secondary_output(const LoadOp& op);
-const std::string& load_op_raw_name(const LoadOp& op);
-const std::vector<std::string>& load_op_inputs(const LoadOp& op);
-int load_op_shard_axis(const LoadOp& op);
-int load_op_slice_axis(const LoadOp& op);
-std::int64_t load_op_row_offset(const LoadOp& op);
-std::int64_t load_op_rows(const LoadOp& op);
-std::int64_t load_op_slice_start(const LoadOp& op);
-std::int64_t load_op_slice_length(const LoadOp& op);
-const std::vector<TensorSourceRef>& load_op_sources(const LoadOp& op);
-void set_load_op_output(LoadOp& op, std::string output_name);
+const std::string& layout_op_output(const LayoutOp& op);
+const std::string& layout_op_secondary_output(const LayoutOp& op);
+const std::string& layout_op_raw_name(const LayoutOp& op);
+const std::vector<std::string>& layout_op_inputs(const LayoutOp& op);
+int layout_op_shard_axis(const LayoutOp& op);
+int layout_op_slice_axis(const LayoutOp& op);
+std::int64_t layout_op_row_offset(const LayoutOp& op);
+std::int64_t layout_op_rows(const LayoutOp& op);
+std::int64_t layout_op_slice_start(const LayoutOp& op);
+std::int64_t layout_op_slice_length(const LayoutOp& op);
+const std::vector<TensorSourceRef>& layout_op_sources(const LayoutOp& op);
+void set_layout_op_output(LayoutOp& op, std::string output_name);
 
-void validate_load_plan(const LoadPlan& plan);
-std::string describe_load_plan(const LoadPlan& plan);
-std::string dump_load_plan_json(const LoadPlan& plan);
+void validate_layout_plan(const LayoutPlan& plan);
+void build_layout_algebra_from_ops(LayoutPlan& plan);
+std::string describe_layout_plan(const LayoutPlan& plan);
+std::string dump_layout_plan_json(const LayoutPlan& plan);
 
 }  // namespace pie_cuda_driver

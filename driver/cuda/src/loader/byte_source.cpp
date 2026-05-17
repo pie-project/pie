@@ -40,7 +40,7 @@ std::uint64_t tensor_nbytes(DType dtype, const std::vector<std::int64_t>& shape)
 
 bool can_direct_read_contiguous(
     const TensorInfo& info,
-    const ByteRangeWrite& write,
+    const ExtentWrite& write,
     std::uint64_t& source_delta)
 {
     source_delta = 0;
@@ -77,8 +77,17 @@ const char* checkpoint_io_policy_name(CheckpointIoPolicy policy) noexcept {
     return "?";
 }
 
+void CheckpointByteSource::write_to_device_async(
+    const ExtentWrite& write,
+    void* dst_base,
+    void* stream)
+{
+    (void)stream;
+    write_to_device(write, dst_base);
+}
+
 void MmapByteSource::write_to_device(
-    const ByteRangeWrite& write,
+    const ExtentWrite& write,
     void* dst_base)
 {
     if (dst_base == nullptr) {
@@ -91,6 +100,24 @@ void MmapByteSource::write_to_device(
         write.slices,
         dst,
         write.dst_shape);
+}
+
+void MmapByteSource::write_to_device_async(
+    const ExtentWrite& write,
+    void* dst_base,
+    void* stream)
+{
+    if (dst_base == nullptr) {
+        throw std::runtime_error(
+            "byte source: null destination for '" + write.output_name + "'");
+    }
+    auto* dst = static_cast<std::uint8_t*>(dst_base) + write.dst_offset_bytes;
+    loader_.copy_strided_to_device_async(
+        write.raw_name,
+        write.slices,
+        dst,
+        write.dst_shape,
+        stream);
 }
 
 #if PIE_CUDA_BYTE_SOURCE_HAS_CUFILE_HEADER
@@ -341,7 +368,7 @@ public:
 #endif
 
 GdsByteSource::GdsByteSource(
-    SafetensorsLoader& loader,
+    SafetensorsCheckpointSource& loader,
     bool required,
     bool verbose)
     : loader_(loader),
@@ -354,14 +381,14 @@ GdsByteSource::GdsByteSource(
     if (verbose_ && direct_enabled_) {
         std::cerr << "[pie-driver-cuda] checkpoint_io="
                   << (required_ ? "gds" : "auto")
-                  << ": using GPUDirect Storage for contiguous byte writes\n";
+                  << ": using GPUDirect Storage for contiguous extent writes\n";
     }
 }
 
 GdsByteSource::~GdsByteSource() = default;
 
 void GdsByteSource::write_to_device(
-    const ByteRangeWrite& write,
+    const ExtentWrite& write,
     void* dst_base)
 {
     if (dst_base == nullptr) {
@@ -390,9 +417,26 @@ void GdsByteSource::write_to_device(
     fallback_.write_to_device(write, dst_base);
 }
 
+bool GdsByteSource::supports_async_writes() const noexcept
+{
+    return !direct_enabled_ && fallback_.supports_async_writes();
+}
+
+void GdsByteSource::write_to_device_async(
+    const ExtentWrite& write,
+    void* dst_base,
+    void* stream)
+{
+    if (!direct_enabled_) {
+        fallback_.write_to_device_async(write, dst_base, stream);
+        return;
+    }
+    write_to_device(write, dst_base);
+}
+
 std::unique_ptr<CheckpointByteSource> make_checkpoint_byte_source(
     CheckpointIoPolicy policy,
-    SafetensorsLoader& loader,
+    SafetensorsCheckpointSource& loader,
     bool verbose)
 {
     switch (policy) {

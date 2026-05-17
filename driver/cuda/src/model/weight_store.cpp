@@ -18,11 +18,11 @@ const TensorRecord& WeightStore::record(const std::string& name) const {
     return it->second;
 }
 
-TensorSpec WeightStore::default_spec_for(
+TensorDecl WeightStore::default_spec_for(
     const std::string& name,
     const DeviceTensor& tensor)
 {
-    TensorSpec spec;
+    TensorDecl spec;
     spec.name = name;
     spec.dtype = tensor.dtype();
     spec.shape = tensor.shape();
@@ -65,18 +65,18 @@ void WeightStore::insert(std::string name, DeviceTensor tensor) {
     }
 }
 
-void WeightStore::insert(std::string name, DeviceTensor tensor, TensorSpec spec) {
+void WeightStore::insert(std::string name, DeviceTensor tensor, TensorDecl spec) {
     ensure_mutable();
     if (name.empty()) {
         throw std::runtime_error("weight store: empty tensor name");
     }
     if (spec.name != name) {
         throw std::runtime_error(
-            "weight store: TensorSpec name mismatch for '" + name + "'");
+            "weight store: TensorDecl name mismatch for '" + name + "'");
     }
     if (tensor.dtype() != spec.dtype || tensor.shape() != spec.shape) {
         throw std::runtime_error(
-            "weight store: tensor does not match TensorSpec for '" + name + "'");
+            "weight store: tensor does not match TensorDecl for '" + name + "'");
     }
     TensorRecord rec;
     rec.spec = std::move(spec);
@@ -103,18 +103,18 @@ void WeightStore::replace(std::string name, DeviceTensor tensor) {
     tensors_.insert_or_assign(std::move(name), std::move(rec));
 }
 
-void WeightStore::replace(std::string name, DeviceTensor tensor, TensorSpec spec) {
+void WeightStore::replace(std::string name, DeviceTensor tensor, TensorDecl spec) {
     ensure_mutable();
     if (name.empty()) {
         throw std::runtime_error("weight store: empty tensor name");
     }
     if (spec.name != name) {
         throw std::runtime_error(
-            "weight store: TensorSpec name mismatch for '" + name + "'");
+            "weight store: TensorDecl name mismatch for '" + name + "'");
     }
     if (tensor.dtype() != spec.dtype || tensor.shape() != spec.shape) {
         throw std::runtime_error(
-            "weight store: tensor does not match TensorSpec for '" + name + "'");
+            "weight store: tensor does not match TensorDecl for '" + name + "'");
     }
     validate_erase_allowed(name);
     quant_meta_.erase(name);
@@ -233,7 +233,7 @@ void WeightStore::validate_tensor_records() const {
     for (const auto& [name, record] : tensors_) {
         if (!record.has_spec) {
             throw std::runtime_error(
-                "weight store: tensor '" + name + "' has no TensorSpec");
+                "weight store: tensor '" + name + "' has no TensorDecl");
         }
         if (record.spec.name != name) {
             throw std::runtime_error(
@@ -243,7 +243,7 @@ void WeightStore::validate_tensor_records() const {
             record.spec.shape != record.tensor.shape()) {
             throw std::runtime_error(
                 "weight store: tensor '" + name +
-                "' no longer matches its TensorSpec");
+                "' no longer matches its TensorDecl");
         }
         if (record.spec.ownership == TensorOwnershipKind::Temporary) {
             throw std::runtime_error(

@@ -1,4 +1,4 @@
-#include "loader/materializer.hpp"
+#include "loader/load_executor.hpp"
 
 #include <cuda_runtime.h>
 #include <nccl.h>
@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <stdexcept>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -19,7 +20,8 @@
 #include "kernels/dtype_cast.hpp"
 #include "kernels/quant_bf16_to_fp8.hpp"
 #include "loader/byte_source.hpp"
-#include "loader/physical_load_plan.hpp"
+#include "loader/storage_executor.hpp"
+#include "loader/storage_program.hpp"
 #include "loader/safetensors.hpp"
 #include "model/weight_store.hpp"
 #include "tensor.hpp"
@@ -32,8 +34,8 @@ namespace pie_cuda_driver {
 
 namespace {
 
-const TensorSpec& tensor_spec_for(
-    const LoadPlan& plan,
+const TensorDecl& tensor_spec_for(
+    const LayoutPlan& plan,
     const std::string& name);
 
 std::uint64_t shape_nbytes(
@@ -99,77 +101,90 @@ public:
         const ScopedDeviceTensorMemoryCallback&) = delete;
 };
 
-std::uint64_t materialize_byte_writes_for_op(
-    const LoadOp& op,
-    std::size_t op_index,
-    const LoadPlan& plan,
-    const TensorMetadataSource& metadata,
-    CheckpointByteSource& byte_source,
-    WeightStoreBuilder& weights,
-    int tp_rank,
-    int tp_size)
+std::vector<ExtentWrite> extent_writes_for_instruction(
+    const StorageProgram& storage_program,
+    const StorageInstr& instr)
 {
-    auto writes = lower_byte_writes_for_op(
-        op, op_index, plan, metadata, tp_rank, tp_size);
-    if (writes.empty()) {
-        throw std::runtime_error(
-            "physical load plan: no byte writes for " +
-            std::string(load_op_kind_name(op.kind)) + " op '" +
-            load_op_output(op) + "'");
-    }
-
-    std::unordered_map<std::string, DeviceTensor> outputs;
-    outputs.reserve(writes.size());
-    std::uint64_t allocated_bytes = 0;
-    for (const auto& write : writes) {
-        if (outputs.contains(write.output_name)) continue;
-        const TensorSpec& spec = tensor_spec_for(plan, write.output_name);
-        DeviceTensor out = DeviceTensor::allocate(spec.dtype, spec.shape);
-        allocated_bytes += out.nbytes();
-        outputs.emplace(write.output_name, std::move(out));
-    }
-
-    for (const auto& write : writes) {
-        auto it = outputs.find(write.output_name);
-        if (it == outputs.end()) {
+    std::vector<ExtentWrite> writes;
+    writes.reserve(instr.extent_write_indices.size());
+    for (const auto write_index : instr.extent_write_indices) {
+        if (write_index >= storage_program.extent_writes.size()) {
             throw std::runtime_error(
-                "physical load plan: missing destination allocation for '" +
+                "storage program: instruction extent-write index out of range");
+        }
+        writes.push_back(storage_program.extent_writes[write_index]);
+    }
+    return writes;
+}
+
+std::uint64_t materialize_extent_write_instruction_run(
+    const LayoutPlan& plan,
+    const StorageProgram& storage_program,
+    std::size_t first_step,
+    std::size_t last_step_exclusive,
+    StorageWriteExecutor& executor,
+    WeightStoreBuilder& weights)
+{
+    std::vector<std::size_t> write_indices;
+    for (std::size_t i = first_step; i < last_step_exclusive; ++i) {
+        const auto& instr = storage_program.schedule[i];
+        if (instr.kind != StorageInstrKind::ExtentWrite) {
+            throw std::runtime_error(
+                "storage program: extent-write run contains non-write instruction");
+        }
+        write_indices.insert(
+            write_indices.end(),
+            instr.extent_write_indices.begin(),
+            instr.extent_write_indices.end());
+    }
+    if (write_indices.empty()) {
+        throw std::runtime_error("storage program: empty extent-write run");
+    }
+
+    std::unordered_set<std::size_t> run_write_indices(
+        write_indices.begin(), write_indices.end());
+    std::unordered_map<std::string, DeviceTensor> outputs;
+    std::uint64_t allocated_bytes = 0;
+    for (const auto write_index : write_indices) {
+        if (write_index >= storage_program.extent_writes.size()) {
+            throw std::runtime_error(
+                "storage program: extent-write run index out of range");
+        }
+        const auto& write = storage_program.extent_writes[write_index];
+        if (!outputs.contains(write.output_name)) {
+            const TensorDecl& spec = tensor_spec_for(plan, write.output_name);
+            DeviceTensor out = DeviceTensor::allocate(spec.dtype, spec.shape);
+            allocated_bytes += out.nbytes();
+            outputs.emplace(write.output_name, std::move(out));
+        }
+    }
+
+    std::vector<StorageWriteDestination> destinations;
+    destinations.reserve(write_indices.size());
+    for (const auto write_index : storage_program.scheduled_extent_writes) {
+        if (!run_write_indices.contains(write_index)) continue;
+        const auto& write = storage_program.extent_writes[write_index];
+        auto out = outputs.find(write.output_name);
+        if (out == outputs.end()) {
+            throw std::runtime_error(
+                "storage program: missing destination allocation for '" +
                 write.output_name + "'");
         }
-        byte_source.write_to_device(write, it->second.data());
+        destinations.push_back(StorageWriteDestination{
+            .write = &write,
+            .dst_base = out->second.data(),
+        });
     }
+    if (destinations.size() != write_indices.size()) {
+        throw std::runtime_error(
+            "storage program: extent-write run schedule coverage mismatch");
+    }
+    executor.execute(destinations);
 
     for (auto& [name, tensor] : outputs) {
         weights.insert(name, std::move(tensor), tensor_spec_for(plan, name));
     }
     return allocated_bytes;
-}
-
-bool is_raw_copy_cast_drop_sequence(
-    const LoadPlan& plan,
-    std::size_t op_index)
-{
-    if (op_index + 2 >= plan.ops.size()) return false;
-    const LoadOp& producer = plan.ops[op_index];
-    const LoadOp& cast = plan.ops[op_index + 1];
-    const LoadOp& drop = plan.ops[op_index + 2];
-    const bool raw_producer =
-        producer.kind == LoadOpKind::Read ||
-        producer.kind == LoadOpKind::Copy ||
-        producer.kind == LoadOpKind::Shard ||
-        producer.kind == LoadOpKind::RowRangeShard;
-    if (!raw_producer || cast.kind != LoadOpKind::Cast ||
-        drop.kind != LoadOpKind::Drop) {
-        return false;
-    }
-    if (load_op_inputs(cast).size() != 1 ||
-        load_op_inputs(cast)[0] != load_op_output(producer)) {
-        return false;
-    }
-    return std::find(
-        load_op_inputs(drop).begin(),
-        load_op_inputs(drop).end(),
-        load_op_output(producer)) != load_op_inputs(drop).end();
 }
 
 void cast_tile_to_output(
@@ -192,14 +207,14 @@ void cast_tile_to_output(
             scratch.data(), out_ptr, scratch.numel(), /*stream=*/0);
     } else {
         throw std::runtime_error(
-            "physical load plan: unsupported tiled Cast " +
+            "storage program: unsupported TileMap Cast " +
             std::string(dtype_name(scratch.dtype())) + " -> " +
             std::string(dtype_name(out_dtype)));
     }
 }
 
 std::vector<TensorSlice> tile_slices_for_leading_axis(
-    const ByteRangeWrite& base_write,
+    const ExtentWrite& base_write,
     std::int64_t tile_start,
     std::int64_t tile_rows)
 {
@@ -215,36 +230,35 @@ std::vector<TensorSlice> tile_slices_for_leading_axis(
     return slices;
 }
 
-std::uint64_t materialize_tiled_raw_cast(
-    const LoadOp& producer,
-    std::size_t producer_index,
-    const LoadOp& cast,
-    const LoadPlan& plan,
-    const TensorMetadataSource& metadata,
+std::uint64_t materialize_tile_raw_cast(
+    const TileMap& tile,
+    const std::vector<ExtentWrite>& writes,
+    const LayoutPlan& plan,
     CheckpointByteSource& byte_source,
     WeightStoreBuilder& weights,
-    int tp_rank,
-    int tp_size,
     std::uint64_t tile_bytes)
 {
-    const TensorSpec& out_spec = tensor_spec_for(plan, load_op_output(cast));
-    const TensorSpec& src_spec = tensor_spec_for(plan, load_op_output(producer));
+    if (tile.kind != TileMapKind::Cast || tile.inputs.size() != 1) {
+        throw std::runtime_error(
+            "storage program: raw TileMap requires one Cast input for '" +
+            tile.output_name + "'");
+    }
+    const TensorDecl& out_spec = tensor_spec_for(plan, tile.output_name);
+    const TensorDecl& src_spec = tensor_spec_for(plan, tile.inputs.front());
     if (src_spec.shape != out_spec.shape) {
         throw std::runtime_error(
-            "physical load plan: tiled Cast source/output shape mismatch for '" +
+            "storage program: TileMap Cast source/output shape mismatch for '" +
             out_spec.name + "'");
     }
-    auto writes = lower_byte_writes_for_op(
-        producer, producer_index, plan, metadata, tp_rank, tp_size);
     if (writes.size() != 1 || writes[0].dst_offset_bytes != 0 ||
         writes[0].dst_shape != src_spec.shape) {
         throw std::runtime_error(
-            "physical load plan: tiled Cast expects one compact raw write for '" +
+            "storage program: TileMap Cast expects one compact raw write for '" +
             out_spec.name + "'");
     }
 
     DeviceTensor out = DeviceTensor::allocate(out_spec.dtype, out_spec.shape);
-    const ByteRangeWrite& base_write = writes[0];
+    const ExtentWrite& base_write = writes[0];
     if (src_spec.shape.empty()) {
         DeviceTensor scratch = DeviceTensor::allocate(src_spec.dtype, {});
         byte_source.write_to_device(base_write, scratch.data());
@@ -264,7 +278,7 @@ std::uint64_t materialize_tiled_raw_cast(
             const std::int64_t tile_rows = std::min(rows_per_tile, rows - row);
             auto tile_shape = src_spec.shape;
             tile_shape[0] = tile_rows;
-            ByteRangeWrite tile_write = base_write;
+            ExtentWrite tile_write = base_write;
             tile_write.slices = tile_slices_for_leading_axis(
                 base_write, row, tile_rows);
             tile_write.dst_shape = tile_shape;
@@ -285,30 +299,83 @@ std::uint64_t materialize_tiled_raw_cast(
     return bytes;
 }
 
-const TensorSpec& tensor_spec_for(
-    const LoadPlan& plan,
+const TensorDecl& tensor_spec_for(
+    const LayoutPlan& plan,
     const std::string& name)
 {
     auto it = plan.tensors.find(name);
     if (it == plan.tensors.end()) {
         throw std::runtime_error(
-            "load plan: no TensorSpec for materialized tensor '" + name + "'");
+            "layout plan: no TensorDecl for materialized tensor '" + name + "'");
     }
     return it->second;
 }
 
-const std::string& first_input(const LoadOp& op) {
-    if (load_op_inputs(op).empty()) {
+struct ExecOp {
+    std::string output_name;
+    std::string secondary_output_name;
+    std::vector<std::string> inputs;
+    int shard_axis = -1;
+    int slice_axis = -1;
+    std::int64_t row_offset = 0;
+    std::int64_t rows = 0;
+    std::int64_t slice_start = 0;
+    std::int64_t slice_length = 0;
+    std::vector<TensorSourceRef> sources;
+};
+
+const std::string& exec_op_output(const ExecOp& op) {
+    return op.output_name;
+}
+
+const std::string& exec_op_secondary_output(const ExecOp& op) {
+    return op.secondary_output_name;
+}
+
+const std::vector<std::string>& exec_op_inputs(const ExecOp& op) {
+    return op.inputs;
+}
+
+int exec_op_shard_axis(const ExecOp& op) {
+    return op.shard_axis;
+}
+
+int exec_op_slice_axis(const ExecOp& op) {
+    return op.slice_axis;
+}
+
+std::int64_t exec_op_row_offset(const ExecOp& op) {
+    return op.row_offset;
+}
+
+std::int64_t exec_op_rows(const ExecOp& op) {
+    return op.rows;
+}
+
+std::int64_t exec_op_slice_start(const ExecOp& op) {
+    return op.slice_start;
+}
+
+std::int64_t exec_op_slice_length(const ExecOp& op) {
+    return op.slice_length;
+}
+
+const std::vector<TensorSourceRef>& exec_op_sources(const ExecOp& op) {
+    return op.sources;
+}
+
+const std::string& first_input(const ExecOp& op) {
+    if (exec_op_inputs(op).empty()) {
         throw std::runtime_error(
-            "load plan: op for '" + load_op_output(op) +
+            "layout plan: op for '" + exec_op_output(op) +
             "' requires at least one input");
     }
-    return load_op_inputs(op).front();
+    return exec_op_inputs(op).front();
 }
 
 void insert_row_view(
     WeightStoreBuilder& weights,
-    const TensorSpec& view_spec,
+    const TensorDecl& view_spec,
     const std::string& backing_name,
     const std::string& view_name,
     std::int64_t row_offset,
@@ -328,11 +395,11 @@ void insert_row_view(
 std::uint64_t copy_tensor_to_output(
     const DeviceTensor& src,
     WeightStoreBuilder& weights,
-    const TensorSpec& out_spec)
+    const TensorDecl& out_spec)
 {
     if (src.dtype() != out_spec.dtype || src.shape() != out_spec.shape) {
         throw std::runtime_error(
-            "load plan: Materialize source does not match TensorSpec for '" +
+            "layout plan: Materialize source does not match TensorDecl for '" +
             out_spec.name + "'");
     }
     DeviceTensor out = DeviceTensor::allocate(out_spec.dtype, out_spec.shape);
@@ -347,11 +414,11 @@ std::uint64_t copy_tensor_to_output(
 void cast_tensor_to_output(
     const DeviceTensor& src,
     WeightStoreBuilder& weights,
-    const TensorSpec& out_spec)
+    const TensorDecl& out_spec)
 {
     if (src.shape() != out_spec.shape) {
         throw std::runtime_error(
-            "load plan: Cast source shape does not match TensorSpec for '" +
+            "layout plan: Cast source shape does not match TensorDecl for '" +
             out_spec.name + "'");
     }
     DeviceTensor out = DeviceTensor::allocate(out_spec.dtype, out_spec.shape);
@@ -370,7 +437,7 @@ void cast_tensor_to_output(
             src.data(), out.data(), src.numel(), /*stream=*/0);
     } else {
         throw std::runtime_error(
-            "load plan: unsupported Cast " +
+            "layout plan: unsupported Cast " +
             std::string(dtype_name(src.dtype())) + " -> " +
             std::string(dtype_name(out_spec.dtype)) + " for '" +
             out_spec.name + "'");
@@ -379,42 +446,42 @@ void cast_tensor_to_output(
 }
 
 std::uint64_t concat_rows_to_output(
-    const LoadOp& op,
-    const LoadPlan& plan,
+    const ExecOp& op,
+    const LayoutPlan& plan,
     WeightStoreBuilder& weights)
 {
-    const TensorSpec& out_spec = tensor_spec_for(plan, load_op_output(op));
+    const TensorDecl& out_spec = tensor_spec_for(plan, exec_op_output(op));
     if (out_spec.shape.size() != 2) {
         throw std::runtime_error(
-            "load plan: Concat output must be 2-D: " + load_op_output(op));
+            "layout plan: Concat output must be 2-D: " + exec_op_output(op));
     }
-    if (load_op_inputs(op).empty()) {
+    if (exec_op_inputs(op).empty()) {
         throw std::runtime_error(
-            "load plan: Concat op has no inputs for " + load_op_output(op));
+            "layout plan: Concat op has no inputs for " + exec_op_output(op));
     }
 
     const std::int64_t out_cols = out_spec.shape[1];
     std::int64_t total_rows = 0;
-    for (const auto& name : load_op_inputs(op)) {
+    for (const auto& name : exec_op_inputs(op)) {
         const DeviceTensor& t = weights.get(name);
         if (t.dtype() != out_spec.dtype || t.shape().size() != 2 ||
             t.shape()[1] != out_cols) {
             throw std::runtime_error(
-                "load plan: Concat input mismatch for '" + load_op_output(op) +
+                "layout plan: Concat input mismatch for '" + exec_op_output(op) +
                 "': " + name);
         }
         total_rows += t.shape()[0];
     }
     if (total_rows != out_spec.shape[0]) {
         throw std::runtime_error(
-            "load plan: Concat row count does not match TensorSpec for '" +
-            load_op_output(op) + "'");
+            "layout plan: Concat row count does not match TensorDecl for '" +
+            exec_op_output(op) + "'");
     }
 
     DeviceTensor out = DeviceTensor::allocate(out_spec.dtype, out_spec.shape);
     auto* dst = static_cast<std::uint8_t*>(out.data());
     std::size_t byte_offset = 0;
-    for (const auto& name : load_op_inputs(op)) {
+    for (const auto& name : exec_op_inputs(op)) {
         const DeviceTensor& t = weights.get(name);
         CUDA_CHECK(cudaMemcpyAsync(
             dst + byte_offset,
@@ -425,32 +492,32 @@ std::uint64_t concat_rows_to_output(
         byte_offset += t.nbytes();
     }
     const std::uint64_t bytes = out.nbytes();
-    weights.insert(load_op_output(op), std::move(out), out_spec);
+    weights.insert(exec_op_output(op), std::move(out), out_spec);
     return bytes;
 }
 
 std::uint64_t slice_rows_to_output(
-    const LoadOp& op,
-    const LoadPlan& plan,
+    const ExecOp& op,
+    const LayoutPlan& plan,
     WeightStoreBuilder& weights)
 {
-    const TensorSpec& out_spec = tensor_spec_for(plan, load_op_output(op));
+    const TensorDecl& out_spec = tensor_spec_for(plan, exec_op_output(op));
     if (out_spec.shape.size() != 2) {
         throw std::runtime_error(
-            "load plan: Slice output must be 2-D: " + load_op_output(op));
+            "layout plan: Slice output must be 2-D: " + exec_op_output(op));
     }
     const DeviceTensor& src = weights.get(first_input(op));
     if (src.dtype() != out_spec.dtype || src.shape().size() != 2 ||
         src.shape()[1] != out_spec.shape[1]) {
         throw std::runtime_error(
-            "load plan: Slice source mismatch for '" + load_op_output(op) + "'");
+            "layout plan: Slice source mismatch for '" + exec_op_output(op) + "'");
     }
     const std::int64_t rows =
-        load_op_rows(op) > 0 ? load_op_rows(op) : out_spec.shape[0];
-    if (rows != out_spec.shape[0] || load_op_row_offset(op) < 0 ||
-        load_op_row_offset(op) + rows > src.shape()[0]) {
+        exec_op_rows(op) > 0 ? exec_op_rows(op) : out_spec.shape[0];
+    if (rows != out_spec.shape[0] || exec_op_row_offset(op) < 0 ||
+        exec_op_row_offset(op) + rows > src.shape()[0]) {
         throw std::runtime_error(
-            "load plan: Slice range out of bounds for '" + load_op_output(op) + "'");
+            "layout plan: Slice range out of bounds for '" + exec_op_output(op) + "'");
     }
 
     DeviceTensor out = DeviceTensor::allocate(out_spec.dtype, out_spec.shape);
@@ -458,65 +525,65 @@ std::uint64_t slice_rows_to_output(
         static_cast<std::size_t>(out_spec.shape[1]) *
         dtype_bytes(out_spec.dtype);
     const auto* src8 = static_cast<const std::uint8_t*>(src.data()) +
-        static_cast<std::size_t>(load_op_row_offset(op)) * row_bytes;
+        static_cast<std::size_t>(exec_op_row_offset(op)) * row_bytes;
     CUDA_CHECK(cudaMemcpyAsync(
         out.data(), src8, static_cast<std::size_t>(rows) * row_bytes,
         cudaMemcpyDeviceToDevice, /*stream=*/0));
     const std::uint64_t bytes = out.nbytes();
-    weights.insert(load_op_output(op), std::move(out), out_spec);
+    weights.insert(exec_op_output(op), std::move(out), out_spec);
     return bytes;
 }
 
 std::uint64_t slice_axis_to_output(
-    const LoadOp& op,
-    const LoadPlan& plan,
+    const ExecOp& op,
+    const LayoutPlan& plan,
     WeightStoreBuilder& weights,
     int tp_rank,
     int tp_size)
 {
-    const TensorSpec& out_spec = tensor_spec_for(plan, load_op_output(op));
+    const TensorDecl& out_spec = tensor_spec_for(plan, exec_op_output(op));
     const DeviceTensor& src = weights.get(first_input(op));
     if (src.dtype() != out_spec.dtype) {
         throw std::runtime_error(
-            "load plan: Slice dtype mismatch for '" + load_op_output(op) + "'");
+            "layout plan: Slice dtype mismatch for '" + exec_op_output(op) + "'");
     }
-    if (load_op_slice_axis(op) < 0 ||
-        load_op_slice_axis(op) >= static_cast<int>(src.shape().size())) {
+    if (exec_op_slice_axis(op) < 0 ||
+        exec_op_slice_axis(op) >= static_cast<int>(src.shape().size())) {
         throw std::runtime_error(
-            "load plan: Slice axis out of range for '" + load_op_output(op) + "'");
+            "layout plan: Slice axis out of range for '" + exec_op_output(op) + "'");
     }
 
     auto expected = src.shape();
-    std::int64_t length = load_op_slice_length(op) > 0
-        ? load_op_slice_length(op)
-        : out_spec.shape.at(static_cast<std::size_t>(load_op_slice_axis(op)));
-    std::int64_t start = load_op_slice_start(op);
-    if (tp_size > 1 && load_op_shard_axis(op) == load_op_slice_axis(op)) {
+    std::int64_t length = exec_op_slice_length(op) > 0
+        ? exec_op_slice_length(op)
+        : out_spec.shape.at(static_cast<std::size_t>(exec_op_slice_axis(op)));
+    std::int64_t start = exec_op_slice_start(op);
+    if (tp_size > 1 && exec_op_shard_axis(op) == exec_op_slice_axis(op)) {
         start += static_cast<std::int64_t>(tp_rank) * length;
     }
     if (length <= 0 || start < 0 ||
-        start + length > src.shape()[static_cast<std::size_t>(load_op_slice_axis(op))]) {
+        start + length > src.shape()[static_cast<std::size_t>(exec_op_slice_axis(op))]) {
         throw std::runtime_error(
-            "load plan: Slice range out of bounds for '" + load_op_output(op) + "'");
+            "layout plan: Slice range out of bounds for '" + exec_op_output(op) + "'");
     }
-    expected[static_cast<std::size_t>(load_op_slice_axis(op))] = length;
+    expected[static_cast<std::size_t>(exec_op_slice_axis(op))] = length;
     if (expected != out_spec.shape) {
         throw std::runtime_error(
-            "load plan: Slice output shape does not match TensorSpec for '" +
-            load_op_output(op) + "'");
+            "layout plan: Slice output shape does not match TensorDecl for '" +
+            exec_op_output(op) + "'");
     }
 
     std::int64_t outer = 1;
-    for (int i = 0; i < load_op_slice_axis(op); ++i) {
+    for (int i = 0; i < exec_op_slice_axis(op); ++i) {
         outer *= src.shape()[static_cast<std::size_t>(i)];
     }
     std::int64_t inner = 1;
-    for (std::size_t i = static_cast<std::size_t>(load_op_slice_axis(op)) + 1;
+    for (std::size_t i = static_cast<std::size_t>(exec_op_slice_axis(op)) + 1;
          i < src.shape().size(); ++i) {
         inner *= src.shape()[i];
     }
     const std::int64_t axis_dim =
-        src.shape()[static_cast<std::size_t>(load_op_slice_axis(op))];
+        src.shape()[static_cast<std::size_t>(exec_op_slice_axis(op))];
     const std::size_t elem = dtype_bytes(src.dtype());
     const std::size_t width =
         static_cast<std::size_t>(length) *
@@ -536,61 +603,61 @@ std::uint64_t slice_axis_to_output(
         width, static_cast<std::size_t>(outer),
         cudaMemcpyDeviceToDevice, /*stream=*/0));
     const std::uint64_t bytes = out.nbytes();
-    weights.insert(load_op_output(op), std::move(out), out_spec);
+    weights.insert(exec_op_output(op), std::move(out), out_spec);
     return bytes;
 }
 
 void view_or_alias_to_output(
-    const LoadOp& op,
-    const LoadPlan& plan,
+    const ExecOp& op,
+    const LayoutPlan& plan,
     WeightStoreBuilder& weights)
 {
-    const TensorSpec& out_spec = tensor_spec_for(plan, load_op_output(op));
+    const TensorDecl& out_spec = tensor_spec_for(plan, exec_op_output(op));
     const DeviceTensor& src = weights.get(first_input(op));
     if (src.dtype() != out_spec.dtype) {
         throw std::runtime_error(
-            "load plan: View/Alias dtype mismatch for '" + load_op_output(op) + "'");
+            "layout plan: View/Alias dtype mismatch for '" + exec_op_output(op) + "'");
     }
 
     void* ptr = const_cast<void*>(src.data());
-    if (load_op_rows(op) > 0 || load_op_row_offset(op) > 0) {
+    if (exec_op_rows(op) > 0 || exec_op_row_offset(op) > 0) {
         if (src.shape().size() != 2 || out_spec.shape.size() != 2 ||
             src.shape()[1] != out_spec.shape[1]) {
             throw std::runtime_error(
-                "load plan: row view requires matching 2-D tensors for '" +
-                load_op_output(op) + "'");
+                "layout plan: row view requires matching 2-D tensors for '" +
+                exec_op_output(op) + "'");
         }
-        const std::int64_t rows = load_op_rows(op) > 0 ? load_op_rows(op) : out_spec.shape[0];
-        if (rows != out_spec.shape[0] || load_op_row_offset(op) < 0 ||
-            load_op_row_offset(op) + rows > src.shape()[0]) {
+        const std::int64_t rows = exec_op_rows(op) > 0 ? exec_op_rows(op) : out_spec.shape[0];
+        if (rows != out_spec.shape[0] || exec_op_row_offset(op) < 0 ||
+            exec_op_row_offset(op) + rows > src.shape()[0]) {
             throw std::runtime_error(
-                "load plan: row view range out of bounds for '" +
-                load_op_output(op) + "'");
+                "layout plan: row view range out of bounds for '" +
+                exec_op_output(op) + "'");
         }
         const std::size_t row_bytes =
             static_cast<std::size_t>(src.shape()[1]) * dtype_bytes(src.dtype());
         ptr = static_cast<std::uint8_t*>(ptr) +
-            static_cast<std::size_t>(load_op_row_offset(op)) * row_bytes;
+            static_cast<std::size_t>(exec_op_row_offset(op)) * row_bytes;
     } else if (src.shape() != out_spec.shape) {
         throw std::runtime_error(
-            "load plan: Alias shape mismatch for '" + load_op_output(op) + "'");
+            "layout plan: Alias shape mismatch for '" + exec_op_output(op) + "'");
     }
 
-    weights.insert(load_op_output(op), DeviceTensor::view(
+    weights.insert(exec_op_output(op), DeviceTensor::view(
         ptr, out_spec.dtype, out_spec.shape), out_spec);
 }
 
 void bind_metadata_for_output(
-    const LoadOp& op,
-    const LoadPlan& plan,
+    const ExecOp& op,
+    const LayoutPlan& plan,
     WeightStoreBuilder& weights)
 {
-    const TensorSpec& spec = tensor_spec_for(plan, load_op_output(op));
+    const TensorDecl& spec = tensor_spec_for(plan, exec_op_output(op));
     if (spec.quant.format == QuantFormat::None ||
         spec.quant.scale_tensor.empty()) {
         throw std::runtime_error(
-            "load plan: BindMetadata needs quant TensorSpec for '" +
-            load_op_output(op) + "'");
+            "layout plan: AttachMetadata needs quant TensorDecl for '" +
+            exec_op_output(op) + "'");
     }
 
     QuantMeta meta;
@@ -606,8 +673,8 @@ void bind_metadata_for_output(
         break;
     case QuantGranularity::None:
         throw std::runtime_error(
-            "load plan: BindMetadata missing granularity for '" +
-            load_op_output(op) + "'");
+            "layout plan: AttachMetadata missing granularity for '" +
+            exec_op_output(op) + "'");
     }
     meta.scale = &weights.get(spec.quant.scale_tensor);
     meta.zero_point = spec.quant.zero_point_tensor.empty()
@@ -615,7 +682,7 @@ void bind_metadata_for_output(
         : &weights.get(spec.quant.zero_point_tensor);
     meta.group_size = spec.quant.group_size;
     meta.channel_axis = spec.quant.channel_axis;
-    weights.set_quant_meta(load_op_output(op), std::move(meta));
+    weights.set_quant_meta(exec_op_output(op), std::move(meta));
 }
 
 struct RuntimeQuantResult {
@@ -626,24 +693,24 @@ struct RuntimeQuantResult {
 int checked_int_dim(std::int64_t value, const std::string& name);
 
 RuntimeQuantResult quantize_runtime_to_output(
-    const LoadOp& op,
-    const LoadPlan& plan,
+    const ExecOp& op,
+    const LayoutPlan& plan,
     WeightStoreBuilder& weights,
     NcclComm* tp_comm,
     int tp_size)
 {
-    const TensorSpec& out_spec = tensor_spec_for(plan, load_op_output(op));
+    const TensorDecl& out_spec = tensor_spec_for(plan, exec_op_output(op));
     const DeviceTensor& src = weights.get(first_input(op));
     if (src.shape().size() != 2 || out_spec.shape.size() != 2 ||
         src.shape() != out_spec.shape) {
         throw std::runtime_error(
-            "load plan: QuantizeRuntime requires matching 2-D source and "
-            "output shapes for '" + load_op_output(op) + "'");
+            "layout plan: QuantizeRuntime requires matching 2-D source and "
+            "output shapes for '" + exec_op_output(op) + "'");
     }
     if (out_spec.quant.scale_tensor.empty()) {
         throw std::runtime_error(
-            "load plan: QuantizeRuntime missing scale tensor for '" +
-            load_op_output(op) + "'");
+            "layout plan: QuantizeRuntime missing scale tensor for '" +
+            exec_op_output(op) + "'");
     }
 
     const bool is_int8 =
@@ -654,13 +721,13 @@ RuntimeQuantResult quantize_runtime_to_output(
         out_spec.dtype == DType::FP8_E4M3;
     if (!is_int8 && !is_fp8) {
         throw std::runtime_error(
-            "load plan: QuantizeRuntime has unsupported quant spec for '" +
-            load_op_output(op) + "'");
+            "layout plan: QuantizeRuntime has unsupported quant spec for '" +
+            exec_op_output(op) + "'");
     }
     if (out_spec.quant.granularity != QuantGranularity::PerChannel) {
         throw std::runtime_error(
-            "load plan: QuantizeRuntime currently expects per-channel "
-            "quantization for '" + load_op_output(op) + "'");
+            "layout plan: QuantizeRuntime currently expects per-channel "
+            "quantization for '" + exec_op_output(op) + "'");
     }
 
     DeviceTensor bf16_scratch;
@@ -677,7 +744,7 @@ RuntimeQuantResult quantize_runtime_to_output(
         bf16_src = &bf16_scratch;
     } else if (src.dtype() != DType::BF16) {
         throw std::runtime_error(
-            "load plan: QuantizeRuntime source '" + first_input(op) +
+            "layout plan: QuantizeRuntime source '" + first_input(op) +
             "' has unsupported dtype " + dtype_name(src.dtype()));
     }
 
@@ -692,8 +759,8 @@ RuntimeQuantResult quantize_runtime_to_output(
     if (tp_size > 1 && out_spec.parallel == TensorParallelKind::Row) {
         if (!tp_comm) {
             throw std::runtime_error(
-                "load plan: QuantizeRuntime row-parallel tensor '" +
-                load_op_output(op) + "' requires a tensor-parallel communicator");
+                "layout plan: QuantizeRuntime row-parallel tensor '" +
+                exec_op_output(op) + "' requires a tensor-parallel communicator");
         }
         tp_comm->all_reduce_fp32(
             scale_ptr, static_cast<std::size_t>(rows),
@@ -716,7 +783,7 @@ RuntimeQuantResult quantize_runtime_to_output(
     RuntimeQuantResult result;
     result.bytes_before = src.nbytes();
     result.bytes_after = q.nbytes() + scale.nbytes();
-    weights.insert(load_op_output(op), std::move(q), out_spec);
+    weights.insert(exec_op_output(op), std::move(q), out_spec);
     weights.insert(
         out_spec.quant.scale_tensor,
         std::move(scale),
@@ -724,8 +791,8 @@ RuntimeQuantResult quantize_runtime_to_output(
     return result;
 }
 
-const TensorSpec* find_tensor_spec(
-    const LoadPlan& plan,
+const TensorDecl* find_tensor_spec(
+    const LayoutPlan& plan,
     const std::string& name) noexcept
 {
     const auto it = plan.tensors.find(name);
@@ -749,7 +816,7 @@ const void* bf16_scale_ptr_for_int4_dequant(
             scale.data(), bf16_scratch.data(), scale.numel(), /*stream=*/0);
     } else {
         throw std::runtime_error(
-            "load plan: INT4 Dequantize scale for '" + output_name +
+            "layout plan: INT4 Dequantize scale for '" + output_name +
             "' must be bf16/fp16/fp32, got " +
             std::string(dtype_name(scale.dtype())));
     }
@@ -757,28 +824,28 @@ const void* bf16_scale_ptr_for_int4_dequant(
 }
 
 std::uint64_t dequantize_awq_to_output(
-    const LoadOp& op,
-    const LoadPlan& plan,
+    const ExecOp& op,
+    const LayoutPlan& plan,
     WeightStoreBuilder& weights,
-    const TensorSpec& source_spec,
-    const TensorSpec& out_spec)
+    const TensorDecl& source_spec,
+    const TensorDecl& out_spec)
 {
-    if (load_op_inputs(op).size() != 3) {
+    if (exec_op_inputs(op).size() != 3) {
         throw std::runtime_error(
-            "load plan: AWQ Dequantize op for '" + load_op_output(op) +
+            "layout plan: AWQ Dequantize op for '" + exec_op_output(op) +
             "' requires qweight, qzeros, and scales inputs");
     }
-    const DeviceTensor& qweight = weights.get(load_op_inputs(op)[0]);
-    const DeviceTensor& qzeros = weights.get(load_op_inputs(op)[1]);
-    const DeviceTensor& scales = weights.get(load_op_inputs(op)[2]);
+    const DeviceTensor& qweight = weights.get(exec_op_inputs(op)[0]);
+    const DeviceTensor& qzeros = weights.get(exec_op_inputs(op)[1]);
+    const DeviceTensor& scales = weights.get(exec_op_inputs(op)[2]);
     (void)plan;
 
     if (qweight.dtype() != DType::INT32 || qweight.shape().size() != 2 ||
         qzeros.dtype() != DType::INT32 || qzeros.shape().size() != 2 ||
         scales.shape().size() != 2 || out_spec.dtype != DType::BF16) {
         throw std::runtime_error(
-            "load plan: AWQ Dequantize input dtype/rank mismatch for '" +
-            load_op_output(op) + "'");
+            "layout plan: AWQ Dequantize input dtype/rank mismatch for '" +
+            exec_op_output(op) + "'");
     }
     const std::int64_t size_k = qweight.shape()[0];
     const std::int64_t size_n = qweight.shape()[1] * 8;
@@ -787,55 +854,55 @@ std::uint64_t dequantize_awq_to_output(
         size_k % source_spec.quant.group_size != 0 ||
         out_spec.shape != std::vector<std::int64_t>{size_n, size_k}) {
         throw std::runtime_error(
-            "load plan: AWQ Dequantize output shape mismatch for '" +
-            load_op_output(op) + "'");
+            "layout plan: AWQ Dequantize output shape mismatch for '" +
+            exec_op_output(op) + "'");
     }
     const std::int64_t groups = size_k / source_spec.quant.group_size;
     if (qzeros.shape() != std::vector<std::int64_t>{groups, size_n / 8} ||
         scales.shape() != std::vector<std::int64_t>{groups, size_n}) {
         throw std::runtime_error(
-            "load plan: AWQ Dequantize qzeros/scales shape mismatch for '" +
-            load_op_output(op) + "'");
+            "layout plan: AWQ Dequantize qzeros/scales shape mismatch for '" +
+            exec_op_output(op) + "'");
     }
 
     DeviceTensor scale_bf16;
     const void* scale_ptr =
-        bf16_scale_ptr_for_int4_dequant(scales, scale_bf16, load_op_output(op));
+        bf16_scale_ptr_for_int4_dequant(scales, scale_bf16, exec_op_output(op));
     DeviceTensor out = DeviceTensor::allocate(out_spec.dtype, out_spec.shape);
     kernels::launch_awq_dequant_to_bf16(
         qweight.data(), qzeros.data(), scale_ptr, out.data(),
-        checked_int_dim(size_k, load_op_output(op)),
-        checked_int_dim(size_n, load_op_output(op)),
+        checked_int_dim(size_k, exec_op_output(op)),
+        checked_int_dim(size_n, exec_op_output(op)),
         source_spec.quant.group_size,
         /*stream=*/0);
     const std::uint64_t bytes = out.nbytes();
-    weights.insert(load_op_output(op), std::move(out), out_spec);
+    weights.insert(exec_op_output(op), std::move(out), out_spec);
     return bytes;
 }
 
 std::uint64_t dequantize_gptq_to_output(
-    const LoadOp& op,
-    const LoadPlan& plan,
+    const ExecOp& op,
+    const LayoutPlan& plan,
     WeightStoreBuilder& weights,
-    const TensorSpec& source_spec,
-    const TensorSpec& out_spec)
+    const TensorDecl& source_spec,
+    const TensorDecl& out_spec)
 {
-    if (load_op_inputs(op).size() != 3 && load_op_inputs(op).size() != 4) {
+    if (exec_op_inputs(op).size() != 3 && exec_op_inputs(op).size() != 4) {
         throw std::runtime_error(
-            "load plan: GPTQ Dequantize op for '" + load_op_output(op) +
+            "layout plan: GPTQ Dequantize op for '" + exec_op_output(op) +
             "' requires qweight, qzeros, scales, and optional g_idx inputs");
     }
-    const DeviceTensor& qweight = weights.get(load_op_inputs(op)[0]);
-    const DeviceTensor& qzeros = weights.get(load_op_inputs(op)[1]);
-    const DeviceTensor& scales = weights.get(load_op_inputs(op)[2]);
+    const DeviceTensor& qweight = weights.get(exec_op_inputs(op)[0]);
+    const DeviceTensor& qzeros = weights.get(exec_op_inputs(op)[1]);
+    const DeviceTensor& scales = weights.get(exec_op_inputs(op)[2]);
     (void)plan;
 
     if (qweight.dtype() != DType::INT32 || qweight.shape().size() != 2 ||
         qzeros.dtype() != DType::INT32 || qzeros.shape().size() != 2 ||
         scales.shape().size() != 2 || out_spec.dtype != DType::BF16) {
         throw std::runtime_error(
-            "load plan: GPTQ Dequantize input dtype/rank mismatch for '" +
-            load_op_output(op) + "'");
+            "layout plan: GPTQ Dequantize input dtype/rank mismatch for '" +
+            exec_op_output(op) + "'");
     }
     const std::int64_t size_k = qweight.shape()[0] * 8;
     const std::int64_t size_n = qweight.shape()[1];
@@ -844,17 +911,17 @@ std::uint64_t dequantize_gptq_to_output(
         size_k % source_spec.quant.group_size != 0 ||
         out_spec.shape != std::vector<std::int64_t>{size_n, size_k}) {
         throw std::runtime_error(
-            "load plan: GPTQ Dequantize output shape mismatch for '" +
-            load_op_output(op) + "'");
+            "layout plan: GPTQ Dequantize output shape mismatch for '" +
+            exec_op_output(op) + "'");
     }
     const std::int64_t groups = size_k / source_spec.quant.group_size;
-    const bool has_gidx = load_op_inputs(op).size() == 4;
+    const bool has_gidx = exec_op_inputs(op).size() == 4;
     if (!has_gidx) {
         if (qzeros.shape() != std::vector<std::int64_t>{groups, size_n / 8} ||
             scales.shape() != std::vector<std::int64_t>{groups, size_n}) {
             throw std::runtime_error(
-                "load plan: GPTQ Dequantize qzeros/scales shape mismatch for '" +
-                load_op_output(op) + "'");
+                "layout plan: GPTQ Dequantize qzeros/scales shape mismatch for '" +
+                exec_op_output(op) + "'");
         }
     } else {
         if (qzeros.shape().size() != 2 || scales.shape().size() != 2 ||
@@ -863,50 +930,50 @@ std::uint64_t dequantize_gptq_to_output(
             qzeros.shape()[0] != scales.shape()[0] ||
             qzeros.shape()[0] < groups) {
             throw std::runtime_error(
-                "load plan: GPTQ act-order Dequantize qzeros/scales do not "
-                "cover local groups for '" + load_op_output(op) + "'");
+                "layout plan: GPTQ act-order Dequantize qzeros/scales do not "
+                "cover local groups for '" + exec_op_output(op) + "'");
         }
     }
 
     const void* gidx_ptr = nullptr;
     if (has_gidx) {
-        const DeviceTensor& gidx = weights.get(load_op_inputs(op)[3]);
+        const DeviceTensor& gidx = weights.get(exec_op_inputs(op)[3]);
         if (gidx.dtype() != DType::INT32 ||
             gidx.shape() != std::vector<std::int64_t>{size_k}) {
             throw std::runtime_error(
-                "load plan: GPTQ Dequantize g_idx shape mismatch for '" +
-                load_op_output(op) + "'");
+                "layout plan: GPTQ Dequantize g_idx shape mismatch for '" +
+                exec_op_output(op) + "'");
         }
         gidx_ptr = gidx.data();
     }
 
     DeviceTensor scale_bf16;
     const void* scale_ptr =
-        bf16_scale_ptr_for_int4_dequant(scales, scale_bf16, load_op_output(op));
+        bf16_scale_ptr_for_int4_dequant(scales, scale_bf16, exec_op_output(op));
     DeviceTensor out = DeviceTensor::allocate(out_spec.dtype, out_spec.shape);
     kernels::launch_gptq_dequant_to_bf16(
         qweight.data(), qzeros.data(), scale_ptr, gidx_ptr, out.data(),
-        checked_int_dim(size_k, load_op_output(op)),
-        checked_int_dim(size_n, load_op_output(op)),
+        checked_int_dim(size_k, exec_op_output(op)),
+        checked_int_dim(size_n, exec_op_output(op)),
         source_spec.quant.group_size,
         /*stream=*/0);
     const std::uint64_t bytes = out.nbytes();
-    weights.insert(load_op_output(op), std::move(out), out_spec);
+    weights.insert(exec_op_output(op), std::move(out), out_spec);
     return bytes;
 }
 
 std::uint64_t dequantize_to_output(
-    const LoadOp& op,
-    const LoadPlan& plan,
+    const ExecOp& op,
+    const LayoutPlan& plan,
     WeightStoreBuilder& weights)
 {
-    if (load_op_inputs(op).size() < 2) {
+    if (exec_op_inputs(op).size() < 2) {
         throw std::runtime_error(
-            "load plan: Dequantize op for '" + load_op_output(op) +
+            "layout plan: Dequantize op for '" + exec_op_output(op) +
             "' requires weight and scale inputs");
     }
-    const TensorSpec& out_spec = tensor_spec_for(plan, load_op_output(op));
-    const TensorSpec* source_spec = find_tensor_spec(plan, load_op_inputs(op)[0]);
+    const TensorDecl& out_spec = tensor_spec_for(plan, exec_op_output(op));
+    const TensorDecl* source_spec = find_tensor_spec(plan, exec_op_inputs(op)[0]);
     if (source_spec != nullptr &&
         source_spec->quant.format == QuantFormat::AwqInt4) {
         return dequantize_awq_to_output(
@@ -918,20 +985,20 @@ std::uint64_t dequantize_to_output(
             op, plan, weights, *source_spec, out_spec);
     }
 
-    const DeviceTensor& src = weights.get(load_op_inputs(op)[0]);
-    const DeviceTensor& scale = weights.get(load_op_inputs(op)[1]);
+    const DeviceTensor& src = weights.get(exec_op_inputs(op)[0]);
+    const DeviceTensor& scale = weights.get(exec_op_inputs(op)[1]);
     if (src.dtype() == DType::UINT8 && scale.dtype() == DType::UINT8 &&
         out_spec.dtype == DType::BF16) {
         if (scale.shape().empty() || src.shape().size() != scale.shape().size() + 1) {
             throw std::runtime_error(
-                "load plan: MXFP4 Dequantize expects packed blocks with one "
-                "extra trailing dimension for '" + load_op_output(op) + "'");
+                "layout plan: MXFP4 Dequantize expects packed blocks with one "
+                "extra trailing dimension for '" + exec_op_output(op) + "'");
         }
         const std::int64_t blocks_per_row = scale.shape().back();
         if (blocks_per_row <= 0 || src.shape().back() != 16) {
             throw std::runtime_error(
-                "load plan: MXFP4 Dequantize expects 16 packed bytes per "
-                "32-value block for '" + load_op_output(op) + "'");
+                "layout plan: MXFP4 Dequantize expects 16 packed bytes per "
+                "32-value block for '" + exec_op_output(op) + "'");
         }
         std::int64_t rows = 1;
         for (std::size_t i = 0; i + 1 < scale.shape().size(); ++i) {
@@ -942,13 +1009,13 @@ std::uint64_t dequantize_to_output(
         expected.back() = in_dim;
         if (expected != out_spec.shape) {
             throw std::runtime_error(
-                "load plan: MXFP4 Dequantize output shape mismatch for '" +
-                load_op_output(op) + "'");
+                "layout plan: MXFP4 Dequantize output shape mismatch for '" +
+                exec_op_output(op) + "'");
         }
         if (src.numel() != static_cast<std::size_t>(rows * blocks_per_row * 16)) {
             throw std::runtime_error(
-                "load plan: MXFP4 Dequantize packed source shape mismatch for '" +
-                load_op_output(op) + "'");
+                "layout plan: MXFP4 Dequantize packed source shape mismatch for '" +
+                exec_op_output(op) + "'");
         }
 
         DeviceTensor out = DeviceTensor::allocate(out_spec.dtype, out_spec.shape);
@@ -978,24 +1045,24 @@ std::uint64_t dequantize_to_output(
                 /*stream=*/0);
         }
         const std::uint64_t bytes = out.nbytes();
-        weights.insert(load_op_output(op), std::move(out), out_spec);
+        weights.insert(exec_op_output(op), std::move(out), out_spec);
         return bytes;
     }
 
     if (src.dtype() != DType::FP8_E4M3 || out_spec.dtype != DType::BF16) {
         throw std::runtime_error(
-            "load plan: Dequantize currently supports FP8_E4M3, MXFP4, "
+            "layout plan: Dequantize currently supports FP8_E4M3, MXFP4, "
             "AWQ INT4, and GPTQ INT4 to BF16 for '" +
-            load_op_output(op) + "'");
+            exec_op_output(op) + "'");
     }
     if (src.shape() != out_spec.shape || src.shape().empty()) {
         throw std::runtime_error(
-            "load plan: Dequantize source shape does not match output spec for '" +
-            load_op_output(op) + "'");
+            "layout plan: Dequantize source shape does not match output spec for '" +
+            exec_op_output(op) + "'");
     }
     if (scale.dtype() != DType::FP32 && scale.dtype() != DType::BF16) {
         throw std::runtime_error(
-            "load plan: Dequantize scale for '" + load_op_output(op) +
+            "layout plan: Dequantize scale for '" + exec_op_output(op) +
             "' must be fp32 or bf16, got " +
             std::string(dtype_name(scale.dtype())));
     }
@@ -1037,8 +1104,8 @@ std::uint64_t dequantize_to_output(
                                            static_cast<std::size_t>(rows));
         if (fp32_scale->numel() != static_cast<std::size_t>(rows)) {
             throw std::runtime_error(
-                "load plan: Dequantize per-channel scale length does not "
-                "match source rows for '" + load_op_output(op) + "'");
+                "layout plan: Dequantize per-channel scale length does not "
+                "match source rows for '" + exec_op_output(op) + "'");
         }
         const int rows_per_tile = std::max<int>(
             1,
@@ -1065,37 +1132,37 @@ std::uint64_t dequantize_to_output(
     }
 
     const std::uint64_t bytes = out.nbytes();
-    weights.insert(load_op_output(op), std::move(out), out_spec);
+    weights.insert(exec_op_output(op), std::move(out), out_spec);
     return bytes;
 }
 
 std::uint64_t deinterleave_to_outputs(
-    const LoadOp& op,
-    const LoadPlan& plan,
+    const ExecOp& op,
+    const LayoutPlan& plan,
     WeightStoreBuilder& weights,
     int tp_rank,
     int tp_size)
 {
-    const TensorSpec& first_spec = tensor_spec_for(plan, load_op_output(op));
-    const TensorSpec& second_spec = tensor_spec_for(plan, load_op_secondary_output(op));
+    const TensorDecl& first_spec = tensor_spec_for(plan, exec_op_output(op));
+    const TensorDecl& second_spec = tensor_spec_for(plan, exec_op_secondary_output(op));
     const DeviceTensor& src = weights.get(first_input(op));
     if (src.dtype() != DType::BF16 ||
         first_spec.dtype != DType::BF16 ||
         second_spec.dtype != DType::BF16) {
         throw std::runtime_error(
-            "load plan: Deinterleave currently supports bf16 tensors for '" +
-            load_op_output(op) + "'");
+            "layout plan: Deinterleave currently supports bf16 tensors for '" +
+            exec_op_output(op) + "'");
     }
     if (first_spec.shape != second_spec.shape) {
         throw std::runtime_error(
-            "load plan: Deinterleave output shapes differ for '" +
-            load_op_output(op) + "'");
+            "layout plan: Deinterleave output shapes differ for '" +
+            exec_op_output(op) + "'");
     }
     if (src.shape().size() != first_spec.shape.size() ||
         (src.shape().size() != 2 && src.shape().size() != 3)) {
         throw std::runtime_error(
-            "load plan: Deinterleave expects rank-2 or rank-3 source for '" +
-            load_op_output(op) + "'");
+            "layout plan: Deinterleave expects rank-2 or rank-3 source for '" +
+            exec_op_output(op) + "'");
     }
     const auto& src_shape = src.shape();
     const auto& out_shape = first_spec.shape;
@@ -1103,28 +1170,28 @@ std::uint64_t deinterleave_to_outputs(
     const std::int64_t two_I_full = src_shape[1];
     if (two_I_full % 2 != 0 || E != out_shape[0]) {
         throw std::runtime_error(
-            "load plan: Deinterleave source shape mismatch for '" +
-            load_op_output(op) + "'");
+            "layout plan: Deinterleave source shape mismatch for '" +
+            exec_op_output(op) + "'");
     }
     const std::int64_t I_full = two_I_full / 2;
     const std::int64_t I_local = out_shape[1];
     if (I_local <= 0 || I_full % I_local != 0) {
         throw std::runtime_error(
-            "load plan: Deinterleave local size mismatch for '" +
-            load_op_output(op) + "'");
+            "layout plan: Deinterleave local size mismatch for '" +
+            exec_op_output(op) + "'");
     }
     std::int64_t start = 0;
-    if (tp_size > 1 && load_op_shard_axis(op) == 1) {
+    if (tp_size > 1 && exec_op_shard_axis(op) == 1) {
         if (I_full % tp_size != 0 || I_local != I_full / tp_size) {
             throw std::runtime_error(
-                "load plan: Deinterleave cannot shard intermediate axis for '" +
-                load_op_output(op) + "'");
+                "layout plan: Deinterleave cannot shard intermediate axis for '" +
+                exec_op_output(op) + "'");
         }
         start = static_cast<std::int64_t>(tp_rank) * I_local;
     } else if (I_local != I_full) {
         throw std::runtime_error(
-            "load plan: Deinterleave output is sharded but op has no "
-            "matching shard_axis for '" + load_op_output(op) + "'");
+            "layout plan: Deinterleave output is sharded but op has no "
+            "matching shard_axis for '" + exec_op_output(op) + "'");
     }
 
     DeviceTensor first = DeviceTensor::allocate(first_spec.dtype, first_spec.shape);
@@ -1134,8 +1201,8 @@ std::uint64_t deinterleave_to_outputs(
         const std::int64_t H = src_shape[2];
         if (out_shape.size() != 3 || out_shape[2] != H) {
             throw std::runtime_error(
-                "load plan: Deinterleave matrix output mismatch for '" +
-                load_op_output(op) + "'");
+                "layout plan: Deinterleave matrix output mismatch for '" +
+                exec_op_output(op) + "'");
         }
         const std::size_t src_expert_bytes =
             static_cast<std::size_t>(two_I_full) *
@@ -1161,8 +1228,8 @@ std::uint64_t deinterleave_to_outputs(
     } else {
         if (out_shape.size() != 2) {
             throw std::runtime_error(
-                "load plan: Deinterleave vector output mismatch for '" +
-                load_op_output(op) + "'");
+                "layout plan: Deinterleave vector output mismatch for '" +
+                exec_op_output(op) + "'");
         }
         const std::size_t src_expert_bytes =
             static_cast<std::size_t>(two_I_full) * elem;
@@ -1184,28 +1251,28 @@ std::uint64_t deinterleave_to_outputs(
     }
 
     const std::uint64_t bytes = first.nbytes() + second.nbytes();
-    weights.insert(load_op_output(op), std::move(first), first_spec);
-    weights.insert(load_op_secondary_output(op), std::move(second), second_spec);
+    weights.insert(exec_op_output(op), std::move(first), first_spec);
+    weights.insert(exec_op_secondary_output(op), std::move(second), second_spec);
     return bytes;
 }
 
 std::uint64_t stack_groups_to_outputs(
-    const LoadOp& op,
-    const LoadPlan& plan,
+    const ExecOp& op,
+    const LayoutPlan& plan,
     WeightStoreBuilder& weights)
 {
-    const TensorSpec& gate_up_spec = tensor_spec_for(plan, load_op_output(op));
-    const TensorSpec& down_spec =
-        tensor_spec_for(plan, load_op_secondary_output(op));
-    if (load_op_inputs(op).empty() ||
-        load_op_inputs(op).size() % 3 != 0 ||
-        !load_op_sources(op).empty()) {
+    const TensorDecl& gate_up_spec = tensor_spec_for(plan, exec_op_output(op));
+    const TensorDecl& down_spec =
+        tensor_spec_for(plan, exec_op_secondary_output(op));
+    if (exec_op_inputs(op).empty() ||
+        exec_op_inputs(op).size() % 3 != 0 ||
+        !exec_op_sources(op).empty()) {
         throw std::runtime_error(
-            "load plan: StackGroups expects input tensor triples for '" +
-            load_op_output(op) + "'");
+            "layout plan: StackGroups expects input tensor triples for '" +
+            exec_op_output(op) + "'");
     }
     const std::int64_t E =
-        static_cast<std::int64_t>(load_op_inputs(op).size() / 3);
+        static_cast<std::int64_t>(exec_op_inputs(op).size() / 3);
     if (gate_up_spec.dtype != DType::BF16 ||
         down_spec.dtype != DType::BF16 ||
         gate_up_spec.shape.size() != 3 ||
@@ -1213,8 +1280,8 @@ std::uint64_t stack_groups_to_outputs(
         gate_up_spec.shape[0] != E ||
         down_spec.shape[0] != E) {
         throw std::runtime_error(
-            "load plan: StackGroups output spec mismatch for '" +
-            load_op_output(op) + "'");
+            "layout plan: StackGroups output spec mismatch for '" +
+            exec_op_output(op) + "'");
     }
 
     const std::int64_t I = gate_up_spec.shape[1] / 2;
@@ -1225,8 +1292,8 @@ std::uint64_t stack_groups_to_outputs(
         down_spec.shape !=
             std::vector<std::int64_t>{E, H, I_down}) {
         throw std::runtime_error(
-            "load plan: StackGroups output shapes do not match inputs for '" +
-            load_op_output(op) + "'");
+            "layout plan: StackGroups output shapes do not match inputs for '" +
+            exec_op_output(op) + "'");
     }
 
     DeviceTensor gate_up =
@@ -1249,19 +1316,19 @@ std::uint64_t stack_groups_to_outputs(
             static_cast<std::size_t>(e) * down_expert_bytes;
 
         const DeviceTensor& gate =
-            weights.get(load_op_inputs(op)[static_cast<std::size_t>(e) * 3]);
+            weights.get(exec_op_inputs(op)[static_cast<std::size_t>(e) * 3]);
         const DeviceTensor& up =
-            weights.get(load_op_inputs(op)[static_cast<std::size_t>(e) * 3 + 1]);
+            weights.get(exec_op_inputs(op)[static_cast<std::size_t>(e) * 3 + 1]);
         const DeviceTensor& down_src =
-            weights.get(load_op_inputs(op)[static_cast<std::size_t>(e) * 3 + 2]);
+            weights.get(exec_op_inputs(op)[static_cast<std::size_t>(e) * 3 + 2]);
         if (gate.dtype() != DType::BF16 || up.dtype() != DType::BF16 ||
             down_src.dtype() != DType::BF16 ||
             gate.shape() != std::vector<std::int64_t>{I, H} ||
             up.shape() != std::vector<std::int64_t>{I, H} ||
             down_src.shape() != std::vector<std::int64_t>{H, I_down}) {
             throw std::runtime_error(
-                "load plan: StackGroups expert input mismatch for '" +
-                load_op_output(op) + "'");
+                "layout plan: StackGroups expert input mismatch for '" +
+                exec_op_output(op) + "'");
         }
         CUDA_CHECK(cudaMemcpyAsync(
             gate_up_e, gate.data(), proj_bytes,
@@ -1275,8 +1342,8 @@ std::uint64_t stack_groups_to_outputs(
     }
 
     const std::uint64_t bytes = gate_up.nbytes() + down.nbytes();
-    weights.insert(load_op_output(op), std::move(gate_up), gate_up_spec);
-    weights.insert(load_op_secondary_output(op), std::move(down), down_spec);
+    weights.insert(exec_op_output(op), std::move(gate_up), gate_up_spec);
+    weights.insert(exec_op_secondary_output(op), std::move(down), down_spec);
     return bytes;
 }
 
@@ -1284,82 +1351,82 @@ int checked_int_dim(std::int64_t value, const std::string& name) {
     if (value <= 0 ||
         value > static_cast<std::int64_t>(std::numeric_limits<int>::max())) {
         throw std::runtime_error(
-            "load plan: dimension out of range for '" + name + "'");
+            "layout plan: dimension out of range for '" + name + "'");
     }
     return static_cast<int>(value);
 }
 
 std::uint64_t repack_layout_to_outputs(
-    const LoadOp& op,
-    const LoadPlan& plan,
+    const ExecOp& op,
+    const LayoutPlan& plan,
     WeightStoreBuilder& weights)
 {
 #ifndef PIE_CUDA_HAS_MARLIN
     throw std::runtime_error(
-        "load plan: RepackLayout for '" + load_op_output(op) +
+        "layout plan: RepackLayout for '" + exec_op_output(op) +
         "' requires Marlin, but this build was configured without "
         "PIE_CUDA_BUILD_MARLIN=ON.");
 #else
-    const TensorSpec& out_spec = tensor_spec_for(plan, load_op_output(op));
-    const TensorSpec& scale_spec =
-        tensor_spec_for(plan, load_op_secondary_output(op));
+    const TensorDecl& out_spec = tensor_spec_for(plan, exec_op_output(op));
+    const TensorDecl& scale_spec =
+        tensor_spec_for(plan, exec_op_secondary_output(op));
     const bool is_gptq = out_spec.quant.format == QuantFormat::GptqInt4;
     const bool is_awq = out_spec.quant.format == QuantFormat::AwqInt4;
     if ((!is_gptq && !is_awq) ||
         out_spec.quant.granularity != QuantGranularity::PerGroup ||
-        out_spec.quant.scale_tensor != load_op_secondary_output(op)) {
+        out_spec.quant.scale_tensor != exec_op_secondary_output(op)) {
         throw std::runtime_error(
-            "load plan: RepackLayout supports GPTQ/AWQ int4 with "
-            "per-group scale metadata for '" + load_op_output(op) + "'");
+            "layout plan: RepackLayout supports GPTQ/AWQ int4 with "
+            "per-group scale metadata for '" + exec_op_output(op) + "'");
     }
     if (out_spec.dtype != DType::INT4_PACKED ||
         out_spec.layout != TensorLayoutKind::QuantPacked) {
         throw std::runtime_error(
-            "load plan: RepackLayout output spec must be QuantPacked int4 for '" +
-            load_op_output(op) + "'");
+            "layout plan: RepackLayout output spec must be QuantPacked int4 for '" +
+            exec_op_output(op) + "'");
     }
     if (scale_spec.dtype != DType::BF16 ||
         scale_spec.layout != TensorLayoutKind::Dense) {
         throw std::runtime_error(
-            "load plan: RepackLayout scale output must be dense bf16 for '" +
-            load_op_output(op) + "'");
+            "layout plan: RepackLayout scale output must be dense bf16 for '" +
+            exec_op_output(op) + "'");
     }
 
-    const DeviceTensor& qweight = weights.get(load_op_inputs(op).at(0));
+    const DeviceTensor& qweight = weights.get(exec_op_inputs(op).at(0));
     if (qweight.dtype() != DType::INT32 || qweight.shape().size() != 2) {
         throw std::runtime_error(
-            "load plan: RepackLayout source must be 2-D int32 for '" +
-            load_op_output(op) + "'");
+            "layout plan: RepackLayout source must be 2-D int32 for '" +
+            exec_op_output(op) + "'");
     }
 
     if (is_awq) {
-        if (load_op_inputs(op).size() != 3) {
+        if (exec_op_inputs(op).size() != 3) {
             throw std::runtime_error(
-                "load plan: AWQ RepackLayout requires qweight, qzeros, "
-                "and scales inputs for '" + load_op_output(op) + "'");
+                "layout plan: AWQ RepackLayout requires qweight, qzeros, "
+                "and scales inputs for '" + exec_op_output(op) + "'");
         }
         if (out_spec.quant.zero_point_tensor.empty()) {
             throw std::runtime_error(
-                "load plan: AWQ RepackLayout output is missing zero-point "
-                "metadata for '" + load_op_output(op) + "'");
+                "layout plan: AWQ RepackLayout output is missing zero-point "
+                "metadata for '" + exec_op_output(op) + "'");
         }
-        const TensorSpec& zero_spec =
+        const TensorDecl& zero_spec =
             tensor_spec_for(plan, out_spec.quant.zero_point_tensor);
-        const DeviceTensor& qzeros = weights.get(load_op_inputs(op).at(1));
-        const DeviceTensor& scales = weights.get(load_op_inputs(op).at(2));
+        const DeviceTensor& qzeros = weights.get(exec_op_inputs(op).at(1));
+        const DeviceTensor& scales = weights.get(exec_op_inputs(op).at(2));
         if (qzeros.dtype() != DType::INT32 || qzeros.shape().size() != 2 ||
             scales.shape().size() != 2) {
             throw std::runtime_error(
-                "load plan: AWQ RepackLayout qzeros/scales mismatch for '" +
-                load_op_output(op) + "'");
+                "layout plan: AWQ RepackLayout qzeros/scales mismatch for '" +
+                exec_op_output(op) + "'");
         }
 
         const int size_k =
-            checked_int_dim(qweight.shape()[0], load_op_output(op));
+            checked_int_dim(qweight.shape()[0], exec_op_output(op));
         const int size_n =
-            checked_int_dim(qweight.shape()[1] * 8, load_op_output(op));
+            checked_int_dim(qweight.shape()[1] * 8, exec_op_output(op));
         const int groups =
-            checked_int_dim(scales.shape()[0], load_op_secondary_output(op));
+            checked_int_dim(scales.shape()[0], exec_op_secondary_output(op));
         if (size_k % 16 != 0 || size_n % 64 != 0 ||
             qzeros.shape() !=
                 std::vector<std::int64_t>{groups, size_n / 8} ||
@@ -1371,8 +1438,8 @@ std::uint64_t repack_layout_to_outputs(
                 static_cast<std::int64_t>(size_k / 16),
                 static_cast<std::int64_t>(size_n) * 8}) {
             throw std::runtime_error(
-                "load plan: AWQ RepackLayout shape mismatch for '" +
-                load_op_output(op) + "'");
+                "layout plan: AWQ RepackLayout shape mismatch for '" +
+                exec_op_output(op) + "'");
         }
 
         DeviceTensor gptq_qweight =
@@ -1403,8 +1470,8 @@ std::uint64_t repack_layout_to_outputs(
                 /*stream=*/0);
         } else {
             throw std::runtime_error(
-                "load plan: AWQ RepackLayout scales must be bf16/fp16/fp32 "
-                "for '" + load_op_output(op) + "'");
+                "layout plan: AWQ RepackLayout scales must be bf16/fp16/fp32 "
+                "for '" + exec_op_output(op) + "'");
         }
         kernels::launch_marlin_permute_scales_bf16(
             bf16_scales.data(),
@@ -1419,8 +1486,8 @@ std::uint64_t repack_layout_to_outputs(
 
         const std::uint64_t bytes =
             packed.nbytes() + bf16_scales.nbytes() + qzeros_marlin.nbytes();
-        weights.insert(load_op_output(op), std::move(packed), out_spec);
-        weights.insert(load_op_secondary_output(op), std::move(bf16_scales), scale_spec);
+        weights.insert(exec_op_output(op), std::move(packed), out_spec);
+        weights.insert(exec_op_secondary_output(op), std::move(bf16_scales), scale_spec);
         weights.insert(
             out_spec.quant.zero_point_tensor,
             std::move(qzeros_marlin),
@@ -1428,36 +1495,36 @@ std::uint64_t repack_layout_to_outputs(
         return bytes;
     }
 
-    const DeviceTensor& scales = weights.get(load_op_inputs(op).at(1));
+    const DeviceTensor& scales = weights.get(exec_op_inputs(op).at(1));
     if (scales.dtype() != DType::FP16 || scales.shape().size() != 2) {
         throw std::runtime_error(
-            "load plan: RepackLayout GPTQ scales must be 2-D fp16 for '" +
-            load_op_output(op) + "'");
+            "layout plan: RepackLayout GPTQ scales must be 2-D fp16 for '" +
+            exec_op_output(op) + "'");
     }
 
     const int size_k =
-        checked_int_dim(qweight.shape()[0] * 8, load_op_output(op));
+        checked_int_dim(qweight.shape()[0] * 8, exec_op_output(op));
     const int size_n =
-        checked_int_dim(qweight.shape()[1], load_op_output(op));
+        checked_int_dim(qweight.shape()[1], exec_op_output(op));
     const int groups =
-        checked_int_dim(scales.shape()[0], load_op_secondary_output(op));
+        checked_int_dim(scales.shape()[0], exec_op_secondary_output(op));
     if (scales.shape()[1] != size_n) {
         throw std::runtime_error(
-            "load plan: RepackLayout scale columns do not match qweight for '" +
-            load_op_output(op) + "'");
+            "layout plan: RepackLayout scale columns do not match qweight for '" +
+            exec_op_output(op) + "'");
     }
     if (size_k % 16 != 0 ||
         out_spec.shape != std::vector<std::int64_t>{
             static_cast<std::int64_t>(size_k / 16),
             static_cast<std::int64_t>(size_n) * 8}) {
         throw std::runtime_error(
-            "load plan: RepackLayout packed output shape mismatch for '" +
-            load_op_output(op) + "'");
+            "layout plan: RepackLayout packed output shape mismatch for '" +
+            exec_op_output(op) + "'");
     }
     if (scale_spec.shape != scales.shape()) {
         throw std::runtime_error(
-            "load plan: RepackLayout scale output shape mismatch for '" +
-            load_op_output(op) + "'");
+            "layout plan: RepackLayout scale output shape mismatch for '" +
+            exec_op_output(op) + "'");
     }
 
     DeviceTensor packed =
@@ -1475,106 +1542,332 @@ std::uint64_t repack_layout_to_outputs(
         /*stream=*/0);
 
     const std::uint64_t bytes = packed.nbytes() + bf16_scales.nbytes();
-    weights.insert(load_op_output(op), std::move(packed), out_spec);
-    weights.insert(load_op_secondary_output(op), std::move(bf16_scales), scale_spec);
+    weights.insert(exec_op_output(op), std::move(packed), out_spec);
+    weights.insert(exec_op_secondary_output(op), std::move(bf16_scales), scale_spec);
     return bytes;
 #endif
 }
 
 void validate_materialized_tensors(
-    const LoadPlan& plan,
+    const LayoutPlan& plan,
     const WeightStore& weights)
 {
     for (const auto& [name, spec] : plan.tensors) {
         if (spec.ownership == TensorOwnershipKind::Temporary) continue;
         if (weights.find(name) == weights.end()) {
             throw std::runtime_error(
-                "load plan: materializer did not produce tensor '" + name + "'");
+                "layout plan: load_executor did not produce tensor '" + name + "'");
         }
         const DeviceTensor& tensor = weights.get(name);
         if (tensor.dtype() != spec.dtype) {
             throw std::runtime_error(
-                "load plan: tensor '" + name + "' dtype mismatch: planned " +
+                "layout plan: tensor '" + name + "' dtype mismatch: planned " +
                 std::string(dtype_name(spec.dtype)) + ", got " +
                 std::string(dtype_name(tensor.dtype())));
         }
         if (tensor.shape() != spec.shape) {
             throw std::runtime_error(
-                "load plan: tensor '" + name +
+                "layout plan: tensor '" + name +
                 "' shape mismatch after materialization");
         }
         if (spec.ownership == TensorOwnershipKind::BorrowedView &&
             weights.find(spec.backing_tensor) == weights.end()) {
             throw std::runtime_error(
-                "load plan: view '" + name + "' backing tensor '" +
+                "layout plan: view '" + name + "' backing tensor '" +
                 spec.backing_tensor + "' was not materialized");
         }
     }
 }
 
-std::uint64_t materialize_axis_concat(
-    const LoadOp& op,
-    std::size_t op_index,
-    const LoadPlan& plan,
-    const TensorMetadataSource& metadata,
-    CheckpointByteSource& byte_source,
-    WeightStoreBuilder& weights,
-    int tp_rank,
-    int tp_size)
+void register_axis_concat_views(
+    const ExecOp& op,
+    const std::vector<ExtentWrite>& writes,
+    const LayoutPlan& plan,
+    WeightStoreBuilder& weights)
 {
-    if (load_op_sources(op).empty()) {
-        throw std::runtime_error("load plan: AxisConcat op has no sources for " +
-                                 load_op_output(op));
-    }
-
-    auto writes = lower_byte_writes_for_op(
-        op, op_index, plan, metadata, tp_rank, tp_size);
-    if (writes.size() != load_op_sources(op).size()) {
+    if (writes.size() != exec_op_sources(op).size()) {
         throw std::runtime_error(
-            "physical load plan: AxisConcat byte-write count mismatch for '" +
-            load_op_output(op) + "'");
+            "storage program: AxisConcat extent-write count mismatch for '" +
+            exec_op_output(op) + "'");
     }
-    const std::uint64_t loaded_bytes = materialize_byte_writes_for_op(
-        op, op_index, plan, metadata, byte_source, weights, tp_rank, tp_size);
-
-    const TensorSpec& packed_spec = tensor_spec_for(plan, load_op_output(op));
+    const TensorDecl& packed_spec = tensor_spec_for(plan, exec_op_output(op));
     if (packed_spec.shape.size() != 2) {
         throw std::runtime_error(
-            "load plan: AxisConcat output must be 2-D: " + load_op_output(op));
+            "layout plan: AxisConcat output must be 2-D: " + exec_op_output(op));
     }
     const std::int64_t cols = packed_spec.shape[1];
     std::int64_t row_offset = 0;
-    for (std::size_t i = 0; i < load_op_sources(op).size(); ++i) {
+    for (std::size_t i = 0; i < exec_op_sources(op).size(); ++i) {
         const auto& write = writes[i];
         if (write.dst_shape.size() != 2 || write.dst_shape[1] != cols) {
             throw std::runtime_error(
-                "physical load plan: AxisConcat view shape mismatch for '" +
-                load_op_sources(op)[i].view_name + "'");
+                "storage program: AxisConcat view shape mismatch for '" +
+                exec_op_sources(op)[i].view_name + "'");
         }
         insert_row_view(
             weights,
-            tensor_spec_for(plan, load_op_sources(op)[i].view_name),
-            load_op_output(op),
-            load_op_sources(op)[i].view_name,
+            tensor_spec_for(plan, exec_op_sources(op)[i].view_name),
+            exec_op_output(op),
+            exec_op_sources(op)[i].view_name,
             row_offset,
             write.dst_shape[0],
             cols);
         row_offset += write.dst_shape[0];
     }
+}
 
-    return loaded_bytes;
+std::vector<ExtentWrite> storage_writes_for_output(
+    const StorageProgram& storage_program,
+    const std::string& output_name)
+{
+    std::vector<ExtentWrite> writes;
+    for (const auto& write : storage_program.extent_writes) {
+        if (write.output_name == output_name) {
+            writes.push_back(write);
+        }
+    }
+    return writes;
+}
+
+ExecOp exec_op_for_instruction(
+    const StorageProgram& storage_program,
+    const StorageInstr& instr)
+{
+    ExecOp op;
+    op.inputs = instr.inputs;
+    if (!instr.outputs.empty()) {
+        op.output_name = instr.outputs[0];
+    }
+    if (instr.outputs.size() > 1) {
+        op.secondary_output_name = instr.outputs[1];
+    }
+
+    if (instr.kind == StorageInstrKind::TileMap) {
+        if (instr.tile_map_index >= storage_program.tile_maps.size()) {
+            throw std::runtime_error(
+                "storage program: TileMap instruction index out of range");
+        }
+        const TileMap& tile = storage_program.tile_maps[instr.tile_map_index];
+        op.inputs = tile.inputs;
+        op.output_name = tile.output_name;
+        op.secondary_output_name.clear();
+    }
+
+    if (const auto* slice =
+            std::get_if<StorageSlicePayload>(&instr.payload)) {
+        op.slice_axis = slice->axis;
+        op.slice_start = slice->start;
+        op.slice_length = slice->length;
+        op.shard_axis = slice->shard_axis;
+    } else if (const auto* view =
+                   std::get_if<StorageViewPayload>(&instr.payload)) {
+        op.row_offset = view->start;
+        op.rows = view->length;
+        if (view->axis >= 0) {
+            op.slice_axis = view->axis;
+        }
+    } else if (const auto* axis =
+                   std::get_if<StorageAxisPayload>(&instr.payload)) {
+        op.shard_axis = axis->shard_axis;
+    }
+
+    if (instr.kind == StorageInstrKind::CreateView &&
+        instr.outputs.size() > 1) {
+        if (instr.inputs.empty()) {
+            throw std::runtime_error(
+                "storage program: CreateView group has no backing input");
+        }
+        op.output_name = instr.inputs.front();
+        op.secondary_output_name.clear();
+        op.sources.reserve(instr.outputs.size());
+        for (const auto& output : instr.outputs) {
+            op.sources.push_back(TensorSourceRef{
+                .raw_name = {},
+                .view_name = output,
+            });
+        }
+    }
+
+    if (op.output_name.empty() &&
+        instr.kind != StorageInstrKind::Release) {
+        throw std::runtime_error(
+            "storage program: instruction has no output tensor");
+    }
+    return op;
+}
+
+std::uint64_t execute_tile_map_instruction(
+    const LayoutPlan& plan,
+    const StorageProgram& storage_program,
+    const StorageInstr& instr,
+    CheckpointByteSource& byte_source,
+    WeightStoreBuilder& weights)
+{
+    if (instr.tile_map_index >= storage_program.tile_maps.size()) {
+        throw std::runtime_error(
+            "storage program: TileMap instruction index out of range");
+    }
+    const TileMap& tile = storage_program.tile_maps[instr.tile_map_index];
+    if (!instr.extent_write_indices.empty()) {
+        return materialize_tile_raw_cast(
+            tile,
+            extent_writes_for_instruction(storage_program, instr),
+            plan,
+            byte_source,
+            weights,
+            tile.tile_bytes);
+    }
+
+    switch (tile.kind) {
+    case TileMapKind::Cast: {
+        if (tile.inputs.size() != 1) {
+            throw std::runtime_error(
+                "storage program: TileMap Cast needs one input for '" +
+                tile.output_name + "'");
+        }
+        const TensorDecl& out_spec = tensor_spec_for(plan, tile.output_name);
+        cast_tensor_to_output(weights.get(tile.inputs.front()), weights, out_spec);
+        return weights.get(tile.output_name).nbytes();
+    }
+    case TileMapKind::Decode:
+        return dequantize_to_output(
+            exec_op_for_instruction(storage_program, instr), plan, weights);
+    case TileMapKind::Encode:
+    case TileMapKind::Transcode:
+    case TileMapKind::Reblock:
+    case TileMapKind::Reorder:
+        throw std::runtime_error(
+            "storage program: TileMap " +
+            std::string(tile_map_kind_name(tile.kind)) +
+            " execution is not implemented for '" + tile.output_name + "'");
+    }
+    throw std::runtime_error("storage program: unknown TileMap kind");
+}
+
+RuntimeQuantResult execute_transform_instruction(
+    const LayoutPlan& plan,
+    const StorageProgram& storage_program,
+    const StorageInstr& instr,
+    WeightStoreBuilder& weights,
+    NcclComm* tp_comm,
+    int tp_rank,
+    int tp_size)
+{
+    const ExecOp op = exec_op_for_instruction(storage_program, instr);
+    RuntimeQuantResult result;
+    switch (instr.transform_kind) {
+    case StorageTransformKind::Slice:
+        result.bytes_after = (exec_op_slice_axis(op) >= 0)
+            ? slice_axis_to_output(op, plan, weights, tp_rank, tp_size)
+            : slice_rows_to_output(op, plan, weights);
+        return result;
+    case StorageTransformKind::Concat:
+        result.bytes_after = concat_rows_to_output(op, plan, weights);
+        return result;
+    case StorageTransformKind::Quantize:
+        return quantize_runtime_to_output(op, plan, weights, tp_comm, tp_size);
+    case StorageTransformKind::Materialize: {
+        const TensorDecl& out_spec =
+            tensor_spec_for(plan, exec_op_output(op));
+        result.bytes_after = copy_tensor_to_output(
+            weights.get(first_input(op)), weights, out_spec);
+        return result;
+    }
+    case StorageTransformKind::Decode:
+        result.bytes_after = dequantize_to_output(op, plan, weights);
+        return result;
+    case StorageTransformKind::Deinterleave:
+        result.bytes_after =
+            deinterleave_to_outputs(op, plan, weights, tp_rank, tp_size);
+        return result;
+    case StorageTransformKind::Repack:
+        result.bytes_after = repack_layout_to_outputs(op, plan, weights);
+        return result;
+    case StorageTransformKind::Stack:
+        result.bytes_after = stack_groups_to_outputs(op, plan, weights);
+        return result;
+    case StorageTransformKind::None:
+        throw std::runtime_error(
+            "storage program: Transform instruction has no transform kind");
+    }
+    throw std::runtime_error("storage program: unknown transform kind");
+}
+
+void execute_create_view_instruction(
+    const LayoutPlan& plan,
+    const StorageProgram& storage_program,
+    const StorageInstr& instr,
+    WeightStoreBuilder& weights)
+{
+    const ExecOp op = exec_op_for_instruction(storage_program, instr);
+    if (instr.outputs.size() > 1) {
+        register_axis_concat_views(
+            op, storage_writes_for_output(storage_program, op.output_name),
+            plan, weights);
+        return;
+    }
+
+    if (const auto* view =
+            std::get_if<StorageViewPayload>(&instr.payload)) {
+        if (instr.inputs.size() != 1 || instr.outputs.size() != 1) {
+            throw std::runtime_error(
+                "storage program: invalid CreateView payload shape");
+        }
+        const TensorDecl& view_spec =
+            tensor_spec_for(plan, instr.outputs.front());
+        const std::string& backing_name = view_spec.backing_tensor.empty()
+            ? instr.inputs.front()
+            : view_spec.backing_tensor;
+        if (view->axis == 0 && view_spec.shape.size() == 2) {
+            insert_row_view(
+                weights, view_spec, backing_name, view_spec.name,
+                view->start, view->length, view_spec.shape[1]);
+            return;
+        }
+        if (view->axis < 0) {
+            const DeviceTensor& backing = weights.get(backing_name);
+            weights.insert(
+                view_spec.name,
+                DeviceTensor::view(
+                    const_cast<void*>(backing.data()),
+                    backing.dtype(),
+                    view_spec.shape),
+                view_spec);
+            return;
+        }
+    }
+
+    view_or_alias_to_output(op, plan, weights);
+}
+
+void execute_release_instruction(
+    const StorageInstr& instr,
+    WeightStoreBuilder& weights)
+{
+    for (const auto& input : instr.inputs) {
+        weights.erase(input);
+    }
+}
+
+void execute_attach_instruction(
+    const LayoutPlan& plan,
+    const StorageInstr& instr,
+    WeightStoreBuilder& weights)
+{
+    bind_metadata_for_output(
+        exec_op_for_instruction(StorageProgram{}, instr), plan, weights);
 }
 
 }  // namespace
 
-Materializer::Materializer(
-    SafetensorsLoader& loader,
+LoadExecutor::LoadExecutor(
+    SafetensorsCheckpointSource& loader,
     WeightStore& weights,
     int tp_rank,
     int tp_size,
     NcclComm* tp_comm,
     CheckpointByteSource* byte_source,
-    const PhysicalLoadPlan* physical_plan) noexcept
+    const StorageProgram* storage_program) noexcept
     : loader_(loader),
       weights_(weights),
       builder_(weights),
@@ -1582,21 +1875,25 @@ Materializer::Materializer(
       tp_size_(tp_size),
       tp_comm_(tp_comm),
       byte_source_(byte_source),
-      physical_plan_(physical_plan)
+      storage_program_(storage_program)
 {}
 
-MaterializedLoadPlan Materializer::run(const LoadPlan& plan)
+LoadExecutionStats LoadExecutor::run(const LayoutPlan& plan)
 {
-    validate_load_plan(plan);
+    if (storage_program_ == nullptr) {
+        throw std::runtime_error(
+            "load executor: compiled StorageProgram is required");
+    }
+    validate_layout_plan(plan);
 
-    MaterializedLoadPlan result;
+    LoadExecutionStats result;
     result.axis_concat_groups = plan.axis_concat_groups;
     result.planned_tensor_count = plan.tensors.size();
-    if (physical_plan_ != nullptr) {
-        result.planned_physical_peak_bytes =
-            physical_plan_->memory.estimated_peak_bytes;
-        result.planned_physical_temp_bytes =
-            physical_plan_->memory.max_temporary_bytes;
+    if (storage_program_ != nullptr) {
+        result.planned_storage_peak_bytes =
+            storage_program_->memory.estimated_peak_bytes;
+        result.planned_storage_temp_bytes =
+            storage_program_->memory.max_temporary_bytes;
     }
     CudaLoadMemoryTelemetry cuda_memory;
     cuda_memory.sample();
@@ -1604,120 +1901,61 @@ MaterializedLoadPlan Materializer::run(const LoadPlan& plan)
     MmapByteSource mmap_byte_source(loader_);
     CheckpointByteSource& byte_source =
         byte_source_ != nullptr ? *byte_source_ : mmap_byte_source;
+    auto write_executor = make_storage_write_executor(byte_source);
 
-    for (std::size_t op_index = 0; op_index < plan.ops.size(); ++op_index) {
-        const auto& op = plan.ops[op_index];
-        if (is_raw_copy_cast_drop_sequence(plan, op_index)) {
-            result.loaded_bytes += materialize_tiled_raw_cast(
-                plan.ops[op_index],
-                op_index,
-                plan.ops[op_index + 1],
-                plan,
-                loader_,
-                byte_source,
-                builder_,
-                tp_rank_,
-                tp_size_,
-                64ull * 1024ull * 1024ull);
-            op_index += 2;
+    for (std::size_t step_index = 0;
+         step_index < storage_program_->schedule.size();
+         ++step_index) {
+        const StorageInstr& instr = storage_program_->schedule[step_index];
+        if (instr.kind == StorageInstrKind::ExtentWrite) {
+            std::size_t run_end = step_index + 1;
+            while (run_end < storage_program_->schedule.size() &&
+                   storage_program_->schedule[run_end].kind ==
+                       StorageInstrKind::ExtentWrite) {
+                ++run_end;
+            }
+            result.loaded_bytes += materialize_extent_write_instruction_run(
+                plan, *storage_program_, step_index, run_end,
+                *write_executor, builder_);
+            step_index = run_end - 1;
             cuda_memory.sample();
             continue;
         }
-        switch (op.kind) {
-        case LoadOpKind::Copy:
-        case LoadOpKind::Shard:
-        case LoadOpKind::Read:
-            result.loaded_bytes += materialize_byte_writes_for_op(
-                op, op_index, plan, loader_, byte_source, builder_,
-                tp_rank_, tp_size_);
+
+        switch (instr.kind) {
+        case StorageInstrKind::Allocate:
             break;
-        case LoadOpKind::RowRangeShard:
-            result.loaded_bytes += materialize_byte_writes_for_op(
-                op, op_index, plan, loader_, byte_source, builder_,
-                tp_rank_, tp_size_);
+        case StorageInstrKind::ExtentWrite:
             break;
-        case LoadOpKind::GroupedSliceConcat:
-            result.loaded_bytes += materialize_byte_writes_for_op(
-                op, op_index, plan, loader_, byte_source, builder_,
-                tp_rank_, tp_size_);
+        case StorageInstrKind::TileMap:
+            result.loaded_bytes += execute_tile_map_instruction(
+                plan, *storage_program_, instr, byte_source, builder_);
             break;
-        case LoadOpKind::GroupedSlice:
-            result.loaded_bytes += materialize_byte_writes_for_op(
-                op, op_index, plan, loader_, byte_source, builder_,
-                tp_rank_, tp_size_);
-            break;
-        case LoadOpKind::AxisConcat:
-            result.loaded_bytes += materialize_axis_concat(
-                op, op_index, plan, loader_, byte_source, builder_,
-                tp_rank_, tp_size_);
-            break;
-        case LoadOpKind::Slice:
-            result.loaded_bytes += (load_op_slice_axis(op) >= 0)
-                ? slice_axis_to_output(
-                      op, plan, builder_, tp_rank_, tp_size_)
-                : slice_rows_to_output(op, plan, builder_);
-            break;
-        case LoadOpKind::Cast: {
-            const TensorSpec& out_spec = tensor_spec_for(plan, load_op_output(op));
-            cast_tensor_to_output(
-                builder_.get(first_input(op)), builder_, out_spec);
-            result.loaded_bytes += builder_.get(load_op_output(op)).nbytes();
-            break;
-        }
-        case LoadOpKind::Concat:
-            result.loaded_bytes += concat_rows_to_output(op, plan, builder_);
-            break;
-        case LoadOpKind::View:
-        case LoadOpKind::Alias:
-            view_or_alias_to_output(op, plan, builder_);
-            break;
-        case LoadOpKind::Drop:
-            if (load_op_inputs(op).empty()) {
-                builder_.erase(load_op_output(op));
-            } else {
-                for (const auto& input : load_op_inputs(op)) {
-                    builder_.erase(input);
+        case StorageInstrKind::Transform: {
+            const RuntimeQuantResult qr = execute_transform_instruction(
+                plan, *storage_program_, instr, builder_,
+                tp_comm_, tp_rank_, tp_size_);
+            result.loaded_bytes += qr.bytes_after;
+            if (qr.bytes_before != 0 || qr.bytes_after != 0) {
+                if (instr.transform_kind == StorageTransformKind::Quantize) {
+                    result.runtime_quantized_weights += 1;
+                    result.runtime_quant_bytes_before += qr.bytes_before;
+                    result.runtime_quant_bytes_after += qr.bytes_after;
                 }
             }
             break;
-        case LoadOpKind::BindMetadata:
-            bind_metadata_for_output(op, plan, builder_);
-            break;
-        case LoadOpKind::QuantizeRuntime: {
-            const RuntimeQuantResult qr = quantize_runtime_to_output(
-                op, plan, builder_, tp_comm_, tp_size_);
-            result.loaded_bytes += qr.bytes_after;
-            result.runtime_quantized_weights += 1;
-            result.runtime_quant_bytes_before += qr.bytes_before;
-            result.runtime_quant_bytes_after += qr.bytes_after;
-            break;
         }
-        case LoadOpKind::Materialize: {
-            const TensorSpec& out_spec = tensor_spec_for(plan, load_op_output(op));
-            result.loaded_bytes += copy_tensor_to_output(
-                builder_.get(first_input(op)), builder_, out_spec);
+        case StorageInstrKind::Attach:
+            execute_attach_instruction(plan, instr, builder_);
             break;
-        }
-        case LoadOpKind::Dequantize:
-            result.loaded_bytes += dequantize_to_output(op, plan, builder_);
+        case StorageInstrKind::CreateView:
+            execute_create_view_instruction(
+                plan, *storage_program_, instr, builder_);
             break;
-        case LoadOpKind::Deinterleave:
-            result.loaded_bytes += deinterleave_to_outputs(
-                op, plan, builder_, tp_rank_, tp_size_);
+        case StorageInstrKind::Release:
+            execute_release_instruction(instr, builder_);
             break;
-        case LoadOpKind::RepackLayout:
-            result.loaded_bytes += repack_layout_to_outputs(
-                op, plan, builder_);
-            break;
-        case LoadOpKind::StackGroups:
-            if (!load_op_sources(op).empty()) {
-                result.loaded_bytes += materialize_byte_writes_for_op(
-                    op, op_index, plan, loader_, byte_source, builder_,
-                    tp_rank_, tp_size_);
-            } else {
-                result.loaded_bytes += stack_groups_to_outputs(
-                    op, plan, builder_);
-            }
+        case StorageInstrKind::Finalize:
             break;
         }
         cuda_memory.sample();
@@ -1739,19 +1977,19 @@ MaterializedLoadPlan Materializer::run(const LoadPlan& plan)
     return result;
 }
 
-MaterializedLoadPlan materialize_load_plan(
-    const LoadPlan& plan,
-    SafetensorsLoader& loader,
+LoadExecutionStats execute_layout_plan(
+    const LayoutPlan& plan,
+    SafetensorsCheckpointSource& loader,
     WeightStore& weights,
     int tp_rank,
     int tp_size,
     NcclComm* tp_comm,
     CheckpointByteSource* byte_source,
-    const PhysicalLoadPlan* physical_plan)
+    const StorageProgram* storage_program)
 {
-    return Materializer(
+    return LoadExecutor(
         loader, weights, tp_rank, tp_size, tp_comm,
-        byte_source, physical_plan).run(plan);
+        byte_source, storage_program).run(plan);
 }
 
 }  // namespace pie_cuda_driver

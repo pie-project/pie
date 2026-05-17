@@ -58,7 +58,7 @@ def bench_env(base: dict[str, str], *, plan_dump: Path | None = None) -> dict[st
         paths.append(env["PYTHONPATH"])
     env["PYTHONPATH"] = os.pathsep.join(paths)
     if plan_dump is not None:
-        env["PIE_CUDA_LOAD_PLAN_DUMP"] = str(plan_dump)
+        env["PIE_CUDA_LAYOUT_PLAN_DUMP"] = str(plan_dump)
     return env
 
 
@@ -92,9 +92,9 @@ def parse_pie_loader_log(log_path: Path) -> dict[str, Any]:
                 "cuda_memory_samples": int(memory.group(7)),
             }
         )
-    physical = re.search(r"physical load compiler: (.*)", text)
-    if physical:
-        out["physical_summary"] = physical.group(1).strip()
+    storage = re.search(r"storage compiler: (.*)", text)
+    if storage:
+        out["storage_summary"] = storage.group(1).strip()
     source = re.search(r"checkpoint byte source: (\w+) \(policy=(\w+)\)", text)
     if source:
         out["checkpoint_byte_source"] = source.group(1)
@@ -107,6 +107,38 @@ def load_bench_json(path: Path) -> dict[str, Any]:
         return {}
     with path.open("r", encoding="utf-8") as f:
         return json.load(f)
+
+
+def parse_plan_dump(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        return {}
+    with path.open("r", encoding="utf-8") as f:
+        data = json.load(f)
+    algebra = data.get("algebra", {})
+    storage = data.get("storage", {})
+    expr_kinds: dict[str, int] = {}
+    for expr in algebra.get("exprs", []):
+        kind = str(expr.get("kind", ""))
+        expr_kinds[kind] = expr_kinds.get(kind, 0) + 1
+    instr_kinds: dict[str, int] = {}
+    transform_kinds: dict[str, int] = {}
+    for instr in storage.get("schedule", []):
+        kind = str(instr.get("kind", ""))
+        transform = str(instr.get("transform_kind", ""))
+        instr_kinds[kind] = instr_kinds.get(kind, 0) + 1
+        if transform and transform != "None":
+            transform_kinds[transform] = transform_kinds.get(transform, 0) + 1
+    return {
+        "layout_summary": data.get("summary"),
+        "storage_summary": storage.get("summary"),
+        "algebra_expr_count": len(algebra.get("exprs", [])),
+        "algebra_binding_count": len(algebra.get("bindings", [])),
+        "algebra_expr_kinds": expr_kinds,
+        "storage_instr_count": len(storage.get("schedule", [])),
+        "storage_instr_kinds": instr_kinds,
+        "storage_transform_kinds": transform_kinds,
+        "storage_memory": storage.get("memory", {}),
+    }
 
 
 def bench_cmd(args: argparse.Namespace, engine: str, mode: str, model: str, json_out: Path) -> list[str]:
@@ -214,6 +246,14 @@ def write_markdown(path: Path, evidence: dict[str, Any]) -> None:
                 f", load={loader.get('load_time_ms')} ms, "
                 f"actual_cuda_delta={loader.get('actual_cuda_delta_mib')} MiB"
             )
+        plan = run.get("plan_dump_summary", {})
+        if plan:
+            memory = plan.get("storage_memory", {})
+            metric += (
+                f", instr={plan.get('storage_instr_count')}, "
+                f"extent_writes={memory.get('extent_write_count')}, "
+                f"tile_maps={memory.get('tile_map_count')}"
+            )
         lines.append(
             f"- `{status}` `{run['engine']}` `{run['mode']}` `{run['model']}`{metric}"
         )
@@ -230,6 +270,11 @@ def main() -> None:
     parser.add_argument("--modes", default="latency,tput")
     parser.add_argument("--output-dir", default=None)
     parser.add_argument("--skip-benches", action="store_true")
+    parser.add_argument(
+        "--cuda-build-dir",
+        default=os.environ.get("PIE_CUDA_BUILD_DIR"),
+        help="CMake build directory containing CUDA loader tests.",
+    )
     parser.add_argument("--timeout-s", type=float, default=3600.0)
     parser.add_argument("--requests", type=int, default=8)
     parser.add_argument("--num-requests", type=int, default=64)
@@ -274,10 +319,20 @@ def main() -> None:
     stamp = dt.datetime.now(dt.UTC).strftime("%Y%m%dT%H%M%SZ")
     out_dir = Path(args.output_dir) if args.output_dir else ROOT / ".tmp" / "loader_evidence" / stamp
     out_dir.mkdir(parents=True, exist_ok=True)
+    cuda_build_dir = (
+        Path(args.cuda_build_dir)
+        if args.cuda_build_dir
+        else (
+            ROOT / "driver" / "cuda" / "build"
+            if (ROOT / "driver" / "cuda" / "build").exists()
+            else Path("/tmp/pie-cuda-loader-build")
+        )
+    )
 
     evidence: dict[str, Any] = {
         "generated_at": dt.datetime.now(dt.UTC).isoformat(),
         "root": str(ROOT),
+        "cuda_build_dir": str(cuda_build_dir),
         "models": models,
         "tests": [],
         "benchmarks": [],
@@ -286,9 +341,9 @@ def main() -> None:
     test_cmd = [
         "ctest",
         "--test-dir",
-        str(ROOT / "driver" / "cuda" / "build"),
+        str(cuda_build_dir),
         "-R",
-        "load_plan|loader_golden",
+        "layout_plan|loader_golden",
         "--output-on-failure",
     ]
     evidence["tests"].append(
@@ -341,6 +396,7 @@ def main() -> None:
                     )
                     if engine == "pie":
                         run["plan_dump"] = str(plan_dump)
+                        run["plan_dump_summary"] = parse_plan_dump(plan_dump)
                         run["server_log"] = str(pie_server_log)
                         run["pie_loader"] = parse_pie_loader_log(pie_server_log)
                     evidence["benchmarks"].append(run)

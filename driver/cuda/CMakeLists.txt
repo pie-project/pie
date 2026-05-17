@@ -80,12 +80,22 @@ add_library(pie_driver_cuda_lib STATIC
   src/model/loaded_model.cpp
   src/model/bound_model.cpp
   ../common/src/safetensors_manifest.cpp
+  src/loader/gguf_source.cpp
   src/loader/hf_config.cpp
   src/loader/byte_source.cpp
-  src/loader/load_plan.cpp
-  src/loader/materializer.cpp
+  src/loader/layout_optimizer.cpp
+  src/loader/layout_plan.cpp
+  src/loader/layout_planner.cpp
+  src/loader/layout_typecheck.cpp
+  src/loader/load_executor.cpp
+  src/loader/model_adapter.cpp
+  src/loader/model_family.cpp
   src/loader/model_schema.cpp
-  src/loader/physical_load_plan.cpp
+  src/loader/semantic_graph.cpp
+  src/loader/storage_compiler.cpp
+  src/loader/storage_executor.cpp
+  src/loader/storage_program.cpp
+  src/loader/runtime_abi.cpp
   src/loader/safetensors.cpp
   src/model/qwen3.cpp
   src/model/qwen3_forward.cpp
@@ -228,15 +238,24 @@ target_include_directories(test_driver_common PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/../common/include)
 target_link_libraries(test_driver_common PRIVATE nlohmann_json::nlohmann_json)
 
-add_executable(test_load_plan
-  tests/test_load_plan.cpp
-  src/loader/load_plan.cpp
+add_executable(test_layout_plan
+  tests/test_layout_plan.cpp
+  src/loader/gguf_source.cpp
+  src/loader/layout_optimizer.cpp
+  src/loader/layout_plan.cpp
+  src/loader/layout_planner.cpp
+  src/loader/layout_typecheck.cpp
+  src/loader/model_adapter.cpp
+  src/loader/model_family.cpp
   src/loader/model_schema.cpp
-  src/loader/physical_load_plan.cpp)
-target_include_directories(test_load_plan PRIVATE
+  src/loader/semantic_graph.cpp
+  src/loader/storage_compiler.cpp
+  src/loader/storage_program.cpp
+  src/loader/runtime_abi.cpp)
+target_include_directories(test_layout_plan PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/src
   ${CMAKE_CURRENT_SOURCE_DIR}/../common/include)
-target_link_libraries(test_load_plan PRIVATE tomlplusplus::tomlplusplus)
+target_link_libraries(test_layout_plan PRIVATE tomlplusplus::tomlplusplus)
 
 add_executable(test_loader_golden tests/test_loader_golden.cpp)
 target_include_directories(test_loader_golden PRIVATE
@@ -247,7 +266,7 @@ target_link_libraries(test_loader_golden PRIVATE pie_driver_cuda_lib)
 enable_testing()
 add_test(NAME brle COMMAND test_brle)
 add_test(NAME driver_common COMMAND test_driver_common)
-add_test(NAME load_plan COMMAND test_load_plan)
+add_test(NAME layout_plan COMMAND test_layout_plan)
 add_test(NAME loader_golden COMMAND test_loader_golden)
 
 target_link_libraries(pie_driver_cuda_lib PUBLIC

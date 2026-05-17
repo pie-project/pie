@@ -7,8 +7,11 @@
 #include <unordered_map>
 #include <unordered_set>
 
-#include <pie_driver_common/tensor_names.hpp>
-
+#include "loader/model_adapter.hpp"
+#include "loader/model_family.hpp"
+#include "loader/layout_optimizer.hpp"
+#include "loader/layout_planner.hpp"
+#include "loader/runtime_abi.hpp"
 #include "loader/safetensors.hpp"
 
 namespace pie_cuda_driver {
@@ -20,25 +23,8 @@ bool ends_with(const std::string& s, const char* suffix) {
     return s.size() >= n && s.compare(s.size() - n, n, suffix) == 0;
 }
 
-bool is_qwen3_5_moe_arch(const std::string& mt) {
-    return mt == "qwen3_5_moe" || mt == "qwen3_5_moe_text"
-        || mt == "qwen3_moe";
-}
-
-bool supports_dense_llama_packed_load(const HfConfig& hf, const Config& boot_cfg) {
-    if (!hf.quant_method.empty()) return false;
-    if (!boot_cfg.model.runtime_quant.empty()) return false;
-
-    const std::string& mt = hf.model_type;
-    return mt == "qwen3"
-        || mt == "qwen2"
-        || mt == "llama" || mt == "llama3"
-        || mt == "mistral" || mt == "mistral3" || mt == "ministral3"
-        || mt == "olmo2" || mt == "olmo3";
-}
-
 bool can_pack_2d_bf16_group(
-    const TensorMetadataSource& loader,
+    const CheckpointSource& loader,
     const std::vector<std::string>& raw_names)
 {
     if (raw_names.empty()) return false;
@@ -84,7 +70,7 @@ std::vector<std::int64_t> sharded_shape(
 }
 
 void register_tensor_spec(
-    LoadPlan& plan,
+    LayoutPlan& plan,
     std::string name,
     DType dtype,
     std::vector<std::int64_t> shape,
@@ -94,7 +80,7 @@ void register_tensor_spec(
     std::string backing_tensor = {},
     QuantSpec quant = {})
 {
-    TensorSpec spec;
+    TensorDecl spec;
     spec.name = std::move(name);
     spec.dtype = dtype;
     spec.shape = std::move(shape);
@@ -130,7 +116,173 @@ void register_tensor_spec(
     }
 }
 
-void estimate_temporary_bytes(LoadPlan& plan, std::uint64_t bytes) {
+LayoutExprId add_expr(LayoutPlan& plan, LayoutExpr expr) {
+    const LayoutExprId id = plan.algebra.exprs.size();
+    plan.algebra.exprs.push_back(std::move(expr));
+    return id;
+}
+
+LayoutExpr make_expr(LayoutExprKind kind, TensorDecl decl) {
+    LayoutExpr expr;
+    expr.kind = kind;
+    expr.decl = std::move(decl);
+    expr.dtype = expr.decl.dtype;
+    expr.encoding = expr.decl.quant;
+    return expr;
+}
+
+TensorDecl tensor_decl_for(LayoutPlan& plan, const std::string& name) {
+    const auto it = plan.tensors.find(name);
+    if (it == plan.tensors.end()) {
+        throw std::runtime_error(
+            "load schema: missing TensorDecl for algebra tensor '" + name + "'");
+    }
+    return it->second;
+}
+
+LayoutExprId source_expr(
+    LayoutPlan& plan,
+    const std::string& raw_name,
+    TensorDecl decl)
+{
+    LayoutExpr expr = make_expr(LayoutExprKind::Source, std::move(decl));
+    expr.raw_name = raw_name;
+    return add_expr(plan, std::move(expr));
+}
+
+LayoutExprId partition_expr(
+    LayoutPlan& plan,
+    LayoutExprId input,
+    TensorDecl decl,
+    int shard_axis,
+    int tp_size)
+{
+    if (tp_size <= 1 || shard_axis < 0) return input;
+    LayoutExpr expr = make_expr(LayoutExprKind::Partition, std::move(decl));
+    expr.inputs = {input};
+    expr.axis = shard_axis;
+    expr.partitions = tp_size;
+    return add_expr(plan, std::move(expr));
+}
+
+LayoutExprId select_expr(
+    LayoutPlan& plan,
+    LayoutExprId input,
+    TensorDecl decl,
+    int axis,
+    std::int64_t start,
+    std::int64_t length,
+    int shard_axis = -1)
+{
+    LayoutExpr expr = make_expr(LayoutExprKind::Select, std::move(decl));
+    expr.inputs = {input};
+    expr.axis = axis;
+    expr.start = start;
+    expr.length = length;
+    expr.partitions = shard_axis;
+    return add_expr(plan, std::move(expr));
+}
+
+LayoutExprId realize_expr(
+    LayoutPlan& plan,
+    const std::string& runtime_name,
+    LayoutExprId input,
+    TensorDecl decl)
+{
+    LayoutExpr expr = make_expr(LayoutExprKind::Realize, std::move(decl));
+    expr.inputs = {input};
+    expr.runtime_name = runtime_name;
+    const LayoutExprId root = add_expr(plan, std::move(expr));
+    plan.algebra.bindings.push_back(LayoutBinding{
+        .runtime_name = runtime_name,
+        .root = root,
+    });
+    return root;
+}
+
+LayoutExprId source_realize_expr(
+    LayoutPlan& plan,
+    const std::string& raw_name,
+    const std::string& output_name,
+    int shard_axis,
+    int tp_size)
+{
+    TensorDecl decl = tensor_decl_for(plan, output_name);
+    LayoutExprId expr = source_expr(plan, raw_name, decl);
+    expr = partition_expr(plan, expr, decl, shard_axis, tp_size);
+    return realize_expr(plan, output_name, expr, std::move(decl));
+}
+
+LayoutExprId decode_realize_expr(
+    LayoutPlan& plan,
+    const std::string& output_name,
+    std::vector<LayoutExprId> inputs)
+{
+    TensorDecl decl = tensor_decl_for(plan, output_name);
+    LayoutExpr decode = make_expr(LayoutExprKind::Decode, decl);
+    decode.inputs = std::move(inputs);
+    decode.runtime_name = output_name;
+    const LayoutExprId decoded = add_expr(plan, std::move(decode));
+    return realize_expr(plan, output_name, decoded, std::move(decl));
+}
+
+LayoutExprId unzip_realize_expr(
+    LayoutPlan& plan,
+    const std::string& first_output,
+    const std::string& second_output,
+    LayoutExprId input,
+    int shard_axis)
+{
+    TensorDecl decl = tensor_decl_for(plan, first_output);
+    LayoutExpr unzip = make_expr(LayoutExprKind::Unzip, decl);
+    unzip.inputs = {input};
+    unzip.runtime_name = first_output;
+    unzip.secondary_runtime_name = second_output;
+    unzip.axis = shard_axis;
+    const LayoutExprId unzipped = add_expr(plan, std::move(unzip));
+    realize_expr(plan, first_output, unzipped, decl);
+    TensorDecl second_decl = tensor_decl_for(plan, second_output);
+    return realize_expr(plan, second_output, unzipped, std::move(second_decl));
+}
+
+LayoutExprId attach_metadata_expr(
+    LayoutPlan& plan,
+    const std::string& output_name,
+    LayoutExprId input)
+{
+    TensorDecl decl = tensor_decl_for(plan, output_name);
+    LayoutExpr attach = make_expr(LayoutExprKind::Attach, std::move(decl));
+    attach.inputs = {input};
+    attach.runtime_name = output_name;
+    return add_expr(plan, std::move(attach));
+}
+
+void release_expr(LayoutPlan& plan, std::string name, std::vector<LayoutExprId> inputs) {
+    TensorDecl decl;
+    decl.name = std::move(name);
+    LayoutExpr release = make_expr(LayoutExprKind::Release, std::move(decl));
+    release.inputs = std::move(inputs);
+    release.runtime_name = release.decl.name;
+    (void)add_expr(plan, std::move(release));
+}
+
+void register_tensor_contract(
+    LayoutPlan& plan,
+    RuntimeTensorContract contract)
+{
+    register_tensor_spec(
+        plan,
+        std::move(contract.name),
+        contract.dtype,
+        std::move(contract.shape),
+        contract.layout,
+        contract.ownership,
+        contract.parallel,
+        std::move(contract.backing_tensor),
+        std::move(contract.quant));
+}
+
+void estimate_temporary_bytes(LayoutPlan& plan, std::uint64_t bytes) {
     plan.memory.max_temporary_bytes =
         std::max(plan.memory.max_temporary_bytes, bytes);
     plan.memory.estimated_peak_bytes = std::max(
@@ -147,8 +299,8 @@ bool normalizes_to_bf16(DType dtype) noexcept {
 }
 
 void add_owned_producer(
-    LoadPlan& plan,
-    LoadOp producer,
+    LayoutPlan& plan,
+    LayoutOp producer,
     const std::string& output_name,
     DType source_dtype,
     const std::vector<std::int64_t>& shape,
@@ -156,7 +308,7 @@ void add_owned_producer(
     TensorParallelKind parallel)
 {
     if (!normalizes_to_bf16(source_dtype) || ends_with(output_name, "_scale_inv")) {
-        set_load_op_output(producer, output_name);
+        set_layout_op_output(producer, output_name);
         plan.ops.push_back(std::move(producer));
         register_tensor_spec(
             plan, output_name, source_dtype, shape, layout,
@@ -165,7 +317,7 @@ void add_owned_producer(
     }
 
     const std::string tmp_name = output_name + ".__dtype_source";
-    set_load_op_output(producer, tmp_name);
+    set_layout_op_output(producer, tmp_name);
     plan.ops.push_back(std::move(producer));
 
     register_tensor_spec(
@@ -176,28 +328,28 @@ void add_owned_producer(
         TensorOwnershipKind::Owned, parallel);
 
     plan.ops.push_back(make_tensor_op(
-        LoadOpKind::Cast, output_name, {tmp_name}));
+        LayoutOpKind::Cast, output_name, {tmp_name}));
     plan.ops.push_back(make_tensor_op(
-        LoadOpKind::Drop, tmp_name + ".__drop", {tmp_name}));
+        LayoutOpKind::Drop, tmp_name + ".__drop", {tmp_name}));
 
     estimate_temporary_bytes(plan, tensor_nbytes(source_dtype, shape));
 }
 
 bool try_add_packed_axis_group(
-    LoadPlan& plan,
-    const TensorMetadataSource& loader,
-    const LogicalTensorGroup& group,
+    LayoutPlan& plan,
+    const CheckpointSource& loader,
+    const SemanticGroup& group,
     std::unordered_set<std::string>& consumed_raw,
     int tp_size)
 {
-    const bool is_qkv = group.kind == LogicalTensorGroupKind::PackedQkv;
-    const bool is_gate_up = group.kind == LogicalTensorGroupKind::PackedGateUp;
+    const bool is_qkv = group.kind == SemanticGroupKind::PackedQkv;
+    const bool is_gate_up = group.kind == SemanticGroupKind::PackedGateUp;
     if (!is_qkv && !is_gate_up) return false;
     const std::size_t expected = is_qkv ? 3 : 2;
     if (group.raw_names.size() != expected ||
         group.runtime_names.size() != expected) {
         throw std::runtime_error(
-            "load schema: packed logical group has wrong arity at '" +
+            "load schema: packed semantic group has wrong arity at '" +
             group.runtime_base + "'");
     }
     for (const auto& raw : group.raw_names) {
@@ -205,9 +357,13 @@ bool try_add_packed_axis_group(
     }
     if (!can_pack_2d_bf16_group(loader, group.raw_names)) return false;
 
-    const std::string packed_name = is_qkv
-        ? group.runtime_base + ".qkv_proj.fused.weight"
-        : group.runtime_base + ".gate_up_proj.fused.weight";
+    const auto& runtime_abi = pie_cuda_runtime_abi();
+    const auto packed = runtime_abi.packed_projection(
+        is_qkv
+            ? RuntimeProjectionPackKind::AttentionQkvRows
+            : RuntimeProjectionPackKind::MlpGateUpRows,
+        group.runtime_base);
+    const std::string& packed_name = packed.storage_name;
     std::vector<TensorSourceRef> sources;
     sources.reserve(expected);
     for (std::size_t i = 0; i < expected; ++i) {
@@ -226,25 +382,33 @@ bool try_add_packed_axis_group(
         rows += info.shape[0] / tp_size;
     }
 
-    register_tensor_spec(
-        plan, packed_name, loader.info(group.raw_names[0]).dtype,
-        {rows, cols}, TensorLayoutKind::AxisConcatenated,
-        TensorOwnershipKind::Owned, TensorParallelKind::Column);
+    register_tensor_contract(
+        plan,
+        runtime_abi.tensor_contract(
+            packed_name,
+            loader.info(group.raw_names[0]).dtype,
+            {rows, cols},
+            packed.storage_layout,
+            TensorOwnershipKind::Owned,
+            TensorParallelKind::Column));
     for (std::size_t i = 0; i < expected; ++i) {
         const auto& info = loader.info(group.raw_names[i]);
-        register_tensor_spec(
-            plan, group.runtime_names[i], info.dtype,
-            {info.shape[0] / tp_size, info.shape[1]},
-            TensorLayoutKind::View, TensorOwnershipKind::BorrowedView,
-            TensorParallelKind::Column, packed_name);
+        register_tensor_contract(
+            plan,
+            runtime_abi.view_contract(
+                group.runtime_names[i],
+                info.dtype,
+                {info.shape[0] / tp_size, info.shape[1]},
+                packed_name,
+                TensorParallelKind::Column));
         consumed_raw.insert(group.raw_names[i]);
     }
     return true;
 }
 
 const std::string& group_runtime_name_for_role(
-    const LogicalTensorGroup& group,
-    LogicalTensorRole role)
+    const SemanticGroup& group,
+    SemanticRole role)
 {
     for (std::size_t i = 0; i < group.runtime_roles.size(); ++i) {
         if (group.runtime_roles[i] == role && i < group.runtime_names.size()) {
@@ -252,19 +416,19 @@ const std::string& group_runtime_name_for_role(
         }
     }
     throw std::runtime_error(
-        "load schema: logical group '" + group.runtime_base +
+        "load schema: semantic group '" + group.runtime_base +
         "' does not declare expected runtime role");
 }
 
 bool try_add_row_range_split_group(
-    LoadPlan& plan,
+    LayoutPlan& plan,
     const HfConfig& hf,
-    const TensorMetadataSource& loader,
-    const LogicalTensorGroup& group,
+    const CheckpointSource& loader,
+    const SemanticGroup& group,
     std::unordered_set<std::string>& consumed_raw,
     int tp_size)
 {
-    if (group.kind != LogicalTensorGroupKind::RowRangeSplit) return false;
+    if (group.kind != SemanticGroupKind::RowRangeSplit) return false;
     if (group.raw_names.size() != 1 || group.raw_roles.size() != 1) {
         throw std::runtime_error(
             "load schema: row-range split group has wrong source arity at '" +
@@ -273,29 +437,29 @@ bool try_add_row_range_split_group(
     const std::string& raw_name = group.raw_names[0];
     if (consumed_raw.contains(raw_name)) return true;
     const TensorInfo& info = loader.info(raw_name);
-    const LogicalTensorRole fused_role = group.raw_roles[0];
+    const SemanticRole fused_role = group.raw_roles[0];
 
     struct SplitPart {
-        LogicalTensorRole role;
+        SemanticRole role;
         std::int64_t offset;
         std::int64_t rows;
     };
     std::vector<SplitPart> parts;
-    if (fused_role == LogicalTensorRole::AttentionQkv) {
+    if (fused_role == SemanticRole::AttentionQkv) {
         const std::int64_t Hq =
             static_cast<std::int64_t>(hf.num_attention_heads) * hf.head_dim;
         const std::int64_t Hk =
             static_cast<std::int64_t>(hf.num_key_value_heads) * hf.head_dim;
         parts = {
-            {LogicalTensorRole::AttentionQ, 0, Hq},
-            {LogicalTensorRole::AttentionK, Hq, Hk},
-            {LogicalTensorRole::AttentionV, Hq + Hk, Hk},
+            {SemanticRole::AttentionQ, 0, Hq},
+            {SemanticRole::AttentionK, Hq, Hk},
+            {SemanticRole::AttentionV, Hq + Hk, Hk},
         };
-    } else if (fused_role == LogicalTensorRole::MlpGateUp) {
+    } else if (fused_role == SemanticRole::MlpGateUp) {
         const std::int64_t I = hf.intermediate_size;
         parts = {
-            {LogicalTensorRole::MlpGate, 0, I},
-            {LogicalTensorRole::MlpUp, I, I},
+            {SemanticRole::MlpGate, 0, I},
+            {SemanticRole::MlpUp, I, I},
         };
     } else {
         return false;
@@ -314,7 +478,7 @@ bool try_add_row_range_split_group(
         }
         const std::string& output_name =
             group_runtime_name_for_role(group, part.role);
-        LoadOp op = make_row_range_shard_op(
+        LayoutOp op = make_row_range_shard_op(
             /*output_name=*/{}, raw_name, part.offset, part.rows);
         add_owned_producer(
             plan, std::move(op), output_name, info.dtype,
@@ -326,12 +490,12 @@ bool try_add_row_range_split_group(
     return true;
 }
 
-void add_copy(LoadPlan& plan, const std::string& raw_name,
+void add_copy(LayoutPlan& plan, const std::string& raw_name,
               const std::string& output_name, const TensorInfo& info,
               int shard_axis, int tp_size)
 {
-    LoadOp op = make_raw_load_op(
-        LoadOpKind::Copy, /*output_name=*/{}, raw_name, shard_axis);
+    LayoutOp op = make_raw_load_op(
+        LayoutOpKind::Copy, /*output_name=*/{}, raw_name, shard_axis);
     add_owned_producer(
         plan, std::move(op), output_name, info.dtype,
         sharded_shape(info.shape, shard_axis, tp_size, output_name),
@@ -346,15 +510,15 @@ bool runtime_quant_model_supported(const std::string& mt) {
         || mt == "qwen3_5" || mt == "qwen3_5_text";
 }
 
-bool runtime_quantizable_role(LogicalTensorRole role) {
+bool runtime_quantizable_role(SemanticRole role) {
     switch (role) {
-    case LogicalTensorRole::AttentionQ:
-    case LogicalTensorRole::AttentionK:
-    case LogicalTensorRole::AttentionV:
-    case LogicalTensorRole::AttentionO:
-    case LogicalTensorRole::MlpGate:
-    case LogicalTensorRole::MlpUp:
-    case LogicalTensorRole::MlpDown:
+    case SemanticRole::AttentionQ:
+    case SemanticRole::AttentionK:
+    case SemanticRole::AttentionV:
+    case SemanticRole::AttentionO:
+    case SemanticRole::MlpGate:
+    case SemanticRole::MlpUp:
+    case SemanticRole::MlpDown:
         return true;
     default:
         return false;
@@ -387,8 +551,8 @@ bool runtime_quant_enabled_for_plan(
 }
 
 void add_runtime_quantized_copy(
-    LoadPlan& plan,
-    const LogicalTensor& logical,
+    LayoutPlan& plan,
+    const SemanticTensor& semantic,
     const TensorInfo& info,
     const Config& boot_cfg,
     int shard_axis,
@@ -397,22 +561,23 @@ void add_runtime_quantized_copy(
     if (info.shape.size() != 2) {
         throw std::runtime_error(
             "load schema: runtime quant source is not 2-D: " +
-            logical.runtime_name);
+            semantic.runtime_name);
     }
 
     const std::string tmp_name =
-        logical.runtime_name + ".__runtime_quant_source";
+        semantic.runtime_name + ".__runtime_quant_source";
     plan.ops.push_back(make_raw_load_op(
-        LoadOpKind::Copy, tmp_name, logical.raw_name, shard_axis));
+        LayoutOpKind::Copy, tmp_name, semantic.raw_name, shard_axis));
 
     auto final_shape =
-        sharded_shape(info.shape, shard_axis, tp_size, logical.runtime_name);
+        sharded_shape(info.shape, shard_axis, tp_size, semantic.runtime_name);
     const bool is_int8 = boot_cfg.model.runtime_quant == "int8";
     const DType q_dtype = is_int8 ? DType::INT8 : DType::FP8_E4M3;
     const QuantFormat q_format = is_int8
         ? QuantFormat::RuntimeInt8
         : QuantFormat::RuntimeFp8E4M3;
-    const std::string scale_name = logical.runtime_name + "_scale_inv";
+    const std::string scale_name =
+        pie_cuda_runtime_abi().quant_scale_inv_name(semantic.runtime_name);
     const TensorParallelKind parallel = parallel_kind_from_axis(shard_axis);
 
     register_tensor_spec(
@@ -428,7 +593,7 @@ void add_runtime_quantized_copy(
     quant.scale_tensor = scale_name;
 
     register_tensor_spec(
-        plan, logical.runtime_name, q_dtype, final_shape,
+        plan, semantic.runtime_name, q_dtype, final_shape,
         TensorLayoutKind::QuantPacked, TensorOwnershipKind::Owned,
         parallel, /*backing_tensor=*/{}, std::move(quant));
     register_tensor_spec(
@@ -437,12 +602,12 @@ void add_runtime_quantized_copy(
         parallel);
 
     plan.ops.push_back(make_tensor_op(
-        LoadOpKind::QuantizeRuntime, logical.runtime_name,
+        LayoutOpKind::QuantizeRuntime, semantic.runtime_name,
         {tmp_name}, scale_name));
     plan.ops.push_back(make_tensor_op(
-        LoadOpKind::BindMetadata, logical.runtime_name));
+        LayoutOpKind::AttachMetadata, semantic.runtime_name));
     plan.ops.push_back(make_tensor_op(
-        LoadOpKind::Drop, tmp_name + ".__drop", {tmp_name}));
+        LayoutOpKind::Drop, tmp_name + ".__drop", {tmp_name}));
 
     std::uint64_t source_numel = 1;
     for (const auto dim : final_shape) {
@@ -459,14 +624,14 @@ void add_runtime_quantized_copy(
 
 bool is_compressed_fp8_scale_companion(
     const HfConfig& hf,
-    const TensorMetadataSource& loader,
-    const LogicalTensor& logical)
+    const CheckpointSource& loader,
+    const SemanticTensor& semantic)
 {
     if (hf.quant_method != "compressed-tensors") return false;
     constexpr const char* scale_suffix = "_scale";
-    if (!ends_with(logical.raw_name, scale_suffix)) return false;
+    if (!ends_with(semantic.raw_name, scale_suffix)) return false;
     const std::string raw_weight =
-        logical.raw_name.substr(0, logical.raw_name.size() -
+        semantic.raw_name.substr(0, semantic.raw_name.size() -
                                       std::strlen(scale_suffix));
     return loader.contains(raw_weight) &&
            loader.info(raw_weight).dtype == DType::FP8_E4M3;
@@ -474,22 +639,22 @@ bool is_compressed_fp8_scale_companion(
 
 bool is_compressed_quant_companion(
     const HfConfig& hf,
-    const TensorMetadataSource& loader,
-    const LogicalTensor& logical)
+    const CheckpointSource& loader,
+    const SemanticTensor& semantic)
 {
-    if (is_compressed_fp8_scale_companion(hf, loader, logical)) {
+    if (is_compressed_fp8_scale_companion(hf, loader, semantic)) {
         return true;
     }
     if (hf.quant_method != "compressed-tensors") return false;
     constexpr const char* scale_suffix = "_scale";
     constexpr const char* zero_suffix = "_zero_point";
     const char* matched = nullptr;
-    if (ends_with(logical.raw_name, scale_suffix)) matched = scale_suffix;
-    if (ends_with(logical.raw_name, zero_suffix)) matched = zero_suffix;
+    if (ends_with(semantic.raw_name, scale_suffix)) matched = scale_suffix;
+    if (ends_with(semantic.raw_name, zero_suffix)) matched = zero_suffix;
     if (matched == nullptr) return false;
 
     const std::string raw_weight =
-        logical.raw_name.substr(0, logical.raw_name.size() -
+        semantic.raw_name.substr(0, semantic.raw_name.size() -
                                       std::strlen(matched));
     return loader.contains(raw_weight) &&
            (loader.info(raw_weight).dtype == DType::FP8_E4M3 ||
@@ -497,23 +662,23 @@ bool is_compressed_quant_companion(
 }
 
 bool is_fp8_scale_inv_companion(
-    const TensorMetadataSource& loader,
-    const LogicalTensor& logical)
+    const CheckpointSource& loader,
+    const SemanticTensor& semantic)
 {
     constexpr const char* scale_suffix = "_scale_inv";
-    if (!ends_with(logical.raw_name, scale_suffix)) return false;
+    if (!ends_with(semantic.raw_name, scale_suffix)) return false;
     const std::string raw_weight =
-        logical.raw_name.substr(0, logical.raw_name.size() -
+        semantic.raw_name.substr(0, semantic.raw_name.size() -
                                       std::strlen(scale_suffix));
     return loader.contains(raw_weight) &&
            loader.info(raw_weight).dtype == DType::FP8_E4M3;
 }
 
 bool try_add_compressed_fp8_weight(
-    LoadPlan& plan,
+    LayoutPlan& plan,
     const HfConfig& hf,
-    const TensorMetadataSource& loader,
-    const LogicalTensor& logical,
+    const CheckpointSource& loader,
+    const SemanticTensor& semantic,
     const TensorInfo& info,
     int shard_axis,
     int tp_size,
@@ -521,11 +686,11 @@ bool try_add_compressed_fp8_weight(
 {
     if (hf.quant_method != "compressed-tensors" ||
         info.dtype != DType::FP8_E4M3 ||
-        !ends_with(logical.runtime_name, ".weight")) {
+        !ends_with(semantic.runtime_name, ".weight")) {
         return false;
     }
 
-    const std::string scale_raw = logical.raw_name + "_scale";
+    const std::string scale_raw = semantic.raw_name + "_scale";
     if (!loader.contains(scale_raw)) return false;
     const TensorInfo& scale_info = loader.info(scale_raw);
     if (scale_info.dtype != DType::BF16 && scale_info.dtype != DType::FP32) {
@@ -536,19 +701,20 @@ bool try_add_compressed_fp8_weight(
     }
 
     const auto final_shape =
-        sharded_shape(info.shape, shard_axis, tp_size, logical.runtime_name);
+        sharded_shape(info.shape, shard_axis, tp_size, semantic.runtime_name);
     const int scale_axis = (tp_size > 1)
-        ? llama_like_shard_axis(logical.runtime_name + "_scale")
+        ? llama_like_shard_axis(semantic.runtime_name + "_scale")
         : -1;
     const auto scale_shape = sharded_shape(
-        scale_info.shape, scale_axis, tp_size, logical.runtime_name + "_scale");
+        scale_info.shape, scale_axis, tp_size, semantic.runtime_name + "_scale");
     std::uint64_t scale_numel = 1;
     for (const auto dim : scale_shape) {
         scale_numel *= static_cast<std::uint64_t>(dim);
     }
 
     if (fp8_native) {
-        const std::string scale_name = logical.runtime_name + "_scale_inv";
+        const std::string scale_name =
+            pie_cuda_runtime_abi().quant_scale_inv_name(semantic.runtime_name);
 
         QuantSpec quant;
         quant.format = QuantFormat::CompressedFp8E4M3;
@@ -560,10 +726,10 @@ bool try_add_compressed_fp8_weight(
         quant.scale_tensor = scale_name;
 
         plan.ops.push_back(make_raw_load_op(
-            LoadOpKind::Copy, logical.runtime_name,
-            logical.raw_name, shard_axis));
+            LayoutOpKind::Copy, semantic.runtime_name,
+            semantic.raw_name, shard_axis));
         register_tensor_spec(
-            plan, logical.runtime_name, DType::FP8_E4M3, final_shape,
+            plan, semantic.runtime_name, DType::FP8_E4M3, final_shape,
             TensorLayoutKind::QuantPacked, TensorOwnershipKind::Owned,
             parallel_kind_from_axis(shard_axis),
             /*backing_tensor=*/{}, std::move(quant));
@@ -574,11 +740,11 @@ bool try_add_compressed_fp8_weight(
             parallel_kind_from_axis(scale_axis));
         if (scale_info.dtype == DType::FP32) {
             plan.ops.push_back(make_raw_load_op(
-                LoadOpKind::Copy, scale_name, scale_raw, scale_axis));
+                LayoutOpKind::Copy, scale_name, scale_raw, scale_axis));
         } else {
             const std::string scale_tmp = scale_name + ".__source";
             plan.ops.push_back(make_raw_load_op(
-                LoadOpKind::Copy, scale_tmp, scale_raw, scale_axis));
+                LayoutOpKind::Copy, scale_tmp, scale_raw, scale_axis));
 
             register_tensor_spec(
                 plan, scale_tmp, scale_info.dtype, scale_shape,
@@ -586,23 +752,23 @@ bool try_add_compressed_fp8_weight(
                 parallel_kind_from_axis(scale_axis));
 
             plan.ops.push_back(make_tensor_op(
-                LoadOpKind::Cast, scale_name, {scale_tmp}));
+                LayoutOpKind::Cast, scale_name, {scale_tmp}));
             plan.ops.push_back(make_tensor_op(
-                LoadOpKind::Drop, scale_tmp + ".__drop", {scale_tmp}));
+                LayoutOpKind::Drop, scale_tmp + ".__drop", {scale_tmp}));
         }
 
         plan.ops.push_back(make_tensor_op(
-            LoadOpKind::BindMetadata, logical.runtime_name));
+            LayoutOpKind::AttachMetadata, semantic.runtime_name));
     } else {
         const std::string weight_tmp =
-            logical.runtime_name + ".__compressed_fp8_source";
+            semantic.runtime_name + ".__compressed_fp8_source";
         const std::string scale_tmp =
-            logical.runtime_name + ".__compressed_fp8_scale";
+            semantic.runtime_name + ".__compressed_fp8_scale";
 
         plan.ops.push_back(make_raw_load_op(
-            LoadOpKind::Copy, weight_tmp, logical.raw_name, shard_axis));
+            LayoutOpKind::Copy, weight_tmp, semantic.raw_name, shard_axis));
         plan.ops.push_back(make_raw_load_op(
-            LoadOpKind::Copy, scale_tmp, scale_raw, scale_axis));
+            LayoutOpKind::Copy, scale_tmp, scale_raw, scale_axis));
 
         register_tensor_spec(
             plan, weight_tmp, DType::FP8_E4M3, final_shape,
@@ -614,16 +780,16 @@ bool try_add_compressed_fp8_weight(
             parallel_kind_from_axis(scale_axis));
 
         register_tensor_spec(
-            plan, logical.runtime_name, DType::BF16, final_shape,
+            plan, semantic.runtime_name, DType::BF16, final_shape,
             TensorLayoutKind::Dense, TensorOwnershipKind::Owned,
             parallel_kind_from_axis(shard_axis));
 
         plan.ops.push_back(make_tensor_op(
-            LoadOpKind::Dequantize, logical.runtime_name,
+            LayoutOpKind::Dequantize, semantic.runtime_name,
             {weight_tmp, scale_tmp}));
         plan.ops.push_back(make_tensor_op(
-            LoadOpKind::Drop,
-            logical.runtime_name + ".__compressed_fp8_drop",
+            LayoutOpKind::Drop,
+            semantic.runtime_name + ".__compressed_fp8_drop",
             {weight_tmp, scale_tmp}));
 
         std::uint64_t source_numel = 1;
@@ -645,19 +811,19 @@ bool try_add_compressed_fp8_weight(
 }
 
 bool try_add_fp8_scale_inv_weight(
-    LoadPlan& plan,
-    const TensorMetadataSource& loader,
-    const LogicalTensor& logical,
+    LayoutPlan& plan,
+    const CheckpointSource& loader,
+    const SemanticTensor& semantic,
     const TensorInfo& info,
     int shard_axis,
     int tp_size)
 {
     if (info.dtype != DType::FP8_E4M3 ||
-        !ends_with(logical.runtime_name, ".weight")) {
+        !ends_with(semantic.runtime_name, ".weight")) {
         return false;
     }
 
-    const std::string scale_raw = logical.raw_name + "_scale_inv";
+    const std::string scale_raw = semantic.raw_name + "_scale_inv";
     if (!loader.contains(scale_raw)) return false;
     const TensorInfo& scale_info = loader.info(scale_raw);
     if (scale_info.dtype != DType::BF16 && scale_info.dtype != DType::FP32) {
@@ -668,8 +834,9 @@ bool try_add_fp8_scale_inv_weight(
     }
 
     const auto final_shape =
-        sharded_shape(info.shape, shard_axis, tp_size, logical.runtime_name);
-    const std::string scale_name = logical.runtime_name + "_scale_inv";
+        sharded_shape(info.shape, shard_axis, tp_size, semantic.runtime_name);
+    const std::string scale_name =
+        pie_cuda_runtime_abi().quant_scale_inv_name(semantic.runtime_name);
     int scale_axis = -1;
     if (scale_info.shape.size() == 1 && final_shape.size() >= 1 &&
         scale_info.shape[0] == info.shape[0]) {
@@ -688,18 +855,18 @@ bool try_add_fp8_scale_inv_weight(
         throw std::runtime_error(
             "load schema: FP8 scale_inv '" + scale_raw +
             "' must be scalar or one scale per output row for '" +
-            logical.runtime_name + "'");
+            semantic.runtime_name + "'");
     }
 
     const std::string weight_tmp =
-        logical.runtime_name + ".__fp8_scale_inv_source";
+        semantic.runtime_name + ".__fp8_scale_inv_source";
     const std::string scale_tmp =
-        logical.runtime_name + ".__fp8_scale_inv_scale";
+        semantic.runtime_name + ".__fp8_scale_inv_scale";
 
     plan.ops.push_back(make_raw_load_op(
-        LoadOpKind::Copy, weight_tmp, logical.raw_name, shard_axis));
+        LayoutOpKind::Copy, weight_tmp, semantic.raw_name, shard_axis));
     plan.ops.push_back(make_raw_load_op(
-        LoadOpKind::Copy, scale_tmp, scale_raw, scale_axis));
+        LayoutOpKind::Copy, scale_tmp, scale_raw, scale_axis));
 
     register_tensor_spec(
         plan, weight_tmp, DType::FP8_E4M3, final_shape,
@@ -710,16 +877,16 @@ bool try_add_fp8_scale_inv_weight(
         TensorLayoutKind::Dense, TensorOwnershipKind::Temporary,
         parallel_kind_from_axis(scale_axis));
     register_tensor_spec(
-        plan, logical.runtime_name, DType::BF16, final_shape,
+        plan, semantic.runtime_name, DType::BF16, final_shape,
         TensorLayoutKind::Dense, TensorOwnershipKind::Owned,
         parallel_kind_from_axis(shard_axis));
 
     plan.ops.push_back(make_tensor_op(
-        LoadOpKind::Dequantize, logical.runtime_name,
+        LayoutOpKind::Dequantize, semantic.runtime_name,
         {weight_tmp, scale_tmp}));
     plan.ops.push_back(make_tensor_op(
-        LoadOpKind::Drop,
-        logical.runtime_name + ".__fp8_scale_inv_drop",
+        LayoutOpKind::Drop,
+        semantic.runtime_name + ".__fp8_scale_inv_drop",
         {weight_tmp, scale_tmp}));
 
     estimate_temporary_bytes(
@@ -733,27 +900,27 @@ bool try_add_fp8_scale_inv_weight(
 }
 
 bool try_add_compressed_int8_weight(
-    LoadPlan& plan,
+    LayoutPlan& plan,
     const HfConfig& hf,
-    const TensorMetadataSource& loader,
-    const LogicalTensor& logical,
+    const CheckpointSource& loader,
+    const SemanticTensor& semantic,
     const TensorInfo& info,
     int shard_axis,
     int tp_size)
 {
     if (hf.quant_method != "compressed-tensors" ||
         info.dtype != DType::INT8 ||
-        !ends_with(logical.runtime_name, ".weight")) {
+        !ends_with(semantic.runtime_name, ".weight")) {
         return false;
     }
 
-    const std::string scale_raw = logical.raw_name + "_scale";
-    const std::string zero_raw = logical.raw_name + "_zero_point";
+    const std::string scale_raw = semantic.raw_name + "_scale";
+    const std::string zero_raw = semantic.raw_name + "_zero_point";
     if (!loader.contains(scale_raw)) return false;
     if (loader.contains(zero_raw)) {
         throw std::runtime_error(
             "load schema: compressed-tensors INT8 weight '" +
-            logical.raw_name + "' has a zero-point companion. The scheduled "
+            semantic.raw_name + "' has a zero-point companion. The scheduled "
             "INT8 runtime backend supports symmetric per-channel INT8; "
             "asymmetric compressed-tensors INT8 should lower through an "
             "explicit Dequantize op once that kernel is registered.");
@@ -768,18 +935,18 @@ bool try_add_compressed_int8_weight(
     }
 
     const auto final_shape =
-        sharded_shape(info.shape, shard_axis, tp_size, logical.runtime_name);
+        sharded_shape(info.shape, shard_axis, tp_size, semantic.runtime_name);
     if (final_shape.size() != 2) {
         throw std::runtime_error(
             "load schema: compressed-tensors INT8 weight is not 2-D: " +
-            logical.runtime_name);
+            semantic.runtime_name);
     }
 
     const int scale_axis = (tp_size > 1)
-        ? llama_like_shard_axis(logical.runtime_name + "_scale")
+        ? llama_like_shard_axis(semantic.runtime_name + "_scale")
         : -1;
     const auto scale_shape = sharded_shape(
-        scale_info.shape, scale_axis, tp_size, logical.runtime_name + "_scale");
+        scale_info.shape, scale_axis, tp_size, semantic.runtime_name + "_scale");
     std::uint64_t scale_numel = 1;
     for (const auto dim : scale_shape) {
         scale_numel *= static_cast<std::uint64_t>(dim);
@@ -787,10 +954,11 @@ bool try_add_compressed_int8_weight(
     if (scale_numel != static_cast<std::uint64_t>(final_shape[0])) {
         throw std::runtime_error(
             "load schema: compressed-tensors INT8 currently requires one "
-            "scale per output row for '" + logical.runtime_name + "'");
+            "scale per output row for '" + semantic.runtime_name + "'");
     }
 
-    const std::string scale_name = logical.runtime_name + "_scale_inv";
+    const std::string scale_name =
+        pie_cuda_runtime_abi().quant_scale_inv_name(semantic.runtime_name);
 
     QuantSpec quant;
     quant.format = QuantFormat::CompressedInt8;
@@ -800,10 +968,10 @@ bool try_add_compressed_int8_weight(
     quant.scale_tensor = scale_name;
 
     plan.ops.push_back(make_raw_load_op(
-        LoadOpKind::Copy, logical.runtime_name,
-        logical.raw_name, shard_axis));
+        LayoutOpKind::Copy, semantic.runtime_name,
+        semantic.raw_name, shard_axis));
     register_tensor_spec(
-        plan, logical.runtime_name, DType::INT8, final_shape,
+        plan, semantic.runtime_name, DType::INT8, final_shape,
         TensorLayoutKind::QuantPacked, TensorOwnershipKind::Owned,
         parallel_kind_from_axis(shard_axis),
         /*backing_tensor=*/{}, std::move(quant));
@@ -814,11 +982,11 @@ bool try_add_compressed_int8_weight(
         parallel_kind_from_axis(scale_axis));
     if (scale_info.dtype == DType::FP32) {
         plan.ops.push_back(make_raw_load_op(
-            LoadOpKind::Copy, scale_name, scale_raw, scale_axis));
+            LayoutOpKind::Copy, scale_name, scale_raw, scale_axis));
     } else {
         const std::string scale_tmp = scale_name + ".__source";
         plan.ops.push_back(make_raw_load_op(
-            LoadOpKind::Copy, scale_tmp, scale_raw, scale_axis));
+            LayoutOpKind::Copy, scale_tmp, scale_raw, scale_axis));
 
         register_tensor_spec(
             plan, scale_tmp, scale_info.dtype, scale_shape,
@@ -826,13 +994,13 @@ bool try_add_compressed_int8_weight(
             parallel_kind_from_axis(scale_axis));
 
         plan.ops.push_back(make_tensor_op(
-            LoadOpKind::Cast, scale_name, {scale_tmp}));
+            LayoutOpKind::Cast, scale_name, {scale_tmp}));
         plan.ops.push_back(make_tensor_op(
-            LoadOpKind::Drop, scale_tmp + ".__drop", {scale_tmp}));
+            LayoutOpKind::Drop, scale_tmp + ".__drop", {scale_tmp}));
     }
 
     plan.ops.push_back(make_tensor_op(
-        LoadOpKind::BindMetadata, logical.runtime_name));
+        LayoutOpKind::AttachMetadata, semantic.runtime_name));
     return true;
 }
 
@@ -929,7 +1097,7 @@ OfflineInt4ShardPlan gptq_shard_plan_for(
 }
 
 void add_awq_marlin_repack_ops(
-    LoadPlan& plan,
+    LayoutPlan& plan,
     const HfConfig& hf,
     const TensorInfo& qweight_info,
     const TensorInfo& qzeros_info,
@@ -968,26 +1136,27 @@ void add_awq_marlin_repack_ops(
             "qweight/group_size for Marlin repack at '" + raw_qweight + "'");
     }
 
-    const std::string canonical_s = canonical_w + "_scale_inv";
+    const std::string canonical_s =
+        pie_cuda_runtime_abi().quant_scale_inv_name(canonical_w);
     const std::string canonical_z = canonical_w + "_zero_point";
     const std::string tmp_qw = canonical_w + ".__awq_qweight";
     const std::string tmp_qz = canonical_w + ".__awq_qzeros";
     const std::string tmp_scales = canonical_w + ".__awq_scales";
 
     plan.ops.push_back(make_raw_load_op(
-        LoadOpKind::Copy, tmp_qw, raw_qweight, shard_plan.qweight_axis));
+        LayoutOpKind::Copy, tmp_qw, raw_qweight, shard_plan.qweight_axis));
     plan.ops.push_back(make_raw_load_op(
-        LoadOpKind::Copy, tmp_qz, raw_qzeros, shard_plan.qzeros_axis));
+        LayoutOpKind::Copy, tmp_qz, raw_qzeros, shard_plan.qzeros_axis));
     plan.ops.push_back(make_raw_load_op(
-        LoadOpKind::Copy, tmp_scales, raw_scales, shard_plan.scale_axis));
+        LayoutOpKind::Copy, tmp_scales, raw_scales, shard_plan.scale_axis));
     plan.ops.push_back(make_tensor_op(
-        LoadOpKind::RepackLayout, canonical_w,
+        LayoutOpKind::RepackLayout, canonical_w,
         {tmp_qw, tmp_qz, tmp_scales}, canonical_s,
         shard_plan.canonical_axis));
     plan.ops.push_back(make_tensor_op(
-        LoadOpKind::BindMetadata, canonical_w));
+        LayoutOpKind::AttachMetadata, canonical_w));
     plan.ops.push_back(make_tensor_op(
-        LoadOpKind::Drop, canonical_w + ".__drop_awq_sources",
+        LayoutOpKind::Drop, canonical_w + ".__drop_awq_sources",
         {tmp_qw, tmp_qz, tmp_scales}));
 
     register_tensor_spec(
@@ -1034,8 +1203,8 @@ void add_awq_marlin_repack_ops(
 
 bool is_gptq_repack_companion(
     const HfConfig& hf,
-    const TensorMetadataSource& loader,
-    const LogicalTensor& logical,
+    const CheckpointSource& loader,
+    const SemanticTensor& semantic,
     bool lowering_enabled)
 {
     if (!lowering_enabled || hf.quant_method != "gptq") return false;
@@ -1045,21 +1214,21 @@ bool is_gptq_repack_companion(
     constexpr const char* gidx_suffix = ".g_idx";
 
     const char* matched = nullptr;
-    if (ends_with(logical.raw_name, scale_suffix)) matched = scale_suffix;
-    if (ends_with(logical.raw_name, zero_suffix)) matched = zero_suffix;
-    if (ends_with(logical.raw_name, gidx_suffix)) matched = gidx_suffix;
+    if (ends_with(semantic.raw_name, scale_suffix)) matched = scale_suffix;
+    if (ends_with(semantic.raw_name, zero_suffix)) matched = zero_suffix;
+    if (ends_with(semantic.raw_name, gidx_suffix)) matched = gidx_suffix;
     if (matched == nullptr) return false;
 
     const std::string prefix =
-        logical.raw_name.substr(0, logical.raw_name.size() -
+        semantic.raw_name.substr(0, semantic.raw_name.size() -
                                       std::strlen(matched));
     return loader.contains(prefix + ".qweight");
 }
 
 bool is_offline_int4_dequant_companion(
     const HfConfig& hf,
-    const TensorMetadataSource& loader,
-    const LogicalTensor& logical,
+    const CheckpointSource& loader,
+    const SemanticTensor& semantic,
     bool lowering_enabled)
 {
     if (!lowering_enabled) return false;
@@ -1070,43 +1239,43 @@ bool is_offline_int4_dequant_companion(
     constexpr const char* gidx_suffix = ".g_idx";
 
     const char* matched = nullptr;
-    if (ends_with(logical.raw_name, scale_suffix)) matched = scale_suffix;
-    if (ends_with(logical.raw_name, zero_suffix)) matched = zero_suffix;
+    if (ends_with(semantic.raw_name, scale_suffix)) matched = scale_suffix;
+    if (ends_with(semantic.raw_name, zero_suffix)) matched = zero_suffix;
     if (hf.quant_method == "gptq" &&
-        ends_with(logical.raw_name, gidx_suffix)) {
+        ends_with(semantic.raw_name, gidx_suffix)) {
         matched = gidx_suffix;
     }
     if (matched == nullptr) return false;
 
     const std::string prefix =
-        logical.raw_name.substr(0, logical.raw_name.size() -
+        semantic.raw_name.substr(0, semantic.raw_name.size() -
                                       std::strlen(matched));
     return loader.contains(prefix + ".qweight");
 }
 
 bool try_add_gptq_marlin_repack_weight(
-    LoadPlan& plan,
+    LayoutPlan& plan,
     const HfConfig& hf,
-    const TensorMetadataSource& loader,
-    const LogicalTensor& logical,
+    const CheckpointSource& loader,
+    const SemanticTensor& semantic,
     const TensorInfo& info,
     int tp_size,
     std::unordered_set<std::string>& consumed_raw)
 {
     constexpr const char* qweight_suffix = ".qweight";
-    if (!ends_with(logical.runtime_name, qweight_suffix)) return false;
+    if (!ends_with(semantic.runtime_name, qweight_suffix)) return false;
 
     if (info.dtype != DType::INT32 || info.shape.size() != 2) {
         throw std::runtime_error(
-            "load schema: GPTQ qweight '" + logical.raw_name +
+            "load schema: GPTQ qweight '" + semantic.raw_name +
             "' must be a 2-D int32 tensor");
     }
 
     const std::string raw_prefix =
-        logical.raw_name.substr(0, logical.raw_name.size() -
+        semantic.raw_name.substr(0, semantic.raw_name.size() -
                                       std::strlen(qweight_suffix));
     const std::string runtime_prefix =
-        logical.runtime_name.substr(0, logical.runtime_name.size() -
+        semantic.runtime_name.substr(0, semantic.runtime_name.size() -
                                           std::strlen(qweight_suffix));
     const std::string canonical_w = runtime_prefix + ".weight";
     const OfflineInt4ShardPlan shard_plan =
@@ -1114,7 +1283,7 @@ bool try_add_gptq_marlin_repack_weight(
     const std::string raw_scales = raw_prefix + ".scales";
     if (!loader.contains(raw_scales)) {
         throw std::runtime_error(
-            "load schema: GPTQ qweight '" + logical.raw_name +
+            "load schema: GPTQ qweight '" + semantic.raw_name +
             "' is missing matching '.scales' tensor");
     }
     const TensorInfo& scale_info = loader.info(raw_scales);
@@ -1128,12 +1297,12 @@ bool try_add_gptq_marlin_repack_weight(
     const std::int64_t n_full = info.shape[1];
     if (k_full <= 0 || n_full <= 0 || k_full % 16 != 0) {
         throw std::runtime_error(
-            "load schema: GPTQ qweight '" + logical.raw_name +
+            "load schema: GPTQ qweight '" + semantic.raw_name +
             "' has unsupported packed shape");
     }
     if (k_full % hf.quant_group_size != 0) {
         throw std::runtime_error(
-            "load schema: GPTQ qweight '" + logical.raw_name +
+            "load schema: GPTQ qweight '" + semantic.raw_name +
             "' K dimension is not divisible by group_size=" +
             std::to_string(hf.quant_group_size));
     }
@@ -1145,9 +1314,10 @@ bool try_add_gptq_marlin_repack_weight(
             "' shape does not match qweight/group_size");
     }
 
-    const std::string canonical_s = runtime_prefix + ".weight_scale_inv";
+    const std::string canonical_s =
+        pie_cuda_runtime_abi().quant_scale_inv_name(runtime_prefix + ".weight");
     const auto local_qweight_shape = sharded_shape(
-        info.shape, shard_plan.qweight_axis, tp_size, logical.raw_name);
+        info.shape, shard_plan.qweight_axis, tp_size, semantic.raw_name);
     const auto local_scale_shape = sharded_shape(
         scale_info.shape, shard_plan.scale_axis, tp_size, raw_scales);
     const std::int64_t k_local = local_qweight_shape[0] * 8;
@@ -1155,31 +1325,31 @@ bool try_add_gptq_marlin_repack_weight(
     if (local_scale_shape[1] != n_local) {
         throw std::runtime_error(
             "load schema: GPTQ scale/qweight TP slices disagree for '" +
-            logical.raw_name + "'");
+            semantic.raw_name + "'");
     }
     if (k_local % hf.quant_group_size != 0 ||
         local_scale_shape[0] != k_local / hf.quant_group_size) {
         throw std::runtime_error(
-            "load schema: GPTQ row-parallel slice for '" + logical.raw_name +
+            "load schema: GPTQ row-parallel slice for '" + semantic.raw_name +
             "' does not preserve whole quantization groups");
     }
     const std::string tmp_qw = canonical_w + ".__gptq_qweight";
     const std::string tmp_scales = canonical_w + ".__gptq_scales";
 
     plan.ops.push_back(make_raw_load_op(
-        LoadOpKind::Copy, tmp_qw, logical.raw_name,
+        LayoutOpKind::Copy, tmp_qw, semantic.raw_name,
         shard_plan.qweight_axis));
     plan.ops.push_back(make_raw_load_op(
-        LoadOpKind::Copy, tmp_scales, raw_scales,
+        LayoutOpKind::Copy, tmp_scales, raw_scales,
         shard_plan.scale_axis));
     plan.ops.push_back(make_tensor_op(
-        LoadOpKind::RepackLayout, canonical_w,
+        LayoutOpKind::RepackLayout, canonical_w,
         {tmp_qw, tmp_scales}, canonical_s,
         shard_plan.canonical_axis));
     plan.ops.push_back(make_tensor_op(
-        LoadOpKind::BindMetadata, canonical_w));
+        LayoutOpKind::AttachMetadata, canonical_w));
     plan.ops.push_back(make_tensor_op(
-        LoadOpKind::Drop, canonical_w + ".__drop_gptq_sources",
+        LayoutOpKind::Drop, canonical_w + ".__drop_gptq_sources",
         {tmp_qw, tmp_scales}));
 
     register_tensor_spec(
@@ -1213,7 +1383,7 @@ bool try_add_gptq_marlin_repack_weight(
         tensor_nbytes(info.dtype, local_qweight_shape) +
         tensor_nbytes(scale_info.dtype, local_scale_shape));
 
-    consumed_raw.insert(logical.raw_name);
+    consumed_raw.insert(semantic.raw_name);
     consumed_raw.insert(raw_scales);
     if (loader.contains(raw_prefix + ".qzeros")) {
         consumed_raw.insert(raw_prefix + ".qzeros");
@@ -1229,7 +1399,7 @@ bool scale_dtype_supported_for_int4_dequant(DType dtype) {
 }
 
 void add_int4_dequant_ops(
-    LoadPlan& plan,
+    LayoutPlan& plan,
     const HfConfig& hf,
     const TensorInfo& qweight_info,
     const TensorInfo& qzeros_info,
@@ -1306,13 +1476,13 @@ void add_int4_dequant_ops(
         canonical_w + ".__" + quant_prefix + "_g_idx";
 
     plan.ops.push_back(make_raw_load_op(
-        LoadOpKind::Copy, tmp_qw, raw_qweight,
+        LayoutOpKind::Copy, tmp_qw, raw_qweight,
         shard_plan.qweight_axis));
     plan.ops.push_back(make_raw_load_op(
-        LoadOpKind::Copy, tmp_qz, raw_qzeros,
+        LayoutOpKind::Copy, tmp_qz, raw_qzeros,
         shard_plan.qzeros_axis));
     plan.ops.push_back(make_raw_load_op(
-        LoadOpKind::Copy, tmp_scales, raw_scales,
+        LayoutOpKind::Copy, tmp_scales, raw_scales,
         shard_plan.scale_axis));
 
     std::vector<std::string> dequant_inputs = {tmp_qw, tmp_qz, tmp_scales};
@@ -1327,7 +1497,7 @@ void add_int4_dequant_ops(
         }
 
         plan.ops.push_back(make_raw_load_op(
-            LoadOpKind::Copy, tmp_gidx, raw_gidx,
+            LayoutOpKind::Copy, tmp_gidx, raw_gidx,
             shard_plan.gidx_axis));
         dequant_inputs.push_back(tmp_gidx);
         drop_inputs.push_back(tmp_gidx);
@@ -1339,11 +1509,11 @@ void add_int4_dequant_ops(
     }
 
     plan.ops.push_back(make_tensor_op(
-        LoadOpKind::Dequantize, canonical_w,
+        LayoutOpKind::Dequantize, canonical_w,
         std::move(dequant_inputs), /*secondary_output_name=*/{},
         shard_plan.canonical_axis));
     plan.ops.push_back(make_tensor_op(
-        LoadOpKind::Drop,
+        LayoutOpKind::Drop,
         canonical_w + ".__drop_" + quant_prefix + "_sources",
         std::move(drop_inputs)));
 
@@ -1392,33 +1562,33 @@ void add_int4_dequant_ops(
 }
 
 bool try_add_awq_dequant_weight(
-    LoadPlan& plan,
+    LayoutPlan& plan,
     const HfConfig& hf,
-    const TensorMetadataSource& loader,
-    const LogicalTensor& logical,
+    const CheckpointSource& loader,
+    const SemanticTensor& semantic,
     const TensorInfo& info,
     int tp_size,
     std::unordered_set<std::string>& consumed_raw)
 {
     constexpr const char* qweight_suffix = ".qweight";
-    if (!ends_with(logical.runtime_name, qweight_suffix)) return false;
+    if (!ends_with(semantic.runtime_name, qweight_suffix)) return false;
     if (info.dtype != DType::INT32 || info.shape.size() != 2) {
         throw std::runtime_error(
-            "load schema: AWQ qweight '" + logical.raw_name +
+            "load schema: AWQ qweight '" + semantic.raw_name +
             "' must be a 2-D int32 tensor");
     }
 
     const std::string raw_prefix =
-        logical.raw_name.substr(0, logical.raw_name.size() -
+        semantic.raw_name.substr(0, semantic.raw_name.size() -
                                       std::strlen(qweight_suffix));
     const std::string runtime_prefix =
-        logical.runtime_name.substr(0, logical.runtime_name.size() -
+        semantic.runtime_name.substr(0, semantic.runtime_name.size() -
                                           std::strlen(qweight_suffix));
     const std::string raw_qzeros = raw_prefix + ".qzeros";
     const std::string raw_scales = raw_prefix + ".scales";
     if (!loader.contains(raw_qzeros) || !loader.contains(raw_scales)) {
         throw std::runtime_error(
-            "load schema: AWQ qweight '" + logical.raw_name +
+            "load schema: AWQ qweight '" + semantic.raw_name +
             "' is missing qzeros/scales companions");
     }
     const TensorInfo& qzeros_info = loader.info(raw_qzeros);
@@ -1427,7 +1597,7 @@ bool try_add_awq_dequant_weight(
         scale_info.shape.size() != 2 ||
         !scale_dtype_supported_for_int4_dequant(scale_info.dtype)) {
         throw std::runtime_error(
-            "load schema: AWQ qzeros/scales for '" + logical.raw_name +
+            "load schema: AWQ qzeros/scales for '" + semantic.raw_name +
             "' have unsupported dtype or rank");
     }
 
@@ -1436,7 +1606,7 @@ bool try_add_awq_dequant_weight(
     if (k_full <= 0 || n_full <= 0 ||
         k_full % hf.quant_group_size != 0) {
         throw std::runtime_error(
-            "load schema: AWQ qweight '" + logical.raw_name +
+            "load schema: AWQ qweight '" + semantic.raw_name +
             "' shape is incompatible with group_size=" +
             std::to_string(hf.quant_group_size));
     }
@@ -1445,7 +1615,7 @@ bool try_add_awq_dequant_weight(
         scale_info.shape != std::vector<std::int64_t>{groups, n_full}) {
         throw std::runtime_error(
             "load schema: AWQ qzeros/scales shape does not match qweight for '" +
-            logical.raw_name + "'");
+            semantic.raw_name + "'");
     }
 
     const std::string canonical_w = runtime_prefix + ".weight";
@@ -1454,43 +1624,43 @@ bool try_add_awq_dequant_weight(
             OfflineInt4Format::Awq, canonical_w, tp_size);
     add_int4_dequant_ops(
         plan, hf, info, qzeros_info, scale_info, nullptr,
-        logical.raw_name, raw_qzeros, raw_scales, {},
+        semantic.raw_name, raw_qzeros, raw_scales, {},
         canonical_w, OfflineInt4Format::Awq, shard_plan, tp_size);
 
-    consumed_raw.insert(logical.raw_name);
+    consumed_raw.insert(semantic.raw_name);
     consumed_raw.insert(raw_qzeros);
     consumed_raw.insert(raw_scales);
     return true;
 }
 
 bool try_add_awq_marlin_repack_weight(
-    LoadPlan& plan,
+    LayoutPlan& plan,
     const HfConfig& hf,
-    const TensorMetadataSource& loader,
-    const LogicalTensor& logical,
+    const CheckpointSource& loader,
+    const SemanticTensor& semantic,
     const TensorInfo& info,
     int tp_size,
     std::unordered_set<std::string>& consumed_raw)
 {
     constexpr const char* qweight_suffix = ".qweight";
-    if (!ends_with(logical.runtime_name, qweight_suffix)) return false;
+    if (!ends_with(semantic.runtime_name, qweight_suffix)) return false;
     if (info.dtype != DType::INT32 || info.shape.size() != 2) {
         throw std::runtime_error(
-            "load schema: AWQ qweight '" + logical.raw_name +
+            "load schema: AWQ qweight '" + semantic.raw_name +
             "' must be a 2-D int32 tensor");
     }
 
     const std::string raw_prefix =
-        logical.raw_name.substr(0, logical.raw_name.size() -
+        semantic.raw_name.substr(0, semantic.raw_name.size() -
                                       std::strlen(qweight_suffix));
     const std::string runtime_prefix =
-        logical.runtime_name.substr(0, logical.runtime_name.size() -
+        semantic.runtime_name.substr(0, semantic.runtime_name.size() -
                                           std::strlen(qweight_suffix));
     const std::string raw_qzeros = raw_prefix + ".qzeros";
     const std::string raw_scales = raw_prefix + ".scales";
     if (!loader.contains(raw_qzeros) || !loader.contains(raw_scales)) {
         throw std::runtime_error(
-            "load schema: AWQ qweight '" + logical.raw_name +
+            "load schema: AWQ qweight '" + semantic.raw_name +
             "' is missing qzeros/scales companions");
     }
     const TensorInfo& qzeros_info = loader.info(raw_qzeros);
@@ -1499,7 +1669,7 @@ bool try_add_awq_marlin_repack_weight(
         scale_info.shape.size() != 2 ||
         !scale_dtype_supported_for_int4_dequant(scale_info.dtype)) {
         throw std::runtime_error(
-            "load schema: AWQ qzeros/scales for '" + logical.raw_name +
+            "load schema: AWQ qzeros/scales for '" + semantic.raw_name +
             "' have unsupported dtype or rank");
     }
 
@@ -1509,7 +1679,7 @@ bool try_add_awq_marlin_repack_weight(
         k_full % hf.quant_group_size != 0 ||
         k_full % 16 != 0 || n_full % 64 != 0) {
         throw std::runtime_error(
-            "load schema: AWQ qweight '" + logical.raw_name +
+            "load schema: AWQ qweight '" + semantic.raw_name +
             "' shape is incompatible with Marlin repack");
     }
     const std::int64_t groups = k_full / hf.quant_group_size;
@@ -1517,7 +1687,7 @@ bool try_add_awq_marlin_repack_weight(
         scale_info.shape != std::vector<std::int64_t>{groups, n_full}) {
         throw std::runtime_error(
             "load schema: AWQ qzeros/scales shape does not match qweight for '" +
-            logical.raw_name + "'");
+            semantic.raw_name + "'");
     }
 
     const std::string canonical_w = runtime_prefix + ".weight";
@@ -1526,44 +1696,44 @@ bool try_add_awq_marlin_repack_weight(
             OfflineInt4Format::Awq, canonical_w, tp_size);
     add_awq_marlin_repack_ops(
         plan, hf, info, qzeros_info, scale_info,
-        logical.raw_name, raw_qzeros, raw_scales,
+        semantic.raw_name, raw_qzeros, raw_scales,
         canonical_w, shard_plan, tp_size);
 
-    consumed_raw.insert(logical.raw_name);
+    consumed_raw.insert(semantic.raw_name);
     consumed_raw.insert(raw_qzeros);
     consumed_raw.insert(raw_scales);
     return true;
 }
 
 bool try_add_gptq_dequant_weight(
-    LoadPlan& plan,
+    LayoutPlan& plan,
     const HfConfig& hf,
-    const TensorMetadataSource& loader,
-    const LogicalTensor& logical,
+    const CheckpointSource& loader,
+    const SemanticTensor& semantic,
     const TensorInfo& info,
     int tp_size,
     std::unordered_set<std::string>& consumed_raw)
 {
     constexpr const char* qweight_suffix = ".qweight";
-    if (!ends_with(logical.runtime_name, qweight_suffix)) return false;
+    if (!ends_with(semantic.runtime_name, qweight_suffix)) return false;
     if (info.dtype != DType::INT32 || info.shape.size() != 2) {
         throw std::runtime_error(
-            "load schema: GPTQ qweight '" + logical.raw_name +
+            "load schema: GPTQ qweight '" + semantic.raw_name +
             "' must be a 2-D int32 tensor");
     }
 
     const std::string raw_prefix =
-        logical.raw_name.substr(0, logical.raw_name.size() -
+        semantic.raw_name.substr(0, semantic.raw_name.size() -
                                       std::strlen(qweight_suffix));
     const std::string runtime_prefix =
-        logical.runtime_name.substr(0, logical.runtime_name.size() -
+        semantic.runtime_name.substr(0, semantic.runtime_name.size() -
                                           std::strlen(qweight_suffix));
     const std::string raw_qzeros = raw_prefix + ".qzeros";
     const std::string raw_scales = raw_prefix + ".scales";
     const std::string raw_gidx = raw_prefix + ".g_idx";
     if (!loader.contains(raw_qzeros) || !loader.contains(raw_scales)) {
         throw std::runtime_error(
-            "load schema: GPTQ qweight '" + logical.raw_name +
+            "load schema: GPTQ qweight '" + semantic.raw_name +
             "' is missing qzeros/scales companions");
     }
     const TensorInfo& qzeros_info = loader.info(raw_qzeros);
@@ -1572,7 +1742,7 @@ bool try_add_gptq_dequant_weight(
         scale_info.shape.size() != 2 ||
         !scale_dtype_supported_for_int4_dequant(scale_info.dtype)) {
         throw std::runtime_error(
-            "load schema: GPTQ qzeros/scales for '" + logical.raw_name +
+            "load schema: GPTQ qzeros/scales for '" + semantic.raw_name +
             "' have unsupported dtype or rank");
     }
 
@@ -1582,7 +1752,7 @@ bool try_add_gptq_dequant_weight(
         k_full % hf.quant_group_size != 0 ||
         n_full % 8 != 0) {
         throw std::runtime_error(
-            "load schema: GPTQ qweight '" + logical.raw_name +
+            "load schema: GPTQ qweight '" + semantic.raw_name +
             "' shape is incompatible with group_size=" +
             std::to_string(hf.quant_group_size));
     }
@@ -1591,14 +1761,14 @@ bool try_add_gptq_dequant_weight(
         scale_info.shape != std::vector<std::int64_t>{groups, n_full}) {
         throw std::runtime_error(
             "load schema: GPTQ qzeros/scales shape does not match qweight for '" +
-            logical.raw_name + "'");
+            semantic.raw_name + "'");
     }
 
     const TensorInfo* gidx_info = nullptr;
     if (hf.quant_desc_act) {
         if (!loader.contains(raw_gidx)) {
             throw std::runtime_error(
-                "load schema: GPTQ desc_act qweight '" + logical.raw_name +
+                "load schema: GPTQ desc_act qweight '" + semantic.raw_name +
                 "' is missing g_idx companion");
         }
         gidx_info = &loader.info(raw_gidx);
@@ -1606,7 +1776,7 @@ bool try_add_gptq_dequant_weight(
             gidx_info->shape != std::vector<std::int64_t>{k_full}) {
             throw std::runtime_error(
                 "load schema: GPTQ g_idx shape does not match qweight for '" +
-                logical.raw_name + "'");
+                semantic.raw_name + "'");
         }
     }
 
@@ -1623,10 +1793,10 @@ bool try_add_gptq_dequant_weight(
     }
     add_int4_dequant_ops(
         plan, hf, info, qzeros_info, scale_info, gidx_info,
-        logical.raw_name, raw_qzeros, raw_scales, raw_gidx,
+        semantic.raw_name, raw_qzeros, raw_scales, raw_gidx,
         canonical_w, OfflineInt4Format::Gptq, shard_plan, tp_size);
 
-    consumed_raw.insert(logical.raw_name);
+    consumed_raw.insert(semantic.raw_name);
     consumed_raw.insert(raw_qzeros);
     consumed_raw.insert(raw_scales);
     if (loader.contains(raw_gidx)) {
@@ -1643,69 +1813,19 @@ std::uint64_t tensor_nbytes(DType dtype, const std::vector<std::int64_t>& shape)
     return numel * static_cast<std::uint64_t>(dtype_bytes(dtype));
 }
 
-std::uint64_t tensor_nbytes(const TensorSpec& spec) {
+std::uint64_t tensor_nbytes(const TensorDecl& spec) {
     return tensor_nbytes(spec.dtype, spec.shape);
 }
 
-struct PerExpertMoeName {
-    std::string base;
-    int expert = -1;
-    std::string projection;
-};
-
-bool try_parse_per_expert_moe_weight(
-    const std::string& name,
-    PerExpertMoeName& out)
-{
-    const std::string marker = ".experts.";
-    const auto marker_pos = name.find(marker);
-    if (marker_pos == std::string::npos) return false;
-    const std::size_t idx_begin = marker_pos + marker.size();
-    const auto idx_end = name.find('.', idx_begin);
-    if (idx_end == std::string::npos || idx_end == idx_begin) return false;
-    const std::string idx_text = name.substr(idx_begin, idx_end - idx_begin);
-    if (!std::all_of(idx_text.begin(), idx_text.end(), [](unsigned char ch) {
-            return ch >= '0' && ch <= '9';
-        })) {
-        return false;
-    }
-
-    const std::string suffix = name.substr(idx_end);
-    std::string projection;
-    if (suffix == ".gate_proj.weight") {
-        projection = "gate";
-    } else if (suffix == ".up_proj.weight") {
-        projection = "up";
-    } else if (suffix == ".down_proj.weight") {
-        projection = "down";
-    } else {
-        return false;
-    }
-
-    out.base = name.substr(0, marker_pos);
-    out.expert = std::stoi(idx_text);
-    out.projection = std::move(projection);
-    return true;
-}
-
-std::string per_expert_raw_name(
-    const std::string& base,
-    int expert,
-    const char* projection)
-{
-    return base + ".experts." + std::to_string(expert) + "." +
-           projection + "_proj.weight";
-}
-
 bool try_add_per_expert_moe_fusion(
-    LoadPlan& plan,
+    LayoutPlan& plan,
     const HfConfig& hf,
-    const TensorMetadataSource& loader,
-    const LogicalTensorGroup& group,
+    const CheckpointSource& loader,
+    const SemanticGroup& group,
     std::unordered_set<std::string>& consumed_raw,
     int tp_size)
 {
-    if (group.kind != LogicalTensorGroupKind::PerExpertMoe) return false;
+    if (group.kind != SemanticGroupKind::PerExpertMoe) return false;
     if (group.raw_names.empty() || group.raw_names.size() % 3 != 0 ||
         group.raw_roles.size() != group.raw_names.size() ||
         group.runtime_names.size() != 2) {
@@ -1735,9 +1855,9 @@ bool try_add_per_expert_moe_fusion(
     std::vector<std::int64_t> down_shape0;
     for (int e = 0; e < expert_count; ++e) {
         const std::size_t base = static_cast<std::size_t>(e) * 3;
-        if (group.raw_roles[base] != LogicalTensorRole::MoeExpertGate ||
-            group.raw_roles[base + 1] != LogicalTensorRole::MoeExpertUp ||
-            group.raw_roles[base + 2] != LogicalTensorRole::MoeExpertDown) {
+        if (group.raw_roles[base] != SemanticRole::MoeExpertGate ||
+            group.raw_roles[base + 1] != SemanticRole::MoeExpertUp ||
+            group.raw_roles[base + 2] != SemanticRole::MoeExpertDown) {
             throw std::runtime_error(
                 "load schema: per-expert MoE source roles are not gate/up/down "
                 "triples at '" + group.runtime_base + "'");
@@ -1805,9 +1925,9 @@ bool try_add_per_expert_moe_fusion(
     }
 
     const std::string& gate_up_name =
-        group_runtime_name_for_role(group, LogicalTensorRole::MoeExpertsGateUp);
+        group_runtime_name_for_role(group, SemanticRole::MoeExpertsGateUp);
     const std::string& down_name =
-        group_runtime_name_for_role(group, LogicalTensorRole::MoeExpertsDown);
+        group_runtime_name_for_role(group, SemanticRole::MoeExpertsDown);
     const std::int64_t E = expert_count;
     register_tensor_spec(
         plan, gate_up_name, DType::BF16,
@@ -1836,7 +1956,7 @@ bool temporary_tensor_bytes(
     return true;
 }
 
-void finalize_memory_plan(LoadPlan& plan) {
+void finalize_memory_plan(LayoutPlan& plan) {
     const std::uint64_t conservative_temp_floor =
         plan.memory.max_temporary_bytes;
 
@@ -1854,8 +1974,8 @@ void finalize_memory_plan(LoadPlan& plan) {
     std::unordered_map<std::string, std::size_t> last_use;
     last_use.reserve(temp_bytes.size());
     for (std::size_t i = 0; i < plan.ops.size(); ++i) {
-        const LoadOp& op = plan.ops[i];
-        for (const auto& input : load_op_inputs(op)) {
+        const LayoutOp& op = plan.ops[i];
+        for (const auto& input : layout_op_inputs(op)) {
             if (temp_bytes.contains(input)) {
                 last_use[input] = i;
             }
@@ -1882,10 +2002,10 @@ void finalize_memory_plan(LoadPlan& plan) {
     };
 
     for (std::size_t i = 0; i < plan.ops.size(); ++i) {
-        const LoadOp& op = plan.ops[i];
-        add_if_temporary(load_op_output(op));
-        add_if_temporary(load_op_secondary_output(op));
-        for (const auto& input : load_op_inputs(op)) {
+        const LayoutOp& op = plan.ops[i];
+        add_if_temporary(layout_op_output(op));
+        add_if_temporary(layout_op_secondary_output(op));
+        for (const auto& input : layout_op_inputs(op)) {
             release_if_last_use(input, i);
         }
     }
@@ -1895,6 +2015,38 @@ void finalize_memory_plan(LoadPlan& plan) {
         std::max(conservative_temp_floor, high_water_temp_bytes);
     plan.memory.estimated_peak_bytes =
         plan.memory.persistent_bytes + plan.memory.max_temporary_bytes;
+}
+
+bool can_use_native_dense_algebra_plan(
+    const HfConfig& hf,
+    const Config& boot_cfg,
+    const CheckpointSource& loader,
+    const SemanticGraph& semantic_graph,
+    const ModelSchema& schema)
+{
+    if (!schema.pack_dense_qkv_and_gate_up ||
+        schema.unfuse_phi3_for_tp ||
+        schema.shard_fused_moe_experts_for_tp ||
+        schema.fuse_per_expert_moe_after_load) {
+        return false;
+    }
+    if (!hf.quant_method.empty() ||
+        !boot_cfg.model.runtime_quant.empty()) {
+        return false;
+    }
+    for (const auto& tensor : semantic_graph.tensors) {
+        if (!loader.contains(tensor.raw_name) ||
+            loader.info(tensor.raw_name).dtype != DType::BF16) {
+            return false;
+        }
+    }
+    for (const auto& group : semantic_graph.groups) {
+        if (group.kind != SemanticGroupKind::PackedQkv &&
+            group.kind != SemanticGroupKind::PackedGateUp) {
+            return false;
+        }
+    }
+    return true;
 }
 
 enum class Mxfp4ExpertProjection {
@@ -1928,98 +2080,57 @@ struct Mxfp4ExpertGroup {
     }
 };
 
-void push_copy_op(
-    LoadPlan& plan,
-    const std::string& raw_name,
-    const std::string& output_name,
-    int shard_axis = -1)
-{
-    plan.ops.push_back(make_raw_load_op(
-        LoadOpKind::Copy, output_name, raw_name, shard_axis));
-}
-
-void push_dequant_op(
-    LoadPlan& plan,
-    const std::string& output_name,
-    const std::string& blocks_name,
-    const std::string& scales_name)
-{
-    plan.ops.push_back(make_tensor_op(
-        LoadOpKind::Dequantize, output_name, {blocks_name, scales_name}));
-}
-
-void push_deinterleave_op(
-    LoadPlan& plan,
-    const std::string& first_output,
-    const std::string& second_output,
-    const std::string& input,
-    int shard_axis)
-{
-    plan.ops.push_back(make_tensor_op(
-        LoadOpKind::Deinterleave, first_output, {input},
-        second_output, shard_axis));
-}
-
-void push_drop_op(
-    LoadPlan& plan,
-    const std::string& output_name,
-    std::vector<std::string> inputs)
-{
-    plan.ops.push_back(make_tensor_op(
-        LoadOpKind::Drop, output_name, std::move(inputs)));
-}
-
 bool try_describe_gpt_oss_mxfp4_group(
     const HfConfig& hf,
-    const TensorMetadataSource& loader,
-    const LogicalTensorGroup& logical_group,
+    const CheckpointSource& loader,
+    const SemanticGroup& semantic_group,
     int tp_size,
     Mxfp4ExpertGroup& out)
 {
     if (hf.model_type != "gpt_oss" || hf.quant_method != "mxfp4") return false;
-    if (logical_group.kind != LogicalTensorGroupKind::GptOssMxfp4) return false;
-    if (logical_group.raw_names.size() != 3 ||
-        logical_group.runtime_names.size() != 3 ||
-        logical_group.raw_roles.size() != 3 ||
-        logical_group.runtime_roles.size() != 3 ||
-        logical_group.raw_roles[0] != LogicalTensorRole::QuantPackedData ||
-        logical_group.raw_roles[1] != LogicalTensorRole::QuantScale ||
-        logical_group.raw_roles[2] != LogicalTensorRole::Bias) {
+    if (semantic_group.kind != SemanticGroupKind::GptOssMxfp4) return false;
+    if (semantic_group.raw_names.size() != 3 ||
+        semantic_group.runtime_names.size() != 3 ||
+        semantic_group.raw_roles.size() != 3 ||
+        semantic_group.runtime_roles.size() != 3 ||
+        semantic_group.raw_roles[0] != SemanticRole::QuantPackedData ||
+        semantic_group.raw_roles[1] != SemanticRole::QuantScale ||
+        semantic_group.raw_roles[2] != SemanticRole::Bias) {
         throw std::runtime_error(
             "load schema: GPT-OSS MXFP4 group has wrong declaration at '" +
-            logical_group.runtime_base + "'");
+            semantic_group.runtime_base + "'");
     }
 
     const bool is_gate_up =
-        logical_group.runtime_base.find(".gate_up_proj") != std::string::npos;
+        semantic_group.runtime_base.find(".gate_up_proj") != std::string::npos;
     const bool is_down =
-        logical_group.runtime_base.find(".down_proj") != std::string::npos;
+        semantic_group.runtime_base.find(".down_proj") != std::string::npos;
     if (!is_gate_up && !is_down) {
         throw std::runtime_error(
             "load schema: GPT-OSS MXFP4 group has unknown projection at '" +
-            logical_group.runtime_base + "'");
+            semantic_group.runtime_base + "'");
     }
 
     Mxfp4ExpertGroup group;
     group.projection = is_gate_up
         ? Mxfp4ExpertProjection::GateUpInterleaved
         : Mxfp4ExpertProjection::Down;
-    group.raw_base = logical_group.raw_names[0].substr(
-        0, logical_group.raw_names[0].size() - std::strlen("_blocks"));
+    group.raw_base = semantic_group.raw_names[0].substr(
+        0, semantic_group.raw_names[0].size() - std::strlen("_blocks"));
     const std::string marker =
         is_gate_up ? ".mlp.experts.gate_up_proj" : ".mlp.experts.down_proj";
-    const auto marker_pos = logical_group.runtime_base.rfind(marker);
+    const auto marker_pos = semantic_group.runtime_base.rfind(marker);
     if (marker_pos == std::string::npos) {
         throw std::runtime_error(
             "load schema: GPT-OSS MXFP4 group base is inconsistent at '" +
-            logical_group.runtime_base + "'");
+            semantic_group.runtime_base + "'");
     }
-    group.runtime_base = logical_group.runtime_base.substr(0, marker_pos);
+    group.runtime_base = semantic_group.runtime_base.substr(0, marker_pos);
     group.stem = is_gate_up ? "gate_up_proj" : "down_proj";
-    group.raw_blocks = logical_group.raw_names[0];
-    group.raw_scales = logical_group.raw_names[1];
-    group.raw_bias = logical_group.raw_names[2];
-    group.group_prefix = logical_group.runtime_base;
+    group.raw_blocks = semantic_group.raw_names[0];
+    group.raw_scales = semantic_group.raw_names[1];
+    group.raw_bias = semantic_group.raw_names[2];
+    group.group_prefix = semantic_group.runtime_base;
 
     if (!loader.contains(group.raw_blocks) ||
         !loader.contains(group.raw_scales) ||
@@ -2093,7 +2204,7 @@ void validate_gpt_oss_mxfp4_runtime_shape(
 }
 
 void lower_mxfp4_expert_group_routed_dequant(
-    LoadPlan& plan,
+    LayoutPlan& plan,
     const HfConfig& hf,
     const Mxfp4ExpertGroup& group,
     int tp_size)
@@ -2129,20 +2240,22 @@ void lower_mxfp4_expert_group_routed_dequant(
         TensorLayoutKind::Grouped, TensorOwnershipKind::Owned,
         TensorParallelKind::Expert);
 
-    push_copy_op(plan, group.raw_blocks, weight_name, group.shard_axis);
-    push_copy_op(plan, group.raw_scales, scale_name, group.shard_axis);
-    push_copy_op(plan, group.raw_bias, bias_name, bias_shard_axis);
-
-    plan.ops.push_back(make_tensor_op(
-        LoadOpKind::BindMetadata, weight_name));
+    const LayoutExprId weight =
+        source_realize_expr(plan, group.raw_blocks, weight_name,
+                            group.shard_axis, tp_size);
+    (void)source_realize_expr(plan, group.raw_scales, scale_name,
+                              group.shard_axis, tp_size);
+    (void)source_realize_expr(plan, group.raw_bias, bias_name,
+                              bias_shard_axis, tp_size);
+    (void)attach_metadata_expr(plan, weight_name, weight);
 }
 
 void lower_mxfp4_gate_up_group_to_bf16(
-    LoadPlan& plan,
+    LayoutPlan& plan,
     const Mxfp4ExpertGroup& group,
     int tp_size,
-    const std::string& blocks_tmp,
-    const std::string& scales_tmp)
+    LayoutExprId blocks_expr,
+    LayoutExprId scales_expr)
 {
     const std::vector<std::int64_t> full_bf16_shape = group.full_bf16_shape();
     const std::int64_t I_local = (group.out_dim / 2) / tp_size;
@@ -2173,12 +2286,12 @@ void lower_mxfp4_gate_up_group_to_bf16(
         TensorLayoutKind::Grouped, TensorOwnershipKind::Temporary,
         TensorParallelKind::Expert);
 
-    push_dequant_op(plan, bf16_tmp, blocks_tmp, scales_tmp);
-    push_deinterleave_op(
-        plan, gate_w, up_w, bf16_tmp, group.shard_axis);
+    const LayoutExprId bf16_expr =
+        decode_realize_expr(plan, bf16_tmp, {blocks_expr, scales_expr});
+    (void)unzip_realize_expr(
+        plan, gate_w, up_w, bf16_expr, group.shard_axis);
 
     const std::string bias_tmp = group.group_prefix + ".__gate_up_bias";
-    push_copy_op(plan, group.raw_bias, bias_tmp);
     register_tensor_spec(
         plan, bias_tmp, group.bias.dtype, group.bias.shape,
         TensorLayoutKind::Dense, TensorOwnershipKind::Temporary,
@@ -2191,12 +2304,14 @@ void lower_mxfp4_gate_up_group_to_bf16(
         plan, up_b, DType::BF16, expert_b_shape,
         TensorLayoutKind::Grouped, TensorOwnershipKind::Owned,
         TensorParallelKind::Expert);
-    push_deinterleave_op(
-        plan, gate_b, up_b, bias_tmp, group.shard_axis);
+    const LayoutExprId bias_expr =
+        source_realize_expr(plan, group.raw_bias, bias_tmp, -1, tp_size);
+    (void)unzip_realize_expr(
+        plan, gate_b, up_b, bias_expr, group.shard_axis);
 
-    push_drop_op(
+    release_expr(
         plan, group.group_prefix + ".__drop",
-        {blocks_tmp, scales_tmp, bf16_tmp, bias_tmp});
+        {blocks_expr, scales_expr, bf16_expr, bias_expr});
     estimate_temporary_bytes(
         plan,
         group.blocks.nbytes + group.scales.nbytes + group.bias.nbytes +
@@ -2204,11 +2319,11 @@ void lower_mxfp4_gate_up_group_to_bf16(
 }
 
 void lower_mxfp4_down_group_to_bf16(
-    LoadPlan& plan,
+    LayoutPlan& plan,
     const Mxfp4ExpertGroup& group,
     int tp_size,
-    const std::string& blocks_tmp,
-    const std::string& scales_tmp)
+    LayoutExprId blocks_expr,
+    LayoutExprId scales_expr)
 {
     const std::vector<std::int64_t> full_bf16_shape = group.full_bf16_shape();
     const std::int64_t I_local = group.in_dim / tp_size;
@@ -2221,32 +2336,36 @@ void lower_mxfp4_down_group_to_bf16(
         plan, down_w, DType::BF16, {group.experts, group.out_dim, I_local},
         TensorLayoutKind::Grouped, TensorOwnershipKind::Owned,
         TensorParallelKind::Expert);
+    constexpr LayoutExprId invalid_expr = static_cast<LayoutExprId>(-1);
+    LayoutExprId bf16_expr = invalid_expr;
     if (tp_size == 1) {
-        push_dequant_op(plan, down_w, blocks_tmp, scales_tmp);
+        (void)decode_realize_expr(plan, down_w, {blocks_expr, scales_expr});
     } else {
         const std::string bf16_tmp = group.group_prefix + ".__mxfp4_bf16";
         register_tensor_spec(
             plan, bf16_tmp, DType::BF16, full_bf16_shape,
             TensorLayoutKind::Grouped, TensorOwnershipKind::Temporary,
             TensorParallelKind::Expert);
-        push_dequant_op(plan, bf16_tmp, blocks_tmp, scales_tmp);
-
-        plan.ops.push_back(make_slice_op(
-            down_w, bf16_tmp, /*slice_axis=*/2,
-            /*slice_start=*/0, I_local, group.shard_axis));
+        bf16_expr =
+            decode_realize_expr(plan, bf16_tmp, {blocks_expr, scales_expr});
+        TensorDecl down_decl = tensor_decl_for(plan, down_w);
+        const LayoutExprId selected = select_expr(
+            plan, bf16_expr, down_decl, /*axis=*/2,
+            /*start=*/0, I_local, group.shard_axis);
+        (void)realize_expr(plan, down_w, selected, std::move(down_decl));
     }
 
-    push_copy_op(plan, group.raw_bias, down_b);
     register_tensor_spec(
         plan, down_b, DType::BF16, group.bias.shape,
         TensorLayoutKind::Grouped, TensorOwnershipKind::Owned,
         TensorParallelKind::Expert);
+    (void)source_realize_expr(plan, group.raw_bias, down_b, -1, tp_size);
 
-    std::vector<std::string> drop_inputs = {blocks_tmp, scales_tmp};
-    if (tp_size > 1) {
-        drop_inputs.push_back(group.group_prefix + ".__mxfp4_bf16");
+    std::vector<LayoutExprId> drop_inputs = {blocks_expr, scales_expr};
+    if (bf16_expr != invalid_expr) {
+        drop_inputs.push_back(bf16_expr);
     }
-    push_drop_op(plan, group.group_prefix + ".__drop", std::move(drop_inputs));
+    release_expr(plan, group.group_prefix + ".__drop", std::move(drop_inputs));
     estimate_temporary_bytes(
         plan,
         group.blocks.nbytes + group.scales.nbytes +
@@ -2254,7 +2373,7 @@ void lower_mxfp4_down_group_to_bf16(
 }
 
 void lower_mxfp4_expert_group_to_bf16(
-    LoadPlan& plan,
+    LayoutPlan& plan,
     const HfConfig& hf,
     const Mxfp4ExpertGroup& group,
     int tp_size)
@@ -2264,8 +2383,6 @@ void lower_mxfp4_expert_group_to_bf16(
 
     const std::string blocks_tmp = group.group_prefix + ".__mxfp4_blocks";
     const std::string scales_tmp = group.group_prefix + ".__mxfp4_scales";
-    push_copy_op(plan, group.raw_blocks, blocks_tmp);
-    push_copy_op(plan, group.raw_scales, scales_tmp);
     register_tensor_spec(
         plan, blocks_tmp, group.blocks.dtype, group.blocks.shape,
         TensorLayoutKind::Dense, TensorOwnershipKind::Temporary,
@@ -2274,13 +2391,17 @@ void lower_mxfp4_expert_group_to_bf16(
         plan, scales_tmp, group.scales.dtype, group.scales.shape,
         TensorLayoutKind::Dense, TensorOwnershipKind::Temporary,
         TensorParallelKind::Expert);
+    const LayoutExprId blocks_expr =
+        source_realize_expr(plan, group.raw_blocks, blocks_tmp, -1, tp_size);
+    const LayoutExprId scales_expr =
+        source_realize_expr(plan, group.raw_scales, scales_tmp, -1, tp_size);
 
     if (group.is_gate_up()) {
         lower_mxfp4_gate_up_group_to_bf16(
-            plan, group, tp_size, blocks_tmp, scales_tmp);
+            plan, group, tp_size, blocks_expr, scales_expr);
     } else {
         lower_mxfp4_down_group_to_bf16(
-            plan, group, tp_size, blocks_tmp, scales_tmp);
+            plan, group, tp_size, blocks_expr, scales_expr);
     }
 }
 
@@ -2294,17 +2415,17 @@ void mark_mxfp4_group_consumed(
 }
 
 bool try_add_gpt_oss_mxfp4_expert(
-    LoadPlan& plan,
+    LayoutPlan& plan,
     const HfConfig& hf,
-    const TensorMetadataSource& loader,
-    const LogicalTensorGroup& logical_group,
+    const CheckpointSource& loader,
+    const SemanticGroup& semantic_group,
     std::unordered_set<std::string>& consumed_raw,
     int tp_size,
     Mxfp4MoeLowering lowering)
 {
     Mxfp4ExpertGroup group;
     if (!try_describe_gpt_oss_mxfp4_group(
-            hf, loader, logical_group, tp_size, group)) {
+            hf, loader, semantic_group, tp_size, group)) {
         return false;
     }
     if (consumed_raw.contains(group.raw_blocks)) return true;
@@ -2325,366 +2446,6 @@ bool try_add_gpt_oss_mxfp4_expert(
 
 }  // namespace
 
-LogicalTensorRole infer_logical_tensor_role(const std::string& name) {
-    if (ends_with(name, ".embed_tokens.weight")) {
-        return LogicalTensorRole::Embedding;
-    }
-    if (name == "lm_head.weight" || ends_with(name, ".lm_head.weight")) {
-        return LogicalTensorRole::LmHead;
-    }
-    if (ends_with(name, ".input_layernorm.weight") ||
-        ends_with(name, ".post_attention_layernorm.weight") ||
-        ends_with(name, ".norm.weight") ||
-        ends_with(name, ".q_norm.weight") ||
-        ends_with(name, ".k_norm.weight")) {
-        return LogicalTensorRole::Norm;
-    }
-    if (ends_with(name, ".self_attn.q_proj.weight")) {
-        return LogicalTensorRole::AttentionQ;
-    }
-    if (ends_with(name, ".self_attn.k_proj.weight")) {
-        return LogicalTensorRole::AttentionK;
-    }
-    if (ends_with(name, ".self_attn.v_proj.weight")) {
-        return LogicalTensorRole::AttentionV;
-    }
-    if (ends_with(name, ".self_attn.o_proj.weight")) {
-        return LogicalTensorRole::AttentionO;
-    }
-    if (ends_with(name, ".self_attn.qkv_proj.weight")) {
-        return LogicalTensorRole::AttentionQkv;
-    }
-    if (ends_with(name, ".mlp.gate_proj.weight")) {
-        return LogicalTensorRole::MlpGate;
-    }
-    if (ends_with(name, ".mlp.up_proj.weight")) {
-        return LogicalTensorRole::MlpUp;
-    }
-    if (ends_with(name, ".mlp.down_proj.weight")) {
-        return LogicalTensorRole::MlpDown;
-    }
-    if (ends_with(name, ".mlp.gate_up_proj.weight")) {
-        return LogicalTensorRole::MlpGateUp;
-    }
-    if (ends_with(name, ".experts.gate_up_proj")) {
-        return LogicalTensorRole::MoeExpertsGateUp;
-    }
-    if (ends_with(name, ".experts.down_proj")) {
-        return LogicalTensorRole::MoeExpertsDown;
-    }
-    if (ends_with(name, "_blocks")) {
-        return LogicalTensorRole::QuantPackedData;
-    }
-    if (ends_with(name, "_bias") || ends_with(name, ".bias")) {
-        return LogicalTensorRole::Bias;
-    }
-    if (ends_with(name, ".gate_proj.weight")) {
-        return LogicalTensorRole::MoeExpertGate;
-    }
-    if (ends_with(name, ".up_proj.weight")) {
-        return LogicalTensorRole::MoeExpertUp;
-    }
-    if (ends_with(name, ".down_proj.weight")) {
-        return LogicalTensorRole::MoeExpertDown;
-    }
-    if (ends_with(name, ".w1.weight")) {
-        return LogicalTensorRole::MoeExpertGate;
-    }
-    if (ends_with(name, ".w3.weight")) {
-        return LogicalTensorRole::MoeExpertUp;
-    }
-    if (ends_with(name, ".w2.weight")) {
-        return LogicalTensorRole::MoeExpertDown;
-    }
-    if (ends_with(name, ".weight_scale") ||
-        ends_with(name, ".weight_scale_inv") ||
-        ends_with(name, ".scales")) {
-        return LogicalTensorRole::QuantScale;
-    }
-    if (ends_with(name, ".weight_zero_point") ||
-        ends_with(name, ".qzeros") ||
-        ends_with(name, ".zero_point")) {
-        return LogicalTensorRole::QuantZeroPoint;
-    }
-    return LogicalTensorRole::Unknown;
-}
-
-namespace {
-
-void add_logical_group_once(
-    LogicalTensorGraph& graph,
-    std::unordered_set<std::string>& seen,
-    LogicalTensorGroupKind kind,
-    std::string runtime_base,
-    std::vector<std::string> raw_names,
-    std::vector<std::string> runtime_names,
-    std::vector<LogicalTensorRole> raw_roles = {},
-    std::vector<LogicalTensorRole> runtime_roles = {})
-{
-    const std::string key =
-        std::to_string(static_cast<int>(kind)) + ":" + runtime_base;
-    if (!seen.insert(key).second) return;
-    graph.groups.push_back(LogicalTensorGroup{
-        .kind = kind,
-        .runtime_base = std::move(runtime_base),
-        .raw_names = std::move(raw_names),
-        .runtime_names = std::move(runtime_names),
-        .raw_roles = std::move(raw_roles),
-        .runtime_roles = std::move(runtime_roles),
-    });
-}
-
-void discover_logical_tensor_groups(
-    LogicalTensorGraph& graph,
-    const HfConfig& hf,
-    const TensorMetadataSource& loader)
-{
-    std::unordered_set<std::string> seen;
-    seen.reserve(graph.tensors.size());
-
-    for (const auto& logical : graph.tensors) {
-        constexpr const char* q_suffix = ".self_attn.q_proj.weight";
-        constexpr const char* k_suffix = ".self_attn.k_proj.weight";
-        constexpr const char* v_suffix = ".self_attn.v_proj.weight";
-        constexpr const char* gate_suffix = ".mlp.gate_proj.weight";
-        constexpr const char* up_suffix = ".mlp.up_proj.weight";
-
-        if (ends_with(logical.runtime_name, q_suffix) ||
-            ends_with(logical.runtime_name, k_suffix) ||
-            ends_with(logical.runtime_name, v_suffix)) {
-            const char* matched = ends_with(logical.runtime_name, q_suffix)
-                ? q_suffix
-                : (ends_with(logical.runtime_name, k_suffix) ? k_suffix : v_suffix);
-            const std::string raw_base =
-                logical.raw_name.substr(
-                    0, logical.raw_name.size() - std::strlen(matched));
-            const std::string runtime_base =
-                logical.runtime_name.substr(
-                    0, logical.runtime_name.size() - std::strlen(matched));
-            const std::vector<std::string> raw_names = {
-                raw_base + q_suffix,
-                raw_base + k_suffix,
-                raw_base + v_suffix,
-            };
-            if (can_pack_2d_bf16_group(loader, raw_names)) {
-                add_logical_group_once(
-                    graph, seen, LogicalTensorGroupKind::PackedQkv,
-                    runtime_base + ".self_attn", raw_names,
-                    {runtime_base + q_suffix,
-                     runtime_base + k_suffix,
-                     runtime_base + v_suffix},
-                    {LogicalTensorRole::AttentionQ,
-                     LogicalTensorRole::AttentionK,
-                     LogicalTensorRole::AttentionV},
-                    {LogicalTensorRole::AttentionQ,
-                     LogicalTensorRole::AttentionK,
-                     LogicalTensorRole::AttentionV});
-            }
-        }
-
-        if (ends_with(logical.runtime_name, gate_suffix) ||
-            ends_with(logical.runtime_name, up_suffix)) {
-            const char* matched = ends_with(logical.runtime_name, gate_suffix)
-                ? gate_suffix
-                : up_suffix;
-            const std::string raw_base =
-                logical.raw_name.substr(
-                    0, logical.raw_name.size() - std::strlen(matched));
-            const std::string runtime_base =
-                logical.runtime_name.substr(
-                    0, logical.runtime_name.size() - std::strlen(matched));
-            const std::vector<std::string> raw_names = {
-                raw_base + gate_suffix,
-                raw_base + up_suffix,
-            };
-            if (can_pack_2d_bf16_group(loader, raw_names)) {
-                add_logical_group_once(
-                    graph, seen, LogicalTensorGroupKind::PackedGateUp,
-                    runtime_base + ".mlp", raw_names,
-                    {runtime_base + gate_suffix,
-                     runtime_base + up_suffix},
-                    {LogicalTensorRole::MlpGate,
-                     LogicalTensorRole::MlpUp},
-                    {LogicalTensorRole::MlpGate,
-                     LogicalTensorRole::MlpUp});
-            }
-        }
-
-        if (logical.role == LogicalTensorRole::AttentionQkv) {
-            constexpr const char* qkv_suffix = ".self_attn.qkv_proj.weight";
-            if (ends_with(logical.runtime_name, qkv_suffix)) {
-                const std::string runtime_base =
-                    logical.runtime_name.substr(
-                        0, logical.runtime_name.size() - std::strlen(qkv_suffix));
-                add_logical_group_once(
-                    graph, seen, LogicalTensorGroupKind::RowRangeSplit,
-                    logical.runtime_name,
-                    {logical.raw_name},
-                    {runtime_base + ".self_attn.q_proj.weight",
-                     runtime_base + ".self_attn.k_proj.weight",
-                     runtime_base + ".self_attn.v_proj.weight"},
-                    {LogicalTensorRole::AttentionQkv},
-                    {LogicalTensorRole::AttentionQ,
-                     LogicalTensorRole::AttentionK,
-                     LogicalTensorRole::AttentionV});
-            }
-        }
-
-        if (logical.role == LogicalTensorRole::MlpGateUp) {
-            constexpr const char* gate_up_suffix = ".mlp.gate_up_proj.weight";
-            if (ends_with(logical.runtime_name, gate_up_suffix)) {
-                const std::string runtime_base =
-                    logical.runtime_name.substr(
-                        0, logical.runtime_name.size() -
-                               std::strlen(gate_up_suffix));
-                add_logical_group_once(
-                    graph, seen, LogicalTensorGroupKind::RowRangeSplit,
-                    logical.runtime_name,
-                    {logical.raw_name},
-                    {runtime_base + ".mlp.gate_proj.weight",
-                     runtime_base + ".mlp.up_proj.weight"},
-                    {LogicalTensorRole::MlpGateUp},
-                    {LogicalTensorRole::MlpGate,
-                     LogicalTensorRole::MlpUp});
-            }
-        }
-
-        PerExpertMoeName expert;
-        PerExpertMoeName raw_expert;
-        if (try_parse_per_expert_moe_weight(logical.runtime_name, expert) &&
-            try_parse_per_expert_moe_weight(logical.raw_name, raw_expert)) {
-            int expert_count = hf.num_experts;
-            if (expert_count <= 0) {
-                expert_count = 0;
-                for (;;) {
-                    const std::string gate =
-                        per_expert_raw_name(raw_expert.base, expert_count, "gate");
-                    const std::string up =
-                        per_expert_raw_name(raw_expert.base, expert_count, "up");
-                    const std::string down =
-                        per_expert_raw_name(raw_expert.base, expert_count, "down");
-                    if (!loader.contains(gate) ||
-                        !loader.contains(up) ||
-                        !loader.contains(down)) {
-                        break;
-                    }
-                    ++expert_count;
-                }
-            }
-            std::vector<std::string> raw_names;
-            std::vector<LogicalTensorRole> raw_roles;
-            raw_names.reserve(static_cast<std::size_t>(std::max(expert_count, 0)) * 3);
-            raw_roles.reserve(raw_names.capacity());
-            for (int e = 0; e < expert_count; ++e) {
-                raw_names.push_back(per_expert_raw_name(raw_expert.base, e, "gate"));
-                raw_roles.push_back(LogicalTensorRole::MoeExpertGate);
-                raw_names.push_back(per_expert_raw_name(raw_expert.base, e, "up"));
-                raw_roles.push_back(LogicalTensorRole::MoeExpertUp);
-                raw_names.push_back(per_expert_raw_name(raw_expert.base, e, "down"));
-                raw_roles.push_back(LogicalTensorRole::MoeExpertDown);
-            }
-            add_logical_group_once(
-                graph, seen, LogicalTensorGroupKind::PerExpertMoe,
-                expert.base + ".experts", std::move(raw_names),
-                {expert.base + ".experts.gate_up_proj",
-                 expert.base + ".experts.down_proj"},
-                std::move(raw_roles),
-                {LogicalTensorRole::MoeExpertsGateUp,
-                 LogicalTensorRole::MoeExpertsDown});
-        }
-
-        if (ends_with(logical.runtime_name, ".experts.gate_up_proj") ||
-            ends_with(logical.runtime_name, ".experts.down_proj")) {
-            const auto experts_pos = logical.runtime_name.rfind(".experts.");
-            const std::string runtime_base =
-                logical.runtime_name.substr(0, experts_pos);
-            add_logical_group_once(
-                graph, seen, LogicalTensorGroupKind::FusedMoeExperts,
-                runtime_base + ".experts", {}, {},
-                {},
-                {LogicalTensorRole::MoeExpertsGateUp,
-                 LogicalTensorRole::MoeExpertsDown});
-        }
-
-        if (hf.model_type == "gpt_oss" &&
-            (ends_with(logical.runtime_name,
-                       ".mlp.experts.gate_up_proj_blocks") ||
-             ends_with(logical.runtime_name,
-                       ".mlp.experts.down_proj_blocks"))) {
-            const std::string raw_base =
-                logical.raw_name.substr(
-                    0, logical.raw_name.rfind("_blocks"));
-            const std::string runtime_base =
-                logical.runtime_name.substr(
-                    0, logical.runtime_name.rfind("_blocks"));
-            add_logical_group_once(
-                graph, seen, LogicalTensorGroupKind::GptOssMxfp4,
-                runtime_base,
-                {raw_base + "_blocks",
-                 raw_base + "_scales",
-                 raw_base + "_bias"},
-                {runtime_base + ".weight",
-                 runtime_base + ".weight_scale",
-                 runtime_base + ".bias"},
-                {LogicalTensorRole::QuantPackedData,
-                 LogicalTensorRole::QuantScale,
-                 LogicalTensorRole::Bias},
-                {LogicalTensorRole::QuantPackedData,
-                 LogicalTensorRole::QuantScale,
-                 LogicalTensorRole::Bias});
-        }
-
-        if (logical.checkpoint_dtype == DType::FP8_E4M3 &&
-            loader.contains(logical.raw_name + "_scale_inv")) {
-            add_logical_group_once(
-                graph, seen, LogicalTensorGroupKind::Fp8ScaleInv,
-                logical.runtime_name,
-                {logical.raw_name, logical.raw_name + "_scale_inv"},
-                {logical.runtime_name, logical.runtime_name + "_scale_inv"});
-        }
-    }
-}
-
-bool logical_graph_has_group(
-    const LogicalTensorGraph& graph,
-    LogicalTensorGroupKind kind)
-{
-    return std::any_of(
-        graph.groups.begin(), graph.groups.end(),
-        [kind](const LogicalTensorGroup& group) {
-            return group.kind == kind;
-        });
-}
-
-}  // namespace
-
-LogicalTensorGraph build_logical_tensor_graph(
-    const HfConfig& hf,
-    const TensorMetadataSource& loader)
-{
-    LogicalTensorGraph graph;
-    graph.tensors.reserve(loader.num_tensors());
-
-    const std::string& mm_strip = hf.mm_lm_strip_prefix;
-    const auto& mm_skip = hf.mm_skip_prefixes;
-    for (const auto& raw_name : loader.tensor_names()) {
-        if (pie_driver_common::starts_with_any(raw_name, mm_skip)) continue;
-        const std::string runtime_name =
-            pie_driver_common::strip_prefix(raw_name, mm_strip);
-        const auto& info = loader.info(raw_name);
-        graph.tensors.push_back(LogicalTensor{
-            .raw_name = raw_name,
-            .runtime_name = runtime_name,
-            .role = infer_logical_tensor_role(runtime_name),
-            .checkpoint_dtype = info.dtype,
-            .checkpoint_shape = info.shape,
-            .shard_axis = llama_like_shard_axis(runtime_name),
-        });
-    }
-    discover_logical_tensor_groups(graph, hf, loader);
-    return graph;
-}
-
 ModelSchema resolve_model_schema(
     const HfConfig& hf,
     const Config& boot_cfg,
@@ -2696,109 +2457,57 @@ ModelSchema resolve_model_schema(
         supports_dense_llama_packed_load(hf, boot_cfg);
     schema.unfuse_phi3_for_tp = (hf.model_type == "phi3");
     schema.shard_fused_moe_experts_for_tp =
-        (tp_size > 1) && is_qwen3_5_moe_arch(hf.model_type);
-    schema.fuse_per_expert_moe_after_load = is_qwen3_5_moe_arch(hf.model_type);
-
-    const std::string& mt = hf.model_type;
-    if (mt == "phi3") {
-        schema.family = ModelSchemaFamily::Phi3;
-    } else if (is_qwen3_5_moe_arch(mt)) {
-        schema.family = ModelSchemaFamily::QwenMoe;
-    } else if (mt == "qwen3" || mt == "qwen2" ||
-               mt == "llama" || mt == "llama3" ||
-               mt == "mistral" || mt == "mistral3" || mt == "ministral3" ||
-               mt == "olmo2" || mt == "olmo3") {
-        schema.family = ModelSchemaFamily::DenseLlamaLike;
-    }
+        (tp_size > 1) && is_qwen_moe_model_type(hf.model_type);
+    schema.fuse_per_expert_moe_after_load =
+        is_qwen_moe_model_type(hf.model_type);
+    schema.family = model_schema_family_for_type(hf.model_type);
 
     return schema;
 }
 
-int llama_like_shard_axis(const std::string& name) {
-    // Column-parallel: shard along the leading output dim.
-    if (ends_with(name, ".q_proj.weight") || ends_with(name, ".q_proj.bias") ||
-        ends_with(name, ".k_proj.weight") || ends_with(name, ".k_proj.bias") ||
-        ends_with(name, ".v_proj.weight") || ends_with(name, ".v_proj.bias") ||
-        ends_with(name, ".gate_proj.weight") ||
-        ends_with(name, ".up_proj.weight") ||
-        ends_with(name, ".sinks")) {
-        return 0;
-    }
-    // Row-parallel: shard along the inner input dim.
-    if (ends_with(name, ".o_proj.weight") || ends_with(name, ".down_proj.weight")) {
-        return 1;
-    }
-    // Mixtral / GPT-OSS expert weights.
-    if (ends_with(name, ".w1.weight") || ends_with(name, ".w3.weight") ||
-        ends_with(name, ".w1.bias")   || ends_with(name, ".w3.bias")) {
-        return 0;
-    }
-    if (ends_with(name, ".w2.weight")) {
-        return 1;
-    }
-    // Compressed-tensors FP8 per-channel weight_scale companion.
-    if (ends_with(name, ".q_proj.weight_scale") ||
-        ends_with(name, ".q_proj.weight_scale_inv") ||
-        ends_with(name, ".k_proj.weight_scale") ||
-        ends_with(name, ".k_proj.weight_scale_inv") ||
-        ends_with(name, ".v_proj.weight_scale") ||
-        ends_with(name, ".v_proj.weight_scale_inv") ||
-        ends_with(name, ".gate_proj.weight_scale") ||
-        ends_with(name, ".gate_proj.weight_scale_inv") ||
-        ends_with(name, ".up_proj.weight_scale") ||
-        ends_with(name, ".up_proj.weight_scale_inv")) {
-        return 0;
-    }
-    // Qwen3.5 / Qwen3.6 linear-attention tensors that shard cleanly.
-    if (ends_with(name, ".linear_attn.in_proj_z.weight") ||
-        ends_with(name, ".linear_attn.in_proj_b.weight") ||
-        ends_with(name, ".linear_attn.in_proj_a.weight") ||
-        ends_with(name, ".linear_attn.dt_bias") ||
-        ends_with(name, ".linear_attn.A_log")) {
-        return 0;
-    }
-    if (ends_with(name, ".linear_attn.out_proj.weight")) {
-        return 1;
-    }
-    return -1;
-}
-
-LoadPlan build_model_load_plan(
+LayoutPlan build_model_layout_plan(
     const HfConfig& hf,
     const Config& boot_cfg,
-    const TensorMetadataSource& loader,
+    const CheckpointSource& loader,
     int tp_size,
-    const LoadTarget& target)
+    const BackendTarget& target)
 {
-    LoadPlan plan;
+    LayoutPlan plan;
     std::unordered_set<std::string> consumed_raw;
 
     const ModelSchema schema = resolve_model_schema(hf, boot_cfg, tp_size);
-    const LogicalTensorGraph logical_graph =
-        build_logical_tensor_graph(hf, loader);
-    std::unordered_map<std::string, const LogicalTensorGroup*> packed_group_by_raw;
-    packed_group_by_raw.reserve(logical_graph.groups.size() * 3);
-    std::unordered_map<std::string, const LogicalTensorGroup*> row_split_group_by_raw;
-    row_split_group_by_raw.reserve(logical_graph.groups.size());
-    std::unordered_map<std::string, const LogicalTensorGroup*> per_expert_group_by_raw;
-    per_expert_group_by_raw.reserve(logical_graph.groups.size() * 3);
-    std::unordered_map<std::string, const LogicalTensorGroup*> mxfp4_group_by_raw;
-    mxfp4_group_by_raw.reserve(logical_graph.groups.size() * 3);
-    for (const auto& group : logical_graph.groups) {
-        if (group.kind == LogicalTensorGroupKind::PackedQkv ||
-            group.kind == LogicalTensorGroupKind::PackedGateUp) {
+    const SemanticGraph semantic_graph =
+        build_model_semantic_graph(hf, boot_cfg, loader);
+    if (can_use_native_dense_algebra_plan(
+            hf, boot_cfg, loader, semantic_graph, schema)) {
+        plan = build_native_dense_algebra_plan(
+            semantic_graph, loader, tp_size);
+        (void)optimize_layout_algebra(plan);
+        return plan;
+    }
+    std::unordered_map<std::string, const SemanticGroup*> packed_group_by_raw;
+    packed_group_by_raw.reserve(semantic_graph.groups.size() * 3);
+    std::unordered_map<std::string, const SemanticGroup*> row_split_group_by_raw;
+    row_split_group_by_raw.reserve(semantic_graph.groups.size());
+    std::unordered_map<std::string, const SemanticGroup*> per_expert_group_by_raw;
+    per_expert_group_by_raw.reserve(semantic_graph.groups.size() * 3);
+    std::unordered_map<std::string, const SemanticGroup*> mxfp4_group_by_raw;
+    mxfp4_group_by_raw.reserve(semantic_graph.groups.size() * 3);
+    for (const auto& group : semantic_graph.groups) {
+        if (group.kind == SemanticGroupKind::PackedQkv ||
+            group.kind == SemanticGroupKind::PackedGateUp) {
             for (const auto& raw : group.raw_names) {
                 packed_group_by_raw.emplace(raw, &group);
             }
-        } else if (group.kind == LogicalTensorGroupKind::RowRangeSplit) {
+        } else if (group.kind == SemanticGroupKind::RowRangeSplit) {
             for (const auto& raw : group.raw_names) {
                 row_split_group_by_raw.emplace(raw, &group);
             }
-        } else if (group.kind == LogicalTensorGroupKind::PerExpertMoe) {
+        } else if (group.kind == SemanticGroupKind::PerExpertMoe) {
             for (const auto& raw : group.raw_names) {
                 per_expert_group_by_raw.emplace(raw, &group);
             }
-        } else if (group.kind == LogicalTensorGroupKind::GptOssMxfp4) {
+        } else if (group.kind == SemanticGroupKind::GptOssMxfp4) {
             for (const auto& raw : group.raw_names) {
                 mxfp4_group_by_raw.emplace(raw, &group);
             }
@@ -2806,8 +2515,8 @@ LoadPlan build_model_load_plan(
     }
     const bool has_per_expert_moe_sources =
         schema.fuse_per_expert_moe_after_load &&
-        logical_graph_has_group(
-            logical_graph, LogicalTensorGroupKind::PerExpertMoe);
+        semantic_graph_has_group(
+            semantic_graph, SemanticGroupKind::PerExpertMoe);
     const bool lower_runtime_quant =
         runtime_quant_enabled_for_plan(hf, boot_cfg, target.fp8_native);
     const bool can_repack_gptq_marlin =
@@ -2830,26 +2539,26 @@ LoadPlan build_model_load_plan(
     bool lowered_offline_int4_dequant = false;
     bool lowered_per_expert_moe_fusion = false;
 
-    for (const auto& logical : logical_graph.tensors) {
-        const std::string& raw_name = logical.raw_name;
-        const std::string& name = logical.runtime_name;
+    for (const auto& semantic : semantic_graph.tensors) {
+        const std::string& raw_name = semantic.raw_name;
+        const std::string& name = semantic.runtime_name;
         if (consumed_raw.contains(raw_name)) continue;
-        if (is_compressed_quant_companion(hf, loader, logical)) {
+        if (is_compressed_quant_companion(hf, loader, semantic)) {
             continue;
         }
-        if (is_fp8_scale_inv_companion(loader, logical)) {
+        if (is_fp8_scale_inv_companion(loader, semantic)) {
             continue;
         }
         if (is_gptq_repack_companion(
-                hf, loader, logical, lower_gptq_marlin_repack)) {
+                hf, loader, semantic, lower_gptq_marlin_repack)) {
             continue;
         }
         if (is_offline_int4_dequant_companion(
-                hf, loader, logical, lower_offline_int4_dequant)) {
+                hf, loader, semantic, lower_offline_int4_dequant)) {
             continue;
         }
         if (is_offline_int4_dequant_companion(
-                hf, loader, logical, lower_awq_marlin_repack)) {
+                hf, loader, semantic, lower_awq_marlin_repack)) {
             continue;
         }
         if (mxfp4_group_by_raw.contains(raw_name) &&
@@ -2858,9 +2567,9 @@ LoadPlan build_model_load_plan(
         }
 
         if (schema.shard_fused_moe_experts_for_tp &&
-            logical.role == LogicalTensorRole::MoeExpertsGateUp) {
-            LoadOp op = make_raw_load_op(
-                LoadOpKind::GroupedSliceConcat, /*output_name=*/{},
+            semantic.role == SemanticRole::MoeExpertsGateUp) {
+            LayoutOp op = make_raw_load_op(
+                LayoutOpKind::GroupedSliceConcat, /*output_name=*/{},
                 raw_name);
             const auto& info = loader.info(raw_name);
             auto shape = info.shape;
@@ -2878,9 +2587,9 @@ LoadPlan build_model_load_plan(
             continue;
         }
         if (schema.shard_fused_moe_experts_for_tp &&
-            logical.role == LogicalTensorRole::MoeExpertsDown) {
-            LoadOp op = make_raw_load_op(
-                LoadOpKind::GroupedSlice, /*output_name=*/{},
+            semantic.role == SemanticRole::MoeExpertsDown) {
+            LayoutOp op = make_raw_load_op(
+                LayoutOpKind::GroupedSlice, /*output_name=*/{},
                 raw_name);
             const auto& info = loader.info(raw_name);
             auto shape = info.shape;
@@ -2935,9 +2644,9 @@ LoadPlan build_model_load_plan(
             continue;
         }
 
-        const int axis = (tp_size > 1) ? logical.shard_axis : -1;
+        const int axis = (tp_size > 1) ? semantic.shard_axis : -1;
         if (try_add_compressed_fp8_weight(
-                plan, hf, loader, logical, loader.info(raw_name),
+                plan, hf, loader, semantic, loader.info(raw_name),
                 axis, tp_size, target.fp8_native)) {
             consumed_raw.insert(raw_name);
             consumed_raw.insert(raw_name + "_scale");
@@ -2945,7 +2654,7 @@ LoadPlan build_model_load_plan(
             continue;
         }
         if (try_add_compressed_int8_weight(
-                plan, hf, loader, logical, loader.info(raw_name),
+                plan, hf, loader, semantic, loader.info(raw_name),
                 axis, tp_size)) {
             consumed_raw.insert(raw_name);
             consumed_raw.insert(raw_name + "_scale");
@@ -2953,7 +2662,7 @@ LoadPlan build_model_load_plan(
             continue;
         }
         if (try_add_fp8_scale_inv_weight(
-                plan, loader, logical, loader.info(raw_name),
+                plan, loader, semantic, loader.info(raw_name),
                 axis, tp_size)) {
             consumed_raw.insert(raw_name);
             consumed_raw.insert(raw_name + "_scale_inv");
@@ -2961,35 +2670,35 @@ LoadPlan build_model_load_plan(
         }
         if (lower_awq_dequant &&
             try_add_awq_dequant_weight(
-                plan, hf, loader, logical, loader.info(raw_name),
+                plan, hf, loader, semantic, loader.info(raw_name),
                 tp_size, consumed_raw)) {
             lowered_offline_int4_dequant = true;
             continue;
         }
         if (lower_awq_marlin_repack &&
             try_add_awq_marlin_repack_weight(
-                plan, hf, loader, logical, loader.info(raw_name),
+                plan, hf, loader, semantic, loader.info(raw_name),
                 tp_size, consumed_raw)) {
             lowered_gptq_marlin_repack = true;
             continue;
         }
         if (lower_gptq_marlin_repack &&
             try_add_gptq_marlin_repack_weight(
-                plan, hf, loader, logical, loader.info(raw_name),
+                plan, hf, loader, semantic, loader.info(raw_name),
                 tp_size, consumed_raw)) {
             lowered_gptq_marlin_repack = true;
             continue;
         }
         if (lower_gptq_dequant &&
             try_add_gptq_dequant_weight(
-                plan, hf, loader, logical, loader.info(raw_name),
+                plan, hf, loader, semantic, loader.info(raw_name),
                 tp_size, consumed_raw)) {
             lowered_offline_int4_dequant = true;
             continue;
         }
-        if (lower_runtime_quant && runtime_quantizable_role(logical.role)) {
+        if (lower_runtime_quant && runtime_quantizable_role(semantic.role)) {
             add_runtime_quantized_copy(
-                plan, logical, loader.info(raw_name), boot_cfg,
+                plan, semantic, loader.info(raw_name), boot_cfg,
                 axis, tp_size);
             consumed_raw.insert(raw_name);
             continue;
@@ -3017,6 +2726,10 @@ LoadPlan build_model_load_plan(
             "scheduled");
     }
     finalize_memory_plan(plan);
+    if (!plan.ops.empty()) {
+        build_layout_algebra_from_ops(plan);
+    }
+    (void)optimize_layout_algebra(plan);
     return plan;
 }
 

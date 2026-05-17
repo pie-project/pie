@@ -9,7 +9,7 @@
 //
 // We mmap the file, slice into its header, and copy checkpoint bytes into
 // caller-owned device storage via cudaMemcpyAsync. Allocation and runtime
-// representation decisions live in the load plan materializer, not here.
+// representation decisions live in the layout plan load_executor, not here.
 // Sharded models (`model.safetensors.index.json`) are transparently split
 // across files.
 
@@ -20,57 +20,24 @@
 #include <unordered_map>
 #include <vector>
 
-#include "tensor.hpp"
+#include "loader/checkpoint_source.hpp"
 
 namespace pie_cuda_driver {
 
-struct TensorInfo {
-    DType dtype;
-    std::vector<std::int64_t> shape;
-    // Offset into the shard's data segment (NOT into the file).
-    std::uint64_t data_offset;
-    std::uint64_t nbytes;
-    // Index into SafetensorsLoader::shards_.
-    std::uint32_t shard_id;
-};
-
-struct TensorSlice {
-    int axis = -1;
-    std::int64_t start = 0;
-    std::int64_t length = 0;
-};
-
-struct TensorStorageInfo {
-    std::filesystem::path path;
-    std::uint64_t file_offset = 0;
-    std::uint64_t nbytes = 0;
-    std::uint32_t shard_id = 0;
-};
-
-class TensorMetadataSource {
-public:
-    virtual ~TensorMetadataSource() = default;
-
-    virtual std::vector<std::string> tensor_names() const = 0;
-    virtual std::size_t num_tensors() const noexcept = 0;
-    virtual const TensorInfo& info(const std::string& name) const = 0;
-    virtual bool contains(const std::string& name) const noexcept = 0;
-};
-
-class SafetensorsLoader : public TensorMetadataSource {
+class SafetensorsCheckpointSource : public CheckpointSource {
 public:
     /// Open either `<snapshot_dir>/model.safetensors` (single file) or
     /// `<snapshot_dir>/model.safetensors.index.json` (sharded). The shard
     /// files are mmap'd lazily on first tensor access.
-    static SafetensorsLoader open(const std::filesystem::path& snapshot_dir);
+    static SafetensorsCheckpointSource open(const std::filesystem::path& snapshot_dir);
 
-    SafetensorsLoader() = default;
-    ~SafetensorsLoader();
+    SafetensorsCheckpointSource() = default;
+    ~SafetensorsCheckpointSource();
 
-    SafetensorsLoader(const SafetensorsLoader&) = delete;
-    SafetensorsLoader& operator=(const SafetensorsLoader&) = delete;
-    SafetensorsLoader(SafetensorsLoader&&) noexcept = default;
-    SafetensorsLoader& operator=(SafetensorsLoader&&) noexcept = default;
+    SafetensorsCheckpointSource(const SafetensorsCheckpointSource&) = delete;
+    SafetensorsCheckpointSource& operator=(const SafetensorsCheckpointSource&) = delete;
+    SafetensorsCheckpointSource(SafetensorsCheckpointSource&&) noexcept = default;
+    SafetensorsCheckpointSource& operator=(SafetensorsCheckpointSource&&) noexcept = default;
 
     /// All weight names found across all shards.
     std::vector<std::string> tensor_names() const override;
@@ -88,9 +55,9 @@ public:
         return index_.find(name) != index_.end();
     }
 
-    /// Physical storage location for a checkpoint tensor. `file_offset` is an
+    /// Storage storage location for a checkpoint tensor. `file_offset` is an
     /// absolute byte offset into `path`, suitable for pread/cuFileRead.
-    TensorStorageInfo storage_info(const std::string& name) const;
+    TensorStorageInfo storage_info(const std::string& name) const override;
 
     /// Copy a full checkpoint tensor into caller-owned device storage.
     void copy_to_device(
@@ -99,7 +66,7 @@ public:
         const std::vector<std::int64_t>& dst_shape);
 
     /// Copy a slice of `name` along `axis`, keeping only this rank's portion
-    /// of the world. Used by load-plan materialization to shard linear weights
+    /// of the world. Used by layout-plan materialization to shard linear weights
     /// directly into their final runtime allocations.
     ///
     /// - 1-D tensors (biases): `axis` must be 0.
@@ -130,6 +97,12 @@ public:
         const std::vector<TensorSlice>& slices,
         void* dst,
         const std::vector<std::int64_t>& dst_shape);
+    void copy_strided_to_device_async(
+        const std::string& name,
+        const std::vector<TensorSlice>& slices,
+        void* dst,
+        const std::vector<std::int64_t>& dst_shape,
+        void* stream);
 
 private:
     struct Shard {

@@ -741,7 +741,7 @@ pub struct CudaNativeDriverOptions {
     pub device: String,
     #[serde(skip)]
     pub verbose: bool,
-    /// Runtime quantization mode applied during CUDA load-plan
+    /// Runtime quantization mode applied during CUDA layout-plan
     /// materialization. Empty = none; `"fp8"` and `"int8"` enable
     /// per-channel symmetric quantization for supported projection weights.
     pub runtime_quant: String,
@@ -750,13 +750,13 @@ pub struct CudaNativeDriverOptions {
     /// dequantize routed experts at runtime; `"bf16"`/`"dequant"` eagerly
     /// materialize BF16 experts; `"native"` requires true MXFP4 GEMM kernels.
     pub mxfp4_moe: String,
-    /// CUDA checkpoint IO backend for physical materialization. `"auto"`
+    /// CUDA checkpoint IO backend for storage-program materialization. `"auto"`
     /// uses GPUDirect Storage when available and falls back to mmap;
     /// `"mmap"` forces mmap + cudaMemcpy; `"gds"` requires cuFile.
     pub checkpoint_io: String,
-    /// Enables the physical load optimizer and coverage validator in the
+    /// Enables the storage program optimizer and coverage validator in the
     /// CUDA loader. This is a target policy knob, not an environment toggle.
-    pub physical_load_optimizer: bool,
+    pub storage_program_optimizer: bool,
 
     pub ready_timeout_s: f64,
     pub shutdown_timeout_s: f64,
@@ -778,7 +778,7 @@ impl Default for CudaNativeDriverOptions {
             runtime_quant: String::new(),
             mxfp4_moe: "auto".to_string(),
             checkpoint_io: "auto".to_string(),
-            physical_load_optimizer: true,
+            storage_program_optimizer: true,
             ready_timeout_s: 600.0,
             shutdown_timeout_s: 5.0,
         }
@@ -961,7 +961,7 @@ max_num_kv_pages = 2048
 runtime_quant = "fp8"
 mxfp4_moe = "routed_dequant"
 checkpoint_io = "gds"
-physical_load_optimizer = false
+storage_program_optimizer = false
 "#;
         let cfg: Config = toml::from_str(cuda).unwrap();
         cfg.validate().unwrap();
@@ -972,7 +972,7 @@ physical_load_optimizer = false
         assert_eq!(opts.runtime_quant, "fp8");
         assert_eq!(opts.mxfp4_moe, "routed_dequant");
         assert_eq!(opts.checkpoint_io, "gds");
-        assert!(!opts.physical_load_optimizer);
+        assert!(!opts.storage_program_optimizer);
         assert_eq!(opts.weight_dtype, "bfloat16"); // default
         assert_eq!(opts.kv_page_size, 32); // default
     }
@@ -998,7 +998,7 @@ device = ["cuda:0"]
         assert_eq!(opts.gpu_mem_utilization, 0.85);
         assert_eq!(opts.mxfp4_moe, "auto");
         assert_eq!(opts.checkpoint_io, "auto");
-        assert!(opts.physical_load_optimizer);
+        assert!(opts.storage_program_optimizer);
         assert_eq!(opts.ready_timeout_s, 600.0);
     }
 

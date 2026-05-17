@@ -54,7 +54,7 @@ public:
     }
     LoadedModelCapabilities capabilities() const;
 
-    /// Number of weights physically resident on device.
+    /// Number of weights resident on device.
     std::size_t num_loaded_tensors() const noexcept { return weights_.size(); }
     std::uint64_t total_weight_bytes() const noexcept;
 
@@ -68,7 +68,7 @@ public:
     std::optional<QuantMeta> quant_meta(const std::string& name) const;
 
 private:
-    // Owns runtime-layout tensors produced by the schema/load-plan materializer.
+    // Owns runtime-layout tensors produced by the schema/layout-plan load_executor.
     // Some names are non-owning views into packed backing tensors so older
     // forward paths can keep their unfused fallback pointers.
     Config boot_;

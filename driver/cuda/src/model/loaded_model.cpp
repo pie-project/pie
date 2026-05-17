@@ -12,10 +12,11 @@
 #include "cuda_check.hpp"
 #include "distributed.hpp"
 #include "loader/byte_source.hpp"
-#include "loader/load_plan.hpp"
-#include "loader/materializer.hpp"
+#include "loader/layout_plan.hpp"
+#include "loader/load_executor.hpp"
 #include "loader/model_schema.hpp"
-#include "loader/physical_load_plan.hpp"
+#include "loader/storage_compiler.hpp"
+#include "loader/storage_program.hpp"
 
 namespace pie_cuda_driver {
 
@@ -53,7 +54,7 @@ bool is_qwen3_5_moe_arch(const std::string& mt) {
 
 Mxfp4MoeLowering select_mxfp4_moe_lowering(
     const ModelConfig& model_cfg,
-    const LoadTarget& target)
+    const BackendTarget& target)
 {
     const std::string& policy = model_cfg.mxfp4_moe;
     if (policy.empty() || policy == "auto" ||
@@ -125,18 +126,18 @@ LoadedModel LoadedModel::load(const Config& boot_cfg, NcclComm* tp_comm) {
 #else
     const bool gptq_marlin_int4 = false;
 #endif
-    LoadTarget load_target{
+    BackendTarget backend_target{
         .device_major = dev_prop.major,
         .device_minor = dev_prop.minor,
         .fp8_native = fp8_native,
         .gptq_marlin_int4 = gptq_marlin_int4,
         .mxfp4_native_gemm = false,
     };
-    load_target.mxfp4_moe =
-        select_mxfp4_moe_lowering(boot_cfg.model, load_target);
-    e.mxfp4_moe_lowering_ = load_target.mxfp4_moe;
+    backend_target.mxfp4_moe =
+        select_mxfp4_moe_lowering(boot_cfg.model, backend_target);
+    e.mxfp4_moe_lowering_ = backend_target.mxfp4_moe;
 
-    auto loader = SafetensorsLoader::open(snapshot);
+    auto loader = SafetensorsCheckpointSource::open(snapshot);
 
     const int tp_size = boot_cfg.distributed.tp_size;
     const int tp_rank = boot_cfg.distributed.tp_rank;
@@ -205,31 +206,31 @@ LoadedModel LoadedModel::load(const Config& boot_cfg, NcclComm* tp_comm) {
 
     WeightStoreBuilder(e.weights_).reserve(loader.num_tensors());
 
-    LoadPlan load_plan =
-        build_model_load_plan(e.hf_, boot_cfg, loader, tp_size, load_target);
-    PhysicalLoadPlan physical_plan =
-        build_physical_load_plan(
-            load_plan, loader, tp_rank, tp_size,
+    LayoutPlan layout_plan =
+        build_model_layout_plan(e.hf_, boot_cfg, loader, tp_size, backend_target);
+    StorageProgram storage_program =
+        compile_storage_program(
+            layout_plan, loader, tp_rank, tp_size,
             64ull * 1024ull * 1024ull,
-            PhysicalLoadOptimizerConfig{
-                .enabled = boot_cfg.model.physical_load_optimizer,
+            StorageOptimizerConfig{
+                .enabled = boot_cfg.model.storage_program_optimizer,
                 .coalesce_adjacent = true,
             });
-    if (const char* dump_path = std::getenv("PIE_CUDA_LOAD_PLAN_DUMP");
+    if (const char* dump_path = std::getenv("PIE_CUDA_LAYOUT_PLAN_DUMP");
         dump_path && dump_path[0] != '\0') {
         std::ofstream out(dump_path);
         if (!out) {
             throw std::runtime_error(
-                "engine: failed to open PIE_CUDA_LOAD_PLAN_DUMP path: " +
+                "engine: failed to open PIE_CUDA_LAYOUT_PLAN_DUMP path: " +
                 std::string(dump_path));
         }
-        out << dump_load_plan_json(load_plan, physical_plan);
+        out << dump_layout_plan_json(layout_plan, storage_program);
     }
     if (verbose) {
-        std::cerr << "[pie-driver-cuda] load compiler: "
-                  << describe_load_plan(load_plan) << "\n";
-        std::cerr << "[pie-driver-cuda] physical load compiler: "
-                  << describe_physical_load_plan(physical_plan) << "\n";
+        std::cerr << "[pie-driver-cuda] layout compiler: "
+                  << describe_layout_plan(layout_plan) << "\n";
+        std::cerr << "[pie-driver-cuda] storage compiler: "
+                  << describe_storage_program(storage_program) << "\n";
     }
     auto byte_source = make_checkpoint_byte_source(
         parse_checkpoint_io_policy(boot_cfg.model.checkpoint_io),
@@ -240,10 +241,10 @@ LoadedModel LoadedModel::load(const Config& boot_cfg, NcclComm* tp_comm) {
                   << byte_source->name()
                   << " (policy=" << boot_cfg.model.checkpoint_io << ")\n";
     }
-    Materializer materializer(
+    LoadExecutor load_executor(
         loader, e.weights_, tp_rank, tp_size, tp_comm,
-        byte_source.get(), &physical_plan);
-    const MaterializedLoadPlan materialized = materializer.run(load_plan);
+        byte_source.get(), &storage_program);
+    const LoadExecutionStats materialized = load_executor.run(layout_plan);
     CUDA_CHECK(cudaDeviceSynchronize());
     if (verbose && materialized.runtime_quantized_weights > 0) {
         const double mib_before =
@@ -263,7 +264,7 @@ LoadedModel LoadedModel::load(const Config& boot_cfg, NcclComm* tp_comm) {
                   << "% of original)\n";
     }
     if (verbose && materialized.axis_concat_groups > 0) {
-        std::cerr << "[pie-driver-cuda] load plan: "
+        std::cerr << "[pie-driver-cuda] layout plan: "
                   << materialized.axis_concat_groups << " AxisConcat groups"
                   << " (raw projection weights exposed as non-owning views)\n";
     }
@@ -272,9 +273,9 @@ LoadedModel LoadedModel::load(const Config& boot_cfg, NcclComm* tp_comm) {
             return bytes / (1024ull * 1024ull);
         };
         std::cerr << "[pie-driver-cuda] load memory high-water: planned_peak~"
-                  << to_mib(materialized.planned_physical_peak_bytes)
+                  << to_mib(materialized.planned_storage_peak_bytes)
                   << " MiB, planned_temp<="
-                  << to_mib(materialized.planned_physical_temp_bytes)
+                  << to_mib(materialized.planned_storage_temp_bytes)
                   << " MiB, actual_cuda_delta~"
                   << to_mib(materialized.cuda_actual_peak_delta_bytes)
                   << " MiB, free "

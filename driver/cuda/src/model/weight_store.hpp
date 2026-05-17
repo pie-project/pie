@@ -7,7 +7,7 @@
 #include <unordered_map>
 #include <utility>
 
-#include "loader/load_plan.hpp"
+#include "loader/layout_plan.hpp"
 #include "tensor.hpp"
 
 namespace pie_cuda_driver {
@@ -29,7 +29,7 @@ struct QuantMeta {
 };
 
 struct TensorRecord {
-    TensorSpec spec;
+    TensorDecl spec;
     DeviceTensor tensor;
     bool has_spec = false;
 
@@ -112,9 +112,9 @@ private:
     iterator erase(iterator it);
     std::size_t erase(const std::string& name);
     void insert(std::string name, DeviceTensor tensor);
-    void insert(std::string name, DeviceTensor tensor, TensorSpec spec);
+    void insert(std::string name, DeviceTensor tensor, TensorDecl spec);
     void replace(std::string name, DeviceTensor tensor);
-    void replace(std::string name, DeviceTensor tensor, TensorSpec spec);
+    void replace(std::string name, DeviceTensor tensor, TensorDecl spec);
     void set_quant_meta(const std::string& name, QuantMeta meta);
 
     bool owns_tensor_handle(const DeviceTensor* tensor) const noexcept;
@@ -123,7 +123,7 @@ private:
     void validate_erase_allowed(const std::string& name) const;
     void ensure_mutable() const;
     void finalize();
-    static TensorSpec default_spec_for(
+    static TensorDecl default_spec_for(
         const std::string& name,
         const DeviceTensor& tensor);
 
@@ -161,13 +161,13 @@ public:
     void insert(std::string name, DeviceTensor tensor) {
         store_.insert(std::move(name), std::move(tensor));
     }
-    void insert(std::string name, DeviceTensor tensor, TensorSpec spec) {
+    void insert(std::string name, DeviceTensor tensor, TensorDecl spec) {
         store_.insert(std::move(name), std::move(tensor), std::move(spec));
     }
     void replace(std::string name, DeviceTensor tensor) {
         store_.replace(std::move(name), std::move(tensor));
     }
-    void replace(std::string name, DeviceTensor tensor, TensorSpec spec) {
+    void replace(std::string name, DeviceTensor tensor, TensorDecl spec) {
         store_.replace(std::move(name), std::move(tensor), std::move(spec));
     }
     std::size_t erase(const std::string& name) {
