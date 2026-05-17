@@ -418,41 +418,26 @@ impl<'g, 'ctx> GenStep<'g, 'ctx> {
         let n_pending = pending.len() as u32;
         let n_drafted = drafts.len() as u32;
 
-        if n_pending == 0 && n_drafted == 0 && user_cleared_sampler && extra_probes.is_empty() {
-            // Truly nothing to do — no input, no sampler, no probes.
-            // Mark done so collect_* sugars terminate cleanly.
-            parent.done = true;
-            return Ok(Output::new(RawOutput {
-                slots: Vec::new(),
-                spec_tokens: Vec::new(),
-                spec_positions: Vec::new(),
-            }));
-        }
-
-        // No input + sampler still attached: the SDK once advertised this
-        // as a "no-input bootstrap" path that samples from the last cached
-        // KV position without growing the working tail (see the comment
-        // below). The portable driver's `plan_single_request` rejects
-        // zero-token requests, and silent failure here lets `collect_*`
-        // spin forever firing empty batches once the previous step's
-        // sample came back empty (e.g. grammar mask exhaustion). Fail
-        // loudly so the caller sees the real problem instead of an
-        // infinite retry loop.
+        // Nothing to compute. With the sampler cleared this is a clean
+        // exit; otherwise the driver would reject a zero-input request
+        // and collect_* would spin firing empty batches.
         if n_pending == 0 && n_drafted == 0 && extra_probes.is_empty() {
             parent.done = true;
+            if user_cleared_sampler {
+                return Ok(Output::new(RawOutput {
+                    slots: Vec::new(),
+                    spec_tokens: Vec::new(),
+                    spec_positions: Vec::new(),
+                }));
+            }
             return Err(
-                "GenStep::execute: no input tokens and no probes — previous \
-                 step likely sampled zero tokens (constraint mask exhausted, \
-                 or driver returned empty response). Refusing to fire a \
-                 zero-input forward pass that the driver would reject."
+                "GenStep::execute: no input, no probes — refusing zero-input forward pass."
                     .to_string(),
             );
         }
 
         // Reserve pages for pending (drafts share the working tail —
         // their commit/truncate happens after we know what was accepted).
-        // No-input bootstrap path skips reservation: the host samples from
-        // the last cached KV position without growing the working tail.
         let n_total_input = n_pending + n_drafted;
         if n_total_input > 0 {
             let total_after = parent.ctx.working_tokens + n_total_input;
