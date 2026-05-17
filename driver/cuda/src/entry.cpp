@@ -803,14 +803,15 @@ CudaMemoryPlan plan_cuda_memory(
                     static_cast<double>(1024ull * 1024ull);
                 const bool enough_kv_headroom = kv_headroom >= min_headroom;
                 const double arena_penalty =
-                    (tp_size > 1 && enough_kv_headroom)
+                    enough_kv_headroom
                         ? pressure * 0.25
                         : arena_mib / 1024.0 + pressure * 0.75;
-                const double prefill_weight = tp_size > 1 ? 4.0 : 2.0;
+                const double prefill_weight =
+                    enough_kv_headroom ? (tp_size > 1 ? 4.0 : 3.0) : 2.0;
                 const double kv_weight =
-                    (tp_size > 1 && enough_kv_headroom) ? 2.0 : 4.0;
-                const double tp_prefill_bonus =
-                    (tp_size > 1 && enough_kv_headroom &&
+                    enough_kv_headroom ? 2.0 : 4.0;
+                const double prefill_target_bonus =
+                    (enough_kv_headroom &&
                      N >= score_prefill_target &&
                      R >= score_decode_target)
                         ? 1.25
@@ -819,7 +820,7 @@ CudaMemoryPlan plan_cuda_memory(
                         decode_score * 4.0 +
                         prefill_score * prefill_weight +
                         kv_residency_score * kv_weight +
-                        tp_prefill_bonus +
+                        prefill_target_bonus +
                         page_score -
                         decode_shape_penalty * 6.0 -
                         prefill_overshoot_penalty * 0.75 -
