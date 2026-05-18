@@ -126,6 +126,9 @@ pub trait ForwardPassExt {
 impl ForwardPassExt for inference::ForwardPass {
     async fn execute_async(&self) -> Result<inference::Output> {
         let future_output = self.execute()?;
+        if let Some(output) = future_output.get() {
+            return Ok(output);
+        }
         let pollable = future_output.pollable();
         AsyncPollable::new(pollable).wait_for().await;
         future_output.get().ok_or_else(|| "No output available".to_string())

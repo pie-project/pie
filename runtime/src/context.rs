@@ -254,8 +254,8 @@ impl Market {
 ///   don't declare an explicit token limit at admission.
 /// - `default_token_limit`: compute-wallet cap for the same;
 ///   `None` means unlimited (the system-wide default).
-/// - `admission_oversubscription_factor`: admission gate — `Σ endowment` must not
-///   exceed `total_pages × factor`.
+/// - `admission_oversubscription_factor`: admission gate — `Σ admission_claim`
+///   must not exceed `total_pages × factor`.
 /// - `restore_pause_at_utilization`: the restore loop pauses when any
 ///   driver's GPU page utilization exceeds this fraction.
 pub fn spawn(
@@ -381,7 +381,7 @@ pub async fn destroy(model_idx: usize, id: ContextId) -> Result<()> {
 /// Called from `InstanceState::new` before any context operations.
 ///
 /// Waits if a model's admission gate is temporarily full (the
-/// `Σ endowment ≤ capacity × admission_oversubscription_factor` invariant).
+/// `Σ admission_claim ≤ capacity × admission_oversubscription_factor` invariant).
 /// On partial failure — e.g., model 0 admits but model 1 refuses — the
 /// successful registrations are rolled back so no orphan state remains.
 pub async fn register_process(pid: ProcessId, token_budget: Option<usize>) -> Result<()> {
@@ -392,7 +392,7 @@ pub async fn register_process(pid: ProcessId, token_budget: Option<usize>) -> Re
                 let Some(admission) = e.downcast_ref::<sched::AdmissionDenied>() else {
                     return Err(e);
                 };
-                if admission.endowment_pages > admission.cap {
+                if admission.admission_pages > admission.cap {
                     return Err(e);
                 }
                 tokio::select! {
@@ -773,6 +773,14 @@ pub(crate) struct TokenInfo {
     pub adapter_seed: Option<i64>,
 }
 
+pub(super) fn materialize_lineage_mask(mask: &Brle, position: u32) -> Brle {
+    if mask.buffer.is_empty() && mask.total_size == 0 {
+        Brle::all_true((position + 1) as usize)
+    } else {
+        mask.clone()
+    }
+}
+
 // =============================================================================
 // Internal Types
 // =============================================================================
@@ -1018,8 +1026,8 @@ pub(crate) struct ContextManager {
     /// an explicit token_budget at admission.
     /// `None` = unlimited (the system-wide default); `Some(n)` = cap at `n`.
     pub(crate) default_token_limit: Option<usize>,
-    /// Admission cap: `Σ endowment ≤ total_gpu_capacity × admission_oversubscription_factor`.
-    /// At 1.0 strictly bound by physical capacity; > 1.0 allows overbook.
+    /// Admission cap: `Σ admission_claim ≤ total_gpu_capacity × admission_oversubscription_factor`.
+    /// At 1.0 claims are strictly bound by physical capacity; > 1.0 allows overbook.
     pub(crate) admission_oversubscription_factor: f64,
     /// Hard admission gate for the restore loop: pause restoring suspended
     /// contexts when any driver's page utilization exceeds this fraction.
@@ -1400,7 +1408,7 @@ impl ContextManager {
         for info in &ctx.working_page_tokens[..total_tokens] {
             tokens.push(info.token);
             positions.push(info.position);
-            masks.push(info.mask.clone());
+            masks.push(materialize_lineage_mask(&info.mask, info.position));
         }
 
         // Validate positions are strictly after any previously committed position.
@@ -1744,6 +1752,17 @@ impl ContextManager {
         }
     }
 
+    pub(crate) fn publish_working_token_count(&self, id: ContextId) {
+        let Some(ctx) = self.contexts.get(&id) else {
+            return;
+        };
+        if let Some(mut info) = CACHED_CONTEXT_INFO.get_mut(&(self.model_idx, id)) {
+            info.working_tokens = ctx.working_page_tokens.len() as u32;
+        } else {
+            self.publish_context_counts(id);
+        }
+    }
+
     /// Remove cached entry for a context (on destroy).
     pub(crate) fn remove_context_caches(&self, id: ContextId) {
         CACHED_CONTEXT_INFO.remove(&(self.model_idx, id));
@@ -2081,7 +2100,7 @@ impl ServiceHandler for ContextManager {
                 ) {
                     tracing::warn!("append_working_page_tokens for ctx {id}: {e:#}");
                 }
-                self.publish_context_counts(id);
+                self.publish_working_token_count(id);
                 self.sched_counters.append_us += t0.elapsed().as_micros() as u64;
                 self.sched_counters.append_count += 1;
             }

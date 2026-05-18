@@ -331,11 +331,23 @@ pub fn append_request_with_options(
         && req.token_ids.len() <= 1
         && req.spec_token_ids.is_empty();
 
+    let synthesized_masks;
+    let masks = if !elide_decode_mask && req.masks.is_empty() && !req.position_ids.is_empty() {
+        synthesized_masks = req
+            .position_ids
+            .iter()
+            .map(|&pos| Brle::all_true((pos + 1) as usize))
+            .collect::<Vec<_>>();
+        synthesized_masks.as_slice()
+    } else {
+        req.masks.as_slice()
+    };
+
     let trim = if elide_decode_mask {
         None
     } else {
         TrimPlan::compute(
-            &req.masks,
+            masks,
             physical_page_ids.len() as u32,
             last_page_len,
             page_size,
@@ -359,7 +371,7 @@ pub fn append_request_with_options(
     if elide_decode_mask {
         batch.mask_indptr.push(batch.masks.len() as u32);
     } else {
-        emit_attention_masks(batch, &req.masks, trim.as_ref());
+        emit_attention_masks(batch, masks, trim.as_ref());
     }
 
     // Logit mask. Per-request: each request contributes 0 or 1 Brle

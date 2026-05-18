@@ -9,6 +9,7 @@
 #include "kernels/kv_paged.hpp"
 #include "kernels/rmsnorm.hpp"
 #include "kernels/rope.hpp"
+#include "kernels/split_packed.hpp"
 #include "kernels/swiglu.hpp"
 #include "ops/attention_flashinfer.hpp"
 #include "ops/attention_naive.hpp"
@@ -18,7 +19,8 @@ namespace pie_cuda_driver::model {
 
 Qwen3Workspace Qwen3Workspace::allocate_full(
     const HfConfig& cfg, int max_tokens,
-    int max_intermediate, int max_Hq, int max_Hk)
+    int max_intermediate, int max_Hq, int max_Hk,
+    int max_output_rows)
 {
     const int H  = cfg.hidden_size;
     const int Hq = max_Hq;
@@ -26,6 +28,7 @@ Qwen3Workspace Qwen3Workspace::allocate_full(
     const int I  = max_intermediate;
     const int V  = cfg.vocab_size;
     const int N  = max_tokens;
+    const int O  = max_output_rows > 0 ? max_output_rows : max_tokens;
 
     Qwen3Workspace ws;
     ws.y             = DeviceTensor::allocate(DType::BF16, {N, H});
@@ -42,8 +45,8 @@ Qwen3Workspace Qwen3Workspace::allocate_full(
     ws.norm_y        = DeviceTensor::allocate(DType::BF16, {N, H});
     ws.gate          = DeviceTensor::allocate(DType::BF16, {N, I});
     ws.up            = DeviceTensor::allocate(DType::BF16, {N, I});
-    ws.logits        = DeviceTensor::allocate(DType::BF16, {N, V});
-    ws.probs         = DeviceTensor::allocate(DType::FP32, {N, V});
+    ws.logits        = DeviceTensor::allocate(DType::BF16, {O, V});
+    ws.probs         = DeviceTensor::allocate(DType::FP32, {O, V});
     // Tiny scratch for TP greedy decode. The current launcher supports
     // up to 8 ranks here; larger TP groups fall back to the full-logits
     // path before touching these buffers.
@@ -72,11 +75,13 @@ Qwen3Workspace Qwen3Workspace::allocate_full(
 }
 
 Qwen3Workspace Qwen3Workspace::allocate_with_max_intermediate(
-    const HfConfig& cfg, int max_tokens, int max_intermediate)
+    const HfConfig& cfg, int max_tokens, int max_intermediate,
+    int max_output_rows)
 {
     const int Hq = cfg.num_attention_heads * cfg.head_dim;
     const int Hk = cfg.num_key_value_heads * cfg.head_dim;
-    return allocate_full(cfg, max_tokens, max_intermediate, Hq, Hk);
+    return allocate_full(
+        cfg, max_tokens, max_intermediate, Hq, Hk, max_output_rows);
 }
 
 Qwen3Workspace Qwen3Workspace::allocate(const HfConfig& cfg, int max_tokens) {
@@ -114,16 +119,25 @@ void qwen3_forward_prefill(
             ws.y.data(), layer.attn_norm->data(), ws.norm_x.data(),
             N, H, eps, stream);
 
-        // 3. QKV projections (no fusion yet).
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_x.data(), make_weight_view(layer.q_proj, layer.q_proj_quant),
-            ws.q.data(), N, Hq, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_x.data(), make_weight_view(layer.k_proj, layer.k_proj_quant),
-            ws.k.data(), N, Hk, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_x.data(), make_weight_view(layer.v_proj, layer.v_proj_quant),
-            ws.v.data(), N, Hk, H);
+        // 3. QKV projections.
+        if (layer.qkv_proj_fused) {
+            ops::gemm_act_x_w(cublas.handle(),
+                ws.norm_x.data(), *layer.qkv_proj_fused,
+                ws.qkv_fused.data(), N, Hq + 2 * Hk, H);
+            kernels::launch_split_qkv_bf16(
+                ws.qkv_fused.data(), ws.q.data(), ws.k.data(), ws.v.data(),
+                N, Hq, Hk, stream);
+        } else {
+            ops::gemm_act_x_w(cublas.handle(),
+                ws.norm_x.data(), make_weight_view(layer.q_proj, layer.q_proj_quant),
+                ws.q.data(), N, Hq, H);
+            ops::gemm_act_x_w(cublas.handle(),
+                ws.norm_x.data(), make_weight_view(layer.k_proj, layer.k_proj_quant),
+                ws.k.data(), N, Hk, H);
+            ops::gemm_act_x_w(cublas.handle(),
+                ws.norm_x.data(), make_weight_view(layer.v_proj, layer.v_proj_quant),
+                ws.v.data(), N, Hk, H);
+        }
 
         // 4. Per-head q_norm / k_norm. Qwen3-only — Llama 3 / Mistral /
         //    Qwen 2 leave these null and skip the extra RMSNorm. Reshape Q
@@ -162,12 +176,21 @@ void qwen3_forward_prefill(
             N, H, eps, stream);
 
         // 9. Gate / up projections.
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(), make_weight_view(layer.gate_proj, layer.gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(), make_weight_view(layer.up_proj, layer.up_proj_quant),
-            ws.up.data(),   N, I, H);
+        if (layer.gate_up_proj_fused) {
+            ops::gemm_act_x_w(cublas.handle(),
+                ws.norm_y.data(), *layer.gate_up_proj_fused,
+                ws.gate_up_fused.data(), N, 2 * I, H);
+            kernels::launch_split_gate_up_bf16(
+                ws.gate_up_fused.data(), ws.gate.data(), ws.up.data(),
+                N, I, stream);
+        } else {
+            ops::gemm_act_x_w(cublas.handle(),
+                ws.norm_y.data(), make_weight_view(layer.gate_proj, layer.gate_proj_quant),
+                ws.gate.data(), N, I, H);
+            ops::gemm_act_x_w(cublas.handle(),
+                ws.norm_y.data(), make_weight_view(layer.up_proj, layer.up_proj_quant),
+                ws.up.data(),   N, I, H);
+        }
 
         // 10. SwiGLU into ws.gate (in place: gate <- silu(gate) * up).
         kernels::launch_swiglu_bf16(
@@ -257,15 +280,24 @@ void qwen3_forward_paged(
             N, H, eps, stream);
 
         // 3. QKV
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_x.data(), make_weight_view(layer.q_proj, layer.q_proj_quant),
-            ws.q.data(), N, Hq, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_x.data(), make_weight_view(layer.k_proj, layer.k_proj_quant),
-            ws.k.data(), N, Hk, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_x.data(), make_weight_view(layer.v_proj, layer.v_proj_quant),
-            ws.v.data(), N, Hk, H);
+        if (layer.qkv_proj_fused) {
+            ops::gemm_act_x_w(cublas.handle(),
+                ws.norm_x.data(), *layer.qkv_proj_fused,
+                ws.qkv_fused.data(), N, Hq + 2 * Hk, H);
+            kernels::launch_split_qkv_bf16(
+                ws.qkv_fused.data(), ws.q.data(), ws.k.data(), ws.v.data(),
+                N, Hq, Hk, stream);
+        } else {
+            ops::gemm_act_x_w(cublas.handle(),
+                ws.norm_x.data(), make_weight_view(layer.q_proj, layer.q_proj_quant),
+                ws.q.data(), N, Hq, H);
+            ops::gemm_act_x_w(cublas.handle(),
+                ws.norm_x.data(), make_weight_view(layer.k_proj, layer.k_proj_quant),
+                ws.k.data(), N, Hk, H);
+            ops::gemm_act_x_w(cublas.handle(),
+                ws.norm_x.data(), make_weight_view(layer.v_proj, layer.v_proj_quant),
+                ws.v.data(), N, Hk, H);
+        }
 
         // 4. q/k norm (Qwen3 only — null on Llama-likes).
         if (layer.q_norm) {
@@ -344,12 +376,21 @@ void qwen3_forward_paged(
             N, H, eps, stream);
 
         // 10. gate / up
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(), make_weight_view(layer.gate_proj, layer.gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(), make_weight_view(layer.up_proj, layer.up_proj_quant),
-            ws.up.data(),   N, I, H);
+        if (layer.gate_up_proj_fused) {
+            ops::gemm_act_x_w(cublas.handle(),
+                ws.norm_y.data(), *layer.gate_up_proj_fused,
+                ws.gate_up_fused.data(), N, 2 * I, H);
+            kernels::launch_split_gate_up_bf16(
+                ws.gate_up_fused.data(), ws.gate.data(), ws.up.data(),
+                N, I, stream);
+        } else {
+            ops::gemm_act_x_w(cublas.handle(),
+                ws.norm_y.data(), make_weight_view(layer.gate_proj, layer.gate_proj_quant),
+                ws.gate.data(), N, I, H);
+            ops::gemm_act_x_w(cublas.handle(),
+                ws.norm_y.data(), make_weight_view(layer.up_proj, layer.up_proj_quant),
+                ws.up.data(),   N, I, H);
+        }
 
         // 11. SwiGLU (in-place into ws.gate)
         kernels::launch_swiglu_bf16(

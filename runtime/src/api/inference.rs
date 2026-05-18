@@ -55,6 +55,17 @@ pub struct FutureOutput {
     done: bool,
 }
 
+fn empty_forward_request() -> pie_bridge::ForwardRequest {
+    pie_bridge::ForwardRequest {
+        adapter_bindings: vec![pie_bridge::AdapterBinding {
+            adapter_id: -1,
+            seed: -1,
+        }],
+        output_spec_flags: vec![false],
+        ..Default::default()
+    }
+}
+
 #[async_trait]
 impl Pollable for FutureOutput {
     async fn ready(&mut self) {
@@ -294,14 +305,7 @@ impl pie::core::inference::HostForwardPass for InstanceState {
             context_id: None,
             spec: None,
             adapter_seed: None,
-            req: pie_bridge::ForwardRequest {
-                adapter_bindings: vec![pie_bridge::AdapterBinding {
-                    adapter_id: -1,
-                    seed: -1,
-                }],
-                output_spec_flags: vec![false],
-                ..Default::default()
-            },
+            req: empty_forward_request(),
         };
         Ok(self.ctx().table.push(pass)?)
     }
@@ -423,11 +427,11 @@ impl pie::core::inference::HostForwardPass for InstanceState {
             .context_id
             .ok_or_else(|| anyhow::anyhow!("ForwardPass requires a context"))?;
         let adapter_seed = pass.adapter_seed;
-        let spec_handle = pass.spec.take();
+        let spec_handle = pass.spec.clone();
         // Drain the accumulator. The remaining work is to synthesize
         // masks if absent and stamp the per-request indptrs onto the
         // ForwardRequest, then submit.
-        let mut req = take(&mut pass.req);
+        let mut req = std::mem::replace(&mut pass.req, empty_forward_request());
         // Clone samplers BEFORE finalizing so we can reconstruct the
         // per-slot WIT output against the original slot order.
         let samplers_for_output = req.samplers.clone();
@@ -437,35 +441,6 @@ impl pie::core::inference::HostForwardPass for InstanceState {
         // synthesized causal default.
         let has_user_mask = !req.masks.is_empty();
 
-        // WIT spec: "if not provided, fallback to causal mask".
-        if req.masks.is_empty() && !req.position_ids.is_empty() {
-            req.masks = req
-                .position_ids
-                .iter()
-                .map(|&pos| Brle::all_true((pos + 1) as usize))
-                .collect();
-        }
-        req.has_user_mask = has_user_mask;
-        req.single_token_mode = !has_user_mask && req.token_ids.len() <= 1;
-        // Finalize per-request indptr shape ([0, N]).
-        let n_tokens = req.token_ids.len() as u32;
-        let n_masks = req.masks.len() as u32;
-        let n_logit = req.logit_masks.len() as u32;
-        let n_sampling = req.sampling_indices.len() as u32;
-        let n_samplers = req.samplers.len() as u32;
-        let n_spec = req.spec_token_ids.len() as u32;
-        req.qo_indptr = vec![0, n_tokens];
-        req.mask_indptr = vec![0, n_masks];
-        req.logit_mask_indptr = vec![0, n_logit];
-        req.sampling_indptr = vec![0, n_sampling];
-        req.sampler_indptr = vec![0, n_samplers];
-        req.spec_indptr = vec![0, n_spec];
-        req.kv_page_indptr = vec![0];
-        req.context_ids = vec![context_id];
-        // adapter_bindings[0] already has the adapter_id set by `adapter()`;
-        // stamp the seed picked up out-of-band.
-        req.adapter_bindings[0].seed = adapter_seed.unwrap_or(-1);
-
         // Save data needed for context::append_working_page_tokens() before
         // moving into request. We also clone the speculative arrays so we
         // can append the verified-prefix to the working-page lineage once
@@ -473,7 +448,11 @@ impl pie::core::inference::HostForwardPass for InstanceState {
         let num_input_tokens = req.token_ids.len();
         let fill_tokens = req.token_ids.clone();
         let fill_positions = req.position_ids.clone();
-        let fill_masks = req.masks.clone();
+        let fill_masks = if has_user_mask {
+            req.masks.clone()
+        } else {
+            Vec::new()
+        };
         let spec_tokens_for_fill = req.spec_token_ids.clone();
         let spec_positions_for_fill = req.spec_position_ids.clone();
         // Adapter id for context::append_working_page_tokens.
@@ -481,11 +460,15 @@ impl pie::core::inference::HostForwardPass for InstanceState {
             let bound = req.adapter_bindings[0].adapter_id;
             if bound < 0 { None } else { Some(bound as u64) }
         };
+        req.has_user_mask = has_user_mask;
+        req.single_token_mode = !has_user_mask && req.token_ids.len() <= 1;
+        // adapter_bindings[0] already has the adapter_id set by `adapter()`;
+        // stamp the seed picked up out-of-band.
+        req.adapter_bindings[0].seed = adapter_seed.unwrap_or(-1);
 
-        // Try the lock-free staged hit before pinning. On hit we skip
-        // pin/unpin entirely — the staged fire runs on pages from the
-        // prior cycle. On miss we pin + submit. The ctx-cached `spec`
-        // handle lets us skip the REGISTRY lookup.
+        // Try the staged hit before synthesizing default masks or pinning. On
+        // hit we skip pin/unpin entirely — the staged fire runs on pages from
+        // the prior cycle.
         let driver_idx_hint = context::get_device(model_id, context_id);
         let use_pass_speculation = inference::should_use_pass_speculation(driver_idx_hint);
         let (was_pinned, submit_result) = if let Some(rx) = spec_handle
@@ -500,6 +483,30 @@ impl pie::core::inference::HostForwardPass for InstanceState {
                     .and_then(|result| result),
             )
         } else {
+            // WIT spec: "if not provided, fallback to causal mask".
+            if req.masks.is_empty() && !req.position_ids.is_empty() {
+                req.masks = req
+                    .position_ids
+                    .iter()
+                    .map(|&pos| Brle::all_true((pos + 1) as usize))
+                    .collect();
+            }
+            // Finalize per-request indptr shape ([0, N]).
+            let n_tokens = req.token_ids.len() as u32;
+            let n_masks = req.masks.len() as u32;
+            let n_logit = req.logit_masks.len() as u32;
+            let n_sampling = req.sampling_indices.len() as u32;
+            let n_samplers = req.samplers.len() as u32;
+            let n_spec = req.spec_token_ids.len() as u32;
+            req.qo_indptr = vec![0, n_tokens];
+            req.mask_indptr = vec![0, n_masks];
+            req.logit_mask_indptr = vec![0, n_logit];
+            req.sampling_indptr = vec![0, n_sampling];
+            req.sampler_indptr = vec![0, n_samplers];
+            req.spec_indptr = vec![0, n_spec];
+            req.kv_page_indptr = vec![0];
+            req.context_ids = vec![context_id];
+
             // Cold path: pin, validate page capacity, submit.
             let pinned = match context::pin(model_id, context_id, num_input_tokens as u32).await {
                 Ok(p) => p,
@@ -569,8 +576,10 @@ impl pie::core::inference::HostForwardPass for InstanceState {
         if !spec_tokens_for_fill.is_empty() {
             all_fill_tokens.extend_from_slice(&spec_tokens_for_fill);
             all_fill_positions.extend_from_slice(&spec_positions_for_fill);
-            for &pos in &spec_positions_for_fill {
-                all_fill_masks.push(Brle::all_true((pos + 1) as usize));
+            if !all_fill_masks.is_empty() {
+                for &pos in &spec_positions_for_fill {
+                    all_fill_masks.push(Brle::all_true((pos + 1) as usize));
+                }
             }
         }
         if !all_fill_tokens.is_empty() {

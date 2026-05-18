@@ -97,11 +97,17 @@ struct PendingRequest {
 struct RequestCapacityUsage {
     forward_tokens: usize,
     page_refs: usize,
+    logit_rows: usize,
+    prob_rows: usize,
     sampler_rows: usize,
     logprob_labels: usize,
     user_custom_mask_bytes: usize,
     spec_custom_mask_bytes: usize,
     has_spec_drafts: bool,
+    has_dense_logit_requirement: bool,
+    has_prob_sampling: bool,
+    is_single_token_decode: bool,
+    all_samplers_token: bool,
 }
 
 fn request_capacity_usage(req: &PendingRequest, page_size: u32) -> RequestCapacityUsage {
@@ -112,6 +118,26 @@ fn request_capacity_usage(req: &PendingRequest, page_size: u32) -> RequestCapaci
     if spec_tokens > 0 {
         sampler_rows = sampler_rows.saturating_add(spec_tokens.saturating_add(1));
     }
+    let mut all_samplers_token = true;
+    let mut has_prob_sampling = false;
+    for sampler in &req.request.samplers {
+        if !is_token_sampler(sampler) {
+            all_samplers_token = false;
+        }
+        if sampler_needs_prob_rows(sampler) {
+            has_prob_sampling = true;
+        }
+    }
+    let has_output_spec = req.request.output_spec_flags.iter().any(|&enabled| enabled);
+    let has_dense_logit_requirement = req.request.has_user_mask
+        || !req.request.logit_masks.is_empty()
+        || spec_tokens > 0
+        || has_output_spec
+        || !all_samplers_token;
+    let is_single_token_decode = input_tokens == 1
+        && spec_tokens == 0
+        && req.request.single_token_mode
+        && !req.request.has_user_mask;
     let page_refs = req.physical_page_ids.len();
     let spec_custom_mask_bytes =
         packed_mask_bytes(forward_tokens, page_refs, req.last_page_len, page_size);
@@ -124,11 +150,39 @@ fn request_capacity_usage(req: &PendingRequest, page_size: u32) -> RequestCapaci
     RequestCapacityUsage {
         forward_tokens,
         page_refs,
+        logit_rows: 0,
+        prob_rows: 0,
         sampler_rows,
         logprob_labels: request_logprob_labels(&req.request),
         user_custom_mask_bytes,
         spec_custom_mask_bytes,
         has_spec_drafts: spec_tokens > 0,
+        has_dense_logit_requirement,
+        has_prob_sampling,
+        is_single_token_decode,
+        all_samplers_token,
+    }
+}
+
+fn is_token_sampler(sampler: &pie_bridge::Sampler) -> bool {
+    matches!(
+        sampler,
+        pie_bridge::Sampler::Multinomial { .. }
+            | pie_bridge::Sampler::TopK { .. }
+            | pie_bridge::Sampler::TopP { .. }
+            | pie_bridge::Sampler::MinP { .. }
+            | pie_bridge::Sampler::TopKTopP { .. }
+    )
+}
+
+fn sampler_needs_prob_rows(sampler: &pie_bridge::Sampler) -> bool {
+    match sampler {
+        pie_bridge::Sampler::TopK { temperature, k } => *temperature > 0.0 && *k > 0,
+        pie_bridge::Sampler::TopP { temperature, p } => *temperature > 0.0 && *p < 1.0,
+        pie_bridge::Sampler::TopKTopP { temperature, k, p } => {
+            *temperature > 0.0 && (*k > 0 || *p < 1.0)
+        }
+        _ => false,
     }
 }
 
@@ -171,11 +225,17 @@ struct BatchAccumulator {
     requests: Vec<PendingRequest>,
     total_tokens: usize,
     total_pages: usize,
+    total_logit_rows: usize,
+    total_prob_rows: usize,
     total_sampler_rows: usize,
     total_logprob_labels: usize,
     total_user_custom_mask_bytes: usize,
     total_spec_custom_mask_bytes: usize,
     has_spec_drafts: bool,
+    has_dense_logit_requirement: bool,
+    has_prob_sampling: bool,
+    all_single_token_decode: bool,
+    all_samplers_token: bool,
     page_size: u32,
     limits: SchedulerLimits,
 }
@@ -186,20 +246,74 @@ impl BatchAccumulator {
             requests: Vec::new(),
             total_tokens: 0,
             total_pages: 0,
+            total_logit_rows: 0,
+            total_prob_rows: 0,
             total_sampler_rows: 0,
             total_logprob_labels: 0,
             total_user_custom_mask_bytes: 0,
             total_spec_custom_mask_bytes: 0,
             has_spec_drafts: false,
+            has_dense_logit_requirement: false,
+            has_prob_sampling: false,
+            all_single_token_decode: true,
+            all_samplers_token: true,
             page_size,
             limits,
         }
     }
 
+    fn projected_rows(
+        &self,
+        extra: Option<&RequestCapacityUsage>,
+    ) -> (usize, usize, bool, bool, bool) {
+        let total_tokens = self
+            .total_tokens
+            .saturating_add(extra.map(|usage| usage.forward_tokens).unwrap_or(0));
+        let total_sampler_rows = self
+            .total_sampler_rows
+            .saturating_add(extra.map(|usage| usage.sampler_rows).unwrap_or(0));
+        let has_dense_logit_requirement = self.has_dense_logit_requirement
+            || extra
+                .map(|usage| usage.has_dense_logit_requirement)
+                .unwrap_or(false);
+        let has_prob_sampling =
+            self.has_prob_sampling || extra.map(|usage| usage.has_prob_sampling).unwrap_or(false);
+        let all_samplers_token =
+            self.all_samplers_token && extra.map(|usage| usage.all_samplers_token).unwrap_or(true);
+        let all_single_token_decode = self.all_single_token_decode
+            && extra
+                .map(|usage| usage.is_single_token_decode)
+                .unwrap_or(true);
+        let compact_logit_rows = !all_single_token_decode
+            && !has_dense_logit_requirement
+            && !has_prob_sampling
+            && all_samplers_token
+            && total_sampler_rows > 0
+            && total_sampler_rows < total_tokens;
+        let logit_rows = if compact_logit_rows {
+            total_sampler_rows
+        } else {
+            total_tokens
+        };
+        let prob_rows = if has_prob_sampling { total_tokens } else { 0 };
+        (
+            logit_rows,
+            prob_rows,
+            has_dense_logit_requirement,
+            has_prob_sampling,
+            all_single_token_decode,
+        )
+    }
+
     fn push(&mut self, req: PendingRequest) {
-        let usage = request_capacity_usage(&req, self.page_size);
+        let mut usage = request_capacity_usage(&req, self.page_size);
+        let (logit_rows, prob_rows, _, _, _) = self.projected_rows(Some(&usage));
+        usage.logit_rows = logit_rows;
+        usage.prob_rows = prob_rows;
         self.total_tokens = self.total_tokens.saturating_add(usage.forward_tokens);
         self.total_pages = self.total_pages.saturating_add(usage.page_refs);
+        self.total_logit_rows = usage.logit_rows;
+        self.total_prob_rows = usage.prob_rows;
         self.total_sampler_rows = self.total_sampler_rows.saturating_add(usage.sampler_rows);
         self.total_logprob_labels = self
             .total_logprob_labels
@@ -211,11 +325,17 @@ impl BatchAccumulator {
             .total_spec_custom_mask_bytes
             .saturating_add(usage.spec_custom_mask_bytes);
         self.has_spec_drafts |= usage.has_spec_drafts;
+        self.has_dense_logit_requirement |= usage.has_dense_logit_requirement;
+        self.has_prob_sampling |= usage.has_prob_sampling;
+        self.all_single_token_decode &= usage.is_single_token_decode;
+        self.all_samplers_token &= usage.all_samplers_token;
         self.requests.push(req);
     }
 
     fn single_request_limit_error(&self, req: &PendingRequest) -> Option<String> {
         let usage = request_capacity_usage(req, self.page_size);
+        let (logit_rows, prob_rows, _, _, _) =
+            BatchAccumulator::new(self.limits, self.page_size).projected_rows(Some(&usage));
         if usage.forward_tokens > self.limits.max_forward_tokens {
             return Some(format!(
                 "forward request has {} forward tokens, exceeding driver limit {}",
@@ -227,6 +347,20 @@ impl BatchAccumulator {
             return Some(format!(
                 "forward request has {} page refs, exceeding driver limit {}",
                 usage.page_refs, self.limits.max_page_refs
+            ));
+        }
+
+        if logit_rows > self.limits.max_logit_rows {
+            return Some(format!(
+                "forward request needs {} logit rows, exceeding driver limit {}",
+                logit_rows, self.limits.max_logit_rows
+            ));
+        }
+
+        if prob_rows > self.limits.max_prob_rows {
+            return Some(format!(
+                "forward request needs {} probability rows, exceeding driver limit {}",
+                prob_rows, self.limits.max_prob_rows
             ));
         }
 
@@ -276,10 +410,13 @@ impl BatchAccumulator {
             self.total_user_custom_mask_bytes
                 .saturating_add(usage.user_custom_mask_bytes)
         };
+        let (next_logit_rows, next_prob_rows, _, _, _) = self.projected_rows(Some(&usage));
         self.requests.len() + 1 > self.limits.max_forward_requests
             || self.total_tokens.saturating_add(usage.forward_tokens)
                 > self.limits.max_forward_tokens
             || self.total_pages.saturating_add(usage.page_refs) > self.limits.max_page_refs
+            || next_logit_rows > self.limits.max_logit_rows
+            || next_prob_rows > self.limits.max_prob_rows
             || self.total_sampler_rows.saturating_add(usage.sampler_rows)
                 > self.limits.max_sampler_rows
             || self
@@ -298,6 +435,8 @@ impl BatchAccumulator {
         self.requests.len() >= self.limits.max_forward_requests
             || self.total_tokens >= self.limits.max_forward_tokens
             || self.total_pages >= self.limits.max_page_refs
+            || self.total_logit_rows >= self.limits.max_logit_rows
+            || self.total_prob_rows >= self.limits.max_prob_rows
             || self.total_sampler_rows >= self.limits.max_sampler_rows
             || self.total_logprob_labels >= self.limits.max_logprob_labels
             || active_custom_mask_bytes >= self.limits.max_custom_mask_bytes
@@ -318,11 +457,17 @@ impl BatchAccumulator {
     fn take(&mut self) -> Vec<PendingRequest> {
         self.total_tokens = 0;
         self.total_pages = 0;
+        self.total_logit_rows = 0;
+        self.total_prob_rows = 0;
         self.total_sampler_rows = 0;
         self.total_logprob_labels = 0;
         self.total_user_custom_mask_bytes = 0;
         self.total_spec_custom_mask_bytes = 0;
         self.has_spec_drafts = false;
+        self.has_dense_logit_requirement = false;
+        self.has_prob_sampling = false;
+        self.all_single_token_decode = true;
+        self.all_samplers_token = true;
         std::mem::take(&mut self.requests)
     }
 }
@@ -336,6 +481,8 @@ mod tests {
             max_forward_requests: max_requests,
             max_forward_tokens: max_tokens,
             max_page_refs: max_pages,
+            max_logit_rows: usize::MAX,
+            max_prob_rows: usize::MAX,
             max_sampler_rows: usize::MAX,
             max_custom_mask_bytes: usize::MAX,
             max_logprob_labels: usize::MAX,
@@ -364,6 +511,16 @@ mod tests {
 
     fn with_sampler_rows(mut req: PendingRequest, sampler_rows: usize) -> PendingRequest {
         req.request.sampling_indices = vec![0; sampler_rows];
+        req
+    }
+
+    fn with_samplers(
+        mut req: PendingRequest,
+        indices: Vec<u32>,
+        samplers: Vec<pie_bridge::Sampler>,
+    ) -> PendingRequest {
+        req.request.sampling_indices = indices;
+        req.request.samplers = samplers;
         req
     }
 
@@ -482,6 +639,69 @@ mod tests {
         req.request.samplers = vec![pie_bridge::Sampler::Logprobs {
             token_ids: vec![1, 2, 3],
         }];
+        assert!(batch.single_request_limit_error(&req).is_some());
+    }
+
+    #[test]
+    fn accumulator_allows_compact_prefill_logit_rows() {
+        let mut capped = limits(8, 8, 100);
+        capped.max_logit_rows = 2;
+        let batch = BatchAccumulator::new(capped, 16);
+        let req = with_samplers(
+            pending(4, 1),
+            vec![3],
+            vec![pie_bridge::Sampler::TopP {
+                temperature: 0.0,
+                p: 1.0,
+            }],
+        );
+        assert!(batch.single_request_limit_error(&req).is_none());
+    }
+
+    #[test]
+    fn accumulator_splits_by_compact_logit_rows() {
+        let mut capped = limits(8, 100, 100);
+        capped.max_logit_rows = 2;
+        let mut batch = BatchAccumulator::new(capped, 16);
+        let req = || {
+            with_samplers(
+                pending(4, 1),
+                vec![3],
+                vec![pie_bridge::Sampler::TopP {
+                    temperature: 0.0,
+                    p: 1.0,
+                }],
+            )
+        };
+        batch.push(req());
+        assert!(!batch.would_exceed(&req()));
+        batch.push(req());
+        assert!(batch.would_exceed(&req()));
+    }
+
+    #[test]
+    fn accumulator_rejects_dense_logit_over_limit() {
+        let mut capped = limits(8, 100, 100);
+        capped.max_logit_rows = 3;
+        let batch = BatchAccumulator::new(capped, 16);
+        let req = with_samplers(pending(4, 1), vec![3], vec![pie_bridge::Sampler::RawLogits]);
+        assert!(batch.single_request_limit_error(&req).is_some());
+    }
+
+    #[test]
+    fn accumulator_rejects_probability_rows_over_limit() {
+        let mut capped = limits(8, 100, 100);
+        capped.max_logit_rows = 8;
+        capped.max_prob_rows = 3;
+        let batch = BatchAccumulator::new(capped, 16);
+        let req = with_samplers(
+            pending(4, 1),
+            vec![3],
+            vec![pie_bridge::Sampler::TopP {
+                temperature: 1.0,
+                p: 0.9,
+            }],
+        );
         assert!(batch.single_request_limit_error(&req).is_some());
     }
 

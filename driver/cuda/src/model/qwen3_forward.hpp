@@ -57,7 +57,8 @@ struct Qwen3Workspace {
     // Caller passes the worst-case value; ws.gate / ws.up / logits are
     // sized accordingly. Other shapes match the standard `allocate`.
     static Qwen3Workspace allocate_with_max_intermediate(
-        const HfConfig& cfg, int max_tokens, int max_intermediate);
+        const HfConfig& cfg, int max_tokens, int max_intermediate,
+        int max_output_rows = -1);
 
     // Variant for architectures whose per-layer attention dimensions
     // (Hq = num_q_heads * head_dim, Hk = num_kv_heads * head_dim) vary
@@ -67,7 +68,8 @@ struct Qwen3Workspace {
     // layers. Caller passes the worst-case `Hq` and `Hk`.
     static Qwen3Workspace allocate_full(
         const HfConfig& cfg, int max_tokens,
-        int max_intermediate, int max_Hq, int max_Hk);
+        int max_intermediate, int max_Hq, int max_Hk,
+        int max_output_rows = -1);
 };
 
 // Run prefill on `num_tokens` consecutive tokens starting at position 0.

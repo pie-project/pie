@@ -15,7 +15,7 @@
 //!     self-sustains until end-of-reserved-pages, ctx invalidation,
 //!     or fingerprint miss.
 //!   - The inferlet's `execute()` first calls [`try_hit`]
-//!     (lock-free). On match it claims the staged entry's rx and
+//!     directly. On match it claims the staged entry's rx and
 //!     skips the actor mailbox round-trip entirely. On miss/cold
 //!     it falls through to a normal submit through the actor.
 //!
@@ -34,6 +34,8 @@ use crate::context::ContextId;
 use crate::context::pagestore::PhysicalPageId;
 use crate::inference::ForwardOutput;
 use crate::inference::scheduler::SchedulerHandle;
+
+pub(crate) type StagedBatchMap = Arc<Mutex<HashMap<ContextId, VecDeque<StagedEntry>>>>;
 
 /// A pre-fired forward pass for a ctx, sitting in the per-ctx
 /// chain queue waiting for the inferlet's matching `execute()` call.
@@ -57,10 +59,10 @@ struct ModelEntry {
     /// speculation for this model.
     speculation_depth: usize,
     /// One staged-batch map per device on this model.
-    devices: Vec<Arc<Mutex<HashMap<ContextId, VecDeque<StagedEntry>>>>>,
+    devices: Vec<StagedBatchMap>,
 }
 
-/// Per-model registry. The lock-free `try_hit` accesses this
+/// Per-model registry. The inferlet-side `try_hit` accesses this
 /// without going through the inference actor.
 static REGISTRY: LazyLock<Mutex<Vec<ModelEntry>>> = LazyLock::new(|| Mutex::new(Vec::new()));
 
@@ -84,7 +86,7 @@ pub static CHAIN_DROP_COUNT: AtomicU64 = AtomicU64::new(0);
 /// `speculation_depth == 0` disables speculation for this model.
 pub(crate) fn register_model(
     model_idx: usize,
-    staged_batch: &[Arc<Mutex<HashMap<ContextId, VecDeque<StagedEntry>>>>],
+    staged_batch: &[StagedBatchMap],
     speculation_depth: usize,
 ) {
     if let Ok(mut reg) = REGISTRY.lock() {
@@ -116,7 +118,7 @@ fn is_spec_enabled(model_idx: usize) -> bool {
 /// `execute()` — the lookup happens once when the ctx is first
 /// bound to a `ForwardPass`, and the resulting arc is reused.
 #[derive(Clone)]
-pub struct StagedBatch(Arc<Mutex<HashMap<ContextId, VecDeque<StagedEntry>>>>);
+pub struct StagedBatch(StagedBatchMap);
 
 impl std::fmt::Debug for StagedBatch {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -137,7 +139,7 @@ pub fn lookup_for_ctx(model_idx: usize, device_idx: usize) -> Option<StagedBatch
     Some(StagedBatch(arc))
 }
 
-/// Lock-free hit check from the api layer, using a cached
+/// Fast hit check from the api layer, using a cached
 /// `StagedBatch` handle. If the front entry's anchor matches the
 /// inferlet's request, pop it and return the output receiver. On
 /// mismatch, clear the entire chain — deeper stages were built on
@@ -218,7 +220,7 @@ pub(crate) fn spawn_extend_chain(
     sched_rx: oneshot::Receiver<Result<ForwardOutput>>,
     response: oneshot::Sender<Result<ForwardOutput>>,
     scheduler_handle: SchedulerHandle,
-    staged_batch_arc: Arc<Mutex<HashMap<ContextId, VecDeque<StagedEntry>>>>,
+    staged_batch_arc: StagedBatchMap,
     model_idx: usize,
     prev_request: pie_bridge::ForwardRequest,
     all_pages: Vec<PhysicalPageId>,
@@ -287,18 +289,17 @@ pub(crate) fn spawn_extend_chain(
                 };
                 if next_page_idx < all_pages.len() {
                     let next_pages: Vec<PhysicalPageId> = all_pages[..=next_page_idx].to_vec();
-                    let should_extend = match staged_batch_arc.lock() {
-                        Ok(sb) => {
-                            let queued = sb.get(&ctx_id).map_or(0, |d| d.len());
-                            // If this stage completed before the inferlet
-                            // claimed it, the current staged entry is still
-                            // sitting in the deque. Keep one future stage
-                            // ahead of that entry; otherwise the chain breaks
-                            // whenever the GPU outruns the WASM loop.
-                            max_queue_depth > 0 && queued <= max_queue_depth
-                        }
-                        Err(_) => false,
-                    };
+                    let queued = staged_batch_arc
+                        .lock()
+                        .ok()
+                        .and_then(|sb| sb.get(&ctx_id).map(|deque| deque.len()))
+                        .unwrap_or(0);
+                    // If this stage completed before the inferlet
+                    // claimed it, the current staged entry is still
+                    // sitting in the deque. Keep one future stage
+                    // ahead of that entry; otherwise the chain breaks
+                    // whenever the GPU outruns the WASM loop.
+                    let should_extend = max_queue_depth > 0 && queued <= max_queue_depth;
                     if should_extend {
                         let (sched_tx_next, sched_rx_next) = oneshot::channel();
                         let (final_tx_next, final_rx_next) = oneshot::channel();
@@ -437,7 +438,6 @@ pub fn build_next_request(
     let last_pos = *prev_req.position_ids.last()?;
     let next_pos = last_pos.checked_add(1)?;
     let context_id = *prev_req.context_ids.first()?;
-    let causal_mask = pie_bridge::Brle::all_true((next_pos + 1) as usize);
     let next_req = pie_bridge::ForwardRequest {
         token_ids: vec![sampled_token],
         position_ids: vec![next_pos],
@@ -445,8 +445,8 @@ pub fn build_next_request(
         kv_page_indptr: vec![0],
         kv_last_page_lens: Vec::new(),
         qo_indptr: vec![0, 1],
-        masks: vec![causal_mask],
-        mask_indptr: vec![0, 1],
+        masks: Vec::new(),
+        mask_indptr: vec![0, 0],
         logit_masks: Vec::new(),
         logit_mask_indptr: vec![0, 0],
         sampling_indices: vec![0],
@@ -563,9 +563,8 @@ mod tests {
         assert_eq!(anchor_pos, 11);
         assert_eq!(next.token_ids, vec![42]);
         assert_eq!(next.position_ids, vec![11]);
-        assert_eq!(next.masks.len(), 1);
-        assert_eq!(next.masks[0].buffer, vec![0, 12]);
-        assert_eq!(next.mask_indptr, vec![0, 1]);
+        assert!(next.masks.is_empty());
+        assert_eq!(next.mask_indptr, vec![0, 0]);
     }
 
     #[test]

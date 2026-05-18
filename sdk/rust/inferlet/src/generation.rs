@@ -31,6 +31,8 @@ use crate::pie::core::inference::{ForwardPass, Sampler as WitSampler, SlotOutput
 use crate::sample::{Probe, Sampler};
 use crate::spec::Speculator;
 
+const GENERATION_RESERVATION_WINDOW_TOKENS: u32 = 512;
+
 // Re-export so callers don't have to pull from `context` directly.
 pub use crate::context::{Constrain, GrammarConstraint, Schema};
 
@@ -54,6 +56,7 @@ enum SpecMode {
 /// Builder + iterator for token generation. See module docs.
 pub struct Generator<'ctx> {
     ctx: &'ctx mut Context,
+    pass: ForwardPass,
     sampler: Sampler,
     stop: Vec<u32>,
     max_tokens: Option<usize>,
@@ -87,8 +90,12 @@ impl<'ctx> Generator<'ctx> {
             balance, pages, 4096.0, 1.0, page_size, dividend,
         ));
 
+        let pass = ForwardPass::new(&ctx.model);
+        pass.context(&ctx.inner);
+
         Self {
             ctx,
+            pass,
             sampler,
             stop: Vec::new(),
             max_tokens: None,
@@ -359,6 +366,35 @@ impl<'ctx> Generator<'ctx> {
         self.ctx
             .set_bid(compute_bid(balance, pages, mu, cv2, page_size, dividend));
     }
+
+    fn reservation_lookahead_tokens(&self) -> u32 {
+        let remaining = self
+            .horizon
+            .or(self.max_tokens)
+            .map(|limit| limit.saturating_sub(self.tokens_generated))
+            .unwrap_or(0);
+        remaining.min(GENERATION_RESERVATION_WINDOW_TOKENS as usize) as u32
+    }
+
+    fn release_empty_working_pages(&mut self) {
+        let used_pages = if self.ctx.working_tokens == 0 {
+            0
+        } else {
+            self.ctx.working_tokens.div_ceil(self.ctx.page_size)
+        };
+        let excess = self.ctx.working_pages.saturating_sub(used_pages);
+        if excess == 0 {
+            return;
+        }
+        self.ctx.inner.release_working_pages(excess);
+        self.ctx.working_pages -= excess;
+    }
+}
+
+impl Drop for Generator<'_> {
+    fn drop(&mut self) {
+        self.release_empty_working_pages();
+    }
 }
 
 // =============================================================================
@@ -448,7 +484,11 @@ impl<'g, 'ctx> GenStep<'g, 'ctx> {
         // the last cached KV position without growing the working tail.
         let n_total_input = n_pending + n_drafted;
         if n_total_input > 0 {
-            let total_after = parent.ctx.working_tokens + n_total_input;
+            let total_after = parent
+                .ctx
+                .working_tokens
+                .saturating_add(n_total_input)
+                .saturating_add(parent.reservation_lookahead_tokens());
             let pages_needed = (total_after + parent.ctx.page_size - 1) / parent.ctx.page_size;
             let additional = pages_needed.saturating_sub(parent.ctx.working_pages);
             if additional > 0 {
@@ -461,9 +501,10 @@ impl<'g, 'ctx> GenStep<'g, 'ctx> {
             }
         }
 
-        // Build forward pass.
-        let pass = ForwardPass::new(&parent.ctx.model);
-        pass.context(&parent.ctx.inner);
+        // Build forward pass. A Generator is single-context and
+        // single-step-at-a-time, so reuse the same WIT ForwardPass resource
+        // and let the host reset its request accumulator after execute().
+        let pass = &parent.pass;
         if let Some(a) = parent.adapter {
             pass.adapter(a);
         }

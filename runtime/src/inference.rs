@@ -22,7 +22,7 @@ use crate::driver::{DriverId, SchedulerLimits};
 use crate::service::{ServiceArray, ServiceHandler};
 use anyhow::Result;
 use scheduler::BatchScheduler;
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::Ordering::Relaxed;
@@ -32,7 +32,7 @@ pub use speculator::{
     BYPASS_HIT_COUNT, CHAIN_DROP_COUNT, CHAIN_SUBMIT_COUNT, StagedBatch, lookup_for_ctx, try_hit,
 };
 
-use speculator::StagedEntry;
+use speculator::StagedBatchMap;
 
 pub(crate) fn should_use_pass_speculation(driver_idx: usize) -> bool {
     let pinned = crate::context::pinned_count(driver_idx);
@@ -195,7 +195,7 @@ struct InferenceService {
     /// per ctx_id. Inferlet `execute()` calls hit-check the front
     /// of the deque; the chain extender pushes new entries as each
     /// fire completes (bounded by `speculation_depth`).
-    staged_batch: Vec<Arc<Mutex<HashMap<crate::context::ContextId, VecDeque<StagedEntry>>>>>,
+    staged_batch: Vec<StagedBatchMap>,
 }
 
 impl std::fmt::Debug for InferenceService {
@@ -233,9 +233,7 @@ impl InferenceService {
 
         let scheduler_stats: Vec<_> = schedulers.iter().map(|s| s.stats().clone()).collect();
 
-        let staged_batch: Vec<
-            Arc<Mutex<HashMap<crate::context::ContextId, VecDeque<StagedEntry>>>>,
-        > = (0..num_drivers)
+        let staged_batch: Vec<StagedBatchMap> = (0..num_drivers)
             .map(|_| Arc::new(Mutex::new(HashMap::new())))
             .collect();
         speculator::register_model(model_idx, &staged_batch, speculation_depth);
@@ -345,12 +343,14 @@ impl ServiceHandler for InferenceService {
                 // hit, submit cold otherwise, and chain-extend up to
                 // `speculation_depth` pre-fired stages. Inferlet-side
                 // hits typically bypass this path via
-                // `inference::try_hit` (lock-free) before reaching
-                // the actor. Submits reaching this actor are
-                // therefore either cold or post-miss (the api
-                // layer's try_hit returned None).
-                let staged_entry = self.staged_batch[idx].lock().ok().and_then(|mut sb| {
-                    if let Some(deque) = sb.get_mut(&ctx_id) {
+                // `inference::try_hit` before reaching the actor.
+                // Submits reaching this actor are therefore either
+                // cold or post-miss (the api layer's try_hit
+                // returned None).
+                let staged_entry = {
+                    let mut sb = self.staged_batch[idx].lock().ok();
+                    sb.as_mut().and_then(|sb| {
+                        let deque = sb.get_mut(&ctx_id)?;
                         if let Some(front) = deque.front() {
                             let req_token = request.token_ids.first().copied();
                             let req_pos = request.position_ids.first().copied();
@@ -360,13 +360,12 @@ impl ServiceHandler for InferenceService {
                                 return deque.pop_front();
                             }
                         }
-                        // Fingerprint mismatch — drop the entire
-                        // chain. Deeper stages were built on a now-
-                        // invalid assumption.
+                        // Fingerprint mismatch — drop the entire chain.
+                        // Deeper stages were built on a now-invalid assumption.
                         deque.clear();
-                    }
-                    None
-                });
+                        None
+                    })
+                };
 
                 let scheduler_handle = self.schedulers[idx].handle();
                 let staged_batch_arc = self.staged_batch[idx].clone();

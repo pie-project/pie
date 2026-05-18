@@ -173,6 +173,11 @@ float bf16_to_float(std::uint16_t v) {
     return out;
 }
 
+int tensor_rows(const DeviceTensor& t) {
+    if (t.shape().empty()) return 0;
+    return static_cast<int>(t.shape()[0]);
+}
+
 std::int32_t masked_argmax_bf16(
     const std::uint16_t* row,
     int vocab_size,
@@ -991,6 +996,25 @@ void handle_fire_batch(
             all_rows_greedy &&
             is_pure_decode &&
             sample_rows_are_dense;
+        const int logit_rows_required =
+            compact_logit_rows ? num_sampling : N;
+        const int prob_rows_required = any_topk_topp ? N : 0;
+        if (logit_rows_required > tensor_rows(ws.logits)) {
+            std::cerr << "[pie-driver-cuda] fire_batch needs "
+                      << logit_rows_required
+                      << " logit rows, exceeding workspace capacity "
+                      << tensor_rows(ws.logits) << "\n";
+            out_resp = pie_driver::PieForwardResponseView{};
+            return;
+        }
+        if (prob_rows_required > tensor_rows(ws.probs)) {
+            std::cerr << "[pie-driver-cuda] fire_batch needs "
+                      << prob_rows_required
+                      << " probability rows, exceeding workspace capacity "
+                      << tensor_rows(ws.probs) << "\n";
+            out_resp = pie_driver::PieForwardResponseView{};
+            return;
+        }
 
         const SamplingPlan sample_plan{
             any_topk_topp,

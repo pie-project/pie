@@ -23,7 +23,7 @@
 //! re-suspended instead.
 
 use super::pagestore::{PhysicalPageId, compute_last_page_len};
-use super::{ContextId, ContextManager, Record, SERVICES, State};
+use super::{ContextId, ContextManager, Record, SERVICES, State, materialize_lineage_mask};
 use crate::driver::{self, DriverId};
 use crate::inference;
 
@@ -324,7 +324,11 @@ impl ContextManager {
                         0,
                         suffix_tokens[..aligned_len].to_vec(),
                         suffix_positions[..aligned_len].to_vec(),
-                        suffix_masks[..aligned_len].to_vec(),
+                        suffix_masks[..aligned_len]
+                            .iter()
+                            .zip(&suffix_positions[..aligned_len])
+                            .map(|(mask, &position)| materialize_lineage_mask(mask, position))
+                            .collect(),
                         true, // has_user_mask
                         None,
                         Vec::new(),
@@ -359,7 +363,7 @@ impl ContextManager {
                 for info in &working_page_tokens[..num_replay_tokens] {
                     tokens.push(info.token);
                     positions.push(info.position);
-                    masks.push(info.mask.clone());
+                    masks.push(materialize_lineage_mask(&info.mask, info.position));
                 }
 
                 // Try to merge into the last committed suffix request.

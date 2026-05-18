@@ -35,7 +35,7 @@ use super::{Context, ContextId, ContextManager, MARKET, RestoreEntry, State};
 
 #[derive(Debug, Clone)]
 pub(crate) struct AdmissionDenied {
-    pub endowment_pages: f64,
+    pub admission_pages: f64,
     pub total_after: f64,
     pub cap: f64,
     pub total_capacity: f64,
@@ -47,10 +47,10 @@ impl fmt::Display for AdmissionDenied {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "admission denied: Σ endowment would become {} after adding {}, \
+            "admission denied: Σ admission claim would become {} after adding {}, \
              exceeding capacity × factor plus page-rounding slack ({} × {} + {} = {})",
             self.total_after,
-            self.endowment_pages,
+            self.admission_pages,
             self.total_capacity,
             self.oversubscription_factor,
             self.rounding_slack_pages,
@@ -98,6 +98,11 @@ pub(crate) struct ProcessEntry {
     /// Fixed at admission. One endowment unit = one KV page of long-run
     /// residency under contention. Used to weight dividend distribution.
     pub endowment: f64,
+    /// Admission accounting claim (unit: pages). This is bounded by the fair
+    /// share of a driver-reported forward slot so a dense serving wave can be
+    /// admitted without reserving every future output token up front. Market
+    /// balance/endowment stay at the declared budget footprint.
+    pub admission_claim: f64,
 }
 
 impl ProcessEntry {
@@ -108,6 +113,7 @@ impl ProcessEntry {
             context_ids: Vec::new(),
             created_at: Instant::now(),
             endowment: 0.0,
+            admission_claim: 0.0,
         }
     }
 }
@@ -187,43 +193,55 @@ impl ContextManager {
         //   - If the caller passes None, inherit the config default, which
         //     itself is Option<usize> (None = unlimited by default).
         //
+        let total_capacity: f64 = self.gpu_stores.iter().map(|s| s.total_pages() as f64).sum();
+        let fair_slot_share_pages = if self.admission_wave_requests > 0 && total_capacity > 0.0 {
+            (total_capacity / self.admission_wave_requests as f64)
+                .ceil()
+                .max(1.0)
+        } else {
+            self.default_endowment.max(1.0)
+        };
+
         // Credit wallet (balance/endowment): pages entitled under long-run
-        // contention. An explicit token budget is also the caller's declared
-        // future KV footprint, so admission reserves ceil(T / page_size)
-        // credits. This lets short requests fill a large forward cohort while
-        // long requests remain bounded by the available KV page pool.
+        // contention. A token budget caps compute and seeds the market
+        // endowment, but admission should not reserve the request's full
+        // future KV footprint up front: that serializes dense serving bursts
+        // even when the driver can execute a full forward wave and evict later
+        // if the long-run KV peak does not fit. The admission claim is
+        // therefore capped to this process's fair share of one forward slot.
         let tokens_remaining = token_budget.or(self.default_token_limit);
         let endowment_pages = match token_budget {
             Some(t) => t.div_ceil(self.page_size.max(1)) as f64,
             None => self.default_endowment,
         };
+        let admission_claim = endowment_pages.min(fair_slot_share_pages);
 
-        // Admission gate: Σ endowment ≤ capacity × factor + bounded page-rounding slack.
-        // Each endowment unit is a claim on one page of long-run GPU residency.
-        // Token budgets are rounded up to pages, so a dense cohort can be
-        // rejected only because every request paid the same final partial-page
-        // tax. Admit at most one page of slack per forward slot, capped at
-        // 1/16 of the pool, then drain saturated cohorts by full waves rather
-        // than one process at a time.
-        let sigma_e: f64 = self.processes.values().map(|p| p.endowment).sum();
-        let total_capacity: f64 = self.gpu_stores.iter().map(|s| s.total_pages() as f64).sum();
+        // Admission gate: Σ admission_claim ≤ capacity × factor + bounded
+        // page-rounding slack. Each claim unit is one page of expected
+        // near-term GPU residency.
+        // Endowments are rounded up to pages, so a dense cohort can be rejected
+        // only because every request paid the same final partial-page tax.
+        // Admit at most one page of slack per forward slot, capped at 1/16 of
+        // the pool, then drain saturated cohorts by full waves rather than one
+        // process at a time.
+        let sigma_e: f64 = self.processes.values().map(|p| p.admission_claim).sum();
         let rounding_slack_pages =
             self.admission_wave_requests
                 .min(((total_capacity / 16.0).ceil() as usize).max(1)) as f64;
         let cap = total_capacity * self.admission_oversubscription_factor + rounding_slack_pages;
         if self.admission_drain_barrier {
-            let wave_requests = if endowment_pages > 0.0 {
+            let wave_requests = if admission_claim > 0.0 {
                 self.admission_wave_requests
-                    .min((cap / endowment_pages).floor().max(1.0) as usize)
+                    .min((cap / admission_claim).floor().max(1.0) as usize)
                     .max(1)
             } else {
                 self.admission_wave_requests
             };
-            let resume_below = (cap - endowment_pages * wave_requests as f64).max(0.0);
+            let resume_below = (cap - admission_claim * wave_requests as f64).max(0.0);
             if sigma_e > resume_below {
                 return Err(AdmissionDenied {
-                    endowment_pages,
-                    total_after: sigma_e + endowment_pages,
+                    admission_pages: admission_claim,
+                    total_after: sigma_e + admission_claim,
                     cap,
                     total_capacity,
                     rounding_slack_pages,
@@ -233,11 +251,11 @@ impl ContextManager {
             }
             self.admission_drain_barrier = false;
         }
-        if sigma_e + endowment_pages > cap {
+        if sigma_e + admission_claim > cap {
             self.admission_drain_barrier = true;
             return Err(AdmissionDenied {
-                endowment_pages,
-                total_after: sigma_e + endowment_pages,
+                admission_pages: admission_claim,
+                total_after: sigma_e + admission_claim,
                 cap,
                 total_capacity,
                 rounding_slack_pages,
@@ -250,6 +268,7 @@ impl ContextManager {
         entry.tokens_remaining = tokens_remaining;
         entry.balance = endowment_pages;
         entry.endowment = endowment_pages;
+        entry.admission_claim = admission_claim;
         self.processes.insert(pid, entry);
         if let Some(market) = MARKET.get(self.model_idx) {
             market.balances.insert(pid, endowment_pages);
@@ -419,10 +438,6 @@ impl ContextManager {
                 .resize(driver_idx + 1, AuctionResult::default());
         }
 
-        // Build set of in-batch context IDs for O(1) lookup.
-        let batch_set: std::collections::HashSet<ContextId> =
-            batch_ctx_ids.iter().copied().collect();
-
         // All contexts on this driver are admitted by construction (the
         // contention/eviction system enforces physical capacity).
         // Clearing price = smallest bid on the driver when contended; zero otherwise.
@@ -476,10 +491,16 @@ impl ContextManager {
         let mut ctx_payments: Vec<(ContextId, ProcessId, f64)> = Vec::new();
         let mut n_charged = 0usize;
 
-        for (&ctx_id, ctx) in &self.contexts {
-            if !batch_set.contains(&ctx_id) {
+        let mut charged_ctx_ids = Vec::with_capacity(batch_ctx_ids.len());
+        for &ctx_id in batch_ctx_ids {
+            // Only charge in-batch, and charge each context once even if a
+            // caller submits duplicate context IDs in a malformed batch.
+            if charged_ctx_ids.contains(&ctx_id) {
                 continue;
-            } // Only charge in-batch
+            }
+            let Some(ctx) = self.contexts.get(&ctx_id) else {
+                continue;
+            };
             if ctx.owner.is_none() {
                 continue;
             }
@@ -493,6 +514,7 @@ impl ContextManager {
 
             let payment = clearing_price * eff;
             n_charged += 1;
+            charged_ctx_ids.push(ctx_id);
             if let Some(pid) = ctx.owner {
                 ctx_payments.push((ctx_id, pid, payment));
             }
@@ -1308,6 +1330,32 @@ mod tests {
         assert_eq!(entry.balance, 63.0, "initial balance = endowment");
     }
 
+    #[test]
+    fn admission_claim_caps_large_budget_to_fair_forward_slot_share() {
+        let mut mgr = ContextManager::new(0, 16, &[100], &[100], 10, 64, None, 1.0, 0.85);
+        let pid = ProcessId::new_v4();
+        mgr.register_process(pid, Some(16 * 100)).unwrap();
+
+        let entry = mgr.process_entry(pid);
+        assert_eq!(
+            entry.tokens_remaining,
+            Some(16 * 100),
+            "token wallet keeps the explicit compute cap"
+        );
+        assert_eq!(
+            entry.endowment, 100.0,
+            "market endowment keeps the declared KV footprint"
+        );
+        assert_eq!(
+            entry.balance, 100.0,
+            "market balance keeps enough credit for the declared footprint"
+        );
+        assert_eq!(
+            entry.admission_claim, 10.0,
+            "admission reserves only one fair forward-slot share"
+        );
+    }
+
     /// Processes launched without an explicit budget inherit the default,
     /// which is unlimited (None) by system policy.
     #[test]
@@ -1457,7 +1505,7 @@ mod tests {
     }
 
     // =============================================================================
-    // Phase 3: Admission gate (Σ endowment ≤ capacity × admission_oversubscription_factor)
+    // Phase 3: Admission gate (Σ admission_claim ≤ capacity × admission_oversubscription_factor)
     // =============================================================================
 
     /// At factor = 1.0, capacity plus bounded page-rounding slack fits.
@@ -1546,7 +1594,7 @@ mod tests {
         let mut mgr = ContextManager::new(0, 16, &[10], &[10], 4, 1, None, 1.0, 0.85);
 
         // Effective cap is 11 pages. Once denied, the restore wave is 4 one-page
-        // requests, so admission resumes only when Σ endowment <= 7.
+        // requests, so admission resumes only when Σ admission_claim <= 7.
         let pids: Vec<_> = (0..11)
             .map(|_| {
                 let pid = ProcessId::new_v4();

@@ -74,6 +74,7 @@ struct LlamaLikeForwardCfg {
     bool decode_plan_cuda_graph = true;
     bool use_prefill_decode_plan = false;
     int prefill_decode_full_attention_min_requests = 0;
+    int prefill_decode_full_attention_min_kv_pages = 0;
     int prefill_decode_min_kv_pages = 0;
 
     // Tensor-parallel state. `tp_size = 1` (default) keeps the original

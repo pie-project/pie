@@ -117,6 +117,8 @@ fn build_model(m: &config::ModelConfig, hs: &ModelHandshake) -> pie::bootstrap::
                 max_forward_requests: g.caps.max_forward_requests as usize,
                 max_forward_tokens: g.caps.max_forward_tokens as usize,
                 max_page_refs: g.caps.max_page_refs as usize,
+                max_logit_rows: g.caps.max_logit_rows as usize,
+                max_prob_rows: g.caps.max_prob_rows as usize,
                 max_sampler_rows: g.caps.max_sampler_rows as usize,
                 max_custom_mask_bytes: g.caps.max_custom_mask_bytes as usize,
                 max_logprob_labels: g.caps.max_logprob_labels as usize,

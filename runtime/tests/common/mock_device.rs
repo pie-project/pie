@@ -285,6 +285,8 @@ impl MockBackend {
                     max_forward_requests: 32,
                     max_forward_tokens: 4096,
                     max_page_refs: 64,
+                    max_logit_rows: usize::MAX,
+                    max_prob_rows: usize::MAX,
                     max_sampler_rows: usize::MAX,
                     max_custom_mask_bytes: usize::MAX,
                     max_logprob_labels: usize::MAX,

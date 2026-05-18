@@ -241,11 +241,13 @@ CudaMemoryPlan tp_min_plan(const pie_cuda_driver::Config& cfg,
 }
 
 std::size_t workspace_bytes(const pie_cuda_driver::HfConfig& cfg,
-                            int N, int max_intermediate,
+                            int N, int output_rows,
+                            int max_intermediate,
                             int max_Hq, int max_Hk) {
     const auto bf16 = [](std::size_t elems) { return elems * 2; };
     const auto fp32 = [](std::size_t elems) { return elems * 4; };
     const std::size_t n = static_cast<std::size_t>(N);
+    const std::size_t o = static_cast<std::size_t>(std::max(1, output_rows));
     std::size_t bytes = 0;
     bytes += bf16(n * cfg.hidden_size);              // y
     bytes += bf16(n * cfg.hidden_size);              // norm_x
@@ -258,8 +260,8 @@ std::size_t workspace_bytes(const pie_cuda_driver::HfConfig& cfg,
     bytes += bf16(n * cfg.hidden_size);              // norm_y
     bytes += bf16(n * max_intermediate);             // gate
     bytes += bf16(n * max_intermediate);             // up
-    bytes += bf16(n * cfg.vocab_size);               // logits
-    bytes += fp32(n * cfg.vocab_size);               // probs
+    bytes += bf16(o * cfg.vocab_size);               // logits
+    bytes += fp32(o * cfg.vocab_size);               // probs
     if (cfg.head_dim != cfg.head_dim_kernel) {
         const int q_heads = max_Hq / std::max(1, cfg.head_dim);
         const int kv_heads = max_Hk / std::max(1, cfg.head_dim);
@@ -537,12 +539,10 @@ int profile_decode_target(const std::string& profile,
     // above it we often inflate attention/KV pressure without increasing
     // useful device occupancy. The first-order knee tracks SM count; larger
     // GPUs need enough independent rows to keep the decode matmuls full.
-    const int sm_factor = profile == "latency" ? 4 : 6;
+    const int sm_factor =
+        (profile == "latency" || profile == "capacity") ? 4 : 6;
     int target = clamp_pow2_nearest(
         prop.multiProcessorCount * sm_factor, 64, 2048);
-    if (profile == "latency") {
-        target = std::max(32, target / 2);
-    }
     return target;
 }
 
@@ -611,9 +611,12 @@ CudaMemoryPlan plan_cuda_memory(
     CUDA_CHECK(cudaMemGetInfo(&free_bytes, &total_bytes));
 
     const std::size_t current_used = total_bytes - free_bytes;
-    const std::size_t safety = std::max<std::size_t>(
+    const std::size_t graph_runtime_reserve = std::max<std::size_t>(
         512ull * 1024 * 1024,
-        static_cast<std::size_t>(static_cast<double>(total_bytes) * 0.05));
+        static_cast<std::size_t>(static_cast<double>(total_bytes) * 0.01));
+    const std::size_t safety = std::min<std::size_t>(
+        1024ull * 1024 * 1024,
+        graph_runtime_reserve);
     const std::size_t usable = static_cast<std::size_t>(
         static_cast<double>(total_bytes) * cfg.batching.gpu_mem_utilization);
     if (usable <= current_used + safety) {
@@ -627,12 +630,14 @@ CudaMemoryPlan plan_cuda_memory(
 
     const int tp_size = std::max(1, cfg.distributed.tp_size);
     const bool auto_profile = is_auto_memory_profile(cfg.batching.memory_profile);
-    const std::vector<std::string> policy_profiles =
+    std::vector<std::string> policy_profiles =
         planner_policy_profiles(cfg.batching.memory_profile);
-    const int auto_decode_target =
-        profile_decode_target("throughput", cfg, prop);
-    const int auto_prefill_target =
-        profile_prefill_target("throughput", cfg, prop);
+    const bool narrow_latency_auto =
+        auto_profile && prop.multiProcessorCount < 100 && hf.hidden_size <= 2048;
+    if (narrow_latency_auto) {
+        policy_profiles = {"latency"};
+    }
+    const bool score_as_auto = auto_profile && !narrow_latency_auto;
     const std::vector<int> kv_page_sizes =
         derive_kv_page_size_candidates(cfg, hf, prop);
 
@@ -644,6 +649,16 @@ CudaMemoryPlan plan_cuda_memory(
     if (per_kv_token_bytes == 0) {
         throw std::runtime_error("cuda memory planner: computed zero KV page bytes");
     }
+    const std::size_t global_per_kv_token_bytes =
+        per_kv_token_bytes * static_cast<std::size_t>(tp_size);
+    const int throughput_decode_target =
+        profile_decode_target("throughput", cfg, prop);
+    const int auto_decode_target =
+        global_per_kv_token_bytes >= 192ull * 1024ull
+            ? std::min(512, throughput_decode_target)
+            : throughput_decode_target;
+    const int auto_prefill_target =
+        profile_prefill_target("throughput", cfg, prop);
 
     const bool has_linear_state = is_qwen3_5_arch || is_qwen3_5_moe_arch;
     const std::size_t K_dim =
@@ -691,7 +706,7 @@ CudaMemoryPlan plan_cuda_memory(
     if (policy_profile == "capacity") {
         Ns.push_back(std::max(1, prefill_target / 4));
     }
-    if (auto_profile) {
+    if (score_as_auto) {
         Ns.push_back(4 * prefill_target);
         Ns.push_back(std::max(1, prefill_target / 4));
     }
@@ -704,7 +719,7 @@ CudaMemoryPlan plan_cuda_memory(
         64,
         32,
     };
-    if (policy_profile == "throughput" || auto_profile) {
+    if (policy_profile == "throughput" || score_as_auto) {
         Rs.push_back(4 * decode_target);
     }
     if (policy_profile == "latency") {
@@ -726,8 +741,10 @@ CudaMemoryPlan plan_cuda_memory(
                                   static_cast<int>(
                                       (static_cast<std::int64_t>(N) *
                                        std::max(1024, R0 * 64) + 7) / 8)));
+            const int output_rows = R0;
             std::size_t arena = 0;
-            arena += workspace_bytes(hf, N, max_intermediate, max_Hq, max_Hk);
+            arena += workspace_bytes(
+                hf, N, output_rows, max_intermediate, max_Hq, max_Hk);
             if (is_qwen3_5_arch || is_qwen3_5_moe_arch) {
                 arena += qwen3_5_la_workspace_bytes(hf, N);
             }
@@ -764,15 +781,23 @@ CudaMemoryPlan plan_cuda_memory(
             if (kv_pages <= 0) continue;
             const std::size_t kv_tokens =
                 static_cast<std::size_t>(kv_pages) * kv_page_size;
-            const double active_kv_horizon =
-                (auto_profile || policy_profile == "latency" ||
-                 policy_profile == "throughput")
-                    ? 256.0
-                    : 608.0;
+            // A candidate only needs enough KV to be viable for early decode;
+            // admission and eviction can handle longer tails. Scoring, however,
+            // should value layouts that keep a realistic long-output cohort
+            // resident. Using the same small horizon for both made auto prefer
+            // very large request caps that fragmented 512-token generations.
+            const double min_kv_horizon =
+                score_as_auto
+                    ? 544.0
+                    : (policy_profile == "latency" ||
+                       policy_profile == "throughput")
+                          ? 256.0
+                          : 608.0;
+            const double score_kv_horizon = score_as_auto ? 544.0 : 608.0;
             const std::size_t min_kv_tokens = std::max<std::size_t>(
                 32768,
                 static_cast<std::size_t>(
-                    std::ceil(static_cast<double>(R) * active_kv_horizon)));
+                    std::ceil(static_cast<double>(R) * min_kv_horizon)));
             if (kv_tokens < min_kv_tokens) continue;
 
             CudaMemoryPlan p;
@@ -790,17 +815,17 @@ CudaMemoryPlan plan_cuda_memory(
                 N,
                 R,
                 p.max_page_refs,
-                N,
-                N,
+                output_rows,
+                output_rows,
                 max_custom_mask_bytes,
-                N,
-                N,
+                output_rows,
+                output_rows,
             };
 
             const int score_decode_target =
-                auto_profile ? auto_decode_target : decode_target;
+                score_as_auto ? auto_decode_target : decode_target;
             const int score_prefill_target =
-                auto_profile ? auto_prefill_target : prefill_target;
+                score_as_auto ? auto_prefill_target : prefill_target;
             const double prefill_score =
                 target_saturation_score(N, score_prefill_target);
             const double decode_score =
@@ -815,10 +840,10 @@ CudaMemoryPlan plan_cuda_memory(
                 std::log1p(static_cast<double>(kv_tokens) / 65536.0);
             const double kv_headroom =
                 static_cast<double>(kv_tokens) /
-                std::max(1.0, static_cast<double>(R) * active_kv_horizon);
+                std::max(1.0, static_cast<double>(R) * score_kv_horizon);
             const double kv_headroom_score = std::log1p(kv_headroom);
             const double min_headroom =
-                auto_profile ? 1.0 :
+                score_as_auto ? 1.0 :
                 policy_profile == "capacity" ? 1.0 :
                 policy_profile == "throughput" ? 1.0 :
                 1.25;
@@ -830,14 +855,14 @@ CudaMemoryPlan plan_cuda_memory(
             double page_score = 0.0;
             if (policy_profile == "latency") {
                 page_score = (kv_page_size == 16) ? 0.20 : -0.20;
-            } else if (policy_profile == "throughput" || auto_profile) {
+            } else if (policy_profile == "throughput" || score_as_auto) {
                 page_score = (kv_page_size == 32) ? 0.25 : 0.0;
             } else {
                 page_score = (kv_page_size == 32) ? 0.15 : 0.0;
             }
             double score = 0.0;
             const auto& profile = policy_profile;
-            if (auto_profile) {
+            if (score_as_auto) {
                 const double cohort_score =
                     target_saturation_score(R, score_decode_target);
                 const double kv_residency_score =
@@ -1690,7 +1715,8 @@ int run_impl(int argc,
 
     auto ws = pie_cuda_driver::model::Qwen3Workspace::allocate_full(
         engine.hf_config(), max_workspace_tokens,
-        max_mlp_intermediate, max_Hq, max_Hk);
+        max_mlp_intermediate, max_Hq, max_Hk,
+        mem_plan.capacity.max_logit_rows);
 
     auto kv_cache =
         is_gemma4_arch
@@ -1952,16 +1978,28 @@ int run_impl(int argc,
             fwd_cfg.sliding_window < 0 &&
             fwd_cfg.per_layer_window_left.empty();
         if (fwd_cfg.use_prefill_decode_plan) {
+            const std::size_t rank_kv_token_bytes =
+                kv_page_bytes_homogeneous(hf, std::max(1, cfg.distributed.tp_size));
+            const std::size_t global_kv_token_bytes =
+                rank_kv_token_bytes *
+                static_cast<std::size_t>(std::max(1, cfg.distributed.tp_size));
+            const bool kv_heavy_attention =
+                global_kv_token_bytes >= 192ull * 1024ull;
             // For Hopper full-attention decode routed through FlashInfer's
-            // prefill kernel, the sliding-capable specialization remains
-            // faster through the common <=512-request serving cohorts. Keep
-            // the no-sliding variant for very wide cohorts only.
-            fwd_cfg.prefill_decode_full_attention_min_requests = 1024;
+            // prefill kernel, KV-heavy models benefit from entering the
+            // split/full-attention prefill variant earlier to keep long
+            // generations resident. Smaller dense models prefer the lower
+            // overhead decode path until the KV history is deeper.
+            fwd_cfg.prefill_decode_full_attention_min_requests =
+                kv_heavy_attention ? 256 : 1024;
+            fwd_cfg.prefill_decode_full_attention_min_kv_pages =
+                kv_heavy_attention ? 7 : 0;
             // The dedicated decode kernel is faster for short KV histories on
             // Hopper; switch to the prefill-plan path only after the batch has
             // enough average KV pages for split-KV/full-attention work to pay
             // for itself.
-            fwd_cfg.prefill_decode_min_kv_pages = 12;
+            fwd_cfg.prefill_decode_min_kv_pages =
+                kv_heavy_attention ? 6 : 12;
         }
 
         if (verbose) {

@@ -116,9 +116,13 @@ void prepare_llama_like_decode_plan(
         for (int r = 0; r <= num_requests; ++r) {
             qo_indptr_h[r] = static_cast<std::uint32_t>(r);
         }
+        const int min_full_attention_pages =
+            std::max(0, fwd_cfg.prefill_decode_full_attention_min_kv_pages);
         const bool full_attention_variant =
             fwd_cfg.prefill_decode_full_attention_min_requests > 0 &&
             num_requests >= fwd_cfg.prefill_decode_full_attention_min_requests &&
+            (min_full_attention_pages == 0 ||
+             avg_kv_pages >= min_full_attention_pages) &&
             fwd_cfg.sliding_window < 0 &&
             fwd_cfg.per_layer_window_left.empty();
         ops::plan_attention_flashinfer_prefill_bf16(

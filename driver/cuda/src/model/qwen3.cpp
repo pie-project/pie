@@ -233,7 +233,9 @@ Qwen3Weights bind_llama_like(LoadedModel& engine, bool drop_fused_originals) {
         const bool gu_bf16 =
             L.gate_proj->dtype() == DType::BF16 &&
             L.up_proj->dtype() == DType::BF16;
-        if (!qkv_quantized && qkv_bf16) {
+        const bool qkv_has_bias =
+            L.q_bias != nullptr || L.k_bias != nullptr || L.v_bias != nullptr;
+        if (!qkv_quantized && qkv_bf16 && !qkv_has_bias) {
             const std::string fused_name = p + "self_attn.qkv_proj.fused.weight";
             if (!engine.has(fused_name)) {
                 fuse_three_rowwise_bf16(
