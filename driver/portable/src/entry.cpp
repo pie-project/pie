@@ -30,10 +30,14 @@
 #include "aux_server.hpp"
 #include "config.hpp"
 #include "forward.hpp"
+#include "gguf_tokenizer.hpp"
 #include "hf_config.hpp"
 #include "model.hpp"
 #include "shmem_ipc.hpp"
 #include "shmem_schema.hpp"
+
+#include <filesystem>
+#include <unistd.h>
 
 namespace {
 
@@ -281,6 +285,25 @@ int run_impl(int argc,
                   << ", backend=" << model.backend_name() << ")\n";
     }
 
+    // GGUF embeds the tokenizer in KV; emit HF-format files to a temp
+    // dir and report that as `snapshot_dir` so the server-side
+    // `Tokenizer::from_file(snapshot_dir / "tokenizer.json")` works.
+    std::string effective_snapshot_dir = cfg.model.hf_path;
+    {
+        const std::filesystem::path src(cfg.model.hf_path);
+        if (std::filesystem::is_regular_file(src) && src.extension() == ".gguf") {
+            const auto tmpdir = std::filesystem::temp_directory_path() /
+                ("pie-gguf-tokenizer-" + std::to_string(::getpid()));
+            std::filesystem::create_directories(tmpdir);
+            pie_portable_driver::emit_tokenizer_files(src, tmpdir);
+            effective_snapshot_dir = tmpdir.string();
+            if (cfg.runtime.verbose) {
+                std::cerr << "[pie-driver-portable] minted tokenizer.json to "
+                          << effective_snapshot_dir << "\n";
+            }
+        }
+    }
+
     // ---- Allocate forward engine + paged KV pool. ---------------------------
     // The runtime owns page allocation; we report total_pages and page_size
     // in the READY handshake and honor the page IDs the runtime sends in
@@ -419,7 +442,7 @@ int run_impl(int argc,
         {"vocab_size",       h.vocab_size},
         {"max_model_len",    max_model_len},
         {"activation_dtype", model.activation_dtype_str()},
-        {"snapshot_dir",     cfg.model.hf_path},
+        {"snapshot_dir",     effective_snapshot_dir},
         {"shmem_name",       cfg.shmem.name},
     };
     // Hand caps to the host. The standalone executable's default
