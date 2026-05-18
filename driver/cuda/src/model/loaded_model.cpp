@@ -211,14 +211,7 @@ LoadedModel LoadedModel::load(const Config& boot_cfg, NcclComm* tp_comm) {
     e.hf_ = parse_hf_config(snapshot / "config.json");
 
     // Bind to the requested CUDA device before we allocate anything.
-    int dev_id = 0;
-    {
-        const auto& d = boot_cfg.model.device;
-        const auto colon = d.find(':');
-        if (colon != std::string::npos) {
-            dev_id = std::stoi(d.substr(colon + 1));
-        }
-    }
+    const int dev_id = parse_cuda_device_id(boot_cfg.model.device);
     CUDA_CHECK(cudaSetDevice(dev_id));
 
     // Compute capability — used by the runtime-quant skip (sm<89) and

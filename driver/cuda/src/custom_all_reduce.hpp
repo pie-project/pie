@@ -1,10 +1,11 @@
 #pragma once
 
-// Custom NVLink P2P all-reduce, wrapping flashinfer's vllm-style kernel
+// Custom P2P all-reduce, wrapping flashinfer's vllm-style kernel
 // (`flashinfer/comm/vllm_custom_all_reduce.cuh`). Roughly 2-3× lower
-// latency than NCCL for sub-MB BF16 reductions on NVSwitch/NVLink, which
-// is the regime our per-layer attn-O / MLP-down all-reduces hit at TP=2
-// for small-to-medium models.
+// latency than NCCL for sub-MB BF16 reductions on TP=2, which is the
+// regime our per-layer attn-O / MLP-down all-reduces hit for
+// small-to-medium models. For TP>2 the vLLM kernel needs a fully-connected
+// fast interconnect topology.
 //
 // Lifecycle:
 //   1. Construct once at startup (after NCCL is up).
@@ -15,7 +16,7 @@
 //   3. During CUDA graph capture, `register_graph_buffers` fills the
 //      deferred rank-data slots recorded by flashinfer's custom AR body.
 //   4. `all_reduce_bf16` dispatches the kernel; falls back to NCCL when
-//      the message exceeds the kernel's NVLink-friendly threshold.
+//      the message exceeds the custom kernel's useful threshold.
 
 #include <cstddef>
 #include <cstdint>
@@ -62,9 +63,9 @@ public:
     void register_graph_buffers(NcclComm& comm);
 
     // Returns true when the kernel will handle `bytes` directly. Above
-    // the threshold (~512 KB for 2-rank, less for higher TP) the kernel
-    // falls off NCCL on bandwidth, so we short-circuit and return false
-    // — caller should fall back to ncclAllReduce.
+    // the threshold the kernel falls off NCCL on bandwidth, so we
+    // short-circuit and return false — caller should fall back to
+    // ncclAllReduce.
     bool can_handle(const void* input, std::size_t bytes,
                     cudaStream_t stream) const noexcept;
     bool can_fuse_residual_rmsnorm(int tokens, int hidden,
@@ -87,7 +88,7 @@ public:
 private:
     int rank_ = 0;
     int world_size_ = 1;
-    bool full_nvlink_ = true;
+    bool fully_connected_ = false;
     bool same_process_ = false;
     std::size_t max_bytes_ = 0;
     vllm::Signal* signal_self_ = nullptr;

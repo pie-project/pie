@@ -104,11 +104,14 @@ CustomAllReduce::CustomAllReduce(NcclComm& comm,
     }
 
     // Best-effort peer access; cudaIpcOpenMemHandle below will surface a
-    // hard error if NVLink P2P isn't actually available between this
-    // GPU and any peer.
+    // hard error if P2P is not actually available between this GPU and a peer.
     int dev = 0;
     CUDA_CHECK(cudaGetDevice(&dev));
     enable_peer_access(dev, world_size_);
+    // We only construct this wrapper for TP=2 today. vLLM allows custom
+    // all-reduce on two PCIe GPUs; the fully-connected flag only affects
+    // world sizes above two.
+    fully_connected_ = false;
 
     // Allocate the local Signal struct plus the temporary region needed by
     // flashinfer's 2-stage algorithm. TP=2 uses the 1-stage kernel, but
@@ -163,7 +166,7 @@ CustomAllReduce::CustomAllReduce(NcclComm& comm,
 
     impl_ = std::make_unique<vllm::CustomAllreduce>(
         signal_peers_.data(), rank_data_, rank_data_bytes_,
-        rank_, world_size_, full_nvlink_);
+        rank_, world_size_, fully_connected_);
 
     if (world_size_ == 2 && fusion_max_tokens > 0 && fusion_hidden > 0) {
         fusion_max_tokens_ = fusion_max_tokens;
@@ -259,7 +262,8 @@ CustomAllReduce::CustomAllReduce(NcclComm& comm,
     std::cerr << "[custom_all_reduce] initialised (world=" << world_size_
               << ", rank=" << rank_
               << ", mode=" << (same_process_ ? "same-process" : "ipc")
-              << ", NVLink=" << (full_nvlink_ ? "yes" : "no")
+              << ", fully_connected="
+              << (fully_connected_ ? "yes" : "no")
               << ")\n";
 }
 
@@ -286,7 +290,8 @@ CustomAllReduce::~CustomAllReduce() {
 }
 
 CustomAllReduce::CustomAllReduce(CustomAllReduce&& o) noexcept
-    : rank_(o.rank_), world_size_(o.world_size_), full_nvlink_(o.full_nvlink_),
+    : rank_(o.rank_), world_size_(o.world_size_),
+      fully_connected_(o.fully_connected_),
       same_process_(o.same_process_), max_bytes_(o.max_bytes_),
       signal_self_(o.signal_self_), signal_peers_(std::move(o.signal_peers_)),
       rank_data_(o.rank_data_), rank_data_bytes_(o.rank_data_bytes_),
@@ -320,6 +325,7 @@ bool CustomAllReduce::can_handle(const void* input, std::size_t bytes,
                                  cudaStream_t stream) const noexcept {
     if (!impl_ || input == nullptr) return false;
     if (bytes == 0 || bytes > max_bytes_ || (bytes % 16) != 0) return false;
+    if (world_size_ > 2 && !fully_connected_) return false;
     cudaStreamCaptureStatus status = cudaStreamCaptureStatusNone;
     if (cudaStreamIsCapturing(stream, &status) != cudaSuccess) return false;
     if (status == cudaStreamCaptureStatusActive) return true;
@@ -332,9 +338,9 @@ bool CustomAllReduce::can_handle(const void* input, std::size_t bytes,
     if (registered_bases_.find(base) == registered_bases_.end()) return false;
     // The vllm one-shot kernel handles arbitrary sizes correctly; the
     // question is just where NCCL takes over on raw bandwidth. On
-    // NVLink/NVSwitch the crossover is around a few MB for 2 ranks,
-    // less for higher TP. Be generous on small TP (2 ranks); tighter
-    // thresholds for larger TP where the kernel becomes the bottleneck.
+    // fast interconnects the crossover is around a few MB for 2 ranks,
+    // less for higher TP. Be generous on small TP; tighter thresholds for
+    // larger TP where the kernel becomes the bottleneck.
     if (world_size_ <= 2)         return bytes < max_bytes_;
     if (world_size_ <= 4)         return bytes < 1 * 1024 * 1024;
     return bytes < 256 * 1024;

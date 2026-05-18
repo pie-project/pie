@@ -195,9 +195,7 @@ impl ContextManager {
         //
         let total_capacity: f64 = self.gpu_stores.iter().map(|s| s.total_pages() as f64).sum();
         let fair_slot_share_pages = if self.admission_wave_requests > 0 && total_capacity > 0.0 {
-            (total_capacity / self.admission_wave_requests as f64)
-                .ceil()
-                .max(1.0)
+            (total_capacity / self.admission_wave_requests as f64).max(1.0)
         } else {
             self.default_endowment.max(1.0)
         };

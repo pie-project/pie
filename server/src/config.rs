@@ -399,7 +399,7 @@ fn default_endowment_pages() -> usize {
     64
 }
 fn default_oversubscription_factor() -> f64 {
-    1.0
+    4.0
 }
 fn default_restore_pause_at_utilization() -> f64 {
     0.85

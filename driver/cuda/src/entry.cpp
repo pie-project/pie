@@ -399,15 +399,19 @@ std::size_t persistent_input_bytes(int N, int R, int max_page_refs,
     return bytes;
 }
 
+bool flashinfer_decode_supports_gqa(int gqa) {
+    return gqa == 1 || gqa == 2 || gqa == 3 || gqa == 4 || gqa == 8;
+}
+
 std::size_t attention_float_workspace_bytes(
     const pie_cuda_driver::HfConfig& hf,
     const pie_cuda_driver::Config& cfg,
-    const cudaDeviceProp& prop,
+    const cudaDeviceProp&,
     int max_requests)
 {
     const std::size_t base = 80ull * 1024 * 1024;
     const int tp_size = std::max(1, cfg.distributed.tp_size);
-    if (prop.major < 9 || tp_size != 1 || max_requests <= 0) {
+    if (tp_size != 1 || max_requests <= 0) {
         return base;
     }
     if (hf.num_key_value_heads <= 0 ||
@@ -415,8 +419,7 @@ std::size_t attention_float_workspace_bytes(
         return base;
     }
     const int gqa = hf.num_attention_heads / hf.num_key_value_heads;
-    const bool gqa_in_decode_set =
-        gqa == 1 || gqa == 2 || gqa == 3 || gqa == 4 || gqa == 8;
+    const bool gqa_in_decode_set = flashinfer_decode_supports_gqa(gqa);
     const bool supported_head_dim =
         hf.head_dim_kernel == 64 || hf.head_dim_kernel == 128 ||
         hf.head_dim_kernel == 256 || hf.head_dim_kernel == 512;
@@ -561,8 +564,11 @@ int profile_prefill_target(const std::string& profile,
                            const cudaDeviceProp& prop) {
     const int tp = std::max(1, cfg.distributed.tp_size);
     const int tp_factor = std::min(tp, 2);
-    const int sm_factor = profile == "throughput" ? 32 : 16;
-    const int max_target = profile == "throughput" ? 4096 : 8192;
+    const bool wide_prefill_device = prop.major >= 12;
+    const int sm_factor =
+        profile == "throughput" ? (wide_prefill_device ? 64 : 32) : 16;
+    const int max_target =
+        profile == "throughput" ? (wide_prefill_device ? 8192 : 4096) : 8192;
     int target = clamp_pow2_nearest(
         prop.multiProcessorCount * sm_factor * tp_factor, 512, max_target);
     if (profile == "latency" || profile == "capacity") {
@@ -586,6 +592,10 @@ void uniq_clip_desc(std::vector<int>& xs, int cap) {
     std::sort(xs.begin(), xs.end());
     xs.erase(std::unique(xs.begin(), xs.end()), xs.end());
     std::reverse(xs.begin(), xs.end());
+}
+
+int prefill_candidate_cap(const cudaDeviceProp& prop) {
+    return prop.major >= 12 ? 16384 : 8192;
 }
 
 CudaMemoryPlan plan_cuda_memory(
@@ -654,11 +664,10 @@ CudaMemoryPlan plan_cuda_memory(
     const int throughput_decode_target =
         profile_decode_target("throughput", cfg, prop);
     const int auto_decode_target =
-        global_per_kv_token_bytes >= 192ull * 1024ull
-            ? std::min(512, throughput_decode_target)
-            : throughput_decode_target;
+        std::min(512, throughput_decode_target);
+    const int prefill_cap = prefill_candidate_cap(prop);
     const int auto_prefill_target =
-        profile_prefill_target("throughput", cfg, prop);
+        std::min(prefill_cap, 2 * profile_prefill_target("throughput", cfg, prop));
 
     const bool has_linear_state = is_qwen3_5_arch || is_qwen3_5_moe_arch;
     const std::size_t K_dim =
@@ -725,7 +734,7 @@ CudaMemoryPlan plan_cuda_memory(
     if (policy_profile == "latency") {
         Rs.push_back(std::max(1, decode_target / 4));
     }
-    uniq_clip_desc(Ns, 8192);
+    uniq_clip_desc(Ns, prefill_cap);
     uniq_clip_desc(Rs, 4096);
     for (int kv_page_size : kv_page_sizes) {
         const std::size_t per_page_bytes =
@@ -786,14 +795,22 @@ CudaMemoryPlan plan_cuda_memory(
             // should value layouts that keep a realistic long-output cohort
             // resident. Using the same small horizon for both made auto prefer
             // very large request caps that fragmented 512-token generations.
+            const bool kv_heavy_model =
+                global_per_kv_token_bytes >= 192ull * 1024ull;
+            const bool low_horizon_kv_heavy =
+                kv_heavy_model &&
+                (prop.major >= 12 ||
+                 total_bytes >= 120ull * 1024ull * 1024ull * 1024ull);
             const double min_kv_horizon =
                 score_as_auto
-                    ? 544.0
-                    : (policy_profile == "latency" ||
-                       policy_profile == "throughput")
+                    ? (low_horizon_kv_heavy ? 128.0 : 256.0)
+                    : policy_profile == "latency"
                           ? 256.0
-                          : 608.0;
-            const double score_kv_horizon = score_as_auto ? 544.0 : 608.0;
+                          : policy_profile == "throughput"
+                              ? 512.0
+                              : 608.0;
+            const double score_kv_horizon =
+                score_as_auto ? (low_horizon_kv_heavy ? 384.0 : 544.0) : 608.0;
             const std::size_t min_kv_tokens = std::max<std::size_t>(
                 32768,
                 static_cast<std::size_t>(
@@ -853,9 +870,19 @@ CudaMemoryPlan plan_cuda_memory(
                 static_cast<double>(arena + state_bytes) /
                 static_cast<double>(budget);
             double page_score = 0.0;
-            if (policy_profile == "latency") {
+            if (score_as_auto) {
+                const bool latency_shaped =
+                    policy_profile == "latency" && R <= 256;
+                const bool metadata_heavy =
+                    R >= 512 || N >= 4096 || p.max_page_refs >= 262144;
+                if (latency_shaped && !metadata_heavy) {
+                    page_score = (kv_page_size == 16) ? 0.20 : -0.05;
+                } else {
+                    page_score = (kv_page_size == 32) ? 0.20 : 0.0;
+                }
+            } else if (policy_profile == "latency") {
                 page_score = (kv_page_size == 16) ? 0.20 : -0.20;
-            } else if (policy_profile == "throughput" || score_as_auto) {
+            } else if (policy_profile == "throughput") {
                 page_score = (kv_page_size == 32) ? 0.25 : 0.0;
             } else {
                 page_score = (kv_page_size == 32) ? 0.15 : 0.0;
@@ -1450,12 +1477,8 @@ int run_impl(int argc,
     // Bind the requested CUDA device before NCCL init — ncclCommInitRank
     // captures whatever is current on the calling thread.
     {
-        const std::string& dev = cfg.model.device;
-        const auto colon = dev.find(':');
-        const int dev_id = (colon == std::string::npos)
-            ? 0
-            : std::atoi(dev.c_str() + colon + 1);
-        CUDA_CHECK(cudaSetDevice(dev_id));
+        CUDA_CHECK(cudaSetDevice(
+            pie_cuda_driver::parse_cuda_device_id(cfg.model.device)));
     }
 
     pie_cuda_driver::NcclComm tp_comm;
@@ -1913,13 +1936,10 @@ int run_impl(int argc,
         fwd_cfg.yarn_high_freq_factor     = hf.rope_high_freq_factor;
         fwd_cfg.yarn_original_max_position = hf.rope_original_max_position;
         fwd_cfg.sliding_window            = hf.sliding_window;
-        // flashinfer's decode kernel (DISPATCH_GQA_GROUP_SIZE in
-        // utils.cuh) instantiates GQA group sizes {1, 2, 3, 4, 8}.
-        // Models like Qwen2-0.5B (group=7), Qwen2-1.5B (group=6) need
-        // the prefill kernel even for decode-only fires.
+        // FlashInfer's decode dispatch set covers {1, 2, 3, 4, 8}. Other
+        // GQA ratios use the prefill path for decode-only batches as well.
         const int gqa = hf.num_attention_heads / hf.num_key_value_heads;
-        const bool gqa_in_decode_set = (gqa == 1 || gqa == 2 || gqa == 3
-                                        || gqa == 4 || gqa == 8);
+        const bool gqa_in_decode_set = flashinfer_decode_supports_gqa(gqa);
         fwd_cfg.force_prefill_path = !gqa_in_decode_set;
         fwd_cfg.decode_plan_cuda_graph = use_cuda_graphs;
         // Tensor-parallel state. tp_comm == nullptr at tp_size == 1
@@ -1985,21 +2005,14 @@ int run_impl(int argc,
                 static_cast<std::size_t>(std::max(1, cfg.distributed.tp_size));
             const bool kv_heavy_attention =
                 global_kv_token_bytes >= 192ull * 1024ull;
-            // For Hopper full-attention decode routed through FlashInfer's
-            // prefill kernel, KV-heavy models benefit from entering the
-            // split/full-attention prefill variant earlier to keep long
-            // generations resident. Smaller dense models prefer the lower
-            // overhead decode path until the KV history is deeper.
-            fwd_cfg.prefill_decode_full_attention_min_requests =
-                kv_heavy_attention ? 256 : 1024;
-            fwd_cfg.prefill_decode_full_attention_min_kv_pages =
-                kv_heavy_attention ? 7 : 0;
-            // The dedicated decode kernel is faster for short KV histories on
-            // Hopper; switch to the prefill-plan path only after the batch has
-            // enough average KV pages for split-KV/full-attention work to pay
-            // for itself.
+            // The dedicated decode kernel is faster for short KV histories.
+            // Switch to the prefill-plan path only after the batch has enough
+            // average KV pages for split-KV/full-attention work to pay for
+            // itself.
             fwd_cfg.prefill_decode_min_kv_pages =
-                kv_heavy_attention ? 6 : 12;
+                kv_heavy_attention ? 6 : 7;
+            fwd_cfg.prefill_decode_full_attention_min_requests = 256;
+            fwd_cfg.prefill_decode_full_attention_min_kv_pages = 7;
         }
 
         if (verbose) {
@@ -2020,8 +2033,7 @@ int run_impl(int argc,
         const auto& hf = engine.hf_config();
         gemma4_fwd_cfg.final_logit_softcap = hf.gemma_final_logit_softcap;
         const int gqa = hf.num_attention_heads / hf.num_key_value_heads;
-        const bool gqa_in_decode_set = (gqa == 1 || gqa == 2 || gqa == 3
-                                        || gqa == 4 || gqa == 8);
+        const bool gqa_in_decode_set = flashinfer_decode_supports_gqa(gqa);
         gemma4_fwd_cfg.force_prefill_path = !gqa_in_decode_set;
         gemma4_fwd_cfg.tp_size = cfg.distributed.tp_size;
         gemma4_fwd_cfg.tp_comm = tp_comm_ptr;
@@ -2185,8 +2197,7 @@ int run_impl(int argc,
             const int gqa_q = hf_q.num_attention_heads /
                               std::max(1, hf_q.num_key_value_heads);
             q35_fwd.force_prefill_path =
-                !(gqa_q == 1 || gqa_q == 2 || gqa_q == 3 ||
-                  gqa_q == 4 || gqa_q == 8);
+                !flashinfer_decode_supports_gqa(gqa_q);
             q35_fwd.tp_size = q35_tp_size;
             q35_fwd.tp_comm = q35_tp_comm;
             pie_cuda_driver::model::prepare_qwen3_5_decode_plan(
@@ -2219,8 +2230,7 @@ int run_impl(int argc,
             const int gqa_q = hf_q.num_attention_heads /
                               std::max(1, hf_q.num_key_value_heads);
             q35_fwd.force_prefill_path =
-                !(gqa_q == 1 || gqa_q == 2 || gqa_q == 3 ||
-                  gqa_q == 4 || gqa_q == 8);
+                !flashinfer_decode_supports_gqa(gqa_q);
             q35_fwd.tp_size = q35_tp_size;
             q35_fwd.tp_comm = q35_tp_comm;
             pie_cuda_driver::model::qwen3_5_forward_paged(
@@ -2246,8 +2256,7 @@ int run_impl(int argc,
             const int gqa_q = hf_q.num_attention_heads /
                               std::max(1, hf_q.num_key_value_heads);
             q35_fwd.force_prefill_path =
-                !(gqa_q == 1 || gqa_q == 2 || gqa_q == 3 ||
-                  gqa_q == 4 || gqa_q == 8);
+                !flashinfer_decode_supports_gqa(gqa_q);
             q35_fwd.tp_size = q35moe_tp_size;
             q35_fwd.tp_comm = q35moe_tp_comm;
             pie_cuda_driver::model::prepare_qwen3_5_decode_plan(
@@ -2281,8 +2290,7 @@ int run_impl(int argc,
             const int gqa_q = hf_q.num_attention_heads /
                               std::max(1, hf_q.num_key_value_heads);
             q35_fwd.force_prefill_path =
-                !(gqa_q == 1 || gqa_q == 2 || gqa_q == 3 ||
-                  gqa_q == 4 || gqa_q == 8);
+                !flashinfer_decode_supports_gqa(gqa_q);
             q35_fwd.tp_size = q35moe_tp_size;
             q35_fwd.tp_comm = q35moe_tp_comm;
             pie_cuda_driver::model::qwen3_5_moe_forward_paged(

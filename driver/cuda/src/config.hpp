@@ -54,6 +54,25 @@ struct Config {
     RuntimeConfig runtime;
 };
 
+inline int parse_cuda_device_id(const std::string& device) {
+    const auto colon = device.find(':');
+    const std::string id_str =
+        colon == std::string::npos ? device : device.substr(colon + 1);
+    std::size_t consumed = 0;
+    int id = 0;
+    try {
+        id = std::stoi(id_str, &consumed);
+    } catch (const std::exception&) {
+        throw std::runtime_error(
+            "invalid CUDA device '" + device + "'; expected cuda:N or N");
+    }
+    if (consumed != id_str.size() || id < 0) {
+        throw std::runtime_error(
+            "invalid CUDA device '" + device + "'; expected cuda:N or N");
+    }
+    return id;
+}
+
 inline Config load_config(const std::filesystem::path& path) {
     if (!std::filesystem::exists(path)) {
         throw std::runtime_error("config not found: " + path.string());

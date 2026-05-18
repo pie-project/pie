@@ -139,6 +139,7 @@ struct DecodePlanCache {
     int num_kv_heads = 0;
     int head_dim = 0;
     int page_size = 0;
+    bool enable_pdl = false;
     bool valid = false;
 };
 
@@ -222,10 +223,6 @@ cudaError_t plan_decode_for_head_dim(
             enable_cuda_graph,
             stream, work_estimator);
     };
-    // Must match the kernel-side DISPATCH_GQA_GROUP_SIZE set in
-    // flashinfer/utils.cuh ({1, 2, 3, 4, 8}). Other group sizes (5/6/7)
-    // are routed to the prefill path by main.cpp's force_prefill_path
-    // gate, so they never reach this dispatch.
     switch (gqa_group_size) {
         case 1: return plan_for(DecodeWorkEstimator<HEAD_DIM, 1>{});
         case 2: return plan_for(DecodeWorkEstimator<HEAD_DIM, 2>{});
@@ -235,7 +232,8 @@ cudaError_t plan_decode_for_head_dim(
     }
     throw std::runtime_error(
         "flashinfer decode: unsupported GQA group size " +
-        std::to_string(gqa_group_size) + " (instantiated: 1, 2, 3, 4, 8)");
+        std::to_string(gqa_group_size) +
+        " (instantiated: 1, 2, 3, 4, 8)");
 }
 
 }  // namespace
@@ -301,6 +299,7 @@ void plan_attention_flashinfer_decode_bf16(
     cache.num_kv_heads = num_kv_heads;
     cache.head_dim     = head_dim;
     cache.page_size    = page_size;
+    cache.enable_pdl   = current_device_supports_pdl();
     cache.valid        = true;
 }
 
@@ -438,7 +437,7 @@ cudaError_t dispatch_decode_for_head_dim_v(
 
     return ::flashinfer::BatchDecodeWithPagedKVCacheDispatched<
         HEAD_DIM, POS_ENC, Variant, DecodeParams>(
-        params, tmp_v, tmp_s, /*enable_pdl=*/true, stream);
+        params, tmp_v, tmp_s, cache.enable_pdl, stream);
 }
 
 // Soft-cap-aware HEAD_DIM dispatch. Routes to either the plain or the
