@@ -10,6 +10,7 @@
 #include <unordered_map>
 
 #include "loader/layout_plan.hpp"
+#include "loader/rust_quant_attachment.hpp"
 #include "loader/rust_loader_input.hpp"
 #include "loader/rust_storage_program.hpp"
 #include "loader/safetensors.hpp"
@@ -47,6 +48,7 @@ inline const char* rust_loader_planner_mode_name(
 struct RustLoaderCompileResult {
     RustStorageProgram program;
     std::vector<std::string> source_tensor_names;
+    std::vector<RustQuantAttachment> quant_attachments;
     std::size_t source_tensor_count = 0;
     std::size_t direct_contract_count = 0;
     std::size_t cpp_tensor_count = 0;
@@ -64,7 +66,43 @@ inline bool rust_loader_contract_is_direct(
     return spec.shape == info.shape &&
            dtype_supported &&
            spec.ownership == TensorOwnershipKind::Owned &&
-           spec.layout == TensorLayoutKind::Dense;
+           (spec.layout == TensorLayoutKind::Dense ||
+            spec.layout == TensorLayoutKind::Grouped ||
+            spec.layout == TensorLayoutKind::QuantPacked);
+}
+
+inline std::uint64_t rust_loader_checked_mul(
+    std::uint64_t lhs,
+    std::uint64_t rhs,
+    const std::string& context)
+{
+    if (rhs != 0 && lhs > UINT64_MAX / rhs) {
+        throw std::runtime_error(
+            "rust loader compiler: byte-size overflow while lowering " +
+            context);
+    }
+    return lhs * rhs;
+}
+
+inline std::uint64_t rust_loader_tensor_nbytes(
+    const TensorInfo& info,
+    const std::string& name)
+{
+    std::uint64_t elements = 1;
+    for (const auto dim : info.shape) {
+        if (dim < 0) {
+            throw std::runtime_error(
+                "rust loader compiler: negative dimension for '" + name + "'");
+        }
+        elements = rust_loader_checked_mul(
+            elements,
+            static_cast<std::uint64_t>(dim),
+            name);
+    }
+    return rust_loader_checked_mul(
+        elements,
+        static_cast<std::uint64_t>(dtype_bytes(info.dtype)),
+        name);
 }
 
 inline RustLoaderCompileResult compile_rust_loader_plan_from_cpp_plan(
@@ -183,6 +221,101 @@ inline RustLoaderCompileResult compile_rust_loader_plan_from_cpp_plan(
             return true;
         };
 
+        auto emit_expert_stack_byte_spans =
+            [&](const LayoutExpr& stack_expr) -> bool {
+                if (stack_expr.kind != LayoutExprKind::Stack ||
+                    stack_expr.inputs.empty() ||
+                    stack_expr.inputs.size() % 3 != 0) {
+                    return false;
+                }
+                const bool wants_gate_up =
+                    binding.runtime_name == stack_expr.runtime_name;
+                const bool wants_down =
+                    binding.runtime_name == stack_expr.secondary_runtime_name;
+                if (!wants_gate_up && !wants_down) return false;
+                if (spec.dtype != DType::BF16 || spec.shape.size() != 3) {
+                    return false;
+                }
+
+                const std::size_t expert_count =
+                    stack_expr.inputs.size() / 3;
+                if (static_cast<std::uint64_t>(spec.shape[0]) !=
+                    expert_count) {
+                    return false;
+                }
+
+                std::vector<pie_weight_loader::PieLoaderRuntimeByteSpanView>
+                    spans;
+                spans.reserve(wants_gate_up ? expert_count * 2 : expert_count);
+                for (std::size_t expert = 0; expert < expert_count;
+                     ++expert) {
+                    const std::size_t base = expert * 3;
+                    const std::size_t first = wants_gate_up ? base : base + 2;
+                    const std::size_t count = wants_gate_up ? 2 : 1;
+                    std::int64_t row_offset = 0;
+                    for (std::size_t j = 0; j < count; ++j) {
+                        const LayoutExprId source_expr_id =
+                            stack_expr.inputs[first + j];
+                        if (source_expr_id >=
+                            cpp_plan.algebra.exprs.size()) {
+                            return false;
+                        }
+                        const LayoutExpr& source_expr =
+                            cpp_plan.algebra.exprs[source_expr_id];
+                        if (source_expr.kind != LayoutExprKind::Source ||
+                            !loader.contains(source_expr.raw_name)) {
+                            return false;
+                        }
+                        const TensorInfo& info =
+                            loader.info(source_expr.raw_name);
+                        if (info.dtype != spec.dtype ||
+                            info.shape.size() != 2 ||
+                            info.shape[1] != spec.shape[2]) {
+                            return false;
+                        }
+                        if (row_offset + info.shape[0] > spec.shape[1]) {
+                            return false;
+                        }
+                        const auto tensor_it =
+                            tensor_ids.find(source_expr.raw_name);
+                        if (tensor_it == tensor_ids.end()) return false;
+                        const std::uint64_t rows_before =
+                            static_cast<std::uint64_t>(expert) *
+                                static_cast<std::uint64_t>(spec.shape[1]) +
+                            static_cast<std::uint64_t>(row_offset);
+                        const std::uint64_t dest_offset =
+                            rust_loader_checked_mul(
+                                rust_loader_checked_mul(
+                                    rows_before,
+                                    static_cast<std::uint64_t>(spec.shape[2]),
+                                    binding.runtime_name),
+                                static_cast<std::uint64_t>(
+                                    dtype_bytes(spec.dtype)),
+                                binding.runtime_name);
+                        spans.push_back(
+                            pie_weight_loader::
+                                PieLoaderRuntimeByteSpanView{
+                                    .source_tensor_id = tensor_it->second,
+                                    .source_offset_bytes = 0,
+                                    .dest_offset_bytes = dest_offset,
+                                    .span_bytes =
+                                        rust_loader_tensor_nbytes(
+                                            info,
+                                            source_expr.raw_name),
+                                });
+                        row_offset += info.shape[0];
+                    }
+                    if (row_offset != spec.shape[1]) return false;
+                }
+                input.add_byte_span_contract(
+                    binding.runtime_name,
+                    std::move(spans),
+                    spec.dtype,
+                    spec.shape,
+                    preferred_alignment);
+                return true;
+            };
+
         bool emitted = false;
         if (root.kind == LayoutExprKind::Realize && !root.inputs.empty()) {
             const LayoutExprId input_expr_id = root.inputs.front();
@@ -193,17 +326,35 @@ inline RustLoaderCompileResult compile_rust_loader_plan_from_cpp_plan(
                 if (!emitted) {
                     emitted = emit_join(input_expr_id, input_expr);
                 }
+                if (!emitted) {
+                    emitted = emit_expert_stack_byte_spans(input_expr);
+                }
             }
         } else if (root.kind == LayoutExprKind::View && !root.inputs.empty()) {
             const LayoutExprId input_expr_id = root.inputs.front();
             const auto source_contract = contract_for_expr.find(input_expr_id);
-            if (source_contract != contract_for_expr.end() && root.axis >= 0) {
+            if (source_contract != contract_for_expr.end()) {
+                if (spec.view_axis < 0) {
+                    throw std::runtime_error(
+                        "rust loader compiler: view tensor '" +
+                        binding.runtime_name +
+                        "' does not declare ABI-owned view range");
+                }
+                if (root.axis >= 0 &&
+                    (root.axis != spec.view_axis ||
+                     root.start != spec.view_start ||
+                     root.length != spec.view_length)) {
+                    throw std::runtime_error(
+                        "rust loader compiler: view tensor '" +
+                        binding.runtime_name +
+                        "' algebra range disagrees with RuntimeABI contract");
+                }
                 input.add_select_contract(
                     binding.runtime_name,
                     source_contract->second,
-                    root.axis,
-                    root.start,
-                    root.length,
+                    spec.view_axis,
+                    spec.view_start,
+                    spec.view_length,
                     spec.dtype,
                     spec.shape,
                     preferred_alignment);
@@ -224,10 +375,25 @@ inline RustLoaderCompileResult compile_rust_loader_plan_from_cpp_plan(
     RustLoaderCompileResult result{
         .program = compile_rust_storage_program(input.view()),
         .source_tensor_names = std::move(tensor_names),
+        .quant_attachments = {},
         .source_tensor_count = tensor_ids.size(),
         .direct_contract_count = emitted_contracts,
         .cpp_tensor_count = cpp_plan.algebra.bindings.size(),
     };
+    for (const auto& [name, spec] : cpp_plan.tensors) {
+        if (spec.quant.format == QuantFormat::None ||
+            spec.quant.scale_tensor.empty()) {
+            continue;
+        }
+        result.quant_attachments.push_back(
+            RustQuantAttachment{
+                .tensor_name = name,
+                .scale_tensor_name = spec.quant.scale_tensor,
+                .granularity = spec.quant.granularity,
+                .group_size = spec.quant.group_size,
+                .channel_axis = spec.quant.channel_axis,
+            });
+    }
     return result;
 }
 

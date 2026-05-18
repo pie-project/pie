@@ -275,7 +275,8 @@ LoadedModel LoadedModel::load(const Config& boot_cfg, NcclComm* tp_comm) {
             RustStorageProgramExecutor rust_executor(
                 loader,
                 rust_builder,
-                std::move(rust_plan.source_tensor_names));
+                std::move(rust_plan.source_tensor_names),
+                std::move(rust_plan.quant_attachments));
             materialized = rust_executor.execute(rust_view);
             CUDA_CHECK(cudaDeviceSynchronize());
             materialized_with_rust = true;

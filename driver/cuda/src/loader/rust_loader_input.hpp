@@ -134,7 +134,11 @@ public:
         std::uint32_t file_id,
         std::uint64_t file_offset,
         std::uint64_t span_bytes,
-        const TensorInfo& info)
+        const TensorInfo& info,
+        pie_weight_loader::PieLoaderEncodingKind encoding_kind =
+            pie_weight_loader::PieLoaderEncodingKind::Raw,
+        pie_weight_loader::PieLoaderQuantScheme quant_scheme =
+            pie_weight_loader::PieLoaderQuantScheme::None)
     {
         const std::uint32_t name_id = intern_string(std::move(name));
         const std::uint32_t shape_id = intern_shape(info.shape);
@@ -145,8 +149,8 @@ public:
             .file_offset = file_offset,
             .span_bytes = span_bytes,
             .dtype = dtype_to_rust(info.dtype),
-            .encoding_kind = pie_weight_loader::PieLoaderEncodingKind::Raw,
-            .quant_scheme = pie_weight_loader::PieLoaderQuantScheme::None,
+            .encoding_kind = encoding_kind,
+            .quant_scheme = quant_scheme,
             .shape = shape(shape_id),
         });
     }
@@ -165,10 +169,13 @@ public:
         DType dtype,
         std::vector<std::int64_t> tensor_shape,
         std::uint32_t alignment,
-        int shard_axis = -1)
+        int shard_axis = -1,
+        std::vector<std::uint32_t> metadata_tensor_ids = {})
     {
         const std::uint32_t name_id = intern_string(std::move(output_name));
         const std::uint32_t shape_id = intern_shape(std::move(tensor_shape));
+        const std::uint32_t metadata_id =
+            intern_u32_slice(std::move(metadata_tensor_ids));
         contracts_.push_back(
             pie_weight_loader::PieLoaderRuntimeTensorContractView{
                 .output_name = bytes(name_id),
@@ -176,6 +183,8 @@ public:
                     pie_weight_loader::PieLoaderRuntimeSourceKind::DirectTensor,
                 .source_tensor_id = source_tensor_id,
                 .source_tensor_ids = {},
+                .byte_spans = {},
+                .metadata_tensor_ids = u32_slice(metadata_id),
                 .source_contract_id = UINT32_MAX,
                 .semantic_role =
                     pie_weight_loader::PieLoaderSemanticRole::DirectTensor,
@@ -192,6 +201,49 @@ public:
                 .shape = shape(shape_id),
                 .alignment = alignment,
                 .shard_axis = shard_axis,
+            });
+        refresh_contract_slice();
+    }
+
+    void add_byte_span_contract(
+        std::string output_name,
+        std::vector<pie_weight_loader::PieLoaderRuntimeByteSpanView> spans,
+        DType dtype,
+        std::vector<std::int64_t> tensor_shape,
+        std::uint32_t alignment)
+    {
+        byte_spans_.push_back(std::move(spans));
+        const std::uint32_t name_id = intern_string(std::move(output_name));
+        const std::uint32_t shape_id = intern_shape(std::move(tensor_shape));
+        const auto& stored_spans = byte_spans_.back();
+        contracts_.push_back(
+            pie_weight_loader::PieLoaderRuntimeTensorContractView{
+                .output_name = bytes(name_id),
+                .source_kind =
+                    pie_weight_loader::PieLoaderRuntimeSourceKind::ByteSpans,
+                .source_tensor_id = UINT32_MAX,
+                .source_tensor_ids = {},
+                .byte_spans = {
+                    .ptr = stored_spans.data(),
+                    .len = stored_spans.size(),
+                },
+                .metadata_tensor_ids = {},
+                .source_contract_id = UINT32_MAX,
+                .semantic_role =
+                    pie_weight_loader::PieLoaderSemanticRole::DirectTensor,
+                .layer = 0,
+                .has_layer = false,
+                .expert = 0,
+                .has_expert = false,
+                .axis = -1,
+                .start = 0,
+                .length = 0,
+                .dtype = dtype_to_rust(dtype),
+                .encoding_kind = pie_weight_loader::PieLoaderEncodingKind::Raw,
+                .quant_scheme = pie_weight_loader::PieLoaderQuantScheme::None,
+                .shape = shape(shape_id),
+                .alignment = alignment,
+                .shard_axis = -1,
             });
         refresh_contract_slice();
     }
@@ -215,6 +267,8 @@ public:
                     pie_weight_loader::PieLoaderRuntimeSourceKind::Join,
                 .source_tensor_id = UINT32_MAX,
                 .source_tensor_ids = u32_slice(sources_id),
+                .byte_spans = {},
+                .metadata_tensor_ids = {},
                 .source_contract_id = UINT32_MAX,
                 .semantic_role =
                     pie_weight_loader::PieLoaderSemanticRole::DirectTensor,
@@ -254,6 +308,8 @@ public:
                     pie_weight_loader::PieLoaderRuntimeSourceKind::Select,
                 .source_tensor_id = UINT32_MAX,
                 .source_tensor_ids = {},
+                .byte_spans = {},
+                .metadata_tensor_ids = {},
                 .source_contract_id = source_contract_id,
                 .semantic_role =
                     pie_weight_loader::PieLoaderSemanticRole::DirectTensor,
@@ -307,6 +363,8 @@ private:
     std::deque<std::string> strings_;
     std::deque<std::vector<std::int64_t>> shapes_;
     std::deque<std::vector<std::uint32_t>> u32_slices_;
+    std::deque<std::vector<pie_weight_loader::PieLoaderRuntimeByteSpanView>>
+        byte_spans_;
     std::vector<pie_weight_loader::PieLoaderCheckpointFileView> files_;
     std::vector<pie_weight_loader::PieLoaderCheckpointTensorView> tensors_;
     std::vector<pie_weight_loader::PieLoaderRuntimeTensorContractView> contracts_;

@@ -145,6 +145,31 @@ void validate_layout_plan(const LayoutPlan& plan) {
                     "' references missing backing tensor '" +
                     spec.backing_tensor + "'");
             }
+            if (spec.ownership == TensorOwnershipKind::BorrowedView) {
+                if (spec.view_axis < 0 ||
+                    spec.view_axis >= static_cast<int>(spec.shape.size())) {
+                    throw std::runtime_error(
+                        "layout plan: view spec '" + name +
+                        "' has invalid view axis");
+                }
+                if (spec.view_start < 0 || spec.view_length <= 0 ||
+                    spec.view_length !=
+                        spec.shape[static_cast<std::size_t>(spec.view_axis)]) {
+                    throw std::runtime_error(
+                        "layout plan: view spec '" + name +
+                        "' has invalid view range");
+                }
+                const auto& backing = plan.tensors.at(spec.backing_tensor);
+                if (backing.shape.size() != spec.shape.size() ||
+                    spec.view_axis >= static_cast<int>(backing.shape.size()) ||
+                    spec.view_start + spec.view_length >
+                        backing.shape[static_cast<std::size_t>(spec.view_axis)]) {
+                    throw std::runtime_error(
+                        "layout plan: view spec '" + name +
+                        "' range exceeds backing tensor '" +
+                        spec.backing_tensor + "'");
+                }
+            }
         }
         if (spec.quant.format != QuantFormat::None) {
             if (spec.quant.scale_tensor.empty()) {
@@ -265,6 +290,9 @@ std::string dump_layout_plan_json(const LayoutPlan& plan) {
         json_string(out, parallel_kind_name(spec.parallel));
         out << ",\"backing_tensor\":";
         json_string(out, spec.backing_tensor);
+        out << ",\"view\":{\"axis\":" << spec.view_axis
+            << ",\"start\":" << spec.view_start
+            << ",\"length\":" << spec.view_length << '}';
         out << ",\"quant\":{";
         out << "\"format\":";
         json_string(out, quant_format_name(spec.quant.format));

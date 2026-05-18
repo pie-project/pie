@@ -35,9 +35,12 @@ RuntimeTensorContract RuntimeABI::view_contract(
     DType dtype,
     std::vector<std::int64_t> shape,
     std::string backing_tensor,
+    int axis,
+    std::int64_t start,
+    std::int64_t length,
     TensorParallelKind parallel) const
 {
-    return tensor_contract(
+    RuntimeTensorContract contract = tensor_contract(
         std::move(name),
         dtype,
         std::move(shape),
@@ -47,6 +50,10 @@ RuntimeTensorContract RuntimeABI::view_contract(
         {},
         RuntimeQuantPolicyKind::None,
         std::move(backing_tensor));
+    contract.view_axis = axis;
+    contract.view_start = start;
+    contract.view_length = length;
+    return contract;
 }
 
 RuntimePackedProjectionDecl RuntimeABI::packed_projection(

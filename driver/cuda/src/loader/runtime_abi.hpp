@@ -39,6 +39,9 @@ struct RuntimeTensorContract {
     TensorParallelKind parallel = TensorParallelKind::Replicated;
     std::uint64_t alignment_bytes = 256;
     std::string backing_tensor;
+    int view_axis = -1;
+    std::int64_t view_start = 0;
+    std::int64_t view_length = 0;
     QuantSpec quant;
     RuntimeQuantPolicyKind quant_policy = RuntimeQuantPolicyKind::None;
 };
@@ -79,6 +82,9 @@ public:
         DType dtype,
         std::vector<std::int64_t> shape,
         std::string backing_tensor,
+        int axis,
+        std::int64_t start,
+        std::int64_t length,
         TensorParallelKind parallel =
             TensorParallelKind::Replicated) const;
 

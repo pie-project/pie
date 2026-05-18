@@ -20,6 +20,7 @@
 #include "cuda_check.hpp"
 #include "kernels/dtype_cast.hpp"
 #endif
+#include "loader/rust_quant_attachment.hpp"
 #include "loader/safetensors.hpp"
 #include "model/weight_store.hpp"
 #include "tensor.hpp"
@@ -31,10 +32,12 @@ public:
     RustStorageProgramExecutor(
         SafetensorsCheckpointSource& loader,
         WeightStoreBuilder& weights,
-        std::vector<std::string> source_tensor_names)
+        std::vector<std::string> source_tensor_names,
+        std::vector<RustQuantAttachment> quant_attachments)
         : loader_(loader),
           weights_(weights),
-          source_tensor_names_(std::move(source_tensor_names))
+          source_tensor_names_(std::move(source_tensor_names)),
+          quant_attachments_(std::move(quant_attachments))
     {}
 
     LoadExecutionStats execute(
@@ -72,11 +75,23 @@ public:
                 break;
             }
         }
+        attach_quant_metadata();
         weights_.finalize();
         return stats;
     }
 
 private:
+    static QuantMeta::Kind quant_meta_kind(QuantGranularity granularity)
+    {
+        switch (granularity) {
+        case QuantGranularity::PerTensor: return QuantMeta::Kind::PerTensor;
+        case QuantGranularity::PerChannel: return QuantMeta::Kind::PerChannel;
+        case QuantGranularity::PerGroup: return QuantMeta::Kind::PerGroup;
+        case QuantGranularity::None: break;
+        }
+        return QuantMeta::Kind::PerTensor;
+    }
+
     static std::string bytes_to_string(
         pie_weight_loader::PieLoaderBytes bytes)
     {
@@ -504,9 +519,34 @@ private:
         finalized_buffer_names_[instr.buffer_id] = runtime_name;
     }
 
+    void attach_quant_metadata()
+    {
+        for (const auto& attachment : quant_attachments_) {
+            if (weights_.find(attachment.tensor_name) == weights_.end()) {
+                throw std::runtime_error(
+                    "rust storage executor: quant tensor '" +
+                    attachment.tensor_name + "' was not finalized");
+            }
+            if (weights_.find(attachment.scale_tensor_name) ==
+                weights_.end()) {
+                throw std::runtime_error(
+                    "rust storage executor: quant scale tensor '" +
+                    attachment.scale_tensor_name + "' for '" +
+                    attachment.tensor_name + "' was not finalized");
+            }
+            QuantMeta meta;
+            meta.kind = quant_meta_kind(attachment.granularity);
+            meta.scale = &weights_.get(attachment.scale_tensor_name);
+            meta.group_size = attachment.group_size;
+            meta.channel_axis = attachment.channel_axis;
+            weights_.set_quant_meta(attachment.tensor_name, std::move(meta));
+        }
+    }
+
     SafetensorsCheckpointSource& loader_;
     WeightStoreBuilder& weights_;
     std::vector<std::string> source_tensor_names_;
+    std::vector<RustQuantAttachment> quant_attachments_;
     std::unordered_map<std::uint32_t, DeviceTensor> buffers_;
     std::unordered_map<std::uint32_t, std::string> finalized_buffer_names_;
     std::unordered_map<std::uint32_t, std::string> view_backing_names_;

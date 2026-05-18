@@ -245,16 +245,19 @@ bool add_packed_axis_group(
         packed.storage_layout,
         TensorOwnershipKind::Owned,
         TensorParallelKind::Column);
-    TensorDecl packed_decl{
-        .name = packed_contract.name,
-        .dtype = packed_contract.dtype,
-        .shape = packed_contract.shape,
-        .layout = packed_contract.layout,
-        .ownership = packed_contract.ownership,
-        .parallel = packed_contract.parallel,
-        .quant = packed_contract.quant,
-        .backing_tensor = packed_contract.backing_tensor,
-    };
+        TensorDecl packed_decl{
+            .name = packed_contract.name,
+            .dtype = packed_contract.dtype,
+            .shape = packed_contract.shape,
+            .layout = packed_contract.layout,
+            .ownership = packed_contract.ownership,
+            .parallel = packed_contract.parallel,
+            .quant = packed_contract.quant,
+            .backing_tensor = packed_contract.backing_tensor,
+            .view_axis = packed_contract.view_axis,
+            .view_start = packed_contract.view_start,
+            .view_length = packed_contract.view_length,
+        };
     register_tensor(plan, packed_decl);
 
     LayoutExpr join = make_expr(LayoutExprKind::Join, packed_decl);
@@ -274,6 +277,9 @@ bool add_packed_axis_group(
             info.dtype,
             local_shape,
             packed_decl.name,
+            /*axis=*/0,
+            row_offset,
+            local_shape[0],
             TensorParallelKind::Column);
         TensorDecl view_decl{
             .name = view_contract.name,
@@ -284,6 +290,9 @@ bool add_packed_axis_group(
             .parallel = view_contract.parallel,
             .quant = {},
             .backing_tensor = view_contract.backing_tensor,
+            .view_axis = view_contract.view_axis,
+            .view_start = view_contract.view_start,
+            .view_length = view_contract.view_length,
         };
         const std::string view_name = view_decl.name;
         register_tensor(plan, view_decl);

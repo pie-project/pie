@@ -910,6 +910,24 @@ Current Rust implementation status:
   now lower as `Decode(data, metadata)` rather than relying on executor-side
   name conventions; portable FP8 checkpoints use this for scalar and per-row
   scale tensors.
+- Moved CUDA compatibility-view ranges into `RuntimeABI`/`TensorDecl` as
+  explicit `view_axis/start/length` fields. The Rust bridge now validates
+  QKV/gate-up view ranges against the ABI-owned contract before emitting
+  `Select` contracts.
+- Extended the CUDA Rust input surface to match portable: direct contracts can
+  carry metadata tensor IDs, and `ByteSpans` contracts are available for
+  source/destination offset assembly.
+- Lowered CUDA MoE expert-bank `Stack` roots into generic `ByteSpans`
+  contracts. Qwen MoE gate/up/down expert tensors now compile to ordinary
+  storage-program extent writes instead of requiring a model-specific Rust
+  executor path.
+- Added generic quant metadata attachment for CUDA Rust execution. The bridge
+  carries `TensorDecl.quant` scale contracts into the executor, and the
+  executor restores `WeightStore` quant metadata before finalization. This is
+  used by GPT-OSS packed MXFP4 expert tensors.
+- Added a Rust optimizer rewrite that distributes `Cast` over `Join`/`Stack`,
+  allowing the storage compiler to avoid materializing a wide joined temporary
+  when inputs can be tiled directly into the final dtype.
 - Updated the CUDA Rust executor to honor compiled physical file offsets for
   compact `ExtentWrite` instructions via safetensors byte-range copies.
 - Extended the portable Rust executor with CPU temporary buffers and executable
@@ -937,6 +955,20 @@ Current e2e smoke evidence:
 - CUDA native, `PIE_CUDA_LOADER_PLANNER=rust`, `Qwen/Qwen3-0.6B`,
   `cuda:0`: 367/367 contracts, one-token latency smoke passed after the
   explicit TileMap destination change.
+- CUDA native, `PIE_CUDA_LOADER_PLANNER=rust`, `Qwen/Qwen3-32B`,
+  `cuda:0`, small KV pool: 835/835 contracts, 62.5 GiB loaded through Rust
+  storage, one-token smoke passed.
+- CUDA native, `PIE_CUDA_LOADER_PLANNER=rust`, `Qwen/Qwen3.6-27B`,
+  `cuda:0`, small KV pool: 1199/1199 contracts, 52.9 GiB loaded through Rust
+  storage, one-token smoke passed.
+- CUDA native, `PIE_CUDA_LOADER_PLANNER=rust`, `Qwen/Qwen3-30B-A3B`,
+  `cuda:0`, small KV pool: 531/531 contracts, MoE expert bank byte-span
+  lowering, one-token smoke passed.
+- CUDA native, `PIE_CUDA_LOADER_PLANNER=rust`, `Qwen/Qwen3.6-35B-A3B`,
+  `cuda:0`, small KV pool: 1045/1045 contracts, one-token smoke passed.
+- CUDA native, `PIE_CUDA_LOADER_PLANNER=rust`, `openai/gpt-oss-20b`,
+  `cuda:0`, `mxfp4_moe=packed`, small KV pool: 459/459 contracts, packed
+  MXFP4 quant metadata restored, one-token smoke passed.
 - Portable ggml, `PIE_PORTABLE_LOADER_PLANNER=rust`, `Qwen/Qwen3-0.6B`,
   CPU backend: 311/311 contracts, one-token latency smoke passed.
 - Portable ggml, `PIE_PORTABLE_LOADER_PLANNER=rust`,

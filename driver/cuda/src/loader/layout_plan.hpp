@@ -69,6 +69,9 @@ struct TensorDecl {
     TensorParallelKind parallel = TensorParallelKind::Replicated;
     QuantSpec quant;
     std::string backing_tensor;
+    int view_axis = -1;
+    std::int64_t view_start = 0;
+    std::int64_t view_length = 0;
 };
 
 struct LayoutMemoryPlan {

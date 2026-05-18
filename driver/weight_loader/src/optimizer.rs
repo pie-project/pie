@@ -1,7 +1,7 @@
 use crate::error::CompileError;
 use crate::ir::{LayoutExpr, LayoutPlan};
 use crate::typecheck::typecheck;
-use crate::types::ExprId;
+use crate::types::{DType, Encoding, ExprId};
 use std::collections::HashMap;
 
 pub fn optimize(mut plan: LayoutPlan) -> Result<LayoutPlan, CompileError> {
@@ -120,12 +120,7 @@ fn normalize_expr(
             })
         }
         LayoutExpr::Cast { input, dtype, decl } => {
-            let input = normalize_expr(plan, *input, out, memo)?;
-            out.push(LayoutExpr::Cast {
-                input,
-                dtype: *dtype,
-                decl: decl.clone(),
-            })
+            normalize_cast(plan, *input, *dtype, decl, out, memo)?
         }
         LayoutExpr::Decode {
             scheme,
@@ -203,6 +198,72 @@ fn normalize_expr(
     };
     memo.insert(id, new_id);
     Ok(new_id)
+}
+
+fn normalize_cast(
+    plan: &LayoutPlan,
+    input: ExprId,
+    dtype: DType,
+    decl: &crate::types::TensorDecl,
+    out: &mut LayoutPlan,
+    memo: &mut HashMap<ExprId, ExprId>,
+) -> Result<ExprId, CompileError> {
+    if let Some(input_decl) = plan.decl(input)
+        && input_decl.encoding == Encoding::Raw(dtype)
+    {
+        return normalize_expr(plan, input, out, memo);
+    }
+    if let Some(LayoutExpr::Join { inputs, axis, .. }) = plan.expr(input) {
+        let casted = normalize_cast_inputs(plan, inputs, dtype, out, memo)?;
+        return Ok(out.push(LayoutExpr::Join {
+            inputs: casted,
+            axis: *axis,
+            decl: decl.clone(),
+        }));
+    }
+    if let Some(LayoutExpr::Stack { inputs, axis, .. }) = plan.expr(input) {
+        let casted = normalize_cast_inputs(plan, inputs, dtype, out, memo)?;
+        return Ok(out.push(LayoutExpr::Stack {
+            inputs: casted,
+            axis: *axis,
+            decl: decl.clone(),
+        }));
+    }
+    let input = normalize_expr(plan, input, out, memo)?;
+    Ok(out.push(LayoutExpr::Cast {
+        input,
+        dtype,
+        decl: decl.clone(),
+    }))
+}
+
+fn normalize_cast_inputs(
+    plan: &LayoutPlan,
+    inputs: &[ExprId],
+    dtype: DType,
+    out: &mut LayoutPlan,
+    memo: &mut HashMap<ExprId, ExprId>,
+) -> Result<Vec<ExprId>, CompileError> {
+    inputs
+        .iter()
+        .map(|input| {
+            let normalized = normalize_expr(plan, *input, out, memo)?;
+            let source_decl = plan.decl(*input).ok_or_else(|| {
+                CompileError::InvalidInput(format!("Cast input {} has no decl", input.0))
+            })?;
+            if source_decl.encoding == Encoding::Raw(dtype) {
+                return Ok(normalized);
+            }
+            let mut cast_decl = source_decl.clone();
+            cast_decl.name = format!("{}.cast.{dtype:?}", source_decl.name);
+            cast_decl.encoding = Encoding::Raw(dtype);
+            Ok(out.push(LayoutExpr::Cast {
+                input: normalized,
+                dtype,
+                decl: cast_decl,
+            }))
+        })
+        .collect()
 }
 
 #[allow(clippy::too_many_arguments)]

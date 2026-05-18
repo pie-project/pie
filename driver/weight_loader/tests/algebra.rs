@@ -186,6 +186,64 @@ fn optimizer_pushes_select_through_join_and_drops_dead_full_join() {
 }
 
 #[test]
+fn optimizer_distributes_cast_over_join() {
+    let mut plan = LayoutPlan::new();
+    let a_decl = decl(0, "a", &[2], Encoding::Raw(DType::F32));
+    let b_decl = decl(1, "b", &[2], Encoding::Raw(DType::F32));
+    let a = plan.push(LayoutExpr::Source {
+        tensor: TensorId(0),
+        decl: a_decl.clone(),
+    });
+    let b = plan.push(LayoutExpr::Source {
+        tensor: TensorId(1),
+        decl: b_decl.clone(),
+    });
+    let joined_decl = decl(2, "joined", &[4], Encoding::Raw(DType::F32));
+    let joined = plan.push(LayoutExpr::Join {
+        inputs: vec![a, b],
+        axis: Axis(0),
+        decl: joined_decl,
+    });
+    let cast_decl = decl(3, "out", &[4], Encoding::Raw(DType::BF16));
+    let cast = plan.push(LayoutExpr::Cast {
+        input: joined,
+        dtype: DType::BF16,
+        decl: cast_decl.clone(),
+    });
+    let out = plan.push(LayoutExpr::Realize {
+        input: cast,
+        runtime_name: "out".to_string(),
+        decl: cast_decl,
+    });
+    plan.outputs.push(out);
+
+    let optimized = optimize(plan.clone()).unwrap();
+    let join_has_cast_inputs = optimized.exprs.iter().any(|expr| {
+        let LayoutExpr::Join { inputs, .. } = expr else {
+            return false;
+        };
+        inputs.iter().all(|input| {
+            matches!(
+                optimized.exprs[input.0 as usize],
+                LayoutExpr::Cast {
+                    dtype: DType::BF16,
+                    ..
+                }
+            )
+        })
+    });
+    assert!(join_has_cast_inputs);
+
+    let mut sources = HashMap::new();
+    sources.insert(TensorId(0), TensorValue::new(a_decl, vec![1, 2]).unwrap());
+    sources.insert(TensorId(1), TensorValue::new(b_decl, vec![3, 4]).unwrap());
+    assert_eq!(
+        evaluate(&optimized, &sources).unwrap()["out"].data,
+        evaluate(&plan, &sources).unwrap()["out"].data
+    );
+}
+
+#[test]
 fn encode_decode_transcode_are_explicit_reference_ops() {
     let mut plan = LayoutPlan::new();
     let raw = decl(0, "raw", &[4], Encoding::Raw(DType::BF16));

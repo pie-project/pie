@@ -217,10 +217,16 @@ async def cli_pie_client(args: argparse.Namespace):
         assert proc.stdout is not None
         deadline = time.perf_counter() + args.server_startup_timeout
         while time.perf_counter() < deadline:
-            line = await asyncio.wait_for(
-                proc.stdout.readline(),
-                timeout=max(0.1, deadline - time.perf_counter()),
-            )
+            try:
+                line = await asyncio.wait_for(
+                    proc.stdout.readline(),
+                    timeout=max(0.1, deadline - time.perf_counter()),
+                )
+            except asyncio.TimeoutError as exc:
+                raise TimeoutError(
+                    "timed out waiting for pie serve startup:\n"
+                    + "".join(startup_lines[-80:])
+                ) from exc
             if not line:
                 raise RuntimeError(
                     "pie serve exited before startup completed:\n"

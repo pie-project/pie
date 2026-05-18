@@ -107,6 +107,9 @@ TensorDecl infer_unary_passthrough(
     inferred.parallel = expr.decl.parallel;
     inferred.quant = expr.decl.quant;
     inferred.backing_tensor = expr.decl.backing_tensor;
+    inferred.view_axis = expr.decl.view_axis;
+    inferred.view_start = expr.decl.view_start;
+    inferred.view_length = expr.decl.view_length;
     return inferred;
 }
 
@@ -392,6 +395,19 @@ void validate_layout_algebra(const LayoutAlgebra& algebra) {
                     expr.axis < static_cast<int>(input.shape.size()) &&
                         input.shape.size() == expr.decl.shape.size(),
                     "View axis/rank mismatch at expr " + std::to_string(i));
+                require(
+                    expr.start >= 0 && expr.length > 0 &&
+                        expr.start + expr.length <=
+                            input.shape[static_cast<std::size_t>(expr.axis)],
+                    "View range out of bounds at expr " + std::to_string(i));
+                if (expr.decl.ownership == TensorOwnershipKind::BorrowedView) {
+                    require(
+                        expr.decl.view_axis == expr.axis &&
+                            expr.decl.view_start == expr.start &&
+                            expr.decl.view_length == expr.length,
+                        "View expr range disagrees with TensorDecl at expr " +
+                            std::to_string(i));
+                }
                 auto inferred_shape = input.shape;
                 inferred_shape[static_cast<std::size_t>(expr.axis)] =
                     expr.length;
