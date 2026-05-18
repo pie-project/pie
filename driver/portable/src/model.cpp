@@ -15,6 +15,7 @@
 
 #include "gguf_archive.hpp"
 #include "gguf_hparams.hpp"
+#include "rust_loader.hpp"
 
 namespace pie_portable_driver {
 
@@ -607,6 +608,13 @@ void Model::load_into_backend_() {
     if (!buf_) {
         throw std::runtime_error(
             "model: ggml_backend_alloc_ctx_tensors failed (out of memory?)");
+    }
+
+    if (const char* planner = std::getenv("PIE_PORTABLE_LOADER_PLANNER");
+        planner != nullptr && planner[0] != '\0') {
+        if (try_load_with_rust_storage_program(*this, planner)) {
+            return;
+        }
     }
 
     for (const auto& d : declared_) {

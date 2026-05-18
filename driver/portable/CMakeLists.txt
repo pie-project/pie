@@ -84,6 +84,7 @@ add_library(pie_driver_portable_lib STATIC
   src/gguf_archive.cpp
   src/gguf_hparams.cpp
   src/model.cpp
+  src/rust_loader.cpp
   src/kv_cache.cpp
   src/state_cache.cpp
   src/arch_spec.cpp
@@ -110,6 +111,7 @@ target_include_directories(pie_driver_portable_lib
   PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/src
     ${CMAKE_CURRENT_SOURCE_DIR}/../common/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/../weight_loader/include
     ${PIE_BRIDGE_INCLUDE_DIR})
 
 target_link_libraries(pie_driver_portable_lib PUBLIC

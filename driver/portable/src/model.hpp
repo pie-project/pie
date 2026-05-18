@@ -27,6 +27,9 @@
 
 namespace pie_portable_driver {
 
+class Model;
+bool try_load_with_rust_storage_program(Model& model, const char* planner_mode);
+
 // Per-layer weights, raw split-projection layout (matches HF; no QKV/MLP
 // fusion). The graph builder is free to fuse on the fly. Optional tensors
 // (biases, QK-norm) are nullptr when the architecture doesn't use them.
@@ -269,6 +272,8 @@ public:
     std::string activation_dtype_str() const;
 
 private:
+    friend bool try_load_with_rust_storage_program(Model& model, const char* planner_mode);
+
     // Per-arch loader description. Captures the structural variations across
     // archs (extra norms, fused/biased QKV, MoE naming) so a single set of
     // loader helpers can drive all of them. Specialized cases that don't fit
