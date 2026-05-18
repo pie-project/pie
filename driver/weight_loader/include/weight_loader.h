@@ -342,6 +342,22 @@ struct PieLoaderMemoryPlanView {
   uint64_t device_write_bytes;
 };
 
+struct PieLoaderOptimizerPassStatsView {
+  PieLoaderBytes name;
+  uint64_t exprs_before;
+  uint64_t exprs_after;
+  uint64_t rewrites;
+};
+
+struct PieLoaderOptimizerPassStatsSlice {
+  const PieLoaderOptimizerPassStatsView *ptr;
+  size_t len;
+};
+
+struct PieLoaderOptimizerReportView {
+  PieLoaderOptimizerPassStatsSlice passes;
+};
+
 struct PieLoaderStorageProgramView {
   uint32_t version;
   PieLoaderTensorDeclSlice tensors;
@@ -349,6 +365,7 @@ struct PieLoaderStorageProgramView {
   PieLoaderStorageInstrSlice instrs;
   PieLoaderU32Slice schedule;
   PieLoaderMemoryPlanView memory;
+  PieLoaderOptimizerReportView optimizer;
 };
 
 struct PieLoaderError {

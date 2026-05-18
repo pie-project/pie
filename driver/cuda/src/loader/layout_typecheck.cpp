@@ -406,7 +406,14 @@ void validate_layout_algebra(const LayoutAlgebra& algebra) {
                             expr.decl.view_start == expr.start &&
                             expr.decl.view_length == expr.length,
                         "View expr range disagrees with TensorDecl at expr " +
-                            std::to_string(i));
+                            std::to_string(i) + " runtime='" +
+                            expr.runtime_name + "' decl='" + expr.decl.name +
+                            "' expr=(" + std::to_string(expr.axis) + "," +
+                            std::to_string(expr.start) + "," +
+                            std::to_string(expr.length) + ") decl=(" +
+                            std::to_string(expr.decl.view_axis) + "," +
+                            std::to_string(expr.decl.view_start) + "," +
+                            std::to_string(expr.decl.view_length) + ")");
                 }
                 auto inferred_shape = input.shape;
                 inferred_shape[static_cast<std::size_t>(expr.axis)] =

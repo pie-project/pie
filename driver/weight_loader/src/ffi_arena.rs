@@ -1,10 +1,12 @@
 use crate::ffi_types::{
     PieLoaderBufferDeclSlice, PieLoaderBufferDeclView, PieLoaderBufferIdSlice, PieLoaderBytes,
     PieLoaderDType, PieLoaderDestExtentView, PieLoaderDimSpecSlice, PieLoaderDimSpecView,
-    PieLoaderEncodingKind, PieLoaderI64Slice, PieLoaderMemoryPlanView, PieLoaderQuantScheme,
-    PieLoaderSourceExtentView, PieLoaderStorageInstrKind, PieLoaderStorageInstrSlice,
-    PieLoaderStorageInstrView, PieLoaderStorageProgramView, PieLoaderStridedExtentView,
-    PieLoaderTensorDeclSlice, PieLoaderTensorDeclView, PieLoaderTileMapKind, PieLoaderU32Slice,
+    PieLoaderEncodingKind, PieLoaderI64Slice, PieLoaderMemoryPlanView,
+    PieLoaderOptimizerPassStatsSlice, PieLoaderOptimizerPassStatsView,
+    PieLoaderOptimizerReportView, PieLoaderQuantScheme, PieLoaderSourceExtentView,
+    PieLoaderStorageInstrKind, PieLoaderStorageInstrSlice, PieLoaderStorageInstrView,
+    PieLoaderStorageProgramView, PieLoaderStridedExtentView, PieLoaderTensorDeclSlice,
+    PieLoaderTensorDeclView, PieLoaderTileMapKind, PieLoaderU32Slice,
 };
 use crate::storage::{
     DestExtent, SourceExtent, StorageInstr, StorageProgram, StridedExtent, TileMapKind,
@@ -20,6 +22,7 @@ pub struct FfiArena {
     tensor_views: Vec<PieLoaderTensorDeclView>,
     buffer_views: Vec<PieLoaderBufferDeclView>,
     instr_views: Vec<PieLoaderStorageInstrView>,
+    optimizer_pass_views: Vec<PieLoaderOptimizerPassStatsView>,
     schedule: Vec<u32>,
 }
 
@@ -65,6 +68,20 @@ impl FfiArena {
             .schedule
             .extend(program.schedule.iter().map(|id| id.0));
         arena
+            .optimizer_pass_views
+            .reserve(program.optimizer.passes.len());
+        for pass in &program.optimizer.passes {
+            let name = arena.push_string(&pass.name);
+            arena
+                .optimizer_pass_views
+                .push(PieLoaderOptimizerPassStatsView {
+                    name,
+                    exprs_before: pass.exprs_before as u64,
+                    exprs_after: pass.exprs_after as u64,
+                    rewrites: pass.rewrites as u64,
+                });
+        }
+        arena
     }
 
     pub fn view(&self, program: &StorageProgram) -> PieLoaderStorageProgramView {
@@ -92,6 +109,12 @@ impl FfiArena {
                 transform_scratch_peak_bytes: program.memory.transform_scratch_peak_bytes,
                 checkpoint_read_bytes: program.memory.checkpoint_read_bytes,
                 device_write_bytes: program.memory.device_write_bytes,
+            },
+            optimizer: PieLoaderOptimizerReportView {
+                passes: PieLoaderOptimizerPassStatsSlice {
+                    ptr: self.optimizer_pass_views.as_ptr(),
+                    len: self.optimizer_pass_views.len(),
+                },
             },
         }
     }

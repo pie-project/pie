@@ -16,7 +16,6 @@
 
 #include "cuda_check.hpp"
 #include "loader/layout_plan.hpp"
-#include "loader/layout_optimizer.hpp"
 #include "loader/load_executor.hpp"
 #include "loader/storage_compiler.hpp"
 #include "loader/storage_program.hpp"
@@ -106,7 +105,10 @@ void register_spec(
     TensorOwnershipKind ownership = TensorOwnershipKind::Owned,
     TensorParallelKind parallel = TensorParallelKind::Replicated,
     std::string backing = {},
-    QuantSpec quant = {})
+    QuantSpec quant = {},
+    int view_axis = -1,
+    std::int64_t view_start = 0,
+    std::int64_t view_length = 0)
 {
     TensorDecl spec;
     spec.name = std::move(name);
@@ -117,6 +119,9 @@ void register_spec(
     spec.parallel = parallel;
     spec.backing_tensor = std::move(backing);
     spec.quant = std::move(quant);
+    spec.view_axis = view_axis;
+    spec.view_start = view_start;
+    spec.view_length = view_length;
     plan.tensors.emplace(spec.name, std::move(spec));
 }
 
@@ -296,15 +301,15 @@ void test_axis_concat_exact()
     register_spec(
         plan, "q_view", DType::BF16, {2, 2}, TensorLayoutKind::View,
         TensorOwnershipKind::BorrowedView, TensorParallelKind::Column,
-        "packed");
+        "packed", {}, 0, 0, 2);
     register_spec(
         plan, "k_view", DType::BF16, {1, 2}, TensorLayoutKind::View,
         TensorOwnershipKind::BorrowedView, TensorParallelKind::Column,
-        "packed");
+        "packed", {}, 0, 2, 1);
     register_spec(
         plan, "v_view", DType::BF16, {1, 2}, TensorLayoutKind::View,
         TensorOwnershipKind::BorrowedView, TensorParallelKind::Column,
-        "packed");
+        "packed", {}, 0, 3, 1);
     const auto q = source(plan, "q", TensorDecl{
         .name = "q", .dtype = DType::BF16, .shape = {2, 2}});
     const auto k = source(plan, "k", TensorDecl{
@@ -561,9 +566,6 @@ void test_transcode_fp8_to_int8_exact()
     register_spec(
         plan, "scale_tmp", DType::FP32, {1},
         TensorLayoutKind::Dense, TensorOwnershipKind::Temporary);
-    register_spec(
-        plan, "decoded_tmp", DType::BF16, {2, 2},
-        TensorLayoutKind::Dense, TensorOwnershipKind::Temporary);
     QuantSpec quant;
     quant.format = QuantFormat::RuntimeInt8;
     quant.granularity = QuantGranularity::PerChannel;
@@ -577,18 +579,17 @@ void test_transcode_fp8_to_int8_exact()
 
     const auto fp8 = source(plan, "fp8", spec_for(plan, "fp8_tmp"));
     const auto scale = source(plan, "scale", spec_for(plan, "scale_tmp"));
-    LayoutExpr decode;
-    decode.kind = LayoutExprKind::Decode;
-    decode.inputs = {fp8, scale};
-    decode.decl = spec_for(plan, "decoded_tmp");
-    decode.dtype = DType::BF16;
-    const auto decoded = add_expr(plan, std::move(decode));
-    const auto encoded = unary(
-        plan, LayoutExprKind::Encode, decoded, spec_for(plan, "q"),
-        "q", "q_scale");
-    realize(plan, "q", encoded);
+    LayoutExpr transcode;
+    transcode.kind = LayoutExprKind::Transcode;
+    transcode.inputs = {fp8, scale};
+    transcode.decl = spec_for(plan, "q");
+    transcode.dtype = DType::INT8;
+    transcode.runtime_name = "q";
+    transcode.secondary_runtime_name = "q_scale";
+    transcode.encoding = transcode.decl.quant;
+    const auto transcoded = add_expr(plan, std::move(transcode));
+    realize(plan, "q", transcoded);
     release(plan, {fp8, scale});
-    (void)optimize_layout_algebra(plan);
 
     WeightStore weights;
     run_plan(dir, plan, weights);

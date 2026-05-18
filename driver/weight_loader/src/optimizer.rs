@@ -1,12 +1,47 @@
 use crate::error::CompileError;
 use crate::ir::{LayoutExpr, LayoutPlan};
 use crate::typecheck::typecheck;
-use crate::types::{DType, Encoding, ExprId};
-use std::collections::HashMap;
+use crate::types::{Axis, DType, Encoding, ExprId, TensorDecl};
+use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet};
 
-pub fn optimize(mut plan: LayoutPlan) -> Result<LayoutPlan, CompileError> {
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OptimizerPassStats {
+    pub name: String,
+    pub exprs_before: usize,
+    pub exprs_after: usize,
+    pub rewrites: usize,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OptimizerReport {
+    pub passes: Vec<OptimizerPassStats>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OptimizedLayoutPlan {
+    pub plan: LayoutPlan,
+    pub report: OptimizerReport,
+}
+
+pub fn optimize(plan: LayoutPlan) -> Result<LayoutPlan, CompileError> {
+    Ok(optimize_with_report(plan)?.plan)
+}
+
+pub fn optimize_with_report(mut plan: LayoutPlan) -> Result<OptimizedLayoutPlan, CompileError> {
+    let mut report = OptimizerReport::default();
     typecheck(&plan)?;
+    let before = plan.exprs.len();
+    let output_count_before = plan.outputs.len();
+    plan = dedupe_realize_outputs(plan);
+    let output_rewrites = output_count_before.saturating_sub(plan.outputs.len());
     plan = normalize_live_plan(&plan)?;
+    report.passes.push(OptimizerPassStats {
+        name: "live-normalization".to_string(),
+        exprs_before: before,
+        exprs_after: plan.exprs.len(),
+        rewrites: output_rewrites + before.saturating_sub(plan.exprs.len()),
+    });
     let mut changed = true;
     let mut iterations = 0;
     while changed {
@@ -16,14 +51,42 @@ pub fn optimize(mut plan: LayoutPlan) -> Result<LayoutPlan, CompileError> {
                 "layout optimizer did not converge".to_string(),
             ));
         }
+        let before = plan.exprs.len();
         changed = false;
-        changed |= collapse_selects(&mut plan);
-        changed |= cancel_partition_join(&mut plan);
-        changed |= coalesce_reorders(&mut plan);
-        changed |= elide_identity_views(&mut plan);
+        let mut rewrites = 0;
+        rewrites += collapse_selects(&mut plan);
+        rewrites += cancel_partition_join(&mut plan);
+        rewrites += coalesce_reorders(&mut plan);
+        rewrites += elide_identity_views(&mut plan);
+        changed |= rewrites > 0;
         typecheck(&plan)?;
+        if rewrites > 0 {
+            report.passes.push(OptimizerPassStats {
+                name: format!("fixed-point-normalization-{iterations}"),
+                exprs_before: before,
+                exprs_after: plan.exprs.len(),
+                rewrites,
+            });
+        }
     }
-    Ok(plan)
+    Ok(OptimizedLayoutPlan { plan, report })
+}
+
+fn dedupe_realize_outputs(mut plan: LayoutPlan) -> LayoutPlan {
+    let mut seen = HashSet::new();
+    let mut outputs = Vec::with_capacity(plan.outputs.len());
+    for output in plan.outputs.iter().rev() {
+        let key = match plan.expr(*output) {
+            Some(LayoutExpr::Realize { runtime_name, .. }) => runtime_name.clone(),
+            _ => format!("expr:{}", output.0),
+        };
+        if seen.insert(key) {
+            outputs.push(*output);
+        }
+    }
+    outputs.reverse();
+    plan.outputs = outputs;
+    plan
 }
 
 fn normalize_live_plan(plan: &LayoutPlan) -> Result<LayoutPlan, CompileError> {
@@ -142,15 +205,7 @@ fn normalize_expr(
             input,
             metadata_outputs,
             decl,
-        } => {
-            let input = normalize_expr(plan, *input, out, memo)?;
-            out.push(LayoutExpr::Encode {
-                scheme: *scheme,
-                input,
-                metadata_outputs: metadata_outputs.clone(),
-                decl: decl.clone(),
-            })
-        }
+        } => normalize_encode(plan, *scheme, *input, metadata_outputs, decl, out, memo)?,
         LayoutExpr::Transcode {
             from,
             to,
@@ -204,7 +259,7 @@ fn normalize_cast(
     plan: &LayoutPlan,
     input: ExprId,
     dtype: DType,
-    decl: &crate::types::TensorDecl,
+    decl: &TensorDecl,
     out: &mut LayoutPlan,
     memo: &mut HashMap<ExprId, ExprId>,
 ) -> Result<ExprId, CompileError> {
@@ -226,6 +281,22 @@ fn normalize_cast(
         return Ok(out.push(LayoutExpr::Stack {
             inputs: casted,
             axis: *axis,
+            decl: decl.clone(),
+        }));
+    }
+    if let Some(LayoutExpr::Decode {
+        scheme,
+        data,
+        metadata,
+        ..
+    }) = plan.expr(input)
+    {
+        let data = normalize_expr(plan, *data, out, memo)?;
+        let metadata = normalize_inputs(plan, metadata, out, memo)?;
+        return Ok(out.push(LayoutExpr::Decode {
+            scheme: *scheme,
+            data,
+            metadata,
             decl: decl.clone(),
         }));
     }
@@ -270,10 +341,10 @@ fn normalize_cast_inputs(
 fn normalize_select(
     plan: &LayoutPlan,
     input: ExprId,
-    axis: crate::types::Axis,
+    axis: Axis,
     start: i64,
     length: i64,
-    decl: &crate::types::TensorDecl,
+    decl: &TensorDecl,
     out: &mut LayoutPlan,
     memo: &mut HashMap<ExprId, ExprId>,
 ) -> Result<ExprId, CompileError> {
@@ -305,6 +376,17 @@ fn normalize_select(
     {
         return push_select_through_join(plan, inputs, axis, start, length, decl, out, memo);
     }
+    if let Some(LayoutExpr::Decode {
+        scheme,
+        data,
+        metadata,
+        ..
+    }) = plan.expr(input)
+    {
+        return push_select_through_decode(
+            plan, *scheme, *data, metadata, axis, start, length, decl, out, memo,
+        );
+    }
     let input = normalize_expr(plan, input, out, memo)?;
     Ok(out.push(LayoutExpr::Select {
         input,
@@ -319,10 +401,10 @@ fn normalize_select(
 fn normalize_partition(
     plan: &LayoutPlan,
     input: ExprId,
-    axis: crate::types::Axis,
+    axis: Axis,
     parts: u32,
     index: u32,
-    decl: &crate::types::TensorDecl,
+    decl: &TensorDecl,
     out: &mut LayoutPlan,
     memo: &mut HashMap<ExprId, ExprId>,
 ) -> Result<ExprId, CompileError> {
@@ -359,10 +441,10 @@ fn normalize_partition(
 fn push_select_through_join(
     plan: &LayoutPlan,
     inputs: &[ExprId],
-    axis: crate::types::Axis,
+    axis: Axis,
     start: i64,
     length: i64,
-    decl: &crate::types::TensorDecl,
+    decl: &TensorDecl,
     out: &mut LayoutPlan,
     memo: &mut HashMap<ExprId, ExprId>,
 ) -> Result<ExprId, CompileError> {
@@ -411,6 +493,168 @@ fn push_select_through_join(
     }))
 }
 
+#[allow(clippy::too_many_arguments)]
+fn push_select_through_decode(
+    plan: &LayoutPlan,
+    scheme: crate::types::QuantScheme,
+    data: ExprId,
+    metadata: &[ExprId],
+    axis: Axis,
+    start: i64,
+    length: i64,
+    decl: &TensorDecl,
+    out: &mut LayoutPlan,
+    memo: &mut HashMap<ExprId, ExprId>,
+) -> Result<ExprId, CompileError> {
+    let data_decl = plan
+        .decl(data)
+        .ok_or_else(|| CompileError::InvalidInput(format!("Decode data {} has no decl", data.0)))?;
+    let selected_data_decl = select_decl(data_decl, axis, start, length, "select")?;
+    let data = normalize_expr(plan, data, out, memo)?;
+    let selected_data = out.push(LayoutExpr::Select {
+        input: data,
+        axis,
+        start,
+        length,
+        decl: selected_data_decl,
+    });
+    let mut selected_metadata = Vec::with_capacity(metadata.len());
+    for meta in metadata {
+        let meta_decl = plan.decl(*meta).ok_or_else(|| {
+            CompileError::InvalidInput(format!("Decode metadata {} has no decl", meta.0))
+        })?;
+        let axis_index = axis.0 as usize;
+        let tracks_selected_axis = axis_index < meta_decl.shape.len()
+            && axis_index < decl.shape.len()
+            && axis_index < data_decl.shape.len()
+            && meta_decl.shape[axis_index] == data_decl.shape[axis_index]
+            && start + length <= meta_decl.shape[axis_index];
+        let normalized_meta = normalize_expr(plan, *meta, out, memo)?;
+        if tracks_selected_axis {
+            selected_metadata.push(out.push(LayoutExpr::Select {
+                input: normalized_meta,
+                axis,
+                start,
+                length,
+                decl: select_decl(meta_decl, axis, start, length, "select")?,
+            }));
+        } else {
+            selected_metadata.push(normalized_meta);
+        }
+    }
+    Ok(out.push(LayoutExpr::Decode {
+        scheme,
+        data: selected_data,
+        metadata: selected_metadata,
+        decl: decl.clone(),
+    }))
+}
+
+fn normalize_encode(
+    plan: &LayoutPlan,
+    scheme: crate::types::QuantScheme,
+    input: ExprId,
+    metadata_outputs: &[TensorDecl],
+    decl: &TensorDecl,
+    out: &mut LayoutPlan,
+    memo: &mut HashMap<ExprId, ExprId>,
+) -> Result<ExprId, CompileError> {
+    if let Some(LayoutExpr::Decode {
+        scheme: from,
+        data,
+        metadata,
+        ..
+    }) = plan.expr(input)
+    {
+        let data = normalize_expr(plan, *data, out, memo)?;
+        let metadata = normalize_inputs(plan, metadata, out, memo)?;
+        return Ok(out.push(LayoutExpr::Transcode {
+            from: *from,
+            to: scheme,
+            data,
+            metadata,
+            metadata_outputs: metadata_outputs.to_vec(),
+            decl: decl.clone(),
+        }));
+    }
+    if let Some(LayoutExpr::Select {
+        input: selected_input,
+        axis,
+        start,
+        length,
+        ..
+    }) = plan.expr(input)
+        && metadata_outputs.is_empty()
+        && encode_select_is_aligned(decl, *axis, *start, *length)
+    {
+        let source_decl = plan.decl(*selected_input).ok_or_else(|| {
+            CompileError::InvalidInput(format!("Encode input {} has no decl", selected_input.0))
+        })?;
+        let mut encoded_source_decl = source_decl.clone();
+        encoded_source_decl.name = format!("{}.encoded.{scheme:?}", source_decl.name);
+        encoded_source_decl.encoding = decl.encoding.clone();
+        let source = normalize_expr(plan, *selected_input, out, memo)?;
+        let encoded_source = out.push(LayoutExpr::Encode {
+            scheme,
+            input: source,
+            metadata_outputs: Vec::new(),
+            decl: encoded_source_decl,
+        });
+        return Ok(out.push(LayoutExpr::Select {
+            input: encoded_source,
+            axis: *axis,
+            start: *start,
+            length: *length,
+            decl: decl.clone(),
+        }));
+    }
+    let input = normalize_expr(plan, input, out, memo)?;
+    Ok(out.push(LayoutExpr::Encode {
+        scheme,
+        input,
+        metadata_outputs: metadata_outputs.to_vec(),
+        decl: decl.clone(),
+    }))
+}
+
+fn select_decl(
+    source: &TensorDecl,
+    axis: Axis,
+    start: i64,
+    length: i64,
+    suffix: &str,
+) -> Result<TensorDecl, CompileError> {
+    let axis_index = axis.0 as usize;
+    if axis_index >= source.shape.len()
+        || start < 0
+        || length <= 0
+        || start + length > source.shape[axis_index]
+    {
+        return Err(CompileError::InvalidInput(format!(
+            "cannot select axis {} range [{}:{}) from {:?}",
+            axis.0,
+            start,
+            start + length,
+            source.shape
+        )));
+    }
+    let mut decl = source.clone();
+    decl.name = format!("{}.{}", source.name, suffix);
+    decl.shape[axis_index] = length;
+    Ok(decl)
+}
+
+fn encode_select_is_aligned(decl: &TensorDecl, _axis: Axis, start: i64, length: i64) -> bool {
+    match &decl.encoding {
+        Encoding::Raw(_) => false,
+        Encoding::Quant(spec) if spec.bits_per_element >= 8 => true,
+        Encoding::Quant(spec) => {
+            let group = i64::from(spec.group_size.max(1));
+            start % group == 0 && length % group == 0
+        }
+    }
+}
+
 fn normalize_inputs(
     plan: &LayoutPlan,
     inputs: &[ExprId],
@@ -423,8 +667,8 @@ fn normalize_inputs(
         .collect()
 }
 
-fn collapse_selects(plan: &mut LayoutPlan) -> bool {
-    let mut changed = false;
+fn collapse_selects(plan: &mut LayoutPlan) -> usize {
+    let mut changed = 0;
     for id in 0..plan.exprs.len() {
         let replacement = match &plan.exprs[id] {
             LayoutExpr::Select {
@@ -452,14 +696,14 @@ fn collapse_selects(plan: &mut LayoutPlan) -> bool {
         };
         if let Some(expr) = replacement {
             plan.exprs[id] = expr;
-            changed = true;
+            changed += 1;
         }
     }
     changed
 }
 
-fn cancel_partition_join(plan: &mut LayoutPlan) -> bool {
-    let mut changed = false;
+fn cancel_partition_join(plan: &mut LayoutPlan) -> usize {
+    let mut changed = 0;
     for id in 0..plan.exprs.len() {
         let replacement = match &plan.exprs[id] {
             LayoutExpr::Partition {
@@ -489,14 +733,14 @@ fn cancel_partition_join(plan: &mut LayoutPlan) -> bool {
         };
         if let Some(expr) = replacement {
             plan.exprs[id] = expr;
-            changed = true;
+            changed += 1;
         }
     }
     changed
 }
 
-fn coalesce_reorders(plan: &mut LayoutPlan) -> bool {
-    let mut changed = false;
+fn coalesce_reorders(plan: &mut LayoutPlan) -> usize {
+    let mut changed = 0;
     for id in 0..plan.exprs.len() {
         let replacement = match &plan.exprs[id] {
             LayoutExpr::Reorder { input, perm, decl } => match plan.expr(*input) {
@@ -521,14 +765,14 @@ fn coalesce_reorders(plan: &mut LayoutPlan) -> bool {
         };
         if let Some(expr) = replacement {
             plan.exprs[id] = expr;
-            changed = true;
+            changed += 1;
         }
     }
     changed
 }
 
-fn elide_identity_views(plan: &mut LayoutPlan) -> bool {
-    let mut changed = false;
+fn elide_identity_views(plan: &mut LayoutPlan) -> usize {
+    let mut changed = 0;
     for id in 0..plan.exprs.len() {
         let replacement = match &plan.exprs[id] {
             LayoutExpr::View {
@@ -555,7 +799,7 @@ fn elide_identity_views(plan: &mut LayoutPlan) -> bool {
         };
         if let Some(expr) = replacement {
             plan.exprs[id] = expr;
-            changed = true;
+            changed += 1;
         }
     }
     changed

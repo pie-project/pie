@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 
+use crate::optimizer::OptimizerReport;
 use crate::types::{
     BackendKind, BufferId, FileId, InstrId, Layout, Mxfp4MoePolicy, QuantScheme, TensorDecl,
     TensorId,
@@ -155,6 +156,7 @@ pub enum StorageInstr {
 pub struct StorageProgram {
     pub version: u32,
     pub target: StorageTarget,
+    pub optimizer: OptimizerReport,
     pub tensors: Vec<TensorDecl>,
     pub buffers: Vec<BufferDecl>,
     pub instrs: Vec<StorageInstr>,
@@ -167,6 +169,7 @@ impl StorageProgram {
         Self {
             version: STORAGE_PROGRAM_VERSION,
             target,
+            optimizer: OptimizerReport::default(),
             tensors: Vec::new(),
             buffers: Vec::new(),
             instrs: Vec::new(),

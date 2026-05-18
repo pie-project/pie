@@ -262,6 +262,16 @@ fn infer_expr(
                 Encoding::Raw(_) => unreachable!(),
             };
             expected.encoding = Encoding::Raw(logical_dtype);
+            if decl.same_runtime_contract(&expected) {
+                return Ok(decl.clone());
+            }
+            if let Encoding::Raw(dtype) = decl.encoding
+                && dtype.is_float()
+                && logical_dtype.is_float()
+            {
+                expected.encoding = Encoding::Raw(dtype);
+                return expect_decl(index, decl, expected);
+            }
             expect_decl(index, decl, expected)
         }
         LayoutExpr::Encode {

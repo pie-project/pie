@@ -4,7 +4,7 @@ use crate::abi::RuntimeAbi;
 use crate::error::CompileError;
 use crate::frontend::{plan_from_semantics, runtime_bytes};
 use crate::ir::{LayoutExpr, LayoutPlan};
-use crate::optimizer::optimize;
+use crate::optimizer::optimize_with_report;
 use crate::schema::build_semantic_graph;
 use crate::source::{CheckpointMetadata, RawTensor};
 use crate::storage::{
@@ -25,8 +25,10 @@ pub fn compile_storage_program(
 ) -> Result<StorageProgram, CompileError> {
     let graph = build_semantic_graph(metadata, cfg)?;
     let plan = plan_from_semantics(metadata, &graph, abi, &target)?;
-    let plan = optimize(plan)?;
-    lower_layout_plan(metadata, &plan, target)
+    let optimized = optimize_with_report(plan)?;
+    let mut program = lower_layout_plan(metadata, &optimized.plan, target)?;
+    program.optimizer = optimized.report;
+    Ok(program)
 }
 
 pub fn lower_dense_copies(

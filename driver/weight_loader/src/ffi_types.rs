@@ -446,6 +446,28 @@ pub struct PieLoaderMemoryPlanView {
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PieLoaderOptimizerPassStatsView {
+    pub name: PieLoaderBytes,
+    pub exprs_before: u64,
+    pub exprs_after: u64,
+    pub rewrites: u64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PieLoaderOptimizerPassStatsSlice {
+    pub ptr: *const PieLoaderOptimizerPassStatsView,
+    pub len: usize,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PieLoaderOptimizerReportView {
+    pub passes: PieLoaderOptimizerPassStatsSlice,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct PieLoaderStorageProgramView {
     pub version: u32,
     pub tensors: PieLoaderTensorDeclSlice,
@@ -453,6 +475,7 @@ pub struct PieLoaderStorageProgramView {
     pub instrs: PieLoaderStorageInstrSlice,
     pub schedule: PieLoaderU32Slice,
     pub memory: PieLoaderMemoryPlanView,
+    pub optimizer: PieLoaderOptimizerReportView,
 }
 
 #[repr(C)]

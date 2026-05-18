@@ -83,7 +83,6 @@ add_library(pie_driver_cuda_lib STATIC
   src/loader/gguf_source.cpp
   src/loader/hf_config.cpp
   src/loader/byte_source.cpp
-  src/loader/layout_optimizer.cpp
   src/loader/layout_plan.cpp
   src/loader/layout_planner.cpp
   src/loader/layout_typecheck.cpp
@@ -241,7 +240,6 @@ target_link_libraries(test_driver_common PRIVATE nlohmann_json::nlohmann_json)
 add_executable(test_layout_plan
   tests/test_layout_plan.cpp
   src/loader/gguf_source.cpp
-  src/loader/layout_optimizer.cpp
   src/loader/layout_plan.cpp
   src/loader/layout_planner.cpp
   src/loader/layout_typecheck.cpp

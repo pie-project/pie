@@ -26,12 +26,12 @@ enum class RustLoaderPlannerMode {
 inline RustLoaderPlannerMode parse_rust_loader_planner_mode(
     const std::string& value)
 {
-    if (value.empty() || value == "cpp") return RustLoaderPlannerMode::Cpp;
-    if (value == "rust") return RustLoaderPlannerMode::Rust;
+    if (value.empty() || value == "rust") return RustLoaderPlannerMode::Rust;
+    if (value == "cpp") return RustLoaderPlannerMode::Cpp;
     if (value == "dual") return RustLoaderPlannerMode::Dual;
     throw std::runtime_error(
         "rust loader planner: PIE_CUDA_LOADER_PLANNER must be one of "
-        "{cpp,rust,dual}");
+        "{rust,dual,cpp}; cpp is deprecated");
 }
 
 inline const char* rust_loader_planner_mode_name(
@@ -43,6 +43,15 @@ inline const char* rust_loader_planner_mode_name(
     case RustLoaderPlannerMode::Dual: return "dual";
     }
     return "?";
+}
+
+inline std::string rust_loader_bytes_to_string(
+    pie_weight_loader::PieLoaderBytes bytes)
+{
+    if (bytes.ptr == nullptr || bytes.len == 0) return {};
+    return std::string(
+        reinterpret_cast<const char*>(bytes.ptr),
+        reinterpret_cast<const char*>(bytes.ptr) + bytes.len);
 }
 
 struct RustLoaderCompileResult {
@@ -403,6 +412,10 @@ inline std::string describe_rust_storage_program(
     std::size_t direct_contract_count,
     std::size_t cpp_tensor_count)
 {
+    std::uint64_t optimizer_rewrites = 0;
+    for (std::size_t i = 0; i < view.optimizer.passes.len; ++i) {
+        optimizer_rewrites += view.optimizer.passes.ptr[i].rewrites;
+    }
     std::ostringstream out;
     out << "rust_storage_program(version=" << view.version
         << ", source_tensors=" << source_tensor_count
@@ -411,6 +424,8 @@ inline std::string describe_rust_storage_program(
         << ", buffers=" << view.buffers.len
         << ", instrs=" << view.instrs.len
         << ", schedule=" << view.schedule.len
+        << ", optimizer_passes=" << view.optimizer.passes.len
+        << ", optimizer_rewrites=" << optimizer_rewrites
         << ", persistent_bytes=" << view.memory.persistent_bytes
         << ", read_bytes=" << view.memory.checkpoint_read_bytes
         << ", write_bytes=" << view.memory.device_write_bytes
@@ -478,6 +493,27 @@ inline void dump_rust_count_map(
     out << "}" << suffix << "\n";
 }
 
+inline void dump_rust_optimizer_report(
+    std::ostringstream& out,
+    const pie_weight_loader::PieLoaderOptimizerReportView& optimizer,
+    const char* suffix)
+{
+    out << "  \"optimizer\": {\n"
+        << "    \"passes\": [\n";
+    for (std::size_t i = 0; i < optimizer.passes.len; ++i) {
+        const auto& pass = optimizer.passes.ptr[i];
+        out << "      {\"name\": \""
+            << rust_loader_bytes_to_string(pass.name)
+            << "\", \"exprs_before\": " << pass.exprs_before
+            << ", \"exprs_after\": " << pass.exprs_after
+            << ", \"rewrites\": " << pass.rewrites << "}";
+        if (i + 1 < optimizer.passes.len) out << ",";
+        out << "\n";
+    }
+    out << "    ]\n"
+        << "  }" << suffix << "\n";
+}
+
 inline std::string dump_rust_storage_program_json(
     const pie_weight_loader::PieLoaderStorageProgramView& view,
     std::size_t source_tensor_count,
@@ -520,6 +556,7 @@ inline std::string dump_rust_storage_program_json(
         << "    \"device_write_bytes\": "
         << view.memory.device_write_bytes << "\n"
         << "  },\n";
+    dump_rust_optimizer_report(out, view.optimizer, ",");
     dump_rust_count_map(out, "instruction_kinds", instruction_kinds, ",");
     dump_rust_count_map(out, "tile_map_kinds", tile_map_kinds, "");
     out

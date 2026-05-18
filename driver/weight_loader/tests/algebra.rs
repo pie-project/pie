@@ -244,6 +244,244 @@ fn optimizer_distributes_cast_over_join() {
 }
 
 #[test]
+fn optimizer_pushes_select_through_decode() {
+    let mut plan = LayoutPlan::new();
+    let q_decl = decl(
+        0,
+        "q",
+        &[8, 2],
+        Encoding::Quant(quant(QuantScheme::Fp8E4M3, DType::BF16)),
+    );
+    let scale_decl = decl(1, "q.scale", &[8], Encoding::Raw(DType::F32));
+    let q = plan.push(LayoutExpr::Source {
+        tensor: TensorId(0),
+        decl: q_decl.clone(),
+    });
+    let scale = plan.push(LayoutExpr::Source {
+        tensor: TensorId(1),
+        decl: scale_decl.clone(),
+    });
+    let decoded_decl = decl(2, "decoded", &[8, 2], Encoding::Raw(DType::BF16));
+    let decoded = plan.push(LayoutExpr::Decode {
+        scheme: QuantScheme::Fp8E4M3,
+        data: q,
+        metadata: vec![scale],
+        decl: decoded_decl,
+    });
+    let out_decl = decl(3, "out", &[4, 2], Encoding::Raw(DType::BF16));
+    let selected = plan.push(LayoutExpr::Select {
+        input: decoded,
+        axis: Axis(0),
+        start: 2,
+        length: 4,
+        decl: out_decl.clone(),
+    });
+    let out = plan.push(LayoutExpr::Realize {
+        input: selected,
+        runtime_name: "out".to_string(),
+        decl: out_decl,
+    });
+    plan.outputs.push(out);
+
+    let optimized = optimize(plan.clone()).unwrap();
+    assert!(optimized.exprs.iter().any(|expr| matches!(
+        expr,
+        LayoutExpr::Decode { decl, metadata, .. }
+            if decl.shape == vec![4, 2] && metadata.iter().any(|id| matches!(
+                optimized.exprs[id.0 as usize],
+                LayoutExpr::Select { length: 4, .. }
+            ))
+    )));
+
+    let mut sources = HashMap::new();
+    sources.insert(
+        TensorId(0),
+        TensorValue::new(q_decl, (0..16).collect()).unwrap(),
+    );
+    sources.insert(
+        TensorId(1),
+        TensorValue::new(scale_decl, (0..8).collect()).unwrap(),
+    );
+    assert_eq!(
+        evaluate(&optimized, &sources).unwrap()["out"].data,
+        evaluate(&plan, &sources).unwrap()["out"].data
+    );
+}
+
+#[test]
+fn optimizer_fuses_cast_into_decode() {
+    let mut plan = LayoutPlan::new();
+    let q_decl = decl(
+        0,
+        "q",
+        &[4],
+        Encoding::Quant(quant(QuantScheme::Fp8E4M3, DType::BF16)),
+    );
+    let q = plan.push(LayoutExpr::Source {
+        tensor: TensorId(0),
+        decl: q_decl.clone(),
+    });
+    let decoded_decl = decl(1, "decoded", &[4], Encoding::Raw(DType::BF16));
+    let decoded = plan.push(LayoutExpr::Decode {
+        scheme: QuantScheme::Fp8E4M3,
+        data: q,
+        metadata: Vec::new(),
+        decl: decoded_decl,
+    });
+    let cast_decl = decl(2, "out", &[4], Encoding::Raw(DType::F32));
+    let cast = plan.push(LayoutExpr::Cast {
+        input: decoded,
+        dtype: DType::F32,
+        decl: cast_decl.clone(),
+    });
+    let out = plan.push(LayoutExpr::Realize {
+        input: cast,
+        runtime_name: "out".to_string(),
+        decl: cast_decl,
+    });
+    plan.outputs.push(out);
+
+    let optimized = optimize(plan.clone()).unwrap();
+    assert!(optimized.exprs.iter().any(|expr| matches!(
+        expr,
+        LayoutExpr::Decode { decl, .. } if decl.encoding == Encoding::Raw(DType::F32)
+    )));
+    assert!(
+        !optimized
+            .exprs
+            .iter()
+            .any(|expr| matches!(expr, LayoutExpr::Cast { .. }))
+    );
+
+    let mut sources = HashMap::new();
+    sources.insert(
+        TensorId(0),
+        TensorValue::new(q_decl, vec![1, 2, 3, 4]).unwrap(),
+    );
+    assert_eq!(
+        evaluate(&optimized, &sources).unwrap()["out"].data,
+        evaluate(&plan, &sources).unwrap()["out"].data
+    );
+}
+
+#[test]
+fn optimizer_hoists_aligned_encode_through_select() {
+    let mut plan = LayoutPlan::new();
+    let raw = decl(0, "raw", &[128], Encoding::Raw(DType::BF16));
+    let source = plan.push(LayoutExpr::Source {
+        tensor: TensorId(0),
+        decl: raw.clone(),
+    });
+    let selected_decl = decl(1, "selected", &[32], Encoding::Raw(DType::BF16));
+    let selected = plan.push(LayoutExpr::Select {
+        input: source,
+        axis: Axis(0),
+        start: 32,
+        length: 32,
+        decl: selected_decl,
+    });
+    let encoded_decl = decl(
+        2,
+        "encoded",
+        &[32],
+        Encoding::Quant(quant(QuantScheme::AwqInt4, DType::BF16)),
+    );
+    let encoded = plan.push(LayoutExpr::Encode {
+        scheme: QuantScheme::AwqInt4,
+        input: selected,
+        metadata_outputs: Vec::new(),
+        decl: encoded_decl.clone(),
+    });
+    let out = plan.push(LayoutExpr::Realize {
+        input: encoded,
+        runtime_name: "encoded".to_string(),
+        decl: encoded_decl,
+    });
+    plan.outputs.push(out);
+
+    let optimized = optimize(plan.clone()).unwrap();
+    assert!(optimized.exprs.iter().any(|expr| matches!(
+        expr,
+        LayoutExpr::Encode { decl, .. } if decl.shape == vec![128]
+    )));
+    assert!(optimized.exprs.iter().any(|expr| matches!(
+        expr,
+        LayoutExpr::Select { decl, .. }
+            if decl.encoding == Encoding::Quant(quant(QuantScheme::AwqInt4, DType::BF16))
+    )));
+
+    let mut sources = HashMap::new();
+    sources.insert(
+        TensorId(0),
+        TensorValue::new(raw, (0..128).collect()).unwrap(),
+    );
+    assert_eq!(
+        evaluate(&optimized, &sources).unwrap()["encoded"].data,
+        evaluate(&plan, &sources).unwrap()["encoded"].data
+    );
+}
+
+#[test]
+fn optimizer_fuses_encode_decode_to_transcode() {
+    let mut plan = LayoutPlan::new();
+    let awq = decl(
+        0,
+        "awq",
+        &[4],
+        Encoding::Quant(quant(QuantScheme::AwqInt4, DType::BF16)),
+    );
+    let source = plan.push(LayoutExpr::Source {
+        tensor: TensorId(0),
+        decl: awq.clone(),
+    });
+    let decoded = decl(1, "decoded", &[4], Encoding::Raw(DType::BF16));
+    let dec = plan.push(LayoutExpr::Decode {
+        scheme: QuantScheme::AwqInt4,
+        data: source,
+        metadata: Vec::new(),
+        decl: decoded,
+    });
+    let gptq = decl(
+        2,
+        "gptq",
+        &[4],
+        Encoding::Quant(quant(QuantScheme::GptqInt4, DType::BF16)),
+    );
+    let enc = plan.push(LayoutExpr::Encode {
+        scheme: QuantScheme::GptqInt4,
+        input: dec,
+        metadata_outputs: Vec::new(),
+        decl: gptq.clone(),
+    });
+    let out = plan.push(LayoutExpr::Realize {
+        input: enc,
+        runtime_name: "gptq".to_string(),
+        decl: gptq,
+    });
+    plan.outputs.push(out);
+
+    let optimized = optimize(plan.clone()).unwrap();
+    assert_eq!(
+        optimized
+            .exprs
+            .iter()
+            .filter(|expr| matches!(expr, LayoutExpr::Transcode { .. }))
+            .count(),
+        1
+    );
+
+    let mut sources = HashMap::new();
+    sources.insert(
+        TensorId(0),
+        TensorValue::new(awq, vec![11, 12, 13, 14]).unwrap(),
+    );
+    assert_eq!(
+        evaluate(&optimized, &sources).unwrap()["gptq"].data,
+        evaluate(&plan, &sources).unwrap()["gptq"].data
+    );
+}
+
+#[test]
 fn encode_decode_transcode_are_explicit_reference_ops() {
     let mut plan = LayoutPlan::new();
     let raw = decl(0, "raw", &[4], Encoding::Raw(DType::BF16));

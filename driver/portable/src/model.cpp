@@ -729,11 +729,9 @@ void Model::load_into_backend_() {
             "model: ggml_backend_alloc_ctx_tensors failed (out of memory?)");
     }
 
-    if (const char* planner = std::getenv("PIE_PORTABLE_LOADER_PLANNER");
-        planner != nullptr && planner[0] != '\0') {
-        if (try_load_with_rust_storage_program(*this, planner)) {
-            return;
-        }
+    const char* planner = std::getenv("PIE_PORTABLE_LOADER_PLANNER");
+    if (try_load_with_rust_storage_program(*this, planner == nullptr ? "" : planner)) {
+        return;
     }
 
     for (const auto& d : declared_) {

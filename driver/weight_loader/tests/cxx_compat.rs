@@ -5,6 +5,7 @@ fn generated_header_uses_stable_cxx_names() {
     let header = std::fs::read_to_string(header_path).expect("generated header exists");
     assert!(header.contains("struct PieLoaderStorageProgramView"));
     assert!(header.contains("struct PieLoaderStorageInstrView"));
+    assert!(header.contains("struct PieLoaderOptimizerReportView"));
     assert!(header.contains("enum class PieLoaderSemanticRole"));
     assert!(header.contains("PieLoaderSourceExtentView source"));
     assert!(header.contains("int32_t shard_axis"));

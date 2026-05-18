@@ -53,7 +53,7 @@ def bench_env(
     *,
     plan_dump: Path | None = None,
     pie_driver: str = "cuda_native",
-    loader_planner: str = "cpp",
+    loader_planner: str = "rust",
 ) -> dict[str, str]:
     env = base.copy()
     paths = [
@@ -145,6 +145,7 @@ def parse_plan_dump(path: Path) -> dict[str, Any]:
             "storage_instr_kinds": instr_kinds,
             "storage_transform_kinds": tile_kinds,
             "storage_memory": memory,
+            "optimizer": data.get("optimizer", {}),
         }
     algebra = data.get("algebra", {})
     storage = data.get("storage", {})
@@ -170,6 +171,7 @@ def parse_plan_dump(path: Path) -> dict[str, Any]:
         "storage_instr_kinds": instr_kinds,
         "storage_transform_kinds": transform_kinds,
         "storage_memory": storage.get("memory", {}),
+        "optimizer": data.get("optimizer", storage.get("optimizer", {})),
     }
 
 
@@ -327,7 +329,7 @@ def main() -> None:
     parser.add_argument(
         "--loader-planner",
         choices=["cpp", "rust", "dual"],
-        default="cpp",
+        default="rust",
         help="Set PIE_*_LOADER_PLANNER for Pie evidence runs.",
     )
     parser.add_argument(

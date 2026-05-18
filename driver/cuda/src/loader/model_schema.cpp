@@ -9,7 +9,6 @@
 
 #include "loader/model_adapter.hpp"
 #include "loader/model_family.hpp"
-#include "loader/layout_optimizer.hpp"
 #include "loader/layout_planner.hpp"
 #include "loader/runtime_abi.hpp"
 #include "loader/safetensors.hpp"
@@ -2630,10 +2629,8 @@ LayoutPlan build_model_layout_plan(
         build_model_semantic_graph(hf, boot_cfg, loader);
     if (can_use_native_dense_algebra_plan(
             hf, boot_cfg, loader, semantic_graph, schema)) {
-        plan = build_native_dense_algebra_plan(
+        return build_native_dense_algebra_plan(
             semantic_graph, loader, tp_size);
-        (void)optimize_layout_algebra(plan);
-        return plan;
     }
     std::unordered_map<std::string, const SemanticGroup*> packed_group_by_raw;
     packed_group_by_raw.reserve(semantic_graph.groups.size() * 3);
@@ -2901,7 +2898,6 @@ LayoutPlan build_model_layout_plan(
             "scheduled");
     }
     finalize_memory_plan(plan);
-    (void)optimize_layout_algebra(plan);
     return plan;
 }
 
