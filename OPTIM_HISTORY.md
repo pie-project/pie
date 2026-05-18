@@ -534,3 +534,19 @@ part of the large-GPU validation set because it exposes planner mistakes that
   variable and still chooses `FLASH_ATTN` for attention. Future vLLM backend
   A/Bs should use the current vLLM 0.21 configuration API rather than the old
   environment variable.
+- Inspecting vLLM 0.21's Hopper attention backend explains the remaining
+  large-model gap more concretely:
+  - `vllm/v1/attention/backends/flash_attn.py` builds paged metadata with a
+    dense `block_table`, per-request `seq_lens`, and optional FA3 scheduler
+    metadata from `get_scheduler_metadata`.
+  - `vllm/vllm_flash_attn/flash_attn_interface.py` then calls
+    `torch.ops._vllm_fa3_C.fwd(q, k_cache, v_cache, ..., seqused_k,
+    block_table, scheduler_metadata, num_splits, ...)`.
+  - This supports GQA generally because FA3 accepts Q heads and KV heads
+    directly; Pie's FlashInfer decode kernel only supports GQA groups
+    `{1,2,3,4,8}`, so Qwen's GQA=5 decode is forced through Pie's FlashInfer
+    prefill fallback.
+  The next real optimization is therefore not another planner heuristic. It is
+  either a native FA3 paged-attention integration for Pie's KV layout, or a
+  deliberate KV-layout adapter plus graph-safe metadata cache for the vLLM/FA3
+  ABI. The previous generic XQA attempt was not that path and was slower.
