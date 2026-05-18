@@ -56,8 +56,13 @@ inline bool rust_loader_contract_is_direct(
     const TensorDecl& spec,
     const TensorInfo& info)
 {
+    const bool dtype_supported =
+        spec.dtype == info.dtype ||
+        (info.dtype == DType::FP16 && spec.dtype == DType::BF16) ||
+        (info.dtype == DType::FP32 && spec.dtype == DType::BF16) ||
+        (info.dtype == DType::BF16 && spec.dtype == DType::FP32);
     return spec.shape == info.shape &&
-           spec.dtype == info.dtype &&
+           dtype_supported &&
            spec.ownership == TensorOwnershipKind::Owned &&
            spec.layout == TensorLayoutKind::Dense;
 }
@@ -247,12 +252,82 @@ inline std::string describe_rust_storage_program(
     return out.str();
 }
 
+inline const char* rust_storage_instr_kind_name(
+    pie_weight_loader::PieLoaderStorageInstrKind kind) noexcept
+{
+    switch (kind) {
+    case pie_weight_loader::PieLoaderStorageInstrKind::Allocate:
+        return "Allocate";
+    case pie_weight_loader::PieLoaderStorageInstrKind::ExtentWrite:
+        return "ExtentWrite";
+    case pie_weight_loader::PieLoaderStorageInstrKind::TileMap:
+        return "TileMap";
+    case pie_weight_loader::PieLoaderStorageInstrKind::CreateView:
+        return "CreateView";
+    case pie_weight_loader::PieLoaderStorageInstrKind::Attach:
+        return "Attach";
+    case pie_weight_loader::PieLoaderStorageInstrKind::Release:
+        return "Release";
+    case pie_weight_loader::PieLoaderStorageInstrKind::Finalize:
+        return "Finalize";
+    }
+    return "Unknown";
+}
+
+inline const char* rust_tile_map_kind_name(
+    pie_weight_loader::PieLoaderTileMapKind kind) noexcept
+{
+    switch (kind) {
+    case pie_weight_loader::PieLoaderTileMapKind::Cast:
+        return "Cast";
+    case pie_weight_loader::PieLoaderTileMapKind::Decode:
+        return "Decode";
+    case pie_weight_loader::PieLoaderTileMapKind::Encode:
+        return "Encode";
+    case pie_weight_loader::PieLoaderTileMapKind::Transcode:
+        return "Transcode";
+    case pie_weight_loader::PieLoaderTileMapKind::Reblock:
+        return "Reblock";
+    case pie_weight_loader::PieLoaderTileMapKind::Reorder:
+        return "Reorder";
+    case pie_weight_loader::PieLoaderTileMapKind::None:
+        return "None";
+    }
+    return "Unknown";
+}
+
+inline void dump_rust_count_map(
+    std::ostringstream& out,
+    const char* key,
+    const std::map<std::string, std::size_t>& counts,
+    const char* suffix)
+{
+    out << "  \"" << key << "\": {";
+    bool first = true;
+    for (const auto& [name, count] : counts) {
+        if (!first) out << ", ";
+        out << "\"" << name << "\": " << count;
+        first = false;
+    }
+    out << "}" << suffix << "\n";
+}
+
 inline std::string dump_rust_storage_program_json(
     const pie_weight_loader::PieLoaderStorageProgramView& view,
     std::size_t source_tensor_count,
     std::size_t direct_contract_count,
     std::size_t cpp_tensor_count)
 {
+    std::map<std::string, std::size_t> instruction_kinds;
+    std::map<std::string, std::size_t> tile_map_kinds;
+    for (std::size_t i = 0; i < view.instrs.len; ++i) {
+        const auto& instr = view.instrs.ptr[i];
+        instruction_kinds[rust_storage_instr_kind_name(instr.kind)] += 1;
+        if (instr.kind ==
+            pie_weight_loader::PieLoaderStorageInstrKind::TileMap) {
+            tile_map_kinds[rust_tile_map_kind_name(instr.tile_kind)] += 1;
+        }
+    }
     std::ostringstream out;
     out << "{\n"
         << "  \"summary\": \""
@@ -278,7 +353,10 @@ inline std::string dump_rust_storage_program_json(
         << view.memory.checkpoint_read_bytes << ",\n"
         << "    \"device_write_bytes\": "
         << view.memory.device_write_bytes << "\n"
-        << "  }\n"
+        << "  },\n";
+    dump_rust_count_map(out, "instruction_kinds", instruction_kinds, ",");
+    dump_rust_count_map(out, "tile_map_kinds", tile_map_kinds, "");
+    out
         << "}\n";
     return out.str();
 }

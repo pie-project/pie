@@ -177,6 +177,7 @@ impl FfiArena {
                 id,
                 kind,
                 source,
+                dest,
                 inputs,
                 outputs,
                 transform,
@@ -190,8 +191,11 @@ impl FfiArena {
                     .map(|source| self.source_view(source))
                     .unwrap_or_default(),
                 has_source: source.is_some(),
-                dest: empty_dest,
-                has_dest: false,
+                dest: dest
+                    .as_ref()
+                    .map(|dest| self.dest_view(dest))
+                    .unwrap_or_default(),
+                has_dest: dest.is_some(),
                 input_buffers: self.push_buffer_ids(inputs),
                 output_buffers: self.push_buffer_ids(outputs),
                 tile_kind: ffi_tile_kind(*kind),

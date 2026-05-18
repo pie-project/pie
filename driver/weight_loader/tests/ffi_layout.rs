@@ -244,8 +244,10 @@ fn cast_contract_lowers_to_source_tile_map() {
     assert_eq!(instrs[1].kind, PieLoaderStorageInstrKind::TileMap);
     assert_eq!(instrs[1].tile_kind, PieLoaderTileMapKind::Cast);
     assert!(instrs[1].has_source);
+    assert!(instrs[1].has_dest);
     assert_eq!(instrs[1].source.file_offset, 64);
     assert_eq!(instrs[1].source.span_bytes, 8);
+    assert_eq!(instrs[1].dest.offset, 0);
     assert_eq!(view.memory.checkpoint_read_bytes, 8);
     assert_eq!(view.memory.device_write_bytes, 4);
 
@@ -344,8 +346,10 @@ fn fp8_quant_contract_lowers_to_decode_with_metadata() {
     assert_eq!(instrs[3].transform_from, PieLoaderQuantScheme::Fp8E4M3);
     assert_eq!(instrs[3].input_buffers.len, 1);
     assert!(instrs[3].has_source);
+    assert!(instrs[3].has_dest);
     assert_eq!(instrs[3].source.file_offset, 64);
     assert_eq!(instrs[3].source.span_bytes, 8);
+    assert_eq!(instrs[3].dest.offset, 0);
     assert_eq!(view.memory.checkpoint_read_bytes, 10);
     assert_eq!(view.memory.device_write_bytes, 18);
 

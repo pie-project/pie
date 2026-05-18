@@ -888,14 +888,20 @@ Current Rust implementation status:
 - Implemented flat executable `StorageProgram` views with instruction payloads
   for allocate, extent write, tile map, create view, attach, release, and
   finalize.
+- Made `TileMap` placement explicit: tiled transforms now carry an optional
+  destination extent, so buffer-to-buffer joins/stacks/reblocks have the same
+  physical addressability as raw `ExtentWrite`s instead of relying on implicit
+  output offsets.
 - Added C++ boundary headers for owning Rust program handles and for building
   flat `PieLoaderCompileInput` views from CUDA-side metadata/config data.
 - Wired the CUDA loader to compile/dump Rust storage programs with
-  `PIE_CUDA_LOADER_PLANNER={cpp,dual,rust}` and to execute the dense
-  Rust-compiled path through the CUDA `WeightStoreBuilder`.
+  `PIE_CUDA_LOADER_PLANNER={cpp,dual,rust}` and to execute dense direct,
+  compact cast, create-view, release, and identity reblock Rust-compiled paths
+  through the CUDA `WeightStoreBuilder`.
 - Wired the portable ggml loader to compile/dump Rust storage programs with
   `PIE_PORTABLE_LOADER_PLANNER={cpp,dual,rust}` and to execute full-coverage
-  direct/cast paths into existing ggml backend tensors.
+  direct/cast, strided extent-write, create-view, identity reblock/reorder, and
+  decode paths into existing ggml backend tensors.
 - Added a generic `ByteSpans` runtime source/IR term for byte-range assembly:
   fused slices, stacked expert writes, source/destination offset writes, and
   GGUF-style byte passthrough now lower to ordinary `ExtentWrite`
@@ -909,6 +915,8 @@ Current Rust implementation status:
 - Extended the portable Rust executor with CPU temporary buffers and executable
   `TileMap::Decode` for FP8_E4M3 -> BF16, so metadata-backed transforms run
   from the compiled storage program.
+- Added a storage-compiler regression test proving tiled buffer joins carry
+  exact destination offsets.
 - Fixed GGUF declaration policy so tensors with `ggml_type_override` keep the
   GGUF-owned runtime type instead of passing through safetensors F32/BF16
   cast heuristics.
@@ -927,7 +935,8 @@ Current Rust implementation status:
 Current e2e smoke evidence:
 
 - CUDA native, `PIE_CUDA_LOADER_PLANNER=rust`, `Qwen/Qwen3-0.6B`,
-  `cuda:0`: 367/367 contracts, one-token latency smoke passed.
+  `cuda:0`: 367/367 contracts, one-token latency smoke passed after the
+  explicit TileMap destination change.
 - Portable ggml, `PIE_PORTABLE_LOADER_PLANNER=rust`, `Qwen/Qwen3-0.6B`,
   CPU backend: 311/311 contracts, one-token latency smoke passed.
 - Portable ggml, `PIE_PORTABLE_LOADER_PLANNER=rust`,
@@ -940,13 +949,15 @@ Current e2e smoke evidence:
   `allenai/Olmo-3-7B-Instruct`: 355/355 contracts, one-token smoke passed.
 - Portable ggml, `PIE_PORTABLE_LOADER_PLANNER=rust`,
   `RedHatAI/Qwen3-0.6B-FP8-dynamic`: 311/311 contracts,
-  metadata-backed FP8 decode smoke passed.
+  metadata-backed FP8 decode smoke passed after the explicit TileMap
+  destination change.
 - Portable ggml, `PIE_PORTABLE_LOADER_PLANNER=rust`,
   `mistralai/Ministral-3-3B-Instruct-2512`: 236/236 contracts,
   static FP8 `weight_scale_inv` decode smoke passed.
 - Portable ggml offline driver runner, `PIE_PORTABLE_LOADER_PLANNER=rust`,
   `unsloth/Qwen3-0.6B-GGUF`: Q4_K_M, Q5_K_M, and Q8_0 all loaded as
-  310/310-contract Rust storage programs and completed one-token generation.
+  310/310-contract Rust storage programs and completed one-token generation;
+  Q4_K_M was rechecked after the explicit TileMap destination change.
 
 Remaining cutover work is now concentrated on large-model and production
 evidence: running the very large MoE families where host/GPU memory permits,

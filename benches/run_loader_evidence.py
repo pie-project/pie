@@ -130,6 +130,11 @@ def parse_plan_dump(path: Path) -> dict[str, Any]:
     with path.open("r", encoding="utf-8") as f:
         data = json.load(f)
     if "storage" not in data and "instruction_count" in data:
+        instr_kinds = data.get("instruction_kinds", {})
+        tile_kinds = data.get("tile_map_kinds", {})
+        memory = dict(data.get("memory", {}))
+        memory.setdefault("extent_write_count", instr_kinds.get("ExtentWrite"))
+        memory.setdefault("tile_map_count", instr_kinds.get("TileMap"))
         return {
             "layout_summary": data.get("summary"),
             "storage_summary": data.get("summary"),
@@ -137,9 +142,9 @@ def parse_plan_dump(path: Path) -> dict[str, Any]:
             "algebra_binding_count": data.get("cpp_tensor_count"),
             "algebra_expr_kinds": {},
             "storage_instr_count": data.get("instruction_count"),
-            "storage_instr_kinds": {},
-            "storage_transform_kinds": {},
-            "storage_memory": data.get("memory", {}),
+            "storage_instr_kinds": instr_kinds,
+            "storage_transform_kinds": tile_kinds,
+            "storage_memory": memory,
         }
     algebra = data.get("algebra", {})
     storage = data.get("storage", {})

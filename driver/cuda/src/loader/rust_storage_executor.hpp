@@ -8,6 +8,18 @@
 #include <vector>
 
 #include "../../../weight_loader/include/weight_loader.h"
+#if defined(__has_include)
+#if __has_include(<cuda_runtime.h>)
+#define PIE_CUDA_RUST_STORAGE_EXECUTOR_HAS_CUDA 1
+#endif
+#endif
+#ifndef PIE_CUDA_RUST_STORAGE_EXECUTOR_HAS_CUDA
+#define PIE_CUDA_RUST_STORAGE_EXECUTOR_HAS_CUDA 0
+#endif
+#if PIE_CUDA_RUST_STORAGE_EXECUTOR_HAS_CUDA
+#include "cuda_check.hpp"
+#include "kernels/dtype_cast.hpp"
+#endif
 #include "loader/safetensors.hpp"
 #include "model/weight_store.hpp"
 #include "tensor.hpp"
@@ -48,17 +60,16 @@ public:
                 finalize(program, instr, stats);
                 break;
             case pie_weight_loader::PieLoaderStorageInstrKind::TileMap:
-                throw std::runtime_error(
-                    "rust storage executor: TileMap is not yet implemented "
-                    "in the dense cutover path");
+                tile_map(instr);
+                break;
             case pie_weight_loader::PieLoaderStorageInstrKind::CreateView:
                 create_view(program, instr);
                 break;
-            case pie_weight_loader::PieLoaderStorageInstrKind::Attach:
             case pie_weight_loader::PieLoaderStorageInstrKind::Release:
-                throw std::runtime_error(
-                    "rust storage executor: instruction kind is not yet "
-                    "implemented in the dense cutover path");
+                buffers_.erase(instr.buffer_id);
+                break;
+            case pie_weight_loader::PieLoaderStorageInstrKind::Attach:
+                break;
             }
         }
         weights_.finalize();
@@ -130,6 +141,31 @@ private:
         return true;
     }
 
+    static std::uint64_t extent_bytes(
+        const pie_weight_loader::PieLoaderStridedExtentView& extent)
+    {
+        std::uint64_t elements = 1;
+        for (std::size_t i = 0; i < extent.dims.len; ++i) {
+            const auto count = extent.dims.ptr[i].count;
+            if (count < 0) {
+                throw std::runtime_error(
+                    "rust storage executor: negative extent dimension");
+            }
+            const auto ucount = static_cast<std::uint64_t>(count);
+            if (ucount != 0 && elements > UINT64_MAX / ucount) {
+                throw std::runtime_error(
+                    "rust storage executor: extent element count overflow");
+            }
+            elements *= ucount;
+        }
+        if (extent.element_bytes != 0 &&
+            elements > UINT64_MAX / extent.element_bytes) {
+            throw std::runtime_error(
+                "rust storage executor: extent byte count overflow");
+        }
+        return elements * extent.element_bytes;
+    }
+
     const pie_weight_loader::PieLoaderStorageInstrView& instruction(
         const pie_weight_loader::PieLoaderStorageProgramView& program,
         std::uint32_t id) const
@@ -176,9 +212,12 @@ private:
     {
         const auto& buffer = buffer_decl(program, instr.buffer_id);
         if (!buffer.has_tensor) {
-            throw std::runtime_error(
-                "rust storage executor: temporary allocate is not yet "
-                "implemented");
+            buffers_.emplace(
+                buffer.id,
+                DeviceTensor::allocate(
+                    DType::UINT8,
+                    {static_cast<std::int64_t>(buffer.bytes)}));
+            return;
         }
         const auto& tensor = tensor_decl(program, buffer.tensor_id);
         buffers_.emplace(
@@ -217,6 +256,157 @@ private:
             instr.source.file_offset,
             instr.source.span_bytes,
             dst);
+    }
+
+    DeviceTensor& buffer_tensor(std::uint32_t buffer_id)
+    {
+        auto buffer = buffers_.find(buffer_id);
+        if (buffer == buffers_.end()) {
+            throw std::runtime_error("rust storage executor: buffer missing");
+        }
+        return buffer->second;
+    }
+
+    static void cast_tensor_to_ptr(
+        const DeviceTensor& src,
+        void* dst,
+        DType dst_dtype)
+    {
+#if PIE_CUDA_RUST_STORAGE_EXECUTOR_HAS_CUDA
+        if (src.dtype() == dst_dtype) {
+            CUDA_CHECK(cudaMemcpyAsync(
+                dst,
+                src.data(),
+                src.nbytes(),
+                cudaMemcpyDeviceToDevice,
+                /*stream=*/0));
+        } else if (src.dtype() == DType::FP16 && dst_dtype == DType::BF16) {
+            kernels::launch_cast_fp16_to_bf16(
+                src.data(), dst, src.numel(), /*stream=*/0);
+        } else if (src.dtype() == DType::FP32 && dst_dtype == DType::BF16) {
+            kernels::launch_cast_fp32_to_bf16(
+                src.data(), dst, src.numel(), /*stream=*/0);
+        } else if (src.dtype() == DType::BF16 && dst_dtype == DType::FP32) {
+            kernels::launch_cast_bf16_to_fp32(
+                src.data(), dst, src.numel(), /*stream=*/0);
+        } else {
+            throw std::runtime_error(
+                "rust storage executor: unsupported TileMap Cast " +
+                std::string(dtype_name(src.dtype())) + " -> " +
+                std::string(dtype_name(dst_dtype)));
+        }
+#else
+        (void)src;
+        (void)dst;
+        (void)dst_dtype;
+        throw std::runtime_error(
+            "rust storage executor: CUDA TileMap Cast compiled without CUDA "
+            "headers");
+#endif
+    }
+
+    void tile_map(
+        const pie_weight_loader::PieLoaderStorageInstrView& instr)
+    {
+        switch (instr.tile_kind) {
+        case pie_weight_loader::PieLoaderTileMapKind::Cast:
+            cast_tile_map(instr);
+            return;
+        case pie_weight_loader::PieLoaderTileMapKind::Reblock:
+        case pie_weight_loader::PieLoaderTileMapKind::Reorder:
+            reblock_tile_map(instr);
+            return;
+        case pie_weight_loader::PieLoaderTileMapKind::Decode:
+        case pie_weight_loader::PieLoaderTileMapKind::Encode:
+        case pie_weight_loader::PieLoaderTileMapKind::Transcode:
+        case pie_weight_loader::PieLoaderTileMapKind::None:
+            throw std::runtime_error(
+                "rust storage executor: unsupported TileMap kind in CUDA "
+                "cutover path");
+        }
+        throw std::runtime_error("rust storage executor: unknown TileMap kind");
+    }
+
+    void cast_tile_map(
+        const pie_weight_loader::PieLoaderStorageInstrView& instr)
+    {
+        if (instr.output_buffers.len != 1) {
+            throw std::runtime_error(
+                "rust storage executor: Cast TileMap expects one output");
+        }
+        const auto output_id = instr.output_buffers.ptr[0];
+        DeviceTensor& out = buffer_tensor(output_id);
+        const auto dst_offset =
+            instr.has_dest ? instr.dest.offset + instr.dest.stride.base_offset : 0;
+        auto* dst = static_cast<std::uint8_t*>(out.data()) + dst_offset;
+
+        if (instr.has_source) {
+            if (instr.source.tensor_id >= source_tensor_names_.size()) {
+                throw std::runtime_error(
+                    "rust storage executor: Cast source tensor id out of range");
+            }
+            if (!compact_extent(instr.source.stride)) {
+                throw std::runtime_error(
+                    "rust storage executor: non-compact Cast source is not "
+                    "implemented");
+            }
+            const TensorInfo& info =
+                loader_.info(source_tensor_names_[instr.source.tensor_id]);
+            DeviceTensor scratch =
+                DeviceTensor::allocate(info.dtype, shape_from_extent(instr.source.stride));
+            if (scratch.nbytes() != instr.source.span_bytes) {
+                throw std::runtime_error(
+                    "rust storage executor: Cast source byte size mismatch");
+            }
+            loader_.copy_storage_bytes_to_device(
+                instr.source.file_id,
+                instr.source.file_offset,
+                instr.source.span_bytes,
+                scratch.data());
+            cast_tensor_to_ptr(scratch, dst, out.dtype());
+            return;
+        }
+
+        if (instr.input_buffers.len != 1) {
+            throw std::runtime_error(
+                "rust storage executor: Cast TileMap expects source or one input");
+        }
+        cast_tensor_to_ptr(buffer_or_finalized_tensor(instr.input_buffers.ptr[0]), dst, out.dtype());
+    }
+
+    void reblock_tile_map(
+        const pie_weight_loader::PieLoaderStorageInstrView& instr)
+    {
+        if (instr.input_buffers.len != 1 || instr.output_buffers.len != 1) {
+            throw std::runtime_error(
+                "rust storage executor: Reblock TileMap expects one input "
+                "and one output");
+        }
+        const DeviceTensor& input =
+            buffer_or_finalized_tensor(instr.input_buffers.ptr[0]);
+        DeviceTensor& output = buffer_tensor(instr.output_buffers.ptr[0]);
+        const auto dst_offset =
+            instr.has_dest ? instr.dest.offset + instr.dest.stride.base_offset : 0;
+        const auto bytes = instr.has_dest
+            ? extent_bytes(instr.dest.stride)
+            : static_cast<std::uint64_t>(input.nbytes());
+        if (bytes > input.nbytes() ||
+            dst_offset + bytes > output.nbytes()) {
+            throw std::runtime_error(
+                "rust storage executor: Reblock byte range out of bounds");
+        }
+#if PIE_CUDA_RUST_STORAGE_EXECUTOR_HAS_CUDA
+        CUDA_CHECK(cudaMemcpyAsync(
+            static_cast<std::uint8_t*>(output.data()) + dst_offset,
+            input.data(),
+            bytes,
+            cudaMemcpyDeviceToDevice,
+            /*stream=*/0));
+#else
+        throw std::runtime_error(
+            "rust storage executor: CUDA Reblock compiled without CUDA "
+            "headers");
+#endif
     }
 
     const DeviceTensor& buffer_or_finalized_tensor(std::uint32_t buffer_id)
@@ -323,3 +513,5 @@ private:
 };
 
 }  // namespace pie_cuda_driver
+
+#undef PIE_CUDA_RUST_STORAGE_EXECUTOR_HAS_CUDA

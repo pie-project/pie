@@ -9,7 +9,9 @@
 #include <deque>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <iostream>
+#include <map>
 #include <optional>
 #include <sstream>
 #include <stdexcept>
@@ -855,6 +857,8 @@ public:
                     buffers_.erase(instr.buffer_id);
                     break;
                 case pie_weight_loader::PieLoaderStorageInstrKind::CreateView:
+                    create_view(program, instr);
+                    break;
                 case pie_weight_loader::PieLoaderStorageInstrKind::Attach:
                     throw std::runtime_error(
                         "portable rust loader: instruction is not executable in "
@@ -899,6 +903,31 @@ private:
         return entry.bytes.size();
     }
 
+    static std::uint64_t extent_bytes(
+        const pie_weight_loader::PieLoaderStridedExtentView& extent) {
+        std::uint64_t elements = 1;
+        for (std::size_t i = 0; i < extent.dims.len; ++i) {
+            const auto count = extent.dims.ptr[i].count;
+            if (count < 0) {
+                throw std::runtime_error(
+                    "portable rust loader: negative extent dimension");
+            }
+            const auto ucount = static_cast<std::uint64_t>(count);
+            if (ucount != 0 &&
+                elements > UINT64_MAX / ucount) {
+                throw std::runtime_error(
+                    "portable rust loader: extent element count overflow");
+            }
+            elements *= ucount;
+        }
+        if (extent.element_bytes != 0 &&
+            elements > UINT64_MAX / extent.element_bytes) {
+            throw std::runtime_error(
+                "portable rust loader: extent byte count overflow");
+        }
+        return elements * extent.element_bytes;
+    }
+
     std::size_t buffer_elements_bf16(const BufferEntry& entry) const {
         if (entry.tensor != nullptr) return static_cast<std::size_t>(ggml_nelements(entry.tensor));
         if (entry.bytes.size() % sizeof(std::uint16_t) != 0) {
@@ -920,6 +949,76 @@ private:
         } else {
             std::memcpy(entry.bytes.data() + offset, data, nbytes);
         }
+    }
+
+    void read_buffer(std::uint32_t buffer,
+                     void* data,
+                     std::uint64_t offset,
+                     std::uint64_t nbytes) {
+        const auto& entry = buffer_entry(buffer);
+        if (offset + nbytes > buffer_bytes(entry)) {
+            throw std::runtime_error("portable rust loader: read exceeds buffer");
+        }
+        if (entry.tensor != nullptr) {
+            ggml_backend_tensor_get(entry.tensor, data, offset, nbytes);
+        } else {
+            std::memcpy(data, entry.bytes.data() + offset, nbytes);
+        }
+    }
+
+    template <class CopyFn>
+    void for_each_strided_span(
+        const pie_weight_loader::PieLoaderStridedExtentView& src,
+        const pie_weight_loader::PieLoaderStridedExtentView& dst,
+        CopyFn&& copy) {
+        if (src.element_bytes != dst.element_bytes) {
+            throw std::runtime_error(
+                "portable rust loader: strided copy element size mismatch");
+        }
+        if (src.dims.len != dst.dims.len) {
+            throw std::runtime_error(
+                "portable rust loader: strided copy rank mismatch");
+        }
+        const std::size_t rank = src.dims.len;
+        for (std::size_t i = 0; i < rank; ++i) {
+            if (src.dims.ptr[i].count != dst.dims.ptr[i].count) {
+                throw std::runtime_error(
+                    "portable rust loader: strided copy shape mismatch");
+            }
+        }
+        const auto elem = static_cast<std::uint64_t>(src.element_bytes);
+        if (rank == 0) {
+            copy(src.base_offset, dst.base_offset, elem);
+            return;
+        }
+
+        std::function<void(std::size_t, std::uint64_t, std::uint64_t)> walk =
+            [&](std::size_t dim, std::uint64_t src_offset, std::uint64_t dst_offset) {
+                if (dim == rank) {
+                    copy(src_offset, dst_offset, elem);
+                    return;
+                }
+                const auto& src_dim = src.dims.ptr[dim];
+                const auto& dst_dim = dst.dims.ptr[dim];
+                if (src_dim.count < 0) {
+                    throw std::runtime_error(
+                        "portable rust loader: negative strided copy count");
+                }
+                const auto count = static_cast<std::uint64_t>(src_dim.count);
+                if (dim + 1 == rank &&
+                    src_dim.src_stride == static_cast<std::int64_t>(elem) &&
+                    dst_dim.dst_stride == static_cast<std::int64_t>(elem)) {
+                    copy(src_offset, dst_offset, count * elem);
+                    return;
+                }
+                for (std::uint64_t i = 0; i < count; ++i) {
+                    walk(
+                        dim + 1,
+                        src_offset + i * static_cast<std::uint64_t>(src_dim.src_stride),
+                        dst_offset + i * static_cast<std::uint64_t>(dst_dim.dst_stride));
+                }
+            };
+        walk(0, src.base_offset, dst.base_offset);
     }
 
     const std::uint8_t* temp_data(std::uint32_t buffer) const {
@@ -963,23 +1062,40 @@ private:
         if (!instr.has_source || !instr.has_dest) {
             throw std::runtime_error("portable rust loader: ExtentWrite missing extent");
         }
-        if (!compact_extent(instr.source.stride) || !compact_extent(instr.dest.stride)) {
-            throw std::runtime_error(
-                "portable rust loader: non-compact ExtentWrite is not implemented");
-        }
         const auto& src = source_tensor(instr.source.tensor_id);
-        if (instr.source.file_offset + instr.source.span_bytes > src.nbytes) {
+        if (instr.source.file_offset + instr.source.span_bytes >
+            static_cast<std::uint64_t>(src.nbytes)) {
             throw std::runtime_error("portable rust loader: source extent out of range");
         }
         if (auto& entry = buffer_entry(instr.dest.buffer_id); entry.tensor == nullptr) {
             entry.source_dtype = src.dtype;
             entry.source_shape = src.shape;
         }
-        write_buffer(
-            instr.dest.buffer_id,
-            src.data + instr.source.file_offset,
-            instr.dest.offset,
-            instr.source.span_bytes);
+        if (compact_extent(instr.source.stride) && compact_extent(instr.dest.stride)) {
+            write_buffer(
+                instr.dest.buffer_id,
+                src.data + instr.source.file_offset + instr.source.stride.base_offset,
+                instr.dest.offset + instr.dest.stride.base_offset,
+                instr.source.span_bytes);
+            return;
+        }
+        for_each_strided_span(
+            instr.source.stride,
+            instr.dest.stride,
+            [&](std::uint64_t src_offset,
+                std::uint64_t dst_offset,
+                std::uint64_t nbytes) {
+                if (instr.source.file_offset + src_offset + nbytes >
+                    static_cast<std::uint64_t>(src.nbytes)) {
+                    throw std::runtime_error(
+                        "portable rust loader: strided source span out of range");
+                }
+                write_buffer(
+                    instr.dest.buffer_id,
+                    src.data + instr.source.file_offset + src_offset,
+                    instr.dest.offset + dst_offset,
+                    nbytes);
+            });
     }
 
     void tile_map(const pie_weight_loader::PieLoaderStorageInstrView& instr) {
@@ -990,10 +1106,28 @@ private:
             case pie_weight_loader::PieLoaderTileMapKind::Decode:
                 decode_tile_map(instr);
                 return;
+            case pie_weight_loader::PieLoaderTileMapKind::Reblock:
+                reblock_tile_map(instr);
+                return;
+            case pie_weight_loader::PieLoaderTileMapKind::Reorder:
+                reorder_tile_map(instr);
+                return;
             default:
                 throw std::runtime_error(
                     "portable rust loader: unsupported TileMap kind");
         }
+    }
+
+    std::uint64_t tile_dest_offset(
+        const pie_weight_loader::PieLoaderStorageInstrView& instr) const {
+        return instr.has_dest ? instr.dest.offset + instr.dest.stride.base_offset : 0;
+    }
+
+    std::uint64_t tile_dest_bytes(
+        const pie_weight_loader::PieLoaderStorageInstrView& instr,
+        std::uint32_t output) const {
+        if (instr.has_dest) return extent_bytes(instr.dest.stride);
+        return static_cast<std::uint64_t>(buffer_bytes(buffer_entry(output)));
     }
 
     void cast_tile_map(const pie_weight_loader::PieLoaderStorageInstrView& instr) {
@@ -1022,7 +1156,7 @@ private:
                 reinterpret_cast<const ggml_bf16_t*>(data),
                 tmp.data(),
                 n);
-            write_buffer(output, tmp.data(), 0, n * sizeof(float));
+            write_buffer(output, tmp.data(), tile_dest_offset(instr), n * sizeof(float));
         } else if (src.dtype == StDtype::F32 && dst_type == GGML_TYPE_BF16) {
             if (instr.source.span_bytes != n * sizeof(float)) {
                 throw std::runtime_error(
@@ -1033,13 +1167,17 @@ private:
                 reinterpret_cast<const float*>(data),
                 tmp.data(),
                 n);
-            write_buffer(output, tmp.data(), 0, n * sizeof(ggml_bf16_t));
+            write_buffer(
+                output,
+                tmp.data(),
+                tile_dest_offset(instr),
+                n * sizeof(ggml_bf16_t));
         } else if (dst.tensor != nullptr && same_dtype(src.dtype, dst.tensor->type)) {
             if (instr.source.span_bytes != ggml_nbytes(dst.tensor)) {
                 throw std::runtime_error(
                     "portable rust loader: identity cast byte size mismatch");
             }
-            write_buffer(output, data, 0, instr.source.span_bytes);
+            write_buffer(output, data, tile_dest_offset(instr), instr.source.span_bytes);
         } else {
             throw std::runtime_error(
                 "portable rust loader: unsupported Cast TileMap dtype pair");
@@ -1129,7 +1267,62 @@ private:
             }
             tmp[i] = bf16_from_f32(f8_e4m3fn_to_f32(src8[i]) * scale);
         }
-        write_buffer(output, tmp.data(), 0, tmp.size() * sizeof(std::uint16_t));
+        write_buffer(
+            output,
+            tmp.data(),
+            tile_dest_offset(instr),
+            tmp.size() * sizeof(std::uint16_t));
+    }
+
+    void reblock_tile_map(const pie_weight_loader::PieLoaderStorageInstrView& instr) {
+        if (instr.input_buffers.len != 1 || instr.output_buffers.len != 1) {
+            throw std::runtime_error(
+                "portable rust loader: Reblock TileMap expects one input and one output");
+        }
+        const auto input = instr.input_buffers.ptr[0];
+        const auto output = instr.output_buffers.ptr[0];
+        const auto nbytes = tile_dest_bytes(instr, output);
+        std::vector<std::uint8_t> tmp(static_cast<std::size_t>(nbytes));
+        read_buffer(input, tmp.data(), 0, nbytes);
+        write_buffer(output, tmp.data(), tile_dest_offset(instr), nbytes);
+    }
+
+    void reorder_tile_map(const pie_weight_loader::PieLoaderStorageInstrView& instr) {
+        // The v1 FFI does not yet carry a permutation payload. Treat
+        // identity reorders as a byte reblock and fail other cases in the
+        // compiler before they reach a production executor.
+        reblock_tile_map(instr);
+    }
+
+    void create_view(const pie_weight_loader::PieLoaderStorageProgramView& program,
+                     const pie_weight_loader::PieLoaderStorageInstrView& instr) {
+        if (instr.input_buffers.len != 1 || instr.output_buffers.len != 1 ||
+            !instr.has_dest) {
+            throw std::runtime_error(
+                "portable rust loader: CreateView expects one input, one output, and a view");
+        }
+        const auto input = instr.input_buffers.ptr[0];
+        const auto output = instr.output_buffers.ptr[0];
+        const auto nbytes = extent_bytes(instr.dest.stride);
+        BufferEntry entry;
+        const auto& output_buffer = buffer_decl(program, output);
+        if (!output_buffer.has_tensor) {
+            entry.bytes.resize(static_cast<std::size_t>(nbytes));
+        } else if (const auto target = targets_.find(bytes_to_string(
+                       tensor_decl(program, output_buffer.tensor_id).name));
+            target != targets_.end()) {
+            entry.tensor = target->second;
+            if (nbytes > ggml_nbytes(entry.tensor)) {
+                throw std::runtime_error(
+                    "portable rust loader: CreateView target is smaller than view");
+            }
+        } else {
+            entry.bytes.resize(static_cast<std::size_t>(nbytes));
+        }
+        buffers_[output] = std::move(entry);
+        std::vector<std::uint8_t> tmp(static_cast<std::size_t>(nbytes));
+        read_buffer(input, tmp.data(), instr.dest.offset + instr.dest.stride.base_offset, nbytes);
+        write_buffer(output, tmp.data(), 0, nbytes);
     }
 
     void finalize(const pie_weight_loader::PieLoaderStorageInstrView& instr) {
@@ -1164,8 +1357,72 @@ std::string describe_program(const pie_weight_loader::PieLoaderStorageProgramVie
     return out.str();
 }
 
+const char* storage_instr_kind_name(
+    pie_weight_loader::PieLoaderStorageInstrKind kind) {
+    switch (kind) {
+        case pie_weight_loader::PieLoaderStorageInstrKind::Allocate:
+            return "Allocate";
+        case pie_weight_loader::PieLoaderStorageInstrKind::ExtentWrite:
+            return "ExtentWrite";
+        case pie_weight_loader::PieLoaderStorageInstrKind::TileMap:
+            return "TileMap";
+        case pie_weight_loader::PieLoaderStorageInstrKind::CreateView:
+            return "CreateView";
+        case pie_weight_loader::PieLoaderStorageInstrKind::Attach:
+            return "Attach";
+        case pie_weight_loader::PieLoaderStorageInstrKind::Release:
+            return "Release";
+        case pie_weight_loader::PieLoaderStorageInstrKind::Finalize:
+            return "Finalize";
+    }
+    return "Unknown";
+}
+
+const char* tile_map_kind_name(pie_weight_loader::PieLoaderTileMapKind kind) {
+    switch (kind) {
+        case pie_weight_loader::PieLoaderTileMapKind::Cast:
+            return "Cast";
+        case pie_weight_loader::PieLoaderTileMapKind::Decode:
+            return "Decode";
+        case pie_weight_loader::PieLoaderTileMapKind::Encode:
+            return "Encode";
+        case pie_weight_loader::PieLoaderTileMapKind::Transcode:
+            return "Transcode";
+        case pie_weight_loader::PieLoaderTileMapKind::Reblock:
+            return "Reblock";
+        case pie_weight_loader::PieLoaderTileMapKind::Reorder:
+            return "Reorder";
+        case pie_weight_loader::PieLoaderTileMapKind::None:
+            return "None";
+    }
+    return "Unknown";
+}
+
+void dump_count_map(std::ostringstream& out,
+                    const char* key,
+                    const std::map<std::string, std::size_t>& counts,
+                    const char* suffix) {
+    out << "  \"" << key << "\": {";
+    bool first = true;
+    for (const auto& [name, count] : counts) {
+        if (!first) out << ", ";
+        out << "\"" << name << "\": " << count;
+        first = false;
+    }
+    out << "}" << suffix << "\n";
+}
+
 std::string dump_program_json(const pie_weight_loader::PieLoaderStorageProgramView& view,
                               const CompileResult& result) {
+    std::map<std::string, std::size_t> instruction_kinds;
+    std::map<std::string, std::size_t> tile_map_kinds;
+    for (std::size_t i = 0; i < view.instrs.len; ++i) {
+        const auto& instr = view.instrs.ptr[i];
+        instruction_kinds[storage_instr_kind_name(instr.kind)] += 1;
+        if (instr.kind == pie_weight_loader::PieLoaderStorageInstrKind::TileMap) {
+            tile_map_kinds[tile_map_kind_name(instr.tile_kind)] += 1;
+        }
+    }
     std::ostringstream out;
     out << "{\n"
         << "  \"summary\": \"" << describe_program(view, result) << "\",\n"
@@ -1185,7 +1442,10 @@ std::string dump_program_json(const pie_weight_loader::PieLoaderStorageProgramVi
         << "    \"checkpoint_read_bytes\": "
         << view.memory.checkpoint_read_bytes << ",\n"
         << "    \"device_write_bytes\": " << view.memory.device_write_bytes << "\n"
-        << "  }\n"
+        << "  },\n";
+    dump_count_map(out, "instruction_kinds", instruction_kinds, ",");
+    dump_count_map(out, "tile_map_kinds", tile_map_kinds, "");
+    out
         << "}\n";
     return out.str();
 }

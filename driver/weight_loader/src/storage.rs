@@ -121,6 +121,7 @@ pub enum StorageInstr {
         id: InstrId,
         kind: TileMapKind,
         source: Option<SourceExtent>,
+        dest: Option<DestExtent>,
         inputs: Vec<BufferId>,
         outputs: Vec<BufferId>,
         tile: TileSpec,

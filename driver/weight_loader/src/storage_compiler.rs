@@ -146,9 +146,16 @@ impl StorageCompiler<'_> {
                     ValueLoc::Source(_) => self.lower_select(id, *input, *axis, start, length),
                     ValueLoc::Buffer(buffer) => {
                         let out = self.allocate_expr(id, true)?;
+                        let out_decl = self.plan.decl(id).ok_or_else(|| {
+                            CompileError::InvalidInput(format!(
+                                "Partition expr {} has no decl",
+                                id.0
+                            ))
+                        })?;
                         self.emit_view_or_tile(
                             TileMapKind::Reblock,
                             None,
+                            Some(full_dest_extent(out, out_decl)),
                             vec![buffer],
                             vec![out],
                             TransformSpec::default(),
@@ -411,6 +418,11 @@ impl StorageCompiler<'_> {
                     self.emit_view_or_tile(
                         TileMapKind::Reblock,
                         None,
+                        Some(DestExtent {
+                            buffer: out,
+                            offset: dest_offset,
+                            stride: compact_extent(&input_decl.shape, decl.dtype().bytes()),
+                        }),
                         vec![buffer],
                         vec![out],
                         TransformSpec::default(),
@@ -444,6 +456,11 @@ impl StorageCompiler<'_> {
                     self.emit_view_or_tile(
                         TileMapKind::Reblock,
                         None,
+                        Some(DestExtent {
+                            buffer: out,
+                            offset: dest_offset,
+                            stride: compact_extent(&input_decl.shape, decl.dtype().bytes()),
+                        }),
                         vec![buffer],
                         vec![out],
                         TransformSpec::default(),
@@ -536,7 +553,17 @@ impl StorageCompiler<'_> {
         for meta in metadata {
             inputs.push(self.ensure_buffer(*meta)?);
         }
-        self.emit_view_or_tile(kind, source, inputs, vec![out], transform);
+        let decl = self.plan.decl(id).ok_or_else(|| {
+            CompileError::InvalidInput(format!("expr {} has no tensor decl", id.0))
+        })?;
+        self.emit_view_or_tile(
+            kind,
+            source,
+            Some(full_dest_extent(out, decl)),
+            inputs,
+            vec![out],
+            transform,
+        );
         Ok(ValueLoc::Buffer(out))
     }
 
@@ -558,6 +585,7 @@ impl StorageCompiler<'_> {
         &mut self,
         kind: TileMapKind,
         source: Option<SourceExtent>,
+        dest: Option<DestExtent>,
         inputs: Vec<BufferId>,
         outputs: Vec<BufferId>,
         transform: TransformSpec,
@@ -585,6 +613,7 @@ impl StorageCompiler<'_> {
             id: instr,
             kind,
             source,
+            dest,
             inputs,
             outputs,
             tile: TileSpec {
@@ -779,6 +808,14 @@ fn byte_extent(bytes: u64) -> StridedExtent {
             src_stride: 1,
             dst_stride: 1,
         }],
+    }
+}
+
+fn full_dest_extent(buffer: BufferId, decl: &TensorDecl) -> DestExtent {
+    DestExtent {
+        buffer,
+        offset: 0,
+        stride: compact_extent(&decl.shape, encoding_storage_bytes(&decl.encoding)),
     }
 }
 
