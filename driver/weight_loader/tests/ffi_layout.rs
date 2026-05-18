@@ -6,7 +6,8 @@ use pie_weight_loader::{
     PieLoaderCheckpointFileView, PieLoaderCheckpointFormat, PieLoaderCheckpointTensorSlice,
     PieLoaderCheckpointTensorView, PieLoaderCompileInput, PieLoaderDType, PieLoaderEncodingKind,
     PieLoaderError, PieLoaderI64Slice, PieLoaderProgramHandle, PieLoaderQuantScheme,
-    PieLoaderRuntimeAbiView, PieLoaderRuntimeSourceKind, PieLoaderRuntimeTensorContractSlice,
+    PieLoaderRuntimeAbiView, PieLoaderRuntimeByteSpanSlice, PieLoaderRuntimeByteSpanView,
+    PieLoaderRuntimeSourceKind, PieLoaderRuntimeTensorContractSlice,
     PieLoaderRuntimeTensorContractView, PieLoaderSemanticRole, PieLoaderStatus,
     PieLoaderStorageInstrKind, PieLoaderTileMapKind, PieLoaderU32Slice, pie_loader_compile,
     pie_loader_error_free, pie_loader_program_free, pie_loader_program_view,
@@ -108,6 +109,7 @@ fn dense_contract_lowers_to_storage_program() {
         source_kind: PieLoaderRuntimeSourceKind::DirectTensor,
         source_tensor_id: 7,
         source_tensor_ids: PieLoaderU32Slice::default(),
+        byte_spans: Default::default(),
         source_contract_id: u32::MAX,
         semantic_role: PieLoaderSemanticRole::DirectTensor,
         layer: 0,
@@ -211,6 +213,7 @@ fn cast_contract_lowers_to_source_tile_map() {
         source_kind: PieLoaderRuntimeSourceKind::DirectTensor,
         source_tensor_id: 0,
         source_tensor_ids: PieLoaderU32Slice::default(),
+        byte_spans: Default::default(),
         source_contract_id: u32::MAX,
         semantic_role: PieLoaderSemanticRole::DirectTensor,
         layer: 0,
@@ -283,6 +286,7 @@ fn semantic_role_contract_resolves_source_tensor() {
         source_kind: PieLoaderRuntimeSourceKind::Semantic,
         source_tensor_id: u32::MAX,
         source_tensor_ids: PieLoaderU32Slice::default(),
+        byte_spans: Default::default(),
         source_contract_id: u32::MAX,
         semantic_role: PieLoaderSemanticRole::TokenEmbedding,
         layer: 0,
@@ -310,6 +314,117 @@ fn semantic_role_contract_resolves_source_tensor() {
     let instrs = unsafe { std::slice::from_raw_parts(view.instrs.ptr, view.instrs.len) };
     assert_eq!(instrs[1].source.tensor_id, 42);
     assert_eq!(instrs[1].source.file_offset, 256);
+
+    unsafe {
+        pie_loader_program_free(handle);
+        pie_loader_error_free(&mut error);
+    }
+}
+
+#[test]
+fn byte_span_contract_lowers_to_explicit_extent_writes() {
+    let file_path = bytes("model.safetensors");
+    let a_name = bytes("a.weight");
+    let b_name = bytes("b.weight");
+    let output_name = bytes("runtime.assembled");
+    let a_shape_values = [16_i64];
+    let b_shape_values = [8_i64];
+    let output_shape_values = [24_i64];
+    let a_shape = PieLoaderI64Slice {
+        ptr: a_shape_values.as_ptr(),
+        len: a_shape_values.len(),
+    };
+    let b_shape = PieLoaderI64Slice {
+        ptr: b_shape_values.as_ptr(),
+        len: b_shape_values.len(),
+    };
+    let output_shape = PieLoaderI64Slice {
+        ptr: output_shape_values.as_ptr(),
+        len: output_shape_values.len(),
+    };
+    let files = [PieLoaderCheckpointFileView {
+        id: 0,
+        path: file_path,
+        size_bytes: 160,
+        format: PieLoaderCheckpointFormat::Safetensors,
+    }];
+    let tensors = [
+        PieLoaderCheckpointTensorView {
+            id: 0,
+            name: a_name,
+            file_id: 0,
+            file_offset: 64,
+            span_bytes: 16,
+            dtype: PieLoaderDType::U8,
+            encoding_kind: PieLoaderEncodingKind::Raw,
+            quant_scheme: PieLoaderQuantScheme::None,
+            shape: a_shape,
+        },
+        PieLoaderCheckpointTensorView {
+            id: 1,
+            name: b_name,
+            file_id: 0,
+            file_offset: 128,
+            span_bytes: 8,
+            dtype: PieLoaderDType::U8,
+            encoding_kind: PieLoaderEncodingKind::Raw,
+            quant_scheme: PieLoaderQuantScheme::None,
+            shape: b_shape,
+        },
+    ];
+    let spans = [
+        PieLoaderRuntimeByteSpanView {
+            source_tensor_id: 0,
+            source_offset_bytes: 4,
+            dest_offset_bytes: 0,
+            span_bytes: 12,
+        },
+        PieLoaderRuntimeByteSpanView {
+            source_tensor_id: 1,
+            source_offset_bytes: 0,
+            dest_offset_bytes: 12,
+            span_bytes: 8,
+        },
+        PieLoaderRuntimeByteSpanView {
+            source_tensor_id: 0,
+            source_offset_bytes: 0,
+            dest_offset_bytes: 20,
+            span_bytes: 4,
+        },
+    ];
+    let contracts = [PieLoaderRuntimeTensorContractView {
+        output_name,
+        source_kind: PieLoaderRuntimeSourceKind::ByteSpans,
+        byte_spans: PieLoaderRuntimeByteSpanSlice {
+            ptr: spans.as_ptr(),
+            len: spans.len(),
+        },
+        dtype: PieLoaderDType::U8,
+        shape: output_shape,
+        alignment: 1,
+        ..PieLoaderRuntimeTensorContractView::default()
+    }];
+    let input = compile_input(&files, &tensors, &contracts);
+
+    let mut handle: *mut PieLoaderProgramHandle = ptr::null_mut();
+    let mut error = PieLoaderError::default();
+    let status = unsafe { pie_loader_compile(&input, &mut handle, &mut error) };
+    assert_eq!(status, PieLoaderStatus::Ok, "{}", error_message(&error));
+    let view = unsafe { pie_loader_program_view(handle) };
+    let instrs = unsafe { std::slice::from_raw_parts(view.instrs.ptr, view.instrs.len) };
+    assert_eq!(view.tensors.len, 1);
+    assert_eq!(view.buffers.len, 1);
+    assert_eq!(instrs.len(), 5);
+    assert_eq!(instrs[1].kind, PieLoaderStorageInstrKind::ExtentWrite);
+    assert_eq!(instrs[1].source.file_offset, 68);
+    assert_eq!(instrs[1].dest.offset, 0);
+    assert_eq!(instrs[2].source.file_offset, 128);
+    assert_eq!(instrs[2].dest.offset, 12);
+    assert_eq!(instrs[3].source.file_offset, 64);
+    assert_eq!(instrs[3].dest.offset, 20);
+    assert_eq!(view.memory.persistent_bytes, 24);
+    assert_eq!(view.memory.checkpoint_read_bytes, 24);
+    assert_eq!(view.memory.device_write_bytes, 24);
 
     unsafe {
         pie_loader_program_free(handle);

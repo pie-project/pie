@@ -115,6 +115,21 @@ private:
         return shape;
     }
 
+    static bool compact_extent(
+        const pie_weight_loader::PieLoaderStridedExtentView& extent)
+    {
+        std::int64_t stride =
+            static_cast<std::int64_t>(extent.element_bytes);
+        for (std::size_t i = extent.dims.len; i > 0; --i) {
+            const auto& dim = extent.dims.ptr[i - 1];
+            if (dim.src_stride != stride || dim.dst_stride != stride) {
+                return false;
+            }
+            stride *= dim.count;
+        }
+        return true;
+    }
+
     const pie_weight_loader::PieLoaderStorageInstrView& instruction(
         const pie_weight_loader::PieLoaderStorageProgramView& program,
         std::uint32_t id) const
@@ -191,11 +206,17 @@ private:
         }
         auto* dst = static_cast<std::uint8_t*>(dst_it->second.data()) +
             instr.dest.offset;
-        loader_.copy_strided_to_device(
-            source_tensor_names_[instr.source.tensor_id],
-            {},
-            dst,
-            shape_from_extent(instr.dest.stride));
+        if (!compact_extent(instr.source.stride) ||
+            !compact_extent(instr.dest.stride)) {
+            throw std::runtime_error(
+                "rust storage executor: non-compact ExtentWrite is not "
+                "implemented");
+        }
+        loader_.copy_storage_bytes_to_device(
+            instr.source.file_id,
+            instr.source.file_offset,
+            instr.source.span_bytes,
+            dst);
     }
 
     const DeviceTensor& buffer_or_finalized_tensor(std::uint32_t buffer_id)

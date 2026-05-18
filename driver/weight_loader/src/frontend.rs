@@ -1,6 +1,6 @@
 use crate::abi::{RuntimeAbi, RuntimeTensorContract, RuntimeTensorSource};
 use crate::error::CompileError;
-use crate::ir::{LayoutExpr, LayoutPlan};
+use crate::ir::{ByteSpan, LayoutExpr, LayoutPlan};
 use crate::semantic::SemanticGraph;
 use crate::source::{CheckpointMetadata, RawTensor};
 use crate::storage::StorageTarget;
@@ -137,6 +137,45 @@ fn lower_contract_source(
             });
             Ok((source, source_decl))
         }
+        RuntimeTensorSource::ByteSpans(spans) => {
+            let decl = contract_decl(contract, output_id);
+            for span in spans {
+                let raw = metadata.tensor(span.tensor).ok_or_else(|| {
+                    CompileError::InvalidInput(format!(
+                        "runtime tensor '{}' references missing ByteSpans source tensor {}",
+                        contract.output_name, span.tensor.0
+                    ))
+                })?;
+                let end = span
+                    .source_offset_bytes
+                    .checked_add(span.span_bytes)
+                    .ok_or_else(|| {
+                        CompileError::InvalidInput(format!(
+                            "runtime tensor '{}' ByteSpans source offset overflow",
+                            contract.output_name
+                        ))
+                    })?;
+                if end > raw.span_bytes {
+                    return Err(CompileError::InvalidInput(format!(
+                        "runtime tensor '{}' ByteSpans source range exceeds '{}'",
+                        contract.output_name, raw.name
+                    )));
+                }
+            }
+            let value = plan.push(LayoutExpr::ByteSpans {
+                spans: spans
+                    .iter()
+                    .map(|span| ByteSpan {
+                        tensor: span.tensor,
+                        source_offset_bytes: span.source_offset_bytes,
+                        dest_offset_bytes: span.dest_offset_bytes,
+                        span_bytes: span.span_bytes,
+                    })
+                    .collect(),
+                decl: decl.clone(),
+            });
+            Ok((value, decl))
+        }
         RuntimeTensorSource::Join { tensors, axis } => {
             let mut inputs = Vec::with_capacity(tensors.len());
             for tensor_id in tensors {
@@ -154,15 +193,7 @@ fn lower_contract_source(
                     decl,
                 }));
             }
-            let decl = TensorDecl {
-                id: output_id,
-                name: contract.output_name.clone(),
-                shape: contract.shape.clone(),
-                encoding: contract.encoding.clone(),
-                layout: contract.layout.clone(),
-                sharding: contract.sharding,
-                alignment: contract.alignment,
-            };
+            let decl = contract_decl(contract, output_id);
             let joined = plan.push(LayoutExpr::Join {
                 inputs,
                 axis: *axis,
@@ -185,15 +216,7 @@ fn lower_contract_source(
                         contract.output_name, source_contract
                     ))
                 })?;
-            let decl = TensorDecl {
-                id: output_id,
-                name: contract.output_name.clone(),
-                shape: contract.shape.clone(),
-                encoding: contract.encoding.clone(),
-                layout: contract.layout.clone(),
-                sharding: contract.sharding,
-                alignment: contract.alignment,
-            };
+            let decl = contract_decl(contract, output_id);
             let selected = plan.push(LayoutExpr::View {
                 input,
                 layout: decl.layout.clone(),
@@ -238,7 +261,9 @@ fn resolve_raw_tensor<'a>(
             }
             first.raw
         }
-        RuntimeTensorSource::Join { .. } | RuntimeTensorSource::SelectContract { .. } => {
+        RuntimeTensorSource::ByteSpans(_)
+        | RuntimeTensorSource::Join { .. }
+        | RuntimeTensorSource::SelectContract { .. } => {
             return Err(CompileError::InvalidInput(format!(
                 "runtime tensor '{}' has no single raw source",
                 contract.output_name
@@ -251,6 +276,18 @@ fn resolve_raw_tensor<'a>(
             contract.output_name, source_id.0
         ))
     })
+}
+
+fn contract_decl(contract: &RuntimeTensorContract, output_id: TensorId) -> TensorDecl {
+    TensorDecl {
+        id: output_id,
+        name: contract.output_name.clone(),
+        shape: contract.shape.clone(),
+        encoding: contract.encoding.clone(),
+        layout: contract.layout.clone(),
+        sharding: contract.sharding,
+        alignment: contract.alignment,
+    }
 }
 
 fn lower_encoding_change(

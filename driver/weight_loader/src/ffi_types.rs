@@ -107,6 +107,7 @@ pub enum PieLoaderRuntimeSourceKind {
     Semantic = 1,
     Join = 2,
     Select = 3,
+    ByteSpans = 4,
 }
 
 #[repr(C)]
@@ -120,6 +121,22 @@ pub struct PieLoaderBytes {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct PieLoaderU32Slice {
     pub ptr: *const u32,
+    pub len: usize,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PieLoaderRuntimeByteSpanView {
+    pub source_tensor_id: u32,
+    pub source_offset_bytes: u64,
+    pub dest_offset_bytes: u64,
+    pub span_bytes: u64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PieLoaderRuntimeByteSpanSlice {
+    pub ptr: *const PieLoaderRuntimeByteSpanView,
     pub len: usize,
 }
 
@@ -246,6 +263,7 @@ pub struct PieLoaderRuntimeTensorContractView {
     pub source_kind: PieLoaderRuntimeSourceKind,
     pub source_tensor_id: u32,
     pub source_tensor_ids: PieLoaderU32Slice,
+    pub byte_spans: PieLoaderRuntimeByteSpanSlice,
     pub source_contract_id: u32,
     pub semantic_role: PieLoaderSemanticRole,
     pub layer: u32,
@@ -270,6 +288,7 @@ impl Default for PieLoaderRuntimeTensorContractView {
             source_kind: PieLoaderRuntimeSourceKind::DirectTensor,
             source_tensor_id: u32::MAX,
             source_tensor_ids: PieLoaderU32Slice::default(),
+            byte_spans: PieLoaderRuntimeByteSpanSlice::default(),
             source_contract_id: u32::MAX,
             semantic_role: PieLoaderSemanticRole::DirectTensor,
             layer: 0,

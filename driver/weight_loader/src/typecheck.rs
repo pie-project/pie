@@ -1,6 +1,8 @@
 use crate::error::CompileError;
 use crate::ir::{LayoutExpr, LayoutPlan};
-use crate::types::{Encoding, Layout, QuantScheme, TensorDecl};
+use crate::types::{
+    Encoding, Layout, QuantScheme, TensorDecl, encoding_storage_bytes, tensor_nbytes,
+};
 
 pub fn typecheck(plan: &LayoutPlan) -> Result<Vec<TensorDecl>, CompileError> {
     let mut inferred = Vec::with_capacity(plan.exprs.len());
@@ -27,6 +29,38 @@ fn infer_expr(
 ) -> Result<TensorDecl, CompileError> {
     match expr {
         LayoutExpr::Source { decl, .. } => Ok(decl.clone()),
+        LayoutExpr::ByteSpans { spans, decl } => {
+            if spans.is_empty() {
+                return Err(CompileError::InvalidInput(format!(
+                    "ByteSpans expr {index} has no spans"
+                )));
+            }
+            let total_bytes = tensor_nbytes(&decl.shape, encoding_storage_bytes(&decl.encoding))
+                .ok_or_else(|| {
+                    CompileError::InvalidInput(format!("ByteSpans expr {index} size overflow"))
+                })?;
+            for (span_index, span) in spans.iter().enumerate() {
+                if span.span_bytes == 0 {
+                    return Err(CompileError::InvalidInput(format!(
+                        "ByteSpans expr {index} span {span_index} is empty"
+                    )));
+                }
+                let end = span
+                    .dest_offset_bytes
+                    .checked_add(span.span_bytes)
+                    .ok_or_else(|| {
+                        CompileError::InvalidInput(format!(
+                            "ByteSpans expr {index} span {span_index} offset overflow"
+                        ))
+                    })?;
+                if end > total_bytes {
+                    return Err(CompileError::InvalidInput(format!(
+                        "ByteSpans expr {index} span {span_index} exceeds output size"
+                    )));
+                }
+            }
+            Ok(decl.clone())
+        }
         LayoutExpr::Select {
             input,
             axis,

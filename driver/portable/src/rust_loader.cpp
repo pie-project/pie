@@ -292,14 +292,23 @@ public:
                     std::string name,
                     const StTensor& tensor,
                     pie_weight_loader::PieLoaderDType dtype) {
+        add_raw_tensor(id, std::move(name), dtype, tensor.shape,
+                       static_cast<std::uint64_t>(tensor.nbytes));
+    }
+
+    void add_raw_tensor(std::uint32_t id,
+                        std::string name,
+                        pie_weight_loader::PieLoaderDType dtype,
+                        std::vector<std::int64_t> tensor_shape,
+                        std::uint64_t span_bytes) {
         const auto name_id = intern_string(std::move(name));
-        const auto shape_id = intern_shape(tensor.shape);
+        const auto shape_id = intern_shape(std::move(tensor_shape));
         tensors_.push_back(pie_weight_loader::PieLoaderCheckpointTensorView{
             .id = id,
             .name = bytes(name_id),
             .file_id = 0,
             .file_offset = 0,
-            .span_bytes = static_cast<std::uint64_t>(tensor.nbytes),
+            .span_bytes = span_bytes,
             .dtype = dtype,
             .encoding_kind = pie_weight_loader::PieLoaderEncodingKind::Raw,
             .quant_scheme = pie_weight_loader::PieLoaderQuantScheme::None,
@@ -318,6 +327,44 @@ public:
             .source_kind = pie_weight_loader::PieLoaderRuntimeSourceKind::DirectTensor,
             .source_tensor_id = source_tensor_id,
             .source_tensor_ids = {},
+            .byte_spans = {},
+            .source_contract_id = UINT32_MAX,
+            .semantic_role = pie_weight_loader::PieLoaderSemanticRole::DirectTensor,
+            .layer = 0,
+            .has_layer = false,
+            .expert = 0,
+            .has_expert = false,
+            .axis = -1,
+            .start = 0,
+            .length = 0,
+            .dtype = dtype,
+            .encoding_kind = pie_weight_loader::PieLoaderEncodingKind::Raw,
+            .quant_scheme = pie_weight_loader::PieLoaderQuantScheme::None,
+            .shape = shape(shape_id),
+            .alignment = 1,
+            .shard_axis = -1,
+        });
+        refresh_contract_slice();
+    }
+
+    void add_byte_span_contract(
+            std::string output_name,
+            std::vector<pie_weight_loader::PieLoaderRuntimeByteSpanView> spans,
+            pie_weight_loader::PieLoaderDType dtype,
+            std::vector<std::int64_t> tensor_shape) {
+        byte_spans_.push_back(std::move(spans));
+        const auto name_id = intern_string(std::move(output_name));
+        const auto shape_id = intern_shape(std::move(tensor_shape));
+        const auto& stored_spans = byte_spans_.back();
+        contracts_.push_back(pie_weight_loader::PieLoaderRuntimeTensorContractView{
+            .output_name = bytes(name_id),
+            .source_kind = pie_weight_loader::PieLoaderRuntimeSourceKind::ByteSpans,
+            .source_tensor_id = UINT32_MAX,
+            .source_tensor_ids = {},
+            .byte_spans = {
+                .ptr = stored_spans.data(),
+                .len = stored_spans.size(),
+            },
             .source_contract_id = UINT32_MAX,
             .semantic_role = pie_weight_loader::PieLoaderSemanticRole::DirectTensor,
             .layer = 0,
@@ -349,6 +396,7 @@ private:
     std::deque<std::vector<std::int64_t>> shapes_;
     std::vector<pie_weight_loader::PieLoaderCheckpointFileView> files_;
     std::vector<pie_weight_loader::PieLoaderCheckpointTensorView> tensors_;
+    std::deque<std::vector<pie_weight_loader::PieLoaderRuntimeByteSpanView>> byte_spans_;
     std::vector<pie_weight_loader::PieLoaderRuntimeTensorContractView> contracts_;
     std::uint32_t model_type_ = 0;
     std::uint32_t quant_method_ = 0;
@@ -370,6 +418,7 @@ struct CompileResult {
 struct ContractCandidate {
     std::string hf_name;
     ggml_tensor* tensor = nullptr;
+    std::size_t src_offset_bytes = 0;
     std::size_t copy_bytes = 0;
     std::size_t dst_offset_bytes = 0;
 };
@@ -394,7 +443,7 @@ CompileResult compile_from_candidates(
         const std::filesystem::path& snapshot_dir,
         WeightArchive& archive,
         const std::vector<ContractCandidate>& candidates,
-        std::size_t synth_count) {
+        std::size_t /*synth_count*/) {
     InputBuilder input;
     input.set_model(hparams);
     input.set_target();
@@ -422,44 +471,145 @@ CompileResult compile_from_candidates(
     std::unordered_map<std::string, ggml_tensor*> targets;
     std::size_t emitted = 0;
 
-    auto source_id_for = [&](const std::string& name) -> std::optional<std::uint32_t> {
-        if (const auto it = source_ids.find(name); it != source_ids.end()) {
+    enum class SourceMode {
+        Typed,
+        Bytes,
+    };
+
+    auto source_key = [](const std::string& name, SourceMode mode) {
+        return name + (mode == SourceMode::Typed ? "\n typed" : "\n bytes");
+    };
+
+    auto source_id_for = [&](const std::string& name,
+                             SourceMode mode) -> std::optional<std::uint32_t> {
+        const auto key = source_key(name, mode);
+        if (const auto it = source_ids.find(key); it != source_ids.end()) {
             return it->second;
         }
         const auto* tensor = archive.find(name);
-        if (tensor == nullptr || tensor->ggml_type_override >= 0) {
+        if (tensor == nullptr) {
             return std::nullopt;
         }
-        const auto dtype = dtype_from_st(tensor->dtype);
-        if (!dtype) return std::nullopt;
+        if (mode == SourceMode::Typed) {
+            if (tensor->ggml_type_override >= 0) return std::nullopt;
+            if (!dtype_from_st(tensor->dtype)) return std::nullopt;
+        }
         const auto id = static_cast<std::uint32_t>(source_ids.size());
-        source_ids.emplace(name, id);
+        source_ids.emplace(key, id);
         source_names.push_back(name);
-        input.add_tensor(id, name, *tensor, *dtype);
+        if (mode == SourceMode::Bytes) {
+            input.add_raw_tensor(
+                id,
+                name,
+                pie_weight_loader::PieLoaderDType::U8,
+                {static_cast<std::int64_t>(tensor->nbytes)},
+                static_cast<std::uint64_t>(tensor->nbytes));
+        } else {
+            const auto dtype = dtype_from_st(tensor->dtype);
+            input.add_tensor(id, name, *tensor, *dtype);
+        }
         return id;
     };
 
+    std::unordered_map<std::string, std::vector<const ContractCandidate*>> groups;
+    std::vector<std::string> group_order;
     for (const auto& d : candidates) {
-        if (d.copy_bytes != 0 || d.dst_offset_bytes != 0) {
-            continue;
-        }
-        const auto* src = archive.find(d.hf_name);
-        if (src == nullptr) continue;
-        if (src->ggml_type_override >= 0) continue;
-        const auto source_id = source_id_for(d.hf_name);
-        const auto dtype = dtype_from_ggml(d.tensor->type);
-        if (!source_id || !dtype) continue;
+        if (d.tensor == nullptr) continue;
         const auto output = tensor_name(d.tensor, d.hf_name);
-        if (targets.contains(output)) {
-            continue;
+        if (!groups.contains(output)) group_order.push_back(output);
+        groups[output].push_back(&d);
+    }
+
+    for (const auto& output : group_order) {
+        const auto& group = groups.at(output);
+        if (group.empty()) continue;
+        auto* target = group.front()->tensor;
+        if (target == nullptr || targets.contains(output)) continue;
+
+        if (group.size() == 1) {
+            const auto& d = *group.front();
+            if (d.copy_bytes == 0 && d.dst_offset_bytes == 0 &&
+                d.src_offset_bytes == 0) {
+                const auto* src = archive.find(d.hf_name);
+                const auto source_id = source_id_for(d.hf_name, SourceMode::Typed);
+                const auto dtype = dtype_from_ggml(target->type);
+                if (src != nullptr && source_id && dtype) {
+                    const bool cast_ok =
+                        same_dtype(src->dtype, target->type) ||
+                        (src->dtype == StDtype::BF16 && target->type == GGML_TYPE_F32) ||
+                        (src->dtype == StDtype::F32 && target->type == GGML_TYPE_BF16);
+                    if (cast_ok) {
+                        input.add_direct_contract(
+                            output,
+                            *source_id,
+                            *dtype,
+                            shape_from_ggml(target));
+                        targets.emplace(output, target);
+                        ++emitted;
+                        continue;
+                    }
+                }
+            }
         }
-        const bool cast_ok =
-            same_dtype(src->dtype, d.tensor->type) ||
-            (src->dtype == StDtype::BF16 && d.tensor->type == GGML_TYPE_F32) ||
-            (src->dtype == StDtype::F32 && d.tensor->type == GGML_TYPE_BF16);
-        if (!cast_ok) continue;
-        input.add_direct_contract(output, *source_id, *dtype, shape_from_ggml(d.tensor));
-        targets.emplace(output, d.tensor);
+
+        const std::uint64_t target_bytes =
+            static_cast<std::uint64_t>(ggml_nbytes(target));
+        const auto typed_output = dtype_from_ggml(target->type);
+        const auto output_dtype =
+            typed_output.value_or(pie_weight_loader::PieLoaderDType::U8);
+        const auto output_shape = typed_output
+            ? shape_from_ggml(target)
+            : std::vector<std::int64_t>{static_cast<std::int64_t>(target_bytes)};
+        std::vector<pie_weight_loader::PieLoaderRuntimeByteSpanView> spans;
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> intervals;
+        bool byte_spans_ok = true;
+        for (const auto* candidate : group) {
+            const auto& d = *candidate;
+            const auto* src = archive.find(d.hf_name);
+            if (src == nullptr) {
+                byte_spans_ok = false;
+                break;
+            }
+            const std::uint64_t span_bytes = static_cast<std::uint64_t>(
+                d.copy_bytes == 0 ? src->nbytes : d.copy_bytes);
+            const std::uint64_t src_offset =
+                static_cast<std::uint64_t>(d.src_offset_bytes);
+            const std::uint64_t dst_offset =
+                static_cast<std::uint64_t>(d.dst_offset_bytes);
+            if (span_bytes == 0 ||
+                src_offset + span_bytes > static_cast<std::uint64_t>(src->nbytes) ||
+                dst_offset + span_bytes > target_bytes) {
+                byte_spans_ok = false;
+                break;
+            }
+            const auto source_id = source_id_for(d.hf_name, SourceMode::Bytes);
+            if (!source_id) {
+                byte_spans_ok = false;
+                break;
+            }
+            spans.push_back(pie_weight_loader::PieLoaderRuntimeByteSpanView{
+                .source_tensor_id = *source_id,
+                .source_offset_bytes = src_offset,
+                .dest_offset_bytes = dst_offset,
+                .span_bytes = span_bytes,
+            });
+            intervals.emplace_back(dst_offset, dst_offset + span_bytes);
+        }
+
+        if (!byte_spans_ok || spans.empty()) continue;
+        std::sort(intervals.begin(), intervals.end());
+        std::uint64_t cursor = 0;
+        for (const auto& [begin, end] : intervals) {
+            if (begin != cursor || end < begin) {
+                byte_spans_ok = false;
+                break;
+            }
+            cursor = end;
+        }
+        if (!byte_spans_ok || cursor != target_bytes) continue;
+
+        input.add_byte_span_contract(output, std::move(spans), output_dtype, output_shape);
+        targets.emplace(output, target);
         ++emitted;
     }
 
@@ -469,7 +619,7 @@ CompileResult compile_from_candidates(
         .targets = std::move(targets),
         .source_tensor_count = source_ids.size(),
         .emitted_contracts = emitted,
-        .required_contracts = candidates.size() + synth_count,
+        .required_contracts = group_order.size(),
     };
     return result;
 }
@@ -731,6 +881,7 @@ bool try_load_with_rust_storage_program(Model& model, const char* planner_mode) 
         candidates.push_back(ContractCandidate{
             .hf_name = d.hf_name,
             .tensor = d.tensor,
+            .src_offset_bytes = d.src_offset_bytes,
             .copy_bytes = d.copy_bytes,
             .dst_offset_bytes = d.dst_offset_bytes,
         });
@@ -760,6 +911,9 @@ bool try_load_with_rust_storage_program(Model& model, const char* planner_mode) 
 
     Executor executor(*model.archive_, std::move(result.source_names), std::move(result.targets));
     executor.execute(view);
+    for (const auto& s : model.synth_) {
+        ggml_backend_tensor_set(s.tensor, s.data.data(), 0, s.data.size());
+    }
     return true;
 }
 

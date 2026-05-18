@@ -57,6 +57,9 @@ fn eval_expr(
             value.decl = decl.clone();
             Ok(value)
         }
+        LayoutExpr::ByteSpans { .. } => Err(CompileError::InvalidInput(
+            "reference evaluator does not model byte-span assembly".to_string(),
+        )),
         LayoutExpr::Select {
             input,
             axis,

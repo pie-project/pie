@@ -47,6 +47,10 @@ pub enum LayoutExpr {
         tensor: TensorId,
         decl: TensorDecl,
     },
+    ByteSpans {
+        spans: Vec<ByteSpan>,
+        decl: TensorDecl,
+    },
     Select {
         input: ExprId,
         axis: Axis,
@@ -126,10 +130,18 @@ pub enum LayoutExpr {
     },
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ByteSpan {
+    pub tensor: TensorId,
+    pub source_offset_bytes: u64,
+    pub dest_offset_bytes: u64,
+    pub span_bytes: u64,
+}
+
 impl LayoutExpr {
     pub fn inputs(&self) -> Vec<ExprId> {
         match self {
-            Self::Source { .. } => Vec::new(),
+            Self::Source { .. } | Self::ByteSpans { .. } => Vec::new(),
             Self::Select { input, .. }
             | Self::Partition { input, .. }
             | Self::Unzip { input, .. }
@@ -155,6 +167,7 @@ impl LayoutExpr {
     pub fn decl(&self) -> Option<&TensorDecl> {
         match self {
             Self::Source { decl, .. }
+            | Self::ByteSpans { decl, .. }
             | Self::Select { decl, .. }
             | Self::Partition { decl, .. }
             | Self::Join { decl, .. }
@@ -174,6 +187,7 @@ impl LayoutExpr {
     pub fn decl_mut(&mut self) -> Option<&mut TensorDecl> {
         match self {
             Self::Source { decl, .. }
+            | Self::ByteSpans { decl, .. }
             | Self::Select { decl, .. }
             | Self::Partition { decl, .. }
             | Self::Join { decl, .. }

@@ -50,7 +50,7 @@ fn normalize_expr(
         CompileError::InvalidInput(format!("optimizer expr {} is out of range", id.0))
     })?;
     let new_id = match expr {
-        LayoutExpr::Source { .. } => out.push(expr.clone()),
+        LayoutExpr::Source { .. } | LayoutExpr::ByteSpans { .. } => out.push(expr.clone()),
         LayoutExpr::Select {
             input,
             axis,

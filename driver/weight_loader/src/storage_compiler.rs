@@ -120,6 +120,7 @@ impl StorageCompiler<'_> {
                     }
                 })
             }
+            LayoutExpr::ByteSpans { spans, decl } => self.lower_byte_spans(spans, decl),
             LayoutExpr::Select {
                 input,
                 axis,
@@ -328,6 +329,63 @@ impl StorageCompiler<'_> {
                 Ok(ValueLoc::Buffer(buffer))
             }
         }
+    }
+
+    fn lower_byte_spans(
+        &mut self,
+        spans: &[crate::ir::ByteSpan],
+        decl: &TensorDecl,
+    ) -> Result<ValueLoc, CompileError> {
+        let out = self.allocate_decl(decl, true)?;
+        for span in spans {
+            let raw = self.raw(span.tensor)?;
+            let source_end = span
+                .source_offset_bytes
+                .checked_add(span.span_bytes)
+                .ok_or_else(|| {
+                    CompileError::InvalidInput(format!(
+                        "ByteSpans source offset overflow for '{}'",
+                        raw.name
+                    ))
+                })?;
+            if source_end > raw.span_bytes {
+                return Err(CompileError::InvalidInput(format!(
+                    "ByteSpans source range exceeds '{}'",
+                    raw.name
+                )));
+            }
+            let file_id = raw.file_id;
+            let tensor_id = raw.id;
+            let file_offset = raw
+                .file_offset
+                .checked_add(span.source_offset_bytes)
+                .ok_or_else(|| {
+                    CompileError::InvalidInput(format!(
+                        "ByteSpans file offset overflow for '{}'",
+                        raw.name
+                    ))
+                })?;
+            let instr = self.next_instr();
+            self.program.instrs.push(StorageInstr::ExtentWrite {
+                id: instr,
+                source: SourceExtent {
+                    file_id,
+                    tensor_id,
+                    file_offset,
+                    span_bytes: span.span_bytes,
+                    stride: byte_extent(span.span_bytes),
+                },
+                dest: DestExtent {
+                    buffer: out,
+                    offset: span.dest_offset_bytes,
+                    stride: byte_extent(span.span_bytes),
+                },
+            });
+            self.program.schedule.push(instr);
+            self.program.memory.checkpoint_read_bytes += span.span_bytes;
+            self.program.memory.device_write_bytes += span.span_bytes;
+        }
+        Ok(ValueLoc::Buffer(out))
     }
 
     fn lower_join(
@@ -709,6 +767,18 @@ fn compact_extent(shape: &[i64], element_bytes: u64) -> StridedExtent {
         base_offset: 0,
         element_bytes: u32::try_from(element_bytes).unwrap_or(u32::MAX),
         dims,
+    }
+}
+
+fn byte_extent(bytes: u64) -> StridedExtent {
+    StridedExtent {
+        base_offset: 0,
+        element_bytes: 1,
+        dims: vec![DimSpec {
+            count: i64::try_from(bytes).unwrap_or(i64::MAX),
+            src_stride: 1,
+            dst_stride: 1,
+        }],
     }
 }
 

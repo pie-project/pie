@@ -65,6 +65,14 @@ public:
         void* dst,
         const std::vector<std::int64_t>& dst_shape);
 
+    /// Copy an explicit byte range from a shard into caller-owned device
+    /// storage. `file_offset` is absolute within the shard file.
+    void copy_storage_bytes_to_device(
+        std::uint32_t shard_id,
+        std::uint64_t file_offset,
+        std::uint64_t span_bytes,
+        void* dst);
+
     /// Copy a slice of `name` along `axis`, keeping only this rank's portion
     /// of the world. Used by layout-plan materialization to shard linear weights
     /// directly into their final runtime allocations.

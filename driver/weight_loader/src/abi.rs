@@ -1,7 +1,7 @@
 use crate::error::CompileError;
 use crate::ffi_types::{
-    PieLoaderRuntimeAbiView, PieLoaderRuntimeSourceKind, PieLoaderRuntimeTensorContractView,
-    PieLoaderSemanticRole,
+    PieLoaderRuntimeAbiView, PieLoaderRuntimeByteSpanSlice, PieLoaderRuntimeSourceKind,
+    PieLoaderRuntimeTensorContractView, PieLoaderSemanticRole,
 };
 use crate::semantic::SemanticRole;
 use crate::source::{ffi_dtype, ffi_i64_slice, ffi_quant_scheme, ffi_string};
@@ -35,6 +35,7 @@ pub enum RuntimeTensorSource {
         layer: Option<u32>,
         expert: Option<u32>,
     },
+    ByteSpans(Vec<RuntimeByteSpan>),
     Join {
         tensors: Vec<TensorId>,
         axis: Axis,
@@ -45,6 +46,14 @@ pub enum RuntimeTensorSource {
         start: i64,
         length: i64,
     },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RuntimeByteSpan {
+    pub tensor: TensorId,
+    pub source_offset_bytes: u64,
+    pub dest_offset_bytes: u64,
+    pub span_bytes: u64,
 }
 
 impl RuntimeAbi {
@@ -146,6 +155,15 @@ fn runtime_source(
                 axis: ffi_axis(view.axis, "runtime_tensor.axis")?,
             });
         }
+        PieLoaderRuntimeSourceKind::ByteSpans => {
+            let spans = ffi_byte_spans(view.byte_spans, "runtime_tensor.byte_spans")?;
+            if spans.is_empty() {
+                return Err(CompileError::InvalidInput(
+                    "ByteSpans runtime tensor source has no spans".to_string(),
+                ));
+            }
+            return Ok(RuntimeTensorSource::ByteSpans(spans));
+        }
         PieLoaderRuntimeSourceKind::Select => {
             if view.length <= 0 {
                 return Err(CompileError::InvalidInput(
@@ -170,6 +188,35 @@ fn runtime_source(
         layer: view.has_layer.then_some(view.layer),
         expert: view.has_expert.then_some(view.expert),
     })
+}
+
+fn ffi_byte_spans(
+    slice: PieLoaderRuntimeByteSpanSlice,
+    name: &'static str,
+) -> Result<Vec<RuntimeByteSpan>, CompileError> {
+    if slice.len == 0 {
+        return Ok(Vec::new());
+    }
+    if slice.ptr.is_null() {
+        return Err(CompileError::NullArgument(name));
+    }
+    unsafe { std::slice::from_raw_parts(slice.ptr, slice.len) }
+        .iter()
+        .enumerate()
+        .map(|(index, span)| {
+            if span.span_bytes == 0 {
+                return Err(CompileError::InvalidInput(format!(
+                    "{name}[{index}] has zero span"
+                )));
+            }
+            Ok(RuntimeByteSpan {
+                tensor: TensorId(span.source_tensor_id),
+                source_offset_bytes: span.source_offset_bytes,
+                dest_offset_bytes: span.dest_offset_bytes,
+                span_bytes: span.span_bytes,
+            })
+        })
+        .collect()
 }
 
 fn ffi_u32_slice(

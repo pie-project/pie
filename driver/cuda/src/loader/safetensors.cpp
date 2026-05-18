@@ -206,6 +206,31 @@ void SafetensorsCheckpointSource::copy_to_device(
     CUDA_CHECK(cudaMemcpy(dst, host_src, ti.nbytes, cudaMemcpyHostToDevice));
 }
 
+void SafetensorsCheckpointSource::copy_storage_bytes_to_device(
+    std::uint32_t shard_id,
+    std::uint64_t file_offset,
+    std::uint64_t span_bytes,
+    void* dst)
+{
+    if (dst == nullptr) {
+        throw std::runtime_error("safetensors: null destination for byte range");
+    }
+    if (shard_id >= shards_.size()) {
+        throw std::runtime_error("safetensors: byte range shard id out of range");
+    }
+    auto& shard = shards_[shard_id];
+    if (!shard.data) open_shard_(shard);
+    if (file_offset > shard.mapped_size ||
+        span_bytes > shard.mapped_size - file_offset) {
+        throw std::runtime_error("safetensors: byte range exceeds shard size");
+    }
+    CUDA_CHECK(cudaMemcpy(
+        dst,
+        shard.data + file_offset,
+        span_bytes,
+        cudaMemcpyHostToDevice));
+}
+
 void SafetensorsCheckpointSource::copy_shard_to_device(
     const std::string& name,
     int axis,

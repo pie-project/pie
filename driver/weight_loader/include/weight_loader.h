@@ -75,6 +75,7 @@ enum class PieLoaderRuntimeSourceKind {
   Semantic = 1,
   Join = 2,
   Select = 3,
+  ByteSpans = 4,
 };
 
 enum class PieLoaderSemanticRole {
@@ -209,11 +210,24 @@ struct PieLoaderCheckpointTensorSlice {
   size_t len;
 };
 
+struct PieLoaderRuntimeByteSpanView {
+  uint32_t source_tensor_id;
+  uint64_t source_offset_bytes;
+  uint64_t dest_offset_bytes;
+  uint64_t span_bytes;
+};
+
+struct PieLoaderRuntimeByteSpanSlice {
+  const PieLoaderRuntimeByteSpanView *ptr;
+  size_t len;
+};
+
 struct PieLoaderRuntimeTensorContractView {
   PieLoaderBytes output_name;
   PieLoaderRuntimeSourceKind source_kind;
   uint32_t source_tensor_id;
   PieLoaderU32Slice source_tensor_ids;
+  PieLoaderRuntimeByteSpanSlice byte_spans;
   uint32_t source_contract_id;
   PieLoaderSemanticRole semantic_role;
   uint32_t layer;

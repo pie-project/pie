@@ -48,7 +48,13 @@ def run_cmd(
     }
 
 
-def bench_env(base: dict[str, str], *, plan_dump: Path | None = None) -> dict[str, str]:
+def bench_env(
+    base: dict[str, str],
+    *,
+    plan_dump: Path | None = None,
+    pie_driver: str = "cuda_native",
+    loader_planner: str = "cpp",
+) -> dict[str, str]:
     env = base.copy()
     paths = [
         str(ROOT / "sdk" / "python-server" / "python"),
@@ -57,7 +63,16 @@ def bench_env(base: dict[str, str], *, plan_dump: Path | None = None) -> dict[st
     if env.get("PYTHONPATH"):
         paths.append(env["PYTHONPATH"])
     env["PYTHONPATH"] = os.pathsep.join(paths)
-    if plan_dump is not None:
+    if loader_planner != "cpp":
+        if pie_driver == "portable":
+            env["PIE_PORTABLE_LOADER_PLANNER"] = loader_planner
+            if plan_dump is not None:
+                env["PIE_PORTABLE_RUST_LAYOUT_PLAN_DUMP"] = str(plan_dump)
+        else:
+            env["PIE_CUDA_LOADER_PLANNER"] = loader_planner
+            if plan_dump is not None:
+                env["PIE_CUDA_RUST_LAYOUT_PLAN_DUMP"] = str(plan_dump)
+    elif plan_dump is not None and pie_driver == "cuda_native":
         env["PIE_CUDA_LAYOUT_PLAN_DUMP"] = str(plan_dump)
     return env
 
@@ -114,6 +129,18 @@ def parse_plan_dump(path: Path) -> dict[str, Any]:
         return {}
     with path.open("r", encoding="utf-8") as f:
         data = json.load(f)
+    if "storage" not in data and "instruction_count" in data:
+        return {
+            "layout_summary": data.get("summary"),
+            "storage_summary": data.get("summary"),
+            "algebra_expr_count": None,
+            "algebra_binding_count": data.get("cpp_tensor_count"),
+            "algebra_expr_kinds": {},
+            "storage_instr_count": data.get("instruction_count"),
+            "storage_instr_kinds": {},
+            "storage_transform_kinds": {},
+            "storage_memory": data.get("memory", {}),
+        }
     algebra = data.get("algebra", {})
     storage = data.get("storage", {})
     expr_kinds: dict[str, int] = {}
@@ -176,7 +203,7 @@ def bench_cmd(args: argparse.Namespace, engine: str, mode: str, model: str, json
             *mode_args,
             *common,
             "--driver",
-            "cuda_native",
+            args.pie_driver,
             "--device",
             args.device,
             "--pie-bin",
@@ -184,9 +211,9 @@ def bench_cmd(args: argparse.Namespace, engine: str, mode: str, model: str, json
             "--server-startup-timeout",
             str(args.server_startup_timeout),
         ]
-        if args.checkpoint_io:
+        if args.checkpoint_io and args.pie_driver == "cuda_native":
             cmd += ["--checkpoint-io", args.checkpoint_io]
-        if args.mxfp4_moe:
+        if args.mxfp4_moe and args.pie_driver == "cuda_native":
             cmd += ["--mxfp4-moe", args.mxfp4_moe]
         return cmd
     if engine == "vllm":
@@ -287,6 +314,18 @@ def main() -> None:
     parser.add_argument("--max-model-len", type=int, default=2048)
     parser.add_argument("--checkpoint-io", choices=["auto", "mmap", "gds"], default="auto")
     parser.add_argument(
+        "--pie-driver",
+        choices=["cuda_native", "portable"],
+        default="cuda_native",
+        help="Pie backend used for Pie evidence runs.",
+    )
+    parser.add_argument(
+        "--loader-planner",
+        choices=["cpp", "rust", "dual"],
+        default="cpp",
+        help="Set PIE_*_LOADER_PLANNER for Pie evidence runs.",
+    )
+    parser.add_argument(
         "--mxfp4-moe",
         choices=["auto", "routed_dequant", "packed", "bf16", "dequant", "eager_bf16", "native"],
         default="auto",
@@ -367,6 +406,8 @@ def main() -> None:
                     env = bench_env(
                         os.environ,
                         plan_dump=plan_dump if engine == "pie" else None,
+                        pie_driver=args.pie_driver,
+                        loader_planner=args.loader_planner,
                     )
                     pie_server_log = out_dir / f"{engine}-{mode}-{model_tag}.server.log"
                     if engine == "pie":
