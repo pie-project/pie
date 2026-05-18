@@ -1,5 +1,6 @@
 #include "model/llama_like.hpp"
 
+#include <algorithm>
 #include <cstdlib>
 #include <cstdint>
 
@@ -87,6 +88,46 @@ void prepare_llama_like_decode_plan(
     // cudaMemcpyAsync at replay time, so the same captured graph stays
     // correct across fires with different KV lengths.
     if (!is_pure_decode || fwd_cfg.force_prefill_path) {
+        state.use_prefill_decode_plan = false;
+        return;
+    }
+    const int min_prefill_decode_pages =
+        std::max(0, fwd_cfg.prefill_decode_min_kv_pages);
+    std::uint64_t total_kv_pages = 0;
+    for (int r = 0; r < num_requests; ++r) {
+        total_kv_pages += static_cast<std::uint64_t>(
+            kv_page_indptr_h[r + 1] - kv_page_indptr_h[r]);
+    }
+    const int avg_kv_pages = num_requests > 0
+        ? static_cast<int>((total_kv_pages + num_requests - 1) / num_requests)
+        : 0;
+    state.use_prefill_decode_plan =
+        fwd_cfg.use_prefill_decode_plan &&
+        (min_prefill_decode_pages == 0 ||
+         avg_kv_pages >= min_prefill_decode_pages);
+    if (state.use_prefill_decode_plan) {
+        if (!state.prefill_decode_plan) {
+            state.prefill_decode_plan = ops::make_prefill_plan();
+        }
+        const int T = (fwd_cfg.tp_size > 0) ? fwd_cfg.tp_size : 1;
+        const int num_q_heads_local  = cfg.num_attention_heads / T;
+        const int num_kv_heads_local = cfg.num_key_value_heads / T;
+        std::vector<std::uint32_t> qo_indptr_h(num_requests + 1);
+        for (int r = 0; r <= num_requests; ++r) {
+            qo_indptr_h[r] = static_cast<std::uint32_t>(r);
+        }
+        const bool full_attention_variant =
+            fwd_cfg.prefill_decode_full_attention_min_requests > 0 &&
+            num_requests >= fwd_cfg.prefill_decode_full_attention_min_requests &&
+            fwd_cfg.sliding_window < 0 &&
+            fwd_cfg.per_layer_window_left.empty();
+        ops::plan_attention_flashinfer_prefill_bf16(
+            *state.prefill_decode_plan, qo_indptr_h.data(), kv_page_indptr_h,
+            /*total_tokens=*/num_requests, num_requests,
+            num_q_heads_local, num_kv_heads_local, cfg.head_dim_kernel,
+            cache.page_size(), attn_ws, /*stream=*/nullptr,
+            fwd_cfg.decode_plan_cuda_graph, fwd_cfg.sliding_window,
+            full_attention_variant);
         return;
     }
     if (!state.decode_plan) {
@@ -105,6 +146,9 @@ void prepare_llama_like_decode_plan(
 std::uint8_t llama_like_decode_graph_layout(
     const LlamaLikePlanState& state)
 {
+    if (state.use_prefill_decode_plan && state.prefill_decode_plan) {
+        return ops::prefill_plan_graph_layout(*state.prefill_decode_plan);
+    }
     if (!state.decode_plan) return 0;
     return ops::decode_plan_graph_layout(*state.decode_plan);
 }
@@ -185,6 +229,8 @@ void llama_like_forward_paged(
     // kernel even for qo_len==1 batches. The runtime decision lives in
     // a single bool: anything past the plan_attention call uses it.
     const bool use_decode_path = is_pure_decode && !fwd_cfg.force_prefill_path;
+    const bool use_prefill_decode_path =
+        use_decode_path && plan_state.use_prefill_decode_plan;
 
     // Decode plan was set up by the prepare hook (runs outside any
     // cudaStream capture region) — the body just reads from
@@ -192,6 +238,8 @@ void llama_like_forward_paged(
     // the executor can capture it into a CUDA graph.
     const ops::DecodePlanCache* decode_plan =
         plan_state.decode_plan ? plan_state.decode_plan.get() : nullptr;
+    const ops::PrefillPlanCache* prefill_decode_plan =
+        plan_state.prefill_decode_plan ? plan_state.prefill_decode_plan.get() : nullptr;
 
     const bool post_norm = fwd_cfg.norm_placement == NormPlacement::Post;
     bool have_next_attn_norm = false;
@@ -278,7 +326,6 @@ void llama_like_forward_paged(
             layer.k_norm && layer.k_norm->shape().size() == 1 &&
             layer.k_norm->shape()[0] == d;
         const bool fuse_qk_norm_rope =
-            std::getenv("PIE_DISABLE_QK_ROPE_FUSION") == nullptr &&
             T == 1 &&
             fwd_cfg.use_qk_norm &&
             q_norm_is_per_head && k_norm_is_per_head &&
@@ -352,7 +399,13 @@ void llama_like_forward_paged(
                 ? fwd_cfg.per_layer_window_left[L]
                 : fwd_cfg.sliding_window;
 
-        if (use_decode_path) {
+        if (use_prefill_decode_path) {
+            ops::dispatch_attention_flashinfer_prefill_bf16(
+                *prefill_decode_plan,
+                attn_q, cache.k(L), cache.v(L), attn_out_buf,
+                qo_indptr, kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                attn_ws, stream, /*logits_soft_cap=*/0.f, sm_scale_override);
+        } else if (use_decode_path) {
             ops::dispatch_attention_flashinfer_decode_bf16(
                 *decode_plan,
                 attn_q, cache.k(L), cache.v(L), attn_out_buf,

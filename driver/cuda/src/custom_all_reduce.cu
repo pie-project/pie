@@ -342,7 +342,6 @@ bool CustomAllReduce::can_handle(const void* input, std::size_t bytes,
 
 bool CustomAllReduce::can_fuse_residual_rmsnorm(
     int tokens, int hidden, cudaStream_t /*stream*/) const noexcept {
-    if (std::getenv("PIE_DISABLE_AR_FUSION") != nullptr) return false;
     if (fusion_workspace_dev_ == nullptr) return false;
     if (tokens <= 0 || tokens > fusion_max_tokens_) return false;
     if (hidden != fusion_hidden_) return false;

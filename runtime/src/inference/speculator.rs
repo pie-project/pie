@@ -35,10 +35,6 @@ use crate::context::pagestore::PhysicalPageId;
 use crate::inference::ForwardOutput;
 use crate::inference::scheduler::SchedulerHandle;
 
-fn trace_spec_enabled() -> bool {
-    std::env::var_os("PIE_TRACE_SPEC").is_some()
-}
-
 /// A pre-fired forward pass for a ctx, sitting in the per-ctx
 /// chain queue waiting for the inferlet's matching `execute()` call.
 ///
@@ -161,26 +157,8 @@ pub fn try_hit(
     if Some(front.anchor_token) == req_token && Some(front.anchor_pos) == req_pos {
         let entry = deque.pop_front()?;
         BYPASS_HIT_COUNT.fetch_add(1, Ordering::Relaxed);
-        if trace_spec_enabled() {
-            eprintln!(
-                "[pie-spec] hit ctx={ctx_id} anchor=({},{}) remaining_depth={}",
-                entry.anchor_token,
-                entry.anchor_pos,
-                deque.len()
-            );
-        }
         Some(entry.output_rx)
     } else {
-        if trace_spec_enabled() {
-            eprintln!(
-                "[pie-spec] miss ctx={ctx_id} req=({:?},{:?}) front=({},{}) drop_depth={}",
-                req_token,
-                req_pos,
-                front.anchor_token,
-                front.anchor_pos,
-                deque.len()
-            );
-        }
         deque.clear();
         CHAIN_DROP_COUNT.fetch_add(1, Ordering::Relaxed);
         None
@@ -324,18 +302,11 @@ pub(crate) fn spawn_extend_chain(
                     if should_extend {
                         let (sched_tx_next, sched_rx_next) = oneshot::channel();
                         let (final_tx_next, final_rx_next) = oneshot::channel();
-                        let next_pages_len = next_pages.len();
                         if scheduler_handle
                             .submit(next_req.clone(), sched_tx_next, next_pages, next_lpl)
                             .is_ok()
                         {
                             CHAIN_SUBMIT_COUNT.fetch_add(1, Ordering::Relaxed);
-                            if trace_spec_enabled() {
-                                eprintln!(
-                                    "[pie-spec] submit ctx={ctx_id} anchor=({anchor_token},{anchor_pos}) pages={} last_page_len={next_lpl}",
-                                    next_pages_len
-                                );
-                            }
                             if let Ok(mut sb) = staged_batch_arc.lock() {
                                 sb.entry(ctx_id).or_default().push_back(StagedEntry {
                                     anchor_token,
@@ -491,13 +462,6 @@ pub fn build_next_request(
         single_token_mode: true,
         has_user_mask: false,
     };
-    if trace_spec_enabled() {
-        eprintln!(
-            "[pie-spec] build ctx={context_id} sampled_token={sampled_token} last_pos={last_pos} next_pos={next_pos} mask_bits={} samplers={}",
-            next_pos + 1,
-            next_req.samplers.len()
-        );
-    }
     Some((next_req, sampled_token, next_pos))
 }
 

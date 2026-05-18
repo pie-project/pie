@@ -638,18 +638,11 @@ impl BatchScheduler {
         let (latency_tx, mut latency_rx) = mpsc::unbounded_channel::<Duration>();
         let mut next_pending: Option<PendingRequest> = None;
 
-        // Per-fire wall timing instrumentation. Gated on PIE_TIMING.
-        let timing_on = std::env::var_os("PIE_TIMING").is_some();
-        let trace_batches = std::env::var_os("PIE_TRACE_BATCHES").is_some();
-        let mut last_fire_time: Option<Instant> = None;
-        let mut sched_fire_count: u64 = 0;
-
         'run_loop: loop {
             // Drain completed batch latencies (non-blocking)
             while let Ok(latency) = latency_rx.try_recv() {
                 policy.on_complete(latency);
             }
-            let t_loop_top = Instant::now();
 
             // Wait for first request if batch is empty
             while batch.is_empty() {
@@ -668,7 +661,6 @@ impl BatchScheduler {
                 policy.on_arrival();
                 batch.push(pending);
             }
-            let t_first_arrival = Instant::now();
 
             // Accumulate more requests (non-blocking). If a request is
             // already stashed for the next batch, fire the current batch
@@ -692,7 +684,6 @@ impl BatchScheduler {
                     break;
                 }
             }
-            let t_accumulated = Instant::now();
 
             // Ask the policy what to do
             let decision = if next_pending.is_some() {
@@ -702,24 +693,18 @@ impl BatchScheduler {
             };
             match decision {
                 Decision::Fire => {
-                    // Acquire a permit (may wait if at in-flight limit)
-                    // if in_flight.available_permits() == 0 {
-                    //     eprintln!("[SCHED dev={driver_idx}] semaphore full, waiting for in-flight batch to complete");
-                    // }
-                    let t_before_permit = Instant::now();
+                    // Acquire a permit (may wait if at in-flight limit).
                     let permit = in_flight
                         .clone()
                         .acquire_owned()
                         .await
                         .expect("semaphore closed");
-                    let t_permit = Instant::now();
 
                     // The policy may decide to fire while the previous GPU
                     // batch is still in flight. Do one last non-blocking
                     // drain after the permit opens so requests that arrived
                     // during that wait are coalesced into this batch instead
                     // of being stranded behind a tiny stale fire.
-                    let mut post_permit_added = 0usize;
                     while next_pending.is_none() && !batch.is_full() {
                         let Ok(pending) = req_rx.try_recv() else {
                             break;
@@ -734,59 +719,10 @@ impl BatchScheduler {
                         }
                         policy.on_arrival();
                         batch.push(pending);
-                        post_permit_added += 1;
                     }
-
-                    let fire_n = sched_fire_count;
-                    sched_fire_count += 1;
-                    let log_outer = timing_on && fire_n >= 50 && fire_n % 50 == 0;
-                    if log_outer {
-                        let fire_to_fire = last_fire_time
-                            .map(|t| t_permit.duration_since(t).as_micros())
-                            .unwrap_or(0);
-                        eprintln!(
-                            "[outer-fire {} B={}] fire_to_fire={}us \
-                             loop_top_after_prev={}us \
-                             recv_first_req={}us accumulate_more={}us \
-                             permit_wait_after_decide={}us \
-                             post_permit_added={}",
-                            fire_n,
-                            batch.len(),
-                            fire_to_fire,
-                            last_fire_time
-                                .map(|t| t_loop_top.duration_since(t).as_micros())
-                                .unwrap_or(0),
-                            (t_first_arrival - t_loop_top).as_micros(),
-                            (t_accumulated - t_first_arrival).as_micros(),
-                            (t_permit - t_before_permit).as_micros(),
-                            post_permit_added,
-                        );
-                    }
-                    last_fire_time = Some(t_permit);
 
                     let total_tokens = batch.total_tokens();
                     let requests_to_fire = batch.take();
-                    if trace_batches {
-                        let first = requests_to_fire.first();
-                        let last = requests_to_fire.last();
-                        let first_ctx = first
-                            .and_then(|r| r.request.context_ids.first().copied())
-                            .unwrap_or(0);
-                        let last_ctx = last
-                            .and_then(|r| r.request.context_ids.first().copied())
-                            .unwrap_or(0);
-                        let first_pos = first
-                            .and_then(|r| r.request.position_ids.first().copied())
-                            .unwrap_or(0);
-                        let last_pos = last
-                            .and_then(|r| r.request.position_ids.first().copied())
-                            .unwrap_or(0);
-                        eprintln!(
-                            "[sched-batch dev={driver_idx} fire={fire_n} B={} tokens={} first=({first_ctx},{first_pos}) last=({last_ctx},{last_pos})",
-                            requests_to_fire.len(),
-                            total_tokens,
-                        );
-                    }
                     policy.on_fired(requests_to_fire.len());
 
                     // Collect batch context IDs for accurate rent charging.
@@ -906,17 +842,6 @@ impl BatchScheduler {
         _timeout: Duration,
         mut permit: Option<OwnedSemaphorePermit>,
     ) {
-        // Per-stage timing for the Rust side of the inter-fire path.
-        // Driver-side timing already lives in `request_handler.cpp`; this
-        // tells us what fraction of the per-fire wall sits in scheduler /
-        // msgpack / shmem-roundtrip / response-distribution.
-        let timing_on = std::env::var_os("PIE_TIMING").is_some();
-        static FIRE_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let fire_n = FIRE_COUNT.fetch_add(1, Relaxed);
-        let log_this = timing_on && fire_n >= 50 && fire_n % 50 == 0;
-        let t0 = std::time::Instant::now();
-        let r = requests.len();
-
         // Build batched request — a single `pie_bridge::ForwardRequest`
         // populated by folding each per-request shape into the batch.
         let elide_decode_masks = requests.iter().all(|req| {
@@ -936,11 +861,9 @@ impl BatchScheduler {
                 elide_decode_masks,
             );
         }
-        let t_build = std::time::Instant::now();
 
         // Send via driver service (typed call handles serialization + timeout)
         let result = driver::fire_batch(driver_idx, batch_req).await;
-        let t_resp = std::time::Instant::now();
         drop(permit.take());
 
         match result {
@@ -982,18 +905,6 @@ impl BatchScheduler {
                         };
                         req.response_tx.send(Ok(output)).ok();
                     }
-                    let t_done = std::time::Instant::now();
-                    if log_this {
-                        eprintln!(
-                            "[sched-fire {} R={}] build={}us roundtrip={}us distribute={}us TOTAL={}us",
-                            fire_n,
-                            r,
-                            (t_build - t0).as_micros(),
-                            (t_resp - t_build).as_micros(),
-                            (t_done - t_resp).as_micros(),
-                            (t_done - t0).as_micros(),
-                        );
-                    }
                 } else {
                     for (r, req) in requests.into_iter().enumerate() {
                         // Extract this request's slice from the batched
@@ -1017,18 +928,6 @@ impl BatchScheduler {
                         .ok();
                 }
             }
-        }
-        let t_done = std::time::Instant::now();
-        if log_this {
-            eprintln!(
-                "[sched-fire {} R={}] build={}us roundtrip={}us distribute={}us TOTAL={}us",
-                fire_n,
-                r,
-                (t_build - t0).as_micros(),
-                (t_resp - t_build).as_micros(),
-                (t_done - t_resp).as_micros(),
-                (t_done - t0).as_micros(),
-            );
         }
     }
 }

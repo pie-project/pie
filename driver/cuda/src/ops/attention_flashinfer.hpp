@@ -29,10 +29,20 @@ using DecodePlanCachePtr = std::unique_ptr<DecodePlanCache, DecodePlanCacheDelet
 
 DecodePlanCachePtr make_decode_plan();
 
+struct PrefillPlanCache;
+
+struct PrefillPlanCacheDeleter {
+    void operator()(PrefillPlanCache* p) const noexcept;
+};
+using PrefillPlanCachePtr = std::unique_ptr<PrefillPlanCache, PrefillPlanCacheDeleter>;
+
+PrefillPlanCachePtr make_prefill_plan();
+
 // Compact graph-layout class for the most recent decode plan. CUDA graph
 // replay records the host-side dispatch branch, so changes such as
 // non-partitioned -> split-KV need distinct graph keys.
 std::uint8_t decode_plan_graph_layout(const DecodePlanCache& cache);
+std::uint8_t prefill_plan_graph_layout(const PrefillPlanCache& cache);
 
 // Compute decode plan once per fire. Stores results in `cache` and the
 // workspace's int/float buffers (so per-layer dispatch can read them).
@@ -47,6 +57,22 @@ void plan_attention_flashinfer_decode_bf16(
     AttentionWorkspace& workspace,
     cudaStream_t stream,
     bool enable_cuda_graph = true);
+
+void plan_attention_flashinfer_prefill_bf16(
+    PrefillPlanCache& cache,
+    const std::uint32_t* qo_indptr_h,
+    const std::uint32_t* kv_page_indptr_h,
+    int total_tokens,
+    int num_requests,
+    int num_q_heads,
+    int num_kv_heads,
+    int head_dim,
+    int page_size,
+    AttentionWorkspace& workspace,
+    cudaStream_t stream,
+    bool enable_cuda_graph = true,
+    int window_left = -1,
+    bool full_attention_variant = false);
 
 // Per-layer dispatch reusing the cached plan. `q`/`k_pages`/`v_pages`/`o`
 // vary per layer; everything else comes from the cache + workspace.
@@ -85,6 +111,21 @@ void dispatch_attention_flashinfer_decode_bf16(
     AttentionWorkspace& workspace,
     cudaStream_t stream,
     int window_left = -1,
+    float logits_soft_cap = 0.f,
+    float sm_scale = -1.f,
+    float* lse_out = nullptr);
+
+void dispatch_attention_flashinfer_prefill_bf16(
+    const PrefillPlanCache& cache,
+    const void* q,
+    void* k_pages, void* v_pages,
+    void* o,
+    const std::uint32_t* qo_indptr_d,
+    const std::uint32_t* kv_page_indices_d,
+    const std::uint32_t* kv_page_indptr_d,
+    const std::uint32_t* kv_last_page_lens_d,
+    AttentionWorkspace& workspace,
+    cudaStream_t stream,
     float logits_soft_cap = 0.f,
     float sm_scale = -1.f,
     float* lse_out = nullptr);

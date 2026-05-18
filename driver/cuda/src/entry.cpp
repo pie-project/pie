@@ -162,6 +162,7 @@ struct CudaMemoryPlan {
     int max_page_refs = 0;
     int kv_pages = 0;
     int state_slots = 0;
+    std::size_t attn_float_workspace_bytes = 0;
     std::size_t arena_bytes = 0;
     std::size_t kv_bytes = 0;
     std::size_t state_bytes = 0;
@@ -176,6 +177,8 @@ void min_into(CudaMemoryPlan& dst, const CudaMemoryPlan& src) {
     dst.max_page_refs = std::min(dst.max_page_refs, src.max_page_refs);
     dst.kv_pages = std::min(dst.kv_pages, src.kv_pages);
     dst.state_slots = std::min(dst.state_slots, src.state_slots);
+    dst.attn_float_workspace_bytes = std::max(
+        dst.attn_float_workspace_bytes, src.attn_float_workspace_bytes);
     dst.arena_bytes = std::max(dst.arena_bytes, src.arena_bytes);
     dst.kv_bytes = std::min(dst.kv_bytes, src.kv_bytes);
     dst.state_bytes = std::min(dst.state_bytes, src.state_bytes);
@@ -394,6 +397,46 @@ std::size_t persistent_input_bytes(int N, int R, int max_page_refs,
     return bytes;
 }
 
+std::size_t attention_float_workspace_bytes(
+    const pie_cuda_driver::HfConfig& hf,
+    const pie_cuda_driver::Config& cfg,
+    const cudaDeviceProp& prop,
+    int max_requests)
+{
+    const std::size_t base = 80ull * 1024 * 1024;
+    const int tp_size = std::max(1, cfg.distributed.tp_size);
+    if (prop.major < 9 || tp_size != 1 || max_requests <= 0) {
+        return base;
+    }
+    if (hf.num_key_value_heads <= 0 ||
+        hf.num_attention_heads % hf.num_key_value_heads != 0) {
+        return base;
+    }
+    const int gqa = hf.num_attention_heads / hf.num_key_value_heads;
+    const bool gqa_in_decode_set =
+        gqa == 1 || gqa == 2 || gqa == 3 || gqa == 4 || gqa == 8;
+    const bool supported_head_dim =
+        hf.head_dim_kernel == 64 || hf.head_dim_kernel == 128 ||
+        hf.head_dim_kernel == 256 || hf.head_dim_kernel == 512;
+    if (!gqa_in_decode_set || !supported_head_dim || hf.sliding_window >= 0 ||
+        !hf.layer_types.empty()) {
+        return base;
+    }
+
+    const std::size_t q_heads =
+        static_cast<std::size_t>(hf.num_attention_heads / tp_size);
+    const std::size_t head_dim = static_cast<std::size_t>(hf.head_dim_kernel);
+    const std::size_t cta_tile_q = 16;
+    const std::size_t padded_batch =
+        align_up(static_cast<std::size_t>(max_requests) * 2, 128);
+    const std::size_t tmp_v =
+        q_heads * padded_batch * cta_tile_q * head_dim * sizeof(float);
+    const std::size_t tmp_s =
+        q_heads * padded_batch * cta_tile_q * sizeof(float);
+    const std::size_t planned = tmp_v + tmp_s + 16ull * 1024 * 1024;
+    return std::max(base, align_up(planned, 16ull * 1024 * 1024));
+}
+
 std::size_t kv_page_bytes_homogeneous(const pie_cuda_driver::HfConfig& cfg,
                                       int tp_size) {
     const int kv_heads = cfg.num_key_value_heads / std::max(1, tp_size);
@@ -433,8 +476,8 @@ std::vector<std::string> planner_policy_profiles(const std::string& profile) {
     return {"latency", "balanced", "throughput", "capacity"};
 }
 
-int derive_kv_page_size_for_profile(const std::string& profile, int tp_size) {
-    // FlashInfer paged attention supports 16/32/64-token pages for the CUDA
+int derive_kv_page_size_for_profile(const std::string& profile, int /*tp_size*/) {
+    // FlashInfer paged attention supports 16/32-token pages for the CUDA
     // backends we use. vLLM keeps 16 as its general default; SGLang picks by
     // backend. Pie's balanced/throughput/capacity profiles benefit from fewer
     // page refs and lower scheduler/metadata pressure, while latency keeps the
@@ -443,7 +486,7 @@ int derive_kv_page_size_for_profile(const std::string& profile, int tp_size) {
         return 16;
     }
     if (profile == "throughput") {
-        return std::max(1, tp_size) == 1 ? 32 : 16;
+        return 32;
     }
     return 32;
 }
@@ -694,7 +737,8 @@ CudaMemoryPlan plan_cuda_memory(
             if (is_gemma4_arch && hf.gemma4_enable_moe) {
                 arena += gemma4_moe_workspace_bytes(hf, N);
             }
-            const std::size_t attn_float_bytes = 80ull * 1024 * 1024;
+            const std::size_t attn_float_bytes =
+                attention_float_workspace_bytes(hf, cfg, prop, R0);
             arena += attn_float_bytes;     // AttentionWorkspace float section
             arena += 8ull * 1024 * 1024;  // AttentionWorkspace int section
             arena += persistent_input_bytes(N, R0, max_page_refs,
@@ -738,6 +782,7 @@ CudaMemoryPlan plan_cuda_memory(
             p.max_page_refs = std::max(262144, R * 512);
             p.kv_pages = kv_pages;
             p.state_slots = state_slots;
+            p.attn_float_workspace_bytes = attn_float_bytes;
             p.arena_bytes = arena;
             p.kv_bytes = static_cast<std::size_t>(kv_pages) * per_page_bytes;
             p.state_bytes = state_bytes;
@@ -786,12 +831,7 @@ CudaMemoryPlan plan_cuda_memory(
             if (policy_profile == "latency") {
                 page_score = (kv_page_size == 16) ? 0.20 : -0.20;
             } else if (policy_profile == "throughput" || auto_profile) {
-                page_score =
-                    (prop.major >= 9)
-                        ? ((kv_page_size == 16) ? 0.30 : 0.0)
-                    : (tp_size == 1)
-                        ? ((kv_page_size == 32) ? 0.25 : 0.0)
-                        : ((kv_page_size == 16) ? 0.25 : 0.0);
+                page_score = (kv_page_size == 32) ? 0.25 : 0.0;
             } else {
                 page_score = (kv_page_size == 32) ? 0.15 : 0.0;
             }
@@ -1227,26 +1267,6 @@ int run_parity(const pie_cuda_driver::Config& cfg,
             dump_row = 0;
         }
 
-        // Optional decode-microbench (PIE_PARITY_BENCH_DECODE=K): replay K
-        // additional decode steps after the parity step, timing the total
-        // wall clock. Logits at the dump_row are unchanged (we use the
-        // last step's output).
-        if (const char* dbg = std::getenv("PIE_PARITY_BENCH_DECODE")) {
-            const int extra = std::max(1, std::atoi(dbg));
-            CUDA_CHECK(cudaDeviceSynchronize());
-            const auto t0 = std::chrono::steady_clock::now();
-            for (int s = 0; s < extra; ++s) {
-                run_call(d_tokens + (N - 1), d_positions + (N - 1),
-                         /*total_n=*/1, /*kv_n=*/N + s + 1, /*is_decode=*/true);
-            }
-            CUDA_CHECK(cudaDeviceSynchronize());
-            const auto t1 = std::chrono::steady_clock::now();
-            const double ms =
-                std::chrono::duration<double, std::milli>(t1 - t0).count();
-            std::cerr << "[bench-decode] " << extra << " steps in "
-                      << ms << " ms => " << (extra * 1000.0 / ms)
-                      << " tok/s (single-stream, single-request)\n";
-        }
     } else {
         pie_cuda_driver::model::qwen3_forward_prefill(
             weights, engine.hf_config(), ws, cublas, d_tokens, d_positions, N);
@@ -1360,9 +1380,6 @@ int run_impl(int argc,
                    "the TP group. Only required when tp_size > 1.");
 
     CLI11_PARSE(app, argc, argv);
-    if (std::getenv("PIE_DISABLE_CUDA_GRAPHS")) {
-        use_cuda_graphs = false;
-    }
 
     auto cfg = pie_cuda_driver::load_config(config_path);
     if (cli_tp_size >= 1) cfg.distributed.tp_size = cli_tp_size;
@@ -1691,9 +1708,8 @@ int run_impl(int argc,
                   local_kv_heads,
                   engine.hf_config().head_dim_kernel);
 
-    const std::size_t attn_float_workspace_bytes = 80ull * 1024 * 1024;
     auto attn_ws = pie_cuda_driver::AttentionWorkspace::allocate(
-        attn_float_workspace_bytes, 8ull * 1024 * 1024);
+        mem_plan.attn_float_workspace_bytes, 8ull * 1024 * 1024);
 
     // Plan-state holders used by the prepare/body split for graph-friendly
     // dispatch. Allocated unconditionally — empty on archs that don't use
@@ -1780,9 +1796,8 @@ int run_impl(int argc,
         mem_plan.capacity.max_custom_mask_bytes);
 
     pie_cuda_driver::CustomAllReduce custom_ar;
-    const bool disable_custom_ar = std::getenv("PIE_DISABLE_CUSTOM_AR") != nullptr;
     if (tp_comm_ptr != nullptr && vtable_opt != nullptr &&
-        cfg.distributed.tp_size == 2 && !disable_custom_ar) {
+        cfg.distributed.tp_size == 2) {
         custom_ar = pie_cuda_driver::CustomAllReduce(
             *tp_comm_ptr, /*same_process=*/true,
             /*max_bytes=*/8 * 1024 * 1024,
@@ -1792,9 +1807,6 @@ int run_impl(int argc,
         custom_ar.register_buffer(*tp_comm_ptr, ws.norm_x.data(),
                                   ws.norm_x.nbytes());
         tp_comm_ptr->set_custom_all_reduce(&custom_ar);
-    } else if (verbose && disable_custom_ar) {
-        std::cerr << "[pie-driver-cuda] custom allreduce disabled by "
-                  << "PIE_DISABLE_CUSTOM_AR\n";
     }
 
     if (verbose) {
@@ -1809,6 +1821,9 @@ int run_impl(int argc,
                   << "; max requests=" << mem_plan.max_requests
                   << "; page_refs=" << mem_plan.max_page_refs
                   << "; arena ~" << (mem_plan.arena_bytes / (1024 * 1024))
+                  << " MiB"
+                  << "; attn_ws="
+                  << (mem_plan.attn_float_workspace_bytes / (1024 * 1024))
                   << " MiB"
                   << "; swap_pool=" << swap_pool.num_pages() << " pages\n";
     }
@@ -1880,9 +1895,6 @@ int run_impl(int argc,
         const bool gqa_in_decode_set = (gqa == 1 || gqa == 2 || gqa == 3
                                         || gqa == 4 || gqa == 8);
         fwd_cfg.force_prefill_path = !gqa_in_decode_set;
-        if (std::getenv("PIE_FORCE_PREFILL_DECODE")) {
-            fwd_cfg.force_prefill_path = true;
-        }
         fwd_cfg.decode_plan_cuda_graph = use_cuda_graphs;
         // Tensor-parallel state. tp_comm == nullptr at tp_size == 1
         // keeps the original single-GPU branches in the forward kernels.
@@ -1924,12 +1936,44 @@ int run_impl(int argc,
             }
         }
 
+        cudaDeviceProp serving_prop{};
+        int serving_dev = 0;
+        CUDA_CHECK(cudaGetDevice(&serving_dev));
+        CUDA_CHECK(cudaGetDeviceProperties(&serving_prop, serving_dev));
+        const bool prefill_decode_supported_head_dim =
+            hf.head_dim_kernel == 64 || hf.head_dim_kernel == 128 ||
+            hf.head_dim_kernel == 256 || hf.head_dim_kernel == 512;
+        fwd_cfg.use_prefill_decode_plan =
+            serving_prop.major >= 9 &&
+            cfg.distributed.tp_size == 1 &&
+            gqa_in_decode_set &&
+            !fwd_cfg.force_prefill_path &&
+            prefill_decode_supported_head_dim &&
+            fwd_cfg.sliding_window < 0 &&
+            fwd_cfg.per_layer_window_left.empty();
+        if (fwd_cfg.use_prefill_decode_plan) {
+            // For Hopper full-attention decode routed through FlashInfer's
+            // prefill kernel, the sliding-capable specialization remains
+            // faster through the common <=512-request serving cohorts. Keep
+            // the no-sliding variant for very wide cohorts only.
+            fwd_cfg.prefill_decode_full_attention_min_requests = 1024;
+            // The dedicated decode kernel is faster for short KV histories on
+            // Hopper; switch to the prefill-plan path only after the batch has
+            // enough average KV pages for split-KV/full-attention work to pay
+            // for itself.
+            fwd_cfg.prefill_decode_min_kv_pages = 12;
+        }
+
         if (verbose) {
             std::cerr << "[pie-driver-cuda] model_type=" << mt
                       << " use_qk_norm=" << fwd_cfg.use_qk_norm
                       << " use_qkv_bias=" << fwd_cfg.use_qkv_bias
                       << " rope=" << (fwd_cfg.rope_kind ==
                            pie_cuda_driver::model::RopeKind::YaRN ? "yarn" : "standard")
+                      << " prefill_decode_plan="
+                      << (fwd_cfg.use_prefill_decode_plan ? "on" : "off")
+                      << " full_attn_min_R="
+                      << fwd_cfg.prefill_decode_full_attention_min_requests
                       << "\n";
         }
     }

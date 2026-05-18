@@ -60,16 +60,16 @@ void gemm_bf16_impl(
 {
     const float alpha = 1.f;
     const auto status = cublasGemmEx(
-              handle,
-              /*transa=*/CUBLAS_OP_T, /*transb=*/CUBLAS_OP_N,
-              /*m=*/N, /*n=*/M, /*k=*/K,
-              &alpha,
-              /*A=*/W,   CUDA_R_16BF, /*lda=*/K,
-              /*B=*/act, CUDA_R_16BF, /*ldb=*/K,
-              &beta,
-              /*C=*/y,   CUDA_R_16BF, /*ldc=*/N,
-              CUBLAS_COMPUTE_32F,
-              CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+        handle,
+        /*transa=*/CUBLAS_OP_T, /*transb=*/CUBLAS_OP_N,
+        /*m=*/N, /*n=*/M, /*k=*/K,
+        &alpha,
+        /*A=*/W,   CUDA_R_16BF, /*lda=*/K,
+        /*B=*/act, CUDA_R_16BF, /*ldb=*/K,
+        &beta,
+        /*C=*/y,   CUDA_R_16BF, /*ldc=*/N,
+        CUBLAS_COMPUTE_32F_FAST_16BF,
+        CUBLAS_GEMM_DEFAULT_TENSOR_OP);
     if (status != CUBLAS_STATUS_SUCCESS) {
         throw std::runtime_error(
             "cuBLAS error (" + std::to_string(static_cast<int>(status)) +
@@ -101,7 +101,7 @@ void gemm_batched_bf16_impl(
               &beta,
               /*C=*/y_ptrs_dev,   CUDA_R_16BF, /*ldc=*/N,
               batch_count,
-              CUBLAS_COMPUTE_32F,
+              CUBLAS_COMPUTE_32F_FAST_16BF,
               CUBLAS_GEMM_DEFAULT_TENSOR_OP);
     if (status != CUBLAS_STATUS_SUCCESS) {
         throw std::runtime_error(

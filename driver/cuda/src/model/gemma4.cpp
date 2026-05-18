@@ -1,10 +1,7 @@
 #include "model/gemma4.hpp"
 
 #include <cmath>
-#include <cstdio>
-#include <cstdlib>
 #include <cstring>
-#include <fstream>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -322,48 +319,6 @@ Gemma4Weights bind_gemma4(const LoadedModel& engine) {
 
 namespace {
 
-// Parity-dump helper: write a bf16 tensor of `numel` elements to
-// `<dir>/<tag>.bin` as raw bf16 bytes. We only record the *first* fire
-// of a session (typically the prefill) — subsequent decode fires would
-// overwrite the prefill's intermediates with decode-shaped tensors,
-// which is not what the PyTorch parity harness compares against.
-inline bool& dbg_first_fire_flag() {
-    static bool first = true;
-    return first;
-}
-// True only when `PIE_GEMMA4_DUMP_DIR` is set in the environment.
-// Cached on first call so per-fire checks are a single bool load.
-inline bool dbg_dumps_enabled() {
-    static const bool enabled = std::getenv("PIE_GEMMA4_DUMP_DIR") != nullptr;
-    return enabled;
-}
-inline void dbg_dump_bf16(const char* tag, const void* dev_ptr,
-                          std::size_t numel) {
-    if (!dbg_dumps_enabled()) return;
-    if (!dbg_first_fire_flag()) return;
-    static const char* dir = std::getenv("PIE_GEMMA4_DUMP_DIR");
-    std::vector<std::uint16_t> tmp(numel);
-    cudaMemcpy(tmp.data(), dev_ptr, numel * 2, cudaMemcpyDeviceToHost);
-    std::string path = std::string(dir) + "/" + tag + ".bin";
-    std::ofstream out(path, std::ios::binary);
-    if (!out) return;
-    out.write(reinterpret_cast<const char*>(tmp.data()), numel * 2);
-}
-// Sync-then-dump: paired with `dbg_dump_bf16` to guarantee the kernel
-// preceding the dump has finished. **Only syncs when dumping is on.**
-// Replaces the previous pattern of unconditional `cudaDeviceSynchronize()
-// + dbg_dump_bf16(...)` which stalled the GPU on every layer of every
-// fire even with no dump directory configured (the dumps no-op'd, but
-// the syncs did not — they were the dominant per-step overhead in
-// Gemma-4 release builds).
-inline void dbg_sync_dump_bf16(const char* tag, const void* dev_ptr,
-                               std::size_t numel) {
-    if (!dbg_dumps_enabled()) return;
-    if (!dbg_first_fire_flag()) return;
-    cudaDeviceSynchronize();
-    dbg_dump_bf16(tag, dev_ptr, numel);
-}
-
 // Read a single bf16 tensor's first element to host. Used for the
 // per-layer learnable scalar — there's one float per layer; copying
 // one bf16 value at startup is cheap and lets the forward avoid a
@@ -555,30 +510,11 @@ void gemma4_forward_paged(
     const bool use_decode_path = is_pure_decode && !fwd_cfg.force_prefill_path;
 
     // ── 1. Embed + √hidden scale ──────────────────────────────────────────
-    // Dump input tokens to disk so the parity harness can confirm
-    // it's running HF on the same prefix. Only on the first fire
-    // (the prefill) — subsequent decode fires would clobber the
-    // file with a single-token dump.
-    {
-        const char* dir = std::getenv("PIE_GEMMA4_DUMP_DIR");
-        if (dir != nullptr && dbg_first_fire_flag()) {
-            std::vector<std::int32_t> tmp(N);
-            cudaMemcpy(tmp.data(), token_ids, N * sizeof(std::int32_t),
-                       cudaMemcpyDeviceToHost);
-            std::ofstream out(std::string(dir) + "/tokens.bin", std::ios::binary);
-            if (out) out.write(reinterpret_cast<const char*>(tmp.data()),
-                               N * sizeof(std::int32_t));
-        }
-    }
     kernels::launch_embed_bf16(
         token_ids, w.embed->data(), ws.y.data(), N, H, V, stream);
-    dbg_sync_dump_bf16("embed_pre_scale", ws.y.data(),
-                  static_cast<std::size_t>(N) * H);
     kernels::launch_scalar_mul_bf16(
         ws.y.data(), std::sqrt(static_cast<float>(H)),
         static_cast<std::size_t>(N) * H, stream);
-    dbg_sync_dump_bf16("embed_post_scale", ws.y.data(),
-                  static_cast<std::size_t>(N) * H);
 
     // ── 2. Per-layer inputs (PLE) ────────────────────────────────────────
     // Compute once per fire; sliced per layer below. Skipped entirely
@@ -645,9 +581,6 @@ void gemma4_forward_paged(
     // (l+1)*ple_dim]` per layer below by pointer-arithmetic.
     auto* per_layer_base = static_cast<std::uint8_t*>(per_layer_proj);
     constexpr int bf16_bytes = 2;
-    dbg_sync_dump_bf16("per_layer_inputs", per_layer_proj,
-                  static_cast<std::size_t>(N) * L * ple_dim);
-
     // Hoist decode plan(s). Gemma-4 has dual head_dim so we plan twice
     // — once at sliding head_dim, once at global head_dim. Both reuse
     // the same workspace (flashinfer's plan info encodes only memory
@@ -656,23 +589,8 @@ void gemma4_forward_paged(
     // for small batches than maintaining two cached plans.
 
     // ── 3. Layer loop ────────────────────────────────────────────────────
-    int debug_max_layers = L;
-    if (const char* lim = getenv("PIE_GEMMA4_MAX_LAYERS")) {
-        debug_max_layers = std::min(L, std::atoi(lim));
-    }
-    for (int l = 0; l < debug_max_layers; ++l) {
+    for (int l = 0; l < L; ++l) {
         const auto& layer = w.layers[l];
-        const bool dump_this = (l == 0);
-        // Pair the sync with the dump so a release run (no dump dir
-        // env var) skips both — the standalone syncs that used to
-        // precede each dump_l0 call were the dominant per-step
-        // overhead on Gemma-4 (~3-15 ms per fire across 30 layers).
-        auto dump_l0 = [&](const char* tag, const void* p, std::size_t n) {
-            if (!dump_this || !dbg_dumps_enabled() || !dbg_first_fire_flag()) return;
-            cudaDeviceSynchronize();
-            std::string t = std::string("L0_") + tag;
-            dbg_dump_bf16(t.c_str(), p, n);
-        };
         // Per-layer dims sharded by tp_size on TP runs. The head/intermediate
         // counts must be divisible by tp_size — guarded at engine load.
         const int T  = (fwd_cfg.tp_size > 0) ? fwd_cfg.tp_size : 1;
@@ -691,8 +609,6 @@ void gemma4_forward_paged(
         kernels::launch_rmsnorm_bf16(
             ws.y.data(), layer.attn_norm_pre->data(), ws.norm_x.data(),
             N, H, eps, stream);
-        dump_l0("attn_norm_pre", ws.norm_x.data(),
-                static_cast<std::size_t>(N) * H);
 
         // Q-projection always runs.
         ops::gemm_act_x_wt_bf16(cublas.handle(),
@@ -719,36 +635,20 @@ void gemma4_forward_paged(
             }
         }
 
-        // Pre-norm dumps for parity.
-        if (l == 0 && !layer.is_shared) {
-            dump_l0("v_pre_norm", ws.v.data(),
-                    static_cast<std::size_t>(N) * num_kv_heads_local * d);
-            dump_l0("q_pre_norm", ws.q.data(),
-                    static_cast<std::size_t>(N) * num_q_heads_local * d);
-        }
-
         // Per-head Q/K RMSNorm (Gemma-4 always has it).
-        if (getenv("PIE_NO_QK_NORM") == nullptr) {
+        kernels::launch_rmsnorm_bf16(
+            ws.q.data(), layer.q_norm->data(), ws.q.data(),
+            N * num_q_heads_local, d, eps, stream);
+        if (!layer.is_shared) {
             kernels::launch_rmsnorm_bf16(
-                ws.q.data(), layer.q_norm->data(), ws.q.data(),
-                N * num_q_heads_local, d, eps, stream);
-            if (!layer.is_shared) {
-                kernels::launch_rmsnorm_bf16(
-                    ws.k.data(), layer.k_norm->data(), ws.k.data(),
-                    N * num_kv_heads_local, d, eps, stream);
-                // V-Norm: pure RMSNorm (no learnable scale) on V before the
-                // KV write. Gemma-4 trained against this; skipping it
-                // produces gibberish even though softmax stays well-formed.
-                kernels::launch_rmsnorm_no_scale_bf16(
-                    ws.v.data(), ws.v.data(),
-                    N * num_kv_heads_local, d, eps, stream);
-            }
-        }
-        if (l == 0 && !layer.is_shared) {
-            dump_l0("v_post_norm", ws.v.data(),
-                    static_cast<std::size_t>(N) * num_kv_heads_local * d);
-            dump_l0("q_post_norm", ws.q.data(),
-                    static_cast<std::size_t>(N) * num_q_heads_local * d);
+                ws.k.data(), layer.k_norm->data(), ws.k.data(),
+                N * num_kv_heads_local, d, eps, stream);
+            // V-Norm: pure RMSNorm (no learnable scale) on V before the
+            // KV write. Gemma-4 trained against this; skipping it
+            // produces gibberish even though softmax stays well-formed.
+            kernels::launch_rmsnorm_no_scale_bf16(
+                ws.v.data(), ws.v.data(),
+                N * num_kv_heads_local, d, eps, stream);
         }
 
         // RoPE: partial rotary on full-attention layers
@@ -843,9 +743,6 @@ void gemma4_forward_paged(
                 /*sm_scale=*/1.0f);
         }
 
-        dump_l0("attn_out", ws.attn_out.data(),
-                static_cast<std::size_t>(N) * Hq);
-
         // o_proj → norm_x scratch, post-attn norm, residual-add y. Under
         // TP this is row-parallel: all-reduce the partial sums before
         // post-norm sees them.
@@ -856,25 +753,17 @@ void gemma4_forward_paged(
             tp->all_reduce_bf16(ws.norm_x.data(),
                 static_cast<std::size_t>(N) * H, ncclSum, stream);
         }
-        dump_l0("o_proj_out", ws.norm_x.data(),
-                static_cast<std::size_t>(N) * H);
         kernels::launch_rmsnorm_bf16(
             ws.norm_x.data(), layer.attn_norm_post->data(), ws.norm_y.data(),
             N, H, eps, stream);
-        dump_l0("attn_norm_post", ws.norm_y.data(),
-                static_cast<std::size_t>(N) * H);
         kernels::launch_residual_add_bf16(
             ws.y.data(), ws.norm_y.data(),
             static_cast<std::size_t>(N) * H, stream);
-        dump_l0("post_attn_y", ws.y.data(),
-                static_cast<std::size_t>(N) * H);
 
         // ── 3b. MLP block ──────────────────────────────────────────────
         kernels::launch_rmsnorm_bf16(
             ws.y.data(), layer.mlp_norm_pre->data(), ws.norm_x.data(),
             N, H, eps, stream);
-        dump_l0("mlp_norm_pre", ws.norm_x.data(),
-                static_cast<std::size_t>(N) * H);
 
         ops::gemm_act_x_wt_bf16(cublas.handle(),
             ws.norm_x.data(), layer.gate_proj->data(), ws.gate.data(),
@@ -885,8 +774,6 @@ void gemma4_forward_paged(
         kernels::launch_geglu_tanh_bf16(
             ws.gate.data(), ws.up.data(), ws.gate.data(),
             N * I, stream);
-        dump_l0("mlp_geglu", ws.gate.data(),
-                static_cast<std::size_t>(N) * I);
         ops::gemm_act_x_wt_bf16(cublas.handle(),
             ws.gate.data(), layer.down_proj->data(), ws.norm_x.data(),
             N, H, I, /*beta=*/0.f);
@@ -894,9 +781,6 @@ void gemma4_forward_paged(
             tp->all_reduce_bf16(ws.norm_x.data(),
                 static_cast<std::size_t>(N) * H, ncclSum, stream);
         }
-        dump_l0("mlp_down", ws.norm_x.data(),
-                static_cast<std::size_t>(N) * H);
-
         // Gemma-4 26B-A4B's MoE block runs **alongside** the dense MLP
         // and the two branches' post-norms are summed before the final
         // `post_feedforward_layernorm`. On the dense E2B / E4B / 31B
@@ -925,8 +809,6 @@ void gemma4_forward_paged(
             kernels::launch_rmsnorm_bf16(
                 ws.norm_y.data(), layer.mlp_norm_post->data(),
                 ws.norm_x.data(), N, H, eps, stream);
-            dump_l0("mlp_norm_post", ws.norm_x.data(),
-                    static_cast<std::size_t>(N) * H);
             kernels::launch_residual_add_bf16(
                 ws.y.data(), ws.norm_x.data(),
                 static_cast<std::size_t>(N) * H, stream);
@@ -934,85 +816,62 @@ void gemma4_forward_paged(
             kernels::launch_rmsnorm_bf16(
                 ws.norm_x.data(), layer.mlp_norm_post->data(), ws.norm_y.data(),
                 N, H, eps, stream);
-            dump_l0("mlp_norm_post", ws.norm_y.data(),
-                    static_cast<std::size_t>(N) * H);
             kernels::launch_residual_add_bf16(
                 ws.y.data(), ws.norm_y.data(),
                 static_cast<std::size_t>(N) * H, stream);
         }
-        dump_l0("post_mlp_y", ws.y.data(),
-                static_cast<std::size_t>(N) * H);
 
         // ── 3c. PLE residual ───────────────────────────────────────────
-        // Wrapped in a block so debugging can disable the whole step
-        // (env `PIE_NO_PLE=1`) without touching the surrounding flow.
         // Skipped on Gemma-4 26B-A4B (`hidden_size_per_layer_input == 0`
         // → `ple_dim == 0`), which doesn't ship the per-layer triple at
         // all.
-        if (ple_dim > 0 && getenv("PIE_NO_PLE") == nullptr) {
-        dump_l0("ple_residual_in", ws.y.data(),
-                static_cast<std::size_t>(N) * H);
-        // Gather this layer's slice of per_layer_inputs:
-        //   ple_signal[n, :] = per_layer_proj[n, l*ple_dim:(l+1)*ple_dim]
-        // The base tensor is already laid out as [N, L*ple_dim]; we
-        // pass the offset pointer to the GEMM as the "input" matrix
-        // with stride = L*ple_dim. cuBLAS row-major convention here
-        // means the kernel reads N rows of `ple_dim` cols at offset
-        // l*ple_dim within each row.
-        //
-        // ple_gate = ple_input_gate @ y_norm (using attn output in y)
-        ops::gemm_act_x_wt_bf16(cublas.handle(),
-            ws.y.data(), layer.ple_input_gate->data(), ws.norm_x.data(),
-            N, ple_dim, H);
-        dump_l0("ple_gate_pre_gelu", ws.norm_x.data(),
-                static_cast<std::size_t>(N) * ple_dim);
-        // GeGLU(tanh) but with the per-layer input acting as the "up"
-        // signal. We don't have a strided-input GeGLU kernel; instead
-        // use a temporary stride-pack: copy the layer's PLE slice into
-        // ws.norm_y so it's contiguous, then geglu over [N, ple_dim].
-        // The slice is `[N, ple_dim]` from a `[N, L*ple_dim]` buffer.
-        const std::size_t row_stride = static_cast<std::size_t>(per_layer_total);
-        const std::size_t slice_off  = static_cast<std::size_t>(l) * ple_dim;
-        for (int n = 0; n < N; ++n) {
-            // Pack PLE slice for token n into ws.norm_y[n].
-            const auto* src = per_layer_base +
-                              (n * row_stride + slice_off) * bf16_bytes;
-            auto* dst = static_cast<std::uint8_t*>(ws.norm_y.data()) +
-                        static_cast<std::size_t>(n) * ple_dim * bf16_bytes;
-            CUDA_CHECK(cudaMemcpyAsync(dst, src,
-                                       ple_dim * bf16_bytes,
-                                       cudaMemcpyDeviceToDevice, stream));
-        }
-        dump_l0("ple_signal_slice", ws.norm_y.data(),
-                static_cast<std::size_t>(N) * ple_dim);
-        kernels::launch_geglu_tanh_bf16(
-            ws.norm_x.data(), ws.norm_y.data(), ws.norm_x.data(),
-            N * ple_dim, stream);
-        dump_l0("ple_gated", ws.norm_x.data(),
-                static_cast<std::size_t>(N) * ple_dim);
-        // Project back to hidden, post-norm, add to residual.
-        ops::gemm_act_x_wt_bf16(cublas.handle(),
-            ws.norm_x.data(), layer.ple_projection->data(), ws.norm_y.data(),
-            N, H, ple_dim, /*beta=*/0.f);
-        kernels::launch_rmsnorm_bf16(
-            ws.norm_y.data(), layer.ple_norm->data(), ws.norm_y.data(),
-            N, H, eps, stream);
-        kernels::launch_residual_add_bf16(
-            ws.y.data(), ws.norm_y.data(),
-            static_cast<std::size_t>(N) * H, stream);
-        }  // end PLE-bypass guard
-
-        // Parity dump: residual stream after attention/MLP/PLE for
-        // the first few layers.
-        if (l < 4) {
-            char tag[32];
-            std::snprintf(tag, sizeof tag, "layer_%d_post_ple_y", l);
-            dbg_sync_dump_bf16(tag, ws.y.data(),
-                               static_cast<std::size_t>(N) * H);
+        if (ple_dim > 0) {
+            // Gather this layer's slice of per_layer_inputs:
+            //   ple_signal[n, :] = per_layer_proj[n, l*ple_dim:(l+1)*ple_dim]
+            // The base tensor is already laid out as [N, L*ple_dim]; we
+            // pass the offset pointer to the GEMM as the "input" matrix
+            // with stride = L*ple_dim. cuBLAS row-major convention here
+            // means the kernel reads N rows of `ple_dim` cols at offset
+            // l*ple_dim within each row.
+            //
+            // ple_gate = ple_input_gate @ y_norm (using attn output in y)
+            ops::gemm_act_x_wt_bf16(cublas.handle(),
+                ws.y.data(), layer.ple_input_gate->data(), ws.norm_x.data(),
+                N, ple_dim, H);
+            // GeGLU(tanh) but with the per-layer input acting as the "up"
+            // signal. We don't have a strided-input GeGLU kernel; instead
+            // use a temporary stride-pack: copy the layer's PLE slice into
+            // ws.norm_y so it's contiguous, then geglu over [N, ple_dim].
+            // The slice is `[N, ple_dim]` from a `[N, L*ple_dim]` buffer.
+            const std::size_t row_stride = static_cast<std::size_t>(per_layer_total);
+            const std::size_t slice_off  = static_cast<std::size_t>(l) * ple_dim;
+            for (int n = 0; n < N; ++n) {
+                // Pack PLE slice for token n into ws.norm_y[n].
+                const auto* src = per_layer_base +
+                                  (n * row_stride + slice_off) * bf16_bytes;
+                auto* dst = static_cast<std::uint8_t*>(ws.norm_y.data()) +
+                            static_cast<std::size_t>(n) * ple_dim * bf16_bytes;
+                CUDA_CHECK(cudaMemcpyAsync(dst, src,
+                                           ple_dim * bf16_bytes,
+                                           cudaMemcpyDeviceToDevice, stream));
+            }
+            kernels::launch_geglu_tanh_bf16(
+                ws.norm_x.data(), ws.norm_y.data(), ws.norm_x.data(),
+                N * ple_dim, stream);
+            // Project back to hidden, post-norm, add to residual.
+            ops::gemm_act_x_wt_bf16(cublas.handle(),
+                ws.norm_x.data(), layer.ple_projection->data(), ws.norm_y.data(),
+                N, H, ple_dim, /*beta=*/0.f);
+            kernels::launch_rmsnorm_bf16(
+                ws.norm_y.data(), layer.ple_norm->data(), ws.norm_y.data(),
+                N, H, eps, stream);
+            kernels::launch_residual_add_bf16(
+                ws.y.data(), ws.norm_y.data(),
+                static_cast<std::size_t>(N) * H, stream);
         }
 
         // ── 3d. Per-layer learnable scalar ────────────────────────────
-        if (layer.layer_scalar && getenv("PIE_NO_LAYER_SCALAR") == nullptr) {
+        if (layer.layer_scalar) {
             // Read the bf16 scalar to host once at this point. The
             // overhead is one cudaMemcpy of 2 bytes per layer per
             // fire — small enough to ignore at the scale of full
@@ -1024,15 +883,6 @@ void gemma4_forward_paged(
                     ws.y.data(), s,
                     static_cast<std::size_t>(N) * H, stream);
             }
-        }
-
-        // Post-layer_scalar dump for parity comparison against HF's
-        // `hidden_states[layer+1]` (which is after the scalar mul).
-        if (l < 4) {
-            char tag[32];
-            std::snprintf(tag, sizeof tag, "layer_%d_post_scalar_y", l);
-            dbg_sync_dump_bf16(tag, ws.y.data(),
-                               static_cast<std::size_t>(N) * H);
         }
     }
 
@@ -1048,13 +898,6 @@ void gemma4_forward_paged(
             ws.logits.data(), fwd_cfg.final_logit_softcap,
             static_cast<std::size_t>(N) * V, stream);
     }
-    dbg_sync_dump_bf16("logits_last", static_cast<const std::uint16_t*>(ws.logits.data())
-                                  + static_cast<std::size_t>(N - 1) * V,
-                  static_cast<std::size_t>(V));
-    // After the first fire, freeze the dumps so subsequent decode
-    // fires don't overwrite the prefill intermediates we want to
-    // parity-check.
-    dbg_first_fire_flag() = false;
 }
 
 }  // namespace pie_cuda_driver::model

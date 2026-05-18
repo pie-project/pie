@@ -2,9 +2,6 @@
 
 #include <cmath>
 #include <cstdint>
-#include <cstdlib>
-#include <cstring>
-#include <string>
 #include <vector>
 
 #include "arch_spec.hpp"
@@ -17,14 +14,6 @@
 // kernel launch per layer with built-in CUDA / Metal implementations.
 // Standard RMSNorms apply `(1.0 + weight)` (Gemma-style); only
 // `linear_attn.norm` (the gated SSM norm) uses bare `weight`.
-//
-// Optional debug-tap: set PIE_QWEN35_DUMP=<name> to capture an
-// intermediate tensor from layer 0 of request 0 — forward.cpp downloads
-// it and prints first 16 floats + l2. Available taps: x_r_input, embed,
-// qkv_proj, conv_out, q_post_l2, k_post_l2, v_post_conv, g, beta,
-// y_block, new_state, y_normed, gated, lin_out, ffn_pre_norm_l<N>,
-// ffn_normed_l<N>, ffn_out_l<N>, attn_out_l<N>, x_after_l<N>,
-// final_norm, sampled, logits, lm_head_w, tok_embd_w.
 
 namespace pie_portable_driver {
 
@@ -44,9 +33,7 @@ ggml_tensor* build_qwen3_5_linear_layer(
         const LayerWeights& L,
         const Hparams& h,
         ggml_tensor*  ssm_state_r,
-        ggml_tensor*  conv_state_r,
-        const char*   dbg_tap_name,
-        ggml_tensor** dbg_tap_out) {
+        ggml_tensor*  conv_state_r) {
     const std::int32_t n_kh    = h.qwen35_linear_num_k_heads;
     const std::int32_t n_vh    = h.qwen35_linear_num_v_heads;
     const std::int32_t hk      = h.qwen35_linear_k_head_dim;
@@ -189,29 +176,6 @@ ggml_tensor* build_qwen3_5_linear_layer(
     // ---- 8. Output projection.
     auto* lin_out = ggml_mul_mat(ctx, L.lin_out_proj, gated_3d);  // [hidden, n_tokens, n_seqs]
 
-    // Debug tap: route requested tensor to dbg_tap_out (one-shot).
-    if (dbg_tap_name && dbg_tap_out && !*dbg_tap_out) {
-        ggml_tensor* sel = nullptr;
-        if      (std::strcmp(dbg_tap_name, "x_r_input")       == 0) sel = x_r;
-        else if (std::strcmp(dbg_tap_name, "qkv_proj")        == 0) sel = qkv;
-        else if (std::strcmp(dbg_tap_name, "conv_out")        == 0) sel = qkv_conv;
-        else if (std::strcmp(dbg_tap_name, "q_post_l2")       == 0) sel = q;
-        else if (std::strcmp(dbg_tap_name, "k_post_l2")       == 0) sel = k;
-        else if (std::strcmp(dbg_tap_name, "v_post_conv")     == 0) sel = v;
-        else if (std::strcmp(dbg_tap_name, "g")               == 0) sel = g;
-        else if (std::strcmp(dbg_tap_name, "beta")            == 0) sel = beta_2d;
-        else if (std::strcmp(dbg_tap_name, "y_block")         == 0) sel = y_block;
-        else if (std::strcmp(dbg_tap_name, "new_state")       == 0) sel = new_state;
-        else if (std::strcmp(dbg_tap_name, "y_normed")        == 0) sel = y_normed;
-        else if (std::strcmp(dbg_tap_name, "gated")           == 0) sel = gated;
-        else if (std::strcmp(dbg_tap_name, "lin_out")         == 0) sel = lin_out;
-        if (sel) {
-            *dbg_tap_out = ggml_cont(ctx, sel);
-            ggml_set_name(*dbg_tap_out, "qwen35_dbg_tap");
-            ggml_set_output(*dbg_tap_out);
-            ggml_build_forward_expand(gf, *dbg_tap_out);
-        }
-    }
     return lin_out;
 }
 
@@ -404,10 +368,6 @@ GraphResult build_qwen3_5_graph(ggml_context* ctx,
     auto* gf = ggml_new_graph_custom(ctx, static_cast<int>(GRAPH_MAX_NODES),
                                      /*grads=*/false);
 
-    // Debug tap: env-driven, one tensor from layer 0 of request 0.
-    const char*   dbg_tap_name = std::getenv("PIE_QWEN35_DUMP");
-    ggml_tensor*  dbg_tap_out  = nullptr;
-
     // Standard inputs (slow-path: per-request masks + gathers).
     GraphInputs in = declare_graph_inputs(ctx, plan, n_total, n_req,
                                           model.supports_paged_attn_ext());
@@ -420,13 +380,6 @@ GraphResult build_qwen3_5_graph(ggml_context* ctx,
 
     // Embed.
     auto* embd = ggml_get_rows(ctx, w.tok_embd, in.tok_input);  // [hidden, n_total]
-    if (dbg_tap_name && std::strcmp(dbg_tap_name, "embed") == 0 && !dbg_tap_out) {
-        dbg_tap_out = ggml_cont(ctx, embd);
-        ggml_set_name(dbg_tap_out, "qwen35_dbg_tap_embed");
-        ggml_set_output(dbg_tap_out);
-        ggml_build_forward_expand(gf, dbg_tap_out);
-    }
-
     // Decide between batched (per-layer outer) and per-request (per-request
     // outer) shapes. Batched mode requires:
     //   (a) every request has the same n_tokens (so x reshapes to a
@@ -472,11 +425,8 @@ GraphResult build_qwen3_5_graph(ggml_context* ctx,
                     ctx, conv,
                     state.conv_kernel() - 1, state.conv_dim(), n_req,
                     conv->nb[1], conv->nb[2], 0);
-                const bool tap_here = (il == 0);
                 attn_out = build_qwen3_5_linear_layer(
-                    ctx, gf, cur, L, h, ssm_r, conv_r,
-                    tap_here ? dbg_tap_name : nullptr,
-                    tap_here ? &dbg_tap_out : nullptr);
+                    ctx, gf, cur, L, h, ssm_r, conv_r);
             } else {
                 // Full-attention layers still need per-request masks/gathers.
                 // Slice cur on ne[2]=request, run per-request, concat.
@@ -512,27 +462,6 @@ GraphResult build_qwen3_5_graph(ggml_context* ctx,
             auto* ffn_out = build_qwen3_5_ffn(ctx, cur2, L, h);
             x = ggml_add(ctx, ffn_out, ffn_in);
 
-            // Optional per-layer post-FFN tap (for MoE bring-up debugging).
-            // Set PIE_QWEN35_DUMP=x_after_l<N> or attn_out_l<N> or ffn_out_l<N>.
-            if (dbg_tap_name && !dbg_tap_out) {
-                ggml_tensor* sel = nullptr;
-                const std::string base = dbg_tap_name;
-                const std::string suffix = "_l" + std::to_string(il);
-                auto match = [&](const char* prefix) {
-                    return base == std::string(prefix) + suffix;
-                };
-                if      (match("attn_out"))     sel = attn_out;
-                else if (match("ffn_pre_norm")) sel = ffn_in;
-                else if (match("ffn_normed"))   sel = cur2;
-                else if (match("ffn_out"))      sel = ffn_out;
-                else if (match("x_after"))      sel = x;
-                if (sel) {
-                    dbg_tap_out = ggml_cont(ctx, sel);
-                    ggml_set_name(dbg_tap_out, "qwen35_dbg_tap");
-                    ggml_set_output(dbg_tap_out);
-                    ggml_build_forward_expand(gf, dbg_tap_out);
-                }
-            }
         }
         // Flatten [hidden, n_tokens, n_seqs] back to [hidden, n_total].
         finals = ggml_reshape_2d(ctx, ggml_cont(ctx, x),
@@ -582,11 +511,8 @@ GraphResult build_qwen3_5_graph(ggml_context* ctx,
                         state.conv_kernel() - 1, state.conv_dim(), 1,
                         conv->nb[1], conv->nb[2],
                         static_cast<std::size_t>(R.state_slot) * conv_slot_bytes);
-                    const bool tap_here = (r == 0 && il == 0);
                     attn_out = build_qwen3_5_linear_layer(
-                        ctx, gf, cur, L, h, ssm_r, conv_r,
-                        tap_here ? dbg_tap_name : nullptr,
-                        tap_here ? &dbg_tap_out : nullptr);
+                        ctx, gf, cur, L, h, ssm_r, conv_r);
                 } else {
                     // Full-attn function expects 2D [hidden, n_tokens].
                     auto* cur_2d = ggml_reshape_2d(ctx, cur, h.hidden_size,
@@ -627,26 +553,6 @@ GraphResult build_qwen3_5_graph(ggml_context* ctx,
     ggml_tensor* lm_head_w = h.tie_word_embeddings ? w.tok_embd : w.output_head;
     auto* logits = ggml_mul_mat(ctx, lm_head_w, sampled);
 
-    if (dbg_tap_name && !dbg_tap_out) {
-        ggml_tensor* sel = nullptr;
-        if      (std::strcmp(dbg_tap_name, "final_norm") == 0) sel = cur;
-        else if (std::strcmp(dbg_tap_name, "sampled")    == 0) sel = sampled;
-        else if (std::strcmp(dbg_tap_name, "logits")     == 0) sel = logits;
-        else if (std::strcmp(dbg_tap_name, "lm_head_w")  == 0) {
-            // Cast to F32 so the host-side dump is comparable.
-            sel = ggml_cast(ctx, lm_head_w, GGML_TYPE_F32);
-        }
-        else if (std::strcmp(dbg_tap_name, "tok_embd_w") == 0) {
-            sel = ggml_cast(ctx, w.tok_embd, GGML_TYPE_F32);
-        }
-        if (sel) {
-            dbg_tap_out = ggml_cont(ctx, sel);
-            ggml_set_name(dbg_tap_out, "qwen35_dbg_tap");
-            ggml_set_output(dbg_tap_out);
-            ggml_build_forward_expand(gf, dbg_tap_out);
-        }
-    }
-
     // Optional GPU-side sampler (mirrors graph_qwen3 fast paths). Saves
     // the ~vocab*n_slots*4-byte logits download on greedy / uniform-top-K
     // batches; the slow path materializes full logits.
@@ -684,8 +590,6 @@ GraphResult build_qwen3_5_graph(ggml_context* ctx,
     else if (plan.uniform_top_sample) { res.top_k_idx = top_k_idx; res.top_k_probs = top_k_probs; }
     else                              res.logits = logits;
     res.in = in;
-    res.debug_tensor = dbg_tap_out;
-    res.debug_name   = dbg_tap_name;
     return res;
 }
 

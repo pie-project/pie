@@ -130,34 +130,6 @@ PlanArrays extract_plan_arrays(const pie_driver::PieForwardRequestView& req) {
     a.spec_position_ids    = req.spec_position_ids.as<std::uint32_t>();
     a.spec_indptr          = req.spec_indptr.as<std::uint32_t>();
 
-    // Wire-trace, enabled via `PIE_PORTABLE_TRACE_KV=1`. Paired with
-    // the cuda trace in `driver/cuda/src/executor/executor.cpp`; together
-    // they let us diff what each driver sees per request. Low-cost
-    // diagnostic kept in tree.
-    if (std::getenv("PIE_PORTABLE_TRACE_KV")) {
-        std::cerr << "[portable-trace] req: tokens=[";
-        for (auto t : a.token_ids) std::cerr << t << ",";
-        std::cerr << "] positions=[";
-        for (auto p : a.position_ids) std::cerr << p << ",";
-        std::cerr << "] qo_indptr=[";
-        for (auto q : a.qo_indptr) std::cerr << q << ",";
-        std::cerr << "] sampling_indices=[";
-        for (auto s : a.sampling_idx) std::cerr << s << ",";
-        std::cerr << "] sampling_indptr=[";
-        for (auto s : a.sampling_indptr) std::cerr << s << ",";
-        std::cerr << "] sampler_types=[";
-        for (auto s : a.sampler_types) std::cerr << s << ",";
-        std::cerr << "] sampler_temps=[";
-        for (auto s : a.sampler_temps) std::cerr << s << ",";
-        std::cerr << "] kv_pages=[";
-        for (auto k : a.kv_page_indices) std::cerr << k << ",";
-        std::cerr << "] kv_indptr=[";
-        for (auto k : a.kv_page_indptr) std::cerr << k << ",";
-        std::cerr << "] kv_last_lens=[";
-        for (auto k : a.kv_last_lens) std::cerr << k << ",";
-        std::cerr << "]\n";
-    }
-
     a.n_request      = static_cast<std::int32_t>(a.context_ids.size());
     a.total_n_tokens = static_cast<std::int32_t>(a.token_ids.size());
     a.batch_has_drafts =

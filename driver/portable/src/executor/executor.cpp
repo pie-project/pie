@@ -775,25 +775,6 @@ std::vector<SamplerOutput> Executor::compute_(const BatchPlan& plan) {
             if (!ggml_backend_sched_alloc_graph(sched_, cache_->result.gf)) {
                 throw std::runtime_error("compute: sched_alloc_graph failed");
             }
-            // First-call sanity diagnostic: log how the scheduler
-            // partitioned the graph. With Part A's norm upcast in
-            // place + the slow_only fallback when in-graph top-k is
-            // unsupported, this should print n_splits=1 (all on
-            // primary) on Qwen3 / Llama / Gemma. Multiple splits =
-            // some op fell to CPU, which is correct but slow; worth
-            // investigating with `ggml_backend_sched_get_tensor_backend`
-            // on each graph node to find the offender.
-            static bool _printed_assignments = false;
-            if (!_printed_assignments && std::getenv("PIE_PORTABLE_LOG_SCHED")) {
-                _printed_assignments = true;
-                std::cerr << "[sched] n_splits="
-                          << ggml_backend_sched_get_n_splits(sched_)
-                          << " n_nodes=" << ggml_graph_n_nodes(cache_->result.gf)
-                          << " backend="
-                          << ggml_backend_name(model_.backend())
-                          << (model_.cpu_fallback() ? " (+CPU fallback)" : "")
-                          << "\n";
-            }
             take_us(timings_.graph_alloc_us);
         } catch (...) {
             cache_->release();
@@ -815,35 +796,6 @@ std::vector<SamplerOutput> Executor::compute_(const BatchPlan& plan) {
                                  std::to_string(static_cast<int>(status)));
     }
     take_us(timings_.compute_us);
-
-    // Debug: optional intermediate-tensor dump (set by per-arch builders
-    // when an env var is active). Prints first 16 floats + l2 norm.
-    if (g.debug_tensor && g.debug_name) {
-        const std::size_t nb = ggml_nbytes(g.debug_tensor);
-        const std::size_t n_elem = nb / sizeof(float);
-        std::vector<float> buf(n_elem);
-        ggml_backend_tensor_get(g.debug_tensor, buf.data(), 0, nb);
-        double l2 = 0.0;
-        for (auto v : buf) l2 += static_cast<double>(v) * v;
-        l2 = std::sqrt(l2);
-        std::fprintf(stderr,
-            "[qwen35-dbg] %s shape=[%lld,%lld,%lld,%lld] n=%zu l2=%.6f first16:",
-            g.debug_name,
-            (long long)g.debug_tensor->ne[0], (long long)g.debug_tensor->ne[1],
-            (long long)g.debug_tensor->ne[2], (long long)g.debug_tensor->ne[3],
-            n_elem, l2);
-        for (std::size_t i = 0; i < std::min<std::size_t>(16, n_elem); ++i) {
-            std::fprintf(stderr, " %.6f", buf[i]);
-        }
-        std::fprintf(stderr, "\n");
-        if (const char* path = std::getenv("PIE_QWEN35_DUMP_BIN")) {
-            std::FILE* f = std::fopen(path, "wb");
-            if (f) {
-                std::fwrite(buf.data(), sizeof(float), n_elem, f);
-                std::fclose(f);
-            }
-        }
-    }
 
     const std::int32_t n_slots =
         static_cast<std::int32_t>(plan.sampling_pos_i32.size());

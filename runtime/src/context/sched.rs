@@ -39,6 +39,7 @@ pub(crate) struct AdmissionDenied {
     pub total_after: f64,
     pub cap: f64,
     pub total_capacity: f64,
+    pub rounding_slack_pages: f64,
     pub oversubscription_factor: f64,
 }
 
@@ -47,11 +48,12 @@ impl fmt::Display for AdmissionDenied {
         write!(
             f,
             "admission denied: Σ endowment would become {} after adding {}, \
-             exceeding capacity × factor ({} × {} = {})",
+             exceeding capacity × factor plus page-rounding slack ({} × {} + {} = {})",
             self.total_after,
             self.endowment_pages,
             self.total_capacity,
             self.oversubscription_factor,
+            self.rounding_slack_pages,
             self.cap,
         )
     }
@@ -196,20 +198,49 @@ impl ContextManager {
             None => self.default_endowment,
         };
 
-        // Admission gate: Σ endowment ≤ total_capacity × admission_oversubscription_factor.
+        // Admission gate: Σ endowment ≤ capacity × factor + bounded page-rounding slack.
         // Each endowment unit is a claim on one page of long-run GPU residency.
-        // A denied launch simply waits until enough endowment is released for
-        // that launch. This keeps memory-bound serving in a rolling-replacement
-        // regime instead of forcing whole-cohort waves.
+        // Token budgets are rounded up to pages, so a dense cohort can be
+        // rejected only because every request paid the same final partial-page
+        // tax. Admit at most one page of slack per forward slot, capped at
+        // 1/16 of the pool, then drain saturated cohorts by full waves rather
+        // than one process at a time.
         let sigma_e: f64 = self.processes.values().map(|p| p.endowment).sum();
         let total_capacity: f64 = self.gpu_stores.iter().map(|s| s.total_pages() as f64).sum();
-        let cap = total_capacity * self.admission_oversubscription_factor;
+        let rounding_slack_pages =
+            self.admission_wave_requests
+                .min(((total_capacity / 16.0).ceil() as usize).max(1)) as f64;
+        let cap = total_capacity * self.admission_oversubscription_factor + rounding_slack_pages;
+        if self.admission_drain_barrier {
+            let wave_requests = if endowment_pages > 0.0 {
+                self.admission_wave_requests
+                    .min((cap / endowment_pages).floor().max(1.0) as usize)
+                    .max(1)
+            } else {
+                self.admission_wave_requests
+            };
+            let resume_below = (cap - endowment_pages * wave_requests as f64).max(0.0);
+            if sigma_e > resume_below {
+                return Err(AdmissionDenied {
+                    endowment_pages,
+                    total_after: sigma_e + endowment_pages,
+                    cap,
+                    total_capacity,
+                    rounding_slack_pages,
+                    oversubscription_factor: self.admission_oversubscription_factor,
+                }
+                .into());
+            }
+            self.admission_drain_barrier = false;
+        }
         if sigma_e + endowment_pages > cap {
+            self.admission_drain_barrier = true;
             return Err(AdmissionDenied {
                 endowment_pages,
                 total_after: sigma_e + endowment_pages,
                 cap,
                 total_capacity,
+                rounding_slack_pages,
                 oversubscription_factor: self.admission_oversubscription_factor,
             }
             .into());
@@ -1429,38 +1460,39 @@ mod tests {
     // Phase 3: Admission gate (Σ endowment ≤ capacity × admission_oversubscription_factor)
     // =============================================================================
 
-    /// At factor = 1.0, exactly `capacity` pages worth of endowment fits.
-    /// The N+1th page pushes Σ over the cap and is rejected.
+    /// At factor = 1.0, capacity plus bounded page-rounding slack fits.
+    /// The next page pushes Σ over the effective cap and is rejected.
     #[test]
     fn admission_gate_at_factor_1_enforces_capacity() {
-        // 10 pages total, strict (factor = 1.0).
+        // 10 pages total plus 1 page of slack from a single forward slot.
         let mut mgr = ContextManager::new(0, 16, &[10], &[10], 1, 1, None, 1.0, 0.85);
 
-        // 10 processes of 1 endowment-page each fit exactly.
-        for _ in 0..10 {
+        // 11 processes of 1 endowment-page each fit exactly.
+        for _ in 0..11 {
             mgr.register_process(ProcessId::new_v4(), Some(16)).unwrap();
         }
-        // The 11th process pushes Σ = 11 over cap = 10.
-        let eleventh = ProcessId::new_v4();
-        let err = mgr.register_process(eleventh, Some(16)).unwrap_err();
+        // The 12th process pushes Σ over the effective cap.
+        let twelfth = ProcessId::new_v4();
+        let err = mgr.register_process(twelfth, Some(16)).unwrap_err();
         assert!(
             err.to_string().contains("admission denied"),
             "expected admission-denied error, got: {err}"
         );
         // Rejected process must not have been inserted.
-        assert!(!mgr.processes.contains_key(&eleventh));
+        assert!(!mgr.processes.contains_key(&twelfth));
     }
 
-    /// At factor = 2.0, the cap is 2× physical capacity.
+    /// At factor = 2.0, the cap is 2× physical capacity plus the same
+    /// bounded page-rounding slack.
     #[test]
     fn admission_gate_overbook_factor_scales_cap() {
         let mut mgr = ContextManager::new(0, 16, &[10], &[10], 1, 1, None, 2.0, 0.85);
 
-        // 20 processes at 1 page each = 20 endowment ≤ 20 cap. All admit.
-        for _ in 0..20 {
+        // 21 processes at 1 page each = 21 endowment ≤ 20 + 1 cap.
+        for _ in 0..21 {
             mgr.register_process(ProcessId::new_v4(), Some(16)).unwrap();
         }
-        // 21st rejected.
+        // 22nd rejected.
         assert!(mgr.register_process(ProcessId::new_v4(), Some(16)).is_err());
     }
 
@@ -1470,7 +1502,7 @@ mod tests {
     fn admission_frees_budget_on_unregister() {
         let mut mgr = ContextManager::new(0, 16, &[10], &[10], 1, 1, None, 1.0, 0.85);
 
-        let pids: Vec<_> = (0..10)
+        let pids: Vec<_> = (0..11)
             .map(|_| {
                 let pid = ProcessId::new_v4();
                 mgr.register_process(pid, Some(16)).unwrap();
@@ -1489,14 +1521,33 @@ mod tests {
             .expect("admission should succeed after unregister");
     }
 
-    /// After saturation, admission resumes as soon as one process's endowment
-    /// fits again. This keeps memory-bound serving in a rolling-replacement
-    /// regime instead of forcing whole-cohort waves.
+    /// Page-rounding slack admits a near-fit cohort whose token budgets have
+    /// each rounded up to the next KV page.
     #[test]
-    fn admission_denial_resumes_when_one_endowment_fits() {
+    fn admission_rounding_slack_admits_near_fit_cohort() {
+        // 15 physical pages, 4 forward slots => slack min(4, ceil(15 / 16)) = 1.
+        // Four 4-page budgets fit exactly in the effective cap of 16 pages.
+        let mut mgr = ContextManager::new(0, 16, &[15], &[15], 4, 1, None, 1.0, 0.85);
+        for _ in 0..4 {
+            mgr.register_process(ProcessId::new_v4(), Some(16 * 4))
+                .unwrap();
+        }
+        assert!(
+            mgr.register_process(ProcessId::new_v4(), Some(16 * 4))
+                .is_err()
+        );
+    }
+
+    /// After saturation, admission drains until the largest full wave that fits
+    /// in the effective cap can be admitted. This avoids one-at-a-time tail
+    /// refills after a saturated long-running cohort.
+    #[test]
+    fn admission_denial_drains_until_effective_wave_fits() {
         let mut mgr = ContextManager::new(0, 16, &[10], &[10], 4, 1, None, 1.0, 0.85);
 
-        let pids: Vec<_> = (0..10)
+        // Effective cap is 11 pages. Once denied, the restore wave is 4 one-page
+        // requests, so admission resumes only when Σ endowment <= 7.
+        let pids: Vec<_> = (0..11)
             .map(|_| {
                 let pid = ProcessId::new_v4();
                 mgr.register_process(pid, Some(16)).unwrap();
@@ -1506,8 +1557,16 @@ mod tests {
         assert!(mgr.register_process(ProcessId::new_v4(), Some(16)).is_err());
 
         mgr.unregister_process(pids[0]);
+        assert!(
+            mgr.register_process(ProcessId::new_v4(), Some(16)).is_err(),
+            "one freed slot should not trickle-admit after a saturation denial"
+        );
+
+        for pid in &pids[1..4] {
+            mgr.unregister_process(*pid);
+        }
         mgr.register_process(ProcessId::new_v4(), Some(16))
-            .expect("admission should resume once one endowment fits");
+            .expect("admission should resume once a full effective wave fits");
     }
 
     /// Capacity is summed across drivers — endowment competes against the
@@ -1515,8 +1574,8 @@ mod tests {
     #[test]
     fn admission_cap_is_sum_across_devices() {
         let mut mgr = ContextManager::new(0, 16, &[5, 5], &[5, 5], 1, 1, None, 1.0, 0.85);
-        // 10 pages total across 2 drivers.
-        for _ in 0..10 {
+        // 10 pages total across 2 drivers plus 1 slack page.
+        for _ in 0..11 {
             mgr.register_process(ProcessId::new_v4(), Some(16)).unwrap();
         }
         assert!(mgr.register_process(ProcessId::new_v4(), Some(16)).is_err());

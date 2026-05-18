@@ -51,8 +51,7 @@ NcclComm::NcclComm(int world_size, int rank, const ncclUniqueId& uid)
     // persistent 100% GPU-utilization spin. Use NCCL's blocking mode so idle
     // collectives sleep instead of burning a device while rank 0 is between
     // requests or still publishing readiness.
-    const char* blocking_env = std::getenv("PIE_NCCL_BLOCKING");
-    config.blocking = (blocking_env && std::string(blocking_env) == "0") ? 0 : 1;
+    config.blocking = 1;
     NCCL_CHECK(ncclCommInitRankConfig(&comm_, world_size, uid, rank, &config));
 }
 

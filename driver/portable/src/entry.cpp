@@ -465,11 +465,6 @@ int run_impl(int argc,
         std::cerr << "[pie-driver-portable] shutting down (handled " << handled
                   << " requests)\n";
     }
-    // Print per-stage timings on demand (e.g. e2e benchmarks). Default
-    // off so production logs stay quiet.
-    if (std::getenv("PIE_PORTABLE_LOG_TIMINGS")) {
-        executor.log_timings("shmem-loop");
-    }
     return 0;
 }
 

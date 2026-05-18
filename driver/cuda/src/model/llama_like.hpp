@@ -72,6 +72,9 @@ struct LlamaLikeForwardCfg {
     // ~1.3× per-step latency vs the dedicated decode kernel.
     bool force_prefill_path = false;
     bool decode_plan_cuda_graph = true;
+    bool use_prefill_decode_plan = false;
+    int prefill_decode_full_attention_min_requests = 0;
+    int prefill_decode_min_kv_pages = 0;
 
     // Tensor-parallel state. `tp_size = 1` (default) keeps the original
     // single-GPU forward; `tp_size > 1` activates the sharded GEMM dims
@@ -94,6 +97,8 @@ struct LlamaLikeForwardCfg {
 // graph capture region — no host-side work, no allocations.
 struct LlamaLikePlanState {
     ops::DecodePlanCachePtr decode_plan;
+    ops::PrefillPlanCachePtr prefill_decode_plan;
+    bool use_prefill_decode_plan = false;
 };
 
 // Refresh the decode plan for the current fire. Caller invokes this
