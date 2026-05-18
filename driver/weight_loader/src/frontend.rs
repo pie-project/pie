@@ -43,6 +43,7 @@ fn lower_contract(
 ) -> Result<(crate::types::ExprId, crate::types::ExprId), CompileError> {
     let (mut current, mut current_decl) =
         lower_contract_source(metadata, graph, contract, plan, contract_values, output_id)?;
+    let metadata_values = lower_metadata_sources(metadata, contract, plan)?;
     if current_decl.shape != contract.shape {
         return Err(CompileError::InvalidInput(format!(
             "runtime tensor '{}' shape {:?} does not match source shape {:?}",
@@ -77,7 +78,7 @@ fn lower_contract(
         current_decl = decl;
     }
 
-    current = lower_encoding_change(plan, current, &mut current_decl, contract)?;
+    current = lower_encoding_change(plan, current, &metadata_values, &mut current_decl, contract)?;
 
     let target_layout = contract.layout.clone();
     if current_decl.layout != target_layout || current_decl.alignment != contract.alignment {
@@ -117,6 +118,27 @@ fn lower_contract(
         decl: current_decl,
     });
     Ok((value, realized))
+}
+
+fn lower_metadata_sources(
+    metadata: &CheckpointMetadata,
+    contract: &RuntimeTensorContract,
+    plan: &mut LayoutPlan,
+) -> Result<Vec<crate::types::ExprId>, CompileError> {
+    let mut values = Vec::with_capacity(contract.metadata.len());
+    for tensor_id in &contract.metadata {
+        let raw = metadata.tensor(*tensor_id).ok_or_else(|| {
+            CompileError::InvalidInput(format!(
+                "runtime tensor '{}' references missing metadata tensor {}",
+                contract.output_name, tensor_id.0
+            ))
+        })?;
+        values.push(plan.push(LayoutExpr::Source {
+            tensor: raw.id,
+            decl: source_decl(raw),
+        }));
+    }
+    Ok(values)
 }
 
 fn lower_contract_source(
@@ -293,6 +315,7 @@ fn contract_decl(contract: &RuntimeTensorContract, output_id: TensorId) -> Tenso
 fn lower_encoding_change(
     plan: &mut LayoutPlan,
     input: crate::types::ExprId,
+    metadata: &[crate::types::ExprId],
     current_decl: &mut TensorDecl,
     contract: &RuntimeTensorContract,
 ) -> Result<crate::types::ExprId, CompileError> {
@@ -319,7 +342,7 @@ fn lower_encoding_change(
             Ok(plan.push(LayoutExpr::Decode {
                 scheme: source.scheme,
                 data: input,
-                metadata: Vec::new(),
+                metadata: metadata.to_vec(),
                 decl,
             }))
         }
@@ -342,7 +365,7 @@ fn lower_encoding_change(
                 from: source.scheme,
                 to: target.scheme,
                 data: input,
-                metadata: Vec::new(),
+                metadata: metadata.to_vec(),
                 metadata_outputs: Vec::new(),
                 decl,
             }))

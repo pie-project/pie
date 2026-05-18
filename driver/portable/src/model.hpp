@@ -507,6 +507,11 @@ private:
         // mantissa bits. See `is_small_weight_for_upcast()` for the
         // norms/biases that stay F32.
         bool         downcast_f32_to_bf16 = false;
+        // FP8 checkpoints store projection weights as raw E4M3 bytes plus
+        // a scalar or per-row scale tensor. Runtime ggml matmuls consume
+        // BF16 here, so the loader lowers this as Decode(FP8, scale).
+        bool         decode_fp8_to_bf16 = false;
+        std::string  fp8_scale_hf_name;
     };
     std::vector<DeclaredTensor> declared_;
 

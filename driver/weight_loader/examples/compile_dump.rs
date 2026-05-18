@@ -80,6 +80,7 @@ fn synthetic_abi(tensors: u32) -> RuntimeAbi {
             .map(|id| RuntimeTensorContract {
                 output_name: format!("runtime.layers.{id}.weight"),
                 source: RuntimeTensorSource::DirectTensor(TensorId(id)),
+                metadata: Vec::new(),
                 dtype: DType::BF16,
                 encoding: Encoding::Raw(DType::BF16),
                 shape: vec![64, 64],

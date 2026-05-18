@@ -900,8 +900,18 @@ Current Rust implementation status:
   fused slices, stacked expert writes, source/destination offset writes, and
   GGUF-style byte passthrough now lower to ordinary `ExtentWrite`
   instructions instead of model-family compatibility code.
+- Added explicit runtime metadata tensors to the ABI. Quantized source tensors
+  now lower as `Decode(data, metadata)` rather than relying on executor-side
+  name conventions; portable FP8 checkpoints use this for scalar and per-row
+  scale tensors.
 - Updated the CUDA Rust executor to honor compiled physical file offsets for
   compact `ExtentWrite` instructions via safetensors byte-range copies.
+- Extended the portable Rust executor with CPU temporary buffers and executable
+  `TileMap::Decode` for FP8_E4M3 -> BF16, so metadata-backed transforms run
+  from the compiled storage program.
+- Fixed GGUF declaration policy so tensors with `ggml_type_override` keep the
+  GGUF-owned runtime type instead of passing through safetensors F32/BF16
+  cast heuristics.
 - Kept generated portable constants outside checkpoint coverage: synthesized
   tensors are produced by the runtime and copied after Rust materializes all
   checkpoint-backed weights.
@@ -928,10 +938,19 @@ Current e2e smoke evidence:
   smoke passed.
 - Portable ggml, `PIE_PORTABLE_LOADER_PLANNER=rust`,
   `allenai/Olmo-3-7B-Instruct`: 355/355 contracts, one-token smoke passed.
+- Portable ggml, `PIE_PORTABLE_LOADER_PLANNER=rust`,
+  `RedHatAI/Qwen3-0.6B-FP8-dynamic`: 311/311 contracts,
+  metadata-backed FP8 decode smoke passed.
+- Portable ggml, `PIE_PORTABLE_LOADER_PLANNER=rust`,
+  `mistralai/Ministral-3-3B-Instruct-2512`: 236/236 contracts,
+  static FP8 `weight_scale_inv` decode smoke passed.
+- Portable ggml offline driver runner, `PIE_PORTABLE_LOADER_PLANNER=rust`,
+  `unsloth/Qwen3-0.6B-GGUF`: Q4_K_M, Q5_K_M, and Q8_0 all loaded as
+  310/310-contract Rust storage programs and completed one-token generation.
 
-Remaining cutover work is intentionally coverage-side integration: expanding
-runtime ABI contracts for quantized portable paths that the existing portable
-runtime itself does not yet execute (for example safetensors FP8 in Ministral
-3), exercising actual GGUF Q4/Q5/Q8 model files, and running the very large MoE
-families where host/GPU memory permits. Once those pass, remove the remaining
-C++ planner/executor fallback windows.
+Remaining cutover work is now concentrated on large-model and production
+evidence: running the very large MoE families where host/GPU memory permits,
+checking CUDA Rust execution on the same coverage matrix, broadening quantized
+executor kernels beyond FP8/MXFP4/AWQ/GPTQ reference paths, and removing the
+remaining C++ planner/executor fallback windows once the CUDA and portable
+matrices both stay green.

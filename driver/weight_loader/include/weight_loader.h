@@ -228,6 +228,7 @@ struct PieLoaderRuntimeTensorContractView {
   uint32_t source_tensor_id;
   PieLoaderU32Slice source_tensor_ids;
   PieLoaderRuntimeByteSpanSlice byte_spans;
+  PieLoaderU32Slice metadata_tensor_ids;
   uint32_t source_contract_id;
   PieLoaderSemanticRole semantic_role;
   uint32_t layer;

@@ -18,6 +18,7 @@ pub struct RuntimeAbi {
 pub struct RuntimeTensorContract {
     pub output_name: String,
     pub source: RuntimeTensorSource,
+    pub metadata: Vec<TensorId>,
     pub dtype: DType,
     pub encoding: Encoding,
     pub shape: Vec<i64>,
@@ -118,6 +119,13 @@ impl RuntimeTensorContract {
         Ok(Self {
             output_name: output_name.clone(),
             source: runtime_source(view)?,
+            metadata: ffi_u32_slice(
+                view.metadata_tensor_ids,
+                "runtime_tensor.metadata_tensor_ids",
+            )?
+            .into_iter()
+            .map(TensorId)
+            .collect(),
             dtype,
             encoding,
             shape,

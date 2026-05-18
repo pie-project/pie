@@ -110,6 +110,7 @@ fn dense_contract_lowers_to_storage_program() {
         source_tensor_id: 7,
         source_tensor_ids: PieLoaderU32Slice::default(),
         byte_spans: Default::default(),
+        metadata_tensor_ids: PieLoaderU32Slice::default(),
         source_contract_id: u32::MAX,
         semantic_role: PieLoaderSemanticRole::DirectTensor,
         layer: 0,
@@ -214,6 +215,7 @@ fn cast_contract_lowers_to_source_tile_map() {
         source_tensor_id: 0,
         source_tensor_ids: PieLoaderU32Slice::default(),
         byte_spans: Default::default(),
+        metadata_tensor_ids: PieLoaderU32Slice::default(),
         source_contract_id: u32::MAX,
         semantic_role: PieLoaderSemanticRole::DirectTensor,
         layer: 0,
@@ -246,6 +248,106 @@ fn cast_contract_lowers_to_source_tile_map() {
     assert_eq!(instrs[1].source.span_bytes, 8);
     assert_eq!(view.memory.checkpoint_read_bytes, 8);
     assert_eq!(view.memory.device_write_bytes, 4);
+
+    unsafe {
+        pie_loader_program_free(handle);
+        pie_loader_error_free(&mut error);
+    }
+}
+
+#[test]
+fn fp8_quant_contract_lowers_to_decode_with_metadata() {
+    let file_path = bytes("model.safetensors");
+    let weight_name = bytes("linear.weight");
+    let scale_name = bytes("linear.weight_scale_inv");
+    let output_name = bytes("runtime.linear.weight");
+    let weight_shape_values = [2_i64, 4_i64];
+    let scale_shape_values: [i64; 0] = [];
+    let weight_shape = PieLoaderI64Slice {
+        ptr: weight_shape_values.as_ptr(),
+        len: weight_shape_values.len(),
+    };
+    let scale_shape = PieLoaderI64Slice {
+        ptr: scale_shape_values.as_ptr(),
+        len: scale_shape_values.len(),
+    };
+    let files = [PieLoaderCheckpointFileView {
+        id: 0,
+        path: file_path,
+        size_bytes: 72,
+        format: PieLoaderCheckpointFormat::Safetensors,
+    }];
+    let tensors = [
+        PieLoaderCheckpointTensorView {
+            id: 0,
+            name: weight_name,
+            file_id: 0,
+            file_offset: 64,
+            span_bytes: 8,
+            dtype: PieLoaderDType::BF16,
+            encoding_kind: PieLoaderEncodingKind::Quant,
+            quant_scheme: PieLoaderQuantScheme::Fp8E4M3,
+            shape: weight_shape,
+        },
+        PieLoaderCheckpointTensorView {
+            id: 1,
+            name: scale_name,
+            file_id: 0,
+            file_offset: 72,
+            span_bytes: 2,
+            dtype: PieLoaderDType::BF16,
+            encoding_kind: PieLoaderEncodingKind::Raw,
+            quant_scheme: PieLoaderQuantScheme::None,
+            shape: scale_shape,
+        },
+    ];
+    let metadata_ids = [1_u32];
+    let contracts = [PieLoaderRuntimeTensorContractView {
+        output_name,
+        source_kind: PieLoaderRuntimeSourceKind::DirectTensor,
+        source_tensor_id: 0,
+        source_tensor_ids: PieLoaderU32Slice::default(),
+        byte_spans: Default::default(),
+        metadata_tensor_ids: PieLoaderU32Slice {
+            ptr: metadata_ids.as_ptr(),
+            len: metadata_ids.len(),
+        },
+        source_contract_id: u32::MAX,
+        semantic_role: PieLoaderSemanticRole::DirectTensor,
+        layer: 0,
+        has_layer: false,
+        expert: 0,
+        has_expert: false,
+        axis: -1,
+        start: 0,
+        length: 0,
+        dtype: PieLoaderDType::BF16,
+        encoding_kind: PieLoaderEncodingKind::Raw,
+        quant_scheme: PieLoaderQuantScheme::None,
+        shape: weight_shape,
+        alignment: 1,
+        shard_axis: -1,
+    }];
+    let input = compile_input(&files, &tensors, &contracts);
+
+    let mut handle: *mut PieLoaderProgramHandle = ptr::null_mut();
+    let mut error = PieLoaderError::default();
+    let status = unsafe { pie_loader_compile(&input, &mut handle, &mut error) };
+    assert_eq!(status, PieLoaderStatus::Ok, "{}", error_message(&error));
+    let view = unsafe { pie_loader_program_view(handle) };
+    let instrs = unsafe { std::slice::from_raw_parts(view.instrs.ptr, view.instrs.len) };
+    assert_eq!(instrs.len(), 5);
+    assert_eq!(instrs[1].kind, PieLoaderStorageInstrKind::Allocate);
+    assert_eq!(instrs[2].kind, PieLoaderStorageInstrKind::ExtentWrite);
+    assert_eq!(instrs[3].kind, PieLoaderStorageInstrKind::TileMap);
+    assert_eq!(instrs[3].tile_kind, PieLoaderTileMapKind::Decode);
+    assert_eq!(instrs[3].transform_from, PieLoaderQuantScheme::Fp8E4M3);
+    assert_eq!(instrs[3].input_buffers.len, 1);
+    assert!(instrs[3].has_source);
+    assert_eq!(instrs[3].source.file_offset, 64);
+    assert_eq!(instrs[3].source.span_bytes, 8);
+    assert_eq!(view.memory.checkpoint_read_bytes, 10);
+    assert_eq!(view.memory.device_write_bytes, 18);
 
     unsafe {
         pie_loader_program_free(handle);
@@ -287,6 +389,7 @@ fn semantic_role_contract_resolves_source_tensor() {
         source_tensor_id: u32::MAX,
         source_tensor_ids: PieLoaderU32Slice::default(),
         byte_spans: Default::default(),
+        metadata_tensor_ids: PieLoaderU32Slice::default(),
         source_contract_id: u32::MAX,
         semantic_role: PieLoaderSemanticRole::TokenEmbedding,
         layer: 0,

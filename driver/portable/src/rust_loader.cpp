@@ -2,8 +2,10 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cmath>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <deque>
 #include <filesystem>
 #include <fstream>
@@ -241,6 +243,19 @@ public:
         };
     }
 
+    std::uint32_t intern_u32_slice(std::vector<std::uint32_t> values) {
+        u32_slices_.push_back(std::move(values));
+        return static_cast<std::uint32_t>(u32_slices_.size() - 1);
+    }
+
+    pie_weight_loader::PieLoaderU32Slice u32_slice(std::uint32_t id) const noexcept {
+        const auto& value = u32_slices_[id];
+        return pie_weight_loader::PieLoaderU32Slice{
+            .ptr = value.data(),
+            .len = value.size(),
+        };
+    }
+
     void set_model(const Hparams& hp) {
         model_type_ = intern_string(hp.hf_model_type);
         quant_method_ = intern_string(std::string{});
@@ -301,6 +316,39 @@ public:
                         pie_weight_loader::PieLoaderDType dtype,
                         std::vector<std::int64_t> tensor_shape,
                         std::uint64_t span_bytes) {
+        add_checkpoint_tensor(
+            id,
+            std::move(name),
+            dtype,
+            pie_weight_loader::PieLoaderEncodingKind::Raw,
+            pie_weight_loader::PieLoaderQuantScheme::None,
+            std::move(tensor_shape),
+            span_bytes);
+    }
+
+    void add_quant_tensor(std::uint32_t id,
+                          std::string name,
+                          pie_weight_loader::PieLoaderDType logical_dtype,
+                          pie_weight_loader::PieLoaderQuantScheme scheme,
+                          std::vector<std::int64_t> tensor_shape,
+                          std::uint64_t span_bytes) {
+        add_checkpoint_tensor(
+            id,
+            std::move(name),
+            logical_dtype,
+            pie_weight_loader::PieLoaderEncodingKind::Quant,
+            scheme,
+            std::move(tensor_shape),
+            span_bytes);
+    }
+
+    void add_checkpoint_tensor(std::uint32_t id,
+                               std::string name,
+                               pie_weight_loader::PieLoaderDType dtype,
+                               pie_weight_loader::PieLoaderEncodingKind encoding_kind,
+                               pie_weight_loader::PieLoaderQuantScheme quant_scheme,
+                               std::vector<std::int64_t> tensor_shape,
+                               std::uint64_t span_bytes) {
         const auto name_id = intern_string(std::move(name));
         const auto shape_id = intern_shape(std::move(tensor_shape));
         tensors_.push_back(pie_weight_loader::PieLoaderCheckpointTensorView{
@@ -310,24 +358,28 @@ public:
             .file_offset = 0,
             .span_bytes = span_bytes,
             .dtype = dtype,
-            .encoding_kind = pie_weight_loader::PieLoaderEncodingKind::Raw,
-            .quant_scheme = pie_weight_loader::PieLoaderQuantScheme::None,
+            .encoding_kind = encoding_kind,
+            .quant_scheme = quant_scheme,
             .shape = shape(shape_id),
         });
     }
 
     void add_direct_contract(std::string output_name,
                              std::uint32_t source_tensor_id,
+                             std::vector<std::uint32_t> metadata_tensor_ids,
                              pie_weight_loader::PieLoaderDType dtype,
                              std::vector<std::int64_t> tensor_shape) {
         const auto name_id = intern_string(std::move(output_name));
         const auto shape_id = intern_shape(std::move(tensor_shape));
+        const auto metadata_id =
+            intern_u32_slice(std::move(metadata_tensor_ids));
         contracts_.push_back(pie_weight_loader::PieLoaderRuntimeTensorContractView{
             .output_name = bytes(name_id),
             .source_kind = pie_weight_loader::PieLoaderRuntimeSourceKind::DirectTensor,
             .source_tensor_id = source_tensor_id,
             .source_tensor_ids = {},
             .byte_spans = {},
+            .metadata_tensor_ids = u32_slice(metadata_id),
             .source_contract_id = UINT32_MAX,
             .semantic_role = pie_weight_loader::PieLoaderSemanticRole::DirectTensor,
             .layer = 0,
@@ -365,6 +417,7 @@ public:
                 .ptr = stored_spans.data(),
                 .len = stored_spans.size(),
             },
+            .metadata_tensor_ids = {},
             .source_contract_id = UINT32_MAX,
             .semantic_role = pie_weight_loader::PieLoaderSemanticRole::DirectTensor,
             .layer = 0,
@@ -394,6 +447,7 @@ private:
 
     std::deque<std::string> strings_;
     std::deque<std::vector<std::int64_t>> shapes_;
+    std::deque<std::vector<std::uint32_t>> u32_slices_;
     std::vector<pie_weight_loader::PieLoaderCheckpointFileView> files_;
     std::vector<pie_weight_loader::PieLoaderCheckpointTensorView> tensors_;
     std::deque<std::vector<pie_weight_loader::PieLoaderRuntimeByteSpanView>> byte_spans_;
@@ -421,6 +475,8 @@ struct ContractCandidate {
     std::size_t src_offset_bytes = 0;
     std::size_t copy_bytes = 0;
     std::size_t dst_offset_bytes = 0;
+    bool decode_fp8_to_bf16 = false;
+    std::string fp8_scale_hf_name;
 };
 
 RustProgram compile_program(const pie_weight_loader::PieLoaderCompileInput& input) {
@@ -474,10 +530,19 @@ CompileResult compile_from_candidates(
     enum class SourceMode {
         Typed,
         Bytes,
+        QuantFp8,
     };
 
     auto source_key = [](const std::string& name, SourceMode mode) {
-        return name + (mode == SourceMode::Typed ? "\n typed" : "\n bytes");
+        switch (mode) {
+            case SourceMode::Typed:
+                return name + "\n typed";
+            case SourceMode::Bytes:
+                return name + "\n bytes";
+            case SourceMode::QuantFp8:
+                return name + "\n quant-fp8";
+        }
+        return name;
     };
 
     auto source_id_for = [&](const std::string& name,
@@ -493,6 +558,11 @@ CompileResult compile_from_candidates(
         if (mode == SourceMode::Typed) {
             if (tensor->ggml_type_override >= 0) return std::nullopt;
             if (!dtype_from_st(tensor->dtype)) return std::nullopt;
+        } else if (mode == SourceMode::QuantFp8) {
+            if (tensor->ggml_type_override >= 0 ||
+                tensor->dtype != StDtype::F8_E4M3) {
+                return std::nullopt;
+            }
         }
         const auto id = static_cast<std::uint32_t>(source_ids.size());
         source_ids.emplace(key, id);
@@ -503,6 +573,14 @@ CompileResult compile_from_candidates(
                 name,
                 pie_weight_loader::PieLoaderDType::U8,
                 {static_cast<std::int64_t>(tensor->nbytes)},
+                static_cast<std::uint64_t>(tensor->nbytes));
+        } else if (mode == SourceMode::QuantFp8) {
+            input.add_quant_tensor(
+                id,
+                name,
+                pie_weight_loader::PieLoaderDType::BF16,
+                pie_weight_loader::PieLoaderQuantScheme::Fp8E4M3,
+                tensor->shape,
                 static_cast<std::uint64_t>(tensor->nbytes));
         } else {
             const auto dtype = dtype_from_st(tensor->dtype);
@@ -531,8 +609,35 @@ CompileResult compile_from_candidates(
             if (d.copy_bytes == 0 && d.dst_offset_bytes == 0 &&
                 d.src_offset_bytes == 0) {
                 const auto* src = archive.find(d.hf_name);
-                const auto source_id = source_id_for(d.hf_name, SourceMode::Typed);
                 const auto dtype = dtype_from_ggml(target->type);
+                if (src != nullptr && dtype && d.decode_fp8_to_bf16 &&
+                    target->type == GGML_TYPE_BF16) {
+                    const auto source_id =
+                        source_id_for(d.hf_name, SourceMode::QuantFp8);
+                    std::vector<std::uint32_t> metadata_ids;
+                    if (!d.fp8_scale_hf_name.empty()) {
+                        const auto scale_id =
+                            source_id_for(d.fp8_scale_hf_name, SourceMode::Typed);
+                        if (!scale_id) {
+                            throw std::runtime_error(
+                                "portable rust loader: missing FP8 scale tensor '" +
+                                d.fp8_scale_hf_name + "'");
+                        }
+                        metadata_ids.push_back(*scale_id);
+                    }
+                    if (source_id) {
+                        input.add_direct_contract(
+                            output,
+                            *source_id,
+                            std::move(metadata_ids),
+                            *dtype,
+                            shape_from_ggml(target));
+                        targets.emplace(output, target);
+                        ++emitted;
+                        continue;
+                    }
+                }
+                const auto source_id = source_id_for(d.hf_name, SourceMode::Typed);
                 if (src != nullptr && source_id && dtype) {
                     const bool cast_ok =
                         same_dtype(src->dtype, target->type) ||
@@ -542,6 +647,7 @@ CompileResult compile_from_candidates(
                         input.add_direct_contract(
                             output,
                             *source_id,
+                            {},
                             *dtype,
                             shape_from_ggml(target));
                         targets.emplace(output, target);
@@ -651,6 +757,75 @@ const pie_weight_loader::PieLoaderTensorDeclView& tensor_decl(
     throw std::runtime_error("portable rust loader: tensor id out of range");
 }
 
+std::uint16_t bf16_from_f32(float x) {
+    std::uint32_t bits;
+    std::memcpy(&bits, &x, sizeof(bits));
+    return static_cast<std::uint16_t>(bits >> 16);
+}
+
+float bf16_to_f32(std::uint16_t bits) {
+    const std::uint32_t widened = static_cast<std::uint32_t>(bits) << 16;
+    float out;
+    std::memcpy(&out, &widened, sizeof(out));
+    return out;
+}
+
+float fp16_to_f32(std::uint16_t h) {
+    const std::uint32_t sign = (static_cast<std::uint32_t>(h & 0x8000)) << 16;
+    int exp = (h >> 10) & 0x1f;
+    std::uint32_t mant = h & 0x03ff;
+    std::uint32_t bits = 0;
+    if (exp == 0) {
+        if (mant == 0) {
+            bits = sign;
+        } else {
+            exp = 1;
+            while ((mant & 0x0400) == 0) {
+                mant <<= 1;
+                --exp;
+            }
+            mant &= 0x03ff;
+            bits = sign |
+                (static_cast<std::uint32_t>(exp + (127 - 15)) << 23) |
+                (mant << 13);
+        }
+    } else if (exp == 0x1f) {
+        bits = sign | 0x7f800000u | (mant << 13);
+    } else {
+        bits = sign |
+            (static_cast<std::uint32_t>(exp + (127 - 15)) << 23) |
+            (mant << 13);
+    }
+    float out;
+    std::memcpy(&out, &bits, sizeof(out));
+    return out;
+}
+
+float f8_e4m3fn_to_f32(std::uint8_t v) {
+    const float sign = (v & 0x80) ? -1.0f : 1.0f;
+    const int exp = (v >> 3) & 0x0f;
+    const int mant = v & 0x07;
+    if (exp == 0 && mant == 0) return sign * 0.0f;
+    if (exp == 0) {
+        return sign * std::ldexp(static_cast<float>(mant) / 8.0f, -6);
+    }
+    if (exp == 0x0f && mant == 0x07) return 0.0f;
+    return sign * std::ldexp(1.0f + static_cast<float>(mant) / 8.0f, exp - 7);
+}
+
+float scalar_to_f32(const std::uint8_t* data, std::size_t index, StDtype dtype) {
+    if (dtype == StDtype::F32) {
+        return reinterpret_cast<const float*>(data)[index];
+    }
+    if (dtype == StDtype::BF16) {
+        return bf16_to_f32(reinterpret_cast<const std::uint16_t*>(data)[index]);
+    }
+    if (dtype == StDtype::F16) {
+        return fp16_to_f32(reinterpret_cast<const std::uint16_t*>(data)[index]);
+    }
+    throw std::runtime_error("portable rust loader: unsupported scale element size");
+}
+
 class Executor {
 public:
     Executor(WeightArchive& archive,
@@ -689,6 +864,13 @@ public:
     }
 
 private:
+    struct BufferEntry {
+        ggml_tensor* tensor = nullptr;
+        std::vector<std::uint8_t> bytes;
+        std::optional<StDtype> source_dtype;
+        std::vector<std::int64_t> source_shape;
+    };
+
     const StTensor& source_tensor(std::uint32_t id) const {
         if (id >= source_names_.size()) {
             throw std::runtime_error("portable rust loader: source tensor id out of range");
@@ -696,20 +878,69 @@ private:
         return archive_.at(source_names_[id]);
     }
 
-    ggml_tensor* target_for_buffer(std::uint32_t buffer) const {
+    const BufferEntry& buffer_entry(std::uint32_t buffer) const {
         const auto it = buffers_.find(buffer);
         if (it == buffers_.end()) {
-            throw std::runtime_error("portable rust loader: target buffer missing");
+            throw std::runtime_error("portable rust loader: buffer missing");
         }
         return it->second;
+    }
+
+    BufferEntry& buffer_entry(std::uint32_t buffer) {
+        const auto it = buffers_.find(buffer);
+        if (it == buffers_.end()) {
+            throw std::runtime_error("portable rust loader: buffer missing");
+        }
+        return it->second;
+    }
+
+    std::size_t buffer_bytes(const BufferEntry& entry) const {
+        if (entry.tensor != nullptr) return ggml_nbytes(entry.tensor);
+        return entry.bytes.size();
+    }
+
+    std::size_t buffer_elements_bf16(const BufferEntry& entry) const {
+        if (entry.tensor != nullptr) return static_cast<std::size_t>(ggml_nelements(entry.tensor));
+        if (entry.bytes.size() % sizeof(std::uint16_t) != 0) {
+            throw std::runtime_error("portable rust loader: BF16 buffer byte size mismatch");
+        }
+        return entry.bytes.size() / sizeof(std::uint16_t);
+    }
+
+    void write_buffer(std::uint32_t buffer,
+                      const void* data,
+                      std::uint64_t offset,
+                      std::uint64_t nbytes) {
+        auto& entry = buffer_entry(buffer);
+        if (offset + nbytes > buffer_bytes(entry)) {
+            throw std::runtime_error("portable rust loader: write exceeds buffer");
+        }
+        if (entry.tensor != nullptr) {
+            ggml_backend_tensor_set(entry.tensor, data, offset, nbytes);
+        } else {
+            std::memcpy(entry.bytes.data() + offset, data, nbytes);
+        }
+    }
+
+    const std::uint8_t* temp_data(std::uint32_t buffer) const {
+        const auto& entry = buffer_entry(buffer);
+        if (entry.tensor != nullptr) {
+            throw std::runtime_error(
+                "portable rust loader: expected CPU temporary buffer");
+        }
+        return entry.bytes.data();
     }
 
     void allocate(const pie_weight_loader::PieLoaderStorageProgramView& program,
                   const pie_weight_loader::PieLoaderStorageInstrView& instr) {
         const auto& buffer = buffer_decl(program, instr.buffer_id);
         if (!buffer.has_tensor) {
-            throw std::runtime_error(
-                "portable rust loader: temporary allocation is not supported");
+            buffers_[buffer.id] = BufferEntry{
+                .tensor = nullptr,
+                .bytes = std::vector<std::uint8_t>(
+                    static_cast<std::size_t>(buffer.bytes)),
+            };
+            return;
         }
         const auto& tensor = tensor_decl(program, buffer.tensor_id);
         const auto name = bytes_to_string(tensor.name);
@@ -725,7 +956,7 @@ private:
                 "' (rust=" + std::to_string(buffer.bytes) +
                 ", ggml=" + std::to_string(nbytes) + ")");
         }
-        buffers_[buffer.id] = target->second;
+        buffers_[buffer.id] = BufferEntry{.tensor = target->second};
     }
 
     void extent_write(const pie_weight_loader::PieLoaderStorageInstrView& instr) {
@@ -740,19 +971,32 @@ private:
         if (instr.source.file_offset + instr.source.span_bytes > src.nbytes) {
             throw std::runtime_error("portable rust loader: source extent out of range");
         }
-        auto* dst = target_for_buffer(instr.dest.buffer_id);
-        ggml_backend_tensor_set(
-            dst,
+        if (auto& entry = buffer_entry(instr.dest.buffer_id); entry.tensor == nullptr) {
+            entry.source_dtype = src.dtype;
+            entry.source_shape = src.shape;
+        }
+        write_buffer(
+            instr.dest.buffer_id,
             src.data + instr.source.file_offset,
             instr.dest.offset,
             instr.source.span_bytes);
     }
 
     void tile_map(const pie_weight_loader::PieLoaderStorageInstrView& instr) {
-        if (instr.tile_kind != pie_weight_loader::PieLoaderTileMapKind::Cast) {
-            throw std::runtime_error(
-                "portable rust loader: only Cast TileMap is implemented");
+        switch (instr.tile_kind) {
+            case pie_weight_loader::PieLoaderTileMapKind::Cast:
+                cast_tile_map(instr);
+                return;
+            case pie_weight_loader::PieLoaderTileMapKind::Decode:
+                decode_tile_map(instr);
+                return;
+            default:
+                throw std::runtime_error(
+                    "portable rust loader: unsupported TileMap kind");
         }
+    }
+
+    void cast_tile_map(const pie_weight_loader::PieLoaderStorageInstrView& instr) {
         if (!instr.has_source || instr.output_buffers.len != 1) {
             throw std::runtime_error(
                 "portable rust loader: Cast TileMap expects a source and one output");
@@ -761,10 +1005,14 @@ private:
         if (instr.source.file_offset + instr.source.span_bytes > src.nbytes) {
             throw std::runtime_error("portable rust loader: cast source extent out of range");
         }
-        auto* dst = target_for_buffer(instr.output_buffers.ptr[0]);
-        const auto n = static_cast<std::size_t>(ggml_nelements(dst));
+        const auto output = instr.output_buffers.ptr[0];
+        const auto& dst = buffer_entry(output);
+        const auto n = dst.tensor != nullptr
+            ? static_cast<std::size_t>(ggml_nelements(dst.tensor))
+            : buffer_bytes(dst) / sizeof(std::uint16_t);
         const auto* data = src.data + instr.source.file_offset;
-        if (src.dtype == StDtype::BF16 && dst->type == GGML_TYPE_F32) {
+        const ggml_type dst_type = dst.tensor != nullptr ? dst.tensor->type : GGML_TYPE_BF16;
+        if (src.dtype == StDtype::BF16 && dst_type == GGML_TYPE_F32) {
             if (instr.source.span_bytes != n * sizeof(ggml_bf16_t)) {
                 throw std::runtime_error(
                     "portable rust loader: bf16->f32 cast size mismatch");
@@ -774,8 +1022,8 @@ private:
                 reinterpret_cast<const ggml_bf16_t*>(data),
                 tmp.data(),
                 n);
-            ggml_backend_tensor_set(dst, tmp.data(), 0, n * sizeof(float));
-        } else if (src.dtype == StDtype::F32 && dst->type == GGML_TYPE_BF16) {
+            write_buffer(output, tmp.data(), 0, n * sizeof(float));
+        } else if (src.dtype == StDtype::F32 && dst_type == GGML_TYPE_BF16) {
             if (instr.source.span_bytes != n * sizeof(float)) {
                 throw std::runtime_error(
                     "portable rust loader: f32->bf16 cast size mismatch");
@@ -785,17 +1033,103 @@ private:
                 reinterpret_cast<const float*>(data),
                 tmp.data(),
                 n);
-            ggml_backend_tensor_set(dst, tmp.data(), 0, n * sizeof(ggml_bf16_t));
-        } else if (same_dtype(src.dtype, dst->type)) {
-            if (instr.source.span_bytes != ggml_nbytes(dst)) {
+            write_buffer(output, tmp.data(), 0, n * sizeof(ggml_bf16_t));
+        } else if (dst.tensor != nullptr && same_dtype(src.dtype, dst.tensor->type)) {
+            if (instr.source.span_bytes != ggml_nbytes(dst.tensor)) {
                 throw std::runtime_error(
                     "portable rust loader: identity cast byte size mismatch");
             }
-            ggml_backend_tensor_set(dst, data, 0, instr.source.span_bytes);
+            write_buffer(output, data, 0, instr.source.span_bytes);
         } else {
             throw std::runtime_error(
                 "portable rust loader: unsupported Cast TileMap dtype pair");
         }
+    }
+
+    void decode_tile_map(const pie_weight_loader::PieLoaderStorageInstrView& instr) {
+        if (!instr.has_source || instr.output_buffers.len != 1) {
+            throw std::runtime_error(
+                "portable rust loader: Decode TileMap expects a source and one output");
+        }
+        if (instr.transform_from != pie_weight_loader::PieLoaderQuantScheme::Fp8E4M3) {
+            throw std::runtime_error(
+                "portable rust loader: only FP8_E4M3 Decode TileMap is implemented");
+        }
+        const auto& src = source_tensor(instr.source.tensor_id);
+        if (src.dtype != StDtype::F8_E4M3) {
+            throw std::runtime_error("portable rust loader: Decode source is not F8_E4M3");
+        }
+        if (instr.source.file_offset + instr.source.span_bytes > src.nbytes) {
+            throw std::runtime_error("portable rust loader: decode source extent out of range");
+        }
+        const auto output = instr.output_buffers.ptr[0];
+        const auto& dst = buffer_entry(output);
+        const auto n = buffer_elements_bf16(dst);
+        if (instr.source.span_bytes != n) {
+            throw std::runtime_error("portable rust loader: FP8 decode byte size mismatch");
+        }
+        const std::uint8_t* scale_data = nullptr;
+        std::size_t scale_bytes = 0;
+        if (instr.input_buffers.len > 0) {
+            const auto& scale = buffer_entry(instr.input_buffers.ptr[0]);
+            if (scale.tensor != nullptr) {
+                throw std::runtime_error(
+                    "portable rust loader: Decode scale must be a temporary buffer");
+            }
+            scale_data = scale.bytes.data();
+            scale_bytes = scale.bytes.size();
+        }
+        const std::size_t rows = src.shape.empty()
+            ? 1
+            : static_cast<std::size_t>(src.shape.front());
+        const std::size_t cols = rows == 0 ? 0 : n / rows;
+        if (rows == 0 || rows * cols != n) {
+            throw std::runtime_error("portable rust loader: invalid FP8 source shape");
+        }
+        std::size_t scale_count = 0;
+        std::size_t scale_elem = 0;
+        StDtype scale_dtype = StDtype::F32;
+        if (scale_data != nullptr) {
+            const auto& scale = buffer_entry(instr.input_buffers.ptr[0]);
+            if (!scale.source_dtype) {
+                throw std::runtime_error(
+                    "portable rust loader: Decode scale dtype is unknown");
+            }
+            scale_dtype = *scale.source_dtype;
+            switch (scale_dtype) {
+                case StDtype::F32:
+                    scale_elem = sizeof(float);
+                    break;
+                case StDtype::BF16:
+                case StDtype::F16:
+                    scale_elem = sizeof(std::uint16_t);
+                    break;
+                default:
+                    throw std::runtime_error(
+                        "portable rust loader: unsupported Decode scale dtype");
+            }
+            if (scale_bytes % scale_elem != 0) {
+                throw std::runtime_error(
+                    "portable rust loader: FP8 scale byte size is not aligned");
+            }
+            scale_count = scale_bytes / scale_elem;
+            if (scale_count != 1 && scale_count != rows) {
+                throw std::runtime_error(
+                    "portable rust loader: FP8 scale must be scalar or per-row");
+            }
+        }
+        std::vector<std::uint16_t> tmp(n);
+        const auto* src8 = src.data + instr.source.file_offset;
+        for (std::size_t i = 0; i < n; ++i) {
+            float scale = 1.0f;
+            if (scale_count == 1) {
+                scale = scalar_to_f32(scale_data, 0, scale_dtype);
+            } else if (scale_count == rows) {
+                scale = scalar_to_f32(scale_data, i / cols, scale_dtype);
+            }
+            tmp[i] = bf16_from_f32(f8_e4m3fn_to_f32(src8[i]) * scale);
+        }
+        write_buffer(output, tmp.data(), 0, tmp.size() * sizeof(std::uint16_t));
     }
 
     void finalize(const pie_weight_loader::PieLoaderStorageInstrView& instr) {
@@ -809,7 +1143,7 @@ private:
     WeightArchive& archive_;
     std::vector<std::string> source_names_;
     std::unordered_map<std::string, ggml_tensor*> targets_;
-    std::unordered_map<std::uint32_t, ggml_tensor*> buffers_;
+    std::unordered_map<std::uint32_t, BufferEntry> buffers_;
 };
 
 std::string describe_program(const pie_weight_loader::PieLoaderStorageProgramView& view,
@@ -884,6 +1218,8 @@ bool try_load_with_rust_storage_program(Model& model, const char* planner_mode) 
             .src_offset_bytes = d.src_offset_bytes,
             .copy_bytes = d.copy_bytes,
             .dst_offset_bytes = d.dst_offset_bytes,
+            .decode_fp8_to_bf16 = d.decode_fp8_to_bf16,
+            .fp8_scale_hf_name = d.fp8_scale_hf_name,
         });
     }
 
