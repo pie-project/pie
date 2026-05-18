@@ -358,6 +358,11 @@ def main() -> None:
         help="Compatibility override for FlashInfer JIT on Blackwell/CUDA 12.8 hosts.",
     )
     args = parser.parse_args()
+    if args.pie_driver == "portable" and args.loader_planner != "rust":
+        raise SystemExit(
+            "portable driver always uses the Rust storage-program loader; "
+            "--loader-planner must be rust for --pie-driver portable"
+        )
 
     models = args.model or ["Qwen/Qwen3-32B"]
     engines = [e.strip() for e in args.engines.split(",") if e.strip()]

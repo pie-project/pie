@@ -49,12 +49,6 @@ namespace pie_portable_driver {
 
 namespace {
 
-enum class PlannerMode {
-    Cpp,
-    Rust,
-    Dual,
-};
-
 std::string lowercase(std::string value) {
     std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) {
         return static_cast<char>(std::tolower(c));
@@ -62,23 +56,16 @@ std::string lowercase(std::string value) {
     return value;
 }
 
-PlannerMode parse_mode(const char* value) {
+void validate_loader_mode(const char* value) {
     const std::string mode = lowercase(value == nullptr ? std::string{} : value);
-    if (mode.empty() || mode == "rust") return PlannerMode::Rust;
-    if (mode == "cpp") return PlannerMode::Cpp;
-    if (mode == "dual") return PlannerMode::Dual;
-    throw std::runtime_error(
-        "portable rust loader: PIE_PORTABLE_LOADER_PLANNER must be one of "
-        "{rust,dual,cpp}; cpp is deprecated");
-}
-
-const char* mode_name(PlannerMode mode) noexcept {
-    switch (mode) {
-        case PlannerMode::Cpp: return "cpp";
-        case PlannerMode::Rust: return "rust";
-        case PlannerMode::Dual: return "dual";
+    if (mode.empty() || mode == "rust") return;
+    if (mode == "cpp" || mode == "dual") {
+        throw std::runtime_error(
+            "portable rust loader: cpp/dual planner modes were removed; "
+            "portable weight loading is always the Rust storage program");
     }
-    return "?";
+    throw std::runtime_error(
+        "portable rust loader: PIE_PORTABLE_LOADER_PLANNER must be unset or 'rust'");
 }
 
 std::string bytes_to_string(pie_weight_loader::PieLoaderBytes bytes) {
@@ -1491,9 +1478,8 @@ void maybe_dump_program(const pie_weight_loader::PieLoaderStorageProgramView& vi
 
 }  // namespace
 
-bool try_load_with_rust_storage_program(Model& model, const char* planner_mode) {
-    const PlannerMode mode = parse_mode(planner_mode);
-    if (mode == PlannerMode::Cpp) return false;
+void load_with_rust_storage_program(Model& model, const char* planner_mode) {
+    validate_loader_mode(planner_mode);
 
     std::vector<ContractCandidate> candidates;
     candidates.reserve(model.declared_.size());
@@ -1518,25 +1504,21 @@ bool try_load_with_rust_storage_program(Model& model, const char* planner_mode) 
     const auto view = result.program.view();
     maybe_dump_program(view, result);
     std::cerr << "[model] " << describe_program(view, result)
-              << " (planner=" << mode_name(mode) << ")\n";
+              << " (planner=rust)\n";
 
     const bool complete = result.emitted_contracts == result.required_contracts;
     if (!complete) {
-        if (mode == PlannerMode::Dual) return false;
         throw std::runtime_error(
             "portable rust loader: incomplete contract coverage (" +
             std::to_string(result.emitted_contracts) + "/" +
             std::to_string(result.required_contracts) + ")");
     }
 
-    if (mode == PlannerMode::Dual) return false;
-
     Executor executor(*model.archive_, std::move(result.source_names), std::move(result.targets));
     executor.execute(view);
     for (const auto& s : model.synth_) {
         ggml_backend_tensor_set(s.tensor, s.data.data(), 0, s.data.size());
     }
-    return true;
 }
 
 }  // namespace pie_portable_driver

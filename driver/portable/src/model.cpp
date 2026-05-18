@@ -98,107 +98,6 @@ inline float bf16_to_f32(std::uint16_t bf16_bits) {
     return f;
 }
 
-inline float fp16_to_f32(std::uint16_t h) {
-    const std::uint32_t sign = (static_cast<std::uint32_t>(h & 0x8000)) << 16;
-    int exp = (h >> 10) & 0x1f;
-    std::uint32_t mant = h & 0x03ff;
-    std::uint32_t bits = 0;
-    if (exp == 0) {
-        if (mant == 0) {
-            bits = sign;
-        } else {
-            exp = 1;
-            while ((mant & 0x0400) == 0) {
-                mant <<= 1;
-                --exp;
-            }
-            mant &= 0x03ff;
-            bits = sign |
-                (static_cast<std::uint32_t>(exp + (127 - 15)) << 23) |
-                (mant << 13);
-        }
-    } else if (exp == 0x1f) {
-        bits = sign | 0x7f800000u | (mant << 13);
-    } else {
-        bits = sign |
-            (static_cast<std::uint32_t>(exp + (127 - 15)) << 23) |
-            (mant << 13);
-    }
-    float f;
-    std::memcpy(&f, &bits, 4);
-    return f;
-}
-
-inline float f8_e4m3fn_to_f32(std::uint8_t v) {
-    const float sign = (v & 0x80) ? -1.0f : 1.0f;
-    const int exp = (v >> 3) & 0x0f;
-    const int mant = v & 0x07;
-    if (exp == 0 && mant == 0) return sign * 0.0f;
-    if (exp == 0) {
-        return sign * std::ldexp(static_cast<float>(mant) / 8.0f, -6);
-    }
-    if (exp == 0x0f && mant == 0x07) {
-        return 0.0f;
-    }
-    return sign * std::ldexp(1.0f + static_cast<float>(mant) / 8.0f, exp - 7);
-}
-
-float scalar_to_f32(const StTensor& tensor, std::size_t index) {
-    switch (tensor.dtype) {
-        case StDtype::F32:
-            return reinterpret_cast<const float*>(tensor.data)[index];
-        case StDtype::BF16:
-            return bf16_to_f32(reinterpret_cast<const std::uint16_t*>(tensor.data)[index]);
-        case StDtype::F16:
-            return fp16_to_f32(reinterpret_cast<const std::uint16_t*>(tensor.data)[index]);
-        default:
-            throw std::runtime_error(
-                "model: unsupported scale dtype " +
-                std::string(st_dtype_name(tensor.dtype)));
-    }
-}
-
-void decode_fp8_e4m3_to_bf16(const StTensor& src,
-                             const StTensor* scale,
-                             std::uint16_t* dst,
-                             std::size_t n) {
-    if (src.dtype != StDtype::F8_E4M3) {
-        throw std::runtime_error("model: FP8 decode currently supports F8_E4M3 only");
-    }
-    std::size_t scale_numel = 0;
-    if (scale != nullptr) {
-        scale_numel = 1;
-        for (const auto dim : scale->shape) {
-            if (dim < 0) {
-                throw std::runtime_error("model: negative FP8 scale dimension");
-            }
-            scale_numel *= static_cast<std::size_t>(dim);
-        }
-    }
-    const std::size_t rows = src.shape.empty()
-        ? 1
-        : static_cast<std::size_t>(src.shape.front());
-    const std::size_t cols = rows == 0 ? 0 : n / rows;
-    if (rows == 0 || rows * cols != n) {
-        throw std::runtime_error("model: invalid FP8 source shape");
-    }
-    if (scale_numel != 0 && scale_numel != 1 && scale_numel != rows) {
-        throw std::runtime_error(
-            "model: FP8 scale must be scalar or one value per output row");
-    }
-
-    const auto* src8 = src.data;
-    for (std::size_t i = 0; i < n; ++i) {
-        float s = 1.0f;
-        if (scale_numel == 1) {
-            s = scalar_to_f32(*scale, 0);
-        } else if (scale_numel == rows) {
-            s = scalar_to_f32(*scale, i / cols);
-        }
-        dst[i] = bf16_from_f32(f8_e4m3fn_to_f32(src8[i]) * s);
-    }
-}
-
 // Dequantize MXFP4 (HF gpt-oss layout) into BF16. Each block is 32
 // elements: 16 packed-nibble bytes + 1 E8M0 scale byte. HF stores nibbles
 // in interleaved-pair convention: byte j → out[2j] = lut[lo nibble],
@@ -596,7 +495,7 @@ ggml_tensor* Model::declare_(const std::string& hf_name) {
     // Norm-style weights stored in bf16 get promoted to f32 here. The
     // tensor we hand back to the graph builder is typed F32, so the
     // implicit `ggml_cast` in `norm_scale` becomes a no-op. The actual
-    // bf16 → f32 byte conversion happens in load_into_backend_().
+    // bf16 -> f32 byte conversion is a Rust storage-program TileMap.
     const bool gguf_typed = t.ggml_type_override >= 0;
     const bool upcast = !gguf_typed
                      && t.dtype == StDtype::BF16
@@ -730,83 +629,7 @@ void Model::load_into_backend_() {
     }
 
     const char* planner = std::getenv("PIE_PORTABLE_LOADER_PLANNER");
-    if (try_load_with_rust_storage_program(*this, planner == nullptr ? "" : planner)) {
-        return;
-    }
-
-    for (const auto& d : declared_) {
-        const auto& src = archive_->at(d.hf_name);
-        if (d.decode_fp8_to_bf16) {
-            const std::size_t n = static_cast<std::size_t>(ggml_nelements(d.tensor));
-            if (src.nbytes != n) {
-                throw std::runtime_error(
-                    "model: fp8 decode size mismatch for '" + d.hf_name +
-                    "': expected=" + std::to_string(n) +
-                    " safetensors=" + std::to_string(src.nbytes));
-            }
-            const StTensor* scale = nullptr;
-            if (!d.fp8_scale_hf_name.empty()) {
-                scale = &archive_->at(d.fp8_scale_hf_name);
-            }
-            std::vector<std::uint16_t> tmp(n);
-            decode_fp8_e4m3_to_bf16(src, scale, tmp.data(), n);
-            ggml_backend_tensor_set(d.tensor, tmp.data(), 0,
-                                    n * sizeof(std::uint16_t));
-        } else if (d.upcast_bf16_to_f32) {
-            // Promote bf16 source bytes to f32 in a temp buffer, then
-            // upload. ggml provides `ggml_bf16_to_fp32_row` for this.
-            // Norm weights are small enough that the temp allocation
-            // is irrelevant (a few KB per call).
-            const std::size_t n = static_cast<std::size_t>(ggml_nelements(d.tensor));
-            if (src.nbytes != n * sizeof(ggml_bf16_t)) {
-                throw std::runtime_error(
-                    "model: bf16 upcast size mismatch for '" + d.hf_name +
-                    "': expected=" + std::to_string(n * sizeof(ggml_bf16_t)) +
-                    " safetensors=" + std::to_string(src.nbytes));
-            }
-            std::vector<float> tmp(n);
-            ggml_bf16_to_fp32_row(
-                reinterpret_cast<const ggml_bf16_t*>(src.data),
-                tmp.data(), n);
-            ggml_backend_tensor_set(d.tensor, tmp.data(), 0,
-                                    n * sizeof(float));
-        } else if (d.downcast_f32_to_bf16) {
-            // Demote f32 source bytes to bf16 in a temp buffer, then
-            // upload. Matmul weights only — norms & biases keep F32 via
-            // is_small_weight_for_upcast().
-            const std::size_t n = static_cast<std::size_t>(ggml_nelements(d.tensor));
-            if (src.nbytes != n * sizeof(float)) {
-                throw std::runtime_error(
-                    "model: f32 downcast size mismatch for '" + d.hf_name +
-                    "': expected=" + std::to_string(n * sizeof(float)) +
-                    " safetensors=" + std::to_string(src.nbytes));
-            }
-            std::vector<ggml_bf16_t> tmp(n);
-            ggml_fp32_to_bf16_row(
-                reinterpret_cast<const float*>(src.data),
-                tmp.data(), n);
-            ggml_backend_tensor_set(d.tensor, tmp.data(), 0,
-                                    n * sizeof(ggml_bf16_t));
-        } else if (d.copy_bytes > 0) {
-            // Sliced load (phi3 fused QKV / gate_up) OR stacked-expert
-            // load (one source written into a 3D dest at dst_offset).
-            ggml_backend_tensor_set(d.tensor,
-                                    src.data + d.src_offset_bytes,
-                                    d.dst_offset_bytes,
-                                    d.copy_bytes);
-        } else {
-            const std::size_t need = ggml_nbytes(d.tensor);
-            if (need != src.nbytes) {
-                throw std::runtime_error(
-                    "model: byte-size mismatch for '" + d.hf_name + "': ggml=" +
-                    std::to_string(need) + " safetensors=" + std::to_string(src.nbytes));
-            }
-            ggml_backend_tensor_set(d.tensor, src.data, 0, src.nbytes);
-        }
-    }
-    for (const auto& s : synth_) {
-        ggml_backend_tensor_set(s.tensor, s.data.data(), 0, s.data.size());
-    }
+    load_with_rust_storage_program(*this, planner == nullptr ? "" : planner);
 }
 
 std::size_t Model::buffer_size() const noexcept {

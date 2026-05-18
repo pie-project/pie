@@ -899,11 +899,11 @@ Current Rust implementation status:
   deprecated) and to execute dense direct,
   compact cast, create-view, release, and identity reblock Rust-compiled paths
   through the CUDA `WeightStoreBuilder`.
-- Wired the portable ggml loader to compile/dump Rust storage programs with
-  Rust as the default planner (`PIE_PORTABLE_LOADER_PLANNER={rust,dual,cpp}`;
-  `cpp` is deprecated) and to execute full-coverage
-  direct/cast, strided extent-write, create-view, identity reblock/reorder, and
-  decode paths into existing ggml backend tensors.
+- Wired the portable ggml loader to compile/dump Rust storage programs as the
+  only weight-loading path. The old portable C++/dual planner fallback has
+  been removed; all ggml backends, including Metal builds, execute the same
+  Rust-compiled direct/cast, strided extent-write, create-view, identity
+  reblock/reorder, and decode paths into backend tensors.
 - Added a generic `ByteSpans` runtime source/IR term for byte-range assembly:
   fused slices, stacked expert writes, source/destination offset writes, and
   GGUF-style byte passthrough now lower to ordinary `ExtentWrite`
@@ -992,28 +992,28 @@ Current e2e smoke evidence:
 - Portable ggml, default Rust planner, `Qwen/Qwen3-0.6B`, CPU backend:
   311/311 contracts, 933 Rust storage instructions, optimizer report present
   in the plan dump, one-token latency smoke passed.
-- Portable ggml, `PIE_PORTABLE_LOADER_PLANNER=rust`,
+- Portable ggml, Rust storage loader,
   `microsoft/Phi-3-mini-4k-instruct`: 291/291 checkpoint-backed contracts,
   fused QKV/gate-up slice smoke passed.
-- Portable ggml, `PIE_PORTABLE_LOADER_PLANNER=rust`, `google/gemma-4-E2B`:
+- Portable ggml, Rust storage loader, `google/gemma-4-E2B`:
   505/505 checkpoint-backed contracts plus generated constants, one-token
   smoke passed.
-- Portable ggml, `PIE_PORTABLE_LOADER_PLANNER=rust`, `google/gemma-4-E4B`:
+- Portable ggml, Rust storage loader, `google/gemma-4-E4B`:
   623/623 checkpoint-backed contracts plus generated constants, one-token
   smoke passed.
-- Portable ggml, `PIE_PORTABLE_LOADER_PLANNER=rust`,
+- Portable ggml, Rust storage loader,
   `google/gemma-4-26B-A4B`: 657/657 checkpoint-backed contracts plus generated
   constants, one-token MoE smoke passed.
-- Portable ggml, `PIE_PORTABLE_LOADER_PLANNER=rust`,
+- Portable ggml, Rust storage loader,
   `allenai/Olmo-3-7B-Instruct`: 355/355 contracts, one-token smoke passed.
-- Portable ggml, `PIE_PORTABLE_LOADER_PLANNER=rust`,
+- Portable ggml, Rust storage loader,
   `RedHatAI/Qwen3-0.6B-FP8-dynamic`: 311/311 contracts,
   metadata-backed FP8 decode smoke passed after the explicit TileMap
   destination change.
-- Portable ggml, `PIE_PORTABLE_LOADER_PLANNER=rust`,
+- Portable ggml, Rust storage loader,
   `mistralai/Ministral-3-3B-Instruct-2512`: 236/236 contracts,
   static FP8 `weight_scale_inv` decode smoke passed.
-- Portable ggml offline driver runner, `PIE_PORTABLE_LOADER_PLANNER=rust`,
+- Portable ggml offline driver runner, Rust storage loader,
   `unsloth/Qwen3-0.6B-GGUF`: Q4_K_M, Q5_K_M, and Q8_0 all loaded as
   310/310-contract Rust storage programs and completed one-token generation;
   Q4_K_M was rechecked after the explicit TileMap destination change.
