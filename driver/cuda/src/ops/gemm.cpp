@@ -124,8 +124,34 @@ void gemm_batched_bf16_impl(
                               DType act_dtype, DType w_dtype, DType y_dtype) {
     throw std::runtime_error(
         std::string("ops::") + api + ": unsupported dtype combo (act=" +
-        dtype_name(act_dtype) + ", w=" + dtype_name(w_dtype) +
+            dtype_name(act_dtype) + ", w=" + dtype_name(w_dtype) +
         ", y=" + dtype_name(y_dtype) + ")");
+}
+
+void validate_quant_weight_view(const char* api, const WeightView& w, int N, int K) {
+    if (w.data == nullptr) {
+        throw std::runtime_error(std::string(api) + ": quant weight data is null");
+    }
+    if (w.scale_data == nullptr) {
+        throw std::runtime_error(std::string(api) + ": quant scale data is null");
+    }
+    const std::size_t expected_weight_bytes =
+        static_cast<std::size_t>(N) * static_cast<std::size_t>(K) *
+        dtype_bytes(w.dtype);
+    if (w.nbytes < expected_weight_bytes) {
+        throw std::runtime_error(
+            std::string(api) + ": quant weight buffer is smaller than GEMM "
+            "shape requires; have " + std::to_string(w.nbytes) +
+            " bytes, need " + std::to_string(expected_weight_bytes) +
+            " bytes for N=" + std::to_string(N) +
+            " K=" + std::to_string(K));
+    }
+    if (w.scale_numel < static_cast<std::size_t>(N)) {
+        throw std::runtime_error(
+            std::string(api) + ": quant scale tensor is smaller than GEMM "
+            "N; have " + std::to_string(w.scale_numel) +
+            " values, need " + std::to_string(N));
+    }
 }
 
 // ── cuBLASLt FP8 path ─────────────────────────────────────────────────
@@ -308,6 +334,7 @@ void gemm_fp8_dequant_then_bf16_fallback(
             bf16_w,
             static_cast<const float*>(w_scale_fp32_dev),
             N, K, stream);
+        CUDA_CHECK(cudaGetLastError());
     } else {
         // Per-tensor: pull the scalar to host. One sync per layer per
         // fire — acceptable on this fallback path.
@@ -318,7 +345,33 @@ void gemm_fp8_dequant_then_bf16_fallback(
         kernels::launch_dequant_fp8_e4m3_to_bf16(
             static_cast<const std::uint8_t*>(w_fp8),
             bf16_w, scale, weight_elems, stream);
+        CUDA_CHECK(cudaGetLastError());
     }
+    gemm_bf16_impl(cublas_handle, act, bf16_w, y, M, N, K, beta);
+}
+
+void gemm_int8_dequant_then_bf16_fallback(
+    cublasHandle_t cublas_handle,
+    const void* act,
+    const void* w_int8,
+    const float* w_scale_inv,
+    void* y,
+    int M, int N, int K,
+    float beta,
+    cudaStream_t stream)
+{
+    auto& ctx = LtCtx::instance();
+    const std::size_t weight_elems =
+        static_cast<std::size_t>(N) * static_cast<std::size_t>(K);
+    void* bf16_w = ctx.dequant.ensure(weight_elems * 2);
+    kernels::launch_dequant_int8_to_bf16_per_channel(
+        static_cast<const std::int8_t*>(w_int8),
+        bf16_w,
+        w_scale_inv,
+        N,
+        K,
+        stream);
+    CUDA_CHECK(cudaGetLastError());
     gemm_bf16_impl(cublas_handle, act, bf16_w, y, M, N, K, beta);
 }
 
@@ -562,6 +615,13 @@ void gemm_int8_w_bf16_act_impl(
     auto& ctx = LtCtx::instance();
     ctx.ensure_init();
 
+    if ((M % 4) != 0 || (N % 4) != 0 || (K % 4) != 0) {
+        gemm_int8_dequant_then_bf16_fallback(
+            cublas_handle, act_bf16, w_int8, w_scale_inv,
+            y_bf16, M, N, K, beta, stream);
+        return;
+    }
+
     // Stage 1: per-token activation quant.
     const std::size_t act_int8_bytes =
         static_cast<std::size_t>(M) * static_cast<std::size_t>(K);
@@ -599,10 +659,10 @@ void gemm_int8_w_bf16_act_impl(
         CUBLAS_COMPUTE_32I,
         CUBLAS_GEMM_DEFAULT);
     if (status != CUBLAS_STATUS_SUCCESS) {
-        throw std::runtime_error(
-            "cuBLAS error (" + std::to_string(static_cast<int>(status)) +
-            "): cublasGemmEx[int8 W8A8] M=" + std::to_string(M) +
-            " N=" + std::to_string(N) + " K=" + std::to_string(K));
+        gemm_int8_dequant_then_bf16_fallback(
+            cublas_handle, act_bf16, w_int8, w_scale_inv,
+            y_bf16, M, N, K, beta, stream);
+        return;
     }
 
     // Stage 3: dequant int32 → bf16 with per-row × per-col scales.
@@ -657,6 +717,7 @@ void gemm_act_x_w(
                 "gemm_act_x_w[FP8_E4M3]: scale must be FP32 (got " +
                 std::string(dtype_name(w.scale_dtype)) + ")");
         }
+        validate_quant_weight_view("gemm_act_x_w[FP8_E4M3]", w, N, K);
         gemm_fp8_e4m3_w_bf16_act_impl(handle, act, w.data, w.scale_data,
                                       w.quant_kind,
                                       y, M, N, K, beta, stream);
@@ -676,6 +737,7 @@ void gemm_act_x_w(
                 "gemm_act_x_w[INT8 W8A8]: only PerChannel weight scale "
                 "supported (per-tensor / per-group not yet wired)");
         }
+        validate_quant_weight_view("gemm_act_x_w[INT8 W8A8]", w, N, K);
         gemm_int8_w_bf16_act_impl(
             handle, act, w.data,
             static_cast<const float*>(w.scale_data),

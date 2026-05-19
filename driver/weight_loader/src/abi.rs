@@ -10,7 +10,7 @@ use crate::source::{
     ffi_string,
 };
 use crate::storage::StorageTarget;
-use crate::types::{Axis, DType, Encoding, Layout, QuantSpec, Sharding, TensorId};
+use crate::types::{Axis, DType, Encoding, Layout, QuantScheme, QuantSpec, Sharding, TensorId};
 use std::collections::HashSet;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -118,6 +118,7 @@ struct DefaultAbiBuilder<'a> {
 
 impl DefaultAbiBuilder<'_> {
     fn build(&mut self) -> Result<(), CompileError> {
+        let runtime_quant = self.runtime_quant_scheme()?;
         self.add_phi3_fused_splits()?;
         self.add_gpt_oss_mxfp4_groups();
         self.add_fused_moe_gate_up_tp_slices()?;
@@ -125,7 +126,13 @@ impl DefaultAbiBuilder<'_> {
             if self.consumed.contains(&raw.id) {
                 continue;
             }
-            self.push_direct(raw, raw.name.clone(), self.shard_axis(&raw.name));
+            if let Some(scheme) = runtime_quant
+                && runtime_quantizable_name(&raw.name)
+            {
+                self.push_runtime_quant(raw, raw.name.clone(), scheme)?;
+            } else {
+                self.push_direct(raw, raw.name.clone(), self.shard_axis(&raw.name));
+            }
         }
         Ok(())
     }
@@ -151,6 +158,64 @@ impl DefaultAbiBuilder<'_> {
             alignment: self.alignment(),
             shard_axis,
         });
+    }
+
+    fn push_runtime_quant(
+        &mut self,
+        raw: &RawTensor,
+        output_name: String,
+        scheme: QuantScheme,
+    ) -> Result<(), CompileError> {
+        if raw.shape.len() != 2 {
+            return Err(CompileError::InvalidInput(format!(
+                "runtime_quant source '{}' must be 2-D",
+                raw.name
+            )));
+        }
+        if !matches!(
+            raw.encoding,
+            Encoding::Raw(DType::BF16 | DType::F16 | DType::F32)
+        ) {
+            return Err(CompileError::InvalidInput(format!(
+                "runtime_quant source '{}' must be BF16/FP16/FP32",
+                raw.name
+            )));
+        }
+        let dtype = match scheme {
+            QuantScheme::Fp8E4M3 => DType::F8E4M3,
+            QuantScheme::Int8Symmetric => DType::I8,
+            _ => {
+                return Err(CompileError::InvalidInput(format!(
+                    "unsupported runtime_quant scheme {:?}",
+                    scheme
+                )));
+            }
+        };
+        self.tensors.push(RuntimeTensorContract {
+            output_name,
+            source: RuntimeTensorSource::DirectTensor(raw.id),
+            metadata: Vec::new(),
+            dtype,
+            encoding: Encoding::Quant(
+                QuantSpec {
+                    scheme,
+                    logical_dtype: dtype,
+                    bits_per_element: 8,
+                    group_size: 1,
+                    channel_axis: Some(Axis(0)),
+                    scale_dtype: Some(DType::F32),
+                    zero_point_dtype: None,
+                    block_shape: Vec::new(),
+                }
+                .normalized(),
+            ),
+            shape: raw.shape.clone(),
+            layout: Layout::dense(self.alignment()),
+            sharding: Sharding::replicated(),
+            alignment: self.alignment(),
+            shard_axis: self.shard_axis(&raw.name),
+        });
+        Ok(())
     }
 
     fn push_byte_spans(
@@ -375,6 +440,32 @@ impl DefaultAbiBuilder<'_> {
         }
         llama_like_shard_axis(name)
     }
+
+    fn runtime_quant_scheme(&self) -> Result<Option<QuantScheme>, CompileError> {
+        let mode = self.cfg.runtime_quant.as_str();
+        if mode.is_empty() {
+            return Ok(None);
+        }
+        let scheme = match mode {
+            "fp8" => QuantScheme::Fp8E4M3,
+            "int8" => QuantScheme::Int8Symmetric,
+            other => {
+                return Err(CompileError::InvalidInput(format!(
+                    "unsupported runtime_quant '{other}'; expected 'fp8' or 'int8'"
+                )));
+            }
+        };
+        if !self.cfg.quant_method.is_empty() {
+            return Ok(None);
+        }
+        if !runtime_quant_model_supported(&self.cfg.model_type) {
+            return Err(CompileError::InvalidInput(format!(
+                "runtime_quant={} is supported for qwen2/qwen3/qwen3_5/llama/mistral-style dense models, got '{}'",
+                mode, self.cfg.model_type
+            )));
+        }
+        Ok(Some(scheme))
+    }
 }
 
 fn dtype_for_encoding(encoding: &Encoding) -> DType {
@@ -478,6 +569,28 @@ fn llama_like_shard_axis(name: &str) -> Option<Axis> {
     } else {
         None
     }
+}
+
+fn runtime_quant_model_supported(model_type: &str) -> bool {
+    matches!(
+        model_type,
+        "qwen3" | "qwen2" | "llama" | "llama3" | "mistral" | "qwen3_5" | "qwen3_5_text"
+    )
+}
+
+fn runtime_quantizable_name(name: &str) -> bool {
+    ends_with_any(
+        name,
+        &[
+            ".self_attn.q_proj.weight",
+            ".self_attn.k_proj.weight",
+            ".self_attn.v_proj.weight",
+            ".self_attn.o_proj.weight",
+            ".mlp.gate_proj.weight",
+            ".mlp.up_proj.weight",
+            ".mlp.down_proj.weight",
+        ],
+    )
 }
 
 fn ends_with_any(value: &str, suffixes: &[&str]) -> bool {

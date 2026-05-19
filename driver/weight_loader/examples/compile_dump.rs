@@ -21,6 +21,7 @@ fn main() {
     let cfg = ModelConfig {
         model_type: "qwen3".to_string(),
         quant_method: String::new(),
+        runtime_quant: String::new(),
         num_hidden_layers: tensors,
         num_experts: 0,
         num_experts_per_tok: 0,

@@ -204,15 +204,13 @@ LoadedModel LoadedModel::load(const Config& boot_cfg, NcclComm* tp_comm) {
 
     WeightStoreBuilder(e.weights_).reserve(loader.num_tensors());
 
-    if (!boot_cfg.model.runtime_quant.empty()) {
-        throw std::runtime_error(
-            "engine: runtime_quant is not yet exposed through the Rust "
-            "loader RuntimeABI. Use an offline-quantized checkpoint or leave "
-            "runtime_quant empty.");
+    std::string runtime_quant = boot_cfg.model.runtime_quant;
+    if (runtime_quant == "fp8" && !fp8_native) {
+        runtime_quant.clear();
     }
     RustLoaderCompileResult rust_plan =
         compile_rust_loader_plan_from_metadata(
-            e.hf_, loader, tp_rank, tp_size,
+            e.hf_, loader, runtime_quant, tp_rank, tp_size,
             64ull * 1024ull * 1024ull,
             /*preferred_alignment=*/256);
     const auto rust_view = rust_plan.program.view();

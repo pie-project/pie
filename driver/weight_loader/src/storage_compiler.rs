@@ -39,6 +39,7 @@ pub fn lower_dense_copies(
     let cfg = crate::config::ModelConfig {
         model_type: String::new(),
         quant_method: String::new(),
+        runtime_quant: String::new(),
         num_hidden_layers: 0,
         num_experts: 0,
         num_experts_per_tok: 0,
@@ -193,9 +194,12 @@ impl StorageCompiler<'_> {
                 layout,
                 axis,
                 start,
-                length: _,
+                length,
                 decl,
             } => {
+                if let Some(axis) = axis {
+                    return self.lower_select(id, *input, *axis, *start, *length);
+                }
                 let input_value = self.value(*input)?;
                 match input_value {
                     ValueLoc::Buffer(input_buffer) => {
@@ -205,31 +209,14 @@ impl StorageCompiler<'_> {
                                 input.0
                             ))
                         })?;
-                        let offset = if let Some(axis) = axis {
-                            dense_axis_offset_bytes(
-                                &input_decl.shape,
-                                *axis,
-                                *start,
-                                &input_decl.encoding,
-                            )?
-                        } else {
-                            0
-                        };
-                        let out = self.declare_view_buffer(decl);
-                        let instr = self.next_instr();
-                        self.program.instrs.push(StorageInstr::CreateView {
-                            id: instr,
-                            input: input_buffer,
-                            output: out,
-                            view: DestExtent {
-                                buffer: out,
-                                offset,
-                                stride: storage_extent_for_shape(&decl.shape, &decl.encoding)?,
-                            },
-                            layout: layout.clone(),
-                        });
-                        self.program.schedule.push(instr);
-                        Ok(ValueLoc::Buffer(out))
+                        if input_decl.shape != decl.shape || input_decl.encoding != decl.encoding {
+                            return Err(CompileError::InvalidInput(format!(
+                                "metadata-only View {} cannot change shape/encoding",
+                                id.0
+                            )));
+                        }
+                        let _ = layout;
+                        Ok(ValueLoc::Buffer(input_buffer))
                     }
                     ValueLoc::Source(source) => Ok(ValueLoc::Source(source)),
                 }
@@ -258,15 +245,12 @@ impl StorageCompiler<'_> {
                     to: None,
                 },
             ),
-            LayoutExpr::Encode { scheme, input, .. } => self.lower_tiled_unary(
-                id,
-                *input,
-                TileMapKind::Encode,
-                TransformSpec {
-                    from: None,
-                    to: Some(*scheme),
-                },
-            ),
+            LayoutExpr::Encode {
+                scheme,
+                input,
+                metadata_outputs,
+                ..
+            } => self.lower_encode(id, *input, *scheme, metadata_outputs),
             LayoutExpr::Transcode {
                 from,
                 to,
@@ -568,6 +552,71 @@ impl StorageCompiler<'_> {
         self.lower_tiled_with_metadata(id, input, &[], kind, transform)
     }
 
+    fn lower_encode(
+        &mut self,
+        id: ExprId,
+        input: ExprId,
+        scheme: QuantScheme,
+        metadata_outputs: &[TensorDecl],
+    ) -> Result<ValueLoc, CompileError> {
+        if metadata_outputs.is_empty() {
+            return self.lower_tiled_unary(
+                id,
+                input,
+                TileMapKind::Encode,
+                TransformSpec {
+                    from: None,
+                    to: Some(scheme),
+                },
+            );
+        }
+
+        let out_decl = self.plan.decl(id).ok_or_else(|| {
+            CompileError::InvalidInput(format!("expr {} has no tensor decl", id.0))
+        })?;
+        let out = self.allocate_decl(out_decl, false)?;
+        let mut inputs = Vec::new();
+        let source = match self.value(input)? {
+            ValueLoc::Source(source) => Some(self.source_extent(&source)?),
+            ValueLoc::Buffer(buffer) => {
+                inputs.push(buffer);
+                None
+            }
+        };
+        let mut outputs = Vec::with_capacity(metadata_outputs.len() + 1);
+        outputs.push(out);
+        for metadata in metadata_outputs {
+            outputs.push(self.allocate_decl(metadata, false)?);
+        }
+        self.emit_view_or_tile(
+            TileMapKind::Encode,
+            source,
+            None,
+            inputs,
+            outputs.clone(),
+            TransformSpec {
+                from: None,
+                to: Some(scheme),
+            },
+        );
+        for (decl, buffer) in metadata_outputs.iter().zip(outputs.iter().skip(1)) {
+            if !self.finalized_names.insert(decl.name.clone()) {
+                return Err(CompileError::InvalidInput(format!(
+                    "duplicate runtime tensor '{}'",
+                    decl.name
+                )));
+            }
+            let instr = self.next_instr();
+            self.program.instrs.push(StorageInstr::Finalize {
+                id: instr,
+                tensor: *buffer,
+                name: decl.name.clone(),
+            });
+            self.program.schedule.push(instr);
+        }
+        Ok(ValueLoc::Buffer(out))
+    }
+
     fn lower_tiled_with_metadata(
         &mut self,
         id: ExprId,
@@ -753,18 +802,26 @@ impl StorageCompiler<'_> {
             .ok_or_else(|| {
                 CompileError::InvalidInput(format!("buffer {} does not exist", buffer.0))
             })?;
-        if existing.tensor.is_none() {
-            existing.tensor = Some(decl.id);
+        if let Some(existing_id) = existing.tensor {
+            if existing_id != decl.id {
+                return Err(CompileError::InvalidInput(format!(
+                    "buffer {} already belongs to tensor {}, cannot promote to {}",
+                    buffer.0, existing_id.0, decl.id.0
+                )));
+            }
         }
+        existing.tensor = Some(decl.id);
         if existing.temporary {
             existing.temporary = false;
         }
-        if !self
+        if let Some(tensor) = self
             .program
             .tensors
-            .iter()
-            .any(|tensor| tensor.id == decl.id)
+            .iter_mut()
+            .find(|tensor| tensor.id == decl.id)
         {
+            *tensor = decl.clone();
+        } else {
             self.program.tensors.push(decl.clone());
         }
         Ok(())
@@ -916,10 +973,16 @@ fn validate_target_support(program: &StorageProgram) -> Result<(), CompileError>
         };
         let supported = match program.target.backend {
             BackendKind::Unknown => true,
-            BackendKind::Cuda => matches!(
-                kind,
-                TileMapKind::Cast | TileMapKind::Reblock | TileMapKind::Reorder
-            ),
+            BackendKind::Cuda => {
+                matches!(
+                    kind,
+                    TileMapKind::Cast | TileMapKind::Reblock | TileMapKind::Reorder
+                ) || (*kind == TileMapKind::Encode
+                    && matches!(
+                        transform.to,
+                        Some(QuantScheme::Fp8E4M3 | QuantScheme::Int8Symmetric)
+                    ))
+            }
             BackendKind::Portable => match kind {
                 TileMapKind::Cast | TileMapKind::Reblock | TileMapKind::Reorder => true,
                 TileMapKind::Decode => transform.from == Some(QuantScheme::Fp8E4M3),

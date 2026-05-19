@@ -370,6 +370,7 @@ pub struct PieLoaderRuntimeTensorContractSlice {
 pub struct PieLoaderModelConfigView {
     pub model_type: PieLoaderBytes,
     pub quant_method: PieLoaderBytes,
+    pub runtime_quant: PieLoaderBytes,
     pub num_hidden_layers: u32,
     pub num_experts: u32,
     pub num_experts_per_tok: u32,
@@ -470,6 +471,7 @@ pub struct PieLoaderStorageInstrView {
     pub input_buffers: PieLoaderBufferIdSlice,
     pub output_buffers: PieLoaderBufferIdSlice,
     pub tile_kind: PieLoaderTileMapKind,
+    pub max_tile_bytes: u64,
     pub transform_from: PieLoaderQuantScheme,
     pub transform_to: PieLoaderQuantScheme,
     pub name: PieLoaderBytes,

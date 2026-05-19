@@ -270,6 +270,7 @@ struct PieLoaderRuntimeTensorContractSlice {
 struct PieLoaderModelConfigView {
   PieLoaderBytes model_type;
   PieLoaderBytes quant_method;
+  PieLoaderBytes runtime_quant;
   uint32_t num_hidden_layers;
   uint32_t num_experts;
   uint32_t num_experts_per_tok;
@@ -340,6 +341,7 @@ struct PieLoaderStorageInstrView {
   PieLoaderBufferIdSlice input_buffers;
   PieLoaderBufferIdSlice output_buffers;
   PieLoaderTileMapKind tile_kind;
+  uint64_t max_tile_bytes;
   PieLoaderQuantScheme transform_from;
   PieLoaderQuantScheme transform_to;
   PieLoaderBytes name;

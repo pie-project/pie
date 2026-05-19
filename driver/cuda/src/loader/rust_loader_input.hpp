@@ -79,13 +79,15 @@ public:
         };
     }
 
-    void set_model(const HfConfig& hf)
+    void set_model(const HfConfig& hf, std::string runtime_quant = {})
     {
         model_type_ = intern_string(hf.model_type);
         quant_method_ = intern_string(hf.quant_method);
+        runtime_quant_ = intern_string(std::move(runtime_quant));
         model_ = pie_weight_loader::PieLoaderModelConfigView{
             .model_type = bytes(model_type_),
             .quant_method = bytes(quant_method_),
+            .runtime_quant = bytes(runtime_quant_),
             .num_hidden_layers = static_cast<std::uint32_t>(
                 std::max(hf.num_hidden_layers, 0)),
             .num_experts = static_cast<std::uint32_t>(
@@ -411,6 +413,7 @@ private:
 
     std::uint32_t model_type_ = 0;
     std::uint32_t quant_method_ = 0;
+    std::uint32_t runtime_quant_ = 0;
     std::uint32_t runtime_abi_name_ = 0;
     pie_weight_loader::PieLoaderModelConfigView model_{};
     pie_weight_loader::PieLoaderRuntimeAbiView runtime_abi_{};

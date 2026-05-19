@@ -20,6 +20,7 @@ set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib)
 set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib)
 
 find_package(CUDAToolkit REQUIRED)
+find_package(Threads REQUIRED)
 
 if(NOT PIE_BRIDGE_INCLUDE_DIR)
   set(PIE_BRIDGE_INCLUDE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../bridge/include")
@@ -142,8 +143,40 @@ add_library(pie_driver_cuda_lib STATIC
   src/ops/attention_flashinfer.cu
 )
 
+find_program(CARGO_EXECUTABLE cargo REQUIRED)
+set(PIE_WORKSPACE_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../..")
+set(PIE_WEIGHT_LOADER_MANIFEST
+    "${PIE_WORKSPACE_ROOT}/driver/weight_loader/Cargo.toml")
+set(PIE_WEIGHT_LOADER_STATICLIB_PATH
+    "${PIE_WORKSPACE_ROOT}/target/release/libpie_weight_loader.a")
+add_custom_target(pie_weight_loader_staticlib
+  COMMAND "${CARGO_EXECUTABLE}" build
+          --manifest-path "${PIE_WEIGHT_LOADER_MANIFEST}"
+          --release
+  WORKING_DIRECTORY "${PIE_WORKSPACE_ROOT}"
+  BYPRODUCTS "${PIE_WEIGHT_LOADER_STATICLIB_PATH}"
+  COMMENT "Building Rust weight-loader static library")
+add_library(pie_weight_loader_static STATIC IMPORTED GLOBAL)
+set_target_properties(pie_weight_loader_static PROPERTIES
+  IMPORTED_LOCATION "${PIE_WEIGHT_LOADER_STATICLIB_PATH}")
+add_dependencies(pie_weight_loader_static pie_weight_loader_staticlib)
+
+set(PIE_WEIGHT_LOADER_SYSTEM_LIBS Threads::Threads ${CMAKE_DL_LIBS} m)
+if(UNIX AND NOT APPLE)
+  list(APPEND PIE_WEIGHT_LOADER_SYSTEM_LIBS rt util)
+endif()
+
 add_executable(pie_driver_cuda src/main.cpp)
-target_link_libraries(pie_driver_cuda PRIVATE pie_driver_cuda_lib)
+target_link_libraries(pie_driver_cuda PRIVATE
+  pie_driver_cuda_lib
+  # The C++ declarations are weak so server builds can link the CUDA driver
+  # archive before Cargo supplies Rust symbols. For the standalone parity
+  # binary, force the Rust staticlib into the link; weak references alone do
+  # not cause archive extraction.
+  "-Wl,--whole-archive"
+  pie_weight_loader_static
+  "-Wl,--no-whole-archive"
+  ${PIE_WEIGHT_LOADER_SYSTEM_LIBS})
 
 target_compile_options(pie_driver_cuda_lib PRIVATE
   $<$<COMPILE_LANGUAGE:CUDA>:

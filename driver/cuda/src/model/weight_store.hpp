@@ -22,6 +22,8 @@ class WeightStoreBuilder;
 struct QuantMeta {
     enum class Kind { PerTensor, PerChannel, PerGroup };
     Kind kind = Kind::PerTensor;
+    std::string scale_name;
+    std::string zero_point_name;
     const DeviceTensor* scale = nullptr;
     const DeviceTensor* zero_point = nullptr;
     int group_size = 0;
@@ -66,8 +68,16 @@ public:
     WeightStore() = default;
     WeightStore(const WeightStore&) = delete;
     WeightStore& operator=(const WeightStore&) = delete;
-    WeightStore(WeightStore&&) noexcept = default;
-    WeightStore& operator=(WeightStore&&) noexcept = default;
+    WeightStore(WeightStore&& other) noexcept { move_from(other); }
+    WeightStore& operator=(WeightStore&& other) noexcept {
+        if (this != &other) {
+            tensors_.clear();
+            quant_meta_.clear();
+            finalized_ = false;
+            move_from(other);
+        }
+        return *this;
+    }
 
     std::size_t size() const noexcept { return tensors_.size(); }
     bool empty() const noexcept { return tensors_.empty(); }
@@ -123,6 +133,7 @@ private:
     void validate_erase_allowed(const std::string& name) const;
     void ensure_mutable() const;
     void finalize();
+    void move_from(WeightStore& other) noexcept;
     static TensorDecl default_spec_for(
         const std::string& name,
         const DeviceTensor& tensor);

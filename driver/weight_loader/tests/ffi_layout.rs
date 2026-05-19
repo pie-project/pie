@@ -786,6 +786,77 @@ fn empty_runtime_abi_builds_default_tp_column_contracts_as_strided_extents() {
     }
 }
 
+#[test]
+fn empty_runtime_abi_lowers_runtime_quant_to_encode_and_scale_output() {
+    let file_path = bytes("model.safetensors");
+    let tensor_name = bytes("model.layers.0.self_attn.q_proj.weight");
+    let model_type = bytes("qwen3");
+    let runtime_quant = bytes("int8");
+    let shape_values = [4_i64, 4_i64];
+    let shape = PieLoaderI64Slice {
+        ptr: shape_values.as_ptr(),
+        len: shape_values.len(),
+    };
+    let files = [PieLoaderCheckpointFileView {
+        id: 0,
+        path: file_path,
+        size_bytes: 256,
+        format: PieLoaderCheckpointFormat::Safetensors,
+    }];
+    let tensors = [PieLoaderCheckpointTensorView {
+        id: 0,
+        name: tensor_name,
+        file_id: 0,
+        file_offset: 64,
+        span_bytes: 32,
+        dtype: PieLoaderDType::BF16,
+        encoding_kind: PieLoaderEncodingKind::Raw,
+        quant_scheme: PieLoaderQuantScheme::None,
+        shape,
+        ..PieLoaderCheckpointTensorView::default()
+    }];
+    let mut input = compile_input(&files, &tensors, &[]);
+    input.model.model_type = model_type;
+    input.model.runtime_quant = runtime_quant;
+    input.target.backend = pie_weight_loader::PieLoaderBackendKind::Cuda;
+    input.target.preferred_alignment = 256;
+
+    let mut handle: *mut PieLoaderProgramHandle = ptr::null_mut();
+    let mut error = PieLoaderError::default();
+    let status = unsafe { pie_loader_compile(&input, &mut handle, &mut error) };
+    assert_eq!(status, PieLoaderStatus::Ok, "{}", error_message(&error));
+    let view = unsafe { pie_loader_program_view(handle) };
+    assert_eq!(view.tensors.len, 2);
+    let tensors_view = unsafe { std::slice::from_raw_parts(view.tensors.ptr, view.tensors.len) };
+    assert_eq!(tensors_view[0].encoding_kind, PieLoaderEncodingKind::Quant);
+    assert_eq!(
+        tensors_view[0].quant_scheme,
+        PieLoaderQuantScheme::Int8Symmetric
+    );
+    assert_eq!(tensors_view[1].encoding_kind, PieLoaderEncodingKind::Raw);
+    assert_eq!(tensors_view[1].dtype, PieLoaderDType::F32);
+    let scale_shape =
+        unsafe { std::slice::from_raw_parts(tensors_view[1].shape.ptr, tensors_view[1].shape.len) };
+    assert_eq!(scale_shape, &[4]);
+    let instrs = unsafe { std::slice::from_raw_parts(view.instrs.ptr, view.instrs.len) };
+    assert_eq!(instrs[2].kind, PieLoaderStorageInstrKind::TileMap);
+    assert_eq!(instrs[2].tile_kind, PieLoaderTileMapKind::Encode);
+    assert_eq!(instrs[2].transform_to, PieLoaderQuantScheme::Int8Symmetric);
+    assert_eq!(instrs[2].output_buffers.len, 2);
+    assert_eq!(instrs[3].kind, PieLoaderStorageInstrKind::Finalize);
+    assert_eq!(instrs[4].kind, PieLoaderStorageInstrKind::Finalize);
+    assert!(
+        !instrs
+            .iter()
+            .any(|instr| instr.kind == PieLoaderStorageInstrKind::CreateView)
+    );
+
+    unsafe {
+        pie_loader_program_free(handle);
+        pie_loader_error_free(&mut error);
+    }
+}
+
 fn bytes(value: &'static str) -> PieLoaderBytes {
     PieLoaderBytes {
         ptr: value.as_ptr(),

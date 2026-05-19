@@ -18,6 +18,13 @@ const TensorRecord& WeightStore::record(const std::string& name) const {
     return it->second;
 }
 
+void WeightStore::move_from(WeightStore& other) noexcept {
+    tensors_.swap(other.tensors_);
+    quant_meta_.swap(other.quant_meta_);
+    finalized_ = other.finalized_;
+    other.finalized_ = false;
+}
+
 TensorDecl WeightStore::default_spec_for(
     const std::string& name,
     const DeviceTensor& tensor)
@@ -180,7 +187,14 @@ std::optional<QuantMeta> WeightStore::quant_meta(
 {
     auto it = quant_meta_.find(name);
     if (it == quant_meta_.end()) return std::nullopt;
-    return it->second;
+    QuantMeta meta = it->second;
+    if (!meta.scale_name.empty()) {
+        meta.scale = &get(meta.scale_name);
+    }
+    if (!meta.zero_point_name.empty()) {
+        meta.zero_point = &get(meta.zero_point_name);
+    }
+    return meta;
 }
 
 bool WeightStore::owns_tensor_handle(
@@ -211,12 +225,34 @@ void WeightStore::validate_quant_metadata() const {
                 "weight store: quant metadata references missing weight '" +
                 name + "'");
         }
-        if (!owns_tensor_handle(meta.scale)) {
+        const DeviceTensor* scale = meta.scale;
+        if (!meta.scale_name.empty()) {
+            auto scale_it = tensors_.find(meta.scale_name);
+            if (scale_it == tensors_.end()) {
+                throw std::runtime_error(
+                    "weight store: quant metadata for '" + name +
+                    "' references missing scale tensor '" +
+                    meta.scale_name + "'");
+            }
+            scale = &scale_it->second.tensor;
+        }
+        if (!owns_tensor_handle(scale)) {
             throw std::runtime_error(
                 "weight store: quant metadata for '" + name +
                 "' references an unregistered scale tensor");
         }
-        if (meta.zero_point && !owns_tensor_handle(meta.zero_point)) {
+        const DeviceTensor* zero_point = meta.zero_point;
+        if (!meta.zero_point_name.empty()) {
+            auto zp_it = tensors_.find(meta.zero_point_name);
+            if (zp_it == tensors_.end()) {
+                throw std::runtime_error(
+                    "weight store: quant metadata for '" + name +
+                    "' references missing zero-point tensor '" +
+                    meta.zero_point_name + "'");
+            }
+            zero_point = &zp_it->second.tensor;
+        }
+        if (zero_point && !owns_tensor_handle(zero_point)) {
             throw std::runtime_error(
                 "weight store: quant metadata for '" + name +
                 "' references an unregistered zero-point tensor");
@@ -261,6 +297,11 @@ void WeightStore::validate_tensor_records() const {
                 throw std::runtime_error(
                     "weight store: view/alias tensor '" + name +
                     "' has no backing tensor");
+            }
+            if (record.spec.backing_tensor == name) {
+                throw std::runtime_error(
+                    "weight store: view/alias tensor '" + name +
+                    "' cannot use itself as backing storage");
             }
             auto backing = tensors_.find(record.spec.backing_tensor);
             if (backing == tensors_.end()) {

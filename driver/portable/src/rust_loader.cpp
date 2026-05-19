@@ -215,6 +215,7 @@ public:
         model_ = pie_weight_loader::PieLoaderModelConfigView{
             .model_type = bytes(model_type_),
             .quant_method = bytes(quant_method_),
+            .runtime_quant = {},
             .num_hidden_layers =
                 static_cast<std::uint32_t>(std::max(hp.num_hidden_layers, 0)),
             .num_experts = static_cast<std::uint32_t>(std::max(hp.num_experts, 0)),

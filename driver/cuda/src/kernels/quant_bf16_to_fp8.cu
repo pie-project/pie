@@ -139,6 +139,21 @@ __global__ void cast_per_channel_int8_kernel(
     }
 }
 
+__global__ void dequant_int8_per_channel_kernel(
+    const std::int8_t* __restrict__ W,
+    __nv_bfloat16*     __restrict__ out,
+    const float*       __restrict__ scale_inv_dev,
+    int                              cols,
+    std::size_t                      n)
+{
+    const std::size_t i = static_cast<std::size_t>(blockIdx.x) * BLOCK + threadIdx.x;
+    if (i >= n) return;
+    const int row = static_cast<int>(i / static_cast<std::size_t>(cols));
+    const float scale_inv = scale_inv_dev[row];
+    const float f = static_cast<float>(W[i]) * scale_inv;
+    out[i] = __float2bfloat16(f);
+}
+
 // Stage 2: cast `[rows, cols]` bf16 → fp8 using per-row weight_scale_inv.
 __global__ void cast_per_channel_kernel(
     const __nv_bfloat16*    __restrict__ W,
@@ -349,6 +364,22 @@ void launch_cast_bf16_to_int8_per_channel(
     cast_per_channel_int8_kernel<<<rows, BLOCK, 0, stream>>>(
         static_cast<const __nv_bfloat16*>(W_bf16),
         W_int8, scale_inv_dev, cols);
+}
+
+void launch_dequant_int8_to_bf16_per_channel(
+    const std::int8_t* W_int8, void* W_bf16,
+    const float* scale_inv_dev, int rows, int cols, cudaStream_t stream)
+{
+    if (rows == 0 || cols == 0) return;
+    const std::size_t n =
+        static_cast<std::size_t>(rows) * static_cast<std::size_t>(cols);
+    const auto blocks = static_cast<unsigned>((n + BLOCK - 1) / BLOCK);
+    dequant_int8_per_channel_kernel<<<blocks, BLOCK, 0, stream>>>(
+        W_int8,
+        static_cast<__nv_bfloat16*>(W_bf16),
+        scale_inv_dev,
+        cols,
+        n);
 }
 
 namespace {

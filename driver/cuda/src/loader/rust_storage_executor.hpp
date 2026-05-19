@@ -1,5 +1,6 @@
 #pragma once
 
+#include <algorithm>
 #include <cstdint>
 #include <stdexcept>
 #include <string>
@@ -20,6 +21,7 @@
 #if PIE_CUDA_RUST_STORAGE_EXECUTOR_HAS_CUDA
 #include "cuda_check.hpp"
 #include "kernels/dtype_cast.hpp"
+#include "kernels/quant_bf16_to_fp8.hpp"
 #endif
 #include "loader/rust_quant_attachment.hpp"
 #include "loader/safetensors.hpp"
@@ -67,7 +69,7 @@ public:
                 finalize(program, instr, stats);
                 break;
             case pie_weight_loader::PieLoaderStorageInstrKind::TileMap:
-                tile_map(instr);
+                tile_map(instr, stats);
                 break;
             case pie_weight_loader::PieLoaderStorageInstrKind::CreateView:
                 create_view(program, instr);
@@ -118,6 +120,19 @@ private:
         return DType::UINT8;
     }
 
+    static DType quant_physical_dtype(
+        const pie_weight_loader::PieLoaderTensorDeclView& tensor)
+    {
+        switch (tensor.quant_scheme) {
+        case pie_weight_loader::PieLoaderQuantScheme::Fp8E4M3:
+            return DType::FP8_E4M3;
+        case pie_weight_loader::PieLoaderQuantScheme::Int8Symmetric:
+            return DType::INT8;
+        default:
+            return DType::UINT8;
+        }
+    }
+
     void allocate(
         const pie_weight_loader::PieLoaderStorageProgramView& program,
         const pie_weight_loader::PieLoaderStorageInstrView& instr)
@@ -134,6 +149,15 @@ private:
         const auto& tensor = program_index_.tensor(buffer.tensor_id);
         if (tensor.encoding_kind ==
             pie_weight_loader::PieLoaderEncodingKind::Quant) {
+            const DType physical = quant_physical_dtype(tensor);
+            if (physical == DType::FP8_E4M3 || physical == DType::INT8) {
+                buffers_.emplace(
+                    buffer.id,
+                    DeviceTensor::allocate(
+                        physical,
+                        wl_cpp::i64_slice_to_vector(tensor.shape)));
+                return;
+            }
             buffers_.emplace(
                 buffer.id,
                 DeviceTensor::allocate(
@@ -172,7 +196,10 @@ private:
                 "implemented");
         }
         if (!wl_cpp::compact_extent(instr.source.stride)) {
-            copy_strided_extent_to_device(instr, dst);
+            copy_strided_extent_to_device(
+                instr,
+                dst,
+                wl_cpp::extent_shape(instr.dest.stride));
             return;
         }
         loader_.copy_storage_bytes_to_device(
@@ -184,7 +211,8 @@ private:
 
     void copy_strided_extent_to_device(
         const pie_weight_loader::PieLoaderStorageInstrView& instr,
-        void* dst)
+        void* dst,
+        const std::vector<std::int64_t>& dst_shape)
     {
         const std::string& name = source_tensor_names_[instr.source.tensor_id];
         const TensorInfo& info = loader_.info(name);
@@ -253,7 +281,7 @@ private:
             name,
             slices,
             dst,
-            wl_cpp::extent_shape(instr.dest.stride));
+            dst_shape);
     }
 
     DeviceTensor& buffer_tensor(std::uint32_t buffer_id)
@@ -304,7 +332,8 @@ private:
     }
 
     void tile_map(
-        const pie_weight_loader::PieLoaderStorageInstrView& instr)
+        const pie_weight_loader::PieLoaderStorageInstrView& instr,
+        LoadExecutionStats& stats)
     {
         switch (instr.tile_kind) {
         case pie_weight_loader::PieLoaderTileMapKind::Cast:
@@ -314,8 +343,10 @@ private:
         case pie_weight_loader::PieLoaderTileMapKind::Reorder:
             reblock_tile_map(instr);
             return;
-        case pie_weight_loader::PieLoaderTileMapKind::Decode:
         case pie_weight_loader::PieLoaderTileMapKind::Encode:
+            encode_tile_map(instr, stats);
+            return;
+        case pie_weight_loader::PieLoaderTileMapKind::Decode:
         case pie_weight_loader::PieLoaderTileMapKind::Transcode:
         case pie_weight_loader::PieLoaderTileMapKind::None:
             throw std::runtime_error(
@@ -372,6 +403,235 @@ private:
                 "rust storage executor: Cast TileMap expects source or one input");
         }
         cast_tensor_to_ptr(buffer_or_finalized_tensor(instr.input_buffers.ptr[0]), dst, out.dtype());
+    }
+
+    DeviceTensor materialize_encode_input_bf16_rows(
+        const pie_weight_loader::PieLoaderStorageInstrView& instr,
+        const std::vector<std::int64_t>& full_shape,
+        int row_start,
+        int rows)
+    {
+        const int cols = static_cast<int>(full_shape[1]);
+        const std::vector<std::int64_t> tile_shape{
+            static_cast<std::int64_t>(rows),
+            static_cast<std::int64_t>(cols),
+        };
+        DeviceTensor source;
+        if (instr.has_source) {
+            if (instr.source.tensor_id >= source_tensor_names_.size()) {
+                throw std::runtime_error(
+                    "rust storage executor: Encode source tensor id out of range");
+            }
+            const TensorInfo& info =
+                loader_.info(source_tensor_names_[instr.source.tensor_id]);
+            source = DeviceTensor::allocate(info.dtype, tile_shape);
+            if (!wl_cpp::compact_extent(instr.source.stride)) {
+                if (row_start != 0 || rows != full_shape[0]) {
+                    throw std::runtime_error(
+                        "rust storage executor: tiled Encode for non-compact "
+                        "sources is not implemented");
+                }
+                copy_strided_extent_to_device(instr, source.data(), full_shape);
+            } else {
+                const std::uint64_t elem = dtype_bytes(info.dtype);
+                const std::uint64_t row_bytes =
+                    static_cast<std::uint64_t>(cols) * elem;
+                loader_.copy_storage_bytes_to_device(
+                    instr.source.file_id,
+                    instr.source.file_offset + instr.source.stride.base_offset +
+                        static_cast<std::uint64_t>(row_start) * row_bytes,
+                    static_cast<std::uint64_t>(rows) * row_bytes,
+                    source.data());
+            }
+        } else {
+            if (instr.input_buffers.len != 1) {
+                throw std::runtime_error(
+                    "rust storage executor: Encode expects source or one input");
+            }
+            const DeviceTensor& input =
+                buffer_or_finalized_tensor(instr.input_buffers.ptr[0]);
+            source = DeviceTensor::allocate(input.dtype(), tile_shape);
+#if PIE_CUDA_RUST_STORAGE_EXECUTOR_HAS_CUDA
+            const std::uint64_t row_bytes =
+                static_cast<std::uint64_t>(cols) * dtype_bytes(input.dtype());
+            CUDA_CHECK(cudaMemcpyAsync(
+                source.data(),
+                static_cast<const std::uint8_t*>(input.data()) +
+                    static_cast<std::uint64_t>(row_start) * row_bytes,
+                static_cast<std::uint64_t>(rows) * row_bytes,
+                cudaMemcpyDeviceToDevice,
+                /*stream=*/0));
+#else
+            throw std::runtime_error(
+                "rust storage executor: CUDA Encode compiled without CUDA "
+                "headers");
+#endif
+        }
+        if (source.dtype() == DType::BF16) {
+            return source;
+        }
+        DeviceTensor bf16 = DeviceTensor::allocate(DType::BF16, tile_shape);
+        cast_tensor_to_ptr(source, bf16.data(), DType::BF16);
+        return bf16;
+    }
+
+    DType encode_source_dtype(
+        const pie_weight_loader::PieLoaderStorageInstrView& instr)
+    {
+        if (instr.has_source) {
+            if (instr.source.tensor_id >= source_tensor_names_.size()) {
+                throw std::runtime_error(
+                    "rust storage executor: Encode source tensor id out of range");
+            }
+            return loader_.info(source_tensor_names_[instr.source.tensor_id]).dtype;
+        }
+        if (instr.input_buffers.len != 1) {
+            throw std::runtime_error(
+                "rust storage executor: Encode expects source or one input");
+        }
+        return buffer_or_finalized_tensor(instr.input_buffers.ptr[0]).dtype();
+    }
+
+    bool can_tile_encode(
+        const pie_weight_loader::PieLoaderStorageInstrView& instr) const
+    {
+        return !instr.has_source || wl_cpp::compact_extent(instr.source.stride);
+    }
+
+    int encode_rows_per_tile(
+        const pie_weight_loader::PieLoaderStorageInstrView& instr,
+        DType source_dtype,
+        int rows,
+        int cols) const
+    {
+        const std::uint64_t max_tile_bytes =
+            instr.max_tile_bytes == 0 ? (64ull << 20) : instr.max_tile_bytes;
+        const std::uint64_t source_row_bytes =
+            static_cast<std::uint64_t>(cols) * dtype_bytes(source_dtype);
+        const std::uint64_t bf16_row_bytes =
+            static_cast<std::uint64_t>(cols) * dtype_bytes(DType::BF16);
+        const std::uint64_t scratch_per_row =
+            source_dtype == DType::BF16
+                ? bf16_row_bytes
+                : source_row_bytes + bf16_row_bytes;
+        const std::uint64_t rows_per_tile = std::max<std::uint64_t>(
+            1,
+            max_tile_bytes / std::max<std::uint64_t>(1, scratch_per_row));
+        return static_cast<int>(
+            std::min<std::uint64_t>(
+                static_cast<std::uint64_t>(rows),
+                rows_per_tile));
+    }
+
+    void launch_encode_tile(
+        const pie_weight_loader::PieLoaderStorageInstrView& instr,
+        const DeviceTensor& bf16,
+        DeviceTensor& out,
+        DeviceTensor& scale,
+        int row_start,
+        int rows,
+        int cols)
+    {
+#if PIE_CUDA_RUST_STORAGE_EXECUTOR_HAS_CUDA
+        switch (instr.transform_to) {
+        case pie_weight_loader::PieLoaderQuantScheme::Fp8E4M3:
+            if (out.dtype() != DType::FP8_E4M3) {
+                throw std::runtime_error(
+                    "rust storage executor: FP8 Encode output dtype mismatch");
+            }
+            kernels::quantize_bf16_to_fp8_e4m3_per_channel(
+                bf16.data(),
+                static_cast<std::uint8_t*>(out.data()) +
+                    static_cast<std::uint64_t>(row_start) *
+                        static_cast<std::uint64_t>(cols),
+                static_cast<float*>(scale.data()) + row_start,
+                rows,
+                cols,
+                /*stream=*/0);
+            CUDA_CHECK(cudaGetLastError());
+            return;
+        case pie_weight_loader::PieLoaderQuantScheme::Int8Symmetric:
+            if (out.dtype() != DType::INT8) {
+                throw std::runtime_error(
+                    "rust storage executor: INT8 Encode output dtype mismatch");
+            }
+            kernels::quantize_bf16_to_int8_per_channel(
+                bf16.data(),
+                static_cast<std::int8_t*>(out.data()) +
+                    static_cast<std::uint64_t>(row_start) *
+                        static_cast<std::uint64_t>(cols),
+                static_cast<float*>(scale.data()) + row_start,
+                rows,
+                cols,
+                /*stream=*/0);
+            CUDA_CHECK(cudaGetLastError());
+            return;
+        default:
+            throw std::runtime_error(
+                "rust storage executor: unsupported Encode quant scheme");
+        }
+#else
+        (void)instr;
+        (void)bf16;
+        (void)out;
+        (void)scale;
+        (void)row_start;
+        (void)rows;
+        (void)cols;
+        throw std::runtime_error(
+            "rust storage executor: CUDA Encode compiled without CUDA headers");
+#endif
+    }
+
+    void encode_tile_map(
+        const pie_weight_loader::PieLoaderStorageInstrView& instr,
+        LoadExecutionStats& stats)
+    {
+        if (instr.output_buffers.len != 2) {
+            throw std::runtime_error(
+                "rust storage executor: Encode expects weight and scale outputs");
+        }
+        DeviceTensor& out = buffer_tensor(instr.output_buffers.ptr[0]);
+        DeviceTensor& scale = buffer_tensor(instr.output_buffers.ptr[1]);
+        const auto shape = out.shape();
+        if (shape.size() != 2) {
+            throw std::runtime_error(
+                "rust storage executor: runtime Encode expects a 2-D weight");
+        }
+        const int rows = static_cast<int>(shape[0]);
+        const int cols = static_cast<int>(shape[1]);
+        if (scale.dtype() != DType::FP32 ||
+            scale.shape() != std::vector<std::int64_t>{shape[0]}) {
+            throw std::runtime_error(
+                "rust storage executor: Encode scale output must be FP32 [rows]");
+        }
+        stats.runtime_quantized_weights += 1;
+        stats.runtime_quant_bytes_after += out.nbytes();
+        if (instr.has_source) {
+            stats.runtime_quant_bytes_before += instr.source.span_bytes;
+        } else if (instr.input_buffers.len == 1) {
+            stats.runtime_quant_bytes_before +=
+                buffer_or_finalized_tensor(instr.input_buffers.ptr[0]).nbytes();
+        }
+
+        if (can_tile_encode(instr)) {
+            const DType source_dtype = encode_source_dtype(instr);
+            const int rows_per_tile =
+                encode_rows_per_tile(instr, source_dtype, rows, cols);
+            for (int row = 0; row < rows; row += rows_per_tile) {
+                const int tile_rows = std::min(rows_per_tile, rows - row);
+                DeviceTensor bf16_tile =
+                    materialize_encode_input_bf16_rows(
+                        instr, shape, row, tile_rows);
+                launch_encode_tile(
+                    instr, bf16_tile, out, scale, row, tile_rows, cols);
+            }
+            return;
+        }
+
+        DeviceTensor bf16 =
+            materialize_encode_input_bf16_rows(instr, shape, 0, rows);
+        launch_encode_tile(instr, bf16, out, scale, 0, rows, cols);
     }
 
     void reblock_tile_map(
@@ -492,8 +752,14 @@ private:
         spec.name = wl_cpp::bytes_to_string(tensor.name);
         if (tensor.encoding_kind ==
             pie_weight_loader::PieLoaderEncodingKind::Quant) {
-            spec.dtype = DType::UINT8;
-            spec.shape = {static_cast<std::int64_t>(buffer.mapped().nbytes())};
+            const DType physical = quant_physical_dtype(tensor);
+            if (physical == DType::FP8_E4M3 || physical == DType::INT8) {
+                spec.dtype = physical;
+                spec.shape = wl_cpp::i64_slice_to_vector(tensor.shape);
+            } else {
+                spec.dtype = DType::UINT8;
+                spec.shape = {static_cast<std::int64_t>(buffer.mapped().nbytes())};
+            }
         } else {
             spec.dtype = dtype_from_rust(tensor.dtype);
             spec.shape = wl_cpp::i64_slice_to_vector(tensor.shape);
@@ -533,6 +799,7 @@ private:
             }
             QuantMeta meta;
             meta.kind = quant_meta_kind(attachment.granularity);
+            meta.scale_name = attachment.scale_tensor_name;
             meta.scale = &weights_.get(attachment.scale_tensor_name);
             meta.group_size = attachment.group_size;
             meta.channel_axis = attachment.channel_axis;

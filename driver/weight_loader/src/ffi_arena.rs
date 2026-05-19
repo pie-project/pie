@@ -177,6 +177,7 @@ impl FfiArena {
                 input_buffers: empty_buffers,
                 output_buffers: empty_buffers,
                 tile_kind: PieLoaderTileMapKind::None,
+                max_tile_bytes: 0,
                 transform_from: PieLoaderQuantScheme::None,
                 transform_to: PieLoaderQuantScheme::None,
                 name: empty_name,
@@ -192,6 +193,7 @@ impl FfiArena {
                 input_buffers: empty_buffers,
                 output_buffers: empty_buffers,
                 tile_kind: PieLoaderTileMapKind::None,
+                max_tile_bytes: 0,
                 transform_from: PieLoaderQuantScheme::None,
                 transform_to: PieLoaderQuantScheme::None,
                 name: empty_name,
@@ -204,7 +206,7 @@ impl FfiArena {
                 inputs,
                 outputs,
                 transform,
-                ..
+                tile,
             } => PieLoaderStorageInstrView {
                 id: id.0,
                 kind: PieLoaderStorageInstrKind::TileMap,
@@ -222,6 +224,7 @@ impl FfiArena {
                 input_buffers: self.push_buffer_ids(inputs),
                 output_buffers: self.push_buffer_ids(outputs),
                 tile_kind: ffi_tile_kind(*kind),
+                max_tile_bytes: tile.max_tile_bytes,
                 transform_from: transform
                     .from
                     .map(ffi_quant_scheme)
@@ -249,6 +252,7 @@ impl FfiArena {
                 input_buffers: self.push_buffer_ids(&[*input]),
                 output_buffers: self.push_buffer_ids(&[*output]),
                 tile_kind: PieLoaderTileMapKind::None,
+                max_tile_bytes: 0,
                 transform_from: PieLoaderQuantScheme::None,
                 transform_to: PieLoaderQuantScheme::None,
                 name: empty_name,
@@ -269,6 +273,7 @@ impl FfiArena {
                 input_buffers: self.push_buffer_ids(metadata),
                 output_buffers: self.push_buffer_ids(&[*tensor]),
                 tile_kind: PieLoaderTileMapKind::None,
+                max_tile_bytes: 0,
                 transform_from: PieLoaderQuantScheme::None,
                 transform_to: PieLoaderQuantScheme::None,
                 name: empty_name,
@@ -284,6 +289,7 @@ impl FfiArena {
                 input_buffers: empty_buffers,
                 output_buffers: empty_buffers,
                 tile_kind: PieLoaderTileMapKind::None,
+                max_tile_bytes: 0,
                 transform_from: PieLoaderQuantScheme::None,
                 transform_to: PieLoaderQuantScheme::None,
                 name: empty_name,
@@ -299,6 +305,7 @@ impl FfiArena {
                 input_buffers: empty_buffers,
                 output_buffers: self.push_buffer_ids(&[*tensor]),
                 tile_kind: PieLoaderTileMapKind::None,
+                max_tile_bytes: 0,
                 transform_from: PieLoaderQuantScheme::None,
                 transform_to: PieLoaderQuantScheme::None,
                 name: self.push_string(name),

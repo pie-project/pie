@@ -107,6 +107,27 @@ inline std::vector<RustQuantAttachment> infer_rust_quant_attachments(
     }
 
     std::vector<RustQuantAttachment> attachments;
+    for (std::size_t i = 0; i < view.tensors.len; ++i) {
+        const auto& tensor = view.tensors.ptr[i];
+        if (tensor.encoding_kind != pie_weight_loader::PieLoaderEncodingKind::Quant) {
+            continue;
+        }
+        if (tensor.quant_scheme != pie_weight_loader::PieLoaderQuantScheme::Fp8E4M3 &&
+            tensor.quant_scheme != pie_weight_loader::PieLoaderQuantScheme::Int8Symmetric) {
+            continue;
+        }
+        const std::string name = rust_loader_bytes_to_string(tensor.name);
+        const std::string scale = name + "_scale_inv";
+        if (!present.contains(scale)) continue;
+        attachments.push_back(RustQuantAttachment{
+            .tensor_name = name,
+            .scale_tensor_name = scale,
+            .granularity = QuantGranularity::PerChannel,
+            .group_size = 0,
+            .channel_axis = 0,
+        });
+    }
+
     const bool is_gpt_oss =
         hf.model_type == "gpt_oss" || hf.model_type == "gpt-oss" ||
         hf.model_type == "gptoss";
@@ -133,13 +154,14 @@ inline std::vector<RustQuantAttachment> infer_rust_quant_attachments(
 inline RustLoaderCompileResult compile_rust_loader_plan_from_metadata(
     const HfConfig& hf,
     const SafetensorsCheckpointSource& loader,
+    const std::string& runtime_quant,
     int tp_rank,
     int tp_size,
     std::uint64_t max_tile_bytes,
     std::uint32_t preferred_alignment)
 {
     RustLoaderInputBuilder input;
-    input.set_model(hf);
+    input.set_model(hf, runtime_quant);
     input.set_target(
         tp_rank,
         tp_size,

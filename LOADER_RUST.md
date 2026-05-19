@@ -1026,6 +1026,12 @@ Current cutover checkpoint:
 - The Rust storage compiler preserves source strides for non-leading-axis TP
   slices, and the CUDA executor materializes those strided extents through the
   generic safetensors slice copier.
+- CUDA `runtime_quant={fp8,int8}` is back on the Rust path: the default
+  `RuntimeABI` emits Quant contracts for dense projection weights, the algebra
+  lowers Raw -> Quant as `Encode` plus generated `_scale_inv` metadata outputs,
+  and the CUDA executor materializes those outputs through Encode TileMaps.
+  The storage FFI now carries the physical tile budget, so compact Encode
+  sources execute as bounded row tiles rather than full-source scratch tensors.
 - `cargo test --manifest-path driver/weight_loader/Cargo.toml`,
   `cmake --build driver/cuda/build --target pie_driver_cuda_lib -j2`,
   `cmake --build driver/cuda/build --target pie_driver_cuda -j2`,

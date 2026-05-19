@@ -4,7 +4,9 @@ use crate::ir::{ByteSpan, LayoutExpr, LayoutPlan};
 use crate::semantic::SemanticGraph;
 use crate::source::{CheckpointMetadata, RawTensor};
 use crate::storage::StorageTarget;
-use crate::types::{DType, Encoding, QuantSpec, Sharding, TensorDecl, TensorId, encoding_nbytes};
+use crate::types::{
+    DType, Encoding, QuantScheme, QuantSpec, Sharding, TensorDecl, TensorId, encoding_nbytes,
+};
 
 pub fn plan_from_semantics(
     metadata: &CheckpointMetadata,
@@ -14,6 +16,7 @@ pub fn plan_from_semantics(
 ) -> Result<LayoutPlan, CompileError> {
     let mut plan = LayoutPlan::new();
     let mut contract_values = Vec::with_capacity(abi.tensors.len());
+    let mut next_generated_tensor = abi.tensors.len() as u32;
     for (output_index, contract) in abi.tensors.iter().enumerate() {
         let (value_id, output_id) = lower_contract(
             metadata,
@@ -23,6 +26,7 @@ pub fn plan_from_semantics(
             &mut plan,
             &contract_values,
             TensorId(output_index as u32),
+            &mut next_generated_tensor,
         )?;
         contract_values.push(value_id);
         plan.outputs.push(output_id);
@@ -38,6 +42,7 @@ fn lower_contract(
     plan: &mut LayoutPlan,
     contract_values: &[crate::types::ExprId],
     output_id: TensorId,
+    next_generated_tensor: &mut u32,
 ) -> Result<(crate::types::ExprId, crate::types::ExprId), CompileError> {
     let (mut current, mut current_decl) =
         lower_contract_source(metadata, graph, contract, plan, contract_values, output_id)?;
@@ -76,7 +81,15 @@ fn lower_contract(
         current_decl = decl;
     }
 
-    current = lower_encoding_change(plan, current, &metadata_values, &mut current_decl, contract)?;
+    current = lower_encoding_change(
+        plan,
+        current,
+        &metadata_values,
+        &mut current_decl,
+        contract,
+        output_id,
+        next_generated_tensor,
+    )?;
 
     let target_layout = contract.layout.clone();
     if current_decl.layout != target_layout || current_decl.alignment != contract.alignment {
@@ -316,6 +329,8 @@ fn lower_encoding_change(
     metadata: &[crate::types::ExprId],
     current_decl: &mut TensorDecl,
     contract: &RuntimeTensorContract,
+    output_id: TensorId,
+    next_generated_tensor: &mut u32,
 ) -> Result<crate::types::ExprId, CompileError> {
     if current_decl.encoding == contract.encoding {
         return Ok(input);
@@ -346,12 +361,16 @@ fn lower_encoding_change(
         }
         (Encoding::Raw(_), Encoding::Quant(target)) => {
             let mut decl = current_decl.clone();
+            decl.id = output_id;
+            decl.name = contract.output_name.clone();
             decl.encoding = Encoding::Quant(target.clone());
             *current_decl = decl.clone();
+            let metadata_outputs =
+                runtime_quant_metadata_outputs(contract, &decl, next_generated_tensor);
             Ok(plan.push(LayoutExpr::Encode {
                 scheme: target.scheme,
                 input,
-                metadata_outputs: Vec::new(),
+                metadata_outputs,
                 decl,
             }))
         }
@@ -369,6 +388,36 @@ fn lower_encoding_change(
             }))
         }
     }
+}
+
+fn runtime_quant_metadata_outputs(
+    contract: &RuntimeTensorContract,
+    quant_decl: &TensorDecl,
+    next_generated_tensor: &mut u32,
+) -> Vec<TensorDecl> {
+    let Encoding::Quant(spec) = &quant_decl.encoding else {
+        return Vec::new();
+    };
+    if !matches!(
+        spec.scheme,
+        QuantScheme::Fp8E4M3 | QuantScheme::Int8Symmetric
+    ) {
+        return Vec::new();
+    }
+    if quant_decl.shape.len() != 2 {
+        return Vec::new();
+    }
+    let id = TensorId(*next_generated_tensor);
+    *next_generated_tensor = next_generated_tensor.saturating_add(1);
+    vec![TensorDecl {
+        id,
+        name: format!("{}_scale_inv", contract.output_name),
+        shape: vec![quant_decl.shape[0]],
+        encoding: Encoding::Raw(DType::F32),
+        layout: contract.layout.clone(),
+        sharding: quant_decl.sharding,
+        alignment: contract.alignment,
+    }]
 }
 
 fn source_decl(raw: &RawTensor) -> TensorDecl {
