@@ -34,7 +34,6 @@ fn compile(input: &PieLoaderCompileInput) -> Result<StorageProgram, CompileError
         tensors: tensors_from_ffi(tensors)?,
     };
     let model = crate::config::ModelConfig::from_ffi(&input.model)?;
-    let abi = crate::abi::RuntimeAbi::from_ffi(&input.runtime_abi)?;
     let target = StorageTarget {
         backend: backend_kind(input.target.backend),
         tp_rank: input.target.tp_rank,
@@ -43,6 +42,11 @@ fn compile(input: &PieLoaderCompileInput) -> Result<StorageProgram, CompileError
         preferred_alignment: input.target.preferred_alignment.max(1),
         mxfp4_moe: mxfp4_policy(input.target.mxfp4_moe),
         native_mxfp4_moe: input.target.native_mxfp4_moe,
+    };
+    let abi = if input.runtime_abi.tensors.len == 0 {
+        crate::abi::RuntimeAbi::default_for_target(&metadata, &model, &target)?
+    } else {
+        crate::abi::RuntimeAbi::from_ffi(&input.runtime_abi)?
     };
     compile_storage_program(&metadata, &model, &abi, target)
 }

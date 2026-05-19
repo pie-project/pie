@@ -82,15 +82,6 @@ add_library(pie_driver_cuda_lib STATIC
   ../common/src/safetensors_manifest.cpp
   src/loader/gguf_source.cpp
   src/loader/hf_config.cpp
-  src/loader/layout_plan.cpp
-  src/loader/layout_planner.cpp
-  src/loader/layout_typecheck.cpp
-  src/loader/model_adapter.cpp
-  src/loader/model_family.cpp
-  src/loader/model_schema.cpp
-  src/loader/model_schema_registry.cpp
-  src/loader/semantic_graph.cpp
-  src/loader/runtime_abi.cpp
   src/loader/safetensors.cpp
   src/model/qwen3.cpp
   src/model/qwen3_forward.cpp
@@ -233,27 +224,9 @@ target_include_directories(test_driver_common PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/../common/include)
 target_link_libraries(test_driver_common PRIVATE nlohmann_json::nlohmann_json)
 
-add_executable(test_layout_plan
-  tests/test_layout_plan.cpp
-  src/loader/gguf_source.cpp
-  src/loader/layout_plan.cpp
-  src/loader/layout_planner.cpp
-  src/loader/layout_typecheck.cpp
-  src/loader/model_adapter.cpp
-  src/loader/model_family.cpp
-  src/loader/model_schema.cpp
-  src/loader/model_schema_registry.cpp
-  src/loader/semantic_graph.cpp
-  src/loader/runtime_abi.cpp)
-target_include_directories(test_layout_plan PRIVATE
-  ${CMAKE_CURRENT_SOURCE_DIR}/src
-  ${CMAKE_CURRENT_SOURCE_DIR}/../common/include)
-target_link_libraries(test_layout_plan PRIVATE tomlplusplus::tomlplusplus)
-
 enable_testing()
 add_test(NAME brle COMMAND test_brle)
 add_test(NAME driver_common COMMAND test_driver_common)
-add_test(NAME layout_plan COMMAND test_layout_plan)
 
 target_link_libraries(pie_driver_cuda_lib PUBLIC
   CLI11::CLI11

@@ -165,18 +165,95 @@ private:
                 "rust storage executor: destination buffer missing");
         }
         auto* dst = static_cast<std::uint8_t*>(dst_it->second.data()) +
-            instr.dest.offset;
-        if (!wl_cpp::compact_extent(instr.source.stride) ||
-            !wl_cpp::compact_extent(instr.dest.stride)) {
+            instr.dest.offset + instr.dest.stride.base_offset;
+        if (!wl_cpp::compact_extent(instr.dest.stride)) {
             throw std::runtime_error(
-                "rust storage executor: non-compact ExtentWrite is not "
+                "rust storage executor: non-compact ExtentWrite destination is not "
                 "implemented");
+        }
+        if (!wl_cpp::compact_extent(instr.source.stride)) {
+            copy_strided_extent_to_device(instr, dst);
+            return;
         }
         loader_.copy_storage_bytes_to_device(
             instr.source.file_id,
-            instr.source.file_offset,
+            instr.source.file_offset + instr.source.stride.base_offset,
             instr.source.span_bytes,
             dst);
+    }
+
+    void copy_strided_extent_to_device(
+        const pie_weight_loader::PieLoaderStorageInstrView& instr,
+        void* dst)
+    {
+        const std::string& name = source_tensor_names_[instr.source.tensor_id];
+        const TensorInfo& info = loader_.info(name);
+        const TensorStorageInfo storage = loader_.storage_info(name);
+        if (instr.source.file_offset < storage.file_offset) {
+            throw std::runtime_error(
+                "rust storage executor: strided source starts before tensor");
+        }
+        const auto rank = info.shape.size();
+        if (instr.source.stride.dims.len != rank) {
+            throw std::runtime_error(
+                "rust storage executor: strided source rank mismatch for '" +
+                name + "'");
+        }
+
+        std::vector<std::int64_t> dense_strides(rank, 1);
+        std::int64_t stride = static_cast<std::int64_t>(dtype_bytes(info.dtype));
+        for (std::size_t i = rank; i > 0; --i) {
+            dense_strides[i - 1] = stride;
+            stride *= info.shape[i - 1];
+        }
+
+        std::uint64_t relative =
+            instr.source.file_offset - storage.file_offset +
+            instr.source.stride.base_offset;
+        std::vector<TensorSlice> slices;
+        slices.reserve(rank);
+        for (std::size_t axis = 0; axis < rank; ++axis) {
+            const auto& dim = instr.source.stride.dims.ptr[axis];
+            if (dim.src_stride != dense_strides[axis]) {
+                throw std::runtime_error(
+                    "rust storage executor: unsupported strided source layout "
+                    "for '" + name + "'");
+            }
+            if (dim.count < 0 || dim.count > info.shape[axis]) {
+                throw std::runtime_error(
+                    "rust storage executor: strided source count out of range "
+                    "for '" + name + "'");
+            }
+            const auto axis_stride =
+                static_cast<std::uint64_t>(dense_strides[axis]);
+            const std::int64_t start =
+                axis_stride == 0
+                    ? 0
+                    : static_cast<std::int64_t>(relative / axis_stride);
+            relative = axis_stride == 0 ? relative : relative % axis_stride;
+            if (start < 0 || start + dim.count > info.shape[axis]) {
+                throw std::runtime_error(
+                    "rust storage executor: strided source offset out of "
+                    "range for '" + name + "'");
+            }
+            if (start != 0 || dim.count != info.shape[axis]) {
+                slices.push_back(TensorSlice{
+                    .axis = static_cast<int>(axis),
+                    .start = start,
+                    .length = dim.count,
+                });
+            }
+        }
+        if (relative != 0) {
+            throw std::runtime_error(
+                "rust storage executor: strided source offset is not aligned "
+                "to tensor strides for '" + name + "'");
+        }
+        loader_.copy_strided_to_device(
+            name,
+            slices,
+            dst,
+            wl_cpp::extent_shape(instr.dest.stride));
     }
 
     DeviceTensor& buffer_tensor(std::uint32_t buffer_id)

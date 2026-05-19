@@ -1,6 +1,6 @@
 use crate::error::CompileError;
 use crate::ir::{LayoutExpr, LayoutPlan};
-use crate::types::{Encoding, Layout, QuantScheme, TensorDecl, encoding_nbytes};
+use crate::types::{Encoding, Layout, QuantScheme, Sharding, TensorDecl, encoding_nbytes};
 
 pub fn typecheck(plan: &LayoutPlan) -> Result<Vec<TensorDecl>, CompileError> {
     let mut inferred = Vec::with_capacity(plan.exprs.len());
@@ -97,6 +97,7 @@ fn infer_expr(
                 )));
             }
             let mut expected = input_decl(inferred, input.0, index)?.clone();
+            let partition_axis = *axis;
             let axis = axis.0 as usize;
             if axis >= expected.shape.len() || expected.shape[axis] % i64::from(*parts) != 0 {
                 return Err(CompileError::InvalidInput(format!(
@@ -105,6 +106,11 @@ fn infer_expr(
                 )));
             }
             expected.shape[axis] /= i64::from(*parts);
+            expected.sharding = Sharding {
+                axis: Some(partition_axis),
+                world: *parts,
+                rank: *rank,
+            };
             expect_decl(index, decl, expected)
         }
         LayoutExpr::Join { inputs, axis, decl } => {

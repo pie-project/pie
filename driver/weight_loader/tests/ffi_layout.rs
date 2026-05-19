@@ -672,6 +672,120 @@ fn join_and_select_contracts_lower_to_writes_and_view() {
     }
 }
 
+#[test]
+fn empty_runtime_abi_builds_default_tp_row_contracts() {
+    let file_path = bytes("model.safetensors");
+    let tensor_name = bytes("model.layers.0.self_attn.q_proj.weight");
+    let shape_values = [4_i64, 4_i64];
+    let shape = PieLoaderI64Slice {
+        ptr: shape_values.as_ptr(),
+        len: shape_values.len(),
+    };
+    let files = [PieLoaderCheckpointFileView {
+        id: 0,
+        path: file_path,
+        size_bytes: 256,
+        format: PieLoaderCheckpointFormat::Safetensors,
+    }];
+    let tensors = [PieLoaderCheckpointTensorView {
+        id: 0,
+        name: tensor_name,
+        file_id: 0,
+        file_offset: 64,
+        span_bytes: 32,
+        dtype: PieLoaderDType::BF16,
+        encoding_kind: PieLoaderEncodingKind::Raw,
+        quant_scheme: PieLoaderQuantScheme::None,
+        shape,
+        ..PieLoaderCheckpointTensorView::default()
+    }];
+    let mut input = compile_input(&files, &tensors, &[]);
+    input.target.tp_rank = 1;
+    input.target.tp_size = 2;
+
+    let mut handle: *mut PieLoaderProgramHandle = ptr::null_mut();
+    let mut error = PieLoaderError::default();
+    let status = unsafe { pie_loader_compile(&input, &mut handle, &mut error) };
+    assert_eq!(status, PieLoaderStatus::Ok, "{}", error_message(&error));
+    let view = unsafe { pie_loader_program_view(handle) };
+    assert_eq!(view.tensors.len, 1);
+    let tensors_view = unsafe { std::slice::from_raw_parts(view.tensors.ptr, view.tensors.len) };
+    let final_shape =
+        unsafe { std::slice::from_raw_parts(tensors_view[0].shape.ptr, tensors_view[0].shape.len) };
+    assert_eq!(final_shape, &[2, 4]);
+    let instrs = unsafe { std::slice::from_raw_parts(view.instrs.ptr, view.instrs.len) };
+    assert_eq!(instrs[1].kind, PieLoaderStorageInstrKind::ExtentWrite);
+    assert_eq!(instrs[1].source.file_offset, 80);
+    assert_eq!(instrs[1].source.span_bytes, 16);
+
+    unsafe {
+        pie_loader_program_free(handle);
+        pie_loader_error_free(&mut error);
+    }
+}
+
+#[test]
+fn empty_runtime_abi_builds_default_tp_column_contracts_as_strided_extents() {
+    let file_path = bytes("model.safetensors");
+    let tensor_name = bytes("model.layers.0.self_attn.o_proj.weight");
+    let shape_values = [4_i64, 4_i64];
+    let shape = PieLoaderI64Slice {
+        ptr: shape_values.as_ptr(),
+        len: shape_values.len(),
+    };
+    let files = [PieLoaderCheckpointFileView {
+        id: 0,
+        path: file_path,
+        size_bytes: 256,
+        format: PieLoaderCheckpointFormat::Safetensors,
+    }];
+    let tensors = [PieLoaderCheckpointTensorView {
+        id: 0,
+        name: tensor_name,
+        file_id: 0,
+        file_offset: 64,
+        span_bytes: 32,
+        dtype: PieLoaderDType::BF16,
+        encoding_kind: PieLoaderEncodingKind::Raw,
+        quant_scheme: PieLoaderQuantScheme::None,
+        shape,
+        ..PieLoaderCheckpointTensorView::default()
+    }];
+    let mut input = compile_input(&files, &tensors, &[]);
+    input.target.tp_rank = 1;
+    input.target.tp_size = 2;
+
+    let mut handle: *mut PieLoaderProgramHandle = ptr::null_mut();
+    let mut error = PieLoaderError::default();
+    let status = unsafe { pie_loader_compile(&input, &mut handle, &mut error) };
+    assert_eq!(status, PieLoaderStatus::Ok, "{}", error_message(&error));
+    let view = unsafe { pie_loader_program_view(handle) };
+    let tensors_view = unsafe { std::slice::from_raw_parts(view.tensors.ptr, view.tensors.len) };
+    let final_shape =
+        unsafe { std::slice::from_raw_parts(tensors_view[0].shape.ptr, tensors_view[0].shape.len) };
+    assert_eq!(final_shape, &[4, 2]);
+    let instrs = unsafe { std::slice::from_raw_parts(view.instrs.ptr, view.instrs.len) };
+    assert_eq!(instrs[1].source.file_offset, 68);
+    assert_eq!(instrs[1].source.span_bytes, 16);
+    let dims = unsafe {
+        std::slice::from_raw_parts(
+            instrs[1].source.stride.dims.ptr,
+            instrs[1].source.stride.dims.len,
+        )
+    };
+    assert_eq!(dims[0].count, 4);
+    assert_eq!(dims[0].src_stride, 8);
+    assert_eq!(dims[0].dst_stride, 4);
+    assert_eq!(dims[1].count, 2);
+    assert_eq!(dims[1].src_stride, 2);
+    assert_eq!(dims[1].dst_stride, 2);
+
+    unsafe {
+        pie_loader_program_free(handle);
+        pie_loader_error_free(&mut error);
+    }
+}
+
 fn bytes(value: &'static str) -> PieLoaderBytes {
     PieLoaderBytes {
         ptr: value.as_ptr(),

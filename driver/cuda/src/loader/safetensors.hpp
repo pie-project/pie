@@ -74,8 +74,8 @@ public:
         void* dst);
 
     /// Copy a slice of `name` along `axis`, keeping only this rank's portion
-    /// of the world. Used by layout-plan materialization to shard linear weights
-    /// directly into their final runtime allocations.
+    /// of the world. Used by storage-program materialization to shard linear
+    /// weights directly into their final runtime allocations.
     ///
     /// - 1-D tensors (biases): `axis` must be 0.
     /// - 2-D tensors (linear weights): `axis ∈ {0, 1}`.

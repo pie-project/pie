@@ -7,7 +7,7 @@
 #include <unordered_map>
 #include <utility>
 
-#include "loader/layout_plan.hpp"
+#include "loader/tensor_spec.hpp"
 #include "tensor.hpp"
 
 namespace pie_cuda_driver {

@@ -497,7 +497,24 @@ impl StorageCompiler<'_> {
             ValueLoc::Source(mut source) => {
                 let axis_index = axis.0 as usize;
                 let mut shape = source.shape.clone();
-                let row_bytes = dense_axis_stride_bytes(&shape, axis, &source.encoding)?;
+                if axis_index >= shape.len() {
+                    return Err(CompileError::InvalidInput(format!(
+                        "Select axis {} out of range for source shape {:?}",
+                        axis.0, shape
+                    )));
+                }
+                let old_stride = source.stride.clone();
+                let can_preserve_strides = encoding_dense_element_bytes(&source.encoding).is_some()
+                    && old_stride.dims.len() == shape.len();
+                let row_bytes = if can_preserve_strides {
+                    u64::try_from(old_stride.dims[axis_index].src_stride).map_err(|_| {
+                        CompileError::InvalidInput(
+                            "negative source stride in Select lowering".to_string(),
+                        )
+                    })?
+                } else {
+                    dense_axis_stride_bytes(&shape, axis, &source.encoding)?
+                };
                 source.offset_bytes += u64::try_from(start)
                     .ok()
                     .and_then(|start| start.checked_mul(row_bytes))
@@ -506,7 +523,11 @@ impl StorageCompiler<'_> {
                     })?;
                 shape[axis_index] = length;
                 source.shape = shape.clone();
-                source.stride = storage_extent_for_shape(&shape, &source.encoding)?;
+                source.stride = if can_preserve_strides {
+                    selected_source_extent(&old_stride, &shape, &source.encoding)?
+                } else {
+                    storage_extent_for_shape(&shape, &source.encoding)?
+                };
                 Ok(ValueLoc::Source(source))
             }
             ValueLoc::Buffer(input_buffer) => {
@@ -653,7 +674,8 @@ impl StorageCompiler<'_> {
         let span_bytes = encoding_nbytes(&source.shape, &source.encoding).ok_or_else(|| {
             CompileError::InvalidInput("source extent byte size overflow".to_string())
         })?;
-        if source.offset_bytes + span_bytes > raw.span_bytes {
+        let physical_bytes = strided_physical_source_bytes(&source.stride)?;
+        if source.offset_bytes + physical_bytes > raw.span_bytes {
             return Err(CompileError::InvalidInput(format!(
                 "source extent for '{}' exceeds tensor span",
                 raw.name
@@ -943,6 +965,32 @@ fn extent_storage_bytes(extent: &StridedExtent) -> Result<u64, CompileError> {
     .ok_or_else(|| CompileError::InvalidInput("extent byte size overflow".to_string()))
 }
 
+fn strided_physical_source_bytes(extent: &StridedExtent) -> Result<u64, CompileError> {
+    let mut max_offset = extent.base_offset;
+    for dim in &extent.dims {
+        if dim.count < 0 || dim.src_stride < 0 {
+            return Err(CompileError::InvalidInput(
+                "negative source extent dimension or stride".to_string(),
+            ));
+        }
+        if dim.count == 0 {
+            return Ok(0);
+        }
+        let count = u64::try_from(dim.count - 1)
+            .map_err(|_| CompileError::InvalidInput("source extent count overflow".to_string()))?;
+        let stride = u64::try_from(dim.src_stride)
+            .map_err(|_| CompileError::InvalidInput("source extent stride overflow".to_string()))?;
+        max_offset = max_offset
+            .checked_add(count.checked_mul(stride).ok_or_else(|| {
+                CompileError::InvalidInput("source extent byte overflow".to_string())
+            })?)
+            .ok_or_else(|| CompileError::InvalidInput("source extent byte overflow".to_string()))?;
+    }
+    max_offset
+        .checked_add(u64::from(extent.element_bytes))
+        .ok_or_else(|| CompileError::InvalidInput("source extent byte overflow".to_string()))
+}
+
 fn compact_extent(shape: &[i64], element_bytes: u64) -> StridedExtent {
     let mut stride = i64::try_from(element_bytes).unwrap_or(i64::MAX);
     let mut dims = Vec::with_capacity(shape.len());
@@ -992,6 +1040,40 @@ fn storage_extent_for_shape(
     Ok(byte_extent(encoding_nbytes(shape, encoding).ok_or_else(
         || CompileError::InvalidInput("packed extent byte size overflow".to_string()),
     )?))
+}
+
+fn selected_source_extent(
+    source: &StridedExtent,
+    shape: &[i64],
+    encoding: &Encoding,
+) -> Result<StridedExtent, CompileError> {
+    let Some(element_bytes) = encoding_dense_element_bytes(encoding) else {
+        return storage_extent_for_shape(shape, encoding);
+    };
+    if source.dims.len() != shape.len() {
+        return Err(CompileError::InvalidInput(format!(
+            "source stride rank {} does not match selected shape rank {}",
+            source.dims.len(),
+            shape.len()
+        )));
+    }
+    let dest = compact_extent(shape, element_bytes);
+    let dims = source
+        .dims
+        .iter()
+        .zip(shape.iter())
+        .zip(dest.dims.iter())
+        .map(|((dim, count), dest_dim)| DimSpec {
+            count: *count,
+            src_stride: dim.src_stride,
+            dst_stride: dest_dim.dst_stride,
+        })
+        .collect();
+    Ok(StridedExtent {
+        base_offset: source.base_offset,
+        element_bytes: u32::try_from(element_bytes).unwrap_or(u32::MAX),
+        dims,
+    })
 }
 
 fn dense_axis_stride_bytes(

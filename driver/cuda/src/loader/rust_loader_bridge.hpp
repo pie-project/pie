@@ -9,7 +9,6 @@
 #include <string>
 #include <unordered_map>
 
-#include "loader/layout_plan.hpp"
 #include "loader/rust_quant_attachment.hpp"
 #include "loader/rust_loader_input.hpp"
 #include "loader/rust_storage_program.hpp"
@@ -85,93 +84,53 @@ inline RustLoaderSourceIndex add_checkpoint_metadata_to_rust_input(
     return index;
 }
 
-inline bool rust_loader_contract_is_direct(
-    const TensorDecl& spec,
-    const TensorInfo& info)
+inline bool rust_loader_ends_with(
+    const std::string& value,
+    const std::string& suffix)
 {
-    const bool dtype_supported =
-        spec.dtype == info.dtype ||
-        (info.dtype == DType::FP16 && spec.dtype == DType::BF16) ||
-        (info.dtype == DType::FP32 && spec.dtype == DType::BF16) ||
-        (info.dtype == DType::BF16 && spec.dtype == DType::FP32);
-    return spec.shape == info.shape &&
-           dtype_supported &&
-           spec.ownership == TensorOwnershipKind::Owned &&
-           (spec.layout == TensorLayoutKind::Dense ||
-            spec.layout == TensorLayoutKind::Grouped ||
-            spec.layout == TensorLayoutKind::QuantPacked);
+    return value.size() >= suffix.size() &&
+           value.compare(value.size() - suffix.size(), suffix.size(), suffix) == 0;
 }
 
-inline std::uint64_t rust_loader_checked_mul(
-    std::uint64_t lhs,
-    std::uint64_t rhs,
-    const std::string& context)
-{
-    if (rhs != 0 && lhs > UINT64_MAX / rhs) {
-        throw std::runtime_error(
-            "rust loader compiler: byte-size overflow while lowering " +
-            context);
-    }
-    return lhs * rhs;
-}
-
-inline std::uint64_t rust_loader_tensor_nbytes(
-    const TensorInfo& info,
-    const std::string& name)
-{
-    std::uint64_t elements = 1;
-    for (const auto dim : info.shape) {
-        if (dim < 0) {
-            throw std::runtime_error(
-                "rust loader compiler: negative dimension for '" + name + "'");
-        }
-        elements = rust_loader_checked_mul(
-            elements,
-            static_cast<std::uint64_t>(dim),
-            name);
-    }
-    return rust_loader_checked_mul(
-        elements,
-        static_cast<std::uint64_t>(dtype_bytes(info.dtype)),
-        name);
-}
-
-inline bool rust_loader_direct_dtype_supported(DType dtype) noexcept
-{
-    switch (dtype) {
-    case DType::BF16:
-    case DType::INT32:
-    case DType::UINT8:
-        return true;
-    case DType::FP16:
-    case DType::FP32:
-    case DType::FP8_E4M3:
-    case DType::FP8_E5M2:
-    case DType::INT8:
-    case DType::INT64:
-    case DType::INT4_PACKED:
-        return false;
-    }
-    return false;
-}
-
-inline bool can_compile_rust_loader_direct(
+inline std::vector<RustQuantAttachment> infer_rust_quant_attachments(
     const HfConfig& hf,
-    const SafetensorsCheckpointSource& loader,
-    int tp_size)
+    const pie_weight_loader::PieLoaderStorageProgramView& view)
 {
-    if (tp_size != 1 || !hf.quant_method.empty() || hf.num_experts > 0) {
-        return false;
+    std::vector<std::string> runtime_names;
+    runtime_names.reserve(view.tensors.len);
+    std::unordered_map<std::string, bool> present;
+    present.reserve(view.tensors.len);
+    for (std::size_t i = 0; i < view.tensors.len; ++i) {
+        const auto name = rust_loader_bytes_to_string(view.tensors.ptr[i].name);
+        runtime_names.push_back(name);
+        present.emplace(name, true);
     }
-    for (const auto& name : loader.tensor_names()) {
-        if (!rust_loader_direct_dtype_supported(loader.info(name).dtype)) {
-            return false;
-        }
+
+    std::vector<RustQuantAttachment> attachments;
+    const bool is_gpt_oss =
+        hf.model_type == "gpt_oss" || hf.model_type == "gpt-oss" ||
+        hf.model_type == "gptoss";
+    if (!is_gpt_oss) {
+        return attachments;
     }
-    return true;
+    for (const auto& name : runtime_names) {
+        if (!rust_loader_ends_with(name, ".weight")) continue;
+        const std::string scale =
+            name.substr(0, name.size() - std::string(".weight").size()) +
+            ".weight_scale";
+        if (!present.contains(scale)) continue;
+        attachments.push_back(RustQuantAttachment{
+            .tensor_name = name,
+            .scale_tensor_name = scale,
+            .granularity = QuantGranularity::PerGroup,
+            .group_size = 32,
+            .channel_axis = 1,
+        });
+    }
+    return attachments;
 }
 
-inline RustLoaderCompileResult compile_rust_loader_plan_direct(
+inline RustLoaderCompileResult compile_rust_loader_plan_from_metadata(
     const HfConfig& hf,
     const SafetensorsCheckpointSource& loader,
     int tp_rank,
@@ -190,286 +149,19 @@ inline RustLoaderCompileResult compile_rust_loader_plan_direct(
 
     RustLoaderSourceIndex source_index =
         add_checkpoint_metadata_to_rust_input(input, loader);
-    std::size_t covered_contracts = 0;
-    for (const auto& name : source_index.tensor_names) {
-        const TensorInfo& info = loader.info(name);
-        const auto tensor_it = source_index.tensor_ids.find(name);
-        if (tensor_it == source_index.tensor_ids.end()) continue;
-        input.add_direct_contract(
-            name,
-            tensor_it->second,
-            info.dtype,
-            info.shape,
-            preferred_alignment,
-            /*shard_axis=*/-1);
-        ++covered_contracts;
-    }
-
+    RustStorageProgram program = compile_rust_storage_program(input.view());
+    const auto view = program.view();
+    const std::size_t runtime_tensor_count = view.tensors.len;
+    std::vector<RustQuantAttachment> attachments =
+        infer_rust_quant_attachments(hf, view);
     return RustLoaderCompileResult{
-        .program = compile_rust_storage_program(input.view()),
+        .program = std::move(program),
         .source_tensor_names = std::move(source_index.tensor_names),
-        .quant_attachments = {},
+        .quant_attachments = std::move(attachments),
         .source_tensor_count = source_index.tensor_ids.size(),
-        .covered_contract_count = covered_contracts,
-        .runtime_tensor_count = covered_contracts,
+        .covered_contract_count = runtime_tensor_count,
+        .runtime_tensor_count = runtime_tensor_count,
     };
-}
-
-inline RustLoaderCompileResult compile_rust_loader_plan(
-    const HfConfig& hf,
-    const LayoutPlan& layout_plan,
-    const SafetensorsCheckpointSource& loader,
-    int tp_rank,
-    int tp_size,
-    std::uint64_t max_tile_bytes,
-    std::uint32_t preferred_alignment)
-{
-    RustLoaderInputBuilder input;
-    input.set_model(hf);
-    input.set_target(
-        tp_rank,
-        tp_size,
-        max_tile_bytes,
-        preferred_alignment);
-    input.set_runtime_abi_name("pie-cuda", /*version=*/1);
-
-    RustLoaderSourceIndex source_index =
-        add_checkpoint_metadata_to_rust_input(input, loader);
-    const auto& tensor_ids = source_index.tensor_ids;
-
-    std::unordered_map<LayoutExprId, std::uint32_t> contract_for_expr;
-    std::size_t covered_contracts = 0;
-    for (const auto& binding : layout_plan.algebra.bindings) {
-        if (binding.root >= layout_plan.algebra.exprs.size()) continue;
-        const LayoutExpr& root = layout_plan.algebra.exprs[binding.root];
-        const auto spec_it = layout_plan.tensors.find(binding.runtime_name);
-        if (spec_it == layout_plan.tensors.end()) continue;
-        const TensorDecl& spec = spec_it->second;
-
-        auto emit_direct_source = [&](const LayoutExpr& source_expr) -> bool {
-            if (source_expr.kind != LayoutExprKind::Source ||
-                !loader.contains(source_expr.raw_name)) {
-                return false;
-            }
-            const TensorInfo& info = loader.info(source_expr.raw_name);
-            if (!rust_loader_contract_is_direct(spec, info)) return false;
-            const auto tensor_it = tensor_ids.find(source_expr.raw_name);
-            if (tensor_it == tensor_ids.end()) return false;
-            input.add_direct_contract(
-                binding.runtime_name,
-                tensor_it->second,
-                spec.dtype,
-                spec.shape,
-                preferred_alignment,
-                /*shard_axis=*/-1);
-            return true;
-        };
-
-        auto emit_join = [&](LayoutExprId join_id, const LayoutExpr& join_expr) -> bool {
-            if (join_expr.kind != LayoutExprKind::Join || join_expr.axis < 0) {
-                return false;
-            }
-            std::vector<std::uint32_t> source_ids;
-            source_ids.reserve(join_expr.inputs.size());
-            for (const auto source_expr_id : join_expr.inputs) {
-                if (source_expr_id >= layout_plan.algebra.exprs.size()) return false;
-                const LayoutExpr& source_expr =
-                    layout_plan.algebra.exprs[source_expr_id];
-                if (source_expr.kind != LayoutExprKind::Source ||
-                    !loader.contains(source_expr.raw_name)) {
-                    return false;
-                }
-                const auto tensor_it = tensor_ids.find(source_expr.raw_name);
-                if (tensor_it == tensor_ids.end()) return false;
-                source_ids.push_back(tensor_it->second);
-            }
-            if (source_ids.empty()) return false;
-            input.add_join_contract(
-                binding.runtime_name,
-                std::move(source_ids),
-                join_expr.axis,
-                spec.dtype,
-                spec.shape,
-                preferred_alignment);
-            contract_for_expr[join_id] =
-                static_cast<std::uint32_t>(covered_contracts);
-            return true;
-        };
-
-        auto emit_expert_stack_byte_spans =
-            [&](const LayoutExpr& stack_expr) -> bool {
-                if (stack_expr.kind != LayoutExprKind::Stack ||
-                    stack_expr.inputs.empty() ||
-                    stack_expr.inputs.size() % 3 != 0) {
-                    return false;
-                }
-                const bool wants_gate_up =
-                    binding.runtime_name == stack_expr.runtime_name;
-                const bool wants_down =
-                    binding.runtime_name == stack_expr.secondary_runtime_name;
-                if (!wants_gate_up && !wants_down) return false;
-                if (spec.dtype != DType::BF16 || spec.shape.size() != 3) {
-                    return false;
-                }
-
-                const std::size_t expert_count =
-                    stack_expr.inputs.size() / 3;
-                if (static_cast<std::uint64_t>(spec.shape[0]) !=
-                    expert_count) {
-                    return false;
-                }
-
-                std::vector<pie_weight_loader::PieLoaderRuntimeByteSpanView>
-                    spans;
-                spans.reserve(wants_gate_up ? expert_count * 2 : expert_count);
-                for (std::size_t expert = 0; expert < expert_count;
-                     ++expert) {
-                    const std::size_t base = expert * 3;
-                    const std::size_t first = wants_gate_up ? base : base + 2;
-                    const std::size_t count = wants_gate_up ? 2 : 1;
-                    std::int64_t row_offset = 0;
-                    for (std::size_t j = 0; j < count; ++j) {
-                        const LayoutExprId source_expr_id =
-                            stack_expr.inputs[first + j];
-                        if (source_expr_id >=
-                            layout_plan.algebra.exprs.size()) {
-                            return false;
-                        }
-                        const LayoutExpr& source_expr =
-                            layout_plan.algebra.exprs[source_expr_id];
-                        if (source_expr.kind != LayoutExprKind::Source ||
-                            !loader.contains(source_expr.raw_name)) {
-                            return false;
-                        }
-                        const TensorInfo& info =
-                            loader.info(source_expr.raw_name);
-                        if (info.dtype != spec.dtype ||
-                            info.shape.size() != 2 ||
-                            info.shape[1] != spec.shape[2]) {
-                            return false;
-                        }
-                        if (row_offset + info.shape[0] > spec.shape[1]) {
-                            return false;
-                        }
-                        const auto tensor_it =
-                            tensor_ids.find(source_expr.raw_name);
-                        if (tensor_it == tensor_ids.end()) return false;
-                        const std::uint64_t rows_before =
-                            static_cast<std::uint64_t>(expert) *
-                                static_cast<std::uint64_t>(spec.shape[1]) +
-                            static_cast<std::uint64_t>(row_offset);
-                        const std::uint64_t dest_offset =
-                            rust_loader_checked_mul(
-                                rust_loader_checked_mul(
-                                    rows_before,
-                                    static_cast<std::uint64_t>(spec.shape[2]),
-                                    binding.runtime_name),
-                                static_cast<std::uint64_t>(
-                                    dtype_bytes(spec.dtype)),
-                                binding.runtime_name);
-                        spans.push_back(
-                            pie_weight_loader::
-                                PieLoaderRuntimeByteSpanView{
-                                    .source_tensor_id = tensor_it->second,
-                                    .source_offset_bytes = 0,
-                                    .dest_offset_bytes = dest_offset,
-                                    .span_bytes =
-                                        rust_loader_tensor_nbytes(
-                                            info,
-                                            source_expr.raw_name),
-                                });
-                        row_offset += info.shape[0];
-                    }
-                    if (row_offset != spec.shape[1]) return false;
-                }
-                input.add_byte_span_contract(
-                    binding.runtime_name,
-                    std::move(spans),
-                    spec.dtype,
-                    spec.shape,
-                    preferred_alignment);
-                return true;
-            };
-
-        bool emitted = false;
-        if (root.kind == LayoutExprKind::Realize && !root.inputs.empty()) {
-            const LayoutExprId input_expr_id = root.inputs.front();
-            if (input_expr_id < layout_plan.algebra.exprs.size()) {
-                const LayoutExpr& input_expr =
-                    layout_plan.algebra.exprs[input_expr_id];
-                emitted = emit_direct_source(input_expr);
-                if (!emitted) {
-                    emitted = emit_join(input_expr_id, input_expr);
-                }
-                if (!emitted) {
-                    emitted = emit_expert_stack_byte_spans(input_expr);
-                }
-            }
-        } else if (root.kind == LayoutExprKind::View && !root.inputs.empty()) {
-            const LayoutExprId input_expr_id = root.inputs.front();
-            const auto source_contract = contract_for_expr.find(input_expr_id);
-            if (source_contract != contract_for_expr.end()) {
-                if (spec.view_axis < 0) {
-                    throw std::runtime_error(
-                        "rust loader compiler: view tensor '" +
-                        binding.runtime_name +
-                        "' does not declare ABI-owned view range");
-                }
-                if (root.axis >= 0 &&
-                    (root.axis != spec.view_axis ||
-                     root.start != spec.view_start ||
-                     root.length != spec.view_length)) {
-                    throw std::runtime_error(
-                        "rust loader compiler: view tensor '" +
-                        binding.runtime_name +
-                        "' algebra range disagrees with RuntimeABI contract");
-                }
-                input.add_select_contract(
-                    binding.runtime_name,
-                    source_contract->second,
-                    spec.view_axis,
-                    spec.view_start,
-                    spec.view_length,
-                    spec.dtype,
-                    spec.shape,
-                    preferred_alignment);
-                emitted = true;
-            }
-        } else if (root.kind == LayoutExprKind::Source) {
-            emitted = emit_direct_source(root);
-        }
-
-        if (emitted) {
-            const auto contract_id =
-                static_cast<std::uint32_t>(covered_contracts);
-            contract_for_expr[binding.root] = contract_id;
-            ++covered_contracts;
-        }
-    }
-
-    RustLoaderCompileResult result{
-        .program = compile_rust_storage_program(input.view()),
-        .source_tensor_names = std::move(source_index.tensor_names),
-        .quant_attachments = {},
-        .source_tensor_count = source_index.tensor_ids.size(),
-        .covered_contract_count = covered_contracts,
-        .runtime_tensor_count = layout_plan.algebra.bindings.size(),
-    };
-    for (const auto& [name, spec] : layout_plan.tensors) {
-        if (spec.quant.format == QuantFormat::None ||
-            spec.quant.scale_tensor.empty()) {
-            continue;
-        }
-        result.quant_attachments.push_back(
-            RustQuantAttachment{
-                .tensor_name = name,
-                .scale_tensor_name = spec.quant.scale_tensor,
-                .granularity = spec.quant.granularity,
-                .group_size = spec.quant.group_size,
-                .channel_axis = spec.quant.channel_axis,
-            });
-    }
-    return result;
 }
 
 inline std::string describe_rust_storage_program(

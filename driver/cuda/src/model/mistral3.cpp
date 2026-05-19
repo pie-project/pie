@@ -40,7 +40,7 @@ Qwen3Weights bind_mistral3(const LoadedModel& engine) {
             if (!engine.has(weight_name) ||
                 engine.get(weight_name).dtype() != DType::BF16) {
                 throw std::runtime_error(
-                    "mistral3: layout plan did not materialize bf16 weight '" +
+                    "mistral3: storage loader did not materialize bf16 weight '" +
                     weight_name + "'");
             }
         }

@@ -2,7 +2,7 @@
 
 #include <string>
 
-#include "loader/layout_plan.hpp"
+#include "loader/tensor_spec.hpp"
 
 namespace pie_cuda_driver {
 

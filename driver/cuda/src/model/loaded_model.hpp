@@ -9,8 +9,8 @@
 #include <utility>
 
 #include "config.hpp"
+#include "loader/backend_target.hpp"
 #include "loader/hf_config.hpp"
-#include "loader/model_schema.hpp"
 #include "loader/safetensors.hpp"
 #include "model/weight_store.hpp"
 #include "tensor.hpp"

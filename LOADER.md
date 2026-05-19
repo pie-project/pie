@@ -1128,35 +1128,27 @@ Last updated: 2026-05-17.
   `model*.safetensors` are fetched, while duplicate `.pt`, `.bin`, `.gguf`,
   and non-loader safetensors artifacts are skipped. `pie model download --all`
   remains available when a complete HF snapshot is explicitly needed.
-- The planner accepts a metadata-only tensor source, so layout-plan tests can run
-  on synthetic checkpoint metadata without real safetensors files or GPU
-  allocation.
-- `LayoutPlanner` is the native semantic-to-algebra migration target. The
-  production loader now emits algebra directly from semantic tensors/groups and
-  `RuntimeABI`; the storage compiler lowers those plans without a compatibility
-  op stream.
+- The Rust loader accepts a metadata-only tensor source and can synthesize the
+  CUDA `RuntimeABI` directly from safetensors metadata plus `config.json`.
+  CUDA no longer builds or translates the former C++ `LayoutPlan`.
+- Rust is the production semantic-to-algebra migration target. The production
+  loader now emits algebra directly from Rust schema/default ABI rules; the
+  storage compiler lowers those plans without a compatibility op stream.
 - Algebra-only packed row-group plans now emit typed `CreateView` schedule
   records for compatibility views. The executor can materialize those views
   from `LayoutExpr::View` metadata without consulting a planner op.
 - Dense, quantized, MoE, Phi-3 row-split, GPT-OSS MXFP4, and packed Llama-like
   production plans now have no compatibility step stream.
-- CPU-only layout-plan tests cover dense Qwen packed QKV/gate-up lowering,
-  scheduled runtime INT8 quantization, scheduled FP16/FP32-to-BF16 casts,
-  Phi-3 tensor-parallel row-range sharding, symmetric GPTQ lowering into
-  scheduled `RepackLayout`, and GPTQ tensor-parallel local slicing for column-
-  and row-parallel projections. They also cover AWQ Marlin repack and BF16
-  fallback, asymmetric GPTQ and GPTQ act-order dequant fallbacks,
-  compressed-tensors INT8 metadata attachment, scheduled Qwen per-expert MoE
-  fusion, Qwen MoE expert tensor-parallel sharding, and GPT-OSS MXFP4
-  target-dependent plans for BF16 fallback and packed runtime representations.
-  The Phi-3 test caught and fixed a moved-from `LayoutExpr::output_name` bug in
-  row-range spec registration.
+- Rust unit tests cover algebra rewrites, FFI safety, semantic-role contracts,
+  explicit `ByteSpans`, default CUDA ABI synthesis, tensor-parallel row/column
+  sharding, packed quant byte alignment, storage lowering, and generated C++
+  wrapper/header compatibility.
 
 ### Remaining Implementation Work
 
-- Schema adaptation, runtime ABI decisions, and lowering are still concentrated
-  in `model_schema.cpp`; the next cleanup is splitting those into per-family
-  adapters plus reusable planner modules.
+- Schema adaptation, runtime ABI decisions, and lowering now live in Rust.
+  The next cleanup is to split `abi.rs` default-contract synthesis into
+  per-family `schema.rs` modules plus reusable ABI builders.
 - The IR is typed and broad enough for current layouts, but some less common
   checkpoint quantization sub-modes still need schema coverage before they can
   lower into scheduled algebra.
@@ -1243,6 +1235,19 @@ Useful metrics for the system paper:
 - comparison with vLLM and SGLang startup memory for the same models
 
 Latest verification:
+
+- Rust-default CUDA ABI cutover on 2026-05-19:
+  `cargo test --manifest-path driver/weight_loader/Cargo.toml`,
+  `cmake -S driver/cuda -B driver/cuda/build`,
+  `cmake --build driver/cuda/build --target pie_driver_cuda_lib -j2`,
+  `cmake --build driver/cuda/build --target pie_driver_cuda -j2`,
+  `ctest --test-dir driver/cuda/build --output-on-failure`, and
+  `cmake --build driver/portable/build --target pie_driver_portable_lib -j2`
+  pass. `cargo build -p pie-server --release --no-default-features --features driver-cuda`
+  also links. The former CUDA C++ `LayoutPlan`/`model_schema`/`RuntimeABI` sources
+  and `test_layout_plan` target have been removed from the build tree; CUDA now
+  compiles safetensors metadata directly through the Rust default ABI, algebra,
+  optimizer, and storage compiler.
 
 - Storage schedule/executor implementation pass on 2026-05-17:
   `CUDACXX=/usr/local/cuda-12.8/bin/nvcc cmake -S driver/cuda -B /tmp/pie-cuda-loader-build -DCMAKE_BUILD_TYPE=Release`,

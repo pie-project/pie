@@ -5,15 +5,12 @@
 #include <cstdlib>
 #include <fstream>
 #include <iostream>
-#include <optional>
 #include <stdexcept>
 
 #include <cuda_runtime.h>
 
 #include "cuda_check.hpp"
 #include "distributed.hpp"
-#include "loader/layout_plan.hpp"
-#include "loader/model_schema.hpp"
 #include "loader/rust_loader_bridge.hpp"
 #include "loader/rust_storage_executor.hpp"
 
@@ -207,22 +204,17 @@ LoadedModel LoadedModel::load(const Config& boot_cfg, NcclComm* tp_comm) {
 
     WeightStoreBuilder(e.weights_).reserve(loader.num_tensors());
 
-    std::optional<LayoutPlan> layout_plan;
+    if (!boot_cfg.model.runtime_quant.empty()) {
+        throw std::runtime_error(
+            "engine: runtime_quant is not yet exposed through the Rust "
+            "loader RuntimeABI. Use an offline-quantized checkpoint or leave "
+            "runtime_quant empty.");
+    }
     RustLoaderCompileResult rust_plan =
-        (boot_cfg.model.runtime_quant.empty() &&
-         can_compile_rust_loader_direct(e.hf_, loader, tp_size))
-            ? compile_rust_loader_plan_direct(
-                  e.hf_, loader, tp_rank, tp_size,
-                  64ull * 1024ull * 1024ull,
-                  /*preferred_alignment=*/256)
-            : [&] {
-                  layout_plan = build_model_layout_plan(
-                      e.hf_, boot_cfg, loader, tp_size, backend_target);
-                  return compile_rust_loader_plan(
-                      e.hf_, *layout_plan, loader, tp_rank, tp_size,
-                      64ull * 1024ull * 1024ull,
-                      /*preferred_alignment=*/256);
-              }();
+        compile_rust_loader_plan_from_metadata(
+            e.hf_, loader, tp_rank, tp_size,
+            64ull * 1024ull * 1024ull,
+            /*preferred_alignment=*/256);
     const auto rust_view = rust_plan.program.view();
     if (const char* dump_path =
             std::getenv("PIE_CUDA_RUST_LAYOUT_PLAN_DUMP");
@@ -240,14 +232,9 @@ LoadedModel LoadedModel::load(const Config& boot_cfg, NcclComm* tp_comm) {
             rust_plan.runtime_tensor_count);
     }
     if (verbose) {
-        if (layout_plan.has_value()) {
-            std::cerr << "[pie-driver-cuda] layout compiler: "
-                      << describe_layout_plan(*layout_plan) << "\n";
-        } else {
-            std::cerr
-                << "[pie-driver-cuda] layout compiler: rust-direct dense "
-                   "RuntimeABI\n";
-        }
+        std::cerr
+            << "[pie-driver-cuda] layout compiler: rust RuntimeABI -> "
+               "algebra -> storage program\n";
         std::cerr << "[pie-driver-cuda] rust loader compiler: "
                   << describe_rust_storage_program(
                          rust_view,
@@ -292,7 +279,7 @@ LoadedModel LoadedModel::load(const Config& boot_cfg, NcclComm* tp_comm) {
                   << "% of original)\n";
     }
     if (verbose && materialized.axis_concat_groups > 0) {
-        std::cerr << "[pie-driver-cuda] layout plan: "
+        std::cerr << "[pie-driver-cuda] storage loader: "
                   << materialized.axis_concat_groups << " AxisConcat groups"
                   << " (raw projection weights exposed as non-owning views)\n";
     }

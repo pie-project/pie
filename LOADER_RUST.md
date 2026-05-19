@@ -1017,9 +1017,24 @@ Current e2e smoke evidence:
   310/310-contract Rust storage programs and completed one-token generation;
   Q4_K_M was rechecked after the explicit TileMap destination change.
 
+Current cutover checkpoint:
+
+- CUDA now compiles safetensors metadata directly through the Rust default ABI,
+  algebra optimizer, and storage compiler. The former CUDA C++ `LayoutPlan`,
+  `model_schema`, `RuntimeABI`, semantic graph, planner, typecheck, and
+  `test_layout_plan` build target have been removed.
+- The Rust storage compiler preserves source strides for non-leading-axis TP
+  slices, and the CUDA executor materializes those strided extents through the
+  generic safetensors slice copier.
+- `cargo test --manifest-path driver/weight_loader/Cargo.toml`,
+  `cmake --build driver/cuda/build --target pie_driver_cuda_lib -j2`,
+  `cmake --build driver/cuda/build --target pie_driver_cuda -j2`,
+  `ctest --test-dir driver/cuda/build --output-on-failure`, and
+  `cmake --build driver/portable/build --target pie_driver_portable_lib -j2`
+  pass on 2026-05-19. `cargo build -p pie-server --release --no-default-features --features driver-cuda`
+  also links.
+
 Remaining cutover work is now concentrated on large-model and production
 evidence: running the very large MoE families where host/GPU memory permits,
-checking CUDA Rust execution on the same coverage matrix, broadening quantized
-executor kernels beyond FP8/MXFP4/AWQ/GPTQ reference paths, and removing the
-remaining C++ planner/executor fallback windows once the CUDA and portable
-matrices both stay green.
+checking CUDA Rust execution on the same coverage matrix, and broadening
+quantized executor kernels beyond FP8/MXFP4/AWQ/GPTQ reference paths.
