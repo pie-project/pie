@@ -41,11 +41,21 @@ pub struct ForwardPass {
     pub adapter_seed: Option<i64>,
 }
 
+/// Mirrors `types::FutureString` / `types::FutureBlob`: a oneshot
+/// receiver wrapped in a WASI Pollable. The owning host task sends
+/// the final `Output` through the channel; the SDK awaits the
+/// pollable and reads via `get`.
 #[derive(Debug)]
 pub struct FutureOutput {
+    receiver: oneshot::Receiver<pie::core::inference::Output>,
     result: Option<pie::core::inference::Output>,
-    rx: Option<oneshot::Receiver<ForwardPassOutput>>,
     done: bool,
+}
+
+impl FutureOutput {
+    pub fn new(receiver: oneshot::Receiver<pie::core::inference::Output>) -> Self {
+        Self { receiver, result: None, done: false }
+    }
 }
 
 #[async_trait]
@@ -54,29 +64,13 @@ impl Pollable for FutureOutput {
         if self.done {
             return;
         }
-        if let Some(rx) = self.rx.take() {
-            match rx.await {
-                Ok(output) => {
-                    self.result = Some(convert_output(output));
-                    self.done = true;
-                }
-                Err(_) => {
-                    self.result = Some(pie::core::inference::Output {
-                        slots: Vec::new(),
-                        spec_tokens: Vec::new(),
-                        spec_positions: Vec::new(),
-                    });
-                    self.done = true;
-                }
-            }
-        } else {
-            self.done = true;
+        if let Ok(res) = (&mut self.receiver).await {
+            self.result = Some(res);
         }
+        self.done = true;
     }
 }
 
-/// Convert internal ForwardPassOutput (per-slot results + spec channel) to
-/// the WIT `Output` record.
 fn convert_output(output: ForwardPassOutput) -> pie::core::inference::Output {
     let slots = output
         .slots
@@ -361,161 +355,124 @@ impl pie::core::inference::HostForwardPass for InstanceState {
             .map(convert_sampler)
             .collect();
 
-        // Save data needed for context::append_working_page_tokens() before
-        // moving into request. We also clone the speculative arrays so we
-        // can append the verified-prefix to the working-page lineage once
-        // the response tells us how many drafts were accepted.
         let num_input_tokens = tokens.len();
-        let fill_tokens = tokens.clone();
-        let fill_positions = positions.clone();
-        let fill_masks = masks.clone();
-        let spec_tokens_for_fill = speculative_tokens.clone();
-        let spec_positions_for_fill = speculative_positions.clone();
-
         let context_id = pass.context_id
             .ok_or_else(|| anyhow::anyhow!("ForwardPass requires a context"))?;
 
-        // =====================================================================
-        // Context preparation — runs in THIS process's tokio task, not the
-        // inference actor. This is critical: blocking here only stalls this
-        // one process, not the entire inference pipeline.
-        //
-        // STATE MACHINE (new 3-state context module):
-        //
-        //   reserve_working_pages: blocks if process is suspended — actor handles
-        //     restoration via drain_queues, process resumes automatically.
-        //   pin: Active → Pinned (non-evictable).
-        //   unpin: Pinned → Active (evictable again).
-        //
-        // The process calls unpin after fill, which is the ONLY
-        // transition Pinned → Active. Eviction of Pinned contexts is
-        // deferred via pending_suspend flag.
-        // =====================================================================
-
-        // Step 1: Resolve physical page IDs. Atomically pins the context
-        // (Active → Pinned) so pages cannot be evicted during the forward pass.
-        let pinned = match context::pin(model_id, context_id, num_input_tokens as u32).await {
-            Ok(p) => p,
-            Err(e) => {
-                tracing::warn!("pin failed for ctx {context_id}: {e:#}");
-                return Ok(Err(e.to_string()));
+        // Pre-compose the lineage append set (input + speculative drafts)
+        // before the request consumes `tokens` / `positions` / `masks`.
+        // Replayed into working pages after the device responds. Spec
+        // drafts are appended unconditionally; the SDK calls
+        // `truncate_working_page_tokens(n_rejected)` after seeing the
+        // verifier verdict.
+        let mut all_fill_tokens = tokens.clone();
+        let mut all_fill_positions = positions.clone();
+        let mut all_fill_masks = masks.clone();
+        if !speculative_tokens.is_empty() {
+            all_fill_tokens.extend_from_slice(&speculative_tokens);
+            all_fill_positions.extend_from_slice(&speculative_positions);
+            for &pos in &speculative_positions {
+                all_fill_masks.push(Brle::all_true((pos + 1) as usize));
             }
-        };
-        let kv_len = pinned.kv_len;
-        let last_page_len = pinned.last_page_len;
-        let device_id = pinned.device;
-        let physical_page_ids = pinned.pages;
+        }
 
-        let num_pages = physical_page_ids.len() as u32;
-        let page_size = context::tokens_per_page(model_id);
-        let total_kv = kv_len + num_input_tokens as u32;
+        // Mirrors `messaging::pull` / `session::receive_file`: oneshot
+        // channel + spawned task. The task drives the whole pipeline
+        // (pin → submit → await → post-process) so this host fn returns
+        // without awaiting anything. That's load-bearing: a host await
+        // inside a sync-shaped WIT export suspends the WASM module,
+        // which would serialize sibling `execute` calls from the same
+        // inferlet (defeating `future::join_all` over forked branches).
+        //
+        // Error propagation: on any failure the task drops `tx` without
+        // sending. The SDK then sees `FutureOutput.get() -> None` and
+        // turns that into `Err("No output available")` — matching the
+        // pre-refactor `Ok(Err(...))` shape from this fn. Detailed cause
+        // is logged via `tracing::warn!`.
+        let (tx, rx) = oneshot::channel();
+        tokio::spawn(async move {
+            let pinned = match context::pin(model_id, context_id, num_input_tokens as u32).await {
+                Ok(p) => p,
+                Err(e) => {
+                    tracing::warn!("pin failed for ctx {context_id}: {e:#}");
+                    return;
+                }
+            };
+            let page_size = context::tokens_per_page(model_id);
+            let total_kv = pinned.kv_len + num_input_tokens as u32;
+            let page_capacity = pinned.pages.len() as u32 * page_size;
+            if pinned.pages.is_empty() || total_kv > page_capacity {
+                tracing::warn!(
+                    "KV_INVARIANT_VIOLATION ctx={context_id} total_kv={total_kv} \
+                     page_capacity={page_capacity} num_pages={} \
+                     kv_len={} num_input={num_input_tokens} page_size={page_size} \
+                     phys_ids={:?}",
+                    pinned.pages.len(), pinned.kv_len, pinned.pages,
+                );
+                context::unpin(model_id, context_id);
+                return;
+            }
 
-        // INVARIANT: total_kv must fit within the allocated pages.
-        // Violation means working pages were lost between reserve_working_pages
-        // and execute — see swap lifecycle diagnostics.
-        let page_capacity = num_pages * page_size;
-        if total_kv > page_capacity || num_pages == 0 {
-            let msg = format!(
-                "KV_INVARIANT_VIOLATION ctx={context_id} total_kv={total_kv} \
-                 page_capacity={page_capacity} num_pages={num_pages} \
-                 kv_len={kv_len} num_input={num_input_tokens} page_size={page_size} \
-                 phys_ids={physical_page_ids:?}"
-            );
-            eprintln!("{msg}");
+            let request = ForwardPassRequest {
+                context_id,
+                tokens,
+                positions,
+                speculative_tokens,
+                speculative_positions,
+                output_speculative_tokens,
+                masks,
+                has_user_mask,
+                logit_mask,
+                sampling_indices,
+                samplers,
+                adapter_id,
+                adapter_seed,
+            };
+
+            let inner_rx = match inference::submit_nowait(
+                model_id, request, pinned.device as usize,
+                pinned.pages, pinned.last_page_len,
+            ) {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::warn!("inference::submit_nowait failed for ctx {context_id}: {e:#}");
+                    context::unpin(model_id, context_id);
+                    return;
+                }
+            };
+
+            let raw = match inner_rx.await {
+                Ok(raw) => raw,
+                Err(_) => {
+                    context::unpin(model_id, context_id);
+                    return;
+                }
+            };
+
+            // Append lineage BEFORE unpin to keep working_page_tokens
+            // consistent with KV while the context is still non-evictable.
+            // If append fails the response is discarded — the alternative
+            // is silently leaving the next forward pass on this context
+            // running against an inconsistent lineage.
+            if !all_fill_tokens.is_empty() {
+                if let Err(e) = context::append_working_page_tokens(
+                    model_id, context_id,
+                    all_fill_tokens, all_fill_positions, all_fill_masks,
+                    adapter_id, adapter_seed,
+                ).await {
+                    tracing::warn!(
+                        "context::append_working_page_tokens failed for ctx {context_id}: {e:#}",
+                    );
+                    context::unpin(model_id, context_id);
+                    return;
+                }
+            }
             context::unpin(model_id, context_id);
-            return Ok(Err(msg));
-        }
 
-        let request = ForwardPassRequest {
-            context_id,
-            tokens,
-            positions,
-            speculative_tokens,
-            speculative_positions,
-            output_speculative_tokens,
-            masks,
-            has_user_mask,
-            logit_mask,
-            sampling_indices,
-            samplers,
-            adapter_id,
-            adapter_seed,
-        };
+            let _ = tx.send(convert_output(raw));
+        });
 
-        // Step 5: Submit to inference service (inference actor just dispatches — never blocks)
-        let device_idx = device_id as usize;
-        match inference::submit(model_id, request, device_idx, physical_page_ids.clone(), last_page_len).await {
-            Ok(output) => {
-                // Diagnostic: log prefill metadata to trace corruption
-                // if num_input_tokens > 1 {
-                //     eprintln!(
-                //         "PREFILL_RESULT ctx={context_id} kv={kv_len} np={num_pages} \
-                //          inp={num_input_tokens} lpl={last_page_len} pages={physical_page_ids:?}"
-                //     );
-                // }
-                // Diagnostic: log first decode step metadata
-                // if num_input_tokens == 1 && kv_len < 45 {
-                //     eprintln!(
-                //         "DECODE_STEP ctx={context_id} kv={kv_len} np={num_pages} \
-                //          lpl={last_page_len} pos={:?} pages={physical_page_ids:?}",
-                //         fill_positions,
-                //     );
-                // }
-                // Step 3: Mark input tokens as forwarded WHILE still Pinned
-                // (non-evictable). This ensures working_page_tokens + lineage are consistent
-                // before the context becomes Active (evictable).
-                //
-                // For speculative-decoding flows, the forward pass also
-                // wrote KV for every speculative token (accepted or not).
-                // The SDK's stream code accounts for this exact pattern:
-                //   * lineage += pending + ALL_drafts
-                //   * truncate(n_rejected) to drop the tail of rejected drafts
-                //   * commit_working_pages(...) using the post-truncate state
-                // So we append the FULL speculative chain here and rely on
-                // the SDK to call `truncate_working_page_tokens(n_rejected)`
-                // afterwards. Skipping that truncate would leave stale
-                // entries in the lineage; in practice the SDK's
-                // `Stream::generate_step` always issues it.
-                let mut all_fill_tokens = fill_tokens;
-                let mut all_fill_positions = fill_positions;
-                let mut all_fill_masks = fill_masks;
-                if !spec_tokens_for_fill.is_empty() {
-                    all_fill_tokens.extend_from_slice(&spec_tokens_for_fill);
-                    all_fill_positions.extend_from_slice(&spec_positions_for_fill);
-                    // Synthesize causal masks for each spec token, matching
-                    // the convention applied above for un-masked inputs.
-                    for &pos in &spec_positions_for_fill {
-                        all_fill_masks.push(Brle::all_true((pos + 1) as usize));
-                    }
-                }
-                if !all_fill_tokens.is_empty() {
-                    if let Err(e) = context::append_working_page_tokens(
-                        model_id, context_id, all_fill_tokens,
-                        all_fill_positions, all_fill_masks, adapter_id, adapter_seed,
-                    ).await {
-                        context::unpin(model_id, context_id);
-                        tracing::warn!("context::fill failed for ctx {context_id}: {e:#}");
-                        return Ok(Err(e.to_string()));
-                    }
-                }
-
-                // Unpin — forward pass completed and tokens recorded in lineage.
-                // Context is now safe to evict: lineage is consistent with working_page_tokens.
-                context::unpin(model_id, context_id);
-
-                let future_output = FutureOutput {
-                    result: Some(convert_output(output)),
-                    rx: None,
-                    done: true,
-                };
-                Ok(Ok(self.ctx().table.push(future_output)?))
-            }
-            Err(e) => {
-                context::unpin(model_id, context_id);
-                tracing::warn!("inference::submit failed for ctx {context_id}: {e:#}");
-                return Ok(Err(e.to_string()));
-            },
-        }
+        Ok(Ok(self.ctx().table.push(FutureOutput::new(rx))?))
     }
 
     async fn drop(&mut self, this: Resource<ForwardPass>) -> Result<()> {
@@ -530,9 +487,9 @@ impl pie::core::inference::HostFutureOutput for InstanceState {
     }
 
     async fn get(&mut self, this: Resource<FutureOutput>) -> Result<Option<pie::core::inference::Output>> {
-        let result = self.ctx().table.get_mut(&this)?;
-        if result.done {
-            Ok(take(&mut result.result))
+        let fo = self.ctx().table.get_mut(&this)?;
+        if fo.done {
+            Ok(take(&mut fo.result))
         } else {
             Ok(None)
         }
