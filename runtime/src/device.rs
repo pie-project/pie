@@ -32,17 +32,12 @@ use crate::service::{ServiceArray, ServiceHandler};
 /// by the driver and read out of the header at attach time; see
 /// `shmem_ipc::ShmemClient`.
 ///
-/// `$PIE_SHMEM_NAME` overrides the default `/pie_shmem` base so a launcher
-/// (e.g. her-code-v3 test harness) can run multiple pie processes on one
-/// host without colliding on POSIX shmem (a host-global namespace). The
-/// per-DP `_g{N}` suffix is always appended.
+/// Naming + `$PIE_SHMEM_NAME` validation lives in `crate::shmem` so the
+/// runtime side here and `pie-server`'s `embedded_driver` agree
+/// byte-for-byte; drift between the two would have the runtime attach
+/// to a region the server never created.
 fn shmem_name(device_idx: usize) -> String {
-    let base = std::env::var("PIE_SHMEM_NAME")
-        .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "/pie_shmem".to_string());
-    format!("{base}_g{device_idx}")
+    crate::shmem::region_name(device_idx)
 }
 /// Busy-spin window (µs) before yielding while waiting on resp_seq.
 const SHMEM_SPIN_US: u64 = 10_000;
