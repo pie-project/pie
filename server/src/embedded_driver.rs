@@ -189,19 +189,14 @@ impl Drop for PendingEmbeddedDriver {
     }
 }
 
-/// Per-DP-replica shmem name. Mirrors `runtime/src/device.rs::shmem_name`
-/// (Python wrapper too — `_write_startup_toml(group_id=...)`).
-///
-/// Base name comes from `$PIE_SHMEM_NAME` (default `/pie_shmem`) so a
-/// launcher can namespace each pie process; the per-DP `_g{N}` suffix is
-/// always appended.
+/// Per-DP-replica shmem name. Thin wrapper over `pie::shmem::region_name`
+/// so the runtime side (`pie::device::shmem_name`) and this server side
+/// share one source of truth for region naming + `$PIE_SHMEM_NAME`
+/// validation. The Python wrapper (legacy `_write_startup_toml`) is gone
+/// in the standalone build; if it ever returns it must call the same
+/// helper.
 pub fn shmem_name(group_id: usize) -> String {
-    let base = std::env::var("PIE_SHMEM_NAME")
-        .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "/pie_shmem".to_string());
-    format!("{base}_g{group_id}")
+    pie::shmem::region_name(group_id)
 }
 
 /// `[shmem]` TOML block. `req_buf` is fixed at 4 MiB across drivers;
