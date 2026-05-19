@@ -23,7 +23,7 @@ use tokio::sync::oneshot;
 use crate::service::{ServiceArray, ServiceHandler};
 
 /// Per-device shmem region name. Each DP replica's worker creates its own
-/// POSIX shmem region (`/pie_shmem_g{device_idx}`); the runtime connects to
+/// POSIX shmem region (`<base>_g{device_idx}`); the runtime connects to
 /// the matching one based on which device a request is routed to.
 /// Hardcoding a single name silently mixes requests across replicas (the
 /// second replica attaches to the first's backing store or fails to
@@ -31,8 +31,18 @@ use crate::service::{ServiceArray, ServiceHandler};
 /// DP > 1. Region geometry (slots, request/response buffer sizes) is owned
 /// by the driver and read out of the header at attach time; see
 /// `shmem_ipc::ShmemClient`.
+///
+/// Two parallel `pie serve` processes on the same host would otherwise
+/// collide on `/pie_shmem_g0` (POSIX shmem is a host-global namespace).
+/// `$PIE_SHMEM_NAME` lets a launcher (e.g. test harness) namespace each
+/// run; the default keeps the legacy `/pie_shmem` base.
 fn shmem_name(device_idx: usize) -> String {
-    format!("/pie_shmem_g{device_idx}")
+    let base = std::env::var("PIE_SHMEM_NAME")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "/pie_shmem".to_string());
+    format!("{base}_g{device_idx}")
 }
 /// Busy-spin window (µs) before yielding while waiting on resp_seq.
 const SHMEM_SPIN_US: u64 = 10_000;

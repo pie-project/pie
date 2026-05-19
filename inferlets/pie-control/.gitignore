@@ -1,0 +1,6 @@
+# Allow the prebuilt control-plane inferlet artifact even though
+# the root .gitignore excludes `*.wasm` globally. The runtime
+# `include_bytes!`s this file from `runtime/src/bootstrap.rs`, so
+# it needs to be tracked alongside the source.
+!prebuilt/
+!prebuilt/*.wasm

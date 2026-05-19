@@ -1,0 +1,17 @@
+[package]
+name = "pie-control"
+version = "0.1.0"
+edition = "2024"
+description = "Engine control-plane inferlet: GET /healthz + GET /v1/models (OpenAI shape)"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wstd = "0.5.6"
+inferlet = { path = "../../sdk/rust/inferlet" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[profile.release]
+lto = true

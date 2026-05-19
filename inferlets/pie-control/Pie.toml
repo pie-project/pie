@@ -1,0 +1,12 @@
+[package]
+name = "pie-control"
+version = "0.1.0"
+description = "Engine control-plane inferlet: /healthz + /v1/models"
+authors = ["Pie Team"]
+
+[runtime]
+core = "^0.2.0"
+
+# No daemon input expected; model list is queried via the
+# `pie:core/runtime.models` WIT import at request time.
+[parameters]
