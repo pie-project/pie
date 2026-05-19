@@ -650,7 +650,13 @@ fn join_and_select_contracts_lower_to_writes_and_view() {
     assert_eq!(instrs.len(), 6);
     assert_eq!(instrs[0].kind, PieLoaderStorageInstrKind::Allocate);
     assert_eq!(instrs[1].kind, PieLoaderStorageInstrKind::ExtentWrite);
+    assert_eq!(instrs[1].source.tensor_id, 0);
+    assert_eq!(instrs[1].source.file_offset, 64);
+    assert_eq!(instrs[1].dest.offset, 0);
     assert_eq!(instrs[2].kind, PieLoaderStorageInstrKind::ExtentWrite);
+    assert_eq!(instrs[2].source.tensor_id, 1);
+    assert_eq!(instrs[2].source.file_offset, 80);
+    assert_eq!(instrs[2].dest.offset, 16);
     assert_eq!(instrs[3].kind, PieLoaderStorageInstrKind::Finalize);
     assert_eq!(instrs[4].kind, PieLoaderStorageInstrKind::CreateView);
     assert!(instrs[4].has_dest);

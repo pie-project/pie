@@ -17,8 +17,6 @@
 #include "loader/layout_plan.hpp"
 #include "loader/layout_planner.hpp"
 #include "loader/runtime_abi.hpp"
-#include "loader/storage_compiler.hpp"
-#include "loader/storage_program.hpp"
 
 namespace {
 
@@ -142,33 +140,6 @@ std::size_t count_exprs(const pie_cuda_driver::LayoutPlan& plan,
     return static_cast<std::size_t>(std::count_if(
         plan.algebra.exprs.begin(), plan.algebra.exprs.end(),
         [kind](const auto& expr) { return expr.kind == kind; }));
-}
-
-std::size_t count_storage_instrs(
-    const pie_cuda_driver::StorageProgram& program,
-    pie_cuda_driver::StorageInstrKind kind) {
-    return static_cast<std::size_t>(std::count_if(
-        program.schedule.begin(), program.schedule.end(),
-        [kind](const auto& instr) { return instr.kind == kind; }));
-}
-
-std::size_t count_storage_transforms(
-    const pie_cuda_driver::StorageProgram& program,
-    pie_cuda_driver::StorageTransformKind kind) {
-    return static_cast<std::size_t>(std::count_if(
-        program.schedule.begin(), program.schedule.end(),
-        [kind](const auto& instr) {
-            return instr.kind == pie_cuda_driver::StorageInstrKind::Transform &&
-                   instr.transform_kind == kind;
-        }));
-}
-
-std::size_t count_tile_maps(
-    const pie_cuda_driver::StorageProgram& program,
-    pie_cuda_driver::TileMapKind kind) {
-    return static_cast<std::size_t>(std::count_if(
-        program.tile_maps.begin(), program.tile_maps.end(),
-        [kind](const auto& tile) { return tile.kind == kind; }));
 }
 
 const pie_cuda_driver::TensorDecl* find_spec(
@@ -413,200 +384,6 @@ void test_dense_qwen_plan_packs_projection_groups() {
     }
 }
 
-void test_storage_program_lowers_packed_groups_to_extent_writes() {
-    auto hf = qwen3_config();
-    pie_cuda_driver::Config cfg{};
-    const auto meta = dense_llama_metadata();
-    const pie_cuda_driver::BackendTarget target{};
-    auto plan = pie_cuda_driver::build_model_layout_plan(
-        hf, cfg, meta, /*tp_size=*/1, target);
-    pie_cuda_driver::StorageProgram storage =
-        pie_cuda_driver::compile_storage_program(
-        plan, meta, /*tp_rank=*/0, /*tp_size=*/1);
-
-    CHECK_EQ(storage.memory.max_extent_temporary_bytes, std::uint64_t{0});
-    CHECK(storage.memory.extent_write_count >= 5);
-    CHECK(storage.memory.algebra_extent_write_count >= 5);
-    std::vector<const pie_cuda_driver::ExtentWrite*> qkv_writes;
-    for (const auto& write : storage.extent_writes) {
-        if (write.output_name ==
-            "model.layers.0.self_attn.qkv_proj.fused.weight") {
-            qkv_writes.push_back(&write);
-        }
-    }
-    CHECK_EQ(qkv_writes.size(), std::size_t{3});
-    if (qkv_writes.size() == 3) {
-        CHECK_EQ(qkv_writes[0]->dst_offset_bytes, std::uint64_t{0});
-        CHECK_EQ(qkv_writes[1]->dst_offset_bytes, std::uint64_t{128});
-        CHECK_EQ(qkv_writes[2]->dst_offset_bytes, std::uint64_t{192});
-        CHECK((qkv_writes[0]->dst_shape == std::vector<std::int64_t>{8, 8}));
-        CHECK((qkv_writes[1]->dst_shape == std::vector<std::int64_t>{4, 8}));
-        CHECK((qkv_writes[2]->dst_shape == std::vector<std::int64_t>{4, 8}));
-    }
-    const std::string dump =
-        pie_cuda_driver::dump_layout_plan_json(plan, storage);
-    CHECK(dump.find("\"plan_kind\": \"LayoutPlan\"") != std::string::npos);
-    CHECK(dump.find("\"program_kind\":\"StorageProgram\"") != std::string::npos);
-    CHECK(dump.find("\"write_kind\":\"ExtentWrite\"") != std::string::npos);
-    CHECK(dump.find("\"storage\"") != std::string::npos);
-    CHECK(dump.find("axis-concatenated") != std::string::npos);
-}
-
-void test_storage_compiler_covers_every_semantic_expr() {
-    auto hf = qwen3_config();
-    pie_cuda_driver::Config cfg{};
-    cfg.model.runtime_quant = "int8";
-    const auto meta = dense_llama_metadata();
-    pie_cuda_driver::BackendTarget target{};
-    auto plan = pie_cuda_driver::build_model_layout_plan(
-        hf, cfg, meta, /*tp_size=*/1, target);
-    pie_cuda_driver::StorageProgram storage =
-        pie_cuda_driver::compile_storage_program(
-        plan, meta, /*tp_rank=*/0, /*tp_size=*/1);
-    pie_cuda_driver::validate_storage_program(plan, storage);
-
-    CHECK(storage.memory.extent_write_count > 0);
-    CHECK_EQ(count_tile_maps(storage, pie_cuda_driver::TileMapKind::Encode),
-             std::size_t{7});
-    CHECK_EQ(count_storage_instrs(
-                 storage, pie_cuda_driver::StorageInstrKind::Attach),
-             std::size_t{7});
-
-    const std::string dump =
-        pie_cuda_driver::dump_layout_plan_json(plan, storage);
-    CHECK(dump.find("ExtentWrite") != std::string::npos);
-    CHECK(dump.find("TileMap") != std::string::npos);
-    CHECK(dump.find("Attach") != std::string::npos);
-}
-
-void test_storage_schedule_orders_ready_extent_writes_by_file_offset() {
-    using pie_cuda_driver::DType;
-
-    FakeMetadata meta;
-    meta.add("checkpoint.b", DType::BF16, {2});
-    meta.add("checkpoint.a", DType::BF16, {2});
-
-    pie_cuda_driver::LayoutPlan plan;
-    plan.tensors.emplace(
-        "runtime.a",
-        pie_cuda_driver::TensorDecl{
-            .name = "runtime.a",
-            .dtype = DType::BF16,
-            .shape = {2},
-        });
-    plan.tensors.emplace(
-        "runtime.b",
-        pie_cuda_driver::TensorDecl{
-            .name = "runtime.b",
-            .dtype = DType::BF16,
-            .shape = {2},
-        });
-    auto add_source_binding =
-        [&](const std::string& raw_name, const std::string& runtime_name) {
-            const auto decl = plan.tensors.at(runtime_name);
-            pie_cuda_driver::LayoutExpr source;
-            source.kind = pie_cuda_driver::LayoutExprKind::Source;
-            source.raw_name = raw_name;
-            source.decl = decl;
-            source.decl.name = raw_name;
-            source.dtype = decl.dtype;
-            const auto source_id = plan.algebra.exprs.size();
-            plan.algebra.exprs.push_back(std::move(source));
-
-            pie_cuda_driver::LayoutExpr realize;
-            realize.kind = pie_cuda_driver::LayoutExprKind::Realize;
-            realize.inputs = {source_id};
-            realize.decl = decl;
-            realize.runtime_name = runtime_name;
-            realize.dtype = decl.dtype;
-            const auto root = plan.algebra.exprs.size();
-            plan.algebra.exprs.push_back(std::move(realize));
-            plan.algebra.bindings.push_back(
-                pie_cuda_driver::LayoutBinding{runtime_name, root});
-        };
-    add_source_binding("checkpoint.a", "runtime.a");
-    add_source_binding("checkpoint.b", "runtime.b");
-
-    const pie_cuda_driver::StorageProgram storage =
-        pie_cuda_driver::compile_storage_program(
-        plan, meta, /*tp_rank=*/0, /*tp_size=*/1);
-    CHECK_EQ(storage.extent_writes.size(), std::size_t{2});
-    CHECK_EQ(storage.scheduled_extent_writes.size(), std::size_t{2});
-    if (storage.scheduled_extent_writes.size() == 2) {
-        CHECK_EQ(storage.scheduled_extent_writes[0], std::size_t{1});
-        CHECK_EQ(storage.scheduled_extent_writes[1], std::size_t{0});
-    }
-    CHECK(!storage.schedule.empty());
-    CHECK(storage.memory.file_ordered_extent_write_count == 2);
-    const std::string dump =
-        pie_cuda_driver::dump_layout_plan_json(plan, storage);
-    CHECK(dump.find("\"schedule\"") != std::string::npos);
-    CHECK(dump.find("\"source_offset_bytes\"") != std::string::npos);
-}
-
-void test_storage_compiler_lowers_algebra_only_copy_plan() {
-    using namespace pie_cuda_driver;
-
-    FakeMetadata meta;
-    meta.add("checkpoint.weight", DType::BF16, {2, 2});
-
-    TensorDecl decl{
-        .name = "runtime.weight",
-        .dtype = DType::BF16,
-        .shape = {2, 2},
-    };
-
-    LayoutPlan plan;
-    plan.tensors.emplace(decl.name, decl);
-    plan.memory.persistent_bytes = 8;
-    plan.memory.estimated_peak_bytes = 8;
-
-    LayoutExpr source;
-    source.kind = LayoutExprKind::Source;
-    source.decl = decl;
-    source.decl.name = "checkpoint.weight";
-    source.raw_name = "checkpoint.weight";
-    source.dtype = DType::BF16;
-    const LayoutExprId source_id = plan.algebra.exprs.size();
-    plan.algebra.exprs.push_back(std::move(source));
-
-    LayoutExpr realize;
-    realize.kind = LayoutExprKind::Realize;
-    realize.inputs = {source_id};
-    realize.decl = decl;
-    realize.runtime_name = decl.name;
-    realize.dtype = DType::BF16;
-    const LayoutExprId root = plan.algebra.exprs.size();
-    plan.algebra.exprs.push_back(std::move(realize));
-    plan.algebra.bindings.push_back(LayoutBinding{
-        .runtime_name = decl.name,
-        .root = root,
-    });
-
-    const StorageProgram storage =
-        compile_storage_program(plan, meta, /*tp_rank=*/0, /*tp_size=*/1);
-    CHECK_EQ(storage.extent_writes.size(), std::size_t{1});
-    CHECK_EQ(storage.schedule.size(), std::size_t{1});
-    CHECK_EQ(storage.memory.algebra_extent_write_count, std::uint64_t{1});
-    if (!storage.extent_writes.empty()) {
-        const auto& write = storage.extent_writes.front();
-        CHECK_EQ(write.op_index, kInvalidStorageId);
-        CHECK_EQ(write.expr_id, root);
-        CHECK_EQ(write.binding_index, std::size_t{0});
-        CHECK_EQ(write.raw_name, std::string("checkpoint.weight"));
-        CHECK_EQ(write.output_name, std::string("runtime.weight"));
-    }
-    if (!storage.schedule.empty()) {
-        CHECK_EQ(storage.schedule.front().op_index, kInvalidStorageId);
-        CHECK_EQ(storage.schedule.front().expr_id, root);
-        CHECK_EQ(storage.schedule.front().binding_index, std::size_t{0});
-    }
-    const std::string dump = dump_storage_program_json(storage);
-    CHECK(dump.find("\"op_index\":null") != std::string::npos);
-    CHECK(dump.find("\"expr_id\":1") != std::string::npos);
-    CHECK(dump.find("\"binding_index\":0") != std::string::npos);
-}
-
 void test_native_layout_planner_builds_dense_packed_algebra_plan() {
     using namespace pie_cuda_driver;
 
@@ -635,29 +412,8 @@ void test_native_layout_planner_builds_dense_packed_algebra_plan() {
                  std::string("model.layers.0.self_attn.qkv_proj.fused.weight"));
     }
 
-    const StorageProgram storage =
-        compile_storage_program(plan, meta, /*tp_rank=*/0, /*tp_size=*/1);
-    CHECK_EQ(storage.memory.algebra_extent_write_count, std::uint64_t{12});
-    CHECK(std::any_of(
-        storage.schedule.begin(), storage.schedule.end(),
-        [](const auto& instr) {
-            return instr.kind == StorageInstrKind::CreateView &&
-                   instr.op_index == kInvalidStorageId;
-        }));
-
-    std::vector<const ExtentWrite*> qkv_writes;
-    for (const auto& write : storage.extent_writes) {
-        if (write.output_name ==
-            "model.layers.0.self_attn.qkv_proj.fused.weight") {
-            qkv_writes.push_back(&write);
-        }
-    }
-    CHECK_EQ(qkv_writes.size(), std::size_t{3});
-    if (qkv_writes.size() == 3) {
-        CHECK_EQ(qkv_writes[0]->dst_offset_bytes, std::uint64_t{0});
-        CHECK_EQ(qkv_writes[1]->dst_offset_bytes, std::uint64_t{128});
-        CHECK_EQ(qkv_writes[2]->dst_offset_bytes, std::uint64_t{192});
-    }
+    CHECK(!plan.algebra.exprs.empty());
+    CHECK(!plan.algebra.bindings.empty());
 }
 
 void test_dense_schema_adapters_pack_mistral_olmo_variants() {
@@ -814,15 +570,10 @@ void test_fp16_copy_lowers_to_scheduled_cast() {
         CHECK(final->dtype == DType::BF16);
         CHECK(final->ownership == pie_cuda_driver::TensorOwnershipKind::Owned);
     }
-    const auto storage = pie_cuda_driver::compile_storage_program(
-        plan, meta, /*tp_rank=*/0, /*tp_size=*/1);
-    CHECK_EQ(storage.tile_maps.size(), std::size_t{1});
-    if (!storage.tile_maps.empty()) {
-        CHECK(storage.tile_maps[0].kind ==
-              pie_cuda_driver::TileMapKind::Cast);
-        CHECK_EQ(storage.tile_maps[0].output_name,
-                 std::string("model.norm.weight"));
-    }
+    CHECK(find_expr(
+        plan,
+        pie_cuda_driver::LayoutExprKind::Cast,
+        "model.norm.weight") != nullptr);
 }
 
 void test_phi3_tp_uses_row_range_shards_for_fused_tensors() {
@@ -1684,22 +1435,10 @@ void test_gpt_oss_mxfp4_fallback_emits_dequantized_experts() {
     CHECK(find_spec(
         plan, "model.layers.0.mlp.experts.gate_up_proj.weight") == nullptr);
 
-    const auto storage = pie_cuda_driver::compile_storage_program(
-        plan, meta, /*tp_rank=*/0, /*tp_size=*/2);
-    pie_cuda_driver::validate_storage_program(plan, storage);
-    CHECK_EQ(count_tile_maps(storage, pie_cuda_driver::TileMapKind::Decode),
+    CHECK_EQ(count_exprs(plan, pie_cuda_driver::LayoutExprKind::Decode),
              std::size_t{2});
-    CHECK_EQ(count_storage_transforms(
-                 storage, pie_cuda_driver::StorageTransformKind::Deinterleave),
+    CHECK_EQ(count_exprs(plan, pie_cuda_driver::LayoutExprKind::Release),
              std::size_t{2});
-    CHECK_EQ(count_storage_transforms(
-                 storage, pie_cuda_driver::StorageTransformKind::Slice),
-             std::size_t{1});
-    CHECK_EQ(count_storage_instrs(
-                 storage, pie_cuda_driver::StorageInstrKind::Release),
-             std::size_t{2});
-    CHECK(storage.memory.algebra_extent_write_count >= 6);
-    CHECK(storage.memory.tile_map_count == 2);
 }
 
 void test_gpt_oss_mxfp4_native_emits_quant_packed_experts() {
@@ -1742,15 +1481,10 @@ void test_gpt_oss_mxfp4_native_emits_quant_packed_experts() {
               pie_cuda_driver::QuantFormat::Mxfp4E2M1E8M0);
     }
 
-    const auto storage = pie_cuda_driver::compile_storage_program(
-        plan, meta, /*tp_rank=*/0, /*tp_size=*/1);
-    pie_cuda_driver::validate_storage_program(plan, storage);
-    CHECK_EQ(count_storage_instrs(
-                 storage, pie_cuda_driver::StorageInstrKind::Attach),
+    CHECK_EQ(count_exprs(plan, pie_cuda_driver::LayoutExprKind::Attach),
              std::size_t{2});
-    CHECK_EQ(count_tile_maps(storage, pie_cuda_driver::TileMapKind::Decode),
+    CHECK_EQ(count_exprs(plan, pie_cuda_driver::LayoutExprKind::Decode),
              std::size_t{0});
-    CHECK(storage.memory.algebra_extent_write_count >= 6);
 }
 
 void test_gpt_oss_mxfp4_true_native_gemm_requires_backend() {
@@ -1806,10 +1540,6 @@ int main() {
     test_gguf_checkpoint_source_reads_dense_tensor_extents();
     test_gguf_checkpoint_source_reads_q4_0_block_extents_and_decode();
     test_dense_qwen_plan_packs_projection_groups();
-    test_storage_program_lowers_packed_groups_to_extent_writes();
-    test_storage_compiler_covers_every_semantic_expr();
-    test_storage_schedule_orders_ready_extent_writes_by_file_offset();
-    test_storage_compiler_lowers_algebra_only_copy_plan();
     test_native_layout_planner_builds_dense_packed_algebra_plan();
     test_dense_schema_adapters_pack_mistral_olmo_variants();
     test_qwen36_dense_linear_attention_plan();

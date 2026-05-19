@@ -70,6 +70,66 @@ fn buffer_join_tile_maps_carry_destination_offsets() {
 }
 
 #[test]
+fn direct_copy_lowers_to_identity_extent_write() {
+    let mut plan = LayoutPlan::new();
+    let runtime_decl = decl(7, "runtime.weight", &[2, 2], Encoding::Raw(DType::BF16));
+    let source_decl = decl(0, "checkpoint.weight", &[2, 2], Encoding::Raw(DType::BF16));
+    let source = plan.push(LayoutExpr::Source {
+        tensor: TensorId(6),
+        decl: source_decl,
+    });
+    let realized = plan.push(LayoutExpr::Realize {
+        input: source,
+        runtime_name: "runtime.weight".to_string(),
+        decl: runtime_decl,
+    });
+    plan.outputs.push(realized);
+
+    let metadata = CheckpointMetadata {
+        files: vec![CheckpointFile {
+            id: FileId(0),
+            path: "model.safetensors".to_string(),
+            size_bytes: 1024,
+            format: CheckpointFormat::Safetensors,
+        }],
+        tensors: vec![RawTensor {
+            id: TensorId(6),
+            name: "checkpoint.weight".to_string(),
+            file_id: FileId(0),
+            file_offset: 512,
+            span_bytes: 8,
+            shape: vec![2, 2],
+            encoding: Encoding::Raw(DType::BF16),
+            layout: Layout::dense(1),
+        }],
+    };
+
+    let program = lower_layout_plan(&metadata, &plan, StorageTarget::default()).unwrap();
+    let writes: Vec<_> = program
+        .instrs
+        .iter()
+        .filter_map(|instr| match instr {
+            StorageInstr::ExtentWrite { id, source, dest } => Some((id, source, dest)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(writes.len(), 1);
+    let (write_id, source, dest) = writes[0];
+    assert_eq!(source.tensor_id, TensorId(6));
+    assert_eq!(source.file_offset, 512);
+    assert_eq!(source.span_bytes, 8);
+    assert_eq!(dest.offset, 0);
+    assert_eq!(
+        program.schedule,
+        program.instrs.iter().map(instr_id).collect::<Vec<_>>()
+    );
+    assert!(program.schedule.contains(write_id));
+    assert_eq!(program.memory.checkpoint_read_bytes, 8);
+    assert_eq!(program.memory.device_write_bytes, 8);
+    assert_eq!(program.memory.persistent_bytes, 8);
+}
+
+#[test]
 fn packed_quant_row_select_uses_byte_exact_offsets() {
     let mut plan = LayoutPlan::new();
     let q_decl = decl(
@@ -327,5 +387,17 @@ fn quant(scheme: QuantScheme, dtype: DType) -> QuantSpec {
         scale_dtype: Some(DType::F32),
         zero_point_dtype: None,
         block_shape: Vec::new(),
+    }
+}
+
+fn instr_id(instr: &StorageInstr) -> pie_weight_loader::types::InstrId {
+    match instr {
+        StorageInstr::Allocate { id, .. }
+        | StorageInstr::ExtentWrite { id, .. }
+        | StorageInstr::TileMap { id, .. }
+        | StorageInstr::CreateView { id, .. }
+        | StorageInstr::Attach { id, .. }
+        | StorageInstr::Release { id, .. }
+        | StorageInstr::Finalize { id, .. } => *id,
     }
 }

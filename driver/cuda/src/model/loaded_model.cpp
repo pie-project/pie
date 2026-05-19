@@ -5,6 +5,7 @@
 #include <cstdlib>
 #include <fstream>
 #include <iostream>
+#include <optional>
 #include <stdexcept>
 
 #include <cuda_runtime.h>
@@ -206,14 +207,22 @@ LoadedModel LoadedModel::load(const Config& boot_cfg, NcclComm* tp_comm) {
 
     WeightStoreBuilder(e.weights_).reserve(loader.num_tensors());
 
-    LayoutPlan layout_plan =
-        build_model_layout_plan(e.hf_, boot_cfg, loader, tp_size, backend_target);
-
+    std::optional<LayoutPlan> layout_plan;
     RustLoaderCompileResult rust_plan =
-        compile_rust_loader_plan(
-            e.hf_, layout_plan, loader, tp_rank, tp_size,
-            64ull * 1024ull * 1024ull,
-            /*preferred_alignment=*/256);
+        (boot_cfg.model.runtime_quant.empty() &&
+         can_compile_rust_loader_direct(e.hf_, loader, tp_size))
+            ? compile_rust_loader_plan_direct(
+                  e.hf_, loader, tp_rank, tp_size,
+                  64ull * 1024ull * 1024ull,
+                  /*preferred_alignment=*/256)
+            : [&] {
+                  layout_plan = build_model_layout_plan(
+                      e.hf_, boot_cfg, loader, tp_size, backend_target);
+                  return compile_rust_loader_plan(
+                      e.hf_, *layout_plan, loader, tp_rank, tp_size,
+                      64ull * 1024ull * 1024ull,
+                      /*preferred_alignment=*/256);
+              }();
     const auto rust_view = rust_plan.program.view();
     if (const char* dump_path =
             std::getenv("PIE_CUDA_RUST_LAYOUT_PLAN_DUMP");
@@ -227,24 +236,30 @@ LoadedModel LoadedModel::load(const Config& boot_cfg, NcclComm* tp_comm) {
         out << dump_rust_storage_program_json(
             rust_view,
             rust_plan.source_tensor_count,
-            rust_plan.direct_contract_count,
+            rust_plan.covered_contract_count,
             rust_plan.runtime_tensor_count);
     }
     if (verbose) {
-        std::cerr << "[pie-driver-cuda] layout compiler: "
-                  << describe_layout_plan(layout_plan) << "\n";
+        if (layout_plan.has_value()) {
+            std::cerr << "[pie-driver-cuda] layout compiler: "
+                      << describe_layout_plan(*layout_plan) << "\n";
+        } else {
+            std::cerr
+                << "[pie-driver-cuda] layout compiler: rust-direct dense "
+                   "RuntimeABI\n";
+        }
         std::cerr << "[pie-driver-cuda] rust loader compiler: "
                   << describe_rust_storage_program(
                          rust_view,
                          rust_plan.source_tensor_count,
-                         rust_plan.direct_contract_count,
+                         rust_plan.covered_contract_count,
                          rust_plan.runtime_tensor_count)
                   << "\n";
     }
-    if (rust_plan.direct_contract_count != rust_plan.runtime_tensor_count) {
+    if (rust_plan.covered_contract_count != rust_plan.runtime_tensor_count) {
         throw std::runtime_error(
             "engine: Rust loader did not cover the full RuntimeABI; covered " +
-            std::to_string(rust_plan.direct_contract_count) + "/" +
+            std::to_string(rust_plan.covered_contract_count) + "/" +
             std::to_string(rust_plan.runtime_tensor_count) +
             " runtime tensors. Add schema/RuntimeABI coverage before enabling "
             "this model.");

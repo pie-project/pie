@@ -88,6 +88,7 @@ add_library(pie_driver_cuda_lib STATIC
   src/loader/model_adapter.cpp
   src/loader/model_family.cpp
   src/loader/model_schema.cpp
+  src/loader/model_schema_registry.cpp
   src/loader/semantic_graph.cpp
   src/loader/runtime_abi.cpp
   src/loader/safetensors.cpp
@@ -241,9 +242,8 @@ add_executable(test_layout_plan
   src/loader/model_adapter.cpp
   src/loader/model_family.cpp
   src/loader/model_schema.cpp
+  src/loader/model_schema_registry.cpp
   src/loader/semantic_graph.cpp
-  src/loader/storage_compiler.cpp
-  src/loader/storage_program.cpp
   src/loader/runtime_abi.cpp)
 target_include_directories(test_layout_plan PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/src

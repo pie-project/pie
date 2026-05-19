@@ -31,9 +31,59 @@ struct RustLoaderCompileResult {
     std::vector<std::string> source_tensor_names;
     std::vector<RustQuantAttachment> quant_attachments;
     std::size_t source_tensor_count = 0;
-    std::size_t direct_contract_count = 0;
+    std::size_t covered_contract_count = 0;
     std::size_t runtime_tensor_count = 0;
 };
+
+struct RustLoaderSourceIndex {
+    std::unordered_map<std::string, std::uint32_t> tensor_ids;
+    std::vector<std::string> tensor_names;
+};
+
+inline RustLoaderSourceIndex add_checkpoint_metadata_to_rust_input(
+    RustLoaderInputBuilder& input,
+    const SafetensorsCheckpointSource& loader)
+{
+    std::map<std::uint32_t, std::filesystem::path> files;
+    std::map<std::uint32_t, std::uint64_t> file_sizes;
+
+    auto names = loader.tensor_names();
+    std::sort(names.begin(), names.end());
+
+    RustLoaderSourceIndex index;
+    index.tensor_names.reserve(names.size());
+    std::uint32_t next_tensor_id = 0;
+    for (const auto& name : names) {
+        const TensorInfo& info = loader.info(name);
+        const TensorStorageInfo storage = loader.storage_info(name);
+        index.tensor_ids.emplace(name, next_tensor_id);
+        files.emplace(storage.shard_id, storage.path);
+        if (!storage.path.empty()) {
+            std::error_code ec;
+            const auto size = std::filesystem::file_size(storage.path, ec);
+            if (!ec) {
+                file_sizes[storage.shard_id] = size;
+            }
+        }
+        input.add_tensor(
+            next_tensor_id,
+            name,
+            storage.shard_id,
+            storage.file_offset,
+            storage.nbytes,
+            info);
+        index.tensor_names.push_back(name);
+        ++next_tensor_id;
+    }
+    for (const auto& [file_id, path] : files) {
+        input.add_file(
+            file_id,
+            path.string(),
+            file_sizes[file_id],
+            pie_weight_loader::PieLoaderCheckpointFormat::Safetensors);
+    }
+    return index;
+}
 
 inline bool rust_loader_contract_is_direct(
     const TensorDecl& spec,
@@ -86,6 +136,85 @@ inline std::uint64_t rust_loader_tensor_nbytes(
         name);
 }
 
+inline bool rust_loader_direct_dtype_supported(DType dtype) noexcept
+{
+    switch (dtype) {
+    case DType::BF16:
+    case DType::INT32:
+    case DType::UINT8:
+        return true;
+    case DType::FP16:
+    case DType::FP32:
+    case DType::FP8_E4M3:
+    case DType::FP8_E5M2:
+    case DType::INT8:
+    case DType::INT64:
+    case DType::INT4_PACKED:
+        return false;
+    }
+    return false;
+}
+
+inline bool can_compile_rust_loader_direct(
+    const HfConfig& hf,
+    const SafetensorsCheckpointSource& loader,
+    int tp_size)
+{
+    if (tp_size != 1 || !hf.quant_method.empty() || hf.num_experts > 0) {
+        return false;
+    }
+    for (const auto& name : loader.tensor_names()) {
+        if (!rust_loader_direct_dtype_supported(loader.info(name).dtype)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+inline RustLoaderCompileResult compile_rust_loader_plan_direct(
+    const HfConfig& hf,
+    const SafetensorsCheckpointSource& loader,
+    int tp_rank,
+    int tp_size,
+    std::uint64_t max_tile_bytes,
+    std::uint32_t preferred_alignment)
+{
+    RustLoaderInputBuilder input;
+    input.set_model(hf);
+    input.set_target(
+        tp_rank,
+        tp_size,
+        max_tile_bytes,
+        preferred_alignment);
+    input.set_runtime_abi_name("pie-cuda", /*version=*/1);
+
+    RustLoaderSourceIndex source_index =
+        add_checkpoint_metadata_to_rust_input(input, loader);
+    std::size_t covered_contracts = 0;
+    for (const auto& name : source_index.tensor_names) {
+        const TensorInfo& info = loader.info(name);
+        const auto tensor_it = source_index.tensor_ids.find(name);
+        if (tensor_it == source_index.tensor_ids.end()) continue;
+        input.add_direct_contract(
+            name,
+            tensor_it->second,
+            info.dtype,
+            info.shape,
+            preferred_alignment,
+            /*shard_axis=*/-1);
+        ++covered_contracts;
+    }
+
+    return RustLoaderCompileResult{
+        .program = compile_rust_storage_program(input.view()),
+        .source_tensor_names = std::move(source_index.tensor_names),
+        .quant_attachments = {},
+        .source_tensor_count = source_index.tensor_ids.size(),
+        .covered_contract_count = covered_contracts,
+        .runtime_tensor_count = covered_contracts,
+    };
+}
+
 inline RustLoaderCompileResult compile_rust_loader_plan(
     const HfConfig& hf,
     const LayoutPlan& layout_plan,
@@ -104,47 +233,12 @@ inline RustLoaderCompileResult compile_rust_loader_plan(
         preferred_alignment);
     input.set_runtime_abi_name("pie-cuda", /*version=*/1);
 
-    std::unordered_map<std::string, std::uint32_t> tensor_ids;
-    std::map<std::uint32_t, std::filesystem::path> files;
-    std::map<std::uint32_t, std::uint64_t> file_sizes;
-
-    auto names = loader.tensor_names();
-    std::sort(names.begin(), names.end());
-    std::vector<std::string> tensor_names;
-    tensor_names.reserve(names.size());
-    std::uint32_t next_tensor_id = 0;
-    for (const auto& name : names) {
-        const TensorInfo& info = loader.info(name);
-        const TensorStorageInfo storage = loader.storage_info(name);
-        tensor_ids.emplace(name, next_tensor_id);
-        files.emplace(storage.shard_id, storage.path);
-        if (!storage.path.empty()) {
-            std::error_code ec;
-            const auto size = std::filesystem::file_size(storage.path, ec);
-            if (!ec) {
-                file_sizes[storage.shard_id] = size;
-            }
-        }
-        input.add_tensor(
-            next_tensor_id,
-            name,
-            storage.shard_id,
-            storage.file_offset,
-            storage.nbytes,
-            info);
-        tensor_names.push_back(name);
-        ++next_tensor_id;
-    }
-    for (const auto& [file_id, path] : files) {
-        input.add_file(
-            file_id,
-            path.string(),
-            file_sizes[file_id],
-            pie_weight_loader::PieLoaderCheckpointFormat::Safetensors);
-    }
+    RustLoaderSourceIndex source_index =
+        add_checkpoint_metadata_to_rust_input(input, loader);
+    const auto& tensor_ids = source_index.tensor_ids;
 
     std::unordered_map<LayoutExprId, std::uint32_t> contract_for_expr;
-    std::size_t emitted_contracts = 0;
+    std::size_t covered_contracts = 0;
     for (const auto& binding : layout_plan.algebra.bindings) {
         if (binding.root >= layout_plan.algebra.exprs.size()) continue;
         const LayoutExpr& root = layout_plan.algebra.exprs[binding.root];
@@ -198,7 +292,7 @@ inline RustLoaderCompileResult compile_rust_loader_plan(
                 spec.shape,
                 preferred_alignment);
             contract_for_expr[join_id] =
-                static_cast<std::uint32_t>(emitted_contracts);
+                static_cast<std::uint32_t>(covered_contracts);
             return true;
         };
 
@@ -347,18 +441,18 @@ inline RustLoaderCompileResult compile_rust_loader_plan(
 
         if (emitted) {
             const auto contract_id =
-                static_cast<std::uint32_t>(emitted_contracts);
+                static_cast<std::uint32_t>(covered_contracts);
             contract_for_expr[binding.root] = contract_id;
-            ++emitted_contracts;
+            ++covered_contracts;
         }
     }
 
     RustLoaderCompileResult result{
         .program = compile_rust_storage_program(input.view()),
-        .source_tensor_names = std::move(tensor_names),
+        .source_tensor_names = std::move(source_index.tensor_names),
         .quant_attachments = {},
-        .source_tensor_count = tensor_ids.size(),
-        .direct_contract_count = emitted_contracts,
+        .source_tensor_count = source_index.tensor_ids.size(),
+        .covered_contract_count = covered_contracts,
         .runtime_tensor_count = layout_plan.algebra.bindings.size(),
     };
     for (const auto& [name, spec] : layout_plan.tensors) {
@@ -381,7 +475,7 @@ inline RustLoaderCompileResult compile_rust_loader_plan(
 inline std::string describe_rust_storage_program(
     const pie_weight_loader::PieLoaderStorageProgramView& view,
     std::size_t source_tensor_count,
-    std::size_t direct_contract_count,
+    std::size_t covered_contract_count,
     std::size_t runtime_tensor_count)
 {
     std::uint64_t optimizer_rewrites = 0;
@@ -391,7 +485,7 @@ inline std::string describe_rust_storage_program(
     std::ostringstream out;
     out << "rust_storage_program(version=" << view.version
         << ", source_tensors=" << source_tensor_count
-        << ", contracts=" << direct_contract_count << "/" << runtime_tensor_count
+        << ", contracts=" << covered_contract_count << "/" << runtime_tensor_count
         << ", tensors=" << view.tensors.len
         << ", buffers=" << view.buffers.len
         << ", instrs=" << view.instrs.len
@@ -489,7 +583,7 @@ inline void dump_rust_optimizer_report(
 inline std::string dump_rust_storage_program_json(
     const pie_weight_loader::PieLoaderStorageProgramView& view,
     std::size_t source_tensor_count,
-    std::size_t direct_contract_count,
+    std::size_t covered_contract_count,
     std::size_t runtime_tensor_count)
 {
     std::map<std::string, std::size_t> instruction_kinds;
@@ -506,12 +600,12 @@ inline std::string dump_rust_storage_program_json(
     out << "{\n"
         << "  \"summary\": \""
         << describe_rust_storage_program(
-               view, source_tensor_count, direct_contract_count,
+               view, source_tensor_count, covered_contract_count,
                runtime_tensor_count)
         << "\",\n"
         << "  \"version\": " << view.version << ",\n"
         << "  \"source_tensor_count\": " << source_tensor_count << ",\n"
-        << "  \"direct_contract_count\": " << direct_contract_count << ",\n"
+        << "  \"covered_contract_count\": " << covered_contract_count << ",\n"
         << "  \"runtime_tensor_count\": " << runtime_tensor_count << ",\n"
         << "  \"tensor_count\": " << view.tensors.len << ",\n"
         << "  \"buffer_count\": " << view.buffers.len << ",\n"

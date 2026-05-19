@@ -126,6 +126,7 @@ def parse_plan_dump(path: Path) -> dict[str, Any]:
             "storage_summary": data.get("summary"),
             "algebra_expr_count": None,
             "algebra_binding_count": data.get("runtime_tensor_count"),
+            "covered_contract_count": data.get("covered_contract_count"),
             "algebra_expr_kinds": {},
             "storage_instr_count": data.get("instruction_count"),
             "storage_instr_kinds": instr_kinds,

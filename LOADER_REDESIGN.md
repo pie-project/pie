@@ -556,8 +556,19 @@ driver/cuda/src/loader/
     partition_join_cancel.hpp/.cpp
     view_canonicalize.hpp/.cpp
 
-  storage_program.hpp/.cpp
-  storage_compiler.hpp/.cpp
+driver/weight_loader/src/
+  schema.rs
+  abi.rs
+  algebra.rs
+  optimizer.rs
+  storage.rs
+  storage_compiler.rs
+
+driver/weight_loader/include/
+  weight_loader.h
+  weight_loader_cpp.hpp
+
+driver/cuda/src/loader/
   rust_storage_executor.hpp
 ```
 
