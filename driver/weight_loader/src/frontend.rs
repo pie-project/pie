@@ -4,9 +4,7 @@ use crate::ir::{ByteSpan, LayoutExpr, LayoutPlan};
 use crate::semantic::SemanticGraph;
 use crate::source::{CheckpointMetadata, RawTensor};
 use crate::storage::StorageTarget;
-use crate::types::{
-    DType, Encoding, QuantSpec, Sharding, TensorDecl, TensorId, encoding_storage_bytes,
-};
+use crate::types::{DType, Encoding, QuantSpec, Sharding, TensorDecl, TensorId, encoding_nbytes};
 
 pub fn plan_from_semantics(
     metadata: &CheckpointMetadata,
@@ -375,7 +373,7 @@ fn lower_encoding_change(
 
 fn source_decl(raw: &RawTensor) -> TensorDecl {
     let alignment = raw.layout.alignment.max(1);
-    let encoding = normalize_encoding(&raw.encoding);
+    let encoding = crate::types::normalize_encoding(&raw.encoding);
     TensorDecl {
         id: raw.id,
         name: raw.name.clone(),
@@ -387,40 +385,8 @@ fn source_decl(raw: &RawTensor) -> TensorDecl {
     }
 }
 
-fn normalize_encoding(encoding: &Encoding) -> Encoding {
-    match encoding {
-        Encoding::Raw(dtype) => Encoding::Raw(*dtype),
-        Encoding::Quant(spec) => {
-            let mut spec = spec.clone();
-            if spec.bits_per_element == 0 {
-                spec.bits_per_element = default_bits(spec.scheme);
-            }
-            Encoding::Quant(spec)
-        }
-    }
-}
-
-fn default_bits(scheme: crate::types::QuantScheme) -> u8 {
-    use crate::types::QuantScheme;
-    match scheme {
-        QuantScheme::AwqInt4
-        | QuantScheme::GptqInt4
-        | QuantScheme::Mxfp4E2M1E8M0
-        | QuantScheme::GgufQ4_0
-        | QuantScheme::GgufQ4K => 4,
-        QuantScheme::GgufQ5_0 | QuantScheme::GgufQ5K => 5,
-        QuantScheme::Fp8E4M3
-        | QuantScheme::Fp8E5M2
-        | QuantScheme::Int8Symmetric
-        | QuantScheme::Int8Asymmetric
-        | QuantScheme::GgufQ8_0 => 8,
-        QuantScheme::None => 8,
-    }
-}
-
 pub fn runtime_bytes(shape: &[i64], encoding: &Encoding) -> Result<u64, CompileError> {
-    let bytes = encoding_storage_bytes(encoding);
-    crate::types::tensor_nbytes(shape, bytes)
+    encoding_nbytes(shape, encoding)
         .ok_or_else(|| CompileError::InvalidInput("runtime tensor byte size overflow".to_string()))
 }
 

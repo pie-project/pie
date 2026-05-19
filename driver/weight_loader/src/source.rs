@@ -77,7 +77,21 @@ pub fn tensors_from_ffi(
             file_offset: tensor.file_offset,
             span_bytes: tensor.span_bytes,
             shape,
-            encoding: ffi_encoding(tensor.encoding_kind, tensor.dtype, tensor.quant_scheme)?,
+            encoding: ffi_encoding(
+                tensor.encoding_kind,
+                tensor.dtype,
+                tensor.quant_scheme,
+                tensor.quant_bits_per_element,
+                tensor.quant_group_size,
+                tensor.quant_channel_axis,
+                tensor
+                    .quant_has_scale_dtype
+                    .then_some(tensor.quant_scale_dtype),
+                tensor
+                    .quant_has_zero_point_dtype
+                    .then_some(tensor.quant_zero_point_dtype),
+                tensor.quant_block_shape,
+            )?,
             layout: Layout::dense(1),
         });
     }
@@ -158,19 +172,37 @@ fn ffi_encoding(
     kind: PieLoaderEncodingKind,
     dtype: PieLoaderDType,
     scheme: PieLoaderQuantScheme,
+    bits_per_element: u8,
+    group_size: u32,
+    channel_axis: i32,
+    scale_dtype: Option<PieLoaderDType>,
+    zero_point_dtype: Option<PieLoaderDType>,
+    block_shape: PieLoaderI64Slice,
 ) -> Result<Encoding, CompileError> {
     let dtype = ffi_dtype(dtype);
     match kind {
         PieLoaderEncodingKind::Raw => Ok(Encoding::Raw(dtype)),
-        PieLoaderEncodingKind::Quant => Ok(Encoding::Quant(QuantSpec {
-            scheme: ffi_quant_scheme(scheme),
-            logical_dtype: dtype,
-            bits_per_element: 0,
-            group_size: 0,
-            channel_axis: None,
-            scale_dtype: None,
-            zero_point_dtype: None,
-            block_shape: Vec::new(),
-        })),
+        PieLoaderEncodingKind::Quant => Ok(Encoding::Quant(
+            QuantSpec {
+                scheme: ffi_quant_scheme(scheme),
+                logical_dtype: dtype,
+                bits_per_element,
+                group_size,
+                channel_axis: ffi_optional_axis(channel_axis)?,
+                scale_dtype: scale_dtype.map(ffi_dtype),
+                zero_point_dtype: zero_point_dtype.map(ffi_dtype),
+                block_shape: ffi_i64_slice(block_shape, "tensor.quant_block_shape")?,
+            }
+            .normalized(),
+        )),
     }
+}
+
+pub fn ffi_optional_axis(axis: i32) -> Result<Option<crate::types::Axis>, CompileError> {
+    if axis < 0 {
+        return Ok(None);
+    }
+    Ok(Some(crate::types::Axis(u8::try_from(axis).map_err(
+        |_| CompileError::InvalidInput(format!("axis {axis} is out of range")),
+    )?)))
 }

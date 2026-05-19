@@ -17,34 +17,6 @@
 
 namespace pie_cuda_driver {
 
-enum class RustLoaderPlannerMode {
-    Cpp,
-    Rust,
-    Dual,
-};
-
-inline RustLoaderPlannerMode parse_rust_loader_planner_mode(
-    const std::string& value)
-{
-    if (value.empty() || value == "rust") return RustLoaderPlannerMode::Rust;
-    if (value == "cpp") return RustLoaderPlannerMode::Cpp;
-    if (value == "dual") return RustLoaderPlannerMode::Dual;
-    throw std::runtime_error(
-        "rust loader planner: PIE_CUDA_LOADER_PLANNER must be one of "
-        "{rust,dual,cpp}; cpp is deprecated");
-}
-
-inline const char* rust_loader_planner_mode_name(
-    RustLoaderPlannerMode mode) noexcept
-{
-    switch (mode) {
-    case RustLoaderPlannerMode::Cpp: return "cpp";
-    case RustLoaderPlannerMode::Rust: return "rust";
-    case RustLoaderPlannerMode::Dual: return "dual";
-    }
-    return "?";
-}
-
 inline std::string rust_loader_bytes_to_string(
     pie_weight_loader::PieLoaderBytes bytes)
 {
@@ -60,7 +32,7 @@ struct RustLoaderCompileResult {
     std::vector<RustQuantAttachment> quant_attachments;
     std::size_t source_tensor_count = 0;
     std::size_t direct_contract_count = 0;
-    std::size_t cpp_tensor_count = 0;
+    std::size_t runtime_tensor_count = 0;
 };
 
 inline bool rust_loader_contract_is_direct(
@@ -114,9 +86,9 @@ inline std::uint64_t rust_loader_tensor_nbytes(
         name);
 }
 
-inline RustLoaderCompileResult compile_rust_loader_plan_from_cpp_plan(
+inline RustLoaderCompileResult compile_rust_loader_plan(
     const HfConfig& hf,
-    const LayoutPlan& cpp_plan,
+    const LayoutPlan& layout_plan,
     const SafetensorsCheckpointSource& loader,
     int tp_rank,
     int tp_size,
@@ -173,11 +145,11 @@ inline RustLoaderCompileResult compile_rust_loader_plan_from_cpp_plan(
 
     std::unordered_map<LayoutExprId, std::uint32_t> contract_for_expr;
     std::size_t emitted_contracts = 0;
-    for (const auto& binding : cpp_plan.algebra.bindings) {
-        if (binding.root >= cpp_plan.algebra.exprs.size()) continue;
-        const LayoutExpr& root = cpp_plan.algebra.exprs[binding.root];
-        const auto spec_it = cpp_plan.tensors.find(binding.runtime_name);
-        if (spec_it == cpp_plan.tensors.end()) continue;
+    for (const auto& binding : layout_plan.algebra.bindings) {
+        if (binding.root >= layout_plan.algebra.exprs.size()) continue;
+        const LayoutExpr& root = layout_plan.algebra.exprs[binding.root];
+        const auto spec_it = layout_plan.tensors.find(binding.runtime_name);
+        if (spec_it == layout_plan.tensors.end()) continue;
         const TensorDecl& spec = spec_it->second;
 
         auto emit_direct_source = [&](const LayoutExpr& source_expr) -> bool {
@@ -206,9 +178,9 @@ inline RustLoaderCompileResult compile_rust_loader_plan_from_cpp_plan(
             std::vector<std::uint32_t> source_ids;
             source_ids.reserve(join_expr.inputs.size());
             for (const auto source_expr_id : join_expr.inputs) {
-                if (source_expr_id >= cpp_plan.algebra.exprs.size()) return false;
+                if (source_expr_id >= layout_plan.algebra.exprs.size()) return false;
                 const LayoutExpr& source_expr =
-                    cpp_plan.algebra.exprs[source_expr_id];
+                    layout_plan.algebra.exprs[source_expr_id];
                 if (source_expr.kind != LayoutExprKind::Source ||
                     !loader.contains(source_expr.raw_name)) {
                     return false;
@@ -266,11 +238,11 @@ inline RustLoaderCompileResult compile_rust_loader_plan_from_cpp_plan(
                         const LayoutExprId source_expr_id =
                             stack_expr.inputs[first + j];
                         if (source_expr_id >=
-                            cpp_plan.algebra.exprs.size()) {
+                            layout_plan.algebra.exprs.size()) {
                             return false;
                         }
                         const LayoutExpr& source_expr =
-                            cpp_plan.algebra.exprs[source_expr_id];
+                            layout_plan.algebra.exprs[source_expr_id];
                         if (source_expr.kind != LayoutExprKind::Source ||
                             !loader.contains(source_expr.raw_name)) {
                             return false;
@@ -328,9 +300,9 @@ inline RustLoaderCompileResult compile_rust_loader_plan_from_cpp_plan(
         bool emitted = false;
         if (root.kind == LayoutExprKind::Realize && !root.inputs.empty()) {
             const LayoutExprId input_expr_id = root.inputs.front();
-            if (input_expr_id < cpp_plan.algebra.exprs.size()) {
+            if (input_expr_id < layout_plan.algebra.exprs.size()) {
                 const LayoutExpr& input_expr =
-                    cpp_plan.algebra.exprs[input_expr_id];
+                    layout_plan.algebra.exprs[input_expr_id];
                 emitted = emit_direct_source(input_expr);
                 if (!emitted) {
                     emitted = emit_join(input_expr_id, input_expr);
@@ -387,9 +359,9 @@ inline RustLoaderCompileResult compile_rust_loader_plan_from_cpp_plan(
         .quant_attachments = {},
         .source_tensor_count = tensor_ids.size(),
         .direct_contract_count = emitted_contracts,
-        .cpp_tensor_count = cpp_plan.algebra.bindings.size(),
+        .runtime_tensor_count = layout_plan.algebra.bindings.size(),
     };
-    for (const auto& [name, spec] : cpp_plan.tensors) {
+    for (const auto& [name, spec] : layout_plan.tensors) {
         if (spec.quant.format == QuantFormat::None ||
             spec.quant.scale_tensor.empty()) {
             continue;
@@ -410,7 +382,7 @@ inline std::string describe_rust_storage_program(
     const pie_weight_loader::PieLoaderStorageProgramView& view,
     std::size_t source_tensor_count,
     std::size_t direct_contract_count,
-    std::size_t cpp_tensor_count)
+    std::size_t runtime_tensor_count)
 {
     std::uint64_t optimizer_rewrites = 0;
     for (std::size_t i = 0; i < view.optimizer.passes.len; ++i) {
@@ -419,7 +391,7 @@ inline std::string describe_rust_storage_program(
     std::ostringstream out;
     out << "rust_storage_program(version=" << view.version
         << ", source_tensors=" << source_tensor_count
-        << ", contracts=" << direct_contract_count << "/" << cpp_tensor_count
+        << ", contracts=" << direct_contract_count << "/" << runtime_tensor_count
         << ", tensors=" << view.tensors.len
         << ", buffers=" << view.buffers.len
         << ", instrs=" << view.instrs.len
@@ -518,7 +490,7 @@ inline std::string dump_rust_storage_program_json(
     const pie_weight_loader::PieLoaderStorageProgramView& view,
     std::size_t source_tensor_count,
     std::size_t direct_contract_count,
-    std::size_t cpp_tensor_count)
+    std::size_t runtime_tensor_count)
 {
     std::map<std::string, std::size_t> instruction_kinds;
     std::map<std::string, std::size_t> tile_map_kinds;
@@ -535,12 +507,12 @@ inline std::string dump_rust_storage_program_json(
         << "  \"summary\": \""
         << describe_rust_storage_program(
                view, source_tensor_count, direct_contract_count,
-               cpp_tensor_count)
+               runtime_tensor_count)
         << "\",\n"
         << "  \"version\": " << view.version << ",\n"
         << "  \"source_tensor_count\": " << source_tensor_count << ",\n"
         << "  \"direct_contract_count\": " << direct_contract_count << ",\n"
-        << "  \"cpp_tensor_count\": " << cpp_tensor_count << ",\n"
+        << "  \"runtime_tensor_count\": " << runtime_tensor_count << ",\n"
         << "  \"tensor_count\": " << view.tensors.len << ",\n"
         << "  \"buffer_count\": " << view.buffers.len << ",\n"
         << "  \"instruction_count\": " << view.instrs.len << ",\n"

@@ -53,7 +53,6 @@ def bench_env(
     *,
     plan_dump: Path | None = None,
     pie_driver: str = "cuda_native",
-    loader_planner: str = "rust",
 ) -> dict[str, str]:
     env = base.copy()
     paths = [
@@ -63,17 +62,11 @@ def bench_env(
     if env.get("PYTHONPATH"):
         paths.append(env["PYTHONPATH"])
     env["PYTHONPATH"] = os.pathsep.join(paths)
-    if loader_planner != "cpp":
+    if plan_dump is not None:
         if pie_driver == "portable":
-            env["PIE_PORTABLE_LOADER_PLANNER"] = loader_planner
-            if plan_dump is not None:
-                env["PIE_PORTABLE_RUST_LAYOUT_PLAN_DUMP"] = str(plan_dump)
+            env["PIE_PORTABLE_RUST_LAYOUT_PLAN_DUMP"] = str(plan_dump)
         else:
-            env["PIE_CUDA_LOADER_PLANNER"] = loader_planner
-            if plan_dump is not None:
-                env["PIE_CUDA_RUST_LAYOUT_PLAN_DUMP"] = str(plan_dump)
-    elif plan_dump is not None and pie_driver == "cuda_native":
-        env["PIE_CUDA_LAYOUT_PLAN_DUMP"] = str(plan_dump)
+            env["PIE_CUDA_RUST_LAYOUT_PLAN_DUMP"] = str(plan_dump)
     return env
 
 
@@ -107,13 +100,6 @@ def parse_pie_loader_log(log_path: Path) -> dict[str, Any]:
                 "cuda_memory_samples": int(memory.group(7)),
             }
         )
-    storage = re.search(r"storage compiler: (.*)", text)
-    if storage:
-        out["storage_summary"] = storage.group(1).strip()
-    source = re.search(r"checkpoint byte source: (\w+) \(policy=(\w+)\)", text)
-    if source:
-        out["checkpoint_byte_source"] = source.group(1)
-        out["checkpoint_io_policy"] = source.group(2)
     return out
 
 
@@ -139,7 +125,7 @@ def parse_plan_dump(path: Path) -> dict[str, Any]:
             "layout_summary": data.get("summary"),
             "storage_summary": data.get("summary"),
             "algebra_expr_count": None,
-            "algebra_binding_count": data.get("cpp_tensor_count"),
+            "algebra_binding_count": data.get("runtime_tensor_count"),
             "algebra_expr_kinds": {},
             "storage_instr_count": data.get("instruction_count"),
             "storage_instr_kinds": instr_kinds,
@@ -218,8 +204,6 @@ def bench_cmd(args: argparse.Namespace, engine: str, mode: str, model: str, json
             "--server-startup-timeout",
             str(args.server_startup_timeout),
         ]
-        if args.checkpoint_io and args.pie_driver == "cuda_native":
-            cmd += ["--checkpoint-io", args.checkpoint_io]
         if args.mxfp4_moe and args.pie_driver == "cuda_native":
             cmd += ["--mxfp4-moe", args.mxfp4_moe]
         return cmd
@@ -319,18 +303,11 @@ def main() -> None:
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--gpu-mem-util", type=float, default=0.80)
     parser.add_argument("--max-model-len", type=int, default=2048)
-    parser.add_argument("--checkpoint-io", choices=["auto", "mmap", "gds"], default="auto")
     parser.add_argument(
         "--pie-driver",
         choices=["cuda_native", "portable"],
         default="cuda_native",
         help="Pie backend used for Pie evidence runs.",
-    )
-    parser.add_argument(
-        "--loader-planner",
-        choices=["cpp", "rust", "dual"],
-        default="rust",
-        help="Set PIE_*_LOADER_PLANNER for Pie evidence runs.",
     )
     parser.add_argument(
         "--mxfp4-moe",
@@ -358,12 +335,6 @@ def main() -> None:
         help="Compatibility override for FlashInfer JIT on Blackwell/CUDA 12.8 hosts.",
     )
     args = parser.parse_args()
-    if args.pie_driver == "portable" and args.loader_planner != "rust":
-        raise SystemExit(
-            "portable driver always uses the Rust storage-program loader; "
-            "--loader-planner must be rust for --pie-driver portable"
-        )
-
     models = args.model or ["Qwen/Qwen3-32B"]
     engines = [e.strip() for e in args.engines.split(",") if e.strip()]
     modes = [m.strip() for m in args.modes.split(",") if m.strip()]
@@ -394,7 +365,7 @@ def main() -> None:
         "--test-dir",
         str(cuda_build_dir),
         "-R",
-        "layout_plan|loader_golden",
+        "layout_plan",
         "--output-on-failure",
     ]
     evidence["tests"].append(
@@ -419,7 +390,6 @@ def main() -> None:
                         os.environ,
                         plan_dump=plan_dump if engine == "pie" else None,
                         pie_driver=args.pie_driver,
-                        loader_planner=args.loader_planner,
                     )
                     pie_server_log = out_dir / f"{engine}-{mode}-{model_tag}.server.log"
                     if engine == "pie":

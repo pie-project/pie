@@ -9,7 +9,7 @@
 //
 // We mmap the file, slice into its header, and copy checkpoint bytes into
 // caller-owned device storage via cudaMemcpyAsync. Allocation and runtime
-// representation decisions live in the layout plan load_executor, not here.
+// representation decisions live in the compiled storage program, not here.
 // Sharded models (`model.safetensors.index.json`) are transparently split
 // across files.
 

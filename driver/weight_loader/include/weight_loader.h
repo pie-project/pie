@@ -203,6 +203,14 @@ struct PieLoaderCheckpointTensorView {
   PieLoaderEncodingKind encoding_kind;
   PieLoaderQuantScheme quant_scheme;
   PieLoaderI64Slice shape;
+  uint8_t quant_bits_per_element;
+  uint32_t quant_group_size;
+  int32_t quant_channel_axis;
+  bool quant_has_scale_dtype;
+  PieLoaderDType quant_scale_dtype;
+  bool quant_has_zero_point_dtype;
+  PieLoaderDType quant_zero_point_dtype;
+  PieLoaderI64Slice quant_block_shape;
 };
 
 struct PieLoaderCheckpointTensorSlice {
@@ -244,6 +252,14 @@ struct PieLoaderRuntimeTensorContractView {
   PieLoaderI64Slice shape;
   uint32_t alignment;
   int32_t shard_axis;
+  uint8_t quant_bits_per_element;
+  uint32_t quant_group_size;
+  int32_t quant_channel_axis;
+  bool quant_has_scale_dtype;
+  PieLoaderDType quant_scale_dtype;
+  bool quant_has_zero_point_dtype;
+  PieLoaderDType quant_zero_point_dtype;
+  PieLoaderI64Slice quant_block_shape;
 };
 
 struct PieLoaderRuntimeTensorContractSlice {

@@ -48,6 +48,7 @@ public:
         stats.planned_storage_peak_bytes = program.memory.persistent_bytes +
             program.memory.temporary_peak_bytes;
         stats.planned_storage_temp_bytes = program.memory.temporary_peak_bytes;
+        index_program(program);
 
         for (std::size_t i = 0; i < program.schedule.len; ++i) {
             const std::uint32_t instr_id = program.schedule.ptr[i];
@@ -185,8 +186,10 @@ private:
         const pie_weight_loader::PieLoaderStorageProgramView& program,
         std::uint32_t id) const
     {
-        for (std::size_t i = 0; i < program.instrs.len; ++i) {
-            if (program.instrs.ptr[i].id == id) return program.instrs.ptr[i];
+        (void)program;
+        auto it = instr_by_id_.find(id);
+        if (it != instr_by_id_.end()) {
+            return *it->second;
         }
         throw std::runtime_error(
             "rust storage executor: instruction id out of range");
@@ -196,8 +199,10 @@ private:
         const pie_weight_loader::PieLoaderStorageProgramView& program,
         std::uint32_t id) const
     {
-        for (std::size_t i = 0; i < program.buffers.len; ++i) {
-            if (program.buffers.ptr[i].id == id) return program.buffers.ptr[i];
+        (void)program;
+        auto it = buffer_decl_by_id_.find(id);
+        if (it != buffer_decl_by_id_.end()) {
+            return *it->second;
         }
         throw std::runtime_error(
             "rust storage executor: buffer id out of range");
@@ -207,11 +212,33 @@ private:
         const pie_weight_loader::PieLoaderStorageProgramView& program,
         std::uint32_t id) const
     {
-        for (std::size_t i = 0; i < program.tensors.len; ++i) {
-            if (program.tensors.ptr[i].id == id) return program.tensors.ptr[i];
+        (void)program;
+        auto it = tensor_decl_by_id_.find(id);
+        if (it != tensor_decl_by_id_.end()) {
+            return *it->second;
         }
         throw std::runtime_error(
                 "rust storage executor: tensor id out of range");
+    }
+
+    void index_program(
+        const pie_weight_loader::PieLoaderStorageProgramView& program)
+    {
+        instr_by_id_.clear();
+        buffer_decl_by_id_.clear();
+        tensor_decl_by_id_.clear();
+        instr_by_id_.reserve(program.instrs.len);
+        buffer_decl_by_id_.reserve(program.buffers.len);
+        tensor_decl_by_id_.reserve(program.tensors.len);
+        for (std::size_t i = 0; i < program.instrs.len; ++i) {
+            instr_by_id_.emplace(program.instrs.ptr[i].id, &program.instrs.ptr[i]);
+        }
+        for (std::size_t i = 0; i < program.buffers.len; ++i) {
+            buffer_decl_by_id_.emplace(program.buffers.ptr[i].id, &program.buffers.ptr[i]);
+        }
+        for (std::size_t i = 0; i < program.tensors.len; ++i) {
+            tensor_decl_by_id_.emplace(program.tensors.ptr[i].id, &program.tensors.ptr[i]);
+        }
     }
 
     static std::vector<std::uint32_t> ids_from_slice(
@@ -235,6 +262,15 @@ private:
             return;
         }
         const auto& tensor = tensor_decl(program, buffer.tensor_id);
+        if (tensor.encoding_kind ==
+            pie_weight_loader::PieLoaderEncodingKind::Quant) {
+            buffers_.emplace(
+                buffer.id,
+                DeviceTensor::allocate(
+                    DType::UINT8,
+                    {static_cast<std::int64_t>(buffer.bytes)}));
+            return;
+        }
         buffers_.emplace(
             buffer.id,
             DeviceTensor::allocate(
@@ -461,7 +497,8 @@ private:
         const auto& tensor = tensor_decl(program, output_buffer.tensor_id);
         const auto shape = shape_from_slice(tensor.shape);
         const auto* input_base =
-            static_cast<const std::uint8_t*>(input.data()) + instr.dest.offset;
+            static_cast<const std::uint8_t*>(input.data()) + instr.dest.offset +
+            instr.dest.stride.base_offset;
         buffers_.emplace(
             output_id,
             DeviceTensor::view(
@@ -499,8 +536,14 @@ private:
         const auto& tensor = tensor_decl(program, buffer_info.tensor_id);
         TensorDecl spec;
         spec.name = bytes_to_string(tensor.name);
-        spec.dtype = dtype_from_rust(tensor.dtype);
-        spec.shape = shape_from_slice(tensor.shape);
+        if (tensor.encoding_kind ==
+            pie_weight_loader::PieLoaderEncodingKind::Quant) {
+            spec.dtype = DType::UINT8;
+            spec.shape = {static_cast<std::int64_t>(buffer.mapped().nbytes())};
+        } else {
+            spec.dtype = dtype_from_rust(tensor.dtype);
+            spec.shape = shape_from_slice(tensor.shape);
+        }
         spec.layout = TensorLayoutKind::Dense;
         spec.ownership = TensorOwnershipKind::Owned;
         spec.parallel = TensorParallelKind::Replicated;
@@ -550,6 +593,18 @@ private:
     std::unordered_map<std::uint32_t, DeviceTensor> buffers_;
     std::unordered_map<std::uint32_t, std::string> finalized_buffer_names_;
     std::unordered_map<std::uint32_t, std::string> view_backing_names_;
+    std::unordered_map<
+        std::uint32_t,
+        const pie_weight_loader::PieLoaderStorageInstrView*>
+        instr_by_id_;
+    std::unordered_map<
+        std::uint32_t,
+        const pie_weight_loader::PieLoaderBufferDeclView*>
+        buffer_decl_by_id_;
+    std::unordered_map<
+        std::uint32_t,
+        const pie_weight_loader::PieLoaderTensorDeclView*>
+        tensor_decl_by_id_;
 };
 
 }  // namespace pie_cuda_driver

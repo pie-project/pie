@@ -103,6 +103,7 @@ fn dense_contract_lowers_to_storage_program() {
         encoding_kind: PieLoaderEncodingKind::Raw,
         quant_scheme: PieLoaderQuantScheme::None,
         shape,
+        ..PieLoaderCheckpointTensorView::default()
     }];
     let contracts = [PieLoaderRuntimeTensorContractView {
         output_name,
@@ -126,6 +127,7 @@ fn dense_contract_lowers_to_storage_program() {
         shape,
         alignment: 256,
         shard_axis: -1,
+        ..PieLoaderRuntimeTensorContractView::default()
     }];
     let input = PieLoaderCompileInput {
         files: PieLoaderCheckpointFileSlice {
@@ -208,6 +210,7 @@ fn cast_contract_lowers_to_source_tile_map() {
         encoding_kind: PieLoaderEncodingKind::Raw,
         quant_scheme: PieLoaderQuantScheme::None,
         shape,
+        ..PieLoaderCheckpointTensorView::default()
     }];
     let contracts = [PieLoaderRuntimeTensorContractView {
         output_name,
@@ -231,6 +234,7 @@ fn cast_contract_lowers_to_source_tile_map() {
         shape,
         alignment: 1,
         shard_axis: -1,
+        ..PieLoaderRuntimeTensorContractView::default()
     }];
     let input = compile_input(&files, &tensors, &contracts);
 
@@ -290,6 +294,7 @@ fn fp8_quant_contract_lowers_to_decode_with_metadata() {
             encoding_kind: PieLoaderEncodingKind::Quant,
             quant_scheme: PieLoaderQuantScheme::Fp8E4M3,
             shape: weight_shape,
+            ..PieLoaderCheckpointTensorView::default()
         },
         PieLoaderCheckpointTensorView {
             id: 1,
@@ -301,6 +306,7 @@ fn fp8_quant_contract_lowers_to_decode_with_metadata() {
             encoding_kind: PieLoaderEncodingKind::Raw,
             quant_scheme: PieLoaderQuantScheme::None,
             shape: scale_shape,
+            ..PieLoaderCheckpointTensorView::default()
         },
     ];
     let metadata_ids = [1_u32];
@@ -329,6 +335,7 @@ fn fp8_quant_contract_lowers_to_decode_with_metadata() {
         shape: weight_shape,
         alignment: 1,
         shard_axis: -1,
+        ..PieLoaderRuntimeTensorContractView::default()
     }];
     let input = compile_input(&files, &tensors, &contracts);
 
@@ -386,6 +393,7 @@ fn semantic_role_contract_resolves_source_tensor() {
         encoding_kind: PieLoaderEncodingKind::Raw,
         quant_scheme: PieLoaderQuantScheme::None,
         shape,
+        ..PieLoaderCheckpointTensorView::default()
     }];
     let contracts = [PieLoaderRuntimeTensorContractView {
         output_name,
@@ -409,6 +417,7 @@ fn semantic_role_contract_resolves_source_tensor() {
         shape,
         alignment: 1,
         shard_axis: -1,
+        ..PieLoaderRuntimeTensorContractView::default()
     }];
     let mut input = compile_input(&files, &tensors, &contracts);
     input.model.model_type = model_type;
@@ -466,6 +475,7 @@ fn byte_span_contract_lowers_to_explicit_extent_writes() {
             encoding_kind: PieLoaderEncodingKind::Raw,
             quant_scheme: PieLoaderQuantScheme::None,
             shape: a_shape,
+            ..PieLoaderCheckpointTensorView::default()
         },
         PieLoaderCheckpointTensorView {
             id: 1,
@@ -477,6 +487,7 @@ fn byte_span_contract_lowers_to_explicit_extent_writes() {
             encoding_kind: PieLoaderEncodingKind::Raw,
             quant_scheme: PieLoaderQuantScheme::None,
             shape: b_shape,
+            ..PieLoaderCheckpointTensorView::default()
         },
     ];
     let spans = [
@@ -579,6 +590,7 @@ fn join_and_select_contracts_lower_to_writes_and_view() {
             encoding_kind: PieLoaderEncodingKind::Raw,
             quant_scheme: PieLoaderQuantScheme::None,
             shape: source_shape,
+            ..PieLoaderCheckpointTensorView::default()
         },
         PieLoaderCheckpointTensorView {
             id: 1,
@@ -590,6 +602,7 @@ fn join_and_select_contracts_lower_to_writes_and_view() {
             encoding_kind: PieLoaderEncodingKind::Raw,
             quant_scheme: PieLoaderQuantScheme::None,
             shape: source_shape,
+            ..PieLoaderCheckpointTensorView::default()
         },
     ];
     let contracts = [

@@ -152,6 +152,14 @@ public:
             .encoding_kind = encoding_kind,
             .quant_scheme = quant_scheme,
             .shape = shape(shape_id),
+            .quant_bits_per_element = 0,
+            .quant_group_size = 0,
+            .quant_channel_axis = -1,
+            .quant_has_scale_dtype = false,
+            .quant_scale_dtype = pie_weight_loader::PieLoaderDType::F32,
+            .quant_has_zero_point_dtype = false,
+            .quant_zero_point_dtype = pie_weight_loader::PieLoaderDType::U8,
+            .quant_block_shape = {},
         });
     }
 
@@ -201,6 +209,14 @@ public:
                 .shape = shape(shape_id),
                 .alignment = alignment,
                 .shard_axis = shard_axis,
+                .quant_bits_per_element = 0,
+                .quant_group_size = 0,
+                .quant_channel_axis = -1,
+                .quant_has_scale_dtype = false,
+                .quant_scale_dtype = pie_weight_loader::PieLoaderDType::F32,
+                .quant_has_zero_point_dtype = false,
+                .quant_zero_point_dtype = pie_weight_loader::PieLoaderDType::U8,
+                .quant_block_shape = {},
             });
         refresh_contract_slice();
     }
@@ -244,6 +260,14 @@ public:
                 .shape = shape(shape_id),
                 .alignment = alignment,
                 .shard_axis = -1,
+                .quant_bits_per_element = 0,
+                .quant_group_size = 0,
+                .quant_channel_axis = -1,
+                .quant_has_scale_dtype = false,
+                .quant_scale_dtype = pie_weight_loader::PieLoaderDType::F32,
+                .quant_has_zero_point_dtype = false,
+                .quant_zero_point_dtype = pie_weight_loader::PieLoaderDType::U8,
+                .quant_block_shape = {},
             });
         refresh_contract_slice();
     }
@@ -285,6 +309,14 @@ public:
                 .shape = shape(shape_id),
                 .alignment = alignment,
                 .shard_axis = -1,
+                .quant_bits_per_element = 0,
+                .quant_group_size = 0,
+                .quant_channel_axis = -1,
+                .quant_has_scale_dtype = false,
+                .quant_scale_dtype = pie_weight_loader::PieLoaderDType::F32,
+                .quant_has_zero_point_dtype = false,
+                .quant_zero_point_dtype = pie_weight_loader::PieLoaderDType::U8,
+                .quant_block_shape = {},
             });
         refresh_contract_slice();
     }
@@ -326,6 +358,14 @@ public:
                 .shape = shape(shape_id),
                 .alignment = alignment,
                 .shard_axis = -1,
+                .quant_bits_per_element = 0,
+                .quant_group_size = 0,
+                .quant_channel_axis = -1,
+                .quant_has_scale_dtype = false,
+                .quant_scale_dtype = pie_weight_loader::PieLoaderDType::F32,
+                .quant_has_zero_point_dtype = false,
+                .quant_zero_point_dtype = pie_weight_loader::PieLoaderDType::U8,
+                .quant_block_shape = {},
             });
         refresh_contract_slice();
     }

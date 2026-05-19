@@ -68,7 +68,7 @@ public:
     std::optional<QuantMeta> quant_meta(const std::string& name) const;
 
 private:
-    // Owns runtime-layout tensors produced by the schema/layout-plan load_executor.
+    // Owns runtime-layout tensors produced by the Rust storage-program loader.
     // Some names are non-owning views into packed backing tensors so older
     // forward paths can keep their unfused fallback pointers.
     Config boot_;

@@ -647,9 +647,9 @@ fn select_decl(
 fn encode_select_is_aligned(decl: &TensorDecl, _axis: Axis, start: i64, length: i64) -> bool {
     match &decl.encoding {
         Encoding::Raw(_) => false,
-        Encoding::Quant(spec) if spec.bits_per_element >= 8 => true,
+        Encoding::Quant(spec) if spec.normalized_bits() >= 8 => true,
         Encoding::Quant(spec) => {
-            let group = i64::from(spec.group_size.max(1));
+            let group = i64::from(spec.normalized_group_size());
             start % group == 0 && length % group == 0
         }
     }

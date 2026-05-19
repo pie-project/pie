@@ -4,7 +4,7 @@ use crate::ffi_types::{
     PieLoaderRuntimeTensorContractView, PieLoaderSemanticRole,
 };
 use crate::semantic::SemanticRole;
-use crate::source::{ffi_dtype, ffi_i64_slice, ffi_quant_scheme, ffi_string};
+use crate::source::{ffi_dtype, ffi_i64_slice, ffi_optional_axis, ffi_quant_scheme, ffi_string};
 use crate::types::{Axis, DType, Encoding, Layout, QuantSpec, Sharding, TensorId};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -83,16 +83,26 @@ impl RuntimeTensorContract {
         let dtype = ffi_dtype(view.dtype);
         let encoding = match view.encoding_kind {
             crate::ffi_types::PieLoaderEncodingKind::Raw => Encoding::Raw(dtype),
-            crate::ffi_types::PieLoaderEncodingKind::Quant => Encoding::Quant(QuantSpec {
-                scheme: ffi_quant_scheme(view.quant_scheme),
-                logical_dtype: dtype,
-                bits_per_element: 0,
-                group_size: 0,
-                channel_axis: None,
-                scale_dtype: None,
-                zero_point_dtype: None,
-                block_shape: Vec::new(),
-            }),
+            crate::ffi_types::PieLoaderEncodingKind::Quant => Encoding::Quant(
+                QuantSpec {
+                    scheme: ffi_quant_scheme(view.quant_scheme),
+                    logical_dtype: dtype,
+                    bits_per_element: view.quant_bits_per_element,
+                    group_size: view.quant_group_size,
+                    channel_axis: ffi_optional_axis(view.quant_channel_axis)?,
+                    scale_dtype: view
+                        .quant_has_scale_dtype
+                        .then_some(ffi_dtype(view.quant_scale_dtype)),
+                    zero_point_dtype: view
+                        .quant_has_zero_point_dtype
+                        .then_some(ffi_dtype(view.quant_zero_point_dtype)),
+                    block_shape: ffi_i64_slice(
+                        view.quant_block_shape,
+                        "runtime_tensor.quant_block_shape",
+                    )?,
+                }
+                .normalized(),
+            ),
         };
         let shape = ffi_i64_slice(view.shape, "runtime_tensor.shape")?;
         for dim in &shape {

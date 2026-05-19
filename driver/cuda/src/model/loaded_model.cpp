@@ -5,21 +5,16 @@
 #include <cstdlib>
 #include <fstream>
 #include <iostream>
-#include <optional>
 #include <stdexcept>
 
 #include <cuda_runtime.h>
 
 #include "cuda_check.hpp"
 #include "distributed.hpp"
-#include "loader/byte_source.hpp"
 #include "loader/layout_plan.hpp"
-#include "loader/load_executor.hpp"
 #include "loader/model_schema.hpp"
 #include "loader/rust_loader_bridge.hpp"
 #include "loader/rust_storage_executor.hpp"
-#include "loader/storage_compiler.hpp"
-#include "loader/storage_program.hpp"
 
 namespace pie_cuda_driver {
 
@@ -85,6 +80,8 @@ Mxfp4MoeLowering select_mxfp4_moe_lowering(
 }  // namespace
 
 LoadedModel LoadedModel::load(const Config& boot_cfg, NcclComm* tp_comm) {
+    (void)tp_comm;
+
     if (boot_cfg.model.snapshot_dir.empty()) {
         throw std::runtime_error(
             "engine: model.snapshot_dir is empty — pass it in dev.toml or "
@@ -209,140 +206,59 @@ LoadedModel LoadedModel::load(const Config& boot_cfg, NcclComm* tp_comm) {
 
     WeightStoreBuilder(e.weights_).reserve(loader.num_tensors());
 
-    const char* planner_env = std::getenv("PIE_CUDA_LOADER_PLANNER");
-    const RustLoaderPlannerMode planner_mode =
-        parse_rust_loader_planner_mode(
-            planner_env == nullptr ? std::string{} : std::string(planner_env));
-
     LayoutPlan layout_plan =
         build_model_layout_plan(e.hf_, boot_cfg, loader, tp_size, backend_target);
-    std::optional<StorageProgram> storage_program;
-    const bool needs_cpp_storage_program =
-        planner_mode != RustLoaderPlannerMode::Rust ||
-        (std::getenv("PIE_CUDA_LAYOUT_PLAN_DUMP") != nullptr);
-    if (needs_cpp_storage_program) {
-        storage_program =
-            compile_storage_program(
-                layout_plan, loader, tp_rank, tp_size,
-                64ull * 1024ull * 1024ull,
-                StorageOptimizerConfig{
-                    .enabled = boot_cfg.model.storage_program_optimizer,
-                    .coalesce_adjacent = true,
-                });
-    }
 
-    LoadExecutionStats materialized{};
-    bool materialized_with_rust = false;
-
-    if (planner_mode != RustLoaderPlannerMode::Cpp) {
-        RustLoaderCompileResult rust_plan =
-            compile_rust_loader_plan_from_cpp_plan(
-                e.hf_, layout_plan, loader, tp_rank, tp_size,
-                64ull * 1024ull * 1024ull,
-                /*preferred_alignment=*/256);
-        const auto rust_view = rust_plan.program.view();
-        if (const char* dump_path =
-                std::getenv("PIE_CUDA_RUST_LAYOUT_PLAN_DUMP");
-            dump_path && dump_path[0] != '\0') {
-            std::ofstream out(dump_path);
-            if (!out) {
-                throw std::runtime_error(
-                    "engine: failed to open PIE_CUDA_RUST_LAYOUT_PLAN_DUMP "
-                    "path: " + std::string(dump_path));
-            }
-            out << dump_rust_storage_program_json(
-                rust_view,
-                rust_plan.source_tensor_count,
-                rust_plan.direct_contract_count,
-                rust_plan.cpp_tensor_count);
-        }
-        if (verbose) {
-            std::cerr << "[pie-driver-cuda] rust loader compiler: "
-                      << describe_rust_storage_program(
-                             rust_view,
-                             rust_plan.source_tensor_count,
-                             rust_plan.direct_contract_count,
-                             rust_plan.cpp_tensor_count)
-                      << " (planner="
-                      << rust_loader_planner_mode_name(planner_mode)
-                      << ")\n";
-        }
-        if (planner_mode == RustLoaderPlannerMode::Rust) {
-            if (rust_plan.direct_contract_count != rust_plan.cpp_tensor_count) {
-                throw std::runtime_error(
-                    "engine: PIE_CUDA_LOADER_PLANNER=rust did not cover the "
-                    "full runtime ABI; Rust covered " +
-                    std::to_string(rust_plan.direct_contract_count) + "/" +
-                    std::to_string(rust_plan.cpp_tensor_count) +
-                    " C++ runtime tensors. Use PIE_CUDA_LOADER_PLANNER=dual "
-                    "only as a deprecated compatibility fallback.");
-            }
-            WeightStoreBuilder rust_builder(e.weights_);
-            RustStorageProgramExecutor rust_executor(
-                loader,
-                rust_builder,
-                std::move(rust_plan.source_tensor_names),
-                std::move(rust_plan.quant_attachments));
-            materialized = rust_executor.execute(rust_view);
-            CUDA_CHECK(cudaDeviceSynchronize());
-            materialized_with_rust = true;
-        }
-    }
-
-    if (const char* dump_path = std::getenv("PIE_CUDA_LAYOUT_PLAN_DUMP");
+    RustLoaderCompileResult rust_plan =
+        compile_rust_loader_plan(
+            e.hf_, layout_plan, loader, tp_rank, tp_size,
+            64ull * 1024ull * 1024ull,
+            /*preferred_alignment=*/256);
+    const auto rust_view = rust_plan.program.view();
+    if (const char* dump_path =
+            std::getenv("PIE_CUDA_RUST_LAYOUT_PLAN_DUMP");
         dump_path && dump_path[0] != '\0') {
-        if (!storage_program) {
-            storage_program =
-                compile_storage_program(
-                    layout_plan, loader, tp_rank, tp_size,
-                    64ull * 1024ull * 1024ull,
-                    StorageOptimizerConfig{
-                        .enabled = boot_cfg.model.storage_program_optimizer,
-                        .coalesce_adjacent = true,
-                    });
-        }
         std::ofstream out(dump_path);
         if (!out) {
             throw std::runtime_error(
-                "engine: failed to open PIE_CUDA_LAYOUT_PLAN_DUMP path: " +
-                std::string(dump_path));
+                "engine: failed to open PIE_CUDA_RUST_LAYOUT_PLAN_DUMP "
+                "path: " + std::string(dump_path));
         }
-        out << dump_layout_plan_json(layout_plan, *storage_program);
+        out << dump_rust_storage_program_json(
+            rust_view,
+            rust_plan.source_tensor_count,
+            rust_plan.direct_contract_count,
+            rust_plan.runtime_tensor_count);
     }
     if (verbose) {
         std::cerr << "[pie-driver-cuda] layout compiler: "
                   << describe_layout_plan(layout_plan) << "\n";
-        if (storage_program) {
-            std::cerr << "[pie-driver-cuda] storage compiler: "
-                      << describe_storage_program(*storage_program) << "\n";
-        }
+        std::cerr << "[pie-driver-cuda] rust loader compiler: "
+                  << describe_rust_storage_program(
+                         rust_view,
+                         rust_plan.source_tensor_count,
+                         rust_plan.direct_contract_count,
+                         rust_plan.runtime_tensor_count)
+                  << "\n";
     }
-    if (!materialized_with_rust) {
-        if (!storage_program) {
-            storage_program =
-                compile_storage_program(
-                    layout_plan, loader, tp_rank, tp_size,
-                    64ull * 1024ull * 1024ull,
-                    StorageOptimizerConfig{
-                        .enabled = boot_cfg.model.storage_program_optimizer,
-                        .coalesce_adjacent = true,
-                    });
-        }
-        auto byte_source = make_checkpoint_byte_source(
-            parse_checkpoint_io_policy(boot_cfg.model.checkpoint_io),
-            loader,
-            verbose);
-        if (verbose) {
-            std::cerr << "[pie-driver-cuda] checkpoint byte source: "
-                      << byte_source->name()
-                      << " (policy=" << boot_cfg.model.checkpoint_io << ")\n";
-        }
-        LoadExecutor load_executor(
-            loader, e.weights_, tp_rank, tp_size, tp_comm,
-            byte_source.get(), &*storage_program);
-        materialized = load_executor.run(layout_plan);
-        CUDA_CHECK(cudaDeviceSynchronize());
+    if (rust_plan.direct_contract_count != rust_plan.runtime_tensor_count) {
+        throw std::runtime_error(
+            "engine: Rust loader did not cover the full RuntimeABI; covered " +
+            std::to_string(rust_plan.direct_contract_count) + "/" +
+            std::to_string(rust_plan.runtime_tensor_count) +
+            " runtime tensors. Add schema/RuntimeABI coverage before enabling "
+            "this model.");
     }
+
+    WeightStoreBuilder rust_builder(e.weights_);
+    RustStorageProgramExecutor rust_executor(
+        loader,
+        rust_builder,
+        std::move(rust_plan.source_tensor_names),
+        std::move(rust_plan.quant_attachments));
+    LoadExecutionStats materialized = rust_executor.execute(rust_view);
+    CUDA_CHECK(cudaDeviceSynchronize());
+
     if (verbose && materialized.runtime_quantized_weights > 0) {
         const double mib_before =
             static_cast<double>(materialized.runtime_quant_bytes_before) /

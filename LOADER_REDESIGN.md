@@ -558,8 +558,7 @@ driver/cuda/src/loader/
 
   storage_program.hpp/.cpp
   storage_compiler.hpp/.cpp
-  storage_executor.hpp/.cpp
-  load_executor.hpp/.cpp
+  rust_storage_executor.hpp
 ```
 
 The old `model_schema.cpp` should shrink until it disappears. Its current

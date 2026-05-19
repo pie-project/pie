@@ -26,16 +26,6 @@ struct ModelConfig {
     //   * "bf16" / "dequant" — eagerly dequantize experts to BF16 at load.
     //   * "native" — require a true MXFP4 MoE GEMM backend.
     std::string mxfp4_moe = "auto";
-    // Checkpoint byte-source policy for storage-program materialization.
-    // Recognised values:
-    //   * "auto" — use GPUDirect Storage when libcufile + filesystem support
-    //     are available, otherwise mmap + cudaMemcpy.
-    //   * "mmap" — always use mmap + cudaMemcpy.
-    //   * "gds" — require GPUDirect Storage direct reads into device memory.
-    std::string checkpoint_io = "auto";
-    // Enables the storage program optimizer/validator. Kept as an explicit
-    // target policy so diagnostics and experiments do not hide behind env vars.
-    bool storage_program_optimizer = true;
 };
 
 struct BatchingConfig {
@@ -92,9 +82,6 @@ inline Config load_config(const std::filesystem::path& path) {
         c.model.dtype         = (*m)["dtype"].value_or(c.model.dtype);
         c.model.runtime_quant = (*m)["runtime_quant"].value_or(std::string{});
         c.model.mxfp4_moe     = (*m)["mxfp4_moe"].value_or(c.model.mxfp4_moe);
-        c.model.checkpoint_io = (*m)["checkpoint_io"].value_or(c.model.checkpoint_io);
-        c.model.storage_program_optimizer =
-            (*m)["storage_program_optimizer"].value_or(c.model.storage_program_optimizer);
     }
     if (auto b = tbl["batching"].as_table()) {
         c.batching.kv_page_size     = (*b)["kv_page_size"].value_or<int64_t>(c.batching.kv_page_size);
@@ -119,12 +106,6 @@ inline Config load_config(const std::filesystem::path& path) {
 
     if (c.model.snapshot_dir.empty()) {
         throw std::runtime_error("config: [model].snapshot_dir is required");
-    }
-    if (c.model.checkpoint_io != "auto" &&
-        c.model.checkpoint_io != "mmap" &&
-        c.model.checkpoint_io != "gds") {
-        throw std::runtime_error(
-            "config: [model].checkpoint_io must be one of {auto,mmap,gds}");
     }
     if (c.distributed.tp_size < 1) {
         throw std::runtime_error("config: [distributed].tp_size must be >= 1");

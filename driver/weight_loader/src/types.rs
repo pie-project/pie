@@ -85,6 +85,38 @@ pub enum QuantScheme {
     GgufQ8_0,
 }
 
+impl QuantScheme {
+    pub fn default_bits(self) -> u8 {
+        match self {
+            Self::AwqInt4
+            | Self::GptqInt4
+            | Self::Mxfp4E2M1E8M0
+            | Self::GgufQ4_0
+            | Self::GgufQ4K => 4,
+            Self::GgufQ5_0 | Self::GgufQ5K => 5,
+            Self::Fp8E4M3
+            | Self::Fp8E5M2
+            | Self::Int8Symmetric
+            | Self::Int8Asymmetric
+            | Self::GgufQ8_0
+            | Self::None => 8,
+        }
+    }
+
+    pub fn default_group_size(self) -> u32 {
+        match self {
+            Self::AwqInt4 | Self::GptqInt4 | Self::Mxfp4E2M1E8M0 => 32,
+            Self::GgufQ4_0 | Self::GgufQ4K | Self::GgufQ5_0 | Self::GgufQ5K => 32,
+            Self::Fp8E4M3
+            | Self::Fp8E5M2
+            | Self::Int8Symmetric
+            | Self::Int8Asymmetric
+            | Self::GgufQ8_0
+            | Self::None => 1,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Mxfp4MoePolicy {
     RoutedDecode,
@@ -104,10 +136,54 @@ pub struct QuantSpec {
     pub block_shape: Vec<i64>,
 }
 
+impl QuantSpec {
+    pub fn normalized(mut self) -> Self {
+        if self.bits_per_element == 0 {
+            self.bits_per_element = self.scheme.default_bits();
+        }
+        if self.group_size == 0 {
+            self.group_size = self.scheme.default_group_size();
+        }
+        self
+    }
+
+    pub fn dense_element_bytes(&self) -> Option<u64> {
+        let bits = self.normalized_bits();
+        if bits % 8 == 0 {
+            Some(u64::from(bits / 8))
+        } else {
+            None
+        }
+    }
+
+    pub fn normalized_bits(&self) -> u8 {
+        if self.bits_per_element == 0 {
+            self.scheme.default_bits()
+        } else {
+            self.bits_per_element
+        }
+    }
+
+    pub fn normalized_group_size(&self) -> u32 {
+        if self.group_size == 0 {
+            self.scheme.default_group_size()
+        } else {
+            self.group_size
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Encoding {
     Raw(DType),
     Quant(QuantSpec),
+}
+
+pub fn normalize_encoding(encoding: &Encoding) -> Encoding {
+    match encoding {
+        Encoding::Raw(dtype) => Encoding::Raw(*dtype),
+        Encoding::Quant(spec) => Encoding::Quant(spec.clone().normalized()),
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -186,14 +262,33 @@ pub fn tensor_nbytes(shape: &[i64], element_bytes: u64) -> Option<u64> {
     elements.checked_mul(element_bytes)
 }
 
-pub fn encoding_storage_bytes(encoding: &Encoding) -> u64 {
+pub fn tensor_elements(shape: &[i64]) -> Option<u64> {
+    let mut elements = 1u64;
+    for dim in shape {
+        let dim = u64::try_from(*dim).ok()?;
+        elements = elements.checked_mul(dim)?;
+    }
+    Some(elements)
+}
+
+pub fn encoding_dense_element_bytes(encoding: &Encoding) -> Option<u64> {
     match encoding {
-        Encoding::Raw(dtype) => dtype.bytes(),
-        Encoding::Quant(spec) => match spec.bits_per_element {
-            0..=8 => 1,
-            9..=16 => 2,
-            17..=32 => 4,
-            _ => 8,
-        },
+        Encoding::Raw(dtype) => Some(dtype.bytes()),
+        Encoding::Quant(spec) => spec.dense_element_bytes(),
+    }
+}
+
+pub fn encoding_nbytes(shape: &[i64], encoding: &Encoding) -> Option<u64> {
+    match encoding {
+        Encoding::Raw(dtype) => tensor_nbytes(shape, dtype.bytes()),
+        Encoding::Quant(spec) => {
+            let spec = spec.clone().normalized();
+            if let Some(element_bytes) = spec.dense_element_bytes() {
+                return tensor_nbytes(shape, element_bytes);
+            }
+            let elements = tensor_elements(shape)?;
+            let bits = elements.checked_mul(u64::from(spec.bits_per_element))?;
+            Some(bits.div_ceil(8))
+        }
     }
 }

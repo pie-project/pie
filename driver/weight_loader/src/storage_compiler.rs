@@ -13,8 +13,8 @@ use crate::storage::{
 };
 use crate::typecheck::typecheck;
 use crate::types::{
-    Axis, BufferId, DType, ExprId, InstrId, QuantScheme, TensorDecl, TensorId,
-    encoding_storage_bytes, tensor_nbytes,
+    Axis, BackendKind, BufferId, DType, Encoding, ExprId, InstrId, QuantScheme, TensorDecl,
+    TensorId, encoding_dense_element_bytes, encoding_nbytes, tensor_nbytes,
 };
 
 pub fn compile_storage_program(
@@ -75,7 +75,7 @@ enum ValueLoc {
 struct SourceView {
     tensor_id: TensorId,
     shape: Vec<i64>,
-    dtype: DType,
+    encoding: Encoding,
     offset_bytes: u64,
     stride: StridedExtent,
 }
@@ -92,11 +92,18 @@ struct StorageCompiler<'a> {
 
 impl StorageCompiler<'_> {
     fn lower(&mut self) -> Result<(), CompileError> {
-        for id in 0..self.plan.exprs.len() {
-            let expr_id = ExprId(id as u32);
-            let value = self.lower_expr(expr_id, &self.plan.exprs[id])?;
+        let mut reachable = HashSet::new();
+        for output in &self.plan.outputs {
+            mark_reachable(self.plan, *output, &mut reachable)?;
+        }
+        let mut ids = reachable.into_iter().collect::<Vec<_>>();
+        ids.sort_by_key(|id| id.0);
+        for expr_id in ids {
+            let value = self.lower_expr(expr_id, &self.plan.exprs[expr_id.0 as usize])?;
             self.values.insert(expr_id, value);
         }
+        recompute_memory_plan(&mut self.program)?;
+        validate_target_support(&self.program)?;
         Ok(())
     }
 
@@ -107,15 +114,22 @@ impl StorageCompiler<'_> {
                 Ok(ValueLoc::Source(SourceView {
                     tensor_id: *tensor,
                     shape: decl.shape.clone(),
-                    dtype: decl.dtype(),
+                    encoding: decl.encoding.clone(),
                     offset_bytes: 0,
-                    stride: compact_extent(&decl.shape, encoding_storage_bytes(&decl.encoding)),
+                    stride: storage_extent_for_shape(&decl.shape, &decl.encoding)?,
                 }))
                 .and_then(|value| {
                     if raw.shape != decl.shape {
                         Err(CompileError::InvalidInput(format!(
                             "source expr {} shape {:?} does not match raw '{}' shape {:?}",
                             id.0, decl.shape, raw.name, raw.shape
+                        )))
+                    } else if encoding_dense_element_bytes(&decl.encoding).is_none()
+                        && encoding_nbytes(&decl.shape, &decl.encoding) != Some(raw.span_bytes)
+                    {
+                        Err(CompileError::InvalidInput(format!(
+                            "source expr {} packed tensor '{}' has non-affine physical size {}; use ByteSpans or explicit quant block metadata",
+                            id.0, raw.name, raw.span_bytes
                         )))
                     } else {
                         Ok(value)
@@ -157,7 +171,7 @@ impl StorageCompiler<'_> {
                         self.emit_view_or_tile(
                             TileMapKind::Reblock,
                             None,
-                            Some(full_dest_extent(out, out_decl)),
+                            Some(full_dest_extent(out, out_decl)?),
                             vec![buffer],
                             vec![out],
                             TransformSpec::default(),
@@ -196,7 +210,7 @@ impl StorageCompiler<'_> {
                                 &input_decl.shape,
                                 *axis,
                                 *start,
-                                input_decl.dtype(),
+                                &input_decl.encoding,
                             )?
                         } else {
                             0
@@ -210,7 +224,7 @@ impl StorageCompiler<'_> {
                             view: DestExtent {
                                 buffer: out,
                                 offset,
-                                stride: compact_extent(&decl.shape, decl.dtype().bytes()),
+                                stride: storage_extent_for_shape(&decl.shape, &decl.encoding)?,
                             },
                             layout: layout.clone(),
                         });
@@ -391,8 +405,6 @@ impl StorageCompiler<'_> {
                 },
             });
             self.program.schedule.push(instr);
-            self.program.memory.checkpoint_read_bytes += span.span_bytes;
-            self.program.memory.device_write_bytes += span.span_bytes;
         }
         Ok(ValueLoc::Buffer(out))
     }
@@ -411,7 +423,7 @@ impl StorageCompiler<'_> {
                 CompileError::InvalidInput(format!("Join expr {} has tuple input", id.0))
             })?;
             let dest_offset =
-                dense_axis_offset_bytes(&decl.shape, axis, axis_offset, decl.dtype())?;
+                dense_axis_offset_bytes(&decl.shape, axis, axis_offset, &decl.encoding)?;
             match self.value(*input)? {
                 ValueLoc::Source(source) => {
                     self.emit_extent_write(source, out, dest_offset, &input_decl.shape)?;
@@ -423,7 +435,7 @@ impl StorageCompiler<'_> {
                         Some(DestExtent {
                             buffer: out,
                             offset: dest_offset,
-                            stride: compact_extent(&input_decl.shape, decl.dtype().bytes()),
+                            stride: storage_extent_for_shape(&input_decl.shape, &decl.encoding)?,
                         }),
                         vec![buffer],
                         vec![out],
@@ -449,7 +461,7 @@ impl StorageCompiler<'_> {
                 CompileError::InvalidInput(format!("Stack expr {} has tuple input", id.0))
             })?;
             let dest_offset =
-                dense_axis_offset_bytes(&decl.shape, axis, stack_index as i64, decl.dtype())?;
+                dense_axis_offset_bytes(&decl.shape, axis, stack_index as i64, &decl.encoding)?;
             match self.value(*input)? {
                 ValueLoc::Source(source) => {
                     self.emit_extent_write(source, out, dest_offset, &input_decl.shape)?;
@@ -461,7 +473,7 @@ impl StorageCompiler<'_> {
                         Some(DestExtent {
                             buffer: out,
                             offset: dest_offset,
-                            stride: compact_extent(&input_decl.shape, decl.dtype().bytes()),
+                            stride: storage_extent_for_shape(&input_decl.shape, &decl.encoding)?,
                         }),
                         vec![buffer],
                         vec![out],
@@ -485,7 +497,7 @@ impl StorageCompiler<'_> {
             ValueLoc::Source(mut source) => {
                 let axis_index = axis.0 as usize;
                 let mut shape = source.shape.clone();
-                let row_bytes = dense_axis_stride_bytes(&shape, axis, source.dtype)?;
+                let row_bytes = dense_axis_stride_bytes(&shape, axis, &source.encoding)?;
                 source.offset_bytes += u64::try_from(start)
                     .ok()
                     .and_then(|start| start.checked_mul(row_bytes))
@@ -494,7 +506,7 @@ impl StorageCompiler<'_> {
                     })?;
                 shape[axis_index] = length;
                 source.shape = shape.clone();
-                source.stride = compact_extent(&shape, u64::from(source.stride.element_bytes));
+                source.stride = storage_extent_for_shape(&shape, &source.encoding)?;
                 Ok(ValueLoc::Source(source))
             }
             ValueLoc::Buffer(input_buffer) => {
@@ -505,7 +517,7 @@ impl StorageCompiler<'_> {
                     CompileError::InvalidInput(format!("Select expr {} has no decl", id.0))
                 })?;
                 let offset =
-                    dense_axis_offset_bytes(&input_decl.shape, axis, start, input_decl.dtype())?;
+                    dense_axis_offset_bytes(&input_decl.shape, axis, start, &input_decl.encoding)?;
                 let out = self.declare_view_buffer(out_decl);
                 let instr = self.next_instr();
                 self.program.instrs.push(StorageInstr::CreateView {
@@ -515,7 +527,7 @@ impl StorageCompiler<'_> {
                     view: DestExtent {
                         buffer: out,
                         offset,
-                        stride: compact_extent(&out_decl.shape, out_decl.dtype().bytes()),
+                        stride: storage_extent_for_shape(&out_decl.shape, &out_decl.encoding)?,
                     },
                     layout: out_decl.layout.clone(),
                 });
@@ -561,7 +573,7 @@ impl StorageCompiler<'_> {
         self.emit_view_or_tile(
             kind,
             source,
-            Some(full_dest_extent(out, decl)),
+            Some(full_dest_extent(out, decl)?),
             inputs,
             vec![out],
             transform,
@@ -592,24 +604,6 @@ impl StorageCompiler<'_> {
         outputs: Vec<BufferId>,
         transform: TransformSpec,
     ) {
-        if let Some(source) = &source {
-            self.program.memory.checkpoint_read_bytes += source.span_bytes;
-        }
-        for output in &outputs {
-            if let Some(buffer) = self
-                .program
-                .buffers
-                .iter()
-                .find(|buffer| buffer.id == *output)
-            {
-                self.program.memory.device_write_bytes += buffer.bytes;
-                self.program.memory.transform_scratch_peak_bytes = self
-                    .program
-                    .memory
-                    .transform_scratch_peak_bytes
-                    .max(buffer.bytes);
-            }
-        }
         let instr = self.next_instr();
         self.program.instrs.push(StorageInstr::TileMap {
             id: instr,
@@ -634,8 +628,7 @@ impl StorageCompiler<'_> {
         shape: &[i64],
     ) -> Result<(), CompileError> {
         let source_extent = self.source_extent(&source)?;
-        let elem = u64::from(source_extent.stride.element_bytes);
-        let bytes = tensor_nbytes(shape, elem).ok_or_else(|| {
+        let bytes = encoding_nbytes(shape, &source.encoding).ok_or_else(|| {
             CompileError::InvalidInput("extent write byte size overflow".to_string())
         })?;
         let instr = self.next_instr();
@@ -648,19 +641,16 @@ impl StorageCompiler<'_> {
             dest: DestExtent {
                 buffer: dest,
                 offset: dest_offset,
-                stride: compact_extent(shape, elem),
+                stride: storage_extent_for_shape(shape, &source.encoding)?,
             },
         });
         self.program.schedule.push(instr);
-        self.program.memory.checkpoint_read_bytes += bytes;
-        self.program.memory.device_write_bytes += bytes;
         Ok(())
     }
 
     fn source_extent(&self, source: &SourceView) -> Result<SourceExtent, CompileError> {
         let raw = self.raw(source.tensor_id)?;
-        let elem = u64::from(source.stride.element_bytes);
-        let span_bytes = tensor_nbytes(&source.shape, elem).ok_or_else(|| {
+        let span_bytes = encoding_nbytes(&source.shape, &source.encoding).ok_or_else(|| {
             CompileError::InvalidInput("source extent byte size overflow".to_string())
         })?;
         if source.offset_bytes + span_bytes > raw.span_bytes {
@@ -700,11 +690,7 @@ impl StorageCompiler<'_> {
             alignment: decl.alignment,
             temporary,
         });
-        if temporary {
-            self.program.memory.temporary_peak_bytes =
-                self.program.memory.temporary_peak_bytes.max(bytes);
-        } else {
-            self.program.memory.persistent_bytes += bytes;
+        if !temporary {
             self.program.tensors.push(decl.clone());
         }
         let instr = self.next_instr();
@@ -750,7 +736,6 @@ impl StorageCompiler<'_> {
         }
         if existing.temporary {
             existing.temporary = false;
-            self.program.memory.persistent_bytes += existing.bytes;
         }
         if !self
             .program
@@ -780,6 +765,182 @@ impl StorageCompiler<'_> {
         self.next_instr += 1;
         id
     }
+}
+
+fn mark_reachable(
+    plan: &LayoutPlan,
+    id: ExprId,
+    reachable: &mut HashSet<ExprId>,
+) -> Result<(), CompileError> {
+    if id.0 as usize >= plan.exprs.len() {
+        return Err(CompileError::InvalidInput(format!(
+            "layout output expr {} is out of range",
+            id.0
+        )));
+    }
+    if !reachable.insert(id) {
+        return Ok(());
+    }
+    for input in plan.exprs[id.0 as usize].inputs() {
+        mark_reachable(plan, input, reachable)?;
+    }
+    Ok(())
+}
+
+fn recompute_memory_plan(program: &mut StorageProgram) -> Result<(), CompileError> {
+    let mut persistent_bytes = 0u64;
+    let mut live_bytes = 0u64;
+    let mut live_peak = 0u64;
+    let mut checkpoint_read_bytes = 0u64;
+    let mut device_write_bytes = 0u64;
+    let mut transform_scratch_peak_bytes = 0u64;
+    let mut live = HashSet::new();
+
+    for buffer in &program.buffers {
+        if !buffer.temporary && buffer.tensor.is_some() {
+            persistent_bytes = persistent_bytes.checked_add(buffer.bytes).ok_or_else(|| {
+                CompileError::InvalidInput("persistent byte overflow".to_string())
+            })?;
+        }
+    }
+
+    for instr_id in &program.schedule {
+        let instr = program
+            .instrs
+            .iter()
+            .find(|instr| instr_id_of(instr) == *instr_id)
+            .ok_or_else(|| {
+                CompileError::InvalidInput(format!("scheduled instr {} is missing", instr_id.0))
+            })?;
+        match instr {
+            StorageInstr::Allocate { buffer, .. } => {
+                let bytes = buffer_bytes(program, *buffer)?;
+                if live.insert(*buffer) {
+                    live_bytes = live_bytes.checked_add(bytes).ok_or_else(|| {
+                        CompileError::InvalidInput("live byte overflow".to_string())
+                    })?;
+                    live_peak = live_peak.max(live_bytes);
+                }
+            }
+            StorageInstr::Release { buffer, .. } => {
+                if live.remove(buffer) {
+                    live_bytes = live_bytes
+                        .checked_sub(buffer_bytes(program, *buffer)?)
+                        .ok_or_else(|| {
+                            CompileError::InvalidInput("live byte underflow".to_string())
+                        })?;
+                }
+            }
+            StorageInstr::ExtentWrite { source, .. } => {
+                checkpoint_read_bytes = checkpoint_read_bytes
+                    .checked_add(source.span_bytes)
+                    .ok_or_else(|| CompileError::InvalidInput("read byte overflow".to_string()))?;
+                device_write_bytes = device_write_bytes
+                    .checked_add(source.span_bytes)
+                    .ok_or_else(|| CompileError::InvalidInput("write byte overflow".to_string()))?;
+            }
+            StorageInstr::TileMap {
+                source,
+                dest,
+                outputs,
+                ..
+            } => {
+                if let Some(source) = source {
+                    checkpoint_read_bytes = checkpoint_read_bytes
+                        .checked_add(source.span_bytes)
+                        .ok_or_else(|| {
+                            CompileError::InvalidInput("read byte overflow".to_string())
+                        })?;
+                }
+                let write_bytes = if let Some(dest) = dest {
+                    extent_storage_bytes(&dest.stride)?
+                } else {
+                    let mut total = 0u64;
+                    for output in outputs {
+                        total = total
+                            .checked_add(buffer_bytes(program, *output)?)
+                            .ok_or_else(|| {
+                                CompileError::InvalidInput("write byte overflow".to_string())
+                            })?;
+                    }
+                    total
+                };
+                device_write_bytes = device_write_bytes
+                    .checked_add(write_bytes)
+                    .ok_or_else(|| CompileError::InvalidInput("write byte overflow".to_string()))?;
+                transform_scratch_peak_bytes = transform_scratch_peak_bytes.max(write_bytes);
+            }
+            StorageInstr::CreateView { .. }
+            | StorageInstr::Attach { .. }
+            | StorageInstr::Finalize { .. } => {}
+        }
+    }
+
+    program.memory.persistent_bytes = persistent_bytes;
+    program.memory.temporary_peak_bytes = live_peak.saturating_sub(persistent_bytes);
+    program.memory.transform_scratch_peak_bytes = transform_scratch_peak_bytes;
+    program.memory.checkpoint_read_bytes = checkpoint_read_bytes;
+    program.memory.device_write_bytes = device_write_bytes;
+    Ok(())
+}
+
+fn validate_target_support(program: &StorageProgram) -> Result<(), CompileError> {
+    for instr in &program.instrs {
+        let StorageInstr::TileMap {
+            kind, transform, ..
+        } = instr
+        else {
+            continue;
+        };
+        let supported = match program.target.backend {
+            BackendKind::Unknown => true,
+            BackendKind::Cuda => matches!(
+                kind,
+                TileMapKind::Cast | TileMapKind::Reblock | TileMapKind::Reorder
+            ),
+            BackendKind::Portable => match kind {
+                TileMapKind::Cast | TileMapKind::Reblock | TileMapKind::Reorder => true,
+                TileMapKind::Decode => transform.from == Some(QuantScheme::Fp8E4M3),
+                TileMapKind::Encode | TileMapKind::Transcode => false,
+            },
+        };
+        if !supported {
+            return Err(CompileError::InvalidInput(format!(
+                "{:?} target does not support {:?} TileMap ({:?}->{:?})",
+                program.target.backend, kind, transform.from, transform.to
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn instr_id_of(instr: &StorageInstr) -> InstrId {
+    match instr {
+        StorageInstr::Allocate { id, .. }
+        | StorageInstr::ExtentWrite { id, .. }
+        | StorageInstr::TileMap { id, .. }
+        | StorageInstr::CreateView { id, .. }
+        | StorageInstr::Attach { id, .. }
+        | StorageInstr::Release { id, .. }
+        | StorageInstr::Finalize { id, .. } => *id,
+    }
+}
+
+fn buffer_bytes(program: &StorageProgram, id: BufferId) -> Result<u64, CompileError> {
+    program
+        .buffers
+        .iter()
+        .find(|buffer| buffer.id == id)
+        .map(|buffer| buffer.bytes)
+        .ok_or_else(|| CompileError::InvalidInput(format!("buffer {} is missing", id.0)))
+}
+
+fn extent_storage_bytes(extent: &StridedExtent) -> Result<u64, CompileError> {
+    tensor_nbytes(
+        &extent.dims.iter().map(|dim| dim.count).collect::<Vec<_>>(),
+        u64::from(extent.element_bytes),
+    )
+    .ok_or_else(|| CompileError::InvalidInput("extent byte size overflow".to_string()))
 }
 
 fn compact_extent(shape: &[i64], element_bytes: u64) -> StridedExtent {
@@ -813,15 +974,31 @@ fn byte_extent(bytes: u64) -> StridedExtent {
     }
 }
 
-fn full_dest_extent(buffer: BufferId, decl: &TensorDecl) -> DestExtent {
-    DestExtent {
+fn full_dest_extent(buffer: BufferId, decl: &TensorDecl) -> Result<DestExtent, CompileError> {
+    Ok(DestExtent {
         buffer,
         offset: 0,
-        stride: compact_extent(&decl.shape, encoding_storage_bytes(&decl.encoding)),
-    }
+        stride: storage_extent_for_shape(&decl.shape, &decl.encoding)?,
+    })
 }
 
-fn dense_axis_stride_bytes(shape: &[i64], axis: Axis, dtype: DType) -> Result<u64, CompileError> {
+fn storage_extent_for_shape(
+    shape: &[i64],
+    encoding: &Encoding,
+) -> Result<StridedExtent, CompileError> {
+    if let Some(element_bytes) = encoding_dense_element_bytes(encoding) {
+        return Ok(compact_extent(shape, element_bytes));
+    }
+    Ok(byte_extent(encoding_nbytes(shape, encoding).ok_or_else(
+        || CompileError::InvalidInput("packed extent byte size overflow".to_string()),
+    )?))
+}
+
+fn dense_axis_stride_bytes(
+    shape: &[i64],
+    axis: Axis,
+    encoding: &Encoding,
+) -> Result<u64, CompileError> {
     let axis = axis.0 as usize;
     if axis >= shape.len() {
         return Err(CompileError::InvalidInput(format!(
@@ -833,20 +1010,37 @@ fn dense_axis_stride_bytes(shape: &[i64], axis: Axis, dtype: DType) -> Result<u6
         let dim = u64::try_from(*dim).ok()?;
         acc.checked_mul(dim)
     });
-    suffix_elements
-        .and_then(|elements| elements.checked_mul(dtype.bytes()))
-        .ok_or_else(|| CompileError::InvalidInput("dense stride overflow".to_string()))
+    match encoding {
+        Encoding::Raw(dtype) => suffix_elements
+            .and_then(|elements| elements.checked_mul(dtype.bytes()))
+            .ok_or_else(|| CompileError::InvalidInput("dense stride overflow".to_string())),
+        Encoding::Quant(spec) => {
+            let spec = spec.clone().normalized();
+            let suffix = suffix_elements
+                .ok_or_else(|| CompileError::InvalidInput("dense stride overflow".to_string()))?;
+            let bits = suffix
+                .checked_mul(u64::from(spec.bits_per_element))
+                .ok_or_else(|| CompileError::InvalidInput("packed stride overflow".to_string()))?;
+            if bits % 8 != 0 {
+                return Err(CompileError::InvalidInput(format!(
+                    "packed {:?} select on axis {} is not byte-aligned",
+                    spec.scheme, axis
+                )));
+            }
+            Ok(bits / 8)
+        }
+    }
 }
 
 fn dense_axis_offset_bytes(
     shape: &[i64],
     axis: Axis,
     index: i64,
-    dtype: DType,
+    encoding: &Encoding,
 ) -> Result<u64, CompileError> {
     let index = u64::try_from(index)
         .map_err(|_| CompileError::InvalidInput("negative dense axis offset".to_string()))?;
-    let stride = dense_axis_stride_bytes(shape, axis, dtype)?;
+    let stride = dense_axis_stride_bytes(shape, axis, encoding)?;
     index
         .checked_mul(stride)
         .ok_or_else(|| CompileError::InvalidInput("dense axis offset overflow".to_string()))

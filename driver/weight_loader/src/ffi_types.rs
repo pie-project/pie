@@ -247,6 +247,38 @@ pub struct PieLoaderCheckpointTensorView {
     pub encoding_kind: PieLoaderEncodingKind,
     pub quant_scheme: PieLoaderQuantScheme,
     pub shape: PieLoaderI64Slice,
+    pub quant_bits_per_element: u8,
+    pub quant_group_size: u32,
+    pub quant_channel_axis: i32,
+    pub quant_has_scale_dtype: bool,
+    pub quant_scale_dtype: PieLoaderDType,
+    pub quant_has_zero_point_dtype: bool,
+    pub quant_zero_point_dtype: PieLoaderDType,
+    pub quant_block_shape: PieLoaderI64Slice,
+}
+
+impl Default for PieLoaderCheckpointTensorView {
+    fn default() -> Self {
+        Self {
+            id: u32::MAX,
+            name: PieLoaderBytes::default(),
+            file_id: u32::MAX,
+            file_offset: 0,
+            span_bytes: 0,
+            dtype: PieLoaderDType::BF16,
+            encoding_kind: PieLoaderEncodingKind::Raw,
+            quant_scheme: PieLoaderQuantScheme::None,
+            shape: PieLoaderI64Slice::default(),
+            quant_bits_per_element: 0,
+            quant_group_size: 0,
+            quant_channel_axis: -1,
+            quant_has_scale_dtype: false,
+            quant_scale_dtype: PieLoaderDType::F32,
+            quant_has_zero_point_dtype: false,
+            quant_zero_point_dtype: PieLoaderDType::U8,
+            quant_block_shape: PieLoaderI64Slice::default(),
+        }
+    }
 }
 
 #[repr(C)]
@@ -280,6 +312,14 @@ pub struct PieLoaderRuntimeTensorContractView {
     pub shape: PieLoaderI64Slice,
     pub alignment: u32,
     pub shard_axis: i32,
+    pub quant_bits_per_element: u8,
+    pub quant_group_size: u32,
+    pub quant_channel_axis: i32,
+    pub quant_has_scale_dtype: bool,
+    pub quant_scale_dtype: PieLoaderDType,
+    pub quant_has_zero_point_dtype: bool,
+    pub quant_zero_point_dtype: PieLoaderDType,
+    pub quant_block_shape: PieLoaderI64Slice,
 }
 
 impl Default for PieLoaderRuntimeTensorContractView {
@@ -306,6 +346,14 @@ impl Default for PieLoaderRuntimeTensorContractView {
             shape: PieLoaderI64Slice::default(),
             alignment: 1,
             shard_axis: -1,
+            quant_bits_per_element: 0,
+            quant_group_size: 0,
+            quant_channel_axis: -1,
+            quant_has_scale_dtype: false,
+            quant_scale_dtype: PieLoaderDType::F32,
+            quant_has_zero_point_dtype: false,
+            quant_zero_point_dtype: PieLoaderDType::U8,
+            quant_block_shape: PieLoaderI64Slice::default(),
         }
     }
 }

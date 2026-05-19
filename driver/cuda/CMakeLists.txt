@@ -82,18 +82,13 @@ add_library(pie_driver_cuda_lib STATIC
   ../common/src/safetensors_manifest.cpp
   src/loader/gguf_source.cpp
   src/loader/hf_config.cpp
-  src/loader/byte_source.cpp
   src/loader/layout_plan.cpp
   src/loader/layout_planner.cpp
   src/loader/layout_typecheck.cpp
-  src/loader/load_executor.cpp
   src/loader/model_adapter.cpp
   src/loader/model_family.cpp
   src/loader/model_schema.cpp
   src/loader/semantic_graph.cpp
-  src/loader/storage_compiler.cpp
-  src/loader/storage_executor.cpp
-  src/loader/storage_program.cpp
   src/loader/runtime_abi.cpp
   src/loader/safetensors.cpp
   src/model/qwen3.cpp
@@ -255,17 +250,10 @@ target_include_directories(test_layout_plan PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/../common/include)
 target_link_libraries(test_layout_plan PRIVATE tomlplusplus::tomlplusplus)
 
-add_executable(test_loader_golden tests/test_loader_golden.cpp)
-target_include_directories(test_loader_golden PRIVATE
-  ${CMAKE_CURRENT_SOURCE_DIR}/src
-  ${CMAKE_CURRENT_SOURCE_DIR}/../common/include)
-target_link_libraries(test_loader_golden PRIVATE pie_driver_cuda_lib)
-
 enable_testing()
 add_test(NAME brle COMMAND test_brle)
 add_test(NAME driver_common COMMAND test_driver_common)
 add_test(NAME layout_plan COMMAND test_layout_plan)
-add_test(NAME loader_golden COMMAND test_loader_golden)
 
 target_link_libraries(pie_driver_cuda_lib PUBLIC
   CLI11::CLI11

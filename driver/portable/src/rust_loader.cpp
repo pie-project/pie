@@ -1,7 +1,6 @@
 #include "rust_loader.hpp"
 
 #include <algorithm>
-#include <cctype>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
@@ -48,25 +47,6 @@ void pie_loader_error_free(pie_weight_loader::PieLoaderError* error)
 namespace pie_portable_driver {
 
 namespace {
-
-std::string lowercase(std::string value) {
-    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) {
-        return static_cast<char>(std::tolower(c));
-    });
-    return value;
-}
-
-void validate_loader_mode(const char* value) {
-    const std::string mode = lowercase(value == nullptr ? std::string{} : value);
-    if (mode.empty() || mode == "rust") return;
-    if (mode == "cpp" || mode == "dual") {
-        throw std::runtime_error(
-            "portable rust loader: cpp/dual planner modes were removed; "
-            "portable weight loading is always the Rust storage program");
-    }
-    throw std::runtime_error(
-        "portable rust loader: PIE_PORTABLE_LOADER_PLANNER must be unset or 'rust'");
-}
 
 std::string bytes_to_string(pie_weight_loader::PieLoaderBytes bytes) {
     if (bytes.ptr == nullptr || bytes.len == 0) return {};
@@ -350,6 +330,14 @@ public:
             .encoding_kind = encoding_kind,
             .quant_scheme = quant_scheme,
             .shape = shape(shape_id),
+            .quant_bits_per_element = 0,
+            .quant_group_size = 0,
+            .quant_channel_axis = -1,
+            .quant_has_scale_dtype = false,
+            .quant_scale_dtype = pie_weight_loader::PieLoaderDType::F32,
+            .quant_has_zero_point_dtype = false,
+            .quant_zero_point_dtype = pie_weight_loader::PieLoaderDType::U8,
+            .quant_block_shape = {},
         });
     }
 
@@ -384,6 +372,14 @@ public:
             .shape = shape(shape_id),
             .alignment = 1,
             .shard_axis = -1,
+            .quant_bits_per_element = 0,
+            .quant_group_size = 0,
+            .quant_channel_axis = -1,
+            .quant_has_scale_dtype = false,
+            .quant_scale_dtype = pie_weight_loader::PieLoaderDType::F32,
+            .quant_has_zero_point_dtype = false,
+            .quant_zero_point_dtype = pie_weight_loader::PieLoaderDType::U8,
+            .quant_block_shape = {},
         });
         refresh_contract_slice();
     }
@@ -422,6 +418,14 @@ public:
             .shape = shape(shape_id),
             .alignment = 1,
             .shard_axis = -1,
+            .quant_bits_per_element = 0,
+            .quant_group_size = 0,
+            .quant_channel_axis = -1,
+            .quant_has_scale_dtype = false,
+            .quant_scale_dtype = pie_weight_loader::PieLoaderDType::F32,
+            .quant_has_zero_point_dtype = false,
+            .quant_zero_point_dtype = pie_weight_loader::PieLoaderDType::U8,
+            .quant_block_shape = {},
         });
         refresh_contract_slice();
     }
@@ -719,33 +723,6 @@ CompileResult compile_from_candidates(
     return result;
 }
 
-const pie_weight_loader::PieLoaderStorageInstrView& instruction(
-    const pie_weight_loader::PieLoaderStorageProgramView& program,
-    std::uint32_t id) {
-    for (std::size_t i = 0; i < program.instrs.len; ++i) {
-        if (program.instrs.ptr[i].id == id) return program.instrs.ptr[i];
-    }
-    throw std::runtime_error("portable rust loader: instruction id out of range");
-}
-
-const pie_weight_loader::PieLoaderBufferDeclView& buffer_decl(
-    const pie_weight_loader::PieLoaderStorageProgramView& program,
-    std::uint32_t id) {
-    for (std::size_t i = 0; i < program.buffers.len; ++i) {
-        if (program.buffers.ptr[i].id == id) return program.buffers.ptr[i];
-    }
-    throw std::runtime_error("portable rust loader: buffer id out of range");
-}
-
-const pie_weight_loader::PieLoaderTensorDeclView& tensor_decl(
-    const pie_weight_loader::PieLoaderStorageProgramView& program,
-    std::uint32_t id) {
-    for (std::size_t i = 0; i < program.tensors.len; ++i) {
-        if (program.tensors.ptr[i].id == id) return program.tensors.ptr[i];
-    }
-    throw std::runtime_error("portable rust loader: tensor id out of range");
-}
-
 std::uint16_t bf16_from_f32(float x) {
     std::uint32_t bits;
     std::memcpy(&bits, &x, sizeof(bits));
@@ -825,8 +802,9 @@ public:
           targets_(std::move(targets)) {}
 
     void execute(const pie_weight_loader::PieLoaderStorageProgramView& program) {
+        index_program(program);
         for (std::size_t i = 0; i < program.schedule.len; ++i) {
-            const auto& instr = instruction(program, program.schedule.ptr[i]);
+            const auto& instr = instruction(program.schedule.ptr[i]);
             switch (instr.kind) {
                 case pie_weight_loader::PieLoaderStorageInstrKind::Allocate:
                     allocate(program, instr);
@@ -867,6 +845,48 @@ private:
             throw std::runtime_error("portable rust loader: source tensor id out of range");
         }
         return archive_.at(source_names_[id]);
+    }
+
+    void index_program(const pie_weight_loader::PieLoaderStorageProgramView& program) {
+        instr_by_id_.clear();
+        buffer_decl_by_id_.clear();
+        tensor_decl_by_id_.clear();
+        instr_by_id_.reserve(program.instrs.len);
+        buffer_decl_by_id_.reserve(program.buffers.len);
+        tensor_decl_by_id_.reserve(program.tensors.len);
+        for (std::size_t i = 0; i < program.instrs.len; ++i) {
+            instr_by_id_.emplace(program.instrs.ptr[i].id, &program.instrs.ptr[i]);
+        }
+        for (std::size_t i = 0; i < program.buffers.len; ++i) {
+            buffer_decl_by_id_.emplace(program.buffers.ptr[i].id, &program.buffers.ptr[i]);
+        }
+        for (std::size_t i = 0; i < program.tensors.len; ++i) {
+            tensor_decl_by_id_.emplace(program.tensors.ptr[i].id, &program.tensors.ptr[i]);
+        }
+    }
+
+    const pie_weight_loader::PieLoaderStorageInstrView& instruction(std::uint32_t id) const {
+        const auto it = instr_by_id_.find(id);
+        if (it == instr_by_id_.end()) {
+            throw std::runtime_error("portable rust loader: instruction id out of range");
+        }
+        return *it->second;
+    }
+
+    const pie_weight_loader::PieLoaderBufferDeclView& buffer_decl(std::uint32_t id) const {
+        const auto it = buffer_decl_by_id_.find(id);
+        if (it == buffer_decl_by_id_.end()) {
+            throw std::runtime_error("portable rust loader: buffer id out of range");
+        }
+        return *it->second;
+    }
+
+    const pie_weight_loader::PieLoaderTensorDeclView& tensor_decl(std::uint32_t id) const {
+        const auto it = tensor_decl_by_id_.find(id);
+        if (it == tensor_decl_by_id_.end()) {
+            throw std::runtime_error("portable rust loader: tensor id out of range");
+        }
+        return *it->second;
     }
 
     const BufferEntry& buffer_entry(std::uint32_t buffer) const {
@@ -1019,16 +1039,19 @@ private:
 
     void allocate(const pie_weight_loader::PieLoaderStorageProgramView& program,
                   const pie_weight_loader::PieLoaderStorageInstrView& instr) {
-        const auto& buffer = buffer_decl(program, instr.buffer_id);
+        (void)program;
+        const auto& buffer = buffer_decl(instr.buffer_id);
         if (!buffer.has_tensor) {
             buffers_[buffer.id] = BufferEntry{
                 .tensor = nullptr,
                 .bytes = std::vector<std::uint8_t>(
                     static_cast<std::size_t>(buffer.bytes)),
+                .source_dtype = std::nullopt,
+                .source_shape = {},
             };
             return;
         }
-        const auto& tensor = tensor_decl(program, buffer.tensor_id);
+        const auto& tensor = tensor_decl(buffer.tensor_id);
         const auto name = bytes_to_string(tensor.name);
         const auto target = targets_.find(name);
         if (target == targets_.end()) {
@@ -1042,7 +1065,12 @@ private:
                 "' (rust=" + std::to_string(buffer.bytes) +
                 ", ggml=" + std::to_string(nbytes) + ")");
         }
-        buffers_[buffer.id] = BufferEntry{.tensor = target->second};
+        buffers_[buffer.id] = BufferEntry{
+            .tensor = target->second,
+            .bytes = {},
+            .source_dtype = std::nullopt,
+            .source_shape = {},
+        };
     }
 
     void extent_write(const pie_weight_loader::PieLoaderStorageInstrView& instr) {
@@ -1283,6 +1311,7 @@ private:
 
     void create_view(const pie_weight_loader::PieLoaderStorageProgramView& program,
                      const pie_weight_loader::PieLoaderStorageInstrView& instr) {
+        (void)program;
         if (instr.input_buffers.len != 1 || instr.output_buffers.len != 1 ||
             !instr.has_dest) {
             throw std::runtime_error(
@@ -1292,11 +1321,11 @@ private:
         const auto output = instr.output_buffers.ptr[0];
         const auto nbytes = extent_bytes(instr.dest.stride);
         BufferEntry entry;
-        const auto& output_buffer = buffer_decl(program, output);
+        const auto& output_buffer = buffer_decl(output);
         if (!output_buffer.has_tensor) {
             entry.bytes.resize(static_cast<std::size_t>(nbytes));
         } else if (const auto target = targets_.find(bytes_to_string(
-                       tensor_decl(program, output_buffer.tensor_id).name));
+                       tensor_decl(output_buffer.tensor_id).name));
             target != targets_.end()) {
             entry.tensor = target->second;
             if (nbytes > ggml_nbytes(entry.tensor)) {
@@ -1324,6 +1353,18 @@ private:
     std::vector<std::string> source_names_;
     std::unordered_map<std::string, ggml_tensor*> targets_;
     std::unordered_map<std::uint32_t, BufferEntry> buffers_;
+    std::unordered_map<
+        std::uint32_t,
+        const pie_weight_loader::PieLoaderStorageInstrView*>
+        instr_by_id_;
+    std::unordered_map<
+        std::uint32_t,
+        const pie_weight_loader::PieLoaderBufferDeclView*>
+        buffer_decl_by_id_;
+    std::unordered_map<
+        std::uint32_t,
+        const pie_weight_loader::PieLoaderTensorDeclView*>
+        tensor_decl_by_id_;
 };
 
 std::string describe_program(const pie_weight_loader::PieLoaderStorageProgramView& view,
@@ -1478,9 +1519,7 @@ void maybe_dump_program(const pie_weight_loader::PieLoaderStorageProgramView& vi
 
 }  // namespace
 
-void load_with_rust_storage_program(Model& model, const char* planner_mode) {
-    validate_loader_mode(planner_mode);
-
+void load_with_rust_storage_program(Model& model) {
     std::vector<ContractCandidate> candidates;
     candidates.reserve(model.declared_.size());
     for (const auto& d : model.declared_) {

@@ -1,8 +1,6 @@
 use crate::error::CompileError;
 use crate::ir::{LayoutExpr, LayoutPlan};
-use crate::types::{
-    Encoding, Layout, QuantScheme, TensorDecl, encoding_storage_bytes, tensor_nbytes,
-};
+use crate::types::{Encoding, Layout, QuantScheme, TensorDecl, encoding_nbytes};
 
 pub fn typecheck(plan: &LayoutPlan) -> Result<Vec<TensorDecl>, CompileError> {
     let mut inferred = Vec::with_capacity(plan.exprs.len());
@@ -35,10 +33,9 @@ fn infer_expr(
                     "ByteSpans expr {index} has no spans"
                 )));
             }
-            let total_bytes = tensor_nbytes(&decl.shape, encoding_storage_bytes(&decl.encoding))
-                .ok_or_else(|| {
-                    CompileError::InvalidInput(format!("ByteSpans expr {index} size overflow"))
-                })?;
+            let total_bytes = encoding_nbytes(&decl.shape, &decl.encoding).ok_or_else(|| {
+                CompileError::InvalidInput(format!("ByteSpans expr {index} size overflow"))
+            })?;
             for (span_index, span) in spans.iter().enumerate() {
                 if span.span_bytes == 0 {
                     return Err(CompileError::InvalidInput(format!(
@@ -83,6 +80,7 @@ fn infer_expr(
                     expected.shape[axis]
                 )));
             }
+            require_byte_aligned_slice(index, "Select", &expected, axis, *start, *length)?;
             expected.shape[axis] = *length;
             expect_decl(index, decl, expected)
         }
@@ -228,6 +226,7 @@ fn infer_expr(
                         expected.shape[axis_index]
                     )));
                 }
+                require_byte_aligned_slice(index, "View", &expected, axis_index, *start, *length)?;
                 expected.shape[axis_index] = *length;
             }
             expected.layout = layout.clone();
@@ -421,6 +420,65 @@ fn require_quant_scheme(
             "{op} expr {index} input must be quantized"
         ))),
     }
+}
+
+fn require_byte_aligned_slice(
+    index: usize,
+    op: &'static str,
+    source: &TensorDecl,
+    axis: usize,
+    start: i64,
+    length: i64,
+) -> Result<(), CompileError> {
+    let Encoding::Quant(spec) = &source.encoding else {
+        return Ok(());
+    };
+    let spec = spec.clone().normalized();
+    if spec.bits_per_element >= 8 {
+        return Ok(());
+    }
+    let suffix_elements = source.shape[axis + 1..].iter().try_fold(1u64, |acc, dim| {
+        let dim = u64::try_from(*dim).ok()?;
+        acc.checked_mul(dim)
+    });
+    let suffix_elements = suffix_elements.ok_or_else(|| {
+        CompileError::InvalidInput(format!("{op} expr {index} packed slice overflows"))
+    })?;
+    let stride_bits = suffix_elements
+        .checked_mul(u64::from(spec.bits_per_element))
+        .ok_or_else(|| {
+            CompileError::InvalidInput(format!("{op} expr {index} packed slice overflows"))
+        })?;
+    let start = u64::try_from(start).map_err(|_| {
+        CompileError::InvalidInput(format!("{op} expr {index} has negative packed start"))
+    })?;
+    let length = u64::try_from(length).map_err(|_| {
+        CompileError::InvalidInput(format!("{op} expr {index} has negative packed length"))
+    })?;
+    let start_bits = start.checked_mul(stride_bits).ok_or_else(|| {
+        CompileError::InvalidInput(format!("{op} expr {index} packed slice overflows"))
+    })?;
+    let span_bits = length.checked_mul(stride_bits).ok_or_else(|| {
+        CompileError::InvalidInput(format!("{op} expr {index} packed slice overflows"))
+    })?;
+    if start_bits % 8 != 0 || span_bits % 8 != 0 {
+        return Err(CompileError::InvalidInput(format!(
+            "{op} expr {index} packed {:?} slice is not byte-aligned",
+            spec.scheme
+        )));
+    }
+    if let Some(channel_axis) = spec.channel_axis
+        && channel_axis.0 as usize == axis
+    {
+        let group = u64::from(spec.normalized_group_size());
+        if group > 1 && (start % group != 0 || length % group != 0) {
+            return Err(CompileError::InvalidInput(format!(
+                "{op} expr {index} packed {:?} slice is not group-aligned",
+                spec.scheme
+            )));
+        }
+    }
+    Ok(())
 }
 
 #[allow(dead_code)]

@@ -103,9 +103,9 @@ struct ExtentWrite {
 
 // A non-copy storage transform scheduled under a bounded tile/scratch budget.
 // The first implementation records exact storage requirements and lets the
-// load_executor execute copy-free extent writes. Tiled execution hooks are kept
-// generic so Cast/Decode/Encode/Reblock can be fused with raw reads as the
-// executor grows.
+// Rust executor execute copy-free extent writes. Tiled execution hooks are kept
+// generic so Cast/Decode/Encode/Reblock can be fused with raw reads as backend
+// support grows.
 struct TileMap {
     std::size_t op_index = kInvalidStorageId;
     LayoutExprId expr_id = kInvalidStorageId;

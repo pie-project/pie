@@ -79,8 +79,6 @@ def build_config(args: argparse.Namespace):
             driver_options["runtime_quant"] = args.runtime_quant
         if args.mxfp4_moe:
             driver_options["mxfp4_moe"] = args.mxfp4_moe
-        if args.checkpoint_io:
-            driver_options["checkpoint_io"] = args.checkpoint_io
     elif args.driver == "portable":
         driver_options = {
             "max_batch_size": args.max_batch_size,
@@ -423,12 +421,6 @@ def build_parser() -> argparse.ArgumentParser:
             "--mxfp4-moe",
             choices=["auto", "routed_dequant", "packed", "bf16", "dequant", "eager_bf16", "native"],
             default=None,
-        )
-        sp.add_argument(
-            "--checkpoint-io",
-            choices=["auto", "mmap", "gds"],
-            default=None,
-            help="CUDA loader checkpoint IO policy for cuda_native.",
         )
         sp.add_argument("--portable-n-gpu-layers", type=int, default=-1)
         sp.add_argument("--worker-threads", type=int, default=None)
