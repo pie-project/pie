@@ -103,6 +103,17 @@ pub struct ServerConfig {
     pub max_concurrent_processes: Option<usize>,
     #[serde(default = "default_true")]
     pub python_snapshot: bool,
+    /// HTTP control-plane listen spec (`host:port`). `None` disables the
+    /// listener. `host:0` asks the OS for an ephemeral port — the bound
+    /// port is then surfaced on stdout (`HTTP_LISTEN=<host>:<port>`) and
+    /// written to `$PIE_HOME/http.port`.
+    #[serde(default)]
+    pub http_listen: Option<String>,
+    /// Local inferlet cache directory. Overrides the default
+    /// `$PIE_HOME/programs`. The on-disk layout under this path is the
+    /// standard `programs/<name>/<version>.{wasm,toml}` tree.
+    #[serde(default)]
+    pub inferlet_dir: Option<PathBuf>,
 }
 
 impl Default for ServerConfig {
@@ -114,6 +125,8 @@ impl Default for ServerConfig {
             registry: default_registry(),
             max_concurrent_processes: None,
             python_snapshot: true,
+            http_listen: None,
+            inferlet_dir: None,
         }
     }
 }

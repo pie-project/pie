@@ -191,8 +191,16 @@ impl Drop for PendingEmbeddedDriver {
 
 /// Per-DP-replica shmem name. Mirrors `runtime/src/device.rs::shmem_name`
 /// (Python wrapper too — `_write_startup_toml(group_id=...)`).
+///
+/// Honors `$PIE_SHMEM_NAME` (set by `pie serve --shmem-name`) so parallel
+/// test subprocesses end up with disjoint POSIX regions.
 pub fn shmem_name(group_id: usize) -> String {
-    format!("/pie_shmem_g{group_id}")
+    let base = std::env::var("PIE_SHMEM_NAME")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "/pie_shmem".to_string());
+    format!("{base}_g{group_id}")
 }
 
 /// `[shmem]` TOML block. `req_buf` is fixed at 4 MiB across drivers;

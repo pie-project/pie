@@ -44,6 +44,25 @@ pub struct ServeArgs {
     /// `q` / `Esc`; engine shuts down on TUI exit.
     #[arg(short = 'm', long)]
     pub monitor: bool,
+
+    /// Bind the HTTP control plane on `host:port` (routes `/healthz`,
+    /// `/v1/models`). Use `host:0` to let the OS pick an ephemeral
+    /// port. Falls back to `$PIE_HTTP_LISTEN` when omitted.
+    #[arg(long, value_name = "HOST:PORT")]
+    pub http_listen: Option<String>,
+
+    /// Local inferlet directory; overrides the default
+    /// `$PIE_HOME/programs`. Falls back to `$PIE_INFERLET_DIR` when
+    /// omitted.
+    #[arg(long, value_name = "PATH")]
+    pub inferlet_dir: Option<PathBuf>,
+
+    /// POSIX shmem region base name (e.g. `/pie_t_<pid>_<uuid>`). Sets
+    /// `$PIE_SHMEM_NAME` for this process so each DP replica's region
+    /// becomes `<name>_g{N}`. Falls back to `$PIE_SHMEM_NAME` when
+    /// omitted, then to `/pie_shmem`.
+    #[arg(long, value_name = "NAME")]
+    pub shmem_name: Option<String>,
 }
 
 pub fn run(args: ServeArgs) -> Result<()> {
@@ -69,6 +88,33 @@ pub fn run(args: ServeArgs) -> Result<()> {
     if args.no_snapshot {
         cfg.server.python_snapshot = false;
     }
+    // HTTP listener: CLI > $PIE_HTTP_LISTEN > [server].http_listen.
+    if let Some(spec) = args.http_listen {
+        cfg.server.http_listen = Some(spec);
+    } else if let Ok(spec) = std::env::var("PIE_HTTP_LISTEN") {
+        if !spec.trim().is_empty() {
+            cfg.server.http_listen = Some(spec);
+        }
+    }
+    // Inferlet dir: CLI > $PIE_INFERLET_DIR > [server].inferlet_dir.
+    if let Some(p) = args.inferlet_dir {
+        cfg.server.inferlet_dir = Some(p);
+    } else if let Ok(p) = std::env::var("PIE_INFERLET_DIR") {
+        if !p.trim().is_empty() {
+            cfg.server.inferlet_dir = Some(PathBuf::from(p));
+        }
+    }
+    // Shmem-name: CLI overrides env (matches CLI-precedence convention).
+    // Setting the env here means downstream `shmem_name(...)` callers in
+    // `pie::device` and `embedded_driver` pick up the override without
+    // threading config through the IPC boundary.
+    if let Some(name) = args.shmem_name {
+        // SAFETY: set before any driver thread is spawned (driver
+        // spawning happens later in `serve::run_with_config`); no other
+        // thread is reading the environment at this point.
+        unsafe { std::env::set_var("PIE_SHMEM_NAME", name) };
+    }
+
     if args.monitor {
         run_with_monitor(cfg)
     } else {

@@ -57,7 +57,11 @@ pub fn build(
     }
 
     let pie_home = pie::path::get_pie_home();
-    let cache_dir = pie_home.join("programs");
+    let cache_dir = user
+        .server
+        .inferlet_dir
+        .clone()
+        .unwrap_or_else(|| pie_home.join("programs"));
     let log_dir = Some(pie_home.join("logs"));
     let auth_dir = pie_home.join("auth");
 
@@ -100,6 +104,7 @@ pub fn build(
         skip_tracing: false,
         max_concurrent_processes: user.server.max_concurrent_processes,
         python_snapshot: user.server.python_snapshot,
+        http_listen: user.server.http_listen.clone(),
     })
 }
 

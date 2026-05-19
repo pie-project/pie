@@ -17,6 +17,7 @@ use crate::messaging;
 use crate::model;
 use crate::process;
 use crate::program;
+use crate::http as http_mod;
 use crate::server;
 use crate::telemetry;
 
@@ -41,6 +42,12 @@ pub struct Config {
     /// Disable via `python_snapshot = false` in the engine config or the
     /// `--no-snapshot` CLI flag.
     pub python_snapshot: bool,
+    /// `host:port` to bind the HTTP control plane (`/healthz`,
+    /// `/v1/models`). `None` disables the listener. `host:0` asks the
+    /// OS for an ephemeral port; the bound port is then surfaced on
+    /// stdout (`HTTP_LISTEN=<host>:<port>`) and written to
+    /// `$PIE_HOME/http.port`.
+    pub http_listen: Option<String>,
 }
 
 /// Runtime tuning — tokio worker pool + wasmtime engine pool +
@@ -154,6 +161,9 @@ pub struct AuthConfig {
 pub struct BootstrapHandle {
     pub token: String,
     pub port: u16,
+    /// Bound HTTP control-plane address (`host:port`) if
+    /// `Config::http_listen` was set, else `None`.
+    pub http_listen: Option<String>,
 }
 
 pub async fn bootstrap(config: Config) -> Result<BootstrapHandle> {
@@ -252,10 +262,81 @@ async fn bootstrap_inner(config: Config, listener: Option<TcpListener>) -> Resul
         adapter::spawn(&devices);
     }
 
+    let http_listen = match &config.http_listen {
+        Some(spec) => Some(start_http_listener(spec, &config).await?),
+        None => None,
+    };
+
     Ok(BootstrapHandle {
         token: auth::get_internal_auth_token().await?,
         port: bound_port,
+        http_listen,
     })
+}
+
+/// Parse `host:port`, bind the HTTP control plane, write
+/// `$PIE_HOME/http.port`, and print the stdout handshake
+/// (`HTTP_LISTEN=<host>:<port>`). Returns the bound `host:port`.
+async fn start_http_listener(spec: &str, config: &Config) -> Result<String> {
+    let (host, port) = parse_host_port(spec)
+        .with_context(|| format!("parsing --http-listen value {spec:?}"))?;
+    let model_name = config
+        .models
+        .first()
+        .map(|m| m.name.clone())
+        .unwrap_or_default();
+    let state = http_mod::State_ {
+        model_name,
+        created_unix: http_mod::now_unix(),
+        started: std::time::Instant::now(),
+    };
+    let handle = http_mod::spawn(&host, port, state)
+        .await
+        .context("spawning http control plane")?;
+    let bound = format!("{}:{}", host, handle.addr.port());
+
+    // Best-effort `$PIE_HOME/http.port` so external supervisors (the
+    // macOS test harness's IsolatedTestCase.boundHTTPPort poll) can
+    // discover the ephemeral port without parsing stdout.
+    let port_file = crate::path::get_pie_home().join("http.port");
+    if let Some(parent) = port_file.parent() {
+        if let Err(e) = fs::create_dir_all(parent) {
+            tracing::warn!("create {parent:?} for http.port: {e}");
+        }
+    }
+    if let Err(e) = fs::write(&port_file, format!("{}\n", handle.addr.port())) {
+        tracing::warn!("write {port_file:?}: {e}");
+    }
+
+    // Stdout handshake — parsed by the standalone CLI / launcher.
+    // Keep on one line, prefixed `HTTP_LISTEN=`.
+    println!("HTTP_LISTEN={bound}");
+
+    Ok(bound)
+}
+
+/// Split a `host:port` listener spec. Tolerates bracketed IPv6
+/// literals so `[::1]:8080` parses correctly.
+fn parse_host_port(spec: &str) -> Result<(String, u16)> {
+    let trimmed = spec.trim();
+    ensure!(!trimmed.is_empty(), "empty listener spec");
+    // IPv6 bracketed form: `[<addr>]:<port>`.
+    if let Some(rest) = trimmed.strip_prefix('[') {
+        let (host, tail) = rest
+            .split_once("]:")
+            .ok_or_else(|| anyhow::anyhow!("missing ']:port' suffix in {trimmed:?}"))?;
+        let port: u16 = tail
+            .parse()
+            .with_context(|| format!("parsing port in {trimmed:?}"))?;
+        return Ok((host.to_string(), port));
+    }
+    let (host, port_s) = trimmed
+        .rsplit_once(':')
+        .ok_or_else(|| anyhow::anyhow!("expected host:port, got {trimmed:?}"))?;
+    let port: u16 = port_s
+        .parse()
+        .with_context(|| format!("parsing port in {trimmed:?}"))?;
+    Ok((host.to_string(), port))
 }
 
 /// Boot-time checks for the values pie's Python layer cannot validate
@@ -383,4 +464,54 @@ fn init_tracing(
         .init();
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_host_port;
+
+    #[test]
+    fn parse_host_port_ipv4() {
+        let (host, port) = parse_host_port("127.0.0.1:8080").unwrap();
+        assert_eq!(host, "127.0.0.1");
+        assert_eq!(port, 8080);
+    }
+
+    #[test]
+    fn parse_host_port_zero_port() {
+        let (host, port) = parse_host_port("0.0.0.0:0").unwrap();
+        assert_eq!(host, "0.0.0.0");
+        assert_eq!(port, 0);
+    }
+
+    #[test]
+    fn parse_host_port_hostname() {
+        let (host, port) = parse_host_port("localhost:9090").unwrap();
+        assert_eq!(host, "localhost");
+        assert_eq!(port, 9090);
+    }
+
+    #[test]
+    fn parse_host_port_ipv6_bracketed() {
+        let (host, port) = parse_host_port("[::1]:8080").unwrap();
+        assert_eq!(host, "::1");
+        assert_eq!(port, 8080);
+    }
+
+    #[test]
+    fn parse_host_port_rejects_empty() {
+        assert!(parse_host_port("").is_err());
+        assert!(parse_host_port("   ").is_err());
+    }
+
+    #[test]
+    fn parse_host_port_rejects_missing_port() {
+        assert!(parse_host_port("127.0.0.1").is_err());
+    }
+
+    #[test]
+    fn parse_host_port_rejects_bad_port() {
+        assert!(parse_host_port("127.0.0.1:abc").is_err());
+        assert!(parse_host_port("127.0.0.1:99999").is_err());
+    }
 }

@@ -18,6 +18,7 @@ pub mod server;
 pub mod linker;
 pub mod process;
 pub mod daemon;
+pub mod http;
 pub mod telemetry;
 pub mod shmem_ipc;
 pub mod shmem_schema;

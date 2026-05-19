@@ -80,6 +80,8 @@ lru = "0.16.3"
 ahash = "0.8.12"
 libc = "0.2"
 ipnet = "2"
+axum = "0.8"
+tower = "0.5"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Memory"] }
@@ -88,6 +90,8 @@ windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_
 tempfile = "3"
 criterion = { version = "0.5", features = ["html_reports"] }
 tokenizers = "0.21"
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
 
 [[bench]]
 name = "inferlet_bench"
