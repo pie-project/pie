@@ -45,6 +45,7 @@
 #include "kernels/sample_flashinfer.hpp"
 #include "kernels/sample_temp.hpp"
 #include "kv_cache.hpp"
+#include "model/bound_model.hpp"
 #include "model/gemma2.hpp"
 #include "model/gemma3n.hpp"
 #include "model/gemma4.hpp"
@@ -101,6 +102,34 @@ void stop_servers() {
 
 void on_signal(int) {
     if (auto* server = g_signal_server.load()) server->stop();
+}
+
+pie_cuda_driver::model::RopeKind rope_kind_from_config(
+    const pie_cuda_driver::HfConfig& hf) {
+    using RopeScaling = pie_cuda_driver::HfConfig::RopeScaling;
+    using RopeKind = pie_cuda_driver::model::RopeKind;
+    switch (hf.rope_scaling_kind) {
+    case RopeScaling::Llama3:
+        return RopeKind::YaRN;
+    case RopeScaling::OriginalYaRN:
+        return RopeKind::YaRNOriginal;
+    case RopeScaling::None:
+        return RopeKind::Standard;
+    }
+    return RopeKind::Standard;
+}
+
+void apply_rope_config(
+    pie_cuda_driver::model::LlamaLikeForwardCfg& fwd_cfg,
+    const pie_cuda_driver::HfConfig& hf) {
+    fwd_cfg.rope_kind                  = rope_kind_from_config(hf);
+    fwd_cfg.yarn_factor                = hf.rope_factor;
+    fwd_cfg.yarn_low_freq_factor       = hf.rope_low_freq_factor;
+    fwd_cfg.yarn_high_freq_factor      = hf.rope_high_freq_factor;
+    fwd_cfg.yarn_original_max_position = hf.rope_original_max_position;
+    fwd_cfg.yarn_beta_fast             = hf.rope_beta_fast;
+    fwd_cfg.yarn_beta_slow             = hf.rope_beta_slow;
+    fwd_cfg.yarn_attention_factor      = hf.rope_attention_factor;
 }
 
 // All TP ranks in one DP group are threads in the same pie-server
@@ -1134,11 +1163,13 @@ int run_parity(const pie_cuda_driver::Config& cfg,
             std::max(total_pages, 1),
             page_size,
             engine.hf_config().num_key_value_heads,
-            engine.hf_config().head_dim);
+            engine.hf_config().head_dim_kernel,
+            pie_cuda_driver::kv_cache_format_from_string(
+                cfg.batching.kv_cache_dtype, cfg.model.dtype));
 
         auto parity_attn_ws = pie_cuda_driver::AttentionWorkspace::allocate();
 
-        // qwen3_5 / qwen3_5_moe need their own scratch + state caches.
+        // qwen3_5 / qwen3_5_moe need their own scratch + rs_cache storage.
         pie_cuda_driver::model::Qwen3_5LinearAttnWorkspace q35_la_ws;
         pie_cuda_driver::Qwen3_5StateCache q35_state_cache;
         pie_cuda_driver::model::Qwen3_5MoeMlpWorkspace q35_moe_ws;
@@ -1183,13 +1214,7 @@ int run_parity(const pie_cuda_driver::Config& cfg,
         if (is_gpt_oss) {
             const auto& hf = engine.hf_config();
             fwd_cfg.use_qkv_bias = hf.attention_bias;
-            fwd_cfg.rope_kind    = hf.has_rope_scaling
-                ? pie_cuda_driver::model::RopeKind::YaRN
-                : pie_cuda_driver::model::RopeKind::Standard;
-            fwd_cfg.yarn_factor                = hf.rope_factor;
-            fwd_cfg.yarn_low_freq_factor       = hf.rope_low_freq_factor;
-            fwd_cfg.yarn_high_freq_factor      = hf.rope_high_freq_factor;
-            fwd_cfg.yarn_original_max_position = hf.rope_original_max_position;
+            apply_rope_config(fwd_cfg, hf);
             fwd_cfg.sliding_window             = hf.sliding_window;
             for (const auto& t : hf.layer_types) {
                 fwd_cfg.per_layer_window_left.push_back(
@@ -1468,9 +1493,10 @@ int run_impl(int argc,
     if (verbose) {
         std::cerr << "[pie-driver-cuda] config loaded\n"
                   << "  model.snap_dir  = " << cfg.model.snapshot_dir << "\n"
-                  << "  model.device    = " << cfg.model.device << "\n"
-                  << "  model.dtype     = " << cfg.model.dtype << "\n"
-                  << "  tp_size         = " << cfg.distributed.tp_size << "\n"
+	                  << "  model.device    = " << cfg.model.device << "\n"
+	                  << "  model.dtype     = " << cfg.model.dtype << "\n"
+	                  << "  model.mxfp4_moe = " << cfg.model.mxfp4_moe << "\n"
+	                  << "  tp_size         = " << cfg.distributed.tp_size << "\n"
                   << "  tp_rank         = " << cfg.distributed.tp_rank << "\n";
     }
 
@@ -1585,72 +1611,25 @@ int run_impl(int argc,
             return 2;
         }
     }
-    const std::string& mt_for_bind = engine.hf_config().model_type;
+    // Centralized bound-model selection. The forward setup below keeps local
+    // references for now so the rest of the serving path stays unchanged.
+    auto bound_model = pie_cuda_driver::model::bind_cuda_model(engine, verbose);
+    auto& weights_llama = bound_model.llama;
+    auto& weights_gemma = bound_model.gemma;
+    auto& weights_gemma4 = bound_model.gemma4;
+    auto& weights_gemma3n = bound_model.gemma3n;
+    auto& weights_mixtral = bound_model.mixtral;
+    auto& weights_qwen3_5 = bound_model.qwen3_5;
+    auto& weights_qwen3_5_moe = bound_model.qwen3_5_moe;
 
-    // Per-arch weights live in their own struct shape. We hold one of
-    // them on the stack; only the one matching `mt_for_bind` is
-    // populated. The dispatch below wraps the right (weights, cfg,
-    // forward function) triple into a single `ForwardFn` closure.
-    pie_cuda_driver::model::Qwen3Weights   weights_llama;
-    pie_cuda_driver::model::Gemma2Weights  weights_gemma;
-    pie_cuda_driver::model::Gemma4Weights  weights_gemma4;
-    pie_cuda_driver::model::Gemma3nWeights weights_gemma3n;
-    pie_cuda_driver::model::MixtralWeights weights_mixtral;
-    pie_cuda_driver::model::Qwen3_5Weights weights_qwen3_5;
-    pie_cuda_driver::model::Qwen3_5MoeWeights weights_qwen3_5_moe;
-    const bool is_gemma_arch =
-        (mt_for_bind == "gemma2" || mt_for_bind == "gemma3" ||
-         mt_for_bind == "gemma3_text");
-    const bool is_gemma4_arch =
-        (mt_for_bind == "gemma4" || mt_for_bind == "gemma4_text");
-    const bool is_gemma3n_arch =
-        (mt_for_bind == "gemma3n" || mt_for_bind == "gemma3n_text");
-    const bool is_gpt_oss_arch = (mt_for_bind == "gpt_oss");
-    const bool is_mixtral_arch =
-        (mt_for_bind == "mixtral") || is_gpt_oss_arch;  // both use mixtral fwd
-    const bool is_qwen3_5_arch =
-        (mt_for_bind == "qwen3_5" || mt_for_bind == "qwen3_5_text");
-    // Qwen3-MoE (Qwen3-30B-A3B, model_type="qwen3_moe") and Qwen3.5/3.6-MoE
-    // (model_type="qwen3_5_moe[_text]") share the bind + forward path —
-    // engine.cpp::is_qwen3_5_moe_arch groups them, qwen3_5_moe.cpp branches
-    // internally on model_type for the layer_types/shared-expert quirks.
-    const bool is_qwen3_5_moe_arch =
-        (mt_for_bind == "qwen3_5_moe" || mt_for_bind == "qwen3_5_moe_text"
-         || mt_for_bind == "qwen3_moe");
+    const bool is_gemma_arch = bound_model.is_gemma();
+    const bool is_gemma4_arch = bound_model.is_gemma4();
+    const bool is_gemma3n_arch = bound_model.is_gemma3n();
+    const bool is_mixtral_arch = bound_model.is_mixtral();
+    const bool is_qwen3_5_arch = bound_model.is_qwen3_5();
+    const bool is_qwen3_5_moe_arch = bound_model.is_qwen3_5_moe();
 
-    if (mt_for_bind == "phi3") {
-        weights_llama = pie_cuda_driver::model::bind_phi3(engine);
-    } else if (mt_for_bind == "olmo2" || mt_for_bind == "olmo3") {
-        weights_llama = pie_cuda_driver::model::bind_olmo3(engine);
-    } else if (mt_for_bind == "mistral3" || mt_for_bind == "ministral3") {
-        weights_llama = pie_cuda_driver::model::bind_mistral3(engine);
-    } else if (mt_for_bind == "gemma2") {
-        weights_gemma = pie_cuda_driver::model::bind_gemma2(engine);
-    } else if (mt_for_bind == "gemma3" || mt_for_bind == "gemma3_text") {
-        weights_gemma = pie_cuda_driver::model::bind_gemma3(engine);
-    } else if (is_gemma4_arch) {
-        weights_gemma4 = pie_cuda_driver::model::bind_gemma4(engine);
-    } else if (is_gemma3n_arch) {
-        weights_gemma3n = pie_cuda_driver::model::bind_gemma3n(engine);
-    } else if (is_gpt_oss_arch) {
-        weights_mixtral = pie_cuda_driver::model::bind_gpt_oss(engine);
-    } else if (mt_for_bind == "mixtral") {
-        weights_mixtral = pie_cuda_driver::model::bind_mixtral(engine);
-    } else if (is_qwen3_5_arch) {
-        weights_qwen3_5 = pie_cuda_driver::model::bind_qwen3_5(engine);
-    } else if (is_qwen3_5_moe_arch) {
-        weights_qwen3_5_moe = pie_cuda_driver::model::bind_qwen3_5_moe(engine);
-    } else {
-        weights_llama = pie_cuda_driver::model::bind_llama_like(engine);
-    }
-    const std::size_t num_layers_bound =
-        is_gemma4_arch    ? weights_gemma4.layers.size()
-      : is_gemma3n_arch   ? weights_gemma3n.layers.size()
-      : is_gemma_arch     ? weights_gemma.layers.size()
-      : is_mixtral_arch   ? weights_mixtral.layers.size()
-      : is_qwen3_5_arch   ? weights_qwen3_5.layers.size()
-      : is_qwen3_5_moe_arch ? weights_qwen3_5_moe.layers.size()
-                            : weights_llama.layers.size();
+    const std::size_t num_layers_bound = bound_model.num_layers();
     if (verbose) {
         std::cerr << "[pie-driver-cuda] schema bound: "
                   << num_layers_bound << " layers ("
@@ -1659,9 +1638,9 @@ int run_impl(int argc,
                   << ")\n";
     }
 
-    // Pre-allocate persistent state for serving. CUDA-native no longer
+    // Pre-allocate persistent rs_cache state for serving. CUDA-native no longer
     // accepts manual batch/KV sizing from public config; after weights are
-    // resident we plan the forward arena, optional linear-attn state cache,
+    // resident we plan the forward arena, optional linear-attn rs_cache,
     // and remaining KV pages from gpu_mem_utilization + memory_profile.
     // Per-arch worst-case workspace dims. Gemma-4 has both
     // `use_double_wide_mlp` (intermediate doubles on shared layers)
@@ -1741,6 +1720,8 @@ int run_impl(int argc,
         max_mlp_intermediate, max_Hq, max_Hk,
         mem_plan.capacity.max_logit_rows);
 
+    const auto kv_format = pie_cuda_driver::kv_cache_format_from_string(
+        cfg.batching.kv_cache_dtype, cfg.model.dtype);
     auto kv_cache =
         is_gemma4_arch
             ? pie_cuda_driver::KvCache::allocate_per_layer(
@@ -1749,13 +1730,16 @@ int run_impl(int argc,
                   mem_plan.kv_page_size,
                   local_kv_heads,
                   weights_gemma4.per_layer_head_dim,
-                  weights_gemma4.kv_source_layer)
+                  weights_gemma4.kv_source_layer,
+                  weights_gemma4.per_layer_num_kv_heads,
+                  kv_format)
             : pie_cuda_driver::KvCache::allocate(
                   engine.hf_config().num_hidden_layers,
                   physical_kv_pages,
                   mem_plan.kv_page_size,
                   local_kv_heads,
-                  engine.hf_config().head_dim_kernel);
+                  engine.hf_config().head_dim_kernel,
+                  kv_format);
 
     auto attn_ws = pie_cuda_driver::AttentionWorkspace::allocate(
         mem_plan.attn_float_workspace_bytes, 8ull * 1024 * 1024);
@@ -1766,7 +1750,7 @@ int run_impl(int argc,
     // (they share `prepare_qwen3_5_decode_plan`).
     pie_cuda_driver::model::Qwen3_5PlanState qwen3_5_plan_state;
 
-    // Qwen3.5 / Qwen3.6-MoE linear-attention extras: per-layer state cache
+    // Qwen3.5 / Qwen3.6-MoE linear-attention extras: per-layer rs_cache
     // + a per-call workspace. Inert (default-constructed) on every other
     // arch. The MoE arch additionally needs a routed-experts workspace.
     pie_cuda_driver::model::Qwen3_5LinearAttnWorkspace qwen3_5_la_ws;
@@ -1806,7 +1790,7 @@ int run_impl(int argc,
             static_cast<std::size_t>(q35_max_slots) *
             (per_slot_recurrent_bytes + per_slot_conv_bytes);
         if (verbose) {
-            std::cerr << "[pie-driver-cuda] qwen3.5 state cache: "
+            std::cerr << "[pie-driver-cuda] qwen3.5 rs_cache: "
                       << num_linear_layers << " linear layers, "
                       << q35_max_slots << " slots, "
                       << (per_slot_recurrent_bytes + per_slot_conv_bytes)
@@ -1827,12 +1811,8 @@ int run_impl(int argc,
         }
     }
 
-    auto swap_pool = pie_cuda_driver::SwapPool::allocate(
-        engine.hf_config().num_hidden_layers,
-        static_cast<int>(cfg.batching.swap_pool_size),
-        mem_plan.kv_page_size,
-        local_kv_heads,
-        engine.hf_config().head_dim_kernel);
+    auto swap_pool = pie_cuda_driver::SwapPool::allocate_for_cache(
+        kv_cache, static_cast<int>(cfg.batching.swap_pool_size));
 
     pie_cuda_driver::ops::CublasHandle cublas;
 
@@ -1866,6 +1846,7 @@ int run_impl(int argc,
         }
         std::cerr << " × "
                   << kv_cache.page_size() << " tokens; "
+                  << "format=" << kv_cache.format().name << "; "
                   << "workspace tokens=" << max_workspace_tokens
                   << "; max requests=" << mem_plan.max_requests
                   << "; page_refs=" << mem_plan.max_page_refs
@@ -1928,13 +1909,7 @@ int run_impl(int argc,
         if (is_olmo_post_norm) {
             fwd_cfg.use_qk_norm = true;
         }
-        fwd_cfg.rope_kind = hf.has_rope_scaling
-            ? pie_cuda_driver::model::RopeKind::YaRN
-            : pie_cuda_driver::model::RopeKind::Standard;
-        fwd_cfg.yarn_factor               = hf.rope_factor;
-        fwd_cfg.yarn_low_freq_factor      = hf.rope_low_freq_factor;
-        fwd_cfg.yarn_high_freq_factor     = hf.rope_high_freq_factor;
-        fwd_cfg.yarn_original_max_position = hf.rope_original_max_position;
+        apply_rope_config(fwd_cfg, hf);
         fwd_cfg.sliding_window            = hf.sliding_window;
         // FlashInfer's decode dispatch set covers {1, 2, 3, 4, 8}. Other
         // GQA ratios use the prefill path for decode-only batches as well.
@@ -2016,11 +1991,17 @@ int run_impl(int argc,
         }
 
         if (verbose) {
+            const char* rope_name =
+                (fwd_cfg.rope_kind == pie_cuda_driver::model::RopeKind::YaRN)
+                    ? "yarn"
+                    : (fwd_cfg.rope_kind ==
+                       pie_cuda_driver::model::RopeKind::YaRNOriginal)
+                          ? "yarn-original"
+                          : "standard";
             std::cerr << "[pie-driver-cuda] model_type=" << mt
                       << " use_qk_norm=" << fwd_cfg.use_qk_norm
                       << " use_qkv_bias=" << fwd_cfg.use_qkv_bias
-                      << " rope=" << (fwd_cfg.rope_kind ==
-                           pie_cuda_driver::model::RopeKind::YaRN ? "yarn" : "standard")
+                      << " rope=" << rope_name
                       << " prefill_decode_plan="
                       << (fwd_cfg.use_prefill_decode_plan ? "on" : "off")
                       << " full_attn_min_R="
@@ -2374,21 +2355,13 @@ int run_impl(int argc,
         use_cuda_graphs ? &graph_cache : nullptr,
         /*tp_comm=*/tp_comm_ptr,
         /*tp_cpu_gate_key=*/{},
-        /*slot_alloc=*/{},
+        /*rs_cache=*/((is_qwen3_5_arch || is_qwen3_5_moe_arch) ? &qwen3_5_state_cache : nullptr),
         /*response_builder=*/{},
     };
     executor.tp_cpu_gate_key = cfg.distributed.nccl_unique_id_hex;
     // Speculation lives entirely in the runtime. The driver runs
     // forward passes; the runtime's `scheduler.speculation_depth`
     // toml knob controls per-ctx chain depth.
-    // Size the linear-attn slot allocator only when this arch actually
-    // uses a state cache. Default-constructed (max_slots=0) on every
-    // other arch — handle_fire_batch's `use_slots` predicate stays false
-    // and the body's slot_ids/is_fresh args remain nullptr.
-    if ((is_qwen3_5_arch || is_qwen3_5_moe_arch) &&
-        qwen3_5_state_cache.max_slots() > 0) {
-        executor.slot_alloc.reset(qwen3_5_state_cache.max_slots());
-    }
     if (verbose && use_cuda_graphs) {
         std::cerr << "[pie-driver-cuda] CUDA graphs enabled (experimental)\n";
     }
@@ -2426,10 +2399,24 @@ int run_impl(int argc,
         auto c = engine.capabilities();
         c.total_pages = runtime_kv_pages;
         c.swap_pool_size = swap_pool.num_pages();
+        const bool rs_cache_required =
+            (is_qwen3_5_arch || is_qwen3_5_moe_arch) &&
+            qwen3_5_state_cache.max_slots() > 0;
+        const std::uint64_t rs_cache_slots = rs_cache_required
+            ? static_cast<std::uint64_t>(qwen3_5_state_cache.max_slots())
+            : 0;
+        const std::uint64_t rs_cache_slot_bytes = rs_cache_required
+            ? static_cast<std::uint64_t>(qwen3_5_linear_layers) *
+                  (qwen3_5_state_cache.conv_slot_stride_bytes() +
+                   qwen3_5_state_cache.recurrent_slot_stride_floats() * sizeof(float))
+            : 0;
         nlohmann::json caps = {
             {"total_pages",            c.total_pages},
             {"kv_page_size",           mem_plan.kv_page_size},
             {"swap_pool_size",         c.swap_pool_size},
+            {"rs_cache_required",      rs_cache_required},
+            {"rs_cache_slots",         rs_cache_slots},
+            {"rs_cache_slot_bytes",    rs_cache_slot_bytes},
             {"max_forward_tokens",     mem_plan.capacity.max_forward_tokens},
             {"max_forward_requests",   mem_plan.capacity.max_forward_requests},
             {"max_page_refs",          mem_plan.capacity.max_page_refs},

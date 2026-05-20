@@ -42,7 +42,7 @@ from pie_bridge._native import (  # noqa: F401
     ForwardRequest, ForwardResponse, CopyRequest, AdapterRequest,
     StatusResponse, AdapterBinding,
     # Sampler tagged union + unit enums
-    Sampler, CopyDir, AdapterOp,
+    Sampler, CopyDir, CopyResource, AdapterOp,
     # Shmem ring transport
     ShmemServer, Lease,
     # Schema handshake hash (compared against the server's header).
@@ -80,6 +80,8 @@ COPY_D2H = 0
 COPY_H2D = 1
 COPY_D2D = 2
 COPY_H2H = 3
+COPY_RESOURCE_KV = 0
+COPY_RESOURCE_RS = 1
 
 ADAPTER_LOAD = 0
 ADAPTER_SAVE = 1
@@ -201,6 +203,8 @@ class _PieForwardRequestDesc(_ct.Structure):
         ("kv_page_indptr_ptr", _ct.POINTER(_ct.c_uint32)), ("kv_page_indptr_len", _c_size_t),
         ("kv_last_page_lens_ptr", _ct.POINTER(_ct.c_uint32)), ("kv_last_page_lens_len", _c_size_t),
         ("qo_indptr_ptr", _ct.POINTER(_ct.c_uint32)), ("qo_indptr_len", _c_size_t),
+        ("rs_slot_ids_ptr", _ct.POINTER(_ct.c_uint32)), ("rs_slot_ids_len", _c_size_t),
+        ("rs_slot_flags_ptr", _ct.POINTER(_ct.c_uint8)), ("rs_slot_flags_len", _c_size_t),
         ("masks_ptr", _ct.POINTER(_PieBrleDesc)), ("masks_len", _c_size_t),
         ("mask_indptr_ptr", _ct.POINTER(_ct.c_uint32)), ("mask_indptr_len", _c_size_t),
         ("logit_masks_ptr", _ct.POINTER(_PieBrleDesc)), ("logit_masks_len", _c_size_t),
@@ -245,6 +249,7 @@ class _PieCopyRequestDesc(_ct.Structure):
         ("dir", _ct.c_uint8),
         ("srcs_ptr", _ct.POINTER(_ct.c_uint32)), ("srcs_len", _c_size_t),
         ("dsts_ptr", _ct.POINTER(_ct.c_uint32)), ("dsts_len", _c_size_t),
+        ("resource", _ct.c_uint8),
     ]
 
 
@@ -421,7 +426,7 @@ __all__ = [
     "Frame", "ResponseFrame", "RequestPayload", "ResponsePayload",
     "ForwardRequest", "ForwardResponse", "CopyRequest", "AdapterRequest",
     "StatusResponse", "AdapterBinding",
-    "Sampler", "CopyDir", "AdapterOp",
+    "Sampler", "CopyDir", "CopyResource", "AdapterOp",
     "ShmemServer", "Lease", "SCHEMA_HASH",
     # Discriminant constants
     "REQUEST_FORWARD", "REQUEST_COPY", "REQUEST_ADAPTER", "REQUEST_HEALTH",
@@ -430,6 +435,7 @@ __all__ = [
     "SAMPLER_TOP_K_TOP_P", "SAMPLER_EMBEDDING", "SAMPLER_DIST",
     "SAMPLER_RAW_LOGITS", "SAMPLER_LOGPROB", "SAMPLER_LOGPROBS", "SAMPLER_ENTROPY",
     "COPY_D2H", "COPY_H2D", "COPY_D2D", "COPY_H2H",
+    "COPY_RESOURCE_KV", "COPY_RESOURCE_RS",
     "ADAPTER_LOAD", "ADAPTER_SAVE", "ADAPTER_ZO_INIT", "ADAPTER_ZO_UPDATE",
     # Build helpers
     "build_status_response", "build_health_request", "build_forward_response",

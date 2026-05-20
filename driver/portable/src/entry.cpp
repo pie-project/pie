@@ -76,34 +76,6 @@ void on_signal(int) {
     if (auto* server = g_signal_server.load()) server->stop();
 }
 
-constexpr std::int32_t kMinTotalPages = 64;
-constexpr std::int32_t kDefaultTotalPages = 1024;
-constexpr std::int32_t kDefaultMaxForwardTokens = 10240;
-constexpr std::int32_t kDefaultMaxForwardRequests = 512;
-
-std::int32_t pages_for_tokens(std::int32_t tokens, std::int32_t page_size) {
-    if (tokens <= 0) return 0;
-    return (tokens + page_size - 1) / page_size;
-}
-
-std::int32_t derive_total_pages(const pie_portable_driver::Hparams& h,
-                                std::int32_t page_size) {
-    const auto model_pages = pages_for_tokens(h.max_position_embeddings, page_size);
-    return std::max(kMinTotalPages, std::max(kDefaultTotalPages, model_pages));
-}
-
-std::int32_t derive_max_forward_tokens(std::int32_t total_pages,
-                                       std::int32_t page_size) {
-    const auto total_tokens = std::max<std::int32_t>(1, total_pages * page_size);
-    return std::max<std::int32_t>(
-        1, std::min(kDefaultMaxForwardTokens, total_tokens));
-}
-
-std::int32_t derive_max_forward_requests(std::int32_t max_forward_tokens) {
-    return std::max<std::int32_t>(
-        1, std::min(kDefaultMaxForwardRequests, max_forward_tokens));
-}
-
 // -----------------------------------------------------------------------------
 // Offline-test scaffolding (--test-prompt-tokens and friends)
 // -----------------------------------------------------------------------------
@@ -316,20 +288,19 @@ int run_impl(int argc,
     // The runtime owns page allocation; we report total_pages and page_size
     // in the READY handshake and honor the page IDs the runtime sends in
     // every wire request.
+    std::int32_t total_pages = static_cast<std::int32_t>(cfg.batching.total_pages);
     const std::int32_t page_size =
-        static_cast<std::int32_t>(pie_portable_driver::kKvPageSize);
-    std::int32_t total_pages = derive_total_pages(h, page_size);
+        static_cast<std::int32_t>(cfg.batching.kv_page_size);
     const std::int32_t requested_pages = total_pages;
     std::unique_ptr<pie_portable_driver::Executor> executor_ptr;
-    while (total_pages >= kMinTotalPages) {
+    while (total_pages >= 64) {
         try {
             executor_ptr = std::make_unique<pie_portable_driver::Executor>(
-                model, total_pages, page_size);
+                model, total_pages, page_size, cfg.batching.kv_cache_dtype);
             break;
         } catch (const std::exception& e) {
-            if (total_pages == kMinTotalPages) throw;
-            const std::int32_t next_pages =
-                std::max<std::int32_t>(kMinTotalPages, total_pages / 2);
+            if (total_pages == 64) throw;
+            const std::int32_t next_pages = std::max<std::int32_t>(64, total_pages / 2);
             std::cerr << "[pie-driver-portable] warning: KV cache allocation "
                       << "failed at " << total_pages << " pages: " << e.what()
                       << "; retrying with " << next_pages << " pages\n";
@@ -356,7 +327,8 @@ int run_impl(int argc,
     std::unique_ptr<pie_portable_driver::HostSwapPool> swap_pool;
     auto adapters = std::make_unique<pie_portable_driver::AdapterPool>();
     executor.set_adapters(adapters.get());
-    const std::int32_t cpu_pages = 0;
+    const std::int32_t cpu_pages =
+        static_cast<std::int32_t>(cfg.batching.cpu_pages);
     if (cpu_pages > 0) {
         const auto& hp = model.hparams();
         swap_pool = std::make_unique<pie_portable_driver::HostSwapPool>(
@@ -421,18 +393,15 @@ int run_impl(int argc,
                 0,
                 static_cast<std::int64_t>(total_pages) *
                     static_cast<std::int64_t>(page_size)));
-    const std::uint32_t max_forward_tokens =
-        static_cast<std::uint32_t>(
-            derive_max_forward_tokens(total_pages, page_size));
-    const std::uint32_t max_forward_requests =
-        static_cast<std::uint32_t>(
-            derive_max_forward_requests(static_cast<std::int32_t>(max_forward_tokens)));
     nlohmann::json caps = {
         {"total_pages",            total_pages},
         {"kv_page_size",           page_size},
         {"swap_pool_size",         cpu_pages},
-        {"max_forward_tokens",     max_forward_tokens},
-        {"max_forward_requests",   max_forward_requests},
+        {"rs_cache_required",      executor.rs_cache_slots() > 0},
+        {"rs_cache_slots",         executor.rs_cache_slots()},
+        {"rs_cache_slot_bytes",    executor.rs_cache_slot_bytes()},
+        {"max_forward_tokens",     cfg.batching.max_forward_tokens},
+        {"max_forward_requests",   cfg.batching.max_forward_requests},
         {"max_page_refs",          total_pages},
         {"max_logit_rows",         std::numeric_limits<std::uint32_t>::max()},
         {"max_prob_rows",          std::numeric_limits<std::uint32_t>::max()},
@@ -464,6 +433,11 @@ int run_impl(int argc,
     if (cfg.runtime.verbose) {
         std::cerr << "[pie-driver-portable] shutting down (handled " << handled
                   << " requests)\n";
+    }
+    // Print per-stage timings on demand (e.g. e2e benchmarks). Default
+    // off so production logs stay quiet.
+    if (std::getenv("PIE_PORTABLE_LOG_TIMINGS")) {
+        executor.log_timings("shmem-loop");
     }
     return 0;
 }

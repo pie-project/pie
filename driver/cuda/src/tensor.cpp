@@ -19,10 +19,10 @@ DType dtype_from_safetensors(const std::string& s) {
     // native FP8 cuBLAS path (or a dequant-on-load fallback in mistral3).
     if (s == "F8_E4M3") return DType::FP8_E4M3;
     if (s == "F8_E5M2") return DType::FP8_E5M2;
-    // mxfp4 (F4_E2M1) still rides on UINT8 — its storage is two nibbles per
-    // byte, which the dtype enum can't currently express. Per-arch bind
-    // (gpt_oss) reinterprets the bytes via the dequant kernel. M3 (offline
-    // INT4) introduces a packed-int4 dtype proper.
+    // MXFP4 (F4_E2M1) rides on UINT8 storage: two nibbles per byte plus a
+    // side E8M0 scale tensor described by QuantSpec. Target lowering decides
+    // whether those bytes remain native QuantPacked runtime tensors or
+    // dequantize to BF16 during materialization.
     if (s == "F4_E2M1") return DType::UINT8;
     throw std::runtime_error("unsupported safetensors dtype: " + s);
 }

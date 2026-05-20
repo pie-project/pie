@@ -56,6 +56,7 @@ typedef struct PieAdapterBinding     PieAdapterBinding;
 typedef struct PieBrle               PieBrle;
 typedef struct PieSampler            PieSampler;
 typedef struct PieCopyDir            PieCopyDir;
+typedef struct PieCopyResource       PieCopyResource;
 typedef struct PieAdapterOp          PieAdapterOp;
 
 /* ----- Discriminant constants ----- */
@@ -84,6 +85,9 @@ typedef struct PieAdapterOp          PieAdapterOp;
 #define PIE_COPY_DIR_H2D  1
 #define PIE_COPY_DIR_D2D  2
 #define PIE_COPY_DIR_H2H  3
+
+#define PIE_COPY_RESOURCE_KV  0
+#define PIE_COPY_RESOURCE_RS  1
 
 #define PIE_ADAPTER_OP_LOAD        0
 #define PIE_ADAPTER_OP_SAVE        1
@@ -131,6 +135,8 @@ void pie_forward_request_kv_page_indices  (const PieForwardRequest*, const uint3
 void pie_forward_request_kv_page_indptr   (const PieForwardRequest*, const uint32_t**, size_t*);
 void pie_forward_request_kv_last_page_lens(const PieForwardRequest*, const uint32_t**, size_t*);
 void pie_forward_request_qo_indptr        (const PieForwardRequest*, const uint32_t**, size_t*);
+void pie_forward_request_rs_slot_ids      (const PieForwardRequest*, const uint32_t**, size_t*);
+void pie_forward_request_rs_slot_flags    (const PieForwardRequest*, const uint8_t**,  size_t*);
 /* `masks` and `logit_masks` are arrays of nested PieBrle structs;
  * use the `_len`/`_at` pair below instead of a flat slice accessor.
  * `mask_indptr` / `logit_mask_indptr` partition the Vec<Brle> per
@@ -185,8 +191,10 @@ uint32_t pie_sampler_seed       (const PieSampler*);
 const PieCopyDir* pie_copy_request_dir (const PieCopyRequest*);
 void              pie_copy_request_srcs(const PieCopyRequest*, const uint32_t**, size_t*);
 void              pie_copy_request_dsts(const PieCopyRequest*, const uint32_t**, size_t*);
+const PieCopyResource* pie_copy_request_resource(const PieCopyRequest*);
 
 uint8_t pie_copy_dir_value(const PieCopyDir*);
+uint8_t pie_copy_resource_value(const PieCopyResource*);
 
 const PieAdapterOp* pie_adapter_request_op        (const PieAdapterRequest*);
 uint64_t            pie_adapter_request_adapter_id(const PieAdapterRequest*);
@@ -243,6 +251,8 @@ typedef struct PieForwardRequestDesc {
     const uint32_t* kv_page_indptr_ptr;     size_t kv_page_indptr_len;
     const uint32_t* kv_last_page_lens_ptr;  size_t kv_last_page_lens_len;
     const uint32_t* qo_indptr_ptr;          size_t qo_indptr_len;
+    const uint32_t* rs_slot_ids_ptr;        size_t rs_slot_ids_len;
+    const uint8_t*  rs_slot_flags_ptr;      size_t rs_slot_flags_len;
     const PieBrleDesc* masks_ptr;           size_t masks_len;
     const uint32_t* mask_indptr_ptr;        size_t mask_indptr_len;
     const PieBrleDesc* logit_masks_ptr;     size_t logit_masks_len;
@@ -288,6 +298,7 @@ typedef struct PieCopyRequestDesc {
     uint8_t dir;
     const uint32_t* srcs_ptr; size_t srcs_len;
     const uint32_t* dsts_ptr; size_t dsts_len;
+    uint8_t resource;
 } PieCopyRequestDesc;
 
 typedef struct PieAdapterRequestDesc {

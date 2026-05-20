@@ -113,6 +113,8 @@ PlanArrays extract_plan_arrays(const pie_driver::PieForwardRequestView& req) {
     a.kv_page_indices      = req.kv_page_indices.as<std::uint32_t>();
     a.kv_page_indptr       = req.kv_page_indptr.as<std::uint32_t>();
     a.kv_last_lens         = req.kv_last_page_lens.as<std::uint32_t>();
+    a.rs_slot_ids          = req.rs_slot_ids.as<std::uint32_t>();
+    a.rs_slot_flags        = req.rs_slot_flags.as<std::uint8_t>();
     a.sampler_types        = req.sampler_types.as<std::uint32_t>();
     a.sampler_temps        = req.sampler_temperatures.as<float>();
     a.sampler_top_k        = req.sampler_top_k.as<std::uint32_t>();
@@ -191,6 +193,12 @@ void validate_plan_top_level(const PlanArrays& a) {
     }
     if (a.request_num_samplers.size() != static_cast<std::size_t>(a.n_request)) {
         throw std::runtime_error("plan: request_num_samplers length mismatch");
+    }
+    if (!a.rs_slot_ids.empty() && a.rs_slot_ids.size() != static_cast<std::size_t>(a.n_request)) {
+        throw std::runtime_error("plan: rs_slot_ids length must equal num_requests");
+    }
+    if (!a.rs_slot_flags.empty() && a.rs_slot_flags.size() != static_cast<std::size_t>(a.n_request)) {
+        throw std::runtime_error("plan: rs_slot_flags length must equal num_requests");
     }
     if (a.sampling_indptr.size() != n_plus_1) {
         throw std::runtime_error("plan: sampling_indptr length must be num_requests+1");
@@ -288,6 +296,9 @@ void plan_single_request(const PlanArrays& a,
     rp.n_tokens     = n_tok;
     rp.n_tokens_pad = ((n_tok + MASK_PAD - 1) / MASK_PAD) * MASK_PAD;
     rp.n_kv         = seq_len;
+    if (a.rs_slot_ids.size() == static_cast<std::size_t>(a.n_request)) {
+        rp.state_slot = static_cast<std::int32_t>(a.rs_slot_ids[r]);
+    }
 
     rp.gather_idxs.resize(seq_len);
     for (std::int32_t k = 0; k < seq_len; ++k) {

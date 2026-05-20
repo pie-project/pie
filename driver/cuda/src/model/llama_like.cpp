@@ -91,56 +91,14 @@ void prepare_llama_like_decode_plan(
         state.use_prefill_decode_plan = false;
         return;
     }
-    const int min_prefill_decode_pages =
-        std::max(0, fwd_cfg.prefill_decode_min_kv_pages);
-    std::uint64_t total_kv_pages = 0;
-    for (int r = 0; r < num_requests; ++r) {
-        total_kv_pages += static_cast<std::uint64_t>(
-            kv_page_indptr_h[r + 1] - kv_page_indptr_h[r]);
-    }
-    const int avg_kv_pages = num_requests > 0
-        ? static_cast<int>((total_kv_pages + num_requests - 1) / num_requests)
-        : 0;
-    state.use_prefill_decode_plan =
-        fwd_cfg.use_prefill_decode_plan &&
-        (min_prefill_decode_pages == 0 ||
-         avg_kv_pages >= min_prefill_decode_pages);
-    if (state.use_prefill_decode_plan) {
-        if (!state.prefill_decode_plan) {
-            state.prefill_decode_plan = ops::make_prefill_plan();
-        }
-        const int T = (fwd_cfg.tp_size > 0) ? fwd_cfg.tp_size : 1;
-        const int num_q_heads_local  = cfg.num_attention_heads / T;
-        const int num_kv_heads_local = cfg.num_key_value_heads / T;
-        std::vector<std::uint32_t> qo_indptr_h(num_requests + 1);
-        for (int r = 0; r <= num_requests; ++r) {
-            qo_indptr_h[r] = static_cast<std::uint32_t>(r);
-        }
-        const int min_full_attention_pages =
-            std::max(0, fwd_cfg.prefill_decode_full_attention_min_kv_pages);
-        const bool full_attention_variant =
-            fwd_cfg.prefill_decode_full_attention_min_requests > 0 &&
-            num_requests >= fwd_cfg.prefill_decode_full_attention_min_requests &&
-            (min_full_attention_pages == 0 ||
-             avg_kv_pages >= min_full_attention_pages) &&
-            fwd_cfg.sliding_window < 0 &&
-            fwd_cfg.per_layer_window_left.empty();
-        ops::plan_attention_flashinfer_prefill_bf16(
-            *state.prefill_decode_plan, qo_indptr_h.data(), kv_page_indptr_h,
-            /*total_tokens=*/num_requests, num_requests,
-            num_q_heads_local, num_kv_heads_local, cfg.head_dim_kernel,
-            cache.page_size(), attn_ws, /*stream=*/nullptr,
-            fwd_cfg.decode_plan_cuda_graph, fwd_cfg.sliding_window,
-            full_attention_variant);
-        return;
-    }
+    state.use_prefill_decode_plan = false;
     if (!state.decode_plan) {
         state.decode_plan = ops::make_decode_plan();
     }
     const int T = (fwd_cfg.tp_size > 0) ? fwd_cfg.tp_size : 1;
     const int num_q_heads_local  = cfg.num_attention_heads / T;
     const int num_kv_heads_local = cfg.num_key_value_heads / T;
-    ops::plan_attention_flashinfer_decode_bf16(
+    ops::plan_attention_flashinfer_decode(
         *state.decode_plan, kv_page_indptr_h, num_requests,
         num_q_heads_local, num_kv_heads_local, cfg.head_dim_kernel,
         cache.page_size(), attn_ws, /*stream=*/nullptr,
@@ -150,9 +108,6 @@ void prepare_llama_like_decode_plan(
 std::uint8_t llama_like_decode_graph_layout(
     const LlamaLikePlanState& state)
 {
-    if (state.use_prefill_decode_plan && state.prefill_decode_plan) {
-        return ops::prefill_plan_graph_layout(*state.prefill_decode_plan);
-    }
     if (!state.decode_plan) return 0;
     return ops::decode_plan_graph_layout(*state.decode_plan);
 }
@@ -201,8 +156,6 @@ void llama_like_forward_paged(
     const int d  = cfg.head_dim;
     const int dk = cfg.head_dim_kernel;            // padded HEAD_DIM the
                                                    // attention kernel runs at
-    const int Hq_kern = num_q_heads_local * dk;
-    const int Hk_kern = num_kv_heads_local * dk;
     const bool head_dim_padded = (d != dk);
     const float eps = cfg.rms_norm_eps;
     // Inherit the stream bound to `cublas` so manual kernel launches stay
@@ -233,8 +186,6 @@ void llama_like_forward_paged(
     // kernel even for qo_len==1 batches. The runtime decision lives in
     // a single bool: anything past the plan_attention call uses it.
     const bool use_decode_path = is_pure_decode && !fwd_cfg.force_prefill_path;
-    const bool use_prefill_decode_path =
-        use_decode_path && plan_state.use_prefill_decode_plan;
 
     // Decode plan was set up by the prepare hook (runs outside any
     // cudaStream capture region) — the body just reads from
@@ -242,8 +193,6 @@ void llama_like_forward_paged(
     // the executor can capture it into a CUDA graph.
     const ops::DecodePlanCache* decode_plan =
         plan_state.decode_plan ? plan_state.decode_plan.get() : nullptr;
-    const ops::PrefillPlanCache* prefill_decode_plan =
-        plan_state.prefill_decode_plan ? plan_state.prefill_decode_plan.get() : nullptr;
 
     const bool post_norm = fwd_cfg.norm_placement == NormPlacement::Post;
     bool have_next_attn_norm = false;
@@ -379,19 +328,11 @@ void llama_like_forward_paged(
             attn_out_buf = ws.attn_out_padded.data();
         }
 
-        if (is_pure_decode) {
-            kernels::launch_write_kv_decode_to_pages_bf16(
-                cache.k(L), cache.v(L),
-                const_cast<void*>(attn_k), const_cast<void*>(attn_v),
-                kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                R, cache.page_size(), num_kv_heads_local, dk, stream);
-        } else {
-            kernels::launch_write_kv_to_pages_bf16(
-                cache.k(L), cache.v(L),
-                const_cast<void*>(attn_k), const_cast<void*>(attn_v),
-                qo_indptr, kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                N, R, cache.page_size(), num_kv_heads_local, dk, stream);
-        }
+        auto kv_view = cache.layer_view(L);
+        kernels::launch_write_kv_to_pages(
+            kv_view, const_cast<void*>(attn_k), const_cast<void*>(attn_v),
+            qo_indptr, kv_page_indices, kv_page_indptr, kv_last_page_lens,
+            N, R, stream);
 
         // Per-layer sliding-window dispatch (OLMo-3, Mistral). When
         // `per_layer_window_left` is empty we fall back to the global
@@ -403,34 +344,26 @@ void llama_like_forward_paged(
                 ? fwd_cfg.per_layer_window_left[L]
                 : fwd_cfg.sliding_window;
 
-        if (use_prefill_decode_path) {
-            ops::dispatch_attention_flashinfer_prefill_bf16(
-                *prefill_decode_plan,
-                attn_q, cache.k(L), cache.v(L), attn_out_buf,
-                qo_indptr, kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                attn_ws, stream, /*logits_soft_cap=*/0.f, sm_scale_override);
-        } else if (use_decode_path) {
-            ops::dispatch_attention_flashinfer_decode_bf16(
+        if (use_decode_path) {
+            ops::dispatch_attention_flashinfer_decode(
                 *decode_plan,
-                attn_q, cache.k(L), cache.v(L), attn_out_buf,
+                attn_q, kv_view, attn_out_buf,
                 kv_page_indices, kv_page_indptr, kv_last_page_lens,
                 attn_ws, stream, layer_window_left,
                 /*logits_soft_cap=*/0.f, sm_scale_override);
         } else if (custom_mask_d) {
-            ops::launch_attention_flashinfer_prefill_custom_bf16(
-                attn_q, cache.k(L), cache.v(L), attn_out_buf,
+            ops::launch_attention_flashinfer_prefill_custom(
+                attn_q, kv_view, attn_out_buf,
                 qo_indptr, kv_page_indices, kv_page_indptr, kv_last_page_lens,
                 custom_mask_d, custom_mask_indptr_d,
                 qo_indptr_h, kv_page_indptr_h,
-                N, R, num_q_heads_local, num_kv_heads_local, dk,
-                cache.page_size(), attn_ws, stream);
+                N, R, num_q_heads_local, attn_ws, stream);
         } else {
-            ops::launch_attention_flashinfer_prefill_bf16(
-                attn_q, cache.k(L), cache.v(L), attn_out_buf,
+            ops::launch_attention_flashinfer_prefill(
+                attn_q, kv_view, attn_out_buf,
                 qo_indptr, kv_page_indices, kv_page_indptr, kv_last_page_lens,
                 qo_indptr_h, kv_page_indptr_h,
-                N, R, num_q_heads_local, num_kv_heads_local, dk,
-                cache.page_size(), attn_ws, stream, layer_window_left,
+                N, R, num_q_heads_local, attn_ws, stream, layer_window_left,
                 /*logits_soft_cap=*/0.f, sm_scale_override);
         }
 

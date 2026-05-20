@@ -9,7 +9,6 @@
 #include "kernels/kv_paged.hpp"
 #include "kernels/rmsnorm.hpp"
 #include "kernels/rope.hpp"
-#include "kernels/split_packed.hpp"
 #include "kernels/swiglu.hpp"
 #include "ops/attention_flashinfer.hpp"
 #include "ops/attention_naive.hpp"
@@ -47,9 +46,6 @@ Qwen3Workspace Qwen3Workspace::allocate_full(
     ws.up            = DeviceTensor::allocate(DType::BF16, {N, I});
     ws.logits        = DeviceTensor::allocate(DType::BF16, {O, V});
     ws.probs         = DeviceTensor::allocate(DType::FP32, {O, V});
-    // Tiny scratch for TP greedy decode. The current launcher supports
-    // up to 8 ranks here; larger TP groups fall back to the full-logits
-    // path before touching these buffers.
     ws.greedy_values = DeviceTensor::allocate(DType::FP32, {N});
     ws.greedy_tokens = DeviceTensor::allocate(DType::INT32, {N});
     ws.greedy_values_all = DeviceTensor::allocate(DType::FP32, {8, N});
@@ -119,25 +115,16 @@ void qwen3_forward_prefill(
             ws.y.data(), layer.attn_norm->data(), ws.norm_x.data(),
             N, H, eps, stream);
 
-        // 3. QKV projections.
-        if (layer.qkv_proj_fused) {
-            ops::gemm_act_x_w(cublas.handle(),
-                ws.norm_x.data(), *layer.qkv_proj_fused,
-                ws.qkv_fused.data(), N, Hq + 2 * Hk, H);
-            kernels::launch_split_qkv_bf16(
-                ws.qkv_fused.data(), ws.q.data(), ws.k.data(), ws.v.data(),
-                N, Hq, Hk, stream);
-        } else {
-            ops::gemm_act_x_w(cublas.handle(),
-                ws.norm_x.data(), make_weight_view(layer.q_proj, layer.q_proj_quant),
-                ws.q.data(), N, Hq, H);
-            ops::gemm_act_x_w(cublas.handle(),
-                ws.norm_x.data(), make_weight_view(layer.k_proj, layer.k_proj_quant),
-                ws.k.data(), N, Hk, H);
-            ops::gemm_act_x_w(cublas.handle(),
-                ws.norm_x.data(), make_weight_view(layer.v_proj, layer.v_proj_quant),
-                ws.v.data(), N, Hk, H);
-        }
+        // 3. QKV projections (no fusion yet).
+        ops::gemm_act_x_w(cublas.handle(),
+            ws.norm_x.data(), make_weight_view(layer.q_proj, layer.q_proj_quant),
+            ws.q.data(), N, Hq, H);
+        ops::gemm_act_x_w(cublas.handle(),
+            ws.norm_x.data(), make_weight_view(layer.k_proj, layer.k_proj_quant),
+            ws.k.data(), N, Hk, H);
+        ops::gemm_act_x_w(cublas.handle(),
+            ws.norm_x.data(), make_weight_view(layer.v_proj, layer.v_proj_quant),
+            ws.v.data(), N, Hk, H);
 
         // 4. Per-head q_norm / k_norm. Qwen3-only — Llama 3 / Mistral /
         //    Qwen 2 leave these null and skip the extra RMSNorm. Reshape Q
@@ -176,21 +163,12 @@ void qwen3_forward_prefill(
             N, H, eps, stream);
 
         // 9. Gate / up projections.
-        if (layer.gate_up_proj_fused) {
-            ops::gemm_act_x_w(cublas.handle(),
-                ws.norm_y.data(), *layer.gate_up_proj_fused,
-                ws.gate_up_fused.data(), N, 2 * I, H);
-            kernels::launch_split_gate_up_bf16(
-                ws.gate_up_fused.data(), ws.gate.data(), ws.up.data(),
-                N, I, stream);
-        } else {
-            ops::gemm_act_x_w(cublas.handle(),
-                ws.norm_y.data(), make_weight_view(layer.gate_proj, layer.gate_proj_quant),
-                ws.gate.data(), N, I, H);
-            ops::gemm_act_x_w(cublas.handle(),
-                ws.norm_y.data(), make_weight_view(layer.up_proj, layer.up_proj_quant),
-                ws.up.data(),   N, I, H);
-        }
+        ops::gemm_act_x_w(cublas.handle(),
+            ws.norm_y.data(), make_weight_view(layer.gate_proj, layer.gate_proj_quant),
+            ws.gate.data(), N, I, H);
+        ops::gemm_act_x_w(cublas.handle(),
+            ws.norm_y.data(), make_weight_view(layer.up_proj, layer.up_proj_quant),
+            ws.up.data(),   N, I, H);
 
         // 10. SwiGLU into ws.gate (in place: gate <- silu(gate) * up).
         kernels::launch_swiglu_bf16(
@@ -259,7 +237,7 @@ void qwen3_forward_paged(
     ops::DecodePlanCachePtr decode_plan;
     if (is_pure_decode) {
         decode_plan = ops::make_decode_plan();
-        ops::plan_attention_flashinfer_decode_bf16(
+        ops::plan_attention_flashinfer_decode(
             *decode_plan,
             kv_page_indptr_h,
             R,
@@ -280,24 +258,15 @@ void qwen3_forward_paged(
             N, H, eps, stream);
 
         // 3. QKV
-        if (layer.qkv_proj_fused) {
-            ops::gemm_act_x_w(cublas.handle(),
-                ws.norm_x.data(), *layer.qkv_proj_fused,
-                ws.qkv_fused.data(), N, Hq + 2 * Hk, H);
-            kernels::launch_split_qkv_bf16(
-                ws.qkv_fused.data(), ws.q.data(), ws.k.data(), ws.v.data(),
-                N, Hq, Hk, stream);
-        } else {
-            ops::gemm_act_x_w(cublas.handle(),
-                ws.norm_x.data(), make_weight_view(layer.q_proj, layer.q_proj_quant),
-                ws.q.data(), N, Hq, H);
-            ops::gemm_act_x_w(cublas.handle(),
-                ws.norm_x.data(), make_weight_view(layer.k_proj, layer.k_proj_quant),
-                ws.k.data(), N, Hk, H);
-            ops::gemm_act_x_w(cublas.handle(),
-                ws.norm_x.data(), make_weight_view(layer.v_proj, layer.v_proj_quant),
-                ws.v.data(), N, Hk, H);
-        }
+        ops::gemm_act_x_w(cublas.handle(),
+            ws.norm_x.data(), make_weight_view(layer.q_proj, layer.q_proj_quant),
+            ws.q.data(), N, Hq, H);
+        ops::gemm_act_x_w(cublas.handle(),
+            ws.norm_x.data(), make_weight_view(layer.k_proj, layer.k_proj_quant),
+            ws.k.data(), N, Hk, H);
+        ops::gemm_act_x_w(cublas.handle(),
+            ws.norm_x.data(), make_weight_view(layer.v_proj, layer.v_proj_quant),
+            ws.v.data(), N, Hk, H);
 
         // 4. q/k norm (Qwen3 only — null on Llama-likes).
         if (layer.q_norm) {
@@ -318,19 +287,11 @@ void qwen3_forward_paged(
             cfg.rope_theta, stream);
 
         // 6. Write current K/V into the page table for this layer.
-        if (is_pure_decode) {
-            kernels::launch_write_kv_decode_to_pages_bf16(
-                cache.k(L), cache.v(L),
-                ws.k.data(), ws.v.data(),
-                kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                R, cache.page_size(), cfg.num_key_value_heads, d, stream);
-        } else {
-            kernels::launch_write_kv_to_pages_bf16(
-                cache.k(L), cache.v(L),
-                ws.k.data(), ws.v.data(),
-                qo_indptr, kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                N, R, cache.page_size(), cfg.num_key_value_heads, d, stream);
-        }
+        auto kv_view = cache.layer_view(L);
+        kernels::launch_write_kv_to_pages(
+            kv_view, ws.k.data(), ws.v.data(),
+            qo_indptr, kv_page_indices, kv_page_indptr, kv_last_page_lens,
+            N, R, stream);
 
         // 7. Paged attention. flashinfer decode for pure-decode batches,
         // flashinfer prefill (causal) otherwise. The naive paged kernel is
@@ -342,27 +303,25 @@ void qwen3_forward_paged(
             // through prefill instead — TODO if any inferlet hits that.
             // Plan is hoisted (computed once before the loop); each layer
             // only does the dispatch.
-            ops::dispatch_attention_flashinfer_decode_bf16(
+            ops::dispatch_attention_flashinfer_decode(
                 *decode_plan,
-                ws.q.data(), cache.k(L), cache.v(L), ws.attn_out.data(),
+                ws.q.data(), kv_view, ws.attn_out.data(),
                 kv_page_indices, kv_page_indptr, kv_last_page_lens,
                 attn_ws, stream);
         } else if (custom_mask_d) {
-            ops::launch_attention_flashinfer_prefill_custom_bf16(
-                ws.q.data(), cache.k(L), cache.v(L), ws.attn_out.data(),
+            ops::launch_attention_flashinfer_prefill_custom(
+                ws.q.data(), kv_view, ws.attn_out.data(),
                 qo_indptr, kv_page_indices, kv_page_indptr, kv_last_page_lens,
                 custom_mask_d, custom_mask_indptr_d,
                 qo_indptr_h, kv_page_indptr_h,
-                N, R, cfg.num_attention_heads, cfg.num_key_value_heads, d,
-                cache.page_size(), attn_ws, stream);
+                N, R, cfg.num_attention_heads, attn_ws, stream);
         } else {
-            ops::launch_attention_flashinfer_prefill_bf16(
-                ws.q.data(), cache.k(L), cache.v(L), ws.attn_out.data(),
+            ops::launch_attention_flashinfer_prefill(
+                ws.q.data(), kv_view, ws.attn_out.data(),
                 qo_indptr, kv_page_indices, kv_page_indptr, kv_last_page_lens,
                 qo_indptr_h,
                 kv_page_indptr_h,
-                N, R, cfg.num_attention_heads, cfg.num_key_value_heads, d,
-                cache.page_size(), attn_ws, stream);
+                N, R, cfg.num_attention_heads, attn_ws, stream);
         }
 
         // 8. O proj + residual
@@ -376,21 +335,12 @@ void qwen3_forward_paged(
             N, H, eps, stream);
 
         // 10. gate / up
-        if (layer.gate_up_proj_fused) {
-            ops::gemm_act_x_w(cublas.handle(),
-                ws.norm_y.data(), *layer.gate_up_proj_fused,
-                ws.gate_up_fused.data(), N, 2 * I, H);
-            kernels::launch_split_gate_up_bf16(
-                ws.gate_up_fused.data(), ws.gate.data(), ws.up.data(),
-                N, I, stream);
-        } else {
-            ops::gemm_act_x_w(cublas.handle(),
-                ws.norm_y.data(), make_weight_view(layer.gate_proj, layer.gate_proj_quant),
-                ws.gate.data(), N, I, H);
-            ops::gemm_act_x_w(cublas.handle(),
-                ws.norm_y.data(), make_weight_view(layer.up_proj, layer.up_proj_quant),
-                ws.up.data(),   N, I, H);
-        }
+        ops::gemm_act_x_w(cublas.handle(),
+            ws.norm_y.data(), make_weight_view(layer.gate_proj, layer.gate_proj_quant),
+            ws.gate.data(), N, I, H);
+        ops::gemm_act_x_w(cublas.handle(),
+            ws.norm_y.data(), make_weight_view(layer.up_proj, layer.up_proj_quant),
+            ws.up.data(),   N, I, H);
 
         // 11. SwiGLU (in-place into ws.gate)
         kernels::launch_swiglu_bf16(

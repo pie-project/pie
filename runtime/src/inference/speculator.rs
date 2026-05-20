@@ -422,8 +422,8 @@ pub fn evaluate_request_shape(req: &pie_bridge::ForwardRequest) -> Result<(), Sk
 ///   - is a single-token decode at `last_pos + 1` with input =
 ///     the sampled token
 ///   - carries the same samplers / adapter as the prior call
-///   - carries a generated causal mask row, matching the normal API
-///     request shape if this decode is later batched with masked prefills
+///   - leaves masks empty so the scheduler can route it through the
+///     single-token decode path
 ///   - has no speculative drafts (those are a property of the
 ///     specific request, not the chain — propagating them would
 ///     amount to predicting the inferlet's draft strategy)
@@ -445,6 +445,8 @@ pub fn build_next_request(
         kv_page_indptr: vec![0],
         kv_last_page_lens: Vec::new(),
         qo_indptr: vec![0, 1],
+        rs_slot_ids: Vec::new(),
+        rs_slot_flags: Vec::new(),
         masks: Vec::new(),
         mask_indptr: vec![0, 0],
         logit_masks: Vec::new(),
@@ -485,6 +487,8 @@ mod tests {
             kv_page_indptr: vec![0],
             kv_last_page_lens: Vec::new(),
             qo_indptr: vec![0, n],
+            rs_slot_ids: Vec::new(),
+            rs_slot_flags: Vec::new(),
             masks: Vec::new(),
             mask_indptr: vec![0, 0],
             logit_masks: Vec::new(),

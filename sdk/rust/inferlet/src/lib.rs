@@ -180,6 +180,62 @@ impl FutureBlobExt for types::FutureBlob {
 }
 
 // =============================================================================
+// Inferlet-to-inferlet launch
+// =============================================================================
+
+/// Handle to a launched child inferlet. See [`launch`].
+///
+/// Three modes:
+/// - **fire-and-forget**: drop the handle. The child runs to completion on its
+///   own; its return value is discarded.
+/// - **await the result**: `child.await` (via [`IntoFuture`]).
+/// - **timeout / cancel**: keep the handle, call `child.wait()` for a
+///   borrowing future, and call `child.cancel()` if the timeout fires.
+pub struct Child(pie::core::runtime::Child);
+
+impl Child {
+    /// Process id (UUID) of the child, useful for logs.
+    pub fn pid(&self) -> String {
+        self.0.pid()
+    }
+
+    /// Hard-kill the child if still running. Idempotent.
+    pub fn cancel(&self) {
+        self.0.cancel()
+    }
+
+    /// Wait for the child's result without consuming the handle. Use this
+    /// when you may need to call `cancel()` later (e.g. after a timeout).
+    pub async fn wait(&mut self) -> Result<String> {
+        let pollable = self.0.pollable();
+        wstd::io::AsyncPollable::new(pollable).wait_for().await;
+        self.0
+            .get()
+            .unwrap_or_else(|| Err("pollable signaled but get() returned None".to_string()))
+    }
+}
+
+impl std::future::IntoFuture for Child {
+    type Output = Result<String>;
+    // Box the future to keep the SDK on stable Rust without TAIT. The cost
+    // is one allocation per `child.await`, which is negligible next to the
+    // wasmtime store creation a launch already pays for.
+    type IntoFuture = std::pin::Pin<Box<dyn std::future::Future<Output = Result<String>>>>;
+
+    fn into_future(mut self) -> Self::IntoFuture {
+        Box::pin(async move { self.wait().await })
+    }
+}
+
+/// Launch a child inferlet identified by `name@version`. Returns a
+/// [`Child`] handle. See the handle docs for the three usage modes.
+pub fn launch(program: &str, input: &str) -> Result<Child> {
+    pie::core::runtime::launch(program, input)
+        .map(Child)
+        .map_err(|e| e.to_string())
+}
+
+// =============================================================================
 // Argument Parsing (re-exported from pico_args)
 // =============================================================================
 
@@ -198,7 +254,7 @@ pub fn parse_args(args: Vec<String>) -> Arguments {
 /// have to maintain a hand-rolled import grocery list.
 pub mod prelude {
     pub use crate::{main, tool};
-    pub use crate::{Context, Result, Schema, Tool};
+    pub use crate::{Child, Context, Result, Schema, Tool, launch};
     pub use crate::model::Model;
     pub use crate::runtime;
     pub use crate::messaging;

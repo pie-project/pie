@@ -134,6 +134,35 @@ void StateCache::zero_slot(std::int32_t slot) {
     }
 }
 
+void StateCache::copy_slot(std::int32_t src_slot, std::int32_t dst_slot) {
+    if (src_slot < 0 || src_slot >= n_slots_ ||
+        dst_slot < 0 || dst_slot >= n_slots_ || src_slot == dst_slot) {
+        return;
+    }
+    const std::size_t ssm_slot_bytes =
+        static_cast<std::size_t>(head_k_dim_) * head_v_dim_ *
+        n_heads_ * sizeof(float);
+    const std::size_t conv_slot_bytes =
+        static_cast<std::size_t>(conv_kernel_ - 1) * conv_dim_ * sizeof(float);
+    std::vector<float> tmp_ssm(ssm_slot_bytes / sizeof(float));
+    std::vector<float> tmp_conv(conv_slot_bytes / sizeof(float));
+    for (std::size_t il = 0; il < is_linear_.size(); ++il) {
+        if (!is_linear_[il]) continue;
+        ggml_backend_tensor_get(
+            ssm_states_[il], tmp_ssm.data(),
+            static_cast<std::size_t>(src_slot) * ssm_slot_bytes, ssm_slot_bytes);
+        ggml_backend_tensor_set(
+            ssm_states_[il], tmp_ssm.data(),
+            static_cast<std::size_t>(dst_slot) * ssm_slot_bytes, ssm_slot_bytes);
+        ggml_backend_tensor_get(
+            conv_states_[il], tmp_conv.data(),
+            static_cast<std::size_t>(src_slot) * conv_slot_bytes, conv_slot_bytes);
+        ggml_backend_tensor_set(
+            conv_states_[il], tmp_conv.data(),
+            static_cast<std::size_t>(dst_slot) * conv_slot_bytes, conv_slot_bytes);
+    }
+}
+
 std::size_t StateCache::buffer_size() const noexcept {
     return buf_ ? ggml_backend_buffer_get_size(buf_) : 0;
 }

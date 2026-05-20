@@ -21,13 +21,13 @@
 #include "model/llama_like.hpp"
 #include "executor/persistent_inputs.hpp"
 #include <pie_bridge/response_builder.hpp>
-#include "slot_allocator.hpp"
 
 namespace pie_cuda_driver {
 
 class LoadedModel;
 class KvCache;
 class AttentionWorkspace;
+class Qwen3_5StateCache;
 
 namespace model {
 struct Qwen3Weights;
@@ -168,11 +168,9 @@ struct Executor {
     // burning GPU cycles while rank 0 is between requests.
     std::string tp_cpu_gate_key;
 
-    // Per-request linear-attention state-cache slot mapping. Rank 0
-    // owns the LRU; followers receive the pre-resolved slot_ids and
-    // is_fresh flags via NCCL broadcast (see tp_broadcast_inputs).
-    // Inert on archs that don't use a linear-attention state cache.
-    SlotAllocator slot_alloc;
+    // Runtime-managed rs_cache storage. Null on models without
+    // recurrent-state slots.
+    Qwen3_5StateCache* rs_cache = nullptr;
 
     // Response-view builder. Reused fire-to-fire — the builder owns the
     // concat scratch the `PieForwardResponseView` slices point into. The

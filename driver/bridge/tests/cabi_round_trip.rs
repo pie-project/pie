@@ -9,26 +9,27 @@ use std::ptr;
 
 use pie_bridge::wire::encode_request;
 use pie_bridge::{
-    AdapterBinding, AdapterOp, AdapterRequest, CopyDir, CopyRequest, ForwardRequest, Frame,
-    PIE_ADAPTER_OP_LOAD, PIE_COPY_DIR_D2H, PIE_REQUEST_PAYLOAD_FORWARD, PIE_REQUEST_PAYLOAD_HEALTH,
-    PIE_RESPONSE_PAYLOAD_FORWARD, PIE_RESPONSE_PAYLOAD_STATUS, PIE_SAMPLER_LOGPROBS,
-    PIE_SAMPLER_MULTINOMIAL, PIE_SAMPLER_TOP_K, PieAdapterBindingDesc, PieAdapterRequestDesc,
-    PieCopyRequestDesc, PieForwardRequestDesc, PieForwardResponseDesc, PieFrameDesc,
-    PieRequestPayloadDesc, PieResponseFrameDesc, PieResponsePayloadDesc, PieSamplerDesc,
-    PieStatusResponseDesc, RequestPayload, Sampler, pie_adapter_binding_adapter_id,
+    AdapterBinding, AdapterOp, AdapterRequest, CopyDir, CopyRequest, CopyResource, ForwardRequest,
+    Frame, PIE_ADAPTER_OP_LOAD, PIE_COPY_DIR_D2H, PIE_REQUEST_PAYLOAD_FORWARD,
+    PIE_REQUEST_PAYLOAD_HEALTH, PIE_RESPONSE_PAYLOAD_FORWARD, PIE_RESPONSE_PAYLOAD_STATUS,
+    PIE_SAMPLER_LOGPROBS, PIE_SAMPLER_MULTINOMIAL, PIE_SAMPLER_TOP_K, PieAdapterBindingDesc,
+    PieAdapterRequestDesc, PieCopyRequestDesc, PieForwardRequestDesc, PieForwardResponseDesc,
+    PieFrameDesc, PieRequestPayloadDesc, PieResponseFrameDesc, PieResponsePayloadDesc,
+    PieSamplerDesc, PieStatusResponseDesc, RequestPayload, Sampler, pie_adapter_binding_adapter_id,
     pie_adapter_binding_seed, pie_adapter_op_value, pie_adapter_request_adapter_id,
     pie_adapter_request_op, pie_adapter_request_path, pie_build_frame, pie_build_response_frame,
-    pie_copy_dir_value, pie_copy_request_dir, pie_copy_request_dsts, pie_copy_request_srcs,
-    pie_forward_request_adapter_bindings_at, pie_forward_request_adapter_bindings_len,
-    pie_forward_request_context_ids, pie_forward_request_has_user_mask,
-    pie_forward_request_position_ids, pie_forward_request_samplers_at,
-    pie_forward_request_samplers_len, pie_forward_request_single_token_mode,
-    pie_forward_request_token_ids, pie_frame_driver_id, pie_frame_payload, pie_parse_frame,
-    pie_parse_response_frame, pie_request_payload_as_adapter, pie_request_payload_as_copy,
-    pie_request_payload_as_forward, pie_request_payload_kind, pie_response_frame_aborted,
-    pie_response_frame_driver_id, pie_response_frame_payload, pie_response_payload_as_forward,
-    pie_response_payload_as_status, pie_response_payload_kind, pie_sampler_k, pie_sampler_kind,
-    pie_sampler_seed, pie_sampler_temperature, pie_sampler_token_ids, pie_status_response_status,
+    pie_copy_dir_value, pie_copy_request_dir, pie_copy_request_dsts, pie_copy_request_resource,
+    pie_copy_request_srcs, pie_copy_resource_value, pie_forward_request_adapter_bindings_at,
+    pie_forward_request_adapter_bindings_len, pie_forward_request_context_ids,
+    pie_forward_request_has_user_mask, pie_forward_request_position_ids,
+    pie_forward_request_samplers_at, pie_forward_request_samplers_len,
+    pie_forward_request_single_token_mode, pie_forward_request_token_ids, pie_frame_driver_id,
+    pie_frame_payload, pie_parse_frame, pie_parse_response_frame, pie_request_payload_as_adapter,
+    pie_request_payload_as_copy, pie_request_payload_as_forward, pie_request_payload_kind,
+    pie_response_frame_aborted, pie_response_frame_driver_id, pie_response_frame_payload,
+    pie_response_payload_as_forward, pie_response_payload_as_status, pie_response_payload_kind,
+    pie_sampler_k, pie_sampler_kind, pie_sampler_seed, pie_sampler_temperature,
+    pie_sampler_token_ids, pie_status_response_status,
 };
 
 #[test]
@@ -155,6 +156,7 @@ fn copy_frame_through_cabi() {
             dir: CopyDir::D2H,
             srcs: vec![1, 2, 3],
             dsts: vec![10, 20, 30],
+            resource: CopyResource::Kv,
         }),
     })
     .unwrap();
@@ -167,6 +169,8 @@ fn copy_frame_through_cabi() {
 
         let dir = pie_copy_request_dir(cr);
         assert_eq!(pie_copy_dir_value(dir), PIE_COPY_DIR_D2H);
+        let resource = pie_copy_request_resource(cr);
+        assert_eq!(pie_copy_resource_value(resource), 0);
 
         let mut p: *const u32 = ptr::null();
         let mut n: usize = 0;
@@ -328,6 +332,7 @@ fn build_health_request_round_trip() {
         srcs_len: 0,
         dsts_ptr: ptr::null(),
         dsts_len: 0,
+        resource: 0,
     };
     let ar = PieAdapterRequestDesc {
         op: 0,
@@ -375,6 +380,10 @@ fn empty_forward_request_desc() -> PieForwardRequestDesc {
         kv_last_page_lens_len: 0,
         qo_indptr_ptr: ptr::null(),
         qo_indptr_len: 0,
+        rs_slot_ids_ptr: ptr::null(),
+        rs_slot_ids_len: 0,
+        rs_slot_flags_ptr: ptr::null(),
+        rs_slot_flags_len: 0,
         masks_ptr: ptr::null(),
         masks_len: 0,
         mask_indptr_ptr: ptr::null(),

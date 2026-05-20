@@ -39,6 +39,8 @@ wasmtime::component::bindgen!({
         "pie:core/inference.future-output": inference::FutureOutput,
         "pie:core/inference.grammar": inference::Grammar,
         "pie:core/inference.matcher": inference::Matcher,
+        // pie:core/runtime
+        "pie:core/runtime.child": runtime::Child,
         // pie:core/messaging
         "pie:core/messaging.subscription": messaging::Subscription,
         // pie:core/adapter

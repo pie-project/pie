@@ -98,7 +98,6 @@ struct LlamaLikeForwardCfg {
 // graph capture region — no host-side work, no allocations.
 struct LlamaLikePlanState {
     ops::DecodePlanCachePtr decode_plan;
-    ops::PrefillPlanCachePtr prefill_decode_plan;
     bool use_prefill_decode_plan = false;
 };
 

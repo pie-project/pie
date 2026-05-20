@@ -1,4 +1,4 @@
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, ensure};
 
 use std::fs;
 use std::path::PathBuf;
@@ -106,6 +106,9 @@ pub struct ModelConfig {
 pub struct DriverConfig {
     pub total_pages: usize,
     pub cpu_pages: usize,
+    pub rs_cache_required: bool,
+    pub rs_cache_slots: usize,
+    pub rs_cache_slot_bytes: u64,
     pub limits: crate::driver::SchedulerLimits,
 }
 
@@ -239,12 +242,23 @@ async fn bootstrap_inner(config: Config, listener: Option<TcpListener>) -> Resul
             .iter()
             .map(|d| d.limits.max_forward_requests)
             .sum();
+        let num_rs_slots: Vec<usize> = cfg.drivers.iter().map(|d| d.rs_cache_slots).collect();
+        let speculation_depth = if cfg
+            .drivers
+            .iter()
+            .any(|d| d.rs_cache_required || d.rs_cache_slots > 0)
+        {
+            0
+        } else {
+            cfg.scheduler.speculation_depth
+        };
 
         context::spawn(
             cfg.kv_page_size,
             num_gpu_pages,
             num_cpu_pages,
             max_forward_requests,
+            num_rs_slots,
             cfg.scheduler.default_endowment_pages.max(1),
             cfg.scheduler.default_token_limit,
             cfg.scheduler.admission_oversubscription_factor,
@@ -255,7 +269,7 @@ async fn bootstrap_inner(config: Config, listener: Option<TcpListener>) -> Resul
             cfg.kv_page_size as u32,
             cfg.scheduler.request_timeout_secs,
             cfg.scheduler.batch_policy.clone(),
-            cfg.scheduler.speculation_depth,
+            speculation_depth,
         )
         .await;
         adapter::spawn(&drivers);

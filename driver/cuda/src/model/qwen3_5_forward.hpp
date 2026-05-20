@@ -103,7 +103,7 @@ void prepare_qwen3_5_decode_plan(
 
 // Forward pass over `total_tokens` tokens packed as a flat [N, H]
 // stream. Multi-request batching: `slot_ids_h[r]` selects the
-// per-request slab inside the linear-attn state cache; `is_fresh_h[r]`
+// per-request slab inside the linear-attn rs_cache; `is_fresh_h[r]`
 // tells the body to zero that slab before consuming it (a request
 // whose slot was just (re)assigned must be fed a prefill — guaranteed
 // by the runtime's eviction → re-prefill invariant). `slot_ids_d` is

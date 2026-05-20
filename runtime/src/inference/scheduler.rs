@@ -18,6 +18,10 @@ use crate::driver::{self, DriverId, SchedulerLimits};
 use super::adaptive_policy::{AdaptivePolicy, EagerPolicy, GreedyPolicy};
 use super::{ForwardOutput, request};
 
+mod chunked;
+
+use chunked::ChunkContinuation;
+
 // =============================================================================
 // Scheduling Policy Trait
 // =============================================================================
@@ -88,9 +92,33 @@ pub struct SchedulerStats {
 /// A forward pass request bundled with its response channel and physical pages.
 struct PendingRequest {
     request: pie_bridge::ForwardRequest,
-    response_tx: oneshot::Sender<Result<ForwardOutput>>,
+    completion: Completion,
     physical_page_ids: Vec<PhysicalPageId>,
     last_page_len: u32,
+}
+
+enum Completion {
+    Direct(oneshot::Sender<Result<ForwardOutput>>),
+    Chunk {
+        continuation: ChunkContinuation,
+        sampler_slots: Vec<usize>,
+    },
+}
+
+impl PendingRequest {
+    fn direct(
+        request: pie_bridge::ForwardRequest,
+        response_tx: oneshot::Sender<Result<ForwardOutput>>,
+        physical_page_ids: Vec<PhysicalPageId>,
+        last_page_len: u32,
+    ) -> Self {
+        Self {
+            request,
+            completion: Completion::Direct(response_tx),
+            physical_page_ids,
+            last_page_len,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -472,6 +500,24 @@ impl BatchAccumulator {
     }
 }
 
+fn prepare_pending_for_batch(
+    batch: &BatchAccumulator,
+    pending: PendingRequest,
+) -> Option<PendingRequest> {
+    let pending = match pending.maybe_start_chunking(batch.limits, batch.page_size) {
+        Ok(pending) => pending,
+        Err((pending, msg)) => {
+            pending.send_error(msg);
+            return None;
+        }
+    };
+    if let Some(msg) = batch.single_request_limit_error(&pending) {
+        pending.send_error(msg);
+        return None;
+    }
+    Some(pending)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -491,15 +537,15 @@ mod tests {
 
     fn pending(tokens: usize, page_refs: usize) -> PendingRequest {
         let (tx, _rx) = oneshot::channel();
-        PendingRequest {
-            request: pie_bridge::ForwardRequest {
+        PendingRequest::direct(
+            pie_bridge::ForwardRequest {
                 token_ids: vec![0; tokens],
                 ..Default::default()
             },
-            response_tx: tx,
-            physical_page_ids: vec![0; page_refs],
-            last_page_len: 1,
-        }
+            tx,
+            vec![0; page_refs],
+            1,
+        )
     }
 
     fn with_spec(mut req: PendingRequest, spec_tokens: usize) -> PendingRequest {
@@ -738,12 +784,12 @@ impl SchedulerHandle {
         physical_page_ids: Vec<PhysicalPageId>,
         last_page_len: u32,
     ) -> Result<()> {
-        self.tx.send(PendingRequest {
+        self.tx.send(PendingRequest::direct(
             request,
             response_tx,
             physical_page_ids,
             last_page_len,
-        })?;
+        ))?;
         Ok(())
     }
 }
@@ -775,11 +821,13 @@ impl BatchScheduler {
         batch_policy: String,
     ) -> Self {
         let (tx, rx) = mpsc::unbounded_channel();
+        let submit_tx = tx.downgrade();
         let stats = Arc::new(SchedulerStats::default());
         tokio::spawn(Self::run(
             driver_id,
             driver_idx,
             rx,
+            submit_tx,
             page_size,
             limits,
             request_timeout_secs,
@@ -803,12 +851,12 @@ impl BatchScheduler {
         physical_page_ids: Vec<PhysicalPageId>,
         last_page_len: u32,
     ) -> Result<()> {
-        self.tx.send(PendingRequest {
+        self.tx.send(PendingRequest::direct(
             request,
             response_tx,
             physical_page_ids,
             last_page_len,
-        })?;
+        ))?;
         Ok(())
     }
 
@@ -829,6 +877,7 @@ impl BatchScheduler {
         driver_id: DriverId,
         driver_idx: usize,
         mut req_rx: mpsc::UnboundedReceiver<PendingRequest>,
+        submit_tx: mpsc::WeakUnboundedSender<PendingRequest>,
         page_size: u32,
         limits: SchedulerLimits,
         request_timeout_secs: u64,
@@ -874,10 +923,9 @@ impl BatchScheduler {
                     };
                     pending
                 };
-                if let Some(msg) = batch.single_request_limit_error(&pending) {
-                    pending.response_tx.send(Err(anyhow::anyhow!(msg))).ok();
+                let Some(pending) = prepare_pending_for_batch(&batch, pending) else {
                     continue;
-                }
+                };
                 policy.on_arrival();
                 batch.push(pending);
             }
@@ -890,10 +938,9 @@ impl BatchScheduler {
                 let Ok(pending) = req_rx.try_recv() else {
                     break;
                 };
-                if let Some(msg) = batch.single_request_limit_error(&pending) {
-                    pending.response_tx.send(Err(anyhow::anyhow!(msg))).ok();
+                let Some(pending) = prepare_pending_for_batch(&batch, pending) else {
                     continue;
-                }
+                };
                 if batch.would_exceed(&pending) {
                     next_pending = Some(pending);
                     break;
@@ -930,7 +977,7 @@ impl BatchScheduler {
                             break;
                         };
                         if let Some(msg) = batch.single_request_limit_error(&pending) {
-                            pending.response_tx.send(Err(anyhow::anyhow!(msg))).ok();
+                            pending.send_error(msg);
                             continue;
                         }
                         if batch.would_exceed(&pending) {
@@ -958,6 +1005,7 @@ impl BatchScheduler {
                     let latency_tx_clone = latency_tx.clone();
                     let stats_clone = stats.clone();
                     let timeout = request_timeout;
+                    let submit_tx_clone = submit_tx.clone();
 
                     tokio::spawn(async move {
                         let start = Instant::now();
@@ -968,6 +1016,7 @@ impl BatchScheduler {
                             page_size,
                             timeout,
                             Some(permit),
+                            Some(submit_tx_clone),
                         )
                         .await;
                         let latency = start.elapsed();
@@ -1011,13 +1060,12 @@ impl BatchScheduler {
                 }
                 Decision::Wait(wait_duration) => {
                     tokio::select! {
-                        _ = tokio::time::sleep(wait_duration) => {}
+                        _ = tokio::time::sleep(wait_duration) => {},
                         maybe_req = req_rx.recv() => {
                             if let Some(pending) = maybe_req {
-                                if let Some(msg) = batch.single_request_limit_error(&pending) {
-                                    pending.response_tx.send(Err(anyhow::anyhow!(msg))).ok();
+                                let Some(pending) = prepare_pending_for_batch(&batch, pending) else {
                                     continue;
-                                }
+                                };
                                 if batch.would_exceed(&pending) {
                                     next_pending = Some(pending);
                                     continue;
@@ -1027,12 +1075,12 @@ impl BatchScheduler {
                             } else {
                                 break; // channel closed
                             }
-                        }
+                        },
                         latency = latency_rx.recv() => {
                             if let Some(l) = latency {
                                 policy.on_complete(l);
                             }
-                        }
+                        },
                     }
                 }
             }
@@ -1048,6 +1096,7 @@ impl BatchScheduler {
                 page_size,
                 request_timeout,
                 None,
+                None,
             )
             .await;
         }
@@ -1061,6 +1110,7 @@ impl BatchScheduler {
         page_size: u32,
         _timeout: Duration,
         mut permit: Option<OwnedSemaphorePermit>,
+        submit_tx: Option<mpsc::WeakUnboundedSender<PendingRequest>>,
     ) {
         // Build batched request — a single `pie_bridge::ForwardRequest`
         // populated by folding each per-request shape into the batch.
@@ -1102,12 +1152,20 @@ impl BatchScheduler {
                         "Batch response count mismatch",
                     );
                     for req in requests {
-                        req.response_tx.send(Err(anyhow::anyhow!(msg.clone()))).ok();
+                        req.send_result::<ForwardOutput>(
+                            Err(anyhow::anyhow!(msg.clone())),
+                            None,
+                            page_size,
+                        );
                     }
                     return;
                 }
 
-                let token_payload_only = batch_resp.dists_ids.is_empty()
+                let has_chunked = requests
+                    .iter()
+                    .any(|req| matches!(req.completion, Completion::Chunk { .. }));
+                let token_payload_only = !has_chunked
+                    && batch_resp.dists_ids.is_empty()
                     && batch_resp.dists_probs.is_empty()
                     && batch_resp.logits_bytes.is_empty()
                     && batch_resp.logprobs_values.is_empty()
@@ -1123,7 +1181,7 @@ impl BatchScheduler {
                         } else {
                             ForwardOutput::Tokens(batch_resp.tokens[lo..hi].to_vec())
                         };
-                        req.response_tx.send(Ok(output)).ok();
+                        req.send_result(Ok(output), submit_tx.as_ref(), page_size);
                     }
                 } else {
                     for (r, req) in requests.into_iter().enumerate() {
@@ -1132,20 +1190,24 @@ impl BatchScheduler {
                         // walks samplers + the single-request response
                         // to construct the WIT Output.
                         let per_req = request::extract_per_request(&batch_resp, r);
-                        req.response_tx
-                            .send(Ok(ForwardOutput::Response(per_req)))
-                            .ok();
+                        req.send_result(
+                            Ok(ForwardOutput::Response(per_req)),
+                            submit_tx.as_ref(),
+                            page_size,
+                        );
                     }
                 }
             }
             Err(e) => {
                 tracing::error!("fire_batch failed for driver {}: {:?}", driver_id, e);
                 for req in requests {
-                    req.response_tx
-                        .send(Err(anyhow::anyhow!(
+                    req.send_result::<ForwardOutput>(
+                        Err(anyhow::anyhow!(
                             "fire_batch failed for driver {driver_id}: {e:#}"
-                        )))
-                        .ok();
+                        )),
+                        None,
+                        page_size,
+                    );
                 }
             }
         }

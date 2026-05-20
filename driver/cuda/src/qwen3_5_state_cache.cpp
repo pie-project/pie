@@ -85,6 +85,36 @@ void Qwen3_5StateCache::reset_slot(int slot, cudaStream_t stream)
     }
 }
 
+void Qwen3_5StateCache::copy_slot_d2d(int src_slot, int dst_slot, cudaStream_t stream)
+{
+    if (src_slot < 0 || src_slot >= max_slots_ || dst_slot < 0 || dst_slot >= max_slots_) {
+        throw std::out_of_range("Qwen3_5StateCache::copy_slot_d2d: slot out of range");
+    }
+    if (src_slot == dst_slot) {
+        return;
+    }
+    const std::size_t conv_bytes = conv_slot_stride_bytes();
+    const std::size_t rec_floats = recurrent_slot_stride_floats();
+    const std::size_t rec_bytes = rec_floats * sizeof(float);
+    for (std::size_t L = 0; L < layer_is_linear_.size(); ++L) {
+        if (!layer_is_linear_[L]) continue;
+        auto* conv_base = reinterpret_cast<std::uint8_t*>(conv_states_[L].data());
+        auto* rec_base = recurrent_states_[L].data();
+        CUDA_CHECK(cudaMemcpyAsync(
+            conv_base + static_cast<std::size_t>(dst_slot) * conv_bytes,
+            conv_base + static_cast<std::size_t>(src_slot) * conv_bytes,
+            conv_bytes,
+            cudaMemcpyDeviceToDevice,
+            stream));
+        CUDA_CHECK(cudaMemcpyAsync(
+            rec_base + static_cast<std::size_t>(dst_slot) * rec_floats,
+            rec_base + static_cast<std::size_t>(src_slot) * rec_floats,
+            rec_bytes,
+            cudaMemcpyDeviceToDevice,
+            stream));
+    }
+}
+
 void* Qwen3_5StateCache::conv_state(int layer, int slot)
 {
     if (slot < 0 || slot >= max_slots_) {

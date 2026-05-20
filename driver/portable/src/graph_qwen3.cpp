@@ -385,6 +385,8 @@ GraphResult build_qwen3_graph(ggml_context* ctx,
             ggml_tensor* v_for_kv = ggml_is_contiguous(V) ? V : ggml_cont(ctx, V);
             auto* k_2d = ggml_reshape_2d(ctx, k_for_kv, n_embd_gqa, n_total);
             auto* v_2d = ggml_reshape_2d(ctx, v_for_kv, n_embd_gqa, n_total);
+            k_2d = kv.qdq_for_append(ctx, il, k_2d);
+            v_2d = kv.qdq_for_append(ctx, il, v_2d);
             k_cached = ggml_set_rows(ctx, kv.k(il), k_2d, in.kv_idxs);
             v_cached = ggml_set_rows(ctx, kv.v(il), v_2d, in.kv_idxs);
             live_k[il] = k_cached;

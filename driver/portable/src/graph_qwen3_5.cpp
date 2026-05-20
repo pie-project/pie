@@ -186,8 +186,8 @@ ggml_tensor* build_qwen3_5_full_layer(
         ggml_tensor*  x_r,
         const LayerWeights& L,
         const Hparams& h,
-        ggml_tensor*  k_cache_layer,
-        ggml_tensor*  v_cache_layer,
+        KvCachePaged& kv,
+        std::int32_t  layer,
         ggml_tensor*  pos_input,
         ggml_tensor*  kv_idxs_full_batch,
         std::int32_t  qo_start_in_full_batch,
@@ -268,11 +268,13 @@ ggml_tensor* build_qwen3_5_full_layer(
     // KV cache write (uses the global kv_idxs sliced for this request).
     auto* k_2d = ggml_reshape_2d(ctx, ggml_cont(ctx, K), n_embd_gqa, n_tokens);
     auto* v_2d = ggml_reshape_2d(ctx, ggml_cont(ctx, V), n_embd_gqa, n_tokens);
+    k_2d = kv.qdq_for_append(ctx, layer, k_2d);
+    v_2d = kv.qdq_for_append(ctx, layer, v_2d);
     auto* kv_idxs_r = ggml_view_1d(ctx, kv_idxs_full_batch, n_tokens,
                                     static_cast<std::size_t>(qo_start_in_full_batch) *
                                     ggml_element_size(kv_idxs_full_batch));
-    auto* k_cached = ggml_set_rows(ctx, k_cache_layer, k_2d, kv_idxs_r);
-    auto* v_cached = ggml_set_rows(ctx, v_cache_layer, v_2d, kv_idxs_r);
+    auto* k_cached = ggml_set_rows(ctx, kv.k(layer), k_2d, kv_idxs_r);
+    auto* v_cached = ggml_set_rows(ctx, kv.v(layer), v_2d, kv_idxs_r);
 
     // Per-request flash-attn (head_dim=256 fits ggml's flash_attn).
     // Pass Q in [hd, n_q_h, n_tokens] form via the existing helper —
@@ -441,7 +443,7 @@ GraphResult build_qwen3_5_graph(ggml_context* ctx,
                     cur_r = ggml_cont(ctx, cur_r);
                     auto* attn_r = build_qwen3_5_full_layer(
                         ctx, cur_r, L, h,
-                        kv.k(il), kv.v(il),
+                        kv, il,
                         in.pos_input, in.kv_idxs, R.qo_start,
                         in.gather_idxs[r], in.masks[r],
                         R.n_tokens, R.n_kv);
@@ -519,7 +521,7 @@ GraphResult build_qwen3_5_graph(ggml_context* ctx,
                                                     R.n_tokens);
                     auto* attn_2d = build_qwen3_5_full_layer(
                         ctx, cur_2d, L, h,
-                        kv.k(il), kv.v(il),
+                        kv, il,
                         in.pos_input, in.kv_idxs, R.qo_start,
                         in.gather_idxs[r], in.masks[r],
                         R.n_tokens, R.n_kv);

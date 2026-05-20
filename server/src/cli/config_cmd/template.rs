@@ -86,6 +86,11 @@ const PORTABLE_DRIVER_BLOCK: &str = r#"
 type = "portable"
 device = ["auto"]
 ipc_profile = "balanced" # "latency", "balanced", or "power"
+
+[model.driver.options]
+max_forward_tokens = 10240
+max_forward_requests = 512
+kv_cache_dtype = "auto"
 "#;
 
 #[cfg(feature = "driver-cuda")]
@@ -101,6 +106,7 @@ activation_dtype = "bfloat16"
 [model.driver.options]
 gpu_mem_utilization = 0.90
 memory_profile = "auto"
+kv_cache_dtype = "auto"
 "#;
 
 const DUMMY_DRIVER_BLOCK: &str = r#"

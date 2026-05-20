@@ -1,0 +1,13 @@
+[package]
+name = "launch-caller"
+version = "0.1.0"
+description = "Inferlet that calls another inferlet via inferlet::call (runtime::launch + messaging reply-topic)"
+authors = ["In Gim <in.gim@yale.edu>"]
+repository = "https://github.com/pie-project/pie"
+
+[runtime]
+core = "^0.2.0"
+
+[parameters]
+callee = {type = "string", description = "name@version of the inferlet to call"}
+prompt = {type = "string", description = "prompt to pass to the callee"}

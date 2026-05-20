@@ -126,7 +126,7 @@ void gemma2_forward_paged(
     ops::DecodePlanCachePtr decode_plan;
     if (use_decode_path) {
         decode_plan = ops::make_decode_plan();
-        ops::plan_attention_flashinfer_decode_bf16(
+        ops::plan_attention_flashinfer_decode(
             *decode_plan, kv_page_indptr_h, R,
             num_q_heads_local, num_kv_heads_local, d,
             cache.page_size(), attn_ws, stream);
@@ -191,17 +191,11 @@ void gemma2_forward_paged(
             N, num_q_heads_local, num_kv_heads_local, d,
             layer_rope_theta, stream);
 
-        if (use_decode_path) {
-            kernels::launch_write_kv_decode_to_pages_bf16(
-                cache.k(L), cache.v(L), ws.k.data(), ws.v.data(),
-                kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                R, cache.page_size(), num_kv_heads_local, d, stream);
-        } else {
-            kernels::launch_write_kv_to_pages_bf16(
-                cache.k(L), cache.v(L), ws.k.data(), ws.v.data(),
-                qo_indptr, kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                N, R, cache.page_size(), num_kv_heads_local, d, stream);
-        }
+        auto kv_view = cache.layer_view(L);
+        kernels::launch_write_kv_to_pages(
+            kv_view, ws.k.data(), ws.v.data(),
+            qo_indptr, kv_page_indices, kv_page_indptr, kv_last_page_lens,
+            N, R, stream);
 
         const int layer_window_left =
             (!fwd_cfg.per_layer_window_left.empty() &&
@@ -210,26 +204,24 @@ void gemma2_forward_paged(
                 : -1;
 
         if (use_decode_path) {
-            ops::dispatch_attention_flashinfer_decode_bf16(
+            ops::dispatch_attention_flashinfer_decode(
                 *decode_plan,
-                ws.q.data(), cache.k(L), cache.v(L), ws.attn_out.data(),
+                ws.q.data(), kv_view, ws.attn_out.data(),
                 kv_page_indices, kv_page_indptr, kv_last_page_lens,
                 attn_ws, stream, layer_window_left, fwd_cfg.attn_logit_softcap);
         } else if (custom_mask_d) {
-            ops::launch_attention_flashinfer_prefill_custom_bf16(
-                ws.q.data(), cache.k(L), cache.v(L), ws.attn_out.data(),
+            ops::launch_attention_flashinfer_prefill_custom(
+                ws.q.data(), kv_view, ws.attn_out.data(),
                 qo_indptr, kv_page_indices, kv_page_indptr, kv_last_page_lens,
                 custom_mask_d, custom_mask_indptr_d,
                 qo_indptr_h, kv_page_indptr_h,
-                N, R, num_q_heads_local, num_kv_heads_local, d,
-                cache.page_size(), attn_ws, stream);
+                N, R, num_q_heads_local, attn_ws, stream);
         } else {
-            ops::launch_attention_flashinfer_prefill_bf16(
-                ws.q.data(), cache.k(L), cache.v(L), ws.attn_out.data(),
+            ops::launch_attention_flashinfer_prefill(
+                ws.q.data(), kv_view, ws.attn_out.data(),
                 qo_indptr, kv_page_indices, kv_page_indptr, kv_last_page_lens,
                 qo_indptr_h, kv_page_indptr_h,
-                N, R, num_q_heads_local, num_kv_heads_local, d,
-                cache.page_size(), attn_ws, stream,
+                N, R, num_q_heads_local, attn_ws, stream,
                 layer_window_left, fwd_cfg.attn_logit_softcap);
         }
 

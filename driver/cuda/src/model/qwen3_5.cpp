@@ -122,7 +122,7 @@ DeviceTensor slice_la_kkv_blocked(
 
 }  // namespace
 
-Qwen3_5Weights bind_qwen3_5(LoadedModel& engine) {
+Qwen3_5Weights bind_qwen3_5(const LoadedModel& engine) {
     const auto& cfg = engine.hf_config();
     const int L = cfg.num_hidden_layers;
 
@@ -183,8 +183,8 @@ Qwen3_5Weights bind_qwen3_5(LoadedModel& engine) {
         if (kind == "linear_attention") {
             Lw.kind = Qwen3_5LayerWeights::Kind::LinearAttn;
             const std::string la = lp + "linear_attn.";
-            const auto& full_qkv = must(engine, la + "in_proj_qkv.weight");
-            const auto& full_conv_w = must(engine, la + "conv1d.weight");
+            const auto* full_qkv = &must(engine, la + "in_proj_qkv.weight");
+            const auto* full_conv_w = &must(engine, la + "conv1d.weight");
             const auto* full_conv_b = maybe(engine, la + "conv1d.bias");
             // Slice the [K1|K2|V] block layout per-rank when TP > 1; the
             // engine load left these tensors replicated because uniform
@@ -195,10 +195,10 @@ Qwen3_5Weights bind_qwen3_5(LoadedModel& engine) {
             const int V_dim = cfg.linear_num_value_heads * cfg.linear_value_head_dim;
             if (T > 1) {
                 w.owned_bf16_buffers.push_back(
-                    slice_la_kkv_blocked(full_qkv, K_dim, V_dim, rank, T));
+                    slice_la_kkv_blocked(*full_qkv, K_dim, V_dim, rank, T));
                 Lw.la_in_proj_qkv = &w.owned_bf16_buffers.back();
                 w.owned_bf16_buffers.push_back(
-                    slice_la_kkv_blocked(full_conv_w, K_dim, V_dim, rank, T));
+                    slice_la_kkv_blocked(*full_conv_w, K_dim, V_dim, rank, T));
                 Lw.la_conv1d_w = &w.owned_bf16_buffers.back();
                 if (full_conv_b) {
                     w.owned_bf16_buffers.push_back(
@@ -208,8 +208,8 @@ Qwen3_5Weights bind_qwen3_5(LoadedModel& engine) {
                     Lw.la_conv1d_b = nullptr;
                 }
             } else {
-                Lw.la_in_proj_qkv = &full_qkv;
-                Lw.la_conv1d_w = &full_conv_w;
+                Lw.la_in_proj_qkv = full_qkv;
+                Lw.la_conv1d_w = full_conv_w;
                 Lw.la_conv1d_b = full_conv_b;
             }
             Lw.la_in_proj_z   = &must(engine, la + "in_proj_z.weight");

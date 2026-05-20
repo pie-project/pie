@@ -329,6 +329,27 @@ pub fn write_startup_toml(
     insert_str(&mut model, "backend", &options.device);
     insert_table(&mut doc, "model", model);
 
+    let mut batching = toml::Table::new();
+    insert_int(&mut batching, "kv_page_size", options.kv_page_size);
+    insert_int(&mut batching, "total_pages", options.total_pages);
+    insert_int(
+        &mut batching,
+        "max_forward_tokens",
+        options.max_forward_tokens,
+    );
+    insert_int(
+        &mut batching,
+        "max_forward_requests",
+        options.max_forward_requests,
+    );
+    insert_int(&mut batching, "cpu_pages", options.cpu_pages);
+    insert_str(
+        &mut batching,
+        "kv_cache_dtype",
+        options.kv_cache_dtype.clone(),
+    );
+    insert_table(&mut doc, "batching", batching);
+
     let mut runtime = toml::Table::new();
     insert_bool(&mut runtime, "verbose", options.verbose);
     insert_table(&mut doc, "runtime", runtime);
@@ -437,9 +458,9 @@ pub fn write_dummy_startup_toml(
 
 /// Write the cuda driver's startup TOML. Schema mirrors
 /// `driver/cuda/src/config.hpp`: `[model]` with
-/// `hf_repo`/`snapshot_dir`/`device`/`dtype`/optional `runtime_quant`,
-/// `[batching]` with memory planner knobs plus `swap_pool_size`, and
-/// `[runtime]` with the server verbosity flag.
+/// `hf_repo`/`snapshot_dir`/`device`/`dtype`/optional load policy knobs,
+/// `[batching]` with KV-page geometry plus `swap_pool_size`, and `[runtime]`
+/// with the server verbosity flag.
 ///
 /// `[distributed]` is emitted only for TP launches; single-rank uses the
 /// cuda driver's default (`tp_size=1, tp_rank=0`).
@@ -459,6 +480,9 @@ pub(crate) fn write_cuda_startup_toml(
     if !opts.runtime_quant.is_empty() {
         insert_str(&mut model, "runtime_quant", opts.runtime_quant.clone());
     }
+    if !opts.mxfp4_moe.is_empty() && opts.mxfp4_moe != "auto" {
+        insert_str(&mut model, "mxfp4_moe", opts.mxfp4_moe.clone());
+    }
     insert_table(&mut doc, "model", model);
 
     let mut batching = toml::Table::new();
@@ -477,7 +501,9 @@ pub(crate) fn write_cuda_startup_toml(
             CudaMemoryProfile::Capacity => "capacity",
         },
     );
+    insert_int(&mut batching, "kv_page_size", opts.kv_page_size);
     insert_int(&mut batching, "swap_pool_size", opts.swap_pool_size);
+    insert_str(&mut batching, "kv_cache_dtype", opts.kv_cache_dtype.clone());
     insert_table(&mut doc, "batching", batching);
 
     let mut runtime = toml::Table::new();
@@ -1001,10 +1027,10 @@ mod tests {
             val.get("aux_ipc").is_none(),
             "portable no longer emits [aux_ipc]"
         );
-        assert!(
-            val.get("batching").is_none(),
-            "portable capacities are derived by the driver"
-        );
+        assert_eq!(val["batching"]["kv_page_size"].as_integer().unwrap(), 32);
+        assert_eq!(val["batching"]["total_pages"].as_integer().unwrap(), 1024);
+        assert!(val["batching"].get("max_num_kv_pages").is_none());
+        assert_eq!(val["batching"]["kv_cache_dtype"].as_str().unwrap(), "auto");
         assert_eq!(
             val["model"]["hf_path"].as_str().unwrap(),
             snap.to_str().unwrap()
@@ -1039,13 +1065,14 @@ mod tests {
         assert_eq!(val["model"]["device"].as_str().unwrap(), "cuda:0");
         assert_eq!(val["model"]["dtype"].as_str().unwrap(), "bfloat16");
         assert!(val["model"].get("runtime_quant").is_none()); // omitted when empty
-        assert!(val["batching"].get("kv_page_size").is_none());
+        assert_eq!(val["batching"]["kv_page_size"].as_integer().unwrap(), 32);
+        assert_eq!(val["batching"]["kv_cache_dtype"].as_str().unwrap(), "auto");
         assert_eq!(
             val["batching"]["gpu_mem_utilization"].as_float().unwrap(),
             0.90
         );
         assert_eq!(val["batching"]["memory_profile"].as_str().unwrap(), "auto");
-        assert_eq!(val["batching"].as_table().unwrap().len(), 3);
+        assert_eq!(val["batching"].as_table().unwrap().len(), 5);
         assert_eq!(val["batching"]["swap_pool_size"].as_integer().unwrap(), 0);
         assert_eq!(val["runtime"]["verbose"].as_bool().unwrap(), false);
     }
@@ -1081,6 +1108,22 @@ mod tests {
         let val: toml::Value = toml::from_str(&text).unwrap();
         assert_eq!(val["model"]["runtime_quant"].as_str().unwrap(), "fp8");
         assert_eq!(val["model"]["device"].as_str().unwrap(), "cuda:1");
+    }
+
+    #[test]
+    fn cuda_startup_toml_emits_mxfp4_policy_when_non_default() {
+        let tmp = tempfile::tempdir().unwrap();
+        let out = tmp.path().join("cuda.toml");
+        let snap = tmp.path().join("snap");
+        let mut opts = CudaNativeDriverOptions::default();
+        opts.device = "cuda:0".to_string();
+        opts.mxfp4_moe = "bf16".to_string();
+
+        write_cuda_startup_toml(&out, &opts, &snap, 0, None).unwrap();
+
+        let text = std::fs::read_to_string(&out).unwrap();
+        let val: toml::Value = toml::from_str(&text).unwrap();
+        assert_eq!(val["model"]["mxfp4_moe"].as_str().unwrap(), "bf16");
     }
 
     #[test]

@@ -20,14 +20,10 @@
 //   * Q/K/V/O biases. Loaded from the checkpoint and added via
 //     `launch_add_bias_bf16` after each projection.
 //   * MXFP4 expert weights. Stored as packed E2M1 nibbles plus per-32
-//     E8M0 block scales. We dequantise to bf16 at bind time using
-//     `kernels/dequant_fp4` (one launch per expert per layer per
-//     {gate, up, down}). flashinfer ships a fused MXFP4 grouped GEMM
-//     in `gemm/group_gemm_mxfp4_groupwise_sm100.cuh`, but it requires
-//     SM100/SM120 (Blackwell); on Ampere/Hopper we materialise bf16.
-//     Memory cost: ~3·E·L·H·I bytes. For the 20B reference (E=32,
-//     L=24, H=I=2880) that's ~38 GiB — comfortable on an 80 GB GPU
-//     but not on a 40 GB one.
+//     E8M0 block scales in the checkpoint. The target-aware load planner can
+//     keep them resident as QuantPacked MoE tensors for routed runtime
+//     dequant, or lower through an eager BF16 fallback. A true native MXFP4
+//     GEMM backend is represented as a separate target policy.
 //
 // Returns a `MixtralWeights` so the runtime dispatch can reuse
 // `mixtral_forward_paged` directly.
@@ -37,6 +33,6 @@
 
 namespace pie_cuda_driver::model {
 
-MixtralWeights bind_gpt_oss(LoadedModel& engine);
+MixtralWeights bind_gpt_oss(const LoadedModel& engine);
 
 }  // namespace pie_cuda_driver::model

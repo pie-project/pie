@@ -326,7 +326,7 @@ void gemm_fp8_e4m3_w_bf16_act_impl(
     if (!w_scale_fp32_dev) {
         throw std::runtime_error(
             "gemm_act_x_w[FP8_E4M3]: scale pointer is null — "
-            "weight_scale_inv must be registered via LoadedModel::set_quant_meta "
+            "weight_scale_inv must be attached to the materialized WeightStore "
             "as an FP32 device tensor before calling FP8 GEMM");
     }
     auto& ctx = LtCtx::instance();

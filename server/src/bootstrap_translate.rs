@@ -113,6 +113,9 @@ fn build_model(m: &config::ModelConfig, hs: &ModelHandshake) -> pie::bootstrap::
         .map(|g| pie::bootstrap::DriverConfig {
             total_pages: g.caps.total_pages as usize,
             cpu_pages: g.caps.swap_pool_size as usize,
+            rs_cache_required: g.caps.rs_cache_required,
+            rs_cache_slots: g.caps.rs_cache_slots as usize,
+            rs_cache_slot_bytes: g.caps.rs_cache_slot_bytes,
             limits: pie::driver::SchedulerLimits {
                 max_forward_requests: g.caps.max_forward_requests as usize,
                 max_forward_tokens: g.caps.max_forward_tokens as usize,
@@ -167,6 +170,9 @@ mod tests {
             activation_dtype: "bfloat16".into(),
             snapshot_dir: "/tmp/snapshot".into(),
             shmem_name: Some("/pie_shmem_g0".into()),
+            rs_cache_required: false,
+            rs_cache_slots: 0,
+            rs_cache_slot_bytes: 0,
         }
     }
 

@@ -120,9 +120,11 @@ HfConfig parse_hf_config(const std::filesystem::path& path) {
     cfg.rope_original_max_position = cfg.max_position_embeddings;
     cfg.rope_scaling_kind        = HfConfig::RopeScaling::None;
     cfg.has_rope_scaling         = false;
-    if (j.contains("rope_scaling") && j["rope_scaling"].is_object()) {
-        const auto& s = j["rope_scaling"];
-        const std::string rope_type = optional<std::string>(s, "rope_type", "");
+    if (const auto* rope_cfg = pie_driver_common::flat_rope_config_view(j)) {
+        const auto& s = *rope_cfg;
+        cfg.rope_theta = optional<float>(s, "rope_theta", cfg.rope_theta);
+        const std::string rope_type = optional<std::string>(
+            s, "rope_type", optional<std::string>(s, "type", ""));
         const bool has_llama3_keys = s.contains("low_freq_factor") ||
                                      s.contains("high_freq_factor");
         if (rope_type == "llama3" || has_llama3_keys) {

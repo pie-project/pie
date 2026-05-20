@@ -30,6 +30,17 @@ if str(SERVER_SDK) not in sys.path:
 
 BENCH_INFERLET = "text-completion-bench"
 EMBEDDED_CLI_DRIVERS: set[str] = {"cuda_native", "portable", "dummy", "vllm", "sglang", "dev"}
+KV_CACHE_DTYPES = [
+    "auto",
+    "bf16",
+    "bfloat16",
+    "fp8_e4m3",
+    "fp8_e5m2",
+    "int8_per_token_head",
+    "fp8_per_token_head",
+    "fp4_e2m1",
+    "nvfp4",
+]
 
 
 def bench_inferlet_paths() -> tuple[Path, Path, str]:
@@ -72,14 +83,25 @@ def build_config(args: argparse.Namespace):
         driver_options = {
             "gpu_mem_utilization": args.gpu_mem_util,
             "cpu_mem_budget_in_gb": args.cpu_mem_budget,
+            "kv_cache_dtype": args.kv_cache_dtype,
         }
     elif args.driver == "cuda_native":
         driver_options = {
             "gpu_mem_utilization": args.gpu_mem_util,
             "memory_profile": args.memory_profile,
+            "kv_cache_dtype": args.kv_cache_dtype,
         }
+        if args.runtime_quant:
+            driver_options["runtime_quant"] = args.runtime_quant
+        if args.mxfp4_moe:
+            driver_options["mxfp4_moe"] = args.mxfp4_moe
     elif args.driver == "portable":
-        driver_options = {}
+        driver_options = {
+            "max_forward_tokens": args.max_forward_tokens,
+            "max_forward_requests": args.max_forward_requests,
+            "total_pages": args.kv_pages,
+            "kv_cache_dtype": args.kv_cache_dtype,
+        }
     elif args.driver == "vllm":
         driver_options = {
             "gpu_memory_utilization": args.gpu_mem_util,
@@ -102,7 +124,7 @@ def build_config(args: argparse.Namespace):
     else:
         driver_options = {}
 
-    max_concurrent_processes = args.num_requests if args.mode == "tput" else 1
+    max_concurrent_processes = args.concurrency if args.mode == "tput" else 1
     scheduler = args.batch_policy or ("greedy" if args.mode == "latency" else "adaptive")
     scheduler_kwargs = {
         "batch_policy": scheduler,
@@ -457,6 +479,17 @@ def build_parser() -> argparse.ArgumentParser:
             default="auto",
             choices=["auto", "latency", "balanced", "throughput", "capacity"],
         )
+        sp.add_argument("--kv-pages", type=int, default=2048)
+        sp.add_argument("--kv-cache-dtype", choices=KV_CACHE_DTYPES, default="auto")
+        sp.add_argument("--max-forward-tokens", type=int, default=10240)
+        sp.add_argument("--max-forward-requests", type=int, default=512)
+        sp.add_argument("--runtime-quant", choices=["fp8", "int8"], default=None)
+        sp.add_argument(
+            "--mxfp4-moe",
+            choices=["auto", "routed_dequant", "packed", "bf16", "dequant", "eager_bf16", "native"],
+            default=None,
+        )
+        sp.add_argument("--portable-n-gpu-layers", type=int, default=-1)
         sp.add_argument("--worker-threads", type=int, default=None)
         sp.add_argument("--token-budget", type=int, default=None)
         sp.add_argument("--auto-token-budget", action=argparse.BooleanOptionalAction, default=False)
@@ -483,7 +516,6 @@ def build_parser() -> argparse.ArgumentParser:
                  "or adaptive (tput).",
         )
         sp.add_argument("--vllm-attention-backend", default=None)
-        sp.add_argument("--sglang-attention-backend", default=None)
         sp.add_argument("--pie-bin", default=str(ROOT / "target" / "release" / "pie"))
         sp.add_argument("--server-startup-timeout", type=float, default=300.0)
         sp.add_argument("--venv", default=None,

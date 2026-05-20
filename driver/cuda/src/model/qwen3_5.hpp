@@ -72,11 +72,10 @@ struct Qwen3_5LayerWeights {
     const DeviceTensor* up_proj   = nullptr;  // [I, H] bf16
     const DeviceTensor* down_proj = nullptr;  // [H, I] bf16
 
-    // Optional QuantMeta companions for the GEMM-fed projections —
-    // populated when runtime_quant or an offline-quantized checkpoint
-    // tags these weights via `LoadedModel::set_quant_meta`. Linear-attn
-    // weights stay bf16 for now (their fused [K1|K2|V] block layout
-    // needs per-block scale handling that isn't wired yet).
+    // Optional QuantMeta companions for the GEMM-fed projections. The
+    // materialized WeightStore owns this metadata after load-plan execution.
+    // Linear-attn weights stay bf16 for now (their fused [K1|K2|V] block
+    // layout needs per-block scale handling that isn't wired yet).
     std::optional<QuantMeta> fa_q_proj_quant;
     std::optional<QuantMeta> fa_k_proj_quant;
     std::optional<QuantMeta> fa_v_proj_quant;
@@ -86,7 +85,7 @@ struct Qwen3_5LayerWeights {
     std::optional<QuantMeta> down_proj_quant;
 
     // KV cache slot for full-attn layers; -1 for linear-attn layers
-    // (their state lives in the recurrent/conv state caches).
+    // (their state lives in the recurrent/conv rs_cache slabs).
     int kv_layer = -1;
 };
 
@@ -112,6 +111,6 @@ struct Qwen3_5Weights {
     std::vector<DeviceTensor> owned_bf16_buffers;
 };
 
-Qwen3_5Weights bind_qwen3_5(LoadedModel& engine);
+Qwen3_5Weights bind_qwen3_5(const LoadedModel& engine);
 
 }  // namespace pie_cuda_driver::model

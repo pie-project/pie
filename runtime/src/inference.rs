@@ -158,6 +158,12 @@ impl ForwardOutput {
     }
 }
 
+impl From<pie_bridge::ForwardResponse> for ForwardOutput {
+    fn from(resp: pie_bridge::ForwardResponse) -> Self {
+        Self::Response(resp)
+    }
+}
+
 /// Returns aggregated inference stats for a model (lock-free, non-blocking).
 pub async fn get_stats(model_idx: usize) -> InferenceStats {
     let (tx, rx) = oneshot::channel();
@@ -370,7 +376,9 @@ impl ServiceHandler for InferenceService {
                 let scheduler_handle = self.schedulers[idx].handle();
                 let staged_batch_arc = self.staged_batch[idx].clone();
                 let request_clone = request.clone();
-                let speculation_depth = if crate::context::pinned_count(idx) > 1 {
+                let speculation_depth = if crate::context::pinned_count(idx) <= 1
+                    && request_clone.rs_slot_ids.is_empty()
+                {
                     self.speculation_depth
                 } else {
                     0

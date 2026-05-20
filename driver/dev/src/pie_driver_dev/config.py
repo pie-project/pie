@@ -20,6 +20,7 @@ from dataclasses import dataclass
 import torch
 
 from ._bridge.config import RuntimeConfig, _resolve_universal_kwargs
+from .kv_cache import parse_kv_cache_dtype
 
 
 # Valid weight dtype categories.
@@ -46,6 +47,9 @@ class NativeRuntimeConfig(RuntimeConfig):
     # Memory + KV layout
     gpu_mem_utilization: float = 0.8
     kv_page_size: int = DEFAULT_KV_PAGE_SIZE
+    kv_cache_dtype: str = "auto"
+    max_forward_tokens: int = 10240
+    max_forward_requests: int = 512
 
     max_dist_size: int = 32
     max_num_embeds: int = 128
@@ -112,6 +116,10 @@ class NativeRuntimeConfig(RuntimeConfig):
         cpu_mem_budget_in_gb: int = 0,
         # native-specific
         gpu_mem_utilization: float = 0.8,
+        kv_page_size: int = DEFAULT_KV_PAGE_SIZE,
+        kv_cache_dtype: str = "auto",
+        max_forward_tokens: int = 10240,
+        max_forward_requests: int = 512,
         max_dist_size: int = 32,
         max_num_embeds: int = 128,
         max_num_adapters: int = 32,
@@ -125,6 +133,7 @@ class NativeRuntimeConfig(RuntimeConfig):
                 f"Invalid weight_dtype: '{weight_dtype}'. "
                 f"Expected one of: {sorted(FLOAT_DTYPES | QUANT_DTYPES)}"
             )
+        parse_kv_cache_dtype(kv_cache_dtype)
 
         # Pre-resolve devices when not explicitly supplied — flavor-side
         # torch probing belongs here, not in bridge.
@@ -148,7 +157,10 @@ class NativeRuntimeConfig(RuntimeConfig):
         return cls(
             **universal,
             gpu_mem_utilization=gpu_mem_utilization,
-            kv_page_size=derive_kv_page_size(),
+            kv_page_size=kv_page_size,
+            kv_cache_dtype=kv_cache_dtype,
+            max_forward_tokens=max_forward_tokens,
+            max_forward_requests=max_forward_requests,
             max_dist_size=max_dist_size,
             max_num_embeds=max_num_embeds,
             max_num_adapters=max_num_adapters,
@@ -174,5 +186,9 @@ class NativeDriverConfig:
     max_num_embeds: int = 128
     max_num_adapters: int = 32
     max_adapter_rank: int = 8
+    kv_page_size: int = DEFAULT_KV_PAGE_SIZE
+    kv_cache_dtype: str = "auto"
+    max_forward_tokens: int = 10240
+    max_forward_requests: int = 512
     weight_dtype: str = "auto"
     cpu_mem_budget_in_gb: int = 0

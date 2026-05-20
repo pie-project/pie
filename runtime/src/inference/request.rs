@@ -60,6 +60,8 @@ pub fn new_per_request(
         kv_page_indptr: vec![0],
         kv_last_page_lens: Vec::new(),
         qo_indptr: vec![0, n_tokens],
+        rs_slot_ids: Vec::new(),
+        rs_slot_flags: Vec::new(),
         masks,
         mask_indptr: vec![0, n_masks],
         logit_masks,
@@ -362,6 +364,12 @@ pub fn append_request_with_options(
         .push(batch.kv_page_indices.len() as u32);
     batch.kv_last_page_lens.push(last_page_len);
     batch.qo_indptr.push(batch.token_ids.len() as u32);
+
+    // Recurrent-state cache layout. For rs_cache models this carries
+    // one runtime-assigned slot and one flag byte per request; for
+    // regular KV-only models both vectors stay empty.
+    batch.rs_slot_ids.extend(&req.rs_slot_ids);
+    batch.rs_slot_flags.extend(&req.rs_slot_flags);
 
     // Attention masks. The runtime synthesizes causal masks for every
     // request so context lineage remains explicit, but pure single-token

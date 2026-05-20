@@ -13,7 +13,7 @@ Procedure (one server / one model load):
 
   2. Submit the SAME prompts CONCURRENTLY (asyncio.gather + greedy batch
      policy) — drives the driver into multi-request fires (R>1 prefill
-     and/or R>1 decode), exercising the slot allocator, per-slot
+     and/or R>1 decode), exercising runtime-managed rs_cache slots, per-slot
      state-cache reset, and the batched linear-attn kernels.
 
   3. Pass criteria:
@@ -29,7 +29,7 @@ Procedure (one server / one model load):
         That is a property of the underlying attention kernels, not of
         the multi-request batching layer this test exists to verify.
 
-A real bug in the slot allocator / per-slot reset / batched-kernel
+A real bug in rs_cache slot assignment / per-slot reset / batched-kernel
 offset arithmetic would manifest as nonsense output (not just an early
 argmax flip): incoherent text, wrong language, or repetitive garbage
 from reading another request's state.
@@ -124,7 +124,7 @@ async def run_test(args) -> int:
         return 2
 
     cfg = Config(
-        server=ServerConfig(port=0),
+        server=ServerConfig(port=0, verbose=args.server_verbose),
         auth=AuthConfig(enabled=False),
         telemetry=TelemetryConfig(),
         runtime=RuntimeConfig(wasm_max_instances=4096),
@@ -196,7 +196,7 @@ async def run_test(args) -> int:
         for i, text in enumerate(stress_outputs):
             print(f"  [{i}] {len(text)} chars", flush=True)
 
-        # Phase 2c: high-fanout pass. The CUDA planner now derives slot
+        # Phase 2c: high-fanout pass. The runtime now owns rs_cache slot
         # count, so this cannot force an exact eviction count; it still
         # keeps many contexts live concurrently and exercises reassignment
         # on constrained cards.
@@ -306,8 +306,8 @@ def main() -> int:
                     help="Comma-separated device list. With --tp-size N, N "
                          "devices must be listed (e.g. cuda:0,cuda:1).")
     ap.add_argument("--tp-size", type=int, default=1,
-                    help="Tensor-parallel rank count. Verifies the slot "
-                         "allocator + broadcast wiring under TP>1 by running "
+                    help="Tensor-parallel rank count. Verifies rs_cache "
+                         "slot ids + broadcast wiring under TP>1 by running "
                          "the same sequential-vs-concurrent comparison.")
     ap.add_argument("--max-tokens", type=int, default=40)
     ap.add_argument("--max-forward-requests", type=int, default=32,
@@ -322,6 +322,8 @@ def main() -> int:
     ap.add_argument("--gpu-mem-util", type=float, default=0.90)
     ap.add_argument("--memory-profile", default="balanced",
                     choices=["latency", "balanced", "throughput", "capacity"])
+    ap.add_argument("--server-verbose", action="store_true",
+                    help="Enable embedded driver verbose logs.")
     args = ap.parse_args()
     return asyncio.run(run_test(args))
 
