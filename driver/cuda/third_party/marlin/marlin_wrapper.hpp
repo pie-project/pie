@@ -49,6 +49,21 @@ void launch_gptq_gemm_w4a16_bf16(
     bool        use_fp32_reduce,
     cudaStream_t stream);
 
+/// Compute `out = act @ dequant(W_mxfp4)^T` with GPT-OSS MXFP4 weights.
+/// Activation dtype = bf16. Weight values are FE2M1 packed in Marlin's W4
+/// layout; scales are raw E8M0 bytes in Marlin's `[K / 32, N]` scale layout.
+void launch_mxfp4_gemm_w4a16_bf16(
+    const void* act_bf16,        // [M, K] bf16
+    const void* w_mxfp4_packed,  // marlin-repacked FE2M1
+    const void* scales_e8m0,     // [K / 32, N] E8M0 bytes
+    void*       out_bf16,        // [M, N] bf16
+    void*       reduce_scratch,  // fp32 split-K scratch
+    void*       workspace,       // device scratch
+    int         M,
+    int         N,
+    int         K,
+    cudaStream_t stream);
+
 /// Required device workspace size for the gptq_gemm path. Conservative
 /// upper bound; safe to allocate once at engine init.
 std::size_t marlin_gptq_workspace_bytes(int M, int N, int K, int group_size);

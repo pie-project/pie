@@ -146,7 +146,7 @@ Qwen3Weights bind_llama_like(const LoadedModel& engine, bool verbose) {
 Qwen3Weights bind_phi3(const LoadedModel& engine) {
     const auto& cfg = engine.hf_config();
 
-    // The load plan always splits Phi-3 fused QKV and gate/up checkpoint
+    // The Rust loader always splits Phi-3 fused QKV and gate/up checkpoint
     // tensors into the canonical Llama-like names before binding.
     for (int i = 0; i < cfg.num_hidden_layers; ++i) {
         const std::string p = "model.layers." + std::to_string(i) + ".";
@@ -154,13 +154,13 @@ Qwen3Weights bind_phi3(const LoadedModel& engine) {
             !engine.has(p + "self_attn.k_proj.weight") ||
             !engine.has(p + "self_attn.v_proj.weight")) {
             throw std::runtime_error(
-                "bind_phi3: load plan did not materialize q/k/v projections");
+                "bind_phi3: storage loader did not materialize q/k/v projections");
         }
 
         if (!engine.has(p + "mlp.gate_proj.weight") ||
             !engine.has(p + "mlp.up_proj.weight")) {
             throw std::runtime_error(
-                "bind_phi3: load plan did not materialize gate/up projections");
+                "bind_phi3: storage loader did not materialize gate/up projections");
         }
     }
     return bind_llama_like(engine);

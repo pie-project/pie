@@ -7,7 +7,7 @@
 #include <unordered_map>
 #include <utility>
 
-#include "loader/load_plan.hpp"
+#include "loader/tensor_spec.hpp"
 #include "tensor.hpp"
 
 namespace pie_cuda_driver {
@@ -22,6 +22,8 @@ class WeightStoreBuilder;
 struct QuantMeta {
     enum class Kind { PerTensor, PerChannel, PerGroup };
     Kind kind = Kind::PerTensor;
+    std::string scale_name;
+    std::string zero_point_name;
     const DeviceTensor* scale = nullptr;
     const DeviceTensor* zero_point = nullptr;
     int group_size = 0;
@@ -29,7 +31,7 @@ struct QuantMeta {
 };
 
 struct TensorRecord {
-    TensorSpec spec;
+    TensorDecl spec;
     DeviceTensor tensor;
     bool has_spec = false;
 
@@ -66,8 +68,16 @@ public:
     WeightStore() = default;
     WeightStore(const WeightStore&) = delete;
     WeightStore& operator=(const WeightStore&) = delete;
-    WeightStore(WeightStore&&) noexcept = default;
-    WeightStore& operator=(WeightStore&&) noexcept = default;
+    WeightStore(WeightStore&& other) noexcept { move_from(other); }
+    WeightStore& operator=(WeightStore&& other) noexcept {
+        if (this != &other) {
+            tensors_.clear();
+            quant_meta_.clear();
+            finalized_ = false;
+            move_from(other);
+        }
+        return *this;
+    }
 
     std::size_t size() const noexcept { return tensors_.size(); }
     bool empty() const noexcept { return tensors_.empty(); }
@@ -112,9 +122,9 @@ private:
     iterator erase(iterator it);
     std::size_t erase(const std::string& name);
     void insert(std::string name, DeviceTensor tensor);
-    void insert(std::string name, DeviceTensor tensor, TensorSpec spec);
+    void insert(std::string name, DeviceTensor tensor, TensorDecl spec);
     void replace(std::string name, DeviceTensor tensor);
-    void replace(std::string name, DeviceTensor tensor, TensorSpec spec);
+    void replace(std::string name, DeviceTensor tensor, TensorDecl spec);
     void set_quant_meta(const std::string& name, QuantMeta meta);
 
     bool owns_tensor_handle(const DeviceTensor* tensor) const noexcept;
@@ -123,7 +133,8 @@ private:
     void validate_erase_allowed(const std::string& name) const;
     void ensure_mutable() const;
     void finalize();
-    static TensorSpec default_spec_for(
+    void move_from(WeightStore& other) noexcept;
+    static TensorDecl default_spec_for(
         const std::string& name,
         const DeviceTensor& tensor);
 
@@ -161,13 +172,13 @@ public:
     void insert(std::string name, DeviceTensor tensor) {
         store_.insert(std::move(name), std::move(tensor));
     }
-    void insert(std::string name, DeviceTensor tensor, TensorSpec spec) {
+    void insert(std::string name, DeviceTensor tensor, TensorDecl spec) {
         store_.insert(std::move(name), std::move(tensor), std::move(spec));
     }
     void replace(std::string name, DeviceTensor tensor) {
         store_.replace(std::move(name), std::move(tensor));
     }
-    void replace(std::string name, DeviceTensor tensor, TensorSpec spec) {
+    void replace(std::string name, DeviceTensor tensor, TensorDecl spec) {
         store_.replace(std::move(name), std::move(tensor), std::move(spec));
     }
     std::size_t erase(const std::string& name) {

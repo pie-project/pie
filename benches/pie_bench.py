@@ -6,6 +6,7 @@ import asyncio
 import contextlib
 import inspect
 import json
+import os
 import socket
 import sys
 import time
@@ -221,6 +222,11 @@ async def cli_pie_client(args: argparse.Namespace):
     server_lines: list[str] = startup_lines
     drain_task: asyncio.Task[None] | None = None
     token: str | None = None
+    server_log_file = None
+    if server_log_path := os.environ.get("PIE_BENCH_SERVER_LOG"):
+        path = Path(server_log_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        server_log_file = path.open("w", encoding="utf-8")
 
     def should_surface_server_line(txt: str) -> bool:
         return (
@@ -253,6 +259,9 @@ async def cli_pie_client(args: argparse.Namespace):
             txt = line.decode("utf-8", errors="replace")
             server_lines.append(txt)
             del server_lines[:-200]
+            if server_log_file is not None:
+                server_log_file.write(txt)
+                server_log_file.flush()
             # Surface per-fire timing and server diagnostics the moment
             # they land; otherwise keep the server log buffered for
             # startup/failure messages.
@@ -264,10 +273,16 @@ async def cli_pie_client(args: argparse.Namespace):
         assert proc.stdout is not None
         deadline = time.perf_counter() + args.server_startup_timeout
         while time.perf_counter() < deadline:
-            line = await asyncio.wait_for(
-                proc.stdout.readline(),
-                timeout=max(0.1, deadline - time.perf_counter()),
-            )
+            try:
+                line = await asyncio.wait_for(
+                    proc.stdout.readline(),
+                    timeout=max(0.1, deadline - time.perf_counter()),
+                )
+            except asyncio.TimeoutError as exc:
+                raise TimeoutError(
+                    "timed out waiting for pie serve startup:\n"
+                    + "".join(startup_lines[-80:])
+                ) from exc
             if not line:
                 raise RuntimeError(
                     "pie serve exited before startup completed:\n"
@@ -275,6 +290,9 @@ async def cli_pie_client(args: argparse.Namespace):
                 )
             text = line.decode("utf-8", errors="replace")
             startup_lines.append(text)
+            if server_log_file is not None:
+                server_log_file.write(text)
+                server_log_file.flush()
             if should_surface_server_line(text):
                 sys.stderr.write(text)
                 sys.stderr.flush()
@@ -312,6 +330,8 @@ async def cli_pie_client(args: argparse.Namespace):
             drain_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await drain_task
+        if server_log_file is not None:
+            server_log_file.close()
 
 
 def pie_client(args: argparse.Namespace):

@@ -73,7 +73,7 @@ struct Qwen3_5LayerWeights {
     const DeviceTensor* down_proj = nullptr;  // [H, I] bf16
 
     // Optional QuantMeta companions for the GEMM-fed projections. The
-    // materialized WeightStore owns this metadata after load-plan execution.
+    // materialized WeightStore owns this metadata after storage-program execution.
     // Linear-attn weights stay bf16 for now (their fused [K1|K2|V] block
     // layout needs per-block scale handling that isn't wired yet).
     std::optional<QuantMeta> fa_q_proj_quant;

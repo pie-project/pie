@@ -20,6 +20,7 @@ set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib)
 set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib)
 
 find_package(CUDAToolkit REQUIRED)
+find_package(Threads REQUIRED)
 
 if(NOT PIE_BRIDGE_INCLUDE_DIR)
   set(PIE_BRIDGE_INCLUDE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../bridge/include")
@@ -106,12 +107,8 @@ add_library(pie_driver_cuda_lib STATIC
   src/model/loaded_model.cpp
   src/model/bound_model.cpp
   ../common/src/safetensors_manifest.cpp
+  src/loader/gguf_source.cpp
   src/loader/hf_config.cpp
-  src/loader/byte_source.cpp
-  src/loader/load_plan.cpp
-  src/loader/materializer.cpp
-  src/loader/model_schema.cpp
-  src/loader/physical_load_plan.cpp
   src/loader/safetensors.cpp
   src/model/qwen3.cpp
   src/model/qwen3_forward.cpp
@@ -151,6 +148,7 @@ add_library(pie_driver_cuda_lib STATIC
   src/kernels/softcap.cu
   src/kernels/scalar_mul.cu
   src/kernels/dequant_fp4.cu
+  src/kernels/mxfp4_marlin.cu
   src/kernels/dequant_fp8.cu
   src/kernels/dtype_cast.cu
   src/kernels/quant_bf16_to_fp8.cu
@@ -175,8 +173,40 @@ add_library(pie_driver_cuda_lib STATIC
   ${PIE_CUDA_FLASHINFER_HOPPER_SOURCE}
 )
 
+find_program(CARGO_EXECUTABLE cargo REQUIRED)
+set(PIE_WORKSPACE_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../..")
+set(PIE_WEIGHT_LOADER_MANIFEST
+    "${PIE_WORKSPACE_ROOT}/driver/weight_loader/Cargo.toml")
+set(PIE_WEIGHT_LOADER_STATICLIB_PATH
+    "${PIE_WORKSPACE_ROOT}/target/release/libpie_weight_loader.a")
+add_custom_target(pie_weight_loader_staticlib
+  COMMAND "${CARGO_EXECUTABLE}" build
+          --manifest-path "${PIE_WEIGHT_LOADER_MANIFEST}"
+          --release
+  WORKING_DIRECTORY "${PIE_WORKSPACE_ROOT}"
+  BYPRODUCTS "${PIE_WEIGHT_LOADER_STATICLIB_PATH}"
+  COMMENT "Building Rust weight-loader static library")
+add_library(pie_weight_loader_static STATIC IMPORTED GLOBAL)
+set_target_properties(pie_weight_loader_static PROPERTIES
+  IMPORTED_LOCATION "${PIE_WEIGHT_LOADER_STATICLIB_PATH}")
+add_dependencies(pie_weight_loader_static pie_weight_loader_staticlib)
+
+set(PIE_WEIGHT_LOADER_SYSTEM_LIBS Threads::Threads ${CMAKE_DL_LIBS} m)
+if(UNIX AND NOT APPLE)
+  list(APPEND PIE_WEIGHT_LOADER_SYSTEM_LIBS rt util)
+endif()
+
 add_executable(pie_driver_cuda src/main.cpp)
-target_link_libraries(pie_driver_cuda PRIVATE pie_driver_cuda_lib)
+target_link_libraries(pie_driver_cuda PRIVATE
+  pie_driver_cuda_lib
+  # The C++ declarations are weak so server builds can link the CUDA driver
+  # archive before Cargo supplies Rust symbols. For the standalone parity
+  # binary, force the Rust staticlib into the link; weak references alone do
+  # not cause archive extraction.
+  "-Wl,--whole-archive"
+  pie_weight_loader_static
+  "-Wl,--no-whole-archive"
+  ${PIE_WEIGHT_LOADER_SYSTEM_LIBS})
 
 target_compile_options(pie_driver_cuda_lib PRIVATE
   $<$<COMPILE_LANGUAGE:CUDA>:
@@ -211,16 +241,14 @@ target_include_directories(pie_driver_cuda_lib
     ${flashinfer_SOURCE_DIR}/3rdparty/cutlass/tools/util/include
     ${flashinfer_SOURCE_DIR}/3rdparty/spdlog/include)
 
-# ── Marlin (W4A16 GEMM via vendored vLLM kernel) ─────────────────────
-# Off by default while M3 plumbing lands. Vendored sources live under
-# `third_party/marlin/`; the wrapper exposes a torch-free C++ API.
-# Compile cost is ~3 minutes on first build (heavy templates) so we
-# gate it behind an explicit switch until a model actually uses it.
-option(PIE_CUDA_BUILD_MARLIN "Build vendored marlin W4A16 GEMM" OFF)
+# ── Marlin (W4A16 / MXFP4 GEMM via vendored vLLM kernel) ──────────────
+# Built by default because GPT-OSS MXFP4 auto policy should use native
+# packed-weight GEMM on supported GPUs and fall back only on legacy targets.
+# Vendored sources live under `third_party/marlin/`; the wrapper exposes a
+# torch-free C++ API.
+option(PIE_CUDA_BUILD_MARLIN "Build vendored marlin W4A16/MXFP4 GEMM" ON)
 if(PIE_CUDA_BUILD_MARLIN)
-    # Include the generated per-arch kernel instantiations alongside the
-    # core driver. `generate_kernels.py` produced sm80 variants targeting
-    # A100; rerun with a different arch to add Hopper / Ada coverage.
+	    # Include the generated kernel instantiations alongside the core driver.
     file(GLOB MARLIN_SM_KERNELS
         "${CMAKE_CURRENT_SOURCE_DIR}/third_party/marlin/sm*_kernel_*.cu")
     target_sources(pie_driver_cuda_lib PRIVATE
@@ -298,15 +326,14 @@ target_include_directories(test_swap_pool PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(test_swap_pool PRIVATE CUDA::cudart)
 
-add_executable(test_load_plan
-  tests/test_load_plan.cpp
-  src/loader/load_plan.cpp
-  src/loader/model_schema.cpp
-  src/loader/physical_load_plan.cpp)
-target_include_directories(test_load_plan PRIVATE
-  ${CMAKE_CURRENT_SOURCE_DIR}/src
-  ${CMAKE_CURRENT_SOURCE_DIR}/../common/include)
-target_link_libraries(test_load_plan PRIVATE tomlplusplus::tomlplusplus)
+add_executable(test_mxfp4_marlin
+  tests/test_mxfp4_marlin.cu
+  src/kernels/mxfp4_marlin.cu)
+target_include_directories(test_mxfp4_marlin PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_compile_options(test_mxfp4_marlin PRIVATE
+  $<$<COMPILE_LANGUAGE:CUDA>: --extended-lambda --expt-relaxed-constexpr >)
+target_link_libraries(test_mxfp4_marlin PRIVATE CUDA::cudart)
 
 enable_testing()
 add_test(NAME brle COMMAND test_brle)
@@ -315,7 +342,7 @@ add_test(NAME driver_common COMMAND test_driver_common)
 add_test(NAME kv_cache_format COMMAND test_kv_cache_format)
 add_test(NAME kv_cache_quant COMMAND test_kv_cache_quant)
 add_test(NAME swap_pool COMMAND test_swap_pool)
-add_test(NAME load_plan COMMAND test_load_plan)
+add_test(NAME mxfp4_marlin COMMAND test_mxfp4_marlin)
 
 target_link_libraries(pie_driver_cuda_lib PUBLIC
   CLI11::CLI11
@@ -323,6 +350,7 @@ target_link_libraries(pie_driver_cuda_lib PUBLIC
   zstd
   nlohmann_json::nlohmann_json
   rt
+  dl
   CUDA::cudart
   CUDA::cublas
   CUDA::cublasLt

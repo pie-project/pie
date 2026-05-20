@@ -1,7 +1,9 @@
 #include "model/mixtral.hpp"
 
 #include <algorithm>
+#include <cstdint>
 #include <stdexcept>
+#include <string>
 #include <vector>
 
 #include <cuda_runtime.h>
@@ -11,6 +13,7 @@
 #include "kernels/add_bias.hpp"
 #include "kernels/attn_sink.hpp"
 #include "kernels/dequant_fp4.hpp"
+#include "kernels/deinterleave.hpp"
 #include "kernels/embed.hpp"
 #include "kernels/gather_rows.hpp"
 #include "kernels/residual_add.hpp"
@@ -146,6 +149,9 @@ void mixtral_forward_paged(
     const int Hq = (cfg.num_attention_heads * cfg.head_dim) / T;
     const int Hk = (cfg.num_key_value_heads * cfg.head_dim) / T;
     const int I  = cfg.intermediate_size / T;
+    const int Ip = (w.mxfp4_intermediate_padded > I)
+        ? w.mxfp4_intermediate_padded
+        : I;
     const int num_q_heads_local  = cfg.num_attention_heads / T;
     const int num_kv_heads_local = cfg.num_key_value_heads / T;
     const int V  = cfg.vocab_size;
@@ -201,8 +207,8 @@ void mixtral_forward_paged(
     // that bound to avoid re-allocating inside the layer loop.
     const std::size_t max_routed = static_cast<std::size_t>(N) * top_k;
     auto d_expert_in    = DeviceBuffer<std::uint16_t>::alloc(max_routed * H);
-    auto d_expert_gate  = DeviceBuffer<std::uint16_t>::alloc(max_routed * I);
-    auto d_expert_up    = DeviceBuffer<std::uint16_t>::alloc(max_routed * I);
+    auto d_expert_gate  = DeviceBuffer<std::uint16_t>::alloc(max_routed * Ip);
+    auto d_expert_up    = DeviceBuffer<std::uint16_t>::alloc(max_routed * Ip);
     auto d_expert_out   = DeviceBuffer<std::uint16_t>::alloc(max_routed * H);
     auto d_expert_idx   = DeviceBuffer<std::int32_t>::alloc(max_routed);
     auto d_expert_w     = DeviceBuffer<float>::alloc(max_routed);
@@ -387,10 +393,60 @@ void mixtral_forward_paged(
             const void* gate_w = nullptr;
             const void* up_w = nullptr;
             const void* down_w = nullptr;
+            if (expert.format == MixtralExpertWeightFormat::Mxfp4NativeGemm) {
+                if (!expert.w_gate_mxfp4 || !expert.w_gate_mxfp4_scale ||
+                    !expert.w_up_mxfp4 || !expert.w_up_mxfp4_scale ||
+                    !expert.w_down_mxfp4 || !expert.w_down_mxfp4_scale) {
+                    throw std::runtime_error(
+                        "mixtral/gpt_oss: incomplete native MXFP4 expert backend");
+                }
+                ops::gemm_act_x_w(cublas.handle(),
+                    d_expert_in.data(),
+                    ops::WeightView::mxfp4_marlin(
+                        *expert.w_gate_mxfp4, *expert.w_gate_mxfp4_scale),
+                    d_expert_gate.data(), Ne, Ip, H);
+                ops::gemm_act_x_w(cublas.handle(),
+                    d_expert_in.data(),
+                    ops::WeightView::mxfp4_marlin(
+                        *expert.w_up_mxfp4, *expert.w_up_mxfp4_scale),
+                    d_expert_up.data(), Ne, Ip, H);
+                if (expert.b_gate) kernels::launch_add_bias_bf16_strided(
+                    d_expert_gate.data(), expert.b_gate->data(), Ne, I, Ip,
+                    stream);
+                if (expert.b_up) kernels::launch_add_bias_bf16_strided(
+                    d_expert_up.data(), expert.b_up->data(), Ne, I, Ip,
+                    stream);
+                if (cfg.swiglu_limit > 0.f) {
+                    kernels::launch_gpt_oss_glu_bf16(
+                        d_expert_gate.data(), d_expert_up.data(),
+                        d_expert_gate.data(),
+                        static_cast<int>(static_cast<std::size_t>(Ne) * Ip), stream,
+                        /*limit=*/cfg.swiglu_limit);
+                } else {
+                    kernels::launch_swiglu_bf16(
+                        d_expert_gate.data(), d_expert_up.data(),
+                        d_expert_gate.data(),
+                        static_cast<std::size_t>(Ne) * Ip, stream);
+                }
+                ops::gemm_act_x_w(cublas.handle(),
+                    d_expert_gate.data(),
+                    ops::WeightView::mxfp4_marlin(
+                        *expert.w_down_mxfp4, *expert.w_down_mxfp4_scale),
+                    d_expert_out.data(), Ne, H, Ip);
+                if (expert.b_down && tp_is_leader) kernels::launch_add_bias_bf16(
+                    d_expert_out.data(), expert.b_down->data(), Ne, H, stream);
+                kernels::launch_scatter_add_weighted_bf16(
+                    moe_target, d_expert_out.data(),
+                    d_expert_idx.data(), d_expert_w.data(),
+                    Ne, H, stream);
+                continue;
+            }
             if (expert.format == MixtralExpertWeightFormat::Mxfp4RoutedDequant) {
                 if (!expert.w_gate_up || !expert.w_gate_up_scale ||
                     !expert.w_down_packed || !expert.w_down_scale ||
                     w.mxfp4_gate_up_bf16_scratch.empty() ||
+                    w.mxfp4_gate_bf16_scratch.empty() ||
+                    w.mxfp4_up_bf16_scratch.empty() ||
                     w.mxfp4_down_bf16_scratch.empty()) {
                     throw std::runtime_error(
                         "mixtral/gpt_oss: incomplete MXFP4 expert backend");
@@ -408,11 +464,13 @@ void mixtral_forward_paged(
                         expert.w_down_scale->data()),
                     w.mxfp4_down_bf16_scratch.data(),
                     H, I, stream);
-                gate_w = w.mxfp4_gate_up_bf16_scratch.data();
-                up_w = static_cast<const std::uint8_t*>(
-                    w.mxfp4_gate_up_bf16_scratch.data()) +
-                    static_cast<std::size_t>(I) *
-                    static_cast<std::size_t>(H) * sizeof(std::uint16_t);
+                kernels::launch_deinterleave_rows_bf16(
+                    w.mxfp4_gate_up_bf16_scratch.data(),
+                    w.mxfp4_gate_bf16_scratch.data(),
+                    w.mxfp4_up_bf16_scratch.data(),
+                    I, H, stream);
+                gate_w = w.mxfp4_gate_bf16_scratch.data();
+                up_w = w.mxfp4_up_bf16_scratch.data();
                 down_w = w.mxfp4_down_bf16_scratch.data();
             } else {
                 gate_w = expert.w_gate->data();

@@ -11,10 +11,8 @@
 
 #include "cuda_check.hpp"
 #include "distributed.hpp"
-#include "loader/load_plan.hpp"
-#include "loader/materializer.hpp"
-#include "loader/model_schema.hpp"
-#include "loader/physical_load_plan.hpp"
+#include "loader/rust_loader_bridge.hpp"
+#include "loader/rust_storage_executor.hpp"
 
 namespace pie_cuda_driver {
 
@@ -52,11 +50,15 @@ bool is_qwen3_5_moe_arch(const std::string& mt) {
 
 Mxfp4MoeLowering select_mxfp4_moe_lowering(
     const ModelConfig& model_cfg,
-    const LoadTarget& target)
+    const BackendTarget& target)
 {
     const std::string& policy = model_cfg.mxfp4_moe;
-    if (policy.empty() || policy == "auto" ||
-        policy == "routed_dequant" || policy == "packed") {
+    if (policy.empty() || policy == "auto") {
+        return target.mxfp4_native_gemm
+            ? Mxfp4MoeLowering::NativeGemm
+            : Mxfp4MoeLowering::RoutedDequant;
+    }
+    if (policy == "routed_dequant" || policy == "packed") {
         return Mxfp4MoeLowering::RoutedDequant;
     }
     if (policy == "bf16" || policy == "dequant" ||
@@ -80,6 +82,8 @@ Mxfp4MoeLowering select_mxfp4_moe_lowering(
 }  // namespace
 
 LoadedModel LoadedModel::load(const Config& boot_cfg, NcclComm* tp_comm) {
+    (void)tp_comm;
+
     if (boot_cfg.model.snapshot_dir.empty()) {
         throw std::runtime_error(
             "engine: model.snapshot_dir is empty — pass it in dev.toml or "
@@ -121,21 +125,26 @@ LoadedModel LoadedModel::load(const Config& boot_cfg, NcclComm* tp_comm) {
     }
 #ifdef PIE_CUDA_HAS_MARLIN
     const bool gptq_marlin_int4 = true;
+    // Native MXFP4 expert execution requires a Blackwell-class FP4 path.
+    // Older GPUs keep packed MXFP4 resident but use routed BF16 dequant
+    // scratch for the selected experts.
+    const bool mxfp4_native_gemm = dev_prop.major >= 10;
 #else
     const bool gptq_marlin_int4 = false;
+    const bool mxfp4_native_gemm = false;
 #endif
-    LoadTarget load_target{
+    BackendTarget backend_target{
         .device_major = dev_prop.major,
         .device_minor = dev_prop.minor,
         .fp8_native = fp8_native,
         .gptq_marlin_int4 = gptq_marlin_int4,
-        .mxfp4_native_gemm = false,
+        .mxfp4_native_gemm = mxfp4_native_gemm,
     };
-    load_target.mxfp4_moe =
-        select_mxfp4_moe_lowering(boot_cfg.model, load_target);
-    e.mxfp4_moe_lowering_ = load_target.mxfp4_moe;
+    backend_target.mxfp4_moe =
+        select_mxfp4_moe_lowering(boot_cfg.model, backend_target);
+    e.mxfp4_moe_lowering_ = backend_target.mxfp4_moe;
 
-    auto loader = SafetensorsLoader::open(snapshot);
+    auto loader = SafetensorsCheckpointSource::open(snapshot);
 
     const int tp_size = boot_cfg.distributed.tp_size;
     const int tp_rank = boot_cfg.distributed.tp_rank;
@@ -206,29 +215,62 @@ LoadedModel LoadedModel::load(const Config& boot_cfg, NcclComm* tp_comm) {
 
     WeightStoreBuilder(e.weights_).reserve(loader.num_tensors());
 
-    LoadPlan load_plan =
-        build_model_load_plan(e.hf_, boot_cfg, loader, tp_size, load_target);
-    PhysicalLoadPlan physical_plan =
-        build_physical_load_plan(load_plan, loader, tp_rank, tp_size);
-    if (const char* dump_path = std::getenv("PIE_CUDA_LOAD_PLAN_DUMP");
+    std::string runtime_quant = boot_cfg.model.runtime_quant;
+    if (runtime_quant == "fp8" && !fp8_native) {
+        runtime_quant.clear();
+    }
+    RustLoaderCompileResult rust_plan =
+        compile_rust_loader_plan_from_metadata(
+            e.hf_, loader, runtime_quant, tp_rank, tp_size,
+            64ull * 1024ull * 1024ull,
+            /*preferred_alignment=*/256,
+            backend_target);
+    const auto rust_view = rust_plan.program.view();
+    if (const char* dump_path =
+            std::getenv("PIE_CUDA_RUST_LAYOUT_PLAN_DUMP");
         dump_path && dump_path[0] != '\0') {
         std::ofstream out(dump_path);
         if (!out) {
             throw std::runtime_error(
-                "engine: failed to open PIE_CUDA_LOAD_PLAN_DUMP path: " +
-                std::string(dump_path));
+                "engine: failed to open PIE_CUDA_RUST_LAYOUT_PLAN_DUMP "
+                "path: " + std::string(dump_path));
         }
-        out << dump_load_plan_json(load_plan, physical_plan);
+        out << dump_rust_storage_program_json(
+            rust_view,
+            rust_plan.source_tensor_count,
+            rust_plan.covered_contract_count,
+            rust_plan.runtime_tensor_count);
     }
     if (verbose) {
-        std::cerr << "[pie-driver-cuda] load compiler: "
-                  << describe_load_plan(load_plan) << "\n";
-        std::cerr << "[pie-driver-cuda] physical load compiler: "
-                  << describe_physical_load_plan(physical_plan) << "\n";
+        std::cerr
+            << "[pie-driver-cuda] layout compiler: rust RuntimeABI -> "
+               "algebra -> storage program\n";
+        std::cerr << "[pie-driver-cuda] rust loader compiler: "
+                  << describe_rust_storage_program(
+                         rust_view,
+                         rust_plan.source_tensor_count,
+                         rust_plan.covered_contract_count,
+                         rust_plan.runtime_tensor_count)
+                  << "\n";
     }
-    Materializer materializer(loader, e.weights_, tp_rank, tp_size, tp_comm);
-    const MaterializedLoadPlan materialized = materializer.run(load_plan);
+    if (rust_plan.covered_contract_count != rust_plan.runtime_tensor_count) {
+        throw std::runtime_error(
+            "engine: Rust loader did not cover the full RuntimeABI; covered " +
+            std::to_string(rust_plan.covered_contract_count) + "/" +
+            std::to_string(rust_plan.runtime_tensor_count) +
+            " runtime tensors. Add schema/RuntimeABI coverage before enabling "
+            "this model.");
+    }
+
+    WeightStoreBuilder rust_builder(e.weights_);
+    RustStorageProgramExecutor rust_executor(
+        loader,
+        rust_builder,
+        std::move(rust_plan.source_tensor_names),
+        std::move(rust_plan.quant_attachments));
+    LoadExecutionStats materialized = rust_executor.execute(rust_view);
     CUDA_CHECK(cudaDeviceSynchronize());
+
     if (verbose && materialized.runtime_quantized_weights > 0) {
         const double mib_before =
             static_cast<double>(materialized.runtime_quant_bytes_before) /
@@ -247,9 +289,28 @@ LoadedModel LoadedModel::load(const Config& boot_cfg, NcclComm* tp_comm) {
                   << "% of original)\n";
     }
     if (verbose && materialized.axis_concat_groups > 0) {
-        std::cerr << "[pie-driver-cuda] load plan: "
+        std::cerr << "[pie-driver-cuda] storage loader: "
                   << materialized.axis_concat_groups << " AxisConcat groups"
                   << " (raw projection weights exposed as non-owning views)\n";
+    }
+    if (verbose && materialized.cuda_memory_samples > 0) {
+        const auto to_mib = [](std::uint64_t bytes) {
+            return bytes / (1024ull * 1024ull);
+        };
+        std::cerr << "[pie-driver-cuda] load memory high-water: planned_peak~"
+                  << to_mib(materialized.planned_storage_peak_bytes)
+                  << " MiB, planned_temp<="
+                  << to_mib(materialized.planned_storage_temp_bytes)
+                  << " MiB, actual_cuda_delta~"
+                  << to_mib(materialized.cuda_actual_peak_delta_bytes)
+                  << " MiB, free "
+                  << to_mib(materialized.cuda_free_before_bytes)
+                  << " -> min "
+                  << to_mib(materialized.cuda_min_free_bytes)
+                  << " -> "
+                  << to_mib(materialized.cuda_free_after_bytes)
+                  << " MiB across "
+                  << materialized.cuda_memory_samples << " samples\n";
     }
 
     e.weights_.validate_quant_metadata();

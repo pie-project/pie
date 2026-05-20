@@ -20,3 +20,11 @@ pub mod py_runtime;
 pub mod python_resolve;
 pub mod serve;
 pub mod subprocess_driver;
+
+#[cfg(any(feature = "driver-cuda", feature = "driver-portable"))]
+#[used]
+static PIE_WEIGHT_LOADER_LINK_ANCHOR: unsafe extern "C" fn(
+    *const pie_weight_loader::PieLoaderCompileInput,
+    *mut *mut pie_weight_loader::PieLoaderProgramHandle,
+    *mut pie_weight_loader::PieLoaderError,
+) -> pie_weight_loader::PieLoaderStatus = pie_weight_loader::pie_loader_compile;

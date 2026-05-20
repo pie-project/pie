@@ -27,6 +27,9 @@
 
 namespace pie_portable_driver {
 
+class Model;
+void load_with_rust_storage_program(Model& model);
+
 // Per-layer weights, raw split-projection layout (matches HF; no QKV/MLP
 // fusion). The graph builder is free to fuse on the fly. Optional tensors
 // (biases, QK-norm) are nullptr when the architecture doesn't use them.
@@ -269,6 +272,8 @@ public:
     std::string activation_dtype_str() const;
 
 private:
+    friend void load_with_rust_storage_program(Model& model);
+
     // Per-arch loader description. Captures the structural variations across
     // archs (extra norms, fused/biased QKV, MoE naming) so a single set of
     // loader helpers can drive all of them. Specialized cases that don't fit
@@ -473,7 +478,7 @@ private:
     ggml_context*         ctx_         = nullptr;
     ggml_backend_buffer_t buf_         = nullptr;
 
-    // Each entry tells `load_into_backend_` where to copy data from.
+    // Each entry tells the Rust storage compiler where to copy data from.
     // `src_offset_bytes` and `copy_bytes` are 0 for full-tensor loads;
     // non-zero `copy_bytes` indicates a sliced load from a fused
     // safetensor (phi3 qkv_proj / gate_up_proj).
@@ -486,12 +491,12 @@ private:
         std::size_t  src_offset_bytes = 0;
         std::size_t  copy_bytes       = 0;
         std::size_t  dst_offset_bytes = 0;
-        // When set, `load_into_backend_` materializes the source bf16
-        // bytes into a temporary f32 buffer before uploading. Used for
-        // small parameters (norm scales, projection biases) that we
-        // promote to f32 at load time so backends that lack a bf16→f32
+        // When set, the Rust storage program materializes the source
+        // bf16 bytes into a temporary f32 buffer before uploading. Used
+        // for small parameters (norm scales, projection biases) that we
+        // promote to f32 at load time so backends that lack a bf16->f32
         // CPY kernel (notably ggml-vulkan, b6993) don't see an implicit
-        // cast in the graph. Memory cost is trivial — norm + bias
+        // cast in the graph. Memory cost is trivial: norm + bias
         // weights together are <1 MB on a 1.7 B model. See
         // `is_small_weight_for_upcast()` in model.cpp for the predicate.
         bool         upcast_bf16_to_f32 = false;
@@ -502,6 +507,11 @@ private:
         // mantissa bits. See `is_small_weight_for_upcast()` for the
         // norms/biases that stay F32.
         bool         downcast_f32_to_bf16 = false;
+        // FP8 checkpoints store projection weights as raw E4M3 bytes plus
+        // a scalar or per-row scale tensor. Runtime ggml matmuls consume
+        // BF16 here, so the loader lowers this as Decode(FP8, scale).
+        bool         decode_fp8_to_bf16 = false;
+        std::string  fp8_scale_hf_name;
     };
     std::vector<DeclaredTensor> declared_;
 

@@ -770,14 +770,15 @@ pub struct CudaNativeDriverOptions {
     pub device: String,
     #[serde(skip)]
     pub verbose: bool,
-    /// Runtime quantization mode applied during CUDA load-plan
+    /// Runtime quantization mode applied during CUDA layout-plan
     /// materialization. Empty = none; `"fp8"` and `"int8"` enable
     /// per-channel symmetric quantization for supported projection weights.
     pub runtime_quant: String,
-    /// GPT-OSS MXFP4 MoE policy. `"auto"` selects the best registered
-    /// backend; `"routed_dequant"`/`"packed"` keep MXFP4 resident and
-    /// dequantize routed experts at runtime; `"bf16"`/`"dequant"` eagerly
-    /// materialize BF16 experts; `"native"` requires true MXFP4 GEMM kernels.
+    /// GPT-OSS MXFP4 MoE policy. `"auto"` selects native packed MXFP4 GEMM
+    /// on supported Blackwell-class GPUs/builds and routed dequant on legacy
+    /// GPUs; `"routed_dequant"`/`"packed"` force the packed-weight
+    /// BF16-scratch fallback; `"bf16"`/`"dequant"` eagerly materialize BF16
+    /// experts; `"native"` requires true MXFP4 GEMM kernels.
     pub mxfp4_moe: String,
 
     pub ready_timeout_s: f64,

@@ -30,6 +30,7 @@ namespace pie_cuda_driver::model {
 enum class MixtralExpertWeightFormat {
     Bf16,
     Mxfp4RoutedDequant,
+    Mxfp4NativeGemm,
 };
 
 struct MixtralExpertWeights {
@@ -47,6 +48,17 @@ struct MixtralExpertWeights {
     const DeviceTensor* w_gate_up_scale = nullptr;
     const DeviceTensor* w_down_packed = nullptr;
     const DeviceTensor* w_down_scale = nullptr;
+
+    // Native MXFP4 expert representation. These weights are Marlin-repacked
+    // FE2M1 values with companion E8M0 scale tensors, split into ordinary
+    // gate/up/down logical matrices so the host-routed MoE loop can dispatch
+    // each GEMM directly without materializing bf16 expert weights.
+    const DeviceTensor* w_gate_mxfp4 = nullptr;
+    const DeviceTensor* w_gate_mxfp4_scale = nullptr;
+    const DeviceTensor* w_up_mxfp4 = nullptr;
+    const DeviceTensor* w_up_mxfp4_scale = nullptr;
+    const DeviceTensor* w_down_mxfp4 = nullptr;
+    const DeviceTensor* w_down_mxfp4_scale = nullptr;
 
     // Optional per-expert biases. Mixtral's reference release ships
     // bias-free MLPs; GPT-OSS adds them. Nullptr → bias-add step is
@@ -99,7 +111,10 @@ struct MixtralWeights {
     // dequantizes only routed experts for the current layer into these
     // fixed buffers, then reuses the existing BF16 expert GEMM path.
     mutable DeviceTensor mxfp4_gate_up_bf16_scratch;
+    mutable DeviceTensor mxfp4_gate_bf16_scratch;
+    mutable DeviceTensor mxfp4_up_bf16_scratch;
     mutable DeviceTensor mxfp4_down_bf16_scratch;
+    int mxfp4_intermediate_padded = 0;
 };
 
 MixtralWeights bind_mixtral(const LoadedModel& engine);

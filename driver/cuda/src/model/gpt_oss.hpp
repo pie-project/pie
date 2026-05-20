@@ -20,10 +20,11 @@
 //   * Q/K/V/O biases. Loaded from the checkpoint and added via
 //     `launch_add_bias_bf16` after each projection.
 //   * MXFP4 expert weights. Stored as packed E2M1 nibbles plus per-32
-//     E8M0 block scales in the checkpoint. The target-aware load planner can
-//     keep them resident as QuantPacked MoE tensors for routed runtime
-//     dequant, or lower through an eager BF16 fallback. A true native MXFP4
-//     GEMM backend is represented as a separate target policy.
+//     E8M0 block scales in the checkpoint. Blackwell-class native targets
+//     repack them into the backend's packed FE2M1/E8M0 GEMM layout. Legacy
+//     targets keep the packed weights resident and dequantize only routed
+//     experts into bounded BF16 scratch, or can lower through the eager BF16
+//     fallback when requested.
 //
 // Returns a `MixtralWeights` so the runtime dispatch can reuse
 // `mixtral_forward_paged` directly.
