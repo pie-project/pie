@@ -58,13 +58,29 @@ cpmaddpackage(URI "gh:facebook/zstd@1.5.7")
 
 set(PIE_CUDA_CUSTOM_ALL_REDUCE_SOURCE src/custom_all_reduce.cu)
 foreach(PIE_CUDA_ARCH IN LISTS CMAKE_CUDA_ARCHITECTURES)
-  string(REGEX REPLACE "[-+].*$" "" PIE_CUDA_ARCH_NUMBER "${PIE_CUDA_ARCH}")
+  string(REGEX REPLACE "[^0-9].*$" "" PIE_CUDA_ARCH_NUMBER "${PIE_CUDA_ARCH}")
   if(PIE_CUDA_ARCH_NUMBER STREQUAL "120")
     set(PIE_CUDA_CUSTOM_ALL_REDUCE_SOURCE src/custom_all_reduce_stub.cpp)
   endif()
 endforeach()
 if(PIE_CUDA_CUSTOM_ALL_REDUCE_SOURCE MATCHES "stub")
   message(STATUS "Disabling FlashInfer custom all-reduce for CUDA architecture ${CMAKE_CUDA_ARCHITECTURES}")
+endif()
+
+set(PIE_CUDA_FLASHINFER_HOPPER_SOURCE src/ops/attention_flashinfer_hopper_stub.cpp)
+foreach(PIE_CUDA_ARCH IN LISTS CMAKE_CUDA_ARCHITECTURES)
+  string(REGEX REPLACE "[^0-9].*$" "" PIE_CUDA_ARCH_NUMBER "${PIE_CUDA_ARCH}")
+  if(PIE_CUDA_ARCH_NUMBER STREQUAL "90")
+    set(PIE_CUDA_FLASHINFER_HOPPER_SOURCE
+      src/ops/attention_flashinfer_hopper.cu
+      src/ops/attention_xqa_gqa8_sm90.cu
+    )
+  endif()
+endforeach()
+if(PIE_CUDA_FLASHINFER_HOPPER_SOURCE MATCHES "stub")
+  message(STATUS "Disabling FlashInfer Hopper/FA3 attention for CUDA architecture ${CMAKE_CUDA_ARCHITECTURES}")
+else()
+  message(STATUS "Enabling FlashInfer Hopper/FA3 attention for CUDA architecture ${CMAKE_CUDA_ARCHITECTURES}")
 endif()
 
 # pie_driver_cuda — native CUDA backend. Built two ways from the same
@@ -112,6 +128,8 @@ add_library(pie_driver_cuda_lib STATIC
   src/ops/gemm.cpp
   src/ops/attention_naive.cu
   src/ops/attention_naive_paged.cu
+  src/ops/attention_xqa.cu
+  src/ops/attention_xqa_gqa8.cu
   src/kernels/rmsnorm.cu
   src/kernels/embed.cu
   src/kernels/swiglu.cu
@@ -154,6 +172,7 @@ add_library(pie_driver_cuda_lib STATIC
   src/distributed.cpp
   ${PIE_CUDA_CUSTOM_ALL_REDUCE_SOURCE}
   src/ops/attention_flashinfer.cu
+  ${PIE_CUDA_FLASHINFER_HOPPER_SOURCE}
 )
 
 add_executable(pie_driver_cuda src/main.cpp)
@@ -187,6 +206,7 @@ target_include_directories(pie_driver_cuda_lib
     ${PIE_BRIDGE_INCLUDE_DIR}
     ${NCCL_INCLUDE_DIR}
     ${flashinfer_SOURCE_DIR}/include
+    ${flashinfer_SOURCE_DIR}/csrc
     ${flashinfer_SOURCE_DIR}/3rdparty/cutlass/include
     ${flashinfer_SOURCE_DIR}/3rdparty/cutlass/tools/util/include
     ${flashinfer_SOURCE_DIR}/3rdparty/spdlog/include)

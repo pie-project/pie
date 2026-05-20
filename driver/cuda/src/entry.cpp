@@ -19,6 +19,7 @@
 #include <csignal>
 #include <cstdint>
 #include <cstdio>
+#include <filesystem>
 #include <iostream>
 #include <limits>
 #include <memory>
@@ -282,6 +283,7 @@ std::size_t workspace_bytes(const pie_cuda_driver::HfConfig& cfg,
     bytes += bf16(n * cfg.hidden_size);              // norm_x
     bytes += bf16(n * (max_Hq + 2 * max_Hk));        // qkv_fused
     bytes += bf16(n * (2 * max_intermediate));       // gate_up_fused
+    bytes += fp32(n * cfg.head_dim);                 // rope_table
     bytes += bf16(n * max_Hq);                       // q
     bytes += bf16(n * max_Hk);                       // k
     bytes += bf16(n * max_Hk);                       // v
@@ -627,6 +629,49 @@ int prefill_candidate_cap(const cudaDeviceProp& prop) {
     return prop.major >= 12 ? 16384 : 8192;
 }
 
+std::filesystem::path cuda_planner_profile_path() {
+    if (const char* home = std::getenv("HOME")) {
+        if (home[0] != '\0') {
+            return std::filesystem::path(home) / ".cache" / "pie" /
+                   "cuda_memory_profiles.json";
+        }
+    }
+    return {};
+}
+
+bool json_required_eq(const nlohmann::json& key,
+                      const char* name,
+                      const std::string& expected) {
+    auto it = key.find(name);
+    return it != key.end() && it->is_string() &&
+           it->get<std::string>() == expected;
+}
+
+bool json_required_eq(const nlohmann::json& key,
+                      const char* name,
+                      int expected) {
+    auto it = key.find(name);
+    return it != key.end() && it->is_number_integer() &&
+           it->get<int>() == expected;
+}
+
+bool planner_profile_key_matches(const nlohmann::json& key,
+                                 const cudaDeviceProp& prop,
+                                 const pie_cuda_driver::HfConfig& hf,
+                                 int tp_size) {
+    return json_required_eq(key, "gpu_name", std::string(prop.name)) &&
+           json_required_eq(key, "compute_major", prop.major) &&
+           json_required_eq(key, "compute_minor", prop.minor) &&
+           json_required_eq(key, "sm_count", prop.multiProcessorCount) &&
+           json_required_eq(key, "tp_size", tp_size) &&
+           json_required_eq(key, "model_type", hf.model_type) &&
+           json_required_eq(key, "hidden_size", hf.hidden_size) &&
+           json_required_eq(key, "num_hidden_layers", hf.num_hidden_layers) &&
+           json_required_eq(key, "num_attention_heads", hf.num_attention_heads) &&
+           json_required_eq(key, "num_key_value_heads", hf.num_key_value_heads) &&
+           json_required_eq(key, "head_dim", hf.head_dim_kernel);
+}
+
 CudaMemoryPlan plan_cuda_memory(
     const pie_cuda_driver::Config& cfg,
     const pie_cuda_driver::HfConfig& hf,
@@ -692,8 +737,10 @@ CudaMemoryPlan plan_cuda_memory(
         per_kv_token_bytes * static_cast<std::size_t>(tp_size);
     const int throughput_decode_target =
         profile_decode_target("throughput", cfg, prop);
+    const bool kv_heavy_auto_model =
+        global_per_kv_token_bytes >= 192ull * 1024ull;
     const int auto_decode_target =
-        std::min(512, throughput_decode_target);
+        std::min(kv_heavy_auto_model ? 256 : 512, throughput_decode_target);
     const int prefill_cap = prefill_candidate_cap(prop);
     const int auto_prefill_target =
         std::min(prefill_cap, 2 * profile_prefill_target("throughput", cfg, prop));
@@ -998,10 +1045,76 @@ CudaMemoryPlan plan_cuda_memory(
             "cuda memory planner: no viable forward/KV layout fits budget " +
             std::to_string(budget / (1024 * 1024)) + " MiB");
     }
-    auto best_it = std::max_element(candidates.begin(), candidates.end(),
+
+    bool selected_from_profile = false;
+    auto best_it = candidates.end();
+    if (auto_profile) {
+        const auto path = cuda_planner_profile_path();
+        if (!path.empty() && std::filesystem::exists(path)) {
+            try {
+                std::ifstream in(path);
+                nlohmann::json root = nlohmann::json::parse(in);
+                const auto* entries =
+                    root.contains("entries") && root["entries"].is_array()
+                        ? &root["entries"]
+                        : nullptr;
+                if (entries != nullptr) {
+                    for (const auto& entry : *entries) {
+                        if (!entry.contains("key") || !entry.contains("plan")) {
+                            continue;
+                        }
+                        if (!planner_profile_key_matches(
+                                entry["key"], prop, hf, tp_size)) {
+                            continue;
+                        }
+                        const auto& plan = entry["plan"];
+                        const std::string prof =
+                            plan.value("policy_profile", std::string{});
+                        const int page_size =
+                            plan.value("kv_page_size", 0);
+                        const int tokens =
+                            plan.value("max_forward_tokens", 0);
+                        const int requests =
+                            plan.value("max_forward_requests", 0);
+                        for (auto it = candidates.begin();
+                             it != candidates.end(); ++it) {
+                            if (!prof.empty() && it->policy_profile != prof) {
+                                continue;
+                            }
+                            if (page_size > 0 &&
+                                it->plan.kv_page_size != page_size) {
+                                continue;
+                            }
+                            if (tokens > 0 &&
+                                it->plan.max_workspace_tokens != tokens) {
+                                continue;
+                            }
+                            if (requests > 0 &&
+                                it->plan.max_requests != requests) {
+                                continue;
+                            }
+                            best_it = it;
+                            selected_from_profile = true;
+                            break;
+                        }
+                        if (selected_from_profile) break;
+                    }
+                }
+            } catch (const std::exception& e) {
+                if (verbose) {
+                    std::cerr << "[pie-driver-cuda] memory planner: ignored "
+                              << "profile cache "
+                              << path.string() << ": " << e.what() << "\n";
+                }
+            }
+        }
+    }
+    if (best_it == candidates.end()) {
+        best_it = std::max_element(candidates.begin(), candidates.end(),
         [](const Candidate& a, const Candidate& b) {
             return a.score < b.score;
         });
+    }
     CudaMemoryPlan best_plan = tp_min_plan(cfg, best_it->plan);
     const std::string best_policy_profile = best_it->policy_profile;
     const int selected_decode_target = best_it->decode_target;
@@ -1011,6 +1124,8 @@ CudaMemoryPlan plan_cuda_memory(
         std::cerr << "[pie-driver-cuda] memory planner: profile="
                   << cfg.batching.memory_profile
                   << " resolved_profile=" << best_policy_profile
+                  << " selector="
+                  << (selected_from_profile ? "profiled" : "rule")
                   << " util=" << cfg.batching.gpu_mem_utilization
                   << " total=" << (total_bytes / (1024 * 1024)) << " MiB"
                   << " sm=" << prop.multiProcessorCount
@@ -1922,6 +2037,20 @@ int run_impl(int argc,
         fwd_cfg.tp_size = cfg.distributed.tp_size;
         fwd_cfg.tp_comm = tp_comm_ptr;
         fwd_cfg.emit_logits = (cfg.distributed.tp_rank == 0);
+        {
+            const int T = std::max(1, cfg.distributed.tp_size);
+            const int local_q_heads = hf.num_attention_heads / T;
+            const int local_kv_heads = hf.num_key_value_heads / T;
+            fwd_cfg.use_xqa_decode =
+                pie_cuda_driver::ops::xqa_decode_bf16_supported(
+                    local_q_heads, local_kv_heads, hf.head_dim_kernel,
+                    mem_plan.kv_page_size, hf.sliding_window,
+                    /*logits_soft_cap=*/0.f, /*sm_scale=*/-1.f) &&
+                hf.layer_types.empty();
+            if (fwd_cfg.use_xqa_decode) {
+                fwd_cfg.force_prefill_path = false;
+            }
+        }
 
         // Gemma-2 / Gemma-3 forward knobs. `query_pre_attn_scalar` and
         // `final_logit_softcapping` come straight from the HF config —
@@ -1985,9 +2114,10 @@ int run_impl(int argc,
             // average KV pages for split-KV/full-attention work to pay for
             // itself.
             fwd_cfg.prefill_decode_min_kv_pages =
-                kv_heavy_attention ? 6 : 7;
+                kv_heavy_attention ? 1 : 7;
             fwd_cfg.prefill_decode_full_attention_min_requests = 256;
-            fwd_cfg.prefill_decode_full_attention_min_kv_pages = 7;
+            fwd_cfg.prefill_decode_full_attention_min_kv_pages =
+                kv_heavy_attention ? 1 : 7;
         }
 
         if (verbose) {
@@ -2004,6 +2134,8 @@ int run_impl(int argc,
                       << " rope=" << rope_name
                       << " prefill_decode_plan="
                       << (fwd_cfg.use_prefill_decode_plan ? "on" : "off")
+                      << " xqa_decode="
+                      << (fwd_cfg.use_xqa_decode ? "on" : "off")
                       << " full_attn_min_R="
                       << fwd_cfg.prefill_decode_full_attention_min_requests
                       << "\n";
@@ -2171,8 +2303,7 @@ int run_impl(int argc,
         forward_fn.prepare = [&engine, &kv_cache, &qwen3_5_plan_state,
                               q35_tp_size, q35_tp_comm](
             pie_cuda_driver::AttentionWorkspace& attn_ws,
-            const std::uint32_t* kv_page_indptr_h,
-            int R, bool is_pure_decode) {
+            const pie_cuda_driver::ForwardFn::PrepareInputs& prep) {
             pie_cuda_driver::model::Qwen3_5ForwardCfg q35_fwd{};
             const auto& hf_q = engine.hf_config();
             const int gqa_q = hf_q.num_attention_heads /
@@ -2183,7 +2314,8 @@ int run_impl(int argc,
             q35_fwd.tp_comm = q35_tp_comm;
             pie_cuda_driver::model::prepare_qwen3_5_decode_plan(
                 qwen3_5_plan_state, attn_ws, kv_cache, engine.hf_config(),
-                q35_fwd, kv_page_indptr_h, R, is_pure_decode);
+                q35_fwd, prep.kv_page_indptr_h, prep.num_requests,
+                prep.is_pure_decode);
         };
         forward_fn.body = [&engine, &weights_qwen3_5, &qwen3_5_la_ws,
                            &qwen3_5_state_cache, &qwen3_5_plan_state,
@@ -2230,8 +2362,7 @@ int run_impl(int argc,
         forward_fn.prepare = [&engine, &kv_cache, &qwen3_5_plan_state,
                               q35moe_tp_size, q35moe_tp_comm](
             pie_cuda_driver::AttentionWorkspace& attn_ws,
-            const std::uint32_t* kv_page_indptr_h,
-            int R, bool is_pure_decode) {
+            const pie_cuda_driver::ForwardFn::PrepareInputs& prep) {
             pie_cuda_driver::model::Qwen3_5ForwardCfg q35_fwd{};
             const auto& hf_q = engine.hf_config();
             const int gqa_q = hf_q.num_attention_heads /
@@ -2242,7 +2373,8 @@ int run_impl(int argc,
             q35_fwd.tp_comm = q35moe_tp_comm;
             pie_cuda_driver::model::prepare_qwen3_5_decode_plan(
                 qwen3_5_plan_state, attn_ws, kv_cache, engine.hf_config(),
-                q35_fwd, kv_page_indptr_h, R, is_pure_decode);
+                q35_fwd, prep.kv_page_indptr_h, prep.num_requests,
+                prep.is_pure_decode);
         };
         forward_fn.body = [&engine, &weights_qwen3_5_moe, &qwen3_5_la_ws,
                            &qwen3_5_moe_ws, &qwen3_5_state_cache,
@@ -2304,11 +2436,19 @@ int run_impl(int argc,
             weights_llama.lm_head_tp_shard != nullptr;
         forward_fn.prepare = [&engine, &kv_cache, &fwd_cfg, &llama_plan](
             pie_cuda_driver::AttentionWorkspace& attn_ws,
-            const std::uint32_t* kv_page_indptr_h,
-            int R, bool is_pure_decode) {
+            const pie_cuda_driver::ForwardFn::PrepareInputs& prep) {
             pie_cuda_driver::model::prepare_llama_like_decode_plan(
                 llama_plan, attn_ws, kv_cache, engine.hf_config(),
-                fwd_cfg, kv_page_indptr_h, R, is_pure_decode);
+                fwd_cfg,
+                prep.qo_indptr_h,
+                prep.kv_page_indices_d,
+                prep.kv_page_indptr_h,
+                prep.kv_page_indptr_d,
+                prep.kv_last_page_lens_h,
+                prep.kv_last_page_lens_d,
+                prep.total_tokens,
+                prep.num_requests,
+                prep.is_pure_decode);
         };
         forward_fn.graph_layout = [&llama_plan]() {
             return pie_cuda_driver::model::llama_like_decode_graph_layout(

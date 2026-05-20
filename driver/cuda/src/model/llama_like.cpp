@@ -79,7 +79,13 @@ void prepare_llama_like_decode_plan(
     KvCache& cache,
     const HfConfig& cfg,
     const LlamaLikeForwardCfg& fwd_cfg,
+    const std::uint32_t* qo_indptr_h,
+    const std::uint32_t* kv_page_indices_d,
     const std::uint32_t* kv_page_indptr_h,
+    const std::uint32_t* kv_page_indptr_d,
+    const std::uint32_t* kv_last_page_lens_h,
+    const std::uint32_t* kv_last_page_lens_d,
+    int total_tokens,
     int num_requests,
     bool is_pure_decode)
 {
@@ -87,11 +93,104 @@ void prepare_llama_like_decode_plan(
     // pinned/device buffers in `attn_ws` that the captured body reads via
     // cudaMemcpyAsync at replay time, so the same captured graph stays
     // correct across fires with different KV lengths.
-    if (!is_pure_decode || fwd_cfg.force_prefill_path) {
+    state.use_xqa_decode = false;
+    state.xqa_max_pages_per_seq = 0;
+    state.use_prefill_plan = false;
+    state.use_prefill_decode_plan = false;
+    if (is_pure_decode && fwd_cfg.use_xqa_decode &&
+        cache.format().is_native_bf16()) {
+        int max_pages = 1;
+        for (int r = 0; r < num_requests; ++r) {
+            const int pages = static_cast<int>(
+                kv_page_indptr_h[r + 1] - kv_page_indptr_h[r]);
+            max_pages = std::max(max_pages, pages);
+        }
+        state.use_xqa_decode = true;
+        state.xqa_max_pages_per_seq =
+            ops::xqa_decode_page_bucket(max_pages);
+        return;
+    }
+    if (!is_pure_decode) {
+        // Real prefill/mixed batches share one attention schedule across all
+        // layers when the model has a single global attention window. Plan it
+        // once here so the forward body can dispatch per layer without doing
+        // host planner work inside the model loop. Models with alternating
+        // sliding-window layouts keep the older per-layer planner path.
+        if (fwd_cfg.per_layer_window_left.empty()) {
+            if (!state.prefill_plan) {
+                state.prefill_plan = ops::make_prefill_plan();
+            }
+            const int T = (fwd_cfg.tp_size > 0) ? fwd_cfg.tp_size : 1;
+            const int num_q_heads_local  = cfg.num_attention_heads / T;
+            const int num_kv_heads_local = cfg.num_key_value_heads / T;
+            ops::plan_attention_flashinfer_prefill_bf16(
+                *state.prefill_plan,
+                qo_indptr_h,
+                kv_page_indptr_h,
+                kv_last_page_lens_h,
+                total_tokens,
+                num_requests,
+                num_q_heads_local,
+                num_kv_heads_local,
+                cfg.head_dim_kernel,
+                cache.page_size(),
+                attn_ws,
+                /*stream=*/nullptr,
+                /*enable_cuda_graph=*/false,
+                fwd_cfg.sliding_window,
+                /*full_attention_variant=*/false);
+            state.use_prefill_plan = true;
+        }
+        return;
+    }
+    if (fwd_cfg.force_prefill_path) {
         state.use_prefill_decode_plan = false;
         return;
     }
-    state.use_prefill_decode_plan = false;
+    const int min_prefill_decode_pages =
+        std::max(0, fwd_cfg.prefill_decode_min_kv_pages);
+    std::uint64_t total_kv_pages = 0;
+    for (int r = 0; r < num_requests; ++r) {
+        total_kv_pages += static_cast<std::uint64_t>(
+            kv_page_indptr_h[r + 1] - kv_page_indptr_h[r]);
+    }
+    const int avg_kv_pages = num_requests > 0
+        ? static_cast<int>((total_kv_pages + num_requests - 1) / num_requests)
+        : 0;
+    state.use_prefill_decode_plan =
+        fwd_cfg.use_prefill_decode_plan &&
+        (min_prefill_decode_pages == 0 ||
+         avg_kv_pages >= min_prefill_decode_pages);
+    if (state.use_prefill_decode_plan) {
+        if (!state.prefill_decode_plan) {
+            state.prefill_decode_plan = ops::make_prefill_plan();
+        }
+        const int T = (fwd_cfg.tp_size > 0) ? fwd_cfg.tp_size : 1;
+        const int num_q_heads_local  = cfg.num_attention_heads / T;
+        const int num_kv_heads_local = cfg.num_key_value_heads / T;
+        std::vector<std::uint32_t> qo_indptr_h(num_requests + 1);
+        for (int r = 0; r <= num_requests; ++r) {
+            qo_indptr_h[r] = static_cast<std::uint32_t>(r);
+        }
+        const int min_full_attention_pages =
+            std::max(0, fwd_cfg.prefill_decode_full_attention_min_kv_pages);
+        const bool full_attention_variant =
+            fwd_cfg.prefill_decode_full_attention_min_requests > 0 &&
+            num_requests >= fwd_cfg.prefill_decode_full_attention_min_requests &&
+            (min_full_attention_pages == 0 ||
+             avg_kv_pages >= min_full_attention_pages) &&
+            fwd_cfg.sliding_window < 0 &&
+            fwd_cfg.per_layer_window_left.empty();
+        ops::plan_attention_flashinfer_prefill_bf16(
+            *state.prefill_decode_plan, qo_indptr_h.data(), kv_page_indptr_h,
+            kv_last_page_lens_h,
+            /*total_tokens=*/num_requests, num_requests,
+            num_q_heads_local, num_kv_heads_local, cfg.head_dim_kernel,
+            cache.page_size(), attn_ws, /*stream=*/nullptr,
+            fwd_cfg.decode_plan_cuda_graph, fwd_cfg.sliding_window,
+            full_attention_variant);
+        return;
+    }
     if (!state.decode_plan) {
         state.decode_plan = ops::make_decode_plan();
     }
@@ -108,6 +207,12 @@ void prepare_llama_like_decode_plan(
 std::uint8_t llama_like_decode_graph_layout(
     const LlamaLikePlanState& state)
 {
+    if (state.use_xqa_decode) {
+        return ops::xqa_decode_graph_layout(state.xqa_max_pages_per_seq);
+    }
+    if (state.use_prefill_decode_plan && state.prefill_decode_plan) {
+        return ops::prefill_plan_graph_layout(*state.prefill_decode_plan);
+    }
     if (!state.decode_plan) return 0;
     return ops::decode_plan_graph_layout(*state.decode_plan);
 }
@@ -165,6 +270,7 @@ void llama_like_forward_paged(
     // not — lands on the captured graph.
     cudaStream_t stream = cublas.stream();
     NcclComm* tp = (T > 1) ? fwd_cfg.tp_comm : nullptr;
+    const bool native_bf16_kv_cache = cache.format().is_native_bf16();
 
     // When head_dim is padded, the attention kernel runs at `dk`
     // (e.g. 128) and consumes Q/K/V from the *padded* workspace
@@ -185,7 +291,13 @@ void llama_like_forward_paged(
     // flashinfer's decode dispatch table; for those we run the prefill
     // kernel even for qo_len==1 batches. The runtime decision lives in
     // a single bool: anything past the plan_attention call uses it.
-    const bool use_decode_path = is_pure_decode && !fwd_cfg.force_prefill_path;
+    const bool use_xqa_decode_path =
+        is_pure_decode && plan_state.use_xqa_decode;
+    const bool use_decode_path =
+        is_pure_decode && (!fwd_cfg.force_prefill_path || use_xqa_decode_path);
+    const bool use_prefill_decode_path =
+        use_decode_path && !use_xqa_decode_path &&
+        plan_state.use_prefill_decode_plan;
 
     // Decode plan was set up by the prepare hook (runs outside any
     // cudaStream capture region) — the body just reads from
@@ -193,11 +305,28 @@ void llama_like_forward_paged(
     // the executor can capture it into a CUDA graph.
     const ops::DecodePlanCache* decode_plan =
         plan_state.decode_plan ? plan_state.decode_plan.get() : nullptr;
+    const ops::PrefillPlanCache* prefill_decode_plan =
+        plan_state.prefill_decode_plan ? plan_state.prefill_decode_plan.get() : nullptr;
+    const ops::PrefillPlanCache* prefill_plan =
+        plan_state.prefill_plan ? plan_state.prefill_plan.get() : nullptr;
+    if (use_xqa_decode_path) {
+        ops::prepare_attention_xqa_decode_bf16(
+            kv_page_indices,
+            kv_page_indptr,
+            kv_last_page_lens,
+            R,
+            cache.page_size(),
+            plan_state.xqa_max_pages_per_seq,
+            attn_ws,
+            stream);
+    }
 
     const bool post_norm = fwd_cfg.norm_placement == NormPlacement::Post;
     bool have_next_attn_norm = false;
     bool have_final_norm = false;
     const void* final_norm_buf = nullptr;
+    bool rope_table_ready = false;
+    const float* rope_table = nullptr;
 
     for (int L = 0; L < cfg.num_hidden_layers; ++L) {
         const auto& layer = w.layers[L];
@@ -220,16 +349,53 @@ void llama_like_forward_paged(
         // `qkv_proj_fused` (single wide gemm + split kernel), unfused
         // fallback for quantized projections / TP-sharded loads /
         // architectures that haven't opted in yet.
+        const bool q_norm_is_per_head =
+            layer.q_norm && layer.q_norm->shape().size() == 1 &&
+            layer.q_norm->shape()[0] == d;
+        const bool k_norm_is_per_head =
+            layer.k_norm && layer.k_norm->shape().size() == 1 &&
+            layer.k_norm->shape()[0] == d;
         const bool use_fused_qkv = (layer.qkv_proj_fused != nullptr) &&
                                    !ws.qkv_fused.empty();
+        const bool fused_decode_qkv_post =
+            use_fused_qkv &&
+            is_pure_decode &&
+            native_bf16_kv_cache &&
+            !head_dim_padded &&
+            !fwd_cfg.use_qkv_bias &&
+            fwd_cfg.use_qk_norm &&
+            q_norm_is_per_head && k_norm_is_per_head &&
+            fwd_cfg.rope_kind == RopeKind::Standard;
         if (use_fused_qkv) {
             ops::gemm_act_x_w(cublas.handle(),
                 qkv_in, ops::WeightView(*layer.qkv_proj_fused),
                 ws.qkv_fused.data(), N, Hq + 2 * Hk, H);
-            kernels::launch_split_qkv_bf16(
-                ws.qkv_fused.data(),
-                ws.q.data(), ws.k.data(), ws.v.data(),
-                N, Hq, Hk, stream);
+            if (fused_decode_qkv_post) {
+                if (!rope_table_ready && !ws.rope_table.empty()) {
+                    kernels::launch_rope_standard_table(
+                        positions,
+                        static_cast<float*>(ws.rope_table.data()),
+                        N, d, cfg.rope_theta, stream);
+                    rope_table =
+                        static_cast<const float*>(ws.rope_table.data());
+                    rope_table_ready = true;
+                }
+                kernels::launch_qkv_decode_qk_norm_rope_write_kv_bf16(
+                    ws.qkv_fused.data(),
+                    ws.q.data(),
+                    cache.k(L), cache.v(L),
+                    layer.q_norm->data(), layer.k_norm->data(),
+                    positions,
+                    rope_table,
+                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    R, num_q_heads_local, num_kv_heads_local, d,
+                    cache.page_size(), cfg.rope_theta, eps, stream);
+            } else {
+                kernels::launch_split_qkv_bf16(
+                    ws.qkv_fused.data(),
+                    ws.q.data(), ws.k.data(), ws.v.data(),
+                    N, Hq, Hk, stream);
+            }
         } else {
             ops::gemm_act_x_w(cublas.handle(),
                 qkv_in, make_weight_view(layer.q_proj, layer.q_proj_quant),
@@ -242,7 +408,7 @@ void llama_like_forward_paged(
                 ws.v.data(), N, Hk, H);
         }
 
-        if (fwd_cfg.use_qkv_bias) {
+        if (!fused_decode_qkv_post && fwd_cfg.use_qkv_bias) {
             maybe_add_bias(ws.q.data(), layer.q_bias, N, Hq, stream);
             maybe_add_bias(ws.k.data(), layer.k_bias, N, Hk, stream);
             maybe_add_bias(ws.v.data(), layer.v_bias, N, Hk, stream);
@@ -272,18 +438,14 @@ void llama_like_forward_paged(
                     N * num_heads_local, d, eps, stream);
             }
         };
-        const bool q_norm_is_per_head =
-            layer.q_norm && layer.q_norm->shape().size() == 1 &&
-            layer.q_norm->shape()[0] == d;
-        const bool k_norm_is_per_head =
-            layer.k_norm && layer.k_norm->shape().size() == 1 &&
-            layer.k_norm->shape()[0] == d;
         const bool fuse_qk_norm_rope =
-            T == 1 &&
             fwd_cfg.use_qk_norm &&
             q_norm_is_per_head && k_norm_is_per_head &&
             fwd_cfg.rope_kind == RopeKind::Standard;
-        if (fuse_qk_norm_rope) {
+        if (fused_decode_qkv_post) {
+            // Q was normalized/rotated and K/V were written directly to the
+            // paged cache by the fused decode postprocess above.
+        } else if (fuse_qk_norm_rope) {
             kernels::launch_qk_rmsnorm_rope_bf16(
                 ws.q.data(), ws.k.data(),
                 layer.q_norm->data(), layer.k_norm->data(),
@@ -312,7 +474,7 @@ void llama_like_forward_paged(
         const void* attn_k   = ws.k.data();
         const void* attn_v   = ws.v.data();
         void* attn_out_buf   = ws.attn_out.data();
-        if (head_dim_padded) {
+        if (!fused_decode_qkv_post && head_dim_padded) {
             kernels::launch_pad_head_dim_bf16(
                 ws.q.data(), ws.q_padded.data(),
                 N, num_q_heads_local, d, dk, stream);
@@ -329,10 +491,15 @@ void llama_like_forward_paged(
         }
 
         auto kv_view = cache.layer_view(L);
-        kernels::launch_write_kv_to_pages(
-            kv_view, const_cast<void*>(attn_k), const_cast<void*>(attn_v),
-            qo_indptr, kv_page_indices, kv_page_indptr, kv_last_page_lens,
-            N, R, stream);
+        if (fused_decode_qkv_post) {
+            // Already written by launch_qkv_decode_qk_norm_rope_write_kv_bf16.
+        } else {
+            kernels::launch_write_kv_to_pages(
+                kv_view,
+                const_cast<void*>(attn_k), const_cast<void*>(attn_v),
+                qo_indptr, kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                N, R, stream);
+        }
 
         // Per-layer sliding-window dispatch (OLMo-3, Mistral). When
         // `per_layer_window_left` is empty we fall back to the global
@@ -344,7 +511,22 @@ void llama_like_forward_paged(
                 ? fwd_cfg.per_layer_window_left[L]
                 : fwd_cfg.sliding_window;
 
-        if (use_decode_path) {
+        if (use_xqa_decode_path) {
+            ops::launch_attention_xqa_decode_bf16_prepared(
+                attn_q, kv_view.k_bf16_pages, kv_view.v_bf16_pages, attn_out_buf,
+                R, num_q_heads_local, num_kv_heads_local, dk,
+                cache.page_size(), plan_state.xqa_max_pages_per_seq,
+                attn_ws, stream, sm_scale_override);
+        } else if (use_prefill_decode_path) {
+            const int num_pages_in_batch = kv_page_indptr_h[R];
+            kernels::launch_dequant_kv_cache_layer_to_bf16_active(
+                kv_view, kv_page_indices, num_pages_in_batch, stream);
+            ops::dispatch_attention_flashinfer_prefill_bf16(
+                *prefill_decode_plan,
+                attn_q, kv_view.k_bf16_pages, kv_view.v_bf16_pages, attn_out_buf,
+                qo_indptr, kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                attn_ws, stream, /*logits_soft_cap=*/0.f, sm_scale_override);
+        } else if (use_decode_path) {
             ops::dispatch_attention_flashinfer_decode(
                 *decode_plan,
                 attn_q, kv_view, attn_out_buf,
@@ -358,6 +540,15 @@ void llama_like_forward_paged(
                 custom_mask_d, custom_mask_indptr_d,
                 qo_indptr_h, kv_page_indptr_h,
                 N, R, num_q_heads_local, attn_ws, stream);
+        } else if (plan_state.use_prefill_plan && prefill_plan != nullptr) {
+            const int num_pages_in_batch = kv_page_indptr_h[R];
+            kernels::launch_dequant_kv_cache_layer_to_bf16_active(
+                kv_view, kv_page_indices, num_pages_in_batch, stream);
+            ops::dispatch_attention_flashinfer_prefill_bf16(
+                *prefill_plan,
+                attn_q, kv_view.k_bf16_pages, kv_view.v_bf16_pages, attn_out_buf,
+                qo_indptr, kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                attn_ws, stream, /*logits_soft_cap=*/0.f, sm_scale_override);
         } else {
             ops::launch_attention_flashinfer_prefill(
                 attn_q, kv_view, attn_out_buf,

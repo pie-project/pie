@@ -18,6 +18,27 @@ __device__ __forceinline__ void rotate_pair(
     h_ptr[dim_pair + half] = __float2bfloat16(b * cos_v + a * sin_v);
 }
 
+__global__ void rope_standard_table_kernel(
+    const std::int32_t* __restrict__ positions,
+    float* __restrict__ table,
+    int head_dim,
+    float theta)
+{
+    const int n = blockIdx.x;
+    const int half = head_dim / 2;
+    const int pos = positions[n];
+    float* row = table + static_cast<long long>(n) * head_dim;
+    for (int dim_pair = threadIdx.x; dim_pair < half; dim_pair += blockDim.x) {
+        const float freq = powf(theta,
+            -2.f * static_cast<float>(dim_pair) / static_cast<float>(head_dim));
+        const float ang = static_cast<float>(pos) * freq;
+        float cos_v, sin_v;
+        __sincosf(ang, &sin_v, &cos_v);
+        row[dim_pair] = cos_v;
+        row[dim_pair + half] = sin_v;
+    }
+}
+
 __global__ void rope_bf16_kernel(
     __nv_bfloat16* __restrict__ q,
     __nv_bfloat16* __restrict__ k,
@@ -112,6 +133,20 @@ __global__ void qk_rmsnorm_rope_bf16_kernel(
 }
 
 }  // namespace
+
+void launch_rope_standard_table(
+    const std::int32_t* positions,
+    float* table,
+    int num_tokens,
+    int head_dim,
+    float theta,
+    cudaStream_t stream)
+{
+    if (num_tokens <= 0 || table == nullptr) return;
+    constexpr int BLOCK = 128;
+    rope_standard_table_kernel<<<num_tokens, BLOCK, 0, stream>>>(
+        positions, table, head_dim, theta);
+}
 
 void launch_rope_bf16(
     void* q, void* k,

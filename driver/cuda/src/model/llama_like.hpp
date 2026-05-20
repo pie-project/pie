@@ -21,6 +21,7 @@
 #include "model/qwen3.hpp"           // Qwen3Weights / Qwen3Workspace shared
 #include "model/qwen3_forward.hpp"   // Qwen3Workspace (already declared)
 #include "ops/attention_flashinfer.hpp"
+#include "ops/attention_xqa.hpp"
 
 namespace pie_cuda_driver::model {
 
@@ -71,6 +72,7 @@ struct LlamaLikeForwardCfg {
     // fastdiv for group_size and accepts arbitrary values; cost is
     // ~1.3× per-step latency vs the dedicated decode kernel.
     bool force_prefill_path = false;
+    bool use_xqa_decode = false;
     bool decode_plan_cuda_graph = true;
     bool use_prefill_decode_plan = false;
     int prefill_decode_full_attention_min_requests = 0;
@@ -98,20 +100,32 @@ struct LlamaLikeForwardCfg {
 // graph capture region — no host-side work, no allocations.
 struct LlamaLikePlanState {
     ops::DecodePlanCachePtr decode_plan;
+    ops::PrefillPlanCachePtr prefill_plan;
+    ops::PrefillPlanCachePtr prefill_decode_plan;
+    bool use_prefill_plan = false;
     bool use_prefill_decode_plan = false;
+    bool use_xqa_decode = false;
+    int xqa_max_pages_per_seq = 0;
 };
 
 // Refresh the decode plan for the current fire. Caller invokes this
 // BEFORE either a direct forward call OR a graph replay, outside any
-// capture region. No-op when `is_pure_decode == false` (the prefill
-// path doesn't use a pre-planned decode kernel).
+// capture region. Pure decode plans the flashinfer decode/predecode path;
+// ordinary prefill plans the reusable flashinfer prefill path when a single
+// layer layout is valid for every layer.
 void prepare_llama_like_decode_plan(
     LlamaLikePlanState& state,
     AttentionWorkspace& attn_ws,
     KvCache& cache,
     const HfConfig& cfg,
     const LlamaLikeForwardCfg& fwd_cfg,
+    const std::uint32_t* qo_indptr_h,
+    const std::uint32_t* kv_page_indices_d,
     const std::uint32_t* kv_page_indptr_h,
+    const std::uint32_t* kv_page_indptr_d,
+    const std::uint32_t* kv_last_page_lens_h,
+    const std::uint32_t* kv_last_page_lens_d,
+    int total_tokens,
     int num_requests,
     bool is_pure_decode);
 

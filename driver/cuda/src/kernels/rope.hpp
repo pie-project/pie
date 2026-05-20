@@ -16,6 +16,16 @@
 
 namespace pie_cuda_driver::kernels {
 
+// Build a per-token standard RoPE table. Layout is [num_tokens, head_dim]:
+// row[0:head_dim/2] contains cos, row[head_dim/2:head_dim] contains sin.
+void launch_rope_standard_table(
+    const std::int32_t* positions,
+    float* table,
+    int num_tokens,
+    int head_dim,
+    float theta,
+    cudaStream_t stream);
+
 void launch_rope_bf16(
     void* q, void* k,
     const std::int32_t* positions,  // [num_tokens]

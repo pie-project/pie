@@ -100,11 +100,21 @@ struct ForwardFn {
         bool                 /* tp_greedy_argmax */
     )>;
 
+    struct PrepareInputs {
+        const std::uint32_t* qo_indptr_h = nullptr;
+        const std::uint32_t* kv_page_indices_d = nullptr;
+        const std::uint32_t* kv_page_indptr_h = nullptr;
+        const std::uint32_t* kv_page_indptr_d = nullptr;
+        const std::uint32_t* kv_last_page_lens_h = nullptr;
+        const std::uint32_t* kv_last_page_lens_d = nullptr;
+        int total_tokens = 0;
+        int num_requests = 0;
+        bool is_pure_decode = false;
+    };
+
     using PrepareFn = std::function<void(
         AttentionWorkspace&,
-        const std::uint32_t* /* kv_page_indptr_h */,
-        int                  /* num_requests R */,
-        bool                 /* is_pure_decode */
+        const PrepareInputs&
     )>;
 
     using GraphLayoutFn = std::function<std::uint8_t()>;

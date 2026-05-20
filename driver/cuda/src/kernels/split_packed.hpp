@@ -31,4 +31,29 @@ void launch_split_gate_up_bf16(
     int n_tokens, int inter,
     cudaStream_t stream);
 
+// Pure-decode fast path for fused QKV projections with per-head Q/K RMSNorm
+// and standard RoPE. Reads packed [R, q_dim + 2 * kv_dim], writes Q to
+// [R, num_q_heads, head_dim], and writes K/V directly into the paged cache at
+// the current decode position for each request.
+void launch_qkv_decode_qk_norm_rope_write_kv_bf16(
+    const void* packed,
+    void* q_out,
+    void* k_pages,
+    void* v_pages,
+    const void* q_weight,
+    const void* k_weight,
+    const std::int32_t* positions,
+    const float* rope_table,
+    const std::uint32_t* kv_page_indices,
+    const std::uint32_t* kv_page_indptr,
+    const std::uint32_t* kv_last_page_lens,
+    int num_requests,
+    int num_q_heads,
+    int num_kv_heads,
+    int head_dim,
+    int page_size,
+    float theta,
+    float eps,
+    cudaStream_t stream);
+
 }  // namespace pie_cuda_driver::kernels

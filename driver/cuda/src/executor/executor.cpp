@@ -565,7 +565,21 @@ std::size_t capture_forward_graph_lattice(Executor& executor) {
         pi.kv_last_page_lens.copy_from_host(std::span<const std::uint32_t>(kvlpl));
 
         executor.forward_fn.prepare(
-            executor.attn_ws, kvpp.data(), R, /*is_pure_decode=*/true);
+            executor.attn_ws,
+            ForwardFn::PrepareInputs{
+                .qo_indptr_h = qo.data(),
+                .kv_page_indices_d =
+                    reinterpret_cast<const std::uint32_t*>(pi.kv_page_indices.data()),
+                .kv_page_indptr_h = kvpp.data(),
+                .kv_page_indptr_d =
+                    reinterpret_cast<const std::uint32_t*>(pi.kv_page_indptr.data()),
+                .kv_last_page_lens_h = kvlpl.data(),
+                .kv_last_page_lens_d =
+                    reinterpret_cast<const std::uint32_t*>(pi.kv_last_page_lens.data()),
+                .total_tokens = N,
+                .num_requests = R,
+                .is_pure_decode = true,
+            });
         const std::uint8_t graph_layout =
             executor.forward_fn.graph_layout ? executor.forward_fn.graph_layout() : 0u;
         const std::uint8_t graph_variant =
@@ -1061,8 +1075,23 @@ void handle_fire_batch(
         // plan state for the captured body to read. Lives outside any
         // capture region so the host work re-runs every fire.
         if (forward_fn.prepare) {
-            forward_fn.prepare(attn_ws, h_kvpp_forward, forward_R,
-                               is_pure_decode);
+            forward_fn.prepare(
+                attn_ws,
+                ForwardFn::PrepareInputs{
+                    .qo_indptr_h = h_qo_forward,
+                    .kv_page_indices_d =
+                        reinterpret_cast<const std::uint32_t*>(pi.kv_page_indices.data()),
+                    .kv_page_indptr_h = h_kvpp_forward,
+                    .kv_page_indptr_d =
+                        reinterpret_cast<const std::uint32_t*>(pi.kv_page_indptr.data()),
+                    .kv_last_page_lens_h =
+                        forward_inputs.kv_last_page_lens.data(),
+                    .kv_last_page_lens_d =
+                        reinterpret_cast<const std::uint32_t*>(pi.kv_last_page_lens.data()),
+                    .total_tokens = forward_N,
+                    .num_requests = forward_R,
+                    .is_pure_decode = is_pure_decode,
+                });
         }
 
         // ── Upload sampling inputs (must precede sampling launch) ──
@@ -1430,12 +1459,18 @@ void tp_follower_serve(Executor& executor, std::atomic<bool>& stop) {
         // attention planner (lives outside the captured kernel sequence).
         h_qo.resize(R + 1);
         h_kvpp.resize(R + 1);
+        std::vector<std::uint32_t> h_kvlpl(R);
         CUDA_CHECK(cudaMemcpyAsync(h_qo.data(), pi.qo_indptr.data(),
                                    static_cast<std::size_t>(R + 1) * 4,
                                    cudaMemcpyDeviceToHost, stream));
         CUDA_CHECK(cudaMemcpyAsync(h_kvpp.data(), pi.kv_page_indptr.data(),
                                    static_cast<std::size_t>(R + 1) * 4,
                                    cudaMemcpyDeviceToHost, stream));
+        if (R > 0) {
+            CUDA_CHECK(cudaMemcpyAsync(h_kvlpl.data(), pi.kv_last_page_lens.data(),
+                                       static_cast<std::size_t>(R) * 4,
+                                       cudaMemcpyDeviceToHost, stream));
+        }
         std::vector<std::int32_t> h_slot_ids;
         std::vector<std::uint8_t> h_is_fresh;
         if (have_slot_ids) {
@@ -1454,8 +1489,22 @@ void tp_follower_serve(Executor& executor, std::atomic<bool>& stop) {
         // inside synchronise both ranks; we don't sample or write a
         // response — that's rank-0-only.
         if (executor.forward_fn.prepare) {
-            executor.forward_fn.prepare(executor.attn_ws, h_kvpp.data(), R,
-                                        is_pure_decode);
+            executor.forward_fn.prepare(
+                executor.attn_ws,
+                ForwardFn::PrepareInputs{
+                    .qo_indptr_h = h_qo.data(),
+                    .kv_page_indices_d =
+                        reinterpret_cast<const std::uint32_t*>(pi.kv_page_indices.data()),
+                    .kv_page_indptr_h = h_kvpp.data(),
+                    .kv_page_indptr_d =
+                        reinterpret_cast<const std::uint32_t*>(pi.kv_page_indptr.data()),
+                    .kv_last_page_lens_h = h_kvlpl.data(),
+                    .kv_last_page_lens_d =
+                        reinterpret_cast<const std::uint32_t*>(pi.kv_last_page_lens.data()),
+                    .total_tokens = N,
+                    .num_requests = R,
+                    .is_pure_decode = is_pure_decode,
+                });
         }
         // Mirror rank 0's graph capture/replay decision so NCCL ops
         // inside the body record on both ranks simultaneously (otherwise

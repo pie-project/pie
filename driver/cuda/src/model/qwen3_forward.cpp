@@ -37,6 +37,7 @@ Qwen3Workspace Qwen3Workspace::allocate_full(
     // layer whether to use the fused or unfused projection.
     ws.qkv_fused     = DeviceTensor::allocate(DType::BF16, {N, Hq + 2 * Hk});
     ws.gate_up_fused = DeviceTensor::allocate(DType::BF16, {N, 2 * I});
+    ws.rope_table    = DeviceTensor::allocate(DType::FP32, {N, cfg.head_dim});
     ws.q             = DeviceTensor::allocate(DType::BF16, {N, Hq});
     ws.k             = DeviceTensor::allocate(DType::BF16, {N, Hk});
     ws.v             = DeviceTensor::allocate(DType::BF16, {N, Hk});

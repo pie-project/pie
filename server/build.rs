@@ -24,6 +24,12 @@ fn main() {
     let cuda = cfg!(feature = "driver-cuda");
     println!("cargo:rerun-if-changed=../driver/common/include");
     println!("cargo:rerun-if-changed=../driver/common/src");
+    if cuda {
+        println!("cargo:rerun-if-changed=../driver/cuda/CMakeLists.txt");
+        println!("cargo:rerun-if-changed=../driver/cuda/cmake");
+        println!("cargo:rerun-if-changed=../driver/cuda/include");
+        println!("cargo:rerun-if-changed=../driver/cuda/src");
+    }
 
     if portable {
         build_portable();

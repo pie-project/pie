@@ -546,7 +546,42 @@ part of the large-GPU validation set because it exposes planner mistakes that
     directly; Pie's FlashInfer decode kernel only supports GQA groups
     `{1,2,3,4,8}`, so Qwen's GQA=5 decode is forced through Pie's FlashInfer
     prefill fallback.
-  The next real optimization is therefore not another planner heuristic. It is
-  either a native FA3 paged-attention integration for Pie's KV layout, or a
-  deliberate KV-layout adapter plus graph-safe metadata cache for the vLLM/FA3
-  ABI. The previous generic XQA attempt was not that path and was slower.
+The next real optimization is therefore not another planner heuristic. It is
+either a native FA3 paged-attention integration for Pie's KV layout, or a
+deliberate KV-layout adapter plus graph-safe metadata cache for the vLLM/FA3
+ABI. The previous generic XQA attempt was not that path and was slower.
+
+## 2026-05-19 XQA/FA3 Follow-Up
+
+- The profiler/cache path was rechecked on H200 Qwen3-32B, 256 requests x 512
+  output tokens. With the current rule selector (`N=8192`, `R=256`, page=32),
+  the profiler did not find a better memory layout:
+  - rule: 6173.68 output tok/s in the best clean sweep run.
+  - profiled `8192/512`: 6156-6169 output tok/s.
+  - profiled `4096/256` and `4096/512`: about 6151-6152 output tok/s.
+  The right behavior here is to avoid installing a profile when measurement
+  says the rule plan is already best.
+- Forcing Hopper FA3 prefill-decode ahead of XQA for pure decode was tested and
+  rejected on the same H200 32B row. It fell to 5910.80 output tok/s. The
+  conclusion is narrower than "FA3 is bad": Pie's current FlashInfer Hopper
+  prefill wrapper is useful for real prefill/mixed batches, but it is not a
+  faster replacement for the GQA=8 XQA decode path on this shape.
+- XQA metadata construction was hoisted from every layer's attention call to
+  once per forward fire. This removes repeated page-table/sequence-length
+  metadata kernels and reduced H200 32B decode graph memory from about 124 MiB
+  to about 118 MiB. Throughput was noise-neutral on the 32B row, but the code
+  now better matches the real lifetime of that metadata.
+- Fresh H200 Qwen3-32B 256x512 comparison after these changes:
+  - standalone vLLM 0.21: 6173.99 output tok/s.
+  - Pie best clean sweep run: 6173.68 output tok/s.
+  - Pie individual reruns varied from about 6102 to 6174 output tok/s.
+  This should be treated as parity, not a robust Pie win. The earlier 6194
+  output tok/s Pie run was not reproduced consistently.
+- Local L40 TP=2 Qwen3-8B 512x512 remains a clear Pie win:
+  - Pie: 7455.62 output tok/s.
+  - standalone vLLM 0.20.2, used because the local driver cannot run the vLLM
+    0.21 torch/CUDA wheel: 7298.62 output tok/s.
+- MLA primitives do exist in FlashInfer (`paged_kv_mla_t`, batch MLA plan/run
+  files, SM90 and SM120 MLA kernels), but Pie does not yet have an MLA model
+  path or MLA KV-cache layout. Wiring those kernels would be model support work,
+  not a small attention dispatch swap. No fake MLA integration was kept.

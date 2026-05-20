@@ -21,6 +21,8 @@ struct Qwen3Workspace {
     DeviceTensor norm_x;     // [max_tokens, hidden]
     DeviceTensor qkv_fused;  // [max_tokens, Hq + 2*Hk]   — only allocated when fused
                              // QKV path is in use; empty otherwise.
+    DeviceTensor rope_table; // [max_tokens, head_dim] FP32; first half of
+                             // each row is standard-RoPE cos, second is sin.
     DeviceTensor q;          // [max_tokens, h_q  * head_dim]   — packed
     DeviceTensor k;          // [max_tokens, h_kv * head_dim]   — packed
     DeviceTensor v;          // [max_tokens, h_kv * head_dim]   — packed

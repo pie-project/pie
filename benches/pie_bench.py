@@ -234,6 +234,7 @@ async def cli_pie_client(args: argparse.Namespace):
             or "[pie-driver-cuda] forward_limits:" in txt
             or "[pie-driver-cuda] kv_cache:" in txt
             or "[pie-driver-cuda] CUDA graph upfront capture:" in txt
+            or " xqa_decode=" in txt
             or " WARN " in txt
             or " ERROR " in txt
             or "Batch response count mismatch" in txt
