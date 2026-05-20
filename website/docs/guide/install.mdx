@@ -70,6 +70,9 @@ This provides the standalone `bakery` command and the Python package used by
 
 The `pie` binary runs the embedded `cuda_native` and `portable` drivers without Python. Python is required only for the subprocess drivers: `dev`, `vllm`, and `sglang`. Install one with:
 
+> Note: The `dev`, `vllm`, and `sglang` drivers are currently not supported on Windows.
+> Please use the `portable` driver on Windows, or run these drivers in WSL/Linux.
+
 ```bash
 pie driver dev install ~/.pie/venvs/dev --run
 pie driver dev set venv ~/.pie/venvs/dev
