@@ -70,6 +70,19 @@ enum class PieLoaderQuantScheme {
   GgufQ8_0 = 12,
 };
 
+enum class PieLoaderRepackLayout {
+  None = 0,
+  MarlinMxfp4Weight = 1,
+  MarlinMxfp4Scale = 2,
+  DenseRowGather = 3,
+};
+
+enum class PieLoaderRowMap {
+  Identity = 0,
+  Even = 1,
+  Odd = 2,
+};
+
 enum class PieLoaderRuntimeSourceKind {
   DirectTensor = 0,
   Semantic = 1,
@@ -125,6 +138,7 @@ enum class PieLoaderTileMapKind {
   Transcode = 3,
   Reblock = 4,
   Reorder = 5,
+  Repack = 6,
   None = 255,
 };
 
@@ -344,6 +358,18 @@ struct PieLoaderStorageInstrView {
   uint64_t max_tile_bytes;
   PieLoaderQuantScheme transform_from;
   PieLoaderQuantScheme transform_to;
+  PieLoaderRepackLayout repack_layout;
+  PieLoaderRowMap row_map;
+  uint32_t transform_batch;
+  uint32_t transform_source_rows;
+  uint32_t transform_source_row_offset;
+  uint32_t transform_target_rows;
+  uint32_t transform_valid_rows;
+  uint32_t transform_source_stride_cols;
+  uint32_t transform_source_col_offset;
+  uint32_t transform_source_cols;
+  uint32_t transform_target_cols;
+  uint64_t transform_scratch_bytes;
   PieLoaderBytes name;
 };
 

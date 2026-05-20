@@ -1047,6 +1047,9 @@ private:
             case pie_weight_loader::PieLoaderTileMapKind::Reorder:
                 reorder_tile_map(instr);
                 return;
+            case pie_weight_loader::PieLoaderTileMapKind::Repack:
+                throw std::runtime_error(
+                    "portable rust loader: Repack TileMap is not supported");
             default:
                 throw std::runtime_error(
                     "portable rust loader: unsupported TileMap kind");
@@ -1341,6 +1344,8 @@ const char* tile_map_kind_name(pie_weight_loader::PieLoaderTileMapKind kind) {
             return "Reblock";
         case pie_weight_loader::PieLoaderTileMapKind::Reorder:
             return "Reorder";
+        case pie_weight_loader::PieLoaderTileMapKind::Repack:
+            return "Repack";
         case pie_weight_loader::PieLoaderTileMapKind::None:
             return "None";
     }

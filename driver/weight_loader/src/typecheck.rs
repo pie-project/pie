@@ -1,6 +1,9 @@
 use crate::error::CompileError;
 use crate::ir::{LayoutExpr, LayoutPlan};
-use crate::types::{Encoding, Layout, QuantScheme, Sharding, TensorDecl, encoding_nbytes};
+use crate::types::{
+    DType, Encoding, Layout, QuantScheme, RepackLayout, RepackSpec, RowMap, Sharding, TensorDecl,
+    encoding_nbytes,
+};
 
 pub fn typecheck(plan: &LayoutPlan) -> Result<Vec<TensorDecl>, CompileError> {
     let mut inferred = Vec::with_capacity(plan.exprs.len());
@@ -320,6 +323,11 @@ fn infer_expr(
                 ))),
             }
         }
+        LayoutExpr::Repack { input, spec, decl } => {
+            let source = input_decl(inferred, input.0, index)?;
+            validate_repack_spec(index, source, decl, *spec)?;
+            Ok(decl.clone())
+        }
         LayoutExpr::Attach {
             data,
             metadata,
@@ -365,6 +373,121 @@ fn input_decl(
     inferred.get(input as usize).ok_or_else(|| {
         CompileError::InvalidInput(format!("expr {index} input {input} is out of range"))
     })
+}
+
+fn validate_repack_spec(
+    index: usize,
+    source: &TensorDecl,
+    decl: &TensorDecl,
+    spec: RepackSpec,
+) -> Result<(), CompileError> {
+    if spec.layout == RepackLayout::None {
+        return Err(CompileError::InvalidInput(format!(
+            "Repack expr {index} has no target layout"
+        )));
+    }
+    if spec.batch == 0 || spec.source_rows == 0 || spec.target_rows == 0 {
+        return Err(CompileError::InvalidInput(format!(
+            "Repack expr {index} has invalid row dimensions"
+        )));
+    }
+    let valid_rows = if spec.valid_rows == 0 {
+        spec.target_rows
+    } else {
+        spec.valid_rows
+    };
+    if valid_rows > spec.target_rows {
+        return Err(CompileError::InvalidInput(format!(
+            "Repack expr {index} valid_rows exceeds target_rows"
+        )));
+    }
+    let source_col_end = spec
+        .source_col_offset
+        .checked_add(spec.source_cols)
+        .ok_or_else(|| {
+            CompileError::InvalidInput(format!("Repack expr {index} column offset overflow"))
+        })?;
+    if spec.source_cols == 0
+        || spec.target_cols == 0
+        || spec.target_cols < spec.source_cols
+        || spec.source_stride_cols < spec.source_cols
+        || spec.source_col_offset > spec.source_stride_cols
+        || source_col_end > spec.source_stride_cols
+    {
+        return Err(CompileError::InvalidInput(format!(
+            "Repack expr {index} has invalid column dimensions"
+        )));
+    }
+    match spec.row_map {
+        RowMap::Identity => {
+            if spec.source_row_offset + valid_rows > spec.source_rows {
+                return Err(CompileError::InvalidInput(format!(
+                    "Repack expr {index} row offset exceeds source rows"
+                )));
+            }
+        }
+        RowMap::Even | RowMap::Odd => {
+            if spec.source_rows % 2 != 0 {
+                return Err(CompileError::InvalidInput(format!(
+                    "Repack expr {index} even/odd row maps require an even source row count"
+                )));
+            }
+            let required = spec
+                .source_row_offset
+                .checked_add(valid_rows)
+                .and_then(|rows| rows.checked_mul(2))
+                .ok_or_else(|| {
+                    CompileError::InvalidInput(format!("Repack expr {index} row offset overflow"))
+                })?;
+            if required > spec.source_rows {
+                return Err(CompileError::InvalidInput(format!(
+                    "Repack expr {index} even/odd row offset exceeds source rows"
+                )));
+            }
+        }
+    }
+    match spec.layout {
+        RepackLayout::MarlinMxfp4Weight => {
+            if spec.source_cols % 8 != 0
+                || spec.target_cols % 8 != 0
+                || spec.source_stride_cols % 8 != 0
+                || spec.source_col_offset % 8 != 0
+            {
+                return Err(CompileError::InvalidInput(format!(
+                    "Repack expr {index} Marlin MXFP4 weight columns and offsets must be divisible by 8"
+                )));
+            }
+            match &decl.encoding {
+                Encoding::Quant(q) if q.scheme == QuantScheme::Mxfp4E2M1E8M0 => {}
+                _ => {
+                    return Err(CompileError::InvalidInput(format!(
+                        "Repack expr {index} Marlin MXFP4 weight output must be MXFP4 quantized"
+                    )));
+                }
+            }
+        }
+        RepackLayout::MarlinMxfp4Scale => {
+            if !matches!(decl.encoding, Encoding::Raw(DType::U8)) {
+                return Err(CompileError::InvalidInput(format!(
+                    "Repack expr {index} Marlin MXFP4 scale output must be raw U8"
+                )));
+            }
+            if u64::from(spec.target_rows) * u64::from(spec.target_cols) % 64 != 0 {
+                return Err(CompileError::InvalidInput(format!(
+                    "Repack expr {index} Marlin MXFP4 scale output requires total scale count divisible by 64"
+                )));
+            }
+        }
+        RepackLayout::DenseRowGather => {
+            if source.encoding != decl.encoding {
+                return Err(CompileError::InvalidInput(format!(
+                    "Repack expr {index} DenseRowGather cannot change encoding"
+                )));
+            }
+        }
+        RepackLayout::None => unreachable!(),
+    }
+    Ok(())
 }
 
 fn expect_decl(

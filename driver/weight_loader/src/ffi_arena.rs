@@ -3,15 +3,15 @@ use crate::ffi_types::{
     PieLoaderDType, PieLoaderDestExtentView, PieLoaderDimSpecSlice, PieLoaderDimSpecView,
     PieLoaderEncodingKind, PieLoaderI64Slice, PieLoaderMemoryPlanView,
     PieLoaderOptimizerPassStatsSlice, PieLoaderOptimizerPassStatsView,
-    PieLoaderOptimizerReportView, PieLoaderQuantScheme, PieLoaderSourceExtentView,
-    PieLoaderStorageInstrKind, PieLoaderStorageInstrSlice, PieLoaderStorageInstrView,
-    PieLoaderStorageProgramView, PieLoaderStridedExtentView, PieLoaderTensorDeclSlice,
-    PieLoaderTensorDeclView, PieLoaderTileMapKind, PieLoaderU32Slice,
+    PieLoaderOptimizerReportView, PieLoaderQuantScheme, PieLoaderRepackLayout, PieLoaderRowMap,
+    PieLoaderSourceExtentView, PieLoaderStorageInstrKind, PieLoaderStorageInstrSlice,
+    PieLoaderStorageInstrView, PieLoaderStorageProgramView, PieLoaderStridedExtentView,
+    PieLoaderTensorDeclSlice, PieLoaderTensorDeclView, PieLoaderTileMapKind, PieLoaderU32Slice,
 };
 use crate::storage::{
     DestExtent, SourceExtent, StorageInstr, StorageProgram, StridedExtent, TileMapKind,
 };
-use crate::types::{BufferId, DType, Encoding, QuantScheme};
+use crate::types::{BufferId, DType, Encoding, QuantScheme, RepackLayout, RowMap};
 
 #[derive(Default)]
 pub struct FfiArena {
@@ -165,6 +165,8 @@ impl FfiArena {
         let empty_buffers = PieLoaderBufferIdSlice::default();
         let empty_source = PieLoaderSourceExtentView::default();
         let empty_dest = PieLoaderDestExtentView::default();
+        let empty_repack = PieLoaderRepackLayout::None;
+        let empty_row_map = PieLoaderRowMap::Identity;
         match instr {
             StorageInstr::Allocate { id, buffer } => PieLoaderStorageInstrView {
                 id: id.0,
@@ -180,6 +182,18 @@ impl FfiArena {
                 max_tile_bytes: 0,
                 transform_from: PieLoaderQuantScheme::None,
                 transform_to: PieLoaderQuantScheme::None,
+                repack_layout: empty_repack,
+                row_map: empty_row_map,
+                transform_batch: 0,
+                transform_source_rows: 0,
+                transform_source_row_offset: 0,
+                transform_target_rows: 0,
+                transform_valid_rows: 0,
+                transform_source_stride_cols: 0,
+                transform_source_col_offset: 0,
+                transform_source_cols: 0,
+                transform_target_cols: 0,
+                transform_scratch_bytes: 0,
                 name: empty_name,
             },
             StorageInstr::ExtentWrite { id, source, dest } => PieLoaderStorageInstrView {
@@ -196,6 +210,18 @@ impl FfiArena {
                 max_tile_bytes: 0,
                 transform_from: PieLoaderQuantScheme::None,
                 transform_to: PieLoaderQuantScheme::None,
+                repack_layout: empty_repack,
+                row_map: empty_row_map,
+                transform_batch: 0,
+                transform_source_rows: 0,
+                transform_source_row_offset: 0,
+                transform_target_rows: 0,
+                transform_valid_rows: 0,
+                transform_source_stride_cols: 0,
+                transform_source_col_offset: 0,
+                transform_source_cols: 0,
+                transform_target_cols: 0,
+                transform_scratch_bytes: 0,
                 name: empty_name,
             },
             StorageInstr::TileMap {
@@ -233,6 +259,18 @@ impl FfiArena {
                     .to
                     .map(ffi_quant_scheme)
                     .unwrap_or(PieLoaderQuantScheme::None),
+                repack_layout: ffi_repack_layout(transform.repack.layout),
+                row_map: ffi_row_map(transform.repack.row_map),
+                transform_batch: transform.repack.batch,
+                transform_source_rows: transform.repack.source_rows,
+                transform_source_row_offset: transform.repack.source_row_offset,
+                transform_target_rows: transform.repack.target_rows,
+                transform_valid_rows: transform.repack.valid_rows,
+                transform_source_stride_cols: transform.repack.source_stride_cols,
+                transform_source_col_offset: transform.repack.source_col_offset,
+                transform_source_cols: transform.repack.source_cols,
+                transform_target_cols: transform.repack.target_cols,
+                transform_scratch_bytes: transform.scratch_bytes,
                 name: empty_name,
             },
             StorageInstr::CreateView {
@@ -255,6 +293,18 @@ impl FfiArena {
                 max_tile_bytes: 0,
                 transform_from: PieLoaderQuantScheme::None,
                 transform_to: PieLoaderQuantScheme::None,
+                repack_layout: empty_repack,
+                row_map: empty_row_map,
+                transform_batch: 0,
+                transform_source_rows: 0,
+                transform_source_row_offset: 0,
+                transform_target_rows: 0,
+                transform_valid_rows: 0,
+                transform_source_stride_cols: 0,
+                transform_source_col_offset: 0,
+                transform_source_cols: 0,
+                transform_target_cols: 0,
+                transform_scratch_bytes: 0,
                 name: empty_name,
             },
             StorageInstr::Attach {
@@ -276,6 +326,18 @@ impl FfiArena {
                 max_tile_bytes: 0,
                 transform_from: PieLoaderQuantScheme::None,
                 transform_to: PieLoaderQuantScheme::None,
+                repack_layout: empty_repack,
+                row_map: empty_row_map,
+                transform_batch: 0,
+                transform_source_rows: 0,
+                transform_source_row_offset: 0,
+                transform_target_rows: 0,
+                transform_valid_rows: 0,
+                transform_source_stride_cols: 0,
+                transform_source_col_offset: 0,
+                transform_source_cols: 0,
+                transform_target_cols: 0,
+                transform_scratch_bytes: 0,
                 name: empty_name,
             },
             StorageInstr::Release { id, buffer } => PieLoaderStorageInstrView {
@@ -292,6 +354,18 @@ impl FfiArena {
                 max_tile_bytes: 0,
                 transform_from: PieLoaderQuantScheme::None,
                 transform_to: PieLoaderQuantScheme::None,
+                repack_layout: empty_repack,
+                row_map: empty_row_map,
+                transform_batch: 0,
+                transform_source_rows: 0,
+                transform_source_row_offset: 0,
+                transform_target_rows: 0,
+                transform_valid_rows: 0,
+                transform_source_stride_cols: 0,
+                transform_source_col_offset: 0,
+                transform_source_cols: 0,
+                transform_target_cols: 0,
+                transform_scratch_bytes: 0,
                 name: empty_name,
             },
             StorageInstr::Finalize { id, tensor, name } => PieLoaderStorageInstrView {
@@ -308,6 +382,18 @@ impl FfiArena {
                 max_tile_bytes: 0,
                 transform_from: PieLoaderQuantScheme::None,
                 transform_to: PieLoaderQuantScheme::None,
+                repack_layout: empty_repack,
+                row_map: empty_row_map,
+                transform_batch: 0,
+                transform_source_rows: 0,
+                transform_source_row_offset: 0,
+                transform_target_rows: 0,
+                transform_valid_rows: 0,
+                transform_source_stride_cols: 0,
+                transform_source_col_offset: 0,
+                transform_source_cols: 0,
+                transform_target_cols: 0,
+                transform_scratch_bytes: 0,
                 name: self.push_string(name),
             },
         }
@@ -400,5 +486,23 @@ fn ffi_tile_kind(kind: TileMapKind) -> PieLoaderTileMapKind {
         TileMapKind::Transcode => PieLoaderTileMapKind::Transcode,
         TileMapKind::Reblock => PieLoaderTileMapKind::Reblock,
         TileMapKind::Reorder => PieLoaderTileMapKind::Reorder,
+        TileMapKind::Repack => PieLoaderTileMapKind::Repack,
+    }
+}
+
+fn ffi_repack_layout(layout: RepackLayout) -> PieLoaderRepackLayout {
+    match layout {
+        RepackLayout::None => PieLoaderRepackLayout::None,
+        RepackLayout::MarlinMxfp4Weight => PieLoaderRepackLayout::MarlinMxfp4Weight,
+        RepackLayout::MarlinMxfp4Scale => PieLoaderRepackLayout::MarlinMxfp4Scale,
+        RepackLayout::DenseRowGather => PieLoaderRepackLayout::DenseRowGather,
+    }
+}
+
+fn ffi_row_map(row_map: RowMap) -> PieLoaderRowMap {
+    match row_map {
+        RowMap::Identity => PieLoaderRowMap::Identity,
+        RowMap::Even => PieLoaderRowMap::Even,
+        RowMap::Odd => PieLoaderRowMap::Odd,
     }
 }

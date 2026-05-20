@@ -161,7 +161,27 @@ pub enum PieLoaderTileMapKind {
     Transcode = 3,
     Reblock = 4,
     Reorder = 5,
+    Repack = 6,
     None = 255,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PieLoaderRowMap {
+    #[default]
+    Identity = 0,
+    Even = 1,
+    Odd = 2,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PieLoaderRepackLayout {
+    #[default]
+    None = 0,
+    MarlinMxfp4Weight = 1,
+    MarlinMxfp4Scale = 2,
+    DenseRowGather = 3,
 }
 
 #[repr(C)]
@@ -474,6 +494,18 @@ pub struct PieLoaderStorageInstrView {
     pub max_tile_bytes: u64,
     pub transform_from: PieLoaderQuantScheme,
     pub transform_to: PieLoaderQuantScheme,
+    pub repack_layout: PieLoaderRepackLayout,
+    pub row_map: PieLoaderRowMap,
+    pub transform_batch: u32,
+    pub transform_source_rows: u32,
+    pub transform_source_row_offset: u32,
+    pub transform_target_rows: u32,
+    pub transform_valid_rows: u32,
+    pub transform_source_stride_cols: u32,
+    pub transform_source_col_offset: u32,
+    pub transform_source_cols: u32,
+    pub transform_target_cols: u32,
+    pub transform_scratch_bytes: u64,
     pub name: PieLoaderBytes,
 }
 

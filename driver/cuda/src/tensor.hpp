@@ -38,6 +38,10 @@ enum class DType : std::uint8_t {
     // reads `(M, N, K)` from the QuantMeta companion (group_size /
     // channel_axis) plus the tensor shape rather than from the dtype.
     INT4_PACKED = 9,
+    // Marlin-packed MXFP4 (E2M1 values with E8M0 block scales). The tensor
+    // stores the packed FP4 bytes in Marlin's tile layout; a QuantMeta /
+    // WeightView side tensor carries the E8M0 per-32-K scales.
+    MXFP4_PACKED = 10,
 };
 
 inline std::size_t dtype_bytes(DType d) {
@@ -52,6 +56,7 @@ inline std::size_t dtype_bytes(DType d) {
         case DType::FP8_E4M3: return 1;
         case DType::FP8_E5M2: return 1;
         case DType::INT4_PACKED: return 1;  // 1 byte holds 2 nibbles
+        case DType::MXFP4_PACKED: return 1;
     }
     throw std::runtime_error("unknown dtype");
 }
@@ -68,6 +73,7 @@ inline const char* dtype_name(DType d) {
         case DType::FP8_E4M3: return "fp8e4m3";
         case DType::FP8_E5M2: return "fp8e5m2";
         case DType::INT4_PACKED: return "int4-packed";
+        case DType::MXFP4_PACKED: return "mxfp4-packed";
     }
     return "?";
 }

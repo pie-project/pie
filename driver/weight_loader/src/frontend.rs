@@ -260,6 +260,26 @@ fn lower_contract_source(
             });
             Ok((selected, decl))
         }
+        RuntimeTensorSource::Repack { tensor, spec } => {
+            let raw = metadata.tensor(*tensor).ok_or_else(|| {
+                CompileError::InvalidInput(format!(
+                    "runtime tensor '{}' references missing Repack source tensor {}",
+                    contract.output_name, tensor.0
+                ))
+            })?;
+            let source_decl = source_decl(raw);
+            let source = plan.push(LayoutExpr::Source {
+                tensor: raw.id,
+                decl: source_decl,
+            });
+            let decl = contract_decl(contract, output_id);
+            let repacked = plan.push(LayoutExpr::Repack {
+                input: source,
+                spec: *spec,
+                decl: decl.clone(),
+            });
+            Ok((repacked, decl))
+        }
     }
 }
 
@@ -296,6 +316,7 @@ fn resolve_raw_tensor<'a>(
         }
         RuntimeTensorSource::ByteSpans(_)
         | RuntimeTensorSource::Join { .. }
+        | RuntimeTensorSource::Repack { .. }
         | RuntimeTensorSource::SelectContract { .. } => {
             return Err(CompileError::InvalidInput(format!(
                 "runtime tensor '{}' has no single raw source",

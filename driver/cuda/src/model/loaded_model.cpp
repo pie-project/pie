@@ -53,8 +53,12 @@ Mxfp4MoeLowering select_mxfp4_moe_lowering(
     const BackendTarget& target)
 {
     const std::string& policy = model_cfg.mxfp4_moe;
-    if (policy.empty() || policy == "auto" ||
-        policy == "routed_dequant" || policy == "packed") {
+    if (policy.empty() || policy == "auto") {
+        return target.mxfp4_native_gemm
+            ? Mxfp4MoeLowering::NativeGemm
+            : Mxfp4MoeLowering::RoutedDequant;
+    }
+    if (policy == "routed_dequant" || policy == "packed") {
         return Mxfp4MoeLowering::RoutedDequant;
     }
     if (policy == "bf16" || policy == "dequant" ||
@@ -121,15 +125,20 @@ LoadedModel LoadedModel::load(const Config& boot_cfg, NcclComm* tp_comm) {
     }
 #ifdef PIE_CUDA_HAS_MARLIN
     const bool gptq_marlin_int4 = true;
+    // Native MXFP4 expert execution requires a Blackwell-class FP4 path.
+    // Older GPUs keep packed MXFP4 resident but use routed BF16 dequant
+    // scratch for the selected experts.
+    const bool mxfp4_native_gemm = dev_prop.major >= 10;
 #else
     const bool gptq_marlin_int4 = false;
+    const bool mxfp4_native_gemm = false;
 #endif
     BackendTarget backend_target{
         .device_major = dev_prop.major,
         .device_minor = dev_prop.minor,
         .fp8_native = fp8_native,
         .gptq_marlin_int4 = gptq_marlin_int4,
-        .mxfp4_native_gemm = false,
+        .mxfp4_native_gemm = mxfp4_native_gemm,
     };
     backend_target.mxfp4_moe =
         select_mxfp4_moe_lowering(boot_cfg.model, backend_target);
@@ -212,7 +221,8 @@ LoadedModel LoadedModel::load(const Config& boot_cfg, NcclComm* tp_comm) {
         compile_rust_loader_plan_from_metadata(
             e.hf_, loader, runtime_quant, tp_rank, tp_size,
             64ull * 1024ull * 1024ull,
-            /*preferred_alignment=*/256);
+            /*preferred_alignment=*/256,
+            backend_target);
     const auto rust_view = rust_plan.program.view();
     if (const char* dump_path =
             std::getenv("PIE_CUDA_RUST_LAYOUT_PLAN_DUMP");

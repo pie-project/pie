@@ -1,10 +1,10 @@
 use pie_weight_loader::ir::{LayoutExpr, LayoutPlan};
 use pie_weight_loader::source::{CheckpointFile, CheckpointMetadata, RawTensor};
 use pie_weight_loader::storage::{StorageInstr, StorageTarget, TileMapKind};
-use pie_weight_loader::storage_compiler::lower_layout_plan;
+use pie_weight_loader::storage_compiler::{compile_storage_program, lower_layout_plan};
 use pie_weight_loader::types::{
-    Axis, BackendKind, CheckpointFormat, DType, Encoding, FileId, Layout, QuantScheme, QuantSpec,
-    Sharding, TensorDecl, TensorId,
+    Axis, BackendKind, CheckpointFormat, DType, Encoding, FileId, Layout, Mxfp4MoePolicy,
+    QuantScheme, QuantSpec, RepackLayout, RowMap, Sharding, TensorDecl, TensorId,
 };
 
 #[test]
@@ -294,6 +294,200 @@ fn packed_quant_source_requires_exact_affine_size() {
     assert!(err.contains("non-affine physical size"));
 }
 
+#[test]
+fn gpt_oss_native_mxfp4_default_abi_lowers_to_repack_tile_maps() {
+    let cfg = pie_weight_loader::config::ModelConfig {
+        model_type: "gpt_oss".to_string(),
+        quant_method: String::new(),
+        runtime_quant: String::new(),
+        num_hidden_layers: 1,
+        num_experts: 2,
+        num_experts_per_tok: 2,
+    };
+    let target = StorageTarget {
+        backend: BackendKind::Cuda,
+        mxfp4_moe: Mxfp4MoePolicy::NativeGemm,
+        native_mxfp4_moe: true,
+        ..StorageTarget::default()
+    };
+    let metadata = gpt_oss_mxfp4_metadata();
+    let abi =
+        pie_weight_loader::abi::RuntimeAbi::default_for_target(&metadata, &cfg, &target).unwrap();
+    let program = compile_storage_program(&metadata, &cfg, &abi, target).unwrap();
+
+    let repacks: Vec<_> = program
+        .instrs
+        .iter()
+        .filter_map(|instr| match instr {
+            StorageInstr::TileMap {
+                kind: TileMapKind::Repack,
+                transform,
+                ..
+            } => Some(transform),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(repacks.len(), 8);
+    assert!(
+        repacks
+            .iter()
+            .any(|spec| spec.repack.layout == RepackLayout::MarlinMxfp4Weight)
+    );
+    assert!(
+        repacks
+            .iter()
+            .any(|spec| spec.repack.layout == RepackLayout::MarlinMxfp4Scale)
+    );
+    assert!(
+        repacks
+            .iter()
+            .any(|spec| spec.repack.layout == RepackLayout::DenseRowGather)
+    );
+    let names = program
+        .tensors
+        .iter()
+        .map(|tensor| tensor.name.as_str())
+        .collect::<Vec<_>>();
+    assert!(names.contains(&"model.layers.0.mlp.experts.gate_proj.weight"));
+    assert!(names.contains(&"model.layers.0.mlp.experts.up_proj.weight"));
+    assert!(names.contains(&"model.layers.0.mlp.experts.down_proj.weight"));
+    assert!(!names.contains(&"model.layers.0.mlp.experts.gate_up_proj.weight"));
+    assert!(program.memory.transform_scratch_peak_bytes > 0);
+}
+
+#[test]
+fn gpt_oss_native_mxfp4_tp_uses_row_and_column_offset_repack_contracts() {
+    let cfg = pie_weight_loader::config::ModelConfig {
+        model_type: "gpt_oss".to_string(),
+        quant_method: String::new(),
+        runtime_quant: String::new(),
+        num_hidden_layers: 1,
+        num_experts: 2,
+        num_experts_per_tok: 2,
+    };
+    let target = StorageTarget {
+        backend: BackendKind::Cuda,
+        tp_rank: 1,
+        tp_size: 2,
+        mxfp4_moe: Mxfp4MoePolicy::NativeGemm,
+        native_mxfp4_moe: true,
+        ..StorageTarget::default()
+    };
+    let metadata = gpt_oss_mxfp4_metadata_with_intermediate(128);
+    let abi =
+        pie_weight_loader::abi::RuntimeAbi::default_for_target(&metadata, &cfg, &target).unwrap();
+    let abi_repacks = abi
+        .tensors
+        .iter()
+        .filter_map(|contract| match contract.source {
+            pie_weight_loader::abi::RuntimeTensorSource::Repack { spec, .. } => Some(spec),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        abi_repacks
+            .iter()
+            .any(|spec| spec.layout == RepackLayout::MarlinMxfp4Weight
+                && spec.row_map == RowMap::Even
+                && spec.source_row_offset == 64
+                && spec.valid_rows == 64
+                && spec.source_stride_cols == 64
+                && spec.source_col_offset == 0)
+    );
+    assert!(
+        abi_repacks
+            .iter()
+            .any(|spec| spec.layout == RepackLayout::MarlinMxfp4Weight
+                && spec.row_map == RowMap::Identity
+                && spec.source_col_offset == 64
+                && spec.source_stride_cols == 128
+                && spec.source_cols == 64)
+    );
+
+    let program = compile_storage_program(&metadata, &cfg, &abi, target).unwrap();
+
+    let repacks = program
+        .instrs
+        .iter()
+        .filter_map(|instr| match instr {
+            StorageInstr::TileMap {
+                kind: TileMapKind::Repack,
+                transform,
+                ..
+            } => Some(transform.repack),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let repack_sources = program
+        .instrs
+        .iter()
+        .filter_map(|instr| match instr {
+            StorageInstr::TileMap {
+                kind: TileMapKind::Repack,
+                source,
+                transform,
+                ..
+            } => source.as_ref().map(|source| (transform.repack, source)),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(repacks.len(), 8);
+    assert!(
+        repacks
+            .iter()
+            .any(|spec| spec.layout == RepackLayout::MarlinMxfp4Weight
+                && spec.row_map == RowMap::Even
+                && spec.source_rows == 128
+                && spec.source_row_offset == 0
+                && spec.valid_rows == 64
+                && spec.target_rows == 128
+                && spec.source_stride_cols == 64
+                && spec.source_col_offset == 0
+                && spec.source_cols == 64
+                && spec.target_cols == 64)
+    );
+    assert!(
+        repacks
+            .iter()
+            .any(|spec| spec.layout == RepackLayout::DenseRowGather
+                && spec.row_map == RowMap::Odd
+                && spec.source_rows == 128
+                && spec.source_row_offset == 0
+                && spec.valid_rows == 64
+                && spec.target_rows == 64)
+    );
+    assert!(
+        repacks
+            .iter()
+            .any(|spec| spec.layout == RepackLayout::MarlinMxfp4Weight
+                && spec.row_map == RowMap::Identity
+                && spec.source_col_offset == 0
+                && spec.source_stride_cols == 64
+                && spec.source_cols == 64
+                && spec.target_cols == 128)
+    );
+    assert!(
+        repacks
+            .iter()
+            .any(|spec| spec.layout == RepackLayout::MarlinMxfp4Scale
+                && spec.row_map == RowMap::Identity
+                && spec.source_col_offset == 0
+                && spec.source_stride_cols == 2
+                && spec.source_cols == 2
+                && spec.target_cols == 4)
+    );
+    assert!(repack_sources.iter().any(|(spec, source)| spec.layout
+        == RepackLayout::MarlinMxfp4Weight
+        && spec.row_map == RowMap::Even
+        && source.span_bytes == 8192));
+    assert!(repack_sources.iter().any(|(spec, source)| spec.layout
+        == RepackLayout::MarlinMxfp4Weight
+        && spec.row_map == RowMap::Identity
+        && source.span_bytes == 4096));
+    assert_eq!(program.memory.checkpoint_read_bytes, 23_040);
+}
+
 fn metadata() -> CheckpointMetadata {
     CheckpointMetadata {
         files: vec![CheckpointFile {
@@ -352,6 +546,80 @@ fn quant_metadata() -> CheckpointMetadata {
     }
 }
 
+fn gpt_oss_mxfp4_metadata() -> CheckpointMetadata {
+    gpt_oss_mxfp4_metadata_with_intermediate(64)
+}
+
+fn gpt_oss_mxfp4_metadata_with_intermediate(intermediate: i64) -> CheckpointMetadata {
+    assert!(intermediate % 32 == 0);
+    let mut offset = 0u64;
+    let mut tensors = Vec::new();
+    let hidden = 64;
+    let hidden_groups = hidden / 32;
+    let intermediate_groups = intermediate / 32;
+    let specs = [
+        (
+            10,
+            "model.layers.0.mlp.experts.gate_up_proj_blocks",
+            vec![2, 2 * intermediate, hidden_groups, 16],
+            DType::U8,
+        ),
+        (
+            11,
+            "model.layers.0.mlp.experts.gate_up_proj_scales",
+            vec![2, 2 * intermediate, hidden_groups],
+            DType::U8,
+        ),
+        (
+            12,
+            "model.layers.0.mlp.experts.gate_up_proj_bias",
+            vec![2, 2 * intermediate],
+            DType::BF16,
+        ),
+        (
+            13,
+            "model.layers.0.mlp.experts.down_proj_blocks",
+            vec![2, hidden, intermediate_groups, 16],
+            DType::U8,
+        ),
+        (
+            14,
+            "model.layers.0.mlp.experts.down_proj_scales",
+            vec![2, hidden, intermediate_groups],
+            DType::U8,
+        ),
+        (
+            15,
+            "model.layers.0.mlp.experts.down_proj_bias",
+            vec![2, hidden],
+            DType::BF16,
+        ),
+    ];
+    for (id, name, shape, dtype) in specs {
+        let bytes = tensor_bytes(&shape, dtype);
+        tensors.push(RawTensor {
+            id: TensorId(id),
+            name: name.to_string(),
+            file_id: FileId(0),
+            file_offset: offset,
+            span_bytes: bytes,
+            shape,
+            encoding: Encoding::Raw(dtype),
+            layout: Layout::dense(1),
+        });
+        offset += bytes;
+    }
+    CheckpointMetadata {
+        files: vec![CheckpointFile {
+            id: FileId(0),
+            path: "gpt_oss.safetensors".to_string(),
+            size_bytes: offset,
+            format: CheckpointFormat::Safetensors,
+        }],
+        tensors,
+    }
+}
+
 fn raw(id: u32, name: &str, offset: u64, shape: &[i64], dtype: DType) -> RawTensor {
     RawTensor {
         id: TensorId(id),
@@ -388,6 +656,12 @@ fn quant(scheme: QuantScheme, dtype: DType) -> QuantSpec {
         zero_point_dtype: None,
         block_shape: Vec::new(),
     }
+}
+
+fn tensor_bytes(shape: &[i64], dtype: DType) -> u64 {
+    shape
+        .iter()
+        .fold(dtype.bytes(), |acc, dim| acc * u64::try_from(*dim).unwrap())
 }
 
 fn instr_id(instr: &StorageInstr) -> pie_weight_loader::types::InstrId {

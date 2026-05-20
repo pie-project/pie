@@ -688,10 +688,10 @@ Expose final packed expert tensors and fused expert biases
 ```
 
 This lowering keeps MXFP4 as the final runtime representation. Backends are
-pluggable capabilities: the default CUDA native backend dequantizes only the
-routed experts into bounded runtime scratch before invoking existing BF16 GEMMs,
-while a FlashInfer/TRT-LLM, CUTLASS, or Marlin backend can consume the same
-packed artifact with true native MXFP4 MoE kernels. Pie should not maintain a
+pluggable capabilities: Blackwell-class CUDA targets use the Marlin-backed
+FE2M1/E8M0 expert GEMM adapter, while legacy or non-Marlin builds keep the same
+packed artifact resident and dequantize only routed experts into bounded
+runtime scratch before invoking existing BF16 GEMMs. Pie should not maintain a
 naive in-tree MXFP4 GEMM; native execution is an adapter over a proven backend.
 
 BF16 fallback lowering:
@@ -706,12 +706,13 @@ Drop packed blocks, scales, and temporary BF16 tensors
 ```
 
 GPT-OSS uses these lowerings for expert MLP weights and biases. Packed MXFP4
-is now the default representation for the CUDA native driver: `bind_gpt_oss`
-consumes `QuantPacked` expert tensors and the Mixtral-style MoE backend
-dequantizes routed experts into fixed BF16 scratch buffers at dispatch time.
-`[model].mxfp4_moe = "bf16"` or `"eager_bf16"` forces the eager load-time BF16
-fallback when comparing representation and memory behavior; `"native"` requires
-a registered backend such as FlashInfer/TRT-LLM, CUTLASS, or Marlin.
+is now the default representation for the CUDA native driver. `auto` selects
+native packed expert GEMM on supported Blackwell-class GPUs/builds; otherwise
+`bind_gpt_oss` consumes `QuantPacked` expert tensors and the Mixtral-style MoE
+backend dequantizes only routed experts into fixed BF16 scratch buffers at
+dispatch time. `[model].mxfp4_moe = "bf16"` or `"eager_bf16"` forces the eager
+load-time BF16 fallback when comparing representation and memory behavior;
+`"native"` requires a registered backend such as Marlin.
 
 ### FP8 Fallback
 
@@ -1026,7 +1027,8 @@ Last updated: 2026-05-17.
   shard ops; canonical quant scale tensors that must remain FP32 are left
   untouched.
 - `RepackLayout` is a first-class scheduled load executor operation for
-  symmetric GPTQ int4 checkpoints that target Marlin W4A16 storage.
+  symmetric GPTQ int4 checkpoints that target Marlin W4A16 storage and for
+  GPT-OSS native MXFP4 expert tensors that target Marlin MXFP4 storage.
 - AWQ int4 checkpoints and GPTQ int4 fallback variants, including GPTQ
   act-order, lower into scheduled
   `Copy(qweight/qzeros/scales[/g_idx]) -> Dequantize -> Drop` op sequences.
@@ -1057,6 +1059,13 @@ Last updated: 2026-05-17.
 - `Dequantize` materialization supports compressed-tensors FP8 E4M3, AWQ
   int4, GPTQ int4, and GPT-OSS MXFP4 E2M1/E8M0 blockwise dequantization to
   BF16.
+- GPT-OSS native MXFP4 no longer performs binder-time repacking. The Rust
+  RuntimeABI emits final `gate_proj`, `up_proj`, and `down_proj` contracts;
+  the storage compiler lowers raw `_blocks`, `_scales`, and fused bias tensors
+  into typed `RepackLayout` tile maps. The CUDA executor materializes Marlin
+  MXFP4 weights/scales and bias row gathers directly into final `WeightStore`
+  tensors, and `bind_gpt_oss` only creates expert views over those finalized
+  tensors. Legacy GPUs keep the routed-dequant fallback.
 - Symmetric GPTQ int4 checkpoints with `desc_act=false` and no zero-points
   lower into scheduled
   `Copy(qweight/scales) -> RepackLayout -> AttachMetadata -> Drop`. The final
@@ -1083,15 +1092,21 @@ Last updated: 2026-05-17.
   in addition to `rope_scaling`, and serving maps the full `RopeScaling` enum
   into runtime `RopeKind`. This preserves Original YaRN for OLMo-3, GPT-OSS,
   and Ministral-3 instead of collapsing it to standard RoPE.
-- GPT-OSS 20B MXFP4 expert tensors have two explicit lowerings. The default
-  CUDA native lowering emits final `QuantPacked` MXFP4 expert tensors with
-  E8M0 scale metadata and fused expert biases. The runtime MoE backend
-  consumes those packed tensors and dequantizes only routed experts into
-  bounded BF16 scratch before existing BF16 GEMMs. The eager load-time BF16
-  fallback remains available through `[model].mxfp4_moe = "bf16"` or
-  `"eager_bf16"`. True native MXFP4 is represented as a `BackendTarget`
-  capability and should bind to FlashInfer/TRT-LLM, CUTLASS, or Marlin rather
-  than an architecture-local custom GEMM.
+- GPT-OSS 20B MXFP4 expert tensors have target-dependent lowerings. On CUDA
+  targets with native MXFP4 enabled, the storage program repacks E2M1 blocks
+  and E8M0 scales into Marlin's native FE2M1/E8M0 GEMM layout and runtime
+  expert GEMMs consume those packed tensors directly. Tensor-parallel native
+  plans are expressed with row/column-offset `Repack` contracts, so gate/up
+  rank slices deinterleave from the right fused rows and down-projection rank
+  slices read the right intermediate columns without a routed-dequant fallback.
+  The storage compiler narrows the physical source extent before execution:
+  row offsets become compact row slices, down-projection column offsets become
+  compact MXFP4 group slices, and the executor uses strided source reads to
+  materialize only the rank-local repack input.
+  Legacy or explicitly configured targets keep the same packed checkpoint
+  tensors resident and dequantize only routed experts into bounded BF16 scratch.
+  The eager load-time BF16 fallback remains available through
+  `[model].mxfp4_moe = "bf16"` or `"eager_bf16"`.
 - `PIE_CUDA_RUST_LAYOUT_PLAN_DUMP=/path/to/plan.json` writes a JSON plan artifact with
   algebra expressions, tensor specs, storage extent writes, tile maps, and
   semantic/storage memory estimates.
@@ -1170,9 +1185,9 @@ Last updated: 2026-05-17.
 
 ### Not Yet Implemented
 
-- True hardware-native MXFP4 MoE GEMM kernels. The current packed runtime
-  backend keeps MXFP4 as the final loaded representation and dequantizes only
-  routed experts into bounded BF16 scratch before GEMM.
+- A full fused FlashInfer/TRT-LLM MXFP4 MoE backend. The current native CUDA
+  adapter uses Marlin per-expert MXFP4 GEMMs inside Pie's existing host-routed
+  MoE loop; unsupported legacy GPUs/builds fall back to routed BF16 scratch.
 - Future architecture adapters for checkpoint formats not yet in the local
   claim set.
 
@@ -1305,6 +1320,24 @@ Latest verification:
   transform. They also cover target-dependent symmetric GPTQ and AWQ:
   Marlin-capable targets emit `RepackLayout`; non-Marlin targets emit scheduled
   BF16 `Dequantize` when the checkpoint has qzeros metadata.
+- GPT-OSS 20B native MXFP4 current verification:
+  `cargo test --manifest-path driver/weight_loader/Cargo.toml`,
+  `cmake --build driver/cuda/build --target pie_driver_cuda -j2`, and
+  `ctest --test-dir driver/cuda/build --output-on-failure` pass. One-token
+  CUDA smoke with `model.mxfp4_moe=native` emits 192 `Repack` tile maps,
+  finalizes 531 runtime tensors, loads 13,338 MiB on this rank in 1.5 s, and
+  returns last-token argmax 271. `auto` selects the same native plan on the
+  tested Blackwell target and produces byte-identical logits to explicit
+  `native`; `routed_dequant` remains functional and returns the same argmax.
+  Tensor-parallel GPT-OSS MXFP4 native planning now emits row/column-offset
+  `Repack` contracts; the rank-local native path is compiled instead of
+  falling back to routed-dequant when the TP shard aligns with MXFP4 groups.
+  Rust storage-compiler tests cover TP=2/rank=1 gate/up row offsets and
+  down-projection column offsets, including narrowed source byte counts. CUDA
+  CTest includes MXFP4 Marlin kernel golden fixtures for even/odd row offsets,
+  padded valid rows, down-projection column offsets, and scale group-offset
+  permutation. `benches/run_loader_evidence.py --skip-benches` records both
+  Rust loader tests and the CUDA CTest suite.
 - Current-turn verification: Qwen3-0.6B CUDA native one-token smoke completed
   1/1 with 98.9 ms mean latency. Dumped plan: 171 `Copy`, 56 `AxisConcat`,
   persistent 1,433 MiB, temp 6 MiB, and zero post-load transforms.
@@ -1341,8 +1374,10 @@ Latest verification:
   tensors, and no compressed-FP8 post-load transform.
 - Dumped openai/gpt-oss-20b packed-runtime plan: 459 `Copy` ops and
   48 `AttachMetadata` ops, zero post-load transforms, persistent weight
-  estimate 13,123 MiB, and load-time temporary estimate 0 MiB. Runtime MoE
-  dispatch uses bounded BF16 scratch for only the routed MXFP4 experts.
+  estimate 13,123 MiB, and load-time temporary estimate 0 MiB. On Blackwell
+  native targets, bind time repacks those packed tensors into Marlin FE2M1/E8M0
+  expert GEMM storage; legacy targets use bounded BF16 scratch only for the
+  routed MXFP4 experts.
 - Small real GPTQ/AWQ smokes:
   `Qwen/Qwen2.5-0.5B-Instruct-GPTQ-Int4` completed 1/1 with 98.5 ms mean
   latency, and `Qwen/Qwen2-0.5B-Instruct-AWQ` completed 1/1 with 98.8 ms mean
@@ -1395,8 +1430,9 @@ Latest verification:
     and PDL disabled for CUDA 12.8/SM120 compatibility: 786.1 ms mean latency,
     20.35 output tok/s latency run, 76.95 output tok/s throughput run.
 - Current algebra compiler milestone:
-  - GPT-OSS MXFP4 is emitted as native algebra for packed routed-dequant and
-    eager-BF16 fallback, with no planner ops in either path.
+  - GPT-OSS MXFP4 is emitted as native algebra for packed native-GEMM,
+    packed routed-dequant, and eager-BF16 fallback, with no planner ops in any
+    path.
   - Algebra-only storage compilation covers GPT-OSS MXFP4 extent writes,
     decode tile maps, deinterleave/select transforms, attach steps, and
     releases.

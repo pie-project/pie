@@ -158,7 +158,8 @@ inline RustLoaderCompileResult compile_rust_loader_plan_from_metadata(
     int tp_rank,
     int tp_size,
     std::uint64_t max_tile_bytes,
-    std::uint32_t preferred_alignment)
+    std::uint32_t preferred_alignment,
+    const BackendTarget& backend_target)
 {
     RustLoaderInputBuilder input;
     input.set_model(hf, runtime_quant);
@@ -166,7 +167,9 @@ inline RustLoaderCompileResult compile_rust_loader_plan_from_metadata(
         tp_rank,
         tp_size,
         max_tile_bytes,
-        preferred_alignment);
+        preferred_alignment,
+        backend_target.mxfp4_moe,
+        backend_target.mxfp4_native_gemm);
     input.set_runtime_abi_name("pie-cuda", /*version=*/1);
 
     RustLoaderSourceIndex source_index =
@@ -251,6 +254,8 @@ inline const char* rust_tile_map_kind_name(
         return "Reblock";
     case pie_weight_loader::PieLoaderTileMapKind::Reorder:
         return "Reorder";
+    case pie_weight_loader::PieLoaderTileMapKind::Repack:
+        return "Repack";
     case pie_weight_loader::PieLoaderTileMapKind::None:
         return "None";
     }

@@ -17,6 +17,8 @@ include = [
   "PieLoaderSemanticRole",
   "PieLoaderStorageInstrKind",
   "PieLoaderTileMapKind",
+  "PieLoaderRowMap",
+  "PieLoaderRepackLayout",
   "PieLoaderBytes",
   "PieLoaderU32Slice",
   "PieLoaderI64Slice",

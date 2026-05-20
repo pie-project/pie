@@ -71,6 +71,23 @@ struct WeightView {
         v.channel_axis = meta.channel_axis;
         return v;
     }
+
+    static WeightView mxfp4_marlin(
+        const DeviceTensor& weight,
+        const DeviceTensor& scale)
+    {
+        WeightView v;
+        v.data = weight.data();
+        v.dtype = DType::MXFP4_PACKED;
+        v.nbytes = weight.nbytes();
+        v.scale_data = scale.data();
+        v.scale_dtype = DType::UINT8;
+        v.scale_numel = scale.numel();
+        v.quant_kind = QuantMeta::Kind::PerGroup;
+        v.group_size = 32;
+        v.channel_axis = 0;
+        return v;
+    }
 };
 
 class CublasHandle {

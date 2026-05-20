@@ -21,7 +21,11 @@
 #if PIE_CUDA_RUST_STORAGE_EXECUTOR_HAS_CUDA
 #include "cuda_check.hpp"
 #include "kernels/dtype_cast.hpp"
+#include "kernels/mxfp4_marlin.hpp"
 #include "kernels/quant_bf16_to_fp8.hpp"
+#ifdef PIE_CUDA_HAS_MARLIN
+#include "marlin_wrapper.hpp"
+#endif
 #endif
 #include "loader/rust_quant_attachment.hpp"
 #include "loader/safetensors.hpp"
@@ -346,6 +350,9 @@ private:
         case pie_weight_loader::PieLoaderTileMapKind::Encode:
             encode_tile_map(instr, stats);
             return;
+        case pie_weight_loader::PieLoaderTileMapKind::Repack:
+            repack_tile_map(instr);
+            return;
         case pie_weight_loader::PieLoaderTileMapKind::Decode:
         case pie_weight_loader::PieLoaderTileMapKind::Transcode:
         case pie_weight_loader::PieLoaderTileMapKind::None:
@@ -633,6 +640,276 @@ private:
             materialize_encode_input_bf16_rows(instr, shape, 0, rows);
         launch_encode_tile(instr, bf16, out, scale, 0, rows, cols);
     }
+
+#if PIE_CUDA_RUST_STORAGE_EXECUTOR_HAS_CUDA
+    static kernels::Mxfp4RowSelect repack_row_map(
+        pie_weight_loader::PieLoaderRowMap row_map)
+    {
+        switch (row_map) {
+        case pie_weight_loader::PieLoaderRowMap::Identity:
+            return kernels::Mxfp4RowSelect::Identity;
+        case pie_weight_loader::PieLoaderRowMap::Even:
+            return kernels::Mxfp4RowSelect::Even;
+        case pie_weight_loader::PieLoaderRowMap::Odd:
+            return kernels::Mxfp4RowSelect::Odd;
+        }
+        throw std::runtime_error(
+            "rust storage executor: unknown Repack row map");
+    }
+#endif
+
+    static std::uint64_t checked_mul_u64(
+        std::uint64_t lhs,
+        std::uint64_t rhs,
+        const char* context)
+    {
+        if (rhs != 0 && lhs > UINT64_MAX / rhs) {
+            throw std::runtime_error(
+                std::string("rust storage executor: ") + context +
+                " byte size overflow");
+        }
+        return lhs * rhs;
+    }
+
+    static std::uint64_t checked_nibble_bytes(
+        std::uint64_t rows,
+        std::uint64_t cols,
+        const char* context)
+    {
+        const std::uint64_t elements = checked_mul_u64(rows, cols, context);
+        if (elements % 2 != 0) {
+            throw std::runtime_error(
+                std::string("rust storage executor: ") + context +
+                " has odd nibble element count");
+        }
+        return elements / 2;
+    }
+
+    DeviceTensor materialize_repack_source(
+        const pie_weight_loader::PieLoaderStorageInstrView& instr)
+    {
+        if (instr.has_source) {
+            if (instr.source.tensor_id >= source_tensor_names_.size()) {
+                throw std::runtime_error(
+                    "rust storage executor: Repack source tensor id out of range");
+            }
+            DeviceTensor scratch = DeviceTensor::allocate(
+                DType::UINT8,
+                {static_cast<std::int64_t>(instr.source.span_bytes)});
+            if (!wl_cpp::compact_extent(instr.source.stride)) {
+                copy_strided_extent_to_device(
+                    instr,
+                    scratch.data(),
+                    wl_cpp::extent_shape(instr.source.stride));
+            } else {
+                loader_.copy_storage_bytes_to_device(
+                    instr.source.file_id,
+                    instr.source.file_offset + instr.source.stride.base_offset,
+                    instr.source.span_bytes,
+                    scratch.data());
+            }
+            return scratch;
+        }
+        if (instr.input_buffers.len != 1) {
+            throw std::runtime_error(
+                "rust storage executor: Repack expects source or one input buffer");
+        }
+        const DeviceTensor& input =
+            buffer_or_finalized_tensor(instr.input_buffers.ptr[0]);
+        DeviceTensor scratch = DeviceTensor::allocate(
+            DType::UINT8,
+            {static_cast<std::int64_t>(input.nbytes())});
+#if PIE_CUDA_RUST_STORAGE_EXECUTOR_HAS_CUDA
+        CUDA_CHECK(cudaMemcpyAsync(
+            scratch.data(),
+            input.data(),
+            input.nbytes(),
+            cudaMemcpyDeviceToDevice,
+            /*stream=*/0));
+#else
+        throw std::runtime_error(
+            "rust storage executor: CUDA Repack compiled without CUDA headers");
+#endif
+        return scratch;
+    }
+
+    void repack_tile_map(
+        const pie_weight_loader::PieLoaderStorageInstrView& instr)
+    {
+#if PIE_CUDA_RUST_STORAGE_EXECUTOR_HAS_CUDA
+        if (instr.output_buffers.len != 1 || !instr.has_dest) {
+            throw std::runtime_error(
+                "rust storage executor: Repack expects one output and destination extent");
+        }
+        const int batch = static_cast<int>(instr.transform_batch);
+        const int source_rows = static_cast<int>(instr.transform_source_rows);
+        const int source_row_offset =
+            static_cast<int>(instr.transform_source_row_offset);
+        const int target_rows = static_cast<int>(instr.transform_target_rows);
+        const int valid_rows = instr.transform_valid_rows == 0
+            ? target_rows
+            : static_cast<int>(instr.transform_valid_rows);
+        const int source_stride_cols = instr.transform_source_stride_cols == 0
+            ? static_cast<int>(instr.transform_source_cols)
+            : static_cast<int>(instr.transform_source_stride_cols);
+        const int source_col_offset =
+            static_cast<int>(instr.transform_source_col_offset);
+        const int source_cols = static_cast<int>(instr.transform_source_cols);
+        const int target_cols = static_cast<int>(instr.transform_target_cols);
+        if (batch <= 0 || source_rows <= 0 || target_rows <= 0 ||
+            valid_rows <= 0 || valid_rows > target_rows ||
+            source_stride_cols <= 0 || source_col_offset < 0 ||
+            source_cols <= 0 || target_cols <= 0 ||
+            source_col_offset + source_cols > source_stride_cols) {
+            throw std::runtime_error(
+                "rust storage executor: Repack has invalid transform dimensions");
+        }
+        DeviceTensor& output = buffer_tensor(instr.output_buffers.ptr[0]);
+        auto* dst_base = static_cast<std::uint8_t*>(output.data()) +
+            instr.dest.offset + instr.dest.stride.base_offset;
+        DeviceTensor source = materialize_repack_source(instr);
+        const auto* src_base =
+            static_cast<const std::uint8_t*>(source.data());
+        const auto row_map = repack_row_map(instr.row_map);
+
+        switch (instr.repack_layout) {
+        case pie_weight_loader::PieLoaderRepackLayout::MarlinMxfp4Weight:
+            repack_marlin_mxfp4_weight(
+                src_base, dst_base, batch, source_rows, source_row_offset,
+                target_rows, valid_rows, source_stride_cols,
+                source_col_offset, source_cols, target_cols, row_map);
+            return;
+        case pie_weight_loader::PieLoaderRepackLayout::MarlinMxfp4Scale:
+            repack_marlin_mxfp4_scale(
+                src_base, dst_base, batch, source_rows, source_row_offset,
+                target_rows, valid_rows, source_stride_cols,
+                source_col_offset, source_cols, target_cols, row_map);
+            return;
+        case pie_weight_loader::PieLoaderRepackLayout::DenseRowGather:
+            if (source_cols != 1 || target_cols != 1) {
+                throw std::runtime_error(
+                    "rust storage executor: DenseRowGather Repack expects column count 1");
+            }
+            kernels::launch_bf16_row_map_to_dense(
+                src_base, dst_base, batch, source_rows, source_row_offset,
+                target_rows, valid_rows, row_map, /*stream=*/0);
+            CUDA_CHECK(cudaGetLastError());
+            return;
+        case pie_weight_loader::PieLoaderRepackLayout::None:
+            break;
+        }
+        throw std::runtime_error(
+            "rust storage executor: Repack has no target layout");
+#else
+        (void)instr;
+        throw std::runtime_error(
+            "rust storage executor: CUDA Repack compiled without CUDA headers");
+#endif
+    }
+
+#if PIE_CUDA_RUST_STORAGE_EXECUTOR_HAS_CUDA
+    void repack_marlin_mxfp4_weight(
+        const std::uint8_t* src_base,
+        std::uint8_t* dst_base,
+        int batch,
+        int source_rows,
+        int source_row_offset,
+        int target_rows,
+        int valid_rows,
+        int source_stride_cols,
+        int source_col_offset,
+        int source_cols,
+        int target_cols,
+        kernels::Mxfp4RowSelect row_map)
+    {
+#if defined(PIE_CUDA_HAS_MARLIN)
+        if (source_cols % 8 != 0 || target_cols % 8 != 0 ||
+            source_stride_cols % 8 != 0 || source_col_offset % 8 != 0 ||
+            target_cols < source_cols ||
+            source_col_offset + source_cols > source_stride_cols) {
+            throw std::runtime_error(
+                "rust storage executor: MarlinMxfp4Weight Repack requires "
+                "K/stride/offset divisible by 8 and target K >= source K");
+        }
+        const std::uint64_t source_bytes =
+            checked_nibble_bytes(
+                source_rows, source_stride_cols, "MXFP4 source");
+        const std::uint64_t target_bytes =
+            checked_nibble_bytes(target_rows, target_cols, "MXFP4 target");
+        DeviceTensor gptq_stage = DeviceTensor::allocate(
+            DType::UINT8,
+            {static_cast<std::int64_t>(target_bytes)});
+        for (int b = 0; b < batch; ++b) {
+            const auto* src =
+                src_base + static_cast<std::uint64_t>(b) * source_bytes;
+            auto* dst =
+                dst_base + static_cast<std::uint64_t>(b) * target_bytes;
+            kernels::launch_mxfp4_weight_to_gptq_w4(
+                src, gptq_stage.data(),
+                source_rows, source_row_offset, target_rows, valid_rows,
+                source_stride_cols, source_col_offset, source_cols,
+                target_cols, row_map, /*stream=*/0);
+            marlin::launch_gptq_repack_w4_no_perm(
+                gptq_stage.data(), dst, target_cols, target_rows,
+                /*stream=*/0);
+        }
+        CUDA_CHECK(cudaGetLastError());
+#else
+        (void)src_base;
+        (void)dst_base;
+        (void)batch;
+        (void)source_rows;
+        (void)source_row_offset;
+        (void)target_rows;
+        (void)valid_rows;
+        (void)source_stride_cols;
+        (void)source_col_offset;
+        (void)source_cols;
+        (void)target_cols;
+        (void)row_map;
+        throw std::runtime_error(
+            "rust storage executor: MarlinMxfp4Weight Repack requires Marlin");
+#endif
+    }
+
+    void repack_marlin_mxfp4_scale(
+        const std::uint8_t* src_base,
+        std::uint8_t* dst_base,
+        int batch,
+        int source_rows,
+        int source_row_offset,
+        int target_rows,
+        int valid_rows,
+        int source_stride_groups,
+        int source_group_offset,
+        int source_groups,
+        int target_groups,
+        kernels::Mxfp4RowSelect row_map)
+    {
+        if (source_stride_groups <= 0 || source_group_offset < 0 ||
+            target_groups < source_groups ||
+            source_group_offset + source_groups > source_stride_groups) {
+            throw std::runtime_error(
+                "rust storage executor: MarlinMxfp4Scale Repack requires "
+                "target group count >= source group count and source slice "
+                "within stride");
+        }
+        const std::uint64_t source_bytes =
+            checked_mul_u64(
+                source_rows, source_stride_groups, "MXFP4 scale source");
+        const std::uint64_t target_bytes =
+            checked_mul_u64(target_rows, target_groups, "MXFP4 scale target");
+        for (int b = 0; b < batch; ++b) {
+            kernels::launch_mxfp4_scales_to_marlin_e8m0(
+                src_base + static_cast<std::uint64_t>(b) * source_bytes,
+                dst_base + static_cast<std::uint64_t>(b) * target_bytes,
+                source_rows, source_row_offset, target_rows, valid_rows,
+                source_stride_groups, source_group_offset, source_groups,
+                target_groups, row_map, /*stream=*/0);
+        }
+        CUDA_CHECK(cudaGetLastError());
+    }
+#endif
 
     void reblock_tile_map(
         const pie_weight_loader::PieLoaderStorageInstrView& instr)

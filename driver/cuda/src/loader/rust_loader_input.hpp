@@ -8,6 +8,7 @@
 #include <vector>
 
 #include "../../../weight_loader/include/weight_loader.h"
+#include "loader/backend_target.hpp"
 #include "loader/checkpoint_source.hpp"
 #include "loader/hf_config.hpp"
 
@@ -101,17 +102,30 @@ public:
         int tp_rank,
         int tp_size,
         std::uint64_t max_tile_bytes,
-        std::uint32_t preferred_alignment)
+        std::uint32_t preferred_alignment,
+        Mxfp4MoeLowering mxfp4_moe = Mxfp4MoeLowering::RoutedDequant,
+        bool native_mxfp4_moe = false)
     {
+        auto mxfp4_policy = pie_weight_loader::PieLoaderMxfp4MoePolicy::RoutedDecode;
+        switch (mxfp4_moe) {
+            case Mxfp4MoeLowering::RoutedDequant:
+                mxfp4_policy = pie_weight_loader::PieLoaderMxfp4MoePolicy::RoutedDecode;
+                break;
+            case Mxfp4MoeLowering::NativeGemm:
+                mxfp4_policy = pie_weight_loader::PieLoaderMxfp4MoePolicy::NativeGemm;
+                break;
+            case Mxfp4MoeLowering::Bf16Dequant:
+                mxfp4_policy = pie_weight_loader::PieLoaderMxfp4MoePolicy::EagerBf16;
+                break;
+        }
         target_ = pie_weight_loader::PieLoaderBackendTargetView{
             .backend = pie_weight_loader::PieLoaderBackendKind::Cuda,
             .tp_rank = static_cast<std::uint32_t>(std::max(tp_rank, 0)),
             .tp_size = static_cast<std::uint32_t>(std::max(tp_size, 1)),
             .max_tile_bytes = max_tile_bytes,
             .preferred_alignment = preferred_alignment,
-            .mxfp4_moe =
-                pie_weight_loader::PieLoaderMxfp4MoePolicy::RoutedDecode,
-            .native_mxfp4_moe = false,
+            .mxfp4_moe = mxfp4_policy,
+            .native_mxfp4_moe = native_mxfp4_moe,
         };
     }
 
@@ -388,6 +402,7 @@ private:
             return pie_weight_loader::PieLoaderDType::F8E5M2;
         case DType::INT64:
         case DType::INT4_PACKED:
+        case DType::MXFP4_PACKED:
             return pie_weight_loader::PieLoaderDType::U8;
         }
         return pie_weight_loader::PieLoaderDType::U8;

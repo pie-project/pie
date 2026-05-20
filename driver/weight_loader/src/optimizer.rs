@@ -225,6 +225,14 @@ fn normalize_expr(
                 decl: decl.clone(),
             })
         }
+        LayoutExpr::Repack { input, spec, decl } => {
+            let input = normalize_expr(plan, *input, out, memo)?;
+            out.push(LayoutExpr::Repack {
+                input,
+                spec: *spec,
+                decl: decl.clone(),
+            })
+        }
         LayoutExpr::Attach {
             data,
             metadata,

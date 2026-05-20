@@ -124,6 +124,38 @@ pub enum Mxfp4MoePolicy {
     EagerBf16,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum RowMap {
+    #[default]
+    Identity,
+    Even,
+    Odd,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum RepackLayout {
+    #[default]
+    None,
+    MarlinMxfp4Weight,
+    MarlinMxfp4Scale,
+    DenseRowGather,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct RepackSpec {
+    pub layout: RepackLayout,
+    pub row_map: RowMap,
+    pub batch: u32,
+    pub source_rows: u32,
+    pub source_row_offset: u32,
+    pub target_rows: u32,
+    pub valid_rows: u32,
+    pub source_stride_cols: u32,
+    pub source_col_offset: u32,
+    pub source_cols: u32,
+    pub target_cols: u32,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct QuantSpec {
     pub scheme: QuantScheme,

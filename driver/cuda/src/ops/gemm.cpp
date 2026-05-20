@@ -135,9 +135,12 @@ void validate_quant_weight_view(const char* api, const WeightView& w, int N, int
     if (w.scale_data == nullptr) {
         throw std::runtime_error(std::string(api) + ": quant scale data is null");
     }
-    const std::size_t expected_weight_bytes =
-        static_cast<std::size_t>(N) * static_cast<std::size_t>(K) *
-        dtype_bytes(w.dtype);
+    const bool is_nibble_packed =
+        w.dtype == DType::INT4_PACKED || w.dtype == DType::MXFP4_PACKED;
+    const std::size_t expected_weight_bytes = is_nibble_packed
+        ? (static_cast<std::size_t>(N) * static_cast<std::size_t>(K) + 1) / 2
+        : static_cast<std::size_t>(N) * static_cast<std::size_t>(K) *
+              dtype_bytes(w.dtype);
     if (w.nbytes < expected_weight_bytes) {
         throw std::runtime_error(
             std::string(api) + ": quant weight buffer is smaller than GEMM "
@@ -146,11 +149,16 @@ void validate_quant_weight_view(const char* api, const WeightView& w, int N, int
             " bytes for N=" + std::to_string(N) +
             " K=" + std::to_string(K));
     }
-    if (w.scale_numel < static_cast<std::size_t>(N)) {
+    std::size_t expected_scales = static_cast<std::size_t>(N);
+    if (w.quant_kind == QuantMeta::Kind::PerGroup && w.group_size > 0) {
+        expected_scales *=
+            static_cast<std::size_t>((K + w.group_size - 1) / w.group_size);
+    }
+    if (w.scale_numel < expected_scales) {
         throw std::runtime_error(
             std::string(api) + ": quant scale tensor is smaller than GEMM "
-            "N; have " + std::to_string(w.scale_numel) +
-            " values, need " + std::to_string(N));
+            "shape requires; have " + std::to_string(w.scale_numel) +
+            " values, need " + std::to_string(expected_scales));
     }
 }
 
@@ -219,6 +227,18 @@ void* marlin_workspace_() {
             throw std::runtime_error("marlin: cudaMalloc workspace failed");
         }
         cudaMemset(ws, 0, ws_bytes);
+    }
+    return ws;
+}
+
+void* marlin_fp32_reduce_scratch_() {
+    static void* ws = nullptr;
+    static const std::size_t ws_bytes = 32 * 1024 * 1024;
+    if (!ws) {
+        if (cudaMalloc(&ws, ws_bytes) != cudaSuccess) {
+            throw std::runtime_error(
+                "marlin: cudaMalloc fp32 reduce scratch failed");
+        }
     }
     return ws;
 }
@@ -780,6 +800,42 @@ void gemm_act_x_w(
             "gemm_act_x_w[INT4_PACKED]: marlin is not compiled into this "
             "build (PIE_CUDA_BUILD_MARLIN was OFF). Reconfigure cmake with "
             "-DPIE_CUDA_BUILD_MARLIN=ON to enable W4A16 GEMM.");
+#endif
+    }
+    if (act_dtype == DType::BF16 && w.dtype == DType::MXFP4_PACKED &&
+        y_dtype == DType::BF16) {
+#ifdef PIE_CUDA_HAS_MARLIN
+        cudaStream_t stream = nullptr;
+        cublasGetStream(handle, &stream);
+        if (w.scale_dtype != DType::UINT8) {
+            throw std::runtime_error(
+                "gemm_act_x_w[MXFP4]: scale must be raw E8M0 bytes (got " +
+                std::string(dtype_name(w.scale_dtype)) + ")");
+        }
+        if (w.quant_kind != QuantMeta::Kind::PerGroup || w.group_size != 32) {
+            throw std::runtime_error(
+                "gemm_act_x_w[MXFP4]: expected per-group scales with "
+                "group_size=32");
+        }
+        validate_quant_weight_view("gemm_act_x_w[MXFP4]", w, N, K);
+        const std::size_t mn_bytes =
+            static_cast<std::size_t>(M) * static_cast<std::size_t>(N) * 2;
+        void* dst = (beta == 0.f) ? y : marlin_residual_scratch_(mn_bytes);
+        marlin::launch_mxfp4_gemm_w4a16_bf16(
+            act, w.data, w.scale_data, dst,
+            marlin_fp32_reduce_scratch_(), marlin_workspace_(),
+            M, N, K, stream);
+        if (beta != 0.f) {
+            kernels::launch_residual_add_bf16(
+                y, dst,
+                static_cast<std::size_t>(M) * static_cast<std::size_t>(N),
+                stream);
+        }
+        return;
+#else
+        throw std::runtime_error(
+            "gemm_act_x_w[MXFP4]: native MXFP4 GEMM was selected but "
+            "marlin is not compiled into this build");
 #endif
     }
     unsupported("gemm_act_x_w", act_dtype, w.dtype, y_dtype);

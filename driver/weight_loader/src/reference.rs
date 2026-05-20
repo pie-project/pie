@@ -116,6 +116,7 @@ fn eval_expr(
         LayoutExpr::Decode { data, decl, .. } | LayoutExpr::Transcode { data, decl, .. } => {
             retag(value(values, *data)?, decl)
         }
+        LayoutExpr::Repack { input, decl, .. } => retag(value(values, *input)?, decl),
         LayoutExpr::Attach { data, decl, .. }
         | LayoutExpr::Realize {
             input: data, decl, ..

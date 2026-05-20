@@ -361,23 +361,36 @@ def main() -> None:
         "benchmarks": [],
     }
 
-    test_cmd = [
-        "ctest",
-        "--test-dir",
-        str(cuda_build_dir),
-        "-R",
-        "layout_plan",
-        "--output-on-failure",
+    test_cmds = [
+        (
+            [
+                "cargo",
+                "test",
+                "--manifest-path",
+                str(ROOT / "driver" / "weight_loader" / "Cargo.toml"),
+            ],
+            "weight-loader-tests.log",
+        ),
+        (
+            [
+                "ctest",
+                "--test-dir",
+                str(cuda_build_dir),
+                "--output-on-failure",
+            ],
+            "cuda-ctest.log",
+        ),
     ]
-    evidence["tests"].append(
-        run_cmd(
-            test_cmd,
-            cwd=ROOT,
-            env=os.environ.copy(),
-            log_path=out_dir / "tests.log",
-            timeout_s=args.timeout_s,
+    for cmd, log_name in test_cmds:
+        evidence["tests"].append(
+            run_cmd(
+                cmd,
+                cwd=ROOT,
+                env=os.environ.copy(),
+                log_path=out_dir / log_name,
+                timeout_s=args.timeout_s,
+            )
         )
-    )
 
     if not args.skip_benches:
         for model in models:

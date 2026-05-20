@@ -19,10 +19,11 @@ struct ModelConfig {
     //   * "int8" — per-channel symmetric INT8 for projection weights.
     // Norms, biases, embeddings, and lm_head stay in their native dtype.
     std::string runtime_quant;
-    // GPT-OSS MXFP4 MoE load/runtime policy. "auto" selects the best
-    // registered backend for this build. Recognised values:
-    //   * "auto" / "routed_dequant" / "packed" — keep MXFP4 resident and
-    //     dequantize only routed experts into bounded BF16 runtime scratch.
+    // GPT-OSS MXFP4 MoE load/runtime policy. "auto" selects native packed
+    // MXFP4 expert GEMM on supported Blackwell-class GPUs/builds and uses the
+    // routed-dequant fallback on legacy GPUs. Recognised values:
+    //   * "routed_dequant" / "packed" — keep MXFP4 resident and dequantize
+    //     only routed experts into bounded BF16 runtime scratch.
     //   * "bf16" / "dequant" — eagerly dequantize experts to BF16 at load.
     //   * "native" — require a true MXFP4 MoE GEMM backend.
     std::string mxfp4_moe = "auto";

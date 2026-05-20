@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::types::{Axis, DType, ExprId, Layout, QuantScheme, TensorDecl, TensorId};
+use crate::types::{Axis, DType, ExprId, Layout, QuantScheme, RepackSpec, TensorDecl, TensorId};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LayoutPlan {
@@ -118,6 +118,11 @@ pub enum LayoutExpr {
         metadata_outputs: Vec<TensorDecl>,
         decl: TensorDecl,
     },
+    Repack {
+        input: ExprId,
+        spec: RepackSpec,
+        decl: TensorDecl,
+    },
     Attach {
         data: ExprId,
         metadata: Vec<ExprId>,
@@ -149,6 +154,7 @@ impl LayoutExpr {
             | Self::View { input, .. }
             | Self::Cast { input, .. }
             | Self::Encode { input, .. }
+            | Self::Repack { input, .. }
             | Self::Realize { input, .. } => vec![*input],
             Self::Join { inputs, .. } | Self::Stack { inputs, .. } => inputs.clone(),
             Self::Decode { data, metadata, .. } | Self::Transcode { data, metadata, .. } => {
@@ -178,6 +184,7 @@ impl LayoutExpr {
             | Self::Decode { decl, .. }
             | Self::Encode { decl, .. }
             | Self::Transcode { decl, .. }
+            | Self::Repack { decl, .. }
             | Self::Attach { decl, .. }
             | Self::Realize { decl, .. } => Some(decl),
             Self::Unzip { .. } => None,
@@ -198,6 +205,7 @@ impl LayoutExpr {
             | Self::Decode { decl, .. }
             | Self::Encode { decl, .. }
             | Self::Transcode { decl, .. }
+            | Self::Repack { decl, .. }
             | Self::Attach { decl, .. }
             | Self::Realize { decl, .. } => Some(decl),
             Self::Unzip { .. } => None,

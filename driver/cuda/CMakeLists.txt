@@ -119,6 +119,7 @@ add_library(pie_driver_cuda_lib STATIC
   src/kernels/softcap.cu
   src/kernels/scalar_mul.cu
   src/kernels/dequant_fp4.cu
+  src/kernels/mxfp4_marlin.cu
   src/kernels/dequant_fp8.cu
   src/kernels/dtype_cast.cu
   src/kernels/quant_bf16_to_fp8.cu
@@ -210,16 +211,14 @@ target_include_directories(pie_driver_cuda_lib
     ${flashinfer_SOURCE_DIR}/3rdparty/cutlass/tools/util/include
     ${flashinfer_SOURCE_DIR}/3rdparty/spdlog/include)
 
-# ── Marlin (W4A16 GEMM via vendored vLLM kernel) ─────────────────────
-# Off by default while M3 plumbing lands. Vendored sources live under
-# `third_party/marlin/`; the wrapper exposes a torch-free C++ API.
-# Compile cost is ~3 minutes on first build (heavy templates) so we
-# gate it behind an explicit switch until a model actually uses it.
-option(PIE_CUDA_BUILD_MARLIN "Build vendored marlin W4A16 GEMM" OFF)
+# ── Marlin (W4A16 / MXFP4 GEMM via vendored vLLM kernel) ──────────────
+# Built by default because GPT-OSS MXFP4 auto policy should use native
+# packed-weight GEMM on supported GPUs and fall back only on legacy targets.
+# Vendored sources live under `third_party/marlin/`; the wrapper exposes a
+# torch-free C++ API.
+option(PIE_CUDA_BUILD_MARLIN "Build vendored marlin W4A16/MXFP4 GEMM" ON)
 if(PIE_CUDA_BUILD_MARLIN)
-    # Include the generated per-arch kernel instantiations alongside the
-    # core driver. `generate_kernels.py` produced sm80 variants targeting
-    # A100; rerun with a different arch to add Hopper / Ada coverage.
+	    # Include the generated kernel instantiations alongside the core driver.
     file(GLOB MARLIN_SM_KERNELS
         "${CMAKE_CURRENT_SOURCE_DIR}/third_party/marlin/sm*_kernel_*.cu")
     target_sources(pie_driver_cuda_lib PRIVATE
@@ -257,9 +256,19 @@ target_include_directories(test_driver_common PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/../common/include)
 target_link_libraries(test_driver_common PRIVATE nlohmann_json::nlohmann_json)
 
+add_executable(test_mxfp4_marlin
+  tests/test_mxfp4_marlin.cu
+  src/kernels/mxfp4_marlin.cu)
+target_include_directories(test_mxfp4_marlin PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_compile_options(test_mxfp4_marlin PRIVATE
+  $<$<COMPILE_LANGUAGE:CUDA>: --extended-lambda --expt-relaxed-constexpr >)
+target_link_libraries(test_mxfp4_marlin PRIVATE CUDA::cudart)
+
 enable_testing()
 add_test(NAME brle COMMAND test_brle)
 add_test(NAME driver_common COMMAND test_driver_common)
+add_test(NAME mxfp4_marlin COMMAND test_mxfp4_marlin)
 
 target_link_libraries(pie_driver_cuda_lib PUBLIC
   CLI11::CLI11

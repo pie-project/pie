@@ -10,7 +10,10 @@ use crate::source::{
     ffi_string,
 };
 use crate::storage::StorageTarget;
-use crate::types::{Axis, DType, Encoding, Layout, QuantScheme, QuantSpec, Sharding, TensorId};
+use crate::types::{
+    Axis, DType, Encoding, Layout, Mxfp4MoePolicy, QuantScheme, QuantSpec, RepackLayout,
+    RepackSpec, RowMap, Sharding, TensorId,
+};
 use std::collections::HashSet;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -52,6 +55,10 @@ pub enum RuntimeTensorSource {
         axis: Axis,
         start: i64,
         length: i64,
+    },
+    Repack {
+        tensor: TensorId,
+        spec: RepackSpec,
     },
 }
 
@@ -120,7 +127,7 @@ impl DefaultAbiBuilder<'_> {
     fn build(&mut self) -> Result<(), CompileError> {
         let runtime_quant = self.runtime_quant_scheme()?;
         self.add_phi3_fused_splits()?;
-        self.add_gpt_oss_mxfp4_groups();
+        self.add_gpt_oss_mxfp4_groups()?;
         self.add_fused_moe_gate_up_tp_slices()?;
         for raw in &self.metadata.tensors {
             if self.consumed.contains(&raw.id) {
@@ -239,6 +246,32 @@ impl DefaultAbiBuilder<'_> {
             shard_axis: None,
         });
         self.consumed.insert(raw.id);
+    }
+
+    fn push_repack(
+        &mut self,
+        output_name: String,
+        raw: &RawTensor,
+        dtype: DType,
+        encoding: Encoding,
+        shape: Vec<i64>,
+        spec: RepackSpec,
+    ) {
+        self.tensors.push(RuntimeTensorContract {
+            output_name,
+            source: RuntimeTensorSource::Repack {
+                tensor: raw.id,
+                spec,
+            },
+            metadata: Vec::new(),
+            dtype,
+            encoding,
+            shape,
+            layout: Layout::dense(self.alignment()),
+            sharding: Sharding::replicated(),
+            alignment: self.alignment(),
+            shard_axis: None,
+        });
     }
 
     fn add_phi3_fused_splits(&mut self) -> Result<(), CompileError> {
@@ -391,12 +424,19 @@ impl DefaultAbiBuilder<'_> {
         Ok(())
     }
 
-    fn add_gpt_oss_mxfp4_groups(&mut self) {
+    fn add_gpt_oss_mxfp4_groups(&mut self) -> Result<(), CompileError> {
         if !self.cfg.model_type.eq_ignore_ascii_case("gpt_oss")
             && !self.cfg.model_type.eq_ignore_ascii_case("gpt-oss")
             && !self.cfg.model_type.eq_ignore_ascii_case("gptoss")
         {
-            return;
+            return Ok(());
+        }
+        let native = self.target.mxfp4_moe == Mxfp4MoePolicy::NativeGemm;
+        if native && !self.target.native_mxfp4_moe {
+            return Err(CompileError::InvalidInput(
+                "GPT-OSS native MXFP4 requested, but target does not support native MXFP4 MoE"
+                    .to_string(),
+            ));
         }
         let blocks: Vec<RawTensor> = self
             .metadata
@@ -425,13 +465,229 @@ impl DefaultAbiBuilder<'_> {
             else {
                 continue;
             };
-            self.push_direct(block, format!("{base}.weight"), None);
-            self.push_direct(scale, format!("{base}.weight_scale"), None);
-            self.push_direct(bias, format!("{base}.bias"), None);
+            if native {
+                self.add_gpt_oss_native_mxfp4_group(block, scale, bias, base)?;
+            } else {
+                self.push_direct(block, format!("{base}.weight"), None);
+                self.push_direct(scale, format!("{base}.weight_scale"), None);
+                self.push_direct(bias, format!("{base}.bias"), None);
+            }
             self.consumed.insert(block.id);
             self.consumed.insert(scale.id);
             self.consumed.insert(bias.id);
         }
+        Ok(())
+    }
+
+    fn add_gpt_oss_native_mxfp4_group(
+        &mut self,
+        block: &RawTensor,
+        scale: &RawTensor,
+        bias: &RawTensor,
+        base: &str,
+    ) -> Result<(), CompileError> {
+        if base.ends_with("gate_up_proj") {
+            self.add_gpt_oss_native_gate_up(block, scale, bias, base)
+        } else if base.ends_with("down_proj") {
+            self.add_gpt_oss_native_down(block, scale, bias, base)
+        } else {
+            Err(CompileError::InvalidInput(format!(
+                "GPT-OSS MXFP4 tensor '{}' is not gate_up_proj or down_proj",
+                block.name
+            )))
+        }
+    }
+
+    fn add_gpt_oss_native_gate_up(
+        &mut self,
+        block: &RawTensor,
+        scale: &RawTensor,
+        bias: &RawTensor,
+        base: &str,
+    ) -> Result<(), CompileError> {
+        if block.shape.len() != 4 || scale.shape.len() != 3 || bias.shape.len() != 2 {
+            return Err(CompileError::InvalidInput(format!(
+                "GPT-OSS native gate/up '{}' has unsupported block/scale/bias rank",
+                base
+            )));
+        }
+        let experts = block.shape[0];
+        let fused_rows = block.shape[1];
+        let groups = block.shape[2];
+        let lanes = block.shape[3];
+        if fused_rows % 2 != 0 || lanes != 16 {
+            return Err(CompileError::InvalidInput(format!(
+                "GPT-OSS native gate/up '{}' expected [E, 2I, H/32, 16], got {:?}",
+                base, block.shape
+            )));
+        }
+        if scale.shape != vec![experts, fused_rows, groups]
+            || bias.shape != vec![experts, fused_rows]
+        {
+            return Err(CompileError::InvalidInput(format!(
+                "GPT-OSS native gate/up '{}' scale/bias shape mismatch",
+                base
+            )));
+        }
+        let full_intermediate = fused_rows / 2;
+        let hidden = checked_mul_i64(groups, 32, "GPT-OSS hidden size")? as i64;
+        let (local_start, local_intermediate) = local_range(full_intermediate, self.target)?;
+        let intermediate_native = align_up_i64(local_intermediate, 128)?;
+        let prefix = base.trim_end_matches("gate_up_proj");
+        for (name, row_map) in [("gate_proj", RowMap::Even), ("up_proj", RowMap::Odd)] {
+            let out_base = format!("{prefix}{name}");
+            self.push_repack(
+                format!("{out_base}.weight"),
+                block,
+                DType::BF16,
+                mxfp4_encoding(Axis(1)),
+                vec![experts, intermediate_native, hidden],
+                RepackSpec {
+                    layout: RepackLayout::MarlinMxfp4Weight,
+                    row_map,
+                    batch: u32_dim(experts, "GPT-OSS experts")?,
+                    source_rows: u32_dim(fused_rows, "GPT-OSS gate/up source rows")?,
+                    source_row_offset: u32_dim(local_start, "GPT-OSS gate/up source row offset")?,
+                    target_rows: u32_dim(intermediate_native, "GPT-OSS gate/up target rows")?,
+                    valid_rows: u32_dim(local_intermediate, "GPT-OSS gate/up valid rows")?,
+                    source_stride_cols: u32_dim(hidden, "GPT-OSS hidden stride")?,
+                    source_col_offset: 0,
+                    source_cols: u32_dim(hidden, "GPT-OSS hidden size")?,
+                    target_cols: u32_dim(hidden, "GPT-OSS hidden size")?,
+                },
+            );
+            self.push_repack(
+                format!("{out_base}.weight_scale"),
+                scale,
+                DType::U8,
+                Encoding::Raw(DType::U8),
+                vec![experts, intermediate_native, groups],
+                RepackSpec {
+                    layout: RepackLayout::MarlinMxfp4Scale,
+                    row_map,
+                    batch: u32_dim(experts, "GPT-OSS experts")?,
+                    source_rows: u32_dim(fused_rows, "GPT-OSS gate/up source rows")?,
+                    source_row_offset: u32_dim(local_start, "GPT-OSS gate/up source row offset")?,
+                    target_rows: u32_dim(intermediate_native, "GPT-OSS gate/up target rows")?,
+                    valid_rows: u32_dim(local_intermediate, "GPT-OSS gate/up valid rows")?,
+                    source_stride_cols: u32_dim(groups, "GPT-OSS hidden group stride")?,
+                    source_col_offset: 0,
+                    source_cols: u32_dim(groups, "GPT-OSS hidden groups")?,
+                    target_cols: u32_dim(groups, "GPT-OSS hidden groups")?,
+                },
+            );
+            self.push_repack(
+                format!("{out_base}.bias"),
+                bias,
+                DType::BF16,
+                Encoding::Raw(DType::BF16),
+                vec![experts, local_intermediate],
+                RepackSpec {
+                    layout: RepackLayout::DenseRowGather,
+                    row_map,
+                    batch: u32_dim(experts, "GPT-OSS experts")?,
+                    source_rows: u32_dim(fused_rows, "GPT-OSS gate/up bias rows")?,
+                    source_row_offset: u32_dim(
+                        local_start,
+                        "GPT-OSS gate/up bias source row offset",
+                    )?,
+                    target_rows: u32_dim(local_intermediate, "GPT-OSS gate/up bias target rows")?,
+                    valid_rows: u32_dim(local_intermediate, "GPT-OSS gate/up bias valid rows")?,
+                    source_stride_cols: 1,
+                    source_col_offset: 0,
+                    source_cols: 1,
+                    target_cols: 1,
+                },
+            );
+        }
+        Ok(())
+    }
+
+    fn add_gpt_oss_native_down(
+        &mut self,
+        block: &RawTensor,
+        scale: &RawTensor,
+        bias: &RawTensor,
+        base: &str,
+    ) -> Result<(), CompileError> {
+        if block.shape.len() != 4 || scale.shape.len() != 3 || bias.shape.len() != 2 {
+            return Err(CompileError::InvalidInput(format!(
+                "GPT-OSS native down '{}' has unsupported block/scale/bias rank",
+                base
+            )));
+        }
+        let experts = block.shape[0];
+        let hidden = block.shape[1];
+        let groups = block.shape[2];
+        let lanes = block.shape[3];
+        if lanes != 16 {
+            return Err(CompileError::InvalidInput(format!(
+                "GPT-OSS native down '{}' expected [E, H, I/32, 16], got {:?}",
+                base, block.shape
+            )));
+        }
+        if scale.shape != vec![experts, hidden, groups] || bias.shape != vec![experts, hidden] {
+            return Err(CompileError::InvalidInput(format!(
+                "GPT-OSS native down '{}' scale/bias shape mismatch",
+                base
+            )));
+        }
+        let full_intermediate = checked_mul_i64(groups, 32, "GPT-OSS intermediate size")? as i64;
+        let (local_start, local_intermediate) = local_range(full_intermediate, self.target)?;
+        if local_start % 32 != 0 || local_intermediate % 32 != 0 {
+            return Err(CompileError::InvalidInput(format!(
+                "GPT-OSS native down '{}' TP shard must align to MXFP4 32-wide groups",
+                base
+            )));
+        }
+        let local_groups = local_intermediate / 32;
+        let source_group_offset = local_start / 32;
+        let intermediate_native = align_up_i64(local_intermediate, 128)?;
+        self.push_repack(
+            format!("{base}.weight"),
+            block,
+            DType::BF16,
+            mxfp4_encoding(Axis(2)),
+            vec![experts, hidden, intermediate_native],
+            RepackSpec {
+                layout: RepackLayout::MarlinMxfp4Weight,
+                row_map: RowMap::Identity,
+                batch: u32_dim(experts, "GPT-OSS experts")?,
+                source_rows: u32_dim(hidden, "GPT-OSS down source rows")?,
+                source_row_offset: 0,
+                target_rows: u32_dim(hidden, "GPT-OSS down target rows")?,
+                valid_rows: u32_dim(hidden, "GPT-OSS down valid rows")?,
+                source_stride_cols: u32_dim(full_intermediate, "GPT-OSS down source stride")?,
+                source_col_offset: u32_dim(local_start, "GPT-OSS down source column offset")?,
+                source_cols: u32_dim(local_intermediate, "GPT-OSS intermediate size")?,
+                target_cols: u32_dim(intermediate_native, "GPT-OSS padded intermediate size")?,
+            },
+        );
+        self.push_repack(
+            format!("{base}.weight_scale"),
+            scale,
+            DType::U8,
+            Encoding::Raw(DType::U8),
+            vec![experts, hidden, intermediate_native / 32],
+            RepackSpec {
+                layout: RepackLayout::MarlinMxfp4Scale,
+                row_map: RowMap::Identity,
+                batch: u32_dim(experts, "GPT-OSS experts")?,
+                source_rows: u32_dim(hidden, "GPT-OSS down source rows")?,
+                source_row_offset: 0,
+                target_rows: u32_dim(hidden, "GPT-OSS down target rows")?,
+                valid_rows: u32_dim(hidden, "GPT-OSS down valid rows")?,
+                source_stride_cols: u32_dim(groups, "GPT-OSS down source group stride")?,
+                source_col_offset: u32_dim(
+                    source_group_offset,
+                    "GPT-OSS down source group offset",
+                )?,
+                source_cols: u32_dim(local_groups, "GPT-OSS down source groups")?,
+                target_cols: u32_dim(intermediate_native / 32, "GPT-OSS down target groups")?,
+            },
+        );
+        self.push_direct(bias, format!("{base}.bias"), None);
+        Ok(())
     }
 
     fn shard_axis(&self, name: &str) -> Option<Axis> {
@@ -473,6 +729,41 @@ fn dtype_for_encoding(encoding: &Encoding) -> DType {
         Encoding::Raw(dtype) => *dtype,
         Encoding::Quant(spec) => spec.logical_dtype,
     }
+}
+
+fn mxfp4_encoding(channel_axis: Axis) -> Encoding {
+    Encoding::Quant(
+        QuantSpec {
+            scheme: QuantScheme::Mxfp4E2M1E8M0,
+            logical_dtype: DType::BF16,
+            bits_per_element: 4,
+            group_size: 32,
+            channel_axis: Some(channel_axis),
+            scale_dtype: Some(DType::U8),
+            zero_point_dtype: None,
+            block_shape: vec![32],
+        }
+        .normalized(),
+    )
+}
+
+fn align_up_i64(value: i64, alignment: i64) -> Result<i64, CompileError> {
+    if value < 0 || alignment <= 0 {
+        return Err(CompileError::InvalidInput(
+            "align_up_i64 requires non-negative value and positive alignment".to_string(),
+        ));
+    }
+    value
+        .checked_add(alignment - 1)
+        .and_then(|v| v.checked_div(alignment))
+        .and_then(|v| v.checked_mul(alignment))
+        .ok_or_else(|| CompileError::InvalidInput("alignment overflow".to_string()))
+}
+
+fn u32_dim(value: i64, context: &str) -> Result<u32, CompileError> {
+    u32::try_from(value).map_err(|_| {
+        CompileError::InvalidInput(format!("{context}: dimension {value} does not fit u32"))
+    })
 }
 
 fn dense_element_bytes(raw: &RawTensor, context: &str) -> Result<u64, CompileError> {

@@ -2,8 +2,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::optimizer::OptimizerReport;
 use crate::types::{
-    BackendKind, BufferId, FileId, InstrId, Layout, Mxfp4MoePolicy, QuantScheme, TensorDecl,
-    TensorId,
+    BackendKind, BufferId, FileId, InstrId, Layout, Mxfp4MoePolicy, QuantScheme, RepackSpec,
+    TensorDecl, TensorId,
 };
 
 pub const STORAGE_PROGRAM_VERSION: u32 = 1;
@@ -89,6 +89,7 @@ pub enum TileMapKind {
     Transcode,
     Reblock,
     Reorder,
+    Repack,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -100,6 +101,8 @@ pub struct TileSpec {
 pub struct TransformSpec {
     pub from: Option<QuantScheme>,
     pub to: Option<QuantScheme>,
+    pub repack: RepackSpec,
+    pub scratch_bytes: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

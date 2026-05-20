@@ -13,8 +13,8 @@ use crate::storage::{
 };
 use crate::typecheck::typecheck;
 use crate::types::{
-    Axis, BackendKind, BufferId, DType, Encoding, ExprId, InstrId, QuantScheme, TensorDecl,
-    TensorId, encoding_dense_element_bytes, encoding_nbytes, tensor_nbytes,
+    Axis, BackendKind, BufferId, DType, Encoding, ExprId, InstrId, QuantScheme, RepackLayout,
+    RepackSpec, TensorDecl, TensorId, encoding_dense_element_bytes, encoding_nbytes, tensor_nbytes,
 };
 
 pub fn compile_storage_program(
@@ -228,6 +228,7 @@ impl StorageCompiler<'_> {
                 TransformSpec {
                     from: None,
                     to: Some(dtype_to_quant_marker(*dtype)),
+                    ..TransformSpec::default()
                 },
             ),
             LayoutExpr::Decode {
@@ -243,6 +244,7 @@ impl StorageCompiler<'_> {
                 TransformSpec {
                     from: Some(*scheme),
                     to: None,
+                    ..TransformSpec::default()
                 },
             ),
             LayoutExpr::Encode {
@@ -265,8 +267,10 @@ impl StorageCompiler<'_> {
                 TransformSpec {
                     from: Some(*from),
                     to: Some(*to),
+                    ..TransformSpec::default()
                 },
             ),
+            LayoutExpr::Repack { input, spec, .. } => self.lower_repack(id, *input, *spec),
             LayoutExpr::Attach { data, metadata, .. } => {
                 let value = self.value(*data)?;
                 if metadata.is_empty() {
@@ -478,42 +482,9 @@ impl StorageCompiler<'_> {
         length: i64,
     ) -> Result<ValueLoc, CompileError> {
         match self.value(input)? {
-            ValueLoc::Source(mut source) => {
-                let axis_index = axis.0 as usize;
-                let mut shape = source.shape.clone();
-                if axis_index >= shape.len() {
-                    return Err(CompileError::InvalidInput(format!(
-                        "Select axis {} out of range for source shape {:?}",
-                        axis.0, shape
-                    )));
-                }
-                let old_stride = source.stride.clone();
-                let can_preserve_strides = encoding_dense_element_bytes(&source.encoding).is_some()
-                    && old_stride.dims.len() == shape.len();
-                let row_bytes = if can_preserve_strides {
-                    u64::try_from(old_stride.dims[axis_index].src_stride).map_err(|_| {
-                        CompileError::InvalidInput(
-                            "negative source stride in Select lowering".to_string(),
-                        )
-                    })?
-                } else {
-                    dense_axis_stride_bytes(&shape, axis, &source.encoding)?
-                };
-                source.offset_bytes += u64::try_from(start)
-                    .ok()
-                    .and_then(|start| start.checked_mul(row_bytes))
-                    .ok_or_else(|| {
-                        CompileError::InvalidInput("slice offset overflow".to_string())
-                    })?;
-                shape[axis_index] = length;
-                source.shape = shape.clone();
-                source.stride = if can_preserve_strides {
-                    selected_source_extent(&old_stride, &shape, &source.encoding)?
-                } else {
-                    storage_extent_for_shape(&shape, &source.encoding)?
-                };
-                Ok(ValueLoc::Source(source))
-            }
+            ValueLoc::Source(source) => Ok(ValueLoc::Source(narrow_source_axis(
+                source, axis, start, length,
+            )?)),
             ValueLoc::Buffer(input_buffer) => {
                 let input_decl = self.plan.decl(input).ok_or_else(|| {
                     CompileError::InvalidInput(format!("Select input {} has no decl", input.0))
@@ -567,6 +538,7 @@ impl StorageCompiler<'_> {
                 TransformSpec {
                     from: None,
                     to: Some(scheme),
+                    ..TransformSpec::default()
                 },
             );
         }
@@ -597,6 +569,7 @@ impl StorageCompiler<'_> {
             TransformSpec {
                 from: None,
                 to: Some(scheme),
+                ..TransformSpec::default()
             },
         );
         for (decl, buffer) in metadata_outputs.iter().zip(outputs.iter().skip(1)) {
@@ -647,6 +620,50 @@ impl StorageCompiler<'_> {
             inputs,
             vec![out],
             transform,
+        );
+        Ok(ValueLoc::Buffer(out))
+    }
+
+    fn lower_repack(
+        &mut self,
+        id: ExprId,
+        input: ExprId,
+        spec: RepackSpec,
+    ) -> Result<ValueLoc, CompileError> {
+        let out = self.allocate_expr(id, true)?;
+        let mut inputs = Vec::new();
+        let mut repack = spec;
+        let (source, input_bytes) = match self.value(input)? {
+            ValueLoc::Source(source) => {
+                let (source, narrowed) = narrow_repack_source(source, spec)?;
+                repack = narrowed;
+                let extent = self.source_extent(&source)?;
+                let bytes = extent.span_bytes;
+                (Some(extent), bytes)
+            }
+            ValueLoc::Buffer(buffer) => {
+                let bytes = buffer_bytes(&self.program, buffer)?;
+                inputs.push(buffer);
+                (None, bytes)
+            }
+        };
+        let decl = self.plan.decl(id).ok_or_else(|| {
+            CompileError::InvalidInput(format!("expr {} has no tensor decl", id.0))
+        })?;
+        let stage_bytes = repack_stage_bytes(repack)?;
+        self.emit_view_or_tile(
+            TileMapKind::Repack,
+            source,
+            Some(full_dest_extent(out, decl)?),
+            inputs,
+            vec![out],
+            TransformSpec {
+                repack,
+                scratch_bytes: input_bytes.checked_add(stage_bytes).ok_or_else(|| {
+                    CompileError::InvalidInput("Repack scratch byte overflow".to_string())
+                })?,
+                ..TransformSpec::default()
+            },
         );
         Ok(ValueLoc::Buffer(out))
     }
@@ -922,6 +939,7 @@ fn recompute_memory_plan(program: &mut StorageProgram) -> Result<(), CompileErro
                 source,
                 dest,
                 outputs,
+                transform,
                 ..
             } => {
                 if let Some(source) = source {
@@ -947,7 +965,8 @@ fn recompute_memory_plan(program: &mut StorageProgram) -> Result<(), CompileErro
                 device_write_bytes = device_write_bytes
                     .checked_add(write_bytes)
                     .ok_or_else(|| CompileError::InvalidInput("write byte overflow".to_string()))?;
-                transform_scratch_peak_bytes = transform_scratch_peak_bytes.max(write_bytes);
+                transform_scratch_peak_bytes =
+                    transform_scratch_peak_bytes.max(write_bytes.max(transform.scratch_bytes));
             }
             StorageInstr::CreateView { .. }
             | StorageInstr::Attach { .. }
@@ -982,11 +1001,19 @@ fn validate_target_support(program: &StorageProgram) -> Result<(), CompileError>
                         transform.to,
                         Some(QuantScheme::Fp8E4M3 | QuantScheme::Int8Symmetric)
                     ))
+                    || (*kind == TileMapKind::Repack
+                        && (matches!(transform.repack.layout, RepackLayout::DenseRowGather)
+                            || (program.target.native_mxfp4_moe
+                                && matches!(
+                                    transform.repack.layout,
+                                    RepackLayout::MarlinMxfp4Weight
+                                        | RepackLayout::MarlinMxfp4Scale
+                                ))))
             }
             BackendKind::Portable => match kind {
                 TileMapKind::Cast | TileMapKind::Reblock | TileMapKind::Reorder => true,
                 TileMapKind::Decode => transform.from == Some(QuantScheme::Fp8E4M3),
-                TileMapKind::Encode | TileMapKind::Transcode => false,
+                TileMapKind::Encode | TileMapKind::Transcode | TileMapKind::Repack => false,
             },
         };
         if !supported {
@@ -1011,6 +1038,126 @@ fn instr_id_of(instr: &StorageInstr) -> InstrId {
     }
 }
 
+fn narrow_repack_source(
+    mut source: SourceView,
+    spec: RepackSpec,
+) -> Result<(SourceView, RepackSpec), CompileError> {
+    let mut narrowed = spec;
+    let valid_rows = if narrowed.valid_rows == 0 {
+        narrowed.target_rows
+    } else {
+        narrowed.valid_rows
+    };
+    narrowed.valid_rows = valid_rows;
+
+    if source.shape.len() < 2 {
+        return Err(CompileError::InvalidInput(
+            "Repack source must have batch and row axes".to_string(),
+        ));
+    }
+    if source.shape[0] != i64::from(narrowed.batch)
+        || source.shape[1] != i64::from(narrowed.source_rows)
+    {
+        return Err(CompileError::InvalidInput(format!(
+            "Repack source shape {:?} does not match batch/source_rows {:?}/{}",
+            source.shape, narrowed.batch, narrowed.source_rows
+        )));
+    }
+
+    let (row_start, row_count) = match narrowed.row_map {
+        crate::types::RowMap::Identity => (narrowed.source_row_offset, valid_rows),
+        crate::types::RowMap::Even | crate::types::RowMap::Odd => {
+            let start = narrowed.source_row_offset.checked_mul(2).ok_or_else(|| {
+                CompileError::InvalidInput("Repack row offset overflow".to_string())
+            })?;
+            let rows = valid_rows.checked_mul(2).ok_or_else(|| {
+                CompileError::InvalidInput("Repack row count overflow".to_string())
+            })?;
+            (start, rows)
+        }
+    };
+    if row_start != 0 || row_count != narrowed.source_rows {
+        source = narrow_source_axis(source, Axis(1), i64::from(row_start), i64::from(row_count))?;
+        narrowed.source_rows = row_count;
+        narrowed.source_row_offset = 0;
+    }
+
+    match narrowed.layout {
+        RepackLayout::MarlinMxfp4Weight => {
+            if source.shape.len() != 4 || source.shape[3] != 16 {
+                return Err(CompileError::InvalidInput(format!(
+                    "MarlinMxfp4Weight Repack source must be [B, R, K/32, 16], got {:?}",
+                    source.shape
+                )));
+            }
+            if narrowed.source_col_offset % 32 != 0
+                || narrowed.source_cols % 32 != 0
+                || narrowed.source_stride_cols % 32 != 0
+            {
+                return Err(CompileError::InvalidInput(
+                    "MarlinMxfp4Weight source narrowing requires 32-wide MXFP4 group alignment"
+                        .to_string(),
+                ));
+            }
+            let group_start = narrowed.source_col_offset / 32;
+            let group_count = narrowed.source_cols / 32;
+            if source.shape[2] != i64::from(narrowed.source_stride_cols / 32) {
+                return Err(CompileError::InvalidInput(format!(
+                    "MarlinMxfp4Weight source group axis {:?} does not match stride cols {}",
+                    source.shape, narrowed.source_stride_cols
+                )));
+            }
+            if group_start != 0 || narrowed.source_cols != narrowed.source_stride_cols {
+                source = narrow_source_axis(
+                    source,
+                    Axis(2),
+                    i64::from(group_start),
+                    i64::from(group_count),
+                )?;
+                narrowed.source_stride_cols = narrowed.source_cols;
+                narrowed.source_col_offset = 0;
+            }
+        }
+        RepackLayout::MarlinMxfp4Scale => {
+            if source.shape.len() != 3 {
+                return Err(CompileError::InvalidInput(format!(
+                    "MarlinMxfp4Scale Repack source must be [B, R, groups], got {:?}",
+                    source.shape
+                )));
+            }
+            if source.shape[2] != i64::from(narrowed.source_stride_cols) {
+                return Err(CompileError::InvalidInput(format!(
+                    "MarlinMxfp4Scale source group axis {:?} does not match stride cols {}",
+                    source.shape, narrowed.source_stride_cols
+                )));
+            }
+            if narrowed.source_col_offset != 0
+                || narrowed.source_cols != narrowed.source_stride_cols
+            {
+                source = narrow_source_axis(
+                    source,
+                    Axis(2),
+                    i64::from(narrowed.source_col_offset),
+                    i64::from(narrowed.source_cols),
+                )?;
+                narrowed.source_stride_cols = narrowed.source_cols;
+                narrowed.source_col_offset = 0;
+            }
+        }
+        RepackLayout::DenseRowGather => {
+            if source.shape.len() != 2 {
+                return Err(CompileError::InvalidInput(format!(
+                    "DenseRowGather Repack source must be [B, R], got {:?}",
+                    source.shape
+                )));
+            }
+        }
+        RepackLayout::None => {}
+    }
+
+    Ok((source, narrowed))
+}
+
 fn buffer_bytes(program: &StorageProgram, id: BufferId) -> Result<u64, CompileError> {
     program
         .buffers
@@ -1018,6 +1165,20 @@ fn buffer_bytes(program: &StorageProgram, id: BufferId) -> Result<u64, CompileEr
         .find(|buffer| buffer.id == id)
         .map(|buffer| buffer.bytes)
         .ok_or_else(|| CompileError::InvalidInput(format!("buffer {} is missing", id.0)))
+}
+
+fn repack_stage_bytes(spec: RepackSpec) -> Result<u64, CompileError> {
+    match spec.layout {
+        RepackLayout::MarlinMxfp4Weight => {
+            let elems = u64::from(spec.target_rows)
+                .checked_mul(u64::from(spec.target_cols))
+                .ok_or_else(|| {
+                    CompileError::InvalidInput("MXFP4 repack stage size overflow".to_string())
+                })?;
+            Ok(elems.div_ceil(2))
+        }
+        RepackLayout::MarlinMxfp4Scale | RepackLayout::DenseRowGather | RepackLayout::None => Ok(0),
+    }
 }
 
 fn extent_storage_bytes(extent: &StridedExtent) -> Result<u64, CompileError> {
@@ -1137,6 +1298,57 @@ fn selected_source_extent(
         element_bytes: u32::try_from(element_bytes).unwrap_or(u32::MAX),
         dims,
     })
+}
+
+fn narrow_source_axis(
+    mut source: SourceView,
+    axis: Axis,
+    start: i64,
+    length: i64,
+) -> Result<SourceView, CompileError> {
+    let axis_index = axis.0 as usize;
+    if axis_index >= source.shape.len() {
+        return Err(CompileError::InvalidInput(format!(
+            "source slice axis {} out of range for shape {:?}",
+            axis.0, source.shape
+        )));
+    }
+    if start < 0 || length < 0 || start + length > source.shape[axis_index] {
+        return Err(CompileError::InvalidInput(format!(
+            "source slice [{start}, {}) on axis {} exceeds shape {:?}",
+            start + length,
+            axis.0,
+            source.shape
+        )));
+    }
+    let old_stride = source.stride.clone();
+    let can_preserve_strides = encoding_dense_element_bytes(&source.encoding).is_some()
+        && old_stride.dims.len() == source.shape.len();
+    let axis_stride_bytes = if can_preserve_strides {
+        u64::try_from(old_stride.dims[axis_index].src_stride).map_err(|_| {
+            CompileError::InvalidInput("negative source stride in slice lowering".to_string())
+        })?
+    } else {
+        dense_axis_stride_bytes(&source.shape, axis, &source.encoding)?
+    };
+    source.offset_bytes = source
+        .offset_bytes
+        .checked_add(
+            u64::try_from(start)
+                .ok()
+                .and_then(|start| start.checked_mul(axis_stride_bytes))
+                .ok_or_else(|| {
+                    CompileError::InvalidInput("source slice offset overflow".to_string())
+                })?,
+        )
+        .ok_or_else(|| CompileError::InvalidInput("source slice offset overflow".to_string()))?;
+    source.shape[axis_index] = length;
+    source.stride = if can_preserve_strides {
+        selected_source_extent(&old_stride, &source.shape, &source.encoding)?
+    } else {
+        storage_extent_for_shape(&source.shape, &source.encoding)?
+    };
+    Ok(source)
 }
 
 fn dense_axis_stride_bytes(
