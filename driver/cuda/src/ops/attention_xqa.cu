@@ -168,6 +168,20 @@ bool xqa_decode_bf16_supported(int num_q_heads,
     return current_device_major() >= 8;
 }
 
+void xqa_decode_bf16_gqa5_warmup_current_device() {
+    // Re-issue the smem-symbol read + per-kernel attribute set that
+    // FlashInfer's xqa csrc does in a static initializer. The static
+    // covers only one device; multi-GPU TP needs every rank's device to
+    // see the attribute or the captured kernel launch trips
+    // cudaErrorInvalidValue.
+    std::uint32_t size = 0;
+    CUDA_CHECK(cudaMemcpyFromSymbol(&size, smemSize, sizeof(smemSize)));
+    CUDA_CHECK(cudaFuncSetAttribute(
+        kernel_mha,
+        cudaFuncAttributeMaxDynamicSharedMemorySize,
+        static_cast<int>(size)));
+}
+
 int xqa_decode_page_bucket(int max_pages_per_seq) {
     int bucket = 1;
     const int pages = std::max(1, max_pages_per_seq);

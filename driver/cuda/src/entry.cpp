@@ -2049,6 +2049,14 @@ int run_impl(int argc,
                 hf.layer_types.empty();
             if (fwd_cfg.use_xqa_decode) {
                 fwd_cfg.force_prefill_path = false;
+                // Per-rank, per-device init of XQA gqa=5's smem attribute.
+                // Without this the kernel launch trips cudaErrorInvalidValue
+                // on TP>1 non-rank-0 devices during graph capture — see
+                // ops/attention_xqa.cu for details.
+                if (local_q_heads > 0 && local_kv_heads > 0 &&
+                    local_q_heads / local_kv_heads == 5) {
+                    pie_cuda_driver::ops::xqa_decode_bf16_gqa5_warmup_current_device();
+                }
             }
         }
 
