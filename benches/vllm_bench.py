@@ -21,7 +21,13 @@ def run(args: argparse.Namespace):
     prompts, prompt_counts = hf_chat_prompts_and_counts(
         args.model, args.system, make_prompts(args, n + args.warmup)
     )
-    max_num_seqs = args.concurrency if args.mode == "tput" else 1
+    # Concurrency 0 means "no batch cap" — match pie's --concurrency 0 path.
+    if args.mode == "latency":
+        max_num_seqs = 1
+    elif args.concurrency == 0:
+        max_num_seqs = max(1, args.num_requests)
+    else:
+        max_num_seqs = args.concurrency
     llm_kwargs = {}
     if args.attention_backend:
         llm_kwargs["attention_config"] = {"backend": args.attention_backend}

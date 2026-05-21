@@ -125,7 +125,14 @@ def build_config(args: argparse.Namespace):
     else:
         driver_options = {}
 
-    max_concurrent_processes = args.concurrency if args.mode == "tput" else 1
+    # Concurrency 0 means "no admission cap" (all submitted inferlets run wasm
+    # immediately; the inference scheduler still caps via max_forward_requests).
+    if args.mode == "latency":
+        max_concurrent_processes: int | None = 1
+    elif args.concurrency == 0:
+        max_concurrent_processes = None  # serializer drops field → unlimited
+    else:
+        max_concurrent_processes = args.concurrency
     scheduler = args.batch_policy or ("greedy" if args.mode == "latency" else "adaptive")
     scheduler_kwargs = {
         "batch_policy": scheduler,
