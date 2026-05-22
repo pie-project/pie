@@ -146,6 +146,11 @@ pub fn compiled_embedded() -> [(&'static str, bool); 3] {
     ]
 }
 
+/// Whether the compiled portable driver includes ggml-metal support.
+pub fn portable_metal_enabled() -> bool {
+    cfg!(feature = "driver-portable") && option_env!("PIE_COMPILED_PORTABLE_METAL") == Some("1")
+}
+
 /// Pick a sensible default flavor for commands that don't specify one
 /// (e.g. `pie smoke` without `--flavor`, `pie config init`'s template).
 /// Order: cuda → portable → dummy.

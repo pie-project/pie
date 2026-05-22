@@ -118,6 +118,13 @@ pub enum Command {
         #[arg(long)]
         flavor: Option<String>,
     },
+
+    /// Print compiled binary capabilities.
+    Capabilities {
+        /// Emit machine-readable JSON.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 /// Parse + dispatch. Top-level entry from `main.rs`.
@@ -136,5 +143,36 @@ pub fn dispatch() -> Result<()> {
         Command::Doctor => doctor_cmd::doctor(),
         Command::Check { config, debug } => diag_cmd::check(&config, debug),
         Command::Smoke { rpc, flavor } => diag_cmd::smoke(rpc, flavor.as_deref()),
+        Command::Capabilities { json } => capabilities(json),
     }
+}
+
+fn capabilities(json_output: bool) -> Result<()> {
+    let portable = cfg!(feature = "driver-portable");
+    let cuda_native = cfg!(feature = "driver-cuda");
+    let dummy = true;
+    let metal = crate::driver_ffi::portable_metal_enabled();
+
+    if json_output {
+        println!(
+            "{}",
+            serde_json::json!({
+                "drivers": {
+                    "portable": portable,
+                    "cuda_native": cuda_native,
+                    "dummy": dummy,
+                },
+                "devices": {
+                    "metal": metal,
+                },
+            })
+        );
+    } else {
+        println!("Compiled capabilities:");
+        println!("  driver.portable    {portable}");
+        println!("  driver.cuda_native {cuda_native}");
+        println!("  driver.dummy       {dummy}");
+        println!("  device.metal       {metal}");
+    }
+    Ok(())
 }
