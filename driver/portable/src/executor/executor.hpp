@@ -16,6 +16,7 @@
 #include <cstdint>
 #include <memory>
 #include <span>
+#include <string>
 #include <vector>
 
 #include "adapter.hpp"
@@ -32,7 +33,8 @@ class Executor {
 public:
     Executor(Model& model,
              std::int32_t total_pages,
-             std::int32_t page_size);
+             std::int32_t page_size,
+             std::string kv_cache_dtype = "auto");
     ~Executor();
 
     Executor(const Executor&) = delete;
@@ -65,6 +67,16 @@ public:
 
     // Access the KV cache (for the M7 aux IPC server's page copies).
     KvCachePaged& kv() noexcept { return kv_; }
+
+    StateCache* state_cache() noexcept { return state_.get(); }
+    std::int32_t rs_cache_slots() const noexcept {
+        return state_ ? state_->n_slots() : 0;
+    }
+    std::size_t rs_cache_slot_bytes() const noexcept {
+        return state_ && state_->n_slots() > 0
+            ? state_->buffer_size() / static_cast<std::size_t>(state_->n_slots())
+            : 0;
+    }
 
     // Wire in the adapter pool (M9). The executor looks up active adapters
     // per batch from this pool.

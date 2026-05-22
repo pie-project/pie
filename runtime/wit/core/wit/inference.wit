@@ -30,6 +30,9 @@ interface inference {
         // enabled by default
         output-speculative-tokens: func(flag: bool);
 
+        // Controls runtime pass-level speculation for this execute only.
+        pass-speculation: func(flag: bool);
+
         // if not provided, fallback to causal mask
         attention-mask: func(
             mask: list<brle>,

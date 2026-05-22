@@ -10,8 +10,3 @@ spin_us = 0
 [model]
 hf_path = "/root/.cache/huggingface/hub/models--mistralai--Mixtral-8x7B-v0.1/snapshots/fc7ac94680e38d7348cfa806e51218e6273104b0"
 
-[batching]
-kv_page_size = 32
-total_pages = 64
-max_forward_tokens = 2048
-max_forward_requests = 16

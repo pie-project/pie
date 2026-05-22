@@ -4,7 +4,8 @@
   "tagline": "In Pie user code can call fork() on the KV cache. N branches share the prompt's pages, so prefill runs once instead of N times.",
   "question": "What is 17 * 24 + 13? Show your reasoning step by step, then give the final number on its own line as: Final Answer: <number>",
   "naive": {
-    "label": "Naive",
+    "label": "With Stock API",
+    "note": "(via vLLM/SGLang/llama.cpp)",
     "sublabel": "4 independent contexts — prompt prefilled 4×",
     "tone": "warn",
     "events": [
@@ -99,7 +100,7 @@
     ]
   },
   "pie": {
-    "label": "Pie",
+    "label": "With Pie",
     "sublabel": "1 prefill + Context::fork() ×4 — KV pages shared across all forks",
     "tone": "good",
     "events": [

@@ -22,6 +22,15 @@ pub struct DriverCapabilities {
     pub kv_page_size: u32,
     /// Number of CPU-resident swap-pool pages (0 if no swap support).
     pub swap_pool_size: u32,
+    /// True when the model needs runtime-assigned recurrent-state slots.
+    #[serde(default)]
+    pub rs_cache_required: bool,
+    /// Number of GPU-resident recurrent-state slots (0 if unsupported).
+    #[serde(default)]
+    pub rs_cache_slots: u32,
+    /// Bytes per recurrent-state slot, for accounting/telemetry.
+    #[serde(default)]
+    pub rs_cache_slot_bytes: u64,
     /// Maximum forward-pass tokens accepted in one driver fire.
     pub max_forward_tokens: u32,
     /// Maximum forward-pass requests accepted in one driver fire.

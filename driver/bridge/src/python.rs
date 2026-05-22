@@ -17,7 +17,7 @@ pie_bridge_macros::schema_module! {
     Frame, ResponseFrame, RequestPayload, ResponsePayload,
     ForwardRequest, ForwardResponse, CopyRequest, AdapterRequest,
     StatusResponse, AdapterBinding,
-    Sampler, CopyDir, AdapterOp,
+    Sampler, CopyDir, CopyResource, AdapterOp,
 }
 
 // ---------------------------------------------------------------------------

@@ -84,7 +84,9 @@ add_library(pie_driver_portable_lib STATIC
   src/gguf_archive.cpp
   src/gguf_hparams.cpp
   src/model.cpp
+  src/rust_loader.cpp
   src/kv_cache.cpp
+  src/kv_cache_quant.cpp
   src/state_cache.cpp
   src/arch_spec.cpp
   src/plan.cpp
@@ -110,6 +112,7 @@ target_include_directories(pie_driver_portable_lib
   PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/src
     ${CMAKE_CURRENT_SOURCE_DIR}/../common/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/../weight_loader/include
     ${PIE_BRIDGE_INCLUDE_DIR})
 
 target_link_libraries(pie_driver_portable_lib PUBLIC
@@ -121,6 +124,16 @@ target_link_libraries(pie_driver_portable_lib PUBLIC
 if(UNIX AND NOT APPLE)
   target_link_libraries(pie_driver_portable_lib PUBLIC rt)
 endif()
+
+enable_testing()
+add_executable(test_kv_cache_quant
+  tests/test_kv_cache_quant.cpp
+  src/kv_cache_quant.cpp
+)
+target_include_directories(test_kv_cache_quant PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_link_libraries(test_kv_cache_quant PRIVATE ggml)
+add_test(NAME portable_kv_cache_quant COMMAND test_kv_cache_quant)
 
 # ── CUDA paged-attention (FlashInfer) ─────────────────────────────────────
 #

@@ -48,6 +48,8 @@ pub struct SchedulerLimits {
     pub max_forward_requests: usize,
     pub max_forward_tokens: usize,
     pub max_page_refs: usize,
+    pub max_logit_rows: usize,
+    pub max_prob_rows: usize,
     pub max_sampler_rows: usize,
     pub max_custom_mask_bytes: usize,
     pub max_logprob_labels: usize,
@@ -88,6 +90,8 @@ mod tests {
                 max_forward_requests: 64,
                 max_forward_tokens: 2048,
                 max_page_refs: 262144,
+                max_logit_rows: 2048,
+                max_prob_rows: 2048,
                 max_sampler_rows: 2048,
                 max_custom_mask_bytes: 8 * 1024 * 1024,
                 max_logprob_labels: 512,
@@ -98,6 +102,8 @@ mod tests {
         assert_eq!(limits.max_forward_requests, 64);
         assert_eq!(limits.max_forward_tokens, 2048);
         assert_eq!(limits.max_page_refs, 262144);
+        assert_eq!(limits.max_logit_rows, 2048);
+        assert_eq!(limits.max_prob_rows, 2048);
         assert_eq!(limits.max_sampler_rows, 2048);
         assert_eq!(limits.max_logprob_labels, 512);
     }
@@ -136,7 +142,7 @@ pub use inproc::{InProcChannel, InProcVTable};
 pub use inproc_polling::InProcPollingChannel;
 
 pub use ops::{
-    copy_d2d, copy_d2h, copy_h2d, copy_h2h, load_adapter, save_adapter, zo_initialize_adapter,
-    zo_update_adapter,
+    copy_d2d, copy_d2h, copy_h2d, copy_h2h, copy_rs_d2d, load_adapter, save_adapter,
+    zo_initialize_adapter, zo_update_adapter,
 };
 pub use shmem::ShmemChannel;

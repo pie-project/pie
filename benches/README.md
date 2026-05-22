@@ -53,6 +53,7 @@ uv --project sdk/python-server run python benches/pie_bench.py tput \
   --device cuda:0 \
   --max-tokens 128 \
   --num-requests 512 \
+  --kv-cache-dtype auto \
   --warmup 16
 ```
 

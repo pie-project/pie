@@ -89,6 +89,8 @@ struct PlanArrays {
     std::span<const std::uint32_t> kv_page_indices;
     std::span<const std::uint32_t> kv_page_indptr;
     std::span<const std::uint32_t> kv_last_lens;
+    std::span<const std::uint32_t> rs_slot_ids;
+    std::span<const std::uint8_t>  rs_slot_flags;
     std::span<const std::uint32_t> sampler_types;
     std::span<const float>         sampler_temps;
     std::span<const std::uint32_t> sampler_top_k;

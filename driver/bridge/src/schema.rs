@@ -89,6 +89,13 @@ pub struct ForwardRequest {
     pub kv_last_page_lens: Vec<u32>,
     pub qo_indptr: Vec<u32>,
 
+    /// Runtime-managed recurrent-state cache slots, one per request
+    /// for linear-attention models. Empty for models without rs_cache.
+    pub rs_slot_ids: Vec<u32>,
+    /// Per-request rs_cache flags. Bit 0 means "reset this slot before
+    /// executing the request" (fresh context or replay-from-zero).
+    pub rs_slot_flags: Vec<u8>,
+
     /// Per-row BRLE attention masks, flattened across the batch.
     /// `mask_indptr[r..r+1]` is the half-open range of rows in `masks`
     /// belonging to request `r`.
@@ -217,6 +224,7 @@ pub struct CopyRequest {
     pub dir: CopyDir,
     pub srcs: Vec<u32>,
     pub dsts: Vec<u32>,
+    pub resource: CopyResource,
 }
 
 #[derive(Copy, PartialEq, Eq)]
@@ -226,6 +234,13 @@ pub enum CopyDir {
     H2D,
     D2D,
     H2H,
+}
+
+#[derive(Copy, PartialEq, Eq)]
+#[schema]
+pub enum CopyResource {
+    Kv,
+    Rs,
 }
 
 #[schema]

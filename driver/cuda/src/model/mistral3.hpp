@@ -27,6 +27,6 @@ namespace pie_cuda_driver::model {
 // place (registering bf16 views under the un-suffixed names), and then
 // returns a `Qwen3Weights` ready for `llama_like_forward_paged`. The
 // FP8 source tensors stay in the engine but are unreferenced.
-Qwen3Weights bind_mistral3(LoadedModel& engine);
+Qwen3Weights bind_mistral3(const LoadedModel& engine);
 
 }  // namespace pie_cuda_driver::model

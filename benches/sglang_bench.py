@@ -21,16 +21,22 @@ def run(args: argparse.Namespace):
     prompts, prompt_counts = hf_chat_prompts_and_counts(
         args.model, args.system, make_prompts(args, n + args.warmup)
     )
-    max_running_requests = args.num_requests if args.mode == "tput" else 1
-    engine = sgl.Engine(
-        model_path=args.model,
-        mem_fraction_static=args.gpu_mem_util,
-        disable_cuda_graph=False,
-        disable_radix_cache=True,
-        max_running_requests=max_running_requests,
-        tp_size=args.tp_size,
-        context_length=args.max_model_len,
-    )
+    max_running_requests = args.concurrency if args.mode == "tput" else 1
+    engine_kwargs = {
+        "model_path": args.model,
+        "mem_fraction_static": args.gpu_mem_util,
+        "disable_cuda_graph": args.sglang_disable_cuda_graph,
+        "disable_piecewise_cuda_graph": args.sglang_disable_piecewise_cuda_graph,
+        "disable_radix_cache": True,
+        "max_running_requests": max_running_requests,
+        "tp_size": args.tp_size,
+        "context_length": args.max_model_len,
+    }
+    if args.sglang_attention_backend:
+        engine_kwargs["attention_backend"] = args.sglang_attention_backend
+    if args.sglang_sampling_backend:
+        engine_kwargs["sampling_backend"] = args.sglang_sampling_backend
+    engine = sgl.Engine(**engine_kwargs)
     sampling = {
         "temperature": args.temperature,
         "top_p": args.top_p,
@@ -80,8 +86,11 @@ def run(args: argparse.Namespace):
         results=results,
         wall_s=wall,
         config={
-            "disable_cuda_graph": False,
+            "disable_cuda_graph": args.sglang_disable_cuda_graph,
+            "disable_piecewise_cuda_graph": args.sglang_disable_piecewise_cuda_graph,
             "disable_radix_cache": True,
+            "attention_backend": args.sglang_attention_backend,
+            "sampling_backend": args.sglang_sampling_backend,
             "max_running_requests": max_running_requests,
             "temperature": args.temperature,
             "top_p": args.top_p,

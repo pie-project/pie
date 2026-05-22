@@ -13,9 +13,9 @@ pub use wstd;
 pub use wit_bindgen;
 
 // Re-export serde and serde_json so the macro-generated JSON bridge can use them
+pub use schemars;
 pub use serde;
 pub use serde_json;
-pub use schemars;
 
 // Re-export the attribute macros
 pub use inferlet_macros::{main, tool};
@@ -43,29 +43,27 @@ pub use pie::zo;
 mod context;
 
 pub use context::{
-    Context, RawContext,
-    Constrain, GrammarConstraint, Schema,
-    AnyJson, Ebnf, JsonSchema, Regex,
+    AnyJson, Constrain, Context, Ebnf, GrammarConstraint, JsonSchema, RawContext, Regex, Schema,
 };
 
 // =============================================================================
 // Sampler / Probe + Forward primitive
 // =============================================================================
 
-pub mod sample;
 pub mod forward;
+pub mod sample;
 
 // =============================================================================
 // Generation state machine + decoders + speculation
 // =============================================================================
 
-pub mod generation;
 pub mod chat;
+pub mod generation;
 pub mod reasoning;
 pub mod spec;
 pub mod tools;
 
-pub use generation::{Generator, GenStep};
+pub use generation::{GenStep, Generator};
 pub use spec::Speculator;
 pub use tools::Tool;
 
@@ -110,7 +108,6 @@ pub mod inference {
 /// [`GrammarConstraint`] instead.
 pub use crate::pie::core::inference::Matcher;
 
-
 // =============================================================================
 // Async Extension Traits
 // =============================================================================
@@ -126,9 +123,14 @@ pub trait ForwardPassExt {
 impl ForwardPassExt for inference::ForwardPass {
     async fn execute_async(&self) -> Result<inference::Output> {
         let future_output = self.execute()?;
+        if let Some(output) = future_output.get() {
+            return Ok(output);
+        }
         let pollable = future_output.pollable();
         AsyncPollable::new(pollable).wait_for().await;
-        future_output.get().ok_or_else(|| "No output available".to_string())
+        future_output
+            .get()
+            .ok_or_else(|| "No output available".to_string())
     }
 }
 
@@ -250,22 +252,22 @@ pub fn parse_args(args: Vec<String>) -> Arguments {
 /// `use inferlet::prelude::*;` covers the common case so inferlets don't
 /// have to maintain a hand-rolled import grocery list.
 pub mod prelude {
-    pub use crate::{main, tool};
-    pub use crate::{Child, Context, Result, Schema, Tool, launch};
+    pub use crate::adapter::Adapter;
+    pub use crate::messaging;
     pub use crate::model::Model;
     pub use crate::runtime;
-    pub use crate::messaging;
-    pub use crate::adapter::Adapter;
+    pub use crate::{Child, Context, Result, Schema, Tool, launch};
+    pub use crate::{main, tool};
 
-    pub use crate::forward::{Forward, Output, SampleHandle, ProbeHandle};
-    pub use crate::sample::{Sampler, Probe};
-    pub use crate::generation::{Generator, GenStep};
-    pub use crate::{chat, reasoning, tools};
+    pub use crate::forward::{Forward, Output, ProbeHandle, SampleHandle};
+    pub use crate::generation::{GenStep, Generator};
+    pub use crate::sample::{Probe, Sampler};
     pub use crate::spec::Speculator;
+    pub use crate::{chat, reasoning, tools};
 
     // Extension traits
     pub use crate::ForwardPassExt;
-    pub use crate::SubscriptionExt;
-    pub use crate::FutureStringExt;
     pub use crate::FutureBlobExt;
+    pub use crate::FutureStringExt;
+    pub use crate::SubscriptionExt;
 }

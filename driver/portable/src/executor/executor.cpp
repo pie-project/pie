@@ -11,6 +11,7 @@
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include <ggml.h>
@@ -24,6 +25,7 @@
 #include "graph_phi3small.hpp"
 #include "graph_phi3_5moe.hpp"
 #include "graph_qwen3_5.hpp"
+#include "kv_cache_quant.hpp"
 #include "plan.hpp"
 #include "sampler.hpp"
 
@@ -306,8 +308,10 @@ std::vector<SamplerOutput> sample_batch_greedy(const Executor::BatchPlan& plan,
 
 KvCachePaged build_kv_for_(Model& model,
                             std::int32_t total_pages,
-                            std::int32_t page_size) {
+                            std::int32_t page_size,
+                            const std::string& kv_cache_dtype) {
     const auto& h = model.hparams();
+    auto quant_format = kv_cache_quant_format_from_string(kv_cache_dtype);
     if (h.arch == PieArch::Gemma4) {
         // Per-layer head_dim AND kv_heads. Sliding layers carry
         // [num_key_value_heads, head_dim]; full layers carry
@@ -328,14 +332,16 @@ KvCachePaged build_kv_for_(Model& model,
                              std::move(per_layer_kvh),
                              std::move(per_layer_dim),
                              total_pages, page_size,
-                             GGML_TYPE_F16);
+                             GGML_TYPE_F16,
+                             std::move(quant_format));
     }
     return KvCachePaged(model.backend(),
                         h.num_hidden_layers,
                         h.num_key_value_heads,
                         h.head_dim,
                         total_pages, page_size,
-                        GGML_TYPE_F16);
+                        GGML_TYPE_F16,
+                        std::move(quant_format));
 }
 
 }  // namespace
@@ -346,9 +352,10 @@ KvCachePaged build_kv_for_(Model& model,
 
 Executor::Executor(Model& model,
                    std::int32_t total_pages,
-                   std::int32_t page_size)
+                   std::int32_t page_size,
+                   std::string kv_cache_dtype)
     : model_(model),
-      kv_(build_kv_for_(model, total_pages, page_size)),
+      kv_(build_kv_for_(model, total_pages, page_size, kv_cache_dtype)),
       cache_(std::make_unique<GraphCache>()) {
     // Qwen 3.5 / 3.6 needs a recurrent-state cache for its linear-
     // attention layers. Allocate one slot per concurrent context the
@@ -365,8 +372,8 @@ Executor::Executor(Model& model,
         const std::int32_t conv_dim =
             2 * h.qwen35_linear_num_k_heads * h.qwen35_linear_k_head_dim
             +     h.qwen35_linear_num_v_heads * h.qwen35_linear_v_head_dim;
-        // n_slots: use the configured max_forward_requests, capped at 64 so we
-        // don't burn arbitrary GPU RAM on idle slots.
+        // Keep recurrent-state slots bounded so we don't burn arbitrary GPU RAM
+        // on idle slots.
         const std::int32_t n_slots = 64;
         state_ = std::make_unique<StateCache>(
             model.backend(), n_slots, linear_layers,
@@ -477,6 +484,11 @@ Executor::BatchPlan Executor::plan_(const pie_driver::PieForwardRequestView& req
 
     const PlanArrays arrays = extract_plan_arrays(req);
     validate_plan_top_level(arrays);
+    if (state_ && arrays.n_request > 0 &&
+        arrays.rs_slot_ids.size() != static_cast<std::size_t>(arrays.n_request)) {
+        throw std::runtime_error(
+            "plan: rs_cache forward missing runtime-assigned slot ids");
+    }
 
     BatchPlan plan;
     plan.total_n_tokens = arrays.total_n_tokens;
@@ -495,6 +507,13 @@ Executor::BatchPlan Executor::plan_(const pie_driver::PieForwardRequestView& req
     const std::int32_t total_pages = kv_.total_pages();
     for (std::int32_t r = 0; r < arrays.n_request; ++r) {
         plan_single_request(arrays, r, page_size, total_pages, spec, plan);
+    }
+    if (state_ && arrays.rs_slot_flags.size() == static_cast<std::size_t>(arrays.n_request)) {
+        for (std::int32_t r = 0; r < arrays.n_request; ++r) {
+            if ((arrays.rs_slot_flags[r] & 1u) != 0 && plan.reqs[r].state_slot >= 0) {
+                state_->zero_slot(plan.reqs[r].state_slot);
+            }
+        }
     }
 
     // M11 packed-decode fast path: all-decode (n_tokens == 1) batches with
@@ -775,25 +794,6 @@ std::vector<SamplerOutput> Executor::compute_(const BatchPlan& plan) {
             if (!ggml_backend_sched_alloc_graph(sched_, cache_->result.gf)) {
                 throw std::runtime_error("compute: sched_alloc_graph failed");
             }
-            // First-call sanity diagnostic: log how the scheduler
-            // partitioned the graph. With Part A's norm upcast in
-            // place + the slow_only fallback when in-graph top-k is
-            // unsupported, this should print n_splits=1 (all on
-            // primary) on Qwen3 / Llama / Gemma. Multiple splits =
-            // some op fell to CPU, which is correct but slow; worth
-            // investigating with `ggml_backend_sched_get_tensor_backend`
-            // on each graph node to find the offender.
-            static bool _printed_assignments = false;
-            if (!_printed_assignments && std::getenv("PIE_PORTABLE_LOG_SCHED")) {
-                _printed_assignments = true;
-                std::cerr << "[sched] n_splits="
-                          << ggml_backend_sched_get_n_splits(sched_)
-                          << " n_nodes=" << ggml_graph_n_nodes(cache_->result.gf)
-                          << " backend="
-                          << ggml_backend_name(model_.backend())
-                          << (model_.cpu_fallback() ? " (+CPU fallback)" : "")
-                          << "\n";
-            }
             take_us(timings_.graph_alloc_us);
         } catch (...) {
             cache_->release();
@@ -815,35 +815,6 @@ std::vector<SamplerOutput> Executor::compute_(const BatchPlan& plan) {
                                  std::to_string(static_cast<int>(status)));
     }
     take_us(timings_.compute_us);
-
-    // Debug: optional intermediate-tensor dump (set by per-arch builders
-    // when an env var is active). Prints first 16 floats + l2 norm.
-    if (g.debug_tensor && g.debug_name) {
-        const std::size_t nb = ggml_nbytes(g.debug_tensor);
-        const std::size_t n_elem = nb / sizeof(float);
-        std::vector<float> buf(n_elem);
-        ggml_backend_tensor_get(g.debug_tensor, buf.data(), 0, nb);
-        double l2 = 0.0;
-        for (auto v : buf) l2 += static_cast<double>(v) * v;
-        l2 = std::sqrt(l2);
-        std::fprintf(stderr,
-            "[qwen35-dbg] %s shape=[%lld,%lld,%lld,%lld] n=%zu l2=%.6f first16:",
-            g.debug_name,
-            (long long)g.debug_tensor->ne[0], (long long)g.debug_tensor->ne[1],
-            (long long)g.debug_tensor->ne[2], (long long)g.debug_tensor->ne[3],
-            n_elem, l2);
-        for (std::size_t i = 0; i < std::min<std::size_t>(16, n_elem); ++i) {
-            std::fprintf(stderr, " %.6f", buf[i]);
-        }
-        std::fprintf(stderr, "\n");
-        if (const char* path = std::getenv("PIE_QWEN35_DUMP_BIN")) {
-            std::FILE* f = std::fopen(path, "wb");
-            if (f) {
-                std::fwrite(buf.data(), sizeof(float), n_elem, f);
-                std::fclose(f);
-            }
-        }
-    }
 
     const std::int32_t n_slots =
         static_cast<std::int32_t>(plan.sampling_pos_i32.size());

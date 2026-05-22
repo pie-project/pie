@@ -14,6 +14,7 @@ members = [
     "driver/bridge",
     "driver/bridge-macros",
     "driver/dummy",
+    "driver/weight_loader",
     "sdk/python-server",
 ]
 exclude = [

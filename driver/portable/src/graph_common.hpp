@@ -133,11 +133,6 @@ struct GraphResult {
     ggml_tensor* top_k_idx   = nullptr;  // I32 [K, n_slots]
     ggml_tensor* top_k_probs = nullptr;  // F32 [K, n_slots]
     GraphInputs  in;
-    // Debug-only: per-arch builders may attach an extra named output for
-    // ad-hoc inspection. forward.cpp downloads + prints first 8 floats
-    // when present.
-    ggml_tensor* debug_tensor = nullptr;
-    const char*  debug_name   = nullptr;
 };
 
 // Stage all per-batch host arrays into the graph's input tensors. Picks

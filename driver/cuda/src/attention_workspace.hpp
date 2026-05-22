@@ -18,8 +18,8 @@ namespace pie_cuda_driver {
 class AttentionWorkspace {
 public:
     static AttentionWorkspace allocate(
-        std::size_t float_workspace_bytes = 64 * 1024 * 1024,   // 64 MiB
-        std::size_t int_workspace_bytes  =  8 * 1024 * 1024);   // 8  MiB
+        std::size_t float_workspace_bytes = 80 * 1024 * 1024,  // 80 MiB
+        std::size_t int_workspace_bytes  =  8 * 1024 * 1024);  // 8  MiB
 
     AttentionWorkspace() = default;
     AttentionWorkspace(const AttentionWorkspace&) = delete;

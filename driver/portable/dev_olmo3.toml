@@ -9,8 +9,3 @@ spin_us = 0
 [model]
 hf_path = "/root/.cache/huggingface/hub/models--allenai--Olmo-3-1025-7B/snapshots/a81bae42db3975be1671e27b9c9a56da1a9f980f"
 
-[batching]
-kv_page_size = 32
-total_pages = 512
-max_forward_tokens = 4096
-max_forward_requests = 64

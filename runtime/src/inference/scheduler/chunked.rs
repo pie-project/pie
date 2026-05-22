@@ -12,12 +12,13 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::context::pagestore::{PhysicalPageId, compute_last_page_len};
 use crate::driver::SchedulerLimits;
+use crate::inference::ForwardOutput;
 
 use super::{Completion, PendingRequest, RequestCapacityUsage, request_capacity_usage};
 
 pub(super) struct ChunkContinuation {
     original_request: pie_bridge::ForwardRequest,
-    response_tx: oneshot::Sender<Result<pie_bridge::ForwardResponse>>,
+    response_tx: oneshot::Sender<Result<ForwardOutput>>,
     physical_page_ids: Vec<PhysicalPageId>,
     final_last_page_len: u32,
     chunk_end: usize,
@@ -121,15 +122,17 @@ impl PendingRequest {
     }
 
     pub(super) fn send_error(self, msg: String) {
-        self.send_result(Err(anyhow::anyhow!(msg)), None, 0);
+        self.send_result::<ForwardOutput>(Err(anyhow::anyhow!(msg)), None, 0);
     }
 
-    pub(super) fn send_result(
+    pub(super) fn send_result<T>(
         self,
-        result: Result<pie_bridge::ForwardResponse>,
+        result: Result<T>,
         submit_tx: Option<&mpsc::WeakUnboundedSender<PendingRequest>>,
         page_size: u32,
-    ) {
+    ) where
+        T: Into<ForwardOutput>,
+    {
         let PendingRequest {
             request,
             completion,
@@ -137,6 +140,7 @@ impl PendingRequest {
             last_page_len: _,
         } = self;
 
+        let result = result.map(Into::into);
         match completion {
             Completion::Direct(tx) => {
                 tx.send(result).ok();
@@ -145,13 +149,21 @@ impl PendingRequest {
                 continuation,
                 sampler_slots,
             } => match result {
-                Ok(resp) => continuation.complete_chunk(
+                Ok(ForwardOutput::Response(resp)) => continuation.complete_chunk(
                     resp,
                     request.samplers,
                     sampler_slots,
                     submit_tx,
                     page_size,
                 ),
+                Ok(_) => {
+                    continuation
+                        .response_tx
+                        .send(Err(anyhow::anyhow!(
+                            "chunked prefill expected a structured response"
+                        )))
+                        .ok();
+                }
                 Err(e) => {
                     continuation.response_tx.send(Err(e)).ok();
                 }
@@ -186,7 +198,7 @@ impl ChunkContinuation {
             } = self;
             match response_accumulator.into_response(&original_request.samplers) {
                 Ok(resp) => {
-                    response_tx.send(Ok(resp)).ok();
+                    response_tx.send(Ok(ForwardOutput::Response(resp))).ok();
                 }
                 Err(msg) => {
                     response_tx.send(Err(anyhow::anyhow!(msg))).ok();
@@ -881,6 +893,11 @@ fn build_chunk_request_for_slots(
     if output_spec_flags.is_empty() {
         output_spec_flags.push(false);
     }
+    let rs_slot_flags = if start == 0 {
+        original.rs_slot_flags.clone()
+    } else {
+        vec![0; original.rs_slot_flags.len()]
+    };
     let sampling_len = sampling_indices.len() as u32;
     let sampler_len = samplers.len() as u32;
     let chunk = pie_bridge::ForwardRequest {
@@ -890,6 +907,8 @@ fn build_chunk_request_for_slots(
         kv_page_indptr: vec![0],
         kv_last_page_lens: Vec::new(),
         qo_indptr: vec![0, chunk_len as u32],
+        rs_slot_ids: original.rs_slot_ids.clone(),
+        rs_slot_flags,
         masks,
         mask_indptr,
         logit_masks,
@@ -947,6 +966,28 @@ fn chunk_capacity_usage(
             _ => 0,
         })
         .sum();
+    let mut all_samplers_token = true;
+    let mut has_prob_sampling = false;
+    let mut has_output_spec = false;
+    for &slot in sampler_slots {
+        if let Some(sampler) = original.samplers.get(slot) {
+            if !super::is_token_sampler(sampler) {
+                all_samplers_token = false;
+            }
+            if super::sampler_needs_prob_rows(sampler) {
+                has_prob_sampling = true;
+            }
+        }
+        has_output_spec |= original
+            .output_spec_flags
+            .get(slot)
+            .copied()
+            .unwrap_or(false);
+    }
+    let has_dense_logit_requirement = original.has_user_mask
+        || !original.logit_masks.is_empty()
+        || has_output_spec
+        || !all_samplers_token;
     let user_custom_mask_bytes = if original.has_user_mask && chunk_len > 1 {
         super::packed_mask_bytes(chunk_len, chunk_pages, chunk_last_page_len, page_size)
     } else {
@@ -958,11 +999,27 @@ fn chunk_capacity_usage(
     Ok(RequestCapacityUsage {
         forward_tokens: chunk_len,
         page_refs: chunk_pages,
+        logit_rows: if has_dense_logit_requirement {
+            sampler_slots.len()
+        } else {
+            0
+        },
+        prob_rows: if has_prob_sampling {
+            sampler_slots.len()
+        } else {
+            0
+        },
         sampler_rows: sampler_slots.len(),
         logprob_labels,
         user_custom_mask_bytes,
         spec_custom_mask_bytes,
         has_spec_drafts: false,
+        has_dense_logit_requirement,
+        has_prob_sampling,
+        is_single_token_decode: chunk_len == 1
+            && original.single_token_mode
+            && !original.has_user_mask,
+        all_samplers_token,
     })
 }
 

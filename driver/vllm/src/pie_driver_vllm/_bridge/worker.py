@@ -249,6 +249,11 @@ def _populate_next_drafts(batch, sampling_results: dict, engine) -> None:
     step = getattr(engine, "spec_step", None)
     if step is None:
         return
+    driver_config = getattr(engine, "driver_config", None)
+    if driver_config is not None and not getattr(
+        driver_config, "spec_ngram_enabled", True
+    ):
+        return
 
     num_requests = len(batch.request_output_counts)
     output_flags = batch.output_spec_flags
@@ -334,10 +339,9 @@ def _leader_loop(
     config = engine.config
     latency_stats = LatencyStats(enabled=config.telemetry_enabled)
 
-    # `kv_page_size` and `max_dist_size` are NativeRuntimeConfig-only after
-    # the universal/native config split. Fall back to the engine's
-    # capability handshake (which every driver implements) for kv_page_size,
-    # and to a sensible default for max_dist_size which only matters for
+    # Some runtime configs carry the resolved page size directly. Fall back
+    # to the engine's capability handshake (which every driver implements)
+    # and to a sensible default for max_dist_size, which only matters for
     # distribution-mode sampling responses.
     _kv_page_size = getattr(config, "kv_page_size", None)
     if _kv_page_size is None:
@@ -399,6 +403,7 @@ def _leader_loop(
         t0 = time.perf_counter()
         sampling_results = engine.fire_batch(inputs, sampling_metadata)
         t_inference = time.perf_counter() - t0
+        driver_profile = getattr(engine, "_last_fire_profile", None)
 
         if batch.has_speculative_inputs:
             batch.verify_drafts(sampling_results)
@@ -413,10 +418,12 @@ def _leader_loop(
             "inference": t_inference,
             "build_timing": build_timing,
             "traceparent": kwargs.get("trace_context"),
+            "driver_profile": driver_profile,
         }
         return sampling_results, batch, timings
 
     def _record_step_timing(timings, t_create_responses):
+        response_profile = timings.get("response_profile")
         latency_stats.record_span(
             StepTiming(
                 build_batch=timings["build_batch"],
@@ -430,6 +437,8 @@ def _leader_loop(
                 mask_loop=timings["build_timing"]["mask_loop"],
                 brle_decode=timings["build_timing"]["brle_decode"],
                 sampler_loop=timings["build_timing"]["sampler_loop"],
+                driver_profile=timings.get("driver_profile"),
+                response_profile=response_profile,
             ),
             traceparent=timings["traceparent"],
         )
@@ -543,15 +552,24 @@ def _leader_loop(
             if lease is None:
                 continue
             payload = lease.payload  # bytes (copy from shmem slot)
+            args = None
             try:
-                method_tag = _shm_schema.peek_method_tag(payload)
+                # Forward is the hot path. Parse it directly once; fall back
+                # to a lightweight method peek for copy/adapter/health frames.
+                args = _shm_schema.parse_request(payload)
+                method_tag = _METHOD_FORWARD
             except Exception as e:
-                print(f"[pie_driver_dev] malformed request: {e}")
-                lease.commit_status(2)
-                continue
+                try:
+                    method_tag = _shm_schema.peek_method_tag(payload)
+                except Exception:
+                    print(f"[pie_driver_dev] malformed request: {e}")
+                    lease.commit_status(2)
+                    continue
 
             if method_tag == _METHOD_FORWARD:
-                args = _shm_schema.parse_request(payload)
+                if args is None:
+                    lease.commit_status(2)
+                    continue
                 driver_id = int(args.get("driver_id", 0))
                 try:
                     sampling_results, batch, timings = _run_fire_batch_inner(args)
@@ -567,7 +585,13 @@ def _leader_loop(
                 out_bytes = _response_builder.build_from_batch(
                     sampling_results, batch, driver_id
                 )
+                t_after_build_response = _time.perf_counter()
                 lease.commit(out_bytes)
+                timings["response_profile"] = {
+                    **(_response_builder.last_profile or {}),
+                    "build_total": t_after_build_response - t_after_handler,
+                    "commit": _time.perf_counter() - t_after_build_response,
+                }
                 _record_step_timing(timings, _time.perf_counter() - t_after_handler)
             elif method_tag in (_METHOD_COPY_D2H, _METHOD_COPY_H2D,
                                 _METHOD_COPY_D2D, _METHOD_COPY_H2H):

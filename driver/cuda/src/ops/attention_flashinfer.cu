@@ -4,6 +4,7 @@
 
 #include <cmath>
 #include <stdexcept>
+#include <string>
 #include <vector>
 
 #include <cuda_bf16.h>
@@ -22,6 +23,8 @@
 #include <flashinfer/utils.cuh>
 
 #include "cuda_check.hpp"
+#include "kernels/kv_paged.hpp"
+#include "ops/attention_flashinfer_hopper.hpp"
 
 namespace pie_cuda_driver::ops {
 
@@ -56,6 +59,18 @@ using AttnVariantSoftcap = ::flashinfer::DefaultAttention<
     /*use_logits_soft_cap=*/true,
     /*use_alibi=*/false>;
 
+using AttnVariantFull = ::flashinfer::DefaultAttention<
+    /*use_custom_mask=*/false,
+    /*use_sliding_window=*/false,
+    /*use_logits_soft_cap=*/false,
+    /*use_alibi=*/false>;
+
+using AttnVariantFullSoftcap = ::flashinfer::DefaultAttention<
+    /*use_custom_mask=*/false,
+    /*use_sliding_window=*/false,
+    /*use_logits_soft_cap=*/true,
+    /*use_alibi=*/false>;
+
 using DecodeParams = ::flashinfer::BatchDecodeParams<DTypeQ, DTypeKV, DTypeO, IdType>;
 
 // flashinfer's `GetPtrFromBaseOffset` is `(base + offset_bytes) reinterpret to T*`.
@@ -77,6 +92,20 @@ constexpr bool head_dim_supports_cascade_merge(uint32_t hd) {
     return hd == 64 || hd == 128 || hd == 256 || hd == 512;
 }
 
+int current_device_major() {
+    thread_local int cached_device = -1;
+    thread_local int cached_major = 0;
+    int dev = 0;
+    CUDA_CHECK(cudaGetDevice(&dev));
+    if (dev != cached_device) {
+        cudaDeviceProp prop{};
+        CUDA_CHECK(cudaGetDeviceProperties(&prop, dev));
+        cached_device = dev;
+        cached_major = prop.major;
+    }
+    return cached_major;
+}
+
 template <uint32_t HEAD_DIM, uint32_t GROUP_SIZE>
 struct DecodeWorkEstimator {
     cudaError_t operator()(bool& split_kv, uint32_t& max_grid_size,
@@ -90,6 +119,10 @@ struct DecodeWorkEstimator {
             split_kv, max_grid_size, max_num_pages_per_batch, new_batch_size, gdy,
             batch_size, kv_indptr_h, num_qo_heads, page_size, enable_cuda_graph, stream);
         if constexpr (!head_dim_supports_cascade_merge(HEAD_DIM)) {
+            split_kv = false;
+            new_batch_size = batch_size;
+        }
+        if (current_device_major() >= 9 && batch_size <= 512) {
             split_kv = false;
             new_batch_size = batch_size;
         }
@@ -108,6 +141,24 @@ struct DecodePlanCache {
     int num_kv_heads = 0;
     int head_dim = 0;
     int page_size = 0;
+    int num_pages_in_batch = 0;
+    bool enable_pdl = false;
+    bool valid = false;
+};
+
+struct PrefillPlanCache {
+    ::flashinfer::PrefillPlanInfo plan_info;
+    HopperPrefillPlan sm90_plan;
+    int total_tokens = 0;
+    int num_requests = 0;
+    int num_q_heads = 0;
+    int num_kv_heads = 0;
+    int head_dim = 0;
+    int page_size = 0;
+    int window_left = -1;
+    bool full_attention_variant = false;
+    bool use_sm90 = false;
+    bool enable_pdl = false;
     bool valid = false;
 };
 
@@ -115,11 +166,50 @@ void DecodePlanCacheDeleter::operator()(DecodePlanCache* p) const noexcept {
     delete p;
 }
 
+void PrefillPlanCacheDeleter::operator()(PrefillPlanCache* p) const noexcept {
+    delete p;
+}
+
 DecodePlanCachePtr make_decode_plan() {
     return DecodePlanCachePtr(new DecodePlanCache{});
 }
 
+PrefillPlanCachePtr make_prefill_plan() {
+    return PrefillPlanCachePtr(new PrefillPlanCache{});
+}
+
+std::uint8_t decode_plan_graph_layout(const DecodePlanCache& cache) {
+    if (!cache.valid) return 0;
+    return cache.plan_info.split_kv ? 2 : 1;
+}
+
+std::uint8_t prefill_plan_graph_layout(const PrefillPlanCache& cache) {
+    if (!cache.valid) return 0;
+    if (cache.use_sm90) {
+        return hopper_prefill_graph_layout(cache.sm90_plan);
+    }
+    std::uint8_t tile_class = 0;
+    switch (cache.plan_info.cta_tile_q) {
+        case 16:  tile_class = 1; break;
+        case 32:  tile_class = 2; break;
+        case 64:  tile_class = 3; break;
+        case 128: tile_class = 4; break;
+        default:  tile_class = 0; break;
+    }
+    const std::uint8_t variant_class =
+        cache.full_attention_variant ? 1u : 0u;
+    return static_cast<std::uint8_t>(
+        64u |
+        (cache.plan_info.split_kv ? 1u : 0u) |
+        (tile_class << 1) |
+        (variant_class << 4));
+}
+
 namespace {
+
+bool current_device_supports_pdl() {
+    return current_device_major() >= 9;
+}
 
 template <uint32_t HEAD_DIM>
 cudaError_t plan_decode_for_head_dim(
@@ -128,7 +218,8 @@ cudaError_t plan_decode_for_head_dim(
     uint32_t num_requests, uint32_t num_q_heads, uint32_t page_size,
     int gqa_group_size,
     AttentionWorkspace& workspace,
-    cudaStream_t stream)
+    cudaStream_t stream,
+    bool enable_cuda_graph)
 {
     auto plan_for = [&](auto work_estimator) {
         return ::flashinfer::DecodePlan<HEAD_DIM, POS_ENC, AttnVariant, DecodeParams>(
@@ -138,7 +229,7 @@ cudaError_t plan_decode_for_head_dim(
             cache.plan_info,
             const_cast<IdType*>(indptr_h_buf.data()),
             num_requests, num_q_heads, page_size,
-            /*enable_cuda_graph=*/true,
+            enable_cuda_graph,
             stream, work_estimator);
     };
     // Must match the kernel-side DISPATCH_GQA_GROUP_SIZE set in
@@ -165,7 +256,8 @@ void plan_attention_flashinfer_decode_bf16(
     int num_requests,
     int num_q_heads, int num_kv_heads, int head_dim, int page_size,
     AttentionWorkspace& workspace,
-    cudaStream_t stream)
+    cudaStream_t stream,
+    bool enable_cuda_graph)
 {
     const int gqa_group_size = num_q_heads / num_kv_heads;
 
@@ -180,31 +272,31 @@ void plan_attention_flashinfer_decode_bf16(
             status = plan_decode_for_head_dim<64>(
                 cache, indptr_h_buf,
                 num_requests, num_q_heads, page_size, gqa_group_size,
-                workspace, stream);
+                workspace, stream, enable_cuda_graph);
             break;
         case 96:
             status = plan_decode_for_head_dim<96>(
                 cache, indptr_h_buf,
                 num_requests, num_q_heads, page_size, gqa_group_size,
-                workspace, stream);
+                workspace, stream, enable_cuda_graph);
             break;
         case 128:
             status = plan_decode_for_head_dim<128>(
                 cache, indptr_h_buf,
                 num_requests, num_q_heads, page_size, gqa_group_size,
-                workspace, stream);
+                workspace, stream, enable_cuda_graph);
             break;
         case 256:
             status = plan_decode_for_head_dim<256>(
                 cache, indptr_h_buf,
                 num_requests, num_q_heads, page_size, gqa_group_size,
-                workspace, stream);
+                workspace, stream, enable_cuda_graph);
             break;
         case 512:
             status = plan_decode_for_head_dim<512>(
                 cache, indptr_h_buf,
                 num_requests, num_q_heads, page_size, gqa_group_size,
-                workspace, stream);
+                workspace, stream, enable_cuda_graph);
             break;
         default:
             throw std::runtime_error(
@@ -219,7 +311,111 @@ void plan_attention_flashinfer_decode_bf16(
     cache.num_kv_heads = num_kv_heads;
     cache.head_dim     = head_dim;
     cache.page_size    = page_size;
+    cache.num_pages_in_batch = kv_page_indptr_h[num_requests];
+    cache.enable_pdl   = current_device_supports_pdl();
     cache.valid        = true;
+}
+
+void plan_attention_flashinfer_prefill_bf16(
+    PrefillPlanCache& cache,
+    const std::uint32_t* qo_indptr_h,
+    const std::uint32_t* kv_page_indptr_h,
+    const std::uint32_t* kv_last_page_lens_h,
+    int total_tokens,
+    int num_requests,
+    int num_q_heads,
+    int num_kv_heads,
+    int head_dim,
+    int page_size,
+    AttentionWorkspace& workspace,
+    cudaStream_t stream,
+    bool enable_cuda_graph,
+    int window_left,
+    bool full_attention_variant)
+{
+    if (head_dim != 64 && head_dim != 128 && head_dim != 256 && head_dim != 512) {
+        throw std::runtime_error(
+            "flashinfer prefill plan: instantiated for HEAD_DIM in {64, 128, 256, 512}; got " +
+            std::to_string(head_dim));
+    }
+
+    cache.use_sm90 = false;
+    cache.sm90_plan.valid = false;
+    if (kv_last_page_lens_h != nullptr &&
+        hopper_prefill_supported(
+            head_dim, window_left, total_tokens, num_requests)) {
+        plan_attention_flashinfer_prefill_sm90_bf16(
+            cache.sm90_plan,
+            qo_indptr_h,
+            kv_page_indptr_h,
+            kv_last_page_lens_h,
+            total_tokens,
+            num_requests,
+            num_q_heads,
+            num_kv_heads,
+            head_dim,
+            page_size,
+            workspace,
+            stream,
+            enable_cuda_graph,
+            /*causal=*/!full_attention_variant,
+            window_left);
+        cache.total_tokens = total_tokens;
+        cache.num_requests = num_requests;
+        cache.num_q_heads = num_q_heads;
+        cache.num_kv_heads = num_kv_heads;
+        cache.head_dim = head_dim;
+        cache.page_size = page_size;
+        cache.window_left = window_left;
+        cache.full_attention_variant = full_attention_variant;
+        cache.enable_pdl = current_device_supports_pdl();
+        cache.use_sm90 = true;
+        cache.valid = true;
+        return;
+    }
+
+    std::vector<IdType> qo_h(num_requests + 1);
+    std::vector<IdType> kv_h(num_requests + 1);
+    for (int r = 0; r <= num_requests; ++r) {
+        qo_h[r] = static_cast<IdType>(qo_indptr_h[r]);
+        kv_h[r] = static_cast<IdType>(kv_page_indptr_h[r]);
+    }
+
+    const bool head_dim_supports_split =
+        (head_dim == 64 || head_dim == 128 || head_dim == 256 || head_dim == 512);
+
+    auto status = ::flashinfer::PrefillPlan<IdType>(
+        workspace.float_buffer(), workspace.float_bytes(),
+        workspace.int_buffer(), workspace.page_locked_int(),
+        workspace.int_bytes(),
+        cache.plan_info,
+        qo_h.data(), kv_h.data(),
+        static_cast<uint32_t>(total_tokens),
+        static_cast<uint32_t>(num_requests),
+        static_cast<uint32_t>(num_q_heads),
+        static_cast<uint32_t>(num_kv_heads),
+        static_cast<uint32_t>(head_dim),
+        static_cast<uint32_t>(head_dim),
+        static_cast<uint32_t>(page_size),
+        enable_cuda_graph,
+        sizeof(DTypeO),
+        window_left,
+        /*fixed_split_size=*/-1,
+        /*disable_split_kv=*/!head_dim_supports_split,
+        /*num_colocated_ctas=*/0,
+        stream);
+    CUDA_CHECK(status);
+
+    cache.total_tokens = total_tokens;
+    cache.num_requests = num_requests;
+    cache.num_q_heads = num_q_heads;
+    cache.num_kv_heads = num_kv_heads;
+    cache.head_dim = head_dim;
+    cache.page_size = page_size;
+    cache.window_left = window_left;
+    cache.full_attention_variant = full_attention_variant;
+    cache.enable_pdl = current_device_supports_pdl();
+    cache.valid = true;
 }
 
 namespace {
@@ -290,7 +486,7 @@ cudaError_t dispatch_decode_for_head_dim_v(
 
     return ::flashinfer::BatchDecodeWithPagedKVCacheDispatched<
         HEAD_DIM, POS_ENC, Variant, DecodeParams>(
-        params, tmp_v, tmp_s, /*enable_pdl=*/false, stream);
+        params, tmp_v, tmp_s, cache.enable_pdl, stream);
 }
 
 // Soft-cap-aware HEAD_DIM dispatch. Routes to either the plain or the
@@ -370,6 +566,32 @@ void dispatch_attention_flashinfer_decode_bf16(
     CUDA_CHECK(status);
 }
 
+void dispatch_attention_flashinfer_decode(
+    const DecodePlanCache& cache,
+    const void* q,
+    KvCacheLayerView kv_layer,
+    void* o,
+    const std::uint32_t* kv_page_indices_d,
+    const std::uint32_t* kv_page_indptr_d,
+    const std::uint32_t* kv_last_page_lens_d,
+    AttentionWorkspace& workspace,
+    cudaStream_t stream,
+    int window_left,
+    float logits_soft_cap,
+    float sm_scale,
+    float* lse_out)
+{
+    kernels::launch_dequant_kv_cache_layer_to_bf16_active(
+        kv_layer, kv_page_indices_d, cache.num_pages_in_batch, stream);
+    dispatch_attention_flashinfer_decode_bf16(
+        cache, q,
+        kv_layer.k_bf16_pages,
+        kv_layer.v_bf16_pages,
+        o,
+        kv_page_indices_d, kv_page_indptr_d, kv_last_page_lens_d,
+        workspace, stream, window_left, logits_soft_cap, sm_scale, lse_out);
+}
+
 // ── Prefill ────────────────────────────────────────────────────────────────
 
 namespace {
@@ -382,21 +604,153 @@ using PrefillParams = ::flashinfer::BatchPrefillPagedParams<DTypeQ, DTypeKV, DTy
 template <uint32_t HEAD_DIM, ::flashinfer::MaskMode MASK, class Variant>
 cudaError_t prefill_dispatch_for_head_dim(
     PrefillParams& params, const ::flashinfer::PrefillPlanInfo& plan_info,
-    DTypeO* tmp_v, float* tmp_s, cudaStream_t stream)
+    DTypeO* tmp_v, float* tmp_s, bool enable_pdl, cudaStream_t stream)
 {
     cudaError_t status;
     DISPATCH_CTA_TILE_Q(plan_info.cta_tile_q, CTA_TILE_Q, {
         status = ::flashinfer::BatchPrefillWithPagedKVCacheDispatched<
             CTA_TILE_Q, HEAD_DIM, HEAD_DIM, POS_ENC,
-            /*USE_FP16_QK_REDUCTION=*/false,
+            /*USE_FP16_QK_REDUCTION=*/true,
             MASK,
             Variant, PrefillParams>(
-            params, tmp_v, tmp_s, /*enable_pdl=*/false, stream);
+            params, tmp_v, tmp_s, enable_pdl, stream);
     });
     return status;
 }
 
 }  // namespace
+
+void dispatch_attention_flashinfer_prefill_bf16(
+    const PrefillPlanCache& cache,
+    const void* q,
+    void* k_pages, void* v_pages, void* o,
+    const std::uint32_t* qo_indptr_d,
+    const std::uint32_t* kv_page_indices_d,
+    const std::uint32_t* kv_page_indptr_d,
+    const std::uint32_t* kv_last_page_lens_d,
+    AttentionWorkspace& workspace,
+    cudaStream_t stream,
+    float logits_soft_cap,
+    float sm_scale,
+    float* lse_out)
+{
+    if (!cache.valid) {
+        throw std::runtime_error(
+            "dispatch_attention_flashinfer_prefill_bf16: cache is empty; "
+            "call plan_attention_flashinfer_prefill_bf16 first");
+    }
+    if (cache.use_sm90) {
+        dispatch_attention_flashinfer_prefill_sm90_bf16(
+            cache.sm90_plan,
+            q,
+            k_pages,
+            v_pages,
+            o,
+            kv_page_indices_d,
+            workspace,
+            stream,
+            logits_soft_cap,
+            sm_scale,
+            lse_out);
+        return;
+    }
+
+    ::flashinfer::paged_kv_t<DTypeKV, IdType> paged_kv(
+        static_cast<uint32_t>(cache.num_kv_heads),
+        static_cast<uint32_t>(cache.page_size),
+        static_cast<uint32_t>(cache.head_dim),
+        static_cast<uint32_t>(cache.num_requests),
+        ::flashinfer::QKVLayout::kNHD,
+        static_cast<DTypeKV*>(k_pages),
+        static_cast<DTypeKV*>(v_pages),
+        const_cast<IdType*>(reinterpret_cast<const IdType*>(kv_page_indices_d)),
+        const_cast<IdType*>(reinterpret_cast<const IdType*>(kv_page_indptr_d)),
+        const_cast<IdType*>(reinterpret_cast<const IdType*>(kv_last_page_lens_d)));
+
+    PrefillParams params;
+    params.q = const_cast<DTypeQ*>(static_cast<const DTypeQ*>(q));
+    params.paged_kv = paged_kv;
+    params.maybe_custom_mask = nullptr;
+    params.q_indptr = const_cast<IdType*>(reinterpret_cast<const IdType*>(qo_indptr_d));
+    params.maybe_mask_indptr = nullptr;
+    params.maybe_q_rope_offset = nullptr;
+    params.o = static_cast<DTypeO*>(o);
+    params.lse = lse_out;
+    params.maybe_alibi_slopes = nullptr;
+    params.group_size = ::flashinfer::uint_fastdiv(
+        static_cast<uint32_t>(cache.num_q_heads / cache.num_kv_heads));
+    params.num_qo_heads = static_cast<uint32_t>(cache.num_q_heads);
+    params.q_stride_n = static_cast<IdType>(cache.num_q_heads * cache.head_dim);
+    params.q_stride_h = static_cast<IdType>(cache.head_dim);
+    params.window_left = cache.window_left;
+    params.logits_soft_cap = logits_soft_cap;
+    params.sm_scale = (sm_scale > 0.f)
+        ? sm_scale
+        : (1.0f / std::sqrt(static_cast<float>(cache.head_dim)));
+    params.rope_rcp_scale = 1.0f;
+    params.rope_rcp_theta = 1.0f;
+
+    void* int_buf = workspace.int_buffer();
+    void* float_buf = workspace.float_buffer();
+    const auto& plan_info = cache.plan_info;
+    params.request_indices = offset_ptr<IdType>(int_buf, plan_info.request_indices_offset);
+    params.qo_tile_indices = offset_ptr<IdType>(int_buf, plan_info.qo_tile_indices_offset);
+    params.kv_tile_indices = offset_ptr<IdType>(int_buf, plan_info.kv_tile_indices_offset);
+    params.o_indptr = offset_ptr<IdType>(int_buf, plan_info.o_indptr_offset);
+    params.kv_chunk_size_ptr = offset_ptr<IdType>(int_buf, plan_info.kv_chunk_size_ptr_offset);
+    params.padded_batch_size = static_cast<uint32_t>(plan_info.padded_batch_size);
+    params.partition_kv = plan_info.split_kv;
+    params.max_total_num_rows = static_cast<uint32_t>(plan_info.total_num_rows);
+    params.merge_indptr = nullptr;
+    params.block_valid_mask = nullptr;
+    params.total_num_rows = nullptr;
+    params.maybe_prefix_len_ptr = nullptr;
+    params.maybe_token_pos_in_items_ptr = nullptr;
+    params.token_pos_in_items_len = 0;
+    params.maybe_max_item_len_ptr = nullptr;
+
+    DTypeO* tmp_v = nullptr;
+    float* tmp_s = nullptr;
+    if (plan_info.split_kv) {
+        params.merge_indptr = offset_ptr<IdType>(int_buf, plan_info.merge_indptr_offset);
+        tmp_v = offset_ptr<DTypeO>(float_buf, plan_info.v_offset);
+        tmp_s = offset_ptr<float>(float_buf, plan_info.s_offset);
+        if (plan_info.enable_cuda_graph) {
+            params.block_valid_mask =
+                offset_ptr<bool>(int_buf, plan_info.block_valid_mask_offset);
+        }
+    }
+
+    auto dispatch = [&]<class Variant>(::std::type_identity<Variant>) {
+        switch (cache.head_dim) {
+            case 64:
+                return prefill_dispatch_for_head_dim<64, ::flashinfer::MaskMode::kNone, Variant>(
+                    params, plan_info, tmp_v, tmp_s, cache.enable_pdl, stream);
+            case 128:
+                return prefill_dispatch_for_head_dim<128, ::flashinfer::MaskMode::kNone, Variant>(
+                    params, plan_info, tmp_v, tmp_s, cache.enable_pdl, stream);
+            case 256:
+                return prefill_dispatch_for_head_dim<256, ::flashinfer::MaskMode::kNone, Variant>(
+                    params, plan_info, tmp_v, tmp_s, cache.enable_pdl, stream);
+            case 512:
+                return prefill_dispatch_for_head_dim<512, ::flashinfer::MaskMode::kNone, Variant>(
+                    params, plan_info, tmp_v, tmp_s, cache.enable_pdl, stream);
+        }
+        return cudaErrorInvalidValue;
+    };
+
+    cudaError_t status;
+    if (cache.full_attention_variant && logits_soft_cap > 0.f) {
+        status = dispatch(::std::type_identity<AttnVariantFullSoftcap>{});
+    } else if (cache.full_attention_variant) {
+        status = dispatch(::std::type_identity<AttnVariantFull>{});
+    } else if (logits_soft_cap > 0.f) {
+        status = dispatch(::std::type_identity<AttnVariantSoftcap>{});
+    } else {
+        status = dispatch(::std::type_identity<AttnVariant>{});
+    }
+    CUDA_CHECK(status);
+}
 
 void launch_attention_flashinfer_prefill_bf16(
     const void* q, void* k_pages, void* v_pages, void* o,
@@ -527,18 +881,19 @@ void launch_attention_flashinfer_prefill_bf16(
     // templated on the variant via a type-tag (`std::type_identity`)
     // because flashinfer's variant types are not default-constructible.
     auto dispatch = [&]<class Variant>(::std::type_identity<Variant>) {
+        const bool enable_pdl = current_device_supports_pdl();
         if (head_dim == 64) {
             return prefill_dispatch_for_head_dim<64, ::flashinfer::MaskMode::kCausal, Variant>(
-                params, plan_info, tmp_v, tmp_s, stream);
+                params, plan_info, tmp_v, tmp_s, enable_pdl, stream);
         } else if (head_dim == 256) {
             return prefill_dispatch_for_head_dim<256, ::flashinfer::MaskMode::kCausal, Variant>(
-                params, plan_info, tmp_v, tmp_s, stream);
+                params, plan_info, tmp_v, tmp_s, enable_pdl, stream);
         } else if (head_dim == 512) {
             return prefill_dispatch_for_head_dim<512, ::flashinfer::MaskMode::kCausal, Variant>(
-                params, plan_info, tmp_v, tmp_s, stream);
+                params, plan_info, tmp_v, tmp_s, enable_pdl, stream);
         } else {
             return prefill_dispatch_for_head_dim<128, ::flashinfer::MaskMode::kCausal, Variant>(
-                params, plan_info, tmp_v, tmp_s, stream);
+                params, plan_info, tmp_v, tmp_s, enable_pdl, stream);
         }
     };
     if (logits_soft_cap > 0.f) {
@@ -547,6 +902,42 @@ void launch_attention_flashinfer_prefill_bf16(
         status = dispatch(::std::type_identity<AttnVariant>{});
     }
     CUDA_CHECK(status);
+}
+
+void launch_attention_flashinfer_prefill(
+    const void* q,
+    KvCacheLayerView kv_layer,
+    void* o,
+    const std::uint32_t* qo_indptr_d,
+    const std::uint32_t* kv_page_indices_d,
+    const std::uint32_t* kv_page_indptr_d,
+    const std::uint32_t* kv_last_page_lens_d,
+    const std::uint32_t* qo_indptr_h,
+    const std::uint32_t* kv_page_indptr_h,
+    int total_tokens,
+    int num_requests,
+    int num_q_heads,
+    AttentionWorkspace& workspace,
+    cudaStream_t stream,
+    int window_left,
+    float logits_soft_cap,
+    float sm_scale,
+    float* lse_out)
+{
+    const int num_pages_in_batch = kv_page_indptr_h[num_requests];
+    kernels::launch_dequant_kv_cache_layer_to_bf16_active(
+        kv_layer, kv_page_indices_d, num_pages_in_batch, stream);
+    launch_attention_flashinfer_prefill_bf16(
+        q,
+        kv_layer.k_bf16_pages,
+        kv_layer.v_bf16_pages,
+        o,
+        qo_indptr_d, kv_page_indices_d, kv_page_indptr_d, kv_last_page_lens_d,
+        qo_indptr_h, kv_page_indptr_h,
+        total_tokens, num_requests, num_q_heads, kv_layer.num_kv_heads,
+        kv_layer.head_dim, kv_layer.page_size, workspace, stream,
+        window_left, logits_soft_cap, sm_scale,
+        lse_out);
 }
 
 // ── Prefill with custom mask ───────────────────────────────────────────────
@@ -698,18 +1089,19 @@ void launch_attention_flashinfer_prefill_custom_bf16(
     //    based on logits_soft_cap (mirrors the kCausal path's dispatch).
     auto dispatch = [&](auto variant_tag) {
         using V = typename decltype(variant_tag)::type;
+        const bool enable_pdl = current_device_supports_pdl();
         if (head_dim == 64) {
             return prefill_dispatch_for_head_dim<64, ::flashinfer::MaskMode::kCustom, V>(
-                params, plan_info, tmp_v, tmp_s, stream);
+                params, plan_info, tmp_v, tmp_s, enable_pdl, stream);
         } else if (head_dim == 256) {
             return prefill_dispatch_for_head_dim<256, ::flashinfer::MaskMode::kCustom, V>(
-                params, plan_info, tmp_v, tmp_s, stream);
+                params, plan_info, tmp_v, tmp_s, enable_pdl, stream);
         } else if (head_dim == 512) {
             return prefill_dispatch_for_head_dim<512, ::flashinfer::MaskMode::kCustom, V>(
-                params, plan_info, tmp_v, tmp_s, stream);
+                params, plan_info, tmp_v, tmp_s, enable_pdl, stream);
         } else {
             return prefill_dispatch_for_head_dim<128, ::flashinfer::MaskMode::kCustom, V>(
-                params, plan_info, tmp_v, tmp_s, stream);
+                params, plan_info, tmp_v, tmp_s, enable_pdl, stream);
         }
     };
     if (logits_soft_cap > 0.f) {
@@ -718,6 +1110,44 @@ void launch_attention_flashinfer_prefill_custom_bf16(
         status = dispatch(::std::type_identity<AttnVariantCustom>{});
     }
     CUDA_CHECK(status);
+}
+
+void launch_attention_flashinfer_prefill_custom(
+    const void* q,
+    KvCacheLayerView kv_layer,
+    void* o,
+    const std::uint32_t* qo_indptr_d,
+    const std::uint32_t* kv_page_indices_d,
+    const std::uint32_t* kv_page_indptr_d,
+    const std::uint32_t* kv_last_page_lens_d,
+    const std::uint8_t*  mask_d,
+    const std::int32_t*  mask_indptr_d,
+    const std::uint32_t* qo_indptr_h,
+    const std::uint32_t* kv_page_indptr_h,
+    int total_tokens,
+    int num_requests,
+    int num_q_heads,
+    AttentionWorkspace& workspace,
+    cudaStream_t stream,
+    int window_left,
+    float logits_soft_cap,
+    float sm_scale,
+    float* lse_out)
+{
+    const int num_pages_in_batch = kv_page_indptr_h[num_requests];
+    kernels::launch_dequant_kv_cache_layer_to_bf16_active(
+        kv_layer, kv_page_indices_d, num_pages_in_batch, stream);
+    launch_attention_flashinfer_prefill_custom_bf16(
+        q,
+        kv_layer.k_bf16_pages,
+        kv_layer.v_bf16_pages,
+        o,
+        qo_indptr_d, kv_page_indices_d, kv_page_indptr_d, kv_last_page_lens_d,
+        mask_d, mask_indptr_d, qo_indptr_h, kv_page_indptr_h,
+        total_tokens, num_requests, num_q_heads, kv_layer.num_kv_heads,
+        kv_layer.head_dim, kv_layer.page_size, workspace, stream,
+        window_left, logits_soft_cap, sm_scale,
+        lse_out);
 }
 
 }  // namespace pie_cuda_driver::ops

@@ -86,11 +86,11 @@ impl pie::core::runtime::Host for InstanceState {
             username,
             program_name,
             input,
-            None,    // client_id: detached
-            false,   // capture_outputs
+            None,  // client_id: detached
+            false, // capture_outputs
             Some(tx),
-            None,    // workflow_id
-            None,    // token_budget: default
+            None, // workflow_id
+            None, // token_budget: default
         ) {
             Ok(pid) => pid,
             Err(e) => return Ok(Err(format!("spawn failed: {e}"))),

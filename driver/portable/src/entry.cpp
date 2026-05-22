@@ -296,7 +296,7 @@ int run_impl(int argc,
     while (total_pages >= 64) {
         try {
             executor_ptr = std::make_unique<pie_portable_driver::Executor>(
-                model, total_pages, page_size);
+                model, total_pages, page_size, cfg.batching.kv_cache_dtype);
             break;
         } catch (const std::exception& e) {
             if (total_pages == 64) throw;
@@ -397,6 +397,9 @@ int run_impl(int argc,
         {"total_pages",            total_pages},
         {"kv_page_size",           page_size},
         {"swap_pool_size",         cpu_pages},
+        {"rs_cache_required",      executor.rs_cache_slots() > 0},
+        {"rs_cache_slots",         executor.rs_cache_slots()},
+        {"rs_cache_slot_bytes",    executor.rs_cache_slot_bytes()},
         {"max_forward_tokens",     cfg.batching.max_forward_tokens},
         {"max_forward_requests",   cfg.batching.max_forward_requests},
         {"max_page_refs",          total_pages},

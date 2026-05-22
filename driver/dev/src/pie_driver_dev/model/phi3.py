@@ -209,7 +209,7 @@ class ForwardPass(DenseForwardPass):
             q=q, k=k, pos_ids=position_ids, rope_theta=cfg.rope_theta,
         )
 
-        ops.append_paged_kv_cache(
+        ops.append_paged_kv_cache_with_format(
             append_key=k, append_value=v,
             batch_indices=batch_indices, positions=batch_positions,
             paged_kv_cache=kv_cache_layer,

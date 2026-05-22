@@ -40,11 +40,14 @@ The development binary lands at `build/bin/pie_driver_portable`.
 type = "portable"
 device = ["cpu"]
 activation_dtype = "bfloat16"
-
-[model.driver.options]
-max_forward_tokens = 10240
-max_forward_requests = 512
-total_pages = 1024
 ```
 
-The driver prefers the best compiled ggml backend and falls back to CPU.
+The driver prefers the best compiled ggml backend and falls back to CPU. KV
+pages, page size, and forward limits are derived at startup and reported in
+`DriverCapabilities`.
+
+Weight loading is compiled by the shared Rust storage-program loader for every
+portable backend. CPU, CUDA, Metal, and Vulkan builds therefore use the same
+typed load plan and executor; backend-specific differences are handled by
+ggml's `ggml_backend_tensor_set`/`get` APIs after the storage program has
+chosen the exact byte ranges and transforms.

@@ -1,7 +1,7 @@
 #pragma once
 
 // Qwen3.6-MoE forward driver. Reuses the linear-attn / full-attn /
-// state-cache plumbing from Qwen3.5; only the MLP becomes a sparse-MoE
+// rs_cache plumbing from Qwen3.5; only the MLP becomes a sparse-MoE
 // block (routed experts + shared expert with sigmoid gate).
 
 #include <cstdint>

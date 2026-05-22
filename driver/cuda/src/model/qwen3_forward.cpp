@@ -1,5 +1,7 @@
 #include "model/qwen3_forward.hpp"
 
+#include <algorithm>
+
 #include <cuda_runtime.h>
 
 #include "cuda_check.hpp"
@@ -16,7 +18,8 @@ namespace pie_cuda_driver::model {
 
 Qwen3Workspace Qwen3Workspace::allocate_full(
     const HfConfig& cfg, int max_tokens,
-    int max_intermediate, int max_Hq, int max_Hk)
+    int max_intermediate, int max_Hq, int max_Hk,
+    int max_output_rows)
 {
     const int H  = cfg.hidden_size;
     const int Hq = max_Hq;
@@ -24,6 +27,7 @@ Qwen3Workspace Qwen3Workspace::allocate_full(
     const int I  = max_intermediate;
     const int V  = cfg.vocab_size;
     const int N  = max_tokens;
+    const int O  = max_output_rows > 0 ? max_output_rows : max_tokens;
 
     Qwen3Workspace ws;
     ws.y             = DeviceTensor::allocate(DType::BF16, {N, H});
@@ -33,6 +37,7 @@ Qwen3Workspace Qwen3Workspace::allocate_full(
     // layer whether to use the fused or unfused projection.
     ws.qkv_fused     = DeviceTensor::allocate(DType::BF16, {N, Hq + 2 * Hk});
     ws.gate_up_fused = DeviceTensor::allocate(DType::BF16, {N, 2 * I});
+    ws.rope_table    = DeviceTensor::allocate(DType::FP32, {N, cfg.head_dim});
     ws.q             = DeviceTensor::allocate(DType::BF16, {N, Hq});
     ws.k             = DeviceTensor::allocate(DType::BF16, {N, Hk});
     ws.v             = DeviceTensor::allocate(DType::BF16, {N, Hk});
@@ -40,16 +45,24 @@ Qwen3Workspace Qwen3Workspace::allocate_full(
     ws.norm_y        = DeviceTensor::allocate(DType::BF16, {N, H});
     ws.gate          = DeviceTensor::allocate(DType::BF16, {N, I});
     ws.up            = DeviceTensor::allocate(DType::BF16, {N, I});
-    ws.logits        = DeviceTensor::allocate(DType::BF16, {N, V});
-    ws.probs         = DeviceTensor::allocate(DType::FP32, {N, V});
+    ws.logits        = DeviceTensor::allocate(DType::BF16, {O, V});
+    ws.probs         = DeviceTensor::allocate(DType::FP32, {O, V});
+    ws.greedy_values = DeviceTensor::allocate(DType::FP32, {N});
+    ws.greedy_tokens = DeviceTensor::allocate(DType::INT32, {N});
+    ws.greedy_values_all = DeviceTensor::allocate(DType::FP32, {8, N});
+    ws.greedy_tokens_all = DeviceTensor::allocate(DType::INT32, {8, N});
+    ws.greedy_pairs = DeviceTensor::allocate(DType::INT64, {N});
+    ws.greedy_pairs_all = DeviceTensor::allocate(DType::INT64, {8, N});
 
     // Padded q/k/v/attn_out only when head_dim != head_dim_kernel
     // (currently only Phi-3 at 96 → 128). Empty allocations otherwise
     // — the forward path detects the empty-state and aliases the
     // packed buffers.
     if (cfg.head_dim != cfg.head_dim_kernel) {
-        const int Hq_pad = cfg.num_attention_heads * cfg.head_dim_kernel;
-        const int Hk_pad = cfg.num_key_value_heads * cfg.head_dim_kernel;
+        const int q_heads = Hq / std::max(1, cfg.head_dim);
+        const int kv_heads = Hk / std::max(1, cfg.head_dim);
+        const int Hq_pad = q_heads * cfg.head_dim_kernel;
+        const int Hk_pad = kv_heads * cfg.head_dim_kernel;
         ws.q_padded        = DeviceTensor::allocate(DType::BF16, {N, Hq_pad});
         ws.k_padded        = DeviceTensor::allocate(DType::BF16, {N, Hk_pad});
         ws.v_padded        = DeviceTensor::allocate(DType::BF16, {N, Hk_pad});
@@ -59,11 +72,13 @@ Qwen3Workspace Qwen3Workspace::allocate_full(
 }
 
 Qwen3Workspace Qwen3Workspace::allocate_with_max_intermediate(
-    const HfConfig& cfg, int max_tokens, int max_intermediate)
+    const HfConfig& cfg, int max_tokens, int max_intermediate,
+    int max_output_rows)
 {
     const int Hq = cfg.num_attention_heads * cfg.head_dim;
     const int Hk = cfg.num_key_value_heads * cfg.head_dim;
-    return allocate_full(cfg, max_tokens, max_intermediate, Hq, Hk);
+    return allocate_full(
+        cfg, max_tokens, max_intermediate, Hq, Hk, max_output_rows);
 }
 
 Qwen3Workspace Qwen3Workspace::allocate(const HfConfig& cfg, int max_tokens) {
@@ -223,7 +238,7 @@ void qwen3_forward_paged(
     ops::DecodePlanCachePtr decode_plan;
     if (is_pure_decode) {
         decode_plan = ops::make_decode_plan();
-        ops::plan_attention_flashinfer_decode_bf16(
+        ops::plan_attention_flashinfer_decode(
             *decode_plan,
             kv_page_indptr_h,
             R,
@@ -273,11 +288,11 @@ void qwen3_forward_paged(
             cfg.rope_theta, stream);
 
         // 6. Write current K/V into the page table for this layer.
-        kernels::launch_write_kv_to_pages_bf16(
-            cache.k(L), cache.v(L),
-            ws.k.data(), ws.v.data(),
+        auto kv_view = cache.layer_view(L);
+        kernels::launch_write_kv_to_pages(
+            kv_view, ws.k.data(), ws.v.data(),
             qo_indptr, kv_page_indices, kv_page_indptr, kv_last_page_lens,
-            N, R, cache.page_size(), cfg.num_key_value_heads, d, stream);
+            N, R, stream);
 
         // 7. Paged attention. flashinfer decode for pure-decode batches,
         // flashinfer prefill (causal) otherwise. The naive paged kernel is
@@ -289,27 +304,25 @@ void qwen3_forward_paged(
             // through prefill instead — TODO if any inferlet hits that.
             // Plan is hoisted (computed once before the loop); each layer
             // only does the dispatch.
-            ops::dispatch_attention_flashinfer_decode_bf16(
+            ops::dispatch_attention_flashinfer_decode(
                 *decode_plan,
-                ws.q.data(), cache.k(L), cache.v(L), ws.attn_out.data(),
+                ws.q.data(), kv_view, ws.attn_out.data(),
                 kv_page_indices, kv_page_indptr, kv_last_page_lens,
                 attn_ws, stream);
         } else if (custom_mask_d) {
-            ops::launch_attention_flashinfer_prefill_custom_bf16(
-                ws.q.data(), cache.k(L), cache.v(L), ws.attn_out.data(),
+            ops::launch_attention_flashinfer_prefill_custom(
+                ws.q.data(), kv_view, ws.attn_out.data(),
                 qo_indptr, kv_page_indices, kv_page_indptr, kv_last_page_lens,
                 custom_mask_d, custom_mask_indptr_d,
                 qo_indptr_h, kv_page_indptr_h,
-                N, R, cfg.num_attention_heads, cfg.num_key_value_heads, d,
-                cache.page_size(), attn_ws, stream);
+                N, R, cfg.num_attention_heads, attn_ws, stream);
         } else {
-            ops::launch_attention_flashinfer_prefill_bf16(
-                ws.q.data(), cache.k(L), cache.v(L), ws.attn_out.data(),
+            ops::launch_attention_flashinfer_prefill(
+                ws.q.data(), kv_view, ws.attn_out.data(),
                 qo_indptr, kv_page_indices, kv_page_indptr, kv_last_page_lens,
                 qo_indptr_h,
                 kv_page_indptr_h,
-                N, R, cfg.num_attention_heads, cfg.num_key_value_heads, d,
-                cache.page_size(), attn_ws, stream);
+                N, R, cfg.num_attention_heads, attn_ws, stream);
         }
 
         // 8. O proj + residual

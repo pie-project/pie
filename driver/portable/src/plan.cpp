@@ -113,6 +113,8 @@ PlanArrays extract_plan_arrays(const pie_driver::PieForwardRequestView& req) {
     a.kv_page_indices      = req.kv_page_indices.as<std::uint32_t>();
     a.kv_page_indptr       = req.kv_page_indptr.as<std::uint32_t>();
     a.kv_last_lens         = req.kv_last_page_lens.as<std::uint32_t>();
+    a.rs_slot_ids          = req.rs_slot_ids.as<std::uint32_t>();
+    a.rs_slot_flags        = req.rs_slot_flags.as<std::uint8_t>();
     a.sampler_types        = req.sampler_types.as<std::uint32_t>();
     a.sampler_temps        = req.sampler_temperatures.as<float>();
     a.sampler_top_k        = req.sampler_top_k.as<std::uint32_t>();
@@ -129,34 +131,6 @@ PlanArrays extract_plan_arrays(const pie_driver::PieForwardRequestView& req) {
     a.spec_token_ids       = req.spec_token_ids.as<std::uint32_t>();
     a.spec_position_ids    = req.spec_position_ids.as<std::uint32_t>();
     a.spec_indptr          = req.spec_indptr.as<std::uint32_t>();
-
-    // Wire-trace, enabled via `PIE_PORTABLE_TRACE_KV=1`. Paired with
-    // the cuda trace in `driver/cuda/src/executor/executor.cpp`; together
-    // they let us diff what each driver sees per request. Low-cost
-    // diagnostic kept in tree.
-    if (std::getenv("PIE_PORTABLE_TRACE_KV")) {
-        std::cerr << "[portable-trace] req: tokens=[";
-        for (auto t : a.token_ids) std::cerr << t << ",";
-        std::cerr << "] positions=[";
-        for (auto p : a.position_ids) std::cerr << p << ",";
-        std::cerr << "] qo_indptr=[";
-        for (auto q : a.qo_indptr) std::cerr << q << ",";
-        std::cerr << "] sampling_indices=[";
-        for (auto s : a.sampling_idx) std::cerr << s << ",";
-        std::cerr << "] sampling_indptr=[";
-        for (auto s : a.sampling_indptr) std::cerr << s << ",";
-        std::cerr << "] sampler_types=[";
-        for (auto s : a.sampler_types) std::cerr << s << ",";
-        std::cerr << "] sampler_temps=[";
-        for (auto s : a.sampler_temps) std::cerr << s << ",";
-        std::cerr << "] kv_pages=[";
-        for (auto k : a.kv_page_indices) std::cerr << k << ",";
-        std::cerr << "] kv_indptr=[";
-        for (auto k : a.kv_page_indptr) std::cerr << k << ",";
-        std::cerr << "] kv_last_lens=[";
-        for (auto k : a.kv_last_lens) std::cerr << k << ",";
-        std::cerr << "]\n";
-    }
 
     a.n_request      = static_cast<std::int32_t>(a.context_ids.size());
     a.total_n_tokens = static_cast<std::int32_t>(a.token_ids.size());
@@ -219,6 +193,12 @@ void validate_plan_top_level(const PlanArrays& a) {
     }
     if (a.request_num_samplers.size() != static_cast<std::size_t>(a.n_request)) {
         throw std::runtime_error("plan: request_num_samplers length mismatch");
+    }
+    if (!a.rs_slot_ids.empty() && a.rs_slot_ids.size() != static_cast<std::size_t>(a.n_request)) {
+        throw std::runtime_error("plan: rs_slot_ids length must equal num_requests");
+    }
+    if (!a.rs_slot_flags.empty() && a.rs_slot_flags.size() != static_cast<std::size_t>(a.n_request)) {
+        throw std::runtime_error("plan: rs_slot_flags length must equal num_requests");
     }
     if (a.sampling_indptr.size() != n_plus_1) {
         throw std::runtime_error("plan: sampling_indptr length must be num_requests+1");
@@ -316,6 +296,9 @@ void plan_single_request(const PlanArrays& a,
     rp.n_tokens     = n_tok;
     rp.n_tokens_pad = ((n_tok + MASK_PAD - 1) / MASK_PAD) * MASK_PAD;
     rp.n_kv         = seq_len;
+    if (a.rs_slot_ids.size() == static_cast<std::size_t>(a.n_request)) {
+        rp.state_slot = static_cast<std::int32_t>(a.rs_slot_ids[r]);
+    }
 
     rp.gather_idxs.resize(seq_len);
     for (std::int32_t k = 0; k < seq_len; ++k) {

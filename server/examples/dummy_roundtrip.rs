@@ -279,12 +279,8 @@ type = "dummy"
 device = ["cpu"]
 
 [model.driver.options]
-kv_page_size = 16
-max_forward_tokens = 4096
-max_forward_requests = 128
 vocab_size = 151936
 arch_name = "qwen3"
-max_model_len = 4096
 "#
     )
 }

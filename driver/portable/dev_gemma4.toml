@@ -9,8 +9,3 @@ spin_us = 0
 [model]
 hf_path = "/root/.cache/huggingface/hub/models--google--gemma-4-E2B-it/snapshots/6b7e72c67d3c4556f42b56d5a68b4b8e864c63b4"
 
-[batching]
-kv_page_size = 32
-total_pages = 256
-max_forward_tokens = 4096
-max_forward_requests = 64

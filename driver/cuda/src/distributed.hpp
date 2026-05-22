@@ -59,6 +59,11 @@ public:
     void all_reduce_bf16(void* sendrecv, std::size_t count, ncclRedOp_t op,
                          cudaStream_t stream);
 
+    // bf16 out-of-place all-reduce. Used by TP hot paths that can consume the
+    // reduced value from a separate scratch buffer.
+    void all_reduce_bf16_out(const void* send, void* recv, std::size_t count,
+                             ncclRedOp_t op, cudaStream_t stream);
+
     // fp32 in-place all-reduce. Used by the runtime-quant absmax MAX
     // reduction (row-parallel weights need cross-rank absmax to compute
     // the global per-row scale).

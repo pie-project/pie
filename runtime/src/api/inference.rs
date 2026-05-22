@@ -4,6 +4,7 @@ use crate::api::adapter::Adapter;
 use crate::api::context::Context;
 use crate::api::model::Model;
 use crate::api::pie;
+use crate::inference::ForwardOutput;
 use crate::inference::structured::compiled_grammar::CompiledGrammar;
 use crate::inference::structured::grammar::Grammar as InternalGrammar;
 use crate::inference::structured::json_schema::{
@@ -40,18 +41,114 @@ pub struct ForwardPass {
     /// without taking the global REGISTRY lock.
     spec: Option<inference::StagedBatch>,
     pub adapter_seed: Option<i64>,
+    allow_pass_speculation: bool,
     req: pie_bridge::ForwardRequest,
 }
 
 #[derive(Debug)]
 pub struct FutureOutput {
     result: Option<pie::core::inference::Output>,
-    rx: Option<oneshot::Receiver<pie_bridge::ForwardResponse>>,
+    rx: Option<oneshot::Receiver<Result<ForwardOutput>>>,
     /// Samplers from the originating request — cloned before draining
     /// `pass.req` at execute() time so we can reconstruct the WIT
     /// per-slot output list against this slot order.
     samplers: Vec<pie_bridge::Sampler>,
     done: bool,
+    model_id: usize,
+    context_id: Option<crate::context::ContextId>,
+    was_pinned: bool,
+    fill_tokens: Vec<u32>,
+    fill_positions: Vec<u32>,
+    fill_masks: Vec<Brle>,
+    spec_tokens_for_fill: Vec<u32>,
+    spec_positions_for_fill: Vec<u32>,
+    adapter_id: Option<crate::adapter::AdapterId>,
+    adapter_seed: Option<i64>,
+}
+
+impl FutureOutput {
+    fn release_pin(&mut self) {
+        if self.was_pinned {
+            if let Some(context_id) = self.context_id {
+                context::unpin(self.model_id, context_id);
+            }
+            self.was_pinned = false;
+        }
+    }
+
+    fn append_lineage(&mut self) {
+        let Some(context_id) = self.context_id else {
+            return;
+        };
+        let mut all_fill_tokens = take(&mut self.fill_tokens);
+        let mut all_fill_positions = take(&mut self.fill_positions);
+        let mut all_fill_masks = take(&mut self.fill_masks);
+        if !self.spec_tokens_for_fill.is_empty() {
+            all_fill_tokens.extend_from_slice(&self.spec_tokens_for_fill);
+            all_fill_positions.extend_from_slice(&self.spec_positions_for_fill);
+            if !all_fill_masks.is_empty() {
+                for &pos in &self.spec_positions_for_fill {
+                    all_fill_masks.push(Brle::all_true((pos + 1) as usize));
+                }
+            }
+        }
+        if !all_fill_tokens.is_empty() {
+            context::append_working_page_tokens(
+                self.model_id,
+                context_id,
+                all_fill_tokens,
+                all_fill_positions,
+                all_fill_masks,
+                self.adapter_id,
+                self.adapter_seed,
+            );
+        }
+    }
+
+    fn finish_ok(&mut self, output: ForwardOutput) {
+        if self.spec_tokens_for_fill.is_empty() {
+            if let ForwardOutput::Tokens(tokens) = &output {
+                if tokens.len() > 1 {
+                    let start = self
+                        .fill_positions
+                        .last()
+                        .copied()
+                        .map(|pos| pos + 1)
+                        .unwrap_or(0);
+                    let extra = tokens.len() - 1;
+                    self.spec_tokens_for_fill
+                        .extend_from_slice(&tokens[..extra]);
+                    self.spec_positions_for_fill
+                        .extend((0..extra).map(|i| start + i as u32));
+                }
+            }
+        }
+        self.append_lineage();
+        self.release_pin();
+        self.result = Some(build_wit_output(output, &self.samplers));
+        self.done = true;
+    }
+
+    fn finish_empty(&mut self) {
+        self.release_pin();
+        self.result = Some(pie::core::inference::Output {
+            slots: Vec::new(),
+            spec_tokens: Vec::new(),
+            spec_positions: Vec::new(),
+        });
+        self.done = true;
+    }
+}
+
+fn empty_forward_request() -> pie_bridge::ForwardRequest {
+    pie_bridge::ForwardRequest {
+        adapter_bindings: vec![pie_bridge::AdapterBinding {
+            adapter_id: -1,
+            seed: -1,
+        }],
+        output_spec_flags: vec![false],
+        ..Default::default()
+    }
 }
 
 #[async_trait]
@@ -60,19 +157,19 @@ impl Pollable for FutureOutput {
         if self.done {
             return;
         }
-        if let Some(rx) = self.rx.take() {
-            match rx.await {
-                Ok(resp) => {
-                    self.result = Some(build_wit_output(&resp, &self.samplers));
-                    self.done = true;
+        if let Some(rx) = self.rx.as_mut() {
+            let output = rx.await;
+            self.rx = None;
+            match output {
+                Ok(Ok(resp)) => {
+                    self.finish_ok(resp);
+                }
+                Ok(Err(e)) => {
+                    tracing::warn!("future output failed: {e:#}");
+                    self.finish_empty();
                 }
                 Err(_) => {
-                    self.result = Some(pie::core::inference::Output {
-                        slots: Vec::new(),
-                        spec_tokens: Vec::new(),
-                        spec_positions: Vec::new(),
-                    });
-                    self.done = true;
+                    self.finish_empty();
                 }
             }
         } else {
@@ -93,11 +190,10 @@ impl Pollable for FutureOutput {
 /// inferlet's sampler count); in that case all slots collapse to
 /// `Token` entries.
 fn build_wit_output(
-    resp: &pie_bridge::ForwardResponse,
+    output: ForwardOutput,
     samplers: &[pie_bridge::Sampler],
 ) -> pie::core::inference::Output {
     use pie::core::inference::SlotOutput as WitSlot;
-    use pie_bridge::Sampler;
 
     // Spec channel: pie historically returned `spec_tokens` /
     // `spec_positions` inline; the schema's ForwardResponse doesn't
@@ -105,27 +201,72 @@ fn build_wit_output(
     let spec_tokens: Vec<u32> = Vec::new();
     let spec_positions: Vec<u32> = Vec::new();
 
-    let expected_token_slots = samplers
-        .iter()
-        .filter(|s| {
-            matches!(
-                s,
-                Sampler::Multinomial { .. }
-                    | Sampler::TopK { .. }
-                    | Sampler::TopP { .. }
-                    | Sampler::MinP { .. }
-                    | Sampler::TopKTopP { .. }
-            )
-        })
-        .count();
+    match output {
+        ForwardOutput::Token(token) => {
+            return pie::core::inference::Output {
+                slots: vec![WitSlot::Token(token)],
+                spec_tokens,
+                spec_positions,
+            };
+        }
+        ForwardOutput::Tokens(tokens) => {
+            let slots = tokens.into_iter().map(WitSlot::Token).collect();
+            return pie::core::inference::Output {
+                slots,
+                spec_tokens,
+                spec_positions,
+            };
+        }
+        ForwardOutput::Response(resp) => build_wit_output_from_response(resp, samplers),
+    }
+}
 
-    let tokens: Vec<u32> = resp.tokens.clone();
-    let is_spec_walk = !tokens.is_empty()
-        && tokens.len() != expected_token_slots
-        && resp.dists_ids.is_empty()
+fn build_wit_output_from_response(
+    resp: pie_bridge::ForwardResponse,
+    samplers: &[pie_bridge::Sampler],
+) -> pie::core::inference::Output {
+    use pie::core::inference::SlotOutput as WitSlot;
+    use pie_bridge::Sampler;
+
+    let spec_tokens: Vec<u32> = Vec::new();
+    let spec_positions: Vec<u32> = Vec::new();
+
+    let token_payload_only = resp.dists_ids.is_empty()
+        && resp.dists_probs.is_empty()
         && resp.logits_bytes.is_empty()
         && resp.logprobs_values.is_empty()
         && resp.entropies.is_empty();
+
+    let mut expected_token_slots = 0usize;
+    let mut all_samplers_token = true;
+    for sampler in samplers {
+        let is_token = matches!(
+            sampler,
+            Sampler::Multinomial { .. }
+                | Sampler::TopK { .. }
+                | Sampler::TopP { .. }
+                | Sampler::MinP { .. }
+                | Sampler::TopKTopP { .. }
+        );
+        if is_token {
+            expected_token_slots += 1;
+        } else {
+            all_samplers_token = false;
+        }
+    }
+
+    let tokens = resp.tokens;
+    let is_spec_walk =
+        token_payload_only && !tokens.is_empty() && tokens.len() != expected_token_slots;
+
+    if token_payload_only && (all_samplers_token || is_spec_walk) {
+        let slots = tokens.into_iter().map(WitSlot::Token).collect();
+        return pie::core::inference::Output {
+            slots,
+            spec_tokens,
+            spec_positions,
+        };
+    }
 
     if is_spec_walk {
         let slots = tokens.into_iter().map(WitSlot::Token).collect();
@@ -241,22 +382,16 @@ impl pie::core::inference::HostForwardPass for InstanceState {
     async fn new(&mut self, model: Resource<Model>) -> Result<Resource<ForwardPass>> {
         let model = self.ctx().table.get(&model)?;
         // Initialize the accumulator with the per-request invariants:
-        // single adapter binding (-1 sentinels = unbound), and a default
-        // `output_speculative_tokens = true` written into the single
-        // entry of `output_spec_flags`.
+        // single adapter binding (-1 sentinels = unbound), and no
+        // speculative side-channel output unless the caller explicitly
+        // enables it via `output_speculative_tokens(true)`.
         let pass = ForwardPass {
             model_id: model.model_id,
             context_id: None,
             spec: None,
             adapter_seed: None,
-            req: pie_bridge::ForwardRequest {
-                adapter_bindings: vec![pie_bridge::AdapterBinding {
-                    adapter_id: -1,
-                    seed: -1,
-                }],
-                output_spec_flags: vec![true],
-                ..Default::default()
-            },
+            allow_pass_speculation: true,
+            req: empty_forward_request(),
         };
         Ok(self.ctx().table.push(pass)?)
     }
@@ -320,6 +455,16 @@ impl pie::core::inference::HostForwardPass for InstanceState {
         Ok(())
     }
 
+    async fn pass_speculation(
+        &mut self,
+        this: Resource<ForwardPass>,
+        flag: bool,
+    ) -> Result<()> {
+        let pass = self.ctx().table.get_mut(&this)?;
+        pass.allow_pass_speculation = flag;
+        Ok(())
+    }
+
     async fn attention_mask(
         &mut self,
         this: Resource<ForwardPass>,
@@ -378,11 +523,13 @@ impl pie::core::inference::HostForwardPass for InstanceState {
             .context_id
             .ok_or_else(|| anyhow::anyhow!("ForwardPass requires a context"))?;
         let adapter_seed = pass.adapter_seed;
-        let spec_handle = pass.spec.take();
+        let spec_handle = pass.spec.clone();
+        let allow_pass_speculation = pass.allow_pass_speculation;
+        pass.allow_pass_speculation = true;
         // Drain the accumulator. The remaining work is to synthesize
         // masks if absent and stamp the per-request indptrs onto the
         // ForwardRequest, then submit.
-        let mut req = take(&mut pass.req);
+        let mut req = std::mem::replace(&mut pass.req, empty_forward_request());
         // Clone samplers BEFORE finalizing so we can reconstruct the
         // per-slot WIT output against the original slot order.
         let samplers_for_output = req.samplers.clone();
@@ -392,35 +539,6 @@ impl pie::core::inference::HostForwardPass for InstanceState {
         // synthesized causal default.
         let has_user_mask = !req.masks.is_empty();
 
-        // WIT spec: "if not provided, fallback to causal mask".
-        if req.masks.is_empty() && !req.position_ids.is_empty() {
-            req.masks = req
-                .position_ids
-                .iter()
-                .map(|&pos| Brle::all_true((pos + 1) as usize))
-                .collect();
-        }
-        req.has_user_mask = has_user_mask;
-        req.single_token_mode = !has_user_mask && req.token_ids.len() <= 1;
-        // Finalize per-request indptr shape ([0, N]).
-        let n_tokens = req.token_ids.len() as u32;
-        let n_masks = req.masks.len() as u32;
-        let n_logit = req.logit_masks.len() as u32;
-        let n_sampling = req.sampling_indices.len() as u32;
-        let n_samplers = req.samplers.len() as u32;
-        let n_spec = req.spec_token_ids.len() as u32;
-        req.qo_indptr = vec![0, n_tokens];
-        req.mask_indptr = vec![0, n_masks];
-        req.logit_mask_indptr = vec![0, n_logit];
-        req.sampling_indptr = vec![0, n_sampling];
-        req.sampler_indptr = vec![0, n_samplers];
-        req.spec_indptr = vec![0, n_spec];
-        req.kv_page_indptr = vec![0];
-        req.context_ids = vec![context_id];
-        // adapter_bindings[0] already has the adapter_id set by `adapter()`;
-        // stamp the seed picked up out-of-band.
-        req.adapter_bindings[0].seed = adapter_seed.unwrap_or(-1);
-
         // Save data needed for context::append_working_page_tokens() before
         // moving into request. We also clone the speculative arrays so we
         // can append the verified-prefix to the working-page lineage once
@@ -428,7 +546,11 @@ impl pie::core::inference::HostForwardPass for InstanceState {
         let num_input_tokens = req.token_ids.len();
         let fill_tokens = req.token_ids.clone();
         let fill_positions = req.position_ids.clone();
-        let fill_masks = req.masks.clone();
+        let fill_masks = if has_user_mask {
+            req.masks.clone()
+        } else {
+            Vec::new()
+        };
         let spec_tokens_for_fill = req.spec_token_ids.clone();
         let spec_positions_for_fill = req.spec_position_ids.clone();
         // Adapter id for context::append_working_page_tokens.
@@ -436,22 +558,48 @@ impl pie::core::inference::HostForwardPass for InstanceState {
             let bound = req.adapter_bindings[0].adapter_id;
             if bound < 0 { None } else { Some(bound as u64) }
         };
+        req.has_user_mask = has_user_mask;
+        req.single_token_mode = !has_user_mask && req.token_ids.len() <= 1;
+        // adapter_bindings[0] already has the adapter_id set by `adapter()`;
+        // stamp the seed picked up out-of-band.
+        req.adapter_bindings[0].seed = adapter_seed.unwrap_or(-1);
 
-        // Try the lock-free staged hit before pinning. On hit we skip
-        // pin/unpin entirely — the staged fire runs on pages from the
-        // prior cycle. On miss we pin + submit. The ctx-cached `spec`
-        // handle lets us skip the REGISTRY lookup.
+        // Try the staged hit before synthesizing default masks or pinning. On
+        // hit we skip pin/unpin entirely — the staged fire runs on pages from
+        // the prior cycle.
+        let driver_idx_hint = context::get_device(model_id, context_id);
+        let use_pass_speculation = inference::should_use_pass_speculation(driver_idx_hint);
         let (was_pinned, submit_result) = if let Some(rx) = spec_handle
             .as_ref()
-            .and_then(|s| inference::try_hit(s, context_id, &req))
+            .filter(|_| use_pass_speculation && req.spec_token_ids.is_empty())
+            .and_then(|s| inference::try_hit(s, context_id, &req, allow_pass_speculation))
         {
-            (
-                false,
-                rx.await
-                    .map_err(|_| anyhow::anyhow!("staged rx dropped"))
-                    .and_then(|result| result),
-            )
+            (false, Ok(rx))
         } else {
+            // WIT spec: "if not provided, fallback to causal mask".
+            if req.masks.is_empty() && !req.position_ids.is_empty() {
+                req.masks = req
+                    .position_ids
+                    .iter()
+                    .map(|&pos| Brle::all_true((pos + 1) as usize))
+                    .collect();
+            }
+            // Finalize per-request indptr shape ([0, N]).
+            let n_tokens = req.token_ids.len() as u32;
+            let n_masks = req.masks.len() as u32;
+            let n_logit = req.logit_masks.len() as u32;
+            let n_sampling = req.sampling_indices.len() as u32;
+            let n_samplers = req.samplers.len() as u32;
+            let n_spec = req.spec_token_ids.len() as u32;
+            req.qo_indptr = vec![0, n_tokens];
+            req.mask_indptr = vec![0, n_masks];
+            req.logit_mask_indptr = vec![0, n_logit];
+            req.sampling_indptr = vec![0, n_sampling];
+            req.sampler_indptr = vec![0, n_samplers];
+            req.spec_indptr = vec![0, n_spec];
+            req.kv_page_indptr = vec![0];
+            req.context_ids = vec![context_id];
+
             // Cold path: pin, validate page capacity, submit.
             let pinned = match context::pin(model_id, context_id, num_input_tokens as u32).await {
                 Ok(p) => p,
@@ -465,6 +613,16 @@ impl pie::core::inference::HostForwardPass for InstanceState {
             let driver_id = pinned.driver;
             let physical_page_ids = pinned.pages;
             let extra_pages = pinned.extra_pages;
+            if let Some(rs_slot) = pinned.rs_slot {
+                if !req.spec_token_ids.is_empty() {
+                    context::unpin(model_id, context_id);
+                    return Ok(Err(
+                        "rs_cache models do not support speculative draft tokens yet".to_string(),
+                    ));
+                }
+                req.rs_slot_ids = vec![rs_slot];
+                req.rs_slot_flags = vec![pinned.rs_flags];
+            }
 
             let num_pages = physical_page_ids.len() as u32;
             let page_size = context::tokens_per_page(model_id);
@@ -485,21 +643,21 @@ impl pie::core::inference::HostForwardPass for InstanceState {
             }
 
             let driver_idx = driver_id as usize;
-            let result = inference::submit(
+            let result = inference::submit_async(
                 model_id,
                 req,
                 driver_idx,
                 physical_page_ids,
                 extra_pages,
                 last_page_len,
-            )
-            .await;
+                allow_pass_speculation,
+            );
             (true, result)
         };
 
         // On submit failure, unpin (if we pinned) and return early.
-        let output = match submit_result {
-            Ok(o) => o,
+        let rx = match submit_result {
+            Ok(rx) => rx,
             Err(e) => {
                 if was_pinned {
                     context::unpin(model_id, context_id);
@@ -509,43 +667,21 @@ impl pie::core::inference::HostForwardPass for InstanceState {
             }
         };
 
-        // Append the lineage. For speculative-decoding flows, the
-        // forward pass wrote KV for every speculative token (accepted
-        // or not). The SDK truncates rejected drafts afterwards via
-        // `truncate_working_page_tokens`. Fire-and-forget: errors get
-        // logged at the handler. Subsequent ops on this ctx all go
-        // through the same mpsc and are naturally ordered behind this.
-        let mut all_fill_tokens = fill_tokens;
-        let mut all_fill_positions = fill_positions;
-        let mut all_fill_masks = fill_masks;
-        if !spec_tokens_for_fill.is_empty() {
-            all_fill_tokens.extend_from_slice(&spec_tokens_for_fill);
-            all_fill_positions.extend_from_slice(&spec_positions_for_fill);
-            for &pos in &spec_positions_for_fill {
-                all_fill_masks.push(Brle::all_true((pos + 1) as usize));
-            }
-        }
-        if !all_fill_tokens.is_empty() {
-            context::append_working_page_tokens(
-                model_id,
-                context_id,
-                all_fill_tokens,
-                all_fill_positions,
-                all_fill_masks,
-                adapter_id,
-                adapter_seed,
-            );
-        }
-
-        // Unpin (no-op on staged hit) and hand the output back.
-        if was_pinned {
-            context::unpin(model_id, context_id);
-        }
         let future_output = FutureOutput {
-            result: Some(build_wit_output(&output, &samplers_for_output)),
-            rx: None,
+            result: None,
+            rx: Some(rx),
             samplers: samplers_for_output,
-            done: true,
+            done: false,
+            model_id,
+            context_id: Some(context_id),
+            was_pinned,
+            fill_tokens,
+            fill_positions,
+            fill_masks,
+            spec_tokens_for_fill,
+            spec_positions_for_fill,
+            adapter_id,
+            adapter_seed,
         };
         Ok(Ok(self.ctx().table.push(future_output)?))
     }
@@ -574,6 +710,9 @@ impl pie::core::inference::HostFutureOutput for InstanceState {
     }
 
     async fn drop(&mut self, this: Resource<FutureOutput>) -> Result<()> {
+        if let Ok(future) = self.ctx().table.get_mut(&this) {
+            future.release_pin();
+        }
         self.ctx().table.delete(this)?;
         Ok(())
     }

@@ -9,8 +9,3 @@ spin_us = 0
 [model]
 hf_path = "/root/.cache/huggingface/hub/models--unsloth--Qwen3-0.6B-GGUF/snapshots/50968a4468ef4233ed78cd7c3de230dd1d61a56b/Qwen3-0.6B-Q4_K_M.gguf"
 
-[batching]
-kv_page_size = 32
-total_pages = 256
-max_forward_tokens = 2048
-max_forward_requests = 16

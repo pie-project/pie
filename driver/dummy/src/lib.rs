@@ -122,7 +122,7 @@ fn run_impl(
     // Capability handshake.
     let caps = serde_json::json!({
         "total_pages":      total_pages,
-        "kv_page_size":     cfg.dummy.kv_page_size,
+        "kv_page_size":     config::KV_PAGE_SIZE,
         "swap_pool_size":   0u32,
         "max_forward_tokens": cfg.dummy.max_forward_tokens,
         "max_forward_requests": cfg.dummy.max_forward_requests,

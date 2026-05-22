@@ -15,9 +15,11 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
 
-# SGLang 0.5.9 is the newest release that pins flashinfer 0.6.3, which
-# matches pie-driver-vllm's pin so the two wheels are jointly resolvable
-# (separate venvs is still the supported deployment).
+# SGLang 0.5.12 is the latest PyPI release as of 2026-05-21. It requires
+# torch==2.11.0, torchao==0.17.0, transformers==5.6.0, and flashinfer
+# 0.6.11.post1. Keep this driver in its own venv instead of co-installing
+# it with the vLLM driver, whose latest release carries a different
+# flashinfer pin.
 dependencies = [
     # `pie-bridge` is the PyO3 wheel that ships the canonical wire schema,
     # Method enum, DriverCapabilities, and ShmemServer (single source of
@@ -27,33 +29,25 @@ dependencies = [
     "pie-bridge",
     "pie-driver-dev",
     "msgpack>=0.5",
-    "torch==2.9.1",
-    "torchvision==0.24.1",
-    "torchaudio==2.9.1",
-    "torchao==0.9.0",
-    "sglang==0.5.9",
-    "flashinfer-python==0.6.3",
-    "flashinfer-cubin==0.6.3",
-    "flashinfer-jit-cache==0.6.3",
+    "numba>=0.65",
+    "opentelemetry-api>=1.27.0",
+    "opentelemetry-sdk>=1.27.0",
+    "opentelemetry-exporter-otlp>=1.27.0",
+    "torch==2.11.0",
+    "torchvision==0.26.0",
+    "torchaudio==2.11.0",
+    "torchao==0.17.0",
+    "sglang==0.5.12",
+    "flashinfer-python==0.6.11.post1",
+    "flashinfer-cubin==0.6.11.post1",
 ]
-
-[[tool.uv.index]]
-name = "pytorch-cu128"
-url = "https://download.pytorch.org/whl/cu128"
-explicit = true
-
-[[tool.uv.index]]
-name = "flashinfer-cu128"
-url = "https://flashinfer.ai/whl/cu128"
-explicit = true
 
 [tool.uv.sources]
 pie-bridge = { path = "../bridge", editable = true }
 pie-driver-dev = { path = "../dev", editable = true }
-torch = [{ index = "pytorch-cu128" }]
-torchvision = [{ index = "pytorch-cu128" }]
-torchaudio = [{ index = "pytorch-cu128" }]
-flashinfer-jit-cache = [{ index = "flashinfer-cu128" }]
+
+[tool.uv]
+prerelease = "allow"
 
 [tool.setuptools]
 package-dir = { "" = "src" }

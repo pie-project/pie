@@ -22,9 +22,10 @@ use crate::driver::{DriverId, SchedulerLimits};
 use crate::service::{ServiceArray, ServiceHandler};
 use anyhow::Result;
 use scheduler::BatchScheduler;
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering::Relaxed;
 
 pub use scheduler::SchedulerStats;
@@ -32,7 +33,13 @@ pub use speculator::{
     BYPASS_HIT_COUNT, CHAIN_DROP_COUNT, CHAIN_SUBMIT_COUNT, StagedBatch, lookup_for_ctx, try_hit,
 };
 
-use speculator::StagedEntry;
+use speculator::StagedBatchMap;
+
+pub(crate) fn should_use_pass_speculation(driver_idx: usize) -> bool {
+    let pinned = crate::context::pinned_count(driver_idx);
+    let (active, cached_pinned) = crate::context::resident_count(driver_idx);
+    pinned.max(active.saturating_add(cached_pinned)) > 1
+}
 
 /// Aggregated inference stats for a single model (across all drivers).
 #[derive(Debug, Default, serde::Serialize)]
@@ -45,6 +52,14 @@ pub struct InferenceStats {
     pub batch_size_hist: [u64; 8],
     pub last_batch_latency_us: u64,
     pub avg_batch_latency_us: u64,
+    pub avg_permit_wait_us: u64,
+    pub avg_fire_prepare_us: u64,
+    pub avg_execute_batch_us: u64,
+    pub avg_batch_build_us: u64,
+    pub avg_driver_fire_us: u64,
+    pub avg_response_dispatch_us: u64,
+    pub avg_context_tick_submit_us: u64,
+    pub avg_stats_update_us: u64,
 }
 
 // =============================================================================
@@ -110,7 +125,29 @@ pub async fn submit(
     physical_page_ids: Vec<PhysicalPageId>,
     extra_pages: Vec<PhysicalPageId>,
     last_page_len: u32,
-) -> Result<pie_bridge::ForwardResponse> {
+) -> Result<ForwardOutput> {
+    let rx = submit_async(
+        model_idx,
+        request,
+        driver_idx,
+        physical_page_ids,
+        extra_pages,
+        last_page_len,
+        true,
+    )?;
+    rx.await
+        .map_err(|_| anyhow::anyhow!("inference submit: scheduler dropped response channel"))?
+}
+
+pub fn submit_async(
+    model_idx: usize,
+    request: pie_bridge::ForwardRequest,
+    driver_idx: usize,
+    physical_page_ids: Vec<PhysicalPageId>,
+    extra_pages: Vec<PhysicalPageId>,
+    last_page_len: u32,
+    allow_pass_speculation: bool,
+) -> Result<oneshot::Receiver<Result<ForwardOutput>>> {
     let (tx, rx) = oneshot::channel();
     SERVICES.send(
         model_idx,
@@ -120,11 +157,42 @@ pub async fn submit(
             physical_page_ids,
             extra_pages,
             last_page_len,
+            allow_pass_speculation,
             response: tx,
         },
     )?;
-    rx.await
-        .map_err(|_| anyhow::anyhow!("inference submit: scheduler dropped response channel"))?
+    Ok(rx)
+}
+
+/// Internal forward result shape passed from the scheduler to a waiting
+/// inferlet. Normal decode returns a single token per request; carrying that
+/// directly avoids allocating a one-request `ForwardResponse` for every token.
+#[derive(Debug)]
+pub enum ForwardOutput {
+    Token(u32),
+    Tokens(Vec<u32>),
+    Response(pie_bridge::ForwardResponse),
+}
+
+impl ForwardOutput {
+    pub(crate) fn first_token(&self) -> Option<u32> {
+        match self {
+            Self::Token(t) => Some(*t),
+            Self::Tokens(tokens) => tokens.first().copied(),
+            Self::Response(resp) => resp.tokens.first().copied(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_response(resp: pie_bridge::ForwardResponse) -> Self {
+        Self::Response(resp)
+    }
+}
+
+impl From<pie_bridge::ForwardResponse> for ForwardOutput {
+    fn from(resp: pie_bridge::ForwardResponse) -> Self {
+        Self::Response(resp)
+    }
 }
 
 /// Returns aggregated inference stats for a model (lock-free, non-blocking).
@@ -164,7 +232,7 @@ struct InferenceService {
     /// per ctx_id. Inferlet `execute()` calls hit-check the front
     /// of the deque; the chain extender pushes new entries as each
     /// fire completes (bounded by `speculation_depth`).
-    staged_batch: Vec<Arc<Mutex<HashMap<crate::context::ContextId, VecDeque<StagedEntry>>>>>,
+    staged_batch: Vec<StagedBatchMap>,
 }
 
 impl std::fmt::Debug for InferenceService {
@@ -202,9 +270,7 @@ impl InferenceService {
 
         let scheduler_stats: Vec<_> = schedulers.iter().map(|s| s.stats().clone()).collect();
 
-        let staged_batch: Vec<
-            Arc<Mutex<HashMap<crate::context::ContextId, VecDeque<StagedEntry>>>>,
-        > = (0..num_drivers)
+        let staged_batch: Vec<StagedBatchMap> = (0..num_drivers)
             .map(|_| Arc::new(Mutex::new(HashMap::new())))
             .collect();
         speculator::register_model(model_idx, &staged_batch, speculation_depth);
@@ -228,6 +294,14 @@ impl InferenceService {
         let mut hist = [0u64; 8];
         let mut last_latency = 0u64;
         let mut cumulative_latency = 0u64;
+        let mut cumulative_permit_wait = 0u64;
+        let mut cumulative_fire_prepare = 0u64;
+        let mut cumulative_execute_batch = 0u64;
+        let mut cumulative_batch_build = 0u64;
+        let mut cumulative_driver_fire = 0u64;
+        let mut cumulative_response_dispatch = 0u64;
+        let mut cumulative_context_tick_submit = 0u64;
+        let mut cumulative_stats_update = 0u64;
 
         for s in &self.scheduler_stats {
             total_batches += s.total_batches.load(Relaxed);
@@ -240,14 +314,23 @@ impl InferenceService {
             }
             last_latency = last_latency.max(s.last_batch_latency_us.load(Relaxed));
             cumulative_latency += s.cumulative_latency_us.load(Relaxed);
+            cumulative_permit_wait += s.cumulative_permit_wait_us.load(Relaxed);
+            cumulative_fire_prepare += s.cumulative_fire_prepare_us.load(Relaxed);
+            cumulative_execute_batch += s.cumulative_execute_batch_us.load(Relaxed);
+            cumulative_batch_build += s.cumulative_batch_build_us.load(Relaxed);
+            cumulative_driver_fire += s.cumulative_driver_fire_us.load(Relaxed);
+            cumulative_response_dispatch += s.cumulative_response_dispatch_us.load(Relaxed);
+            cumulative_context_tick_submit += s.cumulative_context_tick_submit_us.load(Relaxed);
+            cumulative_stats_update += s.cumulative_stats_update_us.load(Relaxed);
         }
 
-        let avg_latency = if total_batches > 0 {
-            cumulative_latency / total_batches
-        } else {
-            0
+        let avg = |value: u64| {
+            if total_batches > 0 {
+                value / total_batches
+            } else {
+                0
+            }
         };
-
         InferenceStats {
             total_batches,
             total_tokens_processed: total_tokens,
@@ -255,7 +338,15 @@ impl InferenceService {
             max_forward_requests_observed: max_forward_requests,
             batch_size_hist: hist,
             last_batch_latency_us: last_latency,
-            avg_batch_latency_us: avg_latency,
+            avg_batch_latency_us: avg(cumulative_latency),
+            avg_permit_wait_us: avg(cumulative_permit_wait),
+            avg_fire_prepare_us: avg(cumulative_fire_prepare),
+            avg_execute_batch_us: avg(cumulative_execute_batch),
+            avg_batch_build_us: avg(cumulative_batch_build),
+            avg_driver_fire_us: avg(cumulative_driver_fire),
+            avg_response_dispatch_us: avg(cumulative_response_dispatch),
+            avg_context_tick_submit_us: avg(cumulative_context_tick_submit),
+            avg_stats_update_us: avg(cumulative_stats_update),
         }
     }
 }
@@ -278,7 +369,8 @@ enum Message {
         /// full reserved range without re-allocating.
         extra_pages: Vec<PhysicalPageId>,
         last_page_len: u32,
-        response: oneshot::Sender<Result<pie_bridge::ForwardResponse>>,
+        allow_pass_speculation: bool,
+        response: oneshot::Sender<Result<ForwardOutput>>,
     },
     GetStats {
         response: oneshot::Sender<InferenceStats>,
@@ -300,6 +392,7 @@ impl ServiceHandler for InferenceService {
                 physical_page_ids,
                 extra_pages,
                 last_page_len,
+                allow_pass_speculation,
                 response,
             } => {
                 let idx = driver_idx.min(self.num_drivers.saturating_sub(1));
@@ -314,33 +407,47 @@ impl ServiceHandler for InferenceService {
                 // hit, submit cold otherwise, and chain-extend up to
                 // `speculation_depth` pre-fired stages. Inferlet-side
                 // hits typically bypass this path via
-                // `inference::try_hit` (lock-free) before reaching
-                // the actor. Submits reaching this actor are
-                // therefore either cold or post-miss (the api
-                // layer's try_hit returned None).
-                let staged_entry = self.staged_batch[idx].lock().ok().and_then(|mut sb| {
-                    if let Some(deque) = sb.get_mut(&ctx_id) {
+                // `inference::try_hit` before reaching the actor.
+                // Submits reaching this actor are therefore either
+                // cold or post-miss (the api layer's try_hit
+                // returned None).
+                let staged_entry = {
+                    let mut sb = self.staged_batch[idx].lock().ok();
+                    sb.as_mut().and_then(|sb| {
+                        let deque = sb.get_mut(&ctx_id)?;
                         if let Some(front) = deque.front() {
                             let req_token = request.token_ids.first().copied();
                             let req_pos = request.position_ids.first().copied();
                             if Some(front.anchor_token) == req_token
                                 && Some(front.anchor_pos) == req_pos
                             {
-                                return deque.pop_front();
+                                let entry = deque.pop_front();
+                                if let Some(entry) = entry.as_ref() {
+                                    if !allow_pass_speculation {
+                                        entry.allow_extend.store(false, Relaxed);
+                                    }
+                                }
+                                return entry;
                             }
                         }
-                        // Fingerprint mismatch — drop the entire
-                        // chain. Deeper stages were built on a now-
-                        // invalid assumption.
+                        // Fingerprint mismatch — drop the entire chain.
+                        // Deeper stages were built on a now-invalid assumption.
                         deque.clear();
-                    }
-                    None
-                });
+                        None
+                    })
+                };
 
                 let scheduler_handle = self.schedulers[idx].handle();
                 let staged_batch_arc = self.staged_batch[idx].clone();
                 let request_clone = request.clone();
-                let speculation_depth = self.speculation_depth;
+                let speculation_depth = if allow_pass_speculation
+                    && request_clone.rs_slot_ids.is_empty()
+                    && request_clone.spec_token_ids.is_empty()
+                {
+                    self.speculation_depth
+                } else {
+                    0
+                };
 
                 if let Some(entry) = staged_entry {
                     // HIT: forward the staged rx; the chain
@@ -380,6 +487,7 @@ impl ServiceHandler for InferenceService {
                     cur_page_idx,
                     last_page_len,
                     speculation_depth,
+                    Arc::new(AtomicBool::new(allow_pass_speculation)),
                 );
             }
             Message::GetStats { response } => {

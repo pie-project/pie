@@ -8,7 +8,8 @@ torch.distributed up first; sglang's idempotent init layers TP/PP groups
 on top.
 
 This is the analog of `pie_driver_vllm/loader.py`. SGLangDriverConfig
-fields mirror `ServerArgs` so values splat verbatim.
+exposes policy knobs that mirror `ServerArgs`; capacity limits are resolved
+by SGLang and reported later through DriverCapabilities.
 """
 
 from __future__ import annotations
@@ -91,7 +92,8 @@ def _defer_graph_capture(should_defer: bool):
 def _build_sglang_server_args(config: RuntimeConfig, driver_config: SGLangDriverConfig) -> Any:
     """Build an SGLang ServerArgs from the universal RuntimeConfig + driver knobs.
 
-    Driver-config field names match `ServerArgs` so we splat them in directly.
+    Exposed driver-config field names match `ServerArgs` so we splat policy
+    knobs in directly. Capacity limits are resolved by SGLang.
     """
     from sglang.srt.server_args import ServerArgs
 
@@ -118,7 +120,7 @@ def _build_sglang_server_args(config: RuntimeConfig, driver_config: SGLangDriver
         port=30000,
         skip_server_warmup=True,
     )
-    # Driver-specific fields splat verbatim — names match ServerArgs. Skip
+    # Driver-specific policy fields splat verbatim — names match ServerArgs. Skip
     # universal pie knobs that don't correspond to sglang ServerArgs:
     #   - cpu_mem_budget_in_gb sizes pie's host KV pool.
     #   - spec_ngram_* drive pie's own NGRAM drafter (engine-side, see

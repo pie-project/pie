@@ -49,7 +49,6 @@ snapshot_dir = "{snapshot}"
 device = "{device}"
 dtype = "bfloat16"
 [batching]
-kv_page_size = 32
 gpu_mem_utilization = 0.90
 memory_profile = "balanced"
 """

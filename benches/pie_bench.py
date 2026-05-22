@@ -6,7 +6,9 @@ import asyncio
 import contextlib
 import inspect
 import json
+import os
 import socket
+import sys
 import time
 import tomllib
 from contextlib import asynccontextmanager
@@ -18,13 +20,29 @@ from common import (
     RequestResult,
     add_mode_subcommands,
     finish,
+    hf_chat_token_ids_and_counts,
     make_prompts,
     summarize,
 )
 
+SERVER_SDK = ROOT / "sdk" / "python-server" / "python"
+if str(SERVER_SDK) not in sys.path:
+    sys.path.insert(0, str(SERVER_SDK))
+
 
 BENCH_INFERLET = "text-completion-bench"
 EMBEDDED_CLI_DRIVERS: set[str] = {"cuda_native", "portable", "dummy", "vllm", "sglang", "dev"}
+KV_CACHE_DTYPES = [
+    "auto",
+    "bf16",
+    "bfloat16",
+    "fp8_e4m3",
+    "fp8_e5m2",
+    "int8_per_token_head",
+    "fp8_per_token_head",
+    "fp4_e2m1",
+    "nvfp4",
+]
 
 
 def bench_inferlet_paths() -> tuple[Path, Path, str]:
@@ -66,26 +84,41 @@ def build_config(args: argparse.Namespace):
     if args.driver == "dev":
         driver_options = {
             "gpu_mem_utilization": args.gpu_mem_util,
-            "max_forward_tokens": args.max_forward_tokens,
-            "max_forward_requests": args.max_forward_requests,
             "cpu_mem_budget_in_gb": args.cpu_mem_budget,
+            "kv_cache_dtype": args.kv_cache_dtype,
         }
     elif args.driver == "cuda_native":
         driver_options = {
             "gpu_mem_utilization": args.gpu_mem_util,
             "memory_profile": args.memory_profile,
+            "kv_cache_dtype": args.kv_cache_dtype,
         }
+        if args.runtime_quant:
+            driver_options["runtime_quant"] = args.runtime_quant
+        if args.mxfp4_moe:
+            driver_options["mxfp4_moe"] = args.mxfp4_moe
     elif args.driver == "portable":
         driver_options = {
             "max_forward_tokens": args.max_forward_tokens,
             "max_forward_requests": args.max_forward_requests,
             "total_pages": args.kv_pages,
+            "kv_cache_dtype": args.kv_cache_dtype,
         }
     elif args.driver == "vllm":
         driver_options = {
             "gpu_memory_utilization": args.gpu_mem_util,
-            "max_num_seqs": args.max_forward_requests,
         }
+        if args.vllm_max_num_seqs is not None:
+            driver_options["max_num_seqs"] = args.vllm_max_num_seqs
+        if args.vllm_max_num_batched_tokens is not None:
+            driver_options["max_num_batched_tokens"] = args.vllm_max_num_batched_tokens
+        if args.vllm_max_model_len is not None:
+            driver_options["max_model_len"] = args.vllm_max_model_len
+        if getattr(args, "vllm_spec_ngram", False):
+            driver_options["spec_ngram_enabled"] = True
+            driver_options["spec_ngram_num_drafts"] = args.vllm_spec_ngram_num_drafts
+            driver_options["spec_ngram_min_n"] = args.vllm_spec_ngram_min_n
+            driver_options["spec_ngram_max_n"] = args.vllm_spec_ngram_max_n
         if getattr(args, "venv", None):
             driver_options["venv"] = args.venv
         if args.vllm_attention_backend:
@@ -104,7 +137,14 @@ def build_config(args: argparse.Namespace):
     else:
         driver_options = {}
 
-    max_concurrent_processes = args.num_requests if args.mode == "tput" else 1
+    # Concurrency 0 means "no admission cap" (all submitted inferlets run wasm
+    # immediately; the inference scheduler still caps via max_forward_requests).
+    if args.mode == "latency":
+        max_concurrent_processes: int | None = 1
+    elif args.concurrency == 0:
+        max_concurrent_processes = None  # serializer drops field → unlimited
+    else:
+        max_concurrent_processes = args.concurrency
     scheduler = args.batch_policy or ("greedy" if args.mode == "latency" else "adaptive")
     scheduler_kwargs = {
         "batch_policy": scheduler,
@@ -140,6 +180,8 @@ def build_config(args: argparse.Namespace):
                     type=args.driver,
                     device=device,
                     tensor_parallel_size=args.tp_size,
+                    ipc_profile=args.ipc_profile,
+                    spin_budget_us=args.spin_budget_us,
                     options=driver_options,
                 ),
             )
@@ -150,6 +192,10 @@ def build_config(args: argparse.Namespace):
         "scheduler": scheduler,
         **driver_options,
     }
+    if args.token_budget is not None:
+        config_blob["token budget"] = args.token_budget
+    elif args.auto_token_budget:
+        config_blob["token budget"] = args.max_tokens + args.token_budget_prompt_margin
     if args.speculation_depth is not None:
         # Surface for the summary's "spec chain yield" derived stat —
         # yield = hits / (attempted × depth).
@@ -195,6 +241,32 @@ async def cli_pie_client(args: argparse.Namespace):
     server_lines: list[str] = startup_lines
     drain_task: asyncio.Task[None] | None = None
     token: str | None = None
+    server_log_file = None
+    if server_log_path := os.environ.get("PIE_BENCH_SERVER_LOG"):
+        path = Path(server_log_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        server_log_file = path.open("w", encoding="utf-8")
+
+    def should_surface_server_line(txt: str) -> bool:
+        return (
+            txt.startswith("[fire ")
+            or txt.startswith("[sched-fire ")
+            or txt.startswith("[outer-fire ")
+            or txt.startswith("[sched-batch ")
+            or txt.startswith("[pie-spec] ")
+            or txt.startswith("[pie-driver-cuda] sampled tokens ")
+            or "[pie-driver-cuda] memory planner:" in txt
+            or "[pie-driver-cuda] forward_limits:" in txt
+            or "[pie-driver-cuda] kv_cache:" in txt
+            or "[pie-driver-cuda] CUDA graph upfront capture:" in txt
+            or " xqa_decode=" in txt
+            or " WARN " in txt
+            or " ERROR " in txt
+            or "Batch response count mismatch" in txt
+            or "fire_batch failed" in txt
+            or "exceeds workspace" in txt
+            or "graph captured" in txt
+        )
 
     async def drain_stdout() -> None:
         assert proc.stdout is not None
@@ -206,19 +278,13 @@ async def cli_pie_client(args: argparse.Namespace):
             txt = line.decode("utf-8", errors="replace")
             server_lines.append(txt)
             del server_lines[:-200]
+            if server_log_file is not None:
+                server_log_file.write(txt)
+                server_log_file.flush()
             # Surface per-fire timing and server diagnostics the moment
             # they land; otherwise keep the server log buffered for
             # startup/failure messages.
-            if (
-                txt.startswith("[fire ")
-                or txt.startswith("[sched-fire ")
-                or txt.startswith("[outer-fire ")
-                or " WARN " in txt
-                or " ERROR " in txt
-                or "Batch response count mismatch" in txt
-                or "fire_batch failed" in txt
-                or "exceeds workspace" in txt
-            ):
+            if should_surface_server_line(txt):
                 sys.stderr.write(txt)
                 sys.stderr.flush()
 
@@ -226,10 +292,16 @@ async def cli_pie_client(args: argparse.Namespace):
         assert proc.stdout is not None
         deadline = time.perf_counter() + args.server_startup_timeout
         while time.perf_counter() < deadline:
-            line = await asyncio.wait_for(
-                proc.stdout.readline(),
-                timeout=max(0.1, deadline - time.perf_counter()),
-            )
+            try:
+                line = await asyncio.wait_for(
+                    proc.stdout.readline(),
+                    timeout=max(0.1, deadline - time.perf_counter()),
+                )
+            except asyncio.TimeoutError as exc:
+                raise TimeoutError(
+                    "timed out waiting for pie serve startup:\n"
+                    + "".join(startup_lines[-80:])
+                ) from exc
             if not line:
                 raise RuntimeError(
                     "pie serve exited before startup completed:\n"
@@ -237,6 +309,12 @@ async def cli_pie_client(args: argparse.Namespace):
                 )
             text = line.decode("utf-8", errors="replace")
             startup_lines.append(text)
+            if server_log_file is not None:
+                server_log_file.write(text)
+                server_log_file.flush()
+            if should_surface_server_line(text):
+                sys.stderr.write(text)
+                sys.stderr.flush()
             marker = "internal token: "
             if marker in text:
                 token = text.split(marker, 1)[1].strip()
@@ -271,6 +349,8 @@ async def cli_pie_client(args: argparse.Namespace):
             drain_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await drain_task
+        if server_log_file is not None:
+            server_log_file.close()
 
 
 def pie_client(args: argparse.Namespace):
@@ -284,6 +364,11 @@ async def run(args: argparse.Namespace):
 
     n = args.requests if args.mode == "latency" else args.num_requests
     prompts = make_prompts(args, n + args.warmup)
+    prompt_token_ids: list[list[int]] | None = None
+    if args.pretokenized_prompts:
+        prompt_token_ids, _ = hf_chat_token_ids_and_counts(
+            args.model, args.system, prompts
+        )
     wasm, manifest, pkg = bench_inferlet_paths()
 
     async with pie_client(args) as (client, engine_config):
@@ -291,19 +376,42 @@ async def run(args: argparse.Namespace):
 
         first_output_text: list[str | None] = [None]
 
-        async def one(i: int) -> RequestResult:
-            inp = {
-                "prompt": prompts[i],
+        def common_input(max_tokens: int | None = None) -> dict[str, Any]:
+            return {
                 "system": args.system,
-                "max_tokens": args.max_tokens,
+                "max_tokens": args.max_tokens if max_tokens is None else max_tokens,
                 "temperature": args.temperature,
                 "top_p": args.top_p,
                 "ignore_eos": args.ignore_eos,
                 "wasm_delay_us": args.wasm_delay_us,
+                "return_text": args.dump_first_text,
+                "wait_for_start": args.defer_start,
+                "system_speculation": args.system_speculation,
             }
+
+        async def launch_one(i: int, *, max_tokens: int | None = None):
+            inp = {
+                **common_input(max_tokens),
+                "prompt": prompts[i],
+            }
+            if prompt_token_ids is not None:
+                inp["prompt_tokens"] = prompt_token_ids[i]
             start = time.perf_counter()
             try:
-                proc = await client.launch_process(pkg, input=inp)
+                token_budget = args.token_budget
+                if token_budget is None and args.auto_token_budget:
+                    budget_tokens = args.max_tokens if max_tokens is None else max_tokens
+                    token_budget = budget_tokens + args.token_budget_prompt_margin
+                proc = await client.launch_process(pkg, input=inp, token_budget=token_budget)
+                return i, start, proc
+            except Exception as e:
+                return RequestResult(False, time.perf_counter() - start, 0, error=f"{type(e).__name__}: {e}")
+
+        async def wait_one(launched) -> RequestResult:
+            if isinstance(launched, RequestResult):
+                return launched
+            i, start, proc = launched
+            try:
                 while True:
                     ev, msg = await asyncio.wait_for(
                         proc.recv(), timeout=args.request_timeout
@@ -323,15 +431,144 @@ async def run(args: argparse.Namespace):
             except Exception as e:
                 return RequestResult(False, time.perf_counter() - start, 0, error=f"{type(e).__name__}: {e}")
 
-        for i in range(args.warmup):
-            await one(i)
+        async def batch(indices, *, max_tokens: int | None = None) -> list[RequestResult]:
+            indices = list(indices)
+            inp = {
+                **common_input(max_tokens),
+                "prompt": prompts[indices[0]] if indices else args.prompt,
+                "prompts": [prompts[i] for i in indices],
+            }
+            if prompt_token_ids is not None:
+                inp["prompt_tokens_batch"] = [prompt_token_ids[i] for i in indices]
+            start = time.perf_counter()
+            try:
+                token_budget = args.token_budget
+                if token_budget is None and args.auto_token_budget:
+                    budget_tokens = args.max_tokens if max_tokens is None else max_tokens
+                    token_budget = (
+                        budget_tokens + args.token_budget_prompt_margin
+                    ) * max(1, len(indices))
+                proc = await client.launch_process(pkg, input=inp, token_budget=token_budget)
+                if args.defer_start:
+                    while True:
+                        ev, msg = await asyncio.wait_for(
+                            proc.recv(), timeout=args.request_timeout
+                        )
+                        if ev == Event.Message and str(msg) == "ready":
+                            break
+                        if ev == Event.Return:
+                            return [
+                                RequestResult(
+                                    False, 0.0, 0, error="returned before start"
+                                )
+                                for _ in indices
+                            ]
+                        if ev == Event.Error:
+                            return [
+                                RequestResult(False, 0.0, 0, error=str(msg))
+                                for _ in indices
+                            ]
+                    start = time.perf_counter()
+                    await proc.signal("start")
+                while True:
+                    ev, msg = await asyncio.wait_for(
+                        proc.recv(), timeout=args.request_timeout
+                    )
+                    if ev == Event.Return:
+                        obj = json.loads(msg)
+                        if first_output_text[0] is None:
+                            first_output_text[0] = obj.get("text", "")
+                        req_out = obj.get("request_output_tokens") or []
+                        req_prompt = obj.get("request_prompt_tokens") or []
+                        elapsed = time.perf_counter() - start
+                        if len(req_out) == len(indices) and len(req_prompt) == len(indices):
+                            return [
+                                RequestResult(True, elapsed, int(out), int(prompt))
+                                for out, prompt in zip(req_out, req_prompt)
+                            ]
+                        total_out = int(obj["num_output_tokens"])
+                        total_prompt = int(obj["num_prompt_tokens"])
+                        per_out = total_out // max(1, len(indices))
+                        per_prompt = total_prompt // max(1, len(indices))
+                        return [
+                            RequestResult(True, elapsed, per_out, per_prompt)
+                            for _ in indices
+                        ]
+                    if ev == Event.Error:
+                        return [
+                            RequestResult(False, time.perf_counter() - start, 0, error=str(msg))
+                            for _ in indices
+                        ]
+            except Exception as e:
+                return [
+                    RequestResult(
+                        False,
+                        time.perf_counter() - start,
+                        0,
+                        error=f"{type(e).__name__}: {e}",
+                    )
+                    for _ in indices
+                ]
+
+        async def one(i: int, *, max_tokens: int | None = None) -> RequestResult:
+            return await wait_one(await launch_one(i, max_tokens=max_tokens))
+
+        async def many(indices, *, max_tokens: int | None = None) -> list[RequestResult]:
+            if args.single_process_batch and args.mode == "tput":
+                return await batch(indices, max_tokens=max_tokens)
+            launched = await asyncio.gather(
+                *(launch_one(i, max_tokens=max_tokens) for i in indices)
+            )
+            if args.defer_start and args.mode == "tput":
+                ready: list[tuple[int, Any]] = []
+                failed: list[RequestResult] = []
+                for item in launched:
+                    if isinstance(item, RequestResult):
+                        failed.append(item)
+                        continue
+                    i, _start, proc = item
+                    try:
+                        while True:
+                            ev, msg = await asyncio.wait_for(
+                                proc.recv(), timeout=args.request_timeout
+                            )
+                            if ev == Event.Message and str(msg) == "ready":
+                                ready.append((i, proc))
+                                break
+                            if ev == Event.Return:
+                                failed.append(
+                                    RequestResult(False, 0.0, 0, error="returned before start")
+                                )
+                                break
+                            if ev == Event.Error:
+                                failed.append(RequestResult(False, 0.0, 0, error=str(msg)))
+                                break
+                    except Exception as e:
+                        failed.append(
+                            RequestResult(False, 0.0, 0, error=f"{type(e).__name__}: {e}")
+                        )
+                start = time.perf_counter()
+                await asyncio.gather(*(proc.signal("start") for _i, proc in ready))
+                deferred = [(i, start, proc) for i, proc in ready]
+                return failed + await asyncio.gather(
+                    *(wait_one(item) for item in deferred)
+                )
+            return await asyncio.gather(*(wait_one(item) for item in launched))
+
+        if args.warmup:
+            warmup_max_tokens = args.warmup_max_tokens or args.max_tokens
+            if args.mode == "tput":
+                await many(range(args.warmup), max_tokens=warmup_max_tokens)
+            else:
+                for i in range(args.warmup):
+                    await one(i, max_tokens=warmup_max_tokens)
 
         start_idx = args.warmup
         start = time.perf_counter()
         if args.mode == "latency":
             results = [await one(start_idx + i) for i in range(n)]
         else:
-            results = await asyncio.gather(*(one(start_idx + i) for i in range(n)))
+            results = await many(range(start_idx, start_idx + n))
         wall = time.perf_counter() - start
 
         # Pull speculation counters out of the server's model status
@@ -355,6 +592,14 @@ async def run(args: argparse.Namespace):
                     ("default.spec_longest_chain", "spec longest chain"),
                     ("default.total_batches", "total batches"),
                     ("default.avg_batch_latency_us", "avg batch latency us"),
+                    ("default.avg_permit_wait_us", "avg permit wait us"),
+                    ("default.avg_fire_prepare_us", "avg fire prepare us"),
+                    ("default.avg_execute_batch_us", "avg execute batch us"),
+                    ("default.avg_batch_build_us", "avg batch build us"),
+                    ("default.avg_driver_fire_us", "avg driver fire us"),
+                    ("default.avg_response_dispatch_us", "avg response dispatch us"),
+                    ("default.avg_context_tick_submit_us", "avg context tick submit us"),
+                    ("default.avg_stats_update_us", "avg stats update us"),
                     ("default.last_batch_latency_us", "last batch latency us"),
                     ("default.bypass_hits", "bypass hits"),
                     ("default.chain_submits", "chain submits"),
@@ -403,20 +648,30 @@ def build_parser() -> argparse.ArgumentParser:
         sp.add_argument("--device", default="cuda:0")
         sp.add_argument("--driver", default="cuda_native",
                         choices=["dev", "cuda_native", "portable", "vllm", "sglang", "dummy"])
-        sp.add_argument("--max-forward-requests", type=int, default=512)
-        sp.add_argument("--max-forward-tokens", type=int, default=10_240)
         sp.add_argument("--default-token-limit", type=int, default=200_000)
         sp.add_argument("--default-endowment-pages", type=int, default=64)
-        sp.add_argument("--admission-oversubscription-factor", type=float, default=1000.0)
+        sp.add_argument("--admission-oversubscription-factor", type=float, default=4.0)
         sp.add_argument("--cpu-mem-budget", type=int, default=0)
         sp.add_argument(
             "--memory-profile",
-            default="balanced",
-            choices=["latency", "balanced", "throughput", "capacity"],
+            default="auto",
+            choices=["auto", "latency", "balanced", "throughput", "capacity"],
         )
         sp.add_argument("--kv-pages", type=int, default=2048)
+        sp.add_argument("--kv-cache-dtype", choices=KV_CACHE_DTYPES, default="auto")
+        sp.add_argument("--max-forward-tokens", type=int, default=10240)
+        sp.add_argument("--max-forward-requests", type=int, default=512)
+        sp.add_argument("--runtime-quant", choices=["fp8", "int8"], default=None)
+        sp.add_argument(
+            "--mxfp4-moe",
+            choices=["auto", "routed_dequant", "packed", "bf16", "dequant", "eager_bf16", "native"],
+            default=None,
+        )
         sp.add_argument("--portable-n-gpu-layers", type=int, default=-1)
         sp.add_argument("--worker-threads", type=int, default=None)
+        sp.add_argument("--token-budget", type=int, default=None)
+        sp.add_argument("--auto-token-budget", action=argparse.BooleanOptionalAction, default=False)
+        sp.add_argument("--token-budget-prompt-margin", type=int, default=64)
         sp.add_argument(
             "--speculation-depth",
             type=int,
@@ -432,19 +687,58 @@ def build_parser() -> argparse.ArgumentParser:
                  "Use to A/B-compare spec vs no-spec runs at temperature=0.",
         )
         sp.add_argument(
+            "--pretokenized-prompts",
+            action=argparse.BooleanOptionalAction,
+            default=False,
+            help="Pre-render chat prompts to token IDs before timing and send raw tokens "
+                 "to the benchmark inferlet.",
+        )
+        sp.add_argument(
+            "--single-process-batch",
+            action=argparse.BooleanOptionalAction,
+            default=False,
+            help="For throughput mode, launch one benchmark inferlet that drives all "
+                 "requests concurrently inside one WASM process.",
+        )
+        sp.add_argument(
+            "--defer-start",
+            action=argparse.BooleanOptionalAction,
+            default=False,
+            help="For throughput mode, prelaunch inferlets and start timed generation "
+                 "after each process reports ready.",
+        )
+        sp.add_argument(
+            "--system-speculation",
+            action=argparse.BooleanOptionalAction,
+            default=True,
+            help="Ask the benchmark inferlet to request driver-provided speculative drafts.",
+        )
+        sp.add_argument(
             "--batch-policy",
             default=None,
-            choices=["adaptive", "eager", "greedy", "hot"],
+            choices=["adaptive", "eager", "greedy"],
             help="Override scheduler.batch_policy. Default: greedy (latency) "
-                 "or adaptive (tput). Use 'hot' to enable cohort-aware "
-                 "batching for Phase B-hot experiments.",
+                 "or adaptive (tput).",
         )
         sp.add_argument("--vllm-attention-backend", default=None)
-        sp.add_argument("--sglang-attention-backend", default=None)
+        sp.add_argument("--vllm-max-num-seqs", type=int, default=None)
+        sp.add_argument("--vllm-max-num-batched-tokens", type=int, default=None)
+        sp.add_argument("--vllm-max-model-len", type=int, default=None)
+        sp.add_argument("--vllm-spec-ngram", action=argparse.BooleanOptionalAction, default=False)
+        sp.add_argument("--vllm-spec-ngram-num-drafts", type=int, default=4)
+        sp.add_argument("--vllm-spec-ngram-min-n", type=int, default=2)
+        sp.add_argument("--vllm-spec-ngram-max-n", type=int, default=4)
         sp.add_argument("--pie-bin", default=str(ROOT / "target" / "release" / "pie"))
         sp.add_argument("--server-startup-timeout", type=float, default=300.0)
         sp.add_argument("--venv", default=None,
                         help="Path to a Python venv for subprocess drivers (vllm/sglang/dev)")
+        sp.add_argument(
+            "--ipc-profile",
+            default=None,
+            choices=["latency", "balanced", "power"],
+            help="Driver IPC wait profile. latency uses the polling in-process channel.",
+        )
+        sp.add_argument("--spin-budget-us", type=int, default=None)
     return p
 
 

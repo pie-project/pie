@@ -80,13 +80,13 @@ use super::scheduler::{Decision, SchedulingPolicy};
 // **Firing rule** (in evaluation order):
 //
 //   1. `B >= max_forward_requests`              — structural driver limit.
-//   2. `last_latency == 0`                — cold start, no measurement
-//                                           yet; fire to make progress.
-//   3. `in_flight`                        — GPU is occupied by the
+//   2. `in_flight`                        — GPU is occupied by the
 //                                           previous batch. Wait.
 //                                           Arrivals during the wait
 //                                           grow this batch.
-//   4. `B >= pinned_count(driver_idx)`        — every active peer is in
+//   3. `last_latency == 0`                — cold start, no measurement
+//                                           yet; fire to make progress.
+//   4. `B >= pinned_count(driver_idx)`    — every active peer is in
 //                                           the batch (cohort cap).
 //                                           Fire.
 //   5. `start.elapsed() >= last_latency`  — safety bound. Waiting
@@ -223,10 +223,11 @@ impl SchedulingPolicy for AdaptivePolicy {
         self.in_flight = true;
         // Reset per-batch high-water; next batch starts fresh.
         self.cohort_high_water = 0;
-        // Ratchet the persistent fired-cohort estimate. Once we've
-        // seen a fire at B=R, future fires should aim for at least R
-        // before tripping the cohort cap. This counters the race
-        // described on `fired_high_water` above.
+        // Ratchet the persistent fired-cohort estimate to the actual
+        // observed cohort size. Do not round near-full cohorts up to
+        // `max_forward_requests`: admission can legitimately settle at
+        // R=max-1, and rounding would force every later batch to wait for
+        // a request that cannot arrive.
         if fired_size > self.fired_high_water {
             self.fired_high_water = fired_size;
         }
@@ -238,15 +239,16 @@ impl SchedulingPolicy for AdaptivePolicy {
         if current_forward_requests >= self.max_forward_requests {
             return Decision::Fire;
         }
-        // (2) Cold start.
-        if self.last_latency == 0.0 {
-            return Decision::Fire;
-        }
-        // (3) GPU-busy gate. While the GPU is occupied, never fire
+        // (2) GPU-busy gate. While the GPU is occupied, never fire
         //     — let the scheduler stay in its Wait branch and keep
         //     growing this batch with incoming requests.
         if self.in_flight {
             return Decision::Wait(Duration::from_secs(60));
+        }
+        // (3) Cold start. Once the GPU is free and there is no
+        //     latency measurement yet, fire to make progress.
+        if self.last_latency == 0.0 {
+            return Decision::Fire;
         }
         // GPU is free below this point.
         // (4) Cohort cap. The target is `max(this-batch high-water,
@@ -260,7 +262,19 @@ impl SchedulingPolicy for AdaptivePolicy {
         //     other 7+ inferlets still finishing their post-fire CPU
         //     step. Without it, `B = pinned_count = 1` at that moment
         //     trips the cap and we fire at B=1.
-        let active = crate::context::pinned_count(self.driver_idx);
+        let pinned = crate::context::pinned_count(self.driver_idx);
+        let (resident_active, resident_pinned) = crate::context::resident_count(self.driver_idx);
+        let resident = resident_active.saturating_add(resident_pinned);
+        let mut active = pinned;
+        // If a dense serving cohort is already mostly assembled, use the
+        // resident count to wait for stragglers. This prevents a first
+        // 440/512 fire from becoming the permanent cohort size, while
+        // sparse agent workloads still fire from the pinned count below.
+        if resident > active
+            && current_forward_requests.saturating_mul(4) >= resident.saturating_mul(3)
+        {
+            active = resident.min(self.max_forward_requests);
+        }
         if active > self.cohort_high_water {
             self.cohort_high_water = active;
         }
@@ -275,11 +289,18 @@ impl SchedulingPolicy for AdaptivePolicy {
             // decide is called (set on first on_arrival).
             return Decision::Fire;
         };
+        let dense_resident_cohort =
+            target >= self.max_forward_requests && resident >= target && target > 0;
+        let wait_bound = if dense_resident_cohort {
+            self.last_latency * 2.0
+        } else {
+            self.last_latency
+        };
         let elapsed = start.elapsed().as_secs_f64();
-        if elapsed >= self.last_latency {
+        if elapsed >= wait_bound {
             return Decision::Fire;
         }
-        Decision::Wait(Duration::from_secs_f64(self.last_latency - elapsed))
+        Decision::Wait(Duration::from_secs_f64(wait_bound - elapsed))
     }
 }
 
@@ -439,6 +460,13 @@ mod tests {
         // Even at large B (cohort cap would normally fire), we wait
         // because the GPU is occupied.
         assert!(matches!(policy.decide(100), Decision::Wait(_)));
+    }
+
+    #[test]
+    fn adaptive_waits_while_gpu_busy_even_before_latency_calibration() {
+        let mut policy = AdaptivePolicy::new(512, 0);
+        policy.on_fired(1);
+        assert!(matches!(policy.decide(1), Decision::Wait(_)));
     }
 
     #[test]

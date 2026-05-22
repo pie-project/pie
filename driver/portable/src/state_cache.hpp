@@ -59,6 +59,9 @@ public:
     // doesn't have explicit "begin context" RPC plumbing).
     void zero_slot(std::int32_t slot);
 
+    // Copy one slot to another across every linear-attention layer.
+    void copy_slot(std::int32_t src_slot, std::int32_t dst_slot);
+
     std::int32_t n_slots()     const noexcept { return n_slots_; }
     std::int32_t n_heads()     const noexcept { return n_heads_; }
     std::int32_t head_k_dim()  const noexcept { return head_k_dim_; }

@@ -85,6 +85,8 @@ class DriverConfig:
     tensor_parallel_size: Optional[int] = None
     activation_dtype: Optional[str] = None
     random_seed: Optional[int] = None
+    ipc_profile: Optional[str] = None
+    spin_budget_us: Optional[int] = None
     options: dict = field(default_factory=dict)
 
 
@@ -168,7 +170,13 @@ def _driver_block(d: DriverConfig) -> dict:
     """`[model.driver]` block — skip `options` (it goes in its own
     sub-table) and never None-suppress `type`/`device` (they're required)."""
     out = {"type": d.type, "device": d.device}
-    for name in ("tensor_parallel_size", "activation_dtype", "random_seed"):
+    for name in (
+        "tensor_parallel_size",
+        "activation_dtype",
+        "random_seed",
+        "ipc_profile",
+        "spin_budget_us",
+    ):
         v = getattr(d, name)
         if v is not None:
             out[name] = v

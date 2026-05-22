@@ -198,7 +198,6 @@ fn draw_config_panel(f: &mut ratatui::Frame, area: Rect, cfg: &DisplayConfig) {
     item("device", format!("{:?}", cfg.device), false);
     item("tp_size", cfg.tensor_parallel_size.to_string(), false);
     item("dtype", cfg.activation_dtype.clone(), false);
-    item("kv_page", cfg.kv_page_size.to_string(), false);
     item("profile", cfg.memory_profile.clone(), false);
 
     f.render_widget(Paragraph::new(lines).block(block), area);

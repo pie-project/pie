@@ -20,6 +20,7 @@ set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib)
 set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib)
 
 find_package(CUDAToolkit REQUIRED)
+find_package(Threads REQUIRED)
 
 if(NOT PIE_BRIDGE_INCLUDE_DIR)
   set(PIE_BRIDGE_INCLUDE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../bridge/include")
@@ -56,6 +57,32 @@ cpmaddpackage(URI "gh:CLIUtils/CLI11@2.5.0")
 cpmaddpackage(URI "gh:nlohmann/json@3.12.0" OPTIONS "JSON_BuildTests OFF")
 cpmaddpackage(URI "gh:facebook/zstd@1.5.7")
 
+set(PIE_CUDA_CUSTOM_ALL_REDUCE_SOURCE src/custom_all_reduce.cu)
+foreach(PIE_CUDA_ARCH IN LISTS CMAKE_CUDA_ARCHITECTURES)
+  string(REGEX REPLACE "[^0-9].*$" "" PIE_CUDA_ARCH_NUMBER "${PIE_CUDA_ARCH}")
+  if(PIE_CUDA_ARCH_NUMBER STREQUAL "120")
+    set(PIE_CUDA_CUSTOM_ALL_REDUCE_SOURCE src/custom_all_reduce_stub.cpp)
+  endif()
+endforeach()
+if(PIE_CUDA_CUSTOM_ALL_REDUCE_SOURCE MATCHES "stub")
+  message(STATUS "Disabling FlashInfer custom all-reduce for CUDA architecture ${CMAKE_CUDA_ARCHITECTURES}")
+endif()
+
+set(PIE_CUDA_FLASHINFER_HOPPER_SOURCE src/ops/attention_flashinfer_hopper_stub.cpp)
+foreach(PIE_CUDA_ARCH IN LISTS CMAKE_CUDA_ARCHITECTURES)
+  string(REGEX REPLACE "[^0-9].*$" "" PIE_CUDA_ARCH_NUMBER "${PIE_CUDA_ARCH}")
+  if(PIE_CUDA_ARCH_NUMBER STREQUAL "90")
+    set(PIE_CUDA_FLASHINFER_HOPPER_SOURCE
+      src/ops/attention_flashinfer_hopper.cu
+      src/ops/attention_xqa_gqa8_sm90.cu
+    )
+  endif()
+endforeach()
+if(PIE_CUDA_FLASHINFER_HOPPER_SOURCE MATCHES "stub")
+  message(STATUS "Disabling FlashInfer Hopper/FA3 attention for CUDA architecture ${CMAKE_CUDA_ARCHITECTURES}")
+else()
+  message(STATUS "Enabling FlashInfer Hopper/FA3 attention for CUDA architecture ${CMAKE_CUDA_ARCHITECTURES}")
+endif()
 
 # pie_driver_cuda — native CUDA backend. Built two ways from the same
 # translation units:
@@ -76,8 +103,11 @@ add_library(pie_driver_cuda_lib STATIC
   src/sampling_dispatch.cpp
   src/spec_expansion.cpp
   src/tensor.cpp
+  src/model/weight_store.cpp
   src/model/loaded_model.cpp
+  src/model/bound_model.cpp
   ../common/src/safetensors_manifest.cpp
+  src/loader/gguf_source.cpp
   src/loader/hf_config.cpp
   src/loader/safetensors.cpp
   src/model/qwen3.cpp
@@ -90,10 +120,13 @@ add_library(pie_driver_cuda_lib STATIC
   src/model/mistral3.cpp
   src/model/gpt_oss.cpp
   src/model/qwen3_5.cpp
+  src/kv_cache_format.cpp
   src/kv_cache.cpp
   src/ops/gemm.cpp
   src/ops/attention_naive.cu
   src/ops/attention_naive_paged.cu
+  src/ops/attention_xqa.cu
+  src/ops/attention_xqa_gqa8.cu
   src/kernels/rmsnorm.cu
   src/kernels/embed.cu
   src/kernels/swiglu.cu
@@ -115,6 +148,7 @@ add_library(pie_driver_cuda_lib STATIC
   src/kernels/softcap.cu
   src/kernels/scalar_mul.cu
   src/kernels/dequant_fp4.cu
+  src/kernels/mxfp4_marlin.cu
   src/kernels/dequant_fp8.cu
   src/kernels/dtype_cast.cu
   src/kernels/quant_bf16_to_fp8.cu
@@ -127,7 +161,6 @@ add_library(pie_driver_cuda_lib STATIC
   src/kernels/causal_conv1d.cu
   src/kernels/gated_delta_net.cu
   src/qwen3_5_state_cache.cpp
-  src/slot_allocator.cpp
   src/model/qwen3_5_forward.cpp
   src/model/qwen3_5_moe.cpp
   src/model/qwen3_5_moe_forward.cpp
@@ -135,12 +168,45 @@ add_library(pie_driver_cuda_lib STATIC
   src/brle.cpp
   src/swap_pool.cpp
   src/distributed.cpp
-  src/custom_all_reduce.cu
+  ${PIE_CUDA_CUSTOM_ALL_REDUCE_SOURCE}
   src/ops/attention_flashinfer.cu
+  ${PIE_CUDA_FLASHINFER_HOPPER_SOURCE}
 )
 
+find_program(CARGO_EXECUTABLE cargo REQUIRED)
+set(PIE_WORKSPACE_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../..")
+set(PIE_WEIGHT_LOADER_MANIFEST
+    "${PIE_WORKSPACE_ROOT}/driver/weight_loader/Cargo.toml")
+set(PIE_WEIGHT_LOADER_STATICLIB_PATH
+    "${PIE_WORKSPACE_ROOT}/target/release/libpie_weight_loader.a")
+add_custom_target(pie_weight_loader_staticlib
+  COMMAND "${CARGO_EXECUTABLE}" build
+          --manifest-path "${PIE_WEIGHT_LOADER_MANIFEST}"
+          --release
+  WORKING_DIRECTORY "${PIE_WORKSPACE_ROOT}"
+  BYPRODUCTS "${PIE_WEIGHT_LOADER_STATICLIB_PATH}"
+  COMMENT "Building Rust weight-loader static library")
+add_library(pie_weight_loader_static STATIC IMPORTED GLOBAL)
+set_target_properties(pie_weight_loader_static PROPERTIES
+  IMPORTED_LOCATION "${PIE_WEIGHT_LOADER_STATICLIB_PATH}")
+add_dependencies(pie_weight_loader_static pie_weight_loader_staticlib)
+
+set(PIE_WEIGHT_LOADER_SYSTEM_LIBS Threads::Threads ${CMAKE_DL_LIBS} m)
+if(UNIX AND NOT APPLE)
+  list(APPEND PIE_WEIGHT_LOADER_SYSTEM_LIBS rt util)
+endif()
+
 add_executable(pie_driver_cuda src/main.cpp)
-target_link_libraries(pie_driver_cuda PRIVATE pie_driver_cuda_lib)
+target_link_libraries(pie_driver_cuda PRIVATE
+  pie_driver_cuda_lib
+  # The C++ declarations are weak so server builds can link the CUDA driver
+  # archive before Cargo supplies Rust symbols. For the standalone parity
+  # binary, force the Rust staticlib into the link; weak references alone do
+  # not cause archive extraction.
+  "-Wl,--whole-archive"
+  pie_weight_loader_static
+  "-Wl,--no-whole-archive"
+  ${PIE_WEIGHT_LOADER_SYSTEM_LIBS})
 
 target_compile_options(pie_driver_cuda_lib PRIVATE
   $<$<COMPILE_LANGUAGE:CUDA>:
@@ -152,7 +218,7 @@ target_compile_options(pie_driver_cuda_lib PRIVATE
   >
   $<$<COMPILE_LANGUAGE:CXX>:-Wall -Wextra -Wno-unused-parameter>
 )
-# Marlin sources are added to the `pie_driver_cuda` executable below
+# Marlin sources are added to the static driver library below
 # (see `PIE_CUDA_BUILD_MARLIN`); they need the same nvcc relaxed-
 # constexpr / extended-lambda flags the lib gets, since vendored
 # kernels mix `__host__ constexpr` helpers into `__device__` paths.
@@ -170,31 +236,30 @@ target_include_directories(pie_driver_cuda_lib
     ${PIE_BRIDGE_INCLUDE_DIR}
     ${NCCL_INCLUDE_DIR}
     ${flashinfer_SOURCE_DIR}/include
+    ${flashinfer_SOURCE_DIR}/csrc
     ${flashinfer_SOURCE_DIR}/3rdparty/cutlass/include
     ${flashinfer_SOURCE_DIR}/3rdparty/cutlass/tools/util/include
     ${flashinfer_SOURCE_DIR}/3rdparty/spdlog/include)
 
-# ── Marlin (W4A16 GEMM via vendored vLLM kernel) ─────────────────────
-# Off by default while M3 plumbing lands. Vendored sources live under
-# `third_party/marlin/`; the wrapper exposes a torch-free C++ API.
-# Compile cost is ~3 minutes on first build (heavy templates) so we
-# gate it behind an explicit switch until a model actually uses it.
-option(PIE_CUDA_BUILD_MARLIN "Build vendored marlin W4A16 GEMM" OFF)
+# ── Marlin (W4A16 / MXFP4 GEMM via vendored vLLM kernel) ──────────────
+# Built by default because GPT-OSS MXFP4 auto policy should use native
+# packed-weight GEMM on supported GPUs and fall back only on legacy targets.
+# Vendored sources live under `third_party/marlin/`; the wrapper exposes a
+# torch-free C++ API.
+option(PIE_CUDA_BUILD_MARLIN "Build vendored marlin W4A16/MXFP4 GEMM" ON)
 if(PIE_CUDA_BUILD_MARLIN)
-    # Include the generated per-arch kernel instantiations alongside the
-    # core driver. `generate_kernels.py` produced sm80 variants targeting
-    # A100; rerun with a different arch to add Hopper / Ada coverage.
+	    # Include the generated kernel instantiations alongside the core driver.
     file(GLOB MARLIN_SM_KERNELS
         "${CMAKE_CURRENT_SOURCE_DIR}/third_party/marlin/sm*_kernel_*.cu")
-    target_sources(pie_driver_cuda PRIVATE
+    target_sources(pie_driver_cuda_lib PRIVATE
         third_party/marlin/marlin.cu
         third_party/marlin/gptq_marlin_repack.cu
         third_party/marlin/awq_marlin_repack.cu
         third_party/marlin/marlin_wrapper.cpp
         ${MARLIN_SM_KERNELS})
-    target_include_directories(pie_driver_cuda PRIVATE
+    target_include_directories(pie_driver_cuda_lib PRIVATE
         third_party/marlin)
-    target_compile_definitions(pie_driver_cuda PRIVATE PIE_CUDA_HAS_MARLIN=1)
+    target_compile_definitions(pie_driver_cuda_lib PRIVATE PIE_CUDA_HAS_MARLIN=1)
 endif()
 
 # Standalone test for flashinfer sampling debugging.
@@ -209,6 +274,18 @@ target_compile_options(sample_flashinfer_test PRIVATE
   $<$<COMPILE_LANGUAGE:CUDA>: --extended-lambda --expt-relaxed-constexpr >)
 target_link_libraries(sample_flashinfer_test PRIVATE CUDA::cudart)
 
+# Qwen3.5 linear-attention conv-state regression. This catches mixed
+# prefill/decode batches where a continuing T=1 request must consume its
+# existing conv window even when the whole fire is not pure decode.
+add_executable(test_causal_conv1d
+  tests/test_causal_conv1d.cu
+  src/kernels/causal_conv1d.cu)
+target_include_directories(test_causal_conv1d PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_compile_options(test_causal_conv1d PRIVATE
+  $<$<COMPILE_LANGUAGE:CUDA>: --extended-lambda --expt-relaxed-constexpr >)
+target_link_libraries(test_causal_conv1d PRIVATE CUDA::cudart)
+
 # Wire-format unit tests. Pure C++ (no CUDA), short runtime; CTest runs
 # them under `cmake --build build --target test`.
 add_executable(test_brle tests/test_brle.cpp src/brle.cpp)
@@ -221,9 +298,51 @@ target_include_directories(test_driver_common PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/../common/include)
 target_link_libraries(test_driver_common PRIVATE nlohmann_json::nlohmann_json)
 
+add_executable(test_kv_cache_format
+  tests/test_kv_cache_format.cpp
+  src/kv_cache_format.cpp)
+target_include_directories(test_kv_cache_format PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/src)
+
+add_executable(test_kv_cache_quant
+  tests/test_kv_cache_quant.cu
+  src/tensor.cpp
+  src/kv_cache.cpp
+  src/kv_cache_format.cpp
+  src/kernels/kv_paged.cu)
+target_include_directories(test_kv_cache_quant PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_compile_options(test_kv_cache_quant PRIVATE
+  $<$<COMPILE_LANGUAGE:CUDA>: --extended-lambda --expt-relaxed-constexpr >)
+target_link_libraries(test_kv_cache_quant PRIVATE CUDA::cudart)
+
+add_executable(test_swap_pool
+  tests/test_swap_pool.cpp
+  src/tensor.cpp
+  src/kv_cache.cpp
+  src/kv_cache_format.cpp
+  src/swap_pool.cpp)
+target_include_directories(test_swap_pool PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_link_libraries(test_swap_pool PRIVATE CUDA::cudart)
+
+add_executable(test_mxfp4_marlin
+  tests/test_mxfp4_marlin.cu
+  src/kernels/mxfp4_marlin.cu)
+target_include_directories(test_mxfp4_marlin PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_compile_options(test_mxfp4_marlin PRIVATE
+  $<$<COMPILE_LANGUAGE:CUDA>: --extended-lambda --expt-relaxed-constexpr >)
+target_link_libraries(test_mxfp4_marlin PRIVATE CUDA::cudart)
+
 enable_testing()
 add_test(NAME brle COMMAND test_brle)
+add_test(NAME causal_conv1d COMMAND test_causal_conv1d)
 add_test(NAME driver_common COMMAND test_driver_common)
+add_test(NAME kv_cache_format COMMAND test_kv_cache_format)
+add_test(NAME kv_cache_quant COMMAND test_kv_cache_quant)
+add_test(NAME swap_pool COMMAND test_swap_pool)
+add_test(NAME mxfp4_marlin COMMAND test_mxfp4_marlin)
 
 target_link_libraries(pie_driver_cuda_lib PUBLIC
   CLI11::CLI11
@@ -231,6 +350,7 @@ target_link_libraries(pie_driver_cuda_lib PUBLIC
   zstd
   nlohmann_json::nlohmann_json
   rt
+  dl
   CUDA::cudart
   CUDA::cublas
   CUDA::cublasLt

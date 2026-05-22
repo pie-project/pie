@@ -30,3 +30,9 @@ ZO_UPDATE_ADAPTER = 8
 
 # Health request (no driver-side handler — replied with status=0 directly)
 HEALTH = 9
+
+# Recurrent-state cache slot copies.
+RS_COPY_D2H = 10
+RS_COPY_H2D = 11
+RS_COPY_D2D = 12
+RS_COPY_H2H = 13

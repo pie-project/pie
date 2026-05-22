@@ -96,6 +96,6 @@ struct Qwen3_5MoeWeights {
     std::vector<DeviceTensor> owned_bf16_buffers;
 };
 
-Qwen3_5MoeWeights bind_qwen3_5_moe(LoadedModel& engine);
+Qwen3_5MoeWeights bind_qwen3_5_moe(const LoadedModel& engine);
 
 }  // namespace pie_cuda_driver::model

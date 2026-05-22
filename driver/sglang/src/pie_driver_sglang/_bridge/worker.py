@@ -334,10 +334,9 @@ def _leader_loop(
     config = engine.config
     latency_stats = LatencyStats(enabled=config.telemetry_enabled)
 
-    # `kv_page_size` and `max_dist_size` are NativeRuntimeConfig-only after
-    # the universal/native config split. Fall back to the engine's
-    # capability handshake (which every driver implements) for kv_page_size,
-    # and to a sensible default for max_dist_size which only matters for
+    # Some runtime configs carry the resolved page size directly. Fall back
+    # to the engine's capability handshake (which every driver implements)
+    # and to a sensible default for max_dist_size, which only matters for
     # distribution-mode sampling responses.
     _kv_page_size = getattr(config, "kv_page_size", None)
     if _kv_page_size is None:

@@ -367,6 +367,14 @@ impl Process {
             .await
             .map_err(|e| e.to_string())?;
 
+            // KV admission waits here, after the singleton linker has already
+            // prepared the instance and is free to instantiate other queued
+            // processes. Blocking inside the linker would serialize a saturated
+            // second cohort behind the first one and leave the GPU idle.
+            context::register_process(process_id, token_budget)
+                .await
+                .map_err(|e| e.to_string())?;
+
             let run_interface = format!("pie:{}/run", program.name);
 
             let (_, run_export) = instance

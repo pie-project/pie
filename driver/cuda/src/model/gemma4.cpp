@@ -291,11 +291,11 @@ Gemma4Weights bind_gemma4(const LoadedModel& engine) {
             // (1/sqrt(H))` then a linear. Bake `1/sqrt(H)` into the
             // per-channel `scale` here so the forward collapses the
             // first three steps into a single rmsnorm-with-weight call.
-            const auto& raw_scale = must(engine, lp + "router.scale");
-            const std::int64_t H64 = raw_scale.numel();
+            const auto* raw_scale = &must(engine, lp + "router.scale");
+            const std::int64_t H64 = raw_scale->numel();
             const float inv_sqrt_h = 1.f / std::sqrt(static_cast<float>(H64));
             std::vector<std::uint16_t> host(static_cast<std::size_t>(H64));
-            CUDA_CHECK(cudaMemcpy(host.data(), raw_scale.data(),
+            CUDA_CHECK(cudaMemcpy(host.data(), raw_scale->data(),
                                   H64 * sizeof(std::uint16_t),
                                   cudaMemcpyDeviceToHost));
             for (auto& bits : host) {
@@ -787,11 +787,12 @@ void gemma4_forward_paged(
 
         // KV write only on non-shared layers — shared layers attend
         // through the source slot's already-populated pages.
+        auto kv_view = cache.layer_view(l);
         if (!layer.is_shared) {
-            kernels::launch_write_kv_to_pages_bf16(
-                cache.k(l), cache.v(l), ws.k.data(), ws.v.data(),
+            kernels::launch_write_kv_to_pages(
+                kv_view, ws.k.data(), ws.v.data(),
                 qo_indptr, kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                N, R, cache.page_size(), num_kv_heads_local, d, stream);
+                N, R, stream);
         }
 
         // Plan + dispatch attention. Shared layers dispatch against the
@@ -804,33 +805,31 @@ void gemma4_forward_paged(
         ops::DecodePlanCachePtr decode_plan;
         if (use_decode_path) {
             decode_plan = ops::make_decode_plan();
-            ops::plan_attention_flashinfer_decode_bf16(
+            ops::plan_attention_flashinfer_decode(
                 *decode_plan, kv_page_indptr_h, R,
                 num_q_heads_local, num_kv_heads_local, d,
                 cache.page_size(), attn_ws, stream);
-            ops::dispatch_attention_flashinfer_decode_bf16(
+            ops::dispatch_attention_flashinfer_decode(
                 *decode_plan,
-                ws.q.data(), cache.k(l), cache.v(l), ws.attn_out.data(),
+                ws.q.data(), kv_view, ws.attn_out.data(),
                 kv_page_indices, kv_page_indptr, kv_last_page_lens,
                 attn_ws, stream,
                 /*window_left=*/w.per_layer_window_left[l],
                 /*logits_soft_cap=*/0.f,
                 /*sm_scale=*/1.0f);  // Gemma-4: q/k norm absorbs 1/sqrt(d)
         } else if (d == 512) {
-            ops::launch_attention_naive_paged_bf16(
-                ws.q.data(), cache.k(l), cache.v(l), ws.attn_out.data(),
+            ops::launch_attention_naive_paged(
+                ws.q.data(), kv_view, ws.attn_out.data(),
                 qo_indptr, kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                N, R, num_q_heads_local, num_kv_heads_local, d,
-                cache.page_size(), stream,
+                N, R, kv_page_indptr_h[R], num_q_heads_local, stream,
                 /*window_left=*/w.per_layer_window_left[l],
                 /*sm_scale=*/1.0f);
         } else {
-            ops::launch_attention_flashinfer_prefill_bf16(
-                ws.q.data(), cache.k(l), cache.v(l), ws.attn_out.data(),
+            ops::launch_attention_flashinfer_prefill(
+                ws.q.data(), kv_view, ws.attn_out.data(),
                 qo_indptr, kv_page_indices, kv_page_indptr, kv_last_page_lens,
                 qo_indptr_h, kv_page_indptr_h,
-                N, R, num_q_heads_local, num_kv_heads_local, d,
-                cache.page_size(), attn_ws, stream,
+                N, R, num_q_heads_local, attn_ws, stream,
                 /*window_left=*/w.per_layer_window_left[l],
                 /*logits_soft_cap=*/0.f,
                 /*sm_scale=*/1.0f);

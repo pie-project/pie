@@ -101,7 +101,7 @@ impl Linker {
         username: String,
         program_name: &ProgramName,
         capture_outputs: bool,
-        token_budget: Option<usize>,
+        _token_budget: Option<usize>,
     ) -> Result<(Store<InstanceState>, WasmInstance)> {
         // 1. Get the main component (with snapshot status + python-runtime decl)
         let main = program::get_wasm_component(program_name)
@@ -143,7 +143,6 @@ impl Linker {
             username,
             capture_outputs,
             &self.policy,
-            token_budget,
             py_runtime_dir_for_state,
         )
         .await?;

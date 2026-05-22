@@ -4,11 +4,8 @@
 #include <cuda_runtime.h>
 
 #include <cstdint>
-#include <iostream>
-#include <mutex>
 #include <stdexcept>
 #include <string>
-#include <unordered_map>
 
 #include "cuda_check.hpp"
 #include "kernels/dequant_fp8.hpp"
@@ -61,23 +58,18 @@ void gemm_bf16_impl(
     int M, int N, int K,
     float beta)
 {
-    // P1.2 attempt routed this through cublasLtMatmul; the Lt heuristic
-    // returned the same `gemvx` algo cuBLAS picks on its own, so the
-    // change was a wash. We keep the Lt scaffold (defined further down)
-    // for future epilogue-fusion work but route bf16 gemms back through
-    // the simpler GemmEx path here.
     const float alpha = 1.f;
     const auto status = cublasGemmEx(
-              handle,
-              /*transa=*/CUBLAS_OP_T, /*transb=*/CUBLAS_OP_N,
-              /*m=*/N, /*n=*/M, /*k=*/K,
-              &alpha,
-              /*A=*/W,   CUDA_R_16BF, /*lda=*/K,
-              /*B=*/act, CUDA_R_16BF, /*ldb=*/K,
-              &beta,
-              /*C=*/y,   CUDA_R_16BF, /*ldc=*/N,
-              CUBLAS_COMPUTE_32F,
-              CUBLAS_GEMM_DEFAULT);
+        handle,
+        /*transa=*/CUBLAS_OP_T, /*transb=*/CUBLAS_OP_N,
+        /*m=*/N, /*n=*/M, /*k=*/K,
+        &alpha,
+        /*A=*/W,   CUDA_R_16BF, /*lda=*/K,
+        /*B=*/act, CUDA_R_16BF, /*ldb=*/K,
+        &beta,
+        /*C=*/y,   CUDA_R_16BF, /*ldc=*/N,
+        CUBLAS_COMPUTE_32F_FAST_16BF,
+        CUBLAS_GEMM_DEFAULT_TENSOR_OP);
     if (status != CUBLAS_STATUS_SUCCESS) {
         throw std::runtime_error(
             "cuBLAS error (" + std::to_string(static_cast<int>(status)) +
@@ -109,8 +101,8 @@ void gemm_batched_bf16_impl(
               &beta,
               /*C=*/y_ptrs_dev,   CUDA_R_16BF, /*ldc=*/N,
               batch_count,
-              CUBLAS_COMPUTE_32F,
-              CUBLAS_GEMM_DEFAULT);
+              CUBLAS_COMPUTE_32F_FAST_16BF,
+              CUBLAS_GEMM_DEFAULT_TENSOR_OP);
     if (status != CUBLAS_STATUS_SUCCESS) {
         throw std::runtime_error(
             "cuBLAS error (" + std::to_string(static_cast<int>(status)) +
@@ -124,8 +116,42 @@ void gemm_batched_bf16_impl(
                               DType act_dtype, DType w_dtype, DType y_dtype) {
     throw std::runtime_error(
         std::string("ops::") + api + ": unsupported dtype combo (act=" +
-        dtype_name(act_dtype) + ", w=" + dtype_name(w_dtype) +
+            dtype_name(act_dtype) + ", w=" + dtype_name(w_dtype) +
         ", y=" + dtype_name(y_dtype) + ")");
+}
+
+void validate_quant_weight_view(const char* api, const WeightView& w, int N, int K) {
+    if (w.data == nullptr) {
+        throw std::runtime_error(std::string(api) + ": quant weight data is null");
+    }
+    if (w.scale_data == nullptr) {
+        throw std::runtime_error(std::string(api) + ": quant scale data is null");
+    }
+    const bool is_nibble_packed =
+        w.dtype == DType::INT4_PACKED || w.dtype == DType::MXFP4_PACKED;
+    const std::size_t expected_weight_bytes = is_nibble_packed
+        ? (static_cast<std::size_t>(N) * static_cast<std::size_t>(K) + 1) / 2
+        : static_cast<std::size_t>(N) * static_cast<std::size_t>(K) *
+              dtype_bytes(w.dtype);
+    if (w.nbytes < expected_weight_bytes) {
+        throw std::runtime_error(
+            std::string(api) + ": quant weight buffer is smaller than GEMM "
+            "shape requires; have " + std::to_string(w.nbytes) +
+            " bytes, need " + std::to_string(expected_weight_bytes) +
+            " bytes for N=" + std::to_string(N) +
+            " K=" + std::to_string(K));
+    }
+    std::size_t expected_scales = static_cast<std::size_t>(N);
+    if (w.quant_kind == QuantMeta::Kind::PerGroup && w.group_size > 0) {
+        expected_scales *=
+            static_cast<std::size_t>((K + w.group_size - 1) / w.group_size);
+    }
+    if (w.scale_numel < expected_scales) {
+        throw std::runtime_error(
+            std::string(api) + ": quant scale tensor is smaller than GEMM "
+            "shape requires; have " + std::to_string(w.scale_numel) +
+            " values, need " + std::to_string(expected_scales));
+    }
 }
 
 // ── cuBLASLt FP8 path ─────────────────────────────────────────────────
@@ -193,6 +219,18 @@ void* marlin_workspace_() {
             throw std::runtime_error("marlin: cudaMalloc workspace failed");
         }
         cudaMemset(ws, 0, ws_bytes);
+    }
+    return ws;
+}
+
+void* marlin_fp32_reduce_scratch_() {
+    static void* ws = nullptr;
+    static const std::size_t ws_bytes = 32 * 1024 * 1024;
+    if (!ws) {
+        if (cudaMalloc(&ws, ws_bytes) != cudaSuccess) {
+            throw std::runtime_error(
+                "marlin: cudaMalloc fp32 reduce scratch failed");
+        }
     }
     return ws;
 }
@@ -308,6 +346,7 @@ void gemm_fp8_dequant_then_bf16_fallback(
             bf16_w,
             static_cast<const float*>(w_scale_fp32_dev),
             N, K, stream);
+        CUDA_CHECK(cudaGetLastError());
     } else {
         // Per-tensor: pull the scalar to host. One sync per layer per
         // fire — acceptable on this fallback path.
@@ -318,145 +357,34 @@ void gemm_fp8_dequant_then_bf16_fallback(
         kernels::launch_dequant_fp8_e4m3_to_bf16(
             static_cast<const std::uint8_t*>(w_fp8),
             bf16_w, scale, weight_elems, stream);
+        CUDA_CHECK(cudaGetLastError());
     }
     gemm_bf16_impl(cublas_handle, act, bf16_w, y, M, N, K, beta);
 }
 
-// ── cuBLASLt BF16 path (P1.2) ─────────────────────────────────────────
-//
-// Same row-major y[M,N] = act[M,K] @ W[N,K]^T problem as `gemm_bf16_impl`,
-// but routed through cuBLASLt with `cublasLtMatmulAlgoGetHeuristic` so
-// the engine picks a small-tile tensor-core kernel for decode-shaped
-// matmuls (small batch, wide MN). Heuristic queries are cached by shape
-// + beta — the shape set per layer is fixed at boot, so steady-state has
-// zero heuristic calls.
-
-struct LtBf16AlgoKey {
-    int M, N, K;
-    bool beta_one;
-    bool operator==(const LtBf16AlgoKey& o) const noexcept {
-        return M == o.M && N == o.N && K == o.K && beta_one == o.beta_one;
-    }
-};
-
-struct LtBf16AlgoKeyHash {
-    std::size_t operator()(const LtBf16AlgoKey& k) const noexcept {
-        // FNV-1a-ish — only a few keys per process (one per matmul
-        // shape per arch), so collision resistance doesn't matter.
-        std::size_t h = 1469598103934665603ULL;
-        for (auto v : {k.M, k.N, k.K, k.beta_one ? 1 : 0}) {
-            h ^= static_cast<std::size_t>(v);
-            h *= 1099511628211ULL;
-        }
-        return h;
-    }
-};
-
-struct LtBf16AlgoCache {
-    // The cached algo descriptor is portable across calls of the same
-    // shape; cuBLASLt internally owns no per-call state.
-    std::unordered_map<LtBf16AlgoKey, cublasLtMatmulAlgo_t, LtBf16AlgoKeyHash> map;
-    std::mutex mu;
-};
-
-LtBf16AlgoCache& bf16_algo_cache_() {
-    static LtBf16AlgoCache c;
-    return c;
-}
-
-void gemm_bf16_lt_impl(
-    cublasHandle_t handle,
-    const void* act, const void* W, void* y,
+void gemm_int8_dequant_then_bf16_fallback(
+    cublasHandle_t cublas_handle,
+    const void* act,
+    const void* w_int8,
+    const float* w_scale_inv,
+    void* y,
     int M, int N, int K,
-    float beta)
+    float beta,
+    cudaStream_t stream)
 {
     auto& ctx = LtCtx::instance();
-    ctx.ensure_init();
-
-    // Inherit the stream from the legacy cuBLAS handle so call-site
-    // ordering is preserved (everything in the forward pass shares one
-    // stream today; defensive in case that changes).
-    cudaStream_t stream = nullptr;
-    if (handle) {
-        // cublasGetStream is the documented way to extract the stream
-        // from the legacy handle. Errors here are non-fatal — null stream
-        // means the default stream, which is what we want anyway.
-        cublasGetStream(handle, &stream);
-    }
-
-    const float alpha = 1.f;
-
-    // Same row-major-as-col-major reinterpretation: A=W (op_T),
-    // B=act (op_N), C=y (col-major NxM, ld=N).
-    LtMatmulDesc desc(CUBLAS_COMPUTE_32F, CUDA_R_32F);
-    const cublasOperation_t op_t = CUBLAS_OP_T;
-    const cublasOperation_t op_n = CUBLAS_OP_N;
-    desc.set(CUBLASLT_MATMUL_DESC_TRANSA, op_t);
-    desc.set(CUBLASLT_MATMUL_DESC_TRANSB, op_n);
-
-    // A: W stored row-major [N, K] = col-major [K, N], lda=K.
-    LtMatrixLayout A(CUDA_R_16BF, /*rows=*/K, /*cols=*/N, /*ld=*/K);
-    // B: act stored row-major [M, K] = col-major [K, M], ldb=K.
-    LtMatrixLayout B(CUDA_R_16BF, /*rows=*/K, /*cols=*/M, /*ld=*/K);
-    // C/D: y stored row-major [M, N] = col-major [N, M], ldc=N.
-    LtMatrixLayout C(CUDA_R_16BF, /*rows=*/N, /*cols=*/M, /*ld=*/N);
-
-    const bool beta_one = (beta != 0.f);
-    LtBf16AlgoKey key{M, N, K, beta_one};
-
-    cublasLtMatmulAlgo_t algo;
-    bool have_algo = false;
-    auto& cache = bf16_algo_cache_();
-    {
-        std::lock_guard<std::mutex> g(cache.mu);
-        auto it = cache.map.find(key);
-        if (it != cache.map.end()) {
-            algo = it->second;
-            have_algo = true;
-        }
-    }
-
-    if (!have_algo) {
-        LtMatmulPref pref;
-        pref.set(CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, ctx.workspace_bytes);
-
-        cublasLtMatmulHeuristicResult_t result{};
-        int returned = 0;
-        const auto hs = cublasLtMatmulAlgoGetHeuristic(
-            ctx.handle, desc.d, A.d, B.d, C.d, C.d, pref.d,
-            /*requestedAlgoCount=*/1, &result, &returned);
-        if (hs != CUBLAS_STATUS_SUCCESS || returned == 0) {
-            // No suitable algo (rare — e.g. unusual K). Fall back to the
-            // legacy gemm path so we never silently emit no-op.
-            const auto status = cublasGemmEx(
-                handle, op_t, op_n, /*m=*/N, /*n=*/M, /*k=*/K,
-                &alpha, W, CUDA_R_16BF, K, act, CUDA_R_16BF, K,
-                &beta,  y, CUDA_R_16BF, N,
-                CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
-            if (status != CUBLAS_STATUS_SUCCESS) {
-                throw std::runtime_error(
-                    "cuBLASLt heuristic + GemmEx fallback both failed for "
-                    "M=" + std::to_string(M) + " N=" + std::to_string(N) +
-                    " K=" + std::to_string(K));
-            }
-            return;
-        }
-        algo = result.algo;
-        std::lock_guard<std::mutex> g(cache.mu);
-        cache.map[key] = algo;
-    }
-
-    LT_CHECK(cublasLtMatmul(
-        ctx.handle, desc.d,
-        &alpha,
-        W,   A.d,
-        act, B.d,
-        &beta,
-        y,   C.d,
-        y,   C.d,
-        &algo,
-        ctx.workspace, ctx.workspace_bytes,
-        stream));
+    const std::size_t weight_elems =
+        static_cast<std::size_t>(N) * static_cast<std::size_t>(K);
+    void* bf16_w = ctx.dequant.ensure(weight_elems * 2);
+    kernels::launch_dequant_int8_to_bf16_per_channel(
+        static_cast<const std::int8_t*>(w_int8),
+        bf16_w,
+        w_scale_inv,
+        N,
+        K,
+        stream);
+    CUDA_CHECK(cudaGetLastError());
+    gemm_bf16_impl(cublas_handle, act, bf16_w, y, M, N, K, beta);
 }
 
 void gemm_fp8_e4m3_w_bf16_act_impl(
@@ -471,7 +399,7 @@ void gemm_fp8_e4m3_w_bf16_act_impl(
     if (!w_scale_fp32_dev) {
         throw std::runtime_error(
             "gemm_act_x_w[FP8_E4M3]: scale pointer is null — "
-            "weight_scale_inv must be registered via LoadedModel::set_quant_meta "
+            "weight_scale_inv must be attached to the materialized WeightStore "
             "as an FP32 device tensor before calling FP8 GEMM");
     }
     auto& ctx = LtCtx::instance();
@@ -562,6 +490,13 @@ void gemm_int8_w_bf16_act_impl(
     auto& ctx = LtCtx::instance();
     ctx.ensure_init();
 
+    if ((M % 4) != 0 || (N % 4) != 0 || (K % 4) != 0) {
+        gemm_int8_dequant_then_bf16_fallback(
+            cublas_handle, act_bf16, w_int8, w_scale_inv,
+            y_bf16, M, N, K, beta, stream);
+        return;
+    }
+
     // Stage 1: per-token activation quant.
     const std::size_t act_int8_bytes =
         static_cast<std::size_t>(M) * static_cast<std::size_t>(K);
@@ -599,10 +534,10 @@ void gemm_int8_w_bf16_act_impl(
         CUBLAS_COMPUTE_32I,
         CUBLAS_GEMM_DEFAULT);
     if (status != CUBLAS_STATUS_SUCCESS) {
-        throw std::runtime_error(
-            "cuBLAS error (" + std::to_string(static_cast<int>(status)) +
-            "): cublasGemmEx[int8 W8A8] M=" + std::to_string(M) +
-            " N=" + std::to_string(N) + " K=" + std::to_string(K));
+        gemm_int8_dequant_then_bf16_fallback(
+            cublas_handle, act_bf16, w_int8, w_scale_inv,
+            y_bf16, M, N, K, beta, stream);
+        return;
     }
 
     // Stage 3: dequant int32 → bf16 with per-row × per-col scales.
@@ -657,6 +592,7 @@ void gemm_act_x_w(
                 "gemm_act_x_w[FP8_E4M3]: scale must be FP32 (got " +
                 std::string(dtype_name(w.scale_dtype)) + ")");
         }
+        validate_quant_weight_view("gemm_act_x_w[FP8_E4M3]", w, N, K);
         gemm_fp8_e4m3_w_bf16_act_impl(handle, act, w.data, w.scale_data,
                                       w.quant_kind,
                                       y, M, N, K, beta, stream);
@@ -676,6 +612,7 @@ void gemm_act_x_w(
                 "gemm_act_x_w[INT8 W8A8]: only PerChannel weight scale "
                 "supported (per-tensor / per-group not yet wired)");
         }
+        validate_quant_weight_view("gemm_act_x_w[INT8 W8A8]", w, N, K);
         gemm_int8_w_bf16_act_impl(
             handle, act, w.data,
             static_cast<const float*>(w.scale_data),
@@ -718,6 +655,42 @@ void gemm_act_x_w(
             "gemm_act_x_w[INT4_PACKED]: marlin is not compiled into this "
             "build (PIE_CUDA_BUILD_MARLIN was OFF). Reconfigure cmake with "
             "-DPIE_CUDA_BUILD_MARLIN=ON to enable W4A16 GEMM.");
+#endif
+    }
+    if (act_dtype == DType::BF16 && w.dtype == DType::MXFP4_PACKED &&
+        y_dtype == DType::BF16) {
+#ifdef PIE_CUDA_HAS_MARLIN
+        cudaStream_t stream = nullptr;
+        cublasGetStream(handle, &stream);
+        if (w.scale_dtype != DType::UINT8) {
+            throw std::runtime_error(
+                "gemm_act_x_w[MXFP4]: scale must be raw E8M0 bytes (got " +
+                std::string(dtype_name(w.scale_dtype)) + ")");
+        }
+        if (w.quant_kind != QuantMeta::Kind::PerGroup || w.group_size != 32) {
+            throw std::runtime_error(
+                "gemm_act_x_w[MXFP4]: expected per-group scales with "
+                "group_size=32");
+        }
+        validate_quant_weight_view("gemm_act_x_w[MXFP4]", w, N, K);
+        const std::size_t mn_bytes =
+            static_cast<std::size_t>(M) * static_cast<std::size_t>(N) * 2;
+        void* dst = (beta == 0.f) ? y : marlin_residual_scratch_(mn_bytes);
+        marlin::launch_mxfp4_gemm_w4a16_bf16(
+            act, w.data, w.scale_data, dst,
+            marlin_fp32_reduce_scratch_(), marlin_workspace_(),
+            M, N, K, stream);
+        if (beta != 0.f) {
+            kernels::launch_residual_add_bf16(
+                y, dst,
+                static_cast<std::size_t>(M) * static_cast<std::size_t>(N),
+                stream);
+        }
+        return;
+#else
+        throw std::runtime_error(
+            "gemm_act_x_w[MXFP4]: native MXFP4 GEMM was selected but "
+            "marlin is not compiled into this build");
 #endif
     }
     unsupported("gemm_act_x_w", act_dtype, w.dtype, y_dtype);

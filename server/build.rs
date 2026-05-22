@@ -24,6 +24,12 @@ fn main() {
     let cuda = cfg!(feature = "driver-cuda");
     println!("cargo:rerun-if-changed=../driver/common/include");
     println!("cargo:rerun-if-changed=../driver/common/src");
+    if cuda {
+        println!("cargo:rerun-if-changed=../driver/cuda/CMakeLists.txt");
+        println!("cargo:rerun-if-changed=../driver/cuda/cmake");
+        println!("cargo:rerun-if-changed=../driver/cuda/include");
+        println!("cargo:rerun-if-changed=../driver/cuda/src");
+    }
 
     if portable {
         build_portable();
@@ -254,6 +260,8 @@ fn build_cuda() {
     }
 
     let driver_dir = PathBuf::from("../driver/cuda");
+    println!("cargo:rerun-if-changed=../driver/cuda/CMakeLists.txt");
+    println!("cargo:rerun-if-changed=../driver/cuda/src");
 
     let mut cfg = cmake::Config::new(&driver_dir);
     // See `build_portable` — per-flavor out_dir keeps the two CMake
@@ -263,6 +271,20 @@ fn build_cuda() {
         .define("BUILD_SHARED_LIBS", "OFF")
         .define("PIE_BRIDGE_INCLUDE_DIR", pie_bridge_include_dir());
     enable_position_independent_archives(&mut cfg);
+
+    // Optional Marlin W4A16 support. Keep it off by default because the
+    // vendored template kernels add substantial build time, but let Cargo
+    // builds opt into the same CMake path used by standalone driver builds.
+    println!("cargo:rerun-if-env-changed=PIE_CUDA_BUILD_MARLIN");
+    if let Ok(value) = std::env::var("PIE_CUDA_BUILD_MARLIN") {
+        let enabled = matches!(
+            value.to_ascii_lowercase().as_str(),
+            "1" | "on" | "true" | "yes"
+        );
+        if enabled {
+            cfg.define("PIE_CUDA_BUILD_MARLIN", "ON");
+        }
+    }
 
     // nvcc discovery. CMake reads `CMAKE_CUDA_COMPILER` / `CUDACXX` to
     // locate nvcc; some toolchains install CUDA under `/usr/local/cuda`

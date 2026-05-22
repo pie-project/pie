@@ -45,9 +45,7 @@ class DriverCapabilities:
     total_pages: int
 
     # Block size in tokens that the chosen attention kernel actually uses.
-    # The user's `ModelConfig.kv_page_size` is a *preference*; the driver
-    # may resolve to a different value (e.g., FlashInfer requires 16/32/64).
-    # Forwarded to Rust as ModelConfig.kv_page_size.
+    # Resolved by the driver and forwarded to Rust as ModelConfig.kv_page_size.
     kv_page_size: int
 
     # Pinned host-side KV slot count for swap-out. 0 = swap disabled.
@@ -78,6 +76,12 @@ class DriverCapabilities:
 
     # Resolved activation dtype, never "auto". Currently Python-only.
     activation_dtype: str
+
+    # Runtime-managed recurrent-state cache for linear-attention models.
+    # KV-only models report required=False and slots=0.
+    rs_cache_required: bool = False
+    rs_cache_slots: int = 0
+    rs_cache_slot_bytes: int = 0
 
     # ── Feature support ────────────────────────────────────────────────
     # Whether the driver implements user-supplied attention masks (i.e.,

@@ -10,11 +10,11 @@
 use std::ptr;
 
 use pie_bridge::{
-    AdapterBinding, AdapterOp, AdapterRequest, CopyDir, CopyRequest, ForwardRequest, Frame,
-    PIE_ADAPTER_OP_LOAD, PIE_COPY_DIR_D2H, PIE_REQUEST_PAYLOAD_FORWARD, PIE_REQUEST_PAYLOAD_HEALTH,
-    PIE_SAMPLER_LOGPROBS, PIE_SAMPLER_MULTINOMIAL, PIE_SAMPLER_TOP_K, RequestPayload, Sampler,
-    pie_adapter_request_view, pie_copy_request_view, pie_forward_request_view, pie_frame_view,
-    pie_request_payload_view, pie_sampler_view,
+    AdapterBinding, AdapterOp, AdapterRequest, CopyDir, CopyRequest, CopyResource, ForwardRequest,
+    Frame, PIE_ADAPTER_OP_LOAD, PIE_COPY_DIR_D2H, PIE_REQUEST_PAYLOAD_FORWARD,
+    PIE_REQUEST_PAYLOAD_HEALTH, PIE_SAMPLER_LOGPROBS, PIE_SAMPLER_MULTINOMIAL, PIE_SAMPLER_TOP_K,
+    RequestPayload, Sampler, pie_adapter_request_view, pie_copy_request_view,
+    pie_forward_request_view, pie_frame_view, pie_request_payload_view, pie_sampler_view,
 };
 
 #[test]
@@ -99,6 +99,7 @@ fn copy_request_view_unit_enum_field() {
         dir: CopyDir::D2H,
         srcs: vec![1, 2, 3],
         dsts: vec![10, 20, 30],
+        resource: CopyResource::Kv,
     };
     let view = pie_copy_request_view(&cr);
     // Unit enum field is u8 (matches PieCopyDirDesc = u8).

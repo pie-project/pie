@@ -86,6 +86,38 @@ impl Session {
                         format!("{}.avg_batch_latency_us", model_name),
                         serde_json::Value::from(inf.avg_batch_latency_us),
                     );
+                    stats.insert(
+                        format!("{}.avg_permit_wait_us", model_name),
+                        serde_json::Value::from(inf.avg_permit_wait_us),
+                    );
+                    stats.insert(
+                        format!("{}.avg_fire_prepare_us", model_name),
+                        serde_json::Value::from(inf.avg_fire_prepare_us),
+                    );
+                    stats.insert(
+                        format!("{}.avg_execute_batch_us", model_name),
+                        serde_json::Value::from(inf.avg_execute_batch_us),
+                    );
+                    stats.insert(
+                        format!("{}.avg_batch_build_us", model_name),
+                        serde_json::Value::from(inf.avg_batch_build_us),
+                    );
+                    stats.insert(
+                        format!("{}.avg_driver_fire_us", model_name),
+                        serde_json::Value::from(inf.avg_driver_fire_us),
+                    );
+                    stats.insert(
+                        format!("{}.avg_response_dispatch_us", model_name),
+                        serde_json::Value::from(inf.avg_response_dispatch_us),
+                    );
+                    stats.insert(
+                        format!("{}.avg_context_tick_submit_us", model_name),
+                        serde_json::Value::from(inf.avg_context_tick_submit_us),
+                    );
+                    stats.insert(
+                        format!("{}.avg_stats_update_us", model_name),
+                        serde_json::Value::from(inf.avg_stats_update_us),
+                    );
                     // Speculation hit counters — observability for
                     // `try_hit`/chain submissions/drops.
                     stats.insert(

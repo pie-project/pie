@@ -167,11 +167,12 @@ def add_mode_subcommands(parser: argparse.ArgumentParser) -> None:
     latency = sub.add_parser("latency", help="single-request latency")
     add_common_args(latency)
     latency.add_argument("--requests", type=int, default=16)
-    latency.set_defaults(num_requests=0)
+    latency.set_defaults(num_requests=0, concurrency=1)
 
     tput = sub.add_parser("tput", help="many-request throughput")
     add_common_args(tput)
     tput.add_argument("--num-requests", type=int, default=512)
+    tput.add_argument("--concurrency", type=int, default=128)
     tput.set_defaults(requests=0)
 
 
@@ -185,11 +186,21 @@ def add_common_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--ignore-eos", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--unique-prompts", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--warmup", type=int, default=2)
+    p.add_argument(
+        "--warmup-max-tokens",
+        type=int,
+        default=None,
+        help="Override max_tokens only for warmup requests.",
+    )
     p.add_argument("--json-out", default=None)
     p.add_argument("--request-timeout", type=float, default=300.0)
     p.add_argument("--tp-size", type=int, default=1)
     p.add_argument("--gpu-mem-util", type=float, default=0.90)
     p.add_argument("--max-model-len", type=int, default=2048)
+    p.add_argument("--sglang-attention-backend", default=None)
+    p.add_argument("--sglang-sampling-backend", default=None)
+    p.add_argument("--sglang-disable-cuda-graph", action=argparse.BooleanOptionalAction, default=False)
+    p.add_argument("--sglang-disable-piecewise-cuda-graph", action=argparse.BooleanOptionalAction, default=False)
     p.add_argument(
         "--wasm-delay-us",
         type=int,
@@ -223,6 +234,23 @@ def hf_chat_prompts_and_counts(
     ]
     counts = [len(tok.encode(p, add_special_tokens=False)) for p in rendered]
     return rendered, counts
+
+
+def hf_chat_token_ids_and_counts(
+    model: str, system: str, prompts: list[str]
+) -> tuple[list[list[int]], list[int]]:
+    from transformers import AutoTokenizer
+    tok = AutoTokenizer.from_pretrained(model, trust_remote_code=True)
+    rendered = [
+        tok.apply_chat_template(
+            [{"role": "system", "content": system}, {"role": "user", "content": p}],
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+        for p in prompts
+    ]
+    token_ids = [tok.encode(p, add_special_tokens=False) for p in rendered]
+    return token_ids, [len(ids) for ids in token_ids]
 
 
 def finish(summary: BenchSummary, results: list[RequestResult], json_out: str | None) -> None:

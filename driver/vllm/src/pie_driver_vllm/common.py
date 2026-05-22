@@ -4,6 +4,7 @@ Common modeling components for the Pie driver.
 
 from __future__ import annotations
 
+import os
 import torch
 import torch.nn.functional as F
 import numpy as np
@@ -34,6 +35,101 @@ if torch.cuda.is_available():
     ).multi_processor_count
 else:
     NUM_SM = 108
+
+PROFILE = bool(os.environ.get("PIE_VLLM_GPU_PROFILE"))
+ASYNC_TOKEN_COPY = os.environ.get("PIE_VLLM_ASYNC_TOKEN_COPY", "1").lower() not in {
+    "0",
+    "false",
+    "no",
+    "off",
+}
+SCRUB_NANS = bool(os.environ.get("PIE_VLLM_SCRUB_NANS"))
+_PINNED_TOKEN_BUFFERS: dict[tuple[int, tuple[int, ...]], list[torch.Tensor]] = {}
+_PINNED_TOKEN_CURSOR: dict[tuple[int, tuple[int, ...]], int] = {}
+_TOKEN_COPY_STREAMS: dict[int, torch.cuda.Stream] = {}
+_PINNED_TOKEN_POOL_SIZE = max(
+    1,
+    int(
+        os.environ.get(
+            "PIE_VLLM_PINNED_TOKEN_POOL",
+            "4" if os.environ.get("PIE_VLLM_DRIVER_CHAIN") else "1",
+        )
+    ),
+)
+
+
+class AsyncTokenArray:
+    """Pinned host copy of sampled token ids.
+
+    The response builder is the first consumer that truly needs CPU-visible
+    tokens. Keeping the handoff as a pinned int32 tensor avoids per-token Python
+    int materialization in the hot path and lets host-side bookkeeping overlap
+    with the device-to-host copy.
+    """
+
+    def __init__(self, token_tensor: torch.Tensor, cpu_buffer: torch.Tensor):
+        if not token_tensor.is_cuda:
+            raise ValueError("AsyncTokenArray requires a CUDA tensor")
+        self._gpu = token_tensor
+        self._cpu = cpu_buffer
+        self._event = torch.cuda.Event()
+        device_index = token_tensor.device.index
+        if device_index is None:
+            device_index = torch.cuda.current_device()
+        copy_stream = _TOKEN_COPY_STREAMS.get(int(device_index))
+        if copy_stream is None:
+            copy_stream = torch.cuda.Stream(device=token_tensor.device)
+            _TOKEN_COPY_STREAMS[int(device_index)] = copy_stream
+        default_stream = torch.cuda.current_stream(token_tensor.device)
+        with torch.cuda.stream(copy_stream):
+            copy_stream.wait_stream(default_stream)
+            self._cpu.copy_(token_tensor, non_blocking=True)
+            self._event.record(copy_stream)
+        self._np_u32: np.ndarray | None = None
+
+    def _ready(self) -> None:
+        self._event.synchronize()
+
+    def to_numpy_u32(self) -> np.ndarray:
+        self._ready()
+        if self._np_u32 is None:
+            self._np_u32 = self._cpu.numpy().view(np.uint32)
+        return self._np_u32
+
+    def tolist(self) -> list[int]:
+        return self.to_numpy_u32().tolist()
+
+    def gpu_tensor(self) -> torch.Tensor:
+        return self._gpu
+
+    def __len__(self) -> int:
+        return int(self._cpu.numel())
+
+    def __getitem__(self, item):
+        return self.to_numpy_u32()[item]
+
+
+def host_tokens(token_tensor: torch.Tensor):
+    if ASYNC_TOKEN_COPY and token_tensor.is_cuda:
+        device_index = token_tensor.device.index
+        if device_index is None:
+            device_index = torch.cuda.current_device()
+        key = (int(device_index), tuple(int(s) for s in token_tensor.shape))
+        pool = _PINNED_TOKEN_BUFFERS.setdefault(key, [])
+        if len(pool) < _PINNED_TOKEN_POOL_SIZE:
+            cpu_buffer = torch.empty(
+                token_tensor.shape,
+                dtype=torch.int32,
+                device="cpu",
+                pin_memory=True,
+            )
+            pool.append(cpu_buffer)
+        else:
+            cursor = _PINNED_TOKEN_CURSOR.get(key, 0)
+            cpu_buffer = pool[cursor]
+            _PINNED_TOKEN_CURSOR[key] = (cursor + 1) % len(pool)
+        return AsyncTokenArray(token_tensor, cpu_buffer)
+    return token_tensor.tolist()
 
 
 # Sampler type IDs (must agree with Rust `Sampler::type_id()`):
@@ -103,22 +199,70 @@ def sample_common(
 
     # Stage 1: Compute logits via LM head.
     # We deliberately skip an explicit `torch.isnan(...).any()` check here:
-    # the reduction forced a CPU↔GPU sync on every fire_batch, and pre-trained
-    # weights don't produce NaNs in normal inference. `torch.nan_to_num` below
-    # still scrubs any stray NaN as a defense-in-depth.
-    logits_input = hidden_states[indices_for_logits]
+    # the reduction forced a CPU/GPU sync on every fire_batch, and pre-trained
+    # weights don't produce NaNs in normal inference. The optional scrub remains
+    # for debugging pathological models, but the default matches vLLM's hot path.
+    if sampling_metadata.get("all_logits_in_order", False):
+        logits_input = hidden_states
+    else:
+        logits_input = hidden_states[indices_for_logits]
     nan_indices: list[int] = []
-    logits_input = torch.nan_to_num(logits_input)
+    if SCRUB_NANS:
+        logits_input = torch.nan_to_num(logits_input)
 
     # Apply lm_head_fn
+    profile_events = None
+    if PROFILE and logits_input.is_cuda:
+        profile_events = {"start": torch.cuda.Event(enable_timing=True)}
+        profile_events["start"].record()
     logits = lm_head_fn(logits_input)
+    if profile_events is not None:
+        profile_events["lm_head"] = torch.cuda.Event(enable_timing=True)
+        profile_events["lm_head"].record()
 
     # Apply sampling mask
     if (sampling_masks := sampling_metadata.get("sampling_masks")) is not None:
         logits.masked_fill_(~sampling_masks, -float("inf"))
+    if profile_events is not None:
+        profile_events["mask"] = torch.cuda.Event(enable_timing=True)
+        profile_events["mask"].record()
 
     sampler_groups = sampling_metadata["sampler_groups"]
     num_logit_requests = len(indices_for_logits)
+
+    if (
+        sampling_metadata.get("all_temperatures_greedy", False)
+        and sampler_groups
+        and all(idx in TOKEN_SAMPLING_TYPES for idx in sampler_groups)
+    ):
+        # Temperature 0 token samplers collapse to greedy decoding. Avoid
+        # full-vocab softmax + FlashInfer sampling in the common benchmark and
+        # production-greedy path; masks have already been applied to logits.
+        token_tensor = logits.argmax(dim=-1)
+        if profile_events is not None:
+            profile_events["argmax"] = torch.cuda.Event(enable_timing=True)
+            profile_events["argmax"].record()
+        tokens = host_tokens(token_tensor)
+        if profile_events is not None:
+            sampling_metadata["_sample_profile"] = {
+                "gpu_lm_head": profile_events["start"].elapsed_time(
+                    profile_events["lm_head"]
+                ) / 1000.0,
+                "gpu_mask": profile_events["lm_head"].elapsed_time(
+                    profile_events["mask"]
+                ) / 1000.0,
+                "gpu_argmax": profile_events["mask"].elapsed_time(
+                    profile_events["argmax"]
+                ) / 1000.0,
+            }
+        return {
+            "tokens": tokens,
+            "dists": [None] * num_logit_requests,
+            "logits": [None] * num_logit_requests,
+            "logprobs": [None] * num_logit_requests,
+            "entropies": [None] * num_logit_requests,
+            "nan_indices": nan_indices,
+        }
 
     needs_probs = any(idx in NEEDS_PROBS_TYPES for idx in sampler_groups)
     needs_log_probs = any(idx in LOGPROB_TYPES for idx in sampler_groups)

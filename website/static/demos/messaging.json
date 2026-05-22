@@ -4,7 +4,8 @@
   "tagline": "In Pie the engine hosts topics. User code publishes and subscribes through the broker, so producers and consumers hand off work without a conductor process pulling and pushing. This recording runs the three stages in one inferlet for a reproducible one-shot demo.",
   "question": "3-stage writer's room: idea → plot → dialogue over engine topics.",
   "naive": {
-    "label": "Naive",
+    "label": "With Stock API",
+    "note": "(via vLLM/SGLang/llama.cpp)",
     "sublabel": "client-orchestrated — every hop costs a round-trip",
     "tone": "warn",
     "events": [
@@ -66,7 +67,7 @@
     ]
   },
   "pie": {
-    "label": "Pie",
+    "label": "With Pie",
     "sublabel": "messaging::broadcast / subscribe — direct in-engine hops",
     "tone": "good",
     "events": [

@@ -27,6 +27,31 @@ else:
     import flashinfer as _backend  # type: ignore[import-not-found]
 
 
+def append_paged_kv_cache_with_format(
+    *,
+    append_key,
+    append_value,
+    paged_kv_cache,
+    **kwargs,
+):
+    from pie_driver_dev.kv_cache import (
+        format_for_tensor,
+        quantize_dequantize_for_cache,
+    )
+
+    fmt = format_for_tensor(paged_kv_cache)
+    if not fmt.is_native:
+        append_key, append_value = quantize_dequantize_for_cache(
+            append_key, append_value, fmt
+        )
+    return _backend.append_paged_kv_cache(
+        append_key=append_key,
+        append_value=append_value,
+        paged_kv_cache=paged_kv_cache,
+        **kwargs,
+    )
+
+
 def __getattr__(name: str):
     try:
         return getattr(_backend, name)

@@ -29,12 +29,14 @@ namespace pie_cuda_driver::ops {
 struct WeightView {
     const void* data = nullptr;
     DType       dtype = DType::BF16;
+    std::size_t nbytes = 0;
 
     // Quant metadata. `scale_data == nullptr` means "no quant — bf16 path".
     // For per-channel / per-group quant the dispatcher reads the layout
     // hints from `kind`, `group_size`, `channel_axis`.
     const void*       scale_data = nullptr;
     DType             scale_dtype = DType::FP32;
+    std::size_t       scale_numel = 0;
     QuantMeta::Kind   quant_kind = QuantMeta::Kind::PerTensor;
     const void*       zero_point_data = nullptr;
     int               group_size = 0;
@@ -44,7 +46,8 @@ struct WeightView {
 
     // Implicit conversion from a plain DeviceTensor — preserves call-site
     // terseness for the unquantized path (the 99% case in M0).
-    WeightView(const DeviceTensor& t) : data(t.data()), dtype(t.dtype()) {}
+    WeightView(const DeviceTensor& t)
+        : data(t.data()), dtype(t.dtype()), nbytes(t.nbytes()) {}
 
     // Raw pointer + dtype, for buffers without a DeviceTensor handle
     // (deinterleaved MoE scratch, expert pointer arrays).
@@ -58,12 +61,31 @@ struct WeightView {
         WeightView v;
         v.data = weight.data();
         v.dtype = weight.dtype();
+        v.nbytes = weight.nbytes();
         v.scale_data = meta.scale ? meta.scale->data() : nullptr;
         v.scale_dtype = meta.scale ? meta.scale->dtype() : DType::FP32;
+        v.scale_numel = meta.scale ? meta.scale->numel() : 0;
         v.quant_kind = meta.kind;
         v.zero_point_data = meta.zero_point ? meta.zero_point->data() : nullptr;
         v.group_size = meta.group_size;
         v.channel_axis = meta.channel_axis;
+        return v;
+    }
+
+    static WeightView mxfp4_marlin(
+        const DeviceTensor& weight,
+        const DeviceTensor& scale)
+    {
+        WeightView v;
+        v.data = weight.data();
+        v.dtype = DType::MXFP4_PACKED;
+        v.nbytes = weight.nbytes();
+        v.scale_data = scale.data();
+        v.scale_dtype = DType::UINT8;
+        v.scale_numel = scale.numel();
+        v.quant_kind = QuantMeta::Kind::PerGroup;
+        v.group_size = 32;
+        v.channel_axis = 0;
         return v;
     }
 };

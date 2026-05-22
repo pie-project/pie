@@ -35,10 +35,10 @@ activation_dtype = "bfloat16"
 
 [model.driver.options]
 gpu_mem_utilization = 0.90
-memory_profile = "balanced"
+memory_profile = "auto"
 ```
 
-`memory_profile` may be `latency`, `balanced`, `throughput`, or `capacity`.
+`memory_profile` may be `auto`, `latency`, `balanced`, `throughput`, or `capacity`.
 The driver derives forward capacity, Qwen3.5 state slots, and KV pages after
 weights load.
 

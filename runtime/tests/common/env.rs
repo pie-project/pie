@@ -74,10 +74,15 @@ pub fn create_mock_env(
         .map(|_| DriverConfig {
             total_pages: num_pages,
             cpu_pages: 0,
+            rs_cache_required: false,
+            rs_cache_slots: 0,
+            rs_cache_slot_bytes: 0,
             limits: pie::driver::SchedulerLimits {
                 max_forward_requests: 32,
                 max_forward_tokens: 4096,
                 max_page_refs: num_pages,
+                max_logit_rows: usize::MAX,
+                max_prob_rows: usize::MAX,
                 max_sampler_rows: usize::MAX,
                 max_custom_mask_bytes: usize::MAX,
                 max_logprob_labels: usize::MAX,

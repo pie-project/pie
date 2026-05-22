@@ -20,9 +20,39 @@
 
 namespace pie_cuda_driver {
 
+namespace {
+
+std::vector<std::int64_t> normalize_slices(
+    const TensorInfo& ti,
+    const std::vector<TensorSlice>& slices,
+    const std::string& name,
+    std::vector<std::int64_t>& start)
+{
+    const auto rank = static_cast<int>(ti.shape.size());
+    start.assign(ti.shape.size(), 0);
+    std::vector<std::int64_t> shape = ti.shape;
+    for (const auto& slice : slices) {
+        if (slice.axis < 0 || slice.axis >= rank) {
+            throw std::runtime_error(
+                "safetensors: slice axis out of range for '" + name + "'");
+        }
+        if (slice.start < 0 || slice.length <= 0 ||
+            slice.start + slice.length >
+                ti.shape[static_cast<std::size_t>(slice.axis)]) {
+            throw std::runtime_error(
+                "safetensors: slice range out of bounds for '" + name + "'");
+        }
+        start[static_cast<std::size_t>(slice.axis)] = slice.start;
+        shape[static_cast<std::size_t>(slice.axis)] = slice.length;
+    }
+    return shape;
+}
+
+}  // namespace
+
 // Parse a single shard's JSON header into TensorInfo entries. Mutates the
 // caller's `index_` and `total_bytes_`.
-void SafetensorsLoader::parse_shard_header_(
+void SafetensorsCheckpointSource::parse_shard_header_(
     Shard& s,
     std::uint32_t shard_id,
     std::unordered_map<std::string, TensorInfo>& index,
@@ -71,8 +101,8 @@ void SafetensorsLoader::parse_shard_header_(
     }
 }
 
-SafetensorsLoader SafetensorsLoader::open(const std::filesystem::path& snapshot_dir) {
-    SafetensorsLoader loader;
+SafetensorsCheckpointSource SafetensorsCheckpointSource::open(const std::filesystem::path& snapshot_dir) {
+    SafetensorsCheckpointSource loader;
     const auto manifest =
         pie_driver_common::discover_safetensors_manifest(
             snapshot_dir,
@@ -92,7 +122,7 @@ SafetensorsLoader SafetensorsLoader::open(const std::filesystem::path& snapshot_
     return loader;
 }
 
-SafetensorsLoader::~SafetensorsLoader() {
+SafetensorsCheckpointSource::~SafetensorsCheckpointSource() {
     for (auto& s : shards_) {
         if (s.data && s.mapped_size) {
             munmap(const_cast<std::uint8_t*>(s.data), s.mapped_size);
@@ -103,7 +133,7 @@ SafetensorsLoader::~SafetensorsLoader() {
     }
 }
 
-void SafetensorsLoader::open_shard_(Shard& s) const {
+void SafetensorsCheckpointSource::open_shard_(Shard& s) const {
     if (s.data) return;
     auto& m = const_cast<Shard&>(s);
     m.fd = ::open(s.path.c_str(), O_RDONLY);
@@ -128,7 +158,7 @@ void SafetensorsLoader::open_shard_(Shard& s) const {
     ::madvise(p, m.mapped_size, MADV_SEQUENTIAL);
 }
 
-std::vector<std::string> SafetensorsLoader::tensor_names() const {
+std::vector<std::string> SafetensorsCheckpointSource::tensor_names() const {
     std::vector<std::string> out;
     out.reserve(index_.size());
     for (const auto& [k, _] : index_) out.push_back(k);
@@ -136,7 +166,7 @@ std::vector<std::string> SafetensorsLoader::tensor_names() const {
     return out;
 }
 
-const TensorInfo& SafetensorsLoader::info(const std::string& name) const {
+const TensorInfo& SafetensorsCheckpointSource::info(const std::string& name) const {
     auto it = index_.find(name);
     if (it == index_.end()) {
         throw std::runtime_error("tensor not found in safetensors: " + name);
@@ -144,28 +174,84 @@ const TensorInfo& SafetensorsLoader::info(const std::string& name) const {
     return it->second;
 }
 
-DeviceTensor SafetensorsLoader::load_to_device(const std::string& name) {
+TensorStorageInfo SafetensorsCheckpointSource::storage_info(const std::string& name) const {
     const auto& ti = info(name);
+    const auto& shard = shards_.at(ti.shard_id);
+    return TensorStorageInfo{
+        .path = shard.path,
+        .file_offset = shard.data_section_offset + ti.data_offset,
+        .nbytes = ti.nbytes,
+        .shard_id = ti.shard_id,
+    };
+}
+
+void SafetensorsCheckpointSource::copy_to_device(
+    const std::string& name,
+    void* dst,
+    const std::vector<std::int64_t>& dst_shape)
+{
+    const auto& ti = info(name);
+    if (dst == nullptr) {
+        throw std::runtime_error(
+            "safetensors: null destination for tensor '" + name + "'");
+    }
+    if (dst_shape != ti.shape) {
+        throw std::runtime_error(
+            "safetensors: destination shape mismatch for tensor '" + name + "'");
+    }
     auto& shard = shards_[ti.shard_id];
     if (!shard.data) open_shard_(shard);
 
-    auto t = DeviceTensor::allocate(ti.dtype, ti.shape);
-
     const auto* host_src = shard.data + shard.data_section_offset + ti.data_offset;
-    CUDA_CHECK(cudaMemcpy(t.data(), host_src, ti.nbytes, cudaMemcpyHostToDevice));
-    return t;
+    CUDA_CHECK(cudaMemcpy(dst, host_src, ti.nbytes, cudaMemcpyHostToDevice));
 }
 
-DeviceTensor SafetensorsLoader::load_to_device_sharded(
-    const std::string& name, int axis, int rank, int world_size)
+void SafetensorsCheckpointSource::copy_storage_bytes_to_device(
+    std::uint32_t shard_id,
+    std::uint64_t file_offset,
+    std::uint64_t span_bytes,
+    void* dst)
+{
+    if (dst == nullptr) {
+        throw std::runtime_error("safetensors: null destination for byte range");
+    }
+    if (shard_id >= shards_.size()) {
+        throw std::runtime_error("safetensors: byte range shard id out of range");
+    }
+    auto& shard = shards_[shard_id];
+    if (!shard.data) open_shard_(shard);
+    if (file_offset > shard.mapped_size ||
+        span_bytes > shard.mapped_size - file_offset) {
+        throw std::runtime_error("safetensors: byte range exceeds shard size");
+    }
+    CUDA_CHECK(cudaMemcpy(
+        dst,
+        shard.data + file_offset,
+        span_bytes,
+        cudaMemcpyHostToDevice));
+}
+
+void SafetensorsCheckpointSource::copy_shard_to_device(
+    const std::string& name,
+    int axis,
+    int rank,
+    int world_size,
+    void* dst,
+    const std::vector<std::int64_t>& dst_shape)
 {
     if (world_size <= 1 || axis < 0) {
-        return load_to_device(name);
+        copy_to_device(name, dst, dst_shape);
+        return;
     }
 
     const auto& ti = info(name);
     const auto plan = pie_driver_common::plan_axis_shard(
-        ti.shape, axis, rank, world_size, "load_to_device_sharded: " + name);
+        ti.shape, axis, rank, world_size, "copy_shard_to_device: " + name);
+    if (plan.output_shape != dst_shape) {
+        throw std::runtime_error(
+            "safetensors: destination shape mismatch for sharded tensor '" +
+            name + "'");
+    }
     const std::int64_t shard_dim = plan.shard_dim;
 
     auto& shard = shards_[ti.shard_id];
@@ -173,167 +259,213 @@ DeviceTensor SafetensorsLoader::load_to_device_sharded(
     const auto* host_base = shard.data + shard.data_section_offset + ti.data_offset;
     const std::size_t elem = dtype_bytes(ti.dtype);
 
-    auto t = DeviceTensor::allocate(ti.dtype, plan.output_shape);
-
     if (axis == 0) {
         // Contiguous slice along the leading dim: rank `r` owns bytes
         // [r*per_rank, (r+1)*per_rank).
-        const std::size_t per_rank = ti.nbytes / world_size;
-        const auto* host_src = host_base + per_rank * rank;
-        CUDA_CHECK(cudaMemcpy(t.data(), host_src, per_rank,
-                              cudaMemcpyHostToDevice));
+        std::int64_t inner = 1;
+        for (std::size_t i = 1; i < ti.shape.size(); ++i) {
+            inner *= ti.shape[i];
+        }
+        const std::size_t bytes =
+            static_cast<std::size_t>(shard_dim) *
+            static_cast<std::size_t>(inner) * elem;
+        const auto* host_src =
+            host_base + static_cast<std::size_t>(plan.offset) *
+                            static_cast<std::size_t>(inner) * elem;
+        CUDA_CHECK(cudaMemcpy(dst, host_src, bytes, cudaMemcpyHostToDevice));
     } else {
-        // 2-D row-parallel: keep all rows (d0) but only this rank's column
-        // band on the inner dim (d1). Use a 2-D pitched copy: each row is
-        // (d1/world_size) elements wide, source pitch is d1 elements.
-        const std::int64_t d0 = ti.shape[0];
-        const std::int64_t d1 = ti.shape[1];
-        const std::size_t row_bytes = static_cast<std::size_t>(shard_dim) * elem;
-        const std::size_t src_pitch = static_cast<std::size_t>(d1) * elem;
-        const std::size_t dst_pitch = row_bytes;
-        const auto* host_src = host_base + (row_bytes * rank);
-        CUDA_CHECK(cudaMemcpy2D(
-            t.data(), dst_pitch,
-            host_src, src_pitch,
-            row_bytes, static_cast<std::size_t>(d0),
-            cudaMemcpyHostToDevice));
-        (void)d1;
+        copy_strided_to_device(
+            name,
+            {TensorSlice{axis, plan.offset, shard_dim}},
+            dst,
+            dst_shape);
     }
-    return t;
 }
 
-DeviceTensor SafetensorsLoader::load_to_device_row_range_sharded(
+void SafetensorsCheckpointSource::copy_slice_to_device(
     const std::string& name,
-    std::int64_t row_offset, std::int64_t rows,
-    int rank, int world_size)
+    int axis,
+    std::int64_t start,
+    std::int64_t length,
+    void* dst,
+    const std::vector<std::int64_t>& dst_shape)
+{
+    copy_strided_to_device(
+        name,
+        {TensorSlice{axis, start, length}},
+        dst,
+        dst_shape);
+}
+
+void SafetensorsCheckpointSource::copy_strided_to_device(
+    const std::string& name,
+    const std::vector<TensorSlice>& slices,
+    void* dst,
+    const std::vector<std::int64_t>& dst_shape)
 {
     const auto& ti = info(name);
-    if (ti.shape.size() != 2) {
-        throw std::runtime_error("load_to_device_row_range_sharded: " + name +
-                                 " must be 2-D, got rank " +
-                                 std::to_string(ti.shape.size()));
+    if (dst == nullptr) {
+        throw std::runtime_error(
+            "safetensors: null destination for sliced tensor '" + name + "'");
     }
-    const std::int64_t total_rows = ti.shape[0];
-    const auto plan = pie_driver_common::plan_row_range_shard(
-        total_rows, row_offset, rows, rank, world_size,
-        "load_to_device_row_range_sharded: " + name);
-    const std::int64_t cols = ti.shape[1];
-    const std::int64_t shard_rows = plan.rows;
+    if (slices.empty()) {
+        copy_to_device(name, dst, dst_shape);
+        return;
+    }
+
+    std::vector<std::int64_t> start;
+    const auto shape = normalize_slices(ti, slices, name, start);
+    if (shape != dst_shape) {
+        throw std::runtime_error(
+            "safetensors: destination shape mismatch for sliced tensor '" +
+            name + "'");
+    }
 
     auto& shard = shards_[ti.shard_id];
     if (!shard.data) open_shard_(shard);
     const auto* host_base = shard.data + shard.data_section_offset + ti.data_offset;
     const std::size_t elem = dtype_bytes(ti.dtype);
+    const auto rank = static_cast<int>(ti.shape.size());
 
-    // Per-rank start row within the file. Each rank gets a contiguous
-    // slab of `shard_rows` rows from the requested range.
-    const std::int64_t my_row_start = plan.row_start;
-    const std::size_t bytes = static_cast<std::size_t>(shard_rows) *
-                              static_cast<std::size_t>(cols) * elem;
-    const auto* host_src = host_base + static_cast<std::size_t>(my_row_start) *
-                                       static_cast<std::size_t>(cols) * elem;
-
-    auto t = DeviceTensor::allocate(ti.dtype, {shard_rows, cols});
-    CUDA_CHECK(cudaMemcpy(t.data(), host_src, bytes, cudaMemcpyHostToDevice));
-    return t;
-}
-
-DeviceTensor SafetensorsLoader::load_to_device_moe_gate_up_sharded(
-    const std::string& name, int rank, int world_size)
-{
-    const auto& ti = info(name);
-    if (ti.shape.size() != 3) {
-        throw std::runtime_error("load_to_device_moe_gate_up_sharded: " + name +
-                                 " must be 3-D [E, 2*Im, H]");
+    std::vector<std::int64_t> source_strides(ti.shape.size(), 1);
+    for (int axis = rank - 2; axis >= 0; --axis) {
+        source_strides[static_cast<std::size_t>(axis)] =
+            source_strides[static_cast<std::size_t>(axis + 1)] *
+            ti.shape[static_cast<std::size_t>(axis + 1)];
     }
-    pie_driver_common::validate_rank(
-        rank, world_size, "load_to_device_moe_gate_up_sharded: " + name);
-    const std::int64_t E       = ti.shape[0];
-    const std::int64_t two_Im  = ti.shape[1];
-    const std::int64_t H       = ti.shape[2];
-    if (two_Im % 2 != 0 || (two_Im / 2) % world_size != 0) {
-        throw std::runtime_error(
-            "load_to_device_moe_gate_up_sharded: 2*Im=" + std::to_string(two_Im) +
-            " must be even and Im divisible by world_size=" + std::to_string(world_size));
-    }
-    const std::int64_t Im       = two_Im / 2;
-    const std::int64_t Im_local = Im / world_size;
 
-    auto& shard = shards_[ti.shard_id];
-    if (!shard.data) open_shard_(shard);
-    const auto* host_base = shard.data + shard.data_section_offset + ti.data_offset;
-    const std::size_t elem      = dtype_bytes(ti.dtype);
-    const std::size_t row_bytes = static_cast<std::size_t>(H) * elem;
-    const std::size_t local_block_rows = static_cast<std::size_t>(Im_local);
+    auto* dst_base = static_cast<std::uint8_t*>(dst);
+    const std::int64_t inner = shape.empty() ? 1 : shape.back();
+    const std::size_t contiguous_bytes =
+        static_cast<std::size_t>(inner) * elem;
 
-    auto t = DeviceTensor::allocate(ti.dtype, {E, 2 * Im_local, H});
-    auto* dst = static_cast<std::uint8_t*>(t.data());
-
-    for (std::int64_t e = 0; e < E; ++e) {
-        // gate block: file rows [e*two_Im + rank*Im_local, +Im_local)
-        const std::size_t src_gate_off = static_cast<std::size_t>(
-            e * two_Im + static_cast<std::int64_t>(rank) * Im_local) * row_bytes;
-        const std::size_t dst_gate_off = static_cast<std::size_t>(
-            e * 2 * Im_local) * row_bytes;
+    if (rank == 0) {
         CUDA_CHECK(cudaMemcpy(
-            dst + dst_gate_off, host_base + src_gate_off,
-            local_block_rows * row_bytes, cudaMemcpyHostToDevice));
-        // up block: file rows [e*two_Im + Im + rank*Im_local, +Im_local)
-        const std::size_t src_up_off = static_cast<std::size_t>(
-            e * two_Im + Im + static_cast<std::int64_t>(rank) * Im_local) * row_bytes;
-        const std::size_t dst_up_off = static_cast<std::size_t>(
-            e * 2 * Im_local + Im_local) * row_bytes;
+            dst_base, host_base, elem, cudaMemcpyHostToDevice));
+        return;
+    }
+
+    std::vector<std::int64_t> index(ti.shape.size(), 0);
+    std::size_t dst_offset = 0;
+    const int outer_rank = rank - 1;
+    bool done = false;
+    while (!done) {
+        std::int64_t source_linear =
+            start.back() * source_strides.back();
+        for (int axis = 0; axis < outer_rank; ++axis) {
+            source_linear +=
+                (start[static_cast<std::size_t>(axis)] +
+                 index[static_cast<std::size_t>(axis)]) *
+                source_strides[static_cast<std::size_t>(axis)];
+        }
         CUDA_CHECK(cudaMemcpy(
-            dst + dst_up_off, host_base + src_up_off,
-            local_block_rows * row_bytes, cudaMemcpyHostToDevice));
-    }
-    return t;
-}
-
-DeviceTensor SafetensorsLoader::load_to_device_moe_down_sharded(
-    const std::string& name, int rank, int world_size)
-{
-    const auto& ti = info(name);
-    if (ti.shape.size() != 3) {
-        throw std::runtime_error("load_to_device_moe_down_sharded: " + name +
-                                 " must be 3-D [E, H, Im]");
-    }
-    pie_driver_common::validate_rank(
-        rank, world_size, "load_to_device_moe_down_sharded: " + name);
-    const std::int64_t E   = ti.shape[0];
-    const std::int64_t H   = ti.shape[1];
-    const std::int64_t Im  = ti.shape[2];
-    if (Im % world_size != 0) {
-        throw std::runtime_error(
-            "load_to_device_moe_down_sharded: Im=" + std::to_string(Im) +
-            " not divisible by world_size=" + std::to_string(world_size));
-    }
-    const std::int64_t Im_local = Im / world_size;
-
-    auto& shard = shards_[ti.shard_id];
-    if (!shard.data) open_shard_(shard);
-    const auto* host_base = shard.data + shard.data_section_offset + ti.data_offset;
-    const std::size_t elem = dtype_bytes(ti.dtype);
-
-    auto t = DeviceTensor::allocate(ti.dtype, {E, H, Im_local});
-    auto* dst = static_cast<std::uint8_t*>(t.data());
-
-    // Per-expert 2-D pitched copy: H rows × Im_local cols (this rank's
-    // band starts at column rank*Im_local), file pitch = Im, dst pitch = Im_local.
-    const std::size_t local_pitch = static_cast<std::size_t>(Im_local) * elem;
-    const std::size_t file_pitch  = static_cast<std::size_t>(Im) * elem;
-    for (std::int64_t e = 0; e < E; ++e) {
-        const std::size_t src_off = static_cast<std::size_t>(
-            e * H * Im + static_cast<std::int64_t>(rank) * Im_local) * elem;
-        const std::size_t dst_off = static_cast<std::size_t>(
-            e * H * Im_local) * elem;
-        CUDA_CHECK(cudaMemcpy2D(
-            dst + dst_off, local_pitch,
-            host_base + src_off, file_pitch,
-            local_pitch, static_cast<std::size_t>(H),
+            dst_base + dst_offset,
+            host_base + static_cast<std::size_t>(source_linear) * elem,
+            contiguous_bytes,
             cudaMemcpyHostToDevice));
+        dst_offset += contiguous_bytes;
+
+        for (int axis = outer_rank - 1; axis >= 0; --axis) {
+            auto& v = index[static_cast<std::size_t>(axis)];
+            ++v;
+            if (v < shape[static_cast<std::size_t>(axis)]) {
+                break;
+            }
+            v = 0;
+            if (axis == 0) done = true;
+        }
+        if (outer_rank == 0) done = true;
     }
-    return t;
+}
+
+void SafetensorsCheckpointSource::copy_strided_to_device_async(
+    const std::string& name,
+    const std::vector<TensorSlice>& slices,
+    void* dst,
+    const std::vector<std::int64_t>& dst_shape,
+    void* stream)
+{
+    auto cuda_stream = static_cast<cudaStream_t>(stream);
+    const auto& ti = info(name);
+    if (dst == nullptr) {
+        throw std::runtime_error(
+            "safetensors: null destination for sliced tensor '" + name + "'");
+    }
+
+    auto& shard = shards_[ti.shard_id];
+    if (!shard.data) open_shard_(shard);
+    const auto* host_base = shard.data + shard.data_section_offset + ti.data_offset;
+    const std::size_t elem = dtype_bytes(ti.dtype);
+
+    if (slices.empty()) {
+        if (dst_shape != ti.shape) {
+            throw std::runtime_error(
+                "safetensors: destination shape mismatch for tensor '" + name + "'");
+        }
+        CUDA_CHECK(cudaMemcpyAsync(
+            dst, host_base, ti.nbytes, cudaMemcpyHostToDevice, cuda_stream));
+        return;
+    }
+
+    std::vector<std::int64_t> start;
+    const auto shape = normalize_slices(ti, slices, name, start);
+    if (shape != dst_shape) {
+        throw std::runtime_error(
+            "safetensors: destination shape mismatch for sliced tensor '" +
+            name + "'");
+    }
+
+    const auto rank = static_cast<int>(ti.shape.size());
+    std::vector<std::int64_t> source_strides(ti.shape.size(), 1);
+    for (int axis = rank - 2; axis >= 0; --axis) {
+        source_strides[static_cast<std::size_t>(axis)] =
+            source_strides[static_cast<std::size_t>(axis + 1)] *
+            ti.shape[static_cast<std::size_t>(axis + 1)];
+    }
+
+    auto* dst_base = static_cast<std::uint8_t*>(dst);
+    const std::int64_t inner = shape.empty() ? 1 : shape.back();
+    const std::size_t contiguous_bytes =
+        static_cast<std::size_t>(inner) * elem;
+
+    if (rank == 0) {
+        CUDA_CHECK(cudaMemcpyAsync(
+            dst_base, host_base, elem, cudaMemcpyHostToDevice, cuda_stream));
+        return;
+    }
+
+    std::vector<std::int64_t> index(ti.shape.size(), 0);
+    std::size_t dst_offset = 0;
+    const int outer_rank = rank - 1;
+    bool done = false;
+    while (!done) {
+        std::int64_t source_linear =
+            start.back() * source_strides.back();
+        for (int axis = 0; axis < outer_rank; ++axis) {
+            source_linear +=
+                (start[static_cast<std::size_t>(axis)] +
+                 index[static_cast<std::size_t>(axis)]) *
+                source_strides[static_cast<std::size_t>(axis)];
+        }
+        CUDA_CHECK(cudaMemcpyAsync(
+            dst_base + dst_offset,
+            host_base + static_cast<std::size_t>(source_linear) * elem,
+            contiguous_bytes,
+            cudaMemcpyHostToDevice,
+            cuda_stream));
+        dst_offset += contiguous_bytes;
+
+        for (int axis = outer_rank - 1; axis >= 0; --axis) {
+            auto& v = index[static_cast<std::size_t>(axis)];
+            ++v;
+            if (v < shape[static_cast<std::size_t>(axis)]) {
+                break;
+            }
+            v = 0;
+            if (axis == 0) done = true;
+        }
+        if (outer_rank == 0) done = true;
+    }
 }
 
 }  // namespace pie_cuda_driver

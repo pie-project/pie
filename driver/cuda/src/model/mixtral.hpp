@@ -27,10 +27,38 @@
 
 namespace pie_cuda_driver::model {
 
+enum class MixtralExpertWeightFormat {
+    Bf16,
+    Mxfp4RoutedDequant,
+    Mxfp4NativeGemm,
+};
+
 struct MixtralExpertWeights {
+    MixtralExpertWeightFormat format = MixtralExpertWeightFormat::Bf16;
+
     const DeviceTensor* w_gate = nullptr;  // [intermediate, hidden] (HF: w1)
     const DeviceTensor* w_up   = nullptr;  // [intermediate, hidden] (HF: w3)
     const DeviceTensor* w_down = nullptr;  // [hidden, intermediate] (HF: w2)
+
+    // Packed GPT-OSS MXFP4 expert representation. `w_gate_up` stores
+    // [2*intermediate, hidden/32, 16] packed E2M1 bytes for one expert,
+    // with gate rows followed by up rows. `w_down_packed` stores
+    // [hidden, intermediate/32, 16]. The side scales are E8M0 bytes.
+    const DeviceTensor* w_gate_up = nullptr;
+    const DeviceTensor* w_gate_up_scale = nullptr;
+    const DeviceTensor* w_down_packed = nullptr;
+    const DeviceTensor* w_down_scale = nullptr;
+
+    // Native MXFP4 expert representation. These weights are Marlin-repacked
+    // FE2M1 values with companion E8M0 scale tensors, split into ordinary
+    // gate/up/down logical matrices so the host-routed MoE loop can dispatch
+    // each GEMM directly without materializing bf16 expert weights.
+    const DeviceTensor* w_gate_mxfp4 = nullptr;
+    const DeviceTensor* w_gate_mxfp4_scale = nullptr;
+    const DeviceTensor* w_up_mxfp4 = nullptr;
+    const DeviceTensor* w_up_mxfp4_scale = nullptr;
+    const DeviceTensor* w_down_mxfp4 = nullptr;
+    const DeviceTensor* w_down_mxfp4_scale = nullptr;
 
     // Optional per-expert biases. Mixtral's reference release ships
     // bias-free MLPs; GPT-OSS adds them. Nullptr → bias-add step is
@@ -73,12 +101,20 @@ struct MixtralWeights {
     const DeviceTensor* lm_head     = nullptr;
     std::vector<MixtralLayerWeights> layers;
 
-    // Owns the bf16 expert tensors that bind_gpt_oss synthesises by
-    // dequantising MXFP4 fused weights. Plain bind_mixtral leaves this
-    // empty (per-expert tensors live in the LoadedModel). Kept here so they
-    // outlive any lookup-by-name path; pointers in `experts[*]` index
-    // into this vector.
+    // Holds per-expert DeviceTensor handles synthesized during binding.
+    // For GPT-OSS these are non-owning views into loader-materialized
+    // fused expert tensors. Plain bind_mixtral leaves this empty because
+    // per-expert tensors already live in the LoadedModel by name.
     std::vector<DeviceTensor> owned_expert_buffers;
+
+    // Scratch for packed GPT-OSS expert weights. The packed backend
+    // dequantizes only routed experts for the current layer into these
+    // fixed buffers, then reuses the existing BF16 expert GEMM path.
+    mutable DeviceTensor mxfp4_gate_up_bf16_scratch;
+    mutable DeviceTensor mxfp4_gate_bf16_scratch;
+    mutable DeviceTensor mxfp4_up_bf16_scratch;
+    mutable DeviceTensor mxfp4_down_bf16_scratch;
+    int mxfp4_intermediate_padded = 0;
 };
 
 MixtralWeights bind_mixtral(const LoadedModel& engine);

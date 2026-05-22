@@ -197,6 +197,37 @@ void InProcService::serve_forever(pie_driver::InProcServer& server) {
                     }
                     break;
                 }
+                case pie_driver::PIE_METHOD_RS_COPY_D2D: {
+                    const auto srcs = req.copy_srcs.as<std::uint32_t>();
+                    const auto dsts = req.copy_dsts.as<std::uint32_t>();
+                    if (srcs.size() != dsts.size()) {
+                        out.status = 5;
+                        break;
+                    }
+                    auto* state = executor_.state_cache();
+                    if (state == nullptr) {
+                        out.status = 4;
+                        break;
+                    }
+                    try {
+                        for (std::size_t i = 0; i < srcs.size(); ++i) {
+                            state->copy_slot(
+                                static_cast<std::int32_t>(srcs[i]),
+                                static_cast<std::int32_t>(dsts[i]));
+                        }
+                        out.status = 0;
+                    } catch (const std::exception& e) {
+                        std::cerr << "[pie-driver-portable] rs copy failed: "
+                                  << e.what() << "\n";
+                        out.status = 5;
+                    }
+                    break;
+                }
+                case pie_driver::PIE_METHOD_RS_COPY_D2H:
+                case pie_driver::PIE_METHOD_RS_COPY_H2D:
+                case pie_driver::PIE_METHOD_RS_COPY_H2H:
+                    out.status = 4;
+                    break;
                 case pie_driver::PIE_METHOD_LOAD_ADAPTER: {
                     const auto path_bytes = req.adapter_path.as<char>();
                     std::string path(path_bytes.data(), path_bytes.size());

@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use anyhow::Result;
 
 use pie_bridge::{
-    AdapterOp, AdapterRequest, CopyDir, CopyRequest, RequestPayload, ResponsePayload,
+    AdapterOp, AdapterRequest, CopyDir, CopyRequest, CopyResource, RequestPayload, ResponsePayload,
 };
 
 use super::channel::with_channel;
@@ -16,13 +16,19 @@ use super::{DriverId, DriverRequest};
 
 fn copy_request(
     driver_idx: DriverId,
+    resource: CopyResource,
     dir: CopyDir,
     srcs: Vec<u32>,
     dsts: Vec<u32>,
 ) -> DriverRequest {
     DriverRequest {
         driver_id: driver_idx,
-        payload: RequestPayload::Copy(CopyRequest { dir, srcs, dsts }),
+        payload: RequestPayload::Copy(CopyRequest {
+            dir,
+            srcs,
+            dsts,
+            resource,
+        }),
     }
 }
 
@@ -47,6 +53,7 @@ pub fn copy_d2h(driver_idx: DriverId, gpu_phys_ids: &[u32], cpu_pages: &[u32]) -
     with_channel(driver_idx, |ch| {
         ch.notify(copy_request(
             driver_idx,
+            CopyResource::Kv,
             CopyDir::D2H,
             gpu_phys_ids.to_vec(),
             cpu_pages.to_vec(),
@@ -59,6 +66,7 @@ pub fn copy_h2d(driver_idx: DriverId, gpu_phys_ids: &[u32], cpu_pages: &[u32]) -
     with_channel(driver_idx, |ch| {
         ch.notify(copy_request(
             driver_idx,
+            CopyResource::Kv,
             CopyDir::H2D,
             cpu_pages.to_vec(),
             gpu_phys_ids.to_vec(),
@@ -71,6 +79,7 @@ pub fn copy_d2d(driver_idx: DriverId, src_phys_ids: &[u32], dst_phys_ids: &[u32]
     with_channel(driver_idx, |ch| {
         ch.notify(copy_request(
             driver_idx,
+            CopyResource::Kv,
             CopyDir::D2D,
             src_phys_ids.to_vec(),
             dst_phys_ids.to_vec(),
@@ -83,7 +92,21 @@ pub fn copy_h2h(driver_idx: DriverId, src_slots: &[u32], dst_slots: &[u32]) -> R
     with_channel(driver_idx, |ch| {
         ch.notify(copy_request(
             driver_idx,
+            CopyResource::Kv,
             CopyDir::H2H,
+            src_slots.to_vec(),
+            dst_slots.to_vec(),
+        ))
+    })
+}
+
+/// GPU → GPU recurrent-state slot copy (fire-and-forget).
+pub fn copy_rs_d2d(driver_idx: DriverId, src_slots: &[u32], dst_slots: &[u32]) -> Result<()> {
+    with_channel(driver_idx, |ch| {
+        ch.notify(copy_request(
+            driver_idx,
+            CopyResource::Rs,
+            CopyDir::D2D,
             src_slots.to_vec(),
             dst_slots.to_vec(),
         ))

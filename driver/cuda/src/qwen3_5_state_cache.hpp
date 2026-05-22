@@ -1,6 +1,6 @@
 #pragma once
 
-// Per-(layer, request-slot) state caches for Qwen3.5's linear-attention layers.
+// Per-(layer, rs_cache-slot) state slabs for Qwen3.5's linear-attention layers.
 // Each linear-attention layer carries two persistent per-request tensors,
 // indexed by a request slot id in [0, max_slots):
 //
@@ -13,9 +13,9 @@
 //                      in fp32 to avoid drift across hundreds of decode
 //                      steps; promoted at the bf16 boundary.
 //
-// Slot management is owned by the caller (the driver maintains a
-// context_id → slot_id LRU). The cache itself is "dumb": it just hands
-// out raw pointers offset by the slot.
+// Slot assignment is owned by the runtime and arrives on each forward as
+// runtime-managed rs_cache slot ids. The CUDA storage itself is "dumb": it just
+// hands out raw pointers offset by the slot.
 
 #include <cstddef>
 #include <cstdint>
@@ -52,9 +52,13 @@ public:
     void reset(cudaStream_t stream = 0);
 
     // Zero a single slot across every linear-attention layer. Called
-    // when a request is reassigned to that slot (LRU eviction) or when
-    // the runtime signals the request has finished.
+    // when the runtime marks a slot as reset for a fresh recurrent
+    // replay/prefill.
     void reset_slot(int slot, cudaStream_t stream = 0);
+
+    // Copy one state slot to another across every linear-attention layer.
+    // Used by runtime-managed fork/snapshot paths.
+    void copy_slot_d2d(int src_slot, int dst_slot, cudaStream_t stream = 0);
 
     // Per-(layer, slot) accessors. `slot` defaults to 0 to keep the
     // legacy single-request callsites compiling unchanged.

@@ -14,12 +14,21 @@ use anyhow::{Result, anyhow, bail};
 use clap::Subcommand;
 use hf_hub::progress::{DownloadEvent, ProgressEvent, ProgressHandler};
 
+use crate::hf::runtime_snapshot_allow_patterns;
+
 #[derive(Subcommand, Debug)]
 pub enum ModelCmd {
     /// List repo IDs already in the local HF cache.
     List,
     /// Download a model snapshot by HuggingFace repo ID.
-    Download { repo_id: String },
+    Download {
+        repo_id: String,
+        /// Download the complete HF snapshot, including alternate weight
+        /// formats Pie does not use. By default, Pie downloads only runtime
+        /// artifacts: config/tokenizer files and model*.safetensors.
+        #[arg(long)]
+        all: bool,
+    },
     /// Remove a cached model by HuggingFace repo ID. Prompts for
     /// confirmation; `--yes` skips the prompt.
     Remove {
@@ -32,7 +41,7 @@ pub enum ModelCmd {
 pub fn run(cmd: ModelCmd) -> Result<()> {
     match cmd {
         ModelCmd::List => list(),
-        ModelCmd::Download { repo_id } => download(repo_id),
+        ModelCmd::Download { repo_id, all } => download(repo_id, all),
         ModelCmd::Remove { repo_id, yes } => remove(repo_id, yes),
     }
 }
@@ -178,10 +187,14 @@ fn list() -> Result<()> {
 // download
 // -----------------------------------------------------------------------------
 
-fn download(repo_id: String) -> Result<()> {
+fn download(repo_id: String, all: bool) -> Result<()> {
     let (owner, name) = parse_repo_id(&repo_id)?;
 
-    println!("Downloading: {repo_id}");
+    if all {
+        println!("Downloading full snapshot: {repo_id}");
+    } else {
+        println!("Downloading runtime artifacts: {repo_id}");
+    }
 
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -191,8 +204,14 @@ fn download(repo_id: String) -> Result<()> {
         let client = hf_hub::HFClient::new().map_err(|e| anyhow!("init HF client: {e}"))?;
         let repo = client.model(owner, name);
         let progress = ProgressBar::new();
+        let allow_patterns = if all {
+            None
+        } else {
+            Some(runtime_snapshot_allow_patterns())
+        };
         let result = repo
             .snapshot_download()
+            .maybe_allow_patterns(allow_patterns)
             .progress(progress.clone())
             .send()
             .await

@@ -37,7 +37,7 @@ class Batch:
 
         Args:
             args: Dictionary with batched request fields
-            kv_page_size: KV cache page size from model config
+            kv_page_size: KV cache page size reported by driver capabilities
             max_dist_size: Max distribution size from model config
             adapters: Dictionary of active adapters
             vocab_size: Model vocabulary size (optional, needed for sampling masks)

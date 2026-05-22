@@ -8,7 +8,9 @@ imported directly from `pie_driver`.
 
 from __future__ import annotations
 
+import os
 import random
+import time
 
 import numpy as np
 import torch
@@ -37,6 +39,7 @@ class VllmEngine:
 
     config: RuntimeConfig
     forward_pass: object
+    vllm_config: object
     model_config: object
     kv_cache_at_layer: list[torch.Tensor]
     kv_cache_at_layer_host: list[torch.Tensor]
@@ -52,6 +55,7 @@ class VllmEngine:
         config: RuntimeConfig,
         driver_config,
         model_config,
+        vllm_config,
         forward_pass,
         kv_cache_at_layer: list,
         adapter_at_layer: list,
@@ -64,6 +68,7 @@ class VllmEngine:
         self.config = config
         self.driver_config = driver_config
         self.model_config = model_config
+        self.vllm_config = vllm_config
         self.forward_pass = forward_pass
         self.kv_cache_at_layer = kv_cache_at_layer
         self.kv_cache_at_layer_host = kv_cache_at_layer_host or []
@@ -73,6 +78,8 @@ class VllmEngine:
         self.info = info
         self.snapshot_dir = snapshot_dir
         self.adapters = {}
+        self._profile_enabled = bool(os.environ.get("PIE_VLLM_PROFILE"))
+        self._last_fire_profile: dict[str, float] | None = None
 
         # Speculative decoding: driver-side n-gram drafter. Verification
         # and splice live in the shared `._bridge.batching.Batch`; this
@@ -157,6 +164,7 @@ class VllmEngine:
             config=config,
             driver_config=driver_config,
             model_config=loaded.model_config,
+            vllm_config=loaded.vllm_config,
             forward_pass=forward_pass,
             kv_cache_at_layer=kv_cache_at_layer,
             adapter_at_layer=[],
@@ -253,18 +261,44 @@ class VllmEngine:
         # silently dropped. The capability is advertised via
         # DriverCapabilities so the runtime can route mask-dependent
         # inferlets elsewhere (currently only `native`).
-        input_embeds = self.forward_pass.embed_inputs(inputs)
+        t0 = time.perf_counter()
+        if self.forward_pass.use_input_ids_forward:
+            input_ids = inputs["token_ids"]
+            input_embeds = None
+        else:
+            input_ids = None
+            input_embeds = self.forward_pass.embed_inputs(inputs)
+        t_embed = time.perf_counter()
 
         hidden_states = self.forward_pass.transform(
             input_embeds=input_embeds,
+            input_ids=input_ids,
             position_ids=inputs["position_ids"],
             qo_indptr=inputs["qo_indptr"],
             kv_page_indices=inputs["kv_page_indices"],
             kv_page_indptr=inputs["kv_page_indptr"],
             kv_last_page_lens=inputs["kv_last_page_lens"],
+            qo_indptr_cpu=inputs.get("qo_indptr_cpu"),
+            kv_page_indices_cpu=inputs.get("kv_page_indices_cpu"),
+            kv_page_indptr_cpu=inputs.get("kv_page_indptr_cpu"),
+            kv_last_page_lens_cpu=inputs.get("kv_last_page_lens_cpu"),
         )
+        t_transform = time.perf_counter()
 
-        return self.forward_pass.sample(hidden_states, sampling_metadata)
+        out = self.forward_pass.sample(hidden_states, sampling_metadata)
+        t_sample = time.perf_counter()
+        if self._profile_enabled:
+            transform_profile = getattr(self.forward_pass, "_last_transform_profile", {})
+            sample_profile = getattr(self.forward_pass, "_last_sample_profile", {})
+            self._last_fire_profile = {
+                "embed": t_embed - t0,
+                "transform": t_transform - t_embed,
+                "sample": t_sample - t_transform,
+                "fire_total": t_sample - t0,
+                **{f"transform_{k}": v for k, v in transform_profile.items()},
+                **{f"sample_{k}": v for k, v in sample_profile.items()},
+            }
+        return out
 
     # ------------------------------------------------------------------
     # Speculative decoding: NGRAM drafter
@@ -284,7 +318,7 @@ class VllmEngine:
         from vllm.v1.spec_decode.ngram_proposer import batch_propose_numba
 
         max_model_len = int(self.info.get("max_model_len", 0)) or 4096
-        max_num_seqs = int(getattr(self.driver_config, "max_num_seqs", 256))
+        max_num_seqs = int(self.vllm_config.scheduler_config.max_num_seqs)
         k = int(self.driver_config.spec_ngram_num_drafts)
         min_n = int(self.driver_config.spec_ngram_min_n)
         max_n = int(self.driver_config.spec_ngram_max_n)
@@ -437,9 +471,8 @@ class VllmEngine:
         """Report this driver's resolved capacities up to pie's runtime.
 
         Sources every value from vllm's resolved `VllmConfig` rather than
-        echoing the user's `RuntimeConfig`. In particular `kv_page_size`
-        comes from the attention backend's chosen block size, which may
-        differ from what the user requested.
+        echoing input config. In particular `kv_page_size` comes from the
+        attention backend's chosen block size.
 
         Fails loudly if any expected value is missing — the runtime/Rust
         side relies on these being correct, so silent defaulting is unsafe.
@@ -465,15 +498,10 @@ class VllmEngine:
                 "torch.dtype with a 'torch.' prefix."
             )
 
-        # vllm expresses forward limits as max_num_seqs /
-        # max_num_batched_tokens. If max_num_batched_tokens is None
-        # (vllm default), use scheduler_config's resolved value.
-        max_forward_requests = int(self.driver_config.max_num_seqs)
-        max_forward_tokens = self.driver_config.max_num_batched_tokens
-        if max_forward_tokens is None:
-            max_forward_tokens = int(vc.scheduler_config.max_num_batched_tokens)
-        else:
-            max_forward_tokens = int(max_forward_tokens)
+        # vllm resolves scheduler capacity while building VllmConfig. Pie
+        # reports those resolved limits rather than accepting user overrides.
+        max_forward_requests = int(vc.scheduler_config.max_num_seqs)
+        max_forward_tokens = int(vc.scheduler_config.max_num_batched_tokens)
         unconstrained = (1 << 32) - 1
 
         return DriverCapabilities(
@@ -672,9 +700,15 @@ def _run_one_shape(
     # Use the persistent buffers as inputs so the addresses captured here
     # match what transform() will pass at runtime. The values don't matter
     # for capture (only the shape and address do); zero them defensively.
-    forward_pass._buf_input_embeds[:n].zero_()
+    if forward_pass.use_input_ids_forward:
+        forward_pass._buf_input_ids[:n].zero_()
+        input_ids = forward_pass._buf_input_ids[:n]
+        input_embeds = None
+    else:
+        forward_pass._buf_input_embeds[:n].zero_()
+        input_ids = None
+        input_embeds = forward_pass._buf_input_embeds[:n]
     forward_pass._buf_positions[:n].zero_()
-    input_embeds = forward_pass._buf_input_embeds[:n]
     positions = forward_pass._buf_positions[:n]
 
     with set_forward_context(
@@ -685,8 +719,11 @@ def _run_one_shape(
         cudagraph_runtime_mode=runtime_mode,
         batch_descriptor=desc,
     ):
-        forward_pass.model.forward(
-            input_ids=None,
-            positions=positions,
-            inputs_embeds=input_embeds,
-        )
+        if forward_pass.use_input_ids_forward:
+            forward_pass.model.forward(input_ids=input_ids, positions=positions)
+        else:
+            forward_pass.model.forward(
+                input_ids=None,
+                positions=positions,
+                inputs_embeds=input_embeds,
+            )
