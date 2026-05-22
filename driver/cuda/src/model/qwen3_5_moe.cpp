@@ -228,6 +228,10 @@ Qwen3_5MoeWeights bind_qwen3_5_moe(const LoadedModel& engine) {
             Lw.fa_o_proj = &must(engine, fa + "o_proj.weight");
             Lw.fa_q_norm = &must(engine, fa + "q_norm.weight");
             Lw.fa_k_norm = &must(engine, fa + "k_norm.weight");
+            Lw.fa_q_proj_quant = engine.quant_meta(fa + "q_proj.weight");
+            Lw.fa_k_proj_quant = engine.quant_meta(fa + "k_proj.weight");
+            Lw.fa_v_proj_quant = engine.quant_meta(fa + "v_proj.weight");
+            Lw.fa_o_proj_quant = engine.quant_meta(fa + "o_proj.weight");
             Lw.kv_layer = kv_slot++;
         } else {
             throw std::runtime_error(
@@ -252,6 +256,14 @@ Qwen3_5MoeWeights bind_qwen3_5_moe(const LoadedModel& engine) {
             Lw.shared_up_proj   = &must(engine, lp + "mlp.shared_expert.up_proj.weight");
             Lw.shared_down_proj = &must(engine, lp + "mlp.shared_expert.down_proj.weight");
             Lw.shared_gate      = &must(engine, lp + "mlp.shared_expert_gate.weight");
+            Lw.shared_gate_proj_quant =
+                engine.quant_meta(lp + "mlp.shared_expert.gate_proj.weight");
+            Lw.shared_up_proj_quant =
+                engine.quant_meta(lp + "mlp.shared_expert.up_proj.weight");
+            Lw.shared_down_proj_quant =
+                engine.quant_meta(lp + "mlp.shared_expert.down_proj.weight");
+            Lw.shared_gate_quant =
+                engine.quant_meta(lp + "mlp.shared_expert_gate.weight");
         }
     }
 

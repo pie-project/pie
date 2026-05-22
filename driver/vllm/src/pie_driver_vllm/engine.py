@@ -123,9 +123,9 @@ class VllmEngine:
         kv_cache_at_layer = allocate_and_bind_kv_cache(loaded, config, driver_config)
         host_kv, pool_size = allocate_host_pool(kv_cache_at_layer, config.swap_budget_bytes)
 
-        # Wire vllm's CUDA-graph dispatcher when capture is enabled (i.e.
-        # `enforce_eager=False`). With it disabled, set cg_dispatcher=None
-        # and forward_pass falls through to the eager path everywhere.
+        # Wire vllm's CUDA-graph dispatcher when capture is enabled. With
+        # capture disabled, `cg_dispatcher=None` still allows vLLM's compiled
+        # non-graph path when torch.compile is enabled.
         cg_dispatcher = _maybe_init_cg_dispatcher(loaded.vllm_config)
 
         forward_pass = VllmForwardPass(
@@ -142,10 +142,7 @@ class VllmEngine:
                 loaded.vllm_config.compilation_config.max_cudagraph_capture_size
                 or 0
             )
-            forward_pass.setup_cg_buffers(
-                max_n=max_cg_n,
-                hidden_size=int(loaded.vllm_config.model_config.get_hidden_size()),
-            )
+            forward_pass.setup_cg_buffers(max_n=max_cg_n)
 
             _log("Capturing vllm CUDA graphs", "INFO")
             _capture_vllm_cudagraphs(
@@ -257,10 +254,8 @@ class VllmEngine:
         # silently dropped. The capability is advertised via
         # DriverCapabilities so the runtime can route mask-dependent
         # inferlets elsewhere (currently only `native`).
-        input_embeds = self.forward_pass.embed_inputs(inputs)
-
         hidden_states = self.forward_pass.transform(
-            input_embeds=input_embeds,
+            token_ids=inputs["token_ids"],
             position_ids=inputs["position_ids"],
             qo_indptr=inputs["qo_indptr"],
             kv_page_indices=inputs["kv_page_indices"],
@@ -526,7 +521,7 @@ class VllmEngine:
 
 def _maybe_init_cg_dispatcher(vllm_config) -> object | None:
     """Construct + initialize a CudagraphDispatcher, or None if cudagraph
-    capture is disabled in vllm_config (i.e. enforce_eager=True)."""
+    capture is disabled in vllm_config."""
     from ._vllm_compat import CUDAGraphMode, CudagraphDispatcher
 
     cudagraph_mode = vllm_config.compilation_config.cudagraph_mode
@@ -670,9 +665,9 @@ def _run_one_shape(
     # Use the persistent buffers as inputs so the addresses captured here
     # match what transform() will pass at runtime. The values don't matter
     # for capture (only the shape and address do); zero them defensively.
-    forward_pass._buf_input_embeds[:n].zero_()
+    forward_pass._buf_input_ids[:n].zero_()
     forward_pass._buf_positions[:n].zero_()
-    input_embeds = forward_pass._buf_input_embeds[:n]
+    input_ids = forward_pass._buf_input_ids[:n]
     positions = forward_pass._buf_positions[:n]
 
     with set_forward_context(
@@ -684,7 +679,7 @@ def _run_one_shape(
         batch_descriptor=desc,
     ):
         forward_pass.model.forward(
-            input_ids=None,
+            input_ids=input_ids,
             positions=positions,
-            inputs_embeds=input_embeds,
+            inputs_embeds=None,
         )

@@ -37,8 +37,6 @@ KvCache KvCache::allocate(int num_layers,
     c.v_layers_.reserve(num_layers);
     c.k_scale_layers_.reserve(num_layers);
     c.v_scale_layers_.reserve(num_layers);
-    c.k_bf16_layers_.reserve(num_layers);
-    c.v_bf16_layers_.reserve(num_layers);
     for (int i = 0; i < num_layers; ++i) {
         const auto storage_hd = c.format_.storage_head_dim(head_dim);
         c.k_layers_.push_back(DeviceTensor::allocate(
@@ -60,15 +58,6 @@ KvCache KvCache::allocate(int num_layers,
         } else {
             c.k_scale_layers_.emplace_back();
             c.v_scale_layers_.emplace_back();
-        }
-        if (c.format_.is_native_bf16()) {
-            c.k_bf16_layers_.emplace_back();
-            c.v_bf16_layers_.emplace_back();
-        } else {
-            c.k_bf16_layers_.push_back(DeviceTensor::allocate(
-                DType::BF16, {num_pages, page_size, num_kv_heads, head_dim}));
-            c.v_bf16_layers_.push_back(DeviceTensor::allocate(
-                DType::BF16, {num_pages, page_size, num_kv_heads, head_dim}));
         }
     }
     return c;
@@ -134,8 +123,6 @@ KvCache KvCache::allocate_per_layer(int num_layers,
     c.v_layers_.reserve(num_layers);
     c.k_scale_layers_.reserve(num_layers);
     c.v_scale_layers_.reserve(num_layers);
-    c.k_bf16_layers_.reserve(num_layers);
-    c.v_bf16_layers_.reserve(num_layers);
     for (int i = 0; i < num_layers; ++i) {
         const bool is_source = kv_source_layer.empty() || kv_source_layer[i] == i;
         if (is_source) {
@@ -165,22 +152,11 @@ KvCache KvCache::allocate_per_layer(int num_layers,
                 c.k_scale_layers_.emplace_back();
                 c.v_scale_layers_.emplace_back();
             }
-            if (c.format_.is_native_bf16()) {
-                c.k_bf16_layers_.emplace_back();
-                c.v_bf16_layers_.emplace_back();
-            } else {
-                c.k_bf16_layers_.push_back(DeviceTensor::allocate(
-                    DType::BF16, {num_pages, page_size, kvh, hd}));
-                c.v_bf16_layers_.push_back(DeviceTensor::allocate(
-                    DType::BF16, {num_pages, page_size, kvh, hd}));
-            }
         } else {
             c.k_layers_.emplace_back();  // empty
             c.v_layers_.emplace_back();
             c.k_scale_layers_.emplace_back();
             c.v_scale_layers_.emplace_back();
-            c.k_bf16_layers_.emplace_back();
-            c.v_bf16_layers_.emplace_back();
         }
     }
     return c;
@@ -209,25 +185,25 @@ const void* KvCache::v_scale(int layer) const {
 void* KvCache::k_for_attention(int layer) {
     const int src = resolve_(layer);
     return format_.is_native_bf16() ? k_layers_[src].data()
-                                    : k_bf16_layers_[src].data();
+                                    : nullptr;
 }
 
 void* KvCache::v_for_attention(int layer) {
     const int src = resolve_(layer);
     return format_.is_native_bf16() ? v_layers_[src].data()
-                                    : v_bf16_layers_[src].data();
+                                    : nullptr;
 }
 
 const void* KvCache::k_for_attention(int layer) const {
     const int src = resolve_(layer);
     return format_.is_native_bf16() ? k_layers_[src].data()
-                                    : k_bf16_layers_[src].data();
+                                    : nullptr;
 }
 
 const void* KvCache::v_for_attention(int layer) const {
     const int src = resolve_(layer);
     return format_.is_native_bf16() ? v_layers_[src].data()
-                                    : v_bf16_layers_[src].data();
+                                    : nullptr;
 }
 
 KvCacheLayerView KvCache::layer_view(int layer) {
@@ -250,9 +226,9 @@ KvCacheLayerView KvCache::layer_view(int layer) {
         .k_scales = data_or_null(k_scale_layers_[src]),
         .v_scales = data_or_null(v_scale_layers_[src]),
         .k_bf16_pages = format_.is_native_bf16() ? k_layers_[src].data()
-                                                 : k_bf16_layers_[src].data(),
+                                                 : nullptr,
         .v_bf16_pages = format_.is_native_bf16() ? v_layers_[src].data()
-                                                 : v_bf16_layers_[src].data(),
+                                                 : nullptr,
     };
 }
 

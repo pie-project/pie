@@ -25,6 +25,8 @@ struct KvCacheLayerView {
     void* v_pages = nullptr;
     void* k_scales = nullptr;
     void* v_scales = nullptr;
+    // Native-BF16 caches expose these as aliases for k_pages/v_pages. Quantized
+    // caches keep them null; attention must read the quantized storage directly.
     void* k_bf16_pages = nullptr;
     void* v_bf16_pages = nullptr;
 
@@ -128,9 +130,8 @@ public:
     const void* k_scale(int layer) const;
     const void* v_scale(int layer) const;
 
-    // BF16 pages consumed by attention. For native BF16 these alias k()/v().
-    // Quantized formats use private BF16 scratch populated by the format-aware
-    // attention wrappers.
+    // BF16 pages consumed by BF16-only attention paths. For native BF16 these
+    // alias k()/v(); for quantized formats they return nullptr.
     void* k_for_attention(int layer);
     void* v_for_attention(int layer);
     const void* k_for_attention(int layer) const;
@@ -157,8 +158,6 @@ private:
     std::vector<DeviceTensor> v_layers_;
     std::vector<DeviceTensor> k_scale_layers_;
     std::vector<DeviceTensor> v_scale_layers_;
-    std::vector<DeviceTensor> k_bf16_layers_;
-    std::vector<DeviceTensor> v_bf16_layers_;
     // Empty for homogeneous allocations. When populated:
     //   * `per_layer_head_dim_[L]` is layer L's K/V head_dim.
     //   * `kv_source_layer_[L]` is the slot index whose physical

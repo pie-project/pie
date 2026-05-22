@@ -28,6 +28,14 @@ def worker_main(
     `driver_config` is `VllmDriverConfig` as a dict; vllm's own knobs live
     on the typed dataclass and never leak into pie's `RuntimeConfig`.
     """
+    import os
+
+    safe_device = devices[local_rank].replace(":", "_")
+    os.environ.setdefault(
+        "VLLM_CACHE_ROOT",
+        f"/tmp/pie_vllm_cache/pid_{os.getpid()}_{safe_device}",
+    )
+
     from ._bridge.worker import run_worker
     from . import utils as runtime_ops
     from .config import VllmDriverConfig

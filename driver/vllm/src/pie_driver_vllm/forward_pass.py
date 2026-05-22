@@ -18,7 +18,7 @@ from typing import Any
 import torch
 
 from ._bridge.config import RuntimeConfig
-from .common import sample_common
+from .common import TOKEN_SAMPLING_TYPES, sample_common
 
 from .attn_metadata import build_common_metadata
 
@@ -61,34 +61,28 @@ class VllmForwardPass:
         self._kv_spec = None
         self._layer_names: list[str] = []
 
-        # vllm's CUDA-graph dispatcher; None if cudagraph capture is disabled
-        # (enforce_eager=True / --no-cuda-graphs). When set, transform() asks
-        # the dispatcher for the runtime mode + padded shape and forwards
-        # those into vllm's set_forward_context — vllm's CUDAGraphWrapper
-        # then either replays the captured graph or transparently falls
-        # through to eager. Construction lives in VllmEngine.load.
+        # vllm's CUDA-graph dispatcher; None if cudagraph capture is disabled.
+        # When set, transform() asks the dispatcher for the runtime mode +
+        # padded shape and forwards those into vllm's set_forward_context.
+        # vllm's CUDAGraphWrapper then either replays the captured graph or
+        # transparently falls through to eager. Construction lives in
+        # VllmEngine.load.
         self.cg_dispatcher = cg_dispatcher
 
-        # Persistent input buffers for cudagraph replay. Captured graphs
-        # bake in tensor *addresses*, not values — pie must copy_ each
-        # fire's data into the same buffers and pass slices off them.
-        # Sized to the largest captured shape; `None` until set up by the
-        # engine's capture warmup (which knows max_cudagraph_capture_size).
-        self._buf_input_embeds: torch.Tensor | None = None
+        # Persistent input buffers for cudagraph replay. Captured graphs bake
+        # in tensor *addresses*, not values — pie must copy_ each fire's data
+        # into the same buffers and pass slices off them.
+        self._buf_input_ids: torch.Tensor | None = None
         self._buf_positions: torch.Tensor | None = None
         self._buf_max_n: int = 0
 
-    def setup_cg_buffers(self, max_n: int, hidden_size: int) -> None:
-        """Allocate the persistent input_embeds / positions buffers used as
-        the input slice during both capture and replay. Idempotent — safe
-        to call multiple times with the same max_n."""
-        if self._buf_input_embeds is not None and self._buf_max_n >= max_n:
+    def setup_cg_buffers(self, max_n: int) -> None:
+        """Allocate persistent input buffers for capture/replay."""
+        if self._buf_input_ids is not None and self._buf_max_n >= max_n:
             return
         self._buf_max_n = max_n
-        self._buf_input_embeds = torch.zeros(
-            max_n, hidden_size,
-            dtype=self.activation_dtype,
-            device=self.device,
+        self._buf_input_ids = torch.zeros(
+            max_n, dtype=torch.long, device=self.device,
         )
         self._buf_positions = torch.zeros(
             max_n, dtype=torch.int64, device=self.device,
@@ -141,7 +135,7 @@ class VllmForwardPass:
     def transform(
         self,
         *,
-        input_embeds: torch.Tensor,
+        token_ids: torch.Tensor,
         position_ids: torch.Tensor,
         qo_indptr: torch.Tensor,
         kv_page_indices: torch.Tensor,
@@ -176,6 +170,8 @@ class VllmForwardPass:
             name: common.slot_mapping for name in self._layer_names
         }
 
+        token_ids = token_ids.to(self.device, dtype=torch.long, non_blocking=True)
+
         # vllm's RoPE kernel expects int64 positions; pie uses int32.
         positions = position_ids.to(self.device, dtype=torch.int64, non_blocking=True)
 
@@ -197,17 +193,19 @@ class VllmForwardPass:
 
         forward_n = batch_desc.num_tokens
         if cg_mode != CUDAGraphMode.NONE:
-            assert self._buf_input_embeds is not None, (
+            assert self._buf_input_ids is not None, (
                 "cg_dispatcher returned non-NONE mode but persistent buffers "
                 "are not initialized — engine.load must call setup_cg_buffers."
             )
-            self._buf_input_embeds[:actual_n].copy_(input_embeds, non_blocking=True)
+            assert self._buf_positions is not None
+            self._buf_input_ids[:actual_n].copy_(token_ids, non_blocking=True)
             if forward_n > actual_n:
-                self._buf_input_embeds[actual_n:forward_n].zero_()
+                self._buf_input_ids[actual_n:forward_n].zero_()
             self._buf_positions[:actual_n].copy_(positions, non_blocking=True)
             if forward_n > actual_n:
                 self._buf_positions[actual_n:forward_n].zero_()
-            input_embeds_in = self._buf_input_embeds[:forward_n]
+            input_ids_in = self._buf_input_ids[:forward_n]
+            input_embeds_in = None
             positions_in = self._buf_positions[:forward_n]
 
             if forward_n > actual_n:
@@ -215,7 +213,8 @@ class VllmForwardPass:
                     slot_mapping_dict, forward_n
                 )
         else:
-            input_embeds_in = input_embeds
+            input_ids_in = token_ids
+            input_embeds_in = None
             positions_in = positions
 
         with set_forward_context(
@@ -227,7 +226,7 @@ class VllmForwardPass:
             batch_descriptor=batch_desc,
         ):
             hidden_states = self.model.forward(
-                input_ids=None,
+                input_ids=input_ids_in,
                 positions=positions_in,
                 inputs_embeds=input_embeds_in,
             )
@@ -269,6 +268,9 @@ class VllmForwardPass:
 
     def sample(self, hidden_states: torch.Tensor, sampling_metadata: dict) -> dict:
         """Sample via pie_driver's sample_common; vllm's LM head is the lm_head_fn."""
+        greedy = self._try_greedy_sample(hidden_states, sampling_metadata)
+        if greedy is not None:
+            return greedy
         return sample_common(
             hidden_states=hidden_states,
             sampling_metadata=sampling_metadata,
@@ -276,3 +278,102 @@ class VllmForwardPass:
             device=self.device,
             dtype=self.activation_dtype,
         )
+
+    def _try_greedy_sample(
+        self, hidden_states: torch.Tensor, sampling_metadata: dict
+    ) -> dict | None:
+        """Fast path for temperature-0 token sampling.
+
+        vLLM's LogitsProcessor can reduce vocab-parallel argmax by gathering
+        only (max value, token id) pairs across TP ranks. The generic Pie
+        sampler must materialize full logits/probs, which is much slower for
+        TP decode and unnecessary for deterministic sampling.
+        """
+        indices_for_logits = sampling_metadata.get("indices_for_logits")
+        if not indices_for_logits:
+            return {
+                "tokens": [],
+                "dists": [],
+                "logits": [],
+                "logprobs": [],
+                "entropies": [],
+            }
+
+        sampler_groups = sampling_metadata["sampler_groups"]
+        if any(k not in TOKEN_SAMPLING_TYPES for k in sampler_groups):
+            return None
+        if sampling_metadata.get("sampling_masks") is not None:
+            return None
+
+        temperatures = sampling_metadata["temperatures"]
+        if bool(torch.any(temperatures > 1e-5).item()):
+            return None
+
+        rows = torch.nan_to_num(hidden_states[indices_for_logits])
+        tokens = self._vocab_parallel_top_tokens(rows)
+        token_list = tokens.tolist()
+        n = len(indices_for_logits)
+        return {
+            "tokens": token_list,
+            "dists": [None] * n,
+            "logits": [None] * n,
+            "logprobs": [None] * n,
+            "entropies": [None] * n,
+            "nan_indices": [],
+        }
+
+    def _vocab_parallel_top_tokens(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Return greedy token ids without materializing full TP logits.
+
+        vLLM exposes `LogitsProcessor.get_top_tokens` for this, but that helper
+        uses vLLM's custom collective wrapper for the final tiny all-gather. Pie
+        already disables NCCL P2P on SYS-level GPU pairs, so use PyTorch's
+        process-group collective directly here and keep the payload to
+        `(max_value, token_id)` per sampled row.
+        """
+        import torch.distributed as dist
+        from vllm.distributed import get_tp_group
+
+        lm_head = self.model.lm_head
+        logits_processor = self.model.logits_processor
+
+        logits = lm_head.quant_method.apply(lm_head, hidden_states)
+        if logits_processor.soft_cap is not None:
+            logits = (
+                torch.tanh(logits / logits_processor.soft_cap)
+                * logits_processor.soft_cap
+            )
+        if logits_processor.scale != 1.0:
+            logits = logits * logits_processor.scale
+
+        num_pad = lm_head.shard_indices.num_org_vocab_padding
+        if num_pad > 0:
+            logits[..., -num_pad:] = -float("inf")
+
+        local_max_vals, local_max_indices = logits.max(dim=-1)
+        vocab_start = lm_head.shard_indices.org_vocab_start_index
+        global_indices = local_max_indices + vocab_start
+
+        tp_group = get_tp_group()
+        tp_size = tp_group.world_size
+        if tp_size == 1:
+            tokens = global_indices
+        else:
+            local_pair = torch.stack(
+                [local_max_vals.float(), global_indices.float()], dim=-1
+            ).contiguous()
+            gathered_flat = torch.empty(
+                (tp_size * local_pair.shape[0], local_pair.shape[1]),
+                dtype=local_pair.dtype,
+                device=local_pair.device,
+            )
+            dist.all_gather_into_tensor(
+                gathered_flat, local_pair, group=tp_group.device_group
+            )
+            gathered = gathered_flat.view(tp_size, hidden_states.shape[0], 2)
+            gathered = gathered.transpose(0, 1)
+            max_rank_idx = gathered[:, :, 0].argmax(dim=-1, keepdim=True)
+            tokens = gathered[:, :, 1].gather(dim=-1, index=max_rank_idx)
+            tokens = tokens.squeeze(-1).to(torch.int64)
+
+        return tokens

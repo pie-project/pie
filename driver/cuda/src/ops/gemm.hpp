@@ -18,6 +18,30 @@
 
 namespace pie_cuda_driver::ops {
 
+struct RuntimeQuantScratchSpec {
+    std::size_t max_tokens = 0;
+    std::size_t max_weight_rows = 0;  // GEMM N
+    std::size_t max_weight_cols = 0;  // GEMM K
+    bool has_fp8 = false;
+    bool has_int8 = false;
+
+    bool empty() const noexcept {
+        return max_tokens == 0 ||
+               max_weight_rows == 0 ||
+               max_weight_cols == 0 ||
+               (!has_fp8 && !has_int8);
+    }
+};
+
+std::size_t runtime_quant_scratch_bytes(const RuntimeQuantScratchSpec& spec);
+
+// Preallocate the runtime-quant GEMM scratch described by `spec`. When
+// `seal_after_reserve` is true, any later attempt to grow those buffers throws
+// instead of reallocating, preserving CUDA graph pointer stability.
+void reserve_runtime_quant_scratch(
+    const RuntimeQuantScratchSpec& spec,
+    bool seal_after_reserve);
+
 // Lightweight reference to a weight tensor + (optional) quantization
 // metadata, threaded through the GEMM dispatcher. The bf16 path takes the
 // implicit `WeightView(const DeviceTensor&)` constructor and pays nothing;

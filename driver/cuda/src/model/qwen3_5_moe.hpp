@@ -22,6 +22,7 @@
 // to Qwen3_5LayerWeights keeps each arch's invariants local.
 
 #include <cstdint>
+#include <optional>
 #include <vector>
 
 #include "device_buffer.hpp"
@@ -73,6 +74,17 @@ struct Qwen3_5MoeLayerWeights {
     const DeviceTensor* shared_up_proj    = nullptr;  // [I_shared, H]
     const DeviceTensor* shared_down_proj  = nullptr;  // [H, I_shared]
     const DeviceTensor* shared_gate       = nullptr;  // [1, H]
+
+    // Optional QuantMeta companions for runtime-quantized 2-D projections.
+    // Routed experts are fused 3-D tables and stay bf16 on this path.
+    std::optional<QuantMeta> fa_q_proj_quant;
+    std::optional<QuantMeta> fa_k_proj_quant;
+    std::optional<QuantMeta> fa_v_proj_quant;
+    std::optional<QuantMeta> fa_o_proj_quant;
+    std::optional<QuantMeta> shared_gate_proj_quant;
+    std::optional<QuantMeta> shared_up_proj_quant;
+    std::optional<QuantMeta> shared_down_proj_quant;
+    std::optional<QuantMeta> shared_gate_quant;
 
     int kv_layer = -1;  // -1 on linear-attn layers
 };

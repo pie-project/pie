@@ -116,6 +116,7 @@ def build_config(args: argparse.Namespace):
     elif args.driver == "vllm":
         driver_options = {
             "gpu_memory_utilization": args.gpu_mem_util,
+            "max_model_len": args.max_model_len,
         }
         if getattr(args, "venv", None):
             driver_options["venv"] = args.venv
@@ -263,11 +264,16 @@ async def cli_pie_client(args: argparse.Namespace):
             "--no-default-features --features driver-cuda"
         )
 
+    server_env = os.environ.copy()
+    if args.driver in {"dev", "vllm", "sglang"}:
+        server_env.setdefault("PIE_SHMEM_HARD_TIMEOUT_S", "120")
+
     proc = await asyncio.create_subprocess_exec(
         str(pie_bin),
         "serve",
         "--config",
         str(cfg_path),
+        env=server_env,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.STDOUT,
     )

@@ -31,6 +31,19 @@ class CustomAllReduce;  // see custom_all_reduce.hpp
         }                                                                      \
     } while (0)
 
+void nccl_check_async(ncclResult_t result,
+                      ncclComm_t comm,
+                      const char* expr,
+                      const char* file,
+                      int line);
+
+#define NCCL_CHECK_ASYNC(expr, comm)                                           \
+    do {                                                                       \
+        ncclResult_t _r = (expr);                                              \
+        ::pie_cuda_driver::nccl_check_async(                                   \
+            _r, (comm), #expr, __FILE__, __LINE__);                            \
+    } while (0)
+
 // Hex-encode / decode an `ncclUniqueId`. The wrapper passes the id to the
 // driver as 256 hex chars (NCCL_UNIQUE_ID_BYTES = 128 bytes).
 std::string nccl_unique_id_to_hex(const ncclUniqueId& id);

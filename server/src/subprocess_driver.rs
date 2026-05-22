@@ -58,6 +58,7 @@ impl SubprocessFlavor {
 
 #[cfg(unix)]
 mod unix_impl {
+    use std::ffi::OsString;
     use std::io::{BufRead, BufReader};
     use std::os::fd::{FromRawFd, IntoRawFd, OwnedFd};
     use std::os::unix::process::CommandExt;
@@ -305,6 +306,19 @@ mod unix_impl {
                 // (subprocess shouldn't read). stdout inherited too —
                 // launchers print boot diagnostics there.
                 .stdin(Stdio::null());
+
+            // The configured interpreter may be a venv's Python without the
+            // venv being activated. Some Python packages invoke sibling console
+            // tools (for example FlashInfer JIT shells out to `ninja`), so make
+            // the interpreter's bin directory visible to the subprocess tree.
+            if let Some(bin_dir) = python_exe.parent() {
+                let mut path = OsString::from(bin_dir.as_os_str());
+                if let Some(existing) = std::env::var_os("PATH") {
+                    path.push(":");
+                    path.push(existing);
+                }
+                cmd.env("PATH", path);
+            }
 
             // SAFETY: `pre_exec` runs in the forked child between fork()
             // and exec(). The libc calls below are async-signal-safe (per

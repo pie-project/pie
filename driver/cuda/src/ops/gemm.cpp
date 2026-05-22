@@ -3,7 +3,9 @@
 #include <cublasLt.h>
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <cstdint>
+#include <limits>
 #include <stdexcept>
 #include <string>
 
@@ -19,6 +21,45 @@
 namespace pie_cuda_driver::ops {
 
 namespace {
+
+constexpr std::size_t kDefaultLtWorkspaceBytes = 32ull * 1024ull * 1024ull;
+
+std::size_t checked_mul(std::size_t a, std::size_t b, const char* what) {
+    if (a != 0 && b > std::numeric_limits<std::size_t>::max() / a) {
+        throw std::runtime_error(
+            std::string("runtime quant scratch byte overflow: ") + what);
+    }
+    return a * b;
+}
+
+std::size_t checked_add(std::size_t a, std::size_t b, const char* what) {
+    if (b > std::numeric_limits<std::size_t>::max() - a) {
+        throw std::runtime_error(
+            std::string("runtime quant scratch byte overflow: ") + what);
+    }
+    return a + b;
+}
+
+std::size_t runtime_quant_dequant_bytes(
+    const RuntimeQuantScratchSpec& spec)
+{
+    if (spec.empty()) return 0;
+    const std::size_t weight_bf16_bytes =
+        checked_mul(
+            checked_mul(spec.max_weight_rows, spec.max_weight_cols,
+                        "dequant weight elems"),
+            std::size_t{2},
+            "dequant weight bytes");
+    const std::size_t residual_bf16_bytes =
+        spec.has_int8
+            ? checked_mul(
+                  checked_mul(spec.max_tokens, spec.max_weight_rows,
+                              "dequant output elems"),
+                  std::size_t{2},
+                  "dequant output bytes")
+            : 0;
+    return std::max(weight_bf16_bytes, residual_bf16_bytes);
+}
 
 void check(cublasStatus_t s, const char* expr) {
     if (s != CUBLAS_STATUS_SUCCESS) {
@@ -48,6 +89,41 @@ cudaStream_t CublasHandle::stream() const noexcept {
     cudaStream_t s = nullptr;
     cublasGetStream(h_, &s);
     return s;
+}
+
+std::size_t runtime_quant_scratch_bytes(
+    const RuntimeQuantScratchSpec& spec)
+{
+    if (spec.empty()) return 0;
+
+    std::size_t bytes = kDefaultLtWorkspaceBytes;
+    bytes = checked_add(
+        bytes,
+        runtime_quant_dequant_bytes(spec),
+        "dequant scratch");
+
+    if (spec.has_int8) {
+        bytes = checked_add(
+            bytes,
+            checked_mul(spec.max_tokens, spec.max_weight_cols,
+                        "int8 activation bytes"),
+            "int8 activation scratch");
+        bytes = checked_add(
+            bytes,
+            checked_mul(spec.max_tokens, sizeof(float),
+                        "int8 activation scale bytes"),
+            "int8 activation scale scratch");
+        bytes = checked_add(
+            bytes,
+            checked_mul(
+                checked_mul(spec.max_tokens, spec.max_weight_rows,
+                            "int32 accumulator elems"),
+                sizeof(std::int32_t),
+                "int32 accumulator bytes"),
+            "int32 accumulator scratch");
+    }
+
+    return bytes;
 }
 
 namespace {
@@ -271,11 +347,11 @@ struct LtCtx {
     bool             fp8_native_supported = false;
 
     static LtCtx& instance() {
-        static LtCtx ctx;
+        static thread_local LtCtx ctx;
         return ctx;
     }
 
-    void ensure_init(std::size_t ws_bytes = 32 * 1024 * 1024) {
+    void ensure_init(std::size_t ws_bytes = kDefaultLtWorkspaceBytes) {
         if (!handle) LT_CHECK(cublasLtCreate(&handle));
         if (!workspace) {
             CUDA_CHECK(cudaMalloc(&workspace, ws_bytes));
@@ -305,12 +381,32 @@ struct LtCtx {
     struct GrowScratch {
         void*       p = nullptr;
         std::size_t bytes = 0;
-        void* ensure(std::size_t want) {
-            if (want <= bytes) return p;
+        bool        sealed = false;
+        const char* name = "runtime quant scratch";
+
+        void reserve(std::size_t want) {
+            if (want <= bytes) return;
+            if (sealed) {
+                throw std::runtime_error(
+                    std::string(name) +
+                    " attempted to grow after CUDA graph reservation: want " +
+                    std::to_string(want) + " bytes, have " +
+                    std::to_string(bytes) +
+                    " bytes. Increase the planner reserve or disable CUDA graphs.");
+            }
             if (p) CUDA_CHECK(cudaFree(p));
             CUDA_CHECK(cudaMalloc(&p, want));
             bytes = want;
+        }
+
+        void* ensure(std::size_t want) {
+            reserve(want);
             return p;
+        }
+
+        void seal(const char* label) noexcept {
+            if (label != nullptr) name = label;
+            sealed = true;
         }
     };
     GrowScratch dequant;        // sm<89 FP8 → bf16 weight scratch
@@ -318,6 +414,43 @@ struct LtCtx {
     GrowScratch int8_act_scale; // [M] fp32 act_scale_inv
     GrowScratch int32_acc;      // [M, N] int32 W8A8 accumulator
 };
+
+}  // namespace
+
+void reserve_runtime_quant_scratch(
+    const RuntimeQuantScratchSpec& spec,
+    bool seal_after_reserve)
+{
+    if (spec.empty()) return;
+
+    auto& ctx = LtCtx::instance();
+    ctx.ensure_init();
+
+    ctx.dequant.reserve(runtime_quant_dequant_bytes(spec));
+    if (spec.has_int8) {
+        ctx.int8_act.reserve(
+            checked_mul(spec.max_tokens, spec.max_weight_cols,
+                        "int8 activation bytes"));
+        ctx.int8_act_scale.reserve(
+            checked_mul(spec.max_tokens, sizeof(float),
+                        "int8 activation scale bytes"));
+        ctx.int32_acc.reserve(
+            checked_mul(
+                checked_mul(spec.max_tokens, spec.max_weight_rows,
+                            "int32 accumulator elems"),
+                sizeof(std::int32_t),
+                "int32 accumulator bytes"));
+    }
+
+    if (seal_after_reserve) {
+        ctx.dequant.seal("runtime quant dequant scratch");
+        ctx.int8_act.seal("runtime quant INT8 activation scratch");
+        ctx.int8_act_scale.seal("runtime quant INT8 activation-scale scratch");
+        ctx.int32_acc.seal("runtime quant INT8 accumulator scratch");
+    }
+}
+
+namespace {
 
 // Dequant fallback for sm<89 — materialises a bf16 copy of the FP8
 // weight, then runs the classic cuBLAS bf16 GEMM. Costs one extra

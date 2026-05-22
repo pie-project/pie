@@ -193,6 +193,7 @@ struct CudaMemoryPlan {
     int kv_pages = 0;
     int state_slots = 0;
     std::size_t attn_float_workspace_bytes = 0;
+    std::size_t runtime_quant_scratch_bytes = 0;
     std::size_t arena_bytes = 0;
     std::size_t kv_bytes = 0;
     std::size_t state_bytes = 0;
@@ -209,6 +210,8 @@ void min_into(CudaMemoryPlan& dst, const CudaMemoryPlan& src) {
     dst.state_slots = std::min(dst.state_slots, src.state_slots);
     dst.attn_float_workspace_bytes = std::max(
         dst.attn_float_workspace_bytes, src.attn_float_workspace_bytes);
+    dst.runtime_quant_scratch_bytes = std::max(
+        dst.runtime_quant_scratch_bytes, src.runtime_quant_scratch_bytes);
     dst.arena_bytes = std::max(dst.arena_bytes, src.arena_bytes);
     dst.kv_bytes = std::min(dst.kv_bytes, src.kv_bytes);
     dst.state_bytes = std::min(dst.state_bytes, src.state_bytes);
@@ -228,6 +231,42 @@ void min_into(CudaMemoryPlan& dst, const CudaMemoryPlan& src) {
         dst.capacity.max_sampler_rows, src.capacity.max_sampler_rows);
     dst.capacity.max_logprob_labels = std::min(
         dst.capacity.max_logprob_labels, src.capacity.max_logprob_labels);
+}
+
+pie_cuda_driver::ops::RuntimeQuantScratchSpec runtime_quant_scratch_spec(
+    const pie_cuda_driver::LoadedModel& engine,
+    std::size_t max_tokens)
+{
+    pie_cuda_driver::ops::RuntimeQuantScratchSpec spec;
+    spec.max_tokens = max_tokens;
+
+    const auto& store = engine.weight_store();
+    for (const auto& item : store.quant_meta_map()) {
+        const auto& name = item.first;
+        auto it = store.find(name);
+        if (it == store.end()) continue;
+        const auto& tensor = it->second.tensor;
+        if (tensor.shape().size() != 2) continue;
+
+        if (tensor.dtype() == pie_cuda_driver::DType::FP8_E4M3) {
+            spec.has_fp8 = true;
+        } else if (tensor.dtype() == pie_cuda_driver::DType::INT8) {
+            spec.has_int8 = true;
+        } else {
+            continue;
+        }
+
+        spec.max_weight_rows = std::max<std::size_t>(
+            spec.max_weight_rows,
+            static_cast<std::size_t>(std::max<std::int64_t>(
+                0, tensor.shape()[0])));
+        spec.max_weight_cols = std::max<std::size_t>(
+            spec.max_weight_cols,
+            static_cast<std::size_t>(std::max<std::int64_t>(
+                0, tensor.shape()[1])));
+    }
+
+    return spec;
 }
 
 CudaMemoryPlan tp_min_plan(const pie_cuda_driver::Config& cfg,
@@ -474,17 +513,19 @@ std::size_t attention_float_workspace_bytes(
 }
 
 std::size_t kv_page_bytes_homogeneous(const pie_cuda_driver::HfConfig& cfg,
-                                      int tp_size) {
+                                      int tp_size,
+                                      const pie_cuda_driver::KvCacheFormat& format) {
     const int kv_heads = cfg.num_key_value_heads / std::max(1, tp_size);
-    return static_cast<std::size_t>(cfg.num_hidden_layers) * 2 *
-           kv_heads * cfg.head_dim_kernel * 2;
+    return static_cast<std::size_t>(cfg.num_hidden_layers) *
+           format.total_bytes_per_page(1, kv_heads, cfg.head_dim_kernel);
 }
 
 std::size_t kv_page_bytes_per_layer(
     const pie_cuda_driver::HfConfig& cfg,
     const std::vector<int>& per_layer_head_dim,
     const std::vector<int>& kv_source_layer,
-    int tp_size) {
+    int tp_size,
+    const pie_cuda_driver::KvCacheFormat& format) {
     std::size_t per_token = 0;
     const int kv_heads = cfg.num_key_value_heads / std::max(1, tp_size);
     for (int i = 0; i < cfg.num_hidden_layers; ++i) {
@@ -493,8 +534,7 @@ std::size_t kv_page_bytes_per_layer(
         const int hd = per_layer_head_dim.empty()
             ? cfg.head_dim_kernel
             : per_layer_head_dim[i];
-        per_token += static_cast<std::size_t>(2) *
-                     kv_heads * hd * 2;
+        per_token += format.total_bytes_per_page(1, kv_heads, hd);
     }
     return per_token;
 }
@@ -658,11 +698,18 @@ bool json_required_eq(const nlohmann::json& key,
 bool planner_profile_key_matches(const nlohmann::json& key,
                                  const cudaDeviceProp& prop,
                                  const pie_cuda_driver::HfConfig& hf,
-                                 int tp_size) {
+                                 int tp_size,
+                                 const pie_cuda_driver::KvCacheFormat& kv_format) {
+    const auto kv_it = key.find("kv_cache_dtype");
+    const bool kv_matches =
+        (kv_it != key.end() && kv_it->is_string())
+            ? kv_it->get<std::string>() == kv_format.name
+            : kv_format.is_native_bf16();
     return json_required_eq(key, "gpu_name", std::string(prop.name)) &&
            json_required_eq(key, "compute_major", prop.major) &&
            json_required_eq(key, "compute_minor", prop.minor) &&
            json_required_eq(key, "sm_count", prop.multiProcessorCount) &&
+           kv_matches &&
            json_required_eq(key, "tp_size", tp_size) &&
            json_required_eq(key, "model_type", hf.model_type) &&
            json_required_eq(key, "hidden_size", hf.hidden_size) &&
@@ -684,6 +731,8 @@ CudaMemoryPlan plan_cuda_memory(
     bool is_qwen3_5_arch,
     bool is_qwen3_5_moe_arch,
     int qwen3_5_linear_layers,
+    const pie_cuda_driver::KvCacheFormat& kv_format,
+    const pie_cuda_driver::ops::RuntimeQuantScratchSpec& runtime_quant_scratch_base,
     bool verbose)
 {
     int dev_id = 0;
@@ -728,8 +777,9 @@ CudaMemoryPlan plan_cuda_memory(
     const std::size_t per_kv_token_bytes =
         is_gemma4_arch
             ? kv_page_bytes_per_layer(hf, gemma4_per_layer_head_dim,
-                                      gemma4_kv_source_layer, tp_size)
-            : kv_page_bytes_homogeneous(hf, tp_size);
+                                      gemma4_kv_source_layer, tp_size,
+                                      kv_format)
+            : kv_page_bytes_homogeneous(hf, tp_size, kv_format);
     if (per_kv_token_bytes == 0) {
         throw std::runtime_error("cuda memory planner: computed zero KV page bytes");
     }
@@ -784,6 +834,9 @@ CudaMemoryPlan plan_cuda_memory(
         std::max(1, prefill_target / 2),
         1024,
         512,
+        256,
+        128,
+        64,
     };
     if (policy_profile == "throughput") {
         Ns.push_back(4 * prefill_target);
@@ -803,6 +856,10 @@ CudaMemoryPlan plan_cuda_memory(
         128,
         64,
         32,
+        16,
+        8,
+        4,
+        1,
     };
     if (policy_profile == "throughput" || score_as_auto) {
         Rs.push_back(4 * decode_target);
@@ -826,7 +883,7 @@ CudaMemoryPlan plan_cuda_memory(
                                   static_cast<int>(
                                       (static_cast<std::int64_t>(N) *
                                        std::max(1024, R0 * 64) + 7) / 8)));
-            const int output_rows = R0;
+            const int output_rows = std::max(R0, std::min(N, 64));
             std::size_t arena = 0;
             arena += workspace_bytes(
                 hf, N, output_rows, max_intermediate, max_Hq, max_Hk);
@@ -845,6 +902,12 @@ CudaMemoryPlan plan_cuda_memory(
             arena += 8ull * 1024 * 1024;  // AttentionWorkspace int section
             arena += persistent_input_bytes(N, R0, max_page_refs,
                                             max_custom_mask_bytes);
+            auto quant_scratch_spec = runtime_quant_scratch_base;
+            quant_scratch_spec.max_tokens = static_cast<std::size_t>(N);
+            const std::size_t runtime_quant_scratch_bytes =
+                pie_cuda_driver::ops::runtime_quant_scratch_bytes(
+                    quant_scratch_spec);
+            arena += runtime_quant_scratch_bytes;
             arena = align_up(arena, 2ull * 1024 * 1024);
             if (arena >= budget) continue;
 
@@ -887,8 +950,12 @@ CudaMemoryPlan plan_cuda_memory(
                               : 608.0;
             const double score_kv_horizon =
                 score_as_auto ? (low_horizon_kv_heavy ? 384.0 : 544.0) : 608.0;
+            const std::size_t min_kv_floor =
+                (!cfg.model.runtime_quant.empty() && kv_heavy_model)
+                    ? 1024
+                    : 32768;
             const std::size_t min_kv_tokens = std::max<std::size_t>(
-                32768,
+                min_kv_floor,
                 static_cast<std::size_t>(
                     std::ceil(static_cast<double>(R) * min_kv_horizon)));
             if (kv_tokens < min_kv_tokens) continue;
@@ -901,6 +968,7 @@ CudaMemoryPlan plan_cuda_memory(
             p.kv_pages = kv_pages;
             p.state_slots = state_slots;
             p.attn_float_workspace_bytes = attn_float_bytes;
+            p.runtime_quant_scratch_bytes = runtime_quant_scratch_bytes;
             p.arena_bytes = arena;
             p.kv_bytes = static_cast<std::size_t>(kv_pages) * per_page_bytes;
             p.state_bytes = state_bytes;
@@ -1064,7 +1132,8 @@ CudaMemoryPlan plan_cuda_memory(
                             continue;
                         }
                         if (!planner_profile_key_matches(
-                                entry["key"], prop, hf, tp_size)) {
+                                entry["key"], prop, hf, tp_size,
+                                kv_format)) {
                             continue;
                         }
                         const auto& plan = entry["plan"];
@@ -1141,6 +1210,9 @@ CudaMemoryPlan plan_cuda_memory(
                   << " R=" << p.max_requests
                   << " page_refs=" << p.max_page_refs
                   << " arena=" << (p.arena_bytes / (1024 * 1024)) << " MiB"
+                  << " rq_scratch="
+                  << (p.runtime_quant_scratch_bytes / (1024 * 1024))
+                  << " MiB"
                   << " kv_pages=" << p.kv_pages
                   << " kv_tokens="
                   << (static_cast<std::size_t>(p.kv_pages) *
@@ -1647,6 +1719,7 @@ int run_impl(int argc,
                       << "(world=" << tp_comm.world_size()
                       << ", rank=" << tp_comm.rank() << ")\n";
         }
+        tp_startup_cpu_barrier(cfg);
 
         // Smoke test: every rank contributes (rank+1); sum should be
         // world*(world+1)/2. Catches mis-numbered ranks at startup.
@@ -1657,8 +1730,9 @@ int run_impl(int argc,
         const int rank1 = cfg.distributed.tp_rank + 1;
         CUDA_CHECK(cudaMemcpyAsync(d_v, &rank1, sizeof(int),
                                    cudaMemcpyHostToDevice, s));
-        NCCL_CHECK(ncclAllReduce(d_v, d_v, 1, ncclInt32, ncclSum,
-                                 tp_comm.comm(), s));
+        NCCL_CHECK_ASYNC(ncclAllReduce(d_v, d_v, 1, ncclInt32, ncclSum,
+                                       tp_comm.comm(), s),
+                         tp_comm.comm());
         int h_v = 0;
         CUDA_CHECK(cudaMemcpyAsync(&h_v, d_v, sizeof(int),
                                    cudaMemcpyDeviceToHost, s));
@@ -1812,12 +1886,21 @@ int run_impl(int argc,
 
     const int qwen3_5_linear_layers = static_cast<int>(std::count(
         qwen3_5_layer_is_linear.begin(), qwen3_5_layer_is_linear.end(), true));
+    const bool graph_capable_forward =
+        use_cuda_graphs && bound_model.is_llama_like();
+    const auto runtime_quant_scratch_base =
+        graph_capable_forward
+            ? runtime_quant_scratch_spec(engine, /*max_tokens=*/0)
+            : pie_cuda_driver::ops::RuntimeQuantScratchSpec{};
+    const auto kv_format = pie_cuda_driver::kv_cache_format_from_string(
+        cfg.batching.kv_cache_dtype, cfg.model.dtype);
 
     const CudaMemoryPlan mem_plan = plan_cuda_memory(
         cfg, engine.hf_config(), max_mlp_intermediate, max_Hq, max_Hk,
         is_gemma4_arch, weights_gemma4.per_layer_head_dim,
         weights_gemma4.kv_source_layer, is_qwen3_5_arch,
-        is_qwen3_5_moe_arch, qwen3_5_linear_layers, verbose);
+        is_qwen3_5_moe_arch, qwen3_5_linear_layers,
+        kv_format, runtime_quant_scratch_base, verbose);
     const int max_workspace_tokens = mem_plan.max_workspace_tokens;
     // `mem_plan.kv_pages` is the runtime-visible KV capacity. CUDA graph
     // padding needs one isolated page for synthetic rows when replaying a
@@ -1835,8 +1918,6 @@ int run_impl(int argc,
         max_mlp_intermediate, max_Hq, max_Hk,
         mem_plan.capacity.max_logit_rows);
 
-    const auto kv_format = pie_cuda_driver::kv_cache_format_from_string(
-        cfg.batching.kv_cache_dtype, cfg.model.dtype);
     auto kv_cache =
         is_gemma4_arch
             ? pie_cuda_driver::KvCache::allocate_per_layer(
@@ -1930,6 +2011,29 @@ int run_impl(int argc,
         kv_cache, static_cast<int>(cfg.batching.swap_pool_size));
 
     pie_cuda_driver::ops::CublasHandle cublas;
+    auto runtime_quant_scratch = runtime_quant_scratch_base;
+    runtime_quant_scratch.max_tokens =
+        static_cast<std::size_t>(max_workspace_tokens);
+    if (!runtime_quant_scratch.empty()) {
+        pie_cuda_driver::ops::reserve_runtime_quant_scratch(
+            runtime_quant_scratch,
+            /*seal_after_reserve=*/true);
+        CUDA_CHECK(cudaDeviceSynchronize());
+        if (verbose) {
+            std::cerr << "[pie-driver-cuda] runtime quant graph scratch: "
+                      << (runtime_quant_scratch.has_fp8 ? "fp8" : "")
+                      << (runtime_quant_scratch.has_fp8 &&
+                          runtime_quant_scratch.has_int8 ? "+" : "")
+                      << (runtime_quant_scratch.has_int8 ? "int8" : "")
+                      << " max_tokens=" << runtime_quant_scratch.max_tokens
+                      << " max_N=" << runtime_quant_scratch.max_weight_rows
+                      << " max_K=" << runtime_quant_scratch.max_weight_cols
+                      << " reserved="
+                      << (mem_plan.runtime_quant_scratch_bytes /
+                          (1024 * 1024))
+                      << " MiB (sealed for CUDA graphs)\n";
+        }
+    }
 
     // Persistent input buffers, sized for the planned worst case so
     // device pointers stay stable across fires (prereq for graphs).
@@ -1966,6 +2070,9 @@ int run_impl(int argc,
                   << "; max requests=" << mem_plan.max_requests
                   << "; page_refs=" << mem_plan.max_page_refs
                   << "; arena ~" << (mem_plan.arena_bytes / (1024 * 1024))
+                  << " MiB"
+                  << "; rq_scratch="
+                  << (mem_plan.runtime_quant_scratch_bytes / (1024 * 1024))
                   << " MiB"
                   << "; attn_ws="
                   << (mem_plan.attn_float_workspace_bytes / (1024 * 1024))
@@ -2111,7 +2218,8 @@ int run_impl(int argc,
             fwd_cfg.per_layer_window_left.empty();
         if (fwd_cfg.use_prefill_decode_plan) {
             const std::size_t rank_kv_token_bytes =
-                kv_page_bytes_homogeneous(hf, std::max(1, cfg.distributed.tp_size));
+                kv_page_bytes_homogeneous(
+                    hf, std::max(1, cfg.distributed.tp_size), kv_format);
             const std::size_t global_kv_token_bytes =
                 rank_kv_token_bytes *
                 static_cast<std::size_t>(std::max(1, cfg.distributed.tp_size));
