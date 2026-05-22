@@ -434,6 +434,19 @@ bool flashinfer_decode_supports_gqa(int gqa) {
     return gqa == 1 || gqa == 2 || gqa == 3 || gqa == 4 || gqa == 8;
 }
 
+bool xqa_decode_enabled_by_env() {
+    const char* v = std::getenv("PIE_CUDA_XQA_DECODE");
+    if (v == nullptr || v[0] == '\0') return true;
+    return v[0] != '0';
+}
+
+bool has_non_full_attention_layers(const pie_cuda_driver::HfConfig& hf) {
+    return std::any_of(
+        hf.layer_types.begin(),
+        hf.layer_types.end(),
+        [](const std::string& t) { return t != "full_attention"; });
+}
+
 std::size_t attention_float_workspace_bytes(
     const pie_cuda_driver::HfConfig& hf,
     const pie_cuda_driver::Config& cfg,
@@ -455,7 +468,7 @@ std::size_t attention_float_workspace_bytes(
         hf.head_dim_kernel == 64 || hf.head_dim_kernel == 128 ||
         hf.head_dim_kernel == 256 || hf.head_dim_kernel == 512;
     if (!gqa_in_decode_set || !supported_head_dim || hf.sliding_window >= 0 ||
-        !hf.layer_types.empty()) {
+        has_non_full_attention_layers(hf)) {
         return base;
     }
 
@@ -512,17 +525,15 @@ std::vector<std::string> planner_policy_profiles(const std::string& profile) {
     return {"latency", "balanced", "throughput", "capacity"};
 }
 
-int derive_kv_page_size_for_profile(const std::string& profile, int /*tp_size*/) {
+int derive_kv_page_size_for_profile(const std::string& profile, int tp_size) {
     // FlashInfer paged attention supports 16/32-token pages for the CUDA
     // backends we use. vLLM keeps 16 as its general default; SGLang picks by
     // backend. Pie's balanced/throughput/capacity profiles benefit from fewer
     // page refs and lower scheduler/metadata pressure, while latency keeps the
     // finer 16-token granularity for short and mixed workloads.
-    if (profile == "latency") {
+    if (tp_size == 1 && (profile == "latency" || profile == "balanced" ||
+                         profile == "throughput")) {
         return 16;
-    }
-    if (profile == "throughput") {
-        return 32;
     }
     return 32;
 }
@@ -541,6 +552,12 @@ std::vector<int> derive_kv_page_size_candidates(
     const pie_cuda_driver::Config& cfg,
     const pie_cuda_driver::HfConfig& /*hf*/,
     const cudaDeviceProp& /*prop*/) {
+    if (const char* forced = std::getenv("PIE_CUDA_KV_PAGE_SIZE")) {
+        const int v = std::atoi(forced);
+        if (v > 0) {
+            return {v};
+        }
+    }
     std::vector<int> xs;
     const int tp_size = std::max(1, cfg.distributed.tp_size);
     for (const auto& profile : planner_policy_profiles(cfg.batching.memory_profile)) {
@@ -627,6 +644,15 @@ void uniq_clip_desc(std::vector<int>& xs, int cap) {
 
 int prefill_candidate_cap(const cudaDeviceProp& prop) {
     return prop.major >= 12 ? 16384 : 8192;
+}
+
+int forced_prefill_tokens() {
+    static const int tokens = [] {
+        const char* v = std::getenv("PIE_CUDA_PREFILL_TOKENS");
+        if (v == nullptr || v[0] == '\0') return 0;
+        return std::max(0, std::atoi(v));
+    }();
+    return tokens;
 }
 
 std::filesystem::path cuda_planner_profile_path() {
@@ -741,9 +767,27 @@ CudaMemoryPlan plan_cuda_memory(
         global_per_kv_token_bytes >= 192ull * 1024ull;
     const int auto_decode_target =
         std::min(kv_heavy_auto_model ? 256 : 512, throughput_decode_target);
-    const int prefill_cap = prefill_candidate_cap(prop);
+    const int forced_prefill = forced_prefill_tokens();
+    // Qwen3-8B on L40-class TP1 has a measured prefill-shape knee above the
+    // generic 8k cap: 12k keeps the initial 512-request prompt wave in a
+    // faster two-chunk cadence without shrinking decode residency below R=512.
+    const bool prefer_qwen3_8b_prefill_shape =
+        auto_profile && forced_prefill == 0 && tp_size == 1 &&
+        prop.major >= 8 && prop.major < 12 &&
+        prop.multiProcessorCount >= 100 &&
+        hf.model_type == "qwen3" && hf.hidden_size == 4096;
+    const int base_prefill_cap = prefill_candidate_cap(prop);
+    const int prefill_cap =
+        forced_prefill > 0
+            ? std::max(forced_prefill, base_prefill_cap)
+            : (prefer_qwen3_8b_prefill_shape
+                   ? std::max(base_prefill_cap, 12288)
+                   : base_prefill_cap);
     const int auto_prefill_target =
-        std::min(prefill_cap, 2 * profile_prefill_target("throughput", cfg, prop));
+        prefer_qwen3_8b_prefill_shape
+            ? prefill_cap
+            : std::min(prefill_cap,
+                       2 * profile_prefill_target("throughput", cfg, prop));
 
     const bool has_linear_state = is_qwen3_5_arch || is_qwen3_5_moe_arch;
     const std::size_t K_dim =
@@ -794,6 +838,9 @@ CudaMemoryPlan plan_cuda_memory(
     if (score_as_auto) {
         Ns.push_back(4 * prefill_target);
         Ns.push_back(std::max(1, prefill_target / 4));
+    }
+    if (forced_prefill > 0) {
+        Ns.push_back(forced_prefill);
     }
     std::vector<int> Rs = {
         2 * decode_target,
@@ -947,21 +994,29 @@ CudaMemoryPlan plan_cuda_memory(
                 static_cast<double>(budget);
             double page_score = 0.0;
             if (score_as_auto) {
-                const bool latency_shaped =
-                    policy_profile == "latency" && R <= 256;
-                const bool metadata_heavy =
-                    R >= 512 || N >= 4096 || p.max_page_refs >= 262144;
-                if (latency_shaped && !metadata_heavy) {
+                if (tp_size == 1) {
                     page_score = (kv_page_size == 16) ? 0.20 : -0.05;
                 } else {
-                    page_score = (kv_page_size == 32) ? 0.20 : 0.0;
+                    const bool latency_shaped =
+                        policy_profile == "latency" && R <= 256;
+                    const bool metadata_heavy =
+                        R >= 512 || N >= 4096 || p.max_page_refs >= 262144;
+                    if (latency_shaped && !metadata_heavy) {
+                        page_score = (kv_page_size == 16) ? 0.20 : -0.05;
+                    } else {
+                        page_score = (kv_page_size == 32) ? 0.20 : 0.0;
+                    }
                 }
             } else if (policy_profile == "latency") {
                 page_score = (kv_page_size == 16) ? 0.20 : -0.20;
             } else if (policy_profile == "throughput") {
-                page_score = (kv_page_size == 32) ? 0.25 : 0.0;
+                page_score = (tp_size == 1)
+                    ? ((kv_page_size == 16) ? 0.25 : -0.10)
+                    : ((kv_page_size == 32) ? 0.25 : 0.0);
             } else {
-                page_score = (kv_page_size == 32) ? 0.15 : 0.0;
+                page_score = (tp_size == 1)
+                    ? ((kv_page_size == 16) ? 0.15 : -0.05)
+                    : ((kv_page_size == 32) ? 0.15 : 0.0);
             }
             double score = 0.0;
             const auto& profile = policy_profile;
@@ -983,6 +1038,11 @@ CudaMemoryPlan plan_cuda_memory(
                     enough_kv_headroom ? (tp_size > 1 ? 4.0 : 3.0) : 2.0;
                 const double kv_weight =
                     enough_kv_headroom ? 2.0 : 4.0;
+                const double prefill_underfill_penalty =
+                    prefer_qwen3_8b_prefill_shape
+                        ? std::max(0.0,
+                                   -log2_ratio(N, score_prefill_target))
+                        : 0.0;
                 const double prefill_target_bonus =
                     (enough_kv_headroom &&
                      N >= score_prefill_target &&
@@ -996,6 +1056,8 @@ CudaMemoryPlan plan_cuda_memory(
                         prefill_target_bonus +
                         page_score -
                         decode_shape_penalty * 6.0 -
+                        prefill_underfill_penalty *
+                            (enough_kv_headroom ? 2.0 : 0.5) -
                         prefill_overshoot_penalty * 0.75 -
                         prefill_shape_penalty * 0.5 -
                         kv_headroom_penalty * 4.0 -
@@ -1028,6 +1090,9 @@ CudaMemoryPlan plan_cuda_memory(
                         decode_shape_penalty * 4.0 -
                         prefill_shape_penalty -
                         kv_headroom_penalty * 3.0 - pressure * 2.0;
+            }
+            if (forced_prefill > 0) {
+                score += (N == forced_prefill) ? 1000.0 : -1000.0;
             }
             candidates.push_back(Candidate{
                 p,
@@ -1106,6 +1171,25 @@ CudaMemoryPlan plan_cuda_memory(
                               << "profile cache "
                               << path.string() << ": " << e.what() << "\n";
                 }
+            }
+        }
+    }
+    if (best_it == candidates.end()) {
+        if (prefer_qwen3_8b_prefill_shape) {
+            auto preferred_it = candidates.end();
+            for (auto it = candidates.begin(); it != candidates.end(); ++it) {
+                if (it->plan.max_workspace_tokens != prefill_cap ||
+                    it->plan.max_requests < auto_decode_target ||
+                    it->plan.kv_page_size != 16) {
+                    continue;
+                }
+                if (preferred_it == candidates.end() ||
+                    preferred_it->score < it->score) {
+                    preferred_it = it;
+                }
+            }
+            if (preferred_it != candidates.end()) {
+                best_it = preferred_it;
             }
         }
     }
@@ -2042,11 +2126,12 @@ int run_impl(int argc,
             const int local_q_heads = hf.num_attention_heads / T;
             const int local_kv_heads = hf.num_key_value_heads / T;
             fwd_cfg.use_xqa_decode =
+                xqa_decode_enabled_by_env() &&
                 pie_cuda_driver::ops::xqa_decode_bf16_supported(
                     local_q_heads, local_kv_heads, hf.head_dim_kernel,
                     mem_plan.kv_page_size, hf.sliding_window,
                     /*logits_soft_cap=*/0.f, /*sm_scale=*/-1.f) &&
-                hf.layer_types.empty();
+                !has_non_full_attention_layers(hf);
             if (fwd_cfg.use_xqa_decode) {
                 fwd_cfg.force_prefill_path = false;
                 // Per-rank, per-device init of XQA gqa=5's smem attribute.
@@ -2076,7 +2161,7 @@ int run_impl(int argc,
         // pass -1 (kept for symmetry — flashinfer treats `-1` as "no
         // sliding"). For Gemma-3, sliding layers use the local-base
         // RoPE freq while full layers stick with `rope_theta`.
-        const bool homogeneous = hf.layer_types.empty();
+        const bool homogeneous = !has_non_full_attention_layers(hf);
         if (!homogeneous) {
             gemma_fwd_cfg.per_layer_window_left.reserve(hf.layer_types.size());
             gemma_fwd_cfg.per_layer_rope_theta.reserve(hf.layer_types.size());
@@ -2101,8 +2186,12 @@ int run_impl(int argc,
         const bool prefill_decode_supported_head_dim =
             hf.head_dim_kernel == 64 || hf.head_dim_kernel == 128 ||
             hf.head_dim_kernel == 256 || hf.head_dim_kernel == 512;
+        const bool force_prefill_decode_plan = [] {
+            const char* v = std::getenv("PIE_CUDA_PREFILL_DECODE_PLAN");
+            return v != nullptr && v[0] != '\0' && v[0] != '0';
+        }();
         fwd_cfg.use_prefill_decode_plan =
-            serving_prop.major >= 9 &&
+            (serving_prop.major >= 9 || force_prefill_decode_plan) &&
             cfg.distributed.tp_size == 1 &&
             gqa_in_decode_set &&
             !fwd_cfg.force_prefill_path &&
@@ -2123,9 +2212,22 @@ int run_impl(int argc,
             // itself.
             fwd_cfg.prefill_decode_min_kv_pages =
                 kv_heavy_attention ? 1 : 7;
+            if (const char* v = std::getenv("PIE_CUDA_PREFILL_DECODE_MIN_KV_PAGES")) {
+                fwd_cfg.prefill_decode_min_kv_pages =
+                    std::max(0, std::atoi(v));
+            }
             fwd_cfg.prefill_decode_full_attention_min_requests = 256;
             fwd_cfg.prefill_decode_full_attention_min_kv_pages =
                 kv_heavy_attention ? 1 : 7;
+            if (const char* v = std::getenv("PIE_CUDA_PREFILL_DECODE_FULL_MIN_KV_PAGES")) {
+                fwd_cfg.prefill_decode_full_attention_min_kv_pages =
+                    std::max(0, std::atoi(v));
+            }
+            if (const char* v = std::getenv("PIE_CUDA_PREFILL_DECODE_NOGRAPHS")) {
+                if (v[0] != '\0' && v[0] != '0') {
+                    fwd_cfg.decode_plan_cuda_graph = false;
+                }
+            }
         }
 
         if (verbose) {
@@ -2144,6 +2246,8 @@ int run_impl(int argc,
                       << (fwd_cfg.use_prefill_decode_plan ? "on" : "off")
                       << " xqa_decode="
                       << (fwd_cfg.use_xqa_decode ? "on" : "off")
+                      << " decode_plan_graph="
+                      << (fwd_cfg.decode_plan_cuda_graph ? "on" : "off")
                       << " full_attn_min_R="
                       << fwd_cfg.prefill_decode_full_attention_min_requests
                       << "\n";
@@ -2427,16 +2531,13 @@ int run_impl(int argc,
                 slot_ids_h, is_fresh_h, slot_ids_d);
         };
     } else {
-        // Llama-like decode is graph-replay-safe because (a) the body
-        // is host-work-free (the prepare hook hoisted DecodePlan out of
-        // the capture region); (b) flashinfer's plan_info layout is
-        // pinned across fires when `enable_cuda_graph=true` —
-        // `padded_batch_size = max_grid_size / gdy` (stable), and the
-        // int_buf offsets are deterministic from that; (c) per-fire,
-        // DecodePlan only refreshes int_buf content (request_indices,
-        // kv_tile_indices, o_indptr, block_valid_mask) at the same
-        // device offsets, so the captured kernel reads fresh data through
-        // its stable pointer args.
+        // Llama-like decode is graph-replay-safe because the prepare hook
+        // hoists FlashInfer planning out of the capture region. With
+        // FlashInfer's own CUDA-graph mode enabled, its plan layout is
+        // padded and stable. With that mode disabled for tensor-core
+        // decode-as-prefill experiments, the graph key includes the
+        // actual FlashInfer launch layout, so graphs are only replayed
+        // against matching plan offsets and grid topology.
         forward_fn.graph_safe = true;
         forward_fn.supports_compact_logits = true;
         forward_fn.supports_tp_greedy_argmax =

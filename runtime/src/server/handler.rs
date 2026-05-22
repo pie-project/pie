@@ -83,9 +83,98 @@ impl Session {
                         serde_json::Value::from(inf.last_batch_latency_us),
                     );
                     stats.insert(
+                        format!("{}.cumulative_batch_latency_us", model_name),
+                        serde_json::Value::from(inf.cumulative_batch_latency_us),
+                    );
+                    stats.insert(
                         format!("{}.avg_batch_latency_us", model_name),
                         serde_json::Value::from(inf.avg_batch_latency_us),
                     );
+                    for (name, value) in [
+                        ("last_request_queue_us", inf.last_request_queue_us),
+                        (
+                            "cumulative_request_queue_us",
+                            inf.cumulative_request_queue_us,
+                        ),
+                        ("avg_request_queue_us", inf.avg_request_queue_us),
+                        ("last_batch_queue_us", inf.last_batch_queue_us),
+                        ("cumulative_batch_queue_us", inf.cumulative_batch_queue_us),
+                        ("avg_batch_queue_us", inf.avg_batch_queue_us),
+                        ("last_permit_wait_us", inf.last_permit_wait_us),
+                        ("cumulative_permit_wait_us", inf.cumulative_permit_wait_us),
+                        ("avg_permit_wait_us", inf.avg_permit_wait_us),
+                        ("last_batch_build_us", inf.last_batch_build_us),
+                        ("cumulative_batch_build_us", inf.cumulative_batch_build_us),
+                        ("avg_batch_build_us", inf.avg_batch_build_us),
+                        ("last_driver_forward_us", inf.last_driver_forward_us),
+                        (
+                            "cumulative_driver_forward_us",
+                            inf.cumulative_driver_forward_us,
+                        ),
+                        ("avg_driver_forward_us", inf.avg_driver_forward_us),
+                        ("last_response_fanout_us", inf.last_response_fanout_us),
+                        (
+                            "cumulative_response_fanout_us",
+                            inf.cumulative_response_fanout_us,
+                        ),
+                        ("avg_response_fanout_us", inf.avg_response_fanout_us),
+                        ("last_response_classify_us", inf.last_response_classify_us),
+                        (
+                            "cumulative_response_classify_us",
+                            inf.cumulative_response_classify_us,
+                        ),
+                        ("avg_response_classify_us", inf.avg_response_classify_us),
+                        (
+                            "last_response_token_output_build_us",
+                            inf.last_response_token_output_build_us,
+                        ),
+                        (
+                            "cumulative_response_token_output_build_us",
+                            inf.cumulative_response_token_output_build_us,
+                        ),
+                        (
+                            "avg_response_token_output_build_us",
+                            inf.avg_response_token_output_build_us,
+                        ),
+                        (
+                            "last_response_direct_send_us",
+                            inf.last_response_direct_send_us,
+                        ),
+                        (
+                            "cumulative_response_direct_send_us",
+                            inf.cumulative_response_direct_send_us,
+                        ),
+                        (
+                            "avg_response_direct_send_us",
+                            inf.avg_response_direct_send_us,
+                        ),
+                        (
+                            "last_response_chunk_send_us",
+                            inf.last_response_chunk_send_us,
+                        ),
+                        (
+                            "cumulative_response_chunk_send_us",
+                            inf.cumulative_response_chunk_send_us,
+                        ),
+                        ("avg_response_chunk_send_us", inf.avg_response_chunk_send_us),
+                        ("last_response_extract_us", inf.last_response_extract_us),
+                        (
+                            "cumulative_response_extract_us",
+                            inf.cumulative_response_extract_us,
+                        ),
+                        ("avg_response_extract_us", inf.avg_response_extract_us),
+                        ("last_response_error_us", inf.last_response_error_us),
+                        (
+                            "cumulative_response_error_us",
+                            inf.cumulative_response_error_us,
+                        ),
+                        ("avg_response_error_us", inf.avg_response_error_us),
+                    ] {
+                        stats.insert(
+                            format!("{}.{}", model_name, name),
+                            serde_json::Value::from(value),
+                        );
+                    }
                     // Speculation hit counters — observability for
                     // `try_hit`/chain submissions/drops.
                     stats.insert(
@@ -106,6 +195,73 @@ impl Session {
                         serde_json::Value::from(
                             inference::CHAIN_DROP_COUNT.load(std::sync::atomic::Ordering::Relaxed),
                         ),
+                    );
+                }
+
+                let proc = process::get_runtime_stats();
+                for (name, value) in [
+                    ("completed", proc.completed),
+                    (
+                        "cumulative_admission_wait_us",
+                        proc.cumulative_admission_wait_us,
+                    ),
+                    ("avg_admission_wait_us", proc.avg_admission_wait_us),
+                    ("last_admission_wait_us", proc.last_admission_wait_us),
+                    ("cumulative_instantiate_us", proc.cumulative_instantiate_us),
+                    ("avg_instantiate_us", proc.avg_instantiate_us),
+                    ("last_instantiate_us", proc.last_instantiate_us),
+                    (
+                        "cumulative_context_register_us",
+                        proc.cumulative_context_register_us,
+                    ),
+                    ("avg_context_register_us", proc.avg_context_register_us),
+                    ("last_context_register_us", proc.last_context_register_us),
+                    ("cumulative_wasm_run_us", proc.cumulative_wasm_run_us),
+                    ("avg_wasm_run_us", proc.avg_wasm_run_us),
+                    ("last_wasm_run_us", proc.last_wasm_run_us),
+                ] {
+                    stats.insert(format!("process.{}", name), serde_json::Value::from(value));
+                }
+
+                let api_forward = crate::api::inference::get_api_forward_stats();
+                for (name, value) in [
+                    ("completed", api_forward.completed),
+                    ("hit_path", api_forward.hit_path),
+                    ("cold_path", api_forward.cold_path),
+                    ("cumulative_execute_us", api_forward.cumulative_execute_us),
+                    ("avg_execute_us", api_forward.avg_execute_us),
+                    ("cumulative_try_hit_us", api_forward.cumulative_try_hit_us),
+                    ("avg_try_hit_us", api_forward.avg_try_hit_us),
+                    (
+                        "cumulative_staged_await_us",
+                        api_forward.cumulative_staged_await_us,
+                    ),
+                    ("avg_staged_await_us", api_forward.avg_staged_await_us),
+                    (
+                        "cumulative_cold_prepare_us",
+                        api_forward.cumulative_cold_prepare_us,
+                    ),
+                    ("avg_cold_prepare_us", api_forward.avg_cold_prepare_us),
+                    ("cumulative_pin_us", api_forward.cumulative_pin_us),
+                    ("avg_pin_us", api_forward.avg_pin_us),
+                    (
+                        "cumulative_submit_await_us",
+                        api_forward.cumulative_submit_await_us,
+                    ),
+                    ("avg_submit_await_us", api_forward.avg_submit_await_us),
+                    ("cumulative_append_us", api_forward.cumulative_append_us),
+                    ("avg_append_us", api_forward.avg_append_us),
+                    ("cumulative_unpin_us", api_forward.cumulative_unpin_us),
+                    ("avg_unpin_us", api_forward.avg_unpin_us),
+                    (
+                        "cumulative_build_output_us",
+                        api_forward.cumulative_build_output_us,
+                    ),
+                    ("avg_build_output_us", api_forward.avg_build_output_us),
+                ] {
+                    stats.insert(
+                        format!("api_forward.{}", name),
+                        serde_json::Value::from(value),
                     );
                 }
 
@@ -256,6 +412,159 @@ impl Session {
             Err(e) => {
                 self.send_response(corr_id, false, e.to_string()).await;
             }
+        }
+    }
+
+    pub(super) async fn handle_launch_processes(
+        &mut self,
+        corr_id: u32,
+        inferlet: String,
+        inputs: Vec<String>,
+        capture_outputs: bool,
+        token_budgets: Option<Vec<Option<usize>>>,
+    ) {
+        if let Some(budgets) = token_budgets.as_ref() {
+            if budgets.len() != inputs.len() {
+                self.send_response(
+                    corr_id,
+                    false,
+                    format!(
+                        "token_budgets length {} does not match inputs length {}",
+                        budgets.len(),
+                        inputs.len()
+                    ),
+                )
+                .await;
+                return;
+            }
+        }
+
+        let program_name = match ProgramName::parse(&inferlet) {
+            Ok(p) => p,
+            Err(e) => {
+                self.send_response(corr_id, false, e.to_string()).await;
+                return;
+            }
+        };
+
+        if let Err(e) = program::install(&program_name).await {
+            self.send_response(corr_id, false, e.to_string()).await;
+            return;
+        }
+
+        let client_id = if capture_outputs { Some(self.id) } else { None };
+        let mut process_ids = Vec::with_capacity(inputs.len());
+        for (idx, input) in inputs.into_iter().enumerate() {
+            let token_budget = token_budgets
+                .as_ref()
+                .and_then(|budgets| budgets.get(idx).copied().flatten());
+            match process::spawn(
+                self.username.clone(),
+                program_name.clone(),
+                input,
+                client_id,
+                capture_outputs,
+                None,
+                None,
+                token_budget,
+            ) {
+                Ok(process_id) => {
+                    if capture_outputs {
+                        self.attached_processes.push(process_id);
+                    }
+                    process_ids.push(process_id.to_string());
+                }
+                Err(e) => {
+                    self.send_response(corr_id, false, e.to_string()).await;
+                    return;
+                }
+            }
+        }
+
+        match serde_json::to_string(&process_ids) {
+            Ok(json) => self.send_response(corr_id, true, json).await,
+            Err(e) => self.send_response(corr_id, false, e.to_string()).await,
+        }
+    }
+
+    pub(super) async fn handle_run_processes(
+        &mut self,
+        corr_id: u32,
+        inferlet: String,
+        inputs: Vec<String>,
+        token_budgets: Option<Vec<Option<usize>>>,
+    ) {
+        if let Some(budgets) = token_budgets.as_ref() {
+            if budgets.len() != inputs.len() {
+                self.send_response(
+                    corr_id,
+                    false,
+                    format!(
+                        "token_budgets length {} does not match inputs length {}",
+                        budgets.len(),
+                        inputs.len()
+                    ),
+                )
+                .await;
+                return;
+            }
+        }
+
+        let program_name = match ProgramName::parse(&inferlet) {
+            Ok(p) => p,
+            Err(e) => {
+                self.send_response(corr_id, false, e.to_string()).await;
+                return;
+            }
+        };
+
+        if let Err(e) = program::install(&program_name).await {
+            self.send_response(corr_id, false, e.to_string()).await;
+            return;
+        }
+
+        let mut receivers = Vec::with_capacity(inputs.len());
+        for (idx, input) in inputs.into_iter().enumerate() {
+            let token_budget = token_budgets
+                .as_ref()
+                .and_then(|budgets| budgets.get(idx).copied().flatten());
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            match process::spawn(
+                self.username.clone(),
+                program_name.clone(),
+                input,
+                None,
+                false,
+                Some(tx),
+                None,
+                token_budget,
+            ) {
+                Ok(_process_id) => receivers.push(rx),
+                Err(e) => {
+                    self.send_response(corr_id, false, e.to_string()).await;
+                    return;
+                }
+            }
+        }
+
+        let mut outputs = Vec::with_capacity(receivers.len());
+        for rx in receivers {
+            match rx.await {
+                Ok(Ok(output)) => outputs.push(output),
+                Ok(Err(e)) => {
+                    self.send_response(corr_id, false, e).await;
+                    return;
+                }
+                Err(e) => {
+                    self.send_response(corr_id, false, e.to_string()).await;
+                    return;
+                }
+            }
+        }
+
+        match serde_json::to_string(&outputs) {
+            Ok(json) => self.send_response(corr_id, true, json).await,
+            Err(e) => self.send_response(corr_id, false, e.to_string()).await,
         }
     }
 

@@ -6,11 +6,12 @@
 
 pub(crate) mod dynamic_linking;
 
+use std::collections::HashMap;
 use std::sync::LazyLock;
 
 use anyhow::{Result, anyhow};
 use tokio::sync::oneshot;
-use wasmtime::component::{Component, Instance as WasmInstance, Linker as WasmLinker};
+use wasmtime::component::{Component, Instance as WasmInstance, InstancePre, Linker as WasmLinker};
 use wasmtime::{Engine, Store};
 
 use crate::api;
@@ -85,6 +86,7 @@ pub async fn instantiate(
 struct Linker {
     engine: Engine,
     policy: InstancePolicy,
+    instance_pre_cache: HashMap<(ProgramName, u64), InstancePre<InstanceState>>,
 }
 
 impl Linker {
@@ -92,11 +94,12 @@ impl Linker {
         Linker {
             engine: engine.clone(),
             policy,
+            instance_pre_cache: HashMap::new(),
         }
     }
 
     async fn instantiate(
-        &self,
+        &mut self,
         process_id: ProcessId,
         username: String,
         program_name: &ProgramName,
@@ -116,6 +119,9 @@ impl Linker {
             .resolve_dependencies_and_runtime(program_name, &main)
             .await?;
         let component = main.component;
+        let cacheable_instance_pre = dependency_components.is_empty()
+            && python_runtime.is_none()
+            && linker_preinstantiate_enabled();
 
         // 3. Gate shared Python runtime loading by whether anything in the graph
         //    declared a python-runtime requirement. Non-Python inferlets pay no
@@ -188,10 +194,27 @@ impl Linker {
         }
 
         // 7. Instantiate the main component
-        let instance = linker
-            .instantiate_async(&mut store, &component)
-            .await
-            .map_err(|e| anyhow!("Instantiation error: {e}"))?;
+        let instance = if cacheable_instance_pre {
+            let cache_key = (program_name.clone(), main.install_id);
+            let pre = match self.instance_pre_cache.get(&cache_key) {
+                Some(pre) => pre.clone(),
+                None => {
+                    let pre = linker
+                        .instantiate_pre(&component)
+                        .map_err(|e| anyhow!("Instantiation pre-link error: {e}"))?;
+                    self.instance_pre_cache.insert(cache_key, pre.clone());
+                    pre
+                }
+            };
+            pre.instantiate_async(&mut store)
+                .await
+                .map_err(|e| anyhow!("Instantiation error: {e}"))?
+        } else {
+            linker
+                .instantiate_async(&mut store, &component)
+                .await
+                .map_err(|e| anyhow!("Instantiation error: {e}"))?
+        };
 
         Ok((store, instance))
     }
@@ -248,6 +271,20 @@ impl Linker {
 
         Ok((components, python_runtime, any_snapshotted))
     }
+}
+
+fn linker_preinstantiate_enabled() -> bool {
+    static ENABLED: LazyLock<bool> = LazyLock::new(|| {
+        std::env::var("PIE_LINKER_PREINSTANTIATE")
+            .map(|value| {
+                let value = value.trim();
+                value == "1"
+                    || value.eq_ignore_ascii_case("true")
+                    || value.eq_ignore_ascii_case("on")
+            })
+            .unwrap_or(false)
+    });
+    *ENABLED
 }
 
 // ---- Messages ---------------------------------------------------------------

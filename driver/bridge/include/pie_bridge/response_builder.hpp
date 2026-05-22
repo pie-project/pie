@@ -148,7 +148,84 @@ public:
         out.entropies            = slice_from(entropies_.data(), entropies_.size());
     }
 
+    inline void build_token_only(std::span<const std::uint32_t> per_request_counts,
+                                 std::span<const std::uint32_t> tokens,
+                                 PieForwardResponseView& out) {
+        reset_for_build(static_cast<std::uint32_t>(per_request_counts.size()));
+
+        tokens_.assign(tokens.begin(), tokens.end());
+        std::uint32_t cursor = 0;
+        tokens_indptr_.push_back(0);
+        for (std::uint32_t n : per_request_counts) {
+            cursor += n;
+            tokens_indptr_.push_back(cursor);
+        }
+
+        finish_view(static_cast<std::uint32_t>(per_request_counts.size()), out);
+    }
+
+    inline void build_token_only_dense(std::span<const std::int32_t> tokens,
+                                       PieForwardResponseView& out) {
+        const std::uint32_t R = static_cast<std::uint32_t>(tokens.size());
+        reset_for_build(R);
+
+        tokens_.resize(tokens.size());
+        tokens_indptr_.resize(static_cast<std::size_t>(R) + 1);
+        for (std::uint32_t r = 0; r < R; ++r) {
+            tokens_[r] = static_cast<std::uint32_t>(tokens[r]);
+            tokens_indptr_[r] = r;
+        }
+        tokens_indptr_[R] = R;
+
+        finish_view(R, out);
+    }
+
 private:
+    inline void reset_for_build(std::uint32_t R) {
+        tokens_indptr_.clear();
+        tokens_.clear();
+        dists_req_indptr_.clear();
+        dists_kv_indptr_.clear();
+        dists_ids_.clear();
+        dists_probs_.clear();
+        logits_req_indptr_.clear();
+        logits_byte_indptr_.clear();
+        logits_bytes_.clear();
+        logprobs_req_indptr_.clear();
+        logprobs_val_indptr_.clear();
+        logprobs_values_.clear();
+        entropies_indptr_.clear();
+        entropies_.clear();
+
+        tokens_indptr_.reserve(static_cast<std::size_t>(R) + 1);
+        dists_req_indptr_.assign(static_cast<std::size_t>(R) + 1, 0);
+        logits_req_indptr_.assign(static_cast<std::size_t>(R) + 1, 0);
+        logprobs_req_indptr_.assign(static_cast<std::size_t>(R) + 1, 0);
+        entropies_indptr_.assign(static_cast<std::size_t>(R) + 1, 0);
+        dists_kv_indptr_.assign(1, 0);
+        logits_byte_indptr_.assign(1, 0);
+        logprobs_val_indptr_.assign(1, 0);
+    }
+
+    inline void finish_view(std::uint32_t R, PieForwardResponseView& out) {
+        out = PieForwardResponseView{};
+        out.num_requests = R;
+        out.tokens_indptr        = slice_from(tokens_indptr_.data(), tokens_indptr_.size());
+        out.tokens               = slice_from(tokens_.data(), tokens_.size());
+        out.dists_req_indptr     = slice_from(dists_req_indptr_.data(), dists_req_indptr_.size());
+        out.dists_kv_indptr      = slice_from(dists_kv_indptr_.data(), dists_kv_indptr_.size());
+        out.dists_ids            = slice_from(dists_ids_.data(), dists_ids_.size());
+        out.dists_probs          = slice_from(dists_probs_.data(), dists_probs_.size());
+        out.logits_req_indptr    = slice_from(logits_req_indptr_.data(), logits_req_indptr_.size());
+        out.logits_byte_indptr   = slice_from(logits_byte_indptr_.data(), logits_byte_indptr_.size());
+        out.logits_bytes         = slice_from(logits_bytes_.data(), logits_bytes_.size());
+        out.logprobs_req_indptr  = slice_from(logprobs_req_indptr_.data(), logprobs_req_indptr_.size());
+        out.logprobs_val_indptr  = slice_from(logprobs_val_indptr_.data(), logprobs_val_indptr_.size());
+        out.logprobs_values      = slice_from(logprobs_values_.data(), logprobs_values_.size());
+        out.entropies_indptr     = slice_from(entropies_indptr_.data(), entropies_indptr_.size());
+        out.entropies            = slice_from(entropies_.data(), entropies_.size());
+    }
+
     // Concatenated bodies + R+1 indptrs. Reused fire-to-fire — `build()`
     // clears and refills.
     std::vector<std::uint32_t> tokens_indptr_;

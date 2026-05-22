@@ -5,8 +5,8 @@
 //! accumulates them into batches, and fires them based on adaptive
 //! scheduling decisions.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
@@ -48,7 +48,7 @@ pub(super) trait SchedulingPolicy: Send {
     /// Decide whether to fire or wait, given the current batch size.
     /// `&mut self` so policies can ratchet internal state (e.g.,
     /// AdaptivePolicy's `cohort_high_water`) on every poll.
-    fn decide(&mut self, current_batch_size: usize) -> Decision;
+    fn decide(&mut self, current_batch_size: usize, prefill_cohort: bool) -> Decision;
 }
 
 // =============================================================================
@@ -83,6 +83,30 @@ pub struct SchedulerStats {
     pub batch_size_hist: [AtomicU64; 8],
     pub last_batch_latency_us: AtomicU64,
     pub cumulative_latency_us: AtomicU64,
+    pub last_request_queue_us: AtomicU64,
+    pub cumulative_request_queue_us: AtomicU64,
+    pub last_batch_queue_us: AtomicU64,
+    pub cumulative_batch_queue_us: AtomicU64,
+    pub last_permit_wait_us: AtomicU64,
+    pub cumulative_permit_wait_us: AtomicU64,
+    pub last_batch_build_us: AtomicU64,
+    pub cumulative_batch_build_us: AtomicU64,
+    pub last_driver_forward_us: AtomicU64,
+    pub cumulative_driver_forward_us: AtomicU64,
+    pub last_response_fanout_us: AtomicU64,
+    pub cumulative_response_fanout_us: AtomicU64,
+    pub last_response_classify_us: AtomicU64,
+    pub cumulative_response_classify_us: AtomicU64,
+    pub last_response_token_output_build_us: AtomicU64,
+    pub cumulative_response_token_output_build_us: AtomicU64,
+    pub last_response_direct_send_us: AtomicU64,
+    pub cumulative_response_direct_send_us: AtomicU64,
+    pub last_response_chunk_send_us: AtomicU64,
+    pub cumulative_response_chunk_send_us: AtomicU64,
+    pub last_response_extract_us: AtomicU64,
+    pub cumulative_response_extract_us: AtomicU64,
+    pub last_response_error_us: AtomicU64,
+    pub cumulative_response_error_us: AtomicU64,
 }
 
 // =============================================================================
@@ -93,8 +117,54 @@ pub struct SchedulerStats {
 struct PendingRequest {
     request: pie_bridge::ForwardRequest,
     completion: Completion,
-    physical_page_ids: Vec<PhysicalPageId>,
+    physical_page_ids: PhysicalPageSpan,
     last_page_len: u32,
+    enqueued_at: Instant,
+}
+
+#[derive(Clone, Debug)]
+struct PhysicalPageSpan {
+    pages: Arc<[PhysicalPageId]>,
+    len: usize,
+}
+
+impl PhysicalPageSpan {
+    fn from_vec(pages: Vec<PhysicalPageId>) -> Self {
+        let len = pages.len();
+        Self {
+            pages: Arc::from(pages),
+            len,
+        }
+    }
+
+    pub(crate) fn from_shared_prefix(pages: Arc<[PhysicalPageId]>, len: usize) -> Self {
+        debug_assert!(len <= pages.len());
+        Self { pages, len }
+    }
+
+    #[inline]
+    fn as_slice(&self) -> &[PhysicalPageId] {
+        &self.pages[..self.len]
+    }
+
+    #[inline]
+    fn len(&self) -> usize {
+        self.len
+    }
+}
+
+impl std::ops::Deref for PhysicalPageSpan {
+    type Target = [PhysicalPageId];
+
+    fn deref(&self) -> &Self::Target {
+        self.as_slice()
+    }
+}
+
+impl PartialEq<Vec<PhysicalPageId>> for PhysicalPageSpan {
+    fn eq(&self, other: &Vec<PhysicalPageId>) -> bool {
+        self.as_slice() == other.as_slice()
+    }
 }
 
 enum Completion {
@@ -104,6 +174,8 @@ enum Completion {
         sampler_slots: Vec<usize>,
     },
 }
+
+type ForwardOutputSender = oneshot::Sender<Result<ForwardOutput>>;
 
 impl PendingRequest {
     fn direct(
@@ -115,10 +187,220 @@ impl PendingRequest {
         Self {
             request,
             completion: Completion::Direct(response_tx),
-            physical_page_ids,
+            physical_page_ids: PhysicalPageSpan::from_vec(physical_page_ids),
             last_page_len,
+            enqueued_at: Instant::now(),
         }
     }
+
+    fn direct_shared(
+        request: pie_bridge::ForwardRequest,
+        response_tx: oneshot::Sender<Result<ForwardOutput>>,
+        physical_page_ids: Arc<[PhysicalPageId]>,
+        physical_page_len: usize,
+        last_page_len: u32,
+    ) -> Self {
+        Self {
+            request,
+            completion: Completion::Direct(response_tx),
+            physical_page_ids: PhysicalPageSpan::from_shared_prefix(
+                physical_page_ids,
+                physical_page_len,
+            ),
+            last_page_len,
+            enqueued_at: Instant::now(),
+        }
+    }
+
+    #[inline]
+    fn context_id(&self) -> u64 {
+        self.request.context_ids.first().copied().unwrap_or(0)
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct BatchExecutionTiming {
+    batch_build_us: u64,
+    driver_forward_us: u64,
+    response_fanout_us: u64,
+    response_classify_us: u64,
+    response_token_output_build_us: u64,
+    response_direct_send_us: u64,
+    response_chunk_send_us: u64,
+    response_extract_us: u64,
+    response_error_us: u64,
+}
+
+fn duration_us(d: Duration) -> u64 {
+    d.as_micros().min(u128::from(u64::MAX)) as u64
+}
+
+fn fanout_breakdown_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("PIE_SCHED_FANOUT_BREAKDOWN").is_some())
+}
+
+fn preextract_direct_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var_os("PIE_SCHED_PREEXTRACT_DIRECT")
+            .map(|v| !v.is_empty() && v != "0")
+            .unwrap_or(true)
+    })
+}
+
+#[inline]
+fn add_elapsed_us(dst: &mut u64, start: Instant) {
+    *dst = dst.saturating_add(duration_us(start.elapsed()));
+}
+
+fn send_forward_output(
+    req: PendingRequest,
+    output: ForwardOutput,
+    submit_tx: Option<&mpsc::WeakUnboundedSender<PendingRequest>>,
+    page_size: u32,
+    timing: &mut BatchExecutionTiming,
+    breakdown: bool,
+) {
+    let PendingRequest {
+        request,
+        completion,
+        physical_page_ids,
+        last_page_len,
+        enqueued_at,
+    } = req;
+
+    match completion {
+        Completion::Direct(tx) => {
+            let send_start = breakdown.then(Instant::now);
+            tx.send(Ok(output)).ok();
+            if let Some(start) = send_start {
+                add_elapsed_us(&mut timing.response_direct_send_us, start);
+            }
+        }
+        completion => {
+            let req = PendingRequest {
+                request,
+                completion,
+                physical_page_ids,
+                last_page_len,
+                enqueued_at,
+            };
+            let send_start = breakdown.then(Instant::now);
+            req.send_result(Ok(output), submit_tx, page_size);
+            if let Some(start) = send_start {
+                add_elapsed_us(&mut timing.response_chunk_send_us, start);
+            }
+        }
+    }
+}
+
+fn extract_direct_targets(requests: Vec<PendingRequest>) -> Vec<ForwardOutputSender> {
+    let mut targets = Vec::with_capacity(requests.len());
+    for req in requests {
+        let PendingRequest { completion, .. } = req;
+        if let Completion::Direct(tx) = completion {
+            targets.push(tx);
+        }
+    }
+    targets
+}
+
+fn send_direct_forward_output(
+    tx: ForwardOutputSender,
+    result: Result<ForwardOutput>,
+    timing: &mut BatchExecutionTiming,
+    breakdown: bool,
+) {
+    let send_start = breakdown.then(Instant::now);
+    tx.send(result).ok();
+    if let Some(start) = send_start {
+        add_elapsed_us(&mut timing.response_direct_send_us, start);
+    }
+}
+
+fn queue_timing_us(requests: &[PendingRequest], fire_at: Instant) -> (u64, u64) {
+    let mut sum = 0u64;
+    let mut max = 0u64;
+    for req in requests {
+        let q = duration_us(fire_at.saturating_duration_since(req.enqueued_at));
+        sum = sum.saturating_add(q);
+        max = max.max(q);
+    }
+    (sum, max)
+}
+
+fn reserve_batch_request(
+    batch: &mut pie_bridge::ForwardRequest,
+    requests: &[PendingRequest],
+) -> bool {
+    let mut token_ids = 0usize;
+    let mut position_ids = 0usize;
+    let mut kv_pages = 0usize;
+    let mut rs_slots = 0usize;
+    let mut masks_if_not_elided = 0usize;
+    let mut logit_masks = 0usize;
+    let mut sampling_indices = 0usize;
+    let mut samplers = 0usize;
+    let mut adapter_bindings = 0usize;
+    let mut spec_tokens = 0usize;
+    let mut spec_positions = 0usize;
+    let mut output_spec_flags = 0usize;
+    let mut context_ids = 0usize;
+    let mut elide_decode_masks = true;
+
+    for req in requests {
+        let fwd = &req.request;
+        token_ids += fwd.token_ids.len();
+        position_ids += fwd.position_ids.len();
+        kv_pages += req.physical_page_ids.len();
+        rs_slots += fwd.rs_slot_ids.len();
+        logit_masks += fwd.logit_masks.len();
+        sampling_indices += fwd.sampling_indices.len();
+        samplers += fwd.samplers.len();
+        adapter_bindings += fwd.adapter_bindings.len();
+        spec_tokens += fwd.spec_token_ids.len();
+        spec_positions += fwd.spec_position_ids.len();
+        output_spec_flags += fwd.output_spec_flags.len();
+        context_ids += fwd.context_ids.len();
+
+        elide_decode_masks &= fwd.single_token_mode
+            && !fwd.has_user_mask
+            && fwd.token_ids.len() <= 1
+            && fwd.spec_token_ids.is_empty();
+        masks_if_not_elided += if fwd.masks.is_empty() && !fwd.position_ids.is_empty() {
+            fwd.position_ids.len()
+        } else {
+            fwd.masks.len()
+        };
+    }
+
+    let request_count = requests.len();
+    batch.token_ids.reserve(token_ids);
+    batch.position_ids.reserve(position_ids);
+    batch.kv_page_indices.reserve(kv_pages);
+    batch.kv_page_indptr.reserve(request_count);
+    batch.kv_last_page_lens.reserve(request_count);
+    batch.qo_indptr.reserve(request_count);
+    batch.rs_slot_ids.reserve(rs_slots);
+    batch.rs_slot_flags.reserve(rs_slots);
+    if !elide_decode_masks {
+        batch.masks.reserve(masks_if_not_elided);
+    }
+    batch.mask_indptr.reserve(request_count);
+    batch.logit_masks.reserve(logit_masks);
+    batch.logit_mask_indptr.reserve(request_count);
+    batch.sampling_indices.reserve(sampling_indices);
+    batch.sampling_indptr.reserve(request_count);
+    batch.samplers.reserve(samplers);
+    batch.sampler_indptr.reserve(request_count);
+    batch.adapter_bindings.reserve(adapter_bindings);
+    batch.spec_token_ids.reserve(spec_tokens);
+    batch.spec_position_ids.reserve(spec_positions);
+    batch.spec_indptr.reserve(request_count);
+    batch.output_spec_flags.reserve(output_spec_flags);
+    batch.context_ids.reserve(context_ids);
+    elide_decode_masks
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -233,12 +515,16 @@ fn packed_mask_bytes(
 fn request_logprob_labels(req: &pie_bridge::ForwardRequest) -> usize {
     req.samplers
         .iter()
-        .map(|s| match s {
-            pie_bridge::Sampler::Logprob { .. } => 1,
-            pie_bridge::Sampler::Logprobs { token_ids } => token_ids.len(),
-            _ => 0,
-        })
+        .map(request_logprob_labels_for_sampler)
         .sum()
+}
+
+fn request_logprob_labels_for_sampler(sampler: &pie_bridge::Sampler) -> usize {
+    match sampler {
+        pie_bridge::Sampler::Logprob { .. } => 1,
+        pie_bridge::Sampler::Logprobs { token_ids } => token_ids.len(),
+        _ => 0,
+    }
 }
 
 // =============================================================================
@@ -480,6 +766,10 @@ impl BatchAccumulator {
 
     fn total_tokens(&self) -> usize {
         self.total_tokens
+    }
+
+    fn should_prefill_coalesce(&self) -> bool {
+        !self.has_spec_drafts && self.total_tokens > self.requests.len()
     }
 
     fn take(&mut self) -> Vec<PendingRequest> {
@@ -792,6 +1082,24 @@ impl SchedulerHandle {
         ))?;
         Ok(())
     }
+
+    pub(crate) fn submit_shared(
+        &self,
+        request: pie_bridge::ForwardRequest,
+        response_tx: oneshot::Sender<Result<ForwardOutput>>,
+        physical_page_ids: Arc<[PhysicalPageId]>,
+        physical_page_len: usize,
+        last_page_len: u32,
+    ) -> Result<()> {
+        self.tx.send(PendingRequest::direct_shared(
+            request,
+            response_tx,
+            physical_page_ids,
+            physical_page_len,
+            last_page_len,
+        ))?;
+        Ok(())
+    }
 }
 
 // =============================================================================
@@ -855,6 +1163,24 @@ impl BatchScheduler {
             request,
             response_tx,
             physical_page_ids,
+            last_page_len,
+        ))?;
+        Ok(())
+    }
+
+    pub(crate) fn submit_shared(
+        &self,
+        request: pie_bridge::ForwardRequest,
+        response_tx: oneshot::Sender<Result<ForwardOutput>>,
+        physical_page_ids: Arc<[PhysicalPageId]>,
+        physical_page_len: usize,
+        last_page_len: u32,
+    ) -> Result<()> {
+        self.tx.send(PendingRequest::direct_shared(
+            request,
+            response_tx,
+            physical_page_ids,
+            physical_page_len,
             last_page_len,
         ))?;
         Ok(())
@@ -956,16 +1282,18 @@ impl BatchScheduler {
             let decision = if next_pending.is_some() {
                 Decision::Fire
             } else {
-                policy.decide(batch.len())
+                policy.decide(batch.len(), batch.should_prefill_coalesce())
             };
             match decision {
                 Decision::Fire => {
                     // Acquire a permit (may wait if at in-flight limit).
+                    let permit_wait_start = Instant::now();
                     let permit = in_flight
                         .clone()
                         .acquire_owned()
                         .await
                         .expect("semaphore closed");
+                    let permit_wait_us = duration_us(permit_wait_start.elapsed());
 
                     // The policy may decide to fire while the previous GPU
                     // batch is still in flight. Do one last non-blocking
@@ -989,15 +1317,24 @@ impl BatchScheduler {
                     }
 
                     let total_tokens = batch.total_tokens();
+                    let fire_at = Instant::now();
                     let requests_to_fire = batch.take();
+                    let (request_queue_us, batch_queue_us) =
+                        queue_timing_us(&requests_to_fire, fire_at);
                     policy.on_fired(requests_to_fire.len());
+                    if std::env::var_os("PIE_SCHED_TRACE").is_some() {
+                        eprintln!(
+                            "[sched-batch driver={driver_idx} requests={} tokens={total_tokens}]",
+                            requests_to_fire.len()
+                        );
+                    }
 
                     // Collect batch context IDs for accurate rent charging.
                     // Per-request shape stores the single context_id in
                     // `context_ids[0]`.
                     let batch_ctx_ids: Vec<u64> = requests_to_fire
                         .iter()
-                        .map(|r| r.request.context_ids[0])
+                        .map(PendingRequest::context_id)
                         .collect();
                     let batch_size = batch_ctx_ids.len() as u64;
 
@@ -1009,7 +1346,7 @@ impl BatchScheduler {
 
                     tokio::spawn(async move {
                         let start = Instant::now();
-                        Self::execute_batch(
+                        let execution = Self::execute_batch(
                             driver_idx,
                             requests_to_fire,
                             driver_id,
@@ -1056,6 +1393,79 @@ impl BatchScheduler {
                         stats_clone
                             .cumulative_latency_us
                             .fetch_add(latency.as_micros() as u64, Relaxed);
+                        let denom = batch_size.max(1);
+                        stats_clone
+                            .last_request_queue_us
+                            .store(request_queue_us / denom, Relaxed);
+                        stats_clone
+                            .cumulative_request_queue_us
+                            .fetch_add(request_queue_us, Relaxed);
+                        stats_clone
+                            .last_batch_queue_us
+                            .store(batch_queue_us, Relaxed);
+                        stats_clone
+                            .cumulative_batch_queue_us
+                            .fetch_add(batch_queue_us, Relaxed);
+                        stats_clone
+                            .last_permit_wait_us
+                            .store(permit_wait_us, Relaxed);
+                        stats_clone
+                            .cumulative_permit_wait_us
+                            .fetch_add(permit_wait_us, Relaxed);
+                        stats_clone
+                            .last_batch_build_us
+                            .store(execution.batch_build_us, Relaxed);
+                        stats_clone
+                            .cumulative_batch_build_us
+                            .fetch_add(execution.batch_build_us, Relaxed);
+                        stats_clone
+                            .last_driver_forward_us
+                            .store(execution.driver_forward_us, Relaxed);
+                        stats_clone
+                            .cumulative_driver_forward_us
+                            .fetch_add(execution.driver_forward_us, Relaxed);
+                        stats_clone
+                            .last_response_fanout_us
+                            .store(execution.response_fanout_us, Relaxed);
+                        stats_clone
+                            .cumulative_response_fanout_us
+                            .fetch_add(execution.response_fanout_us, Relaxed);
+                        stats_clone
+                            .last_response_classify_us
+                            .store(execution.response_classify_us, Relaxed);
+                        stats_clone
+                            .cumulative_response_classify_us
+                            .fetch_add(execution.response_classify_us, Relaxed);
+                        stats_clone
+                            .last_response_token_output_build_us
+                            .store(execution.response_token_output_build_us, Relaxed);
+                        stats_clone
+                            .cumulative_response_token_output_build_us
+                            .fetch_add(execution.response_token_output_build_us, Relaxed);
+                        stats_clone
+                            .last_response_direct_send_us
+                            .store(execution.response_direct_send_us, Relaxed);
+                        stats_clone
+                            .cumulative_response_direct_send_us
+                            .fetch_add(execution.response_direct_send_us, Relaxed);
+                        stats_clone
+                            .last_response_chunk_send_us
+                            .store(execution.response_chunk_send_us, Relaxed);
+                        stats_clone
+                            .cumulative_response_chunk_send_us
+                            .fetch_add(execution.response_chunk_send_us, Relaxed);
+                        stats_clone
+                            .last_response_extract_us
+                            .store(execution.response_extract_us, Relaxed);
+                        stats_clone
+                            .cumulative_response_extract_us
+                            .fetch_add(execution.response_extract_us, Relaxed);
+                        stats_clone
+                            .last_response_error_us
+                            .store(execution.response_error_us, Relaxed);
+                        stats_clone
+                            .cumulative_response_error_us
+                            .fetch_add(execution.response_error_us, Relaxed);
                     });
                 }
                 Decision::Wait(wait_duration) => {
@@ -1089,7 +1499,7 @@ impl BatchScheduler {
         // Shutdown: fire remaining batch
         if !batch.is_empty() {
             let requests = batch.take();
-            Self::execute_batch(
+            let _ = Self::execute_batch(
                 driver_idx,
                 requests,
                 driver_id,
@@ -1111,105 +1521,288 @@ impl BatchScheduler {
         _timeout: Duration,
         mut permit: Option<OwnedSemaphorePermit>,
         submit_tx: Option<mpsc::WeakUnboundedSender<PendingRequest>>,
-    ) {
+    ) -> BatchExecutionTiming {
+        let mut timing = BatchExecutionTiming::default();
+        let request_count = requests.len();
+        let build_start = Instant::now();
         // Build batched request — a single `pie_bridge::ForwardRequest`
         // populated by folding each per-request shape into the batch.
-        let elide_decode_masks = requests.iter().all(|req| {
-            req.request.single_token_mode
-                && !req.request.has_user_mask
-                && req.request.token_ids.len() <= 1
-                && req.request.spec_token_ids.is_empty()
-        });
         let mut batch_req = request::new_batched_forward_request();
+        let elide_decode_masks = reserve_batch_request(&mut batch_req, &requests);
         for req in &requests {
             request::append_request_with_options(
                 &mut batch_req,
                 &req.request,
-                &req.physical_page_ids,
+                req.physical_page_ids.as_slice(),
                 req.last_page_len,
                 page_size,
                 elide_decode_masks,
             );
         }
+        timing.batch_build_us = duration_us(build_start.elapsed());
+
+        let mut requests = Some(requests);
+        let direct_targets_task = if preextract_direct_enabled()
+            && requests.as_ref().is_some_and(|requests| {
+                requests
+                    .iter()
+                    .all(|req| matches!(req.completion, Completion::Direct(_)))
+            }) {
+            let requests = requests.take().expect("requests must be present");
+            Some(tokio::task::spawn_blocking(move || {
+                extract_direct_targets(requests)
+            }))
+        } else {
+            None
+        };
 
         // Send via driver service (typed call handles serialization + timeout)
+        let driver_start = Instant::now();
         let result = driver::fire_batch(driver_idx, batch_req).await;
+        timing.driver_forward_us = duration_us(driver_start.elapsed());
         drop(permit.take());
+
+        let response_start = Instant::now();
+        let breakdown = fanout_breakdown_enabled();
+        let mut direct_targets = if let Some(task) = direct_targets_task {
+            match task.await {
+                Ok(targets) if targets.len() == request_count => Some(targets),
+                Ok(targets) => {
+                    tracing::error!(
+                        driver = driver_id,
+                        expected = request_count,
+                        got = targets.len(),
+                        "Pre-extracted direct response target count mismatch",
+                    );
+                    Some(targets)
+                }
+                Err(e) => {
+                    tracing::error!(
+                        driver = driver_id,
+                        error = %e,
+                        "Direct response target pre-extraction task failed",
+                    );
+                    Some(Vec::new())
+                }
+            }
+        } else {
+            None
+        };
 
         match result {
             Ok(batch_resp) => {
                 let n_results = batch_resp.num_requests as usize;
-                if n_results != requests.len() {
+                if n_results != request_count {
                     let msg = format!(
                         "batch response count mismatch from driver {driver_id}: \
                          expected {}, got {n_results}",
-                        requests.len()
+                        request_count
                     );
                     tracing::error!(
                         driver = driver_id,
-                        expected = requests.len(),
+                        expected = request_count,
                         got = n_results,
                         "Batch response count mismatch",
                     );
-                    for req in requests {
-                        req.send_result::<ForwardOutput>(
-                            Err(anyhow::anyhow!(msg.clone())),
-                            None,
-                            page_size,
-                        );
+                    let error_start = breakdown.then(Instant::now);
+                    if let Some(targets) = direct_targets.take() {
+                        for tx in targets {
+                            send_direct_forward_output(
+                                tx,
+                                Err(anyhow::anyhow!(msg.clone())),
+                                &mut timing,
+                                breakdown,
+                            );
+                        }
+                    } else {
+                        for req in requests.take().expect("requests must be present") {
+                            req.send_result::<ForwardOutput>(
+                                Err(anyhow::anyhow!(msg.clone())),
+                                None,
+                                page_size,
+                            );
+                        }
                     }
-                    return;
+                    if let Some(start) = error_start {
+                        add_elapsed_us(&mut timing.response_error_us, start);
+                    }
+                    timing.response_fanout_us = duration_us(response_start.elapsed());
+                    return timing;
                 }
 
-                let has_chunked = requests
-                    .iter()
-                    .any(|req| matches!(req.completion, Completion::Chunk { .. }));
+                let classify_start = breakdown.then(Instant::now);
+                let has_chunked = direct_targets.is_none()
+                    && requests
+                        .as_ref()
+                        .expect("requests must be present")
+                        .iter()
+                        .any(|req| matches!(req.completion, Completion::Chunk { .. }));
                 let token_payload_only = !has_chunked
                     && batch_resp.dists_ids.is_empty()
                     && batch_resp.dists_probs.is_empty()
                     && batch_resp.logits_bytes.is_empty()
                     && batch_resp.logprobs_values.is_empty()
                     && batch_resp.entropies.is_empty()
-                    && batch_resp.tokens_indptr.len() >= requests.len() + 1;
+                    && batch_resp.tokens_indptr.len() > request_count;
+                if let Some(start) = classify_start {
+                    add_elapsed_us(&mut timing.response_classify_us, start);
+                }
 
                 if token_payload_only {
-                    for (r, req) in requests.into_iter().enumerate() {
-                        let lo = batch_resp.tokens_indptr[r] as usize;
-                        let hi = batch_resp.tokens_indptr[r + 1] as usize;
-                        let output = if hi == lo + 1 {
-                            ForwardOutput::Token(batch_resp.tokens[lo])
-                        } else {
-                            ForwardOutput::Tokens(batch_resp.tokens[lo..hi].to_vec())
-                        };
-                        req.send_result(Ok(output), submit_tx.as_ref(), page_size);
+                    if let Some(targets) = direct_targets.take() {
+                        for (r, tx) in targets.into_iter().enumerate() {
+                            let build_start = Instant::now();
+                            let lo = batch_resp.tokens_indptr[r] as usize;
+                            let hi = batch_resp.tokens_indptr[r + 1] as usize;
+                            let output = if hi == lo + 1 {
+                                ForwardOutput::Token(batch_resp.tokens[lo])
+                            } else {
+                                ForwardOutput::Tokens(batch_resp.tokens[lo..hi].to_vec())
+                            };
+                            if breakdown {
+                                add_elapsed_us(
+                                    &mut timing.response_token_output_build_us,
+                                    build_start,
+                                );
+                            }
+                            send_direct_forward_output(tx, Ok(output), &mut timing, breakdown);
+                        }
+                    } else if breakdown {
+                        for (r, req) in requests
+                            .take()
+                            .expect("requests must be present")
+                            .into_iter()
+                            .enumerate()
+                        {
+                            let build_start = Instant::now();
+                            let lo = batch_resp.tokens_indptr[r] as usize;
+                            let hi = batch_resp.tokens_indptr[r + 1] as usize;
+                            let output = if hi == lo + 1 {
+                                ForwardOutput::Token(batch_resp.tokens[lo])
+                            } else {
+                                ForwardOutput::Tokens(batch_resp.tokens[lo..hi].to_vec())
+                            };
+                            add_elapsed_us(&mut timing.response_token_output_build_us, build_start);
+                            send_forward_output(
+                                req,
+                                output,
+                                submit_tx.as_ref(),
+                                page_size,
+                                &mut timing,
+                                true,
+                            );
+                        }
+                    } else {
+                        for (r, req) in requests
+                            .take()
+                            .expect("requests must be present")
+                            .into_iter()
+                            .enumerate()
+                        {
+                            let lo = batch_resp.tokens_indptr[r] as usize;
+                            let hi = batch_resp.tokens_indptr[r + 1] as usize;
+                            let output = if hi == lo + 1 {
+                                ForwardOutput::Token(batch_resp.tokens[lo])
+                            } else {
+                                ForwardOutput::Tokens(batch_resp.tokens[lo..hi].to_vec())
+                            };
+                            send_forward_output(
+                                req,
+                                output,
+                                submit_tx.as_ref(),
+                                page_size,
+                                &mut timing,
+                                false,
+                            );
+                        }
                     }
                 } else {
-                    for (r, req) in requests.into_iter().enumerate() {
-                        // Extract this request's slice from the batched
-                        // response. The api layer (build_wit_output)
-                        // walks samplers + the single-request response
-                        // to construct the WIT Output.
-                        let per_req = request::extract_per_request(&batch_resp, r);
-                        req.send_result(
-                            Ok(ForwardOutput::Response(per_req)),
-                            submit_tx.as_ref(),
-                            page_size,
-                        );
+                    if let Some(targets) = direct_targets.take() {
+                        for (r, tx) in targets.into_iter().enumerate() {
+                            let extract_start = breakdown.then(Instant::now);
+                            let per_req = request::extract_per_request(&batch_resp, r);
+                            if let Some(start) = extract_start {
+                                add_elapsed_us(&mut timing.response_extract_us, start);
+                            }
+                            send_direct_forward_output(
+                                tx,
+                                Ok(ForwardOutput::Response(per_req)),
+                                &mut timing,
+                                breakdown,
+                            );
+                        }
+                    } else if breakdown {
+                        for (r, req) in requests
+                            .take()
+                            .expect("requests must be present")
+                            .into_iter()
+                            .enumerate()
+                        {
+                            // Extract this request's slice from the batched
+                            // response. The api layer (build_wit_output)
+                            // walks samplers + the single-request response
+                            // to construct the WIT Output.
+                            let extract_start = Instant::now();
+                            let per_req = request::extract_per_request(&batch_resp, r);
+                            add_elapsed_us(&mut timing.response_extract_us, extract_start);
+                            send_forward_output(
+                                req,
+                                ForwardOutput::Response(per_req),
+                                submit_tx.as_ref(),
+                                page_size,
+                                &mut timing,
+                                true,
+                            );
+                        }
+                    } else {
+                        for (r, req) in requests
+                            .take()
+                            .expect("requests must be present")
+                            .into_iter()
+                            .enumerate()
+                        {
+                            // Extract this request's slice from the batched
+                            // response. The api layer (build_wit_output)
+                            // walks samplers + the single-request response
+                            // to construct the WIT Output.
+                            let per_req = request::extract_per_request(&batch_resp, r);
+                            req.send_result(
+                                Ok(ForwardOutput::Response(per_req)),
+                                submit_tx.as_ref(),
+                                page_size,
+                            );
+                        }
                     }
                 }
             }
             Err(e) => {
                 tracing::error!("fire_batch failed for driver {}: {:?}", driver_id, e);
-                for req in requests {
-                    req.send_result::<ForwardOutput>(
-                        Err(anyhow::anyhow!(
-                            "fire_batch failed for driver {driver_id}: {e:#}"
-                        )),
-                        None,
-                        page_size,
-                    );
+                let error_start = breakdown.then(Instant::now);
+                let msg = format!("fire_batch failed for driver {driver_id}: {e:#}");
+                if let Some(targets) = direct_targets.take() {
+                    for tx in targets {
+                        send_direct_forward_output(
+                            tx,
+                            Err(anyhow::anyhow!(msg.clone())),
+                            &mut timing,
+                            breakdown,
+                        );
+                    }
+                } else {
+                    for req in requests.take().expect("requests must be present") {
+                        req.send_result::<ForwardOutput>(
+                            Err(anyhow::anyhow!(msg.clone())),
+                            None,
+                            page_size,
+                        );
+                    }
+                }
+                if let Some(start) = error_start {
+                    add_elapsed_us(&mut timing.response_error_us, start);
                 }
             }
         }
+        timing.response_fanout_us = duration_us(response_start.elapsed());
+        timing
     }
 }

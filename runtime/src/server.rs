@@ -715,6 +715,33 @@ impl Session {
                     .await
             }
 
+            ClientMessage::LaunchProcesses {
+                corr_id,
+                inferlet,
+                inputs,
+                capture_outputs,
+                token_budgets,
+            } => {
+                self.handle_launch_processes(
+                    corr_id,
+                    inferlet,
+                    inputs,
+                    capture_outputs,
+                    token_budgets,
+                )
+                .await
+            }
+
+            ClientMessage::RunProcesses {
+                corr_id,
+                inferlet,
+                inputs,
+                token_budgets,
+            } => {
+                self.handle_run_processes(corr_id, inferlet, inputs, token_budgets)
+                    .await
+            }
+
             ClientMessage::LaunchDaemon {
                 corr_id,
                 port,

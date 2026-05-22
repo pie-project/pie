@@ -56,6 +56,25 @@ pub enum ClientMessage {
         token_budget: Option<usize>,
     },
 
+    #[serde(rename = "launch_processes")]
+    LaunchProcesses {
+        corr_id: u32,
+        inferlet: String,
+        inputs: Vec<String>,
+        capture_outputs: bool,
+        #[serde(default)]
+        token_budgets: Option<Vec<Option<usize>>>,
+    },
+
+    #[serde(rename = "run_processes")]
+    RunProcesses {
+        corr_id: u32,
+        inferlet: String,
+        inputs: Vec<String>,
+        #[serde(default)]
+        token_budgets: Option<Vec<Option<usize>>>,
+    },
+
     #[serde(rename = "launch_daemon")]
     LaunchDaemon {
         corr_id: u32,

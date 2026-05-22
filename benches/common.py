@@ -3,7 +3,10 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
+import re
 import statistics
+import subprocess
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
@@ -172,7 +175,12 @@ def add_mode_subcommands(parser: argparse.ArgumentParser) -> None:
     tput = sub.add_parser("tput", help="many-request throughput")
     add_common_args(tput)
     tput.add_argument("--num-requests", type=int, default=512)
-    tput.add_argument("--concurrency", type=int, default=128)
+    tput.add_argument(
+        "--concurrency",
+        type=int,
+        default=0,
+        help="Throughput concurrency cap. 0 means unlimited.",
+    )
     tput.set_defaults(requests=0)
 
 
@@ -195,6 +203,13 @@ def add_common_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--json-out", default=None)
     p.add_argument("--request-timeout", type=float, default=300.0)
     p.add_argument("--tp-size", type=int, default=1)
+    p.add_argument(
+        "--cpu-affinity",
+        default="auto",
+        help="CPU affinity for the benchmark process. Use 'auto' to pin to "
+             "the GPU-local CPUs from `nvidia-smi topo -m`, 'none' to disable, "
+             "or an explicit list like '80-87,208-215'.",
+    )
     p.add_argument("--gpu-mem-util", type=float, default=0.90)
     p.add_argument("--max-model-len", type=int, default=2048)
     p.add_argument("--sglang-attention-backend", default=None)
@@ -241,3 +256,87 @@ def finish(summary: BenchSummary, results: list[RequestResult], json_out: str | 
     write_json(json_out, summary, results)
     if summary.failed:
         print(f"{summary.failed} request(s) failed; inspect JSON output for details.")
+
+
+def _parse_cpu_list(spec: str) -> set[int]:
+    cpus: set[int] = set()
+    for part in spec.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "-" in part:
+            lo, hi = part.split("-", 1)
+            cpus.update(range(int(lo), int(hi) + 1))
+        else:
+            cpus.add(int(part))
+    return cpus
+
+
+def _format_cpu_list(cpus: set[int]) -> str:
+    if not cpus:
+        return ""
+    xs = sorted(cpus)
+    ranges: list[str] = []
+    start = prev = xs[0]
+    for x in xs[1:]:
+        if x == prev + 1:
+            prev = x
+            continue
+        ranges.append(f"{start}-{prev}" if start != prev else str(start))
+        start = prev = x
+    ranges.append(f"{start}-{prev}" if start != prev else str(start))
+    return ",".join(ranges)
+
+
+def gpu_local_cpu_affinity(gpu_ids: list[int]) -> set[int]:
+    """Return the union of CPU-affinity masks reported by `nvidia-smi topo -m`."""
+    if not gpu_ids:
+        return set()
+    try:
+        topo = subprocess.check_output(
+            ["nvidia-smi", "topo", "-m"],
+            text=True,
+            stderr=subprocess.DEVNULL,
+        )
+    except Exception:
+        return set()
+    ansi = re.compile(r"\x1b\[[0-9;]*m")
+    lines = [ansi.sub("", line).strip() for line in topo.splitlines() if line.strip()]
+    if not lines:
+        return set()
+    header = lines[0].split()
+    gpu_cols = sum(1 for tok in header if re.fullmatch(r"GPU\d+", tok))
+    affinity_by_gpu: dict[int, set[int]] = {}
+    for line in lines[1:]:
+        toks = line.split()
+        if len(toks) <= gpu_cols + 1 or not re.fullmatch(r"GPU\d+", toks[0]):
+            continue
+        affinity_by_gpu[int(toks[0][3:])] = _parse_cpu_list(toks[1 + gpu_cols])
+    cpus: set[int] = set()
+    for gpu in gpu_ids:
+        cpus.update(affinity_by_gpu.get(gpu, set()))
+    return cpus
+
+
+def visible_cuda_devices(tp_size: int) -> list[int]:
+    visible = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if visible:
+        ids: list[int] = []
+        for item in visible.split(","):
+            item = item.strip()
+            if item.isdigit():
+                ids.append(int(item))
+        if ids:
+            return ids[: max(1, tp_size)]
+    return list(range(max(1, tp_size)))
+
+
+def maybe_set_cpu_affinity(args: argparse.Namespace, gpu_ids: list[int]) -> str | None:
+    mode = getattr(args, "cpu_affinity", "auto")
+    if mode in (None, "", "none"):
+        return None
+    cpus = gpu_local_cpu_affinity(gpu_ids) if mode == "auto" else _parse_cpu_list(mode)
+    if not cpus or not hasattr(os, "sched_setaffinity"):
+        return None
+    os.sched_setaffinity(0, cpus)
+    return _format_cpu_list(cpus)

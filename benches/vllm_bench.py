@@ -10,13 +10,16 @@ from common import (
     finish,
     hf_chat_prompts_and_counts,
     make_prompts,
+    maybe_set_cpu_affinity,
     summarize,
+    visible_cuda_devices,
 )
 
 
 def run(args: argparse.Namespace):
     from vllm import LLM, SamplingParams
 
+    cpu_affinity = maybe_set_cpu_affinity(args, visible_cuda_devices(args.tp_size))
     n = args.requests if args.mode == "latency" else args.num_requests
     prompts, prompt_counts = hf_chat_prompts_and_counts(
         args.model, args.system, make_prompts(args, n + args.warmup)
@@ -90,6 +93,7 @@ def run(args: argparse.Namespace):
             "top_p": args.top_p,
             "ignore_eos": args.ignore_eos,
             "unique_prompts": args.unique_prompts,
+            "cpu affinity": cpu_affinity,
         },
     )
     return summary, results

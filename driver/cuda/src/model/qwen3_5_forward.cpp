@@ -491,7 +491,10 @@ void prepare_qwen3_5_decode_plan(
         cfg.num_attention_heads / T,
         cfg.num_key_value_heads / T,
         cfg.head_dim,
-        cache.page_size(), attn_ws, stream);
+        cache.page_size(), attn_ws, stream,
+        /*enable_cuda_graph=*/true,
+        /*full_attention_variant=*/false,
+        cache.hnd_layout());
 }
 
 void qwen3_5_forward_paged(

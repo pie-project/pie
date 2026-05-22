@@ -518,6 +518,59 @@ class PieClient:
 
         return Process(self, process_id)
 
+    async def launch_processes(
+        self,
+        inferlet: str,
+        inputs: list[dict | list | None],
+        capture_outputs: bool = True,
+        token_budgets: list[int | None] | None = None,
+    ) -> list[Process]:
+        """Launch several processes with one control-plane request."""
+        msg = {
+            "type": "launch_processes",
+            "inferlet": inferlet,
+            "inputs": [json.dumps(inp if inp is not None else {}) for inp in inputs],
+            "capture_outputs": capture_outputs,
+        }
+        if token_budgets is not None:
+            msg["token_budgets"] = token_budgets
+        ok, result = await self._send_msg_and_wait(msg)
+
+        if not ok:
+            raise Exception(f"Failed to launch processes: {result}")
+
+        process_ids = json.loads(result)
+        processes: list[Process] = []
+        for process_id in process_ids:
+            queue = asyncio.Queue()
+            self.process_event_queues[process_id] = queue
+            if process_id in self.orphan_events:
+                for event_tuple in self.orphan_events.pop(process_id):
+                    await queue.put(event_tuple)
+            processes.append(Process(self, process_id))
+        return processes
+
+    async def run_processes(
+        self,
+        inferlet: str,
+        inputs: list[dict | list | None],
+        token_budgets: list[int | None] | None = None,
+    ) -> list[str]:
+        """Run several processes and collect their return payloads in one response."""
+        msg = {
+            "type": "run_processes",
+            "inferlet": inferlet,
+            "inputs": [json.dumps(inp if inp is not None else {}) for inp in inputs],
+        }
+        if token_budgets is not None:
+            msg["token_budgets"] = token_budgets
+        ok, result = await self._send_msg_and_wait(msg)
+
+        if not ok:
+            raise Exception(f"Failed to run processes: {result}")
+
+        return json.loads(result)
+
     async def attach_process(self, process_id: str) -> Process:
         """Attach to an existing process.
 

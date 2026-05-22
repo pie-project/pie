@@ -14,12 +14,14 @@ use crate::context::pagestore::{PhysicalPageId, compute_last_page_len};
 use crate::driver::SchedulerLimits;
 use crate::inference::ForwardOutput;
 
-use super::{Completion, PendingRequest, RequestCapacityUsage, request_capacity_usage};
+use super::{
+    Completion, PendingRequest, PhysicalPageSpan, RequestCapacityUsage, request_capacity_usage,
+};
 
 pub(super) struct ChunkContinuation {
     original_request: pie_bridge::ForwardRequest,
     response_tx: oneshot::Sender<Result<ForwardOutput>>,
-    physical_page_ids: Vec<PhysicalPageId>,
+    physical_page_ids: PhysicalPageSpan,
     final_last_page_len: u32,
     chunk_end: usize,
     chunk_size: usize,
@@ -95,6 +97,7 @@ impl PendingRequest {
             completion,
             physical_page_ids,
             last_page_len,
+            enqueued_at: _,
         } = self;
         let Completion::Direct(response_tx) = completion else {
             unreachable!("chunk continuations returned above");
@@ -116,8 +119,9 @@ impl PendingRequest {
                 },
                 sampler_slots: chunk_sampler_slots,
             },
-            physical_page_ids: chunk.physical_page_ids,
+            physical_page_ids: PhysicalPageSpan::from_vec(chunk.physical_page_ids),
             last_page_len: chunk.last_page_len,
+            enqueued_at: std::time::Instant::now(),
         })
     }
 
@@ -138,6 +142,7 @@ impl PendingRequest {
             completion,
             physical_page_ids: _,
             last_page_len: _,
+            enqueued_at: _,
         } = self;
 
         let result = result.map(Into::into);
@@ -267,8 +272,9 @@ impl ChunkContinuation {
                 },
                 sampler_slots: chunk_sampler_slots,
             },
-            physical_page_ids: chunk.physical_page_ids,
+            physical_page_ids: PhysicalPageSpan::from_vec(chunk.physical_page_ids),
             last_page_len: chunk.last_page_len,
+            enqueued_at: std::time::Instant::now(),
         })
     }
 }
@@ -1117,6 +1123,8 @@ mod tests {
             max_forward_requests: max_requests,
             max_forward_tokens: max_tokens,
             max_page_refs: max_pages,
+            max_logit_rows: usize::MAX,
+            max_prob_rows: usize::MAX,
             max_sampler_rows: usize::MAX,
             max_custom_mask_bytes: usize::MAX,
             max_logprob_labels: usize::MAX,
@@ -1126,10 +1134,7 @@ mod tests {
     fn positioned_pending_with_receiver(
         tokens: usize,
         page_size: u32,
-    ) -> (
-        PendingRequest,
-        oneshot::Receiver<Result<pie_bridge::ForwardResponse>>,
-    ) {
+    ) -> (PendingRequest, oneshot::Receiver<Result<ForwardOutput>>) {
         let (tx, rx) = oneshot::channel();
         let pages = (tokens as u32).div_ceil(page_size);
         let last_page_len = compute_last_page_len(tokens as u32, pages, page_size);
@@ -1155,6 +1160,13 @@ mod tests {
             ),
             rx,
         )
+    }
+
+    fn expect_response(output: ForwardOutput) -> pie_bridge::ForwardResponse {
+        match output {
+            ForwardOutput::Response(resp) => resp,
+            other => panic!("expected structured response, got {other:?}"),
+        }
     }
 
     fn positioned_pending(tokens: usize, page_size: u32) -> PendingRequest {
@@ -1397,6 +1409,7 @@ mod tests {
             .try_recv()
             .expect("merged response")
             .expect("chunked response ok");
+        let merged = expect_response(merged);
         assert_eq!(merged.num_requests, 1);
         assert_eq!(merged.tokens, vec![99, 11]);
         assert_eq!(merged.tokens_indptr, vec![0, 2]);
@@ -1728,7 +1741,7 @@ mod tests {
                 4,
             );
             if let Ok(result) = response_rx.try_recv() {
-                let merged = result.expect("chunked response ok");
+                let merged = expect_response(result.expect("chunked response ok"));
                 assert_eq!(merged.num_requests, 1);
                 assert_eq!(merged.tokens_indptr, vec![0, 0]);
                 assert_eq!(merged.dists_req_indptr, vec![0, 0]);
@@ -1860,7 +1873,7 @@ mod tests {
                 64,
             );
             if let Ok(result) = response_rx.try_recv() {
-                break result.expect("chunked response ok");
+                break expect_response(result.expect("chunked response ok"));
             }
             current = submit_rx.try_recv().expect("next continuation");
         };

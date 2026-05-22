@@ -2,7 +2,10 @@
 
 #include <type_traits>
 
+#include <algorithm>
+#include <cstdlib>
 #include <cmath>
+#include <cstring>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -79,6 +82,11 @@ inline T* offset_ptr(void* base, std::int64_t off) {
     return reinterpret_cast<T*>(reinterpret_cast<std::uint8_t*>(base) + off);
 }
 
+inline ::flashinfer::QKVLayout kv_layout(bool hnd_layout) {
+    return hnd_layout ? ::flashinfer::QKVLayout::kHND
+                      : ::flashinfer::QKVLayout::kNHD;
+}
+
 // Wraps the templated work-estimation function so DecodePlan can call it.
 // GROUP_SIZE = num_q_heads / num_kv_heads (GQA ratio); HEAD_DIM is the
 // per-head feature width. Adding a (head_dim, group_size) pair adds one
@@ -106,7 +114,27 @@ int current_device_major() {
     return cached_major;
 }
 
-template <uint32_t HEAD_DIM, uint32_t GROUP_SIZE>
+bool force_split_kv_small_enabled() {
+    static const bool enabled = [] {
+        const char* v = std::getenv("PIE_FLASHINFER_FORCE_SPLIT_KV_SMALL");
+        return v != nullptr && v[0] != '\0' && v[0] != '0';
+    }();
+    return enabled;
+}
+
+bool static_nonsplit_decode_plan_enabled() {
+    static const bool enabled = [] {
+        const char* v = std::getenv("PIE_CUDA_STATIC_DECODE_PLAN");
+        return v != nullptr && v[0] != '\0' && v[0] != '0';
+    }();
+    return enabled;
+}
+
+std::size_t align_up_bytes(std::size_t n, std::size_t alignment) {
+    return (n + alignment - 1) / alignment * alignment;
+}
+
+template <uint32_t HEAD_DIM, uint32_t GROUP_SIZE, class Variant>
 struct DecodeWorkEstimator {
     cudaError_t operator()(bool& split_kv, uint32_t& max_grid_size,
                            uint32_t& max_num_pages_per_batch, uint32_t& new_batch_size,
@@ -115,14 +143,15 @@ struct DecodeWorkEstimator {
                            cudaStream_t stream)
     {
         const auto rc = ::flashinfer::BatchDecodeWithPagedKVCacheWorkEstimationDispatched<
-            GROUP_SIZE, HEAD_DIM, POS_ENC, AttnVariant, DecodeParams>(
+            GROUP_SIZE, HEAD_DIM, POS_ENC, Variant, DecodeParams>(
             split_kv, max_grid_size, max_num_pages_per_batch, new_batch_size, gdy,
             batch_size, kv_indptr_h, num_qo_heads, page_size, enable_cuda_graph, stream);
         if constexpr (!head_dim_supports_cascade_merge(HEAD_DIM)) {
             split_kv = false;
             new_batch_size = batch_size;
         }
-        if (current_device_major() >= 9 && batch_size <= 512) {
+        if (!force_split_kv_small_enabled() &&
+            current_device_major() >= 8 && batch_size <= 512) {
             split_kv = false;
             new_batch_size = batch_size;
         }
@@ -143,7 +172,14 @@ struct DecodePlanCache {
     int page_size = 0;
     int num_pages_in_batch = 0;
     bool enable_pdl = false;
+    bool full_attention_variant = false;
+    bool hnd_layout = false;
     bool valid = false;
+    int static_nonsplit_num_requests = 0;
+    std::vector<IdType> static_request_indices;
+    std::vector<IdType> static_kv_tile_indices;
+    std::vector<IdType> static_o_indptr;
+    std::vector<IdType> indptr_h_buf;
 };
 
 struct PrefillPlanCache {
@@ -157,9 +193,13 @@ struct PrefillPlanCache {
     int page_size = 0;
     int window_left = -1;
     bool full_attention_variant = false;
+    bool causal_mask = true;
+    bool hnd_layout = false;
     bool use_sm90 = false;
     bool enable_pdl = false;
     bool valid = false;
+    std::vector<IdType> qo_h_buf;
+    std::vector<IdType> kv_h_buf;
 };
 
 void DecodePlanCacheDeleter::operator()(DecodePlanCache* p) const noexcept {
@@ -178,17 +218,22 @@ PrefillPlanCachePtr make_prefill_plan() {
     return PrefillPlanCachePtr(new PrefillPlanCache{});
 }
 
-std::uint8_t decode_plan_graph_layout(const DecodePlanCache& cache) {
+std::uint32_t decode_plan_graph_layout(const DecodePlanCache& cache) {
     if (!cache.valid) return 0;
-    return cache.plan_info.split_kv ? 2 : 1;
+    return static_cast<std::uint32_t>(
+        (cache.plan_info.split_kv ? 2u : 1u) |
+        (cache.full_attention_variant ? 4u : 0u) |
+        (cache.hnd_layout ? 8u : 0u));
 }
 
-std::uint8_t prefill_plan_graph_layout(const PrefillPlanCache& cache) {
+std::uint32_t prefill_plan_graph_layout(const PrefillPlanCache& cache) {
     if (!cache.valid) return 0;
     if (cache.use_sm90) {
-        return hopper_prefill_graph_layout(cache.sm90_plan);
+        return 0x00800000u |
+               static_cast<std::uint32_t>(
+                   hopper_prefill_graph_layout(cache.sm90_plan));
     }
-    std::uint8_t tile_class = 0;
+    std::uint32_t tile_class = 0;
     switch (cache.plan_info.cta_tile_q) {
         case 16:  tile_class = 1; break;
         case 32:  tile_class = 2; break;
@@ -196,13 +241,19 @@ std::uint8_t prefill_plan_graph_layout(const PrefillPlanCache& cache) {
         case 128: tile_class = 4; break;
         default:  tile_class = 0; break;
     }
-    const std::uint8_t variant_class =
+    const std::uint32_t variant_class =
         cache.full_attention_variant ? 1u : 0u;
-    return static_cast<std::uint8_t>(
-        64u |
+    const auto padded_batch_size = static_cast<std::uint32_t>(
+        std::min<std::int64_t>(cache.plan_info.padded_batch_size,
+                               0x000fffff));
+    return static_cast<std::uint32_t>(
+        0x100u |
         (cache.plan_info.split_kv ? 1u : 0u) |
         (tile_class << 1) |
-        (variant_class << 4));
+        (variant_class << 4) |
+        (cache.hnd_layout ? 32u : 0u) |
+        (cache.causal_mask ? 64u : 0u) |
+        (padded_batch_size << 8));
 }
 
 namespace {
@@ -219,33 +270,165 @@ cudaError_t plan_decode_for_head_dim(
     int gqa_group_size,
     AttentionWorkspace& workspace,
     cudaStream_t stream,
-    bool enable_cuda_graph)
+    bool enable_cuda_graph,
+    bool full_attention_variant)
 {
     auto plan_for = [&](auto work_estimator) {
-        return ::flashinfer::DecodePlan<HEAD_DIM, POS_ENC, AttnVariant, DecodeParams>(
-            workspace.float_buffer(), workspace.float_bytes(),
-            workspace.int_buffer(), workspace.page_locked_int(),
-            workspace.int_bytes(),
-            cache.plan_info,
-            const_cast<IdType*>(indptr_h_buf.data()),
-            num_requests, num_q_heads, page_size,
-            enable_cuda_graph,
-            stream, work_estimator);
+        if (full_attention_variant) {
+            return ::flashinfer::DecodePlan<
+                HEAD_DIM, POS_ENC, AttnVariantFull, DecodeParams>(
+                workspace.float_buffer(), workspace.float_bytes(),
+                workspace.int_buffer(), workspace.page_locked_int(),
+                workspace.int_bytes(),
+                cache.plan_info,
+                const_cast<IdType*>(indptr_h_buf.data()),
+                num_requests, num_q_heads, page_size,
+                enable_cuda_graph,
+                stream, work_estimator);
+        }
+        return ::flashinfer::DecodePlan<
+            HEAD_DIM, POS_ENC, AttnVariant, DecodeParams>(
+                workspace.float_buffer(), workspace.float_bytes(),
+                workspace.int_buffer(), workspace.page_locked_int(),
+                workspace.int_bytes(),
+                cache.plan_info,
+                const_cast<IdType*>(indptr_h_buf.data()),
+                num_requests, num_q_heads, page_size,
+                enable_cuda_graph,
+                stream, work_estimator);
     };
     // Must match the kernel-side DISPATCH_GQA_GROUP_SIZE set in
     // flashinfer/utils.cuh ({1, 2, 3, 4, 8}). Other group sizes (5/6/7)
     // are routed to the prefill path by main.cpp's force_prefill_path
     // gate, so they never reach this dispatch.
     switch (gqa_group_size) {
-        case 1: return plan_for(DecodeWorkEstimator<HEAD_DIM, 1>{});
-        case 2: return plan_for(DecodeWorkEstimator<HEAD_DIM, 2>{});
-        case 3: return plan_for(DecodeWorkEstimator<HEAD_DIM, 3>{});
-        case 4: return plan_for(DecodeWorkEstimator<HEAD_DIM, 4>{});
-        case 8: return plan_for(DecodeWorkEstimator<HEAD_DIM, 8>{});
+        case 1:
+            return full_attention_variant
+                ? plan_for(DecodeWorkEstimator<HEAD_DIM, 1, AttnVariantFull>{})
+                : plan_for(DecodeWorkEstimator<HEAD_DIM, 1, AttnVariant>{});
+        case 2:
+            return full_attention_variant
+                ? plan_for(DecodeWorkEstimator<HEAD_DIM, 2, AttnVariantFull>{})
+                : plan_for(DecodeWorkEstimator<HEAD_DIM, 2, AttnVariant>{});
+        case 3:
+            return full_attention_variant
+                ? plan_for(DecodeWorkEstimator<HEAD_DIM, 3, AttnVariantFull>{})
+                : plan_for(DecodeWorkEstimator<HEAD_DIM, 3, AttnVariant>{});
+        case 4:
+            return full_attention_variant
+                ? plan_for(DecodeWorkEstimator<HEAD_DIM, 4, AttnVariantFull>{})
+                : plan_for(DecodeWorkEstimator<HEAD_DIM, 4, AttnVariant>{});
+        case 8:
+            return full_attention_variant
+                ? plan_for(DecodeWorkEstimator<HEAD_DIM, 8, AttnVariantFull>{})
+                : plan_for(DecodeWorkEstimator<HEAD_DIM, 8, AttnVariant>{});
     }
     throw std::runtime_error(
         "flashinfer decode: unsupported GQA group size " +
         std::to_string(gqa_group_size) + " (instantiated: 1, 2, 3, 4, 8)");
+}
+
+bool can_use_static_nonsplit_decode_plan(uint32_t num_requests) {
+    // DecodeWorkEstimator above already overrides FlashInfer's split-kv choice
+    // to false for the TP1 latency shapes we care about. In that case the
+    // schedule is independent of KV lengths, so avoid rerunning the full
+    // FlashInfer planner for every decode batch.
+    return static_nonsplit_decode_plan_enabled() &&
+           current_device_major() >= 8 &&
+           num_requests > 0 &&
+           num_requests <= 512 &&
+           !force_split_kv_small_enabled();
+}
+
+void refresh_static_nonsplit_decode_vectors(
+    DecodePlanCache& cache,
+    int num_requests)
+{
+    if (cache.static_nonsplit_num_requests == num_requests) {
+        return;
+    }
+    cache.static_nonsplit_num_requests = num_requests;
+    cache.static_request_indices.resize(num_requests);
+    cache.static_kv_tile_indices.assign(num_requests, IdType{0});
+    cache.static_o_indptr.resize(num_requests + 1);
+    for (int r = 0; r < num_requests; ++r) {
+        cache.static_request_indices[r] = static_cast<IdType>(r);
+        cache.static_o_indptr[r] = static_cast<IdType>(r);
+    }
+    cache.static_o_indptr[num_requests] = static_cast<IdType>(num_requests);
+}
+
+void plan_static_nonsplit_decode(
+    DecodePlanCache& cache,
+    const std::uint32_t* kv_page_indptr_h,
+    int num_requests,
+    int num_q_heads,
+    int num_kv_heads,
+    int head_dim,
+    int page_size,
+    AttentionWorkspace& workspace,
+    cudaStream_t stream,
+    bool enable_cuda_graph,
+    bool full_attention_variant,
+    bool hnd_layout)
+{
+    refresh_static_nonsplit_decode_vectors(cache, num_requests);
+
+    std::size_t cursor = 0;
+    auto alloc = [&](std::size_t bytes, std::size_t alignment) {
+        cursor = align_up_bytes(cursor, alignment);
+        const std::size_t offset = cursor;
+        cursor += bytes;
+        return static_cast<std::int64_t>(offset);
+    };
+
+    auto& plan = cache.plan_info;
+    plan.padded_batch_size = num_requests;
+    plan.v_offset = 0;
+    plan.s_offset = 0;
+    plan.request_indices_offset =
+        alloc(sizeof(IdType) * static_cast<std::size_t>(num_requests), 16);
+    plan.kv_tile_indices_offset =
+        alloc(sizeof(IdType) * static_cast<std::size_t>(num_requests), 16);
+    plan.o_indptr_offset =
+        alloc(sizeof(IdType) * static_cast<std::size_t>(num_requests + 1), 16);
+    plan.kv_chunk_size_ptr_offset = alloc(sizeof(IdType), 1);
+    plan.block_valid_mask_offset = 0;
+    plan.enable_cuda_graph = enable_cuda_graph;
+    plan.split_kv = false;
+
+    if (cursor > workspace.int_bytes()) {
+        throw std::runtime_error(
+            "flashinfer decode static plan: attention int workspace too small");
+    }
+
+    auto* host = static_cast<std::uint8_t*>(workspace.page_locked_int());
+    std::memcpy(host + plan.request_indices_offset,
+                cache.static_request_indices.data(),
+                sizeof(IdType) * static_cast<std::size_t>(num_requests));
+    std::memcpy(host + plan.kv_tile_indices_offset,
+                cache.static_kv_tile_indices.data(),
+                sizeof(IdType) * static_cast<std::size_t>(num_requests));
+    std::memcpy(host + plan.o_indptr_offset,
+                cache.static_o_indptr.data(),
+                sizeof(IdType) * static_cast<std::size_t>(num_requests + 1));
+    *reinterpret_cast<IdType*>(host + plan.kv_chunk_size_ptr_offset) =
+        static_cast<IdType>(page_size);
+
+    CUDA_CHECK(cudaMemcpyAsync(
+        workspace.int_buffer(), workspace.page_locked_int(), cursor,
+        cudaMemcpyHostToDevice, stream));
+
+    cache.num_requests = num_requests;
+    cache.num_q_heads  = num_q_heads;
+    cache.num_kv_heads = num_kv_heads;
+    cache.head_dim     = head_dim;
+    cache.page_size    = page_size;
+    cache.num_pages_in_batch = kv_page_indptr_h[num_requests];
+    cache.enable_pdl   = current_device_supports_pdl();
+    cache.full_attention_variant = full_attention_variant;
+    cache.hnd_layout   = hnd_layout;
+    cache.valid        = true;
 }
 
 }  // namespace
@@ -257,46 +440,57 @@ void plan_attention_flashinfer_decode_bf16(
     int num_q_heads, int num_kv_heads, int head_dim, int page_size,
     AttentionWorkspace& workspace,
     cudaStream_t stream,
-    bool enable_cuda_graph)
+    bool enable_cuda_graph,
+    bool full_attention_variant,
+    bool hnd_layout)
 {
     const int gqa_group_size = num_q_heads / num_kv_heads;
 
-    std::vector<IdType> indptr_h_buf(num_requests + 1);
+    if (can_use_static_nonsplit_decode_plan(
+            static_cast<uint32_t>(num_requests))) {
+        plan_static_nonsplit_decode(
+            cache, kv_page_indptr_h, num_requests, num_q_heads, num_kv_heads,
+            head_dim, page_size, workspace, stream, enable_cuda_graph,
+            full_attention_variant, hnd_layout);
+        return;
+    }
+
+    cache.indptr_h_buf.resize(num_requests + 1);
     for (int r = 0; r <= num_requests; ++r) {
-        indptr_h_buf[r] = static_cast<IdType>(kv_page_indptr_h[r]);
+        cache.indptr_h_buf[r] = static_cast<IdType>(kv_page_indptr_h[r]);
     }
 
     cudaError_t status;
     switch (head_dim) {
         case 64:
             status = plan_decode_for_head_dim<64>(
-                cache, indptr_h_buf,
+                cache, cache.indptr_h_buf,
                 num_requests, num_q_heads, page_size, gqa_group_size,
-                workspace, stream, enable_cuda_graph);
+                workspace, stream, enable_cuda_graph, full_attention_variant);
             break;
         case 96:
             status = plan_decode_for_head_dim<96>(
-                cache, indptr_h_buf,
+                cache, cache.indptr_h_buf,
                 num_requests, num_q_heads, page_size, gqa_group_size,
-                workspace, stream, enable_cuda_graph);
+                workspace, stream, enable_cuda_graph, full_attention_variant);
             break;
         case 128:
             status = plan_decode_for_head_dim<128>(
-                cache, indptr_h_buf,
+                cache, cache.indptr_h_buf,
                 num_requests, num_q_heads, page_size, gqa_group_size,
-                workspace, stream, enable_cuda_graph);
+                workspace, stream, enable_cuda_graph, full_attention_variant);
             break;
         case 256:
             status = plan_decode_for_head_dim<256>(
-                cache, indptr_h_buf,
+                cache, cache.indptr_h_buf,
                 num_requests, num_q_heads, page_size, gqa_group_size,
-                workspace, stream, enable_cuda_graph);
+                workspace, stream, enable_cuda_graph, full_attention_variant);
             break;
         case 512:
             status = plan_decode_for_head_dim<512>(
-                cache, indptr_h_buf,
+                cache, cache.indptr_h_buf,
                 num_requests, num_q_heads, page_size, gqa_group_size,
-                workspace, stream, enable_cuda_graph);
+                workspace, stream, enable_cuda_graph, full_attention_variant);
             break;
         default:
             throw std::runtime_error(
@@ -313,6 +507,8 @@ void plan_attention_flashinfer_decode_bf16(
     cache.page_size    = page_size;
     cache.num_pages_in_batch = kv_page_indptr_h[num_requests];
     cache.enable_pdl   = current_device_supports_pdl();
+    cache.full_attention_variant = full_attention_variant;
+    cache.hnd_layout   = hnd_layout;
     cache.valid        = true;
 }
 
@@ -331,17 +527,19 @@ void plan_attention_flashinfer_prefill_bf16(
     cudaStream_t stream,
     bool enable_cuda_graph,
     int window_left,
-    bool full_attention_variant)
+    bool full_attention_variant,
+    bool hnd_layout,
+    bool causal_mask)
 {
     if (head_dim != 64 && head_dim != 128 && head_dim != 256 && head_dim != 512) {
         throw std::runtime_error(
             "flashinfer prefill plan: instantiated for HEAD_DIM in {64, 128, 256, 512}; got " +
             std::to_string(head_dim));
     }
-
     cache.use_sm90 = false;
     cache.sm90_plan.valid = false;
-    if (kv_last_page_lens_h != nullptr &&
+    if (!hnd_layout &&
+        kv_last_page_lens_h != nullptr &&
         hopper_prefill_supported(
             head_dim, window_left, total_tokens, num_requests)) {
         plan_attention_flashinfer_prefill_sm90_bf16(
@@ -358,7 +556,7 @@ void plan_attention_flashinfer_prefill_bf16(
             workspace,
             stream,
             enable_cuda_graph,
-            /*causal=*/!full_attention_variant,
+            causal_mask,
             window_left);
         cache.total_tokens = total_tokens;
         cache.num_requests = num_requests;
@@ -368,28 +566,32 @@ void plan_attention_flashinfer_prefill_bf16(
         cache.page_size = page_size;
         cache.window_left = window_left;
         cache.full_attention_variant = full_attention_variant;
+        cache.causal_mask = causal_mask;
+        cache.hnd_layout = hnd_layout;
         cache.enable_pdl = current_device_supports_pdl();
         cache.use_sm90 = true;
         cache.valid = true;
         return;
     }
 
-    std::vector<IdType> qo_h(num_requests + 1);
-    std::vector<IdType> kv_h(num_requests + 1);
+    cache.qo_h_buf.resize(num_requests + 1);
+    cache.kv_h_buf.resize(num_requests + 1);
     for (int r = 0; r <= num_requests; ++r) {
-        qo_h[r] = static_cast<IdType>(qo_indptr_h[r]);
-        kv_h[r] = static_cast<IdType>(kv_page_indptr_h[r]);
+        cache.qo_h_buf[r] = static_cast<IdType>(qo_indptr_h[r]);
+        cache.kv_h_buf[r] = static_cast<IdType>(kv_page_indptr_h[r]);
     }
 
     const bool head_dim_supports_split =
         (head_dim == 64 || head_dim == 128 || head_dim == 256 || head_dim == 512);
+    const bool disable_split_kv =
+        !head_dim_supports_split;
 
     auto status = ::flashinfer::PrefillPlan<IdType>(
         workspace.float_buffer(), workspace.float_bytes(),
         workspace.int_buffer(), workspace.page_locked_int(),
         workspace.int_bytes(),
         cache.plan_info,
-        qo_h.data(), kv_h.data(),
+        cache.qo_h_buf.data(), cache.kv_h_buf.data(),
         static_cast<uint32_t>(total_tokens),
         static_cast<uint32_t>(num_requests),
         static_cast<uint32_t>(num_q_heads),
@@ -401,7 +603,7 @@ void plan_attention_flashinfer_prefill_bf16(
         sizeof(DTypeO),
         window_left,
         /*fixed_split_size=*/-1,
-        /*disable_split_kv=*/!head_dim_supports_split,
+        disable_split_kv,
         /*num_colocated_ctas=*/0,
         stream);
     CUDA_CHECK(status);
@@ -414,6 +616,8 @@ void plan_attention_flashinfer_prefill_bf16(
     cache.page_size = page_size;
     cache.window_left = window_left;
     cache.full_attention_variant = full_attention_variant;
+    cache.causal_mask = causal_mask;
+    cache.hnd_layout = hnd_layout;
     cache.enable_pdl = current_device_supports_pdl();
     cache.valid = true;
 }
@@ -439,7 +643,7 @@ cudaError_t dispatch_decode_for_head_dim_v(
         static_cast<uint32_t>(cache.page_size),
         static_cast<uint32_t>(cache.head_dim),
         static_cast<uint32_t>(cache.num_requests),
-        ::flashinfer::QKVLayout::kNHD,
+        kv_layout(cache.hnd_layout),
         static_cast<DTypeKV*>(k_pages),
         static_cast<DTypeKV*>(v_pages),
         const_cast<IdType*>(reinterpret_cast<const IdType*>(kv_page_indices_d)),
@@ -508,6 +712,12 @@ cudaError_t dispatch_decode_for_head_dim(
     float sm_scale,
     float* lse_out)
 {
+    if (cache.full_attention_variant && window_left < 0 && logits_soft_cap <= 0.f) {
+        return dispatch_decode_for_head_dim_v<HEAD_DIM, AttnVariantFull>(
+            cache, q, k_pages, v_pages, o,
+            kv_page_indices_d, kv_page_indptr_d, kv_last_page_lens_d,
+            workspace, stream, window_left, logits_soft_cap, sm_scale, lse_out);
+    }
     if (logits_soft_cap > 0.f) {
         return dispatch_decode_for_head_dim_v<HEAD_DIM, AttnVariantSoftcap>(
             cache, q, k_pages, v_pages, o,
@@ -660,7 +870,7 @@ void dispatch_attention_flashinfer_prefill_bf16(
         static_cast<uint32_t>(cache.page_size),
         static_cast<uint32_t>(cache.head_dim),
         static_cast<uint32_t>(cache.num_requests),
-        ::flashinfer::QKVLayout::kNHD,
+        kv_layout(cache.hnd_layout),
         static_cast<DTypeKV*>(k_pages),
         static_cast<DTypeKV*>(v_pages),
         const_cast<IdType*>(reinterpret_cast<const IdType*>(kv_page_indices_d)),
@@ -724,17 +934,29 @@ void dispatch_attention_flashinfer_prefill_bf16(
     auto dispatch = [&]<class Variant>(::std::type_identity<Variant>) {
         switch (cache.head_dim) {
             case 64:
-                return prefill_dispatch_for_head_dim<64, ::flashinfer::MaskMode::kNone, Variant>(
-                    params, plan_info, tmp_v, tmp_s, cache.enable_pdl, stream);
+                return cache.causal_mask
+                    ? prefill_dispatch_for_head_dim<64, ::flashinfer::MaskMode::kCausal, Variant>(
+                        params, plan_info, tmp_v, tmp_s, cache.enable_pdl, stream)
+                    : prefill_dispatch_for_head_dim<64, ::flashinfer::MaskMode::kNone, Variant>(
+                        params, plan_info, tmp_v, tmp_s, cache.enable_pdl, stream);
             case 128:
-                return prefill_dispatch_for_head_dim<128, ::flashinfer::MaskMode::kNone, Variant>(
-                    params, plan_info, tmp_v, tmp_s, cache.enable_pdl, stream);
+                return cache.causal_mask
+                    ? prefill_dispatch_for_head_dim<128, ::flashinfer::MaskMode::kCausal, Variant>(
+                        params, plan_info, tmp_v, tmp_s, cache.enable_pdl, stream)
+                    : prefill_dispatch_for_head_dim<128, ::flashinfer::MaskMode::kNone, Variant>(
+                        params, plan_info, tmp_v, tmp_s, cache.enable_pdl, stream);
             case 256:
-                return prefill_dispatch_for_head_dim<256, ::flashinfer::MaskMode::kNone, Variant>(
-                    params, plan_info, tmp_v, tmp_s, cache.enable_pdl, stream);
+                return cache.causal_mask
+                    ? prefill_dispatch_for_head_dim<256, ::flashinfer::MaskMode::kCausal, Variant>(
+                        params, plan_info, tmp_v, tmp_s, cache.enable_pdl, stream)
+                    : prefill_dispatch_for_head_dim<256, ::flashinfer::MaskMode::kNone, Variant>(
+                        params, plan_info, tmp_v, tmp_s, cache.enable_pdl, stream);
             case 512:
-                return prefill_dispatch_for_head_dim<512, ::flashinfer::MaskMode::kNone, Variant>(
-                    params, plan_info, tmp_v, tmp_s, cache.enable_pdl, stream);
+                return cache.causal_mask
+                    ? prefill_dispatch_for_head_dim<512, ::flashinfer::MaskMode::kCausal, Variant>(
+                        params, plan_info, tmp_v, tmp_s, cache.enable_pdl, stream)
+                    : prefill_dispatch_for_head_dim<512, ::flashinfer::MaskMode::kNone, Variant>(
+                        params, plan_info, tmp_v, tmp_s, cache.enable_pdl, stream);
         }
         return cudaErrorInvalidValue;
     };
@@ -768,7 +990,8 @@ void launch_attention_flashinfer_prefill_bf16(
     int window_left,
     float logits_soft_cap,
     float sm_scale,
-    float* lse_out)
+    float* lse_out,
+    bool hnd_layout)
 {
     if (head_dim != 64 && head_dim != 128 && head_dim != 256 && head_dim != 512) {
         throw std::runtime_error(
@@ -782,7 +1005,7 @@ void launch_attention_flashinfer_prefill_bf16(
         static_cast<uint32_t>(page_size),
         static_cast<uint32_t>(head_dim),
         static_cast<uint32_t>(num_requests),
-        ::flashinfer::QKVLayout::kNHD,
+        kv_layout(hnd_layout),
         static_cast<DTypeKV*>(k_pages),
         static_cast<DTypeKV*>(v_pages),
         const_cast<IdType*>(reinterpret_cast<const IdType*>(kv_page_indices_d)),
@@ -937,7 +1160,7 @@ void launch_attention_flashinfer_prefill(
         total_tokens, num_requests, num_q_heads, kv_layer.num_kv_heads,
         kv_layer.head_dim, kv_layer.page_size, workspace, stream,
         window_left, logits_soft_cap, sm_scale,
-        lse_out);
+        lse_out, kv_layer.hnd_layout);
 }
 
 // ── Prefill with custom mask ───────────────────────────────────────────────
@@ -980,7 +1203,8 @@ void launch_attention_flashinfer_prefill_custom_bf16(
     int /* window_left */,  // ignored — kCustom owns the mask
     float logits_soft_cap,
     float sm_scale,
-    float* lse_out)
+    float* lse_out,
+    bool hnd_layout)
 {
     if (head_dim != 64 && head_dim != 128 && head_dim != 256 && head_dim != 512) {
         throw std::runtime_error(
@@ -994,7 +1218,7 @@ void launch_attention_flashinfer_prefill_custom_bf16(
         static_cast<uint32_t>(page_size),
         static_cast<uint32_t>(head_dim),
         static_cast<uint32_t>(num_requests),
-        ::flashinfer::QKVLayout::kNHD,
+        kv_layout(hnd_layout),
         static_cast<DTypeKV*>(k_pages),
         static_cast<DTypeKV*>(v_pages),
         const_cast<IdType*>(reinterpret_cast<const IdType*>(kv_page_indices_d)),
@@ -1147,7 +1371,7 @@ void launch_attention_flashinfer_prefill_custom(
         total_tokens, num_requests, num_q_heads, kv_layer.num_kv_heads,
         kv_layer.head_dim, kv_layer.page_size, workspace, stream,
         window_left, logits_soft_cap, sm_scale,
-        lse_out);
+        lse_out, kv_layer.hnd_layout);
 }
 
 }  // namespace pie_cuda_driver::ops

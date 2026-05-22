@@ -106,6 +106,7 @@ struct LlamaLikePlanState {
     bool use_prefill_decode_plan = false;
     bool use_xqa_decode = false;
     int xqa_max_pages_per_seq = 0;
+    std::vector<std::uint32_t> prefill_decode_qo_indptr_h;
 };
 
 // Refresh the decode plan for the current fire. Caller invokes this
@@ -129,7 +130,7 @@ void prepare_llama_like_decode_plan(
     int num_requests,
     bool is_pure_decode);
 
-std::uint8_t llama_like_decode_graph_layout(
+std::uint32_t llama_like_decode_graph_layout(
     const LlamaLikePlanState& state);
 
 // Same call signature as `qwen3_forward_paged`, plus a `cfg` knob block

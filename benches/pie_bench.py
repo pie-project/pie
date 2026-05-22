@@ -21,6 +21,7 @@ from common import (
     add_mode_subcommands,
     finish,
     make_prompts,
+    maybe_set_cpu_affinity,
     summarize,
 )
 
@@ -42,6 +43,17 @@ KV_CACHE_DTYPES = [
     "fp4_e2m1",
     "nvfp4",
 ]
+
+
+def cuda_device_ids(device: str, tp_size: int) -> list[int]:
+    ids: list[int] = []
+    for raw in device.split(","):
+        part = raw.strip()
+        if part.startswith("cuda:"):
+            part = part.split(":", 1)[1]
+        if part.isdigit():
+            ids.append(int(part))
+    return ids[: max(1, tp_size)] or list(range(max(1, tp_size)))
 
 
 def bench_inferlet_paths() -> tuple[Path, Path, str]:
@@ -146,6 +158,18 @@ def build_config(args: argparse.Namespace):
     ):
         scheduler_kwargs["speculation_depth"] = args.speculation_depth
 
+    runtime_kwargs: dict[str, Any] = {
+        "wasm_max_instances": max(4096, (args.num_requests + args.warmup) * 4),
+    }
+    if args.worker_threads:
+        runtime_kwargs["worker_threads"] = args.worker_threads
+    if args.wasm_max_memory_mb is not None:
+        runtime_kwargs["wasm_max_memory_mb"] = args.wasm_max_memory_mb
+    if args.wasm_warm_memory_mb is not None:
+        runtime_kwargs["wasm_warm_memory_mb"] = args.wasm_warm_memory_mb
+    if args.wasm_warm_slots is not None:
+        runtime_kwargs["wasm_warm_slots"] = args.wasm_warm_slots
+
     cfg = Config(
         server=ServerConfig(
             host="127.0.0.1",
@@ -155,10 +179,7 @@ def build_config(args: argparse.Namespace):
         ),
         auth=AuthConfig(enabled=False),
         telemetry=TelemetryConfig(),
-        runtime=RuntimeConfig(
-            wasm_max_instances=max(4096, (args.num_requests + args.warmup) * 4),
-            **({"worker_threads": args.worker_threads} if args.worker_threads else {}),
-        ),
+        runtime=RuntimeConfig(**runtime_kwargs),
         models=[
             ModelConfig(
                 name="default",
@@ -178,6 +199,7 @@ def build_config(args: argparse.Namespace):
     config_blob = {
         "driver": args.driver,
         "scheduler": scheduler,
+        **{f"runtime {k}": v for k, v in runtime_kwargs.items()},
         **driver_options,
     }
     if args.token_budget is not None:
@@ -217,6 +239,7 @@ async def cli_pie_client(args: argparse.Namespace):
             "--no-default-features --features driver-cuda"
         )
 
+    startup_start = time.perf_counter()
     proc = await asyncio.create_subprocess_exec(
         str(pie_bin),
         "serve",
@@ -321,6 +344,7 @@ async def cli_pie_client(args: argparse.Namespace):
         client = PieClient(f"ws://127.0.0.1:{cfg.server.port}")
         await client.connect()
         await client.auth_by_token(token)
+        engine_config["pie startup s"] = time.perf_counter() - startup_start
         try:
             yield client, {**engine_config, "pie_bin": str(pie_bin)}
         finally:
@@ -350,17 +374,31 @@ def pie_client(args: argparse.Namespace):
 async def run(args: argparse.Namespace):
     from pie_client import Event
 
+    cpu_affinity = maybe_set_cpu_affinity(args, cuda_device_ids(args.device, args.tp_size))
     n = args.requests if args.mode == "latency" else args.num_requests
     prompts = make_prompts(args, n + args.warmup)
     wasm, manifest, pkg = bench_inferlet_paths()
 
     async with pie_client(args) as (client, engine_config):
+        if cpu_affinity:
+            engine_config["cpu affinity"] = cpu_affinity
+        install_start = time.perf_counter()
         await client.install_program(wasm, manifest, force_overwrite=True)
+        engine_config["program install s"] = time.perf_counter() - install_start
 
         first_output_text: list[str | None] = [None]
 
-        async def launch_one(i: int, *, max_tokens: int | None = None):
-            inp = {
+        async def query_model_status() -> dict[str, Any]:
+            try:
+                ok, body = await client.query("model_status", "")
+                if ok:
+                    return json.loads(body)
+            except Exception:  # noqa: BLE001
+                pass
+            return {}
+
+        def request_input(i: int, *, max_tokens: int | None = None) -> dict[str, Any]:
+            return {
                 "prompt": prompts[i],
                 "system": args.system,
                 "max_tokens": args.max_tokens if max_tokens is None else max_tokens,
@@ -368,14 +406,23 @@ async def run(args: argparse.Namespace):
                 "top_p": args.top_p,
                 "ignore_eos": args.ignore_eos,
                 "wasm_delay_us": args.wasm_delay_us,
+                "return_text": args.dump_first_text,
             }
+
+        def request_token_budget(max_tokens: int | None = None) -> int | None:
+            token_budget = args.token_budget
+            if token_budget is None and args.auto_token_budget:
+                budget_tokens = args.max_tokens if max_tokens is None else max_tokens
+                token_budget = budget_tokens + args.token_budget_prompt_margin
+            return token_budget
+
+        async def launch_one(i: int, *, max_tokens: int | None = None):
+            inp = request_input(i, max_tokens=max_tokens)
             start = time.perf_counter()
             try:
-                token_budget = args.token_budget
-                if token_budget is None and args.auto_token_budget:
-                    budget_tokens = args.max_tokens if max_tokens is None else max_tokens
-                    token_budget = budget_tokens + args.token_budget_prompt_margin
-                proc = await client.launch_process(pkg, input=inp, token_budget=token_budget)
+                proc = await client.launch_process(
+                    pkg, input=inp, token_budget=request_token_budget(max_tokens)
+                )
                 return i, start, proc
             except Exception as e:
                 return RequestResult(False, time.perf_counter() - start, 0, error=f"{type(e).__name__}: {e}")
@@ -408,61 +455,331 @@ async def run(args: argparse.Namespace):
             return await wait_one(await launch_one(i, max_tokens=max_tokens))
 
         async def many(indices, *, max_tokens: int | None = None) -> list[RequestResult]:
+            indices = list(indices)
+            if hasattr(client, "run_processes"):
+                start = time.perf_counter()
+                try:
+                    inputs = [
+                        request_input(i, max_tokens=max_tokens)
+                        for i in indices
+                    ]
+                    token_budget = request_token_budget(max_tokens)
+                    token_budgets = (
+                        None if token_budget is None
+                        else [token_budget for _ in indices]
+                    )
+                    outputs = await client.run_processes(
+                        pkg, inputs, token_budgets=token_budgets
+                    )
+                    elapsed = time.perf_counter() - start
+                except Exception as e:
+                    elapsed = time.perf_counter() - start
+                    return [
+                        RequestResult(
+                            False,
+                            elapsed,
+                            0,
+                            error=f"{type(e).__name__}: {e}",
+                        )
+                    ]
+                results: list[RequestResult] = []
+                for i, msg in zip(indices, outputs):
+                    try:
+                        obj = json.loads(msg)
+                        if i == 0 and first_output_text[0] is None:
+                            first_output_text[0] = obj.get("text", "")
+                        results.append(
+                            RequestResult(
+                                True,
+                                elapsed,
+                                int(obj["num_output_tokens"]),
+                                int(obj["num_prompt_tokens"]),
+                            )
+                        )
+                    except Exception as e:
+                        results.append(
+                            RequestResult(
+                                False,
+                                elapsed,
+                                0,
+                                error=f"{type(e).__name__}: {e}",
+                            )
+                        )
+                return results
+            if hasattr(client, "launch_processes"):
+                start = time.perf_counter()
+                try:
+                    inputs = [
+                        request_input(i, max_tokens=max_tokens)
+                        for i in indices
+                    ]
+                    token_budget = request_token_budget(max_tokens)
+                    token_budgets = (
+                        None if token_budget is None
+                        else [token_budget for _ in indices]
+                    )
+                    procs = await client.launch_processes(
+                        pkg, inputs, token_budgets=token_budgets
+                    )
+                    launched = list(zip(indices, [start] * len(indices), procs))
+                except Exception as e:
+                    elapsed = time.perf_counter() - start
+                    return [
+                        RequestResult(
+                            False,
+                            elapsed,
+                            0,
+                            error=f"{type(e).__name__}: {e}",
+                        )
+                    ]
+                return await asyncio.gather(*(wait_one(item) for item in launched))
             launched = await asyncio.gather(
                 *(launch_one(i, max_tokens=max_tokens) for i in indices)
             )
             return await asyncio.gather(*(wait_one(item) for item in launched))
 
         if args.warmup:
+            warmup_start = time.perf_counter()
             warmup_max_tokens = args.warmup_max_tokens or args.max_tokens
             if args.mode == "tput":
                 await many(range(args.warmup), max_tokens=warmup_max_tokens)
             else:
                 for i in range(args.warmup):
                     await one(i, max_tokens=warmup_max_tokens)
+            engine_config["warmup wall s"] = time.perf_counter() - warmup_start
+        else:
+            engine_config["warmup wall s"] = 0.0
 
         start_idx = args.warmup
+        status_before = await query_model_status()
         start = time.perf_counter()
         if args.mode == "latency":
             results = [await one(start_idx + i) for i in range(n)]
         else:
             results = await many(range(start_idx, start_idx + n))
+            # Bulk throughput mode is one all-requests measurement, matching
+            # vLLM's single generate() call. Per-request latency is not
+            # meaningful here, so keep it out of summary percentiles.
+            results = [
+                RequestResult(r.ok, 0.0 if r.ok else r.latency_s, r.output_tokens, r.prompt_tokens, r.error)
+                for r in results
+            ]
         wall = time.perf_counter() - start
+        engine_config["measured wall s"] = wall
 
         # Pull speculation counters out of the server's model status
         # so the bench output reflects what actually happened. Zero
         # on devices without speculation capability or with the
         # operator override disabled.
-        try:
-            ok, body = await client.query("model_status", "")
-            if ok:
-                model_status = json.loads(body)
-                for key, label in (
-                    ("default.spec_attempted", "spec attempted"),
-                    ("default.spec_hits", "spec hits"),
-                    ("default.spec_misses", "spec misses"),
-                    ("default.spec_rule_skipped", "spec rule skipped"),
-                    ("default.spec_budget_skipped", "spec budget skipped"),
-                    ("default.spec_dropped_orphan", "spec dropped orphan"),
-                    ("default.spec_need_pages", "spec need pages"),
-                    ("default.spec_chain_entries", "spec chain now"),
-                    ("default.spec_chain_entries_high_water", "spec chain peak"),
-                    ("default.spec_longest_chain", "spec longest chain"),
-                    ("default.total_batches", "total batches"),
-                    ("default.avg_batch_latency_us", "avg batch latency us"),
-                    ("default.last_batch_latency_us", "last batch latency us"),
-                    ("default.bypass_hits", "bypass hits"),
-                    ("default.chain_submits", "chain submits"),
-                    ("default.chain_drops", "chain drops"),
-                    ("default.total_requests_processed", "total requests"),
-                    ("default.max_forward_requests_observed", "max forward requests"),
-                    ("default.batch_size_hist", "batch size hist"),
-                ):
-                    if key in model_status:
-                        engine_config[label] = model_status[key]
-        except Exception:  # noqa: BLE001
-            # Stats are advisory — never break a bench on a failed query.
-            pass
+        model_status = await query_model_status()
+        for key, label in (
+            ("default.spec_attempted", "spec attempted"),
+            ("default.spec_hits", "spec hits"),
+            ("default.spec_misses", "spec misses"),
+            ("default.spec_rule_skipped", "spec rule skipped"),
+            ("default.spec_budget_skipped", "spec budget skipped"),
+            ("default.spec_dropped_orphan", "spec dropped orphan"),
+            ("default.spec_need_pages", "spec need pages"),
+            ("default.spec_chain_entries", "spec chain now"),
+            ("default.spec_chain_entries_high_water", "spec chain peak"),
+            ("default.spec_longest_chain", "spec longest chain"),
+            ("default.total_batches", "total batches"),
+            ("default.avg_batch_latency_us", "avg batch latency us"),
+            ("default.last_batch_latency_us", "last batch latency us"),
+            ("default.avg_request_queue_us", "avg request queue us"),
+            ("default.avg_batch_queue_us", "avg batch queue us"),
+            ("default.avg_permit_wait_us", "avg permit wait us"),
+            ("default.avg_batch_build_us", "avg batch build us"),
+            ("default.avg_driver_forward_us", "avg driver forward us"),
+            ("default.avg_response_fanout_us", "avg response fanout us"),
+            ("default.avg_response_classify_us", "avg response classify us"),
+            (
+                "default.avg_response_token_output_build_us",
+                "avg response token output build us",
+            ),
+            ("default.avg_response_direct_send_us", "avg response direct send us"),
+            ("default.avg_response_chunk_send_us", "avg response chunk send us"),
+            ("default.avg_response_extract_us", "avg response extract us"),
+            ("default.avg_response_error_us", "avg response error us"),
+            ("default.bypass_hits", "bypass hits"),
+            ("default.chain_submits", "chain submits"),
+            ("default.chain_drops", "chain drops"),
+            ("default.total_requests_processed", "total requests"),
+            ("default.max_forward_requests_observed", "max forward requests"),
+            ("default.batch_size_hist", "batch size hist"),
+            ("api_forward.completed", "api forward completed"),
+            ("api_forward.hit_path", "api forward hit path"),
+            ("api_forward.cold_path", "api forward cold path"),
+            ("api_forward.avg_execute_us", "avg api execute us"),
+            ("api_forward.avg_try_hit_us", "avg api try hit us"),
+            ("api_forward.avg_staged_await_us", "avg api staged await us"),
+            ("api_forward.avg_cold_prepare_us", "avg api cold prepare us"),
+            ("api_forward.avg_pin_us", "avg api pin us"),
+            ("api_forward.avg_submit_await_us", "avg api submit await us"),
+            ("api_forward.avg_append_us", "avg api append us"),
+            ("api_forward.avg_unpin_us", "avg api unpin us"),
+            ("api_forward.avg_build_output_us", "avg api build output us"),
+        ):
+            if key in model_status:
+                engine_config[label] = model_status[key]
+
+        def stat_delta(key: str) -> int:
+            after = model_status.get(key, 0)
+            before = status_before.get(key, 0)
+            if isinstance(after, (int, float)) and isinstance(before, (int, float)):
+                return int(after - before)
+            return 0
+
+        def add_avg(label: str, cumulative_key: str, count_key: str) -> None:
+            count = stat_delta(count_key)
+            total = stat_delta(cumulative_key)
+            if count > 0:
+                engine_config[label] = total / count
+
+        measured_batches = stat_delta("default.total_batches")
+        measured_forward_requests = stat_delta("default.total_requests_processed")
+        measured_processes = stat_delta("process.completed")
+        measured_api_forwards = stat_delta("api_forward.completed")
+        if measured_batches:
+            engine_config["e2e scheduler batches"] = measured_batches
+        if measured_forward_requests:
+            engine_config["e2e scheduler forward requests"] = measured_forward_requests
+        if measured_processes:
+            engine_config["e2e process completed"] = measured_processes
+        if measured_api_forwards:
+            engine_config["e2e api forward completed"] = measured_api_forwards
+            engine_config["e2e api forward hit path"] = stat_delta("api_forward.hit_path")
+            engine_config["e2e api forward cold path"] = stat_delta("api_forward.cold_path")
+        add_avg(
+            "e2e scheduler avg batch latency us",
+            "default.cumulative_batch_latency_us",
+            "default.total_batches",
+        )
+        add_avg(
+            "e2e scheduler avg batch queue us",
+            "default.cumulative_batch_queue_us",
+            "default.total_batches",
+        )
+        add_avg(
+            "e2e scheduler avg request queue us",
+            "default.cumulative_request_queue_us",
+            "default.total_requests_processed",
+        )
+        add_avg(
+            "e2e scheduler avg permit wait us",
+            "default.cumulative_permit_wait_us",
+            "default.total_batches",
+        )
+        add_avg(
+            "e2e scheduler avg batch build us",
+            "default.cumulative_batch_build_us",
+            "default.total_batches",
+        )
+        add_avg(
+            "e2e scheduler avg driver forward us",
+            "default.cumulative_driver_forward_us",
+            "default.total_batches",
+        )
+        add_avg(
+            "e2e scheduler avg response fanout us",
+            "default.cumulative_response_fanout_us",
+            "default.total_batches",
+        )
+        add_avg(
+            "e2e scheduler avg response classify us",
+            "default.cumulative_response_classify_us",
+            "default.total_batches",
+        )
+        add_avg(
+            "e2e scheduler avg response token output build us",
+            "default.cumulative_response_token_output_build_us",
+            "default.total_batches",
+        )
+        add_avg(
+            "e2e scheduler avg response direct send us",
+            "default.cumulative_response_direct_send_us",
+            "default.total_batches",
+        )
+        add_avg(
+            "e2e scheduler avg response chunk send us",
+            "default.cumulative_response_chunk_send_us",
+            "default.total_batches",
+        )
+        add_avg(
+            "e2e scheduler avg response extract us",
+            "default.cumulative_response_extract_us",
+            "default.total_batches",
+        )
+        add_avg(
+            "e2e scheduler avg response error us",
+            "default.cumulative_response_error_us",
+            "default.total_batches",
+        )
+        add_avg(
+            "e2e process avg admission wait us",
+            "process.cumulative_admission_wait_us",
+            "process.completed",
+        )
+        add_avg(
+            "e2e process avg instantiate us",
+            "process.cumulative_instantiate_us",
+            "process.completed",
+        )
+        add_avg(
+            "e2e process avg context register us",
+            "process.cumulative_context_register_us",
+            "process.completed",
+        )
+        add_avg(
+            "e2e process avg wasm run us",
+            "process.cumulative_wasm_run_us",
+            "process.completed",
+        )
+        add_avg(
+            "e2e api avg execute us",
+            "api_forward.cumulative_execute_us",
+            "api_forward.completed",
+        )
+        add_avg(
+            "e2e api avg try hit us",
+            "api_forward.cumulative_try_hit_us",
+            "api_forward.completed",
+        )
+        add_avg(
+            "e2e api avg staged await us",
+            "api_forward.cumulative_staged_await_us",
+            "api_forward.completed",
+        )
+        add_avg(
+            "e2e api avg cold prepare us",
+            "api_forward.cumulative_cold_prepare_us",
+            "api_forward.completed",
+        )
+        add_avg(
+            "e2e api avg pin us",
+            "api_forward.cumulative_pin_us",
+            "api_forward.completed",
+        )
+        add_avg(
+            "e2e api avg submit await us",
+            "api_forward.cumulative_submit_await_us",
+            "api_forward.completed",
+        )
+        add_avg(
+            "e2e api avg append us",
+            "api_forward.cumulative_append_us",
+            "api_forward.completed",
+        )
+        add_avg(
+            "e2e api avg unpin us",
+            "api_forward.cumulative_unpin_us",
+            "api_forward.completed",
+        )
+        add_avg(
+            "e2e api avg build output us",
+            "api_forward.cumulative_build_output_us",
+            "api_forward.completed",
+        )
 
     if args.dump_first_text and first_output_text[0] is not None:
         import hashlib
@@ -519,6 +836,24 @@ def build_parser() -> argparse.ArgumentParser:
         )
         sp.add_argument("--portable-n-gpu-layers", type=int, default=-1)
         sp.add_argument("--worker-threads", type=int, default=None)
+        sp.add_argument(
+            "--wasm-max-memory-mb",
+            type=int,
+            default=None,
+            help="Override runtime.wasm_max_memory_mb for Pie benchmark runs.",
+        )
+        sp.add_argument(
+            "--wasm-warm-memory-mb",
+            type=int,
+            default=None,
+            help="Override runtime.wasm_warm_memory_mb for Pie benchmark runs.",
+        )
+        sp.add_argument(
+            "--wasm-warm-slots",
+            type=int,
+            default=None,
+            help="Override runtime.wasm_warm_slots for Pie benchmark runs.",
+        )
         sp.add_argument("--token-budget", type=int, default=None)
         sp.add_argument("--auto-token-budget", action=argparse.BooleanOptionalAction, default=False)
         sp.add_argument("--token-budget-prompt-margin", type=int, default=64)

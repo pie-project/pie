@@ -17,6 +17,44 @@ const DeviceTensor& must(const LoadedModel& e, const std::string& name) {
     return e.get(name);
 }
 
+const DeviceTensor* maybe_tensor(const LoadedModel& e, const std::string& name) {
+    return e.has(name) ? &e.get(name) : nullptr;
+}
+
+const DeviceTensor* bind_projection_or_fused_view(
+    const LoadedModel& e,
+    const std::string& name,
+    const DeviceTensor* fused,
+    const std::string& fused_name,
+    std::int64_t row_offset,
+    std::int64_t rows,
+    std::int64_t cols,
+    std::unique_ptr<DeviceTensor>& view_slot)
+{
+    if (const DeviceTensor* direct = maybe_tensor(e, name)) {
+        return direct;
+    }
+    if (fused == nullptr) {
+        throw std::runtime_error("llama-like: missing weight '" + name + "'");
+    }
+    const auto& shape = fused->shape();
+    if (fused->dtype() != DType::BF16 || shape.size() != 2 ||
+        shape[1] != cols || row_offset < 0 || rows <= 0 ||
+        row_offset + rows > shape[0]) {
+        throw std::runtime_error(
+            "llama-like: fused weight '" + fused_name +
+            "' cannot provide view for missing weight '" + name + "'");
+    }
+    auto* base = static_cast<std::uint8_t*>(
+        const_cast<void*>(fused->data()));
+    auto* ptr = base + static_cast<std::size_t>(row_offset) *
+                       static_cast<std::size_t>(cols) *
+                       dtype_bytes(fused->dtype());
+    view_slot = std::make_unique<DeviceTensor>(
+        DeviceTensor::view(ptr, fused->dtype(), {rows, cols}));
+    return view_slot.get();
+}
+
 void install_tp_lm_head_shard(const LoadedModel& engine, Qwen3Weights& w) {
     const auto& dist = engine.distributed();
     if (dist.tp_size <= 1 || w.lm_head == nullptr ||
@@ -70,9 +108,27 @@ Qwen3Weights bind_llama_like(const LoadedModel& engine, bool verbose) {
         L.attn_norm = &must(engine, p + "input_layernorm.weight");
         L.mlp_norm  = &must(engine, p + "post_attention_layernorm.weight");
 
-        L.q_proj = &must(engine, p + "self_attn.q_proj.weight");
-        L.k_proj = &must(engine, p + "self_attn.k_proj.weight");
-        L.v_proj = &must(engine, p + "self_attn.v_proj.weight");
+        const int H = cfg.hidden_size;
+        const int Hq = cfg.num_attention_heads * cfg.head_dim;
+        const int Hk = cfg.num_key_value_heads * cfg.head_dim;
+        const int I = cfg.intermediate_size;
+        const std::string qkv_fused_name =
+            p + "self_attn.qkv_proj.fused.weight";
+        const std::string gate_up_fused_name =
+            p + "mlp.gate_up_proj.fused.weight";
+        const DeviceTensor* qkv_fused = maybe_tensor(engine, qkv_fused_name);
+        const DeviceTensor* gate_up_fused =
+            maybe_tensor(engine, gate_up_fused_name);
+
+        L.q_proj = bind_projection_or_fused_view(
+            engine, p + "self_attn.q_proj.weight",
+            qkv_fused, qkv_fused_name, 0, Hq, H, L.q_proj_view);
+        L.k_proj = bind_projection_or_fused_view(
+            engine, p + "self_attn.k_proj.weight",
+            qkv_fused, qkv_fused_name, Hq, Hk, H, L.k_proj_view);
+        L.v_proj = bind_projection_or_fused_view(
+            engine, p + "self_attn.v_proj.weight",
+            qkv_fused, qkv_fused_name, Hq + Hk, Hk, H, L.v_proj_view);
         L.o_proj = &must(engine, p + "self_attn.o_proj.weight");
 
         // QKV biases (Qwen-2 / OLMo-3 / GPT-OSS). HF stores them on the
@@ -90,8 +146,12 @@ Qwen3Weights bind_llama_like(const LoadedModel& engine, bool verbose) {
             L.k_norm = &must(engine, p + "self_attn.k_norm.weight");
         }
 
-        L.gate_proj = &must(engine, p + "mlp.gate_proj.weight");
-        L.up_proj   = &must(engine, p + "mlp.up_proj.weight");
+        L.gate_proj = bind_projection_or_fused_view(
+            engine, p + "mlp.gate_proj.weight",
+            gate_up_fused, gate_up_fused_name, 0, I, H, L.gate_proj_view);
+        L.up_proj = bind_projection_or_fused_view(
+            engine, p + "mlp.up_proj.weight",
+            gate_up_fused, gate_up_fused_name, I, I, H, L.up_proj_view);
         L.down_proj = &must(engine, p + "mlp.down_proj.weight");
 
         // Pull QuantMeta side-map entries — one per projection. Stays
@@ -127,15 +187,13 @@ Qwen3Weights bind_llama_like(const LoadedModel& engine, bool verbose) {
             L.gate_proj->dtype() == DType::BF16 &&
             L.up_proj->dtype() == DType::BF16;
         if (!qkv_quantized && qkv_bf16) {
-            const std::string fused_name = p + "self_attn.qkv_proj.fused.weight";
-            if (engine.has(fused_name)) {
-                L.qkv_proj_fused = &engine.get(fused_name);
+            if (qkv_fused != nullptr) {
+                L.qkv_proj_fused = qkv_fused;
             }
         }
         if (!gu_quantized && gu_bf16) {
-            const std::string fused_name = p + "mlp.gate_up_proj.fused.weight";
-            if (engine.has(fused_name)) {
-                L.gate_up_proj_fused = &engine.get(fused_name);
+            if (gate_up_fused != nullptr) {
+                L.gate_up_proj_fused = gate_up_fused;
             }
         }
     }

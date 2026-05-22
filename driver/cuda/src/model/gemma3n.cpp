@@ -417,7 +417,10 @@ void gemma3n_forward_paged(
         ops::plan_attention_flashinfer_decode(
             *decode_plan, kv_page_indptr_h, R,
             num_q_heads_local, num_kv_heads_local, d,
-            cache.page_size(), attn_ws, stream);
+            cache.page_size(), attn_ws, stream,
+            /*enable_cuda_graph=*/true,
+            /*full_attention_variant=*/false,
+            cache.hnd_layout());
     }
 
     const float router_scale = 1.f / static_cast<float>(H);

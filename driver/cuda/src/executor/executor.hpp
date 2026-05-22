@@ -117,7 +117,7 @@ struct ForwardFn {
         const PrepareInputs&
     )>;
 
-    using GraphLayoutFn = std::function<std::uint8_t()>;
+    using GraphLayoutFn = std::function<std::uint32_t()>;
 
     // Empty by default → executor falls back to "direct call only;
     // no graph capture" mode for this arch.
@@ -187,6 +187,7 @@ struct Executor {
     // view stays valid until the next `build()` call, which is long
     // enough for the `send_response` that immediately follows.
     pie_driver::ResponseBuilder response_builder;
+
 };
 
 // Run the forward pass + sampling pipeline on one forward-pass request

@@ -188,12 +188,15 @@ struct ProgramService {
     installed: HashMap<ProgramName, InstalledProgram>,
     /// Programs that were explicitly installed (not pulled as dependencies)
     explicit_installs: std::collections::HashSet<ProgramName>,
+    /// Monotonic id assigned whenever a component is installed.
+    next_install_id: u64,
 }
 
 /// Cached state for an installed program.
 #[derive(Clone)]
 struct InstalledProgram {
     component: Component,
+    install_id: u64,
     /// True if the component was transformed by the host-side snapshot
     /// pipeline. Consumers use this to pick the stripped shared-module
     /// variant at instantiate time.
@@ -209,6 +212,8 @@ struct InstalledProgram {
 #[derive(Clone)]
 pub struct InstalledComponent {
     pub component: Component,
+    /// Changes whenever this program is freshly installed in this process.
+    pub install_id: u64,
     /// True if the component was transformed by the host-side snapshot
     /// pipeline. Pick the stripped shared-module variant at instantiate time
     /// when this is set.
@@ -224,7 +229,14 @@ impl ProgramService {
             repository,
             installed: HashMap::new(),
             explicit_installs: std::collections::HashSet::new(),
+            next_install_id: 1,
         }
+    }
+
+    fn allocate_install_id(&mut self) -> u64 {
+        let id = self.next_install_id;
+        self.next_install_id = self.next_install_id.wrapping_add(1).max(1);
+        id
     }
 
     fn is_installed(&self, name: &ProgramName) -> bool {
@@ -238,6 +250,7 @@ impl ProgramService {
     fn get_component(&self, name: &ProgramName) -> Option<InstalledComponent> {
         self.installed.get(name).map(|p| InstalledComponent {
             component: p.component.clone(),
+            install_id: p.install_id,
             snapshotted: p.snapshotted,
             python_runtime: p.python_runtime.clone(),
         })
@@ -312,10 +325,12 @@ impl ProgramService {
                     .repository
                     .fetch_manifest(dep_name)
                     .and_then(|m| m.python_runtime().map(str::to_string));
+                let install_id = self.allocate_install_id();
                 self.installed.insert(
                     dep_name.clone(),
                     InstalledProgram {
                         component: dep_component,
+                        install_id,
                         snapshotted: false,
                         python_runtime: dep_python_runtime,
                     },
@@ -391,10 +406,12 @@ impl ProgramService {
         };
 
         // Step 5: Track as installed and mark as explicitly installed
+        let install_id = self.allocate_install_id();
         self.installed.insert(
             name.clone(),
             InstalledProgram {
                 component,
+                install_id,
                 snapshotted,
                 python_runtime,
             },

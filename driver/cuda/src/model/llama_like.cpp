@@ -34,6 +34,15 @@ inline void maybe_add_bias(
     kernels::launch_add_bias_bf16(out, bias_tensor->data(), N, dim, stream);
 }
 
+bool decode_full_attention_variant_enabled() {
+    static const bool enabled = [] {
+        const char* v = std::getenv("PIE_CUDA_DECODE_FULL_ATTENTION");
+        if (v == nullptr || v[0] == '\0') return true;
+        return v[0] != '0';
+    }();
+    return enabled;
+}
+
 inline void apply_rope(
     const LlamaLikeForwardCfg& fwd_cfg,
     const HfConfig& cfg,
@@ -98,7 +107,7 @@ void prepare_llama_like_decode_plan(
     state.use_prefill_plan = false;
     state.use_prefill_decode_plan = false;
     if (is_pure_decode && fwd_cfg.use_xqa_decode &&
-        cache.format().is_native_bf16()) {
+        cache.format().is_native_bf16() && !cache.hnd_layout()) {
         int max_pages = 1;
         for (int r = 0; r < num_requests; ++r) {
             const int pages = static_cast<int>(
@@ -138,7 +147,9 @@ void prepare_llama_like_decode_plan(
                 /*stream=*/nullptr,
                 /*enable_cuda_graph=*/false,
                 fwd_cfg.sliding_window,
-                /*full_attention_variant=*/false);
+                /*full_attention_variant=*/false,
+                cache.hnd_layout(),
+                /*causal_mask=*/true);
             state.use_prefill_plan = true;
         }
         return;
@@ -168,7 +179,8 @@ void prepare_llama_like_decode_plan(
         const int T = (fwd_cfg.tp_size > 0) ? fwd_cfg.tp_size : 1;
         const int num_q_heads_local  = cfg.num_attention_heads / T;
         const int num_kv_heads_local = cfg.num_key_value_heads / T;
-        std::vector<std::uint32_t> qo_indptr_h(num_requests + 1);
+        auto& qo_indptr_h = state.prefill_decode_qo_indptr_h;
+        qo_indptr_h.resize(num_requests + 1);
         for (int r = 0; r <= num_requests; ++r) {
             qo_indptr_h[r] = static_cast<std::uint32_t>(r);
         }
@@ -188,7 +200,8 @@ void prepare_llama_like_decode_plan(
             num_q_heads_local, num_kv_heads_local, cfg.head_dim_kernel,
             cache.page_size(), attn_ws, /*stream=*/nullptr,
             fwd_cfg.decode_plan_cuda_graph, fwd_cfg.sliding_window,
-            full_attention_variant);
+            full_attention_variant, cache.hnd_layout(),
+            /*causal_mask=*/false);
         return;
     }
     if (!state.decode_plan) {
@@ -201,10 +214,13 @@ void prepare_llama_like_decode_plan(
         *state.decode_plan, kv_page_indptr_h, num_requests,
         num_q_heads_local, num_kv_heads_local, cfg.head_dim_kernel,
         cache.page_size(), attn_ws, /*stream=*/nullptr,
-        fwd_cfg.decode_plan_cuda_graph);
+        fwd_cfg.decode_plan_cuda_graph,
+        decode_full_attention_variant_enabled() &&
+            fwd_cfg.sliding_window < 0 && fwd_cfg.per_layer_window_left.empty(),
+        cache.hnd_layout());
 }
 
-std::uint8_t llama_like_decode_graph_layout(
+std::uint32_t llama_like_decode_graph_layout(
     const LlamaLikePlanState& state)
 {
     if (state.use_xqa_decode) {
@@ -389,7 +405,8 @@ void llama_like_forward_paged(
                     rope_table,
                     kv_page_indices, kv_page_indptr, kv_last_page_lens,
                     R, num_q_heads_local, num_kv_heads_local, d,
-                    cache.page_size(), cfg.rope_theta, eps, stream);
+                    cache.page_size(), cache.hnd_layout(),
+                    cfg.rope_theta, eps, stream);
             } else {
                 kernels::launch_split_qkv_bf16(
                     ws.qkv_fused.data(),

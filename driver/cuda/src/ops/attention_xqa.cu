@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <stdexcept>
 
 #include <cuda_bf16.h>
@@ -107,12 +108,100 @@ int current_device_sm_count() {
 }
 
 bool xqa_ratio_supported(int ratio) {
-    return ratio == 5 || ratio == 8;
+    return ratio == 2 || ratio == 4 || ratio == 5 || ratio == 8;
+}
+
+bool xqa_gqa2_page16_enabled() {
+    const char* env = std::getenv("PIE_CUDA_XQA_GQA2_P16");
+    if (!env) return false;
+    return env[0] == '1' || env[0] == 'y' || env[0] == 'Y' ||
+           env[0] == 't' || env[0] == 'T';
 }
 
 }  // namespace
 
 namespace detail {
+
+void launch_attention_xqa_decode_bf16_gqa2(
+    const void* q,
+    void* k_pages,
+    void* v_pages,
+    void* o,
+    const std::uint32_t* kv_page_indices_d,
+    const std::uint32_t* kv_page_indptr_d,
+    const std::uint32_t* kv_last_page_lens_d,
+    int num_requests,
+    int num_q_heads,
+    int num_kv_heads,
+    int head_dim,
+    int page_size,
+    int max_pages_per_seq,
+    AttentionWorkspace& workspace,
+    cudaStream_t stream,
+    float sm_scale);
+
+void launch_attention_xqa_decode_bf16_gqa2_prepared(
+    const void* q,
+    void* k_pages,
+    void* v_pages,
+    void* o,
+    int num_requests,
+    int num_q_heads,
+    int num_kv_heads,
+    int head_dim,
+    int page_size,
+    int max_pages_per_seq,
+    AttentionWorkspace& workspace,
+    cudaStream_t stream,
+    float sm_scale);
+
+void launch_attention_xqa_decode_bf16_gqa2_p16_prepared(
+    const void* q,
+    void* k_pages,
+    void* v_pages,
+    void* o,
+    int num_requests,
+    int num_q_heads,
+    int num_kv_heads,
+    int head_dim,
+    int page_size,
+    int max_pages_per_seq,
+    AttentionWorkspace& workspace,
+    cudaStream_t stream,
+    float sm_scale);
+
+void launch_attention_xqa_decode_bf16_gqa4(
+    const void* q,
+    void* k_pages,
+    void* v_pages,
+    void* o,
+    const std::uint32_t* kv_page_indices_d,
+    const std::uint32_t* kv_page_indptr_d,
+    const std::uint32_t* kv_last_page_lens_d,
+    int num_requests,
+    int num_q_heads,
+    int num_kv_heads,
+    int head_dim,
+    int page_size,
+    int max_pages_per_seq,
+    AttentionWorkspace& workspace,
+    cudaStream_t stream,
+    float sm_scale);
+
+void launch_attention_xqa_decode_bf16_gqa4_prepared(
+    const void* q,
+    void* k_pages,
+    void* v_pages,
+    void* o,
+    int num_requests,
+    int num_q_heads,
+    int num_kv_heads,
+    int head_dim,
+    int page_size,
+    int max_pages_per_seq,
+    AttentionWorkspace& workspace,
+    cudaStream_t stream,
+    float sm_scale);
 
 void launch_attention_xqa_decode_bf16_gqa8(
     const void* q,
@@ -158,8 +247,12 @@ bool xqa_decode_bf16_supported(int num_q_heads,
                                float sm_scale)
 {
     if (num_kv_heads <= 0 || num_q_heads % num_kv_heads != 0) return false;
-    if (!xqa_ratio_supported(num_q_heads / num_kv_heads)) return false;
-    if (head_dim != kXqaHeadDim || page_size != kXqaPageSize) return false;
+    const int ratio = num_q_heads / num_kv_heads;
+    if (!xqa_ratio_supported(ratio)) return false;
+    const bool page_supported =
+        page_size == kXqaPageSize ||
+        (ratio == 2 && page_size == 16 && xqa_gqa2_page16_enabled());
+    if (head_dim != kXqaHeadDim || !page_supported) return false;
     if (window_left >= 0 || logits_soft_cap > 0.f) return false;
     const float default_scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
     if (sm_scale > 0.f && std::abs(sm_scale - default_scale) > 1.0e-6f) {
@@ -317,6 +410,57 @@ void launch_attention_xqa_decode_bf16_prepared(
     if (num_requests <= 0) return;
 
     const int head_group_ratio = num_q_heads / num_kv_heads;
+    if (head_group_ratio == 2) {
+        if (page_size == 16) {
+            detail::launch_attention_xqa_decode_bf16_gqa2_p16_prepared(
+                q,
+                k_pages,
+                v_pages,
+                o,
+                num_requests,
+                num_q_heads,
+                num_kv_heads,
+                head_dim,
+                page_size,
+                max_pages_per_seq,
+                workspace,
+                stream,
+                sm_scale);
+            return;
+        }
+        detail::launch_attention_xqa_decode_bf16_gqa2_prepared(
+            q,
+            k_pages,
+            v_pages,
+            o,
+            num_requests,
+            num_q_heads,
+            num_kv_heads,
+            head_dim,
+            page_size,
+            max_pages_per_seq,
+            workspace,
+            stream,
+            sm_scale);
+        return;
+    }
+    if (head_group_ratio == 4) {
+        detail::launch_attention_xqa_decode_bf16_gqa4_prepared(
+            q,
+            k_pages,
+            v_pages,
+            o,
+            num_requests,
+            num_q_heads,
+            num_kv_heads,
+            head_dim,
+            page_size,
+            max_pages_per_seq,
+            workspace,
+            stream,
+            sm_scale);
+        return;
+    }
     if (head_group_ratio == 8) {
         detail::launch_attention_xqa_decode_bf16_gqa8_prepared(
             q,

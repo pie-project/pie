@@ -1,8 +1,11 @@
 #pragma once
 
-// Paged KV cache pool. One pair of [num_pages, page_size, num_kv_heads,
-// head_dim] tensors per layer. The runtime hands us page-index lists in
-// each wire request; we read/write through that translation.
+// Paged KV cache pool. The default physical layout is one pair of
+// [num_pages, page_size, num_kv_heads, head_dim] tensors per layer. Native
+// BF16 can opt into FlashInfer's HND layout:
+// [num_pages, num_kv_heads, page_size, head_dim].
+// The runtime hands us page-index lists in each wire request; we read/write
+// through that translation.
 
 #include <cstdint>
 #include <cstddef>
@@ -27,6 +30,7 @@ struct KvCacheLayerView {
     void* v_scales = nullptr;
     void* k_bf16_pages = nullptr;
     void* v_bf16_pages = nullptr;
+    bool hnd_layout = false;
 
     bool is_native_bf16() const noexcept {
         return format != nullptr && format->is_native_bf16();
@@ -102,6 +106,7 @@ public:
         return per_layer_head_dim_.empty() ? head_dim_
                                            : per_layer_head_dim_[layer];
     }
+    bool hnd_layout() const noexcept { return hnd_layout_; }
     // Per-layer `num_kv_heads`. Falls back to the scalar when the
     // per-layer override was not supplied at allocation time.
     int num_kv_heads_at(int layer) const noexcept {
@@ -110,8 +115,9 @@ public:
     }
     KvCacheLayerView layer_view(int layer);
 
-    // Per-layer accessors. Layout depends on `format()`:
-    //   BF16 / INT8 / FP8: [num_pages, page_size, num_kv_heads, head_dim_at(layer)]
+    // Per-layer accessors. Layout depends on `format()` and `hnd_layout()`:
+    //   BF16 NHD / INT8 / FP8: [num_pages, page_size, num_kv_heads, head_dim_at(layer)]
+    //   BF16 HND:              [num_pages, num_kv_heads, page_size, head_dim_at(layer)]
     //   FP4 packed:        [num_pages, page_size, num_kv_heads, ceil(head_dim_at(layer)/2)]
     // Resolves through `kv_source_layer_` so shared slots return their
     // source's tensor.
@@ -152,6 +158,7 @@ private:
     int page_size_ = 0;
     int num_kv_heads_ = 0;
     int head_dim_ = 0;
+    bool hnd_layout_ = false;
     KvCacheFormat format_;
     std::vector<DeviceTensor> k_layers_;
     std::vector<DeviceTensor> v_layers_;

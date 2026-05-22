@@ -73,6 +73,30 @@ use std::time::{Duration, Instant};
 
 use super::scheduler::{Decision, SchedulingPolicy};
 
+const PREFILL_COHORT_TARGET: usize = 32;
+
+fn prefill_cohort_grace() -> Duration {
+    static GRACE_MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    Duration::from_millis(*GRACE_MS.get_or_init(|| {
+        std::env::var("PIE_PREFILL_COHORT_GRACE_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or(16)
+    }))
+}
+
+fn dense_cohort_wait_multiplier() -> f64 {
+    static MULT: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    *MULT.get_or_init(|| {
+        std::env::var("PIE_DENSE_COHORT_WAIT_MULT")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| v.is_finite() && *v >= 1.0)
+            .unwrap_or(8.0)
+    })
+}
+
 // =============================================================================
 // AdaptivePolicy — the default. Cohort cap + GPU-busy gate + safety bound.
 // =============================================================================
@@ -158,8 +182,7 @@ pub(super) struct AdaptivePolicy {
     /// completes (the first is skipped due to CUDA/warmup overhead).
     last_latency: f64,
     /// Total batches the policy has seen complete. Used to skip the
-    /// first batch's `on_complete` (warmup latency is
-    /// unrepresentative).
+    /// first batch's `on_complete` (warmup latency is unrepresentative).
     batches_completed: usize,
     /// Set in `on_fired` and cleared in `on_complete` — true while
     /// the driver is executing a batch.
@@ -208,10 +231,6 @@ impl SchedulingPolicy for AdaptivePolicy {
 
     fn on_complete(&mut self, latency: Duration) {
         self.batches_completed += 1;
-        // Skip the first batch: CUDA graph capture, kernel-cache
-        // warmup, and one-shot allocations make its latency
-        // unrepresentative of steady-state. After that, just take
-        // the latest value — no smoothing, no decay.
         if self.batches_completed > 1 {
             self.last_latency = latency.as_secs_f64();
         }
@@ -233,7 +252,7 @@ impl SchedulingPolicy for AdaptivePolicy {
         }
     }
 
-    fn decide(&mut self, current_forward_requests: usize) -> Decision {
+    fn decide(&mut self, current_forward_requests: usize, prefill_cohort: bool) -> Decision {
         // (1) Structural cap. Always fires, even when in_flight,
         //     because the batch can't grow further.
         if current_forward_requests >= self.max_forward_requests {
@@ -245,13 +264,8 @@ impl SchedulingPolicy for AdaptivePolicy {
         if self.in_flight {
             return Decision::Wait(Duration::from_secs(60));
         }
-        // (3) Cold start. Once the GPU is free and there is no
-        //     latency measurement yet, fire to make progress.
-        if self.last_latency == 0.0 {
-            return Decision::Fire;
-        }
         // GPU is free below this point.
-        // (4) Cohort cap. The target is `max(this-batch high-water,
+        // (3) Cohort cap. The target is `max(this-batch high-water,
         //     last fired R)`:
         //   - The per-batch high-water absorbs the case where the
         //     pinned_count climbs through intermediate values as
@@ -270,29 +284,46 @@ impl SchedulingPolicy for AdaptivePolicy {
         // resident count to wait for stragglers. This prevents a first
         // 440/512 fire from becoming the permanent cohort size, while
         // sparse agent workloads still fire from the pinned count below.
-        if resident > active
-            && current_forward_requests.saturating_mul(4) >= resident.saturating_mul(3)
-        {
+        if resident > active && current_forward_requests.saturating_mul(2) >= resident {
             active = resident.min(self.max_forward_requests);
         }
         if active > self.cohort_high_water {
             self.cohort_high_water = active;
         }
-        let target = self.cohort_high_water.max(self.fired_high_water);
-        if target > 0 && current_forward_requests >= target {
-            return Decision::Fire;
-        }
-        // (5) Safety bound — never wait longer than one previous
-        //     batch's compute time.
+        let mut target = self.cohort_high_water.max(self.fired_high_water);
         let Some(start) = self.batch_start_time else {
             // Defensive: batch_start_time should always be Some when
             // decide is called (set on first on_arrival).
             return Decision::Fire;
         };
+        if prefill_cohort && current_forward_requests < self.max_forward_requests {
+            let grace = prefill_cohort_grace();
+            let elapsed = start.elapsed();
+            if elapsed < grace {
+                return Decision::Wait(grace - elapsed);
+            }
+        }
+        if prefill_cohort {
+            target = target.max(PREFILL_COHORT_TARGET.min(self.max_forward_requests));
+        }
         let dense_resident_cohort =
             target >= self.max_forward_requests && resident >= target && target > 0;
-        let wait_bound = if dense_resident_cohort {
-            self.last_latency * 2.0
+        if target > 0 && current_forward_requests >= target {
+            return Decision::Fire;
+        }
+        // (4) Cold prefill burst. No latency measurement exists yet, so give
+        // prompt cohorts a short fixed grace instead of firing the first few
+        // arrivals as tiny prefill batches. Decode-only cold starts still fire
+        // immediately to preserve low-RPS behavior.
+        if self.last_latency == 0.0 {
+            return Decision::Fire;
+        }
+        // (5) Safety bound — never wait longer than one previous
+        //     batch's compute time.
+        let wait_bound = if prefill_cohort {
+            self.last_latency.max(prefill_cohort_grace().as_secs_f64())
+        } else if dense_resident_cohort {
+            self.last_latency * dense_cohort_wait_multiplier()
         } else {
             self.last_latency
         };
@@ -362,7 +393,7 @@ impl SchedulingPolicy for EagerPolicy {
         self.cohort_high_water = 0;
     }
 
-    fn decide(&mut self, current_forward_requests: usize) -> Decision {
+    fn decide(&mut self, current_forward_requests: usize, _prefill_cohort: bool) -> Decision {
         if current_forward_requests >= self.max_forward_requests {
             return Decision::Fire;
         }
@@ -418,7 +449,7 @@ impl SchedulingPolicy for GreedyPolicy {
     fn on_complete(&mut self, _latency: Duration) {}
     fn on_fired(&mut self, _fired_size: usize) {}
 
-    fn decide(&mut self, _current_forward_requests: usize) -> Decision {
+    fn decide(&mut self, _current_forward_requests: usize, _prefill_cohort: bool) -> Decision {
         // The scheduler only calls `decide` when the batch is
         // non-empty, and the BatchAccumulator already enforces
         // `max_forward_requests` upstream of the policy. So: just fire,
@@ -438,7 +469,14 @@ mod tests {
         let mut policy = AdaptivePolicy::new(512, 0);
         // No batches completed yet — last_latency = 0; fire to make
         // progress.
-        assert!(matches!(policy.decide(1), Decision::Fire));
+        assert!(matches!(policy.decide(1, false), Decision::Fire));
+    }
+
+    #[test]
+    fn adaptive_cold_prefill_waits_briefly() {
+        let mut policy = AdaptivePolicy::new(512, 0);
+        policy.on_arrival();
+        assert!(matches!(policy.decide(1, true), Decision::Wait(_)));
     }
 
     #[test]
@@ -448,7 +486,7 @@ mod tests {
         policy.on_complete(Duration::from_millis(20));
         policy.on_fired(0);
         // The structural cap fires unconditionally.
-        assert!(matches!(policy.decide(512), Decision::Fire));
+        assert!(matches!(policy.decide(512, false), Decision::Fire));
     }
 
     #[test]
@@ -459,14 +497,14 @@ mod tests {
         policy.on_fired(0);
         // Even at large B (cohort cap would normally fire), we wait
         // because the GPU is occupied.
-        assert!(matches!(policy.decide(100), Decision::Wait(_)));
+        assert!(matches!(policy.decide(100, false), Decision::Wait(_)));
     }
 
     #[test]
     fn adaptive_waits_while_gpu_busy_even_before_latency_calibration() {
         let mut policy = AdaptivePolicy::new(512, 0);
         policy.on_fired(1);
-        assert!(matches!(policy.decide(1), Decision::Wait(_)));
+        assert!(matches!(policy.decide(1, false), Decision::Wait(_)));
     }
 
     #[test]
@@ -475,10 +513,10 @@ mod tests {
         policy.on_complete(Duration::from_millis(500));
         policy.on_complete(Duration::from_millis(20));
         policy.on_fired(0);
-        assert!(matches!(policy.decide(1), Decision::Wait(_)));
+        assert!(matches!(policy.decide(1, false), Decision::Wait(_)));
         policy.on_complete(Duration::from_millis(20));
         // GPU free, no batch_start_time → Fire (defensive).
-        assert!(matches!(policy.decide(1), Decision::Fire));
+        assert!(matches!(policy.decide(1, false), Decision::Fire));
     }
 
     #[test]
@@ -506,13 +544,13 @@ mod tests {
     #[test]
     fn eager_cold_start_fires() {
         let mut policy = EagerPolicy::new(512, 0);
-        assert!(matches!(policy.decide(1), Decision::Fire));
+        assert!(matches!(policy.decide(1, false), Decision::Fire));
     }
 
     #[test]
     fn eager_fires_at_max_forward_requests() {
         let mut policy = EagerPolicy::new(512, 0);
-        assert!(matches!(policy.decide(512), Decision::Fire));
+        assert!(matches!(policy.decide(512, false), Decision::Fire));
     }
 
     #[test]
@@ -527,8 +565,8 @@ mod tests {
     #[test]
     fn greedy_always_fires() {
         let mut policy = GreedyPolicy::new();
-        assert!(matches!(policy.decide(1), Decision::Fire));
-        assert!(matches!(policy.decide(100), Decision::Fire));
-        assert!(matches!(policy.decide(512), Decision::Fire));
+        assert!(matches!(policy.decide(1, false), Decision::Fire));
+        assert!(matches!(policy.decide(100, false), Decision::Fire));
+        assert!(matches!(policy.decide(512, false), Decision::Fire));
     }
 }

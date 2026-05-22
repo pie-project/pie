@@ -42,8 +42,8 @@ PrefillPlanCachePtr make_prefill_plan();
 // Compact graph-layout class for the most recent decode plan. CUDA graph
 // replay records the host-side dispatch branch, so split-KV and non-split
 // plans need distinct graph keys.
-std::uint8_t decode_plan_graph_layout(const DecodePlanCache& cache);
-std::uint8_t prefill_plan_graph_layout(const PrefillPlanCache& cache);
+std::uint32_t decode_plan_graph_layout(const DecodePlanCache& cache);
+std::uint32_t prefill_plan_graph_layout(const PrefillPlanCache& cache);
 
 // Compute decode plan once per fire. Stores results in `cache` and the
 // workspace's int/float buffers (so per-layer dispatch can read them).
@@ -57,7 +57,9 @@ void plan_attention_flashinfer_decode_bf16(
     int page_size,
     AttentionWorkspace& workspace,
     cudaStream_t stream,
-    bool enable_cuda_graph = true);
+    bool enable_cuda_graph = true,
+    bool full_attention_variant = false,
+    bool hnd_layout = false);
 
 inline void plan_attention_flashinfer_decode(
     DecodePlanCache& cache,
@@ -69,10 +71,13 @@ inline void plan_attention_flashinfer_decode(
     int page_size,
     AttentionWorkspace& workspace,
     cudaStream_t stream,
-    bool enable_cuda_graph = true) {
+    bool enable_cuda_graph = true,
+    bool full_attention_variant = false,
+    bool hnd_layout = false) {
     plan_attention_flashinfer_decode_bf16(
         cache, kv_page_indptr_h, num_requests, num_q_heads, num_kv_heads,
-        head_dim, page_size, workspace, stream, enable_cuda_graph);
+        head_dim, page_size, workspace, stream, enable_cuda_graph,
+        full_attention_variant, hnd_layout);
 }
 
 void plan_attention_flashinfer_prefill_bf16(
@@ -90,7 +95,9 @@ void plan_attention_flashinfer_prefill_bf16(
     cudaStream_t stream,
     bool enable_cuda_graph = true,
     int window_left = -1,
-    bool full_attention_variant = false);
+    bool full_attention_variant = false,
+    bool hnd_layout = false,
+    bool causal_mask = true);
 
 // Per-layer dispatch reusing the cached plan. `q`/`k_pages`/`v_pages`/`o`
 // vary per layer; everything else comes from the cache + workspace.
@@ -189,7 +196,8 @@ void launch_attention_flashinfer_prefill_bf16(
     float logits_soft_cap = 0.f,
     float sm_scale = -1.f,
     // See decode entry point. [total_tokens, num_q_heads] fp32, nullptr = skip.
-    float* lse_out = nullptr);
+    float* lse_out = nullptr,
+    bool hnd_layout = false);
 
 void launch_attention_flashinfer_prefill(
     const void* q,
@@ -239,7 +247,8 @@ void launch_attention_flashinfer_prefill_custom_bf16(
     float logits_soft_cap = 0.f,
     float sm_scale = -1.f,
     // See decode entry point. [total_tokens, num_q_heads] fp32, nullptr = skip.
-    float* lse_out = nullptr);
+    float* lse_out = nullptr,
+    bool hnd_layout = false);
 
 void launch_attention_flashinfer_prefill_custom(
     const void* q,

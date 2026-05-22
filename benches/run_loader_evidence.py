@@ -297,7 +297,7 @@ def main() -> None:
     parser.add_argument("--timeout-s", type=float, default=3600.0)
     parser.add_argument("--requests", type=int, default=8)
     parser.add_argument("--num-requests", type=int, default=64)
-    parser.add_argument("--concurrency", type=int, default=16)
+    parser.add_argument("--concurrency", type=int, default=0)
     parser.add_argument("--max-tokens", type=int, default=128)
     parser.add_argument("--warmup", type=int, default=1)
     parser.add_argument("--tp-size", type=int, default=1)

@@ -247,7 +247,10 @@ void qwen3_forward_paged(
             d,
             cache.page_size(),
             attn_ws,
-            stream);
+            stream,
+            /*enable_cuda_graph=*/true,
+            /*full_attention_variant=*/true,
+            cache.hnd_layout());
     }
 
     for (int L = 0; L < cfg.num_hidden_layers; ++L) {

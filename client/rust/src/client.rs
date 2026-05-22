@@ -207,6 +207,8 @@ impl Client {
             | ClientMessage::Query { corr_id, .. }
             | ClientMessage::AddProgram { corr_id, .. }
             | ClientMessage::LaunchProcess { corr_id, .. }
+            | ClientMessage::LaunchProcesses { corr_id, .. }
+            | ClientMessage::RunProcesses { corr_id, .. }
             | ClientMessage::LaunchDaemon { corr_id, .. }
             | ClientMessage::ListProcesses { corr_id }
             | ClientMessage::RegisterMcpServer { corr_id, .. }

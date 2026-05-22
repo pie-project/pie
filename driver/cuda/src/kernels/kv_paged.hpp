@@ -17,7 +17,7 @@
 namespace pie_cuda_driver::kernels {
 
 void launch_write_kv_to_pages_bf16(
-    void* k_pages,                                 // [num_pages, page_size, h_kv, d]
+    void* k_pages,                                 // NHD: [pages, page_size, h_kv, d]; HND: [pages, h_kv, page_size, d]
     void* v_pages,
     const void* k_curr,                            // [total_tokens, h_kv, d]
     const void* v_curr,
@@ -30,6 +30,7 @@ void launch_write_kv_to_pages_bf16(
     int page_size,
     int num_kv_heads,
     int head_dim,
+    bool hnd_layout,
     cudaStream_t stream);
 
 void launch_write_kv_to_pages(

@@ -1,9 +1,38 @@
 #include "kv_cache.hpp"
 
+#include <cstdlib>
 #include <stdexcept>
+#include <string>
 #include <utility>
 
 namespace pie_cuda_driver {
+
+namespace {
+
+bool env_requests_hnd_kv_layout() {
+    const char* value = std::getenv("PIE_CUDA_KV_LAYOUT");
+    if (value == nullptr || value[0] == '\0') {
+        value = std::getenv("PIE_CUDA_KV_CACHE_LAYOUT");
+    }
+    if (value == nullptr) return false;
+    const std::string layout(value);
+    return layout == "HND" || layout == "hnd";
+}
+
+std::vector<std::int64_t> kv_storage_shape(
+    int num_pages,
+    int page_size,
+    int num_kv_heads,
+    int storage_head_dim,
+    bool hnd_layout)
+{
+    if (hnd_layout) {
+        return {num_pages, num_kv_heads, page_size, storage_head_dim};
+    }
+    return {num_pages, page_size, num_kv_heads, storage_head_dim};
+}
+
+}  // namespace
 
 KvCache KvCache::allocate(int num_layers,
                           int num_pages,
@@ -32,6 +61,7 @@ KvCache KvCache::allocate(int num_layers,
     c.num_kv_heads_ = num_kv_heads;
     c.head_dim_ = head_dim;
     c.format_ = std::move(format);
+    c.hnd_layout_ = c.format_.is_native_bf16() && env_requests_hnd_kv_layout();
 
     c.k_layers_.reserve(num_layers);
     c.v_layers_.reserve(num_layers);
@@ -42,9 +72,13 @@ KvCache KvCache::allocate(int num_layers,
     for (int i = 0; i < num_layers; ++i) {
         const auto storage_hd = c.format_.storage_head_dim(head_dim);
         c.k_layers_.push_back(DeviceTensor::allocate(
-            c.format_.storage_dtype, {num_pages, page_size, num_kv_heads, storage_hd}));
+            c.format_.storage_dtype,
+            kv_storage_shape(num_pages, page_size, num_kv_heads,
+                             storage_hd, c.hnd_layout_)));
         c.v_layers_.push_back(DeviceTensor::allocate(
-            c.format_.storage_dtype, {num_pages, page_size, num_kv_heads, storage_hd}));
+            c.format_.storage_dtype,
+            kv_storage_shape(num_pages, page_size, num_kv_heads,
+                             storage_hd, c.hnd_layout_)));
         if (c.format_.scale_layout == KvCacheScaleLayout::PerTokenHead) {
             c.k_scale_layers_.push_back(DeviceTensor::allocate(
                 DType::FP32, {num_pages, page_size, num_kv_heads}));
@@ -120,6 +154,7 @@ KvCache KvCache::allocate_per_layer(int num_layers,
     c.num_kv_heads_ = num_kv_heads;
     c.head_dim_ = per_layer_head_dim.empty() ? 0 : per_layer_head_dim[0];
     c.format_ = std::move(format);
+    c.hnd_layout_ = c.format_.is_native_bf16() && env_requests_hnd_kv_layout();
     c.per_layer_head_dim_ = per_layer_head_dim;
     c.kv_source_layer_ = kv_source_layer;
     c.per_layer_num_kv_heads_ = per_layer_num_kv_heads;
@@ -146,9 +181,13 @@ KvCache KvCache::allocate_per_layer(int num_layers,
                                 : per_layer_num_kv_heads[i];
             const auto storage_hd = c.format_.storage_head_dim(hd);
             c.k_layers_.push_back(DeviceTensor::allocate(
-                c.format_.storage_dtype, {num_pages, page_size, kvh, storage_hd}));
+                c.format_.storage_dtype,
+                kv_storage_shape(num_pages, page_size, kvh,
+                                 storage_hd, c.hnd_layout_)));
             c.v_layers_.push_back(DeviceTensor::allocate(
-                c.format_.storage_dtype, {num_pages, page_size, kvh, storage_hd}));
+                c.format_.storage_dtype,
+                kv_storage_shape(num_pages, page_size, kvh,
+                                 storage_hd, c.hnd_layout_)));
             if (c.format_.scale_layout == KvCacheScaleLayout::PerTokenHead) {
                 c.k_scale_layers_.push_back(DeviceTensor::allocate(
                     DType::FP32, {num_pages, page_size, kvh}));
@@ -253,6 +292,7 @@ KvCacheLayerView KvCache::layer_view(int layer) {
                                                  : k_bf16_layers_[src].data(),
         .v_bf16_pages = format_.is_native_bf16() ? v_layers_[src].data()
                                                  : v_bf16_layers_[src].data(),
+        .hnd_layout = hnd_layout_,
     };
 }
 

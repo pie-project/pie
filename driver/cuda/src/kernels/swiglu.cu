@@ -146,10 +146,44 @@ __global__ void chunked_swiglu_bf16_kernel(
     const int n = blockIdx.x;
     const int i = blockIdx.y * blockDim.x + threadIdx.x;
     if (n >= N || i >= I) return;
-    const float g = __bfloat162float(packed[(long long)n * 2 * I + i]);
-    const float u = __bfloat162float(packed[(long long)n * 2 * I + I + i]);
+
+    const long long row = static_cast<long long>(n) * I;
+    const long long packed_row = row * 2;
+    const float g = __bfloat162float(packed[packed_row + i]);
+    const float u = __bfloat162float(packed[packed_row + I + i]);
     const float silu = g / (1.f + __expf(-g));
-    y[(long long)n * I + i] = __float2bfloat16(silu * u);
+    y[row + i] = __float2bfloat16(silu * u);
+}
+
+__global__ void chunked_swiglu_bf16_vec2_kernel(
+    const __nv_bfloat16* __restrict__ packed,
+    __nv_bfloat16*       __restrict__ y,
+    int N, int I)
+{
+    const int n = blockIdx.x;
+    const int i = (blockIdx.y * blockDim.x + threadIdx.x) * 2;
+    if (n >= N || i >= I) return;
+
+    const long long row = static_cast<long long>(n) * I;
+    const long long packed_row = row * 2;
+    if (((I & 1) == 0) && i + 1 < I) {
+        const auto gate2 = *reinterpret_cast<const __nv_bfloat162*>(
+            packed + packed_row + i);
+        const auto up2 = *reinterpret_cast<const __nv_bfloat162*>(
+            packed + packed_row + I + i);
+        const float2 g = __bfloat1622float2(gate2);
+        const float2 u = __bfloat1622float2(up2);
+        const float y0 = (g.x / (1.f + __expf(-g.x))) * u.x;
+        const float y1 = (g.y / (1.f + __expf(-g.y))) * u.y;
+        *reinterpret_cast<__nv_bfloat162*>(y + row + i) =
+            __floats2bfloat162_rn(y0, y1);
+        return;
+    }
+
+    const float g = __bfloat162float(packed[packed_row + i]);
+    const float u = __bfloat162float(packed[packed_row + I + i]);
+    const float silu = g / (1.f + __expf(-g));
+    y[row + i] = __float2bfloat16(silu * u);
 }
 
 }  // namespace
@@ -159,8 +193,16 @@ void launch_chunked_swiglu_bf16(
 {
     if (N <= 0 || I <= 0) return;
     constexpr int BLOCK = 128;
-    dim3 grid(N, (I + BLOCK - 1) / BLOCK);
-    chunked_swiglu_bf16_kernel<<<grid, BLOCK, 0, stream>>>(
+    if (I > 10000) {
+        dim3 grid(N, (I + BLOCK - 1) / BLOCK);
+        chunked_swiglu_bf16_kernel<<<grid, BLOCK, 0, stream>>>(
+            static_cast<const __nv_bfloat16*>(packed),
+            static_cast<__nv_bfloat16*>(y),
+            N, I);
+        return;
+    }
+    dim3 grid(N, ((I + 1) / 2 + BLOCK - 1) / BLOCK);
+    chunked_swiglu_bf16_vec2_kernel<<<grid, BLOCK, 0, stream>>>(
         static_cast<const __nv_bfloat16*>(packed),
         static_cast<__nv_bfloat16*>(y),
         N, I);

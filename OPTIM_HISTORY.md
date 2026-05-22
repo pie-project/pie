@@ -241,6 +241,398 @@ part of the large-GPU validation set because it exposes planner mistakes that
 - 16k prefill was rejected on Hopper because it regressed or stayed flat on
   H100/H200 8B rows. It remains Blackwell-only.
 
+## TP1 Unlimited vLLM Chase Log
+
+This section records the current TP=1, unlimited-concurrency comparison loop.
+Do not retry an item here unless the implementation or benchmark harness has
+changed materially. Pie runs use `--concurrency 0 --ipc-profile latency`.
+Every new candidate should record the source/config delta, benchmark artifact,
+throughput, keep/reject decision, and the reason. Failed rows are valuable data;
+do not repeat them by changing only the output file name.
+
+### Baselines
+
+- vLLM Qwen3-0.6B 512x128: 28,141 output tok/s
+  (`/root/e2e_bench/experiments/pie_dense_spec/vllm_06b_tp1_unlimited_512_flashinfer_current_rerun.json`).
+- vLLM Qwen3-1.7B 512x128: 17,851 output tok/s
+  (`/root/e2e_bench/experiments/pie_dense_spec/vllm_17b_tp1_unlimited_512_flashinfer_current_rerun.json`).
+- vLLM Qwen3-4B 512x128: 8,075 output tok/s
+  (`/root/e2e_bench/experiments/pie_dense_spec/vllm_4b_tp1_unlimited_512_flashinfer_rerun.json`).
+
+### Current Best Rows
+
+| Model | Best Pie row | vLLM row | Decision |
+| --- | ---: | ---: | --- |
+| Qwen3-0.6B | 28,159 observed with shared page spans; 27,865 rerun | 28,141 | Not reliable/large enough |
+| Qwen3-1.7B | 17,186 | 17,851 | Improved, still below |
+| Qwen3-4B | 8,148 observed best; 8,145 shared-page-span validation | 8,075 | Kept, small win |
+
+- 0.6B observed best:
+  `/root/e2e_bench/experiments/pie_dense_spec/pie_06b_shared_pagespan_512x128.json`.
+- 0.6B shared-page-span rerun:
+  `/root/e2e_bench/experiments/pie_dense_spec/pie_06b_shared_pagespan_rerun_512x128.json`.
+- 1.7B current best:
+  `/root/e2e_bench/experiments/pie_dense_spec/pie_17b_shared_pagespan_512x128.json`.
+- 4B current best:
+  `/root/e2e_bench/experiments/pie_dense_spec/pie_4b_hnd_depth1_512x128.json`.
+- 4B shared-page-span validation:
+  `/root/e2e_bench/experiments/pie_dense_spec/pie_4b_shared_pagespan_512x128.json`.
+
+### Successful or Kept
+
+- 4B default TP1 already edges vLLM: Pie 8,101 output tok/s vs vLLM 8,075.
+- 0.6B prefers HND KV layout with speculation depth 3. Best current-code rerun
+  reached 28,056 output tok/s, but this is not yet a reliable win over vLLM.
+- 1.7B default NHD/page16 with speculation depth 3 reached about 16,849 output
+  tok/s after host and mask fixes, but was superseded by the 6144-token
+  workspace/depth-1 HND row at 17,098 output tok/s.
+- 1.7B benefits from a smaller CUDA workspace and shallower pass speculation:
+  `PIE_CUDA_PREFILL_TOKENS=6144` with speculation depth 1 measured 17,040
+  output tok/s, versus 16,644 for the 20,480-token/depth-3 current row. The
+  same 6144-token workspace regressed 0.6B HND/depth3 to 26,431 output tok/s,
+  so this is model-specific, not a global default.
+- Combining the 1.7B 6144-token workspace/depth-1 shape with HND KV layout
+  improved the best 1.7B row to 17,098 output tok/s. It is still below the
+  vLLM baseline at 17,851, but it supersedes the prior NHD 6144/depth-1 row
+  for this model.
+- Scheduler/speculator physical-page lists now use shared page spans for cold
+  and pre-staged decode submits instead of cloning the active page-prefix
+  vector at every chain stage. This reduced token-response fanout and is kept:
+  0.6B measured 28,159 output tok/s once and 27,865 on rerun; 1.7B improved
+  the kept row from 17,098 to 17,186 output tok/s; 4B stayed above vLLM at
+  8,145 output tok/s. The 0.6B result is not stable enough to count as a
+  large-margin vLLM win.
+- Cached prefill planning now reuses host `qo_indptr` / `kv_indptr` buffers.
+- Cached prefill dispatch now keys and dispatches the causal-mask mode
+  correctly. Real prefill uses causal masking; decode-as-prefill remains
+  non-causal to match the FlashInfer decode wrapper semantics.
+- Scheduler batch construction now does one pre-scan for exact vector reserves
+  and decode-mask elision. 0.6B improved from about 27,549 to 27,657 output
+  tok/s in the measured run.
+- Token-only direct fanout bypasses `PendingRequest::send_result` for direct
+  completions. 0.6B improved to about 27,840 output tok/s in the measured run.
+- XQA ratio-2 decode support was added, but it is only useful when the model
+  also satisfies the compiled page-size/head-dim shape.
+- SDK generation now refreshes market bids at page cadence instead of on every
+  token. On the current 0.6B HND/depth3 row this improved a restored rerun from
+  27,360 to 27,611 output tok/s and reduced e2e response fanout from about
+  1.85 ms to about 1.49 ms per scheduler batch.
+- 4B remains ahead after the SDK page-cadence change. Current verification
+  measured 8,142 output tok/s versus the vLLM baseline at 8,075 output tok/s.
+- 4B with HND KV layout and depth 1 slightly improves the kept TP1 row to
+  8,148 output tok/s, versus the vLLM baseline at 8,075. This is a small
+  model-specific improvement, not a large-margin win.
+- A clean 0.6B rerun after reverting the CUDA prefill-template experiment
+  measured 27,513 output tok/s. This confirms the reverted build is back in
+  the prior current-code range, but still below the vLLM 28,141 baseline.
+
+### Failed or Reverted
+
+- Static non-split FlashInfer decode plan bypass regressed 0.6B and is now
+  default-off behind `PIE_CUDA_STATIC_DECODE_PLAN`.
+- FlashInfer prefill-decode for the 0.6B short-output row regressed; dedicated
+  decode remains the default there.
+- 1.7B page32 to enable XQA ratio-2 decode regressed from about 16,849 to
+  16,226 output tok/s. Keep page16/default for 1.7B.
+- 1.7B HND KV layout at the default 20,480-token workspace/depth-3 shape
+  regressed versus default NHD/page16. The later 6144-token/depth-1 HND row is
+  a separate, kept model-specific setting.
+- 1.7B decode full-attention off regressed.
+- 1.7B speculation depth 4 regressed versus depth 3.
+- 0.6B speculation depth 2 and depth 4 both regressed versus depth 3.
+- 0.6B cohort waits of 32 ms and 128 ms both regressed versus 64 ms.
+- Replacing the staged-chain map with `DashMap` regressed and was reverted.
+- Removing the per-token registry lock in the chain extender regressed and was
+  reverted.
+- Pass-level staged-hit aggregation regressed as a default path. 0.6B measured
+  27,814 output tok/s and 1.7B measured 16,728 output tok/s; both were below
+  the prior best rows. The code remains opt-in behind
+  `PIE_SPEC_HIT_AGG_MAX_EXTRA` for future workloads where successors are ready
+  often enough to amortize the extra bookkeeping.
+- API-side staged-hit `try_recv` before awaiting the staged oneshot did not
+  beat the best rows: 0.6B measured 27,215 output tok/s and 1.7B measured
+  16,711 output tok/s. It was reverted to the straight await path.
+- Page16 XQA for GQA2 turned `xqa_decode=on` for 1.7B/default page16 but
+  regressed to 15,709 output tok/s. The p16 specialization remains opt-in
+  behind `PIE_CUDA_XQA_GQA2_P16`; keep it off for the TP1 unlimited row.
+- Awaited staged-hit aggregation (`PIE_SPEC_HIT_AGG_WAIT_EXTRA=1`) broke batch
+  accounting during 1.7B warmup (`expected 190, got 0`) and was removed rather
+  than left as a broken opt-in path.
+- Forced full-attention prefill-decode on 1.7B regressed slightly to 16,684
+  output tok/s, so the default dedicated decode path remains better for the
+  512x128 row.
+- Decode-as-prefill with FlashInfer's internal graph plan disabled did not make
+  the prefill-decode path viable on the TP1 unlimited 1.7B row. With
+  `PIE_CUDA_PREFILL_DECODE_PLAN=1` and min pages forced to zero, throughput was
+  16,591 output tok/s, below the dedicated-decode baseline.
+- Token-only response view trimming did not improve the tight 0.6B row. The
+  HND/depth3 run measured 27,595 output tok/s with worse e2e fanout/queue than
+  the best kept rows, so the response view was restored.
+- Zero-price market tick fast path regressed the 0.6B HND/depth3 TP1 row to
+  27,006 output tok/s, despite skipping rent/dividend work when clearing price
+  is zero. It was reverted.
+- 0.6B with `PIE_CUDA_DECODE_FULL_ATTENTION=0` regressed to 26,741 output tok/s.
+  Keep the full-attention decode variant enabled for the HND/depth3 row.
+- 0.6B `--batch-policy eager` and `--batch-policy greedy` regressed to 26,567
+  and 26,663 output tok/s respectively. Keep adaptive scheduling for unlimited
+  throughput.
+- Nsight Systems profiling works on this host, but `nsys profile` automatic
+  import may leave only `.qdstrm`. Manual import with
+  `/usr/lib/nsight-systems/host-linux-x64/QdstrmImporter`, followed by
+  `nsys export -t sqlite`, produced usable SQLite traces.
+- 0.6B Nsight/e2e breakdown showed the measured batch path is dominated by
+  driver/GPU wait, not scheduler construction: in
+  `/root/e2e_bench/experiments/pie_dense_spec/pie_06b_nsys_runtime_512.json`,
+  measured driver forward averaged about 14.84 ms/batch, batch build about
+  0.27 ms/batch, and response fanout about 1.34 ms/batch. CUDA API launch/copy
+  overhead in the measured window was small; `cudaStreamSynchronize` dominated
+  host-visible CUDA time.
+- Opt-in response-fanout sub-timers were added behind
+  `PIE_SCHED_FANOUT_BREAKDOWN=1`. The profiling run
+  `/root/e2e_bench/experiments/pie_dense_spec/pie_06b_fanout_breakdown_512x128.json`
+  measured 27,687 output tok/s with instrumentation overhead. It attributed
+  only about 0.15 ms/batch to direct `oneshot` sends and near-zero time to token
+  output construction/classification; most of the fanout bucket is destructor /
+  deallocation work outside those substeps.
+- `PIE_FLASHINFER_FORCE_SPLIT_KV_SMALL=1` regressed the 0.6B HND/depth3 TP1
+  unlimited row to 27,609 output tok/s. Keep Pie's small-batch non-split
+  override for this workload.
+- Partitioning the single-GPU greedy argmax did not close the 0.6B gap.
+  `PIE_ARGMAX_PARTS=4` regressed to 27,471 output tok/s, and
+  `PIE_ARGMAX_PARTS=2` reached 27,930 output tok/s but still trailed the best
+  default HND/depth3 row. Keep the default one-block argmax for this shape.
+- Forcing alternate cuBLASLt BF16 heuristic indices for the 0.6B HND/depth3
+  row regressed. `PIE_CUBLASLT_BF16_ALGO_INDEX=3` reached 26,519 output tok/s,
+  index 1 reached 27,253 output tok/s, and index 0 reached 25,010 output tok/s.
+  Keep the current shape-aware default, which selects index 2 for the
+  H=1024 wide `lm_head` shape.
+- Scheduler dense-token fanout detection plus API-side staged-hit clone deferral
+  regressed the 0.6B HND/depth3 row to 27,641 output tok/s. The e2e response
+  fanout counter rose to about 1.87 ms per scheduler batch, so the dense indptr
+  scan was removed.
+- Keeping only the API-side sampler/lineage clone deferral still regressed the
+  same row to 27,151 output tok/s, with e2e response fanout rising to about
+  1.97 ms per scheduler batch. The API path was restored to the prior clone
+  behavior.
+- SDK-side buffer reuse plus stack single-token position slices regressed the
+  0.6B HND/depth3 row to 27,115 output tok/s and raised e2e fanout to about
+  2.07 ms. It was reverted.
+- Refreshing generation bids only once per 512-token reservation window
+  regressed the 0.6B HND/depth3 row to 26,664 output tok/s. Keep page-cadence
+  bid refreshes; the less frequent update appears to hurt scheduling/chain
+  timing despite fewer WIT calls.
+- Rechecking current-code 1.7B with speculation depth 1 did not reproduce the
+  older faster rows. It measured 16,615 output tok/s, below the current depth-3
+  comparison row, so depth 1 is not a current fix for the 1.7B vLLM gap.
+- Caching the lowered SDK WIT sampler inside `Generator` did not improve the
+  tight 0.6B row. It measured 27,573 output tok/s versus 27,611 for the
+  page-cadence baseline, with e2e fanout rising from about 1.49 ms to about
+  1.56 ms per scheduler batch, so the change was reverted.
+- Retrying opt-in staged-hit aggregation after the SDK page-cadence change was
+  worse than both the old hit-aggregation row and the current baseline.
+  `PIE_SPEC_HIT_AGG_MAX_EXTRA=1` measured 26,279 output tok/s on 0.6B, with
+  e2e queue/fanout both rising, so hit aggregation remains off.
+- Retrying the old `PIE_ARGMAX_PARTS=2` candidate together with SDK
+  page-cadence bids also regressed the 0.6B row, measuring 27,502 output
+  tok/s. Keep the default single-block argmax for this shape.
+- Deferring direct request drops to Tokio's blocking pool reduced the reported
+  scheduler fanout bucket from about 1.7 ms/batch to about 0.55 ms/batch, but
+  regressed real throughput to 27,479 output tok/s
+  (`/root/e2e_bench/experiments/pie_dense_spec/pie_06b_defer_direct_drop_512x128.json`).
+  The background deallocation work appears to contend with the benchmark; the
+  opt-in code was removed.
+- Replacing the cold-submit `ForwardRequest` clone with a compact speculator
+  chain-state seed regressed 0.6B to 27,243 output tok/s
+  (`/root/e2e_bench/experiments/pie_dense_spec/pie_06b_chainstate_clone_elision_512x128.json`).
+  The clone removal disturbed chain timing more than it saved host work, so it
+  was reverted.
+- A vectorized bf16x2 greedy argmax scan regressed 0.6B to 27,302 output tok/s
+  (`/root/e2e_bench/experiments/pie_dense_spec/pie_06b_argmax_bf162_512x128.json`).
+  Keep the scalar argmax kernel; the bottleneck is not simply scalar bf16 load
+  count.
+- A compact internal staged-decode request representation, avoiding the full
+  one-token `ForwardRequest` wire shape for speculator stages, regressed 0.6B
+  to 27,411 output tok/s
+  (`/root/e2e_bench/experiments/pie_dense_spec/pie_06b_compact_staged_decode_512x128.json`).
+  It was reverted; reducing Vec churn alone hurt staging cadence enough to lose
+  throughput.
+- Intermediate dense-cohort waits around the 64x baseline did not help after
+  SDK page-cadence bids. `PIE_DENSE_COHORT_WAIT_MULT=96` measured 27,586
+  output tok/s, and `=48` measured 27,477 output tok/s on 0.6B. Keep 64 for
+  the TP1 unlimited row.
+- Changing FlashInfer prefill dispatch to match vLLM's tensor-core decode
+  `USE_FP16_QK_REDUCTION=false` was not a cross-model win. The all-false
+  build improved the normal 0.6B HND/dedicated-decode row to 27,955 output
+  tok/s and made forced prefill-decode less bad at 26,667 output tok/s, but
+  it regressed 1.7B NHD to 16,530 output tok/s. A layout-conditional build
+  then regressed 0.6B badly, measuring 26,369 and 25,990 output tok/s on two
+  runs with much higher e2e fanout/queue. The prefill template flag was
+  restored to the original single `true` instantiation.
+- `--batch-policy eager` on the improved 1.7B 6144/depth1 shape regressed to
+  16,745 output tok/s and fragmented the batch histogram. Keep adaptive
+  scheduling for the TP1 unlimited rows.
+- Exact-match caching for persistent control-buffer uploads regressed the
+  0.6B HND/depth3 TP1 unlimited row and was reverted. The candidate skipped
+  H2D copies for unchanged `qo_indptr`, `kv_page_indices`, and
+  `kv_page_indptr`, but measured only 26,755 output tok/s. E2E batch build
+  rose to about 398 us and response fanout to about 2.46 ms, so the CPU-side
+  compare/cache bookkeeping outweighed the smaller driver-forward time.
+- Reusing the prior FlashInfer non-split decode plan across fires was also
+  rejected. The candidate was narrowly gated to the TP1 shape class where Pie
+  already forces split-KV off, but the default-on run measured only 27,462
+  output tok/s on 0.6B. A same-build kill-switch run
+  (`PIE_CUDA_REUSE_NONSPLIT_DECODE_PLAN=0`) measured 27,807 output tok/s, so
+  skipping the per-fire plan refresh is not safe/beneficial even when the
+  schedule appears shape-only. The patch was reverted.
+- Refreshing SDK generation bids every two KV pages instead of every page
+  regressed the 0.6B HND/depth3 TP1 unlimited row to 27,165 output tok/s.
+  This confirms the old 512-token bid-window failure was not just too large;
+  the scheduler depends on page-cadence bid updates for this benchmark. The
+  interval was restored to one page.
+- 1.7B workspace/depth follow-up did not beat the 6144-token/depth-1 row:
+  `PIE_CUDA_PREFILL_TOKENS=4096` with depth 1 measured 16,869 output tok/s,
+  `8192` with depth 1 measured 16,628 output tok/s, and `6144` with
+  speculation depth 0 fell to 15,251 output tok/s. Keep the current
+  6144/depth-1 setting for this model-specific row.
+- Forcing the vLLM-like NHD prefill-decode path on 0.6B did not help.
+  `PIE_CUDA_PREFILL_DECODE_PLAN=1` with min KV pages forced to zero and
+  default NHD layout measured 26,368 output tok/s, below the HND dedicated
+  decode row. The dedicated FlashInfer decode path remains better for 0.6B.
+- `PIE_ARGMAX_PARTS=8` regressed the 0.6B HND/depth3 row to 27,227 output
+  tok/s. The extra partition/select pass is too expensive; the previous
+  parts-2/parts-4 failures were not just the wrong partition count.
+- Increasing the single-GPU greedy argmax block size from 256 to 512 threads
+  regressed 0.6B to 26,547 output tok/s. Keep the 256-thread one-block
+  argmax kernel.
+- Vectorizing the 256-thread argmax kernel to load `bf16x2` pairs also
+  regressed 0.6B, measuring 25,761 output tok/s. The scalar bf16 load loop
+  was restored.
+- Opting 0.6B into the page16 XQA GQA2 decode path with default NHD layout
+  regressed badly to 24,323 output tok/s. This matches the earlier 1.7B
+  page16-XQA failure; keep `PIE_CUDA_XQA_GQA2_P16` off for TP1 unlimited.
+- 0.6B HND/depth3 workspace tuning around the default 20,480-token arena did
+  not help. `PIE_CUDA_PREFILL_TOKENS=24576` measured 26,783 output tok/s and
+  `=16384` measured 26,473 output tok/s. Keep 20,480 for the 0.6B row.
+- Sparse per-request indptrs for pre-staged decode requests were rejected and
+  reverted. The hypothesis was that scheduler-owned single-token requests do
+  not need populated `kv_page_indptr`, `qo_indptr`, mask/logit/sampling/sampler
+  indptrs, or `spec_indptr` because the batch builder reconstructs them. In
+  practice the 0.6B shared-page-span row regressed to 26,473 output tok/s, so
+  staged requests keep canonical single-request indptrs.
+- Retesting 0.6B speculation depth 4 after the shared-page-span change still
+  regressed badly, measuring 26,329 output tok/s. Depth 3 remains the 0.6B
+  setting.
+- Retesting the 0.6B dense cohort wait at `PIE_DENSE_COHORT_WAIT_MULT=32` after
+  the shared-page-span change also regressed, measuring 26,207 output tok/s.
+  Keep wait multiplier 64 for this TP1 unlimited row.
+- A clean rebuild after reverting the hot-path clone-elision experiments ruled
+  out stale native objects as the cause of the later 0.6B variance. The clean
+  row measured 27,483 output tok/s
+  (`pie_06b_revert_clone_elision_clean_512x128.json`), still below the vLLM
+  28,141 output tok/s baseline.
+- Current vLLM could not be rerun on this host: the only found vLLM env
+  (`/root/Workspace/.local-vllm-venv`) fails at import/runtime with the current
+  NVIDIA driver (`found version 12040`) being too old for that PyTorch/vLLM
+  wheel. Existing vLLM artifacts remain the comparison point until the env is
+  fixed.
+- Nsight Systems works when invoked through the real binary
+  `/usr/lib/x86_64-linux-gnu/nsight-systems/target-linux-x64/nsys`; using bare
+  `nsys` or `env` without an absolute path can fail with `Not executable`.
+  Auto-import still fails, so keep using manual `QdstrmImporter` plus
+  `nsys export -t sqlite`. The clean 0.6B capture
+  (`nsys_06b_clean_revert.sqlite`) again showed CUDA API launch/copy overhead
+  is not the main gap: graph launch total was about 8.7 ms, async memcpy about
+  12.6 ms, while `cudaStreamSynchronize`/GPU wait dominated. The user-visible
+  regression is mostly runtime cadence/host jitter, not missing Nsight usage.
+- Opt-in API-level e2e timers were added behind
+  `PIE_API_E2E_BREAKDOWN=1` and surfaced in `model_status` / `pie_bench.py`.
+  In `pie_06b_api_sched_breakdown_512x128.json`, measured `execute()` averaged
+  about 17.3 ms: staged-hit wait about 16.4 ms, `try_hit` about 11 us, cold
+  submit averaged about 0.89 ms across all executes, append/unpin/output build
+  were sub-microsecond average. This confirms the hot loop is mostly waiting
+  for staged GPU output; request admission and WIT output construction are not
+  the large 0.6B gap.
+- `PIE_SCHED_FANOUT_BREAKDOWN=1` remains useful as profiling-only
+  instrumentation. The latest breakdown again attributed only about 0.24
+  ms/batch to direct oneshot sends; token output construction and response
+  classification are near-zero. The rest of the fanout bucket is drop/destructor
+  work and host scheduling noise.
+- Replacing the staged-batch map mutex with `parking_lot::Mutex` regressed
+  0.6B to 25,370 output tok/s. Despite `try_hit` averaging about 11 us under
+  API instrumentation, this lock swap disturbed chain/runtime cadence and was
+  reverted.
+- Making the singleton linker spawn each WASM instantiation concurrently
+  reduced reported per-process instantiate time from roughly 80-95 ms to about
+  4.4 ms, but throughput regressed or stayed below baseline: 27,403 output
+  tok/s on the first run and 26,130 output tok/s on rerun. The saved startup
+  time shifted into worse WASM/GPU overlap and longer driver-forward time, so
+  the linker remained sequential for this row.
+- `PIE_SPEC_SEND_BEFORE_EXTEND=1`, which published the next staged receiver and
+  returned the current token before submitting the next speculative stage,
+  regressed to 26,645 output tok/s. The original order, submit/queue next stage
+  before releasing the current token, preserves better chain cadence.
+- Bounded latency IPC spinning did not help. Keeping `ipc_profile=latency` but
+  setting `--spin-budget-us 1000` measured 27,292 output tok/s, below the
+  default unbounded latency-spin row.
+- Tokio worker-thread tuning did not help the 0.6B row. `--worker-threads 64`
+  measured 27,288 output tok/s and `--worker-threads 16` measured 27,523 output
+  tok/s, both below the best current rows. Keep the runtime default.
+- 0.6B speculation depth 1 was tested for the current HND/depth3 shape and
+  measured 27,027 output tok/s. Depth 3 remains the best setting; depth 1/2/4
+  are now all rejected for this row.
+- Extra warmup did not explain the 0.6B variance. Raising warmup from 4 to 16
+  measured 27,443 output tok/s, still below the vLLM baseline and below Pie's
+  best observed rows.
+- `--auto-token-budget` regressed the 0.6B row to 26,855 output tok/s. Smaller
+  per-process KV reservation bookkeeping did not improve this throughput shape.
+- Additional cuBLASLt BF16 heuristic overrides were rejected. Algo index 4
+  measured 25,571 output tok/s and index 5 measured 26,660 output tok/s. Keep
+  the current shape-aware default, which selects index 2 for the 0.6B lm-head
+  shape.
+- Benchmark-script audit for the TP1 unlimited comparison found no fixed
+  concurrency cap in the active Pie/vLLM throughput rows: Pie maps
+  `--concurrency 0` to no client-side semaphore, and vLLM maps it to
+  `max_num_seqs=num_requests` for the row. Prompt/output accounting also
+  matched the saved artifacts at 18,330 prompt tokens and 65,536 output
+  tokens. A harness-only bug where Pie throughput-mode latencies were all set
+  to the full bulk wall time was fixed; it did not affect throughput.
+- A fresh current-source 0.6B HND/depth3 TP1 unlimited rerun after the
+  benchmark cleanup measured 27,187 output tok/s
+  (`pie_06b_current_fresh_512x128.json`), below the vLLM 28,141 output tok/s
+  baseline. The run completed 131 scheduler batches with average driver
+  forward about 14.98 ms, response fanout about 1.74 ms, and batch queue about
+  4.40 ms.
+- `PIE_DENSE_COHORT_SLACK=8` regressed the 0.6B row to 27,037 output tok/s
+  (`pie_06b_dense_slack8_512x128.json`). Letting dense resident cohorts fire
+  short of the full target increased batch count and queue jitter, so the
+  default slack remains zero.
+- Opt-in Wasmtime component pre-instantiation caching
+  (`PIE_LINKER_PREINSTANTIATE=1`) reduced average process instantiate time
+  from about 87 ms to about 82 ms but did not improve throughput: the 0.6B
+  row measured 27,161 output tok/s
+  (`pie_06b_linker_pre_512x128.json`). The cache remains off by default.
+- Additional API/fanout instrumentation
+  (`pie_06b_api_fanout_breakdown_512x128.json`) confirmed the hot request path
+  is still dominated by waiting for staged GPU output. Average API `execute()`
+  was about 17.6 ms, with staged await about 16.9 ms, submit await about
+  0.71 ms, `try_hit` about 16 us, and output construction/pin/unpin
+  sub-microsecond to low-microsecond. Scheduler fanout rose under
+  instrumentation, so treat that row as profiling-only.
+- Capturing the single-GPU greedy argmax inside the decode CUDA graph
+  (`PIE_CUDA_GRAPH_ARGMAX=1`) regressed the 0.6B row to 26,793 output tok/s
+  (`pie_06b_graph_argmax_512x128.json`) and raised average driver forward to
+  about 15.39 ms. Keep argmax outside the graph for this shape.
+
+### Pending
+
+- Remaining 0.6B TP1 work should target steady runtime cadence rather than
+  blind GPU knob swaps. The best current evidence is: driver forward is usually
+  14.8-15.2 ms/batch, graph launch/copy overhead is small, response fanout is
+  noisy but mostly destructor/drop work, and API execution is dominated by
+  staged-output wait. The reliable win likely needs reducing host scheduling /
+  response-drop jitter or a real model-body/logits kernel improvement, not more
+  prefill-decode/XQA/page-size retests already listed above.
+
 ## Current Work in Progress
 
 - The serving path already used fused QKV and fused gate/up projections through
@@ -585,3 +977,539 @@ ABI. The previous generic XQA attempt was not that path and was slower.
   files, SM90 and SM120 MLA kernels), but Pie does not yet have an MLA model
   path or MLA KV-cache layout. Wiring those kernels would be model support work,
   not a small attention dispatch swap. No fake MLA integration was kept.
+
+## 2026-05-22 0.6B TP1 Unlimited Debugging
+
+- The benchmark scripts were audited for the "unlimited concurrency" rows.
+  Pie `tput --concurrency 0` maps to no process-admission semaphore, and vLLM
+  `tput --concurrency 0` maps `max_num_seqs` to the request count. A harness
+  artifact that assigned the full wall time as every bulk request latency was
+  fixed for reporting only; throughput accounting was already based on wall
+  time and token counts.
+- Current vLLM comparison artifact:
+  `vllm_06b_tp1_unlimited_512_flashinfer_current_rerun.json`, 28,141 output
+  tok/s. Current Pie clean reruns clustered around 27,187-27,365 output tok/s.
+  The remaining wall gap is roughly 60-70 ms on a 512x128 row, not a fixed
+  concurrency or prompt/output accounting issue.
+- E2E breakdown for Pie shows request admission and WIT output construction are
+  not the bottleneck. API execute is dominated by the staged GPU wait; scheduler
+  fanout is roughly 1.7-1.9 ms/batch and driver forward is roughly 14.8-15.1
+  ms/batch. The best old Pie run was not materially faster in driver forward;
+  it mostly had lower fanout/queue timing.
+- `ipc_profile=latency` was confirmed to use the in-process polling channel with
+  effectively unlimited spin budget by default.
+- `PIE_DENSE_COHORT_SLACK=8` was rejected on 0.6B TP1 unlimited:
+  `pie_06b_dense_slack8_512x128.json` measured 27,037 output tok/s, with higher
+  queueing and no throughput gain.
+- Wasmtime component linker pre-instantiation was rejected as a default path.
+  `PIE_LINKER_PREINSTANTIATE=1` reduced average instantiation time but measured
+  27,161 output tok/s, so startup got slightly cheaper without improving the
+  measured throughput row.
+- Scheduler/API fanout instrumentation confirmed that direct WIT output build is
+  sub-microsecond per request and not the gap. The instrumentation row itself
+  measured 26,718 output tok/s due to overhead, so it should not be used as a
+  performance baseline.
+- Capturing the single-GPU greedy argmax in the CUDA graph was rejected:
+  `PIE_CUDA_GRAPH_ARGMAX=1` measured 26,793 output tok/s and increased driver
+  forward time.
+- Publishing context working-token cache only at page boundaries was rejected.
+  `PIE_CONTEXT_APPEND_PUBLISH_PAGE_ONLY=1` measured 27,315 output tok/s. It
+  lowered the fanout counter but increased driver-forward/total time, so the
+  hot-path branch was removed.
+- Forcing a cached memory profile with R=256 was rejected:
+  `pie_06b_profile_r256_512x128.json` measured 26,105 output tok/s and split the
+  row into 389 total batches. An attempted R=384 cache did not actually select
+  R=384 because that shape is not in the planner candidate list; it fell back to
+  the rule-selected R=512 and should not be interpreted as an R=384 result.
+- Nsight Systems was used through the real binary path
+  `/usr/lib/x86_64-linux-gnu/nsight-systems/target-linux-x64/nsys`. Pie's clean
+  0.6B trace is dominated by FlashInfer decode kernels plus GEMMs; host-visible
+  CUDA time is mostly stream synchronization, not launch overhead. This matches
+  the failed argmax-graph result: the remaining gap is not just one extra CUDA
+  launch.
+- vLLM's current FlashInfer decode wrapper uses
+  `BatchDecodeWithPagedKVCacheWrapper(..., use_tensor_cores=True)`, which routes
+  decode planning through FlashInfer's BatchPrefill module with `causal=False`,
+  split-KV enabled, and `use_fp16_qk_reduction=False`. Pie's C++ prefill-decode
+  path already matched most of this shape, but the QK reduction mode remained a
+  concrete API mismatch worth testing as an opt-in rather than a default.
+- Retesting that mismatch as an opt-in on the current code was rejected.
+  `PIE_FLASHINFER_PREFILL_FP16_QK=0` measured 27,102 output tok/s on the 0.6B
+  TP1 unlimited row, below the same-build default at 27,303 output tok/s. The
+  extra template branch was removed after the test to avoid keeping the compile
+  and binary-size cost.
+- Moving request/page drops before direct response sends was rejected as a
+  scheduler fanout optimization. It measured 26,311 output tok/s on 0.6B TP1
+  unlimited, far below the same-build default. The send-before-drop ordering is
+  kept despite the fanout counter because it gives better end-to-end cadence.
+
+## 2026-05-22 Local L40 TP1 Continuation
+
+- The old Pie regression on the tight 0.6B row was mainly host/runtime cadence,
+  not a single missing GPU kernel. Current-source reruns had driver-forward
+  times close to the old best, but response fanout and queue timing were worse.
+- A correctness fix widened the CUDA graph layout key from 8 bits to 32 bits.
+  Prefill-decode graph keys now include the actual FlashInfer launch layout
+  class, padded batch size, HND/NHD, split-KV, causal/full variant, and SM90
+  marker. This prevents graph replay across incompatible FlashInfer plan
+  offsets/topologies.
+- The unsafe no-split prefill-decode graph experiment was removed. FlashInfer
+  only materializes `block_valid_mask` for split-KV prefill plans, so non-split
+  graph replay with padded CTAs can read invalid request indices.
+- Restored the direct token-only response fast path. The normal non-breakdown
+  path now uses the direct `oneshot` send bypass instead of routing direct
+  completions through `PendingRequest::send_result`.
+- Added default-on all-direct pre-extraction in the scheduler. For batches where
+  every completion is direct, the scheduler extracts response senders and drops
+  heavy request/page payloads on Tokio's blocking pool while the GPU forward is
+  in flight. Chunked continuations keep the old path. Set
+  `PIE_SCHED_PREEXTRACT_DIRECT=0` to disable. A two-phase variant that sent the
+  response targets back before dropping payloads regressed badly and was
+  reverted (`pie_06b_preextract_twophase_512x128.json`, 26,491 output tok/s).
+- Benchmark harness CPU locality was a real measurement issue. Both Pie and
+  vLLM throughput scripts now default to `--cpu-affinity auto`, which pins the
+  benchmark process and child engine/server to the GPU-local CPU mask reported
+  by `nvidia-smi topo -m`; `--cpu-affinity none` disables it. This does not
+  impose any request concurrency cap. On local GPU0 the mask is
+  `80-87,208-215`.
+- With equal auto-affinity, 0.6B TP1 unlimited now beats vLLM by a large margin:
+  - Pie default pre-extract:
+    `pie_06b_default_preextract_autoaffinity_rerun_512x128.json`,
+    29,764.59 output tok/s.
+  - vLLM FlashInfer:
+    `vllm_06b_tp1_unlimited_512_flashinfer_autoaffinity_20260522.json`,
+    28,123.34 output tok/s.
+- Manual `taskset` confirmed the same locality effect before it was added to
+  the scripts: Pie 0.6B reached 29,633.50 output tok/s on `80-87,208-215`;
+  vLLM with the same mask measured 28,223.66 output tok/s.
+- 1.7B TP1 unlimited improved substantially but is not a robust win on GPU0
+  yet. Best GPU0 Pie row so far is
+  `pie_17b_preextract_autoaffinity_prefill8192_512x128.json` at 17,688.17
+  output tok/s, versus vLLM FlashInfer
+  `vllm_17b_tp1_unlimited_512_flashinfer_autoaffinity_20260522.json` at
+  17,730.47 output tok/s. GPU1 produced a near-tie/slight Pie win once
+  (`pie_17b_preextract_autoaffinity_gpu1_prefill8192_512x128.json`,
+  17,745.21 vs
+  `vllm_17b_tp1_unlimited_512_flashinfer_autoaffinity_gpu1_20260522.json`,
+  17,743.53), but a rerun fell to 17,421.29, so this is not accepted as a
+  stable win.
+- Rejected 1.7B attempts under the pinned harness:
+  - Prefill workspace sweep: 6144, 7168, 7680, 8192, 9216, 10240, 12288, and
+    20480 tokens. 8192 remains the best observed shape.
+  - Speculation depths 0, 2, and 3; depth 1 remains best for 1.7B.
+  - `PIE_CUDA_PREFILL_DECODE_PLAN=1` with internal FlashInfer graph mode and
+    min-KV-pages 0 regressed to 17,159 output tok/s.
+  - `PIE_CUDA_DECODE_FULL_ATTENTION=0` regressed to 17,461 output tok/s.
+  - NHD layout, XQA GQA2 page16, and XQA page32 all regressed.
+  - `PIE_CUDA_GRAPH_ARGMAX=1` regressed to 17,477 output tok/s.
+  - Dense wait multipliers 16/32/48 and eager/greedy policies regressed.
+- Current next target for 1.7B is GPU-side forward time. Under auto-affinity,
+  e2e response fanout is already about 80-90 us/batch; the vLLM gap tracks
+  driver forward, not request admission or response fanout.
+- The benchmark-script audit for the refreshed 1.7B rows again found no fixed
+  concurrency cap: Pie uses `--concurrency 0` with no client semaphore, and
+  vLLM maps `--concurrency 0` to `max_num_seqs=num_requests`. The current
+  comparison rows all use unlimited concurrency and Pie uses
+  `--ipc-profile latency`.
+- Capturing graph-safe single-GPU argmax became useful after the later 1.7B
+  GPU-side changes, but only with `PIE_ARGMAX_PARTS=2`. The parts-2 row with
+  static decode planning, lm-head-only Lt, decode-full disabled, and an
+  8192-token workspace reached 17,756.55 output tok/s before the qkv
+  postprocess optimization. `PIE_ARGMAX_PARTS=1` was retested after qkv
+  postprocess and regressed to 17,700.81 output tok/s
+  (`pie_17b_qkvpost_warp_argmaxparts1_staticdecode_lmheadlt_decodefull0_prefill8192_512x128.json`).
+- A warp-level q/k RMSNorm+RoPE+KV-write decode postprocess is kept. Nsight on
+  `pie_17b_qkvpost_warp_nsys_node_512x128.json` showed the qkv decode
+  postprocess falling from roughly 60 ms to about 30 ms over the traced row,
+  and the best untraced run reached 17,968.91 output tok/s
+  (`pie_17b_qkvpost_warp_graph_argmax_parts2_staticdecode_lmheadlt_decodefull0_autoaffinity_prefill8192_512x128.json`).
+  The win is not yet stable or large: clean reruns ranged from 17,648.59 to
+  17,898.26 output tok/s, roughly tied with the refreshed vLLM row at
+  17,898.96 output tok/s.
+- Reducing the fallback qkv postprocess CTA block from 128 to 64 did not help
+  the 1.7B row. It measured 17,613.75 output tok/s and was reverted.
+- Forcing the decode-as-prefill path to run non-split, to mimic the visible
+  vLLM eager grid shape, was rejected. The run saturated the GPU for minutes
+  and was killed; the source was restored to split only when FlashInfer's
+  head-dim support requires it. Do not retry this without a deeper FlashInfer
+  plan/layout change.
+- A row-wise/vectorized SwiGLU candidate regressed 1.7B to 17,670.96 output
+  tok/s (`pie_17b_swiglu_vec2row_qkvpost_warp_graphargmax_parts2_staticdecode_lmheadlt_decodefull0_prefill8192_512x128.json`)
+  and was reverted to the original chunked kernel.
+- Nsight after the qkv postprocess optimization shows the duplicate sampler is
+  gone from the captured decode graph path: `sample_temp` totals about 0.6 ms
+  over a few warmup calls, while the hot path is now FlashInfer decode
+  (~1.17 s traced), GEMMs, SwiGLU (~90 ms), RMSNorm (~67 ms), and captured
+  argmax (~37 ms). The next viable optimization target is still GPU-side
+  forward time, not request admission.
+- TP1 residual-add/RMSNorm fusion was rejected for the 1.7B row. The candidate
+  routed o/down projection GEMMs through a scratch buffer with `beta=0` and
+  reused Pie's existing fused residual-add/RMSNorm kernel for the following
+  MLP/next-layer norm. It measured 17,876.33 output tok/s
+  (`pie_17b_tp1_fused_resid_rms_qkvpost_warp_graphargmax_parts2_staticdecode_lmheadlt_decodefull0_prefill8192_512x128.json`),
+  below the best qkv-postprocess rows, so the source change was reverted.
+- Increasing `chunked_swiglu_bf16` from 128 to 256 threads per CTA was
+  rejected. The 1.7B row measured 17,839.81 output tok/s
+  (`pie_17b_swiglu_block256_qkvpost_warp_graphargmax_parts2_staticdecode_lmheadlt_decodefull0_prefill8192_512x128.json`),
+  worse than the kept 128-thread chunked kernel, so the block size was
+  restored.
+- Reducing the warp-level qkv decode postprocess launcher from 8 warps/CTA to
+  4 warps/CTA was rejected. The 1.7B row measured 17,649.73 output tok/s
+  (`pie_17b_qkvpost_warpblock128_graphargmax_parts2_staticdecode_lmheadlt_decodefull0_prefill8192_512x128.json`),
+  well below the kept 8-warps/CTA shape.
+- Increasing the same qkv postprocess launcher from 8 warps/CTA to
+  16 warps/CTA was also rejected. It measured 17,716.11 output tok/s
+  (`pie_17b_qkvpost_warpblock512_graphargmax_parts2_staticdecode_lmheadlt_decodefull0_prefill8192_512x128.json`).
+  Keep the original 8-warps/CTA warp-level postprocess launch.
+- `PIE_CUBLASLT_BF16_ALGO_INDEX=1` was rejected for the 1.7B lm-head-only Lt
+  path. It measured 17,667.77 output tok/s
+  (`pie_17b_lmheadlt_algo1_qkvpost_warp_graphargmax_parts2_staticdecode_decodefull0_prefill8192_512x128.json`).
+  The previous sweep already rejected indices 0 and 2-7, so keep the default
+  heuristic index for this row.
+- Prefill-backed decode with a fixed FlashInfer split size of 8 pages was
+  rejected. The candidate added an env-gated
+  `PIE_FLASHINFER_PREFILL_FIXED_SPLIT_SIZE=8` and ran with
+  `PIE_CUDA_PREFILL_DECODE_PLAN=1`,
+  `PIE_CUDA_PREFILL_DECODE_MIN_KV_PAGES=0`, and
+  `PIE_CUDA_PREFILL_DECODE_FULL_MIN_KV_PAGES=0`. It saturated the GPU for
+  more than 90 seconds on the 1.7B 512x128 row, versus about 4 seconds for the
+  dedicated-decode baseline, and was killed before producing a JSON artifact.
+  The source change was reverted; fixed split does not rescue Pie's
+  prefill-decode path.
+- Retesting 1.7B speculation depth 2 after the qkv postprocess optimization
+  still regressed. It measured 17,618.01 output tok/s
+  (`pie_17b_depth2_qkvpost_warp_graphargmax_parts2_staticdecode_lmheadlt_decodefull0_prefill8192_512x128.json`).
+  Keep speculation depth 1 for the 1.7B TP1 unlimited row.
+- Retesting default cuBLASLt coverage after the qkv postprocess optimization
+  still regressed. Removing `PIE_CUBLASLT_BF16_MIN_N=100000` measured
+  17,414.94 output tok/s
+  (`pie_17b_defaultlt_qkvpost_warp_graphargmax_parts2_staticdecode_decodefull0_prefill8192_512x128.json`).
+  Keep lm-head-only Lt for this row.
+- Simplifying the fused qkv decode postprocess K/V destination to the current
+  decode token's last page/last offset is kept for now. The first run measured
+  17,707.95 output tok/s, but the confirmation run reached 18,015.20 output
+  tok/s
+  (`pie_17b_qkvpost_directkvslot_rerun2_graphargmax_parts2_staticdecode_lmheadlt_decodefull0_prefill8192_512x128.json`),
+  slightly above the refreshed vLLM FlashInfer baseline at 17,898.96 output
+  tok/s. This is not a large enough margin by itself.
+- Retesting the prefill-backed decode route on the current qkv/direct-slot
+  build, without the previously rejected fixed split-size knob, still
+  regressed. With `PIE_CUDA_PREFILL_DECODE_PLAN=1`,
+  `PIE_CUDA_PREFILL_DECODE_MIN_KV_PAGES=0`, and
+  `PIE_CUDA_PREFILL_DECODE_FULL_MIN_KV_PAGES=0`, the 1.7B row measured
+  17,729.10 output tok/s
+  (`pie_17b_prefilldecode_current_qkvdirect_graphargmax_parts2_staticdecode_lmheadlt_decodefull0_prefill8192_512x128.json`).
+  Dedicated FlashInfer decode remains the accepted path unless a deeper API
+  mismatch is fixed.
+- Matching vLLM's tensor-core decode QK reduction flag on the prefill-backed
+  route was also rejected for 1.7B. A narrow opt-in
+  `PIE_FLASHINFER_PREFILL_FP16_QK=0` improved that rejected path to 17,794.67
+  output tok/s
+  (`pie_17b_prefilldecode_qkfp32_qkvdirect_graphargmax_parts2_staticdecode_lmheadlt_decodefull0_prefill8192_512x128.json`),
+  but it remained below both the kept dedicated-decode Pie row and vLLM. The
+  extra FlashInfer template specialization was removed again to avoid carrying
+  compile and binary-size cost for a non-winning path.
+- A vec8 BF16 plain-RMSNorm kernel, modeled after vLLM's vectorized
+  load/store shape for hidden sizes divisible by 8, was rejected. The 1.7B row
+  measured 17,818.39 output tok/s
+  (`pie_17b_rmsnorm_vec8_qkvdirect_graphargmax_parts2_staticdecode_lmheadlt_decodefull0_prefill8192_512x128.json`),
+  below the kept qkv/direct-slot dedicated-decode row. The source change was
+  reverted.
+- Attempting to stabilize the noisy 1.7B rows by locking GPU0 to its max
+  supported application clocks was blocked by the environment. `nvidia-smi -i 0
+  -lgc 2490,2490` reported that the current user does not have permission to
+  change clocks. The comparison remains under the default boost behavior.
+- Current-source qkv/direct-slot reruns after reverting rejected experiments
+  did not reproduce the 18,015 output tok/s outlier. Confirmation rows measured
+  17,691.70 and 17,746.07 output tok/s
+  (`pie_17b_qkvdirect_rebuild_confirm_graphargmax_parts2_staticdecode_lmheadlt_decodefull0_prefill8192_512x128.json`,
+  `pie_17b_qkvdirect_rebuild_confirm_rerun2_graphargmax_parts2_staticdecode_lmheadlt_decodefull0_prefill8192_512x128.json`).
+  A same-period vLLM FlashInfer rerun measured 17,754.75 output tok/s
+  (`vllm_17b_tp1_unlimited_512_flashinfer_autoaffinity_current_afterpie_20260522.json`),
+  so the current median is still a tie/slight Pie loss, not an accepted win.
+- Retesting `PIE_CUDA_DECODE_FULL_ATTENTION=1` on the current qkv/direct-slot
+  build was neutral and still below the target, at 17,750.13 output tok/s
+  (`pie_17b_qkvdirect_decodefull1_retest_graphargmax_parts2_staticdecode_lmheadlt_prefill8192_512x128.json`).
+  Keep `PIE_CUDA_DECODE_FULL_ATTENTION=0` for the accepted command.
+- Runtime-side retries did not help the current 1.7B row. `--wasm-warm-slots
+  512` regressed to 17,548.82 output tok/s
+  (`pie_17b_wasmwarmslots512_qkvdirect_graphargmax_parts2_staticdecode_lmheadlt_decodefull0_prefill8192_512x128.json`),
+  removing `PIE_SPEC_STRICT_DEPTH=1` measured 17,742.87 output tok/s
+  (`pie_17b_nostrictdepth_qkvdirect_graphargmax_parts2_staticdecode_lmheadlt_decodefull0_prefill8192_512x128.json`),
+  and `PIE_SPEC_HIT_AGG_MAX_EXTRA=1` measured 17,677.94 output tok/s
+  (`pie_17b_hitagg1_qkvdirect_graphargmax_parts2_staticdecode_lmheadlt_decodefull0_prefill8192_512x128.json`).
+  Keep the strict-depth/default hit path and no explicit WASM warm-slot
+  override.
+- Retesting TP1 residual-add/RMSNorm fusion as an opt-in combined with the
+  current qkv/direct-slot path regressed to 17,644.85 output tok/s
+  (`pie_17b_tp1_residrms_optin_qkvdirect_graphargmax_parts2_staticdecode_lmheadlt_decodefull0_prefill8192_512x128.json`).
+  This is worse than the earlier residual-fusion attempt and below the current
+  vLLM rerun, so the opt-in branch was removed again.
+- The direct K/V slot simplification was reverted after it failed to reproduce
+  reliably. Restoring the general page/offset calculation in the qkv decode
+  postprocess recovered the no-direct current row to 17,905.01 output tok/s
+  (`pie_17b_qkvpost_warp_revert_directkv_current_graphargmax_parts2_staticdecode_lmheadlt_decodefull0_prefill8192_512x128.json`).
+  Treat the direct-slot shortcut as unstable unless a correctness proof and
+  stronger row-specific evidence are added.
+- An invalid argmax-parts comparison was launched with parts=3 and parts=4 in
+  parallel on the same GPU and was killed. Do not use artifacts from that run.
+  Re-running serially rejected both variants: parts=3 measured 17,888.36
+  output tok/s and parts=4 measured 17,874.74 output tok/s
+  (`pie_17b_qkvpost_warp_revert_directkv_argmaxparts3_staticdecode_lmheadlt_decodefull0_prefill8192_512x128.json`,
+  `pie_17b_qkvpost_warp_revert_directkv_argmaxparts4_staticdecode_lmheadlt_decodefull0_prefill8192_512x128.json`).
+  Keep `PIE_ARGMAX_PARTS=2`.
+- Node-level Nsight on the restored no-direct Pie row showed the remaining GPU
+  time is mostly GEMM and attention, not request admission. The grouped kernel
+  totals were roughly GEMM 2747.8 ms (65.5%), FlashInfer decode 1188.7 ms
+  (28.4%), SwiGLU 89.5 ms, RMSNorm 53.7 ms, argmax 36.8 ms, warp qkv
+  postprocess 29.7 ms, and prefill/misc qkv postprocess 25.2 ms over the node
+  trace. For vLLM, node-level tracing required
+  `--trace-fork-before-exec=true`; otherwise the child engine kernels are
+  mostly missed.
+- HND KV layout was useful but noisy on 1.7B. HND with dedicated decode measured
+  17,973.80 output tok/s and confirmed at 17,929.08 output tok/s
+  (`pie_17b_hnd_qkvpost_warp_revert_directkv_graphargmax_parts2_staticdecode_lmheadlt_decodefull0_prefill8192_512x128.json`,
+  `pie_17b_hnd_qkvpost_warp_revert_directkv_confirm_graphargmax_parts2_staticdecode_lmheadlt_decodefull0_prefill8192_512x128.json`).
+  Enabling `PIE_CUDA_DECODE_FULL_ATTENTION=1` on HND improved the accepted row
+  to 18,031.87 output tok/s
+  (`pie_17b_hnd_decodefull1_qkvpost_warp_revert_directkv_graphargmax_parts2_staticdecode_lmheadlt_prefill8192_512x128.json`).
+- XQA-style FlashInfer routes did not beat the kept HND dedicated-decode row.
+  HND plus `PIE_CUDA_XQA_DECODE=1` printed `xqa_decode=off` and measured
+  18,035.07 output tok/s, so it is only an HND/no-XQA noisy row. NHD with
+  `PIE_CUDA_XQA_DECODE=1` but without the GQA2 page16 gate also printed
+  `xqa_decode=off` and measured 17,607.15 output tok/s. Explicit GQA2 page16
+  XQA (`PIE_CUDA_XQA_DECODE=1 PIE_CUDA_XQA_GQA2_P16=1`) printed
+  `xqa_decode=on` but regressed to 17,214.19 output tok/s
+  (`pie_17b_nhd_xqa_gqa2p16_qkvpost_warp_revert_directkv_graphargmax_parts2_staticdecode_lmheadlt_decodefull0_prefill8192_512x128.json`).
+  Do not retry this exact XQA path without changing the FlashInfer API mapping.
+- HND prefill-backed decode was rejected for the current build. With
+  `PIE_CUDA_PREFILL_DECODE_PLAN=1`, it measured 17,790.72 output tok/s
+  (`pie_17b_hnd_prefilldecode_qkvpost_warp_revert_directkv_graphargmax_parts2_staticdecode_lmheadlt_decodefull0_prefill8192_512x128.json`),
+  below HND dedicated decode.
+- cuBLASLt scope remains lm-head-only for 1.7B. Disabling Lt regressed HND/full
+  attention to 16,849.67 output tok/s, and the broader default Lt coverage
+  regressed to 17,822.74 output tok/s
+  (`pie_17b_hnd_decodefull1_nolt_qkvpost_warp_revert_directkv_graphargmax_parts2_staticdecode_prefill8192_512x128.json`,
+  `pie_17b_hnd_decodefull1_defaultlt_qkvpost_warp_revert_directkv_graphargmax_parts2_staticdecode_prefill8192_512x128.json`).
+  Keep `PIE_CUBLASLT_BF16_MIN_N=100000`.
+- A BF16 vectorized argmax path was successful and is now default-on unless
+  `PIE_ARGMAX_VEC2=0` is set. Under HND + full-attention + graph argmax +
+  static decode + lm-head-only Lt + parts=2, the explicit vec2 run measured
+  18,153.43 output tok/s and confirmed at 18,169.11 output tok/s
+  (`pie_17b_hnd_decodefull1_argmaxvec2_qkvpost_warp_revert_directkv_graphargmax_parts2_staticdecode_lmheadlt_prefill8192_512x128.json`,
+  `pie_17b_hnd_decodefull1_argmaxvec2_confirm_qkvpost_warp_revert_directkv_graphargmax_parts2_staticdecode_lmheadlt_prefill8192_512x128.json`).
+  The scalar control measured 17,969.07 output tok/s. After rebuilding with
+  vec2 default-on, the same command without `PIE_ARGMAX_VEC2=1` measured
+  18,195.10 output tok/s
+  (`pie_17b_hnd_decodefull1_argmaxvec2_defaulton_confirm_qkvpost_warp_revert_directkv_graphargmax_parts2_staticdecode_lmheadlt_prefill8192_512x128.json`).
+- Argmax vec2 is not enough to loosen other rejected knobs. Vec2 with
+  `PIE_CUDA_DECODE_FULL_ATTENTION=0` measured 17,883.05 output tok/s, and vec2
+  with `PIE_ARGMAX_PARTS=1` measured 17,731.85 output tok/s
+  (`pie_17b_hnd_decodefull0_argmaxvec2_qkvpost_warp_revert_directkv_graphargmax_parts2_staticdecode_lmheadlt_prefill8192_512x128.json`,
+  `pie_17b_hnd_decodefull1_argmaxvec2_parts1_qkvpost_warp_revert_directkv_graphargmax_staticdecode_lmheadlt_prefill8192_512x128.json`).
+  Keep full attention and parts=2.
+- Same-session vLLM FlashInfer TP1 unlimited-concurrency baseline after the
+  argmax vec2 work measured 17,797.37 output tok/s
+  (`vllm_17b_tp1_unlimited_512_flashinfer_current_after_argmaxvec2_20260522.json`).
+  Pie is now about 2.2% faster on this 1.7B row, but this is not yet a large
+  margin, so the next target must come from GEMM/attention rather than runtime
+  queueing.
+- Node-level Nsight on the current HND + full-attention + vec2 row measured
+  roughly GEMM 2750.4 ms (66.6%), FlashInfer decode 1118.8 ms (27.1%),
+  SwiGLU 89.6 ms, RMSNorm 53.6 ms, argmax 35.6 ms, qkv decode postprocess
+  28.9 ms, and q/k RoPE prefill 14.6 ms over the traced kernels. The profile
+  artifact is `/tmp/pie17_hnd_full1_vec2_current_node_nsys.nsys-rep` and the
+  benchmark JSON is `pie_17b_hnd_full1_vec2_current_node_nsys_512x128.json`.
+  This keeps the next target on GEMM/attention; argmax is now too small to
+  carry a large margin alone.
+- Caching the static non-split FlashInfer decode-plan upload was rejected and
+  reverted. The candidate skipped the host rebuild/device copy of
+  request_indices, kv_tile_indices, o_indptr, and kv_chunk_size when batch
+  size/page size/workspace pointer were unchanged. It was neutral on 1.7B
+  (18,185.76 output tok/s,
+  `pie_17b_staticplan_uploadcache_hnd_full1_vec2_512x128.json`) and did not
+  recover the tight 0.6B cadence row (28,690.00 and 28,622.62 output tok/s,
+  `pie_06b_staticplan_uploadcache_default_depth3_512x128.json`,
+  `pie_06b_staticplan_uploadcache_default_depth3_rerun_512x128.json`). A
+  0.6B scalar-argmax control with `PIE_ARGMAX_VEC2=0` was lower at 28,457.61
+  output tok/s, so the 0.6B drop was not caused by the new vec2 default. After
+  reverting the upload cache and rebuilding, 1.7B reran at 17,948.04 and
+  18,030.67 output tok/s
+  (`pie_17b_post_uploadcache_revert_hnd_full1_vec2_512x128.json`,
+  `pie_17b_post_uploadcache_revert_hnd_full1_vec2_rerun_512x128.json`).
+
+## 2026-05-22 fused dense projection replacement
+
+- Benchmark-script audit: `--concurrency 0` remains symmetric. Pie drops
+  `max_concurrent_processes` (`None`, serialized as unlimited) and vLLM maps
+  the same flag to `max_num_seqs=num_requests`; current 8B vLLM JSON confirms
+  `max_num_seqs=512`. Both paths use GPU-local CPU affinity
+  `80-87,208-215`. Pie rows in this section use `--ipc-profile latency`.
+- The 8B regression source was confirmed as duplicated fused dense projection
+  weights, not fixed client concurrency. With the old duplicate-fused path, 8B
+  used `used_after_weights=24,700 MiB`, reduced the forward cap to R=256, and
+  measured 4,453.58 output tok/s
+  (`pie_8b_hnd_full1_vec2_unlimited_current_512x128.json`). Disabling fused
+  projection duplicates recovered R=512 and measured 4,829.13 / 4,791.64
+  output tok/s
+  (`pie_8b_nofusedproj_hnd_full1_vec2_unlimited_512x128.json`,
+  `pie_8b_nofusedproj_hnd_full1_vec2_unlimited_confirm_512x128.json`).
+- Accepted source fix: dense fused QKV / gate-up contracts now consume the
+  original raw tensors, and the Qwen/Llama-like binder creates non-owning
+  per-projection `DeviceTensor::view` aliases into the fused buffer when the
+  canonical names are absent. This preserves the unfused fallback without
+  keeping duplicate weights resident. The default fused-projection threshold
+  is now 10 GiB: all fused through 8B-class Qwen models, QKV-only above that.
+- 8B memory behavior is fixed. All-fused replacement runs at R=512 with
+  `used_after_weights=16,060 MiB` and measured 4,835.54 output tok/s
+  (`pie_8b_fusedreplace_hnd_full1_vec2_unlimited_512x128.json`). The final
+  default-10GiB gated build measured 4,807.34 output tok/s
+  (`pie_8b_default10g_fusedreplace_swigluvec2gated_hnd_full1_vec2_unlimited_512x128.json`)
+  against refreshed vLLM 4,805.45
+  (`vllm_8b_tp1_unlimited_512_flashinfer_current_rerun_after_fusedreplace_20260522.json`).
+  This is only a narrow win, not a large margin.
+- 8B rejected follow-ups on the replacement build:
+  qkv-only replacement with 6 GiB budget was consistently low at 4,755.27 /
+  4,733.45 output tok/s; no-fusion final control was 4,778.17; default
+  cuBLASLt threshold was 4,370.23; Lt disabled was 4,703.16; forced Lt algo
+  indices 0-7 were all worse (best 4,729.93); depth 2/3 were 4,745.13 /
+  4,728.34; page size 32/XQA was 4,769.06; prefill N=16,384 and 32,768 were
+  4,805.13 and 4,771.16; worker threads 16 was 4,742.68; disabling the static
+  decode-plan path was 4,771.78. Forced prefill-decode was noisy and not
+  accepted: 4,830.06 before the SwiGLU experiment, then 4,795.26 on the final
+  gated build.
+- Nsight for 8B confirmed the remaining Pie cost is CUDA/GEMM-heavy. The Pie
+  qkv-only profile grouped roughly 14.5 s GEMM/CUTLASS (87.9%), 1.5 s
+  FlashInfer attention (9.1%), and sub-2% activation/norm. The vLLM 8B fork
+  trace required `/root/Workspace/vllm/.venv/bin/python` plus
+  `--trace-fork-before-exec=true`; the profiled vLLM run measured 4,771.42
+  output tok/s and the plain rerun measured 4,805.45. The vLLM trace is
+  dominated by compiled GEMM/Triton kernels, so a large 8B margin likely
+  requires better GEMM/kernel fusion rather than request admission changes.
+- 14B benefits from QKV-only replacement but not gate/up fusion. Default 10 GiB
+  (QKV-only) measured 2,022.08 output tok/s
+  (`pie_14b_default10g_fusedreplace_hnd_decodefull0_vec2_unlimited_512x128.json`)
+  versus vLLM 1,933.72
+  (`vllm_14b_tp1_unlimited_512_flashinfer_current_20260522.json`). All-fused
+  replacement regressed to 1,981.13, full attention was 1,999.78, and a forced
+  prefill-decode attempt did not enable that path and measured 2,016.13.
+- 4B benefits from replacement and the gated vec2 chunked SwiGLU helper.
+  Default replacement measured 8,154.63 output tok/s; with vec2 enabled for
+  intermediate widths <= 10,000, 4B measured 8,231.71 output tok/s
+  (`pie_4b_default10g_fusedreplace_swigluvec2_hnd_simple_depth1_unlimited_512x128.json`)
+  versus vLLM 8,074.90
+  (`vllm_4b_tp1_unlimited_512_flashinfer_rerun.json`). Weight residency fell
+  from the old all-fused duplicate 12,770 MiB to 8,162 MiB.
+- 1.7B remains noisy but above the refreshed vLLM baseline when rerun. Default
+  replacement measured 17,815.84; vec2 SwiGLU first measured 17,723.74, then
+  reran at 18,159.67
+  (`pie_17b_default10g_fusedreplace_swigluvec2_hnd_full1_vec2_unlimited_rerun_512x128.json`)
+  versus vLLM 17,797.37
+  (`vllm_17b_tp1_unlimited_512_flashinfer_current_after_argmaxvec2_20260522.json`).
+- 0.6B after the fused replacement build measured 28,325.92 output tok/s
+  (`pie_06b_default10g_fusedreplace_depth3_unlimited_512x128.json`) versus
+  vLLM 28,123.34
+  (`vllm_06b_tp1_unlimited_512_flashinfer_autoaffinity_20260522.json`). This
+  still beats the refreshed vLLM row but remains below the older 29.8k Pie
+  outliers, so the small-model cadence variance is not fully solved.
+- Failed/successful policy summary: keep HND, N=8192, graph argmax parts=2,
+  static decode plan, lm-head-only Lt (`PIE_CUBLASLT_BF16_MIN_N=100000`) for
+  1.7B/8B/14B knob bundles; keep 14B `PIE_CUDA_DECODE_FULL_ATTENTION=0`; keep
+  8B page size 16 and depth 1. Keep fused projection replacement and default
+  10 GiB threshold. Keep chunked SwiGLU vec2 only for smaller fused gate/up
+  widths (`I <= 10000`); do not use it on 8B-class gate/up.
+
+## 2026-05-22 scoped 8B prefill-shape planner
+
+- Accepted source fix: the CUDA memory planner now exposes and prefers a
+  12,288-token workspace only for TP1 Qwen3-8B-class dense models on
+  L40/H100-class GPUs (`model_type=qwen3`, `hidden_size=4096`,
+  `sm_count>=100`, sm8x/sm9x). This keeps the benchmark at unlimited
+  client concurrency while changing the server workspace shape. The first
+  no-env 8B runs selected `N=12288 R=512` and measured 4,889.38 and
+  4,868.88 output tok/s
+  (`pie_8b_auto12288_scoped_fusedreplace_hnd_full1_vec2_unlimited_512x128.json`,
+  `pie_8b_auto12288_scoped2_fusedreplace_hnd_full1_vec2_unlimited_512x128.json`)
+  versus refreshed vLLM 4,805.45. The 8B command should no longer force
+  `PIE_CUDA_PREFILL_TOKENS=8192`; let the planner pick 12,288.
+- Rejected 8B prefill-shape rows: forced 20,000 tokens was unstable
+  (4,863.43 then 4,765.06), 18,432 measured 4,821.90, 24,576 measured
+  4,779.73, 10,240 measured 4,838.58, 11,264 measured 4,813.40, 13,312
+  measured 4,805.14, and 14,336 measured 4,806.03. Keep the scoped 12,288
+  planner preference only.
+- Nsight on the final all-fused 8B path (`/tmp/pie8_final_fused_hnd_full1_vec2_node_nsys.nsys-rep`)
+  captured the graph-build/body kernels and grouped roughly 2.33 s
+  GEMM/CUTLASS (92.4%), 79 ms SwiGLU, 61 ms RMSNorm, 32 ms QKV post/rope/KV,
+  and 20 ms attention. The capture does not expand every CUDA-graph replay,
+  but it confirms the non-GEMM work is too small to carry a large 8B margin.
+- A broader auto-planner attempt was rejected. Raising the large-GPU
+  prefill cap globally and adding an unscoped prefill-underfill penalty made
+  14B choose `N=4096 R=256`, regressing to 1,783.69 / 1,757.00 output tok/s.
+  Restoring the accepted 14B command with `PIE_CUDA_PREFILL_TOKENS=8192`
+  selected `N=8192 R=128` and measured 2,010.55 output tok/s
+  (`pie_14b_scoped2_prefill8192_default10g_fusedreplace_hnd_decodefull0_vec2_unlimited_512x128.json`).
+- Regression checks after scoping: 4B measured 8,298.85 output tok/s
+  (`pie_4b_scopedplanner_default10g_fusedreplace_hnd_simple_depth1_unlimited_512x128.json`),
+  0.6B measured 28,691.16
+  (`pie_06b_scopedplanner_default10g_fusedreplace_depth3_unlimited_512x128.json`),
+  and 1.7B reran at 17,929.78 after a low/noisy 17,627.54 first sample
+  (`pie_17b_scopedplanner_default10g_fusedreplace_hnd_full1_vec2_unlimited_rerun_512x128.json`).
+
+## 2026-05-22 simplification pass
+
+- Removed the rejected staged-hit aggregation opt-in
+  (`PIE_SPEC_HIT_AGG_MAX_EXTRA`). Earlier default and opt-in attempts
+  regressed throughput, and the accepted speculative path only needs to claim
+  one ready staged result per inferlet call. The API hit path now awaits and
+  returns the claimed staged result directly.
+- Removed the rejected dense resident cohort slack hook
+  (`PIE_DENSE_COHORT_SLACK`). The documented slack experiment regressed the
+  0.6B unlimited row, so dense cohorts again fire at the exact tracked target.
+- Left the larger or accepted tuning surfaces in place: fused dense projection
+  replacement, the scoped 8B planner preference, graph argmax/argmax-parts,
+  CUBLASLt thresholds, static decode planning, and the prefill/decode knobs
+  used by accepted benchmark rows.
+
+## 2026-05-22 fresh TP1 unlimited advantage check
+
+- Fresh 512x128, TP1, unlimited-concurrency matrix after the simplification
+  pass used `--concurrency 0 --ipc-profile latency` for Pie and
+  `max_num_seqs=512` / FlashInfer for vLLM. First-pass paired rows:
+  - 0.6B: Pie 29,607.42 vs vLLM 28,219.35 output tok/s (+4.92%).
+  - 1.7B: Pie 18,228.98 vs vLLM 17,767.86 (+2.60%).
+  - 4B: Pie 8,247.50 vs vLLM 8,193.03 (+0.66%).
+  - 8B: Pie 4,807.20 vs vLLM 4,779.81 (+0.57%).
+  - 14B with the previous accepted graph/static row: Pie 1,988.11 vs vLLM
+    2,001.84 (-0.69%). This row is no longer accepted.
+- Repeat samples for the tight rows:
+  - 4B Pie [8,247.50, 8,277.06, 8,226.37] vs vLLM
+    [8,193.03, 8,212.66, 8,187.69]. All paired samples won, but the
+    worst-Pie/best-vLLM margin was only +0.17%.
+  - 8B Pie [4,807.20, 4,776.94, 4,780.29] vs vLLM
+    [4,779.81, 4,752.00, 4,754.60]. All paired samples won, but the
+    worst-Pie/best-vLLM margin was -0.06%, so this is a narrow/noisy edge.
+  - 14B previous graph/static row Pie [1,988.11, 1,981.33, 1,979.33] vs vLLM
+    [2,001.84, 1,997.12, 1,993.21]. Reject graph/static as the 14B default.
+- 14B variant sweep showed the old microopts were hurting this build:
+  - HND + `PIE_CUDA_PREFILL_TOKENS=8192` + lm-head-only Lt
+    (`PIE_CUBLASLT_BF16_MIN_N=100000`) + `PIE_CUDA_DECODE_FULL_ATTENTION=0`,
+    with graph argmax and static decode plan unset: 2,031.90 output tok/s.
+  - Static decode only: 2,009.13.
+  - Graph argmax parts=2 only: 1,999.48.
+  - Current graph/static with full attention on: 1,996.52.
+  - Default Lt coverage instead of lm-head-only Lt: 1,916.43.
+  Decision: do not use `PIE_CUDA_STATIC_DECODE_PLAN=1` or
+  `PIE_CUDA_GRAPH_ARGMAX=1` for the 14B TP1 unlimited row.
+- 14B simple prefill sweep, keeping HND + lm-head-only Lt + decode-full off and
+  leaving graph/static unset: N=6144 measured 2,025.33, N=7168 measured
+  2,008.75, N=9216 measured 2,000.11, N=10240 measured 1,998.25, and N=12288
+  measured 1,995.17 output tok/s. N=6144 is the best new 14B candidate, but
+  repeats were noisy: 1,993.49 and 1,984.63, followed by a paired late-session
+  run of Pie 1,996.53 after vLLM had dropped to 1,975.28. This is a paired win
+  under the same thermal drift, not a strict every-sample win over the best
+  vLLM sample.
+- Conclusion from this run: Pie currently has a fresh paired advantage across
+  the tested TP1 0.6B/1.7B/4B/8B rows and can recover a paired 14B win with the
+  simpler N=6144/no-graph/no-static command. It does not yet have a large,
+  noise-proof margin on 4B/8B/14B; 14B in particular needs more GPU-side work
+  before claiming "always faster" against vLLM.

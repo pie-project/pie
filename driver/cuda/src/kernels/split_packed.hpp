@@ -52,6 +52,7 @@ void launch_qkv_decode_qk_norm_rope_write_kv_bf16(
     int num_kv_heads,
     int head_dim,
     int page_size,
+    bool hnd_layout,
     float theta,
     float eps,
     cudaStream_t stream);

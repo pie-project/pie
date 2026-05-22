@@ -23,6 +23,7 @@ __device__ __forceinline__ int find_request(const std::uint32_t* qo_indptr,
     return R - 1;
 }
 
+template <bool HND_LAYOUT>
 __global__ void write_kv_kernel(
     const __nv_bfloat16* __restrict__ k_curr,
     const __nv_bfloat16* __restrict__ v_curr,
@@ -58,12 +59,19 @@ __global__ void write_kv_kernel(
 
     const long long row = h_kv * d;
     const long long src = static_cast<long long>(t) * row;
-    const long long dst =
-        ((static_cast<long long>(actual_page) * page_size) + offset_in_page) * row;
-
     for (int i = threadIdx.x; i < row; i += blockDim.x) {
-        k_pages[dst + i] = k_curr[src + i];
-        v_pages[dst + i] = v_curr[src + i];
+        long long dst;
+        if constexpr (HND_LAYOUT) {
+            const int h = i / d;
+            const int j = i - h * d;
+            dst = ((static_cast<long long>(actual_page) * h_kv + h) *
+                   page_size + offset_in_page) * d + j;
+        } else {
+            dst = ((static_cast<long long>(actual_page) * page_size) +
+                   offset_in_page) * row + i;
+        }
+        k_pages[dst] = k_curr[src + i];
+        v_pages[dst] = v_curr[src + i];
     }
 }
 
@@ -488,16 +496,27 @@ void launch_write_kv_to_pages_bf16(
     int page_size,
     int num_kv_heads,
     int head_dim,
+    bool hnd_layout,
     cudaStream_t stream)
 {
     constexpr int BLOCK = 256;
-    write_kv_kernel<<<total_tokens, BLOCK, 0, stream>>>(
-        static_cast<const __nv_bfloat16*>(k_curr),
-        static_cast<const __nv_bfloat16*>(v_curr),
-        static_cast<__nv_bfloat16*>(k_pages),
-        static_cast<__nv_bfloat16*>(v_pages),
-        qo_indptr, kv_page_indices, kv_page_indptr, kv_last_page_lens,
-        num_requests, page_size, num_kv_heads, head_dim);
+    if (hnd_layout) {
+        write_kv_kernel<true><<<total_tokens, BLOCK, 0, stream>>>(
+            static_cast<const __nv_bfloat16*>(k_curr),
+            static_cast<const __nv_bfloat16*>(v_curr),
+            static_cast<__nv_bfloat16*>(k_pages),
+            static_cast<__nv_bfloat16*>(v_pages),
+            qo_indptr, kv_page_indices, kv_page_indptr, kv_last_page_lens,
+            num_requests, page_size, num_kv_heads, head_dim);
+    } else {
+        write_kv_kernel<false><<<total_tokens, BLOCK, 0, stream>>>(
+            static_cast<const __nv_bfloat16*>(k_curr),
+            static_cast<const __nv_bfloat16*>(v_curr),
+            static_cast<__nv_bfloat16*>(k_pages),
+            static_cast<__nv_bfloat16*>(v_pages),
+            qo_indptr, kv_page_indices, kv_page_indptr, kv_last_page_lens,
+            num_requests, page_size, num_kv_heads, head_dim);
+    }
 }
 
 void launch_write_kv_to_pages(
@@ -520,7 +539,7 @@ void launch_write_kv_to_pages(
             layer.k_pages, layer.v_pages, k_curr, v_curr,
             qo_indptr, kv_page_indices, kv_page_indptr, kv_last_page_lens,
             total_tokens, num_requests, page_size, num_kv_heads, head_dim,
-            stream);
+            layer.hnd_layout, stream);
         return;
     }
 

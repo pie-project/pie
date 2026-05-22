@@ -126,6 +126,9 @@ add_library(pie_driver_cuda_lib STATIC
   src/ops/attention_naive.cu
   src/ops/attention_naive_paged.cu
   src/ops/attention_xqa.cu
+  src/ops/attention_xqa_gqa2.cu
+  src/ops/attention_xqa_gqa2_p16.cu
+  src/ops/attention_xqa_gqa4.cu
   src/ops/attention_xqa_gqa8.cu
   src/kernels/rmsnorm.cu
   src/kernels/embed.cu

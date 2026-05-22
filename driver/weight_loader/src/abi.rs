@@ -11,8 +11,8 @@ use crate::source::{
 };
 use crate::storage::StorageTarget;
 use crate::types::{
-    Axis, DType, Encoding, Layout, Mxfp4MoePolicy, QuantScheme, QuantSpec, RepackLayout,
-    RepackSpec, RowMap, Sharding, TensorId,
+    Axis, BackendKind, DType, Encoding, Layout, Mxfp4MoePolicy, QuantScheme, QuantSpec,
+    RepackLayout, RepackSpec, RowMap, Sharding, TensorId,
 };
 use std::collections::HashSet;
 
@@ -123,12 +123,21 @@ struct DefaultAbiBuilder<'a> {
     tensors: Vec<RuntimeTensorContract>,
 }
 
+struct FusedProjectionCandidate {
+    output_name: String,
+    tensors: Vec<TensorId>,
+    rows: i64,
+    cols: i64,
+    bytes: u64,
+}
+
 impl DefaultAbiBuilder<'_> {
     fn build(&mut self) -> Result<(), CompileError> {
         let runtime_quant = self.runtime_quant_scheme()?;
         self.add_phi3_fused_splits()?;
         self.add_gpt_oss_mxfp4_groups()?;
         self.add_fused_moe_gate_up_tp_slices()?;
+        self.add_dense_fused_projection_joins(runtime_quant.is_some())?;
         for raw in &self.metadata.tensors {
             if self.consumed.contains(&raw.id) {
                 continue;
@@ -142,6 +151,162 @@ impl DefaultAbiBuilder<'_> {
             }
         }
         Ok(())
+    }
+
+    fn add_dense_fused_projection_joins(
+        &mut self,
+        runtime_quant_enabled: bool,
+    ) -> Result<(), CompileError> {
+        if self.target.backend != BackendKind::Cuda
+            || self.target.tp_size != 1
+            || runtime_quant_enabled
+        {
+            return Ok(());
+        }
+
+        let mut qkv_candidates = Vec::new();
+        let mut gate_up_candidates = Vec::new();
+        let mut qkv_bytes = 0u64;
+        let mut gate_up_bytes = 0u64;
+
+        for layer in 0..self.cfg.num_hidden_layers {
+            let p = format!("model.layers.{layer}.");
+            if let Some(candidate) = self.fused_join_candidate(
+                &(p.clone() + "self_attn.qkv_proj.fused.weight"),
+                &[
+                    p.clone() + "self_attn.q_proj.weight",
+                    p.clone() + "self_attn.k_proj.weight",
+                    p.clone() + "self_attn.v_proj.weight",
+                ],
+            )? {
+                qkv_bytes = qkv_bytes.checked_add(candidate.bytes).ok_or_else(|| {
+                    CompileError::InvalidInput("fused projection byte budget overflow".to_string())
+                })?;
+                qkv_candidates.push(candidate);
+            }
+            if let Some(candidate) = self.fused_join_candidate(
+                &(p.clone() + "mlp.gate_up_proj.fused.weight"),
+                &[
+                    p.clone() + "mlp.gate_proj.weight",
+                    p.clone() + "mlp.up_proj.weight",
+                ],
+            )? {
+                gate_up_bytes = gate_up_bytes.checked_add(candidate.bytes).ok_or_else(|| {
+                    CompileError::InvalidInput("fused projection byte budget overflow".to_string())
+                })?;
+                gate_up_candidates.push(candidate);
+            }
+        }
+
+        if qkv_candidates.is_empty() && gate_up_candidates.is_empty() {
+            return Ok(());
+        }
+
+        let budget = dense_fused_projection_budget_bytes();
+        let total_bytes = qkv_bytes.checked_add(gate_up_bytes).ok_or_else(|| {
+            CompileError::InvalidInput("fused projection byte budget overflow".to_string())
+        })?;
+        let mut candidates = Vec::new();
+        if total_bytes <= budget {
+            candidates.extend(qkv_candidates);
+            candidates.extend(gate_up_candidates);
+        } else {
+            // Prefer QKV fusion when the full duplicate set is too large. It
+            // is much smaller than gate/up on Qwen-style models and enables
+            // the fused decode postprocess without giving up large-model KV
+            // capacity. Gate/up is only enabled as a complete model-wide set
+            // when it also fits the remaining budget.
+            let mut used = 0u64;
+            if qkv_bytes <= budget {
+                used = qkv_bytes;
+                candidates.extend(qkv_candidates);
+            }
+            if gate_up_bytes <= budget.saturating_sub(used) {
+                candidates.extend(gate_up_candidates);
+            }
+        }
+        if candidates.is_empty() {
+            return Ok(());
+        }
+
+        for candidate in candidates {
+            for tensor in &candidate.tensors {
+                self.consumed.insert(*tensor);
+            }
+            self.tensors.push(RuntimeTensorContract {
+                output_name: candidate.output_name,
+                source: RuntimeTensorSource::Join {
+                    tensors: candidate.tensors,
+                    axis: Axis(0),
+                },
+                metadata: Vec::new(),
+                dtype: DType::BF16,
+                encoding: Encoding::Raw(DType::BF16),
+                shape: vec![candidate.rows, candidate.cols],
+                layout: Layout::dense(self.alignment()),
+                sharding: Sharding::replicated(),
+                alignment: self.alignment(),
+                shard_axis: None,
+            });
+        }
+
+        Ok(())
+    }
+
+    fn fused_join_candidate(
+        &self,
+        output_name: &str,
+        input_names: &[String],
+    ) -> Result<Option<FusedProjectionCandidate>, CompileError> {
+        if self
+            .metadata
+            .tensors
+            .iter()
+            .any(|raw| raw.name == output_name)
+        {
+            return Ok(None);
+        }
+
+        let mut tensors = Vec::with_capacity(input_names.len());
+        let mut rows = 0i64;
+        let mut cols: Option<i64> = None;
+        let mut bytes = 0u64;
+
+        for name in input_names {
+            let Some(raw) = self.metadata.tensors.iter().find(|raw| raw.name == *name) else {
+                return Ok(None);
+            };
+            if raw.shape.len() != 2 || raw.encoding != Encoding::Raw(DType::BF16) {
+                return Ok(None);
+            }
+            let current_cols = raw.shape[1];
+            if let Some(expected) = cols {
+                if current_cols != expected {
+                    return Ok(None);
+                }
+            } else {
+                cols = Some(current_cols);
+            }
+            tensors.push(raw.id);
+            rows = rows.checked_add(raw.shape[0]).ok_or_else(|| {
+                CompileError::InvalidInput(format!(
+                    "fused projection '{output_name}' row count overflow"
+                ))
+            })?;
+            bytes = bytes.checked_add(raw.span_bytes).ok_or_else(|| {
+                CompileError::InvalidInput(format!(
+                    "fused projection '{output_name}' byte count overflow"
+                ))
+            })?;
+        }
+
+        Ok(Some(FusedProjectionCandidate {
+            output_name: output_name.to_string(),
+            tensors,
+            rows,
+            cols: cols.unwrap_or(0),
+            bytes,
+        }))
     }
 
     fn alignment(&self) -> u32 {
@@ -776,6 +941,19 @@ fn dense_element_bytes(raw: &RawTensor, context: &str) -> Result<u64, CompileErr
             ))
         }),
     }
+}
+
+fn dense_fused_projection_budget_bytes() -> u64 {
+    // Fused dense projections replace the original TP1 BF16 tensors. The
+    // unfused fallback binds non-owning views into the fused buffer, so this is
+    // no longer a persistent duplicate-memory budget. The threshold now
+    // selects which groups get a fused GEMM: all groups through 8B-class Qwen
+    // models, and QKV-only above that where gate/up fusion has regressed.
+    const DEFAULT_BUDGET: u64 = 10 * 1024 * 1024 * 1024;
+    std::env::var("PIE_CUDA_FUSED_PROJECTION_BUDGET_BYTES")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_BUDGET)
 }
 
 fn local_range(full: i64, target: &StorageTarget) -> Result<(i64, i64), CompileError> {

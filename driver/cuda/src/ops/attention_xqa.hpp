@@ -8,7 +8,7 @@
 
 namespace pie_cuda_driver::ops {
 
-// FlashInfer XQA decode specialization currently compiled into Pie.
+// FlashInfer XQA decode specializations currently compiled into Pie.
 // This is a torch-free wrapper over FlashInfer's csrc/xqa decode kernel.
 // It is intentionally narrow: unsupported shapes fall back to the existing
 // FlashInfer decode/prefill paths.

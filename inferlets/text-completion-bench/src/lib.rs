@@ -16,13 +16,7 @@
 //! Sampler matches `text-completion` (TopP, default temperature 0.6 /
 //! top_p 0.95) so workload shape is otherwise identical.
 
-use inferlet::{
-    Context, Result,
-    chat,
-    model::Model,
-    runtime,
-    sample::Sampler,
-};
+use inferlet::{Context, Result, chat, model::Model, runtime, sample::Sampler};
 use serde::{Deserialize, Serialize};
 
 #[derive(Deserialize)]
@@ -49,12 +43,24 @@ struct Input {
     /// chain-firing overlap with WASM time.
     #[serde(default)]
     wasm_delay_us: u64,
+    /// Decode and return full output text. The benchmark hot path only
+    /// needs token counts; text is reserved for explicit correctness dumps.
+    #[serde(default)]
+    return_text: bool,
 }
 
-fn default_max_tokens() -> usize { 256 }
-fn default_system() -> String { "You are a helpful, respectful and honest assistant.".into() }
-fn default_temperature() -> f32 { 0.6 }
-fn default_top_p() -> f32 { 0.95 }
+fn default_max_tokens() -> usize {
+    256
+}
+fn default_system() -> String {
+    "You are a helpful, respectful and honest assistant.".into()
+}
+fn default_temperature() -> f32 {
+    0.6
+}
+fn default_top_p() -> f32 {
+    0.95
+}
 
 #[derive(Serialize)]
 struct Output {
@@ -65,6 +71,7 @@ struct Output {
     /// not derived from char/4 nor from re-tokenisation of the text.
     num_output_tokens: usize,
     /// Decoded text — for spot-checking output quality.
+    #[serde(skip_serializing_if = "String::is_empty")]
     text: String,
 }
 
@@ -73,7 +80,6 @@ async fn main(input: Input) -> Result<Output> {
     let models = runtime::models();
     let model_name = models.first().ok_or("No models available")?;
     let model = Model::load(model_name)?;
-
     let mut ctx = Context::new(&model)?;
     ctx.system(&input.system).user(&input.prompt).cue();
 
@@ -90,7 +96,12 @@ async fn main(input: Input) -> Result<Output> {
         chat::stop_tokens(&model)
     };
 
-    let mut all_output_tokens: Vec<u32> = Vec::with_capacity(input.max_tokens);
+    let mut output_tokens: Vec<u32> = if input.return_text {
+        Vec::with_capacity(input.max_tokens)
+    } else {
+        Vec::new()
+    };
+    let mut num_output_tokens = 0usize;
     let mut g = ctx
         .generate(Sampler::TopP {
             temperature: input.temperature,
@@ -105,7 +116,10 @@ async fn main(input: Input) -> Result<Output> {
         if out.tokens.is_empty() {
             continue;
         }
-        all_output_tokens.extend(out.tokens.iter().copied());
+        num_output_tokens += out.tokens.len();
+        if input.return_text {
+            output_tokens.extend(out.tokens.iter().copied());
+        }
         // Sleep to simulate per-token inferlet WASM work. Yields the
         // CPU so chain-firing happening concurrently in the driver's
         // C++ thread can overlap. Skipped when wasm_delay_us == 0 (default).
@@ -114,11 +128,11 @@ async fn main(input: Input) -> Result<Output> {
         }
     }
 
-    let num_output_tokens = all_output_tokens.len();
-    let text = model
-        .tokenizer()
-        .decode(&all_output_tokens)
-        .unwrap_or_default();
+    let text = if input.return_text {
+        model.tokenizer().decode(&output_tokens).unwrap_or_default()
+    } else {
+        String::new()
+    };
 
     Ok(Output {
         num_prompt_tokens,

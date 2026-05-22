@@ -3,6 +3,8 @@
 #include <cublasLt.h>
 #include <cuda_runtime.h>
 
+#include <algorithm>
+#include <cstdlib>
 #include <cstdint>
 #include <stdexcept>
 #include <string>
@@ -25,6 +27,189 @@ void check(cublasStatus_t s, const char* expr) {
         throw std::runtime_error(std::string("cuBLAS error (") +
                                  std::to_string(static_cast<int>(s)) + "): " + expr);
     }
+}
+
+std::size_t cublaslt_bf16_workspace_bytes() {
+    static const std::size_t bytes = [] {
+        const char* v = std::getenv("PIE_CUBLASLT_BF16_WORKSPACE_MIB");
+        if (v == nullptr || v[0] == '\0') return 64ull * 1024ull * 1024ull;
+        const unsigned long long mib = std::strtoull(v, nullptr, 10);
+        if (mib == 0ull) return 64ull * 1024ull * 1024ull;
+        return static_cast<std::size_t>(mib) * 1024ull * 1024ull;
+    }();
+    return bytes;
+}
+
+struct Bf16LtCtx {
+    cublasLtHandle_t handle = nullptr;
+    void* workspace = nullptr;
+    std::size_t workspace_bytes = cublaslt_bf16_workspace_bytes();
+
+    static Bf16LtCtx& instance() {
+        static Bf16LtCtx ctx;
+        return ctx;
+    }
+
+    void ensure() {
+        if (!handle) check(cublasLtCreate(&handle), "cublasLtCreate");
+        if (!workspace) {
+            CUDA_CHECK(cudaMalloc(&workspace, workspace_bytes));
+        }
+    }
+};
+
+bool use_cublaslt_bf16() {
+    static const bool enabled = [] {
+        const char* v = std::getenv("PIE_CUBLASLT_BF16");
+        if (v == nullptr || v[0] == '\0') return true;
+        return v[0] != '0';
+    }();
+    return enabled;
+}
+
+int cublaslt_bf16_forced_algo_index() {
+    static const int index = [] {
+        const char* v = std::getenv("PIE_CUBLASLT_BF16_ALGO_INDEX");
+        if (v == nullptr || v[0] == '\0') return -1;
+        return std::max(0, std::atoi(v));
+    }();
+    return index;
+}
+
+int cublaslt_bf16_algo_index_for_shape(int N, int K) {
+    const int forced = cublaslt_bf16_forced_algo_index();
+    if (forced >= 0) return forced;
+    // Qwen3-0.6B's lm_head shape (K=1024, very wide N) consistently
+    // prefers the third returned Lt heuristic. Larger hidden sizes regress
+    // on that choice, so keep the old default for them.
+    if (K < 2048 && N >= 12288) return 2;
+    return 5;
+}
+
+int cublaslt_bf16_min_n(int K) {
+    static const int min_n = [] {
+        const char* v = std::getenv("PIE_CUBLASLT_BF16_MIN_N");
+        if (v == nullptr || v[0] == '\0') return -1;
+        return std::max(0, std::atoi(v));
+    }();
+    if (min_n >= 0) return min_n;
+    // Small hidden-size models (H=1024) only benefited from cuBLASLt on the
+    // very wide lm_head; routing their 2k/6k projection GEMMs through Lt was
+    // consistently slower. H=2048 keeps the previous threshold because the
+    // 1.7B-class models still prefer Lt for their 6k-wide MLP projection.
+    return K < 2048 ? 12288 : (K == 2048 ? 6144 : 12288);
+}
+
+int cublaslt_bf16_min_k() {
+    static const int min_k = [] {
+        const char* v = std::getenv("PIE_CUBLASLT_BF16_MIN_K");
+        if (v == nullptr || v[0] == '\0') return 1024;
+        return std::max(0, std::atoi(v));
+    }();
+    return min_k;
+}
+
+int cublaslt_bf16_max_n() {
+    static const int max_n = [] {
+        const char* v = std::getenv("PIE_CUBLASLT_BF16_MAX_N");
+        if (v == nullptr || v[0] == '\0') return 0;
+        return std::max(0, std::atoi(v));
+    }();
+    return max_n;
+}
+
+bool gemm_bf16_lt_impl(
+    cublasHandle_t cublas_handle,
+    const void* act, const void* W, void* y,
+    int M, int N, int K,
+    float beta)
+{
+    auto& ctx = Bf16LtCtx::instance();
+    ctx.ensure();
+
+    cublasLtMatmulDesc_t op_desc = nullptr;
+    cublasLtMatrixLayout_t a_desc = nullptr;
+    cublasLtMatrixLayout_t b_desc = nullptr;
+    cublasLtMatrixLayout_t c_desc = nullptr;
+    cublasLtMatmulPreference_t pref = nullptr;
+
+    cublasStatus_t st =
+        cublasLtMatmulDescCreate(
+            &op_desc, CUBLAS_COMPUTE_32F_FAST_16BF, CUDA_R_32F);
+    cublasOperation_t transa = CUBLAS_OP_T;
+    cublasOperation_t transb = CUBLAS_OP_N;
+    if (st == CUBLAS_STATUS_SUCCESS) {
+        st = cublasLtMatmulDescSetAttribute(
+            op_desc, CUBLASLT_MATMUL_DESC_TRANSA,
+            &transa, sizeof(transa));
+    }
+    if (st == CUBLAS_STATUS_SUCCESS) {
+        st = cublasLtMatmulDescSetAttribute(
+            op_desc, CUBLASLT_MATMUL_DESC_TRANSB,
+            &transb, sizeof(transb));
+    }
+    if (st == CUBLAS_STATUS_SUCCESS) {
+        st = cublasLtMatrixLayoutCreate(&a_desc, CUDA_R_16BF, K, N, K);
+    }
+    if (st == CUBLAS_STATUS_SUCCESS) {
+        st = cublasLtMatrixLayoutCreate(&b_desc, CUDA_R_16BF, K, M, K);
+    }
+    if (st == CUBLAS_STATUS_SUCCESS) {
+        st = cublasLtMatrixLayoutCreate(&c_desc, CUDA_R_16BF, N, M, N);
+    }
+    if (st == CUBLAS_STATUS_SUCCESS) {
+        st = cublasLtMatmulPreferenceCreate(&pref);
+    }
+    if (st == CUBLAS_STATUS_SUCCESS) {
+        st = cublasLtMatmulPreferenceSetAttribute(
+            pref, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
+            &ctx.workspace_bytes, sizeof(ctx.workspace_bytes));
+    }
+
+    cublasLtMatmulHeuristicResult_t heuristics[8]{};
+    int returned = 0;
+    if (st == CUBLAS_STATUS_SUCCESS) {
+        st = cublasLtMatmulAlgoGetHeuristic(
+            ctx.handle, op_desc, a_desc, b_desc, c_desc, c_desc,
+            pref, 8, heuristics, &returned);
+    }
+
+    bool ok = false;
+    if (st == CUBLAS_STATUS_SUCCESS) {
+        const float alpha = 1.f;
+        cudaStream_t stream = nullptr;
+        cublasGetStream(cublas_handle, &stream);
+        const int preferred = cublaslt_bf16_algo_index_for_shape(N, K);
+        const int begin = std::min(preferred, std::max(0, returned - 1));
+        for (int pass = 0; pass < 2 && !ok; ++pass) {
+            const int first = (pass == 0) ? begin : 0;
+            const int last = (pass == 0) ? begin + 1 : returned;
+            for (int i = first; i < last; ++i) {
+                if (pass == 1 && i == begin) continue;
+                st = cublasLtMatmul(
+                    ctx.handle, op_desc,
+                    &alpha,
+                    W, a_desc,
+                    act, b_desc,
+                    &beta,
+                    y, c_desc,
+                    y, c_desc,
+                    &heuristics[i].algo,
+                    ctx.workspace, ctx.workspace_bytes, stream);
+                if (st == CUBLAS_STATUS_SUCCESS) {
+                    ok = true;
+                    break;
+                }
+            }
+        }
+    }
+
+    if (pref) cublasLtMatmulPreferenceDestroy(pref);
+    if (c_desc) cublasLtMatrixLayoutDestroy(c_desc);
+    if (b_desc) cublasLtMatrixLayoutDestroy(b_desc);
+    if (a_desc) cublasLtMatrixLayoutDestroy(a_desc);
+    if (op_desc) cublasLtMatmulDescDestroy(op_desc);
+    return ok;
 }
 
 }  // namespace
@@ -59,6 +244,14 @@ void gemm_bf16_impl(
     float beta)
 {
     const float alpha = 1.f;
+    const int lt_max_n = cublaslt_bf16_max_n();
+    if (use_cublaslt_bf16() &&
+        N >= cublaslt_bf16_min_n(K) &&
+        K >= cublaslt_bf16_min_k() &&
+        (lt_max_n == 0 || N <= lt_max_n) &&
+        gemm_bf16_lt_impl(handle, act, W, y, M, N, K, beta)) {
+        return;
+    }
     const auto status = cublasGemmEx(
         handle,
         /*transa=*/CUBLAS_OP_T, /*transb=*/CUBLAS_OP_N,
