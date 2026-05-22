@@ -206,90 +206,18 @@ void run_format(const char* dtype) {
         layer, k_curr.data(), v_curr.data(),
         qo_indptr, kv_page_indices, kv_page_indptr, kv_last_page_lens,
         kTotalTokens, 1, nullptr);
+    pie_cuda_driver::kernels::launch_dequant_kv_cache_layer_to_bf16_active(
+        layer, kv_page_indices, 1, nullptr);
     CUDA_CHECK(cudaDeviceSynchronize());
 
-    const int scale_blocks = fmt.scheme == KvCacheScheme::Fp4Block
-        ? (kHeadDim + fmt.block_size - 1) / fmt.block_size
-        : 1;
-    std::vector<float> k_scales;
-    std::vector<float> v_scales;
-    if (fmt.has_side_scales()) {
-        k_scales.resize(kNumPages * kPageSize * kHeads * scale_blocks);
-        v_scales.resize(kNumPages * kPageSize * kHeads * scale_blocks);
-        CUDA_CHECK(cudaMemcpy(k_scales.data(), cache.k_scale(0),
-                              k_scales.size() * sizeof(float),
-                              cudaMemcpyDeviceToHost));
-        CUDA_CHECK(cudaMemcpy(v_scales.data(), cache.v_scale(0),
-                              v_scales.size() * sizeof(float),
-                              cudaMemcpyDeviceToHost));
-    }
-
-    const int packed_dim = fmt.scheme == KvCacheScheme::Fp4Block
-        ? (kHeadDim + 1) / 2
-        : kHeadDim;
-    const std::size_t storage_elems =
-        static_cast<std::size_t>(kNumPages) * kPageSize * kHeads * packed_dim;
-    std::vector<std::uint8_t> k_u8;
-    std::vector<std::uint8_t> v_u8;
-    std::vector<std::int8_t> k_i8;
-    std::vector<std::int8_t> v_i8;
-    if (fmt.storage_dtype == DType::INT8) {
-        k_i8.resize(storage_elems);
-        v_i8.resize(storage_elems);
-        CUDA_CHECK(cudaMemcpy(k_i8.data(), cache.k(0),
-                              storage_elems * sizeof(std::int8_t),
-                              cudaMemcpyDeviceToHost));
-        CUDA_CHECK(cudaMemcpy(v_i8.data(), cache.v(0),
-                              storage_elems * sizeof(std::int8_t),
-                              cudaMemcpyDeviceToHost));
-    } else {
-        k_u8.resize(storage_elems);
-        v_u8.resize(storage_elems);
-        CUDA_CHECK(cudaMemcpy(k_u8.data(), cache.k(0),
-                              storage_elems * sizeof(std::uint8_t),
-                              cudaMemcpyDeviceToHost));
-        CUDA_CHECK(cudaMemcpy(v_u8.data(), cache.v(0),
-                              storage_elems * sizeof(std::uint8_t),
-                              cudaMemcpyDeviceToHost));
-    }
-
-    auto cached_value = [&](bool value, int t, int h, int d) -> float {
-        const long long token_head =
-            (static_cast<long long>(kActivePage) * kPageSize + t) * kHeads + h;
-        if (fmt.scheme == KvCacheScheme::Fp8PerTensor ||
-            fmt.scheme == KvCacheScheme::Fp8PerTokenHead) {
-            const auto kind =
-                fmt.storage_dtype == DType::FP8_E5M2 ? __NV_E5M2 : __NV_E4M3;
-            const auto& raw = value ? v_u8 : k_u8;
-            const auto fp8 =
-                static_cast<__nv_fp8_storage_t>(
-                    raw[token_head * kHeadDim + d]);
-            const __half hval = __nv_cvt_fp8_to_halfraw(fp8, kind);
-            float out = __half2float(hval);
-            if (fmt.scheme == KvCacheScheme::Fp8PerTokenHead) {
-                const auto& scales = value ? v_scales : k_scales;
-                out *= scales[token_head];
-            }
-            return out;
-        }
-        if (fmt.scheme == KvCacheScheme::Int8PerTokenHead) {
-            const auto& raw = value ? v_i8 : k_i8;
-            const auto& scales = value ? v_scales : k_scales;
-            return static_cast<float>(raw[token_head * kHeadDim + d]) *
-                   scales[token_head];
-        }
-        if (fmt.scheme == KvCacheScheme::Fp4Block) {
-            const auto& raw = value ? v_u8 : k_u8;
-            const auto& scales = value ? v_scales : k_scales;
-            const long long packed_idx = token_head * packed_dim + d / 2;
-            const int shift = (d & 1) ? 4 : 0;
-            const std::uint8_t code = (raw[packed_idx] >> shift) & 0xf;
-            return fp4_value(code) *
-                   scales[token_head * scale_blocks +
-                          d / (fmt.block_size > 0 ? fmt.block_size : 16)];
-        }
-        return 0.f;
-    };
+    std::vector<__nv_bfloat16> k_out(kNumPages * kPageSize * kHeads * kHeadDim);
+    std::vector<__nv_bfloat16> v_out(kNumPages * kPageSize * kHeads * kHeadDim);
+    CUDA_CHECK(cudaMemcpy(k_out.data(), cache.k_for_attention(0),
+                          k_out.size() * sizeof(__nv_bfloat16),
+                          cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(v_out.data(), cache.v_for_attention(0),
+                          v_out.size() * sizeof(__nv_bfloat16),
+                          cudaMemcpyDeviceToHost));
 
     for (int t = 0; t < kTotalTokens; ++t) {
         for (int h = 0; h < kHeads; ++h) {
@@ -299,24 +227,33 @@ void run_format(const char* dtype) {
                 const std::string where =
                     std::string(dtype) + " token=" + std::to_string(t) +
                     " head=" + std::to_string(h) + " dim=" + std::to_string(d);
-                (void)dst;
-                assert_close(cached_value(false, t, h, d),
-                             expected_qdq(k_host, fmt, t, h, d), 0.025f,
+                assert_close(__bfloat162float(k_out[dst]),
+                             expected_qdq(k_host, fmt, t, h, d), 0.02f,
                              "K " + where);
-                assert_close(cached_value(true, t, h, d),
-                             expected_qdq(v_host, fmt, t, h, d), 0.025f,
+                assert_close(__bfloat162float(v_out[dst]),
+                             expected_qdq(v_host, fmt, t, h, d), 0.02f,
                              "V " + where);
             }
         }
     }
 
     if (fmt.has_side_scales()) {
+        const int blocks = fmt.scheme == KvCacheScheme::Fp4Block
+            ? (kHeadDim + fmt.block_size - 1) / fmt.block_size
+            : 1;
+        std::vector<float> k_scales(kNumPages * kPageSize * kHeads * blocks);
+        std::vector<float> v_scales(kNumPages * kPageSize * kHeads * blocks);
+        CUDA_CHECK(cudaMemcpy(k_scales.data(), cache.k_scale(0),
+                              k_scales.size() * sizeof(float),
+                              cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(v_scales.data(), cache.v_scale(0),
+                              v_scales.size() * sizeof(float),
+                              cudaMemcpyDeviceToHost));
         for (int t = 0; t < kTotalTokens; ++t) {
             for (int h = 0; h < kHeads; ++h) {
-                for (int b = 0; b < scale_blocks; ++b) {
+                for (int b = 0; b < blocks; ++b) {
                     const int idx =
-                        ((kActivePage * kPageSize + t) * kHeads + h) *
-                        scale_blocks + b;
+                        ((kActivePage * kPageSize + t) * kHeads + h) * blocks + b;
                     assert_close(k_scales[idx], expected_scale(k_host, fmt, t, h, b),
                                  1e-5f, std::string(dtype) + " K scale");
                     assert_close(v_scales[idx], expected_scale(v_host, fmt, t, h, b),

@@ -26,13 +26,12 @@ def run(args: argparse.Namespace):
         "model_path": args.model,
         "mem_fraction_static": args.gpu_mem_util,
         "disable_cuda_graph": args.sglang_disable_cuda_graph,
+        "disable_piecewise_cuda_graph": args.sglang_disable_piecewise_cuda_graph,
         "disable_radix_cache": True,
         "max_running_requests": max_running_requests,
         "tp_size": args.tp_size,
         "context_length": args.max_model_len,
     }
-    if args.sglang_disable_piecewise_cuda_graph:
-        engine_kwargs["disable_piecewise_cuda_graph"] = True
     if args.sglang_attention_backend:
         engine_kwargs["attention_backend"] = args.sglang_attention_backend
     if args.sglang_sampling_backend:

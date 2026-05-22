@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import argparse
-import os
 import time
 
 from common import (
@@ -15,53 +14,7 @@ from common import (
 )
 
 
-def visible_tp_uses_system_topology(tp_size: int) -> bool:
-    if tp_size <= 1:
-        return False
-    try:
-        import torch
-        import pynvml
-
-        if not torch.cuda.is_available() or torch.cuda.device_count() < 2:
-            return False
-        pynvml.nvmlInit()
-        n = min(tp_size, torch.cuda.device_count())
-        handles = []
-        for i in range(n):
-            prop = torch.cuda.get_device_properties(i)
-            bus_id = (
-                f"{prop.pci_domain_id:08x}:"
-                f"{prop.pci_bus_id:02x}:"
-                f"{prop.pci_device_id:02x}.0"
-            )
-            handles.append(pynvml.nvmlDeviceGetHandleByPciBusId(bus_id.encode()))
-        for i in range(n):
-            for j in range(i + 1, n):
-                level = pynvml.nvmlDeviceGetTopologyCommonAncestor(
-                    handles[i], handles[j],
-                )
-                if level >= pynvml.NVML_TOPOLOGY_SYSTEM:
-                    return True
-    except Exception:
-        return False
-    finally:
-        try:
-            pynvml.nvmlShutdown()  # type: ignore[name-defined]
-        except Exception:
-            pass
-    return False
-
-
-def maybe_disable_nccl_p2p_for_system_topology(tp_size: int) -> bool:
-    system_topology = visible_tp_uses_system_topology(tp_size)
-    if system_topology and os.environ.get("NCCL_P2P_DISABLE") is None:
-        os.environ["NCCL_P2P_DISABLE"] = "1"
-    return system_topology
-
-
 def run(args: argparse.Namespace):
-    system_topology = maybe_disable_nccl_p2p_for_system_topology(args.tp_size)
-
     from vllm import LLM, SamplingParams
 
     n = args.requests if args.mode == "latency" else args.num_requests
@@ -80,13 +33,12 @@ def run(args: argparse.Namespace):
         llm_kwargs["attention_config"] = {"backend": args.attention_backend}
     if args.enforce_eager:
         llm_kwargs["enforce_eager"] = True
-    if system_topology:
-        llm_kwargs["disable_custom_all_reduce"] = True
 
     llm = LLM(
         model=args.model,
         gpu_memory_utilization=args.gpu_mem_util,
         max_num_seqs=max_num_seqs,
+        max_num_batched_tokens=args.max_num_batched_tokens,
         tensor_parallel_size=args.tp_size,
         max_model_len=args.max_model_len,
         enable_prefix_caching=False,
@@ -133,6 +85,7 @@ def run(args: argparse.Namespace):
         config={
             "enable_prefix_caching": False,
             "max_num_seqs": max_num_seqs,
+            "max_num_batched_tokens": args.max_num_batched_tokens,
             "attention_backend": args.attention_backend,
             "enforce_eager": args.enforce_eager,
             "temperature": args.temperature,
@@ -150,6 +103,7 @@ def main() -> None:
     for sp in parser._subparsers._group_actions[0].choices.values():
         sp.add_argument("--attention-backend", default=None)
         sp.add_argument("--enforce-eager", action="store_true")
+        sp.add_argument("--max-num-batched-tokens", type=int, default=None)
     args = parser.parse_args()
     summary, results = run(args)
     finish(summary, results, args.json_out)

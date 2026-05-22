@@ -25,6 +25,7 @@ use scheduler::BatchScheduler;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering::Relaxed;
 
 pub use scheduler::SchedulerStats;
@@ -52,6 +53,14 @@ pub struct InferenceStats {
     pub last_batch_latency_us: u64,
     pub cumulative_batch_latency_us: u64,
     pub avg_batch_latency_us: u64,
+    pub avg_permit_wait_us: u64,
+    pub avg_fire_prepare_us: u64,
+    pub avg_execute_batch_us: u64,
+    pub avg_batch_build_us: u64,
+    pub avg_driver_fire_us: u64,
+    pub avg_response_dispatch_us: u64,
+    pub avg_context_tick_submit_us: u64,
+    pub avg_stats_update_us: u64,
 }
 
 // =============================================================================
@@ -118,6 +127,28 @@ pub async fn submit(
     extra_pages: Vec<PhysicalPageId>,
     last_page_len: u32,
 ) -> Result<ForwardOutput> {
+    let rx = submit_async(
+        model_idx,
+        request,
+        driver_idx,
+        physical_page_ids,
+        extra_pages,
+        last_page_len,
+        true,
+    )?;
+    rx.await
+        .map_err(|_| anyhow::anyhow!("inference submit: scheduler dropped response channel"))?
+}
+
+pub fn submit_async(
+    model_idx: usize,
+    request: pie_bridge::ForwardRequest,
+    driver_idx: usize,
+    physical_page_ids: Vec<PhysicalPageId>,
+    extra_pages: Vec<PhysicalPageId>,
+    last_page_len: u32,
+    allow_pass_speculation: bool,
+) -> Result<oneshot::Receiver<Result<ForwardOutput>>> {
     let (tx, rx) = oneshot::channel();
     SERVICES.send(
         model_idx,
@@ -127,11 +158,11 @@ pub async fn submit(
             physical_page_ids,
             extra_pages,
             last_page_len,
+            allow_pass_speculation,
             response: tx,
         },
     )?;
-    rx.await
-        .map_err(|_| anyhow::anyhow!("inference submit: scheduler dropped response channel"))?
+    Ok(rx)
 }
 
 /// Internal forward result shape passed from the scheduler to a waiting
@@ -264,6 +295,14 @@ impl InferenceService {
         let mut hist = [0u64; 8];
         let mut last_latency = 0u64;
         let mut cumulative_latency = 0u64;
+        let mut cumulative_permit_wait = 0u64;
+        let mut cumulative_fire_prepare = 0u64;
+        let mut cumulative_execute_batch = 0u64;
+        let mut cumulative_batch_build = 0u64;
+        let mut cumulative_driver_fire = 0u64;
+        let mut cumulative_response_dispatch = 0u64;
+        let mut cumulative_context_tick_submit = 0u64;
+        let mut cumulative_stats_update = 0u64;
 
         for s in &self.scheduler_stats {
             total_batches += s.total_batches.load(Relaxed);
@@ -276,14 +315,23 @@ impl InferenceService {
             }
             last_latency = last_latency.max(s.last_batch_latency_us.load(Relaxed));
             cumulative_latency += s.cumulative_latency_us.load(Relaxed);
+            cumulative_permit_wait += s.cumulative_permit_wait_us.load(Relaxed);
+            cumulative_fire_prepare += s.cumulative_fire_prepare_us.load(Relaxed);
+            cumulative_execute_batch += s.cumulative_execute_batch_us.load(Relaxed);
+            cumulative_batch_build += s.cumulative_batch_build_us.load(Relaxed);
+            cumulative_driver_fire += s.cumulative_driver_fire_us.load(Relaxed);
+            cumulative_response_dispatch += s.cumulative_response_dispatch_us.load(Relaxed);
+            cumulative_context_tick_submit += s.cumulative_context_tick_submit_us.load(Relaxed);
+            cumulative_stats_update += s.cumulative_stats_update_us.load(Relaxed);
         }
 
-        let avg_latency = if total_batches > 0 {
-            cumulative_latency / total_batches
-        } else {
-            0
+        let avg = |value: u64| {
+            if total_batches > 0 {
+                value / total_batches
+            } else {
+                0
+            }
         };
-
         InferenceStats {
             total_batches,
             total_tokens_processed: total_tokens,
@@ -292,7 +340,15 @@ impl InferenceService {
             batch_size_hist: hist,
             last_batch_latency_us: last_latency,
             cumulative_batch_latency_us: cumulative_latency,
-            avg_batch_latency_us: avg_latency,
+            avg_batch_latency_us: avg(cumulative_latency),
+            avg_permit_wait_us: avg(cumulative_permit_wait),
+            avg_fire_prepare_us: avg(cumulative_fire_prepare),
+            avg_execute_batch_us: avg(cumulative_execute_batch),
+            avg_batch_build_us: avg(cumulative_batch_build),
+            avg_driver_fire_us: avg(cumulative_driver_fire),
+            avg_response_dispatch_us: avg(cumulative_response_dispatch),
+            avg_context_tick_submit_us: avg(cumulative_context_tick_submit),
+            avg_stats_update_us: avg(cumulative_stats_update),
         }
     }
 }
@@ -315,6 +371,7 @@ enum Message {
         /// full reserved range without re-allocating.
         extra_pages: Vec<PhysicalPageId>,
         last_page_len: u32,
+        allow_pass_speculation: bool,
         response: oneshot::Sender<Result<ForwardOutput>>,
     },
     GetStats {
@@ -337,6 +394,7 @@ impl ServiceHandler for InferenceService {
                 physical_page_ids,
                 extra_pages,
                 last_page_len,
+                allow_pass_speculation,
                 response,
             } => {
                 let idx = driver_idx.min(self.num_drivers.saturating_sub(1));
@@ -365,7 +423,13 @@ impl ServiceHandler for InferenceService {
                             if Some(front.anchor_token) == req_token
                                 && Some(front.anchor_pos) == req_pos
                             {
-                                return deque.pop_front();
+                                let entry = deque.pop_front();
+                                if let Some(entry) = entry.as_ref() {
+                                    if !allow_pass_speculation {
+                                        entry.allow_extend.store(false, Relaxed);
+                                    }
+                                }
+                                return entry;
                             }
                         }
                         // Fingerprint mismatch — drop the entire chain.
@@ -378,8 +442,9 @@ impl ServiceHandler for InferenceService {
                 let scheduler_handle = self.schedulers[idx].handle();
                 let staged_batch_arc = self.staged_batch[idx].clone();
                 let request_clone = request.clone();
-                let speculation_depth = if crate::context::pinned_count(idx) <= 1
+                let speculation_depth = if allow_pass_speculation
                     && request_clone.rs_slot_ids.is_empty()
+                    && request_clone.spec_token_ids.is_empty()
                 {
                     self.speculation_depth
                 } else {
@@ -424,6 +489,7 @@ impl ServiceHandler for InferenceService {
                     cur_page_idx,
                     last_page_len,
                     speculation_depth,
+                    Arc::new(AtomicBool::new(allow_pass_speculation)),
                 );
             }
             Message::GetStats { response } => {

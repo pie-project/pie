@@ -3,8 +3,6 @@
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
 
-#include <stdexcept>
-
 #include "cuda_check.hpp"
 
 namespace pie_cuda_driver::kernels {
@@ -492,7 +490,6 @@ void launch_write_kv_to_pages_bf16(
     int head_dim,
     cudaStream_t stream)
 {
-    if (total_tokens <= 0 || num_requests <= 0) return;
     constexpr int BLOCK = 256;
     write_kv_kernel<<<total_tokens, BLOCK, 0, stream>>>(
         static_cast<const __nv_bfloat16*>(k_curr),
@@ -501,7 +498,6 @@ void launch_write_kv_to_pages_bf16(
         static_cast<__nv_bfloat16*>(v_pages),
         qo_indptr, kv_page_indices, kv_page_indptr, kv_last_page_lens,
         num_requests, page_size, num_kv_heads, head_dim);
-    CUDA_CHECK(cudaGetLastError());
 }
 
 void launch_write_kv_to_pages(
@@ -516,7 +512,6 @@ void launch_write_kv_to_pages(
     int num_requests,
     cudaStream_t stream)
 {
-    if (total_tokens <= 0 || num_requests <= 0) return;
     const int page_size = layer.page_size;
     const int num_kv_heads = layer.num_kv_heads;
     const int head_dim = layer.head_dim;
@@ -600,10 +595,6 @@ void launch_dequant_kv_cache_layer_to_bf16_active(
     cudaStream_t stream)
 {
     if (layer.is_native_bf16() || num_pages_in_batch <= 0) return;
-    if (layer.k_bf16_pages == nullptr || layer.v_bf16_pages == nullptr) {
-        throw std::runtime_error(
-            "kv_cache dequant: quantized caches no longer keep a full BF16 mirror");
-    }
     constexpr int BLOCK = 256;
     const int page_elems = layer.page_size * layer.num_kv_heads * layer.head_dim;
     const long long logical_n =

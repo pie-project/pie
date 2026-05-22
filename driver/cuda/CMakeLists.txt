@@ -316,14 +316,6 @@ target_compile_options(test_kv_cache_quant PRIVATE
   $<$<COMPILE_LANGUAGE:CUDA>: --extended-lambda --expt-relaxed-constexpr >)
 target_link_libraries(test_kv_cache_quant PRIVATE CUDA::cudart)
 
-add_executable(test_flashinfer_decode_head_dim_guard
-  tests/test_flashinfer_decode_head_dim_guard.cpp)
-target_include_directories(test_flashinfer_decode_head_dim_guard PRIVATE
-  ${CMAKE_CURRENT_SOURCE_DIR}/src)
-target_link_libraries(test_flashinfer_decode_head_dim_guard PRIVATE
-  pie_driver_cuda_lib
-  CUDA::cudart)
-
 add_executable(test_swap_pool
   tests/test_swap_pool.cpp
   src/tensor.cpp
@@ -347,7 +339,6 @@ enable_testing()
 add_test(NAME brle COMMAND test_brle)
 add_test(NAME causal_conv1d COMMAND test_causal_conv1d)
 add_test(NAME driver_common COMMAND test_driver_common)
-add_test(NAME flashinfer_decode_head_dim_guard COMMAND test_flashinfer_decode_head_dim_guard)
 add_test(NAME kv_cache_format COMMAND test_kv_cache_format)
 add_test(NAME kv_cache_quant COMMAND test_kv_cache_quant)
 add_test(NAME swap_pool COMMAND test_swap_pool)

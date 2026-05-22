@@ -14,15 +14,23 @@ import torch
 
 from ._bridge.batching import Batch
 
+TOKEN_SAMPLING_TYPES = frozenset({1, 2, 3, 4, 5})
+
+
+def _as_i32_cpu(a: np.ndarray) -> np.ndarray:
+    return np.asarray(a, dtype=np.int32)
+
 
 def _shared_kv_inputs(batch: Batch, device: torch.device) -> dict[str, Any]:
     return {
         "kv_page_indices": torch.as_tensor(
             batch.kv_page_indices, device=device, dtype=torch.int32
         ).contiguous(),
+        "kv_page_indices_cpu": _as_i32_cpu(batch.kv_page_indices),
         "kv_page_indptr": torch.as_tensor(
             batch.kv_page_indptr, device=device, dtype=torch.int32
         ).contiguous(),
+        "kv_page_indptr_cpu": _as_i32_cpu(batch.kv_page_indptr),
     }
 
 
@@ -68,10 +76,12 @@ def build_model_inputs(batch: Batch, device: torch.device) -> dict[str, Any]:
             batch.position_ids, device=device, dtype=torch.int32
         ),
         "qo_indptr": torch.as_tensor(batch.qo_indptr, device=device, dtype=torch.int32),
+        "qo_indptr_cpu": _as_i32_cpu(batch.qo_indptr),
         **_shared_kv_inputs(batch, device),
         "kv_last_page_lens": torch.as_tensor(
             batch.kv_last_page_lens, device=device, dtype=torch.int32
         ),
+        "kv_last_page_lens_cpu": _as_i32_cpu(batch.kv_last_page_lens),
         "custom_mask": (
             torch.as_tensor(batch.attention_masks, device=device, dtype=torch.bool)
             if batch.attention_masks is not None
@@ -161,10 +171,12 @@ def build_spec_expanded_model_inputs(
             position_ids_ext, device=device, dtype=torch.int32
         ),
         "qo_indptr": torch.as_tensor(qo_indptr_ext, device=device, dtype=torch.int32),
+        "qo_indptr_cpu": _as_i32_cpu(qo_indptr_ext),
         **_shared_kv_inputs(batch, device),
         "kv_last_page_lens": torch.as_tensor(
             kv_last_page_lens_ext, device=device, dtype=torch.int32
         ),
+        "kv_last_page_lens_cpu": _as_i32_cpu(kv_last_page_lens_ext),
         "custom_mask": torch.as_tensor(
             attention_masks_ext, device=device, dtype=torch.bool
         ),
@@ -181,6 +193,51 @@ def build_sampling_metadata(
         return {"indices_for_logits": None}
 
     indices_for_logits = batch.indices_for_logits
+    all_logits_in_order = (
+        len(indices_for_logits) == batch.total_tokens
+        and (
+            not indices_for_logits
+            or (
+                indices_for_logits[0] == 0
+                and indices_for_logits[-1] == len(indices_for_logits) - 1
+                and all(i == idx for i, idx in enumerate(indices_for_logits))
+            )
+        )
+    )
+
+    sampler_groups: dict[int, list[int]] = {}
+    for i, sampler_idx in enumerate(batch.sampler_types):
+        sampler_groups.setdefault(sampler_idx, []).append(i)
+    all_temperatures_greedy = bool(np.all(batch.temperatures <= 1e-5))
+    all_token_samplers = bool(sampler_groups) and all(
+        sampler_idx in TOKEN_SAMPLING_TYPES for sampler_idx in sampler_groups
+    )
+
+    sampling_masks = (
+        torch.as_tensor(batch.sampling_masks, device=device, dtype=torch.bool)
+        if batch.sampling_masks is not None
+        else (
+            torch.as_tensor(
+                np.repeat(batch.logit_masks, batch.indices_per_request, axis=0),
+                device=device,
+                dtype=torch.bool,
+            )
+            if batch.logit_masks is not None
+            else None
+        )
+    )
+
+    metadata = {
+        "indices_for_logits": indices_for_logits,
+        "all_logits_in_order": all_logits_in_order,
+        "all_temperatures_greedy": all_temperatures_greedy,
+        "all_token_samplers": all_token_samplers,
+        "sampler_groups": sampler_groups,
+        "sampling_masks": sampling_masks,
+    }
+
+    if all_temperatures_greedy and all_token_samplers:
+        return metadata
 
     temperatures = (
         torch.tensor(batch.temperatures, device=device, dtype=dtype)
@@ -192,10 +249,6 @@ def build_sampling_metadata(
     top_p_tensor = torch.tensor(batch.top_p_values, device=device, dtype=dtype)
     min_p_tensor = torch.tensor(batch.min_p_values, device=device, dtype=dtype)
 
-    sampler_groups: dict[int, list[int]] = {}
-    for i, sampler_idx in enumerate(batch.sampler_types):
-        sampler_groups.setdefault(sampler_idx, []).append(i)
-
     seeds_tensor = (
         torch.as_tensor(
             batch.sampler_seeds_arr.astype(np.int64),
@@ -206,31 +259,16 @@ def build_sampling_metadata(
         else None
     )
 
-    return {
-        "indices_for_logits": indices_for_logits,
+    metadata.update({
         "temperatures": temperatures,
-        "greedy_mask": batch.temperatures <= 0.0,
-        "sampler_groups": sampler_groups,
         "top_k": top_k_tensor,
         "top_p": top_p_tensor,
         "min_p": min_p_tensor,
         "seeds": seeds_tensor,
         "sampler_label_ids": batch.sampler_label_ids,
         "sampler_label_indptr": batch.sampler_label_indptr,
-        "sampling_masks": (
-            torch.as_tensor(batch.sampling_masks, device=device, dtype=torch.bool)
-            if batch.sampling_masks is not None
-            else (
-                torch.as_tensor(
-                    np.repeat(batch.logit_masks, batch.indices_per_request, axis=0),
-                    device=device,
-                    dtype=torch.bool,
-                )
-                if batch.logit_masks is not None
-                else None
-            )
-        ),
-    }
+    })
+    return metadata
 
 
 def build_spec_expanded_sampling_metadata(

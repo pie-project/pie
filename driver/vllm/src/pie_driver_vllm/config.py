@@ -6,10 +6,13 @@ where Pie exposes a backend policy knob:
     attention_backend = "FLASHINFER"      → EngineArgs.attention_backend
     enforce_eager = false                 → EngineArgs.enforce_eager
     gpu_memory_utilization = 0.85         → EngineArgs.gpu_memory_utilization
+    max_num_seqs = 64                     → EngineArgs.max_num_seqs
+    max_num_batched_tokens = 8192         → EngineArgs.max_num_batched_tokens
+    max_model_len = 2048                  → EngineArgs.max_model_len
     ...
 
-Batch capacity knobs are optional: when omitted, vLLM resolves them at
-startup and Pie reports the result through DriverCapabilities.
+Unset batch capacity knobs stay internal: vLLM resolves them at startup and
+Pie reports the result through DriverCapabilities.
 """
 
 from __future__ import annotations
@@ -26,21 +29,20 @@ class VllmDriverConfig:
     attention_backend: str | None = None
 
     # If True, vllm runs eager (no torch.compile, no CUDA graphs).
-    # None lets the driver choose a safe default for the local topology.
-    enforce_eager: bool | None = None
-
-    # If True, vllm uses NCCL collectives instead of its custom all-reduce.
-    # None lets the driver auto-disable custom all-reduce on system-level PCIe
-    # topologies where NCCL P2P must also be disabled to avoid TP startup hangs.
-    disable_custom_all_reduce: bool | None = None
+    enforce_eager: bool = False
 
     # Fraction of free GPU memory to use for KV cache + activations.
     gpu_memory_utilization: float = 0.9
 
-    # Capacity knobs forwarded to vLLM EngineArgs. None = let vLLM choose.
-    max_model_len: int | None = None
+    # Optional active-sequence cap. None = let vllm choose.
     max_num_seqs: int | None = None
+
+    # Optional per-step token budget. None = let the loader choose a safe
+    # compile range for Pie's scheduler.
     max_num_batched_tokens: int | None = None
+
+    # Optional model context length. None = let vLLM use the model default.
+    max_model_len: int | None = None
 
     # ---- Speculative decoding (NGRAM, driver-supplied drafts) ----
     # When True, VllmEngine.spec_step proposes linear draft continuations.

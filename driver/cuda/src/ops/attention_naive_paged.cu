@@ -10,6 +10,8 @@
 
 #include "cuda_check.hpp"
 
+#include "kernels/kv_paged.hpp"
+
 namespace pie_cuda_driver::ops {
 
 namespace {
@@ -637,6 +639,34 @@ void launch_attention_naive_paged_custom(
         logits_soft_cap,
         lse_out);
     CUDA_CHECK(cudaGetLastError());
+}
+
+void launch_attention_naive_paged(
+    const void* q,
+    KvCacheLayerView kv_layer,
+    void* o,
+    const std::uint32_t* qo_indptr_d,
+    const std::uint32_t* kv_page_indices_d,
+    const std::uint32_t* kv_page_indptr_d,
+    const std::uint32_t* kv_last_page_lens_d,
+    int total_tokens,
+    int num_requests,
+    int num_pages_in_batch,
+    int num_q_heads,
+    cudaStream_t stream,
+    int window_left,
+    float sm_scale)
+{
+    kernels::launch_dequant_kv_cache_layer_to_bf16_active(
+        kv_layer, kv_page_indices_d, num_pages_in_batch, stream);
+    launch_attention_naive_paged_bf16(
+        q,
+        kv_layer.k_bf16_pages,
+        kv_layer.v_bf16_pages,
+        o,
+        qo_indptr_d, kv_page_indices_d, kv_page_indptr_d, kv_last_page_lens_d,
+        total_tokens, num_requests, num_q_heads, kv_layer.num_kv_heads,
+        kv_layer.head_dim, kv_layer.page_size, stream, window_left, sm_scale);
 }
 
 }  // namespace pie_cuda_driver::ops

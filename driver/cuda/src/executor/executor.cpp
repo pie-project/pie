@@ -372,9 +372,8 @@ void tp_broadcast_inputs(NcclComm& comm, PersistentInputs& pi,
     // to parse sizes before posting matching payload broadcasts).
     CUDA_CHECK(cudaMemcpyAsync(d_hdr, &hdr, sizeof(hdr),
                                cudaMemcpyHostToDevice, stream));
-    NCCL_CHECK_ASYNC(ncclBroadcast(d_hdr, d_hdr, sizeof(hdr), ncclChar, 0,
-                                   comm.comm(), stream),
-                     comm.comm());
+    NCCL_CHECK(ncclBroadcast(d_hdr, d_hdr, sizeof(hdr), ncclChar, 0,
+                             comm.comm(), stream));
     // Group the payload broadcasts so NCCL submits them as a single batch
     // — tens of microseconds of host-side launch overhead saved per fire,
     // most visible at small batch sizes (decode where each broadcast is
@@ -427,7 +426,7 @@ void tp_broadcast_inputs(NcclComm& comm, PersistentInputs& pi,
                                  static_cast<std::size_t>(logit_rows) * 4,
                                  ncclChar, 0, comm.comm(), stream));
     }
-    NCCL_CHECK_ASYNC(ncclGroupEnd(), comm.comm());
+    NCCL_CHECK(ncclGroupEnd());
 }
 
 }  // namespace
@@ -1380,9 +1379,8 @@ void tp_follower_serve(Executor& executor, std::atomic<bool>& stop) {
     while (!stop.load()) {
         tp_cpu_gate_wait(executor.tp_cpu_gate_key, cpu_gate_seq, stop);
         // 1. Receive header.
-        NCCL_CHECK_ASYNC(ncclBroadcast(d_hdr, d_hdr, sizeof(TpFireHeader),
-                                       ncclChar, 0, comm.comm(), stream),
-                         comm.comm());
+        NCCL_CHECK(ncclBroadcast(d_hdr, d_hdr, sizeof(TpFireHeader),
+                                 ncclChar, 0, comm.comm(), stream));
         TpFireHeader hdr{};
         CUDA_CHECK(cudaMemcpyAsync(&hdr, d_hdr, sizeof(hdr),
                                    cudaMemcpyDeviceToHost, stream));
@@ -1455,7 +1453,7 @@ void tp_follower_serve(Executor& executor, std::atomic<bool>& stop) {
                                      static_cast<std::size_t>(logit_rows) * 4,
                                      ncclChar, 0, comm.comm(), stream));
         }
-        NCCL_CHECK_ASYNC(ncclGroupEnd(), comm.comm());
+        NCCL_CHECK(ncclGroupEnd());
 
         // 3. Pull the host views of qo/kv_page indptrs for the per-arch
         // attention planner (lives outside the captured kernel sequence).
@@ -1566,9 +1564,8 @@ void tp_send_shutdown(NcclComm& comm, const std::string& cpu_gate_key) {
     TpFireHeader hdr{TP_STOP_MAGIC, 0, 0, 0, 0, 0, 0, 0, 0, 0};
     CUDA_CHECK(cudaMemcpyAsync(d_hdr, &hdr, sizeof(hdr),
                                cudaMemcpyHostToDevice, stream));
-    NCCL_CHECK_ASYNC(ncclBroadcast(d_hdr, d_hdr, sizeof(hdr), ncclChar, 0,
-                                   comm.comm(), stream),
-                     comm.comm());
+    NCCL_CHECK(ncclBroadcast(d_hdr, d_hdr, sizeof(hdr), ncclChar, 0,
+                             comm.comm(), stream));
     CUDA_CHECK(cudaStreamSynchronize(stream));
 }
 

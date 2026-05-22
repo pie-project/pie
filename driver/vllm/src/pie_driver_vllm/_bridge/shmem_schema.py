@@ -20,6 +20,9 @@ that compare against old `sampler_type` constants keep working.
 """
 from __future__ import annotations
 
+import os
+import struct
+import time
 from typing import Any
 
 import numpy as np
@@ -36,6 +39,31 @@ _SPECIAL_SAMPLERS = frozenset({
     9,   # LOGPROBS
     10,  # ENTROPY
 })
+
+_EMPTY_U32 = np.empty(0, dtype=np.uint32)
+_EMPTY_F32 = np.empty(0, dtype=np.float32)
+_ZERO_U32_CACHE: dict[int, np.ndarray] = {}
+_ARANGE_U32_CACHE: dict[int, np.ndarray] = {}
+_FAST_TOKEN_RESPONSE_MAGIC = b"PIETFWD1"
+_FAST_TOKEN_RESPONSE_ENABLED = os.environ.get(
+    "PIE_SHMEM_TOKEN_FAST_RESPONSE", "1"
+).lower() not in {"0", "false", "no", "off"}
+
+
+def _zeros_u32(n: int) -> np.ndarray:
+    cached = _ZERO_U32_CACHE.get(n)
+    if cached is None:
+        cached = np.zeros(n, dtype=np.uint32)
+        _ZERO_U32_CACHE[n] = cached
+    return cached
+
+
+def _arange_u32(n: int) -> np.ndarray:
+    cached = _ARANGE_U32_CACHE.get(n)
+    if cached is None:
+        cached = np.arange(n, dtype=np.uint32)
+        _ARANGE_U32_CACHE[n] = cached
+    return cached
 
 # Map new bridge sampler kind (index in the rkyv `Sampler` enum) to the
 # legacy `sampler_type` u32 ID space.
@@ -189,6 +217,7 @@ def _forward_to_dict(fr, *, driver_id: int) -> dict[str, Any]:
         "spec_position_ids": np.asarray(fr.spec_position_ids, dtype=np.uint32),
         "spec_indptr": np.asarray(fr.spec_indptr, dtype=np.uint32),
         "output_spec_flags": list(fr.output_spec_flags),
+        "context_ids": [int(x) for x in fr.context_ids],
         "single_token_mode": bool(fr.single_token_mode),
         # Sampler SoA — legacy schema.
         "sampler_types": np.asarray(sampler_types, dtype=np.uint32),
@@ -282,10 +311,11 @@ class ResponseBuilder:
     Reuse one instance across iterations; `reset` clears state.
     """
 
-    __slots__ = ("_requests",)
+    __slots__ = ("_requests", "last_profile")
 
     def __init__(self) -> None:
         self._requests: list[dict[str, Any]] = []
+        self.last_profile: dict[str, float] | None = None
 
     def reset(self) -> None:
         self._requests.clear()
@@ -326,6 +356,9 @@ class ResponseBuilder:
         sampler_types = batch.sampler_types  # list[int] in legacy IDs
         spec_accepted = sampling_results.get("spec_accepted_tokens")
         spec_tokens_all = sampling_results.get("spec_tokens")
+        profile_enabled = bool(os.environ.get("PIE_VLLM_PROFILE"))
+        profile: dict[str, float] | None = {} if profile_enabled else None
+        t0 = time.perf_counter() if profile_enabled else 0.0
 
         # Fast path: no special samplers, no spec output.
         fast_path = (
@@ -335,57 +368,114 @@ class ResponseBuilder:
             and not any(t in _SPECIAL_SAMPLERS for t in sampler_types)
         )
 
-        self.reset()
         if fast_path:
-            return self._build_token_only(
-                driver_id,
+            if profile is not None:
+                profile["fast_path_ratio"] = 1.0
+                profile["classify"] = time.perf_counter() - t0
+            result = self._build_token_only(
                 batch.request_output_counts,
                 sampling_results["tokens"],
+                driver_id,
                 dst_buf=dst_buf,
+                profile=profile,
             )
+            self.last_profile = profile
+            return result
 
+        if profile is not None:
+            profile["fast_path_ratio"] = 0.0
+            profile["classify"] = time.perf_counter() - t0
+        self.reset()
+        fill_start = time.perf_counter() if profile_enabled else 0.0
         self._fill_full(batch.create_responses(sampling_results))
-
-        return self.build(driver_id, dst_buf=dst_buf)
+        if profile is not None:
+            profile["fill_full"] = time.perf_counter() - fill_start
+        result = self.build(driver_id, dst_buf=dst_buf, profile=profile)
+        self.last_profile = profile
+        return result
 
     def _build_token_only(
         self,
-        driver_id: int,
         counts,
         tokens,
+        driver_id: int,
         dst_buf=None,
+        profile: dict[str, float] | None = None,
     ) -> int | bytes:
         """Serialize the common token-only response without per-request dicts."""
+        t0 = time.perf_counter() if profile is not None else 0.0
         counts_np = np.asarray(counts, dtype=np.uint32)
-        tokens_indptr = np.empty(counts_np.size + 1, dtype=np.uint32)
-        tokens_indptr[0] = 0
-        if counts_np.size:
-            np.cumsum(counts_np, out=tokens_indptr[1:])
-        tokens_np = np.asarray(tokens, dtype=np.uint32)
+        num_requests = int(counts_np.shape[0])
+        if profile is not None:
+            profile["counts"] = time.perf_counter() - t0
 
-        empty_u32 = np.empty(0, dtype=np.uint32)
-        empty_f32 = np.empty(0, dtype=np.float32)
+        t0 = time.perf_counter() if profile is not None else 0.0
+        if hasattr(tokens, "to_numpy_u32"):
+            tokens_np = tokens.to_numpy_u32()
+        else:
+            tokens_np = np.asarray(tokens, dtype=np.uint32)
+        if profile is not None:
+            profile["tokens_to_numpy"] = time.perf_counter() - t0
+
+        if (
+            int(tokens_np.shape[0]) == num_requests
+            and (num_requests == 0 or bool(np.all(counts_np == 1)))
+        ):
+            if _FAST_TOKEN_RESPONSE_ENABLED:
+                t0 = time.perf_counter() if profile is not None else 0.0
+                tokens_np = np.ascontiguousarray(tokens_np, dtype=np.uint32)
+                header = struct.pack(
+                    "<8sIII",
+                    _FAST_TOKEN_RESPONSE_MAGIC,
+                    int(driver_id),
+                    num_requests,
+                    int(tokens_np.shape[0]),
+                )
+                result = header + tokens_np.tobytes()
+                if profile is not None:
+                    profile["serialize"] = time.perf_counter() - t0
+                    profile["bytes"] = float(len(result))
+                return result
+            tokens_indptr = _arange_u32(num_requests + 1)
+        else:
+            t0 = time.perf_counter() if profile is not None else 0.0
+            tokens_indptr = np.empty(num_requests + 1, dtype=np.uint32)
+            tokens_indptr[0] = 0
+            np.cumsum(counts_np, out=tokens_indptr[1:])
+            if profile is not None:
+                profile["indptr"] = time.perf_counter() - t0
+
+        zeros_req = _zeros_u32(num_requests + 1)
+        zeros_one = _zeros_u32(1)
+
+        t0 = time.perf_counter() if profile is not None else 0.0
         result = _pb.build_forward_response(
             driver_id=driver_id,
-            num_requests=int(counts_np.size),
+            num_requests=num_requests,
             tokens_indptr=tokens_indptr,
             tokens=tokens_np,
-            dists_req_indptr=empty_u32,
-            dists_kv_indptr=empty_u32,
-            dists_ids=empty_u32,
-            dists_probs=empty_f32,
-            logits_req_indptr=empty_u32,
-            logits_byte_indptr=empty_u32,
+            dists_req_indptr=zeros_req,
+            dists_kv_indptr=zeros_one,
+            dists_ids=_EMPTY_U32,
+            dists_probs=_EMPTY_F32,
+            logits_req_indptr=zeros_req,
+            logits_byte_indptr=zeros_one,
             logits_bytes=b"",
-            logprobs_req_indptr=empty_u32,
-            logprobs_val_indptr=empty_u32,
-            logprobs_values=empty_f32,
-            entropies_indptr=empty_u32,
-            entropies=empty_f32,
+            logprobs_req_indptr=zeros_req,
+            logprobs_val_indptr=zeros_one,
+            logprobs_values=_EMPTY_F32,
+            entropies_indptr=zeros_req,
+            entropies=_EMPTY_F32,
         )
+        if profile is not None:
+            profile["serialize"] = time.perf_counter() - t0
+            profile["bytes"] = float(len(result))
         if dst_buf is not None:
+            t0 = time.perf_counter() if profile is not None else 0.0
             mv = memoryview(dst_buf)
             mv[: len(result)] = result
+            if profile is not None:
+                profile["dst_copy"] = time.perf_counter() - t0
             return len(result)
         return result
 
@@ -413,7 +503,12 @@ class ResponseBuilder:
 
     # ----- Low-level API: flatten + serialize -----
 
-    def build(self, driver_id: int, dst_buf=None) -> int | bytes:
+    def build(
+        self,
+        driver_id: int,
+        dst_buf=None,
+        profile: dict[str, float] | None = None,
+    ) -> int | bytes:
         """Flatten the accumulated requests into a ResponseFrame +
         ForwardResponse and return wire bytes. If `dst_buf` is provided
         (a `memoryview` or `bytearray`), copy into it and return bytes
@@ -468,6 +563,7 @@ class ResponseBuilder:
                 dists_kv_indptr.append(len(dists_ids))
             dists_req_indptr.append(len(dists_kv_indptr) - 1)
 
+        t0 = time.perf_counter() if profile is not None else 0.0
         result = _pb.build_forward_response(
             driver_id=driver_id,
             num_requests=num_requests,
@@ -486,8 +582,14 @@ class ResponseBuilder:
             entropies_indptr=np.asarray(entropies_indptr, dtype=np.uint32),
             entropies=np.asarray(entropies, dtype=np.float32),
         )
+        if profile is not None:
+            profile["serialize"] = time.perf_counter() - t0
+            profile["bytes"] = float(len(result))
         if dst_buf is not None:
+            t0 = time.perf_counter() if profile is not None else 0.0
             mv = memoryview(dst_buf)
             mv[: len(result)] = result
+            if profile is not None:
+                profile["dst_copy"] = time.perf_counter() - t0
             return len(result)
         return result

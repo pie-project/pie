@@ -97,10 +97,6 @@ CustomAllReduce::CustomAllReduce(NcclComm& comm,
     world_size_ = comm.world_size();
     same_process_ = same_process;
     max_bytes_ = max_bytes;
-    const char* p2p_disabled = std::getenv("NCCL_P2P_DISABLE");
-    if (p2p_disabled != nullptr && std::strcmp(p2p_disabled, "1") == 0) {
-        return;
-    }
     if (world_size_ < 2 || world_size_ > 8 || (world_size_ % 2) != 0) {
         throw std::runtime_error(
             "custom_all_reduce: vllm kernel supports world_size ∈ {2,4,6,8}; got " +

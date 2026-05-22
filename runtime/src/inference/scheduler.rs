@@ -83,6 +83,22 @@ pub struct SchedulerStats {
     pub batch_size_hist: [AtomicU64; 8],
     pub last_batch_latency_us: AtomicU64,
     pub cumulative_latency_us: AtomicU64,
+    pub cumulative_permit_wait_us: AtomicU64,
+    pub cumulative_fire_prepare_us: AtomicU64,
+    pub cumulative_execute_batch_us: AtomicU64,
+    pub cumulative_batch_build_us: AtomicU64,
+    pub cumulative_driver_fire_us: AtomicU64,
+    pub cumulative_response_dispatch_us: AtomicU64,
+    pub cumulative_context_tick_submit_us: AtomicU64,
+    pub cumulative_stats_update_us: AtomicU64,
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+struct BatchExecutionTiming {
+    total_us: u64,
+    batch_build_us: u64,
+    driver_fire_us: u64,
+    response_dispatch_us: u64,
 }
 
 // =============================================================================
@@ -961,17 +977,20 @@ impl BatchScheduler {
             match decision {
                 Decision::Fire => {
                     // Acquire a permit (may wait if at in-flight limit).
+                    let permit_wait_start = Instant::now();
                     let permit = in_flight
                         .clone()
                         .acquire_owned()
                         .await
                         .expect("semaphore closed");
+                    let permit_wait_us = permit_wait_start.elapsed().as_micros() as u64;
 
                     // The policy may decide to fire while the previous GPU
                     // batch is still in flight. Do one last non-blocking
                     // drain after the permit opens so requests that arrived
                     // during that wait are coalesced into this batch instead
                     // of being stranded behind a tiny stale fire.
+                    let fire_prepare_start = Instant::now();
                     while next_pending.is_none() && !batch.is_full() {
                         let Ok(pending) = req_rx.try_recv() else {
                             break;
@@ -1000,6 +1019,13 @@ impl BatchScheduler {
                         .map(|r| r.request.context_ids[0])
                         .collect();
                     let batch_size = batch_ctx_ids.len() as u64;
+                    let fire_prepare_us = fire_prepare_start.elapsed().as_micros() as u64;
+                    stats
+                        .cumulative_permit_wait_us
+                        .fetch_add(permit_wait_us, Relaxed);
+                    stats
+                        .cumulative_fire_prepare_us
+                        .fetch_add(fire_prepare_us, Relaxed);
 
                     // Spawn batch execution
                     let latency_tx_clone = latency_tx.clone();
@@ -1009,7 +1035,7 @@ impl BatchScheduler {
 
                     tokio::spawn(async move {
                         let start = Instant::now();
-                        Self::execute_batch(
+                        let timing = Self::execute_batch(
                             driver_idx,
                             requests_to_fire,
                             driver_id,
@@ -1025,10 +1051,13 @@ impl BatchScheduler {
                         // Advance market clock for this driver: prices, rent, dividends.
                         // Pass batch context IDs so tick only charges contexts
                         // that were in this batch (not stale pinned contexts).
+                        let tick_submit_start = Instant::now();
                         crate::context::tick(driver_idx, latency.as_secs_f64(), batch_ctx_ids);
+                        let tick_submit_us = tick_submit_start.elapsed().as_micros() as u64;
 
                         // Update cumulative atomic counters (consumed by external
                         // monitoring; ignored by the policy).
+                        let stats_update_start = Instant::now();
                         stats_clone.total_batches.fetch_add(1, Relaxed);
                         stats_clone
                             .total_tokens_processed
@@ -1056,6 +1085,24 @@ impl BatchScheduler {
                         stats_clone
                             .cumulative_latency_us
                             .fetch_add(latency.as_micros() as u64, Relaxed);
+                        stats_clone
+                            .cumulative_execute_batch_us
+                            .fetch_add(timing.total_us, Relaxed);
+                        stats_clone
+                            .cumulative_batch_build_us
+                            .fetch_add(timing.batch_build_us, Relaxed);
+                        stats_clone
+                            .cumulative_driver_fire_us
+                            .fetch_add(timing.driver_fire_us, Relaxed);
+                        stats_clone
+                            .cumulative_response_dispatch_us
+                            .fetch_add(timing.response_dispatch_us, Relaxed);
+                        stats_clone
+                            .cumulative_context_tick_submit_us
+                            .fetch_add(tick_submit_us, Relaxed);
+                        stats_clone
+                            .cumulative_stats_update_us
+                            .fetch_add(stats_update_start.elapsed().as_micros() as u64, Relaxed);
                     });
                 }
                 Decision::Wait(wait_duration) => {
@@ -1111,7 +1158,9 @@ impl BatchScheduler {
         _timeout: Duration,
         mut permit: Option<OwnedSemaphorePermit>,
         submit_tx: Option<mpsc::WeakUnboundedSender<PendingRequest>>,
-    ) {
+    ) -> BatchExecutionTiming {
+        let batch_start = Instant::now();
+        let build_start = Instant::now();
         // Build batched request — a single `pie_bridge::ForwardRequest`
         // populated by folding each per-request shape into the batch.
         let elide_decode_masks = requests.iter().all(|req| {
@@ -1131,11 +1180,15 @@ impl BatchScheduler {
                 elide_decode_masks,
             );
         }
+        let batch_build_us = build_start.elapsed().as_micros() as u64;
 
         // Send via driver service (typed call handles serialization + timeout)
+        let driver_fire_start = Instant::now();
         let result = driver::fire_batch(driver_idx, batch_req).await;
+        let driver_fire_us = driver_fire_start.elapsed().as_micros() as u64;
         drop(permit.take());
 
+        let response_start = Instant::now();
         match result {
             Ok(batch_resp) => {
                 let n_results = batch_resp.num_requests as usize;
@@ -1158,43 +1211,42 @@ impl BatchScheduler {
                             page_size,
                         );
                     }
-                    return;
-                }
-
-                let has_chunked = requests
-                    .iter()
-                    .any(|req| matches!(req.completion, Completion::Chunk { .. }));
-                let token_payload_only = !has_chunked
-                    && batch_resp.dists_ids.is_empty()
-                    && batch_resp.dists_probs.is_empty()
-                    && batch_resp.logits_bytes.is_empty()
-                    && batch_resp.logprobs_values.is_empty()
-                    && batch_resp.entropies.is_empty()
-                    && batch_resp.tokens_indptr.len() >= requests.len() + 1;
-
-                if token_payload_only {
-                    for (r, req) in requests.into_iter().enumerate() {
-                        let lo = batch_resp.tokens_indptr[r] as usize;
-                        let hi = batch_resp.tokens_indptr[r + 1] as usize;
-                        let output = if hi == lo + 1 {
-                            ForwardOutput::Token(batch_resp.tokens[lo])
-                        } else {
-                            ForwardOutput::Tokens(batch_resp.tokens[lo..hi].to_vec())
-                        };
-                        req.send_result(Ok(output), submit_tx.as_ref(), page_size);
-                    }
                 } else {
-                    for (r, req) in requests.into_iter().enumerate() {
-                        // Extract this request's slice from the batched
-                        // response. The api layer (build_wit_output)
-                        // walks samplers + the single-request response
-                        // to construct the WIT Output.
-                        let per_req = request::extract_per_request(&batch_resp, r);
-                        req.send_result(
-                            Ok(ForwardOutput::Response(per_req)),
-                            submit_tx.as_ref(),
-                            page_size,
-                        );
+                    let has_chunked = requests
+                        .iter()
+                        .any(|req| matches!(req.completion, Completion::Chunk { .. }));
+                    let token_payload_only = !has_chunked
+                        && batch_resp.dists_ids.is_empty()
+                        && batch_resp.dists_probs.is_empty()
+                        && batch_resp.logits_bytes.is_empty()
+                        && batch_resp.logprobs_values.is_empty()
+                        && batch_resp.entropies.is_empty()
+                        && batch_resp.tokens_indptr.len() >= requests.len() + 1;
+
+                    if token_payload_only {
+                        for (r, req) in requests.into_iter().enumerate() {
+                            let lo = batch_resp.tokens_indptr[r] as usize;
+                            let hi = batch_resp.tokens_indptr[r + 1] as usize;
+                            let output = if hi == lo + 1 {
+                                ForwardOutput::Token(batch_resp.tokens[lo])
+                            } else {
+                                ForwardOutput::Tokens(batch_resp.tokens[lo..hi].to_vec())
+                            };
+                            req.send_result(Ok(output), submit_tx.as_ref(), page_size);
+                        }
+                    } else {
+                        for (r, req) in requests.into_iter().enumerate() {
+                            // Extract this request's slice from the batched
+                            // response. The api layer (build_wit_output)
+                            // walks samplers + the single-request response
+                            // to construct the WIT Output.
+                            let per_req = request::extract_per_request(&batch_resp, r);
+                            req.send_result(
+                                Ok(ForwardOutput::Response(per_req)),
+                                submit_tx.as_ref(),
+                                page_size,
+                            );
+                        }
                     }
                 }
             }
@@ -1210,6 +1262,12 @@ impl BatchScheduler {
                     );
                 }
             }
+        }
+        BatchExecutionTiming {
+            total_us: batch_start.elapsed().as_micros() as u64,
+            batch_build_us,
+            driver_fire_us,
+            response_dispatch_us: response_start.elapsed().as_micros() as u64,
         }
     }
 }

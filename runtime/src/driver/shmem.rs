@@ -49,16 +49,86 @@ impl ShmemChannel {
 }
 
 fn decode_driver_response(bytes: &[u8]) -> Result<DriverResponse> {
+    if let Some(resp) = decode_fast_token_response(bytes) {
+        return resp;
+    }
+
     // Validate at the archived layer first so we get cheap zero-copy
     // error reporting on malformed buffers.
-    let _ = parse_response(bytes).map_err(|e| anyhow!("parse_response: {e}"))?;
+    let archived = parse_response(bytes).map_err(|e| anyhow!("parse_response: {e}"))?;
     // Then materialize an owned ResponseFrame so the caller can walk
     // plain `Vec<T>` fields. One extra alloc per response.
-    let archived = parse_response(bytes).map_err(|e| anyhow!("{e}"))?;
     let owned = deserialize_response(archived).map_err(|e| anyhow!("deserialize_response: {e}"))?;
     Ok(DriverResponse {
         aborted: owned.aborted,
         payload: owned.payload,
+    })
+}
+
+const FAST_TOKEN_RESPONSE_MAGIC: &[u8; 8] = b"PIETFWD1";
+const FAST_TOKEN_RESPONSE_HEADER_LEN: usize = 20;
+
+fn decode_fast_token_response(bytes: &[u8]) -> Option<Result<DriverResponse>> {
+    if bytes.len() < FAST_TOKEN_RESPONSE_MAGIC.len()
+        || &bytes[..FAST_TOKEN_RESPONSE_MAGIC.len()] != FAST_TOKEN_RESPONSE_MAGIC
+    {
+        return None;
+    }
+    Some(decode_fast_token_response_inner(bytes))
+}
+
+fn read_le_u32(bytes: &[u8], offset: usize) -> Result<u32> {
+    let raw = bytes
+        .get(offset..offset + 4)
+        .ok_or_else(|| anyhow!("fast token response truncated at offset {offset}"))?;
+    Ok(u32::from_le_bytes(
+        raw.try_into().expect("slice length checked"),
+    ))
+}
+
+fn decode_fast_token_response_inner(bytes: &[u8]) -> Result<DriverResponse> {
+    if bytes.len() < FAST_TOKEN_RESPONSE_HEADER_LEN {
+        return Err(anyhow!(
+            "fast token response truncated: {} < {}",
+            bytes.len(),
+            FAST_TOKEN_RESPONSE_HEADER_LEN
+        ));
+    }
+    let _driver_id = read_le_u32(bytes, 8)?;
+    let num_requests = read_le_u32(bytes, 12)?;
+    let token_count = read_le_u32(bytes, 16)? as usize;
+    if token_count != num_requests as usize {
+        return Err(anyhow!(
+            "fast token response expected one token per request, got token_count={} num_requests={}",
+            token_count,
+            num_requests
+        ));
+    }
+    let expected_len = FAST_TOKEN_RESPONSE_HEADER_LEN + token_count * std::mem::size_of::<u32>();
+    if bytes.len() != expected_len {
+        return Err(anyhow!(
+            "fast token response length mismatch: got {}, want {}",
+            bytes.len(),
+            expected_len
+        ));
+    }
+
+    let mut tokens = Vec::with_capacity(token_count);
+    for chunk in bytes[FAST_TOKEN_RESPONSE_HEADER_LEN..].chunks_exact(4) {
+        tokens.push(u32::from_le_bytes(
+            chunk.try_into().expect("chunks_exact(4)"),
+        ));
+    }
+
+    let payload = pie_bridge::ResponsePayload::Forward(pie_bridge::ForwardResponse {
+        num_requests,
+        tokens_indptr: (0..=num_requests).collect(),
+        tokens,
+        ..Default::default()
+    });
+    Ok(DriverResponse {
+        aborted: false,
+        payload,
     })
 }
 

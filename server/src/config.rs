@@ -416,7 +416,7 @@ fn default_restore_pause_at_utilization() -> f64 {
 pub struct DriverConfig {
     /// Driver discriminator. Embedded drivers (`portable`,
     /// `cuda_native`, `dummy`) run in-process; Python drivers (`dev`,
-    /// `vllm`, `sglang`, `tensorrt_llm`) are supervised as subprocesses.
+    /// `vllm`, `sglang`) are supervised as subprocesses.
     #[serde(rename = "type")]
     pub kind: DriverKind,
     /// Single string or list of strings — both accepted on input.
@@ -469,7 +469,7 @@ impl DriverConfig {
             "model.driver.device must be non-empty"
         );
         // All `DriverKind`s are valid here: embedded flavors run in-process
-        // through static libs, while dev/vllm/sglang/tensorrt_llm are supervised through
+        // through static libs, while dev/vllm/sglang are supervised through
         // `crate::subprocess_driver`.
         match self.kind {
             DriverKind::Portable => {
@@ -511,7 +511,7 @@ impl DriverConfig {
                     ensure!(
                         self.tensor_parallel_size == 1,
                         "driver type {:?} currently supports tensor_parallel_size = 1",
-                        self.kind
+                        self.kind,
                     );
                 }
             }
@@ -557,6 +557,9 @@ fn validate_subprocess_driver_options(options: &toml::Table, kind: DriverKind) -
         "max_total_tokens",
     ] {
         if kind == DriverKind::TensorRtLlm && key == "max_batch_size" {
+            continue;
+        }
+        if kind == DriverKind::Vllm && (key == "max_num_seqs" || key == "max_num_batched_tokens") {
             continue;
         }
         ensure!(
@@ -1034,8 +1037,6 @@ max_num_kv_pages = 1024
             ("dummy", "max_model_len"),
             ("dev", "max_forward_tokens"),
             ("dev", "max_forward_requests"),
-            ("vllm", "max_num_seqs"),
-            ("vllm", "max_num_batched_tokens"),
             ("sglang", "max_running_requests"),
             ("sglang", "max_total_tokens"),
         ] {
@@ -1055,6 +1056,38 @@ max_num_kv_pages = 1024
             };
             assert!(err.contains(key), "type={ty} key={key} got: {err}");
         }
+    }
+
+    #[test]
+    fn accepts_vllm_max_num_seqs() {
+        let text = r#"
+[[model]]
+name = "m"
+hf_repo = "x"
+[model.driver]
+type = "vllm"
+device = ["cpu"]
+[model.driver.options]
+max_num_seqs = 64
+"#;
+        let cfg: Config = toml::from_str(text).unwrap();
+        cfg.validate().unwrap();
+    }
+
+    #[test]
+    fn accepts_vllm_max_num_batched_tokens() {
+        let text = r#"
+[[model]]
+name = "m"
+hf_repo = "x"
+[model.driver]
+type = "vllm"
+device = ["cpu"]
+[model.driver.options]
+max_num_batched_tokens = 8192
+"#;
+        let cfg: Config = toml::from_str(text).unwrap();
+        cfg.validate().unwrap();
     }
 
     #[test]
@@ -1118,7 +1151,7 @@ device = "cuda:0"
     fn accepts_subprocess_drivers() {
         // dev/vllm/sglang/tensorrt_llm are hosted out-of-process by
         // `crate::subprocess_driver::SubprocessDriver`.
-        for ty in ["dev", "vllm", "sglang", "tensorrt_llm", "tensorrt-llm"] {
+        for ty in ["dev", "vllm", "sglang", "tensorrt_llm"] {
             let toml_text = format!(
                 "[[model]]\nname = \"m\"\nhf_repo = \"x\"\n[model.driver]\n\
                  type = \"{ty}\"\ndevice = [\"cuda:0\"]\n"
@@ -1126,22 +1159,6 @@ device = "cuda:0"
             let cfg: Config = toml::from_str(&toml_text).unwrap();
             cfg.validate().unwrap_or_else(|e| panic!("type={ty}: {e}"));
         }
-    }
-
-    #[test]
-    fn rejects_tensorrt_llm_tensor_parallel() {
-        let text = r#"
-[[model]]
-name = "m"
-hf_repo = "x"
-[model.driver]
-type = "tensorrt_llm"
-device = ["cuda:0", "cuda:1"]
-tensor_parallel_size = 2
-"#;
-        let cfg: Config = toml::from_str(text).unwrap();
-        let err = cfg.validate().unwrap_err().to_string();
-        assert!(err.contains("tensor_parallel_size = 1"), "got: {err}");
     }
 
     #[test]

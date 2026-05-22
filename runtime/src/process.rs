@@ -85,20 +85,6 @@ static SERVICES: LazyLock<ServiceMap<ProcessId, Message>> = LazyLock::new(Servic
 /// Admission semaphore. `None` = unlimited concurrency (no gating).
 static ADMISSION: OnceLock<Option<Arc<Semaphore>>> = OnceLock::new();
 
-fn launch_profile_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var_os("PIE_PROFILE_LAUNCH").is_some())
-}
-
-fn launch_profile(process_id: ProcessId, stage: &str, elapsed: std::time::Duration) {
-    if launch_profile_enabled() {
-        println!(
-            "[launch-profile] pid={process_id} stage={stage} elapsed_us={}",
-            elapsed.as_micros()
-        );
-    }
-}
-
 // =============================================================================
 // Public API
 // =============================================================================
@@ -362,7 +348,6 @@ impl Process {
         result_tx: SharedResultTx,
         token_budget: Option<usize>,
     ) {
-        let launch_start = Instant::now();
         // Admission control: wait for a permit before instantiating.
         // The permit is held for the entire WASM execution lifetime
         // and auto-released on completion, error, or task abort.
@@ -370,10 +355,8 @@ impl Process {
             Some(sem) => Some(sem.acquire().await.expect("admission semaphore closed")),
             None => None,
         };
-        launch_profile(process_id, "admission", launch_start.elapsed());
 
         let result: Result<String, String> = async {
-            let stage_start = Instant::now();
             let (mut store, instance) = linker::instantiate(
                 process_id,
                 username,
@@ -383,19 +366,15 @@ impl Process {
             )
             .await
             .map_err(|e| e.to_string())?;
-            launch_profile(process_id, "linker_instantiate", stage_start.elapsed());
 
             // KV admission waits here, after the singleton linker has already
             // prepared the instance and is free to instantiate other queued
             // processes. Blocking inside the linker would serialize a saturated
             // second cohort behind the first one and leave the GPU idle.
-            let stage_start = Instant::now();
             context::register_process(process_id, token_budget)
                 .await
                 .map_err(|e| e.to_string())?;
-            launch_profile(process_id, "context_register", stage_start.elapsed());
 
-            let stage_start = Instant::now();
             let run_interface = format!("pie:{}/run", program.name);
 
             let (_, run_export) = instance
@@ -409,15 +388,12 @@ impl Process {
             let run_func = instance
                 .get_typed_func::<(&str,), (Result<String, String>,)>(&mut store, &run_func_export)
                 .map_err(|e| format!("Failed to get 'run' function: {e:?}"))?;
-            launch_profile(process_id, "export_lookup", stage_start.elapsed());
 
-            let stage_start = Instant::now();
             match run_func.call_async(&mut store, (&input,)).await {
                 Ok((Ok(output),)) => Ok(output),
                 Ok((Err(runtime_err),)) => Err(runtime_err),
                 Err(call_err) => Err(format!("Call error: {call_err}")),
             }
-            .inspect(|_| launch_profile(process_id, "wasm_call", stage_start.elapsed()))
         }
         .await;
 

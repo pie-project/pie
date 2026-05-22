@@ -251,6 +251,23 @@ def hf_chat_prompts_and_counts(
     return rendered, counts
 
 
+def hf_chat_token_ids_and_counts(
+    model: str, system: str, prompts: list[str]
+) -> tuple[list[list[int]], list[int]]:
+    from transformers import AutoTokenizer
+    tok = AutoTokenizer.from_pretrained(model, trust_remote_code=True)
+    rendered = [
+        tok.apply_chat_template(
+            [{"role": "system", "content": system}, {"role": "user", "content": p}],
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+        for p in prompts
+    ]
+    token_ids = [tok.encode(p, add_special_tokens=False) for p in rendered]
+    return token_ids, [len(ids) for ids in token_ids]
+
+
 def finish(summary: BenchSummary, results: list[RequestResult], json_out: str | None) -> None:
     print_summary(summary)
     write_json(json_out, summary, results)

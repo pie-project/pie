@@ -24,7 +24,7 @@
 //! unaware of speculation — it just runs forward passes.
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 
 use anyhow::Result;
@@ -46,6 +46,10 @@ pub(crate) type StagedBatchMap = Arc<Mutex<HashMap<ContextId, VecDeque<StagedEnt
 pub(crate) struct StagedEntry {
     pub anchor_token: u32,
     pub anchor_pos: u32,
+    /// Claim-side hint for the extender that owns this staged fire.
+    /// The inferlet can claim a pre-fired final token while telling
+    /// its extender not to submit another stage.
+    pub allow_extend: Arc<AtomicBool>,
     /// Future fire's output for this ctx. The scheduler holds the
     /// matching `Sender`; when the kernel finishes and the output
     /// is delivered, this receiver resolves.
@@ -150,6 +154,7 @@ pub fn try_hit(
     spec: &StagedBatch,
     ctx_id: ContextId,
     request: &pie_bridge::ForwardRequest,
+    allow_extend: bool,
 ) -> Option<oneshot::Receiver<Result<ForwardOutput>>> {
     let mut sb = spec.0.lock().ok()?;
     let deque = sb.get_mut(&ctx_id)?;
@@ -158,6 +163,9 @@ pub fn try_hit(
     let req_pos = request.position_ids.first().copied();
     if Some(front.anchor_token) == req_token && Some(front.anchor_pos) == req_pos {
         let entry = deque.pop_front()?;
+        if !allow_extend {
+            entry.allow_extend.store(false, Ordering::Relaxed);
+        }
         BYPASS_HIT_COUNT.fetch_add(1, Ordering::Relaxed);
         Some(entry.output_rx)
     } else {
@@ -227,6 +235,7 @@ pub(crate) fn spawn_extend_chain(
     cur_page_idx: usize,
     cur_last_page_len: u32,
     max_queue_depth: usize,
+    allow_extend: Arc<AtomicBool>,
 ) {
     tokio::spawn(async move {
         let mut sched_rx = sched_rx;
@@ -234,6 +243,7 @@ pub(crate) fn spawn_extend_chain(
         let mut prev_request = prev_request;
         let mut cur_page_idx = cur_page_idx;
         let mut cur_last_page_len = cur_last_page_len;
+        let mut allow_extend = allow_extend;
 
         loop {
             let output = match sched_rx.await {
@@ -274,6 +284,10 @@ pub(crate) fn spawn_extend_chain(
                 let _ = response.send(Ok(output));
                 return;
             }
+            if !allow_extend.load(Ordering::Relaxed) {
+                let _ = response.send(Ok(output));
+                return;
+            }
 
             let mut next_stage = None;
             if let Some((next_req, anchor_token, anchor_pos)) =
@@ -303,6 +317,7 @@ pub(crate) fn spawn_extend_chain(
                     if should_extend {
                         let (sched_tx_next, sched_rx_next) = oneshot::channel();
                         let (final_tx_next, final_rx_next) = oneshot::channel();
+                        let next_allow_extend = Arc::new(AtomicBool::new(true));
                         if scheduler_handle
                             .submit(next_req.clone(), sched_tx_next, next_pages, next_lpl)
                             .is_ok()
@@ -312,6 +327,7 @@ pub(crate) fn spawn_extend_chain(
                                 sb.entry(ctx_id).or_default().push_back(StagedEntry {
                                     anchor_token,
                                     anchor_pos,
+                                    allow_extend: next_allow_extend.clone(),
                                     output_rx: final_rx_next,
                                 });
                             }
@@ -321,6 +337,7 @@ pub(crate) fn spawn_extend_chain(
                                 next_req,
                                 next_page_idx,
                                 next_lpl,
+                                next_allow_extend,
                             ));
                         }
                     }
@@ -331,12 +348,21 @@ pub(crate) fn spawn_extend_chain(
             // upstream forwarder spawned by `try_hit`).
             let _ = response.send(Ok(output));
 
-            if let Some((next_rx, next_response, next_req, next_page_idx, next_lpl)) = next_stage {
+            if let Some((
+                next_rx,
+                next_response,
+                next_req,
+                next_page_idx,
+                next_lpl,
+                next_allow_extend,
+            )) = next_stage
+            {
                 sched_rx = next_rx;
                 response = next_response;
                 prev_request = next_req;
                 cur_page_idx = next_page_idx;
                 cur_last_page_len = next_lpl;
+                allow_extend = next_allow_extend;
             } else {
                 return;
             }
@@ -419,8 +445,8 @@ pub fn evaluate_request_shape(req: &pie_bridge::ForwardRequest) -> Result<(), Sk
 /// next call arrives.
 ///
 /// The returned request:
-///   - is a single-token decode at `last_pos + 1` with input =
-///     the sampled token
+///   - is a single-token decode at the position after all returned
+///     tokens, with input = the last sampled token
 ///   - carries the same samplers / adapter as the prior call
 ///   - leaves masks empty so the scheduler can route it through the
 ///     single-token decode path
@@ -434,9 +460,21 @@ pub fn build_next_request(
     if evaluate_request_shape(prev_req).is_err() {
         return None;
     }
-    let sampled_token = prev_resp.first_token()?;
+    let (sampled_token, pos_advance) = match prev_resp {
+        ForwardOutput::Token(token) => (*token, 1u32),
+        ForwardOutput::Tokens(tokens) => {
+            let token = *tokens.last()?;
+            let advance = u32::try_from(tokens.len()).ok()?;
+            (token, advance)
+        }
+        ForwardOutput::Response(resp) => {
+            let token = *resp.tokens.last()?;
+            let advance = u32::try_from(resp.tokens.len()).ok()?;
+            (token, advance)
+        }
+    };
     let last_pos = *prev_req.position_ids.last()?;
-    let next_pos = last_pos.checked_add(1)?;
+    let next_pos = last_pos.checked_add(pos_advance)?;
     let context_id = *prev_req.context_ids.first()?;
     let next_req = pie_bridge::ForwardRequest {
         token_ids: vec![sampled_token],

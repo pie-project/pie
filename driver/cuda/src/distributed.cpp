@@ -1,11 +1,8 @@
 #include "distributed.hpp"
 
-#include <chrono>
 #include <cstdlib>
-#include <mutex>
 #include <stdexcept>
 #include <string>
-#include <thread>
 #include <utility>
 
 #include "cuda_check.hpp"
@@ -46,60 +43,16 @@ ncclUniqueId nccl_unique_id_from_hex(const std::string& hex) {
     return id;
 }
 
-void nccl_check_async(ncclResult_t result,
-                      ncclComm_t comm,
-                      const char* expr,
-                      const char* file,
-                      int line) {
-    if (result != ncclSuccess && result != ncclInProgress) {
-        throw std::runtime_error(
-            std::string("NCCL error at ") + file + ":" +
-            std::to_string(line) + " (" + expr + "): " +
-            ncclGetErrorString(result));
-    }
-    if (result == ncclSuccess) {
-        return;
-    }
-    ncclResult_t state = ncclInProgress;
-    while (state == ncclInProgress) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
-        const ncclResult_t poll = ncclCommGetAsyncError(comm, &state);
-        if (poll != ncclSuccess) {
-            throw std::runtime_error(
-                std::string("NCCL async poll error at ") + file + ":" +
-                std::to_string(line) + " (" + expr + "): " +
-                ncclGetErrorString(poll));
-        }
-    }
-    if (state != ncclSuccess) {
-        throw std::runtime_error(
-            std::string("NCCL async error at ") + file + ":" +
-            std::to_string(line) + " (" + expr + "): " +
-            ncclGetErrorString(state));
-    }
-}
-
 NcclComm::NcclComm(int world_size, int rank, const ncclUniqueId& uid)
     : world_size_(world_size), rank_(rank) {
-    static std::once_flag env_once;
-    std::call_once(env_once, [] {
-        // The embedded TP launcher runs ranks as threads in one process. On
-        // cross-socket PCIe topologies NCCL's P2P transport can hang before it
-        // falls back. Default to SHM/socket transport unless the operator has
-        // chosen a transport policy explicitly.
-        if (std::getenv("NCCL_P2P_DISABLE") == nullptr) {
-            setenv("NCCL_P2P_DISABLE", "1", /*overwrite=*/0);
-        }
-    });
     ncclConfig_t config = NCCL_CONFIG_INITIALIZER;
-    // TP ranks are threads inside one process. Blocking NCCL calls can wedge
-    // when one rank waits inside NCCL while another rank still needs to enter
-    // the matching call. Non-blocking mode returns ncclInProgress instead; the
-    // wrappers below poll the communicator without holding NCCL's launch path.
-    config.blocking = 0;
-    NCCL_CHECK_ASYNC(
-        ncclCommInitRankConfig(&comm_, world_size, uid, rank, &config),
-        comm_);
+    // Followers often wait for rank 0's next fire-batch broadcast. The
+    // default non-blocking communicator can surface that idle wait as a
+    // persistent 100% GPU-utilization spin. Use NCCL's blocking mode so idle
+    // collectives sleep instead of burning a device while rank 0 is between
+    // requests or still publishing readiness.
+    config.blocking = 1;
+    NCCL_CHECK(ncclCommInitRankConfig(&comm_, world_size, uid, rank, &config));
 }
 
 NcclComm::~NcclComm() {
@@ -121,9 +74,8 @@ NcclComm& NcclComm::operator=(NcclComm&& o) noexcept {
 
 void NcclComm::all_reduce_bf16(void* sendrecv, std::size_t count,
                                ncclRedOp_t op, cudaStream_t stream) {
-    NCCL_CHECK_ASYNC(ncclAllReduce(sendrecv, sendrecv, count, ncclBfloat16,
-                                   op, comm_, stream),
-                     comm_);
+    NCCL_CHECK(ncclAllReduce(sendrecv, sendrecv, count, ncclBfloat16, op,
+                             comm_, stream));
 }
 
 void NcclComm::all_reduce_bf16_out(const void* send, void* recv,
@@ -136,39 +88,34 @@ void NcclComm::all_reduce_bf16_out(const void* send, void* recv,
             return;
         }
     }
-    NCCL_CHECK_ASYNC(ncclAllReduce(send, recv, count, ncclBfloat16, op,
-                                   comm_, stream),
-                     comm_);
+    NCCL_CHECK(ncclAllReduce(send, recv, count, ncclBfloat16, op,
+                             comm_, stream));
 }
 
 void NcclComm::all_reduce_fp32(void* sendrecv, std::size_t count,
                                ncclRedOp_t op, cudaStream_t stream) {
-    NCCL_CHECK_ASYNC(ncclAllReduce(sendrecv, sendrecv, count, ncclFloat32,
-                                   op, comm_, stream),
-                     comm_);
+    NCCL_CHECK(ncclAllReduce(sendrecv, sendrecv, count, ncclFloat32, op,
+                             comm_, stream));
 }
 
 void NcclComm::all_gather_bf16(const void* send, void* recv,
                                std::size_t count_per_rank,
                                cudaStream_t stream) {
-    NCCL_CHECK_ASYNC(ncclAllGather(send, recv, count_per_rank, ncclBfloat16,
-                                   comm_, stream),
-                     comm_);
+    NCCL_CHECK(ncclAllGather(send, recv, count_per_rank, ncclBfloat16,
+                             comm_, stream));
 }
 
 void NcclComm::broadcast_bytes(void* sendrecv, std::size_t bytes, int root,
                                cudaStream_t stream) {
-    NCCL_CHECK_ASYNC(ncclBroadcast(sendrecv, sendrecv, bytes, ncclChar, root,
-                                   comm_, stream),
-                     comm_);
+    NCCL_CHECK(ncclBroadcast(sendrecv, sendrecv, bytes, ncclChar, root,
+                             comm_, stream));
 }
 
 void NcclComm::all_gather_bytes(const void* send, void* recv,
                                 std::size_t count_per_rank,
                                 cudaStream_t stream) {
-    NCCL_CHECK_ASYNC(ncclAllGather(send, recv, count_per_rank, ncclChar,
-                                   comm_, stream),
-                     comm_);
+    NCCL_CHECK(ncclAllGather(send, recv, count_per_rank, ncclChar,
+                             comm_, stream));
 }
 
 void NcclComm::barrier(cudaStream_t stream) {
@@ -180,9 +127,7 @@ void NcclComm::barrier(cudaStream_t stream) {
         const int one = 1;
         CUDA_CHECK(cudaMemcpy(d_one, &one, sizeof(int), cudaMemcpyHostToDevice));
     }
-    NCCL_CHECK_ASYNC(
-        ncclAllReduce(d_one, d_one, 1, ncclInt32, ncclSum, comm_, stream),
-        comm_);
+    NCCL_CHECK(ncclAllReduce(d_one, d_one, 1, ncclInt32, ncclSum, comm_, stream));
 }
 
 }  // namespace pie_cuda_driver
