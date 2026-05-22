@@ -716,7 +716,7 @@ impl DefaultAbiBuilder<'_> {
         }
         if !runtime_quant_model_supported(&self.cfg.model_type) {
             return Err(CompileError::InvalidInput(format!(
-                "runtime_quant={} is supported for qwen2/qwen3/qwen3_5/llama/mistral-style dense models, got '{}'",
+                "runtime_quant={} is supported for qwen2/qwen3/qwen3_5/qwen3_5_moe/llama/mistral-style models, got '{}'",
                 mode, self.cfg.model_type
             )));
         }
@@ -865,7 +865,15 @@ fn llama_like_shard_axis(name: &str) -> Option<Axis> {
 fn runtime_quant_model_supported(model_type: &str) -> bool {
     matches!(
         model_type,
-        "qwen3" | "qwen2" | "llama" | "llama3" | "mistral" | "qwen3_5" | "qwen3_5_text"
+        "qwen3"
+            | "qwen2"
+            | "llama"
+            | "llama3"
+            | "mistral"
+            | "qwen3_5"
+            | "qwen3_5_text"
+            | "qwen3_5_moe"
+            | "qwen3_5_moe_text"
     )
 }
 
@@ -880,6 +888,10 @@ fn runtime_quantizable_name(name: &str) -> bool {
             ".mlp.gate_proj.weight",
             ".mlp.up_proj.weight",
             ".mlp.down_proj.weight",
+            ".mlp.shared_expert.gate_proj.weight",
+            ".mlp.shared_expert.up_proj.weight",
+            ".mlp.shared_expert.down_proj.weight",
+            ".mlp.shared_expert_gate.weight",
         ],
     )
 }

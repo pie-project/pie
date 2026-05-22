@@ -29,6 +29,9 @@ import numpy as np
 
 
 def find_snapshot(hf_repo: str) -> Path:
+    local = Path(hf_repo).expanduser()
+    if local.exists():
+        return local.resolve()
     cache = Path(os.environ.get(
         "HF_HOME", Path.home() / ".cache" / "huggingface")) / "hub"
     name = "models--" + hf_repo.replace("/", "--")

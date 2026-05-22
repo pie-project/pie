@@ -49,7 +49,24 @@ void launch_attention_naive_paged_bf16(
     int page_size,
     cudaStream_t stream,
     int window_left = -1,
-    float sm_scale = -1.f);
+    float sm_scale = -1.f,
+    float logits_soft_cap = 0.f,
+    float* lse_out = nullptr);
+
+void launch_attention_naive_paged_decode(
+    const void* q,
+    KvCacheLayerView kv_layer,
+    void* o,
+    const std::uint32_t* kv_page_indices_d,
+    const std::uint32_t* kv_page_indptr_d,
+    const std::uint32_t* kv_last_page_lens_d,
+    int num_requests,
+    int num_q_heads,
+    cudaStream_t stream,
+    int window_left = -1,
+    float sm_scale = -1.f,
+    float logits_soft_cap = 0.f,
+    float* lse_out = nullptr);
 
 void launch_attention_naive_paged(
     const void* q,
@@ -65,6 +82,26 @@ void launch_attention_naive_paged(
     int num_q_heads,
     cudaStream_t stream,
     int window_left = -1,
-    float sm_scale = -1.f);
+    float sm_scale = -1.f,
+    float logits_soft_cap = 0.f,
+    float* lse_out = nullptr);
+
+void launch_attention_naive_paged_custom(
+    const void* q,
+    KvCacheLayerView kv_layer,
+    void* o,
+    const std::uint32_t* qo_indptr_d,
+    const std::uint32_t* kv_page_indices_d,
+    const std::uint32_t* kv_page_indptr_d,
+    const std::uint32_t* kv_last_page_lens_d,
+    const std::uint8_t* mask_d,
+    const std::int32_t* mask_indptr_d,
+    int total_tokens,
+    int num_requests,
+    int num_q_heads,
+    cudaStream_t stream,
+    float sm_scale = -1.f,
+    float logits_soft_cap = 0.f,
+    float* lse_out = nullptr);
 
 }  // namespace pie_cuda_driver::ops

@@ -1,8 +1,7 @@
 #pragma once
 
-// flashinfer-backed paged attention. Phase 1: decode-only (every request
-// has qo_len == 1). Phase 2 will add the prefill path. Same call signature
-// as `attention_paged.hpp` so the forward pass can dispatch on a flag.
+// flashinfer-backed paged attention. Handles decode, prefill, mixed prefill,
+// and direct CUDA fallbacks for quantized KV formats unsupported by FlashInfer.
 
 #include <cstdint>
 #include <memory>
@@ -15,12 +14,8 @@
 namespace pie_cuda_driver::ops {
 
 // Opaque cache of flashinfer's `DecodePlanInfo` plus the few scheduling
-// fields the dispatch needs. Lifecycle: created once (e.g. in
-// Executor), reset each fire by `plan_attention_flashinfer_decode_bf16`,
-// then reused by 28 per-layer dispatch calls within that fire. Hoisting
-// the plan out of the per-layer loop saves ~27 redundant DecodePlan
-// invocations per fire — the plan is identical across all layers in
-// pure-decode mode.
+// fields the dispatch needs. Non-FlashInfer quantized fallbacks also use this
+// object for request metadata, but do not populate a FlashInfer plan.
 struct DecodePlanCache;
 
 struct DecodePlanCacheDeleter {
@@ -75,6 +70,22 @@ inline void plan_attention_flashinfer_decode(
         head_dim, page_size, workspace, stream, enable_cuda_graph);
 }
 
+// Same planner, but lets callers provide the concrete KV cache format.
+// Native BF16 and FP8 per-tensor caches use FlashInfer plans. Other quantized
+// formats record only the common request metadata for the direct CUDA fallback.
+void plan_attention_flashinfer_decode_kv(
+    DecodePlanCache& cache,
+    const std::uint32_t* kv_page_indptr_h,
+    int num_requests,
+    int num_q_heads,
+    int num_kv_heads,
+    int head_dim,
+    int page_size,
+    const KvCacheFormat& kv_format,
+    AttentionWorkspace& workspace,
+    cudaStream_t stream,
+    bool enable_cuda_graph = true);
+
 void plan_attention_flashinfer_prefill_bf16(
     PrefillPlanCache& cache,
     const std::uint32_t* qo_indptr_h,
@@ -86,6 +97,24 @@ void plan_attention_flashinfer_prefill_bf16(
     int num_kv_heads,
     int head_dim,
     int page_size,
+    AttentionWorkspace& workspace,
+    cudaStream_t stream,
+    bool enable_cuda_graph = true,
+    int window_left = -1,
+    bool full_attention_variant = false);
+
+void plan_attention_flashinfer_prefill_kv(
+    PrefillPlanCache& cache,
+    const std::uint32_t* qo_indptr_h,
+    const std::uint32_t* kv_page_indptr_h,
+    const std::uint32_t* kv_last_page_lens_h,
+    int total_tokens,
+    int num_requests,
+    int num_q_heads,
+    int num_kv_heads,
+    int head_dim,
+    int page_size,
+    const KvCacheFormat& kv_format,
     AttentionWorkspace& workspace,
     cudaStream_t stream,
     bool enable_cuda_graph = true,
@@ -152,6 +181,21 @@ void dispatch_attention_flashinfer_prefill_bf16(
     const PrefillPlanCache& cache,
     const void* q,
     void* k_pages, void* v_pages,
+    void* o,
+    const std::uint32_t* qo_indptr_d,
+    const std::uint32_t* kv_page_indices_d,
+    const std::uint32_t* kv_page_indptr_d,
+    const std::uint32_t* kv_last_page_lens_d,
+    AttentionWorkspace& workspace,
+    cudaStream_t stream,
+    float logits_soft_cap = 0.f,
+    float sm_scale = -1.f,
+    float* lse_out = nullptr);
+
+void dispatch_attention_flashinfer_prefill(
+    const PrefillPlanCache& cache,
+    const void* q,
+    KvCacheLayerView kv_layer,
     void* o,
     const std::uint32_t* qo_indptr_d,
     const std::uint32_t* kv_page_indices_d,

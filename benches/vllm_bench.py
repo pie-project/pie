@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import time
 
 from common import (
@@ -14,7 +15,53 @@ from common import (
 )
 
 
+def visible_tp_uses_system_topology(tp_size: int) -> bool:
+    if tp_size <= 1:
+        return False
+    try:
+        import torch
+        import pynvml
+
+        if not torch.cuda.is_available() or torch.cuda.device_count() < 2:
+            return False
+        pynvml.nvmlInit()
+        n = min(tp_size, torch.cuda.device_count())
+        handles = []
+        for i in range(n):
+            prop = torch.cuda.get_device_properties(i)
+            bus_id = (
+                f"{prop.pci_domain_id:08x}:"
+                f"{prop.pci_bus_id:02x}:"
+                f"{prop.pci_device_id:02x}.0"
+            )
+            handles.append(pynvml.nvmlDeviceGetHandleByPciBusId(bus_id.encode()))
+        for i in range(n):
+            for j in range(i + 1, n):
+                level = pynvml.nvmlDeviceGetTopologyCommonAncestor(
+                    handles[i], handles[j],
+                )
+                if level >= pynvml.NVML_TOPOLOGY_SYSTEM:
+                    return True
+    except Exception:
+        return False
+    finally:
+        try:
+            pynvml.nvmlShutdown()  # type: ignore[name-defined]
+        except Exception:
+            pass
+    return False
+
+
+def maybe_disable_nccl_p2p_for_system_topology(tp_size: int) -> bool:
+    system_topology = visible_tp_uses_system_topology(tp_size)
+    if system_topology and os.environ.get("NCCL_P2P_DISABLE") is None:
+        os.environ["NCCL_P2P_DISABLE"] = "1"
+    return system_topology
+
+
 def run(args: argparse.Namespace):
+    system_topology = maybe_disable_nccl_p2p_for_system_topology(args.tp_size)
+
     from vllm import LLM, SamplingParams
 
     n = args.requests if args.mode == "latency" else args.num_requests
@@ -33,6 +80,8 @@ def run(args: argparse.Namespace):
         llm_kwargs["attention_config"] = {"backend": args.attention_backend}
     if args.enforce_eager:
         llm_kwargs["enforce_eager"] = True
+    if system_topology:
+        llm_kwargs["disable_custom_all_reduce"] = True
 
     llm = LLM(
         model=args.model,

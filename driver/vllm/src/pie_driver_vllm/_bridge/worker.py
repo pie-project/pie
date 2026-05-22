@@ -131,6 +131,7 @@ def run_worker(
                 break
         global_group_id = group_id_base + my_group_id
         tp_degree = len(group_topology[my_group_id])
+        group_devices = [devices[r] for r in group_topology[my_group_id]]
 
         # Per-replica MASTER_PORT so DP replicas on the same host don't
         # collide on downstream nccl ports (sglang derives `nccl_port =
@@ -139,6 +140,12 @@ def run_worker(
         # ports without crossing into the next replica.
         os.environ["MASTER_PORT"] = str(master_port + my_group_id * 10)
         os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
+
+        configure_dist_env = getattr(
+            runtime_ops, "configure_distributed_environment", None
+        )
+        if configure_dist_env is not None:
+            configure_dist_env(tp_degree=tp_degree, devices=group_devices)
 
         # Distributed init: per-TP-group, NOT global. Default PG ends up
         # being the TP group itself. Skipped entirely when this group has
@@ -162,7 +169,6 @@ def run_worker(
             k: v for k, v in merged_source.items()
             if k in valid_keys and v is not None
         }
-        group_devices = [devices[r] for r in group_topology[my_group_id]]
         config = config_cls.from_args(
             **merged,
             devices=group_devices,
