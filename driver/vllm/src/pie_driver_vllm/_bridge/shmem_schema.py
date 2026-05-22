@@ -337,23 +337,57 @@ class ResponseBuilder:
 
         self.reset()
         if fast_path:
-            self._fill_token_only(
+            return self._build_token_only(
+                driver_id,
                 batch.request_output_counts,
                 sampling_results["tokens"],
+                dst_buf=dst_buf,
             )
-        else:
-            self._fill_full(batch.create_responses(sampling_results))
+
+        self._fill_full(batch.create_responses(sampling_results))
 
         return self.build(driver_id, dst_buf=dst_buf)
 
-    def _fill_token_only(self, counts, tokens) -> None:
-        """Fast path: one `add_request` per request with just tokens."""
-        cursor = 0
-        for n in counts:
-            n = int(n)
-            req_tokens = list(tokens[cursor:cursor + n])
-            self.add_request(tokens=req_tokens)
-            cursor += n
+    def _build_token_only(
+        self,
+        driver_id: int,
+        counts,
+        tokens,
+        dst_buf=None,
+    ) -> int | bytes:
+        """Serialize the common token-only response without per-request dicts."""
+        counts_np = np.asarray(counts, dtype=np.uint32)
+        tokens_indptr = np.empty(counts_np.size + 1, dtype=np.uint32)
+        tokens_indptr[0] = 0
+        if counts_np.size:
+            np.cumsum(counts_np, out=tokens_indptr[1:])
+        tokens_np = np.asarray(tokens, dtype=np.uint32)
+
+        empty_u32 = np.empty(0, dtype=np.uint32)
+        empty_f32 = np.empty(0, dtype=np.float32)
+        result = _pb.build_forward_response(
+            driver_id=driver_id,
+            num_requests=int(counts_np.size),
+            tokens_indptr=tokens_indptr,
+            tokens=tokens_np,
+            dists_req_indptr=empty_u32,
+            dists_kv_indptr=empty_u32,
+            dists_ids=empty_u32,
+            dists_probs=empty_f32,
+            logits_req_indptr=empty_u32,
+            logits_byte_indptr=empty_u32,
+            logits_bytes=b"",
+            logprobs_req_indptr=empty_u32,
+            logprobs_val_indptr=empty_u32,
+            logprobs_values=empty_f32,
+            entropies_indptr=empty_u32,
+            entropies=empty_f32,
+        )
+        if dst_buf is not None:
+            mv = memoryview(dst_buf)
+            mv[: len(result)] = result
+            return len(result)
+        return result
 
     def _fill_full(self, responses) -> None:
         """Slow path: walk per-request ForwardPassResponse-like objects."""

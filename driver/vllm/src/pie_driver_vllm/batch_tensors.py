@@ -209,6 +209,7 @@ def build_sampling_metadata(
     return {
         "indices_for_logits": indices_for_logits,
         "temperatures": temperatures,
+        "greedy_mask": batch.temperatures <= 0.0,
         "sampler_groups": sampler_groups,
         "top_k": top_k_tensor,
         "top_p": top_p_tensor,

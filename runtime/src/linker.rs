@@ -6,7 +6,11 @@
 
 pub(crate) mod dynamic_linking;
 
+use std::collections::HashMap;
+use std::path::Path;
 use std::sync::LazyLock;
+use std::sync::OnceLock;
+use std::time::Instant;
 
 use anyhow::{Result, anyhow};
 use tokio::sync::oneshot;
@@ -24,6 +28,20 @@ use crate::service::{Service, ServiceHandler};
 // ---- Singleton Actor --------------------------------------------------------
 
 static SERVICE: LazyLock<Service<Message>> = LazyLock::new(Service::new);
+
+fn launch_profile_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("PIE_PROFILE_LAUNCH").is_some())
+}
+
+fn launch_profile(process_id: ProcessId, stage: &str, elapsed: std::time::Duration) {
+    if launch_profile_enabled() {
+        println!(
+            "[launch-profile] pid={process_id} stage={stage} elapsed_us={}",
+            elapsed.as_micros()
+        );
+    }
+}
 
 /// Per-instance security policies. Compiled once at bootstrap and
 /// shared by reference into every spawned inferlet.
@@ -66,7 +84,7 @@ pub async fn instantiate(
     username: String,
     program_name: &ProgramName,
     capture_outputs: bool,
-    token_budget: Option<usize>,
+    _token_budget: Option<usize>,
 ) -> Result<(Store<InstanceState>, WasmInstance)> {
     let (tx, rx) = oneshot::channel();
     SERVICE.send(Message::Instantiate {
@@ -74,7 +92,6 @@ pub async fn instantiate(
         username,
         program_name: program_name.clone(),
         capture_outputs,
-        token_budget,
         response: tx,
     })?;
     rx.await?
@@ -85,6 +102,32 @@ pub async fn instantiate(
 struct Linker {
     engine: Engine,
     policy: InstancePolicy,
+    base_linkers: HashMap<BaseLinkerKey, WasmLinker<InstanceState>>,
+    prepared_programs: HashMap<ProgramName, PreparedProgram>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct BaseLinkerKey {
+    python_runtime: bool,
+    any_snapshotted: bool,
+}
+
+struct InstantiatePlan {
+    engine: Engine,
+    policy: InstancePolicy,
+    component: Component,
+    dependency_components: Vec<Component>,
+    base_linker: WasmLinker<InstanceState>,
+    py_runtime_dir_for_state: Option<&'static Path>,
+}
+
+#[derive(Clone)]
+struct PreparedProgram {
+    generation: u64,
+    component: Component,
+    dependency_components: Vec<Component>,
+    base_linker_key: BaseLinkerKey,
+    py_runtime_dir_for_state: Option<&'static Path>,
 }
 
 impl Linker {
@@ -92,21 +135,21 @@ impl Linker {
         Linker {
             engine: engine.clone(),
             policy,
+            base_linkers: HashMap::new(),
+            prepared_programs: HashMap::new(),
         }
     }
 
-    async fn instantiate(
-        &self,
-        process_id: ProcessId,
-        username: String,
-        program_name: &ProgramName,
-        capture_outputs: bool,
-        _token_budget: Option<usize>,
-    ) -> Result<(Store<InstanceState>, WasmInstance)> {
+    async fn prepare(&mut self, program_name: &ProgramName) -> Result<InstantiatePlan> {
         // 1. Get the main component (with snapshot status + python-runtime decl)
         let main = program::get_wasm_component(program_name)
             .await
             .ok_or_else(|| anyhow!("Component not found for program: {}", program_name))?;
+        if let Some(prepared) = self.prepared_programs.get(program_name).cloned() {
+            if prepared.generation == main.generation {
+                return self.instantiate_plan(prepared);
+            }
+        }
 
         // 2. Resolve dependencies and reconcile the python-runtime requirement
         //    across the main program and its direct dependencies. Also tracks
@@ -126,31 +169,49 @@ impl Linker {
         //    start sections have been baked into the snapshot image, so
         //    running them again would clobber it. Use full modules otherwise
         //    so CPython can initialize normally.
-        let (shared_modules_for_linker, py_runtime_dir_for_state) = if python_runtime.is_some() {
-            let modules = if any_snapshotted {
-                py_runtime::stripped_modules()
-            } else {
-                py_runtime::full_modules()
-            };
-            (modules, py_runtime::dir())
+        let key = if python_runtime.is_some() {
+            BaseLinkerKey {
+                python_runtime: true,
+                any_snapshotted,
+            }
         } else {
-            (&[][..], None)
+            BaseLinkerKey {
+                python_runtime: false,
+                any_snapshotted: false,
+            }
         };
+        let py_runtime_dir_for_state = python_runtime.as_ref().and(py_runtime::dir());
 
-        // 4. Create instance state and store
-        let inst_state = InstanceState::new(
-            process_id,
-            username,
-            capture_outputs,
-            &self.policy,
+        let prepared = PreparedProgram {
+            generation: main.generation,
+            component,
+            dependency_components,
+            base_linker_key: key,
             py_runtime_dir_for_state,
-        )
-        .await?;
-        let mut store = Store::new(&self.engine, inst_state);
+        };
+        self.prepared_programs
+            .insert(program_name.clone(), prepared.clone());
+        self.instantiate_plan(prepared)
+    }
 
-        // 5. Create and configure linker
+    fn instantiate_plan(&mut self, prepared: PreparedProgram) -> Result<InstantiatePlan> {
+        let base_linker = self.base_linker(prepared.base_linker_key)?;
+        Ok(InstantiatePlan {
+            engine: self.engine.clone(),
+            policy: self.policy.clone(),
+            component: prepared.component,
+            dependency_components: prepared.dependency_components,
+            base_linker,
+            py_runtime_dir_for_state: prepared.py_runtime_dir_for_state,
+        })
+    }
+
+    fn base_linker(&mut self, key: BaseLinkerKey) -> Result<WasmLinker<InstanceState>> {
+        if let Some(linker) = self.base_linkers.get(&key) {
+            return Ok(linker.clone());
+        }
+
         let mut linker = WasmLinker::<InstanceState>::new(&self.engine);
-
         wasmtime_wasi::p2::add_to_linker_async(&mut linker).expect("Failed to link WASI");
 
         // wasi:http operates above wasi:sockets and bypasses the per-socket
@@ -169,6 +230,15 @@ impl Linker {
 
         // Register shared core modules (e.g. CPython interpreter) so Python
         // inferlets can dynamically import the runtime instead of bundling it.
+        let shared_modules_for_linker = if key.python_runtime {
+            if key.any_snapshotted {
+                py_runtime::stripped_modules()
+            } else {
+                py_runtime::full_modules()
+            }
+        } else {
+            &[][..]
+        };
         for (name, module) in shared_modules_for_linker.iter() {
             linker
                 .root()
@@ -176,22 +246,58 @@ impl Linker {
                 .unwrap_or_else(|e| panic!("Failed to register shared module '{name}': {e}"));
         }
 
-        // 6. Instantiate library dependencies (dynamic linking)
+        self.base_linkers.insert(key, linker.clone());
+        Ok(linker)
+    }
+
+    async fn instantiate_prepared(
+        plan: InstantiatePlan,
+        process_id: ProcessId,
+        username: String,
+        capture_outputs: bool,
+    ) -> Result<(Store<InstanceState>, WasmInstance)> {
+        let InstantiatePlan {
+            engine,
+            policy,
+            component,
+            dependency_components,
+            mut base_linker,
+            py_runtime_dir_for_state,
+        } = plan;
+
+        // 1. Create instance state and store
+        let stage_start = Instant::now();
+        let inst_state = InstanceState::new(
+            process_id,
+            username,
+            capture_outputs,
+            &policy,
+            py_runtime_dir_for_state,
+        )
+        .await?;
+        let mut store = Store::new(&engine, inst_state);
+        launch_profile(process_id, "instance_state_store", stage_start.elapsed());
+
+        // 2. Instantiate library dependencies (dynamic linking)
         if !dependency_components.is_empty() {
+            let stage_start = Instant::now();
             dynamic_linking::instantiate_libraries(
-                &self.engine,
-                &mut linker,
+                &engine,
+                &mut base_linker,
                 &mut store,
                 dependency_components,
             )
             .await?;
+            launch_profile(process_id, "dependency_instantiate", stage_start.elapsed());
         }
 
-        // 7. Instantiate the main component
-        let instance = linker
+        // 3. Instantiate the main component
+        let stage_start = Instant::now();
+        let instance = base_linker
             .instantiate_async(&mut store, &component)
             .await
             .map_err(|e| anyhow!("Instantiation error: {e}"))?;
+        launch_profile(process_id, "component_instantiate", stage_start.elapsed());
 
         Ok((store, instance))
     }
@@ -258,7 +364,6 @@ enum Message {
         username: String,
         program_name: ProgramName,
         capture_outputs: bool,
-        token_budget: Option<usize>,
         response: oneshot::Sender<Result<(Store<InstanceState>, WasmInstance)>>,
     },
 }
@@ -273,19 +378,28 @@ impl ServiceHandler for Linker {
                 username,
                 program_name,
                 capture_outputs,
-                token_budget,
                 response,
             } => {
-                let _ = response.send(
-                    self.instantiate(
-                        process_id,
-                        username,
-                        &program_name,
-                        capture_outputs,
-                        token_budget,
-                    )
-                    .await,
-                );
+                let stage_start = Instant::now();
+                let prepared = self.prepare(&program_name).await;
+                launch_profile(process_id, "linker_prepare", stage_start.elapsed());
+                match prepared {
+                    Ok(plan) => {
+                        tokio::spawn(async move {
+                            let result = Linker::instantiate_prepared(
+                                plan,
+                                process_id,
+                                username,
+                                capture_outputs,
+                            )
+                            .await;
+                            let _ = response.send(result);
+                        });
+                    }
+                    Err(e) => {
+                        let _ = response.send(Err(e));
+                    }
+                }
             }
         }
     }

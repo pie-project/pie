@@ -5,6 +5,23 @@ The lifecycle lives in `._bridge._launcher` — sglang depends on
 the launcher helper from there keeps the dependency graph one-deep.
 """
 
+from __future__ import annotations
+
+import os
+import sys
+from pathlib import Path
+
+
+def _ensure_venv_bin_on_path() -> None:
+    bin_dir = str(Path(sys.prefix) / "bin")
+    path = os.environ.get("PATH", "")
+    parts = path.split(os.pathsep) if path else []
+    if bin_dir not in parts:
+        os.environ["PATH"] = bin_dir + (os.pathsep + path if path else "")
+
+
+_ensure_venv_bin_on_path()
+
 from ._bridge._launcher import launch
 
 from . import worker

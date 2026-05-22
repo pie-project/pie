@@ -50,7 +50,11 @@ class _HiddenCapture(torch.nn.Module):
     def forward(self, input_ids, hidden_states, lm_head, forward_batch, aux=None):
         from sglang.srt.layers.logits_processor import LogitsProcessorOutput
         self.captured = hidden_states
-        return LogitsProcessorOutput(next_token_logits=None, hidden_states=hidden_states)
+        placeholder_logits = hidden_states.new_empty((hidden_states.shape[0], 0))
+        return LogitsProcessorOutput(
+            next_token_logits=placeholder_logits,
+            hidden_states=hidden_states,
+        )
 
 
 class SGLangForwardPass:
@@ -117,20 +121,29 @@ class SGLangForwardPass:
                 "kv_page_indices": kv_page_indices,
                 "kv_page_indptr": kv_page_indptr,
                 "kv_last_page_lens": kv_last_page_lens,
+                "custom_mask": input_embeds.get("custom_mask"),
+                "single_token_inference_mode": input_embeds.get(
+                    "single_token_inference_mode", False
+                ),
             },
             page_size=self.page_size,
             device=self.device,
         )
 
         self._capture.captured = None
-        self.runner.forward(fb)
+        output = self.runner.forward(fb)
 
-        if self._capture.captured is None:
+        logits_output = getattr(output, "logits_output", None)
+        hidden_states = getattr(logits_output, "hidden_states", None)
+        if hidden_states is None:
+            hidden_states = self._capture.captured
+
+        if hidden_states is None:
             raise RuntimeError(
                 "pie_driver_sglang: hidden states were not captured. The "
                 "model didn't call its logits_processor (unexpected forward path)."
             )
-        return self._capture.captured
+        return hidden_states
 
     # ------------------------------------------------------------------
     # Sampling

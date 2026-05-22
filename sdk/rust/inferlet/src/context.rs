@@ -8,10 +8,10 @@ mod constraint;
 // Re-export submodule public types.
 pub use constraint::*;
 
-use crate::inference::ForwardPass;
-use crate::model::Model;
 use crate::ForwardPassExt;
 use crate::Result;
+use crate::inference::ForwardPass;
+use crate::model::Model;
 use crate::sample::Sampler;
 use serde_json;
 
@@ -49,12 +49,21 @@ use crate::pie::instruct::chat;
 /// make-cost term: forward-pass compute is billed against the token
 /// wallet, not the credit wallet.
 pub(crate) fn compute_bid(
-    balance: f64, pages: f64, mu: f64, cv2: f64, page_size: f64, dividend: f64,
+    balance: f64,
+    pages: f64,
+    mu: f64,
+    cv2: f64,
+    page_size: f64,
+    dividend: f64,
 ) -> f64 {
     let mu = mu.max(1.0);
     let numerator = balance / mu + dividend;
     let denominator = pages + mu * (1.0 + cv2) / (2.0 * page_size);
-    if denominator > 0.0 { numerator / denominator } else { numerator }
+    if denominator > 0.0 {
+        numerator / denominator
+    } else {
+        numerator
+    }
 }
 
 // =============================================================================
@@ -428,7 +437,6 @@ impl Context {
     pub fn generate(&mut self, sampler: Sampler) -> crate::generation::Generator<'_> {
         crate::generation::Generator::new(self, sampler)
     }
-
 }
 
 // =============================================================================

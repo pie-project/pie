@@ -17,8 +17,8 @@ use crate::ForwardPassExt;
 use crate::Result;
 use crate::adapter::Adapter;
 use crate::context::Context;
-use crate::pie::core::inference::{ForwardPass, SlotOutput};
 use crate::pie::core::inference::Output as RawOutput;
+use crate::pie::core::inference::{ForwardPass, SlotOutput};
 use crate::sample::{self, Probe, Sampler};
 
 // =============================================================================
@@ -61,12 +61,17 @@ pub struct ProbeHandle<P> {
 // impls so handles are always `Copy`.
 impl<P> Copy for ProbeHandle<P> {}
 impl<P> Clone for ProbeHandle<P> {
-    fn clone(&self) -> Self { *self }
+    fn clone(&self) -> Self {
+        *self
+    }
 }
 
 impl<P> ProbeHandle<P> {
     pub(crate) fn new(slot: u32) -> Self {
-        Self { slot, _kind: PhantomData }
+        Self {
+            slot,
+            _kind: PhantomData,
+        }
     }
     pub(crate) fn slot(&self) -> u32 {
         self.slot
@@ -372,7 +377,11 @@ impl Output {
         tokens: Vec<u32>,
         auto_sampler: Option<SampleHandle>,
     ) -> Self {
-        Self { raw, tokens, auto_sampler }
+        Self {
+            raw,
+            tokens,
+            auto_sampler,
+        }
     }
 
     /// Underlying WIT output, for callers who need the raw slot list or the
@@ -414,10 +423,7 @@ impl Output {
     }
 
     /// Distribution as `(ids, probs)` for a [`Distribution`](sample::Distribution) probe.
-    pub fn distribution(
-        &self,
-        h: ProbeHandle<sample::Distribution>,
-    ) -> Option<(&[u32], &[f32])> {
+    pub fn distribution(&self, h: ProbeHandle<sample::Distribution>) -> Option<(&[u32], &[f32])> {
         match self.raw.slots.get(h.slot() as usize)? {
             SlotOutput::Distribution((ids, ps)) => Some((ids.as_slice(), ps.as_slice())),
             _ => None,

@@ -73,6 +73,8 @@ use std::time::{Duration, Instant};
 
 use super::scheduler::{Decision, SchedulingPolicy};
 
+const COLD_START_COHORT_WAIT: Duration = Duration::from_millis(10);
+
 // =============================================================================
 // AdaptivePolicy — the default. Cohort cap + GPU-busy gate + safety bound.
 // =============================================================================
@@ -85,7 +87,9 @@ use super::scheduler::{Decision, SchedulingPolicy};
 //                                           Arrivals during the wait
 //                                           grow this batch.
 //   3. `last_latency == 0`                — cold start, no measurement
-//                                           yet; fire to make progress.
+//                                           yet; briefly wait for the
+//                                           initial serving cohort, then
+//                                           fire to make progress.
 //   4. `B >= pinned_count(driver_idx)`    — every active peer is in
 //                                           the batch (cohort cap).
 //                                           Fire.
@@ -245,9 +249,21 @@ impl SchedulingPolicy for AdaptivePolicy {
         if self.in_flight {
             return Decision::Wait(Duration::from_secs(60));
         }
-        // (3) Cold start. Once the GPU is free and there is no
-        //     latency measurement yet, fire to make progress.
+        // (3) Cold start. Once the GPU is free and there is no latency
+        //     measurement yet, give the first serving cohort a small window
+        //     to assemble. This avoids permanently paying for an initial
+        //     singleton batch when many inferlets are launched concurrently
+        //     but arrive a few milliseconds apart.
         if self.last_latency == 0.0 {
+            let Some(start) = self.batch_start_time else {
+                // Defensive: if decide is called before on_arrival, there is
+                // no accumulation window to measure, so fire.
+                return Decision::Fire;
+            };
+            let elapsed = start.elapsed();
+            if elapsed < COLD_START_COHORT_WAIT {
+                return Decision::Wait(COLD_START_COHORT_WAIT - elapsed);
+            }
             return Decision::Fire;
         }
         // GPU is free below this point.
@@ -436,9 +452,16 @@ mod tests {
     #[test]
     fn adaptive_cold_start_fires() {
         let mut policy = AdaptivePolicy::new(512, 0);
-        // No batches completed yet — last_latency = 0; fire to make
-        // progress.
+        // Defensive case: no batches completed and no accumulation window was
+        // started, so fire to make progress.
         assert!(matches!(policy.decide(1), Decision::Fire));
+    }
+
+    #[test]
+    fn adaptive_cold_start_waits_for_initial_cohort() {
+        let mut policy = AdaptivePolicy::new(512, 0);
+        policy.on_arrival();
+        assert!(matches!(policy.decide(1), Decision::Wait(_)));
     }
 
     #[test]

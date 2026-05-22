@@ -83,6 +83,10 @@ impl Session {
                         serde_json::Value::from(inf.last_batch_latency_us),
                     );
                     stats.insert(
+                        format!("{}.cumulative_batch_latency_us", model_name),
+                        serde_json::Value::from(inf.cumulative_batch_latency_us),
+                    );
+                    stats.insert(
                         format!("{}.avg_batch_latency_us", model_name),
                         serde_json::Value::from(inf.avg_batch_latency_us),
                     );
@@ -107,6 +111,55 @@ impl Session {
                             inference::CHAIN_DROP_COUNT.load(std::sync::atomic::Ordering::Relaxed),
                         ),
                     );
+                    if let Some(exec) = crate::api::inference::execute_profile_snapshot() {
+                        let mean_value = |total_us: u64, denom: u64| -> serde_json::Value {
+                            serde_json::Value::from(if denom > 0 { total_us / denom } else { 0 })
+                        };
+                        stats.insert(
+                            format!("{}.execute_profile_calls", model_name),
+                            serde_json::Value::from(exec.calls),
+                        );
+                        stats.insert(
+                            format!("{}.execute_profile_hits", model_name),
+                            serde_json::Value::from(exec.hits),
+                        );
+                        stats.insert(
+                            format!("{}.execute_profile_misses", model_name),
+                            serde_json::Value::from(exec.misses),
+                        );
+                        stats.insert(
+                            format!("{}.execute_profile_total_mean_us", model_name),
+                            mean_value(exec.total_us, exec.calls),
+                        );
+                        stats.insert(
+                            format!("{}.execute_profile_prepare_mean_us", model_name),
+                            mean_value(exec.prepare_us, exec.calls),
+                        );
+                        stats.insert(
+                            format!("{}.execute_profile_try_hit_mean_us", model_name),
+                            mean_value(exec.try_hit_us, exec.calls),
+                        );
+                        stats.insert(
+                            format!("{}.execute_profile_hit_wait_mean_us", model_name),
+                            mean_value(exec.hit_wait_us, exec.hits),
+                        );
+                        stats.insert(
+                            format!("{}.execute_profile_cold_prepare_mean_us", model_name),
+                            mean_value(exec.cold_prepare_us, exec.misses),
+                        );
+                        stats.insert(
+                            format!("{}.execute_profile_pin_mean_us", model_name),
+                            mean_value(exec.pin_us, exec.misses),
+                        );
+                        stats.insert(
+                            format!("{}.execute_profile_submit_wait_mean_us", model_name),
+                            mean_value(exec.submit_wait_us, exec.misses),
+                        );
+                        stats.insert(
+                            format!("{}.execute_profile_postprocess_mean_us", model_name),
+                            mean_value(exec.postprocess_us, exec.calls),
+                        );
+                    }
                 }
 
                 self.send_response(corr_id, true, serde_json::Value::Object(stats).to_string())
@@ -189,11 +242,27 @@ impl Session {
                         return;
                     }
                 };
+                let program_name = manifest.program_name();
 
                 match program::add(buffer, manifest, force_overwrite).await {
                     Ok(()) => {
-                        self.send_response(corr_id, true, "Program added successfully".to_string())
-                            .await;
+                        if force_overwrite {
+                            self.installed_programs.remove(&program_name);
+                        }
+                        match program::install(&program_name).await {
+                            Ok(()) => {
+                                self.installed_programs.insert(program_name);
+                                self.send_response(
+                                    corr_id,
+                                    true,
+                                    "Program installed successfully".to_string(),
+                                )
+                                .await;
+                            }
+                            Err(e) => {
+                                self.send_response(corr_id, false, e.to_string()).await;
+                            }
+                        }
                     }
                     Err(e) => {
                         self.send_response(corr_id, false, e.to_string()).await;
@@ -225,10 +294,15 @@ impl Session {
             }
         };
 
-        // Install program and dependencies (handles both uploaded and registry)
-        if let Err(e) = program::install(&program_name).await {
-            self.send_response(corr_id, false, e.to_string()).await;
-            return;
+        // Install program and dependencies (handles both uploaded and registry).
+        // Uploaded programs are installed during add_program, so repeated hot
+        // launches can skip the program-manager round trip in this session.
+        if !self.installed_programs.contains(&program_name) {
+            if let Err(e) = program::install(&program_name).await {
+                self.send_response(corr_id, false, e.to_string()).await;
+                return;
+            }
+            self.installed_programs.insert(program_name.clone());
         }
 
         // Launch the process
@@ -275,9 +349,12 @@ impl Session {
         };
 
         // Install program and dependencies (handles both uploaded and registry)
-        if let Err(e) = program::install(&program_name).await {
-            self.send_response(corr_id, false, e.to_string()).await;
-            return;
+        if !self.installed_programs.contains(&program_name) {
+            if let Err(e) = program::install(&program_name).await {
+                self.send_response(corr_id, false, e.to_string()).await;
+                return;
+            }
+            self.installed_programs.insert(program_name.clone());
         }
 
         match daemon::spawn(self.username.clone(), program_name, port as u16, input) {

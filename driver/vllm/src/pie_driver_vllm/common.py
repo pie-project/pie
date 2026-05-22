@@ -52,7 +52,49 @@ TOKEN_SAMPLING_TYPES = frozenset({1, 2, 3, 4, 5})
 DIST_TYPES = frozenset({0})
 RAW_LOGITS_TYPE = 7
 LOGPROB_TYPES = frozenset({8, 9, 10})
-NEEDS_PROBS_TYPES = TOKEN_SAMPLING_TYPES | DIST_TYPES  # need temperature-scaled softmax
+_TOKEN_COPY_BUFFERS: dict[int, torch.Tensor] = {}
+_TOKEN_COPY_EVENTS: dict[int, torch.cuda.Event] = {}
+
+
+def _cuda_device_index(device: torch.device) -> int:
+    if device.index is not None:
+        return int(device.index)
+    return torch.cuda.current_device()
+
+
+def _tokens_to_list(tokens: torch.Tensor) -> list[int]:
+    """Copy sampled ids to CPU using vLLM's pinned-buffer/event pattern.
+
+    Direct `Tensor.tolist()` on a CUDA tensor can force a device-wide sync.
+    A non-blocking copy into pinned CPU memory followed by a CUDA event sync
+    waits only for the token-copy stream dependency before converting the
+    already-host-visible tensor to Python ints.
+    """
+    if not tokens.is_cuda:
+        return tokens.tolist()
+
+    flat = tokens.reshape(-1)
+    n = int(flat.numel())
+    device_idx = _cuda_device_index(flat.device)
+    pinned = _TOKEN_COPY_BUFFERS.get(device_idx)
+    if pinned is None or pinned.dtype != flat.dtype or pinned.numel() < n:
+        pinned = torch.empty(
+            max(n, 1024),
+            dtype=flat.dtype,
+            device="cpu",
+            pin_memory=True,
+        )
+        _TOKEN_COPY_BUFFERS[device_idx] = pinned
+    event = _TOKEN_COPY_EVENTS.get(device_idx)
+    if event is None:
+        event = torch.cuda.Event()
+        _TOKEN_COPY_EVENTS[device_idx] = event
+
+    view = pinned[:n]
+    view.copy_(flat, non_blocking=True)
+    event.record(torch.cuda.current_stream(flat.device))
+    event.synchronize()
+    return view.tolist()
 
 
 def scaled_softmax(logits, temperatures, greedy_threshold=1e-5):
@@ -120,7 +162,18 @@ def sample_common(
     sampler_groups = sampling_metadata["sampler_groups"]
     num_logit_requests = len(indices_for_logits)
 
-    needs_probs = any(idx in NEEDS_PROBS_TYPES for idx in sampler_groups)
+    greedy_mask = sampling_metadata.get("greedy_mask")
+    if greedy_mask is None:
+        greedy_mask = np.zeros(num_logit_requests, dtype=np.bool_)
+
+    def _non_greedy_slots(indices: list[int]) -> list[int]:
+        return [idx for idx in indices if not bool(greedy_mask[idx])]
+
+    needs_probs = any(idx in DIST_TYPES for idx in sampler_groups) or any(
+        _non_greedy_slots(indices)
+        for idx, indices in sampler_groups.items()
+        if idx in TOKEN_SAMPLING_TYPES
+    )
     needs_log_probs = any(idx in LOGPROB_TYPES for idx in sampler_groups)
 
     if needs_probs:
@@ -162,7 +215,7 @@ def sample_common(
     final_logprobs: list[list[float] | None] = [None] * num_logit_requests
     final_entropies: list[float | None] = [None] * num_logit_requests
     final_tokens_tensor = torch.empty(
-        num_logit_requests, dtype=torch.long, device=device
+        num_logit_requests, dtype=torch.int32, device=device
     )
 
     # Pre-built tensors for sampler params (no per-group dict extraction)
@@ -204,6 +257,22 @@ def sample_common(
                 _process_entropy(indices, log_probs, subset_rows, final_entropies)
             continue
 
+        if sampler_idx in TOKEN_SAMPLING_TYPES:
+            greedy_indices = [idx for idx in indices if bool(greedy_mask[idx])]
+            if greedy_indices:
+                greedy_rows = torch.as_tensor(
+                    greedy_indices, device=device, dtype=torch.long
+                )
+                greedy_tokens = logits.index_select(0, greedy_rows).argmax(dim=-1)
+                if greedy_tokens.dtype != torch.int32:
+                    greedy_tokens = greedy_tokens.to(torch.int32)
+                final_tokens_tensor.scatter_(0, greedy_rows, greedy_tokens)
+
+            indices = _non_greedy_slots(indices)
+            if not indices:
+                continue
+            indices_tensor = torch.as_tensor(indices, device=device, dtype=torch.long)
+
         group_probs = probs.index_select(0, indices_tensor)
 
         if sampler_idx == 0:
@@ -229,14 +298,15 @@ def sample_common(
                 group_min_p,
                 group_seeds,
             )
-            if sampled.dtype != torch.long:
-                sampled = sampled.to(torch.long)
+            if sampled.dtype != torch.int32:
+                sampled = sampled.to(torch.int32)
 
             final_tokens_tensor.scatter_(0, indices_tensor, sampled)
 
-    # Stage 5: Combine results — `.tolist()` forces a CPU sync so we can
-    # ship plain Python ints back to the worker.
-    final_tokens_list = final_tokens_tensor.tolist()
+    # Stage 5: Combine results into plain Python ints for the wire path.
+    # Use a pinned CPU staging buffer instead of CUDA `tolist()` so this
+    # synchronization matches vLLM's hot path.
+    final_tokens_list = _tokens_to_list(final_tokens_tensor)
 
     return {
         "tokens": final_tokens_list,

@@ -1117,6 +1117,8 @@ mod tests {
             max_forward_requests: max_requests,
             max_forward_tokens: max_tokens,
             max_page_refs: max_pages,
+            max_logit_rows: usize::MAX,
+            max_prob_rows: usize::MAX,
             max_sampler_rows: usize::MAX,
             max_custom_mask_bytes: usize::MAX,
             max_logprob_labels: usize::MAX,
@@ -1126,10 +1128,7 @@ mod tests {
     fn positioned_pending_with_receiver(
         tokens: usize,
         page_size: u32,
-    ) -> (
-        PendingRequest,
-        oneshot::Receiver<Result<pie_bridge::ForwardResponse>>,
-    ) {
+    ) -> (PendingRequest, oneshot::Receiver<Result<ForwardOutput>>) {
         let (tx, rx) = oneshot::channel();
         let pages = (tokens as u32).div_ceil(page_size);
         let last_page_len = compute_last_page_len(tokens as u32, pages, page_size);
@@ -1215,6 +1214,13 @@ mod tests {
             entropies_indptr: vec![0, 1],
             entropies: vec![entropy],
             ..Default::default()
+        }
+    }
+
+    fn expect_forward_response(result: Result<ForwardOutput>) -> pie_bridge::ForwardResponse {
+        match result.expect("chunked response ok") {
+            ForwardOutput::Response(resp) => resp,
+            other => panic!("expected ForwardOutput::Response, got {other:?}"),
         }
     }
 
@@ -1393,10 +1399,7 @@ mod tests {
         assert_eq!(chunk_sampler_slots(&final_chunk), &[0]);
         final_chunk.send_result(Ok(token_response(99)), Some(&weak_submit_tx), 4);
 
-        let merged = response_rx
-            .try_recv()
-            .expect("merged response")
-            .expect("chunked response ok");
+        let merged = expect_forward_response(response_rx.try_recv().expect("merged response"));
         assert_eq!(merged.num_requests, 1);
         assert_eq!(merged.tokens, vec![99, 11]);
         assert_eq!(merged.tokens_indptr, vec![0, 2]);
@@ -1728,7 +1731,7 @@ mod tests {
                 4,
             );
             if let Ok(result) = response_rx.try_recv() {
-                let merged = result.expect("chunked response ok");
+                let merged = expect_forward_response(result);
                 assert_eq!(merged.num_requests, 1);
                 assert_eq!(merged.tokens_indptr, vec![0, 0]);
                 assert_eq!(merged.dists_req_indptr, vec![0, 0]);
@@ -1860,7 +1863,7 @@ mod tests {
                 64,
             );
             if let Ok(result) = response_rx.try_recv() {
-                break result.expect("chunked response ok");
+                break expect_forward_response(result);
             }
             current = submit_rx.try_recv().expect("next continuation");
         };

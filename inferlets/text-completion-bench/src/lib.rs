@@ -17,11 +17,7 @@
 //! top_p 0.95) so workload shape is otherwise identical.
 
 use inferlet::{
-    Context, Result,
-    chat,
-    model::Model,
-    runtime,
-    sample::Sampler,
+    Context, FutureStringExt, Result, chat, model::Model, runtime, sample::Sampler, session,
 };
 use serde::{Deserialize, Serialize};
 
@@ -49,12 +45,27 @@ struct Input {
     /// chain-firing overlap with WASM time.
     #[serde(default)]
     wasm_delay_us: u64,
+    /// Detokenize generated tokens into the returned `text` field. Throughput
+    /// benchmarks disable this by default to match standalone baselines that
+    /// report token IDs without detokenization.
+    #[serde(default)]
+    decode_output: bool,
+    #[serde(default)]
+    start_signal: bool,
 }
 
-fn default_max_tokens() -> usize { 256 }
-fn default_system() -> String { "You are a helpful, respectful and honest assistant.".into() }
-fn default_temperature() -> f32 { 0.6 }
-fn default_top_p() -> f32 { 0.95 }
+fn default_max_tokens() -> usize {
+    256
+}
+fn default_system() -> String {
+    "You are a helpful, respectful and honest assistant.".into()
+}
+fn default_temperature() -> f32 {
+    0.6
+}
+fn default_top_p() -> f32 {
+    0.95
+}
 
 #[derive(Serialize)]
 struct Output {
@@ -99,6 +110,12 @@ async fn main(input: Input) -> Result<Output> {
         .max_tokens(input.max_tokens)
         .stop(&stop_tokens);
 
+    if input.start_signal {
+        session::send("ready");
+        let fut = session::receive();
+        let _ = fut.wait_async().await;
+    }
+
     let wasm_delay = std::time::Duration::from_micros(input.wasm_delay_us);
     while let Some(step) = g.next()? {
         let out = step.execute().await?;
@@ -115,10 +132,14 @@ async fn main(input: Input) -> Result<Output> {
     }
 
     let num_output_tokens = all_output_tokens.len();
-    let text = model
-        .tokenizer()
-        .decode(&all_output_tokens)
-        .unwrap_or_default();
+    let text = if input.decode_output {
+        model
+            .tokenizer()
+            .decode(&all_output_tokens)
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
 
     Ok(Output {
         num_prompt_tokens,

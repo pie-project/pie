@@ -12,13 +12,7 @@
 //!
 //!     SPEC_STATS prompt_tokens=N generated_tokens=M elapsed_ms=T tokens_per_sec=R steps=S avg_tokens_per_step=A
 
-use inferlet::{
-    Context,
-    sample::Sampler,
-    model::Model,
-    runtime,
-    Result,
-};
+use inferlet::{Context, FutureStringExt, Result, model::Model, runtime, sample::Sampler, session};
 use serde::{Deserialize, Serialize};
 use std::time::Instant;
 
@@ -36,32 +30,53 @@ struct Input {
     temperature: f32,
     #[serde(default = "default_top_p")]
     top_p: f32,
+    #[serde(default)]
+    decode_output: bool,
+    #[serde(default)]
+    start_signal: bool,
+    #[serde(default)]
+    emit_stats: bool,
+    #[serde(default)]
+    compact_output: bool,
 }
 
-fn default_max_tokens() -> usize { 128 }
+fn default_max_tokens() -> usize {
+    128
+}
 fn default_system() -> String {
     "You are a helpful, respectful and honest assistant.".into()
 }
-fn default_temperature() -> f32 { 0.0 }
-fn default_top_p() -> f32 { 1.0 }
+fn default_temperature() -> f32 {
+    0.0
+}
+fn default_top_p() -> f32 {
+    1.0
+}
 
 #[derive(Serialize)]
 struct Output {
     text: String,
     generated_tokens: usize,
-    elapsed_ms: u128,
-    prefill_ms: u128,
-    decode_ms: u128,
-    tokens_per_sec: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    elapsed_ms: Option<u128>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    prefill_ms: Option<u128>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    decode_ms: Option<u128>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tokens_per_sec: Option<f64>,
     /// Decode-loop tokens/sec, excluding the first `next()` call (which
     /// bundles prefill + the first decode step). This is the right number
     /// for NGRAM speedup comparison.
-    decode_tokens_per_sec: f64,
-    steps: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    decode_tokens_per_sec: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    steps: Option<usize>,
     /// Average tokens accepted per `next()` call. >1.0 indicates the
     /// backend is returning useful drafts (NGRAM accepting more than the
     /// single bonus token per step).
-    avg_tokens_per_step: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    avg_tokens_per_step: Option<f64>,
 }
 
 #[inferlet::main]
@@ -78,13 +93,22 @@ async fn main(input: Input) -> Result<Output> {
     let sampler = if input.temperature <= 0.0 {
         Sampler::Argmax
     } else {
-        Sampler::TopP { temperature: input.temperature, p: input.top_p }
+        Sampler::TopP {
+            temperature: input.temperature,
+            p: input.top_p,
+        }
     };
 
     let mut stream = ctx
         .generate(sampler)
         .max_tokens(input.max_tokens)
         .system_speculation();
+
+    if input.start_signal {
+        session::send("ready");
+        let fut = session::receive();
+        let _ = fut.wait_async().await;
+    }
 
     // The first step does prefill + the first decode step in one shot —
     // its latency is dominated by prompt processing, not by decode, so
@@ -110,15 +134,22 @@ async fn main(input: Input) -> Result<Output> {
     let decode_elapsed = decode_start.elapsed();
     let elapsed = prefill_elapsed + decode_elapsed;
 
-    let tokenizer = model.tokenizer();
-    let text = tokenizer.decode(&all_tokens)?;
+    let text = if input.decode_output {
+        model.tokenizer().decode(&all_tokens)?
+    } else {
+        String::new()
+    };
 
     let elapsed_ms = elapsed.as_millis();
     let prefill_ms = prefill_elapsed.as_millis();
     let decode_ms = decode_elapsed.as_millis();
     let secs = elapsed.as_secs_f64();
     let decode_secs = decode_elapsed.as_secs_f64();
-    let tps = if secs > 0.0 { all_tokens.len() as f64 / secs } else { 0.0 };
+    let tps = if secs > 0.0 {
+        all_tokens.len() as f64 / secs
+    } else {
+        0.0
+    };
     // Decode-only tokens/sec — this is what the speedup comparison should
     // use. The first step's bonus token is counted toward "decode tokens"
     // because it WAS a decode-side sample (just bundled with prefill).
@@ -134,35 +165,37 @@ async fn main(input: Input) -> Result<Output> {
         0.0
     };
 
-    // Single-line, parseable. Test reads this from stdout.
-    println!(
-        "SPEC_STATS prompt_tokens={} generated_tokens={} elapsed_ms={} \
-         prefill_ms={} decode_ms={} \
-         tokens_per_sec={:.2} decode_tokens_per_sec={:.2} \
-         steps={} avg_tokens_per_step={:.3}",
-        // Coarse prompt token proxy (whitespace count). The exact tokenizer
-        // count would require an extra tokenization round-trip; not needed
-        // for speedup comparison since prefill is excluded from decode_tps.
-        input.prompt.split_whitespace().count(),
-        all_tokens.len(),
-        elapsed_ms,
-        prefill_ms,
-        decode_ms,
-        tps,
-        decode_tps,
-        steps,
-        avg_per_step,
-    );
+    if input.emit_stats {
+        // Single-line, parseable. Tests opt in and read this from stdout.
+        println!(
+            "SPEC_STATS prompt_tokens={} generated_tokens={} elapsed_ms={} \
+             prefill_ms={} decode_ms={} \
+             tokens_per_sec={:.2} decode_tokens_per_sec={:.2} \
+             steps={} avg_tokens_per_step={:.3}",
+            // Coarse prompt token proxy (whitespace count). The exact tokenizer
+            // count would require an extra tokenization round-trip; not needed
+            // for speedup comparison since prefill is excluded from decode_tps.
+            input.prompt.split_whitespace().count(),
+            all_tokens.len(),
+            elapsed_ms,
+            prefill_ms,
+            decode_ms,
+            tps,
+            decode_tps,
+            steps,
+            avg_per_step,
+        );
+    }
 
     Ok(Output {
         text,
         generated_tokens: all_tokens.len(),
-        elapsed_ms,
-        prefill_ms,
-        decode_ms,
-        tokens_per_sec: tps,
-        decode_tokens_per_sec: decode_tps,
-        steps,
-        avg_tokens_per_step: avg_per_step,
+        elapsed_ms: (!input.compact_output).then_some(elapsed_ms),
+        prefill_ms: (!input.compact_output).then_some(prefill_ms),
+        decode_ms: (!input.compact_output).then_some(decode_ms),
+        tokens_per_sec: (!input.compact_output).then_some(tps),
+        decode_tokens_per_sec: (!input.compact_output).then_some(decode_tps),
+        steps: (!input.compact_output).then_some(steps),
+        avg_tokens_per_step: (!input.compact_output).then_some(avg_per_step),
     })
 }

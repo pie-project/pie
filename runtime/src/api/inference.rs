@@ -19,6 +19,9 @@ use pie_bridge::Brle;
 use std::iter;
 use std::mem::take;
 use std::sync::Arc;
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 use tokio::sync::oneshot;
 use wasmtime::component::Resource;
 use wasmtime_wasi::WasiView;
@@ -42,6 +45,125 @@ pub struct ForwardPass {
     spec: Option<inference::StagedBatch>,
     pub adapter_seed: Option<i64>,
     req: pie_bridge::ForwardRequest,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ExecuteProfileSnapshot {
+    pub calls: u64,
+    pub hits: u64,
+    pub misses: u64,
+    pub total_us: u64,
+    pub prepare_us: u64,
+    pub try_hit_us: u64,
+    pub hit_wait_us: u64,
+    pub cold_prepare_us: u64,
+    pub pin_us: u64,
+    pub submit_wait_us: u64,
+    pub postprocess_us: u64,
+}
+
+struct ExecuteProfileStats {
+    calls: AtomicU64,
+    hits: AtomicU64,
+    misses: AtomicU64,
+    total_us: AtomicU64,
+    prepare_us: AtomicU64,
+    try_hit_us: AtomicU64,
+    hit_wait_us: AtomicU64,
+    cold_prepare_us: AtomicU64,
+    pin_us: AtomicU64,
+    submit_wait_us: AtomicU64,
+    postprocess_us: AtomicU64,
+}
+
+static EXECUTE_PROFILE: ExecuteProfileStats = ExecuteProfileStats {
+    calls: AtomicU64::new(0),
+    hits: AtomicU64::new(0),
+    misses: AtomicU64::new(0),
+    total_us: AtomicU64::new(0),
+    prepare_us: AtomicU64::new(0),
+    try_hit_us: AtomicU64::new(0),
+    hit_wait_us: AtomicU64::new(0),
+    cold_prepare_us: AtomicU64::new(0),
+    pin_us: AtomicU64::new(0),
+    submit_wait_us: AtomicU64::new(0),
+    postprocess_us: AtomicU64::new(0),
+};
+
+fn execute_profile_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("PIE_PROFILE_EXECUTE").is_some())
+}
+
+fn elapsed_us(d: Duration) -> u64 {
+    d.as_micros().min(u128::from(u64::MAX)) as u64
+}
+
+pub fn execute_profile_snapshot() -> Option<ExecuteProfileSnapshot> {
+    if !execute_profile_enabled() {
+        return None;
+    }
+    Some(ExecuteProfileSnapshot {
+        calls: EXECUTE_PROFILE.calls.load(Ordering::Relaxed),
+        hits: EXECUTE_PROFILE.hits.load(Ordering::Relaxed),
+        misses: EXECUTE_PROFILE.misses.load(Ordering::Relaxed),
+        total_us: EXECUTE_PROFILE.total_us.load(Ordering::Relaxed),
+        prepare_us: EXECUTE_PROFILE.prepare_us.load(Ordering::Relaxed),
+        try_hit_us: EXECUTE_PROFILE.try_hit_us.load(Ordering::Relaxed),
+        hit_wait_us: EXECUTE_PROFILE.hit_wait_us.load(Ordering::Relaxed),
+        cold_prepare_us: EXECUTE_PROFILE.cold_prepare_us.load(Ordering::Relaxed),
+        pin_us: EXECUTE_PROFILE.pin_us.load(Ordering::Relaxed),
+        submit_wait_us: EXECUTE_PROFILE.submit_wait_us.load(Ordering::Relaxed),
+        postprocess_us: EXECUTE_PROFILE.postprocess_us.load(Ordering::Relaxed),
+    })
+}
+
+#[derive(Default)]
+struct ExecuteProfileSample {
+    hit: bool,
+    prepare_us: u64,
+    try_hit_us: u64,
+    hit_wait_us: u64,
+    cold_prepare_us: u64,
+    pin_us: u64,
+    submit_wait_us: u64,
+    postprocess_us: u64,
+}
+
+fn record_execute_profile(sample: ExecuteProfileSample, total_us: u64) {
+    if !execute_profile_enabled() {
+        return;
+    }
+    EXECUTE_PROFILE.calls.fetch_add(1, Ordering::Relaxed);
+    if sample.hit {
+        EXECUTE_PROFILE.hits.fetch_add(1, Ordering::Relaxed);
+    } else {
+        EXECUTE_PROFILE.misses.fetch_add(1, Ordering::Relaxed);
+    }
+    EXECUTE_PROFILE
+        .total_us
+        .fetch_add(total_us, Ordering::Relaxed);
+    EXECUTE_PROFILE
+        .prepare_us
+        .fetch_add(sample.prepare_us, Ordering::Relaxed);
+    EXECUTE_PROFILE
+        .try_hit_us
+        .fetch_add(sample.try_hit_us, Ordering::Relaxed);
+    EXECUTE_PROFILE
+        .hit_wait_us
+        .fetch_add(sample.hit_wait_us, Ordering::Relaxed);
+    EXECUTE_PROFILE
+        .cold_prepare_us
+        .fetch_add(sample.cold_prepare_us, Ordering::Relaxed);
+    EXECUTE_PROFILE
+        .pin_us
+        .fetch_add(sample.pin_us, Ordering::Relaxed);
+    EXECUTE_PROFILE
+        .submit_wait_us
+        .fetch_add(sample.submit_wait_us, Ordering::Relaxed);
+    EXECUTE_PROFILE
+        .postprocess_us
+        .fetch_add(sample.postprocess_us, Ordering::Relaxed);
 }
 
 #[derive(Debug)]
@@ -420,6 +542,10 @@ impl pie::core::inference::HostForwardPass for InstanceState {
         &mut self,
         this: Resource<ForwardPass>,
     ) -> Result<Result<Resource<FutureOutput>, String>> {
+        let profiling = execute_profile_enabled();
+        let profile_start = profiling.then(Instant::now);
+        let mut profile_sample = ExecuteProfileSample::default();
+        let prepare_start = profiling.then(Instant::now);
         let pass = self.ctx().table.get_mut(&this)?;
 
         let model_id = pass.model_id;
@@ -465,24 +591,36 @@ impl pie::core::inference::HostForwardPass for InstanceState {
         // adapter_bindings[0] already has the adapter_id set by `adapter()`;
         // stamp the seed picked up out-of-band.
         req.adapter_bindings[0].seed = adapter_seed.unwrap_or(-1);
+        if let Some(start) = prepare_start {
+            profile_sample.prepare_us = elapsed_us(start.elapsed());
+        }
 
         // Try the staged hit before synthesizing default masks or pinning. On
         // hit we skip pin/unpin entirely — the staged fire runs on pages from
         // the prior cycle.
         let driver_idx_hint = context::get_device(model_id, context_id);
         let use_pass_speculation = inference::should_use_pass_speculation(driver_idx_hint);
-        let (was_pinned, submit_result) = if let Some(rx) = spec_handle
+        let try_hit_start = profiling.then(Instant::now);
+        let staged_rx = spec_handle
             .as_ref()
             .filter(|_| use_pass_speculation)
-            .and_then(|s| inference::try_hit(s, context_id, &req))
-        {
-            (
-                false,
-                rx.await
-                    .map_err(|_| anyhow::anyhow!("staged rx dropped"))
-                    .and_then(|result| result),
-            )
+            .and_then(|s| inference::try_hit(s, context_id, &req));
+        if let Some(start) = try_hit_start {
+            profile_sample.try_hit_us = elapsed_us(start.elapsed());
+        }
+        let (was_pinned, submit_result) = if let Some(rx) = staged_rx {
+            profile_sample.hit = true;
+            let hit_wait_start = profiling.then(Instant::now);
+            let result = rx
+                .await
+                .map_err(|_| anyhow::anyhow!("staged rx dropped"))
+                .and_then(|result| result);
+            if let Some(start) = hit_wait_start {
+                profile_sample.hit_wait_us = elapsed_us(start.elapsed());
+            }
+            (false, result)
         } else {
+            let cold_prepare_start = profiling.then(Instant::now);
             // WIT spec: "if not provided, fallback to causal mask".
             if req.masks.is_empty() && !req.position_ids.is_empty() {
                 req.masks = req
@@ -506,8 +644,12 @@ impl pie::core::inference::HostForwardPass for InstanceState {
             req.spec_indptr = vec![0, n_spec];
             req.kv_page_indptr = vec![0];
             req.context_ids = vec![context_id];
+            if let Some(start) = cold_prepare_start {
+                profile_sample.cold_prepare_us = elapsed_us(start.elapsed());
+            }
 
             // Cold path: pin, validate page capacity, submit.
+            let pin_start = profiling.then(Instant::now);
             let pinned = match context::pin(model_id, context_id, num_input_tokens as u32).await {
                 Ok(p) => p,
                 Err(e) => {
@@ -515,6 +657,9 @@ impl pie::core::inference::HostForwardPass for InstanceState {
                     return Ok(Err(e.to_string()));
                 }
             };
+            if let Some(start) = pin_start {
+                profile_sample.pin_us = elapsed_us(start.elapsed());
+            }
             let kv_len = pinned.kv_len;
             let last_page_len = pinned.last_page_len;
             let driver_id = pinned.driver;
@@ -550,6 +695,7 @@ impl pie::core::inference::HostForwardPass for InstanceState {
             }
 
             let driver_idx = driver_id as usize;
+            let submit_start = profiling.then(Instant::now);
             let result = inference::submit(
                 model_id,
                 req,
@@ -559,6 +705,9 @@ impl pie::core::inference::HostForwardPass for InstanceState {
                 last_page_len,
             )
             .await;
+            if let Some(start) = submit_start {
+                profile_sample.submit_wait_us = elapsed_us(start.elapsed());
+            }
             (true, result)
         };
 
@@ -574,6 +723,7 @@ impl pie::core::inference::HostForwardPass for InstanceState {
             }
         };
 
+        let postprocess_start = profiling.then(Instant::now);
         // Append the lineage. For speculative-decoding flows, the
         // forward pass wrote KV for every speculative token (accepted
         // or not). The SDK truncates rejected drafts afterwards via
@@ -614,7 +764,14 @@ impl pie::core::inference::HostForwardPass for InstanceState {
             samplers: samplers_for_output,
             done: true,
         };
-        Ok(Ok(self.ctx().table.push(future_output)?))
+        let pushed = self.ctx().table.push(future_output)?;
+        if let Some(start) = postprocess_start {
+            profile_sample.postprocess_us = elapsed_us(start.elapsed());
+        }
+        if let Some(start) = profile_start {
+            record_execute_profile(profile_sample, elapsed_us(start.elapsed()));
+        }
+        Ok(Ok(pushed))
     }
 
     async fn drop(&mut self, this: Resource<ForwardPass>) -> Result<()> {

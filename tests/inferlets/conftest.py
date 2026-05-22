@@ -46,8 +46,8 @@ def make_parser(description: str = "Inferlet E2E Test") -> argparse.ArgumentPars
     parser.add_argument("--device", default="cuda:0", help="Device(s), comma-separated")
     parser.add_argument("--timeout", type=int, default=120, help="Timeout per inferlet (seconds)")
     parser.add_argument("--verbose", action="store_true", help="Show stdout on failure")
-    parser.add_argument("--driver", default="dev", choices=["dev", "vllm", "sglang", "dummy", "cuda_native", "portable"],
-                        help="Inference driver: 'dev' (pie_driver_dev), 'vllm' (pie_driver_vllm), 'sglang' (pie_driver_sglang), 'dummy' (pie_driver_dummy), 'cuda_native' (pie_driver_cuda_native), 'portable' (pie_driver_portable)")
+    parser.add_argument("--driver", default="dev", choices=["dev", "vllm", "sglang", "tensorrt_llm", "dummy", "cuda_native", "portable"],
+                        help="Inference driver: 'dev', 'vllm', 'sglang', 'tensorrt_llm', 'dummy', 'cuda_native', or 'portable'")
     parser.add_argument("--vllm-attention-backend", default=None,
                         help="vLLM attention backend (FLASH_ATTN / FLASHINFER / TRITON_ATTN / FLEX_ATTENTION). Default: vllm auto-picks")
     parser.add_argument("--sglang-attention-backend", default="triton",

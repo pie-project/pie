@@ -47,6 +47,9 @@ pub fn drivers_config_path() -> PathBuf {
 ///
 /// [driver.sglang]
 /// python = "/home/me/envs/sgl/bin/python"
+///
+/// [driver.tensorrt_llm]
+/// venv = "/home/me/envs/trtllm"
 /// ```
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct DriversConfig {

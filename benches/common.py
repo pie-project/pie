@@ -120,6 +120,7 @@ def print_summary(s: BenchSummary) -> None:
         "spec chain peak",
         "spec longest chain",
         "total batches",
+        "cumulative batch latency us",
         "avg batch latency us",
         "last batch latency us",
         "bypass hits",
@@ -128,6 +129,20 @@ def print_summary(s: BenchSummary) -> None:
         "total requests",
         "max forward requests",
         "batch size hist",
+        "runtime launch ack mean ms",
+        "runtime launch ack p50 ms",
+        "runtime launch ack p95 ms",
+        "runtime launch ack max ms",
+        "runtime launch ack before start ms",
+        "runtime first launch ack ms",
+        "runtime all launch ack ms",
+        "runtime ready before start ms",
+        "runtime all ready ms",
+        "runtime first return ms",
+        "runtime last return ms",
+        "runtime driver cumulative ms",
+        "runtime wall minus driver ms",
+        "runtime non-driver after launch ms",
     )
     if any(k in s.config for k in spec_keys):
         for k in spec_keys:

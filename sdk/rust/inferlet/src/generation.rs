@@ -715,9 +715,7 @@ impl<'g, 'ctx> GenStep<'g, 'ctx> {
             }
         }
         parent.tokens_generated += tokens.len();
-        if let Some(&last) = tokens.last() {
-            parent.ctx.buffer.push(last);
-        }
+        stage_generated_tokens(&mut parent.ctx.buffer, &tokens, n_drafted);
 
         // Generator owns slot 0 for its auto-attached sampler. The
         // post-truncation tokens land on `Output::tokens` (the common
@@ -729,5 +727,35 @@ impl<'g, 'ctx> GenStep<'g, 'ctx> {
             Some(SampleHandle::new(0, 1))
         };
         Ok(crate::forward::Output::from_generator(raw, tokens, auto))
+    }
+}
+
+fn stage_generated_tokens(buffer: &mut Vec<u32>, tokens: &[u32], n_drafted: u32) {
+    if n_drafted == 0 {
+        // A backend may return an accepted run directly as ordinary token
+        // slots. None of those tokens were submitted as draft inputs, so
+        // they all need to become pending input for the next pass.
+        buffer.extend_from_slice(tokens);
+    } else if let Some(&last) = tokens.last() {
+        buffer.push(last);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::stage_generated_tokens;
+
+    #[test]
+    fn stages_all_direct_accept_tokens_without_drafts() {
+        let mut buffer = vec![1];
+        stage_generated_tokens(&mut buffer, &[10, 11, 12], 0);
+        assert_eq!(buffer, vec![1, 10, 11, 12]);
+    }
+
+    #[test]
+    fn stages_only_bonus_token_after_draft_verification() {
+        let mut buffer = vec![1];
+        stage_generated_tokens(&mut buffer, &[10, 11, 12], 2);
+        assert_eq!(buffer, vec![1, 12]);
     }
 }

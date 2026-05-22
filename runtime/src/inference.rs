@@ -50,6 +50,7 @@ pub struct InferenceStats {
     /// Histogram buckets (1, 2-3, 4-7, 8-15, 16-31, 32-63, 64-127, 128+).
     pub batch_size_hist: [u64; 8],
     pub last_batch_latency_us: u64,
+    pub cumulative_batch_latency_us: u64,
     pub avg_batch_latency_us: u64,
 }
 
@@ -290,6 +291,7 @@ impl InferenceService {
             max_forward_requests_observed: max_forward_requests,
             batch_size_hist: hist,
             last_batch_latency_us: last_latency,
+            cumulative_batch_latency_us: cumulative_latency,
             avg_batch_latency_us: avg_latency,
         }
     }
