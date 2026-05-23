@@ -188,126 +188,126 @@ void linear_attn_layer_body(
     // own dense buffer via stride-aware memcpy2D.
     auto* qkv_base = la.mixed_qkv_post.data();
     const std::size_t bf16 = sizeof(std::uint16_t);
-    CUDA_CHECK(cudaMemcpy2DAsync(
-        la.q_raw.data(), K_dim * bf16,
-        qkv_base, conv_dim * bf16,
-        K_dim * bf16, N, cudaMemcpyDeviceToDevice, stream));
-    CUDA_CHECK(cudaMemcpy2DAsync(
-        la.k_raw.data(), K_dim * bf16,
-        qkv_base + K_dim, conv_dim * bf16,
-        K_dim * bf16, N, cudaMemcpyDeviceToDevice, stream));
-    CUDA_CHECK(cudaMemcpy2DAsync(
-        la.v_raw.data(), V_dim * bf16,
-        qkv_base + 2 * K_dim, conv_dim * bf16,
-        V_dim * bf16, N, cudaMemcpyDeviceToDevice, stream));
+        CUDA_CHECK(cudaMemcpy2DAsync(
+            la.q_raw.data(), K_dim * bf16,
+            qkv_base, conv_dim * bf16,
+            K_dim * bf16, N, cudaMemcpyDeviceToDevice, stream));
+        CUDA_CHECK(cudaMemcpy2DAsync(
+            la.k_raw.data(), K_dim * bf16,
+            qkv_base + K_dim, conv_dim * bf16,
+            K_dim * bf16, N, cudaMemcpyDeviceToDevice, stream));
+        CUDA_CHECK(cudaMemcpy2DAsync(
+            la.v_raw.data(), V_dim * bf16,
+            qkv_base + 2 * K_dim, conv_dim * bf16,
+            V_dim * bf16, N, cudaMemcpyDeviceToDevice, stream));
 
-    // ── L2-normalise + scale q, l2-normalise k, widen v to fp32 ─────
-    const float scale = 1.f / std::sqrt(static_cast<float>(K_d));
-    kernels::launch_l2norm_scale_bf16_to_fp32(
-        la.q_raw.data(), la.q_pre.data(),
-        N * K_h, K_d, scale, /*eps=*/1e-6f, stream);
-    kernels::launch_l2norm_scale_bf16_to_fp32(
-        la.k_raw.data(), la.k_pre.data(),
-        N * K_h, K_d, /*scale=*/1.f, /*eps=*/1e-6f, stream);
+        // ── L2-normalise + scale q, l2-normalise k, widen v to fp32 ─────
+        const float scale = 1.f / std::sqrt(static_cast<float>(K_d));
+        kernels::launch_l2norm_scale_bf16_to_fp32(
+            la.q_raw.data(), la.q_pre.data(),
+            N * K_h, K_d, scale, /*eps=*/1e-6f, stream);
+        kernels::launch_l2norm_scale_bf16_to_fp32(
+            la.k_raw.data(), la.k_pre.data(),
+            N * K_h, K_d, /*scale=*/1.f, /*eps=*/1e-6f, stream);
 
-    // repeat_interleave from K_h → V_h heads.
-    if (V_h != K_h) {
-        kernels::launch_repeat_interleave_heads_fp32(
-            la.q_pre.data(), la.q_norm.data(), N, K_h, V_h, K_d, stream);
-        kernels::launch_repeat_interleave_heads_fp32(
-            la.k_pre.data(), la.k_norm.data(), N, K_h, V_h, K_d, stream);
-    } else {
-        CUDA_CHECK(cudaMemcpyAsync(
-            la.q_norm.data(), la.q_pre.data(),
-            (std::size_t)N * K_h * K_d * sizeof(float),
-            cudaMemcpyDeviceToDevice, stream));
-        CUDA_CHECK(cudaMemcpyAsync(
-            la.k_norm.data(), la.k_pre.data(),
-            (std::size_t)N * K_h * K_d * sizeof(float),
-            cudaMemcpyDeviceToDevice, stream));
-    }
-
-    // v: bf16 → fp32 (no l2norm).
-    kernels::launch_bf16_to_fp32(
-        la.v_raw.data(), la.v_fp32.data(),
-        (std::size_t)N * V_dim, stream);
-
-    // ── g, β per token per head ────────────────────────────────────
-    kernels::launch_gated_delta_g_beta(
-        la.a.data(), la.b.data(),
-        Lw.la_A_log_fp32, Lw.la_dt_bias->data(),
-        la.g_log.data(), la.beta.data(),
-        N, V_h, stream);
-
-    // ── Recurrent update ───────────────────────────────────────────
-    // Both decode and prefill: one batched launch over (R, V_h) blocks
-    // with per-block slot (and on prefill, qo_indptr) indirection.
-    // Decode = one token per request; prefill = each block walks its
-    // own T_r-token window from `qo_indptr_d` along the recurrence.
-    {
-        const std::size_t qk_step = static_cast<std::size_t>(V_h) * K_d;
-        const std::size_t v_step  = static_cast<std::size_t>(V_dim);
-        const std::size_t gh_step = static_cast<std::size_t>(V_h);
-        if (is_pure_decode) {
-            if (slot_ids_d != nullptr) {
-                kernels::launch_recurrent_gated_delta_step_batched(
-                    la.q_norm.data(),
-                    la.k_norm.data(),
-                    la.v_fp32.data(),
-                    la.g_log.data(),
-                    la.beta.data(),
-                    state_cache.recurrent_state(layer_idx, /*slot=*/0),
-                    slot_ids_d,
-                    static_cast<long long>(
-                        state_cache.recurrent_slot_stride_floats()),
-                    la.core_out.data(),
-                    R, V_h, K_d, V_d, stream);
-            } else {
-                kernels::launch_recurrent_gated_delta_step(
-                    la.q_norm.data(),
-                    la.k_norm.data(),
-                    la.v_fp32.data(),
-                    la.g_log.data(),
-                    la.beta.data(),
-                    state_cache.recurrent_state(layer_idx, 0),
-                    la.core_out.data(),
-                    /*B=*/1, V_h, K_d, V_d, stream);
-            }
+        // repeat_interleave from K_h → V_h heads.
+        if (V_h != K_h) {
+            kernels::launch_repeat_interleave_heads_fp32(
+                la.q_pre.data(), la.q_norm.data(), N, K_h, V_h, K_d, stream);
+            kernels::launch_repeat_interleave_heads_fp32(
+                la.k_pre.data(), la.k_norm.data(), N, K_h, V_h, K_d, stream);
         } else {
-            if (slot_ids_d != nullptr && qo_indptr_d != nullptr) {
-                kernels::launch_chunk_gated_delta_prefill_batched(
-                    la.q_norm.data(),
-                    la.k_norm.data(),
-                    la.v_fp32.data(),
-                    la.g_log.data(),
-                    la.beta.data(),
-                    state_cache.recurrent_state(layer_idx, /*slot=*/0),
-                    slot_ids_d, qo_indptr_d,
-                    static_cast<long long>(
-                        state_cache.recurrent_slot_stride_floats()),
-                    la.core_out.data(),
-                    R, V_h, K_d, V_d, stream);
+            CUDA_CHECK(cudaMemcpyAsync(
+                la.q_norm.data(), la.q_pre.data(),
+                (std::size_t)N * K_h * K_d * sizeof(float),
+                cudaMemcpyDeviceToDevice, stream));
+            CUDA_CHECK(cudaMemcpyAsync(
+                la.k_norm.data(), la.k_pre.data(),
+                (std::size_t)N * K_h * K_d * sizeof(float),
+                cudaMemcpyDeviceToDevice, stream));
+        }
+
+        // v: bf16 → fp32 (no l2norm).
+        kernels::launch_bf16_to_fp32(
+            la.v_raw.data(), la.v_fp32.data(),
+            (std::size_t)N * V_dim, stream);
+
+        // ── g, β per token per head ────────────────────────────────────
+        kernels::launch_gated_delta_g_beta(
+            la.a.data(), la.b.data(),
+            Lw.la_A_log_fp32, Lw.la_dt_bias->data(),
+            la.g_log.data(), la.beta.data(),
+            N, V_h, stream);
+
+        // ── Recurrent update ───────────────────────────────────────────
+        // Both decode and prefill: one batched launch over (R, V_h) blocks
+        // with per-block slot (and on prefill, qo_indptr) indirection.
+        // Decode = one token per request; prefill = each block walks its
+        // own T_r-token window from `qo_indptr_d` along the recurrence.
+        {
+            const std::size_t qk_step = static_cast<std::size_t>(V_h) * K_d;
+            const std::size_t v_step  = static_cast<std::size_t>(V_dim);
+            const std::size_t gh_step = static_cast<std::size_t>(V_h);
+            if (is_pure_decode) {
+                if (slot_ids_d != nullptr) {
+                    kernels::launch_recurrent_gated_delta_step_batched(
+                        la.q_norm.data(),
+                        la.k_norm.data(),
+                        la.v_fp32.data(),
+                        la.g_log.data(),
+                        la.beta.data(),
+                        state_cache.recurrent_state(layer_idx, /*slot=*/0),
+                        slot_ids_d,
+                        static_cast<long long>(
+                            state_cache.recurrent_slot_stride_floats()),
+                        la.core_out.data(),
+                        R, V_h, K_d, V_d, stream);
+                } else {
+                    kernels::launch_recurrent_gated_delta_step(
+                        la.q_norm.data(),
+                        la.k_norm.data(),
+                        la.v_fp32.data(),
+                        la.g_log.data(),
+                        la.beta.data(),
+                        state_cache.recurrent_state(layer_idx, 0),
+                        la.core_out.data(),
+                        /*B=*/1, V_h, K_d, V_d, stream);
+                }
             } else {
-                for (int r = 0; r < R; ++r) {
-                    const int t0 = static_cast<int>(qo_indptr_h[r]);
-                    const int Nr = static_cast<int>(qo_indptr_h[r + 1]) - t0;
-                    if (Nr <= 0) continue;
-                    const std::size_t qk_off = static_cast<std::size_t>(t0) * qk_step;
-                    const std::size_t v_off  = static_cast<std::size_t>(t0) * v_step;
-                    const std::size_t gh_off = static_cast<std::size_t>(t0) * gh_step;
-                    kernels::launch_chunk_gated_delta_prefill(
-                        la.q_norm.data() + qk_off,
-                        la.k_norm.data() + qk_off,
-                        la.v_fp32.data() + v_off,
-                        la.g_log.data()  + gh_off,
-                        la.beta.data()   + gh_off,
-                        state_cache.recurrent_state(layer_idx, slot_for(r)),
-                        la.core_out.data() + v_off,
-                        Nr, V_h, K_d, V_d, /*chunk_size=*/64, stream);
+                if (slot_ids_d != nullptr && qo_indptr_d != nullptr) {
+                    kernels::launch_chunk_gated_delta_prefill_batched(
+                        la.q_norm.data(),
+                        la.k_norm.data(),
+                        la.v_fp32.data(),
+                        la.g_log.data(),
+                        la.beta.data(),
+                        state_cache.recurrent_state(layer_idx, /*slot=*/0),
+                        slot_ids_d, qo_indptr_d,
+                        static_cast<long long>(
+                            state_cache.recurrent_slot_stride_floats()),
+                        la.core_out.data(),
+                        R, V_h, K_d, V_d, stream);
+                } else {
+                    for (int r = 0; r < R; ++r) {
+                        const int t0 = static_cast<int>(qo_indptr_h[r]);
+                        const int Nr = static_cast<int>(qo_indptr_h[r + 1]) - t0;
+                        if (Nr <= 0) continue;
+                        const std::size_t qk_off = static_cast<std::size_t>(t0) * qk_step;
+                        const std::size_t v_off  = static_cast<std::size_t>(t0) * v_step;
+                        const std::size_t gh_off = static_cast<std::size_t>(t0) * gh_step;
+                        kernels::launch_chunk_gated_delta_prefill(
+                            la.q_norm.data() + qk_off,
+                            la.k_norm.data() + qk_off,
+                            la.v_fp32.data() + v_off,
+                            la.g_log.data()  + gh_off,
+                            la.beta.data()   + gh_off,
+                            state_cache.recurrent_state(layer_idx, slot_for(r)),
+                            la.core_out.data() + v_off,
+                            Nr, V_h, K_d, V_d, /*chunk_size=*/64, stream);
+                    }
                 }
             }
         }
-    }
 
     // ── core_out → bf16, then RMSNormGated with z ──────────────────
     // core_out has [N, V_h, V_d] layout = [N, V_dim] flat. We want
@@ -495,6 +495,13 @@ void prepare_qwen3_5_decode_plan(
         /*enable_cuda_graph=*/true,
         /*full_attention_variant=*/false,
         cache.hnd_layout());
+}
+
+std::uint32_t qwen3_5_decode_graph_layout(
+    const Qwen3_5PlanState& state)
+{
+    if (!state.decode_plan) return 0;
+    return ops::decode_plan_graph_layout(*state.decode_plan);
 }
 
 void qwen3_5_forward_paged(

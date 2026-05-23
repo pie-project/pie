@@ -58,6 +58,21 @@ void launch_batched_weighted_sum_bf16(
     int hidden,
     cudaStream_t stream);
 
+// Batched decode version: writes
+// `out[n, h] = sum_k weights[n, k] * src[n, k, h]`.
+//
+//     src     : [num_tokens * top_k, hidden] bf16
+//     weights : [num_tokens * top_k] fp32
+//     out     : [num_tokens, hidden] bf16
+void launch_token_batched_weighted_sum_bf16(
+    void*       out,
+    const void* src,
+    const float* weights,
+    int num_tokens,
+    int top_k,
+    int hidden,
+    cudaStream_t stream);
+
 // On-device construction of the per-expert cuBLAS pointer arrays for the
 // N=1 MoE decode path. Replaces the host-side build_routing + 6
 // cudaMemcpyAsync's that the original implementation used; produces the
@@ -96,6 +111,86 @@ void launch_build_moe_ptrs_decode_bf16(
     float*              weights_out,
     int top_k,
     int H, int I_moe,
+    cudaStream_t stream);
+
+// Multi-token decode equivalent of `launch_build_moe_ptrs_decode_bf16`.
+// Produces `num_tokens * top_k` pointer triples, treating each routed
+// token/expert pair as one M=1 batched-GEMM item.
+void launch_build_moe_ptrs_decode_batched_bf16(
+    const std::int32_t* topk_idx,
+    const float*        topk_w,
+    const void*         gate_up_base,
+    const void*         down_base,
+    const void*         norm_x,
+    void*               expert_gate_up,
+    void*               expert_act,
+    void*               expert_out,
+    const void**        a_gu_ptrs,
+    const void**        b_gu_ptrs,
+    void**              c_gu_ptrs,
+    const void**        a_dn_ptrs,
+    const void**        b_dn_ptrs,
+    void**              c_dn_ptrs,
+    float*              weights_out,
+    int num_tokens,
+    int top_k,
+    int H, int I_moe,
+    cudaStream_t stream);
+
+// vLLM/SGL-style decode alignment. Sorts route ids [0, num_routes) by expert
+// into fixed-size blocks; padded entries are filled with sentinel num_routes.
+// `expert_ids[b]` is the expert for block b or -1 for inactive padding blocks.
+void launch_moe_align_decode(
+    const std::int32_t* topk_idx,
+    std::int32_t* sorted_route_ids,
+    std::int32_t* expert_ids,
+    int num_routes,
+    int num_experts,
+    int block_size,
+    int max_blocks,
+    cudaStream_t stream);
+
+// Gather `norm_x[route / top_k]` into aligned rows. Sentinel route ids become
+// zero rows so padded expert blocks are harmless GEMM work.
+void launch_gather_moe_aligned_inputs_bf16(
+    const void* norm_x,
+    const std::int32_t* sorted_route_ids,
+    void* aligned_in,
+    int num_routes,
+    int aligned_rows,
+    int top_k,
+    int hidden,
+    cudaStream_t stream);
+
+void launch_build_moe_ptrs_aligned_bf16(
+    const std::int32_t* expert_ids,
+    const void* gate_up_base,
+    const void* down_base,
+    const void* aligned_in,
+    void* aligned_gate_up,
+    void* aligned_act,
+    void* aligned_out,
+    const void** a_gu_ptrs,
+    const void** b_gu_ptrs,
+    void** c_gu_ptrs,
+    const void** a_dn_ptrs,
+    const void** b_dn_ptrs,
+    void** c_dn_ptrs,
+    int max_blocks,
+    int block_size,
+    int H,
+    int I_moe,
+    cudaStream_t stream);
+
+// Undo the expert-block permutation after down_proj: copies aligned rows back
+// to route order [num_tokens * top_k, hidden]. Sentinel rows are ignored.
+void launch_reorder_moe_aligned_output_bf16(
+    const void* aligned_out,
+    const std::int32_t* sorted_route_ids,
+    void* route_out,
+    int num_routes,
+    int aligned_rows,
+    int hidden,
     cudaStream_t stream);
 
 }  // namespace pie_cuda_driver::kernels

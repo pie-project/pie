@@ -18,4 +18,12 @@ void launch_gather_bf16_rows(
     int                  vocab,
     cudaStream_t         stream);
 
+void launch_transpose_bf16_nld_to_lnd(
+    const std::uint16_t* src,        // [N, L, D] bf16
+    std::uint16_t*       dst,        // [L, N, D] bf16
+    int                  n,
+    int                  layers,
+    int                  dim,
+    cudaStream_t         stream);
+
 }  // namespace pie_cuda_driver::kernels

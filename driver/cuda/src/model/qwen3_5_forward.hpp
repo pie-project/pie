@@ -101,6 +101,9 @@ void prepare_qwen3_5_decode_plan(
     bool is_pure_decode,
     cudaStream_t stream = nullptr);
 
+std::uint32_t qwen3_5_decode_graph_layout(
+    const Qwen3_5PlanState& state);
+
 // Forward pass over `total_tokens` tokens packed as a flat [N, H]
 // stream. Multi-request batching: `slot_ids_h[r]` selects the
 // per-request slab inside the linear-attn rs_cache; `is_fresh_h[r]`

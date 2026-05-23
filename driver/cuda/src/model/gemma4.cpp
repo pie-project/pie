@@ -29,11 +29,24 @@ namespace pie_cuda_driver::model {
 
 namespace {
 
+thread_local bool g_logits_argmax_only = false;
+
 const DeviceTensor& must(const LoadedModel& e, const std::string& name) {
     if (!e.has(name)) {
         throw std::runtime_error("gemma4: missing weight '" + name + "'");
     }
     return e.get(name);
+}
+
+float read_bf16_scalar_once(const DeviceTensor& t) {
+    if (t.empty()) return 1.f;
+    std::uint16_t bits = 0;
+    CUDA_CHECK(cudaMemcpy(&bits, t.data(), sizeof(std::uint16_t),
+                          cudaMemcpyDeviceToHost));
+    const std::uint32_t f32_bits = static_cast<std::uint32_t>(bits) << 16;
+    float f;
+    std::memcpy(&f, &f32_bits, sizeof(float));
+    return f;
 }
 
 // HF Gemma-4 prefixes language-model tensors with `model.language_model.`
@@ -43,6 +56,10 @@ const DeviceTensor& must(const LoadedModel& e, const std::string& name) {
 constexpr const char* kPrefix = "model.language_model.";
 
 }  // namespace
+
+void set_gemma4_logits_argmax_only(bool enabled) {
+    g_logits_argmax_only = enabled;
+}
 
 Gemma4MoeMlpWorkspace Gemma4MoeMlpWorkspace::allocate(
     int max_tokens, int hidden, int num_experts, int top_k,
@@ -76,6 +93,16 @@ Gemma4MoeMlpWorkspace Gemma4MoeMlpWorkspace::allocate(
     ws.c_dn_ptrs    = DeviceBuffer<std::uint16_t*>::alloc(top_k);
     ws.batch_weights = DeviceBuffer<float>::alloc(top_k);
     return ws;
+}
+
+void Gemma4MoeMlpWorkspace::allocate_ple(int max_tokens, int per_layer_total)
+{
+    if (max_tokens <= 0 || per_layer_total <= 0) return;
+    const std::size_t elems =
+        static_cast<std::size_t>(max_tokens) *
+        static_cast<std::size_t>(per_layer_total);
+    ple_token = DeviceBuffer<std::uint16_t>::alloc(elems);
+    ple_proj  = DeviceBuffer<std::uint16_t>::alloc(elems);
 }
 
 Gemma4Weights bind_gemma4(const LoadedModel& engine) {
@@ -274,6 +301,9 @@ Gemma4Weights bind_gemma4(const LoadedModel& engine) {
         Lw.layer_scalar = engine.has(lp + "layer_scalar")
                               ? &engine.get(lp + "layer_scalar")
                               : nullptr;
+        Lw.layer_scalar_value = Lw.layer_scalar
+                                  ? read_bf16_scalar_once(*Lw.layer_scalar)
+                                  : 1.f;
 
         // ── Sparse-MoE block (Gemma-4 26B-A4B only) ───────────────────
         // The MoE variant runs in parallel with the dense MLP (HF
@@ -362,20 +392,6 @@ inline void dbg_sync_dump_bf16(const char* tag, const void* dev_ptr,
     if (!dbg_first_fire_flag()) return;
     cudaDeviceSynchronize();
     dbg_dump_bf16(tag, dev_ptr, numel);
-}
-
-// Read a single bf16 tensor's first element to host. Used for the
-// per-layer learnable scalar — there's one float per layer; copying
-// one bf16 value at startup is cheap and lets the forward avoid a
-// small device-side mul.
-inline float read_bf16_scalar(const DeviceTensor& t) {
-    if (t.empty()) return 1.f;
-    std::uint16_t bits = 0;
-    cudaMemcpy(&bits, t.data(), sizeof(std::uint16_t), cudaMemcpyDeviceToHost);
-    const std::uint32_t f32_bits = static_cast<std::uint32_t>(bits) << 16;
-    float f;
-    std::memcpy(&f, &f32_bits, sizeof(float));
-    return f;
 }
 
 // Per-expert routing lists from device-side topk decisions. Mirrors
@@ -543,7 +559,9 @@ void gemma4_forward_paged(
     int R,
     bool is_pure_decode,
     const std::uint8_t* /*custom_mask_d*/,
-    const std::int32_t* /*custom_mask_indptr_d*/)
+    const std::int32_t* /*custom_mask_indptr_d*/,
+    const std::int32_t* logit_row_indices_d,
+    int num_logit_rows)
 {
     const int H        = cfg.hidden_size;
     const int L        = cfg.num_hidden_layers;
@@ -603,12 +621,21 @@ void gemma4_forward_paged(
     void* per_layer_token = nullptr;
     void* per_layer_proj  = nullptr;
     if (ple_dim > 0) {
-        per_layer_token_buf = DeviceTensor::allocate(
-            DType::BF16, {N, per_layer_total});
-        per_layer_proj_buf = DeviceTensor::allocate(
-            DType::BF16, {N, per_layer_total});
-        per_layer_token = per_layer_token_buf.data();
-        per_layer_proj  = per_layer_proj_buf.data();
+        const std::size_t ple_elems =
+            static_cast<std::size_t>(N) *
+            static_cast<std::size_t>(per_layer_total);
+        if (moe_ws.ple_token.size() >= ple_elems &&
+            moe_ws.ple_proj.size() >= ple_elems) {
+            per_layer_token = moe_ws.ple_token.data();
+            per_layer_proj  = moe_ws.ple_proj.data();
+        } else {
+            per_layer_token_buf = DeviceTensor::allocate(
+                DType::BF16, {N, per_layer_total});
+            per_layer_proj_buf = DeviceTensor::allocate(
+                DType::BF16, {N, per_layer_total});
+            per_layer_token = per_layer_token_buf.data();
+            per_layer_proj  = per_layer_proj_buf.data();
+        }
         // Embed lookup into the per-layer table.
         kernels::launch_embed_bf16(
             token_ids, w.embed_per_layer->data(), per_layer_token,
@@ -639,12 +666,17 @@ void gemma4_forward_paged(
         kernels::launch_scalar_mul_bf16(
             per_layer_proj, 1.0f / std::sqrt(2.0f),
             static_cast<std::size_t>(N) * per_layer_total, stream);
+        // The layer loop consumes one `[N, ple_dim]` slice at a time.
+        // Re-layout once here instead of launching a slice-pack kernel
+        // for every layer and fire.
+        kernels::launch_transpose_bf16_nld_to_lnd(
+            static_cast<const std::uint16_t*>(per_layer_proj),
+            static_cast<std::uint16_t*>(per_layer_token),
+            N, L, ple_dim, stream);
     }
-    // After this block, `per_layer_proj` holds the [N, L*ple_dim]
-    // per-layer signal. We slice out `per_layer_proj[:, l*ple_dim :
-    // (l+1)*ple_dim]` per layer below by pointer-arithmetic.
-    auto* per_layer_base = static_cast<std::uint8_t*>(per_layer_proj);
-    constexpr int bf16_bytes = 2;
+    // After this block, `per_layer_proj` keeps the original [N, L, D]
+    // signal for dumps; `per_layer_token` holds the [L, N, D] layout
+    // consumed by the layer loop.
     dbg_sync_dump_bf16("per_layer_inputs", per_layer_proj,
                   static_cast<std::size_t>(N) * L * ple_dim);
 
@@ -947,14 +979,6 @@ void gemma4_forward_paged(
         if (ple_dim > 0 && getenv("PIE_NO_PLE") == nullptr) {
         dump_l0("ple_residual_in", ws.y.data(),
                 static_cast<std::size_t>(N) * H);
-        // Gather this layer's slice of per_layer_inputs:
-        //   ple_signal[n, :] = per_layer_proj[n, l*ple_dim:(l+1)*ple_dim]
-        // The base tensor is already laid out as [N, L*ple_dim]; we
-        // pass the offset pointer to the GEMM as the "input" matrix
-        // with stride = L*ple_dim. cuBLAS row-major convention here
-        // means the kernel reads N rows of `ple_dim` cols at offset
-        // l*ple_dim within each row.
-        //
         // ple_gate = ple_input_gate @ y_norm (using attn output in y)
         ops::gemm_act_x_wt_bf16(cublas.handle(),
             ws.y.data(), layer.ple_input_gate->data(), ws.norm_x.data(),
@@ -962,26 +986,15 @@ void gemma4_forward_paged(
         dump_l0("ple_gate_pre_gelu", ws.norm_x.data(),
                 static_cast<std::size_t>(N) * ple_dim);
         // GeGLU(tanh) but with the per-layer input acting as the "up"
-        // signal. We don't have a strided-input GeGLU kernel; instead
-        // use a temporary stride-pack: copy the layer's PLE slice into
-        // ws.norm_y so it's contiguous, then geglu over [N, ple_dim].
-        // The slice is `[N, ple_dim]` from a `[N, L*ple_dim]` buffer.
-        const std::size_t row_stride = static_cast<std::size_t>(per_layer_total);
-        const std::size_t slice_off  = static_cast<std::size_t>(l) * ple_dim;
-        for (int n = 0; n < N; ++n) {
-            // Pack PLE slice for token n into ws.norm_y[n].
-            const auto* src = per_layer_base +
-                              (n * row_stride + slice_off) * bf16_bytes;
-            auto* dst = static_cast<std::uint8_t*>(ws.norm_y.data()) +
-                        static_cast<std::size_t>(n) * ple_dim * bf16_bytes;
-            CUDA_CHECK(cudaMemcpyAsync(dst, src,
-                                       ple_dim * bf16_bytes,
-                                       cudaMemcpyDeviceToDevice, stream));
-        }
-        dump_l0("ple_signal_slice", ws.norm_y.data(),
+        // signal. `per_layer_token` now holds `[L, N, ple_dim]`, so the
+        // current layer's signal is already contiguous.
+        const auto* ple_signal =
+            static_cast<const std::uint16_t*>(per_layer_token) +
+            static_cast<std::size_t>(l) * N * ple_dim;
+        dump_l0("ple_signal_slice", ple_signal,
                 static_cast<std::size_t>(N) * ple_dim);
         kernels::launch_geglu_tanh_bf16(
-            ws.norm_x.data(), ws.norm_y.data(), ws.norm_x.data(),
+            ws.norm_x.data(), ple_signal, ws.norm_x.data(),
             N * ple_dim, stream);
         dump_l0("ple_gated", ws.norm_x.data(),
                 static_cast<std::size_t>(N) * ple_dim);
@@ -1008,12 +1021,7 @@ void gemma4_forward_paged(
 
         // ── 3d. Per-layer learnable scalar ────────────────────────────
         if (layer.layer_scalar && getenv("PIE_NO_LAYER_SCALAR") == nullptr) {
-            // Read the bf16 scalar to host once at this point. The
-            // overhead is one cudaMemcpy of 2 bytes per layer per
-            // fire — small enough to ignore at the scale of full
-            // forward latency. Cache could hoist this; not needed
-            // for correctness.
-            const float s = read_bf16_scalar(*layer.layer_scalar);
+            const float s = layer.layer_scalar_value;
             if (std::abs(s - 1.f) > 1e-6f) {
                 kernels::launch_scalar_mul_bf16(
                     ws.y.data(), s,
@@ -1032,20 +1040,42 @@ void gemma4_forward_paged(
     }
 
     // ── 4. Final norm, lm_head, optional softcap ─────────────────────
-    kernels::launch_rmsnorm_bf16(
-        ws.y.data(), w.final_norm->data(), ws.norm_x.data(),
-        N, H, eps, stream);
+    const bool compact_logits =
+        logit_row_indices_d != nullptr && num_logit_rows > 0 &&
+        num_logit_rows < N;
+    int lm_head_rows = N;
+    const void* lm_head_input = ws.norm_x.data();
+    if (compact_logits) {
+        kernels::launch_gather_bf16_rows(
+            static_cast<const std::uint16_t*>(ws.y.data()),
+            logit_row_indices_d,
+            static_cast<std::uint16_t*>(ws.norm_y.data()),
+            num_logit_rows, H, stream);
+        kernels::launch_rmsnorm_bf16(
+            ws.norm_y.data(), w.final_norm->data(), ws.norm_x.data(),
+            num_logit_rows, H, eps, stream);
+        lm_head_rows = num_logit_rows;
+    } else {
+        kernels::launch_rmsnorm_bf16(
+            ws.y.data(), w.final_norm->data(), ws.norm_x.data(),
+            N, H, eps, stream);
+    }
     ops::gemm_act_x_wt_bf16(cublas.handle(),
-        ws.norm_x.data(), w.lm_head->data(), ws.logits.data(),
-        N, V, H);
-    if (fwd_cfg.final_logit_softcap > 0.f) {
+        lm_head_input, w.lm_head->data(), ws.logits.data(),
+        lm_head_rows, V, H);
+    const bool skip_final_softcap =
+        g_logits_argmax_only && !dbg_dumps_enabled();
+    if (fwd_cfg.final_logit_softcap > 0.f && !skip_final_softcap) {
         kernels::launch_logit_softcap_bf16(
             ws.logits.data(), fwd_cfg.final_logit_softcap,
-            static_cast<std::size_t>(N) * V, stream);
+            static_cast<std::size_t>(lm_head_rows) * V, stream);
     }
-    dbg_sync_dump_bf16("logits_last", static_cast<const std::uint16_t*>(ws.logits.data())
-                                  + static_cast<std::size_t>(N - 1) * V,
-                  static_cast<std::size_t>(V));
+    if (lm_head_rows > 0) {
+        dbg_sync_dump_bf16("logits_last",
+            static_cast<const std::uint16_t*>(ws.logits.data()) +
+                static_cast<std::size_t>(lm_head_rows - 1) * V,
+            static_cast<std::size_t>(V));
+    }
     // After the first fire, freeze the dumps so subsequent decode
     // fires don't overwrite the prefill intermediates we want to
     // parity-check.

@@ -1513,3 +1513,532 @@ ABI. The previous generic XQA attempt was not that path and was slower.
   simpler N=6144/no-graph/no-static command. It does not yet have a large,
   noise-proof margin on 4B/8B/14B; 14B in particular needs more GPU-side work
   before claiming "always faster" against vLLM.
+
+## 2026-05-22 simple-vs-tuned maintainability check
+
+- Tested whether the per-model TP1 bundles can be removed while keeping the
+  loader/fused-projection fix. "Simple default" means no model-specific env
+  overrides and no explicit speculation-depth override. Same 512x128,
+  TP1, unlimited-concurrency Pie harness.
+- Simple default vs tuned:
+  - 0.6B: simple 28,765.25 vs tuned 29,581.61 output tok/s (-2.76%).
+  - 1.7B: simple 17,932.56 vs tuned 18,162.49 (-1.27%).
+  - 4B: simple 8,282.18 vs tuned 8,290.05 (-0.09%).
+  - 8B: simple 4,542.58 vs tuned 4,803.85 (-5.44%).
+  - 14B: simple 1,678.03 vs tuned 2,003.61 (-16.25%).
+  Conclusion: a fully default/simple command is viable for 4B and close for
+  1.7B, but it is not acceptable for 8B/14B.
+- Ablations to identify removable knobs:
+  - 0.6B: HND with default depth 1 measured 29,575.77, while default layout
+    with depth 3 measured 28,872.15. Keep HND; depth 3 is not justified by
+    this sample.
+  - 1.7B: HND-only measured 17,963.67, close to tuned 18,162.49. Most of the
+    graph/static/prefill/Lt bundle is not a large win in this run.
+  - 8B: HND-only measured 4,570.58, but HND + lm-head-only Lt
+    (`PIE_CUBLASLT_BF16_MIN_N=100000`) measured 4,806.39, matching tuned
+    4,803.85. Graph argmax/static decode are not needed for the 8B recipe.
+  - 14B: HND + N=6144 only measured 1,920.16; adding decode-full off measured
+    1,909.66; HND + N=6144 + lm-head-only Lt measured 2,000.15, close to tuned
+    2,003.61. The important 14B knobs are the smaller workspace and
+    lm-head-only Lt; decode-full off was neutral/noisy here.
+- Simplification recommendation from this pass:
+  - Keep the general fused-projection replacement loader fix.
+  - Prefer HND layout for these Qwen3 TP1 rows, but do not keep per-model
+    speculation-depth overrides based on this sample.
+  - Drop graph argmax/static decode from the 8B/14B recommended bundles unless
+    a future benchmark re-establishes a clear win.
+  - Keep model-size workspace tuning for 14B for now; the default planner
+    shape is still a large loss.
+
+## 2026-05-22 TP2 balance check on local L40 pair
+
+- Ran TP2 512x128, unlimited concurrency on both local L40s
+  (`CUDA_VISIBLE_DEVICES=0,1`, Pie `--device cuda:0,cuda:1 --tp-size 2`,
+  vLLM `--tp-size 2`, FlashInfer). Artifacts are under
+  `/root/e2e_bench/experiments/pie_dense_spec/tp2_balance_20260522/`.
+- 8B:
+  - vLLM first run: 7,588.71 output tok/s.
+  - Pie default XQA-on path stalled during startup/prologue: log selected
+    `xqa_decode=on`, GPU0 held ~40 GiB while GPU1 held ~0.6 GiB, and no
+    graph-capture/JSON completed before the run was killed. Treat default-on
+    XQA as unhealthy for local TP2 8B.
+  - With `PIE_CUDA_XQA_DECODE=0`, Pie simple completed at 7,446.10.
+  - Balanced XQA-off (`PIE_CUDA_KV_LAYOUT=HND`,
+    `PIE_CUBLASLT_BF16_MIN_N=100000`) completed at 7,475.74.
+  - Variant sweep, all XQA-off: N=12288 measured 7,446.10, N=6144 measured
+    7,517.38, graph/static measured 7,449.03, and default Lt measured
+    7,506.55. Same-period rerun was vLLM 7,568.84 vs Pie N=6144 7,523.89
+    (-0.59%). Conclusion: TP1's 8B balanced recipe does not transfer cleanly
+    to TP2; Pie is close but still behind vLLM on this 512x128 TP2 row.
+- 14B:
+  - vLLM TP2: 4,745.24 output tok/s.
+  - Pie simple XQA-off (`PIE_CUDA_XQA_DECODE=0`) selected N=8192/R=512 and ran
+    pathologically slowly: both GPUs stayed at 100% for ~6 minutes with no
+    JSON artifact, so the run was killed.
+  - Pie balanced XQA-off (`PIE_CUDA_XQA_DECODE=0`, `PIE_CUDA_KV_LAYOUT=HND`,
+    `PIE_CUDA_PREFILL_TOKENS=6144`, `PIE_CUBLASLT_BF16_MIN_N=100000`)
+    completed at 4,771.77 output tok/s, a small +0.56% paired win over vLLM.
+- TP2 conclusion: do not generalize the TP1 simplification policy blindly.
+  TP2 needs XQA disabled on this local L40 pair, 8B still has a small vLLM gap,
+  and 14B needs the balanced N=6144/HND/lm-head-only-Lt shape to avoid a severe
+  slow path.
+
+## 2026-05-22 Gemma4 TP1 unlimited check
+
+- Tested `google/gemma-4-E2B-it` and `google/gemma-4-E4B-it` at 512x128,
+  TP1, unlimited client concurrency (`--concurrency 0`) on the local L40.
+  Pie used `--ipc-profile latency --speculation-depth 1`. Artifacts are under
+  `/root/e2e_bench/experiments/pie_dense_spec/gemma4_20260522/`.
+- vLLM cannot use forced FlashInfer on these Gemma4 dense checkpoints. Forced
+  `--attention-backend FLASHINFER` failed for E2B/E4B with
+  `head_size not supported`; vLLM logs say Gemma4 has heterogeneous head dims
+  and forces `TRITON_ATTN`. Valid vLLM baselines therefore used default
+  attention:
+  - E2B: 14,023.70, warm-cache 14,234.23, refreshed same-session 14,287.60
+    output tok/s.
+  - E4B: 7,233.65, warm-cache 7,315.56, refreshed same-session 7,247.35
+    output tok/s.
+- Initial Pie Gemma4 failed at larger request counts because the forward wrote
+  logits for every workspace token. Server log:
+  `fire_batch needs 984 logit rows, exceeding workspace capacity 512`.
+  Wiring Gemma4 to the executor's compact-logits path fixed correctness:
+  32x32 smoke passed at 1,948.45 output tok/s, but full 512x128 remained slow
+  (E2B spec0 6,302.89; E2B spec1 6,759.04; E4B spec1 4,667.18).
+- Main successful optimization: removed the per-token PLE slice copy in each
+  layer. The first version packed each layer's `[N, ple_dim]` slice with one
+  kernel instead of `N` device-to-device memcpys, moving E2B spec1 from
+  6,759.04 to 14,169.23 output tok/s and E4B to 7,512.68.
+- Final accepted PLE shape: after constructing `per_layer_inputs` as
+  `[N, L, D]`, transpose once to `[L, N, D]` and let each layer read its
+  contiguous slice directly. This replaces the intermediate per-layer gather
+  helper, which is now removed. Results:
+  - E2B: 14,578.68, final cleaned-code rerun 14,586.44 output tok/s.
+  - E4B: 7,610.70, final cleaned-code rerun 7,441.48 output tok/s.
+- Smaller successful fixes:
+  - Persistent PLE buffers avoided per-fire allocation and gave a small/noisy
+    E2B improvement (14,238.98, with a low 13,603.92 rerun).
+  - Cached the one-element bf16 `layer_scalar` at bind time; E2B reached
+    14,290.82 and E4B 7,606.67 before the PLE transpose.
+  - Greedy token-only Gemma4 now skips final logit softcap because tanh
+    softcap is monotonic and does not change argmax. E2B had one strong sample
+    (14,540.40) and one low sample (13,798.66); E4B's first sample was
+    7,469.33. Treat this as a small correctness-safe cleanup, not the main win.
+- Rejected/noisy Gemma4 attempts:
+  - Speculation depth 2 was worse than depth 1 on E2B (14,092.70).
+  - HND layout was worse on E2B (14,027.50).
+  - lm-head-only CUBLASLt threshold was worse on E2B (13,837.73).
+  - `--worker-threads 32` was worse/noisy (14,185.40).
+  - Greedy batch policy was much worse (11,906.09).
+- Same-session final comparison against refreshed vLLM default-attention rows:
+  - E2B: Pie 14,586.44 vs vLLM 14,287.60 output tok/s (+2.09%).
+  - E4B: Pie 7,441.48 vs vLLM 7,247.35 output tok/s (+2.68%).
+- Benchmark-script caveat found while scrutinizing the Gemma4 rows: Pie and
+  vLLM report different prompt totals for the same nominal workload
+  (Pie 16,278 prompt tokens, vLLM 18,326, exactly +4 tokens/request for vLLM).
+  Output-token throughput is still the reported metric, but Gemma4 chat/system
+  templating should be aligned in a follow-up before using these rows as a
+  final fairness claim.
+- Not tested in this pass: `google/gemma-4-26B-A4B-it`. It is cached locally
+  but outside the original 0.8B-14B total-size target and likely needs a TP2
+  run on the L40 pair.
+
+## 2026-05-22 Qwen3.6 MoE TP2 unlimited check
+
+- Tested `Qwen/Qwen3.6-35B-A3B` (`model_type=qwen3_5_moe`) at 512x128,
+  TP2, unlimited client concurrency on the local L40 pair. Artifacts are under
+  `/root/e2e_bench/experiments/pie_dense_spec/qwen36moe_20260522/`. TP1 was
+  not pursued because the checkpoint is too large for the single local L40
+  budget. The model has 40 layers, 30 linear-attn layers, 256 experts, top-k 8,
+  hidden 2048, 16 attention heads, 2 KV heads, and head_dim 256.
+- vLLM baseline:
+  - `--gpu-memory-utilization 0.98` OOMed during sampler warmup under the
+    unlimited-concurrency benchmark shape. The log shows `max_num_seqs=512`
+    with only about 372 MiB free while trying to allocate 486 MiB
+    (`vllm_qwen36moe_tp2_util098_unlimited_512x128.log`).
+  - `--gpu-memory-utilization 0.95` is the viable comparison row and completed
+    512/512 at 3,109.60 output tok/s, 24.29 req/s, and 21.075 s wall time
+    (`vllm_qwen36moe_tp2_util095_unlimited_512x128.json`). Weight-load
+    startup was about 13-14 s and vLLM used its Triton unquantized MoE backend,
+    FlashAttention/GDN, and CUDA graphs.
+- Pie progression:
+  - `gpu_mem_util=0.90` could not produce a viable layout: the planner had no
+    forward/KV configuration under a 2,931 MiB budget.
+  - The first `0.98` Pie run failed at real batch sizes with
+    `Batch response count mismatch`; the 1x1 debug run passed. Root cause:
+    Qwen3.6 MoE lacked the executor compact-logits contract, so the forward
+    produced fewer sampled rows than the scheduler expected.
+  - Wiring compact logits for `qwen3_5_moe` fixed correctness. Smoke 32x32
+    measured 998.37 output tok/s and full 512x128 measured 940.08.
+  - Batched on-device decode routing for MoE removed the D2H routing sync from
+    pure decode and raised results to 1,081.03 on 32x32 and 1,377.88 on
+    512x128.
+  - Enabling Qwen3.6 MoE CUDA graph replay, while filling graph-capture
+    `slot_ids` and disabling replay for fresh linear-attn state slots, raised
+    the full row to 2,134.81 output tok/s at `N=2048/R=64`.
+  - TP-local memory sizing fixed the planner/runtime over-allocation of
+    qwen3_5 linear-attn and MoE workspaces. This exposed `R=128`, but the first
+    run failed with a FlashInfer prefill workspace overflow at the old 80 MiB
+    attention scratch size.
+  - Raising the Qwen hybrid attention scratch to 128 MiB made `N=1024/R=128`
+    run, but it was slower at 2,031.60 output tok/s. Forcing `N=2048/R=128`
+    recovered 2,134.23, essentially matching the old `R=64` row.
+  - Accepted planner correction: for Qwen3.6 MoE TP2 latency/auto profiles,
+    prefer the measured `N=2048` knee when prefill is not forced. The current
+    no-env Pie row selects `N=2048/R=128` and measures 2,136.85 output tok/s,
+    16.69 req/s, and 30.669 s wall time
+    (`pie_qwen36moe_tp2_planner_n2048_unlimited_512x128.json`). Average batch
+    latency is 47,708 us and average driver forward is 47,629 us; scheduler
+    overhead is not the limiting factor.
+- Rejected/reverted Qwen3.6 attempts:
+  - TP-sharded greedy/lm-head argmax regressed badly: 32x32 dropped to 898.15
+    and 512x128 dropped to 1,272.23 output tok/s. Reverted. The likely cause
+    is that the extra TP all-gather/NCCL in graph outweighs the smaller local
+    lm-head work.
+  - Out-of-place custom all-reduce for Qwen3.6 (`norm_y -> norm_x`) regressed
+    smoke to 1,203.54 output tok/s and the full run was still crawling after
+    more than five minutes, so it was killed and reverted. On this PCIe pair,
+    the custom peer-memory path is worse than NCCL in-place.
+  - Fusing shared-expert gate/up weights at bind time improved smoke to
+    1,338.55 but slightly regressed the full row to 2,129.91 and cost about
+    80 MiB per rank. Reverted as not worth the maintenance and memory cost.
+  - Nsight Systems is installed (`nsys`) but the attempted profile did not
+    produce usable CUDA stats because the importer binary/dependencies are
+    missing. The capture also used `--duration`, which terminated the
+    benchmark early and left a 0/1-completed failure JSON; the 1.1 GiB
+    `.qdstrm` was removed.
+- Current conclusion: Pie does not yet beat the viable vLLM Qwen3.6 MoE TP2
+  baseline. Pie can run the exact util=0.98 shape where vLLM OOMs, but against
+  the viable vLLM util=0.95 row it is still about 31% behind on output
+  throughput (2,136.85 vs 3,109.60). The remaining runtime bottleneck is the
+  GPU MoE decode backend: Pie now avoids host routing syncs, but still issues
+  N*K M=1 batched cuBLAS GEMMs per MoE layer, while vLLM uses a Triton grouped
+  MoE backend. Startup is also not competitive on this checkpoint: Pie reports
+  about 115 s versus vLLM's 13-14 s weight-load startup. The next real unlock
+  should be a fused/grouped MoE backend or a FlashInfer/CUTLASS/Triton MoE
+  integration, followed separately by loader/startup work.
+
+## 2026-05-23 Qwen3.6 MoE TP2 follow-up
+
+- Scrutinized the vLLM/SGL MoE paths. The viable vLLM row uses the Triton
+  unquantized fused MoE backend, not FlashInfer CUTLASS/TRTLLM, with
+  `moe_align_block_size`, two Triton fused-MoE matmul kernels, activation, and
+  `moe_sum`. Pie's accepted path still uses one on-device pointer-build kernel
+  plus two `cublasGemmBatchedEx` launches over `N*K` independent M=1 route
+  GEMMs, then a token-wise weighted sum. This remains the main kernel-level
+  gap.
+- Tried forcing larger decode request caps through the CUDA memory profile
+  cache:
+  - `N=2048/R=256` and `N=1024/R=256` both fell back to the rule-selected
+    `N=2048/R=128` plan, because Qwen3.6's linear-attention recurrent state is
+    about 30 layers x 1.08 MiB per request per rank. `R=256` would need about
+    7.9 GiB per rank for recurrent/conv state before KV and workspace, beyond
+    the local L40 budget.
+  - Duplicate fallback rows measured 2,136.82 and 2,134.25 output tok/s,
+    matching the current baseline and confirming no benchmark drift.
+- Tried a vLLM/SGL-style host-grouped MoE prototype behind a temporary
+  `PIE_QWEN35_MOE_GROUPED_HOST=1` switch:
+  - Standalone cuBLAS tests showed `cublasGemmGroupedBatchedEx` BF16 on this
+    L40/CUDA stack requires device pointer arrays and `CUBLAS_COMPUTE_32F`.
+    `CUBLAS_COMPUTE_32F_FAST_16BF` returns `CUBLAS_STATUS_NOT_SUPPORTED`, and
+    host pointer arrays return success but execute with illegal memory access.
+  - After fixing those API details, 32x32 smoke completed at 1,267.82 output
+    tok/s with avg driver forward 24.25 ms, slower than the current graph path
+    smoke rows (about 1,287-1,532 output tok/s and about 19.6 ms driver
+    forward).
+  - Full 512x128 completed at 2,100.00 output tok/s, 31.208 s wall, avg batch
+    latency 58,458 us, and max forward requests 128
+    (`qwen36moe_20260523/pie_qwen36moe_tp2_grouped_host_unlimited_512x128.json`),
+    slower than the accepted 2,136.85 output tok/s graph row.
+  - The prototype was removed after the experiment. Losing CUDA graph replay
+    and adding per-layer D2H routing syncs outweighed any reuse from grouped
+    per-expert GEMMs at this batch shape. Do not repeat a host-grouped cuBLAS
+    MoE path unless it preserves graph capture and avoids host routing.
+- Tried an on-device padded expert-block MoE prototype behind a temporary
+  `PIE_QWEN35_MOE_PADDED_GROUPED=1` switch after inspecting the vLLM/SGL
+  aligned-token path. The prototype assigned routes to fixed per-expert slots
+  on device, built stable device pointer arrays, and then ran uniform batched
+  cuBLAS GEMMs over padded `[expert, rows_per_expert]` blocks so CUDA graph
+  replay stayed enabled.
+  - Rows-per-expert=64 captured successfully, but 32x32 smoke fell to 462.82
+    output tok/s with 69,165 us average batch latency
+    (`qwen36moe_20260523/pie_qwen36moe_tp2_padded_batched_r64_smoke_unlimited_32x32.json`).
+  - Rows-per-expert=16 also captured successfully but only reached 542.08
+    output tok/s with 59,327 us average batch latency
+    (`qwen36moe_20260523/pie_qwen36moe_tp2_padded_batched_r16_smoke_unlimited_32x32.json`).
+  - The prototype was removed. The useful lesson is that simply padding into
+    larger cuBLAS batched GEMMs does not reproduce vLLM's Triton fused-MoE
+    performance; it overcomputes too much and still pays cuBLAS batched-GEMM
+    overhead. A real fix needs a fused grouped MoE kernel path, not static
+    padding on top of generic cuBLAS.
+- Updated conclusion: the next useful MoE attempt needs an on-device fused
+  backend closer to vLLM/SGL Triton or FlashInfer/CUTLASS. cuBLAS grouped
+  from host routing is not enough, and larger `R` is blocked by linear-attn
+  state memory rather than planner scoring.
+
+## 2026-05-23 Qwen3.6 MoE TP2 profiling and linear-attention attempts
+
+- Added an opt-in CUDA-event breakdown for `qwen3_5_moe_forward_paged` under
+  `PIE_QWEN35_MOE_PROFILE=1`. Normal graph replay stays enabled unless the
+  profiling flag is set; profiling disables graph safety for this forward only.
+  Useful knobs:
+  - `PIE_QWEN35_MOE_PROFILE_LIMIT`
+  - `PIE_QWEN35_MOE_PROFILE_ALL_RANKS=1`
+- Profile result on TP2 Qwen3.6 MoE, unlimited concurrency, 128x16:
+  - Steady decode `N=128`: total 89.206 ms in the synchronized profiler;
+    linear attention 30.259 ms (33.9%), routed MoE 47.416 ms (53.2%),
+    full attention 1.753 ms, router 1.154 ms, shared expert 1.660 ms,
+    all-reduce 2.197 ms, lm-head 1.732 ms.
+  - Mixed/prefill `N>1000`: total 257.664 ms; linear attention 99.962 ms
+    (38.8%), routed MoE 107.512 ms (41.7%), all-reduce 19.669 ms (7.6%).
+  - Interpretation: the dominant buckets are routed MoE and linear attention.
+    The routed MoE per-layer time is already close to the standalone
+    FlashInfer/vLLM fused-MoE microbench scale, so remaining wins probably need
+    a real fused backend rather than more cuBLAS pointer plumbing.
+- Inspected vLLM/SGL Qwen3.5/Qwen3-Next GDN paths:
+  - vLLM and SGL use merged input projections (`in_proj_qkvz`, `in_proj_ba`)
+    and a fused post-conv prep/packed recurrent decode path.
+  - Pie still uses four projection GEMMs (`qkv`, `z`, `a`, `b`) and separate
+    split/l2norm/repeat/gating kernels after convolution.
+- Rejected packed GDN decode kernel:
+  - Prototype fused q/k split, l2norm, value widening, g/beta, and recurrence
+    for pure decode after conv.
+  - 128x16 measured 1,072.54 output tok/s and 512x128 measured 2,129.23
+    output tok/s (`pie_qwen36moe_tp2_packed_gdn_unlimited_*.json`), both below
+    the accepted baseline (about 1,079.77 and 2,136.85).
+  - Removed. Likely reason: the custom kernel duplicated q/k normalization
+    per repeated value head and did not reduce enough recurrence overhead to
+    offset the extra work.
+- Rejected merged qkvz/ab projection attempt:
+  - A naive bind-time `qkv+z` copy added about 724 MiB per rank
+    (`used_after_weights` 37,392 MiB -> 38,116 MiB) and forced the planner from
+    `N=2048/R=128` down to `N=2048/R=64`.
+  - The first smoke run also exposed a correctness bug: the fused GEMM output
+    is row-strided `[qkv|z]` / `[a|b]`, while the existing kernels expect compact
+    `[N,qkv]`, `[N,z]`, `[N,a]`, `[N,b]`. Passing interior pointers made later
+    rows read the previous row's tail. That run was killed and the artifact is
+    not a valid throughput result.
+  - A split-copy fix would require four compacting copies per linear-attention
+    layer and still keep the `R=64` memory regression, so the approach was
+    removed. Do not retry unless the loader can materialize fused weights
+    without retaining the original tensors, or the downstream kernels can
+    consume strided projection outputs directly.
+- Rejected grouped-qk recurrent attempt:
+  - Prototype avoided materializing repeat_interleave `K_h -> V_h` q/k buffers
+    by reading key-head q/k directly inside the recurrence.
+  - Relinked smoke row completed cleanly at 1,079.78 output tok/s
+    (`pie_qwen36moe_tp2_grouped_qk_relinked_unlimited_128x16.json`), essentially
+    tied with baseline.
+  - Full 512x128 regressed slightly to 2,133.48 output tok/s and 30.718 s wall
+    (`pie_qwen36moe_tp2_grouped_qk_relinked_unlimited_512x128.json`) versus the
+    accepted 2,136.85 / 30.669 s row. Removed as extra kernel surface with no
+    measurable win.
+- Build-process note: for server benchmarks, `cmake --build ... pie_driver_cuda`
+  is not enough after CUDA/C++ changes. Rebuild
+  `cargo build -p pie-server --release --no-default-features --features driver-cuda`
+  so `target/release/pie` relinks the static CUDA driver. One grouped-qk row
+  before relinking reused the stale fused-projection binary and should be
+  ignored.
+- Rejected "skip intermediate decayed-state store" in the GDN recurrence:
+  - Change removed the phase-1 `state[off] = state[off] * g` write and recomputed
+    `state[off] * g` in phase 2, aiming to save one global write/read pair per
+    state element.
+  - 128x16 smoke improved slightly to 1,093.03 output tok/s
+    (`pie_qwen36moe_tp2_skip_decay_store_unlimited_128x16.json`) versus the
+    previous ~1,080 tok/s smoke range.
+  - Full 512x128 run did not complete normally: rank 0 stayed busy with GPU0 at
+    100%, GPU1 idle, and no result artifact was written after far exceeding the
+    baseline runtime. The run was killed and the patch was reverted.
+  - Do not reapply this algebraic rewrite without first building a small
+    correctness/stress harness around the TP2 full-run path; the smoke-only win
+    is not trustworthy.
+- Rejected decode-path GDN gate fusion:
+  - Prototype skipped `launch_gated_delta_g_beta` on pure decode and computed
+    `g=exp(-exp(A_log)*softplus(a+dt_bias))` plus `beta=sigmoid(b)` inside new
+    recurrent decode kernels.
+  - 128x16 smoke completed normally at 1,079.93 output tok/s
+    (`pie_qwen36moe_tp2_decode_gate_fused_unlimited_128x16.json`), effectively
+    tied with the previous ~1,080 tok/s smoke rows.
+  - Removed. It saves one tiny graph-captured kernel and scratch write/read,
+    but the added exp/log work inside every `(request, value-head)` recurrence
+    block cancels the benefit at this batch shape.
+- Rejected standard-CUDA tiled GDN decode kernel:
+  - After inspecting vLLM's compiled
+    `fused_recurrent_gated_delta_rule_packed_decode_kernel`, implemented a
+    graph-safe tiled recurrence for Pie's existing K-major fp32 state layout.
+    The prototype processed 128x32 K/V tiles per CTA with warp reductions over
+    K, trying to match vLLM/FlashInfer's work partition without changing the
+    state-cache layout.
+  - 128x16 smoke regressed to 1,067.95 output tok/s
+    (`pie_qwen36moe_tp2_tiled_gdn_unlimited_128x16.json`) versus the ~1,080
+    baseline.
+  - Removed. The useful lesson is that the high-level tiling alone is not
+    enough; the vLLM/Triton path also gets better codegen/vectorization and
+    fuses q/k/v prep. A hand-written shared-memory CUDA port with extra
+    barriers loses to Pie's current simple coalesced K-major loop.
+- Rejected vLLM/SGL-style V-major packed GDN CUDA port:
+  - Switched the recurrent state experiment to `[slot, V_h, V_d, K_d]` and
+    added a pure-decode packed kernel that consumed post-conv `mixed_qkv`, `a`,
+    `b`, `A_log`, and `dt_bias` directly, mirroring the SGL/vLLM packed decode
+    API shape.
+  - 128x16 smoke regressed badly to 559.74 output tok/s, 3.659 s wall, and
+    90.5 ms average driver-forward time
+    (`pie_qwen36moe_tp2_vmajor_packed_gdn_unlimited_128x16.json`), far below
+    the ~1,080 output tok/s baseline.
+  - Removed. The CUDA port used block-wide reductions and repeated
+    `__syncthreads()` inside every V row; that is not equivalent to the
+    Triton single-program vectorized implementation. Do not retry this exact
+    C++/CUDA shape. If we want the SGL/vLLM win, integrate their generated
+    Triton/cubin path or write a warp-row kernel without per-row block barriers.
+- Rejected cuBLAS grouped linear-attention projection:
+  - Prototype replaced the four linear-attention input projection launches
+    (`qkv`, `z`, `a`, `b`) with `cublasGemmGroupedBatchedEx`, sharing the same
+    activation matrix and separate output widths.
+  - 128x16 smoke looked very good: 1,332.08 output tok/s, 1.537 s wall, and
+    54.8 ms average batch latency
+    (`pie_qwen36moe_tp2_grouped_la_proj_unlimited_128x16.json`) versus the
+    usual ~1,080 output tok/s smoke range.
+  - Full 512x128 did not complete: no JSON artifact was written, both GPUs
+    stayed at 100% with about 44.3 GiB used after more than eight minutes, and
+    the run had to be killed.
+  - Removed. Lesson: this grouped cuBLAS path is not safe for sustained full
+    TP2 graph-replay serving as implemented. Do not reapply it without a
+    dedicated stress/correctness harness and a clear fix for the full-run hang.
+- Rejected bf16 recurrent-state cache for Qwen3.5/Qwen3.6 linear attention:
+  - Motivation: vLLM/SGL keep the GDN/Mamba state in cache/model dtype by
+    default; switching Pie's recurrent state from fp32 to bf16 would halve
+    rs_cache memory and might allow more resident requests.
+  - Implemented a typed state cache and templated GDN kernels with fp32
+    fallback. 128x16 smoke completed, but the real 512x128 TP2 run wedged
+    after READY with rank 0 busy, rank 1 idle, and no completed request rows.
+  - Forcing the fallback env to fp32 through that same templated ABI also
+    wedged, so the regression was in the changed ABI/kernel plumbing rather
+    than only bf16 numerics.
+  - Removed and restored the fp32-only state-cache / `float*` GDN ABI. Do not
+    retry by making the state pointer dynamically typed inside these kernels;
+    use a separate, stress-tested kernel path if bf16 state is revisited.
+- Rejected forced `R=256` / low-KV-horizon planner shape for Qwen3.6-MoE TP2:
+  - Added temporary planner env overrides and forced `R=256` with bf16 state.
+    128x16 smoke improved to 1,361.99 output tok/s, but the 512x128 full run
+    did not complete after several minutes and had to be killed.
+  - Planner math explained the failure mode: `R=256` leaves only about 40k KV
+    tokens on this L40 TP2 layout, too little for stable 512-request,
+    128-token generations despite fitting raw state memory.
+  - Removed the override hooks. The current conservative KV horizon is there
+    for a reason on this model; do not force larger R without adding real KV
+    capacity or changing the state/workspace footprint.
+- Benchmark-script fix: avoid `PieClient.run_processes` for throughput runs by
+  default.
+  - `run_processes` launches all inferlets under one server request and waits
+    for all oneshot returns inside that session handler. It worked for short
+    128x16 smokes but wedged the long 512x128 Qwen3.6-MoE path before any
+    forward completion.
+  - `pie_bench.py` now uses the normal `launch_processes` event path by
+    default; the old path remains opt-in via `PIE_BENCH_USE_RUN_PROCESSES=1`
+    for control-plane microbenching.
+  - Validated TP2, unlimited concurrency, `ipc_profile=latency`,
+    `--warmup-max-tokens 1`: 512x128 completed 512/512 at 2,130.68 output
+    tok/s, 30.758 s wall, avg driver forward 57.6 ms
+    (`pie_qwen36moe_tp2_launchpath_warm1_unlimited_512x128.json`).
+- Successful Qwen3.5/Qwen3.6-MoE decode MoE alignment, using the same core
+  idea as the vLLM/SGL/FlashInfer expert path.
+  - Replaced the pure-decode MoE route matmuls from one cuBLAS batched
+    `M=1` GEMM per routed row (`tokens * top_k`) with expert-aligned fixed
+    blocks and cuBLAS batched `M=16` GEMMs. The new path sorts route ids by
+    expert, pads each expert to block size, gathers aligned inputs, runs
+    block-level gate/up and down GEMMs, then unpermutes the result before the
+    existing top-k weighted sum.
+  - Default block size is 16. `PIE_QWEN35_MOE_ALIGNED_DECODE_BLOCK=0` is the
+    kill switch; other positive values are clamped to [4, 64].
+  - 128x16 TP2 unlimited-concurrency smoke improved from 1,073.14 output
+    tok/s (`pie_qwen36moe_tp2_default_128x16.json`) to 1,667.70 output tok/s
+    (`pie_qwen36moe_tp2_aligned_b16_128x16.json`).
+  - 512x128 TP2 unlimited-concurrency result with no special env completed
+    512/512 at 4,179.14 output tok/s, 15.682 s wall, 28.98 ms average driver
+    forward (`pie_qwen36moe_tp2_default_aligned2_512x128.json`). This is about
+    1.96x the old Pie baseline above and about 1.34x the comparable vLLM TP2
+    run at 3,109.60 output tok/s
+    (`vllm_qwen36moe_tp2_util095_unlimited_512x128.json`).
+  - Revalidated after the dense Qwen3-8B TP2 planner/XQA patch:
+    `Qwen/Qwen3.6-35B-A3B`, TP2, unlimited concurrency, `gpu_mem_util=0.98`
+    still selected `N=2048/R=128`, page32, and completed 512/512 at
+    4,138.48 output tok/s (`pie_qwen36moe_tp2_default_after_dense_plan_util098_512x128.json`).
+  - Memory tradeoff: the aligned planner arena for the full shape is about
+    912 MiB versus about 724 MiB before this path, reducing planned KV pages
+    from roughly 1501 to 1351. At 512x128 the maximum forward request batch
+    stayed 128, so throughput still improved substantially.
+  - Validation gotchas:
+    `Qwen/Qwen3-30B-A3B` is a different `qwen3_moe` checkpoint and currently
+    exits during startup because Pie expects fused `qwen3_5_moe` expert weights
+    (`model.layers.0.mlp.experts.gate_up_proj`). That is a loader/schema issue,
+    not a throughput row. Also, omitting `--gpu-mem-util 0.98` on
+    `Qwen/Qwen3.6-35B-A3B` leaves only about 2.9 GiB budget and selects
+    `N=1024/R=32`; that mismatched run was killed and should not be compared
+    with the accepted MoE baselines.
+- Rejected `PIE_QWEN35_MOE_ALIGNED_DECODE_BLOCK=8` for Qwen3.6-MoE TP2.
+  - The 128x16 run loaded successfully but the first prompt/warmup forward was
+    far slower than the block-16 path and was killed before producing a JSON
+    result.
+  - Do not retry B=8 as a blind "less padding" optimization. It underuses the
+    cuBLAS tile shape or hits a poor kernel path for this decode MoE.
+- Rejected adaptive route-density gating for the aligned MoE path.
+  - Tried using the aligned path only when `routes >= 4 * num_experts`.
+  - The 512x128 TP2 run stalled before request progress with rank 0 busy and
+    rank 1 idle, so the gate was removed and the always-aligned block-16 path
+    was restored.
+  - Do not reintroduce this without a TP/graph-capture stress harness; the
+    simple no-env block-16 default is the validated fast path.
+- Successful Qwen3-8B TP2 Ada/L40 dense planner shape.
+  - Current vLLM control rerun used the vLLM checkout venv, not
+    `/root/Workspace/.local-vllm-venv` because that venv has torch/cu130 and
+    fails on this driver. Command used `--attention-backend FLASHINFER`,
+    TP2, unlimited concurrency, 512 requests, 128 output tokens, and
+    `--gpu-mem-util 0.95`.
+  - vLLM result: 7,575.48 output tok/s, 8.651 s wall
+    (`vllm_8b_tp2_current_flashinfer_unlimited_512x128.json`).
+  - The old Pie default was close but noisy-below-vLLM with page32/N6144:
+    7,560.46 output tok/s
+    (`pie_8b_tp2_current_xqaoff_prefill6144_512x128.json`).
+  - Page-size/workspace sweep showed the real knee is page16/N5632 on L40
+    TP2: first run 7,692.87 output tok/s
+    (`pie_8b_tp2_xqaoff_page16_prefill5632_512x128.json`), rerun
+    7,718.74 output tok/s
+    (`pie_8b_tp2_xqaoff_page16_prefill5632_rerun_512x128.json`).
+    Nearby controls: page16/N5120 was effectively tied at 7,575.56,
+    page16/N5504 was 7,613.63, page16/N5568 was 7,704.26,
+    page16/N5696 was 7,665.72, page16/N5888 was 7,640.36, and current
+    page16/N6144 was 7,572.36. The local peak is centered on N5632.
+  - The default auto planner now recognizes dense Qwen3 hidden_size=4096,
+    TP2, SM89, large-SM GPUs and selects page16/N5632 without env overrides.
+    Default validation after the patch: 7,724.51 output tok/s, 8.484 s wall
+    (`pie_8b_tp2_default_after_ada_plan_512x128.json`), repeat
+    7,698.08 output tok/s
+    (`pie_8b_tp2_default_after_ada_plan_rerun_512x128.json`).
+  - Main lesson: this was not a new custom CUDA kernel. The win came from
+    steering Pie into the FlashInfer paged-decode shape that is actually fast
+    on SM89 TP2 and from removing a bad XQA assumption.
+- Rejected Qwen3-8B TP2 forced prefill-decode plan.
+  - `PIE_CUDA_PREFILL_DECODE_PLAN=1` was temporarily allowed to bypass the
+    TP1-only guard with `PIE_CUDA_XQA_DECODE=0`, HND KV, and N6144.
+  - 128x16 smoke stalled after graph capture with both GPUs busy and no JSON
+    artifact. The bypass was removed; prefill-decode planning remains TP1-only.
+  - Do not retry this by simply forcing the env on TP2. It needs a real TP2
+    plan/capture design.
+- Fixed XQA support gating on SM89.
+  - Pie previously reported XQA decode support for `current_device_major() >= 8`.
+    Local L40/SM89 TP2 serving could spin indefinitely after graph capture with
+    XQA enabled.
+  - vLLM only runs FlashInfer autotune on SM90+ and FlashInfer's public XQA
+    Python wrapper advertises supported compute capabilities `[9, 10, 12]`.
+    SGL likewise vendors FlashInfer/attention kernels and routes page-size
+    support through backend-specific capability checks.
+  - Pie now disables XQA below SM90. Keep dense SM89 on regular FlashInfer
+    paged decode unless upstream exposes and validates an Ada XQA path.
+- Rejected small dense TP2 micro-optimizations around the winning path.
+  - `PIE_CUDA_DECODE_FULL_ATTENTION=0` regressed to 7,532.19 output tok/s
+    (`pie_8b_tp2_xqaoff_prefill6144_decodefull0_512x128.json`).
+  - `PIE_CUDA_STATIC_DECODE_PLAN=1` regressed to 7,525.31 output tok/s
+    (`pie_8b_tp2_xqaoff_prefill6144_staticdecode_512x128.json`).
+  - Forcing cuBLASLt only for lm-head by setting
+    `PIE_CUBLASLT_BF16_MIN_N=100000` regressed to 7,439.82 output tok/s
+    (`pie_8b_tp2_xqaoff_prefill6144_lmheadlt_512x128.json`).
+  - These are not worth carrying as model-specific complexity.

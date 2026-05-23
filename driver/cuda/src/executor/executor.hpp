@@ -118,11 +118,13 @@ struct ForwardFn {
     )>;
 
     using GraphLayoutFn = std::function<std::uint32_t()>;
+    using LogitsModeFn = std::function<void(bool)>;
 
     // Empty by default → executor falls back to "direct call only;
     // no graph capture" mode for this arch.
     PrepareFn prepare;
     GraphLayoutFn graph_layout;
+    LogitsModeFn set_logits_argmax_only;
     BodyFn    body;
 
     // Convenience: `forward_fn = [...]` assigns the lambda as the body.

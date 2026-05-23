@@ -89,4 +89,6 @@ void launch_attention_xqa_decode_bf16_gqa8_sm90_prepared(
     throw std::runtime_error("xqa gqa8 sm90 decode is not built for this CUDA architecture");
 }
 
+void xqa_decode_bf16_gqa8_sm90_warmup_current_device() {}
+
 }  // namespace pie_cuda_driver::ops::detail

@@ -4,8 +4,8 @@
 // `linear_attention` layers. Mirrors HF's `torch_recurrent_gated_delta_rule`
 // (decode, T=1) and `torch_chunk_gated_delta_rule` (prefill, T>1).
 //
-// State per (request, layer): `state[V_h, K_d, V_d]` fp32 — running
-// linear-attention memory. Persisted across decode steps.
+// State per (request, layer): `state[V_h, K_d, V_d]` fp32 —
+// running linear-attention memory. Persisted across decode steps.
 //
 // Per-step recurrence (decode):
 //
@@ -19,8 +19,7 @@
 // also pre-scaled by 1/√K_d. β is sigmoid'd; g is the raw per-head log
 // already (−A_h · softplus(a_h + dt_bias_h) form), and gets exp() inside.
 //
-// All numerics in fp32 — bf16 inputs are widened on load; the state is
-// always fp32 to avoid drift across many recurrent steps.
+// All arithmetic is fp32. bf16 inputs are widened before the recurrent kernel.
 
 #include <cstdint>
 #include <cuda_runtime.h>
@@ -57,7 +56,7 @@ void launch_recurrent_gated_delta_step(
 //     g_log, beta    : [R, V_h]                    fp32
 //     state_base     : [num_slots, V_h, K_d, V_d]  fp32 — slot 0 ptr
 //     slot_ids       : [R] int32, device-resident
-//     slot_stride_elems : V_h * K_d * V_d (per-slot fp32 stride)
+//     slot_stride_elems : V_h * K_d * V_d (per-slot state-element stride)
 //     out            : [R, V_h, V_d]               fp32
 //
 // One launch covers all R requests on the decode path; prefer over

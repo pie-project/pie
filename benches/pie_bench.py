@@ -210,6 +210,8 @@ def build_config(args: argparse.Namespace):
         # Surface for the summary's "spec chain yield" derived stat —
         # yield = hits / (attempted × depth).
         config_blob["speculation depth"] = args.speculation_depth
+    if args.warmup_max_tokens is not None:
+        config_blob["warmup max tokens"] = args.warmup_max_tokens
     return cfg, config_blob
 
 
@@ -456,7 +458,8 @@ async def run(args: argparse.Namespace):
 
         async def many(indices, *, max_tokens: int | None = None) -> list[RequestResult]:
             indices = list(indices)
-            if hasattr(client, "run_processes"):
+            use_run_processes = os.environ.get("PIE_BENCH_USE_RUN_PROCESSES") == "1"
+            if use_run_processes and hasattr(client, "run_processes"):
                 start = time.perf_counter()
                 try:
                     inputs = [

@@ -77,6 +77,15 @@ int current_device_sm_count() {
 
 }  // namespace
 
+void xqa_decode_bf16_gqa4_warmup_current_device() {
+    std::uint32_t size = 0;
+    CUDA_CHECK(cudaMemcpyFromSymbol(&size, smemSize, sizeof(smemSize)));
+    CUDA_CHECK(cudaFuncSetAttribute(
+        kernel_mha,
+        cudaFuncAttributeMaxDynamicSharedMemorySize,
+        static_cast<int>(size)));
+}
+
 void launch_attention_xqa_decode_bf16_gqa4_prepared(
     const void* q,
     void* k_pages,

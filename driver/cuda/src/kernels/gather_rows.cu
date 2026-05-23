@@ -34,6 +34,44 @@ __global__ void gather_bf16_rows_kernel(
     }
 }
 
+__global__ void transpose_bf16_nld_to_lnd_vec4_kernel(
+    const uint4* __restrict__ src,
+    uint4* __restrict__ dst,
+    int n,
+    int layers,
+    int dim4,
+    std::size_t total4)
+{
+    const std::size_t idx =
+        static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (idx >= total4) return;
+    const int d4 = static_cast<int>(idx % dim4);
+    const int row = static_cast<int>((idx / dim4) % n);
+    const int layer = static_cast<int>(idx / (static_cast<std::size_t>(dim4) * n));
+    const std::size_t src_idx =
+        (static_cast<std::size_t>(row) * layers + layer) * dim4 + d4;
+    dst[idx] = src[src_idx];
+}
+
+__global__ void transpose_bf16_nld_to_lnd_kernel(
+    const std::uint16_t* __restrict__ src,
+    std::uint16_t* __restrict__ dst,
+    int n,
+    int layers,
+    int dim,
+    std::size_t total)
+{
+    const std::size_t idx =
+        static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (idx >= total) return;
+    const int d = static_cast<int>(idx % dim);
+    const int row = static_cast<int>((idx / dim) % n);
+    const int layer = static_cast<int>(idx / (static_cast<std::size_t>(dim) * n));
+    const std::size_t src_idx =
+        (static_cast<std::size_t>(row) * layers + layer) * dim + d;
+    dst[idx] = src[src_idx];
+}
+
 }  // namespace
 
 void launch_gather_bf16_rows(
@@ -47,6 +85,38 @@ void launch_gather_bf16_rows(
     if (num_dst_rows <= 0) return;
     gather_bf16_rows_kernel<<<num_dst_rows, BLOCK, 0, stream>>>(
         src, row_indices, dst, vocab);
+}
+
+void launch_transpose_bf16_nld_to_lnd(
+    const std::uint16_t* src,
+    std::uint16_t*       dst,
+    int                  n,
+    int                  layers,
+    int                  dim,
+    cudaStream_t         stream)
+{
+    if (n <= 0 || layers <= 0 || dim <= 0) return;
+    constexpr int BLOCK = 256;
+    if ((dim & 7) == 0) {
+        const int dim4 = dim >> 3;
+        const std::size_t total4 =
+            static_cast<std::size_t>(layers) *
+            static_cast<std::size_t>(n) *
+            static_cast<std::size_t>(dim4);
+        const int grid = static_cast<int>((total4 + BLOCK - 1) / BLOCK);
+        transpose_bf16_nld_to_lnd_vec4_kernel<<<grid, BLOCK, 0, stream>>>(
+            reinterpret_cast<const uint4*>(src),
+            reinterpret_cast<uint4*>(dst),
+            n, layers, dim4, total4);
+    } else {
+        const std::size_t total =
+            static_cast<std::size_t>(layers) *
+            static_cast<std::size_t>(n) *
+            static_cast<std::size_t>(dim);
+        const int grid = static_cast<int>((total + BLOCK - 1) / BLOCK);
+        transpose_bf16_nld_to_lnd_kernel<<<grid, BLOCK, 0, stream>>>(
+            src, dst, n, layers, dim, total);
+    }
 }
 
 }  // namespace pie_cuda_driver::kernels

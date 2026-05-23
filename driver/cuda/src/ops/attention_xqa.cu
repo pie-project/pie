@@ -170,6 +170,9 @@ void launch_attention_xqa_decode_bf16_gqa2_p16_prepared(
     cudaStream_t stream,
     float sm_scale);
 
+void xqa_decode_bf16_gqa2_warmup_current_device();
+void xqa_decode_bf16_gqa2_p16_warmup_current_device();
+
 void launch_attention_xqa_decode_bf16_gqa4(
     const void* q,
     void* k_pages,
@@ -203,6 +206,8 @@ void launch_attention_xqa_decode_bf16_gqa4_prepared(
     cudaStream_t stream,
     float sm_scale);
 
+void xqa_decode_bf16_gqa4_warmup_current_device();
+
 void launch_attention_xqa_decode_bf16_gqa8(
     const void* q,
     void* k_pages,
@@ -221,6 +226,8 @@ void launch_attention_xqa_decode_bf16_gqa8(
     cudaStream_t stream,
     float sm_scale);
 
+void xqa_decode_bf16_gqa8_warmup_current_device();
+
 void launch_attention_xqa_decode_bf16_gqa8_prepared(
     const void* q,
     void* k_pages,
@@ -235,6 +242,8 @@ void launch_attention_xqa_decode_bf16_gqa8_prepared(
     AttentionWorkspace& workspace,
     cudaStream_t stream,
     float sm_scale);
+
+void xqa_decode_bf16_gqa8_sm90_warmup_current_device();
 
 }  // namespace detail
 
@@ -258,7 +267,11 @@ bool xqa_decode_bf16_supported(int num_q_heads,
     if (sm_scale > 0.f && std::abs(sm_scale - default_scale) > 1.0e-6f) {
         return false;
     }
-    return current_device_major() >= 8;
+    // FlashInfer's public XQA wrapper only enables this path on SM90+.
+    // The Ampere/Ada csrc instantiations compile, but local SM89 TP2
+    // serving runs can spin indefinitely after graph capture, so keep
+    // those devices on the regular FlashInfer decode path.
+    return current_device_major() >= 9;
 }
 
 void xqa_decode_bf16_gqa5_warmup_current_device() {
@@ -273,6 +286,33 @@ void xqa_decode_bf16_gqa5_warmup_current_device() {
         kernel_mha,
         cudaFuncAttributeMaxDynamicSharedMemorySize,
         static_cast<int>(size)));
+}
+
+void xqa_decode_bf16_warmup_current_device(int head_group_ratio,
+                                           int page_size) {
+    switch (head_group_ratio) {
+        case 2:
+            if (page_size == 16) {
+                detail::xqa_decode_bf16_gqa2_p16_warmup_current_device();
+            } else {
+                detail::xqa_decode_bf16_gqa2_warmup_current_device();
+            }
+            return;
+        case 4:
+            detail::xqa_decode_bf16_gqa4_warmup_current_device();
+            return;
+        case 5:
+            xqa_decode_bf16_gqa5_warmup_current_device();
+            return;
+        case 8:
+            detail::xqa_decode_bf16_gqa8_warmup_current_device();
+            if (current_device_major() >= 9) {
+                detail::xqa_decode_bf16_gqa8_sm90_warmup_current_device();
+            }
+            return;
+        default:
+            return;
+    }
 }
 
 int xqa_decode_page_bucket(int max_pages_per_seq) {

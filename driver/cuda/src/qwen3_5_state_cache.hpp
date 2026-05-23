@@ -9,9 +9,9 @@
 //                      each active request, oldest-first.
 //
 //   * recurrent_state: [max_slots, V_h, K_d, V_d] fp32
-//                      Linear-attention running state per request. Held
-//                      in fp32 to avoid drift across hundreds of decode
-//                      steps; promoted at the bf16 boundary.
+//                      Linear-attention running state per request. The
+//                      recurrence accumulates in fp32 and keeps the persisted
+//                      state fp32 for the current CUDA kernels.
 //
 // Slot assignment is owned by the runtime and arrives on each forward as
 // runtime-managed rs_cache slot ids. The CUDA storage itself is "dumb": it just
@@ -72,6 +72,9 @@ public:
     }
     std::size_t recurrent_slot_stride_floats() const noexcept {
         return static_cast<std::size_t>(v_heads_) * head_k_dim_ * head_v_dim_;
+    }
+    std::size_t recurrent_slot_stride_bytes() const noexcept {
+        return recurrent_slot_stride_floats() * sizeof(float);
     }
 
     int num_layers() const noexcept { return static_cast<int>(layer_is_linear_.size()); }

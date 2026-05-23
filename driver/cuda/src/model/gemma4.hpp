@@ -92,6 +92,7 @@ struct Gemma4LayerWeights {
 
     // Per-layer learnable scalar. 1-element bf16 tensor.
     const DeviceTensor* layer_scalar  = nullptr;
+    float layer_scalar_value = 1.f;
 
     // Per-layer dimensions (filled in by `bind_gemma4` from layer_types).
     int head_dim     = 0;
@@ -134,6 +135,12 @@ struct Gemma4Weights {
 // MoE workspace for Gemma-4 26B-A4B's parallel routed-expert block.
 // Inert (all buffers length 0) on dense Gemma-4 ckpts.
 struct Gemma4MoeMlpWorkspace {
+    // Dense Gemma-4 PLE inputs. Despite the historical struct name, these
+    // are used by E2B/E4B too; keeping them here avoids a second Gemma4
+    // workspace object threaded through the executor.
+    DeviceBuffer<std::uint16_t> ple_token;         // token scratch, then [L, N, H_ple]
+    DeviceBuffer<std::uint16_t> ple_proj;          // [N, L * H_ple]
+
     // Router intermediate buffers. `router_logits` holds the full E-way
     // softmax distribution; topk extracts the top-K weights/indices.
     DeviceBuffer<std::uint16_t> router_x;          // [N, H] post-norm input to router proj
@@ -165,6 +172,8 @@ struct Gemma4MoeMlpWorkspace {
     static Gemma4MoeMlpWorkspace allocate(
         int max_tokens, int hidden, int num_experts, int top_k,
         int moe_intermediate);
+
+    void allocate_ple(int max_tokens, int per_layer_total);
 };
 
 struct Gemma4ForwardCfg {
@@ -189,6 +198,8 @@ struct Gemma4ForwardCfg {
 // `num_kv_shared_layers`. Throws on missing tensors.
 Gemma4Weights bind_gemma4(const LoadedModel& engine);
 
+void set_gemma4_logits_argmax_only(bool enabled);
+
 void gemma4_forward_paged(
     const Gemma4Weights& w,
     const HfConfig& cfg,
@@ -210,6 +221,8 @@ void gemma4_forward_paged(
     int num_requests,
     bool is_pure_decode,
     const std::uint8_t* custom_mask_d = nullptr,
-    const std::int32_t* custom_mask_indptr_d = nullptr);
+    const std::int32_t* custom_mask_indptr_d = nullptr,
+    const std::int32_t* logit_row_indices_d = nullptr,
+    int num_logit_rows = 0);
 
 }  // namespace pie_cuda_driver::model

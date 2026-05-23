@@ -24,13 +24,16 @@ int xqa_decode_page_bucket(int max_pages_per_seq);
 
 std::uint8_t xqa_decode_graph_layout(int max_pages_per_seq);
 
-// Set the per-device max-dynamic-smem attribute for the XQA gqa=5 kernel
-// on the *current* CUDA device. FlashInfer's xqa csrc does this via a
-// once-per-process static initializer, which only covers whichever device
-// is current when that static runs — under TP>1, other ranks' devices
-// never get the attribute set and `cudaLaunchKernelEx` returns
-// cudaErrorInvalidValue (often surfaced from inside a graph capture).
-// Call this after `cudaSetDevice` on each rank, before any graph capture.
+// Set the per-device max-dynamic-smem attribute for the selected XQA kernel on
+// the *current* CUDA device. FlashInfer's xqa csrc does this via a
+// once-per-process static initializer, which only covers whichever device is
+// current when that static runs; under TP>1, other ranks' devices may never get
+// the attribute set. Call this after `cudaSetDevice` on each rank, before any
+// graph capture.
+void xqa_decode_bf16_warmup_current_device(int head_group_ratio,
+                                           int page_size);
+
+// Back-compat wrapper for the original GQA=5 specialization.
 void xqa_decode_bf16_gqa5_warmup_current_device();
 
 void launch_attention_xqa_decode_bf16(

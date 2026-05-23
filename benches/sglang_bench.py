@@ -53,7 +53,13 @@ def run(args: argparse.Namespace):
     }
     try:
         if args.warmup:
-            engine.generate(prompts[: args.warmup], sampling)
+            warmup_sampling = sampling
+            if args.warmup_max_tokens is not None:
+                warmup_sampling = {
+                    **sampling,
+                    "max_new_tokens": args.warmup_max_tokens,
+                }
+            engine.generate(prompts[: args.warmup], warmup_sampling)
         run_prompts = prompts[args.warmup:]
         run_prompt_counts = prompt_counts[args.warmup:]
         results: list[RequestResult] = []
@@ -105,6 +111,7 @@ def run(args: argparse.Namespace):
             "ignore_eos": args.ignore_eos,
             "unique_prompts": args.unique_prompts,
             "cpu affinity": cpu_affinity,
+            "warmup max tokens": args.warmup_max_tokens,
         },
     )
     return summary, results

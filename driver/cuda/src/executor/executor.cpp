@@ -621,6 +621,7 @@ std::size_t capture_forward_graph_lattice(Executor& executor) {
         std::vector<std::uint32_t> kvpp(static_cast<std::size_t>(R) + 1);
         std::vector<std::uint32_t> kvlpl(static_cast<std::size_t>(R), 1u);
         std::vector<std::uint32_t> kvpi(static_cast<std::size_t>(R));
+        std::vector<std::int32_t> slot_ids;
 
         for (int r = 0; r <= R; ++r) {
             qo[static_cast<std::size_t>(r)] = static_cast<std::uint32_t>(r);
@@ -630,6 +631,13 @@ std::size_t capture_forward_graph_lattice(Executor& executor) {
             kvpi[static_cast<std::size_t>(r)] =
                 static_cast<std::uint32_t>(r % num_pages);
         }
+        if (executor.rs_cache != nullptr) {
+            slot_ids.resize(static_cast<std::size_t>(R));
+            for (int r = 0; r < R; ++r) {
+                slot_ids[static_cast<std::size_t>(r)] =
+                    static_cast<std::int32_t>(r);
+            }
+        }
 
         pi.tokens.copy_from_host(std::span<const std::uint32_t>(tokens));
         pi.positions.copy_from_host(std::span<const std::uint32_t>(positions));
@@ -637,6 +645,9 @@ std::size_t capture_forward_graph_lattice(Executor& executor) {
         pi.kv_page_indices.copy_from_host(std::span<const std::uint32_t>(kvpi));
         pi.kv_page_indptr.copy_from_host(std::span<const std::uint32_t>(kvpp));
         pi.kv_last_page_lens.copy_from_host(std::span<const std::uint32_t>(kvlpl));
+        if (!slot_ids.empty()) {
+            pi.slot_ids.copy_from_host(std::span<const std::int32_t>(slot_ids));
+        }
 
         executor.forward_fn.prepare(
             executor.attn_ws,
@@ -667,7 +678,8 @@ std::size_t capture_forward_graph_lattice(Executor& executor) {
         cudaGraphExec_t exec = capture_forward_graph_exec(
             executor, qo.data(), kvpp.data(), N, R, /*is_pure_decode=*/true,
             /*slot_ids_h=*/nullptr, /*is_fresh_h=*/nullptr,
-            /*slot_ids_d=*/nullptr, /*logit_row_indices_d=*/nullptr,
+            executor.rs_cache != nullptr ? pi.slot_ids.data() : nullptr,
+            /*logit_row_indices_d=*/nullptr,
             /*num_logit_rows=*/0, single_gpu_graph_argmax,
             tp_greedy_argmax);
         executor.graph_cache->put(key, exec);
@@ -924,6 +936,11 @@ void handle_fire_batch(
             }
             pi.slot_ids.copy_from_host(std::span<const std::int32_t>(slot_ids_h));
             pi.is_fresh.copy_from_host(std::span<const std::uint8_t>(is_fresh_h));
+            if (graph_shape_ok &&
+                std::any_of(is_fresh_h.begin(), is_fresh_h.end(),
+                            [](std::uint8_t v) { return v != 0; })) {
+                graph_shape_ok = false;
+            }
         }
 
         // ── Sample-plan construction (hoisted) ──────────────────
@@ -1218,6 +1235,15 @@ void handle_fire_batch(
         // forward bodies.
         if (!tp_greedy_argmax && !single_gpu_greedy_argmax) {
             upload_sampling_inputs(pi, sample_plan, N, /*stream=*/nullptr);
+        }
+        if (forward_fn.set_logits_argmax_only) {
+            const bool logits_argmax_only =
+                !need_msgpack &&
+                logit_masks_view.empty() &&
+                !any_topk_topp &&
+                all_slots_token &&
+                all_rows_greedy;
+            forward_fn.set_logits_argmax_only(logits_argmax_only);
         }
 
         // ── Forward pass ────────────────────────────────────────

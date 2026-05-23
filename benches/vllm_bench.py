@@ -53,7 +53,15 @@ def run(args: argparse.Namespace):
         ignore_eos=args.ignore_eos,
     )
     if args.warmup:
-        llm.generate(prompts[: args.warmup], sampling)
+        warmup_sampling = sampling
+        if args.warmup_max_tokens is not None:
+            warmup_sampling = SamplingParams(
+                temperature=args.temperature,
+                top_p=args.top_p,
+                max_tokens=args.warmup_max_tokens,
+                ignore_eos=args.ignore_eos,
+            )
+        llm.generate(prompts[: args.warmup], warmup_sampling)
 
     run_prompts = prompts[args.warmup:]
     run_prompt_counts = prompt_counts[args.warmup:]
@@ -94,6 +102,7 @@ def run(args: argparse.Namespace):
             "ignore_eos": args.ignore_eos,
             "unique_prompts": args.unique_prompts,
             "cpu affinity": cpu_affinity,
+            "warmup max tokens": args.warmup_max_tokens,
         },
     )
     return summary, results
