@@ -16,6 +16,8 @@ Conversions:
 
 from __future__ import annotations
 
+import inspect
+
 import numba
 import numpy as np
 import torch
@@ -139,22 +141,32 @@ def build_common_metadata(
     max_query_len = int(query_lens_np.max()) if batch > 0 else 0
     max_seq_len = int(seq_lens_np.max()) if batch > 0 else 0
 
-    return CommonAttentionMetadata(
-        query_start_loc=query_start_loc,
-        query_start_loc_cpu=query_start_loc_cpu,
-        seq_lens=seq_lens,
-        num_reqs=batch,
-        num_actual_tokens=num_tokens,
-        max_query_len=max_query_len,
-        max_seq_len=max_seq_len,
-        block_table_tensor=block_table_tensor,
-        slot_mapping=slot_mapping,
-        causal=True,
-        positions=positions,
-        seq_lens_cpu_upper_bound=seq_lens_cpu,
-        _seq_lens_cpu=seq_lens_cpu,
-        _num_computed_tokens_cpu=num_computed_tokens_cpu,
-    )
+    kwargs = {
+        "query_start_loc": query_start_loc,
+        "query_start_loc_cpu": query_start_loc_cpu,
+        "seq_lens": seq_lens,
+        "num_reqs": batch,
+        "num_actual_tokens": num_tokens,
+        "max_query_len": max_query_len,
+        "max_seq_len": max_seq_len,
+        "block_table_tensor": block_table_tensor,
+        "slot_mapping": slot_mapping,
+        "causal": True,
+        "_seq_lens_cpu": seq_lens_cpu,
+        "_num_computed_tokens_cpu": num_computed_tokens_cpu,
+    }
+    optional_kwargs = {
+        # vLLM revisions differ on whether these fields are constructor args
+        # or populated elsewhere in the attention path.
+        "positions": positions,
+        "seq_lens_cpu_upper_bound": seq_lens_cpu,
+    }
+    params = inspect.signature(CommonAttentionMetadata).parameters
+    for name, value in optional_kwargs.items():
+        if name in params:
+            kwargs[name] = value
+
+    return CommonAttentionMetadata(**kwargs)
 
 
 def _i32_np(tensor: torch.Tensor, cpu: np.ndarray | None) -> np.ndarray:

@@ -203,6 +203,7 @@ class VllmForwardPass:
             position_ids=positions,
         )
         t_common = time.perf_counter()
+        common_positions = getattr(common, "positions", None)
 
         # Ask vllm whether a captured graph applies to this num_tokens. If
         # mode is NONE the wrapper falls through to eager and we run the
@@ -286,7 +287,7 @@ class VllmForwardPass:
                 input_ids_in = None
                 input_embeds_in = self._buf_input_embeds[:forward_n]
             positions_for_forward = (
-                common.positions if common.positions is not None else positions
+                common_positions if common_positions is not None else positions
             )
             if positions_for_forward.shape[0] >= forward_n:
                 graph_position_copy_bytes += self._leading_dim_bytes(
@@ -329,9 +330,7 @@ class VllmForwardPass:
                 input_embeds_in = None
             else:
                 assert input_embeds_in is not None
-            positions_in = (
-                common.positions if common.positions is not None else positions
-            )
+            positions_in = common_positions if common_positions is not None else positions
         t_graph_inputs = time.perf_counter()
 
         with set_forward_context(
