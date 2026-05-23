@@ -858,7 +858,9 @@ void gemma4_forward_paged(
                 qo_indptr, kv_page_indices, kv_page_indptr, kv_last_page_lens,
                 N, R, kv_page_indptr_h[R], num_q_heads_local, stream,
                 /*window_left=*/w.per_layer_window_left[l],
-                /*sm_scale=*/1.0f);
+                /*sm_scale=*/1.0f,
+                /*logits_soft_cap=*/0.f,
+                /*lse_out=*/nullptr);
         } else {
             ops::launch_attention_flashinfer_prefill(
                 ws.q.data(), kv_view, ws.attn_out.data(),

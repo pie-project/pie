@@ -188,15 +188,15 @@ struct ProgramService {
     installed: HashMap<ProgramName, InstalledProgram>,
     /// Programs that were explicitly installed (not pulled as dependencies)
     explicit_installs: std::collections::HashSet<ProgramName>,
-    /// Monotonic id assigned whenever a component is installed.
-    next_install_id: u64,
+    /// Monotonic generation for installed-program state. Consumers use this
+    /// as a cheap cache invalidation guard for resolved launch plans.
+    generation: u64,
 }
 
 /// Cached state for an installed program.
 #[derive(Clone)]
 struct InstalledProgram {
     component: Component,
-    install_id: u64,
     /// True if the component was transformed by the host-side snapshot
     /// pipeline. Consumers use this to pick the stripped shared-module
     /// variant at instantiate time.
@@ -212,8 +212,8 @@ struct InstalledProgram {
 #[derive(Clone)]
 pub struct InstalledComponent {
     pub component: Component,
-    /// Changes whenever this program is freshly installed in this process.
-    pub install_id: u64,
+    /// Current installed-program generation for cache invalidation.
+    pub generation: u64,
     /// True if the component was transformed by the host-side snapshot
     /// pipeline. Pick the stripped shared-module variant at instantiate time
     /// when this is set.
@@ -229,14 +229,8 @@ impl ProgramService {
             repository,
             installed: HashMap::new(),
             explicit_installs: std::collections::HashSet::new(),
-            next_install_id: 1,
+            generation: 0,
         }
-    }
-
-    fn allocate_install_id(&mut self) -> u64 {
-        let id = self.next_install_id;
-        self.next_install_id = self.next_install_id.wrapping_add(1).max(1);
-        id
     }
 
     fn is_installed(&self, name: &ProgramName) -> bool {
@@ -250,7 +244,7 @@ impl ProgramService {
     fn get_component(&self, name: &ProgramName) -> Option<InstalledComponent> {
         self.installed.get(name).map(|p| InstalledComponent {
             component: p.component.clone(),
-            install_id: p.install_id,
+            generation: self.generation,
             snapshotted: p.snapshotted,
             python_runtime: p.python_runtime.clone(),
         })
@@ -278,7 +272,12 @@ impl ProgramService {
             }
         }
 
+        self.bump_generation();
         true
+    }
+
+    fn bump_generation(&mut self) {
+        self.generation = self.generation.wrapping_add(1);
     }
 
     /// Add a program with WASM binary and manifest: store in repository + disk (does NOT install).
@@ -288,16 +287,25 @@ impl ProgramService {
         manifest: Manifest,
         force_overwrite: bool,
     ) -> Result<()> {
+        let program_name = manifest.program_name();
         self.repository
             .add(wasm_binary, manifest, force_overwrite)
-            .await
+            .await?;
+        if force_overwrite {
+            self.uninstall(&program_name);
+        }
+        Ok(())
     }
 
     /// Add a program from registry by name: download and store in repository + disk (does NOT install).
     async fn add_from_registry(&mut self, name: &ProgramName, force_overwrite: bool) -> Result<()> {
         self.repository
             .add_from_registry(name, force_overwrite)
-            .await
+            .await?;
+        if force_overwrite {
+            self.uninstall(name);
+        }
+        Ok(())
     }
 
     /// Install a program: JIT compile + link, resolves transitive dependencies.
@@ -325,12 +333,10 @@ impl ProgramService {
                     .repository
                     .fetch_manifest(dep_name)
                     .and_then(|m| m.python_runtime().map(str::to_string));
-                let install_id = self.allocate_install_id();
                 self.installed.insert(
                     dep_name.clone(),
                     InstalledProgram {
                         component: dep_component,
-                        install_id,
                         snapshotted: false,
                         python_runtime: dep_python_runtime,
                     },
@@ -406,17 +412,16 @@ impl ProgramService {
         };
 
         // Step 5: Track as installed and mark as explicitly installed
-        let install_id = self.allocate_install_id();
         self.installed.insert(
             name.clone(),
             InstalledProgram {
                 component,
-                install_id,
                 snapshotted,
                 python_runtime,
             },
         );
         self.explicit_installs.insert(name.clone());
+        self.bump_generation();
 
         Ok(())
     }

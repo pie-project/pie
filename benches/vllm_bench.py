@@ -41,6 +41,7 @@ def run(args: argparse.Namespace):
         model=args.model,
         gpu_memory_utilization=args.gpu_mem_util,
         max_num_seqs=max_num_seqs,
+        max_num_batched_tokens=args.max_num_batched_tokens,
         tensor_parallel_size=args.tp_size,
         max_model_len=args.max_model_len,
         enable_prefix_caching=False,
@@ -95,6 +96,7 @@ def run(args: argparse.Namespace):
         config={
             "enable_prefix_caching": False,
             "max_num_seqs": max_num_seqs,
+            "max_num_batched_tokens": args.max_num_batched_tokens,
             "attention_backend": args.attention_backend,
             "enforce_eager": args.enforce_eager,
             "temperature": args.temperature,
@@ -114,6 +116,7 @@ def main() -> None:
     for sp in parser._subparsers._group_actions[0].choices.values():
         sp.add_argument("--attention-backend", default=None)
         sp.add_argument("--enforce-eager", action="store_true")
+        sp.add_argument("--max-num-batched-tokens", type=int, default=None)
     args = parser.parse_args()
     summary, results = run(args)
     finish(summary, results, args.json_out)

@@ -18,7 +18,7 @@ use anyhow::Result;
 use pie_bridge::Brle;
 use std::iter;
 use std::mem::take;
-use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::sync::oneshot;
@@ -26,6 +26,125 @@ use wasmtime::component::Resource;
 use wasmtime_wasi::WasiView;
 use wasmtime_wasi::async_trait;
 use wasmtime_wasi::p2::{DynPollable, Pollable, subscribe};
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ExecuteProfileSnapshot {
+    pub calls: u64,
+    pub hits: u64,
+    pub misses: u64,
+    pub total_us: u64,
+    pub prepare_us: u64,
+    pub try_hit_us: u64,
+    pub hit_wait_us: u64,
+    pub cold_prepare_us: u64,
+    pub pin_us: u64,
+    pub submit_wait_us: u64,
+    pub postprocess_us: u64,
+}
+
+struct ExecuteProfileStats {
+    calls: AtomicU64,
+    hits: AtomicU64,
+    misses: AtomicU64,
+    total_us: AtomicU64,
+    prepare_us: AtomicU64,
+    try_hit_us: AtomicU64,
+    hit_wait_us: AtomicU64,
+    cold_prepare_us: AtomicU64,
+    pin_us: AtomicU64,
+    submit_wait_us: AtomicU64,
+    postprocess_us: AtomicU64,
+}
+
+static EXECUTE_PROFILE: ExecuteProfileStats = ExecuteProfileStats {
+    calls: AtomicU64::new(0),
+    hits: AtomicU64::new(0),
+    misses: AtomicU64::new(0),
+    total_us: AtomicU64::new(0),
+    prepare_us: AtomicU64::new(0),
+    try_hit_us: AtomicU64::new(0),
+    hit_wait_us: AtomicU64::new(0),
+    cold_prepare_us: AtomicU64::new(0),
+    pin_us: AtomicU64::new(0),
+    submit_wait_us: AtomicU64::new(0),
+    postprocess_us: AtomicU64::new(0),
+};
+
+fn execute_profile_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("PIE_PROFILE_EXECUTE").is_some())
+}
+
+fn elapsed_us(duration: Duration) -> u64 {
+    duration.as_micros() as u64
+}
+
+pub fn execute_profile_snapshot() -> Option<ExecuteProfileSnapshot> {
+    if !execute_profile_enabled() {
+        return None;
+    }
+    Some(ExecuteProfileSnapshot {
+        calls: EXECUTE_PROFILE.calls.load(Ordering::Relaxed),
+        hits: EXECUTE_PROFILE.hits.load(Ordering::Relaxed),
+        misses: EXECUTE_PROFILE.misses.load(Ordering::Relaxed),
+        total_us: EXECUTE_PROFILE.total_us.load(Ordering::Relaxed),
+        prepare_us: EXECUTE_PROFILE.prepare_us.load(Ordering::Relaxed),
+        try_hit_us: EXECUTE_PROFILE.try_hit_us.load(Ordering::Relaxed),
+        hit_wait_us: EXECUTE_PROFILE.hit_wait_us.load(Ordering::Relaxed),
+        cold_prepare_us: EXECUTE_PROFILE.cold_prepare_us.load(Ordering::Relaxed),
+        pin_us: EXECUTE_PROFILE.pin_us.load(Ordering::Relaxed),
+        submit_wait_us: EXECUTE_PROFILE.submit_wait_us.load(Ordering::Relaxed),
+        postprocess_us: EXECUTE_PROFILE.postprocess_us.load(Ordering::Relaxed),
+    })
+}
+
+#[derive(Default)]
+struct ExecuteProfileSample {
+    hit: bool,
+    prepare_us: u64,
+    try_hit_us: u64,
+    hit_wait_us: u64,
+    cold_prepare_us: u64,
+    pin_us: u64,
+    submit_wait_us: u64,
+    postprocess_us: u64,
+}
+
+fn record_execute_profile(sample: ExecuteProfileSample, total_us: u64) {
+    if !execute_profile_enabled() {
+        return;
+    }
+    EXECUTE_PROFILE.calls.fetch_add(1, Ordering::Relaxed);
+    if sample.hit {
+        EXECUTE_PROFILE.hits.fetch_add(1, Ordering::Relaxed);
+    } else {
+        EXECUTE_PROFILE.misses.fetch_add(1, Ordering::Relaxed);
+    }
+    EXECUTE_PROFILE
+        .total_us
+        .fetch_add(total_us, Ordering::Relaxed);
+    EXECUTE_PROFILE
+        .prepare_us
+        .fetch_add(sample.prepare_us, Ordering::Relaxed);
+    EXECUTE_PROFILE
+        .try_hit_us
+        .fetch_add(sample.try_hit_us, Ordering::Relaxed);
+    EXECUTE_PROFILE
+        .hit_wait_us
+        .fetch_add(sample.hit_wait_us, Ordering::Relaxed);
+    EXECUTE_PROFILE
+        .cold_prepare_us
+        .fetch_add(sample.cold_prepare_us, Ordering::Relaxed);
+    EXECUTE_PROFILE
+        .pin_us
+        .fetch_add(sample.pin_us, Ordering::Relaxed);
+    EXECUTE_PROFILE
+        .submit_wait_us
+        .fetch_add(sample.submit_wait_us, Ordering::Relaxed);
+    EXECUTE_PROFILE
+        .postprocess_us
+        .fetch_add(sample.postprocess_us, Ordering::Relaxed);
+}
 
 /// WASM-facing forward-pass accumulator. The WIT methods append/set
 /// into `req: pie_bridge::ForwardRequest` directly — at `execute()`
@@ -43,140 +162,102 @@ pub struct ForwardPass {
     /// without taking the global REGISTRY lock.
     spec: Option<inference::StagedBatch>,
     pub adapter_seed: Option<i64>,
+    allow_pass_speculation: bool,
     req: pie_bridge::ForwardRequest,
 }
 
 #[derive(Debug)]
 pub struct FutureOutput {
     result: Option<pie::core::inference::Output>,
-    rx: Option<oneshot::Receiver<ForwardOutput>>,
+    rx: Option<oneshot::Receiver<Result<ForwardOutput>>>,
     /// Samplers from the originating request — cloned before draining
     /// `pass.req` at execute() time so we can reconstruct the WIT
     /// per-slot output list against this slot order.
     samplers: Vec<pie_bridge::Sampler>,
     done: bool,
+    model_id: usize,
+    context_id: Option<crate::context::ContextId>,
+    was_pinned: bool,
+    fill_tokens: Vec<u32>,
+    fill_positions: Vec<u32>,
+    fill_masks: Vec<Brle>,
+    spec_tokens_for_fill: Vec<u32>,
+    spec_positions_for_fill: Vec<u32>,
+    adapter_id: Option<crate::adapter::AdapterId>,
+    adapter_seed: Option<i64>,
 }
 
-#[derive(Debug, Clone, Copy, Default, serde::Serialize)]
-pub struct ApiForwardStats {
-    pub completed: u64,
-    pub hit_path: u64,
-    pub cold_path: u64,
-    pub cumulative_execute_us: u64,
-    pub avg_execute_us: u64,
-    pub cumulative_try_hit_us: u64,
-    pub avg_try_hit_us: u64,
-    pub cumulative_staged_await_us: u64,
-    pub avg_staged_await_us: u64,
-    pub cumulative_cold_prepare_us: u64,
-    pub avg_cold_prepare_us: u64,
-    pub cumulative_pin_us: u64,
-    pub avg_pin_us: u64,
-    pub cumulative_submit_await_us: u64,
-    pub avg_submit_await_us: u64,
-    pub cumulative_append_us: u64,
-    pub avg_append_us: u64,
-    pub cumulative_unpin_us: u64,
-    pub avg_unpin_us: u64,
-    pub cumulative_build_output_us: u64,
-    pub avg_build_output_us: u64,
-}
-
-#[derive(Debug, Clone, Copy, Default)]
-struct ApiForwardTiming {
-    execute_us: u64,
-    try_hit_us: u64,
-    staged_await_us: u64,
-    cold_prepare_us: u64,
-    pin_us: u64,
-    submit_await_us: u64,
-    append_us: u64,
-    unpin_us: u64,
-    build_output_us: u64,
-    hit_path: bool,
-    cold_path: bool,
-}
-
-static API_FORWARD_COMPLETED: AtomicU64 = AtomicU64::new(0);
-static API_FORWARD_HIT_PATH: AtomicU64 = AtomicU64::new(0);
-static API_FORWARD_COLD_PATH: AtomicU64 = AtomicU64::new(0);
-static API_FORWARD_EXECUTE_US: AtomicU64 = AtomicU64::new(0);
-static API_FORWARD_TRY_HIT_US: AtomicU64 = AtomicU64::new(0);
-static API_FORWARD_STAGED_AWAIT_US: AtomicU64 = AtomicU64::new(0);
-static API_FORWARD_COLD_PREPARE_US: AtomicU64 = AtomicU64::new(0);
-static API_FORWARD_PIN_US: AtomicU64 = AtomicU64::new(0);
-static API_FORWARD_SUBMIT_AWAIT_US: AtomicU64 = AtomicU64::new(0);
-static API_FORWARD_APPEND_US: AtomicU64 = AtomicU64::new(0);
-static API_FORWARD_UNPIN_US: AtomicU64 = AtomicU64::new(0);
-static API_FORWARD_BUILD_OUTPUT_US: AtomicU64 = AtomicU64::new(0);
-
-fn api_breakdown_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var_os("PIE_API_E2E_BREAKDOWN").is_some())
-}
-
-fn duration_us(d: Duration) -> u64 {
-    d.as_micros().min(u128::from(u64::MAX)) as u64
-}
-
-#[inline]
-fn add_elapsed_us(dst: &mut u64, start: Instant) {
-    *dst = dst.saturating_add(duration_us(start.elapsed()));
-}
-
-fn record_api_forward_timing(timing: ApiForwardTiming) {
-    API_FORWARD_COMPLETED.fetch_add(1, Relaxed);
-    if timing.hit_path {
-        API_FORWARD_HIT_PATH.fetch_add(1, Relaxed);
+impl FutureOutput {
+    fn release_pin(&mut self) {
+        if self.was_pinned {
+            if let Some(context_id) = self.context_id {
+                context::unpin(self.model_id, context_id);
+            }
+            self.was_pinned = false;
+        }
     }
-    if timing.cold_path {
-        API_FORWARD_COLD_PATH.fetch_add(1, Relaxed);
-    }
-    API_FORWARD_EXECUTE_US.fetch_add(timing.execute_us, Relaxed);
-    API_FORWARD_TRY_HIT_US.fetch_add(timing.try_hit_us, Relaxed);
-    API_FORWARD_STAGED_AWAIT_US.fetch_add(timing.staged_await_us, Relaxed);
-    API_FORWARD_COLD_PREPARE_US.fetch_add(timing.cold_prepare_us, Relaxed);
-    API_FORWARD_PIN_US.fetch_add(timing.pin_us, Relaxed);
-    API_FORWARD_SUBMIT_AWAIT_US.fetch_add(timing.submit_await_us, Relaxed);
-    API_FORWARD_APPEND_US.fetch_add(timing.append_us, Relaxed);
-    API_FORWARD_UNPIN_US.fetch_add(timing.unpin_us, Relaxed);
-    API_FORWARD_BUILD_OUTPUT_US.fetch_add(timing.build_output_us, Relaxed);
-}
 
-pub fn get_api_forward_stats() -> ApiForwardStats {
-    let completed = API_FORWARD_COMPLETED.load(Relaxed);
-    let avg = |total: u64| if completed > 0 { total / completed } else { 0 };
-    let execute = API_FORWARD_EXECUTE_US.load(Relaxed);
-    let try_hit = API_FORWARD_TRY_HIT_US.load(Relaxed);
-    let staged_await = API_FORWARD_STAGED_AWAIT_US.load(Relaxed);
-    let cold_prepare = API_FORWARD_COLD_PREPARE_US.load(Relaxed);
-    let pin = API_FORWARD_PIN_US.load(Relaxed);
-    let submit_await = API_FORWARD_SUBMIT_AWAIT_US.load(Relaxed);
-    let append = API_FORWARD_APPEND_US.load(Relaxed);
-    let unpin = API_FORWARD_UNPIN_US.load(Relaxed);
-    let build_output = API_FORWARD_BUILD_OUTPUT_US.load(Relaxed);
-    ApiForwardStats {
-        completed,
-        hit_path: API_FORWARD_HIT_PATH.load(Relaxed),
-        cold_path: API_FORWARD_COLD_PATH.load(Relaxed),
-        cumulative_execute_us: execute,
-        avg_execute_us: avg(execute),
-        cumulative_try_hit_us: try_hit,
-        avg_try_hit_us: avg(try_hit),
-        cumulative_staged_await_us: staged_await,
-        avg_staged_await_us: avg(staged_await),
-        cumulative_cold_prepare_us: cold_prepare,
-        avg_cold_prepare_us: avg(cold_prepare),
-        cumulative_pin_us: pin,
-        avg_pin_us: avg(pin),
-        cumulative_submit_await_us: submit_await,
-        avg_submit_await_us: avg(submit_await),
-        cumulative_append_us: append,
-        avg_append_us: avg(append),
-        cumulative_unpin_us: unpin,
-        avg_unpin_us: avg(unpin),
-        cumulative_build_output_us: build_output,
-        avg_build_output_us: avg(build_output),
+    fn append_lineage(&mut self) {
+        let Some(context_id) = self.context_id else {
+            return;
+        };
+        let mut all_fill_tokens = take(&mut self.fill_tokens);
+        let mut all_fill_positions = take(&mut self.fill_positions);
+        let mut all_fill_masks = take(&mut self.fill_masks);
+        if !self.spec_tokens_for_fill.is_empty() {
+            all_fill_tokens.extend_from_slice(&self.spec_tokens_for_fill);
+            all_fill_positions.extend_from_slice(&self.spec_positions_for_fill);
+            if !all_fill_masks.is_empty() {
+                for &pos in &self.spec_positions_for_fill {
+                    all_fill_masks.push(Brle::all_true((pos + 1) as usize));
+                }
+            }
+        }
+        if !all_fill_tokens.is_empty() {
+            context::append_working_page_tokens(
+                self.model_id,
+                context_id,
+                all_fill_tokens,
+                all_fill_positions,
+                all_fill_masks,
+                self.adapter_id,
+                self.adapter_seed,
+            );
+        }
+    }
+
+    fn finish_ok(&mut self, output: ForwardOutput) {
+        if self.spec_tokens_for_fill.is_empty() {
+            if let ForwardOutput::Tokens(tokens) = &output {
+                if tokens.len() > 1 {
+                    let start = self
+                        .fill_positions
+                        .last()
+                        .copied()
+                        .map(|pos| pos + 1)
+                        .unwrap_or(0);
+                    let extra = tokens.len() - 1;
+                    self.spec_tokens_for_fill
+                        .extend_from_slice(&tokens[..extra]);
+                    self.spec_positions_for_fill
+                        .extend((0..extra).map(|i| start + i as u32));
+                }
+            }
+        }
+        self.append_lineage();
+        self.release_pin();
+        self.result = Some(build_wit_output(output, &self.samplers));
+        self.done = true;
+    }
+
+    fn finish_empty(&mut self) {
+        self.release_pin();
+        self.result = Some(pie::core::inference::Output {
+            slots: Vec::new(),
+            spec_tokens: Vec::new(),
+            spec_positions: Vec::new(),
+        });
+        self.done = true;
     }
 }
 
@@ -197,19 +278,19 @@ impl Pollable for FutureOutput {
         if self.done {
             return;
         }
-        if let Some(rx) = self.rx.take() {
-            match rx.await {
-                Ok(resp) => {
-                    self.result = Some(build_wit_output(resp, &self.samplers));
-                    self.done = true;
+        if let Some(rx) = self.rx.as_mut() {
+            let output = rx.await;
+            self.rx = None;
+            match output {
+                Ok(Ok(resp)) => {
+                    self.finish_ok(resp);
+                }
+                Ok(Err(e)) => {
+                    tracing::warn!("future output failed: {e:#}");
+                    self.finish_empty();
                 }
                 Err(_) => {
-                    self.result = Some(pie::core::inference::Output {
-                        slots: Vec::new(),
-                        spec_tokens: Vec::new(),
-                        spec_positions: Vec::new(),
-                    });
-                    self.done = true;
+                    self.finish_empty();
                 }
             }
         } else {
@@ -430,6 +511,7 @@ impl pie::core::inference::HostForwardPass for InstanceState {
             context_id: None,
             spec: None,
             adapter_seed: None,
+            allow_pass_speculation: true,
             req: empty_forward_request(),
         };
         Ok(self.ctx().table.push(pass)?)
@@ -494,6 +576,12 @@ impl pie::core::inference::HostForwardPass for InstanceState {
         Ok(())
     }
 
+    async fn pass_speculation(&mut self, this: Resource<ForwardPass>, flag: bool) -> Result<()> {
+        let pass = self.ctx().table.get_mut(&this)?;
+        pass.allow_pass_speculation = flag;
+        Ok(())
+    }
+
     async fn attention_mask(
         &mut self,
         this: Resource<ForwardPass>,
@@ -545,9 +633,10 @@ impl pie::core::inference::HostForwardPass for InstanceState {
         &mut self,
         this: Resource<ForwardPass>,
     ) -> Result<Result<Resource<FutureOutput>, String>> {
-        let api_breakdown = api_breakdown_enabled();
-        let execute_start = api_breakdown.then(Instant::now);
-        let mut api_timing = ApiForwardTiming::default();
+        let profiling = execute_profile_enabled();
+        let profile_start = profiling.then(Instant::now);
+        let mut profile_sample = ExecuteProfileSample::default();
+        let prepare_start = profiling.then(Instant::now);
         let pass = self.ctx().table.get_mut(&this)?;
 
         let model_id = pass.model_id;
@@ -556,18 +645,20 @@ impl pie::core::inference::HostForwardPass for InstanceState {
             .ok_or_else(|| anyhow::anyhow!("ForwardPass requires a context"))?;
         let adapter_seed = pass.adapter_seed;
         let spec_handle = pass.spec.clone();
+        let allow_pass_speculation = pass.allow_pass_speculation;
+        pass.allow_pass_speculation = true;
         // Drain the accumulator. The remaining work is to synthesize
         // masks if absent and stamp the per-request indptrs onto the
         // ForwardRequest, then submit.
         let mut req = std::mem::replace(&mut pass.req, empty_forward_request());
+        // Clone samplers BEFORE finalizing so we can reconstruct the
+        // per-slot WIT output against the original slot order.
+        let samplers_for_output = req.samplers.clone();
+
         // Track whether the user actually supplied masks; the kernel-dispatch
         // hint downstream needs to distinguish user masks from the runtime's
         // synthesized causal default.
         let has_user_mask = !req.masks.is_empty();
-
-        // Clone samplers BEFORE finalizing so we can reconstruct the
-        // per-slot WIT output against the original slot order.
-        let samplers_for_output = req.samplers.clone();
 
         // Save data needed for context::append_working_page_tokens() before
         // moving into request. We also clone the speculative arrays so we
@@ -593,35 +684,28 @@ impl pie::core::inference::HostForwardPass for InstanceState {
         // adapter_bindings[0] already has the adapter_id set by `adapter()`;
         // stamp the seed picked up out-of-band.
         req.adapter_bindings[0].seed = adapter_seed.unwrap_or(-1);
+        if let Some(start) = prepare_start {
+            profile_sample.prepare_us = elapsed_us(start.elapsed());
+        }
 
         // Try the staged hit before synthesizing default masks or pinning. On
         // hit we skip pin/unpin entirely — the staged fire runs on pages from
         // the prior cycle.
         let driver_idx_hint = context::get_device(model_id, context_id);
         let use_pass_speculation = inference::should_use_pass_speculation(driver_idx_hint);
-        let try_hit_start = api_breakdown.then(Instant::now);
-        let staged_hit = spec_handle
+        let try_hit_start = profiling.then(Instant::now);
+        let staged_rx = spec_handle
             .as_ref()
-            .filter(|_| use_pass_speculation)
-            .and_then(|s| inference::try_hit(s, context_id, &req));
+            .filter(|_| use_pass_speculation && req.spec_token_ids.is_empty())
+            .and_then(|s| inference::try_hit(s, context_id, &req, allow_pass_speculation));
         if let Some(start) = try_hit_start {
-            add_elapsed_us(&mut api_timing.try_hit_us, start);
+            profile_sample.try_hit_us = elapsed_us(start.elapsed());
         }
-        let (was_pinned, submit_result) = if let Some(rx) = staged_hit {
-            api_timing.hit_path = true;
-            let staged_await_start = api_breakdown.then(Instant::now);
-            let staged_result = rx
-                .await
-                .map_err(|_| anyhow::anyhow!("staged rx dropped"))
-                .and_then(|result| result);
-            if let Some(start) = staged_await_start {
-                add_elapsed_us(&mut api_timing.staged_await_us, start);
-            }
-            let submit_result = staged_result;
-            (false, submit_result)
+        let (was_pinned, submit_result) = if let Some(rx) = staged_rx {
+            profile_sample.hit = true;
+            (false, Ok(rx))
         } else {
-            api_timing.cold_path = true;
-            let cold_prepare_start = api_breakdown.then(Instant::now);
+            let cold_prepare_start = profiling.then(Instant::now);
             // WIT spec: "if not provided, fallback to causal mask".
             if req.masks.is_empty() && !req.position_ids.is_empty() {
                 req.masks = req
@@ -646,11 +730,11 @@ impl pie::core::inference::HostForwardPass for InstanceState {
             req.kv_page_indptr = vec![0];
             req.context_ids = vec![context_id];
             if let Some(start) = cold_prepare_start {
-                add_elapsed_us(&mut api_timing.cold_prepare_us, start);
+                profile_sample.cold_prepare_us = elapsed_us(start.elapsed());
             }
 
             // Cold path: pin, validate page capacity, submit.
-            let pin_start = api_breakdown.then(Instant::now);
+            let pin_start = profiling.then(Instant::now);
             let pinned = match context::pin(model_id, context_id, num_input_tokens as u32).await {
                 Ok(p) => p,
                 Err(e) => {
@@ -659,7 +743,7 @@ impl pie::core::inference::HostForwardPass for InstanceState {
                 }
             };
             if let Some(start) = pin_start {
-                add_elapsed_us(&mut api_timing.pin_us, start);
+                profile_sample.pin_us = elapsed_us(start.elapsed());
             }
             let kv_len = pinned.kv_len;
             let last_page_len = pinned.last_page_len;
@@ -696,25 +780,25 @@ impl pie::core::inference::HostForwardPass for InstanceState {
             }
 
             let driver_idx = driver_id as usize;
-            let submit_start = api_breakdown.then(Instant::now);
-            let result = inference::submit(
+            let submit_start = profiling.then(Instant::now);
+            let result = inference::submit_async(
                 model_id,
                 req,
                 driver_idx,
                 physical_page_ids,
                 extra_pages,
                 last_page_len,
-            )
-            .await;
+                allow_pass_speculation,
+            );
             if let Some(start) = submit_start {
-                add_elapsed_us(&mut api_timing.submit_await_us, start);
+                profile_sample.submit_wait_us = elapsed_us(start.elapsed());
             }
             (true, result)
         };
 
         // On submit failure, unpin (if we pinned) and return early.
-        let output = match submit_result {
-            Ok(o) => o,
+        let rx = match submit_result {
+            Ok(rx) => rx,
             Err(e) => {
                 if was_pinned {
                     context::unpin(model_id, context_id);
@@ -724,64 +808,31 @@ impl pie::core::inference::HostForwardPass for InstanceState {
             }
         };
 
-        // Append the lineage. For speculative-decoding flows, the
-        // forward pass wrote KV for every speculative token (accepted
-        // or not). The SDK truncates rejected drafts afterwards via
-        // `truncate_working_page_tokens`. Fire-and-forget: errors get
-        // logged at the handler. Subsequent ops on this ctx all go
-        // through the same mpsc and are naturally ordered behind this.
-        let append_start = api_breakdown.then(Instant::now);
-        let mut all_fill_tokens = fill_tokens;
-        let mut all_fill_positions = fill_positions;
-        let mut all_fill_masks = fill_masks;
-        if !spec_tokens_for_fill.is_empty() {
-            all_fill_tokens.extend_from_slice(&spec_tokens_for_fill);
-            all_fill_positions.extend_from_slice(&spec_positions_for_fill);
-            if !all_fill_masks.is_empty() {
-                for &pos in &spec_positions_for_fill {
-                    all_fill_masks.push(Brle::all_true((pos + 1) as usize));
-                }
-            }
-        }
-        if !all_fill_tokens.is_empty() {
-            context::append_working_page_tokens(
-                model_id,
-                context_id,
-                all_fill_tokens,
-                all_fill_positions,
-                all_fill_masks,
-                adapter_id,
-                adapter_seed,
-            );
-        }
-        if let Some(start) = append_start {
-            add_elapsed_us(&mut api_timing.append_us, start);
-        }
-
-        // Unpin (no-op on staged hit) and hand the output back.
-        if was_pinned {
-            let unpin_start = api_breakdown.then(Instant::now);
-            context::unpin(model_id, context_id);
-            if let Some(start) = unpin_start {
-                add_elapsed_us(&mut api_timing.unpin_us, start);
-            }
-        }
-        let build_output_start = api_breakdown.then(Instant::now);
         let future_output = FutureOutput {
-            result: Some(build_wit_output(output, &samplers_for_output)),
-            rx: None,
+            result: None,
+            rx: Some(rx),
             samplers: samplers_for_output,
-            done: true,
+            done: false,
+            model_id,
+            context_id: Some(context_id),
+            was_pinned,
+            fill_tokens,
+            fill_positions,
+            fill_masks,
+            spec_tokens_for_fill,
+            spec_positions_for_fill,
+            adapter_id,
+            adapter_seed,
         };
-        let future_output = self.ctx().table.push(future_output)?;
-        if let Some(start) = build_output_start {
-            add_elapsed_us(&mut api_timing.build_output_us, start);
+        let postprocess_start = profiling.then(Instant::now);
+        let pushed = self.ctx().table.push(future_output)?;
+        if let Some(start) = postprocess_start {
+            profile_sample.postprocess_us = elapsed_us(start.elapsed());
         }
-        if let Some(start) = execute_start {
-            api_timing.execute_us = duration_us(start.elapsed());
-            record_api_forward_timing(api_timing);
+        if let Some(start) = profile_start {
+            record_execute_profile(profile_sample, elapsed_us(start.elapsed()));
         }
-        Ok(Ok(future_output))
+        Ok(Ok(pushed))
     }
 
     async fn drop(&mut self, this: Resource<ForwardPass>) -> Result<()> {
@@ -808,6 +859,9 @@ impl pie::core::inference::HostFutureOutput for InstanceState {
     }
 
     async fn drop(&mut self, this: Resource<FutureOutput>) -> Result<()> {
+        if let Ok(future) = self.ctx().table.get_mut(&this) {
+            future.release_pin();
+        }
         self.ctx().table.delete(this)?;
         Ok(())
     }

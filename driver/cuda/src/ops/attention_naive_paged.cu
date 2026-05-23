@@ -1,8 +1,14 @@
 #include "ops/attention_naive_paged.hpp"
 
 #include <cmath>
+#include <cstdint>
+#include <stdexcept>
+#include <string>
 
 #include <cuda_bf16.h>
+#include <cuda_fp8.h>
+
+#include "cuda_check.hpp"
 
 #include "kernels/kv_paged.hpp"
 
@@ -11,6 +17,123 @@ namespace pie_cuda_driver::ops {
 namespace {
 
 constexpr int BLOCK = 128;
+constexpr int MAX_HEAD_DIM = BLOCK * 8;
+
+void check_head_dim_supported(int head_dim, const char* caller) {
+    if (head_dim > 0 && head_dim <= MAX_HEAD_DIM) return;
+    throw std::runtime_error(
+        std::string(caller) + ": head_dim must be in [1, " +
+        std::to_string(MAX_HEAD_DIM) + "]; got " + std::to_string(head_dim));
+}
+
+__device__ __forceinline__ float fp4_e2m1_value(std::uint8_t code) {
+    const bool neg = (code & 0x8) != 0;
+    const int mag = code & 0x7;
+    float v = 0.f;
+    switch (mag) {
+        case 0: v = 0.f; break;
+        case 1: v = 0.5f; break;
+        case 2: v = 1.f; break;
+        case 3: v = 1.5f; break;
+        case 4: v = 2.f; break;
+        case 5: v = 3.f; break;
+        case 6: v = 4.f; break;
+        default: v = 6.f; break;
+    }
+    return neg ? -v : v;
+}
+
+__device__ __forceinline__ float fp8_to_float(__nv_fp8_storage_t x,
+                                              DType storage_dtype) {
+    const auto fp8_kind = storage_dtype == DType::FP8_E5M2 ? __NV_E5M2
+                                                           : __NV_E4M3;
+    return __half2float(__nv_cvt_fp8_to_halfraw(x, fp8_kind));
+}
+
+__device__ __forceinline__ float load_kv_scalar(
+    const void* pages_raw,
+    const float* scales,
+    KvCacheScheme scheme,
+    DType storage_dtype,
+    int block_size,
+    int page_size,
+    int num_kv_heads,
+    int head_dim,
+    std::uint32_t page_id,
+    int slot,
+    int kv_head,
+    int dim)
+{
+    const long long token_head =
+        (static_cast<long long>(page_id) * page_size + slot) *
+        num_kv_heads + kv_head;
+    switch (scheme) {
+        case KvCacheScheme::Native: {
+            const auto* pages = static_cast<const __nv_bfloat16*>(pages_raw);
+            return __bfloat162float(
+                pages[token_head * static_cast<long long>(head_dim) + dim]);
+        }
+        case KvCacheScheme::Fp8PerTensor: {
+            const auto* pages = static_cast<const __nv_fp8_storage_t*>(pages_raw);
+            return fp8_to_float(
+                pages[token_head * static_cast<long long>(head_dim) + dim],
+                storage_dtype);
+        }
+        case KvCacheScheme::Fp8PerTokenHead: {
+            const auto* pages = static_cast<const __nv_fp8_storage_t*>(pages_raw);
+            const float q = fp8_to_float(
+                pages[token_head * static_cast<long long>(head_dim) + dim],
+                DType::FP8_E4M3);
+            return q * scales[token_head];
+        }
+        case KvCacheScheme::Int8PerTokenHead: {
+            const auto* pages = static_cast<const std::int8_t*>(pages_raw);
+            return static_cast<float>(
+                pages[token_head * static_cast<long long>(head_dim) + dim]) *
+                scales[token_head];
+        }
+        case KvCacheScheme::Fp4Block: {
+            const auto* pages = static_cast<const std::uint8_t*>(pages_raw);
+            const int packed_d = (head_dim + 1) / 2;
+            const int bs = block_size > 0 ? block_size : 16;
+            const int blocks_per_head = (head_dim + bs - 1) / bs;
+            const long long packed_idx =
+                token_head * static_cast<long long>(packed_d) + dim / 2;
+            const int shift = (dim & 1) ? 4 : 0;
+            const std::uint8_t code = (pages[packed_idx] >> shift) & 0xf;
+            const long long scale_idx =
+                token_head * static_cast<long long>(blocks_per_head) + dim / bs;
+            return fp4_e2m1_value(code) * scales[scale_idx];
+        }
+    }
+    return 0.f;
+}
+
+__device__ __forceinline__ bool custom_mask_allows(
+    const std::uint8_t* mask,
+    const std::int32_t* mask_indptr,
+    int request_idx,
+    int qo_off,
+    int kv_idx,
+    int kv_total)
+{
+    if (mask == nullptr) return true;
+    const long long bit = static_cast<long long>(qo_off) * kv_total + kv_idx;
+    const long long byte = static_cast<long long>(mask_indptr[request_idx]) +
+                           (bit >> 3);
+    return ((mask[byte] >> (bit & 7)) & 1) != 0;
+}
+
+__device__ __forceinline__ float transform_logit(float dot,
+                                                 float scale,
+                                                 float logits_soft_cap)
+{
+    dot *= scale;
+    if (logits_soft_cap > 0.f) {
+        dot = logits_soft_cap * tanhf(dot / logits_soft_cap);
+    }
+    return dot;
+}
 
 // One block per (request_idx, qo_offset, q_head). Threads cover the
 // `head_dim` axis (`head_dim ≤ 1024` keeps us under 1 thread per dim).
@@ -22,18 +145,28 @@ constexpr int BLOCK = 128;
 // the per-pass passes touch O(head_dim · kv_len) bf16 reads — keeping
 // the reduction in fp32 avoids the catastrophic cancellation you'd
 // see in bf16 for long contexts.
-__global__ void naive_paged_attn_bf16_kernel(
+__global__ void naive_paged_attn_kernel(
     const __nv_bfloat16* __restrict__ q,
-    const __nv_bfloat16* __restrict__ k_pages,
-    const __nv_bfloat16* __restrict__ v_pages,
+    const void*          __restrict__ k_pages,
+    const void*          __restrict__ v_pages,
+    const float*         __restrict__ k_scales,
+    const float*         __restrict__ v_scales,
     __nv_bfloat16*       __restrict__ o,
     const std::uint32_t* __restrict__ qo_indptr,
     const std::uint32_t* __restrict__ kv_page_indices,
     const std::uint32_t* __restrict__ kv_page_indptr,
     const std::uint32_t* __restrict__ kv_last_page_lens,
+    const std::uint8_t*  __restrict__ custom_mask,
+    const std::int32_t*  __restrict__ custom_mask_indptr,
     int num_q_heads, int num_kv_heads,
     int head_dim, int page_size,
-    int window_left, float sm_scale)
+    KvCacheScheme scheme,
+    DType storage_dtype,
+    int block_size,
+    int window_left,
+    float sm_scale,
+    float logits_soft_cap,
+    float* __restrict__ lse_out)
 {
     const int r        = blockIdx.x;          // request idx
     const int qo_off   = blockIdx.y;          // offset within this request
@@ -59,7 +192,10 @@ __global__ void naive_paged_attn_bf16_kernel(
     // rows. The trailing `(qo_hi - qo_lo)` KV rows correspond to this
     // fire's own queries.
     const int qo_len  = static_cast<int>(qo_hi - qo_lo);
-    const int kv_lim  = kv_total - qo_len + qo_off + 1;
+    const bool use_custom_mask = custom_mask != nullptr;
+    const int kv_lim = use_custom_mask
+        ? kv_total
+        : kv_total - qo_len + qo_off + 1;
 
     // Q row pointer.
     const __nv_bfloat16* q_row =
@@ -86,15 +222,18 @@ __global__ void naive_paged_attn_bf16_kernel(
         const int page_idx = kv / page_size;
         const int slot     = kv % page_size;
         const std::uint32_t pg_id = kv_page_indices[pg_lo + page_idx];
-        const __nv_bfloat16* k_row =
-            k_pages +
-            ((static_cast<long long>(pg_id) * page_size + slot) * num_kv_heads + kv_head) *
-                head_dim;
         float dot = 0.f;
         for (int d = 0; d < head_dim; ++d) {
-            dot += q_smem[d] * __bfloat162float(k_row[d]);
+            dot += q_smem[d] * load_kv_scalar(
+                k_pages, k_scales, scheme, storage_dtype, block_size,
+                page_size, num_kv_heads, head_dim, pg_id, slot, kv_head, d);
         }
-        dot *= scale;
+        dot = transform_logit(dot, scale, logits_soft_cap);
+        if (use_custom_mask &&
+            !custom_mask_allows(custom_mask, custom_mask_indptr, r, qo_off,
+                                kv, kv_total)) {
+            continue;
+        }
         if (dot > local_max) local_max = dot;
     }
     reduce[tid] = local_max;
@@ -119,21 +258,20 @@ __global__ void naive_paged_attn_bf16_kernel(
         const int page_idx = kv / page_size;
         const int slot     = kv % page_size;
         const std::uint32_t pg_id = kv_page_indices[pg_lo + page_idx];
-        const __nv_bfloat16* k_row =
-            k_pages +
-            ((static_cast<long long>(pg_id) * page_size + slot) * num_kv_heads + kv_head) *
-                head_dim;
-        const __nv_bfloat16* v_row =
-            v_pages +
-            ((static_cast<long long>(pg_id) * page_size + slot) * num_kv_heads + kv_head) *
-                head_dim;
+        if (use_custom_mask &&
+            !custom_mask_allows(custom_mask, custom_mask_indptr, r, qo_off,
+                                kv, kv_total)) {
+            continue;
+        }
 
         // Cooperatively compute q·k across threads, reducing through
         // shared memory. This pass dominates runtime — the reduction
         // is BLOCK-wide for every KV row.
         float partial = 0.f;
         for (int d = tid; d < head_dim; d += BLOCK) {
-            partial += q_smem[d] * __bfloat162float(k_row[d]);
+            partial += q_smem[d] * load_kv_scalar(
+                k_pages, k_scales, scheme, storage_dtype, block_size,
+                page_size, num_kv_heads, head_dim, pg_id, slot, kv_head, d);
         }
         reduce[tid] = partial;
         __syncthreads();
@@ -141,7 +279,7 @@ __global__ void naive_paged_attn_bf16_kernel(
             if (tid < off) reduce[tid] += reduce[tid + off];
             __syncthreads();
         }
-        const float dot   = reduce[0] * scale;
+        const float dot   = transform_logit(reduce[0], scale, logits_soft_cap);
         const float w     = expf(dot - row_max);
         if (tid == 0) local_z += w;
         __syncthreads();
@@ -150,7 +288,10 @@ __global__ void naive_paged_attn_bf16_kernel(
         for (int i = 0; i < dims_per_thread; ++i) {
             const int d = tid + i * BLOCK;
             if (d < head_dim) {
-                acc[i] = fmaf(__bfloat162float(v_row[d]), w, acc[i]);
+                const float v = load_kv_scalar(
+                    v_pages, v_scales, scheme, storage_dtype, block_size,
+                    page_size, num_kv_heads, head_dim, pg_id, slot, kv_head, d);
+                acc[i] = fmaf(v, w, acc[i]);
             }
         }
     }
@@ -159,10 +300,144 @@ __global__ void naive_paged_attn_bf16_kernel(
     __shared__ float z_shared;
     if (tid == 0) z_shared = local_z;
     __syncthreads();
-    const float inv_z = 1.0f / z_shared;
+    const float inv_z = z_shared > 0.f ? 1.0f / z_shared : 0.f;
+    if (tid == 0 && lse_out != nullptr) {
+        lse_out[static_cast<long long>(qo_global) * num_q_heads + q_head] =
+            z_shared > 0.f ? (logf(z_shared) + row_max) : -INFINITY;
+    }
 
     __nv_bfloat16* o_row =
         o + (static_cast<long long>(qo_global) * num_q_heads + q_head) * head_dim;
+    for (int i = 0; i < dims_per_thread; ++i) {
+        const int d = tid + i * BLOCK;
+        if (d < head_dim) {
+            o_row[d] = __float2bfloat16(acc[i] * inv_z);
+        }
+    }
+}
+
+__global__ void naive_paged_decode_kernel(
+    const __nv_bfloat16* __restrict__ q,
+    const void*          __restrict__ k_pages,
+    const void*          __restrict__ v_pages,
+    const float*         __restrict__ k_scales,
+    const float*         __restrict__ v_scales,
+    __nv_bfloat16*       __restrict__ o,
+    const std::uint32_t* __restrict__ kv_page_indices,
+    const std::uint32_t* __restrict__ kv_page_indptr,
+    const std::uint32_t* __restrict__ kv_last_page_lens,
+    int num_q_heads,
+    int num_kv_heads,
+    int head_dim,
+    int page_size,
+    KvCacheScheme scheme,
+    DType storage_dtype,
+    int block_size,
+    int window_left,
+    float sm_scale,
+    float logits_soft_cap,
+    float* __restrict__ lse_out)
+{
+    const int r = blockIdx.x;
+    const int q_head = blockIdx.y;
+    const int tid = threadIdx.x;
+    const int kv_head = q_head / (num_q_heads / num_kv_heads);
+
+    const std::uint32_t pg_lo = kv_page_indptr[r];
+    const std::uint32_t pg_hi = kv_page_indptr[r + 1];
+    const int last_page_len = static_cast<int>(kv_last_page_lens[r]);
+    const int num_full_pages = static_cast<int>(pg_hi - pg_lo) - 1;
+    const int kv_total = (num_full_pages > 0)
+        ? num_full_pages * page_size + last_page_len
+        : last_page_len;
+    const int kv_lim = kv_total;
+
+    const __nv_bfloat16* q_row =
+        q + (static_cast<long long>(r) * num_q_heads + q_head) * head_dim;
+
+    extern __shared__ float smem[];
+    float* q_smem = smem;
+    float* reduce = smem + head_dim;
+    for (int d = tid; d < head_dim; d += BLOCK) {
+        q_smem[d] = __bfloat162float(q_row[d]);
+    }
+    __syncthreads();
+
+    const float scale = (sm_scale > 0.f) ? sm_scale
+        : (1.0f / sqrtf(static_cast<float>(head_dim)));
+
+    float local_max = -INFINITY;
+    for (int kv = tid; kv < kv_lim; kv += BLOCK) {
+        if (window_left >= 0 && kv < kv_lim - 1 - window_left) continue;
+        const int page_idx = kv / page_size;
+        const int slot = kv % page_size;
+        const std::uint32_t pg_id = kv_page_indices[pg_lo + page_idx];
+        float dot = 0.f;
+        for (int d = 0; d < head_dim; ++d) {
+            dot += q_smem[d] * load_kv_scalar(
+                k_pages, k_scales, scheme, storage_dtype, block_size,
+                page_size, num_kv_heads, head_dim, pg_id, slot, kv_head, d);
+        }
+        dot = transform_logit(dot, scale, logits_soft_cap);
+        if (dot > local_max) local_max = dot;
+    }
+    reduce[tid] = local_max;
+    __syncthreads();
+    for (int off = BLOCK / 2; off > 0; off >>= 1) {
+        if (tid < off) reduce[tid] = fmaxf(reduce[tid], reduce[tid + off]);
+        __syncthreads();
+    }
+    const float row_max = reduce[0];
+    __syncthreads();
+
+    const int dims_per_thread = (head_dim + BLOCK - 1) / BLOCK;
+    float acc[8];
+    for (int i = 0; i < dims_per_thread; ++i) acc[i] = 0.f;
+
+    float local_z = 0.f;
+    for (int kv = 0; kv < kv_lim; ++kv) {
+        if (window_left >= 0 && kv < kv_lim - 1 - window_left) continue;
+        const int page_idx = kv / page_size;
+        const int slot = kv % page_size;
+        const std::uint32_t pg_id = kv_page_indices[pg_lo + page_idx];
+        float partial = 0.f;
+        for (int d = tid; d < head_dim; d += BLOCK) {
+            partial += q_smem[d] * load_kv_scalar(
+                k_pages, k_scales, scheme, storage_dtype, block_size,
+                page_size, num_kv_heads, head_dim, pg_id, slot, kv_head, d);
+        }
+        reduce[tid] = partial;
+        __syncthreads();
+        for (int off = BLOCK / 2; off > 0; off >>= 1) {
+            if (tid < off) reduce[tid] += reduce[tid + off];
+            __syncthreads();
+        }
+        const float dot = transform_logit(reduce[0], scale, logits_soft_cap);
+        const float w = expf(dot - row_max);
+        if (tid == 0) local_z += w;
+        __syncthreads();
+        for (int i = 0; i < dims_per_thread; ++i) {
+            const int d = tid + i * BLOCK;
+            if (d < head_dim) {
+                const float v = load_kv_scalar(
+                    v_pages, v_scales, scheme, storage_dtype, block_size,
+                    page_size, num_kv_heads, head_dim, pg_id, slot, kv_head, d);
+                acc[i] = fmaf(v, w, acc[i]);
+            }
+        }
+    }
+
+    __shared__ float z_shared;
+    if (tid == 0) z_shared = local_z;
+    __syncthreads();
+    const float inv_z = z_shared > 0.f ? 1.0f / z_shared : 0.f;
+    if (tid == 0 && lse_out != nullptr) {
+        lse_out[static_cast<long long>(r) * num_q_heads + q_head] =
+            z_shared > 0.f ? (logf(z_shared) + row_max) : -INFINITY;
+    }
+
+    __nv_bfloat16* o_row =
+        o + (static_cast<long long>(r) * num_q_heads + q_head) * head_dim;
     for (int i = 0; i < dims_per_thread; ++i) {
         const int d = tid + i * BLOCK;
         if (d < head_dim) {
@@ -186,9 +461,13 @@ void launch_attention_naive_paged_bf16(
     int num_q_heads, int num_kv_heads,
     int head_dim, int page_size,
     cudaStream_t stream,
-    int window_left, float sm_scale)
+    int window_left,
+    float sm_scale,
+    float logits_soft_cap,
+    float* lse_out)
 {
     if (num_requests <= 0 || total_tokens <= 0) return;
+    check_head_dim_supported(head_dim, "launch_attention_naive_paged_bf16");
     // We launch one block per (request, qo_offset, q_head) — qo_offset
     // is bounded by the largest single-request qo_len. We don't have
     // that bound on hand at the host side, so use `total_tokens` as
@@ -198,15 +477,168 @@ void launch_attention_naive_paged_bf16(
     dim3 grid(num_requests, total_tokens, num_q_heads);
     dim3 block(BLOCK);
     const std::size_t smem = (head_dim + BLOCK) * sizeof(float);
-    naive_paged_attn_bf16_kernel<<<grid, block, smem, stream>>>(
+    naive_paged_attn_kernel<<<grid, block, smem, stream>>>(
         static_cast<const __nv_bfloat16*>(q),
-        static_cast<const __nv_bfloat16*>(k_pages),
-        static_cast<const __nv_bfloat16*>(v_pages),
+        k_pages,
+        v_pages,
+        nullptr,
+        nullptr,
         static_cast<__nv_bfloat16*>(o),
         qo_indptr_d, kv_page_indices_d,
         kv_page_indptr_d, kv_last_page_lens_d,
+        nullptr,
+        nullptr,
         num_q_heads, num_kv_heads, head_dim, page_size,
-        window_left, sm_scale);
+        KvCacheScheme::Native,
+        DType::BF16,
+        0,
+        window_left, sm_scale, logits_soft_cap, lse_out);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void launch_attention_naive_paged_decode(
+    const void* q,
+    KvCacheLayerView kv_layer,
+    void* o,
+    const std::uint32_t* kv_page_indices_d,
+    const std::uint32_t* kv_page_indptr_d,
+    const std::uint32_t* kv_last_page_lens_d,
+    int num_requests,
+    int num_q_heads,
+    cudaStream_t stream,
+    int window_left,
+    float sm_scale,
+    float logits_soft_cap,
+    float* lse_out)
+{
+    if (num_requests <= 0) return;
+    check_head_dim_supported(kv_layer.head_dim, "launch_attention_naive_paged_decode");
+    dim3 grid(num_requests, num_q_heads);
+    dim3 block(BLOCK);
+    const std::size_t smem = (kv_layer.head_dim + BLOCK) * sizeof(float);
+    naive_paged_decode_kernel<<<grid, block, smem, stream>>>(
+        static_cast<const __nv_bfloat16*>(q),
+        kv_layer.k_pages,
+        kv_layer.v_pages,
+        static_cast<const float*>(kv_layer.k_scales),
+        static_cast<const float*>(kv_layer.v_scales),
+        static_cast<__nv_bfloat16*>(o),
+        kv_page_indices_d,
+        kv_page_indptr_d,
+        kv_last_page_lens_d,
+        num_q_heads,
+        kv_layer.num_kv_heads,
+        kv_layer.head_dim,
+        kv_layer.page_size,
+        kv_layer.format != nullptr ? kv_layer.format->scheme : KvCacheScheme::Native,
+        kv_layer.format != nullptr ? kv_layer.format->storage_dtype : DType::BF16,
+        kv_layer.format != nullptr ? kv_layer.format->block_size : 0,
+        window_left,
+        sm_scale,
+        logits_soft_cap,
+        lse_out);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void launch_attention_naive_paged(
+    const void* q,
+    KvCacheLayerView kv_layer,
+    void* o,
+    const std::uint32_t* qo_indptr_d,
+    const std::uint32_t* kv_page_indices_d,
+    const std::uint32_t* kv_page_indptr_d,
+    const std::uint32_t* kv_last_page_lens_d,
+    int total_tokens,
+    int num_requests,
+    int num_pages_in_batch,
+    int num_q_heads,
+    cudaStream_t stream,
+    int window_left,
+    float sm_scale,
+    float logits_soft_cap,
+    float* lse_out)
+{
+    (void)num_pages_in_batch;
+    if (num_requests <= 0 || total_tokens <= 0) return;
+    check_head_dim_supported(kv_layer.head_dim, "launch_attention_naive_paged");
+    dim3 grid(num_requests, total_tokens, num_q_heads);
+    dim3 block(BLOCK);
+    const std::size_t smem = (kv_layer.head_dim + BLOCK) * sizeof(float);
+    naive_paged_attn_kernel<<<grid, block, smem, stream>>>(
+        static_cast<const __nv_bfloat16*>(q),
+        kv_layer.k_pages,
+        kv_layer.v_pages,
+        static_cast<const float*>(kv_layer.k_scales),
+        static_cast<const float*>(kv_layer.v_scales),
+        static_cast<__nv_bfloat16*>(o),
+        qo_indptr_d,
+        kv_page_indices_d,
+        kv_page_indptr_d,
+        kv_last_page_lens_d,
+        nullptr,
+        nullptr,
+        num_q_heads,
+        kv_layer.num_kv_heads,
+        kv_layer.head_dim,
+        kv_layer.page_size,
+        kv_layer.format != nullptr ? kv_layer.format->scheme : KvCacheScheme::Native,
+        kv_layer.format != nullptr ? kv_layer.format->storage_dtype : DType::BF16,
+        kv_layer.format != nullptr ? kv_layer.format->block_size : 0,
+        window_left,
+        sm_scale,
+        logits_soft_cap,
+        lse_out);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void launch_attention_naive_paged_custom(
+    const void* q,
+    KvCacheLayerView kv_layer,
+    void* o,
+    const std::uint32_t* qo_indptr_d,
+    const std::uint32_t* kv_page_indices_d,
+    const std::uint32_t* kv_page_indptr_d,
+    const std::uint32_t* kv_last_page_lens_d,
+    const std::uint8_t* mask_d,
+    const std::int32_t* mask_indptr_d,
+    int total_tokens,
+    int num_requests,
+    int num_q_heads,
+    cudaStream_t stream,
+    float sm_scale,
+    float logits_soft_cap,
+    float* lse_out)
+{
+    if (num_requests <= 0 || total_tokens <= 0) return;
+    check_head_dim_supported(kv_layer.head_dim, "launch_attention_naive_paged_custom");
+    dim3 grid(num_requests, total_tokens, num_q_heads);
+    dim3 block(BLOCK);
+    const std::size_t smem = (kv_layer.head_dim + BLOCK) * sizeof(float);
+    naive_paged_attn_kernel<<<grid, block, smem, stream>>>(
+        static_cast<const __nv_bfloat16*>(q),
+        kv_layer.k_pages,
+        kv_layer.v_pages,
+        static_cast<const float*>(kv_layer.k_scales),
+        static_cast<const float*>(kv_layer.v_scales),
+        static_cast<__nv_bfloat16*>(o),
+        qo_indptr_d,
+        kv_page_indices_d,
+        kv_page_indptr_d,
+        kv_last_page_lens_d,
+        mask_d,
+        mask_indptr_d,
+        num_q_heads,
+        kv_layer.num_kv_heads,
+        kv_layer.head_dim,
+        kv_layer.page_size,
+        kv_layer.format != nullptr ? kv_layer.format->scheme : KvCacheScheme::Native,
+        kv_layer.format != nullptr ? kv_layer.format->storage_dtype : DType::BF16,
+        kv_layer.format != nullptr ? kv_layer.format->block_size : 0,
+        /*window_left=*/-1,
+        sm_scale,
+        logits_soft_cap,
+        lse_out);
+    CUDA_CHECK(cudaGetLastError());
 }
 
 void launch_attention_naive_paged(

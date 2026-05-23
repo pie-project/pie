@@ -3,7 +3,7 @@
 //! Same TOML the legacy Python server consumed. Both embedded
 //! ([`DriverKind::Portable`] / [`DriverKind::CudaNative`] / [`DriverKind::Dummy`])
 //! and subprocess-hosted ([`DriverKind::Dev`] / [`DriverKind::Vllm`] /
-//! [`DriverKind::Sglang`]) drivers are valid; the dispatch happens in
+//! [`DriverKind::Sglang`] / [`DriverKind::TensorRtLlm`]) drivers are valid; the dispatch happens in
 //! [`crate::serve::start_engine`] via [`crate::serve::topology::resolve_flavor`].
 //! Python-only fields are absent from validation here (e.g. nothing
 //! checks `huggingface_hub`-resolved paths until the driver actually
@@ -505,8 +505,15 @@ impl DriverConfig {
                         )
                     })?;
             }
-            DriverKind::Dev | DriverKind::Vllm | DriverKind::Sglang => {
+            DriverKind::Dev | DriverKind::Vllm | DriverKind::Sglang | DriverKind::TensorRtLlm => {
                 validate_subprocess_driver_options(&self.options, self.kind)?;
+                if matches!(self.kind, DriverKind::TensorRtLlm) {
+                    ensure!(
+                        self.tensor_parallel_size == 1,
+                        "driver type {:?} currently supports tensor_parallel_size = 1",
+                        self.kind,
+                    );
+                }
             }
         }
         Ok(())
@@ -549,6 +556,12 @@ fn validate_subprocess_driver_options(options: &toml::Table, kind: DriverKind) -
         "max_running_requests",
         "max_total_tokens",
     ] {
+        if kind == DriverKind::TensorRtLlm && key == "max_batch_size" {
+            continue;
+        }
+        if kind == DriverKind::Vllm && (key == "max_num_seqs" || key == "max_num_batched_tokens") {
+            continue;
+        }
         ensure!(
             !options.contains_key(key),
             "invalid [model.driver.options] for driver type {:?}: \
@@ -611,6 +624,9 @@ pub enum DriverKind {
     Vllm,
     /// SGLang-backed Python driver. Subprocess-hosted.
     Sglang,
+    /// TensorRT-LLM-backed Python driver. Subprocess-hosted.
+    #[serde(rename = "tensorrt_llm", alias = "tensorrt-llm", alias = "trtllm")]
+    TensorRtLlm,
 }
 
 impl DriverKind {
@@ -622,6 +638,7 @@ impl DriverKind {
             DriverKind::Dev => "dev",
             DriverKind::Vllm => "vllm",
             DriverKind::Sglang => "sglang",
+            DriverKind::TensorRtLlm => "tensorrt_llm",
         }
     }
 }
@@ -1020,8 +1037,6 @@ max_num_kv_pages = 1024
             ("dummy", "max_model_len"),
             ("dev", "max_forward_tokens"),
             ("dev", "max_forward_requests"),
-            ("vllm", "max_num_seqs"),
-            ("vllm", "max_num_batched_tokens"),
             ("sglang", "max_running_requests"),
             ("sglang", "max_total_tokens"),
         ] {
@@ -1041,6 +1056,38 @@ max_num_kv_pages = 1024
             };
             assert!(err.contains(key), "type={ty} key={key} got: {err}");
         }
+    }
+
+    #[test]
+    fn accepts_vllm_max_num_seqs() {
+        let text = r#"
+[[model]]
+name = "m"
+hf_repo = "x"
+[model.driver]
+type = "vllm"
+device = ["cpu"]
+[model.driver.options]
+max_num_seqs = 64
+"#;
+        let cfg: Config = toml::from_str(text).unwrap();
+        cfg.validate().unwrap();
+    }
+
+    #[test]
+    fn accepts_vllm_max_num_batched_tokens() {
+        let text = r#"
+[[model]]
+name = "m"
+hf_repo = "x"
+[model.driver]
+type = "vllm"
+device = ["cpu"]
+[model.driver.options]
+max_num_batched_tokens = 8192
+"#;
+        let cfg: Config = toml::from_str(text).unwrap();
+        cfg.validate().unwrap();
     }
 
     #[test]
@@ -1102,9 +1149,9 @@ device = "cuda:0"
 
     #[test]
     fn accepts_subprocess_drivers() {
-        // dev/vllm/sglang are hosted out-of-process by
+        // dev/vllm/sglang/tensorrt_llm are hosted out-of-process by
         // `crate::subprocess_driver::SubprocessDriver`.
-        for ty in ["dev", "vllm", "sglang"] {
+        for ty in ["dev", "vllm", "sglang", "tensorrt_llm"] {
             let toml_text = format!(
                 "[[model]]\nname = \"m\"\nhf_repo = \"x\"\n[model.driver]\n\
                  type = \"{ty}\"\ndevice = [\"cuda:0\"]\n"
@@ -1112,6 +1159,35 @@ device = "cuda:0"
             let cfg: Config = toml::from_str(&toml_text).unwrap();
             cfg.validate().unwrap_or_else(|e| panic!("type={ty}: {e}"));
         }
+    }
+
+    #[test]
+    fn rejects_tensorrt_llm_capacity_knobs() {
+        for key in ["max_forward_requests", "max_num_kv_pages"] {
+            let text = format!(
+                "[[model]]\nname = \"m\"\nhf_repo = \"x\"\n[model.driver]\n\
+                 type = \"tensorrt_llm\"\ndevice = [\"cuda:0\"]\n[model.driver.options]\n{key} = 1\n"
+            );
+            let cfg: Config = toml::from_str(&text).unwrap();
+            let err = cfg.validate().unwrap_err().to_string();
+            assert!(err.contains(key), "key={key} got: {err}");
+        }
+    }
+
+    #[test]
+    fn allows_tensorrt_llm_runtime_max_batch_size() {
+        let text = r#"
+[[model]]
+name = "m"
+hf_repo = "x"
+[model.driver]
+type = "tensorrt_llm"
+device = ["cuda:0"]
+[model.driver.options]
+max_batch_size = 8
+"#;
+        let cfg: Config = toml::from_str(text).unwrap();
+        cfg.validate().unwrap();
     }
 
     #[test]

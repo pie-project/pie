@@ -24,7 +24,7 @@
 //! unaware of speculation — it just runs forward passes.
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 
 use anyhow::Result;
@@ -46,6 +46,10 @@ pub(crate) type StagedBatchMap = Arc<Mutex<HashMap<ContextId, VecDeque<StagedEnt
 pub(crate) struct StagedEntry {
     pub anchor_token: u32,
     pub anchor_pos: u32,
+    /// Claim-side hint for the extender that owns this staged fire.
+    /// The inferlet can claim a pre-fired final token while telling
+    /// its extender not to submit another stage.
+    pub allow_extend: Arc<AtomicBool>,
     /// Future fire's output for this ctx. The scheduler holds the
     /// matching `Sender`; when the kernel finishes and the output
     /// is delivered, this receiver resolves.
@@ -79,20 +83,6 @@ pub static CHAIN_SUBMIT_COUNT: AtomicU64 = AtomicU64::new(0);
 /// Total number of staged chains dropped due to anchor mismatch.
 /// Surfaced via `model_status.chain_drops`.
 pub static CHAIN_DROP_COUNT: AtomicU64 = AtomicU64::new(0);
-
-fn strict_chain_depth_enabled() -> bool {
-    static ENABLED: LazyLock<bool> = LazyLock::new(|| {
-        std::env::var("PIE_SPEC_STRICT_DEPTH")
-            .map(|value| {
-                let value = value.trim();
-                value == "1"
-                    || value.eq_ignore_ascii_case("true")
-                    || value.eq_ignore_ascii_case("on")
-            })
-            .unwrap_or(false)
-    });
-    *ENABLED
-}
 
 /// Register the staged batches for a model with the global
 /// registry. Called once at `InferenceService::new`. The
@@ -164,6 +154,7 @@ pub fn try_hit(
     spec: &StagedBatch,
     ctx_id: ContextId,
     request: &pie_bridge::ForwardRequest,
+    allow_extend: bool,
 ) -> Option<oneshot::Receiver<Result<ForwardOutput>>> {
     let mut sb = spec.0.lock().ok()?;
     let deque = sb.get_mut(&ctx_id)?;
@@ -172,6 +163,9 @@ pub fn try_hit(
     let req_pos = request.position_ids.first().copied();
     if Some(front.anchor_token) == req_token && Some(front.anchor_pos) == req_pos {
         let entry = deque.pop_front()?;
+        if !allow_extend {
+            entry.allow_extend.store(false, Ordering::Relaxed);
+        }
         BYPASS_HIT_COUNT.fetch_add(1, Ordering::Relaxed);
         Some(entry.output_rx)
     } else {
@@ -237,17 +231,19 @@ pub(crate) fn spawn_extend_chain(
     staged_batch_arc: StagedBatchMap,
     model_idx: usize,
     prev_request: pie_bridge::ForwardRequest,
-    all_pages: Arc<[PhysicalPageId]>,
+    all_pages: Vec<PhysicalPageId>,
     cur_page_idx: usize,
     cur_last_page_len: u32,
     max_queue_depth: usize,
+    allow_extend: Arc<AtomicBool>,
 ) {
     tokio::spawn(async move {
         let mut sched_rx = sched_rx;
         let mut response = response;
-        let mut chain_state = DecodeChainState::from_request(&prev_request);
+        let mut prev_request = prev_request;
         let mut cur_page_idx = cur_page_idx;
         let mut cur_last_page_len = cur_last_page_len;
+        let mut allow_extend = allow_extend;
 
         loop {
             let output = match sched_rx.await {
@@ -288,11 +284,14 @@ pub(crate) fn spawn_extend_chain(
                 let _ = response.send(Ok(output));
                 return;
             }
+            if !allow_extend.load(Ordering::Relaxed) {
+                let _ = response.send(Ok(output));
+                return;
+            }
 
             let mut next_stage = None;
-            if let Some(state) = chain_state.as_mut()
-                && let Some((next_req, anchor_token, anchor_pos)) =
-                    state.build_next_request(&output)
+            if let Some((next_req, anchor_token, anchor_pos)) =
+                build_next_request(&prev_request, &output)
             {
                 let page_size = crate::context::tokens_per_page(model_idx);
                 // Advance one write slot: either grow within the current
@@ -303,6 +302,7 @@ pub(crate) fn spawn_extend_chain(
                     (cur_page_idx + 1, 1)
                 };
                 if next_page_idx < all_pages.len() {
+                    let next_pages: Vec<PhysicalPageId> = all_pages[..=next_page_idx].to_vec();
                     let queued = staged_batch_arc
                         .lock()
                         .ok()
@@ -313,36 +313,32 @@ pub(crate) fn spawn_extend_chain(
                     // sitting in the deque. Keep one future stage
                     // ahead of that entry; otherwise the chain breaks
                     // whenever the GPU outruns the WASM loop.
-                    let should_extend = max_queue_depth > 0
-                        && if strict_chain_depth_enabled() {
-                            queued < max_queue_depth
-                        } else {
-                            queued <= max_queue_depth
-                        };
+                    let should_extend = max_queue_depth > 0 && queued <= max_queue_depth;
                     if should_extend {
                         let (sched_tx_next, sched_rx_next) = oneshot::channel();
                         let (final_tx_next, final_rx_next) = oneshot::channel();
+                        let next_allow_extend = Arc::new(AtomicBool::new(true));
                         if scheduler_handle
-                            .submit_shared(
-                                next_req,
-                                sched_tx_next,
-                                all_pages.clone(),
-                                next_page_idx + 1,
-                                next_lpl,
-                            )
+                            .submit(next_req.clone(), sched_tx_next, next_pages, next_lpl)
                             .is_ok()
                         {
-                            state.last_pos = anchor_pos;
                             CHAIN_SUBMIT_COUNT.fetch_add(1, Ordering::Relaxed);
                             if let Ok(mut sb) = staged_batch_arc.lock() {
                                 sb.entry(ctx_id).or_default().push_back(StagedEntry {
                                     anchor_token,
                                     anchor_pos,
+                                    allow_extend: next_allow_extend.clone(),
                                     output_rx: final_rx_next,
                                 });
                             }
-                            next_stage =
-                                Some((sched_rx_next, final_tx_next, next_page_idx, next_lpl));
+                            next_stage = Some((
+                                sched_rx_next,
+                                final_tx_next,
+                                next_req,
+                                next_page_idx,
+                                next_lpl,
+                                next_allow_extend,
+                            ));
                         }
                     }
                 }
@@ -352,11 +348,21 @@ pub(crate) fn spawn_extend_chain(
             // upstream forwarder spawned by `try_hit`).
             let _ = response.send(Ok(output));
 
-            if let Some((next_rx, next_response, next_page_idx, next_lpl)) = next_stage {
+            if let Some((
+                next_rx,
+                next_response,
+                next_req,
+                next_page_idx,
+                next_lpl,
+                next_allow_extend,
+            )) = next_stage
+            {
                 sched_rx = next_rx;
                 response = next_response;
+                prev_request = next_req;
                 cur_page_idx = next_page_idx;
                 cur_last_page_len = next_lpl;
+                allow_extend = next_allow_extend;
             } else {
                 return;
             }
@@ -367,62 +373,6 @@ pub(crate) fn spawn_extend_chain(
 // =============================================================================
 // Eligibility + next-request builder
 // =============================================================================
-
-struct DecodeChainState {
-    context_id: ContextId,
-    last_pos: u32,
-    samplers: Vec<pie_bridge::Sampler>,
-    adapter_bindings: Vec<pie_bridge::AdapterBinding>,
-}
-
-impl DecodeChainState {
-    fn from_request(req: &pie_bridge::ForwardRequest) -> Option<Self> {
-        if evaluate_request_shape(req).is_err() {
-            return None;
-        }
-        Some(Self {
-            context_id: *req.context_ids.first()?,
-            last_pos: *req.position_ids.last()?,
-            samplers: req.samplers.clone(),
-            adapter_bindings: req.adapter_bindings.clone(),
-        })
-    }
-
-    fn build_next_request(
-        &self,
-        prev_resp: &ForwardOutput,
-    ) -> Option<(pie_bridge::ForwardRequest, u32, u32)> {
-        let sampled_token = prev_resp.first_token()?;
-        let next_pos = self.last_pos.checked_add(1)?;
-        let next_req = pie_bridge::ForwardRequest {
-            token_ids: vec![sampled_token],
-            position_ids: vec![next_pos],
-            kv_page_indices: Vec::new(),
-            kv_page_indptr: vec![0],
-            kv_last_page_lens: Vec::new(),
-            qo_indptr: vec![0, 1],
-            rs_slot_ids: Vec::new(),
-            rs_slot_flags: Vec::new(),
-            masks: Vec::new(),
-            mask_indptr: vec![0, 0],
-            logit_masks: Vec::new(),
-            logit_mask_indptr: vec![0, 0],
-            sampling_indices: vec![0],
-            sampling_indptr: vec![0, 1],
-            samplers: self.samplers.clone(),
-            sampler_indptr: vec![0, 1],
-            adapter_bindings: self.adapter_bindings.clone(),
-            spec_token_ids: Vec::new(),
-            spec_position_ids: Vec::new(),
-            spec_indptr: vec![0, 0],
-            output_spec_flags: vec![false],
-            context_ids: vec![self.context_id],
-            single_token_mode: true,
-            has_user_mask: false,
-        };
-        Some((next_req, sampled_token, next_pos))
-    }
-}
 
 /// Why a request was deemed structurally ineligible for the
 /// speculation chain. Surfaces in telemetry so operators can see
@@ -495,8 +445,8 @@ pub fn evaluate_request_shape(req: &pie_bridge::ForwardRequest) -> Result<(), Sk
 /// next call arrives.
 ///
 /// The returned request:
-///   - is a single-token decode at `last_pos + 1` with input =
-///     the sampled token
+///   - is a single-token decode at the position after all returned
+///     tokens, with input = the last sampled token
 ///   - carries the same samplers / adapter as the prior call
 ///   - leaves masks empty so the scheduler can route it through the
 ///     single-token decode path
@@ -510,9 +460,21 @@ pub fn build_next_request(
     if evaluate_request_shape(prev_req).is_err() {
         return None;
     }
-    let sampled_token = prev_resp.first_token()?;
+    let (sampled_token, pos_advance) = match prev_resp {
+        ForwardOutput::Token(token) => (*token, 1u32),
+        ForwardOutput::Tokens(tokens) => {
+            let token = *tokens.last()?;
+            let advance = u32::try_from(tokens.len()).ok()?;
+            (token, advance)
+        }
+        ForwardOutput::Response(resp) => {
+            let token = *resp.tokens.last()?;
+            let advance = u32::try_from(resp.tokens.len()).ok()?;
+            (token, advance)
+        }
+    };
     let last_pos = *prev_req.position_ids.last()?;
-    let next_pos = last_pos.checked_add(1)?;
+    let next_pos = last_pos.checked_add(pos_advance)?;
     let context_id = *prev_req.context_ids.first()?;
     let next_req = pie_bridge::ForwardRequest {
         token_ids: vec![sampled_token],

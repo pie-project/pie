@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "pie-driver-vllm"
 version = "0.3.0"
-description = "Pie driver — vLLM backend. Uses vllm's model definitions and kernels under pie's RPC surface."
+description = "Pie driver - vLLM backend. Uses vllm's model definitions and kernels under pie's RPC surface."
 readme = "README.md"
 requires-python = ">=3.11,<3.13"
 license = "Apache-2.0"
@@ -15,61 +15,47 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
 
-# vLLM 0.16.0 is the newest release that pins torch==2.9.1 and ships a
-# CUDA 12.x wheel; vLLM 0.20.x requires torch 2.11 + CUDA 13. Co-resolves
-# with `pie-driver-sglang` (sglang 0.5.9 carries a matching flashinfer
-# 0.6.3 pin). The two drivers are independent wheels — installing them
-# into separate venvs is the supported path; coexisting in the same venv
-# requires the override-dependencies block at the bottom of this file.
+# vLLM 0.21.0 is the latest release verified in this repo's L40S
+# environment. The PyPI wheel defaults to CUDA 13, so the driver pins
+# vLLM's CUDA 12.9 release wheel explicitly; plain `vllm==0.21.0` will
+# import but fail at runtime on CUDA 12.x drivers with a missing
+# libcudart.so.13. The subprocess drivers are independent wheels -
+# installing them into separate venvs is the supported path.
 dependencies = [
-    # `pie-bridge` is the PyO3 wheel that ships the canonical wire schema,
-    # Method enum, DriverCapabilities, and ShmemServer (single source of
-    # truth, mirrored from Rust). Per-driver scaffolding lives under
-    # `pie_driver_vllm._bridge` as a vendored copy of the legacy
-    # `._bridge` Python.
     "pie-bridge",
+    "pie-driver-dev",
     "msgpack>=0.5",
-    # `psutil` is imported by `utils.get_available_memory` (RAM probe).
+    "msgspec>=0.18",
+    "ninja>=1.13",
+    "numba>=0.65",
+    "opentelemetry-api>=1.42.1",
+    "opentelemetry-sdk>=1.42.1",
+    "opentelemetry-exporter-otlp>=1.42.1",
     "psutil>=5.9",
-    "torch==2.9.1",
-    "torchvision==0.24.1",
-    "torchaudio==2.9.1",
-    "torchao==0.9.0",
-    "vllm==0.16.0",
-    "flashinfer-python==0.6.3",
-    "flashinfer-cubin==0.6.3",
-    "flashinfer-jit-cache==0.6.3",
+    "torch==2.11.0",
+    "torchvision==0.26.0",
+    "torchaudio==2.11.0",
+    "vllm @ https://github.com/vllm-project/vllm/releases/download/v0.21.0/vllm-0.21.0%2Bcu129-cp38-abi3-manylinux_2_34_x86_64.whl",
+    "flashinfer-python==0.6.8.post1",
+    "flashinfer-cubin==0.6.8.post1",
 ]
 
 [[tool.uv.index]]
-name = "pytorch-cu128"
-url = "https://download.pytorch.org/whl/cu128"
-explicit = true
-
-[[tool.uv.index]]
-name = "flashinfer-cu128"
-url = "https://flashinfer.ai/whl/cu128"
+name = "pytorch-cu129"
+url = "https://download.pytorch.org/whl/cu129"
 explicit = true
 
 [tool.uv.sources]
 pie-bridge = { path = "../bridge", editable = true }
-torch = [{ index = "pytorch-cu128" }]
-torchvision = [{ index = "pytorch-cu128" }]
-torchaudio = [{ index = "pytorch-cu128" }]
-flashinfer-jit-cache = [{ index = "flashinfer-cu128" }]
+pie-driver-dev = { path = "../dev", editable = true }
+torch = [{ index = "pytorch-cu129" }]
+torchvision = [{ index = "pytorch-cu129" }]
+torchaudio = [{ index = "pytorch-cu129" }]
 
 [tool.uv]
-# Resolve the structured-decoding pins where vLLM 0.16.0 and SGLang 0.5.9
-# disagree. Taking vLLM's (newer) side: SGLang's grammar-constrained
-# decoding paths will likely fail at runtime, but plain generation is
-# unaffected. Only matters when both wheels share a venv (separate venvs
-# is the supported deployment, in which case this block is inert).
-# Note: `uv pip install` does not honor this block; only `uv lock` /
-# `uv sync` do. Shared-venv users should drive install via uv sync, or
-# pass these as `--override` to uv pip install.
 override-dependencies = [
     "llguidance>=1.3.0,<1.4.0",
-    "xgrammar==0.1.29",
+    "xgrammar==0.2.1",
     "outlines-core==0.2.11",
     "outlines>=1.2.0,<1.3.0",
 ]

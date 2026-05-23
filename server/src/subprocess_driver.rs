@@ -1,5 +1,5 @@
 //! Subprocess driver: out-of-process supervisor for the Python drivers
-//! (`dev`, `vllm`, `sglang`).
+//! (`dev`, `vllm`, `sglang`, `tensorrt_llm`).
 //!
 //! Parallel to [`crate::embedded_driver::EmbeddedDriver`] in shape:
 //!
@@ -15,7 +15,7 @@
 //!
 //! The handshake JSON shape is the contract between this module and each
 //! launcher's `__main__.py`. **If you change `Handshake` here, update
-//! the JSON shape in all three of `driver/{dev,vllm,sglang}/src/.../__main__.py`
+//! the JSON shape in all of `driver/{dev,vllm,sglang,tensorrt_llm}/src/.../__main__.py`
 //! to match.** The duplication is intentional so the standalone can
 //! supervise every Python driver through one small protocol.
 
@@ -28,6 +28,8 @@ pub enum SubprocessFlavor {
     Vllm,
     /// SGLang-backed driver (`pie_driver_sglang`).
     Sglang,
+    /// TensorRT-LLM-backed driver (`pie_driver_tensorrt_llm`).
+    TensorRtLlm,
 }
 
 impl SubprocessFlavor {
@@ -39,6 +41,7 @@ impl SubprocessFlavor {
             SubprocessFlavor::Dev => "dev",
             SubprocessFlavor::Vllm => "vllm",
             SubprocessFlavor::Sglang => "sglang",
+            SubprocessFlavor::TensorRtLlm => "tensorrt_llm",
         }
     }
 
@@ -48,12 +51,14 @@ impl SubprocessFlavor {
             SubprocessFlavor::Dev => "pie_driver_dev",
             SubprocessFlavor::Vllm => "pie_driver_vllm",
             SubprocessFlavor::Sglang => "pie_driver_sglang",
+            SubprocessFlavor::TensorRtLlm => "pie_driver_tensorrt_llm",
         }
     }
 }
 
 #[cfg(unix)]
 mod unix_impl {
+    use std::ffi::OsString;
     use std::io::{BufRead, BufReader};
     use std::os::fd::{FromRawFd, IntoRawFd, OwnedFd};
     use std::os::unix::process::CommandExt;
@@ -301,6 +306,19 @@ mod unix_impl {
                 // (subprocess shouldn't read). stdout inherited too —
                 // launchers print boot diagnostics there.
                 .stdin(Stdio::null());
+
+            // The configured interpreter may be a venv's Python without the
+            // venv being activated. Some Python packages invoke sibling console
+            // tools (for example FlashInfer JIT shells out to `ninja`), so make
+            // the interpreter's bin directory visible to the subprocess tree.
+            if let Some(bin_dir) = python_exe.parent() {
+                let mut path = OsString::from(bin_dir.as_os_str());
+                if let Some(existing) = std::env::var_os("PATH") {
+                    path.push(":");
+                    path.push(existing);
+                }
+                cmd.env("PATH", path);
+            }
 
             // SAFETY: `pre_exec` runs in the forked child between fork()
             // and exec(). The libc calls below are async-signal-safe (per
@@ -655,7 +673,14 @@ mod unix_impl {
             assert_eq!(SubprocessFlavor::Dev.as_str(), "dev");
             assert_eq!(SubprocessFlavor::Vllm.as_str(), "vllm");
             assert_eq!(SubprocessFlavor::Sglang.as_str(), "sglang");
+            assert_eq!(SubprocessFlavor::TensorRtLlm.as_str(), "tensorrt_llm");
             assert_eq!(SubprocessFlavor::Dev.module_name(), "pie_driver_dev");
+            assert_eq!(SubprocessFlavor::Vllm.module_name(), "pie_driver_vllm");
+            assert_eq!(SubprocessFlavor::Sglang.module_name(), "pie_driver_sglang");
+            assert_eq!(
+                SubprocessFlavor::TensorRtLlm.module_name(),
+                "pie_driver_tensorrt_llm"
+            );
         }
 
         #[test]

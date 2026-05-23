@@ -597,23 +597,23 @@ void full_attn_body(
     // are the gate logits. Qwen3-MoE (Qwen3-30B-A3B) ships plain q_proj
     // [Hq, H] with no output gate, so the GEMM goes straight into ws.q.
     if (cfg.attn_output_gate) {
-        ops::gemm_act_x_wt_bf16(cublas.handle(),
-            ws.norm_x.data(), Lw.fa_q_proj->data(),
+        ops::gemm_act_x_w(cublas.handle(),
+            ws.norm_x.data(), make_weight_view(Lw.fa_q_proj, Lw.fa_q_proj_quant),
             la.fa_qg_packed.data(), N, 2 * Hq, H);
         kernels::launch_split_q_gate_bf16(
             la.fa_qg_packed.data(), ws.q.data(), la.fa_gate.data(),
             N, num_q_heads_local, d, stream);
     } else {
-        ops::gemm_act_x_wt_bf16(cublas.handle(),
-            ws.norm_x.data(), Lw.fa_q_proj->data(),
+        ops::gemm_act_x_w(cublas.handle(),
+            ws.norm_x.data(), make_weight_view(Lw.fa_q_proj, Lw.fa_q_proj_quant),
             ws.q.data(), N, Hq, H);
     }
 
-    ops::gemm_act_x_wt_bf16(cublas.handle(),
-        ws.norm_x.data(), Lw.fa_k_proj->data(),
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_x.data(), make_weight_view(Lw.fa_k_proj, Lw.fa_k_proj_quant),
         ws.k.data(), N, Hk, H);
-    ops::gemm_act_x_wt_bf16(cublas.handle(),
-        ws.norm_x.data(), Lw.fa_v_proj->data(),
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_x.data(), make_weight_view(Lw.fa_v_proj, Lw.fa_v_proj_quant),
         ws.v.data(), N, Hk, H);
 
     rmsnorm_bf16_dispatch(cfg,
@@ -658,12 +658,12 @@ void full_attn_body(
     // o_proj: TP=1 fuses residual via beta=1; TP>1 row-parallel +
     // all-reduce + residual-add.
     if (T == 1) {
-        ops::gemm_act_x_wt_bf16(cublas.handle(),
-            ws.attn_out.data(), Lw.fa_o_proj->data(),
+        ops::gemm_act_x_w(cublas.handle(),
+            ws.attn_out.data(), make_weight_view(Lw.fa_o_proj, Lw.fa_o_proj_quant),
             ws.y.data(), N, H, Hq, /*beta=*/1.f);
     } else {
-        ops::gemm_act_x_wt_bf16(cublas.handle(),
-            ws.attn_out.data(), Lw.fa_o_proj->data(),
+        ops::gemm_act_x_w(cublas.handle(),
+            ws.attn_out.data(), make_weight_view(Lw.fa_o_proj, Lw.fa_o_proj_quant),
             ws.norm_y.data(), N, H, Hq, /*beta=*/0.f);
         tp->all_reduce_bf16(ws.norm_y.data(),
             static_cast<std::size_t>(N) * H, ncclSum, stream);
@@ -942,23 +942,29 @@ void moe_block(
     if (Is > 0 && Lw.shared_gate_proj != nullptr) {
         profile_cuda_stage(profile, profile ? &profile->moe_shared_ms : nullptr,
             stream, [&] {
-                ops::gemm_act_x_wt_bf16(cublas.handle(),
-                    ws.norm_x.data(), Lw.shared_gate_proj->data(),
+                ops::gemm_act_x_w(cublas.handle(),
+                    ws.norm_x.data(),
+                    make_weight_view(
+                        Lw.shared_gate_proj, Lw.shared_gate_proj_quant),
                     moe_ws.shared_gate.data(), N, Is, H);
-                ops::gemm_act_x_wt_bf16(cublas.handle(),
-                    ws.norm_x.data(), Lw.shared_up_proj->data(),
+                ops::gemm_act_x_w(cublas.handle(),
+                    ws.norm_x.data(),
+                    make_weight_view(Lw.shared_up_proj, Lw.shared_up_proj_quant),
                     moe_ws.shared_up.data(), N, Is, H);
                 kernels::launch_swiglu_bf16(
                     moe_ws.shared_gate.data(), moe_ws.shared_up.data(),
                     moe_ws.shared_act.data(),
                     N * Is, stream);
-                ops::gemm_act_x_wt_bf16(cublas.handle(),
-                    moe_ws.shared_act.data(), Lw.shared_down_proj->data(),
+                ops::gemm_act_x_w(cublas.handle(),
+                    moe_ws.shared_act.data(),
+                    make_weight_view(
+                        Lw.shared_down_proj, Lw.shared_down_proj_quant),
                     moe_ws.shared_out.data(), N, H, Is);
 
                 // shared_gate logit [N, 1] = norm_x @ shared_gate.weight.T
-                ops::gemm_act_x_wt_bf16(cublas.handle(),
-                    ws.norm_x.data(), Lw.shared_gate->data(),
+                ops::gemm_act_x_w(cublas.handle(),
+                    ws.norm_x.data(),
+                    make_weight_view(Lw.shared_gate, Lw.shared_gate_quant),
                     moe_ws.shared_gate_logit.data(), N, 1, H);
 
                 // shared_out *= sigmoid(scalar_gate[n]) per token, broadcast

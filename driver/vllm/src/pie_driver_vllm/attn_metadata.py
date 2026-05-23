@@ -16,6 +16,8 @@ Conversions:
 
 from __future__ import annotations
 
+import inspect
+
 import numba
 import numpy as np
 import torch
@@ -78,8 +80,13 @@ def build_common_metadata(
     kv_page_indices: torch.Tensor,
     kv_page_indptr: torch.Tensor,
     kv_last_page_lens: torch.Tensor,
+    qo_indptr_cpu: np.ndarray | None = None,
+    kv_page_indices_cpu: np.ndarray | None = None,
+    kv_page_indptr_cpu: np.ndarray | None = None,
+    kv_last_page_lens_cpu: np.ndarray | None = None,
     page_size: int,
     device: torch.device,
+    position_ids: torch.Tensor | None = None,
 ):
     """Produce a `CommonAttentionMetadata` from pie's batch dict fields.
 
@@ -88,10 +95,10 @@ def build_common_metadata(
     """
     from ._vllm_compat import CommonAttentionMetadata
 
-    qo_np = qo_indptr.to(torch.int32).cpu().numpy()
-    kv_idx_np = kv_page_indices.to(torch.int32).cpu().numpy()
-    kv_indptr_np = kv_page_indptr.to(torch.int32).cpu().numpy()
-    kv_last_np = kv_last_page_lens.to(torch.int32).cpu().numpy()
+    qo_np = _i32_np(qo_indptr, qo_indptr_cpu)
+    kv_idx_np = _i32_np(kv_page_indices, kv_page_indices_cpu)
+    kv_indptr_np = _i32_np(kv_page_indptr, kv_page_indptr_cpu)
+    kv_last_np = _i32_np(kv_last_page_lens, kv_last_page_lens_cpu)
 
     batch = qo_np.shape[0] - 1
     num_tokens = int(qo_np[-1])
@@ -108,33 +115,61 @@ def build_common_metadata(
     if batch > 0 and max_blocks > 0:
         _build_block_table(kv_idx_np, kv_indptr_np, max_blocks, block_table_np)
 
-    # slot_mapping: (num_tokens,) absolute slot per query token
-    slot_mapping_np = np.zeros(num_tokens, dtype=np.int64)
+    # slot_mapping: (num_tokens,) absolute slot per query token.
+    slot_mapping_np = np.full(num_tokens, -1, dtype=np.int64)
     if num_tokens > 0:
         _build_slot_mapping(
             qo_np, kv_idx_np, kv_indptr_np, seq_lens_np, page_size, slot_mapping_np
         )
 
+    query_lens_np = qo_np[1:] - qo_np[:-1]
+    num_computed_tokens_np = seq_lens_np - query_lens_np
+
     # Move to GPU
     query_start_loc_cpu = torch.from_numpy(qo_np)
     query_start_loc = query_start_loc_cpu.to(device, non_blocking=True)
-    seq_lens = torch.from_numpy(seq_lens_np).to(device, non_blocking=True)
+    seq_lens_cpu = torch.from_numpy(seq_lens_np)
+    seq_lens = seq_lens_cpu.to(device, non_blocking=True)
     block_table_tensor = torch.from_numpy(block_table_np).to(device, non_blocking=True)
     slot_mapping = torch.from_numpy(slot_mapping_np).to(device, non_blocking=True)
+    num_computed_tokens_cpu = torch.from_numpy(num_computed_tokens_np)
 
-    query_lens = qo_np[1:] - qo_np[:-1]
-    max_query_len = int(query_lens.max()) if batch > 0 else 0
+    positions = None
+    if position_ids is not None:
+        positions = position_ids.to(device, dtype=torch.int64, non_blocking=True)
+
+    max_query_len = int(query_lens_np.max()) if batch > 0 else 0
     max_seq_len = int(seq_lens_np.max()) if batch > 0 else 0
 
-    return CommonAttentionMetadata(
-        query_start_loc=query_start_loc,
-        query_start_loc_cpu=query_start_loc_cpu,
-        seq_lens=seq_lens,
-        num_reqs=batch,
-        num_actual_tokens=num_tokens,
-        max_query_len=max_query_len,
-        max_seq_len=max_seq_len,
-        block_table_tensor=block_table_tensor,
-        slot_mapping=slot_mapping,
-        causal=True,
-    )
+    kwargs = {
+        "query_start_loc": query_start_loc,
+        "query_start_loc_cpu": query_start_loc_cpu,
+        "seq_lens": seq_lens,
+        "num_reqs": batch,
+        "num_actual_tokens": num_tokens,
+        "max_query_len": max_query_len,
+        "max_seq_len": max_seq_len,
+        "block_table_tensor": block_table_tensor,
+        "slot_mapping": slot_mapping,
+        "causal": True,
+        "_seq_lens_cpu": seq_lens_cpu,
+        "_num_computed_tokens_cpu": num_computed_tokens_cpu,
+    }
+    optional_kwargs = {
+        # vLLM revisions differ on whether these fields are constructor args
+        # or populated elsewhere in the attention path.
+        "positions": positions,
+        "seq_lens_cpu_upper_bound": seq_lens_cpu,
+    }
+    params = inspect.signature(CommonAttentionMetadata).parameters
+    for name, value in optional_kwargs.items():
+        if name in params:
+            kwargs[name] = value
+
+    return CommonAttentionMetadata(**kwargs)
+
+
+def _i32_np(tensor: torch.Tensor, cpu: np.ndarray | None) -> np.ndarray:
+    if cpu is not None:
+        return np.asarray(cpu, dtype=np.int32)
+    return tensor.to(torch.int32).cpu().numpy()

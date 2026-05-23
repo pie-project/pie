@@ -75,9 +75,7 @@ impl From<Sampler> for WitSampler {
             Sampler::TopP { temperature, p } => WitSampler::TopP((temperature, p)),
             Sampler::TopK { temperature, k } => WitSampler::TopK((temperature, k)),
             Sampler::MinP { temperature, p } => WitSampler::MinP((temperature, p)),
-            Sampler::TopKTopP { temperature, k, p } => {
-                WitSampler::TopKTopP((temperature, k, p))
-            }
+            Sampler::TopKTopP { temperature, k, p } => WitSampler::TopKTopP((temperature, k, p)),
             Sampler::Multinomial { temperature, draws } => {
                 WitSampler::Multinomial((temperature, draws))
             }
@@ -148,7 +146,9 @@ pub struct Entropy;
 
 impl Probe for Logits {
     type Out = Logits;
-    fn into_wit(self) -> WitSampler { WitSampler::RawLogits }
+    fn into_wit(self) -> WitSampler {
+        WitSampler::RawLogits
+    }
 }
 
 impl Probe for Distribution {
@@ -164,15 +164,21 @@ impl Probe for Logprob {
     /// case. Sharing the marker lets a single `output.logprobs(h)` accessor
     /// serve both.
     type Out = Logprobs;
-    fn into_wit(self) -> WitSampler { WitSampler::Logprob(self.0) }
+    fn into_wit(self) -> WitSampler {
+        WitSampler::Logprob(self.0)
+    }
 }
 
 impl Probe for Logprobs {
     type Out = Logprobs;
-    fn into_wit(self) -> WitSampler { WitSampler::Logprobs(self.0) }
+    fn into_wit(self) -> WitSampler {
+        WitSampler::Logprobs(self.0)
+    }
 }
 
 impl Probe for Entropy {
     type Out = Entropy;
-    fn into_wit(self) -> WitSampler { WitSampler::Entropy }
+    fn into_wit(self) -> WitSampler {
+        WitSampler::Entropy
+    }
 }

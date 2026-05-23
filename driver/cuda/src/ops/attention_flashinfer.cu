@@ -931,7 +931,24 @@ void dispatch_attention_flashinfer_prefill_bf16(
         }
     }
 
-    auto dispatch = [&]<class Variant>(::std::type_identity<Variant>) {
+    auto dispatch_causal = [&]<class Variant>(::std::type_identity<Variant>) {
+        switch (cache.head_dim) {
+            case 64:
+                return prefill_dispatch_for_head_dim<64, ::flashinfer::MaskMode::kCausal, Variant>(
+                    params, plan_info, tmp_v, tmp_s, cache.enable_pdl, stream);
+            case 128:
+                return prefill_dispatch_for_head_dim<128, ::flashinfer::MaskMode::kCausal, Variant>(
+                    params, plan_info, tmp_v, tmp_s, cache.enable_pdl, stream);
+            case 256:
+                return prefill_dispatch_for_head_dim<256, ::flashinfer::MaskMode::kCausal, Variant>(
+                    params, plan_info, tmp_v, tmp_s, cache.enable_pdl, stream);
+            case 512:
+                return prefill_dispatch_for_head_dim<512, ::flashinfer::MaskMode::kCausal, Variant>(
+                    params, plan_info, tmp_v, tmp_s, cache.enable_pdl, stream);
+        }
+        return cudaErrorInvalidValue;
+    };
+    auto dispatch_full = [&]<class Variant>(::std::type_identity<Variant>) {
         switch (cache.head_dim) {
             case 64:
                 return cache.causal_mask
@@ -963,13 +980,13 @@ void dispatch_attention_flashinfer_prefill_bf16(
 
     cudaError_t status;
     if (cache.full_attention_variant && logits_soft_cap > 0.f) {
-        status = dispatch(::std::type_identity<AttnVariantFullSoftcap>{});
+        status = dispatch_full(::std::type_identity<AttnVariantFullSoftcap>{});
     } else if (cache.full_attention_variant) {
-        status = dispatch(::std::type_identity<AttnVariantFull>{});
+        status = dispatch_full(::std::type_identity<AttnVariantFull>{});
     } else if (logits_soft_cap > 0.f) {
-        status = dispatch(::std::type_identity<AttnVariantSoftcap>{});
+        status = dispatch_causal(::std::type_identity<AttnVariantSoftcap>{});
     } else {
-        status = dispatch(::std::type_identity<AttnVariant>{});
+        status = dispatch_causal(::std::type_identity<AttnVariant>{});
     }
     CUDA_CHECK(status);
 }

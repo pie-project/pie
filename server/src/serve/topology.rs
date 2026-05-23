@@ -59,6 +59,7 @@ pub fn resolve_flavor(kind: DriverKind, model_name: &str) -> Result<ResolvedFlav
         DriverKind::Dev => Ok(ResolvedFlavor::Subprocess(SubprocessFlavor::Dev)),
         DriverKind::Vllm => Ok(ResolvedFlavor::Subprocess(SubprocessFlavor::Vllm)),
         DriverKind::Sglang => Ok(ResolvedFlavor::Subprocess(SubprocessFlavor::Sglang)),
+        DriverKind::TensorRtLlm => Ok(ResolvedFlavor::Subprocess(SubprocessFlavor::TensorRtLlm)),
     }
 }
 

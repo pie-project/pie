@@ -14,6 +14,7 @@ import torch
 import torch.distributed as dist
 
 from ._bridge.config import RuntimeConfig
+from .utils import configure_distributed_environment
 
 
 # `RuntimeConfig.activation_dtype` is a string identifier; vllm's
@@ -110,27 +111,36 @@ def _build_vllm_config(config: RuntimeConfig, driver_config) -> Any:
         if v is not None:
             engine_kwargs[k] = v
 
-    # When piggybacking on vllm's CUDA-graph dispatch (enforce_eager=False),
-    # vllm bakes a fixed `compile_ranges` into the piecewise backend at load
-    # time and asserts at fire time that `num_tokens` falls inside one of
-    # them — chunked prefill's default 2048 is far below pie's batched
-    # peak. Default `max_num_batched_tokens` to the model's context length
-    # so any pie batch fits the compile range.
+    system_topology = configure_distributed_environment(
+        int(engine_kwargs["tensor_parallel_size"]), config.devices
+    )
+    if system_topology and "disable_custom_all_reduce" not in engine_kwargs:
+        engine_kwargs["disable_custom_all_reduce"] = True
+    # When piggybacking on vllm's CUDA-graph dispatch, vllm bakes a fixed
+    # `compile_ranges` into the piecewise backend at load time and asserts at
+    # fire time that `num_tokens` falls inside one of them. Keep Pie's default
+    # at vLLM's standard 8192-token compile range unless the user explicitly
+    # sets a different batch-token capacity.
     if (
         not engine_kwargs.get("enforce_eager", False)
         and engine_kwargs.get("max_num_batched_tokens") is None
     ):
-        from transformers import AutoConfig
-        try:
-            hf_cfg = AutoConfig.from_pretrained(config.hf_repo, trust_remote_code=True)
-            mml = int(getattr(hf_cfg, "max_position_embeddings", 0)) or None
-        except Exception:
-            mml = None
-        if mml is not None:
-            engine_kwargs["max_num_batched_tokens"] = mml
+        engine_kwargs["max_num_batched_tokens"] = 8192
 
     args = EngineArgs(**engine_kwargs)
     vllm_config = args.create_engine_config()
+    vllm_config.parallel_config.rank = config.rank
+
+    if system_topology and not engine_kwargs.get("enforce_eager", False):
+        from ._vllm_compat import CUDAGraphMode
+
+        # Keep torch.compile enabled, but avoid Pie's manual CUDA graph
+        # capture on SYS-level TP pairs. That capture path can wedge NCCL
+        # collectives after P2P is disabled; the compiled non-graph path
+        # remains safe and avoids falling all the way back to eager.
+        vllm_config.compilation_config.cudagraph_mode = CUDAGraphMode.NONE
+        vllm_config.compilation_config.cudagraph_capture_sizes = []
+        vllm_config.compilation_config.max_cudagraph_capture_size = None
 
     # Pie launches each DP replica as an independent single-rank subprocess.
     # vLLM names those compile-cache leaves `rank_0_0` in every replica, so
@@ -171,6 +181,14 @@ def _ensure_vllm_distributed(vllm_config: Any, rank: int, local_rank: int) -> No
     )
 
     parallel_config = vllm_config.parallel_config
+
+    # vLLM's normal GPUWorker path applies this before constructing model
+    # parallel groups. Pie loads the model directly, so mirror that hook here;
+    # otherwise `disable_custom_all_reduce=True` is present in config but the
+    # TP communicator still builds vLLM's custom all-reduce path.
+    from vllm.distributed.parallel_state import set_custom_all_reduce
+
+    set_custom_all_reduce(not parallel_config.disable_custom_all_reduce)
 
     if not dist.is_initialized():
         # Single-rank fallback. FileStore avoids picking a port (no contention).

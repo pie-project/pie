@@ -14,14 +14,12 @@ use crate::context::pagestore::{PhysicalPageId, compute_last_page_len};
 use crate::driver::SchedulerLimits;
 use crate::inference::ForwardOutput;
 
-use super::{
-    Completion, PendingRequest, PhysicalPageSpan, RequestCapacityUsage, request_capacity_usage,
-};
+use super::{Completion, PendingRequest, RequestCapacityUsage, request_capacity_usage};
 
 pub(super) struct ChunkContinuation {
     original_request: pie_bridge::ForwardRequest,
     response_tx: oneshot::Sender<Result<ForwardOutput>>,
-    physical_page_ids: PhysicalPageSpan,
+    physical_page_ids: Vec<PhysicalPageId>,
     final_last_page_len: u32,
     chunk_end: usize,
     chunk_size: usize,
@@ -97,7 +95,6 @@ impl PendingRequest {
             completion,
             physical_page_ids,
             last_page_len,
-            enqueued_at: _,
         } = self;
         let Completion::Direct(response_tx) = completion else {
             unreachable!("chunk continuations returned above");
@@ -119,9 +116,8 @@ impl PendingRequest {
                 },
                 sampler_slots: chunk_sampler_slots,
             },
-            physical_page_ids: PhysicalPageSpan::from_vec(chunk.physical_page_ids),
+            physical_page_ids: chunk.physical_page_ids,
             last_page_len: chunk.last_page_len,
-            enqueued_at: std::time::Instant::now(),
         })
     }
 
@@ -142,7 +138,6 @@ impl PendingRequest {
             completion,
             physical_page_ids: _,
             last_page_len: _,
-            enqueued_at: _,
         } = self;
 
         let result = result.map(Into::into);
@@ -272,9 +267,8 @@ impl ChunkContinuation {
                 },
                 sampler_slots: chunk_sampler_slots,
             },
-            physical_page_ids: PhysicalPageSpan::from_vec(chunk.physical_page_ids),
+            physical_page_ids: chunk.physical_page_ids,
             last_page_len: chunk.last_page_len,
-            enqueued_at: std::time::Instant::now(),
         })
     }
 }
@@ -1162,13 +1156,6 @@ mod tests {
         )
     }
 
-    fn expect_response(output: ForwardOutput) -> pie_bridge::ForwardResponse {
-        match output {
-            ForwardOutput::Response(resp) => resp,
-            other => panic!("expected structured response, got {other:?}"),
-        }
-    }
-
     fn positioned_pending(tokens: usize, page_size: u32) -> PendingRequest {
         positioned_pending_with_receiver(tokens, page_size).0
     }
@@ -1227,6 +1214,13 @@ mod tests {
             entropies_indptr: vec![0, 1],
             entropies: vec![entropy],
             ..Default::default()
+        }
+    }
+
+    fn expect_forward_response(result: Result<ForwardOutput>) -> pie_bridge::ForwardResponse {
+        match result.expect("chunked response ok") {
+            ForwardOutput::Response(resp) => resp,
+            other => panic!("expected ForwardOutput::Response, got {other:?}"),
         }
     }
 
@@ -1405,11 +1399,7 @@ mod tests {
         assert_eq!(chunk_sampler_slots(&final_chunk), &[0]);
         final_chunk.send_result(Ok(token_response(99)), Some(&weak_submit_tx), 4);
 
-        let merged = response_rx
-            .try_recv()
-            .expect("merged response")
-            .expect("chunked response ok");
-        let merged = expect_response(merged);
+        let merged = expect_forward_response(response_rx.try_recv().expect("merged response"));
         assert_eq!(merged.num_requests, 1);
         assert_eq!(merged.tokens, vec![99, 11]);
         assert_eq!(merged.tokens_indptr, vec![0, 2]);
@@ -1741,7 +1731,7 @@ mod tests {
                 4,
             );
             if let Ok(result) = response_rx.try_recv() {
-                let merged = expect_response(result.expect("chunked response ok"));
+                let merged = expect_forward_response(result);
                 assert_eq!(merged.num_requests, 1);
                 assert_eq!(merged.tokens_indptr, vec![0, 0]);
                 assert_eq!(merged.dists_req_indptr, vec![0, 0]);
@@ -1873,7 +1863,7 @@ mod tests {
                 64,
             );
             if let Ok(result) = response_rx.try_recv() {
-                break expect_response(result.expect("chunked response ok"));
+                break expect_forward_response(result);
             }
             current = submit_rx.try_recv().expect("next continuation");
         };

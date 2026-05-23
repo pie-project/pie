@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from typing import Any
 
+import os
 import psutil
 import torch
 
@@ -18,6 +19,71 @@ import torch
 # by the worker when it stands up a CPU companion group; None means
 # "use the default PG (NCCL)" inside `broadcast_struct`.
 _cpu_group = None
+
+
+def devices_use_system_topology(
+    devices: list[str], tp_degree: int | None = None
+) -> bool:
+    """Return True when any TP GPU pair only meets at NVML SYSTEM level."""
+    if tp_degree is None:
+        tp_degree = len(devices)
+    if tp_degree <= 1:
+        return False
+    if not torch.cuda.is_available() or torch.cuda.device_count() < 2:
+        return False
+
+    try:
+        import pynvml
+
+        indices: list[int] = []
+        for device in devices[:tp_degree]:
+            dev = torch.device(device)
+            if dev.type != "cuda":
+                return False
+            idx = 0 if dev.index is None else int(dev.index)
+            if idx >= torch.cuda.device_count():
+                return False
+            indices.append(idx)
+
+        if len(set(indices)) < 2:
+            return False
+
+        pynvml.nvmlInit()
+        handles = []
+        for idx in indices:
+            prop = torch.cuda.get_device_properties(idx)
+            bus_id = (
+                f"{prop.pci_domain_id:08x}:"
+                f"{prop.pci_bus_id:02x}:"
+                f"{prop.pci_device_id:02x}.0"
+            )
+            handles.append(pynvml.nvmlDeviceGetHandleByPciBusId(bus_id.encode()))
+
+        system_level = pynvml.NVML_TOPOLOGY_SYSTEM
+        for i in range(len(handles)):
+            for j in range(i + 1, len(handles)):
+                level = pynvml.nvmlDeviceGetTopologyCommonAncestor(
+                    handles[i], handles[j],
+                )
+                if level >= system_level:
+                    return True
+    except Exception:
+        return False
+    finally:
+        try:
+            pynvml.nvmlShutdown()  # type: ignore[name-defined]
+        except Exception:
+            pass
+
+    return False
+
+
+def configure_distributed_environment(tp_degree: int, devices: list[str]) -> bool:
+    """Set distributed env defaults before torch.distributed is initialized."""
+    system_topology = devices_use_system_topology(devices, tp_degree)
+    if system_topology:
+        os.environ.setdefault("NCCL_P2P_DISABLE", "1")
+    return system_topology
 
 
 def get_device_sm() -> int:
@@ -209,6 +275,14 @@ def init_distributed(
         device_id=device_id,
     )
 
+    global _cpu_group
+    if backend == "nccl" and tp_degree > 1:
+        _cpu_group = dist.new_group(
+            ranks=list(range(tp_degree)),
+            backend="gloo",
+            timeout=timeout,
+        )
+
 
 def set_device(device: str) -> None:
     """Pin the current thread to `device` (no-op for non-CUDA strings)."""
@@ -229,6 +303,8 @@ def cleanup_runtime() -> None:
 def cleanup_distributed() -> None:
     import torch.distributed as dist
 
+    global _cpu_group
+    _cpu_group = None
     if dist.is_initialized():
         dist.destroy_process_group()
 

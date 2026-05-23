@@ -195,7 +195,7 @@ impl Linker {
 
         // 7. Instantiate the main component
         let instance = if cacheable_instance_pre {
-            let cache_key = (program_name.clone(), main.install_id);
+            let cache_key = (program_name.clone(), main.generation);
             let pre = match self.instance_pre_cache.get(&cache_key) {
                 Some(pre) => pre.clone(),
                 None => {

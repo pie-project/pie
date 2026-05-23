@@ -90,91 +90,38 @@ impl Session {
                         format!("{}.avg_batch_latency_us", model_name),
                         serde_json::Value::from(inf.avg_batch_latency_us),
                     );
-                    for (name, value) in [
-                        ("last_request_queue_us", inf.last_request_queue_us),
-                        (
-                            "cumulative_request_queue_us",
-                            inf.cumulative_request_queue_us,
-                        ),
-                        ("avg_request_queue_us", inf.avg_request_queue_us),
-                        ("last_batch_queue_us", inf.last_batch_queue_us),
-                        ("cumulative_batch_queue_us", inf.cumulative_batch_queue_us),
-                        ("avg_batch_queue_us", inf.avg_batch_queue_us),
-                        ("last_permit_wait_us", inf.last_permit_wait_us),
-                        ("cumulative_permit_wait_us", inf.cumulative_permit_wait_us),
-                        ("avg_permit_wait_us", inf.avg_permit_wait_us),
-                        ("last_batch_build_us", inf.last_batch_build_us),
-                        ("cumulative_batch_build_us", inf.cumulative_batch_build_us),
-                        ("avg_batch_build_us", inf.avg_batch_build_us),
-                        ("last_driver_forward_us", inf.last_driver_forward_us),
-                        (
-                            "cumulative_driver_forward_us",
-                            inf.cumulative_driver_forward_us,
-                        ),
-                        ("avg_driver_forward_us", inf.avg_driver_forward_us),
-                        ("last_response_fanout_us", inf.last_response_fanout_us),
-                        (
-                            "cumulative_response_fanout_us",
-                            inf.cumulative_response_fanout_us,
-                        ),
-                        ("avg_response_fanout_us", inf.avg_response_fanout_us),
-                        ("last_response_classify_us", inf.last_response_classify_us),
-                        (
-                            "cumulative_response_classify_us",
-                            inf.cumulative_response_classify_us,
-                        ),
-                        ("avg_response_classify_us", inf.avg_response_classify_us),
-                        (
-                            "last_response_token_output_build_us",
-                            inf.last_response_token_output_build_us,
-                        ),
-                        (
-                            "cumulative_response_token_output_build_us",
-                            inf.cumulative_response_token_output_build_us,
-                        ),
-                        (
-                            "avg_response_token_output_build_us",
-                            inf.avg_response_token_output_build_us,
-                        ),
-                        (
-                            "last_response_direct_send_us",
-                            inf.last_response_direct_send_us,
-                        ),
-                        (
-                            "cumulative_response_direct_send_us",
-                            inf.cumulative_response_direct_send_us,
-                        ),
-                        (
-                            "avg_response_direct_send_us",
-                            inf.avg_response_direct_send_us,
-                        ),
-                        (
-                            "last_response_chunk_send_us",
-                            inf.last_response_chunk_send_us,
-                        ),
-                        (
-                            "cumulative_response_chunk_send_us",
-                            inf.cumulative_response_chunk_send_us,
-                        ),
-                        ("avg_response_chunk_send_us", inf.avg_response_chunk_send_us),
-                        ("last_response_extract_us", inf.last_response_extract_us),
-                        (
-                            "cumulative_response_extract_us",
-                            inf.cumulative_response_extract_us,
-                        ),
-                        ("avg_response_extract_us", inf.avg_response_extract_us),
-                        ("last_response_error_us", inf.last_response_error_us),
-                        (
-                            "cumulative_response_error_us",
-                            inf.cumulative_response_error_us,
-                        ),
-                        ("avg_response_error_us", inf.avg_response_error_us),
-                    ] {
-                        stats.insert(
-                            format!("{}.{}", model_name, name),
-                            serde_json::Value::from(value),
-                        );
-                    }
+                    stats.insert(
+                        format!("{}.avg_permit_wait_us", model_name),
+                        serde_json::Value::from(inf.avg_permit_wait_us),
+                    );
+                    stats.insert(
+                        format!("{}.avg_fire_prepare_us", model_name),
+                        serde_json::Value::from(inf.avg_fire_prepare_us),
+                    );
+                    stats.insert(
+                        format!("{}.avg_execute_batch_us", model_name),
+                        serde_json::Value::from(inf.avg_execute_batch_us),
+                    );
+                    stats.insert(
+                        format!("{}.avg_batch_build_us", model_name),
+                        serde_json::Value::from(inf.avg_batch_build_us),
+                    );
+                    stats.insert(
+                        format!("{}.avg_driver_fire_us", model_name),
+                        serde_json::Value::from(inf.avg_driver_fire_us),
+                    );
+                    stats.insert(
+                        format!("{}.avg_response_dispatch_us", model_name),
+                        serde_json::Value::from(inf.avg_response_dispatch_us),
+                    );
+                    stats.insert(
+                        format!("{}.avg_context_tick_submit_us", model_name),
+                        serde_json::Value::from(inf.avg_context_tick_submit_us),
+                    );
+                    stats.insert(
+                        format!("{}.avg_stats_update_us", model_name),
+                        serde_json::Value::from(inf.avg_stats_update_us),
+                    );
                     // Speculation hit counters — observability for
                     // `try_hit`/chain submissions/drops.
                     stats.insert(
@@ -196,73 +143,55 @@ impl Session {
                             inference::CHAIN_DROP_COUNT.load(std::sync::atomic::Ordering::Relaxed),
                         ),
                     );
-                }
-
-                let proc = process::get_runtime_stats();
-                for (name, value) in [
-                    ("completed", proc.completed),
-                    (
-                        "cumulative_admission_wait_us",
-                        proc.cumulative_admission_wait_us,
-                    ),
-                    ("avg_admission_wait_us", proc.avg_admission_wait_us),
-                    ("last_admission_wait_us", proc.last_admission_wait_us),
-                    ("cumulative_instantiate_us", proc.cumulative_instantiate_us),
-                    ("avg_instantiate_us", proc.avg_instantiate_us),
-                    ("last_instantiate_us", proc.last_instantiate_us),
-                    (
-                        "cumulative_context_register_us",
-                        proc.cumulative_context_register_us,
-                    ),
-                    ("avg_context_register_us", proc.avg_context_register_us),
-                    ("last_context_register_us", proc.last_context_register_us),
-                    ("cumulative_wasm_run_us", proc.cumulative_wasm_run_us),
-                    ("avg_wasm_run_us", proc.avg_wasm_run_us),
-                    ("last_wasm_run_us", proc.last_wasm_run_us),
-                ] {
-                    stats.insert(format!("process.{}", name), serde_json::Value::from(value));
-                }
-
-                let api_forward = crate::api::inference::get_api_forward_stats();
-                for (name, value) in [
-                    ("completed", api_forward.completed),
-                    ("hit_path", api_forward.hit_path),
-                    ("cold_path", api_forward.cold_path),
-                    ("cumulative_execute_us", api_forward.cumulative_execute_us),
-                    ("avg_execute_us", api_forward.avg_execute_us),
-                    ("cumulative_try_hit_us", api_forward.cumulative_try_hit_us),
-                    ("avg_try_hit_us", api_forward.avg_try_hit_us),
-                    (
-                        "cumulative_staged_await_us",
-                        api_forward.cumulative_staged_await_us,
-                    ),
-                    ("avg_staged_await_us", api_forward.avg_staged_await_us),
-                    (
-                        "cumulative_cold_prepare_us",
-                        api_forward.cumulative_cold_prepare_us,
-                    ),
-                    ("avg_cold_prepare_us", api_forward.avg_cold_prepare_us),
-                    ("cumulative_pin_us", api_forward.cumulative_pin_us),
-                    ("avg_pin_us", api_forward.avg_pin_us),
-                    (
-                        "cumulative_submit_await_us",
-                        api_forward.cumulative_submit_await_us,
-                    ),
-                    ("avg_submit_await_us", api_forward.avg_submit_await_us),
-                    ("cumulative_append_us", api_forward.cumulative_append_us),
-                    ("avg_append_us", api_forward.avg_append_us),
-                    ("cumulative_unpin_us", api_forward.cumulative_unpin_us),
-                    ("avg_unpin_us", api_forward.avg_unpin_us),
-                    (
-                        "cumulative_build_output_us",
-                        api_forward.cumulative_build_output_us,
-                    ),
-                    ("avg_build_output_us", api_forward.avg_build_output_us),
-                ] {
-                    stats.insert(
-                        format!("api_forward.{}", name),
-                        serde_json::Value::from(value),
-                    );
+                    if let Some(exec) = crate::api::inference::execute_profile_snapshot() {
+                        let mean_value = |total_us: u64, denom: u64| -> serde_json::Value {
+                            serde_json::Value::from(if denom > 0 { total_us / denom } else { 0 })
+                        };
+                        stats.insert(
+                            format!("{}.execute_profile_calls", model_name),
+                            serde_json::Value::from(exec.calls),
+                        );
+                        stats.insert(
+                            format!("{}.execute_profile_hits", model_name),
+                            serde_json::Value::from(exec.hits),
+                        );
+                        stats.insert(
+                            format!("{}.execute_profile_misses", model_name),
+                            serde_json::Value::from(exec.misses),
+                        );
+                        stats.insert(
+                            format!("{}.execute_profile_total_mean_us", model_name),
+                            mean_value(exec.total_us, exec.calls),
+                        );
+                        stats.insert(
+                            format!("{}.execute_profile_prepare_mean_us", model_name),
+                            mean_value(exec.prepare_us, exec.calls),
+                        );
+                        stats.insert(
+                            format!("{}.execute_profile_try_hit_mean_us", model_name),
+                            mean_value(exec.try_hit_us, exec.calls),
+                        );
+                        stats.insert(
+                            format!("{}.execute_profile_hit_wait_mean_us", model_name),
+                            mean_value(exec.hit_wait_us, exec.hits),
+                        );
+                        stats.insert(
+                            format!("{}.execute_profile_cold_prepare_mean_us", model_name),
+                            mean_value(exec.cold_prepare_us, exec.misses),
+                        );
+                        stats.insert(
+                            format!("{}.execute_profile_pin_mean_us", model_name),
+                            mean_value(exec.pin_us, exec.misses),
+                        );
+                        stats.insert(
+                            format!("{}.execute_profile_submit_wait_mean_us", model_name),
+                            mean_value(exec.submit_wait_us, exec.misses),
+                        );
+                        stats.insert(
+                            format!("{}.execute_profile_postprocess_mean_us", model_name),
+                            mean_value(exec.postprocess_us, exec.calls),
+                        );
+                    }
                 }
 
                 self.send_response(corr_id, true, serde_json::Value::Object(stats).to_string())
@@ -345,11 +274,27 @@ impl Session {
                         return;
                     }
                 };
+                let program_name = manifest.program_name();
 
                 match program::add(buffer, manifest, force_overwrite).await {
                     Ok(()) => {
-                        self.send_response(corr_id, true, "Program added successfully".to_string())
-                            .await;
+                        if force_overwrite {
+                            self.installed_programs.remove(&program_name);
+                        }
+                        match program::install(&program_name).await {
+                            Ok(()) => {
+                                self.installed_programs.insert(program_name);
+                                self.send_response(
+                                    corr_id,
+                                    true,
+                                    "Program installed successfully".to_string(),
+                                )
+                                .await;
+                            }
+                            Err(e) => {
+                                self.send_response(corr_id, false, e.to_string()).await;
+                            }
+                        }
                     }
                     Err(e) => {
                         self.send_response(corr_id, false, e.to_string()).await;
@@ -381,10 +326,15 @@ impl Session {
             }
         };
 
-        // Install program and dependencies (handles both uploaded and registry)
-        if let Err(e) = program::install(&program_name).await {
-            self.send_response(corr_id, false, e.to_string()).await;
-            return;
+        // Install program and dependencies (handles both uploaded and registry).
+        // Uploaded programs are installed during add_program, so repeated hot
+        // launches can skip the program-manager round trip in this session.
+        if !self.installed_programs.contains(&program_name) {
+            if let Err(e) = program::install(&program_name).await {
+                self.send_response(corr_id, false, e.to_string()).await;
+                return;
+            }
+            self.installed_programs.insert(program_name.clone());
         }
 
         // Launch the process
@@ -447,9 +397,12 @@ impl Session {
             }
         };
 
-        if let Err(e) = program::install(&program_name).await {
-            self.send_response(corr_id, false, e.to_string()).await;
-            return;
+        if !self.installed_programs.contains(&program_name) {
+            if let Err(e) = program::install(&program_name).await {
+                self.send_response(corr_id, false, e.to_string()).await;
+                return;
+            }
+            self.installed_programs.insert(program_name.clone());
         }
 
         let client_id = if capture_outputs { Some(self.id) } else { None };
@@ -518,9 +471,12 @@ impl Session {
             }
         };
 
-        if let Err(e) = program::install(&program_name).await {
-            self.send_response(corr_id, false, e.to_string()).await;
-            return;
+        if !self.installed_programs.contains(&program_name) {
+            if let Err(e) = program::install(&program_name).await {
+                self.send_response(corr_id, false, e.to_string()).await;
+                return;
+            }
+            self.installed_programs.insert(program_name.clone());
         }
 
         let mut receivers = Vec::with_capacity(inputs.len());
@@ -584,9 +540,12 @@ impl Session {
         };
 
         // Install program and dependencies (handles both uploaded and registry)
-        if let Err(e) = program::install(&program_name).await {
-            self.send_response(corr_id, false, e.to_string()).await;
-            return;
+        if !self.installed_programs.contains(&program_name) {
+            if let Err(e) = program::install(&program_name).await {
+                self.send_response(corr_id, false, e.to_string()).await;
+                return;
+            }
+            self.installed_programs.insert(program_name.clone());
         }
 
         match daemon::spawn(self.username.clone(), program_name, port as u16, input) {
