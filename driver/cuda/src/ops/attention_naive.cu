@@ -291,7 +291,8 @@ __global__ void attn_mtp_paged_history_kernel(
     int num_kv_heads,
     int head_dim,
     bool hnd_layout,
-    float scale)
+    float scale,
+    bool prefix_global)
 {
     extern __shared__ float smem[];
     float* scores = smem;
@@ -311,7 +312,8 @@ __global__ void attn_mtp_paged_history_kernel(
     const int max_kv_len = pages <= 0
         ? 0
         : (pages - 1) * page_size + static_cast<int>(kv_last_page_lens[request]);
-    int global_len = position_ids[row];
+    int global_len = position_ids[row] -
+                     (prefix_global ? (history_steps - 1) : 0);
     if (global_len < 0) global_len = 0;
     if (global_len > max_kv_len) global_len = max_kv_len;
     if (global_len > max_global_tokens) global_len = max_global_tokens;
@@ -465,6 +467,7 @@ void launch_attention_mtp_paged_history_bf16(
     int num_kv_heads,
     int head_dim,
     bool hnd_layout,
+    bool global_cache_uses_prefix_position,
     cudaStream_t stream)
 {
     if (num_tokens <= 0 || history_steps <= 0) return;
@@ -498,7 +501,8 @@ void launch_attention_mtp_paged_history_bf16(
         position_ids, request_ids,
         kv_page_indices, kv_page_indptr, kv_last_page_lens,
         num_tokens, history_steps, history_stride, max_global_tokens,
-        page_size, num_q_heads, num_kv_heads, head_dim, hnd_layout, scale);
+        page_size, num_q_heads, num_kv_heads, head_dim, hnd_layout, scale,
+        global_cache_uses_prefix_position);
 }
 
 void launch_mtp_shift_hidden_bf16(

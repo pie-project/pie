@@ -172,16 +172,6 @@ bool graph_single_gpu_argmax_enabled() {
     return enabled;
 }
 
-int mtp_draft_tokens(int configured_drafts) {
-    static const int forced = [] {
-        const char* v = std::getenv("PIE_MTP_DRAFT_TOKENS");
-        if (v == nullptr || v[0] == '\0') return 0;
-        return std::clamp(std::atoi(v), 1, 16);
-    }();
-    if (forced > 0) return forced;
-    return std::clamp(std::max(1, configured_drafts), 1, 16);
-}
-
 int qwen35_small_spec_graph_tokens() {
     static const int tokens = [] {
         const char* v = std::getenv("PIE_QWEN35_SPEC_VERIFY_GRAPH_N");
@@ -504,7 +494,7 @@ cudaGraphExec_t capture_mtp_graph_exec(
     CUDA_CHECK(cudaStreamCreateWithFlags(&cstream, cudaStreamNonBlocking));
     executor.cublas.set_stream(cstream);
     CUDA_CHECK(cudaStreamBeginCapture(cstream, cudaStreamCaptureModeRelaxed));
-    executor.forward_fn.mtp(
+    executor.system_drafter.draft_step(
         executor.ws, executor.kv_cache, executor.cublas,
         token_ids,
         positions,
@@ -513,8 +503,13 @@ cudaGraphExec_t capture_mtp_graph_exec(
         pi.kv_page_indices.data(),
         pi.kv_page_indptr.data(),
         pi.kv_last_page_lens.data(),
+        executor.system_drafter.draft_step_writes_sampled_tokens
+            ? reinterpret_cast<std::int32_t*>(pi.sampled.data())
+            : nullptr,
         rows, draft_step, max_global_tokens);
-    launch_mtp_argmax(executor, rows, cstream);
+    if (!executor.system_drafter.draft_step_writes_sampled_tokens) {
+        launch_mtp_argmax(executor, rows, cstream);
+    }
     cudaGraph_t graph = nullptr;
     CUDA_CHECK(cudaStreamEndCapture(cstream, &graph));
     executor.cublas.set_stream(nullptr);
@@ -543,7 +538,7 @@ cudaGraphExec_t capture_mtp_chain_graph_exec(
     for (int draft = 0; draft < drafts; ++draft) {
         const std::size_t offset =
             static_cast<std::size_t>(draft) * static_cast<std::size_t>(rows);
-        executor.forward_fn.mtp(
+        executor.system_drafter.draft_step(
             executor.ws, executor.kv_cache, executor.cublas,
             reinterpret_cast<const std::int32_t*>(pi.tokens.data() + offset),
             reinterpret_cast<const std::int32_t*>(pi.positions.data() + offset),
@@ -552,8 +547,13 @@ cudaGraphExec_t capture_mtp_chain_graph_exec(
             pi.kv_page_indices.data(),
             pi.kv_page_indptr.data(),
             pi.kv_last_page_lens.data(),
+            executor.system_drafter.draft_step_writes_sampled_tokens
+                ? reinterpret_cast<std::int32_t*>(pi.sampled.data())
+                : nullptr,
             rows, draft, max_global_tokens);
-        launch_mtp_argmax(executor, rows, cstream);
+        if (!executor.system_drafter.draft_step_writes_sampled_tokens) {
+            launch_mtp_argmax(executor, rows, cstream);
+        }
         CUDA_CHECK(cudaMemcpyAsync(
             pi.tokens.data() + offset + static_cast<std::size_t>(rows),
             pi.sampled.data(),
@@ -658,7 +658,7 @@ void run_mtp_draft_with_argmax(
             request_ids, rows, draft_step, max_global_tokens)) {
         return;
     }
-    executor.forward_fn.mtp(
+    executor.system_drafter.draft_step(
         executor.ws, executor.kv_cache, executor.cublas,
         token_ids,
         positions,
@@ -667,8 +667,13 @@ void run_mtp_draft_with_argmax(
         pi.kv_page_indices.data(),
         pi.kv_page_indptr.data(),
         pi.kv_last_page_lens.data(),
+        executor.system_drafter.draft_step_writes_sampled_tokens
+            ? reinterpret_cast<std::int32_t*>(pi.sampled.data())
+            : nullptr,
         rows, draft_step, max_global_tokens);
-    launch_mtp_argmax(executor, rows, executor.cublas.stream());
+    if (!executor.system_drafter.draft_step_writes_sampled_tokens) {
+        launch_mtp_argmax(executor, rows, executor.cublas.stream());
+    }
 }
 
 void run_mtp_draft_with_argmax(
@@ -682,6 +687,256 @@ void run_mtp_draft_with_argmax(
         pi.sample_idx.data(),
         pi.mtp_request_ids.data(),
         rows, draft_step, max_global_tokens);
+}
+
+void tp_broadcast_mtp_inputs(NcclComm& comm, PersistentInputs& pi,
+                             int num_tokens, int draft_step,
+                             cudaStream_t stream);
+int tensor_rows(const DeviceTensor& t);
+void tp_cpu_gate_notify(const std::string& key);
+
+void run_step_chained_system_drafter(
+    Executor& executor,
+    std::span<const SystemSpecDraftRequest> requests,
+    std::span<pie_driver::PerRequestOutput> per_req,
+    bool mtp_global_cache)
+{
+    const int max_drafts = executor.system_drafter.max_drafts;
+    if (max_drafts <= 0 || requests.empty() ||
+        !executor.system_drafter.draft_step) {
+        return;
+    }
+
+    auto& pi = executor.inputs;
+    auto& ws = executor.ws;
+    auto& cublas = executor.cublas;
+
+    std::vector<std::uint32_t> mtp_tokens;
+    std::vector<std::int32_t> mtp_rows;
+    std::vector<std::uint32_t> mtp_input_pos;
+    std::vector<std::uint32_t> mtp_output_pos;
+    std::vector<int> mtp_requests;
+    mtp_tokens.reserve(requests.size());
+    mtp_rows.reserve(requests.size());
+    mtp_input_pos.reserve(requests.size());
+    mtp_output_pos.reserve(requests.size());
+    mtp_requests.reserve(requests.size());
+
+    const int draft_position_offset =
+        executor.system_drafter.draft_position_offset;
+    const bool prefix_global =
+        executor.system_drafter.draft_global_cache_uses_prefix_position;
+    for (const auto& req : requests) {
+        if (req.request_index < 0 ||
+            req.request_index >= static_cast<int>(per_req.size()) ||
+            req.source_row < 0) {
+            continue;
+        }
+        const std::uint64_t input_pos64 =
+            static_cast<std::uint64_t>(req.source_position) +
+            static_cast<std::uint64_t>(std::max(0, draft_position_offset));
+        if (input_pos64 > std::numeric_limits<std::uint32_t>::max()) {
+            continue;
+        }
+        mtp_tokens.push_back(req.accepted_token);
+        mtp_rows.push_back(req.source_row);
+        mtp_input_pos.push_back(static_cast<std::uint32_t>(input_pos64));
+        mtp_output_pos.push_back(req.first_draft_position);
+        mtp_requests.push_back(req.request_index);
+    }
+
+    const int S = static_cast<int>(mtp_tokens.size());
+    if (S <= 0) return;
+    if (S > tensor_rows(ws.logits)) {
+        throw std::runtime_error(
+            "MTP draft rows exceed logits workspace capacity");
+    }
+    if (static_cast<std::size_t>(S) *
+            static_cast<std::size_t>(max_drafts) >
+        static_cast<std::size_t>(tensor_rows(ws.k))) {
+        throw std::runtime_error(
+            "MTP draft history exceeds workspace capacity");
+    }
+
+    std::vector<std::int32_t> mtp_request_ids(static_cast<std::size_t>(S));
+    std::vector<std::int32_t> chained_rows(static_cast<std::size_t>(S));
+    for (int i = 0; i < S; ++i) {
+        mtp_request_ids[static_cast<std::size_t>(i)] =
+            static_cast<std::int32_t>(mtp_requests[static_cast<std::size_t>(i)]);
+        chained_rows[static_cast<std::size_t>(i)] = i;
+    }
+
+    const std::size_t s_sz = static_cast<std::size_t>(S);
+    const std::size_t drafts_sz = static_cast<std::size_t>(max_drafts);
+    const bool gpu_chain_capacity =
+        s_sz * (drafts_sz + 1) <= pi.tokens.size() &&
+        s_sz * drafts_sz <= pi.positions.size() &&
+        s_sz * drafts_sz <= pi.sample_idx.size() &&
+        s_sz * drafts_sz <= pi.tokens.size();
+    const bool gpu_chain =
+        executor.tp_comm == nullptr && !mtp_trace_enabled() &&
+        gpu_chain_capacity;
+
+    if (gpu_chain) {
+        StepProfileTimer mtp_timer(
+            "mtp_draft_chain", cublas.stream(),
+            static_cast<int>(s_sz * drafts_sz), S);
+        std::vector<std::uint32_t> mtp_positions_flat(s_sz * drafts_sz);
+        std::vector<std::int32_t> mtp_rows_flat(s_sz * drafts_sz);
+        std::vector<int> mtp_max_global_tokens(drafts_sz, 0);
+        int mtp_max_observed_global_tokens = 0;
+        for (int draft = 0; draft < max_drafts; ++draft) {
+            int max_global_tokens = 0;
+            for (int i = 0; i < S; ++i) {
+                const std::uint32_t input_pos =
+                    mtp_input_pos[static_cast<std::size_t>(i)] +
+                    static_cast<std::uint32_t>(draft);
+                const std::size_t flat =
+                    static_cast<std::size_t>(draft) * s_sz +
+                    static_cast<std::size_t>(i);
+                mtp_positions_flat[flat] = input_pos;
+                mtp_rows_flat[flat] =
+                    draft == 0
+                        ? mtp_rows[static_cast<std::size_t>(i)]
+                        : chained_rows[static_cast<std::size_t>(i)];
+                if (mtp_global_cache) {
+                    const int global_tokens = std::max(
+                        0,
+                        static_cast<int>(input_pos) -
+                            (prefix_global ? draft : 0));
+                    max_global_tokens = std::max(
+                        max_global_tokens, global_tokens);
+                }
+            }
+            mtp_max_global_tokens[static_cast<std::size_t>(draft)] =
+                max_global_tokens;
+            mtp_max_observed_global_tokens = std::max(
+                mtp_max_observed_global_tokens, max_global_tokens);
+        }
+
+        pi.tokens.copy_from_host(std::span<const std::uint32_t>(mtp_tokens));
+        pi.positions.copy_from_host(
+            std::span<const std::uint32_t>(mtp_positions_flat));
+        pi.sample_idx.copy_from_host(
+            std::span<const std::int32_t>(mtp_rows_flat));
+        pi.mtp_request_ids.copy_from_host(
+            std::span<const std::int32_t>(mtp_request_ids));
+
+        if (!try_run_mtp_chain_graph_with_argmax(
+                executor, S, max_drafts, mtp_max_observed_global_tokens)) {
+            for (int draft = 0; draft < max_drafts; ++draft) {
+                const std::size_t offset =
+                    static_cast<std::size_t>(draft) * s_sz;
+                run_mtp_draft_with_argmax(
+                    executor,
+                    reinterpret_cast<const std::int32_t*>(
+                        pi.tokens.data() + offset),
+                    reinterpret_cast<const std::int32_t*>(
+                        pi.positions.data() + offset),
+                    pi.sample_idx.data() + offset,
+                    pi.mtp_request_ids.data(),
+                    S, draft,
+                    mtp_max_global_tokens[static_cast<std::size_t>(draft)]);
+                CUDA_CHECK(cudaMemcpyAsync(
+                    pi.tokens.data() + offset + s_sz, pi.sampled.data(),
+                    sizeof(std::uint32_t) * s_sz,
+                    cudaMemcpyDeviceToDevice, cublas.stream()));
+            }
+        }
+
+        std::vector<std::uint32_t> mtp_sampled_flat(s_sz * drafts_sz);
+        CUDA_CHECK(cudaMemcpyAsync(
+            mtp_sampled_flat.data(), pi.tokens.data() + s_sz,
+            sizeof(std::uint32_t) * s_sz * drafts_sz,
+            cudaMemcpyDeviceToHost, cublas.stream()));
+        mtp_timer.finish(cublas.stream());
+        CUDA_CHECK(cudaStreamSynchronize(cublas.stream()));
+
+        for (int draft = 0; draft < max_drafts; ++draft) {
+            for (int i = 0; i < S; ++i) {
+                auto& out = per_req[static_cast<std::size_t>(
+                    mtp_requests[static_cast<std::size_t>(i)])];
+                const std::size_t flat =
+                    static_cast<std::size_t>(draft) * s_sz +
+                    static_cast<std::size_t>(i);
+                out.spec_tokens.push_back(mtp_sampled_flat[flat]);
+                out.spec_positions.push_back(
+                    mtp_output_pos[static_cast<std::size_t>(i)] +
+                    static_cast<std::uint32_t>(draft));
+            }
+        }
+        return;
+    }
+
+    std::vector<std::int32_t> mtp_sampled(static_cast<std::size_t>(S));
+    for (int draft = 0; draft < max_drafts; ++draft) {
+        int max_global_tokens = 0;
+        if (mtp_global_cache) {
+            for (auto pos : mtp_input_pos) {
+                const int global_tokens =
+                    std::max(0,
+                             static_cast<int>(pos) -
+                                 (prefix_global ? draft : 0));
+                max_global_tokens =
+                    std::max(max_global_tokens, global_tokens);
+            }
+        }
+        pi.tokens.copy_from_host(std::span<const std::uint32_t>(mtp_tokens));
+        pi.positions.copy_from_host(
+            std::span<const std::uint32_t>(mtp_input_pos));
+        pi.sample_idx.copy_from_host(std::span<const std::int32_t>(mtp_rows));
+        pi.mtp_request_ids.copy_from_host(
+            std::span<const std::int32_t>(mtp_request_ids));
+        if (executor.tp_comm != nullptr) {
+            tp_cpu_gate_notify(executor.tp_cpu_gate_key);
+            tp_broadcast_mtp_inputs(
+                *executor.tp_comm, pi, S, draft, /*stream=*/nullptr);
+        }
+        run_mtp_draft_with_argmax(executor, S, draft, max_global_tokens);
+        CUDA_CHECK(cudaMemcpyAsync(
+            mtp_sampled.data(), pi.sampled.data(),
+            sizeof(std::int32_t) * static_cast<std::size_t>(S),
+            cudaMemcpyDeviceToHost, cublas.stream()));
+        CUDA_CHECK(cudaStreamSynchronize(cublas.stream()));
+        if (mtp_trace_take()) {
+            std::cerr << "[pie-mtp-trace] draft_step=" << draft
+                      << " rows=" << S << " in_tok=[";
+            for (int i = 0; i < S; ++i) {
+                if (i) std::cerr << ",";
+                std::cerr << mtp_tokens[static_cast<std::size_t>(i)];
+            }
+            std::cerr << "] in_pos=[";
+            for (int i = 0; i < S; ++i) {
+                if (i) std::cerr << ",";
+                std::cerr << mtp_input_pos[static_cast<std::size_t>(i)];
+            }
+            std::cerr << "] out_pos=[";
+            for (int i = 0; i < S; ++i) {
+                if (i) std::cerr << ",";
+                std::cerr << mtp_output_pos[static_cast<std::size_t>(i)];
+            }
+            std::cerr << "] out_tok=[";
+            for (int i = 0; i < S; ++i) {
+                if (i) std::cerr << ",";
+                std::cerr << mtp_sampled[static_cast<std::size_t>(i)];
+            }
+            std::cerr << "]\n";
+        }
+        for (int i = 0; i < S; ++i) {
+            auto& out = per_req[static_cast<std::size_t>(
+                mtp_requests[static_cast<std::size_t>(i)])];
+            const auto sampled =
+                static_cast<std::uint32_t>(
+                    mtp_sampled[static_cast<std::size_t>(i)]);
+            out.spec_tokens.push_back(sampled);
+            out.spec_positions.push_back(
+                mtp_output_pos[static_cast<std::size_t>(i)]);
+            mtp_tokens[static_cast<std::size_t>(i)] = sampled;
+            mtp_input_pos[static_cast<std::size_t>(i)] += 1u;
+            mtp_output_pos[static_cast<std::size_t>(i)] += 1;
+        }
+        mtp_rows = chained_rows;
+    }
 }
 
 std::vector<int> forward_graph_request_lattice(int max_requests) {
@@ -1071,6 +1326,10 @@ void tp_broadcast_mtp_inputs(NcclComm& comm, PersistentInputs& pi,
                                  static_cast<std::size_t>(num_tokens) * 4,
                                  ncclChar, 0, comm.comm(), stream));
         NCCL_CHECK(ncclBroadcast(pi.sample_idx.data(), pi.sample_idx.data(),
+                                 static_cast<std::size_t>(num_tokens) * 4,
+                                 ncclChar, 0, comm.comm(), stream));
+        NCCL_CHECK(ncclBroadcast(pi.mtp_request_ids.data(),
+                                 pi.mtp_request_ids.data(),
                                  static_cast<std::size_t>(num_tokens) * 4,
                                  ncclChar, 0, comm.comm(), stream));
     }
@@ -1592,10 +1851,14 @@ void handle_fire_batch(
         // upload stable device inputs once and launch sampling after the
         // forward body has produced logits.
         const auto outspec_view = view.output_spec_flags.as<std::uint8_t>();
-        bool need_msgpack = false;
+        bool has_msgpack_only_slots = false;
         for (auto t : types_view) {
-            if (pie_cuda_driver::is_msgpack_only(t)) { need_msgpack = true; break; }
+            if (pie_cuda_driver::is_msgpack_only(t)) {
+                has_msgpack_only_slots = true;
+                break;
+            }
         }
+        bool need_msgpack = has_msgpack_only_slots;
         if (!need_msgpack) {
             for (auto f : outspec_view) {
                 if (f) { need_msgpack = true; break; }
@@ -1757,7 +2020,7 @@ void handle_fire_batch(
             executor.forward_fn.supports_compact_logits &&
             !is_pure_decode &&
             !have_custom_mask &&
-            !need_msgpack &&
+            !has_msgpack_only_slots &&
             !has_spec_drafts &&
             logit_masks_view.empty() &&
             !any_topk_topp &&
@@ -2117,23 +2380,18 @@ void handle_fire_batch(
                 static_cast<std::size_t>(R), -1);
             std::vector<std::int32_t> mtp_base_rows(
                 static_cast<std::size_t>(R), -1);
-            std::vector<std::uint32_t> mtp_input_positions(
-                static_cast<std::size_t>(R), 0);
             std::vector<std::uint32_t> mtp_draft_positions(
                 static_cast<std::size_t>(R), 0);
             auto remember_mtp_source = [&](int r, std::uint32_t row) {
                 if (r < 0 || r >= R) return;
                 if (row >= static_cast<std::uint32_t>(N)) return;
                 const std::uint64_t source_pos = pos_view[row];
-                const std::uint64_t input_pos = source_pos + 1ull;
                 const std::uint64_t draft_pos = source_pos + 2ull;
                 if (draft_pos > std::numeric_limits<std::uint32_t>::max()) {
                     return;
                 }
                 mtp_base_rows[static_cast<std::size_t>(r)] =
                     static_cast<std::int32_t>(row);
-                mtp_input_positions[static_cast<std::size_t>(r)] =
-                    static_cast<std::uint32_t>(input_pos);
                 mtp_draft_positions[static_cast<std::size_t>(r)] =
                     static_cast<std::uint32_t>(draft_pos);
             };
@@ -2221,8 +2479,8 @@ void handle_fire_batch(
                     }
                 }
             }
-            if (!forward_fn.mtp && executor.system_speculator) {
-                std::vector<SystemSpecDraftRequest> system_draft_requests;
+            std::vector<SystemSpecDraftRequest> system_draft_requests;
+            if (executor.system_drafter) {
                 system_draft_requests.reserve(static_cast<std::size_t>(R));
                 for (int r = 0; r < R; ++r) {
                     const bool wants_spec =
@@ -2256,31 +2514,11 @@ void handle_fire_batch(
                         .last_num_drafts = last_num_drafts,
                     });
                 }
-                if (!system_draft_requests.empty()) {
-                    StepProfileTimer system_spec_timer(
-                        "system_speculator", cublas.stream(),
-                        static_cast<int>(system_draft_requests.size()), R);
-                    executor.system_speculator(
-                        SystemSpecDraftInputs{
-                            .target_ws = ws,
-                            .kv_cache = kv_cache,
-                            .attn_ws = attn_ws,
-                            .cublas = cublas,
-                            .requests =
-                                std::span<const SystemSpecDraftRequest>(
-                                    system_draft_requests.data(),
-                                    system_draft_requests.size()),
-                            .kv_page_indices = kvpi_view,
-                            .kv_page_indptr = kvpp_view,
-                            .page_size = kv_cache.page_size(),
-                            .max_drafts = executor.system_speculator_max_drafts,
-                        },
-                        std::span<pie_driver::PerRequestOutput>(
-                            per_req.data(), per_req.size()));
-                    system_spec_timer.finish(cublas.stream());
-                }
             }
-            if (forward_fn.mtp) {
+
+            bool native_commit_cache = false;
+            if (!system_draft_requests.empty() &&
+                executor.system_drafter.commit_verified_prefix) {
                 std::vector<std::uint32_t> mtp_commit_tokens;
                 std::vector<std::uint32_t> mtp_commit_positions;
                 std::vector<std::uint32_t> mtp_commit_qo(
@@ -2346,10 +2584,10 @@ void handle_fire_batch(
                 mtp_commit_qo[static_cast<std::size_t>(R)] =
                     static_cast<std::uint32_t>(mtp_commit_tokens.size());
 
-                const bool mtp_global_cache =
-                    executor.tp_comm == nullptr && forward_fn.mtp_process &&
+                native_commit_cache =
+                    executor.tp_comm == nullptr &&
                     !mtp_commit_tokens.empty();
-                if (mtp_global_cache) {
+                if (native_commit_cache) {
                     pi.tokens.copy_from_host(
                         std::span<const std::uint32_t>(mtp_commit_tokens));
                     pi.positions.copy_from_host(
@@ -2364,265 +2602,70 @@ void handle_fire_batch(
                         "commit", cublas.stream(),
                         static_cast<int>(mtp_commit_tokens.size()), R,
                         [&] {
-                            forward_fn.mtp_process(
-                                ws, kv_cache, cublas,
-                                reinterpret_cast<const std::int32_t*>(
-                                    pi.tokens.data()),
-                                reinterpret_cast<const std::int32_t*>(
-                                    pi.positions.data()),
-                                pi.qo_indptr.data(), pi.kv_page_indices.data(),
-                                pi.kv_page_indptr.data(),
-                                pi.kv_last_page_lens.data(),
-                                use_slots ? pi.slot_ids.data() : nullptr,
-                                pi.sample_idx.data(),
-                                static_cast<int>(mtp_commit_tokens.size()), R);
+                            executor.system_drafter.commit_verified_prefix(
+                                NativeSystemCommitInputs{
+                                    .target_ws = ws,
+                                    .kv_cache = kv_cache,
+                                    .cublas = cublas,
+                                    .token_ids =
+                                        reinterpret_cast<const std::int32_t*>(
+                                            pi.tokens.data()),
+                                    .positions =
+                                        reinterpret_cast<const std::int32_t*>(
+                                            pi.positions.data()),
+                                    .qo_indptr = pi.qo_indptr.data(),
+                                    .kv_page_indices =
+                                        pi.kv_page_indices.data(),
+                                    .kv_page_indptr =
+                                        pi.kv_page_indptr.data(),
+                                    .kv_last_page_lens =
+                                        pi.kv_last_page_lens.data(),
+                                    .slot_ids =
+                                        use_slots ? pi.slot_ids.data()
+                                                  : nullptr,
+                                    .source_row_indices = pi.sample_idx.data(),
+                                    .total_tokens =
+                                        static_cast<int>(
+                                            mtp_commit_tokens.size()),
+                                    .num_requests = R,
+                                });
                         });
                 }
+            }
 
-                std::vector<std::uint32_t> mtp_tokens;
-                std::vector<std::int32_t> mtp_rows;
-                std::vector<std::uint32_t> mtp_input_pos;
-                std::vector<std::uint32_t> mtp_output_pos;
-                std::vector<int> mtp_requests;
-                mtp_tokens.reserve(static_cast<std::size_t>(R));
-                mtp_rows.reserve(static_cast<std::size_t>(R));
-                mtp_input_pos.reserve(static_cast<std::size_t>(R));
-                mtp_output_pos.reserve(static_cast<std::size_t>(R));
-                mtp_requests.reserve(static_cast<std::size_t>(R));
-
-                for (int r = 0; r < R; ++r) {
-                    const bool wants_spec =
-                        r < static_cast<int>(outspec_view.size()) &&
-                        outspec_view[r] != 0;
-                    if (!wants_spec) continue;
-                    const auto& bucket = per_req[static_cast<std::size_t>(r)].tokens;
-                    if (bucket.empty()) continue;
-                    const std::int32_t row =
-                        mtp_base_rows[static_cast<std::size_t>(r)];
-                    if (row < 0) continue;
-                    mtp_tokens.push_back(bucket.back());
-                    mtp_rows.push_back(row);
-                    mtp_input_pos.push_back(
-                        mtp_input_positions[static_cast<std::size_t>(r)]);
-                    mtp_output_pos.push_back(
-                        mtp_draft_positions[static_cast<std::size_t>(r)]);
-                    mtp_requests.push_back(r);
-                }
-
-                const int S = static_cast<int>(mtp_tokens.size());
-                if (S > 0) {
-                    if (S > tensor_rows(ws.logits)) {
-                        throw std::runtime_error(
-                            "MTP draft rows exceed logits workspace capacity");
-                    }
-                    const int max_drafts =
-                        mtp_draft_tokens(forward_fn.mtp_num_drafts);
-                    if (static_cast<std::size_t>(S) *
-                            static_cast<std::size_t>(max_drafts) >
-                        static_cast<std::size_t>(tensor_rows(ws.k))) {
-                        throw std::runtime_error(
-                            "MTP draft history exceeds workspace capacity");
-                    }
-                    std::vector<std::int32_t> mtp_request_ids(
-                        static_cast<std::size_t>(S));
-                    std::vector<std::int32_t> chained_rows(
-                        static_cast<std::size_t>(S));
-                    for (int i = 0; i < S; ++i) {
-                        mtp_request_ids[static_cast<std::size_t>(i)] =
-                            static_cast<std::int32_t>(
-                                mtp_requests[static_cast<std::size_t>(i)]);
-                        chained_rows[static_cast<std::size_t>(i)] = i;
-                    }
-
-                    const std::size_t s_sz = static_cast<std::size_t>(S);
-                    const std::size_t drafts_sz =
-                        static_cast<std::size_t>(max_drafts);
-                    const bool gpu_chain_capacity =
-                        s_sz * (drafts_sz + 1) <= pi.tokens.size() &&
-                        s_sz * drafts_sz <= pi.positions.size() &&
-                        s_sz * drafts_sz <= pi.sample_idx.size() &&
-                        s_sz * drafts_sz <= pi.tokens.size();
-                    const bool gpu_chain =
-                        executor.tp_comm == nullptr && !mtp_trace_enabled() &&
-                        gpu_chain_capacity;
-
-                    if (gpu_chain) {
-                        StepProfileTimer mtp_timer(
-                            "mtp_draft_chain", cublas.stream(),
-                            static_cast<int>(s_sz * drafts_sz), S);
-                        std::vector<std::uint32_t> mtp_positions_flat(
-                            s_sz * drafts_sz);
-                        std::vector<std::int32_t> mtp_rows_flat(
-                            s_sz * drafts_sz);
-                        std::vector<int> mtp_max_global_tokens(drafts_sz, 0);
-                        int mtp_max_observed_global_tokens = 0;
-                        for (int draft = 0; draft < max_drafts; ++draft) {
-                            int max_global_tokens = 0;
-                            for (int i = 0; i < S; ++i) {
-                                const std::uint32_t input_pos =
-                                    draft == 0
-                                        ? mtp_input_pos[static_cast<std::size_t>(i)]
-                                        : mtp_output_pos[static_cast<std::size_t>(i)] +
-                                              static_cast<std::uint32_t>(draft - 1);
-                                const std::size_t flat =
-                                    static_cast<std::size_t>(draft) * s_sz +
-                                    static_cast<std::size_t>(i);
-                                mtp_positions_flat[flat] = input_pos;
-                                mtp_rows_flat[flat] =
-                                    draft == 0
-                                        ? mtp_rows[static_cast<std::size_t>(i)]
-                                        : chained_rows[static_cast<std::size_t>(i)];
-                                if (mtp_global_cache) {
-                                    max_global_tokens = std::max(
-                                        max_global_tokens,
-                                        static_cast<int>(input_pos));
-                                }
-                            }
-                            mtp_max_global_tokens[static_cast<std::size_t>(draft)] =
-                                max_global_tokens;
-                            mtp_max_observed_global_tokens = std::max(
-                                mtp_max_observed_global_tokens, max_global_tokens);
-                        }
-
-                        pi.tokens.copy_from_host(
-                            std::span<const std::uint32_t>(mtp_tokens));
-                        pi.positions.copy_from_host(
-                            std::span<const std::uint32_t>(mtp_positions_flat));
-                        pi.sample_idx.copy_from_host(
-                            std::span<const std::int32_t>(mtp_rows_flat));
-                        pi.mtp_request_ids.copy_from_host(
-                            std::span<const std::int32_t>(mtp_request_ids));
-
-                        if (!try_run_mtp_chain_graph_with_argmax(
-                                executor, S, max_drafts,
-                                mtp_max_observed_global_tokens)) {
-                            for (int draft = 0; draft < max_drafts; ++draft) {
-                                const std::size_t offset =
-                                    static_cast<std::size_t>(draft) * s_sz;
-                                run_mtp_draft_with_argmax(
-                                    executor,
-                                    reinterpret_cast<const std::int32_t*>(
-                                        pi.tokens.data() + offset),
-                                    reinterpret_cast<const std::int32_t*>(
-                                        pi.positions.data() + offset),
-                                    pi.sample_idx.data() + offset,
-                                    pi.mtp_request_ids.data(),
-                                    S, draft,
-                                    mtp_max_global_tokens[
-                                        static_cast<std::size_t>(draft)]);
-                                CUDA_CHECK(cudaMemcpyAsync(
-                                    pi.tokens.data() + offset + s_sz,
-                                    pi.sampled.data(),
-                                    sizeof(std::uint32_t) * s_sz,
-                                    cudaMemcpyDeviceToDevice, cublas.stream()));
-                            }
-                        }
-
-                        std::vector<std::uint32_t> mtp_sampled_flat(
-                            s_sz * drafts_sz);
-                        CUDA_CHECK(cudaMemcpyAsync(
-                            mtp_sampled_flat.data(), pi.tokens.data() + s_sz,
-                            sizeof(std::uint32_t) * s_sz * drafts_sz,
-                            cudaMemcpyDeviceToHost, cublas.stream()));
-                        mtp_timer.finish(cublas.stream());
-                        CUDA_CHECK(cudaStreamSynchronize(cublas.stream()));
-
-                        for (int draft = 0; draft < max_drafts; ++draft) {
-                            for (int i = 0; i < S; ++i) {
-                                auto& out = per_req[static_cast<std::size_t>(
-                                    mtp_requests[static_cast<std::size_t>(i)])];
-                                const std::size_t flat =
-                                    static_cast<std::size_t>(draft) * s_sz +
-                                    static_cast<std::size_t>(i);
-                                out.spec_tokens.push_back(
-                                    mtp_sampled_flat[flat]);
-                                out.spec_positions.push_back(
-                                    mtp_output_pos[static_cast<std::size_t>(i)] +
-                                    static_cast<std::uint32_t>(draft));
-                            }
-                        }
-                    } else {
-                        std::vector<std::int32_t> mtp_sampled(
-                            static_cast<std::size_t>(S));
-                        for (int draft = 0; draft < max_drafts; ++draft) {
-                            int max_global_tokens = 0;
-                            if (mtp_global_cache) {
-                                for (auto pos : mtp_input_pos) {
-                                    max_global_tokens = std::max(
-                                        max_global_tokens,
-                                        static_cast<int>(pos));
-                                }
-                            }
-                            pi.tokens.copy_from_host(
-                                std::span<const std::uint32_t>(mtp_tokens));
-                            pi.positions.copy_from_host(
-                                std::span<const std::uint32_t>(mtp_input_pos));
-                            pi.sample_idx.copy_from_host(
-                                std::span<const std::int32_t>(mtp_rows));
-                            pi.mtp_request_ids.copy_from_host(
-                                std::span<const std::int32_t>(mtp_request_ids));
-                            if (executor.tp_comm != nullptr) {
-                                tp_cpu_gate_notify(executor.tp_cpu_gate_key);
-                                tp_broadcast_mtp_inputs(
-                                    *executor.tp_comm, pi, S, draft,
-                                    /*stream=*/nullptr);
-                            }
-                            run_mtp_draft_with_argmax(
-                                executor, S, draft, max_global_tokens);
-                            CUDA_CHECK(cudaMemcpyAsync(
-                                mtp_sampled.data(), pi.sampled.data(),
-                                sizeof(std::int32_t) *
-                                    static_cast<std::size_t>(S),
-                                cudaMemcpyDeviceToHost, cublas.stream()));
-                            CUDA_CHECK(cudaStreamSynchronize(cublas.stream()));
-                            if (mtp_trace_take()) {
-                                std::cerr << "[pie-mtp-trace] draft_step="
-                                          << draft << " rows=" << S
-                                          << " in_tok=[";
-                                for (int i = 0; i < S; ++i) {
-                                    if (i) std::cerr << ",";
-                                    std::cerr << mtp_tokens[
-                                        static_cast<std::size_t>(i)];
-                                }
-                                std::cerr << "] in_pos=[";
-                                for (int i = 0; i < S; ++i) {
-                                    if (i) std::cerr << ",";
-                                    std::cerr << mtp_input_pos[
-                                        static_cast<std::size_t>(i)];
-                                }
-                                std::cerr << "] out_pos=[";
-                                for (int i = 0; i < S; ++i) {
-                                    if (i) std::cerr << ",";
-                                    std::cerr << mtp_output_pos[
-                                        static_cast<std::size_t>(i)];
-                                }
-                                std::cerr << "] out_tok=[";
-                                for (int i = 0; i < S; ++i) {
-                                    if (i) std::cerr << ",";
-                                    std::cerr << mtp_sampled[
-                                        static_cast<std::size_t>(i)];
-                                }
-                                std::cerr << "]\n";
-                            }
-                            for (int i = 0; i < S; ++i) {
-                                auto& out = per_req[static_cast<std::size_t>(
-                                    mtp_requests[static_cast<std::size_t>(i)])];
-                                const auto sampled =
-                                    static_cast<std::uint32_t>(
-                                        mtp_sampled[static_cast<std::size_t>(i)]);
-                                out.spec_tokens.push_back(sampled);
-                                out.spec_positions.push_back(
-                                    mtp_output_pos[static_cast<std::size_t>(i)]);
-                                mtp_tokens[static_cast<std::size_t>(i)] =
-                                    sampled;
-                                mtp_input_pos[static_cast<std::size_t>(i)] =
-                                    mtp_output_pos[static_cast<std::size_t>(i)];
-                                mtp_output_pos[static_cast<std::size_t>(i)] += 1;
-                            }
-                            mtp_rows = chained_rows;
-                        }
-                    }
-                }
+            if (!system_draft_requests.empty() &&
+                executor.system_drafter.draft_next) {
+                StepProfileTimer system_spec_timer(
+                    "system_drafter", cublas.stream(),
+                    static_cast<int>(system_draft_requests.size()), R);
+                executor.system_drafter.draft_next(
+                    SystemSpecDraftInputs{
+                        .target_ws = ws,
+                        .kv_cache = kv_cache,
+                        .attn_ws = attn_ws,
+                        .cublas = cublas,
+                        .requests =
+                            std::span<const SystemSpecDraftRequest>(
+                                system_draft_requests.data(),
+                                system_draft_requests.size()),
+                        .kv_page_indices = kvpi_view,
+                        .kv_page_indptr = kvpp_view,
+                        .page_size = kv_cache.page_size(),
+                        .max_drafts = executor.system_drafter.max_drafts,
+                    },
+                    std::span<pie_driver::PerRequestOutput>(
+                        per_req.data(), per_req.size()));
+                system_spec_timer.finish(cublas.stream());
+            } else if (!system_draft_requests.empty() &&
+                       executor.system_drafter.draft_step) {
+                run_step_chained_system_drafter(
+                    executor,
+                    std::span<const SystemSpecDraftRequest>(
+                        system_draft_requests.data(),
+                        system_draft_requests.size()),
+                    std::span<pie_driver::PerRequestOutput>(
+                        per_req.data(), per_req.size()),
+                    native_commit_cache);
             }
             if (rs_spec_rollback.enabled) {
                 const int accepted = spec_accepted_drafts.empty()
@@ -2760,23 +2803,34 @@ void handle_fire_batch(
                             repair_slots.data(), repair_fresh.data(),
                             pi.slot_ids.data(),
                             nullptr, 0, false);
-                        if (executor.tp_comm == nullptr &&
-                            forward_fn.mtp_process) {
+                        if (!native_commit_cache &&
+                            executor.tp_comm == nullptr &&
+                            executor.system_drafter.commit_verified_prefix) {
                             profile_mtp_process_call(
                                 "repair", cublas.stream(), replay_N, 1, [&] {
-                                    forward_fn.mtp_process(
-                                        ws, kv_cache, cublas,
-                                        reinterpret_cast<const std::int32_t*>(
-                                            pi.tokens.data()),
-                                        reinterpret_cast<const std::int32_t*>(
-                                            pi.positions.data()),
-                                        pi.qo_indptr.data(),
-                                        pi.kv_page_indices.data(),
-                                        pi.kv_page_indptr.data(),
-                                        pi.kv_last_page_lens.data(),
-                                        pi.slot_ids.data(),
-                                        /*source_row_indices=*/nullptr,
-                                        replay_N, 1);
+                                    executor.system_drafter.commit_verified_prefix(
+                                        NativeSystemCommitInputs{
+                                            .target_ws = ws,
+                                            .kv_cache = kv_cache,
+                                            .cublas = cublas,
+                                            .token_ids =
+                                                reinterpret_cast<const std::int32_t*>(
+                                                    pi.tokens.data()),
+                                            .positions =
+                                                reinterpret_cast<const std::int32_t*>(
+                                                    pi.positions.data()),
+                                            .qo_indptr = pi.qo_indptr.data(),
+                                            .kv_page_indices =
+                                                pi.kv_page_indices.data(),
+                                            .kv_page_indptr =
+                                                pi.kv_page_indptr.data(),
+                                            .kv_last_page_lens =
+                                                pi.kv_last_page_lens.data(),
+                                            .slot_ids = pi.slot_ids.data(),
+                                            .source_row_indices = nullptr,
+                                            .total_tokens = replay_N,
+                                            .num_requests = 1,
+                                        });
                                 });
                         }
                         CUDA_CHECK(cudaStreamSynchronize(cublas.stream()));
@@ -2870,10 +2924,14 @@ void tp_follower_serve(Executor& executor, std::atomic<bool>& stop) {
                                          pi.sample_idx.data(),
                                          static_cast<std::size_t>(S) * 4,
                                          ncclChar, 0, comm.comm(), stream));
+                NCCL_CHECK(ncclBroadcast(pi.mtp_request_ids.data(),
+                                         pi.mtp_request_ids.data(),
+                                         static_cast<std::size_t>(S) * 4,
+                                         ncclChar, 0, comm.comm(), stream));
             }
             NCCL_CHECK_ASYNC(ncclGroupEnd(), comm.comm());
-            if (executor.forward_fn.mtp && S > 0) {
-                executor.forward_fn.mtp(
+            if (executor.system_drafter.draft_step && S > 0) {
+                executor.system_drafter.draft_step(
                     executor.ws, executor.kv_cache, executor.cublas,
                     reinterpret_cast<const std::int32_t*>(pi.tokens.data()),
                     reinterpret_cast<const std::int32_t*>(pi.positions.data()),
@@ -2882,6 +2940,7 @@ void tp_follower_serve(Executor& executor, std::atomic<bool>& stop) {
                     pi.kv_page_indices.data(),
                     pi.kv_page_indptr.data(),
                     pi.kv_last_page_lens.data(),
+                    nullptr,
                     S, draft_step, /*max_global_tokens=*/0);
             }
             continue;

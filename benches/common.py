@@ -130,6 +130,8 @@ def print_summary(s: BenchSummary) -> None:
         "last batch latency us",
         "system spec draft tokens proposed",
         "system spec draft tokens accepted",
+        "system spec draft tokens proposed per pos",
+        "system spec draft tokens accepted per pos",
         "bypass hits",
         "chain submits",
         "chain drops",

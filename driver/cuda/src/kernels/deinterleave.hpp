@@ -78,6 +78,15 @@ void launch_split_qwen_gdn_projections_bf16(
     int N, int conv_dim, int v_dim, int v_h,
     cudaStream_t stream);
 
+// Split just Qwen GDN's tiny fused b/a projection:
+//   ba: [N, 2 * v_h] -> b [N, v_h], a [N, v_h]
+void launch_split_qwen_gdn_ba_bf16(
+    const void* ba,
+    void*       b_out,
+    void*       a_out,
+    int N, int v_h,
+    cudaStream_t stream);
+
 // Repeat-interleave KV heads to query heads for the one-token attention
 // case used by MTP. `out[n, qh] = in[n, qh / repeat]`.
 void launch_repeat_interleave_heads_bf16(

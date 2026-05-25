@@ -670,6 +670,14 @@ async def run(args: argparse.Namespace):
                         "default.system_spec_draft_tokens_accepted",
                         "system spec draft tokens accepted",
                     ),
+                    (
+                        "default.system_spec_draft_tokens_proposed_per_pos",
+                        "system spec draft tokens proposed per pos",
+                    ),
+                    (
+                        "default.system_spec_draft_tokens_accepted_per_pos",
+                        "system spec draft tokens accepted per pos",
+                    ),
                     ("default.last_batch_latency_us", "last batch latency us"),
                     ("default.bypass_hits", "bypass hits"),
                     ("default.chain_submits", "chain submits"),

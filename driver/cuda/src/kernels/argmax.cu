@@ -12,6 +12,7 @@ namespace {
 constexpr int BLOCK = 256;
 constexpr int MAX_MASKED_TOP_K = 64;
 constexpr int MASKED_TILE_TOKENS = 8;
+constexpr int LM_HEAD_TILE_TOKENS = 8;
 
 bool argmax_vec2_enabled() {
     static const bool enabled = [] {
@@ -503,6 +504,89 @@ __global__ void masked_embedding_tile_argmax_pairs_bf16_kernel(
     (void)num_tiles;
 }
 
+__global__ void lm_head_argmax_pairs_bf16_kernel(
+    const __nv_bfloat16* __restrict__ hidden_states,
+    const __nv_bfloat16* __restrict__ lm_head_weight,
+    std::uint64_t* __restrict__ partial_pairs,
+    int hidden,
+    int vocab)
+{
+    const int row = blockIdx.x;
+    const int tile = blockIdx.y;
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int tok = tile * LM_HEAD_TILE_TOKENS + warp;
+    const auto* hidden_row =
+        hidden_states + static_cast<long long>(row) * hidden;
+
+    __shared__ float vals[LM_HEAD_TILE_TOKENS];
+    __shared__ int toks[LM_HEAD_TILE_TOKENS];
+
+    float dot = -INFINITY;
+    if (warp < LM_HEAD_TILE_TOKENS && tok < vocab) {
+        const auto* wrow =
+            lm_head_weight + static_cast<long long>(tok) * hidden;
+        float sum = 0.f;
+        for (int h = lane; h < hidden; h += 32) {
+            sum += __bfloat162float(hidden_row[h]) *
+                   __bfloat162float(wrow[h]);
+        }
+        dot = warp_sum(sum);
+    }
+
+    if (lane == 0) {
+        vals[warp] = dot;
+        toks[warp] = tok;
+    }
+    __syncthreads();
+
+    if (threadIdx.x == 0) {
+        float best_val = vals[0];
+        int best_tok = toks[0];
+        for (int i = 1; i < LM_HEAD_TILE_TOKENS; ++i) {
+            update_argmax(vals[i], toks[i], best_val, best_tok);
+        }
+        partial_pairs[static_cast<std::size_t>(tile) * gridDim.x + row] =
+            pack_argmax_pair(best_val, best_tok);
+    }
+}
+
+__device__ __forceinline__ float unpack_argmax_value(std::uint64_t pair) {
+    const std::uint32_t bits = static_cast<std::uint32_t>(pair >> 32);
+    return __uint_as_float(bits);
+}
+
+__device__ __forceinline__ int unpack_argmax_token(std::uint64_t pair) {
+    return static_cast<int>(static_cast<std::uint32_t>(pair));
+}
+
+__global__ void select_lm_head_argmax_pairs_kernel(
+    const std::uint64_t* __restrict__ partial_pairs,
+    std::int32_t* __restrict__ out_tokens,
+    int num_rows,
+    int num_tiles)
+{
+    const int row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= num_rows) return;
+
+    std::uint64_t best_pair = partial_pairs[row];
+    float best_val = unpack_argmax_value(best_pair);
+    int best_tok = unpack_argmax_token(best_pair);
+    for (int tile = 1; tile < num_tiles; ++tile) {
+        const std::uint64_t pair =
+            partial_pairs[static_cast<std::size_t>(tile) * num_rows + row];
+        const float val = unpack_argmax_value(pair);
+        const int tok = unpack_argmax_token(pair);
+        if (val > best_val || (val == best_val && tok < best_tok)) {
+            best_val = val;
+            best_tok = tok;
+            best_pair = pair;
+        }
+    }
+    (void)best_pair;
+    out_tokens[row] = best_tok;
+}
+
 }  // namespace
 
 void launch_argmax_bf16(
@@ -560,6 +644,32 @@ void launch_argmax_bf16_partitioned_pairs(
         argmax_bf16_partitioned_pairs_kernel<<<grid, block, 0, stream>>>(
             static_cast<const __nv_bfloat16*>(logits), partial_pairs, vocab, parts);
     }
+}
+
+void launch_lm_head_argmax_bf16(
+    const void* hidden_states,
+    const void* lm_head_weight,
+    std::uint64_t* partial_pairs,
+    std::int32_t* token_ids,
+    int num_rows,
+    int hidden,
+    int vocab,
+    cudaStream_t stream)
+{
+    if (num_rows <= 0 || hidden <= 0 || vocab <= 0) return;
+    const int tiles = (vocab + LM_HEAD_TILE_TOKENS - 1) / LM_HEAD_TILE_TOKENS;
+    dim3 score_grid(num_rows, tiles);
+    dim3 score_block(BLOCK);
+    lm_head_argmax_pairs_bf16_kernel<<<score_grid, score_block, 0, stream>>>(
+        static_cast<const __nv_bfloat16*>(hidden_states),
+        static_cast<const __nv_bfloat16*>(lm_head_weight),
+        partial_pairs,
+        hidden,
+        vocab);
+    dim3 select_block(128);
+    dim3 select_grid((num_rows + select_block.x - 1) / select_block.x);
+    select_lm_head_argmax_pairs_kernel<<<select_grid, select_block, 0, stream>>>(
+        partial_pairs, token_ids, num_rows, tiles);
 }
 
 void launch_masked_embedding_argmax_bf16(

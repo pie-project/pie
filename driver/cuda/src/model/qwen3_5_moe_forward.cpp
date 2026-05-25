@@ -867,7 +867,7 @@ void linear_attn_body(
                         }
                     } else if (N <= qwen35_gdn_cached_prefill_max_tokens()) {
                         if (state_bf16) {
-                            kernels::launch_chunk_gated_delta_prefill_batched_cached_state_bf16(
+                            kernels::launch_chunk_gated_delta_prefill_batched_cached_snapshot_state_bf16(
                                 q_recur_full,
                                 k_recur_full,
                                 la.v_fp32.data(),
@@ -877,9 +877,10 @@ void linear_attn_body(
                                 slot_ids_d, qo_indptr_d,
                                 slot_stride,
                                 la.core_out.data(),
-                                R, V_h, K_d, V_d, stream);
+                                R, V_h, K_d, V_d,
+                                snapshot_base_slot, snapshot_count, stream);
                         } else {
-                            kernels::launch_chunk_gated_delta_prefill_batched_cached(
+                            kernels::launch_chunk_gated_delta_prefill_batched_cached_snapshot(
                                 q_recur_full,
                                 k_recur_full,
                                 la.v_fp32.data(),
@@ -889,7 +890,8 @@ void linear_attn_body(
                                 slot_ids_d, qo_indptr_d,
                                 slot_stride,
                                 la.core_out.data(),
-                                R, V_h, K_d, V_d, stream);
+                                R, V_h, K_d, V_d,
+                                snapshot_base_slot, snapshot_count, stream);
                         }
                     } else {
                         if (state_bf16) {
@@ -1836,7 +1838,8 @@ void mtp_full_attn_no_cache_moe(
         position_ids, request_ids,
         kv_page_indices, kv_page_indptr, kv_last_page_lens,
         N, draft_step + 1, N, max_global_tokens, cache.page_size(),
-        q_heads, kv_heads, d, mtp_kv.hnd_layout, stream);
+        q_heads, kv_heads, d, mtp_kv.hnd_layout,
+        fwd_cfg.mtp_global_cache_uses_prefix_position, stream);
     if (cfg.attn_output_gate) {
         kernels::launch_sigmoid_gate_inplace_bf16(
             ws.attn_out.data(), la.fa_gate.data(), N * Hq, stream);
@@ -2019,7 +2022,8 @@ void qwen3_5_moe_mtp_process_cache(
     kernels::launch_write_kv_to_pages(
         cache.layer_view(Lw.kv_layer),
         ws.k.data(), ws.v.data(), qo_indptr, kv_page_indices,
-        kv_page_indptr, kv_last_page_lens, total_tokens, num_requests, stream);
+        kv_page_indptr, kv_last_page_lens, total_tokens, num_requests,
+        stream);
 }
 
 void qwen3_5_moe_mtp_forward(
@@ -2038,10 +2042,12 @@ void qwen3_5_moe_mtp_forward(
     const std::uint32_t* kv_page_indices,
     const std::uint32_t* kv_page_indptr,
     const std::uint32_t* kv_last_page_lens,
+    std::int32_t* sampled_token_ids,
     int num_tokens,
     int draft_step,
     int max_global_tokens)
 {
+    (void)sampled_token_ids;
     if (!w.mtp || num_tokens <= 0) return;
     const auto& mtp = *w.mtp;
     const auto& Lw = mtp.layer;

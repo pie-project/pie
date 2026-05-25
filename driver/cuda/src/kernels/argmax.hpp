@@ -31,6 +31,19 @@ void launch_argmax_bf16_partitioned_pairs(
     int parts,
     cudaStream_t stream);
 
+// Direct greedy scorer for single-step draft paths. Computes
+// hidden_states @ lm_head_weight.T and returns the argmax without
+// materializing [num_rows, vocab] logits.
+void launch_lm_head_argmax_bf16(
+    const void* hidden_states,        // [num_rows, hidden] bf16
+    const void* lm_head_weight,       // [vocab, hidden] bf16
+    std::uint64_t* partial_pairs,     // [ceil(vocab / 8), num_rows]
+    std::int32_t* token_ids,          // [num_rows]
+    int num_rows,
+    int hidden,
+    int vocab,
+    cudaStream_t stream);
+
 // Gemma4 MTP ordered-embedding argmax. The assistant first selects top
 // centroids, then scores only the tokens assigned to those centroids.
 void launch_masked_embedding_argmax_bf16(

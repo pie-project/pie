@@ -102,6 +102,7 @@ public:
     void validate_quant_metadata() const;
     const QuantMap& quant_meta_map() const noexcept { return quant_meta_; }
     bool finalized() const noexcept { return finalized_; }
+    std::size_t erase_runtime_weight(const std::string& name);
 
 private:
     friend class WeightStoreBuilder;

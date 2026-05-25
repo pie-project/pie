@@ -28,7 +28,7 @@ use std::sync::Mutex;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering::Relaxed;
 
-pub use scheduler::SchedulerStats;
+pub use scheduler::{SchedulerStats, SYSTEM_SPEC_DRAFT_POS_BUCKETS};
 pub use speculator::{
     BYPASS_HIT_COUNT, CHAIN_DROP_COUNT, CHAIN_SUBMIT_COUNT, StagedBatch, lookup_for_ctx, try_hit,
 };
@@ -62,6 +62,8 @@ pub struct InferenceStats {
     pub avg_stats_update_us: u64,
     pub system_spec_draft_tokens_proposed: u64,
     pub system_spec_draft_tokens_accepted: u64,
+    pub system_spec_draft_tokens_proposed_per_pos: [u64; SYSTEM_SPEC_DRAFT_POS_BUCKETS],
+    pub system_spec_draft_tokens_accepted_per_pos: [u64; SYSTEM_SPEC_DRAFT_POS_BUCKETS],
 }
 
 // =============================================================================
@@ -309,6 +311,10 @@ impl InferenceService {
         let mut cumulative_stats_update = 0u64;
         let mut system_spec_draft_tokens_proposed = 0u64;
         let mut system_spec_draft_tokens_accepted = 0u64;
+        let mut system_spec_draft_tokens_proposed_per_pos =
+            [0u64; SYSTEM_SPEC_DRAFT_POS_BUCKETS];
+        let mut system_spec_draft_tokens_accepted_per_pos =
+            [0u64; SYSTEM_SPEC_DRAFT_POS_BUCKETS];
 
         for s in &self.scheduler_stats {
             total_batches += s.total_batches.load(Relaxed);
@@ -331,6 +337,18 @@ impl InferenceService {
             cumulative_stats_update += s.cumulative_stats_update_us.load(Relaxed);
             system_spec_draft_tokens_proposed += s.system_spec_draft_tokens_proposed.load(Relaxed);
             system_spec_draft_tokens_accepted += s.system_spec_draft_tokens_accepted.load(Relaxed);
+            for (dst, src) in system_spec_draft_tokens_proposed_per_pos
+                .iter_mut()
+                .zip(s.system_spec_draft_tokens_proposed_per_pos.iter())
+            {
+                *dst += src.load(Relaxed);
+            }
+            for (dst, src) in system_spec_draft_tokens_accepted_per_pos
+                .iter_mut()
+                .zip(s.system_spec_draft_tokens_accepted_per_pos.iter())
+            {
+                *dst += src.load(Relaxed);
+            }
         }
 
         let avg = |value: u64| {
@@ -359,6 +377,8 @@ impl InferenceService {
             avg_stats_update_us: avg(cumulative_stats_update),
             system_spec_draft_tokens_proposed,
             system_spec_draft_tokens_accepted,
+            system_spec_draft_tokens_proposed_per_pos,
+            system_spec_draft_tokens_accepted_per_pos,
         }
     }
 }

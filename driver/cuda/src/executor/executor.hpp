@@ -103,38 +103,6 @@ struct ForwardFn {
         bool                 /* tp_greedy_argmax */
     )>;
 
-    using MtpFn = std::function<void(
-        model::Qwen3Workspace&,
-        KvCache&,
-        ops::CublasHandle&,
-        const std::int32_t*  /* token_ids device */,
-        const std::int32_t*  /* position_ids device */,
-        const std::int32_t*  /* base_hidden_row_indices device */,
-        const std::int32_t*  /* request_ids device */,
-        const std::uint32_t* /* kv_page_indices device */,
-        const std::uint32_t* /* kv_page_indptr device */,
-        const std::uint32_t* /* kv_last_page_lens device */,
-        int                  /* num_tokens */,
-        int                  /* draft_step */,
-        int                  /* max_global_tokens */
-    )>;
-
-    using MtpProcessFn = std::function<void(
-        model::Qwen3Workspace&,
-        KvCache&,
-        ops::CublasHandle&,
-        const std::int32_t*  /* token_ids device */,
-        const std::int32_t*  /* positions device */,
-        const std::uint32_t* /* qo_indptr device */,
-        const std::uint32_t* /* kv_page_indices device */,
-        const std::uint32_t* /* kv_page_indptr device */,
-        const std::uint32_t* /* kv_last_page_lens device */,
-        const std::int32_t*  /* slot_ids device, nullable */,
-        const std::int32_t*  /* source_row_indices device, nullable */,
-        int                  /* total_tokens */,
-        int                  /* num_requests */
-    )>;
-
     struct PrepareInputs {
         const std::uint32_t* qo_indptr_h = nullptr;
         const std::uint32_t* kv_page_indices_h = nullptr;
@@ -162,9 +130,6 @@ struct ForwardFn {
     GraphLayoutFn graph_layout;
     LogitsModeFn set_logits_argmax_only;
     BodyFn    body;
-    MtpFn     mtp;
-    MtpProcessFn mtp_process;
-    int mtp_num_drafts = 1;
 
     // Convenience: `forward_fn = [...]` assigns the lambda as the body.
     // entry.cpp uses this terser pattern; the older `forward_fn.body =
@@ -204,9 +169,75 @@ struct SystemSpecDraftInputs {
     int max_drafts = 0;
 };
 
-using SystemSpeculatorFn = std::function<void(
+using NativeSystemDraftNextFn = std::function<void(
     const SystemSpecDraftInputs&,
     std::span<pie_driver::PerRequestOutput>)>;
+
+struct NativeSystemCommitInputs {
+    model::Qwen3Workspace& target_ws;
+    KvCache& kv_cache;
+    ops::CublasHandle& cublas;
+    const std::int32_t* token_ids = nullptr;
+    const std::int32_t* positions = nullptr;
+    const std::uint32_t* qo_indptr = nullptr;
+    const std::uint32_t* kv_page_indices = nullptr;
+    const std::uint32_t* kv_page_indptr = nullptr;
+    const std::uint32_t* kv_last_page_lens = nullptr;
+    const std::int32_t* slot_ids = nullptr;
+    const std::int32_t* source_row_indices = nullptr;
+    int total_tokens = 0;
+    int num_requests = 0;
+};
+
+struct NativeSystemDrafter {
+    using CommitVerifiedPrefixFn = std::function<void(
+        const NativeSystemCommitInputs&)>;
+
+    using DraftStepFn = std::function<void(
+        model::Qwen3Workspace&,
+        KvCache&,
+        ops::CublasHandle&,
+        const std::int32_t*  /* token_ids device */,
+        const std::int32_t*  /* position_ids device */,
+        const std::int32_t*  /* base_hidden_row_indices device */,
+        const std::int32_t*  /* request_ids device */,
+        const std::uint32_t* /* kv_page_indices device */,
+        const std::uint32_t* /* kv_page_indptr device */,
+        const std::uint32_t* /* kv_last_page_lens device */,
+        std::int32_t*        /* sampled_token_ids device, optional */,
+        int                  /* num_tokens */,
+        int                  /* draft_step */,
+        int                  /* max_global_tokens */
+    )>;
+
+    int max_drafts = 0;
+    // Position passed to the first low-level draft step is
+    // source_position + draft_position_offset; later steps advance by one.
+    int draft_position_offset = 1;
+    // Some native drafters keep the just-generated draft chain in local
+    // history instead of writing it into their paged cache. For those,
+    // global-cache attention length is the fixed prefix position, not the
+    // current draft position.
+    bool draft_global_cache_uses_prefix_position = false;
+    // When true, draft_step writes sampled token ids directly to the supplied
+    // output buffer and the executor skips the generic logits argmax.
+    bool draft_step_writes_sampled_tokens = false;
+    // Optional phase used by drafters that maintain native cache/recurrent
+    // state for the prefix that target verification accepted.
+    CommitVerifiedPrefixFn commit_verified_prefix;
+    // Generic model-owned drafter. Gemma4 MTP implements the whole draft loop
+    // behind this callback.
+    NativeSystemDraftNextFn draft_next;
+    // Lower-level single-step drafter. The executor can chain this on GPU while
+    // keeping shared response plumbing model-neutral.
+    DraftStepFn draft_step;
+
+    explicit operator bool() const noexcept {
+        return max_drafts > 0 &&
+               (static_cast<bool>(draft_next) ||
+                static_cast<bool>(draft_step));
+    }
+};
 
 // Stable references the executor needs across calls. Constructed
 // once after loaded-model/workspace allocation in entry.cpp and held by
@@ -231,8 +262,7 @@ struct Executor {
     // function are model-specific; the call site is uniform.
     ForwardFn forward_fn;
     // Optional driver-native drafter for `.system_speculation()`.
-    SystemSpeculatorFn system_speculator;
-    int system_speculator_max_drafts = 0;
+    NativeSystemDrafter system_drafter;
     // Optional CUDA-graph cache. When non-null, decode-only fires
     // attempt graph capture/replay; otherwise the forward runs directly.
     ForwardGraphCache* graph_cache = nullptr;

@@ -142,6 +142,7 @@ void qwen3_5_moe_mtp_forward(
     const std::uint32_t* kv_page_indices,
     const std::uint32_t* kv_page_indptr,
     const std::uint32_t* kv_last_page_lens,
+    std::int32_t* sampled_token_ids,
     int num_tokens,
     int draft_step,
     int max_global_tokens);

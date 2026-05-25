@@ -157,6 +157,23 @@ __global__ void split_qwen_gdn_projections_kernel(
     }
 }
 
+__global__ void split_qwen_gdn_ba_kernel(
+    const __nv_bfloat16* __restrict__ ba,
+    __nv_bfloat16* __restrict__ b_out,
+    __nv_bfloat16* __restrict__ a_out,
+    int v_h)
+{
+    const int n = blockIdx.x;
+    const int tid = threadIdx.x;
+    const __nv_bfloat16* ba_row = ba + (long long)n * (2 * v_h);
+    __nv_bfloat16* b_row = b_out + (long long)n * v_h;
+    __nv_bfloat16* a_row = a_out + (long long)n * v_h;
+    for (int i = tid; i < v_h; i += blockDim.x) {
+        b_row[i] = ba_row[i];
+        a_row[i] = ba_row[v_h + i];
+    }
+}
+
 __global__ void repeat_interleave_heads_bf16_kernel(
     const __nv_bfloat16* __restrict__ in,
     __nv_bfloat16* __restrict__ out,
@@ -204,6 +221,18 @@ void launch_split_qwen_gdn_projections_bf16(
         static_cast<__nv_bfloat16*>(b_out),
         static_cast<__nv_bfloat16*>(a_out),
         conv_dim, v_dim, v_h);
+}
+
+void launch_split_qwen_gdn_ba_bf16(
+    const void* ba, void* b_out, void* a_out,
+    int N, int v_h, cudaStream_t stream)
+{
+    if (N <= 0 || v_h <= 0) return;
+    split_qwen_gdn_ba_kernel<<<N, 64, 0, stream>>>(
+        static_cast<const __nv_bfloat16*>(ba),
+        static_cast<__nv_bfloat16*>(b_out),
+        static_cast<__nv_bfloat16*>(a_out),
+        v_h);
 }
 
 void launch_repeat_interleave_heads_bf16(

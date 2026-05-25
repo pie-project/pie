@@ -67,6 +67,8 @@ pub(super) enum Decision {
 // SchedulerStats (lock-free snapshot for monitoring)
 // =============================================================================
 
+pub const SYSTEM_SPEC_DRAFT_POS_BUCKETS: usize = 32;
+
 /// Cumulative stats exposed for monitoring. Updated atomically after each batch.
 #[derive(Debug, Default)]
 pub struct SchedulerStats {
@@ -93,6 +95,10 @@ pub struct SchedulerStats {
     pub cumulative_stats_update_us: AtomicU64,
     pub system_spec_draft_tokens_proposed: AtomicU64,
     pub system_spec_draft_tokens_accepted: AtomicU64,
+    pub system_spec_draft_tokens_proposed_per_pos:
+        [AtomicU64; SYSTEM_SPEC_DRAFT_POS_BUCKETS],
+    pub system_spec_draft_tokens_accepted_per_pos:
+        [AtomicU64; SYSTEM_SPEC_DRAFT_POS_BUCKETS],
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -103,6 +109,8 @@ struct BatchExecutionTiming {
     response_dispatch_us: u64,
     system_spec_draft_tokens_proposed: u64,
     system_spec_draft_tokens_accepted: u64,
+    system_spec_draft_tokens_proposed_per_pos: [u64; SYSTEM_SPEC_DRAFT_POS_BUCKETS],
+    system_spec_draft_tokens_accepted_per_pos: [u64; SYSTEM_SPEC_DRAFT_POS_BUCKETS],
 }
 
 // =============================================================================
@@ -177,11 +185,9 @@ fn request_capacity_usage(req: &PendingRequest, page_size: u32) -> RequestCapaci
             has_prob_sampling = true;
         }
     }
-    let has_output_spec = req.request.output_spec_flags.iter().any(|&enabled| enabled);
     let has_dense_logit_requirement = req.request.has_user_mask
         || !req.request.logit_masks.is_empty()
         || spec_tokens > 0
-        || has_output_spec
         || !all_samplers_token;
     let is_single_token_decode = input_tokens == 1
         && spec_tokens == 0
@@ -1124,6 +1130,24 @@ impl BatchScheduler {
                         stats_clone
                             .system_spec_draft_tokens_accepted
                             .fetch_add(timing.system_spec_draft_tokens_accepted, Relaxed);
+                        for (counter, value) in stats_clone
+                            .system_spec_draft_tokens_proposed_per_pos
+                            .iter()
+                            .zip(timing.system_spec_draft_tokens_proposed_per_pos)
+                        {
+                            if value != 0 {
+                                counter.fetch_add(value, Relaxed);
+                            }
+                        }
+                        for (counter, value) in stats_clone
+                            .system_spec_draft_tokens_accepted_per_pos
+                            .iter()
+                            .zip(timing.system_spec_draft_tokens_accepted_per_pos)
+                        {
+                            if value != 0 {
+                                counter.fetch_add(value, Relaxed);
+                            }
+                        }
                         stats_clone
                             .cumulative_stats_update_us
                             .fetch_add(stats_update_start.elapsed().as_micros() as u64, Relaxed);
@@ -1192,6 +1216,15 @@ impl BatchScheduler {
         let system_spec_draft_tokens_proposed =
             system_spec_proposed_per_req.iter().sum::<usize>() as u64;
         let mut system_spec_draft_tokens_accepted = 0u64;
+        let mut system_spec_draft_tokens_proposed_per_pos =
+            [0u64; SYSTEM_SPEC_DRAFT_POS_BUCKETS];
+        let mut system_spec_draft_tokens_accepted_per_pos =
+            [0u64; SYSTEM_SPEC_DRAFT_POS_BUCKETS];
+        for proposed in &system_spec_proposed_per_req {
+            for pos in 0..(*proposed).min(SYSTEM_SPEC_DRAFT_POS_BUCKETS) {
+                system_spec_draft_tokens_proposed_per_pos[pos] += 1;
+            }
+        }
 
         // Build batched request — a single `pie_bridge::ForwardRequest`
         // populated by folding each per-request shape into the batch.
@@ -1266,8 +1299,11 @@ impl BatchScheduler {
                                 .unwrap_or_default()
                                 > 0
                             {
-                                system_spec_draft_tokens_accepted +=
-                                    hi.saturating_sub(lo).saturating_sub(1) as u64;
+                                let accepted = hi.saturating_sub(lo).saturating_sub(1);
+                                system_spec_draft_tokens_accepted += accepted as u64;
+                                for pos in 0..accepted.min(SYSTEM_SPEC_DRAFT_POS_BUCKETS) {
+                                    system_spec_draft_tokens_accepted_per_pos[pos] += 1;
+                                }
                             }
                             let output = if hi == lo + 1 {
                                 ForwardOutput::Token(batch_resp.tokens[lo])
@@ -1289,8 +1325,11 @@ impl BatchScheduler {
                                 .unwrap_or_default()
                                 > 0
                             {
-                                system_spec_draft_tokens_accepted +=
-                                    per_req.tokens.len().saturating_sub(1) as u64;
+                                let accepted = per_req.tokens.len().saturating_sub(1);
+                                system_spec_draft_tokens_accepted += accepted as u64;
+                                for pos in 0..accepted.min(SYSTEM_SPEC_DRAFT_POS_BUCKETS) {
+                                    system_spec_draft_tokens_accepted_per_pos[pos] += 1;
+                                }
                             }
                             req.send_result(
                                 Ok(ForwardOutput::Response(per_req)),
@@ -1321,6 +1360,8 @@ impl BatchScheduler {
             response_dispatch_us: response_start.elapsed().as_micros() as u64,
             system_spec_draft_tokens_proposed,
             system_spec_draft_tokens_accepted,
+            system_spec_draft_tokens_proposed_per_pos,
+            system_spec_draft_tokens_accepted_per_pos,
         }
     }
 }

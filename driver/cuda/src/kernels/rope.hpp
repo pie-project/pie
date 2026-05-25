@@ -143,4 +143,16 @@ void launch_rope_partial_bf16(
     float theta,
     cudaStream_t stream);
 
+void launch_rope_partial_bf16_position_delta(
+    void* q, void* k,
+    const std::int32_t* positions,
+    int position_delta,
+    int num_tokens,
+    int num_q_heads,
+    int num_kv_heads,
+    int head_dim,
+    int rotary_dim,
+    float theta,
+    cudaStream_t stream);
+
 }  // namespace pie_cuda_driver::kernels

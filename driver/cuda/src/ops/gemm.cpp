@@ -126,6 +126,10 @@ int cublaslt_bf16_algo_index_for_shape(int N, int K) {
     // Qwen3.6-35B-A3B's MTP/lm_head shape (K=2048, very wide vocab)
     // is a small but repeatable win on the second returned heuristic.
     if (K == 2048 && N >= 200000) return 1;
+    // Qwen3.6-27B's H=5120 projections and lm_head consistently prefer the
+    // first returned heuristic. `cublaslt_bf16_min_n` already keeps smaller
+    // GEMMs on the regular cuBLAS path.
+    if (K == 5120) return 0;
     // Qwen3.6-35B-A3B's hidden-size projections (for example GDN qkv and
     // full-attention q/gate, N≈8k) are faster on the first heuristic. The
     // old generic index 5 regresses the MTP verifier by several percent.
@@ -480,9 +484,11 @@ void validate_quant_weight_view(const char* api, const WeightView& w, int N, int
             " bytes for N=" + std::to_string(N) +
             " K=" + std::to_string(K));
     }
-    std::size_t expected_scales = static_cast<std::size_t>(N);
-    if (w.quant_kind == QuantMeta::Kind::PerGroup && w.group_size > 0) {
-        expected_scales *=
+    std::size_t expected_scales = 1;
+    if (w.quant_kind == QuantMeta::Kind::PerChannel) {
+        expected_scales = static_cast<std::size_t>(N);
+    } else if (w.quant_kind == QuantMeta::Kind::PerGroup && w.group_size > 0) {
+        expected_scales = static_cast<std::size_t>(N) *
             static_cast<std::size_t>((K + w.group_size - 1) / w.group_size);
     }
     if (w.scale_numel < expected_scales) {

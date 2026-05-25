@@ -2111,20 +2111,20 @@ impl ContextManager {
             if count as usize > max {
                 anyhow::bail!("truncate count {} out of range 0..={}", count, max);
             }
-            if count as usize == max {
+            if count == 0 {
                 return Ok(());
             }
+            let keep = max - count as usize;
             let driver_idx = ctx.driver.unwrap_or(0) as usize;
-            let removed = max - count as usize;
+            let removed = count as usize;
             let driver_repaired = ctx.driver_repaired_spec_tail > 0
                 && removed <= ctx.driver_repaired_spec_tail as usize
-                && count as usize + removed == max
                 && self
                     .rs_cache_spec_rollback
                     .get(driver_idx)
                     .copied()
                     .unwrap_or(false);
-            ctx.working_page_tokens.truncate(count as usize);
+            ctx.working_page_tokens.truncate(keep);
             if driver_repaired {
                 ctx.driver_repaired_spec_tail =
                     ctx.driver_repaired_spec_tail.saturating_sub(removed as u32);

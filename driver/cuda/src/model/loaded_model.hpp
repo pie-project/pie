@@ -60,6 +60,7 @@ public:
         return weights_.find(name) != weights_.end();
     }
     const DeviceTensor& get(const std::string& name) const;
+    std::size_t erase_runtime_weight(const std::string& name);
 
     // Lookup quantization metadata for a weight. Returns std::nullopt if
     // the weight is plain bf16/fp16/fp32 (the common case).

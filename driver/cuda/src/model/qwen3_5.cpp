@@ -1,6 +1,7 @@
 #include "model/qwen3_5.hpp"
 
 #include <cstdlib>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -9,6 +10,7 @@
 
 #include "cuda_check.hpp"
 #include "kernels/gated_delta_net.hpp"
+#include "kernels/quant_bf16_to_fp8.hpp"
 
 namespace pie_cuda_driver::model {
 
@@ -28,6 +30,73 @@ const DeviceTensor* maybe(const LoadedModel& e, const std::string& name) {
 bool fused_gdn_projection_weights_enabled() {
     static const bool enabled = [] {
         const char* v = std::getenv("PIE_QWEN35_FUSED_GDN_PROJ");
+        return v != nullptr && v[0] != '\0' && v[0] != '0';
+    }();
+    return enabled;
+}
+
+bool fused_gdn_ba_weights_enabled() {
+    static const bool enabled = [] {
+        const char* v = std::getenv("PIE_QWEN35_FUSED_GDN_BA");
+        return v != nullptr && v[0] != '\0' && v[0] != '0';
+    }();
+    return enabled;
+}
+
+bool fused_dense_mlp_weights_enabled() {
+    static const bool enabled = [] {
+        const char* v = std::getenv("PIE_QWEN35_FUSED_DENSE_MLP");
+        return v != nullptr && v[0] != '\0' && v[0] != '0';
+    }();
+    return enabled;
+}
+
+int fused_dense_mlp_layer_limit() {
+    static const int limit = [] {
+        const char* v = std::getenv("PIE_QWEN35_FUSED_DENSE_MLP_LAYER_LIMIT");
+        if (v == nullptr || v[0] == '\0') return -1;
+        return std::atoi(v);
+    }();
+    return limit;
+}
+
+bool fused_mtp_dense_mlp_weights_enabled() {
+    static const bool enabled = [] {
+        const char* v = std::getenv("PIE_QWEN35_FUSED_MTP_DENSE_MLP");
+        if (v == nullptr || v[0] == '\0') return false;
+        return v[0] != '0';
+    }();
+    return enabled;
+}
+
+bool fused_dense_mlp_drop_originals_enabled() {
+    static const bool enabled = [] {
+        const char* v = std::getenv("PIE_QWEN35_FUSED_DENSE_MLP_KEEP_ORIGINALS");
+        return !(v != nullptr && v[0] != '\0' && v[0] != '0');
+    }();
+    return enabled;
+}
+
+bool fused_full_attn_qgkv_weights_enabled() {
+    static const bool enabled = [] {
+        const char* v = std::getenv("PIE_QWEN35_FUSED_FULL_ATTN_QGKV");
+        return v != nullptr && v[0] != '\0' && v[0] != '0';
+    }();
+    return enabled;
+}
+
+bool fused_mtp_full_attn_qgkv_weights_enabled() {
+    static const bool enabled = [] {
+        const char* v = std::getenv("PIE_QWEN35_FUSED_MTP_FULL_ATTN_QGKV");
+        if (v == nullptr || v[0] == '\0') return false;
+        return v[0] != '0';
+    }();
+    return enabled;
+}
+
+bool mtp_fp8_lm_head_enabled() {
+    static const bool enabled = [] {
+        const char* v = std::getenv("PIE_QWEN35_MTP_FP8_LM_HEAD");
         return v != nullptr && v[0] != '\0' && v[0] != '0';
     }();
     return enabled;
@@ -158,9 +227,92 @@ DeviceTensor concat_axis0_bf16(
     return fused;
 }
 
+DeviceTensor concat_axis0_bf16(
+    const DeviceTensor& first,
+    const DeviceTensor& second,
+    const DeviceTensor& third,
+    const char* what)
+{
+    if (first.dtype() != DType::BF16 ||
+        second.dtype() != DType::BF16 ||
+        third.dtype() != DType::BF16) {
+        throw std::runtime_error(std::string(what) + ": expected bf16 tensors");
+    }
+    if (first.shape().empty() ||
+        first.shape().size() != second.shape().size() ||
+        first.shape().size() != third.shape().size()) {
+        throw std::runtime_error(std::string(what) + ": rank mismatch");
+    }
+    for (std::size_t i = 1; i < first.shape().size(); ++i) {
+        if (first.shape()[i] != second.shape()[i] ||
+            first.shape()[i] != third.shape()[i]) {
+            throw std::runtime_error(std::string(what) + ": trailing shape mismatch");
+        }
+    }
+
+    std::vector<std::int64_t> shape = first.shape();
+    shape[0] += second.shape()[0] + third.shape()[0];
+    auto fused = DeviceTensor::allocate(DType::BF16, shape);
+    auto* dst = static_cast<std::uint8_t*>(fused.data());
+    CUDA_CHECK(cudaMemcpy(
+        dst, first.data(), first.nbytes(), cudaMemcpyDeviceToDevice));
+    CUDA_CHECK(cudaMemcpy(
+        dst + first.nbytes(), second.data(), second.nbytes(),
+        cudaMemcpyDeviceToDevice));
+    CUDA_CHECK(cudaMemcpy(
+        dst + first.nbytes() + second.nbytes(), third.data(), third.nbytes(),
+        cudaMemcpyDeviceToDevice));
+    return fused;
+}
+
+void maybe_fuse_full_attn_qgkv_projection(
+    Qwen3_5Weights& w,
+    Qwen3_5LayerWeights& Lw,
+    const char* what)
+{
+    if (Lw.fa_q_proj == nullptr || Lw.fa_k_proj == nullptr ||
+        Lw.fa_v_proj == nullptr ||
+        Lw.fa_q_proj_quant.has_value() ||
+        Lw.fa_k_proj_quant.has_value() ||
+        Lw.fa_v_proj_quant.has_value() ||
+        Lw.fa_q_proj->dtype() != DType::BF16 ||
+        Lw.fa_k_proj->dtype() != DType::BF16 ||
+        Lw.fa_v_proj->dtype() != DType::BF16) {
+        return;
+    }
+    w.owned_bf16_buffers.push_back(
+        concat_axis0_bf16(*Lw.fa_q_proj, *Lw.fa_k_proj, *Lw.fa_v_proj, what));
+    Lw.fa_qgkv_proj_fused = &w.owned_bf16_buffers.back();
+}
+
+void maybe_fuse_gate_up_projection(
+    Qwen3_5Weights& w,
+    Qwen3_5LayerWeights& Lw,
+    LoadedModel* engine,
+    const std::string& gate_name,
+    const std::string& up_name,
+    const char* what)
+{
+    if (Lw.gate_proj == nullptr || Lw.up_proj == nullptr ||
+        Lw.gate_proj_quant.has_value() || Lw.up_proj_quant.has_value() ||
+        Lw.gate_proj->dtype() != DType::BF16 ||
+        Lw.up_proj->dtype() != DType::BF16) {
+        return;
+    }
+    w.owned_bf16_buffers.push_back(
+        concat_axis0_bf16(*Lw.gate_proj, *Lw.up_proj, what));
+    Lw.gate_up_proj_fused = &w.owned_bf16_buffers.back();
+    if (engine != nullptr && fused_dense_mlp_drop_originals_enabled()) {
+        engine->erase_runtime_weight(gate_name);
+        engine->erase_runtime_weight(up_name);
+        Lw.gate_proj = nullptr;
+        Lw.up_proj = nullptr;
+    }
+}
+
 }  // namespace
 
-Qwen3_5Weights bind_qwen3_5(const LoadedModel& engine) {
+Qwen3_5Weights bind_qwen3_5(LoadedModel& engine) {
     const auto& cfg = engine.hf_config();
     const int L = cfg.num_hidden_layers;
 
@@ -196,11 +348,11 @@ Qwen3_5Weights bind_qwen3_5(const LoadedModel& engine) {
     // forward.
     // owned_bf16_buffers must not reallocate after we hand out pointers
     // — `Lw.la_in_proj_qkv` etc. are observers into this vector. Reserve
-    // up front for the worst case (3 sliced tensors + 2 fused projection
-    // tensors per linear-attn layer)
+    // up front for the worst case (3 sliced tensors + 2 fused GDN
+    // tensors + fused full-attn QGKV / MLP tensors, plus MTP)
     // so push_back never moves the storage. Uses an upper bound on layers
     // so we don't have to count linear-attn layers in advance.
-    w.owned_bf16_buffers.reserve(static_cast<std::size_t>(L) * 6);
+    w.owned_bf16_buffers.reserve(static_cast<std::size_t>(L) * 7 + 4);
 
     int kv_slot = 0;
     for (int li = 0; li < L; ++li) {
@@ -218,6 +370,14 @@ Qwen3_5Weights bind_qwen3_5(const LoadedModel& engine) {
         Lw.gate_proj_quant = engine.quant_meta(lp + "mlp.gate_proj.weight");
         Lw.up_proj_quant   = engine.quant_meta(lp + "mlp.up_proj.weight");
         Lw.down_proj_quant = engine.quant_meta(lp + "mlp.down_proj.weight");
+        const int fused_layer_limit = fused_dense_mlp_layer_limit();
+        if (fused_dense_mlp_weights_enabled() &&
+            (fused_layer_limit < 0 || li < fused_layer_limit)) {
+            maybe_fuse_gate_up_projection(
+                w, Lw, &engine, lp + "mlp.gate_proj.weight",
+                lp + "mlp.up_proj.weight",
+                "qwen3_5: fuse mlp.gate_up_proj");
+        }
 
         if (kind == "linear_attention") {
             Lw.kind = Qwen3_5LayerWeights::Kind::LinearAttn;
@@ -254,11 +414,14 @@ Qwen3_5Weights bind_qwen3_5(const LoadedModel& engine) {
             Lw.la_in_proj_z   = &must(engine, la + "in_proj_z.weight");
             Lw.la_in_proj_b   = &must(engine, la + "in_proj_b.weight");
             Lw.la_in_proj_a   = &must(engine, la + "in_proj_a.weight");
-            if (fused_gdn_projection_weights_enabled()) {
+            const bool fuse_gdn_proj = fused_gdn_projection_weights_enabled();
+            if (fuse_gdn_proj) {
                 w.owned_bf16_buffers.push_back(concat_axis0_bf16(
                     *Lw.la_in_proj_qkv, *Lw.la_in_proj_z,
                     "qwen3_5: fuse linear_attn.in_proj_qkvz"));
                 Lw.la_in_proj_qkvz = &w.owned_bf16_buffers.back();
+            }
+            if (fuse_gdn_proj || fused_gdn_ba_weights_enabled()) {
                 w.owned_bf16_buffers.push_back(concat_axis0_bf16(
                     *Lw.la_in_proj_b, *Lw.la_in_proj_a,
                     "qwen3_5: fuse linear_attn.in_proj_ba"));
@@ -288,6 +451,10 @@ Qwen3_5Weights bind_qwen3_5(const LoadedModel& engine) {
             Lw.fa_k_proj_quant = engine.quant_meta(fa + "k_proj.weight");
             Lw.fa_v_proj_quant = engine.quant_meta(fa + "v_proj.weight");
             Lw.fa_o_proj_quant = engine.quant_meta(fa + "o_proj.weight");
+            if (fused_full_attn_qgkv_weights_enabled()) {
+                maybe_fuse_full_attn_qgkv_projection(
+                    w, Lw, "qwen3_5: fuse self_attn.qgkv_proj");
+            }
             Lw.kv_layer = kv_slot++;
         } else {
             throw std::runtime_error(
@@ -305,6 +472,7 @@ Qwen3_5Weights bind_qwen3_5(const LoadedModel& engine) {
         mtp.embed = cfg.mtp_use_dedicated_embeddings
             ? &must(engine, "mtp.embed_tokens.weight")
             : w.embed;
+        mtp.lm_head = w.lm_head;
 
         const std::string lp = "mtp.layers.0.";
         auto& Lw = mtp.layer;
@@ -322,13 +490,40 @@ Qwen3_5Weights bind_qwen3_5(const LoadedModel& engine) {
         Lw.fa_k_proj_quant = engine.quant_meta(fa + "k_proj.weight");
         Lw.fa_v_proj_quant = engine.quant_meta(fa + "v_proj.weight");
         Lw.fa_o_proj_quant = engine.quant_meta(fa + "o_proj.weight");
+        if (fused_full_attn_qgkv_weights_enabled() ||
+            fused_mtp_full_attn_qgkv_weights_enabled()) {
+            maybe_fuse_full_attn_qgkv_projection(
+                w, Lw, "qwen3_5: fuse mtp.self_attn.qgkv_proj");
+        }
         Lw.gate_proj = &must(engine, lp + "mlp.gate_proj.weight");
         Lw.up_proj = &must(engine, lp + "mlp.up_proj.weight");
         Lw.down_proj = &must(engine, lp + "mlp.down_proj.weight");
         Lw.gate_proj_quant = engine.quant_meta(lp + "mlp.gate_proj.weight");
         Lw.up_proj_quant = engine.quant_meta(lp + "mlp.up_proj.weight");
         Lw.down_proj_quant = engine.quant_meta(lp + "mlp.down_proj.weight");
+        if (fused_dense_mlp_weights_enabled() ||
+            fused_mtp_dense_mlp_weights_enabled()) {
+            maybe_fuse_gate_up_projection(
+                w, Lw, &engine, lp + "mlp.gate_proj.weight",
+                lp + "mlp.up_proj.weight",
+                "qwen3_5: fuse mtp.mlp.gate_up_proj");
+        }
         Lw.kv_layer = kv_slot++;
+        if (mtp_fp8_lm_head_enabled() && w.lm_head->dtype() == DType::BF16) {
+            w.owned_fp8_buffers.push_back(
+                DeviceTensor::allocate(DType::FP8_E4M3, w.lm_head->shape()));
+            w.owned_scale_buffers.push_back(DeviceBuffer<float>::alloc(1));
+            const float scale = kernels::quantize_bf16_to_fp8_e4m3_per_tensor(
+                w.lm_head->data(),
+                static_cast<std::uint8_t*>(w.owned_fp8_buffers.back().data()),
+                w.lm_head->numel(),
+                /*stream=*/0);
+            w.owned_scale_buffers.back().copy_from_host(
+                std::span<const float>(&scale, 1));
+            CUDA_CHECK(cudaStreamSynchronize(0));
+            mtp.lm_head = &w.owned_fp8_buffers.back();
+            mtp.lm_head_scale = &w.owned_scale_buffers.back();
+        }
         w.mtp = mtp;
     }
 

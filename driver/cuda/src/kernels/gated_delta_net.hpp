@@ -243,6 +243,36 @@ void launch_chunk_gated_delta_prefill_batched_cached_state_bf16(
     float*       out,
     int R, int V_h, int K_d, int V_d,
     cudaStream_t stream);
+void launch_chunk_gated_delta_prefill_batched_cached_snapshot(
+    const float* q_norm,
+    const float* k_norm,
+    const float* v,
+    const float* g_log,
+    const float* beta,
+    float*       state_base,
+    const std::int32_t*  slot_ids,
+    const std::uint32_t* qo_indptr,
+    long long    slot_stride_elems,
+    float*       out,
+    int R, int V_h, int K_d, int V_d,
+    int snapshot_base_slot,
+    int snapshot_count,
+    cudaStream_t stream);
+void launch_chunk_gated_delta_prefill_batched_cached_snapshot_state_bf16(
+    const float* q_norm,
+    const float* k_norm,
+    const float* v,
+    const float* g_log,
+    const float* beta,
+    void*        state_base,
+    const std::int32_t*  slot_ids,
+    const std::uint32_t* qo_indptr,
+    long long    slot_stride_elems,
+    float*       out,
+    int R, int V_h, int K_d, int V_d,
+    int snapshot_base_slot,
+    int snapshot_count,
+    cudaStream_t stream);
 
 // Warp-tiled small-T variant. Four warps per block process four V rows for a
 // single (request, head), keeping each lane's K-fragment of recurrent state in

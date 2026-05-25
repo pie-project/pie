@@ -1,6 +1,7 @@
 #include "kernels/gated_delta_net.hpp"
 
 #include <cuda_bf16.h>
+#include <cstdlib>
 #include <stdexcept>
 
 namespace pie_cuda_driver::kernels {
@@ -31,12 +32,40 @@ __device__ __forceinline__ void state_store<__nv_bfloat16>(
     *p = __float2bfloat16(v);
 }
 
+template <bool KLast>
+__device__ __forceinline__ long long state_offset(
+    int k_idx, int v_idx, int K_d, int V_d) {
+    if constexpr (KLast) {
+        return (long long)v_idx * K_d + k_idx;
+    } else {
+        return (long long)k_idx * V_d + v_idx;
+    }
+}
+
 __device__ __forceinline__ float warp_sum(float x) {
     #pragma unroll
     for (int offset = 16; offset > 0; offset >>= 1) {
         x += __shfl_down_sync(0xffffffffu, x, offset);
     }
     return __shfl_sync(0xffffffffu, x, 0);
+}
+
+bool qwen_gdn_gqa_ilp2_enabled() {
+    static const bool enabled = [] {
+        const char* v = std::getenv("PIE_QWEN35_GDN_GQA_ILP2");
+        if (v == nullptr || v[0] == '\0') return false;
+        return v[0] != '0';
+    }();
+    return enabled;
+}
+
+bool qwen_gdn_k_last_state_enabled() {
+    static const bool enabled = [] {
+        const char* v = std::getenv("PIE_QWEN35_GDN_K_LAST_STATE");
+        if (v == nullptr || v[0] == '\0') return true;
+        return v[0] != '0';
+    }();
+    return enabled;
 }
 
 __global__ void bf16_to_fp32_kernel(
@@ -328,7 +357,7 @@ namespace {
 //
 // Shared memory layout: q[K_d] + k[K_d] fp32. Caller passes shmem of
 // size 2*K_d*sizeof(float).
-template <typename StateT>
+template <typename StateT, bool KLast>
 __global__ void recurrent_step_kernel(
     const float* __restrict__ q_norm,
     const float* __restrict__ k_norm,
@@ -369,7 +398,8 @@ __global__ void recurrent_step_kernel(
     for (int v_idx = threadIdx.x; v_idx < V_d; v_idx += blockDim.x) {
         float kv_mem = 0.f;
         for (int k_idx = 0; k_idx < K_d; ++k_idx) {
-            const long long off = (long long)k_idx * V_d + v_idx;
+            const long long off =
+                state_offset<KLast>(k_idx, v_idx, K_d, V_d);
             const float s = state_load(state + off) * g_h;
             state_store(state + off, s);
             kv_mem += s * sk[k_idx];
@@ -381,7 +411,8 @@ __global__ void recurrent_step_kernel(
         // Phase 2: state[k, v] += k[k] * delta; out[v] = Σ_k state[k,v]*q[k].
         float out_v = 0.f;
         for (int k_idx = 0; k_idx < K_d; ++k_idx) {
-            const long long off = (long long)k_idx * V_d + v_idx;
+            const long long off =
+                state_offset<KLast>(k_idx, v_idx, K_d, V_d);
             const float s = state_load(state + off) + sk[k_idx] * delta;
             state_store(state + off, s);
             out_v += s * sq[k_idx];
@@ -394,7 +425,7 @@ __global__ void recurrent_step_kernel(
 // the block walks its T_r tokens sequentially (per-token state
 // dependency), accumulating the recurrence into the request's state
 // slab. Same per-token math as `recurrent_step_kernel`.
-template <typename StateT>
+template <typename StateT, bool KLast>
 __global__ void chunk_gated_delta_prefill_batched_kernel(
     const float* __restrict__ q_norm,
     const float* __restrict__ k_norm,
@@ -441,7 +472,8 @@ __global__ void chunk_gated_delta_prefill_batched_kernel(
         for (int v_idx = threadIdx.x; v_idx < V_d; v_idx += blockDim.x) {
             float kv_mem = 0.f;
             for (int k_idx = 0; k_idx < K_d; ++k_idx) {
-                const long long off = (long long)k_idx * V_d + v_idx;
+                const long long off =
+                    state_offset<KLast>(k_idx, v_idx, K_d, V_d);
                 const float s = state_load(state + off) * g_h;
                 state_store(state + off, s);
                 kv_mem += s * sk[k_idx];
@@ -452,7 +484,8 @@ __global__ void chunk_gated_delta_prefill_batched_kernel(
 
             float out_v = 0.f;
             for (int k_idx = 0; k_idx < K_d; ++k_idx) {
-                const long long off = (long long)k_idx * V_d + v_idx;
+                const long long off =
+                    state_offset<KLast>(k_idx, v_idx, K_d, V_d);
                 const float s = state_load(state + off) + sk[k_idx] * delta;
                 state_store(state + off, s);
                 out_v += s * sq[k_idx];
@@ -466,7 +499,7 @@ __global__ void chunk_gated_delta_prefill_batched_kernel(
     }
 }
 
-template <typename StateT>
+template <typename StateT, bool KLast>
 __global__ void chunk_gated_delta_prefill_batched_cached_kernel(
     const float* __restrict__ q_norm,
     const float* __restrict__ k_norm,
@@ -478,7 +511,9 @@ __global__ void chunk_gated_delta_prefill_batched_cached_kernel(
     const std::uint32_t* __restrict__ qo_indptr,
     long long slot_stride_elems,
     float*       __restrict__ out,
-    int V_h, int K_d, int V_d)
+    int V_h, int K_d, int V_d,
+    int snapshot_base_slot,
+    int snapshot_count)
 {
     const int r = blockIdx.x;
     const int h = blockIdx.y;
@@ -510,7 +545,8 @@ __global__ void chunk_gated_delta_prefill_batched_cached_kernel(
         for (int v_idx = threadIdx.x; v_idx < V_d; v_idx += blockDim.x) {
             float kv_mem = 0.f;
             for (int k_idx = 0; k_idx < K_d; ++k_idx) {
-                const long long off = (long long)k_idx * V_d + v_idx;
+                const long long off =
+                    state_offset<KLast>(k_idx, v_idx, K_d, V_d);
                 const float s = s_state[off] * g_h;
                 s_state[off] = s;
                 kv_mem += s * k_h[k_idx];
@@ -519,12 +555,23 @@ __global__ void chunk_gated_delta_prefill_batched_cached_kernel(
             const float delta = (v_h[v_idx] - kv_mem) * beta_h;
             float out_v = 0.f;
             for (int k_idx = 0; k_idx < K_d; ++k_idx) {
-                const long long off = (long long)k_idx * V_d + v_idx;
+                const long long off =
+                    state_offset<KLast>(k_idx, v_idx, K_d, V_d);
                 const float s = s_state[off] + k_h[k_idx] * delta;
                 s_state[off] = s;
                 out_v += s * q_h[k_idx];
             }
             out_bh[v_idx] = out_v;
+        }
+        if (snapshot_base_slot >= 0 && t < snapshot_count) {
+            __syncthreads();
+            StateT* snap = state_base
+                + (long long)(snapshot_base_slot + t) * slot_stride_elems
+                + (long long)h * K_d * V_d;
+            for (int i = threadIdx.x; i < state_elems; i += blockDim.x) {
+                state_store(snap + i, s_state[i]);
+            }
+            __syncthreads();
         }
     }
 
@@ -534,7 +581,7 @@ __global__ void chunk_gated_delta_prefill_batched_cached_kernel(
     }
 }
 
-template <typename StateT>
+template <typename StateT, bool KLast>
 __global__ void chunk_gated_delta_prefill_batched_warp_tiled_kernel(
     const float* __restrict__ q_norm,
     const float* __restrict__ k_norm,
@@ -574,7 +621,8 @@ __global__ void chunk_gated_delta_prefill_batched_warp_tiled_kernel(
     int n_k = 0;
     for (int k_idx = lane; k_idx < K_d && n_k < MAX_K_PER_LANE; k_idx += 32) {
         k_vals[n_k] = k_idx;
-        s_vals[n_k] = state_load(state + (long long)k_idx * V_d + v_idx);
+        s_vals[n_k] = state_load(
+            state + state_offset<KLast>(k_idx, v_idx, K_d, V_d));
         ++n_k;
     }
 
@@ -621,7 +669,8 @@ __global__ void chunk_gated_delta_prefill_batched_warp_tiled_kernel(
             for (int i = 0; i < MAX_K_PER_LANE; ++i) {
                 if (i < n_k) {
                     state_store(
-                        snap + (long long)k_vals[i] * V_d + v_idx,
+                        snap + state_offset<KLast>(
+                            k_vals[i], v_idx, K_d, V_d),
                         s_vals[i]);
                 }
             }
@@ -632,12 +681,14 @@ __global__ void chunk_gated_delta_prefill_batched_warp_tiled_kernel(
     for (int i = 0; i < MAX_K_PER_LANE; ++i) {
         if (i < n_k) {
             state_store(
-                state + (long long)k_vals[i] * V_d + v_idx, s_vals[i]);
+                state + state_offset<KLast>(
+                    k_vals[i], v_idx, K_d, V_d),
+                s_vals[i]);
         }
     }
 }
 
-template <typename StateT>
+template <typename StateT, bool KLast>
 __global__ void chunk_gated_delta_prefill_batched_warp_tiled_gqa_kernel(
     const float* __restrict__ q_norm_kh,
     const float* __restrict__ k_norm_kh,
@@ -679,7 +730,8 @@ __global__ void chunk_gated_delta_prefill_batched_warp_tiled_gqa_kernel(
     int n_k = 0;
     for (int k_idx = lane; k_idx < K_d && n_k < MAX_K_PER_LANE; k_idx += 32) {
         k_vals[n_k] = k_idx;
-        s_vals[n_k] = state_load(state + (long long)k_idx * V_d + v_idx);
+        s_vals[n_k] = state_load(
+            state + state_offset<KLast>(k_idx, v_idx, K_d, V_d));
         ++n_k;
     }
 
@@ -727,7 +779,8 @@ __global__ void chunk_gated_delta_prefill_batched_warp_tiled_gqa_kernel(
             for (int i = 0; i < MAX_K_PER_LANE; ++i) {
                 if (i < n_k) {
                     state_store(
-                        snap + (long long)k_vals[i] * V_d + v_idx,
+                        snap + state_offset<KLast>(
+                            k_vals[i], v_idx, K_d, V_d),
                         s_vals[i]);
                 }
             }
@@ -738,7 +791,155 @@ __global__ void chunk_gated_delta_prefill_batched_warp_tiled_gqa_kernel(
     for (int i = 0; i < MAX_K_PER_LANE; ++i) {
         if (i < n_k) {
             state_store(
-                state + (long long)k_vals[i] * V_d + v_idx, s_vals[i]);
+                state + state_offset<KLast>(
+                    k_vals[i], v_idx, K_d, V_d),
+                s_vals[i]);
+        }
+    }
+}
+
+template <typename StateT, bool KLast>
+__global__ void chunk_gated_delta_prefill_batched_warp_tiled_gqa_ilp2_kernel(
+    const float* __restrict__ q_norm_kh,
+    const float* __restrict__ k_norm_kh,
+    const float* __restrict__ v,
+    const float* __restrict__ g_log,
+    const float* __restrict__ beta,
+    StateT*      __restrict__ state_base,
+    const int*       __restrict__ slot_ids,
+    const std::uint32_t* __restrict__ qo_indptr,
+    long long slot_stride_elems,
+    float*       __restrict__ out,
+    int K_h, int V_h, int K_d, int V_d,
+    int snapshot_base_slot,
+    int snapshot_count)
+{
+    constexpr int WARPS = 4;
+    constexpr int ILP_V = 2;
+    constexpr int TILE_V = WARPS * ILP_V;
+    constexpr int MAX_K_PER_LANE = 8;  // supports K_d <= 256 with 32 lanes
+    const int r = blockIdx.x;
+    const int h = blockIdx.y;
+    const int warp = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int v0 = blockIdx.z * TILE_V + warp * ILP_V;
+    const int v1 = v0 + 1;
+    if (warp >= WARPS || v0 >= V_d) return;
+    const bool has_v1 = v1 < V_d;
+
+    const int repeat = V_h / K_h;
+    const int qk_h = h / repeat;
+    const int t0 = static_cast<int>(qo_indptr[r]);
+    const int T  = static_cast<int>(qo_indptr[r + 1]) - t0;
+    if (T <= 0) return;
+
+    const int slot = slot_ids[r];
+    StateT* state = state_base
+        + (long long)slot * slot_stride_elems
+        + (long long)h * K_d * V_d;
+
+    float s0[MAX_K_PER_LANE];
+    float s1[MAX_K_PER_LANE];
+    int k_vals[MAX_K_PER_LANE];
+    int n_k = 0;
+    for (int k_idx = lane; k_idx < K_d && n_k < MAX_K_PER_LANE; k_idx += 32) {
+        k_vals[n_k] = k_idx;
+        s0[n_k] = state_load(
+            state + state_offset<KLast>(k_idx, v0, K_d, V_d));
+        s1[n_k] = has_v1
+            ? state_load(state + state_offset<KLast>(k_idx, v1, K_d, V_d))
+            : 0.f;
+        ++n_k;
+    }
+
+    for (int t = 0; t < T; ++t) {
+        const long long qk_bh = ((long long)(t0 + t) * K_h + qk_h);
+        const long long vh = (long long)(t0 + t) * V_h + h;
+        const float* q_h = q_norm_kh + qk_bh * K_d;
+        const float* k_h = k_norm_kh + qk_bh * K_d;
+        const float* v_h = v + vh * V_d;
+        const float g_h = __expf(g_log[vh]);
+        const float beta_h = beta[vh];
+
+        float kv_part0 = 0.f;
+        float kv_part1 = 0.f;
+        #pragma unroll
+        for (int i = 0; i < MAX_K_PER_LANE; ++i) {
+            if (i < n_k) {
+                const int k_idx = k_vals[i];
+                const float k_val = k_h[k_idx];
+                const float s_v0 = s0[i] * g_h;
+                s0[i] = s_v0;
+                kv_part0 += s_v0 * k_val;
+                if (has_v1) {
+                    const float s_v1 = s1[i] * g_h;
+                    s1[i] = s_v1;
+                    kv_part1 += s_v1 * k_val;
+                }
+            }
+        }
+        const float kv_mem0 = warp_sum(kv_part0);
+        const float kv_mem1 = has_v1 ? warp_sum(kv_part1) : 0.f;
+        const float delta0 = (v_h[v0] - kv_mem0) * beta_h;
+        const float delta1 = has_v1 ? (v_h[v1] - kv_mem1) * beta_h : 0.f;
+
+        float out_part0 = 0.f;
+        float out_part1 = 0.f;
+        #pragma unroll
+        for (int i = 0; i < MAX_K_PER_LANE; ++i) {
+            if (i < n_k) {
+                const int k_idx = k_vals[i];
+                const float k_val = k_h[k_idx];
+                const float q_val = q_h[k_idx];
+                const float new_s0 = s0[i] + k_val * delta0;
+                s0[i] = new_s0;
+                out_part0 += new_s0 * q_val;
+                if (has_v1) {
+                    const float new_s1 = s1[i] + k_val * delta1;
+                    s1[i] = new_s1;
+                    out_part1 += new_s1 * q_val;
+                }
+            }
+        }
+        const float out_v0 = warp_sum(out_part0);
+        const float out_v1 = has_v1 ? warp_sum(out_part1) : 0.f;
+        if (lane == 0) {
+            out[vh * (long long)V_d + v0] = out_v0;
+            if (has_v1) out[vh * (long long)V_d + v1] = out_v1;
+        }
+        if (snapshot_base_slot >= 0 && t < snapshot_count) {
+            StateT* snap = state_base
+                + (long long)(snapshot_base_slot + t) * slot_stride_elems
+                + (long long)h * K_d * V_d;
+            #pragma unroll
+            for (int i = 0; i < MAX_K_PER_LANE; ++i) {
+                if (i < n_k) {
+                    state_store(
+                        snap + state_offset<KLast>(
+                            k_vals[i], v0, K_d, V_d),
+                        s0[i]);
+                    if (has_v1) {
+                        state_store(
+                            snap + state_offset<KLast>(
+                                k_vals[i], v1, K_d, V_d),
+                            s1[i]);
+                    }
+                }
+            }
+        }
+    }
+
+    #pragma unroll
+    for (int i = 0; i < MAX_K_PER_LANE; ++i) {
+        if (i < n_k) {
+            state_store(
+                state + state_offset<KLast>(k_vals[i], v0, K_d, V_d),
+                s0[i]);
+            if (has_v1) {
+                state_store(
+                    state + state_offset<KLast>(k_vals[i], v1, K_d, V_d),
+                    s1[i]);
+            }
         }
     }
 }
@@ -746,7 +947,7 @@ __global__ void chunk_gated_delta_prefill_batched_warp_tiled_gqa_kernel(
 // Batched variant with slot indirection. State for request r lives at
 // `state_base + slot_ids[r] * slot_stride_elems`. Otherwise the
 // per-(request, head) compute is identical to `recurrent_step_kernel`.
-template <typename StateT>
+template <typename StateT, bool KLast>
 __global__ void recurrent_step_batched_kernel(
     const float* __restrict__ q_norm,
     const float* __restrict__ k_norm,
@@ -788,7 +989,8 @@ __global__ void recurrent_step_batched_kernel(
     for (int v_idx = threadIdx.x; v_idx < V_d; v_idx += blockDim.x) {
         float kv_mem = 0.f;
         for (int k_idx = 0; k_idx < K_d; ++k_idx) {
-            const long long off = (long long)k_idx * V_d + v_idx;
+            const long long off =
+                state_offset<KLast>(k_idx, v_idx, K_d, V_d);
             const float s = state_load(state + off) * g_h;
             state_store(state + off, s);
             kv_mem += s * sk[k_idx];
@@ -799,7 +1001,8 @@ __global__ void recurrent_step_batched_kernel(
 
         float out_v = 0.f;
         for (int k_idx = 0; k_idx < K_d; ++k_idx) {
-            const long long off = (long long)k_idx * V_d + v_idx;
+            const long long off =
+                state_offset<KLast>(k_idx, v_idx, K_d, V_d);
             const float s = state_load(state + off) + sk[k_idx] * delta;
             state_store(state + off, s);
             out_v += s * sq[k_idx];
@@ -808,7 +1011,7 @@ __global__ void recurrent_step_batched_kernel(
     }
 }
 
-template <typename StateT>
+template <typename StateT, bool KLast>
 __global__ void recurrent_step_batched_gqa_kernel(
     const float* __restrict__ q_norm_kh,
     const float* __restrict__ k_norm_kh,
@@ -853,7 +1056,8 @@ __global__ void recurrent_step_batched_gqa_kernel(
     for (int v_idx = threadIdx.x; v_idx < V_d; v_idx += blockDim.x) {
         float kv_mem = 0.f;
         for (int k_idx = 0; k_idx < K_d; ++k_idx) {
-            const long long off = (long long)k_idx * V_d + v_idx;
+            const long long off =
+                state_offset<KLast>(k_idx, v_idx, K_d, V_d);
             const float s = state_load(state + off) * g_h;
             state_store(state + off, s);
             kv_mem += s * sk[k_idx];
@@ -864,7 +1068,8 @@ __global__ void recurrent_step_batched_gqa_kernel(
 
         float out_v = 0.f;
         for (int k_idx = 0; k_idx < K_d; ++k_idx) {
-            const long long off = (long long)k_idx * V_d + v_idx;
+            const long long off =
+                state_offset<KLast>(k_idx, v_idx, K_d, V_d);
             const float s = state_load(state + off) + sk[k_idx] * delta;
             state_store(state + off, s);
             out_v += s * sq[k_idx];
@@ -887,8 +1092,13 @@ void launch_recurrent_gated_delta_step(
     dim3 grid(B, V_h);
     dim3 block(BLOCK);
     const int shmem_bytes = 2 * K_d * sizeof(float);
-    recurrent_step_kernel<float><<<grid, block, shmem_bytes, stream>>>(
-        q_norm, k_norm, v, g_log, beta, state, out, V_h, K_d, V_d);
+    if (qwen_gdn_k_last_state_enabled()) {
+        recurrent_step_kernel<float, true><<<grid, block, shmem_bytes, stream>>>(
+            q_norm, k_norm, v, g_log, beta, state, out, V_h, K_d, V_d);
+    } else {
+        recurrent_step_kernel<float, false><<<grid, block, shmem_bytes, stream>>>(
+            q_norm, k_norm, v, g_log, beta, state, out, V_h, K_d, V_d);
+    }
 }
 
 void launch_recurrent_gated_delta_step_state_bf16(
@@ -903,9 +1113,17 @@ void launch_recurrent_gated_delta_step_state_bf16(
     dim3 grid(B, V_h);
     dim3 block(BLOCK);
     const int shmem_bytes = 2 * K_d * sizeof(float);
-    recurrent_step_kernel<__nv_bfloat16><<<grid, block, shmem_bytes, stream>>>(
-        q_norm, k_norm, v, g_log, beta,
-        static_cast<__nv_bfloat16*>(state), out, V_h, K_d, V_d);
+    if (qwen_gdn_k_last_state_enabled()) {
+        recurrent_step_kernel<__nv_bfloat16, true><<<
+            grid, block, shmem_bytes, stream>>>(
+            q_norm, k_norm, v, g_log, beta,
+            static_cast<__nv_bfloat16*>(state), out, V_h, K_d, V_d);
+    } else {
+        recurrent_step_kernel<__nv_bfloat16, false><<<
+            grid, block, shmem_bytes, stream>>>(
+            q_norm, k_norm, v, g_log, beta,
+            static_cast<__nv_bfloat16*>(state), out, V_h, K_d, V_d);
+    }
 }
 
 void launch_recurrent_gated_delta_step_batched(
@@ -923,9 +1141,17 @@ void launch_recurrent_gated_delta_step_batched(
     dim3 grid(R, V_h);
     dim3 block(BLOCK);
     const int shmem_bytes = 2 * K_d * sizeof(float);
-    recurrent_step_batched_kernel<float><<<grid, block, shmem_bytes, stream>>>(
-        q_norm, k_norm, v, g_log, beta, state_base,
-        slot_ids, slot_stride_elems, out, V_h, K_d, V_d);
+    if (qwen_gdn_k_last_state_enabled()) {
+        recurrent_step_batched_kernel<float, true><<<
+            grid, block, shmem_bytes, stream>>>(
+            q_norm, k_norm, v, g_log, beta, state_base,
+            slot_ids, slot_stride_elems, out, V_h, K_d, V_d);
+    } else {
+        recurrent_step_batched_kernel<float, false><<<
+            grid, block, shmem_bytes, stream>>>(
+            q_norm, k_norm, v, g_log, beta, state_base,
+            slot_ids, slot_stride_elems, out, V_h, K_d, V_d);
+    }
 }
 
 void launch_recurrent_gated_delta_step_batched_state_bf16(
@@ -943,11 +1169,19 @@ void launch_recurrent_gated_delta_step_batched_state_bf16(
     dim3 grid(R, V_h);
     dim3 block(BLOCK);
     const int shmem_bytes = 2 * K_d * sizeof(float);
-    recurrent_step_batched_kernel<__nv_bfloat16><<<
-        grid, block, shmem_bytes, stream>>>(
-        q_norm, k_norm, v, g_log, beta,
-        static_cast<__nv_bfloat16*>(state_base),
-        slot_ids, slot_stride_elems, out, V_h, K_d, V_d);
+    if (qwen_gdn_k_last_state_enabled()) {
+        recurrent_step_batched_kernel<__nv_bfloat16, true><<<
+            grid, block, shmem_bytes, stream>>>(
+            q_norm, k_norm, v, g_log, beta,
+            static_cast<__nv_bfloat16*>(state_base),
+            slot_ids, slot_stride_elems, out, V_h, K_d, V_d);
+    } else {
+        recurrent_step_batched_kernel<__nv_bfloat16, false><<<
+            grid, block, shmem_bytes, stream>>>(
+            q_norm, k_norm, v, g_log, beta,
+            static_cast<__nv_bfloat16*>(state_base),
+            slot_ids, slot_stride_elems, out, V_h, K_d, V_d);
+    }
 }
 
 void launch_recurrent_gated_delta_step_batched_gqa(
@@ -966,9 +1200,17 @@ void launch_recurrent_gated_delta_step_batched_gqa(
     dim3 grid(R, V_h);
     dim3 block(BLOCK);
     const int shmem_bytes = 2 * K_d * sizeof(float);
-    recurrent_step_batched_gqa_kernel<float><<<grid, block, shmem_bytes, stream>>>(
-        q_norm_kh, k_norm_kh, v, g_log, beta, state_base,
-        slot_ids, slot_stride_elems, out, K_h, V_h, K_d, V_d);
+    if (qwen_gdn_k_last_state_enabled()) {
+        recurrent_step_batched_gqa_kernel<float, true><<<
+            grid, block, shmem_bytes, stream>>>(
+            q_norm_kh, k_norm_kh, v, g_log, beta, state_base,
+            slot_ids, slot_stride_elems, out, K_h, V_h, K_d, V_d);
+    } else {
+        recurrent_step_batched_gqa_kernel<float, false><<<
+            grid, block, shmem_bytes, stream>>>(
+            q_norm_kh, k_norm_kh, v, g_log, beta, state_base,
+            slot_ids, slot_stride_elems, out, K_h, V_h, K_d, V_d);
+    }
 }
 
 void launch_recurrent_gated_delta_step_batched_gqa_state_bf16(
@@ -987,11 +1229,19 @@ void launch_recurrent_gated_delta_step_batched_gqa_state_bf16(
     dim3 grid(R, V_h);
     dim3 block(BLOCK);
     const int shmem_bytes = 2 * K_d * sizeof(float);
-    recurrent_step_batched_gqa_kernel<__nv_bfloat16><<<
-        grid, block, shmem_bytes, stream>>>(
-        q_norm_kh, k_norm_kh, v, g_log, beta,
-        static_cast<__nv_bfloat16*>(state_base),
-        slot_ids, slot_stride_elems, out, K_h, V_h, K_d, V_d);
+    if (qwen_gdn_k_last_state_enabled()) {
+        recurrent_step_batched_gqa_kernel<__nv_bfloat16, true><<<
+            grid, block, shmem_bytes, stream>>>(
+            q_norm_kh, k_norm_kh, v, g_log, beta,
+            static_cast<__nv_bfloat16*>(state_base),
+            slot_ids, slot_stride_elems, out, K_h, V_h, K_d, V_d);
+    } else {
+        recurrent_step_batched_gqa_kernel<__nv_bfloat16, false><<<
+            grid, block, shmem_bytes, stream>>>(
+            q_norm_kh, k_norm_kh, v, g_log, beta,
+            static_cast<__nv_bfloat16*>(state_base),
+            slot_ids, slot_stride_elems, out, K_h, V_h, K_d, V_d);
+    }
 }
 
 // Chunked prefill — for now, implemented as a sequential per-token
@@ -1077,11 +1327,19 @@ void launch_chunk_gated_delta_prefill_batched(
     dim3 grid(R, V_h);
     dim3 block(BLOCK);
     const int shmem_bytes = 2 * K_d * sizeof(float);
-    chunk_gated_delta_prefill_batched_kernel<float><<<
-        grid, block, shmem_bytes, stream>>>(
-        q_norm, k_norm, v, g_log, beta, state_base,
-        slot_ids, qo_indptr, slot_stride_elems,
-        out, V_h, K_d, V_d);
+    if (qwen_gdn_k_last_state_enabled()) {
+        chunk_gated_delta_prefill_batched_kernel<float, true><<<
+            grid, block, shmem_bytes, stream>>>(
+            q_norm, k_norm, v, g_log, beta, state_base,
+            slot_ids, qo_indptr, slot_stride_elems,
+            out, V_h, K_d, V_d);
+    } else {
+        chunk_gated_delta_prefill_batched_kernel<float, false><<<
+            grid, block, shmem_bytes, stream>>>(
+            q_norm, k_norm, v, g_log, beta, state_base,
+            slot_ids, qo_indptr, slot_stride_elems,
+            out, V_h, K_d, V_d);
+    }
 }
 
 void launch_chunk_gated_delta_prefill_batched_state_bf16(
@@ -1100,12 +1358,21 @@ void launch_chunk_gated_delta_prefill_batched_state_bf16(
     dim3 grid(R, V_h);
     dim3 block(BLOCK);
     const int shmem_bytes = 2 * K_d * sizeof(float);
-    chunk_gated_delta_prefill_batched_kernel<__nv_bfloat16><<<
-        grid, block, shmem_bytes, stream>>>(
-        q_norm, k_norm, v, g_log, beta,
-        static_cast<__nv_bfloat16*>(state_base),
-        slot_ids, qo_indptr, slot_stride_elems,
-        out, V_h, K_d, V_d);
+    if (qwen_gdn_k_last_state_enabled()) {
+        chunk_gated_delta_prefill_batched_kernel<__nv_bfloat16, true><<<
+            grid, block, shmem_bytes, stream>>>(
+            q_norm, k_norm, v, g_log, beta,
+            static_cast<__nv_bfloat16*>(state_base),
+            slot_ids, qo_indptr, slot_stride_elems,
+            out, V_h, K_d, V_d);
+    } else {
+        chunk_gated_delta_prefill_batched_kernel<__nv_bfloat16, false><<<
+            grid, block, shmem_bytes, stream>>>(
+            q_norm, k_norm, v, g_log, beta,
+            static_cast<__nv_bfloat16*>(state_base),
+            slot_ids, qo_indptr, slot_stride_elems,
+            out, V_h, K_d, V_d);
+    }
 }
 
 void launch_chunk_gated_delta_prefill_batched_cached(
@@ -1125,18 +1392,34 @@ void launch_chunk_gated_delta_prefill_batched_cached(
     dim3 block(BLOCK);
     const int shmem_bytes = K_d * V_d * static_cast<int>(sizeof(float));
     static int configured_shmem_bytes = 0;
+    const bool k_last = qwen_gdn_k_last_state_enabled();
     if (shmem_bytes > 48 * 1024 && shmem_bytes > configured_shmem_bytes) {
-        cudaFuncSetAttribute(
-            chunk_gated_delta_prefill_batched_cached_kernel<float>,
-            cudaFuncAttributeMaxDynamicSharedMemorySize,
-            shmem_bytes);
+        if (k_last) {
+            cudaFuncSetAttribute(
+                chunk_gated_delta_prefill_batched_cached_kernel<float, true>,
+                cudaFuncAttributeMaxDynamicSharedMemorySize,
+                shmem_bytes);
+        } else {
+            cudaFuncSetAttribute(
+                chunk_gated_delta_prefill_batched_cached_kernel<float, false>,
+                cudaFuncAttributeMaxDynamicSharedMemorySize,
+                shmem_bytes);
+        }
         configured_shmem_bytes = shmem_bytes;
     }
-    chunk_gated_delta_prefill_batched_cached_kernel<float><<<
-        grid, block, shmem_bytes, stream>>>(
-        q_norm, k_norm, v, g_log, beta, state_base,
-        slot_ids, qo_indptr, slot_stride_elems,
-        out, V_h, K_d, V_d);
+    if (k_last) {
+        chunk_gated_delta_prefill_batched_cached_kernel<float, true><<<
+            grid, block, shmem_bytes, stream>>>(
+            q_norm, k_norm, v, g_log, beta, state_base,
+            slot_ids, qo_indptr, slot_stride_elems,
+            out, V_h, K_d, V_d, -1, 0);
+    } else {
+        chunk_gated_delta_prefill_batched_cached_kernel<float, false><<<
+            grid, block, shmem_bytes, stream>>>(
+            q_norm, k_norm, v, g_log, beta, state_base,
+            slot_ids, qo_indptr, slot_stride_elems,
+            out, V_h, K_d, V_d, -1, 0);
+    }
 }
 
 void launch_chunk_gated_delta_prefill_batched_cached_state_bf16(
@@ -1156,19 +1439,150 @@ void launch_chunk_gated_delta_prefill_batched_cached_state_bf16(
     dim3 block(BLOCK);
     const int shmem_bytes = K_d * V_d * static_cast<int>(sizeof(float));
     static int configured_shmem_bytes = 0;
+    const bool k_last = qwen_gdn_k_last_state_enabled();
     if (shmem_bytes > 48 * 1024 && shmem_bytes > configured_shmem_bytes) {
-        cudaFuncSetAttribute(
-            chunk_gated_delta_prefill_batched_cached_kernel<__nv_bfloat16>,
-            cudaFuncAttributeMaxDynamicSharedMemorySize,
-            shmem_bytes);
+        if (k_last) {
+            cudaFuncSetAttribute(
+                chunk_gated_delta_prefill_batched_cached_kernel<__nv_bfloat16, true>,
+                cudaFuncAttributeMaxDynamicSharedMemorySize,
+                shmem_bytes);
+        } else {
+            cudaFuncSetAttribute(
+                chunk_gated_delta_prefill_batched_cached_kernel<__nv_bfloat16, false>,
+                cudaFuncAttributeMaxDynamicSharedMemorySize,
+                shmem_bytes);
+        }
         configured_shmem_bytes = shmem_bytes;
     }
-    chunk_gated_delta_prefill_batched_cached_kernel<__nv_bfloat16><<<
-        grid, block, shmem_bytes, stream>>>(
-        q_norm, k_norm, v, g_log, beta,
-        static_cast<__nv_bfloat16*>(state_base),
-        slot_ids, qo_indptr, slot_stride_elems,
-        out, V_h, K_d, V_d);
+    if (k_last) {
+        chunk_gated_delta_prefill_batched_cached_kernel<__nv_bfloat16, true><<<
+            grid, block, shmem_bytes, stream>>>(
+            q_norm, k_norm, v, g_log, beta,
+            static_cast<__nv_bfloat16*>(state_base),
+            slot_ids, qo_indptr, slot_stride_elems,
+            out, V_h, K_d, V_d, -1, 0);
+    } else {
+        chunk_gated_delta_prefill_batched_cached_kernel<__nv_bfloat16, false><<<
+            grid, block, shmem_bytes, stream>>>(
+            q_norm, k_norm, v, g_log, beta,
+            static_cast<__nv_bfloat16*>(state_base),
+            slot_ids, qo_indptr, slot_stride_elems,
+            out, V_h, K_d, V_d, -1, 0);
+    }
+}
+
+void launch_chunk_gated_delta_prefill_batched_cached_snapshot(
+    const float* q_norm, const float* k_norm, const float* v,
+    const float* g_log, const float* beta,
+    float* state_base,
+    const std::int32_t* slot_ids,
+    const std::uint32_t* qo_indptr,
+    long long slot_stride_elems,
+    float* out,
+    int R, int V_h, int K_d, int V_d,
+    int snapshot_base_slot,
+    int snapshot_count,
+    cudaStream_t stream)
+{
+    if (snapshot_base_slot < 0 || snapshot_count <= 0) {
+        launch_chunk_gated_delta_prefill_batched_cached(
+            q_norm, k_norm, v, g_log, beta, state_base,
+            slot_ids, qo_indptr, slot_stride_elems, out,
+            R, V_h, K_d, V_d, stream);
+        return;
+    }
+    if (R <= 0 || V_h <= 0 || K_d <= 0 || V_d <= 0) return;
+    constexpr int BLOCK = 128;
+    dim3 grid(R, V_h);
+    dim3 block(BLOCK);
+    const int shmem_bytes = K_d * V_d * static_cast<int>(sizeof(float));
+    static int configured_shmem_bytes = 0;
+    const bool k_last = qwen_gdn_k_last_state_enabled();
+    if (shmem_bytes > 48 * 1024 && shmem_bytes > configured_shmem_bytes) {
+        if (k_last) {
+            cudaFuncSetAttribute(
+                chunk_gated_delta_prefill_batched_cached_kernel<float, true>,
+                cudaFuncAttributeMaxDynamicSharedMemorySize,
+                shmem_bytes);
+        } else {
+            cudaFuncSetAttribute(
+                chunk_gated_delta_prefill_batched_cached_kernel<float, false>,
+                cudaFuncAttributeMaxDynamicSharedMemorySize,
+                shmem_bytes);
+        }
+        configured_shmem_bytes = shmem_bytes;
+    }
+    if (k_last) {
+        chunk_gated_delta_prefill_batched_cached_kernel<float, true><<<
+            grid, block, shmem_bytes, stream>>>(
+            q_norm, k_norm, v, g_log, beta, state_base,
+            slot_ids, qo_indptr, slot_stride_elems,
+            out, V_h, K_d, V_d, snapshot_base_slot, snapshot_count);
+    } else {
+        chunk_gated_delta_prefill_batched_cached_kernel<float, false><<<
+            grid, block, shmem_bytes, stream>>>(
+            q_norm, k_norm, v, g_log, beta, state_base,
+            slot_ids, qo_indptr, slot_stride_elems,
+            out, V_h, K_d, V_d, snapshot_base_slot, snapshot_count);
+    }
+}
+
+void launch_chunk_gated_delta_prefill_batched_cached_snapshot_state_bf16(
+    const float* q_norm, const float* k_norm, const float* v,
+    const float* g_log, const float* beta,
+    void* state_base,
+    const std::int32_t* slot_ids,
+    const std::uint32_t* qo_indptr,
+    long long slot_stride_elems,
+    float* out,
+    int R, int V_h, int K_d, int V_d,
+    int snapshot_base_slot,
+    int snapshot_count,
+    cudaStream_t stream)
+{
+    if (snapshot_base_slot < 0 || snapshot_count <= 0) {
+        launch_chunk_gated_delta_prefill_batched_cached_state_bf16(
+            q_norm, k_norm, v, g_log, beta, state_base,
+            slot_ids, qo_indptr, slot_stride_elems, out,
+            R, V_h, K_d, V_d, stream);
+        return;
+    }
+    if (R <= 0 || V_h <= 0 || K_d <= 0 || V_d <= 0) return;
+    constexpr int BLOCK = 128;
+    dim3 grid(R, V_h);
+    dim3 block(BLOCK);
+    const int shmem_bytes = K_d * V_d * static_cast<int>(sizeof(float));
+    static int configured_shmem_bytes = 0;
+    const bool k_last = qwen_gdn_k_last_state_enabled();
+    if (shmem_bytes > 48 * 1024 && shmem_bytes > configured_shmem_bytes) {
+        if (k_last) {
+            cudaFuncSetAttribute(
+                chunk_gated_delta_prefill_batched_cached_kernel<__nv_bfloat16, true>,
+                cudaFuncAttributeMaxDynamicSharedMemorySize,
+                shmem_bytes);
+        } else {
+            cudaFuncSetAttribute(
+                chunk_gated_delta_prefill_batched_cached_kernel<__nv_bfloat16, false>,
+                cudaFuncAttributeMaxDynamicSharedMemorySize,
+                shmem_bytes);
+        }
+        configured_shmem_bytes = shmem_bytes;
+    }
+    if (k_last) {
+        chunk_gated_delta_prefill_batched_cached_kernel<__nv_bfloat16, true><<<
+            grid, block, shmem_bytes, stream>>>(
+            q_norm, k_norm, v, g_log, beta,
+            static_cast<__nv_bfloat16*>(state_base),
+            slot_ids, qo_indptr, slot_stride_elems,
+            out, V_h, K_d, V_d, snapshot_base_slot, snapshot_count);
+    } else {
+        chunk_gated_delta_prefill_batched_cached_kernel<__nv_bfloat16, false><<<
+            grid, block, shmem_bytes, stream>>>(
+            q_norm, k_norm, v, g_log, beta,
+            static_cast<__nv_bfloat16*>(state_base),
+            slot_ids, qo_indptr, slot_stride_elems,
+            out, V_h, K_d, V_d, snapshot_base_slot, snapshot_count);
+    }
 }
 
 void launch_chunk_gated_delta_prefill_batched_warp_tiled(
@@ -1194,11 +1608,19 @@ void launch_chunk_gated_delta_prefill_batched_warp_tiled(
     constexpr int BLOCK = WARPS * 32;
     dim3 grid(R, V_h, (V_d + WARPS - 1) / WARPS);
     dim3 block(BLOCK);
-    chunk_gated_delta_prefill_batched_warp_tiled_kernel<float><<<
-        grid, block, 0, stream>>>(
-        q_norm, k_norm, v, g_log, beta, state_base,
-        slot_ids, qo_indptr, slot_stride_elems,
-        out, V_h, K_d, V_d, -1, 0);
+    if (qwen_gdn_k_last_state_enabled()) {
+        chunk_gated_delta_prefill_batched_warp_tiled_kernel<float, true><<<
+            grid, block, 0, stream>>>(
+            q_norm, k_norm, v, g_log, beta, state_base,
+            slot_ids, qo_indptr, slot_stride_elems,
+            out, V_h, K_d, V_d, -1, 0);
+    } else {
+        chunk_gated_delta_prefill_batched_warp_tiled_kernel<float, false><<<
+            grid, block, 0, stream>>>(
+            q_norm, k_norm, v, g_log, beta, state_base,
+            slot_ids, qo_indptr, slot_stride_elems,
+            out, V_h, K_d, V_d, -1, 0);
+    }
 }
 
 void launch_chunk_gated_delta_prefill_batched_warp_tiled_state_bf16(
@@ -1224,12 +1646,21 @@ void launch_chunk_gated_delta_prefill_batched_warp_tiled_state_bf16(
     constexpr int BLOCK = WARPS * 32;
     dim3 grid(R, V_h, (V_d + WARPS - 1) / WARPS);
     dim3 block(BLOCK);
-    chunk_gated_delta_prefill_batched_warp_tiled_kernel<__nv_bfloat16><<<
-        grid, block, 0, stream>>>(
-        q_norm, k_norm, v, g_log, beta,
-        static_cast<__nv_bfloat16*>(state_base),
-        slot_ids, qo_indptr, slot_stride_elems,
-        out, V_h, K_d, V_d, -1, 0);
+    if (qwen_gdn_k_last_state_enabled()) {
+        chunk_gated_delta_prefill_batched_warp_tiled_kernel<__nv_bfloat16, true><<<
+            grid, block, 0, stream>>>(
+            q_norm, k_norm, v, g_log, beta,
+            static_cast<__nv_bfloat16*>(state_base),
+            slot_ids, qo_indptr, slot_stride_elems,
+            out, V_h, K_d, V_d, -1, 0);
+    } else {
+        chunk_gated_delta_prefill_batched_warp_tiled_kernel<__nv_bfloat16, false><<<
+            grid, block, 0, stream>>>(
+            q_norm, k_norm, v, g_log, beta,
+            static_cast<__nv_bfloat16*>(state_base),
+            slot_ids, qo_indptr, slot_stride_elems,
+            out, V_h, K_d, V_d, -1, 0);
+    }
 }
 
 void launch_chunk_gated_delta_prefill_batched_warp_tiled_snapshot(
@@ -1264,11 +1695,19 @@ void launch_chunk_gated_delta_prefill_batched_warp_tiled_snapshot(
     constexpr int BLOCK = WARPS * 32;
     dim3 grid(R, V_h, (V_d + WARPS - 1) / WARPS);
     dim3 block(BLOCK);
-    chunk_gated_delta_prefill_batched_warp_tiled_kernel<float><<<
-        grid, block, 0, stream>>>(
-        q_norm, k_norm, v, g_log, beta, state_base,
-        slot_ids, qo_indptr, slot_stride_elems,
-        out, V_h, K_d, V_d, snapshot_base_slot, snapshot_count);
+    if (qwen_gdn_k_last_state_enabled()) {
+        chunk_gated_delta_prefill_batched_warp_tiled_kernel<float, true><<<
+            grid, block, 0, stream>>>(
+            q_norm, k_norm, v, g_log, beta, state_base,
+            slot_ids, qo_indptr, slot_stride_elems,
+            out, V_h, K_d, V_d, snapshot_base_slot, snapshot_count);
+    } else {
+        chunk_gated_delta_prefill_batched_warp_tiled_kernel<float, false><<<
+            grid, block, 0, stream>>>(
+            q_norm, k_norm, v, g_log, beta, state_base,
+            slot_ids, qo_indptr, slot_stride_elems,
+            out, V_h, K_d, V_d, snapshot_base_slot, snapshot_count);
+    }
 }
 
 void launch_chunk_gated_delta_prefill_batched_warp_tiled_snapshot_state_bf16(
@@ -1303,12 +1742,21 @@ void launch_chunk_gated_delta_prefill_batched_warp_tiled_snapshot_state_bf16(
     constexpr int BLOCK = WARPS * 32;
     dim3 grid(R, V_h, (V_d + WARPS - 1) / WARPS);
     dim3 block(BLOCK);
-    chunk_gated_delta_prefill_batched_warp_tiled_kernel<__nv_bfloat16><<<
-        grid, block, 0, stream>>>(
-        q_norm, k_norm, v, g_log, beta,
-        static_cast<__nv_bfloat16*>(state_base),
-        slot_ids, qo_indptr, slot_stride_elems,
-        out, V_h, K_d, V_d, snapshot_base_slot, snapshot_count);
+    if (qwen_gdn_k_last_state_enabled()) {
+        chunk_gated_delta_prefill_batched_warp_tiled_kernel<__nv_bfloat16, true><<<
+            grid, block, 0, stream>>>(
+            q_norm, k_norm, v, g_log, beta,
+            static_cast<__nv_bfloat16*>(state_base),
+            slot_ids, qo_indptr, slot_stride_elems,
+            out, V_h, K_d, V_d, snapshot_base_slot, snapshot_count);
+    } else {
+        chunk_gated_delta_prefill_batched_warp_tiled_kernel<__nv_bfloat16, false><<<
+            grid, block, 0, stream>>>(
+            q_norm, k_norm, v, g_log, beta,
+            static_cast<__nv_bfloat16*>(state_base),
+            slot_ids, qo_indptr, slot_stride_elems,
+            out, V_h, K_d, V_d, snapshot_base_slot, snapshot_count);
+    }
 }
 
 void launch_chunk_gated_delta_prefill_batched_warp_tiled_gqa(
@@ -1330,13 +1778,41 @@ void launch_chunk_gated_delta_prefill_batched_warp_tiled_gqa(
     }
     constexpr int WARPS = 4;
     constexpr int BLOCK = WARPS * 32;
+    const bool k_last = qwen_gdn_k_last_state_enabled();
+    if (qwen_gdn_gqa_ilp2_enabled()) {
+        constexpr int TILE_V = WARPS * 2;
+        dim3 grid(R, V_h, (V_d + TILE_V - 1) / TILE_V);
+        dim3 block(BLOCK);
+        if (k_last) {
+            chunk_gated_delta_prefill_batched_warp_tiled_gqa_ilp2_kernel<float, true><<<
+                grid, block, 0, stream>>>(
+                q_norm_kh, k_norm_kh, v, g_log, beta, state_base,
+                slot_ids, qo_indptr, slot_stride_elems,
+                out, K_h, V_h, K_d, V_d, -1, 0);
+        } else {
+            chunk_gated_delta_prefill_batched_warp_tiled_gqa_ilp2_kernel<float, false><<<
+                grid, block, 0, stream>>>(
+                q_norm_kh, k_norm_kh, v, g_log, beta, state_base,
+                slot_ids, qo_indptr, slot_stride_elems,
+                out, K_h, V_h, K_d, V_d, -1, 0);
+        }
+        return;
+    }
     dim3 grid(R, V_h, (V_d + WARPS - 1) / WARPS);
     dim3 block(BLOCK);
-    chunk_gated_delta_prefill_batched_warp_tiled_gqa_kernel<float><<<
-        grid, block, 0, stream>>>(
-        q_norm_kh, k_norm_kh, v, g_log, beta, state_base,
-        slot_ids, qo_indptr, slot_stride_elems,
-        out, K_h, V_h, K_d, V_d, -1, 0);
+    if (k_last) {
+        chunk_gated_delta_prefill_batched_warp_tiled_gqa_kernel<float, true><<<
+            grid, block, 0, stream>>>(
+            q_norm_kh, k_norm_kh, v, g_log, beta, state_base,
+            slot_ids, qo_indptr, slot_stride_elems,
+            out, K_h, V_h, K_d, V_d, -1, 0);
+    } else {
+        chunk_gated_delta_prefill_batched_warp_tiled_gqa_kernel<float, false><<<
+            grid, block, 0, stream>>>(
+            q_norm_kh, k_norm_kh, v, g_log, beta, state_base,
+            slot_ids, qo_indptr, slot_stride_elems,
+            out, K_h, V_h, K_d, V_d, -1, 0);
+    }
 }
 
 void launch_chunk_gated_delta_prefill_batched_warp_tiled_gqa_state_bf16(
@@ -1358,14 +1834,45 @@ void launch_chunk_gated_delta_prefill_batched_warp_tiled_gqa_state_bf16(
     }
     constexpr int WARPS = 4;
     constexpr int BLOCK = WARPS * 32;
+    const bool k_last = qwen_gdn_k_last_state_enabled();
+    if (qwen_gdn_gqa_ilp2_enabled()) {
+        constexpr int TILE_V = WARPS * 2;
+        dim3 grid(R, V_h, (V_d + TILE_V - 1) / TILE_V);
+        dim3 block(BLOCK);
+        if (k_last) {
+            chunk_gated_delta_prefill_batched_warp_tiled_gqa_ilp2_kernel<__nv_bfloat16, true><<<
+                grid, block, 0, stream>>>(
+                q_norm_kh, k_norm_kh, v, g_log, beta,
+                static_cast<__nv_bfloat16*>(state_base),
+                slot_ids, qo_indptr, slot_stride_elems,
+                out, K_h, V_h, K_d, V_d, -1, 0);
+        } else {
+            chunk_gated_delta_prefill_batched_warp_tiled_gqa_ilp2_kernel<__nv_bfloat16, false><<<
+                grid, block, 0, stream>>>(
+                q_norm_kh, k_norm_kh, v, g_log, beta,
+                static_cast<__nv_bfloat16*>(state_base),
+                slot_ids, qo_indptr, slot_stride_elems,
+                out, K_h, V_h, K_d, V_d, -1, 0);
+        }
+        return;
+    }
     dim3 grid(R, V_h, (V_d + WARPS - 1) / WARPS);
     dim3 block(BLOCK);
-    chunk_gated_delta_prefill_batched_warp_tiled_gqa_kernel<__nv_bfloat16><<<
-        grid, block, 0, stream>>>(
-        q_norm_kh, k_norm_kh, v, g_log, beta,
-        static_cast<__nv_bfloat16*>(state_base),
-        slot_ids, qo_indptr, slot_stride_elems,
-        out, K_h, V_h, K_d, V_d, -1, 0);
+    if (k_last) {
+        chunk_gated_delta_prefill_batched_warp_tiled_gqa_kernel<__nv_bfloat16, true><<<
+            grid, block, 0, stream>>>(
+            q_norm_kh, k_norm_kh, v, g_log, beta,
+            static_cast<__nv_bfloat16*>(state_base),
+            slot_ids, qo_indptr, slot_stride_elems,
+            out, K_h, V_h, K_d, V_d, -1, 0);
+    } else {
+        chunk_gated_delta_prefill_batched_warp_tiled_gqa_kernel<__nv_bfloat16, false><<<
+            grid, block, 0, stream>>>(
+            q_norm_kh, k_norm_kh, v, g_log, beta,
+            static_cast<__nv_bfloat16*>(state_base),
+            slot_ids, qo_indptr, slot_stride_elems,
+            out, K_h, V_h, K_d, V_d, -1, 0);
+    }
 }
 
 void launch_chunk_gated_delta_prefill_batched_warp_tiled_gqa_snapshot(
@@ -1396,13 +1903,41 @@ void launch_chunk_gated_delta_prefill_batched_warp_tiled_gqa_snapshot(
     }
     constexpr int WARPS = 4;
     constexpr int BLOCK = WARPS * 32;
+    const bool k_last = qwen_gdn_k_last_state_enabled();
+    if (qwen_gdn_gqa_ilp2_enabled()) {
+        constexpr int TILE_V = WARPS * 2;
+        dim3 grid(R, V_h, (V_d + TILE_V - 1) / TILE_V);
+        dim3 block(BLOCK);
+        if (k_last) {
+            chunk_gated_delta_prefill_batched_warp_tiled_gqa_ilp2_kernel<float, true><<<
+                grid, block, 0, stream>>>(
+                q_norm_kh, k_norm_kh, v, g_log, beta, state_base,
+                slot_ids, qo_indptr, slot_stride_elems,
+                out, K_h, V_h, K_d, V_d, snapshot_base_slot, snapshot_count);
+        } else {
+            chunk_gated_delta_prefill_batched_warp_tiled_gqa_ilp2_kernel<float, false><<<
+                grid, block, 0, stream>>>(
+                q_norm_kh, k_norm_kh, v, g_log, beta, state_base,
+                slot_ids, qo_indptr, slot_stride_elems,
+                out, K_h, V_h, K_d, V_d, snapshot_base_slot, snapshot_count);
+        }
+        return;
+    }
     dim3 grid(R, V_h, (V_d + WARPS - 1) / WARPS);
     dim3 block(BLOCK);
-    chunk_gated_delta_prefill_batched_warp_tiled_gqa_kernel<float><<<
-        grid, block, 0, stream>>>(
-        q_norm_kh, k_norm_kh, v, g_log, beta, state_base,
-        slot_ids, qo_indptr, slot_stride_elems,
-        out, K_h, V_h, K_d, V_d, snapshot_base_slot, snapshot_count);
+    if (k_last) {
+        chunk_gated_delta_prefill_batched_warp_tiled_gqa_kernel<float, true><<<
+            grid, block, 0, stream>>>(
+            q_norm_kh, k_norm_kh, v, g_log, beta, state_base,
+            slot_ids, qo_indptr, slot_stride_elems,
+            out, K_h, V_h, K_d, V_d, snapshot_base_slot, snapshot_count);
+    } else {
+        chunk_gated_delta_prefill_batched_warp_tiled_gqa_kernel<float, false><<<
+            grid, block, 0, stream>>>(
+            q_norm_kh, k_norm_kh, v, g_log, beta, state_base,
+            slot_ids, qo_indptr, slot_stride_elems,
+            out, K_h, V_h, K_d, V_d, snapshot_base_slot, snapshot_count);
+    }
 }
 
 void launch_chunk_gated_delta_prefill_batched_warp_tiled_gqa_snapshot_state_bf16(
@@ -1433,14 +1968,45 @@ void launch_chunk_gated_delta_prefill_batched_warp_tiled_gqa_snapshot_state_bf16
     }
     constexpr int WARPS = 4;
     constexpr int BLOCK = WARPS * 32;
+    const bool k_last = qwen_gdn_k_last_state_enabled();
+    if (qwen_gdn_gqa_ilp2_enabled()) {
+        constexpr int TILE_V = WARPS * 2;
+        dim3 grid(R, V_h, (V_d + TILE_V - 1) / TILE_V);
+        dim3 block(BLOCK);
+        if (k_last) {
+            chunk_gated_delta_prefill_batched_warp_tiled_gqa_ilp2_kernel<__nv_bfloat16, true><<<
+                grid, block, 0, stream>>>(
+                q_norm_kh, k_norm_kh, v, g_log, beta,
+                static_cast<__nv_bfloat16*>(state_base),
+                slot_ids, qo_indptr, slot_stride_elems,
+                out, K_h, V_h, K_d, V_d, snapshot_base_slot, snapshot_count);
+        } else {
+            chunk_gated_delta_prefill_batched_warp_tiled_gqa_ilp2_kernel<__nv_bfloat16, false><<<
+                grid, block, 0, stream>>>(
+                q_norm_kh, k_norm_kh, v, g_log, beta,
+                static_cast<__nv_bfloat16*>(state_base),
+                slot_ids, qo_indptr, slot_stride_elems,
+                out, K_h, V_h, K_d, V_d, snapshot_base_slot, snapshot_count);
+        }
+        return;
+    }
     dim3 grid(R, V_h, (V_d + WARPS - 1) / WARPS);
     dim3 block(BLOCK);
-    chunk_gated_delta_prefill_batched_warp_tiled_gqa_kernel<__nv_bfloat16><<<
-        grid, block, 0, stream>>>(
-        q_norm_kh, k_norm_kh, v, g_log, beta,
-        static_cast<__nv_bfloat16*>(state_base),
-        slot_ids, qo_indptr, slot_stride_elems,
-        out, K_h, V_h, K_d, V_d, snapshot_base_slot, snapshot_count);
+    if (k_last) {
+        chunk_gated_delta_prefill_batched_warp_tiled_gqa_kernel<__nv_bfloat16, true><<<
+            grid, block, 0, stream>>>(
+            q_norm_kh, k_norm_kh, v, g_log, beta,
+            static_cast<__nv_bfloat16*>(state_base),
+            slot_ids, qo_indptr, slot_stride_elems,
+            out, K_h, V_h, K_d, V_d, snapshot_base_slot, snapshot_count);
+    } else {
+        chunk_gated_delta_prefill_batched_warp_tiled_gqa_kernel<__nv_bfloat16, false><<<
+            grid, block, 0, stream>>>(
+            q_norm_kh, k_norm_kh, v, g_log, beta,
+            static_cast<__nv_bfloat16*>(state_base),
+            slot_ids, qo_indptr, slot_stride_elems,
+            out, K_h, V_h, K_d, V_d, snapshot_base_slot, snapshot_count);
+    }
 }
 
 }  // namespace pie_cuda_driver::kernels

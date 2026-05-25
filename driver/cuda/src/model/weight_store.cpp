@@ -150,6 +150,17 @@ std::size_t WeightStore::erase(const std::string& name) {
     return 1;
 }
 
+std::size_t WeightStore::erase_runtime_weight(const std::string& name) {
+    auto it = tensors_.find(name);
+    if (it == tensors_.end()) return 0;
+    validate_erase_allowed(it->first);
+    const DeviceTensor* erased = &it->second.tensor;
+    quant_meta_.erase(it->first);
+    erase_quant_meta_refs_to(erased);
+    tensors_.erase(it);
+    return 1;
+}
+
 std::uint64_t WeightStore::total_bytes() const noexcept {
     std::uint64_t bytes = 0;
     for (const auto& [_, record] : tensors_) {

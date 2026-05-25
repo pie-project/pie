@@ -55,6 +55,9 @@ Qwen3Workspace Qwen3Workspace::allocate_full(
     ws.greedy_tokens_all = DeviceTensor::allocate(DType::INT32, {8, N});
     ws.greedy_pairs = DeviceTensor::allocate(DType::INT64, {N});
     ws.greedy_pairs_all = DeviceTensor::allocate(DType::INT64, {8, N});
+    ws.gate_up_act_ptrs = DeviceBuffer<const std::uint16_t*>::alloc(2);
+    ws.gate_up_w_ptrs = DeviceBuffer<const std::uint16_t*>::alloc(2);
+    ws.gate_up_y_ptrs = DeviceBuffer<std::uint16_t*>::alloc(2);
 
     // Padded q/k/v/attn_out only when head_dim != head_dim_kernel
     // (currently only Phi-3 at 96 → 128). Empty allocations otherwise

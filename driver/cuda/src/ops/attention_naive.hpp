@@ -61,6 +61,7 @@ void launch_attention_mtp_paged_history_bf16(
     int num_kv_heads,
     int head_dim,
     bool hnd_layout,
+    bool global_cache_uses_prefix_position,
     cudaStream_t stream);
 
 void launch_mtp_shift_hidden_bf16(

@@ -596,6 +596,50 @@ int qwen35_small_spec_graph_tokens() {
     return tokens;
 }
 
+bool qwen35_forward_profile_enabled() {
+    static const bool enabled = [] {
+        const char* v = std::getenv("PIE_QWEN35_FORWARD_PROFILE");
+        return v != nullptr && v[0] != '\0' && v[0] != '0';
+    }();
+    return enabled;
+}
+
+int configured_mtp_num_drafts(const pie_cuda_driver::Config& cfg) {
+    static const int forced = [] {
+        const char* v = std::getenv("PIE_MTP_DRAFT_TOKENS");
+        if (v == nullptr || v[0] == '\0') return -1;
+        return std::clamp(std::atoi(v), 0, 32);
+    }();
+    if (forced >= 0) return forced;
+    return cfg.model.mtp_num_drafts;
+}
+
+int qwen35_mtp_draft_position_offset() {
+    static const int offset = [] {
+        const char* v = std::getenv("PIE_QWEN35_MTP_POSITION_OFFSET");
+        if (v == nullptr || v[0] == '\0') return 0;
+        return std::clamp(std::atoi(v), 0, 2);
+    }();
+    return offset;
+}
+
+bool qwen35_mtp_prefix_global_cache() {
+    static const bool enabled = [] {
+        const char* v = std::getenv("PIE_QWEN35_MTP_PREFIX_GLOBAL");
+        if (v == nullptr || v[0] == '\0') return true;
+        return v[0] != '0';
+    }();
+    return enabled;
+}
+
+bool qwen35_mtp_direct_argmax_enabled() {
+    static const bool enabled = [] {
+        const char* v = std::getenv("PIE_QWEN35_MTP_DIRECT_ARGMAX");
+        return v != nullptr && v[0] != '\0' && v[0] != '0';
+    }();
+    return enabled;
+}
+
 bool has_non_full_attention_layers(const pie_cuda_driver::HfConfig& hf) {
     return std::any_of(
         hf.layer_types.begin(),
@@ -2066,6 +2110,7 @@ int run_impl(int argc,
     const bool is_mixtral_arch = bound_model.is_mixtral();
     const bool is_qwen3_5_arch = bound_model.is_qwen3_5();
     const bool is_qwen3_5_moe_arch = bound_model.is_qwen3_5_moe();
+    const int native_mtp_num_drafts = configured_mtp_num_drafts(cfg);
 
     const std::size_t num_layers_bound = bound_model.num_layers();
     if (verbose) {
@@ -2086,7 +2131,7 @@ int run_impl(int argc,
             mtp_snapshot_source = "env";
         }
     }
-    if (is_gemma4_arch && cfg.model.mtp_num_drafts > 0 &&
+    if (is_gemma4_arch && native_mtp_num_drafts > 0 &&
         mtp_snapshot_dir.empty()) {
         if (auto discovered = discover_gemma4_mtp_snapshot_dir(
                 std::filesystem::path(cfg.model.snapshot_dir))) {
@@ -2099,7 +2144,7 @@ int run_impl(int argc,
             }
         }
     }
-    if (is_gemma4_arch && cfg.model.mtp_num_drafts > 0 &&
+    if (is_gemma4_arch && native_mtp_num_drafts > 0 &&
         !mtp_snapshot_dir.empty()) {
         if (cfg.distributed.tp_size > 1) {
             if (verbose && cfg.distributed.tp_rank == 0) {
@@ -2121,7 +2166,7 @@ int run_impl(int argc,
                           << mtp_snapshot_source << "\n";
             }
         }
-    } else if (is_gemma4_arch && cfg.model.mtp_num_drafts > 0 &&
+    } else if (is_gemma4_arch && native_mtp_num_drafts > 0 &&
                verbose && cfg.distributed.tp_rank == 0) {
         std::cerr << "[pie-driver-cuda] Gemma4 MTP system drafter not "
                   << "enabled: assistant checkpoint not found; set "
@@ -2382,10 +2427,10 @@ int run_impl(int argc,
                 *gemma4_mtp_weights,
                 mem_plan.max_requests,
                 mem_plan.max_page_refs,
-                cfg.model.mtp_num_drafts));
+                native_mtp_num_drafts));
         if (verbose) {
             std::cerr << "[pie-driver-cuda] Gemma4 MTP system drafter enabled: "
-                      << "drafts=" << cfg.model.mtp_num_drafts
+                      << "drafts=" << native_mtp_num_drafts
                       << " max_requests=" << mem_plan.max_requests
                       << " page_refs=" << mem_plan.max_page_refs << "\n";
         }
@@ -2641,6 +2686,7 @@ int run_impl(int argc,
     // `main`'s scope (weights_*, fwd_cfg, gemma_fwd_cfg) and persist for
     // the lifetime of the server.
     pie_cuda_driver::ForwardFn forward_fn;
+    pie_cuda_driver::NativeSystemDrafter system_drafter;
     pie_cuda_driver::model::LlamaLikePlanState llama_plan;
     // Gemma-4 26B-A4B's MoE block needs a routed-experts workspace
     // alongside the dense forward state. Inert (zero-byte) on dense
@@ -2821,8 +2867,8 @@ int run_impl(int argc,
             const std::uint8_t* mask_d, const std::int32_t* mask_indptr_d,
             const std::int32_t* slot_ids_h, const std::uint8_t* is_fresh_h,
             const std::int32_t* slot_ids_d,
-            const std::int32_t* /*logit_row_indices_d*/,
-            int /*num_logit_rows*/,
+            const std::int32_t* logit_row_indices_d,
+            int num_logit_rows,
             bool /*tp_greedy_argmax*/) {
             pie_cuda_driver::model::mixtral_forward_paged(
                 weights_mixtral, engine.hf_config(), fwd_cfg,
@@ -2876,8 +2922,8 @@ int run_impl(int argc,
             const std::uint8_t* mask_d, const std::int32_t* mask_indptr_d,
             const std::int32_t* slot_ids_h, const std::uint8_t* is_fresh_h,
             const std::int32_t* slot_ids_d,
-            const std::int32_t* /*logit_row_indices_d*/,
-            int /*num_logit_rows*/,
+            const std::int32_t* logit_row_indices_d,
+            int num_logit_rows,
             bool /*tp_greedy_argmax*/) {
             pie_cuda_driver::model::Qwen3_5ForwardCfg q35_fwd{};
             const auto& hf_q = engine.hf_config();
@@ -2897,37 +2943,44 @@ int run_impl(int argc,
                 qo_indptr, kv_page_indices, kv_page_indptr, kv_last_page_lens,
                 qo_indptr_h, kv_page_indptr_h,
                 N, R, is_pure_decode, mask_d, mask_indptr_d,
-                slot_ids_h, is_fresh_h, slot_ids_d);
+                slot_ids_h, is_fresh_h, slot_ids_d,
+                logit_row_indices_d, num_logit_rows);
         };
-        if (weights_qwen3_5.mtp.has_value() && cfg.model.mtp_num_drafts > 0) {
-            forward_fn.mtp_num_drafts = cfg.model.mtp_num_drafts;
-            forward_fn.mtp_process =
+        if (weights_qwen3_5.mtp.has_value() && native_mtp_num_drafts > 0) {
+            const int mtp_position_offset = qwen35_mtp_draft_position_offset();
+            const bool mtp_prefix_global = qwen35_mtp_prefix_global_cache();
+            const bool mtp_direct_argmax =
+                qwen35_mtp_direct_argmax_enabled() &&
+                weights_qwen3_5.mtp->lm_head != nullptr &&
+                weights_qwen3_5.mtp->lm_head->dtype() ==
+                    pie_cuda_driver::DType::BF16 &&
+                weights_qwen3_5.mtp->lm_head_scale == nullptr;
+            system_drafter.max_drafts = native_mtp_num_drafts;
+            system_drafter.draft_position_offset = mtp_position_offset;
+            system_drafter.draft_global_cache_uses_prefix_position =
+                mtp_prefix_global;
+            system_drafter.draft_step_writes_sampled_tokens =
+                mtp_direct_argmax;
+            system_drafter.commit_verified_prefix =
                 [&engine, &weights_qwen3_5, &qwen3_5_la_ws,
                  &qwen3_5_state_cache, q35_tp_size, q35_tp_comm](
-                pie_cuda_driver::model::Qwen3Workspace& ws,
-                pie_cuda_driver::KvCache& cache,
-                pie_cuda_driver::ops::CublasHandle& cublas,
-                const std::int32_t* tok,
-                const std::int32_t* pos,
-                const std::uint32_t* qo_indptr,
-                const std::uint32_t* kv_page_indices,
-                const std::uint32_t* kv_page_indptr,
-                const std::uint32_t* kv_last_page_lens,
-                const std::int32_t* slot_ids_d,
-                const std::int32_t* source_row_indices,
-                int N,
-                int R) {
+                const pie_cuda_driver::NativeSystemCommitInputs& in) {
                 pie_cuda_driver::model::Qwen3_5ForwardCfg q35_fwd{};
                 q35_fwd.tp_size = q35_tp_size;
                 q35_fwd.tp_comm = q35_tp_comm;
                 pie_cuda_driver::model::qwen3_5_mtp_process_cache(
                     weights_qwen3_5, engine.hf_config(), q35_fwd,
-                    ws, qwen3_5_la_ws, cache, qwen3_5_state_cache, cublas,
-                    tok, pos, qo_indptr, kv_page_indices, kv_page_indptr,
-                    kv_last_page_lens, slot_ids_d, source_row_indices, N, R);
+                    in.target_ws, qwen3_5_la_ws, in.kv_cache,
+                    qwen3_5_state_cache, in.cublas,
+                    in.token_ids, in.positions, in.qo_indptr,
+                    in.kv_page_indices, in.kv_page_indptr,
+                    in.kv_last_page_lens, in.slot_ids,
+                    in.source_row_indices, in.total_tokens,
+                    in.num_requests);
             };
-            forward_fn.mtp = [&engine, &weights_qwen3_5, &qwen3_5_la_ws,
-                              q35_tp_size, q35_tp_comm](
+            system_drafter.draft_step =
+                [&engine, &weights_qwen3_5, &qwen3_5_la_ws,
+                 q35_tp_size, q35_tp_comm, mtp_prefix_global](
                 pie_cuda_driver::model::Qwen3Workspace& ws,
                 pie_cuda_driver::KvCache& cache,
                 pie_cuda_driver::ops::CublasHandle& cublas,
@@ -2938,21 +2991,27 @@ int run_impl(int argc,
                 const std::uint32_t* kv_page_indices,
                 const std::uint32_t* kv_page_indptr,
                 const std::uint32_t* kv_last_page_lens,
+                std::int32_t* sampled_token_ids,
                 int N,
                 int draft_step,
                 int max_global_tokens) {
                 pie_cuda_driver::model::Qwen3_5ForwardCfg q35_fwd{};
                 q35_fwd.tp_size = q35_tp_size;
                 q35_fwd.tp_comm = q35_tp_comm;
+                q35_fwd.mtp_global_cache_uses_prefix_position =
+                    mtp_prefix_global;
                 pie_cuda_driver::model::qwen3_5_mtp_forward(
                     weights_qwen3_5, engine.hf_config(), q35_fwd,
                     ws, qwen3_5_la_ws, cache, cublas,
                     tok, pos, base_hidden_row_indices, request_ids,
                     kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                    N, draft_step, max_global_tokens);
+                    sampled_token_ids, N, draft_step, max_global_tokens);
             };
         }
-        forward_fn.graph_safe = kv_cache.format().is_native_bf16();
+        forward_fn.graph_safe =
+            kv_cache.format().is_native_bf16() &&
+            !qwen35_forward_profile_enabled();
+        forward_fn.supports_compact_logits = true;
         forward_fn.graph_layout = [&qwen3_5_plan_state]() {
             return pie_cuda_driver::model::qwen3_5_decode_graph_layout(
                 qwen3_5_plan_state);
@@ -3030,36 +3089,34 @@ int run_impl(int argc,
                 slot_ids_h, is_fresh_h, slot_ids_d,
                 logit_row_indices_d, num_logit_rows);
         };
-        if (weights_qwen3_5_moe.mtp.has_value() && cfg.model.mtp_num_drafts > 0) {
-            forward_fn.mtp_num_drafts = cfg.model.mtp_num_drafts;
-            forward_fn.mtp_process =
+        if (weights_qwen3_5_moe.mtp.has_value() && native_mtp_num_drafts > 0) {
+            const int mtp_position_offset = qwen35_mtp_draft_position_offset();
+            const bool mtp_prefix_global = qwen35_mtp_prefix_global_cache();
+            system_drafter.max_drafts = native_mtp_num_drafts;
+            system_drafter.draft_position_offset = mtp_position_offset;
+            system_drafter.draft_global_cache_uses_prefix_position =
+                mtp_prefix_global;
+            system_drafter.commit_verified_prefix =
                 [&engine, &weights_qwen3_5_moe, &qwen3_5_la_ws,
                  &qwen3_5_state_cache, q35moe_tp_size, q35moe_tp_comm](
-                pie_cuda_driver::model::Qwen3Workspace& ws,
-                pie_cuda_driver::KvCache& cache,
-                pie_cuda_driver::ops::CublasHandle& cublas,
-                const std::int32_t* tok,
-                const std::int32_t* pos,
-                const std::uint32_t* qo_indptr,
-                const std::uint32_t* kv_page_indices,
-                const std::uint32_t* kv_page_indptr,
-                const std::uint32_t* kv_last_page_lens,
-                const std::int32_t* slot_ids_d,
-                const std::int32_t* source_row_indices,
-                int N,
-                int R) {
+                const pie_cuda_driver::NativeSystemCommitInputs& in) {
                 pie_cuda_driver::model::Qwen3_5ForwardCfg q35_fwd{};
                 q35_fwd.tp_size = q35moe_tp_size;
                 q35_fwd.tp_comm = q35moe_tp_comm;
                 pie_cuda_driver::model::qwen3_5_moe_mtp_process_cache(
                     weights_qwen3_5_moe, engine.hf_config(), q35_fwd,
-                    ws, qwen3_5_la_ws, cache, qwen3_5_state_cache, cublas,
-                    tok, pos, qo_indptr, kv_page_indices, kv_page_indptr,
-                    kv_last_page_lens, slot_ids_d, source_row_indices, N, R);
+                    in.target_ws, qwen3_5_la_ws, in.kv_cache,
+                    qwen3_5_state_cache, in.cublas,
+                    in.token_ids, in.positions, in.qo_indptr,
+                    in.kv_page_indices, in.kv_page_indptr,
+                    in.kv_last_page_lens, in.slot_ids,
+                    in.source_row_indices, in.total_tokens,
+                    in.num_requests);
             };
-            forward_fn.mtp = [&engine, &weights_qwen3_5_moe, &qwen3_5_la_ws,
-                              &qwen3_5_moe_ws,
-                              q35moe_tp_size, q35moe_tp_comm](
+            system_drafter.draft_step =
+                [&engine, &weights_qwen3_5_moe, &qwen3_5_la_ws,
+                 &qwen3_5_moe_ws, q35moe_tp_size, q35moe_tp_comm,
+                 mtp_prefix_global](
                 pie_cuda_driver::model::Qwen3Workspace& ws,
                 pie_cuda_driver::KvCache& cache,
                 pie_cuda_driver::ops::CublasHandle& cublas,
@@ -3070,18 +3127,22 @@ int run_impl(int argc,
                 const std::uint32_t* kv_page_indices,
                 const std::uint32_t* kv_page_indptr,
                 const std::uint32_t* kv_last_page_lens,
+                std::int32_t* sampled_token_ids,
                 int N,
                 int draft_step,
                 int max_global_tokens) {
+                (void)sampled_token_ids;
                 pie_cuda_driver::model::Qwen3_5ForwardCfg q35_fwd{};
                 q35_fwd.tp_size = q35moe_tp_size;
                 q35_fwd.tp_comm = q35moe_tp_comm;
+                q35_fwd.mtp_global_cache_uses_prefix_position =
+                    mtp_prefix_global;
                 pie_cuda_driver::model::qwen3_5_moe_mtp_forward(
                     weights_qwen3_5_moe, engine.hf_config(), q35_fwd,
                     ws, qwen3_5_la_ws, qwen3_5_moe_ws, cache, cublas,
                     tok, pos, base_hidden_row_indices, request_ids,
                     kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                    N, draft_step, max_global_tokens);
+                    nullptr, N, draft_step, max_global_tokens);
             };
         }
         const char* q35moe_profile_env = std::getenv("PIE_QWEN35_MOE_PROFILE");
@@ -3171,11 +3232,9 @@ int run_impl(int argc,
         };
     }
 
-    pie_cuda_driver::SystemSpeculatorFn system_speculator;
-    int system_speculator_max_drafts = 0;
     if (gemma4_mtp_weights && gemma4_mtp_ws) {
-        system_speculator_max_drafts = cfg.model.mtp_num_drafts;
-        system_speculator =
+        system_drafter.max_drafts = native_mtp_num_drafts;
+        system_drafter.draft_next =
             [&weights_gemma4, &mtp_w = *gemma4_mtp_weights,
              &mtp_ws = *gemma4_mtp_ws, gemma4_mtp_runtime](
                 const pie_cuda_driver::SystemSpecDraftInputs& in,
@@ -3192,8 +3251,7 @@ int run_impl(int argc,
         mem_plan.max_requests,
         graph_pad_page,
         persistent_inputs, verbose, std::move(forward_fn),
-        std::move(system_speculator),
-        system_speculator_max_drafts,
+        std::move(system_drafter),
         use_cuda_graphs ? &graph_cache : nullptr,
         /*tp_comm=*/tp_comm_ptr,
         /*tp_cpu_gate_key=*/{},
@@ -3203,7 +3261,7 @@ int run_impl(int argc,
     };
     executor.tp_cpu_gate_key = cfg.distributed.nccl_unique_id_hex;
     // Pass-level speculation is runtime-owned. `.system_speculation()` is
-    // driver-owned when a native drafter (Gemma4 MTP) is configured.
+    // driver-owned when a native drafter is configured.
     if (verbose && use_cuda_graphs) {
         std::cerr << "[pie-driver-cuda] CUDA graphs enabled (experimental)\n";
     }
@@ -3259,8 +3317,7 @@ int run_impl(int argc,
             rs_cache_required && cfg.distributed.tp_size <= 1 &&
             qwen3_5_scratch_rs_slot >= 0;
         const bool system_speculation_supported =
-            static_cast<bool>(executor.forward_fn.mtp) ||
-            static_cast<bool>(executor.system_speculator);
+            static_cast<bool>(executor.system_drafter);
         const auto max_forward_requests_caps = rs_cache_required
             ? std::min<std::uint64_t>(
                   static_cast<std::uint64_t>(mem_plan.capacity.max_forward_requests),

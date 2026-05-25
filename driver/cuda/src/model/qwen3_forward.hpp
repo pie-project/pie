@@ -6,6 +6,7 @@
 
 #include <cstdint>
 
+#include "device_buffer.hpp"
 #include "model/loaded_model.hpp"
 #include "model/qwen3.hpp"
 #include "ops/gemm.hpp"
@@ -42,6 +43,10 @@ struct Qwen3Workspace {
     DeviceTensor greedy_tokens_all;  // [8, max_tokens] INT32, rank-major gather
     DeviceTensor greedy_pairs;       // [max_tokens] packed {FP32 value, INT32 token}
     DeviceTensor greedy_pairs_all;   // [8, max_tokens] packed rank/partition-major gather
+
+    DeviceBuffer<const std::uint16_t*> gate_up_act_ptrs; // [2], graph-stable
+    DeviceBuffer<const std::uint16_t*> gate_up_w_ptrs;   // [2], graph-stable
+    DeviceBuffer<std::uint16_t*>       gate_up_y_ptrs;   // [2], graph-stable
 
     // Padded variants for the attention kernel when `head_dim_kernel >
     // head_dim` (Phi-3 ships head_dim=96; flashinfer's TC kernel only

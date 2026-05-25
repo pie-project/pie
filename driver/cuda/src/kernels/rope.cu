@@ -485,6 +485,7 @@ __global__ void rope_partial_bf16_kernel(
     __nv_bfloat16* __restrict__ q,
     __nv_bfloat16* __restrict__ k,
     const std::int32_t* __restrict__ positions,
+    int position_delta,
     int num_q_heads,
     int num_kv_heads,
     int head_dim,
@@ -495,7 +496,7 @@ __global__ void rope_partial_bf16_kernel(
     const int total_heads = num_q_heads + num_kv_heads;
     const int half = head_dim / 2;
     const int rope_angles = rotary_dim / 2;
-    const int pos = positions[n];
+    const int pos = positions[n] + position_delta;
 
     for (int t = threadIdx.x; t < total_heads * half; t += blockDim.x) {
         const int head_idx = t / half;
@@ -552,6 +553,30 @@ void launch_rope_partial_bf16(
         static_cast<__nv_bfloat16*>(q),
         static_cast<__nv_bfloat16*>(k),
         positions,
+        0,
+        num_q_heads, num_kv_heads, head_dim, rotary_dim, theta);
+}
+
+void launch_rope_partial_bf16_position_delta(
+    void* q, void* k,
+    const std::int32_t* positions,
+    int position_delta,
+    int num_tokens,
+    int num_q_heads,
+    int num_kv_heads,
+    int head_dim,
+    int rotary_dim,
+    float theta,
+    cudaStream_t stream)
+{
+    constexpr int BLOCK = 256;
+    dim3 grid(num_tokens);
+    dim3 block(BLOCK);
+    rope_partial_bf16_kernel<<<grid, block, 0, stream>>>(
+        static_cast<__nv_bfloat16*>(q),
+        static_cast<__nv_bfloat16*>(k),
+        positions,
+        position_delta,
         num_q_heads, num_kv_heads, head_dim, rotary_dim, theta);
 }
 

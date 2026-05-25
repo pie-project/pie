@@ -82,6 +82,11 @@ struct Qwen3_5ForwardCfg {
     // forward just needs to use the local-head dims.
     int tp_size = 1;
     NcclComm* tp_comm = nullptr;
+
+    // Qwen MTP keeps the in-flight draft chain in local history. Its paged
+    // cache lookup should stay pinned to the verified source prefix while
+    // draft positions advance for RoPE and history masking.
+    bool mtp_global_cache_uses_prefix_position = false;
 };
 
 // Persistent decode-plan cache. Owned by main.cpp's serving setup so
@@ -161,7 +166,9 @@ void qwen3_5_forward_paged(
     const std::int32_t* mask_indptr_d,
     const std::int32_t* slot_ids_h = nullptr,
     const std::uint8_t* is_fresh_h = nullptr,
-    const std::int32_t* slot_ids_d = nullptr);
+    const std::int32_t* slot_ids_d = nullptr,
+    const std::int32_t* logit_row_indices_d = nullptr,
+    int num_logit_rows = 0);
 
 void qwen3_5_mtp_process_cache(
     const Qwen3_5Weights& w,
@@ -203,6 +210,7 @@ void qwen3_5_mtp_forward(
     const std::uint32_t* kv_page_indices,
     const std::uint32_t* kv_page_indptr,
     const std::uint32_t* kv_last_page_lens,
+    std::int32_t* sampled_token_ids,
     int num_tokens,
     int draft_step,
     int max_global_tokens);

@@ -6,19 +6,23 @@
 #include <cstdlib>
 #include <iostream>
 #include <stdexcept>
+#include <utility>
 
 #include <cuda_runtime.h>
 
 #include "cuda_check.hpp"
+#include "kernels/argmax.hpp"
 #include "kernels/causal_conv1d.hpp"
 #include "kernels/deinterleave.hpp"
 #include "kernels/embed.hpp"
 #include "kernels/gated_delta_net.hpp"
 #include "kernels/gather_rows.hpp"
 #include "kernels/kv_paged.hpp"
+#include "kernels/moe_dispatch.hpp"
 #include "kernels/residual_add.hpp"
 #include "kernels/rmsnorm.hpp"
 #include "kernels/rope.hpp"
+#include "kernels/split_packed.hpp"
 #include "kernels/swiglu.hpp"
 #include "ops/attention_naive.hpp"
 #include "ops/attention_naive_paged.hpp"
@@ -79,6 +83,24 @@ std::uint64_t mtp_profile_print_limit() {
     return limit;
 }
 
+bool qwen35_forward_profile_enabled() {
+    static const bool enabled = [] {
+        const char* v = std::getenv("PIE_QWEN35_FORWARD_PROFILE");
+        return v != nullptr && v[0] != '\0' && v[0] != '0';
+    }();
+    return enabled;
+}
+
+std::uint64_t qwen35_forward_profile_print_limit() {
+    static const std::uint64_t limit = [] {
+        const char* v = std::getenv("PIE_QWEN35_FORWARD_PROFILE_LIMIT");
+        if (v == nullptr || v[0] == '\0') return std::uint64_t{8};
+        const long parsed = std::strtol(v, nullptr, 10);
+        return parsed > 0 ? static_cast<std::uint64_t>(parsed) : std::uint64_t{0};
+    }();
+    return limit;
+}
+
 int qwen35_gdn_cached_prefill_max_tokens() {
     static const int max_tokens = [] {
         const char* v = std::getenv("PIE_QWEN35_GDN_CACHED_PREFILL_MAX_TOKENS");
@@ -95,6 +117,111 @@ int qwen35_gdn_warp_tiled_max_tokens() {
         return std::max(0, std::atoi(v));
     }();
     return max_tokens;
+}
+
+bool qwen35_mtp_shift_prefix_cache() {
+    static const bool enabled = [] {
+        const char* v = std::getenv("PIE_QWEN35_MTP_SHIFT_PREFIX_CACHE");
+        if (v == nullptr || v[0] == '\0') return false;
+        return v[0] != '0';
+    }();
+    return enabled;
+}
+
+bool qwen35_mtp_direct_argmax_enabled() {
+    static const bool enabled = [] {
+        const char* v = std::getenv("PIE_QWEN35_MTP_DIRECT_ARGMAX");
+        return v != nullptr && v[0] != '\0' && v[0] != '0';
+    }();
+    return enabled;
+}
+
+bool qwen35_dense_gate_up_batched_enabled() {
+    static const bool enabled = [] {
+        const char* v = std::getenv("PIE_QWEN35_DENSE_GATE_UP_BATCHED");
+        return v != nullptr && v[0] != '\0' && v[0] != '0';
+    }();
+    return enabled;
+}
+
+void qwen35_dense_mlp_block(
+    const Qwen3_5LayerWeights& Lw,
+    const HfConfig& cfg,
+    const Qwen3_5ForwardCfg& fwd_cfg,
+    Qwen3Workspace& ws,
+    ops::CublasHandle& cublas,
+    int N,
+    cudaStream_t stream)
+{
+    const int H = cfg.hidden_size;
+    const int T_mlp = std::max(1, fwd_cfg.tp_size);
+    const int I = cfg.intermediate_size / T_mlp;
+    NcclComm* tp_mlp = (T_mlp > 1) ? fwd_cfg.tp_comm : nullptr;
+    const bool use_fused_gate_up =
+        Lw.gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
+    if (use_fused_gate_up) {
+        ops::gemm_act_x_w(cublas.handle(),
+            ws.norm_x.data(), ops::WeightView(*Lw.gate_up_proj_fused),
+            ws.gate_up_fused.data(), N, 2 * I, H);
+        kernels::launch_chunked_swiglu_bf16(
+            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
+    } else if (qwen35_dense_gate_up_batched_enabled() &&
+        Lw.gate_proj != nullptr && Lw.up_proj != nullptr &&
+        !Lw.gate_proj_quant.has_value() &&
+        !Lw.up_proj_quant.has_value() &&
+        ws.gate_up_act_ptrs.size() >= 2 &&
+        ws.gate_up_w_ptrs.size() >= 2 &&
+        ws.gate_up_y_ptrs.size() >= 2) {
+        kernels::launch_build_dual_bf16_gemm_ptrs(
+            ws.norm_x.data(),
+            Lw.gate_proj->data(),
+            Lw.up_proj->data(),
+            ws.gate.data(),
+            ws.up.data(),
+            reinterpret_cast<const void**>(ws.gate_up_act_ptrs.data()),
+            reinterpret_cast<const void**>(ws.gate_up_w_ptrs.data()),
+            reinterpret_cast<void**>(ws.gate_up_y_ptrs.data()),
+            stream);
+        ops::gemm_batched_act_x_wt_bf16(
+            cublas.handle(),
+            reinterpret_cast<const void* const*>(
+                ws.gate_up_act_ptrs.data()),
+            reinterpret_cast<const void* const*>(
+                ws.gate_up_w_ptrs.data()),
+            reinterpret_cast<void* const*>(
+                ws.gate_up_y_ptrs.data()),
+            N, I, H, /*batch_count=*/2);
+        kernels::launch_swiglu_bf16(
+            ws.gate.data(), ws.up.data(), ws.gate.data(),
+            N * I, stream);
+    } else {
+        ops::gemm_act_x_w(cublas.handle(),
+            ws.norm_x.data(), make_weight_view(Lw.gate_proj, Lw.gate_proj_quant),
+            ws.gate.data(), N, I, H);
+        ops::gemm_act_x_w(cublas.handle(),
+            ws.norm_x.data(), make_weight_view(Lw.up_proj, Lw.up_proj_quant),
+            ws.up.data(), N, I, H);
+        kernels::launch_swiglu_bf16(
+            ws.gate.data(), ws.up.data(), ws.gate.data(),
+            N * I, stream);
+    }
+
+    // down_proj: TP=1 fuses residual via beta=1; TP>1 is row-parallel
+    // and needs all-reduce before adding back to the residual stream.
+    if (T_mlp == 1) {
+        ops::gemm_act_x_w(cublas.handle(),
+            ws.gate.data(), make_weight_view(Lw.down_proj, Lw.down_proj_quant),
+            ws.y.data(), N, H, I, /*beta=*/1.f);
+    } else {
+        ops::gemm_act_x_w(cublas.handle(),
+            ws.gate.data(), make_weight_view(Lw.down_proj, Lw.down_proj_quant),
+            ws.norm_y.data(), N, H, I, /*beta=*/0.f);
+        tp_mlp->all_reduce_bf16(ws.norm_y.data(),
+            static_cast<std::size_t>(N) * H, ncclSum, stream);
+        kernels::launch_residual_add_bf16(
+            ws.y.data(), ws.norm_y.data(),
+            static_cast<std::size_t>(N) * H, stream);
+    }
 }
 
 struct MtpProfile {
@@ -184,6 +311,164 @@ void maybe_print_mtp_profile(const MtpProfile& p) {
         << "\n";
 }
 
+struct ForwardProfile {
+    bool enabled = false;
+    int N = 0;
+    int R = 0;
+    int num_logit_rows = 0;
+    int linear_layers = 0;
+    int full_layers = 0;
+    bool pure_decode = false;
+    double reset_ms = 0.0;
+    double embed_ms = 0.0;
+    double attn_norm_ms = 0.0;
+    double linear_attn_ms = 0.0;
+    double linear_proj_ms = 0.0;
+    double linear_conv_ms = 0.0;
+    double linear_prep_ms = 0.0;
+    double linear_recur_ms = 0.0;
+    double linear_post_ms = 0.0;
+    double linear_out_ms = 0.0;
+    double full_attn_ms = 0.0;
+    double mlp_norm_ms = 0.0;
+    double mlp_ms = 0.0;
+    double final_norm_ms = 0.0;
+    double lm_head_ms = 0.0;
+    double final_copy_ms = 0.0;
+    double total_ms = 0.0;
+    cudaEvent_t total_start = nullptr;
+    cudaEvent_t total_stop = nullptr;
+    cudaEvent_t stage_start = nullptr;
+    cudaEvent_t stage_stop = nullptr;
+
+    ~ForwardProfile() {
+        if (total_start != nullptr) cudaEventDestroy(total_start);
+        if (total_stop != nullptr) cudaEventDestroy(total_stop);
+        if (stage_start != nullptr) cudaEventDestroy(stage_start);
+        if (stage_stop != nullptr) cudaEventDestroy(stage_stop);
+    }
+
+    void ensure_events() {
+        if (total_start != nullptr) return;
+        CUDA_CHECK(cudaEventCreate(&total_start));
+        CUDA_CHECK(cudaEventCreate(&total_stop));
+        CUDA_CHECK(cudaEventCreate(&stage_start));
+        CUDA_CHECK(cudaEventCreate(&stage_stop));
+    }
+
+    void begin(
+        int n,
+        int r,
+        bool decode,
+        int logit_rows,
+        cudaStream_t stream)
+    {
+        enabled = qwen35_forward_profile_enabled();
+        if (!enabled) return;
+        cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
+        CUDA_CHECK(cudaStreamIsCapturing(stream, &capture_status));
+        if (capture_status != cudaStreamCaptureStatusNone) {
+            enabled = false;
+            return;
+        }
+        ensure_events();
+        N = n;
+        R = r;
+        pure_decode = decode;
+        num_logit_rows = logit_rows;
+        linear_layers = full_layers = 0;
+        reset_ms = embed_ms = attn_norm_ms = linear_attn_ms = full_attn_ms = 0.0;
+        linear_proj_ms = linear_conv_ms = linear_prep_ms = linear_recur_ms = 0.0;
+        linear_post_ms = linear_out_ms = 0.0;
+        mlp_norm_ms = mlp_ms = final_norm_ms = lm_head_ms = final_copy_ms = 0.0;
+        total_ms = 0.0;
+        CUDA_CHECK(cudaEventRecord(total_start, stream));
+    }
+
+    void end(cudaStream_t stream) {
+        if (!enabled) return;
+        CUDA_CHECK(cudaEventRecord(total_stop, stream));
+        CUDA_CHECK(cudaEventSynchronize(total_stop));
+        float ms = 0.0f;
+        CUDA_CHECK(cudaEventElapsedTime(&ms, total_start, total_stop));
+        total_ms = static_cast<double>(ms);
+    }
+};
+
+template <class F>
+void profile_forward_stage(
+    ForwardProfile& profile,
+    double& dst,
+    cudaStream_t stream,
+    F&& fn)
+{
+    if (!profile.enabled) {
+        fn();
+        return;
+    }
+    CUDA_CHECK(cudaEventRecord(profile.stage_start, stream));
+    fn();
+    CUDA_CHECK(cudaEventRecord(profile.stage_stop, stream));
+    CUDA_CHECK(cudaEventSynchronize(profile.stage_stop));
+    float ms = 0.0f;
+    CUDA_CHECK(cudaEventElapsedTime(&ms, profile.stage_start, profile.stage_stop));
+    dst += static_cast<double>(ms);
+}
+
+template <class F>
+void profile_forward_stage_ptr(
+    ForwardProfile* profile,
+    double ForwardProfile::*field,
+    cudaStream_t stream,
+    F&& fn)
+{
+    if (profile == nullptr) {
+        fn();
+        return;
+    }
+    profile_forward_stage(*profile, (*profile).*field, stream, std::forward<F>(fn));
+}
+
+void maybe_print_forward_profile(const ForwardProfile& p) {
+    if (!p.enabled) return;
+    static std::uint64_t seq = 0;
+    ++seq;
+    const std::uint64_t limit = qwen35_forward_profile_print_limit();
+    if (limit == 0 || seq > limit) return;
+    const double named =
+        p.reset_ms + p.embed_ms + p.attn_norm_ms + p.linear_attn_ms +
+        p.full_attn_ms + p.mlp_norm_ms + p.mlp_ms + p.final_norm_ms +
+        p.lm_head_ms + p.final_copy_ms;
+    const double other = p.total_ms > named ? p.total_ms - named : 0.0;
+    std::cerr
+        << "[pie-qwen35-forward-profile] seq=" << seq
+        << " N=" << p.N
+        << " R=" << p.R
+        << " pure_decode=" << (p.pure_decode ? 1 : 0)
+        << " logit_rows=" << p.num_logit_rows
+        << " linear_layers=" << p.linear_layers
+        << " full_layers=" << p.full_layers
+        << " total_ms=" << p.total_ms
+        << " reset_ms=" << p.reset_ms
+        << " embed_ms=" << p.embed_ms
+        << " attn_norm_ms=" << p.attn_norm_ms
+        << " linear_attn_ms=" << p.linear_attn_ms
+        << " linear_proj_ms=" << p.linear_proj_ms
+        << " linear_conv_ms=" << p.linear_conv_ms
+        << " linear_prep_ms=" << p.linear_prep_ms
+        << " linear_recur_ms=" << p.linear_recur_ms
+        << " linear_post_ms=" << p.linear_post_ms
+        << " linear_out_ms=" << p.linear_out_ms
+        << " full_attn_ms=" << p.full_attn_ms
+        << " mlp_norm_ms=" << p.mlp_norm_ms
+        << " mlp_ms=" << p.mlp_ms
+        << " final_norm_ms=" << p.final_norm_ms
+        << " lm_head_ms=" << p.lm_head_ms
+        << " final_copy_ms=" << p.final_copy_ms
+        << " other_ms=" << other
+        << "\n";
+}
+
 // Linear-attn layer body. Reads `ws.norm_x` (post-input-layernorm
 // activations) and writes the layer's contribution into `ws.norm_y`
 // (which the caller adds to `ws.y` as the residual).
@@ -214,7 +499,8 @@ void linear_attn_layer_body(
     const std::uint32_t* qo_indptr_h,
     const std::uint32_t* qo_indptr_d,
     ops::CublasHandle& cublas,
-    cudaStream_t stream)
+    cudaStream_t stream,
+    ForwardProfile* profile = nullptr)
 {
     // TP-local dims for linear-attention. tp_size == 1 keeps everything
     // unsharded. The K/V head counts must divide tp_size (checked at
@@ -242,99 +528,123 @@ void linear_attn_layer_body(
     // Linear-attn projections stay bf16 (no QuantMeta companion in
     // Qwen3_5LayerWeights) — the implicit WeightView ctor pulls the
     // bf16 tensor through unchanged.
-    if (Lw.la_in_proj_qkvz != nullptr && Lw.la_in_proj_ba != nullptr) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_x.data(), *Lw.la_in_proj_qkvz,
-            la.mixed_qkvz.data(), N, conv_dim + V_dim, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_x.data(), *Lw.la_in_proj_ba,
-            la.ba.data(), N, 2 * V_h, H);
-        kernels::launch_split_qwen_gdn_projections_bf16(
-            la.mixed_qkvz.data(), la.ba.data(),
-            la.mixed_qkv.data(), la.z.data(), la.b.data(), la.a.data(),
-            N, conv_dim, V_dim, V_h, stream);
-    } else {
-        // mixed_qkv [N, conv_dim] = norm_x @ in_proj_qkv.T
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_x.data(), *Lw.la_in_proj_qkv,
-            la.mixed_qkv.data(), N, conv_dim, H);
-        // z [N, V_dim] = norm_x @ in_proj_z.T
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_x.data(), *Lw.la_in_proj_z,
-            la.z.data(), N, V_dim, H);
-        // a [N, V_h] = norm_x @ in_proj_a.T   (b symmetric)
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_x.data(), *Lw.la_in_proj_a,
-            la.a.data(), N, V_h, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_x.data(), *Lw.la_in_proj_b,
-            la.b.data(), N, V_h, H);
-    }
+    profile_forward_stage_ptr(profile, &ForwardProfile::linear_proj_ms, stream, [&] {
+        if (Lw.la_in_proj_qkvz != nullptr && Lw.la_in_proj_ba != nullptr) {
+            ops::gemm_act_x_w(cublas.handle(),
+                ws.norm_x.data(), *Lw.la_in_proj_qkvz,
+                la.mixed_qkvz.data(), N, conv_dim + V_dim, H);
+            ops::gemm_act_x_w(cublas.handle(),
+                ws.norm_x.data(), *Lw.la_in_proj_ba,
+                la.ba.data(), N, 2 * V_h, H);
+            kernels::launch_split_qwen_gdn_projections_bf16(
+                la.mixed_qkvz.data(), la.ba.data(),
+                la.mixed_qkv.data(), la.z.data(), la.b.data(), la.a.data(),
+                N, conv_dim, V_dim, V_h, stream);
+        } else {
+            // mixed_qkv [N, conv_dim] = norm_x @ in_proj_qkv.T
+            ops::gemm_act_x_w(cublas.handle(),
+                ws.norm_x.data(), *Lw.la_in_proj_qkv,
+                la.mixed_qkv.data(), N, conv_dim, H);
+            // z [N, V_dim] = norm_x @ in_proj_z.T
+            ops::gemm_act_x_w(cublas.handle(),
+                ws.norm_x.data(), *Lw.la_in_proj_z,
+                la.z.data(), N, V_dim, H);
+            if (Lw.la_in_proj_ba != nullptr) {
+                ops::gemm_act_x_w(cublas.handle(),
+                    ws.norm_x.data(), *Lw.la_in_proj_ba,
+                    la.ba.data(), N, 2 * V_h, H);
+                kernels::launch_split_qwen_gdn_ba_bf16(
+                    la.ba.data(), la.b.data(), la.a.data(), N, V_h, stream);
+            } else {
+                // a [N, V_h] = norm_x @ in_proj_a.T   (b symmetric)
+                ops::gemm_act_x_w(cublas.handle(),
+                    ws.norm_x.data(), *Lw.la_in_proj_a,
+                    la.a.data(), N, V_h, H);
+                ops::gemm_act_x_w(cublas.handle(),
+                    ws.norm_x.data(), *Lw.la_in_proj_b,
+                    la.b.data(), N, V_h, H);
+            }
+        }
+    });
 
     // ── Causal depthwise conv1d (kernel=K, fused silu) ────────────
     // Per-request conv_state lives in `state_cache.conv_state(layer, slot)`.
     // Layout: conv_state is [conv_K, conv_dim] bf16 per slot.
     auto* qkv_in_base   = la.mixed_qkv.data();
     auto* qkv_post_base = la.mixed_qkv_post.data();
-    if (is_pure_decode) {
-        // N == R; one token per request. Decode hot path → batched
-        // kernel: one launch picks per-request slot via slot_ids_d.
-        if (slot_ids_d != nullptr) {
-            kernels::launch_causal_conv1d_update_batched_bf16(
-                qkv_in_base, Lw.la_conv1d_w->data(),
-                Lw.la_conv1d_b ? Lw.la_conv1d_b->data() : nullptr,
-                state_cache.conv_state(layer_idx, /*slot=*/0),
-                slot_ids_d,
-                static_cast<long long>(state_cache.conv_kernel()) *
-                    state_cache.conv_dim(),
-                qkv_post_base,
-                R, conv_dim, conv_K, stream);
-        } else {
-            // Legacy single-request path (parity entrypoint, slot 0).
-            kernels::launch_causal_conv1d_update_bf16(
-                qkv_in_base, Lw.la_conv1d_w->data(),
-                Lw.la_conv1d_b ? Lw.la_conv1d_b->data() : nullptr,
-                state_cache.conv_state(layer_idx, 0),
-                qkv_post_base,
-                conv_dim, conv_K, stream);
-        }
-    } else {
-        // Prefill: batched kernel — one launch over (C, R) blocks; each
-        // block reads its own (t0_r, Nr_r) window from qo_indptr_d and
-        // walks tokens internally, persisting the trailing K-window
-        // into the request's slot. Falls back to host-loop for the
-        // legacy single-request parity entrypoint.
-        if (slot_ids_d != nullptr && qo_indptr_d != nullptr) {
-            kernels::launch_causal_conv1d_prefill_batched_snapshot_bf16(
-                qkv_in_base, Lw.la_conv1d_w->data(),
-                Lw.la_conv1d_b ? Lw.la_conv1d_b->data() : nullptr,
-                qkv_post_base,
-                state_cache.conv_state(layer_idx, /*slot=*/0),
-                slot_ids_d, qo_indptr_d,
-                static_cast<long long>(state_cache.conv_kernel()) *
-                    state_cache.conv_dim(),
-                R, conv_dim, conv_K,
-                snapshot_base_slot, snapshot_count, stream);
-        } else {
-            for (int r = 0; r < R; ++r) {
-                const int t0 = static_cast<int>(qo_indptr_h[r]);
-                const int Nr = static_cast<int>(qo_indptr_h[r + 1]) - t0;
-                if (Nr <= 0) continue;
-                const std::size_t off = static_cast<std::size_t>(t0) * conv_dim;
-                kernels::launch_causal_conv1d_prefill_bf16(
-                    qkv_in_base + off, Lw.la_conv1d_w->data(),
+    profile_forward_stage_ptr(profile, &ForwardProfile::linear_conv_ms, stream, [&] {
+        if (is_pure_decode) {
+            // N == R; one token per request. Decode hot path → batched
+            // kernel: one launch picks per-request slot via slot_ids_d.
+            if (slot_ids_d != nullptr) {
+                kernels::launch_causal_conv1d_update_batched_bf16(
+                    qkv_in_base, Lw.la_conv1d_w->data(),
                     Lw.la_conv1d_b ? Lw.la_conv1d_b->data() : nullptr,
-                    qkv_post_base + off,
-                    state_cache.conv_state(layer_idx, slot_for(r)),
-                    Nr, conv_dim, conv_K, stream);
+                    state_cache.conv_state(layer_idx, /*slot=*/0),
+                    slot_ids_d,
+                    static_cast<long long>(state_cache.conv_kernel()) *
+                        state_cache.conv_dim(),
+                    qkv_post_base,
+                    R, conv_dim, conv_K, stream);
+            } else {
+                // Legacy single-request path (parity entrypoint, slot 0).
+                kernels::launch_causal_conv1d_update_bf16(
+                    qkv_in_base, Lw.la_conv1d_w->data(),
+                    Lw.la_conv1d_b ? Lw.la_conv1d_b->data() : nullptr,
+                    state_cache.conv_state(layer_idx, 0),
+                    qkv_post_base,
+                    conv_dim, conv_K, stream);
+            }
+        } else {
+            // Prefill: batched kernel — one launch over (C, R) blocks; each
+            // block reads its own (t0_r, Nr_r) window from qo_indptr_d and
+            // walks tokens internally, persisting the trailing K-window
+            // into the request's slot. Falls back to host-loop for the
+            // legacy single-request parity entrypoint.
+            if (slot_ids_d != nullptr && qo_indptr_d != nullptr) {
+                kernels::launch_causal_conv1d_prefill_batched_snapshot_bf16(
+                    qkv_in_base, Lw.la_conv1d_w->data(),
+                    Lw.la_conv1d_b ? Lw.la_conv1d_b->data() : nullptr,
+                    qkv_post_base,
+                    state_cache.conv_state(layer_idx, /*slot=*/0),
+                    slot_ids_d, qo_indptr_d,
+                    static_cast<long long>(state_cache.conv_kernel()) *
+                        state_cache.conv_dim(),
+                    R, conv_dim, conv_K,
+                    snapshot_base_slot, snapshot_count, stream);
+            } else {
+                for (int r = 0; r < R; ++r) {
+                    const int t0 = static_cast<int>(qo_indptr_h[r]);
+                    const int Nr = static_cast<int>(qo_indptr_h[r + 1]) - t0;
+                    if (Nr <= 0) continue;
+                    const std::size_t off = static_cast<std::size_t>(t0) * conv_dim;
+                    kernels::launch_causal_conv1d_prefill_bf16(
+                        qkv_in_base + off, Lw.la_conv1d_w->data(),
+                        Lw.la_conv1d_b ? Lw.la_conv1d_b->data() : nullptr,
+                        qkv_post_base + off,
+                        state_cache.conv_state(layer_idx, slot_for(r)),
+                        Nr, conv_dim, conv_K, stream);
+                }
             }
         }
-    }
+    });
 
     // ── Split mixed_qkv_post + prep recurrent inputs ─────────────
     // mixed_qkv_post[N, conv_dim] packs [q_raw | k_raw | v_raw]. The fused
     // prep kernel emits compact q/k heads, fp32 v, and per-head g/beta.
     auto* qkv_base = la.mixed_qkv_post.data();
+    const bool use_warp_tiled_recurrent =
+        !is_pure_decode &&
+        slot_ids_d != nullptr &&
+        qo_indptr_d != nullptr &&
+        N <= qwen35_gdn_warp_tiled_max_tokens() &&
+        K_d <= 256;
+    const bool use_decode_gqa_recurrent =
+        is_pure_decode &&
+        slot_ids_d != nullptr &&
+        V_h != K_h &&
+        V_h % K_h == 0;
+    profile_forward_stage_ptr(profile, &ForwardProfile::linear_prep_ms, stream, [&] {
         kernels::launch_qwen_gdn_post_conv_prep_bf16(
             qkv_base, la.a.data(), la.b.data(),
             Lw.la_A_log_fp32, Lw.la_dt_bias->data(),
@@ -342,17 +652,6 @@ void linear_attn_layer_body(
             la.g_log.data(), la.beta.data(),
             N, K_h, V_h, K_d, V_d, conv_dim, stream);
 
-        const bool use_warp_tiled_recurrent =
-            !is_pure_decode &&
-            slot_ids_d != nullptr &&
-            qo_indptr_d != nullptr &&
-            N <= qwen35_gdn_warp_tiled_max_tokens() &&
-            K_d <= 256;
-        const bool use_decode_gqa_recurrent =
-            is_pure_decode &&
-            slot_ids_d != nullptr &&
-            V_h != K_h &&
-            V_h % K_h == 0;
         // repeat_interleave from K_h to V_h heads. The warp-tiled verifier
         // and GQA decode recurrent kernels can index the compact K_h layout
         // directly, so skip materialisation there.
@@ -363,16 +662,18 @@ void linear_attn_layer_body(
             kernels::launch_repeat_interleave_heads_fp32(
                 la.k_pre.data(), la.k_norm.data(), N, K_h, V_h, K_d, stream);
         }
-        const float* q_recur_full =
-            (V_h == K_h) ? la.q_pre.data() : la.q_norm.data();
-        const float* k_recur_full =
-            (V_h == K_h) ? la.k_pre.data() : la.k_norm.data();
+    });
+    const float* q_recur_full =
+        (V_h == K_h) ? la.q_pre.data() : la.q_norm.data();
+    const float* k_recur_full =
+        (V_h == K_h) ? la.k_pre.data() : la.k_norm.data();
 
         // ── Recurrent update ───────────────────────────────────────────
         // Both decode and prefill: one batched launch over (R, V_h) blocks
         // with per-block slot (and on prefill, qo_indptr) indirection.
         // Decode = one token per request; prefill = each block walks its
         // own T_r-token window from `qo_indptr_d` along the recurrence.
+    profile_forward_stage_ptr(profile, &ForwardProfile::linear_recur_ms, stream, [&] {
         {
             const std::size_t qk_step = static_cast<std::size_t>(V_h) * K_d;
             const std::size_t v_step  = static_cast<std::size_t>(V_dim);
@@ -520,7 +821,7 @@ void linear_attn_layer_body(
                         }
                     } else if (N <= qwen35_gdn_cached_prefill_max_tokens()) {
                         if (state_bf16) {
-                            kernels::launch_chunk_gated_delta_prefill_batched_cached_state_bf16(
+                            kernels::launch_chunk_gated_delta_prefill_batched_cached_snapshot_state_bf16(
                                 q_recur_full,
                                 k_recur_full,
                                 la.v_fp32.data(),
@@ -530,9 +831,10 @@ void linear_attn_layer_body(
                                 slot_ids_d, qo_indptr_d,
                                 slot_stride,
                                 la.core_out.data(),
-                                R, V_h, K_d, V_d, stream);
+                                R, V_h, K_d, V_d,
+                                snapshot_base_slot, snapshot_count, stream);
                         } else {
-                            kernels::launch_chunk_gated_delta_prefill_batched_cached(
+                            kernels::launch_chunk_gated_delta_prefill_batched_cached_snapshot(
                                 q_recur_full,
                                 k_recur_full,
                                 la.v_fp32.data(),
@@ -542,7 +844,8 @@ void linear_attn_layer_body(
                                 slot_ids_d, qo_indptr_d,
                                 slot_stride,
                                 la.core_out.data(),
-                                R, V_h, K_d, V_d, stream);
+                                R, V_h, K_d, V_d,
+                                snapshot_base_slot, snapshot_count, stream);
                         }
                     } else {
                         if (state_bf16) {
@@ -606,40 +909,45 @@ void linear_attn_layer_body(
                 }
             }
         }
+    });
 
     // ── core_out → bf16, then RMSNormGated with z ──────────────────
     // core_out has [N, V_h, V_d] layout = [N, V_dim] flat. We want
     // RMSNormGated over V_d per (n, h). Treat as [N*V_h, V_d].
-    kernels::launch_fp32_to_bf16(
-        la.core_out.data(), la.core_out_bf16.data(),
-        (std::size_t)N * V_dim, stream);
+    profile_forward_stage_ptr(profile, &ForwardProfile::linear_post_ms, stream, [&] {
+        kernels::launch_fp32_to_bf16(
+            la.core_out.data(), la.core_out_bf16.data(),
+            (std::size_t)N * V_dim, stream);
 
-    // RMSNormGated: y = weight * x_hat * silu(gate) where weight is
-    // per-V_d. z must align — it's [N, V_dim] in token-row layout, so
-    // viewing it as [N*V_h, V_d] gives the correct broadcast.
-    kernels::launch_rmsnorm_gated_bf16(
-        la.core_out_bf16.data(), la.z.data(), Lw.la_norm_w_fp32,
-        la.core_out_bf16.data(),
-        N * V_h, V_d, /*eps=*/cfg.rms_norm_eps, stream);
+        // RMSNormGated: y = weight * x_hat * silu(gate) where weight is
+        // per-V_d. z must align — it's [N, V_dim] in token-row layout, so
+        // viewing it as [N*V_h, V_d] gives the correct broadcast.
+        kernels::launch_rmsnorm_gated_bf16(
+            la.core_out_bf16.data(), la.z.data(), Lw.la_norm_w_fp32,
+            la.core_out_bf16.data(),
+            N * V_h, V_d, /*eps=*/cfg.rms_norm_eps, stream);
+    });
 
     // ── out_proj: [N, V_dim] → [N, H]. On TP=1 we fuse the residual via
     //    beta=1; on TP>1 the proj is row-parallel so we write to scratch,
     //    all-reduce, then residual-add into y.
     NcclComm* tp = (T > 1) ? fwd_cfg.tp_comm : nullptr;
-    if (T == 1) {
-        ops::gemm_act_x_w(cublas.handle(),
-            la.core_out_bf16.data(), *Lw.la_out_proj,
-            ws.y.data(), N, H, V_dim, /*beta=*/1.f);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            la.core_out_bf16.data(), *Lw.la_out_proj,
-            ws.norm_y.data(), N, H, V_dim, /*beta=*/0.f);
-        tp->all_reduce_bf16(ws.norm_y.data(),
-            static_cast<std::size_t>(N) * H, ncclSum, stream);
-        kernels::launch_residual_add_bf16(
-            ws.y.data(), ws.norm_y.data(),
-            static_cast<std::size_t>(N) * H, stream);
-    }
+    profile_forward_stage_ptr(profile, &ForwardProfile::linear_out_ms, stream, [&] {
+        if (T == 1) {
+            ops::gemm_act_x_w(cublas.handle(),
+                la.core_out_bf16.data(), *Lw.la_out_proj,
+                ws.y.data(), N, H, V_dim, /*beta=*/1.f);
+        } else {
+            ops::gemm_act_x_w(cublas.handle(),
+                la.core_out_bf16.data(), *Lw.la_out_proj,
+                ws.norm_y.data(), N, H, V_dim, /*beta=*/0.f);
+            tp->all_reduce_bf16(ws.norm_y.data(),
+                static_cast<std::size_t>(N) * H, ncclSum, stream);
+            kernels::launch_residual_add_bf16(
+                ws.y.data(), ws.norm_y.data(),
+                static_cast<std::size_t>(N) * H, stream);
+        }
+    });
 }
 
 // Full-attention layer body. Reads `ws.norm_x`, writes contribution
@@ -679,20 +987,34 @@ void full_attn_layer_body(
     NcclComm* tp = (T > 1) ? fwd_cfg.tp_comm : nullptr;
 
     // ── q/k/v projections (q is 2× wide for the output gate) ──────
-    // qg_packed [N, 2*Hq] = norm_x @ q_proj.T
-    ops::gemm_act_x_w(cublas.handle(),
-        ws.norm_x.data(), make_weight_view(Lw.fa_q_proj, Lw.fa_q_proj_quant),
-        la.fa_qg_packed.data(), N, 2 * Hq, H);
+    const int qgkv_dim = 2 * Hq + 2 * Hk;
+    const bool use_fused_qgkv =
+        Lw.fa_qgkv_proj_fused != nullptr &&
+        !ws.gate_up_fused.empty() &&
+        ws.gate_up_fused.numel() >= static_cast<std::size_t>(N) * qgkv_dim;
+    if (use_fused_qgkv) {
+        ops::gemm_act_x_w(cublas.handle(),
+            ws.norm_x.data(), ops::WeightView(*Lw.fa_qgkv_proj_fused),
+            ws.gate_up_fused.data(), N, qgkv_dim, H);
+        kernels::launch_split_qkv_bf16(
+            ws.gate_up_fused.data(),
+            la.fa_qg_packed.data(), ws.k.data(), ws.v.data(),
+            N, 2 * Hq, Hk, stream);
+    } else {
+        // qg_packed [N, 2*Hq] = norm_x @ q_proj.T
+        ops::gemm_act_x_w(cublas.handle(),
+            ws.norm_x.data(), make_weight_view(Lw.fa_q_proj, Lw.fa_q_proj_quant),
+            la.fa_qg_packed.data(), N, 2 * Hq, H);
+        ops::gemm_act_x_w(cublas.handle(),
+            ws.norm_x.data(), make_weight_view(Lw.fa_k_proj, Lw.fa_k_proj_quant),
+            ws.k.data(), N, Hk, H);
+        ops::gemm_act_x_w(cublas.handle(),
+            ws.norm_x.data(), make_weight_view(Lw.fa_v_proj, Lw.fa_v_proj_quant),
+            ws.v.data(), N, Hk, H);
+    }
     kernels::launch_split_q_gate_bf16(
         la.fa_qg_packed.data(), ws.q.data(), la.fa_gate.data(),
         N, num_q_heads_local, d, stream);
-
-    ops::gemm_act_x_w(cublas.handle(),
-        ws.norm_x.data(), make_weight_view(Lw.fa_k_proj, Lw.fa_k_proj_quant),
-        ws.k.data(), N, Hk, H);
-    ops::gemm_act_x_w(cublas.handle(),
-        ws.norm_x.data(), make_weight_view(Lw.fa_v_proj, Lw.fa_v_proj_quant),
-        ws.v.data(), N, Hk, H);
 
     // ── q_norm / k_norm (gemma-style (1+w)·x_hat) ─────────────────
     kernels::launch_rmsnorm_gemma_bf16(
@@ -883,7 +1205,9 @@ void qwen3_5_forward_paged(
     const std::int32_t* /*mask_indptr_d*/,
     const std::int32_t* slot_ids_h,
     const std::uint8_t* is_fresh_h,
-    const std::int32_t* slot_ids_d)
+    const std::int32_t* slot_ids_d,
+    const std::int32_t* logit_row_indices_d,
+    int num_logit_rows)
 {
     const int H  = cfg.hidden_size;
     const int V  = cfg.vocab_size;
@@ -891,6 +1215,8 @@ void qwen3_5_forward_paged(
     const int R  = num_requests;
     const float eps = cfg.rms_norm_eps;
     cudaStream_t stream = cublas.stream();
+    ForwardProfile profile;
+    profile.begin(N, R, is_pure_decode, num_logit_rows, stream);
 
     // Per-slot reset for any request whose slot was just (re)assigned.
     // The runtime guarantees a slot is_fresh only on the first fire of a
@@ -899,15 +1225,17 @@ void qwen3_5_forward_paged(
     // continuing decodes that share the fire. Legacy path (slot_ids_h
     // null) keeps the old "reset all on prefill" behaviour for the
     // parity entry point; max_slots == 1 there makes the two equivalent.
-    if (slot_ids_h != nullptr && is_fresh_h != nullptr) {
-        for (int r = 0; r < R; ++r) {
-            if (is_fresh_h[r]) {
-                state_cache.reset_slot(slot_ids_h[r], stream);
+    profile_forward_stage(profile, profile.reset_ms, stream, [&] {
+        if (slot_ids_h != nullptr && is_fresh_h != nullptr) {
+            for (int r = 0; r < R; ++r) {
+                if (is_fresh_h[r]) {
+                    state_cache.reset_slot(slot_ids_h[r], stream);
+                }
             }
+        } else if (!is_pure_decode) {
+            state_cache.reset(stream);
         }
-    } else if (!is_pure_decode) {
-        state_cache.reset(stream);
-    }
+    });
 
     // Decode plan was refreshed by `prepare_qwen3_5_decode_plan` before
     // this body call (in serving) or as part of the host-side parity
@@ -922,33 +1250,43 @@ void qwen3_5_forward_paged(
             : nullptr;
 
     // 1. Embed.
-    kernels::launch_embed_bf16(
-        token_ids, w.embed->data(), ws.y.data(),
-        N, H, cfg.vocab_size, stream);
+    profile_forward_stage(profile, profile.embed_ms, stream, [&] {
+        kernels::launch_embed_bf16(
+            token_ids, w.embed->data(), ws.y.data(),
+            N, H, cfg.vocab_size, stream);
+    });
 
     // 2. Per-layer.
     for (std::size_t L = 0; L < w.layers.size(); ++L) {
         const auto& Lw = w.layers[L];
 
         // Pre-attention norm: y → norm_x.
-        kernels::launch_rmsnorm_gemma_bf16(
-            ws.y.data(), Lw.attn_norm_pre->data(), ws.norm_x.data(),
-            N, H, eps, stream);
+        profile_forward_stage(profile, profile.attn_norm_ms, stream, [&] {
+            kernels::launch_rmsnorm_gemma_bf16(
+                ws.y.data(), Lw.attn_norm_pre->data(), ws.norm_x.data(),
+                N, H, eps, stream);
+        });
 
         if (Lw.kind == Qwen3_5LayerWeights::Kind::LinearAttn) {
-            linear_attn_layer_body(
-                Lw, cfg, fwd_cfg, ws, la_ws, state_cache,
-                static_cast<int>(L), N, R, is_pure_decode,
-                slot_ids_h, slot_ids_d, qo_indptr_h, qo_indptr,
-                cublas, stream);
+            ++profile.linear_layers;
+            profile_forward_stage(profile, profile.linear_attn_ms, stream, [&] {
+                linear_attn_layer_body(
+                    Lw, cfg, fwd_cfg, ws, la_ws, state_cache,
+                    static_cast<int>(L), N, R, is_pure_decode,
+                    slot_ids_h, slot_ids_d, qo_indptr_h, qo_indptr,
+                    cublas, stream, &profile);
+            });
         } else {
-            full_attn_layer_body(
-                Lw, cfg, fwd_cfg, ws, la_ws, cache, attn_ws,
-                decode_plan, prefill_plan, Lw.kv_layer,
-                N, num_requests,
-                positions, qo_indptr, kv_page_indices, kv_page_indptr,
-                kv_last_page_lens, qo_indptr_h, kv_page_indptr_h,
-                cublas, stream);
+            ++profile.full_layers;
+            profile_forward_stage(profile, profile.full_attn_ms, stream, [&] {
+                full_attn_layer_body(
+                    Lw, cfg, fwd_cfg, ws, la_ws, cache, attn_ws,
+                    decode_plan, prefill_plan, Lw.kv_layer,
+                    N, num_requests,
+                    positions, qo_indptr, kv_page_indices, kv_page_indptr,
+                    kv_last_page_lens, qo_indptr_h, kv_page_indptr_h,
+                    cublas, stream);
+            });
         }
 
         // (Post-attention residual is fused into the body's final GEMM
@@ -957,52 +1295,52 @@ void qwen3_5_forward_paged(
         //  point.)
 
         // Post-attention norm + SwiGLU MLP + residual.
-        kernels::launch_rmsnorm_gemma_bf16(
-            ws.y.data(), Lw.mlp_norm_pre->data(), ws.norm_x.data(),
-            N, H, eps, stream);
-        const int T_mlp = std::max(1, fwd_cfg.tp_size);
-        const int I = cfg.intermediate_size / T_mlp;
-        NcclComm* tp_mlp = (T_mlp > 1) ? fwd_cfg.tp_comm : nullptr;
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_x.data(), make_weight_view(Lw.gate_proj, Lw.gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_x.data(), make_weight_view(Lw.up_proj, Lw.up_proj_quant),
-            ws.up.data(), N, I, H);
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-        // down_proj: TP=1 fuses residual via beta=1; TP>1 is row-parallel
-        // — write to scratch, all-reduce, residual-add.
-        if (T_mlp == 1) {
-            ops::gemm_act_x_w(cublas.handle(),
-                ws.gate.data(), make_weight_view(Lw.down_proj, Lw.down_proj_quant),
-                ws.y.data(), N, H, I, /*beta=*/1.f);
-        } else {
-            ops::gemm_act_x_w(cublas.handle(),
-                ws.gate.data(), make_weight_view(Lw.down_proj, Lw.down_proj_quant),
-                ws.norm_y.data(), N, H, I, /*beta=*/0.f);
-            tp_mlp->all_reduce_bf16(ws.norm_y.data(),
-                static_cast<std::size_t>(N) * H, ncclSum, stream);
-            kernels::launch_residual_add_bf16(
-                ws.y.data(), ws.norm_y.data(),
-                static_cast<std::size_t>(N) * H, stream);
-        }
+        profile_forward_stage(profile, profile.mlp_norm_ms, stream, [&] {
+            kernels::launch_rmsnorm_gemma_bf16(
+                ws.y.data(), Lw.mlp_norm_pre->data(), ws.norm_x.data(),
+                N, H, eps, stream);
+        });
+        profile_forward_stage(profile, profile.mlp_ms, stream, [&] {
+            qwen35_dense_mlp_block(Lw, cfg, fwd_cfg, ws, cublas, N, stream);
+        });
     }
 
     // 3. Final norm.
-    kernels::launch_rmsnorm_gemma_bf16(
-        ws.y.data(), w.final_norm->data(), ws.norm_x.data(),
-        N, H, eps, stream);
+    profile_forward_stage(profile, profile.final_norm_ms, stream, [&] {
+        kernels::launch_rmsnorm_gemma_bf16(
+            ws.y.data(), w.final_norm->data(), ws.norm_x.data(),
+            N, H, eps, stream);
+    });
 
-    // 4. lm_head.
-    ops::gemm_act_x_w(cublas.handle(),
-        ws.norm_x.data(), *w.lm_head,
-        ws.logits.data(), N, V, H);
-    CUDA_CHECK(cudaMemcpyAsync(
-        ws.y.data(), ws.norm_x.data(),
-        static_cast<std::size_t>(N) * H * sizeof(std::uint16_t),
-        cudaMemcpyDeviceToDevice, stream));
+    // 4. lm_head. For prompt/prefill-style fires the runtime may need
+    // logits for only a small sampler subset. Keep the full hidden stream in
+    // ws.y for MTP/state plumbing, but feed lm_head from gathered rows.
+    profile_forward_stage(profile, profile.lm_head_ms, stream, [&] {
+        if (logit_row_indices_d != nullptr &&
+            num_logit_rows > 0 &&
+            num_logit_rows < N) {
+            kernels::launch_gather_bf16_rows(
+                static_cast<const std::uint16_t*>(ws.norm_x.data()),
+                logit_row_indices_d,
+                static_cast<std::uint16_t*>(ws.norm_y.data()),
+                num_logit_rows, H, stream);
+            ops::gemm_act_x_w(cublas.handle(),
+                ws.norm_y.data(), *w.lm_head,
+                ws.logits.data(), num_logit_rows, V, H);
+        } else {
+            ops::gemm_act_x_w(cublas.handle(),
+                ws.norm_x.data(), *w.lm_head,
+                ws.logits.data(), N, V, H);
+        }
+    });
+    profile_forward_stage(profile, profile.final_copy_ms, stream, [&] {
+        CUDA_CHECK(cudaMemcpyAsync(
+            ws.y.data(), ws.norm_x.data(),
+            static_cast<std::size_t>(N) * H * sizeof(std::uint16_t),
+            cudaMemcpyDeviceToDevice, stream));
+    });
+    profile.end(stream);
+    maybe_print_forward_profile(profile);
 }
 
 namespace {
@@ -1040,19 +1378,33 @@ void mtp_full_attn_no_cache(
     auto* k_step = static_cast<std::uint16_t*>(ws.k.data()) + kv_step_offset;
     auto* v_step = static_cast<std::uint16_t*>(ws.v.data()) + kv_step_offset;
 
-    ops::gemm_act_x_w(cublas.handle(),
-        ws.norm_x.data(), make_weight_view(Lw.fa_q_proj, Lw.fa_q_proj_quant),
-        la.fa_qg_packed.data(), N, 2 * Hq, H);
+    const int qgkv_dim = 2 * Hq + 2 * Hk;
+    const bool use_fused_qgkv =
+        Lw.fa_qgkv_proj_fused != nullptr &&
+        !ws.gate_up_fused.empty() &&
+        ws.gate_up_fused.numel() >= static_cast<std::size_t>(N) * qgkv_dim;
+    if (use_fused_qgkv) {
+        ops::gemm_act_x_w(cublas.handle(),
+            ws.norm_x.data(), ops::WeightView(*Lw.fa_qgkv_proj_fused),
+            ws.gate_up_fused.data(), N, qgkv_dim, H);
+        kernels::launch_split_qkv_bf16(
+            ws.gate_up_fused.data(),
+            la.fa_qg_packed.data(), k_step, v_step,
+            N, 2 * Hq, Hk, stream);
+    } else {
+        ops::gemm_act_x_w(cublas.handle(),
+            ws.norm_x.data(), make_weight_view(Lw.fa_q_proj, Lw.fa_q_proj_quant),
+            la.fa_qg_packed.data(), N, 2 * Hq, H);
+        ops::gemm_act_x_w(cublas.handle(),
+            ws.norm_x.data(), make_weight_view(Lw.fa_v_proj, Lw.fa_v_proj_quant),
+            v_step, N, Hk, H);
+        ops::gemm_act_x_w(cublas.handle(),
+            ws.norm_x.data(), make_weight_view(Lw.fa_k_proj, Lw.fa_k_proj_quant),
+            k_step, N, Hk, H);
+    }
     kernels::launch_split_q_gate_bf16(
         la.fa_qg_packed.data(), ws.q.data(), la.fa_gate.data(),
         N, q_heads, cfg.head_dim, stream);
-
-    ops::gemm_act_x_w(cublas.handle(),
-        ws.norm_x.data(), make_weight_view(Lw.fa_v_proj, Lw.fa_v_proj_quant),
-        v_step, N, Hk, H);
-    ops::gemm_act_x_w(cublas.handle(),
-        ws.norm_x.data(), make_weight_view(Lw.fa_k_proj, Lw.fa_k_proj_quant),
-        k_step, N, Hk, H);
 
     kernels::launch_rmsnorm_gemma_bf16(
         ws.q.data(), Lw.fa_q_norm->data(), ws.q.data(),
@@ -1071,7 +1423,8 @@ void mtp_full_attn_no_cache(
         position_ids, request_ids,
         kv_page_indices, kv_page_indptr, kv_last_page_lens,
         N, draft_step + 1, N, max_global_tokens, cache.page_size(),
-        q_heads, kv_heads, d, mtp_kv.hnd_layout, stream);
+        q_heads, kv_heads, d, mtp_kv.hnd_layout,
+        fwd_cfg.mtp_global_cache_uses_prefix_position, stream);
     kernels::launch_sigmoid_gate_inplace_bf16(
         ws.attn_out.data(), la.fa_gate.data(), N * Hq, stream);
 
@@ -1171,13 +1524,26 @@ void qwen3_5_mtp_process_cache(
     kernels::launch_rmsnorm_gemma_bf16(
         ws.k.data(), Lw.fa_k_norm->data(), ws.k.data(),
         total_tokens * kv_heads, d, eps, stream);
-    kernels::launch_rope_partial_bf16(
-        /*q=*/nullptr, ws.k.data(), positions,
-        total_tokens, 0, kv_heads, d, rotary_dim, cfg.rope_theta, stream);
-    kernels::launch_write_kv_to_pages(
-        cache.layer_view(Lw.kv_layer),
-        ws.k.data(), ws.v.data(), qo_indptr, kv_page_indices,
-        kv_page_indptr, kv_last_page_lens, total_tokens, num_requests, stream);
+    const bool shifted_prefix_cache = qwen35_mtp_shift_prefix_cache();
+    if (shifted_prefix_cache) {
+        kernels::launch_rope_partial_bf16_position_delta(
+            /*q=*/nullptr, ws.k.data(), positions, -1,
+            total_tokens, 0, kv_heads, d, rotary_dim, cfg.rope_theta, stream);
+        kernels::launch_write_kv_to_pages_at_positions_bf16(
+            cache.layer_view(Lw.kv_layer),
+            ws.k.data(), ws.v.data(), positions, -1,
+            qo_indptr, kv_page_indices, kv_page_indptr,
+            total_tokens, num_requests, stream);
+    } else {
+        kernels::launch_rope_partial_bf16(
+            /*q=*/nullptr, ws.k.data(), positions,
+            total_tokens, 0, kv_heads, d, rotary_dim, cfg.rope_theta, stream);
+        kernels::launch_write_kv_to_pages(
+            cache.layer_view(Lw.kv_layer),
+            ws.k.data(), ws.v.data(), qo_indptr, kv_page_indices,
+            kv_page_indptr, kv_last_page_lens, total_tokens, num_requests,
+            stream);
+    }
 }
 
 void qwen3_5_mtp_forward(
@@ -1195,6 +1561,7 @@ void qwen3_5_mtp_forward(
     const std::uint32_t* kv_page_indices,
     const std::uint32_t* kv_page_indptr,
     const std::uint32_t* kv_last_page_lens,
+    std::int32_t* sampled_token_ids,
     int num_tokens,
     int draft_step,
     int max_global_tokens)
@@ -1246,41 +1613,37 @@ void qwen3_5_mtp_forward(
     kernels::launch_rmsnorm_gemma_bf16(
         ws.y.data(), Lw.mlp_norm_pre->data(), ws.norm_x.data(),
         num_tokens, H, eps, stream);
-    const int T_mlp = std::max(1, fwd_cfg.tp_size);
-    const int I = cfg.intermediate_size / T_mlp;
-    NcclComm* tp_mlp = (T_mlp > 1) ? fwd_cfg.tp_comm : nullptr;
-    ops::gemm_act_x_w(cublas.handle(),
-        ws.norm_x.data(), make_weight_view(Lw.gate_proj, Lw.gate_proj_quant),
-        ws.gate.data(), num_tokens, I, H);
-    ops::gemm_act_x_w(cublas.handle(),
-        ws.norm_x.data(), make_weight_view(Lw.up_proj, Lw.up_proj_quant),
-        ws.up.data(), num_tokens, I, H);
-    kernels::launch_swiglu_bf16(
-        ws.gate.data(), ws.up.data(), ws.gate.data(),
-        num_tokens * I, stream);
-    if (T_mlp == 1) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.gate.data(), make_weight_view(Lw.down_proj, Lw.down_proj_quant),
-            ws.y.data(), num_tokens, H, I, /*beta=*/1.f);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.gate.data(), make_weight_view(Lw.down_proj, Lw.down_proj_quant),
-            ws.norm_y.data(), num_tokens, H, I, /*beta=*/0.f);
-        tp_mlp->all_reduce_bf16(ws.norm_y.data(),
-            static_cast<std::size_t>(num_tokens) * H, ncclSum, stream);
-        kernels::launch_residual_add_bf16(
-            ws.y.data(), ws.norm_y.data(),
-            static_cast<std::size_t>(num_tokens) * H, stream);
-    }
+    qwen35_dense_mlp_block(
+        Lw, cfg, fwd_cfg, ws, cublas, num_tokens, stream);
     });
 
     profile_mtp_stage(profile, profile.lm_head_ms, stream, [&] {
     kernels::launch_rmsnorm_gemma_bf16(
         ws.y.data(), mtp.norm->data(), ws.norm_x.data(),
         num_tokens, H, eps, stream);
-    ops::gemm_act_x_w(cublas.handle(),
-        ws.norm_x.data(), *w.lm_head,
-        ws.logits.data(), num_tokens, V, H);
+    ops::WeightView lm_head(*w.lm_head);
+    if (mtp.lm_head != nullptr) {
+        lm_head = ops::WeightView(*mtp.lm_head);
+        if (mtp.lm_head_scale != nullptr) {
+            lm_head.scale_data = mtp.lm_head_scale->data();
+            lm_head.scale_dtype = DType::FP32;
+            lm_head.scale_numel = mtp.lm_head_scale->size();
+            lm_head.quant_kind = QuantMeta::Kind::PerTensor;
+        }
+    }
+    if (sampled_token_ids != nullptr &&
+        qwen35_mtp_direct_argmax_enabled() &&
+        lm_head.dtype == DType::BF16 &&
+        lm_head.scale_data == nullptr) {
+        kernels::launch_lm_head_argmax_bf16(
+            ws.norm_x.data(), lm_head.data,
+            reinterpret_cast<std::uint64_t*>(ws.probs.data()),
+            sampled_token_ids, num_tokens, H, V, stream);
+    } else {
+        ops::gemm_act_x_w(cublas.handle(),
+            ws.norm_x.data(), lm_head,
+            ws.logits.data(), num_tokens, V, H);
+    }
     CUDA_CHECK(cudaMemcpyAsync(
         ws.y.data(), ws.norm_x.data(),
         static_cast<std::size_t>(num_tokens) * H * sizeof(std::uint16_t),
