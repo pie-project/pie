@@ -2077,6 +2077,7 @@ int run_impl(int argc,
     }
 
     std::optional<pie_cuda_driver::model::Gemma4MtpWeights> gemma4_mtp_weights;
+    pie_cuda_driver::model::Gemma4MtpRuntimeConfig gemma4_mtp_runtime;
     std::string mtp_snapshot_dir = cfg.model.mtp_assistant_snapshot_dir;
     std::string mtp_snapshot_source = mtp_snapshot_dir.empty() ? "" : "config";
     if (mtp_snapshot_dir.empty()) {
@@ -2112,6 +2113,7 @@ int run_impl(int argc,
                     cfg.model.device,
                     engine.hf_config(),
                     weights_gemma4,
+                    gemma4_mtp_runtime,
                     verbose));
             if (verbose && cfg.distributed.tp_rank == 0 &&
                 !mtp_snapshot_source.empty()) {
@@ -2897,7 +2899,8 @@ int run_impl(int argc,
                 N, R, is_pure_decode, mask_d, mask_indptr_d,
                 slot_ids_h, is_fresh_h, slot_ids_d);
         };
-        if (weights_qwen3_5.mtp.has_value()) {
+        if (weights_qwen3_5.mtp.has_value() && cfg.model.mtp_num_drafts > 0) {
+            forward_fn.mtp_num_drafts = cfg.model.mtp_num_drafts;
             forward_fn.mtp_process =
                 [&engine, &weights_qwen3_5, &qwen3_5_la_ws,
                  &qwen3_5_state_cache, q35_tp_size, q35_tp_comm](
@@ -3027,7 +3030,8 @@ int run_impl(int argc,
                 slot_ids_h, is_fresh_h, slot_ids_d,
                 logit_row_indices_d, num_logit_rows);
         };
-        if (weights_qwen3_5_moe.mtp.has_value()) {
+        if (weights_qwen3_5_moe.mtp.has_value() && cfg.model.mtp_num_drafts > 0) {
+            forward_fn.mtp_num_drafts = cfg.model.mtp_num_drafts;
             forward_fn.mtp_process =
                 [&engine, &weights_qwen3_5_moe, &qwen3_5_la_ws,
                  &qwen3_5_state_cache, q35moe_tp_size, q35moe_tp_comm](
@@ -3173,11 +3177,12 @@ int run_impl(int argc,
         system_speculator_max_drafts = cfg.model.mtp_num_drafts;
         system_speculator =
             [&weights_gemma4, &mtp_w = *gemma4_mtp_weights,
-             &mtp_ws = *gemma4_mtp_ws](
+             &mtp_ws = *gemma4_mtp_ws, gemma4_mtp_runtime](
                 const pie_cuda_driver::SystemSpecDraftInputs& in,
                 std::span<pie_driver::PerRequestOutput> per_req) {
                 pie_cuda_driver::model::gemma4_mtp_draft(
-                    mtp_w, weights_gemma4, mtp_ws, in, per_req);
+                    mtp_w, weights_gemma4, mtp_ws, gemma4_mtp_runtime,
+                    in, per_req);
             };
     }
 

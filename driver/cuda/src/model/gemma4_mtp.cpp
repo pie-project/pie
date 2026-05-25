@@ -174,37 +174,65 @@ int mtp_position_offset() {
     return offset;
 }
 
-bool mtp_adaptive_drafts_enabled() {
-    static const bool enabled = [] {
-        const char* v = std::getenv("PIE_GEMMA4_MTP_ADAPTIVE_DRAFTS");
-        if (v == nullptr || v[0] == '\0') return false;
-        return std::string(v) != "0";
-    }();
-    return enabled;
+bool env_bool_or(const char* name, bool fallback) {
+    const char* v = std::getenv(name);
+    if (v == nullptr || v[0] == '\0') return fallback;
+    return v[0] != '0';
 }
 
-int mtp_initial_adaptive_drafts(int max_drafts) {
-    static const int configured = [] {
-        const char* v = std::getenv("PIE_GEMMA4_MTP_INITIAL_DRAFTS");
-        return v == nullptr ? 3 : std::atoi(v);
-    }();
+int env_int_or(const char* name, int fallback) {
+    const char* v = std::getenv(name);
+    if (v == nullptr || v[0] == '\0') return fallback;
+    return std::atoi(v);
+}
+
+std::string env_string_or(const char* name, std::string fallback) {
+    const char* v = std::getenv(name);
+    if (v == nullptr || v[0] == '\0') return fallback;
+    return std::string(v);
+}
+
+bool mtp_adaptive_drafts_enabled(const Gemma4MtpRuntimeConfig& runtime) {
+    return env_bool_or(
+        "PIE_GEMMA4_MTP_ADAPTIVE_DRAFTS", runtime.adaptive_drafts);
+}
+
+int mtp_initial_adaptive_drafts(
+    const Gemma4MtpRuntimeConfig& runtime,
+    int max_drafts)
+{
+    const int configured = env_int_or(
+        "PIE_GEMMA4_MTP_INITIAL_DRAFTS", runtime.initial_drafts);
     return std::clamp(configured, 1, std::max(1, max_drafts));
 }
 
-int mtp_min_adaptive_drafts(int max_drafts) {
-    static const int configured = [] {
-        const char* v = std::getenv("PIE_GEMMA4_MTP_MIN_DRAFTS");
-        return v == nullptr ? 2 : std::atoi(v);
-    }();
+int mtp_min_adaptive_drafts(
+    const Gemma4MtpRuntimeConfig& runtime,
+    int max_drafts)
+{
+    const int configured = env_int_or(
+        "PIE_GEMMA4_MTP_MIN_DRAFTS", runtime.min_drafts);
     return std::clamp(configured, 1, std::max(1, max_drafts));
 }
 
-bool mtp_compact_draft_rows_enabled() {
-    static const bool enabled = [] {
-        const char* v = std::getenv("PIE_GEMMA4_MTP_COMPACT_DRAFT_ROWS");
-        return v != nullptr && v[0] != '\0' && v[0] != '0';
-    }();
-    return enabled;
+bool mtp_compact_draft_rows_enabled(
+    const Gemma4MtpRuntimeConfig& runtime,
+    const std::vector<int>& desired_drafts,
+    int active_max_drafts)
+{
+    const std::string mode = env_string_or(
+        "PIE_GEMMA4_MTP_COMPACT_DRAFT_ROWS", runtime.compact_draft_rows);
+    if (mode == "off" || mode == "0") return false;
+    if (mode == "on" || mode == "1") return true;
+    const int M = static_cast<int>(desired_drafts.size());
+    if (M < 4 || active_max_drafts <= 1) return false;
+    int saved_row_steps = 0;
+    for (const int d : desired_drafts) {
+        saved_row_steps += std::max(0, active_max_drafts - d);
+    }
+    const int dense_row_steps = M * active_max_drafts;
+    return saved_row_steps >= M &&
+           saved_row_steps * 4 >= dense_row_steps;
 }
 
 bool mtp_profile_enabled() {
@@ -215,13 +243,8 @@ bool mtp_profile_enabled() {
     return enabled;
 }
 
-bool mtp_cuda_graph_enabled() {
-    static const bool enabled = [] {
-        const char* v = std::getenv("PIE_GEMMA4_MTP_CUDA_GRAPH");
-        if (v == nullptr || v[0] == '\0') return true;
-        return v[0] != '0';
-    }();
-    return enabled;
+bool mtp_cuda_graph_enabled(const Gemma4MtpRuntimeConfig& runtime) {
+    return env_bool_or("PIE_GEMMA4_MTP_CUDA_GRAPH", runtime.cuda_graph);
 }
 
 std::uint64_t mtp_profile_print_limit() {
@@ -277,13 +300,17 @@ std::mutex& mtp_cuda_graph_cache_mutex() {
     return mu;
 }
 
-int mtp_desired_drafts(const SystemSpecDraftRequest& req, int max_drafts) {
-    if (!mtp_adaptive_drafts_enabled()) return max_drafts;
+int mtp_desired_drafts(
+    const SystemSpecDraftRequest& req,
+    int max_drafts,
+    const Gemma4MtpRuntimeConfig& runtime)
+{
+    if (!mtp_adaptive_drafts_enabled(runtime)) return max_drafts;
     if (max_drafts <= 1) return max_drafts;
     if (req.last_num_drafts <= 0 || req.last_match < 0) {
-        return mtp_initial_adaptive_drafts(max_drafts);
+        return mtp_initial_adaptive_drafts(runtime, max_drafts);
     }
-    const int min_drafts = mtp_min_adaptive_drafts(max_drafts);
+    const int min_drafts = mtp_min_adaptive_drafts(runtime, max_drafts);
     if (req.last_match >= req.last_num_drafts) {
         return std::clamp(req.last_num_drafts + 1, min_drafts, max_drafts);
     }
@@ -575,7 +602,8 @@ Gemma4MtpWorkspace Gemma4MtpWorkspace::allocate(
     ws.h_row_indices.reserve(M);
     ws.h_input_ids.reserve(M);
     ws.h_positions.reserve(M);
-    ws.h_sampled.resize(static_cast<std::size_t>(M) * static_cast<std::size_t>(D));
+    ws.h_sampled = PinnedHostBuffer<std::int32_t>::alloc(
+        static_cast<std::size_t>(M) * static_cast<std::size_t>(D));
     ws.h_qo_indptr.reserve(M + 1);
     ws.h_kv_page_indices.reserve(P);
     ws.h_kv_page_indptr.reserve(M + 1);
@@ -588,6 +616,7 @@ Gemma4MtpWeights load_gemma4_mtp_weights(
     const std::string& device,
     const HfConfig& target_cfg,
     const Gemma4Weights& target_weights,
+    const Gemma4MtpRuntimeConfig& runtime,
     bool verbose)
 {
     if (snapshot_dir.empty()) {
@@ -802,8 +831,15 @@ Gemma4MtpWeights load_gemma4_mtp_weights(
                   << " max_intermediate=" << w.max_intermediate
                   << " kv_map=" << mtp_kv_map_mode()
                   << " pos_offset=" << mtp_position_offset()
-                  << " adaptive_drafts=" << (mtp_adaptive_drafts_enabled() ? "on" : "off")
-                  << " compact_draft_rows=" << (mtp_compact_draft_rows_enabled() ? "on" : "off")
+                  << " adaptive_drafts=" << (mtp_adaptive_drafts_enabled(runtime) ? "on" : "off")
+                  << " initial_drafts=" << mtp_initial_adaptive_drafts(
+                         runtime, std::max(1, runtime.initial_drafts))
+                  << " min_drafts=" << mtp_min_adaptive_drafts(
+                         runtime, std::max(1, runtime.min_drafts))
+                  << " compact_draft_rows=" << env_string_or(
+                         "PIE_GEMMA4_MTP_COMPACT_DRAFT_ROWS",
+                         runtime.compact_draft_rows)
+                  << " cuda_graph=" << (mtp_cuda_graph_enabled(runtime) ? "on" : "off")
                   << " argmax_parts=" << mtp_argmax_parts()
                   << " reverse_preproj=" << (mtp_reverse_preprojection_concat() ? "on" : "off")
                   << " layer_scalar=" << (mtp_disable_layer_scalar() ? "off" : "on")
@@ -816,6 +852,7 @@ void gemma4_mtp_draft(
     const Gemma4MtpWeights& w,
     const Gemma4Weights& target_weights,
     Gemma4MtpWorkspace& ws,
+    const Gemma4MtpRuntimeConfig& runtime,
     const SystemSpecDraftInputs& in,
     std::span<pie_driver::PerRequestOutput> per_request)
 {
@@ -879,7 +916,8 @@ void gemma4_mtp_draft(
         }
 
         active_req.push_back(static_cast<int>(j));
-        const int desired_drafts = mtp_desired_drafts(req, max_drafts);
+        const int desired_drafts =
+            mtp_desired_drafts(req, max_drafts, runtime);
         active_desired_drafts.push_back(desired_drafts);
         active_max_drafts = std::max(active_max_drafts, desired_drafts);
         ws.h_row_indices.push_back(req.source_row);
@@ -901,7 +939,8 @@ void gemma4_mtp_draft(
     const int M = static_cast<int>(active_req.size());
     if (M <= 0) return;
     active_max_drafts = std::clamp(active_max_drafts, 1, max_drafts);
-    const bool compact_draft_rows = mtp_compact_draft_rows_enabled();
+    const bool compact_draft_rows = mtp_compact_draft_rows_enabled(
+        runtime, active_desired_drafts, active_max_drafts);
     if (compact_draft_rows && M > 1) {
         std::vector<int> order(static_cast<std::size_t>(M));
         std::iota(order.begin(), order.end(), 0);
@@ -1263,7 +1302,7 @@ void gemma4_mtp_draft(
     };
 
     const bool graph_steps =
-        mtp_cuda_graph_enabled() &&
+        mtp_cuda_graph_enabled(runtime) &&
         !profile.enabled &&
         !compact_draft_rows &&
         active_max_drafts > 0;

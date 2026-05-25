@@ -16,6 +16,14 @@
 
 namespace pie_cuda_driver::model {
 
+struct Gemma4MtpRuntimeConfig {
+    bool adaptive_drafts = false;
+    int initial_drafts = 3;
+    int min_drafts = 2;
+    std::string compact_draft_rows = "auto";
+    bool cuda_graph = true;
+};
+
 struct Gemma4MtpLayerWeights {
     const DeviceTensor* input_norm = nullptr;
     const DeviceTensor* post_attn_norm = nullptr;
@@ -95,7 +103,7 @@ struct Gemma4MtpWorkspace {
     std::vector<std::int32_t> h_row_indices;
     std::vector<std::int32_t> h_input_ids;
     std::vector<std::int32_t> h_positions;
-    std::vector<std::int32_t> h_sampled;
+    PinnedHostBuffer<std::int32_t> h_sampled;
     std::vector<std::uint32_t> h_qo_indptr;
     std::vector<std::uint32_t> h_kv_page_indices;
     std::vector<std::uint32_t> h_kv_page_indptr;
@@ -117,12 +125,14 @@ Gemma4MtpWeights load_gemma4_mtp_weights(
     const std::string& device,
     const HfConfig& target_cfg,
     const Gemma4Weights& target_weights,
+    const Gemma4MtpRuntimeConfig& runtime,
     bool verbose = false);
 
 void gemma4_mtp_draft(
     const Gemma4MtpWeights& w,
     const Gemma4Weights& target_weights,
     Gemma4MtpWorkspace& ws,
+    const Gemma4MtpRuntimeConfig& runtime,
     const SystemSpecDraftInputs& in,
     std::span<pie_driver::PerRequestOutput> per_request);
 

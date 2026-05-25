@@ -164,6 +164,7 @@ struct ForwardFn {
     BodyFn    body;
     MtpFn     mtp;
     MtpProcessFn mtp_process;
+    int mtp_num_drafts = 1;
 
     // Convenience: `forward_fn = [...]` assigns the lambda as the body.
     // entry.cpp uses this terser pattern; the older `forward_fn.body =

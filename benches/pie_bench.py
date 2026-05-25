@@ -795,7 +795,7 @@ def build_parser() -> argparse.ArgumentParser:
             "--mtp-num-drafts",
             type=int,
             default=None,
-            help="Number of Gemma4 native MTP draft tokens per accepted token.",
+            help="Number of native MTP draft tokens per accepted token.",
         )
         sp.add_argument(
             "--batch-policy",

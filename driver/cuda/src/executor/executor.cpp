@@ -172,22 +172,14 @@ bool graph_single_gpu_argmax_enabled() {
     return enabled;
 }
 
-int mtp_draft_tokens(const HfConfig& cfg) {
+int mtp_draft_tokens(int configured_drafts) {
     static const int forced = [] {
         const char* v = std::getenv("PIE_MTP_DRAFT_TOKENS");
         if (v == nullptr || v[0] == '\0') return 0;
         return std::clamp(std::atoi(v), 1, 16);
     }();
     if (forced > 0) return forced;
-    if (cfg.model_type == "qwen3_5_moe" ||
-        cfg.model_type == "qwen3_5_moe_text") {
-        return 4;
-    }
-    if (cfg.model_type == "qwen3_5" ||
-        cfg.model_type == "qwen3_5_text") {
-        return 8;
-    }
-    return 1;
+    return std::clamp(std::max(1, configured_drafts), 1, 16);
 }
 
 int qwen35_small_spec_graph_tokens() {
@@ -2423,7 +2415,8 @@ void handle_fire_batch(
                         throw std::runtime_error(
                             "MTP draft rows exceed logits workspace capacity");
                     }
-                    const int max_drafts = mtp_draft_tokens(engine.hf_config());
+                    const int max_drafts =
+                        mtp_draft_tokens(forward_fn.mtp_num_drafts);
                     if (static_cast<std::size_t>(S) *
                             static_cast<std::size_t>(max_drafts) >
                         static_cast<std::size_t>(tensor_rows(ws.k))) {
