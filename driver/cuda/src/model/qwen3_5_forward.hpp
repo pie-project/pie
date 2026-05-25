@@ -23,6 +23,8 @@ namespace pie_cuda_driver::model {
 // reused across layers (linear layers are processed sequentially).
 struct Qwen3_5LinearAttnWorkspace {
     DeviceBuffer<std::uint16_t> mixed_qkv;     // [N, conv_dim] bf16
+    DeviceBuffer<std::uint16_t> mixed_qkvz;    // [N, conv_dim + V_dim] bf16
+    DeviceBuffer<std::uint16_t> ba;            // [N, 2 * V_h] bf16
     DeviceBuffer<std::uint16_t> z;             // [N, V_dim]    bf16
     DeviceBuffer<std::uint16_t> a;             // [N, V_h]      bf16
     DeviceBuffer<std::uint16_t> b;             // [N, V_h]      bf16
@@ -66,6 +68,12 @@ struct Qwen3_5LinearAttnWorkspace {
 struct Qwen3_5ForwardCfg {
     bool force_prefill_path = false;
 
+    // Small speculative-verification forwards (`N = D + 1`, `R = 1`)
+    // need a graph-capturable full-attention path. FlashInfer prefill
+    // planning is hoisted into Qwen3_5PlanState; this legacy-named knob
+    // controls which short prefill-like batches use graph-friendly planning.
+    int small_prefill_naive_attention_max_tokens = 0;
+
     // Tensor-parallel state. tp_size > 1 activates sharded dims for both
     // full-attention layers (Q/K/V column-parallel, O row-parallel) and
     // linear-attention layers (per-rank head shares of the conv1d, the
@@ -85,6 +93,8 @@ struct Qwen3_5ForwardCfg {
 // outside any cudaStream capture region.
 struct Qwen3_5PlanState {
     ops::DecodePlanCachePtr decode_plan;
+    ops::PrefillPlanCachePtr prefill_plan;
+    bool use_prefill_plan = false;
 };
 
 // Refresh the decode plan for the current fire. Caller is expected to
@@ -96,7 +106,10 @@ void prepare_qwen3_5_decode_plan(
     KvCache& cache,
     const HfConfig& cfg,
     const Qwen3_5ForwardCfg& fwd_cfg,
+    const std::uint32_t* qo_indptr_h,
     const std::uint32_t* kv_page_indptr_h,
+    const std::uint32_t* kv_last_page_lens_h,
+    int total_tokens,
     int num_requests,
     bool is_pure_decode,
     cudaStream_t stream = nullptr);
@@ -149,5 +162,49 @@ void qwen3_5_forward_paged(
     const std::int32_t* slot_ids_h = nullptr,
     const std::uint8_t* is_fresh_h = nullptr,
     const std::int32_t* slot_ids_d = nullptr);
+
+void qwen3_5_mtp_process_cache(
+    const Qwen3_5Weights& w,
+    const HfConfig& cfg,
+    const Qwen3_5ForwardCfg& fwd_cfg,
+    Qwen3Workspace& ws,
+    Qwen3_5LinearAttnWorkspace& la_ws,
+    KvCache& cache,
+    Qwen3_5StateCache& state_cache,
+    ops::CublasHandle& cublas,
+    const std::int32_t* token_ids,
+    const std::int32_t* positions,
+    const std::uint32_t* qo_indptr,
+    const std::uint32_t* kv_page_indices,
+    const std::uint32_t* kv_page_indptr,
+    const std::uint32_t* kv_last_page_lens,
+    const std::int32_t* slot_ids_d,
+    const std::int32_t* source_row_indices,
+    int total_tokens,
+    int num_requests);
+
+// Run one NEXTN step of Qwen3.6's one-layer MTP head. The
+// `base_hidden_row_indices` select rows from the target model's last hidden
+// states left in `ws.y` by `qwen3_5_forward_paged` (or from the previous MTP
+// step); `token_ids` are the just accepted/drafted tokens at those rows' next
+// positions. Writes logits to `ws.logits[0..num_tokens)`.
+void qwen3_5_mtp_forward(
+    const Qwen3_5Weights& w,
+    const HfConfig& cfg,
+    const Qwen3_5ForwardCfg& fwd_cfg,
+    Qwen3Workspace& ws,
+    Qwen3_5LinearAttnWorkspace& la_ws,
+    KvCache& cache,
+    ops::CublasHandle& cublas,
+    const std::int32_t* token_ids,
+    const std::int32_t* position_ids,
+    const std::int32_t* base_hidden_row_indices,
+    const std::int32_t* request_ids,
+    const std::uint32_t* kv_page_indices,
+    const std::uint32_t* kv_page_indptr,
+    const std::uint32_t* kv_last_page_lens,
+    int num_tokens,
+    int draft_step,
+    int max_global_tokens);
 
 }  // namespace pie_cuda_driver::model

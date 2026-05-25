@@ -46,6 +46,16 @@ void launch_recurrent_gated_delta_step(
     float*       out,
     int B, int V_h, int K_d, int V_d,
     cudaStream_t stream);
+void launch_recurrent_gated_delta_step_state_bf16(
+    const float* q_norm,
+    const float* k_norm,
+    const float* v,
+    const float* g_log,
+    const float* beta,
+    void*        state,
+    float*       out,
+    int B, int V_h, int K_d, int V_d,
+    cudaStream_t stream);
 
 // Multi-request batched variant. Same per-(request, head) compute as
 // `_step` above; outer R dimension picks per-request inputs/outputs and
@@ -73,6 +83,45 @@ void launch_recurrent_gated_delta_step_batched(
     float*       out,
     int R, int V_h, int K_d, int V_d,
     cudaStream_t stream);
+void launch_recurrent_gated_delta_step_batched_state_bf16(
+    const float* q_norm,
+    const float* k_norm,
+    const float* v,
+    const float* g_log,
+    const float* beta,
+    void*        state_base,
+    const std::int32_t* slot_ids,
+    long long    slot_stride_elems,
+    float*       out,
+    int R, int V_h, int K_d, int V_d,
+    cudaStream_t stream);
+
+// Batched decode variant for grouped-query GDN layouts where Q/K have K_h
+// heads and V has V_h heads. Avoids materializing repeated Q/K heads.
+void launch_recurrent_gated_delta_step_batched_gqa(
+    const float* q_norm_kh,
+    const float* k_norm_kh,
+    const float* v,
+    const float* g_log,
+    const float* beta,
+    float*       state_base,
+    const std::int32_t* slot_ids,
+    long long    slot_stride_elems,
+    float*       out,
+    int R, int K_h, int V_h, int K_d, int V_d,
+    cudaStream_t stream);
+void launch_recurrent_gated_delta_step_batched_gqa_state_bf16(
+    const float* q_norm_kh,
+    const float* k_norm_kh,
+    const float* v,
+    const float* g_log,
+    const float* beta,
+    void*        state_base,
+    const std::int32_t* slot_ids,
+    long long    slot_stride_elems,
+    float*       out,
+    int R, int K_h, int V_h, int K_d, int V_d,
+    cudaStream_t stream);
 
 // Chunked prefill (T tokens at a time, per request). Mirrors
 // `torch_chunk_gated_delta_rule` — see the HF reference for the exact
@@ -97,6 +146,17 @@ void launch_chunk_gated_delta_prefill(
     const float* g_log,
     const float* beta,
     float*       state,
+    float*       out,
+    int T, int V_h, int K_d, int V_d,
+    int chunk_size,
+    cudaStream_t stream);
+void launch_chunk_gated_delta_prefill_state_bf16(
+    const float* q_norm,
+    const float* k_norm,
+    const float* v,
+    const float* g_log,
+    const float* beta,
+    void*        state,
     float*       out,
     int T, int V_h, int K_d, int V_d,
     int chunk_size,
@@ -138,6 +198,172 @@ void launch_chunk_gated_delta_prefill_batched(
     long long    slot_stride_elems,
     float*       out,
     int R, int V_h, int K_d, int V_d,
+    cudaStream_t stream);
+void launch_chunk_gated_delta_prefill_batched_state_bf16(
+    const float* q_norm,
+    const float* k_norm,
+    const float* v,
+    const float* g_log,
+    const float* beta,
+    void*        state_base,
+    const std::int32_t*  slot_ids,
+    const std::uint32_t* qo_indptr,
+    long long    slot_stride_elems,
+    float*       out,
+    int R, int V_h, int K_d, int V_d,
+    cudaStream_t stream);
+
+// Small-T variant for target verification. One block per (request, head)
+// caches the [K_d, V_d] recurrent state tile in shared memory, walks the
+// request's short token window, and writes final state back once. This avoids
+// rereading/rewriting the full state for every drafted token.
+void launch_chunk_gated_delta_prefill_batched_cached(
+    const float* q_norm,
+    const float* k_norm,
+    const float* v,
+    const float* g_log,
+    const float* beta,
+    float*       state_base,
+    const std::int32_t*  slot_ids,
+    const std::uint32_t* qo_indptr,
+    long long    slot_stride_elems,
+    float*       out,
+    int R, int V_h, int K_d, int V_d,
+    cudaStream_t stream);
+void launch_chunk_gated_delta_prefill_batched_cached_state_bf16(
+    const float* q_norm,
+    const float* k_norm,
+    const float* v,
+    const float* g_log,
+    const float* beta,
+    void*        state_base,
+    const std::int32_t*  slot_ids,
+    const std::uint32_t* qo_indptr,
+    long long    slot_stride_elems,
+    float*       out,
+    int R, int V_h, int K_d, int V_d,
+    cudaStream_t stream);
+
+// Warp-tiled small-T variant. Four warps per block process four V rows for a
+// single (request, head), keeping each lane's K-fragment of recurrent state in
+// registers across the short verification window.
+void launch_chunk_gated_delta_prefill_batched_warp_tiled(
+    const float* q_norm,
+    const float* k_norm,
+    const float* v,
+    const float* g_log,
+    const float* beta,
+    float*       state_base,
+    const std::int32_t*  slot_ids,
+    const std::uint32_t* qo_indptr,
+    long long    slot_stride_elems,
+    float*       out,
+    int R, int V_h, int K_d, int V_d,
+    cudaStream_t stream);
+void launch_chunk_gated_delta_prefill_batched_warp_tiled_state_bf16(
+    const float* q_norm,
+    const float* k_norm,
+    const float* v,
+    const float* g_log,
+    const float* beta,
+    void*        state_base,
+    const std::int32_t*  slot_ids,
+    const std::uint32_t* qo_indptr,
+    long long    slot_stride_elems,
+    float*       out,
+    int R, int V_h, int K_d, int V_d,
+    cudaStream_t stream);
+
+void launch_chunk_gated_delta_prefill_batched_warp_tiled_snapshot(
+    const float* q_norm,
+    const float* k_norm,
+    const float* v,
+    const float* g_log,
+    const float* beta,
+    float*       state_base,
+    const std::int32_t*  slot_ids,
+    const std::uint32_t* qo_indptr,
+    long long    slot_stride_elems,
+    float*       out,
+    int R, int V_h, int K_d, int V_d,
+    int snapshot_base_slot,
+    int snapshot_count,
+    cudaStream_t stream);
+void launch_chunk_gated_delta_prefill_batched_warp_tiled_snapshot_state_bf16(
+    const float* q_norm,
+    const float* k_norm,
+    const float* v,
+    const float* g_log,
+    const float* beta,
+    void*        state_base,
+    const std::int32_t*  slot_ids,
+    const std::uint32_t* qo_indptr,
+    long long    slot_stride_elems,
+    float*       out,
+    int R, int V_h, int K_d, int V_d,
+    int snapshot_base_slot,
+    int snapshot_count,
+    cudaStream_t stream);
+
+// Same warp-tiled small-T recurrence, but Q/K are stored with fewer heads
+// than V and are repeated logically (`V_h % K_h == 0`). This avoids
+// materialising repeat_interleave(Q/K) for GQA-style GDN layers.
+void launch_chunk_gated_delta_prefill_batched_warp_tiled_gqa(
+    const float* q_norm_kh,
+    const float* k_norm_kh,
+    const float* v,
+    const float* g_log,
+    const float* beta,
+    float*       state_base,
+    const std::int32_t*  slot_ids,
+    const std::uint32_t* qo_indptr,
+    long long    slot_stride_elems,
+    float*       out,
+    int R, int K_h, int V_h, int K_d, int V_d,
+    cudaStream_t stream);
+void launch_chunk_gated_delta_prefill_batched_warp_tiled_gqa_state_bf16(
+    const float* q_norm_kh,
+    const float* k_norm_kh,
+    const float* v,
+    const float* g_log,
+    const float* beta,
+    void*        state_base,
+    const std::int32_t*  slot_ids,
+    const std::uint32_t* qo_indptr,
+    long long    slot_stride_elems,
+    float*       out,
+    int R, int K_h, int V_h, int K_d, int V_d,
+    cudaStream_t stream);
+
+void launch_chunk_gated_delta_prefill_batched_warp_tiled_gqa_snapshot(
+    const float* q_norm_kh,
+    const float* k_norm_kh,
+    const float* v,
+    const float* g_log,
+    const float* beta,
+    float*       state_base,
+    const std::int32_t*  slot_ids,
+    const std::uint32_t* qo_indptr,
+    long long    slot_stride_elems,
+    float*       out,
+    int R, int K_h, int V_h, int K_d, int V_d,
+    int snapshot_base_slot,
+    int snapshot_count,
+    cudaStream_t stream);
+void launch_chunk_gated_delta_prefill_batched_warp_tiled_gqa_snapshot_state_bf16(
+    const float* q_norm_kh,
+    const float* k_norm_kh,
+    const float* v,
+    const float* g_log,
+    const float* beta,
+    void*        state_base,
+    const std::int32_t*  slot_ids,
+    const std::uint32_t* qo_indptr,
+    long long    slot_stride_elems,
+    float*       out,
+    int R, int K_h, int V_h, int K_d, int V_d,
+    int snapshot_base_slot,
+    int snapshot_count,
     cudaStream_t stream);
 
 // L2-normalise rows of `[N, hidden]` bf16, optionally scale each row
@@ -192,6 +418,24 @@ void launch_gated_delta_g_beta(
     float*      g_log_out,
     float*      beta_out,
     int N, int V_h,
+    cudaStream_t stream);
+
+// Fused Qwen GDN post-conv prep:
+//   q/k split + L2 normalization, v bf16-to-fp32, and g/beta gating.
+// `qkv_post` is [N, 2*K_h*K_d + V_h*V_d] bf16 in [q | k | v] channel order.
+// `a` and `b` are [N, V_h] bf16.
+void launch_qwen_gdn_post_conv_prep_bf16(
+    const void* qkv_post,
+    const void* a,
+    const void* b,
+    const void* A_log,
+    const void* dt_bias,
+    float* q_norm_kh,
+    float* k_norm_kh,
+    float* v_fp32,
+    float* g_log_out,
+    float* beta_out,
+    int N, int K_h, int V_h, int K_d, int V_d, int conv_dim,
     cudaStream_t stream);
 
 }  // namespace pie_cuda_driver::kernels

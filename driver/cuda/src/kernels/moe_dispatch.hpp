@@ -73,6 +73,15 @@ void launch_token_batched_weighted_sum_bf16(
     int hidden,
     cudaStream_t stream);
 
+void launch_token_batched_weighted_sum_add_bf16(
+    void*       out,
+    const void* src,
+    const float* weights,
+    int num_tokens,
+    int top_k,
+    int hidden,
+    cudaStream_t stream);
+
 // On-device construction of the per-expert cuBLAS pointer arrays for the
 // N=1 MoE decode path. Replaces the host-side build_routing + 6
 // cudaMemcpyAsync's that the original implementation used; produces the
@@ -135,6 +144,31 @@ void launch_build_moe_ptrs_decode_batched_bf16(
     int num_tokens,
     int top_k,
     int H, int I_moe,
+    cudaStream_t stream);
+
+// Tensor-core decode kernels for the sparse MoE hot path. Each routed
+// token/expert pair is treated as a 1-row GEMM, but computed with BF16 WMMA
+// tiles to avoid the overhead of many tiny cuBLAS batched GEMMs.
+void launch_moe_gate_up_decode_wmma_bf16(
+    const std::int32_t* topk_idx,
+    const void* norm_x,
+    const void* gate_up_base,
+    void* expert_gate_up,
+    int num_tokens,
+    int top_k,
+    int H,
+    int I_moe,
+    cudaStream_t stream);
+
+void launch_moe_down_decode_wmma_bf16(
+    const std::int32_t* topk_idx,
+    const void* expert_act,
+    const void* down_base,
+    void* expert_out,
+    int num_tokens,
+    int top_k,
+    int H,
+    int I_moe,
     cudaStream_t stream);
 
 // vLLM/SGL-style decode alignment. Sorts route ids [0, num_routes) by expert

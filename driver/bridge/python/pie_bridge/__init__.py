@@ -241,6 +241,9 @@ class _PieForwardResponseDesc(_ct.Structure):
         ("logprobs_values_ptr", _ct.POINTER(_ct.c_float)), ("logprobs_values_len", _c_size_t),
         ("entropies_indptr_ptr", _ct.POINTER(_ct.c_uint32)), ("entropies_indptr_len", _c_size_t),
         ("entropies_ptr", _ct.POINTER(_ct.c_float)), ("entropies_len", _c_size_t),
+        ("spec_indptr_ptr", _ct.POINTER(_ct.c_uint32)), ("spec_indptr_len", _c_size_t),
+        ("spec_tokens_ptr", _ct.POINTER(_ct.c_uint32)), ("spec_tokens_len", _c_size_t),
+        ("spec_positions_ptr", _ct.POINTER(_ct.c_uint32)), ("spec_positions_len", _c_size_t),
     ]
 
 
@@ -380,6 +383,7 @@ def build_forward_response(
     logits_req_indptr=None, logits_byte_indptr=None, logits_bytes=None,
     logprobs_req_indptr=None, logprobs_val_indptr=None, logprobs_values=None,
     entropies_indptr=None, entropies=None,
+    spec_indptr=None, spec_tokens=None, spec_positions=None,
 ) -> bytes:
     """Build a `ResponseFrame { driver_id, aborted: false, payload:
     Forward(ForwardResponse) }` from per-field arrays. Each array
@@ -417,6 +421,9 @@ def build_forward_response(
     _pair("logprobs_values",     logprobs_values,     _f32_ptr)
     _pair("entropies_indptr",    entropies_indptr,    _u32_ptr)
     _pair("entropies",           entropies,           _f32_ptr)
+    _pair("spec_indptr",         spec_indptr,         _u32_ptr)
+    _pair("spec_tokens",         spec_tokens,         _u32_ptr)
+    _pair("spec_positions",      spec_positions,      _u32_ptr)
 
     return _try_build(_pie_build_response_frame, _ct.byref(desc), initial_cap=4096)
 

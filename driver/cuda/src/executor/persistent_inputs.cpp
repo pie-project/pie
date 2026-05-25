@@ -20,6 +20,7 @@ PersistentInputs PersistentInputs::allocate(
     p.custom_mask_indptr = DeviceBuffer<std::int32_t >::alloc(static_cast<std::size_t>(max_requests) + 1);
     p.slot_ids           = DeviceBuffer<std::int32_t >::alloc(max_requests);
     p.is_fresh           = DeviceBuffer<std::uint8_t >::alloc(max_requests);
+    p.mtp_request_ids    = DeviceBuffer<std::int32_t >::alloc(max_requests);
     // Sampler scratch — sized to the worst case (`max_workspace_tokens`
     // rows). Capacity-wise these are tiny (~10s of KiB total) so we
     // don't try to right-size per arch; the win is eliminating per-fire

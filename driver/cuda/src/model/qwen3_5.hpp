@@ -48,6 +48,8 @@ struct Qwen3_5LayerWeights {
     const DeviceTensor* la_in_proj_z   = nullptr;  // [V, H]       bf16
     const DeviceTensor* la_in_proj_b   = nullptr;  // [V_heads, H] bf16
     const DeviceTensor* la_in_proj_a   = nullptr;  // [V_heads, H] bf16
+    const DeviceTensor* la_in_proj_qkvz = nullptr; // [2*K + 2*V, H] bf16
+    const DeviceTensor* la_in_proj_ba   = nullptr; // [2*V_heads, H] bf16
     const DeviceTensor* la_conv1d_w    = nullptr;  // [conv_dim, 1, K] bf16
     const DeviceTensor* la_conv1d_b    = nullptr;  // [conv_dim] bf16 (may be null)
     const DeviceTensor* la_dt_bias     = nullptr;  // [V_heads] bf16
@@ -109,6 +111,16 @@ struct Qwen3_5Weights {
     // [K1 | K2 | V] block layout doesn't shard cleanly under uniform
     // axis-0 partitioning, so we slice per-block here.
     std::vector<DeviceTensor> owned_bf16_buffers;
+
+    struct MtpWeights {
+        const DeviceTensor* pre_fc_norm_embedding = nullptr;
+        const DeviceTensor* pre_fc_norm_hidden = nullptr;
+        const DeviceTensor* fc = nullptr;    // [H, 2H]
+        const DeviceTensor* norm = nullptr;  // final MTP norm
+        const DeviceTensor* embed = nullptr; // aliases base embed unless dedicated
+        Qwen3_5LayerWeights layer;
+    };
+    std::optional<MtpWeights> mtp;
 };
 
 Qwen3_5Weights bind_qwen3_5(const LoadedModel& engine);

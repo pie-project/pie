@@ -1,6 +1,10 @@
 #include "model/qwen3_5_forward.hpp"
 
+#include <algorithm>
 #include <cmath>
+#include <cstdint>
+#include <cstdlib>
+#include <iostream>
 #include <stdexcept>
 
 #include <cuda_runtime.h>
@@ -10,11 +14,14 @@
 #include "kernels/deinterleave.hpp"
 #include "kernels/embed.hpp"
 #include "kernels/gated_delta_net.hpp"
+#include "kernels/gather_rows.hpp"
 #include "kernels/kv_paged.hpp"
 #include "kernels/residual_add.hpp"
 #include "kernels/rmsnorm.hpp"
 #include "kernels/rope.hpp"
 #include "kernels/swiglu.hpp"
+#include "ops/attention_naive.hpp"
+#include "ops/attention_naive_paged.hpp"
 #include "ops/attention_flashinfer.hpp"
 #include "ops/gemm.hpp"
 
@@ -29,6 +36,8 @@ Qwen3_5LinearAttnWorkspace Qwen3_5LinearAttnWorkspace::allocate(
     const std::size_t v_dim = static_cast<std::size_t>(v_h) * v_d;
     const std::size_t k_dim = static_cast<std::size_t>(k_h) * k_d;
     ws.mixed_qkv      = DeviceBuffer<std::uint16_t>::alloc(N * conv_dim);
+    ws.mixed_qkvz     = DeviceBuffer<std::uint16_t>::alloc(N * (conv_dim + v_dim));
+    ws.ba             = DeviceBuffer<std::uint16_t>::alloc(N * (std::size_t)2 * v_h);
     ws.mixed_qkv_post = DeviceBuffer<std::uint16_t>::alloc(N * conv_dim);
     ws.z              = DeviceBuffer<std::uint16_t>::alloc(N * v_dim);
     ws.a              = DeviceBuffer<std::uint16_t>::alloc(N * v_h);
@@ -51,6 +60,129 @@ Qwen3_5LinearAttnWorkspace Qwen3_5LinearAttnWorkspace::allocate(
 }
 
 namespace {
+
+bool mtp_profile_enabled() {
+    static const bool enabled = [] {
+        const char* v = std::getenv("PIE_MTP_PROFILE");
+        return v != nullptr && v[0] != '\0' && v[0] != '0';
+    }();
+    return enabled;
+}
+
+std::uint64_t mtp_profile_print_limit() {
+    static const std::uint64_t limit = [] {
+        const char* v = std::getenv("PIE_MTP_PROFILE_LIMIT");
+        if (v == nullptr || v[0] == '\0') return std::uint64_t{8};
+        const long parsed = std::strtol(v, nullptr, 10);
+        return parsed > 0 ? static_cast<std::uint64_t>(parsed) : std::uint64_t{0};
+    }();
+    return limit;
+}
+
+int qwen35_gdn_cached_prefill_max_tokens() {
+    static const int max_tokens = [] {
+        const char* v = std::getenv("PIE_QWEN35_GDN_CACHED_PREFILL_MAX_TOKENS");
+        if (v == nullptr || v[0] == '\0') return 0;
+        return std::max(0, std::atoi(v));
+    }();
+    return max_tokens;
+}
+
+int qwen35_gdn_warp_tiled_max_tokens() {
+    static const int max_tokens = [] {
+        const char* v = std::getenv("PIE_QWEN35_GDN_WARP_TILED_MAX_TOKENS");
+        if (v == nullptr || v[0] == '\0') return 64;
+        return std::max(0, std::atoi(v));
+    }();
+    return max_tokens;
+}
+
+struct MtpProfile {
+    bool enabled = false;
+    int N = 0;
+    double input_fc_ms = 0.0;
+    double attn_ms = 0.0;
+    double mlp_ms = 0.0;
+    double lm_head_ms = 0.0;
+    double total_ms = 0.0;
+    cudaEvent_t total_start = nullptr;
+    cudaEvent_t total_stop = nullptr;
+    cudaEvent_t stage_start = nullptr;
+    cudaEvent_t stage_stop = nullptr;
+
+    ~MtpProfile() {
+        if (total_start != nullptr) cudaEventDestroy(total_start);
+        if (total_stop != nullptr) cudaEventDestroy(total_stop);
+        if (stage_start != nullptr) cudaEventDestroy(stage_start);
+        if (stage_stop != nullptr) cudaEventDestroy(stage_stop);
+    }
+
+    void ensure_events() {
+        if (total_start != nullptr) return;
+        CUDA_CHECK(cudaEventCreate(&total_start));
+        CUDA_CHECK(cudaEventCreate(&total_stop));
+        CUDA_CHECK(cudaEventCreate(&stage_start));
+        CUDA_CHECK(cudaEventCreate(&stage_stop));
+    }
+
+    void begin(int n, cudaStream_t stream) {
+        enabled = mtp_profile_enabled();
+        if (!enabled) return;
+        ensure_events();
+        N = n;
+        input_fc_ms = attn_ms = mlp_ms = lm_head_ms = total_ms = 0.0;
+        CUDA_CHECK(cudaEventRecord(total_start, stream));
+    }
+
+    void end(cudaStream_t stream) {
+        if (!enabled) return;
+        CUDA_CHECK(cudaEventRecord(total_stop, stream));
+        CUDA_CHECK(cudaEventSynchronize(total_stop));
+        float ms = 0.0f;
+        CUDA_CHECK(cudaEventElapsedTime(&ms, total_start, total_stop));
+        total_ms = static_cast<double>(ms);
+    }
+};
+
+template <class F>
+void profile_mtp_stage(
+    MtpProfile& profile,
+    double& dst,
+    cudaStream_t stream,
+    F&& fn)
+{
+    if (!profile.enabled) {
+        fn();
+        return;
+    }
+    CUDA_CHECK(cudaEventRecord(profile.stage_start, stream));
+    fn();
+    CUDA_CHECK(cudaEventRecord(profile.stage_stop, stream));
+    CUDA_CHECK(cudaEventSynchronize(profile.stage_stop));
+    float ms = 0.0f;
+    CUDA_CHECK(cudaEventElapsedTime(&ms, profile.stage_start, profile.stage_stop));
+    dst += static_cast<double>(ms);
+}
+
+void maybe_print_mtp_profile(const MtpProfile& p) {
+    if (!p.enabled) return;
+    static std::uint64_t seq = 0;
+    ++seq;
+    const std::uint64_t limit = mtp_profile_print_limit();
+    if (limit == 0 || seq > limit) return;
+    const double named = p.input_fc_ms + p.attn_ms + p.mlp_ms + p.lm_head_ms;
+    const double other = p.total_ms > named ? p.total_ms - named : 0.0;
+    std::cerr
+        << "[pie-mtp-profile] seq=" << seq
+        << " N=" << p.N
+        << " total_ms=" << p.total_ms
+        << " input_fc_ms=" << p.input_fc_ms
+        << " attn_ms=" << p.attn_ms
+        << " mlp_ms=" << p.mlp_ms
+        << " lm_head_ms=" << p.lm_head_ms
+        << " other_ms=" << other
+        << "\n";
+}
 
 // Linear-attn layer body. Reads `ws.norm_x` (post-input-layernorm
 // activations) and writes the layer's contribution into `ws.norm_y`
@@ -101,26 +233,43 @@ void linear_attn_layer_body(
     auto slot_for = [&](int r) -> int {
         return slot_ids_h ? slot_ids_h[r] : 0;
     };
+    const int snapshot_base_slot =
+        (R == 1) ? state_cache.spec_snapshot_base_slot() : -1;
+    const int snapshot_count =
+        snapshot_base_slot >= 0 ? state_cache.spec_snapshot_count() : 0;
 
     // ── In-projections ────────────────────────────────────────────
     // Linear-attn projections stay bf16 (no QuantMeta companion in
     // Qwen3_5LayerWeights) — the implicit WeightView ctor pulls the
     // bf16 tensor through unchanged.
-    // mixed_qkv [N, conv_dim] = norm_x @ in_proj_qkv.T
-    ops::gemm_act_x_w(cublas.handle(),
-        ws.norm_x.data(), *Lw.la_in_proj_qkv,
-        la.mixed_qkv.data(), N, conv_dim, H);
-    // z [N, V_dim] = norm_x @ in_proj_z.T
-    ops::gemm_act_x_w(cublas.handle(),
-        ws.norm_x.data(), *Lw.la_in_proj_z,
-        la.z.data(), N, V_dim, H);
-    // a [N, V_h] = norm_x @ in_proj_a.T   (b symmetric)
-    ops::gemm_act_x_w(cublas.handle(),
-        ws.norm_x.data(), *Lw.la_in_proj_a,
-        la.a.data(), N, V_h, H);
-    ops::gemm_act_x_w(cublas.handle(),
-        ws.norm_x.data(), *Lw.la_in_proj_b,
-        la.b.data(), N, V_h, H);
+    if (Lw.la_in_proj_qkvz != nullptr && Lw.la_in_proj_ba != nullptr) {
+        ops::gemm_act_x_w(cublas.handle(),
+            ws.norm_x.data(), *Lw.la_in_proj_qkvz,
+            la.mixed_qkvz.data(), N, conv_dim + V_dim, H);
+        ops::gemm_act_x_w(cublas.handle(),
+            ws.norm_x.data(), *Lw.la_in_proj_ba,
+            la.ba.data(), N, 2 * V_h, H);
+        kernels::launch_split_qwen_gdn_projections_bf16(
+            la.mixed_qkvz.data(), la.ba.data(),
+            la.mixed_qkv.data(), la.z.data(), la.b.data(), la.a.data(),
+            N, conv_dim, V_dim, V_h, stream);
+    } else {
+        // mixed_qkv [N, conv_dim] = norm_x @ in_proj_qkv.T
+        ops::gemm_act_x_w(cublas.handle(),
+            ws.norm_x.data(), *Lw.la_in_proj_qkv,
+            la.mixed_qkv.data(), N, conv_dim, H);
+        // z [N, V_dim] = norm_x @ in_proj_z.T
+        ops::gemm_act_x_w(cublas.handle(),
+            ws.norm_x.data(), *Lw.la_in_proj_z,
+            la.z.data(), N, V_dim, H);
+        // a [N, V_h] = norm_x @ in_proj_a.T   (b symmetric)
+        ops::gemm_act_x_w(cublas.handle(),
+            ws.norm_x.data(), *Lw.la_in_proj_a,
+            la.a.data(), N, V_h, H);
+        ops::gemm_act_x_w(cublas.handle(),
+            ws.norm_x.data(), *Lw.la_in_proj_b,
+            la.b.data(), N, V_h, H);
+    }
 
     // ── Causal depthwise conv1d (kernel=K, fused silu) ────────────
     // Per-request conv_state lives in `state_cache.conv_state(layer, slot)`.
@@ -156,7 +305,7 @@ void linear_attn_layer_body(
         // into the request's slot. Falls back to host-loop for the
         // legacy single-request parity entrypoint.
         if (slot_ids_d != nullptr && qo_indptr_d != nullptr) {
-            kernels::launch_causal_conv1d_prefill_batched_bf16(
+            kernels::launch_causal_conv1d_prefill_batched_snapshot_bf16(
                 qkv_in_base, Lw.la_conv1d_w->data(),
                 Lw.la_conv1d_b ? Lw.la_conv1d_b->data() : nullptr,
                 qkv_post_base,
@@ -164,7 +313,8 @@ void linear_attn_layer_body(
                 slot_ids_d, qo_indptr_d,
                 static_cast<long long>(state_cache.conv_kernel()) *
                     state_cache.conv_dim(),
-                R, conv_dim, conv_K, stream);
+                R, conv_dim, conv_K,
+                snapshot_base_slot, snapshot_count, stream);
         } else {
             for (int r = 0; r < R; ++r) {
                 const int t0 = static_cast<int>(qo_indptr_h[r]);
@@ -181,63 +331,42 @@ void linear_attn_layer_body(
         }
     }
 
-    // ── Split mixed_qkv_post into q_raw, k_raw, v_raw ─────────────
-    // mixed_qkv_post[N, conv_dim] packs per-token channels as
-    // [q_raw(K_dim) | k_raw(K_dim) | v_raw(V_dim)]; l2norm wants a
-    // contiguous [N*K_h, K_d] flat view, so copy each segment into its
-    // own dense buffer via stride-aware memcpy2D.
+    // ── Split mixed_qkv_post + prep recurrent inputs ─────────────
+    // mixed_qkv_post[N, conv_dim] packs [q_raw | k_raw | v_raw]. The fused
+    // prep kernel emits compact q/k heads, fp32 v, and per-head g/beta.
     auto* qkv_base = la.mixed_qkv_post.data();
-    const std::size_t bf16 = sizeof(std::uint16_t);
-        CUDA_CHECK(cudaMemcpy2DAsync(
-            la.q_raw.data(), K_dim * bf16,
-            qkv_base, conv_dim * bf16,
-            K_dim * bf16, N, cudaMemcpyDeviceToDevice, stream));
-        CUDA_CHECK(cudaMemcpy2DAsync(
-            la.k_raw.data(), K_dim * bf16,
-            qkv_base + K_dim, conv_dim * bf16,
-            K_dim * bf16, N, cudaMemcpyDeviceToDevice, stream));
-        CUDA_CHECK(cudaMemcpy2DAsync(
-            la.v_raw.data(), V_dim * bf16,
-            qkv_base + 2 * K_dim, conv_dim * bf16,
-            V_dim * bf16, N, cudaMemcpyDeviceToDevice, stream));
+        kernels::launch_qwen_gdn_post_conv_prep_bf16(
+            qkv_base, la.a.data(), la.b.data(),
+            Lw.la_A_log_fp32, Lw.la_dt_bias->data(),
+            la.q_pre.data(), la.k_pre.data(), la.v_fp32.data(),
+            la.g_log.data(), la.beta.data(),
+            N, K_h, V_h, K_d, V_d, conv_dim, stream);
 
-        // ── L2-normalise + scale q, l2-normalise k, widen v to fp32 ─────
-        const float scale = 1.f / std::sqrt(static_cast<float>(K_d));
-        kernels::launch_l2norm_scale_bf16_to_fp32(
-            la.q_raw.data(), la.q_pre.data(),
-            N * K_h, K_d, scale, /*eps=*/1e-6f, stream);
-        kernels::launch_l2norm_scale_bf16_to_fp32(
-            la.k_raw.data(), la.k_pre.data(),
-            N * K_h, K_d, /*scale=*/1.f, /*eps=*/1e-6f, stream);
-
-        // repeat_interleave from K_h → V_h heads.
-        if (V_h != K_h) {
+        const bool use_warp_tiled_recurrent =
+            !is_pure_decode &&
+            slot_ids_d != nullptr &&
+            qo_indptr_d != nullptr &&
+            N <= qwen35_gdn_warp_tiled_max_tokens() &&
+            K_d <= 256;
+        const bool use_decode_gqa_recurrent =
+            is_pure_decode &&
+            slot_ids_d != nullptr &&
+            V_h != K_h &&
+            V_h % K_h == 0;
+        // repeat_interleave from K_h to V_h heads. The warp-tiled verifier
+        // and GQA decode recurrent kernels can index the compact K_h layout
+        // directly, so skip materialisation there.
+        if (V_h != K_h && !use_warp_tiled_recurrent &&
+            !use_decode_gqa_recurrent) {
             kernels::launch_repeat_interleave_heads_fp32(
                 la.q_pre.data(), la.q_norm.data(), N, K_h, V_h, K_d, stream);
             kernels::launch_repeat_interleave_heads_fp32(
                 la.k_pre.data(), la.k_norm.data(), N, K_h, V_h, K_d, stream);
-        } else {
-            CUDA_CHECK(cudaMemcpyAsync(
-                la.q_norm.data(), la.q_pre.data(),
-                (std::size_t)N * K_h * K_d * sizeof(float),
-                cudaMemcpyDeviceToDevice, stream));
-            CUDA_CHECK(cudaMemcpyAsync(
-                la.k_norm.data(), la.k_pre.data(),
-                (std::size_t)N * K_h * K_d * sizeof(float),
-                cudaMemcpyDeviceToDevice, stream));
         }
-
-        // v: bf16 → fp32 (no l2norm).
-        kernels::launch_bf16_to_fp32(
-            la.v_raw.data(), la.v_fp32.data(),
-            (std::size_t)N * V_dim, stream);
-
-        // ── g, β per token per head ────────────────────────────────────
-        kernels::launch_gated_delta_g_beta(
-            la.a.data(), la.b.data(),
-            Lw.la_A_log_fp32, Lw.la_dt_bias->data(),
-            la.g_log.data(), la.beta.data(),
-            N, V_h, stream);
+        const float* q_recur_full =
+            (V_h == K_h) ? la.q_pre.data() : la.q_norm.data();
+        const float* k_recur_full =
+            (V_h == K_h) ? la.k_pre.data() : la.k_norm.data();
 
         // ── Recurrent update ───────────────────────────────────────────
         // Both decode and prefill: one batched launch over (R, V_h) blocks
@@ -248,45 +377,200 @@ void linear_attn_layer_body(
             const std::size_t qk_step = static_cast<std::size_t>(V_h) * K_d;
             const std::size_t v_step  = static_cast<std::size_t>(V_dim);
             const std::size_t gh_step = static_cast<std::size_t>(V_h);
+            const bool state_bf16 = state_cache.recurrent_state_bf16();
+            void* state_slot0 = state_cache.recurrent_state_raw(
+                layer_idx, /*slot=*/0);
+            const auto slot_stride = static_cast<long long>(
+                state_cache.recurrent_slot_stride_floats());
             if (is_pure_decode) {
                 if (slot_ids_d != nullptr) {
-                    kernels::launch_recurrent_gated_delta_step_batched(
-                        la.q_norm.data(),
-                        la.k_norm.data(),
-                        la.v_fp32.data(),
-                        la.g_log.data(),
-                        la.beta.data(),
-                        state_cache.recurrent_state(layer_idx, /*slot=*/0),
-                        slot_ids_d,
-                        static_cast<long long>(
-                            state_cache.recurrent_slot_stride_floats()),
-                        la.core_out.data(),
-                        R, V_h, K_d, V_d, stream);
+                    if (use_decode_gqa_recurrent) {
+                        if (state_bf16) {
+                            kernels::launch_recurrent_gated_delta_step_batched_gqa_state_bf16(
+                                la.q_pre.data(),
+                                la.k_pre.data(),
+                                la.v_fp32.data(),
+                                la.g_log.data(),
+                                la.beta.data(),
+                                state_slot0,
+                                slot_ids_d,
+                                slot_stride,
+                                la.core_out.data(),
+                                R, K_h, V_h, K_d, V_d, stream);
+                        } else {
+                            kernels::launch_recurrent_gated_delta_step_batched_gqa(
+                                la.q_pre.data(),
+                                la.k_pre.data(),
+                                la.v_fp32.data(),
+                                la.g_log.data(),
+                                la.beta.data(),
+                                static_cast<float*>(state_slot0),
+                                slot_ids_d,
+                                slot_stride,
+                                la.core_out.data(),
+                                R, K_h, V_h, K_d, V_d, stream);
+                        }
+                    } else {
+                        if (state_bf16) {
+                            kernels::launch_recurrent_gated_delta_step_batched_state_bf16(
+                                q_recur_full,
+                                k_recur_full,
+                                la.v_fp32.data(),
+                                la.g_log.data(),
+                                la.beta.data(),
+                                state_slot0,
+                                slot_ids_d,
+                                slot_stride,
+                                la.core_out.data(),
+                                R, V_h, K_d, V_d, stream);
+                        } else {
+                            kernels::launch_recurrent_gated_delta_step_batched(
+                                q_recur_full,
+                                k_recur_full,
+                                la.v_fp32.data(),
+                                la.g_log.data(),
+                                la.beta.data(),
+                                static_cast<float*>(state_slot0),
+                                slot_ids_d,
+                                slot_stride,
+                                la.core_out.data(),
+                                R, V_h, K_d, V_d, stream);
+                        }
+                    }
                 } else {
-                    kernels::launch_recurrent_gated_delta_step(
-                        la.q_norm.data(),
-                        la.k_norm.data(),
-                        la.v_fp32.data(),
-                        la.g_log.data(),
-                        la.beta.data(),
-                        state_cache.recurrent_state(layer_idx, 0),
-                        la.core_out.data(),
-                        /*B=*/1, V_h, K_d, V_d, stream);
+                    if (state_bf16) {
+                        kernels::launch_recurrent_gated_delta_step_state_bf16(
+                            q_recur_full,
+                            k_recur_full,
+                            la.v_fp32.data(),
+                            la.g_log.data(),
+                            la.beta.data(),
+                            state_slot0,
+                            la.core_out.data(),
+                            /*B=*/1, V_h, K_d, V_d, stream);
+                    } else {
+                        kernels::launch_recurrent_gated_delta_step(
+                            q_recur_full,
+                            k_recur_full,
+                            la.v_fp32.data(),
+                            la.g_log.data(),
+                            la.beta.data(),
+                            static_cast<float*>(state_slot0),
+                            la.core_out.data(),
+                            /*B=*/1, V_h, K_d, V_d, stream);
+                    }
                 }
             } else {
                 if (slot_ids_d != nullptr && qo_indptr_d != nullptr) {
-                    kernels::launch_chunk_gated_delta_prefill_batched(
-                        la.q_norm.data(),
-                        la.k_norm.data(),
-                        la.v_fp32.data(),
-                        la.g_log.data(),
-                        la.beta.data(),
-                        state_cache.recurrent_state(layer_idx, /*slot=*/0),
-                        slot_ids_d, qo_indptr_d,
-                        static_cast<long long>(
-                            state_cache.recurrent_slot_stride_floats()),
-                        la.core_out.data(),
-                        R, V_h, K_d, V_d, stream);
+                    if (use_warp_tiled_recurrent && V_h != K_h) {
+                        if (state_bf16) {
+                            kernels::launch_chunk_gated_delta_prefill_batched_warp_tiled_gqa_snapshot_state_bf16(
+                                la.q_pre.data(),
+                                la.k_pre.data(),
+                                la.v_fp32.data(),
+                                la.g_log.data(),
+                                la.beta.data(),
+                                state_slot0,
+                                slot_ids_d, qo_indptr_d,
+                                slot_stride,
+                                la.core_out.data(),
+                                R, K_h, V_h, K_d, V_d,
+                                snapshot_base_slot, snapshot_count, stream);
+                        } else {
+                            kernels::launch_chunk_gated_delta_prefill_batched_warp_tiled_gqa_snapshot(
+                                la.q_pre.data(),
+                                la.k_pre.data(),
+                                la.v_fp32.data(),
+                                la.g_log.data(),
+                                la.beta.data(),
+                                static_cast<float*>(state_slot0),
+                                slot_ids_d, qo_indptr_d,
+                                slot_stride,
+                                la.core_out.data(),
+                                R, K_h, V_h, K_d, V_d,
+                                snapshot_base_slot, snapshot_count, stream);
+                        }
+                    } else if (use_warp_tiled_recurrent) {
+                        if (state_bf16) {
+                            kernels::launch_chunk_gated_delta_prefill_batched_warp_tiled_snapshot_state_bf16(
+                                q_recur_full,
+                                k_recur_full,
+                                la.v_fp32.data(),
+                                la.g_log.data(),
+                                la.beta.data(),
+                                state_slot0,
+                                slot_ids_d, qo_indptr_d,
+                                slot_stride,
+                                la.core_out.data(),
+                                R, V_h, K_d, V_d,
+                                snapshot_base_slot, snapshot_count, stream);
+                        } else {
+                            kernels::launch_chunk_gated_delta_prefill_batched_warp_tiled_snapshot(
+                                q_recur_full,
+                                k_recur_full,
+                                la.v_fp32.data(),
+                                la.g_log.data(),
+                                la.beta.data(),
+                                static_cast<float*>(state_slot0),
+                                slot_ids_d, qo_indptr_d,
+                                slot_stride,
+                                la.core_out.data(),
+                                R, V_h, K_d, V_d,
+                                snapshot_base_slot, snapshot_count, stream);
+                        }
+                    } else if (N <= qwen35_gdn_cached_prefill_max_tokens()) {
+                        if (state_bf16) {
+                            kernels::launch_chunk_gated_delta_prefill_batched_cached_state_bf16(
+                                q_recur_full,
+                                k_recur_full,
+                                la.v_fp32.data(),
+                                la.g_log.data(),
+                                la.beta.data(),
+                                state_slot0,
+                                slot_ids_d, qo_indptr_d,
+                                slot_stride,
+                                la.core_out.data(),
+                                R, V_h, K_d, V_d, stream);
+                        } else {
+                            kernels::launch_chunk_gated_delta_prefill_batched_cached(
+                                q_recur_full,
+                                k_recur_full,
+                                la.v_fp32.data(),
+                                la.g_log.data(),
+                                la.beta.data(),
+                                static_cast<float*>(state_slot0),
+                                slot_ids_d, qo_indptr_d,
+                                slot_stride,
+                                la.core_out.data(),
+                                R, V_h, K_d, V_d, stream);
+                        }
+                    } else {
+                        if (state_bf16) {
+                            kernels::launch_chunk_gated_delta_prefill_batched_state_bf16(
+                                q_recur_full,
+                                k_recur_full,
+                                la.v_fp32.data(),
+                                la.g_log.data(),
+                                la.beta.data(),
+                                state_slot0,
+                                slot_ids_d, qo_indptr_d,
+                                slot_stride,
+                                la.core_out.data(),
+                                R, V_h, K_d, V_d, stream);
+                        } else {
+                            kernels::launch_chunk_gated_delta_prefill_batched(
+                                q_recur_full,
+                                k_recur_full,
+                                la.v_fp32.data(),
+                                la.g_log.data(),
+                                la.beta.data(),
+                                static_cast<float*>(state_slot0),
+                                slot_ids_d, qo_indptr_d,
+                                slot_stride,
+                                la.core_out.data(),
+                                R, V_h, K_d, V_d, stream);
+                        }
+                    }
                 } else {
                     for (int r = 0; r < R; ++r) {
                         const int t0 = static_cast<int>(qo_indptr_h[r]);
@@ -295,15 +579,29 @@ void linear_attn_layer_body(
                         const std::size_t qk_off = static_cast<std::size_t>(t0) * qk_step;
                         const std::size_t v_off  = static_cast<std::size_t>(t0) * v_step;
                         const std::size_t gh_off = static_cast<std::size_t>(t0) * gh_step;
-                        kernels::launch_chunk_gated_delta_prefill(
-                            la.q_norm.data() + qk_off,
-                            la.k_norm.data() + qk_off,
-                            la.v_fp32.data() + v_off,
-                            la.g_log.data()  + gh_off,
-                            la.beta.data()   + gh_off,
-                            state_cache.recurrent_state(layer_idx, slot_for(r)),
-                            la.core_out.data() + v_off,
-                            Nr, V_h, K_d, V_d, /*chunk_size=*/64, stream);
+                        void* state_slot = state_cache.recurrent_state_raw(
+                            layer_idx, slot_for(r));
+                        if (state_bf16) {
+                            kernels::launch_chunk_gated_delta_prefill_state_bf16(
+                                q_recur_full + qk_off,
+                                k_recur_full + qk_off,
+                                la.v_fp32.data() + v_off,
+                                la.g_log.data()  + gh_off,
+                                la.beta.data()   + gh_off,
+                                state_slot,
+                                la.core_out.data() + v_off,
+                                Nr, V_h, K_d, V_d, /*chunk_size=*/64, stream);
+                        } else {
+                            kernels::launch_chunk_gated_delta_prefill(
+                                q_recur_full + qk_off,
+                                k_recur_full + qk_off,
+                                la.v_fp32.data() + v_off,
+                                la.g_log.data()  + gh_off,
+                                la.beta.data()   + gh_off,
+                                static_cast<float*>(state_slot),
+                                la.core_out.data() + v_off,
+                                Nr, V_h, K_d, V_d, /*chunk_size=*/64, stream);
+                        }
                     }
                 }
             }
@@ -354,7 +652,8 @@ void full_attn_layer_body(
     Qwen3_5LinearAttnWorkspace& la,
     KvCache& cache,
     AttentionWorkspace& attn_ws,
-    const ops::DecodePlanCachePtr& decode_plan,  // non-null on decode path
+    const ops::DecodePlanCache* decode_plan,  // non-null on decode path
+    const ops::PrefillPlanCache* prefill_plan,
     int kv_layer,
     int N, int R,
     const std::int32_t* positions,
@@ -417,14 +716,34 @@ void full_attn_layer_body(
         N, R, stream);
 
     // ── Flashinfer attention ──────────────────────────────────────
-    // Decode path: pre-planned (graph-friendly). Prefill path: includes
-    // host work inside the launcher (PrefillPlan), so non-graph-capturable.
+    // Decode and planned-prefill paths are graph-friendly: the host-side
+    // FlashInfer planning was hoisted to the executor prepare hook.
+    const bool use_small_prefill_naive =
+        decode_plan == nullptr &&
+        prefill_plan == nullptr &&
+        fwd_cfg.small_prefill_naive_attention_max_tokens > 0 &&
+        N <= fwd_cfg.small_prefill_naive_attention_max_tokens &&
+        kv_view.is_native_bf16() && !kv_view.hnd_layout;
     if (decode_plan) {
         ops::dispatch_attention_flashinfer_decode(
             *decode_plan,
             ws.q.data(), kv_view, ws.attn_out.data(),
             kv_page_indices, kv_page_indptr, kv_last_page_lens,
             attn_ws, stream);
+    } else if (prefill_plan) {
+        ops::dispatch_attention_flashinfer_prefill_bf16(
+            *prefill_plan,
+            ws.q.data(), kv_view.k_bf16_pages, kv_view.v_bf16_pages,
+            ws.attn_out.data(),
+            qo_indptr, kv_page_indices, kv_page_indptr, kv_last_page_lens,
+            attn_ws, stream);
+    } else if (use_small_prefill_naive) {
+        ops::launch_attention_naive_paged_bf16(
+            ws.q.data(), kv_view.k_bf16_pages, kv_view.v_bf16_pages,
+            ws.attn_out.data(),
+            qo_indptr, kv_page_indices, kv_page_indptr, kv_last_page_lens,
+            N, R, num_q_heads_local, num_kv_heads_local, d,
+            cache.page_size(), stream);
     } else {
         ops::launch_attention_flashinfer_prefill(
             ws.q.data(), kv_view, ws.attn_out.data(),
@@ -463,14 +782,46 @@ void prepare_qwen3_5_decode_plan(
     KvCache& cache,
     const HfConfig& cfg,
     const Qwen3_5ForwardCfg& fwd_cfg,
+    const std::uint32_t* qo_indptr_h,
     const std::uint32_t* kv_page_indptr_h,
+    const std::uint32_t* kv_last_page_lens_h,
+    int total_tokens,
     int num_requests,
     bool is_pure_decode,
     cudaStream_t stream)
 {
+    state.use_prefill_plan = false;
     if (!is_pure_decode || fwd_cfg.force_prefill_path) {
-        // Body uses the prefill kernel — no plan to compute.
         state.decode_plan.reset();
+        if (cache.format().is_native_bf16() && !cache.hnd_layout()) {
+            if (!state.prefill_plan) {
+                state.prefill_plan = ops::make_prefill_plan();
+            }
+            const int T = std::max(1, fwd_cfg.tp_size);
+            const bool enable_graph =
+                fwd_cfg.small_prefill_naive_attention_max_tokens > 0 &&
+                total_tokens <=
+                    fwd_cfg.small_prefill_naive_attention_max_tokens;
+            ops::plan_attention_flashinfer_prefill_bf16(
+                *state.prefill_plan,
+                qo_indptr_h,
+                kv_page_indptr_h,
+                kv_last_page_lens_h,
+                total_tokens,
+                num_requests,
+                cfg.num_attention_heads / T,
+                cfg.num_key_value_heads / T,
+                cfg.head_dim,
+                cache.page_size(),
+                attn_ws,
+                stream,
+                enable_graph,
+                /*window_left=*/-1,
+                /*full_attention_variant=*/false,
+                cache.hnd_layout(),
+                /*causal_mask=*/true);
+            state.use_prefill_plan = true;
+        }
         return;
     }
     if (!state.decode_plan) {
@@ -500,6 +851,9 @@ void prepare_qwen3_5_decode_plan(
 std::uint32_t qwen3_5_decode_graph_layout(
     const Qwen3_5PlanState& state)
 {
+    if (state.use_prefill_plan && state.prefill_plan) {
+        return ops::prefill_plan_graph_layout(*state.prefill_plan);
+    }
     if (!state.decode_plan) return 0;
     return ops::decode_plan_graph_layout(*state.decode_plan);
 }
@@ -536,7 +890,7 @@ void qwen3_5_forward_paged(
     const int N  = total_tokens;
     const int R  = num_requests;
     const float eps = cfg.rms_norm_eps;
-    cudaStream_t stream = nullptr;
+    cudaStream_t stream = cublas.stream();
 
     // Per-slot reset for any request whose slot was just (re)assigned.
     // The runtime guarantees a slot is_fresh only on the first fire of a
@@ -560,7 +914,12 @@ void qwen3_5_forward_paged(
     // setup. Reading it from `plan_state` keeps host work — and its
     // attendant cudaMemcpyAsync H2D from a stack-allocated indptr_h_buf
     // — out of any cudaStream capture region.
-    const ops::DecodePlanCachePtr& decode_plan = plan_state.decode_plan;
+    const ops::DecodePlanCache* decode_plan =
+        plan_state.decode_plan ? plan_state.decode_plan.get() : nullptr;
+    const ops::PrefillPlanCache* prefill_plan =
+        (plan_state.use_prefill_plan && plan_state.prefill_plan)
+            ? plan_state.prefill_plan.get()
+            : nullptr;
 
     // 1. Embed.
     kernels::launch_embed_bf16(
@@ -584,7 +943,8 @@ void qwen3_5_forward_paged(
                 cublas, stream);
         } else {
             full_attn_layer_body(
-                Lw, cfg, fwd_cfg, ws, la_ws, cache, attn_ws, decode_plan, Lw.kv_layer,
+                Lw, cfg, fwd_cfg, ws, la_ws, cache, attn_ws,
+                decode_plan, prefill_plan, Lw.kv_layer,
                 N, num_requests,
                 positions, qo_indptr, kv_page_indices, kv_page_indptr,
                 kv_last_page_lens, qo_indptr_h, kv_page_indptr_h,
@@ -639,6 +999,295 @@ void qwen3_5_forward_paged(
     ops::gemm_act_x_w(cublas.handle(),
         ws.norm_x.data(), *w.lm_head,
         ws.logits.data(), N, V, H);
+    CUDA_CHECK(cudaMemcpyAsync(
+        ws.y.data(), ws.norm_x.data(),
+        static_cast<std::size_t>(N) * H * sizeof(std::uint16_t),
+        cudaMemcpyDeviceToDevice, stream));
+}
+
+namespace {
+
+void mtp_full_attn_no_cache(
+    const Qwen3_5LayerWeights& Lw,
+    const HfConfig& cfg,
+    const Qwen3_5ForwardCfg& fwd_cfg,
+    Qwen3Workspace& ws,
+    Qwen3_5LinearAttnWorkspace& la,
+    KvCache& cache,
+    int N,
+    int draft_step,
+    const std::int32_t* position_ids,
+    const std::int32_t* request_ids,
+    const std::uint32_t* kv_page_indices,
+    const std::uint32_t* kv_page_indptr,
+    const std::uint32_t* kv_last_page_lens,
+    int max_global_tokens,
+    ops::CublasHandle& cublas,
+    cudaStream_t stream)
+{
+    const int T = std::max(1, fwd_cfg.tp_size);
+    const int H = cfg.hidden_size;
+    const int q_heads = cfg.num_attention_heads / T;
+    const int kv_heads = cfg.num_key_value_heads / T;
+    const int Hq = q_heads * cfg.head_dim;
+    const int Hk = kv_heads * cfg.head_dim;
+    const int d = cfg.head_dim;
+    const int rotary_dim = std::max<int>(2,
+        2 * static_cast<int>(0.5f * cfg.partial_rotary_factor * d));
+    const float eps = cfg.rms_norm_eps;
+    const std::size_t kv_step_offset =
+        static_cast<std::size_t>(draft_step) * N * Hk;
+    auto* k_step = static_cast<std::uint16_t*>(ws.k.data()) + kv_step_offset;
+    auto* v_step = static_cast<std::uint16_t*>(ws.v.data()) + kv_step_offset;
+
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_x.data(), make_weight_view(Lw.fa_q_proj, Lw.fa_q_proj_quant),
+        la.fa_qg_packed.data(), N, 2 * Hq, H);
+    kernels::launch_split_q_gate_bf16(
+        la.fa_qg_packed.data(), ws.q.data(), la.fa_gate.data(),
+        N, q_heads, cfg.head_dim, stream);
+
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_x.data(), make_weight_view(Lw.fa_v_proj, Lw.fa_v_proj_quant),
+        v_step, N, Hk, H);
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_x.data(), make_weight_view(Lw.fa_k_proj, Lw.fa_k_proj_quant),
+        k_step, N, Hk, H);
+
+    kernels::launch_rmsnorm_gemma_bf16(
+        ws.q.data(), Lw.fa_q_norm->data(), ws.q.data(),
+        N * q_heads, d, eps, stream);
+    kernels::launch_rmsnorm_gemma_bf16(
+        k_step, Lw.fa_k_norm->data(), k_step,
+        N * kv_heads, d, eps, stream);
+    kernels::launch_rope_partial_bf16(
+        ws.q.data(), k_step, position_ids,
+        N, q_heads, kv_heads, d, rotary_dim, cfg.rope_theta, stream);
+
+    const auto mtp_kv = cache.layer_view(Lw.kv_layer);
+    ops::launch_attention_mtp_paged_history_bf16(
+        ws.q.data(), mtp_kv.k_bf16_pages, mtp_kv.v_bf16_pages,
+        ws.k.data(), ws.v.data(), ws.attn_out.data(),
+        position_ids, request_ids,
+        kv_page_indices, kv_page_indptr, kv_last_page_lens,
+        N, draft_step + 1, N, max_global_tokens, cache.page_size(),
+        q_heads, kv_heads, d, mtp_kv.hnd_layout, stream);
+    kernels::launch_sigmoid_gate_inplace_bf16(
+        ws.attn_out.data(), la.fa_gate.data(), N * Hq, stream);
+
+    NcclComm* tp = (T > 1) ? fwd_cfg.tp_comm : nullptr;
+    if (T == 1) {
+        ops::gemm_act_x_w(cublas.handle(),
+            ws.attn_out.data(), make_weight_view(Lw.fa_o_proj, Lw.fa_o_proj_quant),
+            ws.y.data(), N, H, Hq, /*beta=*/1.f);
+    } else {
+        ops::gemm_act_x_w(cublas.handle(),
+            ws.attn_out.data(), make_weight_view(Lw.fa_o_proj, Lw.fa_o_proj_quant),
+            ws.norm_y.data(), N, H, Hq, /*beta=*/0.f);
+        tp->all_reduce_bf16(ws.norm_y.data(),
+            static_cast<std::size_t>(N) * H, ncclSum, stream);
+        kernels::launch_residual_add_bf16(
+            ws.y.data(), ws.norm_y.data(),
+            static_cast<std::size_t>(N) * H, stream);
+    }
+}
+
+}  // namespace
+
+void qwen3_5_mtp_process_cache(
+    const Qwen3_5Weights& w,
+    const HfConfig& cfg,
+    const Qwen3_5ForwardCfg& fwd_cfg,
+    Qwen3Workspace& ws,
+    Qwen3_5LinearAttnWorkspace& la_ws,
+    KvCache& cache,
+    Qwen3_5StateCache& state_cache,
+    ops::CublasHandle& cublas,
+    const std::int32_t* token_ids,
+    const std::int32_t* positions,
+    const std::uint32_t* qo_indptr,
+    const std::uint32_t* kv_page_indices,
+    const std::uint32_t* kv_page_indptr,
+    const std::uint32_t* kv_last_page_lens,
+    const std::int32_t* slot_ids_d,
+    const std::int32_t* source_row_indices,
+    int total_tokens,
+    int num_requests)
+{
+    if (!w.mtp || total_tokens <= 0 || num_requests <= 0) return;
+    const auto& mtp = *w.mtp;
+    const auto& Lw = mtp.layer;
+    if (Lw.kv_layer < 0) return;
+
+    const int H = cfg.hidden_size;
+    const int T = std::max(1, fwd_cfg.tp_size);
+    const int kv_heads = cfg.num_key_value_heads / T;
+    const int Hk = kv_heads * cfg.head_dim;
+    const int d = cfg.head_dim;
+    const int rotary_dim = std::max<int>(2,
+        2 * static_cast<int>(0.5f * cfg.partial_rotary_factor * d));
+    const float eps = cfg.rms_norm_eps;
+    cudaStream_t stream = cublas.stream();
+
+    void* pending = state_cache.mtp_pending_hidden(0);
+    const void* target_hidden = ws.y.data();
+    if (source_row_indices != nullptr) {
+        kernels::launch_gather_bf16_rows(
+            static_cast<const std::uint16_t*>(ws.y.data()),
+            source_row_indices,
+            static_cast<std::uint16_t*>(ws.norm_x.data()),
+            total_tokens, H, stream);
+        target_hidden = ws.norm_x.data();
+    }
+    ops::launch_mtp_shift_hidden_bf16(
+        target_hidden, pending, qo_indptr, slot_ids_d, ws.norm_y.data(),
+        total_tokens, num_requests, H, stream);
+    ops::launch_mtp_update_pending_hidden_bf16(
+        target_hidden, pending, qo_indptr, slot_ids_d, num_requests, H, stream);
+    kernels::launch_embed_bf16(
+        token_ids, mtp.embed->data(), ws.norm_x.data(),
+        total_tokens, H, cfg.vocab_size, stream);
+    kernels::launch_rmsnorm_gemma_bf16(
+        ws.norm_x.data(), mtp.pre_fc_norm_embedding->data(), ws.q.data(),
+        total_tokens, H, eps, stream);
+    kernels::launch_rmsnorm_gemma_bf16(
+        ws.norm_y.data(), mtp.pre_fc_norm_hidden->data(), ws.attn_out.data(),
+        total_tokens, H, eps, stream);
+    kernels::launch_concat_bf16_rows(
+        ws.q.data(), ws.attn_out.data(), ws.mtp_concat.data(),
+        total_tokens, H, H, stream);
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.mtp_concat.data(), *mtp.fc, ws.norm_y.data(),
+        total_tokens, H, 2 * H);
+    kernels::launch_rmsnorm_gemma_bf16(
+        ws.norm_y.data(), Lw.attn_norm_pre->data(), ws.norm_x.data(),
+        total_tokens, H, eps, stream);
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_x.data(), make_weight_view(Lw.fa_k_proj, Lw.fa_k_proj_quant),
+        ws.k.data(), total_tokens, Hk, H);
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_x.data(), make_weight_view(Lw.fa_v_proj, Lw.fa_v_proj_quant),
+        ws.v.data(), total_tokens, Hk, H);
+    kernels::launch_rmsnorm_gemma_bf16(
+        ws.k.data(), Lw.fa_k_norm->data(), ws.k.data(),
+        total_tokens * kv_heads, d, eps, stream);
+    kernels::launch_rope_partial_bf16(
+        /*q=*/nullptr, ws.k.data(), positions,
+        total_tokens, 0, kv_heads, d, rotary_dim, cfg.rope_theta, stream);
+    kernels::launch_write_kv_to_pages(
+        cache.layer_view(Lw.kv_layer),
+        ws.k.data(), ws.v.data(), qo_indptr, kv_page_indices,
+        kv_page_indptr, kv_last_page_lens, total_tokens, num_requests, stream);
+}
+
+void qwen3_5_mtp_forward(
+    const Qwen3_5Weights& w,
+    const HfConfig& cfg,
+    const Qwen3_5ForwardCfg& fwd_cfg,
+    Qwen3Workspace& ws,
+    Qwen3_5LinearAttnWorkspace& la_ws,
+    KvCache& cache,
+    ops::CublasHandle& cublas,
+    const std::int32_t* token_ids,
+    const std::int32_t* position_ids,
+    const std::int32_t* base_hidden_row_indices,
+    const std::int32_t* request_ids,
+    const std::uint32_t* kv_page_indices,
+    const std::uint32_t* kv_page_indptr,
+    const std::uint32_t* kv_last_page_lens,
+    int num_tokens,
+    int draft_step,
+    int max_global_tokens)
+{
+    if (!w.mtp || num_tokens <= 0) return;
+    const auto& mtp = *w.mtp;
+    const auto& Lw = mtp.layer;
+    const int H = cfg.hidden_size;
+    const int V = cfg.vocab_size;
+    const float eps = cfg.rms_norm_eps;
+    cudaStream_t stream = cublas.stream();
+    MtpProfile profile;
+    profile.begin(num_tokens, stream);
+
+    profile_mtp_stage(profile, profile.input_fc_ms, stream, [&] {
+    kernels::launch_gather_bf16_rows(
+        static_cast<const std::uint16_t*>(ws.y.data()),
+        base_hidden_row_indices,
+        static_cast<std::uint16_t*>(ws.norm_y.data()),
+        num_tokens, H, stream);
+    kernels::launch_embed_bf16(
+        token_ids, mtp.embed->data(), ws.norm_x.data(),
+        num_tokens, H, cfg.vocab_size, stream);
+    kernels::launch_rmsnorm_gemma_bf16(
+        ws.norm_x.data(), mtp.pre_fc_norm_embedding->data(), ws.q.data(),
+        num_tokens, H, eps, stream);
+    kernels::launch_rmsnorm_gemma_bf16(
+        ws.norm_y.data(), mtp.pre_fc_norm_hidden->data(), ws.y.data(),
+        num_tokens, H, eps, stream);
+    kernels::launch_concat_bf16_rows(
+        ws.q.data(), ws.y.data(), ws.mtp_concat.data(),
+        num_tokens, H, H, stream);
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.mtp_concat.data(), *mtp.fc, ws.y.data(),
+        num_tokens, H, 2 * H);
+    });
+
+    profile_mtp_stage(profile, profile.attn_ms, stream, [&] {
+    kernels::launch_rmsnorm_gemma_bf16(
+        ws.y.data(), Lw.attn_norm_pre->data(), ws.norm_x.data(),
+        num_tokens, H, eps, stream);
+    mtp_full_attn_no_cache(
+        Lw, cfg, fwd_cfg, ws, la_ws, cache, num_tokens, draft_step,
+        position_ids, request_ids, kv_page_indices, kv_page_indptr,
+        kv_last_page_lens, max_global_tokens, cublas, stream);
+    });
+
+    profile_mtp_stage(profile, profile.mlp_ms, stream, [&] {
+    kernels::launch_rmsnorm_gemma_bf16(
+        ws.y.data(), Lw.mlp_norm_pre->data(), ws.norm_x.data(),
+        num_tokens, H, eps, stream);
+    const int T_mlp = std::max(1, fwd_cfg.tp_size);
+    const int I = cfg.intermediate_size / T_mlp;
+    NcclComm* tp_mlp = (T_mlp > 1) ? fwd_cfg.tp_comm : nullptr;
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_x.data(), make_weight_view(Lw.gate_proj, Lw.gate_proj_quant),
+        ws.gate.data(), num_tokens, I, H);
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_x.data(), make_weight_view(Lw.up_proj, Lw.up_proj_quant),
+        ws.up.data(), num_tokens, I, H);
+    kernels::launch_swiglu_bf16(
+        ws.gate.data(), ws.up.data(), ws.gate.data(),
+        num_tokens * I, stream);
+    if (T_mlp == 1) {
+        ops::gemm_act_x_w(cublas.handle(),
+            ws.gate.data(), make_weight_view(Lw.down_proj, Lw.down_proj_quant),
+            ws.y.data(), num_tokens, H, I, /*beta=*/1.f);
+    } else {
+        ops::gemm_act_x_w(cublas.handle(),
+            ws.gate.data(), make_weight_view(Lw.down_proj, Lw.down_proj_quant),
+            ws.norm_y.data(), num_tokens, H, I, /*beta=*/0.f);
+        tp_mlp->all_reduce_bf16(ws.norm_y.data(),
+            static_cast<std::size_t>(num_tokens) * H, ncclSum, stream);
+        kernels::launch_residual_add_bf16(
+            ws.y.data(), ws.norm_y.data(),
+            static_cast<std::size_t>(num_tokens) * H, stream);
+    }
+    });
+
+    profile_mtp_stage(profile, profile.lm_head_ms, stream, [&] {
+    kernels::launch_rmsnorm_gemma_bf16(
+        ws.y.data(), mtp.norm->data(), ws.norm_x.data(),
+        num_tokens, H, eps, stream);
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_x.data(), *w.lm_head,
+        ws.logits.data(), num_tokens, V, H);
+    CUDA_CHECK(cudaMemcpyAsync(
+        ws.y.data(), ws.norm_x.data(),
+        static_cast<std::size_t>(num_tokens) * H * sizeof(std::uint16_t),
+        cudaMemcpyDeviceToDevice, stream));
+    });
+    profile.end(stream);
+    maybe_print_mtp_profile(profile);
 }
 
 }  // namespace pie_cuda_driver::model

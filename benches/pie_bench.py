@@ -432,7 +432,11 @@ async def run(args: argparse.Namespace):
                 "wasm_delay_us": args.wasm_delay_us,
                 "return_text": args.dump_first_text,
                 "wait_for_start": args.defer_start,
-                "system_speculation": args.system_speculation,
+                **(
+                    {"system_speculation": args.system_speculation}
+                    if args.system_speculation is not None
+                    else {}
+                ),
             }
 
         async def launch_one(i: int, *, max_tokens: int | None = None):
@@ -646,6 +650,14 @@ async def run(args: argparse.Namespace):
                     ("default.avg_response_dispatch_us", "avg response dispatch us"),
                     ("default.avg_context_tick_submit_us", "avg context tick submit us"),
                     ("default.avg_stats_update_us", "avg stats update us"),
+                    (
+                        "default.system_spec_draft_tokens_proposed",
+                        "system spec draft tokens proposed",
+                    ),
+                    (
+                        "default.system_spec_draft_tokens_accepted",
+                        "system spec draft tokens accepted",
+                    ),
                     ("default.last_batch_latency_us", "last batch latency us"),
                     ("default.bypass_hits", "bypass hits"),
                     ("default.chain_submits", "chain submits"),
@@ -756,8 +768,9 @@ def build_parser() -> argparse.ArgumentParser:
         sp.add_argument(
             "--system-speculation",
             action=argparse.BooleanOptionalAction,
-            default=True,
-            help="Ask the benchmark inferlet to request driver-provided speculative drafts.",
+            default=None,
+            help="Override system speculation. Omit to use the model default; "
+                 "--no-system-speculation forces the no-spec baseline.",
         )
         sp.add_argument(
             "--batch-policy",

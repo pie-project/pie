@@ -62,6 +62,7 @@ fn build_token_response(tokens: Vec<u32>) -> pie_bridge::ForwardResponse {
         logprobs_values: Vec::new(),
         entropies_indptr: vec![0; (n + 1) as usize],
         entropies: Vec::new(),
+        ..Default::default()
     }
 }
 

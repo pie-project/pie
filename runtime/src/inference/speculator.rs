@@ -46,6 +46,9 @@ pub(crate) type StagedBatchMap = Arc<Mutex<HashMap<ContextId, VecDeque<StagedEnt
 pub(crate) struct StagedEntry {
     pub anchor_token: u32,
     pub anchor_pos: u32,
+    pub spec_token_ids: Vec<u32>,
+    pub spec_position_ids: Vec<u32>,
+    pub output_spec_flags: Vec<bool>,
     /// Claim-side hint for the extender that owns this staged fire.
     /// The inferlet can claim a pre-fired final token while telling
     /// its extender not to submit another stage.
@@ -54,6 +57,17 @@ pub(crate) struct StagedEntry {
     /// matching `Sender`; when the kernel finishes and the output
     /// is delivered, this receiver resolves.
     pub output_rx: oneshot::Receiver<Result<ForwardOutput>>,
+}
+
+pub(crate) fn entry_matches_request(
+    entry: &StagedEntry,
+    request: &pie_bridge::ForwardRequest,
+) -> bool {
+    Some(entry.anchor_token) == request.token_ids.first().copied()
+        && Some(entry.anchor_pos) == request.position_ids.first().copied()
+        && entry.spec_token_ids == request.spec_token_ids
+        && entry.spec_position_ids == request.spec_position_ids
+        && entry.output_spec_flags == request.output_spec_flags
 }
 
 /// Per-model speculator state.
@@ -159,9 +173,7 @@ pub fn try_hit(
     let mut sb = spec.0.lock().ok()?;
     let deque = sb.get_mut(&ctx_id)?;
     let front = deque.front()?;
-    let req_token = request.token_ids.first().copied();
-    let req_pos = request.position_ids.first().copied();
-    if Some(front.anchor_token) == req_token && Some(front.anchor_pos) == req_pos {
+    if entry_matches_request(front, request) {
         let entry = deque.pop_front()?;
         if !allow_extend {
             entry.allow_extend.store(false, Ordering::Relaxed);
@@ -294,15 +306,31 @@ pub(crate) fn spawn_extend_chain(
                 build_next_request(&prev_request, &output)
             {
                 let page_size = crate::context::tokens_per_page(model_idx);
-                // Advance one write slot: either grow within the current
-                // page, or roll over to the next pre-allocated page.
-                let (next_page_idx, next_lpl) = if cur_last_page_len + 1 <= page_size {
-                    (cur_page_idx, cur_last_page_len + 1)
-                } else {
-                    (cur_page_idx + 1, 1)
+                let Some(&prev_pos) = prev_request.position_ids.last() else {
+                    let _ = response.send(Ok(output));
+                    return;
                 };
-                if next_page_idx < all_pages.len() {
-                    let next_pages: Vec<PhysicalPageId> = all_pages[..=next_page_idx].to_vec();
+                let Some(pos_advance) = anchor_pos.checked_sub(prev_pos) else {
+                    let _ = response.send(Ok(output));
+                    return;
+                };
+                if pos_advance == 0 || page_size == 0 {
+                    let _ = response.send(Ok(output));
+                    return;
+                }
+                let lpl0 = cur_last_page_len.saturating_sub(1);
+                let total = lpl0.saturating_add(pos_advance);
+                let page_delta = total / page_size;
+                let next_lpl = (total % page_size) + 1;
+                let next_page_idx = cur_page_idx.saturating_add(page_delta as usize);
+                let spec_tokens = next_req.spec_token_ids.len() as u32;
+                let writable_total = total.saturating_add(spec_tokens);
+                let writable_page_delta = writable_total / page_size;
+                let writable_page_idx =
+                    cur_page_idx.saturating_add(writable_page_delta as usize);
+                if next_page_idx < all_pages.len() && writable_page_idx < all_pages.len() {
+                    let next_pages: Vec<PhysicalPageId> =
+                        all_pages[..=writable_page_idx].to_vec();
                     let queued = staged_batch_arc
                         .lock()
                         .ok()
@@ -327,6 +355,9 @@ pub(crate) fn spawn_extend_chain(
                                 sb.entry(ctx_id).or_default().push_back(StagedEntry {
                                     anchor_token,
                                     anchor_pos,
+                                    spec_token_ids: next_req.spec_token_ids.clone(),
+                                    spec_position_ids: next_req.spec_position_ids.clone(),
+                                    output_spec_flags: next_req.output_spec_flags.clone(),
                                     allow_extend: next_allow_extend.clone(),
                                     output_rx: final_rx_next,
                                 });
@@ -450,9 +481,9 @@ pub fn evaluate_request_shape(req: &pie_bridge::ForwardRequest) -> Result<(), Sk
 ///   - carries the same samplers / adapter as the prior call
 ///   - leaves masks empty so the scheduler can route it through the
 ///     single-token decode path
-///   - has no speculative drafts (those are a property of the
-///     specific request, not the chain — propagating them would
-///     amount to predicting the inferlet's draft strategy)
+///   - carries forward system-speculative drafts returned by the prior
+///     driver pass, so pass-level speculation remains orthogonal to
+///     driver/system speculation.
 pub fn build_next_request(
     prev_req: &pie_bridge::ForwardRequest,
     prev_resp: &ForwardOutput,
@@ -460,22 +491,38 @@ pub fn build_next_request(
     if evaluate_request_shape(prev_req).is_err() {
         return None;
     }
-    let (sampled_token, pos_advance) = match prev_resp {
-        ForwardOutput::Token(token) => (*token, 1u32),
+    let (sampled_token, pos_advance, spec_token_ids, spec_position_ids) = match prev_resp {
+        ForwardOutput::Token(token) => (*token, 1u32, Vec::new(), Vec::new()),
         ForwardOutput::Tokens(tokens) => {
             let token = *tokens.last()?;
             let advance = u32::try_from(tokens.len()).ok()?;
-            (token, advance)
+            (token, advance, Vec::new(), Vec::new())
         }
         ForwardOutput::Response(resp) => {
             let token = *resp.tokens.last()?;
             let advance = u32::try_from(resp.tokens.len()).ok()?;
-            (token, advance)
+            let (spec_tokens, spec_positions) = if resp.spec_indptr.len() >= 2 {
+                let lo = resp.spec_indptr[0] as usize;
+                let hi = resp.spec_indptr[1] as usize;
+                (
+                    resp.spec_tokens.get(lo..hi).unwrap_or(&[]).to_vec(),
+                    resp.spec_positions.get(lo..hi).unwrap_or(&[]).to_vec(),
+                )
+            } else {
+                (resp.spec_tokens.clone(), resp.spec_positions.clone())
+            };
+            (token, advance, spec_tokens, spec_positions)
         }
     };
     let last_pos = *prev_req.position_ids.last()?;
     let next_pos = last_pos.checked_add(pos_advance)?;
     let context_id = *prev_req.context_ids.first()?;
+    let output_spec_flags = if prev_req.output_spec_flags.is_empty() {
+        vec![false]
+    } else {
+        prev_req.output_spec_flags.clone()
+    };
+    let rs_slot_flags = vec![0; prev_req.rs_slot_ids.len()];
     let next_req = pie_bridge::ForwardRequest {
         token_ids: vec![sampled_token],
         position_ids: vec![next_pos],
@@ -483,8 +530,8 @@ pub fn build_next_request(
         kv_page_indptr: vec![0],
         kv_last_page_lens: Vec::new(),
         qo_indptr: vec![0, 1],
-        rs_slot_ids: Vec::new(),
-        rs_slot_flags: Vec::new(),
+        rs_slot_ids: prev_req.rs_slot_ids.clone(),
+        rs_slot_flags,
         masks: Vec::new(),
         mask_indptr: vec![0, 0],
         logit_masks: Vec::new(),
@@ -494,10 +541,10 @@ pub fn build_next_request(
         samplers: prev_req.samplers.clone(),
         sampler_indptr: vec![0, 1],
         adapter_bindings: prev_req.adapter_bindings.clone(),
-        spec_token_ids: Vec::new(),
-        spec_position_ids: Vec::new(),
-        spec_indptr: vec![0, 0],
-        output_spec_flags: vec![false],
+        spec_indptr: vec![0, spec_token_ids.len() as u32],
+        spec_token_ids,
+        spec_position_ids,
+        output_spec_flags,
         context_ids: vec![context_id],
         single_token_mode: true,
         has_user_mask: false,
@@ -588,6 +635,16 @@ mod tests {
     }
 
     #[test]
+    fn rule_accepts_system_spec_request() {
+        let mut req = req_with(vec![10], vec![0], vec![argmax()]);
+        req.output_spec_flags = vec![true];
+        req.spec_token_ids = vec![11, 12];
+        req.spec_position_ids = vec![11, 12];
+        req.spec_indptr = vec![0, 2];
+        assert_eq!(evaluate_request_shape(&req), Ok(()));
+    }
+
+    #[test]
     fn rule_rejects_multi_slot() {
         let req = req_with(vec![10, 11], vec![0, 1], vec![argmax(), argmax()]);
         assert_eq!(
@@ -607,6 +664,35 @@ mod tests {
         assert_eq!(next.position_ids, vec![11]);
         assert!(next.masks.is_empty());
         assert_eq!(next.mask_indptr, vec![0, 0]);
+    }
+
+    #[test]
+    fn build_next_request_carries_system_spec_drafts() {
+        let mut req = req_with(vec![10], vec![0], vec![argmax()]);
+        req.output_spec_flags = vec![true];
+        req.rs_slot_ids = vec![7];
+        req.rs_slot_flags = vec![1];
+        let resp = ForwardOutput::from_response(pie_bridge::ForwardResponse {
+            num_requests: 1,
+            tokens: vec![42, 43, 44],
+            tokens_indptr: vec![0, 3],
+            spec_tokens: vec![45, 46],
+            spec_positions: vec![14, 15],
+            spec_indptr: vec![0, 2],
+            ..Default::default()
+        });
+        let (next, anchor_token, anchor_pos) =
+            build_next_request(&req, &resp).expect("eligible");
+        assert_eq!(anchor_token, 44);
+        assert_eq!(anchor_pos, 13);
+        assert_eq!(next.token_ids, vec![44]);
+        assert_eq!(next.position_ids, vec![13]);
+        assert_eq!(next.spec_token_ids, vec![45, 46]);
+        assert_eq!(next.spec_position_ids, vec![14, 15]);
+        assert_eq!(next.spec_indptr, vec![0, 2]);
+        assert_eq!(next.output_spec_flags, vec![true]);
+        assert_eq!(next.rs_slot_ids, vec![7]);
+        assert_eq!(next.rs_slot_flags, vec![0]);
     }
 
     #[test]

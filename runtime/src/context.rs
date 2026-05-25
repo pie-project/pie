@@ -278,6 +278,7 @@ pub fn spawn(
     num_cpu_pages: Vec<usize>,
     max_forward_requests: usize,
     num_rs_slots: Vec<usize>,
+    rs_cache_spec_rollback: Vec<bool>,
     default_endowment_pages: usize,
     default_token_limit: Option<usize>,
     admission_oversubscription_factor: f64,
@@ -295,6 +296,7 @@ pub fn spawn(
                 &num_cpu_pages,
                 max_forward_requests,
                 &num_rs_slots,
+                &rs_cache_spec_rollback,
                 default_endowment_pages,
                 default_token_limit,
                 admission_oversubscription_factor,
@@ -756,8 +758,60 @@ pub fn append_working_page_tokens(
             masks,
             adapter,
             adapter_seed,
+            driver_repaired_spec_tail: 0,
+            response: None,
         },
     );
+}
+
+pub async fn append_working_page_tokens_wait(
+    model_idx: usize,
+    id: ContextId,
+    tokens: Vec<u32>,
+    positions: Vec<u32>,
+    masks: Vec<Brle>,
+    adapter: Option<AdapterId>,
+    adapter_seed: Option<i64>,
+) -> Result<()> {
+    append_working_page_tokens_wait_with_repaired_spec_tail(
+        model_idx,
+        id,
+        tokens,
+        positions,
+        masks,
+        adapter,
+        adapter_seed,
+        0,
+    )
+    .await
+}
+
+pub async fn append_working_page_tokens_wait_with_repaired_spec_tail(
+    model_idx: usize,
+    id: ContextId,
+    tokens: Vec<u32>,
+    positions: Vec<u32>,
+    masks: Vec<Brle>,
+    adapter: Option<AdapterId>,
+    adapter_seed: Option<i64>,
+    driver_repaired_spec_tail: u32,
+) -> Result<()> {
+    let (tx, rx) = oneshot::channel();
+    SERVICES.send(
+        model_idx,
+        Message::AppendWorkingPageTokens {
+            id,
+            tokens,
+            positions,
+            masks,
+            adapter,
+            adapter_seed,
+            driver_repaired_spec_tail,
+            response: Some(tx),
+        },
+    )?;
+    rx.await
+        .context("context::append_working_page_tokens_wait: actor dropped response")?
 }
 
 // =============================================================================
@@ -942,6 +996,10 @@ pub(crate) struct Context {
     // Token-level data (previously in ContextTokens / BUFFERS DashMap)
     /// Tokens that have been forwarded but not yet committed to a page.
     pub working_page_tokens: Vec<TokenInfo>,
+    /// Count of tail tokens appended from a system-spec draft request whose
+    /// rs_cache rollback was already handled by the driver. A subsequent
+    /// truncation within this tail must not trigger full rs replay.
+    pub driver_repaired_spec_tail: u32,
     /// Monotonic id for preserving forward-pass boundaries in rs_cache replay.
     pub next_forward_id: u64,
 
@@ -985,6 +1043,7 @@ impl Context {
             lineage: Vec::new(),
             rs_state: RsState::Unsupported,
             working_page_tokens: Vec::new(),
+            driver_repaired_spec_tail: 0,
             next_forward_id: 0,
             max_committed_position: None,
             state: State::Active,
@@ -1114,6 +1173,9 @@ pub(crate) struct ContextManager {
     /// Per-driver recurrent-state slot pools. Empty stores mean this
     /// driver/model does not require rs_cache.
     pub(crate) rs_stores: Vec<RsStore>,
+    /// Per-driver flag: CUDA can repair rs_cache state locally for the
+    /// speculative tail of system-spec decoding, avoiding full replay.
+    pub(crate) rs_cache_spec_rollback: Vec<bool>,
     /// Tokens per KV-cache page. Used to convert token budgets to credit endowments.
     pub(crate) page_size: usize,
     /// Index of the model this manager serves. Used for routing messages.
@@ -1174,6 +1236,7 @@ impl ContextManager {
         num_cpu_pages: &[usize],
         max_forward_requests: usize,
         num_rs_slots: &[usize],
+        rs_cache_spec_rollback: &[bool],
         default_endowment_pages: usize,
         default_token_limit: Option<usize>,
         admission_oversubscription_factor: f64,
@@ -1192,6 +1255,7 @@ impl ContextManager {
             gpu_stores,
             cpu_stores,
             rs_stores,
+            rs_cache_spec_rollback: rs_cache_spec_rollback.to_vec(),
             page_size,
             model_idx,
             snapshots: HashMap::new(),
@@ -1599,6 +1663,7 @@ impl ContextManager {
         let len = ctx.working_page_tokens.len();
         ctx.working_page_tokens
             .truncate(len.saturating_sub(tokens_to_remove));
+        ctx.driver_repaired_spec_tail = 0;
 
         if !ctx.is_off_gpu() {
             self.gpu_stores[driver_idx].free(&to_free);
@@ -1705,6 +1770,7 @@ impl ContextManager {
             ctx.working_pages.drain(..num_pages);
         }
         ctx.working_page_tokens.drain(..total_tokens);
+        ctx.driver_repaired_spec_tail = 0;
         ctx.committed_hashes.extend_from_slice(&hashes);
         ctx.max_committed_position = positions
             .iter()
@@ -2036,15 +2102,100 @@ impl ContextManager {
     }
 
     pub(crate) fn truncate_working_page_tokens(&mut self, id: ContextId, count: u32) -> Result<()> {
-        let ctx = self
-            .contexts
-            .get_mut(&id)
-            .ok_or_else(|| anyhow::anyhow!("Context not found"))?;
-        let max = ctx.working_page_tokens.len();
-        if count as usize > max {
-            anyhow::bail!("truncate count {} out of range 0..={}", count, max);
+        let (driver_idx, repair) = {
+            let ctx = self
+                .contexts
+                .get_mut(&id)
+                .ok_or_else(|| anyhow::anyhow!("Context not found"))?;
+            let max = ctx.working_page_tokens.len();
+            if count as usize > max {
+                anyhow::bail!("truncate count {} out of range 0..={}", count, max);
+            }
+            if count as usize == max {
+                return Ok(());
+            }
+            let driver_idx = ctx.driver.unwrap_or(0) as usize;
+            let removed = max - count as usize;
+            let driver_repaired = ctx.driver_repaired_spec_tail > 0
+                && removed <= ctx.driver_repaired_spec_tail as usize
+                && count as usize + removed == max
+                && self
+                    .rs_cache_spec_rollback
+                    .get(driver_idx)
+                    .copied()
+                    .unwrap_or(false);
+            ctx.working_page_tokens.truncate(count as usize);
+            if driver_repaired {
+                ctx.driver_repaired_spec_tail =
+                    ctx.driver_repaired_spec_tail.saturating_sub(removed as u32);
+            } else {
+                ctx.driver_repaired_spec_tail = 0;
+            }
+
+            let token_len_after =
+                ctx.committed_len() * self.page_size + ctx.working_page_tokens.len();
+            let uses_rs_cache = self
+                .rs_stores
+                .get(driver_idx)
+                .map(|s| s.total_slots() > 0)
+                .unwrap_or(false);
+            let repair = if uses_rs_cache {
+                match ctx.rs_state {
+                    RsState::Resident(slot) if token_len_after == 0 => {
+                        ctx.rs_state = RsState::Empty;
+                        Some((slot, 0usize, true))
+                    }
+                    RsState::Resident(_) if driver_repaired => None,
+                    RsState::Resident(slot) => {
+                        let committed_len = ctx.committed_len();
+                        Some((slot, committed_len, false))
+                    }
+                    _ => None,
+                }
+            } else {
+                None
+            };
+            (driver_idx, repair)
+        };
+
+        let Some((slot, committed_len, became_empty)) = repair else {
+            return Ok(());
+        };
+
+        if became_empty {
+            if let Some(store) = self.rs_stores.get_mut(driver_idx) {
+                store.free(slot);
+            }
+            return Ok(());
         }
-        ctx.working_page_tokens.truncate(count as usize);
+
+        let scratch_prefix_pages = if committed_len > 0 {
+            self.gpu_stores[driver_idx]
+                .alloc(committed_len)
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "truncate: not enough GPU pages to replay rs_cache after draft rejection"
+                    )
+                })?
+        } else {
+            Vec::new()
+        };
+
+        let spawned = self.spawn_full_rs_replay_pass(
+            id,
+            driver_idx,
+            slot,
+            committed_len,
+            scratch_prefix_pages,
+            Vec::new(),
+        )?;
+
+        if spawned {
+            if let Some(ctx) = self.contexts.get_mut(&id) {
+                ctx.state = State::Pinned;
+                ctx.pending_replay = true;
+            }
+        }
         Ok(())
     }
 
@@ -2056,6 +2207,7 @@ impl ContextManager {
         masks: Vec<Brle>,
         adapter: Option<AdapterId>,
         adapter_seed: Option<i64>,
+        driver_repaired_spec_tail: u32,
     ) -> Result<()> {
         let n = tokens.len();
         if positions.len() != n {
@@ -2068,9 +2220,21 @@ impl ContextManager {
             .contexts
             .get_mut(&id)
             .ok_or_else(|| anyhow::anyhow!("Context not found"))?;
+        let driver_idx = ctx.driver.unwrap_or(0) as usize;
+        let repaired_tail = if self
+            .rs_cache_spec_rollback
+            .get(driver_idx)
+            .copied()
+            .unwrap_or(false)
+        {
+            driver_repaired_spec_tail.min(n as u32)
+        } else {
+            0
+        };
         let owner = ctx.owner;
         let forward_id = ctx.next_forward_id;
         ctx.next_forward_id = ctx.next_forward_id.wrapping_add(1);
+        ctx.driver_repaired_spec_tail = repaired_tail;
         for (i, token) in tokens.into_iter().enumerate() {
             ctx.working_page_tokens.push(TokenInfo {
                 token,
@@ -2189,6 +2353,8 @@ pub(crate) enum Message {
         masks: Vec<Brle>,
         adapter: Option<AdapterId>,
         adapter_seed: Option<i64>,
+        driver_repaired_spec_tail: u32,
+        response: Option<oneshot::Sender<Result<()>>>,
     },
 
     DebugState {
@@ -2289,9 +2455,11 @@ impl ServiceHandler for ContextManager {
                 response,
             } => {
                 let t0 = Instant::now();
-                let _ = response.send(self.commit_working_pages(id, num_pages));
-                self.sched_counters.commit_us += t0.elapsed().as_micros() as u64;
-                self.sched_counters.commit_count += 1;
+                self.when_active(id, move |mgr| {
+                    let _ = response.send(mgr.commit_working_pages(id, num_pages));
+                    mgr.sched_counters.commit_us += t0.elapsed().as_micros() as u64;
+                    mgr.sched_counters.commit_count += 1;
+                });
             }
             Message::ReserveWorkingPages {
                 id,
@@ -2384,17 +2552,24 @@ impl ServiceHandler for ContextManager {
                 masks,
                 adapter,
                 adapter_seed,
+                driver_repaired_spec_tail,
+                response,
             } => {
                 let t0 = Instant::now();
-                if let Err(e) = self.append_working_page_tokens(
+                let result = self.append_working_page_tokens(
                     id,
                     tokens,
                     positions,
                     masks,
                     adapter,
                     adapter_seed,
-                ) {
+                    driver_repaired_spec_tail,
+                );
+                if let Err(e) = &result {
                     tracing::warn!("append_working_page_tokens for ctx {id}: {e:#}");
+                }
+                if let Some(response) = response {
+                    let _ = response.send(result);
                 }
                 self.publish_working_token_count(id);
                 self.sched_counters.append_us += t0.elapsed().as_micros() as u64;

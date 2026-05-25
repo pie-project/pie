@@ -27,6 +27,11 @@ export class Model {
   tokenizer(): Tokenizer {
     return new Tokenizer(this._handle.tokenizer());
   }
+
+  /** Whether greedy generation should use the system drafter by default. */
+  defaultSystemSpeculation(): boolean {
+    return this._handle.defaultSystemSpeculation();
+  }
 }
 
 /**

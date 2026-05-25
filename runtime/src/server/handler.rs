@@ -122,6 +122,14 @@ impl Session {
                         format!("{}.avg_stats_update_us", model_name),
                         serde_json::Value::from(inf.avg_stats_update_us),
                     );
+                    stats.insert(
+                        format!("{}.system_spec_draft_tokens_proposed", model_name),
+                        serde_json::Value::from(inf.system_spec_draft_tokens_proposed),
+                    );
+                    stats.insert(
+                        format!("{}.system_spec_draft_tokens_accepted", model_name),
+                        serde_json::Value::from(inf.system_spec_draft_tokens_accepted),
+                    );
                     // Speculation hit counters — observability for
                     // `try_hit`/chain submissions/drops.
                     stats.insert(

@@ -328,6 +328,8 @@ class ResponseBuilder:
         logprobs=None,
         logits=None,
         dists=None,
+        spec_tokens=None,
+        spec_positions=None,
     ) -> None:
         """Append one request's outputs."""
         self._requests.append({
@@ -337,6 +339,10 @@ class ResponseBuilder:
             "logits": [bytes(blob) if not isinstance(blob, bytes) else blob
                        for blob in (logits or [])],
             "dists": [(list(ids), list(probs)) for ids, probs in (dists or [])],
+            "spec_tokens": list(spec_tokens) if spec_tokens is not None else [],
+            "spec_positions": (
+                list(spec_positions) if spec_positions is not None else []
+            ),
         })
 
     # ----- High-level API (preserves the legacy build() signature) -----
@@ -499,6 +505,8 @@ class ResponseBuilder:
                 logprobs=logprobs,
                 logits=logits,
                 dists=dists,
+                spec_tokens=getattr(resp, "spec_tokens", None),
+                spec_positions=getattr(resp, "spec_positions", None),
             )
 
     # ----- Low-level API: flatten + serialize -----
@@ -563,6 +571,14 @@ class ResponseBuilder:
                 dists_kv_indptr.append(len(dists_ids))
             dists_req_indptr.append(len(dists_kv_indptr) - 1)
 
+        spec_indptr: list[int] = [0]
+        spec_tokens: list[int] = []
+        spec_positions: list[int] = []
+        for req in self._requests:
+            spec_tokens.extend(int(t) for t in req["spec_tokens"])
+            spec_positions.extend(int(p) for p in req["spec_positions"])
+            spec_indptr.append(len(spec_tokens))
+
         t0 = time.perf_counter() if profile is not None else 0.0
         result = _pb.build_forward_response(
             driver_id=driver_id,
@@ -581,6 +597,9 @@ class ResponseBuilder:
             logprobs_values=np.asarray(logprobs_values, dtype=np.float32),
             entropies_indptr=np.asarray(entropies_indptr, dtype=np.uint32),
             entropies=np.asarray(entropies, dtype=np.float32),
+            spec_indptr=np.asarray(spec_indptr, dtype=np.uint32),
+            spec_tokens=np.asarray(spec_tokens, dtype=np.uint32),
+            spec_positions=np.asarray(spec_positions, dtype=np.uint32),
         )
         if profile is not None:
             profile["serialize"] = time.perf_counter() - t0

@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import argparse
+import json
 import time
+from typing import Any
 
 from common import (
     RequestResult,
@@ -14,6 +16,87 @@ from common import (
     summarize,
     visible_cuda_devices,
 )
+
+
+def _vllm_metric_value(llm: Any, name: str) -> int:
+    try:
+        metrics = llm.get_metrics()
+    except Exception:
+        return 0
+    total = 0
+    for metric in metrics:
+        if getattr(metric, "name", None) != name:
+            continue
+        value = getattr(metric, "value", None)
+        if value is not None:
+            total += int(value)
+    return total
+
+
+def _vllm_metric_vector(llm: Any, name: str) -> list[int]:
+    try:
+        metrics = llm.get_metrics()
+    except Exception:
+        return []
+    values: list[int] = []
+    for metric in metrics:
+        if getattr(metric, "name", None) != name:
+            continue
+        metric_values = getattr(metric, "values", None)
+        if metric_values is None:
+            continue
+        if not values:
+            values = [0] * len(metric_values)
+        for i, value in enumerate(metric_values):
+            values[i] += int(value)
+    return values
+
+
+def _vllm_spec_metrics(llm: Any) -> dict[str, Any]:
+    return {
+        "drafts": _vllm_metric_value(llm, "vllm:spec_decode_num_drafts"),
+        "draft_tokens": _vllm_metric_value(
+            llm, "vllm:spec_decode_num_draft_tokens"
+        ),
+        "accepted_tokens": _vllm_metric_value(
+            llm, "vllm:spec_decode_num_accepted_tokens"
+        ),
+        "accepted_per_position": _vllm_metric_vector(
+            llm, "vllm:spec_decode_num_accepted_tokens_per_pos"
+        ),
+    }
+
+
+def _vllm_spec_delta(after: dict[str, Any], before: dict[str, Any]) -> dict[str, Any]:
+    pos_after = after.get("accepted_per_position") or []
+    pos_before = before.get("accepted_per_position") or []
+    pos_len = max(len(pos_after), len(pos_before))
+    accepted_per_position = [
+        (pos_after[i] if i < len(pos_after) else 0)
+        - (pos_before[i] if i < len(pos_before) else 0)
+        for i in range(pos_len)
+    ]
+    drafts = int(after.get("drafts", 0)) - int(before.get("drafts", 0))
+    draft_tokens = int(after.get("draft_tokens", 0)) - int(
+        before.get("draft_tokens", 0)
+    )
+    accepted_tokens = int(after.get("accepted_tokens", 0)) - int(
+        before.get("accepted_tokens", 0)
+    )
+    out: dict[str, Any] = {
+        "vllm spec drafts": drafts,
+        "vllm spec draft tokens": draft_tokens,
+        "vllm spec accepted tokens": accepted_tokens,
+    }
+    if accepted_per_position:
+        out["vllm spec accepted per position"] = accepted_per_position
+    if draft_tokens > 0:
+        out["vllm spec acceptance rate"] = accepted_tokens / draft_tokens
+    if drafts > 0:
+        out["vllm spec mean acceptance length"] = 1.0 + (
+            accepted_tokens / drafts
+        )
+    return out
 
 
 def run(args: argparse.Namespace):
@@ -36,6 +119,24 @@ def run(args: argparse.Namespace):
         llm_kwargs["attention_config"] = {"backend": args.attention_backend}
     if args.enforce_eager:
         llm_kwargs["enforce_eager"] = True
+    speculative_config = None
+    if args.speculative_config is not None:
+        speculative_config = json.loads(args.speculative_config)
+    if args.spec_method is not None or args.spec_tokens is not None:
+        speculative_config = dict(speculative_config or {})
+        if args.spec_method is not None:
+            if "method" in speculative_config:
+                raise ValueError("--spec-method conflicts with speculative_config.method")
+            speculative_config["method"] = args.spec_method
+        if args.spec_tokens is not None:
+            if "num_speculative_tokens" in speculative_config:
+                raise ValueError(
+                    "--spec-tokens conflicts with speculative_config.num_speculative_tokens"
+                )
+            speculative_config["num_speculative_tokens"] = args.spec_tokens
+    summary_speculative_config = dict(speculative_config) if speculative_config else None
+    if speculative_config is not None:
+        llm_kwargs["speculative_config"] = dict(speculative_config)
 
     llm = LLM(
         model=args.model,
@@ -45,6 +146,7 @@ def run(args: argparse.Namespace):
         tensor_parallel_size=args.tp_size,
         max_model_len=args.max_model_len,
         enable_prefix_caching=False,
+        disable_log_stats=False,
         **llm_kwargs,
     )
     sampling = SamplingParams(
@@ -64,6 +166,7 @@ def run(args: argparse.Namespace):
             )
         llm.generate(prompts[: args.warmup], warmup_sampling)
 
+    spec_metrics_before = _vllm_spec_metrics(llm)
     run_prompts = prompts[args.warmup:]
     run_prompt_counts = prompt_counts[args.warmup:]
     results: list[RequestResult] = []
@@ -86,6 +189,7 @@ def run(args: argparse.Namespace):
                 RequestResult(True, 0.0, len(out.outputs[0].token_ids), prompt_count)
             )
     wall = time.perf_counter() - start
+    spec_metrics_after = _vllm_spec_metrics(llm)
 
     summary = summarize(
         mode=args.mode,
@@ -99,12 +203,14 @@ def run(args: argparse.Namespace):
             "max_num_batched_tokens": args.max_num_batched_tokens,
             "attention_backend": args.attention_backend,
             "enforce_eager": args.enforce_eager,
+            "speculative_config": summary_speculative_config,
             "temperature": args.temperature,
             "top_p": args.top_p,
             "ignore_eos": args.ignore_eos,
             "unique_prompts": args.unique_prompts,
             "cpu affinity": cpu_affinity,
             "warmup max tokens": args.warmup_max_tokens,
+            **_vllm_spec_delta(spec_metrics_after, spec_metrics_before),
         },
     )
     return summary, results
@@ -117,6 +223,13 @@ def main() -> None:
         sp.add_argument("--attention-backend", default=None)
         sp.add_argument("--enforce-eager", action="store_true")
         sp.add_argument("--max-num-batched-tokens", type=int, default=None)
+        sp.add_argument(
+            "--speculative-config",
+            default=None,
+            help="JSON object passed through to vLLM's speculative_config.",
+        )
+        sp.add_argument("--spec-method", default=None)
+        sp.add_argument("--spec-tokens", type=int, default=None)
     args = parser.parse_args()
     summary, results = run(args)
     finish(summary, results, args.json_out)

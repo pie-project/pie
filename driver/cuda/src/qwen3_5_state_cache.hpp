@@ -44,6 +44,7 @@ public:
         int v_heads,
         int head_k_dim,
         int head_v_dim,
+        int hidden_size = 0,
         int max_slots = 1);
 
     // Zero the state of every slot of every linear-attention layer.
@@ -60,10 +61,19 @@ public:
     // Used by runtime-managed fork/snapshot paths.
     void copy_slot_d2d(int src_slot, int dst_slot, cudaStream_t stream = 0);
 
+    // Copy only the linear-attention state slabs. MTP pending-hidden is
+    // intentionally left alone; speculative verifier rollback can restore
+    // recurrent/conv state after the accepted prefix while preserving the MTP
+    // state that was rebuilt from the accepted tokens.
+    void copy_linear_state_slot_d2d(
+        int src_slot, int dst_slot, cudaStream_t stream = 0);
+
     // Per-(layer, slot) accessors. `slot` defaults to 0 to keep the
     // legacy single-request callsites compiling unchanged.
     void*  conv_state(int layer, int slot = 0);
     float* recurrent_state(int layer, int slot = 0);
+    void*  recurrent_state_raw(int layer, int slot = 0);
+    void*  mtp_pending_hidden(int slot = 0);
 
     // Strides in bytes / fp32 elements between consecutive slots.
     std::size_t conv_slot_stride_bytes() const noexcept {
@@ -74,7 +84,8 @@ public:
         return static_cast<std::size_t>(v_heads_) * head_k_dim_ * head_v_dim_;
     }
     std::size_t recurrent_slot_stride_bytes() const noexcept {
-        return recurrent_slot_stride_floats() * sizeof(float);
+        return recurrent_slot_stride_floats() *
+               (recurrent_state_bf16_ ? sizeof(std::uint16_t) : sizeof(float));
     }
 
     int num_layers() const noexcept { return static_cast<int>(layer_is_linear_.size()); }
@@ -86,20 +97,54 @@ public:
     int v_heads()     const noexcept { return v_heads_; }
     int head_k_dim()  const noexcept { return head_k_dim_; }
     int head_v_dim()  const noexcept { return head_v_dim_; }
+    int hidden_size() const noexcept { return hidden_size_; }
+    bool recurrent_state_bf16() const noexcept {
+        return recurrent_state_bf16_;
+    }
+
+    // Speculative verifier prefix snapshots. When enabled, small prefill
+    // linear-attention kernels write state after prefix length p into
+    // slot `spec_snapshot_base_slot() + p - 1`.
+    void set_spec_snapshot_slots(int base_slot, int count) noexcept {
+        spec_snapshot_base_slot_ = base_slot;
+        spec_snapshot_count_ = count;
+    }
+    void clear_spec_snapshot_slots() noexcept {
+        spec_snapshot_base_slot_ = -1;
+        spec_snapshot_count_ = 0;
+    }
+    int spec_snapshot_base_slot() const noexcept {
+        return spec_snapshot_base_slot_;
+    }
+    int spec_snapshot_count() const noexcept {
+        return spec_snapshot_count_;
+    }
 
     Qwen3_5StateCache() = default;
 
 private:
     std::vector<bool> layer_is_linear_;
-    // Per-layer flat buffer holding `max_slots_` consecutive slabs.
-    std::vector<DeviceBuffer<std::uint16_t>> conv_states_;
-    std::vector<DeviceBuffer<float>>         recurrent_states_;
+    // Mapping from transformer layer index to compact linear-attention layer
+    // index. Full-attention layers carry -1.
+    std::vector<int> linear_layer_index_;
+    int num_linear_layers_ = 0;
+    // Flat buffers laid out as [linear_layer, slot, state]. This preserves the
+    // existing per-layer slot stride seen by kernels while allowing slot-wide
+    // reset/copy across all linear layers via pitched 2D CUDA operations.
+    DeviceBuffer<std::uint16_t> conv_states_;
+    DeviceBuffer<float>         recurrent_states_;
+    DeviceBuffer<std::uint16_t> recurrent_states_bf16_;
+    DeviceBuffer<std::uint16_t>              mtp_pending_hidden_;
     int max_slots_   = 1;
     int conv_dim_    = 0;
     int conv_kernel_ = 0;
     int v_heads_     = 0;
     int head_k_dim_  = 0;
     int head_v_dim_  = 0;
+    int hidden_size_  = 0;
+    bool recurrent_state_bf16_ = false;
+    int spec_snapshot_base_slot_ = -1;
+    int spec_snapshot_count_ = 0;
 };
 
 }  // namespace pie_cuda_driver

@@ -94,7 +94,17 @@ impl<'ctx> Generator<'ctx> {
         let pass = ForwardPass::new(&ctx.model);
         pass.context(&ctx.inner);
 
+        let default_system_speculation =
+            sampler.is_argmax() && ctx.model.default_system_speculation();
         let wit_sampler = sampler.into();
+        let speculation = if default_system_speculation {
+            SpecMode::System {
+                spec_tokens: Vec::new(),
+                spec_positions: Vec::new(),
+            }
+        } else {
+            SpecMode::None
+        };
 
         Self {
             ctx,
@@ -105,7 +115,7 @@ impl<'ctx> Generator<'ctx> {
             horizon: None,
             constraints: Vec::new(),
             constraint_pending: Vec::new(),
-            speculation: SpecMode::None,
+            speculation,
             adapter: None,
             zo_seed: None,
             step_probes: Vec::new(),
@@ -161,12 +171,23 @@ impl<'ctx> Generator<'ctx> {
 
     /// Enable host-driven speculation: the runtime returns next-iter draft
     /// tokens via the forward-pass output and the Generator stages them
-    /// for the next step.
+    /// for the next step. Greedy generators enable this by default on
+    /// models that advertise a default system drafter.
     pub fn system_speculation(mut self) -> Self {
         self.speculation = SpecMode::System {
             spec_tokens: Vec::new(),
             spec_positions: Vec::new(),
         };
+        self
+    }
+
+    /// Disable host-driven system speculation. This opts out of the
+    /// default greedy-system drafter while leaving custom speculators
+    /// untouched.
+    pub fn disable_system_speculation(mut self) -> Self {
+        if matches!(self.speculation, SpecMode::System { .. }) {
+            self.speculation = SpecMode::None;
+        }
         self
     }
 
@@ -567,12 +588,19 @@ impl<'g, 'ctx> GenStep<'g, 'ctx> {
                 pass.input_speculative_tokens(&drafts, &draft_positions);
             }
         }
-        if matches!(parent.speculation, SpecMode::System { .. }) {
+        let max_tokens_remaining = parent
+            .max_tokens
+            .map(|max| max.saturating_sub(parent.tokens_generated));
+        if matches!(parent.speculation, SpecMode::System { .. })
+            && max_tokens_remaining.map_or(true, |remaining| remaining > 1)
+        {
             pass.output_speculative_tokens(true);
         }
-        if parent.max_tokens.map_or(false, |max| {
-            max.saturating_sub(parent.tokens_generated) <= 1
-        }) {
+        if max_tokens_remaining
+            .map_or(false, |remaining| {
+                remaining <= (n_drafted as usize).saturating_add(1)
+            })
+        {
             pass.pass_speculation(false);
         }
         // Sampler attach. Custom-with-drafts attaches (1 + n_drafted)

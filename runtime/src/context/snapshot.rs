@@ -175,6 +175,7 @@ impl ContextManager {
                         lineage,
                         rs_state: child_rs_state,
                         working_page_tokens: forked_tokens,
+                        driver_repaired_spec_tail: 0,
                         next_forward_id,
                         state: State::Active, // may become Pinned below
                         pending_suspend: false,
@@ -327,6 +328,7 @@ impl ContextManager {
                 lineage,
                 rs_state: snapshot_rs_state,
                 working_page_tokens: snapshot_filled,
+                driver_repaired_spec_tail: 0,
                 next_forward_id,
                 max_committed_position: max_pos,
                 state: snapshot_state,
@@ -582,6 +584,7 @@ impl ContextManager {
                 lineage: snap.lineage,
                 rs_state: new_rs_state,
                 working_page_tokens: snap.working_page_tokens,
+                driver_repaired_spec_tail: 0,
                 next_forward_id: snap.next_forward_id,
                 max_committed_position: snap.max_committed_position,
                 state: State::Active,

@@ -177,6 +177,10 @@ struct HfConfig {
     // dimensions are rotated. Defaults to 1.0 (full rotation).
     float partial_rotary_factor;
 
+    // Qwen3.5 / Qwen3.6 MTP (multi-token prediction) auxiliary head.
+    int  mtp_num_hidden_layers = 0;
+    bool mtp_use_dedicated_embeddings = false;
+
     // Gemma-3n (E2B / E4B "Nano") additions on top of Gemma-4.
     // Gemma-3n is a *different* architecture from Gemma-4 (despite the
     // overlapping E2B / E4B naming) — it adds three new building blocks:

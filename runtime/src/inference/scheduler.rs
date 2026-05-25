@@ -91,6 +91,8 @@ pub struct SchedulerStats {
     pub cumulative_response_dispatch_us: AtomicU64,
     pub cumulative_context_tick_submit_us: AtomicU64,
     pub cumulative_stats_update_us: AtomicU64,
+    pub system_spec_draft_tokens_proposed: AtomicU64,
+    pub system_spec_draft_tokens_accepted: AtomicU64,
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -99,6 +101,8 @@ struct BatchExecutionTiming {
     batch_build_us: u64,
     driver_fire_us: u64,
     response_dispatch_us: u64,
+    system_spec_draft_tokens_proposed: u64,
+    system_spec_draft_tokens_accepted: u64,
 }
 
 // =============================================================================
@@ -148,6 +152,7 @@ struct RequestCapacityUsage {
     user_custom_mask_bytes: usize,
     spec_custom_mask_bytes: usize,
     has_spec_drafts: bool,
+    has_rs_spec_drafts: bool,
     has_dense_logit_requirement: bool,
     has_prob_sampling: bool,
     is_single_token_decode: bool,
@@ -201,6 +206,7 @@ fn request_capacity_usage(req: &PendingRequest, page_size: u32) -> RequestCapaci
         user_custom_mask_bytes,
         spec_custom_mask_bytes,
         has_spec_drafts: spec_tokens > 0,
+        has_rs_spec_drafts: spec_tokens > 0 && !req.request.rs_slot_ids.is_empty(),
         has_dense_logit_requirement,
         has_prob_sampling,
         is_single_token_decode,
@@ -276,6 +282,7 @@ struct BatchAccumulator {
     total_user_custom_mask_bytes: usize,
     total_spec_custom_mask_bytes: usize,
     has_spec_drafts: bool,
+    has_rs_spec_drafts: bool,
     has_dense_logit_requirement: bool,
     has_prob_sampling: bool,
     all_single_token_decode: bool,
@@ -297,6 +304,7 @@ impl BatchAccumulator {
             total_user_custom_mask_bytes: 0,
             total_spec_custom_mask_bytes: 0,
             has_spec_drafts: false,
+            has_rs_spec_drafts: false,
             has_dense_logit_requirement: false,
             has_prob_sampling: false,
             all_single_token_decode: true,
@@ -369,6 +377,7 @@ impl BatchAccumulator {
             .total_spec_custom_mask_bytes
             .saturating_add(usage.spec_custom_mask_bytes);
         self.has_spec_drafts |= usage.has_spec_drafts;
+        self.has_rs_spec_drafts |= usage.has_rs_spec_drafts;
         self.has_dense_logit_requirement |= usage.has_dense_logit_requirement;
         self.has_prob_sampling |= usage.has_prob_sampling;
         self.all_single_token_decode &= usage.is_single_token_decode;
@@ -446,6 +455,9 @@ impl BatchAccumulator {
             return false;
         }
         let usage = request_capacity_usage(req, self.page_size);
+        if self.has_rs_spec_drafts || usage.has_rs_spec_drafts {
+            return true;
+        }
         let next_has_spec = self.has_spec_drafts || usage.has_spec_drafts;
         let next_custom_mask_bytes = if next_has_spec {
             self.total_spec_custom_mask_bytes
@@ -477,6 +489,7 @@ impl BatchAccumulator {
             self.total_user_custom_mask_bytes
         };
         self.requests.len() >= self.limits.max_forward_requests
+            || self.has_rs_spec_drafts
             || self.total_tokens >= self.limits.max_forward_tokens
             || self.total_pages >= self.limits.max_page_refs
             || self.total_logit_rows >= self.limits.max_logit_rows
@@ -512,6 +525,7 @@ impl BatchAccumulator {
         self.total_user_custom_mask_bytes = 0;
         self.total_spec_custom_mask_bytes = 0;
         self.has_spec_drafts = false;
+        self.has_rs_spec_drafts = false;
         self.has_dense_logit_requirement = false;
         self.has_prob_sampling = false;
         self.all_single_token_decode = true;
@@ -1105,6 +1119,12 @@ impl BatchScheduler {
                             .cumulative_context_tick_submit_us
                             .fetch_add(tick_submit_us, Relaxed);
                         stats_clone
+                            .system_spec_draft_tokens_proposed
+                            .fetch_add(timing.system_spec_draft_tokens_proposed, Relaxed);
+                        stats_clone
+                            .system_spec_draft_tokens_accepted
+                            .fetch_add(timing.system_spec_draft_tokens_accepted, Relaxed);
+                        stats_clone
                             .cumulative_stats_update_us
                             .fetch_add(stats_update_start.elapsed().as_micros() as u64, Relaxed);
                     });
@@ -1165,6 +1185,14 @@ impl BatchScheduler {
     ) -> BatchExecutionTiming {
         let batch_start = Instant::now();
         let build_start = Instant::now();
+        let system_spec_proposed_per_req: Vec<usize> = requests
+            .iter()
+            .map(|req| req.request.spec_token_ids.len())
+            .collect();
+        let system_spec_draft_tokens_proposed =
+            system_spec_proposed_per_req.iter().sum::<usize>() as u64;
+        let mut system_spec_draft_tokens_accepted = 0u64;
+
         // Build batched request — a single `pie_bridge::ForwardRequest`
         // populated by folding each per-request shape into the batch.
         let elide_decode_masks = requests.iter().all(|req| {
@@ -1225,12 +1253,22 @@ impl BatchScheduler {
                         && batch_resp.logits_bytes.is_empty()
                         && batch_resp.logprobs_values.is_empty()
                         && batch_resp.entropies.is_empty()
+                        && batch_resp.spec_tokens.is_empty()
                         && batch_resp.tokens_indptr.len() >= requests.len() + 1;
 
                     if token_payload_only {
                         for (r, req) in requests.into_iter().enumerate() {
                             let lo = batch_resp.tokens_indptr[r] as usize;
                             let hi = batch_resp.tokens_indptr[r + 1] as usize;
+                            if system_spec_proposed_per_req
+                                .get(r)
+                                .copied()
+                                .unwrap_or_default()
+                                > 0
+                            {
+                                system_spec_draft_tokens_accepted +=
+                                    hi.saturating_sub(lo).saturating_sub(1) as u64;
+                            }
                             let output = if hi == lo + 1 {
                                 ForwardOutput::Token(batch_resp.tokens[lo])
                             } else {
@@ -1245,6 +1283,15 @@ impl BatchScheduler {
                             // walks samplers + the single-request response
                             // to construct the WIT Output.
                             let per_req = request::extract_per_request(&batch_resp, r);
+                            if system_spec_proposed_per_req
+                                .get(r)
+                                .copied()
+                                .unwrap_or_default()
+                                > 0
+                            {
+                                system_spec_draft_tokens_accepted +=
+                                    per_req.tokens.len().saturating_sub(1) as u64;
+                            }
                             req.send_result(
                                 Ok(ForwardOutput::Response(per_req)),
                                 submit_tx.as_ref(),
@@ -1272,6 +1319,8 @@ impl BatchScheduler {
             batch_build_us,
             driver_fire_us,
             response_dispatch_us: response_start.elapsed().as_micros() as u64,
+            system_spec_draft_tokens_proposed,
+            system_spec_draft_tokens_accepted,
         }
     }
 }

@@ -126,6 +126,8 @@ def print_summary(s: BenchSummary) -> None:
         "cumulative batch latency us",
         "avg batch latency us",
         "last batch latency us",
+        "system spec draft tokens proposed",
+        "system spec draft tokens accepted",
         "bypass hits",
         "chain submits",
         "chain drops",
@@ -146,6 +148,12 @@ def print_summary(s: BenchSummary) -> None:
         "runtime driver cumulative ms",
         "runtime wall minus driver ms",
         "runtime non-driver after launch ms",
+        "vllm spec drafts",
+        "vllm spec draft tokens",
+        "vllm spec accepted tokens",
+        "vllm spec accepted per position",
+        "vllm spec acceptance rate",
+        "vllm spec mean acceptance length",
     )
     if any(k in s.config for k in spec_keys):
         for k in spec_keys:

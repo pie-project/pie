@@ -71,6 +71,12 @@ void launch_chunked_swiglu_bf16(
     int N, int I,
     cudaStream_t stream);
 
+void launch_chunked_swiglu_strided_bf16(
+    const void* packed,  // [N, row_stride] bf16 (gate first, up second)
+    void*       y,       // [N, I] bf16
+    int N, int I, int row_stride,
+    cudaStream_t stream);
+
 // GELU-tanh variant of `chunked_swiglu_bf16` — same fused gate/up
 // split, but emits `gelu_tanh(gate) * up` instead of `silu(gate) * up`.
 // Used by Gemma-4 26B-A4B's routed-expert block (its dense MLP also
@@ -88,6 +94,49 @@ void launch_chunked_geglu_tanh_bf16(
 void launch_sigmoid_scalar_gate_inplace_bf16(
     void*       x,             // bf16 [N, H], in-place
     const void* scalar_gate,   // bf16 [N]
+    int N, int H,
+    cudaStream_t stream);
+
+void launch_sigmoid_scalar_gate_strided_inplace_bf16(
+    void*       x,             // bf16 [N, H], in-place
+    const void* scalar_gate,   // bf16 [N, stride]
+    int N, int H, int stride,
+    cudaStream_t stream);
+
+// Fused version of `x *= sigmoid(gate); out += x` for Qwen3.6-MoE's
+// shared expert. Saves one kernel launch and one bf16 read/write pass over
+// the shared expert output on decode/spec-verification shapes.
+void launch_sigmoid_scalar_gate_add_bf16(
+    void*       out,           // bf16 [N, H], in-place add destination
+    const void* x,             // bf16 [N, H]
+    const void* scalar_gate,   // bf16 [N]
+    int N, int H,
+    cudaStream_t stream);
+
+void launch_sigmoid_scalar_gate_strided_add_bf16(
+    void*       out,           // bf16 [N, H], in-place add destination
+    const void* x,             // bf16 [N, H]
+    const void* scalar_gate,   // bf16 [N, stride]
+    int N, int H, int stride,
+    cudaStream_t stream);
+
+// Fused Qwen3.6-MoE shared-expert scalar gate:
+//   gate[n] = dot(x[n, :], gate_w[:])
+//   y[n, h] *= sigmoid(gate[n])
+// This replaces the tiny [N, H] x [H, 1] cuBLAS GEMM plus the scalar gate
+// kernel on decode/spec-verification shapes.
+void launch_sigmoid_dot_scalar_gate_inplace_bf16(
+    const void* x,       // bf16 [N, H]
+    const void* gate_w,  // bf16 [H]
+    void*       y,       // bf16 [N, H], in-place
+    int N, int H,
+    cudaStream_t stream);
+
+void launch_sigmoid_dot_scalar_gate_add_bf16(
+    const void* x,       // bf16 [N, H]
+    const void* gate_w,  // bf16 [H]
+    void*       out,     // bf16 [N, H], in-place add destination
+    const void* y,       // bf16 [N, H]
     int N, int H,
     cudaStream_t stream);
 

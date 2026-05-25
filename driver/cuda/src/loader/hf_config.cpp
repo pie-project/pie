@@ -320,6 +320,9 @@ HfConfig parse_hf_config(const std::filesystem::path& path) {
             cfg.rope_theta = (*rp)["rope_theta"].get<float>();
         }
     }
+    cfg.mtp_num_hidden_layers = optional<int>(j, "mtp_num_hidden_layers", 0);
+    cfg.mtp_use_dedicated_embeddings =
+        optional<bool>(j, "mtp_use_dedicated_embeddings", false);
 
     // Gemma-3n knobs. Defaults match HF's GptOssConfig defaults so non-
     // gemma3n models leave them inert (laurel_rank=0 disables Laurel,

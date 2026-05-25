@@ -45,10 +45,13 @@ namespace pie_cuda_driver {
 // affect graph topology.
 struct ForwardGraphKey {
     int num_requests;
+    int num_tokens;
     std::uint32_t variant = 0;
 
     bool operator==(const ForwardGraphKey& o) const noexcept {
-        return num_requests == o.num_requests && variant == o.variant;
+        return num_requests == o.num_requests &&
+               num_tokens == o.num_tokens &&
+               variant == o.variant;
     }
 };
 
@@ -90,6 +93,7 @@ static_assert(forward_graph_request_bucket(129, 130) == 130);
 struct ForwardGraphKeyHash {
     std::size_t operator()(const ForwardGraphKey& k) const noexcept {
         return static_cast<std::size_t>(k.num_requests) ^
+               (static_cast<std::size_t>(k.num_tokens) << 12) ^
                (static_cast<std::size_t>(k.variant) << 24) ^
                (static_cast<std::size_t>(k.variant) >> 8);
     }

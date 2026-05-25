@@ -244,6 +244,12 @@ fn empty_forward_response_desc() -> PieForwardResponseDesc {
         entropies_indptr_len: 0,
         entropies_ptr: ptr::null(),
         entropies_len: 0,
+        spec_indptr_ptr: ptr::null(),
+        spec_indptr_len: 0,
+        spec_tokens_ptr: ptr::null(),
+        spec_tokens_len: 0,
+        spec_positions_ptr: ptr::null(),
+        spec_positions_len: 0,
     }
 }
 

@@ -73,6 +73,7 @@ struct ForwardFn {
     bool graph_safe = false;
     bool supports_tp_greedy_argmax = false;
     bool supports_compact_logits = false;
+    bool supports_small_prefill_graph = false;
 
     using BodyFn = std::function<void(
         model::Qwen3Workspace&,
@@ -98,6 +99,38 @@ struct ForwardFn {
         const std::int32_t*  /* logit_row_indices_d device, nullable */,
         int                  /* num_logit_rows */,
         bool                 /* tp_greedy_argmax */
+    )>;
+
+    using MtpFn = std::function<void(
+        model::Qwen3Workspace&,
+        KvCache&,
+        ops::CublasHandle&,
+        const std::int32_t*  /* token_ids device */,
+        const std::int32_t*  /* position_ids device */,
+        const std::int32_t*  /* base_hidden_row_indices device */,
+        const std::int32_t*  /* request_ids device */,
+        const std::uint32_t* /* kv_page_indices device */,
+        const std::uint32_t* /* kv_page_indptr device */,
+        const std::uint32_t* /* kv_last_page_lens device */,
+        int                  /* num_tokens */,
+        int                  /* draft_step */,
+        int                  /* max_global_tokens */
+    )>;
+
+    using MtpProcessFn = std::function<void(
+        model::Qwen3Workspace&,
+        KvCache&,
+        ops::CublasHandle&,
+        const std::int32_t*  /* token_ids device */,
+        const std::int32_t*  /* positions device */,
+        const std::uint32_t* /* qo_indptr device */,
+        const std::uint32_t* /* kv_page_indices device */,
+        const std::uint32_t* /* kv_page_indptr device */,
+        const std::uint32_t* /* kv_last_page_lens device */,
+        const std::int32_t*  /* slot_ids device, nullable */,
+        const std::int32_t*  /* source_row_indices device, nullable */,
+        int                  /* total_tokens */,
+        int                  /* num_requests */
     )>;
 
     struct PrepareInputs {
@@ -126,6 +159,8 @@ struct ForwardFn {
     GraphLayoutFn graph_layout;
     LogitsModeFn set_logits_argmax_only;
     BodyFn    body;
+    MtpFn     mtp;
+    MtpProcessFn mtp_process;
 
     // Convenience: `forward_fn = [...]` assigns the lambda as the body.
     // entry.cpp uses this terser pattern; the older `forward_fn.body =
@@ -183,6 +218,9 @@ struct Executor {
     // Runtime-managed rs_cache storage. Null on models without
     // recurrent-state slots.
     Qwen3_5StateCache* rs_cache = nullptr;
+    // Private rs_cache slot reserved for speculative rollback. This slot is
+    // not advertised to the runtime.
+    int rs_cache_scratch_slot = -1;
 
     // Response-view builder. Reused fire-to-fire — the builder owns the
     // concat scratch the `PieForwardResponseView` slices point into. The

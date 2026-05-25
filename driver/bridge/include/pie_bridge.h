@@ -292,6 +292,10 @@ typedef struct PieForwardResponseDesc {
 
     const uint32_t* entropies_indptr_ptr;     size_t entropies_indptr_len;
     const float*    entropies_ptr;            size_t entropies_len;
+
+    const uint32_t* spec_indptr_ptr;          size_t spec_indptr_len;
+    const uint32_t* spec_tokens_ptr;          size_t spec_tokens_len;
+    const uint32_t* spec_positions_ptr;       size_t spec_positions_len;
 } PieForwardResponseDesc;
 
 typedef struct PieCopyRequestDesc {

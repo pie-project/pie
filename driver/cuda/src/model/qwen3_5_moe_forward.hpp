@@ -36,6 +36,7 @@ struct Qwen3_5MoeMlpWorkspace {
     // Shared expert scratch.
     DeviceBuffer<std::uint16_t> shared_gate;       // [N, I_shared]
     DeviceBuffer<std::uint16_t> shared_up;         // [N, I_shared]
+    DeviceBuffer<std::uint16_t> shared_gate_up;    // [N, 2*I_shared(+scalar gate)]
     DeviceBuffer<std::uint16_t> shared_act;        // [N, I_shared]
     DeviceBuffer<std::uint16_t> shared_out;        // [N, H]
     DeviceBuffer<std::uint16_t> shared_gate_logit; // [N, 1]
@@ -102,5 +103,47 @@ void qwen3_5_moe_forward_paged(
     const std::int32_t* slot_ids_d = nullptr,
     const std::int32_t* logit_row_indices_d = nullptr,
     int num_logit_rows = 0);
+
+void qwen3_5_moe_mtp_process_cache(
+    const Qwen3_5MoeWeights& w,
+    const HfConfig& cfg,
+    const Qwen3_5ForwardCfg& fwd_cfg,
+    Qwen3Workspace& ws,
+    Qwen3_5LinearAttnWorkspace& la_ws,
+    KvCache& cache,
+    Qwen3_5StateCache& state_cache,
+    ops::CublasHandle& cublas,
+    const std::int32_t* token_ids,
+    const std::int32_t* positions,
+    const std::uint32_t* qo_indptr,
+    const std::uint32_t* kv_page_indices,
+    const std::uint32_t* kv_page_indptr,
+    const std::uint32_t* kv_last_page_lens,
+    const std::int32_t* slot_ids_d,
+    const std::int32_t* source_row_indices,
+    int total_tokens,
+    int num_requests);
+
+// Run one NEXTN step of Qwen3.6-MoE's one-layer MTP head. The executor can
+// recursively feed this step's hidden rows back in to return multiple drafts.
+void qwen3_5_moe_mtp_forward(
+    const Qwen3_5MoeWeights& w,
+    const HfConfig& cfg,
+    const Qwen3_5ForwardCfg& fwd_cfg,
+    Qwen3Workspace& ws,
+    Qwen3_5LinearAttnWorkspace& la_ws,
+    Qwen3_5MoeMlpWorkspace& moe_ws,
+    KvCache& cache,
+    ops::CublasHandle& cublas,
+    const std::int32_t* token_ids,
+    const std::int32_t* position_ids,
+    const std::int32_t* base_hidden_row_indices,
+    const std::int32_t* request_ids,
+    const std::uint32_t* kv_page_indices,
+    const std::uint32_t* kv_page_indptr,
+    const std::uint32_t* kv_last_page_lens,
+    int num_tokens,
+    int draft_step,
+    int max_global_tokens);
 
 }  // namespace pie_cuda_driver::model

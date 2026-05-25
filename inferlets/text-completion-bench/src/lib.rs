@@ -59,7 +59,7 @@ struct Input {
     #[serde(default)]
     wait_for_start: bool,
     #[serde(default)]
-    system_speculation: bool,
+    system_speculation: Option<bool>,
 }
 
 fn default_max_tokens() -> usize {
@@ -220,21 +220,32 @@ async fn run_one(
     }
 
     let mut all_output_tokens: Vec<u32> = Vec::with_capacity(input.max_tokens);
-    let mut g = ctx
-        .generate(Sampler::TopP {
+    let sampler = if input.temperature <= 0.0 {
+        Sampler::Argmax
+    } else {
+        Sampler::TopP {
             temperature: input.temperature,
             p: input.top_p,
-        })
-        .rebid_each_step(false);
-    if input.system_speculation && input.temperature <= 1e-5 {
-        g = g.system_speculation();
+        }
+    };
+
+    let mut g = ctx.generate(sampler).rebid_each_step(false);
+    if input.temperature <= 1e-5 {
+        if let Some(enabled) = input.system_speculation {
+            g = if enabled {
+                g.system_speculation()
+            } else {
+                g.disable_system_speculation()
+            };
+        }
     }
     let mut g = g.max_tokens(input.max_tokens).stop(&stop_tokens);
 
     if !input.return_text && stop_tokens.is_empty() && input.wasm_delay_us == 0 {
         let mut num_output_tokens = 0usize;
-        while g.next_token().await?.is_some() {
-            num_output_tokens += 1;
+        while let Some(step) = g.next()? {
+            let out = step.execute().await?;
+            num_output_tokens += out.tokens.len();
         }
         return Ok(RunResult {
             num_prompt_tokens,
