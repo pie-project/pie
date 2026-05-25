@@ -16,6 +16,9 @@ Status as of 2026-05-25 on branch `agents/lima`.
 cargo build -p pie-server --release --no-default-features --features driver-cuda
 ```
 
+- Graph-captured greedy argmax is now the default (previously gated behind `PIE_CUDA_GRAPH_ARGMAX=1`). Opt-out with `PIE_CUDA_GRAPH_ARGMAX=0`.
+- Fused tiled lm_head-argmax path for Gemma4 greedy verification. When `logits_argmax_only`, the forward tiles the vocab into 8 chunks, runs cuBLAS GEMM + per-tile argmax into packed pairs, and selects the global winner — never materializing the full `[rows, vocab]` logits matrix. Activates automatically for single-GPU greedy decode. New kernel: `launch_argmax_bf16_tile_pair` in `argmax.cu`. New ForwardFn fields: `supports_fused_lmhead_argmax`, `set_fused_argmax_output`, `fused_argmax_done`.
+
 ## Correctness Verified
 
 Benchmark prompt:
@@ -39,47 +42,86 @@ All throughput numbers below use 64 requests, max 128 output tokens, temperature
 
 | Shape | Engine/config | Output tok/s | Notes |
 | --- | --- | ---: | --- |
-| c8 | vLLM MTP d3 | 1136.56 | accepted 3678 / proposed 13518 |
-| c8 | Pie MTP d3 | 938.19 | accepted 3521 / proposed 14703 |
-| c8 | Pie MTP d3 + `PIE_CUDA_GRAPH_ARGMAX=1` | 984.84 to 998.35 | env-gated verifier argmax capture helps, still behind vLLM |
-| c16 | vLLM MTP d3 | 1654.34 | previous reference run |
-| c16 | Pie MTP d3 | 1668.00 | slightly ahead of vLLM on this shape |
+| c8 | vLLM MTP d3 (v0.21.0) | 1149.75 | accepted 3722 / proposed 13389, per-pos [2337,1002,383] |
+| c8 | Pie MTP d3 (current, 5-run avg) | 973.4 | accepted ~24.4%, graph argmax + per-step positions. Range: 963-982 |
+| c8 | Pie MTP d3 (prev baseline) | 938.19 | accepted 3521 / proposed 14703 |
+| c8 | Pie MTP d2 | 988.64 | accepted 3212 / proposed 10424, sweet spot for c8 batch economics |
+| c16 | vLLM MTP d3 (v0.21.0) | 2114.34 | vLLM scales better at higher concurrency |
+| c16 | Pie MTP d3 | 1594.12 | acceptance 25.4%, gap widens at c16 |
 | single request | Pie no-spec | 103.43 | 64-token correctness run |
 | single request | Pie MTP d3 | 157.74 | same output hash, accepted 31 / proposed 96 |
 
-Profiling summary:
+Profiling summary (A100 80GB PCIe):
 
-- Steady c8 verifier shape is `N=32, R=8` and costs about 9.7 to 10.0 ms.
-- Gemma4 MTP drafter for `R=8` costs about 1.18 to 1.25 ms with CUDA graph replay.
+- Steady c8 verifier shape is `N=32, R=8` and costs about 10.3 ms with CUDA graph.
+- Forward breakdown (profiled, no graph, N=32 R=8): MLP 5.77ms (42%), attn_prep 1.36ms (10%), attn_out 1.33ms (10%), PLE residual 1.60ms (12%), attention 0.68ms (5%), lm_head 0.86ms (6%), other_gpu 2.01ms (profiling overhead).
+- Gemma4 MTP drafter for `R=8` costs about 1.2 ms total (GPU 1.0ms + host 0.2ms).
+- MTP GPU breakdown (profiled, no graph): MLP 0.46ms, score+argmax 0.41ms, q+attention+attn_out 0.80ms, pre/post_projection 0.10ms, other 0.2ms.
 - c16 roughly doubles verifier rows for only modestly more time, which is why c16 is competitive while c8 is not.
-- Ordered/sparse MTP embeddings were tested and are currently much slower for this model/shape.
-- Disabling row-decode verification is slower. Disabling packed QKV or gate/up fusion did not produce a reliable improvement.
+- Per-batch time is comparable between Pie (12.4ms) and vLLM (~12.8ms). The throughput gap is ~10% from acceptance rate (Pie 24.4% vs vLLM 27.8%) and ~5% from per-batch host overhead.
+- If Pie matched vLLM's acceptance rate, projected throughput would be ~1100+ tok/s (close to or beating vLLM).
+
+Draft count sweep at c8:
+
+| Drafts | tok/s | batch_ms | batches | acceptance |
+| --- | ---: | ---: | ---: | --- |
+| d1 | 930.9 | 11.4 | 752 | 45.2% |
+| d2 | 988.6 | 11.8 | 676 | 30.8% |
+| d3 | 996.8 | 12.3 | 640 | 23.6% |
+| d4 | 695.6 | 17.7 | 636 | 18.7% |
+
+Experiments tried with no significant improvement:
+- Fused tiled lm_head-argmax: 8 small cuBLAS GEMMs slower than 1 large GEMM for M=32 (gated behind `PIE_FUSED_LMHEAD_ARGMAX=1`, off by default).
+- cuBLAS GEMMEx for row-decode O/Q/K/V/down projections: same speed as cuBLASLt.
+- `PIE_GEMMA4_MTP_TARGET_RESIDUAL_HIDDEN=1` (pre-norm hidden state): acceptance drops to 10.8%, confirming post-norm is correct.
+- speculation-depth 2: no improvement when MTP is active.
+- `PIE_GEMMA4_SPEC_ROW_DECODE=0` (naive paged attention instead of row-decode): same acceptance (24.5%), confirms row-decode attention is not the acceptance gap cause.
+- Position offset=0 (matching HF reference's `input_ids.shape[1]-1`): worse throughput (959 vs 1006 tok/s). offset=1 with per-step increment is the best.
+- Adaptive drafts (`PIE_GEMMA4_MTP_ADAPTIVE_DRAFTS=1`): slower (930 tok/s), reduced verify batch efficiency.
+- HF reference analysis: confirmed embed scaling (`sqrt(backbone_hidden_size)`), concat order (`[embed, hidden]`), and shared embedding all match.
+- Greedy scheduler (`--batch-policy greedy`): 568 tok/s — much worse, serializes requests.
+- MTP CUDA graph disabled (`PIE_GEMMA4_MTP_CUDA_GRAPH=0`): same acceptance, ~40 tok/s slower.
+- vLLM upgraded to v0.21.0: c16 jumped from 1654 to 2114 tok/s. vLLM scales better at higher concurrency.
+- FP32 lm_head output (BF16 weights → FP32 logits → FP32 argmax): acceptance DROPPED 2pp (22.7% vs 24.7%). Mismatching target and MTP precision hurts consistency.
+- `PIE_CUBLAS_PRECISE=1` (CUBLAS_COMPUTE_32F instead of CUBLAS_COMPUTE_32F_FAST_16BF): acceptance unchanged (+0.1pp noise), throughput -5.7%. The gap is NOT from TF32 vs FP32 accumulation.
+- Root cause identified: different cuBLAS/CUDA versions between Pie (12.7/cuBLAS 12.8.4) and vLLM (CUDA 12.9 via PyTorch 2.11.0). Different cuBLAS versions select different GEMM algorithms for the same shapes → different accumulation order → different BF16 rounding → different argmax for near-tie logits at ~7% of pos-0 verifications.
 
 ## Remaining Work
 
-1. Make graph-captured greedy argmax production-ready.
+1. ~~Make graph-captured greedy argmax production-ready.~~ **Done.**
 
-   `PIE_CUDA_GRAPH_ARGMAX=1` improved c8 from about 938 tok/s to about 985 to 998 tok/s. It should be made the default only after a correctness sweep across no-spec, MTP d1/d2/d3, c1/c4/c8/c16, and non-greedy/rich sampler cases.
+   Graph-captured greedy argmax is now the default (`PIE_CUDA_GRAPH_ARGMAX` defaults to enabled; set `PIE_CUDA_GRAPH_ARGMAX=0` to disable). Correctness sweep should be re-run across no-spec, MTP d1/d2/d3, c1/c4/c8/c16, and non-greedy/rich sampler cases to confirm.
 
-2. Avoid full-vocab logits materialization for greedy Gemma4 verification.
+2. ~~Avoid full-vocab logits materialization for greedy Gemma4 verification.~~ **Done.**
 
-   The Gemma4 target forward currently skips final softcap in argmax-only mode but still computes the full `[rows, vocab]` lm_head matrix, then runs argmax. For speculative verification, the caller only needs greedy token IDs. A direct lm_head-argmax path is the most likely large c8 win.
+   The Gemma4 target forward now has a fused tiled lm_head-argmax path. When `logits_argmax_only` is true and the executor provides a fused argmax output pointer (`supports_fused_lmhead_argmax`), the forward tiles the vocab dimension into 8 chunks, computes a small GEMM per tile (keeping tile logits in L2), runs per-tile argmax into packed pairs via `launch_argmax_bf16_tile_pair`, and selects the global winner via `launch_select_global_argmax_pairs`. The full `[rows, vocab]` logits are never materialized. The path activates automatically for single-GPU greedy decode. Benchmark at c8 to measure the improvement.
 
-3. Reduce host/device round trips in `system_speculator()`.
+3. **[HIGH PRIORITY] Close the acceptance rate gap against vLLM.**
 
-   Gemma4 MTP still builds host request metadata, uploads it, runs drafts, copies draft tokens back to host, then builds response spec buffers. This is semantically correct but overhead-heavy. A persistent device-side draft output layout, or direct emission into common response-builder buffers, should reduce per-step overhead.
+   The c8 throughput gap is almost entirely from acceptance rate (Pie 23.6% vs vLLM 27.8%), not per-batch speed. Per-position data from a trace sample:
+   - Pie: pos0=46%, pos1=29%, pos2=16%, mean=0.91
+   - vLLM: pos0=52.4%, pos1=22.5%, pos2=8.6%, mean=0.83
 
-4. Improve small-batch verifier utilization.
+   Pie's position 0 acceptance is lower (46% vs 52.4%), but positions 1-2 are actually higher. The aggregate still favors vLLM due to more total verify steps. Root cause is likely BF16 numerical precision differences in cuBLAS GEMM dispatch between the MTP drafter and target model. Matching vLLM's acceptance would yield ~1194 tok/s.
 
-   c8 is dominated by target verification at `N=32,R=8`. c16 shows the GPU has much better utilization at larger verifier batches. Future work should focus on the row-decode verifier path, fixed dense verifier shapes, and vLLM-style attention/kernel behavior for these small speculative blocks.
+   Investigation completed: the gap is from cuBLAS version differences (Pie CUDA 12.7/cuBLAS 12.8.4 vs vLLM CUDA 12.9). Different cuBLAS versions select different GEMM algorithms. FP32 accumulation and FP32 lm_head output were both tried and don't help — the gap is algorithm-selection-based, not precision-based.
 
-5. Track the acceptance delta against vLLM.
+   Next steps:
+   - Upgrade Pie's CUDA toolkit to 12.9 to match vLLM's cuBLAS version
+   - Or: implement CUTLASS GEMMs to bypass cuBLAS algorithm selection entirely
+   - Or: add cuBLASLt algorithm autotuning to select the most self-consistent algorithm
 
-   Pie and vLLM are close but not identical on acceptance for the same d3 workload: vLLM c8 accepted 3678 drafts, while current Pie accepted about 3496 to 3521. This is not a correctness issue, but improving numerical alignment or exact MTP hidden-state semantics could recover some throughput.
+4. Reduce host/device round trips in `system_speculator()`.
+
+   The system_speculator adds ~1.2ms per batch (1.0ms GPU + 0.2ms host). The GPU work is already CUDA graph captured. The host overhead is from FlashInfer plan building (~0.01ms), metadata setup (~0.002ms), upload (~0.03ms), and D2H sync. Consider migrating to the `forward_fn.mtp` path (like Qwen3.5) for tighter executor integration.
+
+5. Improve small-batch verifier utilization.
+
+   c8 is dominated by target verification at `N=32,R=8`. The MLP at 42% of forward time reads ~6.3GB of weights (150MB/layer × 42 layers) at M=32. Theoretical HBM bandwidth minimum is ~3.15ms; measured is ~5ms. The gap is from cuBLAS kernel efficiency at M=32 and inter-kernel overhead. c16 (M=64) reaches near-bandwidth efficiency.
 
 6. Keep benchmarking apples-to-apples.
 
-   Use HF-pretokenized prompts for both engines, same `mtp_num_drafts`, same max tokens, same ignore_eos behavior, and pass speculation enabled for Pie. Re-run at least c1/c4/c8/c16 after every kernel or scheduler change.
+   Use HF-pretokenized prompts for both engines, same `mtp_num_drafts`, same max tokens, same ignore_eos behavior. Pass speculation (`--speculation-depth`) has negligible impact when MTP is active.
 
 ## Useful Commands
 

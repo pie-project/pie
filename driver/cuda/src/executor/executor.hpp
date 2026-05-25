@@ -135,6 +135,14 @@ struct ForwardFn {
         int                  /* num_requests */
     )>;
 
+    using MtpPrepareFn = std::function<void(
+        const std::uint32_t* /* kv_page_indptr_h */,
+        const std::uint32_t* /* kv_last_page_lens_h */,
+        int                  /* num_rows */,
+        int                  /* page_size */,
+        cudaStream_t         /* stream */
+    )>;
+
     struct PrepareInputs {
         const std::uint32_t* qo_indptr_h = nullptr;
         const std::uint32_t* kv_page_indices_h = nullptr;
@@ -155,14 +163,20 @@ struct ForwardFn {
 
     using GraphLayoutFn = std::function<std::uint32_t()>;
     using LogitsModeFn = std::function<void(bool)>;
+    using SetFusedArgmaxOutputFn = std::function<void(std::int32_t*)>;
+    using FusedArgmaxDoneFn = std::function<bool()>;
 
     // Empty by default → executor falls back to "direct call only;
     // no graph capture" mode for this arch.
     PrepareFn prepare;
     GraphLayoutFn graph_layout;
     LogitsModeFn set_logits_argmax_only;
+    SetFusedArgmaxOutputFn set_fused_argmax_output;
+    FusedArgmaxDoneFn fused_argmax_done;
+    bool supports_fused_lmhead_argmax = false;
     BodyFn    body;
     MtpFn     mtp;
+    MtpPrepareFn mtp_prepare;
     MtpProcessFn mtp_process;
     int mtp_num_drafts = 1;
 

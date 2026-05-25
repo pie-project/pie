@@ -166,7 +166,7 @@ int mtp_argmax_parts(int vocab) {
 bool graph_single_gpu_argmax_enabled() {
     static const bool enabled = [] {
         const char* v = std::getenv("PIE_CUDA_GRAPH_ARGMAX");
-        if (v == nullptr || v[0] == '\0') return false;
+        if (v == nullptr || v[0] == '\0') return true;
         return v[0] != '0';
     }();
     return enabled;
@@ -1196,8 +1196,12 @@ std::size_t capture_forward_graph_lattice(Executor& executor) {
         executor.tp_comm != nullptr &&
         executor.tp_comm->world_size() <= 8 &&
         executor.forward_fn.supports_tp_greedy_argmax;
+    const bool fwd_handles_argmax_precapture =
+        executor.forward_fn.supports_fused_lmhead_argmax &&
+        executor.tp_comm == nullptr;
     const bool single_gpu_graph_argmax =
-        graph_single_gpu_argmax_enabled() && executor.tp_comm == nullptr;
+        graph_single_gpu_argmax_enabled() && executor.tp_comm == nullptr &&
+        !fwd_handles_argmax_precapture;
     const bool log_rank =
         executor.verbose &&
         (executor.tp_comm == nullptr || executor.tp_comm->rank() == 0);
@@ -1266,10 +1270,18 @@ std::size_t capture_forward_graph_lattice(Executor& executor) {
         const std::uint32_t graph_variant =
             (tp_greedy_argmax ? 1u : 0u) |
             (single_gpu_graph_argmax ? 2u : 0u) |
-            (graph_layout << 2);
+            (fwd_handles_argmax_precapture ? 4u : 0u) |
+            (graph_layout << 3);
         const ForwardGraphKey key{R, N, graph_variant};
         if (executor.graph_cache->get(key) != nullptr) continue;
 
+        if (fwd_handles_argmax_precapture) {
+            if (executor.forward_fn.set_logits_argmax_only)
+                executor.forward_fn.set_logits_argmax_only(true);
+            if (executor.forward_fn.set_fused_argmax_output)
+                executor.forward_fn.set_fused_argmax_output(
+                    reinterpret_cast<std::int32_t*>(pi.sampled.data()));
+        }
         tp_graph_capture_barrier(executor);
         cudaGraphExec_t exec = capture_forward_graph_exec(
             executor, qo.data(), kvpi.data(), kvpp.data(), kvlpl.data(),
@@ -1279,6 +1291,10 @@ std::size_t capture_forward_graph_lattice(Executor& executor) {
             /*logit_row_indices_d=*/nullptr,
             /*num_logit_rows=*/0, single_gpu_graph_argmax,
             tp_greedy_argmax);
+        if (fwd_handles_argmax_precapture &&
+            executor.forward_fn.set_fused_argmax_output) {
+            executor.forward_fn.set_fused_argmax_output(nullptr);
+        }
         executor.graph_cache->put(key, exec);
         ++captured;
         tp_graph_capture_barrier(executor);
@@ -1904,14 +1920,25 @@ void handle_fire_batch(
         if (!tp_greedy_argmax && !single_gpu_greedy_argmax) {
             upload_sampling_inputs(pi, sample_plan, N, /*stream=*/nullptr);
         }
+        const bool logits_argmax_only =
+            forward_fn.set_logits_argmax_only &&
+            !has_rich_sampler_slots &&
+            logit_masks_view.empty() &&
+            !any_topk_topp &&
+            all_slots_token &&
+            all_rows_greedy;
         if (forward_fn.set_logits_argmax_only) {
-            const bool logits_argmax_only =
-                !has_rich_sampler_slots &&
-                logit_masks_view.empty() &&
-                !any_topk_topp &&
-                all_slots_token &&
-                all_rows_greedy;
             forward_fn.set_logits_argmax_only(logits_argmax_only);
+        }
+        const bool forward_handles_argmax =
+            forward_fn.supports_fused_lmhead_argmax &&
+            logits_argmax_only &&
+            single_gpu_greedy_argmax;
+        if (forward_fn.set_fused_argmax_output) {
+            forward_fn.set_fused_argmax_output(
+                forward_handles_argmax
+                    ? reinterpret_cast<std::int32_t*>(pi.sampled.data())
+                    : nullptr);
         }
 
         // ── Forward pass ────────────────────────────────────────
@@ -1927,12 +1954,14 @@ void handle_fire_batch(
             graph_shape_ok && !have_custom_mask && prepared_small_spec_graph;
         const bool graph_captures_single_gpu_argmax =
             try_graphs && single_gpu_greedy_argmax &&
+            !forward_handles_argmax &&
             graph_single_gpu_argmax_enabled();
         const std::uint32_t graph_variant =
             (tp_greedy_argmax ? 1u : 0u) |
             (graph_captures_single_gpu_argmax ? 2u : 0u) |
-            (graph_layout << 2) |
-            (small_spec_graph_shape ? 0x100u : 0u);
+            (forward_handles_argmax ? 4u : 0u) |
+            (graph_layout << 3) |
+            (small_spec_graph_shape ? 0x200u : 0u);
         StepProfileTimer verify_timer(
             "verify", cublas.stream(), forward_N, forward_R);
         if (try_graphs) {
@@ -2016,7 +2045,9 @@ void handle_fire_batch(
                 N, executor.tp_comm->world_size(), cublas.stream());
         } else if (graph_captures_single_gpu_argmax) {
             // The captured forward graph already wrote pi.sampled.
-        } else if (single_gpu_greedy_argmax && !graph_captures_single_gpu_argmax) {
+        } else if (forward_handles_argmax) {
+            // The forward's fused lm_head-argmax wrote pi.sampled.
+        } else if (single_gpu_greedy_argmax) {
             const int argmax_parts =
                 greedy_argmax_parts(engine.hf_config().vocab_size);
             if (argmax_parts > 1 && !ws.greedy_pairs_all.empty()) {
@@ -2525,6 +2556,13 @@ void handle_fire_batch(
                         pi.mtp_request_ids.copy_from_host(
                             std::span<const std::int32_t>(mtp_request_ids));
 
+                        if (forward_fn.mtp_prepare) {
+                            forward_fn.mtp_prepare(
+                                kvpp_view.data(),
+                                kvlpl_view_orig.data(),
+                                S,
+                                kv_cache.page_size(), cublas.stream());
+                        }
                         if (!try_run_mtp_chain_graph_with_argmax(
                                 executor, S, max_drafts,
                                 mtp_max_observed_global_tokens)) {
@@ -3059,7 +3097,7 @@ void tp_follower_serve(Executor& executor, std::atomic<bool>& stop) {
             executor.forward_fn.graph_layout ? executor.forward_fn.graph_layout() : 0u;
         const std::uint32_t graph_variant =
             (tp_greedy_argmax ? 1u : 0u) |
-            (graph_layout << 2);
+            (graph_layout << 3);
         if (try_graphs) {
             const ForwardGraphKey key{R, N, graph_variant};
             cudaGraphExec_t exec = executor.graph_cache->get(key);

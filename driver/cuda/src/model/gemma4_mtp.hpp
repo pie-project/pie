@@ -137,4 +137,25 @@ void gemma4_mtp_draft(
     const SystemSpecDraftInputs& in,
     std::span<pie_driver::PerRequestOutput> per_request);
 
+// Single-step MTP forward matching the executor's MtpFn signature.
+// Gathers hidden states from target_ws.norm_x at base_hidden_row_indices,
+// runs one draft step, writes logits to target_ws.logits for executor argmax.
+void gemma4_mtp_forward_step(
+    const Gemma4MtpWeights& w,
+    const Gemma4Weights& target_weights,
+    Gemma4MtpWorkspace& mtp_ws,
+    Qwen3Workspace& target_ws,
+    KvCache& kv_cache,
+    ops::CublasHandle& cublas,
+    const std::int32_t* token_ids,
+    const std::int32_t* position_ids,
+    const std::int32_t* base_hidden_row_indices,
+    const std::int32_t* request_ids,
+    const std::uint32_t* kv_page_indices,
+    const std::uint32_t* kv_page_indptr,
+    const std::uint32_t* kv_last_page_lens,
+    int num_tokens,
+    int draft_step,
+    int max_global_tokens);
+
 }  // namespace pie_cuda_driver::model

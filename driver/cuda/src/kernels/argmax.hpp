@@ -31,6 +31,26 @@ void launch_argmax_bf16_partitioned_pairs(
     int parts,
     cudaStream_t stream);
 
+// Per-row argmax over [num_rows, vocab] fp32 logits → [num_rows] i32 token ids.
+void launch_argmax_fp32(
+    const void* logits,        // [num_rows, vocab] fp32
+    std::int32_t* token_ids,   // [num_rows]
+    int num_rows,
+    int vocab,
+    cudaStream_t stream);
+
+// Per-tile argmax for fused lm_head-argmax. Operates on a [num_rows,
+// tile_vocab] logits slice and produces one packed (value, token_id) pair
+// per row. `token_offset` is added to each local index so the packed pair
+// carries the global vocab token ID.
+void launch_argmax_bf16_tile_pair(
+    const void* logits,              // [num_rows, tile_vocab] bf16
+    std::uint64_t* out_pair,         // [num_rows]
+    int num_rows,
+    int tile_vocab,
+    int token_offset,
+    cudaStream_t stream);
+
 // Gemma4 MTP ordered-embedding argmax. The assistant first selects top
 // centroids, then scores only the tokens assigned to those centroids.
 void launch_masked_embedding_argmax_bf16(

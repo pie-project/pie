@@ -296,6 +296,121 @@ __global__ void argmax_bf16_partitioned_pairs_vec2_kernel(
     }
 }
 
+__global__ void argmax_fp32_kernel(
+    const float* __restrict__ logits,
+    std::int32_t* __restrict__ out,
+    int vocab)
+{
+    const int row = blockIdx.x;
+    const int tid = threadIdx.x;
+    const float* row_ptr = logits + static_cast<long long>(row) * vocab;
+
+    float best_val = -INFINITY;
+    int   best_idx = 0;
+
+    for (int i = tid; i < vocab; i += BLOCK) {
+        update_argmax(row_ptr[i], i, best_val, best_idx);
+    }
+
+    __shared__ float vals[BLOCK];
+    __shared__ int   idxs[BLOCK];
+    vals[tid] = best_val;
+    idxs[tid] = best_idx;
+    __syncthreads();
+
+    for (int off = BLOCK / 2; off > 0; off >>= 1) {
+        if (tid < off) {
+            update_argmax(vals[tid + off], idxs[tid + off],
+                          vals[tid], idxs[tid]);
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) out[row] = idxs[0];
+}
+
+__global__ void argmax_bf16_tile_pair_kernel(
+    const __nv_bfloat16* __restrict__ logits,
+    std::uint64_t* __restrict__ out_pair,
+    int tile_vocab,
+    int token_offset)
+{
+    const int row = blockIdx.x;
+    const int tid = threadIdx.x;
+    const __nv_bfloat16* row_ptr = logits + static_cast<long long>(row) * tile_vocab;
+
+    float best_val = -INFINITY;
+    int best_idx = token_offset;
+
+    for (int i = tid; i < tile_vocab; i += BLOCK) {
+        const float v = __bfloat162float(row_ptr[i]);
+        update_argmax(v, token_offset + i, best_val, best_idx);
+    }
+
+    __shared__ float vals[BLOCK];
+    __shared__ int idxs[BLOCK];
+    vals[tid] = best_val;
+    idxs[tid] = best_idx;
+    __syncthreads();
+
+    for (int off = BLOCK / 2; off > 0; off >>= 1) {
+        if (tid < off) {
+            update_argmax(vals[tid + off], idxs[tid + off],
+                          vals[tid], idxs[tid]);
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        out_pair[row] = pack_argmax_pair(vals[0], idxs[0]);
+    }
+}
+
+__global__ void argmax_bf16_tile_pair_vec2_kernel(
+    const __nv_bfloat16* __restrict__ logits,
+    std::uint64_t* __restrict__ out_pair,
+    int tile_vocab,
+    int token_offset)
+{
+    const int row = blockIdx.x;
+    const int tid = threadIdx.x;
+    const __nv_bfloat16* row_ptr = logits + static_cast<long long>(row) * tile_vocab;
+    const auto* row2 = reinterpret_cast<const __nv_bfloat162*>(row_ptr);
+
+    float best_val = -INFINITY;
+    int best_idx = token_offset;
+
+    const int even_end = tile_vocab & ~1;
+    for (int j = tid; j < even_end / 2; j += BLOCK) {
+        const float2 vals = __bfloat1622float2(row2[j]);
+        const int i = j * 2;
+        update_argmax(vals.x, token_offset + i, best_val, best_idx);
+        update_argmax(vals.y, token_offset + i + 1, best_val, best_idx);
+    }
+    if ((tile_vocab & 1) && tid == 0) {
+        update_argmax(__bfloat162float(row_ptr[tile_vocab - 1]),
+                      token_offset + tile_vocab - 1, best_val, best_idx);
+    }
+
+    __shared__ float vals[BLOCK];
+    __shared__ int idxs[BLOCK];
+    vals[tid] = best_val;
+    idxs[tid] = best_idx;
+    __syncthreads();
+
+    for (int off = BLOCK / 2; off > 0; off >>= 1) {
+        if (tid < off) {
+            update_argmax(vals[tid + off], idxs[tid + off],
+                          vals[tid], idxs[tid]);
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        out_pair[row] = pack_argmax_pair(vals[0], idxs[0]);
+    }
+}
+
 __global__ void masked_embedding_argmax_bf16_kernel(
     const __nv_bfloat16* __restrict__ centroid_logits,
     const __nv_bfloat16* __restrict__ hidden_states,
@@ -559,6 +674,42 @@ void launch_argmax_bf16_partitioned_pairs(
     } else {
         argmax_bf16_partitioned_pairs_kernel<<<grid, block, 0, stream>>>(
             static_cast<const __nv_bfloat16*>(logits), partial_pairs, vocab, parts);
+    }
+}
+
+void launch_argmax_fp32(
+    const void* logits,
+    std::int32_t* token_ids,
+    int num_rows,
+    int vocab,
+    cudaStream_t stream)
+{
+    if (num_rows <= 0 || vocab <= 0) return;
+    dim3 grid(num_rows);
+    dim3 block(BLOCK);
+    argmax_fp32_kernel<<<grid, block, 0, stream>>>(
+        static_cast<const float*>(logits), token_ids, vocab);
+}
+
+void launch_argmax_bf16_tile_pair(
+    const void* logits,
+    std::uint64_t* out_pair,
+    int num_rows,
+    int tile_vocab,
+    int token_offset,
+    cudaStream_t stream)
+{
+    if (num_rows <= 0 || tile_vocab <= 0) return;
+    dim3 grid(num_rows);
+    dim3 block(BLOCK);
+    if (argmax_vec2_enabled()) {
+        argmax_bf16_tile_pair_vec2_kernel<<<grid, block, 0, stream>>>(
+            static_cast<const __nv_bfloat16*>(logits), out_pair,
+            tile_vocab, token_offset);
+    } else {
+        argmax_bf16_tile_pair_kernel<<<grid, block, 0, stream>>>(
+            static_cast<const __nv_bfloat16*>(logits), out_pair,
+            tile_vocab, token_offset);
     }
 }
 
