@@ -439,6 +439,7 @@ impl DefaultAbiBuilder<'_> {
         self.add_gpt_oss_mxfp4_groups()?;
         self.add_fused_moe_gate_up_tp_slices()?;
         self.add_dense_fused_projection_joins(runtime_quant.is_some())?;
+        self.add_mla_fused_projection_joins()?;
         for raw in &self.metadata.tensors {
             if self.consumed.contains(&raw.id) {
                 continue;
@@ -577,6 +578,66 @@ impl DefaultAbiBuilder<'_> {
             });
         }
 
+        Ok(())
+    }
+
+    fn add_mla_fused_projection_joins(&mut self) -> Result<(), CompileError> {
+        if self.target.backend != BackendKind::Cuda {
+            return Ok(());
+        }
+        let is_mla = matches!(
+            self.cfg.model_type.as_str(),
+            "kimi_k2" | "kimi_k25" | "deepseek_v2" | "deepseek_v3"
+        );
+        if !is_mla {
+            return Ok(());
+        }
+
+        let mut candidates = Vec::new();
+        for layer in 0..self.cfg.num_hidden_layers {
+            let p = format!("model.layers.{layer}.");
+            // Fuse q_a_proj + kv_a_proj_with_mqa (same input: norm_x, unsharded)
+            if let Some(c) = self.fused_join_candidate(
+                &(p.clone() + "self_attn.q_kv_a_proj.fused.weight"),
+                &[
+                    p.clone() + "self_attn.q_a_proj.weight",
+                    p.clone() + "self_attn.kv_a_proj_with_mqa.weight",
+                ],
+            )? {
+                candidates.push(c);
+            }
+            // Fuse shared gate + up (same input: norm_y)
+            if let Some(c) = self.fused_join_candidate(
+                &(p.clone() + "mlp.shared_experts.gate_up_proj.fused.weight"),
+                &[
+                    p.clone() + "mlp.shared_experts.gate_proj.weight",
+                    p.clone() + "mlp.shared_experts.up_proj.weight",
+                ],
+            )? {
+                candidates.push(c);
+            }
+        }
+
+        for candidate in candidates {
+            for tensor in &candidate.tensors {
+                self.consumed.insert(*tensor);
+            }
+            self.tensors.push(RuntimeTensorContract {
+                output_name: candidate.output_name,
+                source: RuntimeTensorSource::Join {
+                    tensors: candidate.tensors,
+                    axis: Axis(0),
+                },
+                metadata: Vec::new(),
+                dtype: DType::BF16,
+                encoding: Encoding::Raw(DType::BF16),
+                shape: vec![candidate.rows, candidate.cols],
+                layout: Layout::dense(self.alignment()),
+                sharding: Sharding::replicated(),
+                alignment: self.alignment(),
+                shard_axis: None,
+            });
+        }
         Ok(())
     }
 

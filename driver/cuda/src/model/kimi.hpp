@@ -38,6 +38,7 @@ struct KimiLayerWeights {
     const DeviceTensor* q_a_norm = nullptr;             // [q_lora_rank]
     const DeviceTensor* q_b_proj = nullptr;             // [local_heads*(nope+rope), q_lora_rank]
     const DeviceTensor* kv_a_proj_with_mqa = nullptr;   // [kv_lora_rank+rope, H]
+    const DeviceTensor* q_kv_a_fused = nullptr;         // [q_lora+kv_lora+rope, H] or null
     const DeviceTensor* kv_a_norm = nullptr;            // [kv_lora_rank]
     const DeviceTensor* kv_b_proj = nullptr;            // [local_heads*(nope+v), kv_lora_rank]
     const DeviceTensor* o_proj = nullptr;               // [H, local_heads*v_dim]
@@ -62,6 +63,7 @@ struct KimiLayerWeights {
     const DeviceTensor* shared_gate_proj = nullptr;     // [I_shared, H]
     const DeviceTensor* shared_up_proj   = nullptr;     // [I_shared, H]
     const DeviceTensor* shared_down_proj = nullptr;     // [H, I_shared]
+    const DeviceTensor* shared_gate_up_fused = nullptr; // [2*I_shared, H] or null
 };
 
 struct KimiWeights {

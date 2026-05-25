@@ -354,7 +354,7 @@ KimiWorkspace KimiWorkspace::allocate(
     ws.expert_up     = DeviceTensor::allocate(DType::BF16, {routes, max_I});
     ws.expert_out    = DeviceTensor::allocate(DType::BF16, {routes, H});
     ws.moe_out       = DeviceTensor::allocate(DType::BF16, {N, H});
-    ws.shared_gate   = DeviceTensor::allocate(DType::BF16, {N, std::max(1, shared_I)});
+    ws.shared_gate   = DeviceTensor::allocate(DType::BF16, {N, std::max(1, 2 * shared_I)});
     ws.shared_up     = DeviceTensor::allocate(DType::BF16, {N, std::max(1, shared_I)});
     ws.shared_act    = DeviceTensor::allocate(DType::BF16, {N, std::max(1, shared_I)});
     ws.shared_out    = DeviceTensor::allocate(DType::BF16, {N, H});
@@ -520,19 +520,33 @@ void kimi_forward_paged(
                 kimi_ws.y.data(), Lw.attn_norm->data(), kimi_ws.norm_x.data(),
                 total_tokens, H, eps, stream);
 
-            ops::gemm_act_x_w(cublas.handle(),
-                kimi_ws.norm_x.data(), *Lw.q_a_proj,
-                kimi_ws.q_a.data(), total_tokens, q_lora, H);
+            if (Lw.q_kv_a_fused != nullptr) {
+                // Fused q_a + kv_a projection: one GEMM instead of two
+                ops::gemm_act_x_w(cublas.handle(),
+                    kimi_ws.norm_x.data(), *Lw.q_kv_a_fused,
+                    kimi_ws.q_a.data(), total_tokens, q_lora + kv_lora + q_rope, H);
+                // Split the fused output: q_a is first q_lora rows, kv_a is the rest
+                // q_a is already in place; copy kv_a part to kv_a_mqa buffer
+                CUDA_CHECK(cudaMemcpyAsync(
+                    kimi_ws.kv_a_mqa.data(),
+                    static_cast<const char*>(kimi_ws.q_a.data()) +
+                        static_cast<std::size_t>(total_tokens) * q_lora * sizeof(std::uint16_t),
+                    static_cast<std::size_t>(total_tokens) * (kv_lora + q_rope) * sizeof(std::uint16_t),
+                    cudaMemcpyDeviceToDevice, stream));
+            } else {
+                ops::gemm_act_x_w(cublas.handle(),
+                    kimi_ws.norm_x.data(), *Lw.q_a_proj,
+                    kimi_ws.q_a.data(), total_tokens, q_lora, H);
+                ops::gemm_act_x_w(cublas.handle(),
+                    kimi_ws.norm_x.data(), *Lw.kv_a_proj_with_mqa,
+                    kimi_ws.kv_a_mqa.data(), total_tokens, kv_lora + q_rope, H);
+            }
             kernels::launch_rmsnorm_bf16(
                 kimi_ws.q_a.data(), Lw.q_a_norm->data(), kimi_ws.q_a.data(),
                 total_tokens, q_lora, eps, stream);
             ops::gemm_act_x_w(cublas.handle(),
                 kimi_ws.q_a.data(), *Lw.q_b_proj,
                 kimi_ws.q_b.data(), total_tokens, heads * (q_nope + q_rope), q_lora);
-
-            ops::gemm_act_x_w(cublas.handle(),
-                kimi_ws.norm_x.data(), *Lw.kv_a_proj_with_mqa,
-                kimi_ws.kv_a_mqa.data(), total_tokens, kv_lora + q_rope, H);
             kernels::launch_kimi_split_kv_a_bf16(
                 kimi_ws.kv_a_mqa.data(), kimi_ws.kv_c.data(), kimi_ws.k_pe.data(),
                 total_tokens, kv_lora, q_rope, stream);
@@ -765,15 +779,38 @@ void kimi_forward_paged(
 
         if (shared_I > 0 && Lw.shared_gate_proj != nullptr) {
             profile_cuda_stage(&profile, &profile.moe_shared_ms, stream, [&] {
-                ops::gemm_act_x_w(cublas.handle(),
-                    kimi_ws.norm_y.data(), *Lw.shared_gate_proj,
-                    kimi_ws.shared_gate.data(), total_tokens, shared_I, H);
-                ops::gemm_act_x_w(cublas.handle(),
-                    kimi_ws.norm_y.data(), *Lw.shared_up_proj,
-                    kimi_ws.shared_up.data(), total_tokens, shared_I, H);
-                kernels::launch_swiglu_bf16(
-                    kimi_ws.shared_gate.data(), kimi_ws.shared_up.data(),
-                    kimi_ws.shared_act.data(), total_tokens * shared_I, stream);
+                if (Lw.shared_gate_up_fused != nullptr && total_tokens == 1) {
+                    // Fused gate+up for single-token decode: one GEMM
+                    // Output: [1, 2*shared_I] = [gate..., up...]
+                    ops::gemm_act_x_w(cublas.handle(),
+                        kimi_ws.norm_y.data(), *Lw.shared_gate_up_fused,
+                        kimi_ws.shared_gate.data(), 1, 2 * shared_I, H);
+                    // SwiGLU reads gate from shared_gate, up from shared_gate+shared_I
+                    // For N=1, shared_up can point into the fused buffer
+                } else if (Lw.shared_gate_up_fused != nullptr) {
+                    // Multi-token: fall back to unfused (need interleaved layout)
+                    // TODO: implement strided SwiGLU for fused gate+up
+                    ops::gemm_act_x_w(cublas.handle(),
+                        kimi_ws.norm_y.data(), *Lw.shared_gate_up_fused,
+                        kimi_ws.shared_gate.data(), total_tokens, 2 * shared_I, H);
+                } else {
+                    ops::gemm_act_x_w(cublas.handle(),
+                        kimi_ws.norm_y.data(), *Lw.shared_gate_proj,
+                        kimi_ws.shared_gate.data(), total_tokens, shared_I, H);
+                    ops::gemm_act_x_w(cublas.handle(),
+                        kimi_ws.norm_y.data(), *Lw.shared_up_proj,
+                        kimi_ws.shared_up.data(), total_tokens, shared_I, H);
+                }
+                {
+                    // For fused gate+up with N=1: gate at offset 0, up at offset shared_I
+                    const void* up_ptr = (Lw.shared_gate_up_fused != nullptr && total_tokens == 1)
+                        ? static_cast<const char*>(kimi_ws.shared_gate.data()) +
+                          static_cast<std::size_t>(shared_I) * sizeof(std::uint16_t)
+                        : kimi_ws.shared_up.data();
+                    kernels::launch_swiglu_bf16(
+                        kimi_ws.shared_gate.data(), up_ptr,
+                        kimi_ws.shared_act.data(), total_tokens * shared_I, stream);
+                }
                 ops::gemm_act_x_w(cublas.handle(),
                     kimi_ws.shared_act.data(), *Lw.shared_down_proj,
                     kimi_ws.shared_out.data(), total_tokens, H, shared_I);

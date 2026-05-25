@@ -120,10 +120,16 @@ KimiWeights bind_kimi(const LoadedModel& engine) {
         L.mlp_norm  = &must(engine, lp + "post_attention_layernorm.weight");
 
         const std::string ap = lp + "self_attn.";
-        L.q_a_proj = &must(engine, ap + "q_a_proj.weight");
+        L.q_kv_a_fused = maybe(engine, ap + "q_kv_a_proj.fused.weight");
+        if (L.q_kv_a_fused != nullptr) {
+            L.q_a_proj = nullptr;
+            L.kv_a_proj_with_mqa = nullptr;
+        } else {
+            L.q_a_proj = &must(engine, ap + "q_a_proj.weight");
+            L.kv_a_proj_with_mqa = &must(engine, ap + "kv_a_proj_with_mqa.weight");
+        }
         L.q_a_norm = &must(engine, ap + "q_a_layernorm.weight");
         L.q_b_proj = &must(engine, ap + "q_b_proj.weight");
-        L.kv_a_proj_with_mqa = &must(engine, ap + "kv_a_proj_with_mqa.weight");
         L.kv_a_norm = &must(engine, ap + "kv_a_layernorm.weight");
         L.kv_b_proj = &must(engine, ap + "kv_b_proj.weight");
         L.o_proj    = &must(engine, ap + "o_proj.weight");
@@ -200,18 +206,34 @@ KimiWeights bind_kimi(const LoadedModel& engine) {
         L.expert_down_scale_ptrs =
             DeviceBuffer<const void*>::from_host(down_scale_ptrs);
 
-        L.shared_gate_proj = maybe(engine, mp + "shared_experts.gate_proj.weight");
-        L.shared_up_proj   = maybe(engine, mp + "shared_experts.up_proj.weight");
+        L.shared_gate_up_fused = maybe(engine,
+            mp + "shared_experts.gate_up_proj.fused.weight");
+        if (L.shared_gate_up_fused != nullptr) {
+            L.shared_gate_proj = nullptr;
+            L.shared_up_proj = nullptr;
+        } else {
+            L.shared_gate_proj = maybe(engine, mp + "shared_experts.gate_proj.weight");
+            L.shared_up_proj   = maybe(engine, mp + "shared_experts.up_proj.weight");
+        }
         L.shared_down_proj = maybe(engine, mp + "shared_experts.down_proj.weight");
         if (cfg.n_shared_experts > 0) {
-            if (L.shared_gate_proj == nullptr || L.shared_up_proj == nullptr ||
-                L.shared_down_proj == nullptr) {
+            if (L.shared_gate_up_fused == nullptr &&
+                (L.shared_gate_proj == nullptr || L.shared_up_proj == nullptr)) {
                 throw std::runtime_error(
                     "kimi: shared experts configured but weights are missing at layer " +
                     std::to_string(li));
             }
-            require_rank2(*L.shared_gate_proj, mp + "shared_experts.gate_proj.weight");
-            require_rank2(*L.shared_up_proj, mp + "shared_experts.up_proj.weight");
+            if (L.shared_down_proj == nullptr) {
+                throw std::runtime_error(
+                    "kimi: shared_down_proj missing at layer " + std::to_string(li));
+            }
+            if (L.shared_gate_up_fused != nullptr) {
+                require_rank2(*L.shared_gate_up_fused,
+                    mp + "shared_experts.gate_up_proj.fused.weight");
+            } else {
+                require_rank2(*L.shared_gate_proj, mp + "shared_experts.gate_proj.weight");
+                require_rank2(*L.shared_up_proj, mp + "shared_experts.up_proj.weight");
+            }
             require_rank2(*L.shared_down_proj, mp + "shared_experts.down_proj.weight");
         }
     }
