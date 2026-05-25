@@ -22,6 +22,7 @@ struct Gemma4MtpRuntimeConfig {
     int min_drafts = 2;
     std::string compact_draft_rows = "auto";
     bool cuda_graph = true;
+    int max_draft_batch_rows = 0;
 };
 
 struct Gemma4MtpLayerWeights {

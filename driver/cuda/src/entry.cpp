@@ -2729,6 +2729,9 @@ int run_impl(int argc,
             return pie_cuda_driver::model::gemma4_decode_graph_layout(
                 gemma4_moe_ws);
         };
+        forward_fn.supports_small_prefill_graph =
+            kv_cache.format().is_native_bf16() &&
+            qwen35_small_spec_graph_tokens() > 0;
     } else if (is_gemma3n_arch) {
         // Loader-only milestone: bind_gemma3n loads every tensor; the
         // forward function (AltUp predict/correct + Laurel + activation

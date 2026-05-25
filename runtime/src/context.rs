@@ -749,6 +749,28 @@ pub fn append_working_page_tokens(
     adapter: Option<AdapterId>,
     adapter_seed: Option<i64>,
 ) {
+    append_working_page_tokens_with_repaired_spec_tail(
+        model_idx,
+        id,
+        tokens,
+        positions,
+        masks,
+        adapter,
+        adapter_seed,
+        0,
+    );
+}
+
+pub fn append_working_page_tokens_with_repaired_spec_tail(
+    model_idx: usize,
+    id: ContextId,
+    tokens: Vec<u32>,
+    positions: Vec<u32>,
+    masks: Vec<Brle>,
+    adapter: Option<AdapterId>,
+    adapter_seed: Option<i64>,
+    driver_repaired_spec_tail: u32,
+) {
     let _ = SERVICES.send(
         model_idx,
         Message::AppendWorkingPageTokens {
@@ -758,7 +780,7 @@ pub fn append_working_page_tokens(
             masks,
             adapter,
             adapter_seed,
-            driver_repaired_spec_tail: 0,
+            driver_repaired_spec_tail,
             response: None,
         },
     );

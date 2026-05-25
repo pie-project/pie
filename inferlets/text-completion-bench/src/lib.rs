@@ -60,6 +60,8 @@ struct Input {
     wait_for_start: bool,
     #[serde(default)]
     system_speculation: Option<bool>,
+    #[serde(default)]
+    batch_concurrency: Option<usize>,
 }
 
 fn default_max_tokens() -> usize {
@@ -125,33 +127,42 @@ async fn main(input: Input) -> Result<Output> {
             session::send("ready");
             let _ = session::receive().wait_async().await;
         }
-        let futures = (0..batch_len).map(|i| {
-            let prompt = input
-                .prompts
-                .get(i)
-                .map(String::as_str)
-                .unwrap_or(input.prompt.as_str());
-            let prompt_tokens = if !prepared_prompt_tokens.is_empty() {
-                prepared_prompt_tokens.get(i).map(Vec::as_slice)
-            } else {
-                input.prompt_tokens_batch.get(i).map(Vec::as_slice)
-            };
-            run_one(&model, &input, prompt, prompt_tokens, &stop_tokens, false)
-        });
         let mut request_prompt_tokens = Vec::with_capacity(batch_len);
         let mut request_output_tokens = Vec::with_capacity(batch_len);
         let mut first_tokens: Vec<u32> = Vec::new();
-        for (i, result) in futures::future::join_all(futures)
-            .await
-            .into_iter()
-            .enumerate()
-        {
-            let result = result?;
-            if i == 0 {
-                first_tokens = result.tokens.clone();
+        let batch_concurrency = input
+            .batch_concurrency
+            .unwrap_or(batch_len)
+            .clamp(1, batch_len);
+        let mut offset = 0usize;
+        while offset < batch_len {
+            let end = (offset + batch_concurrency).min(batch_len);
+            let futures = (offset..end).map(|i| {
+                let prompt = input
+                    .prompts
+                    .get(i)
+                    .map(String::as_str)
+                    .unwrap_or(input.prompt.as_str());
+                let prompt_tokens = if !prepared_prompt_tokens.is_empty() {
+                    prepared_prompt_tokens.get(i).map(Vec::as_slice)
+                } else {
+                    input.prompt_tokens_batch.get(i).map(Vec::as_slice)
+                };
+                run_one(&model, &input, prompt, prompt_tokens, &stop_tokens, false)
+            });
+            for (j, result) in futures::future::join_all(futures)
+                .await
+                .into_iter()
+                .enumerate()
+            {
+                let result = result?;
+                if offset + j == 0 {
+                    first_tokens = result.tokens.clone();
+                }
+                request_prompt_tokens.push(result.num_prompt_tokens);
+                request_output_tokens.push(result.num_output_tokens);
             }
-            request_prompt_tokens.push(result.num_prompt_tokens);
-            request_output_tokens.push(result.num_output_tokens);
+            offset = end;
         }
         let text = if input.return_text {
             model.tokenizer().decode(&first_tokens).unwrap_or_default()

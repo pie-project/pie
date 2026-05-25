@@ -260,6 +260,12 @@ bool gemma4_dense_gate_up_fused_enabled(const HfConfig& cfg) {
            cfg.head_dim == 256;
 }
 
+bool gemma4_dense_gate_up_fused_for_row_decode(const HfConfig& cfg) {
+    const char* v = std::getenv("PIE_GEMMA4_DENSE_GATE_UP_FUSED");
+    if (v != nullptr && v[0] != '\0') return v[0] != '0';
+    return gemma4_dense_gate_up_fused_enabled(cfg);
+}
+
 bool gemma4_dense_qkv_fused_enabled() {
     static const bool enabled = [] {
         const char* v = std::getenv("PIE_GEMMA4_DENSE_QKV_FUSED");
@@ -1762,8 +1768,12 @@ void gemma4_forward_paged(
         dump_l0("mlp_norm_pre", ws.norm_x.data(),
                 static_cast<std::size_t>(N) * H);
 
-        if (layer.gate_up_proj_fused != nullptr &&
-            !ws.gate_up_fused.empty()) {
+        const bool use_gate_up_fused =
+            (!use_row_decode_path ||
+             gemma4_dense_gate_up_fused_for_row_decode(cfg)) &&
+            layer.gate_up_proj_fused != nullptr &&
+            !ws.gate_up_fused.empty();
+        if (use_gate_up_fused) {
             ops::gemm_act_x_wt_bf16_cublas(cublas.handle(),
                 ws.norm_x.data(), layer.gate_up_proj_fused->data(),
                 ws.gate_up_fused.data(), N, 2 * I, H);
@@ -1793,12 +1803,21 @@ void gemma4_forward_paged(
                 ws.gate.data(), ws.up.data(), ws.gate.data(),
                 N * I, stream);
         } else {
-            ops::gemm_act_x_wt_bf16(cublas.handle(),
-                ws.norm_x.data(), layer.gate_proj->data(), ws.gate.data(),
-                N, I, H);
-            ops::gemm_act_x_wt_bf16(cublas.handle(),
-                ws.norm_x.data(), layer.up_proj->data(),   ws.up.data(),
-                N, I, H);
+            if (use_row_decode_path) {
+                ops::gemm_act_x_wt_bf16_cublas(cublas.handle(),
+                    ws.norm_x.data(), layer.gate_proj->data(), ws.gate.data(),
+                    N, I, H);
+                ops::gemm_act_x_wt_bf16_cublas(cublas.handle(),
+                    ws.norm_x.data(), layer.up_proj->data(),   ws.up.data(),
+                    N, I, H);
+            } else {
+                ops::gemm_act_x_wt_bf16(cublas.handle(),
+                    ws.norm_x.data(), layer.gate_proj->data(), ws.gate.data(),
+                    N, I, H);
+                ops::gemm_act_x_wt_bf16(cublas.handle(),
+                    ws.norm_x.data(), layer.up_proj->data(),   ws.up.data(),
+                    N, I, H);
+            }
             kernels::launch_geglu_tanh_bf16(
                 ws.gate.data(), ws.up.data(), ws.gate.data(),
                 N * I, stream);

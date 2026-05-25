@@ -496,6 +496,8 @@ async def run(args: argparse.Namespace):
                 "prompt": prompts[indices[0]] if indices else args.prompt,
                 "prompts": [prompts[i] for i in indices],
             }
+            if args.concurrency and args.concurrency > 0:
+                inp["batch_concurrency"] = args.concurrency
             if prompt_token_ids is not None:
                 inp["prompt_tokens_batch"] = [prompt_token_ids[i] for i in indices]
             start = time.perf_counter()
@@ -632,6 +634,10 @@ async def run(args: argparse.Namespace):
         finally:
             wall = time.perf_counter() - start
             cuda_profiler_stop(args.cuda_profiler_capture)
+        if args.mode == "tput" and args.defer_start:
+            measured = [r.latency_s for r in results if r.ok]
+            if measured:
+                wall = max(measured)
 
         # Pull speculation counters out of the server's model status
         # so the bench output reflects what actually happened. Zero

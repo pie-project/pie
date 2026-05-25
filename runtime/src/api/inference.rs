@@ -22,6 +22,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::sync::oneshot;
+use tokio::sync::oneshot::error::TryRecvError;
 use wasmtime::component::Resource;
 use wasmtime_wasi::WasiView;
 use wasmtime_wasi::async_trait;
@@ -197,7 +198,7 @@ impl FutureOutput {
         }
     }
 
-    async fn append_lineage(&mut self) {
+    fn append_lineage(&mut self) {
         let Some(context_id) = self.context_id else {
             return;
         };
@@ -215,7 +216,7 @@ impl FutureOutput {
         }
         if !all_fill_tokens.is_empty() {
             let driver_repaired_spec_tail = self.spec_tokens_for_fill.len() as u32;
-            if let Err(e) = context::append_working_page_tokens_wait_with_repaired_spec_tail(
+            context::append_working_page_tokens_with_repaired_spec_tail(
                 self.model_id,
                 context_id,
                 all_fill_tokens,
@@ -224,15 +225,11 @@ impl FutureOutput {
                 self.adapter_id,
                 self.adapter_seed,
                 driver_repaired_spec_tail,
-            )
-            .await
-            {
-                tracing::warn!("append_working_page_tokens for ctx {context_id}: {e:#}");
-            }
+            );
         }
     }
 
-    async fn finish_ok(&mut self, output: ForwardOutput) {
+    fn finish_ok(&mut self, output: ForwardOutput) {
         if self.spec_tokens_for_fill.is_empty() {
             if let ForwardOutput::Tokens(tokens) = &output {
                 if tokens.len() > 1 {
@@ -250,7 +247,7 @@ impl FutureOutput {
                 }
             }
         }
-        self.append_lineage().await;
+        self.append_lineage();
         self.release_pin();
         self.result = Some(build_wit_output(output, &self.samplers));
         self.done = true;
@@ -288,9 +285,7 @@ impl Pollable for FutureOutput {
             let output = rx.await;
             self.rx = None;
             match output {
-                Ok(Ok(resp)) => {
-                    self.finish_ok(resp).await;
-                }
+                Ok(Ok(resp)) => self.finish_ok(resp),
                 Ok(Err(e)) => {
                     tracing::warn!("future output failed: {e:#}");
                     self.finish_empty();
@@ -300,7 +295,9 @@ impl Pollable for FutureOutput {
                 }
             }
         } else {
-            self.done = true;
+            // Another readiness probe may have already drained rx and
+            // be finishing lineage/result population. Treat rx=None while
+            // done=false as in-progress rather than completing empty.
         }
     }
 }
@@ -867,6 +864,26 @@ impl pie::core::inference::HostFutureOutput for InstanceState {
         this: Resource<FutureOutput>,
     ) -> Result<Option<pie::core::inference::Output>> {
         let result = self.ctx().table.get_mut(&this)?;
+        if !result.done {
+            if let Some(rx) = result.rx.as_mut() {
+                match rx.try_recv() {
+                    Ok(Ok(resp)) => {
+                        result.rx = None;
+                        result.finish_ok(resp);
+                    }
+                    Ok(Err(e)) => {
+                        result.rx = None;
+                        tracing::warn!("future output failed: {e:#}");
+                        result.finish_empty();
+                    }
+                    Err(TryRecvError::Closed) => {
+                        result.rx = None;
+                        result.finish_empty();
+                    }
+                    Err(TryRecvError::Empty) => {}
+                }
+            }
+        }
         if result.done {
             Ok(take(&mut result.result))
         } else {

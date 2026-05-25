@@ -185,10 +185,29 @@ int mtp_draft_tokens(int configured_drafts) {
 int qwen35_small_spec_graph_tokens() {
     static const int tokens = [] {
         const char* v = std::getenv("PIE_QWEN35_SPEC_VERIFY_GRAPH_N");
-        if (v == nullptr || v[0] == '\0') return 17;
+        if (v == nullptr || v[0] == '\0') return 64;
         return std::clamp(std::atoi(v), 0, 64);
     }();
     return tokens;
+}
+
+int small_spec_graph_max_requests() {
+    static const int requests = [] {
+        const char* v = std::getenv("PIE_SPEC_VERIFY_GRAPH_MAX_R");
+        if (v == nullptr || v[0] == '\0') return 16;
+        return std::clamp(std::atoi(v), 1, 512);
+    }();
+    return requests;
+}
+
+int small_spec_graph_min_requests(int max_requests) {
+    static const int configured = [] {
+        const char* v = std::getenv("PIE_SPEC_VERIFY_GRAPH_MIN_R");
+        if (v == nullptr || v[0] == '\0') return -1;
+        return std::clamp(std::atoi(v), 1, 512);
+    }();
+    if (configured > 0) return std::min(configured, max_requests);
+    return 1;
 }
 
 bool mtp_trace_enabled() {
@@ -1419,6 +1438,9 @@ void handle_fire_batch(
         }
 
         const int small_spec_graph_tokens = qwen35_small_spec_graph_tokens();
+        const int small_spec_graph_requests = small_spec_graph_max_requests();
+        const int small_spec_graph_min_r =
+            small_spec_graph_min_requests(small_spec_graph_requests);
         const bool pure_decode_graph_shape =
             executor.graph_cache != nullptr && is_pure_decode &&
             forward_fn.graph_safe;
@@ -1430,7 +1452,8 @@ void handle_fire_batch(
             forward_fn.graph_safe &&
             forward_fn.supports_small_prefill_graph &&
             small_spec_graph_tokens > 0 &&
-            R == 1 &&
+            R >= small_spec_graph_min_r &&
+            R <= small_spec_graph_requests &&
             N <= small_spec_graph_tokens &&
             kv_cache.format().is_native_bf16() &&
             !kv_cache.hnd_layout();
@@ -1593,8 +1616,13 @@ void handle_fire_batch(
         // forward body has produced logits.
         const auto outspec_view = view.output_spec_flags.as<std::uint8_t>();
         bool need_msgpack = false;
+        bool has_rich_sampler_slots = false;
         for (auto t : types_view) {
-            if (pie_cuda_driver::is_msgpack_only(t)) { need_msgpack = true; break; }
+            if (pie_cuda_driver::is_msgpack_only(t)) {
+                need_msgpack = true;
+                has_rich_sampler_slots = true;
+                break;
+            }
         }
         if (!need_msgpack) {
             for (auto f : outspec_view) {
@@ -1878,7 +1906,7 @@ void handle_fire_batch(
         }
         if (forward_fn.set_logits_argmax_only) {
             const bool logits_argmax_only =
-                !need_msgpack &&
+                !has_rich_sampler_slots &&
                 logit_masks_view.empty() &&
                 !any_topk_topp &&
                 all_slots_token &&
@@ -1891,13 +1919,15 @@ void handle_fire_batch(
         // graph-safe. Today that means llama-like pure decode, where the
         // per-fire attention plan is prepared before capture/replay and the
         // captured body observes stable device pointers.
-        const bool try_graphs =
-            graph_shape_ok && !have_custom_mask;
         const std::uint32_t graph_layout =
             forward_fn.graph_layout ? forward_fn.graph_layout() : 0u;
+        const bool prepared_small_spec_graph =
+            !small_spec_graph_shape || graph_layout != 0u;
+        const bool try_graphs =
+            graph_shape_ok && !have_custom_mask && prepared_small_spec_graph;
         const bool graph_captures_single_gpu_argmax =
             try_graphs && single_gpu_greedy_argmax &&
-            (graph_single_gpu_argmax_enabled() || small_spec_graph_shape);
+            graph_single_gpu_argmax_enabled();
         const std::uint32_t graph_variant =
             (tp_greedy_argmax ? 1u : 0u) |
             (graph_captures_single_gpu_argmax ? 2u : 0u) |
@@ -2137,18 +2167,20 @@ void handle_fire_batch(
                 mtp_draft_positions[static_cast<std::size_t>(r)] =
                     static_cast<std::uint32_t>(draft_pos);
             };
-            const ResponseSubpassContext sub_ctx{
-                ws,
-                R, num_sampling, engine.hf_config().vocab_size,
-                std::span<const std::uint32_t>(per_slot_type),
-                std::span<const float>(per_slot_temp),
-                std::span<const std::int32_t>(per_slot_top_k),
-                qo_view, sptr_view, sidx_view, rns_view,
-            };
-            gather_raw_logits(sub_ctx, per_req);
-            compute_entropy_slots(sub_ctx, per_req);
-            compute_logprob_slots(sub_ctx, view, per_req);
-            compute_dist_slots(sub_ctx, per_req);
+            if (has_rich_sampler_slots) {
+                const ResponseSubpassContext sub_ctx{
+                    ws,
+                    R, num_sampling, engine.hf_config().vocab_size,
+                    std::span<const std::uint32_t>(per_slot_type),
+                    std::span<const float>(per_slot_temp),
+                    std::span<const std::int32_t>(per_slot_top_k),
+                    qo_view, sptr_view, sidx_view, rns_view,
+                };
+                gather_raw_logits(sub_ctx, per_req);
+                compute_entropy_slots(sub_ctx, per_req);
+                compute_logprob_slots(sub_ctx, view, per_req);
+                compute_dist_slots(sub_ctx, per_req);
+            }
 
             // Per-request token list. For non-spec requests this is the
             // token-typed slots' samples. For spec requests we walk the

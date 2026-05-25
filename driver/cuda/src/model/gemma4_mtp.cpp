@@ -169,7 +169,7 @@ bool mtp_disable_layer_scalar() {
 int mtp_position_offset() {
     static const int offset = [] {
         const char* v = std::getenv("PIE_GEMMA4_MTP_POSITION_OFFSET");
-        return v == nullptr ? 0 : std::atoi(v);
+        return v == nullptr ? 1 : std::atoi(v);
     }();
     return offset;
 }
@@ -245,6 +245,12 @@ bool mtp_profile_enabled() {
 
 bool mtp_cuda_graph_enabled(const Gemma4MtpRuntimeConfig& runtime) {
     return env_bool_or("PIE_GEMMA4_MTP_CUDA_GRAPH", runtime.cuda_graph);
+}
+
+int mtp_max_draft_batch_rows(const Gemma4MtpRuntimeConfig& runtime) {
+    return std::max(0, env_int_or(
+        "PIE_GEMMA4_MTP_MAX_DRAFT_BATCH_ROWS",
+        runtime.max_draft_batch_rows));
 }
 
 std::uint64_t mtp_profile_print_limit() {
@@ -327,7 +333,7 @@ int mtp_argmax_parts() {
             v != nullptr && v[0] != '\0') {
             return std::clamp(std::atoi(v), 1, 8);
         }
-        return 4;
+        return 8;
     }();
     return parts;
 }
@@ -840,6 +846,7 @@ Gemma4MtpWeights load_gemma4_mtp_weights(
                          "PIE_GEMMA4_MTP_COMPACT_DRAFT_ROWS",
                          runtime.compact_draft_rows)
                   << " cuda_graph=" << (mtp_cuda_graph_enabled(runtime) ? "on" : "off")
+                  << " max_draft_batch_rows=" << mtp_max_draft_batch_rows(runtime)
                   << " argmax_parts=" << mtp_argmax_parts()
                   << " reverse_preproj=" << (mtp_reverse_preprojection_concat() ? "on" : "off")
                   << " layer_scalar=" << (mtp_disable_layer_scalar() ? "off" : "on")
@@ -938,6 +945,8 @@ void gemma4_mtp_draft(
 
     const int M = static_cast<int>(active_req.size());
     if (M <= 0) return;
+    const int max_draft_batch_rows = mtp_max_draft_batch_rows(runtime);
+    if (max_draft_batch_rows > 0 && M > max_draft_batch_rows) return;
     active_max_drafts = std::clamp(active_max_drafts, 1, max_drafts);
     const bool compact_draft_rows = mtp_compact_draft_rows_enabled(
         runtime, active_desired_drafts, active_max_drafts);

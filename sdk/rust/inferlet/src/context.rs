@@ -380,7 +380,8 @@ impl Context {
         if n == 0 {
             return;
         }
-        self.inner.truncate_working_page_tokens(n);
+        let keep = self.inner.working_page_token_count().saturating_sub(n);
+        self.inner.truncate_working_page_tokens(keep);
         // Re-sync from the host: truncation can release pages, and the
         // safe thing is to read the authoritative counts back.
         self.committed_pages = self.inner.committed_page_count();
