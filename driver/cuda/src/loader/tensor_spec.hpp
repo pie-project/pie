@@ -88,6 +88,19 @@ struct LoadExecutionStats {
     std::uint64_t cuda_free_after_bytes = 0;
     std::uint64_t cuda_actual_peak_delta_bytes = 0;
     std::size_t cuda_memory_samples = 0;
+    std::size_t h2d_copy_count = 0;
+    std::size_t h2d_bulk_copy_count = 0;
+    std::size_t h2d_pinned_copy_count = 0;
+    std::size_t slab_scatter_count = 0;
+    std::size_t slab_scatter_placements = 0;
+    std::uint64_t h2d_copy_bytes = 0;
+    std::uint64_t h2d_bulk_copy_bytes = 0;
+    std::uint64_t h2d_pinned_copy_bytes = 0;
+    std::uint64_t slab_scatter_source_bytes = 0;
+    std::uint64_t slab_scatter_payload_bytes = 0;
+    std::size_t copy_stream_flushes = 0;
+    std::size_t max_pending_copies_seen = 0;
+    std::size_t h2d_batch_calls = 0;
 };
 
 }  // namespace pie_cuda_driver

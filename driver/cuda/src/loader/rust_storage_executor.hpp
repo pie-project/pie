@@ -1,7 +1,9 @@
 #pragma once
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstdint>
+#include <iostream>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
@@ -19,10 +21,13 @@
 #define PIE_CUDA_RUST_STORAGE_EXECUTOR_HAS_CUDA 0
 #endif
 #if PIE_CUDA_RUST_STORAGE_EXECUTOR_HAS_CUDA
+#include <cuda_runtime.h>
+
 #include "cuda_check.hpp"
 #include "kernels/dtype_cast.hpp"
 #include "kernels/mxfp4_marlin.hpp"
 #include "kernels/quant_bf16_to_fp8.hpp"
+#include "kernels/slab_scatter.hpp"
 #ifdef PIE_CUDA_HAS_MARLIN
 #include "marlin_wrapper.hpp"
 #endif
@@ -49,6 +54,11 @@ public:
           quant_attachments_(std::move(quant_attachments))
     {}
 
+    ~RustStorageProgramExecutor()
+    {
+        destroy_copy_streams_noexcept();
+    }
+
     LoadExecutionStats execute(
         const pie_weight_loader::PieLoaderStorageProgramView& program)
     {
@@ -58,35 +68,71 @@ public:
             program.memory.temporary_peak_bytes;
         stats.planned_storage_temp_bytes = program.memory.temporary_peak_bytes;
         program_index_.reset(program);
+        init_persistent_arena(program);
+        active_stats_ = &stats;
+        const bool trace_executor =
+            std::getenv("PIE_CUDA_TRACE_STORAGE_EXECUTOR") != nullptr;
+        if (trace_executor) {
+            std::cerr << "[pie-driver-cuda] storage executor begin schedule="
+                      << program.schedule.len << " instrs=" << program.instrs.len
+                      << " buffers=" << program.buffers.len << "\n";
+        }
 
         for (std::size_t i = 0; i < program.schedule.len; ++i) {
             const std::uint32_t instr_id = program.schedule.ptr[i];
             const auto& instr = program_index_.instruction(instr_id);
+            if (trace_executor && (i < 128 || i % 1000 == 0 ||
+                    instr.kind != pie_weight_loader::PieLoaderStorageInstrKind::Allocate)) {
+                std::cerr << "[pie-driver-cuda] storage executor instr[" << i
+                          << "] id=" << instr.id
+                          << " kind=" << static_cast<int>(instr.kind)
+                          << " buffer=" << instr.buffer_id << "\n";
+            }
             switch (instr.kind) {
             case pie_weight_loader::PieLoaderStorageInstrKind::Allocate:
+                if (allocate_requires_copy_flush(instr)) {
+                    flush_copy_streams();
+                }
                 allocate(program, instr);
+                if (trace_executor && (i < 128 || i % 1000 == 0)) {
+                    std::cerr << "[pie-driver-cuda] storage executor allocated buffer="
+                              << instr.buffer_id << "\n";
+                }
                 break;
             case pie_weight_loader::PieLoaderStorageInstrKind::ExtentWrite:
-                extent_write(instr);
+                extent_write(instr, stats);
+                break;
+            case pie_weight_loader::PieLoaderStorageInstrKind::BulkExtentWrite:
+                bulk_extent_write(instr, stats);
+                break;
+            case pie_weight_loader::PieLoaderStorageInstrKind::SlabScatter:
+                flush_copy_streams();
+                slab_scatter(instr, stats);
                 break;
             case pie_weight_loader::PieLoaderStorageInstrKind::Finalize:
                 finalize(program, instr, stats);
                 break;
             case pie_weight_loader::PieLoaderStorageInstrKind::TileMap:
+                flush_copy_streams();
                 tile_map(instr, stats);
                 break;
             case pie_weight_loader::PieLoaderStorageInstrKind::CreateView:
+                flush_copy_streams();
                 create_view(program, instr);
                 break;
             case pie_weight_loader::PieLoaderStorageInstrKind::Release:
+                flush_copy_streams();
                 buffers_.erase(instr.buffer_id);
                 break;
             case pie_weight_loader::PieLoaderStorageInstrKind::Attach:
+                flush_copy_streams();
                 break;
             }
         }
+        flush_copy_streams();
         attach_quant_metadata();
         weights_.finalize();
+        active_stats_ = nullptr;
         return stats;
     }
 
@@ -142,6 +188,9 @@ private:
         const pie_weight_loader::PieLoaderStorageInstrView& instr)
     {
         const auto& buffer = program_index_.buffer(instr.buffer_id);
+        if (try_allocate_persistent_arena_view(buffer, program)) {
+            return;
+        }
         if (!buffer.has_tensor) {
             buffers_.emplace(
                 buffer.id,
@@ -176,8 +225,92 @@ private:
                 wl_cpp::i64_slice_to_vector(tensor.shape)));
     }
 
+    bool allocate_requires_copy_flush(
+        const pie_weight_loader::PieLoaderStorageInstrView& instr) const
+    {
+        const auto& buffer = program_index_.buffer(instr.buffer_id);
+        return !can_allocate_persistent_arena_view(buffer);
+    }
+
+    void init_persistent_arena(
+        const pie_weight_loader::PieLoaderStorageProgramView& program)
+    {
+        const char* disable = std::getenv("PIE_CUDA_DISABLE_WEIGHT_ARENA");
+        if (disable != nullptr && disable[0] != '\0' && disable[0] != '0') {
+            return;
+        }
+        if (program.memory.persistent_bytes == 0) {
+            return;
+        }
+        persistent_arena_name_ = "__pie.storage_arena.0";
+        DeviceTensor arena = DeviceTensor::allocate(
+            DType::UINT8,
+            {static_cast<std::int64_t>(program.memory.persistent_bytes)});
+        persistent_arena_base_ = static_cast<std::uint8_t*>(arena.data());
+        persistent_arena_bytes_ = arena.nbytes();
+        TensorDecl spec;
+        spec.name = persistent_arena_name_;
+        spec.dtype = DType::UINT8;
+        spec.shape = {static_cast<std::int64_t>(persistent_arena_bytes_)};
+        spec.layout = TensorLayoutKind::Dense;
+        spec.ownership = TensorOwnershipKind::Owned;
+        spec.parallel = TensorParallelKind::Replicated;
+        weights_.insert(persistent_arena_name_, std::move(arena), std::move(spec));
+    }
+
+    bool try_allocate_persistent_arena_view(
+        const pie_weight_loader::PieLoaderBufferDeclView& buffer,
+        const pie_weight_loader::PieLoaderStorageProgramView& program)
+    {
+        if (!can_allocate_persistent_arena_view(buffer)) {
+            return false;
+        }
+        if (!buffer.has_persistent_offset) {
+            throw std::runtime_error(
+                "rust storage executor: persistent buffer missing arena offset");
+        }
+        const std::uint64_t aligned = buffer.persistent_offset;
+        const std::uint64_t end = aligned + buffer.bytes;
+        if (end < aligned || end > persistent_arena_bytes_) {
+            throw std::runtime_error(
+                "rust storage executor: persistent arena exhausted");
+        }
+
+        const auto& tensor = program_index_.tensor(buffer.tensor_id);
+        DType dtype = DType::UINT8;
+        std::vector<std::int64_t> shape;
+        if (tensor.encoding_kind ==
+            pie_weight_loader::PieLoaderEncodingKind::Quant) {
+            const DType physical = quant_physical_dtype(tensor);
+            if (physical == DType::FP8_E4M3 || physical == DType::INT8) {
+                dtype = physical;
+                shape = wl_cpp::i64_slice_to_vector(tensor.shape);
+            } else {
+                dtype = DType::UINT8;
+                shape = {static_cast<std::int64_t>(buffer.bytes)};
+            }
+        } else {
+            dtype = dtype_from_rust(tensor.dtype);
+            shape = wl_cpp::i64_slice_to_vector(tensor.shape);
+        }
+        buffers_.emplace(
+            buffer.id,
+            DeviceTensor::view(persistent_arena_base_ + aligned, dtype, shape));
+        arena_backing_names_[buffer.id] = persistent_arena_name_;
+        (void)program;
+        return true;
+    }
+
+    bool can_allocate_persistent_arena_view(
+        const pie_weight_loader::PieLoaderBufferDeclView& buffer) const
+    {
+        return persistent_arena_base_ != nullptr && buffer.has_tensor &&
+            !buffer.temporary && buffer.bytes != 0;
+    }
+
     void extent_write(
-        const pie_weight_loader::PieLoaderStorageInstrView& instr)
+        const pie_weight_loader::PieLoaderStorageInstrView& instr,
+        LoadExecutionStats& stats)
     {
         if (!instr.has_source || !instr.has_dest) {
             throw std::runtime_error(
@@ -206,12 +339,523 @@ private:
                 wl_cpp::extent_shape(instr.dest.stride));
             return;
         }
-        loader_.copy_storage_bytes_to_device(
+        copy_storage_bytes_to_device(
             instr.source.file_id,
             instr.source.file_offset + instr.source.stride.base_offset,
             instr.source.span_bytes,
             dst);
+        ++stats.h2d_copy_count;
+        stats.h2d_copy_bytes += instr.source.span_bytes;
     }
+
+    void bulk_extent_write(
+        const pie_weight_loader::PieLoaderStorageInstrView& instr,
+        LoadExecutionStats& stats)
+    {
+        if (persistent_arena_base_ == nullptr) {
+            throw std::runtime_error(
+                "rust storage executor: BulkExtentWrite requires persistent arena");
+        }
+        if (!instr.has_source || !instr.has_dest) {
+            throw std::runtime_error(
+                "rust storage executor: BulkExtentWrite missing source/dest");
+        }
+        const std::uint64_t dst_offset =
+            instr.dest.offset + instr.dest.stride.base_offset;
+        if (dst_offset > persistent_arena_bytes_ ||
+            instr.source.span_bytes > persistent_arena_bytes_ - dst_offset) {
+            throw std::runtime_error(
+                "rust storage executor: BulkExtentWrite destination out of bounds");
+        }
+        copy_storage_bytes_to_device(
+            instr.source.file_id,
+            instr.source.file_offset + instr.source.stride.base_offset,
+            instr.source.span_bytes,
+            persistent_arena_base_ + dst_offset);
+        ++stats.h2d_copy_count;
+        ++stats.h2d_bulk_copy_count;
+        stats.h2d_copy_bytes += instr.source.span_bytes;
+        stats.h2d_bulk_copy_bytes += instr.source.span_bytes;
+    }
+
+    void slab_scatter(
+        const pie_weight_loader::PieLoaderStorageInstrView& instr,
+        LoadExecutionStats& stats)
+    {
+#if PIE_CUDA_RUST_STORAGE_EXECUTOR_HAS_CUDA
+        if (persistent_arena_base_ == nullptr) {
+            throw std::runtime_error(
+                "rust storage executor: SlabScatter requires persistent arena");
+        }
+        if (instr.slab_placements.len == 0 || instr.slab_span_bytes == 0) {
+            return;
+        }
+        ensure_copy_streams();
+        ensure_slab_staging_capacity(instr.slab_span_bytes);
+        ensure_slab_placement_capacity(instr.slab_placements.len);
+
+        slab_placement_host_.resize(instr.slab_placements.len);
+        std::uint64_t payload_bytes = 0;
+        for (std::size_t i = 0; i < instr.slab_placements.len; ++i) {
+            const auto& placement = instr.slab_placements.ptr[i];
+            if (placement.src_offset > instr.slab_span_bytes ||
+                placement.bytes > instr.slab_span_bytes - placement.src_offset) {
+                throw std::runtime_error(
+                    "rust storage executor: SlabScatter source placement out of bounds");
+            }
+            if (placement.dest_offset > persistent_arena_bytes_ ||
+                placement.bytes > persistent_arena_bytes_ - placement.dest_offset) {
+                throw std::runtime_error(
+                    "rust storage executor: SlabScatter destination out of bounds");
+            }
+            slab_placement_host_[i] = SlabScatterPlacement{
+                placement.src_offset,
+                placement.dest_offset,
+                placement.bytes,
+            };
+            payload_bytes += placement.bytes;
+        }
+
+        cudaStream_t stream = copy_streams_[next_copy_stream_];
+        next_copy_stream_ = (next_copy_stream_ + 1) % copy_streams_.size();
+        loader_.copy_storage_bytes_to_device_async(
+            instr.slab_file_id,
+            instr.slab_file_offset,
+            instr.slab_span_bytes,
+            slab_staging_,
+            stream);
+        CUDA_CHECK(cudaMemcpyAsync(
+            slab_placements_device_,
+            slab_placement_host_.data(),
+            instr.slab_placements.len * sizeof(SlabScatterPlacement),
+            cudaMemcpyHostToDevice,
+            stream));
+        launch_slab_scatter(
+            static_cast<const std::uint8_t*>(slab_staging_),
+            persistent_arena_base_,
+            slab_placements_device_,
+            instr.slab_placements.len,
+            stream);
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+
+        ++stats.h2d_copy_count;
+        stats.h2d_copy_bytes += instr.slab_span_bytes;
+        ++stats.slab_scatter_count;
+        stats.slab_scatter_placements += instr.slab_placements.len;
+        stats.slab_scatter_source_bytes += instr.slab_span_bytes;
+        stats.slab_scatter_payload_bytes += payload_bytes;
+#else
+        (void)instr;
+        (void)stats;
+        throw std::runtime_error(
+            "rust storage executor: SlabScatter requires CUDA support");
+#endif
+    }
+
+    void copy_storage_bytes_to_device(
+        std::uint32_t shard_id,
+        std::uint64_t file_offset,
+        std::uint64_t span_bytes,
+        void* dst)
+    {
+#if PIE_CUDA_RUST_STORAGE_EXECUTOR_HAS_CUDA
+        if (copy_streams_enabled()) {
+            ensure_copy_streams();
+            if (pinned_staging_enabled()) {
+                if (enqueue_pinned_staged_copy(
+                        shard_id, file_offset, span_bytes, dst)) {
+                    return;
+                }
+            }
+            cudaStream_t stream = copy_streams_[next_copy_stream_];
+            next_copy_stream_ = (next_copy_stream_ + 1) % copy_streams_.size();
+            if (batched_copies_enabled()) {
+                enqueue_batched_copy(
+                    shard_id, file_offset, span_bytes, dst, stream);
+            } else {
+                loader_.copy_storage_bytes_to_device_async(
+                    shard_id, file_offset, span_bytes, dst, stream);
+            }
+            ++pending_copy_count_;
+            if (active_stats_ != nullptr) {
+                active_stats_->max_pending_copies_seen =
+                    std::max(
+                        active_stats_->max_pending_copies_seen,
+                        pending_copy_count_);
+            }
+            if (pending_copy_count_ >= max_pending_copies_) {
+                flush_copy_streams();
+            }
+            return;
+        }
+#endif
+        loader_.copy_storage_bytes_to_device(
+            shard_id, file_offset, span_bytes, dst);
+    }
+
+    bool pinned_staging_enabled() const
+    {
+        const char* enable =
+            std::getenv("PIE_CUDA_ENABLE_PINNED_WEIGHT_STAGING");
+        return enable != nullptr && enable[0] != '\0' && enable[0] != '0';
+    }
+
+    std::uint64_t pinned_staging_min_bytes() const
+    {
+        constexpr std::uint64_t kDefault = 256ull * 1024ull;
+        if (const char* env = std::getenv("PIE_CUDA_PINNED_WEIGHT_MIN_BYTES")) {
+            const auto parsed = std::strtoull(env, nullptr, 10);
+            if (parsed > 0) {
+                return parsed;
+            }
+        }
+        return kDefault;
+    }
+
+    std::uint64_t pinned_staging_pool_bytes() const
+    {
+        constexpr std::uint64_t kDefault = 512ull * 1024ull * 1024ull;
+        if (const char* env = std::getenv("PIE_CUDA_PINNED_WEIGHT_POOL_MB")) {
+            const auto parsed = std::strtoull(env, nullptr, 10);
+            if (parsed > 0) {
+                return parsed * 1024ull * 1024ull;
+            }
+        }
+        return kDefault;
+    }
+
+    std::size_t pinned_staging_slot_count() const
+    {
+#if PIE_CUDA_RUST_STORAGE_EXECUTOR_HAS_CUDA
+        std::size_t count = std::max<std::size_t>(copy_streams_.size(), 1);
+#else
+        std::size_t count = 1;
+#endif
+        if (const char* env = std::getenv("PIE_CUDA_PINNED_WEIGHT_SLOTS")) {
+            const auto parsed = std::strtoull(env, nullptr, 10);
+            if (parsed > 0) {
+                count = std::min<std::size_t>(parsed, 128);
+            }
+        }
+        return count;
+    }
+
+    bool batched_copies_enabled() const
+    {
+#if CUDART_VERSION >= 12080
+        const char* enable =
+            std::getenv("PIE_CUDA_ENABLE_BATCHED_WEIGHT_COPIES");
+        return enable != nullptr && enable[0] != '\0' && enable[0] != '0';
+#else
+        return false;
+#endif
+    }
+
+#if PIE_CUDA_RUST_STORAGE_EXECUTOR_HAS_CUDA
+    void enqueue_batched_copy(
+        std::uint32_t shard_id,
+        std::uint64_t file_offset,
+        std::uint64_t span_bytes,
+        void* dst,
+        cudaStream_t stream)
+    {
+        pending_copies_.push_back(PendingCopy{
+            dst,
+            const_cast<std::uint8_t*>(
+                loader_.storage_host_ptr(shard_id, file_offset, span_bytes)),
+            static_cast<std::size_t>(span_bytes),
+            stream,
+        });
+    }
+
+    bool enqueue_pinned_staged_copy(
+        std::uint32_t shard_id,
+        std::uint64_t file_offset,
+        std::uint64_t span_bytes,
+        void* dst)
+    {
+        const std::uint64_t min_bytes = pinned_staging_min_bytes();
+        if (span_bytes < min_bytes) {
+            return false;
+        }
+        ensure_pinned_slots();
+        const std::uint64_t pool_bytes = pinned_staging_pool_bytes();
+        const std::uint64_t max_slot_bytes =
+            pool_bytes / std::max<std::uint64_t>(pinned_slots_.size(), 1);
+        if (span_bytes > max_slot_bytes) {
+            return false;
+        }
+
+        PinnedSlot& slot = pinned_slots_[next_pinned_slot_];
+        next_pinned_slot_ = (next_pinned_slot_ + 1) % pinned_slots_.size();
+        if (slot.busy) {
+            flush_copy_streams();
+        }
+        if (slot.capacity < span_bytes) {
+            const std::uint64_t next_capacity = next_power_of_two(span_bytes);
+            if (pinned_pool_capacity_bytes_ - slot.capacity + next_capacity >
+                pool_bytes) {
+                return false;
+            }
+            if (slot.ptr != nullptr) {
+                CUDA_CHECK(cudaFreeHost(slot.ptr));
+                pinned_pool_capacity_bytes_ -= slot.capacity;
+                slot.ptr = nullptr;
+                slot.capacity = 0;
+            }
+            CUDA_CHECK(cudaMallocHost(
+                &slot.ptr,
+                static_cast<std::size_t>(next_capacity)));
+            slot.capacity = next_capacity;
+            pinned_pool_capacity_bytes_ += next_capacity;
+        }
+
+        cudaStream_t stream = copy_streams_[next_copy_stream_];
+        next_copy_stream_ = (next_copy_stream_ + 1) % copy_streams_.size();
+        try {
+            loader_.read_storage_bytes_to_host(
+                shard_id, file_offset, span_bytes, slot.ptr);
+        } catch (...) {
+            throw;
+        }
+        CUDA_CHECK(cudaMemcpyAsync(
+            dst,
+            slot.ptr,
+            span_bytes,
+            cudaMemcpyHostToDevice,
+            stream));
+        slot.stream = stream;
+        slot.busy = true;
+        slot.inflight_bytes = span_bytes;
+        pending_pinned_bytes_ += span_bytes;
+        ++pending_copy_count_;
+        if (active_stats_ != nullptr) {
+            ++active_stats_->h2d_pinned_copy_count;
+            active_stats_->h2d_pinned_copy_bytes += span_bytes;
+            active_stats_->max_pending_copies_seen =
+                std::max(
+                    active_stats_->max_pending_copies_seen,
+                    pending_copy_count_);
+        }
+        if (pending_copy_count_ >= max_pending_copies_) {
+            flush_copy_streams();
+        }
+        return true;
+    }
+
+    static std::uint64_t next_power_of_two(std::uint64_t value)
+    {
+        if (value <= 1) {
+            return 1;
+        }
+        --value;
+        for (std::size_t shift = 1; shift < 64; shift <<= 1) {
+            value |= value >> shift;
+        }
+        return value + 1;
+    }
+
+    void ensure_pinned_slots()
+    {
+        if (!pinned_slots_.empty()) {
+            return;
+        }
+        pinned_slots_.resize(pinned_staging_slot_count());
+    }
+#endif
+
+    bool copy_streams_enabled() const
+    {
+        const char* disable =
+            std::getenv("PIE_CUDA_DISABLE_PARALLEL_WEIGHT_COPIES");
+        return !(disable != nullptr && disable[0] != '\0' && disable[0] != '0');
+    }
+
+    void ensure_copy_streams()
+    {
+#if PIE_CUDA_RUST_STORAGE_EXECUTOR_HAS_CUDA
+        if (!copy_streams_.empty()) {
+            return;
+        }
+        std::size_t count = 8;
+        if (const char* env = std::getenv("PIE_CUDA_WEIGHT_COPY_STREAMS")) {
+            const auto parsed = std::strtoull(env, nullptr, 10);
+            if (parsed > 0) {
+                count = std::min<std::size_t>(parsed, 32);
+            }
+        }
+        copy_streams_.resize(count);
+        for (auto& stream : copy_streams_) {
+            CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+        }
+#endif
+    }
+
+    void flush_copy_streams()
+    {
+#if PIE_CUDA_RUST_STORAGE_EXECUTOR_HAS_CUDA
+        if (pending_copy_count_ == 0) {
+            return;
+        }
+        flush_batched_copies();
+        for (auto stream : copy_streams_) {
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+        }
+        release_inflight_pinned_slots();
+        if (active_stats_ != nullptr) {
+            ++active_stats_->copy_stream_flushes;
+        }
+        pending_copy_count_ = 0;
+#endif
+    }
+
+#if PIE_CUDA_RUST_STORAGE_EXECUTOR_HAS_CUDA
+    void flush_batched_copies()
+    {
+#if CUDART_VERSION >= 12080
+        if (pending_copies_.empty()) {
+            return;
+        }
+        cudaMemcpyAttributes attr{};
+        attr.srcAccessOrder = cudaMemcpySrcAccessOrderAny;
+        attr.flags = cudaMemcpyFlagDefault;
+        std::size_t attr_index = 0;
+        for (auto stream : copy_streams_) {
+            batched_dsts_.clear();
+            batched_srcs_.clear();
+            batched_sizes_.clear();
+            for (const auto& copy : pending_copies_) {
+                if (copy.stream != stream) {
+                    continue;
+                }
+                batched_dsts_.push_back(copy.dst);
+                batched_srcs_.push_back(copy.src);
+                batched_sizes_.push_back(copy.size);
+            }
+            if (batched_dsts_.empty()) {
+                continue;
+            }
+            std::size_t fail_index = SIZE_MAX;
+            CUDA_CHECK(cudaMemcpyBatchAsync(
+                batched_dsts_.data(),
+                batched_srcs_.data(),
+                batched_sizes_.data(),
+                batched_dsts_.size(),
+                &attr,
+                &attr_index,
+                1,
+                &fail_index,
+                stream));
+            if (active_stats_ != nullptr) {
+                ++active_stats_->h2d_batch_calls;
+            }
+        }
+        pending_copies_.clear();
+#else
+        pending_copies_.clear();
+#endif
+    }
+#endif
+
+#if PIE_CUDA_RUST_STORAGE_EXECUTOR_HAS_CUDA
+    void release_inflight_pinned_slots() noexcept
+    {
+        for (auto& slot : pinned_slots_) {
+            if (slot.busy) {
+                slot.busy = false;
+                slot.stream = nullptr;
+                slot.inflight_bytes = 0;
+            }
+        }
+        pending_pinned_bytes_ = 0;
+    }
+
+    void free_pinned_slots_noexcept() noexcept
+    {
+        for (auto& slot : pinned_slots_) {
+            if (slot.ptr != nullptr) {
+                (void)cudaFreeHost(slot.ptr);
+                slot.ptr = nullptr;
+            }
+            slot.capacity = 0;
+            slot.busy = false;
+            slot.stream = nullptr;
+            slot.inflight_bytes = 0;
+        }
+        pinned_slots_.clear();
+        pinned_pool_capacity_bytes_ = 0;
+        pending_pinned_bytes_ = 0;
+        next_pinned_slot_ = 0;
+    }
+#endif
+
+    void destroy_copy_streams_noexcept()
+    {
+#if PIE_CUDA_RUST_STORAGE_EXECUTOR_HAS_CUDA
+        free_slab_buffers_noexcept();
+        if (copy_streams_.empty()) {
+            return;
+        }
+        for (auto stream : copy_streams_) {
+            if (stream != nullptr) {
+                if (pending_copy_count_ != 0) {
+                    (void)cudaStreamSynchronize(stream);
+                }
+                (void)cudaStreamDestroy(stream);
+            }
+        }
+        free_pinned_slots_noexcept();
+        copy_streams_.clear();
+        pending_copy_count_ = 0;
+        next_copy_stream_ = 0;
+#endif
+    }
+
+#if PIE_CUDA_RUST_STORAGE_EXECUTOR_HAS_CUDA
+    void ensure_slab_staging_capacity(std::uint64_t bytes)
+    {
+        if (slab_staging_capacity_ >= bytes) {
+            return;
+        }
+        if (slab_staging_ != nullptr) {
+            CUDA_CHECK(cudaFree(slab_staging_));
+            slab_staging_ = nullptr;
+            slab_staging_capacity_ = 0;
+        }
+        CUDA_CHECK(cudaMalloc(&slab_staging_, static_cast<std::size_t>(bytes)));
+        slab_staging_capacity_ = bytes;
+    }
+
+    void ensure_slab_placement_capacity(std::size_t count)
+    {
+        if (slab_placement_capacity_ >= count) {
+            return;
+        }
+        if (slab_placements_device_ != nullptr) {
+            CUDA_CHECK(cudaFree(slab_placements_device_));
+            slab_placements_device_ = nullptr;
+            slab_placement_capacity_ = 0;
+        }
+        CUDA_CHECK(cudaMalloc(
+            &slab_placements_device_,
+            count * sizeof(SlabScatterPlacement)));
+        slab_placement_capacity_ = count;
+    }
+
+    void free_slab_buffers_noexcept() noexcept
+    {
+        if (slab_staging_ != nullptr) {
+            (void)cudaFree(slab_staging_);
+            slab_staging_ = nullptr;
+        }
+        if (slab_placements_device_ != nullptr) {
+            (void)cudaFree(slab_placements_device_);
+            slab_placements_device_ = nullptr;
+        }
+        slab_staging_capacity_ = 0;
+        slab_placement_capacity_ = 0;
+    }
+#endif
 
     void copy_strided_extent_to_device(
         const pie_weight_loader::PieLoaderStorageInstrView& instr,
@@ -396,7 +1040,7 @@ private:
                 throw std::runtime_error(
                     "rust storage executor: Cast source byte size mismatch");
             }
-            loader_.copy_storage_bytes_to_device(
+            copy_storage_bytes_to_device(
                 instr.source.file_id,
                 instr.source.file_offset,
                 instr.source.span_bytes,
@@ -443,7 +1087,7 @@ private:
                 const std::uint64_t elem = dtype_bytes(info.dtype);
                 const std::uint64_t row_bytes =
                     static_cast<std::uint64_t>(cols) * elem;
-                loader_.copy_storage_bytes_to_device(
+                copy_storage_bytes_to_device(
                     instr.source.file_id,
                     instr.source.file_offset + instr.source.stride.base_offset +
                         static_cast<std::uint64_t>(row_start) * row_bytes,
@@ -702,7 +1346,7 @@ private:
                     scratch.data(),
                     wl_cpp::extent_shape(instr.source.stride));
             } else {
-                loader_.copy_storage_bytes_to_device(
+                copy_storage_bytes_to_device(
                     instr.source.file_id,
                     instr.source.file_offset + instr.source.stride.base_offset,
                     instr.source.span_bytes,
@@ -1049,6 +1693,11 @@ private:
             spec.layout = TensorLayoutKind::View;
             spec.ownership = TensorOwnershipKind::BorrowedView;
             spec.backing_tensor = backing->second;
+        } else if (auto backing = arena_backing_names_.find(instr.buffer_id);
+                   backing != arena_backing_names_.end()) {
+            spec.layout = TensorLayoutKind::View;
+            spec.ownership = TensorOwnershipKind::BorrowedView;
+            spec.backing_tensor = backing->second;
         }
         stats.loaded_bytes += buffer.mapped().nbytes();
         const std::string runtime_name = wl_cpp::bytes_to_string(instr.name);
@@ -1091,6 +1740,45 @@ private:
     std::unordered_map<std::uint32_t, DeviceTensor> buffers_;
     std::unordered_map<std::uint32_t, std::string> finalized_buffer_names_;
     std::unordered_map<std::uint32_t, std::string> view_backing_names_;
+    std::unordered_map<std::uint32_t, std::string> arena_backing_names_;
+    std::string persistent_arena_name_;
+    std::uint8_t* persistent_arena_base_ = nullptr;
+    std::uint64_t persistent_arena_bytes_ = 0;
+#if PIE_CUDA_RUST_STORAGE_EXECUTOR_HAS_CUDA
+    std::vector<cudaStream_t> copy_streams_;
+#endif
+    std::size_t next_copy_stream_ = 0;
+    std::size_t pending_copy_count_ = 0;
+    std::size_t max_pending_copies_ = 512;
+    LoadExecutionStats* active_stats_ = nullptr;
+#if PIE_CUDA_RUST_STORAGE_EXECUTOR_HAS_CUDA
+    struct PendingCopy {
+        void* dst = nullptr;
+        void* src = nullptr;
+        std::size_t size = 0;
+        cudaStream_t stream = nullptr;
+    };
+    struct PinnedSlot {
+        void* ptr = nullptr;
+        std::uint64_t capacity = 0;
+        std::uint64_t inflight_bytes = 0;
+        cudaStream_t stream = nullptr;
+        bool busy = false;
+    };
+    std::vector<PendingCopy> pending_copies_;
+    std::vector<PinnedSlot> pinned_slots_;
+    std::size_t next_pinned_slot_ = 0;
+    std::uint64_t pinned_pool_capacity_bytes_ = 0;
+    std::uint64_t pending_pinned_bytes_ = 0;
+    std::vector<void*> batched_dsts_;
+    std::vector<void*> batched_srcs_;
+    std::vector<std::size_t> batched_sizes_;
+    void* slab_staging_ = nullptr;
+    std::uint64_t slab_staging_capacity_ = 0;
+    SlabScatterPlacement* slab_placements_device_ = nullptr;
+    std::size_t slab_placement_capacity_ = 0;
+    std::vector<SlabScatterPlacement> slab_placement_host_;
+#endif
     wl_cpp::StorageProgramIndex program_index_{"rust storage executor"};
 };
 

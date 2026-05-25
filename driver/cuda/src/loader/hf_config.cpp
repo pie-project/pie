@@ -82,6 +82,20 @@ HfConfig parse_hf_config(const std::filesystem::path& path) {
     cfg.num_attention_heads      = require<int>(j, "num_attention_heads", path_str);
     cfg.num_key_value_heads      = optional<int>(j, "num_key_value_heads", cfg.num_attention_heads);
     cfg.head_dim                 = optional<int>(j, "head_dim", cfg.hidden_size / cfg.num_attention_heads);
+    cfg.q_lora_rank              = optional<int>(j, "q_lora_rank", 0);
+    cfg.kv_lora_rank             = optional<int>(j, "kv_lora_rank", 0);
+    cfg.qk_nope_head_dim         = optional<int>(j, "qk_nope_head_dim", 0);
+    cfg.qk_rope_head_dim         = optional<int>(j, "qk_rope_head_dim", 0);
+    cfg.v_head_dim               = optional<int>(j, "v_head_dim", 0);
+    if ((cfg.model_type == "kimi_k2" || cfg.model_type == "deepseek_v2" ||
+         cfg.model_type == "deepseek_v3") &&
+        cfg.qk_nope_head_dim > 0 && cfg.qk_rope_head_dim > 0) {
+        // MLA attention has a query/key width that is independent from the
+        // value width and from hidden_size / num_heads. Keep `head_dim` as
+        // the QK width so RoPE/attention capability checks see the right
+        // logical dimension; `v_head_dim` carries the output-value width.
+        cfg.head_dim = cfg.qk_nope_head_dim + cfg.qk_rope_head_dim;
+    }
 
     // Round head_dim up to the nearest flashinfer-supported dispatch
     // value for kernel bookkeeping. Models in our supported set hit
@@ -213,11 +227,20 @@ HfConfig parse_hf_config(const std::filesystem::path& path) {
     // and `num_experts_per_tok` for Mixtral / GPT-OSS; some configs use
     // `num_experts` instead.
     cfg.num_experts         = optional<int>(j, "num_local_experts",
-                                            optional<int>(j, "num_experts", 0));
+                                            optional<int>(j, "num_experts",
+                                            optional<int>(j, "n_routed_experts", 0)));
     // `num_experts_per_tok` is the canonical name (Mixtral / Qwen MoE);
     // Gemma-4 uses `top_k_experts`. Accept either.
     cfg.num_experts_per_tok = optional<int>(j, "num_experts_per_tok",
                                             optional<int>(j, "top_k_experts", 0));
+    cfg.first_k_dense_replace =
+        optional<int>(j, "first_k_dense_replace", 0);
+    cfg.n_shared_experts =
+        optional<int>(j, "n_shared_experts", 0);
+    cfg.norm_topk_prob =
+        optional<bool>(j, "norm_topk_prob", false);
+    cfg.routed_scaling_factor =
+        optional<float>(j, "routed_scaling_factor", 1.0f);
     // Gemma-4 26B-A4B sets `enable_moe_block: true` to flip its layers
     // from dense-MLP-only to dense + parallel MoE.
     cfg.gemma4_enable_moe   = optional<bool>(j, "enable_moe_block", false);
@@ -286,6 +309,12 @@ HfConfig parse_hf_config(const std::filesystem::path& path) {
         optional<int>(j, "moe_intermediate_size", 0);
     cfg.shared_expert_intermediate_size =
         optional<int>(j, "shared_expert_intermediate_size", 0);
+    if (cfg.shared_expert_intermediate_size == 0 &&
+        cfg.n_shared_experts > 0 &&
+        cfg.moe_intermediate_size > 0) {
+        cfg.shared_expert_intermediate_size =
+            cfg.n_shared_experts * cfg.moe_intermediate_size;
+    }
 
     // Qwen3.5 hybrid (linear-attention SSM) knobs. Defaults are zero so
     // non-qwen3.5 models leave the linear-attn dimensions unset; the
@@ -350,14 +379,19 @@ HfConfig parse_hf_config(const std::filesystem::path& path) {
     // qwen2_5_vl, gemma3 (multimodal variant has vision_config), …
     const bool has_vision_config =
         j_root.contains("vision_config") && j_root["vision_config"].is_object();
+    const bool is_kimi_k25_wrapper =
+        view.outer_model_type == "kimi_k25" && j_root.contains("text_config");
     const bool is_multimodal_wrapper =
-        has_vision_config && j_root.contains("text_config");
+        (has_vision_config && j_root.contains("text_config")) ||
+        is_kimi_k25_wrapper;
     if (is_multimodal_wrapper) {
         cfg.mm_lm_strip_prefix = "language_model.";
         cfg.mm_skip_prefixes = {
             "vision_tower.",
             "vision_model.",
+            "visual.",
             "multi_modal_projector.",
+            "mm_projector.",
         };
     }
 

@@ -30,7 +30,7 @@ fn empty_compile_returns_empty_program() {
     assert!(error.message.is_null());
 
     let view = unsafe { pie_loader_program_view(handle) };
-    assert_eq!(view.version, 1);
+    assert_eq!(view.version, 3);
     assert_eq!(view.tensors.len, 0);
     assert_eq!(view.buffers.len, 0);
     assert_eq!(view.instrs.len, 0);
@@ -168,14 +168,14 @@ fn dense_contract_lowers_to_storage_program() {
     assert_eq!(view.memory.device_write_bytes, 12);
     let instrs = unsafe { std::slice::from_raw_parts(view.instrs.ptr, view.instrs.len) };
     assert_eq!(instrs[0].kind, PieLoaderStorageInstrKind::Allocate);
-    assert_eq!(instrs[1].kind, PieLoaderStorageInstrKind::ExtentWrite);
+    assert_eq!(instrs[1].kind, PieLoaderStorageInstrKind::BulkExtentWrite);
     assert!(instrs[1].has_source);
     assert!(instrs[1].has_dest);
     assert_eq!(instrs[1].source.file_id, 0);
     assert_eq!(instrs[1].source.tensor_id, 7);
     assert_eq!(instrs[1].source.file_offset, 128);
     assert_eq!(instrs[1].source.span_bytes, 12);
-    assert_eq!(instrs[1].dest.buffer_id, 0);
+    assert_eq!(instrs[1].dest.offset, 0);
     assert_eq!(instrs[2].kind, PieLoaderStorageInstrKind::Finalize);
 
     unsafe {
@@ -533,13 +533,13 @@ fn byte_span_contract_lowers_to_explicit_extent_writes() {
     assert_eq!(view.tensors.len, 1);
     assert_eq!(view.buffers.len, 1);
     assert_eq!(instrs.len(), 5);
-    assert_eq!(instrs[1].kind, PieLoaderStorageInstrKind::ExtentWrite);
-    assert_eq!(instrs[1].source.file_offset, 68);
-    assert_eq!(instrs[1].dest.offset, 0);
-    assert_eq!(instrs[2].source.file_offset, 128);
-    assert_eq!(instrs[2].dest.offset, 12);
-    assert_eq!(instrs[3].source.file_offset, 64);
-    assert_eq!(instrs[3].dest.offset, 20);
+    assert_eq!(instrs[1].kind, PieLoaderStorageInstrKind::BulkExtentWrite);
+    assert_eq!(instrs[1].source.file_offset, 64);
+    assert_eq!(instrs[1].dest.offset, 20);
+    assert_eq!(instrs[2].source.file_offset, 68);
+    assert_eq!(instrs[2].dest.offset, 0);
+    assert_eq!(instrs[3].source.file_offset, 128);
+    assert_eq!(instrs[3].dest.offset, 12);
     assert_eq!(view.memory.persistent_bytes, 24);
     assert_eq!(view.memory.checkpoint_read_bytes, 24);
     assert_eq!(view.memory.device_write_bytes, 24);
@@ -647,21 +647,18 @@ fn join_and_select_contracts_lower_to_writes_and_view() {
     let instrs = unsafe { std::slice::from_raw_parts(view.instrs.ptr, view.instrs.len) };
     assert_eq!(view.tensors.len, 2);
     assert_eq!(view.buffers.len, 2);
-    assert_eq!(instrs.len(), 6);
+    assert_eq!(instrs.len(), 5);
     assert_eq!(instrs[0].kind, PieLoaderStorageInstrKind::Allocate);
-    assert_eq!(instrs[1].kind, PieLoaderStorageInstrKind::ExtentWrite);
+    assert_eq!(instrs[1].kind, PieLoaderStorageInstrKind::BulkExtentWrite);
     assert_eq!(instrs[1].source.tensor_id, 0);
     assert_eq!(instrs[1].source.file_offset, 64);
     assert_eq!(instrs[1].dest.offset, 0);
-    assert_eq!(instrs[2].kind, PieLoaderStorageInstrKind::ExtentWrite);
-    assert_eq!(instrs[2].source.tensor_id, 1);
-    assert_eq!(instrs[2].source.file_offset, 80);
-    assert_eq!(instrs[2].dest.offset, 16);
-    assert_eq!(instrs[3].kind, PieLoaderStorageInstrKind::Finalize);
-    assert_eq!(instrs[4].kind, PieLoaderStorageInstrKind::CreateView);
-    assert!(instrs[4].has_dest);
-    assert_eq!(instrs[4].dest.offset, 8);
-    assert_eq!(instrs[5].kind, PieLoaderStorageInstrKind::Finalize);
+    assert_eq!(instrs[1].source.span_bytes, 32);
+    assert_eq!(instrs[2].kind, PieLoaderStorageInstrKind::Finalize);
+    assert_eq!(instrs[3].kind, PieLoaderStorageInstrKind::CreateView);
+    assert!(instrs[3].has_dest);
+    assert_eq!(instrs[3].dest.offset, 8);
+    assert_eq!(instrs[4].kind, PieLoaderStorageInstrKind::Finalize);
     assert_eq!(view.memory.persistent_bytes, 32);
     assert_eq!(view.memory.checkpoint_read_bytes, 32);
     assert_eq!(view.memory.device_write_bytes, 32);
@@ -714,7 +711,7 @@ fn empty_runtime_abi_builds_default_tp_row_contracts() {
         unsafe { std::slice::from_raw_parts(tensors_view[0].shape.ptr, tensors_view[0].shape.len) };
     assert_eq!(final_shape, &[2, 4]);
     let instrs = unsafe { std::slice::from_raw_parts(view.instrs.ptr, view.instrs.len) };
-    assert_eq!(instrs[1].kind, PieLoaderStorageInstrKind::ExtentWrite);
+    assert_eq!(instrs[1].kind, PieLoaderStorageInstrKind::BulkExtentWrite);
     assert_eq!(instrs[1].source.file_offset, 80);
     assert_eq!(instrs[1].source.span_bytes, 16);
 

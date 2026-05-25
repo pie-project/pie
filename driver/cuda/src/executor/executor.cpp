@@ -37,6 +37,7 @@
 #include "ops/gemm.hpp"
 #include "kernels/argmax.hpp"
 #include "kernels/sample_temp.hpp"
+#include "kernels/scatter_int32.hpp"
 #include "sampler_type.hpp"
 #include "sampling_dispatch.hpp"
 #include "spec_expansion.hpp"
@@ -952,8 +953,13 @@ void handle_fire_batch(
         // forward body has produced logits.
         const auto outspec_view = view.output_spec_flags.as<std::uint8_t>();
         bool need_msgpack = false;
+        bool response_logits_required = false;
         for (auto t : types_view) {
-            if (pie_cuda_driver::is_msgpack_only(t)) { need_msgpack = true; break; }
+            if (pie_cuda_driver::is_msgpack_only(t)) {
+                need_msgpack = true;
+                response_logits_required = true;
+                break;
+            }
         }
         if (!need_msgpack) {
             for (auto f : outspec_view) {
@@ -988,7 +994,7 @@ void handle_fire_batch(
         bool fast_dense_greedy_argmax =
             executor.tp_comm == nullptr &&
             !have_custom_mask &&
-            !need_msgpack &&
+            !response_logits_required &&
             !has_spec_drafts &&
             logit_masks_view.empty() &&
             is_pure_decode &&
@@ -1112,46 +1118,73 @@ void handle_fire_batch(
                 }
             }
         }
+        const bool sampling_filters_active = any_topk_topp && !all_rows_greedy;
         const bool compact_logit_rows =
             executor.forward_fn.supports_compact_logits &&
             !is_pure_decode &&
             !have_custom_mask &&
-            !need_msgpack &&
+            !response_logits_required &&
             !has_spec_drafts &&
             logit_masks_view.empty() &&
-            !any_topk_topp &&
+            !sampling_filters_active &&
             all_slots_token &&
             num_sampling > 0 &&
             num_sampling < N;
+        const bool tp_greedy_rows_supported =
+            sample_rows_are_dense ||
+            compact_logit_rows;
         const bool tp_greedy_argmax =
             executor.tp_comm != nullptr &&
             executor.tp_comm->world_size() <= 8 &&
             forward_fn.supports_tp_greedy_argmax &&
             !have_custom_mask &&
-            !need_msgpack &&
+            !response_logits_required &&
             !has_spec_drafts &&
             logit_masks_view.empty() &&
-            !any_topk_topp &&
+            !sampling_filters_active &&
             all_slots_token &&
             all_rows_greedy &&
-            is_pure_decode &&
-            sample_rows_are_dense;
+            tp_greedy_rows_supported;
         // Dense greedy decode can bypass the general sampler machinery: a
         // single argmax over logits produces the requested token output.
         const bool single_gpu_greedy_argmax =
             executor.tp_comm == nullptr &&
             !have_custom_mask &&
-            !need_msgpack &&
+            !response_logits_required &&
             !has_spec_drafts &&
             logit_masks_view.empty() &&
-            !any_topk_topp &&
+            !sampling_filters_active &&
             all_slots_token &&
             all_rows_greedy &&
             is_pure_decode &&
             sample_rows_are_dense;
         const int logit_rows_required =
             compact_logit_rows ? num_sampling : N;
-        const int prob_rows_required = any_topk_topp ? N : 0;
+        const int prob_rows_required = sampling_filters_active ? N : 0;
+        if (std::getenv("PIE_CUDA_DEBUG_TP_GREEDY") &&
+            forward_fn.supports_tp_greedy_argmax) {
+            std::cerr << "[pie-driver-cuda] tp_greedy predicates:"
+                      << " tp=" << (executor.tp_comm != nullptr)
+                      << " world=" << (executor.tp_comm ? executor.tp_comm->world_size() : 1)
+                      << " compact=" << compact_logit_rows
+                      << " dense_rows=" << sample_rows_are_dense
+                      << " rows_supported=" << tp_greedy_rows_supported
+                      << " filters=" << sampling_filters_active
+                      << " any_topk_topp=" << any_topk_topp
+                      << " all_token=" << all_slots_token
+                      << " all_greedy=" << all_rows_greedy
+                      << " msgpack=" << need_msgpack
+                      << " response_logits=" << response_logits_required
+                      << " custom_mask=" << have_custom_mask
+                      << " masks=" << !logit_masks_view.empty()
+                      << " spec=" << has_spec_drafts
+                      << " N=" << N
+                      << " R=" << R
+                      << " num_sampling=" << num_sampling
+                      << " is_pure_decode=" << is_pure_decode
+                      << " enabled=" << tp_greedy_argmax
+                      << "\n";
+        }
         if (logit_rows_required > tensor_rows(ws.logits)) {
             std::cerr << "[pie-driver-cuda] fire_batch needs "
                       << logit_rows_required
@@ -1239,9 +1272,9 @@ void handle_fire_batch(
         }
         if (forward_fn.set_logits_argmax_only) {
             const bool logits_argmax_only =
-                !need_msgpack &&
+                !response_logits_required &&
                 logit_masks_view.empty() &&
-                !any_topk_topp &&
+                !sampling_filters_active &&
                 all_slots_token &&
                 all_rows_greedy;
             forward_fn.set_logits_argmax_only(logits_argmax_only);
@@ -1253,7 +1286,8 @@ void handle_fire_batch(
         // per-fire attention plan is prepared before capture/replay and the
         // captured body observes stable device pointers.
         const bool try_graphs =
-            graph_shape_ok && !have_custom_mask;
+            graph_shape_ok && is_pure_decode && !have_custom_mask &&
+            forward_fn.graph_safe;
         const std::uint32_t graph_layout =
             forward_fn.graph_layout ? forward_fn.graph_layout() : 0u;
         const bool graph_captures_single_gpu_argmax =
@@ -1334,10 +1368,23 @@ void handle_fire_batch(
         // Running the current fire's sampling kernel after the graph launch
         // keeps that R-only key valid.
         if (tp_greedy_argmax) {
-            kernels::launch_select_global_argmax_pairs(
-                reinterpret_cast<const std::uint64_t*>(ws.greedy_pairs_all.data()),
-                reinterpret_cast<std::int32_t*>(pi.sampled.data()),
-                N, executor.tp_comm->world_size(), cublas.stream());
+            const int argmax_rows = compact_logit_rows ? num_sampling : N;
+            if (compact_logit_rows) {
+                kernels::launch_select_global_argmax_pairs(
+                    reinterpret_cast<const std::uint64_t*>(ws.greedy_pairs_all.data()),
+                    reinterpret_cast<std::int32_t*>(ws.greedy_tokens.data()),
+                    argmax_rows, executor.tp_comm->world_size(), cublas.stream());
+                kernels::launch_scatter_int32(
+                    reinterpret_cast<std::int32_t*>(pi.sampled.data()),
+                    pi.sample_idx.data(),
+                    reinterpret_cast<const std::int32_t*>(ws.greedy_tokens.data()),
+                    num_sampling, N, cublas.stream());
+            } else {
+                kernels::launch_select_global_argmax_pairs(
+                    reinterpret_cast<const std::uint64_t*>(ws.greedy_pairs_all.data()),
+                    reinterpret_cast<std::int32_t*>(pi.sampled.data()),
+                    argmax_rows, executor.tp_comm->world_size(), cublas.stream());
+            }
         } else if (graph_captures_single_gpu_argmax) {
             // The captured forward graph already wrote pi.sampled.
         } else if (single_gpu_greedy_argmax && !graph_captures_single_gpu_argmax) {

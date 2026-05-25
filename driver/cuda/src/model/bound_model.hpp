@@ -6,6 +6,7 @@
 #include "model/gemma3n.hpp"
 #include "model/gemma4.hpp"
 #include "model/gpt_oss.hpp"
+#include "model/kimi.hpp"
 #include "model/mistral3.hpp"
 #include "model/mixtral.hpp"
 #include "model/qwen3.hpp"
@@ -23,6 +24,7 @@ struct BoundCudaModel {
         Mixtral,
         Qwen3_5,
         Qwen3_5Moe,
+        Kimi,
     };
 
     Kind kind = Kind::LlamaLike;
@@ -34,6 +36,7 @@ struct BoundCudaModel {
     MixtralWeights mixtral;
     Qwen3_5Weights qwen3_5;
     Qwen3_5MoeWeights qwen3_5_moe;
+    KimiWeights kimi;
 
     bool is_gemma() const noexcept { return kind == Kind::Gemma; }
     bool is_gemma4() const noexcept { return kind == Kind::Gemma4; }
@@ -41,6 +44,7 @@ struct BoundCudaModel {
     bool is_mixtral() const noexcept { return kind == Kind::Mixtral; }
     bool is_qwen3_5() const noexcept { return kind == Kind::Qwen3_5; }
     bool is_qwen3_5_moe() const noexcept { return kind == Kind::Qwen3_5Moe; }
+    bool is_kimi() const noexcept { return kind == Kind::Kimi; }
     bool is_llama_like() const noexcept { return kind == Kind::LlamaLike; }
 
     std::size_t num_layers() const noexcept;

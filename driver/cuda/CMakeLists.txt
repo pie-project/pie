@@ -104,6 +104,7 @@ add_library(pie_driver_cuda_lib STATIC
   src/spec_expansion.cpp
   src/tensor.cpp
   src/model/weight_store.cpp
+  src/mla_cache.cpp
   src/model/loaded_model.cpp
   src/model/bound_model.cpp
   ../common/src/safetensors_manifest.cpp
@@ -119,6 +120,8 @@ add_library(pie_driver_cuda_lib STATIC
   src/model/gemma3n.cpp
   src/model/mistral3.cpp
   src/model/gpt_oss.cpp
+  src/model/kimi.cpp
+  src/model/kimi_forward.cpp
   src/model/qwen3_5.cpp
   src/kv_cache_format.cpp
   src/kv_cache.cpp
@@ -136,8 +139,11 @@ add_library(pie_driver_cuda_lib STATIC
   src/kernels/rope.cu
   src/kernels/split_packed.cu
   src/kernels/scatter_int32.cu
+  src/kernels/slab_scatter.cu
   src/kernels/argmax.cu
   src/kernels/kv_paged.cu
+  src/kernels/mla_paged.cu
+  src/kernels/kimi_mla.cu
   src/kernels/sample_temp.cu
   src/kernels/sample_flashinfer.cu
   src/kernels/entropy.cu
@@ -151,6 +157,7 @@ add_library(pie_driver_cuda_lib STATIC
   src/kernels/softcap.cu
   src/kernels/scalar_mul.cu
   src/kernels/dequant_fp4.cu
+  src/kernels/dequant_wna16.cu
   src/kernels/mxfp4_marlin.cu
   src/kernels/dequant_fp8.cu
   src/kernels/dtype_cast.cu
@@ -173,6 +180,7 @@ add_library(pie_driver_cuda_lib STATIC
   src/distributed.cpp
   ${PIE_CUDA_CUSTOM_ALL_REDUCE_SOURCE}
   src/ops/attention_flashinfer.cu
+  src/ops/attention_mla.cu
   ${PIE_CUDA_FLASHINFER_HOPPER_SOURCE}
 )
 

@@ -100,6 +100,7 @@ def build_config(args: argparse.Namespace):
             "gpu_mem_utilization": args.gpu_mem_util,
             "memory_profile": args.memory_profile,
             "kv_cache_dtype": args.kv_cache_dtype,
+            "ready_timeout_s": float(args.server_startup_timeout),
         }
         if args.runtime_quant:
             driver_options["runtime_quant"] = args.runtime_quant

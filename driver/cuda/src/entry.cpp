@@ -46,11 +46,13 @@
 #include "kernels/sample_flashinfer.hpp"
 #include "kernels/sample_temp.hpp"
 #include "kv_cache.hpp"
+#include "mla_cache.hpp"
 #include "model/bound_model.hpp"
 #include "model/gemma2.hpp"
 #include "model/gemma3n.hpp"
 #include "model/gemma4.hpp"
 #include "model/gpt_oss.hpp"
+#include "model/kimi_forward.hpp"
 #include "model/llama_like.hpp"
 #include "model/mixtral.hpp"
 #include "model/qwen3.hpp"
@@ -342,6 +344,81 @@ std::size_t workspace_bytes(const pie_cuda_driver::HfConfig& cfg,
         bytes += bf16(n * Hk_pad);
         bytes += bf16(n * Hq_pad);
     }
+    return bytes;
+}
+
+std::size_t kimi_workspace_bytes(const pie_cuda_driver::HfConfig& cfg,
+                                 int N,
+                                 int output_rows,
+                                 int tp_size) {
+    const auto bf16 = [](std::size_t elems) { return elems * 2; };
+    const auto fp32 = [](std::size_t elems) { return elems * 4; };
+    const auto i32 = [](std::size_t elems) { return elems * 4; };
+    const int T = std::max(1, tp_size);
+    const std::size_t n = static_cast<std::size_t>(std::max(1, N));
+    const std::size_t o =
+        static_cast<std::size_t>(std::max(1, output_rows));
+    const std::size_t H = static_cast<std::size_t>(cfg.hidden_size);
+    const std::size_t local_heads =
+        static_cast<std::size_t>(cfg.num_attention_heads / T);
+    const std::size_t q_nope = static_cast<std::size_t>(cfg.qk_nope_head_dim);
+    const std::size_t q_rope = static_cast<std::size_t>(cfg.qk_rope_head_dim);
+    const std::size_t v_dim = static_cast<std::size_t>(cfg.v_head_dim);
+    const std::size_t q_lora = static_cast<std::size_t>(cfg.q_lora_rank);
+    const std::size_t kv_lora = static_cast<std::size_t>(cfg.kv_lora_rank);
+    const std::size_t dense_I =
+        cfg.intermediate_size > 0
+            ? static_cast<std::size_t>(cfg.intermediate_size / T)
+            : 0;
+    const std::size_t routed_I =
+        cfg.moe_intermediate_size > 0
+            ? static_cast<std::size_t>(cfg.moe_intermediate_size / T)
+            : 0;
+    const std::size_t shared_I =
+        cfg.shared_expert_intermediate_size > 0
+            ? static_cast<std::size_t>(cfg.shared_expert_intermediate_size / T)
+            : 0;
+    const std::size_t max_I = std::max<std::size_t>(1, std::max(dense_I, routed_I));
+    const std::size_t topk = static_cast<std::size_t>(
+        std::max(1, cfg.num_experts_per_tok));
+    const std::size_t routes = n * topk;
+
+    std::size_t bytes = 0;
+    bytes += bf16(n * H);                                      // y
+    bytes += bf16(n * H);                                      // norm_x
+    bytes += bf16(n * q_lora);                                 // q_a
+    bytes += bf16(n * local_heads * (q_nope + q_rope));         // q_b
+    bytes += bf16(n * local_heads * q_nope);                    // q_nope
+    bytes += bf16(n * (kv_lora + q_rope));                      // kv_a_mqa
+    bytes += bf16(n * kv_lora);                                 // kv_c
+    bytes += bf16(n * q_rope);                                  // k_pe
+    bytes += bf16(n * local_heads * kv_lora);                   // q_nope_latent
+    bytes += bf16(n * local_heads * q_rope);                    // q_pe
+    bytes += bf16(n * local_heads * kv_lora);                   // attn_latent
+    bytes += bf16(n * local_heads * v_dim);                     // attn_v
+    bytes += bf16(n * H);                                      // attn_out
+    bytes += bf16(n * H);                                      // norm_y
+    bytes += bf16(n * max_I);                                  // gate
+    bytes += bf16(n * max_I);                                  // up
+    bytes += bf16(std::max<std::size_t>(1, routed_I) * H);      // expert_gate_w
+    bytes += bf16(std::max<std::size_t>(1, routed_I) * H);      // expert_up_w
+    bytes += bf16(H * std::max<std::size_t>(1, routed_I));      // expert_down_w
+    bytes += bf16(n * std::max(1, cfg.num_experts));            // router_logits
+    bytes += i32(n * topk);                                    // topk_idx
+    bytes += fp32(n * topk);                                   // topk_weights
+    bytes += i32(routes);                                      // route_idx
+    bytes += fp32(routes);                                     // route_w
+    bytes += bf16(routes * H);                                 // expert_in
+    bytes += bf16(routes * max_I);                             // expert_gate
+    bytes += bf16(routes * max_I);                             // expert_up
+    bytes += bf16(routes * H);                                 // expert_out
+    bytes += bf16(n * H);                                      // moe_out
+    bytes += bf16(n * std::max<std::size_t>(1, shared_I));      // shared_gate
+    bytes += bf16(n * std::max<std::size_t>(1, shared_I));      // shared_up
+    bytes += bf16(n * std::max<std::size_t>(1, shared_I));      // shared_act
+    bytes += bf16(n * H);                                      // shared_out
+    bytes += bf16(o * static_cast<std::size_t>(cfg.vocab_size));
+    bytes += fp32(o * static_cast<std::size_t>(cfg.vocab_size));
     return bytes;
 }
 
@@ -811,6 +888,7 @@ CudaMemoryPlan plan_cuda_memory(
     bool is_gemma4_arch,
     const std::vector<int>& gemma4_per_layer_head_dim,
     const std::vector<int>& gemma4_kv_source_layer,
+    bool is_kimi_arch,
     bool is_qwen3_5_arch,
     bool is_qwen3_5_moe_arch,
     int qwen3_5_linear_layers,
@@ -858,7 +936,13 @@ CudaMemoryPlan plan_cuda_memory(
         derive_kv_page_size_candidates(cfg, hf, prop);
 
     const std::size_t per_kv_token_bytes =
-        is_gemma4_arch
+        is_kimi_arch
+            ? static_cast<std::size_t>(hf.num_hidden_layers) *
+                  (static_cast<std::size_t>(hf.kv_lora_rank +
+                                            hf.qk_rope_head_dim) *
+                       pie_cuda_driver::dtype_bytes(pie_cuda_driver::DType::BF16) +
+                   kv_cache_device_bytes_per_page(kv_format, 1, 1, 1))
+        : is_gemma4_arch
             ? kv_page_bytes_per_layer(hf, gemma4_per_layer_head_dim,
                                       gemma4_kv_source_layer, tp_size,
                                       kv_format)
@@ -952,6 +1036,12 @@ CudaMemoryPlan plan_cuda_memory(
         1024,
         512,
     };
+    if (is_kimi_arch) {
+        Ns.push_back(256);
+        Ns.push_back(128);
+        Ns.push_back(64);
+        Ns.push_back(32);
+    }
     if (policy_profile == "throughput") {
         Ns.push_back(4 * prefill_target);
     }
@@ -977,6 +1067,12 @@ CudaMemoryPlan plan_cuda_memory(
         64,
         32,
     };
+    if (is_kimi_arch) {
+        Rs.push_back(16);
+        Rs.push_back(8);
+        Rs.push_back(4);
+        Rs.push_back(1);
+    }
     if (policy_profile == "throughput" || score_as_auto) {
         Rs.push_back(4 * decode_target);
     }
@@ -1001,8 +1097,10 @@ CudaMemoryPlan plan_cuda_memory(
                                        std::max(1024, R0 * 64) + 7) / 8)));
             const int output_rows = R0;
             std::size_t arena = 0;
-            arena += workspace_bytes(
-                hf, N, output_rows, max_intermediate, max_Hq, max_Hk);
+            arena += is_kimi_arch
+                ? kimi_workspace_bytes(hf, N, output_rows, tp_size)
+                : workspace_bytes(
+                      hf, N, output_rows, max_intermediate, max_Hq, max_Hk);
             if (is_qwen3_5_arch || is_qwen3_5_moe_arch) {
                 arena += qwen3_5_la_workspace_bytes(hf, N, tp_size);
             }
@@ -1065,10 +1163,14 @@ CudaMemoryPlan plan_cuda_memory(
                               : 608.0;
             const double score_kv_horizon =
                 score_as_auto ? (low_horizon_kv_heavy ? 384.0 : 544.0) : 608.0;
-            const std::size_t min_kv_tokens = std::max<std::size_t>(
-                32768,
-                static_cast<std::size_t>(
-                    std::ceil(static_cast<double>(R) * min_kv_horizon)));
+            const std::size_t min_kv_tokens = is_kimi_arch
+                ? std::max<std::size_t>(
+                      policy_profile == "latency" ? 1024 : 4096,
+                      static_cast<std::size_t>(R) * 128)
+                : std::max<std::size_t>(
+                      32768,
+                      static_cast<std::size_t>(
+                          std::ceil(static_cast<double>(R) * min_kv_horizon)));
             if (kv_tokens < min_kv_tokens) continue;
 
             CudaMemoryPlan p;
@@ -1952,7 +2054,8 @@ int run_impl(int argc,
          || mt == "gemma2"
          || mt == "gemma3" || mt == "gemma3_text"
          || mt == "gemma4" || mt == "gemma4_text"
-         || mt == "gemma3n" || mt == "gemma3n_text";
+         || mt == "gemma3n" || mt == "gemma3n_text"
+         || mt == "kimi_k2";
         if (!supported) {
             std::cerr << "[pie-driver-cuda] arch '" << mt
                       << "' not yet supported (Qwen 2/3, Llama-3, "
@@ -1970,6 +2073,7 @@ int run_impl(int argc,
     auto& weights_mixtral = bound_model.mixtral;
     auto& weights_qwen3_5 = bound_model.qwen3_5;
     auto& weights_qwen3_5_moe = bound_model.qwen3_5_moe;
+    auto& weights_kimi = bound_model.kimi;
 
     const bool is_gemma_arch = bound_model.is_gemma();
     const bool is_gemma4_arch = bound_model.is_gemma4();
@@ -1977,6 +2081,7 @@ int run_impl(int argc,
     const bool is_mixtral_arch = bound_model.is_mixtral();
     const bool is_qwen3_5_arch = bound_model.is_qwen3_5();
     const bool is_qwen3_5_moe_arch = bound_model.is_qwen3_5_moe();
+    const bool is_kimi_arch = bound_model.is_kimi();
 
     const std::size_t num_layers_bound = bound_model.num_layers();
     if (verbose) {
@@ -2059,7 +2164,7 @@ int run_impl(int argc,
     const CudaMemoryPlan mem_plan = plan_cuda_memory(
         cfg, engine.hf_config(), max_mlp_intermediate, max_Hq, max_Hk,
         is_gemma4_arch, weights_gemma4.per_layer_head_dim,
-        weights_gemma4.kv_source_layer, is_qwen3_5_arch,
+        weights_gemma4.kv_source_layer, is_kimi_arch, is_qwen3_5_arch,
         is_qwen3_5_moe_arch, qwen3_5_linear_layers,
         kv_format, runtime_quant_scratch_base, verbose);
     const int max_workspace_tokens = mem_plan.max_workspace_tokens;
@@ -2079,8 +2184,24 @@ int run_impl(int argc,
         max_mlp_intermediate, max_Hq, max_Hk,
         mem_plan.capacity.max_logit_rows);
 
+    auto kimi_ws =
+        is_kimi_arch
+            ? pie_cuda_driver::model::KimiWorkspace::allocate(
+                  engine.hf_config(), max_workspace_tokens,
+                  mem_plan.capacity.max_logit_rows,
+                  local_tp_size)
+            : pie_cuda_driver::model::KimiWorkspace{};
+
     auto kv_cache =
-        is_gemma4_arch
+        is_kimi_arch
+            ? pie_cuda_driver::KvCache::allocate(
+                  engine.hf_config().num_hidden_layers,
+                  physical_kv_pages,
+                  mem_plan.kv_page_size,
+                  1,
+                  1,
+                  kv_format)
+        : is_gemma4_arch
             ? pie_cuda_driver::KvCache::allocate_per_layer(
                   engine.hf_config().num_hidden_layers,
                   physical_kv_pages,
@@ -2097,6 +2218,17 @@ int run_impl(int argc,
                   local_kv_heads,
                   engine.hf_config().head_dim_kernel,
                   kv_format);
+
+    auto mla_cache =
+        is_kimi_arch
+            ? pie_cuda_driver::MlaCache::allocate(
+                  engine.hf_config().num_hidden_layers,
+                  physical_kv_pages,
+                  mem_plan.kv_page_size,
+                  engine.hf_config().kv_lora_rank,
+                  engine.hf_config().qk_rope_head_dim,
+                  pie_cuda_driver::DType::BF16)
+            : pie_cuda_driver::MlaCache{};
 
     auto attn_ws = pie_cuda_driver::AttentionWorkspace::allocate(
         mem_plan.attn_float_workspace_bytes, 8ull * 1024 * 1024);
@@ -2211,16 +2343,24 @@ int run_impl(int argc,
         mem_plan.capacity.max_custom_mask_bytes);
 
     pie_cuda_driver::CustomAllReduce custom_ar;
-    if (tp_comm_ptr != nullptr && vtable_opt != nullptr &&
-        cfg.distributed.tp_size == 2) {
+    if (tp_comm_ptr != nullptr &&
+        cfg.distributed.tp_size >= 2 && cfg.distributed.tp_size <= 8 &&
+        (cfg.distributed.tp_size % 2) == 0) {
         custom_ar = pie_cuda_driver::CustomAllReduce(
-            *tp_comm_ptr, /*same_process=*/true,
+            *tp_comm_ptr, /*same_process=*/vtable_opt != nullptr,
             /*max_bytes=*/8 * 1024 * 1024,
             /*rank_data_bytes=*/8 * 1024 * 1024,
             /*fusion_max_tokens=*/mem_plan.max_requests,
             /*fusion_hidden=*/engine.hf_config().hidden_size);
-        custom_ar.register_buffer(*tp_comm_ptr, ws.norm_x.data(),
-                                  ws.norm_x.nbytes());
+        if (is_kimi_arch) {
+            custom_ar.register_buffer(*tp_comm_ptr, kimi_ws.norm_x.data(),
+                                      kimi_ws.norm_x.nbytes());
+            custom_ar.register_buffer(*tp_comm_ptr, kimi_ws.moe_out.data(),
+                                      kimi_ws.moe_out.nbytes());
+        } else {
+            custom_ar.register_buffer(*tp_comm_ptr, ws.norm_x.data(),
+                                      ws.norm_x.nbytes());
+        }
         tp_comm_ptr->set_custom_all_reduce(&custom_ar);
     }
 
@@ -2461,6 +2601,7 @@ int run_impl(int argc,
     // the lifetime of the server.
     pie_cuda_driver::ForwardFn forward_fn;
     pie_cuda_driver::model::LlamaLikePlanState llama_plan;
+    pie_cuda_driver::model::KimiPlanState kimi_plan;
     // Gemma-4 26B-A4B's MoE block needs a routed-experts workspace
     // alongside the dense forward state. Inert (zero-byte) on dense
     // E2B / E4B / 31B variants.
@@ -2483,7 +2624,71 @@ int run_impl(int argc,
             hf_cfg.num_hidden_layers *
                 hf_cfg.gemma_hidden_size_per_layer_input);
     }
-    if (is_gemma4_arch) {
+    if (is_kimi_arch) {
+        const int kimi_tp_size = cfg.distributed.tp_size;
+        const bool kimi_emit_logits = cfg.distributed.tp_rank == 0;
+        pie_cuda_driver::NcclComm* kimi_tp_comm = tp_comm_ptr;
+        forward_fn.supports_tp_greedy_argmax =
+            cfg.distributed.tp_size > 1 &&
+            weights_kimi.lm_head_tp_sharded;
+        forward_fn.supports_compact_logits = true;
+        forward_fn.prepare = [&engine, &mla_cache, &kimi_plan, kimi_tp_size](
+            pie_cuda_driver::AttentionWorkspace& attn_ws,
+            const pie_cuda_driver::ForwardFn::PrepareInputs& prep) {
+            pie_cuda_driver::model::prepare_kimi_mla_plan(
+                kimi_plan, attn_ws, mla_cache, engine.hf_config(),
+                prep.kv_page_indices_d,
+                prep.qo_indptr_h,
+                prep.kv_page_indptr_h,
+                prep.kv_page_indptr_d,
+                prep.kv_last_page_lens_h,
+                prep.kv_last_page_lens_d,
+                prep.total_tokens,
+                prep.num_requests,
+                !prep.is_pure_decode,
+                kimi_tp_size);
+        };
+        forward_fn.body = [&engine, &weights_kimi, &kimi_ws, &mla_cache,
+                           &kimi_plan, kimi_tp_size, kimi_tp_comm,
+                           kimi_emit_logits](
+            pie_cuda_driver::model::Qwen3Workspace& ws,
+            pie_cuda_driver::KvCache& cache,
+            pie_cuda_driver::AttentionWorkspace& attn_ws,
+            pie_cuda_driver::ops::CublasHandle& cublas,
+            const std::int32_t* tok, const std::int32_t* pos,
+            const std::uint32_t* qo_indptr,
+            const std::uint32_t* kv_page_indices,
+            const std::uint32_t* kv_page_indptr,
+            const std::uint32_t* kv_last_page_lens,
+            const std::uint32_t* qo_indptr_h,
+            const std::uint32_t* kv_page_indptr_h,
+            int N, int R, bool is_pure_decode,
+            const std::uint8_t* mask_d, const std::int32_t* mask_indptr_d,
+            const std::int32_t* slot_ids_h, const std::uint8_t* is_fresh_h,
+            const std::int32_t* slot_ids_d,
+            const std::int32_t* logit_row_indices_d,
+            int num_logit_rows,
+            bool tp_greedy_argmax) {
+            (void)ws; (void)cache; (void)mask_d; (void)mask_indptr_d;
+            (void)slot_ids_h; (void)is_fresh_h; (void)slot_ids_d;
+            pie_cuda_driver::model::KimiForwardCfg kimi_fwd{};
+            kimi_fwd.tp_size = kimi_tp_size;
+            kimi_fwd.tp_comm = kimi_tp_comm;
+            kimi_fwd.emit_logits = kimi_emit_logits;
+            kimi_fwd.tp_greedy_argmax = tp_greedy_argmax;
+            kimi_fwd.greedy_pairs = ws.greedy_pairs.data();
+            kimi_fwd.greedy_pairs_all = ws.greedy_pairs_all.data();
+            pie_cuda_driver::model::kimi_forward_paged(
+                weights_kimi, engine.hf_config(), kimi_fwd, kimi_plan,
+                kimi_ws, mla_cache, attn_ws, cublas,
+                ws.logits.data(),
+                tok, pos,
+                qo_indptr, kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                qo_indptr_h, kv_page_indptr_h,
+                N, R, is_pure_decode,
+                logit_row_indices_d, num_logit_rows);
+        };
+    } else if (is_gemma4_arch) {
         forward_fn = [&engine, &weights_gemma4, &gemma4_moe_ws, gemma4_fwd_cfg](
             pie_cuda_driver::model::Qwen3Workspace& ws,
             pie_cuda_driver::KvCache& cache,

@@ -162,6 +162,128 @@ pub unsafe extern "C" fn pie_loader_compile(
 }
 
 #[unsafe(no_mangle)]
+/// Return the serialized size, in bytes, of a compiled storage program.
+///
+/// # Safety
+///
+/// `program` must be a live handle returned by this crate. `out_len` must be
+/// valid for one `usize` write. `out_error` follows the usual FFI error rules.
+pub unsafe extern "C" fn pie_loader_program_serialized_len(
+    program: *const PieLoaderProgramHandle,
+    out_len: *mut usize,
+    out_error: *mut PieLoaderError,
+) -> PieLoaderStatus {
+    unsafe { clear_error(out_error) };
+    if program.is_null() {
+        let err = CompileError::NullArgument("program");
+        unsafe { write_error(out_error, &err) };
+        return err.status();
+    }
+    if out_len.is_null() {
+        let err = CompileError::NullArgument("out_len");
+        unsafe { write_error(out_error, &err) };
+        return err.status();
+    }
+    match bincode::serialized_size(&unsafe { &*program }.program) {
+        Ok(len) => {
+            unsafe {
+                *out_len = len as usize;
+            }
+            PieLoaderStatus::Ok
+        }
+        Err(err) => {
+            let err = CompileError::Internal(format!("serialize size failed: {err}"));
+            let status = err.status();
+            unsafe { write_error(out_error, &err) };
+            status
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+/// Serialize a compiled storage program into caller-owned memory.
+///
+/// # Safety
+///
+/// `program` must be a live handle returned by this crate. `dst` must point to
+/// `dst_len` writable bytes and should be at least the value returned by
+/// `pie_loader_program_serialized_len`.
+pub unsafe extern "C" fn pie_loader_program_serialize(
+    program: *const PieLoaderProgramHandle,
+    dst: *mut u8,
+    dst_len: usize,
+    out_error: *mut PieLoaderError,
+) -> PieLoaderStatus {
+    unsafe { clear_error(out_error) };
+    if program.is_null() {
+        let err = CompileError::NullArgument("program");
+        unsafe { write_error(out_error, &err) };
+        return err.status();
+    }
+    if dst_len > 0 && dst.is_null() {
+        let err = CompileError::NullArgument("dst");
+        unsafe { write_error(out_error, &err) };
+        return err.status();
+    }
+    let dst = unsafe { std::slice::from_raw_parts_mut(dst, dst_len) };
+    let mut cursor = std::io::Cursor::new(dst);
+    match bincode::serialize_into(&mut cursor, &unsafe { &*program }.program) {
+        Ok(()) => PieLoaderStatus::Ok,
+        Err(err) => {
+            let err = CompileError::Internal(format!("serialize failed: {err}"));
+            let status = err.status();
+            unsafe { write_error(out_error, &err) };
+            status
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+/// Deserialize a compiled storage program from bytes produced by this crate.
+///
+/// # Safety
+///
+/// `bytes` must point to `bytes_len` readable bytes. `out_program` must be
+/// valid for one pointer write.
+pub unsafe extern "C" fn pie_loader_program_deserialize(
+    bytes: *const u8,
+    bytes_len: usize,
+    out_program: *mut *mut PieLoaderProgramHandle,
+    out_error: *mut PieLoaderError,
+) -> PieLoaderStatus {
+    unsafe { clear_error(out_error) };
+    if out_program.is_null() {
+        let err = CompileError::NullArgument("out_program");
+        unsafe { write_error(out_error, &err) };
+        return err.status();
+    }
+    unsafe {
+        *out_program = std::ptr::null_mut();
+    }
+    if bytes_len > 0 && bytes.is_null() {
+        let err = CompileError::NullArgument("bytes");
+        unsafe { write_error(out_error, &err) };
+        return err.status();
+    }
+    let bytes = unsafe { std::slice::from_raw_parts(bytes, bytes_len) };
+    match bincode::deserialize::<StorageProgram>(bytes) {
+        Ok(program) => {
+            let handle = Box::new(PieLoaderProgramHandle::new(program));
+            unsafe {
+                *out_program = Box::into_raw(handle);
+            }
+            PieLoaderStatus::Ok
+        }
+        Err(err) => {
+            let err = CompileError::InvalidInput(format!("deserialize failed: {err}"));
+            let status = err.status();
+            unsafe { write_error(out_error, &err) };
+            status
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
 /// Borrow a flat view of a compiled program handle.
 ///
 /// # Safety

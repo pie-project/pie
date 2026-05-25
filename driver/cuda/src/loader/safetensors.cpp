@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <cstring>
 #include <fstream>
+#include <limits>
 #include <stdexcept>
 
 #include <fcntl.h>
@@ -46,6 +47,35 @@ std::vector<std::int64_t> normalize_slices(
         shape[static_cast<std::size_t>(slice.axis)] = slice.length;
     }
     return shape;
+}
+
+bool is_last_dim_only_slice(
+    const TensorInfo& ti,
+    const std::vector<std::int64_t>& start,
+    const std::vector<std::int64_t>& shape)
+{
+    const auto rank = ti.shape.size();
+    if (rank < 2 || start.size() != rank || shape.size() != rank) {
+        return false;
+    }
+    if (start[rank - 1] == 0 && shape[rank - 1] == ti.shape[rank - 1]) {
+        return false;
+    }
+    for (std::size_t axis = 0; axis + 1 < rank; ++axis) {
+        if (start[axis] != 0 || shape[axis] != ti.shape[axis]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+std::size_t outer_row_count(const std::vector<std::int64_t>& shape)
+{
+    std::size_t rows = 1;
+    for (std::size_t axis = 0; axis + 1 < shape.size(); ++axis) {
+        rows *= static_cast<std::size_t>(shape[axis]);
+    }
+    return rows;
 }
 
 }  // namespace
@@ -133,8 +163,8 @@ SafetensorsCheckpointSource::~SafetensorsCheckpointSource() {
     }
 }
 
-void SafetensorsCheckpointSource::open_shard_(Shard& s) const {
-    if (s.data) return;
+void SafetensorsCheckpointSource::open_shard_file_(Shard& s) const {
+    if (s.fd >= 0) return;
     auto& m = const_cast<Shard&>(s);
     m.fd = ::open(s.path.c_str(), O_RDONLY);
     if (m.fd < 0) {
@@ -147,6 +177,12 @@ void SafetensorsCheckpointSource::open_shard_(Shard& s) const {
         throw std::runtime_error("fstat(" + s.path.string() + ") failed");
     }
     m.mapped_size = static_cast<std::size_t>(st.st_size);
+}
+
+void SafetensorsCheckpointSource::open_shard_(Shard& s) const {
+    if (s.data) return;
+    open_shard_file_(s);
+    auto& m = const_cast<Shard&>(s);
     void* p = ::mmap(nullptr, m.mapped_size, PROT_READ, MAP_SHARED, m.fd, 0);
     if (p == MAP_FAILED) {
         ::close(m.fd);
@@ -229,6 +265,95 @@ void SafetensorsCheckpointSource::copy_storage_bytes_to_device(
         shard.data + file_offset,
         span_bytes,
         cudaMemcpyHostToDevice));
+}
+
+void SafetensorsCheckpointSource::copy_storage_bytes_to_device_async(
+    std::uint32_t shard_id,
+    std::uint64_t file_offset,
+    std::uint64_t span_bytes,
+    void* dst,
+    void* stream)
+{
+    if (dst == nullptr) {
+        throw std::runtime_error("safetensors: null destination for byte range");
+    }
+    if (shard_id >= shards_.size()) {
+        throw std::runtime_error("safetensors: byte range shard id out of range");
+    }
+    auto& shard = shards_[shard_id];
+    if (!shard.data) open_shard_(shard);
+    if (file_offset > shard.mapped_size ||
+        span_bytes > shard.mapped_size - file_offset) {
+        throw std::runtime_error("safetensors: byte range exceeds shard size");
+    }
+    auto* cuda_stream = static_cast<cudaStream_t>(stream);
+    CUDA_CHECK(cudaMemcpyAsync(
+        dst,
+        shard.data + file_offset,
+        span_bytes,
+        cudaMemcpyHostToDevice,
+        cuda_stream));
+}
+
+const std::uint8_t* SafetensorsCheckpointSource::storage_host_ptr(
+    std::uint32_t shard_id,
+    std::uint64_t file_offset,
+    std::uint64_t span_bytes)
+{
+    if (shard_id >= shards_.size()) {
+        throw std::runtime_error("safetensors: byte range shard id out of range");
+    }
+    auto& shard = shards_[shard_id];
+    if (!shard.data) open_shard_(shard);
+    if (file_offset > shard.mapped_size ||
+        span_bytes > shard.mapped_size - file_offset) {
+        throw std::runtime_error("safetensors: byte range exceeds shard size");
+    }
+    return shard.data + file_offset;
+}
+
+void SafetensorsCheckpointSource::read_storage_bytes_to_host(
+    std::uint32_t shard_id,
+    std::uint64_t file_offset,
+    std::uint64_t span_bytes,
+    void* dst)
+{
+    if (dst == nullptr) {
+        throw std::runtime_error("safetensors: null host destination for byte range");
+    }
+    if (shard_id >= shards_.size()) {
+        throw std::runtime_error("safetensors: byte range shard id out of range");
+    }
+    auto& shard = shards_[shard_id];
+    if (!shard.data) open_shard_(shard);
+    if (file_offset > shard.mapped_size ||
+        span_bytes > shard.mapped_size - file_offset) {
+        throw std::runtime_error("safetensors: byte range exceeds shard size");
+    }
+    auto* out = static_cast<std::uint8_t*>(dst);
+    std::uint64_t done = 0;
+    while (done < span_bytes) {
+        const std::size_t chunk = static_cast<std::size_t>(
+            std::min<std::uint64_t>(
+                span_bytes - done,
+                static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max())));
+        const ssize_t n = ::pread(
+            shard.fd,
+            out + done,
+            chunk,
+            static_cast<off_t>(file_offset + done));
+        if (n < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            throw std::runtime_error(
+                std::string("safetensors: pread failed: ") + std::strerror(errno));
+        }
+        if (n == 0) {
+            throw std::runtime_error("safetensors: short pread");
+        }
+        done += static_cast<std::uint64_t>(n);
+    }
 }
 
 void SafetensorsCheckpointSource::copy_shard_to_device(
@@ -325,6 +450,23 @@ void SafetensorsCheckpointSource::copy_strided_to_device(
     if (!shard.data) open_shard_(shard);
     const auto* host_base = shard.data + shard.data_section_offset + ti.data_offset;
     const std::size_t elem = dtype_bytes(ti.dtype);
+    if (is_last_dim_only_slice(ti, start, shape)) {
+        const std::size_t src_cols =
+            static_cast<std::size_t>(ti.shape.back());
+        const std::size_t dst_cols =
+            static_cast<std::size_t>(shape.back());
+        const std::size_t col_start =
+            static_cast<std::size_t>(start.back());
+        CUDA_CHECK(cudaMemcpy2D(
+            dst,
+            dst_cols * elem,
+            host_base + col_start * elem,
+            src_cols * elem,
+            dst_cols * elem,
+            outer_row_count(shape),
+            cudaMemcpyHostToDevice));
+        return;
+    }
     const auto rank = static_cast<int>(ti.shape.size());
 
     std::vector<std::int64_t> source_strides(ti.shape.size(), 1);
@@ -413,6 +555,25 @@ void SafetensorsCheckpointSource::copy_strided_to_device_async(
         throw std::runtime_error(
             "safetensors: destination shape mismatch for sliced tensor '" +
             name + "'");
+    }
+
+    if (is_last_dim_only_slice(ti, start, shape)) {
+        const std::size_t src_cols =
+            static_cast<std::size_t>(ti.shape.back());
+        const std::size_t dst_cols =
+            static_cast<std::size_t>(shape.back());
+        const std::size_t col_start =
+            static_cast<std::size_t>(start.back());
+        CUDA_CHECK(cudaMemcpy2DAsync(
+            dst,
+            dst_cols * elem,
+            host_base + col_start * elem,
+            src_cols * elem,
+            dst_cols * elem,
+            outer_row_count(shape),
+            cudaMemcpyHostToDevice,
+            cuda_stream));
+        return;
     }
 
     const auto rank = static_cast<int>(ti.shape.size());

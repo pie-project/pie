@@ -13,6 +13,7 @@ std::size_t BoundCudaModel::num_layers() const noexcept {
     case Kind::Mixtral: return mixtral.layers.size();
     case Kind::Qwen3_5: return qwen3_5.layers.size();
     case Kind::Qwen3_5Moe: return qwen3_5_moe.layers.size();
+    case Kind::Kimi: return kimi.layers.size();
     }
     return 0;
 }
@@ -31,7 +32,10 @@ BoundCudaModel bind_cuda_model(const LoadedModel& engine, bool verbose) {
     const bool is_qwen3_5_moe =
         (mt == "qwen3_5_moe" || mt == "qwen3_5_moe_text" || mt == "qwen3_moe");
 
-    if (mt == "phi3") {
+    if (mt == "kimi_k2") {
+        bound.kind = BoundCudaModel::Kind::Kimi;
+        bound.kimi = bind_kimi(engine);
+    } else if (mt == "phi3") {
         bound.kind = BoundCudaModel::Kind::LlamaLike;
         bound.llama = bind_phi3(engine);
     } else if (mt == "olmo2" || mt == "olmo3") {

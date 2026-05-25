@@ -1,15 +1,15 @@
 use std::collections::{HashMap, HashSet};
 
-use crate::abi::RuntimeAbi;
+use crate::abi::{RuntimeAbi, RuntimeTensorSource};
 use crate::error::CompileError;
 use crate::frontend::{plan_from_semantics, runtime_bytes};
 use crate::ir::{LayoutExpr, LayoutPlan};
-use crate::optimizer::optimize_with_report;
+use crate::optimizer::{OptimizerPassStats, optimize_with_report};
 use crate::schema::build_semantic_graph;
 use crate::source::{CheckpointMetadata, RawTensor};
 use crate::storage::{
-    BufferDecl, DestExtent, DimSpec, MetadataSpec, SourceExtent, StorageInstr, StorageProgram,
-    StorageTarget, StridedExtent, TileMapKind, TileSpec, TransformSpec,
+    BufferDecl, DestExtent, DimSpec, MetadataSpec, SlabPlacement, SourceExtent, StorageInstr,
+    StorageProgram, StorageTarget, StridedExtent, TileMapKind, TileSpec, TransformSpec,
 };
 use crate::typecheck::typecheck;
 use crate::types::{
@@ -23,8 +23,17 @@ pub fn compile_storage_program(
     abi: &RuntimeAbi,
     target: StorageTarget,
 ) -> Result<StorageProgram, CompileError> {
-    let graph = build_semantic_graph(metadata, cfg)?;
-    let plan = plan_from_semantics(metadata, &graph, abi, &target)?;
+    let abi = abi.coalesce_direct_row_shards(metadata, &target)?;
+    let needs_semantic_graph = abi
+        .tensors
+        .iter()
+        .any(|contract| matches!(contract.source, RuntimeTensorSource::Semantic { .. }));
+    let graph = if needs_semantic_graph {
+        build_semantic_graph(metadata, cfg)?
+    } else {
+        crate::semantic::SemanticGraph::empty()
+    };
+    let plan = plan_from_semantics(metadata, &graph, &abi, &target)?;
     let optimized = optimize_with_report(plan)?;
     let mut program = lower_layout_plan(metadata, &optimized.plan, target)?;
     program.optimizer = optimized.report;
@@ -103,6 +112,11 @@ impl StorageCompiler<'_> {
             let value = self.lower_expr(expr_id, &self.plan.exprs[expr_id.0 as usize])?;
             self.values.insert(expr_id, value);
         }
+        assign_persistent_offsets(&mut self.program)?;
+        coalesce_persistent_arena_writes(&mut self.program)?;
+        hoist_bulk_extent_writes(&mut self.program)?;
+        build_slab_scatter_writes(&mut self.program)?;
+        merge_adjacent_extent_writes(&mut self.program)?;
         recompute_memory_plan(&mut self.program)?;
         validate_target_support(&self.program)?;
         Ok(())
@@ -777,6 +791,7 @@ impl StorageCompiler<'_> {
             bytes,
             alignment: decl.alignment,
             temporary,
+            persistent_offset: None,
         });
         if !temporary {
             self.program.tensors.push(decl.clone());
@@ -798,6 +813,7 @@ impl StorageCompiler<'_> {
             bytes: 0,
             alignment: decl.alignment,
             temporary: false,
+            persistent_offset: None,
         });
         if !self
             .program
@@ -893,7 +909,13 @@ fn recompute_memory_plan(program: &mut StorageProgram) -> Result<(), CompileErro
     let mut live = HashSet::new();
 
     for buffer in &program.buffers {
-        if !buffer.temporary && buffer.tensor.is_some() {
+        if let Some(offset) = buffer.persistent_offset {
+            persistent_bytes = persistent_bytes.max(
+                offset
+                    .checked_add(buffer.bytes)
+                    .ok_or_else(|| CompileError::InvalidInput("persistent byte overflow".to_string()))?,
+            );
+        } else if !buffer.temporary && buffer.tensor.is_some() {
             persistent_bytes = persistent_bytes.checked_add(buffer.bytes).ok_or_else(|| {
                 CompileError::InvalidInput("persistent byte overflow".to_string())
             })?;
@@ -903,8 +925,9 @@ fn recompute_memory_plan(program: &mut StorageProgram) -> Result<(), CompileErro
     for instr_id in &program.schedule {
         let instr = program
             .instrs
-            .iter()
-            .find(|instr| instr_id_of(instr) == *instr_id)
+            .get(instr_id.0 as usize)
+            .filter(|instr| instr_id_of(instr) == *instr_id)
+            .or_else(|| program.instrs.iter().find(|instr| instr_id_of(instr) == *instr_id))
             .ok_or_else(|| {
                 CompileError::InvalidInput(format!("scheduled instr {} is missing", instr_id.0))
             })?;
@@ -934,6 +957,33 @@ fn recompute_memory_plan(program: &mut StorageProgram) -> Result<(), CompileErro
                 device_write_bytes = device_write_bytes
                     .checked_add(source.span_bytes)
                     .ok_or_else(|| CompileError::InvalidInput("write byte overflow".to_string()))?;
+            }
+            StorageInstr::BulkExtentWrite { source, .. } => {
+                checkpoint_read_bytes = checkpoint_read_bytes
+                    .checked_add(source.span_bytes)
+                    .ok_or_else(|| CompileError::InvalidInput("read byte overflow".to_string()))?;
+                device_write_bytes = device_write_bytes
+                    .checked_add(source.span_bytes)
+                    .ok_or_else(|| CompileError::InvalidInput("write byte overflow".to_string()))?;
+            }
+            StorageInstr::SlabScatter {
+                span_bytes,
+                placements,
+                ..
+            } => {
+                checkpoint_read_bytes = checkpoint_read_bytes
+                    .checked_add(*span_bytes)
+                    .ok_or_else(|| CompileError::InvalidInput("read byte overflow".to_string()))?;
+                let mut payload_bytes = 0u64;
+                for placement in placements {
+                    payload_bytes = payload_bytes
+                        .checked_add(placement.bytes)
+                        .ok_or_else(|| CompileError::InvalidInput("write byte overflow".to_string()))?;
+                }
+                device_write_bytes = device_write_bytes
+                    .checked_add(payload_bytes)
+                    .ok_or_else(|| CompileError::InvalidInput("write byte overflow".to_string()))?;
+                transform_scratch_peak_bytes = transform_scratch_peak_bytes.max(*span_bytes);
             }
             StorageInstr::TileMap {
                 source,
@@ -982,6 +1032,599 @@ fn recompute_memory_plan(program: &mut StorageProgram) -> Result<(), CompileErro
     Ok(())
 }
 
+fn assign_persistent_offsets(program: &mut StorageProgram) -> Result<(), CompileError> {
+    let mut next = 0u64;
+    let source_order = persistent_source_order(program)?;
+    let mut order = (0..program.buffers.len()).collect::<Vec<_>>();
+    order.sort_by_key(|&idx| {
+        source_order
+            .get(&program.buffers[idx].id)
+            .copied()
+            .unwrap_or((u32::MAX, u64::MAX, program.buffers[idx].id.0))
+    });
+    for idx in order {
+        let buffer = &mut program.buffers[idx];
+        if buffer.temporary || buffer.tensor.is_none() || buffer.bytes == 0 {
+            buffer.persistent_offset = None;
+            continue;
+        }
+        let alignment = if source_order.contains_key(&buffer.id) {
+            1
+        } else {
+            u64::from(buffer.alignment.max(1))
+        };
+        let offset = align_up_u64(next, alignment)?;
+        next = offset
+            .checked_add(buffer.bytes)
+            .ok_or_else(|| CompileError::InvalidInput("persistent arena overflow".to_string()))?;
+        buffer.persistent_offset = Some(offset);
+    }
+    Ok(())
+}
+
+fn persistent_source_order(
+    program: &StorageProgram,
+) -> Result<HashMap<BufferId, (u32, u64, u32)>, CompileError> {
+    let mut order = HashMap::new();
+    for instr in &program.instrs {
+        let StorageInstr::ExtentWrite { source, dest, .. } = instr else {
+            continue;
+        };
+        let Some(buffer) = program.buffers.iter().find(|buffer| buffer.id == dest.buffer) else {
+            continue;
+        };
+        if buffer.temporary || buffer.tensor.is_none() || buffer.bytes == 0 {
+            continue;
+        }
+        if !compact_extent_for_copy(&source.stride)
+            || !compact_extent_for_copy(&dest.stride)
+            || source.span_bytes != extent_storage_bytes(&dest.stride)?
+        {
+            continue;
+        }
+        let source_start = source
+            .file_offset
+            .checked_add(source.stride.base_offset)
+            .ok_or_else(|| CompileError::InvalidInput("source offset overflow".to_string()))?;
+        order
+            .entry(dest.buffer)
+            .or_insert((source.file_id.0, source_start, dest.buffer.0));
+    }
+    Ok(order)
+}
+
+fn align_up_u64(value: u64, alignment: u64) -> Result<u64, CompileError> {
+    if alignment <= 1 {
+        return Ok(value);
+    }
+    let rem = value % alignment;
+    if rem == 0 {
+        return Ok(value);
+    }
+    value
+        .checked_add(alignment - rem)
+        .ok_or_else(|| CompileError::InvalidInput("alignment overflow".to_string()))
+}
+
+fn coalesce_persistent_arena_writes(program: &mut StorageProgram) -> Result<(), CompileError> {
+    if program.schedule.is_empty() {
+        return Ok(());
+    }
+    let old_instrs = program.instrs.clone();
+    let blocked_buffers = non_bulk_compatible_persistent_write_buffers(program)?;
+    let mut merged: Vec<StorageInstr> = Vec::with_capacity(old_instrs.len());
+    let mut rewrites = 0_u64;
+
+    for instr_id in &program.schedule {
+        let instr = old_instrs
+            .get(instr_id.0 as usize)
+            .filter(|instr| instr_id_of(instr) == *instr_id)
+            .or_else(|| old_instrs.iter().find(|instr| instr_id_of(instr) == *instr_id))
+            .ok_or_else(|| {
+                CompileError::InvalidInput(format!("scheduled instr {} is missing", instr_id.0))
+            })?;
+
+        if let Some(bulk) = extent_write_as_bulk(program, instr, &blocked_buffers)? {
+            if let Some(previous) = merged.last_mut()
+                && try_merge_bulk_extent_write(previous, &bulk)?
+            {
+                rewrites += 1;
+                continue;
+            }
+            merged.push(bulk);
+            continue;
+        }
+        merged.push(instr.clone());
+    }
+
+    rewrite_program_instrs(program, merged)?;
+    if rewrites > 0 {
+        program.optimizer.passes.push(OptimizerPassStats {
+            name: "coalesce-persistent-arena-writes".to_string(),
+            exprs_before: old_instrs.len(),
+            exprs_after: program.instrs.len(),
+            rewrites: usize::try_from(rewrites).unwrap_or(usize::MAX),
+        });
+    }
+    Ok(())
+}
+
+fn non_bulk_compatible_persistent_write_buffers(
+    program: &StorageProgram,
+) -> Result<HashSet<BufferId>, CompileError> {
+    let mut blocked = HashSet::new();
+    for instr in &program.instrs {
+        let StorageInstr::ExtentWrite { source, dest, .. } = instr else {
+            continue;
+        };
+        let Some(buffer) = program.buffers.iter().find(|buffer| buffer.id == dest.buffer) else {
+            continue;
+        };
+        if buffer.persistent_offset.is_none() {
+            continue;
+        }
+        if !compact_extent_for_copy(&source.stride)
+            || !compact_extent_for_copy(&dest.stride)
+            || source.span_bytes != extent_storage_bytes(&dest.stride)?
+        {
+            blocked.insert(dest.buffer);
+        }
+    }
+    Ok(blocked)
+}
+
+fn hoist_bulk_extent_writes(program: &mut StorageProgram) -> Result<(), CompileError> {
+    if program.schedule.len() < 2 {
+        return Ok(());
+    }
+    let old_instrs = program.instrs.clone();
+    let mut pending_bulk: Vec<StorageInstr> = Vec::new();
+    let mut allocations: Vec<StorageInstr> = Vec::new();
+    let mut rest: Vec<StorageInstr> = Vec::with_capacity(old_instrs.len());
+    let mut result: Vec<StorageInstr> = Vec::with_capacity(old_instrs.len());
+    let mut rewrites = 0_u64;
+
+    for instr_id in &program.schedule {
+        let instr = old_instrs
+            .get(instr_id.0 as usize)
+            .filter(|instr| instr_id_of(instr) == *instr_id)
+            .or_else(|| old_instrs.iter().find(|instr| instr_id_of(instr) == *instr_id))
+            .ok_or_else(|| {
+                CompileError::InvalidInput(format!("scheduled instr {} is missing", instr_id.0))
+            })?;
+        if matches!(instr, StorageInstr::BulkExtentWrite { .. }) {
+            pending_bulk.push(instr.clone());
+        } else if matches!(instr, StorageInstr::Allocate { .. }) {
+            allocations.push(instr.clone());
+        } else {
+            rest.push(instr.clone());
+        }
+    }
+    result.append(&mut allocations);
+    flush_pending_bulk(&mut result, &mut pending_bulk, &mut rewrites)?;
+    result.append(&mut rest);
+
+    rewrite_program_instrs(program, result)?;
+    if rewrites > 0 {
+        program.optimizer.passes.push(OptimizerPassStats {
+            name: "hoist-bulk-arena-writes".to_string(),
+            exprs_before: old_instrs.len(),
+            exprs_after: program.instrs.len(),
+            rewrites: usize::try_from(rewrites).unwrap_or(usize::MAX),
+        });
+    }
+    Ok(())
+}
+
+fn flush_pending_bulk(
+    result: &mut Vec<StorageInstr>,
+    pending_bulk: &mut Vec<StorageInstr>,
+    rewrites: &mut u64,
+) -> Result<(), CompileError> {
+    if pending_bulk.is_empty() {
+        return Ok(());
+    }
+    pending_bulk.sort_by_key(|instr| match instr {
+        StorageInstr::BulkExtentWrite {
+            source,
+            dest_offset,
+            ..
+        } => (
+            source.file_id.0,
+            source.file_offset + source.stride.base_offset,
+            *dest_offset,
+        ),
+        StorageInstr::SlabScatter {
+            file_id,
+            file_offset,
+            ..
+        } => (file_id.0, *file_offset, 0),
+        _ => (u32::MAX, u64::MAX, u64::MAX),
+    });
+    for instr in pending_bulk.drain(..) {
+        if let Some(previous) = result.last_mut()
+            && try_merge_bulk_extent_write(previous, &instr)?
+        {
+            *rewrites += 1;
+            continue;
+        }
+        result.push(instr);
+    }
+    Ok(())
+}
+
+fn build_slab_scatter_writes(program: &mut StorageProgram) -> Result<(), CompileError> {
+    if program.schedule.len() < 2 {
+        return Ok(());
+    }
+    const DEFAULT_MAX_SLAB_BYTES: u64 = 256 * 1024 * 1024;
+    const DEFAULT_MAX_GAP_BYTES: u64 = 64 * 1024 * 1024;
+    const DEFAULT_MAX_PLACEMENTS: usize = 4096;
+    const MIN_PLACEMENTS: usize = 2;
+    const MIN_PAYLOAD_BYTES: u64 = 1024 * 1024;
+    const MAX_OVERREAD_NUMERATOR: u64 = 5;
+    const MAX_OVERREAD_DENOMINATOR: u64 = 4;
+
+    let max_slab_bytes = DEFAULT_MAX_SLAB_BYTES.max(program.target.max_tile_bytes);
+    let old_instrs = program.instrs.clone();
+    let mut result = Vec::with_capacity(old_instrs.len());
+    let mut pending = Vec::new();
+    let mut rewrites = 0u64;
+
+    for instr_id in &program.schedule {
+        let instr = old_instrs
+            .get(instr_id.0 as usize)
+            .filter(|instr| instr_id_of(instr) == *instr_id)
+            .or_else(|| old_instrs.iter().find(|instr| instr_id_of(instr) == *instr_id))
+            .ok_or_else(|| {
+                CompileError::InvalidInput(format!("scheduled instr {} is missing", instr_id.0))
+            })?;
+        if matches!(instr, StorageInstr::BulkExtentWrite { .. }) {
+            pending.push(instr.clone());
+        } else {
+            flush_pending_slab_scatter(
+                &mut result,
+                &mut pending,
+                &mut rewrites,
+                max_slab_bytes,
+                DEFAULT_MAX_GAP_BYTES,
+                DEFAULT_MAX_PLACEMENTS,
+                MIN_PLACEMENTS,
+                MIN_PAYLOAD_BYTES,
+                MAX_OVERREAD_NUMERATOR,
+                MAX_OVERREAD_DENOMINATOR,
+            )?;
+            result.push(instr.clone());
+        }
+    }
+    flush_pending_slab_scatter(
+        &mut result,
+        &mut pending,
+        &mut rewrites,
+        max_slab_bytes,
+        DEFAULT_MAX_GAP_BYTES,
+        DEFAULT_MAX_PLACEMENTS,
+        MIN_PLACEMENTS,
+        MIN_PAYLOAD_BYTES,
+        MAX_OVERREAD_NUMERATOR,
+        MAX_OVERREAD_DENOMINATOR,
+    )?;
+
+    rewrite_program_instrs(program, result)?;
+    if rewrites > 0 {
+        program.optimizer.passes.push(OptimizerPassStats {
+            name: "slab-scatter-arena-writes".to_string(),
+            exprs_before: old_instrs.len(),
+            exprs_after: program.instrs.len(),
+            rewrites: usize::try_from(rewrites).unwrap_or(usize::MAX),
+        });
+    }
+    Ok(())
+}
+
+fn flush_pending_slab_scatter(
+    result: &mut Vec<StorageInstr>,
+    pending: &mut Vec<StorageInstr>,
+    rewrites: &mut u64,
+    max_slab_bytes: u64,
+    max_gap_bytes: u64,
+    max_placements: usize,
+    min_placements: usize,
+    min_payload_bytes: u64,
+    max_overread_num: u64,
+    max_overread_den: u64,
+) -> Result<(), CompileError> {
+    if pending.is_empty() {
+        return Ok(());
+    }
+    pending.sort_by_key(|instr| match instr {
+        StorageInstr::BulkExtentWrite { source, .. } => (
+            source.file_id.0,
+            source.file_offset + source.stride.base_offset,
+        ),
+        _ => (u32::MAX, u64::MAX),
+    });
+
+    let mut current = Vec::new();
+    for instr in pending.drain(..) {
+        if current.is_empty() {
+            current.push(instr);
+            continue;
+        }
+        if slab_can_accept(&current, &instr, max_slab_bytes, max_gap_bytes, max_placements)? {
+            current.push(instr);
+        } else {
+            emit_slab_or_bulk(
+                result,
+                &mut current,
+                rewrites,
+                min_placements,
+                min_payload_bytes,
+                max_overread_num,
+                max_overread_den,
+            )?;
+            current.push(instr);
+        }
+    }
+    emit_slab_or_bulk(
+        result,
+        &mut current,
+        rewrites,
+        min_placements,
+        min_payload_bytes,
+        max_overread_num,
+        max_overread_den,
+    )?;
+    Ok(())
+}
+
+fn slab_can_accept(
+    current: &[StorageInstr],
+    next: &StorageInstr,
+    max_slab_bytes: u64,
+    max_gap_bytes: u64,
+    max_placements: usize,
+) -> Result<bool, CompileError> {
+    if current.len() >= max_placements {
+        return Ok(false);
+    }
+    let Some((file_id, first_start, _, last_end)) = slab_bounds(current)? else {
+        return Ok(false);
+    };
+    let StorageInstr::BulkExtentWrite { source, .. } = next else {
+        return Ok(false);
+    };
+    if source.file_id != file_id || !is_byte_extent(&source.stride) {
+        return Ok(false);
+    }
+    let start = source
+        .file_offset
+        .checked_add(source.stride.base_offset)
+        .ok_or_else(|| CompileError::InvalidInput("source offset overflow".to_string()))?;
+    let end = start
+        .checked_add(source.span_bytes)
+        .ok_or_else(|| CompileError::InvalidInput("source span overflow".to_string()))?;
+    if start < last_end || start - last_end > max_gap_bytes {
+        return Ok(false);
+    }
+    Ok(end - first_start <= max_slab_bytes)
+}
+
+fn slab_bounds(
+    instrs: &[StorageInstr],
+) -> Result<Option<(crate::types::FileId, u64, u64, u64)>, CompileError> {
+    let Some(first) = instrs.first() else {
+        return Ok(None);
+    };
+    let StorageInstr::BulkExtentWrite { source, .. } = first else {
+        return Ok(None);
+    };
+    let file_id = source.file_id;
+    let first_start = source
+        .file_offset
+        .checked_add(source.stride.base_offset)
+        .ok_or_else(|| CompileError::InvalidInput("source offset overflow".to_string()))?;
+    let mut payload = 0u64;
+    let mut last_end = first_start;
+    for instr in instrs {
+        let StorageInstr::BulkExtentWrite { source, .. } = instr else {
+            return Ok(None);
+        };
+        let start = source
+            .file_offset
+            .checked_add(source.stride.base_offset)
+            .ok_or_else(|| CompileError::InvalidInput("source offset overflow".to_string()))?;
+        let end = start
+            .checked_add(source.span_bytes)
+            .ok_or_else(|| CompileError::InvalidInput("source span overflow".to_string()))?;
+        payload = payload
+            .checked_add(source.span_bytes)
+            .ok_or_else(|| CompileError::InvalidInput("slab payload overflow".to_string()))?;
+        last_end = last_end.max(end);
+    }
+    Ok(Some((file_id, first_start, payload, last_end)))
+}
+
+fn emit_slab_or_bulk(
+    result: &mut Vec<StorageInstr>,
+    current: &mut Vec<StorageInstr>,
+    rewrites: &mut u64,
+    min_placements: usize,
+    min_payload_bytes: u64,
+    max_overread_num: u64,
+    max_overread_den: u64,
+) -> Result<(), CompileError> {
+    if current.is_empty() {
+        return Ok(());
+    }
+    if current.len() < min_placements {
+        result.append(current);
+        return Ok(());
+    }
+    let Some((file_id, file_offset, payload, last_end)) = slab_bounds(current)? else {
+        result.append(current);
+        return Ok(());
+    };
+    let span_bytes = last_end - file_offset;
+    if span_bytes <= payload || payload < min_payload_bytes {
+        result.append(current);
+        return Ok(());
+    }
+    if span_bytes
+        .checked_mul(max_overread_den)
+        .ok_or_else(|| CompileError::InvalidInput("slab overread overflow".to_string()))?
+        > payload
+            .checked_mul(max_overread_num)
+            .ok_or_else(|| CompileError::InvalidInput("slab overread overflow".to_string()))?
+    {
+        result.append(current);
+        return Ok(());
+    }
+    let mut placements = Vec::with_capacity(current.len());
+    for instr in current.drain(..) {
+        let StorageInstr::BulkExtentWrite {
+            source,
+            dest_offset,
+            ..
+        } = instr
+        else {
+            continue;
+        };
+        let source_start = source
+            .file_offset
+            .checked_add(source.stride.base_offset)
+            .ok_or_else(|| CompileError::InvalidInput("source offset overflow".to_string()))?;
+        placements.push(SlabPlacement {
+            src_offset: source_start - file_offset,
+            dest_offset,
+            bytes: source.span_bytes,
+        });
+    }
+    *rewrites = rewrites
+        .checked_add(placements.len().saturating_sub(1) as u64)
+        .ok_or_else(|| CompileError::InvalidInput("slab rewrite overflow".to_string()))?;
+    result.push(StorageInstr::SlabScatter {
+        id: InstrId(0),
+        file_id,
+        file_offset,
+        span_bytes,
+        placements,
+    });
+    Ok(())
+}
+
+fn extent_write_as_bulk(
+    program: &StorageProgram,
+    instr: &StorageInstr,
+    blocked_buffers: &HashSet<BufferId>,
+) -> Result<Option<StorageInstr>, CompileError> {
+    let StorageInstr::ExtentWrite { id, source, dest } = instr else {
+        return Ok(None);
+    };
+    if !compact_extent_for_copy(&source.stride)
+        || !compact_extent_for_copy(&dest.stride)
+        || source.span_bytes != extent_storage_bytes(&dest.stride)?
+    {
+        return Ok(None);
+    }
+    let Some(buffer) = program.buffers.iter().find(|buffer| buffer.id == dest.buffer) else {
+        return Err(CompileError::InvalidInput(format!(
+            "destination buffer {} is missing",
+            dest.buffer.0
+        )));
+    };
+    let Some(base) = buffer.persistent_offset else {
+        return Ok(None);
+    };
+    if blocked_buffers.contains(&dest.buffer) {
+        return Ok(None);
+    }
+    let dest_offset = base
+        .checked_add(dest.offset)
+        .and_then(|v| v.checked_add(dest.stride.base_offset))
+        .ok_or_else(|| CompileError::InvalidInput("bulk destination offset overflow".to_string()))?;
+    Ok(Some(StorageInstr::BulkExtentWrite {
+        id: *id,
+        source: SourceExtent {
+            file_id: source.file_id,
+            tensor_id: source.tensor_id,
+            file_offset: source
+                .file_offset
+                .checked_add(source.stride.base_offset)
+                .ok_or_else(|| CompileError::InvalidInput("source offset overflow".to_string()))?,
+            span_bytes: source.span_bytes,
+            stride: byte_extent(source.span_bytes),
+        },
+        dest_offset,
+    }))
+}
+
+fn try_merge_bulk_extent_write(
+    previous: &mut StorageInstr,
+    current: &StorageInstr,
+) -> Result<bool, CompileError> {
+    let (
+        StorageInstr::BulkExtentWrite {
+            source: prev_source,
+            dest_offset: prev_dest_offset,
+            ..
+        },
+        StorageInstr::BulkExtentWrite {
+            source: cur_source,
+            dest_offset: cur_dest_offset,
+            ..
+        },
+    ) = (previous, current)
+    else {
+        return Ok(false);
+    };
+
+    if prev_source.file_id != cur_source.file_id
+        || !is_byte_extent(&prev_source.stride)
+        || !is_byte_extent(&cur_source.stride)
+    {
+        return Ok(false);
+    }
+    let prev_source_start = prev_source.file_offset + prev_source.stride.base_offset;
+    let cur_source_start = cur_source.file_offset + cur_source.stride.base_offset;
+    if prev_source_start
+        .checked_add(prev_source.span_bytes)
+        .ok_or_else(|| CompileError::InvalidInput("source span overflow".to_string()))?
+        != cur_source_start
+        || prev_dest_offset
+            .checked_add(prev_source.span_bytes)
+            .ok_or_else(|| CompileError::InvalidInput("destination span overflow".to_string()))?
+            != *cur_dest_offset
+    {
+        return Ok(false);
+    }
+    let span_bytes = prev_source
+        .span_bytes
+        .checked_add(cur_source.span_bytes)
+        .ok_or_else(|| CompileError::InvalidInput("merged bulk extent overflow".to_string()))?;
+    prev_source.file_offset = prev_source_start;
+    prev_source.span_bytes = span_bytes;
+    prev_source.stride = byte_extent(span_bytes);
+    Ok(true)
+}
+
+fn compact_extent_for_copy(extent: &StridedExtent) -> bool {
+    if extent.dims.iter().any(|dim| dim.count < 0) {
+        return false;
+    }
+    let mut stride = i64::from(extent.element_bytes);
+    for dim in extent.dims.iter().rev() {
+        if dim.src_stride != stride || dim.dst_stride != stride {
+            return false;
+        }
+        stride = match stride.checked_mul(dim.count) {
+            Some(value) => value,
+            None => return false,
+        };
+    }
+    true
+}
+
 fn validate_target_support(program: &StorageProgram) -> Result<(), CompileError> {
     for instr in &program.instrs {
         let StorageInstr::TileMap {
@@ -1026,15 +1669,170 @@ fn validate_target_support(program: &StorageProgram) -> Result<(), CompileError>
     Ok(())
 }
 
+fn merge_adjacent_extent_writes(program: &mut StorageProgram) -> Result<(), CompileError> {
+    if program.schedule.len() < 2 {
+        return Ok(());
+    }
+
+    let old_instrs = program.instrs.clone();
+    let mut merged: Vec<StorageInstr> = Vec::with_capacity(old_instrs.len());
+    let mut rewrites = 0_u64;
+
+    for instr_id in &program.schedule {
+        let instr = old_instrs
+            .get(instr_id.0 as usize)
+            .filter(|instr| instr_id_of(instr) == *instr_id)
+            .or_else(|| old_instrs.iter().find(|instr| instr_id_of(instr) == *instr_id))
+            .ok_or_else(|| {
+                CompileError::InvalidInput(format!("scheduled instr {} is missing", instr_id.0))
+            })?;
+
+        if let Some(previous) = merged.last_mut()
+            && try_merge_extent_write(previous, instr)?
+        {
+            rewrites += 1;
+            continue;
+        }
+        merged.push(instr.clone());
+    }
+
+    rewrite_program_instrs(program, merged)?;
+    if rewrites > 0 {
+        program.optimizer.passes.push(OptimizerPassStats {
+            name: "merge-adjacent-extent-writes".to_string(),
+            exprs_before: old_instrs.len(),
+            exprs_after: program.instrs.len(),
+            rewrites: usize::try_from(rewrites).unwrap_or(usize::MAX),
+        });
+    }
+    Ok(())
+}
+
+fn rewrite_program_instrs(
+    program: &mut StorageProgram,
+    merged: Vec<StorageInstr>,
+) -> Result<(), CompileError> {
+    program.instrs.clear();
+    program.schedule.clear();
+    program.instrs.reserve(merged.len());
+    program.schedule.reserve(merged.len());
+    for mut instr in merged {
+        let id = InstrId(
+            u32::try_from(program.instrs.len())
+                .map_err(|_| CompileError::InvalidInput("too many instructions".to_string()))?,
+        );
+        set_instr_id(&mut instr, id);
+        program.schedule.push(id);
+        program.instrs.push(instr);
+    }
+    Ok(())
+}
+
+fn try_merge_extent_write(
+    previous: &mut StorageInstr,
+    current: &StorageInstr,
+) -> Result<bool, CompileError> {
+    let (
+        StorageInstr::ExtentWrite {
+            source: prev_source,
+            dest: prev_dest,
+            ..
+        },
+        StorageInstr::ExtentWrite {
+            source: cur_source,
+            dest: cur_dest,
+            ..
+        },
+    ) = (previous, current)
+    else {
+        return Ok(false);
+    };
+
+    if prev_source.file_id != cur_source.file_id
+        || prev_dest.buffer != cur_dest.buffer
+        || !is_byte_extent(&prev_source.stride)
+        || !is_byte_extent(&cur_source.stride)
+        || !is_byte_extent(&prev_dest.stride)
+        || !is_byte_extent(&cur_dest.stride)
+    {
+        return Ok(false);
+    }
+
+    let prev_source_start = prev_source
+        .file_offset
+        .checked_add(prev_source.stride.base_offset)
+        .ok_or_else(|| CompileError::InvalidInput("source offset overflow".to_string()))?;
+    let cur_source_start = cur_source
+        .file_offset
+        .checked_add(cur_source.stride.base_offset)
+        .ok_or_else(|| CompileError::InvalidInput("source offset overflow".to_string()))?;
+    let prev_dest_start = prev_dest
+        .offset
+        .checked_add(prev_dest.stride.base_offset)
+        .ok_or_else(|| CompileError::InvalidInput("destination offset overflow".to_string()))?;
+    let cur_dest_start = cur_dest
+        .offset
+        .checked_add(cur_dest.stride.base_offset)
+        .ok_or_else(|| CompileError::InvalidInput("destination offset overflow".to_string()))?;
+
+    if prev_source_start
+        .checked_add(prev_source.span_bytes)
+        .ok_or_else(|| CompileError::InvalidInput("source span overflow".to_string()))?
+        != cur_source_start
+        || prev_dest_start
+            .checked_add(prev_source.span_bytes)
+            .ok_or_else(|| CompileError::InvalidInput("destination span overflow".to_string()))?
+            != cur_dest_start
+    {
+        return Ok(false);
+    }
+
+    let span_bytes = prev_source
+        .span_bytes
+        .checked_add(cur_source.span_bytes)
+        .ok_or_else(|| CompileError::InvalidInput("merged extent overflow".to_string()))?;
+    prev_source.file_offset = prev_source_start;
+    prev_source.span_bytes = span_bytes;
+    prev_source.stride = byte_extent(span_bytes);
+    prev_dest.offset = prev_dest_start;
+    prev_dest.stride = byte_extent(span_bytes);
+    Ok(true)
+}
+
+fn is_byte_extent(extent: &StridedExtent) -> bool {
+    extent.base_offset == 0
+        && extent.element_bytes == 1
+        && extent.dims.len() == 1
+        && extent.dims[0].src_stride == 1
+        && extent.dims[0].dst_stride == 1
+        && extent.dims[0].count >= 0
+}
+
 fn instr_id_of(instr: &StorageInstr) -> InstrId {
     match instr {
         StorageInstr::Allocate { id, .. }
         | StorageInstr::ExtentWrite { id, .. }
+        | StorageInstr::BulkExtentWrite { id, .. }
+        | StorageInstr::SlabScatter { id, .. }
         | StorageInstr::TileMap { id, .. }
         | StorageInstr::CreateView { id, .. }
         | StorageInstr::Attach { id, .. }
         | StorageInstr::Release { id, .. }
         | StorageInstr::Finalize { id, .. } => *id,
+    }
+}
+
+fn set_instr_id(instr: &mut StorageInstr, new_id: InstrId) {
+    match instr {
+        StorageInstr::Allocate { id, .. }
+        | StorageInstr::ExtentWrite { id, .. }
+        | StorageInstr::BulkExtentWrite { id, .. }
+        | StorageInstr::SlabScatter { id, .. }
+        | StorageInstr::TileMap { id, .. }
+        | StorageInstr::CreateView { id, .. }
+        | StorageInstr::Attach { id, .. }
+        | StorageInstr::Release { id, .. }
+        | StorageInstr::Finalize { id, .. } => *id = new_id,
     }
 }
 
@@ -1161,8 +1959,9 @@ fn narrow_repack_source(
 fn buffer_bytes(program: &StorageProgram, id: BufferId) -> Result<u64, CompileError> {
     program
         .buffers
-        .iter()
-        .find(|buffer| buffer.id == id)
+        .get(id.0 as usize)
+        .filter(|buffer| buffer.id == id)
+        .or_else(|| program.buffers.iter().find(|buffer| buffer.id == id))
         .map(|buffer| buffer.bytes)
         .ok_or_else(|| CompileError::InvalidInput(format!("buffer {} is missing", id.0)))
 }

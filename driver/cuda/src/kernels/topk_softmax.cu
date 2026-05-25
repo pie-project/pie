@@ -2,16 +2,16 @@
 
 #include <cuda_bf16.h>
 #include <cfloat>
+#include <stdexcept>
 
 namespace pie_cuda_driver::kernels {
 
 namespace {
 
 constexpr int BLOCK = 64;
-// Qwen3.6-35B-A3B uses 256 experts top-K=8; bump the static shmem
-// allocation to fit. 256 floats == 1 KB shared memory per block — well
-// under the budget on every supported GPU.
-constexpr int MAX_EXPERTS = 256;
+// Qwen3.6-35B-A3B uses 256 experts; Kimi K2.6 uses 384. Keep a single
+// static shared-memory slab large enough for both. 512 floats == 2 KB.
+constexpr int MAX_EXPERTS = 512;
 
 // One block per token. Phase 1: thread-local max-reduce + exp+sum-reduce
 // for softmax. Phase 2: K iterations of argmax-with-exclusion to pick the
@@ -93,6 +93,9 @@ void launch_topk_softmax_bf16(
     cudaStream_t stream)
 {
     if (N <= 0 || num_experts <= 0 || K <= 0) return;
+    if (num_experts > MAX_EXPERTS) {
+        throw std::runtime_error("topk_softmax_bf16: num_experts exceeds MAX_EXPERTS");
+    }
     topk_softmax_bf16_kernel<<<N, BLOCK, 0, stream>>>(
         static_cast<const __nv_bfloat16*>(logits),
         topk_idx, topk_w,

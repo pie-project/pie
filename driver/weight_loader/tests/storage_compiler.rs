@@ -109,7 +109,14 @@ fn direct_copy_lowers_to_identity_extent_write() {
         .instrs
         .iter()
         .filter_map(|instr| match instr {
-            StorageInstr::ExtentWrite { id, source, dest } => Some((id, source, dest)),
+            StorageInstr::ExtentWrite { id, source, dest } => {
+                Some((id, source, dest.offset))
+            }
+            StorageInstr::BulkExtentWrite {
+                id,
+                source,
+                dest_offset,
+            } => Some((id, source, *dest_offset)),
             _ => None,
         })
         .collect();
@@ -118,7 +125,7 @@ fn direct_copy_lowers_to_identity_extent_write() {
     assert_eq!(source.tensor_id, TensorId(6));
     assert_eq!(source.file_offset, 512);
     assert_eq!(source.span_bytes, 8);
-    assert_eq!(dest.offset, 0);
+    assert_eq!(dest, 0);
     assert_eq!(
         program.schedule,
         program.instrs.iter().map(instr_id).collect::<Vec<_>>()
@@ -168,6 +175,7 @@ fn packed_quant_row_select_uses_byte_exact_offsets() {
         .iter()
         .find_map(|instr| match instr {
             StorageInstr::ExtentWrite { source, .. } => Some(source),
+            StorageInstr::BulkExtentWrite { source, .. } => Some(source),
             _ => None,
         })
         .unwrap();
@@ -668,6 +676,8 @@ fn instr_id(instr: &StorageInstr) -> pie_weight_loader::types::InstrId {
     match instr {
         StorageInstr::Allocate { id, .. }
         | StorageInstr::ExtentWrite { id, .. }
+        | StorageInstr::BulkExtentWrite { id, .. }
+        | StorageInstr::SlabScatter { id, .. }
         | StorageInstr::TileMap { id, .. }
         | StorageInstr::CreateView { id, .. }
         | StorageInstr::Attach { id, .. }

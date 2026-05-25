@@ -1,13 +1,18 @@
 #pragma once
 
 #include <algorithm>
+#include <chrono>
+#include <cstdlib>
 #include <cstdint>
 #include <filesystem>
+#include <fstream>
+#include <iostream>
 #include <map>
 #include <sstream>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 #include "loader/rust_quant_attachment.hpp"
 #include "loader/rust_loader_input.hpp"
@@ -38,6 +43,308 @@ struct RustLoaderSourceIndex {
     std::unordered_map<std::string, std::uint32_t> tensor_ids;
     std::vector<std::string> tensor_names;
 };
+
+class RustLoaderFnv1a128 {
+public:
+    void update_bytes(const void* data, std::size_t len) noexcept
+    {
+        const auto* p = static_cast<const std::uint8_t*>(data);
+        for (std::size_t i = 0; i < len; ++i) {
+            h1_ ^= p[i];
+            h1_ *= 1099511628211ull;
+            h2_ ^= static_cast<std::uint64_t>(p[i]) + 0x9e3779b97f4a7c15ull +
+                   (h2_ << 6) + (h2_ >> 2);
+            h2_ *= 1099511628211ull;
+        }
+    }
+
+    template <typename T>
+    void update_scalar(T value) noexcept
+    {
+        update_bytes(&value, sizeof(value));
+    }
+
+    void update_loader_bytes(pie_weight_loader::PieLoaderBytes bytes) noexcept
+    {
+        update_scalar<std::uint64_t>(bytes.len);
+        if (bytes.ptr != nullptr && bytes.len != 0) {
+            update_bytes(bytes.ptr, bytes.len);
+        }
+    }
+
+    std::string hex() const
+    {
+        std::ostringstream out;
+        out << std::hex;
+        out.width(16);
+        out.fill('0');
+        out << h1_;
+        out.width(16);
+        out.fill('0');
+        out << h2_;
+        return out.str();
+    }
+
+private:
+    std::uint64_t h1_ = 1469598103934665603ull;
+    std::uint64_t h2_ = 1099511628211ull;
+};
+
+inline void rust_loader_hash_i64_slice(
+    RustLoaderFnv1a128& h,
+    pie_weight_loader::PieLoaderI64Slice slice)
+{
+    h.update_scalar<std::uint64_t>(slice.len);
+    for (std::size_t i = 0; i < slice.len; ++i) {
+        h.update_scalar<std::int64_t>(slice.ptr[i]);
+    }
+}
+
+inline void rust_loader_hash_u32_slice(
+    RustLoaderFnv1a128& h,
+    pie_weight_loader::PieLoaderU32Slice slice)
+{
+    h.update_scalar<std::uint64_t>(slice.len);
+    for (std::size_t i = 0; i < slice.len; ++i) {
+        h.update_scalar<std::uint32_t>(slice.ptr[i]);
+    }
+}
+
+inline void rust_loader_hash_byte_spans(
+    RustLoaderFnv1a128& h,
+    pie_weight_loader::PieLoaderRuntimeByteSpanSlice slice)
+{
+    h.update_scalar<std::uint64_t>(slice.len);
+    for (std::size_t i = 0; i < slice.len; ++i) {
+        const auto& s = slice.ptr[i];
+        h.update_scalar(s.source_tensor_id);
+        h.update_scalar(s.source_offset_bytes);
+        h.update_scalar(s.dest_offset_bytes);
+        h.update_scalar(s.span_bytes);
+    }
+}
+
+inline std::string rust_loader_compile_cache_key(
+    const pie_weight_loader::PieLoaderCompileInput& input)
+{
+    RustLoaderFnv1a128 h;
+    constexpr const char* cache_version =
+        "pie-cuda-rust-storage-program-cache-v9";
+    h.update_bytes(cache_version, std::char_traits<char>::length(cache_version));
+    h.update_scalar(input.version);
+    h.update_loader_bytes(input.model.model_type);
+    h.update_loader_bytes(input.model.quant_method);
+    h.update_loader_bytes(input.model.runtime_quant);
+    h.update_scalar(input.model.num_hidden_layers);
+    h.update_scalar(input.model.num_experts);
+    h.update_scalar(input.model.num_experts_per_tok);
+    h.update_scalar(static_cast<std::uint32_t>(input.target.backend));
+    h.update_scalar(input.target.tp_rank);
+    h.update_scalar(input.target.tp_size);
+    h.update_scalar(input.target.max_tile_bytes);
+    h.update_scalar(input.target.preferred_alignment);
+    h.update_scalar(static_cast<std::uint32_t>(input.target.mxfp4_moe));
+    h.update_scalar(static_cast<std::uint8_t>(input.target.native_mxfp4_moe));
+    h.update_loader_bytes(input.runtime_abi.name);
+    h.update_scalar(input.runtime_abi.version);
+
+    h.update_scalar<std::uint64_t>(input.files.len);
+    for (std::size_t i = 0; i < input.files.len; ++i) {
+        const auto& f = input.files.ptr[i];
+        h.update_scalar(f.id);
+        h.update_loader_bytes(f.path);
+        h.update_scalar(f.size_bytes);
+        h.update_scalar(static_cast<std::uint32_t>(f.format));
+    }
+
+    h.update_scalar<std::uint64_t>(input.tensors.len);
+    for (std::size_t i = 0; i < input.tensors.len; ++i) {
+        const auto& t = input.tensors.ptr[i];
+        h.update_scalar(t.id);
+        h.update_loader_bytes(t.name);
+        h.update_scalar(t.file_id);
+        h.update_scalar(t.file_offset);
+        h.update_scalar(t.span_bytes);
+        h.update_scalar(static_cast<std::uint32_t>(t.dtype));
+        h.update_scalar(static_cast<std::uint32_t>(t.encoding_kind));
+        h.update_scalar(static_cast<std::uint32_t>(t.quant_scheme));
+        rust_loader_hash_i64_slice(h, t.shape);
+        h.update_scalar(t.quant_bits_per_element);
+        h.update_scalar(t.quant_group_size);
+        h.update_scalar(t.quant_channel_axis);
+        h.update_scalar(static_cast<std::uint8_t>(t.quant_has_scale_dtype));
+        h.update_scalar(static_cast<std::uint32_t>(t.quant_scale_dtype));
+        h.update_scalar(static_cast<std::uint8_t>(t.quant_has_zero_point_dtype));
+        h.update_scalar(static_cast<std::uint32_t>(t.quant_zero_point_dtype));
+        rust_loader_hash_i64_slice(h, t.quant_block_shape);
+    }
+
+    h.update_scalar<std::uint64_t>(input.runtime_abi.tensors.len);
+    for (std::size_t i = 0; i < input.runtime_abi.tensors.len; ++i) {
+        const auto& t = input.runtime_abi.tensors.ptr[i];
+        h.update_loader_bytes(t.output_name);
+        h.update_scalar(static_cast<std::uint32_t>(t.source_kind));
+        h.update_scalar(t.source_tensor_id);
+        rust_loader_hash_u32_slice(h, t.source_tensor_ids);
+        rust_loader_hash_byte_spans(h, t.byte_spans);
+        rust_loader_hash_u32_slice(h, t.metadata_tensor_ids);
+        h.update_scalar(t.source_contract_id);
+        h.update_scalar(static_cast<std::uint32_t>(t.semantic_role));
+        h.update_scalar(t.layer);
+        h.update_scalar(static_cast<std::uint8_t>(t.has_layer));
+        h.update_scalar(t.expert);
+        h.update_scalar(static_cast<std::uint8_t>(t.has_expert));
+        h.update_scalar(t.axis);
+        h.update_scalar(t.start);
+        h.update_scalar(t.length);
+        h.update_scalar(static_cast<std::uint32_t>(t.dtype));
+        h.update_scalar(static_cast<std::uint32_t>(t.encoding_kind));
+        h.update_scalar(static_cast<std::uint32_t>(t.quant_scheme));
+        rust_loader_hash_i64_slice(h, t.shape);
+        h.update_scalar(t.alignment);
+        h.update_scalar(t.shard_axis);
+        h.update_scalar(t.quant_bits_per_element);
+        h.update_scalar(t.quant_group_size);
+        h.update_scalar(t.quant_channel_axis);
+        h.update_scalar(static_cast<std::uint8_t>(t.quant_has_scale_dtype));
+        h.update_scalar(static_cast<std::uint32_t>(t.quant_scale_dtype));
+        h.update_scalar(static_cast<std::uint8_t>(t.quant_has_zero_point_dtype));
+        h.update_scalar(static_cast<std::uint32_t>(t.quant_zero_point_dtype));
+        rust_loader_hash_i64_slice(h, t.quant_block_shape);
+    }
+    if (const char* tag = std::getenv("PIE_WEIGHT_LOADER_COMPILE_CACHE_TAG");
+        tag != nullptr && tag[0] != '\0') {
+        h.update_bytes(tag, std::char_traits<char>::length(tag));
+    }
+    return h.hex();
+}
+
+inline bool rust_loader_compile_cache_enabled()
+{
+    if (const char* value = std::getenv("PIE_WEIGHT_LOADER_COMPILE_CACHE");
+        value != nullptr) {
+        return std::string(value) != "0" && std::string(value) != "false";
+    }
+    return true;
+}
+
+inline bool rust_loader_compile_cache_debug()
+{
+    return std::getenv("PIE_WEIGHT_LOADER_DEBUG") != nullptr ||
+           std::getenv("PIE_WEIGHT_LOADER_COMPILE_CACHE_DEBUG") != nullptr;
+}
+
+inline std::filesystem::path rust_loader_compile_cache_dir()
+{
+    if (const char* dir = std::getenv("PIE_WEIGHT_LOADER_COMPILE_CACHE_DIR");
+        dir != nullptr && dir[0] != '\0') {
+        return std::filesystem::path(dir);
+    }
+    if (const char* xdg = std::getenv("XDG_CACHE_HOME");
+        xdg != nullptr && xdg[0] != '\0') {
+        return std::filesystem::path(xdg) / "pie" / "weight-loader" /
+               "compile-v1";
+    }
+    if (const char* home = std::getenv("HOME");
+        home != nullptr && home[0] != '\0') {
+        return std::filesystem::path(home) / ".cache" / "pie" /
+               "weight-loader" / "compile-v1";
+    }
+    return std::filesystem::temp_directory_path() / "pie-weight-loader" /
+           "compile-v1";
+}
+
+inline bool rust_loader_read_file(
+    const std::filesystem::path& path,
+    std::vector<std::uint8_t>& bytes)
+{
+    std::ifstream in(path, std::ios::binary | std::ios::ate);
+    if (!in) return false;
+    const auto size = in.tellg();
+    if (size < 0) return false;
+    bytes.resize(static_cast<std::size_t>(size));
+    in.seekg(0);
+    if (!bytes.empty()) {
+        in.read(reinterpret_cast<char*>(bytes.data()), bytes.size());
+    }
+    return static_cast<bool>(in);
+}
+
+inline void rust_loader_write_file_atomic(
+    const std::filesystem::path& path,
+    const std::vector<std::uint8_t>& bytes)
+{
+    std::error_code ec;
+    std::filesystem::create_directories(path.parent_path(), ec);
+    if (ec) return;
+    const auto now = std::chrono::steady_clock::now().time_since_epoch().count();
+    const auto tmp = path.string() + ".tmp." + std::to_string(now);
+    {
+        std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
+        if (!out) return;
+        if (!bytes.empty()) {
+            out.write(reinterpret_cast<const char*>(bytes.data()), bytes.size());
+        }
+        if (!out) {
+            std::filesystem::remove(tmp, ec);
+            return;
+        }
+    }
+    std::filesystem::rename(tmp, path, ec);
+    if (ec) {
+        std::filesystem::remove(tmp, ec);
+    }
+}
+
+inline RustStorageProgram compile_rust_storage_program_cached(
+    const pie_weight_loader::PieLoaderCompileInput& input)
+{
+    if (!rust_loader_compile_cache_enabled()) {
+        return compile_rust_storage_program(input);
+    }
+
+    const auto key = rust_loader_compile_cache_key(input);
+    const auto path = rust_loader_compile_cache_dir() / (key + ".bin");
+    if (std::getenv("PIE_WEIGHT_LOADER_COMPILE_CACHE_RESET") == nullptr) {
+        std::vector<std::uint8_t> bytes;
+        if (rust_loader_read_file(path, bytes)) {
+            try {
+                RustStorageProgram program =
+                    deserialize_rust_storage_program(bytes);
+                if (rust_loader_compile_cache_debug()) {
+                    std::cerr << "[pie-weight-loader] compile cache hit "
+                              << path << " bytes=" << bytes.size() << "\n";
+                }
+                return program;
+            } catch (const std::exception& e) {
+                if (rust_loader_compile_cache_debug()) {
+                    std::cerr << "[pie-weight-loader] compile cache ignored "
+                              << path << ": " << e.what() << "\n";
+                }
+            }
+        }
+    }
+
+    if (rust_loader_compile_cache_debug()) {
+        std::cerr << "[pie-weight-loader] compile cache miss " << path << "\n";
+    }
+    RustStorageProgram program = compile_rust_storage_program(input);
+    try {
+        std::vector<std::uint8_t> bytes =
+            serialize_rust_storage_program(program);
+        rust_loader_write_file_atomic(path, bytes);
+        if (rust_loader_compile_cache_debug()) {
+            std::cerr << "[pie-weight-loader] compile cache stored " << path
+                      << " bytes=" << bytes.size() << "\n";
+        }
+    } catch (const std::exception& e) {
+        if (rust_loader_compile_cache_debug()) {
+            std::cerr << "[pie-weight-loader] compile cache store failed "
+                      << path << ": " << e.what() << "\n";
+        }
+    }
+    return program;
+}
 
 inline RustLoaderSourceIndex add_checkpoint_metadata_to_rust_input(
     RustLoaderInputBuilder& input,
@@ -174,7 +481,7 @@ inline RustLoaderCompileResult compile_rust_loader_plan_from_metadata(
 
     RustLoaderSourceIndex source_index =
         add_checkpoint_metadata_to_rust_input(input, loader);
-    RustStorageProgram program = compile_rust_storage_program(input.view());
+    RustStorageProgram program = compile_rust_storage_program_cached(input.view());
     const auto view = program.view();
     const std::size_t runtime_tensor_count = view.tensors.len;
     std::vector<RustQuantAttachment> attachments =
@@ -234,6 +541,10 @@ inline const char* rust_storage_instr_kind_name(
         return "Release";
     case pie_weight_loader::PieLoaderStorageInstrKind::Finalize:
         return "Finalize";
+    case pie_weight_loader::PieLoaderStorageInstrKind::BulkExtentWrite:
+        return "BulkExtentWrite";
+    case pie_weight_loader::PieLoaderStorageInstrKind::SlabScatter:
+        return "SlabScatter";
     }
     return "Unknown";
 }

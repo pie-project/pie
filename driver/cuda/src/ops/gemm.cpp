@@ -137,6 +137,13 @@ int cublaslt_bf16_min_n(int K) {
     // very wide lm_head; routing their 2k/6k projection GEMMs through Lt was
     // consistently slower. H=2048 keeps the previous threshold because the
     // 1.7B-class models still prefer Lt for their 6k-wide MLP projection.
+    //
+    // For large hidden sizes, the current Lt heuristic can select kernels
+    // that fault on compact multi-row lm_head shapes such as Kimi TP greedy
+    // prefill (M small, N ~= 20k, K ~= 7k). The classic cuBLAS path is stable
+    // for those shapes and is already used for M=1 decode, so keep Lt out of
+    // the large-H wide-output path by default.
+    if (K >= 4096) return 32768;
     return K < 2048 ? 12288 : (K == 2048 ? 6144 : 12288);
 }
 
@@ -147,6 +154,15 @@ int cublaslt_bf16_min_k() {
         return std::max(0, std::atoi(v));
     }();
     return min_k;
+}
+
+int cublaslt_bf16_min_m() {
+    static const int min_m = [] {
+        const char* v = std::getenv("PIE_CUBLASLT_BF16_MIN_M");
+        if (v == nullptr || v[0] == '\0') return 2;
+        return std::max(0, std::atoi(v));
+    }();
+    return min_m;
 }
 
 int cublaslt_bf16_max_n() {
@@ -321,6 +337,7 @@ void gemm_bf16_impl(
     const float alpha = 1.f;
     const int lt_max_n = cublaslt_bf16_max_n();
     if (use_cublaslt_bf16() &&
+        M >= cublaslt_bf16_min_m() &&
         N >= cublaslt_bf16_min_n(K) &&
         K >= cublaslt_bf16_min_k() &&
         (lt_max_n == 0 || N <= lt_max_n) &&

@@ -6,7 +6,7 @@ use crate::types::{
     TensorDecl, TensorId,
 };
 
-pub const STORAGE_PROGRAM_VERSION: u32 = 1;
+pub const STORAGE_PROGRAM_VERSION: u32 = 3;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MemoryPlan {
@@ -49,6 +49,7 @@ pub struct BufferDecl {
     pub bytes: u64,
     pub alignment: u32,
     pub temporary: bool,
+    pub persistent_offset: Option<u64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -79,6 +80,13 @@ pub struct DestExtent {
     pub buffer: BufferId,
     pub offset: u64,
     pub stride: StridedExtent,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SlabPlacement {
+    pub src_offset: u64,
+    pub dest_offset: u64,
+    pub bytes: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -120,6 +128,18 @@ pub enum StorageInstr {
         id: InstrId,
         source: SourceExtent,
         dest: DestExtent,
+    },
+    BulkExtentWrite {
+        id: InstrId,
+        source: SourceExtent,
+        dest_offset: u64,
+    },
+    SlabScatter {
+        id: InstrId,
+        file_id: FileId,
+        file_offset: u64,
+        span_bytes: u64,
+        placements: Vec<SlabPlacement>,
     },
     TileMap {
         id: InstrId,
