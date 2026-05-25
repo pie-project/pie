@@ -2,21 +2,26 @@
 
 ## Kimi CUDA Driver
 
-- Investigate the remaining Moon-prompt repetition case.
-  - France smoke test on the normal CUDA path is sensible: `The capital of France is Paris.`
-  - The Moon prompt still repeats meta text, and forcing the prefill MoE path did not change it.
-  - Likely areas: MLA/KV cache state, decode context update, position handling, stop handling, or prompt/template edge cases.
+- ~~Investigate the remaining Moon-prompt repetition case.~~ (partially resolved)
+  - **Fixed**: 4 bugs found and fixed:
+    1. MLA KV cache uninitialized (`mla_cache.cpp`: `cudaMemset` after alloc)
+    2. Missing `e_score_correction_bias` for noaux_tc MoE routing (`kimi.hpp/cpp`, `kimi_mla.cu/hpp`, `generic.rs`)
+    3. YaRN RoPE not applied: `has_rope_scaling=true` missing from yarn branch, wrong `mscale_all_dim` handling (`hf_config.cpp`), added `launch_rope_yarn_original_bf16` call (`kimi_forward.cpp`)
+    4. Routing weights used biased scores instead of original sigmoid (`kimi_mla.cu`)
+  - **Result**: France smoke test correct ("Paris."). Model recognizes topics correctly. Raw completion produces correct content.
+  - **Remaining**: Output still repeats for multi-sentence generation. Root cause: FlashInfer `BatchMLAPagedAttention` (absorbed Q, 512-dim dot products) accumulates more FP error per layer than vLLM's explicit-K/V prefill + TRT-LLM decode path (128-dim dot products). Fix: implement explicit K/V attention for prefill (compute K,V from `kv_b_proj @ kv_c`) matching vLLM's approach.
 - Keep `PIE_CUDA_KIMI_FORCE_PREFILL_MOE` as a temporary diagnostic switch only.
   - Remove it once the decode path is validated.
+- Implement explicit K/V prefill for Kimi MLA.
+  - During prefill, compute `kv = kv_b_proj(kv_c)` → explicit K_nope, V.
+  - Use standard FlashInfer prefill attention (not absorbed MLA).
+  - Continue using absorbed MLA for decode (read from compressed KV cache).
+  - This matches vLLM's architecture and should fix the remaining repetition.
 - Add focused correctness tests for Kimi decode.
   - Single request, deterministic temperature 0.
   - Multi-token decode with EOS enabled and disabled.
   - Batch size > 1 with mixed prompt lengths.
   - Long context prefill followed by decode.
-- Compare intermediate tensors against a trusted implementation for a tiny request.
-  - Start with logits after prefill.
-  - Then compare first decode step.
-  - If logits diverge, narrow by layer: embedding, MLA attention, MoE routing, expert output, residual/norm.
 
 ## Weight Loader Correctness
 

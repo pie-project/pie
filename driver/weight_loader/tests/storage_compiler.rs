@@ -672,6 +672,204 @@ fn tensor_bytes(shape: &[i64], dtype: DType) -> u64 {
         .fold(dtype.bytes(), |acc, dim| acc * u64::try_from(*dim).unwrap())
 }
 
+// ── SlabScatter lowering tests ──────────────────────────────────────
+
+#[test]
+fn slab_scatter_merges_nearby_bulk_extent_writes() {
+    // Three tensors with small gaps in the file. The gaps prevent
+    // coalesce_persistent_arena_writes from merging them into a single
+    // BulkExtentWrite, but they're close enough for slab_scatter to
+    // group them (gap < 64 MiB, overread < 5/4).
+    let chunk = 2 * 1024 * 1024; // 2 MiB per tensor
+    let gap = 1024; // 1 KiB gap between tensors in the file
+    let file_size = chunk * 3 + gap * 2 + 4096;
+    let meta = CheckpointMetadata {
+        files: vec![CheckpointFile {
+            id: FileId(0),
+            path: "big.safetensors".to_string(),
+            size_bytes: file_size,
+            format: CheckpointFormat::Safetensors,
+        }],
+        tensors: vec![
+            raw_big(0, "t0", 0, chunk, DType::BF16),
+            raw_big(1, "t1", chunk + gap, chunk, DType::BF16),
+            raw_big(2, "t2", 2 * (chunk + gap), chunk, DType::BF16),
+        ],
+    };
+    let mut plan = LayoutPlan::new();
+    let mut ids = Vec::new();
+    for i in 0..3u32 {
+        let cols = (chunk / 2) as i64; // BF16 = 2 bytes
+        let src = plan.push(LayoutExpr::Source {
+            tensor: TensorId(i),
+            decl: decl(i, &format!("t{i}"), &[cols], Encoding::Raw(DType::BF16)),
+        });
+        let r = plan.push(LayoutExpr::Realize {
+            input: src,
+            runtime_name: format!("t{i}"),
+            decl: decl(i, &format!("t{i}"), &[cols], Encoding::Raw(DType::BF16)),
+        });
+        ids.push(r);
+    }
+    plan.outputs = ids;
+
+    let target = StorageTarget {
+        backend: BackendKind::Cuda,
+        ..StorageTarget::default()
+    };
+    let program = lower_layout_plan(&meta, &plan, target).unwrap();
+
+    let slabs: Vec<_> = program
+        .instrs
+        .iter()
+        .filter(|i| matches!(i, StorageInstr::SlabScatter { .. }))
+        .collect();
+    assert!(
+        !slabs.is_empty(),
+        "expected at least one SlabScatter, got none; instrs: {:#?}",
+        program.instrs,
+    );
+    if let StorageInstr::SlabScatter { placements, span_bytes, .. } = slabs[0] {
+        assert!(
+            placements.len() >= 2,
+            "slab must have at least 2 placements, got {}",
+            placements.len()
+        );
+        assert!(
+            *span_bytes >= chunk * 2,
+            "slab span_bytes {} should cover at least two chunks",
+            span_bytes,
+        );
+        for p in placements {
+            assert!(
+                p.bytes > 0,
+                "placement bytes must be non-zero"
+            );
+        }
+    }
+}
+
+#[test]
+fn slab_scatter_rejects_excessive_overread() {
+    // Two small tensors with a huge gap — overread exceeds 5/4 threshold.
+    let small = 1024 * 1024; // 1 MiB each
+    let gap = 256 * 1024 * 1024; // 256 MiB gap
+    let file_size = small + gap + small;
+    let meta = CheckpointMetadata {
+        files: vec![CheckpointFile {
+            id: FileId(0),
+            path: "sparse.safetensors".to_string(),
+            size_bytes: file_size,
+            format: CheckpointFormat::Safetensors,
+        }],
+        tensors: vec![
+            raw_big(0, "near", 0, small, DType::BF16),
+            raw_big(1, "far", small + gap, small, DType::BF16),
+        ],
+    };
+    let mut plan = LayoutPlan::new();
+    for i in 0..2u32 {
+        let cols = (small / 2) as i64;
+        let src = plan.push(LayoutExpr::Source {
+            tensor: TensorId(i),
+            decl: decl(i, &format!("t{i}"), &[cols], Encoding::Raw(DType::BF16)),
+        });
+        let r = plan.push(LayoutExpr::Realize {
+            input: src,
+            runtime_name: format!("t{i}"),
+            decl: decl(i, &format!("t{i}"), &[cols], Encoding::Raw(DType::BF16)),
+        });
+        plan.outputs.push(r);
+    }
+    let target = StorageTarget {
+        backend: BackendKind::Cuda,
+        ..StorageTarget::default()
+    };
+    let program = lower_layout_plan(&meta, &plan, target).unwrap();
+    let slabs: Vec<_> = program
+        .instrs
+        .iter()
+        .filter(|i| matches!(i, StorageInstr::SlabScatter { .. }))
+        .collect();
+    assert!(
+        slabs.is_empty(),
+        "should NOT merge into SlabScatter when overread is excessive; got {:#?}",
+        slabs,
+    );
+}
+
+#[test]
+fn slab_scatter_placement_offsets_are_within_span() {
+    let chunk = 4 * 1024 * 1024;
+    let gap = 512 * 1024; // small gap
+    let file_size = chunk * 3 + gap * 2;
+    let meta = CheckpointMetadata {
+        files: vec![CheckpointFile {
+            id: FileId(0),
+            path: "layout.safetensors".to_string(),
+            size_bytes: file_size,
+            format: CheckpointFormat::Safetensors,
+        }],
+        tensors: vec![
+            raw_big(0, "a", 0, chunk, DType::BF16),
+            raw_big(1, "b", chunk + gap, chunk, DType::BF16),
+            raw_big(2, "c", 2 * (chunk + gap), chunk, DType::BF16),
+        ],
+    };
+    let mut plan = LayoutPlan::new();
+    for i in 0..3u32 {
+        let cols = (chunk / 2) as i64;
+        let src = plan.push(LayoutExpr::Source {
+            tensor: TensorId(i),
+            decl: decl(i, &format!("p{i}"), &[cols], Encoding::Raw(DType::BF16)),
+        });
+        let r = plan.push(LayoutExpr::Realize {
+            input: src,
+            runtime_name: format!("p{i}"),
+            decl: decl(i, &format!("p{i}"), &[cols], Encoding::Raw(DType::BF16)),
+        });
+        plan.outputs.push(r);
+    }
+    let target = StorageTarget {
+        backend: BackendKind::Cuda,
+        ..StorageTarget::default()
+    };
+    let program = lower_layout_plan(&meta, &plan, target).unwrap();
+    for instr in &program.instrs {
+        if let StorageInstr::SlabScatter {
+            span_bytes,
+            placements,
+            ..
+        } = instr
+        {
+            for (idx, p) in placements.iter().enumerate() {
+                assert!(
+                    p.src_offset + p.bytes <= *span_bytes,
+                    "placement {idx}: src_offset {} + bytes {} exceeds span_bytes {}",
+                    p.src_offset,
+                    p.bytes,
+                    span_bytes,
+                );
+            }
+        }
+    }
+}
+
+fn raw_big(id: u32, name: &str, offset: u64, span_bytes: u64, dtype: DType) -> RawTensor {
+    let elem = dtype.bytes();
+    let count = (span_bytes / elem) as i64;
+    RawTensor {
+        id: TensorId(id),
+        name: name.to_string(),
+        file_id: FileId(0),
+        file_offset: offset,
+        span_bytes,
+        shape: vec![count],
+        encoding: Encoding::Raw(dtype),
+        layout: Layout::dense(1),
+    }
+}
+
 fn instr_id(instr: &StorageInstr) -> pie_weight_loader::types::InstrId {
     match instr {
         StorageInstr::Allocate { id, .. }

@@ -53,6 +53,65 @@ bool kimi_profile_all_ranks() {
     return enabled;
 }
 
+bool kimi_dump_logits_enabled() {
+    static const bool enabled = [] {
+        const char* v = std::getenv("PIE_KIMI_DUMP_LOGITS");
+        return v != nullptr && v[0] != '\0' && v[0] != '0';
+    }();
+    return enabled;
+}
+
+void dump_top_logits(const void* logits_bf16, int rows, int cols,
+                     int tp_rank, int vocab_offset, cudaStream_t stream) {
+    if (!kimi_dump_logits_enabled() || tp_rank != 0) return;
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    const std::size_t n = static_cast<std::size_t>(rows) * cols;
+    std::vector<std::uint16_t> host(n);
+    CUDA_CHECK(cudaMemcpy(host.data(), logits_bf16,
+        n * sizeof(std::uint16_t), cudaMemcpyDeviceToHost));
+    for (int r = 0; r < rows; ++r) {
+        std::vector<std::pair<float, int>> vals;
+        for (int c = 0; c < cols; ++c) {
+            const __nv_bfloat16* p = reinterpret_cast<const __nv_bfloat16*>(
+                &host[static_cast<std::size_t>(r) * cols + c]);
+            vals.emplace_back(__bfloat162float(*p), vocab_offset + c);
+        }
+        std::sort(vals.begin(), vals.end(),
+            [](auto& a, auto& b) { return a.first > b.first; });
+        std::cerr << "[pie-logits] rank=" << tp_rank << " row=" << r;
+        for (int i = 0; i < std::min(10, static_cast<int>(vals.size())); ++i) {
+            std::cerr << " " << vals[i].second << ":" << vals[i].first;
+        }
+        std::cerr << "\n";
+    }
+}
+
+void dump_hidden_norm(const void* hidden_bf16, int tokens, int hidden,
+                      int layer, const char* tag, int tp_rank,
+                      cudaStream_t stream) {
+    if (!kimi_dump_logits_enabled() || tp_rank != 0) return;
+    if (tokens > 1) return;
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    const std::size_t n = static_cast<std::size_t>(tokens) * hidden;
+    std::vector<std::uint16_t> host(n);
+    CUDA_CHECK(cudaMemcpy(host.data(), hidden_bf16,
+        n * sizeof(std::uint16_t), cudaMemcpyDeviceToHost));
+    double sum_sq = 0.0;
+    float max_abs = 0.f;
+    for (std::size_t i = 0; i < n; ++i) {
+        const float v = __bfloat162float(
+            *reinterpret_cast<const __nv_bfloat16*>(&host[i]));
+        sum_sq += static_cast<double>(v) * v;
+        max_abs = std::max(max_abs, std::abs(v));
+    }
+    const float rms = std::sqrt(static_cast<float>(sum_sq / n));
+    std::cerr << "[pie-hidden] layer=" << layer
+              << " tag=" << tag
+              << " rms=" << rms
+              << " max=" << max_abs
+              << "\n";
+}
+
 struct KimiForwardProfile {
     bool enabled = false;
     int tp_rank = 0;
@@ -321,6 +380,18 @@ void prepare_kimi_mla_plan(
     int tp_size)
 {
     if (!state.mla_plan) state.mla_plan = ops::make_mla_plan();
+    if (kimi_dump_logits_enabled()) {
+        static int plan_seq = 0;
+        int seq = plan_seq++;
+        int pages = kv_page_indptr_h[1] - kv_page_indptr_h[0];
+        int page_sz = cache.page_size();
+        int kv_len = (pages - 1) * page_sz + kv_last_page_lens_h[0];
+        char buf[256];
+        std::snprintf(buf, sizeof(buf),
+            "[pie-plan] seq=%d N=%d R=%d causal=%d kv_len=%d\n",
+            seq, total_tokens, num_requests, causal ? 1 : 0, kv_len);
+        write(2, buf, std::strlen(buf));
+    }
     ops::plan_attention_mla_bf16(
         *state.mla_plan,
         qo_indptr_h,
@@ -400,6 +471,40 @@ void kimi_forward_paged(
             tp->all_reduce_bf16(kimi_ws.y.data(),
                 static_cast<std::size_t>(total_tokens) * static_cast<std::size_t>(H),
                 ncclSum, stream);
+            if (kimi_dump_logits_enabled() && (tp == nullptr || tp->rank() == 0)) {
+                CUDA_CHECK(cudaStreamSynchronize(stream));
+                // Dump positions
+                std::vector<std::int32_t> pos_h(total_tokens);
+                CUDA_CHECK(cudaMemcpy(pos_h.data(), positions,
+                    total_tokens * sizeof(std::int32_t), cudaMemcpyDeviceToHost));
+                std::cerr << "[pie-pos] N=" << total_tokens << " positions:";
+                for (int i = 0; i < std::min(total_tokens, 5); ++i)
+                    std::cerr << " " << pos_h[i];
+                if (total_tokens > 5) std::cerr << " ...";
+                std::cerr << "\n";
+                // Dump token IDs
+                std::vector<std::int32_t> tok_h(total_tokens);
+                CUDA_CHECK(cudaMemcpy(tok_h.data(), token_ids,
+                    total_tokens * sizeof(std::int32_t), cudaMemcpyDeviceToHost));
+                std::cerr << "[pie-tokens] N=" << total_tokens << " ids:";
+                for (int i = 0; i < std::min(total_tokens, 5); ++i)
+                    std::cerr << " " << tok_h[i];
+                if (total_tokens > 5) std::cerr << " ... " << tok_h[total_tokens-1];
+                std::cerr << "\n";
+                // Dump embed
+                if (total_tokens <= 1) {
+                    std::vector<std::uint16_t> hbuf(static_cast<std::size_t>(H));
+                    CUDA_CHECK(cudaMemcpy(hbuf.data(), kimi_ws.y.data(),
+                        H * sizeof(std::uint16_t), cudaMemcpyDeviceToHost));
+                    std::cerr << "[pie-embed] first10:";
+                    for (int i = 0; i < 10; ++i) {
+                        float v = __bfloat162float(
+                            *reinterpret_cast<const __nv_bfloat16*>(&hbuf[i]));
+                        std::cerr << " " << v;
+                    }
+                    std::cerr << "\n";
+                }
+            }
         } else {
             kernels::launch_embed_bf16(
                 token_ids, w.embed->data(), kimi_ws.y.data(),
@@ -438,19 +543,39 @@ void kimi_forward_paged(
             kernels::launch_kimi_split_q_b_bf16(
                 kimi_ws.q_b.data(), kimi_ws.q_nope.data(), kimi_ws.q_pe.data(),
                 total_tokens, heads, q_nope, q_rope, stream);
-            kernels::launch_rope_bf16(
-                kimi_ws.q_pe.data(), kimi_ws.k_pe.data(), positions,
-                total_tokens, heads, 1, q_rope, cfg.rope_theta, stream);
-            kernels::launch_kimi_q_nope_to_latent_bf16(
-                kimi_ws.q_nope.data(), Lw.kv_b_proj->data(),
-                kimi_ws.q_nope_latent.data(),
-                total_tokens, heads, q_nope, v_dim, kv_lora, stream);
-
+            if (kimi_dump_logits_enabled() && li == 0 && (tp == nullptr || tp->rank() == 0)) {
+                char buf[256];
+                std::snprintf(buf, sizeof(buf),
+                    "[pie-rope] has_scaling=%d kind=%d factor=%.1f beta_fast=%.1f beta_slow=%.1f attn_factor=%.3f orig_max=%d\n",
+                    cfg.has_rope_scaling ? 1 : 0,
+                    static_cast<int>(cfg.rope_scaling_kind),
+                    cfg.rope_factor, cfg.rope_beta_fast, cfg.rope_beta_slow,
+                    cfg.rope_attention_factor, cfg.rope_original_max_position);
+                write(2, buf, std::strlen(buf));
+            }
+            if (cfg.has_rope_scaling &&
+                cfg.rope_scaling_kind == HfConfig::RopeScaling::OriginalYaRN) {
+                kernels::launch_rope_yarn_original_bf16(
+                    kimi_ws.q_pe.data(), kimi_ws.k_pe.data(), positions,
+                    total_tokens, heads, 1, q_rope, cfg.rope_theta,
+                    cfg.rope_factor, cfg.rope_beta_fast, cfg.rope_beta_slow,
+                    cfg.rope_attention_factor,
+                    cfg.rope_original_max_position, stream);
+            } else {
+                kernels::launch_rope_bf16(
+                    kimi_ws.q_pe.data(), kimi_ws.k_pe.data(), positions,
+                    total_tokens, heads, 1, q_rope, cfg.rope_theta, stream);
+            }
             auto layer_view = mla_cache.layer_view(li);
             kernels::launch_write_mla_to_pages(
                 layer_view, kimi_ws.kv_c.data(), kimi_ws.k_pe.data(),
                 qo_indptr, kv_page_indices, kv_page_indptr, kv_last_page_lens,
                 total_tokens, num_requests, stream);
+
+            kernels::launch_kimi_q_nope_to_latent_bf16(
+                kimi_ws.q_nope.data(), Lw.kv_b_proj->data(),
+                kimi_ws.q_nope_latent.data(),
+                total_tokens, heads, q_nope, v_dim, kv_lora, stream);
 
             if (!plan_state.mla_plan) {
                 throw std::runtime_error("kimi: MLA plan missing; prepare hook did not run");
@@ -528,12 +653,17 @@ void kimi_forward_paged(
                 kimi_ws.router_logits.data(),
                 static_cast<std::int32_t*>(kimi_ws.topk_idx.data()),
                 static_cast<float*>(kimi_ws.topk_weights.data()),
+                Lw.e_score_correction_bias != nullptr
+                    ? static_cast<const float*>(Lw.e_score_correction_bias->data())
+                    : nullptr,
                 total_tokens, E, K, cfg.norm_topk_prob,
                 cfg.routed_scaling_factor, stream);
         });
 
-        const bool force_prefill_moe =
-            std::getenv("PIE_CUDA_KIMI_FORCE_PREFILL_MOE") != nullptr;
+        static const bool force_prefill_moe = [] {
+            const char* v = std::getenv("PIE_CUDA_KIMI_FORCE_PREFILL_MOE");
+            return v != nullptr && v[0] != '\0';
+        }();
         if (is_pure_decode && !force_prefill_moe) {
             const int routes = total_tokens * K;
             profile_cuda_stage(&profile, &profile.moe_gate_up_ms, stream, [&] {
@@ -663,6 +793,8 @@ void kimi_forward_paged(
                 kimi_ws.y.data(), kimi_ws.moe_out.data(),
                 static_cast<std::size_t>(total_tokens) * H, stream);
         });
+        dump_hidden_norm(kimi_ws.y.data(), total_tokens, H, li,
+            "post_moe", tp != nullptr ? tp->rank() : 0, stream);
     }
 
     const bool use_tp_greedy =
@@ -704,6 +836,9 @@ void kimi_forward_paged(
             ops::gemm_act_x_w(cublas.handle(),
                 kimi_ws.norm_y.data(), *w.lm_head, logits_out,
                 rows, V_local, H);
+            dump_top_logits(logits_out, rows, V_local,
+                tp != nullptr ? tp->rank() : 0,
+                w.lm_head_tp_vocab_offset, stream);
             kernels::launch_argmax_bf16_pair_with_offset(
                 logits_out,
                 reinterpret_cast<std::uint64_t*>(fwd_cfg.greedy_pairs),
@@ -725,6 +860,8 @@ void kimi_forward_paged(
         ops::gemm_act_x_w(cublas.handle(),
             kimi_ws.norm_y.data(), *w.lm_head, logits_out,
             rows, V, H);
+        dump_top_logits(logits_out, rows, V,
+            tp != nullptr ? tp->rank() : 0, 0, stream);
     });
     profile.end(stream);
     maybe_print_profile(profile);

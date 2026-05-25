@@ -152,15 +152,21 @@ HfConfig parse_hf_config(const std::filesystem::path& path) {
                               cfg.max_position_embeddings);
         } else if (rope_type == "yarn") {
             cfg.rope_scaling_kind = HfConfig::RopeScaling::OriginalYaRN;
+            cfg.has_rope_scaling  = true;
             cfg.rope_factor           = optional<float>(s, "factor", 1.0f);
             cfg.rope_beta_fast        = optional<float>(s, "beta_fast", 32.0f);
             cfg.rope_beta_slow        = optional<float>(s, "beta_slow", 1.0f);
-            // HF's `_compute_yarn_parameters` sets the default mscale
-            // to `0.1 * ln(factor) + 1` when `attention_factor` is
-            // absent. OLMo-3 ships it explicitly (1.2079...).
-            const float default_mscale = (cfg.rope_factor > 1.f)
-                ? 0.1f * std::log(cfg.rope_factor) + 1.0f
-                : 1.0f;
+            // DeepSeek/Kimi models use `mscale_all_dim` (typically 1.0)
+            // as the attention factor. OLMo-3 uses `attention_factor`
+            // directly. Fall back to `0.1 * ln(factor) + 1` if neither
+            // is present.
+            const float mscale_all_dim =
+                optional<float>(s, "mscale_all_dim", 0.0f);
+            const float default_mscale = mscale_all_dim > 0.f
+                ? mscale_all_dim
+                : (cfg.rope_factor > 1.f
+                    ? 0.1f * std::log(cfg.rope_factor) + 1.0f
+                    : 1.0f);
             cfg.rope_attention_factor = optional<float>(
                 s, "attention_factor", default_mscale);
             cfg.rope_original_max_position =

@@ -28,6 +28,7 @@ void launch_topk_sigmoid_bf16(
     const void* logits,
     std::int32_t* topk_idx,
     float* topk_w,
+    const float* correction_bias,
     int tokens,
     int num_experts,
     int top_k,

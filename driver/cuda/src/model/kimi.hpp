@@ -51,6 +51,7 @@ struct KimiLayerWeights {
 
     // Routed + shared MoE (layers >= first_k_dense_replace).
     const DeviceTensor* router = nullptr;               // [E, H]
+    const DeviceTensor* e_score_correction_bias = nullptr; // [E] or null
     std::vector<KimiExpertWeights> experts;             // size E
     DeviceBuffer<const std::int32_t*> expert_gate_packed_ptrs;
     DeviceBuffer<const void*>         expert_gate_scale_ptrs;

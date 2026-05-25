@@ -157,6 +157,8 @@ KimiWeights bind_kimi(const LoadedModel& engine) {
 
         L.router = &must(engine, mp + "gate.weight");
         require_rank2(*L.router, mp + "gate.weight");
+        L.e_score_correction_bias =
+            maybe(engine, mp + "gate.e_score_correction_bias");
         L.experts.resize(static_cast<std::size_t>(cfg.num_experts));
         std::vector<const std::int32_t*> gate_packed_ptrs;
         std::vector<const void*> gate_scale_ptrs;

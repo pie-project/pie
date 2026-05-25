@@ -59,6 +59,7 @@ __global__ void topk_sigmoid_kernel(
     const __nv_bfloat16* __restrict__ logits,
     std::int32_t* __restrict__ topk_idx,
     float* __restrict__ topk_w,
+    const float* __restrict__ correction_bias,
     int E,
     int K,
     bool renormalize,
@@ -68,10 +69,13 @@ __global__ void topk_sigmoid_kernel(
     const int tid = threadIdx.x;
     const __nv_bfloat16* row = logits + static_cast<long long>(n) * E;
     __shared__ float scores[MAX_EXPERTS];
+    __shared__ float orig_scores[MAX_EXPERTS];
 
     for (int e = tid; e < E; e += TOPK_BLOCK) {
         const float x = __bfloat162float(row[e]);
-        scores[e] = 1.f / (1.f + expf(-x));
+        const float s = 1.f / (1.f + expf(-x));
+        orig_scores[e] = s;
+        scores[e] = correction_bias != nullptr ? s + correction_bias[e] : s;
     }
     __syncthreads();
 
@@ -90,8 +94,8 @@ __global__ void topk_sigmoid_kernel(
                 }
             }
             idx[k] = best_i;
-            w[k] = best_v;
-            sum += best_v;
+            w[k] = orig_scores[best_i];
+            sum += orig_scores[best_i];
             scores[best_i] = -FLT_MAX;
         }
         const float scale = renormalize && sum > 0.f
@@ -199,6 +203,7 @@ void launch_topk_sigmoid_bf16(
     const void* logits,
     std::int32_t* topk_idx,
     float* topk_w,
+    const float* correction_bias,
     int tokens,
     int num_experts,
     int top_k,
@@ -210,7 +215,7 @@ void launch_topk_sigmoid_bf16(
     if (num_experts > MAX_EXPERTS) return;
     topk_sigmoid_kernel<<<tokens, TOPK_BLOCK, 0, stream>>>(
         static_cast<const __nv_bfloat16*>(logits),
-        topk_idx, topk_w, num_experts, top_k,
+        topk_idx, topk_w, correction_bias, num_experts, top_k,
         renormalize, routed_scaling_factor);
 }
 
