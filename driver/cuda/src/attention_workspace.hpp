@@ -24,8 +24,8 @@ public:
     AttentionWorkspace() = default;
     AttentionWorkspace(const AttentionWorkspace&) = delete;
     AttentionWorkspace& operator=(const AttentionWorkspace&) = delete;
-    AttentionWorkspace(AttentionWorkspace&&) noexcept = default;
-    AttentionWorkspace& operator=(AttentionWorkspace&&) noexcept = default;
+    AttentionWorkspace(AttentionWorkspace&&) noexcept;
+    AttentionWorkspace& operator=(AttentionWorkspace&&) noexcept;
 
     ~AttentionWorkspace();
 

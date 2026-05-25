@@ -53,6 +53,24 @@ void launch_qk_rmsnorm_rope_bf16(
     float eps,
     cudaStream_t stream);
 
+// Same fused Q/K RMSNorm + standard RoPE, but preserves the bf16
+// materialization point of the unfused sequence:
+//   q = bf16(rmsnorm(q)); k = bf16(rmsnorm(k)); rope(q, k)
+// Gemma-4 parity is sensitive to this rounding boundary.
+void launch_qk_rmsnorm_rope_bf16_rounded(
+    void* q,
+    void* k,
+    const void* q_weight,
+    const void* k_weight,
+    const std::int32_t* positions,
+    int num_tokens,
+    int num_q_heads,
+    int num_kv_heads,
+    int head_dim,
+    float theta,
+    float eps,
+    cudaStream_t stream);
+
 // YaRN (Llama-3 / OLMo / Mistral-3 / GPT-OSS) RoPE scaling. Frequency
 // per pair is modified by a piecewise-linear interpolation between
 // `low_freq_factor` and `high_freq_factor` (in units of cycles / window),

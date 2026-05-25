@@ -708,7 +708,9 @@ std::vector<int> forward_graph_request_lattice(int max_requests) {
 cudaGraphExec_t capture_forward_graph_exec(
     Executor& executor,
     const std::uint32_t* qo_indptr_h,
+    const std::uint32_t* kv_page_indices_h,
     const std::uint32_t* kv_page_indptr_h,
+    const std::uint32_t* kv_last_page_lens_h,
     int N,
     int R,
     bool is_pure_decode,
@@ -733,7 +735,8 @@ cudaGraphExec_t capture_forward_graph_exec(
         reinterpret_cast<const std::int32_t*>(pi.positions.data()),
         pi.qo_indptr.data(), pi.kv_page_indices.data(),
         pi.kv_page_indptr.data(), pi.kv_last_page_lens.data(),
-        qo_indptr_h, kv_page_indptr_h,
+        qo_indptr_h, kv_page_indices_h, kv_page_indptr_h,
+        kv_last_page_lens_h,
         N, R, is_pure_decode, nullptr, nullptr,
         slot_ids_h, is_fresh_h, slot_ids_d,
         logit_row_indices_d, num_logit_rows, tp_greedy_argmax);
@@ -1234,6 +1237,7 @@ std::size_t capture_forward_graph_lattice(Executor& executor) {
             executor.attn_ws,
             ForwardFn::PrepareInputs{
                 .qo_indptr_h = qo.data(),
+                .kv_page_indices_h = kvpi.data(),
                 .kv_page_indices_d =
                     reinterpret_cast<const std::uint32_t*>(pi.kv_page_indices.data()),
                 .kv_page_indptr_h = kvpp.data(),
@@ -1257,7 +1261,8 @@ std::size_t capture_forward_graph_lattice(Executor& executor) {
 
         tp_graph_capture_barrier(executor);
         cudaGraphExec_t exec = capture_forward_graph_exec(
-            executor, qo.data(), kvpp.data(), N, R, /*is_pure_decode=*/true,
+            executor, qo.data(), kvpi.data(), kvpp.data(), kvlpl.data(),
+            N, R, /*is_pure_decode=*/true,
             /*slot_ids_h=*/nullptr, /*is_fresh_h=*/nullptr,
             executor.rs_cache != nullptr ? pi.slot_ids.data() : nullptr,
             /*logit_row_indices_d=*/nullptr,
@@ -1461,8 +1466,12 @@ void handle_fire_batch(
         const int forward_N = forward_inputs.total_tokens;
         const int forward_R = forward_inputs.num_requests;
         const std::uint32_t* h_qo_forward = forward_inputs.qo_indptr.data();
+        const std::uint32_t* h_kvpi_forward =
+            forward_inputs.kv_page_indices.data();
         const std::uint32_t* h_kvpp_forward =
             forward_inputs.kv_page_indptr.data();
+        const std::uint32_t* h_kvlpl_forward =
+            forward_inputs.kv_last_page_lens.data();
 
         // Refill persistent device buffers with this fire's wire inputs.
         // Same device addresses every fire — required for graph-replay
@@ -1851,13 +1860,14 @@ void handle_fire_batch(
                 attn_ws,
                 ForwardFn::PrepareInputs{
                     .qo_indptr_h = h_qo_forward,
+                    .kv_page_indices_h = h_kvpi_forward,
                     .kv_page_indices_d =
                         reinterpret_cast<const std::uint32_t*>(pi.kv_page_indices.data()),
                     .kv_page_indptr_h = h_kvpp_forward,
                     .kv_page_indptr_d =
                         reinterpret_cast<const std::uint32_t*>(pi.kv_page_indptr.data()),
                     .kv_last_page_lens_h =
-                        forward_inputs.kv_last_page_lens.data(),
+                        h_kvlpl_forward,
                     .kv_last_page_lens_d =
                         reinterpret_cast<const std::uint32_t*>(pi.kv_last_page_lens.data()),
                     .total_tokens = forward_N,
@@ -1927,7 +1937,8 @@ void handle_fire_batch(
                 // to the stable device buffers. The capture only records the
                 // graph; the exec is launched below for this same fire.
                 exec = capture_forward_graph_exec(
-                    executor, h_qo_forward, h_kvpp_forward,
+                    executor, h_qo_forward, h_kvpi_forward, h_kvpp_forward,
+                    h_kvlpl_forward,
                     forward_N, forward_R, is_pure_decode,
                     use_slots ? slot_ids_h.data() : nullptr,
                     use_slots ? is_fresh_h.data() : nullptr,
@@ -1958,7 +1969,9 @@ void handle_fire_batch(
                 pi.qo_indptr.data(), pi.kv_page_indices.data(),
                 pi.kv_page_indptr.data(), pi.kv_last_page_lens.data(),
                 /*qo_indptr_h=*/h_qo_forward,
+                /*kv_page_indices_h=*/h_kvpi_forward,
                 /*kv_page_indptr_h=*/h_kvpp_forward,
+                /*kv_last_page_lens_h=*/h_kvlpl_forward,
                 forward_N, forward_R, is_pure_decode,
                 have_custom_mask ? pi.custom_mask.data()        : nullptr,
                 have_custom_mask ? pi.custom_mask_indptr.data() : nullptr,
@@ -2214,6 +2227,65 @@ void handle_fire_batch(
                     if (!bucket.empty()) {
                         remember_mtp_source(r, last_token_row);
                     }
+                }
+            }
+            if (!forward_fn.mtp && executor.system_speculator) {
+                std::vector<SystemSpecDraftRequest> system_draft_requests;
+                system_draft_requests.reserve(static_cast<std::size_t>(R));
+                for (int r = 0; r < R; ++r) {
+                    const bool wants_spec =
+                        r < static_cast<int>(outspec_view.size()) &&
+                        outspec_view[r] != 0;
+                    if (!wants_spec) continue;
+                    const auto& bucket =
+                        per_req[static_cast<std::size_t>(r)].tokens;
+                    if (bucket.empty()) continue;
+                    const std::int32_t row =
+                        mtp_base_rows[static_cast<std::size_t>(r)];
+                    if (row < 0) continue;
+                    const std::uint32_t draft_pos =
+                        mtp_draft_positions[static_cast<std::size_t>(r)];
+                    if (draft_pos < 2u) continue;
+                    const int last_match =
+                        spec_accepted_drafts[static_cast<std::size_t>(r)];
+                    const bool has_prior_drafts =
+                        has_spec_drafts &&
+                        r < static_cast<int>(verify_slot_start.size()) &&
+                        verify_slot_start[r] >= 0;
+                    const int last_num_drafts =
+                        has_prior_drafts ? verify_n_drafts[r] : 0;
+                    system_draft_requests.push_back(SystemSpecDraftRequest{
+                        .request_index = r,
+                        .source_row = row,
+                        .accepted_token = bucket.back(),
+                        .source_position = draft_pos - 2u,
+                        .first_draft_position = draft_pos,
+                        .last_match = last_match,
+                        .last_num_drafts = last_num_drafts,
+                    });
+                }
+                if (!system_draft_requests.empty()) {
+                    StepProfileTimer system_spec_timer(
+                        "system_speculator", cublas.stream(),
+                        static_cast<int>(system_draft_requests.size()), R);
+                    executor.system_speculator(
+                        SystemSpecDraftInputs{
+                            .target_ws = ws,
+                            .kv_cache = kv_cache,
+                            .attn_ws = attn_ws,
+                            .cublas = cublas,
+                            .requests =
+                                std::span<const SystemSpecDraftRequest>(
+                                    system_draft_requests.data(),
+                                    system_draft_requests.size()),
+                            .kv_page_indices = kvpi_view,
+                            .kv_page_indptr = kvpp_view,
+                            .page_size = kv_cache.page_size(),
+                            .max_drafts = executor.system_speculator_max_drafts,
+                        },
+                        std::span<pie_driver::PerRequestOutput>(
+                            per_req.data(), per_req.size()));
+                    system_spec_timer.finish(cublas.stream());
                 }
             }
             if (forward_fn.mtp) {
@@ -2663,6 +2735,7 @@ void handle_fire_batch(
                                 attn_ws,
                                 ForwardFn::PrepareInputs{
                                     .qo_indptr_h = repair_qo.data(),
+                                    .kv_page_indices_h = repair_kvpi.data(),
                                     .kv_page_indices_d =
                                         reinterpret_cast<const std::uint32_t*>(
                                             pi.kv_page_indices.data()),
@@ -2686,7 +2759,9 @@ void handle_fire_batch(
                             pi.qo_indptr.data(), pi.kv_page_indices.data(),
                             pi.kv_page_indptr.data(), pi.kv_last_page_lens.data(),
                             /*qo_indptr_h=*/repair_qo.data(),
+                            /*kv_page_indices_h=*/repair_kvpi.data(),
                             /*kv_page_indptr_h=*/repair_kvpp.data(),
+                            /*kv_last_page_lens_h=*/repair_kvlpl.data(),
                             replay_N, 1, replay_N == 1,
                             nullptr, nullptr,
                             repair_slots.data(), repair_fresh.data(),
@@ -2886,10 +2961,12 @@ void tp_follower_serve(Executor& executor, std::atomic<bool>& stop) {
         }
         NCCL_CHECK_ASYNC(ncclGroupEnd(), comm.comm());
 
-        // 3. Pull the host views of qo/kv_page indptrs for the per-arch
+        // 3. Pull the host views of qo/KV layout for the per-arch
         // attention planner (lives outside the captured kernel sequence).
         h_qo.resize(R + 1);
         h_kvpp.resize(R + 1);
+        std::vector<std::uint32_t> h_kvpi(
+            static_cast<std::size_t>(std::max(0, hdr.kv_indices_count)));
         std::vector<std::uint32_t> h_kvlpl(R);
         CUDA_CHECK(cudaMemcpyAsync(h_qo.data(), pi.qo_indptr.data(),
                                    static_cast<std::size_t>(R + 1) * 4,
@@ -2901,6 +2978,12 @@ void tp_follower_serve(Executor& executor, std::atomic<bool>& stop) {
             CUDA_CHECK(cudaMemcpyAsync(h_kvlpl.data(), pi.kv_last_page_lens.data(),
                                        static_cast<std::size_t>(R) * 4,
                                        cudaMemcpyDeviceToHost, stream));
+        }
+        if (!h_kvpi.empty()) {
+            CUDA_CHECK(cudaMemcpyAsync(
+                h_kvpi.data(), pi.kv_page_indices.data(),
+                h_kvpi.size() * sizeof(std::uint32_t),
+                cudaMemcpyDeviceToHost, stream));
         }
         std::vector<std::int32_t> h_slot_ids;
         std::vector<std::uint8_t> h_is_fresh;
@@ -2924,6 +3007,7 @@ void tp_follower_serve(Executor& executor, std::atomic<bool>& stop) {
                 executor.attn_ws,
                 ForwardFn::PrepareInputs{
                     .qo_indptr_h = h_qo.data(),
+                    .kv_page_indices_h = h_kvpi.data(),
                     .kv_page_indices_d =
                         reinterpret_cast<const std::uint32_t*>(pi.kv_page_indices.data()),
                     .kv_page_indptr_h = h_kvpp.data(),
@@ -2956,7 +3040,8 @@ void tp_follower_serve(Executor& executor, std::atomic<bool>& stop) {
             cudaGraphExec_t exec = executor.graph_cache->get(key);
             if (exec == nullptr) {
                 exec = capture_forward_graph_exec(
-                    executor, h_qo.data(), h_kvpp.data(),
+                    executor, h_qo.data(), h_kvpi.data(), h_kvpp.data(),
+                    h_kvlpl.data(),
                     N, R, is_pure_decode,
                     have_slot_ids ? h_slot_ids.data() : nullptr,
                     have_slot_ids ? h_is_fresh.data() : nullptr,
@@ -2975,7 +3060,7 @@ void tp_follower_serve(Executor& executor, std::atomic<bool>& stop) {
                 reinterpret_cast<const std::int32_t*>(pi.positions.data()),
                 pi.qo_indptr.data(), pi.kv_page_indices.data(),
                 pi.kv_page_indptr.data(), pi.kv_last_page_lens.data(),
-                h_qo.data(), h_kvpp.data(),
+                h_qo.data(), h_kvpi.data(), h_kvpp.data(), h_kvlpl.data(),
                 N, R, is_pure_decode,
                 have_custom_mask ? pi.custom_mask.data()        : nullptr,
                 have_custom_mask ? pi.custom_mask_indptr.data() : nullptr,

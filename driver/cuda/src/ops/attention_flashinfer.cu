@@ -125,7 +125,8 @@ bool force_split_kv_small_enabled() {
 bool static_nonsplit_decode_plan_enabled() {
     static const bool enabled = [] {
         const char* v = std::getenv("PIE_CUDA_STATIC_DECODE_PLAN");
-        return v != nullptr && v[0] != '\0' && v[0] != '0';
+        if (v == nullptr || v[0] == '\0') return true;
+        return v[0] != '0';
     }();
     return enabled;
 }

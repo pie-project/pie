@@ -9,6 +9,8 @@ from typing import Any
 from common import (
     RequestResult,
     add_mode_subcommands,
+    cuda_profiler_start,
+    cuda_profiler_stop,
     finish,
     hf_chat_prompts_and_counts,
     make_prompts,
@@ -134,9 +136,47 @@ def run(args: argparse.Namespace):
                     "--spec-tokens conflicts with speculative_config.num_speculative_tokens"
                 )
             speculative_config["num_speculative_tokens"] = args.spec_tokens
+    if args.mtp_assistant_model is not None:
+        speculative_config = dict(speculative_config or {})
+        if "model" in speculative_config:
+            raise ValueError("--mtp-assistant-model conflicts with speculative_config.model")
+        speculative_config["model"] = args.mtp_assistant_model
+        if "method" in speculative_config:
+            raise ValueError("--mtp-method conflicts with speculative_config.method")
+        speculative_config["method"] = args.mtp_method
+        if "num_speculative_tokens" in speculative_config:
+            raise ValueError(
+                "--mtp-num-drafts conflicts with "
+                "speculative_config.num_speculative_tokens"
+            )
+        speculative_config["num_speculative_tokens"] = args.mtp_num_drafts
+        if args.mtp_draft_tp_size is not None:
+            if "draft_tensor_parallel_size" in speculative_config:
+                raise ValueError(
+                    "--mtp-draft-tp-size conflicts with "
+                    "speculative_config.draft_tensor_parallel_size"
+                )
+            speculative_config["draft_tensor_parallel_size"] = args.mtp_draft_tp_size
     summary_speculative_config = dict(speculative_config) if speculative_config else None
     if speculative_config is not None:
         llm_kwargs["speculative_config"] = dict(speculative_config)
+    if args.print_llm_kwargs:
+        print(
+            json.dumps(
+                {
+                    "model": args.model,
+                    "gpu_memory_utilization": args.gpu_mem_util,
+                    "max_num_seqs": max_num_seqs,
+                    "max_num_batched_tokens": args.max_num_batched_tokens,
+                    "tensor_parallel_size": args.tp_size,
+                    "max_model_len": args.max_model_len,
+                    "enable_prefix_caching": False,
+                    "disable_log_stats": False,
+                    **llm_kwargs,
+                },
+                indent=2,
+            )
+        )
 
     llm = LLM(
         model=args.model,
@@ -170,25 +210,32 @@ def run(args: argparse.Namespace):
     run_prompts = prompts[args.warmup:]
     run_prompt_counts = prompt_counts[args.warmup:]
     results: list[RequestResult] = []
+    cuda_profiler_start(args.cuda_profiler_capture)
     start = time.perf_counter()
-    if args.mode == "latency":
-        for p, prompt_count in zip(run_prompts, run_prompt_counts):
-            req_start = time.perf_counter()
-            outputs = llm.generate([p], sampling)
-            req_wall = time.perf_counter() - req_start
-            for out in outputs:
-                results.append(
-                    RequestResult(
-                        True, float(req_wall), len(out.outputs[0].token_ids), prompt_count
+    try:
+        if args.mode == "latency":
+            for p, prompt_count in zip(run_prompts, run_prompt_counts):
+                req_start = time.perf_counter()
+                outputs = llm.generate([p], sampling)
+                req_wall = time.perf_counter() - req_start
+                for out in outputs:
+                    results.append(
+                        RequestResult(
+                            True,
+                            float(req_wall),
+                            len(out.outputs[0].token_ids),
+                            prompt_count,
+                        )
                     )
+        else:
+            outputs = llm.generate(run_prompts, sampling)
+            for out, prompt_count in zip(outputs, run_prompt_counts):
+                results.append(
+                    RequestResult(True, 0.0, len(out.outputs[0].token_ids), prompt_count)
                 )
-    else:
-        outputs = llm.generate(run_prompts, sampling)
-        for out, prompt_count in zip(outputs, run_prompt_counts):
-            results.append(
-                RequestResult(True, 0.0, len(out.outputs[0].token_ids), prompt_count)
-            )
-    wall = time.perf_counter() - start
+    finally:
+        wall = time.perf_counter() - start
+        cuda_profiler_stop(args.cuda_profiler_capture)
     spec_metrics_after = _vllm_spec_metrics(llm)
 
     summary = summarize(
@@ -208,6 +255,7 @@ def run(args: argparse.Namespace):
             "top_p": args.top_p,
             "ignore_eos": args.ignore_eos,
             "unique_prompts": args.unique_prompts,
+            "cuda profiler capture": args.cuda_profiler_capture,
             "cpu affinity": cpu_affinity,
             "warmup max tokens": args.warmup_max_tokens,
             **_vllm_spec_delta(spec_metrics_after, spec_metrics_before),
@@ -230,6 +278,33 @@ def main() -> None:
         )
         sp.add_argument("--spec-method", default=None)
         sp.add_argument("--spec-tokens", type=int, default=None)
+        sp.add_argument(
+            "--mtp-assistant-model",
+            default=None,
+            help="Assistant checkpoint/model for vLLM Gemma4 MTP speculative decoding.",
+        )
+        sp.add_argument(
+            "--mtp-method",
+            default="gemma4_mtp",
+            help="vLLM speculative method for the assistant. Default: gemma4_mtp.",
+        )
+        sp.add_argument(
+            "--mtp-num-drafts",
+            type=int,
+            default=3,
+            help="Number of vLLM speculative tokens. Match Pie --mtp-num-drafts.",
+        )
+        sp.add_argument(
+            "--mtp-draft-tp-size",
+            type=int,
+            default=None,
+            help="Optional draft_tensor_parallel_size for vLLM speculative_config.",
+        )
+        sp.add_argument(
+            "--print-llm-kwargs",
+            action="store_true",
+            help="Print the vLLM LLM kwargs used by the benchmark before loading.",
+        )
     args = parser.parse_args()
     summary, results = run(args)
     finish(summary, results, args.json_out)

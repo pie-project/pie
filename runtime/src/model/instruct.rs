@@ -87,7 +87,15 @@ pub trait ToolDecoder: Send {
 /// The tokenizer is owned by the implementation to avoid redundant lookups.
 pub trait Instruct: Send + Sync {
     fn system(&self, msg: &str) -> Vec<u32>;
+    fn first_user(&self, msg: &str) -> Vec<u32> {
+        self.user(msg)
+    }
     fn user(&self, msg: &str) -> Vec<u32>;
+    fn system_user(&self, system: &str, user: &str) -> Vec<u32> {
+        let mut tokens = self.system(system);
+        tokens.extend(self.user(user));
+        tokens
+    }
     fn assistant(&self, msg: &str) -> Vec<u32>;
     fn cue(&self) -> Vec<u32>;
     fn seal(&self) -> Vec<u32>;
@@ -125,13 +133,31 @@ pub fn create(arch_name: &str, tokenizer: Arc<Tokenizer>) -> Arc<dyn Instruct> {
         "llama3" | "l4ma" => Arc::new(self::llama3::LlamaInstruct::new(tokenizer)),
         "r1" | "deepseek_v3" => Arc::new(self::r1::R1Instruct::new(tokenizer)),
         "gptoss" | "gpt_oss" => Arc::new(self::gptoss::GptOssInstruct::new(tokenizer)),
-        // Gemma-3n shares the multi-piece `<start_of_turn>` /
-        // `<end_of_turn>` chat template with Gemma 2/3 (Gemma 4
-        // switched to single-token `<|turn>` / `<turn|>`).
-        "gemma2" | "gemma3" | "gemma3_text" | "gemma3n" | "gemma3n_text" => {
-            Arc::new(self::gemma2::GemmaInstruct::new(tokenizer))
-        }
-        "gemma4" | "gemma4_text" => Arc::new(self::gemma4::Gemma4Instruct::new(tokenizer)),
+        "gemma2" => Arc::new(self::gemma2::GemmaInstruct::new(tokenizer)),
+        "gemma3" => Arc::new(self::gemma3::Gemma3Instruct::for_variant(
+            tokenizer,
+            self::gemma3::Gemma3Variant::Gemma3,
+        )),
+        "gemma3_text" => Arc::new(self::gemma3::Gemma3Instruct::for_variant(
+            tokenizer,
+            self::gemma3::Gemma3Variant::Gemma3Text,
+        )),
+        "gemma3n" => Arc::new(self::gemma3::Gemma3Instruct::for_variant(
+            tokenizer,
+            self::gemma3::Gemma3Variant::Gemma3n,
+        )),
+        "gemma3n_text" => Arc::new(self::gemma3::Gemma3Instruct::for_variant(
+            tokenizer,
+            self::gemma3::Gemma3Variant::Gemma3nText,
+        )),
+        "gemma4" => Arc::new(self::gemma4::Gemma4Instruct::for_variant(
+            tokenizer,
+            self::gemma4::Gemma4Variant::Gemma4,
+        )),
+        "gemma4_text" => Arc::new(self::gemma4::Gemma4Instruct::for_variant(
+            tokenizer,
+            self::gemma4::Gemma4Variant::Gemma4Text,
+        )),
         "mistral3" | "ministral3" => Arc::new(self::mistral3::MistralInstruct::new(tokenizer)),
         "olmo2" => Arc::new(self::olmo2::Olmo2Instruct::new(tokenizer)),
         "olmo3" => Arc::new(self::olmo3::OlmoInstruct::new(tokenizer)),

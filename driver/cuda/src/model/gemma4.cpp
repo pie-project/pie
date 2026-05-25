@@ -1,10 +1,16 @@
 #include "model/gemma4.hpp"
 
+#include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <iostream>
+#include <limits>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -21,6 +27,7 @@
 #include "kernels/rope.hpp"
 #include "kernels/scalar_mul.hpp"
 #include "kernels/softcap.hpp"
+#include "kernels/split_packed.hpp"
 #include "kernels/swiglu.hpp"
 #include "kernels/topk_softmax.hpp"
 #include "ops/attention_naive_paged.hpp"
@@ -30,6 +37,149 @@ namespace pie_cuda_driver::model {
 namespace {
 
 thread_local bool g_logits_argmax_only = false;
+
+bool gemma4_forward_profile_enabled() {
+    static const bool enabled = [] {
+        const char* v = std::getenv("PIE_GEMMA4_FORWARD_PROFILE");
+        if (v == nullptr || v[0] == '\0') return false;
+        return v[0] != '0';
+    }();
+    return enabled;
+}
+
+std::uint64_t gemma4_forward_profile_limit() {
+    static const std::uint64_t limit = []() -> std::uint64_t {
+        const char* v = std::getenv("PIE_GEMMA4_FORWARD_PROFILE_LIMIT");
+        if (v == nullptr || v[0] == '\0') return 64ull;
+        char* end = nullptr;
+        const unsigned long long parsed = std::strtoull(v, &end, 10);
+        if (end == v) return 64ull;
+        return static_cast<std::uint64_t>(parsed);
+    }();
+    return limit;
+}
+
+struct Gemma4ForwardProfile {
+    bool enabled = false;
+    bool ended = false;
+    std::uint64_t seq = 0;
+    int N = 0;
+    int R = 0;
+    int layers = 0;
+    int lm_head_rows = 0;
+    bool pure_decode = false;
+    bool decode_path = false;
+    bool row_decode_path = false;
+    bool compact_logits = false;
+    bool logits_argmax_only = false;
+
+    float total_gpu_ms = 0.f;
+    float embed_ms = 0.f;
+    float ple_inputs_ms = 0.f;
+    float attn_prep_ms = 0.f;
+    float attention_ms = 0.f;
+    float attn_out_ms = 0.f;
+    float mlp_ms = 0.f;
+    float ple_residual_ms = 0.f;
+    float final_norm_ms = 0.f;
+    float lm_head_ms = 0.f;
+    float softcap_ms = 0.f;
+
+    cudaEvent_t total_start = nullptr;
+    cudaEvent_t total_stop = nullptr;
+    cudaEvent_t stage_start = nullptr;
+    cudaEvent_t stage_stop = nullptr;
+
+    ~Gemma4ForwardProfile() {
+        if (total_start != nullptr) cudaEventDestroy(total_start);
+        if (total_stop != nullptr) cudaEventDestroy(total_stop);
+        if (stage_start != nullptr) cudaEventDestroy(stage_start);
+        if (stage_stop != nullptr) cudaEventDestroy(stage_stop);
+    }
+
+    void begin(cudaStream_t stream) {
+        static std::atomic<std::uint64_t> counter{0};
+        if (!gemma4_forward_profile_enabled()) return;
+        const std::uint64_t current =
+            counter.fetch_add(1, std::memory_order_relaxed);
+        const std::uint64_t limit = gemma4_forward_profile_limit();
+        if (limit != 0 && current >= limit) return;
+        enabled = true;
+        seq = current;
+        CUDA_CHECK(cudaEventCreate(&total_start));
+        CUDA_CHECK(cudaEventCreate(&total_stop));
+        CUDA_CHECK(cudaEventCreate(&stage_start));
+        CUDA_CHECK(cudaEventCreate(&stage_stop));
+        CUDA_CHECK(cudaEventRecord(total_start, stream));
+    }
+
+    void end(cudaStream_t stream) {
+        if (!enabled || ended) return;
+        ended = true;
+        CUDA_CHECK(cudaEventRecord(total_stop, stream));
+        CUDA_CHECK(cudaEventSynchronize(total_stop));
+        CUDA_CHECK(cudaEventElapsedTime(&total_gpu_ms, total_start, total_stop));
+    }
+};
+
+template <class Fn>
+void profile_gemma4_cuda_stage(
+    Gemma4ForwardProfile& profile,
+    float& dst,
+    cudaStream_t stream,
+    Fn&& fn)
+{
+    if (!profile.enabled) {
+        fn();
+        return;
+    }
+    CUDA_CHECK(cudaEventRecord(profile.stage_start, stream));
+    fn();
+    CUDA_CHECK(cudaEventRecord(profile.stage_stop, stream));
+    CUDA_CHECK(cudaEventSynchronize(profile.stage_stop));
+    float ms = 0.f;
+    CUDA_CHECK(cudaEventElapsedTime(&ms, profile.stage_start,
+                                    profile.stage_stop));
+    dst += ms;
+}
+
+void maybe_print_gemma4_forward_profile(
+    Gemma4ForwardProfile& p,
+    cudaStream_t stream)
+{
+    if (!p.enabled) return;
+    p.end(stream);
+    const float named =
+        p.embed_ms + p.ple_inputs_ms + p.attn_prep_ms + p.attention_ms +
+        p.attn_out_ms + p.mlp_ms + p.ple_residual_ms + p.final_norm_ms +
+        p.lm_head_ms + p.softcap_ms;
+    const float other = p.total_gpu_ms - named;
+    std::cerr
+        << "[pie-gemma4-forward-profile]"
+        << " seq=" << p.seq
+        << " N=" << p.N
+        << " R=" << p.R
+        << " layers=" << p.layers
+        << " lm_head_rows=" << p.lm_head_rows
+        << " pure_decode=" << (p.pure_decode ? 1 : 0)
+        << " decode_path=" << (p.decode_path ? 1 : 0)
+        << " row_decode=" << (p.row_decode_path ? 1 : 0)
+        << " compact_logits=" << (p.compact_logits ? 1 : 0)
+        << " logits_argmax_only=" << (p.logits_argmax_only ? 1 : 0)
+        << " total_gpu_ms=" << p.total_gpu_ms
+        << " embed_ms=" << p.embed_ms
+        << " ple_inputs_ms=" << p.ple_inputs_ms
+        << " attn_prep_ms=" << p.attn_prep_ms
+        << " attention_ms=" << p.attention_ms
+        << " attn_out_ms=" << p.attn_out_ms
+        << " mlp_ms=" << p.mlp_ms
+        << " ple_residual_ms=" << p.ple_residual_ms
+        << " final_norm_ms=" << p.final_norm_ms
+        << " lm_head_ms=" << p.lm_head_ms
+        << " softcap_ms=" << p.softcap_ms
+        << " other_gpu_ms=" << other
+        << "\n";
+}
 
 const DeviceTensor& must(const LoadedModel& e, const std::string& name) {
     if (!e.has(name)) {
@@ -55,10 +205,486 @@ float read_bf16_scalar_once(const DeviceTensor& t) {
 // other binders.
 constexpr const char* kPrefix = "model.language_model.";
 
+bool gemma4_row_decode_verify_enabled() {
+    static const bool enabled = [] {
+        const char* v = std::getenv("PIE_GEMMA4_SPEC_ROW_DECODE");
+        if (v == nullptr || v[0] == '\0') return true;
+        return v[0] != '0';
+    }();
+    return enabled;
+}
+
+int gemma4_row_decode_qmax() {
+    static const int qmax = [] {
+        const char* v = std::getenv("PIE_GEMMA4_SPEC_ROW_DECODE_QMAX");
+        // Gemma4 native MTP uses three draft tokens in vLLM, so the
+        // verifier's common block is the sampled token plus three drafts.
+        // Keep that q_len=4 case on the decode-style verifier by default;
+        // the full causal verifier is substantially slower and follows a
+        // different multi-token numerical path anyway.
+        if (v == nullptr || v[0] == '\0') return 4;
+        return std::max(1, std::atoi(v));
+    }();
+    return qmax;
+}
+
+std::size_t gemma4_row_decode_max_page_refs() {
+    static const std::size_t cap = [] {
+        const char* v = std::getenv("PIE_GEMMA4_SPEC_ROW_DECODE_MAX_PAGE_REFS");
+        if (v == nullptr || v[0] == '\0') return static_cast<std::size_t>(1 << 20);
+        const long long parsed = std::atoll(v);
+        return parsed > 0 ? static_cast<std::size_t>(parsed) : static_cast<std::size_t>(0);
+    }();
+    return cap;
+}
+
+bool gemma4_dense_gate_up_batched_enabled() {
+    static const bool enabled = [] {
+        const char* v = std::getenv("PIE_GEMMA4_DENSE_GATE_UP_BATCHED");
+        if (v == nullptr || v[0] == '\0') return false;
+        return v[0] != '0';
+    }();
+    return enabled;
+}
+
+bool gemma4_dense_gate_up_fused_enabled(const HfConfig& cfg) {
+    const char* v = std::getenv("PIE_GEMMA4_DENSE_GATE_UP_FUSED");
+    if (v != nullptr && v[0] != '\0') return v[0] != '0';
+
+    return !cfg.gemma4_enable_moe &&
+           cfg.hidden_size == 2560 &&
+           cfg.intermediate_size == 10240 &&
+           cfg.num_hidden_layers == 42 &&
+           cfg.num_attention_heads == 8 &&
+           cfg.num_key_value_heads == 2 &&
+           cfg.head_dim == 256;
+}
+
+bool gemma4_dense_qkv_fused_enabled() {
+    static const bool enabled = [] {
+        const char* v = std::getenv("PIE_GEMMA4_DENSE_QKV_FUSED");
+        if (v == nullptr || v[0] == '\0') return true;
+        return v[0] != '0';
+    }();
+    return enabled;
+}
+
+bool gemma4_plan_debug_enabled() {
+    static const bool enabled = [] {
+        const char* v = std::getenv("PIE_GEMMA4_PLAN_DEBUG");
+        if (v == nullptr || v[0] == '\0') return false;
+        return v[0] != '0';
+    }();
+    return enabled;
+}
+
+int gemma4_plan_debug_limit() {
+    static const int limit = [] {
+        const char* v = std::getenv("PIE_GEMMA4_PLAN_DEBUG_LIMIT");
+        if (v == nullptr || v[0] == '\0') return 32;
+        return std::max(0, std::atoi(v));
+    }();
+    return limit;
+}
+
+DeviceTensor make_gate_up_fused_weight(const DeviceTensor& gate,
+                                       const DeviceTensor& up)
+{
+    if (gate.dtype() != DType::BF16 || up.dtype() != DType::BF16 ||
+        gate.shape().size() != 2 || up.shape().size() != 2 ||
+        gate.shape()[0] != up.shape()[0] ||
+        gate.shape()[1] != up.shape()[1]) {
+        throw std::runtime_error(
+            "gemma4: cannot fuse gate/up projections with mismatched shapes");
+    }
+    const std::int64_t I = gate.shape()[0];
+    const std::int64_t H = gate.shape()[1];
+    DeviceTensor fused = DeviceTensor::allocate(DType::BF16, {2 * I, H});
+    const std::size_t bytes =
+        static_cast<std::size_t>(I) * static_cast<std::size_t>(H) *
+        sizeof(std::uint16_t);
+    auto* dst = static_cast<std::uint8_t*>(fused.data());
+    CUDA_CHECK(cudaMemcpy(dst, gate.data(), bytes, cudaMemcpyDeviceToDevice));
+    CUDA_CHECK(cudaMemcpy(dst + bytes, up.data(), bytes, cudaMemcpyDeviceToDevice));
+    return fused;
+}
+
+DeviceTensor make_qkv_fused_weight(const DeviceTensor& q,
+                                   const DeviceTensor& k,
+                                   const DeviceTensor& v)
+{
+    if (q.dtype() != DType::BF16 || k.dtype() != DType::BF16 ||
+        v.dtype() != DType::BF16 || q.shape().size() != 2 ||
+        k.shape().size() != 2 || v.shape().size() != 2 ||
+        q.shape()[1] != k.shape()[1] || q.shape()[1] != v.shape()[1] ||
+        k.shape()[0] != v.shape()[0]) {
+        throw std::runtime_error(
+            "gemma4: cannot fuse q/k/v projections with mismatched shapes");
+    }
+    const std::int64_t Hq = q.shape()[0];
+    const std::int64_t Hk = k.shape()[0];
+    const std::int64_t H = q.shape()[1];
+    DeviceTensor fused = DeviceTensor::allocate(DType::BF16, {Hq + 2 * Hk, H});
+    const std::size_t q_bytes =
+        static_cast<std::size_t>(Hq) * static_cast<std::size_t>(H) *
+        sizeof(std::uint16_t);
+    const std::size_t kv_bytes =
+        static_cast<std::size_t>(Hk) * static_cast<std::size_t>(H) *
+        sizeof(std::uint16_t);
+    auto* dst = static_cast<std::uint8_t*>(fused.data());
+    CUDA_CHECK(cudaMemcpy(dst, q.data(), q_bytes, cudaMemcpyDeviceToDevice));
+    CUDA_CHECK(cudaMemcpy(dst + q_bytes, k.data(), kv_bytes,
+                          cudaMemcpyDeviceToDevice));
+    CUDA_CHECK(cudaMemcpy(dst + q_bytes + kv_bytes, v.data(), kv_bytes,
+                          cudaMemcpyDeviceToDevice));
+    return fused;
+}
+
+bool prepare_row_decode_kv_table(
+    Gemma4MoeMlpWorkspace& moe_ws,
+    const std::uint32_t* qo_indptr_h,
+    const std::uint32_t* kv_page_indices_h,
+    const std::uint32_t* kv_page_indptr_h,
+    const std::uint32_t* kv_last_page_lens_h,
+    int N,
+    int R,
+    int page_size)
+{
+    const bool debug = [] {
+        const char* dbg = std::getenv("PIE_GEMMA4_SPEC_ROW_DECODE_DEBUG");
+        return dbg != nullptr && dbg[0] != '\0' && dbg[0] != '0';
+    }();
+    const auto fail = [&](const char* reason, int r = -1,
+                          std::uint32_t q_len = 0,
+                          std::uint32_t value0 = 0,
+                          std::uint32_t value1 = 0) {
+        if (debug) {
+            static std::atomic<int> count{0};
+            const int idx = count.fetch_add(1, std::memory_order_relaxed);
+            if (idx < 16) {
+                std::cerr << "[pie-driver-cuda] gemma4 row-decode skip"
+                          << " reason=" << reason
+                          << " r=" << r
+                          << " q_len=" << q_len
+                          << " v0=" << value0
+                          << " v1=" << value1
+                          << " N=" << N
+                          << " R=" << R
+                          << "\n";
+            }
+        }
+        return false;
+    };
+    if (!gemma4_row_decode_verify_enabled() ||
+        qo_indptr_h == nullptr ||
+        kv_page_indices_h == nullptr ||
+        kv_page_indptr_h == nullptr ||
+        kv_last_page_lens_h == nullptr ||
+        N <= 0 || R <= 0 || page_size <= 0) {
+        return fail("disabled-or-bad-input");
+    }
+
+    const int qmax = gemma4_row_decode_qmax();
+    const std::size_t max_page_refs = gemma4_row_decode_max_page_refs();
+    if (max_page_refs == 0) return fail("zero-page-ref-cap");
+    bool saw_multi = false;
+    moe_ws.h_row_decode_kv_page_indices.clear();
+    moe_ws.h_row_decode_kv_page_indptr.clear();
+    moe_ws.h_row_decode_kv_last_page_lens.clear();
+    moe_ws.h_row_decode_kv_page_indices.reserve(max_page_refs);
+    moe_ws.h_row_decode_kv_page_indptr.reserve(static_cast<std::size_t>(N) + 1);
+    moe_ws.h_row_decode_kv_last_page_lens.reserve(static_cast<std::size_t>(N));
+    moe_ws.h_row_decode_kv_page_indptr.push_back(0);
+
+    for (int r = 0; r < R; ++r) {
+        const std::uint32_t q_lo = qo_indptr_h[r];
+        const std::uint32_t q_hi = qo_indptr_h[r + 1];
+        if (q_hi < q_lo || q_hi > static_cast<std::uint32_t>(N)) {
+            return fail("bad-qo-indptr", r, 0, q_lo, q_hi);
+        }
+        const std::uint32_t q_len = q_hi - q_lo;
+        if (q_len == 0 || q_len > static_cast<std::uint32_t>(qmax)) {
+            return fail("q-len", r, q_len, static_cast<std::uint32_t>(qmax));
+        }
+        if (q_len > 1) saw_multi = true;
+
+        const std::uint32_t page_lo = kv_page_indptr_h[r];
+        const std::uint32_t page_hi = kv_page_indptr_h[r + 1];
+        if (page_hi <= page_lo) return fail("bad-page-indptr", r, q_len, page_lo, page_hi);
+        const std::uint32_t final_last = kv_last_page_lens_h[r];
+        if (final_last == 0 || final_last > static_cast<std::uint32_t>(page_size)) {
+            return fail("bad-last-page-len", r, q_len, final_last,
+                        static_cast<std::uint32_t>(page_size));
+        }
+        const std::uint32_t final_len =
+            (page_hi - page_lo - 1u) * static_cast<std::uint32_t>(page_size) +
+            final_last;
+        if (final_len < q_len) return false;
+
+        for (std::uint32_t j = 0; j < q_len; ++j) {
+            const std::uint32_t future_rows = q_len - 1u - j;
+            const std::uint32_t prefix_len = final_len - future_rows;
+            const std::uint32_t needed_pages =
+                (prefix_len + static_cast<std::uint32_t>(page_size) - 1u) /
+                static_cast<std::uint32_t>(page_size);
+            if (needed_pages == 0 || page_lo + needed_pages > page_hi) {
+                return fail("needed-pages", r, q_len, needed_pages, page_hi - page_lo);
+            }
+            const std::size_t dst =
+                moe_ws.h_row_decode_kv_page_indices.size();
+            if (dst + needed_pages > max_page_refs) {
+                return fail("page-ref-cap", r, q_len,
+                            static_cast<std::uint32_t>(dst + needed_pages),
+                            static_cast<std::uint32_t>(
+                                std::min<std::size_t>(
+                                    max_page_refs,
+                                    std::numeric_limits<std::uint32_t>::max())));
+            }
+            moe_ws.h_row_decode_kv_page_indices.resize(dst + needed_pages);
+            std::copy(
+                kv_page_indices_h + page_lo,
+                kv_page_indices_h + page_lo + needed_pages,
+                moe_ws.h_row_decode_kv_page_indices.data() + dst);
+            moe_ws.h_row_decode_kv_page_indptr.push_back(
+                static_cast<std::uint32_t>(
+                    moe_ws.h_row_decode_kv_page_indices.size()));
+            std::uint32_t last =
+                prefix_len % static_cast<std::uint32_t>(page_size);
+            if (last == 0) last = static_cast<std::uint32_t>(page_size);
+            moe_ws.h_row_decode_kv_last_page_lens.push_back(last);
+        }
+    }
+
+    if (!saw_multi ||
+        moe_ws.h_row_decode_kv_page_indptr.size() !=
+            static_cast<std::size_t>(N + 1) ||
+        moe_ws.h_row_decode_kv_last_page_lens.size() !=
+            static_cast<std::size_t>(N)) {
+        return fail("final-shape", -1, 0,
+                    static_cast<std::uint32_t>(
+                        std::min<std::size_t>(
+                            moe_ws.h_row_decode_kv_page_indptr.size(),
+                            std::numeric_limits<std::uint32_t>::max())),
+                    static_cast<std::uint32_t>(
+                        std::min<std::size_t>(
+                            moe_ws.h_row_decode_kv_last_page_lens.size(),
+                            std::numeric_limits<std::uint32_t>::max())));
+    }
+
+    if (moe_ws.row_decode_kv_page_indices.size() <
+            moe_ws.h_row_decode_kv_page_indices.size() ||
+        moe_ws.row_decode_kv_page_indptr.size() <
+            moe_ws.h_row_decode_kv_page_indptr.size() ||
+        moe_ws.row_decode_kv_last_page_lens.size() <
+            moe_ws.h_row_decode_kv_last_page_lens.size()) {
+        return fail("device-cap", -1, 0,
+                    static_cast<std::uint32_t>(
+                        std::min<std::size_t>(
+                            moe_ws.h_row_decode_kv_page_indices.size(),
+                            std::numeric_limits<std::uint32_t>::max())),
+                    static_cast<std::uint32_t>(
+                        std::min<std::size_t>(
+                            moe_ws.h_row_decode_kv_page_indptr.size(),
+                            std::numeric_limits<std::uint32_t>::max())));
+    }
+    moe_ws.row_decode_kv_page_indices.copy_from_host(
+        std::span<const std::uint32_t>(moe_ws.h_row_decode_kv_page_indices));
+    moe_ws.row_decode_kv_page_indptr.copy_from_host(
+        std::span<const std::uint32_t>(moe_ws.h_row_decode_kv_page_indptr));
+    moe_ws.row_decode_kv_last_page_lens.copy_from_host(
+        std::span<const std::uint32_t>(moe_ws.h_row_decode_kv_last_page_lens));
+    if (const char* dbg = std::getenv("PIE_GEMMA4_SPEC_ROW_DECODE_DEBUG");
+        dbg != nullptr && dbg[0] != '\0' && dbg[0] != '0') {
+        static std::atomic<int> count{0};
+        const int idx = count.fetch_add(1, std::memory_order_relaxed);
+        if (idx < 8) {
+            std::cerr << "[pie-driver-cuda] gemma4 row-decode verify"
+                      << " rows=" << N
+                      << " page_refs="
+                      << moe_ws.h_row_decode_kv_page_indices.size()
+                      << " qmax=" << qmax << "\n";
+        }
+    }
+    return true;
+}
+
 }  // namespace
 
 void set_gemma4_logits_argmax_only(bool enabled) {
     g_logits_argmax_only = enabled;
+}
+
+namespace {
+
+const Gemma4LayerWeights* first_layer_for_plan(
+    const Gemma4Weights& w,
+    bool full)
+{
+    for (const auto& layer : w.layers) {
+        if (layer.is_full == full) return &layer;
+    }
+    return nullptr;
+}
+
+void prepare_gemma4_plan_for_layer(
+    ops::DecodePlanCachePtr& plan,
+    const Gemma4LayerWeights& layer,
+    const HfConfig& cfg,
+    const Gemma4ForwardCfg& fwd_cfg,
+    AttentionWorkspace& attn_ws,
+    const std::uint32_t* kv_page_indptr_h,
+    int num_requests,
+    int page_size,
+    bool hnd_layout,
+    cudaStream_t stream)
+{
+    if (!plan) plan = ops::make_decode_plan();
+    const int T = (fwd_cfg.tp_size > 0) ? fwd_cfg.tp_size : 1;
+    const int num_q_heads_local = cfg.num_attention_heads / T;
+    const int num_kv_heads_local = layer.num_kv_heads / T;
+    ops::plan_attention_flashinfer_decode(
+        *plan, kv_page_indptr_h, num_requests,
+        num_q_heads_local, num_kv_heads_local, layer.head_dim,
+        page_size, attn_ws, stream,
+        /*enable_cuda_graph=*/true,
+        /*full_attention_variant=*/layer.is_full,
+        hnd_layout);
+}
+
+ops::DecodePlanCachePtr& select_prepared_plan(
+    Gemma4MoeMlpWorkspace& moe_ws,
+    bool row_decode,
+    bool full)
+{
+    if (row_decode) {
+        return full ? moe_ws.row_decode_plan_full
+                    : moe_ws.row_decode_plan_sliding;
+    }
+    return full ? moe_ws.decode_plan_full : moe_ws.decode_plan_sliding;
+}
+
+const ops::DecodePlanCachePtr& select_prepared_plan_const(
+    const Gemma4MoeMlpWorkspace& moe_ws,
+    bool row_decode,
+    bool full)
+{
+    if (row_decode) {
+        return full ? moe_ws.row_decode_plan_full
+                    : moe_ws.row_decode_plan_sliding;
+    }
+    return full ? moe_ws.decode_plan_full : moe_ws.decode_plan_sliding;
+}
+
+}  // namespace
+
+void prepare_gemma4_decode_plans(
+    const Gemma4Weights& w,
+    const HfConfig& cfg,
+    const Gemma4ForwardCfg& fwd_cfg,
+    Gemma4MoeMlpWorkspace& moe_ws,
+    KvCache& cache,
+    AttentionWorkspace& attn_ws,
+    const std::uint32_t* qo_indptr_h,
+    const std::uint32_t* kv_page_indices_h,
+    const std::uint32_t* kv_page_indptr_h,
+    const std::uint32_t* kv_last_page_lens_h,
+    int N,
+    int R,
+    bool is_pure_decode)
+{
+    static std::atomic<int> debug_count{0};
+    const bool debug = gemma4_plan_debug_enabled();
+    const int debug_idx = debug
+        ? debug_count.fetch_add(1, std::memory_order_relaxed)
+        : -1;
+    const bool log_debug = debug && debug_idx < gemma4_plan_debug_limit();
+    moe_ws.decode_plans_prepared = false;
+    moe_ws.row_decode_prepared = false;
+    moe_ws.row_decode_prepared_tokens = 0;
+    moe_ws.row_decode_prepared_requests = 0;
+    if (fwd_cfg.force_prefill_path || N <= 0 || R <= 0 ||
+        kv_page_indptr_h == nullptr) {
+        if (log_debug) {
+            std::cerr << "[pie-driver-cuda] gemma4 plan prepare skip"
+                      << " N=" << N
+                      << " R=" << R
+                      << " pure=" << (is_pure_decode ? 1 : 0)
+                      << " force_prefill=" << (fwd_cfg.force_prefill_path ? 1 : 0)
+                      << " has_kvpp=" << (kv_page_indptr_h != nullptr ? 1 : 0)
+                      << "\n";
+        }
+        return;
+    }
+
+    const auto plan_layout = [](const ops::DecodePlanCachePtr& plan) {
+        return plan ? ops::decode_plan_graph_layout(*plan) : 0u;
+    };
+    const auto prepare_pair = [&](const std::uint32_t* indptr,
+                                  int requests,
+                                  bool row_decode) {
+        if (const auto* sliding = first_layer_for_plan(w, /*full=*/false)) {
+            prepare_gemma4_plan_for_layer(
+                select_prepared_plan(moe_ws, row_decode, /*full=*/false),
+                *sliding, cfg, fwd_cfg, attn_ws, indptr, requests,
+                cache.page_size(), cache.hnd_layout(), /*stream=*/nullptr);
+        }
+        if (const auto* full = first_layer_for_plan(w, /*full=*/true)) {
+            prepare_gemma4_plan_for_layer(
+                select_prepared_plan(moe_ws, row_decode, /*full=*/true),
+                *full, cfg, fwd_cfg, attn_ws, indptr, requests,
+                cache.page_size(), cache.hnd_layout(), /*stream=*/nullptr);
+        }
+    };
+
+    if (is_pure_decode) {
+        prepare_pair(kv_page_indptr_h, R, /*row_decode=*/false);
+        moe_ws.decode_plans_prepared = true;
+        if (log_debug) {
+            std::cerr << "[pie-driver-cuda] gemma4 plan prepare"
+                      << " N=" << N
+                      << " R=" << R
+                      << " pure=1"
+                      << " decode_prepared=1"
+                      << " row_prepared=0"
+                      << " sliding_layout="
+                      << plan_layout(moe_ws.decode_plan_sliding)
+                      << " full_layout=" << plan_layout(moe_ws.decode_plan_full)
+                      << " pages=" << kv_page_indptr_h[R]
+                      << "\n";
+        }
+        return;
+    }
+
+    const bool row_ready = prepare_row_decode_kv_table(
+            moe_ws, qo_indptr_h, kv_page_indices_h, kv_page_indptr_h,
+            kv_last_page_lens_h, N, R, cache.page_size());
+    if (row_ready) {
+        prepare_pair(
+            moe_ws.h_row_decode_kv_page_indptr.data(), N,
+            /*row_decode=*/true);
+        moe_ws.row_decode_prepared = true;
+        moe_ws.row_decode_prepared_tokens = N;
+        moe_ws.row_decode_prepared_requests = R;
+    }
+    if (log_debug) {
+        std::cerr << "[pie-driver-cuda] gemma4 plan prepare"
+                  << " N=" << N
+                  << " R=" << R
+                  << " pure=0"
+                  << " row_ready=" << (row_ready ? 1 : 0)
+                  << " decode_prepared=" << (moe_ws.decode_plans_prepared ? 1 : 0)
+                  << " row_prepared=" << (moe_ws.row_decode_prepared ? 1 : 0)
+                  << " row_tokens=" << moe_ws.row_decode_prepared_tokens
+                  << " row_requests=" << moe_ws.row_decode_prepared_requests
+                  << " sliding_layout="
+                  << plan_layout(moe_ws.row_decode_plan_sliding)
+                  << " full_layout=" << plan_layout(moe_ws.row_decode_plan_full)
+                  << " row_pages="
+                  << (moe_ws.h_row_decode_kv_page_indptr.empty()
+                          ? 0u
+                          : moe_ws.h_row_decode_kv_page_indptr.back())
+                  << "\n";
+    }
 }
 
 Gemma4MoeMlpWorkspace Gemma4MoeMlpWorkspace::allocate(
@@ -85,6 +711,8 @@ Gemma4MoeMlpWorkspace Gemma4MoeMlpWorkspace::allocate(
     ws.expert_w     = DeviceBuffer<float>::alloc(maxR);
     ws.moe_out      = DeviceBuffer<std::uint16_t>::alloc(N * H);
 
+    ws.allocate_row_decode(max_tokens);
+
     ws.a_gu_ptrs    = DeviceBuffer<const std::uint16_t*>::alloc(top_k);
     ws.b_gu_ptrs    = DeviceBuffer<const std::uint16_t*>::alloc(top_k);
     ws.c_gu_ptrs    = DeviceBuffer<std::uint16_t*>::alloc(top_k);
@@ -93,6 +721,41 @@ Gemma4MoeMlpWorkspace Gemma4MoeMlpWorkspace::allocate(
     ws.c_dn_ptrs    = DeviceBuffer<std::uint16_t*>::alloc(top_k);
     ws.batch_weights = DeviceBuffer<float>::alloc(top_k);
     return ws;
+}
+
+void Gemma4MoeMlpWorkspace::allocate_row_decode(int max_tokens)
+{
+    if (max_tokens <= 0) return;
+    // CUDA graphs capture the row-decode KV table device pointers. Allocate
+    // these at workspace lifetime so growing speculative verification prefixes
+    // cannot invalidate a captured graph.
+    const std::size_t N = static_cast<std::size_t>(max_tokens);
+    const std::size_t row_page_refs = gemma4_row_decode_max_page_refs();
+    if (row_page_refs == 0) return;
+    if (row_decode_kv_page_indices.size() < row_page_refs) {
+        row_decode_kv_page_indices =
+            DeviceBuffer<std::uint32_t>::alloc(row_page_refs);
+    }
+    if (row_decode_kv_page_indptr.size() < N + 1) {
+        row_decode_kv_page_indptr =
+            DeviceBuffer<std::uint32_t>::alloc(N + 1);
+    }
+    if (row_decode_kv_last_page_lens.size() < N) {
+        row_decode_kv_last_page_lens =
+            DeviceBuffer<std::uint32_t>::alloc(N);
+    }
+    // Dense Gemma4 uses the MoE pointer-array slots as tiny graph-stable
+    // scratch for batching the gate/up MLP GEMMs. MoE variants allocate
+    // larger arrays in allocate(); keep those when present.
+    if (a_gu_ptrs.size() < 2) {
+        a_gu_ptrs = DeviceBuffer<const std::uint16_t*>::alloc(2);
+    }
+    if (b_gu_ptrs.size() < 2) {
+        b_gu_ptrs = DeviceBuffer<const std::uint16_t*>::alloc(2);
+    }
+    if (c_gu_ptrs.size() < 2) {
+        c_gu_ptrs = DeviceBuffer<std::uint16_t*>::alloc(2);
+    }
 }
 
 void Gemma4MoeMlpWorkspace::allocate_ple(int max_tokens, int per_layer_total)
@@ -123,6 +786,17 @@ Gemma4Weights bind_gemma4(const LoadedModel& engine) {
     // would dangle them. One slot per layer when MoE is on.
     if (cfg.gemma4_enable_moe) {
         w.owned_router_combined_scales.reserve(
+            static_cast<std::size_t>(cfg.num_hidden_layers));
+    }
+    const bool fuse_dense_gate_up = gemma4_dense_gate_up_fused_enabled(cfg);
+    const bool fuse_dense_qkv =
+        !cfg.gemma4_enable_moe && gemma4_dense_qkv_fused_enabled();
+    if (fuse_dense_gate_up) {
+        w.owned_gate_up_fused.reserve(
+            static_cast<std::size_t>(cfg.num_hidden_layers));
+    }
+    if (fuse_dense_qkv) {
+        w.owned_qkv_fused.reserve(
             static_cast<std::size_t>(cfg.num_hidden_layers));
     }
     const std::string p = kPrefix;
@@ -280,6 +954,12 @@ Gemma4Weights bind_gemma4(const LoadedModel& engine) {
             Lw.k_norm = &engine.get(lp + "self_attn.k_norm.weight");
         }
         Lw.o_proj = &must(engine, lp + "self_attn.o_proj.weight");
+        if (fuse_dense_qkv && !is_shared && !Lw.use_k_as_v &&
+            Lw.k_proj != nullptr && Lw.v_proj != nullptr) {
+            w.owned_qkv_fused.push_back(
+                make_qkv_fused_weight(*Lw.q_proj, *Lw.k_proj, *Lw.v_proj));
+            Lw.qkv_proj_fused = &w.owned_qkv_fused.back();
+        }
 
         // MLP (intermediate may be 2× when use_double_wide_mlp + shared).
         Lw.gate_proj = &must(engine, lp + "mlp.gate_proj.weight");
@@ -287,6 +967,11 @@ Gemma4Weights bind_gemma4(const LoadedModel& engine) {
         Lw.down_proj = &must(engine, lp + "mlp.down_proj.weight");
         Lw.intermediate = static_cast<int>(Lw.gate_proj->shape()[0]);
         w.per_layer_intermediate[i] = Lw.intermediate;
+        if (fuse_dense_gate_up) {
+            w.owned_gate_up_fused.push_back(
+                make_gate_up_fused_weight(*Lw.gate_proj, *Lw.up_proj));
+            Lw.gate_up_proj_fused = &w.owned_gate_up_fused.back();
+        }
 
         // PLE per-layer triple. HF names match `per_layer_input_gate`,
         // `per_layer_projection`, `post_per_layer_input_norm`. Optional
@@ -538,6 +1223,30 @@ void gemma4_moe_block(
 
 }  // namespace
 
+std::uint32_t gemma4_decode_graph_layout(
+    const Gemma4MoeMlpWorkspace& moe_ws)
+{
+    const bool row_decode = moe_ws.row_decode_prepared;
+    const bool decode = moe_ws.decode_plans_prepared;
+    if (!row_decode && !decode) return 0u;
+
+    const auto pack = [](const ops::DecodePlanCachePtr& plan) -> std::uint32_t {
+        if (!plan) return 0u;
+        return ops::decode_plan_graph_layout(*plan);
+    };
+    const std::uint32_t sliding = row_decode
+        ? pack(moe_ws.row_decode_plan_sliding)
+        : pack(moe_ws.decode_plan_sliding);
+    const std::uint32_t full = row_decode
+        ? pack(moe_ws.row_decode_plan_full)
+        : pack(moe_ws.decode_plan_full);
+    if (sliding == 0u && full == 0u) return 0u;
+
+    return (row_decode ? 0x10000u : 0x20000u) |
+           (sliding & 0xffu) |
+           ((full & 0xffu) << 8);
+}
+
 void gemma4_forward_paged(
     const Gemma4Weights& w,
     const HfConfig& cfg,
@@ -554,11 +1263,13 @@ void gemma4_forward_paged(
     const std::uint32_t* kv_page_indptr,
     const std::uint32_t* kv_last_page_lens,
     const std::uint32_t* qo_indptr_h,
+    const std::uint32_t* kv_page_indices_h,
     const std::uint32_t* kv_page_indptr_h,
+    const std::uint32_t* kv_last_page_lens_h,
     int N,
     int R,
     bool is_pure_decode,
-    const std::uint8_t* /*custom_mask_d*/,
+    const std::uint8_t* custom_mask_d,
     const std::int32_t* /*custom_mask_indptr_d*/,
     const std::int32_t* logit_row_indices_d,
     int num_logit_rows)
@@ -568,9 +1279,31 @@ void gemma4_forward_paged(
     const int V        = cfg.vocab_size;
     const int ple_dim  = cfg.gemma_hidden_size_per_layer_input;
     const float eps    = cfg.rms_norm_eps;
-    cudaStream_t stream = nullptr;
+    cudaStream_t stream = cublas.stream();
+    Gemma4ForwardProfile profile;
+    profile.begin(stream);
 
     const bool use_decode_path = is_pure_decode && !fwd_cfg.force_prefill_path;
+    const bool prepared_row_decode =
+        !use_decode_path &&
+        moe_ws.row_decode_prepared &&
+        moe_ws.row_decode_prepared_tokens == N &&
+        moe_ws.row_decode_prepared_requests == R;
+    const bool use_row_decode_path =
+        !use_decode_path &&
+        custom_mask_d == nullptr &&
+        !fwd_cfg.force_prefill_path &&
+        (prepared_row_decode ||
+         prepare_row_decode_kv_table(
+             moe_ws, qo_indptr_h, kv_page_indices_h, kv_page_indptr_h,
+             kv_last_page_lens_h, N, R, cache.page_size()));
+    if (profile.enabled) {
+        profile.N = N;
+        profile.R = R;
+        profile.pure_decode = is_pure_decode;
+        profile.decode_path = use_decode_path;
+        profile.row_decode_path = use_row_decode_path;
+    }
 
     // ── 1. Embed + √hidden scale ──────────────────────────────────────────
     // Dump input tokens to disk so the parity harness can confirm
@@ -588,13 +1321,15 @@ void gemma4_forward_paged(
                                N * sizeof(std::int32_t));
         }
     }
-    kernels::launch_embed_bf16(
-        token_ids, w.embed->data(), ws.y.data(), N, H, V, stream);
-    dbg_sync_dump_bf16("embed_pre_scale", ws.y.data(),
-                  static_cast<std::size_t>(N) * H);
-    kernels::launch_scalar_mul_bf16(
-        ws.y.data(), std::sqrt(static_cast<float>(H)),
-        static_cast<std::size_t>(N) * H, stream);
+    profile_gemma4_cuda_stage(profile, profile.embed_ms, stream, [&] {
+        kernels::launch_embed_bf16(
+            token_ids, w.embed->data(), ws.y.data(), N, H, V, stream);
+        dbg_sync_dump_bf16("embed_pre_scale", ws.y.data(),
+                      static_cast<std::size_t>(N) * H);
+        kernels::launch_scalar_mul_bf16(
+            ws.y.data(), std::sqrt(static_cast<float>(H)),
+            static_cast<std::size_t>(N) * H, stream);
+    });
     dbg_sync_dump_bf16("embed_post_scale", ws.y.data(),
                   static_cast<std::size_t>(N) * H);
 
@@ -636,6 +1371,8 @@ void gemma4_forward_paged(
             per_layer_token = per_layer_token_buf.data();
             per_layer_proj  = per_layer_proj_buf.data();
         }
+        profile_gemma4_cuda_stage(
+            profile, profile.ple_inputs_ms, stream, [&] {
         // Embed lookup into the per-layer table.
         kernels::launch_embed_bf16(
             token_ids, w.embed_per_layer->data(), per_layer_token,
@@ -673,6 +1410,7 @@ void gemma4_forward_paged(
             static_cast<const std::uint16_t*>(per_layer_proj),
             static_cast<std::uint16_t*>(per_layer_token),
             N, L, ple_dim, stream);
+            });
     }
     // After this block, `per_layer_proj` keeps the original [N, L, D]
     // signal for dumps; `per_layer_token` holds the [L, N, D] layout
@@ -692,6 +1430,10 @@ void gemma4_forward_paged(
     if (const char* lim = getenv("PIE_GEMMA4_MAX_LAYERS")) {
         debug_max_layers = std::min(L, std::atoi(lim));
     }
+    if (profile.enabled) {
+        profile.layers = debug_max_layers;
+    }
+    bool attn_norm_precomputed = false;
     for (int l = 0; l < debug_max_layers; ++l) {
         const auto& layer = w.layers[l];
         const bool dump_this = (l == 0);
@@ -720,34 +1462,88 @@ void gemma4_forward_paged(
         NcclComm* tp = (T > 1) ? fwd_cfg.tp_comm : nullptr;
 
         // ── 3a. Attention block ─────────────────────────────────────────
-        kernels::launch_rmsnorm_bf16(
-            ws.y.data(), layer.attn_norm_pre->data(), ws.norm_x.data(),
-            N, H, eps, stream);
+        auto kv_view = cache.layer_view(l);
+        profile_gemma4_cuda_stage(
+            profile, profile.attn_prep_ms, stream, [&] {
+        if (!attn_norm_precomputed) {
+            kernels::launch_rmsnorm_bf16(
+                ws.y.data(), layer.attn_norm_pre->data(), ws.norm_x.data(),
+                N, H, eps, stream);
+        }
+        attn_norm_precomputed = false;
         dump_l0("attn_norm_pre", ws.norm_x.data(),
                 static_cast<std::size_t>(N) * H);
 
-        // Q-projection always runs.
-        ops::gemm_act_x_wt_bf16(cublas.handle(),
-            ws.norm_x.data(), layer.q_proj->data(), ws.q.data(),
-            N, Hq, H);
-        // K/V projections only on non-shared layers. On 26B-A4B's
-        // `use_k_as_v` full layers there's no v_proj — V is the raw
-        // k_proj output (before k_norm/RoPE), then v-norm. Copy K to V
-        // here so the v-norm step below can apply in-place on V.
-        if (!layer.is_shared) {
+        // RoPE: partial rotary on full-attention layers
+        // (`partial_rotary_factor < 1`), full rotation otherwise.
+        const float prf = w.per_layer_partial_rotary_factor[l];
+        const int rotary_dim = static_cast<int>(prf * d);
+        const bool partial = (prf < 1.0f) && (rotary_dim > 0);
+        const bool qk_norm_enabled = getenv("PIE_NO_QK_NORM") == nullptr;
+        bool qkv_post_fused = false;
+
+        const bool use_fused_qkv =
+            !layer.is_shared &&
+            gemma4_dense_qkv_fused_enabled() &&
+            layer.qkv_proj_fused != nullptr &&
+            !ws.qkv_fused.empty();
+        if (use_fused_qkv) {
             ops::gemm_act_x_wt_bf16(cublas.handle(),
-                ws.norm_x.data(), layer.k_proj->data(), ws.k.data(),
-                N, Hk, H);
-            if (layer.use_k_as_v) {
-                CUDA_CHECK(cudaMemcpyAsync(
-                    ws.v.data(), ws.k.data(),
-                    static_cast<std::size_t>(N) * Hk *
-                        sizeof(std::uint16_t),
-                    cudaMemcpyDeviceToDevice, stream));
+                ws.norm_x.data(), layer.qkv_proj_fused->data(),
+                ws.qkv_fused.data(), N, Hq + 2 * Hk, H);
+            const bool can_fuse_packed_qkv_post =
+                qk_norm_enabled && !partial && !dbg_dumps_enabled() &&
+                kv_view.is_native_bf16() &&
+                (use_row_decode_path || use_decode_path);
+            if (can_fuse_packed_qkv_post) {
+                const std::uint32_t* post_kv_page_indices = use_row_decode_path
+                    ? moe_ws.row_decode_kv_page_indices.data()
+                    : kv_page_indices;
+                const std::uint32_t* post_kv_page_indptr = use_row_decode_path
+                    ? moe_ws.row_decode_kv_page_indptr.data()
+                    : kv_page_indptr;
+                const std::uint32_t* post_kv_last_page_lens = use_row_decode_path
+                    ? moe_ws.row_decode_kv_last_page_lens.data()
+                    : kv_last_page_lens;
+                kernels::launch_qkv_packed_qk_norm_rope_vnorm_write_kv_bf16(
+                    ws.qkv_fused.data(), ws.q.data(),
+                    kv_view.k_pages, kv_view.v_pages,
+                    layer.q_norm->data(), layer.k_norm->data(),
+                    positions, post_kv_page_indices, post_kv_page_indptr,
+                    post_kv_last_page_lens, N, num_q_heads_local,
+                    num_kv_heads_local, d, cache.page_size(),
+                    kv_view.hnd_layout, w.per_layer_rope_theta[l], eps,
+                    stream);
+                qkv_post_fused = true;
             } else {
+                kernels::launch_split_qkv_bf16(
+                    ws.qkv_fused.data(), ws.q.data(), ws.k.data(), ws.v.data(),
+                    N, Hq, Hk, stream);
+            }
+        } else {
+            // Q-projection always runs.
+            ops::gemm_act_x_wt_bf16(cublas.handle(),
+                ws.norm_x.data(), layer.q_proj->data(), ws.q.data(),
+                N, Hq, H);
+            // K/V projections only on non-shared layers. On 26B-A4B's
+            // `use_k_as_v` full layers there's no v_proj — V is the raw
+            // k_proj output (before k_norm/RoPE), then v-norm. Copy K to V
+            // here so the v-norm step below can apply in-place on V.
+            if (!layer.is_shared) {
                 ops::gemm_act_x_wt_bf16(cublas.handle(),
-                    ws.norm_x.data(), layer.v_proj->data(), ws.v.data(),
+                    ws.norm_x.data(), layer.k_proj->data(), ws.k.data(),
                     N, Hk, H);
+                if (layer.use_k_as_v) {
+                    CUDA_CHECK(cudaMemcpyAsync(
+                        ws.v.data(), ws.k.data(),
+                        static_cast<std::size_t>(N) * Hk *
+                            sizeof(std::uint16_t),
+                        cudaMemcpyDeviceToDevice, stream));
+                } else {
+                    ops::gemm_act_x_wt_bf16(cublas.handle(),
+                        ws.norm_x.data(), layer.v_proj->data(), ws.v.data(),
+                        N, Hk, H);
+                }
             }
         }
 
@@ -759,21 +1555,67 @@ void gemma4_forward_paged(
                     static_cast<std::size_t>(N) * num_q_heads_local * d);
         }
 
-        // Per-head Q/K RMSNorm (Gemma-4 always has it).
-        if (getenv("PIE_NO_QK_NORM") == nullptr) {
-            kernels::launch_rmsnorm_bf16(
-                ws.q.data(), layer.q_norm->data(), ws.q.data(),
-                N * num_q_heads_local, d, eps, stream);
+        const bool can_fuse_qk_norm_rope = qk_norm_enabled && !partial;
+        if (qkv_post_fused) {
+            // Packed QKV post-processing already produced Q and wrote K/V.
+        } else if (can_fuse_qk_norm_rope) {
             if (!layer.is_shared) {
-                kernels::launch_rmsnorm_bf16(
-                    ws.k.data(), layer.k_norm->data(), ws.k.data(),
-                    N * num_kv_heads_local, d, eps, stream);
                 // V-Norm: pure RMSNorm (no learnable scale) on V before the
                 // KV write. Gemma-4 trained against this; skipping it
                 // produces gibberish even though softmax stays well-formed.
                 kernels::launch_rmsnorm_no_scale_bf16(
                     ws.v.data(), ws.v.data(),
                     N * num_kv_heads_local, d, eps, stream);
+            }
+            kernels::launch_qk_rmsnorm_rope_bf16_rounded(
+                ws.q.data(), ws.k.data(),
+                layer.q_norm->data(),
+                layer.is_shared ? nullptr : layer.k_norm->data(),
+                positions, N, num_q_heads_local,
+                layer.is_shared ? 0 : num_kv_heads_local, d,
+                w.per_layer_rope_theta[l], eps, stream);
+        } else {
+            // Per-head Q/K RMSNorm (Gemma-4 always has it).
+            if (qk_norm_enabled) {
+                kernels::launch_rmsnorm_bf16(
+                    ws.q.data(), layer.q_norm->data(), ws.q.data(),
+                    N * num_q_heads_local, d, eps, stream);
+                if (!layer.is_shared) {
+                    kernels::launch_rmsnorm_bf16(
+                        ws.k.data(), layer.k_norm->data(), ws.k.data(),
+                        N * num_kv_heads_local, d, eps, stream);
+                    kernels::launch_rmsnorm_no_scale_bf16(
+                        ws.v.data(), ws.v.data(),
+                        N * num_kv_heads_local, d, eps, stream);
+                }
+            }
+
+            if (!layer.is_shared) {
+                if (partial) {
+                    kernels::launch_rope_partial_bf16(
+                        ws.q.data(), ws.k.data(), positions,
+                        N, num_q_heads_local, num_kv_heads_local, d,
+                        rotary_dim, w.per_layer_rope_theta[l], stream);
+                } else {
+                    kernels::launch_rope_bf16(
+                        ws.q.data(), ws.k.data(), positions,
+                        N, num_q_heads_local, num_kv_heads_local, d,
+                        w.per_layer_rope_theta[l], stream);
+                }
+            } else {
+                // Shared layers: only Q gets RoPE'd here; K was rotated at
+                // its source layer (where it was written to the cache).
+                if (partial) {
+                    kernels::launch_rope_partial_bf16(
+                        ws.q.data(), ws.q.data(), positions,
+                        N, num_q_heads_local, /*num_kv_heads=*/0, d,
+                        rotary_dim, w.per_layer_rope_theta[l], stream);
+                } else {
+                    kernels::launch_rope_bf16(
+                        ws.q.data(), ws.q.data(), positions,
+                        N, num_q_heads_local, /*num_kv_heads=*/0, d,
+                        w.per_layer_rope_theta[l], stream);
+                }
             }
         }
         if (l == 0 && !layer.is_shared) {
@@ -783,49 +1625,15 @@ void gemma4_forward_paged(
                     static_cast<std::size_t>(N) * num_q_heads_local * d);
         }
 
-        // RoPE: partial rotary on full-attention layers
-        // (`partial_rotary_factor < 1`), full rotation otherwise.
-        const float prf = w.per_layer_partial_rotary_factor[l];
-        const int rotary_dim = static_cast<int>(prf * d);
-        const bool partial = (prf < 1.0f) && (rotary_dim > 0);
-
-        if (!layer.is_shared) {
-            if (partial) {
-                kernels::launch_rope_partial_bf16(
-                    ws.q.data(), ws.k.data(), positions,
-                    N, num_q_heads_local, num_kv_heads_local, d,
-                    rotary_dim, w.per_layer_rope_theta[l], stream);
-            } else {
-                kernels::launch_rope_bf16(
-                    ws.q.data(), ws.k.data(), positions,
-                    N, num_q_heads_local, num_kv_heads_local, d,
-                    w.per_layer_rope_theta[l], stream);
-            }
-        } else {
-            // Shared layers: only Q gets RoPE'd here; K was rotated at
-            // its source layer (where it was written to the cache).
-            if (partial) {
-                kernels::launch_rope_partial_bf16(
-                    ws.q.data(), ws.q.data(), positions,
-                    N, num_q_heads_local, /*num_kv_heads=*/0, d,
-                    rotary_dim, w.per_layer_rope_theta[l], stream);
-            } else {
-                kernels::launch_rope_bf16(
-                    ws.q.data(), ws.q.data(), positions,
-                    N, num_q_heads_local, /*num_kv_heads=*/0, d,
-                    w.per_layer_rope_theta[l], stream);
-            }
-        }
-
         // KV write only on non-shared layers — shared layers attend
         // through the source slot's already-populated pages.
-        auto kv_view = cache.layer_view(l);
-        if (!layer.is_shared) {
+        if (!layer.is_shared && !qkv_post_fused) {
             kernels::launch_write_kv_to_pages(
                 kv_view, ws.k.data(), ws.v.data(),
                 qo_indptr, kv_page_indices, kv_page_indptr, kv_last_page_lens,
                 N, R, stream);
         }
+            });
 
         // Plan + dispatch attention. Shared layers dispatch against the
         // source slot's tensors (KvCache redirects via `kv_source_layer`).
@@ -834,43 +1642,84 @@ void gemma4_forward_paged(
         // configuration: NUM_MMA_D_QK=32"). For prefill at 512 we fall
         // back to a naive paged-attention kernel (much slower but
         // correct); decode at 512 still uses flashinfer.
-        ops::DecodePlanCachePtr decode_plan;
-        if (use_decode_path) {
-            decode_plan = ops::make_decode_plan();
-            ops::plan_attention_flashinfer_decode(
-                *decode_plan, kv_page_indptr_h, R,
-                num_q_heads_local, num_kv_heads_local, d,
-                cache.page_size(), attn_ws, stream,
-                /*enable_cuda_graph=*/true,
-                /*full_attention_variant=*/false,
-                cache.hnd_layout());
-            ops::dispatch_attention_flashinfer_decode(
-                *decode_plan,
-                ws.q.data(), kv_view, ws.attn_out.data(),
-                kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                attn_ws, stream,
-                /*window_left=*/w.per_layer_window_left[l],
-                /*logits_soft_cap=*/0.f,
-                /*sm_scale=*/1.0f);  // Gemma-4: q/k norm absorbs 1/sqrt(d)
-        } else if (d == 512) {
-            ops::launch_attention_naive_paged(
-                ws.q.data(), kv_view, ws.attn_out.data(),
-                qo_indptr, kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                N, R, kv_page_indptr_h[R], num_q_heads_local, stream,
-                /*window_left=*/w.per_layer_window_left[l],
-                /*sm_scale=*/1.0f,
-                /*logits_soft_cap=*/0.f,
-                /*lse_out=*/nullptr);
-        } else {
-            ops::launch_attention_flashinfer_prefill(
-                ws.q.data(), kv_view, ws.attn_out.data(),
-                qo_indptr, kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                qo_indptr_h, kv_page_indptr_h,
-                N, R, num_q_heads_local, attn_ws, stream,
-                /*window_left=*/w.per_layer_window_left[l],
-                /*logits_soft_cap=*/0.f,
-                /*sm_scale=*/1.0f);
-        }
+        profile_gemma4_cuda_stage(
+            profile, profile.attention_ms, stream, [&] {
+                ops::DecodePlanCachePtr decode_plan;
+                if (use_decode_path) {
+                    ops::DecodePlanCache* plan =
+                        select_prepared_plan(
+                            moe_ws, /*row_decode=*/false, layer.is_full).get();
+                    ops::DecodePlanCachePtr decode_plan;
+                    if (plan == nullptr) {
+                        decode_plan = ops::make_decode_plan();
+                        plan = decode_plan.get();
+                        ops::plan_attention_flashinfer_decode(
+                            *plan, kv_page_indptr_h, R,
+                            num_q_heads_local, num_kv_heads_local, d,
+                            cache.page_size(), attn_ws, stream,
+                            /*enable_cuda_graph=*/true,
+                            /*full_attention_variant=*/layer.is_full,
+                            cache.hnd_layout());
+                    }
+                    ops::dispatch_attention_flashinfer_decode(
+                        *plan,
+                        ws.q.data(), kv_view, ws.attn_out.data(),
+                        kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                        attn_ws, stream,
+                        /*window_left=*/w.per_layer_window_left[l],
+                        /*logits_soft_cap=*/0.f,
+                        /*sm_scale=*/1.0f);
+                } else if (use_row_decode_path) {
+                    // Short speculative-verification blocks are causal and
+                    // already have K/V written above. Treat each query row as
+                    // its own decode request with a prefix-specific page table.
+                    ops::DecodePlanCache* plan =
+                        select_prepared_plan(
+                            moe_ws, /*row_decode=*/true, layer.is_full).get();
+                    ops::DecodePlanCachePtr row_plan;
+                    if (plan == nullptr) {
+                        row_plan = ops::make_decode_plan();
+                        plan = row_plan.get();
+                        ops::plan_attention_flashinfer_decode(
+                            *plan,
+                            moe_ws.h_row_decode_kv_page_indptr.data(), N,
+                            num_q_heads_local, num_kv_heads_local, d,
+                            cache.page_size(), attn_ws, stream,
+                            /*enable_cuda_graph=*/true,
+                            /*full_attention_variant=*/layer.is_full,
+                            cache.hnd_layout());
+                    }
+                    ops::dispatch_attention_flashinfer_decode(
+                        *plan,
+                        ws.q.data(), kv_view, ws.attn_out.data(),
+                        moe_ws.row_decode_kv_page_indices.data(),
+                        moe_ws.row_decode_kv_page_indptr.data(),
+                        moe_ws.row_decode_kv_last_page_lens.data(),
+                        attn_ws, stream,
+                        /*window_left=*/w.per_layer_window_left[l],
+                        /*logits_soft_cap=*/0.f,
+                        /*sm_scale=*/1.0f);
+                } else if (d == 512) {
+                    ops::launch_attention_naive_paged(
+                        ws.q.data(), kv_view, ws.attn_out.data(),
+                        qo_indptr, kv_page_indices, kv_page_indptr,
+                        kv_last_page_lens, N, R, kv_page_indptr_h[R],
+                        num_q_heads_local, stream,
+                        /*window_left=*/w.per_layer_window_left[l],
+                        /*sm_scale=*/1.0f,
+                        /*logits_soft_cap=*/0.f,
+                        /*lse_out=*/nullptr);
+                } else {
+                    ops::launch_attention_flashinfer_prefill(
+                        ws.q.data(), kv_view, ws.attn_out.data(),
+                        qo_indptr, kv_page_indices, kv_page_indptr,
+                        kv_last_page_lens, qo_indptr_h, kv_page_indptr_h,
+                        N, R, num_q_heads_local, attn_ws, stream,
+                        /*window_left=*/w.per_layer_window_left[l],
+                        /*logits_soft_cap=*/0.f,
+                        /*sm_scale=*/1.0f);
+                }
+            });
 
         dump_l0("attn_out", ws.attn_out.data(),
                 static_cast<std::size_t>(N) * Hq);
@@ -878,6 +1727,8 @@ void gemma4_forward_paged(
         // o_proj → norm_x scratch, post-attn norm, residual-add y. Under
         // TP this is row-parallel: all-reduce the partial sums before
         // post-norm sees them.
+        profile_gemma4_cuda_stage(
+            profile, profile.attn_out_ms, stream, [&] {
         ops::gemm_act_x_wt_bf16(cublas.handle(),
             ws.attn_out.data(), layer.o_proj->data(), ws.norm_x.data(),
             N, H, Hq, /*beta=*/0.f);
@@ -887,33 +1738,71 @@ void gemma4_forward_paged(
         }
         dump_l0("o_proj_out", ws.norm_x.data(),
                 static_cast<std::size_t>(N) * H);
-        kernels::launch_rmsnorm_bf16(
-            ws.norm_x.data(), layer.attn_norm_post->data(), ws.norm_y.data(),
-            N, H, eps, stream);
-        dump_l0("attn_norm_post", ws.norm_y.data(),
-                static_cast<std::size_t>(N) * H);
-        kernels::launch_residual_add_bf16(
-            ws.y.data(), ws.norm_y.data(),
-            static_cast<std::size_t>(N) * H, stream);
+        if (!dbg_dumps_enabled()) {
+            kernels::launch_rmsnorm_residual_add_scale_rmsnorm_bf16(
+                ws.norm_x.data(), layer.attn_norm_post->data(), ws.y.data(),
+                1.f, layer.mlp_norm_pre->data(), ws.norm_x.data(),
+                N, H, eps, stream);
+        } else {
+            kernels::launch_rmsnorm_bf16(
+                ws.norm_x.data(), layer.attn_norm_post->data(), ws.norm_y.data(),
+                N, H, eps, stream);
+            dump_l0("attn_norm_post", ws.norm_y.data(),
+                    static_cast<std::size_t>(N) * H);
+            kernels::launch_residual_add_rmsnorm_bf16(
+                ws.y.data(), ws.norm_y.data(), layer.mlp_norm_pre->data(),
+                ws.norm_x.data(), N, H, eps, stream);
+        }
         dump_l0("post_attn_y", ws.y.data(),
                 static_cast<std::size_t>(N) * H);
+            });
 
         // ── 3b. MLP block ──────────────────────────────────────────────
-        kernels::launch_rmsnorm_bf16(
-            ws.y.data(), layer.mlp_norm_pre->data(), ws.norm_x.data(),
-            N, H, eps, stream);
+        profile_gemma4_cuda_stage(profile, profile.mlp_ms, stream, [&] {
         dump_l0("mlp_norm_pre", ws.norm_x.data(),
                 static_cast<std::size_t>(N) * H);
 
-        ops::gemm_act_x_wt_bf16(cublas.handle(),
-            ws.norm_x.data(), layer.gate_proj->data(), ws.gate.data(),
-            N, I, H);
-        ops::gemm_act_x_wt_bf16(cublas.handle(),
-            ws.norm_x.data(), layer.up_proj->data(),   ws.up.data(),
-            N, I, H);
-        kernels::launch_geglu_tanh_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
+        if (layer.gate_up_proj_fused != nullptr &&
+            !ws.gate_up_fused.empty()) {
+            ops::gemm_act_x_wt_bf16_cublas(cublas.handle(),
+                ws.norm_x.data(), layer.gate_up_proj_fused->data(),
+                ws.gate_up_fused.data(), N, 2 * I, H);
+            kernels::launch_chunked_geglu_tanh_bf16(
+                ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
+        } else if (gemma4_dense_gate_up_batched_enabled() &&
+            moe_ws.a_gu_ptrs.size() >= 2 &&
+            moe_ws.b_gu_ptrs.size() >= 2 &&
+            moe_ws.c_gu_ptrs.size() >= 2) {
+            kernels::launch_build_dual_bf16_gemm_ptrs(
+                ws.norm_x.data(),
+                layer.gate_proj->data(),
+                layer.up_proj->data(),
+                ws.gate.data(),
+                ws.up.data(),
+                reinterpret_cast<const void**>(moe_ws.a_gu_ptrs.data()),
+                reinterpret_cast<const void**>(moe_ws.b_gu_ptrs.data()),
+                reinterpret_cast<void**>(moe_ws.c_gu_ptrs.data()),
+                stream);
+            ops::gemm_batched_act_x_wt_bf16(
+                cublas.handle(),
+                reinterpret_cast<const void* const*>(moe_ws.a_gu_ptrs.data()),
+                reinterpret_cast<const void* const*>(moe_ws.b_gu_ptrs.data()),
+                reinterpret_cast<void* const*>(moe_ws.c_gu_ptrs.data()),
+                N, I, H, /*batch_count=*/2);
+            kernels::launch_geglu_tanh_bf16(
+                ws.gate.data(), ws.up.data(), ws.gate.data(),
+                N * I, stream);
+        } else {
+            ops::gemm_act_x_wt_bf16(cublas.handle(),
+                ws.norm_x.data(), layer.gate_proj->data(), ws.gate.data(),
+                N, I, H);
+            ops::gemm_act_x_wt_bf16(cublas.handle(),
+                ws.norm_x.data(), layer.up_proj->data(),   ws.up.data(),
+                N, I, H);
+            kernels::launch_geglu_tanh_bf16(
+                ws.gate.data(), ws.up.data(), ws.gate.data(),
+                N * I, stream);
+        }
         dump_l0("mlp_geglu", ws.gate.data(),
                 static_cast<std::size_t>(N) * I);
         ops::gemm_act_x_wt_bf16(cublas.handle(),
@@ -960,17 +1849,24 @@ void gemma4_forward_paged(
                 ws.y.data(), ws.norm_x.data(),
                 static_cast<std::size_t>(N) * H, stream);
         } else {
-            kernels::launch_rmsnorm_bf16(
-                ws.norm_x.data(), layer.mlp_norm_post->data(), ws.norm_y.data(),
-                N, H, eps, stream);
-            dump_l0("mlp_norm_post", ws.norm_y.data(),
-                    static_cast<std::size_t>(N) * H);
-            kernels::launch_residual_add_bf16(
-                ws.y.data(), ws.norm_y.data(),
-                static_cast<std::size_t>(N) * H, stream);
+            if (!dbg_dumps_enabled()) {
+                kernels::launch_rmsnorm_residual_add_bf16(
+                    ws.norm_x.data(), layer.mlp_norm_post->data(),
+                    ws.y.data(), N, H, eps, stream);
+            } else {
+                kernels::launch_rmsnorm_bf16(
+                    ws.norm_x.data(), layer.mlp_norm_post->data(),
+                    ws.norm_y.data(), N, H, eps, stream);
+                dump_l0("mlp_norm_post", ws.norm_y.data(),
+                        static_cast<std::size_t>(N) * H);
+                kernels::launch_residual_add_bf16(
+                    ws.y.data(), ws.norm_y.data(),
+                    static_cast<std::size_t>(N) * H, stream);
+            }
         }
         dump_l0("post_mlp_y", ws.y.data(),
                 static_cast<std::size_t>(N) * H);
+        });
 
         // ── 3c. PLE residual ───────────────────────────────────────────
         // Wrapped in a block so debugging can disable the whole step
@@ -978,7 +1874,18 @@ void gemma4_forward_paged(
         // Skipped on Gemma-4 26B-A4B (`hidden_size_per_layer_input == 0`
         // → `ple_dim == 0`), which doesn't ship the per-layer triple at
         // all.
-        if (ple_dim > 0 && getenv("PIE_NO_PLE") == nullptr) {
+        const bool ple_active =
+            ple_dim > 0 && getenv("PIE_NO_PLE") == nullptr;
+        const bool layer_scalar_active =
+            layer.layer_scalar && getenv("PIE_NO_LAYER_SCALAR") == nullptr &&
+            std::abs(layer.layer_scalar_value - 1.f) > 1e-6f;
+        const float layer_scalar =
+            layer_scalar_active ? layer.layer_scalar_value : 1.f;
+        bool scalar_applied_in_ple = false;
+        bool next_attn_norm_ready = false;
+        profile_gemma4_cuda_stage(
+            profile, profile.ple_residual_ms, stream, [&] {
+        if (ple_active) {
         dump_l0("ple_residual_in", ws.y.data(),
                 static_cast<std::size_t>(N) * H);
         // ple_gate = ple_input_gate @ y_norm (using attn output in y)
@@ -1004,13 +1911,32 @@ void gemma4_forward_paged(
         ops::gemm_act_x_wt_bf16(cublas.handle(),
             ws.norm_x.data(), layer.ple_projection->data(), ws.norm_y.data(),
             N, H, ple_dim, /*beta=*/0.f);
-        kernels::launch_rmsnorm_bf16(
-            ws.norm_y.data(), layer.ple_norm->data(), ws.norm_y.data(),
-            N, H, eps, stream);
-        kernels::launch_residual_add_bf16(
-            ws.y.data(), ws.norm_y.data(),
-            static_cast<std::size_t>(N) * H, stream);
+        if (l + 1 < debug_max_layers && !dbg_dumps_enabled()) {
+            kernels::launch_rmsnorm_residual_add_scale_rmsnorm_bf16(
+                ws.norm_y.data(), layer.ple_norm->data(), ws.y.data(),
+                layer_scalar, w.layers[l + 1].attn_norm_pre->data(),
+                ws.norm_x.data(), N, H, eps, stream);
+            scalar_applied_in_ple = true;
+            next_attn_norm_ready = true;
+        } else {
+            kernels::launch_rmsnorm_bf16(
+                ws.norm_y.data(), layer.ple_norm->data(), ws.norm_y.data(),
+                N, H, eps, stream);
+        if (l + 1 < debug_max_layers) {
+            kernels::launch_residual_add_scale_rmsnorm_bf16(
+                ws.y.data(), ws.norm_y.data(), layer_scalar,
+                w.layers[l + 1].attn_norm_pre->data(), ws.norm_x.data(),
+                N, H, eps, stream);
+            scalar_applied_in_ple = true;
+            next_attn_norm_ready = true;
+        } else {
+            kernels::launch_residual_add_bf16(
+                ws.y.data(), ws.norm_y.data(),
+                static_cast<std::size_t>(N) * H, stream);
+        }
+        }
         }  // end PLE-bypass guard
+            });
 
         // Parity dump: residual stream after attention/MLP/PLE for
         // the first few layers.
@@ -1022,14 +1948,12 @@ void gemma4_forward_paged(
         }
 
         // ── 3d. Per-layer learnable scalar ────────────────────────────
-        if (layer.layer_scalar && getenv("PIE_NO_LAYER_SCALAR") == nullptr) {
-            const float s = layer.layer_scalar_value;
-            if (std::abs(s - 1.f) > 1e-6f) {
-                kernels::launch_scalar_mul_bf16(
-                    ws.y.data(), s,
-                    static_cast<std::size_t>(N) * H, stream);
-            }
+        if (layer_scalar_active && !scalar_applied_in_ple) {
+            kernels::launch_scalar_mul_bf16(
+                ws.y.data(), layer_scalar,
+                static_cast<std::size_t>(N) * H, stream);
         }
+        attn_norm_precomputed = next_attn_norm_ready;
 
         // Post-layer_scalar dump for parity comparison against HF's
         // `hidden_states[layer+1]` (which is after the scalar mul).
@@ -1048,29 +1972,50 @@ void gemma4_forward_paged(
     int lm_head_rows = N;
     const void* lm_head_input = ws.norm_x.data();
     if (compact_logits) {
-        kernels::launch_gather_bf16_rows(
-            static_cast<const std::uint16_t*>(ws.y.data()),
-            logit_row_indices_d,
-            static_cast<std::uint16_t*>(ws.norm_y.data()),
-            num_logit_rows, H, stream);
-        kernels::launch_rmsnorm_bf16(
-            ws.norm_y.data(), w.final_norm->data(), ws.norm_x.data(),
-            num_logit_rows, H, eps, stream);
+        // System speculation consumes the verifier's normalized hidden
+        // state by original row index. Keep ws.norm_x populated for all
+        // rows, then compact only the expensive lm_head input.
+        profile_gemma4_cuda_stage(
+            profile, profile.final_norm_ms, stream, [&] {
+                kernels::launch_rmsnorm_bf16(
+                    ws.y.data(), w.final_norm->data(), ws.norm_x.data(),
+                    N, H, eps, stream);
+                kernels::launch_gather_bf16_rows(
+                    static_cast<const std::uint16_t*>(ws.norm_x.data()),
+                    logit_row_indices_d,
+                    static_cast<std::uint16_t*>(ws.norm_y.data()),
+                    num_logit_rows, H, stream);
+            });
+        lm_head_input = ws.norm_y.data();
         lm_head_rows = num_logit_rows;
     } else {
-        kernels::launch_rmsnorm_bf16(
-            ws.y.data(), w.final_norm->data(), ws.norm_x.data(),
-            N, H, eps, stream);
+        profile_gemma4_cuda_stage(
+            profile, profile.final_norm_ms, stream, [&] {
+                kernels::launch_rmsnorm_bf16(
+                    ws.y.data(), w.final_norm->data(), ws.norm_x.data(),
+                    N, H, eps, stream);
+            });
     }
-    ops::gemm_act_x_wt_bf16(cublas.handle(),
-        lm_head_input, w.lm_head->data(), ws.logits.data(),
-        lm_head_rows, V, H);
+    if (profile.enabled) {
+        profile.compact_logits = compact_logits;
+        profile.lm_head_rows = lm_head_rows;
+    }
+    profile_gemma4_cuda_stage(profile, profile.lm_head_ms, stream, [&] {
+        ops::gemm_act_x_wt_bf16(cublas.handle(),
+            lm_head_input, w.lm_head->data(), ws.logits.data(),
+            lm_head_rows, V, H);
+    });
     const bool skip_final_softcap =
         g_logits_argmax_only && !dbg_dumps_enabled();
+    if (profile.enabled) {
+        profile.logits_argmax_only = g_logits_argmax_only;
+    }
     if (fwd_cfg.final_logit_softcap > 0.f && !skip_final_softcap) {
-        kernels::launch_logit_softcap_bf16(
-            ws.logits.data(), fwd_cfg.final_logit_softcap,
-            static_cast<std::size_t>(lm_head_rows) * V, stream);
+        profile_gemma4_cuda_stage(profile, profile.softcap_ms, stream, [&] {
+            kernels::launch_logit_softcap_bf16(
+                ws.logits.data(), fwd_cfg.final_logit_softcap,
+                static_cast<std::size_t>(lm_head_rows) * V, stream);
+        });
     }
     if (lm_head_rows > 0) {
         dbg_sync_dump_bf16("logits_last",
@@ -1078,6 +2023,7 @@ void gemma4_forward_paged(
                 static_cast<std::size_t>(lm_head_rows - 1) * V,
             static_cast<std::size_t>(V));
     }
+    maybe_print_gemma4_forward_profile(profile, stream);
     // After the first fire, freeze the dumps so subsequent decode
     // fires don't overwrite the prefill intermediates we want to
     // parity-check.

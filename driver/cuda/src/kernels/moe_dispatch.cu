@@ -73,6 +73,50 @@ void launch_scalar_weighted_add_bf16(
 
 namespace {
 
+__global__ void build_dual_bf16_gemm_ptrs_kernel(
+    const __nv_bfloat16* act,
+    const __nv_bfloat16* w0,
+    const __nv_bfloat16* w1,
+    __nv_bfloat16* out0,
+    __nv_bfloat16* out1,
+    const __nv_bfloat16** act_ptrs,
+    const __nv_bfloat16** w_ptrs,
+    __nv_bfloat16** out_ptrs)
+{
+    act_ptrs[0] = act;
+    act_ptrs[1] = act;
+    w_ptrs[0] = w0;
+    w_ptrs[1] = w1;
+    out_ptrs[0] = out0;
+    out_ptrs[1] = out1;
+}
+
+}  // namespace
+
+void launch_build_dual_bf16_gemm_ptrs(
+    const void* act,
+    const void* w0,
+    const void* w1,
+    void* out0,
+    void* out1,
+    const void** act_ptrs,
+    const void** w_ptrs,
+    void** out_ptrs,
+    cudaStream_t stream)
+{
+    build_dual_bf16_gemm_ptrs_kernel<<<1, 1, 0, stream>>>(
+        static_cast<const __nv_bfloat16*>(act),
+        static_cast<const __nv_bfloat16*>(w0),
+        static_cast<const __nv_bfloat16*>(w1),
+        static_cast<__nv_bfloat16*>(out0),
+        static_cast<__nv_bfloat16*>(out1),
+        reinterpret_cast<const __nv_bfloat16**>(act_ptrs),
+        reinterpret_cast<const __nv_bfloat16**>(w_ptrs),
+        reinterpret_cast<__nv_bfloat16**>(out_ptrs));
+}
+
+namespace {
+
 __global__ void batched_weighted_sum_bf16_kernel(
     __nv_bfloat16* __restrict__ out,
     const __nv_bfloat16* __restrict__ src,   // [batch, hidden]

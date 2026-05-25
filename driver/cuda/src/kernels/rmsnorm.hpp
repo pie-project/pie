@@ -34,6 +34,53 @@ void launch_residual_add_rmsnorm_bf16(
     float eps,
     cudaStream_t stream);
 
+// Fused Gemma4 end-of-layer helper:
+//   hidden = round_bf16(round_bf16(hidden + residual) * round_bf16(scale))
+//   norm_out = rmsnorm(hidden, next_weight)
+// This matches the separate PLE residual add, layer scalar, and next-layer
+// attention pre-norm sequence while avoiding two extra full-row passes.
+void launch_residual_add_scale_rmsnorm_bf16(
+    void* hidden,
+    const void* residual,
+    float scale,
+    const void* next_weight,
+    void* norm_out,
+    int num_rows,
+    int hidden_size,
+    float eps,
+    cudaStream_t stream);
+
+// Fuses:
+//   tmp = rmsnorm(x, weight)
+//   hidden = round_bf16(hidden + tmp)
+// preserving the bf16 tmp materialization of the unfused sequence.
+void launch_rmsnorm_residual_add_bf16(
+    const void* x,
+    const void* weight,
+    void* hidden,
+    int num_rows,
+    int hidden_size,
+    float eps,
+    cudaStream_t stream);
+
+// Fuses:
+//   tmp = rmsnorm(x, weight)
+//   hidden = round_bf16(round_bf16(hidden + tmp) * round_bf16(scale))
+//   norm_out = rmsnorm(hidden, next_weight)
+// This is the exact fused form of Gemma4's PLE post-norm, residual add,
+// layer scalar, and next-layer attention pre-norm sequence.
+void launch_rmsnorm_residual_add_scale_rmsnorm_bf16(
+    const void* x,
+    const void* weight,
+    void* hidden,
+    float scale,
+    const void* next_weight,
+    void* norm_out,
+    int num_rows,
+    int hidden_size,
+    float eps,
+    cudaStream_t stream);
+
 // Gemma family RMSNorm — applies `(1 + w) * x_hat` instead of `w * x_hat`.
 // HF stores Gemma's RMSNorm gamma centered at zero; this lets the loaded
 // tensor be inspected/initialized like a residual gate, but downstream

@@ -142,6 +142,9 @@ struct HfConfig {
     // source layer of the same `layer_types[i]`.
     int gemma_hidden_size_per_layer_input;
     int num_kv_shared_layers;
+    bool gemma4_use_ordered_embeddings = false;
+    int gemma4_num_centroids = 0;
+    int gemma4_centroid_intermediate_top_k = 0;
 
     // Gemma-4 per-layer rope_theta (HF nests under `rope_parameters`),
     // including `partial_rotary_factor` for full-attention layers

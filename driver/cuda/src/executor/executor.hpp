@@ -87,7 +87,9 @@ struct ForwardFn {
         const std::uint32_t* /* kv_page_indptr   device */,
         const std::uint32_t* /* kv_last_page_lens device */,
         const std::uint32_t* /* qo_indptr_h        host */,
+        const std::uint32_t* /* kv_page_indices_h  host */,
         const std::uint32_t* /* kv_page_indptr_h   host */,
+        const std::uint32_t* /* kv_last_page_lens_h host */,
         int                  /* total_tokens N */,
         int                  /* num_requests R */,
         bool                 /* is_pure_decode */,
@@ -135,6 +137,7 @@ struct ForwardFn {
 
     struct PrepareInputs {
         const std::uint32_t* qo_indptr_h = nullptr;
+        const std::uint32_t* kv_page_indices_h = nullptr;
         const std::uint32_t* kv_page_indices_d = nullptr;
         const std::uint32_t* kv_page_indptr_h = nullptr;
         const std::uint32_t* kv_page_indptr_d = nullptr;
@@ -178,6 +181,32 @@ struct ForwardFn {
     ForwardFn& operator=(ForwardFn&&) noexcept = default;
 };
 
+struct SystemSpecDraftRequest {
+    int request_index = -1;
+    int source_row = -1;
+    std::uint32_t accepted_token = 0;
+    std::uint32_t source_position = 0;
+    std::uint32_t first_draft_position = 0;
+    int last_match = -1;
+    int last_num_drafts = 0;
+};
+
+struct SystemSpecDraftInputs {
+    model::Qwen3Workspace& target_ws;
+    KvCache& kv_cache;
+    AttentionWorkspace& attn_ws;
+    ops::CublasHandle& cublas;
+    std::span<const SystemSpecDraftRequest> requests;
+    std::span<const std::uint32_t> kv_page_indices;
+    std::span<const std::uint32_t> kv_page_indptr;
+    int page_size = 0;
+    int max_drafts = 0;
+};
+
+using SystemSpeculatorFn = std::function<void(
+    const SystemSpecDraftInputs&,
+    std::span<pie_driver::PerRequestOutput>)>;
+
 // Stable references the executor needs across calls. Constructed
 // once after loaded-model/workspace allocation in entry.cpp and held by
 // the service.
@@ -200,6 +229,9 @@ struct Executor {
     // Type-erased forward call. The captured weights / cfg / model
     // function are model-specific; the call site is uniform.
     ForwardFn forward_fn;
+    // Optional driver-native drafter for `.system_speculation()`.
+    SystemSpeculatorFn system_speculator;
+    int system_speculator_max_drafts = 0;
     // Optional CUDA-graph cache. When non-null, decode-only fires
     // attempt graph capture/replay; otherwise the forward runs directly.
     ForwardGraphCache* graph_cache = nullptr;

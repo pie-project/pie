@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import argparse
+import ctypes
+import ctypes.util
 import json
 import math
 import os
@@ -224,6 +226,14 @@ def add_common_args(p: argparse.ArgumentParser) -> None:
         help="Override max_tokens only for warmup requests.",
     )
     p.add_argument("--json-out", default=None)
+    p.add_argument(
+        "--cuda-profiler-capture",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Call cudaProfilerStart/Stop around the measured section. Use with "
+             "`nsys profile --capture-range=cudaProfilerApi` to exclude setup "
+             "and warmup from the trace.",
+    )
     p.add_argument("--request-timeout", type=float, default=300.0)
     p.add_argument("--tp-size", type=int, default=1)
     p.add_argument(
@@ -296,6 +306,46 @@ def finish(summary: BenchSummary, results: list[RequestResult], json_out: str | 
     write_json(json_out, summary, results)
     if summary.failed:
         print(f"{summary.failed} request(s) failed; inspect JSON output for details.")
+
+
+def _load_cudart():
+    candidates = []
+    found = ctypes.util.find_library("cudart")
+    if found:
+        candidates.append(found)
+    candidates.extend(
+        [
+            "libcudart.so",
+            "libcudart.so.12",
+            "/usr/local/cuda/lib64/libcudart.so",
+            "/usr/local/cuda-12.8/lib64/libcudart.so",
+        ]
+    )
+    last_error: Exception | None = None
+    for candidate in candidates:
+        try:
+            return ctypes.CDLL(candidate)
+        except OSError as exc:
+            last_error = exc
+    raise RuntimeError(f"could not load CUDA runtime: {last_error}")
+
+
+def cuda_profiler_start(enabled: bool) -> None:
+    if not enabled:
+        return
+    cudart = _load_cudart()
+    rc = int(cudart.cudaProfilerStart())
+    if rc != 0:
+        raise RuntimeError(f"cudaProfilerStart failed with CUDA error {rc}")
+
+
+def cuda_profiler_stop(enabled: bool) -> None:
+    if not enabled:
+        return
+    cudart = _load_cudart()
+    rc = int(cudart.cudaProfilerStop())
+    if rc != 0:
+        raise RuntimeError(f"cudaProfilerStop failed with CUDA error {rc}")
 
 
 def _parse_cpu_list(spec: str) -> set[int]:

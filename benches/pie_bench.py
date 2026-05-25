@@ -19,6 +19,8 @@ from common import (
     ROOT,
     RequestResult,
     add_mode_subcommands,
+    cuda_profiler_start,
+    cuda_profiler_stop,
     finish,
     hf_chat_token_ids_and_counts,
     make_prompts,
@@ -105,6 +107,12 @@ def build_config(args: argparse.Namespace):
             driver_options["runtime_quant"] = args.runtime_quant
         if args.mxfp4_moe:
             driver_options["mxfp4_moe"] = args.mxfp4_moe
+        if args.mtp_assistant_snapshot_dir:
+            driver_options["mtp_assistant_snapshot_dir"] = (
+                args.mtp_assistant_snapshot_dir
+            )
+        if args.mtp_num_drafts is not None:
+            driver_options["mtp_num_drafts"] = args.mtp_num_drafts
     elif args.driver == "portable":
         driver_options = {
             "max_forward_tokens": args.max_forward_tokens,
@@ -614,12 +622,16 @@ async def run(args: argparse.Namespace):
                     await one(i, max_tokens=warmup_max_tokens)
 
         start_idx = args.warmup
+        cuda_profiler_start(args.cuda_profiler_capture)
         start = time.perf_counter()
-        if args.mode == "latency":
-            results = [await one(start_idx + i) for i in range(n)]
-        else:
-            results = await many(range(start_idx, start_idx + n))
-        wall = time.perf_counter() - start
+        try:
+            if args.mode == "latency":
+                results = [await one(start_idx + i) for i in range(n)]
+            else:
+                results = await many(range(start_idx, start_idx + n))
+        finally:
+            wall = time.perf_counter() - start
+            cuda_profiler_stop(args.cuda_profiler_capture)
 
         # Pull speculation counters out of the server's model status
         # so the bench output reflects what actually happened. Zero
@@ -693,6 +705,7 @@ async def run(args: argparse.Namespace):
             "top_p": args.top_p,
             "ignore_eos": args.ignore_eos,
             "unique_prompts": args.unique_prompts,
+            "cuda profiler capture": args.cuda_profiler_capture,
             **engine_config,
         },
     )
@@ -771,6 +784,18 @@ def build_parser() -> argparse.ArgumentParser:
             default=None,
             help="Override system speculation. Omit to use the model default; "
                  "--no-system-speculation forces the no-spec baseline.",
+        )
+        sp.add_argument(
+            "--mtp-assistant-snapshot-dir",
+            default=None,
+            help="cuda_native Gemma4 MTP assistant snapshot path used by .system_speculation(); "
+                 "auto-discovered from the HF cache when omitted.",
+        )
+        sp.add_argument(
+            "--mtp-num-drafts",
+            type=int,
+            default=None,
+            help="Number of Gemma4 native MTP draft tokens per accepted token.",
         )
         sp.add_argument(
             "--batch-policy",

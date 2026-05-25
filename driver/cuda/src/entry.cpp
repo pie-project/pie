@@ -24,6 +24,7 @@
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <span>
 #include <string>
 #include <unordered_map>
@@ -50,6 +51,7 @@
 #include "model/gemma2.hpp"
 #include "model/gemma3n.hpp"
 #include "model/gemma4.hpp"
+#include "model/gemma4_mtp.hpp"
 #include "model/gpt_oss.hpp"
 #include "model/llama_like.hpp"
 #include "model/mixtral.hpp"
@@ -99,6 +101,76 @@ void stop_servers() {
     for (auto* server : servers) {
         if (server != nullptr) server->stop();
     }
+}
+
+std::string trim_ascii(std::string s) {
+    while (!s.empty() &&
+           (s.back() == '\n' || s.back() == '\r' || s.back() == ' ' ||
+            s.back() == '\t')) {
+        s.pop_back();
+    }
+    std::size_t start = 0;
+    while (start < s.size() &&
+           (s[start] == ' ' || s[start] == '\t' || s[start] == '\n' ||
+            s[start] == '\r')) {
+        ++start;
+    }
+    if (start > 0) s.erase(0, start);
+    return s;
+}
+
+bool looks_like_hf_snapshot(const std::filesystem::path& path) {
+    return std::filesystem::exists(path / "config.json");
+}
+
+std::optional<std::filesystem::path> resolve_hf_cache_snapshot(
+    const std::filesystem::path& repo_dir) {
+    const auto snapshots_dir = repo_dir / "snapshots";
+    if (!std::filesystem::is_directory(snapshots_dir)) return std::nullopt;
+
+    const auto main_ref = repo_dir / "refs" / "main";
+    if (std::filesystem::is_regular_file(main_ref)) {
+        std::ifstream in(main_ref);
+        std::string sha;
+        std::getline(in, sha);
+        sha = trim_ascii(sha);
+        if (!sha.empty()) {
+            const auto candidate = snapshots_dir / sha;
+            if (looks_like_hf_snapshot(candidate)) return candidate;
+        }
+    }
+
+    std::optional<std::filesystem::path> only_snapshot;
+    int count = 0;
+    for (const auto& entry : std::filesystem::directory_iterator(snapshots_dir)) {
+        if (!entry.is_directory()) continue;
+        if (!looks_like_hf_snapshot(entry.path())) continue;
+        only_snapshot = entry.path();
+        ++count;
+        if (count > 1) return std::nullopt;
+    }
+    return only_snapshot;
+}
+
+std::optional<std::filesystem::path> discover_gemma4_mtp_snapshot_dir(
+    const std::filesystem::path& target_snapshot_dir) {
+    const auto direct = std::filesystem::path(
+        target_snapshot_dir.string() + "-assistant");
+    if (looks_like_hf_snapshot(direct)) return direct;
+
+    for (auto cur = target_snapshot_dir;
+         !cur.empty() && cur != cur.parent_path();
+         cur = cur.parent_path()) {
+        const std::string name = cur.filename().string();
+        if (name.rfind("models--", 0) != 0) continue;
+        const auto assistant_repo =
+            cur.parent_path() / (name + "-assistant");
+        if (auto snapshot = resolve_hf_cache_snapshot(assistant_repo)) {
+            return snapshot;
+        }
+        break;
+    }
+    return std::nullopt;
 }
 
 void on_signal(int) {
@@ -2004,6 +2076,57 @@ int run_impl(int argc,
                   << ")\n";
     }
 
+    std::optional<pie_cuda_driver::model::Gemma4MtpWeights> gemma4_mtp_weights;
+    std::string mtp_snapshot_dir = cfg.model.mtp_assistant_snapshot_dir;
+    std::string mtp_snapshot_source = mtp_snapshot_dir.empty() ? "" : "config";
+    if (mtp_snapshot_dir.empty()) {
+        if (const char* env = std::getenv("PIE_GEMMA4_MTP_SNAPSHOT_DIR")) {
+            mtp_snapshot_dir = env;
+            mtp_snapshot_source = "env";
+        }
+    }
+    if (is_gemma4_arch && cfg.model.mtp_num_drafts > 0 &&
+        mtp_snapshot_dir.empty()) {
+        if (auto discovered = discover_gemma4_mtp_snapshot_dir(
+                std::filesystem::path(cfg.model.snapshot_dir))) {
+            mtp_snapshot_dir = discovered->string();
+            mtp_snapshot_source = "auto";
+            if (verbose && cfg.distributed.tp_rank == 0) {
+                std::cerr << "[pie-driver-cuda] Gemma4 MTP assistant "
+                          << "auto-discovered: " << mtp_snapshot_dir
+                          << "\n";
+            }
+        }
+    }
+    if (is_gemma4_arch && cfg.model.mtp_num_drafts > 0 &&
+        !mtp_snapshot_dir.empty()) {
+        if (cfg.distributed.tp_size > 1) {
+            if (verbose && cfg.distributed.tp_rank == 0) {
+                std::cerr << "[pie-driver-cuda] Gemma4 MTP disabled under "
+                          << "tensor parallelism for this build\n";
+            }
+        } else {
+            gemma4_mtp_weights.emplace(
+                pie_cuda_driver::model::load_gemma4_mtp_weights(
+                    std::filesystem::path(mtp_snapshot_dir),
+                    cfg.model.device,
+                    engine.hf_config(),
+                    weights_gemma4,
+                    verbose));
+            if (verbose && cfg.distributed.tp_rank == 0 &&
+                !mtp_snapshot_source.empty()) {
+                std::cerr << "[pie-driver-cuda] Gemma4 MTP assistant source="
+                          << mtp_snapshot_source << "\n";
+            }
+        }
+    } else if (is_gemma4_arch && cfg.model.mtp_num_drafts > 0 &&
+               verbose && cfg.distributed.tp_rank == 0) {
+        std::cerr << "[pie-driver-cuda] Gemma4 MTP system drafter not "
+                  << "enabled: assistant checkpoint not found; set "
+                  << "mtp_assistant_snapshot_dir or "
+                  << "PIE_GEMMA4_MTP_SNAPSHOT_DIR\n";
+    }
+
     // Pre-allocate persistent rs_cache state for serving. CUDA-native no longer
     // accepts manual batch/KV sizing from public config; after weights are
     // resident we plan the forward arena, optional linear-attn rs_cache,
@@ -2249,6 +2372,22 @@ int run_impl(int argc,
         /*max_requests=*/mem_plan.max_requests,
         /*max_kv_pages=*/mem_plan.max_page_refs,
         mem_plan.capacity.max_custom_mask_bytes);
+
+    std::optional<pie_cuda_driver::model::Gemma4MtpWorkspace> gemma4_mtp_ws;
+    if (gemma4_mtp_weights) {
+        gemma4_mtp_ws.emplace(
+            pie_cuda_driver::model::Gemma4MtpWorkspace::allocate(
+                *gemma4_mtp_weights,
+                mem_plan.max_requests,
+                mem_plan.max_page_refs,
+                cfg.model.mtp_num_drafts));
+        if (verbose) {
+            std::cerr << "[pie-driver-cuda] Gemma4 MTP system drafter enabled: "
+                      << "drafts=" << cfg.model.mtp_num_drafts
+                      << " max_requests=" << mem_plan.max_requests
+                      << " page_refs=" << mem_plan.max_page_refs << "\n";
+        }
+    }
 
     pie_cuda_driver::CustomAllReduce custom_ar;
     if (tp_comm_ptr != nullptr && vtable_opt != nullptr &&
@@ -2515,6 +2654,9 @@ int run_impl(int argc,
             hf_cfg.moe_intermediate_size /
                 std::max(1, cfg.distributed.tp_size));
     }
+    if (is_gemma4_arch) {
+        gemma4_moe_ws.allocate_row_decode(max_workspace_tokens);
+    }
     if (is_gemma4_arch &&
         engine.hf_config().gemma_hidden_size_per_layer_input > 0) {
         const auto& hf_cfg = engine.hf_config();
@@ -2535,7 +2677,9 @@ int run_impl(int argc,
             const std::uint32_t* kv_page_indptr,
             const std::uint32_t* kv_last_page_lens,
             const std::uint32_t* qo_indptr_h,
+            const std::uint32_t* kv_page_indices_h,
             const std::uint32_t* kv_page_indptr_h,
+            const std::uint32_t* kv_last_page_lens_h,
             int N, int R, bool is_pure_decode,
             const std::uint8_t* mask_d, const std::int32_t* mask_indptr_d,
             const std::int32_t* slot_ids_h, const std::uint8_t* is_fresh_h,
@@ -2548,7 +2692,8 @@ int run_impl(int argc,
                 ws, gemma4_moe_ws, cache, attn_ws, cublas,
                 tok, pos,
                 qo_indptr, kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                qo_indptr_h, kv_page_indptr_h,
+                qo_indptr_h, kv_page_indices_h, kv_page_indptr_h,
+                kv_last_page_lens_h,
                 N, R, is_pure_decode, mask_d, mask_indptr_d,
                 logit_row_indices_d, num_logit_rows);
         };
@@ -2557,6 +2702,31 @@ int run_impl(int argc,
             [](bool enabled) {
                 pie_cuda_driver::model::set_gemma4_logits_argmax_only(enabled);
             };
+        forward_fn.prepare = [&engine, &weights_gemma4, &gemma4_moe_ws,
+                              &kv_cache, gemma4_fwd_cfg](
+            pie_cuda_driver::AttentionWorkspace& attn_ws,
+            const pie_cuda_driver::ForwardFn::PrepareInputs& prep) {
+            pie_cuda_driver::model::prepare_gemma4_decode_plans(
+                weights_gemma4, engine.hf_config(), gemma4_fwd_cfg,
+                gemma4_moe_ws, kv_cache, attn_ws,
+                prep.qo_indptr_h,
+                prep.kv_page_indices_h,
+                prep.kv_page_indptr_h,
+                prep.kv_last_page_lens_h,
+                prep.total_tokens,
+                prep.num_requests,
+                prep.is_pure_decode);
+        };
+        const char* gemma4_profile_env = std::getenv("PIE_GEMMA4_FORWARD_PROFILE");
+        forward_fn.graph_safe =
+            kv_cache.format().is_native_bf16() &&
+            !(gemma4_profile_env != nullptr &&
+              gemma4_profile_env[0] != '\0' &&
+              gemma4_profile_env[0] != '0');
+        forward_fn.graph_layout = [&gemma4_moe_ws]() {
+            return pie_cuda_driver::model::gemma4_decode_graph_layout(
+                gemma4_moe_ws);
+        };
     } else if (is_gemma3n_arch) {
         // Loader-only milestone: bind_gemma3n loads every tensor; the
         // forward function (AltUp predict/correct + Laurel + activation
@@ -2577,7 +2747,9 @@ int run_impl(int argc,
             const std::uint32_t* kv_page_indptr,
             const std::uint32_t* kv_last_page_lens,
             const std::uint32_t* qo_indptr_h,
+            const std::uint32_t* kv_page_indices_h,
             const std::uint32_t* kv_page_indptr_h,
+            const std::uint32_t* kv_last_page_lens_h,
             int N, int R, bool is_pure_decode,
             const std::uint8_t* mask_d, const std::int32_t* mask_indptr_d,
             const std::int32_t* slot_ids_h, const std::uint8_t* is_fresh_h,
@@ -2605,7 +2777,9 @@ int run_impl(int argc,
             const std::uint32_t* kv_page_indptr,
             const std::uint32_t* kv_last_page_lens,
             const std::uint32_t* qo_indptr_h,
+            const std::uint32_t* kv_page_indices_h,
             const std::uint32_t* kv_page_indptr_h,
+            const std::uint32_t* kv_last_page_lens_h,
             int N, int R, bool is_pure_decode,
             const std::uint8_t* mask_d, const std::int32_t* mask_indptr_d,
             const std::int32_t* slot_ids_h, const std::uint8_t* is_fresh_h,
@@ -2638,7 +2812,9 @@ int run_impl(int argc,
             const std::uint32_t* kv_page_indptr,
             const std::uint32_t* kv_last_page_lens,
             const std::uint32_t* qo_indptr_h,
+            const std::uint32_t* kv_page_indices_h,
             const std::uint32_t* kv_page_indptr_h,
+            const std::uint32_t* kv_last_page_lens_h,
             int N, int R, bool is_pure_decode,
             const std::uint8_t* mask_d, const std::int32_t* mask_indptr_d,
             const std::int32_t* slot_ids_h, const std::uint8_t* is_fresh_h,
@@ -2691,7 +2867,9 @@ int run_impl(int argc,
             const std::uint32_t* kv_page_indptr,
             const std::uint32_t* kv_last_page_lens,
             const std::uint32_t* qo_indptr_h,
+            const std::uint32_t* kv_page_indices_h,
             const std::uint32_t* kv_page_indptr_h,
+            const std::uint32_t* kv_last_page_lens_h,
             int N, int R, bool is_pure_decode,
             const std::uint8_t* mask_d, const std::int32_t* mask_indptr_d,
             const std::int32_t* slot_ids_h, const std::uint8_t* is_fresh_h,
@@ -2816,7 +2994,9 @@ int run_impl(int argc,
             const std::uint32_t* kv_page_indptr,
             const std::uint32_t* kv_last_page_lens,
             const std::uint32_t* qo_indptr_h,
+            const std::uint32_t* kv_page_indices_h,
             const std::uint32_t* kv_page_indptr_h,
+            const std::uint32_t* kv_last_page_lens_h,
             int N, int R, bool is_pure_decode,
             const std::uint8_t* mask_d, const std::int32_t* mask_indptr_d,
             const std::int32_t* slot_ids_h, const std::uint8_t* is_fresh_h,
@@ -2964,7 +3144,9 @@ int run_impl(int argc,
             const std::uint32_t* kv_page_indptr,
             const std::uint32_t* kv_last_page_lens,
             const std::uint32_t* qo_indptr_h,
+            const std::uint32_t* kv_page_indices_h,
             const std::uint32_t* kv_page_indptr_h,
+            const std::uint32_t* kv_last_page_lens_h,
             int N, int R, bool is_pure_decode,
             const std::uint8_t* mask_d, const std::int32_t* mask_indptr_d,
             const std::int32_t* slot_ids_h, const std::uint8_t* is_fresh_h,
@@ -2985,12 +3167,28 @@ int run_impl(int argc,
         };
     }
 
+    pie_cuda_driver::SystemSpeculatorFn system_speculator;
+    int system_speculator_max_drafts = 0;
+    if (gemma4_mtp_weights && gemma4_mtp_ws) {
+        system_speculator_max_drafts = cfg.model.mtp_num_drafts;
+        system_speculator =
+            [&weights_gemma4, &mtp_w = *gemma4_mtp_weights,
+             &mtp_ws = *gemma4_mtp_ws](
+                const pie_cuda_driver::SystemSpecDraftInputs& in,
+                std::span<pie_driver::PerRequestOutput> per_req) {
+                pie_cuda_driver::model::gemma4_mtp_draft(
+                    mtp_w, weights_gemma4, mtp_ws, in, per_req);
+            };
+    }
+
     pie_cuda_driver::Executor executor{
         engine, ws, kv_cache, attn_ws, cublas,
         max_workspace_tokens,
         mem_plan.max_requests,
         graph_pad_page,
         persistent_inputs, verbose, std::move(forward_fn),
+        std::move(system_speculator),
+        system_speculator_max_drafts,
         use_cuda_graphs ? &graph_cache : nullptr,
         /*tp_comm=*/tp_comm_ptr,
         /*tp_cpu_gate_key=*/{},
@@ -2999,9 +3197,8 @@ int run_impl(int argc,
         /*response_builder=*/{},
     };
     executor.tp_cpu_gate_key = cfg.distributed.nccl_unique_id_hex;
-    // Speculation lives entirely in the runtime. The driver runs
-    // forward passes; the runtime's `scheduler.speculation_depth`
-    // toml knob controls per-ctx chain depth.
+    // Pass-level speculation is runtime-owned. `.system_speculation()` is
+    // driver-owned when a native drafter (Gemma4 MTP) is configured.
     if (verbose && use_cuda_graphs) {
         std::cerr << "[pie-driver-cuda] CUDA graphs enabled (experimental)\n";
     }
@@ -3057,7 +3254,8 @@ int run_impl(int argc,
             rs_cache_required && cfg.distributed.tp_size <= 1 &&
             qwen3_5_scratch_rs_slot >= 0;
         const bool system_speculation_supported =
-            static_cast<bool>(executor.forward_fn.mtp);
+            static_cast<bool>(executor.forward_fn.mtp) ||
+            static_cast<bool>(executor.system_speculator);
         const auto max_forward_requests_caps = rs_cache_required
             ? std::min<std::uint64_t>(
                   static_cast<std::uint64_t>(mem_plan.capacity.max_forward_requests),

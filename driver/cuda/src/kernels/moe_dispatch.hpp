@@ -171,6 +171,21 @@ void launch_moe_down_decode_wmma_bf16(
     int I_moe,
     cudaStream_t stream);
 
+// Builds a two-entry pointer table for running two same-shaped BF16 GEMMs as
+// one cublasGemmBatchedEx call:
+//   out0 = act @ w0^T
+//   out1 = act @ w1^T
+void launch_build_dual_bf16_gemm_ptrs(
+    const void* act,
+    const void* w0,
+    const void* w1,
+    void* out0,
+    void* out1,
+    const void** act_ptrs,
+    const void** w_ptrs,
+    void** out_ptrs,
+    cudaStream_t stream);
+
 // vLLM/SGL-style decode alignment. Sorts route ids [0, num_routes) by expert
 // into fixed-size blocks; padded entries are filled with sentinel num_routes.
 // `expert_ids[b]` is the expert for block b or -1 for inactive padding blocks.

@@ -130,6 +130,10 @@ int cublaslt_bf16_algo_index_for_shape(int N, int K) {
     // full-attention q/gate, N≈8k) are faster on the first heuristic. The
     // old generic index 5 regresses the MTP verifier by several percent.
     if (K == 2048 && N >= 6144) return 0;
+    // Gemma4 E4B's target lm_head (K=2560, very wide vocab) is slightly
+    // faster with the first returned Lt heuristic; keep this narrow so the
+    // MTP assistant scorer (K=256) and other projection GEMMs stay unchanged.
+    if (K == 2560 && N >= 100000) return 0;
     return 5;
 }
 
@@ -358,6 +362,32 @@ void gemm_bf16_impl(
         throw std::runtime_error(
             "cuBLAS error (" + std::to_string(static_cast<int>(status)) +
             "): cublasGemmEx[bf16] M=" + std::to_string(M) +
+            " N=" + std::to_string(N) + " K=" + std::to_string(K));
+    }
+}
+
+void gemm_bf16_cublas_impl(
+    cublasHandle_t handle,
+    const void* act, const void* W, void* y,
+    int M, int N, int K,
+    float beta)
+{
+    const float alpha = 1.f;
+    const auto status = cublasGemmEx(
+        handle,
+        /*transa=*/CUBLAS_OP_T, /*transb=*/CUBLAS_OP_N,
+        /*m=*/N, /*n=*/M, /*k=*/K,
+        &alpha,
+        /*A=*/W,   CUDA_R_16BF, /*lda=*/K,
+        /*B=*/act, CUDA_R_16BF, /*ldb=*/K,
+        &beta,
+        /*C=*/y,   CUDA_R_16BF, /*ldc=*/N,
+        CUBLAS_COMPUTE_32F_FAST_16BF,
+        CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+    if (status != CUBLAS_STATUS_SUCCESS) {
+        throw std::runtime_error(
+            "cuBLAS error (" + std::to_string(static_cast<int>(status)) +
+            "): cublasGemmEx[bf16:cublas] M=" + std::to_string(M) +
             " N=" + std::to_string(N) + " K=" + std::to_string(K));
     }
 }
@@ -1060,6 +1090,15 @@ void gemm_act_x_w(
 #endif
     }
     unsupported("gemm_act_x_w", act_dtype, w.dtype, y_dtype);
+}
+
+void gemm_act_x_wt_bf16_cublas(
+    cublasHandle_t handle,
+    const void* act, const void* W, void* y,
+    int M, int N, int K,
+    float beta)
+{
+    gemm_bf16_cublas_impl(handle, act, W, y, M, N, K, beta);
 }
 
 void gemm_batched_act_x_w(

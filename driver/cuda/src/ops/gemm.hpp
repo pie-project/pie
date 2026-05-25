@@ -199,6 +199,14 @@ inline void gemm_act_x_wt_bf16(
                  y, M, N, K, beta);
 }
 
+// Same math as `gemm_act_x_wt_bf16`, but bypasses the cuBLASLt BF16
+// dispatcher. This is useful for a few skinny-M packed projections where
+// Lt's heuristic is slower than cuBLAS GEMMEx.
+void gemm_act_x_wt_bf16_cublas(
+    cublasHandle_t handle,
+    const void* act, const void* W, void* y,
+    int M, int N, int K, float beta = 0.f);
+
 inline void gemm_batched_act_x_wt_bf16(
     cublasHandle_t handle,
     const void* const* act_ptrs_dev,

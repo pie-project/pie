@@ -270,9 +270,7 @@ impl pie::core::context::HostContext for InstanceState {
         num_tokens: u32,
     ) -> Result<()> {
         let ctx = self.ctx().table.get(&this)?;
-        let current = context::working_page_token_count(ctx.model_id, ctx.context_id);
-        let new_count = current.saturating_sub(num_tokens);
-        context::truncate_working_page_tokens(ctx.model_id, ctx.context_id, new_count).await?;
+        context::truncate_working_page_tokens(ctx.model_id, ctx.context_id, num_tokens).await?;
         Ok(())
     }
 

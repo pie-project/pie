@@ -326,11 +326,9 @@ pub(crate) fn spawn_extend_chain(
                 let spec_tokens = next_req.spec_token_ids.len() as u32;
                 let writable_total = total.saturating_add(spec_tokens);
                 let writable_page_delta = writable_total / page_size;
-                let writable_page_idx =
-                    cur_page_idx.saturating_add(writable_page_delta as usize);
+                let writable_page_idx = cur_page_idx.saturating_add(writable_page_delta as usize);
                 if next_page_idx < all_pages.len() && writable_page_idx < all_pages.len() {
-                    let next_pages: Vec<PhysicalPageId> =
-                        all_pages[..=writable_page_idx].to_vec();
+                    let next_pages: Vec<PhysicalPageId> = all_pages[..=writable_page_idx].to_vec();
                     let queued = staged_batch_arc
                         .lock()
                         .ok()
@@ -681,8 +679,7 @@ mod tests {
             spec_indptr: vec![0, 2],
             ..Default::default()
         });
-        let (next, anchor_token, anchor_pos) =
-            build_next_request(&req, &resp).expect("eligible");
+        let (next, anchor_token, anchor_pos) = build_next_request(&req, &resp).expect("eligible");
         assert_eq!(anchor_token, 44);
         assert_eq!(anchor_pos, 13);
         assert_eq!(next.token_ids, vec![44]);

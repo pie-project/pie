@@ -26,4 +26,16 @@ void launch_transpose_bf16_nld_to_lnd(
     int                  dim,
     cudaStream_t         stream);
 
+void launch_embed_scaled_concat_bf16(
+    const std::int32_t* token_ids,    // [rows]
+    const void*         embed_weight, // [vocab, hidden] bf16
+    const std::uint16_t* hidden,      // [rows, hidden] bf16
+    std::uint16_t*       dst,         // [rows, 2 * hidden] bf16
+    int                  rows,
+    int                  hidden_cols,
+    int                  vocab,
+    float                scale,
+    bool                 hidden_first,
+    cudaStream_t         stream);
+
 }  // namespace pie_cuda_driver::kernels

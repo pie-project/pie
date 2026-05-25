@@ -30,6 +30,7 @@ use crate::pie::core::inference::Output as RawOutput;
 use crate::pie::core::inference::{ForwardPass, Sampler as WitSampler, SlotOutput};
 use crate::sample::{Probe, Sampler};
 use crate::spec::Speculator;
+use std::collections::VecDeque;
 
 const GENERATION_RESERVATION_WINDOW_TOKENS: u32 = 512;
 
@@ -71,6 +72,7 @@ pub struct Generator<'ctx> {
     /// Probes added via [`Generator::probe_each_step`] — re-attached every
     /// step. Stored as `(query_index, wit_variant)` pairs.
     step_probes: Vec<(u32, WitSampler)>,
+    output_buffer: VecDeque<u32>,
     tokens_generated: usize,
     rebid_each_step: bool,
     done: bool,
@@ -119,6 +121,7 @@ impl<'ctx> Generator<'ctx> {
             adapter: None,
             zo_seed: None,
             step_probes: Vec::new(),
+            output_buffer: VecDeque::new(),
             tokens_generated: 0,
             rebid_each_step: true,
             done: false,
@@ -246,11 +249,23 @@ impl<'ctx> Generator<'ctx> {
 
     /// Convenience wrapper for callers that only need the next sampled token.
     pub async fn next_token(&mut self) -> Result<Option<u32>> {
-        let Some(step) = self.next()? else {
-            return Ok(None);
-        };
-        let out = step.execute().await?;
-        Ok(out.tokens.into_iter().next())
+        if let Some(token) = self.output_buffer.pop_front() {
+            return Ok(Some(token));
+        }
+
+        loop {
+            let Some(step) = self.next()? else {
+                return Ok(None);
+            };
+            let out = step.execute().await?;
+            self.output_buffer.extend(out.tokens);
+            if let Some(token) = self.output_buffer.pop_front() {
+                return Ok(Some(token));
+            }
+            if self.is_done() {
+                return Ok(None);
+            }
+        }
     }
 
     /// Begin the next step. Returns `Ok(None)` when generation is finished.

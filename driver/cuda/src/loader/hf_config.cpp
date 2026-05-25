@@ -257,6 +257,15 @@ HfConfig parse_hf_config(const std::filesystem::path& path) {
     cfg.gemma_hidden_size_per_layer_input =
         optional<int>(j, "hidden_size_per_layer_input", 0);
     cfg.num_kv_shared_layers = optional<int>(j, "num_kv_shared_layers", 0);
+    cfg.gemma4_use_ordered_embeddings =
+        optional<bool>(j_root, "use_ordered_embeddings",
+                       optional<bool>(j, "use_ordered_embeddings", false));
+    cfg.gemma4_num_centroids =
+        optional<int>(j_root, "num_centroids",
+                      optional<int>(j, "num_centroids", 0));
+    cfg.gemma4_centroid_intermediate_top_k =
+        optional<int>(j_root, "centroid_intermediate_top_k",
+                      optional<int>(j, "centroid_intermediate_top_k", 0));
 
     // Gemma-4 nests RoPE settings under `rope_parameters` keyed by
     // attention type. Each entry has `rope_theta` and (full only)
