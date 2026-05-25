@@ -231,6 +231,8 @@ struct Gemma4ForwardCfg {
 Gemma4Weights bind_gemma4(const LoadedModel& engine);
 
 void set_gemma4_logits_argmax_only(bool enabled);
+void set_gemma4_fused_argmax_output(std::int32_t* ptr);
+bool gemma4_fused_argmax_done();
 
 void prepare_gemma4_decode_plans(
     const Gemma4Weights& w,

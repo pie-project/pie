@@ -2947,6 +2947,19 @@ int run_impl(int argc,
             [](bool enabled) {
                 pie_cuda_driver::model::set_gemma4_logits_argmax_only(enabled);
             };
+        forward_fn.set_fused_argmax_output =
+            [](std::int32_t* ptr) {
+                pie_cuda_driver::model::set_gemma4_fused_argmax_output(ptr);
+            };
+        forward_fn.fused_argmax_done =
+            []() {
+                return pie_cuda_driver::model::gemma4_fused_argmax_done();
+            };
+        {
+            const char* fused_env = std::getenv("PIE_FUSED_LMHEAD_ARGMAX");
+            forward_fn.supports_fused_lmhead_argmax =
+                fused_env != nullptr && fused_env[0] != '\0' && fused_env[0] != '0';
+        }
         forward_fn.prepare = [&engine, &weights_gemma4, &gemma4_moe_ws,
                               &kv_cache, gemma4_fwd_cfg](
             pie_cuda_driver::AttentionWorkspace& attn_ws,
@@ -2972,6 +2985,9 @@ int run_impl(int argc,
             return pie_cuda_driver::model::gemma4_decode_graph_layout(
                 gemma4_moe_ws);
         };
+        forward_fn.supports_small_prefill_graph =
+            kv_cache.format().is_native_bf16() &&
+            qwen35_small_spec_graph_tokens() > 0;
     } else if (is_gemma3n_arch) {
         // Loader-only milestone: bind_gemma3n loads every tensor; the
         // forward function (AltUp predict/correct + Laurel + activation
@@ -3498,16 +3514,74 @@ int run_impl(int argc,
     }
 
     if (gemma4_mtp_weights && gemma4_mtp_ws) {
-        system_drafter.max_drafts = native_mtp_num_drafts;
-        system_drafter.draft_next =
-            [&weights_gemma4, &mtp_w = *gemma4_mtp_weights,
-             &mtp_ws = *gemma4_mtp_ws, gemma4_mtp_runtime](
-                const pie_cuda_driver::SystemSpecDraftInputs& in,
-                std::span<pie_driver::PerRequestOutput> per_req) {
-                pie_cuda_driver::model::gemma4_mtp_draft(
-                    mtp_w, weights_gemma4, mtp_ws, gemma4_mtp_runtime,
-                    in, per_req);
-            };
+        const bool use_inline_mtp =
+            std::getenv("PIE_GEMMA4_MTP_INLINE") != nullptr &&
+            std::string(std::getenv("PIE_GEMMA4_MTP_INLINE")) != "0";
+        if (use_inline_mtp) {
+            forward_fn.mtp_num_drafts = cfg.model.mtp_num_drafts;
+            forward_fn.mtp =
+                [&weights_gemma4, &mtp_w = *gemma4_mtp_weights,
+                 &mtp_ws = *gemma4_mtp_ws, &kv_cache](
+                    pie_cuda_driver::model::Qwen3Workspace& target_ws,
+                    pie_cuda_driver::KvCache& cache,
+                    pie_cuda_driver::ops::CublasHandle& cublas,
+                    const std::int32_t* token_ids,
+                    const std::int32_t* position_ids,
+                    const std::int32_t* base_hidden_row_indices,
+                    const std::int32_t* request_ids,
+                    const std::uint32_t* kv_page_indices,
+                    const std::uint32_t* kv_page_indptr,
+                    const std::uint32_t* kv_last_page_lens,
+                    int num_tokens, int draft_step,
+                    int max_global_tokens) {
+                    pie_cuda_driver::model::gemma4_mtp_forward_step(
+                        mtp_w, weights_gemma4, mtp_ws, target_ws, cache,
+                        cublas, token_ids, position_ids,
+                        base_hidden_row_indices, request_ids,
+                        kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                        num_tokens, draft_step, max_global_tokens);
+                };
+            forward_fn.mtp_prepare =
+                [&mtp_w = *gemma4_mtp_weights,
+                 &mtp_ws = *gemma4_mtp_ws,
+                 &weights_gemma4, &kv_cache](
+                    const std::uint32_t* kv_page_indptr_h,
+                    const std::uint32_t* kv_last_page_lens_h,
+                    int num_rows, int page_size,
+                    cudaStream_t stream) {
+                    mtp_ws.kv_last_page_lens.copy_from_host(
+                        std::span<const std::uint32_t>(
+                            kv_last_page_lens_h,
+                            static_cast<std::size_t>(num_rows)));
+                    for (std::size_t li = 0; li < mtp_w.layers.size(); ++li) {
+                        const auto& layer = mtp_w.layers[li];
+                        const int d = layer.head_dim;
+                        const int num_q_heads = mtp_w.cfg.num_attention_heads;
+                        const auto& target_layer =
+                            weights_gemma4.layers[layer.target_kv_layer];
+                        const int num_kv_heads = target_layer.num_kv_heads;
+                        pie_cuda_driver::ops::plan_attention_flashinfer_decode(
+                            *mtp_ws.decode_plans[li],
+                            kv_page_indptr_h,
+                            num_rows, num_q_heads, num_kv_heads, d,
+                            page_size, mtp_ws.attn_workspaces[li], stream,
+                            /*enable_cuda_graph=*/true,
+                            /*full_attention_variant=*/layer.window_left < 0,
+                            kv_cache.hnd_layout());
+                    }
+                };
+        } else {
+            system_drafter.max_drafts = native_mtp_num_drafts;
+            system_drafter.draft_next =
+                [&weights_gemma4, &mtp_w = *gemma4_mtp_weights,
+                 &mtp_ws = *gemma4_mtp_ws, gemma4_mtp_runtime](
+                    const pie_cuda_driver::SystemSpecDraftInputs& in,
+                    std::span<pie_driver::PerRequestOutput> per_req) {
+                    pie_cuda_driver::model::gemma4_mtp_draft(
+                        mtp_w, weights_gemma4, mtp_ws, gemma4_mtp_runtime,
+                        in, per_req);
+                };
+        }
     }
 
     pie_cuda_driver::Executor executor{

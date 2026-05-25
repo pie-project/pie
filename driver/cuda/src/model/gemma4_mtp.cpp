@@ -169,7 +169,7 @@ bool mtp_disable_layer_scalar() {
 int mtp_position_offset() {
     static const int offset = [] {
         const char* v = std::getenv("PIE_GEMMA4_MTP_POSITION_OFFSET");
-        return v == nullptr ? 0 : std::atoi(v);
+        return v == nullptr ? 1 : std::atoi(v);
     }();
     return offset;
 }
@@ -245,6 +245,12 @@ bool mtp_profile_enabled() {
 
 bool mtp_cuda_graph_enabled(const Gemma4MtpRuntimeConfig& runtime) {
     return env_bool_or("PIE_GEMMA4_MTP_CUDA_GRAPH", runtime.cuda_graph);
+}
+
+int mtp_max_draft_batch_rows(const Gemma4MtpRuntimeConfig& runtime) {
+    return std::max(0, env_int_or(
+        "PIE_GEMMA4_MTP_MAX_DRAFT_BATCH_ROWS",
+        runtime.max_draft_batch_rows));
 }
 
 std::uint64_t mtp_profile_print_limit() {
@@ -327,7 +333,7 @@ int mtp_argmax_parts() {
             v != nullptr && v[0] != '\0') {
             return std::clamp(std::atoi(v), 1, 8);
         }
-        return 4;
+        return 8;
     }();
     return parts;
 }
@@ -584,7 +590,8 @@ Gemma4MtpWorkspace Gemma4MtpWorkspace::allocate(
 
     ws.row_indices = DeviceBuffer<std::int32_t>::alloc(M);
     ws.input_ids = DeviceBuffer<std::int32_t>::alloc(M);
-    ws.positions = DeviceBuffer<std::int32_t>::alloc(M);
+    ws.positions = DeviceBuffer<std::int32_t>::alloc(
+        static_cast<std::size_t>(M) * static_cast<std::size_t>(std::max(D, 1)));
     ws.sampled = DeviceBuffer<std::int32_t>::alloc(M);
     ws.draft_tokens = DeviceBuffer<std::int32_t>::alloc(
         static_cast<std::size_t>(M) * static_cast<std::size_t>(D));
@@ -840,6 +847,7 @@ Gemma4MtpWeights load_gemma4_mtp_weights(
                          "PIE_GEMMA4_MTP_COMPACT_DRAFT_ROWS",
                          runtime.compact_draft_rows)
                   << " cuda_graph=" << (mtp_cuda_graph_enabled(runtime) ? "on" : "off")
+                  << " max_draft_batch_rows=" << mtp_max_draft_batch_rows(runtime)
                   << " argmax_parts=" << mtp_argmax_parts()
                   << " reverse_preproj=" << (mtp_reverse_preprojection_concat() ? "on" : "off")
                   << " layer_scalar=" << (mtp_disable_layer_scalar() ? "off" : "on")
@@ -938,6 +946,8 @@ void gemma4_mtp_draft(
 
     const int M = static_cast<int>(active_req.size());
     if (M <= 0) return;
+    const int max_draft_batch_rows = mtp_max_draft_batch_rows(runtime);
+    if (max_draft_batch_rows > 0 && M > max_draft_batch_rows) return;
     active_max_drafts = std::clamp(active_max_drafts, 1, max_drafts);
     const bool compact_draft_rows = mtp_compact_draft_rows_enabled(
         runtime, active_desired_drafts, active_max_drafts);
@@ -1003,6 +1013,19 @@ void gemma4_mtp_draft(
         }
     }
 
+    if (active_max_drafts > 1) {
+        const auto base_positions = ws.h_positions;
+        ws.h_positions.resize(
+            static_cast<std::size_t>(M) *
+            static_cast<std::size_t>(active_max_drafts));
+        for (int step = 1; step < active_max_drafts; ++step) {
+            for (int i = 0; i < M; ++i) {
+                ws.h_positions[static_cast<std::size_t>(step) * M + i] =
+                    base_positions[i] + step;
+            }
+        }
+    }
+
     if (profile.enabled) {
         profile.M = M;
         profile.active_max_drafts = active_max_drafts;
@@ -1019,7 +1042,9 @@ void gemma4_mtp_draft(
         ws.row_indices.copy_from_host(std::span<const std::int32_t>(
             ws.h_row_indices.data(), static_cast<std::size_t>(M)));
         ws.positions.copy_from_host(std::span<const std::int32_t>(
-            ws.h_positions.data(), static_cast<std::size_t>(M)));
+            ws.h_positions.data(),
+            static_cast<std::size_t>(M) *
+                static_cast<std::size_t>(active_max_drafts)));
         ws.input_ids.copy_from_host(std::span<const std::int32_t>(
             ws.h_input_ids.data(), static_cast<std::size_t>(M)));
         ws.qo_indptr.copy_from_host(std::span<const std::uint32_t>(
@@ -1118,11 +1143,10 @@ void gemma4_mtp_draft(
             const int num_q_heads = w.cfg.num_attention_heads;
             const int Hq = num_q_heads * d;
             const int I = dim0(*layer.gate_proj, "mtp gate_proj");
-
             profile_mtp_cuda_stage(profile, profile.q_ms, stream, [&] {
                 kernels::launch_rmsnorm_bf16(
-                    ws.y.data(), layer.input_norm->data(), ws.norm_x.data(),
-                    step_rows, H, eps, stream);
+                    ws.y.data(), layer.input_norm->data(),
+                    ws.norm_x.data(), step_rows, H, eps, stream);
                 ops::gemm_act_x_wt_bf16(
                     in.cublas.handle(), ws.norm_x.data(),
                     layer.q_proj->data(), ws.q.data(), step_rows, Hq, H);
@@ -1130,18 +1154,22 @@ void gemma4_mtp_draft(
                     ws.q.data(), layer.q_norm->data(), ws.q.data(),
                     step_rows * num_q_heads, d, eps, stream);
 
+                const std::int32_t* step_positions =
+                    ws.positions.data() +
+                    static_cast<std::size_t>(step) *
+                        static_cast<std::size_t>(M);
                 const int rotary_dim =
                     static_cast<int>(layer.partial_rotary_factor * d);
                 const bool partial =
                     layer.partial_rotary_factor < 1.0f && rotary_dim > 0;
                 if (partial) {
                     kernels::launch_rope_partial_bf16(
-                        ws.q.data(), ws.q.data(), ws.positions.data(),
+                        ws.q.data(), ws.q.data(), step_positions,
                         step_rows, num_q_heads, /*num_kv_heads=*/0, d,
                         rotary_dim, layer.rope_theta, stream);
                 } else {
                     kernels::launch_rope_bf16(
-                        ws.q.data(), ws.q.data(), ws.positions.data(),
+                        ws.q.data(), ws.q.data(), step_positions,
                         step_rows, num_q_heads, /*num_kv_heads=*/0, d,
                         layer.rope_theta, stream);
                 }
@@ -1165,11 +1193,9 @@ void gemma4_mtp_draft(
                     in.cublas.handle(), ws.attn_out.data(),
                     layer.o_proj->data(), ws.norm_x.data(),
                     step_rows, H, Hq, /*beta=*/0.f);
-                kernels::launch_rmsnorm_bf16(
+                kernels::launch_rmsnorm_residual_add_scale_rmsnorm_bf16(
                     ws.norm_x.data(), layer.post_attn_norm->data(),
-                    ws.norm_y.data(), step_rows, H, eps, stream);
-                kernels::launch_residual_add_rmsnorm_bf16(
-                    ws.y.data(), ws.norm_y.data(), layer.pre_mlp_norm->data(),
+                    ws.y.data(), 1.f, layer.pre_mlp_norm->data(),
                     ws.norm_x.data(), step_rows, H, eps, stream);
             });
 
@@ -1198,13 +1224,9 @@ void gemma4_mtp_draft(
                     in.cublas.handle(), ws.gate.data(),
                     layer.down_proj->data(), ws.norm_x.data(),
                     step_rows, H, I, /*beta=*/0.f);
-                kernels::launch_rmsnorm_bf16(
+                kernels::launch_rmsnorm_residual_add_bf16(
                     ws.norm_x.data(), layer.post_mlp_norm->data(),
-                    ws.norm_y.data(), step_rows, H, eps, stream);
-                kernels::launch_residual_add_bf16(
-                    ws.y.data(), ws.norm_y.data(),
-                    static_cast<std::size_t>(step_rows) * H, stream);
-
+                    ws.y.data(), step_rows, H, eps, stream);
                 if (!mtp_disable_layer_scalar() &&
                     std::abs(layer.layer_scalar_value - 1.f) > 1e-6f) {
                     kernels::launch_scalar_mul_bf16(
@@ -1394,6 +1416,165 @@ void gemma4_mtp_draft(
         }
     });
     maybe_print_mtp_profile(profile);
+}
+
+void gemma4_mtp_forward_step(
+    const Gemma4MtpWeights& w,
+    const Gemma4Weights& target_weights,
+    Gemma4MtpWorkspace& mtp_ws,
+    Qwen3Workspace& target_ws,
+    KvCache& kv_cache,
+    ops::CublasHandle& cublas,
+    const std::int32_t* token_ids,
+    const std::int32_t* position_ids,
+    const std::int32_t* base_hidden_row_indices,
+    const std::int32_t* request_ids,
+    const std::uint32_t* kv_page_indices,
+    const std::uint32_t* kv_page_indptr,
+    const std::uint32_t* kv_last_page_lens,
+    int num_tokens,
+    int draft_step,
+    int max_global_tokens)
+{
+    if (num_tokens <= 0) return;
+    const int Hb = w.backbone_hidden_size;
+    const int H = w.cfg.hidden_size;
+    const int V = w.cfg.vocab_size;
+    const int target_vocab = w.backbone_vocab_size;
+    const float eps = w.cfg.rms_norm_eps;
+    cudaStream_t stream = cublas.stream();
+    const int S = num_tokens;
+
+    // 1. Gather hidden states from target model
+    kernels::launch_gather_bf16_rows(
+        static_cast<const std::uint16_t*>(
+            mtp_use_target_residual_hidden()
+                ? target_ws.y.data()
+                : target_ws.norm_x.data()),
+        base_hidden_row_indices,
+        static_cast<std::uint16_t*>(mtp_ws.hidden.data()),
+        S, Hb, stream);
+
+    // 2. Embed + concat (token_ids comes from the executor for all steps)
+    kernels::launch_embed_scaled_concat_bf16(
+        token_ids, target_weights.embed->data(),
+        static_cast<const std::uint16_t*>(mtp_ws.hidden.data()),
+        static_cast<std::uint16_t*>(mtp_ws.combined.data()),
+        S, Hb, target_vocab,
+        std::sqrt(static_cast<float>(Hb)),
+        mtp_reverse_preprojection_concat(), stream);
+
+    // 3. Pre-projection
+    ops::gemm_act_x_wt_bf16(
+        cublas.handle(), mtp_ws.combined.data(),
+        w.pre_projection->data(), mtp_ws.y.data(),
+        S, H, 2 * Hb);
+
+    // 4. Transformer layers
+    for (std::size_t li = 0; li < w.layers.size(); ++li) {
+        const auto& layer = w.layers[li];
+        const int d = layer.head_dim;
+        const int num_q_heads = w.cfg.num_attention_heads;
+        const int Hq = num_q_heads * d;
+        const int I = dim0(*layer.gate_proj, "mtp gate_proj");
+
+        // Q projection + norm + RoPE
+        kernels::launch_rmsnorm_bf16(
+            mtp_ws.y.data(), layer.input_norm->data(),
+            mtp_ws.norm_x.data(), S, H, eps, stream);
+        ops::gemm_act_x_wt_bf16(
+            cublas.handle(), mtp_ws.norm_x.data(),
+            layer.q_proj->data(), mtp_ws.q.data(), S, Hq, H);
+        kernels::launch_rmsnorm_bf16(
+            mtp_ws.q.data(), layer.q_norm->data(), mtp_ws.q.data(),
+            S * num_q_heads, d, eps, stream);
+        const int rotary_dim =
+            static_cast<int>(layer.partial_rotary_factor * d);
+        const bool partial =
+            layer.partial_rotary_factor < 1.0f && rotary_dim > 0;
+        if (partial) {
+            kernels::launch_rope_partial_bf16(
+                mtp_ws.q.data(), mtp_ws.q.data(), position_ids,
+                S, num_q_heads, 0, d,
+                rotary_dim, layer.rope_theta, stream);
+        } else {
+            kernels::launch_rope_bf16(
+                mtp_ws.q.data(), mtp_ws.q.data(), position_ids,
+                S, num_q_heads, 0, d,
+                layer.rope_theta, stream);
+        }
+
+        // Attention against target KV cache using original (pre-spec) page lens
+        ops::dispatch_attention_flashinfer_decode(
+            *mtp_ws.decode_plans[li],
+            mtp_ws.q.data(), kv_cache.layer_view(layer.target_kv_layer),
+            mtp_ws.attn_out.data(),
+            kv_page_indices, kv_page_indptr,
+            mtp_ws.kv_last_page_lens.data(),
+            mtp_ws.attn_workspaces[li], stream,
+            layer.window_left, 0.f, 1.0f);
+
+        // O-proj + fused post-attn norm + residual + pre-MLP norm
+        ops::gemm_act_x_wt_bf16(
+            cublas.handle(), mtp_ws.attn_out.data(),
+            layer.o_proj->data(), mtp_ws.norm_x.data(),
+            S, H, Hq, 0.f);
+        kernels::launch_rmsnorm_residual_add_scale_rmsnorm_bf16(
+            mtp_ws.norm_x.data(), layer.post_attn_norm->data(),
+            mtp_ws.y.data(), 1.f, layer.pre_mlp_norm->data(),
+            mtp_ws.norm_x.data(), S, H, eps, stream);
+
+        // MLP
+        if (layer.gate_up_proj_fused != nullptr) {
+            ops::gemm_act_x_wt_bf16_cublas(
+                cublas.handle(), mtp_ws.norm_x.data(),
+                layer.gate_up_proj_fused->data(),
+                mtp_ws.gate_up_fused.data(), S, 2 * I, H);
+            kernels::launch_chunked_geglu_tanh_bf16(
+                mtp_ws.gate_up_fused.data(), mtp_ws.gate.data(),
+                S, I, stream);
+        } else {
+            ops::gemm_act_x_wt_bf16(
+                cublas.handle(), mtp_ws.norm_x.data(),
+                layer.gate_proj->data(), mtp_ws.gate.data(), S, I, H);
+            ops::gemm_act_x_wt_bf16(
+                cublas.handle(), mtp_ws.norm_x.data(),
+                layer.up_proj->data(), mtp_ws.up.data(), S, I, H);
+            kernels::launch_geglu_tanh_bf16(
+                mtp_ws.gate.data(), mtp_ws.up.data(), mtp_ws.gate.data(),
+                S * I, stream);
+        }
+        ops::gemm_act_x_wt_bf16(
+            cublas.handle(), mtp_ws.gate.data(),
+            layer.down_proj->data(), mtp_ws.norm_x.data(),
+            S, H, I, 0.f);
+        kernels::launch_rmsnorm_residual_add_bf16(
+            mtp_ws.norm_x.data(), layer.post_mlp_norm->data(),
+            mtp_ws.y.data(), S, H, eps, stream);
+        if (!mtp_disable_layer_scalar() &&
+            std::abs(layer.layer_scalar_value - 1.f) > 1e-6f) {
+            kernels::launch_scalar_mul_bf16(
+                mtp_ws.y.data(), layer.layer_scalar_value,
+                static_cast<std::size_t>(S) * H, stream);
+        }
+    }
+
+    // 5. Final norm + lm_head → write to TARGET workspace's logits
+    kernels::launch_rmsnorm_bf16(
+        mtp_ws.y.data(), w.final_norm->data(), mtp_ws.norm_x.data(),
+        S, H, eps, stream);
+    ops::gemm_act_x_wt_bf16(
+        cublas.handle(), mtp_ws.norm_x.data(),
+        w.lm_head->data(), target_ws.logits.data(),
+        S, V, H);
+
+    // 6. Post-projection for feedback to next draft step
+    if (w.post_projection != nullptr) {
+        ops::gemm_act_x_wt_bf16(
+            cublas.handle(), mtp_ws.norm_x.data(),
+            w.post_projection->data(), mtp_ws.hidden.data(),
+            S, Hb, H, 0.f);
+    }
 }
 
 }  // namespace pie_cuda_driver::model

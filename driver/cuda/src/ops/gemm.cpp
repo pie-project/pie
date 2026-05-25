@@ -30,6 +30,16 @@ namespace {
 
 constexpr std::size_t kDefaultLtWorkspaceBytes = 32ull * 1024ull * 1024ull;
 
+cublasComputeType_t bf16_compute_type() {
+    static const cublasComputeType_t ct = [] {
+        const char* v = std::getenv("PIE_CUBLAS_PRECISE");
+        if (v != nullptr && v[0] != '\0' && v[0] != '0')
+            return CUBLAS_COMPUTE_32F;
+        return CUBLAS_COMPUTE_32F_FAST_16BF;
+    }();
+    return ct;
+}
+
 std::size_t checked_mul(std::size_t a, std::size_t b, const char* what) {
     if (a != 0 && b > std::numeric_limits<std::size_t>::max() / a) {
         throw std::runtime_error(
@@ -303,7 +313,7 @@ bool gemm_bf16_lt_impl(
 
     cublasStatus_t st =
         cublasLtMatmulDescCreate(
-            &plan->op_desc, CUBLAS_COMPUTE_32F_FAST_16BF, CUDA_R_32F);
+            &plan->op_desc, bf16_compute_type(), CUDA_R_32F);
     cublasOperation_t transa = CUBLAS_OP_T;
     cublasOperation_t transb = CUBLAS_OP_N;
     if (st == CUBLAS_STATUS_SUCCESS) {
@@ -584,7 +594,7 @@ void gemm_bf16_impl(
         /*B=*/act, CUDA_R_16BF, /*ldb=*/K,
         &beta,
         /*C=*/y,   CUDA_R_16BF, /*ldc=*/N,
-        CUBLAS_COMPUTE_32F_FAST_16BF,
+        bf16_compute_type(),
         CUBLAS_GEMM_DEFAULT_TENSOR_OP);
     if (status != CUBLAS_STATUS_SUCCESS) {
         throw std::runtime_error(
@@ -614,12 +624,38 @@ void gemm_bf16_out_fp32_impl(
         /*B=*/act, CUDA_R_16BF, /*ldb=*/K,
         &beta,
         /*C=*/y,   CUDA_R_32F, /*ldc=*/N,
-        CUBLAS_COMPUTE_32F_FAST_16BF,
+        bf16_compute_type(),
         CUBLAS_GEMM_DEFAULT_TENSOR_OP);
     if (status != CUBLAS_STATUS_SUCCESS) {
         throw std::runtime_error(
             "cuBLAS error (" + std::to_string(static_cast<int>(status)) +
             "): cublasGemmEx[bf16->fp32] M=" + std::to_string(M) +
+            " N=" + std::to_string(N) + " K=" + std::to_string(K));
+    }
+}
+
+void gemm_bf16_to_fp32_impl(
+    cublasHandle_t handle,
+    const void* act, const void* W, void* y,
+    int M, int N, int K,
+    float beta)
+{
+    const float alpha = 1.f;
+    const auto status = cublasGemmEx(
+        handle,
+        /*transa=*/CUBLAS_OP_T, /*transb=*/CUBLAS_OP_N,
+        /*m=*/N, /*n=*/M, /*k=*/K,
+        &alpha,
+        /*A=*/W,   CUDA_R_16BF, /*lda=*/K,
+        /*B=*/act, CUDA_R_16BF, /*ldb=*/K,
+        &beta,
+        /*C=*/y,   CUDA_R_32F,  /*ldc=*/N,
+        CUBLAS_COMPUTE_32F,
+        CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+    if (status != CUBLAS_STATUS_SUCCESS) {
+        throw std::runtime_error(
+            "cuBLAS error (" + std::to_string(static_cast<int>(status)) +
+            "): cublasGemmEx[bf16→fp32] M=" + std::to_string(M) +
             " N=" + std::to_string(N) + " K=" + std::to_string(K));
     }
 }
@@ -640,7 +676,7 @@ void gemm_bf16_cublas_impl(
         /*B=*/act, CUDA_R_16BF, /*ldb=*/K,
         &beta,
         /*C=*/y,   CUDA_R_16BF, /*ldc=*/N,
-        CUBLAS_COMPUTE_32F_FAST_16BF,
+        bf16_compute_type(),
         CUBLAS_GEMM_DEFAULT_TENSOR_OP);
     if (status != CUBLAS_STATUS_SUCCESS) {
         throw std::runtime_error(
@@ -681,13 +717,11 @@ void gemm_batched_bf16_impl(
             &beta,
             y_ptrs_dev, CUDA_R_16BF, ldc_array,
             /*group_count=*/1, group_size,
-            CUBLAS_COMPUTE_32F_FAST_16BF);
+            bf16_compute_type());
         if (status == CUBLAS_STATUS_SUCCESS) {
             return;
         }
     }
-    // Same row-major-as-col-major reinterpretation as the unbatched
-    // wrapper above: A=W (op_T), B=act (op_N), C=y (col-major NxM).
     const auto status = cublasGemmBatchedEx(
               handle,
               /*transa=*/CUBLAS_OP_T, /*transb=*/CUBLAS_OP_N,
@@ -698,7 +732,7 @@ void gemm_batched_bf16_impl(
               &beta,
               /*C=*/y_ptrs_dev,   CUDA_R_16BF, /*ldc=*/N,
               batch_count,
-              CUBLAS_COMPUTE_32F_FAST_16BF,
+              bf16_compute_type(),
               CUBLAS_GEMM_DEFAULT_TENSOR_OP);
     if (status != CUBLAS_STATUS_SUCCESS) {
         throw std::runtime_error(
@@ -1311,6 +1345,11 @@ void gemm_act_x_w(
     if (act_dtype == DType::BF16 && w.dtype == DType::BF16 &&
         y_dtype == DType::BF16) {
         gemm_bf16_impl(handle, act, w.data, y, M, N, K, beta);
+        return;
+    }
+    if (act_dtype == DType::BF16 && w.dtype == DType::BF16 &&
+        y_dtype == DType::FP32) {
+        gemm_bf16_to_fp32_impl(handle, act, w.data, y, M, N, K, beta);
         return;
     }
     if (act_dtype == DType::BF16 && w.dtype == DType::FP8_E4M3 &&

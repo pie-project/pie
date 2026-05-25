@@ -166,7 +166,7 @@ int mtp_argmax_parts(int vocab) {
 bool graph_single_gpu_argmax_enabled() {
     static const bool enabled = [] {
         const char* v = std::getenv("PIE_CUDA_GRAPH_ARGMAX");
-        if (v == nullptr || v[0] == '\0') return false;
+        if (v == nullptr || v[0] == '\0') return true;
         return v[0] != '0';
     }();
     return enabled;
@@ -175,10 +175,29 @@ bool graph_single_gpu_argmax_enabled() {
 int qwen35_small_spec_graph_tokens() {
     static const int tokens = [] {
         const char* v = std::getenv("PIE_QWEN35_SPEC_VERIFY_GRAPH_N");
-        if (v == nullptr || v[0] == '\0') return 17;
+        if (v == nullptr || v[0] == '\0') return 64;
         return std::clamp(std::atoi(v), 0, 64);
     }();
     return tokens;
+}
+
+int small_spec_graph_max_requests() {
+    static const int requests = [] {
+        const char* v = std::getenv("PIE_SPEC_VERIFY_GRAPH_MAX_R");
+        if (v == nullptr || v[0] == '\0') return 16;
+        return std::clamp(std::atoi(v), 1, 512);
+    }();
+    return requests;
+}
+
+int small_spec_graph_min_requests(int max_requests) {
+    static const int configured = [] {
+        const char* v = std::getenv("PIE_SPEC_VERIFY_GRAPH_MIN_R");
+        if (v == nullptr || v[0] == '\0') return -1;
+        return std::clamp(std::atoi(v), 1, 512);
+    }();
+    if (configured > 0) return std::min(configured, max_requests);
+    return 1;
 }
 
 bool mtp_trace_enabled() {
@@ -1447,8 +1466,12 @@ std::size_t capture_forward_graph_lattice(Executor& executor) {
         executor.tp_comm != nullptr &&
         executor.tp_comm->world_size() <= 8 &&
         executor.forward_fn.supports_tp_greedy_argmax;
+    const bool fwd_handles_argmax_precapture =
+        executor.forward_fn.supports_fused_lmhead_argmax &&
+        executor.tp_comm == nullptr;
     const bool single_gpu_graph_argmax =
-        graph_single_gpu_argmax_enabled() && executor.tp_comm == nullptr;
+        graph_single_gpu_argmax_enabled() && executor.tp_comm == nullptr &&
+        !fwd_handles_argmax_precapture;
     const bool log_rank =
         executor.verbose &&
         (executor.tp_comm == nullptr || executor.tp_comm->rank() == 0);
@@ -1517,10 +1540,18 @@ std::size_t capture_forward_graph_lattice(Executor& executor) {
         const std::uint32_t graph_variant =
             (tp_greedy_argmax ? 1u : 0u) |
             (single_gpu_graph_argmax ? 2u : 0u) |
-            (graph_layout << 2);
+            (fwd_handles_argmax_precapture ? 4u : 0u) |
+            (graph_layout << 3);
         const ForwardGraphKey key{R, N, graph_variant};
         if (executor.graph_cache->get(key) != nullptr) continue;
 
+        if (fwd_handles_argmax_precapture) {
+            if (executor.forward_fn.set_logits_argmax_only)
+                executor.forward_fn.set_logits_argmax_only(true);
+            if (executor.forward_fn.set_fused_argmax_output)
+                executor.forward_fn.set_fused_argmax_output(
+                    reinterpret_cast<std::int32_t*>(pi.sampled.data()));
+        }
         tp_graph_capture_barrier(executor);
         cudaGraphExec_t exec = capture_forward_graph_exec(
             executor, qo.data(), kvpi.data(), kvpp.data(), kvlpl.data(),
@@ -1530,6 +1561,10 @@ std::size_t capture_forward_graph_lattice(Executor& executor) {
             /*logit_row_indices_d=*/nullptr,
             /*num_logit_rows=*/0, single_gpu_graph_argmax,
             tp_greedy_argmax);
+        if (fwd_handles_argmax_precapture &&
+            executor.forward_fn.set_fused_argmax_output) {
+            executor.forward_fn.set_fused_argmax_output(nullptr);
+        }
         executor.graph_cache->put(key, exec);
         ++captured;
         tp_graph_capture_barrier(executor);
@@ -1702,6 +1737,9 @@ void handle_fire_batch(
                 [](std::uint8_t v) { return (v & 1u) != 0; });
 
         const int small_spec_graph_tokens = qwen35_small_spec_graph_tokens();
+        const int small_spec_graph_requests = small_spec_graph_max_requests();
+        const int small_spec_graph_min_r =
+            small_spec_graph_min_requests(small_spec_graph_requests);
         const bool pure_decode_graph_shape =
             executor.graph_cache != nullptr && is_pure_decode &&
             forward_fn.graph_safe && !has_fresh_slot;
@@ -1713,7 +1751,8 @@ void handle_fire_batch(
             forward_fn.graph_safe &&
             forward_fn.supports_small_prefill_graph &&
             small_spec_graph_tokens > 0 &&
-            R == 1 &&
+            R >= small_spec_graph_min_r &&
+            R <= small_spec_graph_requests &&
             N <= small_spec_graph_tokens &&
             kv_cache.format().is_native_bf16() &&
             !kv_cache.hnd_layout() &&
@@ -1871,9 +1910,11 @@ void handle_fire_batch(
         // forward body has produced logits.
         const auto outspec_view = view.output_spec_flags.as<std::uint8_t>();
         bool has_msgpack_only_slots = false;
+        bool has_rich_sampler_slots = false;
         for (auto t : types_view) {
             if (pie_cuda_driver::is_msgpack_only(t)) {
                 has_msgpack_only_slots = true;
+                has_rich_sampler_slots = true;
                 break;
             }
         }
@@ -2158,14 +2199,25 @@ void handle_fire_batch(
         if (!tp_greedy_argmax && !single_gpu_greedy_argmax) {
             upload_sampling_inputs(pi, sample_plan, N, /*stream=*/nullptr);
         }
+        const bool logits_argmax_only =
+            forward_fn.set_logits_argmax_only &&
+            !has_rich_sampler_slots &&
+            logit_masks_view.empty() &&
+            !any_topk_topp &&
+            all_slots_token &&
+            all_rows_greedy;
         if (forward_fn.set_logits_argmax_only) {
-            const bool logits_argmax_only =
-                !need_msgpack &&
-                logit_masks_view.empty() &&
-                !any_topk_topp &&
-                all_slots_token &&
-                all_rows_greedy;
             forward_fn.set_logits_argmax_only(logits_argmax_only);
+        }
+        const bool forward_handles_argmax =
+            forward_fn.supports_fused_lmhead_argmax &&
+            logits_argmax_only &&
+            single_gpu_greedy_argmax;
+        if (forward_fn.set_fused_argmax_output) {
+            forward_fn.set_fused_argmax_output(
+                forward_handles_argmax
+                    ? reinterpret_cast<std::int32_t*>(pi.sampled.data())
+                    : nullptr);
         }
 
         // ── Forward pass ────────────────────────────────────────
@@ -2173,18 +2225,22 @@ void handle_fire_batch(
         // graph-safe. Today that means llama-like pure decode, where the
         // per-fire attention plan is prepared before capture/replay and the
         // captured body observes stable device pointers.
-        const bool try_graphs =
-            graph_shape_ok && !have_custom_mask;
         const std::uint32_t graph_layout =
             forward_fn.graph_layout ? forward_fn.graph_layout() : 0u;
+        const bool prepared_small_spec_graph =
+            !small_spec_graph_shape || graph_layout != 0u;
+        const bool try_graphs =
+            graph_shape_ok && !have_custom_mask && prepared_small_spec_graph;
         const bool graph_captures_single_gpu_argmax =
             try_graphs && single_gpu_greedy_argmax &&
-            (graph_single_gpu_argmax_enabled() || small_spec_graph_shape);
+            !forward_handles_argmax &&
+            graph_single_gpu_argmax_enabled();
         const std::uint32_t graph_variant =
             (tp_greedy_argmax ? 1u : 0u) |
             (graph_captures_single_gpu_argmax ? 2u : 0u) |
-            (graph_layout << 2) |
-            (small_spec_graph_shape ? 0x100u : 0u);
+            (forward_handles_argmax ? 4u : 0u) |
+            (graph_layout << 3) |
+            (small_spec_graph_shape ? 0x200u : 0u);
         StepProfileTimer verify_timer(
             "verify", cublas.stream(), forward_N, forward_R);
         if (try_graphs) {
@@ -2268,7 +2324,9 @@ void handle_fire_batch(
                 N, executor.tp_comm->world_size(), cublas.stream());
         } else if (graph_captures_single_gpu_argmax) {
             // The captured forward graph already wrote pi.sampled.
-        } else if (single_gpu_greedy_argmax && !graph_captures_single_gpu_argmax) {
+        } else if (forward_handles_argmax) {
+            // The forward's fused lm_head-argmax wrote pi.sampled.
+        } else if (single_gpu_greedy_argmax) {
             const int argmax_parts =
                 greedy_argmax_parts(engine.hf_config().vocab_size);
             if (argmax_parts > 1 && !ws.greedy_pairs_all.empty()) {
@@ -2414,18 +2472,20 @@ void handle_fire_batch(
                 mtp_draft_positions[static_cast<std::size_t>(r)] =
                     static_cast<std::uint32_t>(draft_pos);
             };
-            const ResponseSubpassContext sub_ctx{
-                ws,
-                R, num_sampling, engine.hf_config().vocab_size,
-                std::span<const std::uint32_t>(per_slot_type),
-                std::span<const float>(per_slot_temp),
-                std::span<const std::int32_t>(per_slot_top_k),
-                qo_view, sptr_view, sidx_view, rns_view,
-            };
-            gather_raw_logits(sub_ctx, per_req);
-            compute_entropy_slots(sub_ctx, per_req);
-            compute_logprob_slots(sub_ctx, view, per_req);
-            compute_dist_slots(sub_ctx, per_req);
+            if (has_rich_sampler_slots) {
+                const ResponseSubpassContext sub_ctx{
+                    ws,
+                    R, num_sampling, engine.hf_config().vocab_size,
+                    std::span<const std::uint32_t>(per_slot_type),
+                    std::span<const float>(per_slot_temp),
+                    std::span<const std::int32_t>(per_slot_top_k),
+                    qo_view, sptr_view, sidx_view, rns_view,
+                };
+                gather_raw_logits(sub_ctx, per_req);
+                compute_entropy_slots(sub_ctx, per_req);
+                compute_logprob_slots(sub_ctx, view, per_req);
+                compute_dist_slots(sub_ctx, per_req);
+            }
 
             // Per-request token list. For non-spec requests this is the
             // token-typed slots' samples. For spec requests we walk the
@@ -3105,7 +3165,7 @@ void tp_follower_serve(Executor& executor, std::atomic<bool>& stop) {
             executor.forward_fn.graph_layout ? executor.forward_fn.graph_layout() : 0u;
         const std::uint32_t graph_variant =
             (tp_greedy_argmax ? 1u : 0u) |
-            (graph_layout << 2);
+            (graph_layout << 3);
         if (try_graphs) {
             const ForwardGraphKey key{R, N, graph_variant};
             cudaGraphExec_t exec = executor.graph_cache->get(key);
