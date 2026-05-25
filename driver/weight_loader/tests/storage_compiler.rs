@@ -488,6 +488,97 @@ fn gpt_oss_native_mxfp4_tp_uses_row_and_column_offset_repack_contracts() {
     assert_eq!(program.memory.checkpoint_read_bytes, 23_040);
 }
 
+#[test]
+fn nemotron_h_default_abi_packs_experts_and_exposes_views() {
+    let cfg = pie_weight_loader::config::ModelConfig {
+        model_type: "nemotron_h".to_string(),
+        quant_method: String::new(),
+        runtime_quant: String::new(),
+        num_hidden_layers: 1,
+        num_experts: 2,
+        num_experts_per_tok: 2,
+    };
+    let target = StorageTarget {
+        backend: BackendKind::Cuda,
+        tp_rank: 1,
+        tp_size: 2,
+        ..StorageTarget::default()
+    };
+    let metadata = nemotron_h_expert_metadata();
+    let abi =
+        pie_weight_loader::abi::RuntimeAbi::default_for_target(&metadata, &cfg, &target).unwrap();
+
+    assert!(abi.tensors.iter().any(|contract| {
+        contract.output_name
+            == "language_model.backbone.layers.0.mixer.experts.up_proj.packed.weight"
+            && contract.shape == vec![4, 3]
+    }));
+    assert!(abi.tensors.iter().any(|contract| {
+        contract.output_name
+            == "language_model.backbone.layers.0.mixer.experts.down_proj.packed.weight"
+            && contract.shape == vec![6, 4]
+            && contract.shard_axis == Some(Axis(1))
+    }));
+    assert!(abi.tensors.iter().any(|contract| {
+        contract.output_name == "language_model.backbone.layers.0.mixer.experts.0.up_proj.weight"
+            && contract.shape == vec![2, 3]
+    }));
+    assert!(abi.tensors.iter().any(|contract| {
+        contract.output_name == "language_model.backbone.layers.0.mixer.experts.1.down_proj.weight"
+            && contract.shape == vec![3, 2]
+    }));
+
+    let program = compile_storage_program(&metadata, &cfg, &abi, target).unwrap();
+    let names = program
+        .tensors
+        .iter()
+        .map(|tensor| tensor.name.as_str())
+        .collect::<Vec<_>>();
+    assert!(
+        names.contains(&"language_model.backbone.layers.0.mixer.experts.up_proj.packed.weight")
+    );
+    assert!(
+        names.contains(&"language_model.backbone.layers.0.mixer.experts.down_proj.packed.weight")
+    );
+    assert!(names.contains(&"language_model.backbone.layers.0.mixer.experts.0.up_proj.weight"));
+    assert!(names.contains(&"language_model.backbone.layers.0.mixer.experts.1.down_proj.weight"));
+
+    let writes = program
+        .instrs
+        .iter()
+        .filter_map(|instr| match instr {
+            StorageInstr::ExtentWrite { source, dest, .. } => {
+                Some((source.tensor_id, source.span_bytes, dest.offset))
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(writes.len(), 4);
+    assert!(
+        writes
+            .iter()
+            .any(|(id, bytes, offset)| { *id == TensorId(0) && *bytes == 12 && *offset == 0 })
+    );
+    assert!(
+        writes
+            .iter()
+            .any(|(id, bytes, offset)| { *id == TensorId(1) && *bytes == 12 && *offset == 12 })
+    );
+    assert!(
+        writes
+            .iter()
+            .any(|(id, bytes, offset)| { *id == TensorId(2) && *bytes == 12 && *offset == 0 })
+    );
+    assert!(
+        writes
+            .iter()
+            .any(|(id, bytes, offset)| { *id == TensorId(3) && *bytes == 12 && *offset == 12 })
+    );
+    assert_eq!(program.memory.checkpoint_read_bytes, 48);
+    assert_eq!(program.memory.device_write_bytes, 48);
+    assert_eq!(program.memory.persistent_bytes, 48);
+}
+
 fn metadata() -> CheckpointMetadata {
     CheckpointMetadata {
         files: vec![CheckpointFile {
@@ -500,6 +591,56 @@ fn metadata() -> CheckpointMetadata {
             raw(0, "a", 0, &[2], DType::F32),
             raw(1, "b", 8, &[2], DType::F32),
         ],
+    }
+}
+
+fn nemotron_h_expert_metadata() -> CheckpointMetadata {
+    let mut offset = 0u64;
+    let mut tensors = Vec::new();
+    let specs = [
+        (
+            0,
+            "language_model.backbone.layers.0.mixer.experts.0.up_proj.weight",
+            vec![4, 3],
+        ),
+        (
+            1,
+            "language_model.backbone.layers.0.mixer.experts.1.up_proj.weight",
+            vec![4, 3],
+        ),
+        (
+            2,
+            "language_model.backbone.layers.0.mixer.experts.0.down_proj.weight",
+            vec![3, 4],
+        ),
+        (
+            3,
+            "language_model.backbone.layers.0.mixer.experts.1.down_proj.weight",
+            vec![3, 4],
+        ),
+    ];
+    for (id, name, shape) in specs {
+        let bytes = tensor_bytes(&shape, DType::BF16);
+        tensors.push(RawTensor {
+            id: TensorId(id),
+            name: name.to_string(),
+            file_id: FileId(0),
+            file_offset: offset,
+            span_bytes: bytes,
+            shape,
+            encoding: Encoding::Raw(DType::BF16),
+            layout: Layout::dense(1),
+        });
+        offset += bytes;
+    }
+    CheckpointMetadata {
+        files: vec![CheckpointFile {
+            id: FileId(0),
+            path: "nemotron.safetensors".to_string(),
+            size_bytes: offset,
+            format: CheckpointFormat::Safetensors,
+        }],
+        tensors,
     }
 }
 

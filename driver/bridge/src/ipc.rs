@@ -182,7 +182,7 @@ static HARD_TIMEOUT: LazyLock<Duration> = LazyLock::new(|| {
         .and_then(|v| v.parse::<f64>().ok())
         .filter(|v| v.is_finite() && *v > 0.0)
         .map(Duration::from_secs_f64)
-        .unwrap_or_else(|| Duration::from_secs(5))
+        .unwrap_or_else(|| Duration::from_secs(60))
 });
 
 // ============================================================================

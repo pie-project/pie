@@ -81,6 +81,14 @@ void launch_chunked_geglu_tanh_bf16(
     int N, int I,
     cudaStream_t stream);
 
+// ReLU-squared activation used by Nemotron-H MLP experts:
+//     y = relu(x) ** 2
+void launch_relu2_bf16(
+    const void* x,
+    void* y,
+    int num_elements,
+    cudaStream_t stream);
+
 // In-place per-token sigmoid gate on a `[N, H]` tensor: `x[n, h] *=
 // sigmoid(scalar_gate[n])`. Used by the Qwen3.6-MoE shared-expert path,
 // where the gate is a single scalar per token (output of the `[N, 1]`

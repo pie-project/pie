@@ -41,7 +41,8 @@ struct RustLoaderSourceIndex {
 
 inline RustLoaderSourceIndex add_checkpoint_metadata_to_rust_input(
     RustLoaderInputBuilder& input,
-    const SafetensorsCheckpointSource& loader)
+    const SafetensorsCheckpointSource& loader,
+    const HfConfig& hf)
 {
     std::map<std::uint32_t, std::filesystem::path> files;
     std::map<std::uint32_t, std::uint64_t> file_sizes;
@@ -53,6 +54,14 @@ inline RustLoaderSourceIndex add_checkpoint_metadata_to_rust_input(
     index.tensor_names.reserve(names.size());
     std::uint32_t next_tensor_id = 0;
     for (const auto& name : names) {
+        bool skip = false;
+        for (const auto& prefix : hf.mm_skip_prefixes) {
+            if (!prefix.empty() && name.rfind(prefix, 0) == 0) {
+                skip = true;
+                break;
+            }
+        }
+        if (skip) continue;
         const TensorInfo& info = loader.info(name);
         const TensorStorageInfo storage = loader.storage_info(name);
         index.tensor_ids.emplace(name, next_tensor_id);
@@ -173,7 +182,7 @@ inline RustLoaderCompileResult compile_rust_loader_plan_from_metadata(
     input.set_runtime_abi_name("pie-cuda", /*version=*/1);
 
     RustLoaderSourceIndex source_index =
-        add_checkpoint_metadata_to_rust_input(input, loader);
+        add_checkpoint_metadata_to_rust_input(input, loader, hf);
     RustStorageProgram program = compile_rust_storage_program(input.view());
     const auto view = program.view();
     const std::size_t runtime_tensor_count = view.tensors.len;

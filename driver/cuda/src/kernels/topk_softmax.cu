@@ -133,4 +133,161 @@ void launch_apply_per_expert_scale_bf16(
         total);
 }
 
+namespace {
+
+__global__ void topk_sigmoid_bias_bf16_kernel(
+    const __nv_bfloat16* __restrict__ logits,
+    const float* __restrict__ correction_bias,
+    std::int32_t* __restrict__ topk_idx,
+    float* __restrict__ topk_w,
+    int num_experts,
+    int K,
+    int normalize,
+    float routed_scaling_factor)
+{
+    const int n = blockIdx.x;
+    const int tid = threadIdx.x;
+    const __nv_bfloat16* row =
+        logits + static_cast<long long>(n) * num_experts;
+
+    __shared__ float probs[MAX_EXPERTS];
+    __shared__ float choice[MAX_EXPERTS];
+
+    for (int j = tid; j < num_experts; j += BLOCK) {
+        const float z = __bfloat162float(row[j]);
+        const float p = 1.f / (1.f + __expf(-z));
+        probs[j] = p;
+        choice[j] = p + correction_bias[j];
+    }
+    __syncthreads();
+
+    if (tid == 0) {
+        std::int32_t* out_idx = topk_idx + static_cast<long long>(n) * K;
+        float* out_w = topk_w + static_cast<long long>(n) * K;
+        float sum = 0.f;
+        for (int k = 0; k < K; ++k) {
+            int best_i = -1;
+            float best_v = -FLT_MAX;
+            for (int j = 0; j < num_experts; ++j) {
+                if (choice[j] > best_v) {
+                    best_v = choice[j];
+                    best_i = j;
+                }
+            }
+            out_idx[k] = best_i;
+            out_w[k] = probs[best_i];
+            sum += out_w[k];
+            choice[best_i] = -FLT_MAX;
+        }
+        const float scale =
+            normalize ? (routed_scaling_factor / (sum + 1e-20f))
+                      : routed_scaling_factor;
+        for (int k = 0; k < K; ++k) {
+            out_w[k] *= scale;
+        }
+    }
+}
+
+__global__ void topk_sigmoid_bias_fp32_kernel(
+    const float* __restrict__ logits,
+    const float* __restrict__ correction_bias,
+    std::int32_t* __restrict__ topk_idx,
+    float* __restrict__ topk_w,
+    int num_experts,
+    int K,
+    int normalize,
+    float routed_scaling_factor)
+{
+    const int n = blockIdx.x;
+    const int tid = threadIdx.x;
+    const float* row = logits + static_cast<long long>(n) * num_experts;
+
+    __shared__ float probs[MAX_EXPERTS];
+    __shared__ float choice[MAX_EXPERTS];
+
+    for (int j = tid; j < num_experts; j += BLOCK) {
+        const float z = row[j];
+        const float p = 1.f / (1.f + __expf(-z));
+        probs[j] = p;
+        choice[j] = p + correction_bias[j];
+    }
+    __syncthreads();
+
+    if (tid == 0) {
+        std::int32_t* out_idx = topk_idx + static_cast<long long>(n) * K;
+        float* out_w = topk_w + static_cast<long long>(n) * K;
+        float sum = 0.f;
+        for (int k = 0; k < K; ++k) {
+            int best_i = -1;
+            float best_v = -FLT_MAX;
+            for (int j = 0; j < num_experts; ++j) {
+                if (choice[j] > best_v) {
+                    best_v = choice[j];
+                    best_i = j;
+                }
+            }
+            out_idx[k] = best_i;
+            out_w[k] = probs[best_i];
+            sum += out_w[k];
+            choice[best_i] = -FLT_MAX;
+        }
+        const float scale =
+            normalize ? (routed_scaling_factor / (sum + 1e-20f))
+                      : routed_scaling_factor;
+        for (int k = 0; k < K; ++k) {
+            out_w[k] *= scale;
+        }
+    }
+}
+
+}  // namespace
+
+void launch_topk_sigmoid_bias_bf16(
+    const void* logits,
+    const float* correction_bias,
+    std::int32_t* topk_idx,
+    float* topk_w,
+    int N,
+    int num_experts,
+    int K,
+    bool normalize,
+    float routed_scaling_factor,
+    cudaStream_t stream)
+{
+    if (N <= 0 || num_experts <= 0 || K <= 0) return;
+    topk_sigmoid_bias_bf16_kernel<<<N, BLOCK, 0, stream>>>(
+        static_cast<const __nv_bfloat16*>(logits),
+        correction_bias,
+        topk_idx,
+        topk_w,
+        num_experts,
+        K,
+        normalize ? 1 : 0,
+        routed_scaling_factor);
+}
+
+void launch_topk_sigmoid_bias_fp32(
+    const float* logits,
+    const float* correction_bias,
+    std::int32_t* topk_idx,
+    float* topk_w,
+    int N,
+    int num_experts,
+    int K,
+    bool normalize,
+    float routed_scaling_factor,
+    cudaStream_t stream)
+{
+    if (N <= 0 || num_experts <= 0 || K <= 0) return;
+    topk_sigmoid_bias_fp32_kernel<<<N, BLOCK, 0, stream>>>(
+        logits,
+        correction_bias,
+        topk_idx,
+        topk_w,
+        num_experts,
+        K,
+        normalize ? 1 : 0,
+        routed_scaling_factor);
+}
+
 }  // namespace pie_cuda_driver::kernels

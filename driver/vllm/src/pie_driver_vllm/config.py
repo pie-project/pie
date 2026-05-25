@@ -44,6 +44,23 @@ class VllmDriverConfig:
     # Optional model context length. None = let vLLM use the model default.
     max_model_len: int | None = None
 
+    # Required for HF checkpoints that ship custom model/config classes
+    # (for example NVIDIA Nemotron Omni).
+    trust_remote_code: bool = False
+
+    # Text-only serving for multimodal wrapper checkpoints. When true, the
+    # loader forwards vLLM multimodal per-prompt limits of zero for image,
+    # video, and audio towers.
+    text_only_mm: bool = False
+
+    # Deterministic decode lookahead. When >1, single-request greedy steps
+    # generate a short continuation inside the vLLM driver and drain it over
+    # subsequent Pie steps. This mirrors the TensorRT-LLM driver's lookahead
+    # buffer: only deterministic token samplers are eligible, and the last
+    # buffered token is returned without committed KV so the next non-buffered
+    # step can resume normally.
+    decode_lookahead_tokens: int = 1
+
     # ---- Speculative decoding (NGRAM, driver-supplied drafts) ----
     # When True, VllmEngine.spec_step proposes linear draft continuations.
     # Verification + splice run in the shared `._bridge.batching.Batch`

@@ -81,7 +81,7 @@ def devices_use_system_topology(
 def configure_distributed_environment(tp_degree: int, devices: list[str]) -> bool:
     """Set distributed env defaults before torch.distributed is initialized."""
     system_topology = devices_use_system_topology(devices, tp_degree)
-    if system_topology:
+    if system_topology and os.environ.get("PIE_VLLM_DISABLE_NCCL_P2P_ON_SYSTEM"):
         os.environ.setdefault("NCCL_P2P_DISABLE", "1")
     return system_topology
 
@@ -234,54 +234,20 @@ def init_distributed(
     master_port: int,
     device: str,
 ) -> None:
-    """Initialize torch.distributed for one TP group.
+    """Prepare distributed env for one TP group.
 
-    Each DP replica brings up its own torch.distributed *world* whose size
-    is just `tp_degree`. The default process group thus equals the TP
-    group — no global PG, no subgroups. Cross-replica coordination happens
-    at the Rust runtime / RPC layer (request routing + KV swap framing),
-    not via torch.distributed.
-
-    The FileStore path is namespaced by `(master_port, group_id)` so each
-    TP group rendezvous independently when multiple groups share a host.
+    The vLLM driver lets vLLM initialize torch.distributed/model-parallel
+    groups inside its loader. Pre-initializing Pie's own process groups here
+    creates group-order mismatches with vLLM on hybrid models. We only set
+    the CUDA device and the env values vLLM's `env://` rendezvous expects.
     """
-    import datetime
-    import warnings
-    import torch.distributed as dist
 
     torch.cuda.set_device(device)
-
-    warnings.filterwarnings(
-        "ignore", message=".*barrier.*device under current context.*"
-    )
-
-    store = dist.FileStore(
-        f"/tmp/pie_dist_store_{master_port}_g{group_id}", tp_degree
-    )
-    timeout = datetime.timedelta(seconds=300)
-
-    backend = "nccl" if torch.cuda.is_available() else "gloo"
-
-    device_id = None
-    if device.startswith("cuda:"):
-        device_id = torch.device(device)
-
-    dist.init_process_group(
-        backend,
-        store=store,
-        rank=tp_local_rank,
-        world_size=tp_degree,
-        timeout=timeout,
-        device_id=device_id,
-    )
-
-    global _cpu_group
-    if backend == "nccl" and tp_degree > 1:
-        _cpu_group = dist.new_group(
-            ranks=list(range(tp_degree)),
-            backend="gloo",
-            timeout=timeout,
-        )
+    os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
+    os.environ["MASTER_PORT"] = str(master_port + group_id * 10)
+    os.environ["RANK"] = str(tp_local_rank)
+    os.environ["WORLD_SIZE"] = str(tp_degree)
+    os.environ["LOCAL_RANK"] = str(tp_local_rank)
 
 
 def set_device(device: str) -> None:

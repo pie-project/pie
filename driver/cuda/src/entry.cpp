@@ -53,6 +53,8 @@
 #include "model/gpt_oss.hpp"
 #include "model/llama_like.hpp"
 #include "model/mixtral.hpp"
+#include "model/nemotron_h.hpp"
+#include "model/nemotron_h_forward.hpp"
 #include "model/qwen3.hpp"
 #include "model/qwen3_5.hpp"
 #include "model/qwen3_5_forward.hpp"
@@ -73,6 +75,14 @@ namespace {
 std::mutex g_servers_mu;
 std::vector<pie_driver::InProcServer*> g_servers;
 std::atomic<pie_driver::InProcServer*> g_signal_server{nullptr};
+
+std::size_t custom_all_reduce_max_bytes() {
+    const char* v = std::getenv("PIE_CUDA_CUSTOM_ALL_REDUCE_MAX_MIB");
+    if (v == nullptr || v[0] == '\0') return 64ull * 1024ull * 1024ull;
+    const unsigned long long mib = std::strtoull(v, nullptr, 10);
+    if (mib == 0ull) return 64ull * 1024ull * 1024ull;
+    return static_cast<std::size_t>(mib) * 1024ull * 1024ull;
+}
 
 void register_server(pie_driver::InProcServer* server) {
     std::lock_guard<std::mutex> lk(g_servers_mu);
@@ -609,6 +619,61 @@ std::size_t kv_page_bytes_per_layer(
     return per_token;
 }
 
+std::size_t kv_page_bytes_nemotron_h(
+    const pie_cuda_driver::HfConfig& cfg,
+    int tp_size,
+    const pie_cuda_driver::KvCacheFormat& format) {
+    const int attention_layers = static_cast<int>(std::count(
+        cfg.layer_types.begin(), cfg.layer_types.end(), "attention"));
+    const int kv_heads = cfg.num_key_value_heads / std::max(1, tp_size);
+    return static_cast<std::size_t>(attention_layers) *
+           kv_cache_device_bytes_per_page(
+               format, 1, kv_heads, cfg.head_dim_kernel);
+}
+
+int count_nemotron_h_mamba_layers(const pie_cuda_driver::HfConfig& cfg) {
+    return static_cast<int>(std::count(
+        cfg.layer_types.begin(), cfg.layer_types.end(), "mamba"));
+}
+
+std::size_t nemotron_h_state_slot_bytes(
+    const pie_cuda_driver::HfConfig& cfg,
+    int mamba_layers,
+    int tp_size) {
+    if (mamba_layers <= 0) return 0;
+    const int T = std::max(1, tp_size);
+    const bool shard_mamba =
+        pie_cuda_driver::model::nemotron_h_tp_mamba_sharding_enabled(T);
+    const std::size_t m_intermediate =
+        static_cast<std::size_t>(
+            std::max(0, shard_mamba
+                ? cfg.mamba_num_heads / T
+                : cfg.mamba_num_heads)) *
+        static_cast<std::size_t>(std::max(0, cfg.mamba_head_dim));
+    const std::size_t m_groups =
+        static_cast<std::size_t>(
+            std::max(0, shard_mamba
+                ? cfg.mamba_n_groups / T
+                : cfg.mamba_n_groups));
+    const std::size_t conv_dim =
+        m_intermediate +
+        2ull * m_groups * static_cast<std::size_t>(
+            std::max(0, cfg.mamba_state_size));
+    const std::size_t per_slot_conv =
+        static_cast<std::size_t>(std::max(0, cfg.mamba_conv_kernel)) *
+        conv_dim * sizeof(std::uint16_t);
+    const std::size_t per_slot_recurrent =
+        static_cast<std::size_t>(
+            std::max(0, shard_mamba
+                ? cfg.mamba_num_heads / T
+                : cfg.mamba_num_heads)) *
+        static_cast<std::size_t>(std::max(0, cfg.mamba_head_dim)) *
+        static_cast<std::size_t>(std::max(0, cfg.mamba_state_size)) *
+        sizeof(std::uint16_t);
+    return static_cast<std::size_t>(mamba_layers) *
+           (per_slot_conv + per_slot_recurrent);
+}
+
 bool is_auto_memory_profile(const std::string& profile) {
     return profile == "auto";
 }
@@ -814,6 +879,8 @@ CudaMemoryPlan plan_cuda_memory(
     bool is_qwen3_5_arch,
     bool is_qwen3_5_moe_arch,
     int qwen3_5_linear_layers,
+    bool is_nemotron_h_arch,
+    int nemotron_h_mamba_layers,
     const pie_cuda_driver::KvCacheFormat& kv_format,
     const pie_cuda_driver::ops::RuntimeQuantScratchSpec& runtime_quant_scratch_base,
     bool verbose)
@@ -862,6 +929,8 @@ CudaMemoryPlan plan_cuda_memory(
             ? kv_page_bytes_per_layer(hf, gemma4_per_layer_head_dim,
                                       gemma4_kv_source_layer, tp_size,
                                       kv_format)
+            : is_nemotron_h_arch
+                ? kv_page_bytes_nemotron_h(hf, tp_size, kv_format)
             : kv_page_bytes_homogeneous(hf, tp_size, kv_format);
     if (per_kv_token_bytes == 0) {
         throw std::runtime_error("cuda memory planner: computed zero KV page bytes");
@@ -893,6 +962,10 @@ CudaMemoryPlan plan_cuda_memory(
         prop.major == 8 && prop.minor == 9 &&
         prop.multiProcessorCount >= 100 &&
         hf.model_type == "qwen3" && hf.hidden_size == 4096;
+    const bool prefer_nemotron_h_tp2_ada_prefill_shape =
+        auto_profile && forced_prefill == 0 && tp_size == 2 &&
+        prop.major == 8 && prop.minor == 9 &&
+        prop.multiProcessorCount >= 100 && is_nemotron_h_arch;
     const int base_prefill_cap = prefill_candidate_cap(prop);
     const int prefill_cap =
         forced_prefill > 0
@@ -909,7 +982,8 @@ CudaMemoryPlan plan_cuda_memory(
                          prefill_cap,
                          2 * profile_prefill_target("throughput", cfg, prop)));
 
-    const bool has_linear_state = is_qwen3_5_arch || is_qwen3_5_moe_arch;
+    const bool has_qwen_linear_state =
+        is_qwen3_5_arch || is_qwen3_5_moe_arch;
     const std::size_t K_dim =
         static_cast<std::size_t>(
             std::max(0, hf.linear_num_key_heads / tp_size)) *
@@ -927,10 +1001,14 @@ CudaMemoryPlan plan_cuda_memory(
     const std::size_t per_slot_conv =
         static_cast<std::size_t>(std::max(0, hf.linear_conv_kernel_dim)) *
         conv_dim * sizeof(std::uint16_t);
-    const std::size_t state_slot_bytes = has_linear_state
+    std::size_t state_slot_bytes = has_qwen_linear_state
         ? static_cast<std::size_t>(std::max(0, qwen3_5_linear_layers)) *
-          (per_slot_recurrent + per_slot_conv)
+              (per_slot_recurrent + per_slot_conv)
         : 0;
+    if (is_nemotron_h_arch) {
+        state_slot_bytes =
+            nemotron_h_state_slot_bytes(hf, nemotron_h_mamba_layers, tp_size);
+    }
 
     struct Candidate {
         CudaMemoryPlan plan;
@@ -1008,6 +1086,10 @@ CudaMemoryPlan plan_cuda_memory(
             }
             if (is_qwen3_5_moe_arch) {
                 arena += qwen3_5_moe_workspace_bytes(hf, N, tp_size);
+            }
+            if (is_nemotron_h_arch) {
+                arena += pie_cuda_driver::model::nemotron_h_workspace_bytes(
+                    hf, N, tp_size);
             }
             if (is_gemma4_arch && hf.gemma4_enable_moe) {
                 arena += gemma4_moe_workspace_bytes(hf, N);
@@ -1234,6 +1316,14 @@ CudaMemoryPlan plan_cuda_memory(
                 // R128/N2048 matches the older R64/N2048 path.
                 score += (N >= 2048) ? 1.5 : -1.5;
                 score -= std::abs(log2_ratio(N, 2048)) * 4.0;
+            }
+            if (prefer_nemotron_h_tp2_ada_prefill_shape) {
+                // Nemotron-H TP2 prompt bursts on L40 need the 8k workspace
+                // to keep 128 short prompts in one prefill batch. The 8k
+                // plan still leaves 256 recurrent slots, so decode residency
+                // does not regress versus the 4k auto-selected shape.
+                score += (N >= 8192) ? 1.5 : -1.5;
+                score -= std::abs(log2_ratio(N, 8192)) * 4.0;
             }
             if (forced_prefill > 0) {
                 score += (N == forced_prefill) ? 1000.0 : -1000.0;
@@ -1952,7 +2042,8 @@ int run_impl(int argc,
          || mt == "gemma2"
          || mt == "gemma3" || mt == "gemma3_text"
          || mt == "gemma4" || mt == "gemma4_text"
-         || mt == "gemma3n" || mt == "gemma3n_text";
+         || mt == "gemma3n" || mt == "gemma3n_text"
+         || mt == "nemotron_h";
         if (!supported) {
             std::cerr << "[pie-driver-cuda] arch '" << mt
                       << "' not yet supported (Qwen 2/3, Llama-3, "
@@ -1970,6 +2061,7 @@ int run_impl(int argc,
     auto& weights_mixtral = bound_model.mixtral;
     auto& weights_qwen3_5 = bound_model.qwen3_5;
     auto& weights_qwen3_5_moe = bound_model.qwen3_5_moe;
+    auto& weights_nemotron_h = bound_model.nemotron_h;
 
     const bool is_gemma_arch = bound_model.is_gemma();
     const bool is_gemma4_arch = bound_model.is_gemma4();
@@ -1977,6 +2069,7 @@ int run_impl(int argc,
     const bool is_mixtral_arch = bound_model.is_mixtral();
     const bool is_qwen3_5_arch = bound_model.is_qwen3_5();
     const bool is_qwen3_5_moe_arch = bound_model.is_qwen3_5_moe();
+    const bool is_nemotron_h_arch = bound_model.is_nemotron_h();
 
     const std::size_t num_layers_bound = bound_model.num_layers();
     if (verbose) {
@@ -2026,6 +2119,12 @@ int run_impl(int argc,
             const int local_v = v / local_tp_size;
             if (local_v > max_mlp_intermediate) max_mlp_intermediate = local_v;
         }
+    } else if (is_nemotron_h_arch) {
+        const auto& hf_n = engine.hf_config();
+        max_mlp_intermediate = std::max(
+            max_mlp_intermediate,
+            std::max(hf_n.moe_intermediate_size / local_tp_size,
+                     hf_n.shared_expert_intermediate_size / local_tp_size));
     }
 
     std::vector<bool> qwen3_5_layer_is_linear;
@@ -2046,6 +2145,23 @@ int run_impl(int argc,
 
     const int qwen3_5_linear_layers = static_cast<int>(std::count(
         qwen3_5_layer_is_linear.begin(), qwen3_5_layer_is_linear.end(), true));
+
+    std::vector<bool> nemotron_h_layer_is_mamba;
+    if (is_nemotron_h_arch) {
+        nemotron_h_layer_is_mamba.resize(weights_nemotron_h.layers.size());
+        for (std::size_t L = 0; L < weights_nemotron_h.layers.size(); ++L) {
+            nemotron_h_layer_is_mamba[L] =
+                weights_nemotron_h.layers[L].kind ==
+                pie_cuda_driver::model::NemotronHLayerWeights::Kind::Mamba;
+        }
+    }
+    const int nemotron_h_mamba_layers = static_cast<int>(std::count(
+        nemotron_h_layer_is_mamba.begin(),
+        nemotron_h_layer_is_mamba.end(),
+        true));
+    const int nemotron_h_attention_layer_count = is_nemotron_h_arch
+        ? pie_cuda_driver::model::nemotron_h_attention_layers(engine.hf_config())
+        : 0;
     const auto kv_format = pie_cuda_driver::kv_cache_format_from_string(
         cfg.batching.kv_cache_dtype, cfg.model.dtype);
     const bool graph_capable_forward =
@@ -2061,6 +2177,7 @@ int run_impl(int argc,
         is_gemma4_arch, weights_gemma4.per_layer_head_dim,
         weights_gemma4.kv_source_layer, is_qwen3_5_arch,
         is_qwen3_5_moe_arch, qwen3_5_linear_layers,
+        is_nemotron_h_arch, nemotron_h_mamba_layers,
         kv_format, runtime_quant_scratch_base, verbose);
     const int max_workspace_tokens = mem_plan.max_workspace_tokens;
     // `mem_plan.kv_pages` is the runtime-visible KV capacity. CUDA graph
@@ -2073,6 +2190,16 @@ int run_impl(int argc,
         mem_plan.kv_pages > 0 ? mem_plan.kv_pages + 1 : mem_plan.kv_pages;
     const int graph_pad_page =
         mem_plan.kv_pages > 0 ? runtime_kv_pages : -1;
+    const bool has_recurrent_state_cache =
+        is_qwen3_5_arch || is_qwen3_5_moe_arch || is_nemotron_h_arch;
+    const int runtime_state_slots = mem_plan.state_slots;
+    const int graph_pad_slot =
+        has_recurrent_state_cache && runtime_state_slots > 0 &&
+                graph_pad_page >= 0
+            ? runtime_state_slots
+            : -1;
+    const int allocated_state_slots =
+        runtime_state_slots + (graph_pad_slot >= 0 ? 1 : 0);
 
     auto ws = pie_cuda_driver::model::Qwen3Workspace::allocate_full(
         engine.hf_config(), max_workspace_tokens,
@@ -2090,6 +2217,14 @@ int run_impl(int argc,
                   weights_gemma4.kv_source_layer,
                   weights_gemma4.per_layer_num_kv_heads,
                   kv_format)
+            : is_nemotron_h_arch
+                ? pie_cuda_driver::KvCache::allocate(
+                      nemotron_h_attention_layer_count,
+                      physical_kv_pages,
+                      mem_plan.kv_page_size,
+                      local_kv_heads,
+                      engine.hf_config().head_dim_kernel,
+                      kv_format)
             : pie_cuda_driver::KvCache::allocate(
                   engine.hf_config().num_hidden_layers,
                   physical_kv_pages,
@@ -2113,6 +2248,8 @@ int run_impl(int argc,
     pie_cuda_driver::model::Qwen3_5LinearAttnWorkspace qwen3_5_la_ws;
     pie_cuda_driver::Qwen3_5StateCache qwen3_5_state_cache;
     pie_cuda_driver::model::Qwen3_5MoeMlpWorkspace qwen3_5_moe_ws;
+    pie_cuda_driver::model::NemotronHWorkspace nemotron_h_ws;
+    pie_cuda_driver::Qwen3_5StateCache nemotron_h_state_cache;
     if (is_qwen3_5_arch || is_qwen3_5_moe_arch) {
         const auto& cfg_q = engine.hf_config();
         const int q35_tp_size = std::max(1, cfg.distributed.tp_size);
@@ -2134,7 +2271,7 @@ int run_impl(int argc,
         // Allocate per-slot state for the linear-attn layers. The memory
         // planner sizes slots before KV pages and clamps max forward
         // requests to the resulting slot count.
-        const int q35_max_slots = std::max<int>(1, mem_plan.state_slots);
+        const int q35_max_slots = std::max<int>(1, allocated_state_slots);
         qwen3_5_state_cache = pie_cuda_driver::Qwen3_5StateCache::allocate(
             qwen3_5_layer_is_linear, conv_dim, cfg_q.linear_conv_kernel_dim,
             local_linear_value_heads,
@@ -2155,7 +2292,8 @@ int run_impl(int argc,
         if (verbose) {
             std::cerr << "[pie-driver-cuda] qwen3.5 rs_cache: "
                       << num_linear_layers << " linear layers, "
-                      << q35_max_slots << " slots, "
+                      << runtime_state_slots << " runtime slots"
+                      << (graph_pad_slot >= 0 ? " (+1 graph pad slot), " : ", ")
                       << (per_slot_recurrent_bytes + per_slot_conv_bytes)
                       << " B/slot (recurrent="
                       << per_slot_recurrent_bytes << " conv="
@@ -2171,6 +2309,52 @@ int run_impl(int argc,
                 cfg_q.num_experts_per_tok,
                 cfg_q.moe_intermediate_size / q35_tp_size,
                 cfg_q.shared_expert_intermediate_size / q35_tp_size);
+        }
+    } else if (is_nemotron_h_arch) {
+        const auto& cfg_n = engine.hf_config();
+        nemotron_h_ws = pie_cuda_driver::model::NemotronHWorkspace::allocate(
+            cfg_n, max_workspace_tokens, local_tp_size);
+        const bool shard_mamba =
+            pie_cuda_driver::model::nemotron_h_tp_mamba_sharding_enabled(
+                local_tp_size);
+        const int local_mamba_heads = shard_mamba
+            ? cfg_n.mamba_num_heads / local_tp_size
+            : cfg_n.mamba_num_heads;
+        const int local_mamba_groups = shard_mamba
+            ? cfg_n.mamba_n_groups / local_tp_size
+            : cfg_n.mamba_n_groups;
+        const int m_intermediate =
+            local_mamba_heads * cfg_n.mamba_head_dim;
+        const int conv_dim =
+            m_intermediate + 2 * local_mamba_groups * cfg_n.mamba_state_size;
+        const int nemotron_max_slots = std::max<int>(1, allocated_state_slots);
+        nemotron_h_state_cache =
+            pie_cuda_driver::Qwen3_5StateCache::allocate_bf16_recurrent(
+                nemotron_h_layer_is_mamba,
+                conv_dim,
+                cfg_n.mamba_conv_kernel,
+                local_mamba_heads,
+                cfg_n.mamba_head_dim,
+                cfg_n.mamba_state_size,
+                nemotron_max_slots);
+        if (verbose) {
+            const std::size_t slot_bytes =
+                nemotron_h_state_slot_bytes(
+                    cfg_n, nemotron_h_mamba_layers, local_tp_size);
+            const std::size_t layer_slot_bytes =
+                nemotron_h_mamba_layers > 0
+                    ? slot_bytes /
+                          static_cast<std::size_t>(nemotron_h_mamba_layers)
+                    : 0;
+            std::cerr << "[pie-driver-cuda] nemotron_h rs_cache: "
+                      << nemotron_h_mamba_layers << " mamba layers, "
+                      << runtime_state_slots << " runtime slots"
+                      << (graph_pad_slot >= 0 ? " (+1 graph pad slot), " : ", ")
+                      << layer_slot_bytes
+                      << " B/layer-slot, total ~"
+                      << (static_cast<std::size_t>(nemotron_max_slots) *
+                          slot_bytes / (1024 * 1024))
+                      << " MiB\n";
         }
     }
 
@@ -2213,15 +2397,27 @@ int run_impl(int argc,
     pie_cuda_driver::CustomAllReduce custom_ar;
     if (tp_comm_ptr != nullptr && vtable_opt != nullptr &&
         cfg.distributed.tp_size == 2) {
-        custom_ar = pie_cuda_driver::CustomAllReduce(
-            *tp_comm_ptr, /*same_process=*/true,
-            /*max_bytes=*/8 * 1024 * 1024,
-            /*rank_data_bytes=*/8 * 1024 * 1024,
-            /*fusion_max_tokens=*/mem_plan.max_requests,
-            /*fusion_hidden=*/engine.hf_config().hidden_size);
-        custom_ar.register_buffer(*tp_comm_ptr, ws.norm_x.data(),
-                                  ws.norm_x.nbytes());
-        tp_comm_ptr->set_custom_all_reduce(&custom_ar);
+        try {
+            custom_ar = pie_cuda_driver::CustomAllReduce(
+                *tp_comm_ptr, /*same_process=*/true,
+                /*max_bytes=*/custom_all_reduce_max_bytes(),
+                /*rank_data_bytes=*/8 * 1024 * 1024,
+                /*fusion_max_tokens=*/mem_plan.max_requests,
+                /*fusion_hidden=*/engine.hf_config().hidden_size);
+            custom_ar.register_buffer(*tp_comm_ptr, ws.norm_x.data(),
+                                      ws.norm_x.nbytes());
+            custom_ar.register_buffer(*tp_comm_ptr, ws.norm_y.data(),
+                                      ws.norm_y.nbytes());
+            if (custom_ar) {
+                tp_comm_ptr->set_custom_all_reduce(&custom_ar);
+            }
+        } catch (const std::exception& e) {
+            custom_ar = pie_cuda_driver::CustomAllReduce();
+            if (verbose) {
+                std::cerr << "[pie-driver-cuda] custom all-reduce unavailable: "
+                          << e.what() << "; falling back to NCCL\n";
+            }
+        }
     }
 
     if (verbose) {
@@ -2461,6 +2657,7 @@ int run_impl(int argc,
     // the lifetime of the server.
     pie_cuda_driver::ForwardFn forward_fn;
     pie_cuda_driver::model::LlamaLikePlanState llama_plan;
+    pie_cuda_driver::model::LlamaLikePlanState nemotron_h_plan;
     // Gemma-4 26B-A4B's MoE block needs a routed-experts workspace
     // alongside the dense forward state. Inert (zero-byte) on dense
     // E2B / E4B / 31B variants.
@@ -2615,6 +2812,77 @@ int run_impl(int argc,
                 qo_indptr_h, kv_page_indptr_h,
                 N, R, is_pure_decode, mask_d, mask_indptr_d);
         };
+    } else if (is_nemotron_h_arch) {
+        const int nemotron_tp_size = cfg.distributed.tp_size;
+        pie_cuda_driver::NcclComm* nemotron_tp_comm = tp_comm_ptr;
+        pie_cuda_driver::model::LlamaLikeForwardCfg nemotron_fwd_cfg = fwd_cfg;
+        nemotron_fwd_cfg.tp_size = nemotron_tp_size;
+        nemotron_fwd_cfg.tp_comm = nemotron_tp_comm;
+        const char* nemotron_graphs_env =
+            std::getenv("PIE_NEMOTRON_ENABLE_CUDA_GRAPHS");
+        forward_fn.graph_safe =
+            kv_cache.format().is_native_bf16() &&
+            nemotron_graphs_env != nullptr &&
+            nemotron_graphs_env[0] != '\0' &&
+            nemotron_graphs_env[0] != '0';
+        forward_fn.graph_layout = [&nemotron_h_plan]() {
+            return pie_cuda_driver::model::llama_like_decode_graph_layout(
+                nemotron_h_plan);
+        };
+        forward_fn.prepare =
+            [&engine, &kv_cache, &nemotron_h_plan, nemotron_fwd_cfg](
+                pie_cuda_driver::AttentionWorkspace& attn_ws,
+                const pie_cuda_driver::ForwardFn::PrepareInputs& prep) {
+                pie_cuda_driver::model::prepare_llama_like_decode_plan(
+                    nemotron_h_plan, attn_ws, kv_cache, engine.hf_config(),
+                    nemotron_fwd_cfg,
+                    prep.qo_indptr_h,
+                    prep.kv_page_indices_d,
+                    prep.kv_page_indptr_h,
+                    prep.kv_page_indptr_d,
+                    prep.kv_last_page_lens_h,
+                    prep.kv_last_page_lens_d,
+                    prep.total_tokens,
+                    prep.num_requests,
+                    prep.is_pure_decode);
+            };
+        forward_fn.body =
+            [&engine, &weights_nemotron_h, &nemotron_h_ws,
+             &nemotron_h_state_cache, &nemotron_h_plan, nemotron_fwd_cfg](
+                pie_cuda_driver::model::Qwen3Workspace& ws,
+                pie_cuda_driver::KvCache& cache,
+                pie_cuda_driver::AttentionWorkspace& attn_ws,
+                pie_cuda_driver::ops::CublasHandle& cublas,
+                const std::int32_t* tok, const std::int32_t* pos,
+                const std::uint32_t* qo_indptr,
+                const std::uint32_t* kv_page_indices,
+                const std::uint32_t* kv_page_indptr,
+                const std::uint32_t* kv_last_page_lens,
+                const std::uint32_t* qo_indptr_h,
+                const std::uint32_t* kv_page_indptr_h,
+                int N, int R, bool is_pure_decode,
+                const std::uint8_t* mask_d,
+                const std::int32_t* mask_indptr_d,
+                const std::int32_t* slot_ids_h,
+                const std::uint8_t* is_fresh_h,
+                const std::int32_t* slot_ids_d,
+                const std::int32_t* logit_row_indices_d,
+                int num_logit_rows,
+                bool /*tp_greedy_argmax*/) {
+                pie_cuda_driver::model::nemotron_h_forward_paged(
+                    weights_nemotron_h, engine.hf_config(), nemotron_fwd_cfg,
+                    nemotron_h_plan,
+                    ws, nemotron_h_ws, cache, nemotron_h_state_cache,
+                    attn_ws, cublas,
+                    tok, pos,
+                    qo_indptr, kv_page_indices, kv_page_indptr,
+                    kv_last_page_lens,
+                    qo_indptr_h, kv_page_indptr_h,
+                    N, R, is_pure_decode, mask_d, mask_indptr_d,
+                    slot_ids_h, is_fresh_h, slot_ids_d,
+                    logit_row_indices_d, num_logit_rows);
+            };
+        forward_fn.supports_compact_logits = true;
     } else if (is_qwen3_5_arch) {
         const int q35_tp_size = cfg.distributed.tp_size;
         pie_cuda_driver::NcclComm* q35_tp_comm = tp_comm_ptr;
@@ -2824,11 +3092,15 @@ int run_impl(int argc,
         max_workspace_tokens,
         mem_plan.max_requests,
         graph_pad_page,
+        graph_pad_slot,
         persistent_inputs, verbose, std::move(forward_fn),
         use_cuda_graphs ? &graph_cache : nullptr,
         /*tp_comm=*/tp_comm_ptr,
         /*tp_cpu_gate_key=*/{},
-        /*rs_cache=*/((is_qwen3_5_arch || is_qwen3_5_moe_arch) ? &qwen3_5_state_cache : nullptr),
+        /*rs_cache=*/((is_qwen3_5_arch || is_qwen3_5_moe_arch)
+                          ? &qwen3_5_state_cache
+                          : (is_nemotron_h_arch ? &nemotron_h_state_cache
+                                                 : nullptr)),
         /*response_builder=*/{},
     };
     executor.tp_cpu_gate_key = cfg.distributed.nccl_unique_id_hex;
@@ -2873,15 +3145,21 @@ int run_impl(int argc,
         c.total_pages = runtime_kv_pages;
         c.swap_pool_size = swap_pool.num_pages();
         const bool rs_cache_required =
-            (is_qwen3_5_arch || is_qwen3_5_moe_arch) &&
-            qwen3_5_state_cache.max_slots() > 0;
+            ((is_qwen3_5_arch || is_qwen3_5_moe_arch) &&
+             runtime_state_slots > 0) ||
+            (is_nemotron_h_arch && runtime_state_slots > 0);
         const std::uint64_t rs_cache_slots = rs_cache_required
-            ? static_cast<std::uint64_t>(qwen3_5_state_cache.max_slots())
+            ? static_cast<std::uint64_t>(runtime_state_slots)
             : 0;
         const std::uint64_t rs_cache_slot_bytes = rs_cache_required
-            ? static_cast<std::uint64_t>(qwen3_5_linear_layers) *
-                  (qwen3_5_state_cache.conv_slot_stride_bytes() +
-                   qwen3_5_state_cache.recurrent_slot_stride_bytes())
+            ? (is_nemotron_h_arch
+                   ? static_cast<std::uint64_t>(
+                         nemotron_h_state_slot_bytes(
+                             engine.hf_config(), nemotron_h_mamba_layers,
+                             local_tp_size))
+                   : static_cast<std::uint64_t>(qwen3_5_linear_layers) *
+                         (qwen3_5_state_cache.conv_slot_stride_bytes() +
+                          qwen3_5_state_cache.recurrent_slot_stride_bytes()))
             : 0;
         nlohmann::json caps = {
             {"total_pages",            c.total_pages},

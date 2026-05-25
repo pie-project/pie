@@ -30,11 +30,29 @@ def worker_main(
     """
     import os
 
-    safe_device = devices[local_rank].replace(":", "_")
-    os.environ.setdefault(
-        "VLLM_CACHE_ROOT",
-        f"/tmp/pie_vllm_cache/pid_{os.getpid()}_{safe_device}",
-    )
+    # Match vLLM's multiprocessing executor behavior. Without this clamp each
+    # embedded TP rank can fan out to hundreds of CPU threads during weight
+    # load/postprocess, which makes large hybrid checkpoints spend minutes in
+    # loader CPU contention before Pie ever reaches the ready handshake.
+    if "OMP_NUM_THREADS" not in os.environ:
+        try:
+            import torch
+
+            if torch.get_num_threads() > 1:
+                os.environ["OMP_NUM_THREADS"] = "1"
+                torch.set_num_threads(1)
+        except Exception:
+            pass
+
+    # Only isolate vLLM's cache when Pie is launching multiple independent
+    # DP replicas. For a single TP group, keep vLLM's normal cache root so
+    # compile/kernel artifacts are shared with standalone vLLM benchmarks.
+    if len(group_topology) > 1:
+        safe_device = devices[local_rank].replace(":", "_")
+        os.environ.setdefault(
+            "VLLM_CACHE_ROOT",
+            f"/tmp/pie_vllm_cache/pid_{os.getpid()}_{safe_device}",
+        )
 
     from ._bridge.worker import run_worker
     from . import utils as runtime_ops

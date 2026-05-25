@@ -9,18 +9,20 @@
 
 namespace pie_cuda_driver {
 
-Qwen3_5StateCache Qwen3_5StateCache::allocate(
+Qwen3_5StateCache Qwen3_5StateCache::allocate_impl(
     const std::vector<bool>& layer_is_linear,
     int conv_dim,
     int conv_kernel,
     int v_heads,
     int head_k_dim,
     int head_v_dim,
-    int max_slots)
+    int max_slots,
+    bool recurrent_bf16)
 {
     if (max_slots < 1) max_slots = 1;
     Qwen3_5StateCache c;
     c.layer_is_linear_ = layer_is_linear;
+    c.recurrent_bf16_ = recurrent_bf16;
     c.max_slots_   = max_slots;
     c.conv_dim_    = conv_dim;
     c.conv_kernel_ = conv_kernel;
@@ -37,21 +39,60 @@ Qwen3_5StateCache Qwen3_5StateCache::allocate(
 
     c.conv_states_.reserve(layer_is_linear.size());
     c.recurrent_states_.reserve(layer_is_linear.size());
+    c.recurrent_bf16_states_.reserve(layer_is_linear.size());
     for (bool linear : layer_is_linear) {
         if (linear) {
             c.conv_states_.push_back(
                 DeviceBuffer<std::uint16_t>::alloc(conv_total));
-            c.recurrent_states_.push_back(
-                DeviceBuffer<float>::alloc(rec_total));
+            if (recurrent_bf16) {
+                c.recurrent_bf16_states_.push_back(
+                    DeviceBuffer<std::uint16_t>::alloc(rec_total));
+                c.recurrent_states_.emplace_back();
+            } else {
+                c.recurrent_states_.push_back(
+                    DeviceBuffer<float>::alloc(rec_total));
+                c.recurrent_bf16_states_.emplace_back();
+            }
         } else {
             // Empty placeholders for full-attention layers — keeps
             // indexing by `layer` direct.
             c.conv_states_.emplace_back();
             c.recurrent_states_.emplace_back();
+            c.recurrent_bf16_states_.emplace_back();
         }
     }
     c.reset();
     return c;
+}
+
+Qwen3_5StateCache Qwen3_5StateCache::allocate(
+    const std::vector<bool>& layer_is_linear,
+    int conv_dim,
+    int conv_kernel,
+    int v_heads,
+    int head_k_dim,
+    int head_v_dim,
+    int max_slots)
+{
+    return Qwen3_5StateCache::allocate_impl(
+        layer_is_linear, conv_dim, conv_kernel,
+        v_heads, head_k_dim, head_v_dim, max_slots,
+        /*recurrent_bf16=*/false);
+}
+
+Qwen3_5StateCache Qwen3_5StateCache::allocate_bf16_recurrent(
+    const std::vector<bool>& layer_is_linear,
+    int conv_dim,
+    int conv_kernel,
+    int v_heads,
+    int head_k_dim,
+    int head_v_dim,
+    int max_slots)
+{
+    return Qwen3_5StateCache::allocate_impl(
+        layer_is_linear, conv_dim, conv_kernel,
+        v_heads, head_k_dim, head_v_dim, max_slots,
+        /*recurrent_bf16=*/true);
 }
 
 void Qwen3_5StateCache::reset(cudaStream_t stream)
@@ -61,7 +102,10 @@ void Qwen3_5StateCache::reset(cudaStream_t stream)
     for (std::size_t L = 0; L < layer_is_linear_.size(); ++L) {
         if (!layer_is_linear_[L]) continue;
         CUDA_CHECK(cudaMemsetAsync(conv_states_[L].data(), 0, conv_bytes, stream));
-        CUDA_CHECK(cudaMemsetAsync(recurrent_states_[L].data(), 0, rec_bytes, stream));
+        void* rec = recurrent_bf16_
+            ? static_cast<void*>(recurrent_bf16_states_[L].data())
+            : static_cast<void*>(recurrent_states_[L].data());
+        CUDA_CHECK(cudaMemsetAsync(rec, 0, rec_bytes, stream));
     }
 }
 
@@ -75,7 +119,9 @@ void Qwen3_5StateCache::reset_slot(int slot, cudaStream_t stream)
     for (std::size_t L = 0; L < layer_is_linear_.size(); ++L) {
         if (!layer_is_linear_[L]) continue;
         auto* conv_base = reinterpret_cast<std::uint8_t*>(conv_states_[L].data());
-        auto* rec_base  = reinterpret_cast<std::uint8_t*>(recurrent_states_[L].data());
+        auto* rec_base  = recurrent_bf16_
+            ? reinterpret_cast<std::uint8_t*>(recurrent_bf16_states_[L].data())
+            : reinterpret_cast<std::uint8_t*>(recurrent_states_[L].data());
         CUDA_CHECK(cudaMemsetAsync(
             conv_base + slot * conv_bytes, 0, conv_bytes, stream));
         CUDA_CHECK(cudaMemsetAsync(
@@ -97,7 +143,9 @@ void Qwen3_5StateCache::copy_slot_d2d(int src_slot, int dst_slot, cudaStream_t s
     for (std::size_t L = 0; L < layer_is_linear_.size(); ++L) {
         if (!layer_is_linear_[L]) continue;
         auto* conv_base = reinterpret_cast<std::uint8_t*>(conv_states_[L].data());
-        auto* rec_base = reinterpret_cast<std::uint8_t*>(recurrent_states_[L].data());
+        auto* rec_base = recurrent_bf16_
+            ? reinterpret_cast<std::uint8_t*>(recurrent_bf16_states_[L].data())
+            : reinterpret_cast<std::uint8_t*>(recurrent_states_[L].data());
         CUDA_CHECK(cudaMemcpyAsync(
             conv_base + static_cast<std::size_t>(dst_slot) * conv_bytes,
             conv_base + static_cast<std::size_t>(src_slot) * conv_bytes,
@@ -125,6 +173,10 @@ void* Qwen3_5StateCache::conv_state(int layer, int slot)
 
 float* Qwen3_5StateCache::recurrent_state(int layer, int slot)
 {
+    if (recurrent_bf16_) {
+        throw std::runtime_error(
+            "Qwen3_5StateCache::recurrent_state: recurrent storage is bf16");
+    }
     if (slot < 0 || slot >= max_slots_) {
         throw std::out_of_range("Qwen3_5StateCache::recurrent_state: slot out of range");
     }
@@ -132,6 +184,23 @@ float* Qwen3_5StateCache::recurrent_state(int layer, int slot)
     if (base == nullptr) return nullptr;  // full-attention layer
     return base + static_cast<std::size_t>(slot) *
         recurrent_slot_stride_floats();
+}
+
+void* Qwen3_5StateCache::recurrent_state_bf16(int layer, int slot)
+{
+    if (!recurrent_bf16_) {
+        throw std::runtime_error(
+            "Qwen3_5StateCache::recurrent_state_bf16: recurrent storage is fp32");
+    }
+    if (slot < 0 || slot >= max_slots_) {
+        throw std::out_of_range(
+            "Qwen3_5StateCache::recurrent_state_bf16: slot out of range");
+    }
+    auto* base = reinterpret_cast<std::uint8_t*>(
+        recurrent_bf16_states_[layer].data());
+    if (base == nullptr) return nullptr;
+    return base + static_cast<std::size_t>(slot) *
+        recurrent_slot_stride_bytes();
 }
 
 }  // namespace pie_cuda_driver

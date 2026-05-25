@@ -776,6 +776,7 @@ void moe_block(
                         moe_ws.topk_idx.data(),
                         moe_ws.aligned_route_ids.data(),
                         moe_ws.aligned_expert_ids.data(),
+                        nullptr,
                         routes, E, block, max_blocks, stream);
                     kernels::launch_gather_moe_aligned_inputs_bf16(
                         ws.norm_x.data(), moe_ws.aligned_route_ids.data(),

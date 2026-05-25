@@ -41,6 +41,7 @@ struct HfConfig {
     // ── Norm / activation ─────────────────────────────────────────────
     float rms_norm_eps;
     std::string hidden_act;    // "silu" — only one supported for now.
+    std::string mlp_hidden_act; // Nemotron-H uses "relu2".
 
     // ── RoPE ──────────────────────────────────────────────────────────
     float rope_theta;
@@ -156,6 +157,21 @@ struct HfConfig {
     // is the (always-on) shared expert's MLP width.
     int moe_intermediate_size;
     int shared_expert_intermediate_size;
+    float routed_scaling_factor = 1.f;
+    int n_group = 1;
+    int topk_group = 1;
+    bool norm_topk_prob = true;
+
+    // ── Nemotron-H hybrid Mamba2/attention/MoE ─────────────────────
+    // `layer_types` stores "mamba", "attention", or "moe" for this
+    // architecture. These dimensions are zero on non-Nemotron models.
+    int mamba_num_heads = 0;
+    int mamba_head_dim = 0;
+    int mamba_state_size = 0;
+    int mamba_n_groups = 0;
+    int mamba_conv_kernel = 0;
+    int mamba_chunk_size = 0;
+    float mamba_time_step_min = 0.f;
 
     // ── Qwen3.5 hybrid (linear-attention SSM + full attention) ──────
     // Per-layer attention type is in `layer_types` (values

@@ -73,6 +73,19 @@ void launch_token_batched_weighted_sum_bf16(
     int hidden,
     cudaStream_t stream);
 
+// Fused combine for aligned MoE output. `route_to_aligned_row[route]`
+// maps the original route id (`token * top_k + k`) to its row in
+// `aligned_out`; accumulation still proceeds in top-k order for each token.
+void launch_token_batched_weighted_sum_aligned_bf16(
+    void* out,
+    const void* aligned_out,
+    const float* weights,
+    const std::int32_t* route_to_aligned_row,
+    int num_tokens,
+    int top_k,
+    int hidden,
+    cudaStream_t stream);
+
 // On-device construction of the per-expert cuBLAS pointer arrays for the
 // N=1 MoE decode path. Replaces the host-side build_routing + 6
 // cudaMemcpyAsync's that the original implementation used; produces the
@@ -144,10 +157,25 @@ void launch_moe_align_decode(
     const std::int32_t* topk_idx,
     std::int32_t* sorted_route_ids,
     std::int32_t* expert_ids,
+    std::int32_t* route_to_aligned_row,
     int num_routes,
     int num_experts,
     int block_size,
     int max_blocks,
+    cudaStream_t stream);
+
+// Exact device-side expert bucketing for grouped MoE. Unlike
+// `launch_moe_align_decode`, this does not pad to fixed-size expert blocks.
+// It writes sorted route ids, the inverse route->sorted-row map, and exact
+// per-expert counts. The host may copy only `counts_out[num_experts]` to build
+// cuBLAS grouped shapes while route metadata stays on device.
+void launch_moe_bucket_exact(
+    const std::int32_t* topk_idx,
+    std::int32_t* sorted_route_ids,
+    std::int32_t* route_to_sorted_row,
+    std::int32_t* counts_out,
+    int num_routes,
+    int num_experts,
     cudaStream_t stream);
 
 // Gather `norm_x[route / top_k]` into aligned rows. Sentinel route ids become

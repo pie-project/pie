@@ -116,10 +116,20 @@ pub fn create(arch_name: &str, tokenizer: Arc<Tokenizer>) -> Arc<dyn Instruct> {
                 ChatMLConfig {
                     has_thinking: true,
                     has_tools: true,
+                    generation_suffix: "",
                     stop_tokens: &["<|im_end|>", "<|endoftext|>"],
                 },
             ))
         }
+        "nemotron_h" => Arc::new(QwenInstruct::new(
+            tokenizer,
+            ChatMLConfig {
+                has_thinking: true,
+                has_tools: false,
+                generation_suffix: "<think>\n",
+                stop_tokens: &["<|im_end|>", "<|endoftext|>"],
+            },
+        )),
         "qwen2" => Arc::new(self::qwen2::new(tokenizer)),
         "llama2" => Arc::new(self::llama2::LlamaInstruct::new(tokenizer)),
         "llama3" | "l4ma" => Arc::new(self::llama3::LlamaInstruct::new(tokenizer)),
@@ -141,6 +151,7 @@ pub fn create(arch_name: &str, tokenizer: Arc<Tokenizer>) -> Arc<dyn Instruct> {
             ChatMLConfig {
                 has_thinking: false,
                 has_tools: false,
+                generation_suffix: "",
                 stop_tokens: &["<|im_end|>", "<|endoftext|>"],
             },
         )),

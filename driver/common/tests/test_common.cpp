@@ -202,6 +202,16 @@ void test_hf_config_json() {
     CHECK(common::flat_rope_parameters_view(flat) != nullptr);
     CHECK(common::flat_rope_config_view(flat) != nullptr);
 
+    const auto llm_wrapped = nlohmann::json::parse(R"json({
+        "model_type": "NemotronH_Nano_Omni_Reasoning_V3",
+        "llm_config": {"model_type": "nemotron_h"}
+    })json");
+    auto llm_view = common::hf_config_json_view(llm_wrapped);
+    CHECK_EQ(llm_view.outer_model_type,
+             std::string("NemotronH_Nano_Omni_Reasoning_V3"));
+    CHECK_EQ(llm_view.text_model_type, std::string("nemotron_h"));
+    CHECK_EQ(llm_view.text_or_outer_model_type(), std::string("nemotron_h"));
+
     const auto scaling = nlohmann::json::parse(R"json({
         "rope_scaling": {"rope_type": "llama3", "factor": 8.0},
         "rope_parameters": {"rope_theta": 10000.0}

@@ -7,6 +7,7 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
@@ -21,6 +22,11 @@ use super::{ForwardOutput, request};
 mod chunked;
 
 use chunked::ChunkContinuation;
+
+fn scheduler_trace_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("PIE_SCHED_TRACE").is_some())
+}
 
 // =============================================================================
 // Scheduling Policy Trait
@@ -468,6 +474,71 @@ impl BatchAccumulator {
                 .saturating_add(usage.logprob_labels)
                 > self.limits.max_logprob_labels
             || next_custom_mask_bytes > self.limits.max_custom_mask_bytes
+    }
+
+    fn would_exceed_reason(&self, req: &PendingRequest) -> Option<String> {
+        if self.requests.is_empty() {
+            return None;
+        }
+        let usage = request_capacity_usage(req, self.page_size);
+        let next_has_spec = self.has_spec_drafts || usage.has_spec_drafts;
+        let next_custom_mask_bytes = if next_has_spec {
+            self.total_spec_custom_mask_bytes
+                .saturating_add(usage.spec_custom_mask_bytes)
+        } else {
+            self.total_user_custom_mask_bytes
+                .saturating_add(usage.user_custom_mask_bytes)
+        };
+        let (next_logit_rows, next_prob_rows, _, _, _) = self.projected_rows(Some(&usage));
+        let checks = [
+            (
+                "requests",
+                self.requests.len().saturating_add(1),
+                self.limits.max_forward_requests,
+            ),
+            (
+                "tokens",
+                self.total_tokens.saturating_add(usage.forward_tokens),
+                self.limits.max_forward_tokens,
+            ),
+            (
+                "pages",
+                self.total_pages.saturating_add(usage.page_refs),
+                self.limits.max_page_refs,
+            ),
+            ("logit_rows", next_logit_rows, self.limits.max_logit_rows),
+            ("prob_rows", next_prob_rows, self.limits.max_prob_rows),
+            (
+                "sampler_rows",
+                self.total_sampler_rows.saturating_add(usage.sampler_rows),
+                self.limits.max_sampler_rows,
+            ),
+            (
+                "logprob_labels",
+                self.total_logprob_labels
+                    .saturating_add(usage.logprob_labels),
+                self.limits.max_logprob_labels,
+            ),
+            (
+                "custom_mask_bytes",
+                next_custom_mask_bytes,
+                self.limits.max_custom_mask_bytes,
+            ),
+        ];
+        checks
+            .into_iter()
+            .find(|(_, have, limit)| have > limit)
+            .map(|(name, have, limit)| {
+                format!(
+                    "{name} {have}>{limit} pending_tokens={} pending_pages={} pending_sampler_rows={} pending_has_spec={} pending_dense={} pending_prob={}",
+                    usage.forward_tokens,
+                    usage.page_refs,
+                    usage.sampler_rows,
+                    usage.has_spec_drafts,
+                    usage.has_dense_logit_requirement,
+                    usage.has_prob_sampling,
+                )
+            })
     }
 
     fn is_full(&self) -> bool {
@@ -962,6 +1033,18 @@ impl BatchScheduler {
                     continue;
                 };
                 if batch.would_exceed(&pending) {
+                    if scheduler_trace_enabled() {
+                        let reason = batch
+                            .would_exceed_reason(&pending)
+                            .unwrap_or_else(|| "unknown".to_string());
+                        eprintln!(
+                            "[pie-sched-trace] driver={} stash current_requests={} current_tokens={} reason={}",
+                            driver_idx,
+                            batch.len(),
+                            batch.total_tokens(),
+                            reason,
+                        );
+                    }
                     next_pending = Some(pending);
                     break;
                 }
@@ -1004,6 +1087,18 @@ impl BatchScheduler {
                             continue;
                         }
                         if batch.would_exceed(&pending) {
+                            if scheduler_trace_enabled() {
+                                let reason = batch
+                                    .would_exceed_reason(&pending)
+                                    .unwrap_or_else(|| "unknown".to_string());
+                                eprintln!(
+                                    "[pie-sched-trace] driver={} stash current_requests={} current_tokens={} reason={}",
+                                    driver_idx,
+                                    batch.len(),
+                                    batch.total_tokens(),
+                                    reason,
+                                );
+                            }
                             next_pending = Some(pending);
                             break;
                         }
@@ -1012,6 +1107,16 @@ impl BatchScheduler {
                     }
 
                     let total_tokens = batch.total_tokens();
+                    if scheduler_trace_enabled() {
+                        eprintln!(
+                            "[pie-sched-trace] driver={} fire requests={} tokens={} prefill_like={} stashed={}",
+                            driver_idx,
+                            batch.len(),
+                            total_tokens,
+                            batch.should_prefill_coalesce(),
+                            next_pending.is_some(),
+                        );
+                    }
                     let requests_to_fire = batch.take();
                     policy.on_fired(requests_to_fire.len());
 
@@ -1118,6 +1223,18 @@ impl BatchScheduler {
                                     continue;
                                 };
                                 if batch.would_exceed(&pending) {
+                                    if scheduler_trace_enabled() {
+                                        let reason = batch
+                                            .would_exceed_reason(&pending)
+                                            .unwrap_or_else(|| "unknown".to_string());
+                                        eprintln!(
+                                            "[pie-sched-trace] driver={} stash current_requests={} current_tokens={} reason={}",
+                                            driver_idx,
+                                            batch.len(),
+                                            batch.total_tokens(),
+                                            reason,
+                                        );
+                                    }
                                     next_pending = Some(pending);
                                     continue;
                                 }

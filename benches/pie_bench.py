@@ -6,6 +6,7 @@ import asyncio
 import contextlib
 import inspect
 import json
+import math
 import os
 import socket
 import sys
@@ -19,10 +20,13 @@ from common import (
     ROOT,
     RequestResult,
     add_mode_subcommands,
+    cuda_profiler_range,
     finish,
     hf_chat_token_ids_and_counts,
     make_prompts,
+    maybe_set_cpu_affinity,
     summarize,
+    visible_cuda_devices,
 )
 
 SERVER_SDK = ROOT / "sdk" / "python-server" / "python"
@@ -122,6 +126,14 @@ def build_config(args: argparse.Namespace):
             driver_options["max_num_batched_tokens"] = args.vllm_max_num_batched_tokens
         if args.vllm_max_model_len is not None:
             driver_options["max_model_len"] = args.vllm_max_model_len
+        if args.vllm_enforce_eager:
+            driver_options["enforce_eager"] = True
+        if args.vllm_text_only_mm:
+            driver_options["text_only_mm"] = True
+        if args.trust_remote_code:
+            driver_options["trust_remote_code"] = True
+        if getattr(args, "vllm_decode_lookahead_tokens", 1) != 1:
+            driver_options["decode_lookahead_tokens"] = args.vllm_decode_lookahead_tokens
         if getattr(args, "vllm_spec_ngram", False):
             driver_options["spec_ngram_enabled"] = True
             driver_options["spec_ngram_num_drafts"] = args.vllm_spec_ngram_num_drafts
@@ -192,6 +204,7 @@ def build_config(args: argparse.Namespace):
     scheduler = args.batch_policy or ("greedy" if args.mode == "latency" else "adaptive")
     scheduler_kwargs = {
         "batch_policy": scheduler,
+        "request_timeout_secs": max(1, math.ceil(args.request_timeout)),
         "default_token_limit": args.default_token_limit,
         "default_endowment_pages": args.default_endowment_pages,
         "admission_oversubscription_factor": args.admission_oversubscription_factor,
@@ -275,6 +288,12 @@ async def cli_pie_client(args: argparse.Namespace):
             "--no-default-features --features driver-cuda"
         )
 
+    child_env = os.environ.copy()
+    child_env.setdefault(
+        "PIE_SHMEM_HARD_TIMEOUT_S",
+        str(max(1, math.ceil(args.request_timeout))),
+    )
+
     proc = await asyncio.create_subprocess_exec(
         str(pie_bin),
         "serve",
@@ -282,6 +301,7 @@ async def cli_pie_client(args: argparse.Namespace):
         str(cfg_path),
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.STDOUT,
+        env=child_env,
     )
     startup_lines: list[str] = []
     server_lines: list[str] = startup_lines
@@ -408,12 +428,16 @@ def pie_client(args: argparse.Namespace):
 async def run(args: argparse.Namespace):
     from pie_client import Event
 
+    cpu_affinity = maybe_set_cpu_affinity(args, visible_cuda_devices(args.tp_size))
     n = args.requests if args.mode == "latency" else args.num_requests
     prompts = make_prompts(args, n + args.warmup)
     prompt_token_ids: list[list[int]] | None = None
     if args.pretokenized_prompts:
         prompt_token_ids, _ = hf_chat_token_ids_and_counts(
-            args.model, args.system, prompts
+            args.model,
+            args.system,
+            prompts,
+            trust_remote_code=args.trust_remote_code,
         )
     wasm, manifest, pkg = bench_inferlet_paths()
 
@@ -421,6 +445,7 @@ async def run(args: argparse.Namespace):
         await client.install_program(wasm, manifest, force_overwrite=True)
 
         first_output_text: list[str | None] = [None]
+        first_output_tokens: list[list[int] | None] = [None]
 
         def common_input(max_tokens: int | None = None) -> dict[str, Any]:
             return {
@@ -466,6 +491,7 @@ async def run(args: argparse.Namespace):
                         obj = json.loads(msg)
                         if i == 0 and first_output_text[0] is None:
                             first_output_text[0] = obj.get("text", "")
+                            first_output_tokens[0] = obj.get("token_ids") or []
                         return RequestResult(
                             True,
                             time.perf_counter() - start,
@@ -524,6 +550,7 @@ async def run(args: argparse.Namespace):
                         obj = json.loads(msg)
                         if first_output_text[0] is None:
                             first_output_text[0] = obj.get("text", "")
+                            first_output_tokens[0] = obj.get("token_ids") or []
                         req_out = obj.get("request_output_tokens") or []
                         req_prompt = obj.get("request_prompt_tokens") or []
                         elapsed = time.perf_counter() - start
@@ -610,12 +637,13 @@ async def run(args: argparse.Namespace):
                     await one(i, max_tokens=warmup_max_tokens)
 
         start_idx = args.warmup
-        start = time.perf_counter()
-        if args.mode == "latency":
-            results = [await one(start_idx + i) for i in range(n)]
-        else:
-            results = await many(range(start_idx, start_idx + n))
-        wall = time.perf_counter() - start
+        with cuda_profiler_range(args.cuda_profiler_range):
+            start = time.perf_counter()
+            if args.mode == "latency":
+                results = [await one(start_idx + i) for i in range(n)]
+            else:
+                results = await many(range(start_idx, start_idx + n))
+            wall = time.perf_counter() - start
 
         # Pull speculation counters out of the server's model status
         # so the bench output reflects what actually happened. Zero
@@ -665,6 +693,8 @@ async def run(args: argparse.Namespace):
         sha = hashlib.sha256(first_output_text[0].encode()).hexdigest()[:16]
         print(f"\nFIRST REQUEST OUTPUT (sha256[:16]={sha}):")
         print(first_output_text[0])
+        if first_output_tokens[0] is not None:
+            print(f"TOKEN IDS: {first_output_tokens[0]}")
         print(f"END OUTPUT (chars={len(first_output_text[0])})")
 
     summary = summarize(
@@ -681,6 +711,7 @@ async def run(args: argparse.Namespace):
             "top_p": args.top_p,
             "ignore_eos": args.ignore_eos,
             "unique_prompts": args.unique_prompts,
+            "cpu affinity": cpu_affinity,
             **engine_config,
         },
     )
@@ -756,8 +787,10 @@ def build_parser() -> argparse.ArgumentParser:
         sp.add_argument(
             "--system-speculation",
             action=argparse.BooleanOptionalAction,
-            default=True,
-            help="Ask the benchmark inferlet to request driver-provided speculative drafts.",
+            default=False,
+            help="Ask the benchmark inferlet to request driver-provided speculative drafts. "
+                 "Default is off because drivers without this side channel pay a dense-logit "
+                 "batching cost without receiving drafts.",
         )
         sp.add_argument(
             "--batch-policy",
@@ -767,9 +800,18 @@ def build_parser() -> argparse.ArgumentParser:
                  "or adaptive (tput).",
         )
         sp.add_argument("--vllm-attention-backend", default=None)
+        sp.add_argument("--vllm-enforce-eager", action="store_true")
+        sp.add_argument(
+            "--vllm-text-only-mm",
+            action=argparse.BooleanOptionalAction,
+            default=False,
+            help="Set vLLM multimodal limits to zero for text-only generation.",
+        )
         sp.add_argument("--vllm-max-num-seqs", type=int, default=None)
         sp.add_argument("--vllm-max-num-batched-tokens", type=int, default=None)
         sp.add_argument("--vllm-max-model-len", type=int, default=None)
+        sp.add_argument("--trust-remote-code", action=argparse.BooleanOptionalAction, default=False)
+        sp.add_argument("--vllm-decode-lookahead-tokens", type=int, default=1)
         sp.add_argument("--vllm-spec-ngram", action=argparse.BooleanOptionalAction, default=False)
         sp.add_argument("--vllm-spec-ngram-num-drafts", type=int, default=4)
         sp.add_argument("--vllm-spec-ngram-min-n", type=int, default=2)

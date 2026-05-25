@@ -98,8 +98,12 @@ HfConfig parse_hf_config(const std::filesystem::path& path) {
     cfg.vocab_size               = require<int>(j, "vocab_size", path_str);
     cfg.max_position_embeddings  = require<int>(j, "max_position_embeddings", path_str);
 
-    cfg.rms_norm_eps = require<float>(j, "rms_norm_eps", path_str);
+    cfg.rms_norm_eps = optional<float>(
+        j, "rms_norm_eps",
+        optional<float>(j, "layer_norm_epsilon",
+                        optional<float>(j, "norm_eps", 1e-5f)));
     cfg.hidden_act   = optional<std::string>(j, "hidden_act", "silu");
+    cfg.mlp_hidden_act = optional<std::string>(j, "mlp_hidden_act", cfg.hidden_act);
 
     cfg.rope_theta       = optional<float>(j, "rope_theta", 10000.0f);
 
@@ -168,6 +172,31 @@ HfConfig parse_hf_config(const std::filesystem::path& path) {
         for (const auto& t : j["layer_types"]) {
             cfg.layer_types.push_back(t.get<std::string>());
         }
+    } else if (cfg.model_type == "nemotron_h" &&
+               j.contains("hybrid_override_pattern")) {
+        const std::string pattern =
+            j["hybrid_override_pattern"].get<std::string>();
+        if (static_cast<int>(pattern.size()) != cfg.num_hidden_layers) {
+            throw std::runtime_error(
+                "config.json (" + path_str +
+                "): hybrid_override_pattern size != num_hidden_layers");
+        }
+        cfg.layer_types.reserve(pattern.size());
+        for (char c : pattern) {
+            if (c == 'M') {
+                cfg.layer_types.push_back("mamba");
+            } else if (c == '*') {
+                cfg.layer_types.push_back("attention");
+            } else if (c == 'E') {
+                cfg.layer_types.push_back("moe");
+            } else if (c == '-') {
+                cfg.layer_types.push_back("mlp");
+            } else {
+                throw std::runtime_error(
+                    "config.json (" + path_str +
+                    "): unsupported hybrid_override_pattern character");
+            }
+        }
     } else if ((cfg.model_type == "gemma3" || cfg.model_type == "gemma3_text") &&
                j.contains("sliding_window_pattern")) {
         const int pat = j["sliding_window_pattern"].get<int>();
@@ -212,8 +241,10 @@ HfConfig parse_hf_config(const std::filesystem::path& path) {
     // Sparse MoE (zero on dense models). HF spelling: `num_local_experts`
     // and `num_experts_per_tok` for Mixtral / GPT-OSS; some configs use
     // `num_experts` instead.
-    cfg.num_experts         = optional<int>(j, "num_local_experts",
-                                            optional<int>(j, "num_experts", 0));
+    cfg.num_experts         = optional<int>(
+        j, "num_local_experts",
+        optional<int>(j, "num_experts",
+                      optional<int>(j, "n_routed_experts", 0)));
     // `num_experts_per_tok` is the canonical name (Mixtral / Qwen MoE);
     // Gemma-4 uses `top_k_experts`. Accept either.
     cfg.num_experts_per_tok = optional<int>(j, "num_experts_per_tok",
@@ -284,8 +315,34 @@ HfConfig parse_hf_config(const std::filesystem::path& path) {
     // Qwen3.6-MoE knobs (zero on non-MoE archs).
     cfg.moe_intermediate_size =
         optional<int>(j, "moe_intermediate_size", 0);
-    cfg.shared_expert_intermediate_size =
-        optional<int>(j, "shared_expert_intermediate_size", 0);
+    cfg.shared_expert_intermediate_size = optional<int>(
+        j, "shared_expert_intermediate_size",
+        optional<int>(j, "moe_shared_expert_intermediate_size", 0));
+    cfg.routed_scaling_factor =
+        optional<float>(j, "routed_scaling_factor", 1.f);
+    cfg.n_group = optional<int>(j, "n_group",
+                                optional<int>(j, "n_groups", 1));
+    cfg.topk_group = optional<int>(j, "topk_group", 1);
+    cfg.norm_topk_prob = optional<bool>(j, "norm_topk_prob", true);
+
+    if (cfg.model_type == "nemotron_h") {
+        cfg.mamba_num_heads =
+            optional<int>(j, "mamba_num_heads", 0);
+        cfg.mamba_head_dim =
+            optional<int>(j, "mamba_head_dim", 0);
+        cfg.mamba_state_size =
+            optional<int>(j, "ssm_state_size", 0);
+        cfg.mamba_n_groups =
+            optional<int>(j, "n_groups",
+                          optional<int>(j, "mamba_n_groups", 0));
+        cfg.mamba_conv_kernel =
+            optional<int>(j, "conv_kernel",
+                          optional<int>(j, "mamba_d_conv", 0));
+        cfg.mamba_chunk_size = optional<int>(j, "chunk_size", 0);
+        cfg.mamba_time_step_min =
+            optional<float>(j, "time_step_min",
+                            optional<float>(j, "mamba_dt_min", 0.001f));
+    }
 
     // Qwen3.5 hybrid (linear-attention SSM) knobs. Defaults are zero so
     // non-qwen3.5 models leave the linear-attn dimensions unset; the
@@ -358,6 +415,14 @@ HfConfig parse_hf_config(const std::filesystem::path& path) {
             "vision_tower.",
             "vision_model.",
             "multi_modal_projector.",
+        };
+    }
+    if (cfg.model_type == "nemotron_h") {
+        cfg.mm_skip_prefixes = {
+            "vision_model.",
+            "mlp1.",
+            "sound_encoder.",
+            "sound_projection.",
         };
     }
 

@@ -21,6 +21,7 @@ set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib)
 
 find_package(CUDAToolkit REQUIRED)
 find_package(Threads REQUIRED)
+find_package(Python3 COMPONENTS Interpreter REQUIRED)
 
 if(NOT PIE_BRIDGE_INCLUDE_DIR)
   set(PIE_BRIDGE_INCLUDE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../bridge/include")
@@ -120,6 +121,7 @@ add_library(pie_driver_cuda_lib STATIC
   src/model/mistral3.cpp
   src/model/gpt_oss.cpp
   src/model/qwen3_5.cpp
+  src/model/nemotron_h.cpp
   src/kv_cache_format.cpp
   src/kv_cache.cpp
   src/ops/gemm.cpp
@@ -163,16 +165,19 @@ add_library(pie_driver_cuda_lib STATIC
   src/kernels/altup_aux.cu
   src/kernels/causal_conv1d.cu
   src/kernels/gated_delta_net.cu
+  src/kernels/nemotron_h.cu
   src/qwen3_5_state_cache.cpp
   src/model/qwen3_5_forward.cpp
   src/model/qwen3_5_moe.cpp
   src/model/qwen3_5_moe_forward.cpp
+  src/model/nemotron_h_forward.cpp
   src/attention_workspace.cpp
   src/brle.cpp
   src/swap_pool.cpp
   src/distributed.cpp
   ${PIE_CUDA_CUSTOM_ALL_REDUCE_SOURCE}
   src/ops/attention_flashinfer.cu
+  src/ops/flashinfer_mamba.cu
   ${PIE_CUDA_FLASHINFER_HOPPER_SOURCE}
 )
 
@@ -243,6 +248,79 @@ target_include_directories(pie_driver_cuda_lib
     ${flashinfer_SOURCE_DIR}/3rdparty/cutlass/include
     ${flashinfer_SOURCE_DIR}/3rdparty/cutlass/tools/util/include
     ${flashinfer_SOURCE_DIR}/3rdparty/spdlog/include)
+
+# FlashInfer's CUTLASS MoE path expects generated launcher instantiations
+# beside the static csrc files. Generate only the SM80 grouped-GEMM launchers
+# needed by the SM89/Ada BF16 MoE path instead of pulling in the entire TVM
+# extension module.
+list(GET CMAKE_CUDA_ARCHITECTURES 0 PIE_FLASHINFER_MOE_ARCH)
+string(REGEX REPLACE "[^0-9].*$" "" PIE_FLASHINFER_MOE_ARCH_NUMBER
+  "${PIE_FLASHINFER_MOE_ARCH}")
+set(PIE_FLASHINFER_MOE_GEN_DIR
+  "${CMAKE_BINARY_DIR}/flashinfer_generated/cutlass_instantiations/${PIE_FLASHINFER_MOE_ARCH_NUMBER}")
+file(MAKE_DIRECTORY "${PIE_FLASHINFER_MOE_GEN_DIR}")
+execute_process(
+  COMMAND ${CMAKE_COMMAND} -E env
+          FLASHINFER_DISABLE_VERSION_CHECK=1
+          PYTHONPATH=${flashinfer_SOURCE_DIR}
+          ${Python3_EXECUTABLE} -c
+          "from pathlib import Path; from flashinfer.jit.gemm.cutlass.generate_kernels import generate_gemm_operations; generate_gemm_operations(Path(r'${PIE_FLASHINFER_MOE_GEN_DIR}'), '${PIE_FLASHINFER_MOE_ARCH_NUMBER};${PIE_FLASHINFER_MOE_ARCH_NUMBER}-real')"
+  RESULT_VARIABLE PIE_FLASHINFER_MOE_GEN_RESULT)
+if(NOT PIE_FLASHINFER_MOE_GEN_RESULT EQUAL 0)
+  message(FATAL_ERROR "Failed to generate FlashInfer CUTLASS MoE launchers")
+endif()
+file(GLOB PIE_FLASHINFER_MOE_GENERATED_SOURCES CONFIGURE_DEPENDS
+  "${PIE_FLASHINFER_MOE_GEN_DIR}/gemm_grouped/80/*.generated.cu")
+list(LENGTH PIE_FLASHINFER_MOE_GENERATED_SOURCES PIE_FLASHINFER_MOE_GENERATED_COUNT)
+message(STATUS "Using ${PIE_FLASHINFER_MOE_GENERATED_COUNT} FlashInfer generated MoE launchers")
+
+# FlashInfer/TensorRT-LLM CUTLASS MoE runner. Keep this isolated from the
+# regular driver TUs because the dependency slice is large and should remain a
+# clear opt-in boundary for Nemotron experimentation.
+add_library(pie_flashinfer_cutlass_moe OBJECT
+  src/ops/flashinfer_moe.cu
+  ${flashinfer_SOURCE_DIR}/csrc/nv_internal/cpp/common/envUtils.cpp
+  ${flashinfer_SOURCE_DIR}/csrc/nv_internal/cpp/common/logger.cpp
+  ${flashinfer_SOURCE_DIR}/csrc/nv_internal/cpp/common/stringUtils.cpp
+  ${flashinfer_SOURCE_DIR}/csrc/nv_internal/cpp/common/tllmException.cpp
+  ${flashinfer_SOURCE_DIR}/csrc/nv_internal/cpp/common/memoryUtils.cu
+  ${flashinfer_SOURCE_DIR}/csrc/nv_internal/tensorrt_llm/kernels/preQuantScaleKernel.cu
+  ${flashinfer_SOURCE_DIR}/csrc/nv_internal/tensorrt_llm/kernels/cutlass_kernels/cutlass_heuristic.cpp
+  ${flashinfer_SOURCE_DIR}/csrc/nv_internal/tensorrt_llm/kernels/cutlass_kernels/moe_gemm/moe_gemm_tma_warp_specialized_input.cu
+  ${flashinfer_SOURCE_DIR}/csrc/nv_internal/tensorrt_llm/kernels/cutlass_kernels/moe_gemm/moe_gemm_kernels_bf16_bf16.cu
+  ${flashinfer_SOURCE_DIR}/csrc/nv_internal/tensorrt_llm/kernels/cutlass_kernels/fp8_blockscale_gemm/fp8_blockscale_gemm.cu
+  ${flashinfer_SOURCE_DIR}/csrc/nv_internal/tensorrt_llm/kernels/lora/lora.cpp
+  ${PIE_FLASHINFER_MOE_GENERATED_SOURCES})
+target_include_directories(pie_flashinfer_cutlass_moe PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/src
+  ${CUDAToolkit_INCLUDE_DIRS}
+  ${flashinfer_SOURCE_DIR}/include
+  ${flashinfer_SOURCE_DIR}/csrc
+  ${flashinfer_SOURCE_DIR}/csrc/fused_moe/cutlass_backend
+  ${flashinfer_SOURCE_DIR}/csrc/nv_internal
+  ${flashinfer_SOURCE_DIR}/csrc/nv_internal/include
+  ${flashinfer_SOURCE_DIR}/csrc/nv_internal/tensorrt_llm/cutlass_extensions/include
+  ${flashinfer_SOURCE_DIR}/csrc/nv_internal/tensorrt_llm/kernels/cutlass_kernels/include
+  ${flashinfer_SOURCE_DIR}/csrc/nv_internal/tensorrt_llm/kernels/cutlass_kernels
+  ${flashinfer_SOURCE_DIR}/csrc/nv_internal/tensorrt_llm/kernels/cutlass_kernels/moe_gemm
+  ${flashinfer_SOURCE_DIR}/csrc/nv_internal/tensorrt_llm/kernels/cutlass_kernels/fp8_blockscale_gemm
+  ${PIE_FLASHINFER_MOE_GEN_DIR}
+  ${flashinfer_SOURCE_DIR}/3rdparty/cutlass/include
+  ${flashinfer_SOURCE_DIR}/3rdparty/cutlass/tools/util/include
+  ${flashinfer_SOURCE_DIR}/3rdparty/spdlog/include)
+target_compile_definitions(pie_flashinfer_cutlass_moe PRIVATE
+  ENABLE_BF16=1
+  ENABLE_FP8=1
+  USING_OSS_CUTLASS_MOE_GEMM=1)
+target_compile_options(pie_flashinfer_cutlass_moe PRIVATE
+  $<$<COMPILE_LANGUAGE:CUDA>:
+    --extended-lambda
+    --expt-relaxed-constexpr
+  >)
+set_target_properties(pie_flashinfer_cutlass_moe PROPERTIES
+  POSITION_INDEPENDENT_CODE ON)
+target_sources(pie_driver_cuda_lib PRIVATE
+  $<TARGET_OBJECTS:pie_flashinfer_cutlass_moe>)
 
 # ── Marlin (W4A16 / MXFP4 GEMM via vendored vLLM kernel) ──────────────
 # Built by default because GPT-OSS MXFP4 auto policy should use native

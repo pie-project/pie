@@ -29,7 +29,7 @@ CustomAllReduce::~CustomAllReduce() = default;
 CustomAllReduce::CustomAllReduce(CustomAllReduce&& o) noexcept
     : rank_(o.rank_),
       world_size_(o.world_size_),
-      full_nvlink_(o.full_nvlink_),
+      fully_connected_(o.fully_connected_),
       same_process_(o.same_process_),
       max_bytes_(o.max_bytes_),
       signal_self_(o.signal_self_),
@@ -91,6 +91,19 @@ void CustomAllReduce::all_reduce_residual_rmsnorm_bf16(
     cudaStream_t) {
     throw std::runtime_error(
         "custom_all_reduce: fused residual RMSNorm is unavailable");
+}
+
+void CustomAllReduce::all_reduce_residual_rmsnorm_bf16_exact(
+    const void*,
+    void*,
+    const void*,
+    void*,
+    int,
+    int,
+    float,
+    cudaStream_t) {
+    throw std::runtime_error(
+        "custom_all_reduce: exact fused residual RMSNorm is unavailable");
 }
 
 }  // namespace pie_cuda_driver

@@ -110,7 +110,10 @@ class AsyncTokenArray:
 
 
 def host_tokens(token_tensor: torch.Tensor):
-    if ASYNC_TOKEN_COPY and token_tensor.is_cuda:
+    # For the latency path (one sampled token), the extra stream/event handoff
+    # costs more than it can overlap. Keep the pinned async path for batched
+    # responses where the copy can hide behind response bookkeeping.
+    if ASYNC_TOKEN_COPY and token_tensor.is_cuda and token_tensor.numel() > 1:
         device_index = token_tensor.device.index
         if device_index is None:
             device_index = torch.cuda.current_device()

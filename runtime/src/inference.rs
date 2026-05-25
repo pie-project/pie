@@ -36,9 +36,12 @@ pub use speculator::{
 use speculator::StagedBatchMap;
 
 pub(crate) fn should_use_pass_speculation(driver_idx: usize) -> bool {
-    let pinned = crate::context::pinned_count(driver_idx);
-    let (active, cached_pinned) = crate::context::resident_count(driver_idx);
-    pinned.max(active.saturating_add(cached_pinned)) > 1
+    // The chain extender is already gated by scheduler.speculation_depth and
+    // request shape. If a staged entry exists, claim it even for a single
+    // resident context; otherwise the API path pays pin/actor overhead and
+    // the pre-fired chain only gets discovered later inside InferenceService.
+    let _ = driver_idx;
+    true
 }
 
 /// Aggregated inference stats for a single model (across all drivers).

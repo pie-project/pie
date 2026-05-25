@@ -37,4 +37,36 @@ void launch_apply_per_expert_scale_bf16(
     int N, int K,
     cudaStream_t stream);
 
+// Nemotron-H router:
+//   p = sigmoid(logits)
+//   choice = p + correction_bias
+//   topk_idx = topk(choice, K)
+//   topk_w = p[topk_idx], optionally renormalized, then multiplied by
+//            routed_scaling_factor.
+//
+// This covers the published Nano-Omni config where n_group=topk_group=1.
+void launch_topk_sigmoid_bias_bf16(
+    const void* logits,                  // [N, num_experts] bf16
+    const float* correction_bias,        // [num_experts] fp32
+    std::int32_t* topk_idx,              // [N, K]
+    float* topk_w,                       // [N, K]
+    int N,
+    int num_experts,
+    int K,
+    bool normalize,
+    float routed_scaling_factor,
+    cudaStream_t stream);
+
+void launch_topk_sigmoid_bias_fp32(
+    const float* logits,                 // [N, num_experts] fp32
+    const float* correction_bias,        // [num_experts] fp32
+    std::int32_t* topk_idx,              // [N, K]
+    float* topk_w,                       // [N, K]
+    int N,
+    int num_experts,
+    int K,
+    bool normalize,
+    float routed_scaling_factor,
+    cudaStream_t stream);
+
 }  // namespace pie_cuda_driver::kernels

@@ -9,6 +9,7 @@
 // → output column-major [N, M] which is the same memory as row-major [M, N].
 
 #include <cstddef>
+#include <cstdint>
 #include <cublas_v2.h>
 #include <cuda_runtime.h>
 #include <memory>
@@ -182,6 +183,20 @@ void gemm_batched_act_x_w(
     DType w_dtype = DType::BF16,
     DType y_dtype = DType::BF16);
 
+// Grouped variant for sparse-MoE expert buckets. Each group has one GEMM
+// with a shared output width `N` and reduction dim `K`, but its own row count
+// `M_array[group]`.
+void gemm_grouped_act_x_wt_bf16(
+    cublasHandle_t handle,
+    const void* const* act_ptrs_host,
+    const void* const* W_ptrs_host,
+    void* const*       y_ptrs_host,
+    const int*         M_array_host,
+    int group_count,
+    int N,
+    int K,
+    float beta = 0.f);
+
 // ── Legacy bf16-only entry points ─────────────────────────────────────
 // Thin wrappers around the dispatchers above. Kept as the primary entry
 // point for archs whose forward functions haven't been migrated to
@@ -198,6 +213,18 @@ inline void gemm_act_x_wt_bf16(
     gemm_act_x_w(handle, act, WeightView::raw(W, DType::BF16),
                  y, M, N, K, beta);
 }
+
+// Same storage convention as `gemm_act_x_wt_bf16`, but materialises the
+// output as fp32. Used by routers that are specified to compute logits in
+// fp32 before top-k selection.
+void gemm_act_x_wt_bf16_out_fp32(
+    cublasHandle_t handle,
+    const void* act,
+    const void* W,
+    float* y,
+    int M,
+    int N,
+    int K);
 
 inline void gemm_batched_act_x_wt_bf16(
     cublasHandle_t handle,

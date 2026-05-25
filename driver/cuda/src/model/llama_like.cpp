@@ -155,6 +155,7 @@ void prepare_llama_like_decode_plan(
         return;
     }
     if (fwd_cfg.force_prefill_path) {
+        state.use_prefill_plan = false;
         state.use_prefill_decode_plan = false;
         return;
     }

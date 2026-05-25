@@ -247,6 +247,33 @@ void launch_chunked_geglu_tanh_bf16(
 
 namespace {
 
+__global__ void relu2_bf16_kernel(
+    const __nv_bfloat16* __restrict__ x,
+    __nv_bfloat16* __restrict__ y,
+    int n)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const float v = fmaxf(__bfloat162float(x[i]), 0.f);
+    y[i] = __float2bfloat16(v * v);
+}
+
+}  // namespace
+
+void launch_relu2_bf16(
+    const void* x, void* y, int num_elements, cudaStream_t stream)
+{
+    if (num_elements <= 0) return;
+    constexpr int BLOCK = 256;
+    const int grid = (num_elements + BLOCK - 1) / BLOCK;
+    relu2_bf16_kernel<<<grid, BLOCK, 0, stream>>>(
+        static_cast<const __nv_bfloat16*>(x),
+        static_cast<__nv_bfloat16*>(y),
+        num_elements);
+}
+
+namespace {
+
 __global__ void sigmoid_scalar_gate_inplace_bf16_kernel(
     __nv_bfloat16* __restrict__ x,
     const __nv_bfloat16* __restrict__ scalar_gate,

@@ -41,6 +41,7 @@ class LatencyStats:
     step_count: int = 0
     profile_enabled: bool = bool(os.environ.get("PIE_VLLM_PROFILE"))
     profile_interval: int = int(os.environ.get("PIE_VLLM_PROFILE_INTERVAL", "256"))
+    profile_each: bool = bool(os.environ.get("PIE_VLLM_PROFILE_EACH"))
     _sums: dict[str, float] | None = None
 
     def record_span(self, timing: StepTiming, traceparent: str | None = None):
@@ -71,6 +72,8 @@ class LatencyStats:
                 base.update({f"driver_{k}": v for k, v in timing.driver_profile.items()})
             if timing.response_profile:
                 base.update({f"response_{k}": v for k, v in timing.response_profile.items()})
+            if self.profile_each:
+                self._print_profile_values(base, prefix=f"[pie-vllm-step] step={self.step_count}")
             for k, v in base.items():
                 self._sums[k] = self._sums.get(k, 0.0) + float(v)
             if self.step_count % self.profile_interval == 0:
@@ -103,10 +106,14 @@ class LatencyStats:
         if not self._sums or self.step_count == 0:
             return
         n = self.step_count
-        keys = sorted(self._sums)
+        values = {k: v / n for k, v in self._sums.items()}
+        self._print_profile_values(values, prefix=f"[pie-vllm-profile] steps={n}")
+
+    def _print_profile_values(self, values: dict[str, float], *, prefix: str) -> None:
+        keys = sorted(values)
         parts = []
         for k in keys:
-            avg = self._sums[k] / n
+            avg = values[k]
             if k.endswith("_ratio"):
                 parts.append(f"{k}={avg * 100.0:.1f}%")
             elif k.endswith("_bytes"):
@@ -124,4 +131,4 @@ class LatencyStats:
                 parts.append(f"{k}={avg:.1f}")
             else:
                 parts.append(f"{k}={avg * 1000.0:.3f}ms")
-        print(f"[pie-vllm-profile] steps={n} " + " ".join(parts), flush=True)
+        print(f"{prefix} " + " ".join(parts), flush=True)

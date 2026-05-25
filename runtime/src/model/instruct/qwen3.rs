@@ -122,6 +122,7 @@ static TEMPLATE: &str = r#"
 pub struct ChatMLConfig {
     pub has_thinking: bool,
     pub has_tools: bool,
+    pub generation_suffix: &'static str,
     /// Stop token strings (vary per sub-architecture)
     pub stop_tokens: &'static [&'static str],
 }
@@ -180,11 +181,14 @@ impl QwenInstruct {
         let mut tool_resp_suffix = newline.clone();
         tool_resp_suffix.extend(encode("</tool_response>"));
 
+        let mut generation_header = make_prefix("assistant");
+        generation_header.extend(encode(config.generation_suffix));
+
         Self {
             system_prefix: make_prefix("system"),
             user_prefix: make_prefix("user"),
             assistant_prefix: make_prefix("assistant"),
-            generation_header: make_prefix("assistant"),
+            generation_header,
             turn_suffix,
             stop_ids,
             think_prefix_ids: think_prefix,
@@ -462,6 +466,7 @@ mod tests {
             ChatMLConfig {
                 has_thinking: true,
                 has_tools: true,
+                generation_suffix: "",
                 stop_tokens: &["<|im_end|>", "<|endoftext|>"],
             },
         )
@@ -473,6 +478,7 @@ mod tests {
             ChatMLConfig {
                 has_thinking: false,
                 has_tools: true,
+                generation_suffix: "",
                 stop_tokens: &["<|im_end|>", "<|endoftext|>"],
             },
         )
@@ -484,6 +490,7 @@ mod tests {
             ChatMLConfig {
                 has_thinking: true,
                 has_tools: false,
+                generation_suffix: "",
                 stop_tokens: &["<|im_end|>"],
             },
         )
@@ -630,6 +637,7 @@ mod tests {
             ChatMLConfig {
                 has_thinking: true,
                 has_tools: true,
+                generation_suffix: "",
                 stop_tokens: &["<|im_end|>", "<|endoftext|>"],
             },
         );

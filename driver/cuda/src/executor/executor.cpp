@@ -588,6 +588,17 @@ std::size_t capture_forward_graph_lattice(Executor& executor) {
     if (executor.graph_cache == nullptr) return 0;
     if (!executor.forward_fn.graph_safe || !executor.forward_fn.body) return 0;
     if (!executor.forward_fn.prepare) return 0;
+    if (executor.loaded_model.hf_config().model_type == "nemotron_h") {
+        // Nemotron-H has recurrent Mamba state in addition to attention state.
+        // Synthetic upfront capture replays incorrectly; first-use capture with
+        // real slot/page metadata is correct, so leave the cache cold here.
+        return 0;
+    }
+    const char* disable_upfront = std::getenv("PIE_CUDA_DISABLE_UPFRONT_GRAPHS");
+    if (disable_upfront != nullptr && disable_upfront[0] != '\0' &&
+        disable_upfront[0] != '0') {
+        return 0;
+    }
     const int max_requests =
         std::min(executor.max_forward_requests, executor.max_workspace_tokens);
     if (max_requests <= 0) return 0;
@@ -841,9 +852,22 @@ void handle_fire_batch(
             if (h_qo[r + 1] - h_qo[r] != 1u) is_pure_decode = false;
         }
 
+        const auto rs_slot_view = view.rs_slot_ids.as<std::uint32_t>();
+        const auto rs_flag_view = view.rs_slot_flags.as<std::uint8_t>();
+        bool use_slots =
+            R > 0 && rs_slot_view.size() == static_cast<std::size_t>(R);
+        if (executor.rs_cache != nullptr && R > 0 && !use_slots) {
+            throw std::runtime_error(
+                "rs_cache forward missing runtime-assigned slot ids");
+        }
+        const bool has_fresh_slot =
+            use_slots && std::any_of(
+                rs_flag_view.begin(), rs_flag_view.end(),
+                [](std::uint8_t v) { return (v & 1u) != 0; });
+
         bool graph_shape_ok =
             executor.graph_cache != nullptr && is_pure_decode &&
-            forward_fn.graph_safe;
+            forward_fn.graph_safe && !has_fresh_slot;
         int graph_requests = R;
         if (graph_shape_ok) {
             const int bucket =
@@ -853,6 +877,8 @@ void handle_fire_batch(
             const bool can_pad =
                 bucket > R &&
                 graph_pad_page >= 0 &&
+                (executor.rs_cache == nullptr ||
+                 executor.graph_pad_slot >= 0) &&
                 bucket <= max_workspace_tokens &&
                 pad <= page_size &&
                 kvpi_view.size() + static_cast<std::size_t>(pad) <=
@@ -917,17 +943,10 @@ void handle_fire_batch(
         // RS-capable models must receive one slot id per request.
         std::vector<std::int32_t> slot_ids_h;
         std::vector<std::uint8_t> is_fresh_h;
-        const auto rs_slot_view = view.rs_slot_ids.as<std::uint32_t>();
-        const auto rs_flag_view = view.rs_slot_flags.as<std::uint8_t>();
-        bool use_slots =
-            R > 0 && rs_slot_view.size() == static_cast<std::size_t>(R);
-        if (executor.rs_cache != nullptr && R > 0 && !use_slots) {
-            throw std::runtime_error(
-                "rs_cache forward missing runtime-assigned slot ids");
-        }
         if (use_slots) {
-            slot_ids_h.resize(R);
-            is_fresh_h.resize(R);
+            const int slot_count = graph_shape_ok ? forward_R : R;
+            slot_ids_h.resize(slot_count);
+            is_fresh_h.resize(slot_count);
             for (int r = 0; r < R; ++r) {
                 slot_ids_h[r] = static_cast<std::int32_t>(rs_slot_view[r]);
                 is_fresh_h[r] = (r < static_cast<int>(rs_flag_view.size()) &&
@@ -935,13 +954,12 @@ void handle_fire_batch(
                                     ? 1u
                                     : 0u;
             }
+            for (int r = R; r < slot_count; ++r) {
+                slot_ids_h[r] = executor.graph_pad_slot;
+                is_fresh_h[r] = 0u;
+            }
             pi.slot_ids.copy_from_host(std::span<const std::int32_t>(slot_ids_h));
             pi.is_fresh.copy_from_host(std::span<const std::uint8_t>(is_fresh_h));
-            if (graph_shape_ok &&
-                std::any_of(is_fresh_h.begin(), is_fresh_h.end(),
-                            [](std::uint8_t v) { return v != 0; })) {
-                graph_shape_ok = false;
-            }
         }
 
         // ── Sample-plan construction (hoisted) ──────────────────

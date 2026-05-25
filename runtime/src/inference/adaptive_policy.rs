@@ -75,15 +75,30 @@ use super::scheduler::{Decision, SchedulingPolicy};
 
 const PREFILL_COHORT_TARGET: usize = 32;
 
-fn prefill_cohort_grace() -> Duration {
-    static GRACE_MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    Duration::from_millis(*GRACE_MS.get_or_init(|| {
+fn prefill_cohort_grace(current_forward_requests: usize) -> Duration {
+    static BASE_GRACE_MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    static LARGE_GRACE_MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    let base = *BASE_GRACE_MS.get_or_init(|| {
         std::env::var("PIE_PREFILL_COHORT_GRACE_MS")
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
             .filter(|v| *v > 0)
             .unwrap_or(16)
-    }))
+    });
+    let large = *LARGE_GRACE_MS.get_or_init(|| {
+        std::env::var("PIE_PREFILL_LARGE_COHORT_GRACE_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or(64)
+            .max(base)
+    });
+    let ms = if current_forward_requests >= PREFILL_COHORT_TARGET {
+        large
+    } else {
+        base
+    };
+    Duration::from_millis(ms)
 }
 
 fn dense_cohort_wait_multiplier() -> f64 {
@@ -297,7 +312,7 @@ impl SchedulingPolicy for AdaptivePolicy {
             return Decision::Fire;
         };
         if prefill_cohort && current_forward_requests < self.max_forward_requests {
-            let grace = prefill_cohort_grace();
+            let grace = prefill_cohort_grace(current_forward_requests);
             let elapsed = start.elapsed();
             if elapsed < grace {
                 return Decision::Wait(grace - elapsed);
@@ -321,7 +336,8 @@ impl SchedulingPolicy for AdaptivePolicy {
         // (5) Safety bound — never wait longer than one previous
         //     batch's compute time.
         let wait_bound = if prefill_cohort {
-            self.last_latency.max(prefill_cohort_grace().as_secs_f64())
+            self.last_latency
+                .max(prefill_cohort_grace(current_forward_requests).as_secs_f64())
         } else if dense_resident_cohort {
             self.last_latency * dense_cohort_wait_multiplier()
         } else {

@@ -158,6 +158,10 @@ struct Executor {
     // This page is not reported in DriverCapabilities.total_pages, so the
     // runtime never assigns it to a context.
     int graph_pad_page = -1;
+    // Private recurrent-state slot used only for CUDA-graph padding rows.
+    // Like graph_pad_page, it is allocated in CUDA storage but hidden from
+    // runtime capabilities.
+    int graph_pad_slot = -1;
     // Pre-allocated input buffers — refreshed per fire via memcpy
     // rather than re-allocated. See `persistent_inputs.hpp`.
     PersistentInputs& inputs;

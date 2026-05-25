@@ -12,6 +12,9 @@ inline const nlohmann::json& text_config_view(const nlohmann::json& root) {
     if (root.contains("text_config") && root["text_config"].is_object()) {
         return root["text_config"];
     }
+    if (root.contains("llm_config") && root["llm_config"].is_object()) {
+        return root["llm_config"];
+    }
     return root;
 }
 

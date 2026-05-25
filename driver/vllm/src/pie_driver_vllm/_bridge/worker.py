@@ -338,12 +338,16 @@ def _leader_loop(
     and adapter-load handlers. All transport flows through the same
     `DriverChannel` — there is no separate cold-path RPC.
     """
+    import os
     import time
     from .batching import Batch
     from .latency import StepTiming, LatencyStats
 
     config = engine.config
     latency_stats = LatencyStats(enabled=config.telemetry_enabled)
+    broadcast_step_kwargs = os.environ.get(
+        "PIE_VLLM_BROADCAST_STEP_KWARGS", "1",
+    ).lower() not in {"0", "false", "no", "off"}
 
     # Some runtime configs carry the resolved page size directly. Fall back
     # to the engine's capability handshake (which every driver implements)
@@ -392,22 +396,19 @@ def _leader_loop(
         t0 = time.perf_counter()
         should_broadcast = config.world_size > 1 and config.rank == 0
         if should_broadcast:
-            runtime_ops.broadcast_struct(
-                {
+            if broadcast_step_kwargs:
+                msg = {"type": "STEP_KWARGS", "kwargs": kwargs}
+            else:
+                msg = {
                     "type": "STEP",
                     "inputs": inputs,
                     "sampling_metadata": sampling_metadata,
-                },
-                src=0,
-                device=device,
-            )
+                }
+            runtime_ops.broadcast_struct(msg, src=0, device=device)
         t_broadcast = time.perf_counter() - t0
 
-        if config.world_size > 1:
-            runtime_ops.barrier()
-
         t0 = time.perf_counter()
-        sampling_results = engine.fire_batch(inputs, sampling_metadata)
+        sampling_results = engine.fire_batch(inputs, sampling_metadata, batch)
         t_inference = time.perf_counter() - t0
         driver_profile = getattr(engine, "_last_fire_profile", None)
 
@@ -692,8 +693,18 @@ def _follower_loop(
     inference steps or adapter operations.
     """
     import signal
+    from .batching import Batch
 
     device = config.device
+    _kv_page_size = getattr(config, "kv_page_size", None)
+    if _kv_page_size is None:
+        _kv_page_size = engine.capabilities().kv_page_size
+    _max_dist_size = getattr(config, "max_dist_size", 32)
+    _vocab_size = getattr(
+        engine.model_config,
+        "num_vocabs",
+        getattr(engine.model_config, "vocab_size", 128000),
+    )
 
     shutdown_requested = False
 
@@ -725,11 +736,22 @@ def _follower_loop(
                 inputs = msg["inputs"]
                 sampling_metadata = msg["sampling_metadata"]
                 try:
-                    # TP barrier — default PG is the TP group post-init.
-                    if config.world_size > 1:
-                        runtime_ops.barrier()
-
                     engine.fire_batch(inputs, sampling_metadata)
+                except Exception as e:
+                    print(f"Worker {config.rank} fire_batch error: {e}")
+
+            elif msg_type == "STEP_KWARGS":
+                try:
+                    batch = Batch(
+                        msg["kwargs"],
+                        _kv_page_size,
+                        _max_dist_size,
+                        engine.adapters,
+                        vocab_size=_vocab_size,
+                    )
+                    inputs = engine.build_model_inputs(batch)
+                    sampling_metadata = engine.build_sampling_metadata(batch)
+                    engine.fire_batch(inputs, sampling_metadata, batch)
                 except Exception as e:
                     print(f"Worker {config.rank} fire_batch error: {e}")
 

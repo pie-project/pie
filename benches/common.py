@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
+import ctypes
 import json
 import math
 import os
@@ -15,6 +17,40 @@ from typing import Any
 ROOT = Path(__file__).resolve().parent.parent
 BENCH_SYSTEM = "You are a helpful benchmarking assistant."
 BENCH_PROMPT = "Write a short story about a robot."
+
+
+def _load_cudart():
+    for name in (
+        "libcudart.so",
+        "libcudart.so.12",
+        "libcudart.so.11.0",
+    ):
+        with contextlib.suppress(OSError):
+            return ctypes.CDLL(name)
+    return None
+
+
+@contextlib.contextmanager
+def cuda_profiler_range(enabled: bool):
+    if not enabled:
+        yield
+        return
+    cudart = _load_cudart()
+    if cudart is None:
+        raise RuntimeError("CUDA profiler range requested, but libcudart was not found")
+    start = cudart.cudaProfilerStart
+    stop = cudart.cudaProfilerStop
+    start.restype = ctypes.c_int
+    stop.restype = ctypes.c_int
+    rc = int(start())
+    if rc != 0:
+        raise RuntimeError(f"cudaProfilerStart failed with CUDA error {rc}")
+    try:
+        yield
+    finally:
+        rc = int(stop())
+        if rc != 0:
+            raise RuntimeError(f"cudaProfilerStop failed with CUDA error {rc}")
 
 
 @dataclass
@@ -216,6 +252,12 @@ def add_common_args(p: argparse.ArgumentParser) -> None:
         help="Override max_tokens only for warmup requests.",
     )
     p.add_argument("--json-out", default=None)
+    p.add_argument(
+        "--cuda-profiler-range",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Bracket only the timed generation window with cudaProfilerStart/Stop.",
+    )
     p.add_argument("--request-timeout", type=float, default=300.0)
     p.add_argument("--tp-size", type=int, default=1)
     p.add_argument(
@@ -249,11 +291,17 @@ def make_prompts(args: argparse.Namespace, n: int) -> list[str]:
 
 
 def hf_chat_prompts_and_counts(
-    model: str, system: str, prompts: list[str]
+    model: str,
+    system: str,
+    prompts: list[str],
+    *,
+    trust_remote_code: bool = False,
 ) -> tuple[list[str], list[int]]:
     from transformers import AutoTokenizer
 
-    tok = AutoTokenizer.from_pretrained(model)
+    tok = AutoTokenizer.from_pretrained(
+        model, trust_remote_code=trust_remote_code
+    )
     rendered = [
         tok.apply_chat_template(
             [{"role": "system", "content": system}, {"role": "user", "content": p}],
@@ -267,10 +315,17 @@ def hf_chat_prompts_and_counts(
 
 
 def hf_chat_token_ids_and_counts(
-    model: str, system: str, prompts: list[str]
+    model: str,
+    system: str,
+    prompts: list[str],
+    *,
+    trust_remote_code: bool = False,
 ) -> tuple[list[list[int]], list[int]]:
     from transformers import AutoTokenizer
-    tok = AutoTokenizer.from_pretrained(model, trust_remote_code=True)
+
+    tok = AutoTokenizer.from_pretrained(
+        model, trust_remote_code=trust_remote_code
+    )
     rendered = [
         tok.apply_chat_template(
             [{"role": "system", "content": system}, {"role": "user", "content": p}],

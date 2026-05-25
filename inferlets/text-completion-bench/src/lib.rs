@@ -89,6 +89,8 @@ struct Output {
     /// Decoded text — for spot-checking output quality.
     text: String,
     #[serde(skip_serializing_if = "Vec::is_empty")]
+    token_ids: Vec<u32>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     request_prompt_tokens: Vec<usize>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     request_output_tokens: Vec<usize>,
@@ -162,6 +164,7 @@ async fn main(input: Input) -> Result<Output> {
             num_prompt_tokens: request_prompt_tokens.iter().sum(),
             num_output_tokens: request_output_tokens.iter().sum(),
             text,
+            token_ids: first_tokens,
             request_prompt_tokens,
             request_output_tokens,
         });
@@ -186,6 +189,7 @@ async fn main(input: Input) -> Result<Output> {
         num_prompt_tokens: result.num_prompt_tokens,
         num_output_tokens: result.num_output_tokens,
         text,
+        token_ids: result.tokens,
         request_prompt_tokens: Vec::new(),
         request_output_tokens: Vec::new(),
     })
@@ -233,8 +237,9 @@ async fn run_one(
 
     if !input.return_text && stop_tokens.is_empty() && input.wasm_delay_us == 0 {
         let mut num_output_tokens = 0usize;
-        while g.next_token().await?.is_some() {
-            num_output_tokens += 1;
+        while let Some(step) = g.next()? {
+            let out = step.execute().await?;
+            num_output_tokens += out.tokens.len();
         }
         return Ok(RunResult {
             num_prompt_tokens,

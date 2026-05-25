@@ -10,6 +10,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
+import os
+import sys
 import torch
 import torch.distributed as dist
 
@@ -91,7 +93,11 @@ def _build_vllm_config(config: RuntimeConfig, driver_config) -> Any:
         dtype=config.activation_dtype,
         tensor_parallel_size=config.tensor_parallel_size,
         seed=config.random_seed,
-        skip_tokenizer_init=True,        # pie owns tokenization
+        # Pie still owns request tokenization, but some vLLM model classes
+        # need a tokenizer during construction to pre-tokenize multimodal
+        # sentinels (e.g. Nemotron-H Nano Omni). Keep this aligned with
+        # standalone vLLM and pass token IDs at runtime as before.
+        skip_tokenizer_init=False,
         download_dir=config.cache_dir,
     )
 
@@ -104,6 +110,8 @@ def _build_vllm_config(config: RuntimeConfig, driver_config) -> Any:
         "spec_ngram_num_drafts",
         "spec_ngram_min_n",
         "spec_ngram_max_n",
+        "text_only_mm",
+        "decode_lookahead_tokens",
     }
     for k, v in asdict(driver_config).items():
         if k in _PIE_ONLY_KEYS:
@@ -111,10 +119,21 @@ def _build_vllm_config(config: RuntimeConfig, driver_config) -> Any:
         if v is not None:
             engine_kwargs[k] = v
 
+    if getattr(driver_config, "text_only_mm", False):
+        engine_kwargs["limit_mm_per_prompt"] = {
+            "image": 0,
+            "video": 0,
+            "audio": 0,
+        }
+
     system_topology = configure_distributed_environment(
         int(engine_kwargs["tensor_parallel_size"]), config.devices
     )
-    if system_topology and "disable_custom_all_reduce" not in engine_kwargs:
+    if (
+        system_topology
+        and "disable_custom_all_reduce" not in engine_kwargs
+        and os.environ.get("PIE_VLLM_DISABLE_CUSTOM_AR_ON_SYSTEM")
+    ):
         engine_kwargs["disable_custom_all_reduce"] = True
     # When piggybacking on vllm's CUDA-graph dispatch, vllm bakes a fixed
     # `compile_ranges` into the piecewise backend at load time and asserts at
@@ -131,13 +150,15 @@ def _build_vllm_config(config: RuntimeConfig, driver_config) -> Any:
     vllm_config = args.create_engine_config()
     vllm_config.parallel_config.rank = config.rank
 
-    if system_topology and not engine_kwargs.get("enforce_eager", False):
+    if (
+        system_topology
+        and not engine_kwargs.get("enforce_eager", False)
+        and os.environ.get("PIE_VLLM_DISABLE_CUDAGRAPH_ON_SYSTEM")
+    ):
         from ._vllm_compat import CUDAGraphMode
 
-        # Keep torch.compile enabled, but avoid Pie's manual CUDA graph
-        # capture on SYS-level TP pairs. That capture path can wedge NCCL
-        # collectives after P2P is disabled; the compiled non-graph path
-        # remains safe and avoids falling all the way back to eager.
+        # Keep torch.compile enabled, but allow an explicit escape hatch for
+        # SYS-level TP pairs if CUDA graph capture wedges NCCL collectives.
         vllm_config.compilation_config.cudagraph_mode = CUDAGraphMode.NONE
         vllm_config.compilation_config.cudagraph_capture_sizes = []
         vllm_config.compilation_config.max_cudagraph_capture_size = None
@@ -145,14 +166,13 @@ def _build_vllm_config(config: RuntimeConfig, driver_config) -> Any:
     # Pie launches each DP replica as an independent single-rank subprocess.
     # vLLM names those compile-cache leaves `rank_0_0` in every replica, so
     # two DP replicas on different CUDA devices can otherwise reuse the same
-    # TorchInductor/static-launcher artifacts. Keep compile + CUDA graphs on,
-    # but isolate the cache per process/device.
+    # TorchInductor/static-launcher artifacts. Keep TP-only runs on vLLM's
+    # normal cache path so they can reuse warmed standalone compile artifacts.
     if (
         not engine_kwargs.get("enforce_eager", False)
         and not vllm_config.compilation_config.cache_dir
+        and config.num_groups > 1
     ):
-        import os
-
         safe_device = config.device.replace(":", "_")
         vllm_config.compilation_config.cache_dir = (
             f"/tmp/pie_vllm_compile_cache/pid_{os.getpid()}_{safe_device}"
@@ -175,10 +195,20 @@ def _ensure_vllm_distributed(vllm_config: Any, rank: int, local_rank: int) -> No
     groups that model layers consult during construction.
     """
     import tempfile, datetime
+    import os
+    import sys
     from ._vllm_compat import (
         ensure_model_parallel_initialized,
         init_distributed_environment,
     )
+
+    def _debug_stage(msg: str) -> None:
+        if os.environ.get("PIE_VLLM_DEBUG_LOAD"):
+            print(
+                f"[pie-vllm-load rank={rank}] ensure: {msg}",
+                file=sys.stderr,
+                flush=True,
+            )
 
     parallel_config = vllm_config.parallel_config
 
@@ -188,15 +218,18 @@ def _ensure_vllm_distributed(vllm_config: Any, rank: int, local_rank: int) -> No
     # TP communicator still builds vLLM's custom all-reduce path.
     from vllm.distributed.parallel_state import set_custom_all_reduce
 
+    _debug_stage("set_custom_all_reduce: begin")
     set_custom_all_reduce(not parallel_config.disable_custom_all_reduce)
+    _debug_stage("set_custom_all_reduce: done")
 
-    if not dist.is_initialized():
+    if not dist.is_initialized() and parallel_config.world_size == 1:
         # Single-rank fallback. FileStore avoids picking a port (no contention).
         store_path = tempfile.mktemp(prefix="pie_vllm_singlerank_")
         store = dist.FileStore(store_path, parallel_config.world_size)
         device_id = (
             torch.device(f"cuda:{local_rank}") if torch.cuda.is_available() else None
         )
+        _debug_stage("torch init_process_group: begin")
         dist.init_process_group(
             backend="nccl" if torch.cuda.is_available() else "gloo",
             store=store,
@@ -205,20 +238,36 @@ def _ensure_vllm_distributed(vllm_config: Any, rank: int, local_rank: int) -> No
             timeout=datetime.timedelta(seconds=300),
             device_id=device_id,
         )
+        _debug_stage("torch init_process_group: done")
 
+    _debug_stage("init_distributed_environment: begin")
     init_distributed_environment(
         world_size=parallel_config.world_size,
         rank=rank,
         distributed_init_method="env://",
         local_rank=local_rank,
     )
+    _debug_stage("init_distributed_environment: done")
 
+    _debug_stage("ensure_model_parallel_initialized: begin")
     ensure_model_parallel_initialized(
         parallel_config.tensor_parallel_size,
         parallel_config.pipeline_parallel_size,
         parallel_config.prefill_context_parallel_size,
         parallel_config.decode_context_parallel_size,
     )
+    _debug_stage("ensure_model_parallel_initialized: done")
+
+    # Reuse vLLM's CPU world group for Pie's metadata broadcasts. Creating
+    # an extra Gloo group before vLLM initializes can deadlock group creation
+    # order; assigning this after vLLM setup keeps both systems aligned.
+    try:
+        from vllm.distributed.parallel_state import get_world_group
+        from . import utils as runtime_utils
+
+        runtime_utils._cpu_group = get_world_group().cpu_group
+    except Exception:
+        pass
 
 
 def load_vllm_model(
@@ -232,6 +281,14 @@ def load_vllm_model(
         if log_queue is not None:
             log_queue.put({"message": msg, "level": level})
 
+    def _debug_stage(msg: str) -> None:
+        if os.environ.get("PIE_VLLM_DEBUG_LOAD"):
+            print(
+                f"[pie-vllm-load rank={config.rank}] {msg}",
+                file=sys.stderr,
+                flush=True,
+            )
+
     # Pin the device for this rank — vllm reads current_device() during
     # model construction.
     device_str = config.device
@@ -241,8 +298,25 @@ def load_vllm_model(
     else:
         local_rank = config.rank
 
+    # GPUModelRunner normally initializes this before any MoE forward path.
+    # Pie embeds the model directly, so mirror the hook here; otherwise
+    # vLLM's modular MoE kernels fail on first request with an uninitialized
+    # workspace manager.
+    try:
+        from vllm.v1.worker.workspace import (
+            init_workspace_manager,
+            is_workspace_manager_initialized,
+        )
+
+        if not is_workspace_manager_initialized():
+            init_workspace_manager(torch.device(device_str))
+    except Exception:
+        pass
+
     _log(f"Building VllmConfig for {config.hf_repo}", "DEBUG")
+    _debug_stage("build_vllm_config: begin")
     vllm_config = _build_vllm_config(config, driver_config)
+    _debug_stage("build_vllm_config: done")
 
     # vllm's parallel state and model construction both consult
     # `get_current_vllm_config()` — they must run inside `set_current_vllm_config`.
@@ -250,13 +324,42 @@ def load_vllm_model(
 
     with set_current_vllm_config(vllm_config):
         _log("Bringing up vllm parallel state", "DEBUG")
+        _debug_stage("ensure_vllm_distributed: begin")
         _ensure_vllm_distributed(vllm_config, rank=config.rank, local_rank=local_rank)
+        _debug_stage("ensure_vllm_distributed: done")
 
         _log(f"Loading model weights ({config.hf_repo})", "INFO")
+        _debug_stage("loader.load_model: begin")
         loader = get_model_loader(vllm_config.load_config)
         model = loader.load_model(
             vllm_config=vllm_config,
             model_config=vllm_config.model_config,
+        )
+        if getattr(driver_config, "text_only_mm", False):
+            language_model = getattr(model, "language_model", None)
+            if language_model is not None:
+                _debug_stage(
+                    "loader.load_model: using inner language_model for text-only"
+                )
+                model = language_model
+        _debug_stage("loader.load_model: done")
+
+        # Hybrid attention/Mamba models can only finalize the KV block geometry
+        # after layers resolve their concrete attention backend. Standalone vLLM
+        # runs this platform hook before KV cache initialization; Pie loads the
+        # model directly, so mirror it here before allocate_and_bind_kv_cache()
+        # asks each layer for its cache spec.
+        _debug_stage("update_block_size_for_backend: begin")
+        from vllm.platforms import current_platform
+
+        current_platform.update_block_size_for_backend(vllm_config)
+        vllm_config.validate_block_size()
+        _debug_stage(
+            "update_block_size_for_backend: done "
+            f"block_size={vllm_config.cache_config.block_size} "
+            f"mamba_block_size={vllm_config.cache_config.mamba_block_size} "
+            "mamba_page_size_padded="
+            f"{vllm_config.cache_config.mamba_page_size_padded}"
         )
         _log("Model weights loaded", "INFO")
 
@@ -291,6 +394,7 @@ def load_vllm_model(
     # because it transitively imports `pie_kernels` which JIT-compiles CUDA
     # extensions; that's heavy and irrelevant on the vllm path.)
     snapshot_dir = _resolve_hf_snapshot_dir(config.hf_repo)
+    _debug_stage("resolve_snapshot_dir: done")
     if snapshot_dir is None:
         raise RuntimeError(
             f"Could not resolve a local snapshot dir for {config.hf_repo!r}. "

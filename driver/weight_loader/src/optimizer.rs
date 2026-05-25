@@ -435,6 +435,49 @@ fn normalize_partition(
             decl: decl.clone(),
         }));
     }
+    if let Some(LayoutExpr::Join {
+        inputs,
+        axis: join_axis,
+        ..
+    }) = plan.expr(input)
+        && *join_axis != axis
+    {
+        let mut partitioned = Vec::with_capacity(inputs.len());
+        for input in inputs {
+            let input_decl = plan.decl(*input).ok_or_else(|| {
+                CompileError::InvalidInput(format!("Join input {} has no decl", input.0))
+            })?;
+            let axis_index = axis.0 as usize;
+            if axis_index >= input_decl.shape.len()
+                || input_decl.shape[axis_index] % i64::from(parts) != 0
+            {
+                return Err(CompileError::InvalidInput(format!(
+                    "Partition through Join input {} cannot partition axis {} into {} parts",
+                    input.0, axis.0, parts
+                )));
+            }
+            let normalized_input = normalize_expr(plan, *input, out, memo)?;
+            let mut part_decl = input_decl.clone();
+            part_decl.shape[axis_index] /= i64::from(parts);
+            part_decl.sharding = crate::types::Sharding {
+                axis: Some(axis),
+                world: parts,
+                rank: index,
+            };
+            partitioned.push(out.push(LayoutExpr::Partition {
+                input: normalized_input,
+                axis,
+                parts,
+                index,
+                decl: part_decl,
+            }));
+        }
+        return Ok(out.push(LayoutExpr::Join {
+            inputs: partitioned,
+            axis: *join_axis,
+            decl: decl.clone(),
+        }));
+    }
     let input = normalize_expr(plan, input, out, memo)?;
     Ok(out.push(LayoutExpr::Partition {
         input,

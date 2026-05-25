@@ -46,6 +46,19 @@ public:
         int head_v_dim,
         int max_slots = 1);
 
+    // Same slot/indexing contract as `allocate`, but recurrent slabs are
+    // stored as bf16. Nemotron-H's Mamba2 cache is defined in activation
+    // dtype and would consume too much memory as fp32 at serving request
+    // counts.
+    static Qwen3_5StateCache allocate_bf16_recurrent(
+        const std::vector<bool>& layer_is_linear,
+        int conv_dim,
+        int conv_kernel,
+        int v_heads,
+        int head_k_dim,
+        int head_v_dim,
+        int max_slots = 1);
+
     // Zero the state of every slot of every linear-attention layer.
     // Called at the start of each fresh prefill — no cross-prefill
     // state continuity in this driver's batching model.
@@ -64,6 +77,7 @@ public:
     // legacy single-request callsites compiling unchanged.
     void*  conv_state(int layer, int slot = 0);
     float* recurrent_state(int layer, int slot = 0);
+    void*  recurrent_state_bf16(int layer, int slot = 0);
 
     // Strides in bytes / fp32 elements between consecutive slots.
     std::size_t conv_slot_stride_bytes() const noexcept {
@@ -74,8 +88,10 @@ public:
         return static_cast<std::size_t>(v_heads_) * head_k_dim_ * head_v_dim_;
     }
     std::size_t recurrent_slot_stride_bytes() const noexcept {
-        return recurrent_slot_stride_floats() * sizeof(float);
+        return recurrent_slot_stride_floats() *
+               (recurrent_bf16_ ? sizeof(std::uint16_t) : sizeof(float));
     }
+    bool recurrent_is_bf16() const noexcept { return recurrent_bf16_; }
 
     int num_layers() const noexcept { return static_cast<int>(layer_is_linear_.size()); }
     int max_slots()  const noexcept { return max_slots_; }
@@ -90,10 +106,22 @@ public:
     Qwen3_5StateCache() = default;
 
 private:
+    static Qwen3_5StateCache allocate_impl(
+        const std::vector<bool>& layer_is_linear,
+        int conv_dim,
+        int conv_kernel,
+        int v_heads,
+        int head_k_dim,
+        int head_v_dim,
+        int max_slots,
+        bool recurrent_bf16);
+
     std::vector<bool> layer_is_linear_;
     // Per-layer flat buffer holding `max_slots_` consecutive slabs.
     std::vector<DeviceBuffer<std::uint16_t>> conv_states_;
     std::vector<DeviceBuffer<float>>         recurrent_states_;
+    std::vector<DeviceBuffer<std::uint16_t>> recurrent_bf16_states_;
+    bool recurrent_bf16_ = false;
     int max_slots_   = 1;
     int conv_dim_    = 0;
     int conv_kernel_ = 0;

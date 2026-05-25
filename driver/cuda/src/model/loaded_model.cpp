@@ -13,6 +13,7 @@
 #include "distributed.hpp"
 #include "loader/rust_loader_bridge.hpp"
 #include "loader/rust_storage_executor.hpp"
+#include "tensor.hpp"
 
 namespace pie_cuda_driver {
 
@@ -36,7 +37,8 @@ bool supports_tp(const std::string& mt) {
         || mt == "gpt_oss"
         || mt == "qwen3_5" || mt == "qwen3_5_text"
         || mt == "qwen3_5_moe" || mt == "qwen3_5_moe_text"
-        || mt == "qwen3_moe";
+        || mt == "qwen3_moe"
+        || mt == "nemotron_h";
 }
 
 // True for any MoE model whose forward path lives in qwen3_5_moe_forward.
@@ -78,6 +80,53 @@ Mxfp4MoeLowering select_mxfp4_moe_lowering(
         "engine: model.mxfp4_moe must be one of "
         "{auto,routed_dequant,packed,bf16,dequant,eager_bf16,native}");
 }
+
+struct LoadMemorySampler {
+    LoadExecutionStats* stats = nullptr;
+
+    static void sample(void* context) noexcept {
+        auto* self = static_cast<LoadMemorySampler*>(context);
+        if (self == nullptr || self->stats == nullptr) return;
+        std::size_t free_bytes = 0;
+        std::size_t total_bytes = 0;
+        if (cudaMemGetInfo(&free_bytes, &total_bytes) != cudaSuccess) return;
+        auto& s = *self->stats;
+        if (s.cuda_memory_samples == 0) {
+            s.cuda_free_before_bytes = free_bytes;
+            s.cuda_min_free_bytes = free_bytes;
+            s.cuda_total_bytes = total_bytes;
+        } else {
+            s.cuda_min_free_bytes = std::min<std::uint64_t>(
+                s.cuda_min_free_bytes, free_bytes);
+        }
+        s.cuda_total_bytes = total_bytes;
+        s.cuda_memory_samples += 1;
+    }
+};
+
+class ScopedDeviceTensorMemoryCallback {
+public:
+    explicit ScopedDeviceTensorMemoryCallback(LoadMemorySampler* sampler)
+        : enabled_(sampler != nullptr)
+    {
+        if (enabled_) {
+            set_device_tensor_memory_callback(&LoadMemorySampler::sample, sampler);
+        }
+    }
+
+    ScopedDeviceTensorMemoryCallback(const ScopedDeviceTensorMemoryCallback&) = delete;
+    ScopedDeviceTensorMemoryCallback& operator=(
+        const ScopedDeviceTensorMemoryCallback&) = delete;
+
+    ~ScopedDeviceTensorMemoryCallback() {
+        if (enabled_) {
+            set_device_tensor_memory_callback(nullptr, nullptr);
+        }
+    }
+
+private:
+    bool enabled_ = false;
+};
 
 }  // namespace
 
@@ -177,6 +226,7 @@ LoadedModel LoadedModel::load(const Config& boot_cfg, NcclComm* tp_comm) {
         // intermediate_size` for the 3.5/3.6 family — Qwen3-MoE has no
         // shared expert).
         const bool is_q35_moe = is_qwen3_5_moe_arch(hf.model_type);
+        const bool is_nemotron_h = hf.model_type == "nemotron_h";
         if (!is_q35_moe) {
             require_divisible(hf.intermediate_size, "intermediate_size");
         }
@@ -190,7 +240,7 @@ LoadedModel LoadedModel::load(const Config& boot_cfg, NcclComm* tp_comm) {
             require_divisible(hf.linear_num_key_heads, "linear_num_key_heads");
             require_divisible(hf.linear_num_value_heads, "linear_num_value_heads");
         }
-        if (is_q35_moe) {
+        if (is_q35_moe || is_nemotron_h) {
             require_divisible(hf.moe_intermediate_size, "moe_intermediate_size");
             // shared_expert_intermediate_size is 0 for Qwen3-MoE (no shared
             // expert); only enforce divisibility when the family actually
@@ -268,8 +318,43 @@ LoadedModel LoadedModel::load(const Config& boot_cfg, NcclComm* tp_comm) {
         rust_builder,
         std::move(rust_plan.source_tensor_names),
         std::move(rust_plan.quant_attachments));
-    LoadExecutionStats materialized = rust_executor.execute(rust_view);
+    LoadExecutionStats load_memory_stats;
+    const bool sample_load_memory =
+        verbose || std::getenv("PIE_CUDA_PROFILE_LOAD_MEMORY") != nullptr;
+    LoadMemorySampler load_memory_sampler{.stats = &load_memory_stats};
+    if (sample_load_memory) {
+        LoadMemorySampler::sample(&load_memory_sampler);
+    }
+    LoadExecutionStats materialized;
+    {
+        ScopedDeviceTensorMemoryCallback callback(
+            sample_load_memory ? &load_memory_sampler : nullptr);
+        materialized = rust_executor.execute(rust_view);
+    }
     CUDA_CHECK(cudaDeviceSynchronize());
+    if (sample_load_memory) {
+        std::size_t free_after = 0;
+        std::size_t total_after = 0;
+        CUDA_CHECK(cudaMemGetInfo(&free_after, &total_after));
+        load_memory_stats.cuda_free_after_bytes = free_after;
+        load_memory_stats.cuda_total_bytes = total_after;
+        if (load_memory_stats.cuda_memory_samples > 0 &&
+            load_memory_stats.cuda_free_before_bytes >=
+                load_memory_stats.cuda_min_free_bytes) {
+            load_memory_stats.cuda_actual_peak_delta_bytes =
+                load_memory_stats.cuda_free_before_bytes -
+                load_memory_stats.cuda_min_free_bytes;
+        }
+        materialized.cuda_total_bytes = load_memory_stats.cuda_total_bytes;
+        materialized.cuda_free_before_bytes =
+            load_memory_stats.cuda_free_before_bytes;
+        materialized.cuda_min_free_bytes = load_memory_stats.cuda_min_free_bytes;
+        materialized.cuda_free_after_bytes =
+            load_memory_stats.cuda_free_after_bytes;
+        materialized.cuda_actual_peak_delta_bytes =
+            load_memory_stats.cuda_actual_peak_delta_bytes;
+        materialized.cuda_memory_samples = load_memory_stats.cuda_memory_samples;
+    }
 
     if (verbose && materialized.runtime_quantized_weights > 0) {
         const double mib_before =

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstdint>
 #include <stdexcept>
 #include <string>
@@ -36,6 +37,19 @@ namespace pie_cuda_driver {
 
 namespace wl_cpp = pie_weight_loader::cpp;
 
+namespace {
+
+constexpr const char* kPersistentArenaName = "__pie_loader_persistent_arena";
+
+inline std::uint64_t align_up_u64(std::uint64_t value, std::uint64_t alignment)
+{
+    if (alignment <= 1) return value;
+    const std::uint64_t rem = value % alignment;
+    return rem == 0 ? value : value + (alignment - rem);
+}
+
+}  // namespace
+
 class RustStorageProgramExecutor {
 public:
     RustStorageProgramExecutor(
@@ -58,6 +72,7 @@ public:
             program.memory.temporary_peak_bytes;
         stats.planned_storage_temp_bytes = program.memory.temporary_peak_bytes;
         program_index_.reset(program);
+        prepare_persistent_arena(program);
 
         for (std::size_t i = 0; i < program.schedule.len; ++i) {
             const std::uint32_t instr_id = program.schedule.ptr[i];
@@ -86,6 +101,7 @@ public:
             }
         }
         attach_quant_metadata();
+        finalize_persistent_arena();
         weights_.finalize();
         return stats;
     }
@@ -142,38 +158,154 @@ private:
         const pie_weight_loader::PieLoaderStorageInstrView& instr)
     {
         const auto& buffer = program_index_.buffer(instr.buffer_id);
+        if (const auto arena = arena_offsets_.find(buffer.id);
+            arena != arena_offsets_.end()) {
+            if (persistent_arena_.empty()) {
+                throw std::runtime_error(
+                    "rust storage executor: persistent arena offset without arena");
+            }
+            auto* base =
+                static_cast<std::uint8_t*>(persistent_arena_.data()) +
+                arena->second;
+            const auto& tensor = program_index_.tensor(buffer.tensor_id);
+            buffers_.emplace(
+                buffer.id,
+                tensor_view_for_buffer(tensor, base, buffer.bytes));
+            view_backing_names_[buffer.id] = kPersistentArenaName;
+            return;
+        }
         if (!buffer.has_tensor) {
             buffers_.emplace(
                 buffer.id,
-                DeviceTensor::allocate(
-                    DType::UINT8,
-                    {static_cast<std::int64_t>(buffer.bytes)}));
+                DeviceTensor::allocate(DType::UINT8, byte_shape(buffer.bytes)));
             return;
         }
         const auto& tensor = program_index_.tensor(buffer.tensor_id);
+        buffers_.emplace(buffer.id, allocate_tensor_for_buffer(tensor, buffer.bytes));
+    }
+
+    static std::vector<std::int64_t> byte_shape(std::uint64_t bytes)
+    {
+        return {static_cast<std::int64_t>(bytes)};
+    }
+
+    static DeviceTensor tensor_view_for_buffer(
+        const pie_weight_loader::PieLoaderTensorDeclView& tensor,
+        void* ptr,
+        std::uint64_t bytes)
+    {
         if (tensor.encoding_kind ==
             pie_weight_loader::PieLoaderEncodingKind::Quant) {
             const DType physical = quant_physical_dtype(tensor);
             if (physical == DType::FP8_E4M3 || physical == DType::INT8) {
-                buffers_.emplace(
-                    buffer.id,
-                    DeviceTensor::allocate(
-                        physical,
-                        wl_cpp::i64_slice_to_vector(tensor.shape)));
-                return;
+                return DeviceTensor::view(
+                    ptr, physical, wl_cpp::i64_slice_to_vector(tensor.shape));
             }
-            buffers_.emplace(
-                buffer.id,
-                DeviceTensor::allocate(
-                    DType::UINT8,
-                    {static_cast<std::int64_t>(buffer.bytes)}));
+            return DeviceTensor::view(ptr, DType::UINT8, byte_shape(bytes));
+        }
+        return DeviceTensor::view(
+            ptr,
+            dtype_from_rust(tensor.dtype),
+            wl_cpp::i64_slice_to_vector(tensor.shape));
+    }
+
+    static DeviceTensor allocate_tensor_for_buffer(
+        const pie_weight_loader::PieLoaderTensorDeclView& tensor,
+        std::uint64_t bytes)
+    {
+        if (tensor.encoding_kind ==
+            pie_weight_loader::PieLoaderEncodingKind::Quant) {
+            const DType physical = quant_physical_dtype(tensor);
+            if (physical == DType::FP8_E4M3 || physical == DType::INT8) {
+                return DeviceTensor::allocate(
+                    physical, wl_cpp::i64_slice_to_vector(tensor.shape));
+            }
+            return DeviceTensor::allocate(DType::UINT8, byte_shape(bytes));
+        }
+        return DeviceTensor::allocate(
+            dtype_from_rust(tensor.dtype),
+            wl_cpp::i64_slice_to_vector(tensor.shape));
+    }
+
+    bool can_use_persistent_arena(
+        const pie_weight_loader::PieLoaderStorageProgramView& program) const
+    {
+        if (std::getenv("PIE_CUDA_DISABLE_WEIGHT_ARENA") != nullptr) {
+            return false;
+        }
+        if (program.memory.persistent_bytes == 0 || program.buffers.len < 1024) {
+            return false;
+        }
+        for (std::size_t i = 0; i < program.schedule.len; ++i) {
+            const auto& instr = program_index_.instruction(program.schedule.ptr[i]);
+            switch (instr.kind) {
+            case pie_weight_loader::PieLoaderStorageInstrKind::Allocate:
+            case pie_weight_loader::PieLoaderStorageInstrKind::ExtentWrite:
+            case pie_weight_loader::PieLoaderStorageInstrKind::Finalize:
+            case pie_weight_loader::PieLoaderStorageInstrKind::Attach:
+                break;
+            case pie_weight_loader::PieLoaderStorageInstrKind::TileMap:
+            case pie_weight_loader::PieLoaderStorageInstrKind::CreateView:
+            case pie_weight_loader::PieLoaderStorageInstrKind::Release:
+                return false;
+            }
+        }
+        for (std::size_t i = 0; i < program.buffers.len; ++i) {
+            const auto& buffer = program.buffers.ptr[i];
+            if (buffer.temporary || !buffer.has_tensor) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    void prepare_persistent_arena(
+        const pie_weight_loader::PieLoaderStorageProgramView& program)
+    {
+        arena_offsets_.clear();
+        persistent_arena_ = DeviceTensor{};
+        if (!can_use_persistent_arena(program)) {
             return;
         }
-        buffers_.emplace(
-            buffer.id,
-            DeviceTensor::allocate(
-                dtype_from_rust(tensor.dtype),
-                wl_cpp::i64_slice_to_vector(tensor.shape)));
+
+        std::uint64_t offset = 0;
+        for (std::size_t i = 0; i < program.buffers.len; ++i) {
+            const auto& buffer = program.buffers.ptr[i];
+            const std::uint64_t alignment = std::max<std::uint64_t>(
+                1, static_cast<std::uint64_t>(buffer.alignment));
+            offset = align_up_u64(offset, alignment);
+            arena_offsets_.emplace(buffer.id, offset);
+            offset += buffer.bytes;
+        }
+        offset = align_up_u64(offset, 256);
+        if (offset == 0) {
+            arena_offsets_.clear();
+            return;
+        }
+        persistent_arena_ = DeviceTensor::allocate(DType::UINT8, byte_shape(offset));
+    }
+
+    void finalize_persistent_arena()
+    {
+        if (persistent_arena_.empty()) {
+            return;
+        }
+        if (weights_.find(kPersistentArenaName) != weights_.end()) {
+            throw std::runtime_error(
+                "rust storage executor: persistent arena backing name collides "
+                "with checkpoint tensor");
+        }
+        TensorDecl spec;
+        spec.name = kPersistentArenaName;
+        spec.dtype = DType::UINT8;
+        spec.shape = byte_shape(persistent_arena_.nbytes());
+        spec.layout = TensorLayoutKind::Dense;
+        spec.ownership = TensorOwnershipKind::Owned;
+        spec.parallel = TensorParallelKind::Replicated;
+        weights_.insert(
+            kPersistentArenaName,
+            std::move(persistent_arena_),
+            std::move(spec));
     }
 
     void extent_write(
@@ -1091,6 +1223,8 @@ private:
     std::unordered_map<std::uint32_t, DeviceTensor> buffers_;
     std::unordered_map<std::uint32_t, std::string> finalized_buffer_names_;
     std::unordered_map<std::uint32_t, std::string> view_backing_names_;
+    std::unordered_map<std::uint32_t, std::uint64_t> arena_offsets_;
+    DeviceTensor persistent_arena_;
     wl_cpp::StorageProgramIndex program_index_{"rust storage executor"};
 };
 

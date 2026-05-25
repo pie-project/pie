@@ -94,6 +94,7 @@ const HF_TO_PIE_ARCH: &[(&str, &str)] = &[
     ("olmo3", "olmo3"),
     ("gptoss", "gptoss"),
     ("gpt_oss", "gptoss"),
+    ("nemotron_h", "nemotron_h"),
 ];
 
 /// Read `<repo_dir>/snapshots/<latest>/config.json` and look up its
@@ -122,7 +123,10 @@ fn check_pie_compatibility(repo_dir: &Path) -> (bool, String) {
         return (false, "no config".to_string());
     };
     let model_type = json
-        .get("model_type")
+        .get("text_config")
+        .or_else(|| json.get("llm_config"))
+        .and_then(|v| v.get("model_type"))
+        .or_else(|| json.get("model_type"))
         .and_then(|v| v.as_str())
         .unwrap_or("");
     if model_type.is_empty() {

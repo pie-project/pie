@@ -757,6 +757,11 @@ impl pie::core::inference::HostForwardPass for InstanceState {
                         "rs_cache models do not support speculative draft tokens yet".to_string(),
                     ));
                 }
+                // Recurrent-state-cache models cannot currently use the
+                // driver-provided speculative-token side channel. Leaving the
+                // request flag set only forces dense-logit scheduling and
+                // fragments prompt batching.
+                req.output_spec_flags = vec![false];
                 req.rs_slot_ids = vec![rs_slot];
                 req.rs_slot_flags = vec![pinned.rs_flags];
             }

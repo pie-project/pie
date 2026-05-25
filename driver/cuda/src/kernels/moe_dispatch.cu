@@ -143,6 +143,57 @@ void launch_token_batched_weighted_sum_bf16(
         weights, top_k, hidden);
 }
 
+namespace {
+
+__global__ void token_batched_weighted_sum_aligned_bf16_kernel(
+    __nv_bfloat16* __restrict__ out,
+    const __nv_bfloat16* __restrict__ aligned_out,
+    const float* __restrict__ weights,
+    const std::int32_t* __restrict__ route_to_aligned_row,
+    int top_k,
+    int hidden)
+{
+    const int n = blockIdx.y;
+    const int h = blockIdx.x * blockDim.x + threadIdx.x;
+    if (h >= hidden) return;
+    const long long base = static_cast<long long>(n) * top_k;
+    float acc = 0.f;
+#pragma unroll
+    for (int k = 0; k < 16; ++k) {
+        if (k >= top_k) break;
+        const long long route = base + k;
+        const int row = route_to_aligned_row[route];
+        const float v = __bfloat162float(
+            aligned_out[static_cast<long long>(row) * hidden + h]);
+        acc += weights[route] * v;
+    }
+    out[static_cast<long long>(n) * hidden + h] = __float2bfloat16(acc);
+}
+
+}  // namespace
+
+void launch_token_batched_weighted_sum_aligned_bf16(
+    void* out,
+    const void* aligned_out,
+    const float* weights,
+    const std::int32_t* route_to_aligned_row,
+    int num_tokens,
+    int top_k,
+    int hidden,
+    cudaStream_t stream)
+{
+    if (num_tokens <= 0 || top_k <= 0 || hidden <= 0) return;
+    constexpr int BS = 256;
+    const dim3 grid((hidden + BS - 1) / BS, num_tokens);
+    token_batched_weighted_sum_aligned_bf16_kernel<<<grid, BS, 0, stream>>>(
+        static_cast<__nv_bfloat16*>(out),
+        static_cast<const __nv_bfloat16*>(aligned_out),
+        weights,
+        route_to_aligned_row,
+        top_k,
+        hidden);
+}
+
 // One block, top_k threads. Each thread is responsible for one of the
 // active experts: looks up the expert ID and emits a row of pointers
 // into the cuBLAS batched-gemm input arrays.
@@ -289,6 +340,7 @@ __global__ void moe_align_decode_kernel(
     const std::int32_t* __restrict__ topk_idx,
     std::int32_t* __restrict__ sorted_route_ids,
     std::int32_t* __restrict__ expert_ids,
+    std::int32_t* __restrict__ route_to_aligned_row,
     int num_routes,
     int num_experts,
     int block_size,
@@ -346,7 +398,62 @@ __global__ void moe_align_decode_kernel(
         if (0 <= e && e < num_experts) {
             const int pos = atomicAdd(fill + e, 1);
             const int out = offsets[e] + pos;
-            if (out < aligned_rows) sorted_route_ids[out] = r;
+            if (out < aligned_rows) {
+                sorted_route_ids[out] = r;
+                if (route_to_aligned_row != nullptr) {
+                    route_to_aligned_row[r] = out;
+                }
+            }
+        }
+    }
+}
+
+__global__ void moe_bucket_exact_kernel(
+    const std::int32_t* __restrict__ topk_idx,
+    std::int32_t* __restrict__ sorted_route_ids,
+    std::int32_t* __restrict__ route_to_sorted_row,
+    std::int32_t* __restrict__ counts_out,
+    int num_routes,
+    int num_experts)
+{
+    extern __shared__ std::int32_t smem[];
+    std::int32_t* counts = smem;
+    std::int32_t* offsets = counts + num_experts;
+    std::int32_t* fill = offsets + num_experts + 1;
+
+    for (int i = threadIdx.x; i < num_experts; i += blockDim.x) {
+        counts[i] = 0;
+        fill[i] = 0;
+    }
+    __syncthreads();
+
+    for (int r = threadIdx.x; r < num_routes; r += blockDim.x) {
+        const int e = topk_idx[r];
+        if (0 <= e && e < num_experts) {
+            atomicAdd(counts + e, 1);
+        }
+    }
+    __syncthreads();
+
+    if (threadIdx.x == 0) {
+        int running = 0;
+        for (int e = 0; e < num_experts; ++e) {
+            offsets[e] = running;
+            const int c = counts[e];
+            counts_out[e] = c;
+            running += c;
+        }
+        offsets[num_experts] = running;
+    }
+    __syncthreads();
+
+    for (int r = threadIdx.x; r < num_routes; r += blockDim.x) {
+        const int e = topk_idx[r];
+        if (0 <= e && e < num_experts) {
+            const int pos = atomicAdd(fill + e, 1);
+            const int out = offsets[e] + pos;
+            sorted_route_ids[out] = r;
+            route_to_sorted_row[r] = out;
         }
     }
 }
@@ -431,6 +538,7 @@ void launch_moe_align_decode(
     const std::int32_t* topk_idx,
     std::int32_t* sorted_route_ids,
     std::int32_t* expert_ids,
+    std::int32_t* route_to_aligned_row,
     int num_routes,
     int num_experts,
     int block_size,
@@ -445,8 +553,26 @@ void launch_moe_align_decode(
     const std::size_t smem =
         static_cast<std::size_t>(3 * num_experts + 1) * sizeof(std::int32_t);
     moe_align_decode_kernel<<<1, BS, smem, stream>>>(
-        topk_idx, sorted_route_ids, expert_ids,
+        topk_idx, sorted_route_ids, expert_ids, route_to_aligned_row,
         num_routes, num_experts, block_size, max_blocks);
+}
+
+void launch_moe_bucket_exact(
+    const std::int32_t* topk_idx,
+    std::int32_t* sorted_route_ids,
+    std::int32_t* route_to_sorted_row,
+    std::int32_t* counts_out,
+    int num_routes,
+    int num_experts,
+    cudaStream_t stream)
+{
+    if (num_routes <= 0 || num_experts <= 0) return;
+    constexpr int BS = 1024;
+    const std::size_t smem =
+        static_cast<std::size_t>(3 * num_experts + 1) * sizeof(std::int32_t);
+    moe_bucket_exact_kernel<<<1, BS, smem, stream>>>(
+        topk_idx, sorted_route_ids, route_to_sorted_row, counts_out,
+        num_routes, num_experts);
 }
 
 void launch_gather_moe_aligned_inputs_bf16(

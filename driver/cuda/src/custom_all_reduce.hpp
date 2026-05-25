@@ -84,6 +84,15 @@ public:
         int hidden,
         float eps,
         cudaStream_t stream);
+    void all_reduce_residual_rmsnorm_bf16_exact(
+        const void* input,
+        void* residual_inout,
+        const void* rms_gamma,
+        void* norm_out,
+        int tokens,
+        int hidden,
+        float eps,
+        cudaStream_t stream);
 
 private:
     int rank_ = 0;
