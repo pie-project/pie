@@ -1,5 +1,7 @@
 #include "ops/flashinfer_mamba.hpp"
 
+#include "cuda_check.hpp"
+
 #include <algorithm>
 #include <cstdlib>
 #include <cstring>
@@ -37,6 +39,27 @@ bool env_truthy(const char* value) {
            value[0] == 'O';
 }
 
+// -1 = unset, 0 = explicitly off, 1 = explicitly on.
+int env_tristate(const char* name) {
+    const char* v = std::getenv(name);
+    if (v == nullptr || v[0] == '\0') return -1;
+    return env_truthy(v) ? 1 : 0;
+}
+
+int current_device_major() {
+    thread_local int cached_device = -1;
+    thread_local int cached_major = 0;
+    int dev = 0;
+    CUDA_CHECK(cudaGetDevice(&dev));
+    if (dev != cached_device) {
+        cudaDeviceProp prop{};
+        CUDA_CHECK(cudaGetDeviceProperties(&prop, dev));
+        cached_device = dev;
+        cached_major = prop.major;
+    }
+    return cached_major;
+}
+
 flashinfer::mamba::SSUAlgorithm requested_algorithm() {
     const char* v = std::getenv("PIE_NEMOTRON_FLASHINFER_SSU_ALGO");
     if (v == nullptr || v[0] == '\0' || std::strcmp(v, "auto") == 0) {
@@ -57,9 +80,15 @@ flashinfer::mamba::SSUAlgorithm requested_algorithm() {
 }  // namespace
 
 bool flashinfer_mamba_ssu_enabled() {
-    static const bool enabled =
-        env_truthy(std::getenv("PIE_NEMOTRON_FLASHINFER_SSU"));
-    return enabled;
+    // Env override is read once and cached. On L40 (sm_89) FlashInfer SSU only
+    // exposes the "simple" algorithm, which trails the legacy warp_kernel past
+    // R~144 (microbenched 2026-05-25); the "vertical"/"horizontal" algorithms
+    // that beat the legacy path are gated to sm_90+. So default by SM:
+    // on sm_90+, prefer FlashInfer; on sm_89 and below, keep the legacy path.
+    static const int forced =
+        env_tristate("PIE_NEMOTRON_FLASHINFER_SSU");
+    if (forced >= 0) return forced != 0;
+    return current_device_major() >= 9;
 }
 
 bool flashinfer_mamba_ssu_bf16(

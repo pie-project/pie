@@ -70,6 +70,7 @@ if(PIE_CUDA_CUSTOM_ALL_REDUCE_SOURCE MATCHES "stub")
 endif()
 
 set(PIE_CUDA_FLASHINFER_HOPPER_SOURCE src/ops/attention_flashinfer_hopper_stub.cpp)
+set(PIE_CUDA_FLASHINFER_MAMBA_SM90 OFF)
 foreach(PIE_CUDA_ARCH IN LISTS CMAKE_CUDA_ARCHITECTURES)
   string(REGEX REPLACE "[^0-9].*$" "" PIE_CUDA_ARCH_NUMBER "${PIE_CUDA_ARCH}")
   if(PIE_CUDA_ARCH_NUMBER STREQUAL "90")
@@ -77,12 +78,26 @@ foreach(PIE_CUDA_ARCH IN LISTS CMAKE_CUDA_ARCHITECTURES)
       src/ops/attention_flashinfer_hopper.cu
       src/ops/attention_xqa_gqa8_sm90.cu
     )
+    set(PIE_CUDA_FLASHINFER_MAMBA_SM90 ON)
+  endif()
+  # FlashInfer's Mamba SSU vertical/horizontal kernels use TMA +
+  # memcpy_async_tx, which Blackwell also supports. The runtime
+  # algorithm auto-selector in selective_state_update prefers the
+  # horizontal kernel for sm >= 10 with bf16/fp16 state — so the same
+  # FLASHINFER_MAMBA_ENABLE_SM90 compile gate should be on for sm_100.
+  if(PIE_CUDA_ARCH_NUMBER STREQUAL "100")
+    set(PIE_CUDA_FLASHINFER_MAMBA_SM90 ON)
   endif()
 endforeach()
 if(PIE_CUDA_FLASHINFER_HOPPER_SOURCE MATCHES "stub")
   message(STATUS "Disabling FlashInfer Hopper/FA3 attention for CUDA architecture ${CMAKE_CUDA_ARCHITECTURES}")
 else()
   message(STATUS "Enabling FlashInfer Hopper/FA3 attention for CUDA architecture ${CMAKE_CUDA_ARCHITECTURES}")
+endif()
+if(PIE_CUDA_FLASHINFER_MAMBA_SM90)
+  message(STATUS "Enabling FlashInfer Mamba SM90 vertical/horizontal SSU kernels")
+else()
+  message(STATUS "FlashInfer Mamba SM90 vertical/horizontal SSU kernels disabled (legacy + simple algorithm only)")
 endif()
 
 # pie_driver_cuda — native CUDA backend. Built two ways from the same
@@ -341,6 +356,17 @@ if(PIE_CUDA_BUILD_MARLIN)
     target_include_directories(pie_driver_cuda_lib PRIVATE
         third_party/marlin)
     target_compile_definitions(pie_driver_cuda_lib PRIVATE PIE_CUDA_HAS_MARLIN=1)
+endif()
+
+# FlashInfer Mamba SSU on Hopper / Blackwell gates the vertical and horizontal
+# producer-consumer kernels behind FLASHINFER_MAMBA_ENABLE_SM90 at compile
+# time (TMA + memcpy_async_tx are sm_90+). Without this define, sm_90+ runs
+# would silently fall back to the simple algorithm — the same slow path used
+# on sm_89 — even though the runtime SM check would otherwise pick vertical
+# or horizontal.
+if(PIE_CUDA_FLASHINFER_MAMBA_SM90)
+    target_compile_definitions(pie_driver_cuda_lib PRIVATE
+        FLASHINFER_MAMBA_ENABLE_SM90=1)
 endif()
 
 # Standalone test for flashinfer sampling debugging.

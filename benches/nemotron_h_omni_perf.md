@@ -324,6 +324,96 @@ Historical eager-vLLM comparison, retained only as context:
   layers. The exact bucketer improves steady throughput but is not a substitute
   for a fused MoE kernel.
 
+### Nsight Systems CUDA-only hotspot comparison (2026-05-25)
+
+Captured with `nsys profile --trace=cuda --sample=none
+--capture-range=cudaProfilerApi --capture-range-end=stop` wrapping the bench;
+both engines bracket only the timed `tput` window through `--cuda-profiler-range`
+so the trace excludes model load and warmup. TP2 worker subprocesses are
+included because the cudaProfilerApi capture is process-tree wide. Numbers
+below are kernel-name percentages of total CUDA kernel time across both GPUs
+in the captured window. Raw nsys reports live under `.tmp/nsys/`:
+
+- Pie 64x16 warm64: `nemo_pie_64x16_warm64_cudaonly.nsys-rep` (wall 0.483 s, 2122 tok/s under nsys)
+- vLLM 64x16 warm64: `nemo_vllm_64x16_warm64_cudaonly.nsys-rep` (wall 0.374 s, 2740 tok/s under nsys)
+- Pie 256x16 warm256: `nemo_pie_256x16_warm256_cudaonly.nsys-rep` (wall 1.218 s, 3362 tok/s under nsys)
+- vLLM 256x16 warm256: `nemo_vllm_256x16_warm256_cudaonly.nsys-rep` (wall 1.370 s, 2989 tok/s under nsys)
+
+Top kernels at 64x16 warm64:
+
+| bucket | Pie | vLLM |
+| --- | --- | --- |
+| MoE expert GEMMs | 33.5% (Cutlass MoeFCGemm x2) | 29.1% (Triton fused_moe_kernel x2) |
+| TP all-reduce | 17.0% (vllm::cross_device_reduce_1stage, in-tree custom AR) | 25.4% (ncclDevKernel_AllReduce_Sum_bf16) + 5.3% AllGather |
+| Mamba SSM core | 12.1% (mamba_ssm_batched_prefill_reg + warp decode) | 5.2% (chunk_scan + chunk_state + state_passing + bmm_chunk + selective_scan_update + causal_conv1d) |
+| Mamba in-proj GEMM | 5.8% (cutlass bf16 64x64 prefill) | 6.8% (ampere bf16 64x128) |
+| Decode workhorse GEMM | 5.5% (ampere bf16 64x64) | 6.3% (ampere bf16 128x64) + 6.2% (128x64 sliced) |
+
+Top kernels at 256x16 warm256:
+
+| bucket | Pie | vLLM |
+| --- | --- | --- |
+| TP all-reduce | 22.4% (custom AR) | 27.8% (NCCL AllReduce) + 5.1% AllGather |
+| MoE expert GEMMs | 26.3% (Cutlass MoeFCGemm x2) | 25.2% (Triton fused_moe_kernel, 6 distinct shapes) |
+| Mamba SSM core | 23.5% (warp decode 12.6% + prefill_reg 8.1% + prefill_reg alt 2.1% + warp variant 0.7%) | 6.2% (selective_scan_update x2 = 2.1% + state_passing x2 = 2.0% + chunk_state x2 = 1.8% + chunk_scan x2 = 1.2% + causal_conv1d) |
+| Mamba in-proj GEMM | 3.2% prefill 64x128 + 2.8% decode 64x128 | 3.0% prefill 64x128 + 1.4% decode 64x64 |
+| Misc GEMMs/finalize | ~6% (ampere bf16 GEMMs, finalizeMoeRoutingKernel) | ~7% (ampere bf16 GEMMs) |
+
+Takeaways:
+
+1. **Mamba SSM is the dominant remaining GPU-side gap.** At 256x16, Pie spends
+   23.5% of GPU time in custom recurrent SSM kernels while vLLM spends 6.2%
+   in the Triton chunk-scan / state-passing / selective-scan-update family.
+   The ratio at 64x16 is similar (12.1% vs 5.2%). This is the largest
+   single-bucket gap and is consistent with the recurrent vs. SSU/chunk-scan
+   structural difference. Item 3 of REMAINING.md remains the highest-leverage
+   next change.
+2. **MoE expert GEMMs are roughly comparable.** Cutlass MoeFCGemm (Pie) and
+   Triton fused_moe_kernel (vLLM) consume similar fractions of GPU time at
+   both 64x16 and 256x16. A fused/grouped MoE rewrite (REMAINING.md item 4)
+   will still help, but the headroom is smaller than the Mamba gap.
+3. **Pie's custom all-reduce remains a real win on collectives.** At 256x16
+   Pie spends 22.4% in custom AR; vLLM spends 27.8% in NCCL AllReduce plus
+   another 5.1% in NCCL AllGather. Keep custom AR default-on with peer access.
+4. **Throughput at 256x16 is noisy.** This single nsys run had Pie at 3362
+   tok/s and vLLM at 2989 tok/s — i.e. Pie wins — which contradicts the
+   recent fair-bench snapshot in `REMAINING.md`. The variance argues for
+   three-run medians (REMAINING.md item 1) before any further claim about
+   the 256x16 gap.
+
+### FlashInfer SSU dispatch scaffolding (2026-05-25)
+
+`flashinfer_mamba_ssu_enabled()` is now SM-aware: defaults on for sm_90+,
+off for sm_89 and below. Env override `PIE_NEMOTRON_FLASHINFER_SSU=0|1`
+still wins when set.
+
+Rationale (microbenched on L40 the same day):
+
+- FlashInfer SSU only exposes the `simple` algorithm on sm_89; the
+  `vertical` and `horizontal` algorithms that beat Pie's `warp_kernel` at
+  steady-state R are compute-capability ≥ 9. On L40, `simple` is faster
+  than `warp_kernel` up to R≈144 (FI 41 µs vs Pie 53 µs at R=64) but
+  trails it past R=160 (FI 132–897 µs vs Pie ~371 µs at R=256). Defaulting
+  on for L40 would hurt the 256x16/512x64 workloads we need to win.
+- On H100/B100 the better algorithms unlock, so SM-default-on is the
+  right call there. Validated on H100/B100 the moment hardware appears.
+
+End-to-end correctness validated on L40 by forcing `PIE_NEMOTRON_FLASHINFER_SSU=1`:
+
+- 1x8 deterministic: `[4268, 2534, 1317, 7418, 1261, 4958, 8303, 2314]` ✓ identical to legacy (sha256[:16]=`7ff374afdf996ced`)
+- 1x16 deterministic: 16 tokens identical to legacy (sha256[:16]=`c5765b793b7abbfb`)
+
+This means strides, slot mapping, A/B/C layouts, and state-cache update
+are correct end-to-end in the FlashInfer path on this codebase. The H100/B100
+ship path is the same code, just a different FlashInfer algorithm.
+
+L40 non-regression (legacy path still default):
+
+- 64x16 warm64: 2210.90 tok/s (-0.46% vs 2221.11 historical, within noise)
+- 256x16 warm256: 3370–3483 tok/s across 3 runs (median 3382, identical to
+  force-off run at 3372; the 3548 historical was top-of-band)
+- 1x8 / 1x16 deterministic: unchanged
+
 ## Failed or neutral attempts
 
 - Standalone vLLM default AOT failed startup for this model with

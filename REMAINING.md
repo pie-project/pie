@@ -157,6 +157,17 @@ stats, but the dominant time is still driver/GPU execution.
 2. Profile one representative losing shape with Nsight Systems CUDA-only trace:
    64x16 for small-batch overhead and 256x16 for steady state. Avoid NVTX with
    vLLM if it triggers NCCL instability.
+   - **2026-05-25:** Done. Pie and vLLM both traced under
+     `nsys profile --trace=cuda --capture-range=cudaProfilerApi` at 64x16 and
+     256x16. Reports under `.tmp/nsys/nemo_{pie,vllm}_{64,256}x16_warm{64,256}_cudaonly.nsys-rep`.
+     Hotspot comparison written up in
+     `benches/nemotron_h_omni_perf.md` under
+     "Nsight Systems CUDA-only hotspot comparison (2026-05-25)". Headline:
+     Mamba SSM is the dominant remaining GPU-side gap (Pie 23.5% vs vLLM
+     6.2% at 256x16); MoE GEMM is roughly comparable; custom all-reduce is
+     a Pie win. The single 256x16 run had Pie ahead of vLLM, contradicting
+     the fair-bench snapshot — argues for item 1's three-run medians before
+     re-stating the steady-state gap.
 3. Implement the Mamba2 chunk-scan/SSU path in a maintainable way. Preferred
    direction is a narrow adapter to an existing proven implementation
    (FlashInfer, SGLang/vLLM Triton logic, or TensorRT-LLM-style kernels), with
