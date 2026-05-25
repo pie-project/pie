@@ -18,7 +18,6 @@
 #include "kernels/gated_delta_net.hpp"
 #include "kernels/gather_rows.hpp"
 #include "kernels/kv_paged.hpp"
-#include "kernels/moe_dispatch.hpp"
 #include "kernels/residual_add.hpp"
 #include "kernels/rmsnorm.hpp"
 #include "kernels/rope.hpp"
@@ -119,27 +118,20 @@ int qwen35_gdn_warp_tiled_max_tokens() {
     return max_tokens;
 }
 
-bool qwen35_mtp_shift_prefix_cache() {
+bool qwen35_mtp_fused_gemv_enabled() {
     static const bool enabled = [] {
-        const char* v = std::getenv("PIE_QWEN35_MTP_SHIFT_PREFIX_CACHE");
+        const char* v = std::getenv("PIE_QWEN35_MTP_FUSED_GEMV");
         if (v == nullptr || v[0] == '\0') return false;
         return v[0] != '0';
     }();
     return enabled;
 }
 
-bool qwen35_mtp_direct_argmax_enabled() {
+bool qwen35_mtp_shift_prefix_cache() {
     static const bool enabled = [] {
-        const char* v = std::getenv("PIE_QWEN35_MTP_DIRECT_ARGMAX");
-        return v != nullptr && v[0] != '\0' && v[0] != '0';
-    }();
-    return enabled;
-}
-
-bool qwen35_dense_gate_up_batched_enabled() {
-    static const bool enabled = [] {
-        const char* v = std::getenv("PIE_QWEN35_DENSE_GATE_UP_BATCHED");
-        return v != nullptr && v[0] != '\0' && v[0] != '0';
+        const char* v = std::getenv("PIE_QWEN35_MTP_SHIFT_PREFIX_CACHE");
+        if (v == nullptr || v[0] == '\0') return false;
+        return v[0] != '0';
     }();
     return enabled;
 }
@@ -157,43 +149,12 @@ void qwen35_dense_mlp_block(
     const int T_mlp = std::max(1, fwd_cfg.tp_size);
     const int I = cfg.intermediate_size / T_mlp;
     NcclComm* tp_mlp = (T_mlp > 1) ? fwd_cfg.tp_comm : nullptr;
-    const bool use_fused_gate_up =
-        Lw.gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (use_fused_gate_up) {
+    if (Lw.gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty()) {
         ops::gemm_act_x_w(cublas.handle(),
             ws.norm_x.data(), ops::WeightView(*Lw.gate_up_proj_fused),
             ws.gate_up_fused.data(), N, 2 * I, H);
         kernels::launch_chunked_swiglu_bf16(
             ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else if (qwen35_dense_gate_up_batched_enabled() &&
-        Lw.gate_proj != nullptr && Lw.up_proj != nullptr &&
-        !Lw.gate_proj_quant.has_value() &&
-        !Lw.up_proj_quant.has_value() &&
-        ws.gate_up_act_ptrs.size() >= 2 &&
-        ws.gate_up_w_ptrs.size() >= 2 &&
-        ws.gate_up_y_ptrs.size() >= 2) {
-        kernels::launch_build_dual_bf16_gemm_ptrs(
-            ws.norm_x.data(),
-            Lw.gate_proj->data(),
-            Lw.up_proj->data(),
-            ws.gate.data(),
-            ws.up.data(),
-            reinterpret_cast<const void**>(ws.gate_up_act_ptrs.data()),
-            reinterpret_cast<const void**>(ws.gate_up_w_ptrs.data()),
-            reinterpret_cast<void**>(ws.gate_up_y_ptrs.data()),
-            stream);
-        ops::gemm_batched_act_x_wt_bf16(
-            cublas.handle(),
-            reinterpret_cast<const void* const*>(
-                ws.gate_up_act_ptrs.data()),
-            reinterpret_cast<const void* const*>(
-                ws.gate_up_w_ptrs.data()),
-            reinterpret_cast<void* const*>(
-                ws.gate_up_y_ptrs.data()),
-            N, I, H, /*batch_count=*/2);
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
     } else {
         ops::gemm_act_x_w(cublas.handle(),
             ws.norm_x.data(), make_weight_view(Lw.gate_proj, Lw.gate_proj_quant),
@@ -549,21 +510,13 @@ void linear_attn_layer_body(
             ops::gemm_act_x_w(cublas.handle(),
                 ws.norm_x.data(), *Lw.la_in_proj_z,
                 la.z.data(), N, V_dim, H);
-            if (Lw.la_in_proj_ba != nullptr) {
-                ops::gemm_act_x_w(cublas.handle(),
-                    ws.norm_x.data(), *Lw.la_in_proj_ba,
-                    la.ba.data(), N, 2 * V_h, H);
-                kernels::launch_split_qwen_gdn_ba_bf16(
-                    la.ba.data(), la.b.data(), la.a.data(), N, V_h, stream);
-            } else {
-                // a [N, V_h] = norm_x @ in_proj_a.T   (b symmetric)
-                ops::gemm_act_x_w(cublas.handle(),
-                    ws.norm_x.data(), *Lw.la_in_proj_a,
-                    la.a.data(), N, V_h, H);
-                ops::gemm_act_x_w(cublas.handle(),
-                    ws.norm_x.data(), *Lw.la_in_proj_b,
-                    la.b.data(), N, V_h, H);
-            }
+            // a [N, V_h] = norm_x @ in_proj_a.T   (b symmetric)
+            ops::gemm_act_x_w(cublas.handle(),
+                ws.norm_x.data(), *Lw.la_in_proj_a,
+                la.a.data(), N, V_h, H);
+            ops::gemm_act_x_w(cublas.handle(),
+                ws.norm_x.data(), *Lw.la_in_proj_b,
+                la.b.data(), N, V_h, H);
         }
     });
 
@@ -1418,13 +1371,13 @@ void mtp_full_attn_no_cache(
 
     const auto mtp_kv = cache.layer_view(Lw.kv_layer);
     ops::launch_attention_mtp_paged_history_bf16(
-        ws.q.data(), mtp_kv.k_bf16_pages, mtp_kv.v_bf16_pages,
-        ws.k.data(), ws.v.data(), ws.attn_out.data(),
-        position_ids, request_ids,
-        kv_page_indices, kv_page_indptr, kv_last_page_lens,
-        N, draft_step + 1, N, max_global_tokens, cache.page_size(),
-        q_heads, kv_heads, d, mtp_kv.hnd_layout,
-        fwd_cfg.mtp_global_cache_uses_prefix_position, stream);
+            ws.q.data(), mtp_kv.k_bf16_pages, mtp_kv.v_bf16_pages,
+            ws.k.data(), ws.v.data(), ws.attn_out.data(),
+            position_ids, request_ids,
+            kv_page_indices, kv_page_indptr, kv_last_page_lens,
+            N, draft_step + 1, N, max_global_tokens, cache.page_size(),
+            q_heads, kv_heads, d, mtp_kv.hnd_layout,
+            fwd_cfg.mtp_global_cache_uses_prefix_position, stream);
     kernels::launch_sigmoid_gate_inplace_bf16(
         ws.attn_out.data(), la.fa_gate.data(), N * Hq, stream);
 
@@ -1624,22 +1577,25 @@ void qwen3_5_mtp_forward(
     ops::WeightView lm_head(*w.lm_head);
     if (mtp.lm_head != nullptr) {
         lm_head = ops::WeightView(*mtp.lm_head);
-        if (mtp.lm_head_scale != nullptr) {
-            lm_head.scale_data = mtp.lm_head_scale->data();
-            lm_head.scale_dtype = DType::FP32;
-            lm_head.scale_numel = mtp.lm_head_scale->size();
-            lm_head.quant_kind = QuantMeta::Kind::PerTensor;
-        }
     }
     if (sampled_token_ids != nullptr &&
-        qwen35_mtp_direct_argmax_enabled() &&
-        lm_head.dtype == DType::BF16 &&
-        lm_head.scale_data == nullptr) {
-        kernels::launch_lm_head_argmax_bf16(
+        mtp.lm_head_scale_inv != nullptr &&
+        lm_head.dtype == DType::INT8) {
+        kernels::launch_lm_head_gemv_argmax_int8(
+            ws.norm_x.data(),
+            static_cast<const std::int8_t*>(lm_head.data),
+            mtp.lm_head_scale_inv->data(),
+            sampled_token_ids, num_tokens, H, V, stream);
+    } else if (sampled_token_ids != nullptr &&
+               qwen35_mtp_fused_gemv_enabled() &&
+               lm_head.dtype == DType::BF16) {
+        kernels::launch_lm_head_gemv_argmax_bf16(
             ws.norm_x.data(), lm_head.data,
-            reinterpret_cast<std::uint64_t*>(ws.probs.data()),
             sampled_token_ids, num_tokens, H, V, stream);
     } else {
+        ops::maybe_bench_lm_head_algos(cublas.handle(),
+            ws.norm_x.data(), lm_head.data, ws.logits.data(),
+            num_tokens, V, H);
         ops::gemm_act_x_w(cublas.handle(),
             ws.norm_x.data(), lm_head,
             ws.logits.data(), num_tokens, V, H);

@@ -623,19 +623,20 @@ int qwen35_mtp_draft_position_offset() {
     return offset;
 }
 
-bool qwen35_mtp_prefix_global_cache() {
+bool qwen35_mtp_fused_gemv_enabled() {
     static const bool enabled = [] {
-        const char* v = std::getenv("PIE_QWEN35_MTP_PREFIX_GLOBAL");
-        if (v == nullptr || v[0] == '\0') return true;
+        const char* v = std::getenv("PIE_QWEN35_MTP_FUSED_GEMV");
+        if (v == nullptr || v[0] == '\0') return false;
         return v[0] != '0';
     }();
     return enabled;
 }
 
-bool qwen35_mtp_direct_argmax_enabled() {
+bool qwen35_mtp_prefix_global_cache() {
     static const bool enabled = [] {
-        const char* v = std::getenv("PIE_QWEN35_MTP_DIRECT_ARGMAX");
-        return v != nullptr && v[0] != '\0' && v[0] != '0';
+        const char* v = std::getenv("PIE_QWEN35_MTP_PREFIX_GLOBAL");
+        if (v == nullptr || v[0] == '\0') return true;
+        return v[0] != '0';
     }();
     return enabled;
 }
@@ -2949,18 +2950,13 @@ int run_impl(int argc,
         if (weights_qwen3_5.mtp.has_value() && native_mtp_num_drafts > 0) {
             const int mtp_position_offset = qwen35_mtp_draft_position_offset();
             const bool mtp_prefix_global = qwen35_mtp_prefix_global_cache();
-            const bool mtp_direct_argmax =
-                qwen35_mtp_direct_argmax_enabled() &&
-                weights_qwen3_5.mtp->lm_head != nullptr &&
-                weights_qwen3_5.mtp->lm_head->dtype() ==
-                    pie_cuda_driver::DType::BF16 &&
-                weights_qwen3_5.mtp->lm_head_scale == nullptr;
             system_drafter.max_drafts = native_mtp_num_drafts;
             system_drafter.draft_position_offset = mtp_position_offset;
             system_drafter.draft_global_cache_uses_prefix_position =
                 mtp_prefix_global;
             system_drafter.draft_step_writes_sampled_tokens =
-                mtp_direct_argmax;
+                weights_qwen3_5.mtp->lm_head_scale_inv != nullptr ||
+                qwen35_mtp_fused_gemv_enabled();
             system_drafter.commit_verified_prefix =
                 [&engine, &weights_qwen3_5, &qwen3_5_la_ws,
                  &qwen3_5_state_cache, q35_tp_size, q35_tp_comm](

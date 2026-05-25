@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cstdlib>
 #include <cstdint>
+#include <iostream>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -277,6 +278,137 @@ bool gemm_bf16_lt_impl(
 }
 
 }  // namespace
+
+void maybe_bench_lm_head_algos(
+    cublasHandle_t cublas_handle,
+    const void* act, const void* W, void* y,
+    int M, int N, int K)
+{
+    static const bool enabled = [] {
+        const char* v = std::getenv("PIE_BENCH_LM_HEAD_ALGOS");
+        return v != nullptr && v[0] != '\0' && v[0] != '0';
+    }();
+    if (!enabled) return;
+    static bool done = false;
+    if (done) return;
+    done = true;
+
+    auto& ctx = Bf16LtCtx::instance();
+    ctx.ensure();
+
+    cublasLtMatmulDesc_t op_desc = nullptr;
+    cublasLtMatrixLayout_t a_desc = nullptr;
+    cublasLtMatrixLayout_t b_desc = nullptr;
+    cublasLtMatrixLayout_t c_desc = nullptr;
+    cublasLtMatmulPreference_t pref = nullptr;
+
+    cublasLtMatmulDescCreate(&op_desc, CUBLAS_COMPUTE_32F_FAST_16BF, CUDA_R_32F);
+    cublasOperation_t transa = CUBLAS_OP_T;
+    cublasOperation_t transb = CUBLAS_OP_N;
+    cublasLtMatmulDescSetAttribute(op_desc, CUBLASLT_MATMUL_DESC_TRANSA,
+        &transa, sizeof(transa));
+    cublasLtMatmulDescSetAttribute(op_desc, CUBLASLT_MATMUL_DESC_TRANSB,
+        &transb, sizeof(transb));
+    cublasLtMatrixLayoutCreate(&a_desc, CUDA_R_16BF, K, N, K);
+    cublasLtMatrixLayoutCreate(&b_desc, CUDA_R_16BF, K, M, K);
+    cublasLtMatrixLayoutCreate(&c_desc, CUDA_R_16BF, N, M, N);
+    cublasLtMatmulPreferenceCreate(&pref);
+    cublasLtMatmulPreferenceSetAttribute(
+        pref, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
+        &ctx.workspace_bytes, sizeof(ctx.workspace_bytes));
+
+    cublasLtMatmulHeuristicResult_t heuristics[8]{};
+    int returned = 0;
+    cublasLtMatmulAlgoGetHeuristic(
+        ctx.handle, op_desc, a_desc, b_desc, c_desc, c_desc,
+        pref, 8, heuristics, &returned);
+
+    cudaStream_t stream = nullptr;
+    cublasGetStream(cublas_handle, &stream);
+    const float alpha = 1.f;
+    const float beta = 0.f;
+    constexpr int warmup = 3;
+    constexpr int iters = 10;
+
+    std::cerr << "[pie-bench-lm-head-algos] M=" << M << " N=" << N
+              << " K=" << K << " returned=" << returned << "\n";
+
+    {
+        for (int w = 0; w < warmup; ++w) {
+            cublasGemmEx(cublas_handle,
+                CUBLAS_OP_T, CUBLAS_OP_N, N, M, K, &alpha,
+                W, CUDA_R_16BF, K, act, CUDA_R_16BF, K, &beta,
+                y, CUDA_R_16BF, N,
+                CUBLAS_COMPUTE_32F_FAST_16BF, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+        }
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        cudaEvent_t start, stop;
+        CUDA_CHECK(cudaEventCreate(&start));
+        CUDA_CHECK(cudaEventCreate(&stop));
+        CUDA_CHECK(cudaEventRecord(start, stream));
+        for (int i = 0; i < iters; ++i) {
+            cublasGemmEx(cublas_handle,
+                CUBLAS_OP_T, CUBLAS_OP_N, N, M, K, &alpha,
+                W, CUDA_R_16BF, K, act, CUDA_R_16BF, K, &beta,
+                y, CUDA_R_16BF, N,
+                CUBLAS_COMPUTE_32F_FAST_16BF, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+        }
+        CUDA_CHECK(cudaEventRecord(stop, stream));
+        CUDA_CHECK(cudaEventSynchronize(stop));
+        float ms = 0.0f;
+        CUDA_CHECK(cudaEventElapsedTime(&ms, start, stop));
+        std::cerr << "[pie-bench-lm-head-algos]   GEMMEx: "
+                  << (ms / iters) << " ms\n";
+        CUDA_CHECK(cudaEventDestroy(start));
+        CUDA_CHECK(cudaEventDestroy(stop));
+    }
+
+    for (int i = 0; i < returned; ++i) {
+        bool ok = false;
+        for (int w = 0; w < warmup; ++w) {
+            auto st = cublasLtMatmul(
+                ctx.handle, op_desc, &alpha,
+                W, a_desc, act, b_desc, &beta,
+                y, c_desc, y, c_desc,
+                &heuristics[i].algo,
+                ctx.workspace, ctx.workspace_bytes, stream);
+            if (st != CUBLAS_STATUS_SUCCESS) break;
+            ok = true;
+        }
+        if (!ok) {
+            std::cerr << "[pie-bench-lm-head-algos]   Lt[" << i
+                      << "]: FAILED\n";
+            continue;
+        }
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        cudaEvent_t start, stop;
+        CUDA_CHECK(cudaEventCreate(&start));
+        CUDA_CHECK(cudaEventCreate(&stop));
+        CUDA_CHECK(cudaEventRecord(start, stream));
+        for (int it = 0; it < iters; ++it) {
+            cublasLtMatmul(
+                ctx.handle, op_desc, &alpha,
+                W, a_desc, act, b_desc, &beta,
+                y, c_desc, y, c_desc,
+                &heuristics[i].algo,
+                ctx.workspace, ctx.workspace_bytes, stream);
+        }
+        CUDA_CHECK(cudaEventRecord(stop, stream));
+        CUDA_CHECK(cudaEventSynchronize(stop));
+        float ms = 0.0f;
+        CUDA_CHECK(cudaEventElapsedTime(&ms, start, stop));
+        std::cerr << "[pie-bench-lm-head-algos]   Lt[" << i << "]: "
+                  << (ms / iters) << " ms\n";
+        CUDA_CHECK(cudaEventDestroy(start));
+        CUDA_CHECK(cudaEventDestroy(stop));
+    }
+
+    if (pref) cublasLtMatmulPreferenceDestroy(pref);
+    if (c_desc) cublasLtMatrixLayoutDestroy(c_desc);
+    if (b_desc) cublasLtMatrixLayoutDestroy(b_desc);
+    if (a_desc) cublasLtMatrixLayoutDestroy(a_desc);
+    if (op_desc) cublasLtMatmulDescDestroy(op_desc);
+}
 
 CublasHandle::CublasHandle(cudaStream_t stream) {
     check(cublasCreate(&h_), "cublasCreate");

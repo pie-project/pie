@@ -219,4 +219,13 @@ inline void gemm_batched_act_x_wt_bf16(
                          M, N, K, batch_count, beta);
 }
 
+// One-shot benchmark of cuBLASLt heuristics + GEMMEx for a given shape.
+// Prints per-algo latencies to stderr. Enabled by PIE_BENCH_LM_HEAD_ALGOS=1.
+// Runs at most once per process. Safe to call on every MTP step — the second
+// and subsequent calls are no-ops.
+void maybe_bench_lm_head_algos(
+    cublasHandle_t handle,
+    const void* act, const void* W, void* y,
+    int M, int N, int K);
+
 }  // namespace pie_cuda_driver::ops

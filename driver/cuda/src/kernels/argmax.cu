@@ -672,6 +672,268 @@ void launch_lm_head_argmax_bf16(
         partial_pairs, token_ids, num_rows, tiles);
 }
 
+// ── Fused INT8 GEMV + argmax ──────────────────────────────────────
+// Persistent-block design: each block has 8 warps, each warp computes
+// one dot product (one vocab row). Blocks loop over vocab rows with a
+// grid-stride pattern. Hidden vector is loaded once to shared memory.
+// After all assigned rows are scored, block-level argmax is written to
+// partial_pairs for a small final reduction.
+
+constexpr int GEMV_WARPS = 8;
+constexpr int GEMV_BLOCK_DIM = GEMV_WARPS * 32; // 256
+
+__device__ __forceinline__ float warp_reduce_sum(float val) {
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        val += __shfl_xor_sync(0xffffffffu, val, offset);
+    }
+    return val;
+}
+
+__global__ void lm_head_gemv_argmax_int8_kernel(
+    const __nv_bfloat16* __restrict__ hidden_states,
+    const std::int8_t* __restrict__ lm_head_weight,
+    const float* __restrict__ scale_inv,
+    std::uint64_t* __restrict__ partial_pairs,
+    int num_rows,
+    int hidden,
+    int vocab,
+    int num_blocks_x)
+{
+    const int row = blockIdx.y;
+    const int warp = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+
+    extern __shared__ char shmem_raw[];
+    float* sh_hidden = reinterpret_cast<float*>(shmem_raw);
+
+    const auto* h_row = hidden_states +
+        static_cast<long long>(row) * hidden;
+    for (int i = threadIdx.x; i < hidden; i += GEMV_BLOCK_DIM) {
+        sh_hidden[i] = __bfloat162float(h_row[i]);
+    }
+    __syncthreads();
+
+    float best_val = -INFINITY;
+    int best_tok = -1;
+
+    for (int v = blockIdx.x * GEMV_WARPS + warp;
+         v < vocab;
+         v += num_blocks_x * GEMV_WARPS) {
+        const auto* w_row = lm_head_weight +
+            static_cast<long long>(v) * hidden;
+        float sum = 0.f;
+        const int h_vec4 = hidden / 4;
+        const auto* w_row_v4 = reinterpret_cast<const char4*>(w_row);
+        for (int i = lane; i < h_vec4; i += 32) {
+            const int h = i * 4;
+            const char4 w4 = __ldg(&w_row_v4[i]);
+            sum += sh_hidden[h]     * static_cast<float>(w4.x)
+                 + sh_hidden[h + 1] * static_cast<float>(w4.y)
+                 + sh_hidden[h + 2] * static_cast<float>(w4.z)
+                 + sh_hidden[h + 3] * static_cast<float>(w4.w);
+        }
+        float dot = warp_reduce_sum(sum) * scale_inv[v];
+
+        if (lane == 0) {
+            if (dot > best_val || (dot == best_val && v < best_tok)) {
+                best_val = dot;
+                best_tok = v;
+            }
+        }
+    }
+
+    // Warp-level best is in lane 0. Collect across warps.
+    __shared__ float sh_vals[GEMV_WARPS];
+    __shared__ int sh_toks[GEMV_WARPS];
+    if (lane == 0) {
+        sh_vals[warp] = best_val;
+        sh_toks[warp] = best_tok;
+    }
+    __syncthreads();
+
+    if (threadIdx.x == 0) {
+        float bv = sh_vals[0];
+        int bt = sh_toks[0];
+        for (int w = 1; w < GEMV_WARPS; ++w) {
+            update_argmax(sh_vals[w], sh_toks[w], bv, bt);
+        }
+        partial_pairs[static_cast<std::size_t>(blockIdx.x) * num_rows + row] =
+            pack_argmax_pair(bv, bt);
+    }
+}
+
+void launch_lm_head_gemv_argmax_int8(
+    const void* hidden_states,
+    const std::int8_t* lm_head_weight,
+    const float* scale_inv,
+    std::int32_t* token_ids,
+    int num_rows,
+    int hidden,
+    int vocab,
+    cudaStream_t stream)
+{
+    if (num_rows <= 0 || hidden <= 0 || vocab <= 0) return;
+
+    int num_sms = 0;
+    cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, 0);
+    static const int blocks_per_sm = [] {
+        const char* v = std::getenv("PIE_GEMV_BLOCKS_PER_SM");
+        if (v == nullptr || v[0] == '\0') return 2;
+        return std::max(1, std::min(8, std::atoi(v)));
+    }();
+    const int max_blocks_x = num_sms * blocks_per_sm;
+    const int min_blocks_x =
+        (vocab + GEMV_WARPS - 1) / GEMV_WARPS;
+    const int num_blocks_x = std::min(max_blocks_x, min_blocks_x);
+    const std::size_t shmem_bytes =
+        static_cast<std::size_t>(hidden) * sizeof(float);
+
+    const std::size_t pairs_elems =
+        static_cast<std::size_t>(num_blocks_x) * num_rows;
+    static std::uint64_t* s_partial_pairs = nullptr;
+    static std::size_t s_pairs_cap = 0;
+    if (pairs_elems > s_pairs_cap) {
+        if (s_partial_pairs) cudaFree(s_partial_pairs);
+        cudaMalloc(&s_partial_pairs, pairs_elems * sizeof(std::uint64_t));
+        s_pairs_cap = pairs_elems;
+    }
+
+    dim3 grid(num_blocks_x, num_rows);
+    dim3 block(GEMV_BLOCK_DIM);
+    lm_head_gemv_argmax_int8_kernel<<<grid, block, shmem_bytes, stream>>>(
+        static_cast<const __nv_bfloat16*>(hidden_states),
+        lm_head_weight,
+        scale_inv,
+        s_partial_pairs,
+        num_rows,
+        hidden,
+        vocab,
+        num_blocks_x);
+
+    dim3 sel_block(128);
+    dim3 sel_grid((num_rows + sel_block.x - 1) / sel_block.x);
+    select_lm_head_argmax_pairs_kernel<<<sel_grid, sel_block, 0, stream>>>(
+        s_partial_pairs, token_ids, num_rows, num_blocks_x);
+}
+
+// ── BF16 variant of fused GEMV + argmax ──────────────────────────
+__global__ void lm_head_gemv_argmax_bf16_kernel(
+    const __nv_bfloat16* __restrict__ hidden_states,
+    const __nv_bfloat16* __restrict__ lm_head_weight,
+    std::uint64_t* __restrict__ partial_pairs,
+    int num_rows,
+    int hidden,
+    int vocab,
+    int num_blocks_x)
+{
+    const int row = blockIdx.y;
+    const int warp = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+
+    extern __shared__ char shmem_raw2[];
+    float* sh_hidden = reinterpret_cast<float*>(shmem_raw2);
+
+    const auto* h_row = hidden_states +
+        static_cast<long long>(row) * hidden;
+    for (int i = threadIdx.x; i < hidden; i += GEMV_BLOCK_DIM) {
+        sh_hidden[i] = __bfloat162float(h_row[i]);
+    }
+    __syncthreads();
+
+    float best_val = -INFINITY;
+    int best_tok = -1;
+
+    for (int v = blockIdx.x * GEMV_WARPS + warp;
+         v < vocab;
+         v += num_blocks_x * GEMV_WARPS) {
+        const auto* w_row = lm_head_weight +
+            static_cast<long long>(v) * hidden;
+        float sum = 0.f;
+        const int h_vec2 = hidden / 2;
+        const auto* w_row_v2 = reinterpret_cast<const __nv_bfloat162*>(w_row);
+        for (int i = lane; i < h_vec2; i += 32) {
+            const int h = i * 2;
+            const __nv_bfloat162 w2 = __ldg(&w_row_v2[i]);
+            sum += sh_hidden[h]     * __bfloat162float(w2.x)
+                 + sh_hidden[h + 1] * __bfloat162float(w2.y);
+        }
+        float dot = warp_reduce_sum(sum);
+
+        if (lane == 0) {
+            if (dot > best_val || (dot == best_val && v < best_tok)) {
+                best_val = dot;
+                best_tok = v;
+            }
+        }
+    }
+
+    __shared__ float sh_vals2[GEMV_WARPS];
+    __shared__ int sh_toks2[GEMV_WARPS];
+    if (lane == 0) {
+        sh_vals2[warp] = best_val;
+        sh_toks2[warp] = best_tok;
+    }
+    __syncthreads();
+
+    if (threadIdx.x == 0) {
+        float bv = sh_vals2[0];
+        int bt = sh_toks2[0];
+        for (int w = 1; w < GEMV_WARPS; ++w) {
+            update_argmax(sh_vals2[w], sh_toks2[w], bv, bt);
+        }
+        partial_pairs[static_cast<std::size_t>(blockIdx.x) * num_rows + row] =
+            pack_argmax_pair(bv, bt);
+    }
+}
+
+void launch_lm_head_gemv_argmax_bf16(
+    const void* hidden_states,
+    const void* lm_head_weight,
+    std::int32_t* token_ids,
+    int num_rows,
+    int hidden,
+    int vocab,
+    cudaStream_t stream)
+{
+    if (num_rows <= 0 || hidden <= 0 || vocab <= 0) return;
+
+    int num_sms = 0;
+    cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, 0);
+    const int blocks_per_sm = 4;
+    const int max_blocks_x = num_sms * blocks_per_sm;
+    const int min_blocks_x =
+        (vocab + GEMV_WARPS - 1) / GEMV_WARPS;
+    const int num_blocks_x = std::min(max_blocks_x, min_blocks_x);
+    const std::size_t shmem_bytes =
+        static_cast<std::size_t>(hidden) * sizeof(float);
+
+    const std::size_t pairs_elems =
+        static_cast<std::size_t>(num_blocks_x) * num_rows;
+    static std::uint64_t* s_partial_pairs_bf16 = nullptr;
+    static std::size_t s_pairs_cap_bf16 = 0;
+    if (pairs_elems > s_pairs_cap_bf16) {
+        if (s_partial_pairs_bf16) cudaFree(s_partial_pairs_bf16);
+        cudaMalloc(&s_partial_pairs_bf16, pairs_elems * sizeof(std::uint64_t));
+        s_pairs_cap_bf16 = pairs_elems;
+    }
+
+    dim3 grid(num_blocks_x, num_rows);
+    dim3 block(GEMV_BLOCK_DIM);
+    lm_head_gemv_argmax_bf16_kernel<<<grid, block, shmem_bytes, stream>>>(
+        static_cast<const __nv_bfloat16*>(hidden_states),
+        static_cast<const __nv_bfloat16*>(lm_head_weight),
+        s_partial_pairs_bf16,
+        num_rows,
+        hidden,
+        vocab,
+        num_blocks_x);
+
+    dim3 sel_block(128);
+    dim3 sel_grid((num_rows + sel_block.x - 1) / sel_block.x);
+    select_lm_head_argmax_pairs_kernel<<<sel_grid, sel_block, 0, stream>>>(
+        s_partial_pairs_bf16, token_ids, num_rows, num_blocks_x);
+}
+
 void launch_masked_embedding_argmax_bf16(
     const void* centroid_logits,
     const void* hidden_states,

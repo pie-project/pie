@@ -80,4 +80,25 @@ void launch_masked_embedding_tile_argmax_pairs_bf16(
     int num_tiles,
     cudaStream_t stream);
 
+// Fused GEMV + argmax for MTP lm_head scoring. Returns greedy token IDs
+// without materializing logits.
+void launch_lm_head_gemv_argmax_int8(
+    const void* hidden_states,        // [num_rows, hidden] bf16
+    const std::int8_t* lm_head_weight, // [vocab, hidden] int8
+    const float* scale_inv,           // [vocab] fp32 per-channel
+    std::int32_t* token_ids,          // [num_rows]
+    int num_rows,
+    int hidden,
+    int vocab,
+    cudaStream_t stream);
+
+void launch_lm_head_gemv_argmax_bf16(
+    const void* hidden_states,        // [num_rows, hidden] bf16
+    const void* lm_head_weight,       // [vocab, hidden] bf16
+    std::int32_t* token_ids,          // [num_rows]
+    int num_rows,
+    int hidden,
+    int vocab,
+    cudaStream_t stream);
+
 }  // namespace pie_cuda_driver::kernels
