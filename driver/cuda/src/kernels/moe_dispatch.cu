@@ -1,6 +1,7 @@
 #include "kernels/moe_dispatch.hpp"
 
 #include <cuda_bf16.h>
+#include <mma.h>
 
 namespace pie_cuda_driver::kernels {
 
@@ -72,6 +73,50 @@ void launch_scalar_weighted_add_bf16(
 
 namespace {
 
+__global__ void build_dual_bf16_gemm_ptrs_kernel(
+    const __nv_bfloat16* act,
+    const __nv_bfloat16* w0,
+    const __nv_bfloat16* w1,
+    __nv_bfloat16* out0,
+    __nv_bfloat16* out1,
+    const __nv_bfloat16** act_ptrs,
+    const __nv_bfloat16** w_ptrs,
+    __nv_bfloat16** out_ptrs)
+{
+    act_ptrs[0] = act;
+    act_ptrs[1] = act;
+    w_ptrs[0] = w0;
+    w_ptrs[1] = w1;
+    out_ptrs[0] = out0;
+    out_ptrs[1] = out1;
+}
+
+}  // namespace
+
+void launch_build_dual_bf16_gemm_ptrs(
+    const void* act,
+    const void* w0,
+    const void* w1,
+    void* out0,
+    void* out1,
+    const void** act_ptrs,
+    const void** w_ptrs,
+    void** out_ptrs,
+    cudaStream_t stream)
+{
+    build_dual_bf16_gemm_ptrs_kernel<<<1, 1, 0, stream>>>(
+        static_cast<const __nv_bfloat16*>(act),
+        static_cast<const __nv_bfloat16*>(w0),
+        static_cast<const __nv_bfloat16*>(w1),
+        static_cast<__nv_bfloat16*>(out0),
+        static_cast<__nv_bfloat16*>(out1),
+        reinterpret_cast<const __nv_bfloat16**>(act_ptrs),
+        reinterpret_cast<const __nv_bfloat16**>(w_ptrs),
+        reinterpret_cast<__nv_bfloat16**>(out_ptrs));
+}
+
+namespace {
+
 __global__ void batched_weighted_sum_bf16_kernel(
     __nv_bfloat16* __restrict__ out,
     const __nv_bfloat16* __restrict__ src,   // [batch, hidden]
@@ -128,6 +173,28 @@ __global__ void token_batched_weighted_sum_bf16_kernel(
     out[static_cast<long long>(n) * hidden + h] = __float2bfloat16(acc);
 }
 
+__global__ void token_batched_weighted_sum_add_bf16_kernel(
+    __nv_bfloat16* __restrict__ out,
+    const __nv_bfloat16* __restrict__ src,   // [num_tokens, top_k, hidden]
+    const float* __restrict__ weights,       // [num_tokens, top_k]
+    int top_k, int hidden)
+{
+    const int n = blockIdx.y;
+    const int h = blockIdx.x * blockDim.x + threadIdx.x;
+    if (h >= hidden) return;
+    const long long base = static_cast<long long>(n) * top_k;
+    float acc = 0.f;
+    #pragma unroll
+    for (int k = 0; k < 16; ++k) {
+        if (k >= top_k) break;
+        const long long r = base + k;
+        const float v = __bfloat162float(src[r * hidden + h]);
+        acc += weights[r] * v;
+    }
+    const long long out_idx = static_cast<long long>(n) * hidden + h;
+    out[out_idx] = __float2bfloat16(__bfloat162float(out[out_idx]) + acc);
+}
+
 }  // namespace
 
 void launch_token_batched_weighted_sum_bf16(
@@ -138,6 +205,19 @@ void launch_token_batched_weighted_sum_bf16(
     constexpr int BS = 256;
     const dim3 grid((hidden + BS - 1) / BS, num_tokens);
     token_batched_weighted_sum_bf16_kernel<<<grid, BS, 0, stream>>>(
+        static_cast<__nv_bfloat16*>(out),
+        static_cast<const __nv_bfloat16*>(src),
+        weights, top_k, hidden);
+}
+
+void launch_token_batched_weighted_sum_add_bf16(
+    void* out, const void* src, const float* weights,
+    int num_tokens, int top_k, int hidden, cudaStream_t stream)
+{
+    if (num_tokens <= 0 || top_k <= 0 || hidden <= 0) return;
+    constexpr int BS = 256;
+    const dim3 grid((hidden + BS - 1) / BS, num_tokens);
+    token_batched_weighted_sum_add_bf16_kernel<<<grid, BS, 0, stream>>>(
         static_cast<__nv_bfloat16*>(out),
         static_cast<const __nv_bfloat16*>(src),
         weights, top_k, hidden);
@@ -336,6 +416,134 @@ void launch_build_moe_ptrs_decode_batched_bf16(
 
 namespace {
 
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+using namespace nvcuda;
+#endif
+
+template <bool ActByToken>
+__global__ void moe_decode_wmma_bf16_kernel(
+    const std::int32_t* __restrict__ topk_idx,
+    const __nv_bfloat16* __restrict__ act,
+    const __nv_bfloat16* __restrict__ weight_base,
+    __nv_bfloat16* __restrict__ out,
+    int top_k,
+    int K,
+    int N,
+    long long expert_stride)
+{
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    constexpr int N_TILE = 64;
+    const int n0 = blockIdx.x * N_TILE;
+    const int route = blockIdx.y;
+    const int expert = topk_idx[route];
+    if (expert < 0 || n0 >= N) return;
+
+    extern __shared__ __align__(16) unsigned char wmma_smem[];
+    auto* a_tile = reinterpret_cast<__nv_bfloat16*>(wmma_smem);
+    auto* c_tile = reinterpret_cast<float*>(a_tile + 16 * 16);
+    const int warp_id = threadIdx.x / 32;
+    const int lane = threadIdx.x & 31;
+    const int n_warp = n0 + warp_id * 16;
+
+    const int token = route / top_k;
+    const __nv_bfloat16* act_row =
+        act + static_cast<long long>(ActByToken ? token : route) * K;
+    const __nv_bfloat16* weight =
+        weight_base + static_cast<long long>(expert) * expert_stride;
+
+    wmma::fragment<wmma::matrix_a, 16, 16, 16, __nv_bfloat16, wmma::row_major> a_frag;
+    wmma::fragment<wmma::matrix_b, 16, 16, 16, __nv_bfloat16, wmma::col_major> b_frag;
+    wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc_frag;
+    wmma::fill_fragment(acc_frag, 0.0f);
+
+    for (int k0 = 0; k0 < K; k0 += 16) {
+        for (int i = threadIdx.x; i < 16 * 16; i += blockDim.x) {
+            a_tile[i] = __float2bfloat16(0.0f);
+        }
+        if (threadIdx.x < 16) {
+            a_tile[threadIdx.x] = act_row[k0 + threadIdx.x];
+        }
+        __syncthreads();
+
+        wmma::load_matrix_sync(a_frag, a_tile, 16);
+        wmma::load_matrix_sync(
+            b_frag,
+            weight + static_cast<long long>(n_warp) * K + k0,
+            K);
+        wmma::mma_sync(acc_frag, a_frag, b_frag, acc_frag);
+        __syncthreads();
+    }
+
+    wmma::store_matrix_sync(
+        c_tile + warp_id * 16 * 16, acc_frag, 16, wmma::mem_row_major);
+    __syncthreads();
+
+    if (lane < 16) {
+        const long long out_base = static_cast<long long>(route) * N + n0;
+        out[out_base + warp_id * 16 + lane] =
+            __float2bfloat16(c_tile[warp_id * 16 * 16 + lane]);
+    }
+#endif
+}
+
+}  // namespace
+
+void launch_moe_gate_up_decode_wmma_bf16(
+    const std::int32_t* topk_idx,
+    const void* norm_x,
+    const void* gate_up_base,
+    void* expert_gate_up,
+    int num_tokens,
+    int top_k,
+    int H,
+    int I_moe,
+    cudaStream_t stream)
+{
+    const int routes = num_tokens * top_k;
+    const int N = 2 * I_moe;
+    if (routes <= 0 || H <= 0 || N <= 0 || (H % 16) != 0 || (N % 64) != 0) {
+        return;
+    }
+    const dim3 grid(N / 64, routes);
+    const std::size_t smem =
+        (16 * 16 * sizeof(__nv_bfloat16)) + (4 * 16 * 16 * sizeof(float));
+    moe_decode_wmma_bf16_kernel</*ActByToken=*/true><<<grid, 128, smem, stream>>>(
+        topk_idx,
+        static_cast<const __nv_bfloat16*>(norm_x),
+        static_cast<const __nv_bfloat16*>(gate_up_base),
+        static_cast<__nv_bfloat16*>(expert_gate_up),
+        top_k, H, N, static_cast<long long>(N) * H);
+}
+
+void launch_moe_down_decode_wmma_bf16(
+    const std::int32_t* topk_idx,
+    const void* expert_act,
+    const void* down_base,
+    void* expert_out,
+    int num_tokens,
+    int top_k,
+    int H,
+    int I_moe,
+    cudaStream_t stream)
+{
+    const int routes = num_tokens * top_k;
+    if (routes <= 0 || H <= 0 || I_moe <= 0 ||
+        (I_moe % 16) != 0 || (H % 64) != 0) {
+        return;
+    }
+    const dim3 grid(H / 64, routes);
+    const std::size_t smem =
+        (16 * 16 * sizeof(__nv_bfloat16)) + (4 * 16 * 16 * sizeof(float));
+    moe_decode_wmma_bf16_kernel</*ActByToken=*/false><<<grid, 128, smem, stream>>>(
+        topk_idx,
+        static_cast<const __nv_bfloat16*>(expert_act),
+        static_cast<const __nv_bfloat16*>(down_base),
+        static_cast<__nv_bfloat16*>(expert_out),
+        top_k, I_moe, H, static_cast<long long>(H) * I_moe);
+}
+
+namespace {
+
 __global__ void moe_align_decode_kernel(
     const std::int32_t* __restrict__ topk_idx,
     std::int32_t* __restrict__ sorted_route_ids,
@@ -346,8 +554,8 @@ __global__ void moe_align_decode_kernel(
     int block_size,
     int max_blocks)
 {
-    extern __shared__ std::int32_t smem[];
-    std::int32_t* counts = smem;
+    extern __shared__ std::int32_t align_smem[];
+    std::int32_t* counts = align_smem;
     std::int32_t* offsets = counts + num_experts;
     std::int32_t* fill = offsets + num_experts + 1;
 
@@ -416,8 +624,8 @@ __global__ void moe_bucket_exact_kernel(
     int num_routes,
     int num_experts)
 {
-    extern __shared__ std::int32_t smem[];
-    std::int32_t* counts = smem;
+    extern __shared__ std::int32_t bucket_smem[];
+    std::int32_t* counts = bucket_smem;
     std::int32_t* offsets = counts + num_experts;
     std::int32_t* fill = offsets + num_experts + 1;
 

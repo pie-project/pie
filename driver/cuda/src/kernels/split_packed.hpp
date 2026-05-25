@@ -57,4 +57,29 @@ void launch_qkv_decode_qk_norm_rope_write_kv_bf16(
     float eps,
     cudaStream_t stream);
 
+// Gemma4 row-decode verifier fast path for packed [Q;K;V] projection output.
+// Each input row has a corresponding decode-style KV page table row. The
+// kernel writes only Q scratch plus normalized/rotated K and normalized V
+// directly into the paged cache, preserving the unfused bf16 rounding points.
+void launch_qkv_packed_qk_norm_rope_vnorm_write_kv_bf16(
+    const void* packed,
+    void* q_out,
+    void* k_pages,
+    void* v_pages,
+    const void* q_weight,
+    const void* k_weight,
+    const std::int32_t* positions,
+    const std::uint32_t* kv_page_indices,
+    const std::uint32_t* kv_page_indptr,
+    const std::uint32_t* kv_last_page_lens,
+    int num_rows,
+    int num_q_heads,
+    int num_kv_heads,
+    int head_dim,
+    int page_size,
+    bool hnd_layout,
+    float theta,
+    float eps,
+    cudaStream_t stream);
+
 }  // namespace pie_cuda_driver::kernels

@@ -200,6 +200,9 @@ fn forward_response_round_trip() {
         tokens: vec![100, 101, 200, 201, 202],
         entropies_indptr: vec![0, 1, 2],
         entropies: vec![0.42, 1.5],
+        spec_indptr: vec![0, 2, 3],
+        spec_tokens: vec![11, 12, 21],
+        spec_positions: vec![5, 6, 9],
         ..Default::default()
     };
     let f = ResponseFrame {
@@ -215,6 +218,9 @@ fn forward_response_round_trip() {
     };
     assert_eq!(fr.num_requests, 2u32);
     assert_eq!(fr.tokens.as_slice(), &[100u32, 101, 200, 201, 202]);
+    assert_eq!(fr.spec_indptr.as_slice(), &[0u32, 2, 3]);
+    assert_eq!(fr.spec_tokens.as_slice(), &[11u32, 12, 21]);
+    assert_eq!(fr.spec_positions.as_slice(), &[5u32, 6, 9]);
 }
 
 #[test]

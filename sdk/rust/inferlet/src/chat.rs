@@ -32,6 +32,16 @@ pub fn user(model: &Model, message: &str) -> Vec<u32> {
     crate::pie::instruct::chat::user(model, message)
 }
 
+/// Token sequence for the first user-role message in a fresh chat.
+pub fn first_user(model: &Model, message: &str) -> Vec<u32> {
+    crate::pie::instruct::chat::first_user(model, message)
+}
+
+/// Token sequence for a system message followed by the first user message.
+pub fn system_user(model: &Model, system: &str, user: &str) -> Vec<u32> {
+    crate::pie::instruct::chat::system_user(model, system, user)
+}
+
 /// Token sequence for an assistant-role message (history replay).
 pub fn assistant(model: &Model, message: &str) -> Vec<u32> {
     crate::pie::instruct::chat::assistant(model, message)

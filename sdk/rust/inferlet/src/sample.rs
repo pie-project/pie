@@ -43,6 +43,11 @@ pub enum Sampler {
 }
 
 impl Sampler {
+    /// True when this sampler is deterministic greedy decoding.
+    pub const fn is_argmax(&self) -> bool {
+        matches!(self, Self::Argmax)
+    }
+
     /// Top-p (nucleus) sampling. `temperature = 0.0` collapses to argmax.
     pub const fn top_p(temperature: f32, p: f32) -> Self {
         Self::TopP { temperature, p }

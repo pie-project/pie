@@ -44,6 +44,9 @@ struct PerRequestOutput {
     std::vector<std::vector<float>> logprobs;
     // One f32 per `Sampler::Entropy` slot.
     std::vector<float> entropies;
+    // Next-iteration system-speculation drafts.
+    std::vector<std::uint32_t> spec_tokens;
+    std::vector<std::uint32_t> spec_positions;
 };
 
 class ResponseBuilder {
@@ -73,12 +76,16 @@ public:
         logprobs_values_.clear();
         entropies_indptr_.clear();
         entropies_.clear();
+        spec_indptr_.clear();
+        spec_tokens_.clear();
+        spec_positions_.clear();
 
         tokens_indptr_.reserve(R + 1);
         dists_req_indptr_.reserve(R + 1);
         logits_req_indptr_.reserve(R + 1);
         logprobs_req_indptr_.reserve(R + 1);
         entropies_indptr_.reserve(R + 1);
+        spec_indptr_.reserve(R + 1);
 
         // Two-level indptrs start with a leading 0 for the kv/byte/val side.
         dists_kv_indptr_.push_back(0);
@@ -96,9 +103,14 @@ public:
             logprobs_req_indptr_.push_back(
                 static_cast<std::uint32_t>(logprobs_val_indptr_.size() - 1));
             entropies_indptr_.push_back(static_cast<std::uint32_t>(entropies_.size()));
+            spec_indptr_.push_back(static_cast<std::uint32_t>(spec_tokens_.size()));
 
             tokens_.insert(tokens_.end(), pr.tokens.begin(), pr.tokens.end());
             entropies_.insert(entropies_.end(), pr.entropies.begin(), pr.entropies.end());
+            spec_tokens_.insert(spec_tokens_.end(),
+                                pr.spec_tokens.begin(), pr.spec_tokens.end());
+            spec_positions_.insert(spec_positions_.end(),
+                                   pr.spec_positions.begin(), pr.spec_positions.end());
 
             for (const auto& [ids, probs] : pr.dists) {
                 dists_ids_.insert(dists_ids_.end(), ids.begin(), ids.end());
@@ -129,6 +141,7 @@ public:
         logprobs_req_indptr_.push_back(
             static_cast<std::uint32_t>(logprobs_val_indptr_.size() - 1));
         entropies_indptr_.push_back(static_cast<std::uint32_t>(entropies_.size()));
+        spec_indptr_.push_back(static_cast<std::uint32_t>(spec_tokens_.size()));
 
         out = PieForwardResponseView{};
         out.num_requests = R;
@@ -146,6 +159,9 @@ public:
         out.logprobs_values      = slice_from(logprobs_values_.data(), logprobs_values_.size());
         out.entropies_indptr     = slice_from(entropies_indptr_.data(), entropies_indptr_.size());
         out.entropies            = slice_from(entropies_.data(), entropies_.size());
+        out.spec_indptr          = slice_from(spec_indptr_.data(), spec_indptr_.size());
+        out.spec_tokens          = slice_from(spec_tokens_.data(), spec_tokens_.size());
+        out.spec_positions       = slice_from(spec_positions_.data(), spec_positions_.size());
     }
 
     inline void build_token_only(std::span<const std::uint32_t> per_request_counts,
@@ -196,12 +212,16 @@ private:
         logprobs_values_.clear();
         entropies_indptr_.clear();
         entropies_.clear();
+        spec_indptr_.clear();
+        spec_tokens_.clear();
+        spec_positions_.clear();
 
         tokens_indptr_.reserve(static_cast<std::size_t>(R) + 1);
         dists_req_indptr_.assign(static_cast<std::size_t>(R) + 1, 0);
         logits_req_indptr_.assign(static_cast<std::size_t>(R) + 1, 0);
         logprobs_req_indptr_.assign(static_cast<std::size_t>(R) + 1, 0);
         entropies_indptr_.assign(static_cast<std::size_t>(R) + 1, 0);
+        spec_indptr_.assign(static_cast<std::size_t>(R) + 1, 0);
         dists_kv_indptr_.assign(1, 0);
         logits_byte_indptr_.assign(1, 0);
         logprobs_val_indptr_.assign(1, 0);
@@ -224,6 +244,9 @@ private:
         out.logprobs_values      = slice_from(logprobs_values_.data(), logprobs_values_.size());
         out.entropies_indptr     = slice_from(entropies_indptr_.data(), entropies_indptr_.size());
         out.entropies            = slice_from(entropies_.data(), entropies_.size());
+        out.spec_indptr          = slice_from(spec_indptr_.data(), spec_indptr_.size());
+        out.spec_tokens          = slice_from(spec_tokens_.data(), spec_tokens_.size());
+        out.spec_positions       = slice_from(spec_positions_.data(), spec_positions_.size());
     }
 
     // Concatenated bodies + R+1 indptrs. Reused fire-to-fire — `build()`
@@ -242,6 +265,9 @@ private:
     std::vector<float>         logprobs_values_;
     std::vector<std::uint32_t> entropies_indptr_;
     std::vector<float>         entropies_;
+    std::vector<std::uint32_t> spec_indptr_;
+    std::vector<std::uint32_t> spec_tokens_;
+    std::vector<std::uint32_t> spec_positions_;
 };
 
 }  // namespace pie_driver

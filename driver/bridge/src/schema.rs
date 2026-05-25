@@ -213,6 +213,13 @@ pub struct ForwardResponse {
 
     pub entropies_indptr: Vec<u32>,
     pub entropies: Vec<f32>,
+
+    /// Per-request speculative draft side channel. `spec_indptr` has
+    /// `num_requests + 1` entries and partitions both `spec_tokens` and
+    /// `spec_positions`.
+    pub spec_indptr: Vec<u32>,
+    pub spec_tokens: Vec<u32>,
+    pub spec_positions: Vec<u32>,
 }
 
 // =============================================================================

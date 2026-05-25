@@ -18,6 +18,15 @@ use crate::workflow::WorkflowId;
 use super::Session;
 use super::data_transfer::{ChunkResult, InFlightUpload};
 
+fn trim_trailing_zeros(values: &[u64]) -> Vec<u64> {
+    let end = values
+        .iter()
+        .rposition(|&value| value != 0)
+        .map(|idx| idx + 1)
+        .unwrap_or(0);
+    values[..end].to_vec()
+}
+
 // =============================================================================
 // Query Handlers
 // =============================================================================
@@ -121,6 +130,36 @@ impl Session {
                     stats.insert(
                         format!("{}.avg_stats_update_us", model_name),
                         serde_json::Value::from(inf.avg_stats_update_us),
+                    );
+                    stats.insert(
+                        format!("{}.system_spec_draft_tokens_proposed", model_name),
+                        serde_json::Value::from(inf.system_spec_draft_tokens_proposed),
+                    );
+                    stats.insert(
+                        format!("{}.system_spec_draft_tokens_accepted", model_name),
+                        serde_json::Value::from(inf.system_spec_draft_tokens_accepted),
+                    );
+                    stats.insert(
+                        format!(
+                            "{}.system_spec_draft_tokens_proposed_per_pos",
+                            model_name
+                        ),
+                        serde_json::json!(
+                            trim_trailing_zeros(
+                                &inf.system_spec_draft_tokens_proposed_per_pos
+                            )
+                        ),
+                    );
+                    stats.insert(
+                        format!(
+                            "{}.system_spec_draft_tokens_accepted_per_pos",
+                            model_name
+                        ),
+                        serde_json::json!(
+                            trim_trailing_zeros(
+                                &inf.system_spec_draft_tokens_accepted_per_pos
+                            )
+                        ),
                     );
                     // Speculation hit counters — observability for
                     // `try_hit`/chain submissions/drops.

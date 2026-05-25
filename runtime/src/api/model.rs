@@ -48,6 +48,11 @@ impl pie::core::model::HostModel for InstanceState {
         Ok(self.ctx().table.push(tokenizer)?)
     }
 
+    async fn default_system_speculation(&mut self, this: Resource<Model>) -> Result<bool> {
+        let model = self.ctx().table.get(&this)?;
+        Ok(model.model.default_system_speculation())
+    }
+
     async fn drop(&mut self, this: Resource<Model>) -> Result<()> {
         self.ctx().table.delete(this)?;
         Ok(())

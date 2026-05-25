@@ -107,6 +107,11 @@ activation_dtype = "bfloat16"
 gpu_mem_utilization = 0.90
 memory_profile = "auto"
 kv_cache_dtype = "auto"
+# Optional Gemma4 native MTP drafter for `.system_speculation()`.
+# If omitted, cuda_native auto-discovers a paired HF cache
+# `-assistant` checkpoint when one is available.
+# mtp_assistant_snapshot_dir = "/path/to/gemma4_assistant"
+mtp_num_drafts = 3
 "#;
 
 const DUMMY_DRIVER_BLOCK: &str = r#"

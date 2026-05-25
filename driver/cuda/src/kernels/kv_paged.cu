@@ -2,6 +2,7 @@
 
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
+#include <stdexcept>
 
 #include "cuda_check.hpp"
 
@@ -56,6 +57,53 @@ __global__ void write_kv_kernel(
     const int page_in_req     = abs_kv_pos / page_size;
     const int offset_in_page  = abs_kv_pos % page_size;
     const int actual_page     = static_cast<int>(kv_page_indices[pages_first + page_in_req]);
+
+    const long long row = h_kv * d;
+    const long long src = static_cast<long long>(t) * row;
+    for (int i = threadIdx.x; i < row; i += blockDim.x) {
+        long long dst;
+        if constexpr (HND_LAYOUT) {
+            const int h = i / d;
+            const int j = i - h * d;
+            dst = ((static_cast<long long>(actual_page) * h_kv + h) *
+                   page_size + offset_in_page) * d + j;
+        } else {
+            dst = ((static_cast<long long>(actual_page) * page_size) +
+                   offset_in_page) * row + i;
+        }
+        k_pages[dst] = k_curr[src + i];
+        v_pages[dst] = v_curr[src + i];
+    }
+}
+
+template <bool HND_LAYOUT>
+__global__ void write_kv_at_positions_kernel(
+    const __nv_bfloat16* __restrict__ k_curr,
+    const __nv_bfloat16* __restrict__ v_curr,
+    __nv_bfloat16* __restrict__ k_pages,
+    __nv_bfloat16* __restrict__ v_pages,
+    const std::int32_t* __restrict__ positions,
+    int position_delta,
+    const std::uint32_t* __restrict__ qo_indptr,
+    const std::uint32_t* __restrict__ kv_page_indices,
+    const std::uint32_t* __restrict__ kv_page_indptr,
+    int R,
+    int page_size,
+    int h_kv,
+    int d)
+{
+    const int t = blockIdx.x;
+    const int abs_kv_pos = positions[t] + position_delta;
+    if (abs_kv_pos < 0) return;
+
+    const int r = find_request(qo_indptr, R, t);
+    const int pages_first = kv_page_indptr[r];
+    const int pages_last = kv_page_indptr[r + 1];
+    const int page_in_req = abs_kv_pos / page_size;
+    if (page_in_req < 0 || pages_first + page_in_req >= pages_last) return;
+    const int offset_in_page = abs_kv_pos % page_size;
+    const int actual_page =
+        static_cast<int>(kv_page_indices[pages_first + page_in_req]);
 
     const long long row = h_kv * d;
     const long long src = static_cast<long long>(t) * row;
@@ -603,6 +651,46 @@ void launch_write_kv_to_pages(
         }
         case KvCacheScheme::Native:
             break;
+    }
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void launch_write_kv_to_pages_at_positions_bf16(
+    KvCacheLayerView layer,
+    const void* k_curr,
+    const void* v_curr,
+    const std::int32_t* positions,
+    int position_delta,
+    const std::uint32_t* qo_indptr,
+    const std::uint32_t* kv_page_indices,
+    const std::uint32_t* kv_page_indptr,
+    int total_tokens,
+    int num_requests,
+    cudaStream_t stream)
+{
+    if (!layer.is_native_bf16()) {
+        throw std::runtime_error(
+            "write_kv_to_pages_at_positions_bf16 requires native bf16 KV cache");
+    }
+    constexpr int BLOCK = 256;
+    if (layer.hnd_layout) {
+        write_kv_at_positions_kernel<true><<<total_tokens, BLOCK, 0, stream>>>(
+            static_cast<const __nv_bfloat16*>(k_curr),
+            static_cast<const __nv_bfloat16*>(v_curr),
+            static_cast<__nv_bfloat16*>(layer.k_pages),
+            static_cast<__nv_bfloat16*>(layer.v_pages),
+            positions, position_delta, qo_indptr, kv_page_indices,
+            kv_page_indptr, num_requests, layer.page_size,
+            layer.num_kv_heads, layer.head_dim);
+    } else {
+        write_kv_at_positions_kernel<false><<<total_tokens, BLOCK, 0, stream>>>(
+            static_cast<const __nv_bfloat16*>(k_curr),
+            static_cast<const __nv_bfloat16*>(v_curr),
+            static_cast<__nv_bfloat16*>(layer.k_pages),
+            static_cast<__nv_bfloat16*>(layer.v_pages),
+            positions, position_delta, qo_indptr, kv_page_indices,
+            kv_page_indptr, num_requests, layer.page_size,
+            layer.num_kv_heads, layer.head_dim);
     }
     CUDA_CHECK(cudaGetLastError());
 }

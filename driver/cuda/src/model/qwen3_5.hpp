@@ -48,6 +48,8 @@ struct Qwen3_5LayerWeights {
     const DeviceTensor* la_in_proj_z   = nullptr;  // [V, H]       bf16
     const DeviceTensor* la_in_proj_b   = nullptr;  // [V_heads, H] bf16
     const DeviceTensor* la_in_proj_a   = nullptr;  // [V_heads, H] bf16
+    const DeviceTensor* la_in_proj_qkvz = nullptr; // [2*K + 2*V, H] bf16
+    const DeviceTensor* la_in_proj_ba   = nullptr; // [2*V_heads, H] bf16
     const DeviceTensor* la_conv1d_w    = nullptr;  // [conv_dim, 1, K] bf16
     const DeviceTensor* la_conv1d_b    = nullptr;  // [conv_dim] bf16 (may be null)
     const DeviceTensor* la_dt_bias     = nullptr;  // [V_heads] bf16
@@ -66,12 +68,13 @@ struct Qwen3_5LayerWeights {
     const DeviceTensor* fa_o_proj      = nullptr;  // [H, Hq*d] bf16
     const DeviceTensor* fa_q_norm      = nullptr;  // [d] bf16 ((1+w) gemma-style)
     const DeviceTensor* fa_k_norm      = nullptr;  // [d] bf16
+    const DeviceTensor* fa_qgkv_proj_fused = nullptr;  // [2*Hq + 2*Hkv, H] bf16
 
     // ── MLP (both kinds) ───────────────────────────────────────────
     const DeviceTensor* gate_proj = nullptr;  // [I, H] bf16
     const DeviceTensor* up_proj   = nullptr;  // [I, H] bf16
     const DeviceTensor* down_proj = nullptr;  // [H, I] bf16
-
+    const DeviceTensor* gate_up_proj_fused = nullptr;  // [2*I, H] bf16
     // Optional QuantMeta companions for the GEMM-fed projections. The
     // materialized WeightStore owns this metadata after storage-program execution.
     // Linear-attn weights stay bf16 for now (their fused [K1|K2|V] block
@@ -109,8 +112,22 @@ struct Qwen3_5Weights {
     // [K1 | K2 | V] block layout doesn't shard cleanly under uniform
     // axis-0 partitioning, so we slice per-block here.
     std::vector<DeviceTensor> owned_bf16_buffers;
+    std::vector<DeviceTensor> owned_int8_buffers;
+    std::vector<DeviceBuffer<float>> owned_scale_buffers;
+
+    struct MtpWeights {
+        const DeviceTensor* pre_fc_norm_embedding = nullptr;
+        const DeviceTensor* pre_fc_norm_hidden = nullptr;
+        const DeviceTensor* fc = nullptr;    // [H, 2H]
+        const DeviceTensor* norm = nullptr;  // final MTP norm
+        const DeviceTensor* embed = nullptr; // aliases base embed unless dedicated
+        const DeviceTensor* lm_head = nullptr; // aliases base lm_head by default
+        const DeviceBuffer<float>* lm_head_scale_inv = nullptr; // INT8 per-channel
+        Qwen3_5LayerWeights layer;
+    };
+    std::optional<MtpWeights> mtp;
 };
 
-Qwen3_5Weights bind_qwen3_5(const LoadedModel& engine);
+Qwen3_5Weights bind_qwen3_5(LoadedModel& engine);
 
 }  // namespace pie_cuda_driver::model

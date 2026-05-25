@@ -199,6 +199,10 @@ struct PieForwardResponseView {
 
     PieSlice<std::uint32_t> entropies_indptr;
     PieSlice<float>         entropies;
+
+    PieSlice<std::uint32_t> spec_indptr;
+    PieSlice<std::uint32_t> spec_tokens;
+    PieSlice<std::uint32_t> spec_positions;
 };
 
 // ---- Top-level request / response views -----------------------------------
@@ -567,6 +571,13 @@ inline void build_response_desc(std::uint32_t driver_id,
         fr.entropies_indptr_len = view.forward.entropies_indptr.size();
         fr.entropies_ptr        = view.forward.entropies.data();
         fr.entropies_len        = view.forward.entropies.size();
+
+        fr.spec_indptr_ptr   = view.forward.spec_indptr.data();
+        fr.spec_indptr_len   = view.forward.spec_indptr.size();
+        fr.spec_tokens_ptr   = view.forward.spec_tokens.data();
+        fr.spec_tokens_len   = view.forward.spec_tokens.size();
+        fr.spec_positions_ptr = view.forward.spec_positions.data();
+        fr.spec_positions_len = view.forward.spec_positions.size();
     } else {
         // Everything else (copy / adapter / health / unknown) just
         // produces a StatusResponse with the int code.

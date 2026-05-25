@@ -45,6 +45,19 @@ void launch_write_kv_to_pages(
     int num_requests,
     cudaStream_t stream);
 
+void launch_write_kv_to_pages_at_positions_bf16(
+    KvCacheLayerView layer,
+    const void* k_curr,                            // [total_tokens, h_kv, d]
+    const void* v_curr,
+    const std::int32_t* positions,                 // [total_tokens], absolute positions
+    int position_delta,
+    const std::uint32_t* qo_indptr,                // [R+1]
+    const std::uint32_t* kv_page_indices,
+    const std::uint32_t* kv_page_indptr,           // [R+1]
+    int total_tokens,
+    int num_requests,
+    cudaStream_t stream);
+
 void launch_dequant_kv_cache_layer_to_bf16_active(
     KvCacheLayerView layer,
     const std::uint32_t* kv_page_indices,

@@ -40,6 +40,25 @@ impl pie::instruct::chat::Host for InstanceState {
         Ok(model.model.instruct().user(&message))
     }
 
+    async fn first_user(
+        &mut self,
+        model: Resource<crate::api::model::Model>,
+        message: String,
+    ) -> Result<Vec<u32>> {
+        let model = self.ctx().table.get(&model)?;
+        Ok(model.model.instruct().first_user(&message))
+    }
+
+    async fn system_user(
+        &mut self,
+        model: Resource<crate::api::model::Model>,
+        system: String,
+        user: String,
+    ) -> Result<Vec<u32>> {
+        let model = self.ctx().table.get(&model)?;
+        Ok(model.model.instruct().system_user(&system, &user))
+    }
+
     async fn assistant(
         &mut self,
         model: Resource<crate::api::model::Model>,

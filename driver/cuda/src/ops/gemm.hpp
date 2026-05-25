@@ -226,6 +226,14 @@ void gemm_act_x_wt_bf16_out_fp32(
     int N,
     int K);
 
+// Same math as `gemm_act_x_wt_bf16`, but bypasses the cuBLASLt BF16
+// dispatcher. This is useful for a few skinny-M packed projections where
+// Lt's heuristic is slower than cuBLAS GEMMEx.
+void gemm_act_x_wt_bf16_cublas(
+    cublasHandle_t handle,
+    const void* act, const void* W, void* y,
+    int M, int N, int K, float beta = 0.f);
+
 inline void gemm_batched_act_x_wt_bf16(
     cublasHandle_t handle,
     const void* const* act_ptrs_dev,
@@ -237,5 +245,14 @@ inline void gemm_batched_act_x_wt_bf16(
                          act_ptrs_dev, W_ptrs_dev, y_ptrs_dev,
                          M, N, K, batch_count, beta);
 }
+
+// One-shot benchmark of cuBLASLt heuristics + GEMMEx for a given shape.
+// Prints per-algo latencies to stderr. Enabled by PIE_BENCH_LM_HEAD_ALGOS=1.
+// Runs at most once per process. Safe to call on every MTP step — the second
+// and subsequent calls are no-ops.
+void maybe_bench_lm_head_algos(
+    cublasHandle_t handle,
+    const void* act, const void* W, void* y,
+    int M, int N, int K);
 
 }  // namespace pie_cuda_driver::ops

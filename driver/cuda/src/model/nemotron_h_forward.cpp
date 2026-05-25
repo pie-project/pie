@@ -612,7 +612,7 @@ void mamba_layer(
                 static_cast<const std::uint16_t*>(D_bf16),
                 static_cast<const std::uint16_t*>(dt_bias_bf16),
                 static_cast<std::uint16_t*>(
-                    state_cache.recurrent_state_bf16(layer_idx, /*slot=*/0)),
+                    state_cache.recurrent_state_raw(layer_idx, /*slot=*/0)),
                 slot_ids_d,
                 nem_ws.mamba_core.data(),
                 R, m_heads, m_head_dim, cfg.mamba_state_size,
@@ -627,7 +627,7 @@ void mamba_layer(
                 Lw.mamba_dt_bias_f32.data(),
                 dt_precomputed,
                 dA_precomputed,
-                state_cache.recurrent_state_bf16(layer_idx, /*slot=*/0),
+                state_cache.recurrent_state_raw(layer_idx, /*slot=*/0),
                 slot_ids_d,
                 qo_indptr,
                 nem_ws.mamba_core.data(),

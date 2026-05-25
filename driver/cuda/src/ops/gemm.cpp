@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cstdlib>
 #include <cstdint>
+#include <iostream>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -184,6 +185,21 @@ int cublaslt_bf16_algo_index_for_shape(int N, int K) {
     // prefers the third returned Lt heuristic. Larger hidden sizes regress
     // on that choice, so keep the old default for them.
     if (K < 2048 && N >= 12288) return 2;
+    // Qwen3.6-35B-A3B's MTP/lm_head shape (K=2048, very wide vocab)
+    // is a small but repeatable win on the second returned heuristic.
+    if (K == 2048 && N >= 200000) return 1;
+    // Qwen3.6-27B's H=5120 projections and lm_head consistently prefer the
+    // first returned heuristic. `cublaslt_bf16_min_n` already keeps smaller
+    // GEMMs on the regular cuBLAS path.
+    if (K == 5120) return 0;
+    // Qwen3.6-35B-A3B's hidden-size projections (for example GDN qkv and
+    // full-attention q/gate, N≈8k) are faster on the first heuristic. The
+    // old generic index 5 regresses the MTP verifier by several percent.
+    if (K == 2048 && N >= 6144) return 0;
+    // Gemma4 E4B's target lm_head (K=2560, very wide vocab) is slightly
+    // faster with the first returned Lt heuristic; keep this narrow so the
+    // MTP assistant scorer (K=256) and other projection GEMMs stay unchanged.
+    if (K == 2560 && N >= 100000) return 0;
     return 5;
 }
 
@@ -251,6 +267,15 @@ bool run_bf16_lt_plan(
         &plan.algo,
         ctx.workspace, ctx.workspace_bytes, stream);
     return st == CUBLAS_STATUS_SUCCESS;
+}
+
+bool use_cublas_grouped_batched_bf16() {
+    static const bool enabled = [] {
+        const char* v = std::getenv("PIE_CUBLAS_GROUPED_BATCHED_BF16");
+        if (v == nullptr || v[0] == '\0') return true;
+        return v[0] != '0';
+    }();
+    return enabled;
 }
 
 bool gemm_bf16_lt_impl(
@@ -344,6 +369,137 @@ bool gemm_bf16_lt_impl(
 }
 
 }  // namespace
+
+void maybe_bench_lm_head_algos(
+    cublasHandle_t cublas_handle,
+    const void* act, const void* W, void* y,
+    int M, int N, int K)
+{
+    static const bool enabled = [] {
+        const char* v = std::getenv("PIE_BENCH_LM_HEAD_ALGOS");
+        return v != nullptr && v[0] != '\0' && v[0] != '0';
+    }();
+    if (!enabled) return;
+    static bool done = false;
+    if (done) return;
+    done = true;
+
+    auto& ctx = Bf16LtCtx::instance();
+    ctx.ensure();
+
+    cublasLtMatmulDesc_t op_desc = nullptr;
+    cublasLtMatrixLayout_t a_desc = nullptr;
+    cublasLtMatrixLayout_t b_desc = nullptr;
+    cublasLtMatrixLayout_t c_desc = nullptr;
+    cublasLtMatmulPreference_t pref = nullptr;
+
+    cublasLtMatmulDescCreate(&op_desc, CUBLAS_COMPUTE_32F_FAST_16BF, CUDA_R_32F);
+    cublasOperation_t transa = CUBLAS_OP_T;
+    cublasOperation_t transb = CUBLAS_OP_N;
+    cublasLtMatmulDescSetAttribute(op_desc, CUBLASLT_MATMUL_DESC_TRANSA,
+        &transa, sizeof(transa));
+    cublasLtMatmulDescSetAttribute(op_desc, CUBLASLT_MATMUL_DESC_TRANSB,
+        &transb, sizeof(transb));
+    cublasLtMatrixLayoutCreate(&a_desc, CUDA_R_16BF, K, N, K);
+    cublasLtMatrixLayoutCreate(&b_desc, CUDA_R_16BF, K, M, K);
+    cublasLtMatrixLayoutCreate(&c_desc, CUDA_R_16BF, N, M, N);
+    cublasLtMatmulPreferenceCreate(&pref);
+    cublasLtMatmulPreferenceSetAttribute(
+        pref, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
+        &ctx.workspace_bytes, sizeof(ctx.workspace_bytes));
+
+    cublasLtMatmulHeuristicResult_t heuristics[8]{};
+    int returned = 0;
+    cublasLtMatmulAlgoGetHeuristic(
+        ctx.handle, op_desc, a_desc, b_desc, c_desc, c_desc,
+        pref, 8, heuristics, &returned);
+
+    cudaStream_t stream = nullptr;
+    cublasGetStream(cublas_handle, &stream);
+    const float alpha = 1.f;
+    const float beta = 0.f;
+    constexpr int warmup = 3;
+    constexpr int iters = 10;
+
+    std::cerr << "[pie-bench-lm-head-algos] M=" << M << " N=" << N
+              << " K=" << K << " returned=" << returned << "\n";
+
+    {
+        for (int w = 0; w < warmup; ++w) {
+            cublasGemmEx(cublas_handle,
+                CUBLAS_OP_T, CUBLAS_OP_N, N, M, K, &alpha,
+                W, CUDA_R_16BF, K, act, CUDA_R_16BF, K, &beta,
+                y, CUDA_R_16BF, N,
+                CUBLAS_COMPUTE_32F_FAST_16BF, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+        }
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        cudaEvent_t start, stop;
+        CUDA_CHECK(cudaEventCreate(&start));
+        CUDA_CHECK(cudaEventCreate(&stop));
+        CUDA_CHECK(cudaEventRecord(start, stream));
+        for (int i = 0; i < iters; ++i) {
+            cublasGemmEx(cublas_handle,
+                CUBLAS_OP_T, CUBLAS_OP_N, N, M, K, &alpha,
+                W, CUDA_R_16BF, K, act, CUDA_R_16BF, K, &beta,
+                y, CUDA_R_16BF, N,
+                CUBLAS_COMPUTE_32F_FAST_16BF, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+        }
+        CUDA_CHECK(cudaEventRecord(stop, stream));
+        CUDA_CHECK(cudaEventSynchronize(stop));
+        float ms = 0.0f;
+        CUDA_CHECK(cudaEventElapsedTime(&ms, start, stop));
+        std::cerr << "[pie-bench-lm-head-algos]   GEMMEx: "
+                  << (ms / iters) << " ms\n";
+        CUDA_CHECK(cudaEventDestroy(start));
+        CUDA_CHECK(cudaEventDestroy(stop));
+    }
+
+    for (int i = 0; i < returned; ++i) {
+        bool ok = false;
+        for (int w = 0; w < warmup; ++w) {
+            auto st = cublasLtMatmul(
+                ctx.handle, op_desc, &alpha,
+                W, a_desc, act, b_desc, &beta,
+                y, c_desc, y, c_desc,
+                &heuristics[i].algo,
+                ctx.workspace, ctx.workspace_bytes, stream);
+            if (st != CUBLAS_STATUS_SUCCESS) break;
+            ok = true;
+        }
+        if (!ok) {
+            std::cerr << "[pie-bench-lm-head-algos]   Lt[" << i
+                      << "]: FAILED\n";
+            continue;
+        }
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        cudaEvent_t start, stop;
+        CUDA_CHECK(cudaEventCreate(&start));
+        CUDA_CHECK(cudaEventCreate(&stop));
+        CUDA_CHECK(cudaEventRecord(start, stream));
+        for (int it = 0; it < iters; ++it) {
+            cublasLtMatmul(
+                ctx.handle, op_desc, &alpha,
+                W, a_desc, act, b_desc, &beta,
+                y, c_desc, y, c_desc,
+                &heuristics[i].algo,
+                ctx.workspace, ctx.workspace_bytes, stream);
+        }
+        CUDA_CHECK(cudaEventRecord(stop, stream));
+        CUDA_CHECK(cudaEventSynchronize(stop));
+        float ms = 0.0f;
+        CUDA_CHECK(cudaEventElapsedTime(&ms, start, stop));
+        std::cerr << "[pie-bench-lm-head-algos]   Lt[" << i << "]: "
+                  << (ms / iters) << " ms\n";
+        CUDA_CHECK(cudaEventDestroy(start));
+        CUDA_CHECK(cudaEventDestroy(stop));
+    }
+
+    if (pref) cublasLtMatmulPreferenceDestroy(pref);
+    if (c_desc) cublasLtMatrixLayoutDestroy(c_desc);
+    if (b_desc) cublasLtMatrixLayoutDestroy(b_desc);
+    if (a_desc) cublasLtMatrixLayoutDestroy(a_desc);
+    if (op_desc) cublasLtMatmulDescDestroy(op_desc);
+}
 
 CublasHandle::CublasHandle(cudaStream_t stream) {
     check(cublasCreate(&h_), "cublasCreate");
@@ -468,6 +624,32 @@ void gemm_bf16_out_fp32_impl(
     }
 }
 
+void gemm_bf16_cublas_impl(
+    cublasHandle_t handle,
+    const void* act, const void* W, void* y,
+    int M, int N, int K,
+    float beta)
+{
+    const float alpha = 1.f;
+    const auto status = cublasGemmEx(
+        handle,
+        /*transa=*/CUBLAS_OP_T, /*transb=*/CUBLAS_OP_N,
+        /*m=*/N, /*n=*/M, /*k=*/K,
+        &alpha,
+        /*A=*/W,   CUDA_R_16BF, /*lda=*/K,
+        /*B=*/act, CUDA_R_16BF, /*ldb=*/K,
+        &beta,
+        /*C=*/y,   CUDA_R_16BF, /*ldc=*/N,
+        CUBLAS_COMPUTE_32F_FAST_16BF,
+        CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+    if (status != CUBLAS_STATUS_SUCCESS) {
+        throw std::runtime_error(
+            "cuBLAS error (" + std::to_string(static_cast<int>(status)) +
+            "): cublasGemmEx[bf16:cublas] M=" + std::to_string(M) +
+            " N=" + std::to_string(N) + " K=" + std::to_string(K));
+    }
+}
+
 void gemm_batched_bf16_impl(
     cublasHandle_t handle,
     const void* const* act_ptrs_dev,
@@ -479,6 +661,31 @@ void gemm_batched_bf16_impl(
 {
     if (batch_count <= 0) return;
     const float alpha = 1.f;
+    if (use_cublas_grouped_batched_bf16()) {
+        const cublasOperation_t transa_array[1] = {CUBLAS_OP_T};
+        const cublasOperation_t transb_array[1] = {CUBLAS_OP_N};
+        const int m_array[1] = {N};
+        const int n_array[1] = {M};
+        const int k_array[1] = {K};
+        const int lda_array[1] = {K};
+        const int ldb_array[1] = {K};
+        const int ldc_array[1] = {N};
+        const int group_size[1] = {batch_count};
+        const auto status = cublasGemmGroupedBatchedEx(
+            handle,
+            transa_array, transb_array,
+            m_array, n_array, k_array,
+            &alpha,
+            W_ptrs_dev, CUDA_R_16BF, lda_array,
+            act_ptrs_dev, CUDA_R_16BF, ldb_array,
+            &beta,
+            y_ptrs_dev, CUDA_R_16BF, ldc_array,
+            /*group_count=*/1, group_size,
+            CUBLAS_COMPUTE_32F_FAST_16BF);
+        if (status == CUBLAS_STATUS_SUCCESS) {
+            return;
+        }
+    }
     // Same row-major-as-col-major reinterpretation as the unbatched
     // wrapper above: A=W (op_T), B=act (op_N), C=y (col-major NxM).
     const auto status = cublasGemmBatchedEx(
@@ -592,9 +799,11 @@ void validate_quant_weight_view(const char* api, const WeightView& w, int N, int
             " bytes for N=" + std::to_string(N) +
             " K=" + std::to_string(K));
     }
-    std::size_t expected_scales = static_cast<std::size_t>(N);
-    if (w.quant_kind == QuantMeta::Kind::PerGroup && w.group_size > 0) {
-        expected_scales *=
+    std::size_t expected_scales = 1;
+    if (w.quant_kind == QuantMeta::Kind::PerChannel) {
+        expected_scales = static_cast<std::size_t>(N);
+    } else if (w.quant_kind == QuantMeta::Kind::PerGroup && w.group_size > 0) {
+        expected_scales = static_cast<std::size_t>(N) *
             static_cast<std::size_t>((K + w.group_size - 1) / w.group_size);
     }
     if (w.scale_numel < expected_scales) {
@@ -1230,6 +1439,15 @@ void gemm_act_x_wt_bf16_out_fp32(
     int K)
 {
     gemm_bf16_out_fp32_impl(handle, act, W, y, M, N, K);
+}
+
+void gemm_act_x_wt_bf16_cublas(
+    cublasHandle_t handle,
+    const void* act, const void* W, void* y,
+    int M, int N, int K,
+    float beta)
+{
+    gemm_bf16_cublas_impl(handle, act, W, y, M, N, K, beta);
 }
 
 void gemm_batched_act_x_w(

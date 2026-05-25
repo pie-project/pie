@@ -127,8 +127,8 @@ fn working_page_token_ops() {
         let count = pie::context::working_page_token_count(MODEL, id);
         assert_eq!(count, 5);
 
-        // Truncate to 3 tokens
-        pie::context::truncate_working_page_tokens(MODEL, id, 3)
+        // Drop the last 2 tokens, leaving 3.
+        pie::context::truncate_working_page_tokens(MODEL, id, 2)
             .await
             .unwrap();
         assert_eq!(pie::context::working_page_token_count(MODEL, id), 3);
@@ -253,7 +253,7 @@ fn full_page_lifecycle() {
 
         // ── Phase 6: Prepare state with filled tokens, then fork ──
         // Clear working page tokens from Phase 5
-        pie::context::truncate_working_page_tokens(MODEL, id, 0)
+        pie::context::truncate_working_page_tokens(MODEL, id, 3)
             .await
             .unwrap();
         // Fill 2 tokens with positions sequential from max_committed (31)

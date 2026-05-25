@@ -451,6 +451,10 @@ const DeviceTensor& LoadedModel::get(const std::string& name) const {
     return weights_.get(name);
 }
 
+std::size_t LoadedModel::erase_runtime_weight(const std::string& name) {
+    return weights_.erase_runtime_weight(name);
+}
+
 std::optional<QuantMeta> LoadedModel::quant_meta(const std::string& name) const {
     return weights_.quant_meta(name);
 }

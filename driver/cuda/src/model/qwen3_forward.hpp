@@ -6,6 +6,7 @@
 
 #include <cstdint>
 
+#include "device_buffer.hpp"
 #include "model/loaded_model.hpp"
 #include "model/qwen3.hpp"
 #include "ops/gemm.hpp"
@@ -19,6 +20,7 @@ namespace pie_cuda_driver::model {
 struct Qwen3Workspace {
     DeviceTensor y;          // [max_tokens, hidden]
     DeviceTensor norm_x;     // [max_tokens, hidden]
+    DeviceTensor spec_hidden; // [max_tokens, hidden] saved verifier hidden rows
     DeviceTensor qkv_fused;  // [max_tokens, Hq + 2*Hk]   — only allocated when fused
                              // QKV path is in use; empty otherwise.
     DeviceTensor rope_table; // [max_tokens, head_dim] FP32; first half of
@@ -30,6 +32,7 @@ struct Qwen3Workspace {
     DeviceTensor norm_y;     // [max_tokens, hidden]
     DeviceTensor gate_up_fused; // [max_tokens, 2*I] — fused gate+up output, empty
                                 // when unfused
+    DeviceTensor mtp_concat;    // [max_tokens, 2*hidden] — Qwen3.6 MTP fc input
     DeviceTensor gate;       // [max_tokens, intermediate]
     DeviceTensor up;         // [max_tokens, intermediate]
     DeviceTensor logits;     // [max_tokens, vocab]

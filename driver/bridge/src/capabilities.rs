@@ -31,6 +31,17 @@ pub struct DriverCapabilities {
     /// Bytes per recurrent-state slot, for accounting/telemetry.
     #[serde(default)]
     pub rs_cache_slot_bytes: u64,
+    /// True when the driver repairs recurrent state internally after
+    /// system-speculative draft rejection.
+    #[serde(default)]
+    pub rs_cache_spec_rollback: bool,
+    /// True when the driver can return system-provided speculative drafts.
+    #[serde(default)]
+    pub system_speculation_supported: bool,
+    /// True when greedy SDK generation should opt into the system drafter
+    /// by default for this model/driver.
+    #[serde(default)]
+    pub default_system_speculation: bool,
     /// Maximum forward-pass tokens accepted in one driver fire.
     pub max_forward_tokens: u32,
     /// Maximum forward-pass requests accepted in one driver fire.

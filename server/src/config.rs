@@ -797,6 +797,13 @@ pub struct CudaNativeDriverOptions {
     /// BF16-scratch fallback; `"bf16"`/`"dequant"` eagerly materialize BF16
     /// experts; `"native"` requires true MXFP4 GEMM kernels.
     pub mxfp4_moe: String,
+    /// Optional Gemma-4 native MTP assistant checkpoint used by
+    /// `.system_speculation()` on cuda_native. If omitted, the CUDA
+    /// driver auto-discovers the paired `-assistant` checkpoint from
+    /// the Hugging Face cache when available.
+    pub mtp_assistant_snapshot_dir: String,
+    /// Maximum number of MTP draft tokens returned per system-spec step.
+    pub mtp_num_drafts: u32,
 
     pub ready_timeout_s: f64,
     pub shutdown_timeout_s: f64,
@@ -827,6 +834,8 @@ impl Default for CudaNativeDriverOptions {
             verbose: false,
             runtime_quant: String::new(),
             mxfp4_moe: "auto".to_string(),
+            mtp_assistant_snapshot_dir: String::new(),
+            mtp_num_drafts: 3,
             ready_timeout_s: 600.0,
             shutdown_timeout_s: 5.0,
         }
@@ -858,6 +867,10 @@ impl CudaNativeDriverOptions {
             self.mxfp4_moe.is_empty() || MXFP4.contains(&self.mxfp4_moe.as_str()),
             "model.driver.options.mxfp4_moe must be one of {:?}",
             MXFP4
+        );
+        ensure!(
+            self.mtp_num_drafts <= 32,
+            "model.driver.options.mtp_num_drafts must be in 0..=32"
         );
         Ok(())
     }
@@ -1243,6 +1256,8 @@ gpu_mem_utilization = 0.90
 memory_profile = "balanced"
 runtime_quant = "fp8"
 mxfp4_moe = "routed_dequant"
+mtp_assistant_snapshot_dir = "/models/gemma4-mtp"
+mtp_num_drafts = 6
 "#;
         let cfg: Config = toml::from_str(cuda).unwrap();
         cfg.validate().unwrap();
@@ -1253,6 +1268,8 @@ mxfp4_moe = "routed_dequant"
         assert_eq!(opts.memory_profile, CudaMemoryProfile::Balanced);
         assert_eq!(opts.runtime_quant, "fp8");
         assert_eq!(opts.mxfp4_moe, "routed_dequant");
+        assert_eq!(opts.mtp_assistant_snapshot_dir, "/models/gemma4-mtp");
+        assert_eq!(opts.mtp_num_drafts, 6);
         assert_eq!(opts.weight_dtype, "bfloat16"); // default
         assert_eq!(opts.kv_page_size, 32); // default
         assert_eq!(opts.kv_cache_dtype, "auto"); // default
@@ -1277,6 +1294,8 @@ device = ["cuda:0"]
         assert_eq!(opts.gpu_mem_utilization, 0.90);
         assert_eq!(opts.memory_profile, CudaMemoryProfile::Auto);
         assert_eq!(opts.mxfp4_moe, "auto");
+        assert!(opts.mtp_assistant_snapshot_dir.is_empty());
+        assert_eq!(opts.mtp_num_drafts, 3);
         assert_eq!(opts.ready_timeout_s, 600.0);
         assert_eq!(opts.kv_cache_dtype, "auto");
     }

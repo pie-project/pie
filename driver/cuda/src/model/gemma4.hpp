@@ -61,6 +61,7 @@ struct Gemma4LayerWeights {
     const DeviceTensor* k_proj = nullptr;
     const DeviceTensor* v_proj = nullptr;
     const DeviceTensor* o_proj = nullptr;
+    const DeviceTensor* qkv_proj_fused = nullptr;  // [Hq + 2 * Hk, hidden]
     const DeviceTensor* q_norm = nullptr;
     const DeviceTensor* k_norm = nullptr;
 
@@ -69,6 +70,7 @@ struct Gemma4LayerWeights {
     const DeviceTensor* gate_proj = nullptr;
     const DeviceTensor* up_proj   = nullptr;
     const DeviceTensor* down_proj = nullptr;
+    const DeviceTensor* gate_up_proj_fused = nullptr;  // [2 * intermediate, hidden]
 
     // ── Sparse-MoE block (Gemma-4 26B-A4B) ────────────────────────────
     // Runs in parallel with the dense MLP. All pointers nullptr on the
@@ -121,6 +123,17 @@ struct Gemma4Weights {
     // Empty on dense Gemma-4 ckpts; one tensor per layer when MoE is on.
     std::vector<DeviceTensor> owned_router_combined_scales;
 
+    // Dense Gemma4 ships gate/up as separate tensors. Decode/spec batches are
+    // small enough that launching two narrow GEMMs per layer is expensive, so
+    // dense variants can materialize a packed [gate; up] tensor once at bind
+    // time and issue a single wide GEMM in the hot path.
+    std::vector<DeviceTensor> owned_gate_up_fused;
+
+    // Dense non-shared Gemma4 layers can likewise materialize [q; k; v]
+    // projection weights. This avoids two extra small-M GEMM launches on the
+    // layers that actually write K/V.
+    std::vector<DeviceTensor> owned_qkv_fused;
+
     // Cached per-layer arrays for the forward / KV-cache allocator.
     std::vector<int> per_layer_head_dim;
     std::vector<int> per_layer_intermediate;
@@ -160,6 +173,24 @@ struct Gemma4MoeMlpWorkspace {
     // Final accumulator before the post_feedforward_layernorm_2.
     DeviceBuffer<std::uint16_t> moe_out;           // [N, H]
 
+    // Short causal multi-token verification (Gemma4 MTP) can be run as
+    // one FlashInfer decode row per token. These buffers hold the expanded
+    // per-row KV page table and avoid per-fire cudaMalloc churn.
+    DeviceBuffer<std::uint32_t> row_decode_kv_page_indices;
+    DeviceBuffer<std::uint32_t> row_decode_kv_page_indptr;
+    DeviceBuffer<std::uint32_t> row_decode_kv_last_page_lens;
+    std::vector<std::uint32_t> h_row_decode_kv_page_indices;
+    std::vector<std::uint32_t> h_row_decode_kv_page_indptr;
+    std::vector<std::uint32_t> h_row_decode_kv_last_page_lens;
+    ops::DecodePlanCachePtr decode_plan_sliding;
+    ops::DecodePlanCachePtr decode_plan_full;
+    ops::DecodePlanCachePtr row_decode_plan_sliding;
+    ops::DecodePlanCachePtr row_decode_plan_full;
+    bool decode_plans_prepared = false;
+    bool row_decode_prepared = false;
+    int row_decode_prepared_tokens = 0;
+    int row_decode_prepared_requests = 0;
+
     // Decode fast-path (N=1) batched-GEMM pointer arrays.
     DeviceBuffer<const std::uint16_t*> a_gu_ptrs;
     DeviceBuffer<const std::uint16_t*> b_gu_ptrs;
@@ -173,6 +204,7 @@ struct Gemma4MoeMlpWorkspace {
         int max_tokens, int hidden, int num_experts, int top_k,
         int moe_intermediate);
 
+    void allocate_row_decode(int max_tokens);
     void allocate_ple(int max_tokens, int per_layer_total);
 };
 
@@ -200,6 +232,24 @@ Gemma4Weights bind_gemma4(const LoadedModel& engine);
 
 void set_gemma4_logits_argmax_only(bool enabled);
 
+void prepare_gemma4_decode_plans(
+    const Gemma4Weights& w,
+    const HfConfig& cfg,
+    const Gemma4ForwardCfg& fwd_cfg,
+    Gemma4MoeMlpWorkspace& moe_ws,
+    KvCache& cache,
+    AttentionWorkspace& attn_ws,
+    const std::uint32_t* qo_indptr_h,
+    const std::uint32_t* kv_page_indices_h,
+    const std::uint32_t* kv_page_indptr_h,
+    const std::uint32_t* kv_last_page_lens_h,
+    int total_tokens,
+    int num_requests,
+    bool is_pure_decode);
+
+std::uint32_t gemma4_decode_graph_layout(
+    const Gemma4MoeMlpWorkspace& moe_ws);
+
 void gemma4_forward_paged(
     const Gemma4Weights& w,
     const HfConfig& cfg,
@@ -216,7 +266,9 @@ void gemma4_forward_paged(
     const std::uint32_t* kv_page_indptr,
     const std::uint32_t* kv_last_page_lens,
     const std::uint32_t* qo_indptr_h,
+    const std::uint32_t* kv_page_indices_h,
     const std::uint32_t* kv_page_indptr_h,
+    const std::uint32_t* kv_last_page_lens_h,
     int total_tokens,
     int num_requests,
     bool is_pure_decode,

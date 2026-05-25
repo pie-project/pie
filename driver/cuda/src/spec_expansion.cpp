@@ -68,13 +68,13 @@ SpecExpansion expand_spec_batch(const SpecExpansionInputs& in, int R) {
     // request, append n_d+1 verification samplers cloned from that
     // request's first sampler config; their relative sampling indices
     // are [n_in - 1, n_in, ..., n_in + n_d - 1].
-    out.sampler_types.assign       (in.sampler_types.begin(),        in.sampler_types.end());
-    out.sampler_temperatures.assign(in.sampler_temperatures.begin(), in.sampler_temperatures.end());
-    out.sampler_top_p.assign       (in.sampler_top_p.begin(),        in.sampler_top_p.end());
-    out.sampler_min_p.assign       (in.sampler_min_p.begin(),        in.sampler_min_p.end());
-    out.sampler_top_k.assign       (in.sampler_top_k.begin(),        in.sampler_top_k.end());
-    out.sampler_seeds.assign       (in.sampler_seeds.begin(),        in.sampler_seeds.end());
-    out.request_num_samplers.assign(in.request_num_samplers.begin(), in.request_num_samplers.end());
+    out.sampler_types.reserve(in.sampler_types.size() + in.spec_token_ids.size() + R);
+    out.sampler_temperatures.reserve(in.sampler_temperatures.size() + in.spec_token_ids.size() + R);
+    out.sampler_top_p.reserve(in.sampler_top_p.size() + in.spec_token_ids.size() + R);
+    out.sampler_min_p.reserve(in.sampler_min_p.size() + in.spec_token_ids.size() + R);
+    out.sampler_top_k.reserve(in.sampler_top_k.size() + in.spec_token_ids.size() + R);
+    out.sampler_seeds.reserve(in.sampler_seeds.size() + in.spec_token_ids.size() + R);
+    out.request_num_samplers.assign(R, 0u);
 
     // First-sampler index per request (used to clone its config).
     std::vector<int> first_sampler_idx(R, -1);
@@ -90,22 +90,71 @@ SpecExpansion expand_spec_batch(const SpecExpansionInputs& in, int R) {
 
     // Walk requests; for each spec request, splice the verification
     // block into sampling_indices/indptr/request_num_samplers and
-    // clone sampler params for the new slots.
+    // clone sampler params for the new slots. A spec request's normal
+    // next-token sampler is redundant when it is the simple token sampler
+    // at the last input row: the verification block samples that same row
+    // as element 0, and the executor discards the original token slot for
+    // spec responses. Dropping it keeps the verify sampling rows dense
+    // ([0..n_drafts]) so the CUDA executor can use the greedy argmax fast
+    // path instead of the general per-slot sampler.
     out.sampling_indices.reserve(in.sampling_indices.size());
     out.sampling_indptr.reserve(R + 1);
     out.sampling_indptr.push_back(0u);
     int cumulative_slots = 0;
+    int original_sampler_off = 0;
+    auto push_sampler_config = [&](int idx) {
+        out.sampler_types.push_back(
+            idx < static_cast<int>(in.sampler_types.size())
+                ? in.sampler_types[idx]
+                : 1u);
+        out.sampler_temperatures.push_back(
+            idx < static_cast<int>(in.sampler_temperatures.size())
+                ? in.sampler_temperatures[idx]
+                : 1.f);
+        out.sampler_top_p.push_back(
+            idx < static_cast<int>(in.sampler_top_p.size())
+                ? in.sampler_top_p[idx]
+                : 1.f);
+        out.sampler_min_p.push_back(
+            idx < static_cast<int>(in.sampler_min_p.size())
+                ? in.sampler_min_p[idx]
+                : 0.f);
+        out.sampler_top_k.push_back(
+            idx < static_cast<int>(in.sampler_top_k.size())
+                ? in.sampler_top_k[idx]
+                : 0u);
+        out.sampler_seeds.push_back(
+            idx < static_cast<int>(in.sampler_seeds.size())
+                ? in.sampler_seeds[idx]
+                : 0u);
+    };
     for (int r = 0; r < R; ++r) {
         const std::uint32_t lo = in.sampling_indptr[r];
         const std::uint32_t hi = in.sampling_indptr[r + 1];
-        for (std::uint32_t k = lo; k < hi; ++k) {
-            out.sampling_indices.push_back(in.sampling_indices[k]);
-        }
-        cumulative_slots += static_cast<int>(hi - lo);
-
         const int n_d = out.verify_n_drafts[r];
+        const int n_in = static_cast<int>(in.qo_indptr[r + 1] - in.qo_indptr[r]);
+        const int fs = first_sampler_idx[r];
+        const bool omit_redundant_spec_sampler =
+            n_d > 0 &&
+            hi == lo + 1 &&
+            fs >= 0 &&
+            fs < static_cast<int>(in.sampler_types.size()) &&
+            is_token_sampler(in.sampler_types[fs]) &&
+            n_in > 0 &&
+            in.sampling_indices[lo] ==
+                static_cast<std::uint32_t>(n_in - 1);
+        if (!omit_redundant_spec_sampler) {
+            for (std::uint32_t k = lo; k < hi; ++k) {
+                out.sampling_indices.push_back(in.sampling_indices[k]);
+                push_sampler_config(
+                    original_sampler_off + static_cast<int>(k - lo));
+            }
+            cumulative_slots += static_cast<int>(hi - lo);
+            out.request_num_samplers[r] += hi - lo;
+        }
+        original_sampler_off += static_cast<int>(hi - lo);
+
         if (n_d > 0) {
-            const int n_in = static_cast<int>(in.qo_indptr[r + 1] - in.qo_indptr[r]);
             out.verify_slot_start[r] = cumulative_slots;
             const int base = n_in - 1;
             for (int j = 0; j <= n_d; ++j) {
@@ -113,7 +162,6 @@ SpecExpansion expand_spec_batch(const SpecExpansionInputs& in, int R) {
             }
             cumulative_slots += n_d + 1;
 
-            const int fs = first_sampler_idx[r];
             if (fs < 0) {
                 std::cerr << "[pie-driver-cuda] spec error: req "
                           << r << " has drafts but no sampler\n";
@@ -125,12 +173,7 @@ SpecExpansion expand_spec_batch(const SpecExpansionInputs& in, int R) {
                               << " incompatible with verify_drafts\n";
                 }
                 for (int j = 0; j <= n_d; ++j) {
-                    out.sampler_types.push_back(stype);
-                    out.sampler_temperatures.push_back(in.sampler_temperatures[fs]);
-                    out.sampler_top_p.push_back(in.sampler_top_p[fs]);
-                    out.sampler_min_p.push_back(in.sampler_min_p[fs]);
-                    out.sampler_top_k.push_back(in.sampler_top_k[fs]);
-                    out.sampler_seeds.push_back(in.sampler_seeds[fs]);
+                    push_sampler_config(fs);
                 }
             }
             out.request_num_samplers[r] += static_cast<std::uint32_t>(n_d + 1);

@@ -50,6 +50,6 @@ struct BoundCudaModel {
     std::size_t num_layers() const noexcept;
 };
 
-BoundCudaModel bind_cuda_model(const LoadedModel& engine, bool verbose);
+BoundCudaModel bind_cuda_model(LoadedModel& engine, bool verbose);
 
 }  // namespace pie_cuda_driver::model

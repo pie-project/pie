@@ -18,7 +18,7 @@ std::size_t BoundCudaModel::num_layers() const noexcept {
     return 0;
 }
 
-BoundCudaModel bind_cuda_model(const LoadedModel& engine, bool verbose) {
+BoundCudaModel bind_cuda_model(LoadedModel& engine, bool verbose) {
     const std::string& mt = engine.hf_config().model_type;
     BoundCudaModel bound;
 

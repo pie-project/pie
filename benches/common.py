@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 import argparse
-import contextlib
 import ctypes
+import ctypes.util
 import json
 import math
 import os
@@ -17,40 +17,6 @@ from typing import Any
 ROOT = Path(__file__).resolve().parent.parent
 BENCH_SYSTEM = "You are a helpful benchmarking assistant."
 BENCH_PROMPT = "Write a short story about a robot."
-
-
-def _load_cudart():
-    for name in (
-        "libcudart.so",
-        "libcudart.so.12",
-        "libcudart.so.11.0",
-    ):
-        with contextlib.suppress(OSError):
-            return ctypes.CDLL(name)
-    return None
-
-
-@contextlib.contextmanager
-def cuda_profiler_range(enabled: bool):
-    if not enabled:
-        yield
-        return
-    cudart = _load_cudart()
-    if cudart is None:
-        raise RuntimeError("CUDA profiler range requested, but libcudart was not found")
-    start = cudart.cudaProfilerStart
-    stop = cudart.cudaProfilerStop
-    start.restype = ctypes.c_int
-    stop.restype = ctypes.c_int
-    rc = int(start())
-    if rc != 0:
-        raise RuntimeError(f"cudaProfilerStart failed with CUDA error {rc}")
-    try:
-        yield
-    finally:
-        rc = int(stop())
-        if rc != 0:
-            raise RuntimeError(f"cudaProfilerStop failed with CUDA error {rc}")
 
 
 @dataclass
@@ -162,6 +128,10 @@ def print_summary(s: BenchSummary) -> None:
         "cumulative batch latency us",
         "avg batch latency us",
         "last batch latency us",
+        "system spec draft tokens proposed",
+        "system spec draft tokens accepted",
+        "system spec draft tokens proposed per pos",
+        "system spec draft tokens accepted per pos",
         "bypass hits",
         "chain submits",
         "chain drops",
@@ -182,6 +152,12 @@ def print_summary(s: BenchSummary) -> None:
         "runtime driver cumulative ms",
         "runtime wall minus driver ms",
         "runtime non-driver after launch ms",
+        "vllm spec drafts",
+        "vllm spec draft tokens",
+        "vllm spec accepted tokens",
+        "vllm spec accepted per position",
+        "vllm spec acceptance rate",
+        "vllm spec mean acceptance length",
     )
     if any(k in s.config for k in spec_keys):
         for k in spec_keys:
@@ -253,10 +229,12 @@ def add_common_args(p: argparse.ArgumentParser) -> None:
     )
     p.add_argument("--json-out", default=None)
     p.add_argument(
-        "--cuda-profiler-range",
+        "--cuda-profiler-capture",
         action=argparse.BooleanOptionalAction,
         default=False,
-        help="Bracket only the timed generation window with cudaProfilerStart/Stop.",
+        help="Call cudaProfilerStart/Stop around the measured section. Use with "
+             "`nsys profile --capture-range=cudaProfilerApi` to exclude setup "
+             "and warmup from the trace.",
     )
     p.add_argument("--request-timeout", type=float, default=300.0)
     p.add_argument("--tp-size", type=int, default=1)
@@ -291,17 +269,11 @@ def make_prompts(args: argparse.Namespace, n: int) -> list[str]:
 
 
 def hf_chat_prompts_and_counts(
-    model: str,
-    system: str,
-    prompts: list[str],
-    *,
-    trust_remote_code: bool = False,
+    model: str, system: str, prompts: list[str]
 ) -> tuple[list[str], list[int]]:
     from transformers import AutoTokenizer
 
-    tok = AutoTokenizer.from_pretrained(
-        model, trust_remote_code=trust_remote_code
-    )
+    tok = AutoTokenizer.from_pretrained(model)
     rendered = [
         tok.apply_chat_template(
             [{"role": "system", "content": system}, {"role": "user", "content": p}],
@@ -315,17 +287,10 @@ def hf_chat_prompts_and_counts(
 
 
 def hf_chat_token_ids_and_counts(
-    model: str,
-    system: str,
-    prompts: list[str],
-    *,
-    trust_remote_code: bool = False,
+    model: str, system: str, prompts: list[str]
 ) -> tuple[list[list[int]], list[int]]:
     from transformers import AutoTokenizer
-
-    tok = AutoTokenizer.from_pretrained(
-        model, trust_remote_code=trust_remote_code
-    )
+    tok = AutoTokenizer.from_pretrained(model, trust_remote_code=True)
     rendered = [
         tok.apply_chat_template(
             [{"role": "system", "content": system}, {"role": "user", "content": p}],
@@ -343,6 +308,46 @@ def finish(summary: BenchSummary, results: list[RequestResult], json_out: str | 
     write_json(json_out, summary, results)
     if summary.failed:
         print(f"{summary.failed} request(s) failed; inspect JSON output for details.")
+
+
+def _load_cudart():
+    candidates = []
+    found = ctypes.util.find_library("cudart")
+    if found:
+        candidates.append(found)
+    candidates.extend(
+        [
+            "libcudart.so",
+            "libcudart.so.12",
+            "/usr/local/cuda/lib64/libcudart.so",
+            "/usr/local/cuda-12.8/lib64/libcudart.so",
+        ]
+    )
+    last_error: Exception | None = None
+    for candidate in candidates:
+        try:
+            return ctypes.CDLL(candidate)
+        except OSError as exc:
+            last_error = exc
+    raise RuntimeError(f"could not load CUDA runtime: {last_error}")
+
+
+def cuda_profiler_start(enabled: bool) -> None:
+    if not enabled:
+        return
+    cudart = _load_cudart()
+    rc = int(cudart.cudaProfilerStart())
+    if rc != 0:
+        raise RuntimeError(f"cudaProfilerStart failed with CUDA error {rc}")
+
+
+def cuda_profiler_stop(enabled: bool) -> None:
+    if not enabled:
+        return
+    cudart = _load_cudart()
+    rc = int(cudart.cudaProfilerStop())
+    if rc != 0:
+        raise RuntimeError(f"cudaProfilerStop failed with CUDA error {rc}")
 
 
 def _parse_cpu_list(spec: str) -> set[int]:

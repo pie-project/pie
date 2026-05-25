@@ -200,4 +200,63 @@ private:
     T* h_pinned_ = nullptr;
 };
 
+template <class T>
+class PinnedHostBuffer {
+public:
+    PinnedHostBuffer() = default;
+
+    explicit PinnedHostBuffer(std::size_t count) {
+        if (count > 0) {
+            CUDA_CHECK(cudaMallocHost(&ptr_, count * sizeof(T)));
+            count_ = count;
+        }
+    }
+
+    ~PinnedHostBuffer() noexcept { reset(); }
+
+    PinnedHostBuffer(const PinnedHostBuffer&) = delete;
+    PinnedHostBuffer& operator=(const PinnedHostBuffer&) = delete;
+
+    PinnedHostBuffer(PinnedHostBuffer&& o) noexcept
+        : ptr_(o.ptr_), count_(o.count_) {
+        o.ptr_ = nullptr;
+        o.count_ = 0;
+    }
+
+    PinnedHostBuffer& operator=(PinnedHostBuffer&& o) noexcept {
+        if (this != &o) {
+            reset();
+            ptr_ = o.ptr_;
+            count_ = o.count_;
+            o.ptr_ = nullptr;
+            o.count_ = 0;
+        }
+        return *this;
+    }
+
+    static PinnedHostBuffer<T> alloc(std::size_t count) {
+        return PinnedHostBuffer<T>(count);
+    }
+
+    T* data() { return ptr_; }
+    const T* data() const { return ptr_; }
+    std::size_t size() const { return count_; }
+    bool empty() const { return count_ == 0; }
+
+    T& operator[](std::size_t i) { return ptr_[i]; }
+    const T& operator[](std::size_t i) const { return ptr_[i]; }
+
+    void reset() noexcept {
+        if (ptr_) {
+            cudaFreeHost(ptr_);
+            ptr_ = nullptr;
+        }
+        count_ = 0;
+    }
+
+private:
+    T* ptr_ = nullptr;
+    std::size_t count_ = 0;
+};
+
 }  // namespace pie_cuda_driver

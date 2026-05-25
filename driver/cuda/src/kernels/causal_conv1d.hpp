@@ -104,4 +104,22 @@ void launch_causal_conv1d_prefill_batched_bf16(
     int R, int C, int K,
     cudaStream_t stream);
 
+// Same as batched prefill, with optional prefix-state snapshots. When
+// `snapshot_base_slot >= 0`, request-count must be 1; after prefix length p
+// (1-indexed), the trailing conv window is written into
+// `snapshot_base_slot + p - 1`, for p <= snapshot_count.
+void launch_causal_conv1d_prefill_batched_snapshot_bf16(
+    const void* x,
+    const void* weight,
+    const void* bias,
+    void*       y,
+    void*       state_out_base,
+    const std::int32_t*  slot_ids,
+    const std::uint32_t* qo_indptr,
+    long long   slot_stride_elems,
+    int R, int C, int K,
+    int snapshot_base_slot,
+    int snapshot_count,
+    cudaStream_t stream);
+
 }  // namespace pie_cuda_driver::kernels

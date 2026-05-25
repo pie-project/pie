@@ -31,6 +31,7 @@
 #include "distributed.hpp"
 #include "model/loaded_model.hpp"
 #include "kv_cache.hpp"
+#include "qwen3_5_state_cache.hpp"
 #include "response_subpass.hpp"
 #include "model/qwen3.hpp"
 #include "model/qwen3_forward.hpp"
@@ -121,6 +122,15 @@ struct SamplingScratch {
     std::vector<std::int32_t> h_sample_idx;
 };
 
+struct RsSpecRollback {
+    bool enabled = false;
+    int slot = -1;
+    int scratch_slot = -1;
+    int snapshot_base_slot = -1;
+    int snapshot_count = 0;
+    bool was_fresh = false;
+};
+
 SamplingScratch& sampling_scratch() {
     thread_local SamplingScratch scratch;
     return scratch;
@@ -135,6 +145,24 @@ int partitioned_argmax_parts() {
     return parts;
 }
 
+int greedy_argmax_parts(int vocab) {
+    const char* global = std::getenv("PIE_ARGMAX_PARTS");
+    if (global != nullptr && global[0] != '\0') {
+        return partitioned_argmax_parts();
+    }
+    return vocab >= 131072 ? 8 : 1;
+}
+
+int mtp_argmax_parts(int vocab) {
+    static const int forced = [] {
+        const char* v = std::getenv("PIE_MTP_ARGMAX_PARTS");
+        if (v == nullptr || v[0] == '\0') return 0;
+        return std::clamp(std::atoi(v), 1, 8);
+    }();
+    if (forced > 0) return forced;
+    return greedy_argmax_parts(vocab);
+}
+
 bool graph_single_gpu_argmax_enabled() {
     static const bool enabled = [] {
         const char* v = std::getenv("PIE_CUDA_GRAPH_ARGMAX");
@@ -142,6 +170,773 @@ bool graph_single_gpu_argmax_enabled() {
         return v[0] != '0';
     }();
     return enabled;
+}
+
+int qwen35_small_spec_graph_tokens() {
+    static const int tokens = [] {
+        const char* v = std::getenv("PIE_QWEN35_SPEC_VERIFY_GRAPH_N");
+        if (v == nullptr || v[0] == '\0') return 17;
+        return std::clamp(std::atoi(v), 0, 64);
+    }();
+    return tokens;
+}
+
+bool mtp_trace_enabled() {
+    static const bool enabled = [] {
+        const char* v = std::getenv("PIE_MTP_TRACE");
+        return v != nullptr && v[0] != '\0' && v[0] != '0';
+    }();
+    return enabled;
+}
+
+std::uint64_t mtp_trace_limit() {
+    static const std::uint64_t limit = [] {
+        const char* v = std::getenv("PIE_MTP_TRACE_LIMIT");
+        if (v == nullptr || v[0] == '\0') return std::uint64_t{32};
+        const long parsed = std::strtol(v, nullptr, 10);
+        return parsed > 0 ? static_cast<std::uint64_t>(parsed) : std::uint64_t{0};
+    }();
+    return limit;
+}
+
+bool mtp_trace_take() {
+    if (!mtp_trace_enabled()) return false;
+    static std::atomic<std::uint64_t> seq{0};
+    return seq.fetch_add(1, std::memory_order_relaxed) < mtp_trace_limit();
+}
+
+bool mtp_argmax_profile_enabled() {
+    static const bool enabled = [] {
+        const char* v = std::getenv("PIE_MTP_PROFILE");
+        return v != nullptr && v[0] != '\0' && v[0] != '0';
+    }();
+    return enabled;
+}
+
+std::uint64_t mtp_argmax_profile_limit() {
+    static const std::uint64_t limit = [] {
+        const char* v = std::getenv("PIE_MTP_PROFILE_LIMIT");
+        if (v == nullptr || v[0] == '\0') return std::uint64_t{8};
+        const long parsed = std::strtol(v, nullptr, 10);
+        return parsed > 0 ? static_cast<std::uint64_t>(parsed) : std::uint64_t{0};
+    }();
+    return limit;
+}
+
+bool mtp_argmax_profile_take() {
+    if (!mtp_argmax_profile_enabled()) return false;
+    static std::atomic<std::uint64_t> seq{0};
+    return seq.fetch_add(1, std::memory_order_relaxed) <
+           mtp_argmax_profile_limit();
+}
+
+bool mtp_process_profile_enabled() {
+    static const bool enabled = [] {
+        const char* v = std::getenv("PIE_MTP_PROCESS_PROFILE");
+        return v != nullptr && v[0] != '\0' && v[0] != '0';
+    }();
+    return enabled;
+}
+
+std::uint64_t mtp_process_profile_limit() {
+    static const std::uint64_t limit = [] {
+        const char* v = std::getenv("PIE_MTP_PROCESS_PROFILE_LIMIT");
+        if (v == nullptr || v[0] == '\0') return std::uint64_t{16};
+        const long parsed = std::strtol(v, nullptr, 10);
+        return parsed > 0 ? static_cast<std::uint64_t>(parsed) : std::uint64_t{0};
+    }();
+    return limit;
+}
+
+bool mtp_process_profile_take() {
+    if (!mtp_process_profile_enabled()) return false;
+    static std::atomic<std::uint64_t> seq{0};
+    return seq.fetch_add(1, std::memory_order_relaxed) <
+           mtp_process_profile_limit();
+}
+
+bool step_profile_enabled() {
+    static const bool enabled = [] {
+        const char* v = std::getenv("PIE_STEP_PROFILE");
+        return v != nullptr && v[0] != '\0' && v[0] != '0';
+    }();
+    return enabled;
+}
+
+std::uint64_t step_profile_limit() {
+    static const std::uint64_t limit = [] {
+        const char* v = std::getenv("PIE_STEP_PROFILE_LIMIT");
+        if (v == nullptr || v[0] == '\0') return std::uint64_t{32};
+        const long parsed = std::strtol(v, nullptr, 10);
+        return parsed > 0 ? static_cast<std::uint64_t>(parsed) : std::uint64_t{0};
+    }();
+    return limit;
+}
+
+bool step_profile_take() {
+    if (!step_profile_enabled()) return false;
+    static std::atomic<std::uint64_t> seq{0};
+    return seq.fetch_add(1, std::memory_order_relaxed) < step_profile_limit();
+}
+
+bool mtp_chain_graph_enabled() {
+    static const bool enabled = [] {
+        const char* v = std::getenv("PIE_MTP_CHAIN_GRAPH");
+        if (v == nullptr || v[0] == '\0') return true;
+        return v[0] != '0';
+    }();
+    return enabled;
+}
+
+int qwen35_rs_snapshot_min_drafts() {
+    static const int min_drafts = [] {
+        const char* v = std::getenv("PIE_QWEN35_RS_SNAPSHOT_MIN_DRAFTS");
+        if (v == nullptr || v[0] == '\0') return 3;
+        return std::clamp(std::atoi(v), 0, 16);
+    }();
+    return min_drafts;
+}
+
+struct StepProfileTimer {
+    bool enabled = false;
+    const char* label = "";
+    int tokens = 0;
+    int requests = 0;
+    cudaEvent_t start = nullptr;
+    cudaEvent_t stop = nullptr;
+
+    StepProfileTimer(
+        const char* label_, cudaStream_t stream, int tokens_, int requests_)
+        : enabled(step_profile_take()),
+          label(label_),
+          tokens(tokens_),
+          requests(requests_)
+    {
+        if (!enabled) return;
+        CUDA_CHECK(cudaEventCreate(&start));
+        CUDA_CHECK(cudaEventCreate(&stop));
+        CUDA_CHECK(cudaEventRecord(start, stream));
+    }
+
+    ~StepProfileTimer() {
+        if (start) CUDA_CHECK(cudaEventDestroy(start));
+        if (stop) CUDA_CHECK(cudaEventDestroy(stop));
+    }
+
+    void finish(cudaStream_t stream) {
+        if (!enabled) return;
+        CUDA_CHECK(cudaEventRecord(stop, stream));
+        CUDA_CHECK(cudaEventSynchronize(stop));
+        float ms = 0.0f;
+        CUDA_CHECK(cudaEventElapsedTime(&ms, start, stop));
+        std::cerr << "[pie-step-profile] label=" << label
+                  << " tokens=" << tokens
+                  << " requests=" << requests
+                  << " ms=" << ms << "\n";
+        enabled = false;
+    }
+};
+
+template <typename Fn>
+void profile_mtp_process_call(
+    const char* label,
+    cudaStream_t stream,
+    int total_tokens,
+    int num_requests,
+    Fn&& fn)
+{
+    const bool profile = mtp_process_profile_take();
+    cudaEvent_t start = nullptr;
+    cudaEvent_t stop = nullptr;
+    if (profile) {
+        CUDA_CHECK(cudaEventCreate(&start));
+        CUDA_CHECK(cudaEventCreate(&stop));
+        CUDA_CHECK(cudaEventRecord(start, stream));
+    }
+    fn();
+    if (profile) {
+        CUDA_CHECK(cudaEventRecord(stop, stream));
+        CUDA_CHECK(cudaEventSynchronize(stop));
+        float ms = 0.0f;
+        CUDA_CHECK(cudaEventElapsedTime(&ms, start, stop));
+        std::cerr << "[pie-mtp-process-profile] label=" << label
+                  << " tokens=" << total_tokens
+                  << " requests=" << num_requests
+                  << " process_ms=" << ms << "\n";
+        CUDA_CHECK(cudaEventDestroy(start));
+        CUDA_CHECK(cudaEventDestroy(stop));
+    }
+}
+
+int mtp_graph_max_global_tokens() {
+    static const int max_tokens = [] {
+        const char* v = std::getenv("PIE_MTP_GRAPH_MAX_GLOBAL_TOKENS");
+        if (v == nullptr || v[0] == '\0') return 1024;
+        return std::max(0, std::atoi(v));
+    }();
+    return max_tokens;
+}
+
+int mtp_graph_global_token_bucket(int observed_tokens) {
+    const int max_tokens = mtp_graph_max_global_tokens();
+    if (max_tokens <= 0) return -1;
+    if (observed_tokens <= 0) return 0;
+
+    int bucket = 1;
+    while (bucket < observed_tokens && bucket < max_tokens) {
+        bucket <<= 1;
+    }
+    return bucket >= observed_tokens ? bucket : -1;
+}
+
+void launch_mtp_argmax(Executor& executor, int rows, cudaStream_t stream) {
+    const int vocab = executor.loaded_model.hf_config().vocab_size;
+    const int argmax_parts = mtp_argmax_parts(vocab);
+    const bool profile = mtp_argmax_profile_take();
+    cudaEvent_t start = nullptr;
+    cudaEvent_t stop = nullptr;
+    if (profile) {
+        CUDA_CHECK(cudaEventCreate(&start));
+        CUDA_CHECK(cudaEventCreate(&stop));
+        CUDA_CHECK(cudaEventRecord(start, stream));
+    }
+    if (argmax_parts > 1 && !executor.ws.greedy_pairs_all.empty()) {
+        kernels::launch_argmax_bf16_partitioned_pairs(
+            executor.ws.logits.data(),
+            reinterpret_cast<std::uint64_t*>(
+                executor.ws.greedy_pairs_all.data()),
+            rows, vocab, argmax_parts, stream);
+        kernels::launch_select_global_argmax_pairs(
+            reinterpret_cast<const std::uint64_t*>(
+                executor.ws.greedy_pairs_all.data()),
+            reinterpret_cast<std::int32_t*>(executor.inputs.sampled.data()),
+            rows, argmax_parts, stream);
+    } else {
+        kernels::launch_argmax_bf16(
+            executor.ws.logits.data(),
+            reinterpret_cast<std::int32_t*>(executor.inputs.sampled.data()),
+            rows, vocab, stream);
+    }
+    if (profile) {
+        CUDA_CHECK(cudaEventRecord(stop, stream));
+        CUDA_CHECK(cudaEventSynchronize(stop));
+        float ms = 0.0f;
+        CUDA_CHECK(cudaEventElapsedTime(&ms, start, stop));
+        std::cerr << "[pie-mtp-argmax-profile] rows=" << rows
+                  << " vocab=" << vocab
+                  << " parts=" << argmax_parts
+                  << " argmax_ms=" << ms << "\n";
+        CUDA_CHECK(cudaEventDestroy(start));
+        CUDA_CHECK(cudaEventDestroy(stop));
+    }
+}
+
+struct MtpGraphKey {
+    const Executor* executor = nullptr;
+    int rows = 0;
+    int draft_step = 0;
+    int max_global_tokens = 0;
+
+    bool operator==(const MtpGraphKey& o) const noexcept {
+        return executor == o.executor &&
+               rows == o.rows &&
+               draft_step == o.draft_step &&
+               max_global_tokens == o.max_global_tokens;
+    }
+};
+
+struct MtpGraphKeyHash {
+    std::size_t operator()(const MtpGraphKey& k) const noexcept {
+        return reinterpret_cast<std::uintptr_t>(k.executor) ^
+               (static_cast<std::size_t>(k.rows) << 8) ^
+               (static_cast<std::size_t>(k.draft_step) << 16) ^
+               (static_cast<std::size_t>(k.max_global_tokens) << 24);
+    }
+};
+
+struct MtpChainGraphKey {
+    const Executor* executor = nullptr;
+    int rows = 0;
+    int drafts = 0;
+    int max_global_tokens = 0;
+
+    bool operator==(const MtpChainGraphKey& o) const noexcept {
+        return executor == o.executor &&
+               rows == o.rows &&
+               drafts == o.drafts &&
+               max_global_tokens == o.max_global_tokens;
+    }
+};
+
+struct MtpChainGraphKeyHash {
+    std::size_t operator()(const MtpChainGraphKey& k) const noexcept {
+        return reinterpret_cast<std::uintptr_t>(k.executor) ^
+               (static_cast<std::size_t>(k.rows) << 8) ^
+               (static_cast<std::size_t>(k.drafts) << 16) ^
+               (static_cast<std::size_t>(k.max_global_tokens) << 24);
+    }
+};
+
+cudaGraphExec_t capture_mtp_graph_exec(
+    Executor& executor,
+    const std::int32_t* token_ids,
+    const std::int32_t* positions,
+    const std::int32_t* base_hidden_row_indices,
+    const std::int32_t* request_ids,
+    int rows,
+    int draft_step,
+    int max_global_tokens)
+{
+    auto& pi = executor.inputs;
+
+    CUDA_CHECK(cudaStreamSynchronize(nullptr));
+    cudaStream_t cstream = nullptr;
+    CUDA_CHECK(cudaStreamCreateWithFlags(&cstream, cudaStreamNonBlocking));
+    executor.cublas.set_stream(cstream);
+    CUDA_CHECK(cudaStreamBeginCapture(cstream, cudaStreamCaptureModeRelaxed));
+    executor.system_drafter.draft_step(
+        executor.ws, executor.kv_cache, executor.cublas,
+        token_ids,
+        positions,
+        base_hidden_row_indices,
+        request_ids,
+        pi.kv_page_indices.data(),
+        pi.kv_page_indptr.data(),
+        pi.kv_last_page_lens.data(),
+        executor.system_drafter.draft_step_writes_sampled_tokens
+            ? reinterpret_cast<std::int32_t*>(pi.sampled.data())
+            : nullptr,
+        rows, draft_step, max_global_tokens);
+    if (!executor.system_drafter.draft_step_writes_sampled_tokens) {
+        launch_mtp_argmax(executor, rows, cstream);
+    }
+    cudaGraph_t graph = nullptr;
+    CUDA_CHECK(cudaStreamEndCapture(cstream, &graph));
+    executor.cublas.set_stream(nullptr);
+
+    cudaGraphExec_t exec = nullptr;
+    CUDA_CHECK(cudaGraphInstantiate(&exec, graph, nullptr, nullptr, 0));
+    CUDA_CHECK(cudaGraphUpload(exec, nullptr));
+    cudaGraphDestroy(graph);
+    cudaStreamDestroy(cstream);
+    return exec;
+}
+
+cudaGraphExec_t capture_mtp_chain_graph_exec(
+    Executor& executor,
+    int rows,
+    int drafts,
+    int max_global_tokens)
+{
+    auto& pi = executor.inputs;
+
+    CUDA_CHECK(cudaStreamSynchronize(nullptr));
+    cudaStream_t cstream = nullptr;
+    CUDA_CHECK(cudaStreamCreateWithFlags(&cstream, cudaStreamNonBlocking));
+    executor.cublas.set_stream(cstream);
+    CUDA_CHECK(cudaStreamBeginCapture(cstream, cudaStreamCaptureModeRelaxed));
+    for (int draft = 0; draft < drafts; ++draft) {
+        const std::size_t offset =
+            static_cast<std::size_t>(draft) * static_cast<std::size_t>(rows);
+        executor.system_drafter.draft_step(
+            executor.ws, executor.kv_cache, executor.cublas,
+            reinterpret_cast<const std::int32_t*>(pi.tokens.data() + offset),
+            reinterpret_cast<const std::int32_t*>(pi.positions.data() + offset),
+            pi.sample_idx.data() + offset,
+            pi.mtp_request_ids.data(),
+            pi.kv_page_indices.data(),
+            pi.kv_page_indptr.data(),
+            pi.kv_last_page_lens.data(),
+            executor.system_drafter.draft_step_writes_sampled_tokens
+                ? reinterpret_cast<std::int32_t*>(pi.sampled.data())
+                : nullptr,
+            rows, draft, max_global_tokens);
+        if (!executor.system_drafter.draft_step_writes_sampled_tokens) {
+            launch_mtp_argmax(executor, rows, cstream);
+        }
+        CUDA_CHECK(cudaMemcpyAsync(
+            pi.tokens.data() + offset + static_cast<std::size_t>(rows),
+            pi.sampled.data(),
+            sizeof(std::uint32_t) * static_cast<std::size_t>(rows),
+            cudaMemcpyDeviceToDevice, cstream));
+    }
+    cudaGraph_t graph = nullptr;
+    CUDA_CHECK(cudaStreamEndCapture(cstream, &graph));
+    executor.cublas.set_stream(nullptr);
+
+    cudaGraphExec_t exec = nullptr;
+    CUDA_CHECK(cudaGraphInstantiate(&exec, graph, nullptr, nullptr, 0));
+    CUDA_CHECK(cudaGraphUpload(exec, nullptr));
+    cudaGraphDestroy(graph);
+    cudaStreamDestroy(cstream);
+    return exec;
+}
+
+bool try_run_mtp_graph_with_argmax(
+    Executor& executor,
+    const std::int32_t* token_ids,
+    const std::int32_t* positions,
+    const std::int32_t* base_hidden_row_indices,
+    const std::int32_t* request_ids,
+    int rows,
+    int draft_step,
+    int max_global_tokens)
+{
+    if (executor.tp_comm != nullptr || rows <= 0) return false;
+    if (mtp_argmax_profile_enabled() || mtp_trace_enabled()) return false;
+    const int graph_tokens = mtp_graph_global_token_bucket(max_global_tokens);
+    if (graph_tokens < 0) return false;
+
+    static std::mutex mu;
+    static std::unordered_map<MtpGraphKey, cudaGraphExec_t, MtpGraphKeyHash>
+        cache;
+    const MtpGraphKey key{&executor, rows, draft_step, graph_tokens};
+    cudaGraphExec_t exec = nullptr;
+    {
+        std::lock_guard<std::mutex> lk(mu);
+        auto it = cache.find(key);
+        if (it == cache.end()) {
+            exec = capture_mtp_graph_exec(
+                executor, token_ids, positions, base_hidden_row_indices,
+                request_ids, rows, draft_step, graph_tokens);
+            cache.emplace(key, exec);
+        } else {
+            exec = it->second;
+        }
+    }
+    CUDA_CHECK(cudaGraphLaunch(exec, nullptr));
+    return true;
+}
+
+bool try_run_mtp_chain_graph_with_argmax(
+    Executor& executor,
+    int rows,
+    int drafts,
+    int max_observed_global_tokens)
+{
+    if (!mtp_chain_graph_enabled()) return false;
+    if (executor.tp_comm != nullptr || rows <= 0 || drafts <= 1) return false;
+    if (mtp_argmax_profile_enabled() || mtp_trace_enabled()) return false;
+    const int graph_tokens =
+        mtp_graph_global_token_bucket(max_observed_global_tokens);
+    if (graph_tokens < 0) return false;
+
+    static std::mutex mu;
+    static std::unordered_map<
+        MtpChainGraphKey, cudaGraphExec_t, MtpChainGraphKeyHash> cache;
+    const MtpChainGraphKey key{&executor, rows, drafts, graph_tokens};
+    cudaGraphExec_t exec = nullptr;
+    {
+        std::lock_guard<std::mutex> lk(mu);
+        auto it = cache.find(key);
+        if (it == cache.end()) {
+            exec = capture_mtp_chain_graph_exec(
+                executor, rows, drafts, graph_tokens);
+            cache.emplace(key, exec);
+        } else {
+            exec = it->second;
+        }
+    }
+    CUDA_CHECK(cudaGraphLaunch(exec, nullptr));
+    return true;
+}
+
+void run_mtp_draft_with_argmax(
+    Executor& executor,
+    const std::int32_t* token_ids,
+    const std::int32_t* positions,
+    const std::int32_t* base_hidden_row_indices,
+    const std::int32_t* request_ids,
+    int rows,
+    int draft_step,
+    int max_global_tokens)
+{
+    if (rows <= 0) return;
+    auto& pi = executor.inputs;
+    if (try_run_mtp_graph_with_argmax(
+            executor, token_ids, positions, base_hidden_row_indices,
+            request_ids, rows, draft_step, max_global_tokens)) {
+        return;
+    }
+    executor.system_drafter.draft_step(
+        executor.ws, executor.kv_cache, executor.cublas,
+        token_ids,
+        positions,
+        base_hidden_row_indices,
+        request_ids,
+        pi.kv_page_indices.data(),
+        pi.kv_page_indptr.data(),
+        pi.kv_last_page_lens.data(),
+        executor.system_drafter.draft_step_writes_sampled_tokens
+            ? reinterpret_cast<std::int32_t*>(pi.sampled.data())
+            : nullptr,
+        rows, draft_step, max_global_tokens);
+    if (!executor.system_drafter.draft_step_writes_sampled_tokens) {
+        launch_mtp_argmax(executor, rows, executor.cublas.stream());
+    }
+}
+
+void run_mtp_draft_with_argmax(
+    Executor& executor, int rows, int draft_step, int max_global_tokens)
+{
+    auto& pi = executor.inputs;
+    run_mtp_draft_with_argmax(
+        executor,
+        reinterpret_cast<const std::int32_t*>(pi.tokens.data()),
+        reinterpret_cast<const std::int32_t*>(pi.positions.data()),
+        pi.sample_idx.data(),
+        pi.mtp_request_ids.data(),
+        rows, draft_step, max_global_tokens);
+}
+
+void tp_broadcast_mtp_inputs(NcclComm& comm, PersistentInputs& pi,
+                             int num_tokens, int draft_step,
+                             cudaStream_t stream);
+int tensor_rows(const DeviceTensor& t);
+void tp_cpu_gate_notify(const std::string& key);
+
+void run_step_chained_system_drafter(
+    Executor& executor,
+    std::span<const SystemSpecDraftRequest> requests,
+    std::span<pie_driver::PerRequestOutput> per_req,
+    bool mtp_global_cache)
+{
+    const int max_drafts = executor.system_drafter.max_drafts;
+    if (max_drafts <= 0 || requests.empty() ||
+        !executor.system_drafter.draft_step) {
+        return;
+    }
+
+    auto& pi = executor.inputs;
+    auto& ws = executor.ws;
+    auto& cublas = executor.cublas;
+
+    std::vector<std::uint32_t> mtp_tokens;
+    std::vector<std::int32_t> mtp_rows;
+    std::vector<std::uint32_t> mtp_input_pos;
+    std::vector<std::uint32_t> mtp_output_pos;
+    std::vector<int> mtp_requests;
+    mtp_tokens.reserve(requests.size());
+    mtp_rows.reserve(requests.size());
+    mtp_input_pos.reserve(requests.size());
+    mtp_output_pos.reserve(requests.size());
+    mtp_requests.reserve(requests.size());
+
+    const int draft_position_offset =
+        executor.system_drafter.draft_position_offset;
+    const bool prefix_global =
+        executor.system_drafter.draft_global_cache_uses_prefix_position;
+    for (const auto& req : requests) {
+        if (req.request_index < 0 ||
+            req.request_index >= static_cast<int>(per_req.size()) ||
+            req.source_row < 0) {
+            continue;
+        }
+        const std::uint64_t input_pos64 =
+            static_cast<std::uint64_t>(req.source_position) +
+            static_cast<std::uint64_t>(std::max(0, draft_position_offset));
+        if (input_pos64 > std::numeric_limits<std::uint32_t>::max()) {
+            continue;
+        }
+        mtp_tokens.push_back(req.accepted_token);
+        mtp_rows.push_back(req.source_row);
+        mtp_input_pos.push_back(static_cast<std::uint32_t>(input_pos64));
+        mtp_output_pos.push_back(req.first_draft_position);
+        mtp_requests.push_back(req.request_index);
+    }
+
+    const int S = static_cast<int>(mtp_tokens.size());
+    if (S <= 0) return;
+    if (S > tensor_rows(ws.logits)) {
+        throw std::runtime_error(
+            "MTP draft rows exceed logits workspace capacity");
+    }
+    if (static_cast<std::size_t>(S) *
+            static_cast<std::size_t>(max_drafts) >
+        static_cast<std::size_t>(tensor_rows(ws.k))) {
+        throw std::runtime_error(
+            "MTP draft history exceeds workspace capacity");
+    }
+
+    std::vector<std::int32_t> mtp_request_ids(static_cast<std::size_t>(S));
+    std::vector<std::int32_t> chained_rows(static_cast<std::size_t>(S));
+    for (int i = 0; i < S; ++i) {
+        mtp_request_ids[static_cast<std::size_t>(i)] =
+            static_cast<std::int32_t>(mtp_requests[static_cast<std::size_t>(i)]);
+        chained_rows[static_cast<std::size_t>(i)] = i;
+    }
+
+    const std::size_t s_sz = static_cast<std::size_t>(S);
+    const std::size_t drafts_sz = static_cast<std::size_t>(max_drafts);
+    const bool gpu_chain_capacity =
+        s_sz * (drafts_sz + 1) <= pi.tokens.size() &&
+        s_sz * drafts_sz <= pi.positions.size() &&
+        s_sz * drafts_sz <= pi.sample_idx.size() &&
+        s_sz * drafts_sz <= pi.tokens.size();
+    const bool gpu_chain =
+        executor.tp_comm == nullptr && !mtp_trace_enabled() &&
+        gpu_chain_capacity;
+
+    if (gpu_chain) {
+        StepProfileTimer mtp_timer(
+            "mtp_draft_chain", cublas.stream(),
+            static_cast<int>(s_sz * drafts_sz), S);
+        std::vector<std::uint32_t> mtp_positions_flat(s_sz * drafts_sz);
+        std::vector<std::int32_t> mtp_rows_flat(s_sz * drafts_sz);
+        std::vector<int> mtp_max_global_tokens(drafts_sz, 0);
+        int mtp_max_observed_global_tokens = 0;
+        for (int draft = 0; draft < max_drafts; ++draft) {
+            int max_global_tokens = 0;
+            for (int i = 0; i < S; ++i) {
+                const std::uint32_t input_pos =
+                    mtp_input_pos[static_cast<std::size_t>(i)] +
+                    static_cast<std::uint32_t>(draft);
+                const std::size_t flat =
+                    static_cast<std::size_t>(draft) * s_sz +
+                    static_cast<std::size_t>(i);
+                mtp_positions_flat[flat] = input_pos;
+                mtp_rows_flat[flat] =
+                    draft == 0
+                        ? mtp_rows[static_cast<std::size_t>(i)]
+                        : chained_rows[static_cast<std::size_t>(i)];
+                if (mtp_global_cache) {
+                    const int global_tokens = std::max(
+                        0,
+                        static_cast<int>(input_pos) -
+                            (prefix_global ? draft : 0));
+                    max_global_tokens = std::max(
+                        max_global_tokens, global_tokens);
+                }
+            }
+            mtp_max_global_tokens[static_cast<std::size_t>(draft)] =
+                max_global_tokens;
+            mtp_max_observed_global_tokens = std::max(
+                mtp_max_observed_global_tokens, max_global_tokens);
+        }
+
+        pi.tokens.copy_from_host(std::span<const std::uint32_t>(mtp_tokens));
+        pi.positions.copy_from_host(
+            std::span<const std::uint32_t>(mtp_positions_flat));
+        pi.sample_idx.copy_from_host(
+            std::span<const std::int32_t>(mtp_rows_flat));
+        pi.mtp_request_ids.copy_from_host(
+            std::span<const std::int32_t>(mtp_request_ids));
+
+        if (!try_run_mtp_chain_graph_with_argmax(
+                executor, S, max_drafts, mtp_max_observed_global_tokens)) {
+            for (int draft = 0; draft < max_drafts; ++draft) {
+                const std::size_t offset =
+                    static_cast<std::size_t>(draft) * s_sz;
+                run_mtp_draft_with_argmax(
+                    executor,
+                    reinterpret_cast<const std::int32_t*>(
+                        pi.tokens.data() + offset),
+                    reinterpret_cast<const std::int32_t*>(
+                        pi.positions.data() + offset),
+                    pi.sample_idx.data() + offset,
+                    pi.mtp_request_ids.data(),
+                    S, draft,
+                    mtp_max_global_tokens[static_cast<std::size_t>(draft)]);
+                CUDA_CHECK(cudaMemcpyAsync(
+                    pi.tokens.data() + offset + s_sz, pi.sampled.data(),
+                    sizeof(std::uint32_t) * s_sz,
+                    cudaMemcpyDeviceToDevice, cublas.stream()));
+            }
+        }
+
+        std::vector<std::uint32_t> mtp_sampled_flat(s_sz * drafts_sz);
+        CUDA_CHECK(cudaMemcpyAsync(
+            mtp_sampled_flat.data(), pi.tokens.data() + s_sz,
+            sizeof(std::uint32_t) * s_sz * drafts_sz,
+            cudaMemcpyDeviceToHost, cublas.stream()));
+        mtp_timer.finish(cublas.stream());
+        CUDA_CHECK(cudaStreamSynchronize(cublas.stream()));
+
+        for (int draft = 0; draft < max_drafts; ++draft) {
+            for (int i = 0; i < S; ++i) {
+                auto& out = per_req[static_cast<std::size_t>(
+                    mtp_requests[static_cast<std::size_t>(i)])];
+                const std::size_t flat =
+                    static_cast<std::size_t>(draft) * s_sz +
+                    static_cast<std::size_t>(i);
+                out.spec_tokens.push_back(mtp_sampled_flat[flat]);
+                out.spec_positions.push_back(
+                    mtp_output_pos[static_cast<std::size_t>(i)] +
+                    static_cast<std::uint32_t>(draft));
+            }
+        }
+        return;
+    }
+
+    std::vector<std::int32_t> mtp_sampled(static_cast<std::size_t>(S));
+    for (int draft = 0; draft < max_drafts; ++draft) {
+        int max_global_tokens = 0;
+        if (mtp_global_cache) {
+            for (auto pos : mtp_input_pos) {
+                const int global_tokens =
+                    std::max(0,
+                             static_cast<int>(pos) -
+                                 (prefix_global ? draft : 0));
+                max_global_tokens =
+                    std::max(max_global_tokens, global_tokens);
+            }
+        }
+        pi.tokens.copy_from_host(std::span<const std::uint32_t>(mtp_tokens));
+        pi.positions.copy_from_host(
+            std::span<const std::uint32_t>(mtp_input_pos));
+        pi.sample_idx.copy_from_host(std::span<const std::int32_t>(mtp_rows));
+        pi.mtp_request_ids.copy_from_host(
+            std::span<const std::int32_t>(mtp_request_ids));
+        if (executor.tp_comm != nullptr) {
+            tp_cpu_gate_notify(executor.tp_cpu_gate_key);
+            tp_broadcast_mtp_inputs(
+                *executor.tp_comm, pi, S, draft, /*stream=*/nullptr);
+        }
+        run_mtp_draft_with_argmax(executor, S, draft, max_global_tokens);
+        CUDA_CHECK(cudaMemcpyAsync(
+            mtp_sampled.data(), pi.sampled.data(),
+            sizeof(std::int32_t) * static_cast<std::size_t>(S),
+            cudaMemcpyDeviceToHost, cublas.stream()));
+        CUDA_CHECK(cudaStreamSynchronize(cublas.stream()));
+        if (mtp_trace_take()) {
+            std::cerr << "[pie-mtp-trace] draft_step=" << draft
+                      << " rows=" << S << " in_tok=[";
+            for (int i = 0; i < S; ++i) {
+                if (i) std::cerr << ",";
+                std::cerr << mtp_tokens[static_cast<std::size_t>(i)];
+            }
+            std::cerr << "] in_pos=[";
+            for (int i = 0; i < S; ++i) {
+                if (i) std::cerr << ",";
+                std::cerr << mtp_input_pos[static_cast<std::size_t>(i)];
+            }
+            std::cerr << "] out_pos=[";
+            for (int i = 0; i < S; ++i) {
+                if (i) std::cerr << ",";
+                std::cerr << mtp_output_pos[static_cast<std::size_t>(i)];
+            }
+            std::cerr << "] out_tok=[";
+            for (int i = 0; i < S; ++i) {
+                if (i) std::cerr << ",";
+                std::cerr << mtp_sampled[static_cast<std::size_t>(i)];
+            }
+            std::cerr << "]\n";
+        }
+        for (int i = 0; i < S; ++i) {
+            auto& out = per_req[static_cast<std::size_t>(
+                mtp_requests[static_cast<std::size_t>(i)])];
+            const auto sampled =
+                static_cast<std::uint32_t>(
+                    mtp_sampled[static_cast<std::size_t>(i)]);
+            out.spec_tokens.push_back(sampled);
+            out.spec_positions.push_back(
+                mtp_output_pos[static_cast<std::size_t>(i)]);
+            mtp_tokens[static_cast<std::size_t>(i)] = sampled;
+            mtp_input_pos[static_cast<std::size_t>(i)] += 1u;
+            mtp_output_pos[static_cast<std::size_t>(i)] += 1;
+        }
+        mtp_rows = chained_rows;
+    }
 }
 
 std::vector<int> forward_graph_request_lattice(int max_requests) {
@@ -160,7 +955,9 @@ std::vector<int> forward_graph_request_lattice(int max_requests) {
 cudaGraphExec_t capture_forward_graph_exec(
     Executor& executor,
     const std::uint32_t* qo_indptr_h,
+    const std::uint32_t* kv_page_indices_h,
     const std::uint32_t* kv_page_indptr_h,
+    const std::uint32_t* kv_last_page_lens_h,
     int N,
     int R,
     bool is_pure_decode,
@@ -185,12 +982,14 @@ cudaGraphExec_t capture_forward_graph_exec(
         reinterpret_cast<const std::int32_t*>(pi.positions.data()),
         pi.qo_indptr.data(), pi.kv_page_indices.data(),
         pi.kv_page_indptr.data(), pi.kv_last_page_lens.data(),
-        qo_indptr_h, kv_page_indptr_h,
+        qo_indptr_h, kv_page_indices_h, kv_page_indptr_h,
+        kv_last_page_lens_h,
         N, R, is_pure_decode, nullptr, nullptr,
         slot_ids_h, is_fresh_h, slot_ids_d,
         logit_row_indices_d, num_logit_rows, tp_greedy_argmax);
     if (single_gpu_greedy_argmax) {
-        const int argmax_parts = partitioned_argmax_parts();
+        const int argmax_parts =
+            greedy_argmax_parts(executor.loaded_model.hf_config().vocab_size);
         if (argmax_parts > 1 && !executor.ws.greedy_pairs_all.empty()) {
             kernels::launch_argmax_bf16_partitioned_pairs(
                 executor.ws.logits.data(),
@@ -381,6 +1180,8 @@ void tp_cpu_gate_wait(const std::string& key,
 // + the forward call. Two magic values:
 //
 //   * TP_FIRE_MAGIC: a regular fire is incoming; payload broadcasts follow.
+//   * TP_MTP_MAGIC: rank 0 has accepted tokens and wants followers to run
+//                   the tensor-parallel MTP head against their local shards.
 //   * TP_STOP_MAGIC: shutdown sentinel; follower exits its serve loop.
 //
 // Sized at exactly 8 i32 so we can broadcast it as `8 * sizeof(int32_t)`
@@ -406,6 +1207,7 @@ struct TpFireHeader {
 static_assert(sizeof(TpFireHeader) == 10 * sizeof(std::int32_t),
               "TpFireHeader must pack into exactly 10 ints");
 constexpr std::int32_t TP_FIRE_MAGIC = 0x55504954;  // 'TPIU' tag
+constexpr std::int32_t TP_MTP_MAGIC  = 0x50544D4D;  // 'MMTP' tag
 constexpr std::int32_t TP_STOP_MAGIC = 0x504F5453;  // 'STOP' tag
 
 // Lazily-allocated 32-byte device buffer holding the broadcast header.
@@ -497,6 +1299,38 @@ void tp_broadcast_inputs(NcclComm& comm, PersistentInputs& pi,
     if (logit_rows > 0) {
         NCCL_CHECK(ncclBroadcast(pi.sample_idx.data(), pi.sample_idx.data(),
                                  static_cast<std::size_t>(logit_rows) * 4,
+                                 ncclChar, 0, comm.comm(), stream));
+    }
+    NCCL_CHECK_ASYNC(ncclGroupEnd(), comm.comm());
+}
+
+void tp_broadcast_mtp_inputs(NcclComm& comm, PersistentInputs& pi,
+                             int num_tokens, int draft_step,
+                             cudaStream_t stream)
+{
+    auto* d_hdr = tp_hdr_dev_buf();
+    TpFireHeader hdr{
+        TP_MTP_MAGIC, num_tokens, draft_step, 0, 0, 0, 0, 0, 0, 0,
+    };
+    CUDA_CHECK(cudaMemcpyAsync(d_hdr, &hdr, sizeof(hdr),
+                               cudaMemcpyHostToDevice, stream));
+    NCCL_CHECK_ASYNC(ncclBroadcast(d_hdr, d_hdr, sizeof(hdr), ncclChar, 0,
+                                   comm.comm(), stream),
+                     comm.comm());
+    NCCL_CHECK(ncclGroupStart());
+    if (num_tokens > 0) {
+        NCCL_CHECK(ncclBroadcast(pi.tokens.data(), pi.tokens.data(),
+                                 static_cast<std::size_t>(num_tokens) * 4,
+                                 ncclChar, 0, comm.comm(), stream));
+        NCCL_CHECK(ncclBroadcast(pi.positions.data(), pi.positions.data(),
+                                 static_cast<std::size_t>(num_tokens) * 4,
+                                 ncclChar, 0, comm.comm(), stream));
+        NCCL_CHECK(ncclBroadcast(pi.sample_idx.data(), pi.sample_idx.data(),
+                                 static_cast<std::size_t>(num_tokens) * 4,
+                                 ncclChar, 0, comm.comm(), stream));
+        NCCL_CHECK(ncclBroadcast(pi.mtp_request_ids.data(),
+                                 pi.mtp_request_ids.data(),
+                                 static_cast<std::size_t>(num_tokens) * 4,
                                  ncclChar, 0, comm.comm(), stream));
     }
     NCCL_CHECK_ASYNC(ncclGroupEnd(), comm.comm());
@@ -665,6 +1499,7 @@ std::size_t capture_forward_graph_lattice(Executor& executor) {
             executor.attn_ws,
             ForwardFn::PrepareInputs{
                 .qo_indptr_h = qo.data(),
+                .kv_page_indices_h = kvpi.data(),
                 .kv_page_indices_d =
                     reinterpret_cast<const std::uint32_t*>(pi.kv_page_indices.data()),
                 .kv_page_indptr_h = kvpp.data(),
@@ -683,12 +1518,13 @@ std::size_t capture_forward_graph_lattice(Executor& executor) {
             (tp_greedy_argmax ? 1u : 0u) |
             (single_gpu_graph_argmax ? 2u : 0u) |
             (graph_layout << 2);
-        const ForwardGraphKey key{R, graph_variant};
+        const ForwardGraphKey key{R, N, graph_variant};
         if (executor.graph_cache->get(key) != nullptr) continue;
 
         tp_graph_capture_barrier(executor);
         cudaGraphExec_t exec = capture_forward_graph_exec(
-            executor, qo.data(), kvpp.data(), N, R, /*is_pure_decode=*/true,
+            executor, qo.data(), kvpi.data(), kvpp.data(), kvlpl.data(),
+            N, R, /*is_pure_decode=*/true,
             /*slot_ids_h=*/nullptr, /*is_fresh_h=*/nullptr,
             executor.rs_cache != nullptr ? pi.slot_ids.data() : nullptr,
             /*logit_row_indices_d=*/nullptr,
@@ -865,11 +1701,26 @@ void handle_fire_batch(
                 rs_flag_view.begin(), rs_flag_view.end(),
                 [](std::uint8_t v) { return (v & 1u) != 0; });
 
-        bool graph_shape_ok =
+        const int small_spec_graph_tokens = qwen35_small_spec_graph_tokens();
+        const bool pure_decode_graph_shape =
             executor.graph_cache != nullptr && is_pure_decode &&
             forward_fn.graph_safe && !has_fresh_slot;
+        const bool small_spec_graph_shape =
+            executor.graph_cache != nullptr &&
+            executor.tp_comm == nullptr &&
+            !is_pure_decode &&
+            has_spec_drafts &&
+            forward_fn.graph_safe &&
+            forward_fn.supports_small_prefill_graph &&
+            small_spec_graph_tokens > 0 &&
+            R == 1 &&
+            N <= small_spec_graph_tokens &&
+            kv_cache.format().is_native_bf16() &&
+            !kv_cache.hnd_layout() &&
+            !has_fresh_slot;
+        bool graph_shape_ok = pure_decode_graph_shape || small_spec_graph_shape;
         int graph_requests = R;
-        if (graph_shape_ok) {
+        if (pure_decode_graph_shape) {
             const int bucket =
                 forward_graph_request_bucket(R, max_forward_requests);
             const int pad = bucket - R;
@@ -893,8 +1744,12 @@ void handle_fire_batch(
         const int forward_N = forward_inputs.total_tokens;
         const int forward_R = forward_inputs.num_requests;
         const std::uint32_t* h_qo_forward = forward_inputs.qo_indptr.data();
+        const std::uint32_t* h_kvpi_forward =
+            forward_inputs.kv_page_indices.data();
         const std::uint32_t* h_kvpp_forward =
             forward_inputs.kv_page_indptr.data();
+        const std::uint32_t* h_kvlpl_forward =
+            forward_inputs.kv_last_page_lens.data();
 
         // Refill persistent device buffers with this fire's wire inputs.
         // Same device addresses every fire — required for graph-replay
@@ -962,6 +1817,52 @@ void handle_fire_batch(
             pi.is_fresh.copy_from_host(std::span<const std::uint8_t>(is_fresh_h));
         }
 
+        RsSpecRollback rs_spec_rollback;
+        if (has_spec_drafts && executor.rs_cache != nullptr && use_slots) {
+            const bool can_repair =
+                executor.tp_comm == nullptr &&
+                executor.rs_cache_scratch_slot >= 0;
+            if (can_repair && R != 1) {
+                throw std::runtime_error(
+                    "rs_cache speculative rollback requires single-request batches");
+            }
+            if (can_repair && !verify_n_drafts.empty() && verify_n_drafts[0] > 0) {
+                rs_spec_rollback.enabled = true;
+                rs_spec_rollback.slot = slot_ids_h[0];
+                rs_spec_rollback.scratch_slot = executor.rs_cache_scratch_slot;
+                const bool use_prefix_snapshots =
+                    verify_n_drafts[0] >= qwen35_rs_snapshot_min_drafts();
+                rs_spec_rollback.snapshot_base_slot = use_prefix_snapshots
+                    ? executor.rs_cache_scratch_slot + 1
+                    : -1;
+                rs_spec_rollback.snapshot_count = use_prefix_snapshots
+                    ? std::max(
+                          0,
+                          executor.rs_cache->max_slots() -
+                              rs_spec_rollback.snapshot_base_slot)
+                    : 0;
+                if (use_prefix_snapshots &&
+                    rs_spec_rollback.snapshot_count > 0) {
+                    executor.rs_cache->set_spec_snapshot_slots(
+                        rs_spec_rollback.snapshot_base_slot,
+                        rs_spec_rollback.snapshot_count);
+                } else {
+                    executor.rs_cache->clear_spec_snapshot_slots();
+                }
+                rs_spec_rollback.was_fresh = !is_fresh_h.empty() && is_fresh_h[0] != 0;
+                if (!rs_spec_rollback.was_fresh) {
+                    executor.rs_cache->copy_slot_d2d(
+                        rs_spec_rollback.slot,
+                        rs_spec_rollback.scratch_slot,
+                        cublas.stream());
+                }
+            } else if (executor.rs_cache != nullptr) {
+                executor.rs_cache->clear_spec_snapshot_slots();
+            }
+        } else if (executor.rs_cache != nullptr) {
+            executor.rs_cache->clear_spec_snapshot_slots();
+        }
+
         // ── Sample-plan construction (hoisted) ──────────────────
         // Sampling stays outside the CUDA graph because sampler/probe
         // layouts can vary even when the decode shape is identical. Build
@@ -969,10 +1870,14 @@ void handle_fire_batch(
         // upload stable device inputs once and launch sampling after the
         // forward body has produced logits.
         const auto outspec_view = view.output_spec_flags.as<std::uint8_t>();
-        bool need_msgpack = false;
+        bool has_msgpack_only_slots = false;
         for (auto t : types_view) {
-            if (pie_cuda_driver::is_msgpack_only(t)) { need_msgpack = true; break; }
+            if (pie_cuda_driver::is_msgpack_only(t)) {
+                has_msgpack_only_slots = true;
+                break;
+            }
         }
+        bool need_msgpack = has_msgpack_only_slots;
         if (!need_msgpack) {
             for (auto f : outspec_view) {
                 if (f) { need_msgpack = true; break; }
@@ -1134,7 +2039,7 @@ void handle_fire_batch(
             executor.forward_fn.supports_compact_logits &&
             !is_pure_decode &&
             !have_custom_mask &&
-            !need_msgpack &&
+            !has_msgpack_only_slots &&
             !has_spec_drafts &&
             logit_masks_view.empty() &&
             !any_topk_topp &&
@@ -1159,13 +2064,10 @@ void handle_fire_batch(
         const bool single_gpu_greedy_argmax =
             executor.tp_comm == nullptr &&
             !have_custom_mask &&
-            !need_msgpack &&
-            !has_spec_drafts &&
             logit_masks_view.empty() &&
             !any_topk_topp &&
             all_slots_token &&
             all_rows_greedy &&
-            is_pure_decode &&
             sample_rows_are_dense;
         const int logit_rows_required =
             compact_logit_rows ? num_sampling : N;
@@ -1232,13 +2134,14 @@ void handle_fire_batch(
                 attn_ws,
                 ForwardFn::PrepareInputs{
                     .qo_indptr_h = h_qo_forward,
+                    .kv_page_indices_h = h_kvpi_forward,
                     .kv_page_indices_d =
                         reinterpret_cast<const std::uint32_t*>(pi.kv_page_indices.data()),
                     .kv_page_indptr_h = h_kvpp_forward,
                     .kv_page_indptr_d =
                         reinterpret_cast<const std::uint32_t*>(pi.kv_page_indptr.data()),
                     .kv_last_page_lens_h =
-                        forward_inputs.kv_last_page_lens.data(),
+                        h_kvlpl_forward,
                     .kv_last_page_lens_d =
                         reinterpret_cast<const std::uint32_t*>(pi.kv_last_page_lens.data()),
                     .total_tokens = forward_N,
@@ -1276,13 +2179,16 @@ void handle_fire_batch(
             forward_fn.graph_layout ? forward_fn.graph_layout() : 0u;
         const bool graph_captures_single_gpu_argmax =
             try_graphs && single_gpu_greedy_argmax &&
-            graph_single_gpu_argmax_enabled();
+            (graph_single_gpu_argmax_enabled() || small_spec_graph_shape);
         const std::uint32_t graph_variant =
             (tp_greedy_argmax ? 1u : 0u) |
             (graph_captures_single_gpu_argmax ? 2u : 0u) |
-            (graph_layout << 2);
+            (graph_layout << 2) |
+            (small_spec_graph_shape ? 0x100u : 0u);
+        StepProfileTimer verify_timer(
+            "verify", cublas.stream(), forward_N, forward_R);
         if (try_graphs) {
-            const ForwardGraphKey key{forward_R, graph_variant};
+            const ForwardGraphKey key{forward_R, forward_N, graph_variant};
             cudaGraphExec_t exec = executor.graph_cache->get(key);
             if (exec == nullptr) {
                 // First fire of this shape: capture the forward body.
@@ -1305,7 +2211,8 @@ void handle_fire_batch(
                 // to the stable device buffers. The capture only records the
                 // graph; the exec is launched below for this same fire.
                 exec = capture_forward_graph_exec(
-                    executor, h_qo_forward, h_kvpp_forward,
+                    executor, h_qo_forward, h_kvpi_forward, h_kvpp_forward,
+                    h_kvlpl_forward,
                     forward_N, forward_R, is_pure_decode,
                     use_slots ? slot_ids_h.data() : nullptr,
                     use_slots ? is_fresh_h.data() : nullptr,
@@ -1319,6 +2226,7 @@ void handle_fire_batch(
                 if (executor.verbose && (sz <= 4 || sz % 16 == 0)) {
                     std::cerr << "[pie-driver-cuda] graph captured: R="
                               << forward_R
+                              << " N=" << forward_N
                               << (forward_inputs.padded ? " padded" : "")
                               << " real_R=" << R
                               << " variant=" << graph_variant
@@ -1335,7 +2243,9 @@ void handle_fire_batch(
                 pi.qo_indptr.data(), pi.kv_page_indices.data(),
                 pi.kv_page_indptr.data(), pi.kv_last_page_lens.data(),
                 /*qo_indptr_h=*/h_qo_forward,
+                /*kv_page_indices_h=*/h_kvpi_forward,
                 /*kv_page_indptr_h=*/h_kvpp_forward,
+                /*kv_last_page_lens_h=*/h_kvlpl_forward,
                 forward_N, forward_R, is_pure_decode,
                 have_custom_mask ? pi.custom_mask.data()        : nullptr,
                 have_custom_mask ? pi.custom_mask_indptr.data() : nullptr,
@@ -1359,7 +2269,8 @@ void handle_fire_batch(
         } else if (graph_captures_single_gpu_argmax) {
             // The captured forward graph already wrote pi.sampled.
         } else if (single_gpu_greedy_argmax && !graph_captures_single_gpu_argmax) {
-            const int argmax_parts = partitioned_argmax_parts();
+            const int argmax_parts =
+                greedy_argmax_parts(engine.hf_config().vocab_size);
             if (argmax_parts > 1 && !ws.greedy_pairs_all.empty()) {
                 kernels::launch_argmax_bf16_partitioned_pairs(
                     ws.logits.data(),
@@ -1415,6 +2326,7 @@ void handle_fire_batch(
                                    sizeof(std::int32_t) * N,
                                    cudaMemcpyDeviceToHost,
                                    cublas.stream()));
+        verify_timer.finish(cublas.stream());
         CUDA_CHECK(cudaStreamSynchronize(cublas.stream()));
 
         // CUDA's fast token samplers do not yet consume BRLE logit masks.
@@ -1483,6 +2395,25 @@ void handle_fire_batch(
 
         if (need_msgpack) {
             std::vector<pie_driver::PerRequestOutput> per_req(R);
+            std::vector<int> spec_accepted_drafts(
+                static_cast<std::size_t>(R), -1);
+            std::vector<std::int32_t> mtp_base_rows(
+                static_cast<std::size_t>(R), -1);
+            std::vector<std::uint32_t> mtp_draft_positions(
+                static_cast<std::size_t>(R), 0);
+            auto remember_mtp_source = [&](int r, std::uint32_t row) {
+                if (r < 0 || r >= R) return;
+                if (row >= static_cast<std::uint32_t>(N)) return;
+                const std::uint64_t source_pos = pos_view[row];
+                const std::uint64_t draft_pos = source_pos + 2ull;
+                if (draft_pos > std::numeric_limits<std::uint32_t>::max()) {
+                    return;
+                }
+                mtp_base_rows[static_cast<std::size_t>(r)] =
+                    static_cast<std::int32_t>(row);
+                mtp_draft_positions[static_cast<std::size_t>(r)] =
+                    static_cast<std::uint32_t>(draft_pos);
+            };
             const ResponseSubpassContext sub_ctx{
                 ws,
                 R, num_sampling, engine.hf_config().vocab_size,
@@ -1520,16 +2451,408 @@ void handle_fire_batch(
                         if (block[k] == spec_tok_view[spec_lo + k]) match++;
                         else break;
                     }
+                    if (mtp_trace_take()) {
+                        std::cerr << "[pie-mtp-trace] verify r=" << r
+                                  << " n_drafts=" << n_d
+                                  << " accepted=" << match
+                                  << " pos=[";
+                        for (int j = 0; j <= n_d; ++j) {
+                            if (j) std::cerr << ",";
+                            const std::uint32_t row = qo_lo + h_sidx[vs + j];
+                            std::cerr << pos_view[row];
+                        }
+                        std::cerr << "] draft=[";
+                        for (int j = 0; j < n_d; ++j) {
+                            if (j) std::cerr << ",";
+                            std::cerr << spec_tok_view[spec_lo + j];
+                        }
+                        std::cerr << "] verify=[";
+                        for (int j = 0; j <= n_d; ++j) {
+                            if (j) std::cerr << ",";
+                            std::cerr << block[j];
+                        }
+                        std::cerr << "]\n";
+                    }
+                    spec_accepted_drafts[static_cast<std::size_t>(r)] = match;
                     bucket.assign(block.begin(), block.begin() + match + 1);
+                    if (!bucket.empty()) {
+                        const int j = static_cast<int>(bucket.size()) - 1;
+                        const std::uint32_t row = qo_lo + h_sidx[vs + j];
+                        remember_mtp_source(r, row);
+                    }
                 } else {
                     const std::uint32_t lo = h_sptr[r];
                     const std::uint32_t hi = h_sptr[r + 1];
                     bucket.reserve(hi - lo);
+                    std::uint32_t last_token_row =
+                        std::numeric_limits<std::uint32_t>::max();
                     for (std::uint32_t k = lo; k < hi; ++k) {
                         const std::uint32_t type = per_slot_type[k];
                         if (!pie_cuda_driver::is_token_sampler(type)) continue;
                         const std::uint32_t row = qo_lo + h_sidx[k];
                         bucket.push_back(static_cast<std::uint32_t>(all_sampled[row]));
+                        last_token_row = row;
+                    }
+                    if (!bucket.empty()) {
+                        remember_mtp_source(r, last_token_row);
+                    }
+                }
+            }
+            std::vector<SystemSpecDraftRequest> system_draft_requests;
+            if (executor.system_drafter) {
+                system_draft_requests.reserve(static_cast<std::size_t>(R));
+                for (int r = 0; r < R; ++r) {
+                    const bool wants_spec =
+                        r < static_cast<int>(outspec_view.size()) &&
+                        outspec_view[r] != 0;
+                    if (!wants_spec) continue;
+                    const auto& bucket =
+                        per_req[static_cast<std::size_t>(r)].tokens;
+                    if (bucket.empty()) continue;
+                    const std::int32_t row =
+                        mtp_base_rows[static_cast<std::size_t>(r)];
+                    if (row < 0) continue;
+                    const std::uint32_t draft_pos =
+                        mtp_draft_positions[static_cast<std::size_t>(r)];
+                    if (draft_pos < 2u) continue;
+                    const int last_match =
+                        spec_accepted_drafts[static_cast<std::size_t>(r)];
+                    const bool has_prior_drafts =
+                        has_spec_drafts &&
+                        r < static_cast<int>(verify_slot_start.size()) &&
+                        verify_slot_start[r] >= 0;
+                    const int last_num_drafts =
+                        has_prior_drafts ? verify_n_drafts[r] : 0;
+                    system_draft_requests.push_back(SystemSpecDraftRequest{
+                        .request_index = r,
+                        .source_row = row,
+                        .accepted_token = bucket.back(),
+                        .source_position = draft_pos - 2u,
+                        .first_draft_position = draft_pos,
+                        .last_match = last_match,
+                        .last_num_drafts = last_num_drafts,
+                    });
+                }
+            }
+
+            bool native_commit_cache = false;
+            if (!system_draft_requests.empty() &&
+                executor.system_drafter.commit_verified_prefix) {
+                std::vector<std::uint32_t> mtp_commit_tokens;
+                std::vector<std::uint32_t> mtp_commit_positions;
+                std::vector<std::uint32_t> mtp_commit_qo(
+                    static_cast<std::size_t>(R) + 1, 0);
+                std::vector<std::uint32_t> mtp_commit_lpl(
+                    static_cast<std::size_t>(R), 0);
+                std::vector<std::int32_t> mtp_commit_source_rows;
+                mtp_commit_tokens.reserve(static_cast<std::size_t>(N));
+                mtp_commit_positions.reserve(static_cast<std::size_t>(N));
+                mtp_commit_source_rows.reserve(static_cast<std::size_t>(N));
+
+                auto bump_last_page_len = [&](std::uint32_t lpl,
+                                              int extra_tokens) {
+                    if (extra_tokens <= 0) return lpl;
+                    const int bumped = static_cast<int>(lpl) + extra_tokens;
+                    return static_cast<std::uint32_t>(
+                        ((bumped - 1) % page_size) + 1);
+                };
+                for (int r = 0; r < R; ++r) {
+                    mtp_commit_qo[static_cast<std::size_t>(r)] =
+                        static_cast<std::uint32_t>(mtp_commit_tokens.size());
+                    mtp_commit_lpl[static_cast<std::size_t>(r)] =
+                        r < static_cast<int>(kvlpl_view_orig.size())
+                            ? kvlpl_view_orig[r]
+                            : (r < static_cast<int>(kvlpl_view.size())
+                                   ? kvlpl_view[r]
+                                   : 0u);
+                    const bool wants_spec =
+                        r < static_cast<int>(outspec_view.size()) &&
+                        outspec_view[r] != 0;
+                    if (!wants_spec) continue;
+
+                    const int orig_qo_lo =
+                        static_cast<int>(qo_view_orig[r]);
+                    const int orig_n_in =
+                        static_cast<int>(qo_view_orig[r + 1]) - orig_qo_lo;
+                    int accepted = 0;
+                    if (has_spec_drafts &&
+                        r < static_cast<int>(spec_accepted_drafts.size()) &&
+                        spec_accepted_drafts[static_cast<std::size_t>(r)] > 0) {
+                        accepted =
+                            spec_accepted_drafts[static_cast<std::size_t>(r)];
+                    }
+                    const int commit_len = orig_n_in + accepted;
+                    if (commit_len <= 0) continue;
+
+                    const int active_qo_lo = static_cast<int>(qo_view[r]);
+                    const int active_qo_hi = static_cast<int>(qo_view[r + 1]);
+                    const int bounded_commit_len =
+                        std::min(commit_len, active_qo_hi - active_qo_lo);
+                    for (int j = 0; j < bounded_commit_len; ++j) {
+                        const int row = active_qo_lo + j;
+                        mtp_commit_tokens.push_back(tok_view[row]);
+                        mtp_commit_positions.push_back(pos_view[row]);
+                        mtp_commit_source_rows.push_back(
+                            static_cast<std::int32_t>(row));
+                    }
+                    mtp_commit_lpl[static_cast<std::size_t>(r)] =
+                        bump_last_page_len(
+                            mtp_commit_lpl[static_cast<std::size_t>(r)],
+                            std::max(0, bounded_commit_len - orig_n_in));
+                }
+                mtp_commit_qo[static_cast<std::size_t>(R)] =
+                    static_cast<std::uint32_t>(mtp_commit_tokens.size());
+
+                native_commit_cache =
+                    executor.tp_comm == nullptr &&
+                    !mtp_commit_tokens.empty();
+                if (native_commit_cache) {
+                    pi.tokens.copy_from_host(
+                        std::span<const std::uint32_t>(mtp_commit_tokens));
+                    pi.positions.copy_from_host(
+                        std::span<const std::uint32_t>(mtp_commit_positions));
+                    pi.qo_indptr.copy_from_host(
+                        std::span<const std::uint32_t>(mtp_commit_qo));
+                    pi.kv_last_page_lens.copy_from_host(
+                        std::span<const std::uint32_t>(mtp_commit_lpl));
+                    pi.sample_idx.copy_from_host(
+                        std::span<const std::int32_t>(mtp_commit_source_rows));
+                    profile_mtp_process_call(
+                        "commit", cublas.stream(),
+                        static_cast<int>(mtp_commit_tokens.size()), R,
+                        [&] {
+                            executor.system_drafter.commit_verified_prefix(
+                                NativeSystemCommitInputs{
+                                    .target_ws = ws,
+                                    .kv_cache = kv_cache,
+                                    .cublas = cublas,
+                                    .token_ids =
+                                        reinterpret_cast<const std::int32_t*>(
+                                            pi.tokens.data()),
+                                    .positions =
+                                        reinterpret_cast<const std::int32_t*>(
+                                            pi.positions.data()),
+                                    .qo_indptr = pi.qo_indptr.data(),
+                                    .kv_page_indices =
+                                        pi.kv_page_indices.data(),
+                                    .kv_page_indptr =
+                                        pi.kv_page_indptr.data(),
+                                    .kv_last_page_lens =
+                                        pi.kv_last_page_lens.data(),
+                                    .slot_ids =
+                                        use_slots ? pi.slot_ids.data()
+                                                  : nullptr,
+                                    .source_row_indices = pi.sample_idx.data(),
+                                    .total_tokens =
+                                        static_cast<int>(
+                                            mtp_commit_tokens.size()),
+                                    .num_requests = R,
+                                });
+                        });
+                }
+            }
+
+            if (!system_draft_requests.empty() &&
+                executor.system_drafter.draft_next) {
+                StepProfileTimer system_spec_timer(
+                    "system_drafter", cublas.stream(),
+                    static_cast<int>(system_draft_requests.size()), R);
+                executor.system_drafter.draft_next(
+                    SystemSpecDraftInputs{
+                        .target_ws = ws,
+                        .kv_cache = kv_cache,
+                        .attn_ws = attn_ws,
+                        .cublas = cublas,
+                        .requests =
+                            std::span<const SystemSpecDraftRequest>(
+                                system_draft_requests.data(),
+                                system_draft_requests.size()),
+                        .kv_page_indices = kvpi_view,
+                        .kv_page_indptr = kvpp_view,
+                        .page_size = kv_cache.page_size(),
+                        .max_drafts = executor.system_drafter.max_drafts,
+                    },
+                    std::span<pie_driver::PerRequestOutput>(
+                        per_req.data(), per_req.size()));
+                system_spec_timer.finish(cublas.stream());
+            } else if (!system_draft_requests.empty() &&
+                       executor.system_drafter.draft_step) {
+                run_step_chained_system_drafter(
+                    executor,
+                    std::span<const SystemSpecDraftRequest>(
+                        system_draft_requests.data(),
+                        system_draft_requests.size()),
+                    std::span<pie_driver::PerRequestOutput>(
+                        per_req.data(), per_req.size()),
+                    native_commit_cache);
+            }
+            if (rs_spec_rollback.enabled) {
+                const int accepted = spec_accepted_drafts.empty()
+                    ? -1
+                    : spec_accepted_drafts[0];
+                const int n_drafts = verify_n_drafts.empty()
+                    ? 0
+                    : verify_n_drafts[0];
+                if (accepted >= 0 && accepted < n_drafts) {
+                    const int n_in = static_cast<int>(
+                        qo_view_orig[1] - qo_view_orig[0]);
+                    const int replay_N = n_in + accepted;
+                    bool restored_from_snapshot = false;
+                    if (replay_N > 0 &&
+                        rs_spec_rollback.snapshot_base_slot >= 0 &&
+                        replay_N <= rs_spec_rollback.snapshot_count) {
+                        executor.rs_cache->copy_linear_state_slot_d2d(
+                            rs_spec_rollback.snapshot_base_slot + replay_N - 1,
+                            rs_spec_rollback.slot,
+                            cublas.stream());
+                        restored_from_snapshot = true;
+                    }
+
+                    if (!restored_from_snapshot) {
+                        if (rs_spec_rollback.was_fresh) {
+                            executor.rs_cache->reset_slot(
+                                rs_spec_rollback.slot, cublas.stream());
+                        } else {
+                            executor.rs_cache->copy_slot_d2d(
+                                rs_spec_rollback.scratch_slot,
+                                rs_spec_rollback.slot,
+                                cublas.stream());
+                        }
+                    }
+
+                    if (!restored_from_snapshot && replay_N > 0) {
+                        std::vector<std::uint32_t> repair_tokens;
+                        std::vector<std::uint32_t> repair_positions;
+                        repair_tokens.reserve(static_cast<std::size_t>(replay_N));
+                        repair_positions.reserve(static_cast<std::size_t>(replay_N));
+                        const int qo_lo =
+                            static_cast<int>(qo_view_orig[0]);
+                        for (int j = 0; j < n_in; ++j) {
+                            repair_tokens.push_back(tok_view_orig[qo_lo + j]);
+                            repair_positions.push_back(pos_view_orig[qo_lo + j]);
+                        }
+                        const int spec_lo = spec_iptr_view.empty()
+                            ? 0
+                            : static_cast<int>(spec_iptr_view[0]);
+                        for (int j = 0; j < accepted; ++j) {
+                            repair_tokens.push_back(spec_tok_view[spec_lo + j]);
+                            repair_positions.push_back(spec_pos_view[spec_lo + j]);
+                        }
+
+                        std::uint32_t repair_lpl = kvlpl_view_orig[0];
+                        if (accepted > 0) {
+                            const int bumped =
+                                static_cast<int>(repair_lpl) + accepted;
+                            repair_lpl = static_cast<std::uint32_t>(
+                                ((bumped - 1) % page_size) + 1);
+                        }
+
+                        const int kv_lo = static_cast<int>(kvpp_view[0]);
+                        const int kv_hi = static_cast<int>(kvpp_view[1]);
+                        if (kv_hi <= kv_lo) {
+                            throw std::runtime_error(
+                                "rs_cache speculative repair missing KV pages");
+                        }
+                        std::vector<std::uint32_t> repair_kvpi(
+                            kvpi_view.begin() + kv_lo,
+                            kvpi_view.begin() + kv_hi);
+                        std::vector<std::uint32_t> repair_qo{
+                            0u, static_cast<std::uint32_t>(replay_N)};
+                        std::vector<std::uint32_t> repair_kvpp{
+                            0u,
+                            static_cast<std::uint32_t>(repair_kvpi.size())};
+                        std::vector<std::uint32_t> repair_kvlpl{repair_lpl};
+                        std::vector<std::int32_t> repair_slots{
+                            static_cast<std::int32_t>(rs_spec_rollback.slot)};
+                        std::vector<std::uint8_t> repair_fresh{
+                            static_cast<std::uint8_t>(
+                                rs_spec_rollback.was_fresh ? 1u : 0u)};
+
+                        pi.tokens.copy_from_host(
+                            std::span<const std::uint32_t>(repair_tokens));
+                        pi.positions.copy_from_host(
+                            std::span<const std::uint32_t>(repair_positions));
+                        pi.qo_indptr.copy_from_host(
+                            std::span<const std::uint32_t>(repair_qo));
+                        pi.kv_page_indices.copy_from_host(
+                            std::span<const std::uint32_t>(repair_kvpi));
+                        pi.kv_page_indptr.copy_from_host(
+                            std::span<const std::uint32_t>(repair_kvpp));
+                        pi.kv_last_page_lens.copy_from_host(
+                            std::span<const std::uint32_t>(repair_kvlpl));
+                        pi.slot_ids.copy_from_host(
+                            std::span<const std::int32_t>(repair_slots));
+                        pi.is_fresh.copy_from_host(
+                            std::span<const std::uint8_t>(repair_fresh));
+
+                        if (forward_fn.prepare) {
+                            forward_fn.prepare(
+                                attn_ws,
+                                ForwardFn::PrepareInputs{
+                                    .qo_indptr_h = repair_qo.data(),
+                                    .kv_page_indices_h = repair_kvpi.data(),
+                                    .kv_page_indices_d =
+                                        reinterpret_cast<const std::uint32_t*>(
+                                            pi.kv_page_indices.data()),
+                                    .kv_page_indptr_h = repair_kvpp.data(),
+                                    .kv_page_indptr_d =
+                                        reinterpret_cast<const std::uint32_t*>(
+                                            pi.kv_page_indptr.data()),
+                                    .kv_last_page_lens_h = repair_kvlpl.data(),
+                                    .kv_last_page_lens_d =
+                                        reinterpret_cast<const std::uint32_t*>(
+                                            pi.kv_last_page_lens.data()),
+                                    .total_tokens = replay_N,
+                                    .num_requests = 1,
+                                    .is_pure_decode = replay_N == 1,
+                                });
+                        }
+                        forward_fn.body(
+                            ws, kv_cache, attn_ws, cublas,
+                            reinterpret_cast<const std::int32_t*>(pi.tokens.data()),
+                            reinterpret_cast<const std::int32_t*>(pi.positions.data()),
+                            pi.qo_indptr.data(), pi.kv_page_indices.data(),
+                            pi.kv_page_indptr.data(), pi.kv_last_page_lens.data(),
+                            /*qo_indptr_h=*/repair_qo.data(),
+                            /*kv_page_indices_h=*/repair_kvpi.data(),
+                            /*kv_page_indptr_h=*/repair_kvpp.data(),
+                            /*kv_last_page_lens_h=*/repair_kvlpl.data(),
+                            replay_N, 1, replay_N == 1,
+                            nullptr, nullptr,
+                            repair_slots.data(), repair_fresh.data(),
+                            pi.slot_ids.data(),
+                            nullptr, 0, false);
+                        if (!native_commit_cache &&
+                            executor.tp_comm == nullptr &&
+                            executor.system_drafter.commit_verified_prefix) {
+                            profile_mtp_process_call(
+                                "repair", cublas.stream(), replay_N, 1, [&] {
+                                    executor.system_drafter.commit_verified_prefix(
+                                        NativeSystemCommitInputs{
+                                            .target_ws = ws,
+                                            .kv_cache = kv_cache,
+                                            .cublas = cublas,
+                                            .token_ids =
+                                                reinterpret_cast<const std::int32_t*>(
+                                                    pi.tokens.data()),
+                                            .positions =
+                                                reinterpret_cast<const std::int32_t*>(
+                                                    pi.positions.data()),
+                                            .qo_indptr = pi.qo_indptr.data(),
+                                            .kv_page_indices =
+                                                pi.kv_page_indices.data(),
+                                            .kv_page_indptr =
+                                                pi.kv_page_indptr.data(),
+                                            .kv_last_page_lens =
+                                                pi.kv_last_page_lens.data(),
+                                            .slot_ids = pi.slot_ids.data(),
+                                            .source_row_indices = nullptr,
+                                            .total_tokens = replay_N,
+                                            .num_requests = 1,
+                                        });
+                                });
+                        }
+                        CUDA_CHECK(cudaStreamSynchronize(cublas.stream()));
                     }
                 }
             }
@@ -1605,6 +2928,42 @@ void tp_follower_serve(Executor& executor, std::atomic<bool>& stop) {
         CUDA_CHECK(cudaStreamSynchronize(stream));
 
         if (hdr.magic == TP_STOP_MAGIC) break;
+        if (hdr.magic == TP_MTP_MAGIC) {
+            const int S = hdr.total_tokens;
+            const int draft_step = hdr.num_requests;
+            NCCL_CHECK(ncclGroupStart());
+            if (S > 0) {
+                NCCL_CHECK(ncclBroadcast(pi.tokens.data(), pi.tokens.data(),
+                                         static_cast<std::size_t>(S) * 4,
+                                         ncclChar, 0, comm.comm(), stream));
+                NCCL_CHECK(ncclBroadcast(pi.positions.data(), pi.positions.data(),
+                                         static_cast<std::size_t>(S) * 4,
+                                         ncclChar, 0, comm.comm(), stream));
+                NCCL_CHECK(ncclBroadcast(pi.sample_idx.data(),
+                                         pi.sample_idx.data(),
+                                         static_cast<std::size_t>(S) * 4,
+                                         ncclChar, 0, comm.comm(), stream));
+                NCCL_CHECK(ncclBroadcast(pi.mtp_request_ids.data(),
+                                         pi.mtp_request_ids.data(),
+                                         static_cast<std::size_t>(S) * 4,
+                                         ncclChar, 0, comm.comm(), stream));
+            }
+            NCCL_CHECK_ASYNC(ncclGroupEnd(), comm.comm());
+            if (executor.system_drafter.draft_step && S > 0) {
+                executor.system_drafter.draft_step(
+                    executor.ws, executor.kv_cache, executor.cublas,
+                    reinterpret_cast<const std::int32_t*>(pi.tokens.data()),
+                    reinterpret_cast<const std::int32_t*>(pi.positions.data()),
+                    pi.sample_idx.data(),
+                    pi.mtp_request_ids.data(),
+                    pi.kv_page_indices.data(),
+                    pi.kv_page_indptr.data(),
+                    pi.kv_last_page_lens.data(),
+                    nullptr,
+                    S, draft_step, /*max_global_tokens=*/0);
+            }
+            continue;
+        }
         if (hdr.magic != TP_FIRE_MAGIC) {
             std::cerr << "[pie-driver-cuda] tp follower: unexpected header "
                       << "magic 0x" << std::hex << hdr.magic << std::dec
@@ -1673,10 +3032,12 @@ void tp_follower_serve(Executor& executor, std::atomic<bool>& stop) {
         }
         NCCL_CHECK_ASYNC(ncclGroupEnd(), comm.comm());
 
-        // 3. Pull the host views of qo/kv_page indptrs for the per-arch
+        // 3. Pull the host views of qo/KV layout for the per-arch
         // attention planner (lives outside the captured kernel sequence).
         h_qo.resize(R + 1);
         h_kvpp.resize(R + 1);
+        std::vector<std::uint32_t> h_kvpi(
+            static_cast<std::size_t>(std::max(0, hdr.kv_indices_count)));
         std::vector<std::uint32_t> h_kvlpl(R);
         CUDA_CHECK(cudaMemcpyAsync(h_qo.data(), pi.qo_indptr.data(),
                                    static_cast<std::size_t>(R + 1) * 4,
@@ -1688,6 +3049,12 @@ void tp_follower_serve(Executor& executor, std::atomic<bool>& stop) {
             CUDA_CHECK(cudaMemcpyAsync(h_kvlpl.data(), pi.kv_last_page_lens.data(),
                                        static_cast<std::size_t>(R) * 4,
                                        cudaMemcpyDeviceToHost, stream));
+        }
+        if (!h_kvpi.empty()) {
+            CUDA_CHECK(cudaMemcpyAsync(
+                h_kvpi.data(), pi.kv_page_indices.data(),
+                h_kvpi.size() * sizeof(std::uint32_t),
+                cudaMemcpyDeviceToHost, stream));
         }
         std::vector<std::int32_t> h_slot_ids;
         std::vector<std::uint8_t> h_is_fresh;
@@ -1711,6 +3078,7 @@ void tp_follower_serve(Executor& executor, std::atomic<bool>& stop) {
                 executor.attn_ws,
                 ForwardFn::PrepareInputs{
                     .qo_indptr_h = h_qo.data(),
+                    .kv_page_indices_h = h_kvpi.data(),
                     .kv_page_indices_d =
                         reinterpret_cast<const std::uint32_t*>(pi.kv_page_indices.data()),
                     .kv_page_indptr_h = h_kvpp.data(),
@@ -1739,11 +3107,12 @@ void tp_follower_serve(Executor& executor, std::atomic<bool>& stop) {
             (tp_greedy_argmax ? 1u : 0u) |
             (graph_layout << 2);
         if (try_graphs) {
-            const ForwardGraphKey key{R, graph_variant};
+            const ForwardGraphKey key{R, N, graph_variant};
             cudaGraphExec_t exec = executor.graph_cache->get(key);
             if (exec == nullptr) {
                 exec = capture_forward_graph_exec(
-                    executor, h_qo.data(), h_kvpp.data(),
+                    executor, h_qo.data(), h_kvpi.data(), h_kvpp.data(),
+                    h_kvlpl.data(),
                     N, R, is_pure_decode,
                     have_slot_ids ? h_slot_ids.data() : nullptr,
                     have_slot_ids ? h_is_fresh.data() : nullptr,
@@ -1762,7 +3131,7 @@ void tp_follower_serve(Executor& executor, std::atomic<bool>& stop) {
                 reinterpret_cast<const std::int32_t*>(pi.positions.data()),
                 pi.qo_indptr.data(), pi.kv_page_indices.data(),
                 pi.kv_page_indptr.data(), pi.kv_last_page_lens.data(),
-                h_qo.data(), h_kvpp.data(),
+                h_qo.data(), h_kvpi.data(), h_kvpp.data(), h_kvlpl.data(),
                 N, R, is_pure_decode,
                 have_custom_mask ? pi.custom_mask.data()        : nullptr,
                 have_custom_mask ? pi.custom_mask_indptr.data() : nullptr,

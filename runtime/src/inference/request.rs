@@ -439,6 +439,14 @@ pub fn extract_per_request(
 
     // Tokens: one indptr range per request.
     let (tok_lo, tok_hi) = indptr_range(&fr.tokens_indptr, r);
+    let (spec_lo, spec_hi) = indptr_range(&fr.spec_indptr, r);
+    if spec_hi > spec_lo {
+        out.spec_indptr = vec![0, (spec_hi - spec_lo) as u32];
+        out.spec_tokens = fr.spec_tokens[spec_lo..spec_hi].to_vec();
+        out.spec_positions = fr.spec_positions[spec_lo..spec_hi].to_vec();
+    } else if !fr.spec_indptr.is_empty() {
+        out.spec_indptr = vec![0, 0];
+    }
 
     // Hot path for normal generation: token samples only, no probe payloads.
     // Avoid allocating several empty indptr vectors for every request in
@@ -447,7 +455,8 @@ pub fn extract_per_request(
         && fr.dists_probs.is_empty()
         && fr.logits_bytes.is_empty()
         && fr.logprobs_values.is_empty()
-        && fr.entropies.is_empty();
+        && fr.entropies.is_empty()
+        && out.spec_tokens.is_empty();
     if token_payload_only {
         if tok_hi == tok_lo + 1 {
             out.tokens = vec![fr.tokens[tok_lo]];

@@ -66,6 +66,8 @@ class Model:
         raise NotImplementedError
     def tokenizer(self) -> Tokenizer:
         raise NotImplementedError
+    def default_system_speculation(self) -> bool:
+        raise NotImplementedError
     def __enter__(self) -> Self:
         """Returns self"""
         return self
@@ -75,6 +77,5 @@ class Model:
         Release this resource.
         """
         raise NotImplementedError
-
 
 

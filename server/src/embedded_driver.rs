@@ -483,6 +483,14 @@ pub(crate) fn write_cuda_startup_toml(
     if !opts.mxfp4_moe.is_empty() && opts.mxfp4_moe != "auto" {
         insert_str(&mut model, "mxfp4_moe", opts.mxfp4_moe.clone());
     }
+    if !opts.mtp_assistant_snapshot_dir.is_empty() {
+        insert_str(
+            &mut model,
+            "mtp_assistant_snapshot_dir",
+            opts.mtp_assistant_snapshot_dir.clone(),
+        );
+    }
+    insert_int(&mut model, "mtp_num_drafts", opts.mtp_num_drafts);
     insert_table(&mut doc, "model", model);
 
     let mut batching = toml::Table::new();

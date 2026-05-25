@@ -132,6 +132,7 @@ add_library(pie_driver_cuda_lib STATIC
   src/model/mixtral.cpp
   src/model/gemma2.cpp
   src/model/gemma4.cpp
+  src/model/gemma4_mtp.cpp
   src/model/gemma3n.cpp
   src/model/mistral3.cpp
   src/model/gpt_oss.cpp

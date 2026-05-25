@@ -32,11 +32,13 @@ Qwen3Workspace Qwen3Workspace::allocate_full(
     Qwen3Workspace ws;
     ws.y             = DeviceTensor::allocate(DType::BF16, {N, H});
     ws.norm_x        = DeviceTensor::allocate(DType::BF16, {N, H});
+    ws.spec_hidden   = DeviceTensor::allocate(DType::BF16, {N, H});
     // Fused QKV / gate-up matmul outputs. Always allocated — costs ~12 MiB
     // at N=10240 for Qwen3 dims and lets the forward dispatch decide per
     // layer whether to use the fused or unfused projection.
     ws.qkv_fused     = DeviceTensor::allocate(DType::BF16, {N, Hq + 2 * Hk});
     ws.gate_up_fused = DeviceTensor::allocate(DType::BF16, {N, 2 * I});
+    ws.mtp_concat    = DeviceTensor::allocate(DType::BF16, {N, 2 * H});
     ws.rope_table    = DeviceTensor::allocate(DType::FP32, {N, cfg.head_dim});
     ws.q             = DeviceTensor::allocate(DType::BF16, {N, Hq});
     ws.k             = DeviceTensor::allocate(DType::BF16, {N, Hk});
@@ -53,7 +55,6 @@ Qwen3Workspace Qwen3Workspace::allocate_full(
     ws.greedy_tokens_all = DeviceTensor::allocate(DType::INT32, {8, N});
     ws.greedy_pairs = DeviceTensor::allocate(DType::INT64, {N});
     ws.greedy_pairs_all = DeviceTensor::allocate(DType::INT64, {8, N});
-
     // Padded q/k/v/attn_out only when head_dim != head_dim_kernel
     // (currently only Phi-3 at 96 → 128). Empty allocations otherwise
     // — the forward path detects the empty-state and aliases the

@@ -85,6 +85,9 @@ pub struct Context {
     pub(crate) page_size: u32,
     /// SDK-side token buffer filled by instruct operations.
     pub(crate) buffer: Vec<u32>,
+    /// Deferred system text, so model templates that fold system into the
+    /// first user turn can render the pair correctly.
+    pending_system: Option<String>,
     /// Total tokens in committed + working pages (tracked locally).
     pub(crate) seq_len: u32,
     /// Number of committed pages (tracked locally).
@@ -134,6 +137,7 @@ impl Context {
             model,
             page_size,
             buffer: Vec::new(),
+            pending_system: None,
             seq_len,
             committed_pages,
             working_pages,
@@ -154,6 +158,7 @@ impl Context {
             model,
             page_size: self.page_size,
             buffer: self.buffer.clone(),
+            pending_system: self.pending_system.clone(),
             seq_len: self.seq_len,
             committed_pages: self.committed_pages,
             working_pages: self.working_pages,
@@ -272,22 +277,38 @@ impl Context {
     // model for template lookup / tokenization) and appends the resulting
     // tokens to the local buffer.
 
+    fn flush_pending_system(&mut self) {
+        if let Some(system) = self.pending_system.take() {
+            let tokens = chat::system(&self.model, &system);
+            self.buffer.extend(tokens);
+        }
+    }
+
+    fn is_first_chat_fill(&self) -> bool {
+        self.seq_len == 0 && self.buffer.is_empty()
+    }
+
     /// Fill a system message; tokens are buffered for the next `flush()`.
     pub fn system(&mut self, message: &str) -> &mut Self {
-        let tokens = chat::system(&self.model, message);
-        self.buffer.extend(tokens);
+        self.flush_pending_system();
+        self.pending_system = Some(message.to_string());
         self
     }
 
     /// Fill a user message.
     pub fn user(&mut self, message: &str) -> &mut Self {
-        let tokens = chat::user(&self.model, message);
+        let tokens = match self.pending_system.take() {
+            Some(system) => chat::system_user(&self.model, &system, message),
+            None if self.is_first_chat_fill() => chat::first_user(&self.model, message),
+            None => chat::user(&self.model, message),
+        };
         self.buffer.extend(tokens);
         self
     }
 
     /// Fill an assistant message (for history replay).
     pub fn assistant(&mut self, message: &str) -> &mut Self {
+        self.flush_pending_system();
         let tokens = chat::assistant(&self.model, message);
         self.buffer.extend(tokens);
         self
@@ -295,6 +316,7 @@ impl Context {
 
     /// Cue the model to generate (fills the generation header).
     pub fn cue(&mut self) -> &mut Self {
+        self.flush_pending_system();
         let tokens = chat::cue(&self.model);
         self.buffer.extend(tokens);
         self
@@ -302,6 +324,7 @@ impl Context {
 
     /// Seal the current turn (insert stop token).
     pub fn seal(&mut self) -> &mut Self {
+        self.flush_pending_system();
         let tokens = chat::seal(&self.model);
         self.buffer.extend(tokens);
         self
@@ -309,6 +332,7 @@ impl Context {
 
     /// Append raw tokens to the buffer directly.
     pub fn append(&mut self, tokens: &[u32]) -> &mut Self {
+        self.flush_pending_system();
         self.buffer.extend_from_slice(tokens);
         self
     }
@@ -327,6 +351,7 @@ impl Context {
     /// tool's `schema()` is not valid JSON, or if the model has no tool
     /// template.
     pub fn equip(&mut self, tools: &[&dyn crate::tools::Tool]) -> Result<&mut Self> {
+        self.flush_pending_system();
         let envelopes: Vec<String> = tools
             .iter()
             .map(|t| {
@@ -371,6 +396,7 @@ impl Context {
     /// After flush, the buffer is empty and `seq_len` reflects all
     /// consumed tokens.
     pub async fn flush(&mut self) -> Result<()> {
+        self.flush_pending_system();
         if self.buffer.is_empty() {
             return Ok(());
         }
@@ -425,6 +451,7 @@ impl Context {
     /// commit. Use for prefill, scoring, custom decode loops, and anywhere
     /// the [`generate`](Self::generate) loop is too high-level.
     pub fn forward(&mut self) -> crate::forward::Forward<'_> {
+        self.flush_pending_system();
         crate::forward::Forward::new(self)
     }
 
@@ -435,6 +462,7 @@ impl Context {
     /// the buffer (from `system / user / cue / …`) are drained on the
     /// first step.
     pub fn generate(&mut self, sampler: Sampler) -> crate::generation::Generator<'_> {
+        self.flush_pending_system();
         crate::generation::Generator::new(self, sampler)
     }
 }
