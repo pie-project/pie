@@ -1406,6 +1406,15 @@ impl BatchScheduler {
                         && batch_resp.spec_tokens.is_empty()
                         && batch_resp.tokens_indptr.len() >= requests.len() + 1;
 
+                    // Send oneshot replies first, defer drop of the
+                    // request husks. Each PendingRequest's drop is
+                    // ~3-4 µs (22-Vec ForwardRequest), and doing it
+                    // inline pushes the 256th chain extender's wake
+                    // out by ~1.2 ms — directly extending the gap.
+                    let mut deferred_drop: Vec<(
+                        pie_bridge::ForwardRequest,
+                        Vec<PhysicalPageId>,
+                    )> = Vec::with_capacity(n_results);
                     if token_payload_only {
                         for (r, req) in requests.into_iter().enumerate() {
                             let lo = batch_resp.tokens_indptr[r] as usize;
@@ -1427,14 +1436,30 @@ impl BatchScheduler {
                             } else {
                                 ForwardOutput::Tokens(batch_resp.tokens[lo..hi].to_vec())
                             };
-                            req.send_result(Ok(output), submit_tx.as_ref(), page_size);
+                            let PendingRequest {
+                                request,
+                                completion,
+                                physical_page_ids,
+                                last_page_len: _,
+                            } = req;
+                            match completion {
+                                Completion::Direct(tx) => {
+                                    tx.send(Ok(output)).ok();
+                                    deferred_drop.push((request, physical_page_ids));
+                                }
+                                Completion::Chunk { .. } => {
+                                    let req = PendingRequest {
+                                        request,
+                                        completion,
+                                        physical_page_ids,
+                                        last_page_len: 0,
+                                    };
+                                    req.send_result(Ok(output), submit_tx.as_ref(), page_size);
+                                }
+                            }
                         }
                     } else {
                         for (r, req) in requests.into_iter().enumerate() {
-                            // Extract this request's slice from the batched
-                            // response. The api layer (build_wit_output)
-                            // walks samplers + the single-request response
-                            // to construct the WIT Output.
                             let per_req = request::extract_per_request(&batch_resp, r);
                             if system_spec_proposed_per_req
                                 .get(r)
@@ -1448,12 +1473,32 @@ impl BatchScheduler {
                                     system_spec_draft_tokens_accepted_per_pos[pos] += 1;
                                 }
                             }
-                            req.send_result(
-                                Ok(ForwardOutput::Response(per_req)),
-                                submit_tx.as_ref(),
-                                page_size,
-                            );
+                            let output = ForwardOutput::Response(per_req);
+                            let PendingRequest {
+                                request,
+                                completion,
+                                physical_page_ids,
+                                last_page_len: _,
+                            } = req;
+                            match completion {
+                                Completion::Direct(tx) => {
+                                    tx.send(Ok(output)).ok();
+                                    deferred_drop.push((request, physical_page_ids));
+                                }
+                                Completion::Chunk { .. } => {
+                                    let req = PendingRequest {
+                                        request,
+                                        completion,
+                                        physical_page_ids,
+                                        last_page_len: 0,
+                                    };
+                                    req.send_result(Ok(output), submit_tx.as_ref(), page_size);
+                                }
+                            }
                         }
+                    }
+                    if !deferred_drop.is_empty() {
+                        tokio::spawn(async move { drop(deferred_drop); });
                     }
                 }
             }
