@@ -24,6 +24,17 @@ void launch_kimi_split_kv_a_bf16(
     int qk_rope_dim,
     cudaStream_t stream);
 
+void launch_kimi_split_kv_a_norm_bf16(
+    const void* kv_a,
+    const void* norm_weight,
+    void* kv_c,
+    void* k_pe,
+    int tokens,
+    int kv_lora_rank,
+    int qk_rope_dim,
+    float eps,
+    cudaStream_t stream);
+
 void launch_topk_sigmoid_bf16(
     const void* logits,
     std::int32_t* topk_idx,

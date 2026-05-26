@@ -547,12 +547,10 @@ void kimi_forward_paged(
             ops::gemm_act_x_w(cublas.handle(),
                 kimi_ws.q_a.data(), *Lw.q_b_proj,
                 kimi_ws.q_b.data(), total_tokens, heads * (q_nope + q_rope), q_lora);
-            kernels::launch_kimi_split_kv_a_bf16(
-                kimi_ws.kv_a_mqa.data(), kimi_ws.kv_c.data(), kimi_ws.k_pe.data(),
-                total_tokens, kv_lora, q_rope, stream);
-            kernels::launch_rmsnorm_bf16(
-                kimi_ws.kv_c.data(), Lw.kv_a_norm->data(), kimi_ws.kv_c.data(),
-                total_tokens, kv_lora, eps, stream);
+            kernels::launch_kimi_split_kv_a_norm_bf16(
+                kimi_ws.kv_a_mqa.data(), Lw.kv_a_norm->data(),
+                kimi_ws.kv_c.data(), kimi_ws.k_pe.data(),
+                total_tokens, kv_lora, q_rope, eps, stream);
 
             kernels::launch_kimi_split_q_b_bf16(
                 kimi_ws.q_b.data(), kimi_ws.q_nope.data(), kimi_ws.q_pe.data(),

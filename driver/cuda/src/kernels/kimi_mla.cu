@@ -55,6 +55,46 @@ __global__ void split_kv_a_kernel(
     }
 }
 
+// Fused split_kv_a + rmsnorm(kv_c): splits [kv_lora+rope] → kv_c[kv_lora] (normalized) + k_pe[rope]
+template <int BLOCK_DIM>
+__global__ void split_kv_a_norm_kernel(
+    const __nv_bfloat16* __restrict__ kv_a,
+    const __nv_bfloat16* __restrict__ norm_weight,
+    __nv_bfloat16* __restrict__ kv_c,
+    __nv_bfloat16* __restrict__ k_pe,
+    int kv_lora, int rope, float eps)
+{
+    const int n = blockIdx.x;
+    const int tid = threadIdx.x;
+    const int per = kv_lora + rope;
+    const __nv_bfloat16* row = kv_a + static_cast<long long>(n) * per;
+
+    // Copy k_pe (no normalization)
+    for (int d = tid; d < rope; d += BLOCK_DIM) {
+        k_pe[static_cast<long long>(n) * rope + d] = row[kv_lora + d];
+    }
+
+    // RMSNorm on kv_c portion
+    float local = 0.f;
+    for (int d = tid; d < kv_lora; d += BLOCK_DIM) {
+        const float v = __bfloat162float(row[d]);
+        local += v * v;
+    }
+    __shared__ float buf[BLOCK_DIM];
+    buf[tid] = local;
+    __syncthreads();
+    for (int off = BLOCK_DIM / 2; off > 0; off >>= 1) {
+        if (tid < off) buf[tid] += buf[tid + off];
+        __syncthreads();
+    }
+    const float inv_rms = rsqrtf(buf[0] / static_cast<float>(kv_lora) + eps);
+    for (int d = tid; d < kv_lora; d += BLOCK_DIM) {
+        const float v = __bfloat162float(row[d]);
+        const float w = __bfloat162float(norm_weight[d]);
+        kv_c[static_cast<long long>(n) * kv_lora + d] = __float2bfloat16(v * inv_rms * w);
+    }
+}
+
 __global__ void topk_sigmoid_kernel(
     const __nv_bfloat16* __restrict__ logits,
     std::int32_t* __restrict__ topk_idx,
@@ -197,6 +237,27 @@ void launch_kimi_split_kv_a_bf16(
         static_cast<__nv_bfloat16*>(kv_c),
         static_cast<__nv_bfloat16*>(k_pe),
         total, kv_lora_rank, qk_rope_dim);
+}
+
+void launch_kimi_split_kv_a_norm_bf16(
+    const void* kv_a,
+    const void* norm_weight,
+    void* kv_c,
+    void* k_pe,
+    int tokens,
+    int kv_lora_rank,
+    int qk_rope_dim,
+    float eps,
+    cudaStream_t stream)
+{
+    if (tokens <= 0) return;
+    constexpr int BS = 256;
+    split_kv_a_norm_kernel<BS><<<tokens, BS, 0, stream>>>(
+        static_cast<const __nv_bfloat16*>(kv_a),
+        static_cast<const __nv_bfloat16*>(norm_weight),
+        static_cast<__nv_bfloat16*>(kv_c),
+        static_cast<__nv_bfloat16*>(k_pe),
+        kv_lora_rank, qk_rope_dim, eps);
 }
 
 void launch_topk_sigmoid_bf16(
