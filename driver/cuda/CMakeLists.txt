@@ -49,7 +49,7 @@ include(cmake/CPM.cmake)
 cpmaddpackage(
   NAME flashinfer
   GITHUB_REPOSITORY flashinfer-ai/flashinfer
-  GIT_TAG v0.6.9
+  GIT_TAG v0.6.12rc1
   DOWNLOAD_ONLY YES)
 
 cpmaddpackage(URI "gh:marzer/tomlplusplus@3.4.0")
