@@ -28,11 +28,11 @@
 - Add regression coverage for async safetensors storage copies.
   - `copy_storage_bytes_to_device_async` must require mapped shard data before using `shard.data + file_offset`.
   - Cover mmap-backed and non-mmap fallback behavior if both paths remain supported.
-- Add tests for `SlabScatter` lowering and FFI layout.
-  - Multiple placements from one source span.
-  - Destination offsets into persistent arena.
-  - Rejection of source or destination ranges that exceed bounds.
-  - Stable ABI layout for `PieLoaderStorageInstrKind::SlabScatter`.
+- ~~Add tests for `SlabScatter` lowering and FFI layout.~~ (done)
+  - ✓ Multiple placements from one source span (`slab_scatter_merges_nearby_bulk_extent_writes`).
+  - ✓ Placement offsets within span bounds (`slab_scatter_placement_offsets_are_within_span`).
+  - ✓ Rejection of excessive overread (`slab_scatter_rejects_excessive_overread`).
+  - ✓ FFI layout (`slab_scatter_ffi_carries_placement_fields`).
 - Add an executor-level smoke test for `SlabScatter`.
   - Copy a contiguous source slab to GPU staging.
   - Scatter into two or more destination ranges.
