@@ -543,9 +543,9 @@ private:
     bool batched_copies_enabled() const
     {
 #if CUDART_VERSION >= 12080
-        const char* enable =
-            std::getenv("PIE_CUDA_ENABLE_BATCHED_WEIGHT_COPIES");
-        return enable != nullptr && enable[0] != '\0' && enable[0] != '0';
+        const char* disable =
+            std::getenv("PIE_CUDA_DISABLE_BATCHED_WEIGHT_COPIES");
+        return !(disable != nullptr && disable[0] != '\0' && disable[0] != '0');
 #else
         return false;
 #endif

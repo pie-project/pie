@@ -1,6 +1,6 @@
 # TODO
 
-## Kimi CUDA Driver
+## Kimi CUDA Driver — Correctness
 
 - ~~Investigate the remaining Moon-prompt repetition case.~~ (partially resolved)
   - **Fixed**: 4 bugs found and fixed:
@@ -8,10 +8,8 @@
     2. Missing `e_score_correction_bias` for noaux_tc MoE routing (`kimi.hpp/cpp`, `kimi_mla.cu/hpp`, `generic.rs`)
     3. YaRN RoPE not applied: `has_rope_scaling=true` missing from yarn branch, wrong `mscale_all_dim` handling (`hf_config.cpp`), added `launch_rope_yarn_original_bf16` call (`kimi_forward.cpp`)
     4. Routing weights used biased scores instead of original sigmoid (`kimi_mla.cu`)
-  - **Result**: France smoke test correct ("Paris."). Model recognizes topics correctly. Raw completion produces correct content.
-  - **Remaining**: Output still repeats for multi-sentence generation. Root cause: FlashInfer `BatchMLAPagedAttention` (absorbed Q, 512-dim dot products) accumulates more FP error per layer than vLLM's explicit-K/V prefill + TRT-LLM decode path (128-dim dot products). Fix: implement explicit K/V attention for prefill (compute K,V from `kv_b_proj @ kv_c`) matching vLLM's approach.
-- Keep `PIE_CUDA_KIMI_FORCE_PREFILL_MOE` as a temporary diagnostic switch only.
-  - Remove it once the decode path is validated.
+  - **Result**: Short factual answers correct ("Paris."). Raw completion produces correct content.
+  - **Remaining**: Output still repeats for multi-sentence generation. Root cause: FlashInfer `BatchMLAPagedAttention` (absorbed Q, 512-dim dot products) accumulates more FP error than vLLM's explicit-K/V prefill + TRT-LLM decode (128-dim dot products).
 - Implement explicit K/V prefill for Kimi MLA.
   - During prefill, compute `kv = kv_b_proj(kv_c)` → explicit K_nope, V.
   - Use standard FlashInfer prefill attention (not absorbed MLA).
@@ -23,121 +21,78 @@
   - Batch size > 1 with mixed prompt lengths.
   - Long context prefill followed by decode.
 
-## Weight Loader Correctness
+## Kimi CUDA Driver — Performance
 
+### Current numbers (8× H100 80GB, TP=8, temp=0, max_tokens=128)
+
+| Benchmark | Pie CUDA | vLLM 0.21.0 | Ratio |
+|-----------|---------|-------------|-------|
+| Latency (1 req) | 34.14 tok/s | 116.49 tok/s (compiled) | 0.29x |
+| Throughput (c=4, 16 req) | 91.14 tok/s | — | — |
+| Throughput (c=16, 64 req) | 202.25 tok/s | — | — |
+
+### Gap analysis
+- 3.4x gap vs compiled vLLM is mainly kernel launch overhead (CUDA graphs + torch.compile).
+- Pie can't use CUDA graphs for Kimi — model uses 91% GPU memory, no headroom for capture.
+- Pie wins on eager-mode vLLM (2.95x latency, 1.64x throughput).
+
+### Completed optimizations
+- ✓ Weight fusion: q_a+kv_a, shared gate+up (via weight loader compiler `add_mla_fused_projection_joins`)
+- ✓ Fused split_kv_a+rmsnorm kernel (`launch_kimi_split_kv_a_norm_bf16`)
+- ✓ `cudaMemcpyBatchAsync` enabled by default (CUDA 12.8+, reduces API call overhead for 161k H2D copies)
+- ✓ `StorageProgramSummary` profiling infrastructure
+
+### Slab scatter investigation (completed, not viable for TP-sharded models)
+- Diagnosed: per-rank slices are sparse within files (803.7 MiB payload in 9349.7 MiB span, 11.63x overread)
+- With relaxed limits (512 MiB slab, 16x overread): reduced 161k copies to 1142 slabs, but H2D bandwidth exploded from 48.9 GiB to 549 GiB per rank due to gap data in staging copies
+- Conclusion: slab scatter is counterproductive when overread > ~2x. For TP-sharded MoE models, `cudaMemcpyBatchAsync` is the right approach (batches 161k copies into ~2528 API calls with zero bandwidth waste)
+
+### Remaining optimization paths
+1. **CUDA graphs with reduced memory footprint** — reduce model memory pressure to free headroom for graph capture scratch buffers. Options: more aggressive weight quantization, KV cache reduction, or partial graph capture (decode-only subgraphs).
+2. **FlashInfer v0.6.12 hopper MLA kernel** — CuTe DSL MLA decode for H64 head dim. Blocked by CUDA 12.8 toolkit (needs CCCL from CUDA 13+). CUDA 13.2 migration blocked by Marlin `__global__` stub visibility change breaking cross-TU kernel refs.
+3. **cublasGemmStridedBatchedEx** for q_nope_to_latent/latent_to_v — replace multiple small GEMMs with batched version.
+4. **Persistent/mega-kernel** to eliminate launch overhead without CUDA graphs — amortize 1200+ kernel launches per forward pass.
+5. **Forward pass profiling** — `PIE_KIMI_PROFILE=1` instrumentation exists, need to collect breakdown (embed, attn, MoE router, gate_up, swiglu, down, shared, allreduce, residual, lm_head).
+
+## Weight Loader — Tests
+
+- ~~SlabScatter lowering and FFI layout~~ (done, 4 tests)
+- ~~MLA weight fusion through compiler~~ (done, `mla_q_kv_a_fusion_produces_joined_tensor`)
+- ~~rs_cache test signature fix~~ (done)
+- Add executor-level SlabScatter smoke test (copy+scatter+readback).
 - Add regression coverage for async safetensors storage copies.
-  - `copy_storage_bytes_to_device_async` must require mapped shard data before using `shard.data + file_offset`.
-  - Cover mmap-backed and non-mmap fallback behavior if both paths remain supported.
-- ~~Add tests for `SlabScatter` lowering and FFI layout.~~ (done)
-  - ✓ Multiple placements from one source span (`slab_scatter_merges_nearby_bulk_extent_writes`).
-  - ✓ Placement offsets within span bounds (`slab_scatter_placement_offsets_are_within_span`).
-  - ✓ Rejection of excessive overread (`slab_scatter_rejects_excessive_overread`).
-  - ✓ FFI layout (`slab_scatter_ffi_carries_placement_fields`).
-- Add an executor-level smoke test for `SlabScatter`.
-  - Copy a contiguous source slab to GPU staging.
-  - Scatter into two or more destination ranges.
-  - Read back and validate exact bytes.
 
-## Weight Loader Performance
+## Weight Loader — Performance
 
-- Reduce the high copy-command count.
-  - Current Kimi profile is roughly `161k` H2D copies per rank for about `48.9 GiB`.
-  - This dominates load latency even with multiple copy streams.
-  - Target is fewer, larger physical copy commands without excessive overread.
-- Replace the current conservative slab heuristic with a file-layout aware batching plan.
-  - Group by shard file and source byte order first.
-  - Build bounded windows over nearby checkpoint ranges.
-  - Scatter into runtime tensor layout from those windows.
-  - Preserve layout algebra generality: the compiler should reason about source spans and destination placements, not model names.
-- Make batching cost-based.
-  - Inputs: payload bytes, overread bytes, placement count, staging memory, expected memcpy launch overhead, and available bandwidth.
-  - Reject slabs when overread or staging pressure is worse than many direct copies.
-  - Prefer slabs when command reduction wins at low memory cost.
-- Improve per-rank load balance.
-  - Current materialization varies from about `34s` to `46s` per rank.
-  - Profile whether the gap is file locality, NUMA, GPU copy contention, or rank-specific tensor layout.
-- Keep pinned staging and GDS as optional experiments.
-  - Mmap direct host-to-device copies are currently the baseline to beat.
-  - Pinned staging should only stay enabled if it improves both load time and peak memory.
-  - GDS should be guarded by capability checks and should not complicate the default path.
+- ✓ `cudaMemcpyBatchAsync` default-enabled (was behind `PIE_CUDA_ENABLE_BATCHED_WEIGHT_COPIES` env var, now default on CUDA 12.8+, disable with `PIE_CUDA_DISABLE_BATCHED_WEIGHT_COPIES=1`)
+- Profile: 161k copies × 8 ranks, ~48.9 GiB/rank, 316 flush cycles → 2528 batch calls
+- Further reduction: slab scatter only viable for dense (non-TP-sharded) tensors with low overread
 
-## Weight Loader Compiler
+## Weight Loader — Compiler
 
-- Revisit the compiled instruction shape for Kimi.
-  - Current compiled program is still mostly many runtime-layout extent writes.
-  - The better shape is file-window reads plus scatter placements when that wins by cost.
-- Add a storage-plan optimizer pass after algebra lowering.
-  - Input: exact source byte ranges and destination byte ranges.
-  - Output: direct copies, slab scatters, or future DMA-friendly operations.
-  - Keep this pass model-agnostic.
-- Persist richer compile-cache metadata.
-  - Program version and ABI version.
-  - Checkpoint file paths, sizes, mtimes, and tensor metadata hash.
-  - Compiler options that affect batching thresholds.
-- Add a debug dump for compiled storage programs.
-  - Number of instructions by kind.
-  - H2D command count estimate.
-  - Total payload bytes, overread bytes, and staging bytes.
-  - Largest slabs and worst rejected candidates.
-- Improve compile-time profiling.
-  - Separate source metadata parsing, algebra lowering, extent coalescing, slab planning, ABI arena build, and cache serialization.
-  - Report cache hit/miss timing clearly.
+- ✓ `add_mla_fused_projection_joins()` — fuses q_a+kv_a and shared gate+up for MLA models
+- ✓ `StorageProgramSummary` for compile-time profiling
+- ✓ Slab scatter debug diagnostics (per-file entry count, span, max gap, overread ratio under `PIE_WEIGHT_LOADER_DEBUG=1`)
+- Revisit compiled instruction shape for cost-based batching decisions
+- Persist richer compile-cache metadata (version, file hashes, compiler options)
 
-## Memory Footprint
+## FlashInfer Upgrade (blocked)
 
-- Measure true peak memory during model loading.
-  - CPU RSS.
-  - GPU allocated bytes per rank.
-  - Persistent arena bytes.
-  - Temporary staging bytes.
-  - Page cache effects from mmap.
-- Keep slab staging bounded.
-  - Enforce a per-rank staging budget.
-  - Reuse one staging allocation per executor.
-  - Avoid plans that reduce copy count by consuming meaningful model capacity.
-- Check fragmentation risk.
-  - Persistent arena allocation should remain stable.
-  - Temporary staging should be allocated once and reused.
-  - Avoid many variable-size CUDA allocations during materialization.
-
-## Benchmarks
-
-- Add a repeatable Kimi loader benchmark under `benches/`.
-  - Cold compile cache.
-  - Warm compile cache.
-  - Warm OS page cache.
-  - Optional cold OS page cache if the environment allows it.
-- Benchmark against vLLM with identical conditions.
-  - Same checkpoint path.
-  - Same GPU set.
-  - Same prompt set.
-  - Same max tokens and sampling settings.
-- Track these metrics:
-  - Time to parse metadata.
-  - Time to compile/load cached storage plan.
-  - Time to materialize weights.
-  - Peak CPU RSS.
-  - Peak GPU memory.
-  - First-token latency.
-  - Decode tokens/sec.
-  - End-to-end throughput.
-- Add correctness prompts to the benchmark suite.
-  - Simple factual answer.
-  - Short instruction requiring EOS.
-  - Prompt that previously triggered Moon repetition.
-  - Longer context prompt.
+- v0.6.9 currently pinned (works with CUDA 12.8 nvcc)
+- v0.6.12rc1 has CuTe DSL MLA decode kernel (hopper H64) — potential major decode speedup
+- v0.6.12 build failures:
+  - Needs `cuda::fast_mod_div` from CCCL 13.2 → requires CUDA 13.2 toolkit
+  - CUDA 13.2 makes `__global__` kernel host stubs static → breaks Marlin cross-TU refs
+  - Tried `-fvisibility=default`, `CUDA_SEPARABLE_COMPILATION`, `-rdc=true` — none worked
+  - Fix: restructure Marlin host wrappers or use device link step
+  - Also needs `cudaMemcpyBatchAsync` compat wrapper (`#if CUDART_VERSION >= 13020`)
 
 ## Cleanup Before Merge
 
-- Decide whether `SlabScatter` is the final name.
-  - If it remains, document it in the weight-loader storage IR.
-- Remove diagnostic-only logs or gate them behind env vars.
-- Keep new loader optimizations general.
-  - No Kimi-specific compiler branches.
-  - Model-specific code should only describe model layout requirements, not loader execution strategy.
-- Re-run:
-  - `cargo test -p pie-weight-loader`
-  - `cargo test -p pie --lib model::tokenizer::tests::test_tiktoken_loader_reads_hf_added_tokens_decoder`
+- Remove `PIE_CUDA_KIMI_FORCE_PREFILL_MOE` diagnostic switch
+- Remove slab scatter debug diagnostics from `build_slab_scatter_writes` (or gate behind `PIE_WEIGHT_LOADER_DEBUG`)
+- Gate `PIE_KIMI_DUMP_LOGITS` instrumentation behind feature flag
+- Re-run full test suite:
+  - `cargo test -p pie-weight-loader` (12 tests, all passing)
+  - `cargo test -p pie-weight-loader --test ffi_layout` (13 tests, all passing)
   - `CMAKE_CUDA_ARCHITECTURES=90 cargo build --release -p pie-server --features driver-cuda`
-- Fix or quarantine unrelated full-suite failure before claiming full test cleanliness.
-  - Current known issue: `runtime/tests/rs_cache.rs` still uses the old `pie::context::spawn` signature.

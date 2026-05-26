@@ -870,6 +870,88 @@ fn raw_big(id: u32, name: &str, offset: u64, span_bytes: u64, dtype: DType) -> R
     }
 }
 
+// ── MLA weight fusion tests ─────────────────────────────────────────
+
+#[test]
+fn mla_q_kv_a_fusion_produces_joined_tensor() {
+    use pie_weight_loader::config::ModelConfig;
+    use pie_weight_loader::storage_compiler::compile_storage_program;
+
+    let h = 128i64;
+    let q_lora = 32i64;
+    let kv_lora_rope = 16i64;
+    let mut offset = 0u64;
+    let mut tensors = Vec::new();
+    let specs: Vec<(u32, &str, Vec<i64>)> = vec![
+        (0, "model.layers.0.self_attn.q_a_proj.weight", vec![q_lora, h]),
+        (1, "model.layers.0.self_attn.kv_a_proj_with_mqa.weight", vec![kv_lora_rope, h]),
+        (2, "model.layers.0.self_attn.q_a_layernorm.weight", vec![q_lora]),
+        (3, "model.layers.0.self_attn.q_b_proj.weight", vec![64, q_lora]),
+        (4, "model.layers.0.self_attn.kv_a_layernorm.weight", vec![12]),
+        (5, "model.layers.0.self_attn.kv_b_proj.weight", vec![64, 12]),
+        (6, "model.layers.0.self_attn.o_proj.weight", vec![h, 32]),
+        (7, "model.layers.0.input_layernorm.weight", vec![h]),
+        (8, "model.layers.0.post_attention_layernorm.weight", vec![h]),
+        (9, "model.layers.0.mlp.gate_proj.weight", vec![h, h]),
+        (10, "model.layers.0.mlp.up_proj.weight", vec![h, h]),
+        (11, "model.layers.0.mlp.down_proj.weight", vec![h, h]),
+    ];
+    for (id, name, shape) in &specs {
+        let bytes = shape.iter().fold(2u64, |acc, d| acc * *d as u64);
+        tensors.push(RawTensor {
+            id: TensorId(*id),
+            name: name.to_string(),
+            file_id: FileId(0),
+            file_offset: offset,
+            span_bytes: bytes,
+            shape: shape.clone(),
+            encoding: Encoding::Raw(DType::BF16),
+            layout: Layout::dense(1),
+        });
+        offset += bytes;
+    }
+    let meta = CheckpointMetadata {
+        files: vec![CheckpointFile {
+            id: FileId(0),
+            path: "model.safetensors".to_string(),
+            size_bytes: offset,
+            format: CheckpointFormat::Safetensors,
+        }],
+        tensors,
+    };
+    let cfg = ModelConfig {
+        model_type: "kimi_k2".to_string(),
+        num_hidden_layers: 1,
+        ..ModelConfig::default()
+    };
+    let target = StorageTarget {
+        backend: BackendKind::Cuda,
+        ..StorageTarget::default()
+    };
+    let abi = pie_weight_loader::abi::RuntimeAbi::default_for_target(&meta, &cfg, &target).unwrap();
+    let program = compile_storage_program(&meta, &cfg, &abi, target).unwrap();
+    let summary = program.summary();
+
+    // The fusion should have joined q_a_proj + kv_a_proj into one tensor
+    let has_fused = program.tensors.iter().any(|t| {
+        t.name.contains("q_kv_a_proj.fused")
+    });
+    assert!(
+        has_fused,
+        "Expected fused q_kv_a_proj tensor; summary: {summary}\ntensors: {:?}",
+        program.tensors.iter().map(|t| &t.name).collect::<Vec<_>>()
+    );
+
+    // The fused tensor should have rows = q_lora + kv_lora_rope
+    let fused = program.tensors.iter().find(|t| t.name.contains("q_kv_a_proj.fused")).unwrap();
+    assert_eq!(fused.shape[0], q_lora + kv_lora_rope);
+    assert_eq!(fused.shape[1], h);
+
+    // Summary should show the program compiled successfully
+    assert!(summary.tensor_count > 0);
+    assert!(summary.finalize_count > 0);
+}
+
 fn instr_id(instr: &StorageInstr) -> pie_weight_loader::types::InstrId {
     match instr {
         StorageInstr::Allocate { id, .. }

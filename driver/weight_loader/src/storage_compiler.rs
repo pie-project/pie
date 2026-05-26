@@ -1311,6 +1311,67 @@ fn build_slab_scatter_writes(program: &mut StorageProgram) -> Result<(), Compile
     )?;
 
     rewrite_program_instrs(program, result)?;
+
+    if std::env::var_os("PIE_WEIGHT_LOADER_DEBUG").is_some() {
+        let bulk_count = old_instrs
+            .iter()
+            .filter(|i| matches!(i, StorageInstr::BulkExtentWrite { .. }))
+            .count();
+        let slab_count = program
+            .instrs
+            .iter()
+            .filter(|i| matches!(i, StorageInstr::SlabScatter { .. }))
+            .count();
+        let remaining_bulk = program
+            .instrs
+            .iter()
+            .filter(|i| matches!(i, StorageInstr::BulkExtentWrite { .. }))
+            .count();
+        eprintln!(
+            "[pie-weight-loader] slab-scatter pass: input_bulk={bulk_count} → output_slab={slab_count} remaining_bulk={remaining_bulk} rewrites={rewrites}"
+        );
+
+        if slab_count == 0 && bulk_count > 0 {
+            let mut file_groups: std::collections::HashMap<u32, Vec<(u64, u64)>> =
+                std::collections::HashMap::new();
+            for instr in &old_instrs {
+                if let StorageInstr::BulkExtentWrite { source, .. } = instr {
+                    file_groups
+                        .entry(source.file_id.0)
+                        .or_default()
+                        .push((
+                            source.file_offset + source.stride.base_offset,
+                            source.span_bytes,
+                        ));
+                }
+            }
+            for (fid, mut entries) in file_groups {
+                entries.sort();
+                let count = entries.len();
+                let total_bytes: u64 = entries.iter().map(|(_, b)| b).sum();
+                let mut max_gap = 0u64;
+                for w in entries.windows(2) {
+                    let end_prev = w[0].0 + w[0].1;
+                    if w[1].0 > end_prev {
+                        max_gap = max_gap.max(w[1].0 - end_prev);
+                    }
+                }
+                let span = if let (Some(first), Some(last)) = (entries.first(), entries.last()) {
+                    last.0 + last.1 - first.0
+                } else {
+                    0
+                };
+                eprintln!(
+                    "[pie-weight-loader]   file={fid} entries={count} total={:.1}MiB span={:.1}MiB max_gap={:.1}MiB overread_ratio={:.2}",
+                    total_bytes as f64 / (1024.0 * 1024.0),
+                    span as f64 / (1024.0 * 1024.0),
+                    max_gap as f64 / (1024.0 * 1024.0),
+                    if total_bytes > 0 { span as f64 / total_bytes as f64 } else { 0.0 }
+                );
+            }
+        }
+    }
+
     if rewrites > 0 {
         program.optimizer.passes.push(OptimizerPassStats {
             name: "slab-scatter-arena-writes".to_string(),
