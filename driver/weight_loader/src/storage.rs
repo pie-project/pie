@@ -200,4 +200,92 @@ impl StorageProgram {
             memory: MemoryPlan::default(),
         }
     }
+
+    pub fn summary(&self) -> StorageProgramSummary {
+        let mut s = StorageProgramSummary::default();
+        s.tensor_count = self.tensors.len();
+        s.buffer_count = self.buffers.len();
+        s.schedule_len = self.schedule.len();
+        s.persistent_bytes = self.memory.persistent_bytes;
+        s.checkpoint_read_bytes = self.memory.checkpoint_read_bytes;
+        s.device_write_bytes = self.memory.device_write_bytes;
+        for instr in &self.instrs {
+            match instr {
+                StorageInstr::Allocate { .. } => s.allocate_count += 1,
+                StorageInstr::ExtentWrite { source, .. } => {
+                    s.extent_write_count += 1;
+                    s.extent_write_bytes += source.span_bytes;
+                }
+                StorageInstr::BulkExtentWrite { source, .. } => {
+                    s.bulk_extent_write_count += 1;
+                    s.bulk_extent_write_bytes += source.span_bytes;
+                }
+                StorageInstr::SlabScatter { placements, span_bytes, .. } => {
+                    s.slab_scatter_count += 1;
+                    s.slab_scatter_placement_count += placements.len();
+                    s.slab_scatter_span_bytes += span_bytes;
+                    s.slab_scatter_payload_bytes +=
+                        placements.iter().map(|p| p.bytes).sum::<u64>();
+                }
+                StorageInstr::TileMap { .. } => s.tile_map_count += 1,
+                StorageInstr::CreateView { .. } => s.create_view_count += 1,
+                StorageInstr::Attach { .. } => s.attach_count += 1,
+                StorageInstr::Release { .. } => s.release_count += 1,
+                StorageInstr::Finalize { .. } => s.finalize_count += 1,
+            }
+        }
+        s
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct StorageProgramSummary {
+    pub tensor_count: usize,
+    pub buffer_count: usize,
+    pub schedule_len: usize,
+    pub persistent_bytes: u64,
+    pub checkpoint_read_bytes: u64,
+    pub device_write_bytes: u64,
+    pub allocate_count: usize,
+    pub extent_write_count: usize,
+    pub extent_write_bytes: u64,
+    pub bulk_extent_write_count: usize,
+    pub bulk_extent_write_bytes: u64,
+    pub slab_scatter_count: usize,
+    pub slab_scatter_placement_count: usize,
+    pub slab_scatter_span_bytes: u64,
+    pub slab_scatter_payload_bytes: u64,
+    pub tile_map_count: usize,
+    pub create_view_count: usize,
+    pub attach_count: usize,
+    pub release_count: usize,
+    pub finalize_count: usize,
+}
+
+impl std::fmt::Display for StorageProgramSummary {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "tensors={} buffers={} schedule={} \
+             alloc={} extent_write={} bulk={} slab={} ({}placements, {:.1}MiB payload, {:.1}MiB span) \
+             tile_map={} view={} finalize={} \
+             persistent={:.1}MiB read={:.1}MiB write={:.1}MiB",
+            self.tensor_count,
+            self.buffer_count,
+            self.schedule_len,
+            self.allocate_count,
+            self.extent_write_count,
+            self.bulk_extent_write_count,
+            self.slab_scatter_count,
+            self.slab_scatter_placement_count,
+            self.slab_scatter_payload_bytes as f64 / (1024.0 * 1024.0),
+            self.slab_scatter_span_bytes as f64 / (1024.0 * 1024.0),
+            self.tile_map_count,
+            self.create_view_count,
+            self.finalize_count,
+            self.persistent_bytes as f64 / (1024.0 * 1024.0),
+            self.checkpoint_read_bytes as f64 / (1024.0 * 1024.0),
+            self.device_write_bytes as f64 / (1024.0 * 1024.0),
+        )
+    }
 }
