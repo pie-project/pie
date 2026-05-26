@@ -1,9 +1,12 @@
 #include "kv_cache.hpp"
 
+#include <algorithm>
 #include <cstdlib>
 #include <stdexcept>
 #include <string>
 #include <utility>
+
+#include "loader/hf_config.hpp"
 
 namespace pie_cuda_driver {
 
@@ -313,6 +316,48 @@ std::vector<KvCache::PageBuffer> KvCache::page_buffers(int layer) {
         out.push_back({v_scale_layers_[src].data(), scale_bytes});
     }
     return out;
+}
+
+std::size_t kv_cache_device_bytes_per_page(const KvCacheFormat& format,
+                                           int page_size,
+                                           int num_kv_heads,
+                                           int head_dim) {
+    std::size_t bytes =
+        format.total_bytes_per_page(page_size, num_kv_heads, head_dim);
+    if (!format.is_native_bf16()) {
+        bytes += 2 * static_cast<std::size_t>(page_size) *
+                 static_cast<std::size_t>(num_kv_heads) *
+                 static_cast<std::size_t>(head_dim) *
+                 dtype_bytes(DType::BF16);
+    }
+    return bytes;
+}
+
+std::size_t kv_page_bytes_homogeneous(const HfConfig& cfg,
+                                      int tp_size,
+                                      const KvCacheFormat& format) {
+    const int kv_heads = cfg.num_key_value_heads / std::max(1, tp_size);
+    return static_cast<std::size_t>(cfg.num_hidden_layers) *
+           kv_cache_device_bytes_per_page(
+               format, 1, kv_heads, cfg.head_dim_kernel);
+}
+
+std::size_t kv_page_bytes_per_layer(const HfConfig& cfg,
+                                    const std::vector<int>& per_layer_head_dim,
+                                    const std::vector<int>& kv_source_layer,
+                                    int tp_size,
+                                    const KvCacheFormat& format) {
+    std::size_t per_token = 0;
+    const int kv_heads = cfg.num_key_value_heads / std::max(1, tp_size);
+    for (int i = 0; i < cfg.num_hidden_layers; ++i) {
+        const bool is_source = kv_source_layer.empty() || kv_source_layer[i] == i;
+        if (!is_source) continue;
+        const int hd = per_layer_head_dim.empty()
+            ? cfg.head_dim_kernel
+            : per_layer_head_dim[i];
+        per_token += kv_cache_device_bytes_per_page(format, 1, kv_heads, hd);
+    }
+    return per_token;
 }
 
 }  // namespace pie_cuda_driver

@@ -10,7 +10,7 @@
 #include "model/nemotron_h.hpp"
 #include "model/qwen3_forward.hpp"
 #include "ops/gemm.hpp"
-#include "qwen3_5_state_cache.hpp"
+#include "recurrent_state_cache.hpp"
 
 namespace pie_cuda_driver::model {
 
@@ -57,6 +57,24 @@ std::size_t nemotron_h_workspace_bytes(
 
 int nemotron_h_attention_layers(const HfConfig& cfg);
 
+// Number of mamba layers in the hybrid stack — the cheap "count == mamba"
+// scan callers use for memory planning.
+int nemotron_h_mamba_layers(const HfConfig& cfg);
+
+// KV page bytes for a Nemotron-H stack — only the "attention" layer slice
+// of the hybrid contributes to the paged KV cache. Mamba state is held
+// separately by the recurrent state cache.
+std::size_t kv_page_bytes_nemotron_h(const HfConfig& cfg,
+                                     int tp_size,
+                                     const ::pie_cuda_driver::KvCacheFormat& format);
+
+// Per-slot bytes for the per-layer mamba state cache (conv + recurrent),
+// accounting for TP sharding when nemotron_h_tp_mamba_sharding_enabled is
+// true. Returns 0 if there are no mamba layers.
+std::size_t nemotron_h_state_slot_bytes(const HfConfig& cfg,
+                                        int mamba_layers,
+                                        int tp_size);
+
 void nemotron_h_forward_paged(
     const NemotronHWeights& w,
     const HfConfig& cfg,
@@ -65,7 +83,7 @@ void nemotron_h_forward_paged(
     Qwen3Workspace& ws,
     NemotronHWorkspace& nem_ws,
     KvCache& cache,
-    Qwen3_5StateCache& state_cache,
+    RecurrentStateCache& state_cache,
     AttentionWorkspace& attn_ws,
     ops::CublasHandle& cublas,
     const std::int32_t* token_ids,

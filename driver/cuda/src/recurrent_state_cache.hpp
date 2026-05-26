@@ -25,7 +25,7 @@
 
 namespace pie_cuda_driver {
 
-class Qwen3_5StateCache {
+class RecurrentStateCache {
 public:
     // Allocate state for `num_linear_layers` linear-attention layers,
     // each holding `max_slots` independent slabs.
@@ -37,7 +37,7 @@ public:
     // Single-slot allocation (`max_slots == 1`) is the legacy
     // bring-up layout — semantics for callers that only ever pass
     // slot=0 are unchanged.
-    static Qwen3_5StateCache allocate(
+    static RecurrentStateCache allocate(
         const std::vector<bool>& layer_is_linear,
         int conv_dim,
         int conv_kernel,
@@ -51,7 +51,7 @@ public:
     // unconditionally bf16 (ignoring PIE_QWEN35_RS_STATE_DTYPE). Used by
     // Nemotron-H's Mamba2 cache, where state is defined in activation dtype
     // and fp32 storage is too large at serving request counts.
-    static Qwen3_5StateCache allocate_bf16_recurrent(
+    static RecurrentStateCache allocate_bf16_recurrent(
         const std::vector<bool>& layer_is_linear,
         int conv_dim,
         int conv_kernel,
@@ -133,7 +133,7 @@ public:
         return spec_snapshot_count_;
     }
 
-    Qwen3_5StateCache() = default;
+    RecurrentStateCache() = default;
 
 private:
     std::vector<bool> layer_is_linear_;

@@ -11,6 +11,7 @@
 
 #include "cuda_check.hpp"
 #include "distributed.hpp"
+#include "ops/gemm.hpp"
 #include "loader/rust_loader_bridge.hpp"
 #include "loader/rust_storage_executor.hpp"
 #include "tensor.hpp"
@@ -457,6 +458,40 @@ std::size_t LoadedModel::erase_runtime_weight(const std::string& name) {
 
 std::optional<QuantMeta> LoadedModel::quant_meta(const std::string& name) const {
     return weights_.quant_meta(name);
+}
+
+ops::RuntimeQuantScratchSpec runtime_quant_scratch_spec(const LoadedModel& engine,
+                                                       std::size_t max_tokens) {
+    ops::RuntimeQuantScratchSpec spec;
+    spec.max_tokens = max_tokens;
+
+    const auto& store = engine.weight_store();
+    for (const auto& item : store.quant_meta_map()) {
+        const auto& name = item.first;
+        auto it = store.find(name);
+        if (it == store.end()) continue;
+        const auto& tensor = it->second.tensor;
+        if (tensor.shape().size() != 2) continue;
+
+        if (tensor.dtype() == DType::FP8_E4M3) {
+            spec.has_fp8 = true;
+        } else if (tensor.dtype() == DType::INT8) {
+            spec.has_int8 = true;
+        } else {
+            continue;
+        }
+
+        spec.max_weight_rows = std::max<std::size_t>(
+            spec.max_weight_rows,
+            static_cast<std::size_t>(std::max<std::int64_t>(
+                0, tensor.shape()[0])));
+        spec.max_weight_cols = std::max<std::size_t>(
+            spec.max_weight_cols,
+            static_cast<std::size_t>(std::max<std::int64_t>(
+                0, tensor.shape()[1])));
+    }
+
+    return spec;
 }
 
 }  // namespace pie_cuda_driver

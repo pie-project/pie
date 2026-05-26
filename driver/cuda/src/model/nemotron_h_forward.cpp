@@ -14,6 +14,7 @@
 #include "custom_all_reduce.hpp"
 #include "cuda_check.hpp"
 #include "distributed.hpp"
+#include "kv_cache.hpp"
 #include "kernels/causal_conv1d.hpp"
 #include "kernels/embed.hpp"
 #include "kernels/gather_rows.hpp"
@@ -490,7 +491,7 @@ void mamba_layer(
     const LlamaLikeForwardCfg& fwd_cfg,
     Qwen3Workspace& ws,
     NemotronHWorkspace& nem_ws,
-    Qwen3_5StateCache& state_cache,
+    RecurrentStateCache& state_cache,
     ops::CublasHandle& cublas,
     const std::uint32_t* qo_indptr,
     int layer_idx,
@@ -1362,7 +1363,7 @@ void nemotron_h_forward_paged(
     Qwen3Workspace& ws,
     NemotronHWorkspace& nem_ws,
     KvCache& cache,
-    Qwen3_5StateCache& state_cache,
+    RecurrentStateCache& state_cache,
     AttentionWorkspace& attn_ws,
     ops::CublasHandle& cublas,
     const std::int32_t* token_ids,
@@ -1484,6 +1485,55 @@ void nemotron_h_forward_paged(
     });
     profile.end(stream);
     maybe_print_profile(profile);
+}
+
+int nemotron_h_mamba_layers(const HfConfig& cfg) {
+    return static_cast<int>(std::count(
+        cfg.layer_types.begin(), cfg.layer_types.end(), "mamba"));
+}
+
+std::size_t kv_page_bytes_nemotron_h(const HfConfig& cfg,
+                                     int tp_size,
+                                     const ::pie_cuda_driver::KvCacheFormat& format) {
+    const int attention_layers = static_cast<int>(std::count(
+        cfg.layer_types.begin(), cfg.layer_types.end(), "attention"));
+    const int kv_heads = cfg.num_key_value_heads / std::max(1, tp_size);
+    return static_cast<std::size_t>(attention_layers) *
+           kv_cache_device_bytes_per_page(
+               format, 1, kv_heads, cfg.head_dim_kernel);
+}
+
+std::size_t nemotron_h_state_slot_bytes(const HfConfig& cfg,
+                                        int mamba_layers,
+                                        int tp_size) {
+    if (mamba_layers <= 0) return 0;
+    const int T = std::max(1, tp_size);
+    const bool shard_mamba = nemotron_h_tp_mamba_sharding_enabled(T);
+    const std::size_t m_intermediate =
+        static_cast<std::size_t>(
+            std::max(0, shard_mamba ? cfg.mamba_num_heads / T
+                                    : cfg.mamba_num_heads)) *
+        static_cast<std::size_t>(std::max(0, cfg.mamba_head_dim));
+    const std::size_t m_groups =
+        static_cast<std::size_t>(
+            std::max(0, shard_mamba ? cfg.mamba_n_groups / T
+                                    : cfg.mamba_n_groups));
+    const std::size_t conv_dim =
+        m_intermediate +
+        2ull * m_groups *
+            static_cast<std::size_t>(std::max(0, cfg.mamba_state_size));
+    const std::size_t per_slot_conv =
+        static_cast<std::size_t>(std::max(0, cfg.mamba_conv_kernel)) *
+        conv_dim * sizeof(std::uint16_t);
+    const std::size_t per_slot_recurrent =
+        static_cast<std::size_t>(
+            std::max(0, shard_mamba ? cfg.mamba_num_heads / T
+                                    : cfg.mamba_num_heads)) *
+        static_cast<std::size_t>(std::max(0, cfg.mamba_head_dim)) *
+        static_cast<std::size_t>(std::max(0, cfg.mamba_state_size)) *
+        sizeof(std::uint16_t);
+    return static_cast<std::size_t>(mamba_layers) *
+           (per_slot_conv + per_slot_recurrent);
 }
 
 }  // namespace pie_cuda_driver::model

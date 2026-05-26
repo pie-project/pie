@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <filesystem>
+#include <optional>
 #include <span>
 #include <string>
 #include <vector>
@@ -128,6 +129,38 @@ Gemma4MtpWeights load_gemma4_mtp_weights(
     const Gemma4Weights& target_weights,
     const Gemma4MtpRuntimeConfig& runtime,
     bool verbose = false);
+
+// Output of `discover_and_load_gemma4_mtp`. Caller takes ownership of the
+// weights (nullopt when no assistant snapshot was found or the arch
+// doesn't ship MTP); `runtime` is always default-constructed.
+struct Gemma4MtpDiscovery {
+    std::optional<Gemma4MtpWeights> weights;
+    Gemma4MtpRuntimeConfig runtime;
+    std::string snapshot_dir;
+    std::string source;  // "config" | "env" | "auto" | ""
+};
+
+}  // namespace pie_cuda_driver::model
+
+namespace pie_cuda_driver {
+struct Config;
+class LoadedModel;
+namespace model { struct Gemma4Weights; }
+}
+
+namespace pie_cuda_driver::model {
+
+// Resolve the Gemma4 MTP assistant snapshot from (config, env, auto-
+// discover) and load its weights if the arch + MTP drafts count are
+// compatible. Bundles the run_impl-shaped logic that used to live in
+// entry.cpp directly.
+Gemma4MtpDiscovery discover_and_load_gemma4_mtp(
+    const Config& cfg,
+    const LoadedModel& engine,
+    const Gemma4Weights& target_weights,
+    bool is_gemma4_arch,
+    int native_mtp_num_drafts,
+    bool verbose);
 
 void gemma4_mtp_draft(
     const Gemma4MtpWeights& w,

@@ -15,7 +15,7 @@
 #include "model/qwen3_forward.hpp"  // for Qwen3Workspace (reused)
 #include "ops/attention_flashinfer.hpp"  // DecodePlanCachePtr
 #include "ops/gemm.hpp"
-#include "qwen3_5_state_cache.hpp"
+#include "recurrent_state_cache.hpp"
 
 namespace pie_cuda_driver::model {
 
@@ -149,7 +149,7 @@ void qwen3_5_forward_paged(
     Qwen3Workspace& ws,
     Qwen3_5LinearAttnWorkspace& la_ws,
     KvCache& cache,
-    Qwen3_5StateCache& state_cache,
+    RecurrentStateCache& state_cache,
     AttentionWorkspace& attn_ws,
     ops::CublasHandle& cublas,
     const std::int32_t* token_ids,
@@ -177,7 +177,7 @@ void qwen3_5_mtp_process_cache(
     Qwen3Workspace& ws,
     Qwen3_5LinearAttnWorkspace& la_ws,
     KvCache& cache,
-    Qwen3_5StateCache& state_cache,
+    RecurrentStateCache& state_cache,
     ops::CublasHandle& cublas,
     const std::int32_t* token_ids,
     const std::int32_t* positions,
@@ -214,5 +214,11 @@ void qwen3_5_mtp_forward(
     int num_tokens,
     int draft_step,
     int max_global_tokens);
+
+// Workspace byte budget for the linear-attention path. Returns 0 if the
+// model has no linear-attn layers (e.g. HF config absent).
+std::size_t qwen3_5_la_workspace_bytes(const HfConfig& cfg,
+                                       int N,
+                                       int tp_size = 1);
 
 }  // namespace pie_cuda_driver::model

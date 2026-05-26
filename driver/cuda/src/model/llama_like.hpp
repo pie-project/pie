@@ -163,4 +163,14 @@ void llama_like_forward_paged(
     const std::uint8_t* custom_mask_d = nullptr,
     const std::int32_t* custom_mask_indptr_d = nullptr);
 
+// Map HF's rope_scaling_kind enum onto the driver's RopeKind. Llama3-style
+// frequency scaling maps to YaRN; the "original_yarn" branch keeps
+// HuggingFace's original formulation.
+RopeKind rope_kind_from_hf_config(const HfConfig& hf);
+
+// Populate the RoPE-related fields on LlamaLikeForwardCfg from the
+// HF config in one place — every arch that builds an LlamaLikeForwardCfg
+// in entry.cpp pulls in the same eight fields.
+void apply_rope_config(LlamaLikeForwardCfg& fwd_cfg, const HfConfig& hf);
+
 }  // namespace pie_cuda_driver::model

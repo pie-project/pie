@@ -13,7 +13,7 @@
 #include "model/qwen3_5_forward.hpp"  // reuse Qwen3_5LinearAttnWorkspace
 #include "model/qwen3_5_moe.hpp"
 #include "ops/gemm.hpp"
-#include "qwen3_5_state_cache.hpp"
+#include "recurrent_state_cache.hpp"
 
 namespace pie_cuda_driver::model {
 
@@ -83,7 +83,7 @@ void qwen3_5_moe_forward_paged(
     Qwen3_5LinearAttnWorkspace& la_ws,
     Qwen3_5MoeMlpWorkspace& moe_ws,
     KvCache& cache,
-    Qwen3_5StateCache& state_cache,
+    RecurrentStateCache& state_cache,
     AttentionWorkspace& attn_ws,
     ops::CublasHandle& cublas,
     const std::int32_t* token_ids,
@@ -111,7 +111,7 @@ void qwen3_5_moe_mtp_process_cache(
     Qwen3Workspace& ws,
     Qwen3_5LinearAttnWorkspace& la_ws,
     KvCache& cache,
-    Qwen3_5StateCache& state_cache,
+    RecurrentStateCache& state_cache,
     ops::CublasHandle& cublas,
     const std::int32_t* token_ids,
     const std::int32_t* positions,
@@ -146,5 +146,11 @@ void qwen3_5_moe_mtp_forward(
     int num_tokens,
     int draft_step,
     int max_global_tokens);
+
+// MoE-side workspace byte budget. Includes the optional aligned-decode
+// rebatch arena (sized by PIE_QWEN35_MOE_ALIGNED_DECODE_BLOCK).
+std::size_t qwen3_5_moe_workspace_bytes(const HfConfig& cfg,
+                                        int N,
+                                        int tp_size = 1);
 
 }  // namespace pie_cuda_driver::model

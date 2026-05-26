@@ -1,5 +1,10 @@
 #include "model/gemma4_mtp.hpp"
 
+#include "config.hpp"
+#include "hf_snapshot.hpp"
+#include "model/gemma4.hpp"
+#include "model/loaded_model.hpp"
+
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -1575,6 +1580,64 @@ void gemma4_mtp_forward_step(
             w.post_projection->data(), mtp_ws.hidden.data(),
             S, Hb, H, 0.f);
     }
+}
+
+Gemma4MtpDiscovery discover_and_load_gemma4_mtp(
+    const Config& cfg,
+    const LoadedModel& engine,
+    const Gemma4Weights& target_weights,
+    bool is_gemma4_arch,
+    int native_mtp_num_drafts,
+    bool verbose)
+{
+    Gemma4MtpDiscovery out;
+    out.snapshot_dir = cfg.model.mtp_assistant_snapshot_dir;
+    if (!out.snapshot_dir.empty()) {
+        out.source = "config";
+    } else if (const char* env = std::getenv("PIE_GEMMA4_MTP_SNAPSHOT_DIR")) {
+        out.snapshot_dir = env;
+        out.source = "env";
+    }
+    if (is_gemma4_arch && native_mtp_num_drafts > 0 && out.snapshot_dir.empty()) {
+        if (auto discovered = discover_gemma4_mtp_snapshot_dir(
+                std::filesystem::path(cfg.model.snapshot_dir))) {
+            out.snapshot_dir = discovered->string();
+            out.source = "auto";
+            if (verbose && cfg.distributed.tp_rank == 0) {
+                std::cerr << "[pie-driver-cuda] Gemma4 MTP assistant "
+                          << "auto-discovered: " << out.snapshot_dir
+                          << "\n";
+            }
+        }
+    }
+    if (is_gemma4_arch && native_mtp_num_drafts > 0 && !out.snapshot_dir.empty()) {
+        if (cfg.distributed.tp_size > 1) {
+            if (verbose && cfg.distributed.tp_rank == 0) {
+                std::cerr << "[pie-driver-cuda] Gemma4 MTP disabled under "
+                          << "tensor parallelism for this build\n";
+            }
+        } else {
+            out.weights.emplace(
+                load_gemma4_mtp_weights(
+                    std::filesystem::path(out.snapshot_dir),
+                    cfg.model.device,
+                    engine.hf_config(),
+                    target_weights,
+                    out.runtime,
+                    verbose));
+            if (verbose && cfg.distributed.tp_rank == 0 && !out.source.empty()) {
+                std::cerr << "[pie-driver-cuda] Gemma4 MTP assistant source="
+                          << out.source << "\n";
+            }
+        }
+    } else if (is_gemma4_arch && native_mtp_num_drafts > 0 &&
+               verbose && cfg.distributed.tp_rank == 0) {
+        std::cerr << "[pie-driver-cuda] Gemma4 MTP system drafter not "
+                  << "enabled: assistant checkpoint not found; set "
+                  << "mtp_assistant_snapshot_dir or "
+                  << "PIE_GEMMA4_MTP_SNAPSHOT_DIR\n";
+    }
+    return out;
 }
 
 }  // namespace pie_cuda_driver::model

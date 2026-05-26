@@ -279,4 +279,8 @@ void gemma4_forward_paged(
     const std::int32_t* logit_row_indices_d = nullptr,
     int num_logit_rows = 0);
 
+// Gemma4 MoE workspace byte budget. Returns 0 if the config has no MoE
+// block configured.
+std::size_t gemma4_moe_workspace_bytes(const HfConfig& cfg, int N);
+
 }  // namespace pie_cuda_driver::model

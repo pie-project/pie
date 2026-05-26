@@ -182,11 +182,24 @@ add_library(pie_driver_cuda_lib STATIC
   src/kernels/causal_conv1d.cu
   src/kernels/gated_delta_net.cu
   src/kernels/nemotron_h.cu
-  src/qwen3_5_state_cache.cpp
+  src/recurrent_state_cache.cpp
+  src/cuda_memory_planner.cpp
+  src/driver_startup.cpp
+  src/parity_harness.cpp
+  src/hf_snapshot.cpp
+  src/model/qwen3_5_config.cpp
   src/model/qwen3_5_forward.cpp
   src/model/qwen3_5_moe.cpp
   src/model/qwen3_5_moe_forward.cpp
   src/model/nemotron_h_forward.cpp
+  src/model/nemotron_h_model.cpp
+  src/model/gemma4_model.cpp
+  src/model/gemma2_model.cpp
+  src/model/gemma3n_model.cpp
+  src/model/mixtral_model.cpp
+  src/model/qwen3_5_model.cpp
+  src/model/qwen3_5_moe_model.cpp
+  src/model/llama_like_model.cpp
   src/attention_workspace.cpp
   src/brle.cpp
   src/swap_pool.cpp

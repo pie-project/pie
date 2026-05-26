@@ -1,10 +1,9 @@
 #pragma once
 
-// Forward executor for the `fire_batch` inproc method. Lifted from
-// entry.cpp so the entry point stays focused on startup and service
-// wiring. Body is unchanged from its lambda incarnation; follow-up
-// refactors (spec expansion, sampling dispatch, sub-passes) split this
-// further.
+// Forward executor for the `fire_batch` inproc method. Owns the per-
+// device persistent state (workspaces, KV cache, attention scratch,
+// graph cache) and dispatches each fire through ForwardFn onto the
+// active IModel implementation.
 
 #include <cstddef>
 #include <cstdint>
@@ -27,11 +26,12 @@ namespace pie_cuda_driver {
 class LoadedModel;
 class KvCache;
 class AttentionWorkspace;
-class Qwen3_5StateCache;
+class RecurrentStateCache;
 
 namespace model {
 struct Qwen3Weights;
 struct Qwen3Workspace;
+class IModel;
 }  // namespace model
 
 namespace ops {
@@ -75,73 +75,46 @@ struct ForwardFn {
     bool supports_compact_logits = false;
     bool supports_small_prefill_graph = false;
 
-    using BodyFn = std::function<void(
-        model::Qwen3Workspace&,
-        KvCache&,
-        AttentionWorkspace&,
-        ops::CublasHandle&,
-        const std::int32_t*  /* token_ids        device */,
-        const std::int32_t*  /* positions        device */,
-        const std::uint32_t* /* qo_indptr        device */,
-        const std::uint32_t* /* kv_page_indices  device */,
-        const std::uint32_t* /* kv_page_indptr   device */,
-        const std::uint32_t* /* kv_last_page_lens device */,
-        const std::uint32_t* /* qo_indptr_h        host */,
-        const std::uint32_t* /* kv_page_indices_h  host */,
-        const std::uint32_t* /* kv_page_indptr_h   host */,
-        const std::uint32_t* /* kv_last_page_lens_h host */,
-        int                  /* total_tokens N */,
-        int                  /* num_requests R */,
-        bool                 /* is_pure_decode */,
-        const std::uint8_t*  /* custom_mask_d  (nullable) */,
-        const std::int32_t*  /* custom_mask_indptr_d (nullable) */,
-        const std::int32_t*  /* slot_ids_h     host, len R, nullable */,
-        const std::uint8_t*  /* is_fresh_h     host, len R, nullable */,
-        const std::int32_t*  /* slot_ids_d     device, len R, nullable */,
-        const std::int32_t*  /* logit_row_indices_d device, nullable */,
-        int                  /* num_logit_rows */,
-        bool                 /* tp_greedy_argmax */
-    )>;
+    // All metadata needed to execute one forward body call. Bundled as a
+    // struct so adding a new field is a one-site addition rather than a
+    // signature change touching every arch's body.
+    struct ForwardInputs {
+        // Per-token device buffers
+        const std::int32_t*  token_ids            = nullptr;
+        const std::int32_t*  positions            = nullptr;
 
-    using MtpFn = std::function<void(
-        model::Qwen3Workspace&,
-        KvCache&,
-        ops::CublasHandle&,
-        const std::int32_t*  /* token_ids device */,
-        const std::int32_t*  /* position_ids device */,
-        const std::int32_t*  /* base_hidden_row_indices device */,
-        const std::int32_t*  /* request_ids device */,
-        const std::uint32_t* /* kv_page_indices device */,
-        const std::uint32_t* /* kv_page_indptr device */,
-        const std::uint32_t* /* kv_last_page_lens device */,
-        int                  /* num_tokens */,
-        int                  /* draft_step */,
-        int                  /* max_global_tokens */
-    )>;
+        // CSR-style indptrs (device + host where required)
+        const std::uint32_t* qo_indptr_d          = nullptr;
+        const std::uint32_t* kv_page_indices_d    = nullptr;
+        const std::uint32_t* kv_page_indptr_d     = nullptr;
+        const std::uint32_t* kv_last_page_lens_d  = nullptr;
+        const std::uint32_t* qo_indptr_h          = nullptr;
+        const std::uint32_t* kv_page_indices_h    = nullptr;
+        const std::uint32_t* kv_page_indptr_h     = nullptr;
+        const std::uint32_t* kv_last_page_lens_h  = nullptr;
 
-    using MtpProcessFn = std::function<void(
-        model::Qwen3Workspace&,
-        KvCache&,
-        ops::CublasHandle&,
-        const std::int32_t*  /* token_ids device */,
-        const std::int32_t*  /* positions device */,
-        const std::uint32_t* /* qo_indptr device */,
-        const std::uint32_t* /* kv_page_indices device */,
-        const std::uint32_t* /* kv_page_indptr device */,
-        const std::uint32_t* /* kv_last_page_lens device */,
-        const std::int32_t*  /* slot_ids device, nullable */,
-        const std::int32_t*  /* source_row_indices device, nullable */,
-        int                  /* total_tokens */,
-        int                  /* num_requests */
-    )>;
+        // Shape
+        int total_tokens   = 0;     // N
+        int num_requests   = 0;     // R
+        bool is_pure_decode = false;
 
-    using MtpPrepareFn = std::function<void(
-        const std::uint32_t* /* kv_page_indptr_h */,
-        const std::uint32_t* /* kv_last_page_lens_h */,
-        int                  /* num_rows */,
-        int                  /* page_size */,
-        cudaStream_t         /* stream */
-    )>;
+        // Optional: custom attention mask (BRLE-packed)
+        const std::uint8_t*  custom_mask_d        = nullptr;
+        const std::int32_t*  custom_mask_indptr_d = nullptr;
+
+        // Optional: per-request rs-cache slot info
+        const std::int32_t*  slot_ids_h           = nullptr;
+        const std::uint8_t*  is_fresh_h           = nullptr;
+        const std::int32_t*  slot_ids_d           = nullptr;
+
+        // Optional: logit row gather indices (for compact-logit modes)
+        const std::int32_t*  logit_row_indices_d  = nullptr;
+        int                  num_logit_rows       = 0;
+
+        // Sampling hint: if the executor only needs argmax, body may skip
+        // dense logits and write straight into the fused-argmax output.
+        bool tp_greedy_argmax = false;
+    };
 
     struct PrepareInputs {
         const std::uint32_t* qo_indptr_h = nullptr;
@@ -156,44 +129,29 @@ struct ForwardFn {
         bool is_pure_decode = false;
     };
 
-    using PrepareFn = std::function<void(
-        AttentionWorkspace&,
-        const PrepareInputs&
-    )>;
-
-    using GraphLayoutFn = std::function<std::uint32_t()>;
-    using LogitsModeFn = std::function<void(bool)>;
-    using SetFusedArgmaxOutputFn = std::function<void(std::int32_t*)>;
-    using FusedArgmaxDoneFn = std::function<bool()>;
-
-    // Empty by default → executor falls back to "direct call only;
-    // no graph capture" mode for this arch.
-    PrepareFn prepare;
-    GraphLayoutFn graph_layout;
-    LogitsModeFn set_logits_argmax_only;
-    SetFusedArgmaxOutputFn set_fused_argmax_output;
-    FusedArgmaxDoneFn fused_argmax_done;
+    // The arch implementation. entry.cpp sets this once at construction;
+    // the executor dispatches every per-fire call through these methods.
+    model::IModel* model = nullptr;
     bool supports_fused_lmhead_argmax = false;
-    BodyFn    body;
-    MtpFn     mtp;
-    MtpPrepareFn mtp_prepare;
-    MtpProcessFn mtp_process;
-    int mtp_num_drafts = 1;
 
-    // Convenience: `forward_fn = [...]` assigns the lambda as the body.
-    // entry.cpp uses this terser pattern; the older `forward_fn.body =
-    // [...]` form continues to work because we leave `body` public.
-    template <class F>
-        requires(!std::is_same_v<std::decay_t<F>, ForwardFn>)
-    ForwardFn& operator=(F&& f) {
-        body = std::forward<F>(f);
-        return *this;
-    }
-    ForwardFn() = default;
-    ForwardFn(const ForwardFn&) = default;
-    ForwardFn(ForwardFn&&) noexcept = default;
-    ForwardFn& operator=(const ForwardFn&) = default;
-    ForwardFn& operator=(ForwardFn&&) noexcept = default;
+    // Wire `m` as the active arch and copy its capability bits onto the
+    // ForwardFn caps that the executor consults each fire. Subsumes the
+    // ~5-line "graph_safe/supports_*/model" boilerplate every arch was
+    // repeating in entry.cpp.
+    void attach_model(model::IModel* m);
+
+    // Dispatch helpers — null-safe so an executor with no model attached
+    // is harmless rather than a segfault.
+    void invoke_prepare(AttentionWorkspace& aws, const PrepareInputs& in);
+    void invoke_body(model::Qwen3Workspace& ws,
+                     KvCache& kv,
+                     AttentionWorkspace& aws,
+                     ops::CublasHandle& cublas,
+                     const ForwardInputs& in);
+    std::uint32_t invoke_graph_layout();
+    void invoke_set_logits_argmax_only(bool enabled);
+    void invoke_set_fused_argmax_output(std::int32_t* ptr);
+    bool invoke_fused_argmax_done();
 };
 
 struct SystemSpecDraftRequest {
@@ -333,7 +291,7 @@ struct Executor {
 
     // Runtime-managed rs_cache storage. Null on models without
     // recurrent-state slots.
-    Qwen3_5StateCache* rs_cache = nullptr;
+    RecurrentStateCache* rs_cache = nullptr;
     // Private rs_cache slot reserved for speculative rollback. This slot is
     // not advertised to the runtime.
     int rs_cache_scratch_slot = -1;

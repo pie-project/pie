@@ -2105,4 +2105,34 @@ void gemma4_forward_paged(
     dbg_first_fire_flag() = false;
 }
 
+std::size_t gemma4_moe_workspace_bytes(const HfConfig& cfg, int N) {
+    if (!cfg.gemma4_enable_moe || cfg.num_experts <= 0 ||
+        cfg.num_experts_per_tok <= 0 || cfg.moe_intermediate_size <= 0) {
+        return 0;
+    }
+    const std::size_t n = static_cast<std::size_t>(N);
+    const std::size_t maxR = n * cfg.num_experts_per_tok;
+    const std::size_t H = static_cast<std::size_t>(cfg.hidden_size);
+    const std::size_t I = static_cast<std::size_t>(cfg.moe_intermediate_size);
+    auto u16 = [](std::size_t elems) { return elems * 2; };
+    auto i32 = [](std::size_t elems) { return elems * 4; };
+    auto fp32 = [](std::size_t elems) { return elems * 4; };
+    std::size_t bytes = 0;
+    bytes += u16(n * H);
+    bytes += u16(n * cfg.num_experts);
+    bytes += i32(n * cfg.num_experts_per_tok);
+    bytes += fp32(n * cfg.num_experts_per_tok);
+    bytes += u16(n * H);
+    bytes += u16(maxR * H);
+    bytes += u16(maxR * 2 * I);
+    bytes += u16(maxR * I);
+    bytes += u16(maxR * H);
+    bytes += i32(maxR);
+    bytes += fp32(maxR);
+    bytes += u16(n * H);
+    bytes += static_cast<std::size_t>(cfg.num_experts_per_tok) *
+             (6 * sizeof(void*) + sizeof(float));
+    return bytes;
+}
+
 }  // namespace pie_cuda_driver::model

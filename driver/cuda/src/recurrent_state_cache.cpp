@@ -1,4 +1,4 @@
-#include "qwen3_5_state_cache.hpp"
+#include "recurrent_state_cache.hpp"
 
 #include <algorithm>
 #include <cstdlib>
@@ -30,7 +30,7 @@ bool qwen35_rs_state_bf16_enabled()
 
 }  // namespace
 
-Qwen3_5StateCache Qwen3_5StateCache::allocate(
+RecurrentStateCache RecurrentStateCache::allocate(
     const std::vector<bool>& layer_is_linear,
     int conv_dim,
     int conv_kernel,
@@ -41,7 +41,7 @@ Qwen3_5StateCache Qwen3_5StateCache::allocate(
     int max_slots)
 {
     if (max_slots < 1) max_slots = 1;
-    Qwen3_5StateCache c;
+    RecurrentStateCache c;
     c.layer_is_linear_ = layer_is_linear;
     c.max_slots_   = max_slots;
     c.conv_dim_    = conv_dim;
@@ -83,7 +83,7 @@ Qwen3_5StateCache Qwen3_5StateCache::allocate(
     return c;
 }
 
-Qwen3_5StateCache Qwen3_5StateCache::allocate_bf16_recurrent(
+RecurrentStateCache RecurrentStateCache::allocate_bf16_recurrent(
     const std::vector<bool>& layer_is_linear,
     int conv_dim,
     int conv_kernel,
@@ -92,7 +92,7 @@ Qwen3_5StateCache Qwen3_5StateCache::allocate_bf16_recurrent(
     int head_v_dim,
     int max_slots)
 {
-    Qwen3_5StateCache c = Qwen3_5StateCache::allocate(
+    RecurrentStateCache c = RecurrentStateCache::allocate(
         layer_is_linear, conv_dim, conv_kernel,
         v_heads, head_k_dim, head_v_dim,
         /*hidden_size=*/0, max_slots);
@@ -113,7 +113,7 @@ Qwen3_5StateCache Qwen3_5StateCache::allocate_bf16_recurrent(
     return c;
 }
 
-void Qwen3_5StateCache::reset(cudaStream_t stream)
+void RecurrentStateCache::reset(cudaStream_t stream)
 {
     if (num_linear_layers_ > 0) {
         const std::size_t conv_bytes =
@@ -137,10 +137,10 @@ void Qwen3_5StateCache::reset(cudaStream_t stream)
     }
 }
 
-void Qwen3_5StateCache::reset_slot(int slot, cudaStream_t stream)
+void RecurrentStateCache::reset_slot(int slot, cudaStream_t stream)
 {
     if (slot < 0 || slot >= max_slots_) {
-        throw std::out_of_range("Qwen3_5StateCache::reset_slot: slot out of range");
+        throw std::out_of_range("RecurrentStateCache::reset_slot: slot out of range");
     }
     const std::size_t conv_bytes  = conv_slot_stride_bytes();
     const std::size_t rec_bytes   = recurrent_slot_stride_bytes();
@@ -172,10 +172,10 @@ void Qwen3_5StateCache::reset_slot(int slot, cudaStream_t stream)
     }
 }
 
-void Qwen3_5StateCache::copy_slot_d2d(int src_slot, int dst_slot, cudaStream_t stream)
+void RecurrentStateCache::copy_slot_d2d(int src_slot, int dst_slot, cudaStream_t stream)
 {
     if (src_slot < 0 || src_slot >= max_slots_ || dst_slot < 0 || dst_slot >= max_slots_) {
-        throw std::out_of_range("Qwen3_5StateCache::copy_slot_d2d: slot out of range");
+        throw std::out_of_range("RecurrentStateCache::copy_slot_d2d: slot out of range");
     }
     if (src_slot == dst_slot) {
         return;
@@ -220,13 +220,13 @@ void Qwen3_5StateCache::copy_slot_d2d(int src_slot, int dst_slot, cudaStream_t s
     }
 }
 
-void Qwen3_5StateCache::copy_linear_state_slot_d2d(
+void RecurrentStateCache::copy_linear_state_slot_d2d(
     int src_slot, int dst_slot, cudaStream_t stream)
 {
     if (src_slot < 0 || src_slot >= max_slots_ ||
         dst_slot < 0 || dst_slot >= max_slots_) {
         throw std::out_of_range(
-            "Qwen3_5StateCache::copy_linear_state_slot_d2d: slot out of range");
+            "RecurrentStateCache::copy_linear_state_slot_d2d: slot out of range");
     }
     if (src_slot == dst_slot) {
         return;
@@ -261,13 +261,13 @@ void Qwen3_5StateCache::copy_linear_state_slot_d2d(
     }
 }
 
-void* Qwen3_5StateCache::conv_state(int layer, int slot)
+void* RecurrentStateCache::conv_state(int layer, int slot)
 {
     if (slot < 0 || slot >= max_slots_) {
-        throw std::out_of_range("Qwen3_5StateCache::conv_state: slot out of range");
+        throw std::out_of_range("RecurrentStateCache::conv_state: slot out of range");
     }
     if (layer < 0 || layer >= static_cast<int>(linear_layer_index_.size())) {
-        throw std::out_of_range("Qwen3_5StateCache::conv_state: layer out of range");
+        throw std::out_of_range("RecurrentStateCache::conv_state: layer out of range");
     }
     const int linear_idx = linear_layer_index_[layer];
     if (linear_idx < 0) return nullptr;  // full-attention layer
@@ -278,14 +278,14 @@ void* Qwen3_5StateCache::conv_state(int layer, int slot)
            static_cast<std::size_t>(slot) * conv_slot_stride_bytes();
 }
 
-void* Qwen3_5StateCache::recurrent_state_raw(int layer, int slot)
+void* RecurrentStateCache::recurrent_state_raw(int layer, int slot)
 {
     if (slot < 0 || slot >= max_slots_) {
-        throw std::out_of_range("Qwen3_5StateCache::recurrent_state: slot out of range");
+        throw std::out_of_range("RecurrentStateCache::recurrent_state: slot out of range");
     }
     if (layer < 0 || layer >= static_cast<int>(linear_layer_index_.size())) {
         throw std::out_of_range(
-            "Qwen3_5StateCache::recurrent_state: layer out of range");
+            "RecurrentStateCache::recurrent_state: layer out of range");
     }
     const int linear_idx = linear_layer_index_[layer];
     if (linear_idx < 0) return nullptr;  // full-attention layer
@@ -298,19 +298,19 @@ void* Qwen3_5StateCache::recurrent_state_raw(int layer, int slot)
            static_cast<std::size_t>(slot) * recurrent_slot_stride_bytes();
 }
 
-float* Qwen3_5StateCache::recurrent_state(int layer, int slot)
+float* RecurrentStateCache::recurrent_state(int layer, int slot)
 {
     if (recurrent_state_bf16_) {
         throw std::runtime_error(
-            "Qwen3_5StateCache::recurrent_state: recurrent state is bf16");
+            "RecurrentStateCache::recurrent_state: recurrent state is bf16");
     }
     return static_cast<float*>(recurrent_state_raw(layer, slot));
 }
 
-void* Qwen3_5StateCache::mtp_pending_hidden(int slot)
+void* RecurrentStateCache::mtp_pending_hidden(int slot)
 {
     if (slot < 0 || slot >= max_slots_) {
-        throw std::out_of_range("Qwen3_5StateCache::mtp_pending_hidden: slot out of range");
+        throw std::out_of_range("RecurrentStateCache::mtp_pending_hidden: slot out of range");
     }
     if (mtp_pending_hidden_.data() == nullptr || hidden_size_ <= 0) {
         return nullptr;

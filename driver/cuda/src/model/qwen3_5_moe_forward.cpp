@@ -568,7 +568,7 @@ void linear_attn_body(
     const Qwen3_5ForwardCfg& fwd_cfg,
     Qwen3Workspace& ws,
     Qwen3_5LinearAttnWorkspace& la,
-    Qwen3_5StateCache& state_cache,
+    RecurrentStateCache& state_cache,
     int layer_idx, int N, int R, bool is_pure_decode,
     const std::int32_t*  slot_ids_h,
     const std::int32_t*  slot_ids_d,
@@ -1613,7 +1613,7 @@ void qwen3_5_moe_forward_paged(
     Qwen3_5LinearAttnWorkspace& la_ws,
     Qwen3_5MoeMlpWorkspace& moe_ws,
     KvCache& cache,
-    Qwen3_5StateCache& state_cache,
+    RecurrentStateCache& state_cache,
     AttentionWorkspace& attn_ws,
     ops::CublasHandle& cublas,
     const std::int32_t* token_ids,
@@ -1947,7 +1947,7 @@ void qwen3_5_moe_mtp_process_cache(
     Qwen3Workspace& ws,
     Qwen3_5LinearAttnWorkspace& la_ws,
     KvCache& cache,
-    Qwen3_5StateCache& state_cache,
+    RecurrentStateCache& state_cache,
     ops::CublasHandle& cublas,
     const std::int32_t* token_ids,
     const std::int32_t* positions,
@@ -2128,6 +2128,71 @@ void qwen3_5_moe_mtp_forward(
     });
     profile.end(stream);
     maybe_print_mtp_profile(profile);
+}
+
+std::size_t qwen3_5_moe_workspace_bytes(const HfConfig& cfg,
+                                        int N, int tp_size) {
+    if (cfg.num_experts <= 0 || cfg.num_experts_per_tok <= 0 ||
+        cfg.moe_intermediate_size <= 0) {
+        return 0;
+    }
+    const int T = std::max(1, tp_size);
+    const std::size_t n = static_cast<std::size_t>(N);
+    const std::size_t maxR = n * cfg.num_experts_per_tok;
+    const std::size_t H = static_cast<std::size_t>(cfg.hidden_size);
+    const std::size_t I =
+        static_cast<std::size_t>(cfg.moe_intermediate_size / T);
+    const std::size_t Ish =
+        static_cast<std::size_t>(
+            std::max(0, cfg.shared_expert_intermediate_size / T));
+    auto u16 = [](std::size_t elems) { return elems * 2; };
+    auto i32 = [](std::size_t elems) { return elems * 4; };
+    auto fp32 = [](std::size_t elems) { return elems * 4; };
+    auto aligned_decode_block = [] {
+        const char* v = std::getenv("PIE_QWEN35_MOE_ALIGNED_DECODE_BLOCK");
+        if (v == nullptr || v[0] == '\0') return 16;
+        char* end = nullptr;
+        long parsed_long = std::strtol(v, &end, 10);
+        if (end == v) return 16;
+        int parsed = static_cast<int>(parsed_long);
+        if (parsed <= 1) return 0;
+        if (parsed < 4) parsed = 4;
+        if (parsed > 64) parsed = 64;
+        return parsed;
+    };
+    std::size_t bytes = 0;
+    bytes += u16(n * cfg.num_experts);
+    bytes += i32(n * cfg.num_experts_per_tok);
+    bytes += fp32(n * cfg.num_experts_per_tok);
+    bytes += u16(maxR * H);
+    bytes += u16(maxR * 2 * I);
+    bytes += u16(maxR * I);
+    bytes += u16(maxR * H);
+    bytes += i32(maxR);
+    bytes += fp32(maxR);
+    bytes += u16(n * Ish);
+    bytes += u16(n * Ish);
+    bytes += u16(n * Ish);
+    bytes += u16(n * H);
+    bytes += u16(n);
+    bytes += u16(n * H);
+    bytes += maxR * (6 * sizeof(void*) + sizeof(float));
+    const int aligned_block = aligned_decode_block();
+    if (aligned_block > 1 && maxR > 0) {
+        const std::size_t block = static_cast<std::size_t>(aligned_block);
+        const std::size_t active_expert_cap =
+            std::min<std::size_t>(static_cast<std::size_t>(cfg.num_experts), maxR);
+        const std::size_t max_blocks =
+            (maxR + active_expert_cap * (block - 1) + block - 1) / block;
+        const std::size_t aligned_rows = max_blocks * block;
+        bytes += i32(aligned_rows);
+        bytes += i32(max_blocks);
+        bytes += u16(aligned_rows * H);
+        bytes += u16(aligned_rows * 2 * I);
+        bytes += u16(aligned_rows * I);
+        bytes += u16(aligned_rows * H);
+    }
+    return bytes;
 }
 
 }  // namespace pie_cuda_driver::model

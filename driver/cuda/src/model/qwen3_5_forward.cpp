@@ -451,7 +451,7 @@ void linear_attn_layer_body(
     const Qwen3_5ForwardCfg& fwd_cfg,
     Qwen3Workspace& ws,
     Qwen3_5LinearAttnWorkspace& la,
-    Qwen3_5StateCache& state_cache,
+    RecurrentStateCache& state_cache,
     int layer_idx,
     int N, int R,
     bool is_pure_decode,
@@ -1141,7 +1141,7 @@ void qwen3_5_forward_paged(
     Qwen3Workspace& ws,
     Qwen3_5LinearAttnWorkspace& la_ws,
     KvCache& cache,
-    Qwen3_5StateCache& state_cache,
+    RecurrentStateCache& state_cache,
     AttentionWorkspace& attn_ws,
     ops::CublasHandle& cublas,
     const std::int32_t* token_ids,
@@ -1407,7 +1407,7 @@ void qwen3_5_mtp_process_cache(
     Qwen3Workspace& ws,
     Qwen3_5LinearAttnWorkspace& la_ws,
     KvCache& cache,
-    Qwen3_5StateCache& state_cache,
+    RecurrentStateCache& state_cache,
     ops::CublasHandle& cublas,
     const std::int32_t* token_ids,
     const std::int32_t* positions,
@@ -1607,6 +1607,53 @@ void qwen3_5_mtp_forward(
     });
     profile.end(stream);
     maybe_print_mtp_profile(profile);
+}
+
+std::size_t qwen3_5_la_workspace_bytes(const HfConfig& cfg,
+                                       int N, int tp_size) {
+    if (cfg.linear_num_key_heads <= 0 || cfg.linear_num_value_heads <= 0) {
+        return 0;
+    }
+    const int T = std::max(1, tp_size);
+    const std::size_t n = static_cast<std::size_t>(N);
+    const std::size_t k_dim =
+        static_cast<std::size_t>(cfg.linear_num_key_heads / T) *
+        cfg.linear_key_head_dim;
+    const std::size_t v_dim =
+        static_cast<std::size_t>(cfg.linear_num_value_heads / T) *
+        cfg.linear_value_head_dim;
+    const std::size_t conv_dim = 2 * k_dim + v_dim;
+    const std::size_t v_h =
+        static_cast<std::size_t>(cfg.linear_num_value_heads / T);
+    const std::size_t k_h =
+        static_cast<std::size_t>(cfg.linear_num_key_heads / T);
+    const std::size_t hq =
+        static_cast<std::size_t>(cfg.num_attention_heads / T) * cfg.head_dim;
+    std::size_t bytes = 0;
+    auto u16 = [](std::size_t elems) { return elems * 2; };
+    auto fp32 = [](std::size_t elems) { return elems * 4; };
+    bytes += u16(n * conv_dim);
+    bytes += u16(n * (conv_dim + v_dim));
+    bytes += u16(n * 2 * v_h);
+    bytes += u16(n * conv_dim);
+    bytes += u16(n * v_dim);
+    bytes += u16(n * v_h);
+    bytes += u16(n * v_h);
+    bytes += fp32(n * v_h * cfg.linear_key_head_dim);
+    bytes += fp32(n * v_h * cfg.linear_key_head_dim);
+    bytes += fp32(n * v_dim);
+    bytes += fp32(n * v_h);
+    bytes += fp32(n * v_h);
+    bytes += fp32(n * v_dim);
+    bytes += u16(n * v_dim);
+    bytes += u16(n * k_dim);
+    bytes += u16(n * k_dim);
+    bytes += u16(n * v_dim);
+    bytes += fp32(n * k_h * cfg.linear_key_head_dim);
+    bytes += fp32(n * k_h * cfg.linear_key_head_dim);
+    bytes += u16(n * 2 * hq);
+    bytes += u16(n * hq);
+    return bytes;
 }
 
 }  // namespace pie_cuda_driver::model

@@ -807,4 +807,28 @@ void llama_like_forward_paged(
     }
 }
 
+RopeKind rope_kind_from_hf_config(const HfConfig& hf) {
+    using RopeScaling = HfConfig::RopeScaling;
+    switch (hf.rope_scaling_kind) {
+    case RopeScaling::Llama3:
+        return RopeKind::YaRN;
+    case RopeScaling::OriginalYaRN:
+        return RopeKind::YaRNOriginal;
+    case RopeScaling::None:
+        return RopeKind::Standard;
+    }
+    return RopeKind::Standard;
+}
+
+void apply_rope_config(LlamaLikeForwardCfg& fwd_cfg, const HfConfig& hf) {
+    fwd_cfg.rope_kind                  = rope_kind_from_hf_config(hf);
+    fwd_cfg.yarn_factor                = hf.rope_factor;
+    fwd_cfg.yarn_low_freq_factor       = hf.rope_low_freq_factor;
+    fwd_cfg.yarn_high_freq_factor      = hf.rope_high_freq_factor;
+    fwd_cfg.yarn_original_max_position = hf.rope_original_max_position;
+    fwd_cfg.yarn_beta_fast             = hf.rope_beta_fast;
+    fwd_cfg.yarn_beta_slow             = hf.rope_beta_slow;
+    fwd_cfg.yarn_attention_factor      = hf.rope_attention_factor;
+}
+
 }  // namespace pie_cuda_driver::model

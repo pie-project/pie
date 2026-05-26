@@ -37,4 +37,21 @@ PersistentInputs PersistentInputs::allocate(
     return p;
 }
 
+std::size_t persistent_input_bytes(int N,
+                                   int R,
+                                   int max_page_refs,
+                                   int max_custom_mask_bytes) {
+    std::size_t bytes = 0;
+    bytes += static_cast<std::size_t>(N) * (4 + 4 + 4);
+    bytes += static_cast<std::size_t>(R + 1) * (4 + 4);
+    bytes += static_cast<std::size_t>(R) * (4 + 4 + 1);
+    bytes += static_cast<std::size_t>(max_page_refs) * 4;
+    bytes += static_cast<std::size_t>(max_custom_mask_bytes);
+    bytes += static_cast<std::size_t>(R + 1) * 4;
+    bytes += static_cast<std::size_t>(N) *
+             (sizeof(float) * 3 + sizeof(std::int32_t) * 4 +
+              sizeof(std::uint32_t) + sizeof(std::uint64_t) + sizeof(bool));
+    return bytes;
+}
+
 }  // namespace pie_cuda_driver

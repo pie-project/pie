@@ -369,4 +369,43 @@ void qwen3_forward_paged(
         N, V, H);
 }
 
+std::size_t qwen3_workspace_bytes(const HfConfig& cfg,
+                                  int N,
+                                  int output_rows,
+                                  int max_intermediate,
+                                  int max_Hq,
+                                  int max_Hk) {
+    const auto bf16 = [](std::size_t elems) { return elems * 2; };
+    const auto fp32 = [](std::size_t elems) { return elems * 4; };
+    const std::size_t n = static_cast<std::size_t>(N);
+    const std::size_t o = static_cast<std::size_t>(std::max(1, output_rows));
+    std::size_t bytes = 0;
+    bytes += bf16(n * cfg.hidden_size);
+    bytes += bf16(n * cfg.hidden_size);
+    bytes += bf16(n * cfg.hidden_size);
+    bytes += bf16(n * (max_Hq + 2 * max_Hk));
+    bytes += bf16(n * (2 * max_intermediate));
+    bytes += fp32(n * cfg.head_dim);
+    bytes += bf16(n * max_Hq);
+    bytes += bf16(n * max_Hk);
+    bytes += bf16(n * max_Hk);
+    bytes += bf16(n * max_Hq);
+    bytes += bf16(n * cfg.hidden_size);
+    bytes += bf16(n * max_intermediate);
+    bytes += bf16(n * max_intermediate);
+    bytes += bf16(o * cfg.vocab_size);
+    bytes += fp32(o * cfg.vocab_size);
+    if (cfg.head_dim != cfg.head_dim_kernel) {
+        const int q_heads = max_Hq / std::max(1, cfg.head_dim);
+        const int kv_heads = max_Hk / std::max(1, cfg.head_dim);
+        const int Hq_pad = q_heads * cfg.head_dim_kernel;
+        const int Hk_pad = kv_heads * cfg.head_dim_kernel;
+        bytes += bf16(n * Hq_pad);
+        bytes += bf16(n * Hk_pad);
+        bytes += bf16(n * Hk_pad);
+        bytes += bf16(n * Hq_pad);
+    }
+    return bytes;
+}
+
 }  // namespace pie_cuda_driver::model

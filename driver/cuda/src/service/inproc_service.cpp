@@ -8,7 +8,7 @@
 
 #include "executor/executor.hpp"
 #include "kv_cache.hpp"
-#include "qwen3_5_state_cache.hpp"
+#include "recurrent_state_cache.hpp"
 #include "swap_pool.hpp"
 
 namespace pie_cuda_driver::service {

@@ -129,4 +129,14 @@ void qwen3_forward_paged(
     const std::uint8_t*  custom_mask_d = nullptr,
     const std::int32_t*  custom_mask_indptr_d = nullptr);
 
+// Byte budget for the per-fire Qwen3Workspace tensors, parameterized by
+// the HF config and the per-fire token/output shape. Used by the memory
+// planner to size the persistent workspace arena.
+std::size_t qwen3_workspace_bytes(const HfConfig& cfg,
+                                  int N,
+                                  int output_rows,
+                                  int max_intermediate,
+                                  int max_Hq,
+                                  int max_Hk);
+
 }  // namespace pie_cuda_driver::model

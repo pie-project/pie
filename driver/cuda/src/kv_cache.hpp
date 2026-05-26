@@ -175,4 +175,28 @@ private:
     std::vector<int> per_layer_num_kv_heads_;
 };
 
+struct HfConfig;
+
+// Device bytes for a single KV cache page in the given format. Includes
+// the dequant BF16 scratch tier when format != native bf16.
+std::size_t kv_cache_device_bytes_per_page(const KvCacheFormat& format,
+                                           int page_size,
+                                           int num_kv_heads,
+                                           int head_dim);
+
+// Per-page bytes for a homogeneous transformer where every layer has
+// the same head_dim/kv_heads. Equivalent to multiplying the per-layer
+// page bytes by num_hidden_layers.
+std::size_t kv_page_bytes_homogeneous(const HfConfig& cfg,
+                                      int tp_size,
+                                      const KvCacheFormat& format);
+
+// Per-page bytes for a heterogeneous stack where layers may have
+// different head_dim or share physical pages (kv_source_layer).
+std::size_t kv_page_bytes_per_layer(const HfConfig& cfg,
+                                    const std::vector<int>& per_layer_head_dim,
+                                    const std::vector<int>& kv_source_layer,
+                                    int tp_size,
+                                    const KvCacheFormat& format);
+
 }  // namespace pie_cuda_driver
