@@ -1,6 +1,7 @@
 #pragma once
 
 #include <algorithm>
+#include <cmath>
 #include <cstdlib>
 #include <cstdint>
 #include <iostream>
@@ -735,17 +736,15 @@ private:
             if (batched_dsts_.empty()) {
                 continue;
             }
-            std::size_t fail_index = SIZE_MAX;
-            CUDA_CHECK(cudaMemcpyBatchAsync(
-                batched_dsts_.data(),
-                batched_srcs_.data(),
-                batched_sizes_.data(),
-                batched_dsts_.size(),
-                &attr,
-                &attr_index,
-                1,
-                &fail_index,
-                stream));
+            for (std::size_t i = 0; i < batched_dsts_.size(); ++i) {
+                CUDA_CHECK(cudaMemcpyAsync(
+                    batched_dsts_[i], batched_srcs_[i], batched_sizes_[i],
+                    cudaMemcpyHostToDevice, stream));
+                if ((i & 1023) == 1023) {
+                    CUDA_CHECK(cudaStreamSynchronize(stream));
+                }
+            }
+            CUDA_CHECK(cudaStreamSynchronize(stream));
             if (active_stats_ != nullptr) {
                 ++active_stats_->h2d_batch_calls;
             }
@@ -1708,6 +1707,52 @@ private:
         finalized_buffer_names_[instr.buffer_id] = runtime_name;
     }
 
+    void convert_e8m0_scale_to_f32(const std::string& name)
+    {
+        const auto& t = weights_.get(name);
+        if (t.dtype() == DType::FP32) return;
+        if (t.dtype() != DType::UINT8) return;
+        const auto& shape = t.shape();
+        const std::size_t n = t.numel();
+        std::vector<std::uint8_t> e8m0(n);
+        cudaMemcpy(e8m0.data(), t.data(), n, cudaMemcpyDeviceToHost);
+
+        if (shape.size() == 2) {
+            // 2D block scale [row_blocks, col_blocks] → expand to
+            // per-channel [row_blocks * 128] using max across columns
+            const int row_blocks = static_cast<int>(shape[0]);
+            const int col_blocks = static_cast<int>(shape[1]);
+            const int rows = row_blocks * 128;
+            std::vector<float> per_row(static_cast<std::size_t>(rows));
+            for (int rb = 0; rb < row_blocks; ++rb) {
+                float max_scale = 0.f;
+                for (int cb = 0; cb < col_blocks; ++cb) {
+                    float s = std::ldexp(1.0f,
+                        static_cast<int>(e8m0[static_cast<std::size_t>(rb) * col_blocks + cb]) - 127);
+                    if (s > max_scale) max_scale = s;
+                }
+                for (int r = 0; r < 128; ++r) {
+                    per_row[static_cast<std::size_t>(rb) * 128 + r] = max_scale;
+                }
+            }
+            auto converted = DeviceTensor::allocate(DType::FP32, {rows});
+            cudaMemcpy(converted.data(), per_row.data(),
+                       static_cast<std::size_t>(rows) * sizeof(float),
+                       cudaMemcpyHostToDevice);
+            weights_.insert(name + ".f32", std::move(converted));
+        } else {
+            std::vector<float> f32(n);
+            for (std::size_t i = 0; i < n; ++i) {
+                f32[i] = std::ldexp(1.0f, static_cast<int>(e8m0[i]) - 127);
+            }
+            auto converted = DeviceTensor::allocate(DType::FP32,
+                {static_cast<int>(n)});
+            cudaMemcpy(converted.data(), f32.data(), n * sizeof(float),
+                       cudaMemcpyHostToDevice);
+            weights_.insert(name + ".f32", std::move(converted));
+        }
+    }
+
     void attach_quant_metadata()
     {
         for (const auto& attachment : quant_attachments_) {
@@ -1723,10 +1768,14 @@ private:
                     attachment.scale_tensor_name + "' for '" +
                     attachment.tensor_name + "' was not finalized");
             }
+            convert_e8m0_scale_to_f32(attachment.scale_tensor_name);
+            const std::string f32_name = attachment.scale_tensor_name + ".f32";
+            const bool has_f32 = weights_.find(f32_name) != weights_.end();
+            const std::string& scale_name = has_f32 ? f32_name : attachment.scale_tensor_name;
             QuantMeta meta;
             meta.kind = quant_meta_kind(attachment.granularity);
-            meta.scale_name = attachment.scale_tensor_name;
-            meta.scale = &weights_.get(attachment.scale_tensor_name);
+            meta.scale_name = scale_name;
+            meta.scale = &weights_.get(scale_name);
             meta.group_size = attachment.group_size;
             meta.channel_axis = attachment.channel_axis;
             weights_.set_quant_meta(attachment.tensor_name, std::move(meta));

@@ -247,6 +247,29 @@ HfConfig parse_hf_config(const std::filesystem::path& path) {
         optional<bool>(j, "norm_topk_prob", false);
     cfg.routed_scaling_factor =
         optional<float>(j, "routed_scaling_factor", 1.0f);
+
+    // ── DeepSeek V4 specific ────────────────────────────────────────
+    if (cfg.model_type == "deepseek_v4") {
+        cfg.dsv4_o_lora_rank       = optional<int>(j, "o_lora_rank", 0);
+        cfg.dsv4_o_groups          = optional<int>(j, "o_groups", 0);
+        cfg.dsv4_index_head_dim    = optional<int>(j, "index_head_dim", 0);
+        cfg.dsv4_index_n_heads     = optional<int>(j, "index_n_heads", 0);
+        cfg.dsv4_index_topk        = optional<int>(j, "index_topk", 0);
+        cfg.dsv4_hc_mult           = optional<int>(j, "hc_mult", 0);
+        cfg.dsv4_hc_eps            = optional<float>(j, "hc_eps", 1e-6f);
+        cfg.dsv4_num_hash_layers   = optional<int>(j, "num_hash_layers", 0);
+        cfg.dsv4_sliding_window    = optional<int>(j, "sliding_window", 0);
+        cfg.dsv4_compress_rope_theta = optional<float>(j, "compress_rope_theta", 0.f);
+        cfg.dsv4_scoring_func      = optional<std::string>(j, "scoring_func", "");
+        cfg.dsv4_expert_dtype      = optional<std::string>(j, "expert_dtype", "");
+        cfg.attention_has_sinks    = true;
+        if (j.contains("compress_ratios") && j["compress_ratios"].is_array()) {
+            for (const auto& v : j["compress_ratios"]) {
+                cfg.dsv4_compress_ratios.push_back(v.get<int>());
+            }
+        }
+    }
+
     // Gemma-4 26B-A4B sets `enable_moe_block: true` to flip its layers
     // from dense-MLP-only to dense + parallel MoE.
     cfg.gemma4_enable_moe   = optional<bool>(j, "enable_moe_block", false);

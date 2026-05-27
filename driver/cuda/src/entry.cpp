@@ -52,6 +52,7 @@
 #include "model/gemma3n.hpp"
 #include "model/gemma4.hpp"
 #include "model/gpt_oss.hpp"
+#include "model/deepseek_v4_forward.hpp"
 #include "model/kimi_forward.hpp"
 #include "model/llama_like.hpp"
 #include "model/mixtral.hpp"
@@ -889,6 +890,7 @@ CudaMemoryPlan plan_cuda_memory(
     const std::vector<int>& gemma4_per_layer_head_dim,
     const std::vector<int>& gemma4_kv_source_layer,
     bool is_kimi_arch,
+    bool is_dsv4_arch,
     bool is_qwen3_5_arch,
     bool is_qwen3_5_moe_arch,
     int qwen3_5_linear_layers,
@@ -946,6 +948,9 @@ CudaMemoryPlan plan_cuda_memory(
             ? kv_page_bytes_per_layer(hf, gemma4_per_layer_head_dim,
                                       gemma4_kv_source_layer, tp_size,
                                       kv_format)
+        : is_dsv4_arch
+            // V4 MQA: 1 KV head replicated (not sharded) across TP ranks
+            ? kv_page_bytes_homogeneous(hf, /*tp_size=*/1, kv_format)
             : kv_page_bytes_homogeneous(hf, tp_size, kv_format);
     if (per_kv_token_bytes == 0) {
         throw std::runtime_error("cuda memory planner: computed zero KV page bytes");
@@ -2055,7 +2060,8 @@ int run_impl(int argc,
          || mt == "gemma3" || mt == "gemma3_text"
          || mt == "gemma4" || mt == "gemma4_text"
          || mt == "gemma3n" || mt == "gemma3n_text"
-         || mt == "kimi_k2";
+         || mt == "kimi_k2"
+         || mt == "deepseek_v2" || mt == "deepseek_v3" || mt == "deepseek_v4";
         if (!supported) {
             std::cerr << "[pie-driver-cuda] arch '" << mt
                       << "' not yet supported (Qwen 2/3, Llama-3, "
@@ -2074,6 +2080,7 @@ int run_impl(int argc,
     auto& weights_qwen3_5 = bound_model.qwen3_5;
     auto& weights_qwen3_5_moe = bound_model.qwen3_5_moe;
     auto& weights_kimi = bound_model.kimi;
+    auto& weights_dsv4 = bound_model.deepseek_v4;
 
     const bool is_gemma_arch = bound_model.is_gemma();
     const bool is_gemma4_arch = bound_model.is_gemma4();
@@ -2082,6 +2089,7 @@ int run_impl(int argc,
     const bool is_qwen3_5_arch = bound_model.is_qwen3_5();
     const bool is_qwen3_5_moe_arch = bound_model.is_qwen3_5_moe();
     const bool is_kimi_arch = bound_model.is_kimi();
+    const bool is_dsv4_arch = bound_model.is_deepseek_v4();
 
     const std::size_t num_layers_bound = bound_model.num_layers();
     if (verbose) {
@@ -2164,7 +2172,7 @@ int run_impl(int argc,
     const CudaMemoryPlan mem_plan = plan_cuda_memory(
         cfg, engine.hf_config(), max_mlp_intermediate, max_Hq, max_Hk,
         is_gemma4_arch, weights_gemma4.per_layer_head_dim,
-        weights_gemma4.kv_source_layer, is_kimi_arch, is_qwen3_5_arch,
+        weights_gemma4.kv_source_layer, is_kimi_arch, is_dsv4_arch, is_qwen3_5_arch,
         is_qwen3_5_moe_arch, qwen3_5_linear_layers,
         kv_format, runtime_quant_scratch_base, verbose);
     const int max_workspace_tokens = mem_plan.max_workspace_tokens;
@@ -2192,8 +2200,24 @@ int run_impl(int argc,
                   local_tp_size)
             : pie_cuda_driver::model::KimiWorkspace{};
 
+    auto dsv4_ws =
+        is_dsv4_arch
+            ? pie_cuda_driver::model::DsV4Workspace::allocate(
+                  engine.hf_config(), max_workspace_tokens,
+                  mem_plan.capacity.max_logit_rows,
+                  local_tp_size)
+            : pie_cuda_driver::model::DsV4Workspace{};
+
     auto kv_cache =
-        is_kimi_arch
+        is_dsv4_arch
+            ? pie_cuda_driver::KvCache::allocate(
+                  engine.hf_config().num_hidden_layers,
+                  physical_kv_pages,
+                  mem_plan.kv_page_size,
+                  1,        // num_kv_heads = 1 for V4 MQA
+                  engine.hf_config().head_dim,
+                  kv_format)
+        : is_kimi_arch
             ? pie_cuda_driver::KvCache::allocate(
                   engine.hf_config().num_hidden_layers,
                   physical_kv_pages,
@@ -2624,7 +2648,48 @@ int run_impl(int argc,
             hf_cfg.num_hidden_layers *
                 hf_cfg.gemma_hidden_size_per_layer_input);
     }
-    if (is_kimi_arch) {
+    if (is_dsv4_arch) {
+        const int dsv4_tp_size = cfg.distributed.tp_size;
+        const bool dsv4_emit_logits = cfg.distributed.tp_rank == 0;
+        pie_cuda_driver::NcclComm* dsv4_tp_comm = tp_comm_ptr;
+        forward_fn.supports_compact_logits = true;
+        forward_fn.body = [&engine, &weights_dsv4, &dsv4_ws,
+                           dsv4_tp_size, dsv4_tp_comm, dsv4_emit_logits](
+            pie_cuda_driver::model::Qwen3Workspace& ws,
+            pie_cuda_driver::KvCache& cache,
+            pie_cuda_driver::AttentionWorkspace& attn_ws,
+            pie_cuda_driver::ops::CublasHandle& cublas,
+            const std::int32_t* tok, const std::int32_t* pos,
+            const std::uint32_t* qo_indptr,
+            const std::uint32_t* kv_page_indices,
+            const std::uint32_t* kv_page_indptr,
+            const std::uint32_t* kv_last_page_lens,
+            const std::uint32_t* qo_indptr_h,
+            const std::uint32_t* kv_page_indptr_h,
+            int N, int R, bool is_pure_decode,
+            const std::uint8_t* mask_d, const std::int32_t* mask_indptr_d,
+            const std::int32_t* slot_ids_h, const std::uint8_t* is_fresh_h,
+            const std::int32_t* slot_ids_d,
+            const std::int32_t* logit_row_indices_d,
+            int num_logit_rows,
+            bool /*tp_greedy_argmax*/) {
+            (void)ws; (void)mask_d; (void)mask_indptr_d;
+            (void)slot_ids_h; (void)is_fresh_h; (void)slot_ids_d;
+            pie_cuda_driver::model::DsV4ForwardCfg dsv4_fwd{};
+            dsv4_fwd.tp_size = dsv4_tp_size;
+            dsv4_fwd.tp_comm = dsv4_tp_comm;
+            dsv4_fwd.emit_logits = dsv4_emit_logits;
+            pie_cuda_driver::model::dsv4_forward_paged(
+                weights_dsv4, engine.hf_config(), dsv4_fwd,
+                dsv4_ws, cache, attn_ws, cublas,
+                ws.logits.data(),
+                tok, pos,
+                qo_indptr, kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                qo_indptr_h, kv_page_indptr_h,
+                N, R, is_pure_decode,
+                logit_row_indices_d, num_logit_rows);
+        };
+    } else if (is_kimi_arch) {
         const int kimi_tp_size = cfg.distributed.tp_size;
         const bool kimi_emit_logits = cfg.distributed.tp_rank == 0;
         pie_cuda_driver::NcclComm* kimi_tp_comm = tp_comm_ptr;

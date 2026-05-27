@@ -122,6 +122,8 @@ add_library(pie_driver_cuda_lib STATIC
   src/model/gpt_oss.cpp
   src/model/kimi.cpp
   src/model/kimi_forward.cpp
+  src/model/deepseek_v4.cpp
+  src/model/deepseek_v4_forward.cpp
   src/model/qwen3_5.cpp
   src/kv_cache_format.cpp
   src/kv_cache.cpp
@@ -144,6 +146,9 @@ add_library(pie_driver_cuda_lib STATIC
   src/kernels/kv_paged.cu
   src/kernels/mla_paged.cu
   src/kernels/kimi_mla.cu
+  src/kernels/dsv4_routing.cu
+  src/kernels/dsv4_hc.cu
+  src/kernels/dsv4_compress.cu
   src/kernels/sample_temp.cu
   src/kernels/sample_flashinfer.cu
   src/kernels/entropy.cu
@@ -257,7 +262,7 @@ target_include_directories(pie_driver_cuda_lib
 # packed-weight GEMM on supported GPUs and fall back only on legacy targets.
 # Vendored sources live under `third_party/marlin/`; the wrapper exposes a
 # torch-free C++ API.
-option(PIE_CUDA_BUILD_MARLIN "Build vendored marlin W4A16/MXFP4 GEMM" ON)
+option(PIE_CUDA_BUILD_MARLIN "Build vendored marlin W4A16/MXFP4 GEMM" OFF)
 if(PIE_CUDA_BUILD_MARLIN)
 	    # Include the generated kernel instantiations alongside the core driver.
     file(GLOB MARLIN_SM_KERNELS

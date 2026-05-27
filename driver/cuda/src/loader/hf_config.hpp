@@ -171,6 +171,21 @@ struct HfConfig {
     bool norm_topk_prob = false;
     float routed_scaling_factor = 1.0f;
 
+    // ── DeepSeek V4 specific ────────────────────────────────────────
+    int dsv4_o_lora_rank = 0;
+    int dsv4_o_groups = 0;
+    int dsv4_index_head_dim = 0;
+    int dsv4_index_n_heads = 0;
+    int dsv4_index_topk = 0;
+    int dsv4_hc_mult = 0;
+    int dsv4_num_hash_layers = 0;
+    int dsv4_sliding_window = 0;
+    float dsv4_hc_eps = 1e-6f;
+    float dsv4_compress_rope_theta = 0.f;
+    std::vector<int> dsv4_compress_ratios;
+    std::string dsv4_scoring_func;
+    std::string dsv4_expert_dtype;
+
     // ── Qwen3.5 hybrid (linear-attention SSM + full attention) ──────
     // Per-layer attention type is in `layer_types` (values
     // "linear_attention" / "full_attention"). The linear layers run a

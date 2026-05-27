@@ -435,6 +435,28 @@ inline std::vector<RustQuantAttachment> infer_rust_quant_attachments(
         });
     }
 
+    // DeepSeek V4: pair block-scaled FP8 (E4M3 weight + E8M0 scale).
+    // Weight names end with `.weight`, scales end with `.scale`.
+    // The scale tensor is E8M0 — the bind function converts to FP32
+    // at load time and creates QuantMeta with PerChannel granularity.
+    if (hf.model_type == "deepseek_v4") {
+        for (const auto& name : runtime_names) {
+            if (!rust_loader_ends_with(name, ".weight")) continue;
+            const std::string scale =
+                name.substr(0, name.size() - std::string(".weight").size()) +
+                ".scale";
+            if (!present.contains(scale)) continue;
+            attachments.push_back(RustQuantAttachment{
+                .tensor_name = name,
+                .scale_tensor_name = scale,
+                .granularity = QuantGranularity::PerChannel,
+                .group_size = 0,
+                .channel_axis = 0,
+            });
+        }
+        return attachments;
+    }
+
     const bool is_gpt_oss =
         hf.model_type == "gpt_oss" || hf.model_type == "gpt-oss" ||
         hf.model_type == "gptoss";

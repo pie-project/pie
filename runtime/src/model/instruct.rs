@@ -124,7 +124,7 @@ pub fn create(arch_name: &str, tokenizer: Arc<Tokenizer>) -> Arc<dyn Instruct> {
         "qwen2" => Arc::new(self::qwen2::new(tokenizer)),
         "llama2" => Arc::new(self::llama2::LlamaInstruct::new(tokenizer)),
         "llama3" | "l4ma" => Arc::new(self::llama3::LlamaInstruct::new(tokenizer)),
-        "r1" | "deepseek_v3" => Arc::new(self::r1::R1Instruct::new(tokenizer)),
+        "r1" | "deepseek_v3" | "deepseek_v4" => Arc::new(self::r1::R1Instruct::new(tokenizer)),
         "kimi_k2" | "kimi_k25" => Arc::new(self::kimi::KimiInstruct::new(tokenizer)),
         "gptoss" | "gpt_oss" => Arc::new(self::gptoss::GptOssInstruct::new(tokenizer)),
         // Gemma-3n shares the multi-piece `<start_of_turn>` /

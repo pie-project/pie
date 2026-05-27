@@ -1247,6 +1247,10 @@ impl DefaultAbiBuilder<'_> {
         if self.target.tp_size <= 1 {
             return None;
         }
+        if name.contains("experts.0.w1.weight") {
+            eprintln!("[shard_axis] tp_size={} model_type='{}' name='{}'",
+                self.target.tp_size, self.cfg.model_type, name);
+        }
         if matches!(self.cfg.model_type.as_str(), "kimi_k2" | "kimi_k25")
             && name.ends_with(".embed_tokens.weight")
         {
@@ -1256,6 +1260,9 @@ impl DefaultAbiBuilder<'_> {
             && name.ends_with(".lm_head.weight")
         {
             return Some(Axis(0));
+        }
+        if self.cfg.model_type == "deepseek_v4" {
+            return dsv4_shard_axis(name);
         }
         llama_like_shard_axis(name)
     }
@@ -1482,6 +1489,47 @@ fn runtime_quantizable_name(name: &str) -> bool {
             ".mlp.down_proj.weight",
         ],
     )
+}
+
+fn dsv4_shard_axis(name: &str) -> Option<Axis> {
+    if name.contains(".ffn.experts.0.w1.weight") {
+        eprintln!("[dsv4_shard_axis] expert match: {name}");
+    }
+    // Embed/head: vocab-shard on axis 0
+    if name == "embed.weight" || name == "head.weight" {
+        return Some(Axis(0));
+    }
+    // Q expansion (wq_b) shards heads on axis 0
+    if name.ends_with(".wq_b.weight") || name.ends_with(".wq_b.scale") {
+        return Some(Axis(0));
+    }
+    // Output projection wo_b is row-parallel (axis 1)
+    if name.ends_with(".wo_b.weight") || name.ends_with(".wo_b.scale") {
+        return Some(Axis(1));
+    }
+    // Shared expert gate/up: axis 0, down: axis 1
+    if ends_with_any(name, &[
+        ".shared_experts.w1.weight", ".shared_experts.w1.scale",
+        ".shared_experts.w3.weight", ".shared_experts.w3.scale",
+    ]) {
+        return Some(Axis(0));
+    }
+    if ends_with_any(name, &[
+        ".shared_experts.w2.weight", ".shared_experts.w2.scale",
+    ]) {
+        return Some(Axis(1));
+    }
+    // Routed expert gate/up (w1/w3): shard axis 0
+    if name.contains(".ffn.experts.") {
+        if ends_with_any(name, &[".w1.weight", ".w1.scale", ".w3.weight", ".w3.scale"]) {
+            return Some(Axis(0));
+        }
+        if ends_with_any(name, &[".w2.weight", ".w2.scale"]) {
+            return Some(Axis(1));
+        }
+    }
+    // Everything else: replicated (no shard)
+    None
 }
 
 fn ends_with_any(value: &str, suffixes: &[&str]) -> bool {

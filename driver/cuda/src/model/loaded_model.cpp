@@ -37,7 +37,8 @@ bool supports_tp(const std::string& mt) {
         || mt == "qwen3_5" || mt == "qwen3_5_text"
         || mt == "qwen3_5_moe" || mt == "qwen3_5_moe_text"
         || mt == "qwen3_moe"
-        || mt == "kimi_k2";
+        || mt == "kimi_k2"
+        || mt == "deepseek_v2" || mt == "deepseek_v3" || mt == "deepseek_v4";
 }
 
 // True for any MoE model whose forward path lives in qwen3_5_moe_forward.
@@ -186,14 +187,20 @@ LoadedModel LoadedModel::load(const Config& boot_cfg, NcclComm* tp_comm) {
             }
         };
         require_divisible(hf.num_attention_heads, "num_attention_heads");
-        require_divisible(hf.num_key_value_heads, "num_key_value_heads");
+        // V4 has num_key_value_heads=1 (MQA) — the single KV head is
+        // replicated, not sharded. Skip the divisibility check.
+        if (hf.model_type != "deepseek_v4") {
+            require_divisible(hf.num_key_value_heads, "num_key_value_heads");
+        }
         // Qwen3.5-MoE / Qwen3-MoE have no dense `intermediate_size`; the
         // MLP lives entirely in `moe_intermediate_size` (+ `shared_expert_
         // intermediate_size` for the 3.5/3.6 family — Qwen3-MoE has no
         // shared expert).
-        const bool is_kimi_k2 = hf.model_type == "kimi_k2";
+        const bool is_kimi_k2 = hf.model_type == "kimi_k2"
+            || hf.model_type == "deepseek_v2" || hf.model_type == "deepseek_v3";
+        const bool is_dsv4 = hf.model_type == "deepseek_v4";
         const bool is_q35_moe = is_qwen3_5_moe_arch(hf.model_type);
-        if (!is_q35_moe && !is_kimi_k2) {
+        if (!is_q35_moe && !is_kimi_k2 && !is_dsv4) {
             require_divisible(hf.intermediate_size, "intermediate_size");
         }
         if (is_kimi_k2) {
@@ -204,6 +211,13 @@ LoadedModel LoadedModel::load(const Config& boot_cfg, NcclComm* tp_comm) {
                 require_divisible(hf.shared_expert_intermediate_size,
                                   "shared_expert_intermediate_size");
             }
+        }
+        if (is_dsv4) {
+            require_divisible(hf.q_lora_rank, "q_lora_rank");
+            if (hf.dsv4_o_lora_rank > 0) {
+                require_divisible(hf.dsv4_o_lora_rank, "o_lora_rank");
+            }
+            require_divisible(hf.moe_intermediate_size, "moe_intermediate_size");
         }
         // Qwen3.5 / 3.6-MoE: linear-attention head counts must shard too.
         // Qwen3-MoE has no linear-attn layers, so this check is skipped.

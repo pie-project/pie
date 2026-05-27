@@ -14,6 +14,7 @@ std::size_t BoundCudaModel::num_layers() const noexcept {
     case Kind::Qwen3_5: return qwen3_5.layers.size();
     case Kind::Qwen3_5Moe: return qwen3_5_moe.layers.size();
     case Kind::Kimi: return kimi.layers.size();
+    case Kind::DeepSeekV4: return deepseek_v4.layers.size();
     }
     return 0;
 }
@@ -32,7 +33,10 @@ BoundCudaModel bind_cuda_model(const LoadedModel& engine, bool verbose) {
     const bool is_qwen3_5_moe =
         (mt == "qwen3_5_moe" || mt == "qwen3_5_moe_text" || mt == "qwen3_moe");
 
-    if (mt == "kimi_k2") {
+    if (mt == "deepseek_v4") {
+        bound.kind = BoundCudaModel::Kind::DeepSeekV4;
+        bound.deepseek_v4 = bind_deepseek_v4(engine);
+    } else if (mt == "kimi_k2" || mt == "deepseek_v2" || mt == "deepseek_v3") {
         bound.kind = BoundCudaModel::Kind::Kimi;
         bound.kimi = bind_kimi(engine);
     } else if (mt == "phi3") {
