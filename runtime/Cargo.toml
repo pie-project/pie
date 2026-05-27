@@ -15,7 +15,7 @@ path = "src/lib.rs"
 [dependencies]
 pie-bridge = { path = "../driver/bridge" }
 pie-client = { path = "../client/rust" }
-tokio = { version = "1.38", features = ["full"] }
+tokio = { version = "1.52", features = ["full"] }
 tokio-util = "0.7"
 anyhow = "1.0"
 futures-util = { version = "0.3", features = ["sink"] }

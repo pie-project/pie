@@ -129,16 +129,6 @@ pub(crate) fn register_model(
     }
 }
 
-/// `true` when this model has speculation enabled
-/// (`scheduler.speculation_depth > 0`).
-fn is_spec_enabled(model_idx: usize) -> bool {
-    REGISTRY
-        .lock()
-        .ok()
-        .and_then(|reg| reg.get(model_idx).map(|m| m.speculation_depth > 0))
-        .unwrap_or(false)
-}
-
 /// Opaque per-(model, device) handle the api layer caches on the
 /// ctx side. Lets `try_hit` skip the REGISTRY lookup on every
 /// `execute()` — the lookup happens once when the ctx is first
@@ -296,8 +286,10 @@ pub(crate) fn spawn_extend_chain(
             // Kill switch: forward the cold-submit output and skip
             // pushing another stage. The next inferlet submit will miss
             // try_hit (deque empty), go through the actor, and land here
-            // again — same forwarding, no chain ever forms.
-            if !is_spec_enabled(model_idx) {
+            // again — same forwarding, no chain ever forms. `max_queue_depth`
+            // is the per-call speculation depth captured at spawn — 0 means
+            // speculation disabled, no global lock needed.
+            if max_queue_depth == 0 {
                 let _ = response.send(Ok(output));
                 return;
             }
