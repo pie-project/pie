@@ -1179,12 +1179,13 @@ impl BatchScheduler {
                 'adaptive' | 'eager' | 'greedy'"
             ),
         };
-        // Only one in-flight batch at a time to prevent pipelined KV cache corruption.
-        // AtomicBool gate: set true on Fire, cleared by execute_batch task
-        // after driver_fire returns (mirrors permit drop in the prior
-        // tokio Semaphore design).
-        use std::sync::atomic::AtomicBool;
-        let in_flight = Arc::new(AtomicBool::new(false));
+        // No cross-thread in-flight gate needed: the scheduler is the
+        // only firer and runs `execute_batch` synchronously, so a
+        // second fire physically cannot start before the previous one
+        // completes. AdaptivePolicy still tracks its own internal
+        // `in_flight` bool (via on_fired/on_complete) for its decide()
+        // heuristics; that's a policy concern, not a scheduling-safety
+        // concern, and stays as-is.
 
         // Channel for batch completion latency feedback to the policy.
         let (latency_tx, latency_rx) = crossbeam::channel::unbounded::<Duration>();
@@ -1266,31 +1267,15 @@ impl BatchScheduler {
             };
             match decision {
                 Decision::Fire => {
-                    // Acquire the in-flight gate. AdaptivePolicy already
-                    // gates on this (returns Wait while in_flight=true),
-                    // so the CAS should usually succeed on first try. The
-                    // spin loop is defensive in case the policy is greedy
-                    // or there's a race.
-                    let permit_wait_start = Instant::now();
-                    while in_flight
-                        .compare_exchange(
-                            false,
-                            true,
-                            std::sync::atomic::Ordering::AcqRel,
-                            std::sync::atomic::Ordering::Acquire,
-                        )
-                        .is_err()
-                    {
-                        std::thread::yield_now();
-                    }
-                    let permit_wait_us =
-                        permit_wait_start.elapsed().as_micros() as u64;
+                    // No in-flight gate to acquire: the scheduler runs
+                    // execute_batch synchronously, so we can only reach
+                    // here when the previous fire has fully completed.
+                    let permit_wait_us = 0u64;
 
-                    // The policy may decide to fire while the previous GPU
-                    // batch is still in flight. Do one last non-blocking
-                    // drain after the permit opens so requests that arrived
-                    // during that wait are coalesced into this batch instead
-                    // of being stranded behind a tiny stale fire.
+                    // Do one last non-blocking drain so requests that
+                    // arrived between the recv loop and here are
+                    // coalesced into this batch instead of being
+                    // stranded behind it.
                     let fire_prepare_start = Instant::now();
                     while next_pending.is_none() && !batch.is_full() {
                         let Ok(pending) = req_rx.try_recv() else {
@@ -1366,116 +1351,108 @@ impl BatchScheduler {
                             .fetch_add(now_us.saturating_sub(last_dispatch_end), Relaxed);
                     }
 
-                    // Spawn batch execution on the shared multi-thread
-                    // tokio runtime (captured rt_handle). The async task
-                    // clears `in_flight` itself when its driver_fire
-                    // returns, mirroring the prior tokio Semaphore permit
-                    // drop semantics.
-                    let latency_tx_clone = latency_tx.clone();
-                    let stats_clone = stats.clone();
+                    // Fire synchronously on the scheduler thread.
+                    // `execute_batch` parks on a futex inside
+                    // `fire_batch_sync` while the GPU runs (the same
+                    // wait the prior `block_in_place(submit_sync)` did
+                    // under the old `async fn`). The ~800 µs
+                    // `deferred_drop` work is still punted via
+                    // `rt_handle.spawn_blocking` inside execute_batch.
                     let timeout = request_timeout;
-                    let submit_tx_clone = submit_tx.clone();
+                    let start = Instant::now();
+                    let timing = Self::execute_batch(
+                        driver_idx,
+                        requests_to_fire,
+                        driver_id,
+                        page_size,
+                        timeout,
+                        &rt_handle,
+                        Some(submit_tx.clone()),
+                        Some(stats.clone()),
+                        Some(chain_pool.clone()),
+                    );
+                    let latency = start.elapsed();
+                    let _ = latency_tx.send(latency);
 
-                    let stats_for_probe = stats_clone.clone();
-                    let chain_pool_clone = chain_pool.clone();
-                    let in_flight_clone = in_flight.clone();
-                    rt_handle.spawn(async move {
-                        let start = Instant::now();
-                        let timing = Self::execute_batch(
-                            driver_idx,
-                            requests_to_fire,
-                            driver_id,
-                            page_size,
-                            timeout,
-                            Some(in_flight_clone),
-                            Some(submit_tx_clone),
-                            Some(stats_for_probe),
-                            Some(chain_pool_clone),
-                        )
-                        .await;
-                        let latency = start.elapsed();
-                        let _ = latency_tx_clone.send(latency);
+                    // Advance market clock for this driver: prices, rent, dividends.
+                    // Pass batch context IDs so tick only charges contexts
+                    // that were in this batch (not stale pinned contexts).
+                    let tick_submit_start = Instant::now();
+                    crate::context::tick(driver_idx, latency.as_secs_f64(), batch_ctx_ids);
+                    let tick_submit_us = tick_submit_start.elapsed().as_micros() as u64;
 
-                        // Advance market clock for this driver: prices, rent, dividends.
-                        // Pass batch context IDs so tick only charges contexts
-                        // that were in this batch (not stale pinned contexts).
-                        let tick_submit_start = Instant::now();
-                        crate::context::tick(driver_idx, latency.as_secs_f64(), batch_ctx_ids);
-                        let tick_submit_us = tick_submit_start.elapsed().as_micros() as u64;
-
-                        // Update cumulative atomic counters (consumed by external
-                        // monitoring; ignored by the policy).
-                        let stats_update_start = Instant::now();
-                        stats_clone.total_batches.fetch_add(1, Relaxed);
-                        stats_clone
-                            .total_tokens_processed
-                            .fetch_add(total_tokens as u64, Relaxed);
-                        stats_clone
-                            .total_requests_processed
-                            .fetch_add(batch_size, Relaxed);
-                        stats_clone
-                            .max_forward_requests_observed
-                            .fetch_max(batch_size, Relaxed);
-                        let bucket = match batch_size {
-                            0 | 1 => 0,
-                            2..=3 => 1,
-                            4..=7 => 2,
-                            8..=15 => 3,
-                            16..=31 => 4,
-                            32..=63 => 5,
-                            64..=127 => 6,
-                            _ => 7,
-                        };
-                        stats_clone.batch_size_hist[bucket].fetch_add(1, Relaxed);
-                        stats_clone
-                            .last_batch_latency_us
-                            .store(latency.as_micros() as u64, Relaxed);
-                        stats_clone
-                            .cumulative_latency_us
-                            .fetch_add(latency.as_micros() as u64, Relaxed);
-                        stats_clone
-                            .cumulative_execute_batch_us
-                            .fetch_add(timing.total_us, Relaxed);
-                        stats_clone
-                            .cumulative_batch_build_us
-                            .fetch_add(timing.batch_build_us, Relaxed);
-                        stats_clone
-                            .cumulative_driver_fire_us
-                            .fetch_add(timing.driver_fire_us, Relaxed);
-                        stats_clone
-                            .cumulative_response_dispatch_us
-                            .fetch_add(timing.response_dispatch_us, Relaxed);
-                        stats_clone
-                            .cumulative_context_tick_submit_us
-                            .fetch_add(tick_submit_us, Relaxed);
-                        stats_clone
-                            .system_spec_draft_tokens_proposed
-                            .fetch_add(timing.system_spec_draft_tokens_proposed, Relaxed);
-                        stats_clone
-                            .system_spec_draft_tokens_accepted
-                            .fetch_add(timing.system_spec_draft_tokens_accepted, Relaxed);
-                        for (counter, value) in stats_clone
-                            .system_spec_draft_tokens_proposed_per_pos
-                            .iter()
-                            .zip(timing.system_spec_draft_tokens_proposed_per_pos)
-                        {
-                            if value != 0 {
-                                counter.fetch_add(value, Relaxed);
-                            }
+                    // Update cumulative atomic counters (consumed by external
+                    // monitoring; ignored by the policy).
+                    let stats_update_start = Instant::now();
+                    stats.total_batches.fetch_add(1, Relaxed);
+                    stats
+                        .total_tokens_processed
+                        .fetch_add(total_tokens as u64, Relaxed);
+                    stats
+                        .total_requests_processed
+                        .fetch_add(batch_size, Relaxed);
+                    stats
+                        .max_forward_requests_observed
+                        .fetch_max(batch_size, Relaxed);
+                    let bucket = match batch_size {
+                        0 | 1 => 0,
+                        2..=3 => 1,
+                        4..=7 => 2,
+                        8..=15 => 3,
+                        16..=31 => 4,
+                        32..=63 => 5,
+                        64..=127 => 6,
+                        _ => 7,
+                    };
+                    stats.batch_size_hist[bucket].fetch_add(1, Relaxed);
+                    stats
+                        .last_batch_latency_us
+                        .store(latency.as_micros() as u64, Relaxed);
+                    stats
+                        .cumulative_latency_us
+                        .fetch_add(latency.as_micros() as u64, Relaxed);
+                    stats
+                        .cumulative_execute_batch_us
+                        .fetch_add(timing.total_us, Relaxed);
+                    stats
+                        .cumulative_batch_build_us
+                        .fetch_add(timing.batch_build_us, Relaxed);
+                    stats
+                        .cumulative_driver_fire_us
+                        .fetch_add(timing.driver_fire_us, Relaxed);
+                    stats
+                        .cumulative_response_dispatch_us
+                        .fetch_add(timing.response_dispatch_us, Relaxed);
+                    stats
+                        .cumulative_context_tick_submit_us
+                        .fetch_add(tick_submit_us, Relaxed);
+                    stats
+                        .system_spec_draft_tokens_proposed
+                        .fetch_add(timing.system_spec_draft_tokens_proposed, Relaxed);
+                    stats
+                        .system_spec_draft_tokens_accepted
+                        .fetch_add(timing.system_spec_draft_tokens_accepted, Relaxed);
+                    for (counter, value) in stats
+                        .system_spec_draft_tokens_proposed_per_pos
+                        .iter()
+                        .zip(timing.system_spec_draft_tokens_proposed_per_pos)
+                    {
+                        if value != 0 {
+                            counter.fetch_add(value, Relaxed);
                         }
-                        for (counter, value) in stats_clone
-                            .system_spec_draft_tokens_accepted_per_pos
-                            .iter()
-                            .zip(timing.system_spec_draft_tokens_accepted_per_pos)
-                        {
-                            if value != 0 {
-                                counter.fetch_add(value, Relaxed);
-                            }
+                    }
+                    for (counter, value) in stats
+                        .system_spec_draft_tokens_accepted_per_pos
+                        .iter()
+                        .zip(timing.system_spec_draft_tokens_accepted_per_pos)
+                    {
+                        if value != 0 {
+                            counter.fetch_add(value, Relaxed);
                         }
-                        stats_clone
-                            .cumulative_stats_update_us
-                            .fetch_add(stats_update_start.elapsed().as_micros() as u64, Relaxed);
-                    });
+                    }
+                    stats
+                        .cumulative_stats_update_us
+                        .fetch_add(stats_update_start.elapsed().as_micros() as u64, Relaxed);
                 }
                 Decision::Wait(wait_duration) => {
                     crossbeam::channel::select! {
@@ -1519,33 +1496,44 @@ impl BatchScheduler {
             }
         }
 
-        // Shutdown: fire remaining batch on the shared runtime and let
-        // it complete in the background. The scheduler thread itself is
-        // exiting; we don't wait for the final fire to finish.
+        // Shutdown: fire the remaining batch synchronously so any
+        // inferlets still awaiting responses get them before we exit.
+        // ~10 ms of additional shutdown latency in the worst case.
         if !batch.is_empty() {
             let requests = batch.take();
-            let _ = rt_handle.spawn(Self::execute_batch(
+            let _ = Self::execute_batch(
                 driver_idx,
                 requests,
                 driver_id,
                 page_size,
                 request_timeout,
+                &rt_handle,
                 None,
                 None,
                 None,
-                None,
-            ));
+            );
         }
     }
 
     /// Execute a batch of forward pass requests via the driver service.
-    async fn execute_batch(
+    ///
+    /// Runs synchronously on the caller's thread. The scheduler invokes
+    /// this directly from its OS-thread `run` loop instead of spawning
+    /// a tokio task per fire — `driver::fire_batch_sync` parks on a
+    /// futex inside the channel, which is all the "async" the prior
+    /// `async fn` ever did (the async wrappers all bottomed out in
+    /// `block_in_place(submit_sync_for_state)`). The only off-thread
+    /// work this function still does is the `deferred_drop` punt, which
+    /// `rt_handle.spawn_blocking` routes to tokio's dedicated blocking
+    /// pool so the chain-extender wake-up wave doesn't compete with it
+    /// for CPU.
+    fn execute_batch(
         driver_idx: usize,
         requests: Vec<PendingRequest>,
         driver_id: DriverId,
         page_size: u32,
         _timeout: Duration,
-        in_flight: Option<Arc<std::sync::atomic::AtomicBool>>,
+        rt_handle: &tokio::runtime::Handle,
         submit_tx: Option<crossbeam::channel::Sender<PendingRequest>>,
         stats_for_probe: Option<Arc<SchedulerStats>>,
         chain_pool: Option<Arc<super::speculator::ChainExtPool>>,
@@ -1600,16 +1588,16 @@ impl BatchScheduler {
         }
         let batch_build_us = build_start.elapsed().as_micros() as u64;
 
-        // Send via driver service (typed call handles serialization + timeout)
+        // Send via driver service (typed call handles serialization + timeout).
+        // Sync call: parks on a futex inside the channel's response
+        // slot. This is the entire reason `execute_batch` used to be
+        // `async` — the prior `fire_batch().await` bottomed out in
+        // `block_in_place(submit_sync_for_state)` with no actual
+        // suspension points. Since the scheduler is the only firer,
+        // there's also no in-flight gate to release.
         let driver_fire_start = Instant::now();
-        let result = driver::fire_batch(driver_idx, batch_req).await;
+        let result = driver::fire_batch_sync(driver_idx, batch_req);
         let driver_fire_us = driver_fire_start.elapsed().as_micros() as u64;
-        // Release the in-flight gate so the main scheduler loop can fire
-        // the next batch immediately (mirrors prior tokio Semaphore
-        // permit drop). Mid-execute_batch, before response_dispatch.
-        if let Some(ref flag) = in_flight {
-            flag.store(false, std::sync::atomic::Ordering::Release);
-        }
 
         let response_start = Instant::now();
         match result {
@@ -1768,8 +1756,12 @@ impl BatchScheduler {
                     if !deferred_drop.is_empty() {
                         // Dedicated blocking pool so the chain-extender
                         // wake-up wave doesn't compete with this dealloc
-                        // task for a worker thread.
-                        tokio::task::spawn_blocking(move || drop(deferred_drop));
+                        // task for a worker thread. Use the captured
+                        // `rt_handle` because we're now on the scheduler
+                        // OS thread, not a tokio task — `tokio::task::
+                        // spawn_blocking` would panic without an ambient
+                        // runtime context.
+                        rt_handle.spawn_blocking(move || drop(deferred_drop));
                     }
                 }
             }

@@ -124,6 +124,15 @@ pub trait DriverChannel: Send + Sync {
     /// Submit a request and resolve with the typed response.
     async fn submit(&self, req: DriverRequest) -> Result<DriverResponse>;
 
+    /// Synchronous submit. Used by the hot fire path, which runs on a
+    /// dedicated OS thread (the batch scheduler loop) — calling the
+    /// async `submit` from there would require either `block_on` or
+    /// dragging tokio's runtime onto the scheduler thread. Every
+    /// production impl already has a sync inner (`submit_sync_for_state`,
+    /// `submit_blocking`, `roundtrip_sync`); this is the trait-level
+    /// entry point.
+    fn submit_sync(&self, req: DriverRequest) -> Result<DriverResponse>;
+
     /// Fire-and-forget submission. The driver still processes the
     /// request; the caller doesn't wait for the response. Errors at
     /// enqueue time (channel closed) are returned synchronously.
@@ -136,7 +145,8 @@ pub trait DriverChannel: Send + Sync {
 }
 
 pub use channel::{
-    abort_all_driver_channels, fire_batch, get_spec, install_channel, install_spec, register_driver,
+    abort_all_driver_channels, fire_batch, fire_batch_sync, get_spec, install_channel,
+    install_spec, register_driver,
 };
 pub use inproc::{InProcChannel, InProcVTable};
 pub use inproc_polling::InProcPollingChannel;

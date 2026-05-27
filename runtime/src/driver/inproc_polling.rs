@@ -530,6 +530,10 @@ impl DriverChannel for InProcPollingChannel {
         }
     }
 
+    fn submit_sync(&self, req: DriverRequest) -> Result<DriverResponse> {
+        self.submit_blocking(req)
+    }
+
     fn notify(&self, req: DriverRequest) -> Result<()> {
         self.state.enqueue(req, false).map(|_| ())
     }

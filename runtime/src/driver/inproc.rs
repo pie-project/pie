@@ -286,6 +286,10 @@ impl DriverChannel for InProcChannel {
         }
     }
 
+    fn submit_sync(&self, req: DriverRequest) -> Result<DriverResponse> {
+        Self::submit_sync_for_state(&self.state, req)
+    }
+
     fn notify(&self, req: DriverRequest) -> Result<()> {
         if self.state.aborted.load(Ordering::Acquire) {
             return Err(anyhow!("InProcChannel aborted"));

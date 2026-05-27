@@ -218,9 +218,8 @@ fn status_response(status: i32) -> DriverResponse {
     }
 }
 
-#[async_trait]
-impl DriverChannel for MockChannel {
-    async fn submit(&self, req: DriverRequest) -> Result<DriverResponse> {
+impl MockChannel {
+    fn submit_impl(&self, req: DriverRequest) -> Result<DriverResponse> {
         if *self.aborted.lock().unwrap() {
             anyhow::bail!("mock channel {}: aborted", self.device_idx);
         }
@@ -243,6 +242,17 @@ impl DriverChannel for MockChannel {
             | pie_bridge::RequestPayload::Adapter(_)
             | pie_bridge::RequestPayload::Health => Ok(status_response(0)),
         }
+    }
+}
+
+#[async_trait]
+impl DriverChannel for MockChannel {
+    async fn submit(&self, req: DriverRequest) -> Result<DriverResponse> {
+        self.submit_impl(req)
+    }
+
+    fn submit_sync(&self, req: DriverRequest) -> Result<DriverResponse> {
+        self.submit_impl(req)
     }
 
     fn notify(&self, _req: DriverRequest) -> Result<()> {

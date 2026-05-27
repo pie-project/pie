@@ -111,6 +111,29 @@ pub async fn fire_batch(
     }
 }
 
+/// Synchronous sibling of [`fire_batch`]. Used by the per-driver
+/// scheduler loop, which runs on a dedicated OS thread (not a tokio
+/// task) and so doesn't have an async context to `.await` in. Every
+/// production `DriverChannel` already has a sync inner; this just
+/// routes through the trait's `submit_sync`.
+pub fn fire_batch_sync(
+    driver_idx: DriverId,
+    req: pie_bridge::ForwardRequest,
+) -> Result<ForwardResponse> {
+    let ch = get_channel(driver_idx)?;
+    let resp = ch.submit_sync(DriverRequest {
+        driver_id: driver_idx,
+        payload: RequestPayload::Forward(req),
+    })?;
+    match resp.payload {
+        ResponsePayload::Forward(r) => Ok(r),
+        ResponsePayload::Status(s) => Err(anyhow!(
+            "fire_batch_sync: driver returned cold-path status {} (driver bug)",
+            s.status,
+        )),
+    }
+}
+
 /// Abort every active driver channel. Called by the supervisor when it
 /// observes a driver exit.
 pub fn abort_all_driver_channels() {

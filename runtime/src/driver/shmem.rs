@@ -139,6 +139,10 @@ impl DriverChannel for ShmemChannel {
         tokio::task::block_in_place(|| self.roundtrip_sync(req))
     }
 
+    fn submit_sync(&self, req: DriverRequest) -> Result<DriverResponse> {
+        self.roundtrip_sync(req)
+    }
+
     fn notify(&self, req: DriverRequest) -> Result<()> {
         let _ = self.roundtrip_sync(req)?;
         Ok(())
