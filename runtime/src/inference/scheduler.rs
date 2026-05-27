@@ -162,6 +162,14 @@ enum Completion {
         continuation: ChunkContinuation,
         sampler_slots: Vec<usize>,
     },
+    /// Self-perpetuating speculation chain. The dispatch loop routes
+    /// these to the per-driver `ChainExtPool` instead of waking 256
+    /// individual per-context tokio tasks; the pool worker then forwards
+    /// this fire's output to `state.response` and submits the next stage
+    /// (if eligible) via `state.scheduler_handle`.
+    Chain {
+        state: Box<super::speculator::ChainState>,
+    },
 }
 
 impl PendingRequest {
@@ -982,6 +990,25 @@ impl SchedulerHandle {
         ))?;
         Ok(())
     }
+
+    /// Submit a forward pass that participates in a speculation chain.
+    /// The dispatch loop routes the output to the per-driver pool worker
+    /// instead of waking a dedicated chain-extender task.
+    pub fn submit_chain(
+        &self,
+        request: pie_bridge::ForwardRequest,
+        state: Box<super::speculator::ChainState>,
+        physical_page_ids: Vec<PhysicalPageId>,
+        last_page_len: u32,
+    ) -> Result<()> {
+        self.tx.send(PendingRequest {
+            request,
+            completion: Completion::Chain { state },
+            physical_page_ids,
+            last_page_len,
+        })?;
+        Ok(())
+    }
 }
 
 // =============================================================================
@@ -995,7 +1022,15 @@ impl SchedulerHandle {
 pub(crate) struct BatchScheduler {
     tx: mpsc::UnboundedSender<PendingRequest>,
     stats: Arc<SchedulerStats>,
+    chain_pool: Arc<super::speculator::ChainExtPool>,
 }
+
+/// Default size of the chain-extender pool per driver. Empirically
+/// optimal at conc=256 decode on Qwen3-0.6B (sweep done 2026-05-27):
+/// 8/16 are too few (long serial tail per worker), 64/128 add wake
+/// overhead with diminishing returns, 32 hits the sweet spot near the
+/// tokio runtime's ~30-worker parallelism.
+const CHAIN_EXT_POOL_SIZE: usize = 32;
 
 impl BatchScheduler {
     /// Spawn a new batch scheduler for a single driver.
@@ -1013,6 +1048,7 @@ impl BatchScheduler {
         let (tx, rx) = mpsc::unbounded_channel();
         let submit_tx = tx.downgrade();
         let stats = Arc::new(SchedulerStats::default());
+        let chain_pool = Arc::new(super::speculator::ChainExtPool::new(CHAIN_EXT_POOL_SIZE));
         tokio::spawn(Self::run(
             driver_id,
             driver_idx,
@@ -1023,9 +1059,17 @@ impl BatchScheduler {
             request_timeout_secs,
             batch_policy,
             stats.clone(),
+            chain_pool.clone(),
         ));
 
-        Self { tx, stats }
+        Self { tx, stats, chain_pool }
+    }
+
+    /// Get the chain extender pool handle. Cold submits use this to
+    /// route the first fire's output through the pool instead of spawning
+    /// a per-context chain-extender task.
+    pub fn chain_pool(&self) -> Arc<super::speculator::ChainExtPool> {
+        self.chain_pool.clone()
     }
 
     /// Get a handle to the cumulative scheduler stats (lock-free).
@@ -1073,6 +1117,7 @@ impl BatchScheduler {
         request_timeout_secs: u64,
         batch_policy: String,
         stats: Arc<SchedulerStats>,
+        chain_pool: Arc<super::speculator::ChainExtPool>,
     ) {
         let request_timeout = Duration::from_secs(request_timeout_secs);
 
@@ -1263,6 +1308,7 @@ impl BatchScheduler {
                     let submit_tx_clone = submit_tx.clone();
 
                     let stats_for_probe = stats_clone.clone();
+                    let chain_pool_clone = chain_pool.clone();
                     tokio::spawn(async move {
                         let start = Instant::now();
                         let timing = Self::execute_batch(
@@ -1274,6 +1320,7 @@ impl BatchScheduler {
                             Some(permit),
                             Some(submit_tx_clone),
                             Some(stats_for_probe),
+                            Some(chain_pool_clone),
                         )
                         .await;
                         let latency = start.elapsed();
@@ -1412,6 +1459,7 @@ impl BatchScheduler {
                 None,
                 None,
                 None,
+                None,
             )
             .await;
         }
@@ -1427,6 +1475,7 @@ impl BatchScheduler {
         mut permit: Option<OwnedSemaphorePermit>,
         submit_tx: Option<mpsc::WeakUnboundedSender<PendingRequest>>,
         stats_for_probe: Option<Arc<SchedulerStats>>,
+        chain_pool: Option<Arc<super::speculator::ChainExtPool>>,
     ) -> BatchExecutionTiming {
         let batch_start = Instant::now();
         let build_start = Instant::now();
@@ -1570,6 +1619,17 @@ impl BatchScheduler {
                                     };
                                     req.send_result(Ok(output), submit_tx.as_ref(), page_size);
                                 }
+                                Completion::Chain { state } => {
+                                    if let Some(pool) = chain_pool.as_ref() {
+                                        let ctx_id = state.prev_request.context_ids
+                                            .first().copied().unwrap_or(0);
+                                        pool.submit(ctx_id, super::speculator::ChainExtJob {
+                                            state,
+                                            output: Ok(output),
+                                        });
+                                    }
+                                    deferred_drop.push((request, physical_page_ids));
+                                }
                             }
                         }
                     } else {
@@ -1607,6 +1667,17 @@ impl BatchScheduler {
                                         last_page_len: 0,
                                     };
                                     req.send_result(Ok(output), submit_tx.as_ref(), page_size);
+                                }
+                                Completion::Chain { state } => {
+                                    if let Some(pool) = chain_pool.as_ref() {
+                                        let ctx_id = state.prev_request.context_ids
+                                            .first().copied().unwrap_or(0);
+                                        pool.submit(ctx_id, super::speculator::ChainExtJob {
+                                            state,
+                                            output: Ok(output),
+                                        });
+                                    }
+                                    deferred_drop.push((request, physical_page_ids));
                                 }
                             }
                         }

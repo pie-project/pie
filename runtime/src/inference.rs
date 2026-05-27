@@ -494,7 +494,6 @@ impl ServiceHandler for InferenceService {
 
                 let scheduler_handle = self.schedulers[idx].handle();
                 let staged_batch_arc = self.staged_batch[idx].clone();
-                let request_clone = request.clone();
                 let speculation_depth = if allow_pass_speculation {
                     self.speculation_depth
                 } else {
@@ -514,28 +513,20 @@ impl ServiceHandler for InferenceService {
                     return;
                 }
 
-                // No hit: cold submit + start a fresh chain.
-                let (sched_tx, sched_rx) = oneshot::channel();
-                if let Err(e) = self.schedulers[idx].submit(
-                    request,
-                    sched_tx,
-                    physical_page_ids.clone(),
-                    last_page_len,
-                ) {
-                    tracing::error!("submit failed: {e}");
-                    return;
-                }
+                // No hit: cold submit + start a fresh chain. The pool's
+                // dispatch-side hook will route this fire's output to a
+                // pool worker; no per-context task is spawned here.
                 let cur_page_idx =
                     active_page_idx.unwrap_or_else(|| physical_page_ids.len().saturating_sub(1));
-                let mut all_pages = physical_page_ids;
+                let mut all_pages = physical_page_ids.clone();
                 all_pages.extend(extra_pages);
-                speculator::spawn_extend_chain(
-                    sched_rx,
+                speculator::start_chain(
                     response,
                     scheduler_handle,
                     staged_batch_arc,
                     self.model_idx,
-                    request_clone,
+                    request,
+                    physical_page_ids,
                     all_pages,
                     cur_page_idx,
                     last_page_len,
