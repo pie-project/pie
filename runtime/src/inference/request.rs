@@ -221,16 +221,75 @@ impl TrimPlan {
 /// push the rolling totals. `single_token_mode` starts at `true`; the
 /// first per-request append that needs `custom_mask` flips it to false.
 pub fn new_batched_forward_request() -> pie_bridge::ForwardRequest {
+    new_batched_forward_request_with_capacity(0)
+}
+
+/// Same as [`new_batched_forward_request`] but pre-allocates Vec
+/// capacities based on an expected request count, eliminating
+/// per-append reallocations during `batch_build_us`. Pass 0 if you
+/// don't know.
+pub fn new_batched_forward_request_with_capacity(n_requests: usize) -> pie_bridge::ForwardRequest {
+    // Per-request indptrs grow by exactly 1 entry. Pages, tokens,
+    // samplers grow by at most a small multiple per request; the
+    // estimates here are upper bounds for typical decode/prefill
+    // shapes (page_size 16, ≤16 input tokens, ≤32 pages per req).
+    let indptr_cap = n_requests + 1;
+    let req_cap = n_requests;
+    let token_cap = n_requests.saturating_mul(16);
+    let page_cap = n_requests.saturating_mul(32);
     pie_bridge::ForwardRequest {
-        kv_page_indptr: vec![0],
-        qo_indptr: vec![0],
-        mask_indptr: vec![0],
-        logit_mask_indptr: vec![0],
-        sampling_indptr: vec![0],
-        sampler_indptr: vec![0],
-        spec_indptr: vec![0],
+        token_ids: Vec::with_capacity(token_cap),
+        position_ids: Vec::with_capacity(token_cap),
+        kv_page_indices: Vec::with_capacity(page_cap),
+        kv_page_indptr: {
+            let mut v = Vec::with_capacity(indptr_cap);
+            v.push(0);
+            v
+        },
+        kv_last_page_lens: Vec::with_capacity(req_cap),
+        qo_indptr: {
+            let mut v = Vec::with_capacity(indptr_cap);
+            v.push(0);
+            v
+        },
+        rs_slot_ids: Vec::with_capacity(req_cap),
+        rs_slot_flags: Vec::with_capacity(req_cap),
+        masks: Vec::new(),
+        mask_indptr: {
+            let mut v = Vec::with_capacity(indptr_cap);
+            v.push(0);
+            v
+        },
+        logit_masks: Vec::new(),
+        logit_mask_indptr: {
+            let mut v = Vec::with_capacity(indptr_cap);
+            v.push(0);
+            v
+        },
+        sampling_indices: Vec::with_capacity(req_cap),
+        sampling_indptr: {
+            let mut v = Vec::with_capacity(indptr_cap);
+            v.push(0);
+            v
+        },
+        samplers: Vec::with_capacity(req_cap),
+        sampler_indptr: {
+            let mut v = Vec::with_capacity(indptr_cap);
+            v.push(0);
+            v
+        },
+        adapter_bindings: Vec::with_capacity(req_cap),
+        spec_token_ids: Vec::new(),
+        spec_position_ids: Vec::new(),
+        spec_indptr: {
+            let mut v = Vec::with_capacity(indptr_cap);
+            v.push(0);
+            v
+        },
+        output_spec_flags: Vec::with_capacity(req_cap),
+        context_ids: Vec::with_capacity(req_cap),
         single_token_mode: true,
-        ..Default::default()
+        has_user_mask: false,
     }
 }
 

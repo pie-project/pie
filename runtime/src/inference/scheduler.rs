@@ -1326,10 +1326,18 @@ impl BatchScheduler {
     ) -> BatchExecutionTiming {
         let batch_start = Instant::now();
         let build_start = Instant::now();
-        let system_spec_proposed_per_req: Vec<usize> = requests
-            .iter()
-            .map(|req| req.request.spec_token_ids.len())
-            .collect();
+        // Detect if ANY request carries system spec drafts. The
+        // common case (256-conc decode) has none, so we skip the
+        // per-request Vec build + position-histogram loop.
+        let any_spec = requests.iter().any(|req| !req.request.spec_token_ids.is_empty());
+        let system_spec_proposed_per_req: Vec<usize> = if any_spec {
+            requests
+                .iter()
+                .map(|req| req.request.spec_token_ids.len())
+                .collect()
+        } else {
+            Vec::new()
+        };
         let system_spec_draft_tokens_proposed =
             system_spec_proposed_per_req.iter().sum::<usize>() as u64;
         let mut system_spec_draft_tokens_accepted = 0u64;
@@ -1337,9 +1345,11 @@ impl BatchScheduler {
             [0u64; SYSTEM_SPEC_DRAFT_POS_BUCKETS];
         let mut system_spec_draft_tokens_accepted_per_pos =
             [0u64; SYSTEM_SPEC_DRAFT_POS_BUCKETS];
-        for proposed in &system_spec_proposed_per_req {
-            for pos in 0..(*proposed).min(SYSTEM_SPEC_DRAFT_POS_BUCKETS) {
-                system_spec_draft_tokens_proposed_per_pos[pos] += 1;
+        if any_spec {
+            for proposed in &system_spec_proposed_per_req {
+                for pos in 0..(*proposed).min(SYSTEM_SPEC_DRAFT_POS_BUCKETS) {
+                    system_spec_draft_tokens_proposed_per_pos[pos] += 1;
+                }
             }
         }
 
@@ -1351,7 +1361,7 @@ impl BatchScheduler {
                 && req.request.token_ids.len() <= 1
                 && req.request.spec_token_ids.is_empty()
         });
-        let mut batch_req = request::new_batched_forward_request();
+        let mut batch_req = request::new_batched_forward_request_with_capacity(requests.len());
         for req in &requests {
             request::append_request_with_options(
                 &mut batch_req,
@@ -1498,7 +1508,10 @@ impl BatchScheduler {
                         }
                     }
                     if !deferred_drop.is_empty() {
-                        tokio::spawn(async move { drop(deferred_drop); });
+                        // Dedicated blocking pool so the chain-extender
+                        // wake-up wave doesn't compete with this dealloc
+                        // task for a worker thread.
+                        tokio::task::spawn_blocking(move || drop(deferred_drop));
                     }
                 }
             }
