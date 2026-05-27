@@ -969,9 +969,14 @@ mod tests {
 /// Cloneable submit handle. Used by the speculator's chain extender
 /// (spawned outside the scheduler's `run` loop) to resubmit
 /// pre-staged forward passes.
+///
+/// Backed by a sync crossbeam_channel rather than tokio mpsc so the
+/// receiving main loop (sync OS thread) can recv with futex-level
+/// wake latency (~5-15 µs) instead of tokio's task-wake roundtrip
+/// (~100-200 µs).
 #[derive(Clone)]
 pub(crate) struct SchedulerHandle {
-    tx: mpsc::UnboundedSender<PendingRequest>,
+    tx: crossbeam::channel::Sender<PendingRequest>,
 }
 
 impl SchedulerHandle {
@@ -982,12 +987,14 @@ impl SchedulerHandle {
         physical_page_ids: Vec<PhysicalPageId>,
         last_page_len: u32,
     ) -> Result<()> {
-        self.tx.send(PendingRequest::direct(
-            request,
-            response_tx,
-            physical_page_ids,
-            last_page_len,
-        ))?;
+        self.tx
+            .send(PendingRequest::direct(
+                request,
+                response_tx,
+                physical_page_ids,
+                last_page_len,
+            ))
+            .map_err(|_| anyhow::anyhow!("scheduler channel closed"))?;
         Ok(())
     }
 
@@ -1001,12 +1008,14 @@ impl SchedulerHandle {
         physical_page_ids: Vec<PhysicalPageId>,
         last_page_len: u32,
     ) -> Result<()> {
-        self.tx.send(PendingRequest {
-            request,
-            completion: Completion::Chain { state },
-            physical_page_ids,
-            last_page_len,
-        })?;
+        self.tx
+            .send(PendingRequest {
+                request,
+                completion: Completion::Chain { state },
+                physical_page_ids,
+                last_page_len,
+            })
+            .map_err(|_| anyhow::anyhow!("scheduler channel closed"))?;
         Ok(())
     }
 }
@@ -1020,7 +1029,7 @@ impl SchedulerHandle {
 /// Owns an RPC client, a scheduling policy, and a tokio task that
 /// runs the batch accumulation and firing loop.
 pub(crate) struct BatchScheduler {
-    tx: mpsc::UnboundedSender<PendingRequest>,
+    tx: crossbeam::channel::Sender<PendingRequest>,
     stats: Arc<SchedulerStats>,
     chain_pool: Arc<super::speculator::ChainExtPool>,
 }
@@ -1046,47 +1055,39 @@ impl BatchScheduler {
         request_timeout_secs: u64,
         batch_policy: String,
     ) -> Self {
-        let (tx, rx) = mpsc::unbounded_channel();
-        let submit_tx = tx.downgrade();
+        let (tx, rx) = crossbeam::channel::unbounded::<PendingRequest>();
+        let submit_tx = tx.clone();
         let stats = Arc::new(SchedulerStats::default());
         let chain_pool = Arc::new(super::speculator::ChainExtPool::new(CHAIN_EXT_POOL_SIZE));
 
-        // Run the main scheduling loop on a dedicated single-thread tokio
-        // runtime, separate from the shared multi-thread runtime that the
-        // chain-ext pool and execute_batch tasks live on. Why: at conc=256
-        // the main loop wakes after every chain-ext submit batch and that
-        // wake has to walk the shared runtime's scheduler, contending with
-        // 30+ chain-ext pool tasks waking simultaneously. With a dedicated
-        // single-worker runtime, the main loop's waker has its own queue
-        // and worker — wake-pickup latency drops by ~100-200 µs per fire.
-        let main_rt_handle = tokio::runtime::Handle::current();
+        // Run the main scheduling loop on a dedicated OS thread with
+        // crossbeam channels. Why: tokio's mpsc/select! wake-pickup
+        // path takes ~100-200 µs because the receiver's waker has to be
+        // scheduled onto a runtime worker. crossbeam's recv/select uses
+        // futex parking directly — wake latency drops to ~5-15 µs.
+        // execute_batch tasks still spawn on the shared tokio runtime
+        // (captured via Handle) so they keep multi-worker parallelism
+        // for the GPU/IPC and response dispatch.
+        let rt_handle = tokio::runtime::Handle::current();
         let stats_for_loop = stats.clone();
         let chain_pool_for_loop = chain_pool.clone();
         let batch_policy_for_loop = batch_policy.clone();
         std::thread::Builder::new()
             .name(format!("pie-sched-{driver_idx}"))
             .spawn(move || {
-                let local_rt = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .thread_name(format!("pie-sched-{driver_idx}-rt"))
-                    .build()
-                    .expect("build pie-sched local runtime");
-                local_rt.block_on(async move {
-                    let _guard = main_rt_handle.enter();
-                    Self::run(
-                        driver_id,
-                        driver_idx,
-                        rx,
-                        submit_tx,
-                        page_size,
-                        limits,
-                        request_timeout_secs,
-                        batch_policy_for_loop,
-                        stats_for_loop,
-                        chain_pool_for_loop,
-                    )
-                    .await;
-                });
+                Self::run(
+                    driver_id,
+                    driver_idx,
+                    rx,
+                    submit_tx,
+                    page_size,
+                    limits,
+                    request_timeout_secs,
+                    batch_policy_for_loop,
+                    stats_for_loop,
+                    chain_pool_for_loop,
+                    rt_handle,
+                );
             })
             .expect("spawn pie-sched thread");
 
@@ -1113,12 +1114,14 @@ impl BatchScheduler {
         physical_page_ids: Vec<PhysicalPageId>,
         last_page_len: u32,
     ) -> Result<()> {
-        self.tx.send(PendingRequest::direct(
-            request,
-            response_tx,
-            physical_page_ids,
-            last_page_len,
-        ))?;
+        self.tx
+            .send(PendingRequest::direct(
+                request,
+                response_tx,
+                physical_page_ids,
+                last_page_len,
+            ))
+            .map_err(|_| anyhow::anyhow!("scheduler channel closed"))?;
         Ok(())
     }
 
@@ -1134,18 +1137,20 @@ impl BatchScheduler {
     // Internal: Scheduling Loop
     // =========================================================================
 
-    /// Main scheduling loop for a single driver.
-    async fn run(
+    /// Main scheduling loop for a single driver. Sync OS thread —
+    /// recv/select use futex parking (no tokio waker overhead).
+    fn run(
         driver_id: DriverId,
         driver_idx: usize,
-        mut req_rx: mpsc::UnboundedReceiver<PendingRequest>,
-        submit_tx: mpsc::WeakUnboundedSender<PendingRequest>,
+        req_rx: crossbeam::channel::Receiver<PendingRequest>,
+        submit_tx: crossbeam::channel::Sender<PendingRequest>,
         page_size: u32,
         limits: SchedulerLimits,
         request_timeout_secs: u64,
         batch_policy: String,
         stats: Arc<SchedulerStats>,
         chain_pool: Arc<super::speculator::ChainExtPool>,
+        rt_handle: tokio::runtime::Handle,
     ) {
         let request_timeout = Duration::from_secs(request_timeout_secs);
 
@@ -1164,10 +1169,14 @@ impl BatchScheduler {
             ),
         };
         // Only one in-flight batch at a time to prevent pipelined KV cache corruption.
-        let in_flight = Arc::new(Semaphore::new(1));
+        // AtomicBool gate: set true on Fire, cleared by execute_batch task
+        // after driver_fire returns (mirrors permit drop in the prior
+        // tokio Semaphore design).
+        use std::sync::atomic::AtomicBool;
+        let in_flight = Arc::new(AtomicBool::new(false));
 
         // Channel for batch completion latency feedback to the policy.
-        let (latency_tx, mut latency_rx) = mpsc::unbounded_channel::<Duration>();
+        let (latency_tx, latency_rx) = crossbeam::channel::unbounded::<Duration>();
         let mut next_pending: Option<PendingRequest> = None;
 
         'run_loop: loop {
@@ -1176,34 +1185,16 @@ impl BatchScheduler {
                 policy.on_complete(latency);
             }
 
-            // Wait for first request if batch is empty. The main loop
-            // runs on a dedicated single-thread runtime, so a tight
-            // try_recv + yield_now loop here doesn't deprive other work
-            // of CPU — it just avoids the ~100-200 µs park→wake
-            // roundtrip that mpsc::recv().await would otherwise pay
-            // between fires.
+            // Wait for first request if batch is empty. crossbeam's
+            // recv() parks via futex — far lower wake latency than
+            // tokio's mpsc waker path.
             while batch.is_empty() {
                 let pending = if let Some(pending) = next_pending.take() {
                     pending
                 } else {
-                    let mut got: Option<PendingRequest> = None;
-                    loop {
-                        match req_rx.try_recv() {
-                            Ok(p) => {
-                                got = Some(p);
-                                break;
-                            }
-                            Err(mpsc::error::TryRecvError::Empty) => {
-                                tokio::task::yield_now().await;
-                            }
-                            Err(mpsc::error::TryRecvError::Disconnected) => {
-                                break;
-                            }
-                        }
-                    }
-                    match got {
-                        Some(p) => p,
-                        None => break 'run_loop,
+                    match req_rx.recv() {
+                        Ok(p) => p,
+                        Err(_) => break 'run_loop,
                     }
                 };
                 let Some(pending) = prepare_pending_for_batch(&batch, pending) else {
@@ -1219,8 +1210,12 @@ impl BatchScheduler {
             // request's response channel.
             let accum_start = Instant::now();
             while next_pending.is_none() {
-                let Ok(pending) = req_rx.try_recv() else {
-                    break;
+                let pending = match req_rx.try_recv() {
+                    Ok(p) => p,
+                    Err(crossbeam::channel::TryRecvError::Empty) => break,
+                    Err(crossbeam::channel::TryRecvError::Disconnected) => {
+                        break 'run_loop;
+                    }
                 };
                 let Some((pending, usage)) = prepare_pending_with_usage(&batch, pending)
                 else {
@@ -1260,14 +1255,25 @@ impl BatchScheduler {
             };
             match decision {
                 Decision::Fire => {
-                    // Acquire a permit (may wait if at in-flight limit).
+                    // Acquire the in-flight gate. AdaptivePolicy already
+                    // gates on this (returns Wait while in_flight=true),
+                    // so the CAS should usually succeed on first try. The
+                    // spin loop is defensive in case the policy is greedy
+                    // or there's a race.
                     let permit_wait_start = Instant::now();
-                    let permit = in_flight
-                        .clone()
-                        .acquire_owned()
-                        .await
-                        .expect("semaphore closed");
-                    let permit_wait_us = permit_wait_start.elapsed().as_micros() as u64;
+                    while in_flight
+                        .compare_exchange(
+                            false,
+                            true,
+                            std::sync::atomic::Ordering::AcqRel,
+                            std::sync::atomic::Ordering::Acquire,
+                        )
+                        .is_err()
+                    {
+                        std::thread::yield_now();
+                    }
+                    let permit_wait_us =
+                        permit_wait_start.elapsed().as_micros() as u64;
 
                     // The policy may decide to fire while the previous GPU
                     // batch is still in flight. Do one last non-blocking
@@ -1349,7 +1355,11 @@ impl BatchScheduler {
                             .fetch_add(now_us.saturating_sub(last_dispatch_end), Relaxed);
                     }
 
-                    // Spawn batch execution
+                    // Spawn batch execution on the shared multi-thread
+                    // tokio runtime (captured rt_handle). The async task
+                    // clears `in_flight` itself when its driver_fire
+                    // returns, mirroring the prior tokio Semaphore permit
+                    // drop semantics.
                     let latency_tx_clone = latency_tx.clone();
                     let stats_clone = stats.clone();
                     let timeout = request_timeout;
@@ -1357,7 +1367,8 @@ impl BatchScheduler {
 
                     let stats_for_probe = stats_clone.clone();
                     let chain_pool_clone = chain_pool.clone();
-                    tokio::spawn(async move {
+                    let in_flight_clone = in_flight.clone();
+                    rt_handle.spawn(async move {
                         let start = Instant::now();
                         let timing = Self::execute_batch(
                             driver_idx,
@@ -1365,14 +1376,14 @@ impl BatchScheduler {
                             driver_id,
                             page_size,
                             timeout,
-                            Some(permit),
+                            Some(in_flight_clone),
                             Some(submit_tx_clone),
                             Some(stats_for_probe),
                             Some(chain_pool_clone),
                         )
                         .await;
                         let latency = start.elapsed();
-                        latency_tx_clone.send(latency).ok();
+                        let _ = latency_tx_clone.send(latency);
 
                         // Advance market clock for this driver: prices, rent, dividends.
                         // Pass batch context IDs so tick only charges contexts
@@ -1456,49 +1467,53 @@ impl BatchScheduler {
                     });
                 }
                 Decision::Wait(wait_duration) => {
-                    tokio::select! {
-                        _ = tokio::time::sleep(wait_duration) => {},
-                        maybe_req = req_rx.recv() => {
-                            if let Some(pending) = maybe_req {
-                                let Some(pending) = prepare_pending_for_batch(&batch, pending) else {
-                                    continue;
-                                };
-                                if batch.would_exceed(&pending) {
-                                    if scheduler_trace_enabled() {
-                                        let reason = batch
-                                            .would_exceed_reason(&pending)
-                                            .unwrap_or_else(|| "unknown".to_string());
-                                        eprintln!(
-                                            "[pie-sched-trace] driver={} stash current_requests={} current_tokens={} reason={}",
-                                            driver_idx,
-                                            batch.len(),
-                                            batch.total_tokens(),
-                                            reason,
-                                        );
+                    crossbeam::channel::select! {
+                        recv(req_rx) -> maybe_req => {
+                            match maybe_req {
+                                Ok(pending) => {
+                                    let Some(pending) = prepare_pending_for_batch(&batch, pending)
+                                    else {
+                                        continue;
+                                    };
+                                    if batch.would_exceed(&pending) {
+                                        if scheduler_trace_enabled() {
+                                            let reason = batch
+                                                .would_exceed_reason(&pending)
+                                                .unwrap_or_else(|| "unknown".to_string());
+                                            eprintln!(
+                                                "[pie-sched-trace] driver={} stash current_requests={} current_tokens={} reason={}",
+                                                driver_idx,
+                                                batch.len(),
+                                                batch.total_tokens(),
+                                                reason,
+                                            );
+                                        }
+                                        next_pending = Some(pending);
+                                        continue;
                                     }
-                                    next_pending = Some(pending);
-                                    continue;
+                                    policy.on_arrival();
+                                    batch.push(pending);
                                 }
-                                policy.on_arrival();
-                                batch.push(pending);
-                            } else {
-                                break; // channel closed
+                                Err(_) => break 'run_loop, // channel closed
                             }
-                        },
-                        latency = latency_rx.recv() => {
-                            if let Some(l) = latency {
+                        }
+                        recv(latency_rx) -> latency => {
+                            if let Ok(l) = latency {
                                 policy.on_complete(l);
                             }
-                        },
+                        }
+                        default(wait_duration) => {}
                     }
                 }
             }
         }
 
-        // Shutdown: fire remaining batch
+        // Shutdown: fire remaining batch on the shared runtime and let
+        // it complete in the background. The scheduler thread itself is
+        // exiting; we don't wait for the final fire to finish.
         if !batch.is_empty() {
             let requests = batch.take();
-            Self::execute_batch(
+            let _ = rt_handle.spawn(Self::execute_batch(
                 driver_idx,
                 requests,
                 driver_id,
@@ -1508,8 +1523,7 @@ impl BatchScheduler {
                 None,
                 None,
                 None,
-            )
-            .await;
+            ));
         }
     }
 
@@ -1520,8 +1534,8 @@ impl BatchScheduler {
         driver_id: DriverId,
         page_size: u32,
         _timeout: Duration,
-        mut permit: Option<OwnedSemaphorePermit>,
-        submit_tx: Option<mpsc::WeakUnboundedSender<PendingRequest>>,
+        in_flight: Option<Arc<std::sync::atomic::AtomicBool>>,
+        submit_tx: Option<crossbeam::channel::Sender<PendingRequest>>,
         stats_for_probe: Option<Arc<SchedulerStats>>,
         chain_pool: Option<Arc<super::speculator::ChainExtPool>>,
     ) -> BatchExecutionTiming {
@@ -1579,7 +1593,12 @@ impl BatchScheduler {
         let driver_fire_start = Instant::now();
         let result = driver::fire_batch(driver_idx, batch_req).await;
         let driver_fire_us = driver_fire_start.elapsed().as_micros() as u64;
-        drop(permit.take());
+        // Release the in-flight gate so the main scheduler loop can fire
+        // the next batch immediately (mirrors prior tokio Semaphore
+        // permit drop). Mid-execute_batch, before response_dispatch.
+        if let Some(ref flag) = in_flight {
+            flag.store(false, std::sync::atomic::Ordering::Release);
+        }
 
         let response_start = Instant::now();
         match result {

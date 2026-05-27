@@ -128,7 +128,7 @@ impl PendingRequest {
     pub(super) fn send_result<T>(
         self,
         result: Result<T>,
-        submit_tx: Option<&mpsc::WeakUnboundedSender<PendingRequest>>,
+        submit_tx: Option<&crossbeam::channel::Sender<PendingRequest>>,
         page_size: u32,
     ) where
         T: Into<ForwardOutput>,
@@ -184,7 +184,7 @@ impl ChunkContinuation {
         resp: pie_bridge::ForwardResponse,
         chunk_samplers: Vec<pie_bridge::Sampler>,
         chunk_sampler_slots: Vec<usize>,
-        submit_tx: Option<&mpsc::WeakUnboundedSender<PendingRequest>>,
+        submit_tx: Option<&crossbeam::channel::Sender<PendingRequest>>,
         page_size: u32,
     ) {
         if let Err(msg) =
@@ -213,7 +213,7 @@ impl ChunkContinuation {
             return;
         }
 
-        let Some(submit_tx) = submit_tx.and_then(mpsc::WeakUnboundedSender::upgrade) else {
+        let Some(submit_tx) = submit_tx else {
             self.response_tx
                 .send(Err(anyhow::anyhow!(
                     "chunked prefill continuation could not be requeued: scheduler shutting down"
@@ -1390,8 +1390,8 @@ mod tests {
         assert_eq!(first.request.sampling_indices, vec![1]);
         assert_eq!(chunk_sampler_slots(&first), &[1]);
 
-        let (submit_tx, mut submit_rx) = mpsc::unbounded_channel();
-        let weak_submit_tx = submit_tx.downgrade();
+        let (submit_tx, submit_rx) = crossbeam::channel::unbounded();
+        let weak_submit_tx = submit_tx.clone();
         first.send_result(Ok(token_response(11)), Some(&weak_submit_tx), 4);
 
         let second = submit_rx.try_recv().expect("second chunk");
@@ -1727,8 +1727,8 @@ mod tests {
             Ok(p) => p,
             Err((_, msg)) => panic!("{msg}"),
         };
-        let (submit_tx, mut submit_rx) = mpsc::unbounded_channel();
-        let weak_submit_tx = submit_tx.downgrade();
+        let (submit_tx, submit_rx) = crossbeam::channel::unbounded();
+        let weak_submit_tx = submit_tx.clone();
 
         let mut current = first;
         loop {
@@ -1761,13 +1761,17 @@ mod tests {
             Ok(p) => p,
             Err((_, msg)) => panic!("{msg}"),
         };
-        let (submit_tx, _submit_rx) = mpsc::unbounded_channel();
-        let weak_submit_tx = submit_tx.downgrade();
-        drop(submit_tx);
+        // Simulate "scheduler gone" by dropping the receiver — the
+        // clone held below will then fail to send. With the prior tokio
+        // mpsc + Weak design the test simulated this by dropping the
+        // strong sender; crossbeam doesn't have weak senders so we now
+        // close the channel from the receiver side instead.
+        let (submit_tx, submit_rx) = crossbeam::channel::unbounded();
+        drop(submit_rx);
 
         chunked.send_result(
             Ok(pie_bridge::ForwardResponse::default()),
-            Some(&weak_submit_tx),
+            Some(&submit_tx),
             4,
         );
 
@@ -1775,7 +1779,10 @@ mod tests {
             .try_recv()
             .expect("response error")
             .expect_err("expected requeue error");
-        assert!(err.to_string().contains("scheduler shutting down"));
+        assert!(
+            err.to_string().contains("scheduler channel closed")
+                || err.to_string().contains("scheduler shutting down")
+        );
     }
 
     #[test]
@@ -1853,8 +1860,8 @@ mod tests {
             Ok(p) => p,
             Err((_, msg)) => panic!("{msg}"),
         };
-        let (submit_tx, mut submit_rx) = mpsc::unbounded_channel();
-        let weak_submit_tx = submit_tx.downgrade();
+        let (submit_tx, submit_rx) = crossbeam::channel::unbounded();
+        let weak_submit_tx = submit_tx.clone();
         let mut current = first;
         let mut chunks = 0usize;
 
@@ -1954,8 +1961,8 @@ mod tests {
             Ok(p) => p,
             Err((_, msg)) => panic!("{msg}"),
         };
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        let weak_tx = tx.downgrade();
+        let (tx, rx) = crossbeam::channel::unbounded();
+        let weak_tx = tx.clone();
         chunked.send_result(
             Ok(pie_bridge::ForwardResponse::default()),
             Some(&weak_tx),
