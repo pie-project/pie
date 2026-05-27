@@ -255,8 +255,15 @@ impl RuntimeConfig {
 }
 
 fn default_worker_threads() -> usize {
+    // Cap at 64 — pie's scheduler + chain-ext pool produces ~20-30
+    // active tokio tasks at conc=256. Beyond ~64 workers the runtime's
+    // scheduling overhead (queue management, wake propagation) starts
+    // adding variance without adding parallelism. Measured on AMD EPYC
+    // 7773X (256 threads visible): tok/s mean +0.5%, stdev cut to ~1/3
+    // by capping. Users with heavier non-inference work in the same
+    // process can override via `[runtime] worker_threads = ...`.
     std::thread::available_parallelism()
-        .map(|n| n.get())
+        .map(|n| n.get().min(64))
         .unwrap_or(4)
 }
 fn default_wasm_max_instances() -> u32 {
