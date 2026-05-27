@@ -28,9 +28,9 @@ import torch
 import torch.nn.functional as fun
 
 from . import ModelConfig as ModelConfigBase
-from ..config import RuntimeConfig
+from pie_driver_dev.config import NativeRuntimeConfig as RuntimeConfig
 from ..adapter import AdapterSubpass
-from ..utils import get_available_memory
+from pie_driver_dev.utils import get_available_memory
 from ..schema import Schema, Source, WeightStore
 
 import pie_kernels as ops
@@ -146,7 +146,7 @@ class ModelConfig(ModelConfigBase):
             top_k=int(spec["num_experts_per_tok"]),
         )
 
-    def eval_max_num_kv_pages(self, runtime_config: RuntimeConfig) -> int:
+    def eval_total_pages(self, runtime_config: RuntimeConfig) -> int:
         available = get_available_memory(devices=runtime_config.devices, rank=runtime_config.rank)
         usable = available * runtime_config.gpu_mem_utilization
         elem = torch.empty((), dtype=runtime_config.activation_dtype).element_size()
@@ -300,7 +300,7 @@ class ForwardPass:
             q=q, k=k, pos_ids=position_ids, rope_theta=cfg.rope_theta,
         )
 
-        ops.append_paged_kv_cache(
+        ops.append_paged_kv_cache_with_format(
             append_key=k, append_value=v,
             batch_indices=batch_indices, positions=batch_positions,
             paged_kv_cache=kv_cache_layer,
@@ -399,7 +399,7 @@ def create_kv_cache(model_config: ModelConfig, runtime_config: RuntimeConfig) ->
     return [
         torch.zeros(
             (
-                runtime_config.max_num_kv_pages + 1,
+                runtime_config.total_pages + 1,
                 2,
                 runtime_config.kv_page_size,
                 local_kv,

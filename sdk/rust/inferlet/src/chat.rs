@@ -16,10 +16,7 @@
 
 use crate::Result;
 use crate::model::Model;
-use crate::pie::instruct::chat::{
-    Decoder as RawDecoder,
-    Event as RawEvent,
-};
+use crate::pie::instruct::chat::{Decoder as RawDecoder, Event as RawEvent};
 
 // =============================================================================
 // Template fillers

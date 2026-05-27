@@ -11,8 +11,10 @@ members = [
     "runtime",
     "client/rust",
     "server",
+    "driver/bridge",
+    "driver/bridge-macros",
     "driver/dummy",
-    "sdk/python-rpc",
+    "driver/weight_loader",
     "sdk/python-server",
 ]
 exclude = [

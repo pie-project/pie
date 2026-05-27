@@ -12,7 +12,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 mod common;
-use common::{create_mock_env, MockEnv, mock_device::EchoBehavior, inferlets};
+use common::{MockEnv, create_mock_env, inferlets, mock_device::EchoBehavior};
 
 use pie::workflow;
 
@@ -49,7 +49,8 @@ fn state() -> &'static TestState {
 
 /// Submit a workflow and await its result, panicking with a descriptive message on failure.
 async fn submit_and_await(label: &str, username: &str, json: &str) -> String {
-    let (id, rx) = workflow::submit(username, json, None).await
+    let (id, rx) = workflow::submit(username, json, None)
+        .await
         .unwrap_or_else(|e| panic!("[{label}] submit failed: {e}"));
 
     match tokio::time::timeout(WORKFLOW_TIMEOUT, rx).await {
@@ -117,7 +118,10 @@ fn fork_workflow_contention() {
         let output = submit_and_await("fork3", "fork-user", &json).await;
 
         let parsed: serde_json::Value = serde_json::from_str(&output).unwrap();
-        assert!(parsed.is_array(), "Fork result should be an array, got: {parsed}");
+        assert!(
+            parsed.is_array(),
+            "Fork result should be an array, got: {parsed}"
+        );
         assert_eq!(parsed.as_array().unwrap().len(), 3, "expected 3 results");
     });
 }
@@ -174,7 +178,8 @@ fn five_concurrent_workflows() {
         let params: Vec<_> = (0..5)
             .map(|i| (format!("multi{i}"), format!("user-{i}")))
             .collect();
-        let futures: Vec<_> = params.iter()
+        let futures: Vec<_> = params
+            .iter()
             .map(|(label, user)| submit_and_await(label, user, &json))
             .collect();
 
@@ -203,15 +208,22 @@ fn wave_stress() {
             let params: Vec<_> = (0..4)
                 .map(|i| (format!("wave{wave}_{i}"), format!("wave-{wave}-user-{i}")))
                 .collect();
-            let futures: Vec<_> = params.iter()
+            let futures: Vec<_> = params
+                .iter()
                 .map(|(label, user)| submit_and_await(label, user, &json))
                 .collect();
 
             let results = futures::future::join_all(futures).await;
             for (i, r) in results.iter().enumerate() {
-                assert!(!r.is_empty(), "wave {wave} workflow {i} produced empty output");
+                assert!(
+                    !r.is_empty(),
+                    "wave {wave} workflow {i} produced empty output"
+                );
             }
-            eprintln!("[wave_stress] wave {wave} complete ({} workflows)", results.len());
+            eprintln!(
+                "[wave_stress] wave {wave} complete ({} workflows)",
+                results.len()
+            );
         }
     });
 }
@@ -237,8 +249,16 @@ fn concurrent_fork_workflows() {
 
         let p1: serde_json::Value = serde_json::from_str(&out1).unwrap();
         let p2: serde_json::Value = serde_json::from_str(&out2).unwrap();
-        assert_eq!(p1.as_array().unwrap().len(), 3, "fork1 should have 3 results");
-        assert_eq!(p2.as_array().unwrap().len(), 3, "fork2 should have 3 results");
+        assert_eq!(
+            p1.as_array().unwrap().len(),
+            3,
+            "fork1 should have 3 results"
+        );
+        assert_eq!(
+            p2.as_array().unwrap().len(),
+            3,
+            "fork2 should have 3 results"
+        );
     });
 }
 
@@ -253,7 +273,8 @@ fn concurrent_fork_workflows() {
 fn pipe_then_fork() {
     let s = state();
     s.rt.block_on(async {
-        let json = format!(r#"{{
+        let json = format!(
+            r#"{{
             "type": "pipe",
             "stages": [
                 {{"type": "process", "program_name": "{GENERATE}"}},
@@ -263,12 +284,17 @@ fn pipe_then_fork() {
                     {{"type": "process", "program_name": "{GENERATE}"}}
                 ]}}
             ]
-        }}"#);
+        }}"#
+        );
 
         let output = submit_and_await("pipe_fork", "pf-user", &json).await;
         let parsed: serde_json::Value = serde_json::from_str(&output).unwrap();
         assert!(parsed.is_array(), "pipe→fork result should be an array");
-        assert_eq!(parsed.as_array().unwrap().len(), 3, "expected 3 fork results");
+        assert_eq!(
+            parsed.as_array().unwrap().len(),
+            3,
+            "expected 3 fork results"
+        );
     });
 }
 
@@ -288,7 +314,9 @@ fn rapid_fire_burst() {
         // Submit all 10 as fast as possible
         let mut receivers = Vec::with_capacity(10);
         for i in 0..10 {
-            let (id, rx) = workflow::submit(&format!("burst-{i}"), &json, None).await.unwrap();
+            let (id, rx) = workflow::submit(&format!("burst-{i}"), &json, None)
+                .await
+                .unwrap();
             eprintln!("[burst] submitted workflow {i}: {id}");
             receivers.push((i, id, rx));
         }
@@ -306,4 +334,3 @@ fn rapid_fire_burst() {
         }
     });
 }
-

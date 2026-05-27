@@ -6,7 +6,7 @@
 // then append a verification block (n_drafts+1 cloned token samplers per
 // spec request) to the sampling layout.
 //
-// Returns owned vectors; the request handler switches its active spans
+// Returns owned vectors; the executor switches its active spans
 // to point at them when `has_drafts` is true.
 
 #include <cstdint>
@@ -38,7 +38,7 @@ struct SpecExpansionInputs {
 struct SpecExpansion {
     bool has_drafts = false;
 
-    // Spec-expanded copies of the BPIQ wire arrays. Populated only when
+    // Spec-expanded copies of the wire arrays. Populated only when
     // `has_drafts` is true; otherwise default-constructed and ignored.
     std::vector<std::uint32_t> tokens;
     std::vector<std::uint32_t> positions;

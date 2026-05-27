@@ -12,12 +12,12 @@ mod stack_parser;
 use std::collections::VecDeque;
 use std::sync::Arc;
 
-use crate::inference::brle::Brle;
 use crate::inference::structured::bitmask::{self, set_bit};
 use crate::inference::structured::compiled_grammar::CompiledGrammar;
 use crate::inference::structured::fsm::{FsmEdge, StateId};
 use crate::inference::structured::grammar::Grammar;
 use crate::model::tokenizer::Tokenizer;
+use pie_bridge::Brle;
 
 use single_dfa::SingleDfaEngine;
 use stack_parser::{SmallDedup, StackParser, StackState};
@@ -104,7 +104,12 @@ impl GrammarMatcher {
         max_rollback_tokens: usize,
     ) -> Self {
         let compiled = Arc::new(CompiledGrammar::new(&grammar, &tokenizer_info));
-        Self::with_compiled(compiled, tokenizer_info, stop_token_ids, max_rollback_tokens)
+        Self::with_compiled(
+            compiled,
+            tokenizer_info,
+            stop_token_ids,
+            max_rollback_tokens,
+        )
     }
 
     /// Create a grammar matcher from a pre-compiled grammar.
@@ -230,7 +235,9 @@ impl GrammarMatcher {
         match &self.engine {
             ParserEngine::SingleDfa(e) => {
                 e.fill_bitmask(
-                    &self.compiled, &self.tokenizer, bitmask,
+                    &self.compiled,
+                    &self.tokenizer,
+                    bitmask,
                     &mut self.trie_scratch.dfa_stack,
                     &mut self.trie_scratch.dfa_active_prefix,
                 );
@@ -377,9 +384,13 @@ impl GrammarMatcher {
                 let rets = &s.stack_returns[r_start..];
 
                 if parser.probe_advance_reuse(
-                    states, rets, byte,
-                    &mut s.queue_buf, &mut s.visited_buf,
-                    &mut s.scanable_buf, &mut s.returns_buf,
+                    states,
+                    rets,
+                    byte,
+                    &mut s.queue_buf,
+                    &mut s.visited_buf,
+                    &mut s.scanable_buf,
+                    &mut s.returns_buf,
                 ) {
                     // Push new level
                     s.stack_state_offsets.push(s.stack_states.len());
@@ -480,7 +491,10 @@ impl GrammarMatcher {
                         match next_byte {
                             None => next_byte = state_byte,
                             Some(b) if Some(b) == state_byte => {}
-                            _ => { conflict = true; break; }
+                            _ => {
+                                conflict = true;
+                                break;
+                            }
                         }
                     }
 
@@ -587,9 +601,7 @@ mod tests {
 
     #[test]
     fn test_accept_simple_string() {
-        let grammar = Arc::new(
-            Grammar::from_ebnf(r#"root ::= "hello""#, "root").unwrap(),
-        );
+        let grammar = Arc::new(Grammar::from_ebnf(r#"root ::= "hello""#, "root").unwrap());
         let vocab: Vec<String> = vec!["hello".into()];
         let tok = Arc::new(Tokenizer::from_vocab(&vocab));
         let mut m = GrammarMatcher::new(grammar, tok, vec![], 10);
@@ -600,9 +612,7 @@ mod tests {
 
     #[test]
     fn test_reject_wrong_string() {
-        let grammar = Arc::new(
-            Grammar::from_ebnf(r#"root ::= "hello""#, "root").unwrap(),
-        );
+        let grammar = Arc::new(Grammar::from_ebnf(r#"root ::= "hello""#, "root").unwrap());
         let vocab: Vec<String> = vec!["hello".into()];
         let tok = Arc::new(Tokenizer::from_vocab(&vocab));
         let mut m = GrammarMatcher::new(grammar, tok, vec![], 10);
@@ -614,9 +624,7 @@ mod tests {
 
     #[test]
     fn test_accept_choices() {
-        let grammar = Arc::new(
-            Grammar::from_ebnf(r#"root ::= "yes" | "no""#, "root").unwrap(),
-        );
+        let grammar = Arc::new(Grammar::from_ebnf(r#"root ::= "yes" | "no""#, "root").unwrap());
         let vocab: Vec<String> = vec!["yes".into(), "no".into()];
         let tok = Arc::new(Tokenizer::from_vocab(&vocab));
 
@@ -685,7 +693,11 @@ mod tests {
 
     #[test]
     fn test_accept_token() {
-        let mut m = make_matcher(r#"root ::= "hello world""#, "root", &["hello", " ", "world"]);
+        let mut m = make_matcher(
+            r#"root ::= "hello world""#,
+            "root",
+            &["hello", " ", "world"],
+        );
         assert!(m.accept_token(0)); // "hello"
         assert!(m.accept_token(1)); // " "
         assert!(m.accept_token(2)); // "world"
@@ -703,11 +715,7 @@ mod tests {
 
     #[test]
     fn test_bitmask_simple() {
-        let mut m = make_matcher(
-            r#"root ::= "ab" | "cd""#,
-            "root",
-            &["ab", "cd", "ef"],
-        );
+        let mut m = make_matcher(r#"root ::= "ab" | "cd""#, "root", &["ab", "cd", "ef"]);
 
         let mut bm = vec![0u32; bitmask_size(3)];
         m.fill_next_token_bitmask(&mut bm);
@@ -779,11 +787,7 @@ mod tests {
 
     #[test]
     fn test_rollback() {
-        let mut m = make_matcher(
-            r#"root ::= "abc""#,
-            "root",
-            &["a", "b", "c"],
-        );
+        let mut m = make_matcher(r#"root ::= "abc""#, "root", &["a", "b", "c"]);
 
         assert!(m.accept_token(0)); // "a"
         assert!(m.accept_token(1)); // "b"
@@ -797,11 +801,7 @@ mod tests {
 
     #[test]
     fn test_rollback_multiple() {
-        let mut m = make_matcher(
-            r#"root ::= "abcd""#,
-            "root",
-            &["a", "b", "c", "d"],
-        );
+        let mut m = make_matcher(r#"root ::= "abcd""#, "root", &["a", "b", "c", "d"]);
 
         assert!(m.accept_token(0)); // "a"
         assert!(m.accept_token(1)); // "b"
@@ -819,11 +819,7 @@ mod tests {
 
     #[test]
     fn test_jump_forward_simple() {
-        let mut m = make_matcher(
-            r#"root ::= "hello""#,
-            "root",
-            &["hello"],
-        );
+        let mut m = make_matcher(r#"root ::= "hello""#, "root", &["hello"]);
 
         let jf = m.find_jump_forward_string();
         assert_eq!(jf, "hello");
@@ -843,11 +839,7 @@ mod tests {
 
     #[test]
     fn test_jump_forward_after_accept() {
-        let mut m = make_matcher(
-            r#"root ::= "ab" "cd""#,
-            "root",
-            &["ab", "cd"],
-        );
+        let mut m = make_matcher(r#"root ::= "ab" "cd""#, "root", &["ab", "cd"]);
 
         m.accept_token(0); // "ab"
         let jf = m.find_jump_forward_string();
@@ -978,18 +970,34 @@ mod tests {
 
     #[test]
     fn test_json_schema_smoke() {
-        use crate::inference::structured::json_schema::{json_schema_to_grammar, JsonSchemaOptions};
+        use crate::inference::structured::json_schema::{
+            JsonSchemaOptions, json_schema_to_grammar,
+        };
         let schema = r#"{"type":"object","properties":{"name":{"type":"string"},"age":{"type":"integer"}},"required":["name","age"]}"#;
-        let opts = JsonSchemaOptions { any_whitespace: false, ..JsonSchemaOptions::default() };
+        let opts = JsonSchemaOptions {
+            any_whitespace: false,
+            ..JsonSchemaOptions::default()
+        };
         let grammar = Arc::new(json_schema_to_grammar(schema, &opts).unwrap());
 
         let mut vocab_strs: Vec<String> = Vec::new();
-        let structural = ["{", "}", "[", "]", ",", ":", "\"", "\\", "true", "false", "null",
-            "\\n", "\\t", "\\r", "\\\\", "\\\"",
-            "0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "-", ".", "e", "E", "+"];
-        for s in &structural { vocab_strs.push(s.to_string()); }
-        for c in 32u8..=126 { let s = String::from(c as char); if !vocab_strs.contains(&s) { vocab_strs.push(s); } }
-        while vocab_strs.len() < 1000 { vocab_strs.push(format!("tok_{}", vocab_strs.len())); }
+        let structural = [
+            "{", "}", "[", "]", ",", ":", "\"", "\\", "true", "false", "null", "\\n", "\\t", "\\r",
+            "\\\\", "\\\"", "0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "-", ".", "e", "E",
+            "+",
+        ];
+        for s in &structural {
+            vocab_strs.push(s.to_string());
+        }
+        for c in 32u8..=126 {
+            let s = String::from(c as char);
+            if !vocab_strs.contains(&s) {
+                vocab_strs.push(s);
+            }
+        }
+        while vocab_strs.len() < 1000 {
+            vocab_strs.push(format!("tok_{}", vocab_strs.len()));
+        }
         vocab_strs.truncate(1000);
 
         let tok = Arc::new(Tokenizer::from_vocab(&vocab_strs));
@@ -1022,7 +1030,9 @@ mod tests {
         let mut m = make_matcher(
             ebnf,
             "root",
-            &["t", "tr", "true", "f", "fa", "false", "n", "nu", "null", "x"],
+            &[
+                "t", "tr", "true", "f", "fa", "false", "n", "nu", "null", "x",
+            ],
         );
 
         let mut bm = vec![0u32; bitmask_size(10)];
@@ -1098,15 +1108,19 @@ mod tests {
     #[test]
     fn test_steady_state_json_schema() {
         // Test with actual JSON schema grammar (the primary use case)
-        use crate::inference::structured::json_schema::{json_schema_to_grammar, JsonSchemaOptions};
-        let schema = r#"{"type":"object","properties":{"name":{"type":"string"}},"required":["name"]}"#;
-        let opts = JsonSchemaOptions { any_whitespace: false, ..JsonSchemaOptions::default() };
+        use crate::inference::structured::json_schema::{
+            JsonSchemaOptions, json_schema_to_grammar,
+        };
+        let schema =
+            r#"{"type":"object","properties":{"name":{"type":"string"}},"required":["name"]}"#;
+        let opts = JsonSchemaOptions {
+            any_whitespace: false,
+            ..JsonSchemaOptions::default()
+        };
         let grammar = Arc::new(json_schema_to_grammar(schema, &opts).unwrap());
 
         let vocab: Vec<String> = (32u8..=126).map(|c| String::from(c as char)).collect();
-        let tok = Arc::new(
-            Tokenizer::from_vocab(&vocab),
-        );
+        let tok = Arc::new(Tokenizer::from_vocab(&vocab));
 
         let mut m = GrammarMatcher::new(grammar, tok, vec![], 10);
         // Parse prefix including string content with steady-state opportunity
@@ -1135,9 +1149,7 @@ ws ::= [ \t\n\r]*
 "#;
         let grammar = Arc::new(Grammar::from_ebnf(ebnf, "root").unwrap());
         let vocab: Vec<String> = vec!["dummy".into()];
-        let tok = Arc::new(
-            Tokenizer::from_vocab(&vocab),
-        );
+        let tok = Arc::new(Tokenizer::from_vocab(&vocab));
         let mut m = GrammarMatcher::new(grammar, tok, vec![], 10);
         let input = r#"{"name": "John", "age": 30}"#;
         assert!(m.accept_string(input));
@@ -1146,15 +1158,19 @@ ws ::= [ \t\n\r]*
     #[test]
     fn test_chain_shortcircuit_long_string() {
         // Verify chain short-circuit handles long strings without O(N^2) blowup
-        use crate::inference::structured::json_schema::{json_schema_to_grammar, JsonSchemaOptions};
-        let schema = r#"{"type":"object","properties":{"name":{"type":"string"}},"required":["name"]}"#;
-        let opts = JsonSchemaOptions { any_whitespace: false, ..JsonSchemaOptions::default() };
+        use crate::inference::structured::json_schema::{
+            JsonSchemaOptions, json_schema_to_grammar,
+        };
+        let schema =
+            r#"{"type":"object","properties":{"name":{"type":"string"}},"required":["name"]}"#;
+        let opts = JsonSchemaOptions {
+            any_whitespace: false,
+            ..JsonSchemaOptions::default()
+        };
         let grammar = Arc::new(json_schema_to_grammar(schema, &opts).unwrap());
 
         let vocab: Vec<String> = (0u16..256).map(|i| String::from(i as u8 as char)).collect();
-        let tok = Arc::new(
-            Tokenizer::from_vocab(&vocab),
-        );
+        let tok = Arc::new(Tokenizer::from_vocab(&vocab));
         let mut m = GrammarMatcher::new(grammar, tok, vec![], 10);
         // 200-char string — without chain short-circuit this would be O(N^2)
         let long_name = "A".repeat(200);

@@ -2,6 +2,8 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
+#include <iostream>
 #include <stdexcept>
 #include <string>
 
@@ -99,34 +101,36 @@ void build_causal_mask_f16(std::vector<std::uint16_t>& dst,
     build_attn_mask_f16(dst, n_kv, n_tokens, n_tokens_pad, positions, nullptr, 0);
 }
 
-PlanArrays extract_plan_arrays(const schema::DecodedRequest& req) {
+PlanArrays extract_plan_arrays(const pie_driver::PieForwardRequestView& req) {
     PlanArrays a;
-    a.context_ids          = req.as<std::uint64_t>(schema::A_CONTEXT_IDS);
-    a.token_ids            = req.as<std::uint32_t>(schema::A_TOKEN_IDS);
-    a.position_ids         = req.as<std::uint32_t>(schema::A_POSITION_IDS);
-    a.qo_indptr            = req.as<std::uint32_t>(schema::A_QO_INDPTR);
-    a.sampling_idx         = req.as<std::uint32_t>(schema::A_SAMPLING_INDICES);
-    a.sampling_indptr      = req.as<std::uint32_t>(schema::A_SAMPLING_INDPTR);
-    a.request_num_samplers = req.as<std::uint32_t>(schema::A_REQUEST_NUM_SAMPLERS);
-    a.kv_page_indices      = req.as<std::uint32_t>(schema::A_KV_PAGE_INDICES);
-    a.kv_page_indptr       = req.as<std::uint32_t>(schema::A_KV_PAGE_INDPTR);
-    a.kv_last_lens         = req.as<std::uint32_t>(schema::A_KV_LAST_PAGE_LENS);
-    a.sampler_types        = req.as<std::uint32_t>(schema::A_SAMPLER_TYPES);
-    a.sampler_temps        = req.as<float>(schema::A_SAMPLER_TEMPERATURES);
-    a.sampler_top_k        = req.as<std::uint32_t>(schema::A_SAMPLER_TOP_K);
-    a.sampler_top_p        = req.as<float>(schema::A_SAMPLER_TOP_P);
-    a.sampler_min_p        = req.as<float>(schema::A_SAMPLER_MIN_P);
-    a.sampler_seeds        = req.as<std::uint32_t>(schema::A_SAMPLER_SEEDS);
-    a.sampler_label_ids    = req.as<std::uint32_t>(schema::A_SAMPLER_LABEL_IDS);
-    a.sampler_label_indptr = req.as<std::uint32_t>(schema::A_SAMPLER_LABEL_INDPTR);
-    a.logit_masks          = req.as<std::uint32_t>(schema::A_LOGIT_MASKS);
-    a.logit_mask_indptr    = req.as<std::uint32_t>(schema::A_LOGIT_MASK_INDPTR);
-    a.flat_attn_masks      = req.as<std::uint32_t>(schema::A_FLATTENED_MASKS);
-    a.attn_mask_indptr     = req.as<std::uint32_t>(schema::A_MASK_INDPTR);
-    a.adapter_indices      = req.as<std::int64_t>(schema::A_ADAPTER_INDICES);
-    a.spec_token_ids       = req.as<std::uint32_t>(schema::A_SPEC_TOKEN_IDS);
-    a.spec_position_ids    = req.as<std::uint32_t>(schema::A_SPEC_POSITION_IDS);
-    a.spec_indptr          = req.as<std::uint32_t>(schema::A_SPEC_INDPTR);
+    a.context_ids          = req.context_ids.as<std::uint64_t>();
+    a.token_ids            = req.token_ids.as<std::uint32_t>();
+    a.position_ids         = req.position_ids.as<std::uint32_t>();
+    a.qo_indptr            = req.qo_indptr.as<std::uint32_t>();
+    a.sampling_idx         = req.sampling_indices.as<std::uint32_t>();
+    a.sampling_indptr      = req.sampling_indptr.as<std::uint32_t>();
+    a.request_num_samplers = req.request_num_samplers.as<std::uint32_t>();
+    a.kv_page_indices      = req.kv_page_indices.as<std::uint32_t>();
+    a.kv_page_indptr       = req.kv_page_indptr.as<std::uint32_t>();
+    a.kv_last_lens         = req.kv_last_page_lens.as<std::uint32_t>();
+    a.rs_slot_ids          = req.rs_slot_ids.as<std::uint32_t>();
+    a.rs_slot_flags        = req.rs_slot_flags.as<std::uint8_t>();
+    a.sampler_types        = req.sampler_types.as<std::uint32_t>();
+    a.sampler_temps        = req.sampler_temperatures.as<float>();
+    a.sampler_top_k        = req.sampler_top_k.as<std::uint32_t>();
+    a.sampler_top_p        = req.sampler_top_p.as<float>();
+    a.sampler_min_p        = req.sampler_min_p.as<float>();
+    a.sampler_seeds        = req.sampler_seeds.as<std::uint32_t>();
+    a.sampler_label_ids    = req.sampler_label_ids.as<std::uint32_t>();
+    a.sampler_label_indptr = req.sampler_label_indptr.as<std::uint32_t>();
+    a.logit_masks          = req.logit_masks.as<std::uint32_t>();
+    a.logit_mask_indptr    = req.logit_mask_indptr.as<std::uint32_t>();
+    a.flat_attn_masks      = req.flattened_masks.as<std::uint32_t>();
+    a.attn_mask_indptr     = req.mask_indptr.as<std::uint32_t>();
+    a.adapter_indices      = req.adapter_indices.as<std::int64_t>();
+    a.spec_token_ids       = req.spec_token_ids.as<std::uint32_t>();
+    a.spec_position_ids    = req.spec_position_ids.as<std::uint32_t>();
+    a.spec_indptr          = req.spec_indptr.as<std::uint32_t>();
 
     a.n_request      = static_cast<std::int32_t>(a.context_ids.size());
     a.total_n_tokens = static_cast<std::int32_t>(a.token_ids.size());
@@ -190,6 +194,12 @@ void validate_plan_top_level(const PlanArrays& a) {
     if (a.request_num_samplers.size() != static_cast<std::size_t>(a.n_request)) {
         throw std::runtime_error("plan: request_num_samplers length mismatch");
     }
+    if (!a.rs_slot_ids.empty() && a.rs_slot_ids.size() != static_cast<std::size_t>(a.n_request)) {
+        throw std::runtime_error("plan: rs_slot_ids length must equal num_requests");
+    }
+    if (!a.rs_slot_flags.empty() && a.rs_slot_flags.size() != static_cast<std::size_t>(a.n_request)) {
+        throw std::runtime_error("plan: rs_slot_flags length must equal num_requests");
+    }
     if (a.sampling_indptr.size() != n_plus_1) {
         throw std::runtime_error("plan: sampling_indptr length must be num_requests+1");
     }
@@ -216,7 +226,7 @@ void plan_single_request(const PlanArrays& a,
                          std::int32_t page_size,
                          std::int32_t total_pages,
                          const ArchSpec& spec,
-                         ForwardEngine::BatchPlan& plan) {
+                         Executor::BatchPlan& plan) {
     // 0 sampler slots = prefill-only (e.g. `Context::flush`): write KV for
     // the supplied tokens, no logit sampling. Decode is 1 slot, M8
     // spec-decode is 1 + n_drafts.
@@ -253,7 +263,7 @@ void plan_single_request(const PlanArrays& a,
         }
     }
 
-    // BPIQ slot count must agree with the prefill/decode mode.
+    // wire slot count must agree with the prefill/decode mode.
     const std::int32_t s_start = static_cast<std::int32_t>(a.sampling_indptr[r]);
     const std::int32_t s_end   = static_cast<std::int32_t>(a.sampling_indptr[r + 1]);
     const std::int32_t n_bpiq_slots = s_end - s_start;
@@ -263,7 +273,7 @@ void plan_single_request(const PlanArrays& a,
             "plan: request " + std::to_string(r) + " has " +
             std::to_string(a.request_num_samplers[r]) +
             " sampler slot(s) but " + std::to_string(n_bpiq_slots) +
-            " BPIQ sampling indices");
+            " wire sampling indices");
     }
 
     // Per-token: tokens, positions, and write idxs.
@@ -281,11 +291,14 @@ void plan_single_request(const PlanArrays& a,
                                            pages_off, page_size, pos_i);
     }
 
-    ForwardEngine::ReqPlan rp;
+    Executor::ReqPlan rp;
     rp.qo_start     = qo_start;
     rp.n_tokens     = n_tok;
     rp.n_tokens_pad = ((n_tok + MASK_PAD - 1) / MASK_PAD) * MASK_PAD;
     rp.n_kv         = seq_len;
+    if (a.rs_slot_ids.size() == static_cast<std::size_t>(a.n_request)) {
+        rp.state_slot = static_cast<std::int32_t>(a.rs_slot_ids[r]);
+    }
 
     rp.gather_idxs.resize(seq_len);
     for (std::int32_t k = 0; k < seq_len; ++k) {
@@ -392,31 +405,54 @@ void plan_single_request(const PlanArrays& a,
         }
     }
 
-    // Sampler params (slot index = s_start in v1, where each request has 1 slot).
-    if (s_start >= static_cast<std::int32_t>(a.sampler_types.size())) {
+    // Per-slot sampler params. The inferlet SDK can attach multiple
+    // sampler kinds to one position in a single forward pass (e.g.
+    // Argmax + RawLogits + Distribution + Logprob + Logprobs + Entropy
+    // all at the same slot — see tests/inferlets/test_sampler_suite.py),
+    // and the wire format pairs each entry in `sampling_indices` with
+    // the same-indexed entries in the per-sampler SoA arrays. Build one
+    // `SamplerParams` per `[s_start, s_end)` slot and store them on the
+    // request plan in slot order; `rp.sampler` (singular) tracks the
+    // first one for fast-path detection + graph-side reads.
+    const std::int32_t total_slots =
+        rp.sampling_positions.empty() ? 0
+        : static_cast<std::int32_t>(rp.sampling_positions.size());
+    if (total_slots > 0 &&
+        s_start + total_slots > static_cast<std::int32_t>(a.sampler_types.size())) {
         throw std::runtime_error(
             "plan: sampler_types too short for request " + std::to_string(r));
     }
-    rp.sampler.type = static_cast<SamplerType>(a.sampler_types[s_start]);
-    auto opt_at = [&](auto span, auto fallback) {
-        return s_start < static_cast<std::int32_t>(span.size())
-            ? span[s_start] : fallback;
-    };
-    rp.sampler.temperature = opt_at(a.sampler_temps, 1.0f);
-    rp.sampler.top_k       = opt_at(a.sampler_top_k, 0u);
-    rp.sampler.top_p       = opt_at(a.sampler_top_p, 1.0f);
-    rp.sampler.min_p       = opt_at(a.sampler_min_p, 0.0f);
-    rp.sampler.seed        = opt_at(a.sampler_seeds, 0u);
+    rp.samplers.resize(static_cast<std::size_t>(total_slots));
+    for (std::int32_t k = 0; k < total_slots; ++k) {
+        const std::int32_t si = s_start + k;
+        auto opt_at = [&](auto span, auto fallback) {
+            return si < static_cast<std::int32_t>(span.size())
+                ? span[si] : fallback;
+        };
+        SamplerParams& sp = rp.samplers[static_cast<std::size_t>(k)];
+        sp.type        = static_cast<SamplerType>(a.sampler_types[si]);
+        sp.temperature = opt_at(a.sampler_temps, 1.0f);
+        sp.top_k       = opt_at(a.sampler_top_k, 0u);
+        sp.top_p       = opt_at(a.sampler_top_p, 1.0f);
+        sp.min_p       = opt_at(a.sampler_min_p, 0.0f);
+        sp.seed        = opt_at(a.sampler_seeds, 0u);
 
-    // Per-slot Logprob/Logprobs labels (sampler-slot-keyed indptr).
-    if (a.sampler_label_indptr.size() > static_cast<std::size_t>(s_start) + 1) {
-        const std::int32_t la = static_cast<std::int32_t>(a.sampler_label_indptr[s_start]);
-        const std::int32_t lb = static_cast<std::int32_t>(a.sampler_label_indptr[s_start + 1]);
-        if (lb > la) {
-            rp.sampler.labels.assign(
-                a.sampler_label_ids.data() + la,
-                a.sampler_label_ids.data() + lb);
+        // Per-slot Logprob/Logprobs labels (sampler-slot-keyed indptr).
+        if (a.sampler_label_indptr.size() > static_cast<std::size_t>(si) + 1) {
+            const std::int32_t la = static_cast<std::int32_t>(a.sampler_label_indptr[si]);
+            const std::int32_t lb = static_cast<std::int32_t>(a.sampler_label_indptr[si + 1]);
+            if (lb > la) {
+                sp.labels.assign(
+                    a.sampler_label_ids.data() + la,
+                    a.sampler_label_ids.data() + lb);
+            }
         }
+    }
+    // `rp.sampler` is the legacy single-handle used by graph builders
+    // and the GPU fast-path detection. Populate from slot 0 when present;
+    // leave as default for prefill-only requests.
+    if (!rp.samplers.empty()) {
+        rp.sampler = rp.samplers[0];
     }
 
     // Per-request BRLE logit mask. Optional — empty = no constraint.
@@ -433,7 +469,7 @@ void plan_single_request(const PlanArrays& a,
     plan.reqs.push_back(std::move(rp));
 }
 
-void build_pure_decode_packing(ForwardEngine::BatchPlan& plan,
+void build_pure_decode_packing(Executor::BatchPlan& plan,
                                std::int32_t n_request,
                                std::int32_t page_size,
                                std::int32_t sliding_window,

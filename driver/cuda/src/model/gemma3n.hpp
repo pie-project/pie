@@ -46,7 +46,7 @@
 #include <vector>
 
 #include "distributed.hpp"
-#include "engine.hpp"
+#include "model/loaded_model.hpp"
 #include "kv_cache.hpp"
 #include "model/qwen3.hpp"
 #include "model/qwen3_forward.hpp"
@@ -146,7 +146,7 @@ struct Gemma3nForwardCfg {
     NcclComm* tp_comm = nullptr;
 };
 
-Gemma3nWeights bind_gemma3n(Engine& engine);
+Gemma3nWeights bind_gemma3n(const LoadedModel& engine);
 
 // Stub for now — throws "not yet implemented". The bind function
 // loads every tensor; the forward path is the next milestone.

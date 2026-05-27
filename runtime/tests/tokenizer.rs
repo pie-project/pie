@@ -1,3 +1,4 @@
+use pie::model::tokenizer::Tokenizer;
 /// Integration tests using real HuggingFace tokenizer.json files.
 ///
 /// These tests load actual model tokenizers from the HF cache and verify
@@ -9,9 +10,7 @@
 /// tok = AutoTokenizer.from_pretrained("meta-llama/Llama-3.2-1B")
 /// print(tok.encode("Hello, world!"))
 /// ```
-
 use std::path::Path;
-use pie::model::tokenizer::Tokenizer;
 
 // ---------------------------------------------------------------------------
 // Helper
@@ -63,38 +62,33 @@ const ROUNDTRIP_TEXTS: &[&str] = &[
     // === Basic ===
     "Hello, world!",
     "The quick brown fox jumps over the lazy dog.",
-    "",  // empty (skipped by roundtrip — but good to include)
-
+    "", // empty (skipped by roundtrip — but good to include)
     // === Whitespace torture ===
     "  spaces  and\ttabs\n",
     "line1\nline2\n\nline4",
-    "   \t\t  \n\n\n  \t ",                   // only whitespace
-    "a b  c   d    e     f",                    // expanding gaps
-    "no\rnewline\r\nwindows\r\nstyle",          // carriage returns
-
+    "   \t\t  \n\n\n  \t ",            // only whitespace
+    "a b  c   d    e     f",           // expanding gaps
+    "no\rnewline\r\nwindows\r\nstyle", // carriage returns
     // === Multilingual ===
-    "こんにちは世界",                            // Japanese
-    "你好世界！这是一个测试。",                   // Chinese
-    "안녕하세요 세계",                           // Korean
-    "مرحبا بالعالم",                            // Arabic (RTL)
-    "שלום עולם",                                // Hebrew (RTL)
-    "Привет, мир! Как дела?",                   // Russian
-    "Γεια σου κόσμε",                           // Greek
-    "สวัสดีครับ",                                 // Thai
-    "Héllo wörld café résumé naïve",            // Latin diacritics
-
+    "こんにちは世界",                // Japanese
+    "你好世界！这是一个测试。",      // Chinese
+    "안녕하세요 세계",               // Korean
+    "مرحبا بالعالم",                 // Arabic (RTL)
+    "שלום עולם",                     // Hebrew (RTL)
+    "Привет, мир! Как дела?",        // Russian
+    "Γεια σου κόσμε",                // Greek
+    "สวัสดีครับ",                       // Thai
+    "Héllo wörld café résumé naïve", // Latin diacritics
     // === Mixed scripts in one string ===
     "Hello 你好 こんにちは مرحبا Привет 🌍",
     "The price is ¥1,000 or €850 or $999.99",
     "Temperature: −40°C = −40°F (they intersect!)",
-
     // === Emoji stress ===
     "🎉 emoji test 🚀",
-    "👨‍👩‍👧‍👦 family",                              // ZWJ sequence (family emoji)
-    "🏳️‍🌈🏴‍☠️",                                    // flag ZWJ sequences
-    "👋🏻👋🏼👋🏽👋🏾👋🏿",                              // skin tone modifiers
-    "😀😃😄😁😆😅🤣😂🙂🙃😉😊😇",            // dense emoji run
-
+    "👨‍👩‍👧‍👦 family",                  // ZWJ sequence (family emoji)
+    "🏳️‍🌈🏴‍☠️",                       // flag ZWJ sequences
+    "👋🏻👋🏼👋🏽👋🏾👋🏿",                 // skin tone modifiers
+    "😀😃😄😁😆😅🤣😂🙂🙃😉😊😇", // dense emoji run
     // === Code ===
     "fn main() { println!(\"test\"); }",
     "def f(x: int) -> list[dict[str, Any]]:\n    return [{\"key\": x}]",
@@ -102,52 +96,43 @@ const ROUNDTRIP_TEXTS: &[&str] = &[
     "const x = { ...obj, arr: [1, [2, [3, [4]]]], fn: () => ({ a: 1 }) };",
     "#include <stdio.h>\nint main() {\n    printf(\"Hello, world!\\n\");\n    return 0;\n}",
     "if (a && b || !c && (d ^ e) & 0xFF) { *ptr++ = ~val; }",
-
     // === Long repetitions (stress the merge loop) ===
-    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",  // 64 'a's
-    "abababababababababababababababababababababababababababababababab",  // 31 "ab"s
-    "the the the the the the the the the the the the the the the the", // repeated word
-
+    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", // 64 'a's
+    "abababababababababababababababababababababababababababababababab", // 31 "ab"s
+    "the the the the the the the the the the the the the the the the",  // repeated word
     // === Numbers and math ===
     "3.14159265358979323846264338327950288419716939937510",
     "1e-10 2.5e+03 -0.001 +42 0xDEADBEEF 0b1101 0o777",
     "∑_{i=0}^{n} x_i² = ∫₀^∞ f(t) dt ≈ π × r²",
-
     // === Markdown / formatting ===
     "# Title\n## Subtitle\n- bullet **bold** _italic_ `code`\n> quote\n\n---\n\n1. ordered\n2. list",
     "Here is a [link](https://example.com/path?q=hello+world&lang=en#section) in text.",
     "| Col A | Col B |\n|-------|-------|\n| val 1 | val 2 |",
-
     // === JSON-like ===
     "{\"name\":\"test\",\"values\":[1,2,3],\"nested\":{\"a\":{\"b\":{\"c\":true}}}}",
-
     // === Special characters and escapes ===
     "backslash: \\\\ quote: \\\" tab: \\t newline: \\n",
     "HTML entities: &amp; &lt; &gt; &quot; &apos;",
     "<div class=\"container\"><p>Hello &amp; <b>world</b></p></div>",
-
     // === URLs and paths ===
     "https://user:pass@example.com:8080/api/v2/resource?key=val&foo=bar#fragment",
     "/usr/local/bin/../lib/python3.11/site-packages/numpy/__init__.py",
     "C:\\Users\\test\\Documents\\file (1).txt",
-
     // === Unicode edge cases ===
-    "\u{200B}\u{200B}\u{200B}",                 // zero-width spaces
-    "\u{FEFF}BOM at start",                     // byte-order mark
-    "a\u{0300}a\u{0301}a\u{0302}a\u{0303}",     // combining diacritics: àáâã
-    "fi fl ffi ffl ﬁ ﬂ ﬃ ﬄ",                    // ligatures (regular + Unicode)
+    "\u{200B}\u{200B}\u{200B}",             // zero-width spaces
+    "\u{FEFF}BOM at start",                 // byte-order mark
+    "a\u{0300}a\u{0301}a\u{0302}a\u{0303}", // combining diacritics: àáâã
+    "fi fl ffi ffl ﬁ ﬂ ﬃ ﬄ",                // ligatures (regular + Unicode)
     "2⁰ 2¹ 2² 2³ 2⁴ 2⁵ 2⁶ 2⁷ 2⁸ 2⁹",        // superscript digits
-    "∀x∈ℝ: x²≥0 ∧ ∃y∈ℂ: y²<0",               // math symbols
-
+    "∀x∈ℝ: x²≥0 ∧ ∃y∈ℂ: y²<0",              // math symbols
     // === Adversarial / boundary ===
-    "a",                                         // single ASCII char
-    "Ω",                                         // single multi-byte char
-    "🎵",                                        // single 4-byte char
-    "\n",                                        // single newline
-    "\t",                                        // single tab
-    " ",                                         // single space
+    "a",  // single ASCII char
+    "Ω",  // single multi-byte char
+    "🎵", // single 4-byte char
+    "\n", // single newline
+    "\t", // single tab
+    " ",  // single space
 ];
-
 
 // ---------------------------------------------------------------------------
 // LLaMA 3.2-1B (ByteLevel pre-tokenizer + ByteLevel decoder)
@@ -160,14 +145,20 @@ fn test_llama32_load() {
     let tok = load_tokenizer(LLAMA_32_DIR);
     if let Some(tok) = tok {
         // LLaMA 3.2 has 128256 tokens (128000 base + 256 special)
-        assert!(tok.vocab_size() >= 128000, "vocab too small: {}", tok.vocab_size());
+        assert!(
+            tok.vocab_size() >= 128000,
+            "vocab too small: {}",
+            tok.vocab_size()
+        );
         println!("LLaMA 3.2 vocab size: {}", tok.vocab_size());
     }
 }
 
 #[test]
 fn test_llama32_encode_hello() {
-    let Some(tok) = load_tokenizer(LLAMA_32_DIR) else { return };
+    let Some(tok) = load_tokenizer(LLAMA_32_DIR) else {
+        return;
+    };
     let ids = tok.encode("Hello, world!");
     println!("LLaMA 3.2 encode 'Hello, world!': {:?}", ids);
     // Verified against HF Python: [9906, 11, 1917, 0]
@@ -179,7 +170,9 @@ fn test_llama32_encode_hello() {
 
 #[test]
 fn test_llama32_encode_multilingual() {
-    let Some(tok) = load_tokenizer(LLAMA_32_DIR) else { return };
+    let Some(tok) = load_tokenizer(LLAMA_32_DIR) else {
+        return;
+    };
     let text = "こんにちは世界";
     let ids = tok.encode(text);
     println!("LLaMA 3.2 encode '{}': {:?}", text, ids);
@@ -190,7 +183,9 @@ fn test_llama32_encode_multilingual() {
 
 #[test]
 fn test_llama32_encode_code() {
-    let Some(tok) = load_tokenizer(LLAMA_32_DIR) else { return };
+    let Some(tok) = load_tokenizer(LLAMA_32_DIR) else {
+        return;
+    };
     let text = "fn main() {\n    println!(\"Hello\");\n}";
     let ids = tok.encode(text);
     println!("LLaMA 3.2 encode code: {:?}", ids);
@@ -201,7 +196,9 @@ fn test_llama32_encode_code() {
 
 #[test]
 fn test_llama32_special_tokens() {
-    let Some(tok) = load_tokenizer(LLAMA_32_DIR) else { return };
+    let Some(tok) = load_tokenizer(LLAMA_32_DIR) else {
+        return;
+    };
 
     // Verify special tokens exist
     assert!(tok.token_to_id("<|begin_of_text|>").is_some());
@@ -229,7 +226,9 @@ fn test_llama32_special_tokens() {
 
 #[test]
 fn test_llama32_whitespace() {
-    let Some(tok) = load_tokenizer(LLAMA_32_DIR) else { return };
+    let Some(tok) = load_tokenizer(LLAMA_32_DIR) else {
+        return;
+    };
     let text = "  multiple   spaces   here  ";
     let ids = tok.encode(text);
     let decoded = tok.decode(&ids, false);
@@ -238,7 +237,9 @@ fn test_llama32_whitespace() {
 
 #[test]
 fn test_llama32_empty() {
-    let Some(tok) = load_tokenizer(LLAMA_32_DIR) else { return };
+    let Some(tok) = load_tokenizer(LLAMA_32_DIR) else {
+        return;
+    };
     let ids = tok.encode("");
     assert!(ids.is_empty());
     let decoded = tok.decode(&[], false);
@@ -247,7 +248,9 @@ fn test_llama32_empty() {
 
 #[test]
 fn test_llama32_newlines() {
-    let Some(tok) = load_tokenizer(LLAMA_32_DIR) else { return };
+    let Some(tok) = load_tokenizer(LLAMA_32_DIR) else {
+        return;
+    };
     let text = "line1\nline2\n\nline4";
     let ids = tok.encode(text);
     let decoded = tok.decode(&ids, false);
@@ -264,14 +267,20 @@ const QWEN3_DIR: &str = "/Users/ingim/.cache/huggingface/hub/models--Qwen--Qwen3
 fn test_qwen3_load() {
     let tok = load_tokenizer(QWEN3_DIR);
     if let Some(tok) = tok {
-        assert!(tok.vocab_size() >= 150000, "vocab too small: {}", tok.vocab_size());
+        assert!(
+            tok.vocab_size() >= 150000,
+            "vocab too small: {}",
+            tok.vocab_size()
+        );
         println!("Qwen3 vocab size: {}", tok.vocab_size());
     }
 }
 
 #[test]
 fn test_qwen3_roundtrip() {
-    let Some(tok) = load_tokenizer(QWEN3_DIR) else { return };
+    let Some(tok) = load_tokenizer(QWEN3_DIR) else {
+        return;
+    };
     // NFC normalizer composes combining characters, making roundtrip lossy
     // for decomposed input (e.g. a+U+0300 → à).
     assert_roundtrip(&tok, ROUNDTRIP_TEXTS, true);
@@ -287,14 +296,20 @@ const MISTRAL_DIR: &str = "/Users/ingim/.cache/huggingface/hub/models--mistralai
 fn test_mistral_load() {
     let tok = load_tokenizer(MISTRAL_DIR);
     if let Some(tok) = tok {
-        assert!(tok.vocab_size() >= 30000, "vocab too small: {}", tok.vocab_size());
+        assert!(
+            tok.vocab_size() >= 30000,
+            "vocab too small: {}",
+            tok.vocab_size()
+        );
         println!("Mistral vocab size: {}", tok.vocab_size());
     }
 }
 
 #[test]
 fn test_mistral_roundtrip() {
-    let Some(tok) = load_tokenizer(MISTRAL_DIR) else { return };
+    let Some(tok) = load_tokenizer(MISTRAL_DIR) else {
+        return;
+    };
     // Mistral uses Metaspace pre-tokenizer — leading whitespace can be lossy.
     assert_roundtrip(&tok, ROUNDTRIP_TEXTS, true);
 }
@@ -309,14 +324,20 @@ const GPT_OSS_DIR: &str = "/Users/ingim/.cache/huggingface/hub/models--openai--g
 fn test_gpt_oss_load() {
     let tok = load_tokenizer(GPT_OSS_DIR);
     if let Some(tok) = tok {
-        assert!(tok.vocab_size() >= 200000, "vocab too small: {}", tok.vocab_size());
+        assert!(
+            tok.vocab_size() >= 200000,
+            "vocab too small: {}",
+            tok.vocab_size()
+        );
         println!("GPT-oss-120b vocab size: {}", tok.vocab_size());
     }
 }
 
 #[test]
 fn test_gpt_oss_roundtrip() {
-    let Some(tok) = load_tokenizer(GPT_OSS_DIR) else { return };
+    let Some(tok) = load_tokenizer(GPT_OSS_DIR) else {
+        return;
+    };
     assert_roundtrip(&tok, ROUNDTRIP_TEXTS, false);
 }
 
@@ -330,14 +351,20 @@ const PHI4_DIR: &str = "/Users/ingim/.cache/huggingface/hub/models--microsoft--p
 fn test_phi4_load() {
     let tok = load_tokenizer(PHI4_DIR);
     if let Some(tok) = tok {
-        assert!(tok.vocab_size() >= 100000, "vocab too small: {}", tok.vocab_size());
+        assert!(
+            tok.vocab_size() >= 100000,
+            "vocab too small: {}",
+            tok.vocab_size()
+        );
         println!("Phi-4 vocab size: {}", tok.vocab_size());
     }
 }
 
 #[test]
 fn test_phi4_roundtrip() {
-    let Some(tok) = load_tokenizer(PHI4_DIR) else { return };
+    let Some(tok) = load_tokenizer(PHI4_DIR) else {
+        return;
+    };
     assert_roundtrip(&tok, ROUNDTRIP_TEXTS, false);
 }
 
@@ -351,14 +378,20 @@ const OLMO_DIR: &str = "/Users/ingim/.cache/huggingface/hub/models--allenai--Olm
 fn test_olmo_load() {
     let tok = load_tokenizer(OLMO_DIR);
     if let Some(tok) = tok {
-        assert!(tok.vocab_size() >= 100000, "vocab too small: {}", tok.vocab_size());
+        assert!(
+            tok.vocab_size() >= 100000,
+            "vocab too small: {}",
+            tok.vocab_size()
+        );
         println!("OLMo vocab size: {}", tok.vocab_size());
     }
 }
 
 #[test]
 fn test_olmo_roundtrip() {
-    let Some(tok) = load_tokenizer(OLMO_DIR) else { return };
+    let Some(tok) = load_tokenizer(OLMO_DIR) else {
+        return;
+    };
     assert_roundtrip(&tok, ROUNDTRIP_TEXTS, false);
 }
 
@@ -372,14 +405,20 @@ const GEMMA2_DIR: &str = "/Users/ingim/.cache/huggingface/hub/models--google--ge
 fn test_gemma2_load() {
     let tok = load_tokenizer(GEMMA2_DIR);
     if let Some(tok) = tok {
-        assert!(tok.vocab_size() >= 256000, "vocab too small: {}", tok.vocab_size());
+        assert!(
+            tok.vocab_size() >= 256000,
+            "vocab too small: {}",
+            tok.vocab_size()
+        );
         println!("Gemma-2-2b vocab size: {}", tok.vocab_size());
     }
 }
 
 #[test]
 fn test_gemma2_roundtrip() {
-    let Some(tok) = load_tokenizer(GEMMA2_DIR) else { return };
+    let Some(tok) = load_tokenizer(GEMMA2_DIR) else {
+        return;
+    };
     assert_roundtrip(&tok, ROUNDTRIP_TEXTS, false);
 }
 
@@ -393,14 +432,20 @@ const GEMMA3_DIR: &str = "/Users/ingim/.cache/huggingface/hub/models--google--ge
 fn test_gemma3_load() {
     let tok = load_tokenizer(GEMMA3_DIR);
     if let Some(tok) = tok {
-        assert!(tok.vocab_size() >= 262000, "vocab too small: {}", tok.vocab_size());
+        assert!(
+            tok.vocab_size() >= 262000,
+            "vocab too small: {}",
+            tok.vocab_size()
+        );
         println!("Gemma-3-12b vocab size: {}", tok.vocab_size());
     }
 }
 
 #[test]
 fn test_gemma3_roundtrip() {
-    let Some(tok) = load_tokenizer(GEMMA3_DIR) else { return };
+    let Some(tok) = load_tokenizer(GEMMA3_DIR) else {
+        return;
+    };
     // Gemma-3 uses SentencePiece — some rare Unicode chars may be lossy.
     assert_roundtrip(&tok, ROUNDTRIP_TEXTS, true);
 }
@@ -415,14 +460,20 @@ const DEEPSEEK_DIR: &str = "/Users/ingim/.cache/huggingface/hub/models--deepseek
 fn test_deepseek_load() {
     let tok = load_tokenizer(DEEPSEEK_DIR);
     if let Some(tok) = tok {
-        assert!(tok.vocab_size() >= 128000, "vocab too small: {}", tok.vocab_size());
+        assert!(
+            tok.vocab_size() >= 128000,
+            "vocab too small: {}",
+            tok.vocab_size()
+        );
         println!("DeepSeek-V3.2-Exp vocab size: {}", tok.vocab_size());
     }
 }
 
 #[test]
 fn test_deepseek_roundtrip() {
-    let Some(tok) = load_tokenizer(DEEPSEEK_DIR) else { return };
+    let Some(tok) = load_tokenizer(DEEPSEEK_DIR) else {
+        return;
+    };
     assert_roundtrip(&tok, ROUNDTRIP_TEXTS, false);
 }
 
@@ -436,14 +487,20 @@ const MINISTRAL_DIR: &str = "/Users/ingim/.cache/huggingface/hub/models--mistral
 fn test_ministral_load() {
     let tok = load_tokenizer(MINISTRAL_DIR);
     if let Some(tok) = tok {
-        assert!(tok.vocab_size() >= 131000, "vocab too small: {}", tok.vocab_size());
+        assert!(
+            tok.vocab_size() >= 131000,
+            "vocab too small: {}",
+            tok.vocab_size()
+        );
         println!("Ministral-3-3B vocab size: {}", tok.vocab_size());
     }
 }
 
 #[test]
 fn test_ministral_roundtrip() {
-    let Some(tok) = load_tokenizer(MINISTRAL_DIR) else { return };
+    let Some(tok) = load_tokenizer(MINISTRAL_DIR) else {
+        return;
+    };
     assert_roundtrip(&tok, ROUNDTRIP_TEXTS, false);
 }
 
@@ -457,14 +514,20 @@ const NEMOTRON_DIR: &str = "/Users/ingim/.cache/huggingface/hub/models--nvidia--
 fn test_nemotron_load() {
     let tok = load_tokenizer(NEMOTRON_DIR);
     if let Some(tok) = tok {
-        assert!(tok.vocab_size() >= 131000, "vocab too small: {}", tok.vocab_size());
+        assert!(
+            tok.vocab_size() >= 131000,
+            "vocab too small: {}",
+            tok.vocab_size()
+        );
         println!("Nemotron-3-Nano vocab size: {}", tok.vocab_size());
     }
 }
 
 #[test]
 fn test_nemotron_roundtrip() {
-    let Some(tok) = load_tokenizer(NEMOTRON_DIR) else { return };
+    let Some(tok) = load_tokenizer(NEMOTRON_DIR) else {
+        return;
+    };
     assert_roundtrip(&tok, ROUNDTRIP_TEXTS, false);
 }
 
@@ -496,4 +559,3 @@ fn test_cross_model_decode_consistency() {
         }
     }
 }
-

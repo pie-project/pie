@@ -57,8 +57,7 @@ Qwen3_5StateCache Qwen3_5StateCache::allocate(
 void Qwen3_5StateCache::reset(cudaStream_t stream)
 {
     const std::size_t conv_bytes = conv_slot_stride_bytes() * max_slots_;
-    const std::size_t rec_bytes  = recurrent_slot_stride_floats() *
-                                   max_slots_ * sizeof(float);
+    const std::size_t rec_bytes  = recurrent_slot_stride_bytes() * max_slots_;
     for (std::size_t L = 0; L < layer_is_linear_.size(); ++L) {
         if (!layer_is_linear_[L]) continue;
         CUDA_CHECK(cudaMemsetAsync(conv_states_[L].data(), 0, conv_bytes, stream));
@@ -72,16 +71,45 @@ void Qwen3_5StateCache::reset_slot(int slot, cudaStream_t stream)
         throw std::out_of_range("Qwen3_5StateCache::reset_slot: slot out of range");
     }
     const std::size_t conv_bytes  = conv_slot_stride_bytes();
-    const std::size_t rec_floats  = recurrent_slot_stride_floats();
-    const std::size_t rec_bytes   = rec_floats * sizeof(float);
+    const std::size_t rec_bytes   = recurrent_slot_stride_bytes();
     for (std::size_t L = 0; L < layer_is_linear_.size(); ++L) {
         if (!layer_is_linear_[L]) continue;
         auto* conv_base = reinterpret_cast<std::uint8_t*>(conv_states_[L].data());
-        auto* rec_base  = recurrent_states_[L].data();
+        auto* rec_base  = reinterpret_cast<std::uint8_t*>(recurrent_states_[L].data());
         CUDA_CHECK(cudaMemsetAsync(
             conv_base + slot * conv_bytes, 0, conv_bytes, stream));
         CUDA_CHECK(cudaMemsetAsync(
-            rec_base + slot * rec_floats, 0, rec_bytes, stream));
+            rec_base + static_cast<std::size_t>(slot) * rec_bytes,
+            0, rec_bytes, stream));
+    }
+}
+
+void Qwen3_5StateCache::copy_slot_d2d(int src_slot, int dst_slot, cudaStream_t stream)
+{
+    if (src_slot < 0 || src_slot >= max_slots_ || dst_slot < 0 || dst_slot >= max_slots_) {
+        throw std::out_of_range("Qwen3_5StateCache::copy_slot_d2d: slot out of range");
+    }
+    if (src_slot == dst_slot) {
+        return;
+    }
+    const std::size_t conv_bytes = conv_slot_stride_bytes();
+    const std::size_t rec_bytes = recurrent_slot_stride_bytes();
+    for (std::size_t L = 0; L < layer_is_linear_.size(); ++L) {
+        if (!layer_is_linear_[L]) continue;
+        auto* conv_base = reinterpret_cast<std::uint8_t*>(conv_states_[L].data());
+        auto* rec_base = reinterpret_cast<std::uint8_t*>(recurrent_states_[L].data());
+        CUDA_CHECK(cudaMemcpyAsync(
+            conv_base + static_cast<std::size_t>(dst_slot) * conv_bytes,
+            conv_base + static_cast<std::size_t>(src_slot) * conv_bytes,
+            conv_bytes,
+            cudaMemcpyDeviceToDevice,
+            stream));
+        CUDA_CHECK(cudaMemcpyAsync(
+            rec_base + static_cast<std::size_t>(dst_slot) * rec_bytes,
+            rec_base + static_cast<std::size_t>(src_slot) * rec_bytes,
+            rec_bytes,
+            cudaMemcpyDeviceToDevice,
+            stream));
     }
 }
 
@@ -102,7 +130,8 @@ float* Qwen3_5StateCache::recurrent_state(int layer, int slot)
     }
     float* base = recurrent_states_[layer].data();
     if (base == nullptr) return nullptr;  // full-attention layer
-    return base + static_cast<std::size_t>(slot) * recurrent_slot_stride_floats();
+    return base + static_cast<std::size_t>(slot) *
+        recurrent_slot_stride_floats();
 }
 
 }  // namespace pie_cuda_driver

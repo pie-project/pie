@@ -30,11 +30,7 @@ pub struct Provider {
 }
 
 impl Provider {
-    pub fn spawn(
-        handle: &tokio::runtime::Handle,
-        url: String,
-        token: String,
-    ) -> Self {
+    pub fn spawn(handle: &tokio::runtime::Handle, url: String, token: String) -> Self {
         let snapshot = Arc::new(Mutex::new(Snapshot::default()));
         let stop_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
@@ -139,9 +135,9 @@ async fn poll_once(
     let mut avg_latency_us: u64 = 0;
     if let Some(map) = stats_obj {
         for (key, value) in map.iter() {
-            let v = value.as_u64().unwrap_or_else(|| {
-                value.as_i64().unwrap_or(0).max(0) as u64
-            });
+            let v = value
+                .as_u64()
+                .unwrap_or_else(|| value.as_i64().unwrap_or(0).max(0) as u64);
             if key.ends_with(".kv_pages_used") {
                 kv_pages_used = kv_pages_used.saturating_add(v);
             } else if key.ends_with(".kv_pages_total") {
@@ -159,8 +155,7 @@ async fn poll_once(
     if let Some(last) = state.last_poll {
         let dt = now.duration_since(last).as_secs_f64();
         if dt > 0.0 && total_tokens > state.prev_total_tokens {
-            state.estimated_tput =
-                (total_tokens - state.prev_total_tokens) as f64 / dt;
+            state.estimated_tput = (total_tokens - state.prev_total_tokens) as f64 / dt;
         } else if total_tokens == state.prev_total_tokens {
             state.estimated_tput = 0.0;
         }
@@ -178,10 +173,7 @@ async fn poll_once(
         0.0
     };
 
-    let gpu_metrics = nvml
-        .as_ref()
-        .map(NvmlContext::sample)
-        .unwrap_or_default();
+    let gpu_metrics = nvml.as_ref().map(NvmlContext::sample).unwrap_or_default();
     // One TP group per visible GPU until the engine side surfaces a
     // real grouping over RPC. Same shape Python's provider produces.
     let tp_groups: Vec<TpGroupMetrics> = gpu_metrics
@@ -194,11 +186,7 @@ async fn poll_once(
         .collect();
 
     let processes = client.list_processes().await.unwrap_or_default();
-    let inferlets: Vec<Inferlet> = processes
-        .into_iter()
-        .take(50)
-        .map(parse_inferlet)
-        .collect();
+    let inferlets: Vec<Inferlet> = processes.into_iter().take(50).map(parse_inferlet).collect();
 
     push_history(&mut state.kv_cache_history, kv_cache_pct);
     push_history(&mut state.token_tput_history, state.estimated_tput);
@@ -242,7 +230,11 @@ fn push_history(history: &mut Vec<f64>, value: f64) {
 fn parse_inferlet(raw: String) -> Inferlet {
     if let Ok(p) = serde_json::from_str::<ProcessJson>(&raw) {
         let id = p.id.unwrap_or_default();
-        let id_short = if id.len() > 12 { id[..12].to_string() } else { id };
+        let id_short = if id.len() > 12 {
+            id[..12].to_string()
+        } else {
+            id
+        };
         let elapsed = p
             .elapsed_secs
             .map(|s| {
@@ -263,7 +255,11 @@ fn parse_inferlet(raw: String) -> Inferlet {
         };
     }
     // Bare UUID string fallback.
-    let id_short = if raw.len() > 12 { raw[..12].to_string() } else { raw };
+    let id_short = if raw.len() > 12 {
+        raw[..12].to_string()
+    } else {
+        raw
+    };
     Inferlet {
         id: id_short,
         program: "inferlet".to_string(),
@@ -308,7 +304,9 @@ impl NvmlContext {
     fn sample(&self) -> Vec<GpuMetrics> {
         let mut out = Vec::with_capacity(self.count as usize);
         for i in 0..self.count {
-            let Ok(d) = self.nvml.device_by_index(i) else { continue };
+            let Ok(d) = self.nvml.device_by_index(i) else {
+                continue;
+            };
             let util = d.utilization_rates().ok();
             let mem = d.memory_info().ok();
             let utilization = util.map(|u| u.gpu as f64).unwrap_or(0.0);

@@ -66,7 +66,10 @@ impl<T: Eq + Hash + Copy> Default for SmallDedup<T> {
 
 impl<T: Eq + Hash + Copy> SmallDedup<T> {
     pub(super) fn new() -> Self {
-        Self { vec: Vec::new(), set: None }
+        Self {
+            vec: Vec::new(),
+            set: None,
+        }
     }
 
     fn clear(&mut self) {
@@ -254,8 +257,12 @@ impl StackParser {
 
         // Process queue (predict/complete)
         self.process_queue(
-            &mut queue, &mut visited, &mut scanable, &mut returns,
-            &mut accept_stop, &[],
+            &mut queue,
+            &mut visited,
+            &mut scanable,
+            &mut returns,
+            &mut accept_stop,
+            &[],
         );
 
         // Append to arenas
@@ -315,7 +322,10 @@ impl StackParser {
         // Scan phase: advance each active state by the byte via DFA
         self.scan_states(
             &self.state_arena[state_start..state_end],
-            ch, &mut queue, &mut visited, &mut scanable,
+            ch,
+            &mut queue,
+            &mut visited,
+            &mut scanable,
         );
 
         if queue.is_empty() && scanable.is_empty() {
@@ -331,8 +341,12 @@ impl StackParser {
         // Process queue (predict/complete) — only when there are non-pure-scan states
         if !queue.is_empty() {
             self.process_queue(
-                &mut queue, &mut visited, &mut scanable, &mut returns,
-                &mut accept_stop, &[],
+                &mut queue,
+                &mut visited,
+                &mut scanable,
+                &mut returns,
+                &mut accept_stop,
+                &[],
             );
         }
 
@@ -395,16 +409,16 @@ impl StackParser {
         for i in 0..ret_count {
             let (expected, mut parent) = self.return_arena[prev_rstart + i];
             if parent.return_level != NO_PARENT {
-                parent.return_level = (parent.return_level as i64
-                    + self.steady.return_deltas[i] as i64)
-                    as u32;
+                parent.return_level =
+                    (parent.return_level as i64 + self.steady.return_deltas[i] as i64) as u32;
             }
             self.return_arena.push((expected, parent));
         }
         self.is_completed.push(self.steady.is_completed);
         // Keep chain cache up to date
         if let Some((rid, dfa, terminal, last)) = self.chain_terminal.get() {
-            self.chain_terminal.set(Some((rid, dfa, terminal, last + 1)));
+            self.chain_terminal
+                .set(Some((rid, dfa, terminal, last + 1)));
         }
     }
 
@@ -483,14 +497,15 @@ impl StackParser {
                 // child finishes. Pre-register grandparents as also waiting for this
                 // child rule, so complete() finds them directly without cascading
                 // through the pass-through intermediate.
-                let parent_action = self.compiled.action(parent_after.rule_id, parent_after.dfa_state);
-                if parent_action.flags.is_pass_through()
-                    && parent_after.return_level != NO_PARENT
-                {
+                let parent_action = self
+                    .compiled
+                    .action(parent_after.rule_id, parent_after.dfa_state);
+                if parent_action.flags.is_pass_through() && parent_after.return_level != NO_PARENT {
                     let level = parent_after.return_level as usize;
                     if level < self.return_offsets.len() {
                         let rstart = self.return_offsets[level];
-                        let rend = self.return_offsets
+                        let rend = self
+                            .return_offsets
                             .get(level + 1)
                             .copied()
                             .unwrap_or(self.return_arena.len());
@@ -526,9 +541,7 @@ impl StackParser {
                         }
                     }
                 }
-                self.complete(
-                    &state, queue, visited, returns, accept_stop, extra_returns,
-                );
+                self.complete(&state, queue, visited, returns, accept_stop, extra_returns);
             }
 
             // If has char edges, it's scanable
@@ -559,7 +572,8 @@ impl StackParser {
         // From stored history
         if start_pos < self.return_offsets.len() {
             let rstart = self.return_offsets[start_pos];
-            let rend = self.return_offsets
+            let rend = self
+                .return_offsets
                 .get(start_pos + 1)
                 .copied()
                 .unwrap_or(self.return_arena.len());
@@ -572,14 +586,19 @@ impl StackParser {
                         && parent_after.rule_id == state.rule_id
                         && parent_after.return_level != NO_PARENT
                         && (parent_after.return_level as usize) < start_pos
-                        && self.compiled.action(parent_after.rule_id, parent_after.dfa_state)
-                            .flags.is_pass_through()
+                        && self
+                            .compiled
+                            .action(parent_after.rule_id, parent_after.dfa_state)
+                            .flags
+                            .is_pass_through()
                     {
                         self.follow_chain_to_terminal(
                             parent_after.rule_id,
                             parent_after.dfa_state,
                             parent_after.return_level as usize,
-                            queue, visited, accept_stop,
+                            queue,
+                            visited,
+                            accept_stop,
                         );
                         continue;
                     }
@@ -632,16 +651,16 @@ impl StackParser {
         // Check cache — only valid for consecutive advances (start == last + 1).
         // This ensures the chain is growing from the same context, not a new one.
         if let Some((cached_rid, cached_dfa, terminal, last_start)) = self.chain_terminal.get() {
-            if cached_rid == chain_rule_id && cached_dfa == chain_dfa_state
+            if cached_rid == chain_rule_id
+                && cached_dfa == chain_dfa_state
                 && start_level == last_start + 1
                 && terminal < self.return_offsets.len()
             {
                 // Use cached terminal — process its returns directly.
                 // Non-chain parents at start_level are handled by complete()'s normal loop.
-                self.process_terminal_returns(
-                    chain_rule_id, terminal, queue, visited, accept_stop,
-                );
-                self.chain_terminal.set(Some((cached_rid, cached_dfa, terminal, start_level)));
+                self.process_terminal_returns(chain_rule_id, terminal, queue, visited, accept_stop);
+                self.chain_terminal
+                    .set(Some((cached_rid, cached_dfa, terminal, start_level)));
                 return;
             }
         }
@@ -656,7 +675,8 @@ impl StackParser {
                 break;
             }
             let rstart = self.return_offsets[level];
-            let rend = self.return_offsets
+            let rend = self
+                .return_offsets
                 .get(level + 1)
                 .copied()
                 .unwrap_or(self.return_arena.len());
@@ -681,7 +701,8 @@ impl StackParser {
             if let Some(next_level) = chain_target {
                 level = next_level;
             } else {
-                self.chain_terminal.set(Some((chain_rule_id, chain_dfa_state, level, start_level)));
+                self.chain_terminal
+                    .set(Some((chain_rule_id, chain_dfa_state, level, start_level)));
                 break;
             }
         }
@@ -699,7 +720,8 @@ impl StackParser {
         _accept_stop: &mut bool,
     ) {
         let rstart = self.return_offsets[terminal_level];
-        let rend = self.return_offsets
+        let rend = self
+            .return_offsets
             .get(terminal_level + 1)
             .copied()
             .unwrap_or(self.return_arena.len());
@@ -767,8 +789,12 @@ impl StackParser {
         let mut accept_stop = false;
         if !queue_buf.is_empty() {
             self.process_queue(
-                queue_buf, visited_buf, scanable_buf, returns_buf,
-                &mut accept_stop, extra_returns,
+                queue_buf,
+                visited_buf,
+                scanable_buf,
+                returns_buf,
+                &mut accept_stop,
+                extra_returns,
             );
         }
 
@@ -898,9 +924,10 @@ impl StackParser {
         }
 
         // Structural comparison: same rule_id and dfa_state (return_level may differ)
-        let structurally_same = prev_states.iter().zip(curr_states.iter()).all(|(a, b)| {
-            a.rule_id == b.rule_id && a.dfa_state == b.dfa_state
-        });
+        let structurally_same = prev_states
+            .iter()
+            .zip(curr_states.iter())
+            .all(|(a, b)| a.rule_id == b.rule_id && a.dfa_state == b.dfa_state);
         if !structurally_same {
             return;
         }
@@ -916,19 +943,22 @@ impl StackParser {
             return;
         }
         let returns_same = prev_returns.iter().zip(curr_returns.iter()).all(|(a, b)| {
-            a.0 == b.0
-                && a.1.rule_id == b.1.rule_id
-                && a.1.dfa_state == b.1.dfa_state
+            a.0 == b.0 && a.1.rule_id == b.1.rule_id && a.1.dfa_state == b.1.dfa_state
         });
         if !returns_same {
             return;
         }
 
         // Compute return_level deltas (state deltas)
-        let state_deltas: Vec<i32> = prev_states.iter().zip(curr_states.iter())
+        let state_deltas: Vec<i32> = prev_states
+            .iter()
+            .zip(curr_states.iter())
             .map(|(p, c)| {
-                if p.return_level == NO_PARENT { 0 }
-                else { c.return_level as i32 - p.return_level as i32 }
+                if p.return_level == NO_PARENT {
+                    0
+                } else {
+                    c.return_level as i32 - p.return_level as i32
+                }
             })
             .collect();
 
@@ -938,10 +968,15 @@ impl StackParser {
         }
 
         // Compute return_level deltas (return entry deltas)
-        let return_deltas: Vec<i32> = prev_returns.iter().zip(curr_returns.iter())
+        let return_deltas: Vec<i32> = prev_returns
+            .iter()
+            .zip(curr_returns.iter())
             .map(|(p, c)| {
-                if p.1.return_level == NO_PARENT { 0 }
-                else { c.1.return_level as i32 - p.1.return_level as i32 }
+                if p.1.return_level == NO_PARENT {
+                    0
+                } else {
+                    c.1.return_level as i32 - p.1.return_level as i32
+                }
             })
             .collect();
 
@@ -949,8 +984,8 @@ impl StackParser {
             return;
         }
 
-        let all_zero = state_deltas.iter().all(|&d| d == 0)
-            && return_deltas.iter().all(|&d| d == 0);
+        let all_zero =
+            state_deltas.iter().all(|&d| d == 0) && return_deltas.iter().all(|&d| d == 0);
 
         // Extract steady ranges from DFA edges
         if let Some(ranges) = self.extract_steady_ranges(curr_states, ch) {
@@ -987,17 +1022,20 @@ impl StackParser {
 
             // Collect byte ranges leading to the SAME target as ch
             let edges = dfa.fsm.edges(StateId(state.dfa_state as u32));
-            let ranges: Vec<(u8, u8)> = edges.iter().filter_map(|e| {
-                if let FsmEdge::CharRange { min, max, target } = e {
-                    if *target == ch_target {
-                        Some((*min, *max))
+            let ranges: Vec<(u8, u8)> = edges
+                .iter()
+                .filter_map(|e| {
+                    if let FsmEdge::CharRange { min, max, target } = e {
+                        if *target == ch_target {
+                            Some((*min, *max))
+                        } else {
+                            None
+                        }
                     } else {
                         None
                     }
-                } else {
-                    None
-                }
-            }).collect();
+                })
+                .collect();
 
             // All direct-advance states must agree on the ranges
             match &winner {
@@ -1084,46 +1122,74 @@ mod tests {
             "required": ["id", "name", "status", "address", "scores"],
             "additionalProperties": false
         }"#;
-        let grammar = Arc::new(crate::inference::structured::json_schema::json_schema_to_grammar(json_schema, &crate::inference::structured::json_schema::JsonSchemaOptions::default()).unwrap());
-        let vocab: Vec<String> = (0..256u16).map(|b| String::from(b as u8 as char)).collect();
-        let tokenizer = Arc::new(
-            Tokenizer::from_vocab(&vocab),
+        let grammar = Arc::new(
+            crate::inference::structured::json_schema::json_schema_to_grammar(
+                json_schema,
+                &crate::inference::structured::json_schema::JsonSchemaOptions::default(),
+            )
+            .unwrap(),
         );
+        let vocab: Vec<String> = (0..256u16).map(|b| String::from(b as u8 as char)).collect();
+        let tokenizer = Arc::new(Tokenizer::from_vocab(&vocab));
         let compiled = Arc::new(CompiledGrammar::new(&grammar, &tokenizer));
         let mut parser = StackParser::new(compiled.clone());
 
         let input = r#"{"id":42,"name":"Alice","status":"active","address":{"street":"123 Main St","city":"Springfield","state":"IL","zip":"62704"},"scores":[95,87,92]}"#;
 
         eprintln!("\n=== PER-BYTE DIAGNOSTIC: {} bytes ===", input.len());
-        eprintln!("{:<5} {:<5} {:<8} {:<8} {:<6}",
-            "pos", "char", "states", "returns", "steady");
+        eprintln!(
+            "{:<5} {:<5} {:<8} {:<8} {:<6}",
+            "pos", "char", "states", "returns", "steady"
+        );
 
         for (pos, &byte) in input.as_bytes().iter().enumerate() {
-            let prev_states = parser.state_arena.len()
-                - parser.state_offsets.last().copied().unwrap_or(0);
+            let prev_states =
+                parser.state_arena.len() - parser.state_offsets.last().copied().unwrap_or(0);
             let was_steady = parser.steady.active;
-            assert!(parser.advance(byte), "failed at pos {} char '{}'", pos, byte as char);
-            let new_states = parser.state_arena.len()
-                - parser.state_offsets.last().copied().unwrap_or(0);
-            let new_returns = parser.return_arena.len()
-                - parser.return_offsets.last().copied().unwrap_or(0);
+            assert!(
+                parser.advance(byte),
+                "failed at pos {} char '{}'",
+                pos,
+                byte as char
+            );
+            let new_states =
+                parser.state_arena.len() - parser.state_offsets.last().copied().unwrap_or(0);
+            let new_returns =
+                parser.return_arena.len() - parser.return_offsets.last().copied().unwrap_or(0);
             let is_steady = parser.steady.active;
-            let steady_str = if was_steady && is_steady { "lazy" }
-                else if !was_steady && is_steady { "ENTER" }
-                else if was_steady && !is_steady { "EXIT" }
-                else { "-" };
-            eprintln!("{:<5} {:<5} {:<8} {:<8} {:<6}",
-                pos, format!("'{}'", byte as char),
+            let steady_str = if was_steady && is_steady {
+                "lazy"
+            } else if !was_steady && is_steady {
+                "ENTER"
+            } else if was_steady && !is_steady {
+                "EXIT"
+            } else {
+                "-"
+            };
+            eprintln!(
+                "{:<5} {:<5} {:<8} {:<8} {:<6}",
+                pos,
+                format!("'{}'", byte as char),
                 format!("{}→{}", prev_states, new_states),
-                format!("→{}", new_returns), steady_str);
+                format!("→{}", new_returns),
+                steady_str
+            );
         }
         eprintln!("\n=== ARENA SIZES ===");
-        eprintln!("state_arena: {} entries, return_arena: {} entries",
-            parser.state_arena.len(), parser.return_arena.len());
+        eprintln!(
+            "state_arena: {} entries, return_arena: {} entries",
+            parser.state_arena.len(),
+            parser.return_arena.len()
+        );
         eprintln!("\n=== RULE DFA SIZES ===");
         for (i, dfa) in compiled.rule_dfas.iter().enumerate() {
             let name = &compiled.grammar.rules()[i].name;
-            eprintln!("  rule {} ({}): {} DFA states", i, name, dfa.fsm.num_states());
+            eprintln!(
+                "  rule {} ({}): {} DFA states",
+                i,
+                name,
+                dfa.fsm.num_states()
+            );
         }
     }
 }

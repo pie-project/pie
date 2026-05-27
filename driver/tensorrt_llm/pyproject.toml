@@ -1,0 +1,47 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pie-driver-tensorrt-llm"
+version = "0.3.0"
+description = "Pie driver - TensorRT-LLM backend. Uses TensorRT-LLM's LLM API under pie's subprocess RPC surface."
+readme = "README.md"
+requires-python = ">=3.11,<3.13"
+license = "Apache-2.0"
+authors = [{ name = "In Gim", email = "in.gim@icloud.com" }]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+dependencies = [
+    "pie-bridge",
+    "msgpack>=0.5",
+    "msgspec>=0.18",
+    "numba>=0.61,<0.66",
+    "opentelemetry-api>=1.20",
+    "psutil>=5.9",
+    "torch==2.9.1",
+    "torchvision==0.24.1",
+    "torchaudio==2.9.1",
+    "tensorrt-llm==1.2.1",
+    "nvidia-cublas>=13,<14",
+    "transformers>=4.46",
+    "huggingface-hub>=0.24",
+]
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[tool.uv.sources]
+pie-bridge = { path = "../bridge", editable = true }
+torch = [{ index = "pytorch-cu128" }]
+torchvision = [{ index = "pytorch-cu128" }]
+torchaudio = [{ index = "pytorch-cu128" }]
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+packages = ["pie_driver_tensorrt_llm", "pie_driver_tensorrt_llm._bridge"]

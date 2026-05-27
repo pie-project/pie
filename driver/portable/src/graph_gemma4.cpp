@@ -47,7 +47,7 @@ inline std::int32_t gemma4_kv_source(const std::string& pattern,
 GraphResult build_gemma4_graph(ggml_context* ctx,
                                const Model& model,
                                KvCachePaged& kv,
-                               const ForwardEngine::BatchPlan& plan) {
+                               const Executor::BatchPlan& plan) {
     const auto& h = model.hparams();
     const auto& w = model.weights();
     const std::int32_t n_q_heads  = h.num_attention_heads;
@@ -188,6 +188,8 @@ GraphResult build_gemma4_graph(ggml_context* ctx,
                                          n_embd_gqa_il, n_total);
             auto* v_2d = ggml_reshape_2d(ctx, ggml_cont(ctx, V),
                                          n_embd_gqa_il, n_total);
+            k_2d = kv.qdq_for_append(ctx, kv_layer, k_2d);
+            v_2d = kv.qdq_for_append(ctx, kv_layer, v_2d);
             live_k[kv_layer] = ggml_set_rows(ctx, kv.k(kv_layer), k_2d, in.kv_idxs);
             live_v[kv_layer] = ggml_set_rows(ctx, kv.v(kv_layer), v_2d, in.kv_idxs);
         }

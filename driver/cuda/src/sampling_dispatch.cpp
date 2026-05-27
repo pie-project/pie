@@ -8,67 +8,130 @@
 #include "cuda_check.hpp"
 #include "kernels/sample_flashinfer.hpp"
 #include "kernels/sample_temp.hpp"
+#include "kernels/scatter_int32.hpp"
 #include "model/qwen3_forward.hpp"
+#include "executor/persistent_inputs.hpp"
 
 namespace pie_cuda_driver {
 
-void dispatch_sampling(
+namespace {
+
+// Async copy a host span to a pre-allocated device buffer on the given
+// stream. Length must fit; partial copies are not allowed.
+template <typename T>
+void upload_async(DeviceBuffer<T>& dst, std::span<const T> src,
+                  cudaStream_t stream) {
+    if (src.empty()) return;
+    if (src.size() > dst.size()) {
+        throw std::runtime_error(
+            "sampling upload: src size > device buffer capacity");
+    }
+    CUDA_CHECK(cudaMemcpyAsync(dst.data(), src.data(),
+                               src.size() * sizeof(T),
+                               cudaMemcpyHostToDevice, stream));
+}
+
+// Pinned host scratch for the topk+top-p seed widening. Allocated once
+// per process so we can keep upload_sampling_inputs allocation-free.
+std::uint64_t* seed64_pinned_buf(std::size_t want_elems) {
+    static std::uint64_t* buf = nullptr;
+    static std::size_t buf_capacity = 0;
+    if (want_elems > buf_capacity) {
+        if (buf) cudaFreeHost(buf);
+        CUDA_CHECK(cudaMallocHost(&buf, want_elems * sizeof(std::uint64_t)));
+        buf_capacity = want_elems;
+    }
+    return buf;
+}
+
+}  // namespace
+
+void upload_sampling_inputs(
+    PersistentInputs& pi,
+    const SamplingPlan& plan,
+    int N,
+    cudaStream_t stream)
+{
+    if (plan.any_topk_topp) {
+        // flashinfer's seed is u64; widen via pinned host scratch so the
+        // cudaMemcpyAsync stays truly async (and graph-capturable, if a
+        // future code path moves it back inside capture).
+        auto* h_seed64 = seed64_pinned_buf(static_cast<std::size_t>(N));
+        for (int i = 0; i < N; ++i) {
+            h_seed64[i] = static_cast<std::uint64_t>(plan.seed[i]);
+        }
+        // flashinfer's TopKTopPSamplingFromProb currently reads seed_arr[0]
+        // once per launch, while top-k/top-p arrays are indexed by row. Put
+        // the first sampled row's resolved seed in slot 0 so prefill samples
+        // whose row index is not zero still get the per-fire fresh seed.
+        if (!plan.sample_idx.empty()) {
+            const int first_row = plan.sample_idx[0];
+            if (first_row >= 0 && first_row < N) {
+                h_seed64[0] = static_cast<std::uint64_t>(plan.seed[first_row]);
+            }
+        }
+        upload_async<float>        (pi.sample_temp,    plan.temp,        stream);
+        upload_async<float>        (pi.sample_top_p,   plan.top_p,       stream);
+        upload_async<std::int32_t> (pi.sample_top_k,   plan.top_k,       stream);
+        upload_async<std::uint64_t>(pi.sample_seed64,
+            std::span<const std::uint64_t>(h_seed64, static_cast<std::size_t>(N)), stream);
+        upload_async<std::int32_t> (pi.sample_idx,     plan.sample_idx,  stream);
+    } else {
+        upload_async<float>        (pi.sample_temp,  plan.temp,  stream);
+        upload_async<float>        (pi.sample_min_p, plan.min_p, stream);
+        upload_async<std::uint32_t>(pi.sample_seed,  plan.seed,  stream);
+    }
+}
+
+void launch_sampling_kernel(
     model::Qwen3Workspace& ws,
     std::int32_t* d_sampled_out,
+    PersistentInputs& pi,
     const SamplingPlan& plan,
     int N,
     int num_sampling,
     int vocab_size,
-    std::uint64_t prng_offset)
+    std::uint64_t prng_offset,
+    cudaStream_t stream)
 {
     if (plan.any_topk_topp) {
-        // flashinfer's seed input is u64; widen.
-        std::vector<std::uint64_t> h_per_seed64(N);
-        for (int i = 0; i < N; ++i) {
-            h_per_seed64[i] = static_cast<std::uint64_t>(plan.seed[i]);
-        }
-
-        auto d_temp_f          = DeviceBuffer<float>::from_host(plan.temp);
-        auto d_top_p_f         = DeviceBuffer<float>::from_host(plan.top_p);
-        auto d_top_k           = DeviceBuffer<std::int32_t>::from_host(plan.top_k);
-        auto d_seed64          = DeviceBuffer<std::uint64_t>::from_host(
-            std::span<const std::uint64_t>(h_per_seed64));
-        auto d_sample_idx      = DeviceBuffer<std::int32_t>::from_host(plan.sample_idx);
-        auto d_per_sample_token = DeviceBuffer<std::int32_t>::alloc(num_sampling);
-        // `valid` scratch: kernel writes per-sample, caller doesn't read.
-        auto d_valid           = DeviceBuffer<bool>::alloc(num_sampling);
-
         kernels::launch_sample_topk_topp_bf16(
             ws.logits.data(), ws.probs.data(),
-            d_temp_f.data(), d_sample_idx.data(), d_top_k.data(),
-            d_top_p_f.data(), d_seed64.data(),
-            d_valid.data(), d_per_sample_token.data(),
+            pi.sample_temp.data(), pi.sample_idx.data(), pi.sample_top_k.data(),
+            pi.sample_top_p.data(), pi.sample_seed64.data(),
+            pi.sample_valid.data(), pi.sample_per_token.data(),
             N, num_sampling, vocab_size,
-            prng_offset, /*stream=*/nullptr);
-
-        // Scatter per-sample tokens back into d_sampled at their global
-        // row positions so downstream code can index by logit row.
-        const auto h_per_sample_token = d_per_sample_token.to_host();
-        std::vector<std::int32_t> h_all_sampled(N, 0);
-        for (int k = 0; k < num_sampling; ++k) {
-            h_all_sampled[plan.sample_idx[k]] = h_per_sample_token[k];
-        }
-        CUDA_CHECK(cudaMemcpy(d_sampled_out, h_all_sampled.data(),
-                              sizeof(std::int32_t) * N,
-                              cudaMemcpyHostToDevice));
+            prng_offset, stream);
+        // On-device scatter — keeps the whole step graph-safe.
+        kernels::launch_scatter_int32(
+            d_sampled_out,
+            pi.sample_idx.data(),
+            pi.sample_per_token.data(),
+            num_sampling, N, stream);
     } else {
-        // Greedy / temperature / min-p path. Writes output for every
-        // row, including non-sample rows; caller indexes by sample row.
-        auto d_temp  = DeviceBuffer<float>::from_host(plan.temp);
-        auto d_min_p = DeviceBuffer<float>::from_host(plan.min_p);
-        auto d_seed  = DeviceBuffer<std::uint32_t>::from_host(plan.seed);
-
         kernels::launch_sample_temp_bf16(
             ws.logits.data(),
-            d_temp.data(), d_min_p.data(), d_seed.data(),
+            pi.sample_temp.data(), pi.sample_min_p.data(), pi.sample_seed.data(),
             d_sampled_out,
-            N, vocab_size, /*stream=*/nullptr);
+            N, vocab_size, stream);
     }
+}
+
+void dispatch_sampling(
+    model::Qwen3Workspace& ws,
+    std::int32_t* d_sampled_out,
+    PersistentInputs& pi,
+    const SamplingPlan& plan,
+    int N,
+    int num_sampling,
+    int vocab_size,
+    std::uint64_t prng_offset,
+    cudaStream_t stream)
+{
+    upload_sampling_inputs(pi, plan, N, stream);
+    launch_sampling_kernel(ws, d_sampled_out, pi, plan,
+                           N, num_sampling, vocab_size,
+                           prng_offset, stream);
 }
 
 }  // namespace pie_cuda_driver

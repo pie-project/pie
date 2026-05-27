@@ -22,6 +22,14 @@ use std::path::{Path, PathBuf};
 fn main() {
     let portable = cfg!(feature = "driver-portable");
     let cuda = cfg!(feature = "driver-cuda");
+    println!("cargo:rerun-if-changed=../driver/common/include");
+    println!("cargo:rerun-if-changed=../driver/common/src");
+    if cuda {
+        println!("cargo:rerun-if-changed=../driver/cuda/CMakeLists.txt");
+        println!("cargo:rerun-if-changed=../driver/cuda/cmake");
+        println!("cargo:rerun-if-changed=../driver/cuda/include");
+        println!("cargo:rerun-if-changed=../driver/cuda/src");
+    }
 
     if portable {
         build_portable();
@@ -30,6 +38,18 @@ fn main() {
         build_cuda();
     }
     build_dummy();
+}
+
+/// Read `DEP_PIE_BRIDGE_INCLUDE` — the directory where `pie-bridge`'s
+/// build.rs writes the cbindgen-generated `pie_bridge.h`. Pass-through to
+/// CMake via `-DPIE_BRIDGE_INCLUDE_DIR=...` so each C++ driver backend
+/// can pick the header up with `target_include_directories`.
+fn pie_bridge_include_dir() -> PathBuf {
+    let dir = std::env::var("DEP_PIE_BRIDGE_INCLUDE").expect(
+        "pie-bridge's build.rs did not emit cargo:include — \
+                 check that `links = \"pie_bridge\"` is set in driver/bridge/Cargo.toml",
+    );
+    PathBuf::from(dir)
 }
 
 // -----------------------------------------------------------------------------
@@ -96,7 +116,8 @@ fn build_portable() {
     };
     cfg.out_dir(portable_out_dir);
     cfg.build_target("pie_driver_portable_lib")
-        .define("BUILD_SHARED_LIBS", "OFF");
+        .define("BUILD_SHARED_LIBS", "OFF")
+        .define("PIE_BRIDGE_INCLUDE_DIR", pie_bridge_include_dir());
     enable_position_independent_archives(&mut cfg);
     // CMake caches option values under OUT_DIR. Define every backend flag
     // explicitly so flipping PIE_PORTABLE_* between builds cannot leave stale
@@ -239,14 +260,53 @@ fn build_cuda() {
     }
 
     let driver_dir = PathBuf::from("../driver/cuda");
+    println!("cargo:rerun-if-changed=../driver/cuda/CMakeLists.txt");
+    println!("cargo:rerun-if-changed=../driver/cuda/src");
 
     let mut cfg = cmake::Config::new(&driver_dir);
     // See `build_portable` — per-flavor out_dir keeps the two CMake
     // configurations from clobbering each other in multi-driver builds.
     cfg.out_dir(std::path::PathBuf::from(std::env::var_os("OUT_DIR").unwrap()).join("cuda"));
     cfg.build_target("pie_driver_cuda_lib")
-        .define("BUILD_SHARED_LIBS", "OFF");
+        .define("BUILD_SHARED_LIBS", "OFF")
+        .define("PIE_BRIDGE_INCLUDE_DIR", pie_bridge_include_dir());
     enable_position_independent_archives(&mut cfg);
+
+    // Optional Marlin W4A16 support. Keep it off by default because the
+    // vendored template kernels add substantial build time, but let Cargo
+    // builds opt into the same CMake path used by standalone driver builds.
+    println!("cargo:rerun-if-env-changed=PIE_CUDA_BUILD_MARLIN");
+    if let Ok(value) = std::env::var("PIE_CUDA_BUILD_MARLIN") {
+        let enabled = matches!(
+            value.to_ascii_lowercase().as_str(),
+            "1" | "on" | "true" | "yes"
+        );
+        if enabled {
+            cfg.define("PIE_CUDA_BUILD_MARLIN", "ON");
+        }
+    }
+
+    // nvcc discovery. CMake reads `CMAKE_CUDA_COMPILER` / `CUDACXX` to
+    // locate nvcc; some toolchains install CUDA under `/usr/local/cuda`
+    // without adding `/usr/local/cuda/bin` to the build user's PATH.
+    // Probe standard locations and hand CMake the explicit path so
+    // workspace builds work without the user having to source CUDA's
+    // env script first.
+    println!("cargo:rerun-if-env-changed=CUDACXX");
+    println!("cargo:rerun-if-env-changed=CMAKE_CUDA_COMPILER");
+    if std::env::var_os("CUDACXX").is_none() && std::env::var_os("CMAKE_CUDA_COMPILER").is_none() {
+        for candidate in [
+            "/usr/local/cuda/bin/nvcc",
+            "/usr/local/cuda-12/bin/nvcc",
+            "/usr/local/cuda-12.8/bin/nvcc",
+            "/opt/cuda/bin/nvcc",
+        ] {
+            if Path::new(candidate).exists() {
+                cfg.define("CMAKE_CUDA_COMPILER", candidate);
+                break;
+            }
+        }
+    }
 
     // CUDA architecture. driver/cuda's `DetectCudaArchitecture.cmake`
     // shells out to `nvidia-smi` if `CMAKE_CUDA_ARCHITECTURES` isn't

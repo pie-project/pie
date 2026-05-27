@@ -1,5 +1,5 @@
 //! OLMo 3 instruct implementation.
-//! 
+//!
 //! Implements OLMo 3 chat template:
 //! - ChatML-style: <|im_start|>role\ncontent<|im_end|>\n
 //! - Tools defined in <functions>...</functions> within system/user messages.
@@ -7,15 +7,10 @@
 //! - Tool outputs in <|im_start|>environment\ncontent<|im_end|>\n.
 //! - Generation prompt adds <|im_start|>assistant\n<think>
 
-use std::sync::Arc;
-use crate::model::instruct::{
-    ChatDecoder,
-    Instruct,
-    ReasoningDecoder,
-    ToolDecoder, ToolEvent,
-};
 use crate::model::instruct::decoders::{GenericChatDecoder, ThinkingDecoder};
+use crate::model::instruct::{ChatDecoder, Instruct, ReasoningDecoder, ToolDecoder, ToolEvent};
 use crate::model::tokenizer::Tokenizer;
+use std::sync::Arc;
 
 static TEMPLATE: &str = r#"
 {% set has_system = messages|selectattr('role', 'equalto', 'system')|list|length > 0 %}{% if not has_system %}{{ '<|im_start|>system
@@ -60,11 +55,11 @@ pub struct OlmoInstruct {
 impl OlmoInstruct {
     pub fn new(tokenizer: Arc<Tokenizer>) -> Self {
         let encode = |s: &str| tokenizer.encode(s);
-        
+
         let im_start = encode("<|im_start|>");
         let im_end = encode("<|im_end|>");
         let newline = encode("\n");
-        let eos_token = encode("<|endoftext|>"); 
+        let eos_token = encode("<|endoftext|>");
 
         let mut stop_ids = im_end.clone();
         stop_ids.extend(&eos_token);
@@ -140,7 +135,7 @@ impl Instruct for OlmoInstruct {
         msg.push_str("<functions>");
         msg.push_str(&tools.join("\n"));
         msg.push_str("</functions>");
-        
+
         self.system(&msg)
     }
 
@@ -149,7 +144,10 @@ impl Instruct for OlmoInstruct {
     }
 
     fn chat_decoder(&self) -> Box<dyn ChatDecoder> {
-        Box::new(GenericChatDecoder::new(self.tokenizer.clone(), self.im_end.clone()))
+        Box::new(GenericChatDecoder::new(
+            self.tokenizer.clone(),
+            self.im_end.clone(),
+        ))
     }
 
     fn reasoning_decoder(&self) -> Box<dyn ReasoningDecoder> {
@@ -190,12 +188,13 @@ impl ToolDecoder for OlmoToolDecoder {
     fn feed(&mut self, tokens: &[u32]) -> ToolEvent {
         let text = self.tokenizer.decode(tokens, false);
         self.accumulated.push_str(&text);
-        
+
         loop {
             match self.state {
                 ToolState::Outside => {
                     if let Some(pos) = self.accumulated.find("<function_calls>") {
-                        self.accumulated = self.accumulated[pos + "<function_calls>".len()..].to_string();
+                        self.accumulated =
+                            self.accumulated[pos + "<function_calls>".len()..].to_string();
                         self.state = ToolState::Inside;
                         continue;
                     }
@@ -208,27 +207,28 @@ impl ToolDecoder for OlmoToolDecoder {
                 ToolState::Inside => {
                     if let Some(pos) = self.accumulated.find("</function_calls>") {
                         let content = self.accumulated[..pos].trim().to_string();
-                        self.accumulated = self.accumulated[pos + "</function_calls>".len()..].to_string();
+                        self.accumulated =
+                            self.accumulated[pos + "</function_calls>".len()..].to_string();
                         self.state = ToolState::Outside;
-                        
+
                         // Parse content. Can be JSON list or single object.
                         // Or just raw string?
                         // Assuming tool call format: [{"name":..., "arguments":...}]
                         if let Ok(val) = serde_json::from_str::<serde_json::Value>(&content) {
-                             if let Some(arr) = val.as_array() {
-                                 if let Some(first) = arr.first() {
-                                     let name = first["name"].as_str().unwrap_or("").to_string();
-                                     let args = first["arguments"].to_string();
-                                     return ToolEvent::Call(name, args);
-                                 }
-                             } else if let Some(obj) = val.as_object() {
-                                 let name = obj["name"].as_str().unwrap_or("").to_string();
-                                 let args = obj["arguments"].to_string();
-                                 return ToolEvent::Call(name, args);
-                             }
+                            if let Some(arr) = val.as_array() {
+                                if let Some(first) = arr.first() {
+                                    let name = first["name"].as_str().unwrap_or("").to_string();
+                                    let args = first["arguments"].to_string();
+                                    return ToolEvent::Call(name, args);
+                                }
+                            } else if let Some(obj) = val.as_object() {
+                                let name = obj["name"].as_str().unwrap_or("").to_string();
+                                let args = obj["arguments"].to_string();
+                                return ToolEvent::Call(name, args);
+                            }
                         }
                         // Fallback parsing?
-                        return ToolEvent::Start; 
+                        return ToolEvent::Start;
                     }
                     return ToolEvent::Start;
                 }
@@ -245,8 +245,8 @@ impl ToolDecoder for OlmoToolDecoder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
     use crate::model::tokenizer::Tokenizer;
+    use std::sync::Arc;
 
     fn make_tok(vocab: &[&str]) -> Arc<Tokenizer> {
         let v: Vec<String> = vocab.iter().map(|s| s.to_string()).collect();
@@ -270,9 +270,18 @@ mod tests {
         let preamble = "You are OLMo, a helpful function-calling AI assistant built by Ai2. Your date cutoff is November 2024. ";
         let content = format!("{}<functions>{}</functions>", preamble, tools.join("\n"));
         let mut vocab: Vec<String> = vec![
-            "<|im_start|>", "<|im_end|>", "\n", "system",
-            "<functions>", "</functions>", "foo", "bar",
-        ].into_iter().map(String::from).collect();
+            "<|im_start|>",
+            "<|im_end|>",
+            "\n",
+            "system",
+            "<functions>",
+            "</functions>",
+            "foo",
+            "bar",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect();
         vocab.push(content);
         let tok = Arc::new(Tokenizer::from_vocab(&vocab));
         let inst = OlmoInstruct::new(tok);
@@ -292,7 +301,7 @@ mod tests {
         let text = inst.tokenizer.decode(&tokens, false);
         assert!(text.contains("<|im_start|>environment\nresult<|im_end|>\n"));
     }
-    
+
     #[test]
     fn generation_cue_includes_think() {
         let tok = make_tok(&["<|im_start|>", "<|im_end|>", "\n", "assistant", "<think>"]);
@@ -304,11 +313,21 @@ mod tests {
 
     fn olmo() -> OlmoInstruct {
         let tok = make_tok(&[
-            "<|im_start|>", "<|im_end|>", "\n", "system", "Hello",
-            "user", "assistant", "environment", "<|endoftext|>",
-            "<functions>", "</functions>",
-            "<function_calls>", "</function_calls>",
-            "<think>", "</think>",
+            "<|im_start|>",
+            "<|im_end|>",
+            "\n",
+            "system",
+            "Hello",
+            "user",
+            "assistant",
+            "environment",
+            "<|endoftext|>",
+            "<functions>",
+            "</functions>",
+            "<function_calls>",
+            "</function_calls>",
+            "<think>",
+            "</think>",
         ]);
         OlmoInstruct::new(tok)
     }
@@ -338,9 +357,6 @@ mod tests {
         let inst = olmo();
         let tokens = inst.answer("fn", "Hello");
         let text = inst.tokenizer.decode(&tokens, false);
-        assert_eq!(
-            text,
-            "<|im_start|>environment\nHello<|im_end|>\n"
-        );
+        assert_eq!(text, "<|im_start|>environment\nHello<|im_end|>\n");
     }
 }

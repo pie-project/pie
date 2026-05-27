@@ -1,5 +1,5 @@
 //! Subprocess driver: out-of-process supervisor for the Python drivers
-//! (`dev`, `vllm`, `sglang`).
+//! (`dev`, `vllm`, `sglang`, `tensorrt_llm`).
 //!
 //! Parallel to [`crate::embedded_driver::EmbeddedDriver`] in shape:
 //!
@@ -8,14 +8,14 @@
 //! | Launch          | `driver_ffi::run` on a thread     | `python -m pie_driver_<flavor>`   |
 //! | Startup config  | Per-flavor TOML via `embedded_driver::write_*_startup_toml` | A flavor-neutral TOML this module writes (`write_subprocess_startup_toml`) |
 //! | Handshake       | `ready_cb(caps_json)` callback    | One JSON line per group on a pipe (fd 3) terminated by a `{"ready":true}` sentinel |
-//! | Cold-path RPC   | Standalone hosts via [`pie::device::RpcServer`] + [`crate::rpc_loop`] | Python launcher hosts its own `RpcServer` (via the `pie-rpc` wheel) inside `worker.py::_leader_loop`; standalone connects as the client |
+//! | Cold-path RPC   | Standalone hosts via [`pie::driver::RpcServer`] + [`crate::rpc_loop`] | Python launcher hosts its own `RpcServer` (via the `_rpc_native` extension bundled in `pie-driver-bridge`) inside `worker.py::_leader_loop`; standalone connects as the client |
 //! | Shmem fast path | Driver allocates `/pie_shmem_g{N}` | Same — Python `pie_driver_dev.shmem_ipc.ShmemServer` |
 //! | Stop signal     | `driver_ffi::request_stop`        | `SIGTERM` to the child            |
 //! | Watchdog        | `JoinHandle::is_finished()`       | `Child::try_wait()`               |
 //!
 //! The handshake JSON shape is the contract between this module and each
 //! launcher's `__main__.py`. **If you change `Handshake` here, update
-//! the JSON shape in all three of `driver/{dev,vllm,sglang}/src/.../__main__.py`
+//! the JSON shape in all of `driver/{dev,vllm,sglang,tensorrt_llm}/src/.../__main__.py`
 //! to match.** The duplication is intentional so the standalone can
 //! supervise every Python driver through one small protocol.
 
@@ -28,6 +28,8 @@ pub enum SubprocessFlavor {
     Vllm,
     /// SGLang-backed driver (`pie_driver_sglang`).
     Sglang,
+    /// TensorRT-LLM-backed driver (`pie_driver_tensorrt_llm`).
+    TensorRtLlm,
 }
 
 impl SubprocessFlavor {
@@ -39,6 +41,7 @@ impl SubprocessFlavor {
             SubprocessFlavor::Dev => "dev",
             SubprocessFlavor::Vllm => "vllm",
             SubprocessFlavor::Sglang => "sglang",
+            SubprocessFlavor::TensorRtLlm => "tensorrt_llm",
         }
     }
 
@@ -48,12 +51,14 @@ impl SubprocessFlavor {
             SubprocessFlavor::Dev => "pie_driver_dev",
             SubprocessFlavor::Vllm => "pie_driver_vllm",
             SubprocessFlavor::Sglang => "pie_driver_sglang",
+            SubprocessFlavor::TensorRtLlm => "pie_driver_tensorrt_llm",
         }
     }
 }
 
 #[cfg(unix)]
 mod unix_impl {
+    use std::ffi::OsString;
     use std::io::{BufRead, BufReader};
     use std::os::fd::{FromRawFd, IntoRawFd, OwnedFd};
     use std::os::unix::process::CommandExt;
@@ -66,9 +71,9 @@ mod unix_impl {
     use anyhow::{Context, Result, anyhow, bail};
     use serde::Deserialize;
 
+    use super::SubprocessFlavor;
     use crate::config::ModelConfig;
     use crate::embedded_driver::DriverCapabilities;
-    use super::SubprocessFlavor;
 
     const SUBPROCESS_SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
     const CHILD_WAIT_POLL: Duration = Duration::from_millis(50);
@@ -78,7 +83,6 @@ mod unix_impl {
     #[derive(Debug, Deserialize)]
     struct GroupLine {
         group_id: usize,
-        server_name: String,
         /// Echoed back from the launcher for cross-checking against the
         /// standalone's expectation (`/pie_shmem_g{group_id}`). Mismatch is
         /// a hard error.
@@ -89,7 +93,6 @@ mod unix_impl {
     /// Decoded handshake — what `start_one_group` returns to the caller.
     #[derive(Debug)]
     pub struct Handshake {
-        pub server_name: String,
         pub shmem_name: String,
         pub caps: DriverCapabilities,
     }
@@ -182,6 +185,14 @@ mod unix_impl {
             "ready_timeout_s".into(),
             toml::Value::Float(ready_timeout_s),
         );
+        // Channel-level wait strategy — forwarded so the Python
+        // launcher can pass to `ShmemServer`. See
+        // `pie_bridge::ipc::ShmemServer::create`.
+        insert_u64(
+            &mut driver_section,
+            "spin_budget_us",
+            model.driver.effective_spin_budget_us(),
+        );
         // [driver.options] — passthrough, minus the standalone-side
         // `venv` / `python` keys (which `crate::python_resolve` consumed
         // before this function was called). The launcher's typed
@@ -203,15 +214,19 @@ mod unix_impl {
         Ok(())
     }
 
+    fn insert_u64(table: &mut toml::Table, key: &str, value: u64) {
+        let value = i64::try_from(value)
+            .map(toml::Value::Integer)
+            .unwrap_or_else(|_| toml::Value::String(value.to_string()));
+        table.insert(key.into(), value);
+    }
+
     /// Owns the Python child process for one DP replica. Same lifecycle
     /// shape as [`EmbeddedDriver`] — caller calls `start_one_group` for
     /// each group and gets back a `SubprocessDriver` per group.
     pub struct SubprocessDriver {
         pub flavor: SubprocessFlavor,
         pub caps: DriverCapabilities,
-        /// Server name from the Python launcher's `RpcServer` (cold-path
-        /// channel). Goes straight into [`crate::bootstrap_translate::GroupHandshake`].
-        pub server_name: String,
         /// `/pie_shmem_g{group_id}` — same convention as embedded; the
         /// launcher computes it from `group_id` and echoes it back so we
         /// can cross-check.
@@ -291,6 +306,19 @@ mod unix_impl {
                 // (subprocess shouldn't read). stdout inherited too —
                 // launchers print boot diagnostics there.
                 .stdin(Stdio::null());
+
+            // The configured interpreter may be a venv's Python without the
+            // venv being activated. Some Python packages invoke sibling console
+            // tools (for example FlashInfer JIT shells out to `ninja`), so make
+            // the interpreter's bin directory visible to the subprocess tree.
+            if let Some(bin_dir) = python_exe.parent() {
+                let mut path = OsString::from(bin_dir.as_os_str());
+                if let Some(existing) = std::env::var_os("PATH") {
+                    path.push(":");
+                    path.push(existing);
+                }
+                cmd.env("PATH", path);
+            }
 
             // SAFETY: `pre_exec` runs in the forked child between fork()
             // and exec(). The libc calls below are async-signal-safe (per
@@ -382,7 +410,6 @@ mod unix_impl {
             Ok(SubprocessDriver {
                 flavor,
                 caps: handshake.caps,
-                server_name: handshake.server_name,
                 shmem_name: handshake.shmem_name,
                 child: Mutex::new(Some(child)),
                 _state_dir: state_dir,
@@ -560,7 +587,6 @@ mod unix_impl {
             if value.get("ready").is_some() {
                 return found
                     .map(|g| Handshake {
-                        server_name: g.server_name,
                         shmem_name: g.shmem_name,
                         caps: g.caps,
                     })
@@ -633,13 +659,13 @@ mod unix_impl {
     #[cfg(test)]
     mod tests {
         use super::*;
-        use crate::config::{DriverConfig, DriverKind, ModelConfig, SchedulerConfig};
+        use crate::config::{DriverConfig, DriverKind, IpcProfile, ModelConfig, SchedulerConfig};
         use std::process::Command;
         use std::time::{Duration, Instant};
 
         fn fixture_caps_json() -> &'static str {
             // Single-line — the handshake protocol is line-delimited JSON.
-            r#"{"total_pages":1024,"kv_page_size":32,"swap_pool_size":0,"max_batch_tokens":10240,"max_batch_size":512,"arch_name":"qwen3","vocab_size":151936,"max_model_len":4096,"activation_dtype":"bfloat16","snapshot_dir":"/tmp/snap","shmem_name":"/pie_shmem_g0"}"#
+            r#"{"total_pages":1024,"kv_page_size":32,"swap_pool_size":0,"max_forward_tokens":10240,"max_forward_requests":512,"max_page_refs":1024,"max_logit_rows":4294967295,"max_prob_rows":4294967295,"max_custom_mask_bytes":4294967295,"max_sampler_rows":4294967295,"max_logprob_labels":4294967295,"arch_name":"qwen3","vocab_size":151936,"max_model_len":4096,"activation_dtype":"bfloat16","snapshot_dir":"/tmp/snap","shmem_name":"/pie_shmem_g0"}"#
         }
 
         #[test]
@@ -647,20 +673,26 @@ mod unix_impl {
             assert_eq!(SubprocessFlavor::Dev.as_str(), "dev");
             assert_eq!(SubprocessFlavor::Vllm.as_str(), "vllm");
             assert_eq!(SubprocessFlavor::Sglang.as_str(), "sglang");
+            assert_eq!(SubprocessFlavor::TensorRtLlm.as_str(), "tensorrt_llm");
             assert_eq!(SubprocessFlavor::Dev.module_name(), "pie_driver_dev");
+            assert_eq!(SubprocessFlavor::Vllm.module_name(), "pie_driver_vllm");
+            assert_eq!(SubprocessFlavor::Sglang.module_name(), "pie_driver_sglang");
+            assert_eq!(
+                SubprocessFlavor::TensorRtLlm.module_name(),
+                "pie_driver_tensorrt_llm"
+            );
         }
 
         #[test]
         fn handshake_parses_group_then_sentinel() {
             let stream = format!(
-                "{{\"group_id\":0,\"server_name\":\"/tmp/sock\",\
+                "{{\"group_id\":0,\
               \"shmem_name\":\"/pie_shmem_g0\",\"caps\":{}}}\n\
              {{\"ready\":true,\"num_groups\":1}}\n",
                 fixture_caps_json(),
             );
             let h = read_handshake_for_group(std::io::Cursor::new(stream.into_bytes()), 0, 5.0)
                 .unwrap();
-            assert_eq!(h.server_name, "/tmp/sock");
             assert_eq!(h.shmem_name, "/pie_shmem_g0");
             assert_eq!(h.caps.total_pages, 1024);
             assert_eq!(h.caps.arch_name, "qwen3");
@@ -669,7 +701,7 @@ mod unix_impl {
         #[test]
         fn handshake_rejects_eof_before_sentinel() {
             let stream = format!(
-                "{{\"group_id\":0,\"server_name\":\"/tmp/sock\",\
+                "{{\"group_id\":0,\
               \"shmem_name\":\"/pie_shmem_g0\",\"caps\":{}}}\n",
                 fixture_caps_json(),
             );
@@ -684,7 +716,7 @@ mod unix_impl {
         #[test]
         fn handshake_rejects_wrong_group_id() {
             let stream = format!(
-                "{{\"group_id\":7,\"server_name\":\"/tmp/sock\",\
+                "{{\"group_id\":7,\
               \"shmem_name\":\"/pie_shmem_g7\",\"caps\":{}}}\n\
              {{\"ready\":true,\"num_groups\":1}}\n",
                 fixture_caps_json(),
@@ -707,7 +739,7 @@ mod unix_impl {
         }
 
         #[test]
-        fn startup_toml_uses_group_device_slice() {
+        fn startup_toml_uses_group_driver_slice() {
             let path = std::env::temp_dir().join(format!(
                 "pie-subprocess-startup-{}-{}.toml",
                 std::process::id(),
@@ -722,6 +754,8 @@ mod unix_impl {
                     tensor_parallel_size: 1,
                     activation_dtype: "bfloat16".to_string(),
                     random_seed: 42,
+                    ipc_profile: Some(IpcProfile::Balanced),
+                    spin_budget_us: None,
                     options: toml::Table::new(),
                 },
                 scheduler: SchedulerConfig::default(),
@@ -761,6 +795,55 @@ mod unix_impl {
                     .get("tensor_parallel_size")
                     .and_then(toml::Value::as_integer),
                 Some(1),
+            );
+            assert_eq!(
+                driver
+                    .get("spin_budget_us")
+                    .and_then(toml::Value::as_integer),
+                Some(1_000),
+            );
+            let _ = std::fs::remove_file(path);
+        }
+
+        #[test]
+        fn startup_toml_writes_unbounded_spin_as_string() {
+            let path = std::env::temp_dir().join(format!(
+                "pie-subprocess-startup-{}-{}.toml",
+                std::process::id(),
+                "unbounded-spin",
+            ));
+            let model = ModelConfig {
+                name: "default".to_string(),
+                hf_repo: "Qwen/Qwen3-0.6B-Base".to_string(),
+                driver: DriverConfig {
+                    kind: DriverKind::Vllm,
+                    device: vec!["cuda:0".to_string()],
+                    tensor_parallel_size: 1,
+                    activation_dtype: "bfloat16".to_string(),
+                    random_seed: 42,
+                    ipc_profile: Some(IpcProfile::Latency),
+                    spin_budget_us: None,
+                    options: toml::Table::new(),
+                },
+                scheduler: SchedulerConfig::default(),
+            };
+
+            write_subprocess_startup_toml(
+                &path,
+                &model,
+                Path::new("/tmp/snapshot"),
+                0,
+                &["cuda:0".to_string()],
+                1,
+                29610,
+                1200.0,
+            )
+            .unwrap();
+            let doc: toml::Value =
+                toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+            assert_eq!(
+                doc["driver"]["spin_budget_us"].as_str(),
+                Some("18446744073709551615"),
             );
             let _ = std::fs::remove_file(path);
         }
@@ -816,7 +899,6 @@ use anyhow::{Result, bail};
 #[cfg(windows)]
 #[derive(Debug)]
 pub struct Handshake {
-    pub server_name: String,
     pub shmem_name: String,
     pub caps: DriverCapabilities,
 }
@@ -839,7 +921,6 @@ pub fn write_subprocess_startup_toml(
 pub struct SubprocessDriver {
     pub flavor: SubprocessFlavor,
     pub caps: DriverCapabilities,
-    pub server_name: String,
     pub shmem_name: String,
 }
 

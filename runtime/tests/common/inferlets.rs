@@ -40,8 +40,7 @@ pub fn read_inferlet_wasm(name: &str) -> Vec<u8> {
     if !path.exists() {
         build_inferlets();
     }
-    std::fs::read(&path)
-        .unwrap_or_else(|e| panic!("Failed to read {}: {}", path.display(), e))
+    std::fs::read(&path).unwrap_or_else(|e| panic!("Failed to read {}: {}", path.display(), e))
 }
 
 /// Read and parse the Pie.toml manifest for a test inferlet.

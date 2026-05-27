@@ -28,7 +28,7 @@ use crate::inference::structured::grammar::Grammar;
 ///
 /// # Example
 /// ```
-/// use pie_grammar::regex::regex_to_grammar;
+/// use pie::inference::structured::regex::regex_to_grammar;
 ///
 /// let grammar = regex_to_grammar("[a-z]+").unwrap();
 /// ```
@@ -89,8 +89,11 @@ impl<'a> RegexConverter<'a> {
         }
 
         if !self.at_end() && self.peek() != Some(b')') {
-            bail!("unexpected character at position {}: '{}'",
-                self.pos, self.input[self.pos] as char);
+            bail!(
+                "unexpected character at position {}: '{}'",
+                self.pos,
+                self.input[self.pos] as char
+            );
         }
 
         if result.is_empty() {
@@ -191,7 +194,10 @@ impl<'a> RegexConverter<'a> {
     /// Check that the next character is not another quantifier (consecutive quantifiers are invalid).
     fn check_no_consecutive_quantifier(&self) -> Result<()> {
         if matches!(self.peek(), Some(b'*') | Some(b'+') | Some(b'{')) {
-            bail!("consecutive quantifiers are not supported at position {}", self.pos);
+            bail!(
+                "consecutive quantifiers are not supported at position {}",
+                self.pos
+            );
         }
         // Note: ? after a quantifier is handled as non-greedy by skip_non_greedy,
         // so by the time we get here, an extra ? would be a third quantifier.
@@ -216,7 +222,11 @@ impl<'a> RegexConverter<'a> {
                 Ok(String::new())
             }
             Some(ch) if is_metachar(ch) => {
-                bail!("unexpected metacharacter '{}' at position {}", ch as char, self.pos);
+                bail!(
+                    "unexpected metacharacter '{}' at position {}",
+                    ch as char,
+                    self.pos
+                );
             }
             Some(_) => self.parse_literal(),
         }
@@ -337,12 +347,30 @@ impl<'a> RegexConverter<'a> {
         assert_eq!(self.advance(), Some(b'\\'));
         match self.peek() {
             None => bail!("truncated escape"),
-            Some(b'd') => { self.advance(); Ok("0-9".to_string()) }
-            Some(b'D') => { self.advance(); Ok("\\u0000-/:-\\U0010ffff".to_string()) }
-            Some(b'w') => { self.advance(); Ok("a-zA-Z0-9_".to_string()) }
-            Some(b'W') => { self.advance(); Ok("\\u0000-/:-@\\[-\\^`\\{-\\U0010ffff".to_string()) }
-            Some(b's') => { self.advance(); Ok("\\t\\n\\r \\u000b\\u000c".to_string()) }
-            Some(b'S') => { self.advance(); Ok("\\u0000-\\u0008\\u000e-\\u001f!-\\U0010ffff".to_string()) }
+            Some(b'd') => {
+                self.advance();
+                Ok("0-9".to_string())
+            }
+            Some(b'D') => {
+                self.advance();
+                Ok("\\u0000-/:-\\U0010ffff".to_string())
+            }
+            Some(b'w') => {
+                self.advance();
+                Ok("a-zA-Z0-9_".to_string())
+            }
+            Some(b'W') => {
+                self.advance();
+                Ok("\\u0000-/:-@\\[-\\^`\\{-\\U0010ffff".to_string())
+            }
+            Some(b's') => {
+                self.advance();
+                Ok("\\t\\n\\r \\u000b\\u000c".to_string())
+            }
+            Some(b'S') => {
+                self.advance();
+                Ok("\\u0000-\\u0008\\u000e-\\u001f!-\\U0010ffff".to_string())
+            }
             Some(b'u') => self.parse_unicode_escape_for_class(),
             Some(b'x') => self.parse_hex_escape_for_class(),
             Some(ch) => {
@@ -377,12 +405,30 @@ impl<'a> RegexConverter<'a> {
         assert_eq!(self.advance(), Some(b'\\'));
         match self.peek() {
             None => bail!("truncated escape"),
-            Some(b'd') => { self.advance(); Ok("[0-9]".to_string()) }
-            Some(b'D') => { self.advance(); Ok("[^0-9]".to_string()) }
-            Some(b'w') => { self.advance(); Ok("[a-zA-Z0-9_]".to_string()) }
-            Some(b'W') => { self.advance(); Ok("[^a-zA-Z0-9_]".to_string()) }
-            Some(b's') => { self.advance(); Ok("[\\t\\n\\r \\u000b\\u000c]".to_string()) }
-            Some(b'S') => { self.advance(); Ok("[^\\t\\n\\r \\u000b\\u000c]".to_string()) }
+            Some(b'd') => {
+                self.advance();
+                Ok("[0-9]".to_string())
+            }
+            Some(b'D') => {
+                self.advance();
+                Ok("[^0-9]".to_string())
+            }
+            Some(b'w') => {
+                self.advance();
+                Ok("[a-zA-Z0-9_]".to_string())
+            }
+            Some(b'W') => {
+                self.advance();
+                Ok("[^a-zA-Z0-9_]".to_string())
+            }
+            Some(b's') => {
+                self.advance();
+                Ok("[\\t\\n\\r \\u000b\\u000c]".to_string())
+            }
+            Some(b'S') => {
+                self.advance();
+                Ok("[^\\t\\n\\r \\u000b\\u000c]".to_string())
+            }
             Some(b'b') | Some(b'B') => {
                 bail!("word boundaries (\\b, \\B) are not supported");
             }
@@ -397,12 +443,30 @@ impl<'a> RegexConverter<'a> {
             }
             Some(b'u') => self.parse_unicode_escape(),
             Some(b'x') => self.parse_hex_escape(),
-            Some(b'n') => { self.advance(); Ok("\"\\n\"".to_string()) }
-            Some(b'r') => { self.advance(); Ok("\"\\r\"".to_string()) }
-            Some(b't') => { self.advance(); Ok("\"\\t\"".to_string()) }
-            Some(b'f') => { self.advance(); Ok("\"\\x0c\"".to_string()) }
-            Some(b'v') => { self.advance(); Ok("\"\\x0b\"".to_string()) }
-            Some(b'0') => { self.advance(); Ok("\"\\x00\"".to_string()) }
+            Some(b'n') => {
+                self.advance();
+                Ok("\"\\n\"".to_string())
+            }
+            Some(b'r') => {
+                self.advance();
+                Ok("\"\\r\"".to_string())
+            }
+            Some(b't') => {
+                self.advance();
+                Ok("\"\\t\"".to_string())
+            }
+            Some(b'f') => {
+                self.advance();
+                Ok("\"\\x0c\"".to_string())
+            }
+            Some(b'v') => {
+                self.advance();
+                Ok("\"\\x0b\"".to_string())
+            }
+            Some(b'0') => {
+                self.advance();
+                Ok("\"\\x00\"".to_string())
+            }
             Some(ch) => {
                 self.advance();
                 // Escaped metachar or literal
@@ -450,7 +514,9 @@ impl<'a> RegexConverter<'a> {
             self.advance();
             let mut hex = String::new();
             while self.peek() != Some(b'}') {
-                if self.at_end() { bail!("unterminated unicode escape"); }
+                if self.at_end() {
+                    bail!("unterminated unicode escape");
+                }
                 hex.push(self.advance().unwrap() as char);
             }
             self.advance();
@@ -487,7 +553,13 @@ impl<'a> RegexConverter<'a> {
         let mut s = String::new();
         while !self.at_end() {
             match self.peek() {
-                Some(ch) if !is_metachar(ch) && ch != b'\\' && ch != b'[' && ch != b'(' && ch != b'.' => {
+                Some(ch)
+                    if !is_metachar(ch)
+                        && ch != b'\\'
+                        && ch != b'['
+                        && ch != b'('
+                        && ch != b'.' =>
+                {
                     self.advance();
                     match ch {
                         b'"' => s.push_str("\\\""),
@@ -498,7 +570,10 @@ impl<'a> RegexConverter<'a> {
                 _ => break,
             }
             // Don't collect across a quantifier boundary
-            if matches!(self.peek(), Some(b'*') | Some(b'+') | Some(b'?') | Some(b'{')) {
+            if matches!(
+                self.peek(),
+                Some(b'*') | Some(b'+') | Some(b'?') | Some(b'{')
+            ) {
                 // Only the last char gets quantified; must break if more than one
                 if s.len() > 1 {
                     // Back up one character
@@ -576,14 +651,28 @@ impl<'a> RegexConverter<'a> {
 }
 
 fn is_metachar(ch: u8) -> bool {
-    matches!(ch, b'*' | b'+' | b'?' | b'{' | b'}' | b'|' | b')' | b'^' | b'$')
+    matches!(
+        ch,
+        b'*' | b'+' | b'?' | b'{' | b'}' | b'|' | b')' | b'^' | b'$'
+    )
 }
 
 fn is_regex_metachar(ch: u8) -> bool {
     matches!(
         ch,
-        b'.' | b'*' | b'+' | b'?' | b'(' | b')' | b'[' | b']'
-            | b'{' | b'}' | b'|' | b'^' | b'$' | b'\\'
+        b'.' | b'*'
+            | b'+'
+            | b'?'
+            | b'('
+            | b')'
+            | b'['
+            | b']'
+            | b'{'
+            | b'}'
+            | b'|'
+            | b'^'
+            | b'$'
+            | b'\\'
     )
 }
 

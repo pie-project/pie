@@ -5,6 +5,7 @@
 #include <stdexcept>
 
 #include <nlohmann/json.hpp>
+#include <pie_driver_common/hf_config_json.hpp>
 
 namespace pie_cuda_driver {
 
@@ -12,16 +13,12 @@ namespace {
 
 template <typename T>
 T require(const nlohmann::json& j, const char* key, const std::string& path) {
-    if (!j.contains(key)) {
-        throw std::runtime_error("config.json (" + path + "): missing key '" + key + "'");
-    }
-    return j[key].get<T>();
+    return pie_driver_common::json_require<T>(j, key, path);
 }
 
 template <typename T>
 T optional(const nlohmann::json& j, const char* key, T default_value) {
-    if (!j.contains(key) || j[key].is_null()) return default_value;
-    return j[key].get<T>();
+    return pie_driver_common::json_get_or<T>(j, key, default_value);
 }
 
 // Qwen3-specific signal: HF marks `use_qk_norm` implicitly via model_type.
@@ -54,12 +51,9 @@ HfConfig parse_hf_config(const std::filesystem::path& path) {
     // architecture name + a stub `model_type=gemma4` at the top level.
     // Dereference once so the rest of the parser reads from the text
     // sub-config when present.
-    const auto& j = j_root.contains("text_config") &&
-                            j_root["text_config"].is_object()
-                        ? j_root["text_config"]
-                        : j_root;
-    cfg.model_type = optional<std::string>(j, "model_type",
-                       optional<std::string>(j_root, "model_type", ""));
+    const auto view = pie_driver_common::hf_config_json_view(j_root);
+    const auto& j = view.text;
+    cfg.model_type = view.text_or_outer_model_type();
 
     cfg.hidden_size              = require<int>(j, "hidden_size", path_str);
     // `intermediate_size` is normally a scalar, but Gemma-3n stores a
@@ -88,6 +82,20 @@ HfConfig parse_hf_config(const std::filesystem::path& path) {
     cfg.num_attention_heads      = require<int>(j, "num_attention_heads", path_str);
     cfg.num_key_value_heads      = optional<int>(j, "num_key_value_heads", cfg.num_attention_heads);
     cfg.head_dim                 = optional<int>(j, "head_dim", cfg.hidden_size / cfg.num_attention_heads);
+    cfg.q_lora_rank              = optional<int>(j, "q_lora_rank", 0);
+    cfg.kv_lora_rank             = optional<int>(j, "kv_lora_rank", 0);
+    cfg.qk_nope_head_dim         = optional<int>(j, "qk_nope_head_dim", 0);
+    cfg.qk_rope_head_dim         = optional<int>(j, "qk_rope_head_dim", 0);
+    cfg.v_head_dim               = optional<int>(j, "v_head_dim", 0);
+    if ((cfg.model_type == "kimi_k2" || cfg.model_type == "deepseek_v2" ||
+         cfg.model_type == "deepseek_v3") &&
+        cfg.qk_nope_head_dim > 0 && cfg.qk_rope_head_dim > 0) {
+        // MLA attention has a query/key width that is independent from the
+        // value width and from hidden_size / num_heads. Keep `head_dim` as
+        // the QK width so RoPE/attention capability checks see the right
+        // logical dimension; `v_head_dim` carries the output-value width.
+        cfg.head_dim = cfg.qk_nope_head_dim + cfg.qk_rope_head_dim;
+    }
 
     // Round head_dim up to the nearest flashinfer-supported dispatch
     // value for kernel bookkeeping. Models in our supported set hit
@@ -126,9 +134,11 @@ HfConfig parse_hf_config(const std::filesystem::path& path) {
     cfg.rope_original_max_position = cfg.max_position_embeddings;
     cfg.rope_scaling_kind        = HfConfig::RopeScaling::None;
     cfg.has_rope_scaling         = false;
-    if (j.contains("rope_scaling") && j["rope_scaling"].is_object()) {
-        const auto& s = j["rope_scaling"];
-        const std::string rope_type = optional<std::string>(s, "rope_type", "");
+    if (const auto* rope_cfg = pie_driver_common::flat_rope_config_view(j)) {
+        const auto& s = *rope_cfg;
+        cfg.rope_theta = optional<float>(s, "rope_theta", cfg.rope_theta);
+        const std::string rope_type = optional<std::string>(
+            s, "rope_type", optional<std::string>(s, "type", ""));
         const bool has_llama3_keys = s.contains("low_freq_factor") ||
                                      s.contains("high_freq_factor");
         if (rope_type == "llama3" || has_llama3_keys) {
@@ -142,15 +152,21 @@ HfConfig parse_hf_config(const std::filesystem::path& path) {
                               cfg.max_position_embeddings);
         } else if (rope_type == "yarn") {
             cfg.rope_scaling_kind = HfConfig::RopeScaling::OriginalYaRN;
+            cfg.has_rope_scaling  = true;
             cfg.rope_factor           = optional<float>(s, "factor", 1.0f);
             cfg.rope_beta_fast        = optional<float>(s, "beta_fast", 32.0f);
             cfg.rope_beta_slow        = optional<float>(s, "beta_slow", 1.0f);
-            // HF's `_compute_yarn_parameters` sets the default mscale
-            // to `0.1 * ln(factor) + 1` when `attention_factor` is
-            // absent. OLMo-3 ships it explicitly (1.2079...).
-            const float default_mscale = (cfg.rope_factor > 1.f)
-                ? 0.1f * std::log(cfg.rope_factor) + 1.0f
-                : 1.0f;
+            // DeepSeek/Kimi models use `mscale_all_dim` (typically 1.0)
+            // as the attention factor. OLMo-3 uses `attention_factor`
+            // directly. Fall back to `0.1 * ln(factor) + 1` if neither
+            // is present.
+            const float mscale_all_dim =
+                optional<float>(s, "mscale_all_dim", 0.0f);
+            const float default_mscale = mscale_all_dim > 0.f
+                ? mscale_all_dim
+                : (cfg.rope_factor > 1.f
+                    ? 0.1f * std::log(cfg.rope_factor) + 1.0f
+                    : 1.0f);
             cfg.rope_attention_factor = optional<float>(
                 s, "attention_factor", default_mscale);
             cfg.rope_original_max_position =
@@ -217,11 +233,20 @@ HfConfig parse_hf_config(const std::filesystem::path& path) {
     // and `num_experts_per_tok` for Mixtral / GPT-OSS; some configs use
     // `num_experts` instead.
     cfg.num_experts         = optional<int>(j, "num_local_experts",
-                                            optional<int>(j, "num_experts", 0));
+                                            optional<int>(j, "num_experts",
+                                            optional<int>(j, "n_routed_experts", 0)));
     // `num_experts_per_tok` is the canonical name (Mixtral / Qwen MoE);
     // Gemma-4 uses `top_k_experts`. Accept either.
     cfg.num_experts_per_tok = optional<int>(j, "num_experts_per_tok",
                                             optional<int>(j, "top_k_experts", 0));
+    cfg.first_k_dense_replace =
+        optional<int>(j, "first_k_dense_replace", 0);
+    cfg.n_shared_experts =
+        optional<int>(j, "n_shared_experts", 0);
+    cfg.norm_topk_prob =
+        optional<bool>(j, "norm_topk_prob", false);
+    cfg.routed_scaling_factor =
+        optional<float>(j, "routed_scaling_factor", 1.0f);
     // Gemma-4 26B-A4B sets `enable_moe_block: true` to flip its layers
     // from dense-MLP-only to dense + parallel MoE.
     cfg.gemma4_enable_moe   = optional<bool>(j, "enable_moe_block", false);
@@ -290,6 +315,12 @@ HfConfig parse_hf_config(const std::filesystem::path& path) {
         optional<int>(j, "moe_intermediate_size", 0);
     cfg.shared_expert_intermediate_size =
         optional<int>(j, "shared_expert_intermediate_size", 0);
+    if (cfg.shared_expert_intermediate_size == 0 &&
+        cfg.n_shared_experts > 0 &&
+        cfg.moe_intermediate_size > 0) {
+        cfg.shared_expert_intermediate_size =
+            cfg.n_shared_experts * cfg.moe_intermediate_size;
+    }
 
     // Qwen3.5 hybrid (linear-attention SSM) knobs. Defaults are zero so
     // non-qwen3.5 models leave the linear-attn dimensions unset; the
@@ -308,24 +339,20 @@ HfConfig parse_hf_config(const std::filesystem::path& path) {
     // some other models. Defaults to 1.0 (full rotation) for everything
     // else.
     cfg.partial_rotary_factor = 1.0f;
-    if (j.contains("rope_parameters") && j["rope_parameters"].is_object()
-            && j["rope_parameters"].contains("partial_rotary_factor")) {
+    if (const auto* rp = pie_driver_common::flat_rope_parameters_view(j);
+        rp != nullptr && rp->contains("partial_rotary_factor")) {
         cfg.partial_rotary_factor =
-            j["rope_parameters"]["partial_rotary_factor"].get<float>();
+            (*rp)["partial_rotary_factor"].get<float>();
     } else {
         cfg.partial_rotary_factor =
             optional<float>(j, "partial_rotary_factor", 1.0f);
     }
     // Qwen3.5 stores `rope_theta` under `rope_parameters` rather than
     // at the top level. Use that as the source of truth when present.
-    if (j.contains("rope_parameters") && j["rope_parameters"].is_object()
-            && j["rope_parameters"].contains("rope_theta")
-            && cfg.layer_types.empty()) {
-        // Only apply when not Gemma-4-style per-layer-type rope_parameters
-        // (those have nested objects keyed by layer type).
-        const auto& rp = j["rope_parameters"];
-        if (rp["rope_theta"].is_number()) {
-            cfg.rope_theta = rp["rope_theta"].get<float>();
+    if (const auto* rp = pie_driver_common::flat_rope_parameters_view(j);
+        rp != nullptr && rp->contains("rope_theta")) {
+        if ((*rp)["rope_theta"].is_number()) {
+            cfg.rope_theta = (*rp)["rope_theta"].get<float>();
         }
     }
 
@@ -356,18 +383,21 @@ HfConfig parse_hf_config(const std::filesystem::path& path) {
     // side tensors entirely. Detection key is the top-level model_type:
     // mistral3 (Mistral-Small-3.1-FP8), llava (Llava-1.6), llava_next,
     // qwen2_5_vl, gemma3 (multimodal variant has vision_config), …
-    const std::string root_model_type =
-        optional<std::string>(j_root, "model_type", "");
     const bool has_vision_config =
         j_root.contains("vision_config") && j_root["vision_config"].is_object();
+    const bool is_kimi_k25_wrapper =
+        view.outer_model_type == "kimi_k25" && j_root.contains("text_config");
     const bool is_multimodal_wrapper =
-        has_vision_config && j_root.contains("text_config");
+        (has_vision_config && j_root.contains("text_config")) ||
+        is_kimi_k25_wrapper;
     if (is_multimodal_wrapper) {
         cfg.mm_lm_strip_prefix = "language_model.";
         cfg.mm_skip_prefixes = {
             "vision_tower.",
             "vision_model.",
+            "visual.",
             "multi_modal_projector.",
+            "mm_projector.",
         };
     }
 

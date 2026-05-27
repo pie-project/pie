@@ -416,9 +416,8 @@ void launch_recurrent_gated_delta_step_batched(
     dim3 block(BLOCK);
     const int shmem_bytes = 2 * K_d * sizeof(float);
     recurrent_step_batched_kernel<<<grid, block, shmem_bytes, stream>>>(
-        q_norm, k_norm, v, g_log, beta,
-        state_base, slot_ids, slot_stride_elems,
-        out, V_h, K_d, V_d);
+        q_norm, k_norm, v, g_log, beta, state_base,
+        slot_ids, slot_stride_elems, out, V_h, K_d, V_d);
 }
 
 // Chunked prefill — for now, implemented as a sequential per-token
@@ -478,8 +477,8 @@ void launch_chunk_gated_delta_prefill_batched(
     dim3 block(BLOCK);
     const int shmem_bytes = 2 * K_d * sizeof(float);
     chunk_gated_delta_prefill_batched_kernel<<<grid, block, shmem_bytes, stream>>>(
-        q_norm, k_norm, v, g_log, beta,
-        state_base, slot_ids, qo_indptr, slot_stride_elems,
+        q_norm, k_norm, v, g_log, beta, state_base,
+        slot_ids, qo_indptr, slot_stride_elems,
         out, V_h, K_d, V_d);
 }
 

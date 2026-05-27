@@ -6,11 +6,10 @@ the V1 metadata classes, etc. When vllm bumps and one of these moves or
 gets renamed, the fix should be a single edit here, not a sweep across
 every callsite.
 
-**Pinned vllm:** see `pie/pyproject.toml [tool.uv.sources] vllm = { path = ..., editable = true }`.
-The currently-supported revision is whatever lives at that path. Bumping it
-is a deliberate operation: update the path/commit, run the integration
-tests under each verified attention backend, and update this file's
-exports if any symbol moved.
+**Pinned vllm:** see `driver/vllm/pyproject.toml`. Bumping it is a
+deliberate operation: update the wheel/pins, run the integration tests under
+each verified attention backend, and update this file's exports if any symbol
+moved.
 
 Importers should `from ._vllm_compat import X` rather than reaching into
 vllm directly. Keeps the surface visible at one location and prevents

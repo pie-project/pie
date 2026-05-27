@@ -5,7 +5,7 @@
 //!   1. Translate user TOML to per-driver options.
 //!   2. For each `[[model]]`, partition devices into DP groups; for
 //!      each group spawn an [`EmbeddedDriver`] thread, attach an
-//!      [`AuxIpcClient`] (portable today) + a cold-path RPC dispatcher.
+//!      a unified `DriverChannel` (one channel per driver carries
 //!   3. Translate the resulting handshakes → [`pie::bootstrap::Config`]
 //!      and call [`pie::bootstrap::bootstrap`]. The runtime now owns
 //!      the websocket server + scheduler.
@@ -17,18 +17,15 @@
 
 use std::path::Path;
 use std::sync::Arc;
-use std::thread::JoinHandle;
 
 use anyhow::{Context, Result, anyhow};
 
-use crate::aux_ipc::AuxIpcClient;
 use crate::bootstrap_translate::{self, GroupHandshake, ModelHandshake};
 use crate::config;
 use crate::driver_ffi::Flavor;
 use crate::embedded_driver::{DriverCapabilities, DriverOptions, EmbeddedDriver};
 use crate::hf;
 use crate::python_resolve::{self, DriversConfig};
-use crate::rpc_loop;
 use crate::subprocess_driver::SubprocessDriver;
 
 mod lifecycle;
@@ -46,10 +43,12 @@ pub enum DriverHandle {
 }
 
 impl DriverHandle {
-    pub fn shmem_name(&self) -> &str {
+    /// Returns the driver's shmem region name, if any. `None` for
+    /// embedded cuda/portable drivers (no shmem region opened).
+    pub fn shmem_name(&self) -> Option<&str> {
         match self {
-            DriverHandle::Embedded(d) => &d.shmem_name,
-            DriverHandle::Subprocess(d) => &d.shmem_name,
+            DriverHandle::Embedded(d) => d.shmem_name.as_deref(),
+            DriverHandle::Subprocess(d) => Some(&d.shmem_name),
         }
     }
 
@@ -90,12 +89,6 @@ impl DriverHandle {
 /// the TUI owns the wait loop).
 pub struct EngineHandle {
     drivers: Vec<DriverHandle>,
-    /// Cold-path RPC servers — only populated for embedded drivers.
-    /// Subprocess drivers host their own `RpcServer` inside the Python
-    /// launcher (via the `pie-rpc` wheel), so the standalone has
-    /// nothing to spawn on this side.
-    rpc_servers: Vec<Arc<pie::device::RpcServer>>,
-    rpc_threads: Vec<std::thread::JoinHandle<()>>,
     shmem_names: Vec<String>,
     /// Bootstrapped engine's WS auth token — handed to the monitor
     /// provider so it can `auth_by_token`.
@@ -123,17 +116,12 @@ impl EngineHandle {
     /// monitor TUI, which owns its own input loop and decides when to
     /// quit.
     pub fn shutdown(self) {
-        // Close cold-path channels first so any in-flight RPCs bail.
-        for s in &self.rpc_servers {
-            s.close();
-        }
-        for t in self.rpc_threads {
-            let _ = t.join();
-        }
-        // Signal each driver's serve loop, then join the threads.
+        // Signal each driver's serve loop, wake any transport-side
+        // waiters/recv loops, then join the threads.
         for d in &self.drivers {
             d.request_stop();
         }
+        pie::driver::abort_all_driver_channels();
         for d in self.drivers {
             let rc = d.join();
             if rc != 0 {
@@ -186,15 +174,13 @@ pub async fn start_engine(user_cfg: config::Config) -> Result<EngineHandle> {
     let listener = pie::server::bind(&user_cfg.server.host, user_cfg.server.port).await?;
     let mut handshakes: Vec<ModelHandshake> = Vec::with_capacity(user_cfg.models.len());
     let mut drivers: Vec<DriverHandle> = Vec::new();
-    let mut rpc_servers: Vec<Arc<pie::device::RpcServer>> = Vec::new();
-    let mut rpc_threads = Vec::new();
 
-    // Global device index. The runtime's `device::spawn` returns
+    // Global device index. The runtime's `driver::spawn` returns
     // indices in call order; the driver-side shmem region is named
-    // `/pie_shmem_g{device_idx}` (`runtime/src/device.rs::shmem_name`).
+    // `/pie_shmem_g{driver_idx}` (`runtime/src/device.rs::shmem_name`).
     // Pass this counter as the driver's `group_id` so the names line
     // up across all models, including DP > 1.
-    let mut next_global_device_idx: usize = 0;
+    let mut next_global_driver_idx: usize = 0;
 
     // Per-model master-port assignment for the Python launchers'
     // torch.distributed FileStore rendezvous. Mirrors the legacy
@@ -254,8 +240,8 @@ pub async fn start_engine(user_cfg: config::Config) -> Result<EngineHandle> {
         let model_master_port = base_master_port.saturating_add((model_idx as u16) * 100);
 
         for (group_idx, group) in topology.iter().enumerate() {
-            let device_idx = next_global_device_idx;
-            next_global_device_idx += 1;
+            let driver_idx = next_global_driver_idx;
+            next_global_driver_idx += 1;
 
             match resolved {
                 ResolvedFlavor::Embedded(flavor) => {
@@ -266,16 +252,14 @@ pub async fn start_engine(user_cfg: config::Config) -> Result<EngineHandle> {
                         flavor,
                         embedded_base_opts.as_ref().expect("embedded => Some"),
                         &snapshot_dir,
-                        device_idx,
+                        driver_idx,
                         tp_degree,
                     )?;
                     group_handshakes.push(started.handshake);
                     drivers.extend(started.drivers);
-                    rpc_servers.push(started.rpc_server);
-                    rpc_threads.push(started.rpc_thread);
                 }
                 ResolvedFlavor::Subprocess(sub_flavor) => {
-                    let group_devices = group
+                    let group_drivers = group
                         .iter()
                         .map(|&idx| {
                             m.driver.device.get(idx).cloned().ok_or_else(|| {
@@ -296,8 +280,8 @@ pub async fn start_engine(user_cfg: config::Config) -> Result<EngineHandle> {
                         sub_flavor,
                         &drivers_config,
                         &snapshot_dir,
-                        device_idx,
-                        &group_devices,
+                        driver_idx,
+                        &group_drivers,
                         tp_degree,
                         group_master_port,
                         user_cfg.server.verbose,
@@ -333,12 +317,13 @@ pub async fn start_engine(user_cfg: config::Config) -> Result<EngineHandle> {
         eprintln!("press Ctrl-C to shut down");
     }
 
-    let shmem_names: Vec<String> = drivers.iter().map(|d| d.shmem_name().to_string()).collect();
+    let shmem_names: Vec<String> = drivers
+        .iter()
+        .filter_map(|d| d.shmem_name().map(|s| s.to_string()))
+        .collect();
 
     Ok(EngineHandle {
         drivers,
-        rpc_servers,
-        rpc_threads,
         shmem_names,
         token,
         url: format!("ws://{}:{}", user_cfg.server.host, bound_port),
@@ -348,8 +333,6 @@ pub async fn start_engine(user_cfg: config::Config) -> Result<EngineHandle> {
 struct StartedEmbeddedGroup {
     handshake: GroupHandshake,
     drivers: Vec<DriverHandle>,
-    rpc_server: Arc<pie::device::RpcServer>,
-    rpc_thread: JoinHandle<()>,
 }
 
 struct StartedSubprocessGroup {
@@ -364,17 +347,9 @@ fn start_embedded_group(
     flavor: Flavor,
     base_opts: &DriverOptions,
     snapshot_dir: &Path,
-    device_idx: usize,
+    driver_idx: usize,
     tp_degree: usize,
 ) -> Result<StartedEmbeddedGroup> {
-    let rpc_server = Arc::new(pie::device::RpcServer::create().map_err(|e| {
-        anyhow!(
-            "RpcServer::create for model {:?} group {group_idx}: {e}",
-            m.name,
-        )
-    })?);
-    let rpc_server_name = rpc_server.server_name().to_owned();
-
     let group_drivers = start_embedded_drivers(
         m,
         group_idx,
@@ -382,7 +357,7 @@ fn start_embedded_group(
         flavor,
         base_opts,
         snapshot_dir,
-        device_idx,
+        driver_idx,
         tp_degree,
     )?;
 
@@ -392,42 +367,25 @@ fn start_embedded_group(
             m.name,
         )
     })?;
-    let primary_aux_socket = primary.aux_socket_path.clone();
     let caps = primary.caps.clone();
-
-    #[cfg(not(feature = "driver-portable"))]
-    let _ = primary_aux_socket;
-
-    let aux_client: Option<Arc<AuxIpcClient>> = match flavor {
-        #[cfg(feature = "driver-portable")]
-        Flavor::Portable => Some(Arc::new(
-            AuxIpcClient::connect(primary_aux_socket).with_context(|| {
-                format!(
-                    "connecting aux-ipc socket for model {:?} group {group_idx}",
-                    m.name,
-                )
-            })?,
-        )),
-        #[allow(unreachable_patterns)]
-        _ => None,
-    };
-
-    let rpc_thread = rpc_loop::spawn(flavor, Arc::clone(&rpc_server), aux_client);
-    let handshake = GroupHandshake {
-        rpc_server_name,
-        caps,
-    };
+    if let Some(shmem_name) = primary.shmem_name.as_deref() {
+        let channel =
+            pie::driver::ShmemChannel::open(shmem_name, m.driver.effective_spin_budget_us())
+                .with_context(|| {
+                    format!(
+                        "opening shmem channel for embedded driver ({}) group {group_idx}",
+                        flavor.as_str(),
+                    )
+                })?;
+        pie::driver::install_channel(driver_idx, Arc::new(channel));
+    }
+    let handshake = GroupHandshake { caps };
     let drivers = group_drivers
         .into_iter()
         .map(DriverHandle::Embedded)
         .collect();
 
-    Ok(StartedEmbeddedGroup {
-        handshake,
-        drivers,
-        rpc_server,
-        rpc_thread,
-    })
+    Ok(StartedEmbeddedGroup { handshake, drivers })
 }
 
 fn start_embedded_drivers(
@@ -437,39 +395,53 @@ fn start_embedded_drivers(
     flavor: Flavor,
     base_opts: &DriverOptions,
     snapshot_dir: &Path,
-    device_idx: usize,
+    driver_idx: usize,
     tp_degree: usize,
 ) -> Result<Vec<EmbeddedDriver>> {
+    let spin_budget_us = m.driver.effective_spin_budget_us();
+    let use_inproc_polling_channel = m.driver.use_inproc_polling_channel();
+
     #[cfg(feature = "driver-cuda")]
     {
         if flavor == Flavor::Cuda && tp_degree > 1 {
             let rank_opts = cuda_rank_options(m, group_idx, group, base_opts)?;
-            return EmbeddedDriver::start_cuda_tp_group(&rank_opts, snapshot_dir, device_idx)
-                .with_context(|| {
-                    format!(
-                        "starting cuda TP driver group for model {:?} group {group_idx}",
-                        m.name,
-                    )
-                });
+            return EmbeddedDriver::start_cuda_tp_group(
+                &rank_opts,
+                snapshot_dir,
+                driver_idx,
+                use_inproc_polling_channel,
+                spin_budget_us,
+            )
+            .with_context(|| {
+                format!(
+                    "starting cuda TP driver group for model {:?} group {group_idx}",
+                    m.name,
+                )
+            });
         }
     }
 
     #[cfg(not(feature = "driver-cuda"))]
     let _ = (flavor, tp_degree);
 
-    let first_device_idx = group.first().copied().ok_or_else(|| {
+    let first_driver_idx = group.first().copied().ok_or_else(|| {
         anyhow!(
             "model {:?}: group {group_idx} is empty; topology calculation produced no ranks",
             m.name,
         )
     })?;
-    let device = group_device(m, group_idx, first_device_idx)?;
+    let device = group_driver(m, group_idx, first_driver_idx)?;
     let opts = embedded_opts_for_device(base_opts, device);
 
     Ok(vec![
-        EmbeddedDriver::start(&opts, snapshot_dir, device_idx).with_context(|| {
-            format!("starting driver for model {:?} group {group_idx}", m.name,)
-        })?,
+        EmbeddedDriver::start(
+            &opts,
+            snapshot_dir,
+            driver_idx,
+            use_inproc_polling_channel,
+            spin_budget_us,
+        )
+        .with_context(|| format!("starting driver for model {:?} group {group_idx}", m.name,))?,
     ])
 }
 
@@ -486,11 +458,11 @@ fn embedded_opts_for_device(base_opts: &DriverOptions, device: String) -> Driver
             DriverOptions::Portable(opts)
         }
         #[cfg(feature = "driver-cuda")]
-        DriverOptions::CudaNative { opts, hf_repo, .. } => DriverOptions::CudaNative {
-            opts: opts.clone(),
-            device,
-            hf_repo: hf_repo.clone(),
-        },
+        DriverOptions::CudaNative(opts) => {
+            let mut opts = opts.clone();
+            opts.device = device;
+            DriverOptions::CudaNative(opts)
+        }
         other => other.clone(),
     }
 }
@@ -502,7 +474,7 @@ fn apply_embedded_verbose(options: &mut Option<DriverOptions>, verbose: bool) {
     }
 
     #[cfg(feature = "driver-cuda")]
-    if let Some(DriverOptions::CudaNative { opts, .. }) = options.as_mut() {
+    if let Some(DriverOptions::CudaNative(opts)) = options.as_mut() {
         opts.verbose = verbose;
     }
 
@@ -518,15 +490,13 @@ fn cuda_rank_options(
     base_opts: &DriverOptions,
 ) -> Result<Vec<DriverOptions>> {
     let mut rank_opts = Vec::with_capacity(group.len());
-    for &rank_device_idx in group {
-        let rank_device = group_device(m, group_idx, rank_device_idx)?;
+    for &rank_driver_idx in group {
+        let rank_driver = group_driver(m, group_idx, rank_driver_idx)?;
         match base_opts {
-            DriverOptions::CudaNative { opts, hf_repo, .. } => {
-                rank_opts.push(DriverOptions::CudaNative {
-                    opts: opts.clone(),
-                    device: rank_device,
-                    hf_repo: hf_repo.clone(),
-                });
+            DriverOptions::CudaNative(opts) => {
+                let mut o = opts.clone();
+                o.device = rank_driver;
+                rank_opts.push(DriverOptions::CudaNative(o));
             }
             _ => unreachable!("flavor checked before building cuda rank options"),
         }
@@ -534,16 +504,16 @@ fn cuda_rank_options(
     Ok(rank_opts)
 }
 
-fn group_device(m: &config::ModelConfig, group_idx: usize, device_idx: usize) -> Result<String> {
+fn group_driver(m: &config::ModelConfig, group_idx: usize, driver_idx: usize) -> Result<String> {
     m.driver
         .device
-        .get(device_idx)
+        .get(driver_idx)
         .cloned()
         .ok_or_else(|| {
             anyhow!(
                 "model {:?}: group {group_idx} references device index {} but only {} devices configured",
                 m.name,
-                device_idx,
+                driver_idx,
                 m.driver.device.len(),
             )
         })
@@ -555,7 +525,7 @@ fn start_subprocess_group(
     sub_flavor: crate::subprocess_driver::SubprocessFlavor,
     drivers_config: &DriversConfig,
     snapshot_dir: &Path,
-    device_idx: usize,
+    driver_idx: usize,
     devices: &[String],
     tp_degree: usize,
     master_port: u16,
@@ -578,7 +548,7 @@ fn start_subprocess_group(
         &resolved.path,
         m,
         snapshot_dir,
-        device_idx,
+        driver_idx,
         devices,
         tp_degree,
         master_port,
@@ -591,8 +561,21 @@ fn start_subprocess_group(
         )
     })?;
 
+    // Pre-install the shmem channel for this driver with the
+    // user-configured spin params. Without this, `get_channel` would
+    // lazy-attach on first use with the channel module's defaults,
+    // ignoring `m.driver.ipc_profile` / `spin_budget_us` from the pie config.
+    let channel =
+        pie::driver::ShmemChannel::open(&driver.shmem_name, m.driver.effective_spin_budget_us())
+            .with_context(|| {
+                format!(
+                    "opening shmem channel for subprocess driver ({}) group {group_idx}",
+                    sub_flavor.as_str(),
+                )
+            })?;
+    pie::driver::install_channel(driver_idx, std::sync::Arc::new(channel));
+
     let handshake = GroupHandshake {
-        rpc_server_name: driver.server_name.clone(),
         caps: driver.caps.clone(),
     };
     Ok(StartedSubprocessGroup {

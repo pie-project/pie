@@ -5,19 +5,24 @@
 //! Direct Addressing.
 
 use std::collections::VecDeque;
-use std::sync::{Arc, LazyLock, OnceLock};
-use std::time::Instant;
+use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+use std::sync::{Arc, LazyLock, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
-use anyhow::{anyhow, Result};
-use uuid::Uuid;
-use tokio::sync::{oneshot, Semaphore};
+use anyhow::{Result, anyhow};
+use tokio::sync::{Semaphore, oneshot};
 use tokio::task::JoinHandle;
+use uuid::Uuid;
+
+/// Shared oneshot sender. Used so that an external Terminate can deliver
+/// the cancellation result if the WASM task is aborted before it can send.
+type SharedResultTx = Arc<Mutex<Option<oneshot::Sender<Result<String, String>>>>>;
 
 use crate::context;
 use crate::linker;
 use crate::program::ProgramName;
 use crate::server::{self, ClientId};
-use crate::service::{ServiceMap, ServiceHandler};
+use crate::service::{ServiceHandler, ServiceMap};
 use crate::workflow::WorkflowId;
 
 // =============================================================================
@@ -49,16 +54,22 @@ impl ProcessEvent {
     /// The payload string.
     pub fn value(&self) -> &str {
         match self {
-            Self::Stdout(v) | Self::Stderr(v) | Self::Message(v)
-            | Self::Return(v) | Self::Error(v) => v,
+            Self::Stdout(v)
+            | Self::Stderr(v)
+            | Self::Message(v)
+            | Self::Return(v)
+            | Self::Error(v) => v,
         }
     }
 
     /// Consume into payload string.
     pub fn into_value(self) -> String {
         match self {
-            Self::Stdout(v) | Self::Stderr(v) | Self::Message(v)
-            | Self::Return(v) | Self::Error(v) => v,
+            Self::Stdout(v)
+            | Self::Stderr(v)
+            | Self::Message(v)
+            | Self::Return(v)
+            | Self::Error(v) => v,
         }
     }
 }
@@ -70,11 +81,97 @@ impl ProcessEvent {
 pub type ProcessId = Uuid;
 
 /// Global registry mapping ProcessId to process actors.
-static SERVICES: LazyLock<ServiceMap<ProcessId, Message>> =
-    LazyLock::new(ServiceMap::new);
+static SERVICES: LazyLock<ServiceMap<ProcessId, Message>> = LazyLock::new(ServiceMap::new);
 
 /// Admission semaphore. `None` = unlimited concurrency (no gating).
 static ADMISSION: OnceLock<Option<Arc<Semaphore>>> = OnceLock::new();
+
+static PROCESS_COMPLETED: AtomicU64 = AtomicU64::new(0);
+static PROCESS_ADMISSION_WAIT_US: AtomicU64 = AtomicU64::new(0);
+static PROCESS_INSTANTIATE_US: AtomicU64 = AtomicU64::new(0);
+static PROCESS_CONTEXT_REGISTER_US: AtomicU64 = AtomicU64::new(0);
+static PROCESS_WASM_RUN_US: AtomicU64 = AtomicU64::new(0);
+static PROCESS_LAST_ADMISSION_WAIT_US: AtomicU64 = AtomicU64::new(0);
+static PROCESS_LAST_INSTANTIATE_US: AtomicU64 = AtomicU64::new(0);
+static PROCESS_LAST_CONTEXT_REGISTER_US: AtomicU64 = AtomicU64::new(0);
+static PROCESS_LAST_WASM_RUN_US: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Debug, Clone, Copy, Default, serde::Serialize)]
+pub struct RuntimeProcessStats {
+    pub completed: u64,
+    pub cumulative_admission_wait_us: u64,
+    pub avg_admission_wait_us: u64,
+    pub last_admission_wait_us: u64,
+    pub cumulative_instantiate_us: u64,
+    pub avg_instantiate_us: u64,
+    pub last_instantiate_us: u64,
+    pub cumulative_context_register_us: u64,
+    pub avg_context_register_us: u64,
+    pub last_context_register_us: u64,
+    pub cumulative_wasm_run_us: u64,
+    pub avg_wasm_run_us: u64,
+    pub last_wasm_run_us: u64,
+}
+
+fn duration_us(d: Duration) -> u64 {
+    d.as_micros().min(u128::from(u64::MAX)) as u64
+}
+
+fn record_process_timing(
+    admission_wait_us: u64,
+    instantiate_us: u64,
+    context_register_us: u64,
+    wasm_run_us: u64,
+) {
+    PROCESS_COMPLETED.fetch_add(1, Relaxed);
+    PROCESS_ADMISSION_WAIT_US.fetch_add(admission_wait_us, Relaxed);
+    PROCESS_INSTANTIATE_US.fetch_add(instantiate_us, Relaxed);
+    PROCESS_CONTEXT_REGISTER_US.fetch_add(context_register_us, Relaxed);
+    PROCESS_WASM_RUN_US.fetch_add(wasm_run_us, Relaxed);
+    PROCESS_LAST_ADMISSION_WAIT_US.store(admission_wait_us, Relaxed);
+    PROCESS_LAST_INSTANTIATE_US.store(instantiate_us, Relaxed);
+    PROCESS_LAST_CONTEXT_REGISTER_US.store(context_register_us, Relaxed);
+    PROCESS_LAST_WASM_RUN_US.store(wasm_run_us, Relaxed);
+}
+
+pub fn get_runtime_stats() -> RuntimeProcessStats {
+    let completed = PROCESS_COMPLETED.load(Relaxed);
+    let admission = PROCESS_ADMISSION_WAIT_US.load(Relaxed);
+    let instantiate = PROCESS_INSTANTIATE_US.load(Relaxed);
+    let context_register = PROCESS_CONTEXT_REGISTER_US.load(Relaxed);
+    let wasm_run = PROCESS_WASM_RUN_US.load(Relaxed);
+    RuntimeProcessStats {
+        completed,
+        cumulative_admission_wait_us: admission,
+        avg_admission_wait_us: if completed > 0 {
+            admission / completed
+        } else {
+            0
+        },
+        last_admission_wait_us: PROCESS_LAST_ADMISSION_WAIT_US.load(Relaxed),
+        cumulative_instantiate_us: instantiate,
+        avg_instantiate_us: if completed > 0 {
+            instantiate / completed
+        } else {
+            0
+        },
+        last_instantiate_us: PROCESS_LAST_INSTANTIATE_US.load(Relaxed),
+        cumulative_context_register_us: context_register,
+        avg_context_register_us: if completed > 0 {
+            context_register / completed
+        } else {
+            0
+        },
+        last_context_register_us: PROCESS_LAST_CONTEXT_REGISTER_US.load(Relaxed),
+        cumulative_wasm_run_us: wasm_run,
+        avg_wasm_run_us: if completed > 0 {
+            wasm_run / completed
+        } else {
+            0
+        },
+        last_wasm_run_us: PROCESS_LAST_WASM_RUN_US.load(Relaxed),
+    }
+}
 
 // =============================================================================
 // Public API
@@ -87,7 +184,9 @@ pub fn init_admission(max_concurrent: Option<usize>) {
     let sem = max_concurrent
         .filter(|&n| n > 0)
         .map(|n| Arc::new(Semaphore::new(n)));
-    ADMISSION.set(sem).expect("admission controller already initialized");
+    ADMISSION
+        .set(sem)
+        .expect("admission controller already initialized");
 }
 
 /// Spawn a new process and register it in the global registry.
@@ -101,7 +200,16 @@ pub fn spawn(
     workflow_id: Option<WorkflowId>,
     token_budget: Option<usize>,
 ) -> Result<ProcessId> {
-    let process = Process::new(username, program_name, input, client_id, capture_outputs, result_tx, workflow_id, token_budget);
+    let process = Process::new(
+        username,
+        program_name,
+        input,
+        client_id,
+        capture_outputs,
+        result_tx,
+        workflow_id,
+        token_budget,
+    );
     let id = process.process_id;
 
     SERVICES.spawn(id, || process)?;
@@ -112,7 +220,13 @@ pub fn spawn(
 /// Attach a client to a process.
 pub async fn attach(process_id: ProcessId, client_id: ClientId) -> Result<()> {
     let (tx, rx) = oneshot::channel();
-    SERVICES.send(&process_id, Message::AttachClient { client_id, response: tx })?;
+    SERVICES.send(
+        &process_id,
+        Message::AttachClient {
+            client_id,
+            response: tx,
+        },
+    )?;
     rx.await?
 }
 
@@ -136,8 +250,6 @@ pub fn stderr(process_id: ProcessId, content: String) {
     let _ = SERVICES.send(&process_id, Message::Stderr { content });
 }
 
-
-
 /// Get the username of a process.
 pub async fn get_username(process_id: ProcessId) -> Result<String> {
     let (tx, rx) = oneshot::channel();
@@ -158,7 +270,6 @@ pub async fn get_stats(process_id: ProcessId) -> Result<ProcessStats> {
     SERVICES.send(&process_id, Message::GetStats { response: tx })?;
     rx.await?
 }
-
 
 /// List all registered process IDs.
 pub fn list() -> Vec<ProcessId> {
@@ -189,22 +300,16 @@ enum Message {
     /// Detach the current client
     DetachClient,
     /// Terminate this process (Ok = return value, Err = exception)
-    Terminate {
-        result: Result<String, String>,
-    },
+    Terminate { result: Result<String, String> },
 
     /// Stdout output from the WASM instance
-    Stdout {
-        content: String,
-    },
+    Stdout { content: String },
     /// Query the process username
     GetUsername {
         response: oneshot::Sender<Result<String>>,
     },
     /// Stderr output from the WASM instance
-    Stderr {
-        content: String,
-    },
+    Stderr { content: String },
     /// Query the attached client ID
     GetClientId {
         response: oneshot::Sender<Result<Option<ClientId>>>,
@@ -235,6 +340,9 @@ struct Process {
     output_buffer: VecDeque<ProcessEvent>,
     /// Optional link to the workflow that spawned this process.
     workflow_id: Option<WorkflowId>,
+    /// Shared with the WASM task. Whoever takes it first (the run loop on
+    /// normal completion, or an external terminate) delivers the result.
+    result_tx: SharedResultTx,
 }
 
 impl Process {
@@ -250,6 +358,7 @@ impl Process {
         token_budget: Option<usize>,
     ) -> Self {
         let process_id = Uuid::new_v4();
+        let result_tx: SharedResultTx = Arc::new(Mutex::new(result_tx));
 
         let handle = tokio::spawn(Self::run(
             process_id,
@@ -257,7 +366,7 @@ impl Process {
             program.clone(),
             input.clone(),
             capture_outputs,
-            result_tx,
+            result_tx.clone(),
             token_budget,
         ));
 
@@ -272,6 +381,7 @@ impl Process {
             capture_outputs,
             output_buffer: VecDeque::new(),
             workflow_id,
+            result_tx,
         }
     }
 
@@ -304,7 +414,9 @@ impl Process {
     /// Flush buffered events to the attached client.
     /// On failure, detaches the client and retains undelivered entries.
     fn flush_output_buffer(&mut self) {
-        let Some(client_id) = self.client_id else { return };
+        let Some(client_id) = self.client_id else {
+            return;
+        };
         while let Some(event) = self.output_buffer.pop_front() {
             if server::send_event(client_id, self.process_id, &event).is_err() {
                 self.client_id = None;
@@ -321,21 +433,44 @@ impl Process {
         program: ProgramName,
         input: String,
         capture_outputs: bool,
-        result_tx: Option<oneshot::Sender<Result<String, String>>>,
+        result_tx: SharedResultTx,
         token_budget: Option<usize>,
     ) {
         // Admission control: wait for a permit before instantiating.
         // The permit is held for the entire WASM execution lifetime
         // and auto-released on completion, error, or task abort.
+        let admission_start = Instant::now();
         let _permit = match ADMISSION.get().and_then(|s| s.as_ref()) {
             Some(sem) => Some(sem.acquire().await.expect("admission semaphore closed")),
             None => None,
         };
+        let admission_wait_us = duration_us(admission_start.elapsed());
 
+        let mut instantiate_us = 0u64;
+        let mut context_register_us = 0u64;
+        let mut wasm_run_us = 0u64;
         let result: Result<String, String> = async {
-            let (mut store, instance) = linker::instantiate(process_id, username, &program, capture_outputs, token_budget)
+            let instantiate_start = Instant::now();
+            let (mut store, instance) = linker::instantiate(
+                process_id,
+                username,
+                &program,
+                capture_outputs,
+                token_budget,
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+            instantiate_us = duration_us(instantiate_start.elapsed());
+
+            // KV admission waits here, after the singleton linker has already
+            // prepared the instance and is free to instantiate other queued
+            // processes. Blocking inside the linker would serialize a saturated
+            // second cohort behind the first one and leave the GPU idle.
+            let context_register_start = Instant::now();
+            context::register_process(process_id, token_budget)
                 .await
                 .map_err(|e| e.to_string())?;
+            context_register_us = duration_us(context_register_start.elapsed());
 
             let run_interface = format!("pie:{}/run", program.name);
 
@@ -351,20 +486,37 @@ impl Process {
                 .get_typed_func::<(&str,), (Result<String, String>,)>(&mut store, &run_func_export)
                 .map_err(|e| format!("Failed to get 'run' function: {e:?}"))?;
 
+            let wasm_run_start = Instant::now();
             match run_func.call_async(&mut store, (&input,)).await {
-                Ok((Ok(output),)) => Ok(output),
-                Ok((Err(runtime_err),)) => Err(runtime_err),
-                Err(call_err) => Err(format!("Call error: {call_err}")),
+                Ok((Ok(output),)) => {
+                    wasm_run_us = duration_us(wasm_run_start.elapsed());
+                    Ok(output)
+                }
+                Ok((Err(runtime_err),)) => {
+                    wasm_run_us = duration_us(wasm_run_start.elapsed());
+                    Err(runtime_err)
+                }
+                Err(call_err) => {
+                    wasm_run_us = duration_us(wasm_run_start.elapsed());
+                    Err(format!("Call error: {call_err}"))
+                }
             }
-        }.await;
-
+        }
+        .await;
+        record_process_timing(
+            admission_wait_us,
+            instantiate_us,
+            context_register_us,
+            wasm_run_us,
+        );
 
         if let Err(ref err) = result {
             tracing::info!("Process {process_id} failed: {err}");
         }
 
-        // Fire result channel if a parent is waiting
-        if let Some(tx) = result_tx {
+        // Fire result channel if a parent is waiting (and an external
+        // terminate hasn't already claimed it).
+        if let Some(tx) = result_tx.lock().unwrap().take() {
             let _ = tx.send(result.clone());
         }
 
@@ -373,8 +525,14 @@ impl Process {
 
     /// Abort the WASM execution task, notify any attached client, and unregister.
     fn terminate(&mut self, result: Result<String, String>) {
-
         self.handle.abort();
+
+        // Deliver `result` to any parent waiting on the launch handle, if the
+        // run loop didn't already send it (e.g., external Terminate fires
+        // before the WASM task finished). First taker wins.
+        if let Some(tx) = self.result_tx.lock().unwrap().take() {
+            let _ = tx.send(result.clone());
+        }
 
         // Notify attached client / workflow
         match result {
@@ -391,7 +549,10 @@ impl ServiceHandler for Process {
 
     async fn handle(&mut self, msg: Message) {
         match msg {
-            Message::AttachClient { client_id, response } => {
+            Message::AttachClient {
+                client_id,
+                response,
+            } => {
                 if self.client_id.is_some() {
                     let _ = response.send(Err(anyhow!("already attached")));
                 } else {
@@ -429,7 +590,6 @@ impl ServiceHandler for Process {
                     elapsed_secs: self.start_time.elapsed().as_secs(),
                 }));
             }
-
         }
     }
 }

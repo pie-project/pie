@@ -13,16 +13,14 @@ from typing import Any
 import torch
 import torch.distributed as dist
 
-from pie_driver_dev.config import RuntimeConfig
+from ._bridge.config import RuntimeConfig
+from .utils import configure_distributed_environment
 
 
-# Map pie's RuntimeConfig.activation_dtype (torch.dtype) to vllm's string form.
-# vllm's EngineArgs wants strings; we work in torch.dtype internally.
-_DTYPE_TO_STR = {
-    torch.bfloat16: "bfloat16",
-    torch.float16: "float16",
-    torch.float32: "float32",
-}
+# `RuntimeConfig.activation_dtype` is a string identifier; vllm's
+# EngineArgs accepts the same vocabulary. This set gates the supported
+# values.
+_SUPPORTED_DTYPES = {"bfloat16", "float16", "float32"}
 
 
 def _resolve_hf_snapshot_dir(hf_repo: str) -> str | None:
@@ -74,30 +72,30 @@ def _build_vllm_config(config: RuntimeConfig, driver_config) -> Any:
     """Build a VllmConfig from pie's `RuntimeConfig` (universal slice) and
     `VllmDriverConfig` (vllm-native knobs).
 
-    Driver config field names mirror EngineArgs exactly, so we splat them
-    into EngineArgs as kwargs.
+    Exposed driver config field names mirror EngineArgs, so we splat policy
+    knobs into EngineArgs as kwargs. Capacity limits are resolved by vLLM and
+    reported later through DriverCapabilities.
     """
     from dataclasses import asdict
     from ._vllm_compat import EngineArgs
 
-    if config.activation_dtype not in _DTYPE_TO_STR:
+    if config.activation_dtype not in _SUPPORTED_DTYPES:
         raise ValueError(
             f"Unsupported activation_dtype for vllm driver: {config.activation_dtype}. "
-            f"Expected one of {list(_DTYPE_TO_STR)}."
+            f"Expected one of {sorted(_SUPPORTED_DTYPES)}."
         )
-    dtype_str = _DTYPE_TO_STR[config.activation_dtype]
 
     # Universal fields go through pie's RuntimeConfig.
     engine_kwargs = dict(
         model=config.hf_repo,
-        dtype=dtype_str,
+        dtype=config.activation_dtype,
         tensor_parallel_size=config.tensor_parallel_size,
         seed=config.random_seed,
         skip_tokenizer_init=True,        # pie owns tokenization
         download_dir=config.cache_dir,
     )
 
-    # Driver-specific fields splat verbatim — names match EngineArgs.
+    # Driver-specific policy fields splat verbatim — names match EngineArgs.
     # `None` means "leave default" (vllm picks). Pie-only knobs that don't
     # correspond to vllm EngineArgs are filtered out: spec_ngram_* drive
     # pie's NGRAM drafter (engine-side, see VllmEngine.spec_step).
@@ -113,27 +111,36 @@ def _build_vllm_config(config: RuntimeConfig, driver_config) -> Any:
         if v is not None:
             engine_kwargs[k] = v
 
-    # When piggybacking on vllm's CUDA-graph dispatch (enforce_eager=False),
-    # vllm bakes a fixed `compile_ranges` into the piecewise backend at load
-    # time and asserts at fire time that `num_tokens` falls inside one of
-    # them — chunked prefill's default 2048 is far below pie's batched
-    # peak. Default `max_num_batched_tokens` to the model's context length
-    # so any pie batch fits the compile range.
+    system_topology = configure_distributed_environment(
+        int(engine_kwargs["tensor_parallel_size"]), config.devices
+    )
+    if system_topology and "disable_custom_all_reduce" not in engine_kwargs:
+        engine_kwargs["disable_custom_all_reduce"] = True
+    # When piggybacking on vllm's CUDA-graph dispatch, vllm bakes a fixed
+    # `compile_ranges` into the piecewise backend at load time and asserts at
+    # fire time that `num_tokens` falls inside one of them. Keep Pie's default
+    # at vLLM's standard 8192-token compile range unless the user explicitly
+    # sets a different batch-token capacity.
     if (
         not engine_kwargs.get("enforce_eager", False)
         and engine_kwargs.get("max_num_batched_tokens") is None
     ):
-        from transformers import AutoConfig
-        try:
-            hf_cfg = AutoConfig.from_pretrained(config.hf_repo, trust_remote_code=True)
-            mml = int(getattr(hf_cfg, "max_position_embeddings", 0)) or None
-        except Exception:
-            mml = None
-        if mml is not None:
-            engine_kwargs["max_num_batched_tokens"] = mml
+        engine_kwargs["max_num_batched_tokens"] = 8192
 
     args = EngineArgs(**engine_kwargs)
     vllm_config = args.create_engine_config()
+    vllm_config.parallel_config.rank = config.rank
+
+    if system_topology and not engine_kwargs.get("enforce_eager", False):
+        from ._vllm_compat import CUDAGraphMode
+
+        # Keep torch.compile enabled, but avoid Pie's manual CUDA graph
+        # capture on SYS-level TP pairs. That capture path can wedge NCCL
+        # collectives after P2P is disabled; the compiled non-graph path
+        # remains safe and avoids falling all the way back to eager.
+        vllm_config.compilation_config.cudagraph_mode = CUDAGraphMode.NONE
+        vllm_config.compilation_config.cudagraph_capture_sizes = []
+        vllm_config.compilation_config.max_cudagraph_capture_size = None
 
     # Pie launches each DP replica as an independent single-rank subprocess.
     # vLLM names those compile-cache leaves `rank_0_0` in every replica, so
@@ -146,7 +153,7 @@ def _build_vllm_config(config: RuntimeConfig, driver_config) -> Any:
     ):
         import os
 
-        safe_device = str(config.device).replace(":", "_")
+        safe_device = config.device.replace(":", "_")
         vllm_config.compilation_config.cache_dir = (
             f"/tmp/pie_vllm_compile_cache/pid_{os.getpid()}_{safe_device}"
         )
@@ -174,6 +181,14 @@ def _ensure_vllm_distributed(vllm_config: Any, rank: int, local_rank: int) -> No
     )
 
     parallel_config = vllm_config.parallel_config
+
+    # vLLM's normal GPUWorker path applies this before constructing model
+    # parallel groups. Pie loads the model directly, so mirror that hook here;
+    # otherwise `disable_custom_all_reduce=True` is present in config but the
+    # TP communicator still builds vLLM's custom all-reduce path.
+    from vllm.distributed.parallel_state import set_custom_all_reduce
+
+    set_custom_all_reduce(not parallel_config.disable_custom_all_reduce)
 
     if not dist.is_initialized():
         # Single-rank fallback. FileStore avoids picking a port (no contention).
@@ -219,7 +234,7 @@ def load_vllm_model(
 
     # Pin the device for this rank — vllm reads current_device() during
     # model construction.
-    device_str = str(config.device)
+    device_str = config.device
     if device_str.startswith("cuda"):
         torch.cuda.set_device(device_str)
         local_rank = int(device_str.split(":")[1]) if ":" in device_str else 0

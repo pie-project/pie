@@ -14,14 +14,14 @@ namespace pie_cuda_driver::model {
 
 namespace {
 
-const DeviceTensor& must(const Engine& e, const std::string& name) {
+const DeviceTensor& must(const LoadedModel& e, const std::string& name) {
     if (!e.has(name)) {
         throw std::runtime_error("qwen3_5_moe: missing weight '" + name + "'");
     }
     return e.get(name);
 }
 
-const DeviceTensor* maybe(const Engine& e, const std::string& name) {
+const DeviceTensor* maybe(const LoadedModel& e, const std::string& name) {
     return e.has(name) ? &e.get(name) : nullptr;
 }
 
@@ -49,7 +49,7 @@ DeviceBuffer<float> to_fp32(const DeviceTensor& t) {
 // weights live under `model.language_model.…`. Qwen3-MoE (Qwen3-30B-A3B)
 // is a pure text model and uses `model.…` directly. Pick the prefix from
 // what the engine actually loaded so a single bind covers both.
-const char* select_prefix(const Engine& e) {
+const char* select_prefix(const LoadedModel& e) {
     if (e.has("model.language_model.embed_tokens.weight")) {
         return "model.language_model.";
     }
@@ -109,7 +109,7 @@ DeviceTensor slice_la_kkv_blocked(
 
 }  // namespace
 
-Qwen3_5MoeWeights bind_qwen3_5_moe(Engine& engine) {
+Qwen3_5MoeWeights bind_qwen3_5_moe(const LoadedModel& engine) {
     const auto& cfg = engine.hf_config();
     const int L = cfg.num_hidden_layers;
     // Qwen3-MoE (Qwen3-30B-A3B) is full-attention only — its config has
@@ -180,8 +180,8 @@ Qwen3_5MoeWeights bind_qwen3_5_moe(Engine& engine) {
         if (kind == "linear_attention") {
             Lw.kind = Qwen3_5MoeLayerWeights::Kind::LinearAttn;
             const std::string la = lp + "linear_attn.";
-            const auto& full_qkv = must(engine, la + "in_proj_qkv.weight");
-            const auto& full_conv_w = must(engine, la + "conv1d.weight");
+            const auto* full_qkv = &must(engine, la + "in_proj_qkv.weight");
+            const auto* full_conv_w = &must(engine, la + "conv1d.weight");
             const auto* full_conv_b = maybe(engine, la + "conv1d.bias");
             // Linear-attn fused QKV / conv1d use the [K1 | K2 | V] block
             // layout — same custom slicing as Qwen3_5 dense.
@@ -189,10 +189,10 @@ Qwen3_5MoeWeights bind_qwen3_5_moe(Engine& engine) {
             const int V_dim = cfg.linear_num_value_heads * cfg.linear_value_head_dim;
             if (T > 1) {
                 w.owned_bf16_buffers.push_back(
-                    slice_la_kkv_blocked(full_qkv, K_dim, V_dim, rank, T));
+                    slice_la_kkv_blocked(*full_qkv, K_dim, V_dim, rank, T));
                 Lw.la_in_proj_qkv = &w.owned_bf16_buffers.back();
                 w.owned_bf16_buffers.push_back(
-                    slice_la_kkv_blocked(full_conv_w, K_dim, V_dim, rank, T));
+                    slice_la_kkv_blocked(*full_conv_w, K_dim, V_dim, rank, T));
                 Lw.la_conv1d_w = &w.owned_bf16_buffers.back();
                 if (full_conv_b) {
                     w.owned_bf16_buffers.push_back(
@@ -202,8 +202,8 @@ Qwen3_5MoeWeights bind_qwen3_5_moe(Engine& engine) {
                     Lw.la_conv1d_b = nullptr;
                 }
             } else {
-                Lw.la_in_proj_qkv = &full_qkv;
-                Lw.la_conv1d_w    = &full_conv_w;
+                Lw.la_in_proj_qkv = full_qkv;
+                Lw.la_conv1d_w    = full_conv_w;
                 Lw.la_conv1d_b    = full_conv_b;
             }
             Lw.la_in_proj_z   = &must(engine, la + "in_proj_z.weight");
@@ -228,6 +228,10 @@ Qwen3_5MoeWeights bind_qwen3_5_moe(Engine& engine) {
             Lw.fa_o_proj = &must(engine, fa + "o_proj.weight");
             Lw.fa_q_norm = &must(engine, fa + "q_norm.weight");
             Lw.fa_k_norm = &must(engine, fa + "k_norm.weight");
+            Lw.fa_q_proj_quant = engine.quant_meta(fa + "q_proj.weight");
+            Lw.fa_k_proj_quant = engine.quant_meta(fa + "k_proj.weight");
+            Lw.fa_v_proj_quant = engine.quant_meta(fa + "v_proj.weight");
+            Lw.fa_o_proj_quant = engine.quant_meta(fa + "o_proj.weight");
             Lw.kv_layer = kv_slot++;
         } else {
             throw std::runtime_error(
@@ -252,6 +256,14 @@ Qwen3_5MoeWeights bind_qwen3_5_moe(Engine& engine) {
             Lw.shared_up_proj   = &must(engine, lp + "mlp.shared_expert.up_proj.weight");
             Lw.shared_down_proj = &must(engine, lp + "mlp.shared_expert.down_proj.weight");
             Lw.shared_gate      = &must(engine, lp + "mlp.shared_expert_gate.weight");
+            Lw.shared_gate_proj_quant =
+                engine.quant_meta(lp + "mlp.shared_expert.gate_proj.weight");
+            Lw.shared_up_proj_quant =
+                engine.quant_meta(lp + "mlp.shared_expert.up_proj.weight");
+            Lw.shared_down_proj_quant =
+                engine.quant_meta(lp + "mlp.shared_expert.down_proj.weight");
+            Lw.shared_gate_quant =
+                engine.quant_meta(lp + "mlp.shared_expert_gate.weight");
         }
     }
 

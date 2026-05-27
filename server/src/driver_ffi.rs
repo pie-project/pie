@@ -15,24 +15,32 @@ pub type ReadyCb = unsafe extern "C" fn(caps_json: *const c_char, ctx: *mut c_vo
 
 #[cfg(feature = "driver-portable")]
 unsafe extern "C" {
-    fn pie_driver_portable_run(
+    /// In-process entry: hands the C++ driver a vtable of FFI callbacks
+    /// for receiving requests and posting responses. There is no
+    /// shmem variant — portable is embedded-only.
+    fn pie_driver_portable_run_inproc(
         argc: c_int,
         argv: *mut *mut c_char,
         install_signal_handlers: c_int,
         ready_cb: ReadyCb,
         ready_ctx: *mut c_void,
+        vtable: pie::driver::InProcVTable,
     ) -> c_int;
     fn pie_driver_portable_request_stop();
 }
 
 #[cfg(feature = "driver-cuda")]
 unsafe extern "C" {
-    fn pie_driver_cuda_run(
+    /// In-process entry: hands the C++ driver a vtable of FFI callbacks
+    /// for receiving requests and posting responses. There is no
+    /// shmem variant — cuda_native is embedded-only.
+    fn pie_driver_cuda_run_inproc(
         argc: c_int,
         argv: *mut *mut c_char,
         install_signal_handlers: c_int,
         ready_cb: ReadyCb,
         ready_ctx: *mut c_void,
+        vtable: pie::driver::InProcVTable,
     ) -> c_int;
     fn pie_driver_cuda_request_stop();
 }
@@ -105,10 +113,12 @@ impl Flavor {
                 }
             }
             DriverKind::Dummy => Ok(Flavor::Dummy),
-            DriverKind::Dev | DriverKind::Vllm | DriverKind::Sglang => Err(format!(
-                "driver type {kind:?} is hosted by a Python subprocess, \
+            DriverKind::Dev | DriverKind::Vllm | DriverKind::Sglang | DriverKind::TensorRtLlm => {
+                Err(format!(
+                    "driver type {kind:?} is hosted by a Python subprocess, \
                  not an embedded FFI flavor."
-            )),
+                ))
+            }
         }
     }
 }
@@ -179,16 +189,52 @@ pub unsafe fn run(
 ) -> c_int {
     match flavor {
         #[cfg(feature = "driver-portable")]
-        Flavor::Portable => unsafe {
-            pie_driver_portable_run(argc, argv, install_signal_handlers, ready_cb, ready_ctx)
-        },
+        Flavor::Portable => panic!("portable is embedded-only; use run_inproc"),
         #[cfg(feature = "driver-cuda")]
-        Flavor::Cuda => unsafe {
-            pie_driver_cuda_run(argc, argv, install_signal_handlers, ready_cb, ready_ctx)
-        },
+        Flavor::Cuda => panic!("cuda_native is embedded-only; use run_inproc"),
         Flavor::Dummy => unsafe {
             pie_driver_dummy_run(argc, argv, install_signal_handlers, ready_cb, ready_ctx)
         },
+    }
+}
+
+/// In-process variant of [`run`]. The runtime hands the driver a
+/// `vtable` of FFI callbacks; both `cuda_native` and `portable` support
+/// this and use it exclusively (no shmem fallback). `dummy` doesn't
+/// have a C++ driver and isn't accepted here.
+pub unsafe fn run_inproc(
+    flavor: Flavor,
+    argc: c_int,
+    argv: *mut *mut c_char,
+    install_signal_handlers: c_int,
+    ready_cb: ReadyCb,
+    ready_ctx: *mut c_void,
+    vtable: pie::driver::InProcVTable,
+) -> Result<c_int, &'static str> {
+    match flavor {
+        #[cfg(feature = "driver-cuda")]
+        Flavor::Cuda => Ok(unsafe {
+            pie_driver_cuda_run_inproc(
+                argc,
+                argv,
+                install_signal_handlers,
+                ready_cb,
+                ready_ctx,
+                vtable,
+            )
+        }),
+        #[cfg(feature = "driver-portable")]
+        Flavor::Portable => Ok(unsafe {
+            pie_driver_portable_run_inproc(
+                argc,
+                argv,
+                install_signal_handlers,
+                ready_cb,
+                ready_ctx,
+                vtable,
+            )
+        }),
+        _ => Err("in-process driver entry not supported for this flavor"),
     }
 }
 

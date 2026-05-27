@@ -51,6 +51,7 @@ _DEFAULT_PROMPT_INPUT = {
     ),
     "max_tokens": 384,
     "temperature": 0.0,
+    "emit_stats": True,
 }
 
 _STATS_RE = re.compile(

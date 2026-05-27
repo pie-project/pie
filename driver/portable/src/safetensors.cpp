@@ -14,6 +14,7 @@
 #endif
 
 #include <nlohmann/json.hpp>
+#include <pie_driver_common/safetensors_manifest.hpp>
 
 namespace pie_portable_driver {
 
@@ -290,42 +291,9 @@ SafetensorsArchive::SafetensorsArchive(const std::filesystem::path& snapshot_dir
             "safetensors: not a directory: " + snapshot_dir.string());
     }
 
-    const auto index_path = snapshot_dir / "model.safetensors.index.json";
-    const auto single_path = snapshot_dir / "model.safetensors";
-
-    std::vector<std::filesystem::path> shard_paths;
-
-    if (std::filesystem::exists(index_path)) {
-        std::ifstream f(index_path);
-        if (!f) {
-            throw std::runtime_error(
-                "safetensors: cannot open " + index_path.string());
-        }
-        nlohmann::json idx = nlohmann::json::parse(f);
-        if (!idx.contains("weight_map") || !idx["weight_map"].is_object()) {
-            throw std::runtime_error(
-                "safetensors: index missing 'weight_map'");
-        }
-        std::vector<std::string> shard_names;
-        for (auto it = idx["weight_map"].begin(); it != idx["weight_map"].end();
-             ++it) {
-            const auto& shard = it.value().get<std::string>();
-            if (std::find(shard_names.begin(), shard_names.end(), shard) ==
-                shard_names.end()) {
-                shard_names.push_back(shard);
-            }
-        }
-        std::sort(shard_names.begin(), shard_names.end());
-        for (const auto& s : shard_names) {
-            shard_paths.push_back(snapshot_dir / s);
-        }
-    } else if (std::filesystem::exists(single_path)) {
-        shard_paths.push_back(single_path);
-    } else {
-        throw std::runtime_error(
-            "safetensors: no model.safetensors[.index.json] in " +
-            snapshot_dir.string());
-    }
+    const auto manifest =
+        pie_driver_common::discover_safetensors_manifest(snapshot_dir);
+    const auto& shard_paths = manifest.shard_paths;
 
     for (const auto& p : shard_paths) {
         auto shard = std::make_unique<SafetensorsShard>(p);

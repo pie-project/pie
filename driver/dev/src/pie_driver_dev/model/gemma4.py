@@ -56,9 +56,9 @@ import torch.nn.functional as fun
 import torch.distributed as dist
 
 from . import ModelConfig as ModelConfigBase
-from ..config import RuntimeConfig
+from pie_driver_dev.config import NativeRuntimeConfig as RuntimeConfig
 from ..adapter import AdapterSubpass
-from ..utils import get_available_memory
+from pie_driver_dev.utils import get_available_memory
 from ..schema import Schema, Source, WeightStore
 
 import pie_kernels as ops
@@ -231,7 +231,7 @@ class ModelConfig(ModelConfigBase):
             f"No source layer found for shared layer {layer_idx} of type {target_type}"
         )
 
-    def eval_max_num_kv_pages(self, runtime_config: RuntimeConfig) -> int:
+    def eval_total_pages(self, runtime_config: RuntimeConfig) -> int:
         available_bytes = get_available_memory(
             devices=runtime_config.devices,
             rank=runtime_config.rank,
@@ -815,7 +815,7 @@ class ForwardPass:
         k = k.contiguous()
         v = v.contiguous()
 
-        ops.append_paged_kv_cache(
+        ops.append_paged_kv_cache_with_format(
             append_key=k,
             append_value=v,
             batch_indices=batch_indices,
@@ -1076,7 +1076,7 @@ def create_kv_cache(
             continue
         kv_cache[i] = torch.zeros(
             (
-                runtime_config.max_num_kv_pages + 1,
+                runtime_config.total_pages + 1,
                 2,
                 runtime_config.kv_page_size,
                 cfg.num_kv_heads,

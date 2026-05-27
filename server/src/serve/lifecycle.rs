@@ -40,9 +40,9 @@ pub async fn wait_for_sigterm() {
 /// (thread) and subprocess (Python child) drivers uniformly via
 /// [`DriverHandle::is_finished`].
 ///
-/// On detected death this also flips the abort flag on every shmem
-/// client. Without that, any `fire_batch` already in the runtime's
-/// busy-spin would block for the full `PIE_SHMEM_TIMEOUT_S` (~5s)
+/// On detected death this also flips the abort flag on every driver
+/// channel. Without that, any `fire_batch` already in the runtime's
+/// busy-spin would block for the full `PIE_SHMEM_TIMEOUT_S` (~60s)
 /// before giving up — much longer than the watchdog's own 1s tick.
 /// Aborting first means the in-flight call returns within microseconds,
 /// the scheduler's batch task unwinds, and the shutdown sequence runs
@@ -55,10 +55,10 @@ pub async fn watchdog(drivers: &[DriverHandle]) -> &'static str {
         for d in drivers {
             if d.is_finished() {
                 tracing::error!(
-                    "driver {} exited unexpectedly; tearing down",
-                    d.shmem_name(),
+                    "driver ({}) exited unexpectedly; tearing down",
+                    d.shmem_name().unwrap_or("inproc"),
                 );
-                pie::device::abort_all_shmem_clients();
+                pie::driver::abort_all_driver_channels();
                 return "driver exited unexpectedly";
             }
         }

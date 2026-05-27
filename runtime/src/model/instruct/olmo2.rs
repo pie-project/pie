@@ -18,22 +18,17 @@
 //! Verified by `tokenizer.apply_chat_template` on
 //! `allenai/OLMo-2-1124-7B-Instruct`.
 
-use std::sync::Arc;
-use crate::model::instruct::{
-    ChatDecoder,
-    Instruct,
-    ReasoningDecoder,
-    ToolDecoder,
-};
 use crate::model::instruct::decoders::{GenericChatDecoder, NoopReasoningDecoder, NoopToolDecoder};
+use crate::model::instruct::{ChatDecoder, Instruct, ReasoningDecoder, ToolDecoder};
 use crate::model::tokenizer::Tokenizer;
+use std::sync::Arc;
 
 pub struct Olmo2Instruct {
     tokenizer: Arc<Tokenizer>,
     bos: Vec<u32>,
-    system_prefix: Vec<u32>,   // "<|system|>\n"
-    user_prefix: Vec<u32>,     // "<|user|>\n"
-    assistant_prefix: Vec<u32>,// "<|assistant|>\n"
+    system_prefix: Vec<u32>,    // "<|system|>\n"
+    user_prefix: Vec<u32>,      // "<|user|>\n"
+    assistant_prefix: Vec<u32>, // "<|assistant|>\n"
     newline: Vec<u32>,
     stop_ids: Vec<u32>,
 }
@@ -58,7 +53,7 @@ impl Olmo2Instruct {
         Self {
             bos: encode("<|endoftext|>"),
             system_prefix: make_prefix("<|system|>"),
-            user_prefix:   make_prefix("<|user|>"),
+            user_prefix: make_prefix("<|user|>"),
             assistant_prefix: make_prefix("<|assistant|>"),
             newline,
             stop_ids,
@@ -102,11 +97,18 @@ impl Instruct for Olmo2Instruct {
         self.stop_ids.clone()
     }
 
-    fn equip(&self, _tools: &[String]) -> Vec<u32> { Vec::new() }
-    fn answer(&self, _name: &str, _value: &str) -> Vec<u32> { Vec::new() }
+    fn equip(&self, _tools: &[String]) -> Vec<u32> {
+        Vec::new()
+    }
+    fn answer(&self, _name: &str, _value: &str) -> Vec<u32> {
+        Vec::new()
+    }
 
     fn chat_decoder(&self) -> Box<dyn ChatDecoder> {
-        Box::new(GenericChatDecoder::new(self.tokenizer.clone(), self.stop_ids.clone()))
+        Box::new(GenericChatDecoder::new(
+            self.tokenizer.clone(),
+            self.stop_ids.clone(),
+        ))
     }
 
     fn reasoning_decoder(&self) -> Box<dyn ReasoningDecoder> {

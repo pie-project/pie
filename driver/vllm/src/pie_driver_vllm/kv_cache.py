@@ -8,7 +8,7 @@ bind each `Attention` layer's `self.kv_cache` attribute via `bind_kv_cache`.
 
 Pie's Rust scheduler still owns block IDs — they're just the integer indices
 into the block dimension of these tensors. The CLI handshake already fixed
-`kv_page_size` (via vllm's preferred block size) before Rust bootstrap, so
+`kv_page_size` from vllm's preferred block size before Rust bootstrap, so
 the per-block stride agrees on both sides.
 
 Host pool: skipped in Phase 1.2 (returns empty). Phase 1.5+ will allocate it
@@ -22,7 +22,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from pie_driver_dev.config import RuntimeConfig
+from ._bridge.config import RuntimeConfig
 
 if TYPE_CHECKING:
     from .loader import LoadedModel
@@ -101,7 +101,7 @@ def allocate_and_bind_kv_cache(
         device=device,
         gpu_mem_utilization=driver_config.gpu_memory_utilization,
     )
-    config.max_num_kv_pages = num_blocks
+    config.total_pages = num_blocks
     # vLLM's FlexAttention metadata builder asserts `cache_config.num_gpu_blocks`
     # is set; pie manages its own KV pool, so we sync the count over here so
     # backends that consult vllm_config see the right value.

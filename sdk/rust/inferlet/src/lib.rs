@@ -13,9 +13,9 @@ pub use wstd;
 pub use wit_bindgen;
 
 // Re-export serde and serde_json so the macro-generated JSON bridge can use them
+pub use schemars;
 pub use serde;
 pub use serde_json;
-pub use schemars;
 
 // Re-export the attribute macros
 pub use inferlet_macros::{main, tool};
@@ -43,29 +43,27 @@ pub use pie::zo;
 mod context;
 
 pub use context::{
-    Context, RawContext,
-    Constrain, GrammarConstraint, Schema,
-    AnyJson, Ebnf, JsonSchema, Regex,
+    AnyJson, Constrain, Context, Ebnf, GrammarConstraint, JsonSchema, RawContext, Regex, Schema,
 };
 
 // =============================================================================
 // Sampler / Probe + Forward primitive
 // =============================================================================
 
-pub mod sample;
 pub mod forward;
+pub mod sample;
 
 // =============================================================================
 // Generation state machine + decoders + speculation
 // =============================================================================
 
-pub mod generation;
 pub mod chat;
+pub mod generation;
 pub mod reasoning;
 pub mod spec;
 pub mod tools;
 
-pub use generation::{Generator, GenStep};
+pub use generation::{GenStep, Generator};
 pub use spec::Speculator;
 pub use tools::Tool;
 
@@ -101,6 +99,10 @@ pub mod messaging {
     pub use crate::pie::core::messaging::*;
 }
 
+pub mod session {
+    pub use crate::pie::core::session::*;
+}
+
 pub mod inference {
     pub use crate::pie::core::inference::*;
 }
@@ -109,7 +111,6 @@ pub mod inference {
 /// constraints around it. Most users should reach for [`Schema`] or
 /// [`GrammarConstraint`] instead.
 pub use crate::pie::core::inference::Matcher;
-
 
 // =============================================================================
 // Async Extension Traits
@@ -126,9 +127,14 @@ pub trait ForwardPassExt {
 impl ForwardPassExt for inference::ForwardPass {
     async fn execute_async(&self) -> Result<inference::Output> {
         let future_output = self.execute()?;
+        if let Some(output) = future_output.get() {
+            return Ok(output);
+        }
         let pollable = future_output.pollable();
         AsyncPollable::new(pollable).wait_for().await;
-        future_output.get().ok_or_else(|| "No output available".to_string())
+        future_output
+            .get()
+            .ok_or_else(|| "No output available".to_string())
     }
 }
 
@@ -177,6 +183,62 @@ impl FutureBlobExt for types::FutureBlob {
 }
 
 // =============================================================================
+// Inferlet-to-inferlet launch
+// =============================================================================
+
+/// Handle to a launched child inferlet. See [`launch`].
+///
+/// Three modes:
+/// - **fire-and-forget**: drop the handle. The child runs to completion on its
+///   own; its return value is discarded.
+/// - **await the result**: `child.await` (via [`IntoFuture`]).
+/// - **timeout / cancel**: keep the handle, call `child.wait()` for a
+///   borrowing future, and call `child.cancel()` if the timeout fires.
+pub struct Child(pie::core::runtime::Child);
+
+impl Child {
+    /// Process id (UUID) of the child, useful for logs.
+    pub fn pid(&self) -> String {
+        self.0.pid()
+    }
+
+    /// Hard-kill the child if still running. Idempotent.
+    pub fn cancel(&self) {
+        self.0.cancel()
+    }
+
+    /// Wait for the child's result without consuming the handle. Use this
+    /// when you may need to call `cancel()` later (e.g. after a timeout).
+    pub async fn wait(&mut self) -> Result<String> {
+        let pollable = self.0.pollable();
+        wstd::io::AsyncPollable::new(pollable).wait_for().await;
+        self.0
+            .get()
+            .unwrap_or_else(|| Err("pollable signaled but get() returned None".to_string()))
+    }
+}
+
+impl std::future::IntoFuture for Child {
+    type Output = Result<String>;
+    // Box the future to keep the SDK on stable Rust without TAIT. The cost
+    // is one allocation per `child.await`, which is negligible next to the
+    // wasmtime store creation a launch already pays for.
+    type IntoFuture = std::pin::Pin<Box<dyn std::future::Future<Output = Result<String>>>>;
+
+    fn into_future(mut self) -> Self::IntoFuture {
+        Box::pin(async move { self.wait().await })
+    }
+}
+
+/// Launch a child inferlet identified by `name@version`. Returns a
+/// [`Child`] handle. See the handle docs for the three usage modes.
+pub fn launch(program: &str, input: &str) -> Result<Child> {
+    pie::core::runtime::launch(program, input)
+        .map(Child)
+        .map_err(|e| e.to_string())
+}
+
+// =============================================================================
 // Argument Parsing (re-exported from pico_args)
 // =============================================================================
 
@@ -194,22 +256,22 @@ pub fn parse_args(args: Vec<String>) -> Arguments {
 /// `use inferlet::prelude::*;` covers the common case so inferlets don't
 /// have to maintain a hand-rolled import grocery list.
 pub mod prelude {
-    pub use crate::{main, tool};
-    pub use crate::{Context, Result, Schema, Tool};
+    pub use crate::adapter::Adapter;
+    pub use crate::messaging;
     pub use crate::model::Model;
     pub use crate::runtime;
-    pub use crate::messaging;
-    pub use crate::adapter::Adapter;
+    pub use crate::{Child, Context, Result, Schema, Tool, launch};
+    pub use crate::{main, tool};
 
-    pub use crate::forward::{Forward, Output, SampleHandle, ProbeHandle};
-    pub use crate::sample::{Sampler, Probe};
-    pub use crate::generation::{Generator, GenStep};
-    pub use crate::{chat, reasoning, tools};
+    pub use crate::forward::{Forward, Output, ProbeHandle, SampleHandle};
+    pub use crate::generation::{GenStep, Generator};
+    pub use crate::sample::{Probe, Sampler};
     pub use crate::spec::Speculator;
+    pub use crate::{chat, reasoning, tools};
 
     // Extension traits
     pub use crate::ForwardPassExt;
-    pub use crate::SubscriptionExt;
-    pub use crate::FutureStringExt;
     pub use crate::FutureBlobExt;
+    pub use crate::FutureStringExt;
+    pub use crate::SubscriptionExt;
 }

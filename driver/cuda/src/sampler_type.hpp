@@ -1,6 +1,6 @@
 #pragma once
 
-// Sampler type IDs as encoded in the BPIQ wire's `A_SAMPLER_TYPES` array.
+// Sampler type IDs as encoded in the wire's `A_SAMPLER_TYPES` array.
 // Authoritative definition lives in the runtime
 // (`runtime/src/inference/request.rs::Sampler::type_id`); this header is
 // the C++ mirror so the driver can dispatch by named constant rather than

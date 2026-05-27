@@ -13,11 +13,37 @@
 //! `pie_driver_dev.hf_utils.get_hf_snapshot_dir`). The cache layout is
 //! identical to the Python `huggingface_hub` package's, so a model
 //! downloaded via `huggingface-cli` or `pie model download` from the
-//! Python side is reused here without re-downloading.
+//! Python side is reused here without re-downloading. Repo downloads are
+//! runtime-artifact selective: safetensors weights plus config/tokenizer
+//! files, excluding alternate checkpoint formats the drivers cannot load.
 
 use std::path::{Path, PathBuf};
 
 use anyhow::{Result, anyhow, bail};
+
+/// Files required by Pie's runtime loaders. Keep this broad for small metadata
+/// and tokenizer artifacts, but narrow for weights: the CUDA/portable loaders
+/// consume `model.safetensors` or `model-*.safetensors` shards, not duplicate
+/// `.pt`, `.bin`, `.gguf`, or `consolidated.safetensors` artifacts.
+pub fn runtime_snapshot_allow_patterns() -> Vec<String> {
+    [
+        "*.json",
+        "*.model",
+        "*.txt",
+        "*.tiktoken",
+        "*.jinja",
+        "model*.safetensors",
+        "**/*.json",
+        "**/*.model",
+        "**/*.txt",
+        "**/*.tiktoken",
+        "**/*.jinja",
+        "**/model*.safetensors",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect()
+}
 
 /// Resolve `repo_id_or_path` to a snapshot directory on disk. Local
 /// directories win; otherwise the input is parsed as an `owner/name`
@@ -67,15 +93,16 @@ fn parse_repo_id(s: &str) -> Result<(String, String)> {
 }
 
 async fn download_snapshot(owner: &str, name: &str) -> Result<PathBuf> {
-    let client = hf_hub::HFClient::new()
-        .map_err(|e| anyhow!("init HF client: {e}"))?;
+    let client = hf_hub::HFClient::new().map_err(|e| anyhow!("init HF client: {e}"))?;
     let repo = client.model(owner.to_string(), name.to_string());
+    let allow_patterns = runtime_snapshot_allow_patterns();
 
     // Touch the cache once locally first to print a helpful "downloading"
     // line only when we'll actually fetch anything. `local_files_only`
     // returns the snapshot dir on cache hit and an error on miss.
     let cache_hit = repo
         .snapshot_download()
+        .allow_patterns(allow_patterns.clone())
         .local_files_only(true)
         .send()
         .await
@@ -83,11 +110,12 @@ async fn download_snapshot(owner: &str, name: &str) -> Result<PathBuf> {
     if cache_hit.is_none() {
         eprintln!(
             "hf: {owner}/{name} not in local cache; downloading \
-             (this may take a while)…"
+             runtime artifacts only (this may take a while)…"
         );
     }
 
     repo.snapshot_download()
+        .allow_patterns(allow_patterns)
         .send()
         .await
         .map_err(|e| anyhow!("download {owner}/{name}: {e}"))
@@ -121,6 +149,18 @@ mod tests {
         assert!(parse_repo_id("/foo").is_err());
         assert!(parse_repo_id("foo/").is_err());
         assert!(parse_repo_id("/").is_err());
+    }
+
+    #[test]
+    fn runtime_allowlist_keeps_weights_safetensors_specific() {
+        let patterns = runtime_snapshot_allow_patterns();
+        assert!(patterns.iter().any(|p| p == "model*.safetensors"));
+        assert!(patterns.iter().any(|p| p == "**/model*.safetensors"));
+        assert!(patterns.iter().any(|p| p == "*.json"));
+        assert!(!patterns.iter().any(|p| p == "*.safetensors"));
+        assert!(!patterns.iter().any(|p| p == "**/*.safetensors"));
+        assert!(!patterns.iter().any(|p| p.ends_with(".pt")));
+        assert!(!patterns.iter().any(|p| p.ends_with(".bin")));
     }
 
     #[tokio::test]

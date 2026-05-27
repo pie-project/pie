@@ -1,4 +1,4 @@
-//! Per-device batch scheduler.
+//! Per-driver batch scheduler.
 //!
 //! Each `BatchScheduler` owns its own RPC client, scheduling policy,
 //! and tokio task. It accepts pre-translated forward pass requests,
@@ -10,89 +10,17 @@ use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use tokio::sync::{mpsc, oneshot, Semaphore};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
 
-
-use crate::device::DeviceId;
 use crate::context::pagestore::PhysicalPageId;
-
-use crate::device;
+use crate::driver::{self, DriverId, SchedulerLimits};
 
 use super::adaptive_policy::{AdaptivePolicy, EagerPolicy, GreedyPolicy};
-use super::request::{
-    BatchedForwardPassRequest, BatchedForwardPassResponse, ForwardPassOutput, ForwardPassRequest,
-    ForwardPassResponse, Sampler, SlotOutput,
-};
+use super::{ForwardOutput, request};
 
-/// Build the per-slot output list from the worker's parallel-fields response.
-///
-/// Walks the request's samplers in slot order, pulling one item from the
-/// matching response field per slot. This preserves the 1:1 mapping between
-/// `pass.sampler(...)` calls and returned slots — even when sampler types
-/// are mixed (e.g. multinomial + entropy on the same position).
-///
-/// Spec-mode requests are detected via a token-count mismatch (the verifier
-/// produces a token sequence whose length is unrelated to the inferlet's
-/// sampler count); in that case all slots collapse to `Token` entries.
-fn build_slot_output(samplers: &[Sampler], resp: ForwardPassResponse) -> ForwardPassOutput {
-    let spec_tokens = resp.spec_tokens;
-    let spec_positions = resp.spec_positions;
+mod chunked;
 
-    let expected_token_slots = samplers
-        .iter()
-        .filter(|s| {
-            matches!(
-                s,
-                Sampler::Multinomial { .. }
-                    | Sampler::TopK { .. }
-                    | Sampler::TopP { .. }
-                    | Sampler::MinP { .. }
-                    | Sampler::TopKTopP { .. }
-            )
-        })
-        .count();
-
-    let is_spec_walk = !resp.tokens.is_empty()
-        && resp.tokens.len() != expected_token_slots
-        && resp.dists.is_empty()
-        && resp.logits.is_empty()
-        && resp.logprobs.is_empty()
-        && resp.entropies.is_empty();
-
-    if is_spec_walk {
-        let slots = resp.tokens.into_iter().map(SlotOutput::Token).collect();
-        return ForwardPassOutput { slots, spec_tokens, spec_positions };
-    }
-
-    let mut tok_iter = resp.tokens.into_iter();
-    let mut dist_iter = resp.dists.into_iter();
-    let mut logit_iter = resp.logits.into_iter();
-    let mut lp_iter = resp.logprobs.into_iter();
-    let mut ent_iter = resp.entropies.into_iter();
-
-    let slots: Vec<SlotOutput> = samplers
-        .iter()
-        .filter_map(|s| match s {
-            Sampler::Multinomial { .. }
-            | Sampler::TopK { .. }
-            | Sampler::TopP { .. }
-            | Sampler::MinP { .. }
-            | Sampler::TopKTopP { .. } => tok_iter.next().map(SlotOutput::Token),
-            Sampler::Dist { .. } => dist_iter
-                .next()
-                .map(|(ids, ps)| SlotOutput::Distribution(ids, ps)),
-            Sampler::RawLogits => logit_iter.next().map(SlotOutput::Logits),
-            Sampler::Logprob { .. } | Sampler::Logprobs { .. } => {
-                lp_iter.next().map(SlotOutput::Logprobs)
-            }
-            Sampler::Entropy => ent_iter.next().map(SlotOutput::Entropy),
-            // Embedding is reserved but not currently produced by the worker.
-            Sampler::Embedding => None,
-        })
-        .collect();
-
-    ForwardPassOutput { slots, spec_tokens, spec_positions }
-}
+use chunked::ChunkContinuation;
 
 // =============================================================================
 // Scheduling Policy Trait
@@ -108,14 +36,19 @@ pub(super) trait SchedulingPolicy: Send {
     fn on_arrival(&mut self);
 
     /// A batch finished executing. `latency` is the wall-clock time
-    /// the forward pass took on the device.
+    /// the forward pass took on the driver.
     fn on_complete(&mut self, latency: Duration);
 
-    /// The current batch was fired.
-    fn on_fired(&mut self);
+    /// The current batch was fired. `fired_size` is the number of
+    /// requests in the batch — policies use it to learn the steady-
+    /// state cohort size and avoid firing partial batches in the next
+    /// cycle.
+    fn on_fired(&mut self, fired_size: usize);
 
     /// Decide whether to fire or wait, given the current batch size.
-    fn decide(&self, current_batch_size: usize) -> Decision;
+    /// `&mut self` so policies can ratchet internal state (e.g.,
+    /// AdaptivePolicy's `cohort_high_water`) on every poll.
+    fn decide(&mut self, current_batch_size: usize, prefill_cohort: bool) -> Decision;
 }
 
 // =============================================================================
@@ -139,9 +72,33 @@ pub(super) enum Decision {
 pub struct SchedulerStats {
     pub total_batches: AtomicU64,
     pub total_tokens_processed: AtomicU64,
+    /// Total request count across all batches (sum of batch sizes).
+    /// Divide by `total_batches` for mean batch size in requests.
+    pub total_requests_processed: AtomicU64,
+    /// Largest forward request count ever fired by this scheduler.
+    pub max_forward_requests_observed: AtomicU64,
+    /// Coarse histogram of batch sizes. Buckets:
+    /// [0]=1, [1]=2-3, [2]=4-7, [3]=8-15, [4]=16-31,
+    /// [5]=32-63, [6]=64-127, [7]=128+.
+    pub batch_size_hist: [AtomicU64; 8],
     pub last_batch_latency_us: AtomicU64,
     pub cumulative_latency_us: AtomicU64,
+    pub cumulative_permit_wait_us: AtomicU64,
+    pub cumulative_fire_prepare_us: AtomicU64,
+    pub cumulative_execute_batch_us: AtomicU64,
+    pub cumulative_batch_build_us: AtomicU64,
+    pub cumulative_driver_fire_us: AtomicU64,
+    pub cumulative_response_dispatch_us: AtomicU64,
+    pub cumulative_context_tick_submit_us: AtomicU64,
+    pub cumulative_stats_update_us: AtomicU64,
+}
 
+#[derive(Debug, Default, Clone, Copy)]
+struct BatchExecutionTiming {
+    total_us: u64,
+    batch_build_us: u64,
+    driver_fire_us: u64,
+    response_dispatch_us: u64,
 }
 
 // =============================================================================
@@ -150,10 +107,154 @@ pub struct SchedulerStats {
 
 /// A forward pass request bundled with its response channel and physical pages.
 struct PendingRequest {
-    request: ForwardPassRequest,
-    response_tx: oneshot::Sender<ForwardPassOutput>,
+    request: pie_bridge::ForwardRequest,
+    completion: Completion,
     physical_page_ids: Vec<PhysicalPageId>,
     last_page_len: u32,
+}
+
+enum Completion {
+    Direct(oneshot::Sender<Result<ForwardOutput>>),
+    Chunk {
+        continuation: ChunkContinuation,
+        sampler_slots: Vec<usize>,
+    },
+}
+
+impl PendingRequest {
+    fn direct(
+        request: pie_bridge::ForwardRequest,
+        response_tx: oneshot::Sender<Result<ForwardOutput>>,
+        physical_page_ids: Vec<PhysicalPageId>,
+        last_page_len: u32,
+    ) -> Self {
+        Self {
+            request,
+            completion: Completion::Direct(response_tx),
+            physical_page_ids,
+            last_page_len,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct RequestCapacityUsage {
+    forward_tokens: usize,
+    page_refs: usize,
+    logit_rows: usize,
+    prob_rows: usize,
+    sampler_rows: usize,
+    logprob_labels: usize,
+    user_custom_mask_bytes: usize,
+    spec_custom_mask_bytes: usize,
+    has_spec_drafts: bool,
+    has_dense_logit_requirement: bool,
+    has_prob_sampling: bool,
+    is_single_token_decode: bool,
+    all_samplers_token: bool,
+}
+
+fn request_capacity_usage(req: &PendingRequest, page_size: u32) -> RequestCapacityUsage {
+    let input_tokens = req.request.token_ids.len();
+    let spec_tokens = req.request.spec_token_ids.len();
+    let forward_tokens = input_tokens.saturating_add(spec_tokens);
+    let mut sampler_rows = req.request.sampling_indices.len();
+    if spec_tokens > 0 {
+        sampler_rows = sampler_rows.saturating_add(spec_tokens.saturating_add(1));
+    }
+    let mut all_samplers_token = true;
+    let mut has_prob_sampling = false;
+    for sampler in &req.request.samplers {
+        if !is_token_sampler(sampler) {
+            all_samplers_token = false;
+        }
+        if sampler_needs_prob_rows(sampler) {
+            has_prob_sampling = true;
+        }
+    }
+    let has_output_spec = req.request.output_spec_flags.iter().any(|&enabled| enabled);
+    let has_dense_logit_requirement = req.request.has_user_mask
+        || !req.request.logit_masks.is_empty()
+        || spec_tokens > 0
+        || has_output_spec
+        || !all_samplers_token;
+    let is_single_token_decode = input_tokens == 1
+        && spec_tokens == 0
+        && req.request.single_token_mode
+        && !req.request.has_user_mask;
+    let page_refs = req.physical_page_ids.len();
+    let spec_custom_mask_bytes =
+        packed_mask_bytes(forward_tokens, page_refs, req.last_page_len, page_size);
+    let user_custom_mask_bytes = if req.request.has_user_mask && input_tokens > 1 {
+        packed_mask_bytes(input_tokens, page_refs, req.last_page_len, page_size)
+    } else {
+        0
+    };
+
+    RequestCapacityUsage {
+        forward_tokens,
+        page_refs,
+        logit_rows: 0,
+        prob_rows: 0,
+        sampler_rows,
+        logprob_labels: request_logprob_labels(&req.request),
+        user_custom_mask_bytes,
+        spec_custom_mask_bytes,
+        has_spec_drafts: spec_tokens > 0,
+        has_dense_logit_requirement,
+        has_prob_sampling,
+        is_single_token_decode,
+        all_samplers_token,
+    }
+}
+
+fn is_token_sampler(sampler: &pie_bridge::Sampler) -> bool {
+    matches!(
+        sampler,
+        pie_bridge::Sampler::Multinomial { .. }
+            | pie_bridge::Sampler::TopK { .. }
+            | pie_bridge::Sampler::TopP { .. }
+            | pie_bridge::Sampler::MinP { .. }
+            | pie_bridge::Sampler::TopKTopP { .. }
+    )
+}
+
+fn sampler_needs_prob_rows(sampler: &pie_bridge::Sampler) -> bool {
+    match sampler {
+        pie_bridge::Sampler::TopK { temperature, k } => *temperature > 0.0 && *k > 0,
+        pie_bridge::Sampler::TopP { temperature, p } => *temperature > 0.0 && *p < 1.0,
+        pie_bridge::Sampler::TopKTopP { temperature, k, p } => {
+            *temperature > 0.0 && (*k > 0 || *p < 1.0)
+        }
+        _ => false,
+    }
+}
+
+fn packed_mask_bytes(
+    query_tokens: usize,
+    page_refs: usize,
+    last_page_len: u32,
+    page_size: u32,
+) -> usize {
+    if query_tokens == 0 || page_refs == 0 || page_size == 0 {
+        return 0;
+    }
+    let kv_len = page_refs
+        .saturating_sub(1)
+        .saturating_mul(page_size as usize)
+        .saturating_add(last_page_len as usize);
+    query_tokens.saturating_mul(kv_len).saturating_add(7) / 8
+}
+
+fn request_logprob_labels(req: &pie_bridge::ForwardRequest) -> usize {
+    req.samplers
+        .iter()
+        .map(|s| match s {
+            pie_bridge::Sampler::Logprob { .. } => 1,
+            pie_bridge::Sampler::Logprobs { token_ids } => token_ids.len(),
+            _ => 0,
+        })
+        .sum()
 }
 
 // =============================================================================
@@ -167,28 +268,222 @@ struct PendingRequest {
 struct BatchAccumulator {
     requests: Vec<PendingRequest>,
     total_tokens: usize,
-    max_batch_size: usize,
-    max_batch_tokens: usize,
+    total_pages: usize,
+    total_logit_rows: usize,
+    total_prob_rows: usize,
+    total_sampler_rows: usize,
+    total_logprob_labels: usize,
+    total_user_custom_mask_bytes: usize,
+    total_spec_custom_mask_bytes: usize,
+    has_spec_drafts: bool,
+    has_dense_logit_requirement: bool,
+    has_prob_sampling: bool,
+    all_single_token_decode: bool,
+    all_samplers_token: bool,
+    page_size: u32,
+    limits: SchedulerLimits,
 }
 
 impl BatchAccumulator {
-    fn new(max_batch_size: usize, max_batch_tokens: usize) -> Self {
+    fn new(limits: SchedulerLimits, page_size: u32) -> Self {
         Self {
             requests: Vec::new(),
             total_tokens: 0,
-            max_batch_size,
-            max_batch_tokens,
+            total_pages: 0,
+            total_logit_rows: 0,
+            total_prob_rows: 0,
+            total_sampler_rows: 0,
+            total_logprob_labels: 0,
+            total_user_custom_mask_bytes: 0,
+            total_spec_custom_mask_bytes: 0,
+            has_spec_drafts: false,
+            has_dense_logit_requirement: false,
+            has_prob_sampling: false,
+            all_single_token_decode: true,
+            all_samplers_token: true,
+            page_size,
+            limits,
         }
     }
 
+    fn projected_rows(
+        &self,
+        extra: Option<&RequestCapacityUsage>,
+    ) -> (usize, usize, bool, bool, bool) {
+        let total_tokens = self
+            .total_tokens
+            .saturating_add(extra.map(|usage| usage.forward_tokens).unwrap_or(0));
+        let total_sampler_rows = self
+            .total_sampler_rows
+            .saturating_add(extra.map(|usage| usage.sampler_rows).unwrap_or(0));
+        let has_dense_logit_requirement = self.has_dense_logit_requirement
+            || extra
+                .map(|usage| usage.has_dense_logit_requirement)
+                .unwrap_or(false);
+        let has_prob_sampling =
+            self.has_prob_sampling || extra.map(|usage| usage.has_prob_sampling).unwrap_or(false);
+        let all_samplers_token =
+            self.all_samplers_token && extra.map(|usage| usage.all_samplers_token).unwrap_or(true);
+        let all_single_token_decode = self.all_single_token_decode
+            && extra
+                .map(|usage| usage.is_single_token_decode)
+                .unwrap_or(true);
+        let compact_logit_rows = !all_single_token_decode
+            && !has_dense_logit_requirement
+            && !has_prob_sampling
+            && all_samplers_token
+            && total_sampler_rows > 0
+            && total_sampler_rows < total_tokens;
+        let logit_rows = if compact_logit_rows {
+            total_sampler_rows
+        } else {
+            total_tokens
+        };
+        let prob_rows = if has_prob_sampling { total_tokens } else { 0 };
+        (
+            logit_rows,
+            prob_rows,
+            has_dense_logit_requirement,
+            has_prob_sampling,
+            all_single_token_decode,
+        )
+    }
+
     fn push(&mut self, req: PendingRequest) {
-        self.total_tokens += req.request.tokens.len();
+        let mut usage = request_capacity_usage(&req, self.page_size);
+        let (logit_rows, prob_rows, _, _, _) = self.projected_rows(Some(&usage));
+        usage.logit_rows = logit_rows;
+        usage.prob_rows = prob_rows;
+        self.total_tokens = self.total_tokens.saturating_add(usage.forward_tokens);
+        self.total_pages = self.total_pages.saturating_add(usage.page_refs);
+        self.total_logit_rows = usage.logit_rows;
+        self.total_prob_rows = usage.prob_rows;
+        self.total_sampler_rows = self.total_sampler_rows.saturating_add(usage.sampler_rows);
+        self.total_logprob_labels = self
+            .total_logprob_labels
+            .saturating_add(usage.logprob_labels);
+        self.total_user_custom_mask_bytes = self
+            .total_user_custom_mask_bytes
+            .saturating_add(usage.user_custom_mask_bytes);
+        self.total_spec_custom_mask_bytes = self
+            .total_spec_custom_mask_bytes
+            .saturating_add(usage.spec_custom_mask_bytes);
+        self.has_spec_drafts |= usage.has_spec_drafts;
+        self.has_dense_logit_requirement |= usage.has_dense_logit_requirement;
+        self.has_prob_sampling |= usage.has_prob_sampling;
+        self.all_single_token_decode &= usage.is_single_token_decode;
+        self.all_samplers_token &= usage.all_samplers_token;
         self.requests.push(req);
     }
 
+    fn single_request_limit_error(&self, req: &PendingRequest) -> Option<String> {
+        let usage = request_capacity_usage(req, self.page_size);
+        let (logit_rows, prob_rows, _, _, _) =
+            BatchAccumulator::new(self.limits, self.page_size).projected_rows(Some(&usage));
+        if usage.forward_tokens > self.limits.max_forward_tokens {
+            return Some(format!(
+                "forward request has {} forward tokens, exceeding driver limit {}",
+                usage.forward_tokens, self.limits.max_forward_tokens
+            ));
+        }
+
+        if usage.page_refs > self.limits.max_page_refs {
+            return Some(format!(
+                "forward request has {} page refs, exceeding driver limit {}",
+                usage.page_refs, self.limits.max_page_refs
+            ));
+        }
+
+        if logit_rows > self.limits.max_logit_rows {
+            return Some(format!(
+                "forward request needs {} logit rows, exceeding driver limit {}",
+                logit_rows, self.limits.max_logit_rows
+            ));
+        }
+
+        if prob_rows > self.limits.max_prob_rows {
+            return Some(format!(
+                "forward request needs {} probability rows, exceeding driver limit {}",
+                prob_rows, self.limits.max_prob_rows
+            ));
+        }
+
+        if usage.sampler_rows > self.limits.max_sampler_rows {
+            return Some(format!(
+                "forward request has {} sampler rows, exceeding driver limit {}",
+                usage.sampler_rows, self.limits.max_sampler_rows
+            ));
+        }
+
+        if usage.logprob_labels > self.limits.max_logprob_labels {
+            return Some(format!(
+                "forward request has {} logprob labels, exceeding driver limit {}",
+                usage.logprob_labels, self.limits.max_logprob_labels
+            ));
+        }
+
+        let custom_mask_bytes = if usage.has_spec_drafts {
+            usage.spec_custom_mask_bytes
+        } else {
+            usage.user_custom_mask_bytes
+        };
+        if custom_mask_bytes > self.limits.max_custom_mask_bytes {
+            return Some(format!(
+                "forward request needs {custom_mask_bytes} custom mask bytes, exceeding driver limit {}",
+                self.limits.max_custom_mask_bytes
+            ));
+        }
+
+        if self.limits.max_forward_requests == 0 {
+            return Some("driver max forward requests is zero".to_string());
+        }
+
+        None
+    }
+
+    fn would_exceed(&self, req: &PendingRequest) -> bool {
+        if self.requests.is_empty() {
+            return false;
+        }
+        let usage = request_capacity_usage(req, self.page_size);
+        let next_has_spec = self.has_spec_drafts || usage.has_spec_drafts;
+        let next_custom_mask_bytes = if next_has_spec {
+            self.total_spec_custom_mask_bytes
+                .saturating_add(usage.spec_custom_mask_bytes)
+        } else {
+            self.total_user_custom_mask_bytes
+                .saturating_add(usage.user_custom_mask_bytes)
+        };
+        let (next_logit_rows, next_prob_rows, _, _, _) = self.projected_rows(Some(&usage));
+        self.requests.len() + 1 > self.limits.max_forward_requests
+            || self.total_tokens.saturating_add(usage.forward_tokens)
+                > self.limits.max_forward_tokens
+            || self.total_pages.saturating_add(usage.page_refs) > self.limits.max_page_refs
+            || next_logit_rows > self.limits.max_logit_rows
+            || next_prob_rows > self.limits.max_prob_rows
+            || self.total_sampler_rows.saturating_add(usage.sampler_rows)
+                > self.limits.max_sampler_rows
+            || self
+                .total_logprob_labels
+                .saturating_add(usage.logprob_labels)
+                > self.limits.max_logprob_labels
+            || next_custom_mask_bytes > self.limits.max_custom_mask_bytes
+    }
+
     fn is_full(&self) -> bool {
-        self.requests.len() >= self.max_batch_size
-            || self.total_tokens >= self.max_batch_tokens
+        let active_custom_mask_bytes = if self.has_spec_drafts {
+            self.total_spec_custom_mask_bytes
+        } else {
+            self.total_user_custom_mask_bytes
+        };
+        self.requests.len() >= self.limits.max_forward_requests
+            || self.total_tokens >= self.limits.max_forward_tokens
+            || self.total_pages >= self.limits.max_page_refs
+            || self.total_logit_rows >= self.limits.max_logit_rows
+            || self.total_prob_rows >= self.limits.max_prob_rows
+            || self.total_sampler_rows >= self.limits.max_sampler_rows
+            || self.total_logprob_labels >= self.limits.max_logprob_labels
+            || active_custom_mask_bytes >= self.limits.max_custom_mask_bytes
     }
 
     fn is_empty(&self) -> bool {
@@ -203,9 +498,319 @@ impl BatchAccumulator {
         self.total_tokens
     }
 
+    fn should_prefill_coalesce(&self) -> bool {
+        !self.has_spec_drafts && self.total_tokens > self.requests.len()
+    }
+
     fn take(&mut self) -> Vec<PendingRequest> {
         self.total_tokens = 0;
+        self.total_pages = 0;
+        self.total_logit_rows = 0;
+        self.total_prob_rows = 0;
+        self.total_sampler_rows = 0;
+        self.total_logprob_labels = 0;
+        self.total_user_custom_mask_bytes = 0;
+        self.total_spec_custom_mask_bytes = 0;
+        self.has_spec_drafts = false;
+        self.has_dense_logit_requirement = false;
+        self.has_prob_sampling = false;
+        self.all_single_token_decode = true;
+        self.all_samplers_token = true;
         std::mem::take(&mut self.requests)
+    }
+}
+
+fn prepare_pending_for_batch(
+    batch: &BatchAccumulator,
+    pending: PendingRequest,
+) -> Option<PendingRequest> {
+    let pending = match pending.maybe_start_chunking(batch.limits, batch.page_size) {
+        Ok(pending) => pending,
+        Err((pending, msg)) => {
+            pending.send_error(msg);
+            return None;
+        }
+    };
+    if let Some(msg) = batch.single_request_limit_error(&pending) {
+        pending.send_error(msg);
+        return None;
+    }
+    Some(pending)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn limits(max_requests: usize, max_tokens: usize, max_pages: usize) -> SchedulerLimits {
+        SchedulerLimits {
+            max_forward_requests: max_requests,
+            max_forward_tokens: max_tokens,
+            max_page_refs: max_pages,
+            max_logit_rows: usize::MAX,
+            max_prob_rows: usize::MAX,
+            max_sampler_rows: usize::MAX,
+            max_custom_mask_bytes: usize::MAX,
+            max_logprob_labels: usize::MAX,
+        }
+    }
+
+    fn pending(tokens: usize, page_refs: usize) -> PendingRequest {
+        let (tx, _rx) = oneshot::channel();
+        PendingRequest::direct(
+            pie_bridge::ForwardRequest {
+                token_ids: vec![0; tokens],
+                ..Default::default()
+            },
+            tx,
+            vec![0; page_refs],
+            1,
+        )
+    }
+
+    fn with_spec(mut req: PendingRequest, spec_tokens: usize) -> PendingRequest {
+        req.request.spec_token_ids = vec![1; spec_tokens];
+        req.request.spec_position_ids = vec![1; spec_tokens];
+        req.request.spec_indptr = vec![0, spec_tokens as u32];
+        req
+    }
+
+    fn with_sampler_rows(mut req: PendingRequest, sampler_rows: usize) -> PendingRequest {
+        req.request.sampling_indices = vec![0; sampler_rows];
+        req
+    }
+
+    fn with_samplers(
+        mut req: PendingRequest,
+        indices: Vec<u32>,
+        samplers: Vec<pie_bridge::Sampler>,
+    ) -> PendingRequest {
+        req.request.sampling_indices = indices;
+        req.request.samplers = samplers;
+        req
+    }
+
+    #[test]
+    fn accumulator_splits_by_forward_tokens() {
+        let mut batch = BatchAccumulator::new(limits(8, 6, 100), 16);
+        batch.push(pending(4, 1));
+        assert!(!batch.would_exceed(&pending(2, 1)));
+        assert!(batch.would_exceed(&pending(3, 1)));
+    }
+
+    #[test]
+    fn accumulator_splits_by_forward_requests() {
+        let mut batch = BatchAccumulator::new(limits(2, 100, 100), 16);
+        batch.push(pending(1, 1));
+        assert!(!batch.would_exceed(&pending(1, 1)));
+        batch.push(pending(1, 1));
+        assert!(batch.is_full());
+        assert!(batch.would_exceed(&pending(1, 1)));
+    }
+
+    #[test]
+    fn accumulator_splits_by_page_refs() {
+        let mut batch = BatchAccumulator::new(limits(8, 100, 5), 16);
+        batch.push(pending(1, 3));
+        assert!(!batch.would_exceed(&pending(1, 2)));
+        assert!(batch.would_exceed(&pending(1, 3)));
+    }
+
+    #[test]
+    fn accumulator_rejects_single_request_over_limit() {
+        let batch = BatchAccumulator::new(limits(8, 6, 5), 16);
+        assert!(batch.single_request_limit_error(&pending(7, 1)).is_some());
+        assert!(batch.single_request_limit_error(&pending(1, 6)).is_some());
+        assert!(batch.single_request_limit_error(&pending(6, 5)).is_none());
+    }
+
+    #[test]
+    fn accumulator_counts_speculative_tokens() {
+        let mut batch = BatchAccumulator::new(limits(8, 6, 100), 16);
+        batch.push(with_spec(pending(4, 1), 2));
+        assert!(batch.is_full());
+        assert!(batch.would_exceed(&pending(1, 1)));
+
+        let batch = BatchAccumulator::new(limits(8, 6, 100), 16);
+        assert!(
+            batch
+                .single_request_limit_error(&with_spec(pending(5, 1), 2))
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn accumulator_splits_by_sampler_rows() {
+        let mut capped = limits(8, 100, 100);
+        capped.max_sampler_rows = 3;
+        let mut batch = BatchAccumulator::new(capped, 16);
+        batch.push(with_sampler_rows(pending(1, 1), 2));
+        assert!(!batch.would_exceed(&with_sampler_rows(pending(1, 1), 1)));
+        assert!(batch.would_exceed(&with_sampler_rows(pending(1, 1), 2)));
+        assert!(
+            batch
+                .single_request_limit_error(&with_sampler_rows(pending(1, 1), 4))
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn accumulator_counts_spec_verification_sampler_rows() {
+        let mut capped = limits(8, 100, 100);
+        capped.max_sampler_rows = 3;
+        let batch = BatchAccumulator::new(capped, 16);
+        let req = with_spec(with_sampler_rows(pending(1, 1), 1), 2);
+        assert!(batch.single_request_limit_error(&req).is_some());
+    }
+
+    #[test]
+    fn accumulator_splits_by_custom_mask_bytes() {
+        let mut capped = limits(8, 100, 100);
+        capped.max_custom_mask_bytes = 31;
+        let mut batch = BatchAccumulator::new(capped, 16);
+
+        // 2 query rows x 64 KV positions = 128 bits = 16 bytes.
+        let mut user_mask = pending(2, 4);
+        user_mask.last_page_len = 16;
+        user_mask.request.has_user_mask = true;
+        batch.push(user_mask);
+
+        let mut next = pending(2, 4);
+        next.last_page_len = 16;
+        next.request.has_user_mask = true;
+        assert!(batch.would_exceed(&next));
+    }
+
+    #[test]
+    fn adding_spec_request_counts_existing_requests_for_spec_mask_path() {
+        let mut capped = limits(8, 100, 100);
+        capped.max_custom_mask_bytes = 31;
+        let mut batch = BatchAccumulator::new(capped, 16);
+
+        let mut existing = pending(2, 4);
+        existing.last_page_len = 16;
+        batch.push(existing);
+
+        let mut spec = with_spec(pending(1, 4), 1);
+        spec.last_page_len = 16;
+        assert!(batch.would_exceed(&spec));
+    }
+
+    #[test]
+    fn accumulator_rejects_logprob_label_over_limit() {
+        let mut capped = limits(8, 100, 100);
+        capped.max_logprob_labels = 2;
+        let batch = BatchAccumulator::new(capped, 16);
+        let mut req = pending(1, 1);
+        req.request.samplers = vec![pie_bridge::Sampler::Logprobs {
+            token_ids: vec![1, 2, 3],
+        }];
+        assert!(batch.single_request_limit_error(&req).is_some());
+    }
+
+    #[test]
+    fn accumulator_allows_compact_prefill_logit_rows() {
+        let mut capped = limits(8, 8, 100);
+        capped.max_logit_rows = 2;
+        let batch = BatchAccumulator::new(capped, 16);
+        let req = with_samplers(
+            pending(4, 1),
+            vec![3],
+            vec![pie_bridge::Sampler::TopP {
+                temperature: 0.0,
+                p: 1.0,
+            }],
+        );
+        assert!(batch.single_request_limit_error(&req).is_none());
+    }
+
+    #[test]
+    fn accumulator_splits_by_compact_logit_rows() {
+        let mut capped = limits(8, 100, 100);
+        capped.max_logit_rows = 2;
+        let mut batch = BatchAccumulator::new(capped, 16);
+        let req = || {
+            with_samplers(
+                pending(4, 1),
+                vec![3],
+                vec![pie_bridge::Sampler::TopP {
+                    temperature: 0.0,
+                    p: 1.0,
+                }],
+            )
+        };
+        batch.push(req());
+        assert!(!batch.would_exceed(&req()));
+        batch.push(req());
+        assert!(batch.would_exceed(&req()));
+    }
+
+    #[test]
+    fn accumulator_rejects_dense_logit_over_limit() {
+        let mut capped = limits(8, 100, 100);
+        capped.max_logit_rows = 3;
+        let batch = BatchAccumulator::new(capped, 16);
+        let req = with_samplers(pending(4, 1), vec![3], vec![pie_bridge::Sampler::RawLogits]);
+        assert!(batch.single_request_limit_error(&req).is_some());
+    }
+
+    #[test]
+    fn accumulator_rejects_probability_rows_over_limit() {
+        let mut capped = limits(8, 100, 100);
+        capped.max_logit_rows = 8;
+        capped.max_prob_rows = 3;
+        let batch = BatchAccumulator::new(capped, 16);
+        let req = with_samplers(
+            pending(4, 1),
+            vec![3],
+            vec![pie_bridge::Sampler::TopP {
+                temperature: 1.0,
+                p: 0.9,
+            }],
+        );
+        assert!(batch.single_request_limit_error(&req).is_some());
+    }
+
+    #[test]
+    fn taking_batch_does_not_drop_stashed_request_shape() {
+        let mut batch = BatchAccumulator::new(limits(8, 6, 5), 16);
+        batch.push(pending(4, 2));
+        let stashed = pending(4, 4);
+        assert!(batch.would_exceed(&stashed));
+        let fired = batch.take();
+        assert_eq!(fired.len(), 1);
+        assert!(batch.is_empty());
+        assert!(!batch.would_exceed(&stashed));
+    }
+}
+
+// =============================================================================
+// SchedulerHandle
+// =============================================================================
+
+/// Cloneable submit handle. Used by the speculator's chain extender
+/// (spawned outside the scheduler's `run` loop) to resubmit
+/// pre-staged forward passes.
+#[derive(Clone)]
+pub(crate) struct SchedulerHandle {
+    tx: mpsc::UnboundedSender<PendingRequest>,
+}
+
+impl SchedulerHandle {
+    pub fn submit(
+        &self,
+        request: pie_bridge::ForwardRequest,
+        response_tx: oneshot::Sender<Result<ForwardOutput>>,
+        physical_page_ids: Vec<PhysicalPageId>,
+        last_page_len: u32,
+    ) -> Result<()> {
+        self.tx.send(PendingRequest::direct(
+            request,
+            response_tx,
+            physical_page_ids,
+            last_page_len,
+        ))?;
+        Ok(())
     }
 }
 
@@ -213,7 +818,7 @@ impl BatchAccumulator {
 // BatchScheduler
 // =============================================================================
 
-/// Per-device batch scheduler.
+/// Per-driver batch scheduler.
 ///
 /// Owns an RPC client, a scheduling policy, and a tokio task that
 /// runs the batch accumulation and firing loop.
@@ -223,25 +828,28 @@ pub(crate) struct BatchScheduler {
 }
 
 impl BatchScheduler {
-    /// Spawn a new batch scheduler for a single device.
+    /// Spawn a new batch scheduler for a single driver.
     ///
-    /// The RPC connection is owned by the device service; the scheduler
-    /// only stores the device index for routing calls.
+    /// The RPC connection is owned by the driver service; the scheduler
+    /// only stores the driver index for routing calls.
     pub fn new(
-        device_id: DeviceId,
-        device_idx: usize,
+        driver_id: DriverId,
+        driver_idx: usize,
         page_size: u32,
-        max_batch_size: usize,
-        max_batch_tokens: usize,
+        limits: SchedulerLimits,
         request_timeout_secs: u64,
         batch_policy: String,
     ) -> Self {
         let (tx, rx) = mpsc::unbounded_channel();
+        let submit_tx = tx.downgrade();
         let stats = Arc::new(SchedulerStats::default());
         tokio::spawn(Self::run(
-            device_id, device_idx, rx,
+            driver_id,
+            driver_idx,
+            rx,
+            submit_tx,
             page_size,
-            max_batch_size, max_batch_tokens,
+            limits,
             request_timeout_secs,
             batch_policy,
             stats.clone(),
@@ -258,47 +866,55 @@ impl BatchScheduler {
     /// Submit a pre-translated forward pass request.
     pub fn submit(
         &self,
-        request: ForwardPassRequest,
-        response_tx: oneshot::Sender<ForwardPassOutput>,
+        request: pie_bridge::ForwardRequest,
+        response_tx: oneshot::Sender<Result<ForwardOutput>>,
         physical_page_ids: Vec<PhysicalPageId>,
         last_page_len: u32,
     ) -> Result<()> {
-        self.tx.send(PendingRequest {
+        self.tx.send(PendingRequest::direct(
             request,
             response_tx,
             physical_page_ids,
             last_page_len,
-        })?;
+        ))?;
         Ok(())
+    }
+
+    /// Cloneable handle for tasks that need to submit outside the
+    /// scheduler's `run` loop (e.g., the speculator chain extender).
+    pub(crate) fn handle(&self) -> SchedulerHandle {
+        SchedulerHandle {
+            tx: self.tx.clone(),
+        }
     }
 
     // =========================================================================
     // Internal: Scheduling Loop
     // =========================================================================
 
-    /// Main scheduling loop for a single device.
+    /// Main scheduling loop for a single driver.
     async fn run(
-        device_id: DeviceId,
-        device_idx: usize,
+        driver_id: DriverId,
+        driver_idx: usize,
         mut req_rx: mpsc::UnboundedReceiver<PendingRequest>,
+        submit_tx: mpsc::WeakUnboundedSender<PendingRequest>,
         page_size: u32,
-        max_batch_size: usize,
-        max_batch_tokens: usize,
+        limits: SchedulerLimits,
         request_timeout_secs: u64,
         batch_policy: String,
         stats: Arc<SchedulerStats>,
     ) {
         let request_timeout = Duration::from_secs(request_timeout_secs);
 
-        // Per-device state
-        let mut batch = BatchAccumulator::new(max_batch_size, max_batch_tokens);
+        // Per-driver state
+        let mut batch = BatchAccumulator::new(limits, page_size);
         // Policy selection from config — see `adaptive_policy.rs` for the
         // design rationale. The per-model `[model.scheduler].batch_policy`
         // setting picks one of "adaptive", "eager", "greedy".
         let mut policy: Box<dyn SchedulingPolicy> = match batch_policy.as_str() {
             "greedy" => Box::new(GreedyPolicy::new()),
-            "eager" => Box::new(EagerPolicy::new(max_batch_size, device_idx)),
-            "adaptive" => Box::new(AdaptivePolicy::new(max_batch_size, device_idx)),
+            "eager" => Box::new(EagerPolicy::new(limits.max_forward_requests, driver_idx)),
+            "adaptive" => Box::new(AdaptivePolicy::new(limits.max_forward_requests, driver_idx)),
             other => panic!(
                 "Unknown scheduler.batch_policy {other:?}; expected one of \
                 'adaptive' | 'eager' | 'greedy'"
@@ -309,24 +925,46 @@ impl BatchScheduler {
 
         // Channel for batch completion latency feedback to the policy.
         let (latency_tx, mut latency_rx) = mpsc::unbounded_channel::<Duration>();
+        let mut next_pending: Option<PendingRequest> = None;
 
-        loop {
+        'run_loop: loop {
             // Drain completed batch latencies (non-blocking)
             while let Ok(latency) = latency_rx.try_recv() {
                 policy.on_complete(latency);
             }
 
             // Wait for first request if batch is empty
-            if batch.is_empty() {
-                let Some(pending) = req_rx.recv().await else {
-                    break;
+            while batch.is_empty() {
+                let pending = if let Some(pending) = next_pending.take() {
+                    pending
+                } else {
+                    let Some(pending) = req_rx.recv().await else {
+                        break 'run_loop;
+                    };
+                    pending
+                };
+                let Some(pending) = prepare_pending_for_batch(&batch, pending) else {
+                    continue;
                 };
                 policy.on_arrival();
                 batch.push(pending);
             }
 
-            // Accumulate more requests (non-blocking)
-            while let Ok(pending) = req_rx.try_recv() {
+            // Accumulate more requests (non-blocking). If a request is
+            // already stashed for the next batch, fire the current batch
+            // before reading more; overwriting the stash would drop that
+            // request's response channel.
+            while next_pending.is_none() {
+                let Ok(pending) = req_rx.try_recv() else {
+                    break;
+                };
+                let Some(pending) = prepare_pending_for_batch(&batch, pending) else {
+                    continue;
+                };
+                if batch.would_exceed(&pending) {
+                    next_pending = Some(pending);
+                    break;
+                }
                 policy.on_arrival();
                 batch.push(pending);
                 if batch.is_full() {
@@ -335,76 +973,165 @@ impl BatchScheduler {
             }
 
             // Ask the policy what to do
-            match policy.decide(batch.len()) {
+            let decision = if next_pending.is_some() {
+                Decision::Fire
+            } else {
+                policy.decide(batch.len(), batch.should_prefill_coalesce())
+            };
+            match decision {
                 Decision::Fire => {
-                    // Acquire a permit (may wait if at in-flight limit)
-                    // if in_flight.available_permits() == 0 {
-                    //     eprintln!("[SCHED dev={device_idx}] semaphore full, waiting for in-flight batch to complete");
-                    // }
+                    // Acquire a permit (may wait if at in-flight limit).
+                    let permit_wait_start = Instant::now();
                     let permit = in_flight
                         .clone()
                         .acquire_owned()
                         .await
                         .expect("semaphore closed");
+                    let permit_wait_us = permit_wait_start.elapsed().as_micros() as u64;
+
+                    // The policy may decide to fire while the previous GPU
+                    // batch is still in flight. Do one last non-blocking
+                    // drain after the permit opens so requests that arrived
+                    // during that wait are coalesced into this batch instead
+                    // of being stranded behind a tiny stale fire.
+                    let fire_prepare_start = Instant::now();
+                    while next_pending.is_none() && !batch.is_full() {
+                        let Ok(pending) = req_rx.try_recv() else {
+                            break;
+                        };
+                        if let Some(msg) = batch.single_request_limit_error(&pending) {
+                            pending.send_error(msg);
+                            continue;
+                        }
+                        if batch.would_exceed(&pending) {
+                            next_pending = Some(pending);
+                            break;
+                        }
+                        policy.on_arrival();
+                        batch.push(pending);
+                    }
 
                     let total_tokens = batch.total_tokens();
                     let requests_to_fire = batch.take();
-                    policy.on_fired();
+                    policy.on_fired(requests_to_fire.len());
 
                     // Collect batch context IDs for accurate rent charging.
-                    let batch_ctx_ids: Vec<u64> = requests_to_fire.iter()
-                        .map(|r| r.request.context_id)
+                    // Per-request shape stores the single context_id in
+                    // `context_ids[0]`.
+                    let batch_ctx_ids: Vec<u64> = requests_to_fire
+                        .iter()
+                        .map(|r| r.request.context_ids[0])
                         .collect();
+                    let batch_size = batch_ctx_ids.len() as u64;
+                    let fire_prepare_us = fire_prepare_start.elapsed().as_micros() as u64;
+                    stats
+                        .cumulative_permit_wait_us
+                        .fetch_add(permit_wait_us, Relaxed);
+                    stats
+                        .cumulative_fire_prepare_us
+                        .fetch_add(fire_prepare_us, Relaxed);
 
                     // Spawn batch execution
                     let latency_tx_clone = latency_tx.clone();
                     let stats_clone = stats.clone();
                     let timeout = request_timeout;
+                    let submit_tx_clone = submit_tx.clone();
 
                     tokio::spawn(async move {
                         let start = Instant::now();
-                        Self::execute_batch(
-                            device_idx,
+                        let timing = Self::execute_batch(
+                            driver_idx,
                             requests_to_fire,
-                            device_id,
+                            driver_id,
                             page_size,
                             timeout,
+                            Some(permit),
+                            Some(submit_tx_clone),
                         )
                         .await;
                         let latency = start.elapsed();
+                        latency_tx_clone.send(latency).ok();
 
-                        // Advance market clock for this device: prices, rent, dividends.
+                        // Advance market clock for this driver: prices, rent, dividends.
                         // Pass batch context IDs so tick only charges contexts
                         // that were in this batch (not stale pinned contexts).
-                        crate::context::tick(device_idx, latency.as_secs_f64(), batch_ctx_ids);
+                        let tick_submit_start = Instant::now();
+                        crate::context::tick(driver_idx, latency.as_secs_f64(), batch_ctx_ids);
+                        let tick_submit_us = tick_submit_start.elapsed().as_micros() as u64;
 
                         // Update cumulative atomic counters (consumed by external
                         // monitoring; ignored by the policy).
+                        let stats_update_start = Instant::now();
                         stats_clone.total_batches.fetch_add(1, Relaxed);
-                        stats_clone.total_tokens_processed.fetch_add(total_tokens as u64, Relaxed);
-                        stats_clone.last_batch_latency_us.store(latency.as_micros() as u64, Relaxed);
-                        stats_clone.cumulative_latency_us.fetch_add(latency.as_micros() as u64, Relaxed);
-
-                        latency_tx_clone.send(latency).ok();
-                        drop(permit); // release in-flight slot
+                        stats_clone
+                            .total_tokens_processed
+                            .fetch_add(total_tokens as u64, Relaxed);
+                        stats_clone
+                            .total_requests_processed
+                            .fetch_add(batch_size, Relaxed);
+                        stats_clone
+                            .max_forward_requests_observed
+                            .fetch_max(batch_size, Relaxed);
+                        let bucket = match batch_size {
+                            0 | 1 => 0,
+                            2..=3 => 1,
+                            4..=7 => 2,
+                            8..=15 => 3,
+                            16..=31 => 4,
+                            32..=63 => 5,
+                            64..=127 => 6,
+                            _ => 7,
+                        };
+                        stats_clone.batch_size_hist[bucket].fetch_add(1, Relaxed);
+                        stats_clone
+                            .last_batch_latency_us
+                            .store(latency.as_micros() as u64, Relaxed);
+                        stats_clone
+                            .cumulative_latency_us
+                            .fetch_add(latency.as_micros() as u64, Relaxed);
+                        stats_clone
+                            .cumulative_execute_batch_us
+                            .fetch_add(timing.total_us, Relaxed);
+                        stats_clone
+                            .cumulative_batch_build_us
+                            .fetch_add(timing.batch_build_us, Relaxed);
+                        stats_clone
+                            .cumulative_driver_fire_us
+                            .fetch_add(timing.driver_fire_us, Relaxed);
+                        stats_clone
+                            .cumulative_response_dispatch_us
+                            .fetch_add(timing.response_dispatch_us, Relaxed);
+                        stats_clone
+                            .cumulative_context_tick_submit_us
+                            .fetch_add(tick_submit_us, Relaxed);
+                        stats_clone
+                            .cumulative_stats_update_us
+                            .fetch_add(stats_update_start.elapsed().as_micros() as u64, Relaxed);
                     });
                 }
                 Decision::Wait(wait_duration) => {
                     tokio::select! {
-                        _ = tokio::time::sleep(wait_duration) => {}
+                        _ = tokio::time::sleep(wait_duration) => {},
                         maybe_req = req_rx.recv() => {
                             if let Some(pending) = maybe_req {
+                                let Some(pending) = prepare_pending_for_batch(&batch, pending) else {
+                                    continue;
+                                };
+                                if batch.would_exceed(&pending) {
+                                    next_pending = Some(pending);
+                                    continue;
+                                }
                                 policy.on_arrival();
                                 batch.push(pending);
                             } else {
                                 break; // channel closed
                             }
-                        }
+                        },
                         latency = latency_rx.recv() => {
                             if let Some(l) = latency {
                                 policy.on_complete(l);
                             }
-                        }
+                        },
                     }
                 }
             }
@@ -414,84 +1141,137 @@ impl BatchScheduler {
         if !batch.is_empty() {
             let requests = batch.take();
             Self::execute_batch(
-                device_idx,
+                driver_idx,
                 requests,
-                device_id,
+                driver_id,
                 page_size,
                 request_timeout,
+                None,
+                None,
             )
             .await;
         }
     }
 
-    /// Execute a batch of forward pass requests via the device service.
+    /// Execute a batch of forward pass requests via the driver service.
     async fn execute_batch(
-        device_idx: usize,
+        driver_idx: usize,
         requests: Vec<PendingRequest>,
-        device_id: DeviceId,
+        driver_id: DriverId,
         page_size: u32,
-        timeout: Duration,
-    ) {
-        // Build batched request
-        let mut batch_req = BatchedForwardPassRequest::new(device_id);
+        _timeout: Duration,
+        mut permit: Option<OwnedSemaphorePermit>,
+        submit_tx: Option<mpsc::WeakUnboundedSender<PendingRequest>>,
+    ) -> BatchExecutionTiming {
+        let batch_start = Instant::now();
+        let build_start = Instant::now();
+        // Build batched request — a single `pie_bridge::ForwardRequest`
+        // populated by folding each per-request shape into the batch.
+        let elide_decode_masks = requests.iter().all(|req| {
+            req.request.single_token_mode
+                && !req.request.has_user_mask
+                && req.request.token_ids.len() <= 1
+                && req.request.spec_token_ids.is_empty()
+        });
+        let mut batch_req = request::new_batched_forward_request();
         for req in &requests {
-            batch_req.add_request(
+            request::append_request_with_options(
+                &mut batch_req,
                 &req.request,
                 &req.physical_page_ids,
                 req.last_page_len,
                 page_size,
+                elide_decode_masks,
             );
         }
+        let batch_build_us = build_start.elapsed().as_micros() as u64;
 
-        // Send via device service (typed call handles serialization + timeout)
-        let result = device::fire_batch(device_idx, &batch_req).await;
+        // Send via driver service (typed call handles serialization + timeout)
+        let driver_fire_start = Instant::now();
+        let result = driver::fire_batch(driver_idx, batch_req).await;
+        let driver_fire_us = driver_fire_start.elapsed().as_micros() as u64;
+        drop(permit.take());
 
+        let response_start = Instant::now();
         match result {
             Ok(batch_resp) => {
-                if batch_resp.results.len() != requests.len() {
-                    tracing::warn!(
-                        device = device_id,
-                        expected = requests.len(),
-                        got = batch_resp.results.len(),
-                        "Batch response count mismatch — some requests may get no output",
+                let n_results = batch_resp.num_requests as usize;
+                if n_results != requests.len() {
+                    let msg = format!(
+                        "batch response count mismatch from driver {driver_id}: \
+                         expected {}, got {n_results}",
+                        requests.len()
                     );
-                }
+                    tracing::error!(
+                        driver = driver_id,
+                        expected = requests.len(),
+                        got = n_results,
+                        "Batch response count mismatch",
+                    );
+                    for req in requests {
+                        req.send_result::<ForwardOutput>(
+                            Err(anyhow::anyhow!(msg.clone())),
+                            None,
+                            page_size,
+                        );
+                    }
+                } else {
+                    let has_chunked = requests
+                        .iter()
+                        .any(|req| matches!(req.completion, Completion::Chunk { .. }));
+                    let token_payload_only = !has_chunked
+                        && batch_resp.dists_ids.is_empty()
+                        && batch_resp.dists_probs.is_empty()
+                        && batch_resp.logits_bytes.is_empty()
+                        && batch_resp.logprobs_values.is_empty()
+                        && batch_resp.entropies.is_empty()
+                        && batch_resp.tokens_indptr.len() >= requests.len() + 1;
 
-                let mut resp_iter = batch_resp.results.into_iter();
-                for req in requests {
-                    if let Some(resp) = resp_iter.next() {
-                        // Build the per-slot output list by walking the
-                        // request's sampler types in order and pulling from
-                        // the matching response field. This preserves the
-                        // 1:1 mapping between `pass.sampler(...)` calls and
-                        // returned slots — even when types are mixed.
-                        let output = build_slot_output(&req.request.samplers, resp);
-                        if output.slots.is_empty()
-                            && output.spec_tokens.is_empty()
-                            && !req.request.sampling_indices.is_empty()
-                        {
-                            eprintln!(
-                                "FP_NONE_FOR_DECODE ctx={} samplers={} tokens={} pages={} lpl={}",
-                                req.request.context_id,
-                                req.request.sampling_indices.len(),
-                                req.request.tokens.len(),
-                                req.physical_page_ids.len(),
-                                req.last_page_len,
+                    if token_payload_only {
+                        for (r, req) in requests.into_iter().enumerate() {
+                            let lo = batch_resp.tokens_indptr[r] as usize;
+                            let hi = batch_resp.tokens_indptr[r + 1] as usize;
+                            let output = if hi == lo + 1 {
+                                ForwardOutput::Token(batch_resp.tokens[lo])
+                            } else {
+                                ForwardOutput::Tokens(batch_resp.tokens[lo..hi].to_vec())
+                            };
+                            req.send_result(Ok(output), submit_tx.as_ref(), page_size);
+                        }
+                    } else {
+                        for (r, req) in requests.into_iter().enumerate() {
+                            // Extract this request's slice from the batched
+                            // response. The api layer (build_wit_output)
+                            // walks samplers + the single-request response
+                            // to construct the WIT Output.
+                            let per_req = request::extract_per_request(&batch_resp, r);
+                            req.send_result(
+                                Ok(ForwardOutput::Response(per_req)),
+                                submit_tx.as_ref(),
+                                page_size,
                             );
                         }
-                        req.response_tx.send(output).ok();
-                    } else {
-                        tracing::warn!(device = device_id, "Fewer results than requests — sending None");
-                        req.response_tx.send(ForwardPassOutput::default()).ok();
                     }
                 }
             }
             Err(e) => {
-                tracing::error!("fire_batch failed for device {}: {:?}", device_id, e);
+                tracing::error!("fire_batch failed for driver {}: {:?}", driver_id, e);
                 for req in requests {
-                    req.response_tx.send(ForwardPassOutput::default()).ok();
+                    req.send_result::<ForwardOutput>(
+                        Err(anyhow::anyhow!(
+                            "fire_batch failed for driver {driver_id}: {e:#}"
+                        )),
+                        None,
+                        page_size,
+                    );
                 }
             }
+        }
+        BatchExecutionTiming {
+            total_us: batch_start.elapsed().as_micros() as u64,
+            batch_build_us,
+            driver_fire_us,
+            response_dispatch_us: response_start.elapsed().as_micros() as u64,
         }
     }
 }

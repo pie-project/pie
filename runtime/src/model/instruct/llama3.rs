@@ -3,16 +3,13 @@
 //! Uses <|start_header_id|>role<|end_header_id|> delimiters.
 //! Tool responses use the `ipython` role.
 
-use std::sync::Arc;
 use crate::inference::structured::grammar::Grammar;
-use crate::model::instruct::{
-    ChatDecoder,
-    Instruct,
-    ReasoningDecoder,
-    ToolDecoder, ToolEvent, ToolGrammar,
-};
 use crate::model::instruct::decoders::{GenericChatDecoder, ThinkingDecoder};
+use crate::model::instruct::{
+    ChatDecoder, Instruct, ReasoningDecoder, ToolDecoder, ToolEvent, ToolGrammar,
+};
 use crate::model::tokenizer::Tokenizer;
+use std::sync::Arc;
 
 static TEMPLATE: &str = r#"
 {{- bos_token }}
@@ -106,7 +103,6 @@ static TEMPLATE: &str = r#"
 {%- endif %}
 "#;
 
-
 pub struct LlamaInstruct {
     tokenizer: Arc<Tokenizer>,
     system_prefix: Vec<u32>,
@@ -195,8 +191,10 @@ impl Instruct for LlamaInstruct {
     }
 
     fn equip(&self, tools: &[String]) -> Vec<u32> {
-        if tools.is_empty() { return Vec::new(); }
-        
+        if tools.is_empty() {
+            return Vec::new();
+        }
+
         let mut prompt = String::from("Environment: ipython\n");
         prompt.push_str("Cutting Knowledge Date: December 2023\n");
         prompt.push_str("Today Date: 26 Jul 2024\n\n");
@@ -217,13 +215,14 @@ impl Instruct for LlamaInstruct {
 
     fn tool_call_grammar(&self, tools: &[String]) -> Option<ToolGrammar> {
         if tools.is_empty() {
-             return None;
+            return None;
         }
 
         let mut names: Vec<String> = Vec::new();
         for tool in tools {
             if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(tool) {
-                let name = parsed.get("function")
+                let name = parsed
+                    .get("function")
                     .and_then(|f| f.get("name"))
                     .or_else(|| parsed.get("name"))
                     .and_then(|n| n.as_str());
@@ -256,11 +255,17 @@ ws ::= [ \t\n]*
             name_alt = name_alt
         );
         let parsed = Grammar::from_ebnf(&grammar, "root").ok()?;
-        Some(ToolGrammar { source: grammar, grammar: Arc::new(parsed) })
+        Some(ToolGrammar {
+            source: grammar,
+            grammar: Arc::new(parsed),
+        })
     }
 
     fn chat_decoder(&self) -> Box<dyn ChatDecoder> {
-        Box::new(GenericChatDecoder::new(self.tokenizer.clone(), self.stop_ids.clone()))
+        Box::new(GenericChatDecoder::new(
+            self.tokenizer.clone(),
+            self.stop_ids.clone(),
+        ))
     }
 
     fn reasoning_decoder(&self) -> Box<dyn ReasoningDecoder> {
@@ -310,8 +315,8 @@ impl ToolDecoder for LlamaToolDecoder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
     use crate::model::tokenizer::Tokenizer;
+    use std::sync::Arc;
 
     fn make_tok(vocab: &[&str]) -> Arc<Tokenizer> {
         let v: Vec<String> = vocab.iter().map(|s| s.to_string()).collect();
@@ -320,17 +325,46 @@ mod tests {
 
     fn llama3() -> LlamaInstruct {
         let tok = make_tok(&[
-            "<|start_header_id|>", "<|end_header_id|>", "<|eot_id|>", "<|end_of_text|>",
-            "system", "user", "assistant", "ipython", "\n", "Hello", "<think>", "</think>", " ",
-            "Environment:", "ipython", "Cutting", "Knowledge", "Date:", "December", "2023",
-            "Today", "26", "Jul", "2024",
+            "<|start_header_id|>",
+            "<|end_header_id|>",
+            "<|eot_id|>",
+            "<|end_of_text|>",
+            "system",
+            "user",
+            "assistant",
+            "ipython",
+            "\n",
+            "Hello",
+            "<think>",
+            "</think>",
+            " ",
+            "Environment:",
+            "ipython",
+            "Cutting",
+            "Knowledge",
+            "Date:",
+            "December",
+            "2023",
+            "Today",
+            "26",
+            "Jul",
+            "2024",
             "Environment: ipython\n",
             "Cutting Knowledge Date: December 2023\n",
             "Today Date: 26 Jul 2024\n\n",
             "You have access to the following functions. To call a function, please respond with JSON for a function call.Respond in the format {\"name\": function name, \"parameters\": dictionary of argument name and its value}.Do not use variables.\n\n",
-            "You", "have", "access", "to", "the", "following", "functions...", 
-            "Respond", "in", "format...",
-            "42", "{\"name\":\"f\"}"
+            "You",
+            "have",
+            "access",
+            "to",
+            "the",
+            "following",
+            "functions...",
+            "Respond",
+            "in",
+            "format...",
+            "42",
+            "{\"name\":\"f\"}",
         ]);
         LlamaInstruct::new(tok)
     }
@@ -349,7 +383,7 @@ mod tests {
         let text = inst.tokenizer.decode(&tokens, false);
         assert!(text.contains("<|start_header_id|>ipython<|end_header_id|>"));
         assert!(text.contains("42"));
-        assert!(!text.contains("fn1")); 
+        assert!(!text.contains("fn1"));
     }
 
     #[test]

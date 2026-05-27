@@ -2,9 +2,10 @@
 
 // Runtime quantization helpers — convert bf16 weight tensors to FP8
 // (E4M3) or INT8 with per-tensor / per-channel symmetric scaling.
-// Used by the runtime quantization path (`--runtime-quant {fp8|int8}`):
-// we walk every projection weight after load, compute absmax, and
-// store the quantized weight + scale.
+// Used by the Rust storage-program runtime quantization path
+// (`--runtime-quant {fp8|int8}`): the loader emits an Encode TileMap that
+// reads the source weight, computes absmax, and stores the quantized weight
+// plus scale tensor directly as runtime outputs.
 //
 // The scale convention matches what `ops::gemm_act_x_w` expects from a
 // `QuantMeta` — cuBLASLt multiplies operand A by the scale pointer
@@ -69,6 +70,17 @@ void launch_cast_bf16_to_int8_per_channel(
     int           rows,
     int           cols,
     cudaStream_t  stream);
+
+/// Correctness fallback for runtime INT8 weights when cuBLAS cannot run
+/// W8A8 for a shape (notably tiny decode/parity M). Dequantizes a row-major
+/// `[rows, cols]` INT8 weight with per-row scales into BF16 scratch.
+void launch_dequant_int8_to_bf16_per_channel(
+    const std::int8_t* W_int8,
+    void*             W_bf16,
+    const float*      scale_inv_dev, // [rows]
+    int               rows,
+    int               cols,
+    cudaStream_t      stream);
 
 /// Post-GEMM W8A8 dequant: convert `[M, N] int32` accumulator to bf16
 /// using per-row activation scales (`[M]`) and per-row weight scales

@@ -11,9 +11,9 @@ import torch.distributed as dist
 import math
 
 from . import ModelConfig as ModelConfigBase
-from ..config import RuntimeConfig
+from pie_driver_dev.config import NativeRuntimeConfig as RuntimeConfig
 from ..adapter import AdapterSubpass
-from ..utils import get_available_memory
+from pie_driver_dev.utils import get_available_memory
 from ..schema import Schema, Source, WeightStore
 
 import pie_kernels as ops
@@ -199,7 +199,7 @@ class ModelConfig(ModelConfigBase):
         #      return self.num_q_heads
         return self.num_kv_heads
 
-    def eval_max_num_kv_pages(self, runtime_config: RuntimeConfig) -> int:
+    def eval_total_pages(self, runtime_config: RuntimeConfig) -> int:
         """Evaluate the maximum number of KV pages based on available memory."""
         available_bytes = get_available_memory(
             devices=runtime_config.devices,
@@ -629,7 +629,7 @@ class ForwardPass(DenseForwardPass):
             )
 
         # 6. Append K, V to cache (local shards to local cache)
-        ops.append_paged_kv_cache(
+        ops.append_paged_kv_cache_with_format(
             append_key=k,
             append_value=v,
             batch_indices=batch_indices,
@@ -892,7 +892,7 @@ def create_kv_cache(
     return [
         torch.zeros(
             (
-                runtime_config.max_num_kv_pages + 1,  # +1 for scratch/padding page
+                runtime_config.total_pages + 1,  # +1 for scratch/padding page
                 2,
                 runtime_config.kv_page_size,
                 local_num_kv_heads,

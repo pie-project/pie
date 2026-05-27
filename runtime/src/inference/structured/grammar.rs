@@ -226,10 +226,10 @@ impl Grammar {
 
     fn fmt_char_class_char(f: &mut fmt::Formatter<'_>, cp: u32) -> fmt::Result {
         match cp {
-            0x5c => write!(f, "\\\\"),         // backslash
-            0x5d => write!(f, "\\]"),           // ]
-            0x5e => write!(f, "\\^"),           // ^
-            0x2d => write!(f, "\\-"),           // -
+            0x5c => write!(f, "\\\\"), // backslash
+            0x5d => write!(f, "\\]"),  // ]
+            0x5e => write!(f, "\\^"),  // ^
+            0x2d => write!(f, "\\-"),  // -
             0x09 => write!(f, "\\t"),
             0x0a => write!(f, "\\n"),
             0x0d => write!(f, "\\r"),

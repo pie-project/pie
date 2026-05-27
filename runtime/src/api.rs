@@ -1,16 +1,16 @@
-pub mod types;
+pub mod adapter;
 pub mod context;
-pub mod model;
 pub mod inference;
 pub mod messaging;
-pub mod session;
-pub mod adapter;
+pub mod model;
 pub mod runtime;
 pub mod scheduling;
+pub mod session;
+pub mod types;
 
+pub mod instruct;
 pub mod mcp;
 pub mod zo;
-pub mod instruct;
 
 use wasmtime::component::HasSelf;
 
@@ -39,6 +39,8 @@ wasmtime::component::bindgen!({
         "pie:core/inference.future-output": inference::FutureOutput,
         "pie:core/inference.grammar": inference::Grammar,
         "pie:core/inference.matcher": inference::Matcher,
+        // pie:core/runtime
+        "pie:core/runtime.child": runtime::Child,
         // pie:core/messaging
         "pie:core/messaging.subscription": messaging::Subscription,
         // pie:core/adapter

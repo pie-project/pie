@@ -20,22 +20,22 @@
 //! The `Workflow` actor manages lifecycle (cancel, status queries).
 //! The `Executor` does the actual evaluation as a spawned async task.
 
-mod expr;
 mod executor;
+mod expr;
 
 use std::sync::{Arc, LazyLock};
 
-use anyhow::{anyhow, Result, bail};
+use anyhow::{Result, anyhow, bail};
 use serde::Serialize;
 use tokio::sync::oneshot;
 use uuid::Uuid;
 
-use crate::process::{ProcessId, ProcessEvent};
+use crate::process::{ProcessEvent, ProcessId};
 use crate::server::{self, ClientId};
-use crate::service::{ServiceMap, ServiceHandler};
+use crate::service::{ServiceHandler, ServiceMap};
 
-pub(crate) use expr::Expr;
 use executor::{Executor, value_to_string};
+pub(crate) use expr::Expr;
 
 pub(crate) type WorkflowId = Uuid;
 
@@ -43,8 +43,7 @@ pub(crate) type WorkflowId = Uuid;
 // Globals
 // =============================================================================
 
-static SERVICES: LazyLock<ServiceMap<WorkflowId, Message>> =
-    LazyLock::new(ServiceMap::new);
+static SERVICES: LazyLock<ServiceMap<WorkflowId, Message>> = LazyLock::new(ServiceMap::new);
 
 // =============================================================================
 // Public API
@@ -57,8 +56,8 @@ pub async fn submit(
     json: &str,
     client_id: Option<ClientId>,
 ) -> Result<(WorkflowId, oneshot::Receiver<Result<String, String>>)> {
-    let expr: Expr = serde_json::from_str(json)
-        .map_err(|e| anyhow::anyhow!("Invalid workflow JSON: {e}"))?;
+    let expr: Expr =
+        serde_json::from_str(json).map_err(|e| anyhow::anyhow!("Invalid workflow JSON: {e}"))?;
 
     // Validate non-empty
     if matches!(expr, Expr::Pipe { ref stages } if stages.is_empty()) {
@@ -106,7 +105,13 @@ pub(crate) fn forward_event(id: WorkflowId, pid: ProcessId, event: ProcessEvent)
 /// Attach a client to a workflow.
 pub async fn attach(id: &WorkflowId, client_id: ClientId) -> Result<()> {
     let (tx, rx) = oneshot::channel();
-    SERVICES.send(id, Message::AttachClient { client_id, response: tx })?;
+    SERVICES.send(
+        id,
+        Message::AttachClient {
+            client_id,
+            response: tx,
+        },
+    )?;
     rx.await?
 }
 
@@ -132,9 +137,14 @@ enum Message {
     /// Cancel the entire workflow.
     Cancel,
     /// Query workflow status.
-    GetStats { response: oneshot::Sender<WorkflowStats> },
+    GetStats {
+        response: oneshot::Sender<WorkflowStats>,
+    },
     /// Attach a client to receive events.
-    AttachClient { client_id: ClientId, response: oneshot::Sender<Result<()>> },
+    AttachClient {
+        client_id: ClientId,
+        response: oneshot::Sender<Result<()>>,
+    },
     /// Detach the current client.
     DetachClient,
     /// Query the submitter username.
@@ -225,7 +235,10 @@ impl ServiceHandler for Workflow {
                 };
                 let _ = response.send(status);
             }
-            Message::AttachClient { client_id, response } => {
+            Message::AttachClient {
+                client_id,
+                response,
+            } => {
                 if self.client_id.is_some() {
                     let _ = response.send(Err(anyhow!("already attached")));
                 } else {
@@ -257,8 +270,8 @@ impl ServiceHandler for Workflow {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::executor::build_process_input;
+    use super::*;
     use serde_json::Value;
 
     #[test]

@@ -1,7 +1,7 @@
 #pragma once
 
 // Qwen3.6-MoE forward driver. Reuses the linear-attn / full-attn /
-// state-cache plumbing from Qwen3.5; only the MLP becomes a sparse-MoE
+// rs_cache plumbing from Qwen3.5; only the MLP becomes a sparse-MoE
 // block (routed experts + shared expert with sigmoid gate).
 
 #include <cstdint>
@@ -45,16 +45,28 @@ struct Qwen3_5MoeMlpWorkspace {
 
     // Decode fast-path scratch — separate pointer arrays for gate_up
     // and down_proj GEMMs (cuBLAS reads them at launch time, so the
-    // two GEMMs cannot share buffers). Each is a top_k device array
-    // of pointers; populated on-device by `launch_build_moe_ptrs_decode`
-    // so the whole MoE block is graph-capturable.
-    DeviceBuffer<const std::uint16_t*> a_gu_ptrs;  // [top_k]
+    // two GEMMs cannot share buffers). Sized for N*K routed rows and
+    // populated on-device so batched decode avoids host routing syncs.
+    DeviceBuffer<const std::uint16_t*> a_gu_ptrs;  // [N*K]
     DeviceBuffer<const std::uint16_t*> b_gu_ptrs;
     DeviceBuffer<std::uint16_t*>       c_gu_ptrs;
     DeviceBuffer<const std::uint16_t*> a_dn_ptrs;
     DeviceBuffer<const std::uint16_t*> b_dn_ptrs;
     DeviceBuffer<std::uint16_t*>       c_dn_ptrs;
-    DeviceBuffer<float>                batch_weights;  // [top_k] fp32
+    DeviceBuffer<float>                batch_weights;  // [N*K] fp32
+
+    // vLLM/SGL-style aligned decode scratch. Decode routes are grouped into
+    // fixed-size expert blocks so cuBLAS sees M=block_size GEMMs instead of
+    // M=1 GEMVs. PIE_QWEN35_MOE_ALIGNED_DECODE_BLOCK=0 disables it for
+    // isolation experiments.
+    int aligned_block_size = 0;
+    std::size_t aligned_rows_capacity = 0;
+    DeviceBuffer<std::int32_t>  aligned_route_ids;   // [aligned_rows]
+    DeviceBuffer<std::int32_t>  aligned_expert_ids;  // [aligned_rows / block]
+    DeviceBuffer<std::uint16_t> aligned_expert_in;   // [aligned_rows, H]
+    DeviceBuffer<std::uint16_t> aligned_gate_up;     // [aligned_rows, 2*I_moe]
+    DeviceBuffer<std::uint16_t> aligned_act;         // [aligned_rows, I_moe]
+    DeviceBuffer<std::uint16_t> aligned_out;         // [aligned_rows, H]
 
     static Qwen3_5MoeMlpWorkspace allocate(
         int max_tokens, int hidden, int num_experts, int top_k,
@@ -87,6 +99,8 @@ void qwen3_5_moe_forward_paged(
     const std::int32_t* mask_indptr_d,
     const std::int32_t* slot_ids_h = nullptr,
     const std::uint8_t* is_fresh_h = nullptr,
-    const std::int32_t* slot_ids_d = nullptr);
+    const std::int32_t* slot_ids_d = nullptr,
+    const std::int32_t* logit_row_indices_d = nullptr,
+    int num_logit_rows = 0);
 
 }  // namespace pie_cuda_driver::model

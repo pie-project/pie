@@ -8,7 +8,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use ipnet::IpNet;
 
 // =============================================================================
@@ -158,18 +158,16 @@ fn parse_rule(spec: &str) -> Result<Rule> {
         let (inside, after) = rest
             .split_once(']')
             .ok_or_else(|| anyhow!("network_allowed_hosts: missing ']' in {spec:?}"))?;
-        let cidr = parse_cidr(inside).map_err(|e| {
-            anyhow!("network_allowed_hosts: bad CIDR/IP in {spec:?}: {e}")
-        })?;
+        let cidr = parse_cidr(inside)
+            .map_err(|e| anyhow!("network_allowed_hosts: bad CIDR/IP in {spec:?}: {e}"))?;
         let port = if after.is_empty() {
             PortFilter::Any
         } else {
-            let port_str = after
-                .strip_prefix(':')
-                .ok_or_else(|| anyhow!("network_allowed_hosts: expected ':' after ']' in {spec:?}"))?;
-            parse_port_filter(port_str).map_err(|e| {
-                anyhow!("network_allowed_hosts: bad port in {spec:?}: {e}")
-            })?
+            let port_str = after.strip_prefix(':').ok_or_else(|| {
+                anyhow!("network_allowed_hosts: expected ':' after ']' in {spec:?}")
+            })?;
+            parse_port_filter(port_str)
+                .map_err(|e| anyhow!("network_allowed_hosts: bad port in {spec:?}: {e}"))?
         };
         return Ok(Rule { cidr, port });
     }
@@ -182,16 +180,17 @@ fn parse_rule(spec: &str) -> Result<Rule> {
     // like `::1/128` or `2001:db8::/32` which contain colons.
     if let Some((host, port_str)) = spec.rsplit_once(':') {
         if let Ok(cidr) = parse_cidr(host) {
-            let port = parse_port_filter(port_str).map_err(|e| {
-                anyhow!("network_allowed_hosts: bad port in {spec:?}: {e}")
-            })?;
+            let port = parse_port_filter(port_str)
+                .map_err(|e| anyhow!("network_allowed_hosts: bad port in {spec:?}: {e}"))?;
             return Ok(Rule { cidr, port });
         }
     }
-    let cidr = parse_cidr(spec).map_err(|e| {
-        anyhow!("network_allowed_hosts: bad CIDR/IP in {spec:?}: {e}")
-    })?;
-    Ok(Rule { cidr, port: PortFilter::Any })
+    let cidr = parse_cidr(spec)
+        .map_err(|e| anyhow!("network_allowed_hosts: bad CIDR/IP in {spec:?}: {e}"))?;
+    Ok(Rule {
+        cidr,
+        port: PortFilter::Any,
+    })
 }
 
 fn parse_cidr(s: &str) -> Result<IpNet> {
@@ -208,8 +207,12 @@ fn parse_cidr(s: &str) -> Result<IpNet> {
 
 fn parse_port_filter(s: &str) -> Result<PortFilter> {
     if let Some((lo, hi)) = s.split_once('-') {
-        let lo: u16 = lo.parse().map_err(|_| anyhow!("low port not u16: {lo:?}"))?;
-        let hi: u16 = hi.parse().map_err(|_| anyhow!("high port not u16: {hi:?}"))?;
+        let lo: u16 = lo
+            .parse()
+            .map_err(|_| anyhow!("low port not u16: {lo:?}"))?;
+        let hi: u16 = hi
+            .parse()
+            .map_err(|_| anyhow!("high port not u16: {hi:?}"))?;
         if lo > hi {
             return Err(anyhow!("port range {lo}-{hi} is reversed"));
         }
@@ -260,8 +263,7 @@ mod tests {
 
     #[test]
     fn star_must_be_alone() {
-        let err = NetworkPolicy::parse(true, &["*".into(), "10.0.0.0/8".into()])
-            .unwrap_err();
+        let err = NetworkPolicy::parse(true, &["*".into(), "10.0.0.0/8".into()]).unwrap_err();
         assert!(err.to_string().contains("must be the only entry"));
     }
 
@@ -318,11 +320,7 @@ mod tests {
 
     #[test]
     fn multiple_rules_or() {
-        let p = NetworkPolicy::parse(
-            true,
-            &["10.0.0.0/8".into(), "127.0.0.0/8".into()],
-        )
-        .unwrap();
+        let p = NetworkPolicy::parse(true, &["10.0.0.0/8".into(), "127.0.0.0/8".into()]).unwrap();
         assert!(p.check(&sa("10.0.0.1:443")));
         assert!(p.check(&sa("127.0.0.1:80")));
         assert!(!p.check(&sa("8.8.8.8:53")));
@@ -336,15 +334,13 @@ mod tests {
 
     #[test]
     fn malformed_port() {
-        let err = NetworkPolicy::parse(true, &["10.0.0.0/8:not-a-port".into()])
-            .unwrap_err();
+        let err = NetworkPolicy::parse(true, &["10.0.0.0/8:not-a-port".into()]).unwrap_err();
         assert!(err.to_string().contains("bad port"));
     }
 
     #[test]
     fn reversed_port_range() {
-        let err = NetworkPolicy::parse(true, &["10.0.0.0/8:9000-1000".into()])
-            .unwrap_err();
+        let err = NetworkPolicy::parse(true, &["10.0.0.0/8:9000-1000".into()]).unwrap_err();
         assert!(err.to_string().contains("reversed"));
     }
 }

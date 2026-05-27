@@ -28,11 +28,18 @@ pub(crate) enum Expr {
 
     /// Map: apply `function` to each element of `over`.
     #[serde(rename = "map")]
-    Map { function: Box<Expr>, over: Box<Expr> },
+    Map {
+        function: Box<Expr>,
+        over: Box<Expr>,
+    },
 
     /// Fold: reduce `over` with `function`, starting from `init`.
     #[serde(rename = "fold")]
-    Fold { function: Box<Expr>, init: Box<Expr>, over: Box<Expr> },
+    Fold {
+        function: Box<Expr>,
+        init: Box<Expr>,
+        over: Box<Expr>,
+    },
 
     /// Fork: run N branches concurrently, collect all results.
     #[serde(rename = "fork")]

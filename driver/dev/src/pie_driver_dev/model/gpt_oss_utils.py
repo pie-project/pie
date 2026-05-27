@@ -13,7 +13,7 @@ from typing import Any
 
 import torch
 
-from ..utils import is_apple_silicon
+from .._bridge.utils import is_apple_silicon
 
 
 # Mapping from fp4 (e2m1) to float values

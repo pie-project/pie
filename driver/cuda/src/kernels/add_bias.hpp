@@ -19,4 +19,12 @@ void launch_add_bias_bf16(
     int dim,
     cudaStream_t stream);
 
+void launch_add_bias_bf16_strided(
+    void* out,                 // [num_rows, stride] bf16, in-place
+    const void* bias,          // [dim] bf16
+    int num_rows,
+    int dim,
+    int stride,
+    cudaStream_t stream);
+
 }  // namespace pie_cuda_driver::kernels

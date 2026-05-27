@@ -1,13 +1,14 @@
 """SGLang driver config — typed view of the `ServerArgs` subset pie cares
-about. Field names mirror sglang's `ServerArgs` so values flow verbatim.
+about. Field names mirror sglang's `ServerArgs` where Pie exposes a backend
+policy knob.
 
     [model.driver.options]    # with [model.driver].type = "sglang"
     attention_backend = "triton"        → ServerArgs.attention_backend
     mem_fraction_static = 0.85          → ServerArgs.mem_fraction_static
-    page_size = 16                      → ServerArgs.page_size
     ...
 
-Adding a new sglang knob: add a same-named field here, splat into ServerArgs.
+Batch capacity knobs stay internal: SGLang resolves them at startup and Pie
+reports the result through DriverCapabilities.
 """
 
 from __future__ import annotations
@@ -34,10 +35,6 @@ class SGLangDriverConfig:
     # first fire_batch.
     mem_fraction_static: float = 0.65
 
-    # KV cache page size override. None = sglang picks based on the chosen
-    # attention backend's allowed sizes.
-    page_size: int | None = 16
-
     # If True, sglang runs eager (no torch.compile, no CUDA graphs).
     # Mirrors sglang's `disable_cuda_graph`.
     disable_cuda_graph: bool = False
@@ -48,18 +45,9 @@ class SGLangDriverConfig:
     disable_radix_cache: bool = True
 
     # Override the largest CUDA-graph batch-size bin sglang captures. None
-    # = sglang's auto-pick, which on a 4090 caps around 24. Bumping this
-    # to match `max_batch_size` lets the scheduler use captured graphs at
-    # high concurrency instead of falling back to eager kernel launches.
+    # = sglang's auto-pick.
     cuda_graph_max_bs: int | None = None
 
-    # Cap on simultaneously-running requests. None = sglang's auto-pick
-    # based on max_total_tokens. Raise to allow wider batches at high
-    # concurrency.
-    max_running_requests: int | None = None
-    # Cap on total tokens (across requests) the scheduler tries to pack
-    # into one fire_batch.
-    max_total_tokens: int | None = None
     # Chunked-prefill size override.
     chunked_prefill_size: int | None = None
 

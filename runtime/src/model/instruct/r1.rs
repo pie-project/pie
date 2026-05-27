@@ -3,17 +3,13 @@
 //! Uses fullwidth Unicode delimiters for roles and tool calls.
 //! Reference: DeepSeek R1 Jinja chat template with tool-calling support.
 
-use std::sync::Arc;
 use crate::inference::structured::grammar::Grammar;
-use crate::model::instruct::{
-    ChatDecoder,
-    Instruct,
-    ReasoningDecoder,
-    ToolDecoder, ToolEvent, ToolGrammar,
-};
 use crate::model::instruct::decoders::{GenericChatDecoder, ThinkingDecoder};
+use crate::model::instruct::{
+    ChatDecoder, Instruct, ReasoningDecoder, ToolDecoder, ToolEvent, ToolGrammar,
+};
 use crate::model::tokenizer::Tokenizer;
-
+use std::sync::Arc;
 
 static TEMPLATE: &str = r#"
 {%- if not add_generation_prompt is defined %}
@@ -187,7 +183,7 @@ impl R1Instruct {
              Make sure the JSON is valid.\
              ## Tools\n\n\
              ### Function\n\n\
-             You have the following functions available:\n\n"
+             You have the following functions available:\n\n",
         );
         for tool in tools {
             prompt.push_str("\n```json\n");
@@ -254,7 +250,10 @@ impl Instruct for R1Instruct {
     }
 
     fn chat_decoder(&self) -> Box<dyn ChatDecoder> {
-        Box::new(GenericChatDecoder::new(self.tokenizer.clone(), self.eos_ids.clone()))
+        Box::new(GenericChatDecoder::new(
+            self.tokenizer.clone(),
+            self.eos_ids.clone(),
+        ))
     }
 
     fn reasoning_decoder(&self) -> Box<dyn ReasoningDecoder> {
@@ -288,7 +287,8 @@ impl Instruct for R1Instruct {
         let mut names: Vec<String> = Vec::new();
         for tool in tools {
             if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(tool) {
-                if let Some(name) = parsed.get("function")
+                if let Some(name) = parsed
+                    .get("function")
                     .and_then(|f| f.get("name"))
                     .and_then(|n| n.as_str())
                 {
@@ -318,7 +318,10 @@ json-array ::= "[" (json-value ("," json-value)*)? "]"
             name_alt = name_alt
         );
         let parsed = Grammar::from_ebnf(&grammar, "root").ok()?;
-        Some(ToolGrammar { source: grammar, grammar: Arc::new(parsed) })
+        Some(ToolGrammar {
+            source: grammar,
+            grammar: Arc::new(parsed),
+        })
     }
 }
 
@@ -374,7 +377,10 @@ impl ToolDecoder for R1ToolDecoder {
                             if let Some(json_end) = content[json_start..].find("\n```") {
                                 let args = content[json_start..json_start + json_end].to_string();
                                 // Extract name from "type<sep>name" format
-                                let name = header.rsplit_once("\n").map_or(header, |(_, n)| n).to_string();
+                                let name = header
+                                    .rsplit_once("\n")
+                                    .map_or(header, |(_, n)| n)
+                                    .to_string();
                                 return ToolEvent::Call(name, args);
                             }
                         }
@@ -397,8 +403,8 @@ impl ToolDecoder for R1ToolDecoder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
     use crate::model::tokenizer::Tokenizer;
+    use std::sync::Arc;
 
     fn make_tok(vocab: &[&str]) -> Arc<Tokenizer> {
         let v: Vec<String> = vocab.iter().map(|s| s.to_string()).collect();
@@ -407,10 +413,19 @@ mod tests {
 
     fn r1() -> R1Instruct {
         let tok = make_tok(&[
-            "<｜end▁of▁sentence｜>", "<|EOT|>", "<｜User｜>", "<｜Assistant｜>",
-            "Hello", "\n", "<think>", "</think>", "<｜begin▁of▁sentence｜>",
-            "<｜tool▁outputs▁begin｜>", "<｜tool▁outputs▁end｜>",
-            "<｜tool▁output▁begin｜>", "<｜tool▁output▁end｜>",
+            "<｜end▁of▁sentence｜>",
+            "<|EOT|>",
+            "<｜User｜>",
+            "<｜Assistant｜>",
+            "Hello",
+            "\n",
+            "<think>",
+            "</think>",
+            "<｜begin▁of▁sentence｜>",
+            "<｜tool▁outputs▁begin｜>",
+            "<｜tool▁outputs▁end｜>",
+            "<｜tool▁output▁begin｜>",
+            "<｜tool▁output▁end｜>",
         ]);
         R1Instruct::new(tok)
     }
@@ -435,8 +450,10 @@ mod tests {
         let sys = inst.system("Hello");
         // Bare prepend: should NOT start with user or assistant prefix
         if !inst.user_prefix.is_empty() {
-            assert_ne!(&sys[..inst.user_prefix.len().min(sys.len())],
-                       &inst.user_prefix[..inst.user_prefix.len().min(sys.len())]);
+            assert_ne!(
+                &sys[..inst.user_prefix.len().min(sys.len())],
+                &inst.user_prefix[..inst.user_prefix.len().min(sys.len())]
+            );
         }
     }
 
@@ -451,8 +468,14 @@ mod tests {
     #[test]
     fn assistant_strips_thinking() {
         assert_eq!(R1Instruct::strip_thinking("some text"), "some text");
-        assert_eq!(R1Instruct::strip_thinking("<think>reasoning</think>actual answer"), "actual answer");
-        assert_eq!(R1Instruct::strip_thinking("<think>a</think><think>b</think>final"), "final");
+        assert_eq!(
+            R1Instruct::strip_thinking("<think>reasoning</think>actual answer"),
+            "actual answer"
+        );
+        assert_eq!(
+            R1Instruct::strip_thinking("<think>a</think><think>b</think>final"),
+            "final"
+        );
     }
 
     #[test]

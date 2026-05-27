@@ -3,10 +3,10 @@
 //! This constrains language model output to follow formal grammars
 //! (EBNF, JSON Schema, regex), enabling structured generation with guaranteed
 //! syntactic correctness.
-//! 
-//! The large portion of this code is a port of the xgrammar library to Rust. 
+//!
+//! The large portion of this code is a port of the xgrammar library to Rust.
 //! (@ingim: add credit to xgrammar in the README)
-//! 
+//!
 //! # Usage
 //!
 //! The typical flow is:
@@ -21,7 +21,7 @@
 //! use pie::inference::structured::bitmask;
 //! use pie::inference::structured::grammar::Grammar;
 //! use pie::inference::structured::matcher::GrammarMatcher;
-//! use pie::tokenizer::Tokenizer;
+//! use pie::model::tokenizer::Tokenizer;
 //!
 //! // Create grammar from EBNF
 //! let grammar = Arc::new(
@@ -81,7 +81,7 @@
 //! use pie::inference::structured::compiled_grammar::CompiledGrammar;
 //! use pie::inference::structured::grammar::Grammar;
 //! use pie::inference::structured::matcher::GrammarMatcher;
-//! use pie::tokenizer::Tokenizer;
+//! use pie::model::tokenizer::Tokenizer;
 //!
 //! let grammar = Arc::new(Grammar::from_ebnf(r#"root ::= [a-z]+"#, "root").unwrap());
 //! let vocab: Vec<String> = (0..128u16).map(|b| String::from(b as u8 as char)).collect();
@@ -114,4 +114,3 @@ pub mod grammar;
 pub mod json_schema;
 pub mod matcher;
 pub mod regex;
-

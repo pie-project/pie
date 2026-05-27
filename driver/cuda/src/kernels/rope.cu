@@ -18,6 +18,27 @@ __device__ __forceinline__ void rotate_pair(
     h_ptr[dim_pair + half] = __float2bfloat16(b * cos_v + a * sin_v);
 }
 
+__global__ void rope_standard_table_kernel(
+    const std::int32_t* __restrict__ positions,
+    float* __restrict__ table,
+    int head_dim,
+    float theta)
+{
+    const int n = blockIdx.x;
+    const int half = head_dim / 2;
+    const int pos = positions[n];
+    float* row = table + static_cast<long long>(n) * head_dim;
+    for (int dim_pair = threadIdx.x; dim_pair < half; dim_pair += blockDim.x) {
+        const float freq = powf(theta,
+            -2.f * static_cast<float>(dim_pair) / static_cast<float>(head_dim));
+        const float ang = static_cast<float>(pos) * freq;
+        float cos_v, sin_v;
+        __sincosf(ang, &sin_v, &cos_v);
+        row[dim_pair] = cos_v;
+        row[dim_pair + half] = sin_v;
+    }
+}
+
 __global__ void rope_bf16_kernel(
     __nv_bfloat16* __restrict__ q,
     __nv_bfloat16* __restrict__ k,
@@ -57,7 +78,75 @@ __global__ void rope_bf16_kernel(
     }
 }
 
+template <int BLOCK>
+__global__ void qk_rmsnorm_rope_bf16_kernel(
+    __nv_bfloat16* __restrict__ q,
+    __nv_bfloat16* __restrict__ k,
+    const __nv_bfloat16* __restrict__ q_weight,
+    const __nv_bfloat16* __restrict__ k_weight,
+    const std::int32_t* __restrict__ positions,
+    int num_q_heads,
+    int num_kv_heads,
+    int head_dim,
+    float theta,
+    float eps)
+{
+    const int n = blockIdx.x;
+    const int head_idx = blockIdx.y;
+    const bool is_q = head_idx < num_q_heads;
+    const int local_head = is_q ? head_idx : (head_idx - num_q_heads);
+    __nv_bfloat16* row = is_q
+        ? q + (static_cast<long long>(n) * num_q_heads + local_head) * head_dim
+        : k + (static_cast<long long>(n) * num_kv_heads + local_head) * head_dim;
+    const __nv_bfloat16* weight = is_q ? q_weight : k_weight;
+
+    float local = 0.f;
+    for (int i = threadIdx.x; i < head_dim; i += BLOCK) {
+        const float v = __bfloat162float(row[i]);
+        local += v * v;
+    }
+
+    __shared__ float buf[BLOCK];
+    buf[threadIdx.x] = local;
+    __syncthreads();
+    for (int off = BLOCK / 2; off > 0; off >>= 1) {
+        if (threadIdx.x < off) buf[threadIdx.x] += buf[threadIdx.x + off];
+        __syncthreads();
+    }
+
+    const float inv_rms = rsqrtf(buf[0] / static_cast<float>(head_dim) + eps);
+    const int half = head_dim / 2;
+    const int pos = positions[n];
+    for (int dim_pair = threadIdx.x; dim_pair < half; dim_pair += BLOCK) {
+        const float a = __bfloat162float(row[dim_pair]) *
+            inv_rms * __bfloat162float(weight[dim_pair]);
+        const float b = __bfloat162float(row[dim_pair + half]) *
+            inv_rms * __bfloat162float(weight[dim_pair + half]);
+        const float freq = powf(theta,
+            -2.f * static_cast<float>(dim_pair) / static_cast<float>(head_dim));
+        const float ang = static_cast<float>(pos) * freq;
+        float cos_v, sin_v;
+        __sincosf(ang, &sin_v, &cos_v);
+        row[dim_pair] = __float2bfloat16(a * cos_v - b * sin_v);
+        row[dim_pair + half] = __float2bfloat16(b * cos_v + a * sin_v);
+    }
+}
+
 }  // namespace
+
+void launch_rope_standard_table(
+    const std::int32_t* positions,
+    float* table,
+    int num_tokens,
+    int head_dim,
+    float theta,
+    cudaStream_t stream)
+{
+    if (num_tokens <= 0 || table == nullptr) return;
+    constexpr int BLOCK = 128;
+    rope_standard_table_kernel<<<num_tokens, BLOCK, 0, stream>>>(
+        positions, table, head_dim, theta);
+}
 
 void launch_rope_bf16(
     void* q, void* k,
@@ -77,6 +166,29 @@ void launch_rope_bf16(
         static_cast<__nv_bfloat16*>(k),
         positions,
         num_q_heads, num_kv_heads, head_dim, theta);
+}
+
+void launch_qk_rmsnorm_rope_bf16(
+    void* q, void* k,
+    const void* q_weight, const void* k_weight,
+    const std::int32_t* positions,
+    int num_tokens,
+    int num_q_heads,
+    int num_kv_heads,
+    int head_dim,
+    float theta,
+    float eps,
+    cudaStream_t stream)
+{
+    constexpr int BLOCK = 128;
+    dim3 grid(num_tokens, num_q_heads + num_kv_heads);
+    qk_rmsnorm_rope_bf16_kernel<BLOCK><<<grid, BLOCK, 0, stream>>>(
+        static_cast<__nv_bfloat16*>(q),
+        static_cast<__nv_bfloat16*>(k),
+        static_cast<const __nv_bfloat16*>(q_weight),
+        static_cast<const __nv_bfloat16*>(k_weight),
+        positions,
+        num_q_heads, num_kv_heads, head_dim, theta, eps);
 }
 
 // ── YaRN variant ────────────────────────────────────────────────────────────

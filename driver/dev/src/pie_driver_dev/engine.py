@@ -12,12 +12,15 @@ import random
 import numpy as np
 import torch
 
-from .config import NativeRuntimeConfig as RuntimeConfig
+from pie_driver_dev.config import NativeRuntimeConfig as RuntimeConfig
+from ._bridge.batching import Batch
 from .loader import ModelLoader
 from .adapter import AdapterSubpass, CmaesAdapter
+from . import batch_tensors
 from . import model as model_registry
 from . import hf_utils
-from . import telemetry
+from ._bridge import telemetry
+from .kv_cache import KvCacheHandle, parse_kv_cache_dtype, register_kv_cache
 
 
 class Engine:
@@ -34,6 +37,7 @@ class Engine:
     forward_pass: object  # e.g., llama3.ForwardPass
     model_config: object  # e.g., llama3.ModelConfig
     kv_cache_at_layer: list[torch.Tensor]
+    kv_cache_handle: KvCacheHandle
 
     # CPU swap pool (pinned host memory, mirrors GPU KV cache layout)
     kv_cache_at_layer_host: list[torch.Tensor]  # [pool_size, 2, page_size, kv_heads, dim_head] per layer
@@ -60,11 +64,15 @@ class Engine:
         snapshot_dir: str | None = None,
         kv_cache_at_layer_host: list | None = None,
         swap_pool_size: int = 0,
+        kv_cache_handle: KvCacheHandle | None = None,
     ):
         self.config = config
         self.model_config = model_config
         self.forward_pass = forward_pass
         self.kv_cache_at_layer = kv_cache_at_layer
+        self.kv_cache_handle = kv_cache_handle or register_kv_cache(
+            kv_cache_at_layer, parse_kv_cache_dtype("auto")
+        )
         self.kv_cache_at_layer_host = kv_cache_at_layer_host or []
         self.swap_pool_size = swap_pool_size
         self.adapter_at_layer = adapter_at_layer
@@ -126,7 +134,7 @@ class Engine:
 
         # Create model-specific components
         model_config = mod.ModelConfig.from_dict(normalized_arch)
-        config.max_num_kv_pages = model_config.eval_max_num_kv_pages(config)
+        config.total_pages = model_config.eval_total_pages(config)
 
         forward_pass = mod.ForwardPass(
             model_config,
@@ -136,6 +144,10 @@ class Engine:
 
         adapter_at_layer = mod.create_adapter_cache(model_config, config)
         kv_cache_at_layer = mod.create_kv_cache(model_config, config)
+        kv_cache_handle = register_kv_cache(
+            kv_cache_at_layer,
+            parse_kv_cache_dtype(config.kv_cache_dtype, config.activation_dtype),
+        )
 
         # Compact weight memory layout for GPU locality (MPS TLB optimization).
         # Must run AFTER KV cache allocation: the CPU roundtrip inside
@@ -160,6 +172,7 @@ class Engine:
             snapshot_dir=snapshot_dir,
             kv_cache_at_layer_host=host_kv,
             swap_pool_size=pool_size,
+            kv_cache_handle=kv_cache_handle,
         )
 
     @classmethod
@@ -199,10 +212,14 @@ class Engine:
         model_config = DummyModelConfig()
         if hf_vocab_size is not None:
             model_config.vocab_size = int(hf_vocab_size)
-        config.max_num_kv_pages = model_config.eval_max_num_kv_pages(config)
+        config.total_pages = model_config.eval_total_pages(config)
 
         forward_pass = DummyForwardPass(model_config, config)
         kv_cache_at_layer = create_kv_cache(model_config, config)
+        kv_cache_handle = register_kv_cache(
+            kv_cache_at_layer,
+            parse_kv_cache_dtype(config.kv_cache_dtype, config.activation_dtype),
+        )
         adapter_at_layer = create_adapter_cache(model_config, config)
 
         info = {
@@ -227,6 +244,7 @@ class Engine:
             snapshot_dir=snapshot_dir,
             kv_cache_at_layer_host=host_kv,
             swap_pool_size=pool_size,
+            kv_cache_handle=kv_cache_handle,
         )
 
     # ========================================================================
@@ -278,7 +296,91 @@ class Engine:
     # Inference
     # ========================================================================
 
+    # ========================================================================
+    # KV swap — page copies. Bridge stays torch-free; the index_copy_ calls
+    # live here next to the engine that owns the GPU and pinned-host KV
+    # tensors.
+    # ========================================================================
+
+    def kv_copy_d2h(self, phys_ids: list[int], slots: list[int]) -> None:
+        gpu_kv = self.kv_cache_at_layer
+        host_kv = self.kv_cache_at_layer_host
+        max_gpu = gpu_kv[0].shape[0]
+        max_cpu = host_kv[0].shape[0] if host_kv else 0
+        for p in phys_ids:
+            if p < 0 or p >= max_gpu:
+                raise ValueError(f"swap_out: GPU phys_id {p} out of bounds [0, {max_gpu})")
+        for s in slots:
+            if s < 0 or s >= max_cpu:
+                raise ValueError(f"swap_out: CPU slot {s} out of bounds [0, {max_cpu})")
+        src = torch.tensor(phys_ids, dtype=torch.long, device=gpu_kv[0].device)
+        dst = torch.tensor(slots, dtype=torch.long)
+        for layer_idx in range(len(gpu_kv)):
+            host_kv[layer_idx].index_copy_(0, dst, gpu_kv[layer_idx][src].cpu())
+
+    def kv_copy_h2d(self, phys_ids: list[int], slots: list[int]) -> None:
+        gpu_kv = self.kv_cache_at_layer
+        host_kv = self.kv_cache_at_layer_host
+        max_gpu = gpu_kv[0].shape[0]
+        max_cpu = host_kv[0].shape[0] if host_kv else 0
+        for p in phys_ids:
+            if p < 0 or p >= max_gpu:
+                raise ValueError(f"swap_in: GPU phys_id {p} out of bounds [0, {max_gpu})")
+        for s in slots:
+            if s < 0 or s >= max_cpu:
+                raise ValueError(f"swap_in: CPU slot {s} out of bounds [0, {max_cpu})")
+        dst = torch.tensor(phys_ids, dtype=torch.long, device=gpu_kv[0].device)
+        src = torch.tensor(slots, dtype=torch.long)
+        for layer_idx in range(len(gpu_kv)):
+            gpu_kv[layer_idx].index_copy_(0, dst, host_kv[layer_idx][src].to(gpu_kv[layer_idx].device))
+
+    def kv_copy_d2d(self, src_phys_ids: list[int], dst_phys_ids: list[int]) -> None:
+        gpu_kv = self.kv_cache_at_layer
+        max_gpu = gpu_kv[0].shape[0]
+        for p in src_phys_ids:
+            if p < 0 or p >= max_gpu:
+                raise ValueError(f"copy_d2d: src phys_id {p} out of bounds [0, {max_gpu})")
+        for p in dst_phys_ids:
+            if p < 0 or p >= max_gpu:
+                raise ValueError(f"copy_d2d: dst phys_id {p} out of bounds [0, {max_gpu})")
+        src = torch.tensor(src_phys_ids, dtype=torch.long, device=gpu_kv[0].device)
+        dst = torch.tensor(dst_phys_ids, dtype=torch.long, device=gpu_kv[0].device)
+        for layer_idx in range(len(gpu_kv)):
+            gpu_kv[layer_idx].index_copy_(0, dst, gpu_kv[layer_idx][src])
+
+    def kv_copy_h2h(self, src_slots: list[int], dst_slots: list[int]) -> None:
+        host_kv = self.kv_cache_at_layer_host
+        max_cpu = host_kv[0].shape[0] if host_kv else 0
+        for s in src_slots:
+            if s < 0 or s >= max_cpu:
+                raise ValueError(f"copy_h2h: src slot {s} out of bounds [0, {max_cpu})")
+        for s in dst_slots:
+            if s < 0 or s >= max_cpu:
+                raise ValueError(f"copy_h2h: dst slot {s} out of bounds [0, {max_cpu})")
+        src = torch.tensor(src_slots, dtype=torch.long)
+        dst = torch.tensor(dst_slots, dtype=torch.long)
+        for layer_idx in range(len(host_kv)):
+            host_kv[layer_idx].index_copy_(0, dst, host_kv[layer_idx][src])
+
     @torch.inference_mode()
+    def build_model_inputs(self, batch: Batch) -> dict:
+        """Materialize a Batch into the dict of torch tensors `fire_batch` expects."""
+        if batch.has_speculative_inputs:
+            return batch_tensors.build_spec_expanded_model_inputs(
+                batch, self.config.device
+            )
+        return batch_tensors.build_model_inputs(batch, self.config.device)
+
+    def build_sampling_metadata(self, batch: Batch) -> dict:
+        """Materialize a Batch into the sampling-metadata dict `fire_batch` expects."""
+        if batch.has_speculative_inputs:
+            return batch_tensors.build_spec_expanded_sampling_metadata(
+                batch, self.config.device, self.config.activation_dtype
+            )
+        return batch_tensors.build_sampling_metadata(
+            batch, self.config.device, self.config.activation_dtype
+        )
+
     def fire_batch(self, inputs: dict, sampling_metadata: dict) -> list:
         """Execute a single inference step (Embed → Transform → Sample).
 
@@ -307,7 +409,7 @@ class Engine:
             )
 
         # Bounds-check kv_page_indices/indptr/last_page_lens. The caller
-        # (Batch.get_model_inputs) is expected to attach pre-computed CPU
+        # (batch_tensors.build_model_inputs) is expected to attach pre-computed CPU
         # min/max in `inputs` so we don't have to issue 6 CUDA syncs every
         # forward pass. Falls back to GPU `.item()` if the precomputed
         # values are absent (legacy paths).
@@ -479,9 +581,9 @@ class Engine:
     def capabilities(self):
         """Report this driver's resolved capacities up to pie's runtime.
 
-        See `pie_driver_dev.capabilities.DriverCapabilities` for the contract.
+        See `pie_driver_dev._bridge.capabilities.DriverCapabilities` for the contract.
         """
-        from pie_driver_dev.capabilities import DriverCapabilities
+        from ._bridge.capabilities import DriverCapabilities
 
         hf_cfg = self.info.get("hf_config", {}) if isinstance(self.info, dict) else {}
         # max_model_len: prefer max_position_embeddings; some configs use
@@ -495,12 +597,24 @@ class Engine:
             getattr(self.model_config, "num_vocabs", None)
             or getattr(self.model_config, "vocab_size", 0)
         )
+        total_pages = int(self.config.total_pages or 0)
+        max_forward_tokens = max(
+            1, min(10240, total_pages * int(self.config.kv_page_size))
+        )
+        max_forward_requests = max(1, min(512, max_forward_tokens))
+        unconstrained = (1 << 32) - 1
         return DriverCapabilities(
-            total_pages=int(self.config.max_num_kv_pages or 0),
+            total_pages=total_pages,
             kv_page_size=int(self.config.kv_page_size),
             swap_pool_size=int(self.swap_pool_size),
-            max_batch_tokens=int(self.config.max_batch_tokens or 0),
-            max_batch_size=int(self.config.max_batch_size or 0),
+            max_forward_tokens=max_forward_tokens,
+            max_forward_requests=max_forward_requests,
+            max_page_refs=total_pages,
+            max_logit_rows=unconstrained,
+            max_prob_rows=unconstrained,
+            max_custom_mask_bytes=unconstrained,
+            max_sampler_rows=unconstrained,
+            max_logprob_labels=unconstrained,
             arch_name=self.arch_type,
             vocab_size=vocab_size,
             max_model_len=max_model_len,

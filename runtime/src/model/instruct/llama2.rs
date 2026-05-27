@@ -9,15 +9,10 @@
 //!
 //! Reference: Llama 2 paper/HuggingFace template.
 
-use std::sync::Arc;
-use crate::model::instruct::{
-    ChatDecoder,
-    Instruct,
-    ReasoningDecoder,
-    ToolDecoder,
-};
 use crate::model::instruct::decoders::{GenericChatDecoder, NoopReasoningDecoder, NoopToolDecoder};
+use crate::model::instruct::{ChatDecoder, Instruct, ReasoningDecoder, ToolDecoder};
 use crate::model::tokenizer::Tokenizer;
+use std::sync::Arc;
 
 // =============================================================================
 // LlamaInstruct
@@ -46,7 +41,7 @@ impl LlamaInstruct {
         // Safe encoding for [INST]
         let mut inst_start = encode("[INST]");
         inst_start.extend(encode(" "));
-        
+
         let mut inst_end = encode(" ");
         inst_end.extend(encode("[/INST]"));
 
@@ -95,7 +90,7 @@ impl Instruct for LlamaInstruct {
     }
 
     fn cue(&self) -> Vec<u32> {
-        Vec::new() 
+        Vec::new()
     }
 
     fn seal(&self) -> Vec<u32> {
@@ -111,7 +106,10 @@ impl Instruct for LlamaInstruct {
     }
 
     fn chat_decoder(&self) -> Box<dyn ChatDecoder> {
-        Box::new(GenericChatDecoder::new(self.tokenizer.clone(), self.stop_ids.clone()))
+        Box::new(GenericChatDecoder::new(
+            self.tokenizer.clone(),
+            self.stop_ids.clone(),
+        ))
     }
 
     fn reasoning_decoder(&self) -> Box<dyn ReasoningDecoder> {
@@ -126,8 +124,8 @@ impl Instruct for LlamaInstruct {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
     use crate::model::tokenizer::Tokenizer;
+    use std::sync::Arc;
 
     fn make_tok(vocab: &[&str]) -> Arc<Tokenizer> {
         let v: Vec<String> = vocab.iter().map(|s| s.to_string()).collect();
@@ -136,12 +134,20 @@ mod tests {
 
     fn llama2() -> LlamaInstruct {
         let tok = make_tok(&[
-            "<s>", "</s>", " ",
-            "[INST]", "[/INST]",
-            "<<SYS>>", "<</SYS>>",
-            "Hello", "world",
-            "system", "user", "assistant",
-            "\n", "\n\n",
+            "<s>",
+            "</s>",
+            " ",
+            "[INST]",
+            "[/INST]",
+            "<<SYS>>",
+            "<</SYS>>",
+            "Hello",
+            "world",
+            "system",
+            "user",
+            "assistant",
+            "\n",
+            "\n\n",
         ]);
         LlamaInstruct::new(tok)
     }
