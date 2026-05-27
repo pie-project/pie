@@ -395,7 +395,11 @@ impl BatchAccumulator {
     }
 
     fn push(&mut self, req: PendingRequest) {
-        let mut usage = request_capacity_usage(&req, self.page_size);
+        let usage = request_capacity_usage(&req, self.page_size);
+        self.push_with(req, usage);
+    }
+
+    fn push_with(&mut self, req: PendingRequest, mut usage: RequestCapacityUsage) {
         let (logit_rows, prob_rows, _, _, _) = self.projected_rows(Some(&usage));
         usage.logit_rows = logit_rows;
         usage.prob_rows = prob_rows;
@@ -492,6 +496,13 @@ impl BatchAccumulator {
             return false;
         }
         let usage = request_capacity_usage(req, self.page_size);
+        self.would_exceed_with(&usage)
+    }
+
+    fn would_exceed_with(&self, usage: &RequestCapacityUsage) -> bool {
+        if self.requests.is_empty() {
+            return false;
+        }
         if self.has_rs_spec_drafts || usage.has_rs_spec_drafts {
             return true;
         }
@@ -503,7 +514,7 @@ impl BatchAccumulator {
             self.total_user_custom_mask_bytes
                 .saturating_add(usage.user_custom_mask_bytes)
         };
-        let (next_logit_rows, next_prob_rows, _, _, _) = self.projected_rows(Some(&usage));
+        let (next_logit_rows, next_prob_rows, _, _, _) = self.projected_rows(Some(usage));
         self.requests.len() + 1 > self.limits.max_forward_requests
             || self.total_tokens.saturating_add(usage.forward_tokens)
                 > self.limits.max_forward_tokens
@@ -640,6 +651,38 @@ fn prepare_pending_for_batch(
     batch: &BatchAccumulator,
     pending: PendingRequest,
 ) -> Option<PendingRequest> {
+    prepare_pending_with_usage(batch, pending).map(|(p, _)| p)
+}
+
+/// Same as `prepare_pending_for_batch` but also returns the computed
+/// `RequestCapacityUsage`, avoiding a recompute when the caller will
+/// immediately consult `would_exceed_with` + `push_with`.
+///
+/// The pure-decode fast path skips `maybe_start_chunking` and
+/// `single_request_limit_error`: for `single_token_mode` requests with
+/// 1 token, no spec drafts, no user mask, and no logit masks, both are
+/// no-ops (chunk_size is never reached; per-request limits hold trivially
+/// given the BatchAccumulator's `would_exceed_with` check will still gate
+/// page_refs / sampler_rows etc. when batching).
+fn prepare_pending_with_usage(
+    batch: &BatchAccumulator,
+    pending: PendingRequest,
+) -> Option<(PendingRequest, RequestCapacityUsage)> {
+    if is_pure_decode_pending(&pending) {
+        let usage = request_capacity_usage(&pending, batch.page_size);
+        let limits = batch.limits;
+        // Fields that COULD still trip the single-request limit for decode:
+        // page_refs (long-context decode) and logprob_labels. Token/sampler/
+        // mask limits hold trivially for 1-token single_token_mode requests.
+        if usage.page_refs <= limits.max_page_refs
+            && usage.logprob_labels <= limits.max_logprob_labels
+            && limits.max_forward_requests > 0
+        {
+            return Some((pending, usage));
+        }
+        // Fall through to the slow path so the proper error message is
+        // surfaced via `single_request_limit_error`.
+    }
     let pending = match pending.maybe_start_chunking(batch.limits, batch.page_size) {
         Ok(pending) => pending,
         Err((pending, msg)) => {
@@ -651,7 +694,18 @@ fn prepare_pending_for_batch(
         pending.send_error(msg);
         return None;
     }
-    Some(pending)
+    let usage = request_capacity_usage(&pending, batch.page_size);
+    Some((pending, usage))
+}
+
+#[inline]
+fn is_pure_decode_pending(p: &PendingRequest) -> bool {
+    matches!(&p.completion, Completion::Direct(_))
+        && p.request.token_ids.len() == 1
+        && p.request.spec_token_ids.is_empty()
+        && p.request.single_token_mode
+        && !p.request.has_user_mask
+        && p.request.logit_masks.is_empty()
 }
 
 #[cfg(test)]
@@ -1075,10 +1129,11 @@ impl BatchScheduler {
                 let Ok(pending) = req_rx.try_recv() else {
                     break;
                 };
-                let Some(pending) = prepare_pending_for_batch(&batch, pending) else {
+                let Some((pending, usage)) = prepare_pending_with_usage(&batch, pending)
+                else {
                     continue;
                 };
-                if batch.would_exceed(&pending) {
+                if batch.would_exceed_with(&usage) {
                     if scheduler_trace_enabled() {
                         let reason = batch
                             .would_exceed_reason(&pending)
@@ -1095,7 +1150,7 @@ impl BatchScheduler {
                     break;
                 }
                 policy.on_arrival();
-                batch.push(pending);
+                batch.push_with(pending, usage);
                 if batch.is_full() {
                     break;
                 }
