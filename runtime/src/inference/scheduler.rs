@@ -708,8 +708,18 @@ fn prepare_pending_with_usage(
 
 #[inline]
 fn is_pure_decode_pending(p: &PendingRequest) -> bool {
-    matches!(&p.completion, Completion::Direct(_))
-        && p.request.token_ids.len() == 1
+    // Chain-ext continuations (Completion::Chain) at conc=256 hit this path
+    // 256x per fire. Their request body is structurally identical to a
+    // pure-decode Direct request — build_next_request emits 1 token,
+    // single_token_mode=true, no user mask, no logit masks, no spec drafts
+    // in the non-spec hot path. Accepting Chain here skips the redundant
+    // `request_capacity_usage` call inside `maybe_start_chunking` for every
+    // chain continuation, trimming ~100ns × 256 = ~25 µs per fire off the
+    // accum-loop critical path.
+    matches!(
+        &p.completion,
+        Completion::Direct(_) | Completion::Chain { .. }
+    ) && p.request.token_ids.len() == 1
         && p.request.spec_token_ids.is_empty()
         && p.request.single_token_mode
         && !p.request.has_user_mask
