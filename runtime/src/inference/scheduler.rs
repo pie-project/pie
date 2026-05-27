@@ -87,6 +87,7 @@ pub const SYSTEM_SPEC_DRAFT_POS_BUCKETS: usize = 32;
 /// Cumulative stats exposed for monitoring. Updated atomically after each batch.
 #[derive(Debug, Default)]
 pub struct SchedulerStats {
+    // ── Always-on counters (no Instant::now needed). ────────────────────────
     pub total_batches: AtomicU64,
     pub total_tokens_processed: AtomicU64,
     /// Total request count across all batches (sum of batch sizes).
@@ -100,44 +101,29 @@ pub struct SchedulerStats {
     pub batch_size_hist: [AtomicU64; 8],
     pub last_batch_latency_us: AtomicU64,
     pub cumulative_latency_us: AtomicU64,
-    pub cumulative_permit_wait_us: AtomicU64,
-    pub cumulative_fire_prepare_us: AtomicU64,
-    pub cumulative_execute_batch_us: AtomicU64,
-    pub cumulative_batch_build_us: AtomicU64,
-    pub cumulative_driver_fire_us: AtomicU64,
-    pub cumulative_response_dispatch_us: AtomicU64,
-    pub cumulative_context_tick_submit_us: AtomicU64,
-    pub cumulative_stats_update_us: AtomicU64,
-    /// Time between consecutive `tokio::spawn(execute_batch)` calls.
-    /// Sum is excluding the first batch; divide by (total_batches-1) for mean.
-    pub cumulative_inter_fire_us: AtomicU64,
-    /// Time from end of response dispatch (fire N) to spawn of fire N+1.
-    /// This is the "rendezvous gap": chain extender wake + main loop drain
-    /// + cohort fill.
-    pub cumulative_post_dispatch_to_fire_us: AtomicU64,
-    /// Time spent in the main run loop's non-blocking accumulator pass —
-    /// per-iter try_recv + prepare + would_exceed + push, until the first
-    /// `try_recv` returns Empty (or batch full / stashed). Sums across
-    /// every batch.
-    pub cumulative_accum_loop_us: AtomicU64,
-    /// Internal: micros since `sched_epoch()` at last fire spawn.
-    pub last_fire_spawn_micros: AtomicU64,
-    /// Internal: micros since `sched_epoch()` at end of response dispatch.
-    pub last_dispatch_end_micros: AtomicU64,
     pub system_spec_draft_tokens_proposed: AtomicU64,
     pub system_spec_draft_tokens_accepted: AtomicU64,
     pub system_spec_draft_tokens_proposed_per_pos:
         [AtomicU64; SYSTEM_SPEC_DRAFT_POS_BUCKETS],
     pub system_spec_draft_tokens_accepted_per_pos:
         [AtomicU64; SYSTEM_SPEC_DRAFT_POS_BUCKETS],
+
+    // ── Fire-domain probes (gated behind `profile-fire` feature). ───────────
+    //
+    // Hierarchy + invariants documented in `crate::probe::fire`. Writers
+    // use the `probe_fire!` macro from that module so the fetch_add
+    // disappears when the feature is off. The struct itself is always
+    // defined so callers and readers compile uniformly.
+    pub fire: crate::probe::fire::FireProbes,
 }
 
+/// Out-of-band data execute_batch reports back to the run loop. Per-fire
+/// *timing* probes are no longer in this struct — they're recorded
+/// directly into `stats.fire.*` via `probe_fire!`. What's left here is
+/// genuine fire-output data (spec-decoding draft counters) that the run
+/// loop then folds into the spec-domain atomics.
 #[derive(Debug, Default, Clone, Copy)]
 struct BatchExecutionTiming {
-    total_us: u64,
-    batch_build_us: u64,
-    driver_fire_us: u64,
-    response_dispatch_us: u64,
     system_spec_draft_tokens_proposed: u64,
     system_spec_draft_tokens_accepted: u64,
     system_spec_draft_tokens_proposed_per_pos: [u64; SYSTEM_SPEC_DRAFT_POS_BUCKETS],
@@ -1255,9 +1241,10 @@ impl BatchScheduler {
                     break;
                 }
             }
-            stats
-                .cumulative_accum_loop_us
-                .fetch_add(accum_start.elapsed().as_micros() as u64, Relaxed);
+            crate::probe_fire_record!(
+                stats.fire.accumulate.accum_loop_us,
+                accum_start.elapsed()
+            );
 
             // Ask the policy what to do
             let decision = if next_pending.is_some() {
@@ -1270,7 +1257,6 @@ impl BatchScheduler {
                     // No in-flight gate to acquire: the scheduler runs
                     // execute_batch synchronously, so we can only reach
                     // here when the previous fire has fully completed.
-                    let permit_wait_us = 0u64;
 
                     // Do one last non-blocking drain so requests that
                     // arrived between the recv loop and here are
@@ -1327,28 +1313,32 @@ impl BatchScheduler {
                         .map(|r| r.request.context_ids[0])
                         .collect();
                     let batch_size = batch_ctx_ids.len() as u64;
-                    let fire_prepare_us = fire_prepare_start.elapsed().as_micros() as u64;
-                    stats
-                        .cumulative_permit_wait_us
-                        .fetch_add(permit_wait_us, Relaxed);
-                    stats
-                        .cumulative_fire_prepare_us
-                        .fetch_add(fire_prepare_us, Relaxed);
+                    crate::probe_fire_record!(
+                        stats.fire.pre_dispatch.fire_prepare_us,
+                        fire_prepare_start.elapsed()
+                    );
 
-                    // Inter-fire instrumentation: time between consecutive spawns,
+                    // Inter-fire instrumentation: time between consecutive fires,
                     // and the post-dispatch-to-next-fire gap (rendezvous window).
+                    // The timestamps themselves (last_fire_spawn_micros,
+                    // last_dispatch_end_micros) are always-on — cheap atomic
+                    // swap/load. The accumulators are probe-gated.
                     let now_us = now_micros();
-                    let last_spawn = stats.last_fire_spawn_micros.swap(now_us, Relaxed);
+                    let last_spawn = stats.fire.last_fire_spawn_micros.swap(now_us, Relaxed);
                     if last_spawn != 0 {
-                        stats
-                            .cumulative_inter_fire_us
-                            .fetch_add(now_us.saturating_sub(last_spawn), Relaxed);
+                        crate::probe_fire_record!(
+                            stats.fire.inter_fire_us,
+                            std::time::Duration::from_micros(now_us.saturating_sub(last_spawn))
+                        );
                     }
-                    let last_dispatch_end = stats.last_dispatch_end_micros.load(Relaxed);
+                    let last_dispatch_end = stats.fire.last_dispatch_end_micros.load(Relaxed);
                     if last_dispatch_end != 0 {
-                        stats
-                            .cumulative_post_dispatch_to_fire_us
-                            .fetch_add(now_us.saturating_sub(last_dispatch_end), Relaxed);
+                        crate::probe_fire_record!(
+                            stats.fire.post_dispatch_to_fire_us,
+                            std::time::Duration::from_micros(
+                                now_us.saturating_sub(last_dispatch_end)
+                            )
+                        );
                     }
 
                     // Fire synchronously on the scheduler thread.
@@ -1358,101 +1348,92 @@ impl BatchScheduler {
                     // under the old `async fn`). The ~800 µs
                     // `deferred_drop` work is still punted via
                     // `rt_handle.spawn_blocking` inside execute_batch.
+                    //
+                    // execute.total_us probe wraps execute_batch end-to-end;
+                    // its children (batch_build, driver_fire, response_dispatch)
+                    // probe inside execute_batch and should sum to total within
+                    // a few µs.
                     let timeout = request_timeout;
                     let start = Instant::now();
-                    let timing = Self::execute_batch(
-                        driver_idx,
-                        requests_to_fire,
-                        driver_id,
-                        page_size,
-                        timeout,
-                        &rt_handle,
-                        Some(submit_tx.clone()),
-                        Some(stats.clone()),
-                        Some(chain_pool.clone()),
-                    );
+                    let timing = crate::probe_fire!(stats.fire.execute.total_us, {
+                        Self::execute_batch(
+                            driver_idx,
+                            requests_to_fire,
+                            driver_id,
+                            page_size,
+                            timeout,
+                            &rt_handle,
+                            Some(submit_tx.clone()),
+                            &stats,
+                            Some(chain_pool.clone()),
+                        )
+                    });
                     let latency = start.elapsed();
                     let _ = latency_tx.send(latency);
 
                     // Advance market clock for this driver: prices, rent, dividends.
                     // Pass batch context IDs so tick only charges contexts
                     // that were in this batch (not stale pinned contexts).
-                    let tick_submit_start = Instant::now();
-                    crate::context::tick(driver_idx, latency.as_secs_f64(), batch_ctx_ids);
-                    let tick_submit_us = tick_submit_start.elapsed().as_micros() as u64;
+                    crate::probe_fire!(stats.fire.post_dispatch.context_tick_us, {
+                        crate::context::tick(driver_idx, latency.as_secs_f64(), batch_ctx_ids);
+                    });
 
-                    // Update cumulative atomic counters (consumed by external
-                    // monitoring; ignored by the policy).
-                    let stats_update_start = Instant::now();
-                    stats.total_batches.fetch_add(1, Relaxed);
-                    stats
-                        .total_tokens_processed
-                        .fetch_add(total_tokens as u64, Relaxed);
-                    stats
-                        .total_requests_processed
-                        .fetch_add(batch_size, Relaxed);
-                    stats
-                        .max_forward_requests_observed
-                        .fetch_max(batch_size, Relaxed);
-                    let bucket = match batch_size {
-                        0 | 1 => 0,
-                        2..=3 => 1,
-                        4..=7 => 2,
-                        8..=15 => 3,
-                        16..=31 => 4,
-                        32..=63 => 5,
-                        64..=127 => 6,
-                        _ => 7,
-                    };
-                    stats.batch_size_hist[bucket].fetch_add(1, Relaxed);
-                    stats
-                        .last_batch_latency_us
-                        .store(latency.as_micros() as u64, Relaxed);
-                    stats
-                        .cumulative_latency_us
-                        .fetch_add(latency.as_micros() as u64, Relaxed);
-                    stats
-                        .cumulative_execute_batch_us
-                        .fetch_add(timing.total_us, Relaxed);
-                    stats
-                        .cumulative_batch_build_us
-                        .fetch_add(timing.batch_build_us, Relaxed);
-                    stats
-                        .cumulative_driver_fire_us
-                        .fetch_add(timing.driver_fire_us, Relaxed);
-                    stats
-                        .cumulative_response_dispatch_us
-                        .fetch_add(timing.response_dispatch_us, Relaxed);
-                    stats
-                        .cumulative_context_tick_submit_us
-                        .fetch_add(tick_submit_us, Relaxed);
-                    stats
-                        .system_spec_draft_tokens_proposed
-                        .fetch_add(timing.system_spec_draft_tokens_proposed, Relaxed);
-                    stats
-                        .system_spec_draft_tokens_accepted
-                        .fetch_add(timing.system_spec_draft_tokens_accepted, Relaxed);
-                    for (counter, value) in stats
-                        .system_spec_draft_tokens_proposed_per_pos
-                        .iter()
-                        .zip(timing.system_spec_draft_tokens_proposed_per_pos)
-                    {
-                        if value != 0 {
-                            counter.fetch_add(value, Relaxed);
+                    // Always-on counters + spec-domain accumulation.
+                    // Wrapped in stats_update_us probe so we can see how
+                    // much the bookkeeping costs.
+                    crate::probe_fire!(stats.fire.post_dispatch.stats_update_us, {
+                        stats.total_batches.fetch_add(1, Relaxed);
+                        stats
+                            .total_tokens_processed
+                            .fetch_add(total_tokens as u64, Relaxed);
+                        stats
+                            .total_requests_processed
+                            .fetch_add(batch_size, Relaxed);
+                        stats
+                            .max_forward_requests_observed
+                            .fetch_max(batch_size, Relaxed);
+                        let bucket = match batch_size {
+                            0 | 1 => 0,
+                            2..=3 => 1,
+                            4..=7 => 2,
+                            8..=15 => 3,
+                            16..=31 => 4,
+                            32..=63 => 5,
+                            64..=127 => 6,
+                            _ => 7,
+                        };
+                        stats.batch_size_hist[bucket].fetch_add(1, Relaxed);
+                        stats
+                            .last_batch_latency_us
+                            .store(latency.as_micros() as u64, Relaxed);
+                        stats
+                            .cumulative_latency_us
+                            .fetch_add(latency.as_micros() as u64, Relaxed);
+                        stats
+                            .system_spec_draft_tokens_proposed
+                            .fetch_add(timing.system_spec_draft_tokens_proposed, Relaxed);
+                        stats
+                            .system_spec_draft_tokens_accepted
+                            .fetch_add(timing.system_spec_draft_tokens_accepted, Relaxed);
+                        for (counter, value) in stats
+                            .system_spec_draft_tokens_proposed_per_pos
+                            .iter()
+                            .zip(timing.system_spec_draft_tokens_proposed_per_pos)
+                        {
+                            if value != 0 {
+                                counter.fetch_add(value, Relaxed);
+                            }
                         }
-                    }
-                    for (counter, value) in stats
-                        .system_spec_draft_tokens_accepted_per_pos
-                        .iter()
-                        .zip(timing.system_spec_draft_tokens_accepted_per_pos)
-                    {
-                        if value != 0 {
-                            counter.fetch_add(value, Relaxed);
+                        for (counter, value) in stats
+                            .system_spec_draft_tokens_accepted_per_pos
+                            .iter()
+                            .zip(timing.system_spec_draft_tokens_accepted_per_pos)
+                        {
+                            if value != 0 {
+                                counter.fetch_add(value, Relaxed);
+                            }
                         }
-                    }
-                    stats
-                        .cumulative_stats_update_us
-                        .fetch_add(stats_update_start.elapsed().as_micros() as u64, Relaxed);
+                    });
                 }
                 Decision::Wait(wait_duration) => {
                     crossbeam::channel::select! {
@@ -1509,7 +1490,7 @@ impl BatchScheduler {
                 request_timeout,
                 &rt_handle,
                 None,
-                None,
+                &stats,
                 None,
             );
         }
@@ -1535,11 +1516,9 @@ impl BatchScheduler {
         _timeout: Duration,
         rt_handle: &tokio::runtime::Handle,
         submit_tx: Option<crossbeam::channel::Sender<PendingRequest>>,
-        stats_for_probe: Option<Arc<SchedulerStats>>,
+        stats: &SchedulerStats,
         chain_pool: Option<Arc<super::speculator::ChainExtPool>>,
     ) -> BatchExecutionTiming {
-        let batch_start = Instant::now();
-        let build_start = Instant::now();
         // Detect if ANY request carries system spec drafts. The
         // common case (256-conc decode) has none, so we skip the
         // per-request Vec build + position-histogram loop.
@@ -1575,18 +1554,21 @@ impl BatchScheduler {
                 && req.request.token_ids.len() <= 1
                 && req.request.spec_token_ids.is_empty()
         });
-        let mut batch_req = request::new_batched_forward_request_with_capacity(requests.len());
-        for req in &requests {
-            request::append_request_with_options(
-                &mut batch_req,
-                &req.request,
-                &req.physical_page_ids,
-                req.last_page_len,
-                page_size,
-                elide_decode_masks,
-            );
-        }
-        let batch_build_us = build_start.elapsed().as_micros() as u64;
+        let batch_req = crate::probe_fire!(stats.fire.execute.batch_build_us, {
+            let mut batch_req =
+                request::new_batched_forward_request_with_capacity(requests.len());
+            for req in &requests {
+                request::append_request_with_options(
+                    &mut batch_req,
+                    &req.request,
+                    &req.physical_page_ids,
+                    req.last_page_len,
+                    page_size,
+                    elide_decode_masks,
+                );
+            }
+            batch_req
+        });
 
         // Send via driver service (typed call handles serialization + timeout).
         // Sync call: parks on a futex inside the channel's response
@@ -1595,11 +1577,14 @@ impl BatchScheduler {
         // `block_in_place(submit_sync_for_state)` with no actual
         // suspension points. Since the scheduler is the only firer,
         // there's also no in-flight gate to release.
-        let driver_fire_start = Instant::now();
-        let result = driver::fire_batch_sync(driver_idx, batch_req);
-        let driver_fire_us = driver_fire_start.elapsed().as_micros() as u64;
+        let result = crate::probe_fire!(stats.fire.execute.driver_fire_us, {
+            driver::fire_batch_sync(driver_idx, batch_req)
+        });
 
-        let response_start = Instant::now();
+        // Response dispatch: per-request oneshot fires, chain-pool submits,
+        // and queueing the deferred_drop Vec. Probe scope ends at the
+        // close of the `match result { ... }` block below.
+        let response_dispatch_start = Instant::now();
         match result {
             Ok(batch_resp) => {
                 let n_results = batch_resp.num_requests as usize;
@@ -1750,9 +1735,7 @@ impl BatchScheduler {
                             }
                         }
                     }
-                    if let Some(s) = stats_for_probe.as_ref() {
-                        s.last_dispatch_end_micros.store(now_micros(), Relaxed);
-                    }
+                    stats.fire.last_dispatch_end_micros.store(now_micros(), Relaxed);
                     if !deferred_drop.is_empty() {
                         // Dedicated blocking pool so the chain-extender
                         // wake-up wave doesn't compete with this dealloc
@@ -1778,11 +1761,11 @@ impl BatchScheduler {
                 }
             }
         }
+        crate::probe_fire_record!(
+            stats.fire.execute.response_dispatch_us,
+            response_dispatch_start.elapsed()
+        );
         BatchExecutionTiming {
-            total_us: batch_start.elapsed().as_micros() as u64,
-            batch_build_us,
-            driver_fire_us,
-            response_dispatch_us: response_start.elapsed().as_micros() as u64,
             system_spec_draft_tokens_proposed,
             system_spec_draft_tokens_accepted,
             system_spec_draft_tokens_proposed_per_pos,

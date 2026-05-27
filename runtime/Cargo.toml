@@ -78,6 +78,19 @@ lru = "0.16.3"
 ahash = "0.8.12"
 ipnet = "2"
 
+[features]
+default = []
+# Host-side performance probes. Each scenario is a separate flag so you
+# only pay for the probes you ask for — different domains have different
+# sample rates and different audiences. The `probe_<domain>!` macros in
+# `src/probe/` expand to zero code when their feature is off.
+#
+# Adding a new domain: define `src/probe/<domain>.rs` with its probe-holder
+# struct + `probe_<domain>!` macro pair, then add a feature flag here.
+profile-fire = []          # per-fire scheduler lifecycle (90×/sec at conc=256)
+profile-hot-path = ["profile-fire"]  # convenience bundle for hot-path work
+profile-all = ["profile-fire"]       # everything
+
 [dev-dependencies]
 tempfile = "3"
 criterion = { version = "0.5", features = ["html_reports"] }

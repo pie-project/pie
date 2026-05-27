@@ -99,49 +99,48 @@ impl Session {
                         format!("{}.avg_batch_latency_us", model_name),
                         serde_json::Value::from(inf.avg_batch_latency_us),
                     );
+                    // Fire-domain probes. Dotted keys mirror the
+                    // `InferenceStats.fire.*` hierarchy. All-zero when the
+                    // binary is built without `--features profile-fire`.
                     stats.insert(
-                        format!("{}.avg_permit_wait_us", model_name),
-                        serde_json::Value::from(inf.avg_permit_wait_us),
+                        format!("{}.fire.inter_fire_us", model_name),
+                        serde_json::Value::from(inf.fire.avg_inter_fire_us),
                     );
                     stats.insert(
-                        format!("{}.avg_fire_prepare_us", model_name),
-                        serde_json::Value::from(inf.avg_fire_prepare_us),
+                        format!("{}.fire.post_dispatch_to_fire_us", model_name),
+                        serde_json::Value::from(inf.fire.avg_post_dispatch_to_fire_us),
                     );
                     stats.insert(
-                        format!("{}.avg_execute_batch_us", model_name),
-                        serde_json::Value::from(inf.avg_execute_batch_us),
+                        format!("{}.fire.accumulate.accum_loop_us", model_name),
+                        serde_json::Value::from(inf.fire.accumulate.avg_accum_loop_us),
                     );
                     stats.insert(
-                        format!("{}.avg_batch_build_us", model_name),
-                        serde_json::Value::from(inf.avg_batch_build_us),
+                        format!("{}.fire.pre_dispatch.fire_prepare_us", model_name),
+                        serde_json::Value::from(inf.fire.pre_dispatch.avg_fire_prepare_us),
                     );
                     stats.insert(
-                        format!("{}.avg_driver_fire_us", model_name),
-                        serde_json::Value::from(inf.avg_driver_fire_us),
+                        format!("{}.fire.execute.total_us", model_name),
+                        serde_json::Value::from(inf.fire.execute.avg_total_us),
                     );
                     stats.insert(
-                        format!("{}.avg_response_dispatch_us", model_name),
-                        serde_json::Value::from(inf.avg_response_dispatch_us),
+                        format!("{}.fire.execute.batch_build_us", model_name),
+                        serde_json::Value::from(inf.fire.execute.avg_batch_build_us),
                     );
                     stats.insert(
-                        format!("{}.avg_context_tick_submit_us", model_name),
-                        serde_json::Value::from(inf.avg_context_tick_submit_us),
+                        format!("{}.fire.execute.driver_fire_us", model_name),
+                        serde_json::Value::from(inf.fire.execute.avg_driver_fire_us),
                     );
                     stats.insert(
-                        format!("{}.avg_stats_update_us", model_name),
-                        serde_json::Value::from(inf.avg_stats_update_us),
+                        format!("{}.fire.execute.response_dispatch_us", model_name),
+                        serde_json::Value::from(inf.fire.execute.avg_response_dispatch_us),
                     );
                     stats.insert(
-                        format!("{}.avg_inter_fire_us", model_name),
-                        serde_json::Value::from(inf.avg_inter_fire_us),
+                        format!("{}.fire.post_dispatch.context_tick_us", model_name),
+                        serde_json::Value::from(inf.fire.post_dispatch.avg_context_tick_us),
                     );
                     stats.insert(
-                        format!("{}.avg_post_dispatch_to_fire_us", model_name),
-                        serde_json::Value::from(inf.avg_post_dispatch_to_fire_us),
-                    );
-                    stats.insert(
-                        format!("{}.avg_accum_loop_us", model_name),
-                        serde_json::Value::from(inf.avg_accum_loop_us),
+                        format!("{}.fire.post_dispatch.stats_update_us", model_name),
+                        serde_json::Value::from(inf.fire.post_dispatch.avg_stats_update_us),
                     );
                     stats.insert(
                         format!("{}.system_spec_draft_tokens_proposed", model_name),

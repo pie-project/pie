@@ -31,6 +31,12 @@ driver-portable = ["dep:pie-weight-loader"]
 driver-cuda = ["dep:pie-weight-loader"]
 driver-dummy = []
 
+# Per-domain probe passthroughs. Each forwards to the runtime crate's
+# corresponding flag. See `pie/src/probe/` for the catalog of domains.
+profile-fire = ["pie/profile-fire"]
+profile-hot-path = ["pie/profile-hot-path"]
+profile-all = ["pie/profile-all"]
+
 [dependencies]
 # `pie` is the runtime crate. After Phase 8 deleted the legacy
 # `pie._runtime` maturin module, runtime has no `python` feature to

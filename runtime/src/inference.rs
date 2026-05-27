@@ -44,6 +44,10 @@ pub(crate) fn should_use_pass_speculation(driver_idx: usize) -> bool {
 }
 
 /// Aggregated inference stats for a single model (across all drivers).
+///
+/// Always-on counters live at the top; per-domain probe averages
+/// (currently just `fire`) are nested so the shape mirrors the probe
+/// hierarchy in `crate::probe::*`.
 #[derive(Debug, Default, serde::Serialize)]
 pub struct InferenceStats {
     pub total_batches: u64,
@@ -55,21 +59,49 @@ pub struct InferenceStats {
     pub last_batch_latency_us: u64,
     pub cumulative_batch_latency_us: u64,
     pub avg_batch_latency_us: u64,
-    pub avg_permit_wait_us: u64,
-    pub avg_fire_prepare_us: u64,
-    pub avg_execute_batch_us: u64,
-    pub avg_batch_build_us: u64,
-    pub avg_driver_fire_us: u64,
-    pub avg_response_dispatch_us: u64,
-    pub avg_context_tick_submit_us: u64,
-    pub avg_stats_update_us: u64,
-    pub avg_inter_fire_us: u64,
-    pub avg_post_dispatch_to_fire_us: u64,
-    pub avg_accum_loop_us: u64,
+
+    /// Fire-domain probe averages. Values are 0 when built without
+    /// `profile-fire`. Mirrors `crate::probe::fire::FireProbes`.
+    pub fire: FireStats,
+
     pub system_spec_draft_tokens_proposed: u64,
     pub system_spec_draft_tokens_accepted: u64,
     pub system_spec_draft_tokens_proposed_per_pos: [u64; SYSTEM_SPEC_DRAFT_POS_BUCKETS],
     pub system_spec_draft_tokens_accepted_per_pos: [u64; SYSTEM_SPEC_DRAFT_POS_BUCKETS],
+}
+
+#[derive(Debug, Default, serde::Serialize)]
+pub struct FireStats {
+    pub avg_inter_fire_us: u64,
+    pub avg_post_dispatch_to_fire_us: u64,
+    pub accumulate: AccumulateStats,
+    pub pre_dispatch: PreDispatchStats,
+    pub execute: ExecuteStats,
+    pub post_dispatch: PostDispatchStats,
+}
+
+#[derive(Debug, Default, serde::Serialize)]
+pub struct AccumulateStats {
+    pub avg_accum_loop_us: u64,
+}
+
+#[derive(Debug, Default, serde::Serialize)]
+pub struct PreDispatchStats {
+    pub avg_fire_prepare_us: u64,
+}
+
+#[derive(Debug, Default, serde::Serialize)]
+pub struct ExecuteStats {
+    pub avg_total_us: u64,
+    pub avg_batch_build_us: u64,
+    pub avg_driver_fire_us: u64,
+    pub avg_response_dispatch_us: u64,
+}
+
+#[derive(Debug, Default, serde::Serialize)]
+pub struct PostDispatchStats {
+    pub avg_context_tick_us: u64,
+    pub avg_stats_update_us: u64,
 }
 
 // =============================================================================
@@ -307,17 +339,19 @@ impl InferenceService {
         let mut hist = [0u64; 8];
         let mut last_latency = 0u64;
         let mut cumulative_latency = 0u64;
-        let mut cumulative_permit_wait = 0u64;
-        let mut cumulative_fire_prepare = 0u64;
-        let mut cumulative_execute_batch = 0u64;
-        let mut cumulative_batch_build = 0u64;
-        let mut cumulative_driver_fire = 0u64;
-        let mut cumulative_response_dispatch = 0u64;
-        let mut cumulative_context_tick_submit = 0u64;
-        let mut cumulative_stats_update = 0u64;
-        let mut cumulative_inter_fire = 0u64;
-        let mut cumulative_post_dispatch_to_fire = 0u64;
-        let mut cumulative_accum_loop = 0u64;
+        // Per-driver sums of probe atomics. Walked in the same shape
+        // as InferenceStats.fire / FireProbes so the relationship is
+        // self-evident.
+        let mut fire_inter = 0u64;
+        let mut fire_post_dispatch_to_fire = 0u64;
+        let mut fire_accumulate_accum_loop = 0u64;
+        let mut fire_pre_dispatch_fire_prepare = 0u64;
+        let mut fire_execute_total = 0u64;
+        let mut fire_execute_batch_build = 0u64;
+        let mut fire_execute_driver_fire = 0u64;
+        let mut fire_execute_response_dispatch = 0u64;
+        let mut fire_post_dispatch_context_tick = 0u64;
+        let mut fire_post_dispatch_stats_update = 0u64;
         let mut system_spec_draft_tokens_proposed = 0u64;
         let mut system_spec_draft_tokens_accepted = 0u64;
         let mut system_spec_draft_tokens_proposed_per_pos =
@@ -336,17 +370,17 @@ impl InferenceService {
             }
             last_latency = last_latency.max(s.last_batch_latency_us.load(Relaxed));
             cumulative_latency += s.cumulative_latency_us.load(Relaxed);
-            cumulative_permit_wait += s.cumulative_permit_wait_us.load(Relaxed);
-            cumulative_fire_prepare += s.cumulative_fire_prepare_us.load(Relaxed);
-            cumulative_execute_batch += s.cumulative_execute_batch_us.load(Relaxed);
-            cumulative_batch_build += s.cumulative_batch_build_us.load(Relaxed);
-            cumulative_driver_fire += s.cumulative_driver_fire_us.load(Relaxed);
-            cumulative_response_dispatch += s.cumulative_response_dispatch_us.load(Relaxed);
-            cumulative_context_tick_submit += s.cumulative_context_tick_submit_us.load(Relaxed);
-            cumulative_stats_update += s.cumulative_stats_update_us.load(Relaxed);
-            cumulative_inter_fire += s.cumulative_inter_fire_us.load(Relaxed);
-            cumulative_post_dispatch_to_fire += s.cumulative_post_dispatch_to_fire_us.load(Relaxed);
-            cumulative_accum_loop += s.cumulative_accum_loop_us.load(Relaxed);
+            let f = &s.fire;
+            fire_inter += f.inter_fire_us.load(Relaxed);
+            fire_post_dispatch_to_fire += f.post_dispatch_to_fire_us.load(Relaxed);
+            fire_accumulate_accum_loop += f.accumulate.accum_loop_us.load(Relaxed);
+            fire_pre_dispatch_fire_prepare += f.pre_dispatch.fire_prepare_us.load(Relaxed);
+            fire_execute_total += f.execute.total_us.load(Relaxed);
+            fire_execute_batch_build += f.execute.batch_build_us.load(Relaxed);
+            fire_execute_driver_fire += f.execute.driver_fire_us.load(Relaxed);
+            fire_execute_response_dispatch += f.execute.response_dispatch_us.load(Relaxed);
+            fire_post_dispatch_context_tick += f.post_dispatch.context_tick_us.load(Relaxed);
+            fire_post_dispatch_stats_update += f.post_dispatch.stats_update_us.load(Relaxed);
             system_spec_draft_tokens_proposed += s.system_spec_draft_tokens_proposed.load(Relaxed);
             system_spec_draft_tokens_accepted += s.system_spec_draft_tokens_accepted.load(Relaxed);
             for (dst, src) in system_spec_draft_tokens_proposed_per_pos
@@ -370,6 +404,16 @@ impl InferenceService {
                 0
             }
         };
+        // Inter-fire is sampled starting at the 2nd batch (first one has
+        // no prior to diff against), so divide by max(total_batches-1, 1)
+        // to get a stable mean.
+        let avg_pair = |value: u64| {
+            if total_batches > 1 {
+                value / (total_batches - 1)
+            } else {
+                0
+            }
+        };
         InferenceStats {
             total_batches,
             total_tokens_processed: total_tokens,
@@ -379,28 +423,26 @@ impl InferenceService {
             last_batch_latency_us: last_latency,
             cumulative_batch_latency_us: cumulative_latency,
             avg_batch_latency_us: avg(cumulative_latency),
-            avg_permit_wait_us: avg(cumulative_permit_wait),
-            avg_fire_prepare_us: avg(cumulative_fire_prepare),
-            avg_execute_batch_us: avg(cumulative_execute_batch),
-            avg_batch_build_us: avg(cumulative_batch_build),
-            avg_driver_fire_us: avg(cumulative_driver_fire),
-            avg_response_dispatch_us: avg(cumulative_response_dispatch),
-            avg_context_tick_submit_us: avg(cumulative_context_tick_submit),
-            avg_stats_update_us: avg(cumulative_stats_update),
-            // Inter-fire is sampled starting at the 2nd batch (first one has
-            // no prior to diff against), so divide by max(total_batches-1, 1)
-            // to get a stable mean.
-            avg_inter_fire_us: if total_batches > 1 {
-                cumulative_inter_fire / (total_batches - 1)
-            } else {
-                0
+            fire: FireStats {
+                avg_inter_fire_us: avg_pair(fire_inter),
+                avg_post_dispatch_to_fire_us: avg_pair(fire_post_dispatch_to_fire),
+                accumulate: AccumulateStats {
+                    avg_accum_loop_us: avg(fire_accumulate_accum_loop),
+                },
+                pre_dispatch: PreDispatchStats {
+                    avg_fire_prepare_us: avg(fire_pre_dispatch_fire_prepare),
+                },
+                execute: ExecuteStats {
+                    avg_total_us: avg(fire_execute_total),
+                    avg_batch_build_us: avg(fire_execute_batch_build),
+                    avg_driver_fire_us: avg(fire_execute_driver_fire),
+                    avg_response_dispatch_us: avg(fire_execute_response_dispatch),
+                },
+                post_dispatch: PostDispatchStats {
+                    avg_context_tick_us: avg(fire_post_dispatch_context_tick),
+                    avg_stats_update_us: avg(fire_post_dispatch_stats_update),
+                },
             },
-            avg_post_dispatch_to_fire_us: if total_batches > 1 {
-                cumulative_post_dispatch_to_fire / (total_batches - 1)
-            } else {
-                0
-            },
-            avg_accum_loop_us: avg(cumulative_accum_loop),
             system_spec_draft_tokens_proposed,
             system_spec_draft_tokens_accepted,
             system_spec_draft_tokens_proposed_per_pos,
