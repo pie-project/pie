@@ -237,55 +237,32 @@ pub fn new_batched_forward_request_with_capacity(n_requests: usize) -> pie_bridg
     let req_cap = n_requests;
     let token_cap = n_requests.saturating_mul(16);
     let page_cap = n_requests.saturating_mul(32);
+    let indptr = |cap: usize| {
+        let mut v = Vec::with_capacity(cap);
+        v.push(0);
+        v
+    };
     pie_bridge::ForwardRequest {
         token_ids: Vec::with_capacity(token_cap),
         position_ids: Vec::with_capacity(token_cap),
         kv_page_indices: Vec::with_capacity(page_cap),
-        kv_page_indptr: {
-            let mut v = Vec::with_capacity(indptr_cap);
-            v.push(0);
-            v
-        },
+        kv_page_indptr: indptr(indptr_cap),
         kv_last_page_lens: Vec::with_capacity(req_cap),
-        qo_indptr: {
-            let mut v = Vec::with_capacity(indptr_cap);
-            v.push(0);
-            v
-        },
+        qo_indptr: indptr(indptr_cap),
         rs_slot_ids: Vec::with_capacity(req_cap),
         rs_slot_flags: Vec::with_capacity(req_cap),
         masks: Vec::new(),
-        mask_indptr: {
-            let mut v = Vec::with_capacity(indptr_cap);
-            v.push(0);
-            v
-        },
+        mask_indptr: indptr(indptr_cap),
         logit_masks: Vec::new(),
-        logit_mask_indptr: {
-            let mut v = Vec::with_capacity(indptr_cap);
-            v.push(0);
-            v
-        },
+        logit_mask_indptr: indptr(indptr_cap),
         sampling_indices: Vec::with_capacity(req_cap),
-        sampling_indptr: {
-            let mut v = Vec::with_capacity(indptr_cap);
-            v.push(0);
-            v
-        },
+        sampling_indptr: indptr(indptr_cap),
         samplers: Vec::with_capacity(req_cap),
-        sampler_indptr: {
-            let mut v = Vec::with_capacity(indptr_cap);
-            v.push(0);
-            v
-        },
+        sampler_indptr: indptr(indptr_cap),
         adapter_bindings: Vec::with_capacity(req_cap),
         spec_token_ids: Vec::new(),
         spec_position_ids: Vec::new(),
-        spec_indptr: {
-            let mut v = Vec::with_capacity(indptr_cap);
-            v.push(0);
-            v
-        },
+        spec_indptr: indptr(indptr_cap),
         output_spec_flags: Vec::with_capacity(req_cap),
         context_ids: Vec::with_capacity(req_cap),
         single_token_mode: true,
