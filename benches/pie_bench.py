@@ -690,6 +690,8 @@ async def run(args: argparse.Namespace):
                     ("default.last_batch_latency_us", "last batch latency us"),
                     ("default.bypass_hits", "bypass hits"),
                     ("default.chain_submits", "chain submits"),
+                    ("default.chain_ext_avg_wake_us", "chain ext avg wake us"),
+                    ("default.chain_ext_avg_work_us", "chain ext avg work us"),
                     ("default.chain_drops", "chain drops"),
                     ("default.total_requests_processed", "total requests"),
                     ("default.max_forward_requests_observed", "max forward requests"),

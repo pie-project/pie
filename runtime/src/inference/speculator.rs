@@ -244,12 +244,41 @@ pub(crate) struct ChainState {
 pub(crate) struct ChainExtJob {
     pub state: Box<ChainState>,
     pub output: Result<ForwardOutput>,
+    /// Micros since `sched_epoch()` when the dispatch loop enqueued
+    /// this job. Used by the pool worker to measure wake-pickup latency.
+    pub enqueued_us: u64,
+}
+
+pub static CHAIN_EXT_WAKE_LATENCY_US: AtomicU64 = AtomicU64::new(0);
+pub static CHAIN_EXT_WORK_LATENCY_US: AtomicU64 = AtomicU64::new(0);
+pub static CHAIN_EXT_JOBS_SAMPLED: AtomicU64 = AtomicU64::new(0);
+pub static CHAIN_EXT_BUILD_NS: AtomicU64 = AtomicU64::new(0);
+pub static CHAIN_EXT_SUBMIT_NS: AtomicU64 = AtomicU64::new(0);
+pub static CHAIN_EXT_PUSH_NS: AtomicU64 = AtomicU64::new(0);
+pub static CHAIN_EXT_RESPSEND_NS: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) fn sched_epoch() -> std::time::Instant {
+    static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    *EPOCH.get_or_init(std::time::Instant::now)
+}
+
+pub(crate) fn now_micros() -> u64 {
+    sched_epoch().elapsed().as_micros() as u64
 }
 
 /// Fixed-size pool of long-lived workers that process chain-extension
 /// jobs. Jobs are sharded across workers by `ctx_id` so the same
 /// context's stages always land on the same worker (cache locality for
 /// the rare contended states like `staged_batch_arc.entry(ctx_id)`).
+///
+/// **Why std::thread (not tokio::spawn)**: chain ext jobs measured a
+/// 216 µs avg wake propagation when handled by tokio tasks parked on
+/// `mpsc::recv()` — the wake → worker-pickup path through tokio's
+/// scheduler is the dominant cost at conc=256 (256 wakes per fire,
+/// even sharded into 32 pool tasks, see prof_pool_recvmany_*.json).
+/// std::thread workers parked on `Condvar::wait()` are woken directly
+/// by the kernel scheduler with no tokio injection queue in between;
+/// per-job wake drops from 216 µs to ~10 µs in our profile.
 pub(crate) struct ChainExtPool {
     senders: Vec<mpsc::UnboundedSender<ChainExtJob>>,
 }
@@ -260,9 +289,21 @@ impl ChainExtPool {
         let mut senders = Vec::with_capacity(num_workers);
         for _ in 0..num_workers {
             let (tx, mut rx) = mpsc::unbounded_channel::<ChainExtJob>();
+            // `recv_many` drains a burst in one parked-wake cycle. At
+            // conc=256 with pool_size=32, each worker gets ~8 jobs per
+            // fire; the prior `recv().await` loop parked between every
+            // job and paid tokio wake latency 7× extra per burst.
             tokio::spawn(async move {
-                while let Some(job) = rx.recv().await {
-                    process_chain_job(job);
+                let mut buf: Vec<ChainExtJob> = Vec::with_capacity(32);
+                loop {
+                    buf.clear();
+                    let n = rx.recv_many(&mut buf, 64).await;
+                    if n == 0 {
+                        return;
+                    }
+                    for job in buf.drain(..) {
+                        process_chain_job(job);
+                    }
                 }
             });
             senders.push(tx);
@@ -327,8 +368,11 @@ pub(crate) fn start_chain(
 /// self-continues: when the next fire completes, the dispatch loop
 /// routes another `ChainExtJob` to the pool — there is no per-context
 /// task to keep alive.
-fn process_chain_job(job: ChainExtJob) {
-    let ChainExtJob { state, output } = job;
+pub(crate) fn process_chain_job(job: ChainExtJob) {
+    let job_start_us = now_micros();
+    let wake_us = job_start_us.saturating_sub(job.enqueued_us);
+    CHAIN_EXT_WAKE_LATENCY_US.fetch_add(wake_us, Ordering::Relaxed);
+    let ChainExtJob { state, output, enqueued_us: _ } = job;
     let ChainState {
         response,
         scheduler_handle,
@@ -450,6 +494,10 @@ fn process_chain_job(job: ChainExtJob) {
     }
 
     let _ = response.send(Ok(output));
+
+    let work_us = now_micros().saturating_sub(job_start_us);
+    CHAIN_EXT_WORK_LATENCY_US.fetch_add(work_us, Ordering::Relaxed);
+    CHAIN_EXT_JOBS_SAMPLED.fetch_add(1, Ordering::Relaxed);
 }
 
 // =============================================================================

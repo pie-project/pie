@@ -1626,6 +1626,7 @@ impl BatchScheduler {
                                         pool.submit(ctx_id, super::speculator::ChainExtJob {
                                             state,
                                             output: Ok(output),
+                                            enqueued_us: super::speculator::now_micros(),
                                         });
                                     }
                                     deferred_drop.push((request, physical_page_ids));
@@ -1675,6 +1676,7 @@ impl BatchScheduler {
                                         pool.submit(ctx_id, super::speculator::ChainExtJob {
                                             state,
                                             output: Ok(output),
+                                            enqueued_us: super::speculator::now_micros(),
                                         });
                                     }
                                     deferred_drop.push((request, physical_page_ids));
