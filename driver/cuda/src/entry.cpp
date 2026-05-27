@@ -46,6 +46,7 @@
 #include "kernels/sample_flashinfer.hpp"
 #include "kernels/sample_temp.hpp"
 #include "kv_cache.hpp"
+#include "dsa_cache.hpp"
 #include "mla_cache.hpp"
 #include "model/bound_model.hpp"
 #include "model/gemma2.hpp"
@@ -53,6 +54,7 @@
 #include "model/gemma4.hpp"
 #include "model/gpt_oss.hpp"
 #include "model/deepseek_v4_forward.hpp"
+#include "model/glm5_forward.hpp"
 #include "model/kimi_forward.hpp"
 #include "model/llama_like.hpp"
 #include "model/mixtral.hpp"
@@ -2061,7 +2063,8 @@ int run_impl(int argc,
          || mt == "gemma4" || mt == "gemma4_text"
          || mt == "gemma3n" || mt == "gemma3n_text"
          || mt == "kimi_k2"
-         || mt == "deepseek_v2" || mt == "deepseek_v3" || mt == "deepseek_v4";
+         || mt == "deepseek_v2" || mt == "deepseek_v3" || mt == "deepseek_v4"
+         || mt == "glm_moe_dsa";
         if (!supported) {
             std::cerr << "[pie-driver-cuda] arch '" << mt
                       << "' not yet supported (Qwen 2/3, Llama-3, "
@@ -2090,6 +2093,7 @@ int run_impl(int argc,
     const bool is_qwen3_5_moe_arch = bound_model.is_qwen3_5_moe();
     const bool is_kimi_arch = bound_model.is_kimi();
     const bool is_dsv4_arch = bound_model.is_deepseek_v4();
+    const bool is_glm5_arch = bound_model.is_glm5();
 
     const std::size_t num_layers_bound = bound_model.num_layers();
     if (verbose) {
@@ -2172,7 +2176,7 @@ int run_impl(int argc,
     const CudaMemoryPlan mem_plan = plan_cuda_memory(
         cfg, engine.hf_config(), max_mlp_intermediate, max_Hq, max_Hk,
         is_gemma4_arch, weights_gemma4.per_layer_head_dim,
-        weights_gemma4.kv_source_layer, is_kimi_arch, is_dsv4_arch, is_qwen3_5_arch,
+        weights_gemma4.kv_source_layer, is_kimi_arch || is_glm5_arch, is_dsv4_arch, is_qwen3_5_arch,
         is_qwen3_5_moe_arch, qwen3_5_linear_layers,
         kv_format, runtime_quant_scratch_base, verbose);
     const int max_workspace_tokens = mem_plan.max_workspace_tokens;
@@ -2208,6 +2212,23 @@ int run_impl(int argc,
                   local_tp_size)
             : pie_cuda_driver::model::DsV4Workspace{};
 
+    auto glm5_ws =
+        is_glm5_arch
+            ? pie_cuda_driver::model::Glm5Workspace::allocate(
+                  engine.hf_config(), max_workspace_tokens,
+                  mem_plan.capacity.max_logit_rows,
+                  engine.hf_config().max_position_embeddings,
+                  local_tp_size)
+            : pie_cuda_driver::model::Glm5Workspace{};
+
+    auto dsa_cache =
+        is_glm5_arch
+            ? pie_cuda_driver::DsaCache::allocate(
+                  engine.hf_config().num_hidden_layers,
+                  engine.hf_config().max_position_embeddings,
+                  engine.hf_config().index_head_dim)
+            : pie_cuda_driver::DsaCache{};
+
     auto kv_cache =
         is_dsv4_arch
             ? pie_cuda_driver::KvCache::allocate(
@@ -2217,7 +2238,7 @@ int run_impl(int argc,
                   1,        // num_kv_heads = 1 for V4 MQA
                   engine.hf_config().head_dim,
                   kv_format)
-        : is_kimi_arch
+        : (is_kimi_arch || is_glm5_arch)
             ? pie_cuda_driver::KvCache::allocate(
                   engine.hf_config().num_hidden_layers,
                   physical_kv_pages,
@@ -2244,7 +2265,7 @@ int run_impl(int argc,
                   kv_format);
 
     auto mla_cache =
-        is_kimi_arch
+        (is_kimi_arch || is_glm5_arch)
             ? pie_cuda_driver::MlaCache::allocate(
                   engine.hf_config().num_hidden_layers,
                   physical_kv_pages,
@@ -2746,6 +2767,66 @@ int run_impl(int argc,
             pie_cuda_driver::model::kimi_forward_paged(
                 weights_kimi, engine.hf_config(), kimi_fwd, kimi_plan,
                 kimi_ws, mla_cache, attn_ws, cublas,
+                ws.logits.data(),
+                tok, pos,
+                qo_indptr, kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                qo_indptr_h, kv_page_indptr_h,
+                N, R, is_pure_decode,
+                logit_row_indices_d, num_logit_rows);
+        };
+    } else if (is_glm5_arch) {
+        const auto& weights_glm5 = bound_model.glm5;
+        const int glm5_tp_size = cfg.distributed.tp_size;
+        const bool glm5_emit_logits = cfg.distributed.tp_rank == 0;
+        pie_cuda_driver::NcclComm* glm5_tp_comm = tp_comm_ptr;
+        forward_fn.supports_compact_logits = true;
+        pie_cuda_driver::model::KimiPlanState glm5_mla_plan;
+        forward_fn.prepare = [&engine, &mla_cache, &glm5_mla_plan, glm5_tp_size](
+            pie_cuda_driver::AttentionWorkspace& attn_ws,
+            const pie_cuda_driver::ForwardFn::PrepareInputs& prep) {
+            pie_cuda_driver::model::prepare_kimi_mla_plan(
+                glm5_mla_plan, attn_ws, mla_cache, engine.hf_config(),
+                prep.kv_page_indices_d,
+                prep.qo_indptr_h,
+                prep.kv_page_indptr_h,
+                prep.kv_page_indptr_d,
+                prep.kv_last_page_lens_h,
+                prep.kv_last_page_lens_d,
+                prep.total_tokens,
+                prep.num_requests,
+                !prep.is_pure_decode,
+                glm5_tp_size);
+        };
+        forward_fn.body = [&engine, &weights_glm5, &glm5_ws, &mla_cache,
+                           &dsa_cache, &glm5_mla_plan, glm5_tp_size, glm5_tp_comm,
+                           glm5_emit_logits](
+            pie_cuda_driver::model::Qwen3Workspace& ws,
+            pie_cuda_driver::KvCache& cache,
+            pie_cuda_driver::AttentionWorkspace& attn_ws,
+            pie_cuda_driver::ops::CublasHandle& cublas,
+            const std::int32_t* tok, const std::int32_t* pos,
+            const std::uint32_t* qo_indptr,
+            const std::uint32_t* kv_page_indices,
+            const std::uint32_t* kv_page_indptr,
+            const std::uint32_t* kv_last_page_lens,
+            const std::uint32_t* qo_indptr_h,
+            const std::uint32_t* kv_page_indptr_h,
+            int N, int R, bool is_pure_decode,
+            const std::uint8_t* mask_d, const std::int32_t* mask_indptr_d,
+            const std::int32_t* slot_ids_h, const std::uint8_t* is_fresh_h,
+            const std::int32_t* slot_ids_d,
+            const std::int32_t* logit_row_indices_d,
+            int num_logit_rows,
+            bool /*tp_greedy_argmax*/) {
+            (void)ws; (void)cache; (void)mask_d; (void)mask_indptr_d;
+            (void)slot_ids_h; (void)is_fresh_h; (void)slot_ids_d;
+            pie_cuda_driver::model::Glm5ForwardCfg glm5_fwd{};
+            glm5_fwd.tp_size = glm5_tp_size;
+            glm5_fwd.tp_comm = glm5_tp_comm;
+            glm5_fwd.emit_logits = glm5_emit_logits;
+            pie_cuda_driver::model::glm5_forward_paged(
+                weights_glm5, engine.hf_config(), glm5_fwd, glm5_mla_plan,
+                glm5_ws, mla_cache, dsa_cache, attn_ws, cublas,
                 ws.logits.data(),
                 tok, pos,
                 qo_indptr, kv_page_indices, kv_page_indptr, kv_last_page_lens,

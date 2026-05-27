@@ -88,7 +88,7 @@ HfConfig parse_hf_config(const std::filesystem::path& path) {
     cfg.qk_rope_head_dim         = optional<int>(j, "qk_rope_head_dim", 0);
     cfg.v_head_dim               = optional<int>(j, "v_head_dim", 0);
     if ((cfg.model_type == "kimi_k2" || cfg.model_type == "deepseek_v2" ||
-         cfg.model_type == "deepseek_v3") &&
+         cfg.model_type == "deepseek_v3" || cfg.model_type == "glm_moe_dsa") &&
         cfg.qk_nope_head_dim > 0 && cfg.qk_rope_head_dim > 0) {
         // MLA attention has a query/key width that is independent from the
         // value width and from hidden_size / num_heads. Keep `head_dim` as
@@ -395,6 +395,24 @@ HfConfig parse_hf_config(const std::filesystem::path& path) {
         j["activation_sparsity_pattern"].is_array()) {
         for (const auto& v : j["activation_sparsity_pattern"]) {
             cfg.gemma3n_activation_sparsity.push_back(v.get<float>());
+        }
+    }
+
+    // GLM-5.1 DSA indexer fields. Inert (zero/empty) on every other model.
+    cfg.index_topk     = optional<int>(j, "index_topk", 0);
+    cfg.index_head_dim = optional<int>(j, "index_head_dim", 0);
+    cfg.index_n_heads  = optional<int>(j, "index_n_heads", 0);
+    if (j.contains("indexer_types") && j["indexer_types"].is_array()) {
+        for (const auto& v : j["indexer_types"]) {
+            cfg.indexer_types.push_back(v.get<std::string>());
+        }
+    } else if (cfg.index_topk > 0 && cfg.num_hidden_layers > 0) {
+        const int freq = optional<int>(j, "index_topk_freq", 1);
+        cfg.indexer_types.reserve(
+            static_cast<std::size_t>(cfg.num_hidden_layers));
+        for (int i = 0; i < cfg.num_hidden_layers; ++i) {
+            const bool is_full = (std::max(i - 1, 0) % freq) == 0;
+            cfg.indexer_types.push_back(is_full ? "full" : "shared");
         }
     }
 

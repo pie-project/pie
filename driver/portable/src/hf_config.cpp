@@ -27,6 +27,7 @@ const char* pie_arch_name(PieArch a) {
         case PieArch::Qwen3_5:  return "qwen3_5";
         case PieArch::Phi3Small: return "phi3small";
         case PieArch::Phi3_5Moe: return "phi3_5moe";
+        case PieArch::GlmMoeDsa: return "glm_moe_dsa";
     }
     return "?";
 }
@@ -59,6 +60,7 @@ PieArch hf_model_type_to_pie_arch(const std::string& hf_model_type) {
         hf_model_type == "qwen3_5_text" ||
         hf_model_type == "qwen3_5_moe" ||
         hf_model_type == "qwen3_5_moe_text") return PieArch::Qwen3_5;
+    if (hf_model_type == "glm_moe_dsa") return PieArch::GlmMoeDsa;
     throw std::runtime_error(
         "hf_config: unsupported model_type '" + hf_model_type + "'");
 }

@@ -236,6 +236,16 @@ struct HfConfig {
     std::vector<int>   gemma3n_per_layer_intermediate;
     std::vector<float> gemma3n_activation_sparsity;
 
+    // ── GLM-5.1 DSA (Differential Sparse Attention) indexer ────────
+    // Per-layer indexer selects top-k tokens for sparse attention.
+    // Zero/empty on non-GLM models.
+    int index_topk = 0;         // 2048 on GLM-5.1
+    int index_head_dim = 0;     // 128 on GLM-5.1
+    int index_n_heads = 0;      // 32 on GLM-5.1
+    // Per-layer indexer type: "full" (computes indices from scratch)
+    // or "shared" (reuses previous layer's indices). Empty on non-GLM.
+    std::vector<std::string> indexer_types;
+
     // ── Storage dtype as declared on disk (for the safetensors loader).
     std::string torch_dtype;   // "bfloat16", "float16", "float32".
 

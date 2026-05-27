@@ -126,6 +126,14 @@ pub fn create(arch_name: &str, tokenizer: Arc<Tokenizer>) -> Arc<dyn Instruct> {
         "llama3" | "l4ma" => Arc::new(self::llama3::LlamaInstruct::new(tokenizer)),
         "r1" | "deepseek_v3" | "deepseek_v4" => Arc::new(self::r1::R1Instruct::new(tokenizer)),
         "kimi_k2" | "kimi_k25" => Arc::new(self::kimi::KimiInstruct::new(tokenizer)),
+        "glm_moe_dsa" => Arc::new(QwenInstruct::new(
+            tokenizer,
+            ChatMLConfig {
+                has_thinking: true,
+                has_tools: true,
+                stop_tokens: &["<|im_end|>", "<|endoftext|>", "<|user|>", "<|assistant|>"],
+            },
+        )),
         "gptoss" | "gpt_oss" => Arc::new(self::gptoss::GptOssInstruct::new(tokenizer)),
         // Gemma-3n shares the multi-piece `<start_of_turn>` /
         // `<end_of_turn>` chat template with Gemma 2/3 (Gemma 4

@@ -38,7 +38,8 @@ bool supports_tp(const std::string& mt) {
         || mt == "qwen3_5_moe" || mt == "qwen3_5_moe_text"
         || mt == "qwen3_moe"
         || mt == "kimi_k2"
-        || mt == "deepseek_v2" || mt == "deepseek_v3" || mt == "deepseek_v4";
+        || mt == "deepseek_v2" || mt == "deepseek_v3" || mt == "deepseek_v4"
+        || mt == "glm_moe_dsa";
 }
 
 // True for any MoE model whose forward path lives in qwen3_5_moe_forward.
@@ -197,7 +198,8 @@ LoadedModel LoadedModel::load(const Config& boot_cfg, NcclComm* tp_comm) {
         // intermediate_size` for the 3.5/3.6 family — Qwen3-MoE has no
         // shared expert).
         const bool is_kimi_k2 = hf.model_type == "kimi_k2"
-            || hf.model_type == "deepseek_v2" || hf.model_type == "deepseek_v3";
+            || hf.model_type == "deepseek_v2" || hf.model_type == "deepseek_v3"
+            || hf.model_type == "glm_moe_dsa";
         const bool is_dsv4 = hf.model_type == "deepseek_v4";
         const bool is_q35_moe = is_qwen3_5_moe_arch(hf.model_type);
         if (!is_q35_moe && !is_kimi_k2 && !is_dsv4) {

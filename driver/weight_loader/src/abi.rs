@@ -1473,6 +1473,7 @@ fn runtime_quant_model_supported(model_type: &str) -> bool {
     matches!(
         model_type,
         "qwen3" | "qwen2" | "llama" | "llama3" | "mistral" | "qwen3_5" | "qwen3_5_text"
+            | "glm_moe_dsa"
     )
 }
 
@@ -1484,11 +1485,21 @@ fn runtime_quantizable_name(name: &str) -> bool {
             ".self_attn.k_proj.weight",
             ".self_attn.v_proj.weight",
             ".self_attn.o_proj.weight",
+            ".self_attn.q_a_proj.weight",
+            ".self_attn.q_b_proj.weight",
+            ".self_attn.kv_a_proj_with_mqa.weight",
+            ".self_attn.kv_b_proj.weight",
+            ".self_attn.o_proj.weight",
             ".mlp.gate_proj.weight",
             ".mlp.up_proj.weight",
             ".mlp.down_proj.weight",
         ],
-    )
+    ) || is_glm_expert_weight(name)
+}
+
+fn is_glm_expert_weight(name: &str) -> bool {
+    (name.contains(".mlp.experts.") || name.contains(".mlp.shared_experts."))
+        && ends_with_any(name, &[".gate_proj.weight", ".up_proj.weight", ".down_proj.weight"])
 }
 
 fn dsv4_shard_axis(name: &str) -> Option<Axis> {

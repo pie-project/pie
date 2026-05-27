@@ -124,6 +124,9 @@ add_library(pie_driver_cuda_lib STATIC
   src/model/kimi_forward.cpp
   src/model/deepseek_v4.cpp
   src/model/deepseek_v4_forward.cpp
+  src/model/glm5.cpp
+  src/model/glm5_forward.cpp
+  src/dsa_cache.cpp
   src/model/qwen3_5.cpp
   src/kv_cache_format.cpp
   src/kv_cache.cpp
@@ -149,6 +152,7 @@ add_library(pie_driver_cuda_lib STATIC
   src/kernels/dsv4_routing.cu
   src/kernels/dsv4_hc.cu
   src/kernels/dsv4_compress.cu
+  src/kernels/dsa_indexer.cu
   src/kernels/sample_temp.cu
   src/kernels/sample_flashinfer.cu
   src/kernels/entropy.cu

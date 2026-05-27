@@ -5,6 +5,7 @@
 #include "model/gemma2.hpp"
 #include "model/gemma3n.hpp"
 #include "model/gemma4.hpp"
+#include "model/glm5.hpp"
 #include "model/gpt_oss.hpp"
 #include "model/deepseek_v4.hpp"
 #include "model/kimi.hpp"
@@ -27,6 +28,7 @@ struct BoundCudaModel {
         Qwen3_5Moe,
         Kimi,
         DeepSeekV4,
+        Glm5,
     };
 
     Kind kind = Kind::LlamaLike;
@@ -40,6 +42,7 @@ struct BoundCudaModel {
     Qwen3_5MoeWeights qwen3_5_moe;
     KimiWeights kimi;
     DsV4Weights deepseek_v4;
+    Glm5Weights glm5;
 
     bool is_gemma() const noexcept { return kind == Kind::Gemma; }
     bool is_gemma4() const noexcept { return kind == Kind::Gemma4; }
@@ -49,6 +52,7 @@ struct BoundCudaModel {
     bool is_qwen3_5_moe() const noexcept { return kind == Kind::Qwen3_5Moe; }
     bool is_kimi() const noexcept { return kind == Kind::Kimi; }
     bool is_deepseek_v4() const noexcept { return kind == Kind::DeepSeekV4; }
+    bool is_glm5() const noexcept { return kind == Kind::Glm5; }
     bool is_llama_like() const noexcept { return kind == Kind::LlamaLike; }
 
     std::size_t num_layers() const noexcept;
