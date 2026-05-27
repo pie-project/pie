@@ -1176,15 +1176,35 @@ impl BatchScheduler {
                 policy.on_complete(latency);
             }
 
-            // Wait for first request if batch is empty
+            // Wait for first request if batch is empty. The main loop
+            // runs on a dedicated single-thread runtime, so a tight
+            // try_recv + yield_now loop here doesn't deprive other work
+            // of CPU — it just avoids the ~100-200 µs park→wake
+            // roundtrip that mpsc::recv().await would otherwise pay
+            // between fires.
             while batch.is_empty() {
                 let pending = if let Some(pending) = next_pending.take() {
                     pending
                 } else {
-                    let Some(pending) = req_rx.recv().await else {
-                        break 'run_loop;
-                    };
-                    pending
+                    let mut got: Option<PendingRequest> = None;
+                    loop {
+                        match req_rx.try_recv() {
+                            Ok(p) => {
+                                got = Some(p);
+                                break;
+                            }
+                            Err(mpsc::error::TryRecvError::Empty) => {
+                                tokio::task::yield_now().await;
+                            }
+                            Err(mpsc::error::TryRecvError::Disconnected) => {
+                                break;
+                            }
+                        }
+                    }
+                    match got {
+                        Some(p) => p,
+                        None => break 'run_loop,
+                    }
                 };
                 let Some(pending) = prepare_pending_for_batch(&batch, pending) else {
                     continue;

@@ -290,9 +290,11 @@ impl ChainExtPool {
         for _ in 0..num_workers {
             let (tx, mut rx) = mpsc::unbounded_channel::<ChainExtJob>();
             // `recv_many` drains a burst in one parked-wake cycle. At
-            // conc=256 with pool_size=32, each worker gets ~8 jobs per
-            // fire; the prior `recv().await` loop parked between every
-            // job and paid tokio wake latency 7× extra per burst.
+            // conc=256 with pool_size=30, each worker gets ~8-9 jobs
+            // per fire; the prior `recv().await` loop parked between
+            // every job and paid tokio wake latency 7× extra per
+            // burst. Pool tasks deliberately run on the main shared
+            // runtime so work-stealing balances bursty load.
             tokio::spawn(async move {
                 let mut buf: Vec<ChainExtJob> = Vec::with_capacity(32);
                 loop {
