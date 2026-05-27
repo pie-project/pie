@@ -88,8 +88,9 @@ default = []
 # Adding a new domain: define `src/probe/<domain>.rs` with its probe-holder
 # struct + `probe_<domain>!` macro pair, then add a feature flag here.
 profile-fire = []          # per-fire scheduler lifecycle (90×/sec at conc=256)
-profile-hot-path = ["profile-fire"]  # convenience bundle for hot-path work
-profile-all = ["profile-fire"]       # everything
+profile-driver-cuda = []   # driver_fire phase breakdown (Rust IPC + C++ host)
+profile-hot-path = ["profile-fire", "profile-driver-cuda"]  # convenience bundle
+profile-all = ["profile-fire", "profile-driver-cuda"]       # everything
 
 [dev-dependencies]
 tempfile = "3"

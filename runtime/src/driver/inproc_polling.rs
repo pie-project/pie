@@ -312,19 +312,30 @@ impl InProcPollingState {
         let slot = &self.slots[slot_idx];
         let mut deadline = None;
         let mut iters = 0u32;
+        // Phase: gpu_wait. Spinning/parking on the response slot
+        // generation until the driver writes a fresh value. Most of
+        // each fire's wall time lives here — it covers the C++ side's
+        // entire handle_fire_batch (host phases + GPU compute).
+        let wait_start = std::time::Instant::now();
         while slot.response_generation.load(Ordering::Acquire) != generation {
             self.spin_or_yield(&mut iters, &mut deadline);
         }
+        crate::probe::driver_cuda::record_gpu_wait(wait_start.elapsed());
 
+        // Phase: ipc_recv. Reading the result out of the slot +
+        // returning the slot to the free pool. Typically a few µs.
+        let recv_start = std::time::Instant::now();
         let state = slot.state.load(Ordering::Acquire);
         let result = unsafe { slot.take_result() };
         if state == SLOT_ABORTED_IN_DRIVER || state == SLOT_ABORTED_DRIVER_DONE {
+            crate::probe::driver_cuda::record_ipc_recv(recv_start.elapsed());
             return self.finish_waiter_after_abort(slot_idx, state, result);
         }
 
         unsafe { slot.reset_after_result_consumed() };
         slot.state.store(SLOT_FREE, Ordering::Release);
         self.push_free(slot_idx);
+        crate::probe::driver_cuda::record_ipc_recv(recv_start.elapsed());
         result
     }
 
@@ -505,8 +516,16 @@ impl InProcPollingChannel {
         state: &InProcPollingState,
         req: DriverRequest,
     ) -> Result<DriverResponse> {
+        // Phase: ipc_submit. Enqueueing the request into the polling
+        // ring buffer (slot allocation + payload write + driver wake).
+        let submit_start = std::time::Instant::now();
         let (slot, req_id) = state.enqueue(req, true)?;
+        crate::probe::driver_cuda::record_ipc_submit(submit_start.elapsed());
+
         let generation = req_id >> SLOT_BITS;
+        // `wait_response` itself splits its body into `gpu_wait`
+        // (parking on the response slot) and `ipc_recv` (taking the
+        // result + slot cleanup).
         state.wait_response(slot, generation)
     }
 }

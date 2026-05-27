@@ -131,8 +131,40 @@ impl Session {
                         serde_json::Value::from(inf.fire.execute.avg_driver_fire_us),
                     );
                     stats.insert(
-                        format!("{}.fire.execute.response_dispatch_us", model_name),
-                        serde_json::Value::from(inf.fire.execute.avg_response_dispatch_us),
+                        format!("{}.fire.execute.response_dispatch.total_us", model_name),
+                        serde_json::Value::from(inf.fire.execute.response_dispatch.avg_total_us),
+                    );
+                    stats.insert(
+                        format!("{}.fire.execute.response_dispatch.direct_count", model_name),
+                        serde_json::Value::from(inf.fire.execute.response_dispatch.direct_count),
+                    );
+                    stats.insert(
+                        format!("{}.fire.execute.response_dispatch.chain_count", model_name),
+                        serde_json::Value::from(inf.fire.execute.response_dispatch.chain_count),
+                    );
+                    stats.insert(
+                        format!("{}.fire.execute.response_dispatch.chunk_count", model_name),
+                        serde_json::Value::from(inf.fire.execute.response_dispatch.chunk_count),
+                    );
+                    // Driver-cuda phase breakdown. All-zero when built
+                    // without `profile-driver-cuda`. C++-side probes
+                    // (wire_parse through response_build) are zero until
+                    // the C++ instrumentation commit wires them.
+                    stats.insert(
+                        format!("{}.fire.execute.driver_cuda.ipc_submit_us", model_name),
+                        serde_json::Value::from(inf.fire.execute.driver_cuda.avg_ipc_submit_us),
+                    );
+                    stats.insert(
+                        format!("{}.fire.execute.driver_cuda.gpu_wait_us", model_name),
+                        serde_json::Value::from(inf.fire.execute.driver_cuda.avg_gpu_wait_us),
+                    );
+                    stats.insert(
+                        format!("{}.fire.execute.driver_cuda.ipc_recv_us", model_name),
+                        serde_json::Value::from(inf.fire.execute.driver_cuda.avg_ipc_recv_us),
+                    );
+                    stats.insert(
+                        format!("{}.fire.execute.driver_cuda.sync_us", model_name),
+                        serde_json::Value::from(inf.fire.execute.driver_cuda.avg_sync_us),
                     );
                     stats.insert(
                         format!("{}.fire.post_dispatch.context_tick_us", model_name),

@@ -115,6 +115,14 @@ pub struct SchedulerStats {
     // disappears when the feature is off. The struct itself is always
     // defined so callers and readers compile uniformly.
     pub fire: crate::probe::fire::FireProbes,
+
+    // ── Driver-fire phase breakdown (gated behind `profile-driver-cuda`). ──
+    //
+    // Decomposes the `fire.execute.driver_fire_us` bucket into Rust
+    // (ipc_submit / gpu_wait / ipc_recv) and C++ host phases (wire_parse
+    // / plan / h2d / kernel_launch / sync / response_build). See
+    // `crate::probe::driver_cuda` for the plumbing.
+    pub driver_cuda: crate::probe::driver_cuda::DriverCudaProbes,
 }
 
 /// Out-of-band data execute_batch reports back to the run loop. Per-fire
@@ -1578,13 +1586,40 @@ impl BatchScheduler {
         // suspension points. Since the scheduler is the only firer,
         // there's also no in-flight gate to release.
         let result = crate::probe_fire!(stats.fire.execute.driver_fire_us, {
-            driver::fire_batch_sync(driver_idx, batch_req)
+            let r = driver::fire_batch_sync(driver_idx, batch_req);
+            // Drain the per-call IPC-phase timings recorded by the
+            // channel into driver_cuda atomics. With `profile-driver-cuda`
+            // off, the `take_*` calls return 0 and `fetch_add(0)` is a
+            // no-op — same compiled output as if these lines weren't here.
+            let ipc_submit_us = crate::probe::driver_cuda::take_ipc_submit_us();
+            let gpu_wait_us = crate::probe::driver_cuda::take_gpu_wait_us();
+            let ipc_recv_us = crate::probe::driver_cuda::take_ipc_recv_us();
+            if ipc_submit_us > 0 {
+                stats
+                    .driver_cuda
+                    .ipc_submit_us
+                    .fetch_add(ipc_submit_us, Relaxed);
+            }
+            if gpu_wait_us > 0 {
+                stats.driver_cuda.gpu_wait_us.fetch_add(gpu_wait_us, Relaxed);
+            }
+            if ipc_recv_us > 0 {
+                stats.driver_cuda.ipc_recv_us.fetch_add(ipc_recv_us, Relaxed);
+            }
+            r
         });
 
         // Response dispatch: per-request oneshot fires, chain-pool submits,
         // and queueing the deferred_drop Vec. Probe scope ends at the
         // close of the `match result { ... }` block below.
+        //
+        // Per-completion-type counts are accumulated into these locals
+        // inside the match arms and fetch_add'd once after the loop, so
+        // we don't pay a per-request atomic op on the hot path.
         let response_dispatch_start = Instant::now();
+        let mut direct_count: u64 = 0;
+        let mut chain_count: u64 = 0;
+        let mut chunk_count: u64 = 0;
         match result {
             Ok(batch_resp) => {
                 let n_results = batch_resp.num_requests as usize;
@@ -1658,10 +1693,12 @@ impl BatchScheduler {
                             } = req;
                             match completion {
                                 Completion::Direct(tx) => {
+                                    direct_count += 1;
                                     tx.send(Ok(output)).ok();
                                     deferred_drop.push((request, physical_page_ids));
                                 }
                                 Completion::Chunk { .. } => {
+                                    chunk_count += 1;
                                     let req = PendingRequest {
                                         request,
                                         completion,
@@ -1671,6 +1708,7 @@ impl BatchScheduler {
                                     req.send_result(Ok(output), submit_tx.as_ref(), page_size);
                                 }
                                 Completion::Chain { state } => {
+                                    chain_count += 1;
                                     if let Some(pool) = chain_pool.as_ref() {
                                         let ctx_id = state.prev_request.context_ids
                                             .first().copied().unwrap_or(0);
@@ -1708,10 +1746,12 @@ impl BatchScheduler {
                             } = req;
                             match completion {
                                 Completion::Direct(tx) => {
+                                    direct_count += 1;
                                     tx.send(Ok(output)).ok();
                                     deferred_drop.push((request, physical_page_ids));
                                 }
                                 Completion::Chunk { .. } => {
+                                    chunk_count += 1;
                                     let req = PendingRequest {
                                         request,
                                         completion,
@@ -1721,6 +1761,7 @@ impl BatchScheduler {
                                     req.send_result(Ok(output), submit_tx.as_ref(), page_size);
                                 }
                                 Completion::Chain { state } => {
+                                    chain_count += 1;
                                     if let Some(pool) = chain_pool.as_ref() {
                                         let ctx_id = state.prev_request.context_ids
                                             .first().copied().unwrap_or(0);
@@ -1762,9 +1803,36 @@ impl BatchScheduler {
             }
         }
         crate::probe_fire_record!(
-            stats.fire.execute.response_dispatch_us,
+            stats.fire.execute.response_dispatch.total_us,
             response_dispatch_start.elapsed()
         );
+        // Per-completion-type counts. Counters, not durations — three
+        // atomic ops per fire regardless of batch size, so always-on
+        // (no feature gate).
+        if direct_count > 0 {
+            stats
+                .fire
+                .execute
+                .response_dispatch
+                .direct_count
+                .fetch_add(direct_count, Relaxed);
+        }
+        if chain_count > 0 {
+            stats
+                .fire
+                .execute
+                .response_dispatch
+                .chain_count
+                .fetch_add(chain_count, Relaxed);
+        }
+        if chunk_count > 0 {
+            stats
+                .fire
+                .execute
+                .response_dispatch
+                .chunk_count
+                .fetch_add(chunk_count, Relaxed);
+        }
         BatchExecutionTiming {
             system_spec_draft_tokens_proposed,
             system_spec_draft_tokens_accepted,

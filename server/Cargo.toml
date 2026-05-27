@@ -34,6 +34,7 @@ driver-dummy = []
 # Per-domain probe passthroughs. Each forwards to the runtime crate's
 # corresponding flag. See `pie/src/probe/` for the catalog of domains.
 profile-fire = ["pie/profile-fire"]
+profile-driver-cuda = ["pie/profile-driver-cuda"]
 profile-hot-path = ["pie/profile-hot-path"]
 profile-all = ["pie/profile-all"]
 

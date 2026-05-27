@@ -86,7 +86,8 @@ pub struct PreDispatchProbes {
 #[derive(Debug, Default)]
 pub struct ExecuteProbes {
     /// Total wall time of `BatchScheduler::execute_batch`. Should
-    /// equal the sum of children below within ~µs.
+    /// equal `batch_build_us + driver_fire_us + response_dispatch.total_us`
+    /// within ~µs.
     pub total_us: AtomicU64,
 
     /// Time spent folding per-request `ForwardRequest`s into one
@@ -94,16 +95,43 @@ pub struct ExecuteProbes {
     pub batch_build_us: AtomicU64,
 
     /// IPC submit + GPU compute + response sync. The bulk of every
-    /// fire (~10 ms at conc=256). On the C++ side this further
-    /// decomposes into wire-parse / plan / kernel / sync — those
-    /// probes belong to a `driver::cuda` profile group, not here.
+    /// fire (~10 ms at conc=256). Further decomposed by the
+    /// `driver_cuda` probe domain into `ipc_submit / gpu_wait /
+    /// ipc_recv` (Rust-side) and `wire_parse / plan / h2d /
+    /// kernel_launch / sync / response_build` (C++-side, filled via
+    /// the response payload).
     pub driver_fire_us: AtomicU64,
 
     /// Per-request response handling — oneshot fires (`Direct`),
     /// chain-extender submits (`Chain`), chunked-retry routes
     /// (`Chunk`), and queueing the `deferred_drop` Vec for the
-    /// blocking pool.
-    pub response_dispatch_us: AtomicU64,
+    /// blocking pool. Sub-structured by completion type.
+    pub response_dispatch: ResponseDispatchProbes,
+}
+
+/// Response-dispatch sub-probes. `total_us` is the wall time of the
+/// response-dispatch loop; the `*_count` fields are counters (not
+/// durations) recording the workload mix per fire.
+///
+/// We deliberately don't time each completion-type arm separately —
+/// each `oneshot::Sender::send` and `pool.submit` call is ~50-100 ns,
+/// and probe overhead at that granularity would dwarf the work. The
+/// counts let us reason about workload shape (`chain_count / fire =
+/// concurrency` at steady state) without per-call probe cost.
+#[derive(Debug, Default)]
+pub struct ResponseDispatchProbes {
+    /// Wall time of the entire response-dispatch loop.
+    pub total_us: AtomicU64,
+    /// Number of `Completion::Direct` arms taken per fire (sum across
+    /// all fires; divide by `total_batches` for per-fire mean).
+    pub direct_count: AtomicU64,
+    /// Number of `Completion::Chain` arms taken (chain-extender pool
+    /// submissions). At conc=256 with chain ext active, this equals
+    /// the batch size every fire.
+    pub chain_count: AtomicU64,
+    /// Number of `Completion::Chunk` arms taken (chunked-retry
+    /// continuations). Rare in the hot path.
+    pub chunk_count: AtomicU64,
 }
 
 /// Probes after execute returns, while the scheduler thread is doing

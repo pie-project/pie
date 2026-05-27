@@ -95,7 +95,29 @@ pub struct ExecuteStats {
     pub avg_total_us: u64,
     pub avg_batch_build_us: u64,
     pub avg_driver_fire_us: u64,
-    pub avg_response_dispatch_us: u64,
+    pub response_dispatch: ResponseDispatchStats,
+    pub driver_cuda: DriverCudaStats,
+}
+
+#[derive(Debug, Default, serde::Serialize)]
+pub struct ResponseDispatchStats {
+    pub avg_total_us: u64,
+    pub direct_count: u64,
+    pub chain_count: u64,
+    pub chunk_count: u64,
+}
+
+#[derive(Debug, Default, serde::Serialize)]
+pub struct DriverCudaStats {
+    pub avg_ipc_submit_us: u64,
+    pub avg_gpu_wait_us: u64,
+    pub avg_ipc_recv_us: u64,
+    pub avg_wire_parse_us: u64,
+    pub avg_plan_us: u64,
+    pub avg_h2d_us: u64,
+    pub avg_kernel_launch_us: u64,
+    pub avg_sync_us: u64,
+    pub avg_response_build_us: u64,
 }
 
 #[derive(Debug, Default, serde::Serialize)]
@@ -349,7 +371,19 @@ impl InferenceService {
         let mut fire_execute_total = 0u64;
         let mut fire_execute_batch_build = 0u64;
         let mut fire_execute_driver_fire = 0u64;
-        let mut fire_execute_response_dispatch = 0u64;
+        let mut fire_execute_response_dispatch_total = 0u64;
+        let mut fire_execute_response_dispatch_direct = 0u64;
+        let mut fire_execute_response_dispatch_chain = 0u64;
+        let mut fire_execute_response_dispatch_chunk = 0u64;
+        let mut dc_ipc_submit = 0u64;
+        let mut dc_gpu_wait = 0u64;
+        let mut dc_ipc_recv = 0u64;
+        let mut dc_wire_parse = 0u64;
+        let mut dc_plan = 0u64;
+        let mut dc_h2d = 0u64;
+        let mut dc_kernel_launch = 0u64;
+        let mut dc_sync = 0u64;
+        let mut dc_response_build = 0u64;
         let mut fire_post_dispatch_context_tick = 0u64;
         let mut fire_post_dispatch_stats_update = 0u64;
         let mut system_spec_draft_tokens_proposed = 0u64;
@@ -378,7 +412,20 @@ impl InferenceService {
             fire_execute_total += f.execute.total_us.load(Relaxed);
             fire_execute_batch_build += f.execute.batch_build_us.load(Relaxed);
             fire_execute_driver_fire += f.execute.driver_fire_us.load(Relaxed);
-            fire_execute_response_dispatch += f.execute.response_dispatch_us.load(Relaxed);
+            fire_execute_response_dispatch_total += f.execute.response_dispatch.total_us.load(Relaxed);
+            fire_execute_response_dispatch_direct += f.execute.response_dispatch.direct_count.load(Relaxed);
+            fire_execute_response_dispatch_chain += f.execute.response_dispatch.chain_count.load(Relaxed);
+            fire_execute_response_dispatch_chunk += f.execute.response_dispatch.chunk_count.load(Relaxed);
+            let dc = &s.driver_cuda;
+            dc_ipc_submit += dc.ipc_submit_us.load(Relaxed);
+            dc_gpu_wait += dc.gpu_wait_us.load(Relaxed);
+            dc_ipc_recv += dc.ipc_recv_us.load(Relaxed);
+            dc_wire_parse += dc.wire_parse_us.load(Relaxed);
+            dc_plan += dc.plan_us.load(Relaxed);
+            dc_h2d += dc.h2d_us.load(Relaxed);
+            dc_kernel_launch += dc.kernel_launch_us.load(Relaxed);
+            dc_sync += dc.sync_us.load(Relaxed);
+            dc_response_build += dc.response_build_us.load(Relaxed);
             fire_post_dispatch_context_tick += f.post_dispatch.context_tick_us.load(Relaxed);
             fire_post_dispatch_stats_update += f.post_dispatch.stats_update_us.load(Relaxed);
             system_spec_draft_tokens_proposed += s.system_spec_draft_tokens_proposed.load(Relaxed);
@@ -436,7 +483,23 @@ impl InferenceService {
                     avg_total_us: avg(fire_execute_total),
                     avg_batch_build_us: avg(fire_execute_batch_build),
                     avg_driver_fire_us: avg(fire_execute_driver_fire),
-                    avg_response_dispatch_us: avg(fire_execute_response_dispatch),
+                    response_dispatch: ResponseDispatchStats {
+                        avg_total_us: avg(fire_execute_response_dispatch_total),
+                        direct_count: fire_execute_response_dispatch_direct,
+                        chain_count: fire_execute_response_dispatch_chain,
+                        chunk_count: fire_execute_response_dispatch_chunk,
+                    },
+                    driver_cuda: DriverCudaStats {
+                        avg_ipc_submit_us: avg(dc_ipc_submit),
+                        avg_gpu_wait_us: avg(dc_gpu_wait),
+                        avg_ipc_recv_us: avg(dc_ipc_recv),
+                        avg_wire_parse_us: avg(dc_wire_parse),
+                        avg_plan_us: avg(dc_plan),
+                        avg_h2d_us: avg(dc_h2d),
+                        avg_kernel_launch_us: avg(dc_kernel_launch),
+                        avg_sync_us: avg(dc_sync),
+                        avg_response_build_us: avg(dc_response_build),
+                    },
                 },
                 post_dispatch: PostDispatchStats {
                     avg_context_tick_us: avg(fire_post_dispatch_context_tick),
