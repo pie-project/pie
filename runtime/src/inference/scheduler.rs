@@ -28,6 +28,15 @@ fn scheduler_trace_enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var_os("PIE_SCHED_TRACE").is_some())
 }
 
+fn sched_epoch() -> Instant {
+    static EPOCH: OnceLock<Instant> = OnceLock::new();
+    *EPOCH.get_or_init(Instant::now)
+}
+
+fn now_micros() -> u64 {
+    sched_epoch().elapsed().as_micros() as u64
+}
+
 // =============================================================================
 // Scheduling Policy Trait
 // =============================================================================
@@ -99,6 +108,22 @@ pub struct SchedulerStats {
     pub cumulative_response_dispatch_us: AtomicU64,
     pub cumulative_context_tick_submit_us: AtomicU64,
     pub cumulative_stats_update_us: AtomicU64,
+    /// Time between consecutive `tokio::spawn(execute_batch)` calls.
+    /// Sum is excluding the first batch; divide by (total_batches-1) for mean.
+    pub cumulative_inter_fire_us: AtomicU64,
+    /// Time from end of response dispatch (fire N) to spawn of fire N+1.
+    /// This is the "rendezvous gap": chain extender wake + main loop drain
+    /// + cohort fill.
+    pub cumulative_post_dispatch_to_fire_us: AtomicU64,
+    /// Time spent in the main run loop's non-blocking accumulator pass —
+    /// per-iter try_recv + prepare + would_exceed + push, until the first
+    /// `try_recv` returns Empty (or batch full / stashed). Sums across
+    /// every batch.
+    pub cumulative_accum_loop_us: AtomicU64,
+    /// Internal: micros since `sched_epoch()` at last fire spawn.
+    pub last_fire_spawn_micros: AtomicU64,
+    /// Internal: micros since `sched_epoch()` at end of response dispatch.
+    pub last_dispatch_end_micros: AtomicU64,
     pub system_spec_draft_tokens_proposed: AtomicU64,
     pub system_spec_draft_tokens_accepted: AtomicU64,
     pub system_spec_draft_tokens_proposed_per_pos:
@@ -1045,6 +1070,7 @@ impl BatchScheduler {
             // already stashed for the next batch, fire the current batch
             // before reading more; overwriting the stash would drop that
             // request's response channel.
+            let accum_start = Instant::now();
             while next_pending.is_none() {
                 let Ok(pending) = req_rx.try_recv() else {
                     break;
@@ -1074,6 +1100,9 @@ impl BatchScheduler {
                     break;
                 }
             }
+            stats
+                .cumulative_accum_loop_us
+                .fetch_add(accum_start.elapsed().as_micros() as u64, Relaxed);
 
             // Ask the policy what to do
             let decision = if next_pending.is_some() {
@@ -1156,12 +1185,29 @@ impl BatchScheduler {
                         .cumulative_fire_prepare_us
                         .fetch_add(fire_prepare_us, Relaxed);
 
+                    // Inter-fire instrumentation: time between consecutive spawns,
+                    // and the post-dispatch-to-next-fire gap (rendezvous window).
+                    let now_us = now_micros();
+                    let last_spawn = stats.last_fire_spawn_micros.swap(now_us, Relaxed);
+                    if last_spawn != 0 {
+                        stats
+                            .cumulative_inter_fire_us
+                            .fetch_add(now_us.saturating_sub(last_spawn), Relaxed);
+                    }
+                    let last_dispatch_end = stats.last_dispatch_end_micros.load(Relaxed);
+                    if last_dispatch_end != 0 {
+                        stats
+                            .cumulative_post_dispatch_to_fire_us
+                            .fetch_add(now_us.saturating_sub(last_dispatch_end), Relaxed);
+                    }
+
                     // Spawn batch execution
                     let latency_tx_clone = latency_tx.clone();
                     let stats_clone = stats.clone();
                     let timeout = request_timeout;
                     let submit_tx_clone = submit_tx.clone();
 
+                    let stats_for_probe = stats_clone.clone();
                     tokio::spawn(async move {
                         let start = Instant::now();
                         let timing = Self::execute_batch(
@@ -1172,6 +1218,7 @@ impl BatchScheduler {
                             timeout,
                             Some(permit),
                             Some(submit_tx_clone),
+                            Some(stats_for_probe),
                         )
                         .await;
                         let latency = start.elapsed();
@@ -1309,6 +1356,7 @@ impl BatchScheduler {
                 request_timeout,
                 None,
                 None,
+                None,
             )
             .await;
         }
@@ -1323,6 +1371,7 @@ impl BatchScheduler {
         _timeout: Duration,
         mut permit: Option<OwnedSemaphorePermit>,
         submit_tx: Option<mpsc::WeakUnboundedSender<PendingRequest>>,
+        stats_for_probe: Option<Arc<SchedulerStats>>,
     ) -> BatchExecutionTiming {
         let batch_start = Instant::now();
         let build_start = Instant::now();
@@ -1506,6 +1555,9 @@ impl BatchScheduler {
                                 }
                             }
                         }
+                    }
+                    if let Some(s) = stats_for_probe.as_ref() {
+                        s.last_dispatch_end_micros.store(now_micros(), Relaxed);
                     }
                     if !deferred_drop.is_empty() {
                         // Dedicated blocking pool so the chain-extender

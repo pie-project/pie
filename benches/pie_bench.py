@@ -668,6 +668,9 @@ async def run(args: argparse.Namespace):
                     ("default.avg_response_dispatch_us", "avg response dispatch us"),
                     ("default.avg_context_tick_submit_us", "avg context tick submit us"),
                     ("default.avg_stats_update_us", "avg stats update us"),
+                    ("default.avg_inter_fire_us", "avg inter fire us"),
+                    ("default.avg_post_dispatch_to_fire_us", "avg post dispatch to fire us"),
+                    ("default.avg_accum_loop_us", "avg accum loop us"),
                     (
                         "default.system_spec_draft_tokens_proposed",
                         "system spec draft tokens proposed",

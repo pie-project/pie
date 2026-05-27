@@ -132,6 +132,18 @@ impl Session {
                         serde_json::Value::from(inf.avg_stats_update_us),
                     );
                     stats.insert(
+                        format!("{}.avg_inter_fire_us", model_name),
+                        serde_json::Value::from(inf.avg_inter_fire_us),
+                    );
+                    stats.insert(
+                        format!("{}.avg_post_dispatch_to_fire_us", model_name),
+                        serde_json::Value::from(inf.avg_post_dispatch_to_fire_us),
+                    );
+                    stats.insert(
+                        format!("{}.avg_accum_loop_us", model_name),
+                        serde_json::Value::from(inf.avg_accum_loop_us),
+                    );
+                    stats.insert(
                         format!("{}.system_spec_draft_tokens_proposed", model_name),
                         serde_json::Value::from(inf.system_spec_draft_tokens_proposed),
                     );

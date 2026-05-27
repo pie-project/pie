@@ -63,6 +63,9 @@ pub struct InferenceStats {
     pub avg_response_dispatch_us: u64,
     pub avg_context_tick_submit_us: u64,
     pub avg_stats_update_us: u64,
+    pub avg_inter_fire_us: u64,
+    pub avg_post_dispatch_to_fire_us: u64,
+    pub avg_accum_loop_us: u64,
     pub system_spec_draft_tokens_proposed: u64,
     pub system_spec_draft_tokens_accepted: u64,
     pub system_spec_draft_tokens_proposed_per_pos: [u64; SYSTEM_SPEC_DRAFT_POS_BUCKETS],
@@ -312,6 +315,9 @@ impl InferenceService {
         let mut cumulative_response_dispatch = 0u64;
         let mut cumulative_context_tick_submit = 0u64;
         let mut cumulative_stats_update = 0u64;
+        let mut cumulative_inter_fire = 0u64;
+        let mut cumulative_post_dispatch_to_fire = 0u64;
+        let mut cumulative_accum_loop = 0u64;
         let mut system_spec_draft_tokens_proposed = 0u64;
         let mut system_spec_draft_tokens_accepted = 0u64;
         let mut system_spec_draft_tokens_proposed_per_pos =
@@ -338,6 +344,9 @@ impl InferenceService {
             cumulative_response_dispatch += s.cumulative_response_dispatch_us.load(Relaxed);
             cumulative_context_tick_submit += s.cumulative_context_tick_submit_us.load(Relaxed);
             cumulative_stats_update += s.cumulative_stats_update_us.load(Relaxed);
+            cumulative_inter_fire += s.cumulative_inter_fire_us.load(Relaxed);
+            cumulative_post_dispatch_to_fire += s.cumulative_post_dispatch_to_fire_us.load(Relaxed);
+            cumulative_accum_loop += s.cumulative_accum_loop_us.load(Relaxed);
             system_spec_draft_tokens_proposed += s.system_spec_draft_tokens_proposed.load(Relaxed);
             system_spec_draft_tokens_accepted += s.system_spec_draft_tokens_accepted.load(Relaxed);
             for (dst, src) in system_spec_draft_tokens_proposed_per_pos
@@ -378,6 +387,20 @@ impl InferenceService {
             avg_response_dispatch_us: avg(cumulative_response_dispatch),
             avg_context_tick_submit_us: avg(cumulative_context_tick_submit),
             avg_stats_update_us: avg(cumulative_stats_update),
+            // Inter-fire is sampled starting at the 2nd batch (first one has
+            // no prior to diff against), so divide by max(total_batches-1, 1)
+            // to get a stable mean.
+            avg_inter_fire_us: if total_batches > 1 {
+                cumulative_inter_fire / (total_batches - 1)
+            } else {
+                0
+            },
+            avg_post_dispatch_to_fire_us: if total_batches > 1 {
+                cumulative_post_dispatch_to_fire / (total_batches - 1)
+            } else {
+                0
+            },
+            avg_accum_loop_us: avg(cumulative_accum_loop),
             system_spec_draft_tokens_proposed,
             system_spec_draft_tokens_accepted,
             system_spec_draft_tokens_proposed_per_pos,
