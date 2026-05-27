@@ -14,7 +14,7 @@ use wasmtime::component::{Component, Instance as WasmInstance, Linker as WasmLin
 use wasmtime::{Engine, Store};
 
 use crate::api;
-use crate::instance::InstanceState;
+use crate::instance::{InstanceState, OutputMode};
 use crate::policy::{FsPolicy, NetworkPolicy};
 use crate::process::ProcessId;
 use crate::program::python::runtime as py_runtime;
@@ -65,7 +65,7 @@ pub async fn instantiate(
     process_id: ProcessId,
     username: String,
     program_name: &ProgramName,
-    capture_outputs: bool,
+    output: OutputMode,
     token_budget: Option<usize>,
 ) -> Result<(Store<InstanceState>, WasmInstance)> {
     let (tx, rx) = oneshot::channel();
@@ -73,7 +73,7 @@ pub async fn instantiate(
         process_id,
         username,
         program_name: program_name.clone(),
-        capture_outputs,
+        output,
         token_budget,
         response: tx,
     })?;
@@ -100,7 +100,7 @@ impl Linker {
         process_id: ProcessId,
         username: String,
         program_name: &ProgramName,
-        capture_outputs: bool,
+        output: OutputMode,
         token_budget: Option<usize>,
     ) -> Result<(Store<InstanceState>, WasmInstance)> {
         // 1. Get the main component (with snapshot status + python-runtime decl)
@@ -140,7 +140,7 @@ impl Linker {
         let inst_state = InstanceState::new(
             process_id,
             username,
-            capture_outputs,
+            output,
             &self.policy,
             token_budget,
             py_runtime_dir_for_state,
@@ -257,7 +257,7 @@ enum Message {
         process_id: ProcessId,
         username: String,
         program_name: ProgramName,
-        capture_outputs: bool,
+        output: OutputMode,
         token_budget: Option<usize>,
         response: oneshot::Sender<Result<(Store<InstanceState>, WasmInstance)>>,
     },
@@ -268,9 +268,9 @@ impl ServiceHandler for Linker {
 
     async fn handle(&mut self, msg: Message) {
         match msg {
-            Message::Instantiate { process_id, username, program_name, capture_outputs, token_budget, response } => {
+            Message::Instantiate { process_id, username, program_name, output, token_budget, response } => {
                 let _ = response.send(
-                    self.instantiate(process_id, username, &program_name, capture_outputs, token_budget).await
+                    self.instantiate(process_id, username, &program_name, output, token_budget).await
                 );
             }
         }
