@@ -18,6 +18,15 @@
 //!
 //! All of the work happens in `pie_server::cli::dispatch`.
 
+// jemalloc as the global allocator: thread-cached, reduces malloc
+// contention on the burst-allocation pattern the scheduler +
+// chain-extender pool produce. Significant on AMD EPYC multi-socket
+// systems where glibc malloc's locking-arena fallback bottlenecks
+// under N>30 parallel allocators.
+#[cfg(not(target_env = "msvc"))]
+#[global_allocator]
+static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 #[cfg(windows)]
 fn main() {
     let handle = std::thread::Builder::new()
