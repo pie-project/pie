@@ -1034,13 +1034,14 @@ pub(crate) struct BatchScheduler {
     chain_pool: Arc<super::speculator::ChainExtPool>,
 }
 
-/// Default size of the chain-extender pool per driver. Sweep on L40
-/// (30 tokio workers) found 30 optimal: 8/16/24 starve per-worker by
-/// serializing too many jobs; 36/40/64/128 over-fan out and contend
-/// for runtime workers. The sweet spot is one pool task per runtime
-/// worker — dispatch's notify burst resolves in a single scheduling
-/// round.
-const CHAIN_EXT_POOL_SIZE: usize = 30;
+/// Default size of the chain-extender pool per driver. Re-swept on L40
+/// after moving the main scheduler loop to a sync OS thread (5d3ff7bf):
+/// 16 narrowly wins over 30 (n=10: 23555 vs 23451 tok/s, sd 175 vs
+/// 238). With the main loop off the tokio runtime there's less
+/// wake-pickup contention between the pool workers and the scheduler,
+/// so a smaller pool where each worker handles ~16 jobs per fire
+/// amortizes per-task tokio scheduling overhead better.
+const CHAIN_EXT_POOL_SIZE: usize = 16;
 
 impl BatchScheduler {
     /// Spawn a new batch scheduler for a single driver.
