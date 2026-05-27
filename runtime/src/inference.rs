@@ -21,10 +21,9 @@ use crate::context::pagestore::PhysicalPageId;
 use crate::driver::{DriverId, SchedulerLimits};
 use crate::service::{ServiceArray, ServiceHandler};
 use anyhow::Result;
+use dashmap::DashMap;
 use scheduler::BatchScheduler;
-use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::Mutex;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering::Relaxed;
 
@@ -282,7 +281,7 @@ impl InferenceService {
         let scheduler_stats: Vec<_> = schedulers.iter().map(|s| s.stats().clone()).collect();
 
         let staged_batch: Vec<StagedBatchMap> = (0..num_drivers)
-            .map(|_| Arc::new(Mutex::new(HashMap::new())))
+            .map(|_| Arc::new(DashMap::new()))
             .collect();
         speculator::register_model(model_idx, &staged_batch, speculation_depth);
 
@@ -450,9 +449,8 @@ impl ServiceHandler for InferenceService {
                 // cold or post-miss (the api layer's try_hit
                 // returned None).
                 let staged_entry = {
-                    let mut sb = self.staged_batch[idx].lock().ok();
-                    sb.as_mut().and_then(|sb| {
-                        let deque = sb.get_mut(&ctx_id)?;
+                    let mut deque = self.staged_batch[idx].get_mut(&ctx_id);
+                    deque.as_deref_mut().and_then(|deque| {
                         if let Some(front) = deque.front() {
                             if speculator::entry_matches_request(front, &request) {
                                 let entry = deque.pop_front();

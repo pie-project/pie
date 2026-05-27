@@ -23,11 +23,12 @@
 //! speculation — it sees normal `submit()` calls. The driver is
 //! unaware of speculation — it just runs forward passes.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 
 use anyhow::Result;
+use dashmap::DashMap;
 use tokio::sync::oneshot;
 
 use crate::context::ContextId;
@@ -35,7 +36,14 @@ use crate::context::pagestore::PhysicalPageId;
 use crate::inference::ForwardOutput;
 use crate::inference::scheduler::SchedulerHandle;
 
-pub(crate) type StagedBatchMap = Arc<Mutex<HashMap<ContextId, VecDeque<StagedEntry>>>>;
+/// Per-(model, device) map of pre-fired stages keyed by context.
+///
+/// Backed by `dashmap` (a sharded concurrent HashMap) rather than a
+/// single `Mutex<HashMap>`. With 256 chain extenders that all wake
+/// after each fire and rush to acquire this map, a single mutex
+/// serializes ~52 µs/iter onto the critical path; dashmap's
+/// per-shard locks let them run in parallel.
+pub(crate) type StagedBatchMap = Arc<DashMap<ContextId, VecDeque<StagedEntry>>>;
 
 /// A pre-fired forward pass for a ctx, sitting in the per-ctx
 /// chain queue waiting for the inferlet's matching `execute()` call.
@@ -170,8 +178,7 @@ pub fn try_hit(
     request: &pie_bridge::ForwardRequest,
     allow_extend: bool,
 ) -> Option<oneshot::Receiver<Result<ForwardOutput>>> {
-    let mut sb = spec.0.lock().ok()?;
-    let deque = sb.get_mut(&ctx_id)?;
+    let mut deque = spec.0.get_mut(&ctx_id)?;
     let front = deque.front()?;
     if entry_matches_request(front, request) {
         let entry = deque.pop_front()?;
@@ -204,9 +211,7 @@ pub fn invalidate_ctx(model_idx: usize, ctx_id: ContextId) {
         return;
     };
     for sb_arc in &model.devices {
-        if let Ok(mut sb) = sb_arc.lock() {
-            sb.remove(&ctx_id);
-        }
+        sb_arc.remove(&ctx_id);
     }
 }
 
@@ -330,9 +335,8 @@ pub(crate) fn spawn_extend_chain(
                 if next_page_idx < all_pages.len() && writable_page_idx < all_pages.len() {
                     let next_pages: Vec<PhysicalPageId> = all_pages[..=writable_page_idx].to_vec();
                     let queued = staged_batch_arc
-                        .lock()
-                        .ok()
-                        .and_then(|sb| sb.get(&ctx_id).map(|deque| deque.len()))
+                        .get(&ctx_id)
+                        .map(|deque| deque.len())
                         .unwrap_or(0);
                     // If this stage completed before the inferlet
                     // claimed it, the current staged entry is still
@@ -349,8 +353,10 @@ pub(crate) fn spawn_extend_chain(
                             .is_ok()
                         {
                             CHAIN_SUBMIT_COUNT.fetch_add(1, Ordering::Relaxed);
-                            if let Ok(mut sb) = staged_batch_arc.lock() {
-                                sb.entry(ctx_id).or_default().push_back(StagedEntry {
+                            staged_batch_arc
+                                .entry(ctx_id)
+                                .or_default()
+                                .push_back(StagedEntry {
                                     anchor_token,
                                     anchor_pos,
                                     spec_token_ids: next_req.spec_token_ids.clone(),
@@ -359,7 +365,6 @@ pub(crate) fn spawn_extend_chain(
                                     allow_extend: next_allow_extend.clone(),
                                     output_rx: final_rx_next,
                                 });
-                            }
                             next_stage = Some((
                                 sched_rx_next,
                                 final_tx_next,
