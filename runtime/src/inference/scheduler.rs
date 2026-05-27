@@ -1050,18 +1050,45 @@ impl BatchScheduler {
         let submit_tx = tx.downgrade();
         let stats = Arc::new(SchedulerStats::default());
         let chain_pool = Arc::new(super::speculator::ChainExtPool::new(CHAIN_EXT_POOL_SIZE));
-        tokio::spawn(Self::run(
-            driver_id,
-            driver_idx,
-            rx,
-            submit_tx,
-            page_size,
-            limits,
-            request_timeout_secs,
-            batch_policy,
-            stats.clone(),
-            chain_pool.clone(),
-        ));
+
+        // Run the main scheduling loop on a dedicated single-thread tokio
+        // runtime, separate from the shared multi-thread runtime that the
+        // chain-ext pool and execute_batch tasks live on. Why: at conc=256
+        // the main loop wakes after every chain-ext submit batch and that
+        // wake has to walk the shared runtime's scheduler, contending with
+        // 30+ chain-ext pool tasks waking simultaneously. With a dedicated
+        // single-worker runtime, the main loop's waker has its own queue
+        // and worker — wake-pickup latency drops by ~100-200 µs per fire.
+        let main_rt_handle = tokio::runtime::Handle::current();
+        let stats_for_loop = stats.clone();
+        let chain_pool_for_loop = chain_pool.clone();
+        let batch_policy_for_loop = batch_policy.clone();
+        std::thread::Builder::new()
+            .name(format!("pie-sched-{driver_idx}"))
+            .spawn(move || {
+                let local_rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .thread_name(format!("pie-sched-{driver_idx}-rt"))
+                    .build()
+                    .expect("build pie-sched local runtime");
+                local_rt.block_on(async move {
+                    let _guard = main_rt_handle.enter();
+                    Self::run(
+                        driver_id,
+                        driver_idx,
+                        rx,
+                        submit_tx,
+                        page_size,
+                        limits,
+                        request_timeout_secs,
+                        batch_policy_for_loop,
+                        stats_for_loop,
+                        chain_pool_for_loop,
+                    )
+                    .await;
+                });
+            })
+            .expect("spawn pie-sched thread");
 
         Self { tx, stats, chain_pool }
     }
