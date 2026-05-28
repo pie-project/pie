@@ -97,6 +97,29 @@ Bounded host-side optimizations exhausted. Remaining gap requires:
 - MTP draft head for Qwen3-0.6B (not available)
 - Attention backend swap (FlashInfer -> FlashAttention 2)
 
+### Speculation depth × concurrency interaction (gemma-4-E4B, L40)
+
+Chain extension (depth>0) is only a net win when the GPU is saturated.
+At lower concurrency the chain-pool round-trip becomes the bottleneck:
+
+| reqs | depth=0 tok/s | depth=1 tok/s | depth=1/depth=0 |
+|---:|---:|---:|---:|
+| 32  | 1,686 |   882 |  52% |
+| 64  | 3,054 | 1,612 |  53% |
+| 128 | 4,822 | 3,789 |  79% |
+| 256 | 6,556 | 6,598 | 101% |
+
+At conc=64 with depth=0, pie hits 95% of vLLM (3,054 vs 3,199).
+With depth=1 the chain-pool round-trip serializes through 4 workers
+processing 16 jobs each, costing ~20 ms / fire of GPU-idle time
+that the underlying GPU work (~18 ms / fire at R=64) can't hide.
+
+The bench's previous `--speculation-depth 1` default is correct
+only for `conc ≥ 256` on this model. For lower concurrency,
+`--speculation-depth 0` matches vLLM. A future change should
+either (a) auto-select depth based on observed concurrency or
+(b) document the per-workload guidance prominently.
+
 ### 256x128 decode profile (gemma-4-E4B, L40, agents/alpha)
 
 Measured-window profile (excluding warmup):
