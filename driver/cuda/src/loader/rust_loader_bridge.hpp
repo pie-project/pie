@@ -437,8 +437,8 @@ inline std::vector<RustQuantAttachment> infer_rust_quant_attachments(
 
     // DeepSeek V4: pair block-scaled FP8 (E4M3 weight + E8M0 scale).
     // Weight names end with `.weight`, scales end with `.scale`.
-    // The scale tensor is E8M0 — the bind function converts to FP32
-    // at load time and creates QuantMeta with PerChannel granularity.
+    // The scale tensor is E8M0 with shape [N/128, K/128] — each 128x128
+    // block shares one scale (block-scaled quantization).
     if (hf.model_type == "deepseek_v4") {
         for (const auto& name : runtime_names) {
             if (!rust_loader_ends_with(name, ".weight")) continue;
@@ -449,8 +449,8 @@ inline std::vector<RustQuantAttachment> infer_rust_quant_attachments(
             attachments.push_back(RustQuantAttachment{
                 .tensor_name = name,
                 .scale_tensor_name = scale,
-                .granularity = QuantGranularity::PerChannel,
-                .group_size = 0,
+                .granularity = QuantGranularity::PerGroup,
+                .group_size = 128,
                 .channel_axis = 0,
             });
         }
@@ -460,22 +460,93 @@ inline std::vector<RustQuantAttachment> infer_rust_quant_attachments(
     const bool is_gpt_oss =
         hf.model_type == "gpt_oss" || hf.model_type == "gpt-oss" ||
         hf.model_type == "gptoss";
-    if (!is_gpt_oss) {
+    if (is_gpt_oss) {
+        for (const auto& name : runtime_names) {
+            if (!rust_loader_ends_with(name, ".weight")) continue;
+            const std::string scale =
+                name.substr(0, name.size() - std::string(".weight").size()) +
+                ".weight_scale";
+            if (!present.contains(scale)) continue;
+            attachments.push_back(RustQuantAttachment{
+                .tensor_name = name,
+                .scale_tensor_name = scale,
+                .granularity = QuantGranularity::PerGroup,
+                .group_size = 32,
+                .channel_axis = 1,
+            });
+        }
         return attachments;
     }
-    for (const auto& name : runtime_names) {
-        if (!rust_loader_ends_with(name, ".weight")) continue;
-        const std::string scale =
-            name.substr(0, name.size() - std::string(".weight").size()) +
-            ".weight_scale";
-        if (!present.contains(scale)) continue;
-        attachments.push_back(RustQuantAttachment{
-            .tensor_name = name,
-            .scale_tensor_name = scale,
-            .granularity = QuantGranularity::PerGroup,
-            .group_size = 32,
-            .channel_axis = 1,
-        });
+
+    // GLM-5.1 ships scales as 2D block tensors (128x128 blocks), e.g.
+    // weight [2048, 6144] pairs with weight_scale_inv [16, 48]. Use
+    // PerGroup with group_size=128 — same handling as V4's block FP8.
+    //
+    // When runtime_quant=fp4 is enabled the expert weights are transcoded
+    // to MXFP4 at materialize time (the FP8 source + its _scale_inv get
+    // consumed by the encode TileMap). In that case the runtime contract
+    // is no longer FP8 and must not get an FP8 PerGroup attachment — the
+    // emitted MXFP4 weight pairs with its own E8M0 `_scale` tensor that
+    // downstream code reads directly.
+    if (hf.model_type == "glm_moe_dsa") {
+        // Map runtime tensor name → final dtype. Attach PerGroup FP8
+        // QuantMeta only to weights that end up as FP8 in the runtime
+        // contract; the runtime fp4 path produces MXFP4 contracts whose
+        // dtype is something else (UINT8 byte buffer) — those weights
+        // pair with their own E8M0 `_scale` and must NOT get an FP8
+        // PerGroup attachment here.
+        // Look up dtype + quant_scheme per runtime tensor name.
+        struct TensorInfo {
+            pie_weight_loader::PieLoaderDType dtype;
+            pie_weight_loader::PieLoaderEncodingKind encoding_kind;
+            pie_weight_loader::PieLoaderQuantScheme scheme;
+        };
+        std::unordered_map<std::string, TensorInfo> info_for;
+        info_for.reserve(view.tensors.len);
+        for (std::size_t i = 0; i < view.tensors.len; ++i) {
+            const auto& t = view.tensors.ptr[i];
+            info_for.emplace(
+                rust_loader_bytes_to_string(t.name),
+                TensorInfo{t.dtype, t.encoding_kind, t.quant_scheme});
+        }
+        for (const auto& name : runtime_names) {
+            if (!rust_loader_ends_with(name, ".weight")) continue;
+            auto it = info_for.find(name);
+            if (it == info_for.end()) continue;
+
+            // MXFP4 runtime-quant output: encoding is Quant with the MXFP4
+            // scheme. Pair with E8M0 `_scale` sibling and emit PerGroup.
+            if (it->second.encoding_kind ==
+                    pie_weight_loader::PieLoaderEncodingKind::Quant &&
+                it->second.scheme ==
+                    pie_weight_loader::PieLoaderQuantScheme::Mxfp4E2M1E8M0) {
+                const std::string scale = name + "_scale";
+                if (!present.contains(scale)) continue;
+                attachments.push_back(RustQuantAttachment{
+                    .tensor_name = name,
+                    .scale_tensor_name = scale,
+                    .granularity = QuantGranularity::PerGroup,
+                    .group_size = 32,
+                    .channel_axis = 1,
+                });
+                continue;
+            }
+
+            // Raw FP8 weight kept as-is: attach PerGroup 128 to pair with
+            // its `_scale_inv` sibling.
+            if (it->second.dtype ==
+                pie_weight_loader::PieLoaderDType::F8E4M3) {
+                const std::string scale = name + "_scale_inv";
+                if (!present.contains(scale)) continue;
+                attachments.push_back(RustQuantAttachment{
+                    .tensor_name = name,
+                    .scale_tensor_name = scale,
+                    .granularity = QuantGranularity::PerGroup,
+                    .group_size = 128,
+                    .channel_axis = 0,
+                });
+            }
+        }
     }
     return attachments;
 }

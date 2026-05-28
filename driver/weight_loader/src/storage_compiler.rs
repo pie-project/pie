@@ -1703,7 +1703,9 @@ fn validate_target_support(program: &StorageProgram) -> Result<(), CompileError>
                 ) || (*kind == TileMapKind::Encode
                     && matches!(
                         transform.to,
-                        Some(QuantScheme::Fp8E4M3 | QuantScheme::Int8Symmetric)
+                        Some(QuantScheme::Fp8E4M3
+                             | QuantScheme::Int8Symmetric
+                             | QuantScheme::Mxfp4E2M1E8M0)
                     ))
                     || (*kind == TileMapKind::Repack
                         && (matches!(transform.repack.layout, RepackLayout::DenseRowGather)

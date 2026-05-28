@@ -58,7 +58,8 @@ void launch_hc_head_postprocess_bf16(
     int N,
     int hc_mult,
     int hidden_size,
-    cudaStream_t stream);
+    cudaStream_t stream,
+    float hc_eps = 1e-6f);
 
 // Expand embedding [N, H] → [N, hc_mult, H] by replicating.
 void launch_hc_expand_bf16(
@@ -76,6 +77,28 @@ void launch_hc_rmsnorm_to_f32(
     float* output,                // [N, hc_mult * H] F32
     int N,
     int dim,                      // hc_mult * H
+    float eps,
+    cudaStream_t stream);
+
+// Post-hoc attention sink correction: o *= sigmoid(lse - sink_h)
+// Applied per-head after standard attention to account for V4's learnable
+// denominator extension.
+void launch_attn_sink_correction_bf16(
+    void* attn_out,               // [N, num_heads, head_dim] BF16 (in-place)
+    const float* lse,             // [N, num_heads] FP32
+    const float* sink,            // [num_heads] FP32
+    int N,
+    int num_heads,
+    int head_dim,
+    cudaStream_t stream);
+
+// Per-head RMSNorm without gamma weight: q *= rsqrt(mean(q^2) + eps).
+// Used by V4 attention on Q after wq_b (applied per head independently).
+void launch_per_head_rmsnorm_bf16(
+    void* q,                      // [N, num_heads, head_dim] BF16 (in-place)
+    int N,
+    int num_heads,
+    int head_dim,
     float eps,
     cudaStream_t stream);
 

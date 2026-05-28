@@ -35,4 +35,16 @@ void launch_dequant_fp8_e4m3_to_bf16_per_channel(
     int                 cols,
     cudaStream_t        stream);
 
+/// Per-group (block-scaled) variant: dequant a `[rows, cols]` row-major
+/// FP8 weight with scales shaped `[rows/group_size, cols/group_size]`.
+/// Each group_size x group_size block of elements shares one scale.
+void launch_dequant_fp8_e4m3_to_bf16_per_group(
+    const std::uint8_t* fp8_in,         // [rows, cols] fp8 bytes
+    void*               bf16_out,       // [rows, cols] bf16
+    const float*        scale_dev,      // [rows/gs, cols/gs] fp32 device scales
+    int                 rows,
+    int                 cols,
+    int                 group_size,
+    cudaStream_t        stream);
+
 }  // namespace pie_cuda_driver::kernels

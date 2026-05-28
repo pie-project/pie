@@ -600,7 +600,9 @@ void kimi_forward_paged(
                 kimi_ws.attn_latent.data(),
                 kv_page_indices,
                 attn_ws,
-                stream);
+                stream,
+                /*lse_out=*/nullptr,
+                qo_indptr, kv_page_indptr, kv_last_page_lens);
             kernels::launch_kimi_latent_to_v_bf16(
                 kimi_ws.attn_latent.data(), Lw.kv_b_proj->data(),
                 kimi_ws.attn_v.data(),

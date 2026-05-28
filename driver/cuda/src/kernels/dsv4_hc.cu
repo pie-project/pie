@@ -57,7 +57,7 @@ __global__ void hc_pre_postprocess_kernel(
     }
     __syncthreads();
 
-    // Softmax per row (rows = M, cols = M)
+    // Softmax per row + eps  (reference: comb = comb.softmax(-1) + eps)
     if (tid < M) {
         float max_v = -FLT_MAX;
         for (int j = 0; j < M; ++j)
@@ -72,22 +72,34 @@ __global__ void hc_pre_postprocess_kernel(
     }
     __syncthreads();
 
-    // Sinkhorn iterations
+    // Initial col normalization (reference: comb = comb / (comb.sum(-2) + eps))
+    if (tid < M) {
+        float col_sum = 0.f;
+        for (int i = 0; i < M; ++i) col_sum += comb[i * M + tid];
+        col_sum += hc_eps;
+        for (int i = 0; i < M; ++i)
+            comb[i * M + tid] = comb[i * M + tid] / col_sum;
+    }
+    __syncthreads();
+
+    // Sinkhorn iterations: (row, col) pairs
     for (int iter = 0; iter < sinkhorn_iters - 1; ++iter) {
-        // Normalize columns
-        if (tid < M) {
-            float col_sum = hc_eps;
-            for (int i = 0; i < M; ++i) col_sum += comb[i * M + tid];
-            for (int i = 0; i < M; ++i)
-                comb[i * M + tid] = comb[i * M + tid] / col_sum;
-        }
-        __syncthreads();
         // Normalize rows
         if (tid < M) {
-            float row_sum = hc_eps;
+            float row_sum = 0.f;
             for (int j = 0; j < M; ++j) row_sum += comb[tid * M + j];
+            row_sum += hc_eps;
             for (int j = 0; j < M; ++j)
                 comb[tid * M + j] = comb[tid * M + j] / row_sum;
+        }
+        __syncthreads();
+        // Normalize columns
+        if (tid < M) {
+            float col_sum = 0.f;
+            for (int i = 0; i < M; ++i) col_sum += comb[i * M + tid];
+            col_sum += hc_eps;
+            for (int i = 0; i < M; ++i)
+                comb[i * M + tid] = comb[i * M + tid] / col_sum;
         }
         __syncthreads();
     }
@@ -138,8 +150,10 @@ __global__ void hc_post_kernel(
 
     float acc = post_j * x_h;
     const __nv_bfloat16* res_n = residual + static_cast<long long>(n) * M * H;
+    // Reference: y[c=j, d=h] = post[c]*x[d] + sum_r comb[r, c] * residual[r, d]
+    // comb is stored as [row, col] with row-major layout: comb[r*M + c].
     for (int i = 0; i < M; ++i) {
-        acc += comb_n[j * M + i] * __bfloat162float(res_n[i * H + h]);
+        acc += comb_n[i * M + j] * __bfloat162float(res_n[i * H + h]);
     }
     out[static_cast<long long>(n) * M * H + j * H + h] = __float2bfloat16(acc);
 }
@@ -151,26 +165,19 @@ __global__ void hc_head_postprocess_kernel(
     const __nv_bfloat16* __restrict__ residual, // [N, M, H]
     __nv_bfloat16* __restrict__ out,     // [N, H]
     int M,
-    int H)
+    int H,
+    float hc_eps)
 {
     const int n = blockIdx.x;
     const int tid = threadIdx.x;
 
     __shared__ float gates[MAX_HC_MULT];
 
+    // Reference: pre = sigmoid(mixes * hc_scale + hc_base) + hc_eps
+    // NO normalization — just direct weighted sum.
     if (tid < M) {
         const float logit = mixes[static_cast<long long>(n) * M + tid] * scale[0] + base[tid];
-        gates[tid] = 1.f / (1.f + expf(-logit));
-    }
-    __syncthreads();
-
-    // Normalize gates
-    if (tid == 0) {
-        float sum = 0.f;
-        for (int i = 0; i < M; ++i) sum += gates[i];
-        if (sum > 0.f) {
-            for (int i = 0; i < M; ++i) gates[i] /= sum;
-        }
+        gates[tid] = 1.f / (1.f + expf(-logit)) + hc_eps;
     }
     __syncthreads();
 
@@ -297,14 +304,15 @@ void launch_hc_head_postprocess_bf16(
     int N,
     int hc_mult,
     int hidden_size,
-    cudaStream_t stream)
+    cudaStream_t stream,
+    float hc_eps)
 {
     if (N <= 0) return;
     hc_head_postprocess_kernel<<<N, BLOCK, 0, stream>>>(
         mixes, scale, base,
         static_cast<const __nv_bfloat16*>(residual),
         static_cast<__nv_bfloat16*>(out),
-        hc_mult, hidden_size);
+        hc_mult, hidden_size, hc_eps);
 }
 
 void launch_hc_expand_bf16(
@@ -337,6 +345,100 @@ void launch_hc_rmsnorm_to_f32(
     hc_rmsnorm_to_f32_kernel<<<N, BLOCK, 0, stream>>>(
         static_cast<const __nv_bfloat16*>(input),
         output, dim, eps);
+}
+
+namespace {
+
+__global__ void attn_sink_correction_kernel(
+    __nv_bfloat16* __restrict__ out,
+    const float* __restrict__ lse,
+    const float* __restrict__ sink,
+    int num_heads,
+    int head_dim)
+{
+    const int n = blockIdx.x;
+    const int h = blockIdx.y;
+    const float s = 1.0f / (1.0f + expf(sink[h] - lse[n * num_heads + h]));
+    __nv_bfloat16* row = out +
+        (static_cast<long long>(n) * num_heads + h) * head_dim;
+    for (int d = threadIdx.x; d < head_dim; d += blockDim.x) {
+        row[d] = __float2bfloat16(__bfloat162float(row[d]) * s);
+    }
+}
+
+}  // namespace
+
+void launch_attn_sink_correction_bf16(
+    void* attn_out,
+    const float* lse,
+    const float* sink,
+    int N, int num_heads, int head_dim,
+    cudaStream_t stream)
+{
+    if (N <= 0 || !sink) return;
+    dim3 grid(N, num_heads);
+    dim3 block(256);
+    attn_sink_correction_kernel<<<grid, block, 0, stream>>>(
+        static_cast<__nv_bfloat16*>(attn_out),
+        lse, sink, num_heads, head_dim);
+}
+
+namespace {
+
+__global__ void per_head_rmsnorm_kernel(
+    __nv_bfloat16* __restrict__ q,
+    int head_dim,
+    float eps)
+{
+    // grid: (N, num_heads). Each block handles one head.
+    const int n = blockIdx.x;
+    const int h = blockIdx.y;
+    const int tid = threadIdx.x;
+    const int num_heads = gridDim.y;
+
+    __nv_bfloat16* row = q +
+        (static_cast<long long>(n) * num_heads + h) * head_dim;
+
+    float local_sum = 0.f;
+    for (int d = tid; d < head_dim; d += blockDim.x) {
+        const float v = __bfloat162float(row[d]);
+        local_sum += v * v;
+    }
+    for (int off = 16; off > 0; off >>= 1)
+        local_sum += __shfl_down_sync(0xFFFFFFFF, local_sum, off);
+
+    __shared__ float scale;
+    if (tid == 0) {
+        // Reduce across warps
+    }
+    __shared__ float reduce_buf[32];
+    if ((tid & 31) == 0) reduce_buf[tid >> 5] = local_sum;
+    __syncthreads();
+    if (tid < 32) {
+        float v = (tid < (blockDim.x + 31) / 32) ? reduce_buf[tid] : 0.f;
+        for (int off = 16; off > 0; off >>= 1)
+            v += __shfl_down_sync(0xFFFFFFFF, v, off);
+        if (tid == 0) scale = rsqrtf(v / static_cast<float>(head_dim) + eps);
+    }
+    __syncthreads();
+
+    const float s = scale;
+    for (int d = tid; d < head_dim; d += blockDim.x) {
+        row[d] = __float2bfloat16(__bfloat162float(row[d]) * s);
+    }
+}
+
+}  // namespace
+
+void launch_per_head_rmsnorm_bf16(
+    void* q, int N, int num_heads, int head_dim,
+    float eps, cudaStream_t stream)
+{
+    if (N <= 0 || num_heads <= 0 || head_dim <= 0) return;
+    dim3 grid(N, num_heads);
+    dim3 block(256);
+    per_head_rmsnorm_kernel<<<grid, block, 0, stream>>>(
+        static_cast<__nv_bfloat16*>(q), head_dim, eps);
 }
 
 }  // namespace pie_cuda_driver::kernels

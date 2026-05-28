@@ -94,9 +94,9 @@ std::optional<QuantMeta> make_block_fp8_quant(
     const DeviceTensor* scale_ptr = &g_dsv4_f32_scales.back();
 
     QuantMeta meta;
-    meta.kind = QuantMeta::Kind::PerChannel;
+    meta.kind = QuantMeta::Kind::PerGroup;
     meta.scale = scale_ptr;
-    meta.group_size = 0;
+    meta.group_size = group_size;
     meta.channel_axis = 0;
     return meta;
 }

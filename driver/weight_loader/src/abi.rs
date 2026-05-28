@@ -448,7 +448,7 @@ impl DefaultAbiBuilder<'_> {
                 continue;
             }
             if let Some(scheme) = runtime_quant
-                && runtime_quantizable_name(&raw.name)
+                && runtime_quantizable_name(&raw.name, scheme)
             {
                 self.push_runtime_quant(raw, raw.name.clone(), scheme)?;
             } else {
@@ -732,18 +732,68 @@ impl DefaultAbiBuilder<'_> {
                 raw.name
             )));
         }
-        if !matches!(
+        // Allowed sources:
+        //   * BF16/FP16/FP32 raw  — handled by the executor's bf16 cast path.
+        //   * FP8 (E4M3) raw     — used by GLM-5.1 routed experts: weights ship
+        //                          quantized; the executor dequants them to bf16
+        //                          using a sibling `_scale_inv` tensor at
+        //                          materialize time, then re-encodes to the
+        //                          target scheme. Only meaningful when the
+        //                          target is a *smaller* scheme (e.g. MXFP4).
+        let source_dtype_ok = matches!(
             raw.encoding,
-            Encoding::Raw(DType::BF16 | DType::F16 | DType::F32)
-        ) {
+            Encoding::Raw(DType::BF16 | DType::F16 | DType::F32 | DType::F8E4M3)
+        );
+        if !source_dtype_ok {
             return Err(CompileError::InvalidInput(format!(
-                "runtime_quant source '{}' must be BF16/FP16/FP32",
+                "runtime_quant source '{}' must be BF16/FP16/FP32/F8E4M3",
                 raw.name
             )));
         }
-        let dtype = match scheme {
-            QuantScheme::Fp8E4M3 => DType::F8E4M3,
-            QuantScheme::Int8Symmetric => DType::I8,
+        let spec = match scheme {
+            QuantScheme::Fp8E4M3 => QuantSpec {
+                scheme,
+                logical_dtype: DType::F8E4M3,
+                bits_per_element: 8,
+                group_size: 1,
+                channel_axis: Some(Axis(0)),
+                scale_dtype: Some(DType::F32),
+                zero_point_dtype: None,
+                block_shape: Vec::new(),
+            }
+            .normalized(),
+            QuantScheme::Int8Symmetric => QuantSpec {
+                scheme,
+                logical_dtype: DType::I8,
+                bits_per_element: 8,
+                group_size: 1,
+                channel_axis: Some(Axis(0)),
+                scale_dtype: Some(DType::F32),
+                zero_point_dtype: None,
+                block_shape: Vec::new(),
+            }
+            .normalized(),
+            QuantScheme::Mxfp4E2M1E8M0 => {
+                // K dimension (columns for 2-D weight) must be 32-multiple
+                // because the MXFP4 block scale covers 32 contiguous elements.
+                if raw.shape[1] % 32 != 0 {
+                    return Err(CompileError::InvalidInput(format!(
+                        "runtime_quant Mxfp4 source '{}' cols {} must be a multiple of 32",
+                        raw.name, raw.shape[1]
+                    )));
+                }
+                QuantSpec {
+                    scheme,
+                    logical_dtype: DType::BF16,
+                    bits_per_element: 4,
+                    group_size: 32,
+                    channel_axis: Some(Axis(1)),
+                    scale_dtype: Some(DType::U8),
+                    zero_point_dtype: None,
+                    block_shape: vec![32],
+                }
+                .normalized()
+            }
             _ => {
                 return Err(CompileError::InvalidInput(format!(
                     "unsupported runtime_quant scheme {:?}",
@@ -751,24 +801,13 @@ impl DefaultAbiBuilder<'_> {
                 )));
             }
         };
+        let dtype = spec.logical_dtype;
         self.tensors.push(RuntimeTensorContract {
             output_name,
             source: RuntimeTensorSource::DirectTensor(raw.id),
             metadata: Vec::new(),
             dtype,
-            encoding: Encoding::Quant(
-                QuantSpec {
-                    scheme,
-                    logical_dtype: dtype,
-                    bits_per_element: 8,
-                    group_size: 1,
-                    channel_axis: Some(Axis(0)),
-                    scale_dtype: Some(DType::F32),
-                    zero_point_dtype: None,
-                    block_shape: Vec::new(),
-                }
-                .normalized(),
-            ),
+            encoding: Encoding::Quant(spec),
             shape: raw.shape.clone(),
             layout: Layout::dense(self.alignment()),
             sharding: Sharding::replicated(),
@@ -1256,13 +1295,24 @@ impl DefaultAbiBuilder<'_> {
         {
             return Some(Axis(0));
         }
+        // K2.6 lm_head: replicate to avoid requiring TP greedy argmax for
+        // logits emission. Costs ~1.7GB per rank extra but simplifies the
+        // logits path.
         if matches!(self.cfg.model_type.as_str(), "kimi_k2" | "kimi_k25")
             && name.ends_with(".lm_head.weight")
         {
-            return Some(Axis(0));
+            return None;
         }
         if self.cfg.model_type == "deepseek_v4" {
             return dsv4_shard_axis(name);
+        }
+        // GLM-5.1: shard embed_tokens to save 1.4GB per rank. lm_head
+        // stays replicated because the current glm5_forward path throws
+        // when it's sharded (TP greedy argmax not wired).
+        if self.cfg.model_type == "glm_moe_dsa"
+            && name == "model.embed_tokens.weight"
+        {
+            return Some(Axis(0));
         }
         llama_like_shard_axis(name)
     }
@@ -1275,18 +1325,22 @@ impl DefaultAbiBuilder<'_> {
         let scheme = match mode {
             "fp8" => QuantScheme::Fp8E4M3,
             "int8" => QuantScheme::Int8Symmetric,
+            "fp4" | "mxfp4" => QuantScheme::Mxfp4E2M1E8M0,
             other => {
                 return Err(CompileError::InvalidInput(format!(
-                    "unsupported runtime_quant '{other}'; expected 'fp8' or 'int8'"
+                    "unsupported runtime_quant '{other}'; expected 'fp8', 'int8', or 'fp4'"
                 )));
             }
         };
-        if !self.cfg.quant_method.is_empty() {
+        // For FP4 we accept a pre-quantized checkpoint (GLM-5.1 ships FP8
+        // experts). For FP8/INT8 the legacy gate stays — we only re-quant
+        // BF16 weights, never re-quant an already-quantized checkpoint.
+        if !self.cfg.quant_method.is_empty() && scheme != QuantScheme::Mxfp4E2M1E8M0 {
             return Ok(None);
         }
-        if !runtime_quant_model_supported(&self.cfg.model_type) {
+        if !runtime_quant_model_supported(&self.cfg.model_type, scheme) {
             return Err(CompileError::InvalidInput(format!(
-                "runtime_quant={} is supported for qwen2/qwen3/qwen3_5/llama/mistral-style dense models, got '{}'",
+                "runtime_quant={} is not supported for model_type='{}'",
                 mode, self.cfg.model_type
             )));
         }
@@ -1469,15 +1523,35 @@ fn llama_like_shard_axis(name: &str) -> Option<Axis> {
     }
 }
 
-fn runtime_quant_model_supported(model_type: &str) -> bool {
-    matches!(
-        model_type,
-        "qwen3" | "qwen2" | "llama" | "llama3" | "mistral" | "qwen3_5" | "qwen3_5_text"
-            | "glm_moe_dsa"
-    )
+fn runtime_quant_model_supported(model_type: &str, scheme: QuantScheme) -> bool {
+    match scheme {
+        QuantScheme::Mxfp4E2M1E8M0 => {
+            // FP4 runtime quant is currently only wired for GLM-5.1's
+            // routed-expert FP8 weights. Other models retain their existing
+            // path.
+            model_type == "glm_moe_dsa"
+        }
+        _ => matches!(
+            model_type,
+            "qwen3"
+                | "qwen2"
+                | "llama"
+                | "llama3"
+                | "mistral"
+                | "qwen3_5"
+                | "qwen3_5_text"
+                | "glm_moe_dsa"
+        ),
+    }
 }
 
-fn runtime_quantizable_name(name: &str) -> bool {
+fn runtime_quantizable_name(name: &str, scheme: QuantScheme) -> bool {
+    if scheme == QuantScheme::Mxfp4E2M1E8M0 {
+        // For FP4 we only touch GLM-5.1's routed/shared experts. Attention
+        // projections stay as FP8+scale (block-scaled GEMM) because there's
+        // no FP4 GEMM path for them on this hardware.
+        return is_glm_expert_weight(name);
+    }
     ends_with_any(
         name,
         &[
@@ -1503,22 +1577,18 @@ fn is_glm_expert_weight(name: &str) -> bool {
 }
 
 fn dsv4_shard_axis(name: &str) -> Option<Axis> {
-    if name.contains(".ffn.experts.0.w1.weight") {
-        eprintln!("[dsv4_shard_axis] expert match: {name}");
+    // Routed experts: shard intermediate dim within each expert.
+    // w1/w3 on axis 0 (gate/up out dim), w2 on axis 1 (down in dim).
+    // Each rank computes a partial expert output; combined via all-reduce.
+    if name.contains(".ffn.experts.") {
+        if ends_with_any(name, &[".w1.weight", ".w1.scale", ".w3.weight", ".w3.scale"]) {
+            return Some(Axis(0));
+        }
+        if ends_with_any(name, &[".w2.weight", ".w2.scale"]) {
+            return Some(Axis(1));
+        }
     }
-    // Embed/head: vocab-shard on axis 0
-    if name == "embed.weight" || name == "head.weight" {
-        return Some(Axis(0));
-    }
-    // Q expansion (wq_b) shards heads on axis 0
-    if name.ends_with(".wq_b.weight") || name.ends_with(".wq_b.scale") {
-        return Some(Axis(0));
-    }
-    // Output projection wo_b is row-parallel (axis 1)
-    if name.ends_with(".wo_b.weight") || name.ends_with(".wo_b.scale") {
-        return Some(Axis(1));
-    }
-    // Shared expert gate/up: axis 0, down: axis 1
+    // Shared experts: same column/row parallelism.
     if ends_with_any(name, &[
         ".shared_experts.w1.weight", ".shared_experts.w1.scale",
         ".shared_experts.w3.weight", ".shared_experts.w3.scale",
@@ -1530,16 +1600,7 @@ fn dsv4_shard_axis(name: &str) -> Option<Axis> {
     ]) {
         return Some(Axis(1));
     }
-    // Routed expert gate/up (w1/w3): shard axis 0
-    if name.contains(".ffn.experts.") {
-        if ends_with_any(name, &[".w1.weight", ".w1.scale", ".w3.weight", ".w3.scale"]) {
-            return Some(Axis(0));
-        }
-        if ends_with_any(name, &[".w2.weight", ".w2.scale"]) {
-            return Some(Axis(1));
-        }
-    }
-    // Everything else: replicated (no shard)
+    // Everything else replicated (avoids TP communication in main path).
     None
 }
 

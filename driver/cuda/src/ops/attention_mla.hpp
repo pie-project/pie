@@ -44,6 +44,17 @@ void dispatch_attention_mla_bf16(
     const std::uint32_t* kv_page_indices_d,
     AttentionWorkspace& workspace,
     cudaStream_t stream,
-    float* lse_out = nullptr);
+    float* lse_out = nullptr,
+    // Device indptr/lens for the naive (Blackwell / sm100) MLA fallback path.
+    // Ignored by the FlashInfer FA2 path. When the naive path is selected
+    // these MUST be provided (else it throws).
+    const std::uint32_t* qo_indptr_d = nullptr,
+    const std::uint32_t* kv_page_indptr_d = nullptr,
+    const std::uint32_t* kv_last_page_lens_d = nullptr,
+    // DSA top-k mask for the naive path: [num_query_tokens, mask_stride] uint8
+    // (1=attend). Applied to in-batch keys (j < mask_stride). Null = dense.
+    // Only valid for single-request pure prefill (key j == batch token j).
+    const std::uint8_t* index_mask = nullptr,
+    int index_mask_stride = 0);
 
 }  // namespace pie_cuda_driver::ops

@@ -29,7 +29,7 @@ CustomAllReduce::~CustomAllReduce() = default;
 CustomAllReduce::CustomAllReduce(CustomAllReduce&& o) noexcept
     : rank_(o.rank_),
       world_size_(o.world_size_),
-      full_nvlink_(o.full_nvlink_),
+      fully_connected_(o.fully_connected_),
       same_process_(o.same_process_),
       max_bytes_(o.max_bytes_),
       signal_self_(o.signal_self_),

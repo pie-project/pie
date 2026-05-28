@@ -60,7 +60,7 @@ cpmaddpackage(URI "gh:facebook/zstd@1.5.7")
 set(PIE_CUDA_CUSTOM_ALL_REDUCE_SOURCE src/custom_all_reduce.cu)
 foreach(PIE_CUDA_ARCH IN LISTS CMAKE_CUDA_ARCHITECTURES)
   string(REGEX REPLACE "[^0-9].*$" "" PIE_CUDA_ARCH_NUMBER "${PIE_CUDA_ARCH}")
-  if(PIE_CUDA_ARCH_NUMBER STREQUAL "120")
+  if(PIE_CUDA_ARCH_NUMBER STREQUAL "120" OR PIE_CUDA_ARCH_NUMBER STREQUAL "100")
     set(PIE_CUDA_CUSTOM_ALL_REDUCE_SOURCE src/custom_all_reduce_stub.cpp)
   endif()
 endforeach()
@@ -171,6 +171,7 @@ add_library(pie_driver_cuda_lib STATIC
   src/kernels/dequant_fp8.cu
   src/kernels/dtype_cast.cu
   src/kernels/quant_bf16_to_fp8.cu
+  src/kernels/quant_bf16_to_mxfp4.cu
   src/kernels/head_dim_pad.cu
   src/kernels/attn_sink.cu
   src/kernels/deinterleave.cu

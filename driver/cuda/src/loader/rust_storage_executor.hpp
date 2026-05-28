@@ -27,7 +27,9 @@
 #include "cuda_check.hpp"
 #include "kernels/dtype_cast.hpp"
 #include "kernels/mxfp4_marlin.hpp"
+#include "kernels/dequant_fp8.hpp"
 #include "kernels/quant_bf16_to_fp8.hpp"
+#include "kernels/quant_bf16_to_mxfp4.hpp"
 #include "kernels/slab_scatter.hpp"
 #ifdef PIE_CUDA_HAS_MARLIN
 #include "marlin_wrapper.hpp"
@@ -58,6 +60,26 @@ public:
     ~RustStorageProgramExecutor()
     {
         destroy_copy_streams_noexcept();
+#if PIE_CUDA_RUST_STORAGE_EXECUTOR_HAS_CUDA
+        if (fp8_bf16_scratch_ptr_ != nullptr) {
+            cudaFree(fp8_bf16_scratch_ptr_);
+            fp8_bf16_scratch_ptr_ = nullptr;
+        }
+        if (fp8_scale_local_ptr_ != nullptr) {
+            cudaFree(fp8_scale_local_ptr_);
+            fp8_scale_local_ptr_ = nullptr;
+        }
+        if (fp8_source_tile_ptr_ != nullptr) {
+            cudaFree(fp8_source_tile_ptr_);
+            fp8_source_tile_ptr_ = nullptr;
+        }
+        for (auto& kv : fp8_scale_cache_) {
+            if (kv.second.data != nullptr) {
+                cudaFree(kv.second.data);
+            }
+        }
+        fp8_scale_cache_.clear();
+#endif
     }
 
     LoadExecutionStats execute(
@@ -494,6 +516,26 @@ private:
             shard_id, file_offset, span_bytes, dst);
     }
 
+#if PIE_CUDA_RUST_STORAGE_EXECUTOR_HAS_CUDA
+    // Variant for callers that need the H2D to land on a specific stream so
+    // a follow-up kernel on that same stream sees the data without an
+    // explicit sync. Bypasses batched/pinned paths to keep stream ordering
+    // trivially correct, then flushes any prior round-robin copies on
+    // *other* streams via wait-events (no host sync).
+    void copy_storage_bytes_to_device_on(
+        std::uint32_t shard_id,
+        std::uint64_t file_offset,
+        std::uint64_t span_bytes,
+        void* dst,
+        cudaStream_t stream)
+    {
+        loader_.copy_storage_bytes_to_device_async(
+            shard_id, file_offset, span_bytes, dst, stream);
+        // Caller will issue the consumer kernel on the same `stream`, so
+        // ordering is implicit — no host or cross-stream sync needed.
+    }
+#endif
+
     bool pinned_staging_enabled() const
     {
         const char* enable =
@@ -717,10 +759,13 @@ private:
         if (pending_copies_.empty()) {
             return;
         }
+        // Single cudaMemcpyAttributes applied to every copy in the batch.
+        // For host→device, srcAccessOrder=Any lets the runtime reorder
+        // reads from pinned host pages for max throughput.
         cudaMemcpyAttributes attr{};
         attr.srcAccessOrder = cudaMemcpySrcAccessOrderAny;
         attr.flags = cudaMemcpyFlagDefault;
-        std::size_t attr_index = 0;
+        std::size_t attrs_idx = 0;
         for (auto stream : copy_streams_) {
             batched_dsts_.clear();
             batched_srcs_.clear();
@@ -736,12 +781,25 @@ private:
             if (batched_dsts_.empty()) {
                 continue;
             }
-            for (std::size_t i = 0; i < batched_dsts_.size(); ++i) {
-                CUDA_CHECK(cudaMemcpyAsync(
-                    batched_dsts_[i], batched_srcs_[i], batched_sizes_[i],
-                    cudaMemcpyHostToDevice, stream));
-                if ((i & 1023) == 1023) {
-                    CUDA_CHECK(cudaStreamSynchronize(stream));
+            // The CUDA 12.8 batched H2D path takes one API call for the
+            // whole batch — far cheaper than N cudaMemcpyAsync launches.
+            // We chunk at 1024 copies/call to stay under any internal
+            // sizing limits and to overlap submit with execute.
+            constexpr std::size_t kChunk = 1024;
+            const std::size_t total = batched_dsts_.size();
+            for (std::size_t off = 0; off < total; off += kChunk) {
+                const std::size_t n = std::min(kChunk, total - off);
+                const cudaError_t err = ::cudaMemcpyBatchAsync(
+                    batched_dsts_.data() + off,
+                    const_cast<const void**>(batched_srcs_.data() + off),
+                    batched_sizes_.data() + off,
+                    n,
+                    &attr, &attrs_idx, /*numAttrs=*/1,
+                    stream);
+                if (err != cudaSuccess) {
+                    throw std::runtime_error(
+                        std::string("cudaMemcpyBatchAsync failed: ") +
+                        cudaGetErrorString(err));
                 }
             }
             CUDA_CHECK(cudaStreamSynchronize(stream));
@@ -1074,7 +1132,27 @@ private:
             }
             const TensorInfo& info =
                 loader_.info(source_tensor_names_[instr.source.tensor_id]);
-            source = DeviceTensor::allocate(info.dtype, tile_shape);
+#if PIE_CUDA_RUST_STORAGE_EXECUTOR_HAS_CUDA
+            // Reuse a persistent device tile buffer for FP8 sources — the
+            // dequant kernel consumes it then we move on, so per-tile
+            // cudaMalloc/cudaFree is pure overhead (and dominates the FP4
+            // encode phase for GLM-5.1's tens of thousands of expert tiles).
+            // Wrap the persistent buffer in a non-owning view.
+            if (info.dtype == DType::FP8_E4M3) {
+                const std::size_t want_bytes =
+                    static_cast<std::size_t>(rows) *
+                    static_cast<std::size_t>(cols) *
+                    dtype_bytes(info.dtype);
+                ensure_dev_buffer(fp8_source_tile_ptr_,
+                                  fp8_source_tile_bytes_,
+                                  want_bytes);
+                source = DeviceTensor::view(
+                    fp8_source_tile_ptr_, info.dtype, tile_shape);
+            } else
+#endif
+            {
+                source = DeviceTensor::allocate(info.dtype, tile_shape);
+            }
             if (!wl_cpp::compact_extent(instr.source.stride)) {
                 if (row_start != 0 || rows != full_shape[0]) {
                     throw std::runtime_error(
@@ -1086,12 +1164,32 @@ private:
                 const std::uint64_t elem = dtype_bytes(info.dtype);
                 const std::uint64_t row_bytes =
                     static_cast<std::uint64_t>(cols) * elem;
-                copy_storage_bytes_to_device(
-                    instr.source.file_id,
-                    instr.source.file_offset + instr.source.stride.base_offset +
-                        static_cast<std::uint64_t>(row_start) * row_bytes,
-                    static_cast<std::uint64_t>(rows) * row_bytes,
-                    source.data());
+#if PIE_CUDA_RUST_STORAGE_EXECUTOR_HAS_CUDA
+                // For FP8 sources the dequant kernel runs on stream 0 right
+                // after this copy. Put the H2D on stream 0 too so ordering
+                // is implicit (no flush, no event wait). For BF16 sources
+                // there's no follow-up kernel — keep the round-robin path
+                // so other in-flight copies still parallelise.
+                if (info.dtype == DType::FP8_E4M3) {
+                    copy_storage_bytes_to_device_on(
+                        instr.source.file_id,
+                        instr.source.file_offset +
+                            instr.source.stride.base_offset +
+                            static_cast<std::uint64_t>(row_start) * row_bytes,
+                        static_cast<std::uint64_t>(rows) * row_bytes,
+                        source.data(),
+                        /*stream=*/0);
+                } else
+#endif
+                {
+                    copy_storage_bytes_to_device(
+                        instr.source.file_id,
+                        instr.source.file_offset +
+                            instr.source.stride.base_offset +
+                            static_cast<std::uint64_t>(row_start) * row_bytes,
+                        static_cast<std::uint64_t>(rows) * row_bytes,
+                        source.data());
+                }
             }
         } else {
             if (instr.input_buffers.len != 1) {
@@ -1120,10 +1218,223 @@ private:
         if (source.dtype() == DType::BF16) {
             return source;
         }
+        if (source.dtype() == DType::FP8_E4M3) {
+#if PIE_CUDA_RUST_STORAGE_EXECUTOR_HAS_CUDA
+            // FP8 (E4M3) source: dequant to BF16 using the per-group block
+            // scale that ships alongside the weight. For GLM-5.1 the scale
+            // tensor is `<weight>_scale_inv` with shape [rows/128, cols/128]
+            // and dtype FP32 (one float per 128x128 block of the weight).
+            return dequant_fp8_tile_to_bf16(
+                instr, source, full_shape, row_start, rows, tile_shape);
+#else
+            throw std::runtime_error(
+                "rust storage executor: FP8 Encode requires CUDA support");
+#endif
+        }
         DeviceTensor bf16 = DeviceTensor::allocate(DType::BF16, tile_shape);
         cast_tensor_to_ptr(source, bf16.data(), DType::BF16);
         return bf16;
     }
+
+#if PIE_CUDA_RUST_STORAGE_EXECUTOR_HAS_CUDA
+    // Grow a persistent device buffer to at least `want_bytes`. Uses
+    // cudaMalloc/cudaFree only when growth is needed, so steady-state
+    // tile encoding does zero per-call allocations.
+    void ensure_dev_buffer(void*& ptr, std::size_t& cap, std::size_t want_bytes)
+    {
+        if (cap >= want_bytes && ptr != nullptr) return;
+        if (ptr != nullptr) {
+            cudaFree(ptr);
+            ptr = nullptr;
+            cap = 0;
+        }
+        if (cudaMalloc(&ptr, want_bytes) != cudaSuccess) {
+            throw std::runtime_error(
+                "rust storage executor: cudaMalloc for FP8 scratch buffer failed (" +
+                std::to_string(want_bytes) + " bytes)");
+        }
+        cap = want_bytes;
+    }
+
+    // Load the FP8 scale tensor for `scale_name` to a persistent device
+    // buffer once and reuse for every subsequent tile of the same weight.
+    // For GLM-5.1 we have ~58k expert weights × multiple tiles each, so
+    // caching saves both disk I/O and cudaMalloc churn.
+    void ensure_fp8_scale_loaded(
+        const std::string& scale_name,
+        const TensorInfo& scale_info,
+        std::size_t scale_nbytes,
+        const TensorStorageInfo& storage)
+    {
+        auto it = fp8_scale_cache_.find(scale_name);
+        if (it != fp8_scale_cache_.end()) return;
+        CachedFp8Scale entry;
+        if (cudaMalloc(&entry.data, scale_nbytes) != cudaSuccess) {
+            throw std::runtime_error(
+                "rust storage executor: cudaMalloc for FP8 scale cache failed");
+        }
+        entry.nbytes = scale_nbytes;
+        // Stream-0 H2D so the dequant kernel (also on stream 0) sees the
+        // scale via implicit ordering. Previously this did a full
+        // flush_copy_streams() per cache miss — ~30k flushes for GLM-5.1's
+        // expert weights, each syncing every copy stream. Stream-0 ordering
+        // is free.
+        copy_storage_bytes_to_device_on(
+            storage.shard_id, storage.file_offset,
+            storage.nbytes, entry.data, /*stream=*/0);
+        (void)scale_info;
+        fp8_scale_cache_.emplace(scale_name, entry);
+    }
+
+    DeviceTensor dequant_fp8_tile_to_bf16(
+        const pie_weight_loader::PieLoaderStorageInstrView& instr,
+        const DeviceTensor& fp8_tile,
+        const std::vector<std::int64_t>& full_shape,
+        int row_start,
+        int rows,
+        const std::vector<std::int64_t>& tile_shape)
+    {
+        if (!instr.has_source) {
+            throw std::runtime_error(
+                "rust storage executor: FP8 Encode requires a checkpoint source");
+        }
+        if (full_shape.size() != 2) {
+            throw std::runtime_error(
+                "rust storage executor: FP8 Encode source must be 2-D");
+        }
+        const std::string& weight_name =
+            source_tensor_names_[instr.source.tensor_id];
+        const std::string scale_name = weight_name + "_scale_inv";
+        if (!loader_.contains(scale_name)) {
+            throw std::runtime_error(
+                "rust storage executor: FP8 Encode source '" + weight_name +
+                "' has no '_scale_inv' sibling tensor");
+        }
+        const TensorInfo& scale_info = loader_.info(scale_name);
+        if (scale_info.shape.size() != 2) {
+            throw std::runtime_error(
+                "rust storage executor: FP8 Encode scale '" + scale_name +
+                "' must be 2-D (block-scaled FP8)");
+        }
+        // Get the FULL (un-sharded) weight shape from the checkpoint so we
+        // can compute the true group_size. The tile's `full_shape` may be
+        // TP-sharded and not match the on-disk scale dimensions.
+        const TensorInfo& weight_info = loader_.info(weight_name);
+        if (weight_info.shape.size() != 2) {
+            throw std::runtime_error(
+                "rust storage executor: FP8 Encode weight '" + weight_name +
+                "' must be 2-D on disk");
+        }
+        const int true_rows = static_cast<int>(weight_info.shape[0]);
+        const int true_cols = static_cast<int>(weight_info.shape[1]);
+        const int scale_rows = static_cast<int>(scale_info.shape[0]);
+        const int scale_cols = static_cast<int>(scale_info.shape[1]);
+        const int true_group_rows = (scale_rows > 0) ? (true_rows / scale_rows) : 0;
+        const int true_group_cols = (scale_cols > 0) ? (true_cols / scale_cols) : 0;
+        if (true_group_rows <= 0 || true_group_cols <= 0
+            || true_group_rows != true_group_cols) {
+            throw std::runtime_error(
+                "rust storage executor: FP8 Encode source '" + weight_name +
+                "' has unsupported scale shape");
+        }
+        const int group_size = true_group_rows;  // typically 128
+
+        // Detect TP shard by comparing rank-local full_shape to on-disk shape.
+        const int local_rows = static_cast<int>(full_shape[0]);
+        const int local_cols = static_cast<int>(full_shape[1]);
+        const int row_shard_factor = (local_rows > 0 && local_rows < true_rows)
+            ? (true_rows / local_rows) : 1;
+        const int col_shard_factor = (local_cols > 0 && local_cols < true_cols)
+            ? (true_cols / local_cols) : 1;
+
+        // Decode this rank's row/col offset within the full weight from
+        // source.stride.base_offset (in bytes; FP8 weights are 1 byte/elem).
+        const std::uint64_t base_byte = instr.source.stride.base_offset;
+        const std::uint64_t rank_row_off_full = base_byte / true_cols;
+        const std::uint64_t rank_col_off_full = base_byte % true_cols;
+
+        if (scale_info.dtype != DType::FP32) {
+            throw std::runtime_error(
+                "rust storage executor: FP8 Encode scale '" + scale_name +
+                "' must be FP32");
+        }
+        // Cache the full FP8 scale per weight: one disk read + one cudaMalloc
+        // amortised across every tile of the same Encode instruction.
+        const TensorStorageInfo storage = loader_.storage_info(scale_name);
+        const std::size_t scale_nbytes =
+            static_cast<std::size_t>(scale_rows) * scale_cols * sizeof(float);
+        ensure_fp8_scale_loaded(scale_name, scale_info, scale_nbytes, storage);
+        const auto& cached_scale = fp8_scale_cache_[scale_name];
+        const float* scale_full_ptr =
+            static_cast<const float*>(cached_scale.data);
+
+        // For TP-sharded weights we need a compact rank-local scale slice
+        // so the kernel sees contiguous [local_rows/gs, local_cols/gs] data.
+        // Use a persistent device buffer that grows on demand.
+        const int local_scale_rows = local_rows / group_size;
+        const int local_scale_cols = local_cols / group_size;
+        const float* scale_for_kernel = scale_full_ptr;
+        if (row_shard_factor != 1 || col_shard_factor != 1) {
+            const std::size_t want_bytes =
+                static_cast<std::size_t>(local_scale_rows) *
+                local_scale_cols * sizeof(float);
+            ensure_dev_buffer(fp8_scale_local_ptr_, fp8_scale_local_bytes_,
+                              want_bytes);
+            const int rank_scale_row_off =
+                static_cast<int>(rank_row_off_full) / group_size;
+            const int rank_scale_col_off =
+                static_cast<int>(rank_col_off_full) / group_size;
+            // One D2D per scale row of the rank's slice. Tiny copies; the
+            // batched async memcpys overlap well on the default stream.
+            for (int r = 0; r < local_scale_rows; ++r) {
+                CUDA_CHECK(cudaMemcpyAsync(
+                    static_cast<float*>(fp8_scale_local_ptr_)
+                        + static_cast<std::size_t>(r) * local_scale_cols,
+                    scale_full_ptr
+                        + static_cast<std::size_t>(rank_scale_row_off + r) *
+                              scale_cols
+                        + rank_scale_col_off,
+                    static_cast<std::size_t>(local_scale_cols) * sizeof(float),
+                    cudaMemcpyDeviceToDevice,
+                    /*stream=*/0));
+            }
+            scale_for_kernel = static_cast<const float*>(fp8_scale_local_ptr_);
+        }
+
+        if (row_start % group_size != 0 && row_start + rows != local_rows) {
+            throw std::runtime_error(
+                "rust storage executor: FP8 Encode tile row range must align "
+                "to scale group rows");
+        }
+        const int scale_row_start = row_start / group_size;
+        const float* scale_dev =
+            scale_for_kernel +
+            static_cast<std::size_t>(scale_row_start) * local_scale_cols;
+        // Persistent BF16 scratch — grown once, reused for every tile.
+        const std::size_t bf16_bytes =
+            static_cast<std::size_t>(rows) *
+            static_cast<std::size_t>(local_cols) * sizeof(std::uint16_t);
+        ensure_dev_buffer(fp8_bf16_scratch_ptr_, fp8_bf16_scratch_bytes_,
+                          bf16_bytes);
+        // The FP8 source tile is enqueued directly on stream 0 by
+        // materialize_encode_input_bf16_rows, so the dequant kernel below
+        // (also on stream 0) sees those bytes via implicit stream ordering.
+        // No explicit copy-stream flush is needed.
+        kernels::launch_dequant_fp8_e4m3_to_bf16_per_group(
+            static_cast<const std::uint8_t*>(fp8_tile.data()),
+            fp8_bf16_scratch_ptr_,
+            scale_dev,
+            rows,
+            local_cols,
+            group_size,
+            /*stream=*/0);
+        CUDA_CHECK(cudaGetLastError());
+        // Wrap the persistent scratch in a non-owning DeviceTensor view so
+        // the caller's existing API doesn't need to change.
+        return DeviceTensor::view(
+            fp8_bf16_scratch_ptr_, DType::BF16, tile_shape);
+    }
+#endif
 
     DType encode_source_dtype(
         const pie_weight_loader::PieLoaderStorageInstrView& instr)
@@ -1154,6 +1465,14 @@ private:
         int rows,
         int cols) const
     {
+        // FP8 Encode source needs a [rows/128, cols/128] block scale; tiling
+        // the dequant by an arbitrary row count would slice through the 128
+        // row block boundary. Disable tiling on FP8 sources — GLM-5.1 expert
+        // weights at [2048, 6144] fit comfortably (~50MB BF16 scratch).
+        if (source_dtype == DType::FP8_E4M3 ||
+            source_dtype == DType::FP8_E5M2) {
+            return rows;
+        }
         const std::uint64_t max_tile_bytes =
             instr.max_tile_bytes == 0 ? (64ull << 20) : instr.max_tile_bytes;
         const std::uint64_t source_row_bytes =
@@ -1216,6 +1535,42 @@ private:
                 /*stream=*/0);
             CUDA_CHECK(cudaGetLastError());
             return;
+        case pie_weight_loader::PieLoaderQuantScheme::Mxfp4E2M1E8M0: {
+            // Output is packed nibbles `[rows, cols/2]` uint8. Scale is
+            // E8M0 `[rows, cols/32]` uint8.
+            if (out.dtype() != DType::UINT8 && out.dtype() != DType::MXFP4_PACKED) {
+                throw std::runtime_error(
+                    "rust storage executor: MXFP4 Encode output dtype mismatch");
+            }
+            if (scale.dtype() != DType::UINT8) {
+                throw std::runtime_error(
+                    "rust storage executor: MXFP4 Encode scale dtype mismatch");
+            }
+            if (cols % 32 != 0) {
+                throw std::runtime_error(
+                    "rust storage executor: MXFP4 Encode cols must be a "
+                    "multiple of 32");
+            }
+            const std::uint64_t packed_row_bytes =
+                static_cast<std::uint64_t>(cols) / 2;
+            const std::uint64_t scale_row_bytes =
+                static_cast<std::uint64_t>(cols) / 32;
+            std::uint8_t* packed_dst =
+                static_cast<std::uint8_t*>(out.data()) +
+                static_cast<std::uint64_t>(row_start) * packed_row_bytes;
+            std::uint8_t* scale_dst =
+                static_cast<std::uint8_t*>(scale.data()) +
+                static_cast<std::uint64_t>(row_start) * scale_row_bytes;
+            kernels::quantize_bf16_to_mxfp4_e2m1_per_block(
+                bf16.data(),
+                packed_dst,
+                scale_dst,
+                rows,
+                cols,
+                /*stream=*/0);
+            CUDA_CHECK(cudaGetLastError());
+            return;
+        }
         default:
             throw std::runtime_error(
                 "rust storage executor: unsupported Encode quant scheme");
@@ -1243,17 +1598,49 @@ private:
         }
         DeviceTensor& out = buffer_tensor(instr.output_buffers.ptr[0]);
         DeviceTensor& scale = buffer_tensor(instr.output_buffers.ptr[1]);
-        const auto shape = out.shape();
+        // For MXFP4 the output buffer is allocated flat (UINT8 [bytes]); the
+        // logical 2-D `[rows, cols]` shape lives on the tensor decl. Recover
+        // it from the program index.
+        std::vector<std::int64_t> shape = out.shape();
+        if (instr.transform_to ==
+            pie_weight_loader::PieLoaderQuantScheme::Mxfp4E2M1E8M0) {
+            const auto& buf = program_index_.buffer(instr.output_buffers.ptr[0]);
+            if (buf.has_tensor) {
+                const auto& t = program_index_.tensor(buf.tensor_id);
+                shape = wl_cpp::i64_slice_to_vector(t.shape);
+            }
+        }
         if (shape.size() != 2) {
             throw std::runtime_error(
                 "rust storage executor: runtime Encode expects a 2-D weight");
         }
         const int rows = static_cast<int>(shape[0]);
         const int cols = static_cast<int>(shape[1]);
-        if (scale.dtype() != DType::FP32 ||
-            scale.shape() != std::vector<std::int64_t>{shape[0]}) {
-            throw std::runtime_error(
-                "rust storage executor: Encode scale output must be FP32 [rows]");
+        switch (instr.transform_to) {
+        case pie_weight_loader::PieLoaderQuantScheme::Mxfp4E2M1E8M0: {
+            // MXFP4 scale is `[rows, cols/32]` uint8 (E8M0 byte per block).
+            // Scale buffer may also be allocated 1-D flat — fetch the logical
+            // shape from the decl for comparison.
+            std::vector<std::int64_t> scale_shape = scale.shape();
+            const auto& sbuf = program_index_.buffer(instr.output_buffers.ptr[1]);
+            if (sbuf.has_tensor) {
+                const auto& st = program_index_.tensor(sbuf.tensor_id);
+                scale_shape = wl_cpp::i64_slice_to_vector(st.shape);
+            }
+            const std::vector<std::int64_t> want{shape[0], shape[1] / 32};
+            if (scale_shape != want) {
+                throw std::runtime_error(
+                    "rust storage executor: MXFP4 Encode scale must be U8 [rows, cols/32]");
+            }
+            break;
+        }
+        default:
+            if (scale.dtype() != DType::FP32 ||
+                scale.shape() != std::vector<std::int64_t>{shape[0]}) {
+                throw std::runtime_error(
+                    "rust storage executor: Encode scale output must be FP32 [rows]");
+            }
+            break;
         }
         stats.runtime_quantized_weights += 1;
         stats.runtime_quant_bytes_after += out.nbytes();
@@ -1718,27 +2105,18 @@ private:
         cudaMemcpy(e8m0.data(), t.data(), n, cudaMemcpyDeviceToHost);
 
         if (shape.size() == 2) {
-            // 2D block scale [row_blocks, col_blocks] → expand to
-            // per-channel [row_blocks * 128] using max across columns
+            // 2D block scale [row_blocks, col_blocks]: convert E8M0 → F32
+            // keeping the full 2D shape for per-group dequant.
             const int row_blocks = static_cast<int>(shape[0]);
             const int col_blocks = static_cast<int>(shape[1]);
-            const int rows = row_blocks * 128;
-            std::vector<float> per_row(static_cast<std::size_t>(rows));
-            for (int rb = 0; rb < row_blocks; ++rb) {
-                float max_scale = 0.f;
-                for (int cb = 0; cb < col_blocks; ++cb) {
-                    float s = std::ldexp(1.0f,
-                        static_cast<int>(e8m0[static_cast<std::size_t>(rb) * col_blocks + cb]) - 127);
-                    if (s > max_scale) max_scale = s;
-                }
-                for (int r = 0; r < 128; ++r) {
-                    per_row[static_cast<std::size_t>(rb) * 128 + r] = max_scale;
-                }
+            std::vector<float> f32_2d(n);
+            for (std::size_t i = 0; i < n; ++i) {
+                f32_2d[i] = std::ldexp(1.0f, static_cast<int>(e8m0[i]) - 127);
             }
-            auto converted = DeviceTensor::allocate(DType::FP32, {rows});
-            cudaMemcpy(converted.data(), per_row.data(),
-                       static_cast<std::size_t>(rows) * sizeof(float),
-                       cudaMemcpyHostToDevice);
+            auto converted = DeviceTensor::allocate(DType::FP32,
+                {row_blocks, col_blocks});
+            cudaMemcpy(converted.data(), f32_2d.data(),
+                       n * sizeof(float), cudaMemcpyHostToDevice);
             weights_.insert(name + ".f32", std::move(converted));
         } else {
             std::vector<float> f32(n);
@@ -1768,10 +2146,21 @@ private:
                     attachment.scale_tensor_name + "' for '" +
                     attachment.tensor_name + "' was not finalized");
             }
-            convert_e8m0_scale_to_f32(attachment.scale_tensor_name);
-            const std::string f32_name = attachment.scale_tensor_name + ".f32";
-            const bool has_f32 = weights_.find(f32_name) != weights_.end();
-            const std::string& scale_name = has_f32 ? f32_name : attachment.scale_tensor_name;
+            // MXFP4 (group_size 32) keeps its raw E8M0 byte scale: the
+            // MXFP4 GEMM / dequant kernels and make_expert_weight_view all
+            // require U8 E8M0 bytes (gemm.cpp asserts scale_dtype==UINT8).
+            // Only the block-scaled FP8 path (e.g. DeepSeek-V4, group 128)
+            // wants the E8M0 bytes expanded to F32 2^(b-127) factors.
+            const bool is_mxfp4_scale = (attachment.group_size == 32);
+            std::string scale_name = attachment.scale_tensor_name;
+            if (!is_mxfp4_scale) {
+                convert_e8m0_scale_to_f32(attachment.scale_tensor_name);
+                const std::string f32_name =
+                    attachment.scale_tensor_name + ".f32";
+                if (weights_.find(f32_name) != weights_.end()) {
+                    scale_name = f32_name;
+                }
+            }
             QuantMeta meta;
             meta.kind = quant_meta_kind(attachment.granularity);
             meta.scale_name = scale_name;
@@ -1827,6 +2216,27 @@ private:
     SlabScatterPlacement* slab_placements_device_ = nullptr;
     std::size_t slab_placement_capacity_ = 0;
     std::vector<SlabScatterPlacement> slab_placement_host_;
+
+    // FP8 Encode scratch: persistent device buffers reused across all
+    // FP8→bf16→encode tiles, so we avoid one cudaMalloc per weight
+    // (cudaMalloc on B200 synchronises the whole device — ~ms per call).
+    //
+    // - fp8_bf16_scratch_*    : tile-sized BF16 scratch buffer
+    // - fp8_scale_cache_      : per-weight cached FP8 scale tensor
+    // - fp8_scale_local_*     : tile-sized rank-local scale slice
+    void*       fp8_bf16_scratch_ptr_ = nullptr;
+    std::size_t fp8_bf16_scratch_bytes_ = 0;
+    struct CachedFp8Scale {
+        void*       data = nullptr;
+        std::size_t nbytes = 0;
+    };
+    std::unordered_map<std::string, CachedFp8Scale> fp8_scale_cache_;
+    void*       fp8_scale_local_ptr_ = nullptr;
+    std::size_t fp8_scale_local_bytes_ = 0;
+    // Reused per-tile FP8 source-tile device buffer. Avoids one cudaMalloc
+    // per Encode tile (~hundreds of thousands of calls for GLM-5.1's MoE).
+    void*       fp8_source_tile_ptr_ = nullptr;
+    std::size_t fp8_source_tile_bytes_ = 0;
 #endif
     wl_cpp::StorageProgramIndex program_index_{"rust storage executor"};
 };

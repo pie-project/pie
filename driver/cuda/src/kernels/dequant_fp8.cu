@@ -3,15 +3,6 @@
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
 
-// NOTE on the design choice: at runtime, the right move is to skip
-// dequant entirely and use cuBLAS's FP8 GEMM (cublasGemmEx with
-// CUDA_R_8F_E4M3 + CUBLAS_COMPUTE_32F) — that path also accepts a
-// scalar scale per operand and avoids the 2× memory blow-up. We keep
-// this load-time dequant kernel as the simple option that lets
-// existing bf16 GEMMs run unchanged. Larger Mistral checkpoints
-// (24B+) will need the fused-GEMM path; the kernel here is a
-// reference + small-model fallback.
-
 namespace pie_cuda_driver::kernels {
 
 namespace {
@@ -26,10 +17,6 @@ __global__ void dequant_fp8_e4m3_kernel(
 {
     const std::size_t i = static_cast<std::size_t>(blockIdx.x) * BLOCK + threadIdx.x;
     if (i >= n) return;
-    // Use the half-conversion intrinsic to keep this dependency on the
-    // CUDA FP8 ABI minimal; older CUDA toolkits don't expose a direct
-    // fp8 → fp32 free function, but the storage → __half path is stable
-    // back to 11.8.
     const __half h = __nv_cvt_fp8_to_halfraw(src[i], __NV_E4M3);
     const float f = __half2float(h) * scale;
     dst[i] = __float2bfloat16(f);
@@ -38,7 +25,7 @@ __global__ void dequant_fp8_e4m3_kernel(
 __global__ void dequant_fp8_e4m3_per_channel_kernel(
     const __nv_fp8_storage_t* __restrict__ src,
     __nv_bfloat16*            __restrict__ dst,
-    const float*              __restrict__ scale_inv,  // [rows]
+    const float*              __restrict__ scale_inv,
     int                                    cols)
 {
     const int row = blockIdx.x;
@@ -46,6 +33,26 @@ __global__ void dequant_fp8_e4m3_per_channel_kernel(
     const float s = scale_inv[row];
     const std::size_t off = static_cast<std::size_t>(row) * cols;
     for (int j = tid; j < cols; j += BLOCK) {
+        const __half h = __nv_cvt_fp8_to_halfraw(src[off + j], __NV_E4M3);
+        dst[off + j] = __float2bfloat16(__half2float(h) * s);
+    }
+}
+
+__global__ void dequant_fp8_e4m3_per_group_kernel(
+    const __nv_fp8_storage_t* __restrict__ src,
+    __nv_bfloat16*            __restrict__ dst,
+    const float*              __restrict__ scales,
+    int                                    cols,
+    int                                    group_size,
+    int                                    scale_cols)
+{
+    const int row = blockIdx.x;
+    const int tid = threadIdx.x;
+    const int scale_row = row / group_size;
+    const std::size_t off = static_cast<std::size_t>(row) * cols;
+    for (int j = tid; j < cols; j += BLOCK) {
+        const int scale_col = j / group_size;
+        const float s = scales[scale_row * scale_cols + scale_col];
         const __half h = __nv_cvt_fp8_to_halfraw(src[off + j], __NV_E4M3);
         dst[off + j] = __float2bfloat16(__half2float(h) * s);
     }
@@ -74,6 +81,19 @@ void launch_dequant_fp8_e4m3_to_bf16_per_channel(
         reinterpret_cast<const __nv_fp8_storage_t*>(fp8_in),
         static_cast<__nv_bfloat16*>(bf16_out),
         scale_inv_dev, cols);
+}
+
+void launch_dequant_fp8_e4m3_to_bf16_per_group(
+    const std::uint8_t* fp8_in, void* bf16_out,
+    const float* scale_dev, int rows, int cols,
+    int group_size, cudaStream_t stream)
+{
+    if (rows == 0 || cols == 0) return;
+    const int scale_cols = (cols + group_size - 1) / group_size;
+    dequant_fp8_e4m3_per_group_kernel<<<rows, BLOCK, 0, stream>>>(
+        reinterpret_cast<const __nv_fp8_storage_t*>(fp8_in),
+        static_cast<__nv_bfloat16*>(bf16_out),
+        scale_dev, cols, group_size, scale_cols);
 }
 
 }  // namespace pie_cuda_driver::kernels

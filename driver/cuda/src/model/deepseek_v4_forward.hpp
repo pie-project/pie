@@ -13,6 +13,7 @@ namespace pie_cuda_driver::model {
 
 struct DsV4ForwardCfg {
     int tp_size = 1;
+    int tp_rank = 0;
     NcclComm* tp_comm = nullptr;
     bool emit_logits = true;
     bool tp_greedy_argmax = false;
@@ -57,6 +58,30 @@ struct DsV4Workspace {
     DeviceTensor shared_up;      // [N, moe_I]
     DeviceTensor shared_act;     // [N, moe_I]
     DeviceTensor shared_out;     // [N, H]
+
+    // Attention sink correction
+    DeviceTensor attn_lse;       // [N, num_heads] fp32 — log-sum-exp from attention
+
+    // ── Compressed attention (C4/C128 layers) ────────────────────────
+    // Compressor projection scratch (reused per layer)
+    DeviceTensor comp_kv_proj;    // [N, coff_max * head_dim] BF16 — wkv projection
+    DeviceTensor comp_score_proj; // [N, coff_max * head_dim] BF16 — wgate projection
+    // Compressed KV buffer (rewritten each layer; holds one layer's worth)
+    DeviceTensor comp_kv;         // [max_comp_tokens, head_dim] BF16
+    // Compressed attention output and LSE (per layer, reused)
+    DeviceTensor comp_attn_out;   // [N, num_heads * head_dim] BF16
+    DeviceTensor comp_attn_lse;   // [N, num_heads] F32
+
+    // Routed expert scratch
+    DeviceTensor expert_in;      // [N, H] bf16 — gathered input rows
+    DeviceTensor expert_gate_w;  // [moe_I, H] bf16 — dequanted gate weight
+    DeviceTensor expert_up_w;    // [moe_I, H] bf16 — dequanted up weight
+    DeviceTensor expert_down_w;  // [H, moe_I] bf16 — dequanted down weight
+    DeviceTensor expert_gate;    // [N, moe_I] bf16 — gate output
+    DeviceTensor expert_up;      // [N, moe_I] bf16 — up output
+    DeviceTensor expert_out;     // [N, H] bf16 — expert output
+    DeviceTensor route_idx;      // [N*K] int32 — token indices for one expert
+    DeviceTensor route_w;        // [N*K] fp32 — routing weights
 
     // Logits
     DeviceTensor logits;         // [O, vocab]

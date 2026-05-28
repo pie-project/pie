@@ -2095,6 +2095,15 @@ int run_impl(int argc,
     const bool is_dsv4_arch = bound_model.is_deepseek_v4();
     const bool is_glm5_arch = bound_model.is_glm5();
 
+    // Workaround: cuBLASLt BF16 GEMM hangs on B200 + CUDA 13 for Kimi K2.6's
+    // o_proj shape (small M, sharded K). Disable LT for Kimi to force the
+    // cublasGemmEx fallback. Skip if user already set PIE_CUBLASLT_BF16
+    // explicitly. setenv before any cuBLAS GEMM is launched so the static
+    // cached value in `use_cublaslt_bf16()` picks it up.
+    if (is_kimi_arch && std::getenv("PIE_CUBLASLT_BF16") == nullptr) {
+        setenv("PIE_CUBLASLT_BF16", "0", /*overwrite=*/0);
+    }
+
     const std::size_t num_layers_bound = bound_model.num_layers();
     if (verbose) {
         std::cerr << "[pie-driver-cuda] schema bound: "
@@ -2647,6 +2656,12 @@ int run_impl(int argc,
     pie_cuda_driver::ForwardFn forward_fn;
     pie_cuda_driver::model::LlamaLikePlanState llama_plan;
     pie_cuda_driver::model::KimiPlanState kimi_plan;
+    // GLM-5.1 reuses the Kimi MLA plan machinery. This MUST live at the
+    // function scope (like kimi_plan) because forward_fn.prepare/.body
+    // capture it by reference and run during serving — declaring it inside
+    // the `else if (is_glm5_arch)` block left the captures dangling once
+    // that block closed, corrupting memory on the first forward.
+    pie_cuda_driver::model::KimiPlanState glm5_mla_plan;
     // Gemma-4 26B-A4B's MoE block needs a routed-experts workspace
     // alongside the dense forward state. Inert (zero-byte) on dense
     // E2B / E4B / 31B variants.
@@ -2671,11 +2686,12 @@ int run_impl(int argc,
     }
     if (is_dsv4_arch) {
         const int dsv4_tp_size = cfg.distributed.tp_size;
+        const int dsv4_tp_rank = cfg.distributed.tp_rank;
         const bool dsv4_emit_logits = cfg.distributed.tp_rank == 0;
         pie_cuda_driver::NcclComm* dsv4_tp_comm = tp_comm_ptr;
         forward_fn.supports_compact_logits = true;
         forward_fn.body = [&engine, &weights_dsv4, &dsv4_ws,
-                           dsv4_tp_size, dsv4_tp_comm, dsv4_emit_logits](
+                           dsv4_tp_size, dsv4_tp_rank, dsv4_tp_comm, dsv4_emit_logits](
             pie_cuda_driver::model::Qwen3Workspace& ws,
             pie_cuda_driver::KvCache& cache,
             pie_cuda_driver::AttentionWorkspace& attn_ws,
@@ -2698,6 +2714,7 @@ int run_impl(int argc,
             (void)slot_ids_h; (void)is_fresh_h; (void)slot_ids_d;
             pie_cuda_driver::model::DsV4ForwardCfg dsv4_fwd{};
             dsv4_fwd.tp_size = dsv4_tp_size;
+            dsv4_fwd.tp_rank = dsv4_tp_rank;
             dsv4_fwd.tp_comm = dsv4_tp_comm;
             dsv4_fwd.emit_logits = dsv4_emit_logits;
             pie_cuda_driver::model::dsv4_forward_paged(
@@ -2780,7 +2797,6 @@ int run_impl(int argc,
         const bool glm5_emit_logits = cfg.distributed.tp_rank == 0;
         pie_cuda_driver::NcclComm* glm5_tp_comm = tp_comm_ptr;
         forward_fn.supports_compact_logits = true;
-        pie_cuda_driver::model::KimiPlanState glm5_mla_plan;
         forward_fn.prepare = [&engine, &mla_cache, &glm5_mla_plan, glm5_tp_size](
             pie_cuda_driver::AttentionWorkspace& attn_ws,
             const pie_cuda_driver::ForwardFn::PrepareInputs& prep) {
