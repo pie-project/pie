@@ -1558,9 +1558,15 @@ __global__ void chunk_gated_delta_prefill_batched_fla_kernel(
     float*       __restrict__ out,
     int V_h, int K_d, int V_d)
 {
-    const int r = blockIdx.x;
-    const int h = blockIdx.y;
-    const int v_idx = threadIdx.x;
+    // Grid: (NV, R, V_h) where NV = ceil(V_d / BV). Each block owns
+    // one V-tile of BV columns. Lowering BV from V_d (single block per
+    // (r, h)) to smaller values raises grid parallelism, reduces
+    // per-block register pressure, and lets the SM scheduler hide
+    // memory latency across more in-flight warps.
+    const int vt = blockIdx.x;
+    const int r  = blockIdx.y;
+    const int h  = blockIdx.z;
+    const int v_idx = vt * BV + threadIdx.x;
     if (v_idx >= V_d) return;
 
     const int t0 = static_cast<int>(qo_indptr[r]);
@@ -1650,9 +1656,10 @@ __global__ void chunk_gated_delta_prefill_batched_gqa_fla_kernel(
     float*       __restrict__ out,
     int K_h, int V_h, int K_d, int V_d)
 {
-    const int r = blockIdx.x;
-    const int h = blockIdx.y;
-    const int v_idx = threadIdx.x;
+    const int vt = blockIdx.x;
+    const int r  = blockIdx.y;
+    const int h  = blockIdx.z;
+    const int v_idx = vt * BV + threadIdx.x;
     if (v_idx >= V_d) return;
     const int repeat = V_h / K_h;
     const int h_k = h / repeat;
@@ -2074,8 +2081,9 @@ void launch_chunk_gated_delta_prefill_batched(
     constexpr int BV_FLA     = 128;
     if (qwen_gdn_fla_prefill_enabled() &&
         !qwen_gdn_k_last_state_enabled() &&
-        K_d <= BK_MAX_FLA && V_d == BV_FLA) {
-        dim3 grid_fla(R, V_h);
+        K_d <= BK_MAX_FLA && V_d % BV_FLA == 0) {
+        const int NV = V_d / BV_FLA;
+        dim3 grid_fla(NV, R, V_h);
         dim3 block_fla(BV_FLA);
         const int shmem_bytes_fla = 2 * BK_MAX_FLA * sizeof(float);
         chunk_gated_delta_prefill_batched_fla_kernel<float, BV_FLA, BK_MAX_FLA><<<
@@ -2120,8 +2128,9 @@ void launch_chunk_gated_delta_prefill_batched_state_bf16(
     constexpr int BV_FLA     = 128;
     if (qwen_gdn_fla_prefill_enabled() &&
         !qwen_gdn_k_last_state_enabled() &&
-        K_d <= BK_MAX_FLA && V_d == BV_FLA) {
-        dim3 grid_fla(R, V_h);
+        K_d <= BK_MAX_FLA && V_d % BV_FLA == 0) {
+        const int NV = V_d / BV_FLA;
+        dim3 grid_fla(NV, R, V_h);
         dim3 block_fla(BV_FLA);
         const int shmem_bytes_fla = 2 * BK_MAX_FLA * sizeof(float);
         chunk_gated_delta_prefill_batched_fla_kernel<__nv_bfloat16, BV_FLA, BK_MAX_FLA><<<
