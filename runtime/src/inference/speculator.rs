@@ -57,6 +57,15 @@ pub(crate) struct StagedEntry {
     pub spec_token_ids: Vec<u32>,
     pub spec_position_ids: Vec<u32>,
     pub output_spec_flags: Vec<bool>,
+    /// True when the staged entry's underlying request uses an
+    /// rs_cache (recurrent-state) slot. For these contexts the api
+    /// layer rewrites output_spec_flags=[false] in the cold path
+    /// before submit, so the chain extender's prev_req (and thus this
+    /// entry) always has [false]. The inferlet's outgoing request
+    /// still carries [true] when SpecMode::System is active, so we
+    /// must skip comparing output_spec_flags on rs_cache entries to
+    /// avoid 99% chain-drop rates.
+    pub uses_rs_cache: bool,
     /// Claim-side hint for the extender that owns this staged fire.
     /// The inferlet can claim a pre-fired final token while telling
     /// its extender not to submit another stage.
@@ -71,11 +80,23 @@ pub(crate) fn entry_matches_request(
     entry: &StagedEntry,
     request: &pie_bridge::ForwardRequest,
 ) -> bool {
-    Some(entry.anchor_token) == request.token_ids.first().copied()
+    let base = Some(entry.anchor_token) == request.token_ids.first().copied()
         && Some(entry.anchor_pos) == request.position_ids.first().copied()
         && entry.spec_token_ids == request.spec_token_ids
-        && entry.spec_position_ids == request.spec_position_ids
-        && entry.output_spec_flags == request.output_spec_flags
+        && entry.spec_position_ids == request.spec_position_ids;
+    if !base {
+        return false;
+    }
+    // For rs_cache contexts the api layer's cold path rewrites
+    // output_spec_flags=[false] before submit, so the chain extender's
+    // staged entry always has [false]. The inferlet's outgoing request
+    // still has [true] when SpecMode::System is active. Skip the flag
+    // comparison here — the rewrite makes the staged fire's output
+    // shape identical regardless of which flag the inferlet sent.
+    if entry.uses_rs_cache {
+        return true;
+    }
+    entry.output_spec_flags == request.output_spec_flags
 }
 
 /// Per-model speculator state.
@@ -483,6 +504,7 @@ pub(crate) fn process_chain_job(job: ChainExtJob) {
                                         output_spec_flags: next_req
                                             .output_spec_flags
                                             .clone(),
+                                        uses_rs_cache: !next_req.rs_slot_ids.is_empty(),
                                         allow_extend: next_allow_extend,
                                         output_rx: final_rx_next,
                                     });
