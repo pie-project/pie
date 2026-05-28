@@ -97,6 +97,38 @@ pub struct DaemonInfo {
 }
 
 // =============================================================================
+// Fault classification for handle_request
+// =============================================================================
+
+/// Fault domain for a daemon HTTP request failure. Mapped to a status code at
+/// the response boundary so the engine-vs-inferlet attribution stays visible
+/// to clients (see `runtime/src/daemon.rs::Daemon::fault_response`).
+#[derive(Clone, Copy, Debug)]
+enum FaultClass {
+    /// Pie-server failed to set up the guest call (body buffer, instantiate,
+    /// missing wasi:http export, new-incoming-request, new-outparam). Status `500`.
+    HostSetup,
+    /// Pie-server set up correctly; the guest violated the WASI HTTP contract
+    /// (set outparam to error, never set outparam, or trapped during `handle`).
+    /// Status `502`.
+    GuestFault,
+    /// The spawned guest task panicked or was aborted in-flight — the engine
+    /// is the immediate culprit from the client's POV. Status `503` with
+    /// `Retry-After: 1`.
+    InFlightCrash,
+}
+
+impl FaultClass {
+    fn status(self) -> hyper::StatusCode {
+        match self {
+            FaultClass::HostSetup => hyper::StatusCode::INTERNAL_SERVER_ERROR,
+            FaultClass::GuestFault => hyper::StatusCode::BAD_GATEWAY,
+            FaultClass::InFlightCrash => hyper::StatusCode::SERVICE_UNAVAILABLE,
+        }
+    }
+}
+
+// =============================================================================
 // Daemon
 // =============================================================================
 
@@ -194,78 +226,166 @@ impl Daemon {
     ///
     /// Each request gets a fresh Store and component instance. The WASM
     /// component must export `wasi:http/incoming-handler@0.2.4`.
+    ///
+    /// Failures are classified into three fault domains and surfaced to the
+    /// client as a status code plus a stable, short body tag (no anyhow chain,
+    /// no internal paths or symbols — those stay in `tracing::error!`):
+    ///   - `500` host setup fault (body buffer, instantiate, missing export,
+    ///     new-incoming-request, new-outparam).
+    ///   - `502` upstream/guest fault (guest set outparam to error, guest
+    ///     never set outparam, handler trap).
+    ///   - `503` in-flight engine crash (spawned handler task panicked or was
+    ///     aborted); includes `Retry-After: 1`.
+    /// Once the guest writes to the outparam, its response is returned
+    /// verbatim — guest status codes are not rewritten.
     async fn handle_request(
         username: String,
         program: ProgramName,
         _input: String,
         req: hyper::Request<hyper::body::Incoming>,
     ) -> Result<hyper::Response<HyperOutgoingBody>> {
-        // Buffer the request body before the WASM handler runs in a spawned
-        // task below. hyper's Incoming body uses a zero-capacity channel that
-        // requires sender and receiver to poll in the same task; a spawned
-        // handler deadlocks on bodies spanning multiple TCP segments (>~16KB).
-        let (parts, body) = req.into_parts();
-        let collected = http_body_util::BodyExt::collect(body)
-            .await
-            .map_err(|e| anyhow!("Failed to read request body: {e}"))?;
-        let buffered_body = http_body_util::BodyExt::map_err(
-            http_body_util::Full::new(collected.to_bytes()),
-            |never: std::convert::Infallible| -> hyper::Error { match never {} },
-        );
-        let req = hyper::Request::from_parts(parts, buffered_body);
+        type HandleErr = (FaultClass, &'static str, anyhow::Error);
 
-        // Instantiate a fresh WASM component (store + instance) per request.
-        // Daemons serve HTTP responses directly, so there is no client to attach
-        // their stdout/stderr to. Route guest output to pie-server's tracing log
-        // (tagged with the program name) so inferlet diagnostics stay visible to
-        // operators instead of falling through to wasmtime's default sink.
-        let output = OutputMode::Server { program: program.to_string() };
-        let (mut store, instance) =
-            linker::instantiate(uuid::Uuid::new_v4(), username, &program, output, None).await?;
+        let result: std::result::Result<hyper::Response<HyperOutgoingBody>, HandleErr> = async {
+            // Buffer the request body before the WASM handler runs in a spawned
+            // task below. hyper's Incoming body uses a zero-capacity channel that
+            // requires sender and receiver to poll in the same task; a spawned
+            // handler deadlocks on bodies spanning multiple TCP segments (>~16KB).
+            let (parts, body) = req.into_parts();
+            let collected = http_body_util::BodyExt::collect(body).await.map_err(|e| {
+                (FaultClass::HostSetup, "body-buffer-failed",
+                 anyhow!("Failed to read request body: {e}"))
+            })?;
+            let buffered_body = http_body_util::BodyExt::map_err(
+                http_body_util::Full::new(collected.to_bytes()),
+                |never: std::convert::Infallible| -> hyper::Error { match never {} },
+            );
+            let req = hyper::Request::from_parts(parts, buffered_body);
 
-        // Convert the hyper request into WASI HTTP resources
-        let (sender, receiver) = oneshot::channel();
-        let req = store.data_mut().new_incoming_request(Scheme::Http, req)?;
-        let out = store.data_mut().new_response_outparam(sender)?;
+            // Instantiate a fresh WASM component (store + instance) per request.
+            // Daemons serve HTTP responses directly, so there is no client to attach
+            // their stdout/stderr to. Route guest output to pie-server's tracing log
+            // (tagged with the program name) so inferlet diagnostics stay visible to
+            // operators instead of falling through to wasmtime's default sink.
+            let output = OutputMode::Server { program: program.to_string() };
+            let (mut store, instance) =
+                linker::instantiate(uuid::Uuid::new_v4(), username, &program, output, None)
+                    .await
+                    .map_err(|e| (FaultClass::HostSetup, "instantiate-failed", e))?;
 
-        // Find the incoming-handler export
-        let (_, serve_export) = instance
-            .get_export(&mut store, None, "wasi:http/incoming-handler@0.2.4")
-            .ok_or_else(|| anyhow!("No 'wasi:http/incoming-handler' interface found"))?;
+            // Convert the hyper request into WASI HTTP resources
+            let (sender, receiver) = oneshot::channel();
+            let req = store
+                .data_mut()
+                .new_incoming_request(Scheme::Http, req)
+                .map_err(|e| (FaultClass::HostSetup, "new-incoming-request-failed", e))?;
+            let out = store
+                .data_mut()
+                .new_response_outparam(sender)
+                .map_err(|e| (FaultClass::HostSetup, "new-outparam-failed", e))?;
 
-        let (_, handle_func_export) = instance
-            .get_export(&mut store, Some(&serve_export), "handle")
-            .ok_or_else(|| anyhow!("No 'handle' function found"))?;
+            // Find the incoming-handler export
+            let (_, serve_export) = instance
+                .get_export(&mut store, None, "wasi:http/incoming-handler@0.2.4")
+                .ok_or_else(|| {
+                    (FaultClass::HostSetup, "missing-export",
+                     anyhow!("No 'wasi:http/incoming-handler' interface found"))
+                })?;
 
-        let handle_func = instance
-            .get_typed_func::<(Resource<IncomingRequest>, Resource<ResponseOutparam>), ()>(
-                &mut store,
-                &handle_func_export,
-            )
-            .map_err(|e| anyhow!("Failed to get 'handle' function: {e}"))?;
+            let (_, handle_func_export) = instance
+                .get_export(&mut store, Some(&serve_export), "handle")
+                .ok_or_else(|| {
+                    (FaultClass::HostSetup, "missing-export",
+                     anyhow!("No 'handle' function found"))
+                })?;
 
-        // Spawn the WASM handler — it writes the response via the outparam
-        let task = tokio::task::spawn(async move {
-            handle_func
-                .call_async(&mut store, (req, out))
-                .await
-                .map_err(|e| anyhow!("Handler error: {e}"))
-        });
+            let handle_func = instance
+                .get_typed_func::<(Resource<IncomingRequest>, Resource<ResponseOutparam>), ()>(
+                    &mut store,
+                    &handle_func_export,
+                )
+                .map_err(|e| {
+                    (FaultClass::HostSetup, "missing-export",
+                     anyhow!("Failed to get 'handle' function: {e}"))
+                })?;
 
-        // Wait for the response from the outparam channel
-        match receiver.await {
-            Ok(Ok(resp)) => Ok(resp),
-            Ok(Err(e)) => Err(e.into()),
-            Err(_) => {
-                // Outparam was never set — check the task for the real error
-                let e = match task.await {
-                    Ok(Err(e)) => e,
-                    Err(e) => e.into(),
-                    Ok(Ok(())) => anyhow!("handler completed without setting response"),
-                };
-                Err(e.context("guest never invoked `response-outparam::set` method"))
+            // Spawn the WASM handler — it writes the response via the outparam
+            let task = tokio::task::spawn(async move {
+                handle_func
+                    .call_async(&mut store, (req, out))
+                    .await
+                    .map_err(|e| anyhow!("Handler error: {e}"))
+            });
+
+            // Wait for the response from the outparam channel
+            match receiver.await {
+                Ok(Ok(resp)) => Ok(resp),
+                Ok(Err(e)) => Err((FaultClass::GuestFault, "outparam-error", e.into())),
+                Err(_) => {
+                    // Outparam was never set — discriminate guest trap vs task panic.
+                    match task.await {
+                        Ok(Err(e)) => Err((
+                            FaultClass::GuestFault,
+                            "handler-trap",
+                            e.context("guest never invoked `response-outparam::set` method"),
+                        )),
+                        Err(join_err) => Err((
+                            FaultClass::InFlightCrash,
+                            "handler-panic",
+                            anyhow!("{join_err}")
+                                .context("guest handler task panicked or was aborted"),
+                        )),
+                        Ok(Ok(())) => Err((
+                            FaultClass::GuestFault,
+                            "outparam-never-set",
+                            anyhow!("handler completed without setting response"),
+                        )),
+                    }
+                }
             }
         }
+        .await;
+
+        match result {
+            Ok(resp) => Ok(resp),
+            Err((class, tag, err)) => {
+                let status = class.status().as_u16();
+                tracing::error!(
+                    fault_class = ?class, fault_tag = tag, fault_status = status,
+                    "Daemon handle_request failed: {err:#}",
+                );
+                Ok(Self::fault_response(class, tag))
+            }
+        }
+    }
+
+    /// Build a fault response with a status from `class` and a short, stable
+    /// plain-text body equal to `tag`. The anyhow chain is intentionally NOT
+    /// placed in the body — it would leak internal topology / runtime versions
+    /// / wasmtime symbols to any caller, and would also lock pie's host-error
+    /// wire format to whatever `Display for anyhow::Error` happens to render.
+    /// Callers wanting a coded shape can match on the tag string; the detail
+    /// is recorded once via `tracing::error!`.
+    ///
+    /// Body tags currently in use:
+    /// `body-buffer-failed`, `instantiate-failed`,
+    /// `new-incoming-request-failed`, `new-outparam-failed`, `missing-export`
+    /// (status 500); `outparam-error`, `handler-trap`, `outparam-never-set`
+    /// (status 502); `handler-panic` (status 503, with `Retry-After: 1`).
+    fn fault_response(class: FaultClass, tag: &'static str) -> hyper::Response<HyperOutgoingBody> {
+        use http_body_util::{BodyExt, Full};
+        let body: HyperOutgoingBody = Full::new(bytes::Bytes::from_static(tag.as_bytes()))
+            .map_err(|never: std::convert::Infallible| match never {})
+            .boxed_unsync();
+        let mut builder = hyper::Response::builder()
+            .status(class.status())
+            .header(hyper::header::CONTENT_TYPE, "text/plain; charset=utf-8");
+        if matches!(class, FaultClass::InFlightCrash) {
+            builder = builder.header(hyper::header::RETRY_AFTER, "1");
+        }
+        builder
+            .body(body)
+            .expect("response builder never fails on static status + header + infallible body")
     }
 
     /// Cleanup: abort the listener and unregister.
