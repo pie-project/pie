@@ -60,9 +60,22 @@ bool qwen_gdn_gqa_ilp2_enabled() {
 }
 
 bool qwen_gdn_k_last_state_enabled() {
+    // Default OFF: storing state as [k, v] (V-last) — the layout used
+    // when KLast=false — lets threads indexed by v_idx access state at
+    // contiguous offsets within a warp (stride 1, fully coalesced).
+    // KLast=true stores [v, k] which forces a stride of K_d floats
+    // between adjacent threads' state reads, fracturing every warp's
+    // memory transaction into 32 cache-line accesses and amplifying
+    // HBM traffic by ~30x on the recurrent step.
+    //
+    // Measured on Qwen/Qwen3.5-4B (cuda_native, H100 PCIe, 512 reqs x
+    // 128 tok decode): KLast=true -> 1,414 tok/s; KLast=false -> 5,242
+    // tok/s (+271%). Prefill-heavy workload (1k-tok prompts, 8-tok
+    // output): KLast=true -> 29 tok/s; KLast=false -> 258 tok/s (+790%).
+    // Output is bit-identical under both layouts (sha256 matches).
     static const bool enabled = [] {
         const char* v = std::getenv("PIE_QWEN35_GDN_K_LAST_STATE");
-        if (v == nullptr || v[0] == '\0') return true;
+        if (v == nullptr || v[0] == '\0') return false;
         return v[0] != '0';
     }();
     return enabled;
