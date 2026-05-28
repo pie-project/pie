@@ -118,6 +118,8 @@ pub struct DriverCudaStats {
     pub avg_kernel_launch_us: u64,
     pub avg_sync_us: u64,
     pub avg_response_build_us: u64,
+    pub sum_sync_us: u64,
+    pub sum_kernel_launch_us: u64,
 }
 
 #[derive(Debug, Default, serde::Serialize)]
@@ -499,6 +501,8 @@ impl InferenceService {
                         avg_kernel_launch_us: avg(dc_kernel_launch),
                         avg_sync_us: avg(dc_sync),
                         avg_response_build_us: avg(dc_response_build),
+                        sum_sync_us: dc_sync,
+                        sum_kernel_launch_us: dc_kernel_launch,
                     },
                 },
                 post_dispatch: PostDispatchStats {

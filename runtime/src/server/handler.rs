@@ -187,6 +187,14 @@ impl Session {
                         serde_json::Value::from(inf.fire.execute.driver_cuda.avg_response_build_us),
                     );
                     stats.insert(
+                        format!("{}.fire.execute.driver_cuda.sum_sync_us", model_name),
+                        serde_json::Value::from(inf.fire.execute.driver_cuda.sum_sync_us),
+                    );
+                    stats.insert(
+                        format!("{}.fire.execute.driver_cuda.sum_kernel_launch_us", model_name),
+                        serde_json::Value::from(inf.fire.execute.driver_cuda.sum_kernel_launch_us),
+                    );
+                    stats.insert(
                         format!("{}.fire.post_dispatch.context_tick_us", model_name),
                         serde_json::Value::from(inf.fire.post_dispatch.avg_context_tick_us),
                     );

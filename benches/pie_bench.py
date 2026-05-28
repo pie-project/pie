@@ -626,6 +626,15 @@ async def run(args: argparse.Namespace):
                     await one(i, max_tokens=warmup_max_tokens)
 
         start_idx = args.warmup
+        # Snapshot cumulative stats after warmup so the final diff
+        # reflects only the measured window, not warmup fires.
+        pre_stats: dict[str, Any] = {}
+        try:
+            ok, body = await client.query("model_status", "")
+            if ok:
+                pre_stats = json.loads(body)
+        except Exception:
+            pass
         cuda_profiler_start(args.cuda_profiler_capture)
         start = time.perf_counter()
         try:
@@ -648,7 +657,18 @@ async def run(args: argparse.Namespace):
         try:
             ok, body = await client.query("model_status", "")
             if ok:
-                model_status = json.loads(body)
+                model_status_raw = json.loads(body)
+                # Diff cumulative counters against pre-warmup snapshot
+                # so the output only reflects the measured window.
+                model_status: dict[str, Any] = {}
+                for k, v in model_status_raw.items():
+                    pre = pre_stats.get(k)
+                    if isinstance(v, (int, float)) and isinstance(pre, (int, float)):
+                        model_status[k] = v - pre
+                    elif isinstance(v, list) and isinstance(pre, list) and len(v) == len(pre):
+                        model_status[k] = [a - b for a, b in zip(v, pre)]
+                    else:
+                        model_status[k] = v
                 for key, label in (
                     ("default.spec_attempted", "spec attempted"),
                     ("default.spec_hits", "spec hits"),
@@ -685,6 +705,9 @@ async def run(args: argparse.Namespace):
                     ("default.fire.execute.driver_cuda.kernel_launch_us", "fire.execute.driver_cuda.kernel_launch_us"),
                     ("default.fire.execute.driver_cuda.sync_us", "fire.execute.driver_cuda.sync_us"),
                     ("default.fire.execute.driver_cuda.response_build_us", "fire.execute.driver_cuda.response_build_us"),
+                    ("default.fire.execute.driver_cuda.sum_sync_us", "fire.execute.driver_cuda.sum_sync_us"),
+                    ("default.fire.execute.driver_cuda.sum_kernel_launch_us", "fire.execute.driver_cuda.sum_kernel_launch_us"),
+                    ("default.cumulative_batch_latency_us", "cumulative_batch_latency_us"),
                     ("default.fire.post_dispatch.context_tick_us", "fire.post_dispatch.context_tick_us"),
                     ("default.fire.post_dispatch.stats_update_us", "fire.post_dispatch.stats_update_us"),
                     (

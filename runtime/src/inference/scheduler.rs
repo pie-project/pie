@@ -61,9 +61,9 @@ pub(super) trait SchedulingPolicy: Send {
     fn on_fired(&mut self, fired_size: usize);
 
     /// Decide whether to fire or wait, given the current batch size.
-    /// `&mut self` so policies can ratchet internal state (e.g.,
-    /// AdaptivePolicy's `cohort_high_water`) on every poll.
-    fn decide(&mut self, current_batch_size: usize, prefill_cohort: bool) -> Decision;
+    /// `&mut self` so policies can update internal state on every poll
+    /// (e.g., `EagerPolicy`'s `cohort_high_water` ratchet).
+    fn decide(&mut self, current_batch_size: usize) -> Decision;
 }
 
 // =============================================================================
@@ -1039,13 +1039,34 @@ pub(crate) struct BatchScheduler {
 }
 
 /// Default size of the chain-extender pool per driver. Re-swept on L40
-/// after moving the main scheduler loop to a sync OS thread (5d3ff7bf):
-/// 16 narrowly wins over 30 (n=10: 23555 vs 23451 tok/s, sd 175 vs
-/// 238). With the main loop off the tokio runtime there's less
-/// wake-pickup contention between the pool workers and the scheduler,
-/// so a smaller pool where each worker handles ~16 jobs per fire
-/// amortizes per-task tokio scheduling overhead better.
-const CHAIN_EXT_POOL_SIZE: usize = 16;
+/// (gemma-4-E4B, conc=256, n=5 trials each):
+///   pool=2:  6633 ± 14 tok/s
+///   pool=4:  6633 ± 36 tok/s  (best single run 6710)
+///   pool=6:  6613 ±  5 tok/s
+///   pool=8:  6602 ± 25 tok/s
+///   pool=16: 6597 ± 21 tok/s  (previous default)
+///   pool=32: 6590 ± 32 tok/s
+///
+/// Smaller pools win because each chain job is ~25us of cheap work;
+/// the per-task tokio wake/schedule overhead dominates over the
+/// parallelism benefit beyond ~4 workers. With 256 jobs across 4
+/// workers, each handles ~64 jobs serially in <2ms — well under the
+/// ~25ms GPU compute window of the previous fire.
+///
+/// Override via `PIE_CHAIN_EXT_POOL_SIZE` env var to sweep without
+/// rebuilding.
+const CHAIN_EXT_POOL_SIZE_DEFAULT: usize = 4;
+
+fn chain_ext_pool_size() -> usize {
+    static CACHED: OnceLock<usize> = OnceLock::new();
+    *CACHED.get_or_init(|| {
+        std::env::var("PIE_CHAIN_EXT_POOL_SIZE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|&n: &usize| n > 0)
+            .unwrap_or(CHAIN_EXT_POOL_SIZE_DEFAULT)
+    })
+}
 
 impl BatchScheduler {
     /// Spawn a new batch scheduler for a single driver.
@@ -1063,7 +1084,7 @@ impl BatchScheduler {
         let (tx, rx) = crossbeam::channel::unbounded::<PendingRequest>();
         let submit_tx = tx.clone();
         let stats = Arc::new(SchedulerStats::default());
-        let chain_pool = Arc::new(super::speculator::ChainExtPool::new(CHAIN_EXT_POOL_SIZE));
+        let chain_pool = Arc::new(super::speculator::ChainExtPool::new(chain_ext_pool_size()));
 
         // Run the main scheduling loop on a dedicated OS thread with
         // crossbeam channels. Why: tokio's mpsc/select! wake-pickup
@@ -1258,7 +1279,7 @@ impl BatchScheduler {
             let decision = if next_pending.is_some() {
                 Decision::Fire
             } else {
-                policy.decide(batch.len(), batch.should_prefill_coalesce())
+                policy.decide(batch.len())
             };
             match decision {
                 Decision::Fire => {

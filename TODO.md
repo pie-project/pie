@@ -97,6 +97,81 @@ Bounded host-side optimizations exhausted. Remaining gap requires:
 - MTP draft head for Qwen3-0.6B (not available)
 - Attention backend swap (FlashInfer -> FlashAttention 2)
 
+### Speculation depth × concurrency interaction (gemma-4-E4B, L40)
+
+**FIXED** by stripping AdaptivePolicy down to two concepts:
+`fired_high_water` (monotonic max of fired batch sizes — the one
+firing-rule heuristic) and `last_latency` (deadlock watchdog when
+active concurrency drops below `fired_high_water`). Removed:
+`cohort_high_water` (per-batch ratchet driven by noisy
+`resident_count`), `prefill_cohort_grace`, `dense_cohort_wait`
+multiplier, `in_flight` gate, `PREFILL_COHORT_TARGET`.
+
+Diagnosis: the cohort_high_water ratchet locked the target at ~67
+due to transient `resident_count` spikes during speculative-context
+turnover. Real batches reached R=64 in ~700 µs but the policy
+waited the full `last_latency` (~20 ms) before timing out. Removing
+the ratchet eliminates the stall — fire happens immediately when
+batch.len() matches `fired_high_water`.
+
+| reqs | depth=0 (before/after) | depth=1 (before/after) | d=1/d=0 |
+|---:|---:|---:|---:|
+|  16 |   — / 957  |   — /  977 | 102% |
+|  32 | 1,686 / 1,741 |   882 / 1,742 | 100% |
+|  64 | 3,054 / 3,074 | 1,612 / 3,149 | 102% |
+| 128 | 4,822 / 4,908 | 3,789 / 5,019 | 102% |
+| 256 | 6,556 / 6,648 | 6,598 / 6,816 | 104% |
+
+Stripped policy is faster than the old one at every concurrency
+(both d=0 and d=1) AND simpler. depth=1 is net-positive at every
+concurrency (102%+ of d=0). At conc=64 + d=1, pie went from
+50.6% of vLLM (1,612 vs 3,199) to 98.4% (3,149).
+
+### 256x128 decode profile (gemma-4-E4B, L40, agents/alpha)
+
+Measured-window profile (excluding warmup):
+```
+Per-decode-fire breakdown (R=256, N=256, 128 fires):
+  GPU compute (sync_us):       ~25 ms     (88%)
+  Kernel launch (graph+memcpy): ~300 us    (graph replay confirmed)
+  Plan + H2D + wire_parse:     <50 us     (negligible)
+  Response dispatch:           ~180 us    (256 chain submits)
+  Batch build:                 ~100 us
+  IPC submit + recv:           ~4 us      (already minimal)
+
+Inter-fire serial gap:         ~1-3 ms    (post_dispatch_to_fire)
+  ↳ Scheduler thread blocks on req_rx.recv() waiting for the
+    chain pool to deliver next batch's requests. The tokio MPSC
+    round-trip + worker wake adds latency that can't overlap
+    with GPU compute.
+```
+
+**Optimization opportunities (decode steady-state):**
+
+1. **Pipelined chain extension** (biggest win, ~1-3ms/fire)
+   - Currently: response_dispatch → chain_pool.submit (tokio) →
+     pool worker wake → build_next_request → submit_chain (mpsc)
+     → scheduler.req_rx.recv() → accumulate → fire
+   - Fix: synchronously build next requests in response_dispatch
+     loop, push directly into BatchAccumulator. Bypass req_rx
+     entirely for the chain-extension path.
+   - Cross-module change: scheduler exposes accumulator, speculator
+     supports sync-build entry point.
+
+2. **Pre-allocate batch_build scratch** (~50us/fire)
+   - new_batched_forward_request_with_capacity allocates 20+ Vecs
+     each fire. Pool them across fires.
+
+3. **Batch chain pool submits** (~50-100us/fire)
+   - Currently 256 separate `pool.submit()` calls. Batch into one
+     per-shard call with a Vec<ChainExtJob>.
+
+**Won't help:**
+- CUDA graph replay (already working, 300us dispatch confirmed)
+- Fused lm_head argmax (already in the graph)
+- IPC ring optimizations (already at <5us per round-trip)
+- Batch size hist reporting fix (cosmetic, no perf impact)
+
 ### Probe hierarchy (current + planned)
 
 ```
