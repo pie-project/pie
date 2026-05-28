@@ -68,6 +68,20 @@ bool qwen_gdn_k_last_state_enabled() {
     return enabled;
 }
 
+// Use the fused recurrent step kernel that caches state values in
+// registers across the two analytical phases, halving HBM traffic on
+// the state slab (2R+2W -> 1R+1W per element). Default OFF until
+// parity is verified across all (K_d, V_d) combinations the kernel is
+// instantiated for; turn ON for benchmarking the new path.
+bool qwen_gdn_fused_step_enabled() {
+    static const bool enabled = [] {
+        const char* v = std::getenv("PIE_QWEN35_GDN_FUSED_STEP");
+        if (v == nullptr || v[0] == '\0') return false;
+        return v[0] != '0';
+    }();
+    return enabled;
+}
+
 __global__ void bf16_to_fp32_kernel(
     const __nv_bfloat16* __restrict__ x, float* __restrict__ y, std::size_t n)
 {
@@ -1078,6 +1092,239 @@ __global__ void recurrent_step_batched_gqa_kernel(
     }
 }
 
+// Fused recurrent-step kernel: same per-token math as
+// `recurrent_step_kernel` / `recurrent_step_batched_kernel`, but
+// reorganized to halve the state slab HBM traffic. The original
+// kernel reads state, scales by g and writes back, then reads state
+// again to apply delta and writes again (4 ops per element). The
+// fused variant:
+//
+//   1. Reads state ONCE into a per-thread register cache `s_cache[K_d]`.
+//   2. Accumulates sum_s_sk = Σ_k s[k]*sk[k] (proxy for kv_mem)
+//      and  sum_s_sq = Σ_k s[k]*sq[k] (proxy for partial out_v).
+//   3. Computes kv_mem = g * sum_s_sk, delta = (v - kv_mem) * beta.
+//   4. Computes out_v = g * sum_s_sq + delta * sum_sk_sq, where
+//      sum_sk_sq is a per-block constant precomputed once in shmem.
+//   5. Writes the updated state once: state[k,v] = s_cache[k]*g + sk[k]*delta.
+//
+// Memory traffic per (head, batch, v_idx): K_d state reads + K_d
+// state writes (1R+1W) vs the original's 2R+2W. Register footprint:
+// K_d floats per thread, fine for K_d up to 256 on H100 (255-reg cap).
+//
+// Output equivalence:
+//   final state[k,v] = s_initial[k,v] * g + sk[k] * delta
+//   out_v          = Σ_k (s_initial[k,v]*g + sk[k]*delta) * sq[k]
+//                  = g * Σ_k s_initial*sq + delta * Σ_k sk*sq
+//                  = g * sum_s_sq + delta * sum_sk_sq
+// — exactly the value the original kernel computes via its second
+// state read. The analytical decomposition introduces no extra FLOPs
+// (same 3 K_d FMAs per element) while saving half the state I/O.
+//
+// Template `K_D_MAX` bounds the per-thread state cache. We
+// dispatch at launch time on the actual K_d.
+template <typename StateT, bool KLast, int K_D_MAX>
+__global__ void recurrent_step_batched_fused_kernel(
+    const float* __restrict__ q_norm,
+    const float* __restrict__ k_norm,
+    const float* __restrict__ v,
+    const float* __restrict__ g_log,
+    const float* __restrict__ beta,
+    StateT*      __restrict__ state_base,
+    const int*   __restrict__ slot_ids,
+    long long slot_stride_elems,
+    float*       __restrict__ out,
+    int V_h, int K_d, int V_d)
+{
+    const int r = blockIdx.x;
+    const int h = blockIdx.y;
+    const int slot = slot_ids[r];
+
+    const long long bh = (long long)r * V_h + h;
+    const float* q_h = q_norm + bh * K_d;
+    const float* k_h = k_norm + bh * K_d;
+    const float* v_h = v      + bh * V_d;
+    const float  g_h = __expf(g_log[bh]);
+    const float  beta_h = beta[bh];
+
+    StateT* state = state_base
+        + (long long)slot * slot_stride_elems
+        + (long long)h * K_d * V_d;
+    float* out_bh = out + bh * V_d;
+
+    extern __shared__ float smem[];
+    float* sq = smem;
+    float* sk = smem + K_d;
+    // sum_sk_sq is a per-block scalar (same value for every v_idx
+    // since sk·sq depends only on the head). Reduce it cooperatively
+    // and broadcast via shared memory; saves K_d FMAs per thread.
+    float* sm_scalars = smem + 2 * K_d;  // [sum_sk_sq]
+
+    for (int i = threadIdx.x; i < K_d; i += blockDim.x) {
+        sq[i] = q_h[i];
+        sk[i] = k_h[i];
+    }
+    __syncthreads();
+
+    // Cooperative reduction of sum_sk_sq across the block.
+    float partial = 0.f;
+    for (int i = threadIdx.x; i < K_d; i += blockDim.x) {
+        partial += sk[i] * sq[i];
+    }
+    // Warp + block reduce.
+    for (int offset = 16; offset > 0; offset /= 2) {
+        partial += __shfl_xor_sync(0xffffffffu, partial, offset);
+    }
+    __shared__ float warp_sums[32];
+    const int lane = threadIdx.x & 31;
+    const int warp_id = threadIdx.x >> 5;
+    if (lane == 0) warp_sums[warp_id] = partial;
+    __syncthreads();
+    if (warp_id == 0) {
+        const int num_warps = (blockDim.x + 31) >> 5;
+        float w = (threadIdx.x < num_warps) ? warp_sums[lane] : 0.f;
+        for (int offset = 16; offset > 0; offset /= 2) {
+            w += __shfl_xor_sync(0xffffffffu, w, offset);
+        }
+        if (threadIdx.x == 0) sm_scalars[0] = w;
+    }
+    __syncthreads();
+    const float sum_sk_sq = sm_scalars[0];
+
+    // Per-thread state cache. K_D_MAX bounds the static array; we
+    // only ever touch [0, K_d). Sized for the worst case across
+    // instantiations (currently K_d <= 256 for Qwen3.5 family).
+    float s_cache[K_D_MAX];
+
+    for (int v_idx = threadIdx.x; v_idx < V_d; v_idx += blockDim.x) {
+        // Pass 1: read state, cache, accumulate kv_mem & out_v partials.
+        float sum_s_sk = 0.f;
+        float sum_s_sq = 0.f;
+        #pragma unroll 4
+        for (int k_idx = 0; k_idx < K_d; ++k_idx) {
+            const long long off =
+                state_offset<KLast>(k_idx, v_idx, K_d, V_d);
+            const float s = state_load(state + off);
+            s_cache[k_idx] = s;
+            sum_s_sk += s * sk[k_idx];
+            sum_s_sq += s * sq[k_idx];
+        }
+
+        const float kv_mem = g_h * sum_s_sk;
+        const float v_t    = v_h[v_idx];
+        const float delta  = (v_t - kv_mem) * beta_h;
+        // out_v = g * Σ s*sq + delta * Σ sk*sq, an algebraic
+        // rewrite of the original Phase-2 reduction.
+        const float out_v  = g_h * sum_s_sq + delta * sum_sk_sq;
+        out_bh[v_idx] = out_v;
+
+        // Pass 2: write updated state.
+        #pragma unroll 4
+        for (int k_idx = 0; k_idx < K_d; ++k_idx) {
+            const long long off =
+                state_offset<KLast>(k_idx, v_idx, K_d, V_d);
+            const float s_new = s_cache[k_idx] * g_h + sk[k_idx] * delta;
+            state_store(state + off, s_new);
+        }
+    }
+}
+
+template <typename StateT, bool KLast, int K_D_MAX>
+__global__ void recurrent_step_batched_gqa_fused_kernel(
+    const float* __restrict__ q_norm_kh,
+    const float* __restrict__ k_norm_kh,
+    const float* __restrict__ v,
+    const float* __restrict__ g_log,
+    const float* __restrict__ beta,
+    StateT*      __restrict__ state_base,
+    const std::int32_t* __restrict__ slot_ids,
+    long long slot_stride_elems,
+    float*       __restrict__ out,
+    int K_h, int V_h, int K_d, int V_d)
+{
+    const int r = blockIdx.x;
+    const int h = blockIdx.y;
+    const int repeat = V_h / K_h;
+    const int h_k = h / repeat;
+    const int slot = slot_ids[r];
+
+    const long long qh = ((long long)r * K_h + h_k) * K_d;
+    const long long vh = (long long)r * V_h + h;
+    const float* q_h = q_norm_kh + qh;
+    const float* k_h = k_norm_kh + qh;
+    const float* v_h = v + vh * V_d;
+    const float  g_h = __expf(g_log[vh]);
+    const float  beta_h = beta[vh];
+
+    StateT* state = state_base
+        + (long long)slot * slot_stride_elems
+        + (long long)h * K_d * V_d;
+    float* out_bh = out + vh * V_d;
+
+    extern __shared__ float smem[];
+    float* sq = smem;
+    float* sk = smem + K_d;
+    float* sm_scalars = smem + 2 * K_d;
+
+    for (int i = threadIdx.x; i < K_d; i += blockDim.x) {
+        sq[i] = q_h[i];
+        sk[i] = k_h[i];
+    }
+    __syncthreads();
+
+    float partial = 0.f;
+    for (int i = threadIdx.x; i < K_d; i += blockDim.x) {
+        partial += sk[i] * sq[i];
+    }
+    for (int offset = 16; offset > 0; offset /= 2) {
+        partial += __shfl_xor_sync(0xffffffffu, partial, offset);
+    }
+    __shared__ float warp_sums[32];
+    const int lane = threadIdx.x & 31;
+    const int warp_id = threadIdx.x >> 5;
+    if (lane == 0) warp_sums[warp_id] = partial;
+    __syncthreads();
+    if (warp_id == 0) {
+        const int num_warps = (blockDim.x + 31) >> 5;
+        float w = (threadIdx.x < num_warps) ? warp_sums[lane] : 0.f;
+        for (int offset = 16; offset > 0; offset /= 2) {
+            w += __shfl_xor_sync(0xffffffffu, w, offset);
+        }
+        if (threadIdx.x == 0) sm_scalars[0] = w;
+    }
+    __syncthreads();
+    const float sum_sk_sq = sm_scalars[0];
+
+    float s_cache[K_D_MAX];
+
+    for (int v_idx = threadIdx.x; v_idx < V_d; v_idx += blockDim.x) {
+        float sum_s_sk = 0.f;
+        float sum_s_sq = 0.f;
+        #pragma unroll 4
+        for (int k_idx = 0; k_idx < K_d; ++k_idx) {
+            const long long off =
+                state_offset<KLast>(k_idx, v_idx, K_d, V_d);
+            const float s = state_load(state + off);
+            s_cache[k_idx] = s;
+            sum_s_sk += s * sk[k_idx];
+            sum_s_sq += s * sq[k_idx];
+        }
+
+        const float kv_mem = g_h * sum_s_sk;
+        const float v_t    = v_h[v_idx];
+        const float delta  = (v_t - kv_mem) * beta_h;
+        const float out_v  = g_h * sum_s_sq + delta * sum_sk_sq;
+        out_bh[v_idx] = out_v;
+
+        #pragma unroll 4
+        for (int k_idx = 0; k_idx < K_d; ++k_idx) {
+            const long long off =
+                state_offset<KLast>(k_idx, v_idx, K_d, V_d);
+            const float s_new = s_cache[k_idx] * g_h + sk[k_idx] * delta;
+            state_store(state + off, s_new);
+        }
+    }
+}
+
 }  // namespace
 
 void launch_recurrent_gated_delta_step(
@@ -1140,7 +1387,31 @@ void launch_recurrent_gated_delta_step_batched(
     constexpr int BLOCK = 128;
     dim3 grid(R, V_h);
     dim3 block(BLOCK);
-    const int shmem_bytes = 2 * K_d * sizeof(float);
+    // Fused kernel needs the existing sq+sk shmem plus one float
+    // scalar (sum_sk_sq broadcast); legacy kernel only needs the
+    // first two arrays.
+    const bool fused = qwen_gdn_fused_step_enabled() && K_d <= 256;
+    const int shmem_bytes = (2 * K_d + (fused ? 1 : 0)) * sizeof(float);
+    if (fused) {
+        // K_d up to 256 covers every qwen3_5 GDN config currently in
+        // production (E4B family is K_d=128). Dispatch on the bound
+        // so the per-thread state_cache array is small enough to fit
+        // in registers without spilling. We dispatch on the maximum
+        // K_d, not the actual: the kernel only iterates [0, K_d) so
+        // unused slots are dead code.
+        if (qwen_gdn_k_last_state_enabled()) {
+            recurrent_step_batched_fused_kernel<float, true, 256><<<
+                grid, block, shmem_bytes, stream>>>(
+                q_norm, k_norm, v, g_log, beta, state_base,
+                slot_ids, slot_stride_elems, out, V_h, K_d, V_d);
+        } else {
+            recurrent_step_batched_fused_kernel<float, false, 256><<<
+                grid, block, shmem_bytes, stream>>>(
+                q_norm, k_norm, v, g_log, beta, state_base,
+                slot_ids, slot_stride_elems, out, V_h, K_d, V_d);
+        }
+        return;
+    }
     if (qwen_gdn_k_last_state_enabled()) {
         recurrent_step_batched_kernel<float, true><<<
             grid, block, shmem_bytes, stream>>>(
@@ -1168,7 +1439,24 @@ void launch_recurrent_gated_delta_step_batched_state_bf16(
     constexpr int BLOCK = 128;
     dim3 grid(R, V_h);
     dim3 block(BLOCK);
-    const int shmem_bytes = 2 * K_d * sizeof(float);
+    const bool fused = qwen_gdn_fused_step_enabled() && K_d <= 256;
+    const int shmem_bytes = (2 * K_d + (fused ? 1 : 0)) * sizeof(float);
+    if (fused) {
+        if (qwen_gdn_k_last_state_enabled()) {
+            recurrent_step_batched_fused_kernel<__nv_bfloat16, true, 256><<<
+                grid, block, shmem_bytes, stream>>>(
+                q_norm, k_norm, v, g_log, beta,
+                static_cast<__nv_bfloat16*>(state_base),
+                slot_ids, slot_stride_elems, out, V_h, K_d, V_d);
+        } else {
+            recurrent_step_batched_fused_kernel<__nv_bfloat16, false, 256><<<
+                grid, block, shmem_bytes, stream>>>(
+                q_norm, k_norm, v, g_log, beta,
+                static_cast<__nv_bfloat16*>(state_base),
+                slot_ids, slot_stride_elems, out, V_h, K_d, V_d);
+        }
+        return;
+    }
     if (qwen_gdn_k_last_state_enabled()) {
         recurrent_step_batched_kernel<__nv_bfloat16, true><<<
             grid, block, shmem_bytes, stream>>>(
@@ -1199,7 +1487,22 @@ void launch_recurrent_gated_delta_step_batched_gqa(
     constexpr int BLOCK = 128;
     dim3 grid(R, V_h);
     dim3 block(BLOCK);
-    const int shmem_bytes = 2 * K_d * sizeof(float);
+    const bool fused = qwen_gdn_fused_step_enabled() && K_d <= 256;
+    const int shmem_bytes = (2 * K_d + (fused ? 1 : 0)) * sizeof(float);
+    if (fused) {
+        if (qwen_gdn_k_last_state_enabled()) {
+            recurrent_step_batched_gqa_fused_kernel<float, true, 256><<<
+                grid, block, shmem_bytes, stream>>>(
+                q_norm_kh, k_norm_kh, v, g_log, beta, state_base,
+                slot_ids, slot_stride_elems, out, K_h, V_h, K_d, V_d);
+        } else {
+            recurrent_step_batched_gqa_fused_kernel<float, false, 256><<<
+                grid, block, shmem_bytes, stream>>>(
+                q_norm_kh, k_norm_kh, v, g_log, beta, state_base,
+                slot_ids, slot_stride_elems, out, K_h, V_h, K_d, V_d);
+        }
+        return;
+    }
     if (qwen_gdn_k_last_state_enabled()) {
         recurrent_step_batched_gqa_kernel<float, true><<<
             grid, block, shmem_bytes, stream>>>(
@@ -1228,7 +1531,24 @@ void launch_recurrent_gated_delta_step_batched_gqa_state_bf16(
     constexpr int BLOCK = 128;
     dim3 grid(R, V_h);
     dim3 block(BLOCK);
-    const int shmem_bytes = 2 * K_d * sizeof(float);
+    const bool fused = qwen_gdn_fused_step_enabled() && K_d <= 256;
+    const int shmem_bytes = (2 * K_d + (fused ? 1 : 0)) * sizeof(float);
+    if (fused) {
+        if (qwen_gdn_k_last_state_enabled()) {
+            recurrent_step_batched_gqa_fused_kernel<__nv_bfloat16, true, 256><<<
+                grid, block, shmem_bytes, stream>>>(
+                q_norm_kh, k_norm_kh, v, g_log, beta,
+                static_cast<__nv_bfloat16*>(state_base),
+                slot_ids, slot_stride_elems, out, K_h, V_h, K_d, V_d);
+        } else {
+            recurrent_step_batched_gqa_fused_kernel<__nv_bfloat16, false, 256><<<
+                grid, block, shmem_bytes, stream>>>(
+                q_norm_kh, k_norm_kh, v, g_log, beta,
+                static_cast<__nv_bfloat16*>(state_base),
+                slot_ids, slot_stride_elems, out, K_h, V_h, K_d, V_d);
+        }
+        return;
+    }
     if (qwen_gdn_k_last_state_enabled()) {
         recurrent_step_batched_gqa_kernel<__nv_bfloat16, true><<<
             grid, block, shmem_bytes, stream>>>(
