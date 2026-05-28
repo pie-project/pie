@@ -2087,6 +2087,27 @@ ForwardDispatchResult run_forward_dispatch(
     return out;
 }
 
+namespace {
+using probe_clock = std::chrono::steady_clock;
+inline std::uint32_t us_between(probe_clock::time_point a,
+                                probe_clock::time_point b) {
+    return static_cast<std::uint32_t>(
+        std::chrono::duration_cast<std::chrono::microseconds>(b - a).count());
+}
+inline void write_probes(pie_driver::PieForwardResponseView& out,
+                         probe_clock::time_point t0, probe_clock::time_point t1,
+                         probe_clock::time_point t2, probe_clock::time_point t3,
+                         probe_clock::time_point t4, probe_clock::time_point t5) {
+    const auto t6 = probe_clock::now();
+    out.probe_wire_parse_us    = us_between(t0, t1);
+    out.probe_plan_us          = us_between(t1, t2);
+    out.probe_h2d_us           = us_between(t2, t3);
+    out.probe_kernel_launch_us = us_between(t3, t4);
+    out.probe_sync_us          = us_between(t4, t5);
+    out.probe_response_build_us = us_between(t5, t6);
+}
+}  // namespace
+
 void handle_fire_batch(
     std::uint32_t req_id,
     const pie_driver::PieForwardRequestView& view,
@@ -2094,6 +2115,9 @@ void handle_fire_batch(
     Executor& executor,
     std::uint64_t handled)
 {
+    using clock = std::chrono::steady_clock;
+    const auto t_entry = clock::now();
+
     // Local references for the most-touched Executor members.
     auto& engine               = executor.loaded_model;
     auto& ws                   = executor.ws;
@@ -2183,6 +2207,8 @@ void handle_fire_batch(
         const std::span<const float>         temp_view  = spec.has_drafts ? std::span<const float>        (spec.sampler_temperatures) : temp_view_orig;
         const std::span<const float>         top_p_view = spec.has_drafts ? std::span<const float>        (spec.sampler_top_p)        : top_p_view_orig;
         const std::span<const float>         min_p_view = spec.has_drafts ? std::span<const float>        (spec.sampler_min_p)        : min_p_view_orig;
+
+        const auto t_wire_parse_end = clock::now();
 
         const int N = static_cast<int>(tok_view.size());
         const int num_sampling = static_cast<int>(sidx_view.size());
@@ -2441,6 +2467,8 @@ void handle_fire_batch(
             std::span<const std::int32_t>(h_sample_idx),
         };
 
+        const auto t_plan_end = clock::now();
+
         if (compact_logit_rows) {
             CUDA_CHECK(cudaMemcpyAsync(pi.sample_idx.data(), h_sample_idx.data(),
                                        sizeof(std::int32_t) * num_sampling,
@@ -2514,6 +2542,8 @@ void handle_fire_batch(
             forward_handles_argmax
                 ? reinterpret_cast<std::int32_t*>(pi.sampled.data())
                 : nullptr);
+
+        const auto t_h2d_end = clock::now();
 
         // ── Forward pass ────────────────────────────────────────
         // Either replay a captured CUDA graph or invoke `forward_fn.body`
@@ -2621,8 +2651,10 @@ void handle_fire_batch(
                                    sizeof(std::int32_t) * N,
                                    cudaMemcpyDeviceToHost,
                                    cublas.stream()));
+        const auto t_kernel_launch_end = clock::now();
         verify_timer.finish(cublas.stream());
         CUDA_CHECK(cudaStreamSynchronize(cublas.stream()));
+        const auto t_sync_end = clock::now();
 
         // CUDA's fast token samplers do not yet consume BRLE logit masks.
         // When constrained decoding supplies one, keep correctness by
@@ -2658,6 +2690,9 @@ void handle_fire_batch(
                 std::span<const std::int32_t>(all_sampled,
                                               static_cast<std::size_t>(R)),
                 out_resp);
+            write_probes(out_resp, t_entry, t_wire_parse_end,
+                         t_plan_end, t_h2d_end,
+                         t_kernel_launch_end, t_sync_end);
             if (executor.verbose && (handled <= 4 || handled % 100 == 0)) {
                 std::cerr << "[pie-driver-cuda] req_id=" << req_id
                           << " R=" << R << " N=" << N
@@ -3157,6 +3192,9 @@ void handle_fire_batch(
                 }
             }
             executor.response_builder.build(per_req, out_resp);
+            write_probes(out_resp, t_entry, t_wire_parse_end,
+                         t_plan_end, t_h2d_end,
+                         t_kernel_launch_end, t_sync_end);
 
             if (executor.verbose && (handled <= 4 || handled % 100 == 0)) {
                 std::cerr << "[pie-driver-cuda] req_id=" << req_id
@@ -3171,6 +3209,9 @@ void handle_fire_batch(
             std::span<const std::uint32_t>(per_request_counts),
             std::span<const std::uint32_t>(sampled_tokens),
             out_resp);
+        write_probes(out_resp, t_entry, t_wire_parse_end,
+                     t_plan_end, t_h2d_end,
+                     t_kernel_launch_end, t_sync_end);
         if (executor.verbose && (handled <= 4 || handled % 100 == 0)) {
             std::cerr << "[pie-driver-cuda] req_id=" << req_id
                       << " R=" << R << " N=" << N

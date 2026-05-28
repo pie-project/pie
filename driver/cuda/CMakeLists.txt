@@ -23,6 +23,22 @@ find_package(CUDAToolkit REQUIRED)
 find_package(Threads REQUIRED)
 find_package(Python3 COMPONENTS Interpreter REQUIRED)
 
+# CUDA 13+ ships libcudacxx/CUB/Thrust under a `cccl/` prefix in the
+# toolkit include tree.  CUTLASS (and vendored Marlin) still includes
+# `<cuda/std/…>`, `<cub/…>`, `<thrust/…>` without that prefix.  When
+# the non-prefixed headers don't exist, add the CCCL directory so the
+# old-style includes resolve.
+if(CUDAToolkit_INCLUDE_DIRS)
+  foreach(_cuda_inc IN LISTS CUDAToolkit_INCLUDE_DIRS)
+    if(EXISTS "${_cuda_inc}/cccl" AND NOT EXISTS "${_cuda_inc}/cuda/std")
+      list(APPEND PIE_CCCL_INCLUDE_DIRS "${_cuda_inc}/cccl")
+    endif()
+  endforeach()
+  if(PIE_CCCL_INCLUDE_DIRS)
+    message(STATUS "Adding CCCL include dirs for CUDA 13+: ${PIE_CCCL_INCLUDE_DIRS}")
+  endif()
+endif()
+
 if(NOT PIE_BRIDGE_INCLUDE_DIR)
   set(PIE_BRIDGE_INCLUDE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../bridge/include")
 endif()
@@ -41,6 +57,13 @@ message(STATUS "Using NCCL: ${NCCL_LIBRARY} (header: ${NCCL_INCLUDE_DIR})")
 
 include(cmake/CPM.cmake)
 
+# Use a persistent CPM cache when the env var is set so incremental
+# builds (and cargo build-hash changes) don't re-clone from GitHub.
+# CI sets this via GITHUB_ENV; local builds can export it in .bashrc.
+if(DEFINED ENV{CPM_SOURCE_CACHE} AND NOT CPM_SOURCE_CACHE)
+  set(CPM_SOURCE_CACHE $ENV{CPM_SOURCE_CACHE})
+endif()
+
 # NOTE: flashinfer dropped its top-level CMakeLists.txt after v0.2.7. From
 # v0.3.0+ the build is Python-driven (per-arch JIT cubins via build_backend.py).
 # We still fetch the source tree for headers and `csrc/`. Kernel integration
@@ -51,12 +74,12 @@ cpmaddpackage(
   NAME flashinfer
   GITHUB_REPOSITORY flashinfer-ai/flashinfer
   GIT_TAG v0.6.9
+  GIT_SHALLOW TRUE
   DOWNLOAD_ONLY YES)
 
 cpmaddpackage(URI "gh:marzer/tomlplusplus@3.4.0")
 cpmaddpackage(URI "gh:CLIUtils/CLI11@2.5.0")
 cpmaddpackage(URI "gh:nlohmann/json@3.12.0" OPTIONS "JSON_BuildTests OFF")
-cpmaddpackage(URI "gh:facebook/zstd@1.5.7")
 
 set(PIE_CUDA_CUSTOM_ALL_REDUCE_SOURCE src/custom_all_reduce.cu)
 foreach(PIE_CUDA_ARCH IN LISTS CMAKE_CUDA_ARCHITECTURES)
@@ -272,6 +295,7 @@ target_include_directories(pie_driver_cuda_lib
     ${CMAKE_CURRENT_SOURCE_DIR}/../common/include
     ${PIE_BRIDGE_INCLUDE_DIR}
     ${NCCL_INCLUDE_DIR}
+    ${PIE_CCCL_INCLUDE_DIRS}
     ${flashinfer_SOURCE_DIR}/include
     ${flashinfer_SOURCE_DIR}/csrc
     ${flashinfer_SOURCE_DIR}/3rdparty/cutlass/include
@@ -288,6 +312,11 @@ string(REGEX REPLACE "[^0-9].*$" "" PIE_FLASHINFER_MOE_ARCH_NUMBER
 set(PIE_FLASHINFER_MOE_GEN_DIR
   "${CMAKE_BINARY_DIR}/flashinfer_generated/cutlass_instantiations/${PIE_FLASHINFER_MOE_ARCH_NUMBER}")
 file(MAKE_DIRECTORY "${PIE_FLASHINFER_MOE_GEN_DIR}")
+# FlashInfer's code-gen script imports tvm_ffi, pynvml, tqdm at the
+# top level.  These must be available to the Python interpreter cmake
+# finds.  When building inside a venv that has them (e.g. the SGLang
+# or vLLM venv) they resolve naturally; on a bare system install add
+# them via `pip install apache-tvm-ffi pynvml tqdm`.
 execute_process(
   COMMAND ${CMAKE_COMMAND} -E env
           FLASHINFER_DISABLE_VERSION_CHECK=1
@@ -296,7 +325,9 @@ execute_process(
           "from pathlib import Path; from flashinfer.jit.gemm.cutlass.generate_kernels import generate_gemm_operations; generate_gemm_operations(Path(r'${PIE_FLASHINFER_MOE_GEN_DIR}'), '${PIE_FLASHINFER_MOE_ARCH_NUMBER};${PIE_FLASHINFER_MOE_ARCH_NUMBER}-real')"
   RESULT_VARIABLE PIE_FLASHINFER_MOE_GEN_RESULT)
 if(NOT PIE_FLASHINFER_MOE_GEN_RESULT EQUAL 0)
-  message(FATAL_ERROR "Failed to generate FlashInfer CUTLASS MoE launchers")
+  message(FATAL_ERROR
+    "Failed to generate FlashInfer CUTLASS MoE launchers.  "
+    "Ensure the Python interpreter has tvm_ffi, pynvml, and tqdm installed.")
 endif()
 file(GLOB PIE_FLASHINFER_MOE_GENERATED_SOURCES CONFIGURE_DEPENDS
   "${PIE_FLASHINFER_MOE_GEN_DIR}/gemm_grouped/80/*.generated.cu")
@@ -323,6 +354,7 @@ add_library(pie_flashinfer_cutlass_moe OBJECT
 target_include_directories(pie_flashinfer_cutlass_moe PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/src
   ${CUDAToolkit_INCLUDE_DIRS}
+  ${PIE_CCCL_INCLUDE_DIRS}
   ${flashinfer_SOURCE_DIR}/include
   ${flashinfer_SOURCE_DIR}/csrc
   ${flashinfer_SOURCE_DIR}/csrc/fused_moe/cutlass_backend
@@ -357,19 +389,27 @@ target_sources(pie_driver_cuda_lib PRIVATE
 # Vendored sources live under `third_party/marlin/`; the wrapper exposes a
 # torch-free C++ API.
 option(PIE_CUDA_BUILD_MARLIN "Build vendored marlin W4A16/MXFP4 GEMM" ON)
+option(PIE_MARLIN_ALL_SHAPES
+  "Compile all Marlin dtype combos (fp16/bf16/int8 × u4/u4b8/fp8/mxfp4). \
+OFF (default) compiles only bf16×{u4,u4b8,mxfp4} — the shapes pie dispatches."
+  OFF)
 if(PIE_CUDA_BUILD_MARLIN)
-	    # Include the generated kernel instantiations alongside the core driver.
-    file(GLOB MARLIN_SM_KERNELS
-        "${CMAKE_CURRENT_SOURCE_DIR}/third_party/marlin/sm*_kernel_*.cu")
+    # CUDA 13 generates __global__ template stubs with static linkage,
+    # breaking cross-TU explicit instantiations. marlin.cu now #includes
+    # the sm80_kernel_*.cu files directly so instantiation and selection
+    # share a single TU. Do NOT list sm80_kernel_*.cu as separate
+    # sources — they would double-define every template.
     target_sources(pie_driver_cuda_lib PRIVATE
         third_party/marlin/marlin.cu
         third_party/marlin/gptq_marlin_repack.cu
         third_party/marlin/awq_marlin_repack.cu
-        third_party/marlin/marlin_wrapper.cpp
-        ${MARLIN_SM_KERNELS})
+        third_party/marlin/marlin_wrapper.cpp)
     target_include_directories(pie_driver_cuda_lib PRIVATE
         third_party/marlin)
     target_compile_definitions(pie_driver_cuda_lib PRIVATE PIE_CUDA_HAS_MARLIN=1)
+    if(PIE_MARLIN_ALL_SHAPES)
+        target_compile_definitions(pie_driver_cuda_lib PRIVATE PIE_MARLIN_ALL_SHAPES=1)
+    endif()
 endif()
 
 # FlashInfer Mamba SSU on Hopper / Blackwell gates the vertical and horizontal
@@ -468,7 +508,6 @@ add_test(NAME mxfp4_marlin COMMAND test_mxfp4_marlin)
 target_link_libraries(pie_driver_cuda_lib PUBLIC
   CLI11::CLI11
   tomlplusplus::tomlplusplus
-  zstd
   nlohmann_json::nlohmann_json
   rt
   dl

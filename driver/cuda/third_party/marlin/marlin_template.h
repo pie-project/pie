@@ -1,3 +1,4 @@
+#pragma once
 /*
  * Modified by Neural Magic
  * Copyright (C) Marlin.2024 Elias Frantar

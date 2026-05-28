@@ -100,9 +100,11 @@ def build_config(args: argparse.Namespace):
     elif args.driver == "cuda_native":
         driver_options = {
             "gpu_mem_utilization": args.gpu_mem_util,
-            "memory_profile": args.memory_profile,
-            "kv_cache_dtype": args.kv_cache_dtype,
         }
+        if args.memory_profile != "auto":
+            driver_options["memory_profile"] = args.memory_profile
+        if args.kv_cache_dtype != "auto":
+            driver_options["kv_cache_dtype"] = args.kv_cache_dtype
         if args.runtime_quant:
             driver_options["runtime_quant"] = args.runtime_quant
         if args.mxfp4_moe:
@@ -677,7 +679,12 @@ async def run(args: argparse.Namespace):
                     ("default.fire.execute.driver_cuda.ipc_submit_us", "fire.execute.driver_cuda.ipc_submit_us"),
                     ("default.fire.execute.driver_cuda.gpu_wait_us", "fire.execute.driver_cuda.gpu_wait_us"),
                     ("default.fire.execute.driver_cuda.ipc_recv_us", "fire.execute.driver_cuda.ipc_recv_us"),
+                    ("default.fire.execute.driver_cuda.wire_parse_us", "fire.execute.driver_cuda.wire_parse_us"),
+                    ("default.fire.execute.driver_cuda.plan_us", "fire.execute.driver_cuda.plan_us"),
+                    ("default.fire.execute.driver_cuda.h2d_us", "fire.execute.driver_cuda.h2d_us"),
+                    ("default.fire.execute.driver_cuda.kernel_launch_us", "fire.execute.driver_cuda.kernel_launch_us"),
                     ("default.fire.execute.driver_cuda.sync_us", "fire.execute.driver_cuda.sync_us"),
+                    ("default.fire.execute.driver_cuda.response_build_us", "fire.execute.driver_cuda.response_build_us"),
                     ("default.fire.post_dispatch.context_tick_us", "fire.post_dispatch.context_tick_us"),
                     ("default.fire.post_dispatch.stats_update_us", "fire.post_dispatch.stats_update_us"),
                     (

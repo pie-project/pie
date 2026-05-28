@@ -163,8 +163,28 @@ impl Session {
                         serde_json::Value::from(inf.fire.execute.driver_cuda.avg_ipc_recv_us),
                     );
                     stats.insert(
+                        format!("{}.fire.execute.driver_cuda.wire_parse_us", model_name),
+                        serde_json::Value::from(inf.fire.execute.driver_cuda.avg_wire_parse_us),
+                    );
+                    stats.insert(
+                        format!("{}.fire.execute.driver_cuda.plan_us", model_name),
+                        serde_json::Value::from(inf.fire.execute.driver_cuda.avg_plan_us),
+                    );
+                    stats.insert(
+                        format!("{}.fire.execute.driver_cuda.h2d_us", model_name),
+                        serde_json::Value::from(inf.fire.execute.driver_cuda.avg_h2d_us),
+                    );
+                    stats.insert(
+                        format!("{}.fire.execute.driver_cuda.kernel_launch_us", model_name),
+                        serde_json::Value::from(inf.fire.execute.driver_cuda.avg_kernel_launch_us),
+                    );
+                    stats.insert(
                         format!("{}.fire.execute.driver_cuda.sync_us", model_name),
                         serde_json::Value::from(inf.fire.execute.driver_cuda.avg_sync_us),
+                    );
+                    stats.insert(
+                        format!("{}.fire.execute.driver_cuda.response_build_us", model_name),
+                        serde_json::Value::from(inf.fire.execute.driver_cuda.avg_response_build_us),
                     );
                     stats.insert(
                         format!("{}.fire.post_dispatch.context_tick_us", model_name),

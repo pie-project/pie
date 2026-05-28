@@ -296,6 +296,13 @@ typedef struct PieForwardResponseDesc {
     const uint32_t* spec_indptr_ptr;          size_t spec_indptr_len;
     const uint32_t* spec_tokens_ptr;          size_t spec_tokens_len;
     const uint32_t* spec_positions_ptr;       size_t spec_positions_len;
+
+    uint32_t probe_wire_parse_us;
+    uint32_t probe_plan_us;
+    uint32_t probe_h2d_us;
+    uint32_t probe_kernel_launch_us;
+    uint32_t probe_sync_us;
+    uint32_t probe_response_build_us;
 } PieForwardResponseDesc;
 
 typedef struct PieCopyRequestDesc {

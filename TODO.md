@@ -12,9 +12,9 @@
 
 ### Uncommitted work in progress (dirty working tree)
 
-**Task 80: Probe upgrade — driver_cuda + IPC split + per-completion counts**
+**Task 80: Probe upgrade — driver_cuda + IPC split + per-completion counts (DONE)**
 
-All Rust code is written but not yet built/tested. Files modified:
+Build-verified and tests pass. Files modified:
 
 - `runtime/src/probe/driver_cuda.rs` — NEW. `DriverCudaProbes` struct +
   thread-local IPC phase timings (`record_ipc_submit`, `record_gpu_wait`,
@@ -44,24 +44,26 @@ All Rust code is written but not yet built/tested. Files modified:
 - `runtime/src/driver/inproc.rs` — same for InProcChannel
 - `benches/pie_bench.py` — reads new keys
 
-**To finish task 80:**
-1. Build: `cargo build --release -p pie-server --features driver-cuda,profile-hot-path`
-   (cmake was hanging on git clones through proxy — deps are now pre-populated,
-   but cmake may still try to update. If stuck, try without profile features first:
-   `cargo build --release -p pie-server --features driver-cuda`)
-2. Run scheduler tests: `cargo test --release -p pie --lib inference::scheduler`
-3. Quick bench with feature on to verify probes report values
-4. Commit and push
+**Task 81: C++ driver probes via ForwardResponse payload (DONE)**
 
-**Task 81: C++ driver probes via ForwardResponse payload (NOT STARTED)**
+Implemented. Files modified:
 
-Plan:
-- Add probe u32 fields to `ForwardResponse` in `driver/bridge/src/schema.rs`
-  (wire_parse_us, plan_us, h2d_us, kernel_launch_us, sync_us, response_build_us)
-- Instrument `handle_fire_batch` in `driver/cuda/src/executor/executor.cpp`
-  with `std::chrono::steady_clock` brackets around each host phase
-- Read the fields in Rust `execute_batch`, fetch_add into `stats.driver_cuda.*`
-- Update handler.rs + bench harness for C++ phase keys
+- `driver/bridge/src/schema.rs` — added 6 `u32` probe fields to `ForwardResponse`
+  (`probe_wire_parse_us`, `probe_plan_us`, `probe_h2d_us`,
+  `probe_kernel_launch_us`, `probe_sync_us`, `probe_response_build_us`)
+- `driver/bridge/include/pie_bridge/view.hpp` — added matching fields to
+  `PieForwardResponseView` + wired in `build_response_desc`
+- `driver/bridge/include/pie_bridge.h` — added fields to `PieForwardResponseDesc`
+- `driver/cuda/src/executor/executor.cpp` — added `steady_clock` phase
+  boundaries in `handle_fire_batch`: wire_parse (entry→spec expansion),
+  plan (KV scan→sample plan), h2d (uploads→prepare→TP), kernel_launch
+  (forward dispatch→sampling→D2H), sync (cudaStreamSynchronize),
+  response_build (response assembly). `write_probes()` at all 3 return paths.
+- `runtime/src/inference/scheduler.rs` — reads `ForwardResponse.probe_*`
+  fields after each fire and `fetch_add`s into `stats.driver_cuda.*`
+- `runtime/src/server/handler.rs` — emits 5 new keys:
+  `driver_cuda.{wire_parse_us,plan_us,h2d_us,kernel_launch_us,response_build_us}`
+- `benches/pie_bench.py` — reads the 5 new keys
 
 ### Build issue notes
 
@@ -106,23 +108,23 @@ fire (profile-fire)                    DONE — committed in 3fbd8589
 ├── execute.total_us
 │   ├── execute.batch_build_us
 │   ├── execute.driver_fire_us
-│   └── execute.response_dispatch.total_us    IN PROGRESS (task 80)
-│       ├── .direct_count                     IN PROGRESS
-│       ├── .chain_count                      IN PROGRESS
-│       └── .chunk_count                      IN PROGRESS
+│   └── execute.response_dispatch.total_us    DONE (task 80)
+│       ├── .direct_count                     DONE
+│       ├── .chain_count                      DONE
+│       └── .chunk_count                      DONE
 ├── post_dispatch.context_tick_us
 └── post_dispatch.stats_update_us
 
-driver_cuda (profile-driver-cuda)      IN PROGRESS (task 80 Rust side)
-├── ipc_submit_us                      IN PROGRESS
-├── gpu_wait_us                        IN PROGRESS
-├── ipc_recv_us                        IN PROGRESS
-├── wire_parse_us                      PLANNED (task 81, C++ side)
-├── plan_us                            PLANNED
-├── h2d_us                             PLANNED
-├── kernel_launch_us                   PLANNED
-├── sync_us                            PLANNED
-└── response_build_us                  PLANNED
+driver_cuda (profile-driver-cuda)      DONE (tasks 80 + 81)
+├── ipc_submit_us                      DONE
+├── gpu_wait_us                        DONE
+├── ipc_recv_us                        DONE
+├── wire_parse_us                      DONE (task 81, C++ side)
+├── plan_us                            DONE
+├── h2d_us                             DONE
+├── kernel_launch_us                   DONE
+├── sync_us                            DONE
+└── response_build_us                  DONE
 
 chain_ext (profile-chain-ext)          NOT STARTED
 ├── wake_us

@@ -1622,6 +1622,20 @@ impl BatchScheduler {
         let mut chunk_count: u64 = 0;
         match result {
             Ok(batch_resp) => {
+                let wp = batch_resp.probe_wire_parse_us as u64;
+                let pl = batch_resp.probe_plan_us as u64;
+                let hd = batch_resp.probe_h2d_us as u64;
+                let kl = batch_resp.probe_kernel_launch_us as u64;
+                let sy = batch_resp.probe_sync_us as u64;
+                let rb = batch_resp.probe_response_build_us as u64;
+                if wp | pl | hd | kl | sy | rb != 0 {
+                    stats.driver_cuda.wire_parse_us.fetch_add(wp, Relaxed);
+                    stats.driver_cuda.plan_us.fetch_add(pl, Relaxed);
+                    stats.driver_cuda.h2d_us.fetch_add(hd, Relaxed);
+                    stats.driver_cuda.kernel_launch_us.fetch_add(kl, Relaxed);
+                    stats.driver_cuda.sync_us.fetch_add(sy, Relaxed);
+                    stats.driver_cuda.response_build_us.fetch_add(rb, Relaxed);
+                }
                 let n_results = batch_resp.num_requests as usize;
                 if n_results != requests.len() {
                     let msg = format!(

@@ -203,6 +203,13 @@ struct PieForwardResponseView {
     PieSlice<std::uint32_t> spec_indptr;
     PieSlice<std::uint32_t> spec_tokens;
     PieSlice<std::uint32_t> spec_positions;
+
+    std::uint32_t probe_wire_parse_us = 0;
+    std::uint32_t probe_plan_us = 0;
+    std::uint32_t probe_h2d_us = 0;
+    std::uint32_t probe_kernel_launch_us = 0;
+    std::uint32_t probe_sync_us = 0;
+    std::uint32_t probe_response_build_us = 0;
 };
 
 // ---- Top-level request / response views -----------------------------------
@@ -578,6 +585,13 @@ inline void build_response_desc(std::uint32_t driver_id,
         fr.spec_tokens_len   = view.forward.spec_tokens.size();
         fr.spec_positions_ptr = view.forward.spec_positions.data();
         fr.spec_positions_len = view.forward.spec_positions.size();
+
+        fr.probe_wire_parse_us    = view.forward.probe_wire_parse_us;
+        fr.probe_plan_us          = view.forward.probe_plan_us;
+        fr.probe_h2d_us           = view.forward.probe_h2d_us;
+        fr.probe_kernel_launch_us = view.forward.probe_kernel_launch_us;
+        fr.probe_sync_us          = view.forward.probe_sync_us;
+        fr.probe_response_build_us = view.forward.probe_response_build_us;
     } else {
         // Everything else (copy / adapter / health / unknown) just
         // produces a StatusResponse with the int code.
