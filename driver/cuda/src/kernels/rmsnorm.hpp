@@ -123,4 +123,17 @@ void launch_rmsnorm_gated_bf16(
     float eps,
     cudaStream_t stream);
 
+// Same as `launch_rmsnorm_gated_bf16` but `x` is fp32 — used by the
+// Qwen3.5 linear-attention path where the GDN recurrent step outputs
+// fp32 and we want to drop the separate fp32→bf16 conversion launch.
+void launch_rmsnorm_gated_fp32_in_bf16(
+    const void* x,            // fp32, shape [num_rows, hidden]
+    const void* gate,         // bf16, same shape as `x`
+    const void* weight,       // fp32, [hidden]
+    void* y,                  // bf16, [num_rows, hidden]
+    int num_rows,
+    int hidden,
+    float eps,
+    cudaStream_t stream);
+
 }  // namespace pie_cuda_driver::kernels

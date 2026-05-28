@@ -465,7 +465,69 @@ __global__ void rmsnorm_gated_bf16_kernel(
     }
 }
 
+// Same as rmsnorm_gated_bf16_kernel but x is fp32 (e.g. came straight
+// from the GDN recurrent step which outputs fp32). Fuses the separate
+// fp32→bf16 conversion that pie's qwen3.5 forward used to emit as its
+// own kernel launch before calling rmsnorm_gated_bf16. Per-row HBM
+// traffic drops from 12*hidden bytes (4-byte x read + 2-byte x write +
+// 4-byte x read + 2-byte gate read + 2-byte y write) to 8*hidden bytes
+// (4-byte x read + 2-byte gate read + 2-byte y write) — eliminates one
+// full pass over the fp32→bf16 intermediate buffer.
+template <int BLOCK>
+__global__ void rmsnorm_gated_fp32_in_bf16_kernel(
+    const float*         __restrict__ x,        // fp32 input
+    const __nv_bfloat16* __restrict__ gate,
+    const float*         __restrict__ weight,
+    __nv_bfloat16*       __restrict__ y,
+    int hidden, float eps)
+{
+    const int row = blockIdx.x;
+    const int tid = threadIdx.x;
+
+    const float*         xr = x    + row * hidden;
+    const __nv_bfloat16* gr = gate + row * hidden;
+    __nv_bfloat16*       yr = y    + row * hidden;
+
+    float local = 0.f;
+    for (int i = tid; i < hidden; i += BLOCK) {
+        const float v = xr[i];
+        local += v * v;
+    }
+
+    __shared__ float buf[BLOCK];
+    buf[tid] = local;
+    __syncthreads();
+    for (int off = BLOCK / 2; off > 0; off >>= 1) {
+        if (tid < off) buf[tid] += buf[tid + off];
+        __syncthreads();
+    }
+    const float inv_rms = rsqrtf(buf[0] / static_cast<float>(hidden) + eps);
+
+    for (int i = tid; i < hidden; i += BLOCK) {
+        const float xv = xr[i] * inv_rms;
+        const float wv = weight[i];
+        const float gv = __bfloat162float(gr[i]);
+        const float sg = gv / (1.f + __expf(-gv));
+        yr[i] = __float2bfloat16(wv * xv * sg);
+    }
+}
+
 }  // namespace
+
+void launch_rmsnorm_gated_fp32_in_bf16(
+    const void* x, const void* gate, const void* weight, void* y,
+    int num_rows, int hidden, float eps, cudaStream_t stream)
+{
+    constexpr int BLOCK = 256;
+    dim3 grid(num_rows);
+    dim3 block(BLOCK);
+    rmsnorm_gated_fp32_in_bf16_kernel<BLOCK><<<grid, block, 0, stream>>>(
+        static_cast<const float*>(x),
+        static_cast<const __nv_bfloat16*>(gate),
+        static_cast<const float*>(weight),
+        static_cast<__nv_bfloat16*>(y),
+        hidden, eps);
+}
 
 void launch_rmsnorm_gated_bf16(
     const void* x, const void* gate, const void* weight, void* y,

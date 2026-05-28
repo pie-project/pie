@@ -864,19 +864,19 @@ void linear_attn_layer_body(
         }
     });
 
-    // ── core_out → bf16, then RMSNormGated with z ──────────────────
+    // ── core_out (fp32) → fused RMSNormGated → bf16 ────────────────
     // core_out has [N, V_h, V_d] layout = [N, V_dim] flat. We want
     // RMSNormGated over V_d per (n, h). Treat as [N*V_h, V_d].
+    //
+    // Fuses the previous (launch_fp32_to_bf16 → launch_rmsnorm_gated_bf16)
+    // pair into a single kernel that reads fp32 x directly. Per-row
+    // HBM IO drops from 12*V_d bytes to 8*V_d bytes (eliminates the
+    // intermediate bf16 round-trip), and we save one kernel launch
+    // per linear layer per fire (6216 launches eliminated at saturated
+    // Qwen3.5-4B 512×128).
     profile_forward_stage_ptr(profile, &ForwardProfile::linear_post_ms, stream, [&] {
-        kernels::launch_fp32_to_bf16(
-            la.core_out.data(), la.core_out_bf16.data(),
-            (std::size_t)N * V_dim, stream);
-
-        // RMSNormGated: y = weight * x_hat * silu(gate) where weight is
-        // per-V_d. z must align — it's [N, V_dim] in token-row layout, so
-        // viewing it as [N*V_h, V_d] gives the correct broadcast.
-        kernels::launch_rmsnorm_gated_bf16(
-            la.core_out_bf16.data(), la.z.data(), Lw.la_norm_w_fp32,
+        kernels::launch_rmsnorm_gated_fp32_in_bf16(
+            la.core_out.data(), la.z.data(), Lw.la_norm_w_fp32,
             la.core_out_bf16.data(),
             N * V_h, V_d, /*eps=*/cfg.rms_norm_eps, stream);
     });
