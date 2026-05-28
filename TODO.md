@@ -99,26 +99,33 @@ Bounded host-side optimizations exhausted. Remaining gap requires:
 
 ### Speculation depth × concurrency interaction (gemma-4-E4B, L40)
 
-Chain extension (depth>0) is only a net win when the GPU is saturated.
-At lower concurrency the chain-pool round-trip becomes the bottleneck:
+**FIXED** by stripping AdaptivePolicy down to two concepts:
+`fired_high_water` (monotonic max of fired batch sizes — the one
+firing-rule heuristic) and `last_latency` (deadlock watchdog when
+active concurrency drops below `fired_high_water`). Removed:
+`cohort_high_water` (per-batch ratchet driven by noisy
+`resident_count`), `prefill_cohort_grace`, `dense_cohort_wait`
+multiplier, `in_flight` gate, `PREFILL_COHORT_TARGET`.
 
-| reqs | depth=0 tok/s | depth=1 tok/s | depth=1/depth=0 |
+Diagnosis: the cohort_high_water ratchet locked the target at ~67
+due to transient `resident_count` spikes during speculative-context
+turnover. Real batches reached R=64 in ~700 µs but the policy
+waited the full `last_latency` (~20 ms) before timing out. Removing
+the ratchet eliminates the stall — fire happens immediately when
+batch.len() matches `fired_high_water`.
+
+| reqs | depth=0 (before/after) | depth=1 (before/after) | d=1/d=0 |
 |---:|---:|---:|---:|
-| 32  | 1,686 |   882 |  52% |
-| 64  | 3,054 | 1,612 |  53% |
-| 128 | 4,822 | 3,789 |  79% |
-| 256 | 6,556 | 6,598 | 101% |
+|  16 |   — / 957  |   — /  977 | 102% |
+|  32 | 1,686 / 1,741 |   882 / 1,742 | 100% |
+|  64 | 3,054 / 3,074 | 1,612 / 3,149 | 102% |
+| 128 | 4,822 / 4,908 | 3,789 / 5,019 | 102% |
+| 256 | 6,556 / 6,648 | 6,598 / 6,816 | 104% |
 
-At conc=64 with depth=0, pie hits 95% of vLLM (3,054 vs 3,199).
-With depth=1 the chain-pool round-trip serializes through 4 workers
-processing 16 jobs each, costing ~20 ms / fire of GPU-idle time
-that the underlying GPU work (~18 ms / fire at R=64) can't hide.
-
-The bench's previous `--speculation-depth 1` default is correct
-only for `conc ≥ 256` on this model. For lower concurrency,
-`--speculation-depth 0` matches vLLM. A future change should
-either (a) auto-select depth based on observed concurrency or
-(b) document the per-workload guidance prominently.
+Stripped policy is faster than the old one at every concurrency
+(both d=0 and d=1) AND simpler. depth=1 is net-positive at every
+concurrency (102%+ of d=0). At conc=64 + d=1, pie went from
+50.6% of vLLM (1,612 vs 3,199) to 98.4% (3,149).
 
 ### 256x128 decode profile (gemma-4-E4B, L40, agents/alpha)
 

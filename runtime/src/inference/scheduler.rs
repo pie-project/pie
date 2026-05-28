@@ -61,9 +61,9 @@ pub(super) trait SchedulingPolicy: Send {
     fn on_fired(&mut self, fired_size: usize);
 
     /// Decide whether to fire or wait, given the current batch size.
-    /// `&mut self` so policies can ratchet internal state (e.g.,
-    /// AdaptivePolicy's `cohort_high_water`) on every poll.
-    fn decide(&mut self, current_batch_size: usize, prefill_cohort: bool) -> Decision;
+    /// `&mut self` so policies can update internal state on every poll
+    /// (e.g., `EagerPolicy`'s `cohort_high_water` ratchet).
+    fn decide(&mut self, current_batch_size: usize) -> Decision;
 }
 
 // =============================================================================
@@ -1279,7 +1279,7 @@ impl BatchScheduler {
             let decision = if next_pending.is_some() {
                 Decision::Fire
             } else {
-                policy.decide(batch.len(), batch.should_prefill_coalesce())
+                policy.decide(batch.len())
             };
             match decision {
                 Decision::Fire => {
