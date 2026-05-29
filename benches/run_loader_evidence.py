@@ -321,12 +321,12 @@ def main() -> None:
     parser.add_argument(
         "--sglang-disable-cuda-graph",
         action=argparse.BooleanOptionalAction,
-        default=True,
+        default=False,
     )
     parser.add_argument(
         "--sglang-disable-piecewise-cuda-graph",
         action=argparse.BooleanOptionalAction,
-        default=True,
+        default=False,
     )
     parser.add_argument("--sglang-attention-backend", default="triton")
     parser.add_argument("--sglang-sampling-backend", default="pytorch")

@@ -24,8 +24,14 @@ pub mod storage_compiler;
 pub mod typecheck;
 pub mod types;
 
+/// Single source for the loader's debug-logging gate (`PIE_WEIGHT_LOADER_DEBUG`).
+pub(crate) fn wl_debug_enabled() -> bool {
+    std::env::var_os("PIE_WEIGHT_LOADER_DEBUG").is_some()
+}
+
 pub use ffi::{
     PieLoaderProgramHandle, pie_loader_compile, pie_loader_error_free, pie_loader_program_free,
-    pie_loader_program_view,
+    pie_loader_program_deserialize, pie_loader_program_serialize,
+    pie_loader_program_serialized_len, pie_loader_program_view,
 };
 pub use ffi_types::*;

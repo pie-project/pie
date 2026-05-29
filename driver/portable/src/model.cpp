@@ -410,6 +410,9 @@ Model::Model(const std::filesystem::path& snapshot_dir,
             case PieArch::Qwen3_5:
                 build_qwen3_5_();
                 break;
+            case PieArch::GlmMoeDsa:
+                build_glm_moe_dsa_();
+                break;
             default:
                 throw std::runtime_error(
                     "model: arch '" + std::string(pie_arch_name(hparams_.arch)) +
@@ -1882,6 +1885,12 @@ void Model::build_qwen3_5_() {
                 std::string(1, kind) + "' at layer " + std::to_string(i));
         }
     }
+}
+
+void Model::build_glm_moe_dsa_() {
+    throw std::runtime_error(
+        "model: glm_moe_dsa (GLM-5.1) uses MLA attention and requires the "
+        "CUDA driver — the portable/ggml backend does not support it");
 }
 
 }  // namespace pie_portable_driver

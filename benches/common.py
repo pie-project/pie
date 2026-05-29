@@ -212,7 +212,7 @@ def add_mode_subcommands(parser: argparse.ArgumentParser) -> None:
 
 
 def add_common_args(p: argparse.ArgumentParser) -> None:
-    p.add_argument("--model", default="Qwen/Qwen2-0.5B")
+    p.add_argument("--model", default="Qwen/Qwen3-0.6B")
     p.add_argument("--prompt", default=BENCH_PROMPT)
     p.add_argument("--system", default=BENCH_SYSTEM)
     p.add_argument("--max-tokens", type=int, default=128)
@@ -273,7 +273,7 @@ def hf_chat_prompts_and_counts(
 ) -> tuple[list[str], list[int]]:
     from transformers import AutoTokenizer
 
-    tok = AutoTokenizer.from_pretrained(model)
+    tok = AutoTokenizer.from_pretrained(model, trust_remote_code=True)
     rendered = [
         tok.apply_chat_template(
             [{"role": "system", "content": system}, {"role": "user", "content": p}],

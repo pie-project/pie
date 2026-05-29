@@ -11,6 +11,26 @@ Modes:
 Pie runs use the `text-completion-bench` inferlet so the runner can record
 actual prompt/output token counts.
 
+## Scripts
+
+Engine runners (shared CLI, `latency` / `tput` modes):
+
+- `pie_bench.py` — Pie (`--driver cuda_native`, …).
+- `vllm_bench.py` — vLLM.
+- `sglang_bench.py` — SGLang.
+- `llamacpp_bench.py` — llama.cpp (HTTP server).
+- `tensorrt_llm_bench.py` — TensorRT-LLM.
+
+Auxiliary tools:
+
+- `run_microbench.py` — WIT call overhead via the `wit-microbench` inferlet.
+- `run_loader_evidence.py` — regenerate loader tests + Pie/vLLM/SGLang evidence.
+- `smoke_deterministic.py` — per-model deterministic smoke check (temp 0, sha ledger).
+- `sweep_spec_on_off.py` — A/B sweep: speculation on vs off.
+- `sweep_pie_cuda_native.py` — sweep Pie cuda_native over local HF models.
+- `tune_cuda_memory_profile.py` — profile CUDA memory-planner candidates; install
+  the fastest auto-profile cache entry.
+
 ## Setup
 
 Run from the repo root.
@@ -37,7 +57,7 @@ Pie latency:
 ```bash
 uv --project sdk/python-server run python benches/pie_bench.py latency \
   --driver cuda_native \
-  --model Qwen/Qwen2-0.5B \
+  --model Qwen/Qwen3-0.6B \
   --device cuda:0 \
   --max-tokens 128 \
   --requests 32 \
@@ -49,7 +69,7 @@ Pie throughput:
 ```bash
 uv --project sdk/python-server run python benches/pie_bench.py tput \
   --driver cuda_native \
-  --model Qwen/Qwen2-0.5B \
+  --model Qwen/Qwen3-0.6B \
   --device cuda:0 \
   --max-tokens 128 \
   --num-requests 512 \
@@ -60,8 +80,8 @@ uv --project sdk/python-server run python benches/pie_bench.py tput \
 vLLM or SGLang:
 
 ```bash
-python benches/vllm_bench.py tput --model Qwen/Qwen2-0.5B
-python benches/sglang_bench.py tput --model Qwen/Qwen2-0.5B
+python benches/vllm_bench.py tput --model Qwen/Qwen3-0.6B
+python benches/sglang_bench.py tput --model Qwen/Qwen3-0.6B
 ```
 
 llama.cpp:
@@ -69,7 +89,7 @@ llama.cpp:
 ```bash
 python benches/llamacpp_bench.py tput \
   --url http://127.0.0.1:8080 \
-  --model Qwen/Qwen2-0.5B
+  --model Qwen/Qwen3-0.6B
 ```
 
 Use `--json-out <path>` to save machine-readable results.
@@ -77,10 +97,16 @@ Use `--json-out <path>` to save machine-readable results.
 ## Fairness defaults
 
 - vLLM prefix caching is disabled.
-- SGLang radix cache and CUDA graphs are disabled.
+- SGLang radix cache is disabled; CUDA graphs are left **enabled** (SGLang's
+  default). Pass `--sglang-disable-cuda-graph` to turn them off for a run.
 - llama.cpp requests use `cache_prompt=false`.
 - Pie prompts are unique by default and `--ignore-eos` is enabled so every
   request consumes the same output-token budget.
+- `tput` runs at **unlimited concurrency** by default (`--concurrency 0`): all
+  `--num-requests` are admitted at once. To keep the comparison fair, vLLM's
+  `max_num_seqs` is raised to `--num-requests` (lifting its built-in 256-seq
+  cap), and the other engines likewise. Pass `--concurrency N` to cap every
+  engine at N. (`latency` mode is sequential by definition — concurrency 1.)
 
 ## Speculation knobs
 
@@ -88,14 +114,10 @@ The CUDA driver advertises pass-level speculation; the bench can drive
 it from the command line for sweeps:
 
 - `--speculation-depth <n>` forwards to `scheduler.speculation_depth`
-  (range 0..=64, default 1). `0` disables speculation entirely —
-  use this as the no-spec baseline in any A/B comparison. `1` is
-  the piggyback path; higher values give more chain steps per real
-  fire to overlap with the inferlet's WASM time.
-- `--max-in-flight-tokens <n>` forwards to
-  `scheduler.max_in_flight_tokens` (default 4096; `0` = unlimited).
-  Soft per-device cap on aggregate chain entries — when reached, the
-  runtime stops sending `predict_flag=true` until the chain drains.
+  (range 0..=64). The bench leaves it unset by default, so the server's
+  default applies; pass `0` for the explicit no-spec baseline in any A/B
+  comparison, `1` for the piggyback path, or higher for more chain steps
+  per real fire to overlap with the inferlet's WASM time.
 - `--wasm-delay-us <µs>` makes `text-completion-bench` busy-spin in
   WASM between every `execute()` call. Simulates per-token inferlet
   work (agent reasoning, tool-call deserialization) so the chain

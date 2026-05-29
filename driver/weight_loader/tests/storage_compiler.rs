@@ -109,7 +109,14 @@ fn direct_copy_lowers_to_identity_extent_write() {
         .instrs
         .iter()
         .filter_map(|instr| match instr {
-            StorageInstr::ExtentWrite { id, source, dest } => Some((id, source, dest)),
+            StorageInstr::ExtentWrite { id, source, dest } => {
+                Some((id, source, dest.offset))
+            }
+            StorageInstr::BulkExtentWrite {
+                id,
+                source,
+                dest_offset,
+            } => Some((id, source, *dest_offset)),
             _ => None,
         })
         .collect();
@@ -118,7 +125,7 @@ fn direct_copy_lowers_to_identity_extent_write() {
     assert_eq!(source.tensor_id, TensorId(6));
     assert_eq!(source.file_offset, 512);
     assert_eq!(source.span_bytes, 8);
-    assert_eq!(dest.offset, 0);
+    assert_eq!(dest, 0);
     assert_eq!(
         program.schedule,
         program.instrs.iter().map(instr_id).collect::<Vec<_>>()
@@ -168,6 +175,7 @@ fn packed_quant_row_select_uses_byte_exact_offsets() {
         .iter()
         .find_map(|instr| match instr {
             StorageInstr::ExtentWrite { source, .. } => Some(source),
+            StorageInstr::BulkExtentWrite { source, .. } => Some(source),
             _ => None,
         })
         .unwrap();
@@ -553,30 +561,32 @@ fn nemotron_h_default_abi_packs_experts_and_exposes_views() {
             _ => None,
         })
         .collect::<Vec<_>>();
-    assert_eq!(writes.len(), 4);
-    assert!(
-        writes
-            .iter()
-            .any(|(id, bytes, offset)| { *id == TensorId(0) && *bytes == 12 && *offset == 0 })
-    );
-    assert!(
-        writes
-            .iter()
-            .any(|(id, bytes, offset)| { *id == TensorId(1) && *bytes == 12 && *offset == 12 })
-    );
-    assert!(
-        writes
-            .iter()
-            .any(|(id, bytes, offset)| { *id == TensorId(2) && *bytes == 12 && *offset == 0 })
-    );
-    assert!(
-        writes
-            .iter()
-            .any(|(id, bytes, offset)| { *id == TensorId(3) && *bytes == 12 && *offset == 12 })
-    );
+    // Experts are packed contiguously *within* their backing buffer (tight
+    // 0/12 offsets), so the exposed `*.packed.weight` view is contiguous.
+    assert!(writes.iter().any(|(_, bytes, off)| *bytes == 12 && *off == 0));
+    assert!(writes.iter().any(|(_, bytes, off)| *bytes == 12 && *off == 12));
+
+    // Each expert pack is one persistent backing buffer (2 experts × 12 B =
+    // 24 B). Backing bases are aligned to PERSISTENT_OPERAND_ALIGNMENT (256)
+    // so cuBLAS(Lt) selects its fast `align8` tensor kernels rather than the
+    // slow `align1` fallback. Packing tightness is *internal* to each
+    // backing and unaffected by the base alignment.
+    let backings = program
+        .buffers
+        .iter()
+        .filter_map(|b| b.persistent_offset.map(|o| (b.bytes, o)))
+        .collect::<Vec<_>>();
+    assert_eq!(backings.len(), 2);
+    for (bytes, offset) in &backings {
+        assert_eq!(*bytes, 24, "each backing packs 2 experts × 12 B");
+        assert_eq!(*offset % 256, 0, "operand base must be 256-aligned");
+    }
+
+    // Raw data moved is unchanged (4 experts × 12 B); persistent arena grows
+    // only by the per-backing alignment padding (2nd backing at offset 256).
     assert_eq!(program.memory.checkpoint_read_bytes, 48);
     assert_eq!(program.memory.device_write_bytes, 48);
-    assert_eq!(program.memory.persistent_bytes, 48);
+    assert_eq!(program.memory.persistent_bytes, 280);
 }
 
 fn metadata() -> CheckpointMetadata {
@@ -805,10 +815,292 @@ fn tensor_bytes(shape: &[i64], dtype: DType) -> u64 {
         .fold(dtype.bytes(), |acc, dim| acc * u64::try_from(*dim).unwrap())
 }
 
+// ── SlabScatter lowering tests ──────────────────────────────────────
+
+#[test]
+fn slab_scatter_merges_nearby_bulk_extent_writes() {
+    // Three tensors with small gaps in the file. The gaps prevent
+    // coalesce_persistent_arena_writes from merging them into a single
+    // BulkExtentWrite, but they're close enough for slab_scatter to
+    // group them (gap < 64 MiB, overread < 5/4).
+    let chunk = 2 * 1024 * 1024; // 2 MiB per tensor
+    let gap = 1024; // 1 KiB gap between tensors in the file
+    let file_size = chunk * 3 + gap * 2 + 4096;
+    let meta = CheckpointMetadata {
+        files: vec![CheckpointFile {
+            id: FileId(0),
+            path: "big.safetensors".to_string(),
+            size_bytes: file_size,
+            format: CheckpointFormat::Safetensors,
+        }],
+        tensors: vec![
+            raw_big(0, "t0", 0, chunk, DType::BF16),
+            raw_big(1, "t1", chunk + gap, chunk, DType::BF16),
+            raw_big(2, "t2", 2 * (chunk + gap), chunk, DType::BF16),
+        ],
+    };
+    let mut plan = LayoutPlan::new();
+    let mut ids = Vec::new();
+    for i in 0..3u32 {
+        let cols = (chunk / 2) as i64; // BF16 = 2 bytes
+        let src = plan.push(LayoutExpr::Source {
+            tensor: TensorId(i),
+            decl: decl(i, &format!("t{i}"), &[cols], Encoding::Raw(DType::BF16)),
+        });
+        let r = plan.push(LayoutExpr::Realize {
+            input: src,
+            runtime_name: format!("t{i}"),
+            decl: decl(i, &format!("t{i}"), &[cols], Encoding::Raw(DType::BF16)),
+        });
+        ids.push(r);
+    }
+    plan.outputs = ids;
+
+    let target = StorageTarget {
+        backend: BackendKind::Cuda,
+        ..StorageTarget::default()
+    };
+    let program = lower_layout_plan(&meta, &plan, target).unwrap();
+
+    let slabs: Vec<_> = program
+        .instrs
+        .iter()
+        .filter(|i| matches!(i, StorageInstr::SlabScatter { .. }))
+        .collect();
+    assert!(
+        !slabs.is_empty(),
+        "expected at least one SlabScatter, got none; instrs: {:#?}",
+        program.instrs,
+    );
+    if let StorageInstr::SlabScatter { placements, span_bytes, .. } = slabs[0] {
+        assert!(
+            placements.len() >= 2,
+            "slab must have at least 2 placements, got {}",
+            placements.len()
+        );
+        assert!(
+            *span_bytes >= chunk * 2,
+            "slab span_bytes {} should cover at least two chunks",
+            span_bytes,
+        );
+        for p in placements {
+            assert!(
+                p.bytes > 0,
+                "placement bytes must be non-zero"
+            );
+        }
+    }
+}
+
+#[test]
+fn slab_scatter_rejects_excessive_overread() {
+    // Two small tensors with a huge gap — overread exceeds 5/4 threshold.
+    let small = 1024 * 1024; // 1 MiB each
+    let gap = 256 * 1024 * 1024; // 256 MiB gap
+    let file_size = small + gap + small;
+    let meta = CheckpointMetadata {
+        files: vec![CheckpointFile {
+            id: FileId(0),
+            path: "sparse.safetensors".to_string(),
+            size_bytes: file_size,
+            format: CheckpointFormat::Safetensors,
+        }],
+        tensors: vec![
+            raw_big(0, "near", 0, small, DType::BF16),
+            raw_big(1, "far", small + gap, small, DType::BF16),
+        ],
+    };
+    let mut plan = LayoutPlan::new();
+    for i in 0..2u32 {
+        let cols = (small / 2) as i64;
+        let src = plan.push(LayoutExpr::Source {
+            tensor: TensorId(i),
+            decl: decl(i, &format!("t{i}"), &[cols], Encoding::Raw(DType::BF16)),
+        });
+        let r = plan.push(LayoutExpr::Realize {
+            input: src,
+            runtime_name: format!("t{i}"),
+            decl: decl(i, &format!("t{i}"), &[cols], Encoding::Raw(DType::BF16)),
+        });
+        plan.outputs.push(r);
+    }
+    let target = StorageTarget {
+        backend: BackendKind::Cuda,
+        ..StorageTarget::default()
+    };
+    let program = lower_layout_plan(&meta, &plan, target).unwrap();
+    let slabs: Vec<_> = program
+        .instrs
+        .iter()
+        .filter(|i| matches!(i, StorageInstr::SlabScatter { .. }))
+        .collect();
+    assert!(
+        slabs.is_empty(),
+        "should NOT merge into SlabScatter when overread is excessive; got {:#?}",
+        slabs,
+    );
+}
+
+#[test]
+fn slab_scatter_placement_offsets_are_within_span() {
+    let chunk = 4 * 1024 * 1024;
+    let gap = 512 * 1024; // small gap
+    let file_size = chunk * 3 + gap * 2;
+    let meta = CheckpointMetadata {
+        files: vec![CheckpointFile {
+            id: FileId(0),
+            path: "layout.safetensors".to_string(),
+            size_bytes: file_size,
+            format: CheckpointFormat::Safetensors,
+        }],
+        tensors: vec![
+            raw_big(0, "a", 0, chunk, DType::BF16),
+            raw_big(1, "b", chunk + gap, chunk, DType::BF16),
+            raw_big(2, "c", 2 * (chunk + gap), chunk, DType::BF16),
+        ],
+    };
+    let mut plan = LayoutPlan::new();
+    for i in 0..3u32 {
+        let cols = (chunk / 2) as i64;
+        let src = plan.push(LayoutExpr::Source {
+            tensor: TensorId(i),
+            decl: decl(i, &format!("p{i}"), &[cols], Encoding::Raw(DType::BF16)),
+        });
+        let r = plan.push(LayoutExpr::Realize {
+            input: src,
+            runtime_name: format!("p{i}"),
+            decl: decl(i, &format!("p{i}"), &[cols], Encoding::Raw(DType::BF16)),
+        });
+        plan.outputs.push(r);
+    }
+    let target = StorageTarget {
+        backend: BackendKind::Cuda,
+        ..StorageTarget::default()
+    };
+    let program = lower_layout_plan(&meta, &plan, target).unwrap();
+    for instr in &program.instrs {
+        if let StorageInstr::SlabScatter {
+            span_bytes,
+            placements,
+            ..
+        } = instr
+        {
+            for (idx, p) in placements.iter().enumerate() {
+                assert!(
+                    p.src_offset + p.bytes <= *span_bytes,
+                    "placement {idx}: src_offset {} + bytes {} exceeds span_bytes {}",
+                    p.src_offset,
+                    p.bytes,
+                    span_bytes,
+                );
+            }
+        }
+    }
+}
+
+fn raw_big(id: u32, name: &str, offset: u64, span_bytes: u64, dtype: DType) -> RawTensor {
+    let elem = dtype.bytes();
+    let count = (span_bytes / elem) as i64;
+    RawTensor {
+        id: TensorId(id),
+        name: name.to_string(),
+        file_id: FileId(0),
+        file_offset: offset,
+        span_bytes,
+        shape: vec![count],
+        encoding: Encoding::Raw(dtype),
+        layout: Layout::dense(1),
+    }
+}
+
+// ── MLA weight fusion tests ─────────────────────────────────────────
+
+#[test]
+fn mla_q_kv_a_fusion_produces_joined_tensor() {
+    use pie_weight_loader::config::ModelConfig;
+    use pie_weight_loader::storage_compiler::compile_storage_program;
+
+    let h = 128i64;
+    let q_lora = 32i64;
+    let kv_lora_rope = 16i64;
+    let mut offset = 0u64;
+    let mut tensors = Vec::new();
+    let specs: Vec<(u32, &str, Vec<i64>)> = vec![
+        (0, "model.layers.0.self_attn.q_a_proj.weight", vec![q_lora, h]),
+        (1, "model.layers.0.self_attn.kv_a_proj_with_mqa.weight", vec![kv_lora_rope, h]),
+        (2, "model.layers.0.self_attn.q_a_layernorm.weight", vec![q_lora]),
+        (3, "model.layers.0.self_attn.q_b_proj.weight", vec![64, q_lora]),
+        (4, "model.layers.0.self_attn.kv_a_layernorm.weight", vec![12]),
+        (5, "model.layers.0.self_attn.kv_b_proj.weight", vec![64, 12]),
+        (6, "model.layers.0.self_attn.o_proj.weight", vec![h, 32]),
+        (7, "model.layers.0.input_layernorm.weight", vec![h]),
+        (8, "model.layers.0.post_attention_layernorm.weight", vec![h]),
+        (9, "model.layers.0.mlp.gate_proj.weight", vec![h, h]),
+        (10, "model.layers.0.mlp.up_proj.weight", vec![h, h]),
+        (11, "model.layers.0.mlp.down_proj.weight", vec![h, h]),
+    ];
+    for (id, name, shape) in &specs {
+        let bytes = shape.iter().fold(2u64, |acc, d| acc * *d as u64);
+        tensors.push(RawTensor {
+            id: TensorId(*id),
+            name: name.to_string(),
+            file_id: FileId(0),
+            file_offset: offset,
+            span_bytes: bytes,
+            shape: shape.clone(),
+            encoding: Encoding::Raw(DType::BF16),
+            layout: Layout::dense(1),
+        });
+        offset += bytes;
+    }
+    let meta = CheckpointMetadata {
+        files: vec![CheckpointFile {
+            id: FileId(0),
+            path: "model.safetensors".to_string(),
+            size_bytes: offset,
+            format: CheckpointFormat::Safetensors,
+        }],
+        tensors,
+    };
+    let cfg = ModelConfig {
+        model_type: "kimi_k2".to_string(),
+        num_hidden_layers: 1,
+        ..ModelConfig::default()
+    };
+    let target = StorageTarget {
+        backend: BackendKind::Cuda,
+        ..StorageTarget::default()
+    };
+    let abi = pie_weight_loader::abi::RuntimeAbi::default_for_target(&meta, &cfg, &target).unwrap();
+    let program = compile_storage_program(&meta, &cfg, &abi, target).unwrap();
+    let summary = program.summary();
+
+    // The fusion should have joined q_a_proj + kv_a_proj into one tensor
+    let has_fused = program.tensors.iter().any(|t| {
+        t.name.contains("q_kv_a_proj.fused")
+    });
+    assert!(
+        has_fused,
+        "Expected fused q_kv_a_proj tensor; summary: {summary}\ntensors: {:?}",
+        program.tensors.iter().map(|t| &t.name).collect::<Vec<_>>()
+    );
+
+    // The fused tensor should have rows = q_lora + kv_lora_rope
+    let fused = program.tensors.iter().find(|t| t.name.contains("q_kv_a_proj.fused")).unwrap();
+    assert_eq!(fused.shape[0], q_lora + kv_lora_rope);
+    assert_eq!(fused.shape[1], h);
+
+    // Summary should show the program compiled successfully
+    assert!(summary.tensor_count > 0);
+    assert!(summary.finalize_count > 0);
+}
+
 fn instr_id(instr: &StorageInstr) -> pie_weight_loader::types::InstrId {
     match instr {
         StorageInstr::Allocate { id, .. }
         | StorageInstr::ExtentWrite { id, .. }
+        | StorageInstr::BulkExtentWrite { id, .. }
+        | StorageInstr::SlabScatter { id, .. }
         | StorageInstr::TileMap { id, .. }
         | StorageInstr::CreateView { id, .. }
         | StorageInstr::Attach { id, .. }

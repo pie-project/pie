@@ -30,7 +30,7 @@ fn empty_compile_returns_empty_program() {
     assert!(error.message.is_null());
 
     let view = unsafe { pie_loader_program_view(handle) };
-    assert_eq!(view.version, 1);
+    assert_eq!(view.version, 3);
     assert_eq!(view.tensors.len, 0);
     assert_eq!(view.buffers.len, 0);
     assert_eq!(view.instrs.len, 0);
@@ -168,14 +168,14 @@ fn dense_contract_lowers_to_storage_program() {
     assert_eq!(view.memory.device_write_bytes, 12);
     let instrs = unsafe { std::slice::from_raw_parts(view.instrs.ptr, view.instrs.len) };
     assert_eq!(instrs[0].kind, PieLoaderStorageInstrKind::Allocate);
-    assert_eq!(instrs[1].kind, PieLoaderStorageInstrKind::ExtentWrite);
+    assert_eq!(instrs[1].kind, PieLoaderStorageInstrKind::BulkExtentWrite);
     assert!(instrs[1].has_source);
     assert!(instrs[1].has_dest);
     assert_eq!(instrs[1].source.file_id, 0);
     assert_eq!(instrs[1].source.tensor_id, 7);
     assert_eq!(instrs[1].source.file_offset, 128);
     assert_eq!(instrs[1].source.span_bytes, 12);
-    assert_eq!(instrs[1].dest.buffer_id, 0);
+    assert_eq!(instrs[1].dest.offset, 0);
     assert_eq!(instrs[2].kind, PieLoaderStorageInstrKind::Finalize);
 
     unsafe {
@@ -533,13 +533,13 @@ fn byte_span_contract_lowers_to_explicit_extent_writes() {
     assert_eq!(view.tensors.len, 1);
     assert_eq!(view.buffers.len, 1);
     assert_eq!(instrs.len(), 5);
-    assert_eq!(instrs[1].kind, PieLoaderStorageInstrKind::ExtentWrite);
-    assert_eq!(instrs[1].source.file_offset, 68);
-    assert_eq!(instrs[1].dest.offset, 0);
-    assert_eq!(instrs[2].source.file_offset, 128);
-    assert_eq!(instrs[2].dest.offset, 12);
-    assert_eq!(instrs[3].source.file_offset, 64);
-    assert_eq!(instrs[3].dest.offset, 20);
+    assert_eq!(instrs[1].kind, PieLoaderStorageInstrKind::BulkExtentWrite);
+    assert_eq!(instrs[1].source.file_offset, 64);
+    assert_eq!(instrs[1].dest.offset, 20);
+    assert_eq!(instrs[2].source.file_offset, 68);
+    assert_eq!(instrs[2].dest.offset, 0);
+    assert_eq!(instrs[3].source.file_offset, 128);
+    assert_eq!(instrs[3].dest.offset, 12);
     assert_eq!(view.memory.persistent_bytes, 24);
     assert_eq!(view.memory.checkpoint_read_bytes, 24);
     assert_eq!(view.memory.device_write_bytes, 24);
@@ -647,21 +647,18 @@ fn join_and_select_contracts_lower_to_writes_and_view() {
     let instrs = unsafe { std::slice::from_raw_parts(view.instrs.ptr, view.instrs.len) };
     assert_eq!(view.tensors.len, 2);
     assert_eq!(view.buffers.len, 2);
-    assert_eq!(instrs.len(), 6);
+    assert_eq!(instrs.len(), 5);
     assert_eq!(instrs[0].kind, PieLoaderStorageInstrKind::Allocate);
-    assert_eq!(instrs[1].kind, PieLoaderStorageInstrKind::ExtentWrite);
+    assert_eq!(instrs[1].kind, PieLoaderStorageInstrKind::BulkExtentWrite);
     assert_eq!(instrs[1].source.tensor_id, 0);
     assert_eq!(instrs[1].source.file_offset, 64);
     assert_eq!(instrs[1].dest.offset, 0);
-    assert_eq!(instrs[2].kind, PieLoaderStorageInstrKind::ExtentWrite);
-    assert_eq!(instrs[2].source.tensor_id, 1);
-    assert_eq!(instrs[2].source.file_offset, 80);
-    assert_eq!(instrs[2].dest.offset, 16);
-    assert_eq!(instrs[3].kind, PieLoaderStorageInstrKind::Finalize);
-    assert_eq!(instrs[4].kind, PieLoaderStorageInstrKind::CreateView);
-    assert!(instrs[4].has_dest);
-    assert_eq!(instrs[4].dest.offset, 8);
-    assert_eq!(instrs[5].kind, PieLoaderStorageInstrKind::Finalize);
+    assert_eq!(instrs[1].source.span_bytes, 32);
+    assert_eq!(instrs[2].kind, PieLoaderStorageInstrKind::Finalize);
+    assert_eq!(instrs[3].kind, PieLoaderStorageInstrKind::CreateView);
+    assert!(instrs[3].has_dest);
+    assert_eq!(instrs[3].dest.offset, 8);
+    assert_eq!(instrs[4].kind, PieLoaderStorageInstrKind::Finalize);
     assert_eq!(view.memory.persistent_bytes, 32);
     assert_eq!(view.memory.checkpoint_read_bytes, 32);
     assert_eq!(view.memory.device_write_bytes, 32);
@@ -714,7 +711,7 @@ fn empty_runtime_abi_builds_default_tp_row_contracts() {
         unsafe { std::slice::from_raw_parts(tensors_view[0].shape.ptr, tensors_view[0].shape.len) };
     assert_eq!(final_shape, &[2, 4]);
     let instrs = unsafe { std::slice::from_raw_parts(view.instrs.ptr, view.instrs.len) };
-    assert_eq!(instrs[1].kind, PieLoaderStorageInstrKind::ExtentWrite);
+    assert_eq!(instrs[1].kind, PieLoaderStorageInstrKind::BulkExtentWrite);
     assert_eq!(instrs[1].source.file_offset, 80);
     assert_eq!(instrs[1].source.span_bytes, 16);
 
@@ -850,6 +847,166 @@ fn empty_runtime_abi_lowers_runtime_quant_to_encode_and_scale_output() {
             .iter()
             .any(|instr| instr.kind == PieLoaderStorageInstrKind::CreateView)
     );
+
+    unsafe {
+        pie_loader_program_free(handle);
+        pie_loader_error_free(&mut error);
+    }
+}
+
+#[test]
+fn slab_scatter_ffi_carries_placement_fields() {
+    let file_path = bytes("model.safetensors");
+    let chunk: u64 = 2 * 1024 * 1024;
+    let gap: u64 = 1024;
+    let file_size = chunk * 3 + gap * 2 + 4096;
+    let files = [PieLoaderCheckpointFileView {
+        id: 0,
+        path: file_path,
+        size_bytes: file_size,
+        format: PieLoaderCheckpointFormat::Safetensors,
+    }];
+    let cols0 = (chunk / 2) as i64;
+    let shape0 = [cols0];
+    let s0 = PieLoaderI64Slice {
+        ptr: shape0.as_ptr(),
+        len: shape0.len(),
+    };
+    let cols1 = (chunk / 2) as i64;
+    let shape1 = [cols1];
+    let s1 = PieLoaderI64Slice {
+        ptr: shape1.as_ptr(),
+        len: shape1.len(),
+    };
+    let cols2 = (chunk / 2) as i64;
+    let shape2 = [cols2];
+    let s2 = PieLoaderI64Slice {
+        ptr: shape2.as_ptr(),
+        len: shape2.len(),
+    };
+    let t0_name = bytes("t0.weight");
+    let t1_name = bytes("t1.weight");
+    let t2_name = bytes("t2.weight");
+    let o0_name = bytes("rt.t0");
+    let o1_name = bytes("rt.t1");
+    let o2_name = bytes("rt.t2");
+    let tensors = [
+        PieLoaderCheckpointTensorView {
+            id: 0,
+            name: t0_name,
+            file_id: 0,
+            file_offset: 0,
+            span_bytes: chunk,
+            dtype: PieLoaderDType::BF16,
+            encoding_kind: PieLoaderEncodingKind::Raw,
+            quant_scheme: PieLoaderQuantScheme::None,
+            shape: s0,
+            ..PieLoaderCheckpointTensorView::default()
+        },
+        PieLoaderCheckpointTensorView {
+            id: 1,
+            name: t1_name,
+            file_id: 0,
+            file_offset: chunk + gap,
+            span_bytes: chunk,
+            dtype: PieLoaderDType::BF16,
+            encoding_kind: PieLoaderEncodingKind::Raw,
+            quant_scheme: PieLoaderQuantScheme::None,
+            shape: s1,
+            ..PieLoaderCheckpointTensorView::default()
+        },
+        PieLoaderCheckpointTensorView {
+            id: 2,
+            name: t2_name,
+            file_id: 0,
+            file_offset: 2 * (chunk + gap),
+            span_bytes: chunk,
+            dtype: PieLoaderDType::BF16,
+            encoding_kind: PieLoaderEncodingKind::Raw,
+            quant_scheme: PieLoaderQuantScheme::None,
+            shape: s2,
+            ..PieLoaderCheckpointTensorView::default()
+        },
+    ];
+    let contracts = [
+        PieLoaderRuntimeTensorContractView {
+            output_name: o0_name,
+            source_kind: PieLoaderRuntimeSourceKind::DirectTensor,
+            source_tensor_id: 0,
+            dtype: PieLoaderDType::BF16,
+            encoding_kind: PieLoaderEncodingKind::Raw,
+            shape: s0,
+            alignment: 1,
+            shard_axis: -1,
+            semantic_role: PieLoaderSemanticRole::DirectTensor,
+            source_contract_id: u32::MAX,
+            ..PieLoaderRuntimeTensorContractView::default()
+        },
+        PieLoaderRuntimeTensorContractView {
+            output_name: o1_name,
+            source_kind: PieLoaderRuntimeSourceKind::DirectTensor,
+            source_tensor_id: 1,
+            dtype: PieLoaderDType::BF16,
+            encoding_kind: PieLoaderEncodingKind::Raw,
+            shape: s1,
+            alignment: 1,
+            shard_axis: -1,
+            semantic_role: PieLoaderSemanticRole::DirectTensor,
+            source_contract_id: u32::MAX,
+            ..PieLoaderRuntimeTensorContractView::default()
+        },
+        PieLoaderRuntimeTensorContractView {
+            output_name: o2_name,
+            source_kind: PieLoaderRuntimeSourceKind::DirectTensor,
+            source_tensor_id: 2,
+            dtype: PieLoaderDType::BF16,
+            encoding_kind: PieLoaderEncodingKind::Raw,
+            shape: s2,
+            alignment: 1,
+            shard_axis: -1,
+            semantic_role: PieLoaderSemanticRole::DirectTensor,
+            source_contract_id: u32::MAX,
+            ..PieLoaderRuntimeTensorContractView::default()
+        },
+    ];
+    let mut input = compile_input(&files, &tensors, &contracts);
+    input.target.backend = pie_weight_loader::PieLoaderBackendKind::Cuda;
+
+    let mut handle: *mut PieLoaderProgramHandle = ptr::null_mut();
+    let mut error = PieLoaderError::default();
+    let status = unsafe { pie_loader_compile(&input, &mut handle, &mut error) };
+    assert_eq!(status, PieLoaderStatus::Ok, "{}", error_message(&error));
+    let view = unsafe { pie_loader_program_view(handle) };
+    let instrs = unsafe { std::slice::from_raw_parts(view.instrs.ptr, view.instrs.len) };
+
+    let slab = instrs
+        .iter()
+        .find(|i| i.kind == PieLoaderStorageInstrKind::SlabScatter);
+    assert!(
+        slab.is_some(),
+        "expected a SlabScatter instruction in FFI view"
+    );
+    let slab = slab.unwrap();
+    assert_eq!(slab.slab_file_id, 0);
+    assert!(slab.slab_span_bytes >= chunk * 2);
+    let placements = unsafe {
+        std::slice::from_raw_parts(slab.slab_placements.ptr, slab.slab_placements.len)
+    };
+    assert!(
+        placements.len() >= 2,
+        "SlabScatter must have >= 2 placements, got {}",
+        placements.len()
+    );
+    for (i, p) in placements.iter().enumerate() {
+        assert!(
+            p.src_offset + p.bytes <= slab.slab_span_bytes,
+            "placement {i}: src_offset {} + bytes {} > span {}",
+            p.src_offset,
+            p.bytes,
+            slab.slab_span_bytes,
+        );
+        assert!(p.bytes > 0, "placement {i} has zero bytes");
+    }
 
     unsafe {
         pie_loader_program_free(handle);

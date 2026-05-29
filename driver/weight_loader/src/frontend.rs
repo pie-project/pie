@@ -419,22 +419,39 @@ fn runtime_quant_metadata_outputs(
     let Encoding::Quant(spec) = &quant_decl.encoding else {
         return Vec::new();
     };
-    if !matches!(
-        spec.scheme,
-        QuantScheme::Fp8E4M3 | QuantScheme::Int8Symmetric
-    ) {
-        return Vec::new();
-    }
     if quant_decl.shape.len() != 2 {
         return Vec::new();
     }
+    let (name, shape, encoding) = match spec.scheme {
+        QuantScheme::Fp8E4M3 | QuantScheme::Int8Symmetric => (
+            format!("{}_scale_inv", contract.output_name),
+            vec![quant_decl.shape[0]],
+            Encoding::Raw(DType::F32),
+        ),
+        QuantScheme::Mxfp4E2M1E8M0 => {
+            // E8M0 block scale: 1 uint8 byte per 32-element block along the
+            // K (column) dimension. The encode-tile kernel writes a row-major
+            // `[rows, cols/32]` byte tensor. Name matches GPT-OSS naming so
+            // downstream paths that look up `*.weight_scale` find it.
+            let cols = quant_decl.shape[1];
+            if cols % 32 != 0 {
+                return Vec::new();
+            }
+            (
+                format!("{}_scale", contract.output_name),
+                vec![quant_decl.shape[0], cols / 32],
+                Encoding::Raw(DType::U8),
+            )
+        }
+        _ => return Vec::new(),
+    };
     let id = TensorId(*next_generated_tensor);
     *next_generated_tensor = next_generated_tensor.saturating_add(1);
     vec![TensorDecl {
         id,
-        name: format!("{}_scale_inv", contract.output_name),
-        shape: vec![quant_decl.shape[0]],
-        encoding: Encoding::Raw(DType::F32),
+        name,
+        shape,
+        encoding,
         layout: contract.layout.clone(),
         sharding: quant_decl.sharding,
         alignment: contract.alignment,

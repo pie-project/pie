@@ -121,6 +121,13 @@ NcclComm& NcclComm::operator=(NcclComm&& o) noexcept {
 
 void NcclComm::all_reduce_bf16(void* sendrecv, std::size_t count,
                                ncclRedOp_t op, cudaStream_t stream) {
+    if (custom_ar_ != nullptr && op == ncclSum) {
+        const std::size_t bytes = count * sizeof(std::uint16_t);
+        if (custom_ar_->can_handle(sendrecv, bytes, stream)) {
+            custom_ar_->all_reduce_bf16(sendrecv, sendrecv, count, stream);
+            return;
+        }
+    }
     NCCL_CHECK_ASYNC(ncclAllReduce(sendrecv, sendrecv, count, ncclBfloat16,
                                    op, comm_, stream),
                      comm_);

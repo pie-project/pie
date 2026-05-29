@@ -51,6 +51,23 @@ void enable_peer_access(int self_device, int world_size) {
     }
 }
 
+bool has_full_peer_access(int world_size) {
+    int device_count = 0;
+    if (cudaGetDeviceCount(&device_count) != cudaSuccess) return false;
+    if (device_count < world_size) return false;
+    for (int src = 0; src < world_size; ++src) {
+        for (int dst = 0; dst < world_size; ++dst) {
+            if (src == dst) continue;
+            int can_access = 0;
+            if (cudaDeviceCanAccessPeer(&can_access, src, dst) != cudaSuccess) {
+                return false;
+            }
+            if (!can_access) return false;
+        }
+    }
+    return true;
+}
+
 // Look up the base allocation address for `ptr`. The vllm kernel needs
 // the *base* pointer for the IPC handle exchange — sub-allocation
 // pointers won't round-trip across processes correctly.
@@ -196,8 +213,10 @@ CustomAllReduce::CustomAllReduce(NcclComm& comm,
     world_size_ = comm.world_size();
     same_process_ = same_process;
     max_bytes_ = max_bytes;
-    const char* disabled = std::getenv("PIE_CUDA_DISABLE_CUSTOM_ALL_REDUCE");
-    if (disabled != nullptr && std::strcmp(disabled, "1") == 0) {
+    const char* custom_ar_disabled =
+        std::getenv("PIE_CUDA_DISABLE_CUSTOM_ALL_REDUCE");
+    if (custom_ar_disabled != nullptr &&
+        std::strcmp(custom_ar_disabled, "1") == 0) {
         return;
     }
     if (world_size_ < 2 || world_size_ > 8 || (world_size_ % 2) != 0) {
@@ -211,10 +230,9 @@ CustomAllReduce::CustomAllReduce(NcclComm& comm,
     int dev = 0;
     CUDA_CHECK(cudaGetDevice(&dev));
     enable_peer_access(dev, world_size_);
-    // We only construct this wrapper for TP=2 today. vLLM allows custom
-    // all-reduce on two PCIe GPUs; the fully-connected flag only affects
-    // world sizes above two.
-    fully_connected_ = false;
+    // vLLM's custom all-reduce can handle larger TP groups only when every
+    // rank has direct peer access to every other rank.
+    fully_connected_ = world_size_ <= 2 || has_full_peer_access(world_size_);
 
     // Allocate the local Signal struct plus the temporary region needed by
     // flashinfer's 2-stage algorithm. TP=2 uses the 1-stage kernel, but

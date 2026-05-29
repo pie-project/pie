@@ -14,7 +14,7 @@
 
 namespace pie_weight_loader {
 
-constexpr static const uint32_t STORAGE_PROGRAM_VERSION = 1;
+constexpr static const uint32_t STORAGE_PROGRAM_VERSION = 3;
 
 enum class PieLoaderBackendKind {
   Cuda = 0,
@@ -129,6 +129,8 @@ enum class PieLoaderStorageInstrKind {
   Attach = 4,
   Release = 5,
   Finalize = 6,
+  BulkExtentWrite = 7,
+  SlabScatter = 8,
 };
 
 enum class PieLoaderTileMapKind {
@@ -337,10 +339,23 @@ struct PieLoaderBufferDeclView {
   uint64_t bytes;
   uint32_t alignment;
   bool temporary;
+  bool has_persistent_offset;
+  uint64_t persistent_offset;
 };
 
 struct PieLoaderBufferDeclSlice {
   const PieLoaderBufferDeclView *ptr;
+  size_t len;
+};
+
+struct PieLoaderSlabPlacementView {
+  uint64_t src_offset;
+  uint64_t dest_offset;
+  uint64_t bytes;
+};
+
+struct PieLoaderSlabPlacementSlice {
+  const PieLoaderSlabPlacementView *ptr;
   size_t len;
 };
 
@@ -371,6 +386,10 @@ struct PieLoaderStorageInstrView {
   uint32_t transform_target_cols;
   uint64_t transform_scratch_bytes;
   PieLoaderBytes name;
+  uint32_t slab_file_id;
+  uint64_t slab_file_offset;
+  uint64_t slab_span_bytes;
+  PieLoaderSlabPlacementSlice slab_placements;
 };
 
 struct PieLoaderStorageInstrSlice {

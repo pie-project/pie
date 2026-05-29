@@ -180,6 +180,7 @@ def run(args: argparse.Namespace):
 
     llm = LLM(
         model=args.model,
+        trust_remote_code=True,
         gpu_memory_utilization=args.gpu_mem_util,
         max_num_seqs=max_num_seqs,
         max_num_batched_tokens=args.max_num_batched_tokens,
