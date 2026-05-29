@@ -45,6 +45,7 @@ DType dtype_from_safetensors(const std::string& s) {
     // whether those bytes remain native QuantPacked runtime tensors or
     // dequantize to BF16 during materialization.
     if (s == "F4_E2M1") return DType::UINT8;
+    if (s == "F8_E8M0") return DType::UINT8;
     throw std::runtime_error("unsupported safetensors dtype: " + s);
 }
 

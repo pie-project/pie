@@ -14,6 +14,7 @@
 #include "ops/gemm.hpp"
 #include "loader/rust_loader_bridge.hpp"
 #include "loader/rust_storage_executor.hpp"
+#include "loader/weight_artifact_cache.hpp"
 #include "tensor.hpp"
 
 namespace pie_cuda_driver {
@@ -39,7 +40,10 @@ bool supports_tp(const std::string& mt) {
         || mt == "qwen3_5" || mt == "qwen3_5_text"
         || mt == "qwen3_5_moe" || mt == "qwen3_5_moe_text"
         || mt == "qwen3_moe"
-        || mt == "nemotron_h";
+        || mt == "nemotron_h"
+        || mt == "kimi_k2"
+        || mt == "deepseek_v2" || mt == "deepseek_v3" || mt == "deepseek_v4"
+        || mt == "glm_moe_dsa";
 }
 
 // True for any MoE model whose forward path lives in qwen3_5_moe_forward.
@@ -143,9 +147,21 @@ LoadedModel LoadedModel::load(const Config& boot_cfg, NcclComm* tp_comm) {
     LoadedModel e;
     e.boot_ = boot_cfg;
     const bool verbose = boot_cfg.runtime.verbose;
+    const auto load_start = std::chrono::steady_clock::now();
+    auto log_stage = [&](const char* stage) {
+        if (!verbose) return;
+        const auto now = std::chrono::steady_clock::now();
+        const double ms =
+            std::chrono::duration<double, std::milli>(now - load_start).count();
+        std::cerr << "[pie-driver-cuda] load stage rank="
+                  << boot_cfg.distributed.tp_rank << " +" << static_cast<int>(ms)
+                  << "ms: " << stage << "\n";
+    };
 
     const std::filesystem::path snapshot{boot_cfg.model.snapshot_dir};
+    log_stage("parse hf config begin");
     e.hf_ = parse_hf_config(snapshot / "config.json");
+    log_stage("parse hf config done");
 
     // Bind to the requested CUDA device before we allocate anything.
     int dev_id = 0;
@@ -194,7 +210,9 @@ LoadedModel LoadedModel::load(const Config& boot_cfg, NcclComm* tp_comm) {
         select_mxfp4_moe_lowering(boot_cfg.model, backend_target);
     e.mxfp4_moe_lowering_ = backend_target.mxfp4_moe;
 
+    log_stage("open safetensors begin");
     auto loader = SafetensorsCheckpointSource::open(snapshot);
+    log_stage("open safetensors done");
 
     const int tp_size = boot_cfg.distributed.tp_size;
     const int tp_rank = boot_cfg.distributed.tp_rank;
@@ -221,15 +239,39 @@ LoadedModel LoadedModel::load(const Config& boot_cfg, NcclComm* tp_comm) {
             }
         };
         require_divisible(hf.num_attention_heads, "num_attention_heads");
-        require_divisible(hf.num_key_value_heads, "num_key_value_heads");
+        // V4 has num_key_value_heads=1 (MQA) — the single KV head is
+        // replicated, not sharded. Skip the divisibility check.
+        if (hf.model_type != "deepseek_v4") {
+            require_divisible(hf.num_key_value_heads, "num_key_value_heads");
+        }
         // Qwen3.5-MoE / Qwen3-MoE have no dense `intermediate_size`; the
         // MLP lives entirely in `moe_intermediate_size` (+ `shared_expert_
         // intermediate_size` for the 3.5/3.6 family — Qwen3-MoE has no
         // shared expert).
+        const bool is_kimi_k2 = hf.model_type == "kimi_k2"
+            || hf.model_type == "deepseek_v2" || hf.model_type == "deepseek_v3"
+            || hf.model_type == "glm_moe_dsa";
+        const bool is_dsv4 = hf.model_type == "deepseek_v4";
         const bool is_q35_moe = is_qwen3_5_moe_arch(hf.model_type);
         const bool is_nemotron_h = hf.model_type == "nemotron_h";
-        if (!is_q35_moe) {
+        if (!is_q35_moe && !is_kimi_k2 && !is_dsv4) {
             require_divisible(hf.intermediate_size, "intermediate_size");
+        }
+        if (is_kimi_k2) {
+            require_divisible(hf.q_lora_rank, "q_lora_rank");
+            require_divisible(hf.kv_lora_rank, "kv_lora_rank");
+            require_divisible(hf.moe_intermediate_size, "moe_intermediate_size");
+            if (hf.shared_expert_intermediate_size > 0) {
+                require_divisible(hf.shared_expert_intermediate_size,
+                                  "shared_expert_intermediate_size");
+            }
+        }
+        if (is_dsv4) {
+            require_divisible(hf.q_lora_rank, "q_lora_rank");
+            if (hf.dsv4_o_lora_rank > 0) {
+                require_divisible(hf.dsv4_o_lora_rank, "o_lora_rank");
+            }
+            require_divisible(hf.moe_intermediate_size, "moe_intermediate_size");
         }
         // Qwen3.5 / 3.6-MoE: linear-attention head counts must shard too.
         // Qwen3-MoE has no linear-attn layers, so this check is skipped.
@@ -270,12 +312,14 @@ LoadedModel LoadedModel::load(const Config& boot_cfg, NcclComm* tp_comm) {
     if (runtime_quant == "fp8" && !fp8_native) {
         runtime_quant.clear();
     }
+    log_stage("compile rust loader plan begin");
     RustLoaderCompileResult rust_plan =
         compile_rust_loader_plan_from_metadata(
             e.hf_, loader, runtime_quant, tp_rank, tp_size,
             64ull * 1024ull * 1024ull,
             /*preferred_alignment=*/256,
             backend_target);
+    log_stage("compile rust loader plan done");
     const auto rust_view = rust_plan.program.view();
     if (const char* dump_path =
             std::getenv("PIE_CUDA_RUST_LAYOUT_PLAN_DUMP");
@@ -313,48 +357,91 @@ LoadedModel LoadedModel::load(const Config& boot_cfg, NcclComm* tp_comm) {
             "this model.");
     }
 
-    WeightStoreBuilder rust_builder(e.weights_);
-    RustStorageProgramExecutor rust_executor(
-        loader,
-        rust_builder,
-        std::move(rust_plan.source_tensor_names),
-        std::move(rust_plan.quant_attachments));
-    LoadExecutionStats load_memory_stats;
-    const bool sample_load_memory =
-        verbose || std::getenv("PIE_CUDA_PROFILE_LOAD_MEMORY") != nullptr;
-    LoadMemorySampler load_memory_sampler{.stats = &load_memory_stats};
-    if (sample_load_memory) {
-        LoadMemorySampler::sample(&load_memory_sampler);
-    }
+    // Materialized-weight artifact cache (WEIGHT_LOADER_TODO.md A3.1). The
+    // materialized weights are a deterministic function of rust_plan.cache_key,
+    // so on a hit we reload them straight into device memory and skip the
+    // executor pass below. The compile above is cheap (~tens of ms) and still
+    // runs every boot, validating the key + full ABI coverage.
     LoadExecutionStats materialized;
-    {
-        ScopedDeviceTensorMemoryCallback callback(
-            sample_load_memory ? &load_memory_sampler : nullptr);
-        materialized = rust_executor.execute(rust_view);
-    }
-    CUDA_CHECK(cudaDeviceSynchronize());
-    if (sample_load_memory) {
-        std::size_t free_after = 0;
-        std::size_t total_after = 0;
-        CUDA_CHECK(cudaMemGetInfo(&free_after, &total_after));
-        load_memory_stats.cuda_free_after_bytes = free_after;
-        load_memory_stats.cuda_total_bytes = total_after;
-        if (load_memory_stats.cuda_memory_samples > 0 &&
-            load_memory_stats.cuda_free_before_bytes >=
-                load_memory_stats.cuda_min_free_bytes) {
-            load_memory_stats.cuda_actual_peak_delta_bytes =
-                load_memory_stats.cuda_free_before_bytes -
-                load_memory_stats.cuda_min_free_bytes;
+    const auto weight_cache_dir = weight_artifact_cache_dir();
+    bool weight_cache_hit = false;
+    if (!weight_cache_dir.empty()) {
+        try {
+            WeightStoreBuilder cache_builder(e.weights_);
+            weight_cache_hit = read_weight_artifact_cache(
+                cache_builder, rust_plan.cache_key, weight_cache_dir);
+        } catch (const std::exception& ex) {
+            std::cerr << "[pie-driver-cuda] weight cache: reload failed ("
+                      << ex.what() << "); falling back to materialize\n";
+            e.weights_ = WeightStore{};
+            weight_cache_hit = false;
         }
-        materialized.cuda_total_bytes = load_memory_stats.cuda_total_bytes;
-        materialized.cuda_free_before_bytes =
-            load_memory_stats.cuda_free_before_bytes;
-        materialized.cuda_min_free_bytes = load_memory_stats.cuda_min_free_bytes;
-        materialized.cuda_free_after_bytes =
-            load_memory_stats.cuda_free_after_bytes;
-        materialized.cuda_actual_peak_delta_bytes =
-            load_memory_stats.cuda_actual_peak_delta_bytes;
-        materialized.cuda_memory_samples = load_memory_stats.cuda_memory_samples;
+        log_stage(weight_cache_hit
+                      ? "weight artifact cache hit (skipped materialize)"
+                      : "weight artifact cache miss");
+    }
+
+    if (!weight_cache_hit) {
+        WeightStoreBuilder rust_builder(e.weights_);
+        RustStorageProgramExecutor rust_executor(
+            loader,
+            rust_builder,
+            std::move(rust_plan.source_tensor_names),
+            std::move(rust_plan.quant_attachments));
+        log_stage("materialize storage program begin");
+        LoadExecutionStats load_memory_stats;
+        const bool sample_load_memory =
+            verbose || std::getenv("PIE_CUDA_PROFILE_LOAD_MEMORY") != nullptr;
+        LoadMemorySampler load_memory_sampler{.stats = &load_memory_stats};
+        if (sample_load_memory) {
+            LoadMemorySampler::sample(&load_memory_sampler);
+        }
+        {
+            ScopedDeviceTensorMemoryCallback callback(
+                sample_load_memory ? &load_memory_sampler : nullptr);
+            materialized = rust_executor.execute(rust_view);
+        }
+        CUDA_CHECK(cudaDeviceSynchronize());
+        log_stage("materialize storage program done");
+        if (sample_load_memory) {
+            std::size_t free_after = 0;
+            std::size_t total_after = 0;
+            CUDA_CHECK(cudaMemGetInfo(&free_after, &total_after));
+            load_memory_stats.cuda_free_after_bytes = free_after;
+            load_memory_stats.cuda_total_bytes = total_after;
+            if (load_memory_stats.cuda_memory_samples > 0 &&
+                load_memory_stats.cuda_free_before_bytes >=
+                    load_memory_stats.cuda_min_free_bytes) {
+                load_memory_stats.cuda_actual_peak_delta_bytes =
+                    load_memory_stats.cuda_free_before_bytes -
+                    load_memory_stats.cuda_min_free_bytes;
+            }
+            materialized.cuda_total_bytes = load_memory_stats.cuda_total_bytes;
+            materialized.cuda_free_before_bytes =
+                load_memory_stats.cuda_free_before_bytes;
+            materialized.cuda_min_free_bytes =
+                load_memory_stats.cuda_min_free_bytes;
+            materialized.cuda_free_after_bytes =
+                load_memory_stats.cuda_free_after_bytes;
+            materialized.cuda_actual_peak_delta_bytes =
+                load_memory_stats.cuda_actual_peak_delta_bytes;
+            materialized.cuda_memory_samples =
+                load_memory_stats.cuda_memory_samples;
+        }
+
+        if (!weight_cache_dir.empty()) {
+            log_stage("weight artifact cache write begin");
+            bool wrote = false;
+            try {
+                wrote = write_weight_artifact_cache(
+                    e.weights_, rust_plan.cache_key, weight_cache_dir);
+            } catch (const std::exception& ex) {
+                std::cerr << "[pie-driver-cuda] weight cache: write failed ("
+                          << ex.what() << ")\n";
+            }
+            log_stage(wrote ? "weight artifact cache write done"
+                            : "weight artifact cache write skipped");
+        }
     }
 
     if (verbose && materialized.runtime_quantized_weights > 0) {
@@ -397,6 +484,36 @@ LoadedModel LoadedModel::load(const Config& boot_cfg, NcclComm* tp_comm) {
                   << to_mib(materialized.cuda_free_after_bytes)
                   << " MiB across "
                   << materialized.cuda_memory_samples << " samples\n";
+    }
+    if (const char* profile = std::getenv("PIE_WEIGHT_LOADER_PROFILE");
+        profile != nullptr && profile[0] != '\0' && profile[0] != '0') {
+        const auto to_mib = [](std::uint64_t bytes) {
+            return bytes / (1024ull * 1024ull);
+        };
+        std::cerr << "[pie-driver-cuda] weight loader profile: h2d_copies="
+                  << materialized.h2d_copy_count
+                  << " bulk_copies=" << materialized.h2d_bulk_copy_count
+                  << " pinned_copies="
+                  << materialized.h2d_pinned_copy_count
+                  << " slab_scatter="
+                  << materialized.slab_scatter_count
+                  << " slab_placements="
+                  << materialized.slab_scatter_placements
+                  << " h2d_bytes=" << to_mib(materialized.h2d_copy_bytes)
+                  << " MiB bulk_bytes="
+                  << to_mib(materialized.h2d_bulk_copy_bytes)
+                  << " MiB pinned_bytes="
+                  << to_mib(materialized.h2d_pinned_copy_bytes)
+                  << " MiB slab_source_bytes="
+                  << to_mib(materialized.slab_scatter_source_bytes)
+                  << " MiB slab_payload_bytes="
+                  << to_mib(materialized.slab_scatter_payload_bytes)
+                  << " MiB copy_flushes="
+                  << materialized.copy_stream_flushes
+                  << " batch_calls="
+                  << materialized.h2d_batch_calls
+                  << " max_pending="
+                  << materialized.max_pending_copies_seen << "\n";
     }
 
     e.weights_.validate_quant_metadata();

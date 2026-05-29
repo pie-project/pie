@@ -18,6 +18,17 @@ __device__ __forceinline__ void rotate_pair(
     h_ptr[dim_pair + half] = __float2bfloat16(b * cos_v + a * sin_v);
 }
 
+// GPT-J / interleaved pairing: rotate adjacent dims (2i, 2i+1). Required by
+// GLM (`rope_interleave=true`). Same per-pair frequency as the half variant.
+__device__ __forceinline__ void rotate_pair_interleaved(
+    __nv_bfloat16* h_ptr, int dim_pair, float cos_v, float sin_v)
+{
+    const float a = __bfloat162float(h_ptr[2 * dim_pair]);
+    const float b = __bfloat162float(h_ptr[2 * dim_pair + 1]);
+    h_ptr[2 * dim_pair]     = __float2bfloat16(a * cos_v - b * sin_v);
+    h_ptr[2 * dim_pair + 1] = __float2bfloat16(b * cos_v + a * sin_v);
+}
+
 __global__ void rope_standard_table_kernel(
     const std::int32_t* __restrict__ positions,
     float* __restrict__ table,
@@ -46,7 +57,8 @@ __global__ void rope_bf16_kernel(
     int num_q_heads,
     int num_kv_heads,
     int head_dim,
-    float theta)
+    float theta,
+    bool interleaved)
 {
     const int n = blockIdx.x;
     const int total_heads = num_q_heads + num_kv_heads;
@@ -68,12 +80,16 @@ __global__ void rope_bf16_kernel(
         if (head_idx < num_q_heads) {
             __nv_bfloat16* qp = q + (static_cast<long long>(n) * num_q_heads +
                                      head_idx) * head_dim;
-            rotate_pair(qp, half, dim_pair, cos_v, sin_v);
-        } else {
+            if (interleaved) rotate_pair_interleaved(qp, dim_pair, cos_v, sin_v);
+            else rotate_pair(qp, half, dim_pair, cos_v, sin_v);
+            continue;
+        }
+        {
             const int kv_h = head_idx - num_q_heads;
             __nv_bfloat16* kp = k + (static_cast<long long>(n) * num_kv_heads +
                                      kv_h) * head_dim;
-            rotate_pair(kp, half, dim_pair, cos_v, sin_v);
+            if (interleaved) rotate_pair_interleaved(kp, dim_pair, cos_v, sin_v);
+            else rotate_pair(kp, half, dim_pair, cos_v, sin_v);
         }
     }
 }
@@ -214,7 +230,8 @@ void launch_rope_bf16(
     int num_kv_heads,
     int head_dim,
     float theta,
-    cudaStream_t stream)
+    cudaStream_t stream,
+    bool interleaved)
 {
     constexpr int BLOCK = 256;
     dim3 grid(num_tokens);
@@ -223,7 +240,7 @@ void launch_rope_bf16(
         static_cast<__nv_bfloat16*>(q),
         static_cast<__nv_bfloat16*>(k),
         positions,
-        num_q_heads, num_kv_heads, head_dim, theta);
+        num_q_heads, num_kv_heads, head_dim, theta, interleaved);
 }
 
 void launch_qk_rmsnorm_rope_bf16(
@@ -578,6 +595,74 @@ void launch_rope_partial_bf16_position_delta(
         positions,
         position_delta,
         num_q_heads, num_kv_heads, head_dim, rotary_dim, theta);
+}
+
+namespace {
+
+__global__ void rope_partial_last_bf16_kernel(
+    __nv_bfloat16* __restrict__ q,
+    __nv_bfloat16* __restrict__ k,
+    const std::int32_t* __restrict__ positions,
+    int num_q_heads,
+    int num_kv_heads,
+    int head_dim,
+    int rotary_dim,
+    float theta,
+    bool inverse)
+{
+    const int n = blockIdx.x;
+    const int total_heads = num_q_heads + num_kv_heads;
+    const int rope_half = rotary_dim / 2;
+    const int offset = head_dim - rotary_dim;
+    const int pos = positions[n];
+
+    for (int t = threadIdx.x; t < total_heads * rope_half; t += blockDim.x) {
+        const int head_idx = t / rope_half;
+        const int dim_pair = t % rope_half;
+
+        const float freq = powf(theta,
+            -2.f * static_cast<float>(dim_pair) /
+                   static_cast<float>(rotary_dim));
+        const float ang = (inverse ? -1.f : 1.f) * static_cast<float>(pos) * freq;
+        float cos_v, sin_v;
+        __sincosf(ang, &sin_v, &cos_v);
+
+        const bool is_q = (head_idx < num_q_heads);
+        __nv_bfloat16* base = is_q
+            ? q + static_cast<long long>(n * num_q_heads + head_idx) * head_dim
+            : k + static_cast<long long>(n * num_kv_heads + (head_idx - num_q_heads)) * head_dim;
+
+        const int i = offset + dim_pair;
+        const int j = offset + dim_pair + rope_half;
+        const float a = __bfloat162float(base[i]);
+        const float b = __bfloat162float(base[j]);
+        base[i] = __float2bfloat16(a * cos_v - b * sin_v);
+        base[j] = __float2bfloat16(b * cos_v + a * sin_v);
+    }
+}
+
+}  // namespace
+
+void launch_rope_partial_last_bf16(
+    void* q, void* k,
+    const std::int32_t* positions,
+    int num_tokens,
+    int num_q_heads,
+    int num_kv_heads,
+    int head_dim,
+    int rotary_dim,
+    float theta,
+    cudaStream_t stream,
+    bool inverse)
+{
+    constexpr int BLOCK = 256;
+    dim3 grid(num_tokens);
+    dim3 block(BLOCK);
+    rope_partial_last_bf16_kernel<<<grid, block, 0, stream>>>(
+        static_cast<__nv_bfloat16*>(q),
+        static_cast<__nv_bfloat16*>(k),
+        positions,
+        num_q_heads, num_kv_heads, head_dim, rotary_dim, theta, inverse);
 }
 
 }  // namespace pie_cuda_driver::kernels

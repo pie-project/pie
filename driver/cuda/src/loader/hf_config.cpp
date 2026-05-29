@@ -82,6 +82,20 @@ HfConfig parse_hf_config(const std::filesystem::path& path) {
     cfg.num_attention_heads      = require<int>(j, "num_attention_heads", path_str);
     cfg.num_key_value_heads      = optional<int>(j, "num_key_value_heads", cfg.num_attention_heads);
     cfg.head_dim                 = optional<int>(j, "head_dim", cfg.hidden_size / cfg.num_attention_heads);
+    cfg.q_lora_rank              = optional<int>(j, "q_lora_rank", 0);
+    cfg.kv_lora_rank             = optional<int>(j, "kv_lora_rank", 0);
+    cfg.qk_nope_head_dim         = optional<int>(j, "qk_nope_head_dim", 0);
+    cfg.qk_rope_head_dim         = optional<int>(j, "qk_rope_head_dim", 0);
+    cfg.v_head_dim               = optional<int>(j, "v_head_dim", 0);
+    if ((cfg.model_type == "kimi_k2" || cfg.model_type == "deepseek_v2" ||
+         cfg.model_type == "deepseek_v3" || cfg.model_type == "glm_moe_dsa") &&
+        cfg.qk_nope_head_dim > 0 && cfg.qk_rope_head_dim > 0) {
+        // MLA attention has a query/key width that is independent from the
+        // value width and from hidden_size / num_heads. Keep `head_dim` as
+        // the QK width so RoPE/attention capability checks see the right
+        // logical dimension; `v_head_dim` carries the output-value width.
+        cfg.head_dim = cfg.qk_nope_head_dim + cfg.qk_rope_head_dim;
+    }
 
     // Round head_dim up to the nearest flashinfer-supported dispatch
     // value for kernel bookkeeping. Models in our supported set hit
@@ -142,15 +156,21 @@ HfConfig parse_hf_config(const std::filesystem::path& path) {
                               cfg.max_position_embeddings);
         } else if (rope_type == "yarn") {
             cfg.rope_scaling_kind = HfConfig::RopeScaling::OriginalYaRN;
+            cfg.has_rope_scaling  = true;
             cfg.rope_factor           = optional<float>(s, "factor", 1.0f);
             cfg.rope_beta_fast        = optional<float>(s, "beta_fast", 32.0f);
             cfg.rope_beta_slow        = optional<float>(s, "beta_slow", 1.0f);
-            // HF's `_compute_yarn_parameters` sets the default mscale
-            // to `0.1 * ln(factor) + 1` when `attention_factor` is
-            // absent. OLMo-3 ships it explicitly (1.2079...).
-            const float default_mscale = (cfg.rope_factor > 1.f)
-                ? 0.1f * std::log(cfg.rope_factor) + 1.0f
-                : 1.0f;
+            // DeepSeek/Kimi models use `mscale_all_dim` (typically 1.0)
+            // as the attention factor. OLMo-3 uses `attention_factor`
+            // directly. Fall back to `0.1 * ln(factor) + 1` if neither
+            // is present.
+            const float mscale_all_dim =
+                optional<float>(s, "mscale_all_dim", 0.0f);
+            const float default_mscale = mscale_all_dim > 0.f
+                ? mscale_all_dim
+                : (cfg.rope_factor > 1.f
+                    ? 0.1f * std::log(cfg.rope_factor) + 1.0f
+                    : 1.0f);
             cfg.rope_attention_factor = optional<float>(
                 s, "attention_factor", default_mscale);
             cfg.rope_original_max_position =
@@ -249,6 +269,37 @@ HfConfig parse_hf_config(const std::filesystem::path& path) {
     // Gemma-4 uses `top_k_experts`. Accept either.
     cfg.num_experts_per_tok = optional<int>(j, "num_experts_per_tok",
                                             optional<int>(j, "top_k_experts", 0));
+    cfg.first_k_dense_replace =
+        optional<int>(j, "first_k_dense_replace", 0);
+    cfg.n_shared_experts =
+        optional<int>(j, "n_shared_experts", 0);
+    cfg.norm_topk_prob =
+        optional<bool>(j, "norm_topk_prob", false);
+    cfg.routed_scaling_factor =
+        optional<float>(j, "routed_scaling_factor", 1.0f);
+
+    // ── DeepSeek V4 specific ────────────────────────────────────────
+    if (cfg.model_type == "deepseek_v4") {
+        cfg.dsv4_o_lora_rank       = optional<int>(j, "o_lora_rank", 0);
+        cfg.dsv4_o_groups          = optional<int>(j, "o_groups", 0);
+        cfg.dsv4_index_head_dim    = optional<int>(j, "index_head_dim", 0);
+        cfg.dsv4_index_n_heads     = optional<int>(j, "index_n_heads", 0);
+        cfg.dsv4_index_topk        = optional<int>(j, "index_topk", 0);
+        cfg.dsv4_hc_mult           = optional<int>(j, "hc_mult", 0);
+        cfg.dsv4_hc_eps            = optional<float>(j, "hc_eps", 1e-6f);
+        cfg.dsv4_num_hash_layers   = optional<int>(j, "num_hash_layers", 0);
+        cfg.dsv4_sliding_window    = optional<int>(j, "sliding_window", 0);
+        cfg.dsv4_compress_rope_theta = optional<float>(j, "compress_rope_theta", 0.f);
+        cfg.dsv4_scoring_func      = optional<std::string>(j, "scoring_func", "");
+        cfg.dsv4_expert_dtype      = optional<std::string>(j, "expert_dtype", "");
+        cfg.attention_has_sinks    = true;
+        if (j.contains("compress_ratios") && j["compress_ratios"].is_array()) {
+            for (const auto& v : j["compress_ratios"]) {
+                cfg.dsv4_compress_ratios.push_back(v.get<int>());
+            }
+        }
+    }
+
     // Gemma-4 26B-A4B sets `enable_moe_block: true` to flip its layers
     // from dense-MLP-only to dense + parallel MoE.
     cfg.gemma4_enable_moe   = optional<bool>(j, "enable_moe_block", false);
@@ -324,15 +375,24 @@ HfConfig parse_hf_config(const std::filesystem::path& path) {
     // Qwen3.6-MoE knobs (zero on non-MoE archs).
     cfg.moe_intermediate_size =
         optional<int>(j, "moe_intermediate_size", 0);
+    // shared_expert_intermediate_size: explicit field, then the
+    // `moe_shared_expert_intermediate_size` alias, then (DeepSeek/GLM
+    // style) computed as n_shared_experts × moe_intermediate_size.
     cfg.shared_expert_intermediate_size = optional<int>(
         j, "shared_expert_intermediate_size",
         optional<int>(j, "moe_shared_expert_intermediate_size", 0));
-    cfg.routed_scaling_factor =
-        optional<float>(j, "routed_scaling_factor", 1.f);
+    if (cfg.shared_expert_intermediate_size == 0 &&
+        cfg.n_shared_experts > 0 &&
+        cfg.moe_intermediate_size > 0) {
+        cfg.shared_expert_intermediate_size =
+            cfg.n_shared_experts * cfg.moe_intermediate_size;
+    }
+    // `routed_scaling_factor` and `norm_topk_prob` are set earlier
+    // (with the MoE expert-count fields). Only the group-routing knobs
+    // are read here.
     cfg.n_group = optional<int>(j, "n_group",
                                 optional<int>(j, "n_groups", 1));
     cfg.topk_group = optional<int>(j, "topk_group", 1);
-    cfg.norm_topk_prob = optional<bool>(j, "norm_topk_prob", true);
 
     if (cfg.model_type == "nemotron_h") {
         cfg.mamba_num_heads =
@@ -409,6 +469,24 @@ HfConfig parse_hf_config(const std::filesystem::path& path) {
         }
     }
 
+    // GLM-5.1 DSA indexer fields. Inert (zero/empty) on every other model.
+    cfg.index_topk     = optional<int>(j, "index_topk", 0);
+    cfg.index_head_dim = optional<int>(j, "index_head_dim", 0);
+    cfg.index_n_heads  = optional<int>(j, "index_n_heads", 0);
+    if (j.contains("indexer_types") && j["indexer_types"].is_array()) {
+        for (const auto& v : j["indexer_types"]) {
+            cfg.indexer_types.push_back(v.get<std::string>());
+        }
+    } else if (cfg.index_topk > 0 && cfg.num_hidden_layers > 0) {
+        const int freq = optional<int>(j, "index_topk_freq", 1);
+        cfg.indexer_types.reserve(
+            static_cast<std::size_t>(cfg.num_hidden_layers));
+        for (int i = 0; i < cfg.num_hidden_layers; ++i) {
+            const bool is_full = (std::max(i - 1, 0) % freq) == 0;
+            cfg.indexer_types.push_back(is_full ? "full" : "shared");
+        }
+    }
+
     cfg.torch_dtype = optional<std::string>(j, "torch_dtype", "bfloat16");
 
     // Multimodal text-tower extraction. The CUDA driver runs the LLM
@@ -419,14 +497,19 @@ HfConfig parse_hf_config(const std::filesystem::path& path) {
     // qwen2_5_vl, gemma3 (multimodal variant has vision_config), …
     const bool has_vision_config =
         j_root.contains("vision_config") && j_root["vision_config"].is_object();
+    const bool is_kimi_k25_wrapper =
+        view.outer_model_type == "kimi_k25" && j_root.contains("text_config");
     const bool is_multimodal_wrapper =
-        has_vision_config && j_root.contains("text_config");
+        (has_vision_config && j_root.contains("text_config")) ||
+        is_kimi_k25_wrapper;
     if (is_multimodal_wrapper) {
         cfg.mm_lm_strip_prefix = "language_model.";
         cfg.mm_skip_prefixes = {
             "vision_tower.",
             "vision_model.",
+            "visual.",
             "multi_modal_projector.",
+            "mm_projector.",
         };
     }
     if (cfg.model_type == "nemotron_h") {

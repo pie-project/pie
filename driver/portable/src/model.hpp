@@ -372,6 +372,7 @@ private:
     // by CUDA kernels asserting / preferring F32 (gpt-oss attn_sinks,
     // gemma4 layer_scalar). Avoids a per-batch in-graph ggml_cast.
     ggml_tensor* declare_synth_f32_from_bf16_(const std::string& hf_name);
+    void build_glm_moe_dsa_(); // GLM-5.1 (MLA + MoE, CUDA-only)
     void build_qwen3_moe_();   // qwen3-moe family
     void build_mixtral_();
     void build_qwen3_5_();     // Qwen 3.5 / 3.6 hybrid (gated delta + GQA)

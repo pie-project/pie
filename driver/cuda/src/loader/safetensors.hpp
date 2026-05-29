@@ -72,6 +72,21 @@ public:
         std::uint64_t file_offset,
         std::uint64_t span_bytes,
         void* dst);
+    void copy_storage_bytes_to_device_async(
+        std::uint32_t shard_id,
+        std::uint64_t file_offset,
+        std::uint64_t span_bytes,
+        void* dst,
+        void* stream);
+    const std::uint8_t* storage_host_ptr(
+        std::uint32_t shard_id,
+        std::uint64_t file_offset,
+        std::uint64_t span_bytes);
+    void read_storage_bytes_to_host(
+        std::uint32_t shard_id,
+        std::uint64_t file_offset,
+        std::uint64_t span_bytes,
+        void* dst);
 
     /// Copy a slice of `name` along `axis`, keeping only this rank's portion
     /// of the world. Used by storage-program materialization to shard linear
@@ -127,6 +142,7 @@ private:
         std::unordered_map<std::string, TensorInfo>& index,
         std::uint64_t& total_bytes);
 
+    void open_shard_file_(Shard& s) const;
     void open_shard_(Shard& s) const;
 
     std::vector<Shard> shards_;

@@ -103,6 +103,38 @@ impl RuntimeAbi {
             tensors: Vec::new(),
         };
         builder.build()?;
+        let sharded = builder
+            .tensors
+            .iter()
+            .filter(|contract| contract.shard_axis.is_some())
+            .count();
+        let (total_bytes, sharded_bytes) =
+            builder.tensors.iter().fold((0_u64, 0_u64), |(total, sharded), contract| {
+                let bytes = metadata
+                    .tensor(match contract.source {
+                        RuntimeTensorSource::DirectTensor(id) => id,
+                        RuntimeTensorSource::Repack { tensor, .. } => tensor,
+                        _ => TensorId(u32::MAX),
+                    })
+                    .map(|raw| raw.span_bytes)
+                    .unwrap_or(0);
+                (
+                    total.saturating_add(bytes),
+                    sharded.saturating_add(if contract.shard_axis.is_some() { bytes } else { 0 }),
+                )
+            });
+        if crate::wl_debug_enabled() {
+            eprintln!(
+                "[pie-weight-loader] default ABI model_type={} tp={}/{} tensors={} sharded={} bytes={} sharded_bytes={}",
+                cfg.model_type,
+                target.tp_rank,
+                target.tp_size,
+                builder.tensors.len(),
+                sharded,
+                total_bytes,
+                sharded_bytes
+            );
+        }
         Ok(Self {
             name: match target.backend {
                 crate::types::BackendKind::Cuda => "pie-cuda".to_string(),
@@ -113,6 +145,275 @@ impl RuntimeAbi {
             tensors: builder.tensors,
         })
     }
+
+    pub fn coalesce_direct_row_shards(
+        &self,
+        metadata: &CheckpointMetadata,
+        target: &StorageTarget,
+    ) -> Result<Self, CompileError> {
+        if target.tp_size <= 1 {
+            return Ok(self.clone());
+        }
+
+        const MIN_GROUP_TENSORS: usize = 16;
+        const DEFAULT_MAX_BANK_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+        let max_bank_bytes = std::env::var("PIE_WEIGHT_LOADER_MAX_BANK_BYTES")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(DEFAULT_MAX_BANK_BYTES);
+
+        #[derive(Clone, Debug, PartialEq, Eq)]
+        struct GroupKey {
+            shape: Vec<i64>,
+            encoding: Encoding,
+            dtype: DType,
+            layout: Layout,
+            alignment: u32,
+        }
+
+        let mut buckets: Vec<(GroupKey, Vec<usize>)> = Vec::new();
+        let mut local_bytes_by_index = vec![0_u64; self.tensors.len()];
+        for (index, contract) in self.tensors.iter().enumerate() {
+            if contract.shard_axis != Some(Axis(0))
+                || !contract.metadata.is_empty()
+                || contract.shape.len() != 2
+                || contract.shape[0] <= 0
+                || contract.shape[1] <= 0
+            {
+                continue;
+            }
+            let RuntimeTensorSource::DirectTensor(tensor_id) = contract.source else {
+                continue;
+            };
+            let Some(raw) = metadata.tensor(tensor_id) else {
+                continue;
+            };
+            if raw.shape != contract.shape || raw.encoding != contract.encoding {
+                continue;
+            }
+            let elem = match dense_element_bytes(raw, "direct row shard coalescing") {
+                Ok(elem) => elem,
+                Err(_) => continue,
+            };
+            let (_, local_rows) = local_range(contract.shape[0], target)?;
+            let row_bytes = checked_mul_i64(
+                contract.shape[1],
+                elem,
+                "direct row shard coalescing row bytes",
+            )?;
+            local_bytes_by_index[index] = checked_mul_i64(
+                local_rows,
+                row_bytes,
+                "direct row shard coalescing local bytes",
+            )?;
+            let key = GroupKey {
+                shape: contract.shape.clone(),
+                encoding: contract.encoding.clone(),
+                dtype: contract.dtype,
+                layout: contract.layout.clone(),
+                alignment: contract.alignment,
+            };
+            if let Some((_, indices)) = buckets
+                .iter_mut()
+                .find(|(candidate, _)| *candidate == key)
+            {
+                indices.push(index);
+            } else {
+                buckets.push((key, vec![index]));
+            }
+        }
+
+        let mut group_for = vec![None; self.tensors.len()];
+        let mut groups: Vec<Vec<usize>> = Vec::new();
+        for (_, indices) in &buckets {
+            let mut chunk = Vec::new();
+            let mut chunk_bytes = 0_u64;
+            for &index in indices {
+                let tensor_bytes = local_bytes_by_index[index];
+                if !chunk.is_empty()
+                    && chunk_bytes.saturating_add(tensor_bytes) > max_bank_bytes
+                    && chunk.len() >= MIN_GROUP_TENSORS
+                {
+                    let group_id = groups.len();
+                    for &member in &chunk {
+                        group_for[member] = Some(group_id);
+                    }
+                    groups.push(std::mem::take(&mut chunk));
+                    chunk_bytes = 0;
+                }
+                chunk.push(index);
+                chunk_bytes = chunk_bytes.saturating_add(tensor_bytes);
+            }
+            if chunk.len() >= MIN_GROUP_TENSORS {
+                let group_id = groups.len();
+                for &member in &chunk {
+                    group_for[member] = Some(group_id);
+                }
+                groups.push(chunk);
+            }
+        }
+
+        if groups.is_empty() {
+            return Ok(self.clone());
+        }
+
+        if crate::wl_debug_enabled() {
+            let coalesced = groups.iter().map(Vec::len).sum::<usize>();
+            eprintln!(
+                "[pie-weight-loader] row-shard coalescing groups={} tensors={} max_bank_bytes={}",
+                groups.len(),
+                coalesced,
+                max_bank_bytes
+            );
+        }
+
+        let mut emitted_groups = vec![false; groups.len()];
+        let mut old_to_new = vec![usize::MAX; self.tensors.len()];
+        let mut new_tensors = Vec::with_capacity(self.tensors.len() + groups.len());
+
+        for old_index in 0..self.tensors.len() {
+            if let Some(group_id) = group_for[old_index] {
+                if emitted_groups[group_id] {
+                    continue;
+                }
+                emitted_groups[group_id] = true;
+                self.emit_row_shard_bank(
+                    metadata,
+                    target,
+                    group_id,
+                    &groups[group_id],
+                    &mut old_to_new,
+                    &mut new_tensors,
+                )?;
+                continue;
+            }
+
+            let mut contract = self.tensors[old_index].clone();
+            remap_select_contract(&mut contract.source, &old_to_new)?;
+            old_to_new[old_index] = new_tensors.len();
+            new_tensors.push(contract);
+        }
+
+        Ok(Self {
+            name: self.name.clone(),
+            version: self.version,
+            tensors: new_tensors,
+        })
+    }
+
+    fn emit_row_shard_bank(
+        &self,
+        metadata: &CheckpointMetadata,
+        target: &StorageTarget,
+        group_id: usize,
+        indices: &[usize],
+        old_to_new: &mut [usize],
+        new_tensors: &mut Vec<RuntimeTensorContract>,
+    ) -> Result<(), CompileError> {
+        let first = &self.tensors[indices[0]];
+        let rows = first.shape[0];
+        let cols = first.shape[1];
+        let first_raw = direct_raw(metadata, first)?;
+        let elem = dense_element_bytes(first_raw, "direct row shard coalescing")?;
+        let (local_start, local_rows) = local_range(rows, target)?;
+        let row_bytes = checked_mul_i64(cols, elem, "direct row shard coalescing row bytes")?;
+        let local_bytes = checked_mul_i64(
+            local_rows,
+            row_bytes,
+            "direct row shard coalescing local bytes",
+        )?;
+
+        let mut spans = Vec::with_capacity(indices.len());
+        for (slot, &old_index) in indices.iter().enumerate() {
+            let raw = direct_raw(metadata, &self.tensors[old_index])?;
+            spans.push(RuntimeByteSpan {
+                tensor: raw.id,
+                source_offset_bytes: checked_mul_i64(
+                    local_start,
+                    row_bytes,
+                    "direct row shard coalescing source offset",
+                )?,
+                dest_offset_bytes: checked_mul_u64(
+                    slot as u64,
+                    local_bytes,
+                    "direct row shard coalescing destination offset",
+                )?,
+                span_bytes: local_bytes,
+            });
+        }
+
+        let bank_index = new_tensors.len();
+        new_tensors.push(RuntimeTensorContract {
+            output_name: format!("__pie.row_shard_bank.{group_id}"),
+            source: RuntimeTensorSource::ByteSpans(spans),
+            metadata: Vec::new(),
+            dtype: first.dtype,
+            encoding: first.encoding.clone(),
+            shape: vec![local_rows * indices.len() as i64, cols],
+            layout: first.layout.clone(),
+            sharding: Sharding::replicated(),
+            alignment: first.alignment,
+            shard_axis: None,
+        });
+
+        for (slot, &old_index) in indices.iter().enumerate() {
+            let original = &self.tensors[old_index];
+            old_to_new[old_index] = new_tensors.len();
+            new_tensors.push(RuntimeTensorContract {
+                output_name: original.output_name.clone(),
+                source: RuntimeTensorSource::SelectContract {
+                    contract: bank_index,
+                    axis: Axis(0),
+                    start: slot as i64 * local_rows,
+                    length: local_rows,
+                },
+                metadata: Vec::new(),
+                dtype: original.dtype,
+                encoding: original.encoding.clone(),
+                shape: vec![local_rows, cols],
+                layout: original.layout.clone(),
+                sharding: Sharding::replicated(),
+                alignment: original.alignment,
+                shard_axis: None,
+            });
+        }
+        Ok(())
+    }
+}
+
+fn remap_select_contract(
+    source: &mut RuntimeTensorSource,
+    old_to_new: &[usize],
+) -> Result<(), CompileError> {
+    if let RuntimeTensorSource::SelectContract { contract, .. } = source {
+        let mapped = old_to_new.get(*contract).copied().unwrap_or(usize::MAX);
+        if mapped == usize::MAX {
+            return Err(CompileError::InvalidInput(format!(
+                "SelectContract references contract {contract} before it has been lowered"
+            )));
+        }
+        *contract = mapped;
+    }
+    Ok(())
+}
+
+fn direct_raw<'a>(
+    metadata: &'a CheckpointMetadata,
+    contract: &RuntimeTensorContract,
+) -> Result<&'a RawTensor, CompileError> {
+    let RuntimeTensorSource::DirectTensor(tensor_id) = contract.source else {
+        return Err(CompileError::InvalidInput(format!(
+            "runtime tensor '{}' is not a direct tensor",
+            contract.output_name
+        )));
+    };
+    metadata.tensor(tensor_id).ok_or_else(|| {
+        CompileError::InvalidInput(format!(
+            "runtime tensor '{}' references missing source tensor {}",
+            contract.output_name, tensor_id.0
+        ))
+    })
 }
 
 struct DefaultAbiBuilder<'a> {
@@ -131,7 +432,112 @@ struct FusedProjectionCandidate {
     bytes: u64,
 }
 
+/// Declarative per-architecture facts. Centralizes the `model_type` knowledge
+/// that was previously scattered across the ABI builder (detector gating,
+/// source-name prefix, TP shard quirks, runtime-quant eligibility) so adding a
+/// model is a single table edit instead of new `matches!(model_type, …)` checks
+/// in half a dozen places. `arch_profile()` returns the matching profile, or a
+/// generic-dense default (all flags off).
+#[derive(Clone, Copy, Debug)]
+struct ArchProfile {
+    /// Source tensors live under this prefix; stripped from output names.
+    source_prefix: Option<&'static str>,
+    /// MLA attention: fuse q_a + kv_a and shared gate+up (DeepSeek/Kimi).
+    mla_fused_joins: bool,
+    /// Phi-3 fused qkv / gate_up splits.
+    phi3_fused_splits: bool,
+    /// Nemotron-H packed-expert views.
+    nemotron_packed_experts: bool,
+    /// GPT-OSS native MXFP4 expert groups.
+    gpt_oss_mxfp4_groups: bool,
+    /// Shard `embed_tokens` on axis 0 under tensor parallelism.
+    shard_embed_tokens: bool,
+    /// Keep `lm_head` replicated under TP (don't shard).
+    replicate_lm_head: bool,
+    /// FP4/MXFP4 runtime quant of routed experts is wired for this arch.
+    mxfp4_runtime_quant: bool,
+    /// BF16 -> FP8/INT8 runtime quant is supported for this arch.
+    bf16_runtime_quant: bool,
+    /// Tensor-parallel shard-axis strategy, keyed by tensor name. Defaults to the
+    /// llama-family rules; archs with a different expert/attention layout (e.g.
+    /// DeepSeek-V4's native `.ffn.experts.w*`) register their own function.
+    shard_axis_fn: fn(&str) -> Option<Axis>,
+}
+
+const GENERIC_ARCH: ArchProfile = ArchProfile {
+    source_prefix: None,
+    mla_fused_joins: false,
+    phi3_fused_splits: false,
+    nemotron_packed_experts: false,
+    gpt_oss_mxfp4_groups: false,
+    shard_embed_tokens: false,
+    replicate_lm_head: false,
+    mxfp4_runtime_quant: false,
+    bf16_runtime_quant: false,
+    shard_axis_fn: llama_like_shard_axis,
+};
+
+/// (matching model_type strings, profile). Matched case-insensitively. The
+/// generic-dense fallback (`GENERIC_ARCH`) covers llama-family models that need
+/// no special handling beyond the name-pattern detectors that always run.
+const ARCH_PROFILES: &[(&[&str], ArchProfile)] = &[
+    (
+        &["kimi_k2", "kimi_k25"],
+        ArchProfile {
+            source_prefix: Some("language_model."),
+            mla_fused_joins: true,
+            shard_embed_tokens: true,
+            replicate_lm_head: true,
+            ..GENERIC_ARCH
+        },
+    ),
+    (
+        &["deepseek_v2", "deepseek_v3"],
+        ArchProfile { mla_fused_joins: true, ..GENERIC_ARCH },
+    ),
+    (
+        // Native `.ffn.experts.w*` naming + per-expert intermediate sharding.
+        &["deepseek_v4"],
+        ArchProfile { shard_axis_fn: dsv4_shard_axis, ..GENERIC_ARCH },
+    ),
+    (&["phi3"], ArchProfile { phi3_fused_splits: true, ..GENERIC_ARCH }),
+    (
+        &["nemotron_h"],
+        ArchProfile { nemotron_packed_experts: true, ..GENERIC_ARCH },
+    ),
+    (
+        &["gpt_oss", "gpt-oss", "gptoss"],
+        ArchProfile { gpt_oss_mxfp4_groups: true, ..GENERIC_ARCH },
+    ),
+    (
+        &["glm_moe_dsa"],
+        ArchProfile {
+            shard_embed_tokens: true,
+            mxfp4_runtime_quant: true,
+            bf16_runtime_quant: true,
+            ..GENERIC_ARCH
+        },
+    ),
+    (
+        &["qwen3", "qwen2", "llama", "llama3", "mistral", "qwen3_5", "qwen3_5_text"],
+        ArchProfile { bf16_runtime_quant: true, ..GENERIC_ARCH },
+    ),
+];
+
+fn arch_profile(model_type: &str) -> ArchProfile {
+    for (names, profile) in ARCH_PROFILES {
+        if names.iter().any(|n| model_type.eq_ignore_ascii_case(n)) {
+            return *profile;
+        }
+    }
+    GENERIC_ARCH
+}
+
 impl DefaultAbiBuilder<'_> {
+    fn profile(&self) -> ArchProfile {
+        arch_profile(&self.cfg.model_type)
+    }
+
     fn build(&mut self) -> Result<(), CompileError> {
         let runtime_quant = self.runtime_quant_scheme()?;
         self.add_phi3_fused_splits()?;
@@ -139,19 +545,43 @@ impl DefaultAbiBuilder<'_> {
         self.add_fused_moe_gate_up_tp_slices()?;
         self.add_nemotron_h_packed_expert_views()?;
         self.add_dense_fused_projection_joins(runtime_quant.is_some())?;
+        self.add_mla_fused_projection_joins()?;
         for raw in &self.metadata.tensors {
             if self.consumed.contains(&raw.id) {
                 continue;
             }
+            if !self.source_name_allowed(&raw.name) {
+                continue;
+            }
             if let Some(scheme) = runtime_quant
-                && runtime_quantizable_name(&raw.name)
+                && runtime_quantizable_name(&raw.name, scheme)
             {
                 self.push_runtime_quant(raw, raw.name.clone(), scheme)?;
             } else {
-                self.push_direct(raw, raw.name.clone(), self.shard_axis(&raw.name));
+                self.push_direct(raw, self.output_name(&raw.name), self.shard_axis(&raw.name));
             }
         }
         Ok(())
+    }
+
+    fn source_name_allowed(&self, raw_name: &str) -> bool {
+        if let Some(prefix) = self.primary_source_prefix() {
+            return raw_name.starts_with(prefix);
+        }
+        true
+    }
+
+    fn primary_source_prefix(&self) -> Option<&'static str> {
+        self.profile().source_prefix
+    }
+
+    fn output_name(&self, raw_name: &str) -> String {
+        if let Some(prefix) = self.profile().source_prefix
+            && let Some(stripped) = raw_name.strip_prefix(prefix)
+        {
+            return stripped.to_string();
+        }
+        raw_name.to_string()
     }
 
     fn add_dense_fused_projection_joins(
@@ -254,6 +684,62 @@ impl DefaultAbiBuilder<'_> {
         Ok(())
     }
 
+    fn add_mla_fused_projection_joins(&mut self) -> Result<(), CompileError> {
+        if self.target.backend != BackendKind::Cuda {
+            return Ok(());
+        }
+        if !self.profile().mla_fused_joins {
+            return Ok(());
+        }
+
+        let mut candidates = Vec::new();
+        for layer in 0..self.cfg.num_hidden_layers {
+            let p = format!("model.layers.{layer}.");
+            // Fuse q_a_proj + kv_a_proj_with_mqa (same input: norm_x, unsharded)
+            if let Some(c) = self.fused_join_candidate(
+                &(p.clone() + "self_attn.q_kv_a_proj.fused.weight"),
+                &[
+                    p.clone() + "self_attn.q_a_proj.weight",
+                    p.clone() + "self_attn.kv_a_proj_with_mqa.weight",
+                ],
+            )? {
+                candidates.push(c);
+            }
+            // Fuse shared gate + up (same input: norm_y)
+            if let Some(c) = self.fused_join_candidate(
+                &(p.clone() + "mlp.shared_experts.gate_up_proj.fused.weight"),
+                &[
+                    p.clone() + "mlp.shared_experts.gate_proj.weight",
+                    p.clone() + "mlp.shared_experts.up_proj.weight",
+                ],
+            )? {
+                candidates.push(c);
+            }
+        }
+
+        for candidate in candidates {
+            for tensor in &candidate.tensors {
+                self.consumed.insert(*tensor);
+            }
+            self.tensors.push(RuntimeTensorContract {
+                output_name: candidate.output_name,
+                source: RuntimeTensorSource::Join {
+                    tensors: candidate.tensors,
+                    axis: Axis(0),
+                },
+                metadata: Vec::new(),
+                dtype: DType::BF16,
+                encoding: Encoding::Raw(DType::BF16),
+                shape: vec![candidate.rows, candidate.cols],
+                layout: Layout::dense(self.alignment()),
+                sharding: Sharding::replicated(),
+                alignment: self.alignment(),
+                shard_axis: None,
+            });
+        }
+        Ok(())
+    }
+
     fn fused_join_candidate(
         &self,
         output_name: &str,
@@ -345,18 +831,68 @@ impl DefaultAbiBuilder<'_> {
                 raw.name
             )));
         }
-        if !matches!(
+        // Allowed sources:
+        //   * BF16/FP16/FP32 raw  — handled by the executor's bf16 cast path.
+        //   * FP8 (E4M3) raw     — used by GLM-5.1 routed experts: weights ship
+        //                          quantized; the executor dequants them to bf16
+        //                          using a sibling `_scale_inv` tensor at
+        //                          materialize time, then re-encodes to the
+        //                          target scheme. Only meaningful when the
+        //                          target is a *smaller* scheme (e.g. MXFP4).
+        let source_dtype_ok = matches!(
             raw.encoding,
-            Encoding::Raw(DType::BF16 | DType::F16 | DType::F32)
-        ) {
+            Encoding::Raw(DType::BF16 | DType::F16 | DType::F32 | DType::F8E4M3)
+        );
+        if !source_dtype_ok {
             return Err(CompileError::InvalidInput(format!(
-                "runtime_quant source '{}' must be BF16/FP16/FP32",
+                "runtime_quant source '{}' must be BF16/FP16/FP32/F8E4M3",
                 raw.name
             )));
         }
-        let dtype = match scheme {
-            QuantScheme::Fp8E4M3 => DType::F8E4M3,
-            QuantScheme::Int8Symmetric => DType::I8,
+        let spec = match scheme {
+            QuantScheme::Fp8E4M3 => QuantSpec {
+                scheme,
+                logical_dtype: DType::F8E4M3,
+                bits_per_element: 8,
+                group_size: 1,
+                channel_axis: Some(Axis(0)),
+                scale_dtype: Some(DType::F32),
+                zero_point_dtype: None,
+                block_shape: Vec::new(),
+            }
+            .normalized(),
+            QuantScheme::Int8Symmetric => QuantSpec {
+                scheme,
+                logical_dtype: DType::I8,
+                bits_per_element: 8,
+                group_size: 1,
+                channel_axis: Some(Axis(0)),
+                scale_dtype: Some(DType::F32),
+                zero_point_dtype: None,
+                block_shape: Vec::new(),
+            }
+            .normalized(),
+            QuantScheme::Mxfp4E2M1E8M0 => {
+                // K dimension (columns for 2-D weight) must be 32-multiple
+                // because the MXFP4 block scale covers 32 contiguous elements.
+                if raw.shape[1] % 32 != 0 {
+                    return Err(CompileError::InvalidInput(format!(
+                        "runtime_quant Mxfp4 source '{}' cols {} must be a multiple of 32",
+                        raw.name, raw.shape[1]
+                    )));
+                }
+                QuantSpec {
+                    scheme,
+                    logical_dtype: DType::BF16,
+                    bits_per_element: 4,
+                    group_size: 32,
+                    channel_axis: Some(Axis(1)),
+                    scale_dtype: Some(DType::U8),
+                    zero_point_dtype: None,
+                    block_shape: vec![32],
+                }
+                .normalized()
+            }
             _ => {
                 return Err(CompileError::InvalidInput(format!(
                     "unsupported runtime_quant scheme {:?}",
@@ -364,24 +900,13 @@ impl DefaultAbiBuilder<'_> {
                 )));
             }
         };
+        let dtype = spec.logical_dtype;
         self.tensors.push(RuntimeTensorContract {
             output_name,
             source: RuntimeTensorSource::DirectTensor(raw.id),
             metadata: Vec::new(),
             dtype,
-            encoding: Encoding::Quant(
-                QuantSpec {
-                    scheme,
-                    logical_dtype: dtype,
-                    bits_per_element: 8,
-                    group_size: 1,
-                    channel_axis: Some(Axis(0)),
-                    scale_dtype: Some(DType::F32),
-                    zero_point_dtype: None,
-                    block_shape: Vec::new(),
-                }
-                .normalized(),
-            ),
+            encoding: Encoding::Quant(spec),
             shape: raw.shape.clone(),
             layout: Layout::dense(self.alignment()),
             sharding: Sharding::replicated(),
@@ -441,7 +966,7 @@ impl DefaultAbiBuilder<'_> {
     }
 
     fn add_phi3_fused_splits(&mut self) -> Result<(), CompileError> {
-        if !self.cfg.model_type.eq_ignore_ascii_case("phi3") {
+        if !self.profile().phi3_fused_splits {
             return Ok(());
         }
         for raw in &self.metadata.tensors {
@@ -592,7 +1117,7 @@ impl DefaultAbiBuilder<'_> {
 
     fn add_nemotron_h_packed_expert_views(&mut self) -> Result<(), CompileError> {
         if self.target.backend != BackendKind::Cuda
-            || !self.cfg.model_type.eq_ignore_ascii_case("nemotron_h")
+            || !self.profile().nemotron_packed_experts
             || self.cfg.num_experts == 0
         {
             return Ok(());
@@ -798,10 +1323,7 @@ impl DefaultAbiBuilder<'_> {
     }
 
     fn add_gpt_oss_mxfp4_groups(&mut self) -> Result<(), CompileError> {
-        if !self.cfg.model_type.eq_ignore_ascii_case("gpt_oss")
-            && !self.cfg.model_type.eq_ignore_ascii_case("gpt-oss")
-            && !self.cfg.model_type.eq_ignore_ascii_case("gptoss")
-        {
+        if !self.profile().gpt_oss_mxfp4_groups {
             return Ok(());
         }
         let native = self.target.mxfp4_moe == Mxfp4MoePolicy::NativeGemm;
@@ -1067,7 +1589,17 @@ impl DefaultAbiBuilder<'_> {
         if self.target.tp_size <= 1 {
             return None;
         }
-        llama_like_shard_axis(name)
+        let profile = self.profile();
+        // Shard embed_tokens on axis 0 to save per-rank memory (Kimi, GLM-5.1).
+        if profile.shard_embed_tokens && name.ends_with(".embed_tokens.weight") {
+            return Some(Axis(0));
+        }
+        // Replicate lm_head (Kimi K2.6): avoids requiring TP greedy argmax for
+        // logits emission — ~1.7GB/rank extra but simplifies the logits path.
+        if profile.replicate_lm_head && name.ends_with(".lm_head.weight") {
+            return None;
+        }
+        (profile.shard_axis_fn)(name)
     }
 
     fn runtime_quant_scheme(&self) -> Result<Option<QuantScheme>, CompileError> {
@@ -1078,18 +1610,22 @@ impl DefaultAbiBuilder<'_> {
         let scheme = match mode {
             "fp8" => QuantScheme::Fp8E4M3,
             "int8" => QuantScheme::Int8Symmetric,
+            "fp4" | "mxfp4" => QuantScheme::Mxfp4E2M1E8M0,
             other => {
                 return Err(CompileError::InvalidInput(format!(
-                    "unsupported runtime_quant '{other}'; expected 'fp8' or 'int8'"
+                    "unsupported runtime_quant '{other}'; expected 'fp8', 'int8', or 'fp4'"
                 )));
             }
         };
-        if !self.cfg.quant_method.is_empty() {
+        // For FP4 we accept a pre-quantized checkpoint (GLM-5.1 ships FP8
+        // experts). For FP8/INT8 the legacy gate stays — we only re-quant
+        // BF16 weights, never re-quant an already-quantized checkpoint.
+        if !self.cfg.quant_method.is_empty() && scheme != QuantScheme::Mxfp4E2M1E8M0 {
             return Ok(None);
         }
-        if !runtime_quant_model_supported(&self.cfg.model_type) {
+        if !runtime_quant_model_supported(&self.cfg.model_type, scheme) {
             return Err(CompileError::InvalidInput(format!(
-                "runtime_quant={} is supported for qwen2/qwen3/qwen3_5/llama/mistral-style dense models, got '{}'",
+                "runtime_quant={} is not supported for model_type='{}'",
                 mode, self.cfg.model_type
             )));
         }
@@ -1197,6 +1733,28 @@ fn checked_mul_u64(lhs: u64, rhs: u64, context: &str) -> Result<u64, CompileErro
 }
 
 fn llama_like_shard_axis(name: &str) -> Option<Axis> {
+    if name.contains(".mlp.experts.") {
+        if ends_with_any(
+            name,
+            &[
+                ".gate_proj.weight_packed",
+                ".gate_proj.weight_scale",
+                ".up_proj.weight_packed",
+                ".up_proj.weight_scale",
+            ],
+        ) {
+            return Some(Axis(0));
+        }
+        if ends_with_any(
+            name,
+            &[
+                ".down_proj.weight_packed",
+                ".down_proj.weight_scale",
+            ],
+        ) {
+            return Some(Axis(1));
+        }
+    }
     if ends_with_any(
         name,
         &[
@@ -1228,6 +1786,8 @@ fn llama_like_shard_axis(name: &str) -> Option<Axis> {
             ".linear_attn.in_proj_a.weight",
             ".linear_attn.dt_bias",
             ".linear_attn.A_log",
+            ".self_attn.q_b_proj.weight",
+            ".self_attn.kv_b_proj.weight",
         ],
     ) {
         Some(Axis(0))
@@ -1248,14 +1808,22 @@ fn llama_like_shard_axis(name: &str) -> Option<Axis> {
     }
 }
 
-fn runtime_quant_model_supported(model_type: &str) -> bool {
-    matches!(
-        model_type,
-        "qwen3" | "qwen2" | "llama" | "llama3" | "mistral" | "qwen3_5" | "qwen3_5_text"
-    )
+fn runtime_quant_model_supported(model_type: &str, scheme: QuantScheme) -> bool {
+    // Eligibility now lives in the ArchProfile registry (single source of truth).
+    let profile = arch_profile(model_type);
+    match scheme {
+        QuantScheme::Mxfp4E2M1E8M0 => profile.mxfp4_runtime_quant,
+        _ => profile.bf16_runtime_quant,
+    }
 }
 
-fn runtime_quantizable_name(name: &str) -> bool {
+fn runtime_quantizable_name(name: &str, scheme: QuantScheme) -> bool {
+    if scheme == QuantScheme::Mxfp4E2M1E8M0 {
+        // For FP4 we only touch GLM-5.1's routed/shared experts. Attention
+        // projections stay as FP8+scale (block-scaled GEMM) because there's
+        // no FP4 GEMM path for them on this hardware.
+        return is_glm_expert_weight(name);
+    }
     ends_with_any(
         name,
         &[
@@ -1263,11 +1831,48 @@ fn runtime_quantizable_name(name: &str) -> bool {
             ".self_attn.k_proj.weight",
             ".self_attn.v_proj.weight",
             ".self_attn.o_proj.weight",
+            ".self_attn.q_a_proj.weight",
+            ".self_attn.q_b_proj.weight",
+            ".self_attn.kv_a_proj_with_mqa.weight",
+            ".self_attn.kv_b_proj.weight",
             ".mlp.gate_proj.weight",
             ".mlp.up_proj.weight",
             ".mlp.down_proj.weight",
         ],
-    )
+    ) || is_glm_expert_weight(name)
+}
+
+fn is_glm_expert_weight(name: &str) -> bool {
+    (name.contains(".mlp.experts.") || name.contains(".mlp.shared_experts."))
+        && ends_with_any(name, &[".gate_proj.weight", ".up_proj.weight", ".down_proj.weight"])
+}
+
+fn dsv4_shard_axis(name: &str) -> Option<Axis> {
+    // Routed experts: shard intermediate dim within each expert.
+    // w1/w3 on axis 0 (gate/up out dim), w2 on axis 1 (down in dim).
+    // Each rank computes a partial expert output; combined via all-reduce.
+    if name.contains(".ffn.experts.") {
+        if ends_with_any(name, &[".w1.weight", ".w1.scale", ".w3.weight", ".w3.scale"]) {
+            return Some(Axis(0));
+        }
+        if ends_with_any(name, &[".w2.weight", ".w2.scale"]) {
+            return Some(Axis(1));
+        }
+    }
+    // Shared experts: same column/row parallelism.
+    if ends_with_any(name, &[
+        ".shared_experts.w1.weight", ".shared_experts.w1.scale",
+        ".shared_experts.w3.weight", ".shared_experts.w3.scale",
+    ]) {
+        return Some(Axis(0));
+    }
+    if ends_with_any(name, &[
+        ".shared_experts.w2.weight", ".shared_experts.w2.scale",
+    ]) {
+        return Some(Axis(1));
+    }
+    // Everything else replicated (avoids TP communication in main path).
+    None
 }
 
 fn ends_with_any(value: &str, suffixes: &[&str]) -> bool {

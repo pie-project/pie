@@ -36,7 +36,10 @@ pub struct RawTensor {
 
 impl CheckpointMetadata {
     pub fn tensor(&self, id: TensorId) -> Option<&RawTensor> {
-        self.tensors.iter().find(|tensor| tensor.id == id)
+        self.tensors
+            .get(id.0 as usize)
+            .filter(|tensor| tensor.id == id)
+            .or_else(|| self.tensors.iter().find(|tensor| tensor.id == id))
     }
 }
 

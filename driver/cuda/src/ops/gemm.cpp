@@ -16,6 +16,7 @@
 #include <vector>
 
 #include "cuda_check.hpp"
+#include "kernels/dequant_fp4.hpp"
 #include "kernels/dequant_fp8.hpp"
 #include "kernels/quant_bf16_to_fp8.hpp"
 #include "kernels/residual_add.hpp"
@@ -224,6 +225,13 @@ int cublaslt_bf16_min_n(int K) {
     // very wide lm_head; routing their 2k/6k projection GEMMs through Lt was
     // consistently slower. H=2048 keeps the previous threshold because the
     // 1.7B-class models still prefer Lt for their 6k-wide MLP projection.
+    //
+    // For large hidden sizes, the current Lt heuristic can select kernels
+    // that fault on compact multi-row lm_head shapes such as Kimi TP greedy
+    // prefill (M small, N ~= 20k, K ~= 7k). The classic cuBLAS path is stable
+    // for those shapes and is already used for M=1 decode, so keep Lt out of
+    // the large-H wide-output path by default.
+    if (K >= 4096) return 32768;
     return K < 2048 ? 12288 : (K == 2048 ? 6144 : 12288);
 }
 
@@ -239,7 +247,7 @@ int cublaslt_bf16_min_k() {
 int cublaslt_bf16_min_m() {
     static const int min_m = [] {
         const char* v = std::getenv("PIE_CUBLASLT_BF16_MIN_M");
-        if (v == nullptr || v[0] == '\0') return 0;
+        if (v == nullptr || v[0] == '\0') return 2;
         return std::max(0, std::atoi(v));
     }();
     return min_m;
@@ -833,12 +841,21 @@ void validate_quant_weight_view(const char* api, const WeightView& w, int N, int
             " bytes for N=" + std::to_string(N) +
             " K=" + std::to_string(K));
     }
+    // PerTensor → 1 scale; PerChannel → N; PerGroup → N×ceil(K/gs),
+    // except 2D block-scaled FP8 (DeepSeek) which is ceil(N/gs)×ceil(K/gs).
     std::size_t expected_scales = 1;
     if (w.quant_kind == QuantMeta::Kind::PerChannel) {
         expected_scales = static_cast<std::size_t>(N);
     } else if (w.quant_kind == QuantMeta::Kind::PerGroup && w.group_size > 0) {
-        expected_scales = static_cast<std::size_t>(N) *
-            static_cast<std::size_t>((K + w.group_size - 1) / w.group_size);
+        if (w.dtype == DType::FP8_E4M3) {
+            // 2D block-scaled FP8: scales are [ceil(N/gs), ceil(K/gs)]
+            expected_scales =
+                static_cast<std::size_t>((N + w.group_size - 1) / w.group_size) *
+                static_cast<std::size_t>((K + w.group_size - 1) / w.group_size);
+        } else {
+            expected_scales = static_cast<std::size_t>(N) *
+                static_cast<std::size_t>((K + w.group_size - 1) / w.group_size);
+        }
     }
     if (w.scale_numel < expected_scales) {
         throw std::runtime_error(
@@ -965,7 +982,7 @@ struct LtCtx {
     bool             fp8_native_supported = false;
 
     static LtCtx& instance() {
-        static LtCtx ctx;
+        thread_local LtCtx ctx;
         return ctx;
     }
 
@@ -1098,16 +1115,22 @@ void gemm_fp8_dequant_then_bf16_fallback(
     void* y,
     int M, int N, int K,
     float beta,
-    cudaStream_t stream)
+    cudaStream_t stream,
+    int group_size = 0)
 {
     auto& ctx = LtCtx::instance();
     const std::size_t weight_elems =
         static_cast<std::size_t>(N) * static_cast<std::size_t>(K);
     void* bf16_w = ctx.dequant.ensure(weight_elems * 2);
 
-    if (scale_kind == QuantMeta::Kind::PerChannel) {
-        // [N] device scale → broadcast across K columns. Stays on
-        // device throughout — no host sync needed.
+    if (scale_kind == QuantMeta::Kind::PerGroup && group_size > 0) {
+        kernels::launch_dequant_fp8_e4m3_to_bf16_per_group(
+            static_cast<const std::uint8_t*>(w_fp8),
+            bf16_w,
+            static_cast<const float*>(w_scale_fp32_dev),
+            N, K, group_size, stream);
+        CUDA_CHECK(cudaGetLastError());
+    } else if (scale_kind == QuantMeta::Kind::PerChannel) {
         kernels::launch_dequant_fp8_e4m3_to_bf16_per_channel(
             static_cast<const std::uint8_t*>(w_fp8),
             bf16_w,
@@ -1115,8 +1138,6 @@ void gemm_fp8_dequant_then_bf16_fallback(
             N, K, stream);
         CUDA_CHECK(cudaGetLastError());
     } else {
-        // Per-tensor: pull the scalar to host. One sync per layer per
-        // fire — acceptable on this fallback path.
         float scale = 0.f;
         CUDA_CHECK(cudaMemcpyAsync(&scale, w_scale_fp32_dev, sizeof(float),
                                    cudaMemcpyDeviceToHost, stream));
@@ -1161,7 +1182,8 @@ void gemm_fp8_e4m3_w_bf16_act_impl(
     void* y,
     int M, int N, int K,
     float beta,
-    cudaStream_t stream)
+    cudaStream_t stream,
+    int group_size = 0)
 {
     if (!w_scale_fp32_dev) {
         throw std::runtime_error(
@@ -1172,15 +1194,12 @@ void gemm_fp8_e4m3_w_bf16_act_impl(
     auto& ctx = LtCtx::instance();
     ctx.ensure_init();
 
-    // For now, route per-channel through the dequant fallback regardless
-    // of GPU. The cuBLASLt vector-scale attribute (CUBLASLT_..._SCALE_
-    // VECTOR_POINTER + CUBLASLT_MATMUL_DESC_A_SCALE_MODE) is Hopper-only
-    // and lands in a follow-up. Per-tensor takes the native LT path on
-    // sm89+ as before.
-    if (!ctx.fp8_native_supported || scale_kind == QuantMeta::Kind::PerChannel) {
+    if (!ctx.fp8_native_supported ||
+        scale_kind == QuantMeta::Kind::PerChannel ||
+        scale_kind == QuantMeta::Kind::PerGroup) {
         gemm_fp8_dequant_then_bf16_fallback(
             cublas_handle, act, w_fp8, w_scale_fp32_dev, scale_kind, y,
-            M, N, K, beta, stream);
+            M, N, K, beta, stream, group_size);
         return;
     }
 
@@ -1367,7 +1386,8 @@ void gemm_act_x_w(
         validate_quant_weight_view("gemm_act_x_w[FP8_E4M3]", w, N, K);
         gemm_fp8_e4m3_w_bf16_act_impl(handle, act, w.data, w.scale_data,
                                       w.quant_kind,
-                                      y, M, N, K, beta, stream);
+                                      y, M, N, K, beta, stream,
+                                      w.group_size);
         return;
     }
     if (act_dtype == DType::BF16 && w.dtype == DType::INT8 &&
@@ -1431,7 +1451,6 @@ void gemm_act_x_w(
     }
     if (act_dtype == DType::BF16 && w.dtype == DType::MXFP4_PACKED &&
         y_dtype == DType::BF16) {
-#ifdef PIE_CUDA_HAS_MARLIN
         cudaStream_t stream = nullptr;
         cublasGetStream(handle, &stream);
         if (w.scale_dtype != DType::UINT8) {
@@ -1445,25 +1464,55 @@ void gemm_act_x_w(
                 "group_size=32");
         }
         validate_quant_weight_view("gemm_act_x_w[MXFP4]", w, N, K);
-        const std::size_t mn_bytes =
-            static_cast<std::size_t>(M) * static_cast<std::size_t>(N) * 2;
-        void* dst = (beta == 0.f) ? y : marlin_residual_scratch_(mn_bytes);
-        marlin::launch_mxfp4_gemm_w4a16_bf16(
-            act, w.data, w.scale_data, dst,
-            marlin_fp32_reduce_scratch_(), marlin_workspace_(),
-            M, N, K, stream);
-        if (beta != 0.f) {
-            kernels::launch_residual_add_bf16(
-                y, dst,
-                static_cast<std::size_t>(M) * static_cast<std::size_t>(N),
-                stream);
-        }
-        return;
+
+        // Decide path: Marlin needs pre-repacked weights. Runtime FP4 quant
+        // emits raw nibble-packed weights, so default to a dequant→bf16 GEMM
+        // fallback (correct but ~2× the memory pass of native). The env var
+        // PIE_MXFP4_GEMM=marlin opts into the native path when weights are
+        // known to be Marlin-repacked (e.g., V4 / GPT-OSS prepacked ckpts).
+        static const bool use_marlin = [] {
+            const char* v = std::getenv("PIE_MXFP4_GEMM");
+            return (v != nullptr && std::string(v) == "marlin");
+        }();
+
+        if (use_marlin) {
+#ifdef PIE_CUDA_HAS_MARLIN
+            const std::size_t mn_bytes =
+                static_cast<std::size_t>(M) * static_cast<std::size_t>(N) * 2;
+            void* dst = (beta == 0.f) ? y : marlin_residual_scratch_(mn_bytes);
+            marlin::launch_mxfp4_gemm_w4a16_bf16(
+                act, w.data, w.scale_data, dst,
+                marlin_fp32_reduce_scratch_(), marlin_workspace_(),
+                M, N, K, stream);
+            if (beta != 0.f) {
+                kernels::launch_residual_add_bf16(
+                    y, dst,
+                    static_cast<std::size_t>(M) * static_cast<std::size_t>(N),
+                    stream);
+            }
+            return;
 #else
-        throw std::runtime_error(
-            "gemm_act_x_w[MXFP4]: native MXFP4 GEMM was selected but "
-            "marlin is not compiled into this build");
+            throw std::runtime_error(
+                "gemm_act_x_w[MXFP4]: marlin requested but not compiled in");
 #endif
+        }
+
+        // Fallback: dequant MXFP4 → bf16 in a scratch buffer, then bf16 GEMM.
+        // Reuse the LtCtx dequant scratch (auto-grows monotonically). Cost is
+        // one extra weight read + write per call, acceptable for prefill /
+        // small-batch decode.
+        auto& ctx = LtCtx::instance();
+        ctx.ensure_init();
+        const std::size_t weight_bf16_bytes =
+            static_cast<std::size_t>(N) * static_cast<std::size_t>(K) * 2;
+        void* bf16_w = ctx.dequant.ensure(weight_bf16_bytes);
+        kernels::launch_dequant_mxfp4_to_bf16(
+            static_cast<const std::uint8_t*>(w.data),
+            static_cast<const std::uint8_t*>(w.scale_data),
+            bf16_w, N, K, stream);
+        CUDA_CHECK(cudaGetLastError());
+        gemm_bf16_impl(handle, act, bf16_w, y, M, N, K, beta);
+        return;
     }
     unsupported("gemm_act_x_w", act_dtype, w.dtype, y_dtype);
 }

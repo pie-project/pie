@@ -28,10 +28,14 @@ static OLMO_SCHEMA: GenericSchema = GenericSchema {
 static GPT_OSS_SCHEMA: GenericSchema = GenericSchema {
     names: &["gpt_oss", "gpt-oss", "gptoss"],
 };
+static KIMI_DEEPSEEK_SCHEMA: GenericSchema = GenericSchema {
+    names: &["kimi", "kimi_k2", "kimi_k25", "deepseek_v2", "deepseek_v3", "deepseek_v4"],
+};
 static BUILTIN_SCHEMAS: &[&dyn ModelSchema] = &[
     &LLAMA_SCHEMA,
     &QWEN_SCHEMA,
     &GEMMA_SCHEMA,
     &OLMO_SCHEMA,
     &GPT_OSS_SCHEMA,
+    &KIMI_DEEPSEEK_SCHEMA,
 ];

@@ -21,6 +21,11 @@ struct ModelConfig {
     // Empty (default) = no quantization. Recognised values:
     //   * "fp8"  — per-channel symmetric FP8_E4M3 for projection weights.
     //   * "int8" — per-channel symmetric INT8 for projection weights.
+    //   * "fp4" / "mxfp4" — MXFP4 (E2M1 weight + E8M0 block scale) for the
+    //                      target model's expert weights. Used by GLM-5.1 to
+    //                      transcode the checkpoint's FP8 routed-expert
+    //                      weights to MXFP4 at materialize time, halving
+    //                      the per-rank expert footprint.
     // Norms, biases, embeddings, and lm_head stay in their native dtype.
     std::string runtime_quant;
     // GPT-OSS MXFP4 MoE load/runtime policy. "auto" selects native packed

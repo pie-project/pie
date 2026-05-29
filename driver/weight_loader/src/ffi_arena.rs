@@ -4,8 +4,9 @@ use crate::ffi_types::{
     PieLoaderEncodingKind, PieLoaderI64Slice, PieLoaderMemoryPlanView,
     PieLoaderOptimizerPassStatsSlice, PieLoaderOptimizerPassStatsView,
     PieLoaderOptimizerReportView, PieLoaderQuantScheme, PieLoaderRepackLayout, PieLoaderRowMap,
-    PieLoaderSourceExtentView, PieLoaderStorageInstrKind, PieLoaderStorageInstrSlice,
-    PieLoaderStorageInstrView, PieLoaderStorageProgramView, PieLoaderStridedExtentView,
+    PieLoaderSlabPlacementSlice, PieLoaderSlabPlacementView, PieLoaderSourceExtentView,
+    PieLoaderStorageInstrKind, PieLoaderStorageInstrSlice, PieLoaderStorageInstrView,
+    PieLoaderStorageProgramView, PieLoaderStridedExtentView,
     PieLoaderTensorDeclSlice, PieLoaderTensorDeclView, PieLoaderTileMapKind, PieLoaderU32Slice,
 };
 use crate::storage::{
@@ -19,6 +20,7 @@ pub struct FfiArena {
     shapes: Vec<Box<[i64]>>,
     dim_specs: Vec<Box<[PieLoaderDimSpecView]>>,
     buffer_id_slices: Vec<Box<[u32]>>,
+    slab_placements: Vec<Box<[PieLoaderSlabPlacementView]>>,
     tensor_views: Vec<PieLoaderTensorDeclView>,
     buffer_views: Vec<PieLoaderBufferDeclView>,
     instr_views: Vec<PieLoaderStorageInstrView>,
@@ -55,6 +57,8 @@ impl FfiArena {
                 bytes: buffer.bytes,
                 alignment: buffer.alignment,
                 temporary: buffer.temporary,
+                has_persistent_offset: buffer.persistent_offset.is_some(),
+                persistent_offset: buffer.persistent_offset.unwrap_or(0),
             });
         }
 
@@ -160,6 +164,25 @@ impl FfiArena {
         PieLoaderBufferIdSlice { ptr, len }
     }
 
+    fn push_slab_placements(
+        &mut self,
+        values: &[crate::storage::SlabPlacement],
+    ) -> PieLoaderSlabPlacementSlice {
+        let placements: Box<[PieLoaderSlabPlacementView]> = values
+            .iter()
+            .map(|placement| PieLoaderSlabPlacementView {
+                src_offset: placement.src_offset,
+                dest_offset: placement.dest_offset,
+                bytes: placement.bytes,
+            })
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        let ptr = placements.as_ptr();
+        let len = placements.len();
+        self.slab_placements.push(placements);
+        PieLoaderSlabPlacementSlice { ptr, len }
+    }
+
     fn instr_view(&mut self, instr: &StorageInstr) -> PieLoaderStorageInstrView {
         let empty_name = PieLoaderBytes::default();
         let empty_buffers = PieLoaderBufferIdSlice::default();
@@ -167,6 +190,7 @@ impl FfiArena {
         let empty_dest = PieLoaderDestExtentView::default();
         let empty_repack = PieLoaderRepackLayout::None;
         let empty_row_map = PieLoaderRowMap::Identity;
+        let empty_placements = PieLoaderSlabPlacementSlice::default();
         match instr {
             StorageInstr::Allocate { id, buffer } => PieLoaderStorageInstrView {
                 id: id.0,
@@ -195,6 +219,10 @@ impl FfiArena {
                 transform_target_cols: 0,
                 transform_scratch_bytes: 0,
                 name: empty_name,
+                slab_file_id: u32::MAX,
+                slab_file_offset: 0,
+                slab_span_bytes: 0,
+                slab_placements: empty_placements,
             },
             StorageInstr::ExtentWrite { id, source, dest } => PieLoaderStorageInstrView {
                 id: id.0,
@@ -223,6 +251,88 @@ impl FfiArena {
                 transform_target_cols: 0,
                 transform_scratch_bytes: 0,
                 name: empty_name,
+                slab_file_id: u32::MAX,
+                slab_file_offset: 0,
+                slab_span_bytes: 0,
+                slab_placements: empty_placements,
+            },
+            StorageInstr::BulkExtentWrite {
+                id,
+                source,
+                dest_offset,
+            } => PieLoaderStorageInstrView {
+                id: id.0,
+                kind: PieLoaderStorageInstrKind::BulkExtentWrite,
+                buffer_id: u32::MAX,
+                source: self.source_view(source),
+                has_source: true,
+                dest: PieLoaderDestExtentView {
+                    buffer_id: u32::MAX,
+                    offset: *dest_offset,
+                    stride: self.strided_view(&byte_extent(source.span_bytes)),
+                },
+                has_dest: true,
+                input_buffers: empty_buffers,
+                output_buffers: empty_buffers,
+                tile_kind: PieLoaderTileMapKind::None,
+                max_tile_bytes: 0,
+                transform_from: PieLoaderQuantScheme::None,
+                transform_to: PieLoaderQuantScheme::None,
+                repack_layout: empty_repack,
+                row_map: empty_row_map,
+                transform_batch: 0,
+                transform_source_rows: 0,
+                transform_source_row_offset: 0,
+                transform_target_rows: 0,
+                transform_valid_rows: 0,
+                transform_source_stride_cols: 0,
+                transform_source_col_offset: 0,
+                transform_source_cols: 0,
+                transform_target_cols: 0,
+                transform_scratch_bytes: 0,
+                name: empty_name,
+                slab_file_id: u32::MAX,
+                slab_file_offset: 0,
+                slab_span_bytes: 0,
+                slab_placements: empty_placements,
+            },
+            StorageInstr::SlabScatter {
+                id,
+                file_id,
+                file_offset,
+                span_bytes,
+                placements,
+            } => PieLoaderStorageInstrView {
+                id: id.0,
+                kind: PieLoaderStorageInstrKind::SlabScatter,
+                buffer_id: u32::MAX,
+                source: empty_source,
+                has_source: false,
+                dest: empty_dest,
+                has_dest: false,
+                input_buffers: empty_buffers,
+                output_buffers: empty_buffers,
+                tile_kind: PieLoaderTileMapKind::None,
+                max_tile_bytes: 0,
+                transform_from: PieLoaderQuantScheme::None,
+                transform_to: PieLoaderQuantScheme::None,
+                repack_layout: empty_repack,
+                row_map: empty_row_map,
+                transform_batch: 0,
+                transform_source_rows: 0,
+                transform_source_row_offset: 0,
+                transform_target_rows: 0,
+                transform_valid_rows: 0,
+                transform_source_stride_cols: 0,
+                transform_source_col_offset: 0,
+                transform_source_cols: 0,
+                transform_target_cols: 0,
+                transform_scratch_bytes: 0,
+                name: empty_name,
+                slab_file_id: file_id.0,
+                slab_file_offset: *file_offset,
+                slab_span_bytes: *span_bytes,
+                slab_placements: self.push_slab_placements(placements),
             },
             StorageInstr::TileMap {
                 id,
@@ -272,6 +382,10 @@ impl FfiArena {
                 transform_target_cols: transform.repack.target_cols,
                 transform_scratch_bytes: transform.scratch_bytes,
                 name: empty_name,
+                slab_file_id: u32::MAX,
+                slab_file_offset: 0,
+                slab_span_bytes: 0,
+                slab_placements: empty_placements,
             },
             StorageInstr::CreateView {
                 id,
@@ -306,6 +420,10 @@ impl FfiArena {
                 transform_target_cols: 0,
                 transform_scratch_bytes: 0,
                 name: empty_name,
+                slab_file_id: u32::MAX,
+                slab_file_offset: 0,
+                slab_span_bytes: 0,
+                slab_placements: empty_placements,
             },
             StorageInstr::Attach {
                 id,
@@ -339,6 +457,10 @@ impl FfiArena {
                 transform_target_cols: 0,
                 transform_scratch_bytes: 0,
                 name: empty_name,
+                slab_file_id: u32::MAX,
+                slab_file_offset: 0,
+                slab_span_bytes: 0,
+                slab_placements: empty_placements,
             },
             StorageInstr::Release { id, buffer } => PieLoaderStorageInstrView {
                 id: id.0,
@@ -367,6 +489,10 @@ impl FfiArena {
                 transform_target_cols: 0,
                 transform_scratch_bytes: 0,
                 name: empty_name,
+                slab_file_id: u32::MAX,
+                slab_file_offset: 0,
+                slab_span_bytes: 0,
+                slab_placements: empty_placements,
             },
             StorageInstr::Finalize { id, tensor, name } => PieLoaderStorageInstrView {
                 id: id.0,
@@ -395,6 +521,10 @@ impl FfiArena {
                 transform_target_cols: 0,
                 transform_scratch_bytes: 0,
                 name: self.push_string(name),
+                slab_file_id: u32::MAX,
+                slab_file_offset: 0,
+                slab_span_bytes: 0,
+                slab_placements: empty_placements,
             },
         }
     }
@@ -504,5 +634,17 @@ fn ffi_row_map(row_map: RowMap) -> PieLoaderRowMap {
         RowMap::Identity => PieLoaderRowMap::Identity,
         RowMap::Even => PieLoaderRowMap::Even,
         RowMap::Odd => PieLoaderRowMap::Odd,
+    }
+}
+
+fn byte_extent(bytes: u64) -> StridedExtent {
+    StridedExtent {
+        base_offset: 0,
+        element_bytes: 1,
+        dims: vec![crate::storage::DimSpec {
+            count: i64::try_from(bytes).unwrap_or(i64::MAX),
+            src_stride: 1,
+            dst_stride: 1,
+        }],
     }
 }

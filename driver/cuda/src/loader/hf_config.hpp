@@ -176,6 +176,33 @@ struct HfConfig {
     int mamba_chunk_size = 0;
     float mamba_time_step_min = 0.f;
 
+    // ── DeepSeek/Kimi MLA + MoE specific ────────────────────────────
+    // Kimi K2.6 exposes the language tower as `model_type=kimi_k2` inside
+    // a `kimi_k25` wrapper and uses DeepSeek-V3-style MLA attention.
+    // These are zero/inert for standard MHA/GQA models.
+    int q_lora_rank = 0;
+    int kv_lora_rank = 0;
+    int qk_nope_head_dim = 0;
+    int qk_rope_head_dim = 0;
+    int v_head_dim = 0;
+    int first_k_dense_replace = 0;
+    int n_shared_experts = 0;
+
+    // ── DeepSeek V4 specific ────────────────────────────────────────
+    int dsv4_o_lora_rank = 0;
+    int dsv4_o_groups = 0;
+    int dsv4_index_head_dim = 0;
+    int dsv4_index_n_heads = 0;
+    int dsv4_index_topk = 0;
+    int dsv4_hc_mult = 0;
+    int dsv4_num_hash_layers = 0;
+    int dsv4_sliding_window = 0;
+    float dsv4_hc_eps = 1e-6f;
+    float dsv4_compress_rope_theta = 0.f;
+    std::vector<int> dsv4_compress_ratios;
+    std::string dsv4_scoring_func;
+    std::string dsv4_expert_dtype;
+
     // ── Qwen3.5 hybrid (linear-attention SSM + full attention) ──────
     // Per-layer attention type is in `layer_types` (values
     // "linear_attention" / "full_attention"). The linear layers run a
@@ -229,6 +256,16 @@ struct HfConfig {
     float gemma3n_rope_local_base_freq; // sliding-layer rope theta
     std::vector<int>   gemma3n_per_layer_intermediate;
     std::vector<float> gemma3n_activation_sparsity;
+
+    // ── GLM-5.1 DSA (Differential Sparse Attention) indexer ────────
+    // Per-layer indexer selects top-k tokens for sparse attention.
+    // Zero/empty on non-GLM models.
+    int index_topk = 0;         // 2048 on GLM-5.1
+    int index_head_dim = 0;     // 128 on GLM-5.1
+    int index_n_heads = 0;      // 32 on GLM-5.1
+    // Per-layer indexer type: "full" (computes indices from scratch)
+    // or "shared" (reuses previous layer's indices). Empty on non-GLM.
+    std::vector<std::string> indexer_types;
 
     // ── Storage dtype as declared on disk (for the safetensors loader).
     std::string torch_dtype;   // "bfloat16", "float16", "float32".

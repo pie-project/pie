@@ -100,6 +100,7 @@ def build_config(args: argparse.Namespace):
     elif args.driver == "cuda_native":
         driver_options = {
             "gpu_mem_utilization": args.gpu_mem_util,
+            "ready_timeout_s": float(args.server_startup_timeout),
         }
         if args.memory_profile != "auto":
             driver_options["memory_profile"] = args.memory_profile

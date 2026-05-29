@@ -22,6 +22,7 @@ pub mod gemma2;
 pub mod gemma3;
 pub mod gemma4;
 pub mod gptoss;
+pub mod kimi;
 pub mod llama2;
 pub mod llama3;
 pub mod mistral3;
@@ -141,7 +142,17 @@ pub fn create(arch_name: &str, tokenizer: Arc<Tokenizer>) -> Arc<dyn Instruct> {
         "qwen2" => Arc::new(self::qwen2::new(tokenizer)),
         "llama2" => Arc::new(self::llama2::LlamaInstruct::new(tokenizer)),
         "llama3" | "l4ma" => Arc::new(self::llama3::LlamaInstruct::new(tokenizer)),
-        "r1" | "deepseek_v3" => Arc::new(self::r1::R1Instruct::new(tokenizer)),
+        "r1" | "deepseek_v3" | "deepseek_v4" => Arc::new(self::r1::R1Instruct::new(tokenizer)),
+        "kimi_k2" | "kimi_k25" => Arc::new(self::kimi::KimiInstruct::new(tokenizer)),
+        "glm_moe_dsa" => Arc::new(QwenInstruct::new(
+            tokenizer,
+            ChatMLConfig {
+                has_thinking: true,
+                has_tools: true,
+                generation_suffix: "",
+                stop_tokens: &["<|im_end|>", "<|endoftext|>", "<|user|>", "<|assistant|>"],
+            },
+        )),
         "gptoss" | "gpt_oss" => Arc::new(self::gptoss::GptOssInstruct::new(tokenizer)),
         "gemma2" => Arc::new(self::gemma2::GemmaInstruct::new(tokenizer)),
         "gemma3" => Arc::new(self::gemma3::Gemma3Instruct::for_variant(

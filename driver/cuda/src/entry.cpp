@@ -54,6 +54,9 @@
 #include "model/bound_model.hpp"
 #include "model/gemma2.hpp"
 #include "model/gemma3n.hpp"
+#include "model/deepseek_v4_model.hpp"
+#include "model/glm5_model.hpp"
+#include "model/kimi_model.hpp"
 #include "model/gemma2_model.hpp"
 #include "model/gemma3n_model.hpp"
 #include "model/gemma4.hpp"
@@ -305,7 +308,15 @@ int run_impl(int argc,
          || mt == "gemma3" || mt == "gemma3_text"
          || mt == "gemma4" || mt == "gemma4_text"
          || mt == "gemma3n" || mt == "gemma3n_text"
-         || mt == "nemotron_h";
+         || mt == "nemotron_h"
+         // MLA / MoE archs (merged from agents/bravo). These have dedicated
+         // bind + forward paths below (weights_dsv4/kimi/glm5, is_*_arch). Keep
+         // this list in sync with bind_cuda_model()'s dispatch in
+         // bound_model.cpp — both must accept the same arch strings.
+         || mt == "deepseek_v4"
+         || mt == "deepseek_v2" || mt == "deepseek_v3"
+         || mt == "kimi_k2"
+         || mt == "glm_moe_dsa";
         if (!supported) {
             std::cerr << "[pie-driver-cuda] arch '" << mt
                       << "' not yet supported (Qwen 2/3, Llama-3, "
@@ -324,6 +335,9 @@ int run_impl(int argc,
     auto& weights_qwen3_5 = bound_model.qwen3_5;
     auto& weights_qwen3_5_moe = bound_model.qwen3_5_moe;
     auto& weights_nemotron_h = bound_model.nemotron_h;
+    auto& weights_dsv4 = bound_model.deepseek_v4;
+    auto& weights_kimi = bound_model.kimi;
+    auto& weights_glm5 = bound_model.glm5;
 
     const bool is_gemma_arch = bound_model.is_gemma();
     const bool is_gemma4_arch = bound_model.is_gemma4();
@@ -332,6 +346,9 @@ int run_impl(int argc,
     const bool is_qwen3_5_arch = bound_model.is_qwen3_5();
     const bool is_qwen3_5_moe_arch = bound_model.is_qwen3_5_moe();
     const bool is_nemotron_h_arch = bound_model.is_nemotron_h();
+    const bool is_dsv4_arch = bound_model.is_deepseek_v4();
+    const bool is_kimi_arch = bound_model.is_kimi();
+    const bool is_glm5_arch = bound_model.is_glm5();
     const int native_mtp_num_drafts = configured_mtp_num_drafts(cfg);
 
     const std::size_t num_layers_bound = bound_model.num_layers();
@@ -477,7 +494,23 @@ int run_impl(int argc,
         mem_plan.capacity.max_logit_rows);
 
     auto kv_cache =
-        is_gemma4_arch
+        is_dsv4_arch
+            ? pie_cuda_driver::KvCache::allocate(
+                  engine.hf_config().num_hidden_layers,
+                  physical_kv_pages,
+                  mem_plan.kv_page_size,
+                  1,  // DeepSeek-V4 MQA: single KV head
+                  engine.hf_config().head_dim,
+                  kv_format)
+        : (is_kimi_arch || is_glm5_arch)
+            ? pie_cuda_driver::KvCache::allocate(
+                  engine.hf_config().num_hidden_layers,
+                  physical_kv_pages,
+                  mem_plan.kv_page_size,
+                  1,  // MLA: the standard cache is a 1×1 placeholder;
+                  1,  // the compressed KV lives in `mla_cache` below.
+                  kv_format)
+        : is_gemma4_arch
             ? pie_cuda_driver::KvCache::allocate_per_layer(
                   engine.hf_config().num_hidden_layers,
                   physical_kv_pages,
@@ -502,6 +535,29 @@ int run_impl(int argc,
                   local_kv_heads,
                   engine.hf_config().head_dim_kernel,
                   kv_format);
+
+    // MLA compressed KV cache (Kimi / GLM5). Holds the per-layer
+    // latent KV that the standard `kv_cache` 1×1 placeholder stands in
+    // for. Empty for non-MLA archs.
+    auto mla_cache =
+        (is_kimi_arch || is_glm5_arch)
+            ? pie_cuda_driver::MlaCache::allocate(
+                  engine.hf_config().num_hidden_layers,
+                  physical_kv_pages,
+                  mem_plan.kv_page_size,
+                  engine.hf_config().kv_lora_rank,
+                  engine.hf_config().qk_rope_head_dim,
+                  pie_cuda_driver::DType::BF16)
+            : pie_cuda_driver::MlaCache{};
+
+    // DeepSeek Sparse Attention indexer cache (GLM5 only).
+    auto dsa_cache =
+        is_glm5_arch
+            ? pie_cuda_driver::DsaCache::allocate(
+                  engine.hf_config().num_hidden_layers,
+                  engine.hf_config().max_position_embeddings,
+                  engine.hf_config().index_head_dim)
+            : pie_cuda_driver::DsaCache{};
 
     auto attn_ws = pie_cuda_driver::AttentionWorkspace::allocate(
         mem_plan.attn_float_workspace_bytes, 8ull * 1024 * 1024);
@@ -977,6 +1033,31 @@ int run_impl(int argc,
     std::unique_ptr<pie_cuda_driver::model::Qwen35Model> qwen3_5_model;
     std::unique_ptr<pie_cuda_driver::model::Qwen35MoeModel> qwen3_5_moe_model;
     std::unique_ptr<pie_cuda_driver::model::LlamaLikeModel> llama_like_model;
+    std::unique_ptr<pie_cuda_driver::model::DsV4Model> dsv4_model;
+    std::unique_ptr<pie_cuda_driver::model::KimiModel> kimi_model;
+    std::unique_ptr<pie_cuda_driver::model::Glm5Model> glm5_model;
+    // New-arch forward workspaces. Allocated only for the matching arch;
+    // a default (empty) workspace otherwise. Live at function scope so
+    // the IModel objects holding references outlive the dispatch below.
+    auto dsv4_ws =
+        is_dsv4_arch
+            ? pie_cuda_driver::model::DsV4Workspace::allocate(
+                  engine.hf_config(), max_workspace_tokens,
+                  mem_plan.capacity.max_logit_rows, local_tp_size)
+            : pie_cuda_driver::model::DsV4Workspace{};
+    auto kimi_ws =
+        is_kimi_arch
+            ? pie_cuda_driver::model::KimiWorkspace::allocate(
+                  engine.hf_config(), max_workspace_tokens,
+                  mem_plan.capacity.max_logit_rows, local_tp_size)
+            : pie_cuda_driver::model::KimiWorkspace{};
+    auto glm5_ws =
+        is_glm5_arch
+            ? pie_cuda_driver::model::Glm5Workspace::allocate(
+                  engine.hf_config(), max_workspace_tokens,
+                  mem_plan.capacity.max_logit_rows,
+                  engine.hf_config().max_position_embeddings, local_tp_size)
+            : pie_cuda_driver::model::Glm5Workspace{};
     // Gemma-4 26B-A4B's MoE block needs a routed-experts workspace
     // alongside the dense forward state. Inert (zero-byte) on dense
     // E2B / E4B / 31B variants.
@@ -1084,6 +1165,26 @@ int run_impl(int argc,
                 pie_cuda_driver::model::qwen35_mtp_draft_position_offset(),
                 pie_cuda_driver::model::qwen35_mtp_prefix_global_cache());
         }
+    } else if (is_dsv4_arch) {
+        dsv4_model = std::make_unique<pie_cuda_driver::model::DsV4Model>(
+            weights_dsv4, engine.hf_config(), dsv4_ws,
+            cfg.distributed.tp_size, cfg.distributed.tp_rank, tp_comm_ptr,
+            cfg.distributed.tp_rank == 0);
+        forward_fn.attach_model(dsv4_model.get());
+    } else if (is_kimi_arch) {
+        const bool kimi_tp_greedy =
+            cfg.distributed.tp_size > 1 && weights_kimi.lm_head_tp_sharded;
+        kimi_model = std::make_unique<pie_cuda_driver::model::KimiModel>(
+            weights_kimi, engine.hf_config(), kimi_ws, mla_cache,
+            cfg.distributed.tp_size, tp_comm_ptr,
+            cfg.distributed.tp_rank == 0, kimi_tp_greedy);
+        forward_fn.attach_model(kimi_model.get());
+    } else if (is_glm5_arch) {
+        glm5_model = std::make_unique<pie_cuda_driver::model::Glm5Model>(
+            weights_glm5, engine.hf_config(), glm5_ws, mla_cache, dsa_cache,
+            cfg.distributed.tp_size, tp_comm_ptr,
+            cfg.distributed.tp_rank == 0);
+        forward_fn.attach_model(glm5_model.get());
     } else {
         // Llama-like fallback: covers Qwen3, Mixtral, Mistral3, GPT-OSS,
         // Gemma2, and any other shape that binds Qwen3Weights and routes

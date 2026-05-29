@@ -13,8 +13,10 @@ pub mod bpe;
 pub mod hf_loader;
 
 use std::borrow::Cow;
+use std::collections::HashMap;
 
 use aho_corasick::AhoCorasick;
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use unicode_normalization::{IsNormalized, UnicodeNormalization, is_nfc_quick};
 
 use bpe::BpeTable;
@@ -303,7 +305,48 @@ impl Tokenizer {
 
     /// Load a tokenizer from an HF `tokenizer.json` file.
     pub fn from_file(path: &std::path::Path) -> anyhow::Result<Self> {
+        if path.file_name().and_then(|name| name.to_str()) == Some("tiktoken.model") {
+            return Self::from_tiktoken_file(path);
+        }
         hf_loader::from_file(path)
+    }
+
+    /// Load a native tiktoken rank file (`base64(token_bytes) rank`).
+    pub fn from_tiktoken_file(path: &std::path::Path) -> anyhow::Result<Self> {
+        let text = std::fs::read_to_string(path)?;
+        let mut map: HashMap<u32, Vec<u8>> = HashMap::new();
+        for (line_no, line) in text.lines().enumerate() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            let mut parts = line.split_whitespace();
+            let bytes_b64 = parts.next().ok_or_else(|| {
+                anyhow::anyhow!("{}:{}: missing token bytes", path.display(), line_no + 1)
+            })?;
+            let rank = parts
+                .next()
+                .ok_or_else(|| {
+                    anyhow::anyhow!("{}:{}: missing token rank", path.display(), line_no + 1)
+                })?
+                .parse::<u32>()?;
+            let bytes = BASE64_STANDARD.decode(bytes_b64)?;
+            map.insert(rank, bytes);
+        }
+        let mut bpe = bpe::BpeTable::from_decoder_map(map);
+        let added_tokens = load_tiktoken_added_tokens(path)?;
+        for token in &added_tokens {
+            bpe.insert(token.content.as_bytes().to_vec(), token.id);
+        }
+        Ok(Self::new(
+            bpe,
+            VocabType::ByteLevel,
+            vec![],
+            SplitStep::None,
+            vec![],
+            None,
+            added_tokens,
+        ))
     }
 
     // -----------------------------------------------------------------------
@@ -802,6 +845,41 @@ fn replace_bytes_owned(haystack: Vec<u8>, needle: &[u8], replacement: &[u8]) -> 
     result
 }
 
+fn load_tiktoken_added_tokens(path: &std::path::Path) -> anyhow::Result<Vec<AddedToken>> {
+    let Some(dir) = path.parent() else {
+        return Ok(Vec::new());
+    };
+    let config_path = dir.join("tokenizer_config.json");
+    if !config_path.exists() {
+        return Ok(Vec::new());
+    }
+    let data = std::fs::read(&config_path)?;
+    let config: serde_json::Value = serde_json::from_slice(&data)?;
+    let Some(decoder) = config
+        .get("added_tokens_decoder")
+        .and_then(serde_json::Value::as_object)
+    else {
+        return Ok(Vec::new());
+    };
+
+    let mut tokens = Vec::with_capacity(decoder.len());
+    for (id, value) in decoder {
+        let Some(content) = value.get("content").and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        tokens.push(AddedToken {
+            id: id.parse::<u32>()?,
+            content: content.to_string(),
+            special: value
+                .get("special")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false),
+        });
+    }
+    tokens.sort_by_key(|token| token.id);
+    Ok(tokens)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1030,5 +1108,36 @@ mod tests {
         assert_eq!(tok.encode("<s>hi</s>"), vec![100, 2, 101]);
         assert_eq!(tok.decode(&[100, 2], true), "hi"); // skip special
         assert_eq!(tok.decode(&[100, 2], false), "<s>hi"); // include special
+    }
+
+    #[test]
+    fn test_tiktoken_loader_reads_hf_added_tokens_decoder() {
+        let dir = tempfile::tempdir().unwrap();
+        let model_path = dir.path().join("tiktoken.model");
+        std::fs::write(
+            &model_path,
+            format!(
+                "{} 0\n{} 1\n",
+                BASE64_STANDARD.encode("h"),
+                BASE64_STANDARD.encode("i")
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("tokenizer_config.json"),
+            r#"{
+              "added_tokens_decoder": {
+                "100": {"content": "<|im_user|>", "special": true},
+                "101": {"content": "<|im_end|>", "special": true}
+              }
+            }"#,
+        )
+        .unwrap();
+
+        let tok = Tokenizer::from_file(&model_path).unwrap();
+        assert_eq!(tok.token_to_id("<|im_user|>"), Some(100));
+        assert_eq!(tok.encode("<|im_user|>hi<|im_end|>"), vec![100, 0, 1, 101]);
+        assert_eq!(tok.decode(&[100, 0, 1, 101], false), "<|im_user|>hi<|im_end|>");
+        assert_eq!(tok.decode(&[100, 0, 1, 101], true), "hi");
     }
 }

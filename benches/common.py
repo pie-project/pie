@@ -273,7 +273,7 @@ def hf_chat_prompts_and_counts(
 ) -> tuple[list[str], list[int]]:
     from transformers import AutoTokenizer
 
-    tok = AutoTokenizer.from_pretrained(model)
+    tok = AutoTokenizer.from_pretrained(model, trust_remote_code=True)
     rendered = [
         tok.apply_chat_template(
             [{"role": "system", "content": system}, {"role": "user", "content": p}],

@@ -31,6 +31,7 @@ PieArch arch_from_gguf(const std::string& s) {
     if (s == "gemma4")             return PieArch::Gemma4;
     if (s == "olmo3" || s == "olmo2") return PieArch::Olmo3;
     if (s == "gpt-oss" || s == "gptoss") return PieArch::GptOss;
+    if (s == "glm_moe_dsa")        return PieArch::GlmMoeDsa;
     throw std::runtime_error(
         "gguf: unsupported general.architecture '" + s + "'");
 }

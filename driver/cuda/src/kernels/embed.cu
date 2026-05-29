@@ -25,6 +25,25 @@ __global__ void embed_bf16_kernel(
     }
 }
 
+__global__ void embed_bf16_vocab_shard_kernel(
+    const std::int32_t* __restrict__ token_ids,
+    const __nv_bfloat16* __restrict__ weight,
+    __nv_bfloat16* __restrict__ y,
+    int hidden, int local_vocab, int vocab_offset)
+{
+    const int n = blockIdx.x;
+    const std::int32_t tid_raw = token_ids[n];
+    const int local_tid = tid_raw - vocab_offset;
+    const bool in_shard = local_tid >= 0 && local_tid < local_vocab;
+    const __nv_bfloat16* row =
+        weight + static_cast<long long>(in_shard ? local_tid : 0) * hidden;
+    __nv_bfloat16* out = y + static_cast<long long>(n) * hidden;
+
+    for (int h = threadIdx.x; h < hidden; h += blockDim.x) {
+        out[h] = in_shard ? row[h] : __float2bfloat16(0.0f);
+    }
+}
+
 }  // namespace
 
 void launch_embed_bf16(
@@ -42,6 +61,23 @@ void launch_embed_bf16(
         static_cast<const __nv_bfloat16*>(weight),
         static_cast<__nv_bfloat16*>(y),
         hidden, vocab);
+}
+
+void launch_embed_bf16_vocab_shard(
+    const std::int32_t* token_ids,
+    const void* weight,
+    void* y,
+    int num_tokens, int hidden, int local_vocab, int vocab_offset,
+    cudaStream_t stream)
+{
+    constexpr int BLOCK = 256;
+    dim3 grid(num_tokens);
+    dim3 block(BLOCK);
+    embed_bf16_vocab_shard_kernel<<<grid, block, 0, stream>>>(
+        token_ids,
+        static_cast<const __nv_bfloat16*>(weight),
+        static_cast<__nv_bfloat16*>(y),
+        hidden, local_vocab, vocab_offset);
 }
 
 }  // namespace pie_cuda_driver::kernels

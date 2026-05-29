@@ -225,6 +225,14 @@ fn run_subprocess(flavor: SubprocessFlavor, action: PerDriverCmd) -> Result<()> 
 }
 
 fn install(flavor: SubprocessFlavor, path: Option<PathBuf>, run: bool) -> Result<()> {
+    #[cfg(windows)]
+    if matches!(flavor, SubprocessFlavor::Dev | SubprocessFlavor::Vllm | SubprocessFlavor::Sglang) {
+        bail!(
+            "{} driver is not supported on Windows. Please use the portable driver on Windows, or use WSL/Linux for dev, vllm, or sglang drivers.",
+            flavor.as_str()
+        );
+    }
+    
     let venv = path.unwrap_or_else(|| crate::paths::pie_home().join("venvs").join(flavor.as_str()));
     let python_bin = venv.join("bin").join("python");
 

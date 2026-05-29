@@ -105,7 +105,13 @@ fn build_model(m: &config::ModelConfig, hs: &ModelHandshake) -> pie::bootstrap::
     // serve the same model so they agree. Per-group caps can differ in
     // memory-derived capacities — those flow through the per-driver entries.
     let group0_caps = &hs.groups[0].caps;
-    let tokenizer_path = PathBuf::from(&group0_caps.snapshot_dir).join("tokenizer.json");
+    let snapshot_dir = PathBuf::from(&group0_caps.snapshot_dir);
+    let tokenizer_json = snapshot_dir.join("tokenizer.json");
+    let tokenizer_path = if tokenizer_json.exists() {
+        tokenizer_json
+    } else {
+        snapshot_dir.join("tiktoken.model")
+    };
 
     let drivers = hs
         .groups
