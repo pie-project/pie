@@ -757,17 +757,39 @@ impl pie::core::inference::HostForwardPass for InstanceState {
             let physical_page_ids = pinned.pages;
             let extra_pages = pinned.extra_pages;
             if let Some(rs_slot) = pinned.rs_slot {
-                if !req.spec_token_ids.is_empty() {
-                    context::unpin(model_id, context_id);
-                    return Ok(Err(
-                        "rs_cache models do not support speculative draft tokens yet".to_string(),
-                    ));
+                // Speculation policy for rs_cache (hybrid GDN) models. Two
+                // independent signals, both owned here by the runtime (the
+                // driver stays pure mechanism):
+                //   * `supported` — the driver wired a system drafter and the
+                //     executor can verify drafts and advance the committed
+                //     recurrent slot by exactly the accepted prefix. Without
+                //     it, an externally-supplied draft cannot be verified, so
+                //     reject it; the side channel would otherwise only force
+                //     dense-logit scheduling and fragment prompt batching.
+                //   * `enabled` — operator opt-in (`enable_system_speculation`,
+                //     default off). Gates only the *auto*-drafter: when off we
+                //     don't ask the driver to draft (`output_spec_flags`), but
+                //     we still honor any manual/user-supplied draft tokens.
+                let (system_spec_supported, system_spec_enabled) =
+                    crate::model::get_model(model_id)
+                        .map(|m| {
+                            (m.system_speculation_supported(), m.enable_system_speculation())
+                        })
+                        .unwrap_or((false, false));
+                if !system_spec_supported {
+                    if !req.spec_token_ids.is_empty() {
+                        context::unpin(model_id, context_id);
+                        return Ok(Err(
+                            "rs_cache models do not support speculative draft tokens yet"
+                                .to_string(),
+                        ));
+                    }
+                    req.output_spec_flags = vec![false];
+                } else if !system_spec_enabled {
+                    // Supported, but not opted in: no auto-drafting. Manual
+                    // drafts in `req.spec_token_ids` are still verified.
+                    req.output_spec_flags = vec![false];
                 }
-                // Recurrent-state-cache models cannot currently use the
-                // driver-provided speculative-token side channel. Leaving the
-                // request flag set only forces dense-logit scheduling and
-                // fragments prompt batching.
-                req.output_spec_flags = vec![false];
                 req.rs_slot_ids = vec![rs_slot];
                 req.rs_slot_flags = vec![pinned.rs_flags];
             }

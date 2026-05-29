@@ -30,6 +30,11 @@ bool qwen35_rs_state_bf16_enabled()
 
 }  // namespace
 
+bool RecurrentStateCache::recurrent_state_bf16_default()
+{
+    return qwen35_rs_state_bf16_enabled();
+}
+
 RecurrentStateCache RecurrentStateCache::allocate(
     const std::vector<bool>& layer_is_linear,
     int conv_dim,
@@ -317,6 +322,32 @@ void* RecurrentStateCache::mtp_pending_hidden(int slot)
     }
     return mtp_pending_hidden_.data() +
         static_cast<std::size_t>(slot) * hidden_size_;
+}
+
+void RecurrentStateCache::configure_verify_hidden_stash(
+    int max_tokens, int hidden_size)
+{
+    if (max_tokens <= 0 || hidden_size <= 0 || num_linear_layers_ <= 0) {
+        return;
+    }
+    verify_stash_max_tokens_ = max_tokens;
+    verify_stash_hidden_ = hidden_size;
+    const std::size_t per_layer =
+        static_cast<std::size_t>(max_tokens) * hidden_size;
+    verify_hidden_stash_ = DeviceBuffer<std::uint16_t>::alloc(
+        per_layer * static_cast<std::size_t>(num_linear_layers_));
+}
+
+void* RecurrentStateCache::verify_hidden_stash_layer(int linear_idx)
+{
+    if (!verify_hidden_stash_enabled() || verify_hidden_stash_.data() == nullptr ||
+        linear_idx < 0 || linear_idx >= num_linear_layers_) {
+        return nullptr;
+    }
+    const std::size_t per_layer =
+        static_cast<std::size_t>(verify_stash_max_tokens_) * verify_stash_hidden_;
+    return verify_hidden_stash_.data() +
+        static_cast<std::size_t>(linear_idx) * per_layer;
 }
 
 }  // namespace pie_cuda_driver

@@ -524,7 +524,6 @@ int run_impl(int argc,
     // memory planner has sized nemotron_h_ws and nemotron_h_state_cache.
     std::unique_ptr<pie_cuda_driver::model::NemotronHModel> nemotron_h_model;
     int qwen3_5_runtime_rs_slots = 0;
-    int qwen3_5_scratch_rs_slot = -1;
     if (is_qwen3_5_arch || is_qwen3_5_moe_arch) {
         const auto& cfg_q = engine.hf_config();
         const int q35_tp_size = std::max(1, cfg.distributed.tp_size);
@@ -545,20 +544,16 @@ int run_impl(int argc,
                 cfg_q.head_dim);
         // Allocate per-slot state for the linear-attn layers. The memory
         // planner sizes runtime slots before KV pages and clamps max forward
-        // requests to the resulting slot count. Keep one unadvertised slot as
-        // a rollback scratch for system-spec draft verification, plus a small
-        // prefix-snapshot bank so partial MTP rejection can restore accepted
-        // recurrent state without replaying the target model.
+        // requests to the resulting slot count. Frozen-verify + batched-repair
+        // speculation (MTP for hybrid GDN models) needs NO per-request snapshot
+        // buffer and NO rollback scratch: the verify leaves each committed slot
+        // at its pre-verify value, and one batched repair forward advances it
+        // through the confirmed prefix [input | accepted]. So every planned
+        // slot is a runtime slot — more concurrent sequences AND uncapped
+        // concurrent speculation.
         const int q35_planned_slots = std::max<int>(1, mem_plan.state_slots);
-        qwen3_5_runtime_rs_slots = std::max<int>(1, q35_planned_slots - 1);
-        qwen3_5_scratch_rs_slot = qwen3_5_runtime_rs_slots;
-        const int q35_spec_snapshot_slots = [] {
-            const char* v = std::getenv("PIE_QWEN35_RS_SNAPSHOT_SLOTS");
-            if (v == nullptr || v[0] == '\0') return 8;
-            return std::clamp(std::atoi(v), 0, 16);
-        }();
-        const int q35_alloc_slots =
-            qwen3_5_runtime_rs_slots + 1 + q35_spec_snapshot_slots;
+        qwen3_5_runtime_rs_slots = q35_planned_slots;
+        const int q35_alloc_slots = qwen3_5_runtime_rs_slots;
         qwen3_5_state_cache = pie_cuda_driver::RecurrentStateCache::allocate(
             qwen3_5_layer_is_linear, conv_dim, cfg_q.linear_conv_kernel_dim,
             local_linear_value_heads,
@@ -566,10 +561,32 @@ int run_impl(int argc,
             cfg_q.linear_value_head_dim,
             cfg_q.hidden_size,
             q35_alloc_slots);
+        // Activation-replay stash (Snakes-and-Ladders / STree) — the sole
+        // hybrid-SSM spec mechanism. The frozen verify caches each linear
+        // layer's cheap O(d)/token in-proj activations ([mixed_qkv | a | b], bf16)
+        // so the commit-advance replays ONLY conv+prep+recurrence over the
+        // accepted prefix (no in_proj GEMM, no attention/MLP) — lossless by
+        // construction. Always on; its presence selects the replay path + freezes
+        // the FLA verify in the executor.
+        //
+        // Sized to the full workspace so the stash can never overflow the verify
+        // window (a too-tight bound corrupts the replay). The concurrency gate
+        // keeps spec — and thus this stash's use — to low batch, where the memory
+        // it reserves is not contended. (A tighter decode-only bound is a future
+        // memory optimization once the exact spec-window size is pinned down.)
+        {
+            const int stash_width = conv_dim + 2 * local_linear_value_heads;
+            qwen3_5_state_cache.configure_verify_hidden_stash(
+                max_workspace_tokens, stash_width);
+        }
+        const std::size_t recurrent_elem_bytes =
+            pie_cuda_driver::RecurrentStateCache::recurrent_state_bf16_default()
+                ? sizeof(std::uint16_t)
+                : sizeof(float);
         const std::size_t per_slot_recurrent_bytes =
             static_cast<std::size_t>(local_linear_value_heads) *
             cfg_q.linear_key_head_dim *
-            cfg_q.linear_value_head_dim * sizeof(float);
+            cfg_q.linear_value_head_dim * recurrent_elem_bytes;
         const std::size_t per_slot_conv_bytes =
             static_cast<std::size_t>(cfg_q.linear_conv_kernel_dim) *
             conv_dim * sizeof(std::uint16_t);
@@ -585,8 +602,7 @@ int run_impl(int argc,
             std::cerr << "[pie-driver-cuda] qwen3.5 rs_cache: "
                       << num_linear_layers << " linear layers, "
                       << qwen3_5_runtime_rs_slots
-                      << " runtime slots + 1 scratch + "
-                      << q35_spec_snapshot_slots << " prefix snapshots, "
+                      << " runtime slots (frozen-verify MTP, no spec buffer), "
                       << (per_slot_recurrent_bytes + per_slot_conv_bytes)
                       << " B/slot (recurrent="
                       << per_slot_recurrent_bytes << " conv="
@@ -1125,7 +1141,6 @@ int run_impl(int argc,
                           ? &qwen3_5_state_cache
                           : (is_nemotron_h_arch ? &nemotron_h_state_cache
                                                  : nullptr)),
-        /*rs_cache_scratch_slot=*/qwen3_5_scratch_rs_slot,
         /*response_builder=*/{},
     };
     executor.tp_cpu_gate_key = cfg.distributed.nccl_unique_id_hex;
@@ -1190,9 +1205,12 @@ int run_impl(int argc,
                              std::max(0, qwen3_5_state_cache.hidden_size())) *
                              sizeof(std::uint16_t))
             : 0;
+        // The driver repairs the rs_cache recurrent state for speculation
+        // in-place (frozen verify + batched repair forward), so the runtime can
+        // skip its full rs-replay pass on speculative truncate. No longer tied
+        // to a rollback scratch slot (which the frozen path doesn't use).
         const bool rs_cache_spec_rollback =
-            rs_cache_required && cfg.distributed.tp_size <= 1 &&
-            qwen3_5_scratch_rs_slot >= 0;
+            rs_cache_required && cfg.distributed.tp_size <= 1;
         const bool system_speculation_supported =
             static_cast<bool>(executor.system_drafter);
         const auto max_forward_requests_caps = rs_cache_required
@@ -1209,7 +1227,9 @@ int run_impl(int argc,
             {"rs_cache_slot_bytes",    rs_cache_slot_bytes},
             {"rs_cache_spec_rollback", rs_cache_spec_rollback},
             {"system_speculation_supported", system_speculation_supported},
-            {"default_system_speculation", system_speculation_supported},
+            // Operator opt-in (data only); the RUNTIME combines it with the
+            // capability above to decide whether to drive system speculation.
+            {"enable_system_speculation", cfg.model.enable_system_speculation},
             {"max_forward_tokens",     mem_plan.capacity.max_forward_tokens},
             {"max_forward_requests",   max_forward_requests_caps},
             {"max_page_refs",          mem_plan.capacity.max_page_refs},

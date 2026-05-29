@@ -811,6 +811,11 @@ pub struct CudaNativeDriverOptions {
     pub mtp_assistant_snapshot_dir: String,
     /// Maximum number of MTP draft tokens returned per system-spec step.
     pub mtp_num_drafts: u32,
+    /// Operator opt-in for system speculation (MTP). Default false: the runtime
+    /// drives the auto-drafter only when this is true. Speculation is a
+    /// latency-regime win (helps at low batch, costs at compute saturation), so
+    /// it's off unless explicitly enabled — matching vLLM/SGLang convention.
+    pub enable_system_speculation: bool,
 
     pub ready_timeout_s: f64,
     pub shutdown_timeout_s: f64,
@@ -843,6 +848,7 @@ impl Default for CudaNativeDriverOptions {
             mxfp4_moe: "auto".to_string(),
             mtp_assistant_snapshot_dir: String::new(),
             mtp_num_drafts: 3,
+            enable_system_speculation: false,
             ready_timeout_s: 600.0,
             shutdown_timeout_s: 5.0,
         }

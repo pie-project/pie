@@ -98,7 +98,14 @@ pub struct ModelConfig {
     pub arch_name: String,
     pub kv_page_size: usize,
     pub tokenizer_path: PathBuf,
-    pub default_system_speculation: bool,
+    /// True when every driver group wired a system drafter (the capability
+    /// signal). Manual/user drafts require this; auto-drafting additionally
+    /// requires `enable_system_speculation`.
+    pub system_speculation_supported: bool,
+    /// Operator opt-in for system speculation (deployment config, default
+    /// false). The runtime drives system drafts only when this is true AND the
+    /// model supports it; manual/user-supplied drafts are honored regardless.
+    pub enable_system_speculation: bool,
     pub drivers: Vec<DriverConfig>,
     pub scheduler: SchedulerConfig,
 }
@@ -111,8 +118,6 @@ pub struct DriverConfig {
     pub rs_cache_slots: usize,
     pub rs_cache_slot_bytes: u64,
     pub rs_cache_spec_rollback: bool,
-    pub system_speculation_supported: bool,
-    pub default_system_speculation: bool,
     pub limits: crate::driver::SchedulerLimits,
 }
 
@@ -226,7 +231,8 @@ async fn bootstrap_inner(config: Config, listener: Option<TcpListener>) -> Resul
             &cfg.arch_name,
             cfg.kv_page_size as u32,
             cfg.tokenizer_path.clone(),
-            cfg.default_system_speculation,
+            cfg.system_speculation_supported,
+            cfg.enable_system_speculation,
         )?;
 
         let drivers: Vec<usize> = cfg

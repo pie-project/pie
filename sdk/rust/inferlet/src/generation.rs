@@ -726,20 +726,16 @@ impl<'g, 'ctx> GenStep<'g, 'ctx> {
             let n_verified = (accepted_tokens.len() as u32).saturating_sub(1);
             let n_rejected = n_drafted.saturating_sub(n_verified);
             if n_rejected > 0 {
-                // The host API truncates to a retained working-token count,
-                // while n_rejected is a suffix length. At this point the
-                // host has appended pending + all draft tokens, but pages are
-                // not committed yet, so the retained count is the previous
-                // local working tail plus pending and accepted drafts.
-                let working_after_append = parent
-                    .ctx
-                    .working_tokens
-                    .saturating_add(n_pending)
-                    .saturating_add(n_drafted);
+                // `truncate_working_page_tokens` REMOVES the last N working
+                // tokens (see context.wit). The host appended pending + ALL
+                // draft tokens, of which the last `n_rejected` were not
+                // verified, so the suffix to drop is exactly `n_rejected`.
+                // (For rs_cache contexts this stays within the driver-repaired
+                // spec tail, so the host skips a recurrent-state replay.)
                 parent
                     .ctx
                     .inner
-                    .truncate_working_page_tokens(working_after_append.saturating_sub(n_rejected));
+                    .truncate_working_page_tokens(n_rejected);
             }
             // Roll back custom speculator's own state too.
             if let SpecMode::Custom(s) = &mut parent.speculation {

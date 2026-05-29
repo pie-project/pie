@@ -35,13 +35,15 @@ pub struct DriverCapabilities {
     /// system-speculative draft rejection.
     #[serde(default)]
     pub rs_cache_spec_rollback: bool,
-    /// True when the driver can return system-provided speculative drafts.
+    /// True when the driver wired a system drafter and can verify/return
+    /// system-provided speculative drafts (the capability signal).
     #[serde(default)]
     pub system_speculation_supported: bool,
-    /// True when greedy SDK generation should opt into the system drafter
-    /// by default for this model/driver.
+    /// Operator opt-in for system speculation (deployment config). The runtime
+    /// combines this with `system_speculation_supported` to decide whether to
+    /// drive drafts. Default false = off unless explicitly enabled.
     #[serde(default)]
-    pub default_system_speculation: bool,
+    pub enable_system_speculation: bool,
     /// Maximum forward-pass tokens accepted in one driver fire.
     pub max_forward_tokens: u32,
     /// Maximum forward-pass requests accepted in one driver fire.

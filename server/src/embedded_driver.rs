@@ -491,6 +491,11 @@ pub(crate) fn write_cuda_startup_toml(
         );
     }
     insert_int(&mut model, "mtp_num_drafts", opts.mtp_num_drafts);
+    insert_bool(
+        &mut model,
+        "enable_system_speculation",
+        opts.enable_system_speculation,
+    );
     insert_table(&mut doc, "model", model);
 
     let mut batching = toml::Table::new();

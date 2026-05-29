@@ -114,6 +114,15 @@ struct ForwardFn {
         // Sampling hint: if the executor only needs argmax, body may skip
         // dense logits and write straight into the fused-argmax output.
         bool tp_greedy_argmax = false;
+
+        // Recurrent-only commit-advance: when non-null, the forward runs ONLY
+        // the linear-attn block of each linear layer (conv + recurrence,
+        // write_state=true) over `total_tokens` accepted tokens, gathering each
+        // layer's input from the verify-stashed hidden via these row indices
+        // (into the verify token layout). Attention, MLP, non-linear layers,
+        // and lm_head are skipped. Used to advance rs_cache state after a
+        // frozen verify without re-running the whole backbone.
+        const std::int32_t*  commit_advance_gather_d = nullptr;
     };
 
     struct PrepareInputs {
@@ -292,9 +301,6 @@ struct Executor {
     // Runtime-managed rs_cache storage. Null on models without
     // recurrent-state slots.
     RecurrentStateCache* rs_cache = nullptr;
-    // Private rs_cache slot reserved for speculative rollback. This slot is
-    // not advertised to the runtime.
-    int rs_cache_scratch_slot = -1;
 
     // Response-view builder. Reused fire-to-fire — the builder owns the
     // concat scratch the `PieForwardResponseView` slices point into. The

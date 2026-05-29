@@ -50,7 +50,12 @@ impl pie::core::model::HostModel for InstanceState {
 
     async fn default_system_speculation(&mut self, this: Resource<Model>) -> Result<bool> {
         let model = self.ctx().table.get(&this)?;
-        Ok(model.model.default_system_speculation())
+        // The effective "speculate by default?" decision the SDK reflects: the
+        // model must support a system drafter AND the operator must have opted
+        // in (`enable_system_speculation`, default off). The runtime owns this
+        // decision; the SDK only requests system drafts when both hold. (Manual
+        // drafts are a separate path, gated in api/inference.rs.)
+        Ok(model.model.system_speculation_supported() && model.model.enable_system_speculation())
     }
 
     async fn drop(&mut self, this: Resource<Model>) -> Result<()> {

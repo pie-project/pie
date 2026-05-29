@@ -117,8 +117,6 @@ fn build_model(m: &config::ModelConfig, hs: &ModelHandshake) -> pie::bootstrap::
             rs_cache_slots: g.caps.rs_cache_slots as usize,
             rs_cache_slot_bytes: g.caps.rs_cache_slot_bytes,
             rs_cache_spec_rollback: g.caps.rs_cache_spec_rollback,
-            system_speculation_supported: g.caps.system_speculation_supported,
-            default_system_speculation: g.caps.default_system_speculation,
             limits: pie::driver::SchedulerLimits {
                 max_forward_requests: g.caps.max_forward_requests as usize,
                 max_forward_tokens: g.caps.max_forward_tokens as usize,
@@ -137,7 +135,11 @@ fn build_model(m: &config::ModelConfig, hs: &ModelHandshake) -> pie::bootstrap::
         arch_name: group0_caps.arch_name.clone(),
         kv_page_size: group0_caps.kv_page_size as usize,
         tokenizer_path,
-        default_system_speculation: hs.groups.iter().all(|g| g.caps.default_system_speculation),
+        system_speculation_supported: hs
+            .groups
+            .iter()
+            .all(|g| g.caps.system_speculation_supported),
+        enable_system_speculation: hs.groups.iter().all(|g| g.caps.enable_system_speculation),
         drivers,
         scheduler: pie::bootstrap::SchedulerConfig {
             batch_policy: m.scheduler.batch_policy.clone(),
@@ -179,7 +181,7 @@ mod tests {
             rs_cache_slot_bytes: 0,
             rs_cache_spec_rollback: false,
             system_speculation_supported: false,
-            default_system_speculation: false,
+            enable_system_speculation: false,
         }
     }
 

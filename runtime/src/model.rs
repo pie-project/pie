@@ -35,7 +35,8 @@ pub fn register(
     arch_name: &str,
     kv_page_size: u32,
     tokenizer_path: PathBuf,
-    default_system_speculation: bool,
+    system_speculation_supported: bool,
+    enable_system_speculation: bool,
 ) -> Result<()> {
     let tokenizer = Arc::new(Tokenizer::from_file(&tokenizer_path)?);
     let instruct = instruct::create(arch_name, tokenizer.clone());
@@ -45,7 +46,8 @@ pub fn register(
         instruct,
         kv_page_size,
         tokenizer,
-        default_system_speculation,
+        system_speculation_supported,
+        enable_system_speculation,
     });
     MODELS.push(model);
     Ok(())
@@ -73,7 +75,8 @@ pub struct Model {
     instruct: Arc<dyn Instruct>,
     kv_page_size: u32,
     tokenizer: Arc<Tokenizer>,
-    default_system_speculation: bool,
+    system_speculation_supported: bool,
+    enable_system_speculation: bool,
 }
 
 impl std::fmt::Debug for Model {
@@ -137,9 +140,17 @@ impl Model {
         self.kv_page_size
     }
 
-    /// Whether greedy SDK generation should request the driver's system
-    /// drafter by default for this model.
-    pub fn default_system_speculation(&self) -> bool {
-        self.default_system_speculation
+    /// Whether the driver wired a system drafter for this model (capability).
+    /// Required to verify manual drafts; auto-drafting additionally requires
+    /// [`Self::enable_system_speculation`].
+    pub fn system_speculation_supported(&self) -> bool {
+        self.system_speculation_supported
+    }
+
+    /// Operator opt-in for system speculation (deployment config, default
+    /// false). The runtime drives system drafts only when this is true; manual
+    /// (user-supplied) drafts are honored regardless of this flag.
+    pub fn enable_system_speculation(&self) -> bool {
+        self.enable_system_speculation
     }
 }

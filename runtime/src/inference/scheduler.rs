@@ -193,7 +193,6 @@ struct RequestCapacityUsage {
     user_custom_mask_bytes: usize,
     spec_custom_mask_bytes: usize,
     has_spec_drafts: bool,
-    has_rs_spec_drafts: bool,
     has_dense_logit_requirement: bool,
     has_prob_sampling: bool,
     is_single_token_decode: bool,
@@ -245,7 +244,6 @@ fn request_capacity_usage(req: &PendingRequest, page_size: u32) -> RequestCapaci
         user_custom_mask_bytes,
         spec_custom_mask_bytes,
         has_spec_drafts: spec_tokens > 0,
-        has_rs_spec_drafts: spec_tokens > 0 && !req.request.rs_slot_ids.is_empty(),
         has_dense_logit_requirement,
         has_prob_sampling,
         is_single_token_decode,
@@ -321,7 +319,6 @@ struct BatchAccumulator {
     total_user_custom_mask_bytes: usize,
     total_spec_custom_mask_bytes: usize,
     has_spec_drafts: bool,
-    has_rs_spec_drafts: bool,
     has_dense_logit_requirement: bool,
     has_prob_sampling: bool,
     all_single_token_decode: bool,
@@ -343,7 +340,6 @@ impl BatchAccumulator {
             total_user_custom_mask_bytes: 0,
             total_spec_custom_mask_bytes: 0,
             has_spec_drafts: false,
-            has_rs_spec_drafts: false,
             has_dense_logit_requirement: false,
             has_prob_sampling: false,
             all_single_token_decode: true,
@@ -420,7 +416,6 @@ impl BatchAccumulator {
             .total_spec_custom_mask_bytes
             .saturating_add(usage.spec_custom_mask_bytes);
         self.has_spec_drafts |= usage.has_spec_drafts;
-        self.has_rs_spec_drafts |= usage.has_rs_spec_drafts;
         self.has_dense_logit_requirement |= usage.has_dense_logit_requirement;
         self.has_prob_sampling |= usage.has_prob_sampling;
         self.all_single_token_decode &= usage.is_single_token_decode;
@@ -505,9 +500,12 @@ impl BatchAccumulator {
         if self.requests.is_empty() {
             return false;
         }
-        if self.has_rs_spec_drafts || usage.has_rs_spec_drafts {
-            return true;
-        }
+        // rs_cache spec-decode (MTP for hybrid GDN models) no longer needs a
+        // per-batch cap: the driver runs a frozen verify (committed slot stays
+        // at its pre-verify value) and a single batched repair forward over
+        // [input | accepted] to advance state. There is no per-request snapshot
+        // buffer, so rs-spec batches grow to the normal forward limits below,
+        // exactly like non-spec batches.
         let next_has_spec = self.has_spec_drafts || usage.has_spec_drafts;
         let next_custom_mask_bytes = if next_has_spec {
             self.total_spec_custom_mask_bytes
@@ -604,7 +602,9 @@ impl BatchAccumulator {
             self.total_user_custom_mask_bytes
         };
         self.requests.len() >= self.limits.max_forward_requests
-            || self.has_rs_spec_drafts
+            // rs-spec batches (frozen verify + batched repair) carry no
+            // per-request buffer, so they fill to the normal forward limits
+            // like any other batch — no rs-spec-specific early fire.
             || self.total_tokens >= self.limits.max_forward_tokens
             || self.total_pages >= self.limits.max_page_refs
             || self.total_logit_rows >= self.limits.max_logit_rows
@@ -640,7 +640,6 @@ impl BatchAccumulator {
         self.total_user_custom_mask_bytes = 0;
         self.total_spec_custom_mask_bytes = 0;
         self.has_spec_drafts = false;
-        self.has_rs_spec_drafts = false;
         self.has_dense_logit_requirement = false;
         self.has_prob_sampling = false;
         self.all_single_token_decode = true;

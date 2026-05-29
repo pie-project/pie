@@ -163,15 +163,6 @@ struct SamplingScratch {
     std::vector<std::int32_t> h_sample_idx;
 };
 
-struct RsSpecRollback {
-    bool enabled = false;
-    int slot = -1;
-    int scratch_slot = -1;
-    int snapshot_base_slot = -1;
-    int snapshot_count = 0;
-    bool was_fresh = false;
-};
-
 SamplingScratch& sampling_scratch() {
     thread_local SamplingScratch scratch;
     return scratch;
@@ -346,15 +337,6 @@ bool mtp_chain_graph_enabled() {
         return v[0] != '0';
     }();
     return enabled;
-}
-
-int qwen35_rs_snapshot_min_drafts() {
-    static const int min_drafts = [] {
-        const char* v = std::getenv("PIE_QWEN35_RS_SNAPSHOT_MIN_DRAFTS");
-        if (v == nullptr || v[0] == '\0') return 3;
-        return std::clamp(std::atoi(v), 0, 16);
-    }();
-    return min_drafts;
 }
 
 struct StepProfileTimer {
@@ -2023,12 +2005,18 @@ ForwardDispatchResult run_forward_dispatch(
         try_graphs && in.single_gpu_greedy_argmax &&
         !in.forward_handles_argmax &&
         graph_single_gpu_argmax_enabled();
+    const bool rs_verify_frozen =
+        executor.rs_cache != nullptr && executor.rs_cache->verify_frozen();
     const std::uint32_t graph_variant =
         (in.tp_greedy_argmax ? 1u : 0u) |
         (out.graph_captures_single_gpu_argmax ? 2u : 0u) |
         (in.forward_handles_argmax ? 4u : 0u) |
         (out.graph_layout << 3) |
-        (in.small_spec_graph_shape ? 0x200u : 0u);
+        (in.small_spec_graph_shape ? 0x200u : 0u) |
+        // Frozen verify skips the GDN state writeback, baked into the captured
+        // kernel — must not share a graph with a normal-writeback forward of
+        // the same shape.
+        (rs_verify_frozen ? 0x400u : 0u);
 
     if (try_graphs) {
         const ForwardGraphKey key{in.forward_R, in.forward_N, graph_variant};
@@ -2344,50 +2332,27 @@ void handle_fire_batch(
             pi.is_fresh.copy_from_host(std::span<const std::uint8_t>(is_fresh_h));
         }
 
-        RsSpecRollback rs_spec_rollback;
-        if (has_spec_drafts && executor.rs_cache != nullptr && use_slots) {
-            const bool can_repair =
-                executor.tp_comm == nullptr &&
-                executor.rs_cache_scratch_slot >= 0;
-            if (can_repair && R != 1) {
-                throw std::runtime_error(
-                    "rs_cache speculative rollback requires single-request batches");
-            }
-            if (can_repair && !verify_n_drafts.empty() && verify_n_drafts[0] > 0) {
-                rs_spec_rollback.enabled = true;
-                rs_spec_rollback.slot = slot_ids_h[0];
-                rs_spec_rollback.scratch_slot = executor.rs_cache_scratch_slot;
-                const bool use_prefix_snapshots =
-                    verify_n_drafts[0] >= qwen35_rs_snapshot_min_drafts();
-                rs_spec_rollback.snapshot_base_slot = use_prefix_snapshots
-                    ? executor.rs_cache_scratch_slot + 1
-                    : -1;
-                rs_spec_rollback.snapshot_count = use_prefix_snapshots
-                    ? std::max(
-                          0,
-                          executor.rs_cache->max_slots() -
-                              rs_spec_rollback.snapshot_base_slot)
-                    : 0;
-                if (use_prefix_snapshots &&
-                    rs_spec_rollback.snapshot_count > 0) {
-                    executor.rs_cache->set_spec_snapshot_slots(
-                        rs_spec_rollback.snapshot_base_slot,
-                        rs_spec_rollback.snapshot_count);
-                } else {
-                    executor.rs_cache->clear_spec_snapshot_slots();
-                }
-                rs_spec_rollback.was_fresh = !is_fresh_h.empty() && is_fresh_h[0] != 0;
-                if (!rs_spec_rollback.was_fresh) {
-                    executor.rs_cache->copy_slot_d2d(
-                        rs_spec_rollback.slot,
-                        rs_spec_rollback.scratch_slot,
-                        cublas.stream());
-                }
-            } else if (executor.rs_cache != nullptr) {
-                executor.rs_cache->clear_spec_snapshot_slots();
-            }
-        } else if (executor.rs_cache != nullptr) {
-            executor.rs_cache->clear_spec_snapshot_slots();
+        // Frozen-verify speculative path. The verify forward walks the GDN
+        // recurrent state in registers to produce correct draft outputs but
+        // persists NOTHING (every linear layer sees write_state=false), so each
+        // committed slot stays at its pre-verify value — the implicit
+        // speculative snapshot. After sampling, one batched repair forward over
+        // [input | accepted] advances each committed slot to exactly the
+        // confirmed prefix. No per-request snapshot buffer → no concurrency
+        // cap; the committed slot only ever reflects committed tokens. (KV is
+        // untouched by freezing — only the recurrent-state writeback is gated —
+        // so the verify writes KV normally and the repair's KV re-write is an
+        // idempotent no-op.)
+        // rs_frozen_verify gates the conv freeze + the repair/commit-advance.
+        // The FLA freeze is decoupled (in linear_attn_layer_body): the fla only
+        // freezes in commit-advance mode (verify_frozen AND stash enabled), so
+        // the default keeps fla-drift + repair (the validated 6899 path) while
+        // the commit-advance gets a truly frozen verify for lossless replay.
+        bool rs_frozen_verify = false;
+        if (executor.rs_cache != nullptr) {
+            rs_frozen_verify = has_spec_drafts && use_slots &&
+                               executor.tp_comm == nullptr;
+            executor.rs_cache->set_verify_frozen(rs_frozen_verify);
         }
 
         // ── Sample-plan construction (hoisted) ──────────────────
@@ -2984,6 +2949,10 @@ void handle_fire_batch(
                 }
             }
 
+            // The driver is pure mechanism: it auto-drafts exactly when the
+            // runtime requested it (system_draft_requests, derived from the
+            // runtime's output_spec_flags). The decision of WHETHER to speculate
+            // this step is the runtime's — see the runtime spec policy.
             if (!system_draft_requests.empty() &&
                 executor.system_drafter.draft_next) {
                 StepProfileTimer system_spec_timer(
@@ -3018,177 +2987,62 @@ void handle_fire_batch(
                         per_req.data(), per_req.size()),
                     native_commit_cache);
             }
-            if (rs_spec_rollback.enabled) {
-                const int accepted = spec_accepted_drafts.empty()
-                    ? -1
-                    : spec_accepted_drafts[0];
-                const int n_drafts = verify_n_drafts.empty()
-                    ? 0
-                    : verify_n_drafts[0];
-                if (accepted >= 0 && accepted < n_drafts) {
+            // Advance each committed rs_cache slot from its pre-verify value
+            // (the frozen verify left it untouched) to its confirmed prefix
+            // [input | accepted] via ACTIVATION REPLAY: replay only the linear-
+            // attn recurrence over the accepted tokens, fed from the verify's
+            // stashed in-proj activations (mixed_qkv + a,b) — no in_proj GEMM, no
+            // attention/MLP, no lm_head. Lossless by construction (the rejected
+            // drafts' state is never committed). The MTP-head commit above must
+            // precede this (invoke_body overwrites ws). The stash is always
+            // configured (entry.cpp), so this is the sole hybrid-SSM spec path.
+            if (rs_frozen_verify) {
+                executor.rs_cache->set_verify_frozen(false);
+
+                // Replay over the verify window with a per-request commit_len
+                // (n_in + accepted): linear_attn_layer_body loads the stashed
+                // in-proj activations and SKIPS in_proj, so conv+prep+fla fold
+                // only the confirmed prefix and write the committed state at that
+                // boundary. No in_proj GEMM means no GEMM-tiling sensitivity, so
+                // the replay is bit-consistent with the verify.
+                std::vector<std::int32_t> commit_len(static_cast<std::size_t>(R));
+                std::vector<std::int32_t> commit_slots(static_cast<std::size_t>(R));
+                for (int r = 0; r < R; ++r) {
                     const int n_in = static_cast<int>(
-                        qo_view_orig[1] - qo_view_orig[0]);
-                    const int replay_N = n_in + accepted;
-                    bool restored_from_snapshot = false;
-                    if (replay_N > 0 &&
-                        rs_spec_rollback.snapshot_base_slot >= 0 &&
-                        replay_N <= rs_spec_rollback.snapshot_count) {
-                        executor.rs_cache->copy_linear_state_slot_d2d(
-                            rs_spec_rollback.snapshot_base_slot + replay_N - 1,
-                            rs_spec_rollback.slot,
-                            cublas.stream());
-                        restored_from_snapshot = true;
-                    }
+                        qo_view_orig[r + 1] - qo_view_orig[r]);
+                    const int accepted =
+                        (r < static_cast<int>(spec_accepted_drafts.size()) &&
+                         spec_accepted_drafts[static_cast<std::size_t>(r)] > 0)
+                            ? spec_accepted_drafts[static_cast<std::size_t>(r)]
+                            : 0;
+                    commit_len[static_cast<std::size_t>(r)] = n_in + accepted;
+                    commit_slots[static_cast<std::size_t>(r)] = slot_ids_h[r];
+                }
 
-                    if (!restored_from_snapshot) {
-                        if (rs_spec_rollback.was_fresh) {
-                            executor.rs_cache->reset_slot(
-                                rs_spec_rollback.slot, cublas.stream());
-                        } else {
-                            executor.rs_cache->copy_slot_d2d(
-                                rs_spec_rollback.scratch_slot,
-                                rs_spec_rollback.slot,
-                                cublas.stream());
-                        }
-                    }
+                if (N > 0) {
+                    // Reuse pi.tokens (uint32, unused — no embed) for the int32
+                    // commit_len array; restore the full verify qo + slots.
+                    pi.tokens.copy_from_host(std::span<const std::uint32_t>(
+                        reinterpret_cast<const std::uint32_t*>(commit_len.data()),
+                        commit_len.size()));
+                    pi.qo_indptr.copy_from_host(std::span<const std::uint32_t>(
+                        qo_view.data(), qo_view.size()));
+                    pi.slot_ids.copy_from_host(
+                        std::span<const std::int32_t>(commit_slots));
 
-                    if (!restored_from_snapshot && replay_N > 0) {
-                        std::vector<std::uint32_t> repair_tokens;
-                        std::vector<std::uint32_t> repair_positions;
-                        repair_tokens.reserve(static_cast<std::size_t>(replay_N));
-                        repair_positions.reserve(static_cast<std::size_t>(replay_N));
-                        const int qo_lo =
-                            static_cast<int>(qo_view_orig[0]);
-                        for (int j = 0; j < n_in; ++j) {
-                            repair_tokens.push_back(tok_view_orig[qo_lo + j]);
-                            repair_positions.push_back(pos_view_orig[qo_lo + j]);
-                        }
-                        const int spec_lo = spec_iptr_view.empty()
-                            ? 0
-                            : static_cast<int>(spec_iptr_view[0]);
-                        for (int j = 0; j < accepted; ++j) {
-                            repair_tokens.push_back(spec_tok_view[spec_lo + j]);
-                            repair_positions.push_back(spec_pos_view[spec_lo + j]);
-                        }
-
-                        std::uint32_t repair_lpl = kvlpl_view_orig[0];
-                        if (accepted > 0) {
-                            const int bumped =
-                                static_cast<int>(repair_lpl) + accepted;
-                            repair_lpl = static_cast<std::uint32_t>(
-                                ((bumped - 1) % page_size) + 1);
-                        }
-
-                        const int kv_lo = static_cast<int>(kvpp_view[0]);
-                        const int kv_hi = static_cast<int>(kvpp_view[1]);
-                        if (kv_hi <= kv_lo) {
-                            throw std::runtime_error(
-                                "rs_cache speculative repair missing KV pages");
-                        }
-                        std::vector<std::uint32_t> repair_kvpi(
-                            kvpi_view.begin() + kv_lo,
-                            kvpi_view.begin() + kv_hi);
-                        std::vector<std::uint32_t> repair_qo{
-                            0u, static_cast<std::uint32_t>(replay_N)};
-                        std::vector<std::uint32_t> repair_kvpp{
-                            0u,
-                            static_cast<std::uint32_t>(repair_kvpi.size())};
-                        std::vector<std::uint32_t> repair_kvlpl{repair_lpl};
-                        std::vector<std::int32_t> repair_slots{
-                            static_cast<std::int32_t>(rs_spec_rollback.slot)};
-                        std::vector<std::uint8_t> repair_fresh{
-                            static_cast<std::uint8_t>(
-                                rs_spec_rollback.was_fresh ? 1u : 0u)};
-
-                        pi.tokens.copy_from_host(
-                            std::span<const std::uint32_t>(repair_tokens));
-                        pi.positions.copy_from_host(
-                            std::span<const std::uint32_t>(repair_positions));
-                        pi.qo_indptr.copy_from_host(
-                            std::span<const std::uint32_t>(repair_qo));
-                        pi.kv_page_indices.copy_from_host(
-                            std::span<const std::uint32_t>(repair_kvpi));
-                        pi.kv_page_indptr.copy_from_host(
-                            std::span<const std::uint32_t>(repair_kvpp));
-                        pi.kv_last_page_lens.copy_from_host(
-                            std::span<const std::uint32_t>(repair_kvlpl));
-                        pi.slot_ids.copy_from_host(
-                            std::span<const std::int32_t>(repair_slots));
-                        pi.is_fresh.copy_from_host(
-                            std::span<const std::uint8_t>(repair_fresh));
-
-                        forward_fn.invoke_prepare(
-                            attn_ws,
-                            ForwardFn::PrepareInputs{
-                                .qo_indptr_h = repair_qo.data(),
-                                .kv_page_indices_h = repair_kvpi.data(),
-                                .kv_page_indices_d =
-                                    reinterpret_cast<const std::uint32_t*>(
-                                        pi.kv_page_indices.data()),
-                                .kv_page_indptr_h = repair_kvpp.data(),
-                                .kv_page_indptr_d =
-                                    reinterpret_cast<const std::uint32_t*>(
-                                        pi.kv_page_indptr.data()),
-                                .kv_last_page_lens_h = repair_kvlpl.data(),
-                                .kv_last_page_lens_d =
-                                    reinterpret_cast<const std::uint32_t*>(
-                                        pi.kv_last_page_lens.data()),
-                                .total_tokens = replay_N,
-                                .num_requests = 1,
-                                .is_pure_decode = replay_N == 1,
-                            });
-                        {
-                            pie_cuda_driver::ForwardFn::ForwardInputs fwd_in;
-                            fwd_in.token_ids = reinterpret_cast<const std::int32_t*>(pi.tokens.data());
-                            fwd_in.positions = reinterpret_cast<const std::int32_t*>(pi.positions.data());
-                            fwd_in.qo_indptr_d         = pi.qo_indptr.data();
-                            fwd_in.kv_page_indices_d   = pi.kv_page_indices.data();
-                            fwd_in.kv_page_indptr_d    = pi.kv_page_indptr.data();
-                            fwd_in.kv_last_page_lens_d = pi.kv_last_page_lens.data();
-                            fwd_in.qo_indptr_h         = repair_qo.data();
-                            fwd_in.kv_page_indices_h   = repair_kvpi.data();
-                            fwd_in.kv_page_indptr_h    = repair_kvpp.data();
-                            fwd_in.kv_last_page_lens_h = repair_kvlpl.data();
-                            fwd_in.total_tokens        = replay_N;
-                            fwd_in.num_requests        = 1;
-                            fwd_in.is_pure_decode      = (replay_N == 1);
-                            fwd_in.slot_ids_h          = repair_slots.data();
-                            fwd_in.is_fresh_h          = repair_fresh.data();
-                            fwd_in.slot_ids_d          = pi.slot_ids.data();
-                            forward_fn.invoke_body(ws, kv_cache, attn_ws, cublas, fwd_in);
-                        }
-                        if (!native_commit_cache &&
-                            executor.tp_comm == nullptr &&
-                            executor.system_drafter.commit_verified_prefix) {
-                            profile_mtp_process_call(
-                                "repair", cublas.stream(), replay_N, 1, [&] {
-                                    executor.system_drafter.commit_verified_prefix(
-                                        NativeSystemCommitInputs{
-                                            .target_ws = ws,
-                                            .kv_cache = kv_cache,
-                                            .cublas = cublas,
-                                            .token_ids =
-                                                reinterpret_cast<const std::int32_t*>(
-                                                    pi.tokens.data()),
-                                            .positions =
-                                                reinterpret_cast<const std::int32_t*>(
-                                                    pi.positions.data()),
-                                            .qo_indptr = pi.qo_indptr.data(),
-                                            .kv_page_indices =
-                                                pi.kv_page_indices.data(),
-                                            .kv_page_indptr =
-                                                pi.kv_page_indptr.data(),
-                                            .kv_last_page_lens =
-                                                pi.kv_last_page_lens.data(),
-                                            .slot_ids = pi.slot_ids.data(),
-                                            .source_row_indices = nullptr,
-                                            .total_tokens = replay_N,
-                                            .num_requests = 1,
-                                        });
-                                });
-                        }
-                        CUDA_CHECK(cudaStreamSynchronize(cublas.stream()));
-                    }
+                    pie_cuda_driver::ForwardFn::ForwardInputs fwd_in;
+                    fwd_in.qo_indptr_d   = pi.qo_indptr.data();
+                    fwd_in.qo_indptr_h   = qo_view.data();
+                    fwd_in.total_tokens  = N;       // full verify window
+                    fwd_in.num_requests  = R;
+                    fwd_in.is_pure_decode = false;  // N > R (has drafts)
+                    fwd_in.slot_ids_h    = commit_slots.data();
+                    fwd_in.slot_ids_d    = pi.slot_ids.data();
+                    fwd_in.num_logit_rows = -1;
+                    fwd_in.commit_advance_gather_d =
+                        reinterpret_cast<const std::int32_t*>(pi.tokens.data());
+                    forward_fn.invoke_body(ws, kv_cache, attn_ws, cublas,
+                                           fwd_in);
                 }
             }
             executor.response_builder.build(per_req, out_resp);

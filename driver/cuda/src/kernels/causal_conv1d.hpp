@@ -92,6 +92,9 @@ void launch_causal_conv1d_update_batched_bf16(
 // Each (channel, request) block reads its own (t0_r, Nr_r) window from
 // qo_indptr and walks tokens internally. The trailing K-window is
 // persisted into the request's state slab for the follow-up decode.
+// write_state=false runs a frozen verify: compute y but leave the committed
+// conv state at its pre-verify value (the repair forward advances it through
+// [input|accepted]). Default true = normal trailing-window writeback.
 void launch_causal_conv1d_prefill_batched_bf16(
     const void* x,
     const void* weight,
@@ -102,24 +105,10 @@ void launch_causal_conv1d_prefill_batched_bf16(
     const std::uint32_t* qo_indptr,
     long long   slot_stride_elems,
     int R, int C, int K,
-    cudaStream_t stream);
-
-// Same as batched prefill, with optional prefix-state snapshots. When
-// `snapshot_base_slot >= 0`, request-count must be 1; after prefix length p
-// (1-indexed), the trailing conv window is written into
-// `snapshot_base_slot + p - 1`, for p <= snapshot_count.
-void launch_causal_conv1d_prefill_batched_snapshot_bf16(
-    const void* x,
-    const void* weight,
-    const void* bias,
-    void*       y,
-    void*       state_out_base,
-    const std::int32_t*  slot_ids,
-    const std::uint32_t* qo_indptr,
-    long long   slot_stride_elems,
-    int R, int C, int K,
-    int snapshot_base_slot,
-    int snapshot_count,
-    cudaStream_t stream);
+    cudaStream_t stream, bool write_state = true,
+    // Boundary-write for the commit-advance: if non-null, request r folds only
+    // commit_len[r] tokens (the confirmed [input|accepted] prefix) into the
+    // conv state.
+    const int* commit_len = nullptr);
 
 }  // namespace pie_cuda_driver::kernels

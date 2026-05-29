@@ -78,8 +78,6 @@ pub fn create_mock_env(
             rs_cache_slots: 0,
             rs_cache_slot_bytes: 0,
             rs_cache_spec_rollback: false,
-            system_speculation_supported: false,
-            default_system_speculation: false,
             limits: pie::driver::SchedulerLimits {
                 max_forward_requests: 32,
                 max_forward_tokens: 4096,
@@ -114,7 +112,8 @@ pub fn create_mock_env(
             arch_name: String::new(),
             kv_page_size: 16,
             tokenizer_path,
-            default_system_speculation: false,
+            system_speculation_supported: false,
+            enable_system_speculation: false,
             drivers,
             scheduler: SchedulerConfig {
                 batch_policy: "adaptive".into(),

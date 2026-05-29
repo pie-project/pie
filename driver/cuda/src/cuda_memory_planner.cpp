@@ -1,4 +1,5 @@
 #include "cuda_memory_planner.hpp"
+#include "recurrent_state_cache.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -447,11 +448,19 @@ CudaMemoryPlan plan_cuda_memory(
             std::max(0, hf.linear_num_value_heads / tp_size)) *
         std::max(0, hf.linear_value_head_dim);
     const std::size_t conv_dim = 2 * K_dim + V_dim;
+    // Recurrent slabs are bf16 by default (PIE_QWEN35_RS_STATE_DTYPE);
+    // size slots with the same dtype `RecurrentStateCache::allocate`
+    // will use, or the planner over-reserves ~2x the recurrent
+    // footprint and caps state_slots / KV pages too low.
+    const std::size_t recurrent_elem_bytes =
+        pie_cuda_driver::RecurrentStateCache::recurrent_state_bf16_default()
+            ? sizeof(std::uint16_t)
+            : sizeof(float);
     const std::size_t per_slot_recurrent =
         static_cast<std::size_t>(
             std::max(0, hf.linear_num_value_heads / tp_size)) *
         std::max(0, hf.linear_key_head_dim) *
-        std::max(0, hf.linear_value_head_dim) * sizeof(float);
+        std::max(0, hf.linear_value_head_dim) * recurrent_elem_bytes;
     const std::size_t per_slot_conv =
         static_cast<std::size_t>(std::max(0, hf.linear_conv_kernel_dim)) *
         conv_dim * sizeof(std::uint16_t);

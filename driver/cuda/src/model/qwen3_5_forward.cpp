@@ -453,6 +453,7 @@ void linear_attn_layer_body(
     Qwen3_5LinearAttnWorkspace& la,
     RecurrentStateCache& state_cache,
     int layer_idx,
+    int linear_idx,   // compact linear-layer index (activation-replay stash key)
     int N, int R,
     bool is_pure_decode,
     const std::int32_t*  slot_ids_h,
@@ -461,7 +462,11 @@ void linear_attn_layer_body(
     const std::uint32_t* qo_indptr_d,
     ops::CublasHandle& cublas,
     cudaStream_t stream,
-    ForwardProfile* profile = nullptr)
+    ForwardProfile* profile = nullptr,
+    // Recurrent-only commit-advance: when non-null, request r folds only
+    // commit_len[r] tokens (confirmed [input|accepted]) into the committed
+    // state. Forces the FLA path (the only one threading commit_len).
+    const int* commit_len = nullptr)
 {
     // TP-local dims for linear-attention. tp_size == 1 keeps everything
     // unsharded. The K/V head counts must divide tp_size (checked at
@@ -480,16 +485,45 @@ void linear_attn_layer_body(
     auto slot_for = [&](int r) -> int {
         return slot_ids_h ? slot_ids_h[r] : 0;
     };
-    const int snapshot_base_slot =
-        (R == 1) ? state_cache.spec_snapshot_base_slot() : -1;
-    const int snapshot_count =
-        snapshot_base_slot >= 0 ? state_cache.spec_snapshot_count() : 0;
+    // Frozen verify: produce outputs but persist no recurrent/conv state, so
+    // each committed slot stays at its pre-verify value (the executor's repair
+    // forward advances it through [input|accepted]). Normal forwards write
+    // state as usual. Activation replay is the sole spec path now: the FLA, conv
+    // and warp-tiled all honor write_state uniformly — frozen verify persists
+    // nothing, the commit-advance replay (verify_frozen reset to false) writes.
+    const bool write_state = !state_cache.verify_frozen();
 
-    // ── In-projections ────────────────────────────────────────────
-    // Linear-attn projections stay bf16 (no QuantMeta companion in
-    // Qwen3_5LayerWeights) — the implicit WeightView ctor pulls the
-    // bf16 tensor through unchanged.
+    // ── In-projections (or activation-replay load) ────────────────
+    // Activation-replay stash layout per linear layer (bf16, max_tokens stride):
+    //   [ mixed_qkv (conv_dim) | a (V_h) | b (V_h) ]
+    // Frozen verify (stash-write): cache these cheap in-proj activations after
+    // the GEMM. Commit-advance replay (commit_len != null): load them and SKIP
+    // the in_proj GEMM entirely — conv+prep+recurrence run from the cache.
+    const bool stash_enabled = state_cache.verify_hidden_stash_enabled();
+    auto* stash = stash_enabled
+        ? static_cast<std::uint16_t*>(
+              state_cache.verify_hidden_stash_layer(linear_idx))
+        : nullptr;
+    const std::size_t stash_stride =
+        static_cast<std::size_t>(state_cache.verify_stash_max_tokens());
+    const std::size_t stash_a_off = stash_stride * conv_dim;
+    const std::size_t stash_b_off = stash_a_off + stash_stride * V_h;
+    const bool replay_load = (commit_len != nullptr) && stash != nullptr;
+    const bool stash_write =
+        state_cache.verify_frozen() && stash != nullptr && commit_len == nullptr;
     profile_forward_stage_ptr(profile, &ForwardProfile::linear_proj_ms, stream, [&] {
+        if (replay_load) {
+            CUDA_CHECK(cudaMemcpyAsync(la.mixed_qkv.data(), stash,
+                static_cast<std::size_t>(N) * conv_dim * sizeof(std::uint16_t),
+                cudaMemcpyDeviceToDevice, stream));
+            CUDA_CHECK(cudaMemcpyAsync(la.a.data(), stash + stash_a_off,
+                static_cast<std::size_t>(N) * V_h * sizeof(std::uint16_t),
+                cudaMemcpyDeviceToDevice, stream));
+            CUDA_CHECK(cudaMemcpyAsync(la.b.data(), stash + stash_b_off,
+                static_cast<std::size_t>(N) * V_h * sizeof(std::uint16_t),
+                cudaMemcpyDeviceToDevice, stream));
+            return;
+        }
         if (Lw.la_in_proj_qkvz != nullptr && Lw.la_in_proj_ba != nullptr) {
             ops::gemm_act_x_w(cublas.handle(),
                 ws.norm_x.data(), *Lw.la_in_proj_qkvz,
@@ -517,6 +551,18 @@ void linear_attn_layer_body(
             ops::gemm_act_x_w(cublas.handle(),
                 ws.norm_x.data(), *Lw.la_in_proj_b,
                 la.b.data(), N, V_h, H);
+        }
+        if (stash_write) {
+            // Cache the cheap in-proj activations for the replay.
+            CUDA_CHECK(cudaMemcpyAsync(stash, la.mixed_qkv.data(),
+                static_cast<std::size_t>(N) * conv_dim * sizeof(std::uint16_t),
+                cudaMemcpyDeviceToDevice, stream));
+            CUDA_CHECK(cudaMemcpyAsync(stash + stash_a_off, la.a.data(),
+                static_cast<std::size_t>(N) * V_h * sizeof(std::uint16_t),
+                cudaMemcpyDeviceToDevice, stream));
+            CUDA_CHECK(cudaMemcpyAsync(stash + stash_b_off, la.b.data(),
+                static_cast<std::size_t>(N) * V_h * sizeof(std::uint16_t),
+                cudaMemcpyDeviceToDevice, stream));
         }
     });
 
@@ -555,7 +601,7 @@ void linear_attn_layer_body(
             // into the request's slot. Falls back to host-loop for the
             // legacy single-request parity entrypoint.
             if (slot_ids_d != nullptr && qo_indptr_d != nullptr) {
-                kernels::launch_causal_conv1d_prefill_batched_snapshot_bf16(
+                kernels::launch_causal_conv1d_prefill_batched_bf16(
                     qkv_in_base, Lw.la_conv1d_w->data(),
                     Lw.la_conv1d_b ? Lw.la_conv1d_b->data() : nullptr,
                     qkv_post_base,
@@ -563,8 +609,7 @@ void linear_attn_layer_body(
                     slot_ids_d, qo_indptr_d,
                     static_cast<long long>(state_cache.conv_kernel()) *
                         state_cache.conv_dim(),
-                    R, conv_dim, conv_K,
-                    snapshot_base_slot, snapshot_count, stream);
+                    R, conv_dim, conv_K, stream, write_state, commit_len);
             } else {
                 for (int r = 0; r < R; ++r) {
                     const int t0 = static_cast<int>(qo_indptr_h[r]);
@@ -591,12 +636,27 @@ void linear_attn_layer_body(
         slot_ids_d != nullptr &&
         qo_indptr_d != nullptr &&
         N <= qwen35_gdn_warp_tiled_max_tokens() &&
-        K_d <= 256;
+        K_d <= 256 &&
+        // The commit-advance threads commit_len only through the FLA path.
+        commit_len == nullptr;
     const bool use_decode_gqa_recurrent =
         is_pure_decode &&
         slot_ids_d != nullptr &&
         V_h != K_h &&
         V_h % K_h == 0;
+    // The batched FLA prefill path (the high-concurrency verify/repair kernel)
+    // is now GQA-aware: it reads the compact K_h-head q/k directly, so it too
+    // skips the repeat_interleave materialisation. This path runs for slotted
+    // prefill that is neither warp-tiled (N small) nor cached (env-gated, off
+    // by default), i.e. exactly the c≥64 spec path. The branches are mutually
+    // exclusive and chosen globally from N, so skipping is safe.
+    const bool use_batched_fla_gqa =
+        !is_pure_decode &&
+        slot_ids_d != nullptr &&
+        qo_indptr_d != nullptr &&
+        !use_warp_tiled_recurrent &&
+        V_h != K_h &&
+        N > qwen35_gdn_cached_prefill_max_tokens();
     profile_forward_stage_ptr(profile, &ForwardProfile::linear_prep_ms, stream, [&] {
         kernels::launch_qwen_gdn_post_conv_prep_bf16(
             qkv_base, la.a.data(), la.b.data(),
@@ -609,7 +669,7 @@ void linear_attn_layer_body(
         // and GQA decode recurrent kernels can index the compact K_h layout
         // directly, so skip materialisation there.
         if (V_h != K_h && !use_warp_tiled_recurrent &&
-            !use_decode_gqa_recurrent) {
+            !use_decode_gqa_recurrent && !use_batched_fla_gqa) {
             kernels::launch_repeat_interleave_heads_fp32(
                 la.q_pre.data(), la.q_norm.data(), N, K_h, V_h, K_d, stream);
             kernels::launch_repeat_interleave_heads_fp32(
@@ -718,7 +778,7 @@ void linear_attn_layer_body(
                 if (slot_ids_d != nullptr && qo_indptr_d != nullptr) {
                     if (use_warp_tiled_recurrent && V_h != K_h) {
                         if (state_bf16) {
-                            kernels::launch_chunk_gated_delta_prefill_batched_warp_tiled_gqa_snapshot_state_bf16(
+                            kernels::launch_chunk_gated_delta_prefill_batched_warp_tiled_gqa_state_bf16(
                                 la.q_pre.data(),
                                 la.k_pre.data(),
                                 la.v_fp32.data(),
@@ -729,9 +789,9 @@ void linear_attn_layer_body(
                                 slot_stride,
                                 la.core_out.data(),
                                 R, K_h, V_h, K_d, V_d,
-                                snapshot_base_slot, snapshot_count, stream);
+                                stream, write_state);
                         } else {
-                            kernels::launch_chunk_gated_delta_prefill_batched_warp_tiled_gqa_snapshot(
+                            kernels::launch_chunk_gated_delta_prefill_batched_warp_tiled_gqa(
                                 la.q_pre.data(),
                                 la.k_pre.data(),
                                 la.v_fp32.data(),
@@ -742,11 +802,11 @@ void linear_attn_layer_body(
                                 slot_stride,
                                 la.core_out.data(),
                                 R, K_h, V_h, K_d, V_d,
-                                snapshot_base_slot, snapshot_count, stream);
+                                stream, write_state);
                         }
                     } else if (use_warp_tiled_recurrent) {
                         if (state_bf16) {
-                            kernels::launch_chunk_gated_delta_prefill_batched_warp_tiled_snapshot_state_bf16(
+                            kernels::launch_chunk_gated_delta_prefill_batched_warp_tiled_state_bf16(
                                 q_recur_full,
                                 k_recur_full,
                                 la.v_fp32.data(),
@@ -757,9 +817,9 @@ void linear_attn_layer_body(
                                 slot_stride,
                                 la.core_out.data(),
                                 R, V_h, K_d, V_d,
-                                snapshot_base_slot, snapshot_count, stream);
+                                stream, write_state);
                         } else {
-                            kernels::launch_chunk_gated_delta_prefill_batched_warp_tiled_snapshot(
+                            kernels::launch_chunk_gated_delta_prefill_batched_warp_tiled(
                                 q_recur_full,
                                 k_recur_full,
                                 la.v_fp32.data(),
@@ -770,11 +830,11 @@ void linear_attn_layer_body(
                                 slot_stride,
                                 la.core_out.data(),
                                 R, V_h, K_d, V_d,
-                                snapshot_base_slot, snapshot_count, stream);
+                                stream, write_state);
                         }
                     } else if (N <= qwen35_gdn_cached_prefill_max_tokens()) {
                         if (state_bf16) {
-                            kernels::launch_chunk_gated_delta_prefill_batched_cached_snapshot_state_bf16(
+                            kernels::launch_chunk_gated_delta_prefill_batched_cached_state_bf16(
                                 q_recur_full,
                                 k_recur_full,
                                 la.v_fp32.data(),
@@ -785,9 +845,9 @@ void linear_attn_layer_body(
                                 slot_stride,
                                 la.core_out.data(),
                                 R, V_h, K_d, V_d,
-                                snapshot_base_slot, snapshot_count, stream);
+                                stream, write_state);
                         } else {
-                            kernels::launch_chunk_gated_delta_prefill_batched_cached_snapshot(
+                            kernels::launch_chunk_gated_delta_prefill_batched_cached(
                                 q_recur_full,
                                 k_recur_full,
                                 la.v_fp32.data(),
@@ -798,13 +858,17 @@ void linear_attn_layer_body(
                                 slot_stride,
                                 la.core_out.data(),
                                 R, V_h, K_d, V_d,
-                                snapshot_base_slot, snapshot_count, stream);
+                                stream, write_state);
                         }
                     } else {
                         if (state_bf16) {
+                            // GQA-aware FLA: pass the compact K_h-head q/k
+                            // (q_pre == q_recur_full when V_h==K_h). The kernel
+                            // maps each V-head to its K-head, so repeat_interleave
+                            // is skipped above (use_batched_fla_gqa).
                             kernels::launch_chunk_gated_delta_prefill_batched_state_bf16(
-                                q_recur_full,
-                                k_recur_full,
+                                la.q_pre.data(),
+                                la.k_pre.data(),
                                 la.v_fp32.data(),
                                 la.g_log.data(),
                                 la.beta.data(),
@@ -812,11 +876,12 @@ void linear_attn_layer_body(
                                 slot_ids_d, qo_indptr_d,
                                 slot_stride,
                                 la.core_out.data(),
-                                R, V_h, K_d, V_d, stream);
+                                R, K_h, V_h, K_d, V_d, stream, write_state,
+                                commit_len);
                         } else {
                             kernels::launch_chunk_gated_delta_prefill_batched(
-                                q_recur_full,
-                                k_recur_full,
+                                la.q_pre.data(),
+                                la.k_pre.data(),
                                 la.v_fp32.data(),
                                 la.g_log.data(),
                                 la.beta.data(),
@@ -824,7 +889,8 @@ void linear_attn_layer_body(
                                 slot_ids_d, qo_indptr_d,
                                 slot_stride,
                                 la.core_out.data(),
-                                R, V_h, K_d, V_d, stream);
+                                R, K_h, V_h, K_d, V_d, stream, write_state,
+                                commit_len);
                         }
                     }
                 } else {
@@ -1160,7 +1226,8 @@ void qwen3_5_forward_paged(
     const std::uint8_t* is_fresh_h,
     const std::int32_t* slot_ids_d,
     const std::int32_t* logit_row_indices_d,
-    int num_logit_rows)
+    int num_logit_rows,
+    const std::int32_t* commit_advance_gather)
 {
     const int H  = cfg.hidden_size;
     const int V  = cfg.vocab_size;
@@ -1171,6 +1238,13 @@ void qwen3_5_forward_paged(
     ForwardProfile profile;
     profile.begin(N, R, is_pure_decode, num_logit_rows, stream);
 
+    // Recurrent-only commit-advance: re-run only the linear-attn block of each
+    // linear layer over the accepted tokens (gathered from the verify stash),
+    // advancing rs_cache state. No embed, no per-slot reset (the committed
+    // state is the frozen pre-verify value we're advancing), no attention/MLP,
+    // no lm_head.
+    const bool commit_advance = commit_advance_gather != nullptr;
+
     // Per-slot reset for any request whose slot was just (re)assigned.
     // The runtime guarantees a slot is_fresh only on the first fire of a
     // context (which is always a prefill), so zeroing here matches the
@@ -1179,7 +1253,9 @@ void qwen3_5_forward_paged(
     // null) keeps the old "reset all on prefill" behaviour for the
     // parity entry point; max_slots == 1 there makes the two equivalent.
     profile_forward_stage(profile, profile.reset_ms, stream, [&] {
-        if (slot_ids_h != nullptr && is_fresh_h != nullptr) {
+        if (commit_advance) {
+            // No reset: advancing the existing committed state.
+        } else if (slot_ids_h != nullptr && is_fresh_h != nullptr) {
             for (int r = 0; r < R; ++r) {
                 if (is_fresh_h[r]) {
                     state_cache.reset_slot(slot_ids_h[r], stream);
@@ -1203,15 +1279,37 @@ void qwen3_5_forward_paged(
             : nullptr;
 
     // 1. Embed.
-    profile_forward_stage(profile, profile.embed_ms, stream, [&] {
-        kernels::launch_embed_bf16(
-            token_ids, w.embed->data(), ws.y.data(),
-            N, H, cfg.vocab_size, stream);
-    });
+    if (!commit_advance) {
+        profile_forward_stage(profile, profile.embed_ms, stream, [&] {
+            kernels::launch_embed_bf16(
+                token_ids, w.embed->data(), ws.y.data(),
+                N, H, cfg.vocab_size, stream);
+        });
+    }
 
     // 2. Per-layer.
+    int linear_idx = 0;  // compact linear-layer index (stash/gather key)
     for (std::size_t L = 0; L < w.layers.size(); ++L) {
         const auto& Lw = w.layers[L];
+        const bool is_linear =
+            Lw.kind == Qwen3_5LayerWeights::Kind::LinearAttn;
+
+        if (commit_advance) {
+            // Activation-replay commit-advance (only linear layers advance
+            // state). linear_attn_layer_body loads this layer's cached in-proj
+            // activations (mixed_qkv + a,b) from the stash and replays only
+            // conv+prep+recurrence over the confirmed prefix — commit_len =
+            // commit_advance_gather (= n_in+accepted) clamps the conv/fla fold
+            // to [input|accepted]. No in_proj GEMM, no attention/MLP/lm_head.
+            if (!is_linear) continue;
+            linear_attn_layer_body(
+                Lw, cfg, fwd_cfg, ws, la_ws, state_cache,
+                static_cast<int>(L), linear_idx, N, R, is_pure_decode,
+                slot_ids_h, slot_ids_d, qo_indptr_h, qo_indptr,
+                cublas, stream, &profile, /*commit_len=*/commit_advance_gather);
+            ++linear_idx;
+            continue;
+        }
 
         // Pre-attention norm: y → norm_x.
         profile_forward_stage(profile, profile.attn_norm_ms, stream, [&] {
@@ -1220,12 +1318,16 @@ void qwen3_5_forward_paged(
                 N, H, eps, stream);
         });
 
-        if (Lw.kind == Qwen3_5LayerWeights::Kind::LinearAttn) {
+        if (is_linear) {
             ++profile.linear_layers;
+            // Frozen verify caches the cheap in-proj activations INSIDE
+            // linear_attn_layer_body (after in_proj), keyed on this li.
+            const int li = linear_idx;
+            ++linear_idx;
             profile_forward_stage(profile, profile.linear_attn_ms, stream, [&] {
                 linear_attn_layer_body(
                     Lw, cfg, fwd_cfg, ws, la_ws, state_cache,
-                    static_cast<int>(L), N, R, is_pure_decode,
+                    static_cast<int>(L), li, N, R, is_pure_decode,
                     slot_ids_h, slot_ids_d, qo_indptr_h, qo_indptr,
                     cublas, stream, &profile);
             });
@@ -1259,6 +1361,17 @@ void qwen3_5_forward_paged(
     }
 
     // 3. Final norm.
+    // State-only forward (num_logit_rows < 0): the speculative repair re-runs
+    // the backbone purely to advance the rs_cache state (written in the layer
+    // loop above). Its logits/hidden are discarded, so skip final_norm,
+    // lm_head, and the final hidden copy entirely — that dense lm_head over all
+    // N repair tokens is the single largest piece of wasted work.
+    if (num_logit_rows < 0 || commit_advance) {
+        profile.end(stream);
+        maybe_print_forward_profile(profile);
+        return;
+    }
+
     profile_forward_stage(profile, profile.final_norm_ms, stream, [&] {
         kernels::launch_rmsnorm_gemma_bf16(
             ws.y.data(), w.final_norm->data(), ws.norm_x.data(),

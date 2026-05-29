@@ -1020,7 +1020,6 @@ fn chunk_capacity_usage(
         user_custom_mask_bytes,
         spec_custom_mask_bytes,
         has_spec_drafts: false,
-        has_rs_spec_drafts: false,
         has_dense_logit_requirement,
         has_prob_sampling,
         is_single_token_decode: chunk_len == 1

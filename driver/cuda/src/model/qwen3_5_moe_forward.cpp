@@ -591,10 +591,9 @@ void linear_attn_body(
     auto slot_for = [&](int r) -> int {
         return slot_ids_h ? slot_ids_h[r] : 0;
     };
-    const int snapshot_base_slot =
-        (R == 1) ? state_cache.spec_snapshot_base_slot() : -1;
-    const int snapshot_count =
-        snapshot_base_slot >= 0 ? state_cache.spec_snapshot_count() : 0;
+    // Frozen verify: produce outputs but persist no recurrent/conv state (the
+    // repair forward advances it through [input|accepted]). See qwen3_5_forward.
+    const bool write_state = !state_cache.verify_frozen();
 
     const void* z_data = la.z.data();
     const void* a_data = la.a.data();
@@ -656,7 +655,7 @@ void linear_attn_body(
             }
         } else {
             if (slot_ids_d != nullptr && qo_indptr_d != nullptr) {
-                kernels::launch_causal_conv1d_prefill_batched_snapshot_bf16(
+                kernels::launch_causal_conv1d_prefill_batched_bf16(
                     qkv_in_base, Lw.la_conv1d_w->data(),
                     Lw.la_conv1d_b ? Lw.la_conv1d_b->data() : nullptr,
                     qkv_post_base,
@@ -664,8 +663,7 @@ void linear_attn_body(
                     slot_ids_d, qo_indptr_d,
                     static_cast<long long>(state_cache.conv_kernel()) *
                         state_cache.conv_dim(),
-                    R, conv_dim, conv_K,
-                    snapshot_base_slot, snapshot_count, stream);
+                    R, conv_dim, conv_K, stream, write_state);
             } else {
                 for (int r = 0; r < R; ++r) {
                     const int t0 = static_cast<int>(qo_indptr_h[r]);
@@ -811,7 +809,7 @@ void linear_attn_body(
                 if (slot_ids_d != nullptr && qo_indptr_d != nullptr) {
                     if (use_warp_tiled_recurrent && V_h != K_h) {
                         if (state_bf16) {
-                            kernels::launch_chunk_gated_delta_prefill_batched_warp_tiled_gqa_snapshot_state_bf16(
+                            kernels::launch_chunk_gated_delta_prefill_batched_warp_tiled_gqa_state_bf16(
                                 la.q_pre.data(),
                                 la.k_pre.data(),
                                 la.v_fp32.data(),
@@ -822,9 +820,9 @@ void linear_attn_body(
                                 slot_stride,
                                 la.core_out.data(),
                                 R, K_h, V_h, K_d, V_d,
-                                snapshot_base_slot, snapshot_count, stream);
+                                stream, write_state);
                         } else {
-                            kernels::launch_chunk_gated_delta_prefill_batched_warp_tiled_gqa_snapshot(
+                            kernels::launch_chunk_gated_delta_prefill_batched_warp_tiled_gqa(
                                 la.q_pre.data(),
                                 la.k_pre.data(),
                                 la.v_fp32.data(),
@@ -835,11 +833,11 @@ void linear_attn_body(
                                 slot_stride,
                                 la.core_out.data(),
                                 R, K_h, V_h, K_d, V_d,
-                                snapshot_base_slot, snapshot_count, stream);
+                                stream, write_state);
                         }
                     } else if (use_warp_tiled_recurrent) {
                         if (state_bf16) {
-                            kernels::launch_chunk_gated_delta_prefill_batched_warp_tiled_snapshot_state_bf16(
+                            kernels::launch_chunk_gated_delta_prefill_batched_warp_tiled_state_bf16(
                                 q_recur_full,
                                 k_recur_full,
                                 la.v_fp32.data(),
@@ -850,9 +848,9 @@ void linear_attn_body(
                                 slot_stride,
                                 la.core_out.data(),
                                 R, V_h, K_d, V_d,
-                                snapshot_base_slot, snapshot_count, stream);
+                                stream, write_state);
                         } else {
-                            kernels::launch_chunk_gated_delta_prefill_batched_warp_tiled_snapshot(
+                            kernels::launch_chunk_gated_delta_prefill_batched_warp_tiled(
                                 q_recur_full,
                                 k_recur_full,
                                 la.v_fp32.data(),
@@ -863,11 +861,11 @@ void linear_attn_body(
                                 slot_stride,
                                 la.core_out.data(),
                                 R, V_h, K_d, V_d,
-                                snapshot_base_slot, snapshot_count, stream);
+                                stream, write_state);
                         }
                     } else if (N <= qwen35_gdn_cached_prefill_max_tokens()) {
                         if (state_bf16) {
-                            kernels::launch_chunk_gated_delta_prefill_batched_cached_snapshot_state_bf16(
+                            kernels::launch_chunk_gated_delta_prefill_batched_cached_state_bf16(
                                 q_recur_full,
                                 k_recur_full,
                                 la.v_fp32.data(),
@@ -878,9 +876,9 @@ void linear_attn_body(
                                 slot_stride,
                                 la.core_out.data(),
                                 R, V_h, K_d, V_d,
-                                snapshot_base_slot, snapshot_count, stream);
+                                stream, write_state);
                         } else {
-                            kernels::launch_chunk_gated_delta_prefill_batched_cached_snapshot(
+                            kernels::launch_chunk_gated_delta_prefill_batched_cached(
                                 q_recur_full,
                                 k_recur_full,
                                 la.v_fp32.data(),
@@ -891,10 +889,13 @@ void linear_attn_body(
                                 slot_stride,
                                 la.core_out.data(),
                                 R, V_h, K_d, V_d,
-                                snapshot_base_slot, snapshot_count, stream);
+                                stream, write_state);
                         }
                     } else {
                         if (state_bf16) {
+                            // K_h==V_h identity: the MoE path still materialises
+                            // the expanded q/k (no use_batched_fla_gqa here), so
+                            // the GQA-aware kernel sees h_k==h and is unchanged.
                             kernels::launch_chunk_gated_delta_prefill_batched_state_bf16(
                                 q_recur_full,
                                 k_recur_full,
@@ -905,7 +906,7 @@ void linear_attn_body(
                                 slot_ids_d, qo_indptr_d,
                                 slot_stride,
                                 la.core_out.data(),
-                                R, V_h, K_d, V_d, stream);
+                                R, V_h, V_h, K_d, V_d, stream);
                         } else {
                             kernels::launch_chunk_gated_delta_prefill_batched(
                                 q_recur_full,
@@ -917,7 +918,7 @@ void linear_attn_body(
                                 slot_ids_d, qo_indptr_d,
                                 slot_stride,
                                 la.core_out.data(),
-                                R, V_h, K_d, V_d, stream);
+                                R, V_h, V_h, K_d, V_d, stream);
                         }
                     }
                 } else {
@@ -1632,8 +1633,13 @@ void qwen3_5_moe_forward_paged(
     const std::uint8_t* is_fresh_h,
     const std::int32_t* slot_ids_d,
     const std::int32_t* logit_row_indices_d,
-    int num_logit_rows)
+    int num_logit_rows,
+    const std::int32_t* commit_advance_gather)
 {
+    // Recurrent-only commit-advance (see qwen3_5_forward.cpp): re-run only the
+    // linear-attn block over the accepted tokens (gathered from the verify
+    // stash), advancing rs_cache state — no embed/reset/attention/MLP/lm_head.
+    const bool commit_advance = commit_advance_gather != nullptr;
     // Pure-Qwen3-MoE (Qwen3-30B-A3B, model_type == "qwen3_moe") has no
     // linear-attn layers; the per-slot rs_cache is unused. Qwen3.5 /
     // 3.6-MoE additionally fires the linear-attn body — those layers
@@ -1653,7 +1659,7 @@ void qwen3_5_moe_forward_paged(
     const int tp_rank = (fwd_cfg.tp_comm != nullptr) ? fwd_cfg.tp_comm->rank() : 0;
     profile.begin(N, R, is_pure_decode, tp_rank, stream);
 
-    if (has_linear_attn_layers) {
+    if (has_linear_attn_layers && !commit_advance) {
         if (slot_ids_h != nullptr && is_fresh_h != nullptr) {
             for (int r = 0; r < R; ++r) {
                 if (is_fresh_h[r]) {
@@ -1674,14 +1680,36 @@ void qwen3_5_moe_forward_paged(
             ? plan_state.prefill_plan.get()
             : nullptr;
 
-    profile_cuda_stage(&profile, &profile.embed_ms, stream, [&] {
-        kernels::launch_embed_bf16(
-            token_ids, w.embed->data(), ws.y.data(),
-            N, H, cfg.vocab_size, stream);
-    });
+    if (!commit_advance) {
+        profile_cuda_stage(&profile, &profile.embed_ms, stream, [&] {
+            kernels::launch_embed_bf16(
+                token_ids, w.embed->data(), ws.y.data(),
+                N, H, cfg.vocab_size, stream);
+        });
+    }
 
+    int linear_idx = 0;  // compact linear-layer index (stash/gather key)
     for (std::size_t L = 0; L < w.layers.size(); ++L) {
         const auto& Lw = w.layers[L];
+        const bool is_linear =
+            Lw.kind == Qwen3_5MoeLayerWeights::Kind::LinearAttn;
+
+        if (commit_advance) {
+            if (!is_linear) continue;
+            const std::uint16_t* stash = static_cast<const std::uint16_t*>(
+                state_cache.verify_hidden_stash_layer(linear_idx));
+            kernels::launch_gather_bf16_rows(
+                stash, commit_advance_gather,
+                static_cast<std::uint16_t*>(ws.norm_x.data()),
+                N, H, stream);
+            linear_attn_body(
+                Lw, cfg, fwd_cfg, ws, la_ws, state_cache,
+                static_cast<int>(L), N, R, is_pure_decode,
+                slot_ids_h, slot_ids_d, qo_indptr_h, qo_indptr,
+                cublas, stream, &profile);
+            ++linear_idx;
+            continue;
+        }
 
         profile_cuda_stage(&profile, &profile.norm_ms, stream, [&] {
             rmsnorm_bf16_dispatch(cfg,
@@ -1689,8 +1717,21 @@ void qwen3_5_moe_forward_paged(
                 N, H, eps, stream);
         });
 
-        if (Lw.kind == Qwen3_5MoeLayerWeights::Kind::LinearAttn) {
+        if (is_linear) {
             ++profile.linear_layers;
+            if (state_cache.verify_frozen() &&
+                state_cache.verify_hidden_stash_enabled()) {
+                void* stash =
+                    state_cache.verify_hidden_stash_layer(linear_idx);
+                if (stash != nullptr) {
+                    CUDA_CHECK(cudaMemcpyAsync(
+                        stash, ws.norm_x.data(),
+                        static_cast<std::size_t>(N) * H *
+                            sizeof(std::uint16_t),
+                        cudaMemcpyDeviceToDevice, stream));
+                }
+            }
+            ++linear_idx;
             profile_cuda_stage(&profile, &profile.linear_attn_ms, stream, [&] {
                 linear_attn_body(
                     Lw, cfg, fwd_cfg, ws, la_ws, state_cache,
@@ -1731,6 +1772,15 @@ void qwen3_5_moe_forward_paged(
                     (std::size_t)N * H, stream);
             });
         }
+    }
+
+    // State-only forward (num_logit_rows < 0) or recurrent-only commit-advance:
+    // logits/hidden are discarded, so skip final_norm + lm_head + final copy.
+    // See qwen3_5_forward.
+    if (num_logit_rows < 0 || commit_advance) {
+        profile.end(stream);
+        maybe_print_profile(profile);
+        return;
     }
 
     profile_cuda_stage(&profile, &profile.lm_head_ms, stream, [&] {

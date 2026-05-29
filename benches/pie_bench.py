@@ -115,6 +115,8 @@ def build_config(args: argparse.Namespace):
             )
         if args.mtp_num_drafts is not None:
             driver_options["mtp_num_drafts"] = args.mtp_num_drafts
+        if args.enable_system_speculation:
+            driver_options["enable_system_speculation"] = True
     elif args.driver == "portable":
         driver_options = {
             "max_forward_tokens": args.max_forward_tokens,
@@ -854,6 +856,15 @@ def build_parser() -> argparse.ArgumentParser:
             type=int,
             default=None,
             help="Number of native MTP draft tokens per accepted token.",
+        )
+        sp.add_argument(
+            "--enable-system-speculation",
+            action=argparse.BooleanOptionalAction,
+            default=False,
+            help="cuda_native deployment opt-in for system speculation (MTP). "
+                 "Sets the driver config [model].enable_system_speculation; the "
+                 "runtime drives the auto-drafter only when this is on. Default "
+                 "off (latency-regime feature).",
         )
         sp.add_argument(
             "--batch-policy",

@@ -35,6 +35,11 @@ struct ModelConfig {
     // Gemma-4 target, output_spec_flags requests draft from this assistant.
     std::string mtp_assistant_snapshot_dir;
     int mtp_num_drafts = 3;
+    // Deployment opt-in for system speculation (MTP). Emitted to the runtime,
+    // which OWNS the decision to drive drafts (the driver stays pure mechanism).
+    // Default false: speculation is a latency-regime feature, off unless the
+    // operator enables it (matches vLLM/SGLang's explicit-enable convention).
+    bool enable_system_speculation = false;
 };
 
 struct BatchingConfig {
@@ -107,6 +112,9 @@ inline Config load_config(const std::filesystem::path& path) {
             (*m)["mtp_assistant_snapshot_dir"].value_or(std::string{});
         c.model.mtp_num_drafts = static_cast<int>(
             (*m)["mtp_num_drafts"].value_or<int64_t>(c.model.mtp_num_drafts));
+        c.model.enable_system_speculation =
+            (*m)["enable_system_speculation"].value_or(
+                c.model.enable_system_speculation);
     }
     if (auto b = tbl["batching"].as_table()) {
         constexpr std::string_view allowed[] = {

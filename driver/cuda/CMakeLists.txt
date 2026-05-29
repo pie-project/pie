@@ -77,6 +77,26 @@ cpmaddpackage(
   GIT_SHALLOW TRUE
   DOWNLOAD_ONLY YES)
 
+# FlashInfer v0.6.9 has a narrowing-conversion warning that nvcc
+# escalates to an error: `state_stride_batch` (signed long) is brace-
+# initialized into a `uint64_t` field. Patch the source once after
+# fetch so we don't have to re-patch every fresh build hash dir.
+set(_FI_PATCH_SENTINEL "${flashinfer_SOURCE_DIR}/.pie_narrowing_patched")
+if(EXISTS "${flashinfer_SOURCE_DIR}" AND NOT EXISTS "${_FI_PATCH_SENTINEL}")
+  set(_FI_PATCH_FILE
+    "${flashinfer_SOURCE_DIR}/include/flashinfer/mamba/kernel_selective_state_update_stp.cuh")
+  if(EXISTS "${_FI_PATCH_FILE}")
+    file(READ  "${_FI_PATCH_FILE}" _fi_src)
+    string(REPLACE
+      "DSTATE * DIM, params.state_stride_batch}"
+      "DSTATE * DIM, static_cast<uint64_t>(params.state_stride_batch)}"
+      _fi_src "${_fi_src}")
+    file(WRITE "${_FI_PATCH_FILE}" "${_fi_src}")
+    file(WRITE "${_FI_PATCH_SENTINEL}" "patched")
+    message(STATUS "Patched FlashInfer narrowing conversion in ${_FI_PATCH_FILE}")
+  endif()
+endif()
+
 cpmaddpackage(URI "gh:marzer/tomlplusplus@3.4.0")
 cpmaddpackage(URI "gh:CLIUtils/CLI11@2.5.0")
 cpmaddpackage(URI "gh:nlohmann/json@3.12.0" OPTIONS "JSON_BuildTests OFF")

@@ -58,7 +58,8 @@ void Qwen35Model::body(Qwen3Workspace& ws,
         in.total_tokens, in.num_requests, in.is_pure_decode,
         in.custom_mask_d, in.custom_mask_indptr_d,
         in.slot_ids_h, in.is_fresh_h, in.slot_ids_d,
-        in.logit_row_indices_d, in.num_logit_rows);
+        in.logit_row_indices_d, in.num_logit_rows,
+        in.commit_advance_gather_d);
 }
 
 std::uint32_t Qwen35Model::graph_layout() {

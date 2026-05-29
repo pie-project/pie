@@ -197,8 +197,14 @@ void launch_chunk_gated_delta_prefill_batched(
     const std::uint32_t* qo_indptr,
     long long    slot_stride_elems,
     float*       out,
-    int R, int V_h, int K_d, int V_d,
-    cudaStream_t stream);
+    int R, int K_h, int V_h, int K_d, int V_d,
+    cudaStream_t stream,
+    // write_state=false → frozen verify (persist nothing). commit_len (non-null)
+    // → boundary-write for the recurrent-only commit-advance: request r folds
+    // only commit_len[r] tokens (the confirmed [input|accepted] prefix) into the
+    // committed state. FLA path only.
+    bool write_state = true,
+    const int* commit_len = nullptr);
 void launch_chunk_gated_delta_prefill_batched_state_bf16(
     const float* q_norm,
     const float* k_norm,
@@ -210,13 +216,18 @@ void launch_chunk_gated_delta_prefill_batched_state_bf16(
     const std::uint32_t* qo_indptr,
     long long    slot_stride_elems,
     float*       out,
-    int R, int V_h, int K_d, int V_d,
-    cudaStream_t stream);
+    int R, int K_h, int V_h, int K_d, int V_d,
+    cudaStream_t stream,
+    bool write_state = true,
+    const int* commit_len = nullptr);
 
 // Small-T variant for target verification. One block per (request, head)
 // caches the [K_d, V_d] recurrent state tile in shared memory, walks the
 // request's short token window, and writes final state back once. This avoids
 // rereading/rewriting the full state for every drafted token.
+// write_state=false runs a frozen verify: produce outputs but persist no
+// recurrent state (the committed slot stays at its pre-verify value, advanced
+// later by the repair forward). Default true = normal writeback.
 void launch_chunk_gated_delta_prefill_batched_cached(
     const float* q_norm,
     const float* k_norm,
@@ -229,7 +240,7 @@ void launch_chunk_gated_delta_prefill_batched_cached(
     long long    slot_stride_elems,
     float*       out,
     int R, int V_h, int K_d, int V_d,
-    cudaStream_t stream);
+    cudaStream_t stream, bool write_state = true);
 void launch_chunk_gated_delta_prefill_batched_cached_state_bf16(
     const float* q_norm,
     const float* k_norm,
@@ -242,37 +253,7 @@ void launch_chunk_gated_delta_prefill_batched_cached_state_bf16(
     long long    slot_stride_elems,
     float*       out,
     int R, int V_h, int K_d, int V_d,
-    cudaStream_t stream);
-void launch_chunk_gated_delta_prefill_batched_cached_snapshot(
-    const float* q_norm,
-    const float* k_norm,
-    const float* v,
-    const float* g_log,
-    const float* beta,
-    float*       state_base,
-    const std::int32_t*  slot_ids,
-    const std::uint32_t* qo_indptr,
-    long long    slot_stride_elems,
-    float*       out,
-    int R, int V_h, int K_d, int V_d,
-    int snapshot_base_slot,
-    int snapshot_count,
-    cudaStream_t stream);
-void launch_chunk_gated_delta_prefill_batched_cached_snapshot_state_bf16(
-    const float* q_norm,
-    const float* k_norm,
-    const float* v,
-    const float* g_log,
-    const float* beta,
-    void*        state_base,
-    const std::int32_t*  slot_ids,
-    const std::uint32_t* qo_indptr,
-    long long    slot_stride_elems,
-    float*       out,
-    int R, int V_h, int K_d, int V_d,
-    int snapshot_base_slot,
-    int snapshot_count,
-    cudaStream_t stream);
+    cudaStream_t stream, bool write_state = true);
 
 // Warp-tiled small-T variant. Four warps per block process four V rows for a
 // single (request, head), keeping each lane's K-fragment of recurrent state in
@@ -289,7 +270,7 @@ void launch_chunk_gated_delta_prefill_batched_warp_tiled(
     long long    slot_stride_elems,
     float*       out,
     int R, int V_h, int K_d, int V_d,
-    cudaStream_t stream);
+    cudaStream_t stream, bool write_state = true);
 void launch_chunk_gated_delta_prefill_batched_warp_tiled_state_bf16(
     const float* q_norm,
     const float* k_norm,
@@ -302,38 +283,7 @@ void launch_chunk_gated_delta_prefill_batched_warp_tiled_state_bf16(
     long long    slot_stride_elems,
     float*       out,
     int R, int V_h, int K_d, int V_d,
-    cudaStream_t stream);
-
-void launch_chunk_gated_delta_prefill_batched_warp_tiled_snapshot(
-    const float* q_norm,
-    const float* k_norm,
-    const float* v,
-    const float* g_log,
-    const float* beta,
-    float*       state_base,
-    const std::int32_t*  slot_ids,
-    const std::uint32_t* qo_indptr,
-    long long    slot_stride_elems,
-    float*       out,
-    int R, int V_h, int K_d, int V_d,
-    int snapshot_base_slot,
-    int snapshot_count,
-    cudaStream_t stream);
-void launch_chunk_gated_delta_prefill_batched_warp_tiled_snapshot_state_bf16(
-    const float* q_norm,
-    const float* k_norm,
-    const float* v,
-    const float* g_log,
-    const float* beta,
-    void*        state_base,
-    const std::int32_t*  slot_ids,
-    const std::uint32_t* qo_indptr,
-    long long    slot_stride_elems,
-    float*       out,
-    int R, int V_h, int K_d, int V_d,
-    int snapshot_base_slot,
-    int snapshot_count,
-    cudaStream_t stream);
+    cudaStream_t stream, bool write_state = true);
 
 // Same warp-tiled small-T recurrence, but Q/K are stored with fewer heads
 // than V and are repeated logically (`V_h % K_h == 0`). This avoids
@@ -350,7 +300,7 @@ void launch_chunk_gated_delta_prefill_batched_warp_tiled_gqa(
     long long    slot_stride_elems,
     float*       out,
     int R, int K_h, int V_h, int K_d, int V_d,
-    cudaStream_t stream);
+    cudaStream_t stream, bool write_state = true);
 void launch_chunk_gated_delta_prefill_batched_warp_tiled_gqa_state_bf16(
     const float* q_norm_kh,
     const float* k_norm_kh,
@@ -363,38 +313,7 @@ void launch_chunk_gated_delta_prefill_batched_warp_tiled_gqa_state_bf16(
     long long    slot_stride_elems,
     float*       out,
     int R, int K_h, int V_h, int K_d, int V_d,
-    cudaStream_t stream);
-
-void launch_chunk_gated_delta_prefill_batched_warp_tiled_gqa_snapshot(
-    const float* q_norm_kh,
-    const float* k_norm_kh,
-    const float* v,
-    const float* g_log,
-    const float* beta,
-    float*       state_base,
-    const std::int32_t*  slot_ids,
-    const std::uint32_t* qo_indptr,
-    long long    slot_stride_elems,
-    float*       out,
-    int R, int K_h, int V_h, int K_d, int V_d,
-    int snapshot_base_slot,
-    int snapshot_count,
-    cudaStream_t stream);
-void launch_chunk_gated_delta_prefill_batched_warp_tiled_gqa_snapshot_state_bf16(
-    const float* q_norm_kh,
-    const float* k_norm_kh,
-    const float* v,
-    const float* g_log,
-    const float* beta,
-    void*        state_base,
-    const std::int32_t*  slot_ids,
-    const std::uint32_t* qo_indptr,
-    long long    slot_stride_elems,
-    float*       out,
-    int R, int K_h, int V_h, int K_d, int V_d,
-    int snapshot_base_slot,
-    int snapshot_count,
-    cudaStream_t stream);
+    cudaStream_t stream, bool write_state = true);
 
 // L2-normalise rows of `[N, hidden]` bf16, optionally scale each row
 // element by `scale` after normalisation, and emit fp32 output. Used

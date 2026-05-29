@@ -168,7 +168,8 @@ void qwen3_5_forward_paged(
     const std::uint8_t* is_fresh_h = nullptr,
     const std::int32_t* slot_ids_d = nullptr,
     const std::int32_t* logit_row_indices_d = nullptr,
-    int num_logit_rows = 0);
+    int num_logit_rows = 0,
+    const std::int32_t* commit_advance_gather = nullptr);
 
 void qwen3_5_mtp_process_cache(
     const Qwen3_5Weights& w,

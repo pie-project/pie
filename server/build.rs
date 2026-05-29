@@ -338,6 +338,20 @@ fn build_cuda() {
         cfg.define("CMAKE_CUDA_ARCHITECTURES", arch);
     }
 
+    // ccache for nvcc + host C++ compiles. Speeds up branch switches
+    // and clean rebuilds, no effect on first-time compiles. Wire only
+    // when ccache is on PATH so CI runners without it are unaffected.
+    if std::process::Command::new("ccache")
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+    {
+        cfg.define("CMAKE_C_COMPILER_LAUNCHER", "ccache");
+        cfg.define("CMAKE_CXX_COMPILER_LAUNCHER", "ccache");
+        cfg.define("CMAKE_CUDA_COMPILER_LAUNCHER", "ccache");
+    }
+
     // NCCL discovery hint. The cuda driver's CMakeLists.txt does
     // `find_path(NCCL_INCLUDE_DIR nccl.h ...)` against `/usr/include`
     // and `/usr/local/include` by default. Sites that install NCCL

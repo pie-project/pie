@@ -37,6 +37,13 @@ public:
     // Single-slot allocation (`max_slots == 1`) is the legacy
     // bring-up layout — semantics for callers that only ever pass
     // slot=0 are unchanged.
+    // Whether `allocate` stores recurrent state in bf16 (the default)
+    // vs fp32, per the PIE_QWEN35_RS_STATE_DTYPE env. Exposed so the
+    // memory planner and verbose logging size rs_cache slots with the
+    // same dtype the cache will actually use (otherwise they assume
+    // fp32 and over-reserve ~2x the recurrent footprint).
+    static bool recurrent_state_bf16_default();
+
     static RecurrentStateCache allocate(
         const std::vector<bool>& layer_is_linear,
         int conv_dim,
@@ -115,23 +122,35 @@ public:
         return recurrent_state_bf16_;
     }
 
-    // Speculative verifier prefix snapshots. When enabled, small prefill
-    // linear-attention kernels write state after prefix length p into
-    // slot `spec_snapshot_base_slot() + p - 1`.
-    void set_spec_snapshot_slots(int base_slot, int count) noexcept {
-        spec_snapshot_base_slot_ = base_slot;
-        spec_snapshot_count_ = count;
+    // Frozen-verify mode. When set, the GDN verify kernels walk the recurrent
+    // state in registers to produce correct speculative draft outputs but
+    // persist NOTHING, leaving each committed slot at its pre-verify value
+    // (the implicit speculative snapshot). The executor then advances each
+    // committed slot to the confirmed prefix via a batched repair forward over
+    // [input | accepted]. The committed slot only ever reflects committed
+    // tokens — no per-request snapshot buffer, no concurrency cap. Set by the
+    // executor around the verify forward; cleared for the repair forward
+    // (which writes state normally).
+    void set_verify_frozen(bool frozen) noexcept { verify_frozen_ = frozen; }
+    bool verify_frozen() const noexcept { return verify_frozen_; }
+
+    // Per-linear-layer stash of the verify forward's normed hidden input
+    // (ws.norm_x), captured during a frozen verify. The recurrent-only
+    // commit-advance reuses it to re-run just the linear-attn block (conv +
+    // recurrence) over the accepted tokens, skipping attention / MLP /
+    // non-linear layers / lm_head — instead of re-running the whole backbone.
+    // Sized [num_linear_layers, max_tokens, hidden_size] bf16.
+    void configure_verify_hidden_stash(int max_tokens, int hidden_size);
+    bool verify_hidden_stash_enabled() const noexcept {
+        return verify_stash_max_tokens_ > 0 && verify_stash_hidden_ > 0;
     }
-    void clear_spec_snapshot_slots() noexcept {
-        spec_snapshot_base_slot_ = -1;
-        spec_snapshot_count_ = 0;
+    int verify_stash_hidden() const noexcept { return verify_stash_hidden_; }
+    int verify_stash_max_tokens() const noexcept {
+        return verify_stash_max_tokens_;
     }
-    int spec_snapshot_base_slot() const noexcept {
-        return spec_snapshot_base_slot_;
-    }
-    int spec_snapshot_count() const noexcept {
-        return spec_snapshot_count_;
-    }
+    // Base pointer of compact linear-layer `linear_idx`'s stash region
+    // (the [max_tokens, hidden_size] bf16 slab). Null if not configured.
+    void* verify_hidden_stash_layer(int linear_idx);
 
     RecurrentStateCache() = default;
 
@@ -156,8 +175,10 @@ private:
     int head_v_dim_  = 0;
     int hidden_size_  = 0;
     bool recurrent_state_bf16_ = false;
-    int spec_snapshot_base_slot_ = -1;
-    int spec_snapshot_count_ = 0;
+    bool verify_frozen_ = false;
+    DeviceBuffer<std::uint16_t> verify_hidden_stash_;
+    int verify_stash_max_tokens_ = 0;
+    int verify_stash_hidden_ = 0;
 };
 
 }  // namespace pie_cuda_driver
