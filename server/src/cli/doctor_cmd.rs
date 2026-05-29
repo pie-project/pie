@@ -55,7 +55,6 @@ pub fn doctor() -> Result<()> {
     let global = DriversConfig::load().unwrap_or_default();
     let empty = toml::Table::new();
     for flavor in [
-        SubprocessFlavor::Dev,
         SubprocessFlavor::Vllm,
         SubprocessFlavor::Sglang,
         SubprocessFlavor::TensorRtLlm,

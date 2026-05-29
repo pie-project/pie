@@ -153,8 +153,8 @@ def launch(
             ready_queue)`.
         validate_devices: optional callback that receives the resolved
             `devices` list and raises if anything is off. Flavor wheels
-            pass a torch-aware version (e.g. `pie_driver_dev.utils.
-            validate_cuda_devices`); bridge stays torch-free here.
+            pass a torch-aware version (e.g. a `validate_cuda_devices`
+            helper); bridge stays torch-free here.
 
     Returns:
         Exit code (0 on graceful shutdown). Raises SystemExit for hard

@@ -23,7 +23,6 @@ classifiers = [
 # installing them into separate venvs is the supported path.
 dependencies = [
     "pie-bridge",
-    "pie-driver-dev",
     "msgpack>=0.5",
     "msgspec>=0.18",
     "ninja>=1.13",
@@ -47,7 +46,6 @@ explicit = true
 
 [tool.uv.sources]
 pie-bridge = { path = "../bridge", editable = true }
-pie-driver-dev = { path = "../dev", editable = true }
 torch = [{ index = "pytorch-cu129" }]
 torchvision = [{ index = "pytorch-cu129" }]
 torchaudio = [{ index = "pytorch-cu129" }]

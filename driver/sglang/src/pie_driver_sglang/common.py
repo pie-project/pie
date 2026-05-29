@@ -12,7 +12,7 @@ import math
 
 from typing import Callable, Any
 
-from pie_kernels.sampling import (  # noqa: F401
+from flashinfer.sampling import (  # noqa: F401
     sampling_from_probs,
     top_p_sampling_from_probs,
     top_k_sampling_from_probs,

@@ -27,7 +27,6 @@ dependencies = [
     # `pie_driver_sglang._bridge` as a vendored copy of the legacy
     # `._bridge` Python.
     "pie-bridge",
-    "pie-driver-dev",
     "msgpack>=0.5",
     "numba>=0.65",
     "opentelemetry-api>=1.27.0",
@@ -44,7 +43,6 @@ dependencies = [
 
 [tool.uv.sources]
 pie-bridge = { path = "../bridge", editable = true }
-pie-driver-dev = { path = "../dev", editable = true }
 
 [tool.uv]
 prerelease = "allow"

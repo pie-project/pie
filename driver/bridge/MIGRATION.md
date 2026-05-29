@@ -49,14 +49,14 @@ The sampler model changed shape too: old was SoA arrays (`sampler_types[i]`, `sa
 - [ ] Resolve `pie_bridge::DriverCapabilities` import — either re-add as a `#[schema]` type or move ownership into the runtime/server crate
 - [ ] Verify `pie_server` compiles with `--no-default-features` and with `--features driver-portable`/`driver-cuda`
 
-### D. Python dev driver (`driver/dev/src/pie_driver_dev/_bridge/`)
+### D. Python vllm driver (`driver/vllm/src/pie_driver_vllm/_bridge/`)
 - [ ] `methods.py`: rewrite using `pie_bridge.SAMPLER_*` / `pie_bridge.REQUEST_*` constants
 - [ ] `shmem_ipc.py`: `ShmemServer` was a PyO3 class — re-expose via a small PyO3 module or move shmem ring logic into pure Python here (the C ABI emits `pie_parse_frame` / `pie_build_*` already)
 - [ ] `shmem_schema.py`: replace `pie_bridge.parse_request(view)` with `pie_bridge.Frame.parse(bytes(view))` and convert the returned wrapper to the dict the worker expects; replace `pie_bridge.ResponseBuilder` with a thin Python adapter that constructs `PieForwardResponseDesc` field-by-field and calls `pie_build_response_frame`
-- [ ] `_bridge/__init__.py`: re-export constants under the names the rest of dev expects
+- [ ] `_bridge/__init__.py`: re-export constants under the names the rest of pie_driver_vllm expects
 
-### E. Python sglang / vllm drivers
-- [ ] Mirror D for `driver/sglang/` and `driver/vllm/` — same `_bridge/` subpackage pattern, same migration steps
+### E. Python sglang / tensorrt_llm drivers
+- [ ] Mirror D for `driver/sglang/` and `driver/tensorrt_llm/` — same `_bridge/` subpackage pattern, same migration steps
 
 ### F. C++ portable (`driver/portable/`)
 - [ ] `src/_bridge/inproc_server.{hpp,cpp}`: rewrite to dispatch via `PieRequestPayloadDesc.kind` instead of `req.method`. Two layout options:

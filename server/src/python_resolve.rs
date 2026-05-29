@@ -369,7 +369,7 @@ mod tests {
         let _g = ENV_LOCK.lock().unwrap();
         clear_python_envs();
         let m = fixture_options("");
-        match resolve_python(SubprocessFlavor::Dev, &m, None) {
+        match resolve_python(SubprocessFlavor::Vllm, &m, None) {
             Ok(r) => {
                 assert!(r.source.contains("$PATH"), "got: {}", r.source);
             }

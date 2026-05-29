@@ -26,7 +26,6 @@ pub enum ResolvedFlavor {
 }
 
 /// Partition `world_size` ranks into TP groups of size `tp_degree`.
-/// Mirrors `pie_driver_dev/worker.py::calculate_topology`.
 ///
 /// Example: `world_size=4, tp_degree=2 → [[0,1], [2,3]]` — two DP
 /// replicas, each with two TP-sharded ranks.
@@ -56,7 +55,6 @@ pub fn resolve_flavor(kind: DriverKind, model_name: &str) -> Result<ResolvedFlav
                 .map(ResolvedFlavor::Embedded)
                 .map_err(|msg| anyhow!("model {model_name:?}: {msg}"))
         }
-        DriverKind::Dev => Ok(ResolvedFlavor::Subprocess(SubprocessFlavor::Dev)),
         DriverKind::Vllm => Ok(ResolvedFlavor::Subprocess(SubprocessFlavor::Vllm)),
         DriverKind::Sglang => Ok(ResolvedFlavor::Subprocess(SubprocessFlavor::Sglang)),
         DriverKind::TensorRtLlm => Ok(ResolvedFlavor::Subprocess(SubprocessFlavor::TensorRtLlm)),

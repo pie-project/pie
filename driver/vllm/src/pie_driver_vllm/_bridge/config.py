@@ -3,7 +3,7 @@
 Bridge owns only the universal `RuntimeConfig`: identity, devices, dtype,
 telemetry, swap budget, and the engine-computed `total_pages`. Each
 flavor wheel ships its own subclass for flavor-specific knobs and torch
-typing (see `pie_driver_dev.config.NativeRuntimeConfig`). Bridge stays
+typing. Bridge stays
 torch-free; the storage fields hold device / dtype as strings, and the
 `device` / `activation_dtype` properties expose strings here — flavor
 subclasses override them to return torch types.

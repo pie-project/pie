@@ -390,9 +390,7 @@ def load_vllm_model(
     # Snapshot dir: pie's Rust runtime needs a local filesystem path that
     # contains tokenizer.json (and the HF config). vllm's `model_config.model`
     # is just the HF repo name like "Qwen/Qwen3-0.6B", so we resolve it to
-    # the cached snapshot via huggingface_hub. (We avoid `pie_driver_dev.hf_utils`
-    # because it transitively imports `pie_kernels` which JIT-compiles CUDA
-    # extensions; that's heavy and irrelevant on the vllm path.)
+    # the cached snapshot via huggingface_hub.
     snapshot_dir = _resolve_hf_snapshot_dir(config.hf_repo)
     _debug_stage("resolve_snapshot_dir: done")
     if snapshot_dir is None:

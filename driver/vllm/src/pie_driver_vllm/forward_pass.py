@@ -1,6 +1,6 @@
 """Adapter that exposes a vllm model under pie_driver's ForwardPass contract.
 
-`pie_driver_dev.engine.Engine` calls three methods on its `forward_pass` object:
+The `Engine` calls three methods on its `forward_pass` object:
 `embed_inputs(inputs) -> hidden`, `transform(...) -> hidden`, and
 `sample(hidden, sampling_metadata) -> list`. We satisfy that contract here
 while delegating the actual compute to vllm.

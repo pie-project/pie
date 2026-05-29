@@ -9,21 +9,19 @@
 //! | Startup config  | Per-flavor TOML via `embedded_driver::write_*_startup_toml` | A flavor-neutral TOML this module writes (`write_subprocess_startup_toml`) |
 //! | Handshake       | `ready_cb(caps_json)` callback    | One JSON line per group on a pipe (fd 3) terminated by a `{"ready":true}` sentinel |
 //! | Cold-path RPC   | Standalone hosts via [`pie::driver::RpcServer`] + [`crate::rpc_loop`] | Python launcher hosts its own `RpcServer` (via the `_rpc_native` extension bundled in `pie-driver-bridge`) inside `worker.py::_leader_loop`; standalone connects as the client |
-//! | Shmem fast path | Driver allocates `/pie_shmem_g{N}` | Same — Python `pie_driver_dev.shmem_ipc.ShmemServer` |
+//! | Shmem fast path | Driver allocates `/pie_shmem_g{N}` | Same — Python `pie_driver_<flavor>.shmem_ipc.ShmemServer` |
 //! | Stop signal     | `driver_ffi::request_stop`        | `SIGTERM` to the child            |
 //! | Watchdog        | `JoinHandle::is_finished()`       | `Child::try_wait()`               |
 //!
 //! The handshake JSON shape is the contract between this module and each
 //! launcher's `__main__.py`. **If you change `Handshake` here, update
-//! the JSON shape in all of `driver/{dev,vllm,sglang,tensorrt_llm}/src/.../__main__.py`
+//! the JSON shape in all of `driver/{vllm,sglang,tensorrt_llm}/src/.../__main__.py`
 //! to match.** The duplication is intentional so the standalone can
 //! supervise every Python driver through one small protocol.
 
 /// Which Python driver flavor the subprocess hosts.
 #[derive(Copy, Clone, Eq, PartialEq, Debug)]
 pub enum SubprocessFlavor {
-    /// Reference Python driver (`pie_driver_dev`).
-    Dev,
     /// vLLM-backed driver (`pie_driver_vllm`).
     Vllm,
     /// SGLang-backed driver (`pie_driver_sglang`).
@@ -38,7 +36,6 @@ impl SubprocessFlavor {
     /// discriminator.
     pub fn as_str(self) -> &'static str {
         match self {
-            SubprocessFlavor::Dev => "dev",
             SubprocessFlavor::Vllm => "vllm",
             SubprocessFlavor::Sglang => "sglang",
             SubprocessFlavor::TensorRtLlm => "tensorrt_llm",
@@ -48,7 +45,6 @@ impl SubprocessFlavor {
     /// Python module name to invoke as `python -m <name>`.
     pub fn module_name(self) -> &'static str {
         match self {
-            SubprocessFlavor::Dev => "pie_driver_dev",
             SubprocessFlavor::Vllm => "pie_driver_vllm",
             SubprocessFlavor::Sglang => "pie_driver_sglang",
             SubprocessFlavor::TensorRtLlm => "pie_driver_tensorrt_llm",
@@ -670,11 +666,9 @@ mod unix_impl {
 
         #[test]
         fn flavor_strings_match_toml_discriminator() {
-            assert_eq!(SubprocessFlavor::Dev.as_str(), "dev");
             assert_eq!(SubprocessFlavor::Vllm.as_str(), "vllm");
             assert_eq!(SubprocessFlavor::Sglang.as_str(), "sglang");
             assert_eq!(SubprocessFlavor::TensorRtLlm.as_str(), "tensorrt_llm");
-            assert_eq!(SubprocessFlavor::Dev.module_name(), "pie_driver_dev");
             assert_eq!(SubprocessFlavor::Vllm.module_name(), "pie_driver_vllm");
             assert_eq!(SubprocessFlavor::Sglang.module_name(), "pie_driver_sglang");
             assert_eq!(

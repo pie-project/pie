@@ -39,7 +39,7 @@ Symbol names derive mechanically from the type name in snake_case — no per-fie
 |----------------------------|---------------------------------------------------|
 | Rust (`pie`, dummy driver) | Import schema types directly                      |
 | C++ (`driver/cuda`, etc.)  | Link `libpie_bridge`, include `pie_bridge.h`     |
-| Python (`driver/dev`, …)   | `pip`-install the maturin wheel; use ctypes or PyO3 |
+| Python (`driver/vllm`, …)  | `pip`-install the maturin wheel; use ctypes or PyO3 |
 
 All three read the same rkyv bytes; the C ABI and PyO3 surfaces are just navigation helpers over the archived form.
 

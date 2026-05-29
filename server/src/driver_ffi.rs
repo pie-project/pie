@@ -113,7 +113,7 @@ impl Flavor {
                 }
             }
             DriverKind::Dummy => Ok(Flavor::Dummy),
-            DriverKind::Dev | DriverKind::Vllm | DriverKind::Sglang | DriverKind::TensorRtLlm => {
+            DriverKind::Vllm | DriverKind::Sglang | DriverKind::TensorRtLlm => {
                 Err(format!(
                     "driver type {kind:?} is hosted by a Python subprocess, \
                  not an embedded FFI flavor."

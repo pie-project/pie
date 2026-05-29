@@ -44,11 +44,6 @@ pub enum DriverCmd {
     /// List known driver types and which appear in the loaded config.
     List(ListArgs),
 
-    /// `pie driver dev <action>` — reference Python driver.
-    Dev {
-        #[command(subcommand)]
-        action: PerDriverCmd,
-    },
     /// `pie driver vllm <action>` — vLLM-backed driver.
     Vllm {
         #[command(subcommand)]
@@ -153,7 +148,6 @@ pub fn run(cmd: DriverCmd) -> Result<()> {
     match cmd {
         DriverCmd::List(args) => list(args),
 
-        DriverCmd::Dev { action } => run_subprocess(SubprocessFlavor::Dev, action),
         DriverCmd::Vllm { action } => run_subprocess(SubprocessFlavor::Vllm, action),
         DriverCmd::Sglang { action } => run_subprocess(SubprocessFlavor::Sglang, action),
         DriverCmd::TensorRtLlm { action } => run_subprocess(SubprocessFlavor::TensorRtLlm, action),
@@ -171,7 +165,6 @@ pub fn run(cmd: DriverCmd) -> Result<()> {
 fn list(args: ListArgs) -> Result<()> {
     println!("Subprocess drivers (Python wheels):");
     for f in [
-        SubprocessFlavor::Dev,
         SubprocessFlavor::Vllm,
         SubprocessFlavor::Sglang,
         SubprocessFlavor::TensorRtLlm,
@@ -229,7 +222,6 @@ fn install(flavor: SubprocessFlavor, path: Option<PathBuf>, run: bool) -> Result
     let python_bin = venv.join("bin").join("python");
 
     let wheel_extras = match flavor {
-        SubprocessFlavor::Dev => "pie-driver-dev[cu128]",
         SubprocessFlavor::Vllm => "pie-driver-vllm",
         SubprocessFlavor::Sglang => "pie-driver-sglang",
         SubprocessFlavor::TensorRtLlm => "pie-driver-tensorrt-llm",

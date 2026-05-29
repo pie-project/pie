@@ -8,9 +8,7 @@
 //!   * Repo ID → resolved against the HF cache (`~/.cache/huggingface/hub/`,
 //!     overridable via `$HF_HOME`); downloaded if missing.
 //!
-//! Mirrors the Python pie behavior in
-//! `pie_driver_cuda_native/worker.py` (which calls
-//! `pie_driver_dev.hf_utils.get_hf_snapshot_dir`). The cache layout is
+//! The cache layout is
 //! identical to the Python `huggingface_hub` package's, so a model
 //! downloaded via `huggingface-cli` or `pie model download` from the
 //! Python side is reused here without re-downloading. Repo downloads are

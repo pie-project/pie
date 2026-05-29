@@ -1,8 +1,7 @@
 """Torch-free helpers shared by the bridge.
 
 Anything that touches `torch`, `torch.distributed`, or `torch.cuda`
-belongs in a per-flavor `utils.py` (see `pie_driver_dev.utils`,
-`pie_driver_sglang.utils`, `pie_driver_vllm.utils`) so the bridge wheel
+belongs in a per-flavor `utils.py` (see `pie_driver_sglang.utils`, `pie_driver_vllm.utils`) so the bridge wheel
 stays torch-free.
 """
 

@@ -7,7 +7,7 @@ topology calculation and the two worker roles:
 
 Bridge is torch-free: every operation that touches `torch.distributed`,
 `torch.cuda`, or per-flavor KV tensors is dispatched through a
-flavor-supplied `runtime_ops` module (see `pie_driver_dev.utils` for the
+flavor-supplied `runtime_ops` module (see a flavor's `utils` for the
 contract) or through methods on `engine` (see `engine.kv_copy_*`).
 """
 
@@ -75,7 +75,7 @@ def run_worker(
         `init_distributed(tp_rank, tp_degree, group_id, master_port, device)`,
         `set_device(device)`, `barrier()`, `broadcast_struct(data, src,
         device)`, `cleanup_runtime()`, and `cleanup_distributed()`. Each
-        flavor wheel ships its own copy (see `pie_driver_dev.utils`).
+        flavor wheel ships its own copy.
 
       * `engine.kv_copy_{d2h,h2d,d2d,h2h}` — per-flavor KV-swap methods.
 
@@ -520,7 +520,7 @@ def _leader_loop(
                 engine.kv_copy_h2h(srcs, dsts)
             return 0
         except Exception as e:
-            print(f"[pie_driver_dev] copy method={method_tag} failed: {e}")
+            print(f"[pie-driver] copy method={method_tag} failed: {e}")
             return 5
 
     def _handle_load_adapter_v2(adapter_id: int, path: str) -> int:
@@ -535,7 +535,7 @@ def _leader_loop(
             engine.load_adapter(adapter_ptr=adapter_id, name=path, data=b"")
             return 0
         except Exception as e:
-            print(f"[pie_driver_dev] load_adapter failed: {e}")
+            print(f"[pie-driver] load_adapter failed: {e}")
             return 5
 
     def _shmem_loop():
@@ -557,7 +557,7 @@ def _leader_loop(
             try:
                 method_tag = _shm_schema.peek_method_tag(payload)
             except Exception as e:
-                print(f"[pie_driver_dev] malformed request: {e}")
+                print(f"[pie-driver] malformed request: {e}")
                 lease.commit_status(2)
                 continue
 
@@ -645,7 +645,7 @@ def _leader_loop(
         stop_event.wait()
     finally:
         _stop_shmem()
-        print("[pie_driver_dev] Shutting down...")
+        print("[pie-driver] Shutting down...")
         if config.world_size > 1 and config.rank == 0:
             try:
                 runtime_ops.broadcast_struct(

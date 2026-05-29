@@ -1,6 +1,6 @@
 """vLLM-backed inference engine.
 
-Mirrors `pie_driver_dev.engine.Engine`'s public surface so that worker.py can use
+Mirrors the shared `Engine` public surface so that worker.py can use
 either driver interchangeably. Internally, the model and kernels come from
 vllm; the surrounding RPC, batching, telemetry, and adapter scaffolding are
 imported directly from `pie_driver`.
@@ -37,7 +37,7 @@ class _DecodeLookaheadBuffer:
 class VllmEngine:
     """Inference engine that delegates the forward pass to a vllm model.
 
-    Public surface matches `pie_driver_dev.engine.Engine`:
+    Public surface matches the shared `Engine` contract:
       - `Engine.load(config, ...)` classmethod
       - `engine.fire_batch(inputs, sampling_metadata) -> list`
       - `engine.kv_cache_at_layer`, `engine.kv_cache_at_layer_host`

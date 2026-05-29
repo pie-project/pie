@@ -2,7 +2,7 @@
 //!
 //! Same TOML the legacy Python server consumed. Both embedded
 //! ([`DriverKind::Portable`] / [`DriverKind::CudaNative`] / [`DriverKind::Dummy`])
-//! and subprocess-hosted ([`DriverKind::Dev`] / [`DriverKind::Vllm`] /
+//! and subprocess-hosted ([`DriverKind::Vllm`] /
 //! [`DriverKind::Sglang`] / [`DriverKind::TensorRtLlm`]) drivers are valid; the dispatch happens in
 //! [`crate::serve::start_engine`] via [`crate::serve::topology::resolve_flavor`].
 //! Python-only fields are absent from validation here (e.g. nothing
@@ -476,8 +476,8 @@ impl DriverConfig {
             "model.driver.device must be non-empty"
         );
         // All `DriverKind`s are valid here: embedded flavors run in-process
-        // through static libs, while dev/vllm/sglang are supervised through
-        // `crate::subprocess_driver`.
+        // through static libs, while vllm/sglang/tensorrt_llm are supervised
+        // through `crate::subprocess_driver`.
         match self.kind {
             DriverKind::Portable => {
                 let opts: PortableDriverOptions = toml::Value::Table(self.options.clone())
@@ -512,7 +512,7 @@ impl DriverConfig {
                         )
                     })?;
             }
-            DriverKind::Dev | DriverKind::Vllm | DriverKind::Sglang | DriverKind::TensorRtLlm => {
+            DriverKind::Vllm | DriverKind::Sglang | DriverKind::TensorRtLlm => {
                 validate_subprocess_driver_options(&self.options, self.kind)?;
                 if matches!(self.kind, DriverKind::TensorRtLlm) {
                     ensure!(
@@ -624,9 +624,6 @@ pub enum DriverKind {
     /// Rust dummy driver — random tokens, no model load. Always
     /// embedded in `pie-server`.
     Dummy,
-    /// Torch-backed reference Python driver (`pie_driver_dev`). Hosted
-    /// out-of-process by [`crate::subprocess_driver::SubprocessDriver`].
-    Dev,
     /// vLLM-backed Python driver. Subprocess-hosted.
     Vllm,
     /// SGLang-backed Python driver. Subprocess-hosted.
@@ -642,7 +639,6 @@ impl DriverKind {
             DriverKind::Portable => "portable",
             DriverKind::CudaNative => "cuda_native",
             DriverKind::Dummy => "dummy",
-            DriverKind::Dev => "dev",
             DriverKind::Vllm => "vllm",
             DriverKind::Sglang => "sglang",
             DriverKind::TensorRtLlm => "tensorrt_llm",
@@ -1061,8 +1057,6 @@ max_num_kv_pages = 1024
             ("dummy", "max_forward_tokens"),
             ("dummy", "max_forward_requests"),
             ("dummy", "max_model_len"),
-            ("dev", "max_forward_tokens"),
-            ("dev", "max_forward_requests"),
             ("sglang", "max_running_requests"),
             ("sglang", "max_total_tokens"),
         ] {
@@ -1175,9 +1169,9 @@ device = "cuda:0"
 
     #[test]
     fn accepts_subprocess_drivers() {
-        // dev/vllm/sglang/tensorrt_llm are hosted out-of-process by
+        // vllm/sglang/tensorrt_llm are hosted out-of-process by
         // `crate::subprocess_driver::SubprocessDriver`.
-        for ty in ["dev", "vllm", "sglang", "tensorrt_llm"] {
+        for ty in ["vllm", "sglang", "tensorrt_llm"] {
             let toml_text = format!(
                 "[[model]]\nname = \"m\"\nhf_repo = \"x\"\n[model.driver]\n\
                  type = \"{ty}\"\ndevice = [\"cuda:0\"]\n"

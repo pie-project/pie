@@ -640,7 +640,7 @@ Instead:
 - **Cuda C++** uses `flatbuffers::FlatBufferBuilder` directly. The accumulator is hand-rolled in `driver/cuda/src/response_accumulator.cpp` (~150 LOC, replaces `cuda/src/_bridge/response_builder.cpp`).
 - **Portable C++** similarly uses `flatbuffers::FlatBufferBuilder` in `driver/portable/src/response_accumulator.cpp`.
 - **Pie Rust** uses `flatbuffers::FlatBufferBuilder` in `pie/runtime/src/inference/response.rs`.
-- **Dev Python** uses `flatbuffers.Builder` in `driver/dev/src/pie_driver_dev/response.py`.
+- **Flavor Python** uses `flatbuffers.Builder` in each driver's vendored `response.py`.
 
 Each one is ~150 LOC. Cross-language consistency is guaranteed by `flatc` (all four use the same schema-derived `Add*` calls); the duplication is shallow boilerplate.
 
@@ -1037,7 +1037,7 @@ pytest tests/inferlets/test_{helloworld,text_completion,sampler_suite,empty_forw
 3. **Pie-server:** update `pie/server/src/embedded_driver.rs` to construct the new shmem ring + Lease-based polling. The `DriverChannel` async wrapper is unchanged in shape (D11 from the prior plan stands — async wrapper stays in pie).
 4. **Driver flavors:**
    - `pie-driver-dummy`: replace internals with M2's `pie-driver-dummy-new`.
-   - `pie-driver-dev`: update to consume the FlatBuffers payload via `pie_bridge.fbs.*`. The torch-free constraint (per the user-memory note) still holds; torch lives in downstream wheels.
+   - `pie-driver-{vllm,sglang,tensorrt_llm}`: update to consume the FlatBuffers payload via `pie_bridge.fbs.*`. The torch-free constraint (per the user-memory note) still holds; torch lives in downstream wheels.
 5. **Cuda backend** (`driver/cuda`):
    - Update CMakeLists per §7.2 (flatc invocation, include path).
    - Replace `cuda/src/_bridge/*` (vendored response builder + headers) with includes from flatc-generated headers + the hand-written `include/pie_bridge.h`.
