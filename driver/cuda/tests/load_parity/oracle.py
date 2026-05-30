@@ -9,6 +9,9 @@ fusion/shard map — purely by reconstructing it from the source bytes:
               that disappeared from the output set), in source-declaration order
   * split   — output is a contiguous slice of a consumed source, AND the family
               of slices from that source exactly tiles it (catches wrong offsets)
+  * expert-stack — fused 3-D MoE expert tensor (experts.gate_up_proj /
+              experts.down_proj) rebuilt from the per-expert source weights
+              (a non-contiguous gather that `fusion`'s contiguous-run match can't express)
   * skip-quant — output dtype differs from source / is packed (FP8/MXFP4): can't
               be reconstructed without reimplementing the quant kernel; covered
               by the differential runs + test_transcode_fused.cu instead
@@ -84,6 +87,33 @@ def _match_split(target: bytes, sources: list[tuple[str, Tensor]]):
     return None
 
 
+# Stacked-MoE-expert fusions: per-expert `experts.{e}.{gate,up,down}_proj.weight`
+# get stacked into 3-D `experts.gate_up_proj` ([E, 2*inter, hidden], slice e =
+# gate[e] ++ up[e]) and `experts.down_proj` ([E, hidden, inter], slice e = down[e]).
+# This is a *non-contiguous* gather of the source set (all gate/up, then all down),
+# so _match_fusion (contiguous runs only) can't express it — reconstruct directly.
+_EXPERT_STACKS = (
+    (".experts.gate_up_proj", ("gate_proj.weight", "up_proj.weight")),
+    (".experts.down_proj", ("down_proj.weight",)),
+)
+
+
+def _match_expert_stack(name: str, by_name: dict) -> bytes | None:
+    """If `name` is a stacked-expert tensor, return the expected bytes rebuilt from
+    the per-expert source weights (in expert-major order), else None."""
+    for suffix, members in _EXPERT_STACKS:
+        if not name.endswith(suffix):
+            continue
+        base = name[: -len(suffix)] + ".experts."   # "....mlp.experts."
+        acc, e = bytearray(), 0
+        while all((f"{base}{e}.{m}") in by_name for m in members):
+            for m in members:
+                acc += by_name[f"{base}{e}.{m}"].raw
+            e += 1
+        return bytes(acc) if e > 0 else None         # e==0: pre-fused source, not this pattern
+    return None
+
+
 def classify(materialized: dict, src: dict, prefix: str = "") -> dict:
     """name -> (kind, ok). kind in {direct, fusion, split, skip-quant, unexplained}."""
     by_name, order = _src_index(src, prefix)
@@ -100,6 +130,10 @@ def classify(materialized: dict, src: dict, prefix: str = "") -> dict:
             continue
         if o.dtype in PACKED or name.endswith(SCALE_SUFFIXES):   # quant weight / scale artifact
             results[name] = ("skip-quant", True)
+            continue
+        stacked = _match_expert_stack(name, by_name)             # fused MoE expert stack
+        if stacked is not None:
+            results[name] = ("expert-stack", o.raw == stacked)
             continue
         same = [(s, t) for (s, t) in consumed if t.dtype == o.dtype]
         if _match_fusion(o.raw, [t.raw for _, t in same]):
