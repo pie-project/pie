@@ -373,7 +373,6 @@ LoadedModel LoadedModel::load(const Config& boot_cfg, NcclComm* tp_comm) {
         } catch (const std::exception& ex) {
             std::cerr << "[pie-driver-cuda] weight cache: reload failed ("
                       << ex.what() << "); falling back to materialize\n";
-            e.weights_ = WeightStore{};
             weight_cache_hit = false;
         }
         log_stage(weight_cache_hit
@@ -382,6 +381,13 @@ LoadedModel LoadedModel::load(const Config& boot_cfg, NcclComm* tp_comm) {
     }
 
     if (!weight_cache_hit) {
+        // A miss can leave the store partially populated — a checksum mismatch
+        // is only detected after the owned blobs are inserted, and a throwing
+        // reload aborts mid-restore. WeightStore::insert rejects duplicate names,
+        // so materialize would abort on the leftovers (e.g. the storage arena).
+        // Reset to a clean slate; this also frees any stranded device tensors
+        // (DeviceTensor RAII). A no-op when the restore left nothing.
+        e.weights_ = WeightStore{};
         WeightStoreBuilder rust_builder(e.weights_);
         RustStorageProgramExecutor rust_executor(
             loader,
