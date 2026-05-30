@@ -101,6 +101,7 @@ private:
         if (fp8_bf16_scratch_ptr_ != nullptr) { cudaFree(fp8_bf16_scratch_ptr_); fp8_bf16_scratch_ptr_ = nullptr; }
         if (fp8_scale_local_ptr_ != nullptr) { cudaFree(fp8_scale_local_ptr_); fp8_scale_local_ptr_ = nullptr; }
         if (fp8_source_tile_ptr_ != nullptr) { cudaFree(fp8_source_tile_ptr_); fp8_source_tile_ptr_ = nullptr; }
+        if (bf16_source_tile_ptr_ != nullptr) { cudaFree(bf16_source_tile_ptr_); bf16_source_tile_ptr_ = nullptr; }
         for (auto& kv : fp8_scale_cache_) { if (kv.second.data != nullptr) cudaFree(kv.second.data); }
         fp8_scale_cache_.clear();
 #endif
@@ -215,28 +216,36 @@ private:
             }
             const TensorInfo& info =
                 loader_.info(source_tensor_names_[instr.source.tensor_id]);
+            const bool compact = wl_cpp::compact_extent(instr.source.stride);
 #if PIE_CUDA_TRANSCODE_ENGINE_HAS_CUDA
-            // Reuse a persistent device tile buffer for FP8 sources — the
-            // dequant kernel consumes it then we move on, so per-tile
-            // cudaMalloc/cudaFree is pure overhead (and dominates the FP4
-            // encode phase for GLM-5.1's tens of thousands of expert tiles).
-            // Wrap the persistent buffer in a non-owning view.
-            if (info.dtype == DType::FP8_E4M3) {
+            // Reuse a persistent device tile buffer for compact sources — the
+            // encode/dequant kernel consumes it then we move on, so per-tile
+            // cudaMalloc/cudaFree is pure overhead (and dominates the FP4 encode
+            // phase for tens of thousands of expert tiles). FP8 and
+            // BF16/FP16/FP32 sources keep separate persistent buffers (different
+            // element sizes); each is wrapped in a non-owning view. The H2D
+            // below runs on stream 0, and so does the follow-up kernel, so a
+            // single reused buffer is safe (stream-0 in-order) — and there's no
+            // flush. Strided (TP-sharded non-compact) sources fall back to a
+            // per-tile allocate: the generic strided copy isn't stream-0 ordered.
+            if (compact) {
                 const std::size_t want_bytes =
                     static_cast<std::size_t>(rows) *
                     static_cast<std::size_t>(cols) *
                     dtype_bytes(info.dtype);
-                ensure_dev_buffer(fp8_source_tile_ptr_,
-                                  fp8_source_tile_bytes_,
-                                  want_bytes);
-                source = DeviceTensor::view(
-                    fp8_source_tile_ptr_, info.dtype, tile_shape);
+                const bool is_fp8 = info.dtype == DType::FP8_E4M3;
+                void*& tile_ptr =
+                    is_fp8 ? fp8_source_tile_ptr_ : bf16_source_tile_ptr_;
+                std::size_t& tile_cap =
+                    is_fp8 ? fp8_source_tile_bytes_ : bf16_source_tile_bytes_;
+                ensure_dev_buffer(tile_ptr, tile_cap, want_bytes);
+                source = DeviceTensor::view(tile_ptr, info.dtype, tile_shape);
             } else
 #endif
             {
                 source = DeviceTensor::allocate(info.dtype, tile_shape);
             }
-            if (!wl_cpp::compact_extent(instr.source.stride)) {
+            if (!compact) {
                 if (row_start != 0 || rows != full_shape[0]) {
                     throw std::runtime_error(
                         "rust storage executor: tiled Encode for non-compact "
@@ -247,32 +256,22 @@ private:
                 const std::uint64_t elem = dtype_bytes(info.dtype);
                 const std::uint64_t row_bytes =
                     static_cast<std::uint64_t>(cols) * elem;
+                const std::uint64_t off =
+                    instr.source.file_offset +
+                    instr.source.stride.base_offset +
+                    static_cast<std::uint64_t>(row_start) * row_bytes;
+                const std::uint64_t span =
+                    static_cast<std::uint64_t>(rows) * row_bytes;
 #if PIE_CUDA_TRANSCODE_ENGINE_HAS_CUDA
-                // For FP8 sources the dequant kernel runs on stream 0 right
-                // after this copy. Put the H2D on stream 0 too so ordering
-                // is implicit (no flush, no event wait). For BF16 sources
-                // there's no follow-up kernel — keep the round-robin path
-                // so other in-flight copies still parallelise.
-                if (info.dtype == DType::FP8_E4M3) {
-                    copy_engine_.queue_on_stream(
-                        instr.source.file_id,
-                        instr.source.file_offset +
-                            instr.source.stride.base_offset +
-                            static_cast<std::uint64_t>(row_start) * row_bytes,
-                        static_cast<std::uint64_t>(rows) * row_bytes,
-                        source.data(),
-                        /*stream=*/0);
-                } else
+                // Stream-0 H2D: the follow-up encode/dequant kernel (also stream
+                // 0) sees it via implicit ordering — no flush, no event wait.
+                copy_engine_.queue_on_stream(
+                    instr.source.file_id, off, span, source.data(),
+                    /*stream=*/0);
+#else
+                copy_engine_.queue(
+                    instr.source.file_id, off, span, source.data());
 #endif
-                {
-                    copy_engine_.queue(
-                        instr.source.file_id,
-                        instr.source.file_offset +
-                            instr.source.stride.base_offset +
-                            static_cast<std::uint64_t>(row_start) * row_bytes,
-                        static_cast<std::uint64_t>(rows) * row_bytes,
-                        source.data());
-                }
             }
         } else {
             if (instr.input_buffers.len != 1) {
@@ -1167,6 +1166,11 @@ private:
     std::size_t fp8_scale_local_bytes_ = 0;
     void* fp8_source_tile_ptr_ = nullptr;
     std::size_t fp8_source_tile_bytes_ = 0;
+    // Pooled tile buffer for non-FP8 (BF16/FP16/FP32) compact encode sources —
+    // the symmetric counterpart of fp8_source_tile_ptr_ (see acquire_encode_
+    // source_tile). Reused across tiles; freed in free_scratch_noexcept.
+    void* bf16_source_tile_ptr_ = nullptr;
+    std::size_t bf16_source_tile_bytes_ = 0;
 };
 
 }  // namespace pie_cuda_driver

@@ -438,3 +438,58 @@ harness is **composable + generative**, not a set of hand-written per-arch fixtu
 
 Items 1–3 are < 50-line patches in `rust_storage_executor.hpp`. Land them and
 re-measure on the B200 box before the larger A2/A3/B1 diffs.
+
+---
+
+## Transcode / quantize-on-load perf — empirical scoping
+
+**Landed:** encode-source pooling + stream-0 ordering for the non-FP8
+(BF16/FP16/FP32) compact `Encode` source in `transcode_engine.hpp`
+(`acquire_encode_source_tile`). Mirrors the FP8 path. Both a perf win (BF16→MXFP4
+951→574 ms; copy_flushes 1388→2) **and a silent-corruption fix** — the old
+round-robin BF16 source had no sync before the stream-0 encode, so it encoded
+*unwritten (zero) buffers*. Untested path (parity only covers FP8→MXFP4), so it
+shipped broken. Proven via byte-diff vs old binary + MXFP4 decode (corr 0.9954 vs
+source; old = all-zero, corr 0). Parity 0/24×3.
+
+Measured floor (synthetic glm_moe_dsa, L40, page-cache warm):
+- FP8→MXFP4 fused (glm/deepseek path), 1.64 GB: transfer=33 transform=205 (294 ms).
+- same model RAW (4-lane, no encode): transfer=111 (162 ms). ← the bandwidth floor.
+- BF16→MXFP4, 3.25 GB: 432 ms; RAW 187 ms.
+
+Bottleneck decomposition (post-fix):
+- transform ≈ expert source H2D (**single-thread ~10 GiB/s** via `queue_on_stream(0)`
+  — driver pageable staging from mmap, confirmed by direct_mmap bench 10.3 GiB/s)
+  + fused/encode kernels (compute-bound).
+- **Per-tile launch overhead is NOT a factor** post-fix: 8×4096 (168 tiles)=218 ms
+  vs 32×1024 (672 tiles)=205 ms, same bytes → fewer tiles no faster. So
+  **kernel-batching is OFF the table — no real gain.**
+
+### The ONE remaining real lever: multi-stream encode-source pipeline (~1.5×)
+Route the expert source H2D through the 4-thread **reader pool** (recovers ~10→~19
+GiB/s) instead of single-thread `queue_on_stream(0)`, and overlap the encode kernels
+with the next tile's copy. Estimated transform 205→~110 ms, total 294→~190 ms;
+generalizes to BF16→MXFP4 (~1.7×) and any transcode-heavy load (glm/kimi/deepseek
+quantize-on-load).
+
+**Why it's not a quick patch (hazards a naive version gets wrong):**
+- The host memcpy (mmap→pinned) is the bottleneck, *not* the DMA — so merely
+  K-laning CUDA streams (`queue_on_stream` per-stream) does NOT recover bandwidth;
+  the source must go through the reader-thread pool (`queue()`/pinned-staged).
+- That pool *defers* copies → needs **per-tile completion events** (not the old
+  per-tile full flush, which was the 1388-flush cost; not no-sync, which was the
+  zero-weight bug) so the encode waits only on *its* tile's copy.
+- The encode kernel on stream 0 has a **web of stream-0 dependencies** any
+  multi-stream version must make stream-aware: FP8 scale-cache load
+  (`ensure_fp8_scale_loaded`, stream 0), scale reblock D2D loop (TP-sharded),
+  dequant BF16 scratch. Each needs its own event/lane or a per-scale wait.
+- Source-tile buffer must become a small **ring** (depth = lanes) with reuse gated
+  by the consuming encode's completion.
+
+Do this as a focused pass with the **byte-diff differential harness** (it caught
+the last silent-corruption bug): validate FP8→MXFP4 AND BF16→MXFP4 bit-exact +
+parity + peak-mem before keeping. Correct-by-construction "same-stream K-lane"
+(copy+kernel on the same lane stream, no events) is the elegant target IF the
+scale/scratch deps can be cleanly laned; otherwise events.
+
+Everything else (dense / TP / fusion / pre-quantized) is at the hardware wall.
