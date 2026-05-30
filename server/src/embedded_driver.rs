@@ -21,7 +21,7 @@ use std::os::raw::{c_char, c_int, c_void};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, mpsc};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
 use serde::Deserialize;
@@ -135,34 +135,83 @@ struct PendingEmbeddedDriver {
 }
 
 impl PendingEmbeddedDriver {
+    /// Block until the driver hands back its capabilities, or fails.
+    ///
+    /// Three terminal conditions, each of which must be observed promptly:
+    ///   * caps arrive on the channel → success;
+    ///   * the driver thread exits without ever emitting caps (e.g. a
+    ///     model-load fatal: the C entry prints `[pie-driver-*] fatal: …`
+    ///     and returns nonzero) → fail with its rc;
+    ///   * neither happens within `timeout` → fail with a timeout.
+    ///
+    /// We poll the thread's liveness explicitly rather than lean on the
+    /// channel disconnecting when the thread dies. The caps `Sender` lives
+    /// inside the leaked `CapsCtx` (so the C `ready_cb` can reach it by raw
+    /// pointer for the thread's whole life) and is dropped *only* by
+    /// `embedded_caps_cb` on a successful emit — never by the thread merely
+    /// exiting. So a driver that dies before caps leaves the channel
+    /// connected-but-silent, and a plain `recv_timeout(timeout)` would
+    /// wedge here for the full `ready_timeout_s` (120s for portable) before
+    /// reporting a misleading timeout, hiding the real stderr fatal.
     fn wait_for_caps(&mut self, timeout: Duration) -> Result<DriverCapabilities> {
         let caps_rx = self
             .caps_rx
             .take()
             .ok_or_else(|| anyhow!("internal error: caps receiver missing"))?;
-        let json = match caps_rx.recv_timeout(timeout) {
-            Ok(j) => j,
-            Err(mpsc::RecvTimeoutError::Disconnected) => {
-                let thread = self.thread.take();
-                let rc = thread.map(|h| h.join().unwrap_or(-1)).unwrap_or(-1);
-                if !self.caps_ctx.is_null() {
-                    unsafe { drop(Box::from_raw(self.caps_ctx)) };
-                    self.caps_ctx = std::ptr::null_mut();
+        let deadline = Instant::now() + timeout;
+        // Short slices keep thread-death detection latency low while each
+        // `recv` still blocks (no busy-spin) between liveness checks.
+        let poll = Duration::from_millis(50);
+        loop {
+            match caps_rx.recv_timeout(poll) {
+                Ok(json) => return DriverCapabilities::from_json(&json),
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    return Err(self.exited_before_caps_err());
                 }
-                return Err(anyhow!(
-                    "driver thread exited (rc={rc}) before emitting capabilities; \
-                     check stderr for the [pie-driver-{}] error message",
-                    self.flavor.as_str(),
-                ));
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    let thread_exited = self
+                        .thread
+                        .as_ref()
+                        .map(|h| h.is_finished())
+                        .unwrap_or(true);
+                    if thread_exited {
+                        // Drain a caps payload that may have landed in the
+                        // same instant the thread exited, so an
+                        // emitted-then-exited driver isn't misreported.
+                        if let Ok(json) = caps_rx.try_recv() {
+                            return DriverCapabilities::from_json(&json);
+                        }
+                        return Err(self.exited_before_caps_err());
+                    }
+                    if Instant::now() >= deadline {
+                        return Err(anyhow!(
+                            "driver did not emit capabilities within {:.1}s",
+                            timeout.as_secs_f64()
+                        ));
+                    }
+                }
             }
-            Err(mpsc::RecvTimeoutError::Timeout) => {
-                return Err(anyhow!(
-                    "driver did not emit capabilities within {:.1}s",
-                    timeout.as_secs_f64()
-                ));
-            }
-        };
-        DriverCapabilities::from_json(&json)
+        }
+    }
+
+    /// Join the (exited) driver thread, reclaim the leaked caps box, and
+    /// build the "exited before caps" error carrying the thread's rc.
+    /// Shared by `wait_for_caps`'s thread-exit and channel-disconnect paths.
+    fn exited_before_caps_err(&mut self) -> anyhow::Error {
+        let rc = self
+            .thread
+            .take()
+            .map(|h| h.join().unwrap_or(-1))
+            .unwrap_or(-1);
+        if !self.caps_ctx.is_null() {
+            unsafe { drop(Box::from_raw(self.caps_ctx)) };
+            self.caps_ctx = std::ptr::null_mut();
+        }
+        anyhow!(
+            "driver thread exited (rc={rc}) before emitting capabilities; \
+             check stderr for the [pie-driver-{}] error message",
+            self.flavor.as_str(),
+        )
     }
 
     fn into_driver(mut self, caps: DriverCapabilities) -> EmbeddedDriver {
@@ -860,6 +909,62 @@ impl Drop for EmbeddedDriver {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wait_for_caps_reports_thread_exit_without_blocking_full_timeout() {
+        // Reproduce a driver that dies before emitting caps (e.g. a
+        // model-load fatal: the C entry prints `[pie-driver-*] fatal: …`
+        // then returns nonzero). The caps `Sender` is leaked into
+        // `CapsCtx` exactly as `spawn_rank` does, so the driver thread
+        // merely exiting does NOT drop it — only a successful
+        // `embedded_caps_cb` emit would. The thread here returns an rc
+        // without ever touching the callback, leaving the channel
+        // connected-but-silent: the precise condition that used to wedge
+        // `wait_for_caps` for the full `ready_timeout_s`.
+        let (caps_tx, caps_rx) = mpsc::sync_channel::<String>(1);
+        let caps_ctx = Box::into_raw(Box::new(CapsCtx {
+            tx: Mutex::new(Some(caps_tx)),
+        }));
+        let thread = std::thread::Builder::new()
+            .name("pie-driver-test-dead".into())
+            .spawn(|| -> i32 { -1 })
+            .unwrap();
+
+        let mut pending = PendingEmbeddedDriver {
+            flavor: Flavor::Dummy,
+            shmem_name: "/pie_shmem_test".to_string(),
+            aux_socket_path: PathBuf::from("/tmp/pie-test-aux.sock"),
+            thread: Some(thread),
+            caps_ctx,
+            caps_rx: Some(caps_rx),
+            state_dir: PathBuf::from("/tmp/pie-test-state"),
+        };
+
+        // Generous timeout: pre-fix this call blocks the whole duration
+        // then returns a *timeout* error; post-fix it must notice the dead
+        // thread and return an *exit* error in a small fraction of it.
+        let timeout = Duration::from_secs(5);
+        let start = Instant::now();
+        let err = pending
+            .wait_for_caps(timeout)
+            .expect_err("a driver that exits before caps must surface an error");
+        let elapsed = start.elapsed();
+
+        let msg = err.to_string();
+        assert!(
+            msg.contains("driver thread exited") && msg.contains("before emitting capabilities"),
+            "expected an exited-before-caps error, got: {msg}"
+        );
+        assert!(
+            !msg.contains("did not emit capabilities within"),
+            "must not misreport thread death as a ready timeout: {msg}"
+        );
+        assert!(
+            elapsed < timeout / 2,
+            "wait_for_caps must detect thread exit promptly, not block the \
+             full ready_timeout (took {elapsed:?} of {timeout:?})"
+        );
+    }
 
     #[test]
     fn shmem_name_format() {
