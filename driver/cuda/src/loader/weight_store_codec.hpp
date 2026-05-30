@@ -1,10 +1,11 @@
 #pragma once
 
-// PIEWCAC3 weight-store codec: serialize a materialized WeightStore to a byte
-// stream, and restore one from a byte buffer. This is the loader's API for
-// persisting/reloading finished device weights; it owns the on-disk byte format
-// and the integrity checksum but knows nothing about caches, directories, keys,
-// or eviction (the driver owns that policy — see model/weight_artifact_cache.hpp).
+// Weight-store codec (PIEWSTOR format): serialize a materialized WeightStore to a
+// byte stream, and restore one from a byte buffer. A general conversion/load
+// primitive for finished device weights — it owns the on-disk byte format and the
+// integrity checksum but knows nothing about caches, directories, keys, or
+// eviction. The artifact cache (model/weight_artifact_cache.hpp) is one consumer:
+// it owns that policy and uses serialize/restore as opaque byte conversion.
 //
 // Memory model: the WeightStore is a set of *owned* DeviceTensors (the storage
 // arena + any separately-owned buffers) and *view* DeviceTensors that point into
@@ -41,7 +42,7 @@
 
 namespace pie_cuda_driver::weight_codec {
 
-inline constexpr char kMagic[8] = {'P', 'I', 'E', 'W', 'C', 'A', 'C', '3'};
+inline constexpr char kMagic[8] = {'P', 'I', 'E', 'W', 'S', 'T', 'O', 'R'};
 inline constexpr std::uint32_t kFormatVersion = 3;
 // Blob checksum fold granularity. Boundary-DEPENDENT (see blob_hash_update), so
 // serialize and restore MUST fold in identical chunks; both use this constant.
@@ -362,8 +363,8 @@ inline bool serialize_weight_store(const WeightStore& store,
 #endif
 }
 
-// Restore a store from a contiguous byte buffer `data` (typically the mmap'd
-// cache file), which must remain valid for the duration of the call. Returns
+// Restore a store from a contiguous byte buffer `data` (e.g. a mmap'd file),
+// which must remain valid for the duration of the call. Returns
 // false on magic/version/key mismatch or corruption (a "miss" the caller falls
 // back from); the blobs are streamed to device through `pool` and each blob's
 // checksum is verified concurrently with the copy when `verify` is set.
@@ -388,7 +389,7 @@ inline bool restore_weight_store(const std::uint8_t* data, std::size_t size,
         return false;
     }
     if (get_str(is) != expected_key) {
-        return false;  // stale/foreign cache; treat as miss
+        return false;  // key mismatch — stale/foreign store
     }
     const auto num_owned = get_scalar<std::uint64_t>(is);
     const auto num_views = get_scalar<std::uint64_t>(is);
@@ -447,7 +448,7 @@ inline bool restore_weight_store(const std::uint8_t* data, std::size_t size,
         if (t.nbytes() != o.nbytes) {
             std::fprintf(stderr,
                 "[pie-driver-cuda] weight codec: nbytes mismatch for '%s' — "
-                "discarding cache\n", o.spec.name.c_str());
+                "discarding restore\n", o.spec.name.c_str());
             return false;
         }
         copies.push_back(StagedCopy{t.data(), blobs + o.blob_offset, o.nbytes});
@@ -482,7 +483,7 @@ inline bool restore_weight_store(const std::uint8_t* data, std::size_t size,
     }
     if (verify && !checksum_ok) {
         std::fprintf(stderr,
-            "[pie-driver-cuda] weight codec: checksum mismatch — discarding cache\n");
+            "[pie-driver-cuda] weight codec: checksum mismatch — discarding restore\n");
         return false;
     }
 

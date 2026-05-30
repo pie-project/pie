@@ -24,7 +24,7 @@ real supported layouts *and* arbitrary random compositions with one code path.
   all derive their tables from the one `DTYPES` list here.
 - **`gen.py`** — writes a tiny checkpoint (config.json + single-shard safetensors
   + index, deterministic random fill; safetensors written by hand, numpy only).
-- **`parse_cache.py`** — reads the materialized artifact cache (PIEWCAC3) and
+- **`parse_cache.py`** — reads the materialized artifact cache (PIEWSTOR) and
   source safetensors into `{name: Tensor}`.
 - **`oracle.py`** — the **generic** checker. Classifies each materialized tensor
   against the source with no per-model knowledge:

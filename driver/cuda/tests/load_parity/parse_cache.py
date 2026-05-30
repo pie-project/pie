@@ -1,4 +1,4 @@
-"""Reader for the materialized-weight artifact cache (PIEWCAC3 format, see
+"""Reader for the materialized-weight artifact cache (PIEWSTOR format, see
 driver/cuda/src/loader/weight_artifact_cache.hpp).
 
 Parses a `<key>.weights` file into the FINAL materialized form of every tensor
@@ -100,7 +100,7 @@ def read_cache(path: str) -> dict[str, Tensor]:
     """Parse a .weights file -> {name: Tensor} of final materialized tensors."""
     r = _Reader(open(path, "rb").read())
     magic = r.take(8)
-    assert magic == b"PIEWCAC3", f"bad magic {magic!r}"
+    assert magic == b"PIEWSTOR", f"bad magic {magic!r}"
     r.u32()                 # format_version
     r.s()                   # cache_key
     n_owned = r.u64()

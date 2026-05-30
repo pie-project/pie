@@ -1,6 +1,6 @@
 """Single source of truth for the dtype metadata the harness shares across the
 write side (gen.py), the read side (parse_cache.py) and the compare side
-(oracle.py). Keyed by the cache dtype tag (the driver DType enum / PIEWCAC3
+(oracle.py). Keyed by the cache dtype tag (the driver DType enum / PIEWSTOR
 order). Everything else derives from the one DTYPES table below.
 """
 
@@ -19,7 +19,7 @@ class DType:
     st: bool          # appears in safetensors checkpoints (gen writes these)
 
 
-# Order == the driver DType enum / PIEWCAC3 tag values. Add a row to extend.
+# Order == the driver DType enum / PIEWSTOR tag values. Add a row to extend.
 DTYPES: list[DType] = [
     DType(0, "BF16", "bf16", 2, False, True),
     DType(1, "F16", "f16", 2, False, True),
