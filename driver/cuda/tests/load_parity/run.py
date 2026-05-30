@@ -103,17 +103,22 @@ def materialize(snap: Path, runtime_quant: str, env_extra: dict, cache_dir: Path
         assert proc.stdout is not None
         os.set_blocking(proc.stdout.fileno(), False)
         while time.time() < deadline and proc.poll() is None:
+            # Completion = `tp` atomically-renamed .weights files exist (so a
+            # file's presence means it is fully written). Check first, every
+            # iteration, so we wait out a slower second rank under tp>1.
+            if len(list(cache_dir.glob("*.weights"))) >= tp:
+                break
             line = proc.stdout.readline()
             if not line:
-                if len(list(cache_dir.glob("*.weights"))) >= tp:
-                    break
-                time.sleep(0.05)
+                time.sleep(0.02)
                 continue
             s = line.decode("utf-8", "replace")
             lines.append(s)
-            if len(list(cache_dir.glob("*.weights"))) >= tp:
-                break
-            if ("error" in s.lower() or "panic" in s.lower() or "fatal" in s.lower()
+            # Keep draining stdout the whole time: if we stop reading, a verbose
+            # server can fill its stdout pipe, block on write(), and then never
+            # finish a rank's cache write. Only stop early on a real hard error
+            # (a benign line containing "error" must not abort the wait).
+            if ("panic" in s.lower() or "fatal" in s.lower()
                     or "did not cover" in s or "CUDA error" in s):
                 break
     finally:

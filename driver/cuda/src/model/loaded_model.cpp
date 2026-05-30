@@ -14,7 +14,7 @@
 #include "ops/gemm.hpp"
 #include "loader/rust_loader_bridge.hpp"
 #include "loader/rust_storage_executor.hpp"
-#include "loader/weight_artifact_cache.hpp"
+#include "model/weight_artifact_cache.hpp"
 #include "tensor.hpp"
 
 namespace pie_cuda_driver {
@@ -514,6 +514,13 @@ LoadedModel LoadedModel::load(const Config& boot_cfg, NcclComm* tp_comm) {
                   << materialized.h2d_batch_calls
                   << " max_pending="
                   << materialized.max_pending_copies_seen << "\n";
+        std::cerr << "[pie-driver-cuda] weight loader phases: alloc="
+                  << static_cast<int>(materialized.phase_alloc_ms)
+                  << "ms transfer=" << static_cast<int>(materialized.phase_transfer_ms)
+                  << "ms (pinned_alloc="
+                  << static_cast<int>(materialized.phase_pinned_alloc_ms)
+                  << "ms) transform="
+                  << static_cast<int>(materialized.phase_transform_ms) << "ms\n";
     }
 
     e.weights_.validate_quant_metadata();
