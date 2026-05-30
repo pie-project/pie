@@ -152,6 +152,8 @@ public:
     void reserve(std::size_t n) { store_.reserve(n); }
     void finalize() { store_.finalize(); }
 
+    const WeightStore& store() const noexcept { return store_; }
+
     WeightStore::iterator find(const std::string& name) {
         return store_.find_mut(name);
     }

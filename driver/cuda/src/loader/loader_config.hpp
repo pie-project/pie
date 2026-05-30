@@ -30,7 +30,16 @@ inline constexpr std::size_t kPinnedSlotsMax = 128;
 
 // --- parallel host reader lanes ---
 inline constexpr std::size_t kReaderThreadsDefault = 4;
-inline constexpr std::uint64_t kReaderBufBytesDefault = 32ull * kMiB;
+// Per-lane double-buffer size. The staged H2D is host-memcpy-bound (mmap page
+// cache -> pinned -> DMA), so a large buffer buys no transfer throughput once
+// the chunk clears the PCIe small-copy cliff (~1 MiB); it only inflates the
+// one-time cudaMallocHost page-locking cost, which is paid on every load
+// (lanes*2*buf pinned). Profiling on an L40 (Qwen3-1.7B, page cache warm):
+// 32 MiB -> ~665 ms load (256 MiB pinned, ~158 ms page-lock, high variance);
+// 2 MiB -> ~268 ms load (16 MiB pinned, ~12 ms page-lock) at the same
+// ~13-15 GiB/s copy rate. 2 MiB is also robust for many-small-tensor (FP8)
+// checkpoints where 1 MiB starts to fragment.
+inline constexpr std::uint64_t kReaderBufBytesDefault = 2ull * kMiB;
 
 // --- transcode / quant ---
 inline constexpr std::uint64_t kFallbackTileBytes = 64ull * kMiB;  // when max_tile_bytes==0
@@ -66,6 +75,21 @@ inline std::uint64_t env_u64_or(const char* name, std::uint64_t fallback)
     const char* v = std::getenv(name);
     return v == nullptr ? fallback
                         : static_cast<std::uint64_t>(std::strtoull(v, nullptr, 10));
+}
+
+// Parallel host-reader-lane knobs, shared by the storage executor's bulk flush
+// and the artifact-cache restore so both stage H2D the same way. A lane count of
+// 0 means "no reader lanes" (the executor's direct mmap->device fallback).
+inline std::size_t reader_lane_count()
+{
+    return static_cast<std::size_t>(
+        env_u64_or("PIE_CUDA_WEIGHT_READER_THREADS", kReaderThreadsDefault));
+}
+
+inline std::uint64_t reader_buf_bytes()
+{
+    const std::uint64_t mb = env_u64("PIE_CUDA_WEIGHT_READER_BUF_MB", 0);
+    return mb != 0 ? mb * kMiB : kReaderBufBytesDefault;
 }
 
 }  // namespace pie_cuda_driver::loader_config

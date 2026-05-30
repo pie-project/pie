@@ -2042,3 +2042,194 @@ ABI. The previous generic XQA attempt was not that path and was slower.
     `PIE_CUBLASLT_BF16_MIN_N=100000` regressed to 7,439.82 output tok/s
     (`pie_8b_tp2_xqaoff_prefill6144_lmheadlt_512x128.json`).
   - These are not worth carrying as model-specific complexity.
+
+## Weight-loader load-time profiling (L40, single-GPU cold load)
+
+Goal: profile the materialize path against the ideal "all final bytes are
+already in one pinned host buffer; load is a single H2D memcpy" and remove any
+overhead that is not fundamental, without adding model-specific complexity.
+
+### Hardware ceilings (NVIDIA L40, PCIe Gen4 x16)
+
+- Pinned H2D, single contiguous buffer: **~21.5 GiB/s** steady (>=1 GiB);
+  pageable only ~15 GiB/s.
+- Per-copy size cliff: throughput holds at ~21 GiB/s down to **1 MiB** chunks,
+  drops to 15.8 at 256 KiB, and collapses to **4 GiB/s at 64 KiB**.
+- Disk / page-cache single-thread read: ~3-8 GiB/s — the loader's true bound on
+  a cold first load is host I/O, not H2D.
+- So the "ideal single memcpy" of a 1.4 GiB model is ~65 ms; a cold load is
+  bounded by the disk read (the cold path overlaps H2D behind it).
+
+### Phase attribution (PIE_WEIGHT_LOADER_PROFILE)
+
+Added always-on phase timers (alloc / transfer / transform / pinned_alloc) to
+`execute()`, surfaced under `PIE_WEIGHT_LOADER_PROFILE`. With the page cache
+warm the dense bf16 materialize is one final `parallel_staged_flush`, and the
+timers showed a large *fixed* cost that was not transfer:
+
+  Qwen3-1.7B, 3875 MiB: transfer=455 ms of which **pinned_alloc=163 ms**.
+
+The reader lanes allocate `lanes*2*reader_buf` pinned bytes via `cudaMallocHost`
+on every load. Default 4 lanes x 2 x 32 MiB = **256 MiB pinned**, and page-locking
+runs at ~1.5 GiB/s -> ~155-185 ms paid on *every* load, with high variance under
+memory pressure.
+
+### What survived: shrink the reader staging buffer (32 MiB -> 2 MiB)
+
+The staged H2D is host-memcpy-bound (mmap page cache -> pinned -> DMA), so a large
+per-lane buffer buys no transfer throughput once the chunk clears the ~1 MiB PCIe
+cliff; it only inflates the one-time page-lock. Buffer sweep on Qwen3-1.7B
+(total load, page cache warm): 32 MiB -> ~665 ms (256 MiB pinned, high variance);
+16 MiB -> 361; 8 -> 302; 4 -> 266; **2 MiB -> ~268 ms (16 MiB pinned, ~12 ms
+page-lock)**; 1 MiB starts to fragment many-small-tensor (FP8) checkpoints.
+
+2 MiB is the robust default. Median full cold load, before -> after:
+
+  Qwen3-0.6B      409 -> 205 ms  (2.0x)
+  Qwen3-1.7B      489 -> 245 ms  (2.0x)
+  Qwen3-0.6B-FP8  415 -> 242 ms  (1.7x)
+
+One constant (`loader_config::kReaderBufBytesDefault`); copy rate unchanged
+(~13-15 GiB/s); byte-identical output (load-parity 0 failures across 36 recipes
+x 3 modes; 13+13 Rust loader unit tests pass). On a truly cold-disk first load
+the relative win shrinks (disk dominates) but the ~150 ms page-lock saving is
+removed regardless, so it is a strict improvement.
+
+### Rejected / deferred
+
+- **`cudaHostRegister` the mmap and DMA directly** (skip the memcpy-to-pinned
+  pass): the direct copy hits the 22 GiB/s ceiling, but *registering* 3.2 GiB
+  costs ~268 ms — far more than the ~207 ms memcpy it saves. The small reusable
+  pinned ring is the right design. Rejected.
+- **More reader lanes**: 4 is optimal on warm page cache; 8/16 are within noise.
+  No change.
+- **Warm artifact-cache reload path** (`PIE_CUDA_WEIGHT_CACHE_DIR`, opt-in): the
+  reload loop is serial read -> verify -> H2D on a *pageable* buffer
+  (Qwen: read=253 ms, verify=63 ms, h2d=71 ms, serial_sum=387 ms). Pipelining it
+  with the pinned reader-lane machinery + overlapped hashing would cut ~35-45%,
+  but the path is opt-in and only the parity harness sets the cache dir today, so
+  it is deferred, not implemented.
+- **Async cache write**: the first-load cache write is a blocking ~1.1 s for
+  1.5 GiB (weights are already resident; it is pure persistence). Backgrounding
+  it would remove that from startup latency for cache-enabled deployments.
+  Deferred (opt-in path).
+
+## Weight-loader API cleanup + faster artifact-cache reload
+
+Goal: give the artifact cache the same fast H2D path as the cold load, and split
+the layering cleanly — the loader provides serialize/restore primitives; the
+driver owns the caching policy. The on-disk format (PIEWCAC3 v3) is unchanged, so
+existing `.weights` files stay valid.
+
+### Shared staged-H2D engine (loader/staged_h2d.hpp)
+
+Extracted the executor's pinned-pipelined copy (reader lanes + double-buffered
+pinned staging + async H2D) into one free function `staged_pinned_h2d(pool,
+copies)` over a caller-owned `PinnedLanePool`. The executor's `parallel_staged_
+flush` is now a thin adapter; cache restore reuses the same engine. Copies are
+sliced into <= buf-sized sub-chunks and split into one contiguous run per lane,
+so a single large buffer (a dense model's whole arena is one owned blob) still
+saturates every lane instead of stalling one — this is what made the reload of a
+single-arena model parallelize (4.5 -> ~9 GiB/s).
+
+### Codec / policy split
+
+- **loader/weight_store_codec.hpp** (loader API): owns the PIEWCAC3 byte format +
+  integrity checksum. `serialize_weight_store(store, key, ostream)` and
+  `restore_weight_store(data, size, key, verify, builder, pool)`. Knows nothing
+  about caches/dirs/keys. restore mmaps via the caller's pointer, streams blobs
+  through `staged_pinned_h2d`, and verifies each blob's checksum on a side thread
+  concurrently with the DMA.
+- **model/weight_artifact_cache.hpp** (driver policy, moved out of loader/): owns
+  the cache dir, key->path, free-space guard, temp+atomic-rename write, and the
+  mmap-backed read. Delegates all serialization to the codec. The old
+  loader/weight_artifact_cache.hpp (617 lines, tangled policy + format + a naive
+  serial pageable reload) is deleted.
+
+### Result (L40, file warm in page cache)
+
+Reload, serial pageable (old) -> pinned/pipelined/byte-balanced (new):
+  Qwen3-0.6B      387 ms serial_sum -> ~150 ms best (2.6x)
+  Qwen3-0.6B-FP8  223 ms serial_sum -> ~110 ms      (2x)
+Cold load unchanged (byte-level lane balancing is a no-regression win for it too).
+Byte-identical output: load-parity 0 failures across 36 recipes x 3 modes (x2),
+13+13 Rust loader unit tests pass. Reload is bounded by max(disk read, host
+memcpy); when the `.weights` file is cold it is disk-bound regardless.
+
+### Test-harness flake fixed
+
+The tp>1 parity path intermittently failed: the runner broke its stdout read loop
+on a benign line containing "error", then a non-draining grace poll let the
+verbose server fill its stdout pipe, block on write(), and never finish a rank's
+cache write. The runner now drains stdout continuously and only hard-stops on
+real fatal markers; .weights files are atomically renamed so presence == complete.
+
+### Rejected: async (background) cache write
+
+qwen3.5/3.6 call erase_runtime_weight (-> cudaFree) during forward-graph
+construction *after* load() returns, so a background D2H from the weight store
+would race a free (use-after-free). The safe variants (synchronous host
+D2H-snapshot + async file write; or coupling the write's lifetime to the
+startup/erase sequence) are costly (model-size host RAM) or fragile for a cost
+paid only once, on the first cache-populating boot. Not implemented.
+
+## B6: split the monolithic storage-executor header
+
+The executor (rust_storage_executor.hpp) had grown to ~2.4k lines because almost
+every method mutates the same shared state (the buffer map, the storage-program
+index, the loader, the stats). Rather than force fake sub-objects with callbacks,
+the split extracts the pieces with genuinely cohesive owned state and a narrow
+interface:
+
+- **loader/dtype_map.hpp** — pure Rust-enum -> runtime-type mappers
+  (dtype_from_rust / quant_meta_kind / quant_physical_dtype), no state, no CUDA.
+- **loader/phase_timer.hpp** — the shared scoped PhaseTimer (executor + copy engine
+  report into the same LoadExecutionStats phase counters).
+- **loader/weight_copy_engine.hpp** — `WeightCopyEngine`: the entire host->device
+  copy path (copy streams, pinned staging slots, the parallel reader-lane pool, the
+  pending/batched queue). Its only dependencies are the checkpoint source (host
+  bytes) and an optional stats sink — it never touches the buffer map or program,
+  which is why it cuts cleanly. Interface: queue() / queue_on_stream() / flush() /
+  acquire_stream() (the last lets slab-scatter borrow a round-robin stream). The
+  executor holds one as a member and delegates; `active_stats_` turned out to be
+  used only by the copy path, so it left the executor entirely.
+
+Result: rust_storage_executor.hpp 2389 -> 1881 lines; the copy subsystem is now a
+445-line unit reused by nothing-yet-but-ready and isolated for testing. Behavior
+is unchanged: cold load no-regression (~250-270 ms on Qwen3-1.7B), load-parity 0
+failures across 36 recipes x 3 modes, and the 45 Rust loader tests pass — including
+the standalone `cuda_rust_executor_header_compiles` check, which caught a real
+guard bug (the destructor's slab-free call must sit inside `#if ...HAS_CUDA`, since
+free_slab_buffers_noexcept is only defined under CUDA).
+
+Not extracted: the ~1000-line transcode/quant subsystem (tile_map / encode /
+repack / reblock + FP8 scratch). It is coupled to the copy engine, the buffer map,
+and the loader, so a clean extraction needs the copy-engine seam first — which now
+exists. Left as the documented next step.
+
+### B6 follow-up: transcode/quant subsystem extracted
+
+The ~1050-line transcode/quant path (the TileMap kinds: Cast / Encode FP8->bf16->
+FP8|MXFP4 / Repack Marlin / Reblock, plus FP8 dequant + the encode scratch) now
+lives in **loader/transcode_engine.hpp** as `TranscodeEngine`. Its dependencies
+are genuine inputs, injected by reference: the checkpoint source, the source-tensor
+names, the WeightCopyEngine, the storage-program index, and a BufferResolver; it
+owns the FP8 encode scratch. The executor holds one and delegates the TileMap
+dispatch.
+
+Two shared primitives were factored out so both the executor and the engine use
+them without one owning the other:
+- **loader/buffer_resolver.hpp** — `BufferResolver` maps a buffer id to its
+  DeviceTensor (live working set, or finalized into the WeightStore). Used by the
+  executor's CreateView and the engine's input/output lookups.
+- **loader/strided_copy.hpp** — the non-compact strided H2D copy, a free function
+  over the checkpoint source. Used by ExtentWrite and the Encode source path.
+
+Result: rust_storage_executor.hpp 1881 -> 675 lines — now just the materialize VM
+(the execute() dispatch loop + allocate/arena + extent/bulk write + slab-scatter +
+create-view + finalize + quant-metadata). The loader's C++ is now: executor (675)
++ weight_copy_engine (445) + transcode_engine (1172) + small shared headers
+(buffer_resolver/strided_copy/dtype_map/phase_timer/staged_h2d). Validated:
+cold-load no-regression, FP8 load OK, load-parity 0 failures across 36 recipes x 3
+modes (x2, incl. the fused/unfused MXFP4 differential), 45 Rust loader tests pass
+incl. the standalone header-compile check.

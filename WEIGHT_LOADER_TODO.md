@@ -341,21 +341,28 @@ Kimi could load+materialize but never serve.
   dispatch) + a sync comment. They now reach bind + the forward path. Full serve
   end-to-end still owed (re-download; may surface a separate glm5 forward-graph issue).
 
-### B6 — Split the monolithic executor — ◻ PARTIAL (stateless seams out; stateful core remains)
-`rust_storage_executor.hpp` is ~2400 lines of header.
-- **Done (safe, verified):** the stateless utility seams are now separate headers —
-  `loader_config.hpp` (constants + env knobs, Phase 3) and `loader_helpers.hpp`
-  (`next_power_of_two` / `checked_mul_u64` / `checked_int` / `checked_nibble_bytes` /
-  `expand_e8m0_to_f32`, free functions in `pie_cuda_driver` so call sites are
-  unchanged). Gated by build + parity.
-- **Remaining (deliberate standalone pass):** the *stateful* clusters — copy engine
-  (streams + pinned pool + reader lanes, ~540 lines), encode/transcode pipeline
-  (~280 lines), arena/finalize — into member sub-objects. Higher risk: it touches
-  CUDA lifecycle/destructor ordering, which the parity harness (kills the process
-  after the cache write) does **not** fully exercise — so it needs a real serve
-  smoke-test as its gate, not just parity. Modest build-time payoff (few TUs).
-  The dtype/enum mappers are also extractable but pull `tensor.hpp` +
-  `weight_store.hpp` + `tensor_spec.hpp` coupling — bundle with that pass.
+### B6 — Split the monolithic executor — ✅ DONE
+`rust_storage_executor.hpp` went 2389 → 675 lines; it is now just the materialize
+VM (the `execute()` dispatch loop + allocate/arena + extent/bulk write + slab-
+scatter + create-view + finalize + quant-metadata). The cohesive subsystems are
+now their own headers, each a member the executor delegates to:
+- **`loader/staged_h2d.hpp`** — `staged_pinned_h2d` + `PinnedLanePool`: the shared
+  pinned-pipelined H2D engine (reused by the copy engine *and* the cache restore).
+- **`loader/weight_copy_engine.hpp`** — `WeightCopyEngine`: copy streams + pinned
+  staging slots + reader-lane pool + pending/batched queue. Narrow interface
+  (loader + stats sink + raw dst; `acquire_stream()` for slab-scatter).
+- **`loader/transcode_engine.hpp`** — `TranscodeEngine`: the TileMap quant path
+  (Cast / Encode / Repack / Reblock + FP8 scratch). Deps injected by ref (loader,
+  source names, copy engine, program index, `BufferResolver`).
+- **shared primitives:** `dtype_map.hpp` (rust-enum → runtime-type mappers),
+  `phase_timer.hpp`, `buffer_resolver.hpp` (buffer-id → DeviceTensor),
+  `strided_copy.hpp` (non-compact strided H2D).
+Each extraction was gated by build + parity (0 failures / 36 recipes × 3 modes) +
+the 45 Rust loader tests, including the standalone `cuda_rust_executor_header_
+compiles` check (which caught a real CUDA-guard bug during the work). The artifact
+cache was also split into a loader codec (`weight_store_codec.hpp`, owns the
+PIEWCAC3 format + a pinned/pipelined restore) and a driver-policy layer
+(`model/weight_artifact_cache.hpp`).
 
 ### Smell cleanup refactor — ✅ DONE (Phases 1-4; SSOT theme)
 Removed scattered hardcoding / duplication across the stack; every phase gated by
