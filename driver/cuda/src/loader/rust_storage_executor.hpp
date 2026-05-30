@@ -567,17 +567,34 @@ private:
         finalized_buffer_names_[instr.buffer_id] = runtime_name;
     }
 
-    void convert_e8m0_scale_to_f32(const std::string& name)
+    // Normalize a block/group FP8 weight scale to FP32 (the gemm_act_x_w FP8
+    // path requires FP32). Handles both shipped formats: E8M0 bytes (DeepSeek-V4,
+    // expanded to 2^(b-127)) and BF16 block scales (Qwen3-FP8 / dense block-FP8,
+    // where BF16 is the high 16 bits of the F32). FP32 passes through unchanged.
+    void convert_block_scale_to_f32(const std::string& name)
     {
 #if PIE_CUDA_RUST_STORAGE_EXECUTOR_HAS_CUDA
         const auto& t = weights_.get(name);
         if (t.dtype() == DType::FP32) return;
-        if (t.dtype() != DType::UINT8) return;
         const auto& shape = t.shape();
         const std::size_t n = t.numel();
-        std::vector<std::uint8_t> e8m0(n);
-        CUDA_CHECK(cudaMemcpy(e8m0.data(), t.data(), n, cudaMemcpyDeviceToHost));
-        const std::vector<float> f32 = expand_e8m0_to_f32(e8m0.data(), n);
+        std::vector<float> f32;
+        if (t.dtype() == DType::UINT8) {
+            std::vector<std::uint8_t> e8m0(n);
+            CUDA_CHECK(cudaMemcpy(e8m0.data(), t.data(), n, cudaMemcpyDeviceToHost));
+            f32 = expand_e8m0_to_f32(e8m0.data(), n);
+        } else if (t.dtype() == DType::BF16) {
+            std::vector<std::uint16_t> bf16(n);
+            CUDA_CHECK(cudaMemcpy(bf16.data(), t.data(),
+                                  n * sizeof(std::uint16_t), cudaMemcpyDeviceToHost));
+            f32.resize(n);
+            for (std::size_t i = 0; i < n; ++i) {
+                const std::uint32_t bits = static_cast<std::uint32_t>(bf16[i]) << 16;
+                std::memcpy(&f32[i], &bits, sizeof(float));
+            }
+        } else {
+            return;  // unsupported scale dtype — the GEMM reports it clearly
+        }
 
         // A 2D block scale [row_blocks, col_blocks] keeps its shape so per-group
         // dequant can index it; a 1D scale collapses to [n].
@@ -616,7 +633,7 @@ private:
             const bool is_mxfp4_scale = (attachment.group_size == 32);
             std::string scale_name = attachment.scale_tensor_name;
             if (!is_mxfp4_scale) {
-                convert_e8m0_scale_to_f32(attachment.scale_tensor_name);
+                convert_block_scale_to_f32(attachment.scale_tensor_name);
                 const std::string f32_name =
                     attachment.scale_tensor_name + ".f32";
                 if (weights_.find(f32_name) != weights_.end()) {

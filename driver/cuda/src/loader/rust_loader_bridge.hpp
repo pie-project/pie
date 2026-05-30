@@ -502,6 +502,41 @@ inline std::vector<RustQuantAttachment> infer_rust_quant_attachments(
         return attachments;
     }
 
+    // Dense pre-quantized block-FP8 (e.g. Qwen3-FP8, Llama-FP8): every linear
+    // weight ships as raw F8_E4M3 paired with a [N/128, K/128] `weight_scale_inv`
+    // block scale (weight_block_size [128,128]). Same handling as GLM/V4 block
+    // FP8 — PerGroup/128 — but keyed off the FP8 quant_method so it covers any
+    // dense arch. (deepseek_v4/glm/gpt_oss have their own scale conventions and
+    // returned above.)
+    if (hf.quant_method == "fp8" && hf.model_type != "deepseek_v4" &&
+        hf.model_type != "glm_moe_dsa" && !is_gpt_oss) {
+        std::unordered_map<std::string, pie_weight_loader::PieLoaderDType> dtype_for;
+        dtype_for.reserve(view.tensors.len);
+        for (std::size_t i = 0; i < view.tensors.len; ++i) {
+            dtype_for.emplace(
+                rust_loader_bytes_to_string(view.tensors.ptr[i].name),
+                view.tensors.ptr[i].dtype);
+        }
+        for (const auto& name : runtime_names) {
+            if (!rust_loader_ends_with(name, ".weight")) continue;
+            auto it = dtype_for.find(name);
+            if (it == dtype_for.end() ||
+                it->second != pie_weight_loader::PieLoaderDType::F8E4M3) {
+                continue;
+            }
+            const std::string scale = name + "_scale_inv";
+            if (!present.contains(scale)) continue;
+            attachments.push_back(RustQuantAttachment{
+                .tensor_name = name,
+                .scale_tensor_name = scale,
+                .granularity = QuantGranularity::PerGroup,
+                .group_size = 128,
+                .channel_axis = 0,
+            });
+        }
+        return attachments;
+    }
+
     // GLM-5.1 ships scales as 2D block tensors (128x128 blocks), e.g.
     // weight [2048, 6144] pairs with weight_scale_inv [16, 48]. Use
     // PerGroup with group_size=128 — same handling as V4's block FP8.
