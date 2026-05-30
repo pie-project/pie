@@ -31,17 +31,42 @@ use crate::shmem::{METHOD_TAG_FIRE_BATCH, ShmemServer};
 
 pub type ReadyCb = unsafe extern "C" fn(caps_json: *const c_char, ctx: *mut c_void);
 
+/// Fatal callback type. Invoked at most once with the failure reason
+/// (NUL-terminated) just before a nonzero return. Nullable / opt-in — mirrors
+/// the C++ drivers' `pie_driver_*_fatal_cb`.
+pub type FatalCb = unsafe extern "C" fn(reason: *const c_char, ctx: *mut c_void);
+
 /// Process-global handles to every running dummy shmem server. The Rust
 /// server can embed multiple same-flavor DP replicas in one process, so
 /// `request_stop` must stop all live instances.
 static SERVERS: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+
+/// Route a fatal reason through `fatal_cb` if one was provided. Mirrors the
+/// `if (fatal_cb) fatal_cb(...)` pattern in the C++ entries; the stderr line
+/// is printed separately by the caller for back-compat.
+///
+/// # Safety
+/// `fatal_cb` must be a valid function pointer and `fatal_ctx` the context it
+/// expects; the callback receives a transient NUL-terminated string.
+unsafe fn report_fatal(reason: &str, fatal_cb: FatalCb, fatal_ctx: *mut c_void) {
+    // A NUL inside the reason would truncate the C string; fall back to a fixed
+    // message so the callback still fires with something meaningful.
+    match CString::new(reason) {
+        Ok(c) => unsafe { fatal_cb(c.as_ptr(), fatal_ctx) },
+        Err(_) => {
+            let fallback = CString::new("fatal reason contained a NUL byte").unwrap();
+            unsafe { fatal_cb(fallback.as_ptr(), fatal_ctx) };
+        }
+    }
+}
 
 /// Library entry point. Mirrors the C++ `pie_driver_portable_run`.
 ///
 /// # Safety
 /// `argv` must point to `argc` C strings; `ready_cb` must be a valid
 /// function pointer or null. The string handed to `ready_cb` is owned
-/// by this function and freed before return.
+/// by this function and freed before return. `fatal_cb` is invoked once with
+/// `fatal_ctx` and the failure reason just before a nonzero return.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pie_driver_dummy_run(
     argc: c_int,
@@ -49,6 +74,8 @@ pub unsafe extern "C" fn pie_driver_dummy_run(
     _install_signal_handlers: c_int,
     ready_cb: ReadyCb,
     ready_ctx: *mut c_void,
+    fatal_cb: FatalCb,
+    fatal_ctx: *mut c_void,
 ) -> c_int {
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         run_impl(argc, argv, ready_cb, ready_ctx)
@@ -57,11 +84,14 @@ pub unsafe extern "C" fn pie_driver_dummy_run(
     match result {
         Ok(Ok(())) => 0,
         Ok(Err(e)) => {
-            eprintln!("[pie-driver-dummy] fatal: {e:#}");
+            let reason = format!("{e:#}");
+            eprintln!("[pie-driver-dummy] fatal: {reason}");
+            unsafe { report_fatal(&reason, fatal_cb, fatal_ctx) };
             -1
         }
         Err(_) => {
             eprintln!("[pie-driver-dummy] fatal: panic");
+            unsafe { report_fatal("panic", fatal_cb, fatal_ctx) };
             -1
         }
     }
@@ -98,10 +128,7 @@ fn run_impl(
          \x20 shmem.num_slots = {}\n\
          \x20 vocab_size      = {}\n\
          \x20 arch_name       = {}",
-        cfg.shmem.name,
-        cfg.shmem.num_slots,
-        cfg.dummy.vocab_size,
-        cfg.dummy.arch_name,
+        cfg.shmem.name, cfg.shmem.num_slots, cfg.dummy.vocab_size, cfg.dummy.arch_name,
     );
 
     // Open the shmem region (we are the server — runtime attaches as client).
@@ -201,7 +228,9 @@ fn parse_argv_for_config(argc: c_int, argv: *mut *mut c_char) -> Result<PathBuf>
     while let Some(arg) = iter.next() {
         match *arg {
             "-c" | "--config" => {
-                let val = iter.next().ok_or_else(|| anyhow!("--config needs a value"))?;
+                let val = iter
+                    .next()
+                    .ok_or_else(|| anyhow!("--config needs a value"))?;
                 return Ok(PathBuf::from(val));
             }
             _ if arg.starts_with("--config=") => {
@@ -210,7 +239,5 @@ fn parse_argv_for_config(argc: c_int, argv: *mut *mut c_char) -> Result<PathBuf>
             _ => {}
         }
     }
-    Err(anyhow!(
-        "missing --config <path>; got argv = {args:?}"
-    ))
+    Err(anyhow!("missing --config <path>; got argv = {args:?}"))
 }

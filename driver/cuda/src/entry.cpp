@@ -1542,14 +1542,18 @@ extern "C" int pie_driver_cuda_run(int argc,
                                    char** argv,
                                    int install_signal_handlers,
                                    pie_driver_cuda_ready_cb ready_cb,
-                                   void* ready_ctx) {
+                                   void* ready_ctx,
+                                   pie_driver_cuda_fatal_cb fatal_cb,
+                                   void* fatal_ctx) {
     try {
         return run_impl(argc, argv, install_signal_handlers, ready_cb, ready_ctx);
     } catch (const std::exception& e) {
         std::cerr << "[pie-driver-cuda] fatal: " << e.what() << "\n";
+        if (fatal_cb) fatal_cb(e.what(), fatal_ctx);
         return -1;
     } catch (...) {
         std::cerr << "[pie-driver-cuda] fatal: unknown exception\n";
+        if (fatal_cb) fatal_cb("unknown exception", fatal_ctx);
         return -1;
     }
 }
