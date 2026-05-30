@@ -15,8 +15,8 @@ pub type ReadyCb = unsafe extern "C" fn(caps_json: *const c_char, ctx: *mut c_vo
 
 // Fatal callback: invoked at most once with the failure reason
 // (NUL-terminated) just before the driver entry returns a nonzero code.
-// Opt-in / nullable — passing a no-op callback keeps the legacy behavior
-// where the reason only reaches stderr. Lets the embedded host capture the
+// Non-nullable — pass a no-op callback to keep the legacy behavior where
+// the reason only reaches stderr. Lets the embedded host capture the
 // reason on the structured `anyhow::Error` instead of just pointing at
 // stderr (#356).
 pub type FatalCb = unsafe extern "C" fn(reason: *const c_char, ctx: *mut c_void);
