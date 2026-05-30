@@ -477,8 +477,13 @@ int run_impl(int argc,
         mem_plan.kv_pages > 0 ? mem_plan.kv_pages + 1 : mem_plan.kv_pages;
     const int graph_pad_page =
         mem_plan.kv_pages > 0 ? runtime_kv_pages : -1;
+    // Plain Qwen3-MoE (model_type "qwen3_moe", e.g. Qwen3-30B-A3B) routes through
+    // the qwen3_5_moe code but is all full-attention — no linear-attn layers, so
+    // it needs no recurrent state cache (it is a standard KV-only transformer).
+    // Only treat a model as rs_cache-backed when it actually has recurrent layers.
     const bool has_recurrent_state_cache =
-        is_qwen3_5_arch || is_qwen3_5_moe_arch || is_nemotron_h_arch;
+        ((is_qwen3_5_arch || is_qwen3_5_moe_arch) && qwen3_5_linear_layers > 0) ||
+        (is_nemotron_h_arch && nemotron_h_mamba_layers > 0);
     const int runtime_state_slots = mem_plan.state_slots;
     const int graph_pad_slot =
         has_recurrent_state_cache && runtime_state_slots > 0 &&
@@ -1238,10 +1243,11 @@ int run_impl(int argc,
         use_cuda_graphs ? &graph_cache : nullptr,
         /*tp_comm=*/tp_comm_ptr,
         /*tp_cpu_gate_key=*/{},
-        /*rs_cache=*/((is_qwen3_5_arch || is_qwen3_5_moe_arch)
-                          ? &qwen3_5_state_cache
-                          : (is_nemotron_h_arch ? &nemotron_h_state_cache
-                                                 : nullptr)),
+        /*rs_cache=*/(!has_recurrent_state_cache
+                          ? nullptr
+                          : ((is_qwen3_5_arch || is_qwen3_5_moe_arch)
+                                 ? &qwen3_5_state_cache
+                                 : &nemotron_h_state_cache)),
         /*response_builder=*/{},
     };
     executor.tp_cpu_gate_key = cfg.distributed.nccl_unique_id_hex;
@@ -1285,9 +1291,7 @@ int run_impl(int argc,
         c.total_pages = runtime_kv_pages;
         c.swap_pool_size = swap_pool.num_pages();
         const bool rs_cache_required =
-            ((is_qwen3_5_arch || is_qwen3_5_moe_arch) &&
-             runtime_state_slots > 0) ||
-            (is_nemotron_h_arch && runtime_state_slots > 0);
+            has_recurrent_state_cache && runtime_state_slots > 0;
         const std::uint64_t rs_cache_slots = rs_cache_required
             ? (is_nemotron_h_arch
                    ? static_cast<std::uint64_t>(runtime_state_slots)

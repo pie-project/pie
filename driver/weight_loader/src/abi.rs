@@ -458,6 +458,16 @@ struct ArchProfile {
     mxfp4_runtime_quant: bool,
     /// BF16 -> FP8/INT8 runtime quant is supported for this arch.
     bf16_runtime_quant: bool,
+    /// Skip the dense fused-QKV projection join. Qwen3-MoE / Qwen3.5-MoE bind
+    /// attention q/k/v as separate tensors and never read a fused qkv, so the
+    /// generic join would consume q_proj/k_proj/v_proj and leave the bind path
+    /// with a `missing weight 'self_attn.q_proj.weight'` error.
+    skip_dense_qkv_fusion: bool,
+    /// Stack per-expert MoE weights (`experts.{i}.{gate,up,down}_proj`) into the
+    /// fused 3-D `experts.gate_up_proj` / `experts.down_proj` tensors the
+    /// qwen3_5_moe forward expects. Plain Qwen3-MoE (Qwen3-30B-A3B) ships
+    /// per-expert weights; qwen3_5_moe checkpoints ship pre-fused (then a no-op).
+    stack_per_expert_moe: bool,
     /// Tensor-parallel shard-axis strategy, keyed by tensor name. Defaults to the
     /// llama-family rules; archs with a different expert/attention layout (e.g.
     /// DeepSeek-V4's native `.ffn.experts.w*`) register their own function.
@@ -474,6 +484,8 @@ const GENERIC_ARCH: ArchProfile = ArchProfile {
     replicate_lm_head: false,
     mxfp4_runtime_quant: false,
     bf16_runtime_quant: false,
+    skip_dense_qkv_fusion: false,
+    stack_per_expert_moe: false,
     shard_axis_fn: llama_like_shard_axis,
 };
 
@@ -519,6 +531,18 @@ const ARCH_PROFILES: &[(&[&str], ArchProfile)] = &[
         },
     ),
     (
+        // Plain Qwen3-MoE (Qwen3-30B-A3B) and Qwen3.5-MoE: their bind path reads
+        // attention q/k/v separately and never a fused qkv, so opt out of the
+        // dense projection join that would otherwise consume q_proj/k_proj/v_proj.
+        &["qwen3_moe", "qwen3_5_moe", "qwen3_5_moe_text"],
+        ArchProfile {
+            bf16_runtime_quant: true,
+            skip_dense_qkv_fusion: true,
+            stack_per_expert_moe: true,
+            ..GENERIC_ARCH
+        },
+    ),
+    (
         &["qwen3", "qwen2", "llama", "llama3", "mistral", "qwen3_5", "qwen3_5_text"],
         ArchProfile { bf16_runtime_quant: true, ..GENERIC_ARCH },
     ),
@@ -543,6 +567,7 @@ impl DefaultAbiBuilder<'_> {
         self.add_phi3_fused_splits()?;
         self.add_gpt_oss_mxfp4_groups()?;
         self.add_fused_moe_gate_up_tp_slices()?;
+        self.add_qwen_moe_expert_stacks()?;
         self.add_nemotron_h_packed_expert_views()?;
         self.add_dense_fused_projection_joins(runtime_quant.is_some())?;
         self.add_mla_fused_projection_joins()?;
@@ -591,6 +616,7 @@ impl DefaultAbiBuilder<'_> {
         if self.target.backend != BackendKind::Cuda
             || self.target.tp_size != 1
             || runtime_quant_enabled
+            || self.profile().skip_dense_qkv_fusion
         {
             return Ok(());
         }
@@ -1111,6 +1137,170 @@ impl DefaultAbiBuilder<'_> {
                 vec![experts, 2 * local_i, hidden],
                 spans,
             );
+        }
+        Ok(())
+    }
+
+    /// Stack per-expert MoE weights into the fused 3-D tensors the qwen3_5_moe
+    /// forward consumes. HF Qwen3-MoE source layout: per expert `e`,
+    /// `mlp.experts.{e}.gate_proj.weight` / `.up_proj.weight` are `[I, H]` and
+    /// `.down_proj.weight` is `[H, I]`. Output:
+    ///   `mlp.experts.gate_up_proj` -> `[E, 2I, H]` (rows `[0,I)`=gate, `[I,2I)`=up)
+    ///   `mlp.experts.down_proj`    -> `[E, H, I]`  (per-expert stack)
+    /// Built as multi-source byte spans (no GPU-side duplicate). No-op when the
+    /// checkpoint already ships the fused tensors (qwen3_5_moe pre-fused case).
+    fn add_qwen_moe_expert_stacks(&mut self) -> Result<(), CompileError> {
+        if !self.profile().stack_per_expert_moe || self.target.tp_size != 1 {
+            // TP>1 per-expert sharding is not wired yet; the bind then fails
+            // loudly on the missing fused tensor rather than loading silently wrong.
+            return Ok(());
+        }
+        let num_experts = self.cfg.num_experts as i64;
+        if num_experts <= 0 {
+            return Ok(());
+        }
+
+        struct LayerStack {
+            gate_up_name: String,
+            down_name: String,
+            gate_up_shape: Vec<i64>,
+            down_shape: Vec<i64>,
+            gate_up_spans: Vec<RuntimeByteSpan>,
+            down_spans: Vec<RuntimeByteSpan>,
+            dtype: DType,
+            consumed: Vec<TensorId>,
+        }
+
+        // Index sources by name once: the lookups below are O(layers × experts),
+        // and a linear scan per lookup would make the whole pass quadratic.
+        let by_name: std::collections::HashMap<&str, &RawTensor> = self
+            .metadata
+            .tensors
+            .iter()
+            .map(|raw| (raw.name.as_str(), raw))
+            .collect();
+
+        let mut stacks: Vec<LayerStack> = Vec::new();
+        for layer in 0..self.cfg.num_hidden_layers {
+            let prefix = format!("model.layers.{layer}.mlp.experts.");
+            let gate_up_name = format!("{prefix}gate_up_proj");
+            if by_name.contains_key(gate_up_name.as_str()) {
+                continue; // already pre-fused; leave to the direct/TP-slice paths.
+            }
+            let Some(gate0) = by_name.get(format!("{prefix}0.gate_proj.weight").as_str()).copied()
+            else {
+                continue; // not a per-expert checkpoint at this layer.
+            };
+            if gate0.shape.len() != 2 {
+                return Err(CompileError::InvalidInput(format!(
+                    "qwen moe expert stack: '{}' expected 2-D, got {:?}",
+                    gate0.name, gate0.shape
+                )));
+            }
+            let inter = gate0.shape[0];
+            let hidden = gate0.shape[1];
+            let dtype = self.dtype(gate0);
+            let elem = dense_element_bytes(gate0, "qwen moe expert stack")?;
+            let row_bytes = checked_mul_i64(hidden, elem, "qwen moe expert row")?;
+            let half_bytes = checked_mul_i64(inter, row_bytes, "qwen moe expert half")?;
+            let expert_gate_up_bytes = checked_mul_u64(2, half_bytes, "qwen moe expert gate_up")?;
+
+            let mut gate_up_spans = Vec::with_capacity((num_experts * 2) as usize);
+            let mut down_spans = Vec::with_capacity(num_experts as usize);
+            let mut consumed = Vec::with_capacity((num_experts * 3) as usize);
+            for e in 0..num_experts {
+                let g = by_name.get(format!("{prefix}{e}.gate_proj.weight").as_str()).copied();
+                let u = by_name.get(format!("{prefix}{e}.up_proj.weight").as_str()).copied();
+                let d = by_name.get(format!("{prefix}{e}.down_proj.weight").as_str()).copied();
+                let (Some(g), Some(u), Some(d)) = (g, u, d) else {
+                    return Err(CompileError::InvalidInput(format!(
+                        "qwen moe expert stack: layer {layer} expert {e} missing gate/up/down"
+                    )));
+                };
+                if g.shape != [inter, hidden]
+                    || u.shape != [inter, hidden]
+                    || d.shape != [hidden, inter]
+                {
+                    return Err(CompileError::InvalidInput(format!(
+                        "qwen moe expert stack: layer {layer} expert {e} shape mismatch \
+                         (gate {:?} up {:?} down {:?}, expected gate/up [{inter},{hidden}] \
+                         down [{hidden},{inter}])",
+                        g.shape, u.shape, d.shape
+                    )));
+                }
+                if self.dtype(g) != dtype || self.dtype(u) != dtype || self.dtype(d) != dtype {
+                    return Err(CompileError::InvalidInput(format!(
+                        "qwen moe expert stack: layer {layer} expert {e} dtype mismatch"
+                    )));
+                }
+                let gate_up_base = checked_mul_i64(e, expert_gate_up_bytes, "qwen moe gate_up base")?;
+                let down_base = checked_mul_i64(e, half_bytes, "qwen moe down base")?;
+                gate_up_spans.push(RuntimeByteSpan {
+                    tensor: g.id,
+                    source_offset_bytes: 0,
+                    dest_offset_bytes: gate_up_base,
+                    span_bytes: half_bytes,
+                });
+                gate_up_spans.push(RuntimeByteSpan {
+                    tensor: u.id,
+                    source_offset_bytes: 0,
+                    dest_offset_bytes: gate_up_base.checked_add(half_bytes).ok_or_else(|| {
+                        CompileError::InvalidInput("qwen moe up dest overflow".to_string())
+                    })?,
+                    span_bytes: half_bytes,
+                });
+                down_spans.push(RuntimeByteSpan {
+                    tensor: d.id,
+                    source_offset_bytes: 0,
+                    dest_offset_bytes: down_base,
+                    span_bytes: half_bytes,
+                });
+                consumed.push(g.id);
+                consumed.push(u.id);
+                consumed.push(d.id);
+            }
+
+            stacks.push(LayerStack {
+                gate_up_name,
+                down_name: format!("{prefix}down_proj"),
+                gate_up_shape: vec![num_experts, 2 * inter, hidden],
+                down_shape: vec![num_experts, hidden, inter],
+                gate_up_spans,
+                down_spans,
+                dtype,
+                consumed,
+            });
+        }
+
+        let align = self.alignment();
+        for s in stacks {
+            self.tensors.push(RuntimeTensorContract {
+                output_name: s.gate_up_name,
+                source: RuntimeTensorSource::ByteSpans(s.gate_up_spans),
+                metadata: Vec::new(),
+                dtype: s.dtype,
+                encoding: Encoding::Raw(s.dtype),
+                shape: s.gate_up_shape,
+                layout: Layout::dense(align),
+                sharding: Sharding::replicated(),
+                alignment: align,
+                shard_axis: None,
+            });
+            self.tensors.push(RuntimeTensorContract {
+                output_name: s.down_name,
+                source: RuntimeTensorSource::ByteSpans(s.down_spans),
+                metadata: Vec::new(),
+                dtype: s.dtype,
+                encoding: Encoding::Raw(s.dtype),
+                shape: s.down_shape,
+                layout: Layout::dense(align),
+                sharding: Sharding::replicated(),
+                alignment: align,
+                shard_axis: None,
+            });
+            for id in s.consumed {
+                self.consumed.insert(id);
+            }
         }
         Ok(())
     }
