@@ -22,8 +22,11 @@ void default_ready_to_stdout(const char* caps_json, void* /*ctx*/) {
 }  // namespace
 
 int main(int argc, char** argv) {
+    // Standalone mode already surfaces the fatal reason on stderr; no fatal_cb.
     return pie_driver_cuda_run(argc, argv,
                                /*install_signal_handlers=*/1,
                                default_ready_to_stdout,
-                               /*ready_ctx=*/nullptr);
+                               /*ready_ctx=*/nullptr,
+                               /*fatal_cb=*/nullptr,
+                               /*fatal_ctx=*/nullptr);
 }
