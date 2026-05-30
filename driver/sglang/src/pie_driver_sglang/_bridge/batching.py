@@ -11,7 +11,7 @@ from typing import Any
 
 import time
 import numpy as np
-from numba import njit, prange
+from numba import njit
 
 from . import message
 
@@ -481,9 +481,7 @@ class Batch:
         responses = []
         cursor = 0
         # Hoist per-iter conversions out of the loop.
-        counts_list = self.request_output_counts.tolist() if hasattr(
-            self.request_output_counts, "tolist"
-        ) else list(self.request_output_counts)
+        counts_list = self.request_output_counts.tolist()
         sampler_types = self.sampler_types  # already a Python list
         output_spec_flags = self.output_spec_flags
         # Bound logits/logprobs/entropies len checks once.

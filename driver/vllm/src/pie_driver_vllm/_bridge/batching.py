@@ -11,7 +11,7 @@ from typing import Any
 
 import time
 import numpy as np
-from numba import njit, prange
+from numba import njit
 
 from . import message
 

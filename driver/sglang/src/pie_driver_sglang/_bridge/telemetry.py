@@ -10,12 +10,11 @@ When disabled: NoOpTracerProvider is used for zero overhead.
 
 from __future__ import annotations
 
-import os
 from contextlib import contextmanager
 from typing import Generator
 
 from opentelemetry import trace
-from opentelemetry.trace import Tracer, Span, Status, StatusCode
+from opentelemetry.trace import Tracer, Span
 
 # Global state
 _tracer: Tracer | None = None

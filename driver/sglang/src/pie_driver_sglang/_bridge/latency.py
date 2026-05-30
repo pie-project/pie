@@ -66,5 +66,5 @@ class LatencyStats:
             broadcast_ms=timing.broadcast * 1000,
             inference_ms=timing.inference * 1000,
             create_responses_ms=timing.create_responses * 1000,
-        ) as span:
-            pass  # span is closed automatically
+        ):
+            pass  # span recorded; closed automatically on block exit

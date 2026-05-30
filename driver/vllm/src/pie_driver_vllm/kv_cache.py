@@ -71,7 +71,6 @@ def allocate_and_bind_kv_cache(
     from ._vllm_compat import (
         AttentionLayerBase,
         bind_kv_cache,
-        extract_layer_index,
         set_current_vllm_config,
     )
     from vllm.v1.kv_cache_interface import AttentionSpec, MambaSpec

@@ -510,7 +510,6 @@ class VllmEngine:
             next_last_len = base_last_len + i
             if next_last_len > page_size:
                 break
-            pos_cpu = pos_cpu_all[i - 1 : i]
             last_cpu = last_cpu_all[i - 1 : i]
             pos_gpu = pos_gpu_all[i - 1 : i]
             last_gpu = last_gpu_all[i - 1 : i]

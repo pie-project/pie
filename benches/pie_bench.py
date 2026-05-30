@@ -140,7 +140,7 @@ def build_config(args: argparse.Namespace):
     elif args.driver == "sglang":
         driver_options = {
             "mem_fraction_static": args.gpu_mem_util,
-            "disable_cuda_graph": True,
+            "disable_cuda_graph": args.sglang_disable_cuda_graph,
             "disable_radix_cache": True,
             "cpu_mem_budget_in_gb": args.cpu_mem_budget,
         }
