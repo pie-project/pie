@@ -5,7 +5,8 @@
 //! ```c
 //! int pie_driver_dummy_run(int argc, char** argv,
 //!                          int install_signal_handlers,
-//!                          ready_cb_t ready_cb, void* ready_ctx);
+//!                          ready_cb_t ready_cb, void* ready_ctx,
+//!                          fatal_cb_t fatal_cb, void* fatal_ctx);
 //! void pie_driver_dummy_request_stop(void);
 //! ```
 //!
@@ -32,8 +33,9 @@ use crate::shmem::{METHOD_TAG_FIRE_BATCH, ShmemServer};
 pub type ReadyCb = unsafe extern "C" fn(caps_json: *const c_char, ctx: *mut c_void);
 
 /// Fatal callback type. Invoked at most once with the failure reason
-/// (NUL-terminated) just before a nonzero return. Nullable / opt-in — mirrors
-/// the C++ drivers' `pie_driver_*_fatal_cb`.
+/// (NUL-terminated) just before a nonzero return. Non-nullable — pass a
+/// no-op callback for the legacy stderr-only behavior. Mirrors the C++
+/// drivers' `pie_driver_*_fatal_cb`.
 pub type FatalCb = unsafe extern "C" fn(reason: *const c_char, ctx: *mut c_void);
 
 /// Process-global handles to every running dummy shmem server. The Rust
