@@ -2233,3 +2233,45 @@ create-view + finalize + quant-metadata). The loader's C++ is now: executor (675
 cold-load no-regression, FP8 load OK, load-parity 0 failures across 36 recipes x 3
 modes (x2, incl. the fused/unfused MXFP4 differential), 45 Rust loader tests pass
 incl. the standalone header-compile check.
+
+## Dense pre-quantized block-FP8 inference (Qwen3-FP8) — fixed
+
+Symptom: `Qwen3-0.6B-FP8` aborted at inference with
+`gemm_act_x_w[FP8_E4M3]: quant scale data is null`. vLLM ran it fine, so the
+checkpoint was valid.
+
+Root cause: pie supported pre-quantized block-FP8 only for GLM/DeepSeek. The
+dense qwen3/llama path loaded the F8_E4M3 weights + their `weight_scale_inv`
+block scales as plain tensors but never attached the scale as QuantMeta, so the
+FP8 GEMM saw a null scale. (Not a regression from the loader refactor — the
+parity suite checks loaded bytes, not the runtime quant-attachment.)
+
+Fix (C++ only — the weights stay `Raw(F8E4M3)`, same as GLM; the bridge attaches
+the scale by name):
+- `rust_loader_bridge.hpp` `infer_rust_quant_attachments`: added a dense
+  block-FP8 branch (gated on `hf.quant_method == "fp8"`, excluding
+  deepseek_v4/glm/gpt_oss which have their own conventions). It pairs each
+  F8_E4M3 `.weight` with its `weight_scale_inv` sibling as PerGroup/128 — the
+  same handling GLM/V4 use, generalized to any dense FP8 arch.
+- `rust_storage_executor.hpp`: Qwen3-FP8 ships **BF16** block scales, but the FP8
+  GEMM requires FP32. Extended the block-scale normalizer (renamed
+  `convert_e8m0_scale_to_f32` -> `convert_block_scale_to_f32`) to also convert
+  BF16 -> F32 (BF16 is the high 16 bits of F32). E8M0 and FP32 paths unchanged.
+
+Validation: greedy (temp 0) output is token-identical to bf16 Qwen3-0.6B for the
+first ~40 tokens, then diverges by one near-tie token — the signature of correct
+FP8 (a wrong scale gives gibberish); Qwen3-8B-FP8 is byte-identical to bf16.
+load-parity 0 failures / 36 recipes x 3 modes; 45 Rust loader tests pass.
+
+Performance (correct, not yet fast — separate from this correctness fix): on Ada
+(L40, sm89) the block-FP8 GEMM (`gemm_act_x_w`) takes the dequant-to-bf16
+fallback, which re-dequantizes the weight every forward — so FP8 runs ~0.5-0.9x
+of vLLM and is actually *slower than pie's own bf16* (no FP8 bandwidth win).
+cuBLASLt's native block-scaled FP8 (`CUBLASLT_MATMUL_MATRIX_SCALE_BLK128x128_32F`)
+returns "not supported" on Ada — it is a Hopper/Blackwell (sm90+) feature. Fast
+block-FP8 on Ada needs a custom W8A8 kernel (FP8xFP8 mma tiled at 128, per-block
+scale folded into the FP32 accumulator, + per-token-group activation quant) —
+what vLLM's Triton `w8a8_block_fp8_matmul` does. Options if revisited: (a) gate
+native cuBLASLt block-FP8 to sm90+ (small; fast on Hopper/Blackwell, Ada stays on
+the fallback); (b) a CUTLASS/CUDA port of the vLLM kernel (portable sm89+, large).
+Deferred.
