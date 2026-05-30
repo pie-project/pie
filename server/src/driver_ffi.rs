@@ -13,6 +13,14 @@ use crate::config::DriverKind;
 
 pub type ReadyCb = unsafe extern "C" fn(caps_json: *const c_char, ctx: *mut c_void);
 
+// Fatal callback: invoked at most once with the failure reason
+// (NUL-terminated) just before the driver entry returns a nonzero code.
+// Opt-in / nullable — passing a no-op callback keeps the legacy behavior
+// where the reason only reaches stderr. Lets the embedded host capture the
+// reason on the structured `anyhow::Error` instead of just pointing at
+// stderr (#356).
+pub type FatalCb = unsafe extern "C" fn(reason: *const c_char, ctx: *mut c_void);
+
 #[cfg(feature = "driver-portable")]
 unsafe extern "C" {
     fn pie_driver_portable_run(
@@ -21,6 +29,8 @@ unsafe extern "C" {
         install_signal_handlers: c_int,
         ready_cb: ReadyCb,
         ready_ctx: *mut c_void,
+        fatal_cb: FatalCb,
+        fatal_ctx: *mut c_void,
     ) -> c_int;
     fn pie_driver_portable_request_stop();
 }
@@ -33,6 +43,8 @@ unsafe extern "C" {
         install_signal_handlers: c_int,
         ready_cb: ReadyCb,
         ready_ctx: *mut c_void,
+        fatal_cb: FatalCb,
+        fatal_ctx: *mut c_void,
     ) -> c_int;
     fn pie_driver_cuda_request_stop();
 }
@@ -174,6 +186,10 @@ pub fn default_flavor() -> Option<Flavor> {
 /// Invoke the driver entry for the given flavor. Mirrors the C
 /// signature: blocks until the driver's serve loop exits, returns
 /// the driver's rc.
+///
+/// `fatal_cb` (with `fatal_ctx`) is invoked at most once with the failure
+/// reason just before the driver returns a nonzero rc; pass a no-op callback
+/// to keep the legacy stderr-only behavior.
 pub unsafe fn run(
     flavor: Flavor,
     argc: c_int,
@@ -181,18 +197,44 @@ pub unsafe fn run(
     install_signal_handlers: c_int,
     ready_cb: ReadyCb,
     ready_ctx: *mut c_void,
+    fatal_cb: FatalCb,
+    fatal_ctx: *mut c_void,
 ) -> c_int {
     match flavor {
         #[cfg(feature = "driver-portable")]
         Flavor::Portable => unsafe {
-            pie_driver_portable_run(argc, argv, install_signal_handlers, ready_cb, ready_ctx)
+            pie_driver_portable_run(
+                argc,
+                argv,
+                install_signal_handlers,
+                ready_cb,
+                ready_ctx,
+                fatal_cb,
+                fatal_ctx,
+            )
         },
         #[cfg(feature = "driver-cuda")]
         Flavor::Cuda => unsafe {
-            pie_driver_cuda_run(argc, argv, install_signal_handlers, ready_cb, ready_ctx)
+            pie_driver_cuda_run(
+                argc,
+                argv,
+                install_signal_handlers,
+                ready_cb,
+                ready_ctx,
+                fatal_cb,
+                fatal_ctx,
+            )
         },
         Flavor::Dummy => unsafe {
-            pie_driver_dummy_run(argc, argv, install_signal_handlers, ready_cb, ready_ctx)
+            pie_driver_dummy_run(
+                argc,
+                argv,
+                install_signal_handlers,
+                ready_cb,
+                ready_ctx,
+                fatal_cb,
+                fatal_ctx,
+            )
         },
     }
 }

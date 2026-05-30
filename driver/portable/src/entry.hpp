@@ -20,6 +20,14 @@ extern "C" {
 // caller passed alongside the callback in `pie_driver_portable_run`.
 typedef void (*pie_driver_portable_ready_cb)(const char* caps_json, void* ctx);
 
+// Fatal callback. Called at most once with the failure reason (a
+// NUL-terminated UTF-8 string, owned by the lib and only valid for the
+// duration of the callback) just before `pie_driver_portable_run` returns a
+// nonzero exit code. Nullable — pass NULL to keep the legacy behavior where
+// the reason only reaches stderr. `ctx` is whatever the caller passed
+// alongside the callback in `pie_driver_portable_run`.
+typedef void (*pie_driver_portable_fatal_cb)(const char* reason, void* ctx);
+
 // Run the driver with the given argv. Returns a process-style exit code.
 //
 // `install_signal_handlers != 0` installs SIGINT/SIGTERM handlers that
@@ -31,11 +39,17 @@ typedef void (*pie_driver_portable_ready_cb)(const char* caps_json, void* ctx);
 // to publish capabilities. The standalone executable provides a default
 // callback that writes `READY <json>` to stdout (preserving the Python
 // wrapper's protocol); library callers route the JSON wherever they want.
+//
+// `fatal_cb` (nullable) is invoked once with `fatal_ctx` and the failure
+// reason just before a nonzero return, so library callers can surface the
+// reason in-process instead of scraping stderr.
 int pie_driver_portable_run(int argc,
                             char** argv,
                             int install_signal_handlers,
                             pie_driver_portable_ready_cb ready_cb,
-                            void* ready_ctx);
+                            void* ready_ctx,
+                            pie_driver_portable_fatal_cb fatal_cb,
+                            void* fatal_ctx);
 
 // Signal the running driver's shmem-serve loop to exit. Idempotent;
 // safe to call from any thread; safe to call before `pie_driver_portable_run`

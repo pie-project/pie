@@ -93,6 +93,15 @@ unsafe extern "C" fn smoke_ready_cb(caps_json: *const c_char, _ctx: *mut c_void)
     println!("[smoke] ready_cb fired with {json}");
 }
 
+// Fatal callback for the smoke probe — echoes the reason the driver reported
+// before returning nonzero.
+unsafe extern "C" fn smoke_fatal_cb(reason: *const c_char, _ctx: *mut c_void) {
+    let reason = unsafe { CStr::from_ptr(reason) }
+        .to_string_lossy()
+        .into_owned();
+    println!("[smoke] fatal_cb fired with {reason}");
+}
+
 fn smoke_ffi(flavor: Flavor) -> Result<()> {
     println!(
         "[smoke] invoking pie_driver_{}_run(--help)…\n",
@@ -113,6 +122,8 @@ fn smoke_ffi(flavor: Flavor) -> Result<()> {
             argv_ptrs.as_mut_ptr(),
             0,
             smoke_ready_cb,
+            std::ptr::null_mut(),
+            smoke_fatal_cb,
             std::ptr::null_mut(),
         )
     };
