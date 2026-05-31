@@ -49,7 +49,10 @@ wasmtime::component::bindgen!({
         "pie:core/adapter.adapter": adapter::Adapter,
         // pie:core/media
         "pie:core/media.image": media::Image,
+        "pie:core/media.video": media::Video,
         "pie:core/media.audio": media::Audio,
+        // pie:core/audio-out
+        "pie:core/audio-out.speech": audio_out::Speech,
         // pie:mcp/client
         "pie:mcp/client.session": mcp::Session,
         // pie:instruct

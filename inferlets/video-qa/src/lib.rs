@@ -1,26 +1,21 @@
 //! Video question-answering inferlet (multimodal).
 //!
-//! Fetches an animated GIF over HTTP, samples up to `max_frames` frames,
-//! patchifies each at the Gemma-4 video soft-token budget (≤70 tokens/frame),
-//! splices them into the context via [`Context::append_video`] (each frame is
-//! encoded by the same vision tower as a still image, preceded by an `mm:ss`
-//! timestamp marker — Gemma 4 has no temporal patching), then answers a
-//! question with ordinary text generation. See MULTIMODAL.md §8.
+//! Fetches an animated GIF over HTTP and hands the raw bytes to the host, which
+//! demuxes, uniformly samples up to `max_frames` frames, and preprocesses each
+//! at the bound model's per-frame budget. The frames are spliced into the
+//! context via [`Context::append_video`] (each preceded by a generic `mm:ss`
+//! timestamp marker), then a question is answered with ordinary text
+//! generation. See MULTIMODAL.md §8.
 //!
-//! Requires a multimodal model (e.g. `gemma-4-E4B`). GIF is the first-cut
-//! container because the `image` crate decodes it offline in wasm; mp4 would
-//! need a host-side decoder. Each frame ≈ up to 70 soft tokens, so an N-frame
-//! clip costs ≈ N×70 KV slots — `max_frames` is the budget knob.
+//! Model-agnostic: no decode, resize, or patchify here — the same binary serves
+//! any vision model. GIF is the first-cut container; mp4 would need a host-side
+//! demuxer. `max_frames` is the KV-budget knob (each frame ≈ tens of soft tokens).
 
-use image::codecs::gif::GifDecoder;
-use image::{AnimationDecoder, DynamicImage, imageops::FilterType};
-use inferlet::media::Image;
-use inferlet::vision;
+use inferlet::media::Video;
 use inferlet::wstd::http::{Client, Method, Request};
 use inferlet::wstd::io::{AsyncRead, empty};
 use inferlet::{Context, Result, chat, model::Model, runtime, sample::Sampler};
 use serde::Deserialize;
-use std::io::Cursor;
 
 #[derive(Deserialize)]
 struct Input {
@@ -118,58 +113,31 @@ async fn main(input: Input) -> Result<String> {
     let models = runtime::models();
     let model = Model::load(models.first().ok_or("No models available")?)?;
 
-    // 1. Fetch + decode the GIF into RGBA frames (Option B: decode in the inferlet).
+    // Model-agnostic: hand the host the raw GIF bytes. It demuxes, uniformly
+    // samples up to `max_frames`, and preprocesses each frame at the bound
+    // model's per-frame budget — no decode or model-specific code here.
     let bytes = fetch_bytes(&input.video_url).await?;
-    let frames = GifDecoder::new(Cursor::new(bytes))
-        .map_err(|e| format!("gif: {e}"))?
-        .into_frames()
-        .collect_frames()
-        .map_err(|e| format!("frames: {e}"))?;
-    if frames.is_empty() {
-        return Err("no frames in GIF".into());
+    let video =
+        Video::from_bytes(&model, &bytes, input.max_frames as u32).map_err(|e| e.to_string())?;
+    let n = video.frame_count();
+    if n == 0 {
+        return Err("no frames sampled from video".into());
     }
-
-    // Cumulative timestamp (seconds) at the start of each frame, from GIF delays.
-    let mut cum_ms = 0.0f32;
-    let timestamps_all: Vec<f32> = frames
-        .iter()
-        .map(|f| {
-            let t = cum_ms / 1000.0;
-            let (num, den) = f.delay().numer_denom_ms();
-            cum_ms += num as f32 / den.max(1) as f32;
-            t
-        })
-        .collect();
-
-    // 2. Uniformly sample up to max_frames; patchify each at the video budget.
-    let n = frames.len();
-    let take = input.max_frames.clamp(1, n);
-    let mut images = Vec::with_capacity(take);
-    let mut timestamps = Vec::with_capacity(take);
-    for k in 0..take {
-        let idx = k * n / take;
-        let rgba = frames[idx].buffer();
-        let (w, h) = (rgba.width(), rgba.height());
-        let (th, tw) = vision::gemma_resize_target_video(w, h);
-        let resized = DynamicImage::ImageRgba8(rgba.clone())
-            .resize_exact(tw, th, FilterType::CatmullRom)
-            .to_rgb8();
-        let (pixels, positions) = vision::gemma_patchify_hwc(resized.as_raw(), th, tw);
-        images.push(Image::from_pixels(&model, &pixels, &positions).map_err(|e| e.to_string())?);
-        timestamps.push(timestamps_all[idx]);
-    }
+    let per_frame = video
+        .frame(0)
+        .map_err(|e| e.to_string())?
+        .token_count();
     println!(
-        "video: {} frames -> sampled {} @ {} soft tokens/frame ({} total)",
+        "video: sampled {} frames @ {} soft tokens/frame ({} total)",
         n,
-        take,
-        images[0].token_count(),
-        images.iter().map(|i| i.token_count()).sum::<u32>(),
+        per_frame,
+        per_frame * n,
     );
 
-    // 3. Prompt: system → "Here is a video:" → frames+timestamps → question → cue.
+    // Prompt: system → "Here is a video:" → frames+timestamps → question → cue.
     let mut ctx = Context::new(&model)?;
     ctx.system(&input.system).user("Here is a video:");
-    ctx.append_video(&images, &timestamps).await?;
+    ctx.append_video(&video).await?;
     ctx.user(&input.question).cue();
 
     let answer = ctx

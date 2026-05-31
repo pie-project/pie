@@ -1,17 +1,20 @@
-# Inferlet-side audio frontend (log-mel) — design spec
+# Audio frontend (log-mel) — design spec
 
-**Status:** spec only. This is the design a human implements in a new
-`sdk/rust/inferlet/src/audio.rs` (+ a host `media.wit` `audio` resource and the
-driver `gemma4_audio` encoder, scaffolded in
-`driver/cuda/src/model/gemma4_audio_forward.{hpp,cu}`). It is written as a
-markdown doc — not code — so it does **not** touch any shared SDK file
-(`lib.rs`, `context.rs`, `forward.rs`, `media.wit`) that a teammate is editing.
+> **SUPERSEDED (2026-05): the frontend moved host-side.** To make inferlets
+> model-agnostic, the log-mel front-end no longer runs in the SDK. The inferlet
+> now hands the host raw WAV bytes via `Audio::from_bytes`, and the host runs
+> the bound model's front-end in **`runtime::multimodal::audio`** (a verbatim
+> port of the pipeline below: `decode_wav` → `resample_to_16k` → `gemma_logmel`).
+> The §1 log-mel math is still exactly what runs — only its *location* changed
+> (WASM → host), so codecs stay sandboxed and the inferlet branches on nothing.
+> The old SDK `audio.rs` input frontend (`gemma_logmel`/`from_pcm`/`from_mel`)
+> and `vision.rs` have been deleted. Kept for the parity-exact spec; read all
+> "in the inferlet" wording below as historical ("in the host").
 
-It mirrors the vision option-B path: the inferlet does the CPU front-end
-(decode → log-mel features) and hands the engine a feature blob; the engine's
-`gemma4_audio` encoder + projector turn that into soft-token KV. See
-`sdk/rust/inferlet/src/vision.rs` (the analogous image preprocessing) and
-MULTIMODAL.md §0/§7 ("encoded input becomes ordinary context KV").
+**Original status (historical):** the inferlet-side option-B path — the inferlet
+does the CPU front-end (decode → log-mel features) and hands the engine a feature
+blob; the engine's `gemma4_audio` encoder + projector turn that into soft-token
+KV. See MULTIMODAL.md ("encoded input becomes ordinary context KV").
 
 ---
 

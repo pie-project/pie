@@ -53,7 +53,6 @@ pub use context::{
 pub mod audio;
 pub mod forward;
 pub mod sample;
-pub mod vision;
 
 // =============================================================================
 // Generation state machine + decoders + speculation
@@ -109,12 +108,14 @@ pub mod inference {
     pub use crate::pie::core::inference::*;
 }
 
-/// Multimodal input. [`media::Image`] encodes a still image or video clip into
-/// a handle whose `token-count` / `position-span` / `grid` describe how it will
-/// occupy the context. The forward-pass splice (`input-image`) lands in a later
-/// phase; see MULTIMODAL.md.
+/// Multimodal input. The inferlet hands the host raw encoded bytes —
+/// [`Image::from_bytes`](media::Image) (PNG/JPEG), [`Video::from_bytes`](media::Video)
+/// (animated GIF), [`Audio::from_bytes`](media::Audio) (WAV) — and the host
+/// decodes + preprocesses per the bound model. The returned handle's
+/// `token-count` / `position-span` / `grid` describe how it occupies the
+/// context. No model-specific code lives in the inferlet. See MULTIMODAL.md.
 pub mod media {
-    pub use crate::pie::core::media::{Audio, Image};
+    pub use crate::pie::core::media::{Audio, Image, Video};
 }
 
 /// Grammar matcher — re-export for callers that build their own

@@ -172,70 +172,80 @@ sliding-window attention.
 
 ---
 
-## 4. Proposed WIT / SDK surface
+## 4. WIT / SDK surface (model-agnostic, shipped)
 
-Mirror `media.wit`'s handle pattern, but **outbound**. An audio output is a
-host-side resource the inferlet drives and streams from — the PCM never has to
-round-trip through WASM linear memory unless the inferlet asks for the bytes.
+Mirror `media.wit`'s handle pattern, but **outbound**, and hold to the same rule
+the input side does: the inferlet supplies neutral intent and the host owns
+everything model-specific. A generated clip is a host-side resource; the PCM
+never round-trips through WASM linear memory unless the inferlet asks for it.
 
-### 4.1 `pie:core/audio-out` (new WIT interface)
+### 4.1 `pie:core/audio-out` (shipped WIT interface)
 
 ```wit
 // Native audio OUTPUT — the inverse of media.wit. See AUDIO_OUTPUT.md.
 interface audio-out {
     use types.{error};
     use model.{model};
-    use context.{context};
-    use wasi:io/poll@0.2.4.{pollable};
 
-    // A host-side streaming audio generation, driven from a text/audio context.
-    // The engine owns the backbone + depth-decoder + Mimi decoder; the inferlet
-    // only steps it and pulls PCM. Fork/KV/market apply to the driving context.
-    resource speech-stream {
-        // Start generating from the current context (text prompt already in KV).
-        // `speaker` selects the CSM speaker id; `max-frames` caps length.
-        start: static func(model: borrow<model>,
-                           ctx: borrow<context>,
-                           speaker: u32,
-                           max-frames: u32) -> result<speech-stream, error>;
+    // Neutral voice selector; the host maps it onto the model's own conditioning
+    // (CSM bakes an integer speaker id into its "[id]text" frame). `named` is for
+    // models that pick voices by name — CSM rejects it with a clear error.
+    variant voice { speaker(u32), named(string) }
 
-        // Advance generation by one Mimi frame (backbone step + 31-step depth
-        // loop + Mimi-decode). Returns the new 24 kHz mono PCM as f32 samples
-        // (1920 per frame), or an empty list once the stream hits audio-EOS.
-        next-chunk: func() -> result<list<f32>, error>;
+    // Plain intent only — the host applies the model's prompt framing
+    // ("[speaker]text" + Llama-3 BOS/EOS for CSM). The inferlet never writes a
+    // special-token id of its own.
+    record speech-request {
+        text: string,
+        voice: voice,
+        // Neutral unit; the host converts to the model's frame count (CSM:
+        // 12.5 Hz Mimi frames, 80 ms each). none => model default cap.
+        max-duration-ms: option<u32>,
+    }
 
-        // Non-blocking readiness for the next chunk (async forward).
-        pollable: func() -> pollable;
-
-        // The raw 32-codebook codes for the last frame (for debugging / re-decode).
-        last-frame-codes: func() -> list<u32>;   // length 32
-
-        // True once audio-EOS frame was produced or max-frames reached.
-        is-finished: func() -> bool;
+    // A self-describing clip: carries its own sample rate + channel count.
+    resource speech {
+        generate: static func(model: borrow<model>,
+                              req: speech-request) -> result<speech, error>;
+        sample-rate: func() -> u32;     // CSM: 24000
+        channels: func() -> u32;        // CSM: 1 (mono)
+        duration-ms: func() -> u32;
+        pcm: func() -> list<f32>;       // [-1, 1], one sample per frame for mono
     }
 }
 ```
 
-A higher-level convenience, mirroring `Context`'s text helpers:
+The model-specific work — `"[speaker]text"` framing, the Llama-3 BOS/EOS, the
+ms→frame mapping, the 24 kHz sample rate — lives host-side in
+`runtime/src/api/audio_out.rs`, dispatched off `arch_name` exactly as the input
+front-ends are in `runtime/src/multimodal.rs`. The same `tts.wasm` drives any
+future audio-output arch with no recompile.
+
+### 4.2 SDK builder
 
 ```rust
-// sdk/rust/inferlet — Context extension
-impl Context {
-    // text in KV → fully-decoded 24 kHz mono wav bytes (16-bit PCM).
-    pub async fn generate_audio(&self, speaker: u32, max_frames: u32) -> Vec<u8>;
-}
+// sdk/rust/inferlet — model-agnostic; no CSM constant in the inferlet.
+let speech = model
+    .speak("Hello, this is a test.")
+    .speaker(0)                              // or .voice(Voice::Speaker(0))
+    .max_duration(Duration::from_secs(20))   // neutral unit
+    .generate()
+    .await?;
+let wav = speech.to_wav();                   // uses speech.sample_rate(), not 24_000
 ```
 
-`generate_audio` loops `next-chunk` to completion, accumulates the PCM, and
-wraps it in a WAV container. Streaming consumers call `next-chunk` directly and
-forward each 80 ms chunk.
+`Speech` is self-describing (`sample_rate()`, `channels()`, `duration()`,
+`pcm()`); `to_wav()` is a pure SDK helper. The `tts` inferlet is the worked
+example: text + speaker + seconds in, base64 WAV out, zero model-specific code.
 
-### 4.2 Example inferlet: `tts`
-`inferlets/tts/` (mirror `inferlets/image-qa/` structure): take a text prompt +
-speaker id, prefill the CSM text context, then either (a) POST the assembled WAV
-to a callback URL via the existing `http`/messaging imports, or (b) stream
-chunks. Demonstrates that fork/KV reuse still works — e.g. fork the prompt
-context and generate two speakers' renditions in parallel.
+### 4.3 Follow-ups (the resource shape leaves room for these)
+- **Streaming**: add `next-chunk: func() -> result<option<list<f32>>, error>` +
+  a `pollable` to `speech`, backed by a stepped driver primitive (`generate_audio`
+  runs the whole GPU loop in one call today). One-shot becomes drain-to-completion
+  with no caller change.
+- **Context-conditioned / conversational**: a `ctx.speak()` form that continues
+  the existing KV context (CSM is a conversational model) instead of building a
+  fresh prompt — the principled mirror of `append_image`/`append_audio`.
 
 ---
 
@@ -255,6 +265,13 @@ encoded images. Two caveats specific to output:
 ---
 
 ## 6. Status (this change)
+
+> **Note (superseded surface):** the bullets below are the historical record of
+> the original CSM *enablement* change. The WIT/SDK surface they reference (a
+> `speech-stream` resource, `Context::generate_audio`) was later replaced by the
+> model-agnostic `speech` resource + `model.speak(...)` builder documented in §4,
+> which is what ships today. The engine/driver pieces (Mimi decoder, depth
+> decoder, frame-stepped loop) are unchanged.
 
 - [x] `scripts/mimi_decoder_parity_ref.py` — **RUNS** against `kyutai/mimi`:
       codes [1,32,25] → waveform [1,1,48000]; dumps dequantized / upsampled /

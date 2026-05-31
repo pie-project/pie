@@ -1,43 +1,34 @@
-// Multimodal visual input — vision + video. See MULTIMODAL.md.
+// Multimodal input — vision, video, audio. See MULTIMODAL.md.
 //
 // Source of truth for the `pie:core` package. Vendored copies live under the
 // builds' `deps/core/` trees (kept in sync via `wit-deps`); this file is what
 // `wit-deps` pulls from.
 //
-// An encoded image becomes ordinary context KV, so fork / snapshot /
-// prefix-cache / market all apply to it for free. The inferlet only ever holds
-// a handle — pixels never cross into WASM linear memory, and there are no
-// `<image>` placeholder token ids.
+// Model-agnostic by construction: the inferlet hands the host raw encoded
+// bytes (a PNG/JPEG, an animated GIF, a WAV) and the host — which knows the
+// bound model — does ALL of the model-specific work (decode, resize, patchify,
+// log-mel, video frame-sampling, and the model's own span delimiters). An
+// inferlet never branches on the model. An encoded input becomes ordinary
+// context KV, so fork / snapshot / prefix-cache / market all apply for free;
+// the inferlet only ever holds a handle (pixels/features never cross into WASM
+// linear memory, and there are no `<image>` placeholder token ids).
 interface media {
 
     use types.{error};
     use model.{model};
 
-    // A host-side handle to a preprocessed visual input (still image OR video
-    // clip). Decode + the processor's geometry pass run on `from-*`; the layout
-    // queries below are therefore answerable synchronously, before the span is
-    // ever fed to a forward pass.
+    // A host-side handle to a preprocessed still image (also used for one
+    // decoded video frame). `from-bytes` decodes + resizes + patchifies per the
+    // bound model's processor, so the layout queries below are answerable
+    // synchronously, before the span is ever fed to a forward pass.
     resource image {
 
-        // Single still image. `bytes` is an encoded image (PNG / JPEG / …).
+        // Encoded still image (PNG / JPEG / …). The host decodes it, then
+        // resizes + patchifies + normalizes exactly as the bound model's image
+        // processor requires (Gemma SigLIP2 vs Qwen smart-resize, etc.). Errors
+        // if the model has no vision front-end or the bytes don't decode.
         from-bytes: static func(model: borrow<model>, bytes: list<u8>)
             -> result<image, error>;
-
-        // Option B: the inferlet has already decoded + resized + patchified the
-        // image. `pixels` is `[n_patch * 3*patch^2]` row-major f32
-        // (channels-last per patch, values in [0,1]); `positions` is
-        // `[n_patch * 2]` of (x,y) patch coords. The engine runs the vision
-        // encoder over these directly. See MULTIMODAL.md §2.3 (option B).
-        from-pixels: static func(model: borrow<model>,
-                                 pixels: list<f32>,
-                                 positions: list<u32>) -> result<image, error>;
-
-        // Video clip: a temporally-ordered list of already-decoded frames (the
-        // inferlet owns frame extraction + sampling) with per-frame timestamps
-        // in seconds. Produces ONE visual span whose grid has t > 1.
-        from-frames: static func(model: borrow<model>,
-                                 frames: list<list<u8>>,
-                                 timestamps: list<f32>) -> result<image, error>;
 
         // Hidden-state rows / KV slots this visual span occupies.
         token-count: func() -> u32;
@@ -49,28 +40,62 @@ interface media {
 
         // (t, h, w) in merged-token units.
         grid: func() -> tuple<u32, u32, u32>;
+
+        // Model-specific delimiter tokens the context must place immediately
+        // before / after this span (e.g. Qwen `<|vision_start|>` /
+        // `<|vision_end|>`); empty for models that need none. The SDK's
+        // `append-image` applies these so the inferlet stays model-agnostic.
+        prefix-tokens: func() -> list<u32>;
+        suffix-tokens: func() -> list<u32>;
     }
 
-    // A host-side handle to a preprocessed audio clip. The inferlet computes
-    // the log-mel features (the §1 frontend in audio_frontend.md); the engine's
-    // gemma4_audio encoder + projector turn them into soft-token KV. Like
+    // A host-side handle to a decoded + sampled video clip. The host demuxes an
+    // animated container (e.g. GIF), uniformly samples up to `max-frames`
+    // frames, and sizes each frame at the model's per-frame soft-token budget.
+    // Each frame is an ordinary `image` span; the SDK splices them in order.
+    resource video {
+
+        // Encoded animated container (e.g. GIF). The host decodes every frame,
+        // uniformly samples `<= max-frames`, and preprocesses each per the bound
+        // model. Errors if the model has no vision front-end or the bytes don't
+        // decode as an animation.
+        from-bytes: static func(model: borrow<model>,
+                                bytes: list<u8>,
+                                max-frames: u32) -> result<video, error>;
+
+        // Number of sampled frames.
+        frame-count: func() -> u32;
+
+        // The `index`-th sampled frame as an owned `image` span.
+        frame: func(index: u32) -> result<image, error>;
+
+        // Timestamp (seconds) of the `index`-th sampled frame.
+        timestamp: func(index: u32) -> f32;
+    }
+
+    // A host-side handle to a preprocessed audio clip. `from-bytes` decodes the
+    // container, resamples, and computes the model's log-mel features; the
+    // engine's audio encoder + projector turn them into soft-token KV. Like
     // `image`, an encoded clip becomes ordinary context KV.
     resource audio {
 
-        // Option B: the inferlet has already computed log-mel features
-        // `[n-frames * 128]` f32, frame-major (row-major, 128 mel bins per
-        // frame), matching Gemma4AudioFeatureExtractor. The engine runs the
-        // audio encoder over these directly. See audio_frontend.md.
-        from-mel: static func(model: borrow<model>,
-                              mel: list<f32>,
-                              n-frames: u32) -> result<audio, error>;
+        // Encoded audio (WAV / RIFF). The host decodes to mono PCM, resamples to
+        // the model's rate, and computes its log-mel features
+        // (Gemma4AudioFeatureExtractor). Errors if the model has no audio
+        // front-end or the bytes don't decode.
+        from-bytes: static func(model: borrow<model>, bytes: list<u8>)
+            -> result<audio, error>;
 
-        // Hidden-state rows / KV slots this clip occupies == audio soft tokens
-        // == gemma4_audio_subsampled_len(n-frames) (two stride-2 convs, ~n/4).
+        // Hidden-state rows / KV slots this clip occupies == audio soft tokens.
         token-count: func() -> u32;
 
         // How far the 1-D sequence cursor advances past this clip. Equals
         // token-count for Gemma (1-D RoPE).
         position-span: func() -> u32;
+
+        // Model-specific delimiter tokens placed before / after the span (e.g.
+        // Gemma `<|audio>` / `<audio|>`); empty for models that need none.
+        prefix-tokens: func() -> list<u32>;
+        suffix-tokens: func() -> list<u32>;
     }
 }

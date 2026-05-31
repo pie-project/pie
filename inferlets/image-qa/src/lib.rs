@@ -8,9 +8,7 @@
 //! Requires a multimodal model (e.g. `gemma-4-E4B`). The image is spliced into
 //! the user turn; `append_image` handles the encode + KV commit.
 
-use image::{imageops::FilterType, load_from_memory};
 use inferlet::media::Image;
-use inferlet::vision;
 use inferlet::wstd::http::{Client, Method, Request};
 use inferlet::wstd::io::{empty, AsyncRead};
 use inferlet::{Context, Result, chat, model::Model, runtime, sample::Sampler};
@@ -108,56 +106,24 @@ async fn main(input: Input) -> Result<String> {
     let models = runtime::models();
     let model = Model::load(models.first().ok_or("No models available")?)?;
 
-    // Arch dispatch (option B: the inferlet patchifies). Qwen3-VL tokenizers
-    // carry a `<|vision_start|>` special token; Gemma's do not. The patch
-    // layout + resize differ per arch, and Qwen wraps the image rows in
-    // `<|vision_start|> … <|vision_end|>` delimiters.
-    let tok = model.tokenizer();
-    let vision_start = tok.encode("<|vision_start|>");
-    let vision_end = tok.encode("<|vision_end|>");
-    let is_qwen = vision_start.len() == 1 && vision_end.len() == 1;
-
-    // Option B: decode + resize + patchify in the inferlet, send the pixel blob.
+    // Model-agnostic: hand the host the raw encoded image bytes. It decodes +
+    // resizes + patchifies per the bound model (Gemma SigLIP2, Qwen smart-resize,
+    // …) and wraps the span in whatever delimiters that model needs. This
+    // inferlet branches on nothing and serves any vision model unchanged.
     let bytes = fetch_image_bytes(&input.image_url).await?;
-    let decoded = load_from_memory(&bytes).map_err(|e| format!("decode: {e}"))?;
-
-    let (pixels, positions) = if is_qwen {
-        // Qwen3-VL: smart-resize to a (patch·merge)-multiple, patchify into the
-        // (3,2,16,16)-flattened pixel_values + merge-order (x,y) positions.
-        let (th, tw) = vision::qwen_resize_target(decoded.width(), decoded.height());
-        let resized = decoded
-            .resize_exact(tw, th, FilterType::CatmullRom)
-            .to_rgb8();
-        vision::qwen_patchify_hwc(resized.as_raw(), th, tw)
-    } else {
-        // Gemma-4: SigLIP2-style aspect-ratio-preserving resize, channels-last patches.
-        let (th, tw) = vision::gemma_resize_target(decoded.width(), decoded.height());
-        let resized = decoded
-            .resize_exact(tw, th, FilterType::CatmullRom)
-            .to_rgb8();
-        vision::gemma_patchify_hwc(resized.as_raw(), th, tw)
-    };
-    let image = Image::from_pixels(&model, &pixels, &positions).map_err(|e| e.to_string())?;
+    let image = Image::from_bytes(&model, &bytes).map_err(|e| e.to_string())?;
     println!(
-        "image ({}): {}x{} -> {} soft tokens (grid {:?})",
-        if is_qwen { "qwen3-vl" } else { "gemma4" },
-        decoded.width(),
-        decoded.height(),
+        "image: {} bytes -> {} soft tokens (grid {:?})",
+        bytes.len(),
         image.token_count(),
         image.grid()
     );
 
-    // Build the prompt: system → user(image + question) → cue. For Qwen the
-    // image span is wrapped in <|vision_start|> … <|vision_end|> delimiters.
+    // Build the prompt: system → user(image + question) → cue. `append_image`
+    // applies the model's own span delimiters.
     let mut ctx = Context::new(&model)?;
     ctx.system(&input.system).user("Here is an image:");
-    if is_qwen {
-        ctx.append(&vision_start);
-        ctx.append_image(&image).await?;
-        ctx.append(&vision_end);
-    } else {
-        ctx.append_image(&image).await?;
-    }
+    ctx.append_image(&image).await?;
     ctx.user(&input.question).cue();
 
     let answer = ctx

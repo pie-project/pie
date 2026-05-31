@@ -1,5 +1,21 @@
 # Multimodal Support (Vision + Video)
 
+> **UPDATE (2026-05): the inferlet API is now model-agnostic.** The model-specific
+> preprocessing that used to run in the inferlet ("option B" — decode, resize,
+> patchify, log-mel, the gemma/qwen branch, and the `<|vision_start|>` etc.
+> delimiters) has moved **host-side** into `runtime::multimodal` (+
+> `runtime::multimodal::audio`). An inferlet now hands the host raw encoded bytes
+> — `Image::from_bytes` (PNG/JPEG), `Video::from_bytes` (animated GIF),
+> `Audio::from_bytes` (WAV) — and the host decodes + preprocesses + applies the
+> model's own span delimiters, dispatched off the bound model's arch. The **same**
+> `image-qa.wasm` serves Gemma (280 soft tokens) and Qwen3-VL (1107 soft tokens)
+> with no recompile and zero branching. The SDK's `vision.rs` and audio input
+> frontend are deleted; `from_pixels`/`from_mel`/`from_frames` are gone. The wire
+> payload (pixels/positions/grid/mel) is byte-identical to before, so the bridge +
+> CUDA driver are unchanged. Sections below describing inferlet-side "option B"
+> are historical — the geometry/patchify/log-mel they specify is exactly what now
+> runs host-side. All five modalities re-verified e2e on 2026-05-31.
+
 **Status:** Phases 1 + 3 + 4 done. **Gemma 4 vision works end-to-end** — `pie run
 image-qa` on `gemma-4-E4B` correctly describes a real image (parity-verified
 encoder, cosine 0.999), with HTTP redirect-following + chat stop tokens fixed.

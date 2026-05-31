@@ -454,10 +454,21 @@ impl Context {
     /// Any buffered text is flushed first so ordering (text → image → text) is
     /// preserved in the KV cache.
     pub async fn append_image(&mut self, image: &crate::media::Image) -> Result<()> {
-        self.flush().await?; // commit any pending text before the image span
+        // The model's own span delimiters (host-provided; empty for models that
+        // need none) are applied here so the inferlet stays model-agnostic — it
+        // never names `<|vision_start|>` etc.
+        let prefix = image.prefix_tokens();
+        let suffix = image.suffix_tokens();
+        if !prefix.is_empty() {
+            self.append(&prefix);
+        }
+        self.flush().await?; // commit any pending text + the span prefix
 
         let num_tokens = image.token_count();
         if num_tokens == 0 {
+            if !suffix.is_empty() {
+                self.append(&suffix);
+            }
             return Ok(());
         }
         let span = image.position_span();
@@ -500,6 +511,10 @@ impl Context {
         let _ = span;
         self.seq_len += num_tokens;
 
+        // Span suffix delimiter (buffered; flushed with the next fill).
+        if !suffix.is_empty() {
+            self.append(&suffix);
+        }
         Ok(())
     }
 
@@ -512,10 +527,20 @@ impl Context {
     /// Any buffered text is flushed first so ordering (text → audio → text) is
     /// preserved in the KV cache.
     pub async fn append_audio(&mut self, audio: &crate::media::Audio) -> Result<()> {
-        self.flush().await?; // commit any pending text before the audio span
+        // Host-provided span delimiters (e.g. Gemma `<|audio>` / `<audio|>`),
+        // applied here so the inferlet never names them.
+        let prefix = audio.prefix_tokens();
+        let suffix = audio.suffix_tokens();
+        if !prefix.is_empty() {
+            self.append(&prefix);
+        }
+        self.flush().await?; // commit any pending text + the span prefix
 
         let num_tokens = audio.token_count();
         if num_tokens == 0 {
+            if !suffix.is_empty() {
+                self.append(&suffix);
+            }
             return Ok(());
         }
 
@@ -548,36 +573,34 @@ impl Context {
         self.working_tokens = new_working % self.page_size;
         self.seq_len += num_tokens;
 
+        // Span suffix delimiter (buffered; flushed with the next fill).
+        if !suffix.is_empty() {
+            self.append(&suffix);
+        }
         Ok(())
     }
 
-    /// Splice a sampled video clip into the context.
+    /// Splice a decoded video clip ([`crate::media::Video`]) into the context.
     ///
-    /// Gemma 4 (Gemma 3n) treats video as a sequence of **independently
-    /// encoded still frames** through the same vision tower as a single image —
-    /// there is no temporal patching (that is a Qwen-VL feature). So this simply
-    /// injects each frame's soft tokens via [`append_image`], each preceded by a
-    /// short `mm:ss` timestamp text marker (ordinary tokens, mirroring the HF
-    /// Gemma 4 video format `"{MM:SS} <frame>"`). The frames must already be
-    /// patchified at the video soft-token budget (≤ 70 each — see
-    /// [`crate::vision::gemma_resize_target_video`]) to keep the clip's KV
-    /// footprint manageable.
-    ///
-    /// `timestamps` are in seconds and parallel to `frames`; a missing entry
-    /// falls back to the frame index. Each frame becomes committed KV exactly
-    /// like an image, so fork / snapshot / prefix-cache apply — encode once,
-    /// fork per question. See MULTIMODAL.md §8.
-    pub async fn append_video(
-        &mut self,
-        frames: &[crate::media::Image],
-        timestamps: &[f32],
-    ) -> Result<()> {
-        for (i, frame) in frames.iter().enumerate() {
-            let secs = timestamps.get(i).copied().unwrap_or(i as f32).max(0.0) as u32;
+    /// The host already demuxed + uniformly sampled the clip and preprocessed
+    /// each frame per the bound model (see [`crate::media::Video::from_bytes`]).
+    /// This injects each frame's soft tokens via [`append_image`], preceded by a
+    /// short generic `mm:ss` timestamp text marker (plain tokens, encoded by
+    /// whatever tokenizer — not model-specific). Each frame becomes committed KV
+    /// exactly like an image, so fork / snapshot / prefix-cache apply. The
+    /// per-frame soft-token budget and any span delimiters are the host's job, so
+    /// this is identical across models. See MULTIMODAL.md §8.
+    pub async fn append_video(&mut self, video: &crate::media::Video) -> Result<()> {
+        let n = video.frame_count();
+        for i in 0..n {
+            let secs = video.timestamp(i).max(0.0) as u32;
             let marker = format!(" {:02}:{:02} ", secs / 60, secs % 60);
             let toks = self.model.tokenizer().encode(&marker);
             self.append(&toks);
-            self.append_image(frame).await?;
+            let frame = video
+                .frame(i)
+                .map_err(|e| format!("append_video: frame {i}: {e}"))?;
+            self.append_image(&frame).await?;
         }
         Ok(())
     }
