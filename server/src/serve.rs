@@ -446,7 +446,11 @@ fn start_embedded_drivers(
 }
 
 fn embedded_opts_for_device(base_opts: &DriverOptions, device: String) -> DriverOptions {
-    #[cfg(not(any(feature = "driver-portable", feature = "driver-cuda")))]
+    #[cfg(not(any(
+        feature = "driver-portable",
+        feature = "driver-cuda",
+        feature = "driver-cuda-native"
+    )))]
     let _ = &device;
 
     #[allow(unreachable_patterns)]
@@ -457,7 +461,7 @@ fn embedded_opts_for_device(base_opts: &DriverOptions, device: String) -> Driver
             opts.device = device;
             DriverOptions::Portable(opts)
         }
-        #[cfg(feature = "driver-cuda")]
+        #[cfg(any(feature = "driver-cuda", feature = "driver-cuda-native"))]
         DriverOptions::CudaNative(opts) => {
             let mut opts = opts.clone();
             opts.device = device;
@@ -473,12 +477,16 @@ fn apply_embedded_verbose(options: &mut Option<DriverOptions>, verbose: bool) {
         p.verbose = verbose;
     }
 
-    #[cfg(feature = "driver-cuda")]
+    #[cfg(any(feature = "driver-cuda", feature = "driver-cuda-native"))]
     if let Some(DriverOptions::CudaNative(opts)) = options.as_mut() {
         opts.verbose = verbose;
     }
 
-    #[cfg(not(any(feature = "driver-portable", feature = "driver-cuda")))]
+    #[cfg(not(any(
+        feature = "driver-portable",
+        feature = "driver-cuda",
+        feature = "driver-cuda-native"
+    )))]
     let _ = (options, verbose);
 }
 

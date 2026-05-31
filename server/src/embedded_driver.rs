@@ -76,7 +76,9 @@ fn nccl_unique_id_hex() -> Result<String> {
 pub enum DriverOptions {
     #[cfg(feature = "driver-portable")]
     Portable(PortableDriverOptions),
-    #[cfg(feature = "driver-cuda")]
+    // Shared by the legacy C++ driver (driver-cuda) and the new Rust control
+    // plane (driver-cuda-native) — same `cuda_native` options either way.
+    #[cfg(any(feature = "driver-cuda", feature = "driver-cuda-native"))]
     CudaNative(CudaNativeDriverOptions),
     Dummy {
         opts: DummyDriverOptions,
@@ -91,8 +93,19 @@ impl DriverOptions {
         match self {
             #[cfg(feature = "driver-portable")]
             DriverOptions::Portable(_) => Flavor::Portable,
-            #[cfg(feature = "driver-cuda")]
-            DriverOptions::CudaNative(_) => Flavor::Cuda,
+            // `cuda_native` options map to the new Rust control plane when it
+            // is compiled in; otherwise the legacy C++ driver.
+            #[cfg(any(feature = "driver-cuda", feature = "driver-cuda-native"))]
+            DriverOptions::CudaNative(_) => {
+                #[cfg(feature = "driver-cuda-native")]
+                {
+                    Flavor::CudaNative
+                }
+                #[cfg(all(not(feature = "driver-cuda-native"), feature = "driver-cuda"))]
+                {
+                    Flavor::Cuda
+                }
+            }
             DriverOptions::Dummy { .. } => Flavor::Dummy,
         }
     }
@@ -102,7 +115,7 @@ fn ready_timeout(options: &DriverOptions) -> Duration {
     let ready_timeout_s = match options {
         #[cfg(feature = "driver-portable")]
         DriverOptions::Portable(p) => p.ready_timeout_s,
-        #[cfg(feature = "driver-cuda")]
+        #[cfg(any(feature = "driver-cuda", feature = "driver-cuda-native"))]
         DriverOptions::CudaNative(opts) => opts.ready_timeout_s,
         DriverOptions::Dummy { opts, .. } => opts.ready_timeout_s,
     };
@@ -742,7 +755,7 @@ impl EmbeddedDriver {
             DriverOptions::Portable(p) => {
                 write_startup_toml(&toml_path, p, snapshot_dir, group_id)?;
             }
-            #[cfg(feature = "driver-cuda")]
+            #[cfg(any(feature = "driver-cuda", feature = "driver-cuda-native"))]
             DriverOptions::CudaNative(opts) => {
                 write_cuda_startup_toml(&toml_path, opts, snapshot_dir, group_id, tp.as_ref())?;
             }
@@ -795,6 +808,8 @@ impl EmbeddedDriver {
         let uses_inproc = match flavor {
             #[cfg(feature = "driver-cuda")]
             Flavor::Cuda => true,
+            #[cfg(feature = "driver-cuda-native")]
+            Flavor::CudaNative => true,
             #[cfg(feature = "driver-portable")]
             Flavor::Portable => true,
             _ => false,

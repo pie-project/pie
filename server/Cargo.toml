@@ -29,6 +29,11 @@ path = "src/main.rs"
 default = ["driver-portable"]
 driver-portable = ["dep:pie-weight-loader"]
 driver-cuda = ["dep:pie-weight-loader"]
+# The cuda_new rewrite: thin C++ device lib + this fat Rust control plane.
+# Serves the same `cuda_native` TOML driver type as `driver-cuda`, taking
+# priority over the legacy C++ driver when both are compiled in. Does its
+# own weight loading, so no pie-weight-loader.
+driver-cuda-native = ["dep:pie-driver-cuda-native"]
 driver-dummy = []
 
 # Per-domain probe passthroughs. Each forwards to the runtime crate's
@@ -87,6 +92,10 @@ nvml-wrapper = "0.12"
 # Always-linked Rust dummy driver — random tokens, no model load.
 pie-driver-dummy = { path = "../driver/dummy" }
 pie-weight-loader = { path = "../driver/weight_loader", optional = true }
+# cuda_new control plane (rlib): linked like the dummy driver — we `use`
+# its #[no_mangle] C entries so the linker keeps them. Optional, gated by
+# the `driver-cuda-native` feature.
+pie-driver-cuda-native = { path = "../driver/cuda_new/control", optional = true }
 
 # Pie websocket client — used by `pie run` to drive an inferlet against
 # the engine subprocess we boot. Same crate the dummy_roundtrip example

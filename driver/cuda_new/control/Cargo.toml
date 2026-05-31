@@ -1,0 +1,34 @@
+[package]
+name = "pie-driver-cuda-native"
+version = "0.1.0"
+edition = "2024"
+authors = ["In Gim <in.gim@yale.edu>"]
+description = "Fat Rust control plane for the driver/cuda_new rewrite. Owns orchestration; calls down into libpie_cuda_device for kernel sequences."
+license = "Apache-2.0"
+repository = "https://github.com/pie-project/pie"
+
+# WIP rewrite. Excluded from the root workspace (see root Cargo.toml
+# `exclude`) until phase 1 lands and server/build.rs wires it in.
+# crate-type mirrors driver/dummy: staticlib for the embedded-driver
+# link, rlib so tests/benches can use it as a normal crate.
+[lib]
+name = "pie_driver_cuda_native_lib"
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+# `cabi` brings the C-ABI descriptor types (PieFrameDesc, PieResponseFrameDesc,
+# Pie*Desc) + the in-process vtable that run_inproc serves.
+pie-bridge = { path = "../../bridge", features = ["cabi"] }
+anyhow = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+toml = "0.9"
+# Weight loading reuses the existing Rust loader. Wire in at phase 2:
+# pie-weight-loader = { path = "../../weight_loader" }
+
+[build-dependencies]
+cmake = "0.1"
+
+[dev-dependencies]
+# Used only by the end-to-end text-completion test (encode prompt / decode ids).
+tokenizers = "0.21"

@@ -492,7 +492,7 @@ fn doctor_embedded(name: &str) -> Result<()> {
     println!("[{}]", name);
     let compiled = match name {
         "portable" => cfg!(feature = "driver-portable"),
-        "cuda_native" => cfg!(feature = "driver-cuda"),
+        "cuda_native" => cfg!(feature = "driver-cuda") || cfg!(feature = "driver-cuda-native"),
         "dummy" => true,
         _ => false,
     };

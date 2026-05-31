@@ -1,0 +1,16 @@
+# C++ device library (CMake)
+device/build*/
+device/out/
+device/compile_commands.json
+
+# Rust control plane (Cargo)
+control/target/
+control/Cargo.lock
+
+# editor / tooling
+/.cache/
+/.vscode/
+/.clangd/
+*.o
+*.obj
+.DS_Store

@@ -14,6 +14,8 @@ pub fn default_config_content() -> String {
         Some(Flavor::Portable) => PORTABLE_DRIVER_BLOCK,
         #[cfg(feature = "driver-cuda")]
         Some(Flavor::Cuda) => CUDA_DRIVER_BLOCK,
+        #[cfg(feature = "driver-cuda-native")]
+        Some(Flavor::CudaNative) => CUDA_DRIVER_BLOCK,
         Some(Flavor::Dummy) => DUMMY_DRIVER_BLOCK,
         // default_flavor always returns Some because dummy is linked
         // unconditionally. Keep this fallback for exhaustiveness.
@@ -93,7 +95,7 @@ max_forward_requests = 512
 kv_cache_dtype = "auto"
 "#;
 
-#[cfg(feature = "driver-cuda")]
+#[cfg(any(feature = "driver-cuda", feature = "driver-cuda-native"))]
 const CUDA_DRIVER_BLOCK: &str = r#"
 [model.driver]
 type = "cuda_native"

@@ -20,6 +20,10 @@ members = [
 exclude = [
     "inferlets",
     "sdk/rust",
+    # WIP clean-rewrite of driver/cuda. Excluded until phase 1 lands and
+    # server/build.rs wires it in (see driver/cuda_new/PLAN.md). Building
+    # it requires CUDA, so keep it out of the default workspace graph.
+    "driver/cuda_new/control",
 ]
 
 # Distribution profile for `pie-server`. Use

@@ -51,6 +51,15 @@ unsafe extern "C" {
 // strips unreferenced `#[no_mangle]` exports out of an rlib.
 use pie_driver_dummy_lib::{pie_driver_dummy_request_stop, pie_driver_dummy_run};
 
+// The cuda_native (cuda_new rewrite) driver is the in-process Rust control
+// plane at driver/cuda_new/control. Like dummy it's an rlib in this
+// workspace, so we `use` its `#[no_mangle]` C entries directly — that Rust-
+// level reference keeps the linker from GC'ing them out of the rlib.
+#[cfg(feature = "driver-cuda-native")]
+use pie_driver_cuda_native_lib::{
+    pie_driver_cuda_native_request_stop, pie_driver_cuda_native_run_inproc,
+};
+
 /// Which driver flavor to dispatch to at runtime. Variants are
 /// gated by Cargo features for portable/cuda; dummy is always present.
 #[derive(Copy, Clone, Eq, PartialEq, Debug)]
@@ -59,6 +68,8 @@ pub enum Flavor {
     Portable,
     #[cfg(feature = "driver-cuda")]
     Cuda,
+    #[cfg(feature = "driver-cuda-native")]
+    CudaNative,
     Dummy,
 }
 
@@ -71,6 +82,8 @@ impl Flavor {
             Flavor::Portable => "portable",
             #[cfg(feature = "driver-cuda")]
             Flavor::Cuda => "cuda",
+            #[cfg(feature = "driver-cuda-native")]
+            Flavor::CudaNative => "cuda_native",
             Flavor::Dummy => "dummy",
         }
     }
@@ -83,6 +96,8 @@ impl Flavor {
             Flavor::Portable => "pie_driver_portable",
             #[cfg(feature = "driver-cuda")]
             Flavor::Cuda => "pie_driver_cuda",
+            #[cfg(feature = "driver-cuda-native")]
+            Flavor::CudaNative => "pie_driver_cuda_native",
             Flavor::Dummy => "pie_driver_dummy",
         }
     }
@@ -103,13 +118,21 @@ impl Flavor {
                 }
             }
             DriverKind::CudaNative => {
-                #[cfg(feature = "driver-cuda")]
+                // The `cuda_native` TOML type is served by the new Rust control
+                // plane (driver-cuda-native) when present; otherwise the legacy
+                // C++ driver (driver-cuda). New takes priority — it's the
+                // strangler-fig replacement for the same discriminator.
+                #[cfg(feature = "driver-cuda-native")]
+                {
+                    Ok(Flavor::CudaNative)
+                }
+                #[cfg(all(not(feature = "driver-cuda-native"), feature = "driver-cuda"))]
                 {
                     Ok(Flavor::Cuda)
                 }
-                #[cfg(not(feature = "driver-cuda"))]
+                #[cfg(all(not(feature = "driver-cuda-native"), not(feature = "driver-cuda")))]
                 {
-                    Err(missing_feature_msg("cuda_native", "driver-cuda"))
+                    Err(missing_feature_msg("cuda_native", "driver-cuda-native"))
                 }
             }
             DriverKind::Dummy => Ok(Flavor::Dummy),
@@ -123,7 +146,11 @@ impl Flavor {
     }
 }
 
-#[cfg(any(not(feature = "driver-portable"), not(feature = "driver-cuda"),))]
+#[cfg(any(
+    not(feature = "driver-portable"),
+    not(feature = "driver-cuda"),
+    not(feature = "driver-cuda-native"),
+))]
 fn missing_feature_msg(toml_type: &str, feature: &str) -> String {
     format!(
         "driver type {toml_type:?} is not built into this binary. \
@@ -141,6 +168,8 @@ pub fn compiled_summary() -> String {
     out.push("portable");
     #[cfg(feature = "driver-cuda")]
     out.push("cuda");
+    #[cfg(feature = "driver-cuda-native")]
+    out.push("cuda_native");
     out.push("dummy");
     out.join(", ")
 }
@@ -151,7 +180,12 @@ pub fn compiled_summary() -> String {
 pub fn compiled_embedded() -> [(&'static str, bool); 3] {
     [
         ("portable", cfg!(feature = "driver-portable")),
-        ("cuda_native", cfg!(feature = "driver-cuda")),
+        // `cuda_native` is servable by either the new Rust control plane
+        // (driver-cuda-native) or the legacy C++ driver (driver-cuda).
+        (
+            "cuda_native",
+            cfg!(feature = "driver-cuda-native") || cfg!(feature = "driver-cuda"),
+        ),
         ("dummy", true),
     ]
 }
@@ -160,15 +194,28 @@ pub fn compiled_embedded() -> [(&'static str, bool); 3] {
 /// (e.g. `pie smoke` without `--flavor`, `pie config init`'s template).
 /// Order: cuda → portable → dummy.
 pub fn default_flavor() -> Option<Flavor> {
-    #[cfg(feature = "driver-cuda")]
+    // Order: cuda_native (new) → cuda (legacy C++) → portable → dummy.
+    #[cfg(feature = "driver-cuda-native")]
+    {
+        return Some(Flavor::CudaNative);
+    }
+    #[cfg(all(not(feature = "driver-cuda-native"), feature = "driver-cuda"))]
     {
         return Some(Flavor::Cuda);
     }
-    #[cfg(all(not(feature = "driver-cuda"), feature = "driver-portable"))]
+    #[cfg(all(
+        not(feature = "driver-cuda-native"),
+        not(feature = "driver-cuda"),
+        feature = "driver-portable"
+    ))]
     {
         return Some(Flavor::Portable);
     }
-    #[cfg(all(not(feature = "driver-cuda"), not(feature = "driver-portable")))]
+    #[cfg(all(
+        not(feature = "driver-cuda-native"),
+        not(feature = "driver-cuda"),
+        not(feature = "driver-portable")
+    ))]
     {
         return Some(Flavor::Dummy);
     }
@@ -191,7 +238,9 @@ pub unsafe fn run(
         #[cfg(feature = "driver-portable")]
         Flavor::Portable => panic!("portable is embedded-only; use run_inproc"),
         #[cfg(feature = "driver-cuda")]
-        Flavor::Cuda => panic!("cuda_native is embedded-only; use run_inproc"),
+        Flavor::Cuda => panic!("cuda is embedded-only; use run_inproc"),
+        #[cfg(feature = "driver-cuda-native")]
+        Flavor::CudaNative => panic!("cuda_native is embedded-only; use run_inproc"),
         Flavor::Dummy => unsafe {
             pie_driver_dummy_run(argc, argv, install_signal_handlers, ready_cb, ready_ctx)
         },
@@ -212,6 +261,17 @@ pub unsafe fn run_inproc(
     vtable: pie::driver::InProcVTable,
 ) -> Result<c_int, &'static str> {
     match flavor {
+        #[cfg(feature = "driver-cuda-native")]
+        Flavor::CudaNative => Ok(unsafe {
+            pie_driver_cuda_native_run_inproc(
+                argc,
+                argv,
+                install_signal_handlers,
+                ready_cb,
+                ready_ctx,
+                vtable,
+            )
+        }),
         #[cfg(feature = "driver-cuda")]
         Flavor::Cuda => Ok(unsafe {
             pie_driver_cuda_run_inproc(
@@ -248,6 +308,8 @@ pub fn request_stop(flavor: Flavor) {
         Flavor::Portable => unsafe { pie_driver_portable_request_stop() },
         #[cfg(feature = "driver-cuda")]
         Flavor::Cuda => unsafe { pie_driver_cuda_request_stop() },
+        #[cfg(feature = "driver-cuda-native")]
+        Flavor::CudaNative => unsafe { pie_driver_cuda_native_request_stop() },
         Flavor::Dummy => unsafe { pie_driver_dummy_request_stop() },
     }
 }

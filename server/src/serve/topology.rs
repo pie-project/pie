@@ -4,7 +4,7 @@
 
 use anyhow::{Result, anyhow};
 
-#[cfg(feature = "driver-cuda")]
+#[cfg(any(feature = "driver-cuda", feature = "driver-cuda-native"))]
 use crate::config::CudaNativeDriverOptions;
 #[cfg(feature = "driver-portable")]
 use crate::config::PortableDriverOptions;
@@ -83,23 +83,12 @@ pub fn build_embedded_options(m: &config::ModelConfig, flavor: Flavor) -> Result
                 .map_err(|e| anyhow!("[model.driver.options] for {:?}: {e}", m.name))?;
             Ok(DriverOptions::Portable(p))
         }
+        // Both the legacy C++ driver (Flavor::Cuda) and the new Rust control
+        // plane (Flavor::CudaNative) consume the same `cuda_native` options.
         #[cfg(feature = "driver-cuda")]
-        Flavor::Cuda => {
-            let mut c: CudaNativeDriverOptions = m
-                .driver
-                .options
-                .clone()
-                .try_into()
-                .map_err(|e| anyhow!("[model.driver.options] for {:?}: {e}", m.name))?;
-            let device = m.driver.device.first().ok_or_else(|| {
-                anyhow!(
-                    "model {:?}: cuda_native requires at least one device",
-                    m.name
-                )
-            })?;
-            c.device = device.clone();
-            Ok(DriverOptions::CudaNative(c))
-        }
+        Flavor::Cuda => cuda_native_options(m),
+        #[cfg(feature = "driver-cuda-native")]
+        Flavor::CudaNative => cuda_native_options(m),
         Flavor::Dummy => {
             let d: DummyDriverOptions = m
                 .driver
@@ -114,6 +103,28 @@ pub fn build_embedded_options(m: &config::ModelConfig, flavor: Flavor) -> Result
             })
         }
     }
+}
+
+/// Project a model's `[driver.options]` into typed `cuda_native` options,
+/// filling `device` from the first configured device as a placeholder (the
+/// per-group spawn loop overwrites it per DP replica). Shared by the legacy
+/// C++ (`Flavor::Cuda`) and new Rust (`Flavor::CudaNative`) backends.
+#[cfg(any(feature = "driver-cuda", feature = "driver-cuda-native"))]
+fn cuda_native_options(m: &config::ModelConfig) -> Result<DriverOptions> {
+    let mut c: CudaNativeDriverOptions = m
+        .driver
+        .options
+        .clone()
+        .try_into()
+        .map_err(|e| anyhow!("[model.driver.options] for {:?}: {e}", m.name))?;
+    let device = m.driver.device.first().ok_or_else(|| {
+        anyhow!(
+            "model {:?}: cuda_native requires at least one device",
+            m.name
+        )
+    })?;
+    c.device = device.clone();
+    Ok(DriverOptions::CudaNative(c))
 }
 
 #[cfg(test)]
