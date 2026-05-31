@@ -238,14 +238,14 @@ impl StartupBanner {
             ("Device", self.device.as_str()),
         ];
         let label_width = 12;
+        let header = "─ Pie Engine ";
         let content_width = rows
             .iter()
-            .map(|(label, value)| label_width.max(label.len()) + 1 + value.len())
+            .map(|(_, value)| label_width + 1 + value.len())
             .max()
             .unwrap_or(0)
-            .max("Pie Engine".len());
-        let header = "─ Pie Engine ";
-        let inner_width = (content_width + 2).max(header.len());
+            .max(header.len() - 2);
+        let inner_width = content_width + 2;
         let mut out = String::new();
 
         out.push_str(&format!(
