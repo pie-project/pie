@@ -1,0 +1,68 @@
+// Multimodal visual input — vision + video. See MULTIMODAL.md.
+//
+// An encoded image becomes ordinary context KV, so fork / snapshot /
+// prefix-cache / market all apply to it for free. The inferlet only ever holds
+// a handle — pixels never cross into WASM linear memory, and there are no
+// <image> placeholder token ids.
+interface media {
+
+    use types.{error};
+    use model.{model};
+
+    // A host-side handle to a preprocessed visual input (still image OR video
+    // clip). Decode + the processor's geometry pass run on `from-*`, so the
+    // layout queries below are answerable synchronously.
+    resource image {
+
+        // Single still image. `bytes` is an encoded image (PNG / JPEG / …).
+        from-bytes: static func(model: borrow<model>, bytes: list<u8>)
+            -> result<image, error>;
+
+        // Option B: the inferlet has already decoded + resized + patchified the
+        // image. `pixels` is `[n_patch * 3*patch^2]` row-major f32
+        // (channels-last per patch, values in [0,1]); `positions` is
+        // `[n_patch * 2]` of (x,y) patch coords. The engine runs the vision
+        // encoder over these directly. See MULTIMODAL.md §2.3 (option B).
+        from-pixels: static func(model: borrow<model>,
+                                 pixels: list<f32>,
+                                 positions: list<u32>) -> result<image, error>;
+
+        // Video clip: a temporally-ordered list of encoded frames (the inferlet
+        // owns frame extraction + sampling) with per-frame timestamps in
+        // seconds. Produces ONE visual span whose grid has t > 1.
+        from-frames: static func(model: borrow<model>,
+                                 frames: list<list<u8>>,
+                                 timestamps: list<f32>) -> result<image, error>;
+
+        // Hidden-state rows / KV slots this visual span occupies.
+        token-count: func() -> u32;
+
+        // How far the 1-D sequence cursor advances past this span. Equals
+        // token-count for Gemma (1-D RoPE); equals max(t, h, w) for Qwen
+        // (M-RoPE), where the next text token's three components all begin.
+        position-span: func() -> u32;
+
+        // (t, h, w) in merged-token units.
+        grid: func() -> tuple<u32, u32, u32>;
+    }
+
+    // A host-side handle to a preprocessed audio clip. The inferlet computes
+    // log-mel features (the audio_frontend.md §1 pipeline); the engine's
+    // gemma4_audio encoder + projector turn them into soft-token KV.
+    resource audio {
+
+        // Option B: the inferlet supplies log-mel features `[n-frames * 128]`
+        // f32, frame-major (128 mel bins per frame), matching
+        // Gemma4AudioFeatureExtractor. The engine runs the audio encoder over
+        // these directly. See audio_frontend.md.
+        from-mel: static func(model: borrow<model>,
+                              mel: list<f32>,
+                              n-frames: u32) -> result<audio, error>;
+
+        // Hidden-state rows / KV slots this clip occupies == audio soft tokens.
+        token-count: func() -> u32;
+
+        // 1-D sequence-cursor advance (== token-count for Gemma's 1-D RoPE).
+        position-span: func() -> u32;
+    }
+}

@@ -19,7 +19,11 @@ public:
         const Gemma4ForwardCfg& fwd_cfg,
         // Token threshold for the small-prefill graph fast path. Set to 0
         // when the runtime's spec-graph window is disabled.
-        int small_spec_graph_tokens);
+        int small_spec_graph_tokens,
+        // Vision tower for multimodal gemma-4 (nullptr = text-only).
+        const Gemma4VisionWeights* vision = nullptr,
+        // Audio tower for multimodal gemma-4 (nullptr = no audio).
+        const Gemma4AudioWeights* audio = nullptr);
 
     void prepare(AttentionWorkspace& attn_ws,
                  const ForwardFn::PrepareInputs& in) override;
@@ -46,6 +50,14 @@ private:
     KvCache& kv_cache_;
     Gemma4ForwardCfg fwd_cfg_;
     ModelCapabilities caps_;
+    // Vision encoder weights (raw bf16 pointers), built once from the bound
+    // tower. `has_vision_` gates the encode+scatter in `body()`.
+    VisRawWeights vision_raw_;
+    bool has_vision_ = false;
+    // Audio encoder weights (raw bf16 pointers), built once from the bound
+    // tower. `has_audio_` gates the encode+scatter in `body()`.
+    AudioRawWeights audio_raw_;
+    bool has_audio_ = false;
 };
 
 }  // namespace pie_cuda_driver::model

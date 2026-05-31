@@ -250,6 +250,12 @@ fn empty_forward_response_desc() -> PieForwardResponseDesc {
         spec_tokens_len: 0,
         spec_positions_ptr: ptr::null(),
         spec_positions_len: 0,
+        probe_wire_parse_us: 0,
+        probe_plan_us: 0,
+        probe_h2d_us: 0,
+        probe_kernel_launch_us: 0,
+        probe_sync_us: 0,
+        probe_response_build_us: 0,
     }
 }
 
@@ -356,7 +362,7 @@ fn build_health_request_round_trip() {
         },
     };
 
-    let mut buf = vec![0u8; 256];
+    let mut buf = vec![0u8; 1024];
     let n = unsafe { pie_build_frame(&desc, buf.as_mut_ptr(), buf.len()) };
     assert!(n > 0);
 
@@ -420,6 +426,32 @@ fn empty_forward_request_desc() -> PieForwardRequestDesc {
         context_ids_len: 0,
         single_token_mode: 0,
         has_user_mask: 0,
+        image_indptr_ptr: ptr::null(),
+        image_indptr_len: 0,
+        image_grids_ptr: ptr::null(),
+        image_grids_len: 0,
+        image_anchor_positions_ptr: ptr::null(),
+        image_anchor_positions_len: 0,
+        image_pixels_ptr: ptr::null(),
+        image_pixels_len: 0,
+        image_pixel_indptr_ptr: ptr::null(),
+        image_pixel_indptr_len: 0,
+        image_mrope_positions_ptr: ptr::null(),
+        image_mrope_positions_len: 0,
+        image_mrope_indptr_ptr: ptr::null(),
+        image_mrope_indptr_len: 0,
+        image_patch_positions_ptr: ptr::null(),
+        image_patch_positions_len: 0,
+        image_anchor_rows_ptr: ptr::null(),
+        image_anchor_rows_len: 0,
+        audio_features_ptr: ptr::null(),
+        audio_features_len: 0,
+        audio_feature_indptr_ptr: ptr::null(),
+        audio_feature_indptr_len: 0,
+        audio_anchor_rows_ptr: ptr::null(),
+        audio_anchor_rows_len: 0,
+        audio_indptr_ptr: ptr::null(),
+        audio_indptr_len: 0,
     }
 }
 

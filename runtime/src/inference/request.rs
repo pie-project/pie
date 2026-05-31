@@ -81,6 +81,22 @@ pub fn new_per_request(
         context_ids: vec![context_id],
         single_token_mode,
         has_user_mask,
+        // Text-only builder: no visual spans. CSR roots start with a leading 0;
+        // image_indptr is the single-request form [0, 0].
+        image_indptr: vec![0, 0],
+        image_grids: Vec::new(),
+        image_anchor_positions: Vec::new(),
+        image_pixels: Vec::new(),
+        image_pixel_indptr: vec![0],
+        image_mrope_positions: Vec::new(),
+        image_mrope_indptr: vec![0],
+        image_patch_positions: Vec::new(),
+        image_anchor_rows: Vec::new(),
+        // Text-only builder: no audio spans. CSR roots start with a leading 0.
+        audio_features: Vec::new(),
+        audio_feature_indptr: vec![0],
+        audio_anchor_rows: Vec::new(),
+        audio_indptr: vec![0, 0],
     }
 }
 
@@ -267,6 +283,23 @@ pub fn new_batched_forward_request_with_capacity(n_requests: usize) -> pie_bridg
         context_ids: Vec::with_capacity(req_cap),
         single_token_mode: true,
         has_user_mask: false,
+        // Image side-channel: per-request `image_indptr` and the per-image
+        // pixel/mrope indptrs each start with a leading 0 (grown by the merge).
+        image_indptr: indptr(indptr_cap),
+        image_grids: Vec::new(),
+        image_anchor_positions: Vec::new(),
+        image_pixels: Vec::new(),
+        image_pixel_indptr: indptr(indptr_cap),
+        image_mrope_positions: Vec::new(),
+        image_mrope_indptr: indptr(indptr_cap),
+        image_patch_positions: Vec::new(),
+        image_anchor_rows: Vec::new(),
+        // Audio side-channel: per-request `audio_indptr` + per-clip feature
+        // indptr each start with a leading 0 (grown by the merge).
+        audio_features: Vec::new(),
+        audio_feature_indptr: indptr(indptr_cap),
+        audio_anchor_rows: Vec::new(),
+        audio_indptr: indptr(indptr_cap),
     }
 }
 
@@ -359,6 +392,9 @@ pub fn append_request_with_options(
     page_size: u32,
     elide_decode_masks: bool,
 ) {
+    // Row offset of this request's tokens within the batch — image anchor rows
+    // shift by this when merged (captured before extending `token_ids`).
+    let row_base = batch.token_ids.len() as u32;
     // Tokens and positions
     batch.token_ids.extend(&req.token_ids);
     batch.position_ids.extend(&req.position_ids);
@@ -446,6 +482,53 @@ pub fn append_request_with_options(
 
     // Context.
     batch.context_ids.extend(&req.context_ids);
+
+    // Multimodal visual spans. Pure side-channel — does not affect the token,
+    // KV-page, or qo layout above. Per-image data (grids, anchors) is appended
+    // directly; the nested pixel/mrope CSRs are offset by the batch's running
+    // lengths; `image_indptr` gets one boundary per request (cumulative image
+    // count), matching the `mask_indptr` convention.
+    batch.image_grids.extend(&req.image_grids);
+    batch
+        .image_anchor_positions
+        .extend(&req.image_anchor_positions);
+    batch
+        .image_patch_positions
+        .extend(&req.image_patch_positions);
+    // Anchor rows shift by this request's row offset in the batch.
+    for &r in &req.image_anchor_rows {
+        batch.image_anchor_rows.push(row_base + r);
+    }
+
+    let pixel_base = batch.image_pixels.len() as u32;
+    batch.image_pixels.extend(&req.image_pixels);
+    for &off in req.image_pixel_indptr.iter().skip(1) {
+        batch.image_pixel_indptr.push(pixel_base + off);
+    }
+
+    let mrope_base = batch.image_mrope_positions.len() as u32;
+    batch.image_mrope_positions.extend(&req.image_mrope_positions);
+    for &off in req.image_mrope_indptr.iter().skip(1) {
+        batch.image_mrope_indptr.push(mrope_base + off);
+    }
+
+    batch.image_indptr.push((batch.image_grids.len() / 3) as u32);
+
+    // Multimodal audio spans — direct analog of the image merge. Per-clip
+    // log-mel features are appended; the feature CSR is offset by the batch's
+    // running byte length; `audio_indptr` gets one boundary per request
+    // (cumulative clip count). Anchor rows shift by this request's row offset.
+    for &r in &req.audio_anchor_rows {
+        batch.audio_anchor_rows.push(row_base + r);
+    }
+    let audio_feat_base = batch.audio_features.len() as u32;
+    batch.audio_features.extend(&req.audio_features);
+    for &off in req.audio_feature_indptr.iter().skip(1) {
+        batch.audio_feature_indptr.push(audio_feat_base + off);
+    }
+    batch
+        .audio_indptr
+        .push(batch.audio_anchor_rows.len() as u32);
 
     // Inference hint: prefill kernel when ANY request needs `custom_mask`.
     if req.token_ids.len() > 1 || req.has_user_mask {
@@ -598,6 +681,130 @@ mod tests {
             None,
             None,
         )
+    }
+
+    /// Attach one visual span to `req`, mirroring the `input_image` host
+    /// handler: append grid + anchor + pixels + mrope, then push exactly one
+    /// entry onto each per-image indptr (unconditionally, even when there are
+    /// no mrope positions) so every image contributes one CSR slot.
+    fn with_image(
+        mut req: pie_bridge::ForwardRequest,
+        grid: [u32; 3],
+        anchor: u32,
+        pixels: &[u8],
+        mrope: &[u32],
+    ) -> pie_bridge::ForwardRequest {
+        req.image_grids.extend_from_slice(&grid);
+        req.image_anchor_positions.push(anchor);
+        req.image_pixels.extend_from_slice(pixels);
+        req.image_pixel_indptr.push(req.image_pixels.len() as u32);
+        req.image_mrope_positions.extend_from_slice(mrope);
+        req.image_mrope_indptr
+            .push(req.image_mrope_positions.len() as u32);
+        req
+    }
+
+    #[test]
+    fn image_side_channel_merges_with_csr_offsets() {
+        // Two single-token decode requests, each carrying one image. Request 0
+        // is an M-RoPE image (6 position components); request 1 is a 1-D-RoPE
+        // image (no mrope). Merging must offset the nested pixel/mrope CSRs by
+        // the batch's running lengths and push one image_indptr boundary per
+        // request.
+        let req0 = with_image(
+            make_request(vec![1], vec![10], vec![]),
+            [1, 4, 4],
+            10,
+            &[1, 2, 3],
+            &[10, 10, 10, 10, 10, 11],
+        );
+        let req1 = with_image(
+            make_request(vec![2], vec![20], vec![]),
+            [1, 2, 2],
+            100,
+            &[9],
+            &[],
+        );
+
+        let mut batch = new_batched_forward_request();
+        append_request(&mut batch, &req0, &[100], 1, 16);
+        append_request(&mut batch, &req1, &[200], 1, 16);
+
+        // Per-image data concatenated in request order.
+        assert_eq!(batch.image_grids, vec![1, 4, 4, 1, 2, 2]);
+        assert_eq!(batch.image_anchor_positions, vec![10, 100]);
+        assert_eq!(batch.image_pixels, vec![1, 2, 3, 9]);
+        // Nested pixel CSR: leading 0, then offset cumulative byte ends.
+        assert_eq!(batch.image_pixel_indptr, vec![0, 3, 4]);
+        // M-RoPE positions only from the first image; the second contributes an
+        // empty (but present) CSR slot.
+        assert_eq!(batch.image_mrope_positions, vec![10, 10, 10, 10, 10, 11]);
+        assert_eq!(batch.image_mrope_indptr, vec![0, 6, 6]);
+        // Per-request CSR: one image each.
+        assert_eq!(batch.image_indptr, vec![0, 1, 2]);
+    }
+
+    /// Attach one audio clip to `req`, mirroring the `input_audio` host handler:
+    /// append the row anchor + feature bytes, then push one feature-CSR slot.
+    fn with_audio(
+        mut req: pie_bridge::ForwardRequest,
+        anchor_row: u32,
+        features: &[u8],
+    ) -> pie_bridge::ForwardRequest {
+        req.audio_anchor_rows.push(anchor_row);
+        req.audio_features.extend_from_slice(features);
+        req.audio_feature_indptr
+            .push(req.audio_features.len() as u32);
+        req
+    }
+
+    #[test]
+    fn audio_side_channel_merges_with_csr_offsets() {
+        // Two single-token requests, each carrying one audio clip. Merging must
+        // offset the per-clip feature CSR by the batch's running byte length,
+        // shift anchor rows by the request's batch-row offset, and push one
+        // audio_indptr boundary per request.
+        let req0 = with_audio(make_request(vec![1], vec![10], vec![]), 0, &[1, 2, 3]);
+        let req1 = with_audio(make_request(vec![2], vec![20], vec![]), 0, &[4, 5]);
+
+        let mut batch = new_batched_forward_request();
+        append_request(&mut batch, &req0, &[100], 1, 16);
+        append_request(&mut batch, &req1, &[200], 1, 16);
+
+        // Per-clip features concatenated in request order.
+        assert_eq!(batch.audio_features, vec![1, 2, 3, 4, 5]);
+        // Nested feature CSR: leading 0, then offset cumulative byte ends.
+        assert_eq!(batch.audio_feature_indptr, vec![0, 3, 5]);
+        // Anchor rows shift by each request's row offset (req0 at row 0, req1
+        // at row 1 since req0 contributed one token).
+        assert_eq!(batch.audio_anchor_rows, vec![0, 1]);
+        // Per-request CSR: one clip each.
+        assert_eq!(batch.audio_indptr, vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn text_only_requests_carry_no_audio() {
+        let req = make_request(vec![1], vec![10], vec![]);
+        let mut batch = new_batched_forward_request();
+        append_request(&mut batch, &req, &[100], 1, 16);
+        assert!(batch.audio_features.is_empty());
+        assert!(batch.audio_anchor_rows.is_empty());
+        // audio_indptr still advances (one boundary per request, 0 clips).
+        assert_eq!(batch.audio_indptr, vec![0, 0]);
+        assert_eq!(batch.audio_feature_indptr, vec![0]);
+    }
+
+    #[test]
+    fn text_only_requests_carry_no_images() {
+        let req = make_request(vec![1], vec![10], vec![]);
+        let mut batch = new_batched_forward_request();
+        append_request(&mut batch, &req, &[100], 1, 16);
+        assert!(batch.image_grids.is_empty());
+        assert!(batch.image_pixels.is_empty());
+        // image_indptr still advances (one boundary per request, 0 images).
+        assert_eq!(batch.image_indptr, vec![0, 0]);
+        assert_eq!(batch.image_pixel_indptr, vec![0]);
+        assert_eq!(batch.image_mrope_indptr, vec![0]);
     }
 
     #[test]

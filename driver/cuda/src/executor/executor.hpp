@@ -111,6 +111,12 @@ struct ForwardFn {
         const std::int32_t*  logit_row_indices_d  = nullptr;
         int                  num_logit_rows       = 0;
 
+        // False when this fire samples nothing (e.g. a multimodal image-token
+        // KV-fill pass): the forward should skip the lm_head entirely rather
+        // than materialize dense logits over all N rows. Defaults true so
+        // ordinary text fires (which always sample ≥ 1 row) are unaffected.
+        bool emit_logits = true;
+
         // Sampling hint: if the executor only needs argmax, body may skip
         // dense logits and write straight into the fused-argmax output.
         bool tp_greedy_argmax = false;
@@ -123,6 +129,33 @@ struct ForwardFn {
         // and lm_head are skipped. Used to advance rs_cache state after a
         // frozen verify without re-running the whole backbone.
         const std::int32_t*  commit_advance_gather_d = nullptr;
+
+        // Multimodal (gemma4 vision, option-B pixel path) — host pointers into
+        // the request view. The model encodes each image and scatters the
+        // projected soft tokens into the embed output. Empty for text-only.
+        const float*         image_pixels_h           = nullptr;  // f32 pixel_values
+        const std::uint32_t* image_pixel_byte_indptr_h = nullptr; // n_img+1 byte offsets
+        const std::uint32_t* image_patch_positions_h  = nullptr;  // 2 per patch
+        const std::uint32_t* image_anchor_rows_h      = nullptr;  // n_img row offsets
+        int                  num_images               = 0;
+
+        // Qwen3-VL extras: per-image patch grids (t,h,w) and the M-RoPE 3-axis
+        // position ids for the whole batch. `mrope_positions_h` is the host
+        // `[total_tokens, 3]` (t,h,w) per-token positions (built by the runtime
+        // for mrope models; image rows carry the grid positions, text rows
+        // carry t==h==w). The Qwen3-VL forward uploads these for the M-RoPE
+        // kernel. Null on gemma4 / non-mrope models.
+        const std::uint32_t* image_grids_h            = nullptr;  // 3 per image (t,h,w)
+        const std::uint32_t* mrope_positions_h        = nullptr;  // [total_tokens, 3]
+        int                  num_mrope_positions       = 0;        // == total_tokens when set
+
+        // Multimodal audio (gemma4_audio) — host pointers into the request
+        // view. The model encodes each clip's log-mel features and scatters
+        // the projected soft tokens at its anchor row. Empty for non-audio.
+        const float*         audio_features_h          = nullptr;  // f32 log-mel
+        const std::uint32_t* audio_feature_byte_indptr_h = nullptr; // n_clip+1 byte offsets
+        const std::uint32_t* audio_anchor_rows_h      = nullptr;  // n_clip row offsets
+        int                  num_clips                 = 0;
     };
 
     struct PrepareInputs {

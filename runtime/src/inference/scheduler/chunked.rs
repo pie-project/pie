@@ -931,6 +931,22 @@ fn build_chunk_request_for_slots(
         context_ids: original.context_ids.clone(),
         single_token_mode: !original.has_user_mask && chunk_len <= 1,
         has_user_mask: original.has_user_mask,
+        // TODO(multimodal): chunked prefill does not yet split visual spans
+        // across chunks. Until the vision encoder consumes these fields, chunks
+        // carry no images (empty CSR roots). See MULTIMODAL.md.
+        image_indptr: vec![0, 0],
+        image_grids: Vec::new(),
+        image_anchor_positions: Vec::new(),
+        image_pixels: Vec::new(),
+        image_pixel_indptr: vec![0],
+        image_mrope_positions: Vec::new(),
+        image_mrope_indptr: vec![0],
+        image_patch_positions: Vec::new(),
+        image_anchor_rows: Vec::new(),
+        audio_features: Vec::new(),
+        audio_feature_indptr: vec![0],
+        audio_anchor_rows: Vec::new(),
+        audio_indptr: vec![0, 0],
     };
 
     Ok(BuiltChunk {

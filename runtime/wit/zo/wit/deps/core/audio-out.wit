@@ -1,0 +1,29 @@
+// Native audio OUTPUT — the inverse of media.wit. See AUDIO_OUTPUT.md.
+//
+// The engine owns the CSM backbone (16-layer Llama, reuses the verified naive
+// forward) + the depth decoder (4-layer RVQ frame sampler, verified by
+// driver/cuda/tests/csm_depth_decoder_parity.cu) + the Mimi decoder (codes ->
+// waveform, verified by driver/cuda/tests/mimi_decoder_full_parity.cu). The
+// inferlet supplies the tokenized "[speaker]text" prompt and receives the fully
+// decoded 24 kHz mono PCM.
+//
+// This synchronous one-shot form (prompt in -> PCM out) matches the driver's
+// `generate_audio` primitive, which runs the entire frame-stepped loop in one
+// call (backbone prefill -> per-frame: backbone step samples codebook 0, the
+// 31-step depth loop samples codebooks 1..31, then Mimi-decode the 32 codes ->
+// 1920 PCM samples) and returns once the all-EOS frame or `max-frames` is hit.
+// Streaming (`next-chunk`) is a follow-up; the codes never round-trip through
+// WASM linear memory — only the final PCM does, on request.
+interface audio-out {
+    use types.{error};
+    use model.{model};
+
+    // Generate speech from a tokenized CSM prompt. `tokens` is the
+    // "[speaker]text" prompt already encoded by the model's tokenizer;
+    // `max-frames` caps the number of 12.5 Hz Mimi frames (each = 1920 samples
+    // = 80 ms). Returns 24 kHz mono PCM as f32 samples in [-1, 1]. Errors if the
+    // model has no audio-output front-end (i.e. is not a CSM checkpoint).
+    generate: func(model: borrow<model>,
+                   tokens: list<u32>,
+                   max-frames: u32) -> result<list<f32>, error>;
+}

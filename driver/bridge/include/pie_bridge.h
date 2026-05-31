@@ -89,10 +89,12 @@ typedef struct PieAdapterOp          PieAdapterOp;
 #define PIE_COPY_RESOURCE_KV  0
 #define PIE_COPY_RESOURCE_RS  1
 
-#define PIE_ADAPTER_OP_LOAD        0
-#define PIE_ADAPTER_OP_SAVE        1
-#define PIE_ADAPTER_OP_ZO_INIT     2
-#define PIE_ADAPTER_OP_ZO_UPDATE   3
+#define PIE_ADAPTER_OP_LOAD          0
+#define PIE_ADAPTER_OP_SAVE          1
+#define PIE_ADAPTER_OP_ZO_INIT       2
+#define PIE_ADAPTER_OP_ZO_UPDATE     3
+/* CSM native audio output (pie:core/audio-out). See AUDIO_OUTPUT.md. */
+#define PIE_ADAPTER_OP_GENERATE_AUDIO 4
 
 /* ===========================================================
  * Parse entry points
@@ -164,6 +166,34 @@ const PieSampler* pie_forward_request_samplers_at (const PieForwardRequest*, siz
 
 size_t                   pie_forward_request_adapter_bindings_len(const PieForwardRequest*);
 const PieAdapterBinding* pie_forward_request_adapter_bindings_at (const PieForwardRequest*, size_t i);
+
+/* Multimodal visual spans (vision/video) — see MULTIMODAL.md. Empty for
+ * text-only passes. `image_indptr` is per-request CSR (images per request);
+ * `image_pixel_indptr` / `image_mrope_indptr` are per-image CSRs. NOTE:
+ * `image_pixels` currently carries the staged *encoded* image bytes (the host
+ * preprocessor lands in a later phase); the driver does not consume them yet. */
+void pie_forward_request_image_indptr           (const PieForwardRequest*, const uint32_t**, size_t*);
+void pie_forward_request_image_grids            (const PieForwardRequest*, const uint32_t**, size_t*);
+void pie_forward_request_image_anchor_positions (const PieForwardRequest*, const uint32_t**, size_t*);
+void pie_forward_request_image_pixels           (const PieForwardRequest*, const uint8_t**,  size_t*);
+void pie_forward_request_image_pixel_indptr     (const PieForwardRequest*, const uint32_t**, size_t*);
+void pie_forward_request_image_mrope_positions  (const PieForwardRequest*, const uint32_t**, size_t*);
+void pie_forward_request_image_mrope_indptr     (const PieForwardRequest*, const uint32_t**, size_t*);
+/* Option-B pixel path: `image_pixels` holds f32 pixel_values as LE bytes;
+ * `image_patch_positions` is per-patch (x,y); `image_anchor_rows` is the batch
+ * row offset of each image's soft-token rows. */
+void pie_forward_request_image_patch_positions  (const PieForwardRequest*, const uint32_t**, size_t*);
+void pie_forward_request_image_anchor_rows      (const PieForwardRequest*, const uint32_t**, size_t*);
+
+/* Multimodal audio spans (gemma4_audio) — direct analog of the image block.
+ * `audio_features` holds per-clip log-mel f32 as LE bytes (range =
+ * `audio_feature_indptr`); `audio_anchor_rows` is the batch row offset of each
+ * clip's soft-token rows; `audio_indptr` is per-request CSR (clips per request).
+ * Empty for non-audio passes. See audio_frontend.md. */
+void pie_forward_request_audio_features         (const PieForwardRequest*, const uint8_t**,  size_t*);
+void pie_forward_request_audio_feature_indptr   (const PieForwardRequest*, const uint32_t**, size_t*);
+void pie_forward_request_audio_anchor_rows      (const PieForwardRequest*, const uint32_t**, size_t*);
+void pie_forward_request_audio_indptr           (const PieForwardRequest*, const uint32_t**, size_t*);
 
 /* AdapterBinding fields — `-1` means unbound for both. */
 int64_t pie_adapter_binding_adapter_id(const PieAdapterBinding*);
@@ -269,6 +299,21 @@ typedef struct PieForwardRequestDesc {
     const uint64_t* context_ids_ptr;        size_t context_ids_len;
     uint8_t single_token_mode;
     uint8_t has_user_mask;
+    /* Multimodal visual spans (appended; struct order matches schema.rs). */
+    const uint32_t* image_indptr_ptr;             size_t image_indptr_len;
+    const uint32_t* image_grids_ptr;              size_t image_grids_len;
+    const uint32_t* image_anchor_positions_ptr;   size_t image_anchor_positions_len;
+    const uint8_t*  image_pixels_ptr;             size_t image_pixels_len;
+    const uint32_t* image_pixel_indptr_ptr;       size_t image_pixel_indptr_len;
+    const uint32_t* image_mrope_positions_ptr;    size_t image_mrope_positions_len;
+    const uint32_t* image_mrope_indptr_ptr;       size_t image_mrope_indptr_len;
+    const uint32_t* image_patch_positions_ptr;    size_t image_patch_positions_len;
+    const uint32_t* image_anchor_rows_ptr;        size_t image_anchor_rows_len;
+    /* Multimodal audio spans (appended; struct order matches schema.rs). */
+    const uint8_t*  audio_features_ptr;           size_t audio_features_len;
+    const uint32_t* audio_feature_indptr_ptr;     size_t audio_feature_indptr_len;
+    const uint32_t* audio_anchor_rows_ptr;        size_t audio_anchor_rows_len;
+    const uint32_t* audio_indptr_ptr;             size_t audio_indptr_len;
 } PieForwardRequestDesc;
 
 typedef struct PieForwardResponseDesc {

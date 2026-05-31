@@ -1,6 +1,7 @@
 #include "model/llama_like.hpp"
 
 #include <algorithm>
+#include <cstdio>
 #include <cstdlib>
 #include <cstdint>
 
@@ -19,6 +20,7 @@
 #include "kernels/sample_temp.hpp"
 #include "kernels/split_packed.hpp"
 #include "kernels/swiglu.hpp"
+#include "model/qwen3_vl_vision_forward.hpp"  // scatter_qwen3vl_vision
 #include "ops/attention_flashinfer.hpp"
 #include "ops/gemm.hpp"
 
@@ -258,7 +260,8 @@ void llama_like_forward_paged(
     int num_logit_rows,
     bool tp_greedy_argmax,
     const std::uint8_t* custom_mask_d,
-    const std::int32_t* custom_mask_indptr_d)
+    const std::int32_t* custom_mask_indptr_d,
+    const LlamaLikeVisionInputs* vision)
 {
     // Tensor-parallel local dims. tp_size == 1 reverts to single-GPU
     // shapes; the local *_local fields just shadow the unsharded value.
@@ -303,6 +306,19 @@ void llama_like_forward_paged(
     kernels::launch_embed_bf16(
         token_ids, w.embed->data(), ws.y.data(),
         N, H, cfg.vocab_size, stream);
+
+    // 1b. Qwen3-VL multimodal: encode each image and overwrite its soft-token
+    // rows in the embed output; also stash the deepstack merger outputs (added
+    // into the hidden state on image rows after early decoder layers below).
+    if (vision != nullptr && vision->vision_in != nullptr &&
+        vision->vision_in->num_images > 0) {
+        scatter_qwen3vl_vision(
+            *vision->vision_in,
+            static_cast<__nv_bfloat16*>(ws.y.data()),
+            N, H,
+            static_cast<__nv_bfloat16*>(vision->deepstack_scratch),
+            vision->num_deepstack, stream);
+    }
 
     // Some GQA group sizes (Qwen2 small models — 6, 7) aren't in
     // flashinfer's decode dispatch table; for those we run the prefill
@@ -460,9 +476,23 @@ void llama_like_forward_paged(
             fwd_cfg.use_qk_norm &&
             q_norm_is_per_head && k_norm_is_per_head &&
             fwd_cfg.rope_kind == RopeKind::Standard;
+        const bool use_mrope =
+            fwd_cfg.rope_kind == RopeKind::MRopeInterleaved &&
+            vision != nullptr && vision->mrope_positions != nullptr &&
+            q_norm_is_per_head && k_norm_is_per_head;
         if (fused_decode_qkv_post) {
             // Q was normalized/rotated and K/V were written directly to the
             // paged cache by the fused decode postprocess above.
+        } else if (use_mrope) {
+            // Qwen3-VL: fused per-head q/k RMSNorm + interleaved 3-axis M-RoPE.
+            kernels::launch_qk_rmsnorm_mrope_bf16(
+                ws.q.data(), ws.k.data(),
+                layer.q_norm->data(), layer.k_norm->data(),
+                vision->mrope_positions,
+                N, num_q_heads_local, num_kv_heads_local, d,
+                cfg.rope_theta, eps,
+                fwd_cfg.mrope_section_t, fwd_cfg.mrope_section_h,
+                fwd_cfg.mrope_section_w, stream);
         } else if (fuse_qk_norm_rope) {
             kernels::launch_qk_rmsnorm_rope_bf16(
                 ws.q.data(), ws.k.data(),
@@ -715,6 +745,19 @@ void llama_like_forward_paged(
                 N, H, eps, stream);
             kernels::launch_residual_add_bf16(
                 ws.y.data(), ws.norm_y.data(), N * H, stream);
+        }
+
+        // Qwen3-VL DeepStack: after decoder layers 0..num_deepstack-1, add the
+        // matching deepstack merger output into the hidden state. The scatter
+        // zeroed the scratch and wrote only image rows, so a whole-tensor
+        // residual-add leaves text rows unchanged (HF `_deepstack_process`).
+        if (vision != nullptr && vision->deepstack_scratch != nullptr &&
+            L < vision->num_deepstack) {
+            const auto* ds = static_cast<const std::uint16_t*>(
+                                 vision->deepstack_scratch) +
+                             static_cast<std::size_t>(L) * N * H;
+            kernels::launch_residual_add_bf16(
+                ws.y.data(), ds, static_cast<std::size_t>(N) * H, stream);
         }
     }
 

@@ -54,6 +54,21 @@ fn frame_forward_round_trip() {
                 seed: -7,
             },
         ],
+        // Multimodal side-channel: two visual spans (an M-RoPE image with
+        // mrope positions, then a 1-D-RoPE image without). Exercises the
+        // appended ForwardRequest fields over the real rkyv wire.
+        image_indptr: vec![0, 2],
+        image_grids: vec![1, 4, 4, 1, 2, 2],
+        image_anchor_positions: vec![10, 100],
+        image_pixels: vec![1, 2, 3, 9],
+        image_pixel_indptr: vec![0, 3, 4],
+        image_mrope_positions: vec![10, 10, 10, 10, 10, 11],
+        image_mrope_indptr: vec![0, 6, 6],
+        // Multimodal audio side-channel: one clip's log-mel features + anchor.
+        audio_features: vec![1, 2, 3, 4, 5, 6, 7, 8],
+        audio_feature_indptr: vec![0, 8],
+        audio_anchor_rows: vec![3],
+        audio_indptr: vec![0, 1],
         ..Default::default()
     };
     let f = Frame {
@@ -72,6 +87,22 @@ fn frame_forward_round_trip() {
     assert!(arch_req.single_token_mode);
     assert!(arch_req.has_user_mask);
     assert_eq!(arch_req.samplers.len(), 2);
+    // Multimodal side-channel survives the rkyv round-trip intact.
+    assert_eq!(arch_req.image_indptr.as_slice(), &[0u32, 2]);
+    assert_eq!(arch_req.image_grids.as_slice(), &[1u32, 4, 4, 1, 2, 2]);
+    assert_eq!(arch_req.image_anchor_positions.as_slice(), &[10u32, 100]);
+    assert_eq!(arch_req.image_pixels.as_slice(), &[1u8, 2, 3, 9]);
+    assert_eq!(arch_req.image_pixel_indptr.as_slice(), &[0u32, 3, 4]);
+    assert_eq!(
+        arch_req.image_mrope_positions.as_slice(),
+        &[10u32, 10, 10, 10, 10, 11]
+    );
+    assert_eq!(arch_req.image_mrope_indptr.as_slice(), &[0u32, 6, 6]);
+    // Audio side-channel survives the rkyv round-trip intact.
+    assert_eq!(arch_req.audio_features.as_slice(), &[1u8, 2, 3, 4, 5, 6, 7, 8]);
+    assert_eq!(arch_req.audio_feature_indptr.as_slice(), &[0u32, 8]);
+    assert_eq!(arch_req.audio_anchor_rows.as_slice(), &[3u32]);
+    assert_eq!(arch_req.audio_indptr.as_slice(), &[0u32, 1]);
 }
 
 #[test]

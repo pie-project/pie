@@ -177,6 +177,20 @@ add_library(pie_driver_cuda_lib STATIC
   src/model/gemma2.cpp
   src/model/gemma4.cpp
   src/model/gemma4_mtp.cpp
+  src/model/gemma4_vision_forward.cu
+  src/model/gemma4_vision_adapter.cpp
+  src/model/gemma4_audio_forward.cu
+  src/model/gemma4_audio_adapter.cpp
+  src/model/mimi_decoder_forward.cu
+  src/model/mimi_decoder_adapter.cpp
+  src/model/csm_depth_decoder_forward.cu
+  src/model/csm_backbone_forward.cu
+  src/model/csm.cpp
+  src/model/csm_model.cpp
+  src/model/qwen3_vl.cpp
+  src/model/qwen3_vl_vision_forward.cu
+  src/model/qwen3_vl_vision_adapter.cpp
+  src/model/qwen3_vl_model.cpp
   src/model/gemma3n.cpp
   src/model/mistral3.cpp
   src/model/gpt_oss.cpp

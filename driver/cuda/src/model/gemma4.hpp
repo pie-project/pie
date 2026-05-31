@@ -39,6 +39,9 @@
 
 #include "device_buffer.hpp"
 #include "distributed.hpp"
+#include "loader/hf_config.hpp"
+#include "model/gemma4_vision_forward.hpp"  // VisRawWeights, Gemma4VisionInputs
+#include "model/gemma4_audio_forward.hpp"   // AudioRawWeights, Gemma4AudioInputs
 #include "model/loaded_model.hpp"
 #include "kv_cache.hpp"
 #include "model/llama_like.hpp"
@@ -230,6 +233,142 @@ struct Gemma4ForwardCfg {
 // `num_kv_shared_layers`. Throws on missing tensors.
 Gemma4Weights bind_gemma4(const LoadedModel& engine);
 
+// ── Gemma-4 vision tower (`gemma4_vision`) ──────────────────────────────────
+// A Gemma-style ViT (sandwich RMSNorms, encoder RoPE, gated gelu-tanh MLP),
+// NOT SigLIP. See MULTIMODAL.md §6.1. The projections are "clipped linears":
+// a weight plus per-tensor input/output clip ranges used for dequant.
+
+/// One clipped-linear projection: `<name>.linear.weight` + scalar clip ranges.
+/// The clip-range tensors are null when the checkpoint is not quantized.
+struct Gemma4ClippedLinear {
+    const DeviceTensor* weight     = nullptr;  // .linear.weight  [out, in]
+    const DeviceTensor* input_min  = nullptr;  // scalar
+    const DeviceTensor* input_max  = nullptr;  // scalar
+    const DeviceTensor* output_min = nullptr;  // scalar
+    const DeviceTensor* output_max = nullptr;  // scalar
+};
+
+struct Gemma4VisionLayerWeights {
+    // Gemma sandwich RMSNorms (same placement as the text tower).
+    const DeviceTensor* input_layernorm           = nullptr;
+    const DeviceTensor* post_attention_layernorm  = nullptr;
+    const DeviceTensor* pre_feedforward_layernorm  = nullptr;
+    const DeviceTensor* post_feedforward_layernorm = nullptr;
+    // Self-attention (non-causal) with per-head q/k RMSNorm.
+    Gemma4ClippedLinear q_proj, k_proj, v_proj, o_proj;
+    const DeviceTensor*  q_norm = nullptr;  // [head_dim]
+    const DeviceTensor*  k_norm = nullptr;  // [head_dim]
+    // Gated MLP (gelu-tanh).
+    Gemma4ClippedLinear gate_proj, up_proj, down_proj;
+};
+
+struct Gemma4VisionWeights {
+    // Patch front-end: linear over flattened patch pixels (patch² · 3 → hidden)
+    // plus a learned position-embedding table.
+    const DeviceTensor* patch_input_proj          = nullptr; // [hidden, patch²·3]
+    const DeviceTensor* patch_position_embedding  = nullptr; // [*, *, hidden]
+    std::vector<Gemma4VisionLayerWeights> layers;
+    // Projector into the text hidden space (`embed_vision`): [text_hidden, hidden].
+    const DeviceTensor* embed_vision_projection   = nullptr;
+    GemmaVisionConfig config;
+};
+
+// Bind the vision tower + projector from `model.vision_tower.` /
+// `model.embed_vision.`. Requires those tensors to be present (i.e. NOT in
+// `mm_skip_prefixes`) and `HfConfig.gemma_vision` populated. Throws otherwise.
+// Not yet invoked by the main bind path — see MULTIMODAL.md Phase 2.2.
+Gemma4VisionWeights bind_gemma4_vision(const LoadedModel& engine);
+
+// ── Gemma-4 audio tower (`gemma4_audio`) ────────────────────────────────────
+// A USM/Conformer encoder (SSCP subsampling + 12 Conformer blocks) + the shared
+// `embed_audio` projector. The weight struct below is the contract
+// `gemma4_audio_adapter.{hpp,cpp}` (`to_audio_raw`) consumes; defining the guard
+// makes the adapter use THIS single definition instead of its fallback copy.
+#define PIE_HAS_GEMMA4_AUDIO_WEIGHTS 1
+
+// One clipped-linear: `<name>.linear.weight` + scalar clip ranges (the audio
+// tower sets `use_clipped_linears=True`). Clip-range tensors null when not
+// quantized — identical layout to Gemma4ClippedLinear.
+struct Gemma4AudioClippedLinear {
+    const DeviceTensor* weight     = nullptr;  // .linear.weight  [out, in]
+    const DeviceTensor* input_min  = nullptr;  // scalar
+    const DeviceTensor* input_max  = nullptr;  // scalar
+    const DeviceTensor* output_min = nullptr;  // scalar
+    const DeviceTensor* output_max = nullptr;  // scalar
+};
+
+// Macaron feed-forward (`Gemma4AudioFeedForward`).
+struct Gemma4AudioFfnWeights {
+    const DeviceTensor* pre_layer_norm  = nullptr;  // [hidden]
+    const DeviceTensor* post_layer_norm = nullptr;  // [hidden]
+    Gemma4AudioClippedLinear ffw_layer_1;            // [4*hidden, hidden]
+    Gemma4AudioClippedLinear ffw_layer_2;            // [hidden, 4*hidden]
+};
+
+// One Conformer block (`Gemma4AudioLayer`).
+struct Gemma4AudioLayerWeights {
+    Gemma4AudioFfnWeights feed_forward1, feed_forward2;
+
+    const DeviceTensor* norm_pre_attn  = nullptr;   // [hidden]
+    const DeviceTensor* norm_post_attn = nullptr;   // [hidden]
+    const DeviceTensor* norm_out       = nullptr;   // [hidden]
+
+    // Chunked-local self-attention. `post` is the attention output projection.
+    Gemma4AudioClippedLinear q_proj, k_proj, v_proj, post;
+    const DeviceTensor* relative_k_proj = nullptr;  // [H*head_dim, hidden] (NOT clipped)
+    const DeviceTensor* per_dim_scale   = nullptr;  // [head_dim]
+
+    // Light depthwise-conv module (`lconv1d`).
+    const DeviceTensor* lconv_pre_layer_norm = nullptr;  // [hidden]
+    const DeviceTensor* lconv_conv_norm      = nullptr;  // [hidden]
+    Gemma4AudioClippedLinear lconv_linear_start;          // [2*hidden, hidden] → GLU
+    Gemma4AudioClippedLinear lconv_linear_end;            // [hidden, hidden]
+    const DeviceTensor* lconv_depthwise_conv = nullptr;  // [hidden, 1, conv_kernel]
+};
+
+// Minimal config the adapter reads (subset of GemmaAudioConfig). Filled by
+// `bind_gemma4_audio` from `HfConfig.gemma_audio`.
+struct Gemma4AudioConfigLite {
+    int hidden_size = 1024;
+    int num_attention_heads = 8;
+    int num_hidden_layers = 12;
+    int conv_kernel_size = 5;
+    int subsampling_conv_channels0 = 128;
+    int subsampling_conv_channels1 = 32;
+    int output_proj_dims = 1536;
+    int attention_chunk_size = 12;
+    int attention_context_left = 13;
+    int attention_context_right = 0;
+    int feature_size = 128;          // mel bins
+    float attention_logit_cap = 50.0f;
+    float residual_weight = 0.5f;
+    float rms_norm_eps = 1e-6f;
+};
+
+struct Gemma4AudioWeights {
+    // SSCP subsampling conv stack.
+    const DeviceTensor* sscp_layer0_conv = nullptr;  // [c0, 1, 3, 3]
+    const DeviceTensor* sscp_layer0_norm = nullptr;  // [c0]
+    const DeviceTensor* sscp_layer1_conv = nullptr;  // [c1, c0, 3, 3]
+    const DeviceTensor* sscp_layer1_norm = nullptr;  // [c1]
+    const DeviceTensor* sscp_input_proj  = nullptr;  // [hidden, (c0/4)*c1]
+
+    std::vector<Gemma4AudioLayerWeights> layers;
+
+    const DeviceTensor* output_proj_weight = nullptr;  // [out_proj_dims, hidden]
+    const DeviceTensor* output_proj_bias   = nullptr;  // [out_proj_dims]
+
+    // Shared embedder (`embed_audio`): parameterless RMSNorm → projection.
+    const DeviceTensor* embed_audio_projection = nullptr;  // [text_hidden, out_proj_dims]
+
+    Gemma4AudioConfigLite config;
+};
+
+// Bind the audio tower + projector from `model.audio_tower.` /
+// `model.embed_audio.`. Requires those tensors present and `HfConfig.gemma_audio`
+// populated. Throws otherwise. Mirrors `bind_gemma4_vision`.
+Gemma4AudioWeights bind_gemma4_audio(const LoadedModel& engine);
+
 void set_gemma4_logits_argmax_only(bool enabled);
 void set_gemma4_fused_argmax_output(std::int32_t* ptr);
 bool gemma4_fused_argmax_done();
@@ -277,7 +416,13 @@ void gemma4_forward_paged(
     const std::uint8_t* custom_mask_d = nullptr,
     const std::int32_t* custom_mask_indptr_d = nullptr,
     const std::int32_t* logit_row_indices_d = nullptr,
-    int num_logit_rows = 0);
+    int num_logit_rows = 0,
+    // Multimodal: encode + scatter image soft tokens after the embed step.
+    // nullptr / 0 images for text-only passes. See gemma4_vision_forward.hpp.
+    const Gemma4VisionInputs* vision_in = nullptr,
+    // Multimodal: encode + scatter audio soft tokens after the embed step.
+    // nullptr / 0 clips for non-audio passes. See gemma4_audio_forward.hpp.
+    const Gemma4AudioInputs* audio_in = nullptr);
 
 // Gemma4 MoE workspace byte budget. Returns 0 if the config has no MoE
 // block configured.

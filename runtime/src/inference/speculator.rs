@@ -670,6 +670,20 @@ pub fn build_next_request(
         context_ids: vec![context_id],
         single_token_mode: true,
         has_user_mask: false,
+        // Speculative single-token decode: no visual spans.
+        image_indptr: vec![0, 0],
+        image_grids: Vec::new(),
+        image_anchor_positions: Vec::new(),
+        image_pixels: Vec::new(),
+        image_pixel_indptr: vec![0],
+        image_mrope_positions: Vec::new(),
+        image_mrope_indptr: vec![0],
+        image_patch_positions: Vec::new(),
+        image_anchor_rows: Vec::new(),
+        audio_features: Vec::new(),
+        audio_feature_indptr: vec![0],
+        audio_anchor_rows: Vec::new(),
+        audio_indptr: vec![0, 0],
     };
     Some((next_req, sampled_token, next_pos))
 }
@@ -715,6 +729,7 @@ mod tests {
             context_ids: vec![0],
             single_token_mode: true,
             has_user_mask: false,
+            ..Default::default()
         }
     }
 

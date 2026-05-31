@@ -43,6 +43,7 @@ pub fn register(
 
     let model = Arc::new(Model {
         name,
+        arch_name: arch_name.to_string(),
         instruct,
         kv_page_size,
         tokenizer,
@@ -72,6 +73,9 @@ pub fn get_model(model_id: ModelId) -> Option<&'static Arc<Model>> {
 
 pub struct Model {
     name: String,
+    /// Architecture identifier supplied at registration (e.g. "gemma4",
+    /// "qwen3_6"). Used to select the multimodal processor / vision front-end.
+    arch_name: String,
     instruct: Arc<dyn Instruct>,
     kv_page_size: u32,
     tokenizer: Arc<Tokenizer>,
@@ -89,6 +93,11 @@ impl Model {
     /// Gets the model name.
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    /// Gets the architecture identifier (e.g. "gemma4", "qwen3_6").
+    pub fn arch_name(&self) -> &str {
+        &self.arch_name
     }
 
     /// Gets the instruct implementation for this model.

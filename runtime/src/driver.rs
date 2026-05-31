@@ -152,7 +152,7 @@ pub use inproc::{InProcChannel, InProcVTable};
 pub use inproc_polling::InProcPollingChannel;
 
 pub use ops::{
-    copy_d2d, copy_d2h, copy_h2d, copy_h2h, copy_rs_d2d, load_adapter, save_adapter,
-    zo_initialize_adapter, zo_update_adapter,
+    copy_d2d, copy_d2h, copy_h2d, copy_h2h, copy_rs_d2d, generate_audio, load_adapter,
+    save_adapter, zo_initialize_adapter, zo_update_adapter,
 };
 pub use shmem::ShmemChannel;

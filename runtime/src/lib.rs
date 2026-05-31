@@ -12,6 +12,7 @@ pub mod instance;
 pub mod linker;
 pub mod messaging;
 pub mod model;
+pub mod multimodal;
 pub mod path;
 pub mod policy;
 pub mod probe;

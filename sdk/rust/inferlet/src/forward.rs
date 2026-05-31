@@ -115,6 +115,12 @@ pub struct Forward<'ctx> {
     attn_mask: Option<Vec<Vec<u32>>>,
     adapter: Option<&'ctx Adapter>,
     zo_seed: Option<i64>,
+    /// Visual spans spliced at the given anchor positions, in declaration
+    /// order. Emitted as `input-image` calls at execute time.
+    images: Vec<(&'ctx crate::media::Image, u32)>,
+    /// Audio clips spliced at the given anchor positions, in declaration
+    /// order. Emitted as `input-audio` calls at execute time.
+    audios: Vec<(&'ctx crate::media::Audio, u32)>,
 }
 
 impl<'ctx> Forward<'ctx> {
@@ -145,6 +151,8 @@ impl<'ctx> Forward<'ctx> {
             attn_mask: None,
             adapter: None,
             zo_seed: None,
+            images: Vec::new(),
+            audios: Vec::new(),
         }
     }
 
@@ -230,6 +238,24 @@ impl<'ctx> Forward<'ctx> {
         self
     }
 
+    /// Splice an encoded visual span (image or video clip) at sequence
+    /// position `anchor`. The driver runs the vision encoder and scatters the
+    /// projected rows into the hidden state. Advance your position cursor by
+    /// `image.position_span()` for any tokens that follow. See MULTIMODAL.md.
+    pub fn input_image(&mut self, image: &'ctx crate::media::Image, anchor: u32) -> &mut Self {
+        self.images.push((image, anchor));
+        self
+    }
+
+    /// Splice an encoded audio clip at sequence position `anchor`. The driver
+    /// runs the gemma4_audio encoder and scatters the projected rows into the
+    /// hidden state. Advance your position cursor by `audio.position_span()`
+    /// for any tokens that follow. See audio_frontend.md.
+    pub fn input_audio(&mut self, audio: &'ctx crate::media::Audio, anchor: u32) -> &mut Self {
+        self.audios.push((audio, anchor));
+        self
+    }
+
     /// Set a `zo` (Evolution Strategies) seed for this forward pass.
     pub fn zo_seed(&mut self, seed: i64) -> &mut Self {
         self.zo_seed = Some(seed);
@@ -252,6 +278,8 @@ impl<'ctx> Forward<'ctx> {
             attn_mask,
             adapter,
             zo_seed,
+            images,
+            audios,
         } = self;
 
         let n_auto = auto_inputs.len() as u32;
@@ -273,6 +301,13 @@ impl<'ctx> Forward<'ctx> {
 
         let pass = ForwardPass::new(&ctx.model);
         pass.context(&ctx.inner);
+
+        for (image, anchor) in images {
+            pass.input_image(image, anchor);
+        }
+        for (audio, anchor) in audios {
+            pass.input_audio(audio, anchor);
+        }
 
         if let Some(a) = adapter {
             pass.adapter(a);

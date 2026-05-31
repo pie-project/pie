@@ -54,6 +54,7 @@ impl Behavior for RecordingBehavior {
             spec_indptr: vec![0; (n + 1) as usize],
             spec_tokens: Vec::new(),
             spec_positions: Vec::new(),
+            ..Default::default()
         }
     }
 }

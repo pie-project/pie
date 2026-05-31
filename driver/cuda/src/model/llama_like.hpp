@@ -30,6 +30,8 @@ enum class RopeKind {
     YaRN,          // Llama-3 smoothed-interpolation YaRN
     YaRNOriginal,  // Original YaRN (OLMo-3, gpt-oss): dim-index ramp +
                    // attention_factor mscale (Peng et al. 2023)
+    MRopeInterleaved,  // Qwen3-VL interleaved 3-axis M-RoPE (t,h,w). Reads
+                       // `mrope_positions` ([N,3]); requires per-head q/k norm.
 };
 
 enum class NormPlacement {
@@ -91,6 +93,29 @@ struct LlamaLikeForwardCfg {
     // logits tail.
     bool emit_logits = true;
 
+    // ── Qwen3-VL M-RoPE ──────────────────────────────────────────────
+    // mrope_section partitions head_dim/2 across the (t,h,w) axes. Consumed
+    // only when `rope_kind == MRopeInterleaved`. The 3-axis positions are
+    // supplied per-fire via `mrope_positions` (see llama_like_forward_paged).
+    int mrope_section_t = 0;
+    int mrope_section_h = 0;
+    int mrope_section_w = 0;
+};
+
+// Per-fire Qwen3-VL multimodal side-inputs threaded into the shared
+// llama_like forward. All null / nullptr disables every multimodal hook
+// (the forward reduces to a plain Qwen3 decode). See Qwen3VLModel::body.
+struct LlamaLikeVisionInputs {
+    // Vision encode + scatter after the embed (gated by num_images > 0).
+    const struct Qwen3VLVisionInputs* vision_in = nullptr;
+    // DeepStack: each deepstack merger output is added to the hidden state on
+    // image rows after decoder layers 0/1/2. `deepstack_scratch` is the
+    // [num_deep, N, H] bf16 buffer the scatter wrote; `num_deepstack` blocks.
+    void* deepstack_scratch = nullptr;
+    int   num_deepstack = 0;
+    // 3-axis M-RoPE positions [N,3] int32 (device). When non-null and
+    // rope_kind==MRopeInterleaved, used in place of the 1-D `positions`.
+    const std::int32_t* mrope_positions = nullptr;
 };
 
 // Persistent decode-plan cache. Owned in main.cpp's serving setup so the
@@ -161,7 +186,9 @@ void llama_like_forward_paged(
     int num_logit_rows = 0,
     bool tp_greedy_argmax = false,
     const std::uint8_t* custom_mask_d = nullptr,
-    const std::int32_t* custom_mask_indptr_d = nullptr);
+    const std::int32_t* custom_mask_indptr_d = nullptr,
+    // Qwen3-VL multimodal side-inputs (nullptr = plain text forward).
+    const LlamaLikeVisionInputs* vision = nullptr);
 
 // Map HF's rope_scaling_kind enum onto the driver's RopeKind. Llama3-style
 // frequency scaling maps to YaRN; the "original_yarn" branch keeps

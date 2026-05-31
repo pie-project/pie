@@ -1063,6 +1063,182 @@ Gemma4Weights bind_gemma4(const LoadedModel& engine) {
     return w;
 }
 
+// ── Gemma-4 vision tower bind ───────────────────────────────────────────────
+// Mirrors `bind_gemma4` for the `model.vision_tower.` / `model.embed_vision.`
+// tensors. The encoder forward (MULTIMODAL.md Phase 2.2) consumes the result;
+// this only wires pointers, so it has no GPU cost beyond what the loader
+// already staged. Requires the vision tensors to be present in the weight
+// store (i.e. removed from `mm_skip_prefixes`) — otherwise `must` throws.
+Gemma4VisionWeights bind_gemma4_vision(const LoadedModel& engine) {
+    const auto& cfg = engine.hf_config();
+    if (!cfg.gemma_vision.has_value()) {
+        throw std::runtime_error(
+            "gemma4 vision: HfConfig.gemma_vision is empty — config has no "
+            "gemma4_vision vision_config");
+    }
+    const GemmaVisionConfig& vc = *cfg.gemma_vision;
+
+    Gemma4VisionWeights w;
+    w.config = vc;
+
+    const std::string vp = "model.vision_tower.";
+    w.patch_input_proj =
+        &must(engine, vp + "patch_embedder.input_proj.weight");
+    w.patch_position_embedding =
+        &must(engine, vp + "patch_embedder.position_embedding_table");
+    w.embed_vision_projection =
+        &must(engine, "model.embed_vision.embedding_projection.weight");
+
+    // Bind one clipped-linear: required weight + optional per-tensor clip
+    // ranges (present only on quantized checkpoints, `use_clipped_linears`).
+    const auto bind_clipped = [&](const std::string& base) {
+        Gemma4ClippedLinear c;
+        c.weight = &must(engine, base + ".linear.weight");
+        const auto opt = [&](const char* suffix) -> const DeviceTensor* {
+            const std::string n = base + suffix;
+            return engine.has(n) ? &engine.get(n) : nullptr;
+        };
+        c.input_min  = opt(".input_min");
+        c.input_max  = opt(".input_max");
+        c.output_min = opt(".output_min");
+        c.output_max = opt(".output_max");
+        return c;
+    };
+
+    const int L = vc.num_hidden_layers;
+    w.layers.resize(static_cast<std::size_t>(L));
+    const std::string ep = vp + "encoder.layers.";
+    for (int i = 0; i < L; ++i) {
+        const std::string lp = ep + std::to_string(i) + ".";
+        auto& Lw = w.layers[static_cast<std::size_t>(i)];
+
+        Lw.input_layernorm =
+            &must(engine, lp + "input_layernorm.weight");
+        Lw.post_attention_layernorm =
+            &must(engine, lp + "post_attention_layernorm.weight");
+        Lw.pre_feedforward_layernorm =
+            &must(engine, lp + "pre_feedforward_layernorm.weight");
+        Lw.post_feedforward_layernorm =
+            &must(engine, lp + "post_feedforward_layernorm.weight");
+
+        Lw.q_proj = bind_clipped(lp + "self_attn.q_proj");
+        Lw.k_proj = bind_clipped(lp + "self_attn.k_proj");
+        Lw.v_proj = bind_clipped(lp + "self_attn.v_proj");
+        Lw.o_proj = bind_clipped(lp + "self_attn.o_proj");
+        Lw.q_norm = &must(engine, lp + "self_attn.q_norm.weight");
+        Lw.k_norm = &must(engine, lp + "self_attn.k_norm.weight");
+
+        Lw.gate_proj = bind_clipped(lp + "mlp.gate_proj");
+        Lw.up_proj   = bind_clipped(lp + "mlp.up_proj");
+        Lw.down_proj = bind_clipped(lp + "mlp.down_proj");
+    }
+
+    return w;
+}
+
+// ── Gemma-4 audio tower bind ────────────────────────────────────────────────
+// Mirrors `bind_gemma4_vision` for `model.audio_tower.` / `model.embed_audio.`.
+// All tensor names verified against scripts/gemma4_audio_parity_ref.py (the
+// `audio.`-prefixed dumps map to `model.audio_tower.` here). Throws on missing.
+Gemma4AudioWeights bind_gemma4_audio(const LoadedModel& engine) {
+    const auto& cfg = engine.hf_config();
+    if (!cfg.gemma_audio.has_value()) {
+        throw std::runtime_error(
+            "gemma4 audio: HfConfig.gemma_audio is empty — config has no "
+            "gemma4_audio audio_config");
+    }
+    const GemmaAudioConfig& ac = *cfg.gemma_audio;
+
+    Gemma4AudioWeights w;
+    w.config.hidden_size              = ac.hidden_size;
+    w.config.num_attention_heads      = ac.num_attention_heads;
+    w.config.num_hidden_layers        = ac.num_hidden_layers;
+    w.config.conv_kernel_size         = ac.conv_kernel_size;
+    w.config.subsampling_conv_channels0 = ac.subsampling_conv_channels0;
+    w.config.subsampling_conv_channels1 = ac.subsampling_conv_channels1;
+    w.config.output_proj_dims         = ac.output_proj_dims;
+    w.config.attention_chunk_size     = ac.attention_chunk_size;
+    w.config.attention_context_left   = ac.attention_context_left;
+    w.config.attention_context_right  = ac.attention_context_right;
+    w.config.feature_size             = ac.feature_size;
+    w.config.attention_logit_cap      = ac.attention_logit_cap;
+    w.config.residual_weight          = ac.residual_weight;
+    w.config.rms_norm_eps             = ac.rms_norm_eps;
+
+    const std::string ap = "model.audio_tower.";
+
+    // SSCP subsampling conv stack.
+    w.sscp_layer0_conv =
+        &must(engine, ap + "subsample_conv_projection.layer0.conv.weight");
+    w.sscp_layer0_norm =
+        &must(engine, ap + "subsample_conv_projection.layer0.norm.weight");
+    w.sscp_layer1_conv =
+        &must(engine, ap + "subsample_conv_projection.layer1.conv.weight");
+    w.sscp_layer1_norm =
+        &must(engine, ap + "subsample_conv_projection.layer1.norm.weight");
+    w.sscp_input_proj =
+        &must(engine, ap + "subsample_conv_projection.input_proj_linear.weight");
+
+    w.output_proj_weight = &must(engine, ap + "output_proj.weight");
+    w.output_proj_bias   = &must(engine, ap + "output_proj.bias");
+    w.embed_audio_projection =
+        &must(engine, "model.embed_audio.embedding_projection.weight");
+
+    // Bind one clipped-linear: required weight + optional per-tensor clip ranges.
+    const auto bind_clipped = [&](const std::string& base) {
+        Gemma4AudioClippedLinear c;
+        c.weight = &must(engine, base + ".linear.weight");
+        const auto opt = [&](const char* suffix) -> const DeviceTensor* {
+            const std::string n = base + suffix;
+            return engine.has(n) ? &engine.get(n) : nullptr;
+        };
+        c.input_min  = opt(".input_min");
+        c.input_max  = opt(".input_max");
+        c.output_min = opt(".output_min");
+        c.output_max = opt(".output_max");
+        return c;
+    };
+    const auto bind_ffn = [&](const std::string& base) {
+        Gemma4AudioFfnWeights f;
+        f.pre_layer_norm  = &must(engine, base + ".pre_layer_norm.weight");
+        f.post_layer_norm = &must(engine, base + ".post_layer_norm.weight");
+        f.ffw_layer_1 = bind_clipped(base + ".ffw_layer_1");
+        f.ffw_layer_2 = bind_clipped(base + ".ffw_layer_2");
+        return f;
+    };
+
+    const int L = ac.num_hidden_layers;
+    w.layers.resize(static_cast<std::size_t>(L));
+    const std::string lp_base = ap + "layers.";
+    for (int i = 0; i < L; ++i) {
+        const std::string lp = lp_base + std::to_string(i) + ".";
+        auto& Lw = w.layers[static_cast<std::size_t>(i)];
+
+        Lw.feed_forward1 = bind_ffn(lp + "feed_forward1");
+        Lw.feed_forward2 = bind_ffn(lp + "feed_forward2");
+
+        Lw.norm_pre_attn  = &must(engine, lp + "norm_pre_attn.weight");
+        Lw.norm_post_attn = &must(engine, lp + "norm_post_attn.weight");
+        Lw.norm_out       = &must(engine, lp + "norm_out.weight");
+
+        Lw.q_proj = bind_clipped(lp + "self_attn.q_proj");
+        Lw.k_proj = bind_clipped(lp + "self_attn.k_proj");
+        Lw.v_proj = bind_clipped(lp + "self_attn.v_proj");
+        Lw.post   = bind_clipped(lp + "self_attn.post");
+        Lw.relative_k_proj = &must(engine, lp + "self_attn.relative_k_proj.weight");
+        Lw.per_dim_scale   = &must(engine, lp + "self_attn.per_dim_scale");
+
+        Lw.lconv_pre_layer_norm = &must(engine, lp + "lconv1d.pre_layer_norm.weight");
+        Lw.lconv_conv_norm      = &must(engine, lp + "lconv1d.conv_norm.weight");
+        Lw.lconv_linear_start = bind_clipped(lp + "lconv1d.linear_start");
+        Lw.lconv_linear_end   = bind_clipped(lp + "lconv1d.linear_end");
+        Lw.lconv_depthwise_conv =
+            &must(engine, lp + "lconv1d.depthwise_conv1d.weight");
+    }
+
+    return w;
+}
+
 namespace {
 
 // Parity-dump helper: write a bf16 tensor of `numel` elements to
@@ -1300,7 +1476,9 @@ void gemma4_forward_paged(
     const std::uint8_t* custom_mask_d,
     const std::int32_t* /*custom_mask_indptr_d*/,
     const std::int32_t* logit_row_indices_d,
-    int num_logit_rows)
+    int num_logit_rows,
+    const Gemma4VisionInputs* vision_in,
+    const Gemma4AudioInputs* audio_in)
 {
     const int H        = cfg.hidden_size;
     const int L        = cfg.num_hidden_layers;
@@ -1360,6 +1538,21 @@ void gemma4_forward_paged(
     });
     dbg_sync_dump_bf16("embed_post_scale", ws.y.data(),
                   static_cast<std::size_t>(N) * H);
+
+    // ── 1b. Multimodal: encode images and overwrite their soft-token rows ──
+    // HF `masked_scatter`s image features into inputs_embeds AFTER the
+    // embed-scale, so the projected rows replace the (scaled) placeholder
+    // embeddings unscaled. No-op for text-only passes.
+    if (vision_in != nullptr && vision_in->num_images > 0) {
+        scatter_gemma4_vision(*vision_in, static_cast<__nv_bfloat16*>(ws.y.data()),
+                              N, H, stream);
+    }
+    // Audio is the direct analog of vision: encode each clip's log-mel features
+    // and overwrite its soft-token rows. No M-RoPE / DeepStack — just scatter.
+    if (audio_in != nullptr && audio_in->num_clips > 0) {
+        scatter_gemma4_audio(*audio_in, static_cast<__nv_bfloat16*>(ws.y.data()),
+                             N, H, stream);
+    }
 
     // ── 2. Per-layer inputs (PLE) ────────────────────────────────────────
     // Compute once per fire; sliced per layer below. Skipped entirely

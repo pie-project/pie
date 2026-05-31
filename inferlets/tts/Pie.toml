@@ -1,0 +1,14 @@
+[package]
+name = "tts"
+version = "0.1.0"
+description = "Text-to-speech (native audio OUTPUT) — CSM-1B + Mimi: text -> generated speech waveform (WAV)"
+authors = ["Pie Team"]
+
+[runtime]
+core = "^0.2.0"
+mcp = "^0.2.0"
+
+[parameters]
+text = {type = "string", optional = true, description = "Text to speak"}
+speaker = {type = "int", optional = true, description = "CSM speaker id (default: 0)"}
+max_frames = {type = "int", optional = true, description = "Max Mimi frames to generate (default: 256; 12.5 Hz => ~20 s)"}

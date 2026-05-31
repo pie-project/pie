@@ -1696,6 +1696,22 @@ struct ForwardDispatchInputs {
     const std::uint32_t* h_kvlpl_forward = nullptr;
     const std::int32_t*  slot_ids_h_data = nullptr;
     const std::uint8_t*  is_fresh_h_data = nullptr;
+    // Multimodal (gemma4 vision): image side-channel, set from the view.
+    const float*         image_pixels_h = nullptr;
+    const std::uint32_t* image_pixel_byte_indptr_h = nullptr;
+    const std::uint32_t* image_patch_positions_h = nullptr;
+    const std::uint32_t* image_anchor_rows_h = nullptr;
+    int                  num_images = 0;
+    // Qwen3-VL: per-image (t,h,w) grids and the assembled per-token M-RoPE
+    // 3-axis positions for the whole batch.
+    const std::uint32_t* image_grids_h = nullptr;
+    const std::uint32_t* mrope_positions_h = nullptr;
+    int                  num_mrope_positions = 0;
+    // Multimodal (gemma4 audio): log-mel side-channel, set from the view.
+    const float*         audio_features_h = nullptr;
+    const std::uint32_t* audio_feature_byte_indptr_h = nullptr;
+    const std::uint32_t* audio_anchor_rows_h = nullptr;
+    int                  num_clips = 0;
 };
 
 struct ForwardDispatchResult {
@@ -1976,7 +1992,9 @@ SamplePlanResult build_sample_plan(
         out.all_rows_greedy &&
         out.sample_rows_are_dense;
     out.logit_rows_required =
-        out.compact_logit_rows ? num_sampling : N;
+        num_sampling == 0 ? 0
+        : out.compact_logit_rows ? num_sampling
+        : N;
     out.prob_rows_required = out.any_topk_topp ? N : 0;
     return out;
 }
@@ -2069,7 +2087,23 @@ ForwardDispatchResult run_forward_dispatch(
         fwd_in.slot_ids_d          = in.use_slots ? pi.slot_ids.data() : nullptr;
         fwd_in.logit_row_indices_d = in.compact_logit_rows ? pi.sample_idx.data() : nullptr;
         fwd_in.num_logit_rows      = in.compact_logit_rows ? in.num_sampling : 0;
+        fwd_in.emit_logits         = in.num_sampling > 0;
         fwd_in.tp_greedy_argmax    = in.tp_greedy_argmax;
+        // Multimodal: image data for the encode+scatter (no-op if none). Only
+        // the non-graph path carries it — image fires are prefills.
+        fwd_in.image_pixels_h            = in.image_pixels_h;
+        fwd_in.image_pixel_byte_indptr_h = in.image_pixel_byte_indptr_h;
+        fwd_in.image_patch_positions_h   = in.image_patch_positions_h;
+        fwd_in.image_anchor_rows_h       = in.image_anchor_rows_h;
+        fwd_in.num_images                = in.num_images;
+        fwd_in.image_grids_h             = in.image_grids_h;
+        fwd_in.mrope_positions_h         = in.mrope_positions_h;
+        fwd_in.num_mrope_positions       = in.num_mrope_positions;
+        // Multimodal: audio data for the encode+scatter (no-op if none).
+        fwd_in.audio_features_h             = in.audio_features_h;
+        fwd_in.audio_feature_byte_indptr_h  = in.audio_feature_byte_indptr_h;
+        fwd_in.audio_anchor_rows_h          = in.audio_anchor_rows_h;
+        fwd_in.num_clips                    = in.num_clips;
         forward_fn.invoke_body(ws, kv_cache, attn_ws, cublas, fwd_in);
     }
     return out;
@@ -2124,6 +2158,32 @@ void handle_fire_batch(
     bool have_custom_mask = false;
     int mask_bytes = 0;
     int mask_indptr_count = 0;
+
+    // Multimodal (gemma4 vision): image side-channel from the view. Declared
+    // before the try so it's in scope at the forward dispatch (which is after
+    // the try/catch). `image_pixels` is f32 pixel_values stored as bytes.
+    const float* img_pixels_h =
+        reinterpret_cast<const float*>(view.image_pixels.data());
+    const auto img_pix_byte_indptr = view.image_pixel_indptr.as<std::uint32_t>();
+    const auto img_patch_pos       = view.image_patch_positions.as<std::uint32_t>();
+    const auto img_anchor          = view.image_anchor_rows.as<std::uint32_t>();
+    const int img_num_images       = static_cast<int>(img_anchor.size());
+    // Qwen3-VL M-RoPE: per-image (t,h,w) grids + per-image-token 3-axis
+    // positions. Assembled into a full `[N, 3]` per-token array below.
+    const auto img_grids           = view.image_grids.as<std::uint32_t>();
+    const auto img_mrope_pos       = view.image_mrope_positions.as<std::uint32_t>();
+    const auto img_mrope_indptr    = view.image_mrope_indptr.as<std::uint32_t>();
+    // Storage for the assembled per-token [N,3] M-RoPE positions (filled
+    // only when this fire carries Qwen3-VL mrope image data).
+    std::vector<std::uint32_t> mrope_positions_storage;
+
+    // Multimodal (gemma4 audio): log-mel side-channel from the view.
+    // `audio_features` is f32 log-mel stored as bytes.
+    const float* aud_features_h =
+        reinterpret_cast<const float*>(view.audio_features.data());
+    const auto aud_feat_byte_indptr = view.audio_feature_indptr.as<std::uint32_t>();
+    const auto aud_anchor           = view.audio_anchor_rows.as<std::uint32_t>();
+    const int aud_num_clips         = static_cast<int>(aud_anchor.size());
 
     try {
         const auto tok_view_orig   = view.token_ids.as<std::uint32_t>();
@@ -2200,6 +2260,39 @@ void handle_fire_batch(
 
         const int N = static_cast<int>(tok_view.size());
         const int num_sampling = static_cast<int>(sidx_view.size());
+
+        // Qwen3-VL: assemble the per-token [N,3] M-RoPE positions. Text rows
+        // carry (p,p,p) from the 1-D `pos_view`; image-token rows are
+        // overwritten with the staged 3-axis (t,h,w) positions for each image
+        // (image i's rows start at batch row `img_anchor[i]`). Built only when
+        // image mrope data is present (image prefills never carry spec drafts).
+        if (img_num_images > 0 && !img_mrope_pos.empty() && !spec.has_drafts) {
+            mrope_positions_storage.resize(static_cast<std::size_t>(N) * 3);
+            for (int t = 0; t < N; ++t) {
+                const std::uint32_t p =
+                    t < static_cast<int>(pos_view.size()) ? pos_view[t] : 0u;
+                mrope_positions_storage[3 * t + 0] = p;
+                mrope_positions_storage[3 * t + 1] = p;
+                mrope_positions_storage[3 * t + 2] = p;
+            }
+            for (int im = 0; im < img_num_images; ++im) {
+                const std::uint32_t anchor_row = img_anchor[im];
+                const std::uint32_t lo =
+                    im < static_cast<int>(img_mrope_indptr.size()) - 1
+                        ? img_mrope_indptr[im] : 0u;
+                const std::uint32_t hi =
+                    im + 1 < static_cast<int>(img_mrope_indptr.size())
+                        ? img_mrope_indptr[im + 1] : 0u;
+                const std::uint32_t n_tok = (hi - lo) / 3u;
+                for (std::uint32_t j = 0; j < n_tok; ++j) {
+                    const int row = static_cast<int>(anchor_row + j);
+                    if (row < 0 || row >= N) continue;
+                    mrope_positions_storage[3 * row + 0] = img_mrope_pos[lo + 3 * j + 0];
+                    mrope_positions_storage[3 * row + 1] = img_mrope_pos[lo + 3 * j + 1];
+                    mrope_positions_storage[3 * row + 2] = img_mrope_pos[lo + 3 * j + 2];
+                }
+            }
+        }
 
         if (N == 0 || R <= 0) {
             // Empty batch — emit a zero-request response view.
@@ -2541,6 +2634,20 @@ void handle_fire_batch(
                 .h_kvlpl_forward = h_kvlpl_forward,
                 .slot_ids_h_data = slot_ids_h.data(),
                 .is_fresh_h_data = is_fresh_h.data(),
+                .image_pixels_h = img_pixels_h,
+                .image_pixel_byte_indptr_h = img_pix_byte_indptr.data(),
+                .image_patch_positions_h = img_patch_pos.data(),
+                .image_anchor_rows_h = img_anchor.data(),
+                .num_images = img_num_images,
+                .image_grids_h = img_grids.data(),
+                .mrope_positions_h = mrope_positions_storage.empty()
+                    ? nullptr : mrope_positions_storage.data(),
+                .num_mrope_positions = static_cast<int>(
+                    mrope_positions_storage.size() / 3),
+                .audio_features_h = aud_features_h,
+                .audio_feature_byte_indptr_h = aud_feat_byte_indptr.data(),
+                .audio_anchor_rows_h = aud_anchor.data(),
+                .num_clips = aud_num_clips,
             });
         const bool graph_captures_single_gpu_argmax =
             fd.graph_captures_single_gpu_argmax;
@@ -2549,7 +2656,13 @@ void handle_fire_batch(
         // (for example top-p token-only decode vs. argmax + rich probes).
         // Running the current fire's sampling kernel after the graph launch
         // keeps that R-only key valid.
-        if (tp_greedy_argmax) {
+        // A fire that samples nothing (e.g. a multimodal image-token KV-fill
+        // pass) produces no logits and no sampled tokens — skip every argmax /
+        // sampling launch (they would read the unwritten, undersized
+        // `ws.logits` over all N rows and fault).
+        if (num_sampling == 0) {
+            // nothing to sample
+        } else if (tp_greedy_argmax) {
             kernels::launch_select_global_argmax_pairs(
                 reinterpret_cast<const std::uint64_t*>(ws.greedy_pairs_all.data()),
                 reinterpret_cast<std::int32_t*>(pi.sampled.data()),

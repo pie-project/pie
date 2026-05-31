@@ -59,12 +59,14 @@
 #include "model/kimi_model.hpp"
 #include "model/gemma2_model.hpp"
 #include "model/gemma3n_model.hpp"
+#include "model/csm_model.hpp"
 #include "model/gemma4.hpp"
 #include "model/gemma4_model.hpp"
 #include "model/gemma4_mtp.hpp"
 #include "model/gpt_oss.hpp"
 #include "model/llama_like.hpp"
 #include "model/llama_like_model.hpp"
+#include "model/qwen3_vl_model.hpp"
 #include "model/mixtral.hpp"
 #include "model/mixtral_model.hpp"
 #include "model/nemotron_h.hpp"
@@ -293,6 +295,7 @@ int run_impl(int argc,
          || mt == "qwen3_5" || mt == "qwen3_5_text"
          || mt == "qwen3_5_moe" || mt == "qwen3_5_moe_text"
          || mt == "qwen3_moe"
+         || mt == "qwen3_vl" || mt == "qwen3_vl_text"
          || mt == "qwen2"
          || mt == "llama" || mt == "llama3"
          || mt == "mistral" || mt == "mistral3" || mt == "ministral3"
@@ -316,7 +319,11 @@ int run_impl(int argc,
          || mt == "deepseek_v4"
          || mt == "deepseek_v2" || mt == "deepseek_v3"
          || mt == "kimi_k2"
-         || mt == "glm_moe_dsa";
+         || mt == "glm_moe_dsa"
+         // CSM native audio output (pie:core/audio-out). The backbone is a
+         // stock Llama-3.2-1B; CSM is driven through generate_audio, not the
+         // per-step text forward. See AUDIO_OUTPUT.md.
+         || mt == "csm";
         if (!supported) {
             std::cerr << "[pie-driver-cuda] arch '" << mt
                       << "' not yet supported (Qwen 2/3, Llama-3, "
@@ -349,6 +356,7 @@ int run_impl(int argc,
     const bool is_dsv4_arch = bound_model.is_deepseek_v4();
     const bool is_kimi_arch = bound_model.is_kimi();
     const bool is_glm5_arch = bound_model.is_glm5();
+    const bool is_qwen3_vl_arch = bound_model.is_qwen3_vl();
     const int native_mtp_num_drafts = configured_mtp_num_drafts(cfg);
 
     const std::size_t num_layers_bound = bound_model.num_layers();
@@ -883,6 +891,18 @@ int run_impl(int argc,
             fwd_cfg.use_qk_norm = true;
         }
         pie_cuda_driver::model::apply_rope_config(fwd_cfg, hf);
+        // Qwen3-VL: interleaved 3-axis M-RoPE in the text tower. The section
+        // split partitions head_dim/2 over (t,h,w); the per-fire 3-axis
+        // positions are supplied by Qwen3VLModel::body. Text rows (t==h==w)
+        // collapse to ordinary RoPE.
+        if (is_qwen3_vl_arch && hf.qwen3_vl_mrope_interleaved &&
+            hf.qwen3_vl_mrope_section.size() == 3) {
+            fwd_cfg.rope_kind =
+                pie_cuda_driver::model::RopeKind::MRopeInterleaved;
+            fwd_cfg.mrope_section_t = hf.qwen3_vl_mrope_section[0];
+            fwd_cfg.mrope_section_h = hf.qwen3_vl_mrope_section[1];
+            fwd_cfg.mrope_section_w = hf.qwen3_vl_mrope_section[2];
+        }
         fwd_cfg.sliding_window            = hf.sliding_window;
         // FlashInfer's decode dispatch set covers {1, 2, 3, 4, 8}. Other
         // GQA ratios use the prefill path for decode-only batches as well.
@@ -1057,6 +1077,8 @@ int run_impl(int argc,
     std::unique_ptr<pie_cuda_driver::model::DsV4Model> dsv4_model;
     std::unique_ptr<pie_cuda_driver::model::KimiModel> kimi_model;
     std::unique_ptr<pie_cuda_driver::model::Glm5Model> glm5_model;
+    std::unique_ptr<pie_cuda_driver::model::Qwen3VLModel> qwen3_vl_model;
+    std::unique_ptr<pie_cuda_driver::model::CsmModel> csm_model;
     // New-arch forward workspaces. Allocated only for the matching arch;
     // a default (empty) workspace otherwise. Live at function scope so
     // the IModel objects holding references outlive the dispatch below.
@@ -1104,11 +1126,27 @@ int run_impl(int argc,
             hf_cfg.num_hidden_layers *
                 hf_cfg.gemma_hidden_size_per_layer_input);
     }
-    if (is_gemma4_arch) {
+    const bool is_csm_arch = bound_model.is_csm();
+    if (is_csm_arch) {
+        // CSM is driven exclusively through generate_audio (pie:core/audio-out);
+        // it has no per-step text forward. Attach the model so the IModel slot
+        // is non-null; the GenerateAudio method routes directly to it.
+        csm_model = std::make_unique<pie_cuda_driver::model::CsmModel>(
+            std::move(bound_model.csm));
+        forward_fn.attach_model(csm_model.get());
+    } else if (is_qwen3_vl_arch) {
+        qwen3_vl_model = std::make_unique<pie_cuda_driver::model::Qwen3VLModel>(
+            weights_llama, engine.hf_config(), kv_cache,
+            fwd_cfg, max_workspace_tokens,
+            bound_model.has_vision ? &bound_model.qwen3_vl_vision : nullptr);
+        forward_fn.attach_model(qwen3_vl_model.get());
+    } else if (is_gemma4_arch) {
         gemma4_model = std::make_unique<pie_cuda_driver::model::Gemma4Model>(
             weights_gemma4, engine.hf_config(),
             gemma4_moe_ws, kv_cache,
-            gemma4_fwd_cfg, pie_cuda_driver::model::qwen35_small_spec_graph_tokens());
+            gemma4_fwd_cfg, pie_cuda_driver::model::qwen35_small_spec_graph_tokens(),
+            bound_model.has_vision ? &bound_model.gemma4_vision : nullptr,
+            bound_model.has_audio ? &bound_model.gemma4_audio : nullptr);
         forward_fn.attach_model(gemma4_model.get());
     } else if (is_gemma3n_arch) {
         pie_cuda_driver::model::Gemma3nForwardCfg gemma3n_fwd_cfg{};
@@ -1370,7 +1408,7 @@ int run_impl(int argc,
             std::cerr << "[pie-driver-cuda] serving on in-process channel\n";
         }
         pie_cuda_driver::service::InProcService service{
-            executor, kv_cache, swap_pool};
+            executor, kv_cache, swap_pool, csm_model.get()};
         service.serve_forever(*server_p);
         handled = service.handled();
         // Leader exited serve loop — wake followers so they can tear

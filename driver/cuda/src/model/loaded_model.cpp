@@ -558,10 +558,11 @@ LoadedModelCapabilities LoadedModel::capabilities() const {
     // `HF_TO_PIE_ARCH` table; we mirror that table here so the
     // runtime gets the same key from both backends.
     auto normalise_arch = [](const std::string& mt) -> std::string {
-        if (mt == "llama")        return "llama3";
-        if (mt == "gemma3_text")  return "gemma3";
-        if (mt == "gemma4_text")  return "gemma4";
-        if (mt == "ministral3")   return "mistral3";
+        if (mt == "llama")          return "llama3";
+        if (mt == "gemma3_text")    return "gemma3";
+        if (mt == "gemma4_text")    return "gemma4";
+        if (mt == "ministral3")     return "mistral3";
+        if (mt == "qwen3_vl_text")  return "qwen3_vl";
         return mt;  // qwen2 / qwen3 / gemma2 / olmo3 / phi3 / mistral3 / mixtral
     };
     c.arch_name = hf_.model_type.empty()

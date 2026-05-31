@@ -271,6 +271,15 @@ fn empty_forward_request() -> pie_bridge::ForwardRequest {
             seed: -1,
         }],
         output_spec_flags: vec![false],
+        // Image side-channel CSR roots: the per-image pixel/mrope indptrs and
+        // the per-request image_indptr all begin with a leading 0 so the
+        // batch-merge in `inference::request` can offset and append cleanly.
+        image_indptr: vec![0],
+        image_pixel_indptr: vec![0],
+        image_mrope_indptr: vec![0],
+        // Audio side-channel CSR roots (leading 0, like the image roots).
+        audio_feature_indptr: vec![0],
+        audio_indptr: vec![0],
         ..Default::default()
     }
 }
@@ -556,6 +565,105 @@ impl pie::core::inference::HostForwardPass for InstanceState {
         let pass = self.ctx().table.get_mut(&this)?;
         pass.req.token_ids.extend(tokens);
         pass.req.position_ids.extend(positions);
+        Ok(())
+    }
+
+    /// Splice an encoded visual span into the pending request. Appends
+    /// `token_count` placeholder rows to `token_ids`/`position_ids` (so the
+    /// forward has KV slots for the soft tokens; the driver overwrites their
+    /// embeddings with the vision-encoder output) and stages the pixel tensor +
+    /// per-patch positions + the batch row offset on the image side-channel.
+    /// See MULTIMODAL.md §2.5.
+    async fn input_image(
+        &mut self,
+        this: Resource<ForwardPass>,
+        image: Resource<crate::api::media::Image>,
+        anchor: u32,
+    ) -> Result<()> {
+        let (token_count, grid, patch_grid, uses_mrope, pixels, positions) = {
+            let img = self.ctx().table.get(&image)?;
+            (
+                img.span.token_count,
+                img.span.grid,    // merged LLM grid (for M-RoPE positions)
+                img.patch_grid,   // pre-merge patch grid (for the driver encoder)
+                img.uses_mrope,
+                img.pixels.clone(),
+                img.positions.clone(),
+            )
+        };
+
+        let pass = self.ctx().table.get_mut(&this)?;
+        let req = &mut pass.req;
+
+        // Row offset (within this request) where the soft-token rows begin.
+        let anchor_row = req.token_ids.len() as u32;
+        req.image_anchor_rows.push(anchor_row);
+
+        // Placeholder rows: valid token id 0 (overwritten by the encoder
+        // scatter), positions sequential from `anchor` (Gemma 1-D RoPE).
+        for i in 0..token_count {
+            req.token_ids.push(0);
+            req.position_ids.push(anchor + i);
+        }
+
+        // Pixel tensor (f32 → little-endian bytes) + per-patch positions.
+        req.image_pixels
+            .extend_from_slice(bytemuck::cast_slice(&pixels));
+        req.image_pixel_indptr.push(req.image_pixels.len() as u32);
+        req.image_patch_positions.extend_from_slice(&positions);
+
+        // Wire `image_grids` carries the PRE-MERGE patch grid: the driver's
+        // vision encoder needs patch units (t*h*w == n_patch). The merged grid
+        // is used below only for the M-RoPE position side-channel.
+        req.image_grids
+            .extend_from_slice(&[patch_grid.t, patch_grid.h, patch_grid.w]);
+        req.image_anchor_positions.push(anchor);
+        if uses_mrope {
+            for p in crate::multimodal::qwen_mrope_positions(grid, anchor) {
+                req.image_mrope_positions.extend_from_slice(&p);
+            }
+        }
+        req.image_mrope_indptr
+            .push(req.image_mrope_positions.len() as u32);
+
+        Ok(())
+    }
+
+    /// Splice an encoded audio clip into the pending request. Direct analog of
+    /// `input_image`: appends `token_count` placeholder rows (KV slots for the
+    /// audio soft tokens; the driver overwrites their embeddings with the
+    /// audio-encoder output) and stages the log-mel features + the batch row
+    /// offset on the audio side-channel. See audio_frontend.md.
+    async fn input_audio(
+        &mut self,
+        this: Resource<ForwardPass>,
+        audio: Resource<crate::api::media::Audio>,
+        anchor: u32,
+    ) -> Result<()> {
+        let (token_count, mel) = {
+            let a = self.ctx().table.get(&audio)?;
+            (a.token_count, a.mel.clone())
+        };
+
+        let pass = self.ctx().table.get_mut(&this)?;
+        let req = &mut pass.req;
+
+        // Row offset (within this request) where the soft-token rows begin.
+        let anchor_row = req.token_ids.len() as u32;
+        req.audio_anchor_rows.push(anchor_row);
+
+        // Placeholder rows: valid token id 0 (overwritten by the encoder
+        // scatter), positions sequential from `anchor` (Gemma 1-D RoPE).
+        for i in 0..token_count {
+            req.token_ids.push(0);
+            req.position_ids.push(anchor + i);
+        }
+
+        // Log-mel features (f32 → little-endian bytes).
+        req.audio_features
+            .extend_from_slice(bytemuck::cast_slice(&mel));
+        req.audio_feature_indptr.push(req.audio_features.len() as u32);
+
         Ok(())
     }
 

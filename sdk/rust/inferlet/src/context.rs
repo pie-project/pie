@@ -445,6 +445,143 @@ impl Context {
         Ok(())
     }
 
+    /// Splice an encoded image (or video clip) into the context. Runs the
+    /// vision encoder driver-side and commits the resulting soft-token KV pages,
+    /// exactly like [`flush`] does for text. The image's `token_count()` soft
+    /// tokens occupy KV slots; the sequence cursor advances by
+    /// `position_span()` (equal for Gemma's 1-D positions). See MULTIMODAL.md.
+    ///
+    /// Any buffered text is flushed first so ordering (text → image → text) is
+    /// preserved in the KV cache.
+    pub async fn append_image(&mut self, image: &crate::media::Image) -> Result<()> {
+        self.flush().await?; // commit any pending text before the image span
+
+        let num_tokens = image.token_count();
+        if num_tokens == 0 {
+            return Ok(());
+        }
+        let span = image.position_span();
+
+        let total_tokens_after = self.working_tokens + num_tokens;
+        let pages_needed = (total_tokens_after + self.page_size - 1) / self.page_size;
+        let additional = pages_needed.saturating_sub(self.working_pages);
+        if additional > 0 {
+            self.inner
+                .reserve_working_pages(additional)
+                .map_err(|e| format!("append_image: reserve pages: {}", e))?;
+            self.working_pages = pages_needed;
+        }
+
+        let pass = ForwardPass::new(&self.model);
+        pass.context(&self.inner);
+        pass.input_image(image, self.seq_len);
+        pass.execute_async()
+            .await
+            .map_err(|e| format!("append_image: forward pass: {}", e))?;
+
+        let new_working = self.working_tokens + num_tokens;
+        let pages_to_commit = new_working / self.page_size;
+        if pages_to_commit > 0 {
+            self.inner
+                .commit_working_pages(pages_to_commit)
+                .map_err(|e| format!("append_image: commit pages: {}", e))?;
+        }
+        self.committed_pages += pages_to_commit;
+        self.working_pages -= pages_to_commit;
+        self.working_tokens = new_working % self.page_size;
+        // The image occupies `num_tokens` physical KV rows whose 1-D
+        // bookkeeping positions are `anchor..anchor+num_tokens`. Advance the
+        // sequence cursor past them so the next text token's position is
+        // strictly greater than every committed image-row position (the KV
+        // commit enforces strict monotonicity). M-RoPE attention positions for
+        // the image rows themselves are carried on the dedicated 3-axis
+        // side-channel (`image_mrope_positions`), so the encoder/attention use
+        // the correct (t,h,w) span regardless of this 1-D advance.
+        let _ = span;
+        self.seq_len += num_tokens;
+
+        Ok(())
+    }
+
+    /// Splice an encoded audio clip into the context. Runs the gemma4_audio
+    /// encoder driver-side and commits the resulting soft-token KV pages,
+    /// exactly like [`append_image`](Self::append_image) does for vision. The
+    /// clip's `token_count()` soft tokens occupy KV slots; the sequence cursor
+    /// advances past them. See audio_frontend.md.
+    ///
+    /// Any buffered text is flushed first so ordering (text → audio → text) is
+    /// preserved in the KV cache.
+    pub async fn append_audio(&mut self, audio: &crate::media::Audio) -> Result<()> {
+        self.flush().await?; // commit any pending text before the audio span
+
+        let num_tokens = audio.token_count();
+        if num_tokens == 0 {
+            return Ok(());
+        }
+
+        let total_tokens_after = self.working_tokens + num_tokens;
+        let pages_needed = (total_tokens_after + self.page_size - 1) / self.page_size;
+        let additional = pages_needed.saturating_sub(self.working_pages);
+        if additional > 0 {
+            self.inner
+                .reserve_working_pages(additional)
+                .map_err(|e| format!("append_audio: reserve pages: {}", e))?;
+            self.working_pages = pages_needed;
+        }
+
+        let pass = ForwardPass::new(&self.model);
+        pass.context(&self.inner);
+        pass.input_audio(audio, self.seq_len);
+        pass.execute_async()
+            .await
+            .map_err(|e| format!("append_audio: forward pass: {}", e))?;
+
+        let new_working = self.working_tokens + num_tokens;
+        let pages_to_commit = new_working / self.page_size;
+        if pages_to_commit > 0 {
+            self.inner
+                .commit_working_pages(pages_to_commit)
+                .map_err(|e| format!("append_audio: commit pages: {}", e))?;
+        }
+        self.committed_pages += pages_to_commit;
+        self.working_pages -= pages_to_commit;
+        self.working_tokens = new_working % self.page_size;
+        self.seq_len += num_tokens;
+
+        Ok(())
+    }
+
+    /// Splice a sampled video clip into the context.
+    ///
+    /// Gemma 4 (Gemma 3n) treats video as a sequence of **independently
+    /// encoded still frames** through the same vision tower as a single image —
+    /// there is no temporal patching (that is a Qwen-VL feature). So this simply
+    /// injects each frame's soft tokens via [`append_image`], each preceded by a
+    /// short `mm:ss` timestamp text marker (ordinary tokens, mirroring the HF
+    /// Gemma 4 video format `"{MM:SS} <frame>"`). The frames must already be
+    /// patchified at the video soft-token budget (≤ 70 each — see
+    /// [`crate::vision::gemma_resize_target_video`]) to keep the clip's KV
+    /// footprint manageable.
+    ///
+    /// `timestamps` are in seconds and parallel to `frames`; a missing entry
+    /// falls back to the frame index. Each frame becomes committed KV exactly
+    /// like an image, so fork / snapshot / prefix-cache apply — encode once,
+    /// fork per question. See MULTIMODAL.md §8.
+    pub async fn append_video(
+        &mut self,
+        frames: &[crate::media::Image],
+        timestamps: &[f32],
+    ) -> Result<()> {
+        for (i, frame) in frames.iter().enumerate() {
+            let secs = timestamps.get(i).copied().unwrap_or(i as f32).max(0.0) as u32;
+            let marker = format!(" {:02}:{:02} ", secs / 60, secs % 60);
+            let toks = self.model.tokenizer().encode(&marker);
+            self.append(&toks);
+            self.append_image(frame).await?;
+        }
+        Ok(())
+    }
+
     // ── Pass ────────────────────────────────────────────────────────
 
     /// Build a single [`Forward`](crate::forward::Forward) — a forward pass with

@@ -6,6 +6,7 @@ interface inference {
     use model.{model, tokenizer};
     use adapter.{adapter};
     use context.{page-id};
+    use media.{image, audio};
 
     // binary run-length encoding
     type brle = list<u32>;
@@ -20,6 +21,24 @@ interface inference {
         input-tokens: func(
             tokens: list<u32>,
             positions: list<u32>,
+        );
+
+        // Splice an encoded visual span (image or video clip) at sequence
+        // position `anchor`. The driver runs the vision encoder and scatters
+        // the projected rows into the hidden state for this span. See
+        // MULTIMODAL.md.
+        input-image: func(
+            image: borrow<image>,
+            anchor: u32,
+        );
+
+        // Splice an encoded audio clip at sequence position `anchor`. The
+        // driver runs the gemma4_audio encoder and scatters the projected
+        // soft-token rows into the hidden state for this clip. Direct analog
+        // of input-image. See audio_frontend.md.
+        input-audio: func(
+            audio: borrow<audio>,
+            anchor: u32,
         );
 
         input-speculative-tokens: func(

@@ -100,6 +100,11 @@ constexpr std::uint32_t PIE_METHOD_RS_COPY_D2H          = 10;
 constexpr std::uint32_t PIE_METHOD_RS_COPY_H2D          = 11;
 constexpr std::uint32_t PIE_METHOD_RS_COPY_D2D          = 12;
 constexpr std::uint32_t PIE_METHOD_RS_COPY_H2H          = 13;
+// CSM native audio output (AdapterOp::GenerateAudio == 4). Dedicated tag (not
+// PIE_METHOD_LOAD_ADAPTER + 4, which would alias PIE_METHOD_HEALTH). The
+// request's `adapter_path` carries the JSON audio-gen request. See
+// AUDIO_OUTPUT.md / inproc_service.cpp.
+constexpr std::uint32_t PIE_METHOD_GENERATE_AUDIO       = 14;
 
 // Driver-side sampler IDs (DISTRIBUTION=0, MULTINOMIAL=1, …, ENTROPY=10).
 // The wire schema orders variants differently (`Sampler::Multinomial`
@@ -168,9 +173,43 @@ struct PieForwardRequestView {
 
     PieSlice<std::uint64_t> context_ids;
 
+    // Multimodal visual spans (vision/video). Pure side-channel; empty for
+    // text-only passes. See MULTIMODAL.md. `image_indptr` is per-request CSR
+    // (images per request); `image_pixel_indptr` / `image_mrope_indptr` are
+    // per-image CSRs. NOTE: `image_pixels` currently holds the staged *encoded*
+    // image bytes (host preprocessor lands in a later phase).
+    PieSlice<std::uint32_t> image_indptr;
+    PieSlice<std::uint32_t> image_grids;             // (t,h,w) per image
+    PieSlice<std::uint32_t> image_anchor_positions;  // 1 per image
+    PieSlice<std::uint8_t>  image_pixels;
+    PieSlice<std::uint32_t> image_pixel_indptr;
+    PieSlice<std::uint32_t> image_mrope_positions;   // 3 per image token
+    PieSlice<std::uint32_t> image_mrope_indptr;
+    // Option-B pixel path: image_pixels holds f32 pixel_values as bytes.
+    PieSlice<std::uint32_t> image_patch_positions;   // 2 per patch (x,y)
+    PieSlice<std::uint32_t> image_anchor_rows;       // batch row offset per image
+
+    // Multimodal audio spans (gemma4_audio). Direct analog of the image
+    // block; empty for non-audio passes. `audio_features` holds per-clip
+    // log-mel f32 as bytes (range = `audio_feature_indptr`).
+    PieSlice<std::uint8_t>  audio_features;
+    PieSlice<std::uint32_t> audio_feature_indptr;    // [num_clips + 1] byte offsets
+    PieSlice<std::uint32_t> audio_anchor_rows;       // batch row offset per clip
+    PieSlice<std::uint32_t> audio_indptr;            // per-request CSR
+
     std::uint32_t driver_id;
     std::uint8_t  single_token_mode;
     std::uint8_t  has_user_mask;
+
+    // Number of visual spans across this (batched) request.
+    constexpr std::size_t num_images() const noexcept {
+        return image_grids.size() / 3;
+    }
+
+    // Number of audio clips across this (batched) request.
+    constexpr std::size_t num_clips() const noexcept {
+        return audio_anchor_rows.size();
+    }
 
     constexpr std::size_t size() const noexcept { return token_ids.size(); }
     constexpr bool empty() const noexcept { return token_ids.empty(); }
@@ -383,6 +422,23 @@ inline void fill_forward_view(const PieForwardRequestDesc& f,
     out.output_spec_flags = slice_from(f.output_spec_flags_ptr, f.output_spec_flags_len);
     out.context_ids       = slice_from(f.context_ids_ptr, f.context_ids_len);
 
+    // Multimodal visual spans — pass-through slices into the archive buffer.
+    out.image_indptr           = slice_from(f.image_indptr_ptr, f.image_indptr_len);
+    out.image_grids            = slice_from(f.image_grids_ptr, f.image_grids_len);
+    out.image_anchor_positions = slice_from(f.image_anchor_positions_ptr, f.image_anchor_positions_len);
+    out.image_pixels           = slice_from(f.image_pixels_ptr, f.image_pixels_len);
+    out.image_pixel_indptr     = slice_from(f.image_pixel_indptr_ptr, f.image_pixel_indptr_len);
+    out.image_mrope_positions  = slice_from(f.image_mrope_positions_ptr, f.image_mrope_positions_len);
+    out.image_mrope_indptr     = slice_from(f.image_mrope_indptr_ptr, f.image_mrope_indptr_len);
+    out.image_patch_positions  = slice_from(f.image_patch_positions_ptr, f.image_patch_positions_len);
+    out.image_anchor_rows      = slice_from(f.image_anchor_rows_ptr, f.image_anchor_rows_len);
+
+    // Multimodal audio spans — pass-through slices into the archive buffer.
+    out.audio_features         = slice_from(f.audio_features_ptr, f.audio_features_len);
+    out.audio_feature_indptr   = slice_from(f.audio_feature_indptr_ptr, f.audio_feature_indptr_len);
+    out.audio_anchor_rows      = slice_from(f.audio_anchor_rows_ptr, f.audio_anchor_rows_len);
+    out.audio_indptr           = slice_from(f.audio_indptr_ptr, f.audio_indptr_len);
+
     // Demultiplex AoS samplers into SoA arenas. The driver handler reads
     // one entry per sampler from each per-attribute array. For sampler
     // variants that don't carry a given attribute (e.g. TopK has no p),
@@ -512,8 +568,13 @@ inline void build_request_view(const PieFrameDesc& frame,
         case PIE_REQUEST_PAYLOAD_ADAPTER: {
             const PieAdapterRequestDesc& a = frame.payload.adapter;
             // AdapterOp: Load=0 / Save=1 / ZoInit=2 / ZoUpdate=3 →
-            // driver methods 5, 6, 7, 8.
-            out.method = PIE_METHOD_LOAD_ADAPTER + a.op;
+            // driver methods 5, 6, 7, 8. GenerateAudio=4 routes to its own tag
+            // (the +op arithmetic would alias PIE_METHOD_HEALTH at op=4).
+            if (a.op == PIE_ADAPTER_OP_GENERATE_AUDIO) {
+                out.method = PIE_METHOD_GENERATE_AUDIO;
+            } else {
+                out.method = PIE_METHOD_LOAD_ADAPTER + a.op;
+            }
             out.adapter_id = a.adapter_id;
             out.adapter_path.ptr = a.path_ptr;
             out.adapter_path.len = a.path_len;

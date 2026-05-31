@@ -155,6 +155,69 @@ pub async fn zo_update_adapter(driver_idx: DriverId, adapter_id: u64) -> Result<
     .await
 }
 
+/// CSM native audio output (pie:core/audio-out). Submits the prompt token ids +
+/// `max_frames` as a JSON `AdapterRequest` with `op = GenerateAudio`; the CSM
+/// driver runs the full generation (backbone prefill + per-frame depth loop +
+/// Mimi decode), writes raw little-endian f32 PCM to a scratch file, and
+/// returns `Status` = number of Mimi frames produced (negative on error). We
+/// then read the PCM back and return it as f32 samples (24 kHz mono).
+/// Returns an error if the model is not CSM or generation failed.
+pub async fn generate_audio(
+    driver_idx: DriverId,
+    prompt: &[u32],
+    max_frames: u32,
+) -> Result<Vec<f32>> {
+    // Unique scratch path the driver writes raw f32 PCM to. The embedded driver
+    // shares this process's filesystem, so a temp file is the simplest reliable
+    // handoff for the variable-length PCM (the Adapter Status response only
+    // carries an i32 — see the AdapterOp::GenerateAudio doc).
+    let pid = std::process::id();
+    let nonce: u64 = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    let out_path = std::env::temp_dir().join(format!("pie_csm_audio_{pid}_{nonce}.f32"));
+    let out_path_str = out_path.to_string_lossy().to_string();
+
+    let req_json = serde_json::json!({
+        "prompt": prompt,
+        "max_frames": max_frames,
+        "out_path": out_path_str,
+    })
+    .to_string();
+
+    let req = adapter_request(driver_idx, AdapterOp::GenerateAudio, 0, req_json);
+    let ch = super::channel::get_channel(driver_idx)?;
+    let resp = ch.submit(req).await?;
+    let status = match resp.payload {
+        ResponsePayload::Status(s) => s.status,
+        ResponsePayload::Forward(_) => {
+            let _ = std::fs::remove_file(&out_path);
+            return Err(anyhow::anyhow!(
+                "generate_audio received forward response (driver bug)"
+            ));
+        }
+    };
+    if status < 0 {
+        let _ = std::fs::remove_file(&out_path);
+        return Err(anyhow::anyhow!(
+            "generate_audio failed in driver (status {status}); model may not be CSM"
+        ));
+    }
+    // Read back the raw f32 PCM the driver wrote.
+    let bytes = std::fs::read(&out_path).map_err(|e| {
+        anyhow::anyhow!("generate_audio: reading PCM scratch {out_path_str}: {e}")
+    })?;
+    let _ = std::fs::remove_file(&out_path);
+    let n = bytes.len() / 4;
+    let mut pcm = Vec::with_capacity(n);
+    for i in 0..n {
+        let b = [bytes[i * 4], bytes[i * 4 + 1], bytes[i * 4 + 2], bytes[i * 4 + 3]];
+        pcm.push(f32::from_le_bytes(b));
+    }
+    Ok(pcm)
+}
+
 async fn submit_adapter_op(req: DriverRequest, method_name: &'static str) -> Result<()> {
     let ch = super::channel::get_channel(req.driver_id)?;
     let resp = ch.submit(req).await?;

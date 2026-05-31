@@ -50,8 +50,10 @@ pub use context::{
 // Sampler / Probe + Forward primitive
 // =============================================================================
 
+pub mod audio;
 pub mod forward;
 pub mod sample;
+pub mod vision;
 
 // =============================================================================
 // Generation state machine + decoders + speculation
@@ -105,6 +107,14 @@ pub mod session {
 
 pub mod inference {
     pub use crate::pie::core::inference::*;
+}
+
+/// Multimodal input. [`media::Image`] encodes a still image or video clip into
+/// a handle whose `token-count` / `position-span` / `grid` describe how it will
+/// occupy the context. The forward-pass splice (`input-image`) lands in a later
+/// phase; see MULTIMODAL.md.
+pub mod media {
+    pub use crate::pie::core::media::{Audio, Image};
 }
 
 /// Grammar matcher — re-export for callers that build their own

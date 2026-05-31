@@ -377,7 +377,13 @@ impl BatchAccumulator {
             && all_samplers_token
             && total_sampler_rows > 0
             && total_sampler_rows < total_tokens;
-        let logit_rows = if compact_logit_rows {
+        let logit_rows = if total_sampler_rows == 0 {
+            // Pure KV-fill / encode fire (e.g. a multimodal image-token
+            // prefill): no token is sampled, so the driver computes no
+            // logits. Without this, the fire would project `total_tokens`
+            // logit rows and trip `max_logit_rows` for large image spans.
+            0
+        } else if compact_logit_rows {
             total_sampler_rows
         } else {
             total_tokens

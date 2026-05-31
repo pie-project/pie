@@ -521,6 +521,125 @@ HfConfig parse_hf_config(const std::filesystem::path& path) {
         };
     }
 
+    // ── Gemma-4 vision encoder (gemma4_vision) ──────────────────────
+    // Parse vision_config + the top-level soft-token count for multimodal
+    // Gemma-4 checkpoints. Parsed but not yet consumed — the encoder graph
+    // (MULTIMODAL.md Phase 2.2) reads this. The vision/audio towers stay in
+    // `mm_skip_prefixes` above until the encoder binds them. Confirmed against
+    // `google/gemma-4-E4B`.
+    const bool is_gemma4_vision =
+        has_vision_config &&
+        j_root["vision_config"].value("model_type", std::string()) == "gemma4_vision";
+    if (is_gemma4_vision) {
+        const auto& v = j_root["vision_config"];
+        GemmaVisionConfig gv;
+        gv.hidden_size         = optional<int>(v, "hidden_size", gv.hidden_size);
+        gv.intermediate_size   = optional<int>(v, "intermediate_size", gv.intermediate_size);
+        gv.num_hidden_layers   = optional<int>(v, "num_hidden_layers", gv.num_hidden_layers);
+        gv.num_attention_heads = optional<int>(v, "num_attention_heads", gv.num_attention_heads);
+        gv.num_key_value_heads = optional<int>(v, "num_key_value_heads", gv.num_attention_heads);
+        gv.head_dim            = optional<int>(v, "head_dim", gv.head_dim);
+        gv.patch_size          = optional<int>(v, "patch_size", gv.patch_size);
+        gv.rms_norm_eps        = optional<float>(v, "rms_norm_eps", gv.rms_norm_eps);
+        gv.pooling_kernel_size = optional<int>(v, "pooling_kernel_size", gv.pooling_kernel_size);
+        gv.use_clipped_linears = optional<bool>(v, "use_clipped_linears", gv.use_clipped_linears);
+        if (v.contains("rope_parameters") && v["rope_parameters"].is_object()) {
+            gv.rope_theta = optional<float>(v["rope_parameters"], "rope_theta", gv.rope_theta);
+        }
+        gv.soft_tokens_per_image =
+            optional<int>(j_root, "vision_soft_tokens_per_image", gv.soft_tokens_per_image);
+        cfg.gemma_vision = gv;
+    }
+
+    // ── Gemma-4 audio encoder (gemma4_audio) ────────────────────────
+    // Parse audio_config for multimodal Gemma-4 checkpoints. The audio tower
+    // (`model.audio_tower.*` + `model.embed_audio.*`) loads alongside vision;
+    // the gemma4 audio encoder graph reads this. Confirmed against
+    // `google/gemma-4-E4B`. See audio_frontend.md.
+    const bool has_audio_config =
+        j_root.contains("audio_config") && j_root["audio_config"].is_object();
+    const bool is_gemma4_audio =
+        has_audio_config &&
+        j_root["audio_config"].value("model_type", std::string()) == "gemma4_audio";
+    if (is_gemma4_audio) {
+        const auto& a = j_root["audio_config"];
+        GemmaAudioConfig ga;
+        ga.hidden_size           = optional<int>(a, "hidden_size", ga.hidden_size);
+        ga.num_attention_heads   = optional<int>(a, "num_attention_heads", ga.num_attention_heads);
+        ga.num_hidden_layers     = optional<int>(a, "num_hidden_layers", ga.num_hidden_layers);
+        ga.conv_kernel_size      = optional<int>(a, "conv_kernel_size", ga.conv_kernel_size);
+        ga.output_proj_dims      = optional<int>(a, "output_proj_dims", ga.output_proj_dims);
+        ga.attention_chunk_size  = optional<int>(a, "attention_chunk_size", ga.attention_chunk_size);
+        ga.attention_context_left  = optional<int>(a, "attention_context_left", ga.attention_context_left);
+        ga.attention_context_right = optional<int>(a, "attention_context_right", ga.attention_context_right);
+        ga.feature_size          = optional<int>(a, "feature_size", ga.feature_size);
+        ga.attention_logit_cap   = optional<float>(a, "attention_logit_cap", ga.attention_logit_cap);
+        ga.residual_weight       = optional<float>(a, "residual_weight", ga.residual_weight);
+        ga.rms_norm_eps          = optional<float>(a, "rms_norm_eps", ga.rms_norm_eps);
+        ga.use_clipped_linears   = optional<bool>(a, "use_clipped_linears", ga.use_clipped_linears);
+        if (a.contains("subsampling_conv_channels") &&
+            a["subsampling_conv_channels"].is_array() &&
+            a["subsampling_conv_channels"].size() >= 2) {
+            ga.subsampling_conv_channels0 = a["subsampling_conv_channels"][0].get<int>();
+            ga.subsampling_conv_channels1 = a["subsampling_conv_channels"][1].get<int>();
+        }
+        cfg.gemma_audio = ga;
+    }
+
+    // ── Qwen3-VL vision encoder (qwen3_vl) ──────────────────────────
+    // Parse the vision_config + the text M-RoPE params + delimiter token ids
+    // for multimodal Qwen3-VL checkpoints. The text tower (model_type
+    // "qwen3_vl_text") is standard Qwen3; the Qwen3VLModel consumes these.
+    const bool is_qwen3_vl_vision =
+        has_vision_config &&
+        j_root["vision_config"].value("model_type", std::string()) == "qwen3_vl";
+    if (is_qwen3_vl_vision) {
+        const auto& v = j_root["vision_config"];
+        Qwen3VLVisionConfig qv;
+        qv.hidden_size          = optional<int>(v, "hidden_size", qv.hidden_size);
+        qv.intermediate_size    = optional<int>(v, "intermediate_size", qv.intermediate_size);
+        qv.depth                = optional<int>(v, "depth", qv.depth);
+        qv.num_heads            = optional<int>(v, "num_heads", qv.num_heads);
+        qv.patch_size           = optional<int>(v, "patch_size", qv.patch_size);
+        qv.temporal_patch_size  = optional<int>(v, "temporal_patch_size", qv.temporal_patch_size);
+        qv.spatial_merge_size   = optional<int>(v, "spatial_merge_size", qv.spatial_merge_size);
+        qv.in_channels          = optional<int>(v, "in_channels", qv.in_channels);
+        qv.out_hidden_size      = optional<int>(v, "out_hidden_size", qv.out_hidden_size);
+        qv.num_position_embeddings =
+            optional<int>(v, "num_position_embeddings", qv.num_position_embeddings);
+        if (v.contains("deepstack_visual_indexes") &&
+            v["deepstack_visual_indexes"].is_array()) {
+            qv.deepstack_visual_indexes.clear();
+            for (const auto& x : v["deepstack_visual_indexes"]) {
+                qv.deepstack_visual_indexes.push_back(x.get<int>());
+            }
+        }
+        cfg.qwen3_vl_vision = qv;
+
+        // Text tower is Qwen3 (per-head q/k norm) — config has no explicit
+        // `use_qk_norm`, so set it here (the tensors carry q_norm/k_norm).
+        cfg.use_qk_norm = true;
+
+        // M-RoPE: text rope_scaling holds the section split + interleave flag.
+        if (j.contains("rope_scaling") && j["rope_scaling"].is_object()) {
+            const auto& rs = j["rope_scaling"];
+            if (rs.contains("mrope_section") && rs["mrope_section"].is_array()) {
+                for (const auto& x : rs["mrope_section"]) {
+                    cfg.qwen3_vl_mrope_section.push_back(x.get<int>());
+                }
+            }
+            cfg.qwen3_vl_mrope_interleaved =
+                optional<bool>(rs, "mrope_interleaved", false);
+        }
+        // M-RoPE is not a frequency-scaling variant — keep plain RoPE math.
+        cfg.rope_scaling_kind = HfConfig::RopeScaling::None;
+        cfg.has_rope_scaling = false;
+
+        cfg.qwen3_vl_image_token_id        = optional<int>(j_root, "image_token_id", -1);
+        cfg.qwen3_vl_vision_start_token_id = optional<int>(j_root, "vision_start_token_id", -1);
+        cfg.qwen3_vl_vision_end_token_id   = optional<int>(j_root, "vision_end_token_id", -1);
+    }
+
     // ── quantization_config ─────────────────────────────────────────
     // GPTQ / AWQ checkpoints attach a `quantization_config` block. We
     // read just enough to drive marlin dispatch — the loader can match
@@ -541,6 +660,77 @@ HfConfig parse_hf_config(const std::filesystem::path& path) {
     } else if (j_root.contains("quantization_config") && j_root["quantization_config"].is_object()) {
         qcfg_src = &j_root["quantization_config"];
     }
+    // ── CSM native audio output (model_type == "csm") ──────────────────
+    // The backbone Llama hyperparameters are already parsed from the top level
+    // above (hidden 2048, 16 layers, etc.). Here we lift the two nested pieces:
+    // `depth_decoder_config` (the RVQ depth sampler) and `codec_config` (Mimi
+    // codes→waveform). See AUDIO_OUTPUT.md.
+    if (cfg.model_type == "csm") {
+        CsmConfig csm;
+        csm.text_vocab_size = optional<int>(j_root, "text_vocab_size", csm.text_vocab_size);
+        csm.audio_vocab_size = cfg.vocab_size;  // top-level vocab_size = per-codebook 2051
+        csm.num_codebooks = optional<int>(j_root, "num_codebooks", csm.num_codebooks);
+        csm.codebook_eos_token_id = optional<int>(j_root, "codebook_eos_token_id", csm.codebook_eos_token_id);
+        csm.audio_eos_token_id = optional<int>(j_root, "audio_eos_token_id", csm.audio_eos_token_id);
+        csm.audio_token_id = optional<int>(j_root, "audio_token_id", csm.audio_token_id);
+
+        if (j_root.contains("depth_decoder_config") &&
+            j_root["depth_decoder_config"].is_object()) {
+            const auto& d = j_root["depth_decoder_config"];
+            auto& dd = csm.depth;
+            dd.hidden_size          = optional<int>(d, "hidden_size", dd.hidden_size);
+            dd.backbone_hidden_size = optional<int>(d, "backbone_hidden_size", dd.backbone_hidden_size);
+            dd.num_hidden_layers    = optional<int>(d, "num_hidden_layers", dd.num_hidden_layers);
+            dd.num_attention_heads  = optional<int>(d, "num_attention_heads", dd.num_attention_heads);
+            dd.num_key_value_heads  = optional<int>(d, "num_key_value_heads", dd.num_key_value_heads);
+            dd.head_dim             = optional<int>(d, "head_dim", dd.head_dim);
+            dd.intermediate_size    = optional<int>(d, "intermediate_size", dd.intermediate_size);
+            dd.num_codebooks        = optional<int>(d, "num_codebooks", dd.num_codebooks);
+            dd.vocab_size           = optional<int>(d, "vocab_size", dd.vocab_size);
+            dd.max_position_embeddings = optional<int>(d, "max_position_embeddings", dd.max_position_embeddings);
+            dd.rms_norm_eps         = optional<float>(d, "rms_norm_eps", dd.rms_norm_eps);
+            dd.rope_theta           = optional<float>(d, "rope_theta", dd.rope_theta);
+            if (d.contains("rope_scaling") && d["rope_scaling"].is_object()) {
+                const auto& s = d["rope_scaling"];
+                dd.rope_factor              = optional<float>(s, "factor", dd.rope_factor);
+                dd.rope_low_freq_factor     = optional<float>(s, "low_freq_factor", dd.rope_low_freq_factor);
+                dd.rope_high_freq_factor    = optional<float>(s, "high_freq_factor", dd.rope_high_freq_factor);
+                dd.rope_original_max_position = optional<int>(s, "original_max_position_embeddings", dd.rope_original_max_position);
+            }
+        }
+
+        if (j_root.contains("codec_config") &&
+            j_root["codec_config"].is_object()) {
+            const auto& c = j_root["codec_config"];
+            auto& mc = csm.codec;
+            mc.hidden_size            = optional<int>(c, "hidden_size", mc.hidden_size);
+            mc.codebook_dim           = optional<int>(c, "vector_quantization_hidden_dimension", optional<int>(c, "codebook_dim", mc.codebook_dim));
+            mc.codebook_size          = optional<int>(c, "codebook_size", mc.codebook_size);
+            mc.num_quantizers         = optional<int>(c, "num_quantizers", mc.num_quantizers);
+            mc.num_semantic_quantizers = optional<int>(c, "num_semantic_quantizers", mc.num_semantic_quantizers);
+            mc.num_filters            = optional<int>(c, "num_filters", mc.num_filters);
+            mc.xf_num_attention_heads = optional<int>(c, "num_attention_heads", mc.xf_num_attention_heads);
+            mc.xf_num_key_value_heads = optional<int>(c, "num_key_value_heads", mc.xf_num_key_value_heads);
+            mc.xf_head_dim            = optional<int>(c, "head_dim", mc.xf_head_dim);
+            mc.xf_intermediate_size   = optional<int>(c, "intermediate_size", mc.xf_intermediate_size);
+            mc.xf_num_hidden_layers   = optional<int>(c, "num_hidden_layers", mc.xf_num_hidden_layers);
+            mc.xf_sliding_window      = optional<int>(c, "sliding_window", mc.xf_sliding_window);
+            mc.xf_rope_theta          = optional<float>(c, "rope_theta", mc.xf_rope_theta);
+            mc.norm_eps               = optional<float>(c, "norm_eps", mc.norm_eps);
+            mc.sampling_rate          = optional<int>(c, "sampling_rate", mc.sampling_rate);
+            mc.use_causal_conv        = optional<bool>(c, "use_causal_conv", mc.use_causal_conv);
+            mc.upsample_groups        = optional<int>(c, "upsample_groups", mc.upsample_groups);
+            mc.residual_kernel_size   = optional<int>(c, "residual_kernel_size", mc.residual_kernel_size);
+            mc.kernel_size            = optional<int>(c, "kernel_size", mc.kernel_size);
+            mc.last_kernel_size       = optional<int>(c, "last_kernel_size", mc.last_kernel_size);
+            if (c.contains("upsampling_ratios") && c["upsampling_ratios"].is_array()) {
+                mc.upsampling_ratios.clear();
+                for (const auto& r : c["upsampling_ratios"]) mc.upsampling_ratios.push_back(r.get<int>());
+            }
+        }
+        cfg.csm = csm;
+    }
+
     if (qcfg_src) {
         const auto& q = *qcfg_src;
         cfg.quant_method = optional<std::string>(q, "quant_method", "");

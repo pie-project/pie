@@ -126,6 +126,62 @@ pub struct ForwardRequest {
 
     pub single_token_mode: bool,
     pub has_user_mask: bool,
+
+    // ── Multimodal visual spans (vision / video) ────────────────────
+    // Appended per the schema evolution rule (append-only). A "visual
+    // span" is one still image or one video clip; the driver runs the
+    // vision encoder over it and scatters the projected rows into the
+    // hidden state. All fields are empty for text-only passes. See
+    // MULTIMODAL.md §4.
+    //
+    // CSR across the batch: `image_indptr[r..r+1]` is the half-open range
+    // of images belonging to request `r` (one extra leading 0, like
+    // `mask_indptr`).
+    pub image_indptr: Vec<u32>,
+    /// `(t, h, w)` merged-token grid per image — 3 entries per image.
+    pub image_grids: Vec<u32>,
+    /// Sequence anchor position per image (1 entry per image).
+    pub image_anchor_positions: Vec<u32>,
+    /// Staged pixel bytes per image, concatenated. NOTE: until the host
+    /// preprocessor lands (Phase 2) these are the *encoded* image bytes,
+    /// not a normalized pixel tensor; the driver does not consume them
+    /// yet. `image_pixel_indptr[i..i+1]` is image `i`'s byte range.
+    pub image_pixels: Vec<u8>,
+    pub image_pixel_indptr: Vec<u32>,
+    /// Precomputed M-RoPE `(t, h, w)` position ids — 3 per image token,
+    /// concatenated. Empty for 1-D-RoPE archs (Gemma). The host owns the
+    /// M-RoPE math; `image_mrope_indptr[i..i+1]` is image `i`'s range.
+    pub image_mrope_positions: Vec<u32>,
+    pub image_mrope_indptr: Vec<u32>,
+
+    // ── Option-B pixel path (inferlet pre-patchified; see MULTIMODAL.md) ──
+    // `image_pixels` carries the f32 `pixel_values` tensor as little-endian
+    // bytes (`n_patch · patch_dim · 4` per image; ranges = `image_pixel_indptr`).
+    /// Per-patch `(x, y)` positions for every image, concatenated (2 per patch).
+    /// Image `i`'s patch count is derivable from its pixel byte range.
+    pub image_patch_positions: Vec<u32>,
+    /// Batch row offset where each image's soft-token rows begin in `token_ids`
+    /// (one per image). The driver runs the vision encoder and writes the
+    /// projected rows' hidden state at `[anchor_row .. anchor_row + n_soft]`.
+    pub image_anchor_rows: Vec<u32>,
+
+    // ── Multimodal audio spans (gemma4_audio) ───────────────────────
+    // Direct analog of the image block. A "clip" is one audio span; the
+    // driver runs the audio (USM/Conformer) encoder over its log-mel
+    // features and scatters the projected soft-token rows into the hidden
+    // state. All fields empty for non-audio passes. See audio_frontend.md.
+    /// Per-clip log-mel features as little-endian f32 bytes, concatenated.
+    /// Clip `i`'s byte range is `audio_feature_indptr[i..i+1]`
+    /// (`n_frames_i * 128 * 4` bytes).
+    pub audio_features: Vec<u8>,
+    pub audio_feature_indptr: Vec<u32>,
+    /// Batch row offset where each clip's soft-token rows begin in `token_ids`
+    /// (one per clip). The driver writes the projected rows at
+    /// `[anchor_row .. anchor_row + n_audio_tok]`.
+    pub audio_anchor_rows: Vec<u32>,
+    /// Per-request CSR: `audio_indptr[r..r+1]` is the half-open range of clips
+    /// belonging to request `r` (one extra leading 0, like `image_indptr`).
+    pub audio_indptr: Vec<u32>,
 }
 
 /// Sampler configuration. Variants align with the kernel-dispatch types
@@ -272,6 +328,16 @@ pub enum AdapterOp {
     Save,
     ZoInit,
     ZoUpdate,
+    // CSM native audio output (pie:core/audio-out). Appended per the enum
+    // evolution rule (append-only — the discriminant byte is on the wire). The
+    // `AdapterRequest.path` carries a JSON request
+    // `{"prompt":[u32,...],"max_frames":u32,"out_path":"..."}`; the CSM driver
+    // runs the full generation (backbone prefill + per-frame depth loop + Mimi
+    // decode), writes the raw little-endian f32 PCM to `out_path`, and returns
+    // `StatusResponse.status` = number of Mimi frames produced (negative on
+    // error). Reuses the Adapter cold-path transport so no new wire payload
+    // variant is needed. See AUDIO_OUTPUT.md.
+    GenerateAudio,
 }
 
 /// Generic status response. Convention:

@@ -17,6 +17,8 @@ std::size_t BoundCudaModel::num_layers() const noexcept {
     case Kind::Kimi: return kimi.layers.size();
     case Kind::DeepSeekV4: return deepseek_v4.layers.size();
     case Kind::Glm5: return glm5.layers.size();
+    case Kind::Qwen3VL: return llama.layers.size();
+    case Kind::Csm: return csm.backbone_layers.size();
     }
     return 0;
 }
@@ -35,8 +37,25 @@ BoundCudaModel bind_cuda_model(LoadedModel& engine, bool verbose) {
     const bool is_qwen3_5_moe =
         (mt == "qwen3_5_moe" || mt == "qwen3_5_moe_text" || mt == "qwen3_moe");
     const bool is_nemotron_h = (mt == "nemotron_h");
+    const bool is_qwen3_vl = (mt == "qwen3_vl" || mt == "qwen3_vl_text");
 
-    if (mt == "deepseek_v4") {
+    if (is_qwen3_vl) {
+        bound.kind = BoundCudaModel::Kind::Qwen3VL;
+        bound.llama = bind_qwen3_vl_text(engine);
+        if (engine.hf_config().qwen3_vl_vision.has_value()) {
+            bound.qwen3_vl_vision = bind_qwen3_vl_vision(engine);
+            bound.has_vision = true;
+            if (verbose) {
+                std::fprintf(stderr,
+                    "[qwen3_vl] bound vision tower (%zu layers, %zu deepstack)\n",
+                    bound.qwen3_vl_vision.layers.size(),
+                    bound.qwen3_vl_vision.deepstack.size());
+            }
+        }
+    } else if (mt == "csm") {
+        bound.kind = BoundCudaModel::Kind::Csm;
+        bound.csm = bind_csm(engine, verbose);
+    } else if (mt == "deepseek_v4") {
         bound.kind = BoundCudaModel::Kind::DeepSeekV4;
         bound.deepseek_v4 = bind_deepseek_v4(engine);
     } else if (mt == "kimi_k2" || mt == "deepseek_v2" || mt == "deepseek_v3") {
@@ -63,6 +82,28 @@ BoundCudaModel bind_cuda_model(LoadedModel& engine, bool verbose) {
     } else if (is_gemma4) {
         bound.kind = BoundCudaModel::Kind::Gemma4;
         bound.gemma4 = bind_gemma4(engine);
+        // Multimodal gemma-4: bind the vision tower too. Its tensors are
+        // already in the weight store (not stripped). The encoder forward
+        // (Phase 2.2) reads `bound.gemma4_vision`.
+        if (engine.hf_config().gemma_vision.has_value()) {
+            bound.gemma4_vision = bind_gemma4_vision(engine);
+            bound.has_vision = true;
+            if (verbose) {
+                std::fprintf(stderr, "[gemma4] bound vision tower (%zu layers)\n",
+                             bound.gemma4_vision.layers.size());
+            }
+        }
+        // Multimodal gemma-4: bind the audio tower (USM/Conformer) too. Like
+        // vision, its tensors load unstripped; the encoder forward scatters
+        // audio soft tokens. See audio_frontend.md.
+        if (engine.hf_config().gemma_audio.has_value()) {
+            bound.gemma4_audio = bind_gemma4_audio(engine);
+            bound.has_audio = true;
+            if (verbose) {
+                std::fprintf(stderr, "[gemma4] bound audio tower (%zu layers)\n",
+                             bound.gemma4_audio.layers.size());
+            }
+        }
     } else if (is_gemma3n) {
         bound.kind = BoundCudaModel::Kind::Gemma3n;
         bound.gemma3n = bind_gemma3n(engine);

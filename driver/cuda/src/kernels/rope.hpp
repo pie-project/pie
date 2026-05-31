@@ -75,6 +75,29 @@ void launch_qk_rmsnorm_rope_bf16_rounded(
     float eps,
     cudaStream_t stream);
 
+// Fused per-head Q/K RMSNorm + interleaved M-RoPE (Qwen3-VL text tower).
+// `positions` is `[num_tokens, 3]` row-major: the (t, h, w) M-RoPE component
+// for each token. The frequency axis per rotary index follows HF's
+// `apply_interleaved_mrope` with section split (t, h, w). Text-only rows pass
+// t == h == w and collapse to ordinary RoPE. Matches Qwen3's per-head q/k norm
+// (weight shape [head_dim]) and the standard half/half rotate_half pairing.
+void launch_qk_rmsnorm_mrope_bf16(
+    void* q,
+    void* k,
+    const void* q_weight,
+    const void* k_weight,
+    const std::int32_t* positions,  // [num_tokens, 3] (t,h,w)
+    int num_tokens,
+    int num_q_heads,
+    int num_kv_heads,
+    int head_dim,
+    float theta,
+    float eps,
+    int mrope_section_t,
+    int mrope_section_h,
+    int mrope_section_w,
+    cudaStream_t stream);
+
 // YaRN (Llama-3 / OLMo / Mistral-3 / GPT-OSS) RoPE scaling. Frequency
 // per pair is modified by a piecewise-linear interpolation between
 // `low_freq_factor` and `high_freq_factor` (in units of cycles / window),

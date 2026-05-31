@@ -82,6 +82,8 @@ const HF_TO_PIE_ARCH: &[(&str, &str)] = &[
     ("qwen3_moe", "qwen3_moe"),
     ("qwen3_5_moe", "qwen3_5_moe"),
     ("qwen3_5_moe_text", "qwen3_5_moe"),
+    ("qwen3_vl", "qwen3_vl"),
+    ("qwen3_vl_text", "qwen3_vl"),
     ("phi3", "phi3"),
     ("mixtral", "mixtral"),
     ("gemma2", "gemma2"),

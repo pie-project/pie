@@ -1,6 +1,8 @@
 pub mod adapter;
+pub mod audio_out;
 pub mod context;
 pub mod inference;
+pub mod media;
 pub mod messaging;
 pub mod model;
 pub mod runtime;
@@ -45,6 +47,9 @@ wasmtime::component::bindgen!({
         "pie:core/messaging.subscription": messaging::Subscription,
         // pie:core/adapter
         "pie:core/adapter.adapter": adapter::Adapter,
+        // pie:core/media
+        "pie:core/media.image": media::Image,
+        "pie:core/media.audio": media::Audio,
         // pie:mcp/client
         "pie:mcp/client.session": mcp::Session,
         // pie:instruct
@@ -65,6 +70,8 @@ where
         + pie::core::messaging::Host
         + pie::core::session::Host
         + pie::core::adapter::Host
+        + pie::core::media::Host
+        + pie::core::audio_out::Host
         + pie::core::runtime::Host
         + pie::core::scheduling::Host
         + pie::mcp::types::Host
@@ -81,6 +88,8 @@ where
     pie::core::messaging::add_to_linker::<T, HasSelf<T>>(linker, |s| s)?;
     pie::core::session::add_to_linker::<T, HasSelf<T>>(linker, |s| s)?;
     pie::core::adapter::add_to_linker::<T, HasSelf<T>>(linker, |s| s)?;
+    pie::core::media::add_to_linker::<T, HasSelf<T>>(linker, |s| s)?;
+    pie::core::audio_out::add_to_linker::<T, HasSelf<T>>(linker, |s| s)?;
     pie::core::runtime::add_to_linker::<T, HasSelf<T>>(linker, |s| s)?;
     pie::core::scheduling::add_to_linker::<T, HasSelf<T>>(linker, |s| s)?;
     pie::mcp::types::add_to_linker::<T, HasSelf<T>>(linker, |s| s)?;
