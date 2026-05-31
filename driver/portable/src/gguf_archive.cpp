@@ -408,6 +408,13 @@ GGUFArchive::open_sharded(const std::filesystem::path& first_shard) {
     int this_index = 0, total_from_name = 0;
     const bool parsed = parse_shard_filename(first_shard, prefix,
                                              this_index, total_from_name);
+    if (parsed && this_index != 0) {
+        throw std::runtime_error(
+            "gguf: open_sharded() requires the first shard (got shard " +
+            std::to_string(this_index + 1) + " of " +
+            std::to_string(total_from_name) + ")");
+    }
+
     if (!parsed) {
         // Filename doesn't match the pattern but split.count > 1 — warn and
         // return what we have; callers will get a missing-tensor error later
