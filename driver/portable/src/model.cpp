@@ -188,7 +188,7 @@ Model::Model(const std::filesystem::path& snapshot_dir,
     }
 
     if (is_gguf_file) {
-        auto gguf = std::make_unique<GGUFArchive>(snapshot_dir_);
+        auto gguf = GGUFArchive::open_sharded(snapshot_dir_);
         hparams_ = parse_gguf_hparams(gguf->meta());
         archive_ = std::move(gguf);
     } else {
