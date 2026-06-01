@@ -21,7 +21,9 @@ void decoder_layer_inplace(
     const LayerScratch& s,
     int num_tokens, int num_requests, int hidden_size,
     int n_q_heads, int n_kv_heads, int head_dim, int intermediate,
-    int page_size, float rms_eps, float rope_theta) {
+    int page_size, float rms_eps, float rope_theta,
+    const AttnPlan& attn,
+    int window_left, float logits_soft_cap, float sm_scale) {
     const int T = num_tokens;
     const int H = hidden_size;
     const int Hq = n_q_heads * head_dim;
@@ -49,10 +51,11 @@ void decoder_layer_inplace(
     kernels::write_kv_to_pages_bf16(k_pages, v_pages, s.k, s.v, qo_indptr, kv_page_indices,
                                     kv_page_indptr, kv_last_page_lens, T, num_requests, page_size,
                                     n_kv_heads, head_dim, /*hnd_layout=*/false, stream);
-    ops::attention_naive_paged_bf16(
-        s.q, k_pages, v_pages, s.attn, qo_indptr, kv_page_indices, kv_page_indptr,
-        kv_last_page_lens, T, num_requests, n_q_heads, n_kv_heads, head_dim, page_size,
-        stream, /*window_left=*/-1, /*sm_scale=*/-1.f, /*logits_soft_cap=*/0.f, nullptr);
+    // Tensor-core paged attention (decode/prefill plan), or naive fallback when
+    // attn.ws==nullptr (head_dim the TC templates don't instantiate).
+    run_attention_layer(attn, s.q, k_pages, v_pages, s.attn, qo_indptr, kv_page_indices,
+                         kv_page_indptr, kv_last_page_lens, stream,
+                         window_left, logits_soft_cap, sm_scale, nullptr);
     ops::gemm_act_x_wt_bf16(cublas, s.attn, w.wo, s.o, T, H, Hq, 0.f);
     kernels::residual_add_bf16(hidden, s.o, (size_t)T * H, stream);
 
@@ -90,10 +93,20 @@ cudaError_t llama_layer_bf16(
         }
     }
     LayerScratch s{b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7], b[8], b[9]};
+    // Standalone single-layer entry keeps the naive attention path (no plan):
+    // an AttnPlan with ws==nullptr but dims populated routes run_attention_layer
+    // to the naive fallback.
+    AttnPlan naive_plan;
+    naive_plan.num_tokens = num_tokens;
+    naive_plan.num_requests = num_requests;
+    naive_plan.n_q_heads = n_q_heads;
+    naive_plan.n_kv_heads = n_kv_heads;
+    naive_plan.head_dim = head_dim;
+    naive_plan.page_size = page_size;
     decoder_layer_inplace(cublas, stream, hidden, w, positions, k_pages, v_pages, qo_indptr,
                           kv_page_indices, kv_page_indptr, kv_last_page_lens, s, num_tokens,
                           num_requests, hidden_size, n_q_heads, n_kv_heads, head_dim,
-                          intermediate, page_size, rms_eps, rope_theta);
+                          intermediate, page_size, rms_eps, rope_theta, naive_plan);
     cudaError_t e = cudaStreamSynchronize(stream);
     for (int i = 0; i < 10; ++i) cudaFree(b[i]);
     return e;

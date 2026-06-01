@@ -8,7 +8,7 @@
 
 use std::os::raw::{c_char, c_void};
 
-pub const ABI_VERSION: u32 = 31;
+pub const ABI_VERSION: u32 = 32;
 
 #[repr(C)]
 #[derive(Copy, Clone, Eq, PartialEq, Debug)]
@@ -407,7 +407,8 @@ unsafe extern "C" {
         vocab: i32, page_size: i32, num_pages: i32, rms_eps: f32, sm_scale: f32,
         rope_theta: f32) -> PieStatus;
     pub fn pie_cuda_gemma_forward_bf16(
-        ctx: *mut PieDevCtx, token_ids: *const i32, w: *const PieGemmaWeights, positions: *const i32,
+        ctx: *mut PieDevCtx, ws: *mut PieWorkspace, token_ids: *const i32,
+        w: *const PieGemmaWeights, positions: *const i32,
         k_pages: *mut c_void, v_pages: *mut c_void, qo_indptr_d: *const u32,
         kv_page_indices_d: *const u32, kv_page_indptr_d: *const u32, kv_last_page_lens_d: *const u32,
         out_logits: *mut c_void, out_token_ids: *mut i32, num_tokens: i32, num_requests: i32,

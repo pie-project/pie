@@ -33,6 +33,18 @@ fn main() {
         cfg.define("CMAKE_CUDA_ARCHITECTURES", arch);
     }
 
+    // FlashInfer (header-only) for the perf attention path. Persist the CPM
+    // clone so build-hash churn doesn't re-fetch; allow an explicit pre-fetched
+    // source dir to skip the network entirely.
+    println!("cargo:rerun-if-env-changed=CPM_SOURCE_CACHE");
+    println!("cargo:rerun-if-env-changed=PIE_FLASHINFER_SOURCE_DIR");
+    let cpm_cache = std::env::var("CPM_SOURCE_CACHE")
+        .unwrap_or_else(|_| "/root/.cache/pie_cpm".to_string());
+    cfg.define("CPM_SOURCE_CACHE", &cpm_cache);
+    if let Ok(fi) = std::env::var("PIE_FLASHINFER_SOURCE_DIR") {
+        cfg.define("PIE_FLASHINFER_SOURCE_DIR", fi);
+    }
+
     let dst = cfg.build();
     println!("cargo:rustc-link-search=native={}", dst.join("build").display());
     println!("cargo:rustc-link-lib=static=pie_cuda_device");

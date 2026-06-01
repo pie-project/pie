@@ -24,6 +24,8 @@
 #include <cublas_v2.h>
 #include <cuda_runtime.h>
 
+#include "attn_runtime.cuh"
+
 namespace pie_cuda_device::forward {
 
 // Per-layer weight pointers (device bf16). HF row-major storage.
@@ -68,6 +70,9 @@ struct LayerScratch {
 // Runs one decoder layer in place on `hidden` [num_tokens, hidden_size]
 // bf16, using caller-provided scratch. All work is enqueued on `stream`;
 // the caller synchronizes.
+// `attn` carries the per-fire attention plan (tensor-core decode/prefill, or
+// naive fallback when attn.ws==nullptr). window_left/logits_soft_cap/sm_scale
+// are the attention knobs (defaults -1/0/-1 = full causal, 1/sqrt(d) scale).
 void decoder_layer_inplace(
     cublasHandle_t cublas, cudaStream_t stream,
     void* hidden, const LlamaLayerWeights& w, const std::int32_t* positions,
@@ -77,7 +82,9 @@ void decoder_layer_inplace(
     const LayerScratch& s,
     int num_tokens, int num_requests, int hidden_size,
     int n_q_heads, int n_kv_heads, int head_dim, int intermediate,
-    int page_size, float rms_eps, float rope_theta);
+    int page_size, float rms_eps, float rope_theta,
+    const AttnPlan& attn,
+    int window_left = -1, float logits_soft_cap = 0.f, float sm_scale = -1.f);
 
 // Convenience: allocates scratch per call, runs one layer, syncs, frees.
 // Kept as the standalone single-layer entry. Returns the first CUDA error.

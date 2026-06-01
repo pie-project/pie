@@ -474,33 +474,43 @@ pub struct LoadedGemma<'a> {
 impl<'a> LoadedGemma<'a> {
     pub fn load(dev: &'a Device, path: &Path, cfg: GemmaConfig) -> Result<Self> {
         let st = read_safetensors(path)?;
-        let embed_m = st.meta("model.embed_tokens.weight")?;
+        // Gemma-3n/4 multimodal checkpoints (e.g. gemma-4-E4B) nest the text
+        // tower under `model.language_model.`; plain gemma uses `model.`. Detect
+        // the prefix from the embed table. The altup / per-layer-embedding /
+        // qk-norm / vision / audio tensors are intentionally NOT loaded — the
+        // forward runs the simplified (single-stream) gemma path.
+        let prefix = if st.has("model.language_model.embed_tokens.weight") {
+            "model.language_model"
+        } else {
+            "model"
+        };
+        let embed_m = st.meta(&format!("{prefix}.embed_tokens.weight"))?;
         if embed_m.shape.len() != 2 {
             bail!("embed_tokens.weight is not 2-D");
         }
         let (vocab, hidden) = (embed_m.shape[0], embed_m.shape[1]);
         let n_layers = (0usize..)
             .take_while(|i| {
-                st.header.contains_key(&format!("model.layers.{i}.input_layernorm.weight"))
+                st.header.contains_key(&format!("{prefix}.layers.{i}.input_layernorm.weight"))
             })
             .count();
         if n_layers == 0 {
-            bail!("no decoder layers found (model.layers.0.* missing)");
+            bail!("no decoder layers found ({prefix}.layers.0.* missing)");
         }
         let hd = cfg.head_dim;
         if hd == 0 {
             bail!("gemma head_dim must be > 0");
         }
-        let n_q_heads = st.meta("model.layers.0.self_attn.q_proj.weight")?.shape[0] / hd;
-        let n_kv_heads = st.meta("model.layers.0.self_attn.k_proj.weight")?.shape[0] / hd;
-        let intermediate = st.meta("model.layers.0.mlp.gate_proj.weight")?.shape[0];
+        let n_q_heads = st.meta(&format!("{prefix}.layers.0.self_attn.q_proj.weight"))?.shape[0] / hd;
+        let n_kv_heads = st.meta(&format!("{prefix}.layers.0.self_attn.k_proj.weight"))?.shape[0] / hd;
+        let intermediate = st.meta(&format!("{prefix}.layers.0.mlp.gate_proj.weight"))?.shape[0];
 
         let (mut input_ln, mut post_attn_ln) = (Vec::new(), Vec::new());
         let (mut pre_ffn_ln, mut post_ffn_ln) = (Vec::new(), Vec::new());
         let (mut wq, mut wk, mut wv, mut wo) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
         let (mut wg, mut wu, mut wd) = (Vec::new(), Vec::new(), Vec::new());
         for i in 0..n_layers {
-            let p = format!("model.layers.{i}");
+            let p = format!("{prefix}.layers.{i}");
             input_ln.push(upload_tensor(dev, &st, &format!("{p}.input_layernorm.weight"))?);
             post_attn_ln.push(upload_tensor(dev, &st, &format!("{p}.post_attention_layernorm.weight"))?);
             pre_ffn_ln.push(upload_tensor(dev, &st, &format!("{p}.pre_feedforward_layernorm.weight"))?);
@@ -513,11 +523,11 @@ impl<'a> LoadedGemma<'a> {
             wu.push(upload_tensor(dev, &st, &format!("{p}.mlp.up_proj.weight"))?);
             wd.push(upload_tensor(dev, &st, &format!("{p}.mlp.down_proj.weight"))?);
         }
-        let embed = upload_tensor(dev, &st, "model.embed_tokens.weight")?;
-        let final_norm = upload_tensor(dev, &st, "model.norm.weight")?;
+        let embed = upload_tensor(dev, &st, &format!("{prefix}.embed_tokens.weight"))?;
+        let final_norm = upload_tensor(dev, &st, &format!("{prefix}.norm.weight"))?;
         // Gemma ties the lm_head to the embedding table.
-        let lm_head_name =
-            if st.has("lm_head.weight") { "lm_head.weight" } else { "model.embed_tokens.weight" };
+        let embed_name = format!("{prefix}.embed_tokens.weight");
+        let lm_head_name = if st.has("lm_head.weight") { "lm_head.weight" } else { &embed_name };
         let lm_head = upload_tensor(dev, &st, lm_head_name)?;
         dev.sync()?;
 
@@ -541,8 +551,10 @@ impl<'a> LoadedGemma<'a> {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     pub fn forward(
-        &self, dev: &Device, token_ids: &DeviceBuffer, positions: &DeviceBuffer,
+        &self, dev: &Device, ws: &crate::device::Workspace, token_ids: &DeviceBuffer,
+        positions: &DeviceBuffer,
         kv_k: &DeviceBuffer, kv_v: &DeviceBuffer, qo_indptr: &DeviceBuffer,
         kv_page_indices: &DeviceBuffer, kv_page_indptr: &DeviceBuffer,
         kv_last_page_lens: &DeviceBuffer, out_logits: &DeviceBuffer, out_tokens: &DeviceBuffer,
@@ -561,7 +573,7 @@ impl<'a> LoadedGemma<'a> {
             qk_norm: 0, altup_num_inputs: 1,
         };
         dev.gemma_forward_bf16(
-            token_ids, &self.embed, &layers, &self.final_norm, &self.lm_head, positions,
+            ws, token_ids, &self.embed, &layers, &self.final_norm, &self.lm_head, positions,
             kv_k, kv_v, qo_indptr, kv_page_indices, kv_page_indptr, kv_last_page_lens,
             out_logits, out_tokens, num_tokens, num_requests, &dims,
         )

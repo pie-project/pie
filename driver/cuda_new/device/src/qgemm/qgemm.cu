@@ -45,6 +45,14 @@ constexpr QTypeId kC8 = kBFloat16.id();
 constexpr QTypeId kS8t = kBFloat16.id();
 constexpr int kNumBits8 = 8;
 
+// The bf16 x fe2m1f (mxfp4, GPT-OSS) path. 4-bit weight (pack_factor 8 like
+// u4b8) but an 8-bit e8m0 *block* scale at group_size == 32 (group_blocks == 2).
+constexpr QTypeId kAmx = kBFloat16.id();
+constexpr QTypeId kBmx = kFE2M1f.id();
+constexpr QTypeId kCmx = kBFloat16.id();
+constexpr QTypeId kSmx = kFE8M0fnu.id();
+constexpr int kNumBitsMx = 4;
+
 struct ThreadConfig {
   int thread_k;
   int thread_n;
@@ -140,14 +148,27 @@ template <QTypeId A, QTypeId B, QTypeId C, QTypeId S>
 KernelPtr pick_kernel(int group_blocks, int threads, int thread_m_blocks,
                       int thread_n_blocks, int thread_k_blocks,
                       bool m_block_size_8) {
-  if (group_blocks == -1)
-    return pick_kernel_gb<A, B, C, S, -1>(threads, thread_m_blocks,
-                                          thread_n_blocks, thread_k_blocks,
-                                          m_block_size_8);
-  if (group_blocks == 8)
-    return pick_kernel_gb<A, B, C, S, 8>(threads, thread_m_blocks,
-                                         thread_n_blocks, thread_k_blocks,
-                                         m_block_size_8);
+  // The kernel's static_assert restricts which (scale-type, group_blocks)
+  // tuples are legal. e8m0 microscaling (mxfp4) is ONLY valid at group_blocks
+  // == 2; the bf16-scale paths (u4b8 / fe4m3fn) use group_blocks ∈ {-1, 8}.
+  // Guard each branch with `if constexpr` so an unreachable branch never forces
+  // an illegal QGemm instantiation.
+  constexpr bool kE8m0 = (S == kFE8M0fnu.id());
+  if constexpr (!kE8m0) {
+    if (group_blocks == -1)
+      return pick_kernel_gb<A, B, C, S, -1>(threads, thread_m_blocks,
+                                            thread_n_blocks, thread_k_blocks,
+                                            m_block_size_8);
+    if (group_blocks == 8)
+      return pick_kernel_gb<A, B, C, S, 8>(threads, thread_m_blocks,
+                                           thread_n_blocks, thread_k_blocks,
+                                           m_block_size_8);
+  } else {
+    if (group_blocks == 2)
+      return pick_kernel_gb<A, B, C, S, 2>(threads, thread_m_blocks,
+                                           thread_n_blocks, thread_k_blocks,
+                                           m_block_size_8);
+  }
   return nullptr;
 }
 
@@ -224,6 +245,33 @@ __global__ void scale_permute_kernel(const __nv_bfloat16* __restrict__ src,
     v = __float2bfloat16(__bfloat162float(v) * bias_mul);
   }
   dst[idx] = v;
+}
+
+// --- e8m0 (mxfp4) scale permutation -----------------------------------------
+// The mxfp4 (fe2m1f) path uses 1-byte e8m0 block scales. The kernel expects
+// them pre-permuted into the same MMA fragment layout as the bf16 scales, with
+// an additional 4-lane byte reorder because e8m0 bytes are packed 4-per-int32.
+//
+// Forward permute (logical [num_groups, N] uint8, permuting the N axis within
+// each group; N is always a multiple of 64). Within each 64-wide N block, for
+// output column c:
+//   (1) 4-lane reorder: m = (c & ~3) + perm4[c & 3],  perm4 = {0,2,1,3}
+//   (2) 8x8 transpose:  src_col = (m % 8) * 8 + (m / 8)
+// This is exactly the forward of the inverse permute the old driver applies in
+// mxfp4_scales_to_marlin_e8m0 (Marlin's 64-wide transpose + vLLM/SGLang's
+// four-lane [0,2,1,3] post-permute). No bias fold: e8m0 decodes to an exact
+// power of two in-register.
+__global__ void e8m0_scale_permute_kernel(const uint8_t* __restrict__ src,
+                                          uint8_t* __restrict__ dst, int total) {
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= total) return;
+  constexpr int block = 64;
+  int base = idx - (idx % block);
+  int c = idx % block;
+  static const int perm4[4] = {0, 2, 1, 3};
+  int m = (c & ~3) + perm4[c & 3];
+  int src_col = (m % 8) * 8 + (m / 8);
+  dst[idx] = src[base + src_col];
 }
 
 // --- Shared launcher core ----------------------------------------------------
@@ -359,6 +407,124 @@ cudaError_t launch_gemm(cudaStream_t stream, const void* act_bf16,
   return cudaSuccess;
 }
 
+// --- mxfp4 (fe2m1f weight + e8m0 block scale) launcher ----------------------
+// Mirrors launch_gemm's host orchestration, but the scale is a 1-byte e8m0
+// block scale (group_size == 32, group_blocks == 2) rather than a bf16 scale,
+// so it permutes through e8m0_scale_permute_kernel into a uint8 scratch buffer.
+// The kernel reads scales_ptr as int4; the e8m0 fragment expansion happens
+// in-kernel (dequant_fp8_scales<kFE8M0fnu>).
+cudaError_t launch_mxfp4_gemm(cudaStream_t stream, const void* act_bf16,
+                              const void* qweight_packed,
+                              const void* scales_e8m0, void* out_bf16, int M,
+                              int N, int K, int* workspace, int sms) {
+  if (M <= 0 || N <= 0 || K <= 0) return cudaErrorInvalidValue;
+  if (K % tile_size != 0 || N % tile_size != 0) return cudaErrorInvalidValue;
+  if (N % min_thread_n != 0 || K % min_thread_k != 0)
+    return cudaErrorInvalidValue;
+  constexpr int group_size = 32;  // fixed for mxfp4 e8m0 microscaling
+  if (K % group_size != 0) return cudaErrorInvalidValue;
+
+  int dev = 0;
+  cudaError_t err = cudaGetDevice(&dev);
+  if (err != cudaSuccess) return err;
+  if (sms <= 0) {
+    err = cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev);
+    if (err != cudaSuccess) return err;
+  }
+  int max_shared_mem = 0;
+  err = cudaDeviceGetAttribute(&max_shared_mem,
+                               cudaDevAttrMaxSharedMemoryPerBlockOptin, dev);
+  if (err != cudaSuccess) return err;
+
+  const int group_blocks = group_size / 16;  // == 2
+  const int num_groups = K / group_size;
+  const int lda = K;
+  const int stages = kStages;
+
+  const int4* A_ptr = reinterpret_cast<const int4*>(act_bf16);
+  const int4* B_ptr = reinterpret_cast<const int4*>(qweight_packed);
+  int4* C_ptr = reinterpret_cast<int4*>(out_bf16);
+  int* locks = workspace;
+
+  // Permute the logical [num_groups, N] uint8 e8m0 scales into the kernel's
+  // fragment layout (64-wide transpose + 4-lane [0,2,1,3] reorder).
+  const int total_scales = num_groups * N;
+  uint8_t* s_perm = nullptr;
+  err = cudaMallocAsync(&s_perm, (size_t)total_scales * sizeof(uint8_t), stream);
+  if (err != cudaSuccess) return err;
+  {
+    int threads_p = 256;
+    int blocks_p = div_ceil(total_scales, threads_p);
+    e8m0_scale_permute_kernel<<<blocks_p, threads_p, 0, stream>>>(
+        reinterpret_cast<const uint8_t*>(scales_e8m0), s_perm, total_scales);
+    err = cudaGetLastError();
+    if (err != cudaSuccess) {
+      cudaFreeAsync(s_perm, stream);
+      return err;
+    }
+  }
+  const int4* s_ptr = reinterpret_cast<const int4*>(s_perm);
+
+  int local_max_par = 16;
+  if (N <= 4096) local_max_par = 16 * 8;
+  int rest_m = M;
+  int max_thread_m_blocks = 4;
+
+  while (rest_m) {
+    int par_count = rest_m / (max_thread_m_blocks * 16);
+    if (par_count > local_max_par) par_count = local_max_par;
+    int prob_m_split =
+        par_count > 0 ? (par_count * (max_thread_m_blocks * 16)) : rest_m;
+
+    int thread_m_blocks =
+        std::min(div_ceil(prob_m_split, 16), max_thread_m_blocks);
+    bool m_block_size_8 = prob_m_split <= 8;
+
+    PickResult pick = choose_config<kAmx, kBmx, kCmx, kSmx, kNumBitsMx>(
+        prob_m_split, N, K, thread_m_blocks, m_block_size_8, group_size,
+        group_blocks, stages, max_shared_mem);
+
+    if (!pick.kernel) {
+      if (max_thread_m_blocks > 1) {
+        max_thread_m_blocks--;
+        continue;
+      }
+      cudaFreeAsync(s_perm, stream);
+      return cudaErrorInvalidConfiguration;
+    }
+
+    int num_threads = pick.cfg.num_threads;
+    int blocks = sms;
+
+    err = cudaFuncSetAttribute(pick.kernel,
+                               cudaFuncAttributeMaxDynamicSharedMemorySize,
+                               max_shared_mem);
+    if (err != cudaSuccess) {
+      cudaFreeAsync(s_perm, stream);
+      return err;
+    }
+
+    pick.kernel<<<blocks, num_threads, max_shared_mem, stream>>>(
+        A_ptr, B_ptr, C_ptr, /*C_tmp=*/nullptr, /*b_bias_ptr=*/nullptr,
+        /*a_scales_ptr=*/nullptr, s_ptr, /*global_scale_ptr=*/nullptr,
+        /*zp_ptr=*/nullptr, /*g_idx=*/nullptr, num_groups, prob_m_split, N, K,
+        lda, locks, /*has_bias=*/false, /*use_atomic_add=*/false,
+        /*use_fp32_reduce=*/false, max_shared_mem);
+
+    err = cudaGetLastError();
+    if (err != cudaSuccess) {
+      cudaFreeAsync(s_perm, stream);
+      return err;
+    }
+
+    A_ptr += prob_m_split * (lda / 8);
+    C_ptr += prob_m_split * (N / 8);
+    rest_m -= prob_m_split;
+  }
+  cudaFreeAsync(s_perm, stream);
+  return cudaSuccess;
+}
+
 }  // namespace
 
 // ---------------------------------------------------------------------------
@@ -401,6 +567,18 @@ cudaError_t w8a16_fp8_bf16_gemm(cudaStream_t stream, const void* act_bf16,
   return launch_gemm<kA8, kB8, kC8, kS8t, kNumBits8>(
       stream, act_bf16, qweight_fp8, scales_bf16, out_bf16, M, N, K, group_size,
       workspace, sms, kFp8BiasMul);
+}
+
+int w4a16_mxfp4_workspace_ints(int N, int max_M) {
+  return w4a16_workspace_ints(N, max_M);
+}
+
+cudaError_t w4a16_mxfp4_bf16_gemm(cudaStream_t stream, const void* act_bf16,
+                                  const void* qweight_mxfp4,
+                                  const void* scales_e8m0, void* out_bf16, int M,
+                                  int N, int K, int* workspace, int sms) {
+  return launch_mxfp4_gemm(stream, act_bf16, qweight_mxfp4, scales_e8m0,
+                           out_bf16, M, N, K, workspace, sms);
 }
 
 }  // namespace pie_cuda_device::qgemm

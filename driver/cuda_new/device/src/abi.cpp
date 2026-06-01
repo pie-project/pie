@@ -688,7 +688,8 @@ PieStatus pie_cuda_deepseek_forward_bf16(
 }
 
 PieStatus pie_cuda_gemma_forward_bf16(
-    PieDevCtx* ctx, const int32_t* token_ids, const PieGemmaWeights* w, const int32_t* positions,
+    PieDevCtx* ctx, PieWorkspace* ws, const int32_t* token_ids, const PieGemmaWeights* w,
+    const int32_t* positions,
     void* k_pages, void* v_pages, const uint32_t* qo_indptr_d, const uint32_t* kv_page_indices_d,
     const uint32_t* kv_page_indptr_d, const uint32_t* kv_last_page_lens_d, void* out_logits,
     int32_t* out_token_ids, int32_t num_tokens, int32_t num_requests, int32_t hidden_size,
@@ -696,7 +697,7 @@ PieStatus pie_cuda_gemma_forward_bf16(
     int32_t page_size, int32_t num_pages, const int32_t* window_left_host, int32_t window_left_all,
     float attn_logit_softcap, float final_logit_softcap, float embed_scale, float rms_eps,
     float rope_theta, int32_t qk_norm, int32_t altup_num_inputs) {
-    if (ctx == nullptr || token_ids == nullptr || w == nullptr || positions == nullptr ||
+    if (ctx == nullptr || ws == nullptr || token_ids == nullptr || w == nullptr || positions == nullptr ||
         k_pages == nullptr || v_pages == nullptr || qo_indptr_d == nullptr ||
         kv_page_indices_d == nullptr || kv_page_indptr_d == nullptr ||
         kv_last_page_lens_d == nullptr || out_logits == nullptr || out_token_ids == nullptr ||
@@ -719,7 +720,7 @@ PieStatus pie_cuda_gemma_forward_bf16(
         num_pages, window_left_host, window_left_all, attn_logit_softcap, final_logit_softcap,
         embed_scale, rms_eps, rope_theta, qk_norm, altup_num_inputs};
     cudaError_t e = pie_cuda_device::forward::gemma_forward_bf16(
-        ctx->cublas, ctx->stream, token_ids, fw, positions, k_pages, v_pages, qo_indptr_d,
+        ctx->cublas, ctx->stream, ws, token_ids, fw, positions, k_pages, v_pages, qo_indptr_d,
         kv_page_indices_d, kv_page_indptr_d, kv_last_page_lens_d, out_logits, out_token_ids,
         num_tokens, num_requests, dims);
     if (e != cudaSuccess) return cuda_fail("pie_cuda_gemma_forward_bf16", e);

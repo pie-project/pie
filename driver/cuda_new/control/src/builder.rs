@@ -68,6 +68,7 @@ enum Backend<'a> {
         w: LoadedGemma<'a>,
         kv_k: DeviceBuffer<'a>,
         kv_v: DeviceBuffer<'a>,
+        ws: Workspace<'a>,
     },
 }
 
@@ -86,15 +87,46 @@ pub struct Model<'a> {
     swap: std::cell::RefCell<SwapPool>,
 }
 
+/// Recursively drop JSON object keys whose value is `null` so serde field
+/// defaults apply (a present `null` fails a non-Option field; `#[serde(default)]`
+/// only covers ABSENT keys). Recurses into nested objects/arrays (e.g. the
+/// multimodal `text_config`).
+fn strip_json_nulls(v: &mut serde_json::Value) {
+    match v {
+        serde_json::Value::Object(map) => {
+            map.retain(|_, val| !val.is_null());
+            for val in map.values_mut() {
+                strip_json_nulls(val);
+            }
+        }
+        serde_json::Value::Array(arr) => {
+            for val in arr.iter_mut() {
+                strip_json_nulls(val);
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Build a ready model from a directory holding `config.json` and
 /// `model.safetensors`.
 pub fn build<'a>(dev: &'a Device, model_dir: &Path, cfg: &BootConfig) -> Result<Model<'a>> {
     // 1. config.json → HfConfig → arch → spec  (no is_*_arch cascade)
     let cfg_path = model_dir.join("config.json");
-    let hf: arch::HfConfig = serde_json::from_reader(
+    // Read to a Value first and strip null-valued keys: HF configs (esp.
+    // multimodal ones like gemma-4-E4B) ship explicit `null`s (e.g.
+    // `num_experts: null`), and serde's `#[serde(default)]` only covers ABSENT
+    // keys — a present `null` errors against a non-Option field. Stripping
+    // nulls turns them into "absent" → the field default.
+    let mut raw: serde_json::Value = serde_json::from_reader(
         std::fs::File::open(&cfg_path).with_context(|| format!("opening {cfg_path:?}"))?,
     )
-    .context("parsing config.json")?;
+    .context("reading config.json")?;
+    strip_json_nulls(&mut raw);
+    let hf: arch::HfConfig =
+        serde_json::from_value(raw).context("parsing config.json")?;
+    // Multimodal checkpoints (gemma-4-E4B) nest the LM dims under `text_config`.
+    let hf = hf.resolve_multimodal();
     let archi = arch::detect(&hf)?;
     let spec = archi.spec(&hf)?;
     let (nkv, hd) = (spec.num_kv_heads, spec.head_dim);
@@ -293,7 +325,15 @@ fn build_backend<'a>(
             let kv_elems = spec.num_layers * num_pages * page_size * nkv * hd;
             let kv_k = dev.alloc(kv_elems * 2)?;
             let kv_v = dev.alloc(kv_elems * 2)?;
-            Ok(Backend::Gemma { w, kv_k, kv_v })
+            // Persistent activation + attn-plan scratch (no per-fire cudaMalloc;
+            // also the CUDA-graph prerequisite). Sized to the full KV token
+            // capacity like the llama arm.
+            let ws_max_tokens = (num_pages * page_size) as i32;
+            let ws = dev.workspace(
+                ws_max_tokens, spec.hidden_size as i32, spec.num_heads as i32, nkv as i32,
+                hd as i32, spec.intermediate_size as i32, spec.vocab_size as i32,
+            )?;
+            Ok(Backend::Gemma { w, kv_k, kv_v, ws })
         }
         other => Err(anyhow!(
             "builder: arch {other:?} detected but its forward/cache is not yet wired in the \
@@ -444,8 +484,8 @@ impl Model<'_> {
                 dev, tib, pb, kv_k, kv_v, qib, kpi, kpp, klp, out_logits, out_tokens,
                 num_tokens, num_requests, ps, num_pages,
             ),
-            Backend::Gemma { w, kv_k, kv_v } => w.forward(
-                dev, tib, pb, kv_k, kv_v, qib, kpi, kpp, klp, out_logits, out_tokens,
+            Backend::Gemma { w, kv_k, kv_v, ws } => w.forward(
+                dev, ws, tib, pb, kv_k, kv_v, qib, kpi, kpp, klp, out_logits, out_tokens,
                 num_tokens, num_requests, ps, num_pages,
             ),
         }

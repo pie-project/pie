@@ -70,7 +70,11 @@ typedef enum PieStatus {
 //   v27: + fp8 (fe4m3fn) fused quant GEMM (qgemm fan-out over the int4 template).
 //   v28: + per-head q/k-norm in the llama layer (Qwen3); q_norm/k_norm weights.
 //   v29: + additive q/k/v projection biases in the llama layer (Qwen2).
-#define PIE_CUDA_DEVICE_ABI_VERSION 31u
+//   v32: + FlashInfer tensor-core paged attention (plan/dispatch in the llama &
+//        gemma forwards via attn_runtime); gemma_forward now takes a PieWorkspace
+//        (persistent scratch, no per-fire cudaMalloc — also the CUDA-graph
+//        prerequisite). llama_forward plans internally (no signature change).
+#define PIE_CUDA_DEVICE_ABI_VERSION 32u
 uint32_t pie_cuda_abi_version(void);
 
 // Last error string for the calling thread (valid until the next ABI
@@ -696,7 +700,8 @@ typedef struct PieGemmaWeights {
 // array (per-layer left window; <0 = full); null → use `window_left_all`. Soft-
 // caps <=0 disable. qk_norm must be 0 and altup_num_inputs 1 (both deferred).
 PieStatus pie_cuda_gemma_forward_bf16(
-    PieDevCtx* ctx, const int32_t* token_ids, const PieGemmaWeights* w, const int32_t* positions,
+    PieDevCtx* ctx, PieWorkspace* ws, const int32_t* token_ids, const PieGemmaWeights* w,
+    const int32_t* positions,
     void* k_pages, void* v_pages, const uint32_t* qo_indptr_d, const uint32_t* kv_page_indices_d,
     const uint32_t* kv_page_indptr_d, const uint32_t* kv_last_page_lens_d, void* out_logits,
     int32_t* out_token_ids, int32_t num_tokens, int32_t num_requests, int32_t hidden_size,

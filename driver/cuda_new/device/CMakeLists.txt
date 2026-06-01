@@ -13,6 +13,39 @@ set(CMAKE_CUDA_STANDARD 20)
 
 find_package(CUDAToolkit REQUIRED)
 
+# ── FlashInfer (header-only consume) ────────────────────────────────────────
+# The perf attention path (`src/ops/attention_paged.cu`) instantiates
+# FlashInfer's BatchPrefill/BatchDecode paged-KV templates. We only need the
+# header tree + 3rdparty/cutlass + spdlog headers — NOT flashinfer's csrc TUs
+# or its Python codegen (those are the MoE-cutlass / Hopper-FA3 paths we don't
+# lift here). Mirrors driver/cuda's CPM fetch (same v0.6.9 pin).
+include(cmake/CPM.cmake)
+if(DEFINED ENV{CPM_SOURCE_CACHE} AND NOT CPM_SOURCE_CACHE)
+  set(CPM_SOURCE_CACHE $ENV{CPM_SOURCE_CACHE})
+endif()
+# Allow an explicit pre-fetched source dir (set by build.rs via -D, or env) to
+# skip the network clone entirely; otherwise CPM fetches v0.6.9.
+if(NOT PIE_FLASHINFER_SOURCE_DIR AND DEFINED ENV{PIE_FLASHINFER_SOURCE_DIR})
+  set(PIE_FLASHINFER_SOURCE_DIR "$ENV{PIE_FLASHINFER_SOURCE_DIR}")
+endif()
+if(PIE_FLASHINFER_SOURCE_DIR AND EXISTS "${PIE_FLASHINFER_SOURCE_DIR}")
+  set(flashinfer_SOURCE_DIR "${PIE_FLASHINFER_SOURCE_DIR}")
+  message(STATUS "Using pre-fetched FlashInfer at ${flashinfer_SOURCE_DIR}")
+else()
+  cpmaddpackage(
+    NAME flashinfer
+    GITHUB_REPOSITORY flashinfer-ai/flashinfer
+    GIT_TAG v0.6.9
+    GIT_SHALLOW TRUE
+    DOWNLOAD_ONLY YES)
+endif()
+set(PIE_FLASHINFER_INCLUDE_DIRS
+  ${flashinfer_SOURCE_DIR}/include
+  ${flashinfer_SOURCE_DIR}/csrc
+  ${flashinfer_SOURCE_DIR}/3rdparty/cutlass/include
+  ${flashinfer_SOURCE_DIR}/3rdparty/cutlass/tools/util/include
+  ${flashinfer_SOURCE_DIR}/3rdparty/spdlog/include)
+
 if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
   # Frontier-only: default to SM 9.0 (Hopper/H100). `native` was unreliable
   # here — CMake's GPU probe fell back to 75 on this toolchain, which strips the
@@ -52,12 +85,16 @@ add_library(pie_cuda_device STATIC
   src/ops/gemm.cpp
   src/ops/grouped_gemm.cu
   src/ops/attention_naive_paged.cu
+  # --- fast paged attention (tensor-core; plan/dispatch scheduler; perf path) + its plan workspace ---
+  src/ops/attention_workspace.cpp
+  src/ops/attention_paged.cu
   # --- internalized de-branded fused quant GEMM (int4/u4b8 slice) ---
   src/qgemm/qgemm.cu
   src/qgemm/qgemm_kernel_inst.cu
   src/qgemm/qgemm_repack.cu
   src/ops/mla_paged.cu
   src/kernels/mla_write.cu
+  src/forward/attn_runtime.cu
   src/forward/llama_layer.cu
   src/forward/llama_forward.cu
   src/forward/moe_mlp.cu
@@ -77,5 +114,8 @@ target_include_directories(pie_cuda_device PUBLIC include)
 # src/ is on the private include path so cross-TU quoted includes (e.g. abi.cpp
 # pulling qgemm/qgemm.h, and the qgemm TUs' sibling headers) resolve uniformly.
 target_include_directories(pie_cuda_device PRIVATE src)
+# FlashInfer template headers (attention_paged.cu only). Kept PRIVATE so the
+# ABI seam doesn't leak the upstream templates into downstream consumers.
+target_include_directories(pie_cuda_device PRIVATE ${PIE_FLASHINFER_INCLUDE_DIRS})
 target_link_libraries(pie_cuda_device PUBLIC CUDA::cudart CUDA::cublas)
 set_target_properties(pie_cuda_device PROPERTIES POSITION_INDEPENDENT_CODE ON)

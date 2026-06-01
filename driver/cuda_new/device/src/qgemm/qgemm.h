@@ -154,4 +154,74 @@ cudaError_t w8a16_fp8_repack(cudaStream_t stream,
                              int32_t*       qweight_out,
                              int N, int K);
 
+// ---------------------------------------------------------------------------
+// w4a16 mxfp4 (bf16 activations x fe2m1f 4-bit weights, e8m0 block scales)
+// ---------------------------------------------------------------------------
+//
+// out[M, N] = act[M, K] @ dequant(qweight_mxfp4_packed)^T
+//
+// GPT-OSS microscaling format: the weight is 4-bit fe2m1f (E2M1, sign + 2 exp +
+// 1 mantissa), packed two nibbles per byte; each contiguous block of
+// MXFP4_BLOCK_SIZE (== 32) weights along K shares a single 1-byte e8m0 (E8M0)
+// power-of-two block scale (the stored byte E decodes to the multiplier
+// 2^(E - 127)). Because group_size == 32 == 2 * tile_size, the kernel runs with
+// group_blocks == 2.
+//
+// Both the fe2m1f weight decode and the e8m0 scale decode are self-correcting
+// in-register (the fe2m1f nibble is splatted to bf16 then re-biased by 2^126;
+// the e8m0 byte is placed directly into the bf16 exponent field), so — unlike
+// the fp8 path — there is NO host-side exponent-bias fold; the scale permute
+// uses bias_mul == 1.
+//
+// Layout / alignment contract:
+//   * act_bf16       : [M, K] row-major bf16 (nv_bfloat16), 16-byte aligned;
+//                      K a multiple of 8.
+//   * qweight_mxfp4  : prepacked fe2m1f weights produced by mxfp4_repack().
+//                      NOT the raw checkpoint layout — call the repack first.
+//                      (The repack is bit-identical to w4a16_repack: 4-bit
+//                      nibble interleave. fe2m1f and u4b8 differ only in how the
+//                      nibble is *decoded*, which is a kernel-side concern.)
+//   * scales_e8m0    : [num_groups, N] row-major uint8 e8m0 block scales, where
+//                          num_groups = K / MXFP4_BLOCK_SIZE.
+//                      The launcher permutes these into the kernel's MMA
+//                      fragment layout internally (Marlin 64-wide transpose +
+//                      the mxfp4 four-lane [0,2,1,3] byte reorder).
+//   * out_bf16       : [M, N] row-major bf16.
+//   * workspace      : device int32 scratch >= w4a16_mxfp4_workspace_ints();
+//                      MUST be zeroed before each call.
+//   * sms            : SMs to launch across; pass 0 to auto-detect.
+//
+// Alignment constraints (validated): K % 16 == 0, N % 16 == 0, N % 64 == 0,
+// K % 64 == 0, and K % MXFP4_BLOCK_SIZE == 0.
+static constexpr int MXFP4_BLOCK_SIZE = 32;
+
+cudaError_t w4a16_mxfp4_bf16_gemm(cudaStream_t stream,
+                                  const void*    act_bf16,
+                                  const void*    qweight_mxfp4,
+                                  const void*    scales_e8m0,
+                                  void*          out_bf16,
+                                  int M, int N, int K,
+                                  int* workspace,
+                                  int  sms /* 0 = auto */);
+
+// Required device workspace size, in int32 elements, for the mxfp4 GEMM. Same
+// fixed, generous bound as the other qgemm paths (one reduction lock per
+// concurrently scheduled threadblock; capped at the SM count).
+int w4a16_mxfp4_workspace_ints(int N, int max_M);
+
+// Repack plain GPTQ-style packed fe2m1f 4-bit weights into the prepacked
+// tile/interleave layout the GEMM kernel expects. Bit-identical to w4a16_repack
+// (the nibble interleave does not depend on the nibble's numeric meaning); a
+// named entry is provided so callers/ABI are explicit about the format.
+//
+//   qweight_rowmajor_packed : [K/8, N] int32, 8 fe2m1f nibbles per int32 along
+//                             K; nibble j of int32 at (kp, n) holds the fe2m1f
+//                             weight for k = kp*8 + j, column n.
+//   qweight_out             : [K/16, N*16/8] int32 prepacked output.
+//   N, K                    : Requires K % 16 == 0 and N % 64 == 0.
+cudaError_t mxfp4_repack(cudaStream_t stream,
+                         const int32_t* qweight_rowmajor_packed,
+                         int32_t*       qweight_out,
+                         int N, int K);
+
 }  // namespace pie_cuda_device::qgemm

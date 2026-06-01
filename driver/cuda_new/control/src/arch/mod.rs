@@ -224,9 +224,36 @@ pub struct HfConfig {
     /// Nemotron-H per-layer schedule, e.g. "M-M-*-M-…" (`M`=Mamba, `*`=attention,
     /// `-`=MLP/MoE). Empty for non-hybrid archs.
     pub hybrid_override_pattern: String,
+
+    /// Multimodal checkpoints (e.g. gemma-4-E4B) nest the LM's transformer dims
+    /// under `text_config`; the top level only carries `model_type` + the
+    /// vision/audio sub-configs. `resolve_multimodal()` lifts these up.
+    pub text_config: Option<Box<HfConfig>>,
 }
 
 impl HfConfig {
+    /// For multimodal checkpoints whose transformer dims live under
+    /// `text_config` (the top level having `num_hidden_layers == 0`), lift the
+    /// nested text config up — but keep the TOP-LEVEL `model_type` (e.g.
+    /// "gemma4", not the nested "gemma4_text") so the registry key matches.
+    /// A no-op for plain single-tower configs.
+    pub fn resolve_multimodal(self) -> HfConfig {
+        if self.num_hidden_layers == 0 {
+            if let Some(tc) = self.text_config.clone() {
+                let mut inner = *tc;
+                if !self.model_type.is_empty() {
+                    inner.model_type = self.model_type.clone();
+                }
+                if self.architectures.len() >= inner.architectures.len() {
+                    inner.architectures = self.architectures.clone();
+                }
+                inner.text_config = None;
+                return inner;
+            }
+        }
+        self
+    }
+
     /// `head_dim` if the config sets it, else `hidden_size /
     /// num_attention_heads` (matching driver/cuda's loader default).
     pub fn resolved_head_dim(&self) -> usize {
@@ -708,7 +735,9 @@ pub fn detect(cfg: &HfConfig) -> Result<Box<dyn Arch>> {
         "gpt_oss" | "gptoss" => Ok(Box::new(GptOssArch)),
 
         // ── Gemma-3/4 (sandwich norms, soft-cap, AltUp, sliding pattern) ──
-        "gemma3" | "gemma3_text" | "gemma4" => Ok(Box::new(Gemma4Arch { id: PieArchId::Gemma4 })),
+        "gemma3" | "gemma3_text" | "gemma4" | "gemma4_text" => {
+            Ok(Box::new(Gemma4Arch { id: PieArchId::Gemma4 }))
+        }
         "gemma3n" => Ok(Box::new(Gemma4Arch { id: PieArchId::Gemma3n })),
 
         // ── Nemotron-H (hybrid Mamba/attention/MLP) ──

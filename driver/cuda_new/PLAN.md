@@ -102,8 +102,51 @@ their forwards from a real executor loop, then cut over. ★ = critical path.
 - [ ] B6. `tp.rs` rank-0 broadcast loop (multi-GPU).
 
 **C. Hot path & perf parity**
-- [ ] C1. flashinfer fast attention + prepare/body two-phase split across the ABI.
-- [ ] C2. CUDA-graph capture (`graph_capture`/`graph_launch`) for decode.
+- [~] C1. **Fast tensor-core paged attention WIRED (llama path).** De-branded lift
+  of driver/cuda's flashinfer wrapper → `ops/attention_paged.{cu,hpp}` (raw-ptr
+  bf16; plan/dispatch split; prefill + decode kernels; SM90-FA3 + KvCacheLayerView
+  dropped). `forward/attn_runtime.{cu,cuh}` is the glue: lazy plan-scratch alloc,
+  a tiny D2H of the index arrays (so **zero Rust signature churn**), decode-vs-
+  prefill gate (GQA∈{1,2,3,4,8} + head_dim∈{64,128,256,512}, else prefill kernel,
+  else naive fallback). Llama forward plans once/fire + dispatches per layer.
+  Device lib + 110 control tests green (argmax-stable parity holds). FlashInfer
+  consumed header-only via CPM v0.6.9 (cached tree, no codegen/csrc).
+  **PERF A/B MEASURED (Qwen2-0.5B, H100, same-session, vs old driver/cuda):**
+  tput 13%→**40%** of old (naive 3244 → fi 10048 → old 25397 tok/s; **3.1×** over
+  naive); latency 33%→**61%** of old (naive 194 → fi 360 → old 594 tok/s; **1.85×**
+  over naive). Remaining gap (2.53× tput / 1.65× lat) is dominated by per-token
+  kernel-launch overhead (~300 un-graphed launches/token on this 24-layer toy) →
+  that's the C2 (CUDA-graph) target. REMAINING: fan out to gemma/moe forwards;
+  prepare/body ABI split (needed for C2).
+  **GEMMA-4 IS THE PERF TARGET (user pivot).** gemma-4-E4B now loads+runs through
+  cuda_native (3 multimodal-loader fixes: prefix, nested text_config, strip-nulls;
+  simplified forward = `<pad>` garbage but real gemma-4 shape, perf-valid). Gemma
+  forward wired to flashinfer + moved to persistent PieWorkspace (killed 12
+  per-fire cudaMalloc). **A/B (gemma-4-E4B, H100, vs old driver/cuda — which also
+  serves gemma-4):** LATENCY old 124 / **fi 109** tok/s = **88% of old (1.13× gap,
+  near parity!)**; TPUT old 10485 / **fi 2756** tok/s = 26% of old (3.8× gap). So
+  the per-token attention path is competitive; the gap is now BATCHED THROUGHPUT.
+- [x] C2a. **Per-fire D2H killed (decode hot path).** `attn_runtime::plan_attention_for_fire`
+  no longer does a synchronous `cudaMemcpy` D2H of the index arrays for decode
+  (R<=512): the static-nonsplit decode schedule is R-only and the raw-bf16
+  dispatch never reads `num_pages_in_batch`, so a zeroed host array suffices —
+  no per-fire stream stall. Prefill (one-shot) keeps the D2H.
+- [~] C2b. **CUDA-graph capture — DESIGNED, thin-C++/fat-Rust (not started in code).**
+  IMPORTANT ARCHITECTURE NOTE: a first attempt put the graph cache + persistent
+  input buffers + capture/replay decision INSIDE C++ (decode_graph.cu, ws fields)
+  — that rebuilt the C++ monolith and was REVERTED. The correct split:
+    • C++ stays THIN — only mechanics: `prepare` (plan→attn_ws; = plan_attention_
+      for_fire), a `body` entry (embed→layers→lm_head→argmax, NO plan / NO sync,
+      reads caller pointers + reconstructs the lightweight AttnPlan from ws), and
+      `graph_begin`/`graph_end(&exec)`/`graph_launch(exec)`/`graph_destroy` (pure
+      cudaStreamBeginCapture/EndCapture/Instantiate/Launch). The `pie_prepare`/
+      `pie_body`/`pie_graph_capture`/`pie_graph_launch` ABI STUBS already exist.
+    • RUST owns ALL control (executor.rs already has graph_request_bucket): the
+      persistent pointer-stable input DeviceBuffers (refilled per fire), the
+      HashMap<(R,N)→PieGraphExec> cache, and the per-fire decision (refill →
+      prepare → cache-hit?launch:capture → sample → one sync).
+  Gated on the decode-kernel path (GQA∈{1,2,3,4,8} ⇒ static R-only schedule ⇒
+  graph-safe; gemma-4 GQA=4 qualifies). Targets the gemma-4 TPUT gap (26%→).
 - [ ] C3. `qgemm` M≤8 grouped path fix + dispatch perf tuning.
 - [ ] C4. Fused grouped-MoE GEMM (replace per-group cuBLAS loop).
 - [ ] C5. MoE block stream-async (drop per-layer sync).

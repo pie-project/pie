@@ -550,7 +550,8 @@ impl Device {
     /// → final soft-cap → argmax. (qk-norm/AltUp deferred: qk_norm=0, altup=1.)
     #[allow(clippy::too_many_arguments)]
     pub fn gemma_forward_bf16(
-        &self, token_ids: &DeviceBuffer, embed: &DeviceBuffer, layers: &[GemmaLayerWeights],
+        &self, ws: &Workspace, token_ids: &DeviceBuffer, embed: &DeviceBuffer,
+        layers: &[GemmaLayerWeights],
         final_norm: &DeviceBuffer, lm_head: &DeviceBuffer, positions: &DeviceBuffer,
         k_pages: &DeviceBuffer, v_pages: &DeviceBuffer, qo_indptr: &DeviceBuffer,
         kv_page_indices: &DeviceBuffer, kv_page_indptr: &DeviceBuffer,
@@ -577,7 +578,8 @@ impl Device {
         check(
             unsafe {
                 ffi::pie_cuda_gemma_forward_bf16(
-                    self.0, token_ids.ptr as *const i32, &bundle, positions.ptr as *const i32,
+                    self.0, ws.ptr, token_ids.ptr as *const i32, &bundle,
+                    positions.ptr as *const i32,
                     k_pages.ptr, v_pages.ptr, qo_indptr.ptr as *const u32,
                     kv_page_indices.ptr as *const u32, kv_page_indptr.ptr as *const u32,
                     kv_last_page_lens.ptr as *const u32, out_logits.ptr,
@@ -3371,12 +3373,14 @@ mod tests {
             rms_eps: 1e-6, rope_theta: 10000.0, qk_norm: 0, altup_num_inputs: 1,
         };
 
+        let ws = dev.workspace(t as i32, h as i32, nq as i32, nkv as i32, hd as i32,
+                               inter as i32, vocab as i32).unwrap();
         let run = || -> (Vec<u16>, Vec<i32>) {
             let kv_k = up(&dev, &vec![0u16; n_layers * num_pages * page_size * hkv]);
             let kv_v = up(&dev, &vec![0u16; n_layers * num_pages * page_size * hkv]);
             let logits = dev.alloc(t * vocab * 2).unwrap();
             let toks = dev.alloc(t * 4).unwrap();
-            dev.gemma_forward_bf16(&token_ids, &embed, &layers, &final_norm, &lm_head, &positions,
+            dev.gemma_forward_bf16(&ws, &token_ids, &embed, &layers, &final_norm, &lm_head, &positions,
                 &kv_k, &kv_v, &qo_indptr, &kv_page_indices, &kv_page_indptr, &kv_last_page_lens,
                 &logits, &toks, t as i32, 1, &dims).unwrap();
             dev.sync().unwrap();

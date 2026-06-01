@@ -131,6 +131,8 @@
 
 #include "gemma_layer.cuh"  // GemmaLayerWeights, decoder_layer_gemma_inplace, LayerScratch
 
+struct PieWorkspace;  // workspace.hpp — persistent activation scratch + attn plan
+
 namespace pie_cuda_device::forward {
 
 // Whole-model Gemma weights. `layers` is a host array of `dims.n_layers`
@@ -195,7 +197,7 @@ struct GemmaForwardDims {
 // cudaErrorInvalidValue if a DEFERRED feature is requested (qk_norm != 0 or
 // altup_num_inputs != 1).
 cudaError_t gemma_forward_bf16(
-    cublasHandle_t cublas, cudaStream_t stream,
+    cublasHandle_t cublas, cudaStream_t stream, PieWorkspace* ws,
     const std::int32_t* token_ids, const GemmaForwardWeights& w,
     const std::int32_t* positions,
     void* k_pages, void* v_pages,

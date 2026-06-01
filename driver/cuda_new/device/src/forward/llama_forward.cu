@@ -5,6 +5,7 @@
 #include "../kernels/rmsnorm.cuh"
 #include "../ops/gemm.cuh"
 #include "../workspace.hpp"
+#include "attn_runtime.cuh"
 
 namespace pie_cuda_device::forward {
 
@@ -26,6 +27,14 @@ cudaError_t llama_forward_bf16(
     // embed: token_ids → residual stream.
     kernels::embed_bf16(token_ids, w.embed, ws->hidden_buf, T, H, vocab, stream);
 
+    // Plan the fast paged attention ONCE for this fire (reused across all
+    // layers). Falls back to naive inside run_attention_layer for head dims the
+    // tensor-core templates don't instantiate. Llama/Qwen are full causal
+    // attention (window_left=-1, no softcap, default 1/sqrt(d) scale).
+    const AttnPlan attn = plan_attention_for_fire(
+        ws, qo_indptr, kv_page_indptr, T, num_requests,
+        n_q_heads, n_kv_heads, head_dim, page_size, stream);
+
     // N decoder layers, reusing the workspace scratch.
     const LayerScratch s{ws->normed, ws->q, ws->k, ws->v, ws->attn,
                          ws->o, ws->gate, ws->up, ws->mlp, ws->mlp_out};
@@ -36,7 +45,7 @@ cudaError_t llama_forward_bf16(
         decoder_layer_inplace(cublas, stream, ws->hidden_buf, w.layers[L], positions, kL, vL,
                               qo_indptr, kv_page_indices, kv_page_indptr, kv_last_page_lens, s,
                               T, num_requests, H, n_q_heads, n_kv_heads, head_dim, intermediate,
-                              page_size, rms_eps, rope_theta);
+                              page_size, rms_eps, rope_theta, attn);
     }
 
     // final norm → lm_head → greedy argmax.

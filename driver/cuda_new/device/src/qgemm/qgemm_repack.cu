@@ -258,6 +258,14 @@ cudaError_t w4a16_repack(cudaStream_t stream,
   return cudaGetLastError();
 }
 
+cudaError_t mxfp4_repack(cudaStream_t stream,
+                         const int32_t* qweight_rowmajor_packed,
+                         int32_t* qweight_out, int N, int K) {
+  // fe2m1f (mxfp4) weights are 4-bit; the nibble interleave is independent of
+  // the nibble's numeric meaning, so this is bit-identical to w4a16_repack.
+  return w4a16_repack(stream, qweight_rowmajor_packed, qweight_out, N, K);
+}
+
 cudaError_t w8a16_fp8_repack(cudaStream_t stream,
                              const int32_t* qweight_rowmajor_packed,
                              int32_t* qweight_out, int N, int K) {

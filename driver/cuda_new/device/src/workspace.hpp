@@ -5,6 +5,9 @@
 // concrete here so abi.cpp (alloc/free) and forward/ (reads) can use it.
 #pragma once
 
+#include "ops/attention_paged.hpp"      // plan caches (opaque) + workspace
+#include "ops/attention_workspace.hpp"
+
 namespace pie_cuda_device {}
 
 // Sized from PieWorkspaceDims at pie_ws_alloc time. All buffers are bf16,
@@ -30,4 +33,17 @@ struct PieWorkspace {
     void* up = nullptr;          // [max_tokens, intermediate]
     void* mlp = nullptr;         // [max_tokens, intermediate]
     void* mlp_out = nullptr;     // [max_tokens, hidden]
+
+    // FlashInfer-backed attention: the persistent plan scratch (device float/
+    // int + pinned host int) and the per-fire plan caches, reused across all
+    // layers. Allocated lazily on first forward that needs the fast path (the
+    // ws geometry alone doesn't say which attention kernel an arch uses). The
+    // AttentionWorkspace destructor + unique_ptr free on `delete ws`.
+    // FlashInfer plan scratch + per-fire plan caches (device-side scratch,
+    // legitimately in the workspace). Persistent INPUT buffers + the graph
+    // cache live in the RUST control plane (executor.rs) — C++ stays thin.
+    bool attn_ready = false;
+    pie_cuda_device::ops::AttentionWorkspace attn_ws;
+    pie_cuda_device::ops::PrefillPlanCachePtr prefill_plan;
+    pie_cuda_device::ops::DecodePlanCachePtr decode_plan;
 };

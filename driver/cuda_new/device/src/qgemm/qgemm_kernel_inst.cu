@@ -89,4 +89,33 @@ QGEMM_INST_FP8_ALL_GB(8)   // group_size == 128
 #undef QGEMM_INST_FP8_ALL_GB
 #undef QGEMM_INST_FP8
 
+// mxfp4 (fe2m1f / GPT-OSS) weight path: bf16 activations x fe2m1f 4-bit weights
+// -> bf16 output, with 1-byte e8m0 microscaling block scales at group_size 32.
+// group_size == 32 == 2 * tile_size, so group_blocks is fixed at 2 (the mxfp4
+// path never uses per-channel or group_size 128). The weight is 4-bit, so the
+// (threads, m/n/k_blocks, m_block_size_8) tuples coincide with the u4b8 set;
+// only the B scalar (kFE2M1f) and S scalar (kFE8M0fnu) change.
+#define QGEMM_INST_MXFP4(THREADS, TM, TN, TK, M8)                              \
+  template __global__ void                                                     \
+  QGemm<kBFloat16.id(), kFE2M1f.id(), kBFloat16.id(), kFE8M0fnu.id(),          \
+        THREADS, TM, TN, TK, M8, 4, 2, false>(QGEMM_KERNEL_PARAMS);
+
+QGEMM_INST_MXFP4(256, 1, 8, 8, true)
+QGEMM_INST_MXFP4(128, 1, 8, 4, true)
+QGEMM_INST_MXFP4(128, 1, 4, 8, true)
+QGEMM_INST_MXFP4(256, 1, 8, 8, false)
+QGEMM_INST_MXFP4(128, 1, 8, 4, false)
+QGEMM_INST_MXFP4(128, 1, 4, 8, false)
+QGEMM_INST_MXFP4(256, 2, 16, 4, false)
+QGEMM_INST_MXFP4(128, 2, 8, 4, false)
+QGEMM_INST_MXFP4(128, 2, 4, 8, false)
+QGEMM_INST_MXFP4(256, 3, 16, 4, false)
+QGEMM_INST_MXFP4(128, 3, 8, 4, false)
+QGEMM_INST_MXFP4(128, 3, 4, 8, false)
+QGEMM_INST_MXFP4(256, 4, 16, 4, false)
+QGEMM_INST_MXFP4(128, 4, 8, 4, false)
+QGEMM_INST_MXFP4(128, 4, 4, 8, false)
+
+#undef QGEMM_INST_MXFP4
+
 }  // namespace pie_cuda_device::qgemm

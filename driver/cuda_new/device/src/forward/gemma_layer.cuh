@@ -56,7 +56,8 @@ void decoder_layer_gemma_inplace(
     int num_tokens, int num_requests, int hidden_size,
     int n_q_heads, int n_kv_heads, int head_dim, int intermediate,
     int page_size, float rms_eps, float rope_theta,
-    int window_left, float attn_logit_softcap);
+    int window_left, float attn_logit_softcap,
+    const AttnPlan& attn);
 
 // Convenience: allocates scratch per call, runs one layer, syncs, frees.
 cudaError_t gemma_layer_bf16(
