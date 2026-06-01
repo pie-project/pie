@@ -52,6 +52,7 @@ pub use context::{
 
 pub mod audio;
 pub mod forward;
+pub mod http;
 pub mod sample;
 
 // =============================================================================

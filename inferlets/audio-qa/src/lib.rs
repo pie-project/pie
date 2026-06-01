@@ -11,8 +11,6 @@
 //! Requires a model with an audio front-end (e.g. `gemma-4-E4B`).
 
 use inferlet::media::Audio;
-use inferlet::wstd::http::{Client, Method, Request};
-use inferlet::wstd::io::{empty, AsyncRead};
 use inferlet::{chat, model::Model, runtime, sample::Sampler, Context, Result};
 use serde::Deserialize;
 
@@ -49,58 +47,6 @@ fn default_temperature() -> f32 {
     0.7
 }
 
-/// Resolve a redirect `Location` against the request URL.
-fn resolve_redirect(base: &str, loc: &str) -> String {
-    if loc.starts_with("http://") || loc.starts_with("https://") {
-        loc.to_string()
-    } else if let Some(rest) = loc.strip_prefix("//") {
-        let scheme = base.split("://").next().unwrap_or("https");
-        format!("{scheme}://{rest}")
-    } else if loc.starts_with('/') {
-        let (scheme, after) = base.split_once("://").unwrap_or(("https", base));
-        let authority = after.split('/').next().unwrap_or(after);
-        format!("{scheme}://{authority}{loc}")
-    } else {
-        match base.rsplit_once('/') {
-            Some((prefix, _)) => format!("{prefix}/{loc}"),
-            None => loc.to_string(),
-        }
-    }
-}
-
-/// Fetch raw bytes over HTTP, following up to 8 redirects (GitHub raw 302s to a
-/// CDN, so this is required — `wstd::http::Client` does not follow on its own).
-async fn fetch_bytes(url: &str) -> Result<Vec<u8>> {
-    let client = Client::new();
-    let mut current = url.to_string();
-    for _ in 0..8 {
-        let req = Request::builder()
-            .uri(&current)
-            .method(Method::GET)
-            .body(empty())
-            .map_err(|e| e.to_string())?;
-        let resp = client.send(req).await.map_err(|e| e.to_string())?;
-        let status = resp.status().as_u16();
-        if (300..400).contains(&status) {
-            let loc = resp
-                .headers()
-                .get("location")
-                .and_then(|v| v.to_str().ok())
-                .ok_or_else(|| format!("redirect {status} without Location ({current})"))?;
-            current = resolve_redirect(&current, loc);
-            continue;
-        }
-        if !(200..300).contains(&status) {
-            return Err(format!("HTTP {status} fetching {current}"));
-        }
-        let mut body = resp.into_body();
-        let mut buf = Vec::new();
-        body.read_to_end(&mut buf).await.map_err(|e| e.to_string())?;
-        return Ok(buf);
-    }
-    Err(format!("too many redirects fetching {url}"))
-}
-
 #[inferlet::main]
 async fn main(input: Input) -> Result<String> {
     let models = runtime::models();
@@ -109,7 +55,7 @@ async fn main(input: Input) -> Result<String> {
     // Model-agnostic: hand the host the raw encoded audio bytes. It decodes the
     // container, resamples, computes the bound model's log-mel features, and
     // wraps the span in whatever delimiters that model needs.
-    let bytes = fetch_bytes(&input.audio_url).await?;
+    let bytes = inferlet::http::fetch(&input.audio_url).await?;
     let clip = Audio::from_bytes(&model, &bytes).map_err(|e| e.to_string())?;
     println!(
         "audio: {} bytes -> {} audio soft tokens",
