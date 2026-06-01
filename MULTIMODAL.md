@@ -250,7 +250,7 @@ lands first and is unit-tested in isolation. **(Started — see Phase 1.1.)**
 
 | | **Gemma 4** | **Qwen 3.6** |
 |---|---|---|
-| Encoder | `gemma4_vision` ViT (§6.1) — NOT SigLIP | native-resolution ViT (NaViT), window attn |
+| Encoder | `gemma4_vision` ViT (§6.1) — NOT SigLIP | native-resolution ViT, **full attn every layer** (Qwen3-VL dropped Qwen2.5-VL's window attn — config has no `window_size`/`fullatt_block_indexes`) |
 | Tokens/image | 280 soft tokens/crop (pan-and-scan) | dynamic from `grid_thw`, 2×2 merge |
 | Positions | standard 1-D RoPE (`mrope_position_ids` empty) | **M-RoPE** (3-component side-channel) |
 | Image attention | **bidirectional** within span (graph sets sub-mask) | causal |

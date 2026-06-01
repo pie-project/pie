@@ -21,6 +21,7 @@
 // cannot parse. The host call site builds `QwenVisRawWeights` from
 // `Qwen3VLVisionWeights` via `DeviceTensor::data()` (see qwen3_vl_vision_adapter).
 
+#include <cublas_v2.h>
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
@@ -141,12 +142,15 @@ typedef void (*Qwen3VLVisionCkptFn)(const char* name, const __nv_bfloat16* dev,
 void set_qwen3vl_vision_ckpt(Qwen3VLVisionCkptFn fn, void* user);
 
 // Allocates internal scratch (first-cut; a workspace arena is a follow-up).
-void run_qwen3vl_vision(const QwenVisRawWeights& w,
-                        const __nv_bfloat16* pixel,
-                        const float* rope_pos,        // [n_patch, 2] (row,col), device
-                        const __nv_bfloat16* pos_embed_interp,  // [n_patch, hidden], device
-                        int grid_t, int grid_h, int grid_w,
-                        __nv_bfloat16* out_main,
+// `blas`'s bound stream MUST equal `stream` (the projection GEMMs run on the
+// handle's stream; the elementwise kernels run on `stream`).
+void run_qwen3vl_vision(cublasHandle_t blas,
+                        const QwenVisRawWeights& w,
+                        const __nv_bfloat16* pixel,   // [Ntot, PATCH_DIM] (images concatenated)
+                        const float* rope_pos,        // [Ntot, 2] (row,col), device
+                        const __nv_bfloat16* pos_embed_interp,  // [Ntot, hidden], device
+                        int num_img, const int* n_patch_h,      // per-image patch counts (host)
+                        __nv_bfloat16* out_main,      // [Σ NTOK, OUT], per-image segments
                         __nv_bfloat16* const* out_deep,
                         int num_deep,
                         cudaStream_t stream = 0);
@@ -168,6 +172,7 @@ void scatter_qwen3vl_vision(const Qwen3VLVisionInputs& in,
                             int out_hidden,
                             __nv_bfloat16* deepstack_scratch,
                             int num_deep,
+                            cublasHandle_t blas,
                             cudaStream_t stream = 0);
 
 }  // namespace pie_cuda_driver::model

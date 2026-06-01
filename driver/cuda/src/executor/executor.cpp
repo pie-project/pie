@@ -2185,6 +2185,22 @@ void handle_fire_batch(
     const auto aud_anchor           = view.audio_anchor_rows.as<std::uint32_t>();
     const int aud_num_clips         = static_cast<int>(aud_anchor.size());
 
+    // Env-gated per-fire timing (PIE_FIRE_TIMING=1): logs tokens/requests/images
+    // and wall duration of the whole fire. Scope guard fires on every return.
+    int dbg_R = 0, dbg_N = 0;
+    const bool dbg_fire = std::getenv("PIE_FIRE_TIMING") != nullptr;
+    struct FireTimer {
+        std::chrono::steady_clock::time_point t0; const int& R; const int& N;
+        int nimg; std::uint32_t rid; bool en;
+        ~FireTimer() {
+            if (!en) return;
+            double ms = std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - t0).count();
+            std::cerr << "[fire] req=" << rid << " R=" << R << " N=" << N
+                      << " imgs=" << nimg << " " << ms << "ms\n";
+        }
+    } dbg_ft{t_entry, dbg_R, dbg_N, img_num_images, req_id, dbg_fire};
+
     try {
         const auto tok_view_orig   = view.token_ids.as<std::uint32_t>();
         const auto pos_view_orig   = view.position_ids.as<std::uint32_t>();
@@ -2260,6 +2276,7 @@ void handle_fire_batch(
 
         const int N = static_cast<int>(tok_view.size());
         const int num_sampling = static_cast<int>(sidx_view.size());
+        dbg_R = R; dbg_N = N;
 
         // Qwen3-VL: assemble the per-token [N,3] M-RoPE positions. Text rows
         // carry (p,p,p) from the 1-D `pos_view`; image-token rows are

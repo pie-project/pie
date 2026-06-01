@@ -317,7 +317,7 @@ void llama_like_forward_paged(
             static_cast<__nv_bfloat16*>(ws.y.data()),
             N, H,
             static_cast<__nv_bfloat16*>(vision->deepstack_scratch),
-            vision->num_deepstack, stream);
+            vision->num_deepstack, cublas.handle(), stream);
     }
 
     // Some GQA group sizes (Qwen2 small models — 6, 7) aren't in
