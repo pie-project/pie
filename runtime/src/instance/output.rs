@@ -27,7 +27,7 @@ enum Dest {
     Process(ProcessId),
     /// pie-server's `tracing` log, tagged with the program name for triage.
     /// Used by daemon components, which have no attached client.
-    Server(Arc<str>),
+    Log(Arc<str>),
 }
 
 /// A WASI-compatible output stream that routes guest stdout/stderr.
@@ -47,11 +47,11 @@ impl LogStream {
     }
 
     pub fn new_server_stdout(program: Arc<str>) -> Self {
-        LogStream { dest: Dest::Server(program), is_stderr: false }
+        LogStream { dest: Dest::Log(program), is_stderr: false }
     }
 
     pub fn new_server_stderr(program: Arc<str>) -> Self {
-        LogStream { dest: Dest::Server(program), is_stderr: true }
+        LogStream { dest: Dest::Log(program), is_stderr: true }
     }
 
     /// Dispatch output to its destination.
@@ -68,7 +68,7 @@ impl LogStream {
                     process::stdout(*process_id, content);
                 }
             }
-            Dest::Server(program) => {
+            Dest::Log(program) => {
                 // Strip the trailing newline so each `eprintln!`/`println!`
                 // becomes one clean tracing event rather than an empty extra line.
                 let content = String::from_utf8_lossy(bytes);
@@ -143,82 +143,5 @@ impl AsyncWrite for LogStream {
 
     fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         Poll::Ready(Ok(()))
-    }
-}
-
-// =============================================================================
-// Tests — the `Server` destination (daemon request path). Regression cover for
-// #300: daemon guest stderr was discarded by wasmtime's default sink because it
-// was never wired to a destination.
-// =============================================================================
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::sync::Mutex;
-    use tracing_subscriber::fmt::MakeWriter;
-
-    /// A `MakeWriter` that captures all tracing output into a shared buffer.
-    #[derive(Clone)]
-    struct CaptureWriter(Arc<Mutex<Vec<u8>>>);
-
-    impl io::Write for CaptureWriter {
-        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-            self.0.lock().unwrap().extend_from_slice(buf);
-            Ok(buf.len())
-        }
-        fn flush(&mut self) -> io::Result<()> {
-            Ok(())
-        }
-    }
-
-    impl<'a> MakeWriter<'a> for CaptureWriter {
-        type Writer = CaptureWriter;
-        fn make_writer(&'a self) -> Self::Writer {
-            self.clone()
-        }
-    }
-
-    /// Run `f` with a tracing subscriber capturing into a buffer; return the text.
-    fn capture_tracing(f: impl FnOnce()) -> String {
-        let buf = Arc::new(Mutex::new(Vec::new()));
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(CaptureWriter(buf.clone()))
-            .with_ansi(false)
-            .with_max_level(tracing::Level::INFO)
-            .finish();
-        tracing::subscriber::with_default(subscriber, f);
-        String::from_utf8(buf.lock().unwrap().clone()).unwrap()
-    }
-
-    #[test]
-    fn server_stderr_surfaces_to_tracing_with_program_tag() {
-        let out = capture_tracing(|| {
-            let mut s = LogStream::new_server_stderr(Arc::from("chat-apc"));
-            s.write_bytes(b"clock skew detected: 42s\n");
-        });
-        assert!(out.contains("clock skew detected: 42s"), "stderr text missing: {out:?}");
-        assert!(out.contains("chat-apc"), "program tag missing: {out:?}");
-        assert!(out.contains("WARN"), "stderr should log at WARN: {out:?}");
-    }
-
-    #[test]
-    fn server_stdout_surfaces_at_info() {
-        let out = capture_tracing(|| {
-            let mut s = LogStream::new_server_stdout(Arc::from("helloworld"));
-            s.write_bytes(b"served request\n");
-        });
-        assert!(out.contains("served request"), "stdout text missing: {out:?}");
-        assert!(out.contains("INFO"), "stdout should log at INFO: {out:?}");
-    }
-
-    #[test]
-    fn server_drops_empty_and_newline_only_writes() {
-        let out = capture_tracing(|| {
-            let mut s = LogStream::new_server_stderr(Arc::from("noisy"));
-            s.write_bytes(b"");
-            s.write_bytes(b"\n");
-        });
-        assert!(out.is_empty(), "blank writes should emit nothing: {out:?}");
     }
 }

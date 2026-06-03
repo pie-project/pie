@@ -219,7 +219,7 @@ impl Daemon {
         // their stdout/stderr to. Route guest output to pie-server's tracing log
         // (tagged with the program name) so inferlet diagnostics stay visible to
         // operators instead of falling through to wasmtime's default sink.
-        let output = OutputMode::Server { program: program.to_string() };
+        let output = OutputMode::Log { program: program.to_string() };
         let (mut store, instance) =
             linker::instantiate(uuid::Uuid::new_v4(), username, &program, output, None).await?;
 
