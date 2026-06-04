@@ -22,6 +22,7 @@ use wasmtime_wasi_http::bindings::http::types::Scheme;
 use wasmtime_wasi_http::body::HyperOutgoingBody;
 use wasmtime_wasi_http::io::TokioIo;
 
+use crate::instance::OutputMode;
 use crate::linker;
 use crate::program::ProgramName;
 use crate::service::{ServiceMap, ServiceHandler};
@@ -214,9 +215,13 @@ impl Daemon {
         let req = hyper::Request::from_parts(parts, buffered_body);
 
         // Instantiate a fresh WASM component (store + instance) per request.
-        // Daemons don't capture outputs — they serve HTTP responses directly.
+        // Daemons serve HTTP responses directly, so there is no client to attach
+        // their stdout/stderr to. Route guest output to pie-server's tracing log
+        // (tagged with the program name) so inferlet diagnostics stay visible to
+        // operators instead of falling through to wasmtime's default sink.
+        let output = OutputMode::Log { program: program.to_string() };
         let (mut store, instance) =
-            linker::instantiate(uuid::Uuid::new_v4(), username, &program, false, None).await?;
+            linker::instantiate(uuid::Uuid::new_v4(), username, &program, output, None).await?;
 
         // Convert the hyper request into WASI HTTP resources
         let (sender, receiver) = oneshot::channel();
