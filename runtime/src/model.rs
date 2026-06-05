@@ -35,6 +35,7 @@ pub fn register(
     name: String,
     arch_name: &str,
     kv_page_size: u32,
+    kv_capacity_tokens: u32,
     tokenizer_path: PathBuf,
 ) -> Result<()> {
     let tokenizer = Arc::new(Tokenizer::from_file(&tokenizer_path)?);
@@ -44,6 +45,7 @@ pub fn register(
         name,
         instruct,
         kv_page_size,
+        kv_capacity_tokens,
         tokenizer,
     });
     MODELS.push(model);
@@ -53,6 +55,15 @@ pub fn register(
 /// Returns a list of all registered model names.
 pub fn models() -> Vec<String> {
     MODELS.iter().map(|(_, model)| model.name().to_string()).collect()
+}
+
+/// Minimum KV-cache capacity (tokens) across registered models; 0 if none.
+pub fn min_kv_capacity_tokens() -> u32 {
+    MODELS
+        .iter()
+        .map(|(_, model)| model.kv_capacity_tokens())
+        .min()
+        .unwrap_or(0)
 }
 
 /// Gets cached model by model ID.
@@ -68,6 +79,7 @@ pub struct Model {
     name: String,
     instruct: Arc<dyn Instruct>,
     kv_page_size: u32,
+    kv_capacity_tokens: u32,
     tokenizer: Arc<Tokenizer>,
 }
 
@@ -132,5 +144,10 @@ impl Model {
     /// Gets the KV page size.
     pub fn kv_page_size(&self) -> u32 {
         self.kv_page_size
+    }
+
+    /// Gets the engine KV-cache capacity for this model in tokens.
+    pub fn kv_capacity_tokens(&self) -> u32 {
+        self.kv_capacity_tokens
     }
 }

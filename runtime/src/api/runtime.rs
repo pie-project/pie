@@ -22,4 +22,8 @@ impl pie::core::runtime::Host for InstanceState {
     async fn models(&mut self) -> Result<Vec<String>> {
         Ok(model::models())
     }
+
+    async fn max_output_tokens(&mut self) -> Result<u32> {
+        Ok(model::min_kv_capacity_tokens())
+    }
 }
