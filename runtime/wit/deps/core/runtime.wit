@@ -14,4 +14,7 @@ interface runtime {
     // Get a list of all available model names
     models: func() -> list<string>;
 
+    // Max output tokens per request = engine KV capacity (0 if no model)
+    max-output-tokens: func() -> u32;
+
 }
