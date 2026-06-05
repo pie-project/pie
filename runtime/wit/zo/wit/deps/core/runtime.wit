@@ -14,7 +14,8 @@ interface runtime {
     // Get a list of all available model names
     models: func() -> list<string>;
 
-    // Max output tokens per request = engine KV capacity (0 if no model)
+    // Max output tokens per request = configured scheduler default_token_limit
+    // when set, otherwise raw engine KV capacity; 0 if no model.
     max-output-tokens: func() -> u32;
 
 }

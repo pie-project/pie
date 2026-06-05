@@ -66,9 +66,30 @@ pub fn models() -> Vec<String> {
 pub fn min_output_token_ceiling() -> u32 {
     MODELS
         .iter()
-        .map(|(_, model)| model.default_token_limit.unwrap_or(model.kv_capacity_tokens()))
+        .map(|(_, model)| {
+            output_token_ceiling_for_model(model.default_token_limit, model.kv_capacity_tokens())
+        })
         .min()
         .unwrap_or(0)
+}
+
+fn output_token_ceiling_for_model(
+    default_token_limit: Option<u32>,
+    kv_capacity_tokens: u32,
+) -> u32 {
+    default_token_limit
+        .unwrap_or(kv_capacity_tokens)
+        .min(kv_capacity_tokens)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn configured_default_token_limit_is_clamped_to_physical_kv_capacity() {
+        assert_eq!(output_token_ceiling_for_model(Some(4096), 1024), 1024);
+    }
 }
 
 /// Gets cached model by model ID.
