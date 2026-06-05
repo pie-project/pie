@@ -61,8 +61,8 @@ pub fn models() -> Vec<String> {
 
 /// Minimum per-request output-token ceiling across registered models;
 /// 0 if none. Per model: the configured `default_token_limit` (the
-/// scheduler's total-token compute cap) when set, else the raw KV
-/// capacity.
+/// scheduler's total-token compute cap) capped by raw KV capacity when
+/// set, else the raw KV capacity.
 pub fn min_output_token_ceiling() -> u32 {
     MODELS
         .iter()
