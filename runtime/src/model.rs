@@ -36,6 +36,7 @@ pub fn register(
     arch_name: &str,
     kv_page_size: u32,
     kv_capacity_tokens: u32,
+    default_token_limit: Option<u32>,
     tokenizer_path: PathBuf,
 ) -> Result<()> {
     let tokenizer = Arc::new(Tokenizer::from_file(&tokenizer_path)?);
@@ -46,6 +47,7 @@ pub fn register(
         instruct,
         kv_page_size,
         kv_capacity_tokens,
+        default_token_limit,
         tokenizer,
     });
     MODELS.push(model);
@@ -57,11 +59,14 @@ pub fn models() -> Vec<String> {
     MODELS.iter().map(|(_, model)| model.name().to_string()).collect()
 }
 
-/// Minimum KV-cache capacity (tokens) across registered models; 0 if none.
-pub fn min_kv_capacity_tokens() -> u32 {
+/// Minimum per-request output-token ceiling across registered models;
+/// 0 if none. Per model: the configured `default_token_limit` (the
+/// scheduler's total-token compute cap) when set, else the raw KV
+/// capacity.
+pub fn min_output_token_ceiling() -> u32 {
     MODELS
         .iter()
-        .map(|(_, model)| model.kv_capacity_tokens())
+        .map(|(_, model)| model.default_token_limit.unwrap_or(model.kv_capacity_tokens()))
         .min()
         .unwrap_or(0)
 }
@@ -80,6 +85,7 @@ pub struct Model {
     instruct: Arc<dyn Instruct>,
     kv_page_size: u32,
     kv_capacity_tokens: u32,
+    default_token_limit: Option<u32>,
     tokenizer: Arc<Tokenizer>,
 }
 
