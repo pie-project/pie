@@ -123,7 +123,10 @@ pub struct LlamaInstruct {
 impl LlamaInstruct {
     pub fn new(tokenizer: Arc<Tokenizer>) -> Self {
         let encode = |s: &str| tokenizer.encode(s);
-        let stop_strs = ["<|eot_id|>", "<|end_of_text|>"];
+        // Llama 3.1 can emit <|eom_id|> at an end-of-message/tool
+        // boundary. Treat it as terminal; otherwise generation continues
+        // past a complete message until max_tokens and looks like garbage.
+        let stop_strs = ["<|eot_id|>", "<|end_of_text|>", "<|eom_id|>"];
         let stop_ids: Vec<u32> = stop_strs
             .iter()
             .filter_map(|s| tokenizer.token_to_id(s))
@@ -320,8 +323,9 @@ mod tests {
 
     fn llama3() -> LlamaInstruct {
         let tok = make_tok(&[
-            "<|start_header_id|>", "<|end_header_id|>", "<|eot_id|>", "<|end_of_text|>",
-            "system", "user", "assistant", "ipython", "\n", "Hello", "<think>", "</think>", " ",
+            "<|start_header_id|>", "<|end_header_id|>", "<|eot_id|>",
+            "<|end_of_text|>", "<|eom_id|>", "system", "user", "assistant",
+            "ipython", "\n", "Hello", "<think>", "</think>", " ",
             "Environment:", "ipython", "Cutting", "Knowledge", "Date:", "December", "2023",
             "Today", "26", "Jul", "2024",
             "Environment: ipython\n",
@@ -339,7 +343,14 @@ mod tests {
     fn has_correct_stop_tokens() {
         let inst = llama3();
         let stop = inst.seal();
-        assert_eq!(stop.len(), 2);
+        let stop_text: Vec<_> = stop
+            .iter()
+            .map(|id| inst.tokenizer.id_to_token_str(*id).unwrap())
+            .collect();
+        assert_eq!(
+            stop_text,
+            vec!["<|eot_id|>", "<|end_of_text|>", "<|eom_id|>"]
+        );
     }
 
     #[test]
