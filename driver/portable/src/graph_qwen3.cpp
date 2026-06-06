@@ -353,14 +353,24 @@ GraphResult build_qwen3_graph(ggml_context* ctx,
             yarn_on ? spec.yarn_beta_fast   : 32.0f;
         const float rope_beta_slow =
             yarn_on ? spec.yarn_beta_slow   : 1.0f;
+        // Llama 3.x GGUFs use ggml's normal RoPE pairing (adjacent
+        // head values). The shared Qwen graph previously hard-coded
+        // NEOX pairing for every arch, which is correct for Qwen/Phi but
+        // rotates Llama Q/K with the wrong dimension pairs. That leaves
+        // the tokenization/template apparently correct while the model
+        // attends incoherently (e.g. Llama 3.1 answers a simple arithmetic
+        // prompt with generic assistant boilerplate).
+        const int rope_type = (h.arch == PieArch::Llama3)
+            ? GGML_ROPE_TYPE_NORMAL
+            : GGML_ROPE_TYPE_NEOX;
         Q = ggml_rope_ext(ctx, Q, in.pos_input, c_rope,
-                          head_dim, GGML_ROPE_TYPE_NEOX, rope_n_ctx_orig,
+                          head_dim, rope_type, rope_n_ctx_orig,
                           layer_rope_theta, rope_freq_scale,
                           rope_ext_factor, rope_attn_factor,
                           rope_beta_fast, rope_beta_slow);
         if (!is_shared) {
             K = ggml_rope_ext(ctx, K, in.pos_input, c_rope,
-                              head_dim, GGML_ROPE_TYPE_NEOX, rope_n_ctx_orig,
+                              head_dim, rope_type, rope_n_ctx_orig,
                               layer_rope_theta, rope_freq_scale,
                               rope_ext_factor, rope_attn_factor,
                               rope_beta_fast, rope_beta_slow);
