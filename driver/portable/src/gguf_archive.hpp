@@ -42,6 +42,12 @@ struct GgufMeta {
 class GGUFArchive : public WeightArchive {
 public:
     explicit GGUFArchive(const std::filesystem::path& gguf_file);
+
+    // Open a split/sharded GGUF set given the first shard path.
+    // Discovers sibling shards via the *-NNNNN-of-MMMMM.gguf pattern,
+    // merges all tensors into one logical archive.
+    static std::unique_ptr<GGUFArchive>
+    open_sharded(const std::filesystem::path& first_shard);
     ~GGUFArchive() override;
 
     GGUFArchive(const GGUFArchive&) = delete;
@@ -81,6 +87,9 @@ private:
     // points into one of these buffers instead of the mmap region.
     std::vector<std::vector<std::uint8_t>> dequant_buffers_;
 
+    // Keeps extra shard GGUFArchive objects alive so their mmap data
+    // pointers remain valid after merging into the primary archive.
+    std::vector<std::unique_ptr<GGUFArchive>> extra_mmaps_;
     void close_mmap_() noexcept;
 };
 
