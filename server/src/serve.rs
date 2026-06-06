@@ -161,11 +161,110 @@ pub fn run_with_config(user_cfg: config::Config) -> Result<()> {
     crate::py_runtime::ensure_installed_best_effort();
 
     let runtime = build_runtime(&user_cfg)?;
+    let banner = StartupBanner::from_config(&user_cfg);
+    let verbose = user_cfg.server.verbose;
 
     runtime.block_on(async move {
         let engine = start_engine(user_cfg).await?;
+        eprintln!("{}", banner.render(&engine.url));
+        if verbose {
+            eprintln!("internal token: {}", engine.token);
+            eprintln!("press Ctrl-C to shut down");
+        }
         engine.wait_then_shutdown().await
     })
+}
+
+struct StartupBanner {
+    model: String,
+    driver: String,
+    device: String,
+}
+
+impl StartupBanner {
+    fn from_config(cfg: &config::Config) -> Self {
+        let model = match cfg.models.as_slice() {
+            [m] => format!("{} ({})", m.name, m.hf_repo),
+            models => format!("{} models", models.len()),
+        };
+        let driver = match cfg.models.as_slice() {
+            [m] => m.driver.kind.as_str().to_string(),
+            models => {
+                let mut drivers = models
+                    .iter()
+                    .map(|m| m.driver.kind.as_str())
+                    .collect::<Vec<_>>();
+                drivers.sort_unstable();
+                drivers.dedup();
+                if drivers.len() == 1 {
+                    drivers[0].to_string()
+                } else {
+                    "mixed".to_string()
+                }
+            }
+        };
+        let device = match cfg.models.as_slice() {
+            [m] => {
+                let device = m.driver.device.join(", ");
+                if device.is_empty() {
+                    "-".to_string()
+                } else {
+                    device
+                }
+            }
+            models => {
+                let count = models.iter().map(|m| m.driver.device.len()).sum::<usize>();
+                if count == 0 {
+                    "-".to_string()
+                } else {
+                    format!("{count} devices")
+                }
+            }
+        };
+
+        Self {
+            model,
+            driver,
+            device,
+        }
+    }
+
+    fn render(&self, url: &str) -> String {
+        let host = url.strip_prefix("ws://").unwrap_or(url);
+        let rows = [
+            ("Host", host),
+            ("Model", self.model.as_str()),
+            ("Driver", self.driver.as_str()),
+            ("Device", self.device.as_str()),
+        ];
+        let label_width = 12;
+        let header = "─ Pie Engine ";
+        let content_width = rows
+            .iter()
+            .map(|(_, value)| label_width + 1 + value.len())
+            .max()
+            .unwrap_or(0)
+            .max(header.len() - 2);
+        let inner_width = content_width + 2;
+        let mut out = String::new();
+
+        out.push_str(&format!(
+            "╭{}{}╮\n",
+            header,
+            "─".repeat(inner_width - header.len())
+        ));
+        for (label, value) in rows {
+            let content = format!("{label:<label_width$} {value}");
+            out.push_str(&format!(
+                "│ {:<content_width$} │\n",
+                content,
+                content_width = content_width
+            ));
+        }
+        out.push_str(&format!("╰{}╯\n\n", "─".repeat(inner_width)));
+        out.push_str(&format!("✓ Server ready at {url}"));
+        out
+    }
 }
 
 /// Build the multi-threaded tokio runtime sized by the user's config.
@@ -321,17 +420,6 @@ pub async fn start_engine(user_cfg: config::Config) -> Result<EngineHandle> {
         .map_err(|e| anyhow!("pie::bootstrap::bootstrap: {e}"))?;
     let bound_port = boot.port;
     let token = boot.token;
-
-    if user_cfg.server.verbose {
-        eprintln!(
-            "pie-server serving on {}:{} ({} model(s))",
-            user_cfg.server.host,
-            bound_port,
-            user_cfg.models.len(),
-        );
-        eprintln!("internal token: {token}");
-        eprintln!("press Ctrl-C to shut down");
-    }
 
     let shmem_names: Vec<String> = drivers.iter().map(|d| d.shmem_name().to_string()).collect();
 
@@ -599,4 +687,28 @@ fn start_subprocess_group(
         handshake,
         driver: DriverHandle::Subprocess(driver),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::StartupBanner;
+
+    #[test]
+    fn startup_banner_render_includes_public_startup_fields_only() {
+        let banner = StartupBanner {
+            model: "default (Qwen/Qwen3-0.6B)".to_string(),
+            driver: "portable".to_string(),
+            device: "cpu".to_string(),
+        };
+
+        let rendered = banner.render("ws://127.0.0.1:8080");
+
+        assert!(rendered.contains("╭─ Pie Engine"));
+        assert!(rendered.contains("Host"));
+        assert!(rendered.contains("Model"));
+        assert!(rendered.contains("Driver"));
+        assert!(rendered.contains("Device"));
+        assert!(rendered.contains("✓ Server ready at ws://127.0.0.1:8080"));
+        assert!(!rendered.contains("internal token"));
+    }
 }
