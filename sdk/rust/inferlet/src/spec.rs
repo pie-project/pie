@@ -248,6 +248,100 @@ pub mod cacheback_tree {
                 metrics,
             })
         }
+
+        fn rollback_plan_for(
+            &self,
+            outcome: &VerificationOutcome,
+        ) -> Result<TreeRollbackPlan, String> {
+            let total_nodes = self.nodes.len();
+            let accepted_len = outcome.accepted_path_nodes.len();
+            let rejected_nodes = total_nodes.checked_sub(accepted_len).ok_or_else(|| {
+                "cacheback_tree accept_verified: accepted path is longer than the draft tree"
+                    .to_string()
+            })?;
+
+            if outcome.metrics.tree_nodes_drafted != total_nodes {
+                return Err(format!(
+                    "cacheback_tree accept_verified: tree_nodes_drafted metric mismatch \
+                     (expected {}, got {})",
+                    total_nodes, outcome.metrics.tree_nodes_drafted
+                ));
+            }
+            if outcome.metrics.accepted_path_length != accepted_len {
+                return Err(format!(
+                    "cacheback_tree accept_verified: accepted_path_length metric mismatch \
+                     (expected {}, got {})",
+                    accepted_len, outcome.metrics.accepted_path_length
+                ));
+            }
+            if outcome.metrics.rejected_nodes != rejected_nodes {
+                return Err(format!(
+                    "cacheback_tree accept_verified: rejected_nodes metric mismatch \
+                     (expected {}, got {})",
+                    rejected_nodes, outcome.metrics.rejected_nodes
+                ));
+            }
+            if outcome.accepted_tokens.len() != accepted_len + 1 {
+                return Err(format!(
+                    "cacheback_tree accept_verified: accepted_tokens must contain the \
+                     accepted path plus one bonus token (expected {}, got {})",
+                    accepted_len + 1,
+                    outcome.accepted_tokens.len()
+                ));
+            }
+
+            let mut seen = vec![false; total_nodes];
+            let mut expected_parent = None;
+            for (path_pos, &node_idx) in outcome.accepted_path_nodes.iter().enumerate() {
+                let Some(node) = self.nodes.get(node_idx) else {
+                    return Err(format!(
+                        "cacheback_tree accept_verified: accepted_path_nodes contains \
+                         out-of-range index {} for {} draft nodes",
+                        node_idx, total_nodes
+                    ));
+                };
+                if seen[node_idx] {
+                    return Err(format!(
+                        "cacheback_tree accept_verified: accepted_path_nodes repeats index {}",
+                        node_idx
+                    ));
+                }
+                if node.parent != expected_parent {
+                    return Err(
+                        "cacheback_tree accept_verified: accepted_path_nodes must form a \
+                         root-to-leaf chain"
+                            .to_string(),
+                    );
+                }
+                if outcome.accepted_tokens[path_pos] != node.token {
+                    return Err(format!(
+                        "cacheback_tree accept_verified: accepted token at path position {} \
+                         does not match draft node {}",
+                        path_pos, node_idx
+                    ));
+                }
+
+                seen[node_idx] = true;
+                expected_parent = Some(node_idx);
+            }
+
+            Ok(TreeRollbackPlan {
+                accepted_draft_nodes: accepted_len,
+                rejected_draft_nodes: rejected_nodes,
+            })
+        }
+
+        fn child_with_token_in(
+            nodes: &[TreeNode],
+            parent: Option<usize>,
+            token: u32,
+        ) -> Option<usize> {
+            nodes
+                .iter()
+                .enumerate()
+                .find(|(_, node)| node.parent == parent && node.token == token)
+                .map(|(idx, _)| idx)
+        }
     }
 
     /// Target-model verifier predictions for a draft tree.
@@ -328,8 +422,10 @@ pub mod cacheback_tree {
         pub fn accept_verified(
             &mut self,
             prior_context_suffix: &[u32],
+            tree: &DraftTree,
             outcome: &VerificationOutcome,
-        ) -> TreeRollbackPlan {
+        ) -> Result<TreeRollbackPlan, String> {
+            let rollback = tree.rollback_plan_for(outcome)?;
             let mut committed =
                 Vec::with_capacity(prior_context_suffix.len() + outcome.accepted_tokens.len());
             committed.extend_from_slice(prior_context_suffix);
@@ -337,10 +433,7 @@ pub mod cacheback_tree {
             self.observe_committed(&committed);
             self.observe_committed_with_partial_tail(&committed);
 
-            TreeRollbackPlan {
-                accepted_draft_nodes: outcome.accepted_path_nodes.len(),
-                rejected_draft_nodes: outcome.metrics.rejected_nodes,
-            }
+            Ok(rollback)
         }
 
         /// Build a bounded draft tree from the suffix of `context`.
@@ -435,11 +528,21 @@ pub mod cacheback_tree {
                 let mut branch_depth = depth;
 
                 for &token in follower {
-                    if nodes.len() >= self.cfg.max_tree_nodes
-                        || branch_depth >= self.cfg.max_tree_depth
-                    {
+                    if branch_depth >= self.cfg.max_tree_depth {
                         break;
                     }
+                    let existing =
+                        DraftTree::child_with_token_in(nodes.as_slice(), branch_parent, token);
+                    if let Some(idx) = existing {
+                        branch_depth = nodes[idx].depth;
+                        branch_context.push(token);
+                        branch_parent = Some(idx);
+                        continue;
+                    }
+                    if nodes.len() >= self.cfg.max_tree_nodes {
+                        break;
+                    }
+
                     branch_depth += 1;
                     let idx = nodes.len();
                     nodes.push(TreeNode {
@@ -460,7 +563,8 @@ pub mod cacheback_tree {
 #[cfg(test)]
 mod cacheback_tree_tests {
     use super::cacheback_tree::{
-        CachebackTreeConfig, CachebackTreeDrafter, RuntimeTreeSupport, VerificationPredictions,
+        CachebackTreeConfig, CachebackTreeDrafter, RuntimeTreeSupport, TreeVerificationMetrics,
+        VerificationOutcome, VerificationPredictions,
     };
 
     #[test]
@@ -510,6 +614,48 @@ mod cacheback_tree_tests {
         assert_eq!(tree.tokens(), vec![5, 6, 3, 4, 9]);
         assert_eq!(tree.parents(), vec![None, Some(0), None, Some(2), Some(3)]);
         assert_eq!(tree.depths(), vec![1, 2, 1, 2, 3]);
+        assert_eq!(tree.leaf_count(), 2);
+    }
+
+    #[test]
+    fn shared_prefix_continuations_reuse_one_physical_tree_node() {
+        let cfg = CachebackTreeConfig {
+            leader_len: 2,
+            follower_len: 2,
+            max_tree_nodes: 8,
+            max_tree_depth: 2,
+            cache_capacity: 16,
+        };
+        let mut drafter = CachebackTreeDrafter::new(cfg).unwrap();
+        drafter.observe_committed(&[1, 2, 5, 6]);
+        drafter.observe_committed(&[1, 2, 5, 7]);
+
+        let tree = drafter.draft_tree(&[1, 2]).unwrap().unwrap();
+
+        assert_eq!(tree.tokens(), vec![5, 7, 6]);
+        assert_eq!(tree.parents(), vec![None, Some(0), Some(0)]);
+        assert_eq!(tree.depths(), vec![1, 2, 2]);
+        assert_eq!(tree.root_children_tokens(), vec![5]);
+        assert_eq!(tree.leaf_count(), 2);
+    }
+
+    #[test]
+    fn shared_prefix_preserves_alternatives_under_tight_node_budget() {
+        let cfg = CachebackTreeConfig {
+            leader_len: 2,
+            follower_len: 2,
+            max_tree_nodes: 3,
+            max_tree_depth: 2,
+            cache_capacity: 16,
+        };
+        let mut drafter = CachebackTreeDrafter::new(cfg).unwrap();
+        drafter.observe_committed(&[1, 2, 5, 6]);
+        drafter.observe_committed(&[1, 2, 5, 7]);
+
+        let tree = drafter.draft_tree(&[1, 2]).unwrap().unwrap();
+
+        assert_eq!(tree.tokens(), vec![5, 7, 6]);
+        assert_eq!(tree.parents(), vec![None, Some(0), Some(0)]);
         assert_eq!(tree.leaf_count(), 2);
     }
 
@@ -619,7 +765,7 @@ mod cacheback_tree_tests {
             })
             .unwrap();
 
-        let rollback = drafter.accept_verified(&[1, 2], &outcome);
+        let rollback = drafter.accept_verified(&[1, 2], &tree, &outcome).unwrap();
 
         assert_eq!(rollback.accepted_draft_nodes, 2);
         assert_eq!(rollback.rejected_draft_nodes, 2);
@@ -631,5 +777,38 @@ mod cacheback_tree_tests {
                 .root_children_tokens(),
             vec![42]
         );
+    }
+
+    #[test]
+    fn accept_verified_rejects_inconsistent_public_metrics() {
+        let cfg = CachebackTreeConfig {
+            leader_len: 2,
+            follower_len: 2,
+            max_tree_nodes: 4,
+            max_tree_depth: 2,
+            cache_capacity: 16,
+        };
+        let mut drafter = CachebackTreeDrafter::new(cfg).unwrap();
+        drafter.observe_committed(&[1, 2, 3, 4]);
+        drafter.observe_committed(&[1, 2, 5, 6]);
+        let tree = drafter.draft_tree(&[1, 2]).unwrap().unwrap();
+
+        let inconsistent = VerificationOutcome {
+            accepted_tokens: vec![5, 42],
+            accepted_path_nodes: vec![0],
+            metrics: TreeVerificationMetrics {
+                tree_nodes_drafted: 4,
+                verified_branches: 2,
+                accepted_path_length: 1,
+                rejected_nodes: 0,
+                accepted_tokens_per_verifier_pass: 2.0,
+            },
+        };
+
+        let err = drafter
+            .accept_verified(&[1, 2], &tree, &inconsistent)
+            .unwrap_err();
+
+        assert!(err.contains("rejected_nodes"));
     }
 }
