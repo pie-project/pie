@@ -281,12 +281,31 @@ pub mod cacheback_tree {
                     rejected_nodes, outcome.metrics.rejected_nodes
                 ));
             }
+            let verified_branches = self.leaf_count();
+            if outcome.metrics.verified_branches != verified_branches {
+                return Err(format!(
+                    "cacheback_tree accept_verified: verified_branches metric mismatch \
+                     (expected {}, got {})",
+                    verified_branches, outcome.metrics.verified_branches
+                ));
+            }
             if outcome.accepted_tokens.len() != accepted_len + 1 {
                 return Err(format!(
                     "cacheback_tree accept_verified: accepted_tokens must contain the \
                      accepted path plus one bonus token (expected {}, got {})",
                     accepted_len + 1,
                     outcome.accepted_tokens.len()
+                ));
+            }
+            let accepted_tokens_per_verifier_pass = outcome.accepted_tokens.len() as f64;
+            if outcome.metrics.accepted_tokens_per_verifier_pass
+                != accepted_tokens_per_verifier_pass
+            {
+                return Err(format!(
+                    "cacheback_tree accept_verified: accepted_tokens_per_verifier_pass \
+                     metric mismatch (expected {}, got {})",
+                    accepted_tokens_per_verifier_pass,
+                    outcome.metrics.accepted_tokens_per_verifier_pass
                 ));
             }
 
@@ -518,11 +537,9 @@ pub mod cacheback_tree {
                 return;
             };
 
-            for follower in followers {
-                if nodes.len() >= self.cfg.max_tree_nodes {
-                    break;
-                }
+            let mut descendants = Vec::new();
 
+            for follower in followers {
                 let mut branch_context = context_path.clone();
                 let mut branch_parent = parent;
                 let mut branch_depth = depth;
@@ -554,6 +571,15 @@ pub mod cacheback_tree {
                     branch_parent = Some(idx);
                 }
 
+                if branch_context.len() > context_path.len() {
+                    descendants.push((branch_context, branch_parent, branch_depth));
+                }
+            }
+
+            for (branch_context, branch_parent, branch_depth) in descendants {
+                if nodes.len() >= self.cfg.max_tree_nodes {
+                    break;
+                }
                 self.expand_from_context(branch_context, branch_parent, branch_depth, nodes);
             }
         }
@@ -651,6 +677,27 @@ mod cacheback_tree_tests {
         let mut drafter = CachebackTreeDrafter::new(cfg).unwrap();
         drafter.observe_committed(&[1, 2, 5, 6]);
         drafter.observe_committed(&[1, 2, 5, 7]);
+
+        let tree = drafter.draft_tree(&[1, 2]).unwrap().unwrap();
+
+        assert_eq!(tree.tokens(), vec![5, 7, 6]);
+        assert_eq!(tree.parents(), vec![None, Some(0), Some(0)]);
+        assert_eq!(tree.leaf_count(), 2);
+    }
+
+    #[test]
+    fn shared_prefix_siblings_win_budget_before_recursive_descendants() {
+        let cfg = CachebackTreeConfig {
+            leader_len: 2,
+            follower_len: 2,
+            max_tree_nodes: 3,
+            max_tree_depth: 3,
+            cache_capacity: 16,
+        };
+        let mut drafter = CachebackTreeDrafter::new(cfg).unwrap();
+        drafter.observe_committed(&[1, 2, 5, 6]);
+        drafter.observe_committed(&[1, 2, 5, 7]);
+        drafter.observe_committed(&[5, 7, 9, 10]);
 
         let tree = drafter.draft_tree(&[1, 2]).unwrap().unwrap();
 
@@ -810,5 +857,63 @@ mod cacheback_tree_tests {
             .unwrap_err();
 
         assert!(err.contains("rejected_nodes"));
+    }
+
+    #[test]
+    fn accept_verified_rejects_inconsistent_verified_branches_without_cache_update() {
+        let cfg = CachebackTreeConfig {
+            leader_len: 2,
+            follower_len: 2,
+            max_tree_nodes: 4,
+            max_tree_depth: 2,
+            cache_capacity: 16,
+        };
+        let mut drafter = CachebackTreeDrafter::new(cfg).unwrap();
+        drafter.observe_committed(&[1, 2, 3, 4]);
+        drafter.observe_committed(&[1, 2, 5, 6]);
+        let tree = drafter.draft_tree(&[1, 2]).unwrap().unwrap();
+        let mut inconsistent = tree
+            .verify(&VerificationPredictions {
+                root_next_token: 5,
+                node_next_tokens: vec![6, 42, 4, 99],
+            })
+            .unwrap();
+        inconsistent.metrics.verified_branches = 999;
+
+        let err = drafter
+            .accept_verified(&[1, 2], &tree, &inconsistent)
+            .unwrap_err();
+
+        assert!(err.contains("verified_branches"));
+        assert!(drafter.draft_tree(&[5, 6]).unwrap().is_none());
+    }
+
+    #[test]
+    fn accept_verified_rejects_inconsistent_acceptance_rate_without_cache_update() {
+        let cfg = CachebackTreeConfig {
+            leader_len: 2,
+            follower_len: 2,
+            max_tree_nodes: 4,
+            max_tree_depth: 2,
+            cache_capacity: 16,
+        };
+        let mut drafter = CachebackTreeDrafter::new(cfg).unwrap();
+        drafter.observe_committed(&[1, 2, 3, 4]);
+        drafter.observe_committed(&[1, 2, 5, 6]);
+        let tree = drafter.draft_tree(&[1, 2]).unwrap().unwrap();
+        let mut inconsistent = tree
+            .verify(&VerificationPredictions {
+                root_next_token: 5,
+                node_next_tokens: vec![6, 42, 4, 99],
+            })
+            .unwrap();
+        inconsistent.metrics.accepted_tokens_per_verifier_pass = 999.0;
+
+        let err = drafter
+            .accept_verified(&[1, 2], &tree, &inconsistent)
+            .unwrap_err();
+
+        assert!(err.contains("accepted_tokens_per_verifier_pass"));
+        assert!(drafter.draft_tree(&[5, 6]).unwrap().is_none());
     }
 }
