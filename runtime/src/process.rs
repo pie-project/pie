@@ -336,7 +336,7 @@ impl Process {
         let result: Result<String, String> = async {
             // capture_outputs ⇒ an attached client drains the per-process actor
             // channel; otherwise this is a headless one-shot whose output is dropped.
-            let output = if capture_outputs { OutputMode::Process } else { OutputMode::Discard };
+            let output = if capture_outputs { OutputMode::Stream } else { OutputMode::Discard };
             let (mut store, instance) = linker::instantiate(process_id, username, &program, output, token_budget)
                 .await
                 .map_err(|e| e.to_string())?;
