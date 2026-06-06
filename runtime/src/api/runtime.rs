@@ -24,6 +24,6 @@ impl pie::core::runtime::Host for InstanceState {
     }
 
     async fn max_output_tokens(&mut self) -> Result<u32> {
-        Ok(model::min_kv_capacity_tokens())
+        Ok(model::min_output_token_ceiling())
     }
 }
