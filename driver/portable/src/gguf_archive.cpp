@@ -210,6 +210,18 @@ GGUFArchive::GGUFArchive(const std::filesystem::path& gguf_file) {
         meta_.general_name = it->second.str_value;
     }
 
+    // Capture the tokens-array length for vocab_size fallback. Most GGUFs
+    // omit `<arch>.vocab_size` but always store `tokenizer.ggml.tokens`.
+    {
+        const std::int64_t tok_id =
+            gguf_find_key(gctx_, "tokenizer.ggml.tokens");
+        if (tok_id >= 0 &&
+            gguf_get_kv_type(gctx_, tok_id) == GGUF_TYPE_ARRAY &&
+            gguf_get_arr_type(gctx_, tok_id) == GGUF_TYPE_STRING) {
+            meta_.tokens_count = gguf_get_arr_n(gctx_, tok_id);
+        }
+    }
+
     // ---- Build the StTensor table keyed by HF canonical name -----------
     const std::int64_t n_tensors = gguf_get_n_tensors(gctx_);
     raw_names_.reserve(static_cast<std::size_t>(n_tensors));

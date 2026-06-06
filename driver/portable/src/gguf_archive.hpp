@@ -32,6 +32,11 @@ struct GgufMeta {
     std::string  general_architecture;   // "qwen3", "llama", "qwen3_5_moe", ...
     std::string  general_name;
     bool         has_output_weight = false; // false → tied embeddings
+    // Length of the `tokenizer.ggml.tokens` array, captured during archive
+    // construction. Many GGUFs omit `<arch>.vocab_size` and rely on the
+    // tokens-array length as the canonical vocab count, so we surface it
+    // here for hparams fallback.
+    std::size_t  tokens_count = 0;
     // All KV pairs as (key, type-erased) — used by the hparams parser.
     // Type is one of gguf_type's underlying values.
     struct KV { std::string key; std::int32_t type; std::string str_value;
