@@ -14,6 +14,9 @@ use crate::model::instruct::{
 use crate::model::instruct::decoders::{GenericChatDecoder, ThinkingDecoder};
 use crate::model::tokenizer::Tokenizer;
 
+const SYSTEM_PREAMBLE: &str =
+    "Cutting Knowledge Date: December 2023\nToday Date: 26 Jul 2024\n\n";
+
 static TEMPLATE: &str = r#"
 {{- bos_token }}
 {%- if custom_tools is defined %}
@@ -109,6 +112,7 @@ static TEMPLATE: &str = r#"
 
 pub struct LlamaInstruct {
     tokenizer: Arc<Tokenizer>,
+    bos_token: Vec<u32>,
     system_prefix: Vec<u32>,
     user_prefix: Vec<u32>,
     assistant_prefix: Vec<u32>,
@@ -150,11 +154,16 @@ impl LlamaInstruct {
         let user_prefix = make_role("user");
         let assistant_prefix = make_role("assistant");
         let ipython_prefix = make_role("ipython");
+        let bos_token = tokenizer
+            .token_to_id("<|begin_of_text|>")
+            .map(|id| vec![id])
+            .unwrap_or_else(|| encode("<|begin_of_text|>"));
 
         // Turn suffix: <|eot_id|>
         let turn_suffix = encode("<|eot_id|>");
 
         Self {
+            bos_token,
             system_prefix,
             user_prefix,
             assistant_prefix: assistant_prefix.clone(),
@@ -170,7 +179,19 @@ impl LlamaInstruct {
 
     fn role_tokens(&self, prefix: &[u32], msg: &str) -> Vec<u32> {
         let mut tokens = prefix.to_vec();
-        tokens.extend(self.tokenizer.encode(msg));
+        tokens.extend(self.tokenizer.encode(msg.trim()));
+        tokens.extend(&self.turn_suffix);
+        tokens
+    }
+
+    fn system_tokens(&self, intro: &str, msg: &str) -> Vec<u32> {
+        let mut tokens = self.bos_token.clone();
+        tokens.extend(&self.system_prefix);
+        if !intro.is_empty() {
+            tokens.extend(self.tokenizer.encode(intro));
+        }
+        tokens.extend(self.tokenizer.encode(SYSTEM_PREAMBLE));
+        tokens.extend(self.tokenizer.encode(msg.trim()));
         tokens.extend(&self.turn_suffix);
         tokens
     }
@@ -178,7 +199,7 @@ impl LlamaInstruct {
 
 impl Instruct for LlamaInstruct {
     fn system(&self, msg: &str) -> Vec<u32> {
-        self.role_tokens(&self.system_prefix, msg)
+        self.system_tokens("", msg)
     }
 
     fn user(&self, msg: &str) -> Vec<u32> {
@@ -200,9 +221,7 @@ impl Instruct for LlamaInstruct {
     fn equip(&self, tools: &[String]) -> Vec<u32> {
         if tools.is_empty() { return Vec::new(); }
         
-        let mut prompt = String::from("Environment: ipython\n");
-        prompt.push_str("Cutting Knowledge Date: December 2023\n");
-        prompt.push_str("Today Date: 26 Jul 2024\n\n");
+        let mut prompt = String::new();
         prompt.push_str("You have access to the following functions. To call a function, please respond with JSON for a function call.");
         prompt.push_str("Respond in the format {\"name\": function name, \"parameters\": dictionary of argument name and its value}.");
         prompt.push_str("Do not use variables.\n\n");
@@ -211,7 +230,7 @@ impl Instruct for LlamaInstruct {
             prompt.push_str(tool);
             prompt.push_str("\n\n");
         }
-        self.system(&prompt)
+        self.system_tokens("Environment: ipython\n", &prompt)
     }
 
     fn answer(&self, _name: &str, value: &str) -> Vec<u32> {
@@ -323,6 +342,7 @@ mod tests {
 
     fn llama3() -> LlamaInstruct {
         let tok = make_tok(&[
+            "<|begin_of_text|>",
             "<|start_header_id|>", "<|end_header_id|>", "<|eot_id|>",
             "<|end_of_text|>", "<|eom_id|>", "system", "user", "assistant",
             "ipython", "\n", "Hello", "<think>", "</think>", " ",
@@ -334,9 +354,28 @@ mod tests {
             "You have access to the following functions. To call a function, please respond with JSON for a function call.Respond in the format {\"name\": function name, \"parameters\": dictionary of argument name and its value}.Do not use variables.\n\n",
             "You", "have", "access", "to", "the", "following", "functions...", 
             "Respond", "in", "format...",
-            "42", "{\"name\":\"f\"}"
+            "42", "{\"name\":\"f\"}",
+            "a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l", "m",
+            "n", "o", "p", "q", "r", "s", "t", "u", "v", "w", "x", "y", "z",
+            "C", "D", "H", "J", "K", "T", "Y", "0", "2", "3", "4", "6",
+            ":", ".",
         ]);
         LlamaInstruct::new(tok)
+    }
+
+    #[test]
+    fn system_prompt_matches_llama31_template_prologue() {
+        let inst = llama3();
+        let tokens = inst.system("Hello");
+        let text = inst.tokenizer.decode(&tokens, false);
+        assert_eq!(
+            text,
+            "<|begin_of_text|>\
+             <|start_header_id|>system<|end_header_id|>\n\n\
+             Cutting Knowledge Date: December 2023\n\
+             Today Date: 26 Jul 2024\n\n\
+             Hello<|eot_id|>"
+        );
     }
 
     #[test]
@@ -403,7 +442,11 @@ mod tests {
         let text = inst.tokenizer.decode(&tokens, false);
         assert_eq!(
             text,
-            "<|start_header_id|>system<|end_header_id|>\n\nHello<|eot_id|>\
+            "<|begin_of_text|>\
+             <|start_header_id|>system<|end_header_id|>\n\n\
+             Cutting Knowledge Date: December 2023\n\
+             Today Date: 26 Jul 2024\n\n\
+             Hello<|eot_id|>\
              <|start_header_id|>user<|end_header_id|>\n\nHello<|eot_id|>\
              <|start_header_id|>assistant<|end_header_id|>\n\nHello<|eot_id|>\
              <|start_header_id|>user<|end_header_id|>\n\nHello<|eot_id|>\
