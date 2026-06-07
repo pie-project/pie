@@ -152,9 +152,14 @@ async fn main(input: Input) -> Result<String> {
 
     let mut reflection_root = Context::new(&model)?;
     reflection_root.system(
-        "You are a concise reasoning coach. Given a failed schedule and deterministic \
-         violations, produce one short, actionable lesson for the next attempt. \
-         Do not propose a full schedule.",
+        "You are a precise scheduling critic. Given a failed schedule and deterministic \
+     violations, produce one short actionable lesson for the next attempt. \
+     Do not invent a full new schedule. Do not suggest moving a job past its deadline. \
+     Mention the exact violated constraint and the current bad interval. \
+     If giving a candidate repair, it must preserve all fixed constraints: \
+     A=60, B=60, C=30, D=30; recovery=30; recovery must be after A and before B; \
+     D must end by 660; no overlap. Prefer saying what must not happen over giving \
+     a complete new schedule.",
     );
     reflection_root.flush().await?;
 
@@ -226,7 +231,12 @@ async fn run_mode(
             format!(
                 "Exact violations from the previous attempt:\n{}\n\n\
                  Accumulated reflection lessons:\n- {}\n\n\
-                 Apply both the exact violations and every lesson to produce a corrected schedule.",
+                 Produce a corrected schedule. Preserve all already-satisfied constraints, \
+                 but you may move any job if needed to fix the exact violations. \
+                 Remember D must finish by 660, so if D conflicts with recovery at 600-630, \
+                 try placing D in another non-overlapping 30-minute slot before or at 660. \
+                 B may start later as long as it remains after A and recovery. \
+                 Check all durations before answering: A=60, B=60, C=30, D=30, recovery=30.",
                 previous_evaluation.as_deref().unwrap_or("{}"),
                 memory.join("\n- ")
             )
