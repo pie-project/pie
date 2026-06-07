@@ -473,7 +473,7 @@ jobs:
         # Pure-JS action — no `gh` install required on the bare-metal
         # runner. Existing assets with the same name are replaced
         # (same effect as `gh release upload --clobber`).
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ inputs.tag }}
           files: dist/${{ env.ARTIFACT_NAME }}
@@ -582,7 +582,7 @@ jobs:
           ls -la dist/
 
       - name: Upload to release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ inputs.tag }}
           files: dist/${{ env.ARTIFACT_NAME }}
