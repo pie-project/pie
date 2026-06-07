@@ -91,6 +91,15 @@ pub mod model {
 
 pub mod runtime {
     pub use crate::pie::core::runtime::*;
+
+    /// Runtime-reported output-token ceiling.
+    ///
+    /// Older Pie WIT does not expose this value. Return `0` as the explicit
+    /// "unknown" sentinel so callers that understand the newer helper can
+    /// fall back locally without failing to compile against this SDK pin.
+    pub fn max_output_tokens() -> u32 {
+        0
+    }
 }
 
 pub mod scheduling {
