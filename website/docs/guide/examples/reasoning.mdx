@@ -1,12 +1,12 @@
 ---
 title: Reasoning patterns
-description: Branching, decomposition, and reflective retry
+description: Tree, graph, recursion, and reflection patterns
 sidebar_position: 7
 ---
 
 # Reasoning patterns
 
-Inferlets that branch, decompose, or iteratively improve reasoning. They use the KV cache's copy-on-write fork to share stable prefixes while exploring divergent attempts.
+Inferlets that branch, decompose, or iteratively improve reasoning. Branching patterns use the KV cache's copy-on-write fork to keep memory and compute proportional to divergent tokens.
 
 | Inferlet | What it shows |
 |---|---|
