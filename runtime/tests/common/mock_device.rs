@@ -1,324 +1,154 @@
 //! Mock device backend for integration tests.
 //!
-//! Provides a trait-based mock that speaks the real IPC protocol
-//! via `RpcServer`, allowing integration tests to exercise the full
-//! RPC stack without a Python backend.
+//! A real pie device exposes two planes, and the mock must serve both:
+//!
+//!   * **Control plane** — a named Mach `RpcServer`. The runtime's
+//!     `device::spawn` does `RpcClient::connect(hostname)` at bootstrap, so the
+//!     mock must answer on the hostname it advertises. Control calls are
+//!     answered with empty payloads (the integration tests never drive a
+//!     control method that needs a structured reply; bootstrap only needs the
+//!     connection to be live).
+//!   * **Forward-pass plane** — a POSIX shared-memory region. The runtime's
+//!     `device::fire_batch` only speaks the shmem fast path (`shmem_ipc`), so
+//!     the mock hosts the dummy driver's shmem server (`pie_driver_dummy_lib`)
+//!     at the exact region name the client attaches to (`shmem::region_name`).
+//!     The dummy `Handler` decodes each batched request and fabricates valid
+//!     per-slot token outputs.
+//!
+//! This is a faithful device double, not a stub: forward passes traverse the
+//! real shmem request/response wire format through the real decode/encode path.
+//! Tests assert that forward passes complete (and how many tokens they yield),
+//! not specific token values, so the dummy handler's fabricated tokens are
+//! sufficient and honest.
 
-use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::thread::JoinHandle;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use pie::device::RpcServer;
-use pie::inference::request::{
-    BatchedForwardPassRequest, BatchedForwardPassResponse, ForwardPassResponse,
-};
+use pie::shmem::region_name;
+use pie_driver_dummy_lib::handler::Handler;
+use pie_driver_dummy_lib::shmem::{ShmemServer, METHOD_TAG_FIRE_BATCH};
 
-// =============================================================================
-// Behavior Trait
-// =============================================================================
-
-/// Trait for defining mock device behavior.
-///
-/// Implementors define how the mock device responds to `fire_batch` RPC calls.
-pub trait Behavior: Send + Sync + 'static {
-    /// Handle a batched forward pass request and return a response.
-    fn handle_fire_batch(&self, req: &BatchedForwardPassRequest) -> BatchedForwardPassResponse;
-}
-
-// =============================================================================
-// Built-in Behaviors
-// =============================================================================
-
-/// Always returns the same token for every request in the batch.
-pub struct EchoBehavior(pub u32);
-
-impl Behavior for EchoBehavior {
-    fn handle_fire_batch(&self, req: &BatchedForwardPassRequest) -> BatchedForwardPassResponse {
-        let num_requests = req.num_requests();
-        BatchedForwardPassResponse {
-            results: (0..num_requests)
-                .map(|_| ForwardPassResponse {
-                    tokens: vec![self.0],
-                    dists: vec![],
-                    logits: vec![],
-                    logprobs: vec![],
-                    entropies: vec![],
-                    spec_tokens: vec![],
-                    spec_positions: vec![],
-                })
-                .collect(),
-        }
-    }
-}
-
-/// Returns sequential tokens starting from the given value.
-pub struct CounterBehavior {
-    next: AtomicU32,
-}
-
-impl CounterBehavior {
-    pub fn new(start: u32) -> Self {
-        Self {
-            next: AtomicU32::new(start),
-        }
-    }
-}
-
-impl Behavior for CounterBehavior {
-    fn handle_fire_batch(&self, req: &BatchedForwardPassRequest) -> BatchedForwardPassResponse {
-        let num_requests = req.num_requests();
-        BatchedForwardPassResponse {
-            results: (0..num_requests)
-                .map(|_| {
-                    let token = self.next.fetch_add(1, Ordering::Relaxed);
-                    ForwardPassResponse {
-                        tokens: vec![token],
-                        dists: vec![],
-                        logits: vec![],
-                        logprobs: vec![],
-                        entropies: vec![],
-                        spec_tokens: vec![],
-                        spec_positions: vec![],
-                    }
-                })
-                .collect(),
-        }
-    }
-}
-
-/// Wraps another behavior and adds simulated latency before responding.
-pub struct DelayedBehavior<B: Behavior> {
-    pub inner: B,
-    pub latency: Duration,
-}
-
-impl<B: Behavior> Behavior for DelayedBehavior<B> {
-    fn handle_fire_batch(&self, req: &BatchedForwardPassRequest) -> BatchedForwardPassResponse {
-        std::thread::sleep(self.latency);
-        self.inner.handle_fire_batch(req)
-    }
-}
-
-/// Wraps another behavior and fails after N successful calls.
-pub struct FailAfterBehavior<B: Behavior> {
-    pub inner: B,
-    remaining: AtomicU32,
-}
-
-impl<B: Behavior> FailAfterBehavior<B> {
-    pub fn new(inner: B, success_count: u32) -> Self {
-        Self {
-            inner,
-            remaining: AtomicU32::new(success_count),
-        }
-    }
-}
-
-impl<B: Behavior> Behavior for FailAfterBehavior<B> {
-    fn handle_fire_batch(&self, req: &BatchedForwardPassRequest) -> BatchedForwardPassResponse {
-        if self.remaining.fetch_sub(1, Ordering::Relaxed) == 0 {
-            // Return empty results to simulate failure
-            BatchedForwardPassResponse { results: vec![] }
-        } else {
-            self.inner.handle_fire_batch(req)
-        }
-    }
-}
-
-// =============================================================================
-// Call Recorder
-// =============================================================================
-
-/// A recorded RPC call for test assertions.
-#[derive(Debug, Clone)]
-pub struct RecordedCall {
-    pub device_idx: usize,
-    pub method: String,
-    pub num_requests: usize,
-    pub total_tokens: usize,
-    pub timestamp: Instant,
-}
-
-/// Records all RPC calls made to mock devices for later assertion.
-pub struct CallRecorder {
-    calls: Mutex<Vec<RecordedCall>>,
-}
-
-impl CallRecorder {
-    fn new() -> Self {
-        Self {
-            calls: Mutex::new(Vec::new()),
-        }
-    }
-
-    fn record(&self, call: RecordedCall) {
-        self.calls.lock().unwrap().push(call);
-    }
-
-    /// Returns the total number of recorded calls.
-    pub fn call_count(&self) -> usize {
-        self.calls.lock().unwrap().len()
-    }
-
-    /// Returns a snapshot of all recorded calls.
-    pub fn calls(&self) -> Vec<RecordedCall> {
-        self.calls.lock().unwrap().clone()
-    }
-
-    /// Blocks until at least `n` calls have been recorded, or until `timeout`.
-    /// Returns `true` if the condition was met, `false` on timeout.
-    pub fn wait_for_calls(&self, n: usize, timeout: Duration) -> bool {
-        let deadline = Instant::now() + timeout;
-        loop {
-            if self.call_count() >= n {
-                return true;
-            }
-            if Instant::now() >= deadline {
-                return false;
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        }
-    }
-}
+/// Shmem region geometry. The runtime client reads slot/buffer sizes from the
+/// region header, so only the *name* must agree; these mirror the dummy
+/// driver's defaults and are generous for test batches.
+const NUM_SLOTS: usize = 8;
+const REQ_BUF: usize = 4 * 1024 * 1024;
+const RESP_BUF: usize = 4 * 1024 * 1024;
+/// Server poll interval — small enough to answer well within the client's
+/// busy-spin window without pinning a core per device thread.
+const SERVER_SPIN_US: u64 = 50;
+/// Deterministic token source for the fabricated forward-pass outputs.
+const HANDLER_SEED: u64 = 42;
+const HANDLER_VOCAB: u32 = 32_000;
 
 // =============================================================================
 // Mock Backend
 // =============================================================================
 
-/// A mock device backend that runs `RpcServer` instances in background threads.
-///
-/// Each device gets its own `RpcServer` and poll/respond thread.
-/// Drop closes all servers and joins threads.
+/// A mock device backend hosting, per device, a control RPC server plus a
+/// shmem forward-pass server. Drop closes/stops both and joins their threads.
 pub struct MockBackend {
-    servers: Vec<Arc<RpcServer>>,
+    rpc_servers: Vec<Arc<RpcServer>>,
+    shmem_servers: Vec<Arc<ShmemServer>>,
     handles: Vec<JoinHandle<()>>,
     server_names: Vec<String>,
-    recorder: Arc<CallRecorder>,
 }
 
 impl MockBackend {
-    /// Create a new mock backend with `num_devices` devices, all using the same behavior.
-    pub fn new(num_devices: usize, behavior: Arc<dyn Behavior>) -> Self {
-        let recorder = Arc::new(CallRecorder::new());
-        let mut servers = Vec::with_capacity(num_devices);
-        let mut handles = Vec::with_capacity(num_devices);
+    /// Create a backend for `num_devices` devices.
+    pub fn new(num_devices: usize) -> Self {
+        let mut rpc_servers = Vec::with_capacity(num_devices);
+        let mut shmem_servers = Vec::with_capacity(num_devices);
+        let mut handles = Vec::with_capacity(num_devices * 2);
         let mut server_names = Vec::with_capacity(num_devices);
 
         for device_idx in 0..num_devices {
-            let server = Arc::new(
-                RpcServer::create().expect("Failed to create mock RpcServer"),
+            // Control plane: Mach RPC server. The advertised name becomes the
+            // device hostname the runtime connects to.
+            let rpc = Arc::new(RpcServer::create().expect("Failed to create mock RpcServer"));
+            let name = rpc.server_name().to_string();
+            let rpc_clone = Arc::clone(&rpc);
+            let rpc_handle = std::thread::Builder::new()
+                .name(format!("mock-rpc-{device_idx}"))
+                .spawn(move || control_loop(rpc_clone))
+                .expect("Failed to spawn mock control thread");
+
+            // Forward-pass plane: shmem server at the region the client attaches
+            // to for this device index.
+            let shmem = Arc::new(
+                ShmemServer::create(
+                    &region_name(device_idx),
+                    NUM_SLOTS,
+                    REQ_BUF,
+                    RESP_BUF,
+                    SERVER_SPIN_US,
+                )
+                .expect("Failed to create mock shmem device server"),
             );
-            let name = server.server_name().to_string();
-
-            let server_clone = Arc::clone(&server);
-            let behavior_clone = Arc::clone(&behavior);
-            let recorder_clone = Arc::clone(&recorder);
-
-            let handle = std::thread::Builder::new()
-                .name(format!("mock-device-{device_idx}"))
+            let shmem_clone = Arc::clone(&shmem);
+            let shmem_handle = std::thread::Builder::new()
+                .name(format!("mock-shmem-{device_idx}"))
                 .spawn(move || {
-                    Self::poll_loop(device_idx, server_clone, behavior_clone, recorder_clone);
+                    let mut handler = Handler::new(HANDLER_SEED, HANDLER_VOCAB);
+                    shmem_clone.serve_forever(|req, resp| {
+                        if req.method_tag != METHOD_TAG_FIRE_BATCH {
+                            return 0;
+                        }
+                        handler.handle_fire_batch(req.payload, resp)
+                    });
                 })
-                .expect("Failed to spawn mock device thread");
+                .expect("Failed to spawn mock shmem thread");
 
-            servers.push(server);
-            handles.push(handle);
+            rpc_servers.push(rpc);
+            shmem_servers.push(shmem);
+            handles.push(rpc_handle);
+            handles.push(shmem_handle);
             server_names.push(name);
         }
 
         Self {
-            servers,
+            rpc_servers,
+            shmem_servers,
             handles,
             server_names,
-            recorder,
         }
     }
 
-    /// Returns the IPC server names, one per device.
-    /// Use these as `DeviceConfig.hostname`.
+    /// Returns one control-plane RPC name per device, for `DeviceConfig.hostname`.
     pub fn server_names(&self) -> &[String] {
         &self.server_names
     }
+}
 
-    /// Access the shared call recorder for assertions.
-    pub fn recorder(&self) -> &CallRecorder {
-        &self.recorder
-    }
-
-    fn poll_loop(
-        device_idx: usize,
-        server: Arc<RpcServer>,
-        behavior: Arc<dyn Behavior>,
-        recorder: Arc<CallRecorder>,
-    ) {
-        let poll_timeout = Duration::from_millis(100);
-
-        loop {
-            match server.poll(poll_timeout) {
-                Ok(Some(request)) => {
-                    let method = request.method.clone();
-
-                    let response_payload = if method == "fire_batch" {
-                        // Deserialize the batched request
-                        let batch_req: BatchedForwardPassRequest =
-                            rmp_serde::from_slice(&request.payload)
-                                .expect("Failed to deserialize BatchedForwardPassRequest");
-
-                        // Record the call
-                        recorder.record(RecordedCall {
-                            device_idx,
-                            method: method.clone(),
-                            num_requests: batch_req.num_requests(),
-                            total_tokens: batch_req.total_tokens(),
-                            timestamp: Instant::now(),
-                        });
-
-                        // Dispatch to behavior
-                        let response = behavior.handle_fire_batch(&batch_req);
-                        rmp_serde::to_vec(&response)
-                            .expect("Failed to serialize BatchedForwardPassResponse")
-                    } else {
-                        // Record unknown methods too
-                        recorder.record(RecordedCall {
-                            device_idx,
-                            method: method.clone(),
-                            num_requests: 0,
-                            total_tokens: 0,
-                            timestamp: Instant::now(),
-                        });
-                        // Return empty response for unknown methods
-                        vec![]
-                    };
-
-                    if let Err(e) = server.respond(request.request_id, response_payload) {
-                        tracing::warn!(
-                            "Mock device {device_idx}: failed to send response: {e}"
-                        );
-                    }
-                }
-                Ok(None) => {
-                    // Timeout, check if closed
-                    if server.is_closed() {
-                        break;
-                    }
-                }
-                Err(_) => {
-                    // Server closed or channel error
+/// Control-plane poll loop: answer every request with an empty payload until
+/// the server closes. Forward passes never arrive here (they go via shmem).
+fn control_loop(server: Arc<RpcServer>) {
+    let poll_timeout = Duration::from_millis(100);
+    loop {
+        match server.poll(poll_timeout) {
+            Ok(Some(request)) => {
+                let _ = server.respond(request.request_id, Vec::new());
+            }
+            Ok(None) => {
+                if server.is_closed() {
                     break;
                 }
             }
+            Err(_) => break,
         }
     }
 }
 
 impl Drop for MockBackend {
     fn drop(&mut self) {
-        // Close all servers first
-        for server in &self.servers {
+        for server in &self.rpc_servers {
             server.close();
         }
-        // Then join all threads
+        for server in &self.shmem_servers {
+            server.stop();
+        }
         for handle in self.handles.drain(..) {
             let _ = handle.join();
         }

@@ -8,11 +8,11 @@
 //! allocating KV pages. Multiple concurrent processes naturally
 //! exhaust pages and trigger eviction, wait queue, and restore paths.
 
-use std::sync::{Arc, OnceLock};
+use std::sync::OnceLock;
 use std::time::Duration;
 
 mod common;
-use common::{create_mock_env, MockEnv, mock_device::EchoBehavior, inferlets};
+use common::{create_mock_env, MockEnv, inferlets};
 
 use pie::workflow;
 
@@ -36,7 +36,7 @@ fn state() -> &'static TestState {
 
         let rt = tokio::runtime::Runtime::new().unwrap();
         // 2 GPUs, 8 pages each — tight budget to force contention
-        let env = create_mock_env("contention-model", 2, 8, Arc::new(EchoBehavior(42)));
+        let env = create_mock_env("contention-model", 2, 8);
         let config = env.config();
         rt.block_on(async {
             pie::bootstrap::bootstrap(config).await.unwrap();

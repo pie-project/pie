@@ -16,9 +16,14 @@
 //! is called. See README.md for the config schema and limitations.
 
 mod config;
-mod handler;
+// `handler` and `shmem` are public so the runtime's integration-test harness
+// can host the same shmem forward-pass server the production driver uses
+// (the runtime's `device::fire_batch` only speaks the shmem fast path, so a
+// mock device must serve shmem, not RPC). `schema` stays crate-private — it is
+// reached transitively through `Handler`.
+pub mod handler;
 mod schema;
-mod shmem;
+pub mod shmem;
 
 use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_int, c_void};

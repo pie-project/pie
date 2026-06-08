@@ -88,6 +88,10 @@ windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_
 tempfile = "3"
 criterion = { version = "0.5", features = ["html_reports"] }
 tokenizers = "0.21"
+# Integration tests host the dummy driver's shmem forward-pass server as the
+# mock device: the runtime's `device::fire_batch` only speaks the shmem fast
+# path, so a mock device must serve shmem (not RPC) to answer forward passes.
+pie-driver-dummy = { path = "../driver/dummy" }
 
 [[bench]]
 name = "inferlet_bench"
