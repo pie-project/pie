@@ -1,0 +1,15 @@
+[package]
+name = "reflexion"
+version = "0.1.0"
+description = "Reflexion-style scheduling with deterministic evaluation and verbal memory"
+authors = ["Pie Team"]
+
+[runtime]
+core = "^0.2.0"
+mcp = "^0.2.0"
+
+[parameters]
+mode = {type = "string", optional = true, description = "'reflexion' | 'baseline' | 'both' (default: 'reflexion')"}
+max_iterations = {type = "int", optional = true, description = "Maximum attempt-reflect-retry iterations (default: 3)"}
+max_tokens = {type = "int", optional = true, description = "Max tokens for each schedule attempt (default: 256)"}
+reflection_tokens = {type = "int", optional = true, description = "Max tokens for each verbal reflection (default: 128)"}
