@@ -1,6 +1,7 @@
 #include "gguf_archive.hpp"
 
 #include <fstream>
+#include <iostream>
 #include <stdexcept>
 #ifndef _WIN32
 #include <fcntl.h>
@@ -341,8 +342,6 @@ const StTensor& GGUFArchive::at(const std::string& name) const {
     return *t;
 }
 
-}  // namespace pie_portable_driver
-
 // ---------------------------------------------------------------------------
 // GGUFArchive::open_sharded — multi-file / split GGUF loader
 // ---------------------------------------------------------------------------
@@ -485,3 +484,5 @@ GGUFArchive::open_sharded(const std::filesystem::path& first_shard) {
 
     return primary;
 }
+
+}  // namespace pie_portable_driver
