@@ -898,7 +898,7 @@ impl Grammar {
     ///
     /// # Example
     /// ```
-    /// use pie_grammar::grammar::Grammar;
+    /// use pie::inference::structured::grammar::Grammar;
     ///
     /// let grammar = Grammar::from_ebnf(r#"root ::= "hello" | "world""#, "root").unwrap();
     /// assert_eq!(grammar.num_rules(), 1);
