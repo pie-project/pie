@@ -42,14 +42,14 @@ fn create_and_save_and_open() {
             .unwrap();
 
         // Anonymous context is not findable by name
-        let found = pie::context::lookup_snapshot(MODEL, USER.to_string(), "test-ctx".into()).await;
+        let found = pie::context::lookup(MODEL, USER.to_string(), "test-ctx".into()).await;
         assert!(found.is_err());
 
         // Save it with a name
         pie::context::save(MODEL, id, USER.to_string(), Some("test-ctx".into())).await.unwrap();
 
         // Now it should be findable (lookup + fork returns a different id)
-        let snapshot_id = pie::context::lookup_snapshot(MODEL, USER.to_string(), "test-ctx".into()).await.unwrap();
+        let snapshot_id = pie::context::lookup(MODEL, USER.to_string(), "test-ctx".into()).await.unwrap();
         let found = pie::context::fork(MODEL, snapshot_id, test_pid()).await;
         assert!(found.is_ok());
     });
