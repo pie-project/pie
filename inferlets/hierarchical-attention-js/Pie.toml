@@ -1,0 +1,21 @@
+[package]
+name = "hierarchical-attention-js"
+version = "0.1.0"
+description = "TypeScript hierarchical attention mask demo over chunk summaries plus selected local chunk"
+authors = ["Abraam Mankaruse"]
+
+[runtime]
+core = "^0.2.0"
+mcp = "^0.2.0"
+
+[parameters]
+prompt = {type = "string", optional = true, description = "User prompt"}
+max_tokens = {type = "int", optional = true, description = "Maximum number of output tokens"}
+
+chunk_size_words = {type = "int", optional = true, description = "Approximate words per chunk"}
+sink_tokens = {type = "int", optional = true, description = "Initial tokens always visible"}
+summary_tokens_per_chunk = {type = "int", optional = true, description = "Header tokens kept for every chunk"}
+local_window_tokens = {type = "int", optional = true, description = "Recent committed tokens always visible"}
+selected_chunks = {type = "int", optional = true, description = "How many full chunk bodies to keep visible (default 1)"}
+selection_mode = {type = "string", optional = true, description = "Chunk relevance scoring: 'lexical' (default)"}
+
