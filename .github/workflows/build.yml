@@ -404,7 +404,7 @@ jobs:
       CMAKE_CUDA_COMPILER_LAUNCHER: env
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           # Workspace persists between jobs on bare-metal; clean to keep
           # builds reproducible. The big caches live outside the
@@ -515,7 +515,7 @@ jobs:
       CMAKE_CUDA_RUNTIME_LIBRARY: Shared
       CARGO_INCREMENTAL: "0"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Bootstrap container
         shell: bash
