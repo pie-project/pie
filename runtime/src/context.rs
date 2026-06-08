@@ -354,10 +354,50 @@ pub async fn commit_working_pages(model_idx: usize, id: ContextId, num_pages: us
     rx.await.context("context::commit_working_pages: actor dropped response")?
 }
 
+/// Hard bound on how long a working-page reservation may wait for KV
+/// capacity before failing the caller. Distinct from
+/// `scheduler.request_timeout_secs` (which bounds the *admitted* forward
+/// pass on the device): a reservation can defer indefinitely on the
+/// `alloc_queue` / `restore_queue` when concurrency exceeds the engine's
+/// KV slot count, and that deferral has no timer of its own. Without this
+/// bound an over-capacity request blocks on the response channel forever
+/// (the single-threaded guest cannot make any other WIT call meanwhile —
+/// see module header), emitting no response until the *client's* deadline.
+///
+/// Resolved once at startup from `PIE_ACQUIRE_TIMEOUT_S` (float seconds),
+/// defaulting to 120s to match the forward-pass request budget — long
+/// enough that a transient burst draining within a few admitted batches is
+/// still served, short enough that a genuinely over-subscribed request
+/// fails fast with a structured error instead of hanging the connection.
+static ACQUIRE_TIMEOUT: LazyLock<std::time::Duration> = LazyLock::new(|| {
+    const DEFAULT_SECS: f64 = 120.0;
+    let secs = std::env::var("PIE_ACQUIRE_TIMEOUT_S")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .filter(|v| v.is_finite() && *v > 0.0)
+        .unwrap_or(DEFAULT_SECS);
+    std::time::Duration::from_secs_f64(secs)
+});
+
 pub async fn reserve_working_pages(model_idx: usize, id: ContextId, num_pages: usize) -> Result<()> {
     let (tx, rx) = oneshot::channel();
     SERVICES.send(model_idx, Message::ReserveWorkingPages { id, num_pages, response: tx })?;
-    rx.await.context("context::reserve_working_pages: actor dropped response")?
+    // Bound the wait: a deferred reservation (no free KV slot, no evictable
+    // victim) otherwise never resolves. On timeout the guest's
+    // `reserve-working-pages` returns Err and the inferlet surfaces a
+    // structured `server_busy` envelope; the orphaned deferral is dropped
+    // when the giving-up process unregisters and its contexts are destroyed.
+    // The `server_busy:` prefix is a stable cross-boundary sentinel the
+    // chat-apc handler matches to map this to HTTP 503 (vs a generic 500).
+    match tokio::time::timeout(*ACQUIRE_TIMEOUT, rx).await {
+        Ok(res) => res.context("context::reserve_working_pages: actor dropped response")?,
+        Err(_elapsed) => Err(anyhow::anyhow!(
+            "server_busy: KV page acquisition timed out after {:?}; engine is over \
+             capacity (concurrent requests exceed the KV slot count) — no slot freed \
+             within the deadline",
+            *ACQUIRE_TIMEOUT
+        )),
+    }
 }
 
 pub fn release_working_pages(model_idx: usize, id: ContextId, num_pages: usize) -> Result<()> {
