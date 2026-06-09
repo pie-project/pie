@@ -1006,22 +1006,19 @@ fn noop_waker() -> Waker {
 
 /// Resolve one CML call to its live API and return the `[INTR]` payload.
 async fn execute_call(code: String, emulate_unknown: bool) -> String {
-    let lc = code.to_lowercase();
-    let result = if lc.contains("get_weather") || lc.contains("weather(") {
-        weather_call(&code).await
-    } else if lc.contains("stock_price") || lc.contains("get_stock") {
-        stock_call(&code).await
-    } else if lc.contains("convert_currency") || lc.contains("exchange_rate") {
-        currency_call(&code).await
-    } else if lc.contains("get_time") || lc.contains("time_in") || lc.contains("current_time") {
-        time_call(&code).await
-    } else if lc.contains("wiki_summary") || lc.contains("wikipedia") || lc.contains("wiki(") {
-        wiki_call(&code).await
-    } else if emulate_unknown {
+    // Match the exact callee (the text before the first `(`), not a substring,
+    // so names like `stock_price_history` or `get_weather_forecast` fall through
+    // to emulation/Err instead of misrouting to a live tool.
+    let callee = code.split('(').next().unwrap_or("").trim().to_lowercase();
+    let result = match callee.as_str() {
+        "get_weather" | "weather" => weather_call(&code).await,
+        "get_stock_price" | "stock_price" | "get_stock" => stock_call(&code).await,
+        "convert_currency" | "exchange_rate" => currency_call(&code).await,
+        "get_time" | "time_in" | "current_time" => time_call(&code).await,
+        "wiki_summary" | "wikipedia" | "wiki" => wiki_call(&code).await,
         // Not one of the five live tools -> BFCL latency-emulated call.
-        bfcl_emulated_call(&code).await
-    } else {
-        Err(format!("unknown tool in call body: {code}"))
+        _ if emulate_unknown => bfcl_emulated_call(&code).await,
+        _ => Err(format!("unknown tool in call body: {code}")),
     };
     result.unwrap_or_else(|e| format!("{{\"error\": {e:?}}}"))
 }
@@ -1230,11 +1227,14 @@ async fn currency_call(code: &str) -> std::result::Result<String, String> {
     Ok(format!("{{\"rate\": {rate}, \"quote\": \"{from}->{to}\"}}"))
 }
 
-/// 3-letter uppercase currency codes (e.g. USD, EUR) in order of appearance.
+/// 3-letter currency codes (e.g. USD, EUR) in order of appearance, normalized
+/// to uppercase so lowercase inputs like `convert_currency(10, "usd", "jpy")`
+/// still resolve. The split already yields all-alphabetic tokens, so only the
+/// length is filtered; downstream (Frankfurter) expects uppercase ISO codes.
 fn currency_codes(code: &str) -> Vec<String> {
     code.split(|c: char| !c.is_ascii_alphabetic())
-        .filter(|t| t.len() == 3 && t.chars().all(|c| c.is_ascii_uppercase()))
-        .map(str::to_string)
+        .filter(|t| t.len() == 3)
+        .map(|t| t.to_ascii_uppercase())
         .collect()
 }
 
