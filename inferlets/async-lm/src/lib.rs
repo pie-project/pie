@@ -53,6 +53,7 @@ use inferlet::model::{Model, Tokenizer};
 use inferlet::sample::Sampler;
 use inferlet::serde_json::Value;
 use inferlet::wstd;
+use inferlet::wstd::future::FutureExt;
 use inferlet::wstd::http::{Client, Method, Request};
 use inferlet::{Constrain, Context, Generator, Result, chat, runtime};
 use serde::Deserialize;
@@ -1050,9 +1051,14 @@ async fn bfcl_emulated_call(code: &str) -> std::result::Result<String, String> {
     ))
 }
 
+/// Per-request HTTP timeout. Tool calls run on the wstd reactor and are
+/// awaited at the trap, so without a bound a hung upstream would block the
+/// whole trap; on timeout the call folds into an `{"error": ...}` frame.
+const HTTP_TIMEOUT_SECS: u64 = 10;
+
 /// GET `url` and return the response body. Non-2xx and transport errors map
 /// to `Err`. A User-Agent is set because Wikipedia (and OSM) reject requests
-/// without one.
+/// without one. Both awaits are bounded by `HTTP_TIMEOUT_SECS`.
 async fn http_get(url: &str) -> std::result::Result<String, String> {
     let client = Client::new();
     let req = Request::builder()
@@ -1063,13 +1069,17 @@ async fn http_get(url: &str) -> std::result::Result<String, String> {
         .map_err(|e| format!("build request {url}: {e}"))?;
     let resp = client
         .send(req)
+        .timeout(wstd::time::Duration::from_secs(HTTP_TIMEOUT_SECS))
         .await
+        .map_err(|_| format!("timeout sending {url}"))?
         .map_err(|e| format!("send {url}: {e}"))?;
     let status = resp.status().as_u16();
     let mut body = resp.into_body();
     let bytes = body
         .bytes()
+        .timeout(wstd::time::Duration::from_secs(HTTP_TIMEOUT_SECS))
         .await
+        .map_err(|_| format!("timeout reading body {url}"))?
         .map_err(|e| format!("read body {url}: {e}"))?;
     let text = String::from_utf8_lossy(&bytes).into_owned();
     if !(200..300).contains(&status) {
@@ -1138,7 +1148,11 @@ async fn weather_call(code: &str) -> std::result::Result<String, String> {
         .get("current_condition")
         .and_then(|c| c.get(0))
         .ok_or("get_weather: no current_condition")?;
-    let temp_f = cur.get("temp_F").and_then(Value::as_str).unwrap_or("0");
+    let temp_f = cur
+        .get("temp_F")
+        .and_then(Value::as_str)
+        .and_then(|s| s.parse::<f64>().ok())
+        .unwrap_or(0.0);
     let sky = cur
         .get("weatherDesc")
         .and_then(|d| d.get(0))
@@ -1643,6 +1657,10 @@ async fn run_inner_session(
         }
         poll_and_collect_ready(pending, interrupts, true);
 
+        // Defer any checkpoint restart until the whole `out.tokens` batch is
+        // processed (see the `Event::Call` arm), so we never drop trailing
+        // tokens/events from this decode step mid-iteration.
+        let mut want_checkpoint = false;
         for &tok in &out.tokens {
             for event in parser.feed(tok, tokenizer) {
                 match event {
@@ -1663,10 +1681,12 @@ async fn run_inner_session(
                         });
                         interrupts.set_critical(false);
                         if !input.disable_checkpointing {
-                            // Paper-faithful path: tear the generator down to
-                            // snapshot a checkpoint at the call site, so a later
-                            // trap can Recompute by restoring it.
-                            return Ok(Restart::Checkpoint);
+                            // Paper-faithful path: snapshot a checkpoint so a
+                            // later trap can Recompute by restoring it. Flag it
+                            // here and tear the generator down only after the
+                            // current step is fully drained (below), rather than
+                            // returning mid-batch and dropping trailing tokens.
+                            want_checkpoint = true;
                         }
                         // Default path (`disable_checkpointing`): do NOT
                         // snapshot — keep decoding in one unbroken session so the
@@ -1775,6 +1795,12 @@ async fn run_inner_session(
                     }
                 }
             }
+        }
+
+        if want_checkpoint {
+            // Whole step drained; now tear the generator down so the outer
+            // loop snapshots a clean checkpoint and restarts (see `Restart`).
+            return Ok(Restart::Checkpoint);
         }
 
         if input.enable_midstream && !interrupts.in_critical_section && parser.is_clean() {
