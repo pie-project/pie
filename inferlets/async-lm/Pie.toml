@@ -1,0 +1,25 @@
+[package]
+name = "async-lm"
+version = "0.1.0"
+description = "AsyncLM: asynchronous LLM function calling — non-blocking tool calls that overlap decoding (arXiv:2412.07017)"
+authors = ["Pie Team"]
+repository = "https://github.com/pie-project/pie"
+
+[runtime]
+core = "^0.2.0"
+mcp = "^0.2.0"
+
+[parameters]
+prompt = {type = "string", description = "The user message to answer"}
+system = {type = "string", optional = true, description = "System prompt to set assistant behavior (default: AsyncLM/CML protocol instructions)"}
+max_tokens = {type = "int", optional = true, description = "Maximum number of tokens to generate (default: 2048)"}
+temperature = {type = "float", optional = true, description = "Sampling temperature (default: 0.6)"}
+top_p = {type = "float", optional = true, description = "Top-p nucleus sampling threshold (default: 0.95)"}
+alpha_recompute_ns_per_tok2 = {type = "float", optional = true, description = "Recompute cost-model alpha in ns/token^2 (default: 800)"}
+beta_swap_ns_per_tok = {type = "float", optional = true, description = "Swap cost-model beta in ns/token (default: 400000)"}
+enable_midstream = {type = "bool", optional = true, description = "Enable safe-boundary mid-stream [INTR] injection — deliver a result before the model reaches [TRAP]; default false"}
+enable_trace = {type = "bool", optional = true, description = "Emit machine-readable [TRACE] timeline events for offline latency analysis; default false"}
+enable_token_trace = {type = "bool", optional = true, description = "Emit verbose per-token [dbg] decode/injection diagnostics; default false"}
+disable_checkpointing = {type = "bool", optional = true, description = "Skip per-call checkpointing and force trap strategy Keep (one unbroken generator session); default true (set false for paper-faithful checkpoint/restore + Recompute)"}
+emulate_unknown_tools = {type = "bool", optional = true, description = "Treat unknown tools as BFCL latency-emulated calls instead of erroring; default false"}
+max_steps = {type = "int", optional = true, description = "Hard decode-step ceiling (default: 4x max_tokens)"}
