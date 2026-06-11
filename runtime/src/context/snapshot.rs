@@ -426,7 +426,9 @@ impl ContextManager {
             .keys()
             .filter(|(u, name)| u == &username && name.starts_with(&name_prefix))
             .count() as u32;
-        let reason = if !evicted_names.is_empty() {
+        let reason = if delete_failed_count > 0 && projected > target {
+            super::SnapshotRetentionReason::RetentionDeleteFailed
+        } else if !evicted_names.is_empty() {
             if projected > budget.hard_pages() {
                 super::SnapshotRetentionReason::HardCapStillExceeded
             } else {
@@ -720,5 +722,33 @@ mod retention_tests {
         assert_eq!(report.reason, SnapshotRetentionReason::EvictedPressure);
         assert!(mgr.snapshots.contains_key(&("u".to_string(), "apc/old".to_string())));
         assert!(!mgr.snapshots.contains_key(&("u".to_string(), "apc/new".to_string())));
+    }
+
+    #[test]
+    fn retention_reports_delete_failure_when_all_candidates_fail() {
+        let mut mgr = manager();
+        add_snapshot(&mut mgr, "u", "apc/old", 15);
+        add_snapshot(&mut mgr, "u", "apc/new", 15);
+
+        let report = mgr.enforce_snapshot_retention_with_delete(
+            "u".to_string(),
+            "apc/".to_string(),
+            "apc/current".to_string(),
+            SnapshotRetentionBudget {
+                kv_pages_used: 95,
+                kv_pages_total: 100,
+                soft_percent: 70,
+                evict_percent: 80,
+                hard_percent: 95,
+            },
+            |_mgr, _key| anyhow::bail!("injected delete failure"),
+        );
+
+        assert!(report.evicted_names.is_empty());
+        assert_eq!(report.pages_reclaimed, 0);
+        assert_eq!(report.delete_failed_count, 2);
+        assert_eq!(report.reason, SnapshotRetentionReason::RetentionDeleteFailed);
+        assert!(mgr.snapshots.contains_key(&("u".to_string(), "apc/old".to_string())));
+        assert!(mgr.snapshots.contains_key(&("u".to_string(), "apc/new".to_string())));
     }
 }

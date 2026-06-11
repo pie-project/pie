@@ -139,6 +139,7 @@ pub enum SnapshotRetentionReason {
     RetainedBelowEvictionLimit,
     EvictedPressure,
     HardCapStillExceeded,
+    RetentionDeleteFailed,
     ProtectedActive,
     NoInactiveSnapshots,
     SkippedUncertainAccounting,

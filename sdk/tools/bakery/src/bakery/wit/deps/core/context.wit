@@ -20,6 +20,7 @@ interface context {
         retained-below-eviction-limit,
         evicted-pressure,
         hard-cap-still-exceeded,
+        retention-delete-failed,
         protected-active,
         no-inactive-snapshots,
         skipped-uncertain-accounting,

@@ -313,6 +313,7 @@ impl From<SnapshotRetentionReason> for pie::core::context::RetentionReason {
             SnapshotRetentionReason::RetainedBelowEvictionLimit => Self::RetainedBelowEvictionLimit,
             SnapshotRetentionReason::EvictedPressure => Self::EvictedPressure,
             SnapshotRetentionReason::HardCapStillExceeded => Self::HardCapStillExceeded,
+            SnapshotRetentionReason::RetentionDeleteFailed => Self::RetentionDeleteFailed,
             SnapshotRetentionReason::ProtectedActive => Self::ProtectedActive,
             SnapshotRetentionReason::NoInactiveSnapshots => Self::NoInactiveSnapshots,
             SnapshotRetentionReason::SkippedUncertainAccounting => Self::SkippedUncertainAccounting,
