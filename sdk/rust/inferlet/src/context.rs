@@ -17,6 +17,7 @@ use serde_json;
 
 /// The raw WIT context resource, re-exported for power users.
 pub use crate::pie::core::context::Context as RawContext;
+pub use crate::pie::core::context::{RetentionBudget, RetentionReason, RetentionReport};
 
 // Instruct WIT bindings.
 use crate::pie::instruct::chat;
@@ -110,6 +111,26 @@ impl Context {
     /// Delete a saved snapshot by name (static — no context needed).
     pub fn delete(model: &Model, name: &str) -> Result<()> {
         RawContext::delete(model, name)
+    }
+
+    /// Mark a saved snapshot as protected by an in-flight request.
+    pub fn retain_snapshot(model: &Model, name: &str) -> Result<()> {
+        RawContext::retain_snapshot(model, name)
+    }
+
+    /// Release a prior in-flight snapshot protection.
+    pub fn release_snapshot(model: &Model, name: &str) {
+        RawContext::release_snapshot(model, name)
+    }
+
+    /// Enforce host-persistent snapshot retention for a namespace prefix.
+    pub fn enforce_retention(
+        model: &Model,
+        name_prefix: &str,
+        current_name: &str,
+        budget: RetentionBudget,
+    ) -> Result<RetentionReport> {
+        RawContext::enforce_retention(model, name_prefix, current_name, budget)
     }
 
     /// Wrap an existing raw context, syncing cached state from the host.

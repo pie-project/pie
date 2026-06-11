@@ -21,6 +21,12 @@ use super::{
 use crate::device::{self, DeviceId};
 use crate::process::ProcessId;
 
+fn snapshot_pages(ctx: &Context) -> usize {
+    ctx.committed_hashes.len()
+        .saturating_add(ctx.working_pages.len())
+        .saturating_add(ctx.suspended_working_count)
+}
+
 // =============================================================================
 // Persistence methods on ContextManager
 // =============================================================================
@@ -244,9 +250,11 @@ impl ContextManager {
         Ok(if auto_generated { Some(name) } else { None })
     }
 
-    pub(crate) fn delete(&mut self, username: String, name: String) -> Result<()> {
-        let snapshot_id = self.snapshots.remove(&(username, name))
+    pub(crate) fn delete_snapshot_key(&mut self, key: &(String, String)) -> Result<()> {
+        let snapshot_id = self.snapshots.remove(key)
             .ok_or_else(|| anyhow::anyhow!("Snapshot not found"))?;
+        self.active_snapshots
+            .retain(|(u, name, _), _| u != &key.0 || name != &key.1);
 
         if let Some(ctx) = self.contexts.remove(&snapshot_id) {
             let dev_idx = ctx.device.unwrap_or(0) as usize;
@@ -262,6 +270,182 @@ impl ContextManager {
         }
 
         Ok(())
+    }
+
+    pub(crate) fn delete(&mut self, username: String, name: String) -> Result<()> {
+        self.delete_snapshot_key(&(username, name))
+    }
+
+    pub(crate) fn retain_snapshot(
+        &mut self,
+        username: String,
+        name: String,
+        owner: crate::process::ProcessId,
+    ) -> Result<()> {
+        if !self.snapshots.contains_key(&(username.clone(), name.clone())) {
+            anyhow::bail!("Snapshot not found");
+        }
+        *self.active_snapshots.entry((username, name, owner)).or_insert(0) += 1;
+        Ok(())
+    }
+
+    pub(crate) fn release_snapshot(
+        &mut self,
+        username: String,
+        name: String,
+        owner: crate::process::ProcessId,
+    ) -> Result<()> {
+        let key = (username, name, owner);
+        match self.active_snapshots.get_mut(&key) {
+            Some(count) if *count > 1 => *count -= 1,
+            Some(_) => {
+                self.active_snapshots.remove(&key);
+            }
+            None => {}
+        }
+        Ok(())
+    }
+
+    fn is_snapshot_active(&self, key: &(String, String)) -> bool {
+        self.active_snapshots
+            .keys()
+            .any(|(u, name, _)| u == &key.0 && name == &key.1)
+    }
+
+    pub(crate) fn enforce_snapshot_retention(
+        &mut self,
+        username: String,
+        name_prefix: String,
+        current_name: String,
+        budget: super::SnapshotRetentionBudget,
+    ) -> super::SnapshotRetentionReport {
+        self.enforce_snapshot_retention_with_delete(
+            username,
+            name_prefix,
+            current_name,
+            budget,
+            |mgr, key| mgr.delete_snapshot_key(key),
+        )
+    }
+
+    pub(crate) fn enforce_snapshot_retention_with_delete<F>(
+        &mut self,
+        username: String,
+        name_prefix: String,
+        current_name: String,
+        budget: super::SnapshotRetentionBudget,
+        mut delete: F,
+    ) -> super::SnapshotRetentionReport
+    where
+        F: FnMut(&mut Self, &(String, String)) -> Result<()>,
+    {
+        let scoped: Vec<((String, String), ContextId)> = self.snapshots
+            .iter()
+            .filter(|((u, name), _)| u == &username && name.starts_with(&name_prefix))
+            .map(|(key, id)| (key.clone(), *id))
+            .collect();
+        let retained_snapshot_count = scoped.len() as u32;
+        if !budget.coherent() {
+            return super::SnapshotRetentionReport {
+                retained_snapshot_count,
+                reason: super::SnapshotRetentionReason::SkippedUncertainAccounting,
+                ..Default::default()
+            };
+        }
+
+        let current_key = (username.clone(), current_name);
+        let mut protected_active_pages = 0u32;
+        for (key, id) in &scoped {
+            let protected = key == &current_key || self.is_snapshot_active(key);
+            if protected {
+                if let Some(ctx) = self.contexts.get(id) {
+                    protected_active_pages =
+                        protected_active_pages.saturating_add(snapshot_pages(ctx) as u32);
+                }
+            }
+        }
+
+        let target = budget.evict_pages();
+        if budget.kv_pages_used <= budget.soft_pages() {
+            return super::SnapshotRetentionReport {
+                retained_snapshot_count,
+                protected_active_pages,
+                reason: super::SnapshotRetentionReason::RetainedBelowSoftLimit,
+                ..Default::default()
+            };
+        }
+        if budget.kv_pages_used <= target {
+            return super::SnapshotRetentionReport {
+                retained_snapshot_count,
+                protected_active_pages,
+                reason: super::SnapshotRetentionReason::RetainedBelowEvictionLimit,
+                ..Default::default()
+            };
+        }
+
+        let mut candidates: Vec<((String, String), usize, Instant)> = scoped
+            .into_iter()
+            .filter(|(key, _)| key != &current_key && !self.is_snapshot_active(key))
+            .filter_map(|(key, id)| {
+                self.contexts.get(&id).map(|ctx| (key, snapshot_pages(ctx), ctx.last_access))
+            })
+            .collect();
+        candidates.sort_by(|(a_key, _, a_last), (b_key, _, b_last)| {
+            a_last
+                .cmp(b_last)
+                .then_with(|| a_key.1.cmp(&b_key.1))
+        });
+
+        let mut projected = budget.kv_pages_used;
+        let mut evicted_names = Vec::new();
+        let mut pages_reclaimed = 0u32;
+        let mut delete_failed_count = 0u32;
+        for (key, pages, _) in candidates {
+            if projected <= target {
+                break;
+            }
+            match delete(self, &key) {
+                Ok(()) => {
+                    let pages = pages as u32;
+                    projected = projected.saturating_sub(pages);
+                    pages_reclaimed = pages_reclaimed.saturating_add(pages);
+                    evicted_names.push(key.1);
+                }
+                Err(e) => {
+                    delete_failed_count = delete_failed_count.saturating_add(1);
+                    tracing::warn!(
+                        "snapshot retention delete failed for user={} name={}: {e:#}",
+                        key.0,
+                        key.1
+                    );
+                }
+            }
+        }
+
+        let retained_snapshot_count = self.snapshots
+            .keys()
+            .filter(|(u, name)| u == &username && name.starts_with(&name_prefix))
+            .count() as u32;
+        let reason = if !evicted_names.is_empty() {
+            if projected > budget.hard_pages() {
+                super::SnapshotRetentionReason::HardCapStillExceeded
+            } else {
+                super::SnapshotRetentionReason::EvictedPressure
+            }
+        } else if protected_active_pages > 0 {
+            super::SnapshotRetentionReason::ProtectedActive
+        } else {
+            super::SnapshotRetentionReason::NoInactiveSnapshots
+        };
+
+        super::SnapshotRetentionReport {
+            evicted_names,
+            pages_reclaimed,
+            protected_active_pages,
+            retained_snapshot_count,
+            delete_failed_count,
+            reason,
+        }
     }
 
 
@@ -453,5 +637,88 @@ impl ContextManager {
         self.publish_context_counts(new_id);
 
         Ok(new_id)
+    }
+}
+
+#[cfg(test)]
+mod retention_tests {
+    use super::*;
+    use crate::context::{Context, SnapshotRetentionBudget, SnapshotRetentionReason};
+
+    fn manager() -> ContextManager {
+        ContextManager::new(0, 16, &[32], &[32], 10, None, 10000.0, 0.85)
+    }
+
+    fn add_snapshot(mgr: &mut ContextManager, username: &str, name: &str, pages: usize) {
+        let id = mgr.next_id();
+        let mut ctx = Context::new(None);
+        ctx.device = Some(0);
+        ctx.working_pages = mgr.gpu_stores[0].alloc(pages).expect("snapshot pages");
+        mgr.contexts.insert(id, ctx);
+        mgr.snapshots.insert((username.to_string(), name.to_string()), id);
+    }
+
+    #[test]
+    fn retention_lru_sees_snapshots_saved_before_the_current_request() {
+        let mut mgr = manager();
+        add_snapshot(&mut mgr, "u", "apc/old", 15);
+        add_snapshot(&mut mgr, "u", "apc/recent", 15);
+
+        mgr.retain_snapshot(
+            "u".to_string(),
+            "apc/recent".to_string(),
+            crate::process::ProcessId::new_v4(),
+        )
+        .unwrap();
+        let report = mgr.enforce_snapshot_retention(
+            "u".to_string(),
+            "apc/".to_string(),
+            "apc/current".to_string(),
+            SnapshotRetentionBudget {
+                kv_pages_used: 95,
+                kv_pages_total: 100,
+                soft_percent: 70,
+                evict_percent: 80,
+                hard_percent: 95,
+            },
+        );
+
+        assert_eq!(report.evicted_names, vec!["apc/old"]);
+        assert_eq!(report.pages_reclaimed, 15);
+        assert!(mgr.snapshots.contains_key(&("u".to_string(), "apc/recent".to_string())));
+        assert!(!mgr.snapshots.contains_key(&("u".to_string(), "apc/old".to_string())));
+    }
+
+    #[test]
+    fn retention_counts_only_successful_deletes_and_keeps_failed_candidates() {
+        let mut mgr = manager();
+        add_snapshot(&mut mgr, "u", "apc/old", 15);
+        add_snapshot(&mut mgr, "u", "apc/new", 15);
+
+        let report = mgr.enforce_snapshot_retention_with_delete(
+            "u".to_string(),
+            "apc/".to_string(),
+            "apc/current".to_string(),
+            SnapshotRetentionBudget {
+                kv_pages_used: 95,
+                kv_pages_total: 100,
+                soft_percent: 70,
+                evict_percent: 80,
+                hard_percent: 95,
+            },
+            |mgr, key| {
+                if key.1 == "apc/old" {
+                    anyhow::bail!("injected delete failure")
+                }
+                mgr.delete_snapshot_key(key)
+            },
+        );
+
+        assert_eq!(report.evicted_names, vec!["apc/new"]);
+        assert_eq!(report.pages_reclaimed, 15);
+        assert_eq!(report.delete_failed_count, 1);
+        assert_eq!(report.reason, SnapshotRetentionReason::EvictedPressure);
+        assert!(mgr.snapshots.contains_key(&("u".to_string(), "apc/old".to_string())));
+        assert!(!mgr.snapshots.contains_key(&("u".to_string(), "apc/new".to_string())));
     }
 }

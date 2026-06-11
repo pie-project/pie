@@ -2,7 +2,9 @@
 
 use crate::api::model::Model;
 use crate::api::pie;
-use crate::context::{self, ContextId};
+use crate::context::{
+    self, ContextId, SnapshotRetentionBudget, SnapshotRetentionReason, SnapshotRetentionReport,
+};
 use crate::instance::InstanceState;
 use crate::model::ModelId;
 use anyhow::Result;
@@ -91,6 +93,60 @@ impl pie::core::context::HostContext for InstanceState {
 
         match context::delete(model_id, username, name).await {
             Ok(()) => Ok(Ok(())),
+            Err(e) => Ok(Err(e.to_string())),
+        }
+    }
+
+    async fn retain_snapshot(
+        &mut self,
+        model: Resource<Model>,
+        name: String,
+    ) -> Result<Result<(), String>> {
+        let model = self.ctx().table.get(&model)?;
+        let model_id = model.model_id;
+        let username = self.get_username();
+
+        match context::retain_snapshot(model_id, username, name, self.id()).await {
+            Ok(()) => Ok(Ok(())),
+            Err(e) => Ok(Err(e.to_string())),
+        }
+    }
+
+    async fn release_snapshot(
+        &mut self,
+        model: Resource<Model>,
+        name: String,
+    ) -> Result<()> {
+        let model = self.ctx().table.get(&model)?;
+        let model_id = model.model_id;
+        let username = self.get_username();
+
+        if let Err(e) = context::release_snapshot(model_id, username, name, self.id()).await {
+            tracing::warn!("context release-snapshot failed: {e:#}");
+        }
+        Ok(())
+    }
+
+    async fn enforce_retention(
+        &mut self,
+        model: Resource<Model>,
+        name_prefix: String,
+        current_name: String,
+        budget: pie::core::context::RetentionBudget,
+    ) -> Result<Result<pie::core::context::RetentionReport, String>> {
+        let model = self.ctx().table.get(&model)?;
+        let model_id = model.model_id;
+        let username = self.get_username();
+
+        let budget = SnapshotRetentionBudget {
+            kv_pages_used: budget.kv_pages_used,
+            kv_pages_total: budget.kv_pages_total,
+            soft_percent: budget.soft_percent,
+            evict_percent: budget.evict_percent,
+            hard_percent: budget.hard_percent,
+        };
+        match context::enforce_retention(model_id, username, name_prefix, current_name, budget).await {
+            Ok(report) => Ok(Ok(report.into())),
             Err(e) => Ok(Err(e.to_string())),
         }
     }
@@ -247,5 +303,32 @@ impl pie::core::context::HostContext for InstanceState {
         let ctx = self.ctx().table.get(&this)?;
         let _ = context::bid(ctx.model_id, ctx.context_id, value).await;
         Ok(())
+    }
+}
+
+impl From<SnapshotRetentionReason> for pie::core::context::RetentionReason {
+    fn from(reason: SnapshotRetentionReason) -> Self {
+        match reason {
+            SnapshotRetentionReason::RetainedBelowSoftLimit => Self::RetainedBelowSoftLimit,
+            SnapshotRetentionReason::RetainedBelowEvictionLimit => Self::RetainedBelowEvictionLimit,
+            SnapshotRetentionReason::EvictedPressure => Self::EvictedPressure,
+            SnapshotRetentionReason::HardCapStillExceeded => Self::HardCapStillExceeded,
+            SnapshotRetentionReason::ProtectedActive => Self::ProtectedActive,
+            SnapshotRetentionReason::NoInactiveSnapshots => Self::NoInactiveSnapshots,
+            SnapshotRetentionReason::SkippedUncertainAccounting => Self::SkippedUncertainAccounting,
+        }
+    }
+}
+
+impl From<SnapshotRetentionReport> for pie::core::context::RetentionReport {
+    fn from(report: SnapshotRetentionReport) -> Self {
+        Self {
+            evicted_names: report.evicted_names,
+            pages_reclaimed: report.pages_reclaimed,
+            protected_active_pages: report.protected_active_pages,
+            retained_snapshot_count: report.retained_snapshot_count,
+            delete_failed_count: report.delete_failed_count,
+            reason: report.reason.into(),
+        }
     }
 }
