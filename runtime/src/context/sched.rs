@@ -750,9 +750,19 @@ impl ContextManager {
 
     /// Peek at the highest-bid context in the restore queue.
     /// Returns None if the queue is empty.
-    /// O(1) with BinaryHeap vs previous O(N) scan.
-    pub(crate) fn highest_bid_in_restore_queue(&self) -> Option<ContextId> {
-        self.restore_queue.peek().map(|e| e.ctx_id)
+    /// Applies the same lazy-deletion convention as `drain_queues`: entries
+    /// whose owning context was already removed from `self.contexts` (e.g.
+    /// its process unregistered before the entry was popped/restored) are
+    /// stale and are popped/skipped here, so the caller never indexes
+    /// `self.contexts` with a dangling `ContextId`.
+    pub(crate) fn highest_bid_in_restore_queue(&mut self) -> Option<ContextId> {
+        while let Some(entry) = self.restore_queue.peek() {
+            if self.contexts.contains_key(&entry.ctx_id) {
+                return Some(entry.ctx_id);
+            }
+            self.restore_queue.pop();
+        }
+        None
     }
 
     // =========================================================================
