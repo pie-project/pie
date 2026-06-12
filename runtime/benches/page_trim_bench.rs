@@ -66,7 +66,6 @@ fn make_request(masks: Vec<Brle>, num_input: u32, kv_before: u32) -> ForwardPass
         samplers: vec![],
         adapter_id: None,
         adapter_seed: None,
-        arrival_time: None,
     }
 }
 
