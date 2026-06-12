@@ -4,7 +4,7 @@
 //! requests by invoking a WASM component's `wasi:http/incoming-handler`.
 //! Unlike a Process (one-shot execution), a Daemon runs indefinitely.
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::LazyLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
@@ -43,8 +43,14 @@ static SERVICES: LazyLock<ServiceMap<DaemonId, Message>> = LazyLock::new(Service
 // =============================================================================
 
 /// Spawn a new daemon and register it in the global registry.
-pub fn spawn(username: String, program: ProgramName, port: u16, input: String) -> Result<DaemonId> {
-    let daemon = Daemon::new(username, program, port, input);
+pub fn spawn(
+    username: String,
+    program: ProgramName,
+    port: u16,
+    host: String,
+    input: String,
+) -> Result<DaemonId> {
+    let daemon = Daemon::new(username, program, port, host, input)?;
     let id = daemon.daemon_id;
     SERVICES.spawn(id, || daemon)?;
     Ok(id)
@@ -140,21 +146,27 @@ struct Daemon {
 
 impl Daemon {
     /// Creates a new Daemon and spawns its HTTP listener task.
-    fn new(username: String, program: ProgramName, port: u16, input: String) -> Self {
+    fn new(
+        username: String,
+        program: ProgramName,
+        port: u16,
+        host: String,
+        input: String,
+    ) -> Result<Self> {
         let daemon_id = NEXT_ID.fetch_add(1, Ordering::SeqCst);
-        let addr = SocketAddr::from(([127, 0, 0, 1], port));
+        let addr = daemon_addr(&host, port)?;
 
         let listener_handle =
             tokio::spawn(Self::serve(addr, username.clone(), program.clone(), input));
 
-        Daemon {
+        Ok(Daemon {
             daemon_id,
             username,
             program,
             port,
             start_time: Instant::now(),
             listener_handle,
-        }
+        })
     }
 
     /// Binds the TCP port and serves HTTP requests indefinitely.
@@ -391,6 +403,16 @@ impl Daemon {
     }
 }
 
+fn daemon_addr(host: &str, port: u16) -> Result<SocketAddr> {
+    let ip: IpAddr = host
+        .parse()
+        .map_err(|_| anyhow!("invalid daemon bind host: {host}"))?;
+    if !ip.is_ipv4() {
+        return Err(anyhow!("daemon bind host must be IPv4: {host}"));
+    }
+    Ok(SocketAddr::new(ip, port))
+}
+
 impl ServiceHandler for Daemon {
     type Message = Message;
 
@@ -408,5 +430,28 @@ impl ServiceHandler for Daemon {
                 });
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn daemon_addr_accepts_loopback() {
+        let addr = daemon_addr("127.0.0.1", 8123).unwrap();
+        assert_eq!(addr.to_string(), "127.0.0.1:8123");
+    }
+
+    #[test]
+    fn daemon_addr_accepts_all_interfaces() {
+        let addr = daemon_addr("0.0.0.0", 8123).unwrap();
+        assert_eq!(addr.to_string(), "0.0.0.0:8123");
+    }
+
+    #[test]
+    fn daemon_addr_rejects_non_ip_hosts() {
+        let err = daemon_addr("localhost", 8123).unwrap_err().to_string();
+        assert!(err.contains("invalid daemon bind host"));
     }
 }

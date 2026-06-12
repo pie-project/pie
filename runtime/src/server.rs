@@ -718,10 +718,11 @@ impl Session {
             ClientMessage::LaunchDaemon {
                 corr_id,
                 port,
+                host,
                 inferlet,
                 input,
             } => {
-                self.handle_launch_daemon(corr_id, port, inferlet, input)
+                self.handle_launch_daemon(corr_id, port, host, inferlet, input)
                     .await
             }
 

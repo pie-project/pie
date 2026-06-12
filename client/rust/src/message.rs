@@ -60,6 +60,8 @@ pub enum ClientMessage {
     LaunchDaemon {
         corr_id: u32,
         port: u32,
+        #[serde(default = "default_daemon_host")]
+        host: String,
         inferlet: String,
         input: String,
     },
@@ -129,6 +131,10 @@ pub enum ClientMessage {
 
     #[serde(rename = "detach_workflow")]
     DetachWorkflow { corr_id: u32, workflow_id: String },
+}
+
+fn default_daemon_host() -> String {
+    "127.0.0.1".to_string()
 }
 
 /// Messages from server -> client

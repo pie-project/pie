@@ -219,6 +219,7 @@ impl Session {
         &mut self,
         corr_id: u32,
         port: u32,
+        host: String,
         inferlet: String,
         input: String,
     ) {
@@ -240,6 +241,7 @@ impl Session {
             self.username.clone(),
             program_name,
             port as u16,
+            host,
             input,
         ) {
             Ok(_daemon_id) => {
