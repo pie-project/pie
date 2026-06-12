@@ -1,8 +1,8 @@
 use std::sync::Mutex;
 
 use pie::metadata_store::{
-    self, MAX_ENTRIES, MAX_KEY_BYTES, MAX_NAMESPACE_BYTES, MAX_TOTAL_BYTES, MAX_VALUE_BYTES,
-    MetadataOwner,
+    self, MetadataOwner, MAX_ENTRIES, MAX_KEY_BYTES, MAX_NAMESPACE_BYTES, MAX_TOTAL_BYTES,
+    MAX_VALUE_BYTES,
 };
 use uuid::Uuid;
 
