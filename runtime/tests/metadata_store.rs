@@ -3,7 +3,8 @@
 use std::sync::Mutex;
 
 use pie::metadata_store::{
-    self, MAX_KEY_BYTES, MAX_NAMESPACE_BYTES, MAX_TOTAL_BYTES, MAX_VALUE_BYTES, MetadataOwner,
+    self, MetadataOwner, MAX_ENTRIES, MAX_KEY_BYTES, MAX_NAMESPACE_BYTES, MAX_TOTAL_BYTES,
+    MAX_VALUE_BYTES,
 };
 use uuid::Uuid;
 
@@ -145,7 +146,9 @@ fn total_store_cap_is_enforced_and_accounted_across_deletes() {
     let owner = owner("total-cap");
     let namespace = ns("total-cap");
     let chunk_size = MAX_VALUE_BYTES;
-    let chunk_count = MAX_TOTAL_BYTES / chunk_size;
+    // Leave room for the owner/namespace/key bytes that are now included in
+    // store-wide accounting, then prove one more max-size value is rejected.
+    let chunk_count = (MAX_TOTAL_BYTES / chunk_size) - 1;
     let mut keys = Vec::new();
 
     for index in 0..chunk_count {
@@ -164,6 +167,38 @@ fn total_store_cap_is_enforced_and_accounted_across_deletes() {
 
     assert!(metadata_store::delete(&owner, &namespace, &keys[0]).unwrap());
     metadata_store::put(&owner, &namespace, "replacement", vec![0; chunk_size]).unwrap();
+
+    for key in keys {
+        let _ = metadata_store::delete(&owner, &namespace, &key);
+    }
+    let _ = metadata_store::delete(&owner, &namespace, "replacement");
+}
+
+#[test]
+fn empty_value_entries_are_capped_and_accounted_across_overwrites_and_deletes() {
+    let _guard = TEST_LOCK.lock().unwrap();
+    let owner = owner("entry-cap");
+    let namespace = ns("entry-cap");
+    let mut keys = Vec::new();
+
+    for index in 0..MAX_ENTRIES {
+        let key = format!("empty-{index}");
+        metadata_store::put(&owner, &namespace, &key, Vec::new()).unwrap();
+        keys.push(key);
+    }
+
+    metadata_store::put(&owner, &namespace, &keys[0], b"overwrite".to_vec()).unwrap();
+
+    let err = metadata_store::put(&owner, &namespace, "overflow", Vec::new())
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("metadata store entry cap"),
+        "unexpected error: {err}"
+    );
+
+    assert!(metadata_store::delete(&owner, &namespace, &keys[0]).unwrap());
+    metadata_store::put(&owner, &namespace, "replacement", Vec::new()).unwrap();
 
     for key in keys {
         let _ = metadata_store::delete(&owner, &namespace, &key);
