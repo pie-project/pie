@@ -8,5 +8,6 @@ world imports {
     import session;
     import model;
     import runtime;
+    import blob-store;
     import inference;
 }

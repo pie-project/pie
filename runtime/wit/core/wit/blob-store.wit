@@ -1,0 +1,15 @@
+interface blob-store {
+    use types.{error};
+
+    // Save a small named byte blob for the current authenticated user.
+    // The host clamps ttl-ms to its maximum daemon-lifetime lease.
+    save-blob: func(name: string, bytes: list<u8>, ttl-ms: u64) -> result<_, error>;
+
+    // Open a named blob for the current authenticated user. Returns none when
+    // the blob is missing or expired.
+    open-blob: func(name: string) -> result<option<list<u8>>, error>;
+
+    // Delete a named blob for the current authenticated user. Missing blobs are
+    // treated as success.
+    delete-blob: func(name: string) -> result<_, error>;
+}

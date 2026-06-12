@@ -4,6 +4,7 @@ pub mod service;
 pub mod adapter;
 pub mod api;
 pub mod auth;
+pub mod blob_store;
 pub mod context;
 pub mod device;
 pub mod bootstrap;
