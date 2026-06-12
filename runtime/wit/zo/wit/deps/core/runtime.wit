@@ -14,6 +14,12 @@ interface runtime {
     // Get a list of all available model names
     models: func() -> list<string>;
 
+    // Minimum per-request max-output-token ceiling across registered
+    // models; 0 if no model is registered. Per model: configured
+    // scheduler default_token_limit capped by raw engine KV capacity
+    // when set, otherwise raw engine KV capacity.
+    max-output-tokens: func() -> u32;
+
     // Store or overwrite engine-lifetime inferlet metadata under a namespace.
     metadata-put: func(namespace: string, key: string, value: blob) -> result<_, error>;
 

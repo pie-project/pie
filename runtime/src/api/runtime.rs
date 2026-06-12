@@ -24,6 +24,10 @@ impl pie::core::runtime::Host for InstanceState {
         Ok(model::models())
     }
 
+    async fn max_output_tokens(&mut self) -> Result<u32> {
+        Ok(model::min_output_token_ceiling())
+    }
+
     async fn metadata_put(
         &mut self,
         namespace: String,

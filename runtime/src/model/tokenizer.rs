@@ -169,7 +169,7 @@ struct EncodeScratch {
 ///
 /// ```no_run
 /// use std::path::Path;
-/// use tokenizer_mini::Tokenizer;
+/// use pie::model::tokenizer::Tokenizer;
 ///
 /// let tokenizer = Tokenizer::from_file(Path::new("tokenizer.json")).unwrap();
 /// let ids = tokenizer.encode("Hello, world!");

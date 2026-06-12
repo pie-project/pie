@@ -194,24 +194,38 @@ impl PendingEmbeddedDriver {
         }
     }
 
-    /// Join the (exited) driver thread, reclaim the leaked caps box, and
-    /// build the "exited before caps" error carrying the thread's rc.
-    /// Shared by `wait_for_caps`'s thread-exit and channel-disconnect paths.
+    /// Join the (exited) driver thread, recover any fatal reason it reported
+    /// through `embedded_fatal_cb`, reclaim the leaked caps box, and build the
+    /// "exited before caps" error carrying the thread's rc. Shared by
+    /// `wait_for_caps`'s thread-exit and channel-disconnect paths.
     fn exited_before_caps_err(&mut self) -> anyhow::Error {
         let rc = self
             .thread
             .take()
             .map(|h| h.join().unwrap_or(-1))
             .unwrap_or(-1);
+        // The join above establishes happens-before, so the fatal write (if
+        // any) is visible here. Take it before we drop the box.
+        let reason = if self.caps_ctx.is_null() {
+            None
+        } else {
+            unsafe { (*self.caps_ctx).fatal.lock().unwrap().take() }
+        };
         if !self.caps_ctx.is_null() {
             unsafe { drop(Box::from_raw(self.caps_ctx)) };
             self.caps_ctx = std::ptr::null_mut();
         }
-        anyhow!(
-            "driver thread exited (rc={rc}) before emitting capabilities; \
-             check stderr for the [pie-driver-{}] error message",
-            self.flavor.as_str(),
-        )
+        match reason {
+            Some(r) => anyhow!(
+                "pie-driver-{} failed during startup (rc={rc}): {r}",
+                self.flavor.as_str()
+            ),
+            None => anyhow!(
+                "driver thread exited (rc={rc}) before emitting capabilities; \
+                 check stderr for the [pie-driver-{}] error message",
+                self.flavor.as_str()
+            ),
+        }
     }
 
     fn into_driver(mut self, caps: DriverCapabilities) -> EmbeddedDriver {
@@ -581,9 +595,14 @@ pub(crate) fn write_cuda_startup_toml(
 
 /// Per-launch callback target. Held alive by the parent `EmbeddedDriver`
 /// for the whole lifetime of the driver thread; the thread reads from
-/// it through a raw pointer.
+/// it through a raw pointer. Both the ready and fatal callbacks share one
+/// box (passed as their respective `ctx`).
 struct CapsCtx {
     tx: Mutex<Option<mpsc::SyncSender<String>>>,
+    /// Slot the fatal callback fills with the driver's failure reason just
+    /// before the thread exits nonzero. Read by `exited_before_caps_err`
+    /// after the thread joins (#356).
+    fatal: Mutex<Option<String>>,
 }
 
 unsafe extern "C" fn embedded_caps_cb(caps_json: *const c_char, ctx: *mut c_void) {
@@ -597,6 +616,20 @@ unsafe extern "C" fn embedded_caps_cb(caps_json: *const c_char, ctx: *mut c_void
     if let Some(tx) = ctx_ref.tx.lock().unwrap().take() {
         let _ = tx.send(json);
     }
+}
+
+/// C callback the driver invokes with its failure reason just before it
+/// returns nonzero. Stores the reason so `exited_before_caps_err` can attach
+/// it to the structured error instead of leaving it on stderr only (#356).
+unsafe extern "C" fn embedded_fatal_cb(reason: *const c_char, ctx: *mut c_void) {
+    if ctx.is_null() || reason.is_null() {
+        return;
+    }
+    let msg = unsafe { CStr::from_ptr(reason) }
+        .to_string_lossy()
+        .into_owned();
+    let ctx_ref = unsafe { &*(ctx as *const CapsCtx) };
+    *ctx_ref.fatal.lock().unwrap() = Some(msg);
 }
 
 /// Owns the embedded driver thread + its on-disk launch state. The
@@ -718,8 +751,8 @@ impl EmbeddedDriver {
         // (model.cpp branches on is_regular_file). CUDA + dummy still need
         // a directory — those drivers fail later with their own message
         // when handed a file, so we don't gate that here.
-        let is_gguf_file = snapshot_dir.is_file()
-            && snapshot_dir.extension().is_some_and(|e| e == "gguf");
+        let is_gguf_file =
+            snapshot_dir.is_file() && snapshot_dir.extension().is_some_and(|e| e == "gguf");
         if !snapshot_dir.is_dir() && !is_gguf_file {
             return Err(anyhow!(
                 "snapshot_dir {snapshot_dir:?} does not exist, or is not a directory or .gguf file"
@@ -781,6 +814,7 @@ impl EmbeddedDriver {
         let (caps_tx, caps_rx) = mpsc::sync_channel::<String>(1);
         let caps_ctx = Box::into_raw(Box::new(CapsCtx {
             tx: Mutex::new(Some(caps_tx)),
+            fatal: Mutex::new(None),
         }));
 
         let toml_path_str = toml_path
@@ -817,6 +851,9 @@ impl EmbeddedDriver {
                     .iter()
                     .map(|s| s.as_ptr() as *mut c_char)
                     .collect();
+                // Both callbacks reach the same caps box through this pointer;
+                // it outlives the thread and is reclaimed after the join.
+                let caps_ctx_ptr = caps_ctx_addr as *mut c_void;
                 unsafe {
                     driver_ffi::run(
                         flavor,
@@ -824,7 +861,9 @@ impl EmbeddedDriver {
                         argv_ptrs.as_mut_ptr(),
                         /*install_signal_handlers=*/ 0,
                         embedded_caps_cb,
-                        caps_ctx_addr as *mut c_void,
+                        caps_ctx_ptr,
+                        embedded_fatal_cb,
+                        caps_ctx_ptr,
                     )
                 }
             })
@@ -924,6 +963,7 @@ mod tests {
         let (caps_tx, caps_rx) = mpsc::sync_channel::<String>(1);
         let caps_ctx = Box::into_raw(Box::new(CapsCtx {
             tx: Mutex::new(Some(caps_tx)),
+            fatal: Mutex::new(None),
         }));
         let thread = std::thread::Builder::new()
             .name("pie-driver-test-dead".into())
@@ -963,6 +1003,65 @@ mod tests {
             elapsed < timeout / 2,
             "wait_for_caps must detect thread exit promptly, not block the \
              full ready_timeout (took {elapsed:?} of {timeout:?})"
+        );
+    }
+
+    #[test]
+    fn wait_for_caps_surfaces_driver_fatal_reason() {
+        // #356: when the driver reports a fatal reason through
+        // `embedded_fatal_cb` before dying, `wait_for_caps` must surface that
+        // reason (and the flavor) on the structured error rather than the
+        // generic "check stderr" message. FFI-free: we store the reason via the
+        // real `embedded_fatal_cb` and let the thread exit nonzero without ever
+        // publishing caps (the same connected-but-silent channel as #347). Thread
+        // death is detected by the `is_finished()` poll, so this stays fast.
+        const REASON: &str = "gguf: gguf_init_from_file failed: bad magic";
+
+        let (caps_tx, caps_rx) = mpsc::sync_channel::<String>(1);
+        let caps_ctx = Box::into_raw(Box::new(CapsCtx {
+            tx: Mutex::new(Some(caps_tx)),
+            fatal: Mutex::new(None),
+        }));
+
+        // Simulate the driver calling the fatal callback just before it returns
+        // nonzero. This exercises the real `embedded_fatal_cb` storage path.
+        let reason_c = CString::new(REASON).unwrap();
+        unsafe { embedded_fatal_cb(reason_c.as_ptr(), caps_ctx as *mut c_void) };
+
+        let thread = std::thread::Builder::new()
+            .name("pie-driver-test-fatal".into())
+            .spawn(|| -> i32 { 7 })
+            .unwrap();
+
+        let mut pending = PendingEmbeddedDriver {
+            flavor: Flavor::Dummy,
+            shmem_name: "/pie_shmem_test".to_string(),
+            aux_socket_path: PathBuf::from("/tmp/pie-test-aux.sock"),
+            thread: Some(thread),
+            caps_ctx,
+            caps_rx: Some(caps_rx),
+            state_dir: PathBuf::from("/tmp/pie-test-state"),
+        };
+
+        let timeout = Duration::from_secs(5);
+        let start = Instant::now();
+        let err = pending
+            .wait_for_caps(timeout)
+            .expect_err("a driver that exits before caps must surface an error");
+        let elapsed = start.elapsed();
+
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains(REASON),
+            "the driver's fatal reason must ride the error, got: {msg}"
+        );
+        assert!(
+            msg.contains(Flavor::Dummy.as_str()),
+            "the flavor must appear in the error, got: {msg}"
+        );
+        assert!(
+            elapsed < timeout / 2,
+            "must detect thread exit promptly (took {elapsed:?} of {timeout:?})"
         );
     }
 

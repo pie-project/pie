@@ -25,11 +25,11 @@ pub enum OutputMode {
     /// where guest output is noise.
     Discard,
     /// Route to the per-process actor channel, drained by an attached client.
-    Process,
+    Stream,
     /// Route to pie-server's `tracing` log, tagged with `program`. Used by the
     /// daemon request path, which serves HTTP directly and has no client to
     /// attach — without this, guest stderr falls through to the default sink.
-    Server { program: String },
+    Log { program: String },
 }
 
 pub struct InstanceState {
@@ -116,11 +116,11 @@ impl InstanceState {
 
         match output {
             OutputMode::Discard => {}
-            OutputMode::Process => {
+            OutputMode::Stream => {
                 builder.stdout(LogStream::new_stdout(id));
                 builder.stderr(LogStream::new_stderr(id));
             }
-            OutputMode::Server { program } => {
+            OutputMode::Log { program } => {
                 let program: Arc<str> = Arc::from(program);
                 builder.stdout(LogStream::new_server_stdout(program.clone()));
                 builder.stderr(LogStream::new_server_stderr(program));
@@ -130,15 +130,11 @@ impl InstanceState {
         let scratch_dir = policy.fs.base_dir.join(id.to_string());
 
         if policy.fs.allow {
-            std::fs::create_dir_all(&scratch_dir)
-                .expect("failed to create scratch dir");
+            std::fs::create_dir_all(&scratch_dir).expect("failed to create scratch dir");
 
-            builder.preopened_dir(
-                &scratch_dir,
-                "/scratch",
-                DirPerms::all(),
-                FilePerms::all(),
-            ).expect("failed to preopen scratch dir");
+            builder
+                .preopened_dir(&scratch_dir, "/scratch", DirPerms::all(), FilePerms::all())
+                .expect("failed to preopen scratch dir");
         }
 
         // Set up Python runtime environment if py-runtime directory is available.

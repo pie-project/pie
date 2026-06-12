@@ -2,9 +2,9 @@
 //!
 //! Tests context CRUD, saving, opening, forking, and the full page lifecycle.
 
-use std::sync::{Arc, OnceLock};
+use std::sync::OnceLock;
 mod common;
-use common::{create_mock_env, MockEnv, mock_device::EchoBehavior};
+use common::{create_mock_env, MockEnv};
 
 struct TestState {
     #[allow(dead_code)]
@@ -17,7 +17,7 @@ static STATE: OnceLock<TestState> = OnceLock::new();
 fn state() -> &'static TestState {
     STATE.get_or_init(|| {
         let rt = tokio::runtime::Runtime::new().unwrap();
-        let env = create_mock_env("ctx-test", 1, 64, Arc::new(EchoBehavior(42)));
+        let env = create_mock_env("ctx-test", 1, 64);
         let config = env.config();
         rt.block_on(async {
             pie::bootstrap::bootstrap(config).await.unwrap();
@@ -33,25 +33,44 @@ fn test_pid() -> uuid::Uuid {
     uuid::Uuid::new_v4()
 }
 
+/// Mint a fresh process id and register it with the scheduler.
+///
+/// Since the MBS scheduler rewrite, every process that owns a context must be
+/// admitted via `register_process` before `create`/`fork` — the scheduler
+/// panics on an unregistered owner. Tests that drive the context API directly
+/// (rather than through `process::spawn`, which registers on instantiation)
+/// must register their owners themselves. `None` budget takes the configured
+/// default endowment.
+async fn registered_pid() -> uuid::Uuid {
+    let pid = test_pid();
+    pie::context::register_process(pid, None).await.unwrap();
+    pid
+}
+
 #[test]
 fn create_and_save_and_open() {
     let s = state();
     s.rt.block_on(async {
-        let id = pie::context::create(MODEL, test_pid())
+        let pid = registered_pid().await;
+        let id = pie::context::create(MODEL, pid)
             .await
             .unwrap();
 
         // Anonymous context is not findable by name
-        let found = pie::context::lookup_snapshot(MODEL, USER.to_string(), "test-ctx".into()).await;
+        let found = pie::context::lookup(MODEL, USER.to_string(), "test-ctx".into()).await;
         assert!(found.is_err());
 
         // Save it with a name
         pie::context::save(MODEL, id, USER.to_string(), Some("test-ctx".into())).await.unwrap();
 
         // Now it should be findable (lookup + fork returns a different id)
-        let snapshot_id = pie::context::lookup_snapshot(MODEL, USER.to_string(), "test-ctx".into()).await.unwrap();
-        let found = pie::context::fork(MODEL, snapshot_id, test_pid()).await;
+        let snapshot_id = pie::context::lookup(MODEL, USER.to_string(), "test-ctx".into()).await.unwrap();
+        let child_pid = registered_pid().await;
+        let found = pie::context::fork(MODEL, snapshot_id, child_pid).await;
         assert!(found.is_ok());
+
+        pie::context::unregister_process(pid);
+        pie::context::unregister_process(child_pid);
     });
 }
 
@@ -59,15 +78,20 @@ fn create_and_save_and_open() {
 fn destroy_removes_context() {
     let s = state();
     s.rt.block_on(async {
-        let id = pie::context::create(MODEL, test_pid())
+        let pid = registered_pid().await;
+        let id = pie::context::create(MODEL, pid)
             .await
             .unwrap();
 
         pie::context::destroy(MODEL, id).await.unwrap();
 
         // Fork from destroyed context should fail
-        let fork_result = pie::context::fork(MODEL, id, test_pid()).await;
+        let child_pid = registered_pid().await;
+        let fork_result = pie::context::fork(MODEL, id, child_pid).await;
         assert!(fork_result.is_err(), "fork from destroyed context should fail");
+
+        pie::context::unregister_process(pid);
+        pie::context::unregister_process(child_pid);
     });
 }
 
@@ -75,12 +99,15 @@ fn destroy_removes_context() {
 fn force_destroy() {
     let s = state();
     s.rt.block_on(async {
-        let id = pie::context::create(MODEL, test_pid())
+        let pid = registered_pid().await;
+        let id = pie::context::create(MODEL, pid)
             .await
             .unwrap();
 
         // Destroy should succeed on a fresh context
         pie::context::destroy(MODEL, id).await.unwrap();
+
+        pie::context::unregister_process(pid);
     });
 }
 
@@ -88,7 +115,8 @@ fn force_destroy() {
 fn working_page_token_ops() {
     let s = state();
     s.rt.block_on(async {
-        let id = pie::context::create(MODEL, test_pid())
+        let pid = registered_pid().await;
+        let id = pie::context::create(MODEL, pid)
             .await
             .unwrap();
 
@@ -111,6 +139,8 @@ fn working_page_token_ops() {
         // Truncate out of range should fail
         let err = pie::context::truncate_working_page_tokens(MODEL, id, 10).await;
         assert!(err.is_err(), "truncate beyond token count should error");
+
+        pie::context::unregister_process(pid);
     });
 }
 
@@ -118,15 +148,20 @@ fn working_page_token_ops() {
 fn fork_context() {
     let s = state();
     s.rt.block_on(async {
-        let parent_id = pie::context::create(MODEL, test_pid())
+        let parent_pid = registered_pid().await;
+        let parent_id = pie::context::create(MODEL, parent_pid)
             .await
             .unwrap();
 
-        let child_id = pie::context::fork(MODEL, parent_id, test_pid())
+        let child_pid = registered_pid().await;
+        let child_id = pie::context::fork(MODEL, parent_id, child_pid)
             .await
             .unwrap();
 
         assert_ne!(parent_id, child_id);
+
+        pie::context::unregister_process(parent_pid);
+        pie::context::unregister_process(child_pid);
     });
 }
 
@@ -147,7 +182,7 @@ fn full_page_lifecycle() {
 
         // ── Phase 1: Create anonymous context and fill prompt tokens ──
         let prompt: Vec<u32> = (1000..1032).collect(); // 32 tokens
-        let pid = uuid::Uuid::new_v4();
+        let pid = registered_pid().await;
         let id = pie::context::create(MODEL, pid).await.unwrap();
 
         // Tokens per page should match the model config
@@ -208,7 +243,8 @@ fn full_page_lifecycle() {
         ).await.unwrap();
         assert_eq!(pie::context::working_page_token_count(MODEL, id), 2);
 
-        let child_id = pie::context::fork(MODEL, id, test_pid()).await.unwrap();
+        let child_pid = registered_pid().await;
+        let child_id = pie::context::fork(MODEL, id, child_pid).await.unwrap();
 
         assert_ne!(id, child_id);
 
@@ -223,5 +259,8 @@ fn full_page_lifecycle() {
             pie::context::working_page_token_count(MODEL, child_id), 2,
             "child inherits filled tokens"
         );
+
+        pie::context::unregister_process(pid);
+        pie::context::unregister_process(child_pid);
     });
 }

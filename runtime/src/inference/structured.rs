@@ -21,7 +21,7 @@
 //! use pie::inference::structured::bitmask;
 //! use pie::inference::structured::grammar::Grammar;
 //! use pie::inference::structured::matcher::GrammarMatcher;
-//! use pie::tokenizer::Tokenizer;
+//! use pie::model::tokenizer::Tokenizer;
 //!
 //! // Create grammar from EBNF
 //! let grammar = Arc::new(
@@ -81,7 +81,7 @@
 //! use pie::inference::structured::compiled_grammar::CompiledGrammar;
 //! use pie::inference::structured::grammar::Grammar;
 //! use pie::inference::structured::matcher::GrammarMatcher;
-//! use pie::tokenizer::Tokenizer;
+//! use pie::model::tokenizer::Tokenizer;
 //!
 //! let grammar = Arc::new(Grammar::from_ebnf(r#"root ::= [a-z]+"#, "root").unwrap());
 //! let vocab: Vec<String> = (0..128u16).map(|b| String::from(b as u8 as char)).collect();

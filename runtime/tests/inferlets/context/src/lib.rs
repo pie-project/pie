@@ -1,6 +1,11 @@
 //! Context test inferlet — exercises model, context, and tokenizer host APIs.
 
-use inferlet::{Context, Result, model::Model, runtime};
+use inferlet::{
+    Context,
+    model::Model,
+    runtime,
+    Result,
+};
 
 #[inferlet::main]
 async fn main(_input: String) -> Result<String> {

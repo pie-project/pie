@@ -4,11 +4,11 @@
 //! program add → install → process::spawn() → linker instantiation → WASM
 //! execution → process completion.
 
-use std::sync::{Arc, OnceLock};
+use std::sync::OnceLock;
 use std::time::Duration;
 
 mod common;
-use common::{MockEnv, create_mock_env, inferlets, mock_device::EchoBehavior};
+use common::{MockEnv, create_mock_env, inferlets};
 
 use pie::process;
 use pie::program::ProgramName;
@@ -31,7 +31,7 @@ fn state() -> &'static TestState {
         inferlets::build_inferlets();
 
         let rt = tokio::runtime::Runtime::new().unwrap();
-        let env = create_mock_env("test-model", 1, 16, Arc::new(EchoBehavior(42)));
+        let env = create_mock_env("test-model", 1, 16);
         let config = env.config();
         rt.block_on(async {
             pie::bootstrap::bootstrap(config).await.unwrap();

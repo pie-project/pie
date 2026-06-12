@@ -27,7 +27,7 @@ enum Dest {
     Process(ProcessId),
     /// pie-server's `tracing` log, tagged with the program name for triage.
     /// Used by daemon components, which have no attached client.
-    Server(Arc<str>),
+    Log(Arc<str>),
 }
 
 /// A WASI-compatible output stream that routes guest stdout/stderr.
@@ -39,19 +39,31 @@ pub struct LogStream {
 
 impl LogStream {
     pub fn new_stdout(process_id: ProcessId) -> Self {
-        LogStream { dest: Dest::Process(process_id), is_stderr: false }
+        LogStream {
+            dest: Dest::Process(process_id),
+            is_stderr: false,
+        }
     }
 
     pub fn new_stderr(process_id: ProcessId) -> Self {
-        LogStream { dest: Dest::Process(process_id), is_stderr: true }
+        LogStream {
+            dest: Dest::Process(process_id),
+            is_stderr: true,
+        }
     }
 
     pub fn new_server_stdout(program: Arc<str>) -> Self {
-        LogStream { dest: Dest::Server(program), is_stderr: false }
+        LogStream {
+            dest: Dest::Log(program),
+            is_stderr: false,
+        }
     }
 
     pub fn new_server_stderr(program: Arc<str>) -> Self {
-        LogStream { dest: Dest::Server(program), is_stderr: true }
+        LogStream {
+            dest: Dest::Log(program),
+            is_stderr: true,
+        }
     }
 
     /// Dispatch output to its destination.
@@ -68,7 +80,7 @@ impl LogStream {
                     process::stdout(*process_id, content);
                 }
             }
-            Dest::Server(program) => {
+            Dest::Log(program) => {
                 // Strip the trailing newline so each `eprintln!`/`println!`
                 // becomes one clean tracing event rather than an empty extra line.
                 let content = String::from_utf8_lossy(bytes);
@@ -197,7 +209,10 @@ mod tests {
             let mut s = LogStream::new_server_stderr(Arc::from("chat-apc"));
             s.write_bytes(b"clock skew detected: 42s\n");
         });
-        assert!(out.contains("clock skew detected: 42s"), "stderr text missing: {out:?}");
+        assert!(
+            out.contains("clock skew detected: 42s"),
+            "stderr text missing: {out:?}"
+        );
         assert!(out.contains("chat-apc"), "program tag missing: {out:?}");
         assert!(out.contains("WARN"), "stderr should log at WARN: {out:?}");
     }
@@ -208,7 +223,10 @@ mod tests {
             let mut s = LogStream::new_server_stdout(Arc::from("helloworld"));
             s.write_bytes(b"served request\n");
         });
-        assert!(out.contains("served request"), "stdout text missing: {out:?}");
+        assert!(
+            out.contains("served request"),
+            "stdout text missing: {out:?}"
+        );
         assert!(out.contains("INFO"), "stdout should log at INFO: {out:?}");
     }
 

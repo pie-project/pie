@@ -4,7 +4,6 @@
 //! complete `Config`, ready to pass to `bootstrap::bootstrap()`.
 
 use std::path::PathBuf;
-use std::sync::Arc;
 
 use tempfile::TempDir;
 
@@ -13,7 +12,7 @@ use pie::bootstrap::{
     TelemetryConfig,
 };
 
-use super::mock_device::{Behavior, MockBackend};
+use super::mock_device::MockBackend;
 
 // =============================================================================
 // MockEnv
@@ -24,7 +23,7 @@ use super::mock_device::{Behavior, MockBackend};
 /// Owns the mock backend (keeping IPC servers alive) and temporary
 /// directories. Everything is cleaned up on drop.
 pub struct MockEnv {
-    /// The mock device backend (RPC servers + poll threads).
+    /// The mock device backend (shmem forward-pass servers + serving threads).
     pub backend: MockBackend,
     /// The generated Config, ready for `bootstrap::bootstrap()`.
     config: Config,
@@ -47,16 +46,15 @@ impl MockEnv {
 ///
 /// This:
 /// 1. Creates temporary directories for cache and auth
-/// 2. Spawns mock RPC servers (one per device)
+/// 2. Spawns mock shmem device servers (one per device)
 /// 3. Builds a `Config` with `skip_tracing: true` and `auth.enabled: false`
 /// 4. Sets `tokenizer_path` to the bundled test fixture
 pub fn create_mock_env(
     model_name: &str,
     num_devices: usize,
     num_pages: usize,
-    behavior: Arc<dyn Behavior>,
 ) -> MockEnv {
-    let backend = MockBackend::new(num_devices, behavior);
+    let backend = MockBackend::new(num_devices);
 
     let temp_cache = TempDir::new().expect("Failed to create temp cache dir");
     let temp_auth = TempDir::new().expect("Failed to create temp auth dir");

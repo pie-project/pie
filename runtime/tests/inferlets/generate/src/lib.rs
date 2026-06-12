@@ -3,7 +3,13 @@
 //! This inferlet tests: fill_tokens → flush → generate (step loop).
 //! Skips chat template rendering to work with mock backends.
 
-use inferlet::{Context, Result, model::Model, runtime, sample::Sampler};
+use inferlet::{
+    Context,
+    sample::Sampler,
+    model::Model,
+    runtime,
+    Result,
+};
 
 #[inferlet::main]
 async fn main(_input: String) -> Result<String> {
@@ -27,11 +33,16 @@ async fn main(_input: String) -> Result<String> {
 
     // Generate tokens with a small limit
     let max_tokens: usize = 5;
-    let generated = context
+    let mut stream = context
         .generate(Sampler::top_k(0.0, 1))
-        .max_tokens(max_tokens)
-        .collect_tokens()
-        .await?;
+        .max_tokens(max_tokens);
+
+    let mut generated = Vec::new();
+    while let Some(step) = stream.next()? {
+        let out = step.execute().await?;
+        eprintln!("[GENERATE] got tokens: {:?}", out.tokens);
+        generated.extend(out.tokens);
+    }
 
     let result = format!("generated {} tokens: {:?}", generated.len(), generated);
     eprintln!("[GENERATE] {}", result);

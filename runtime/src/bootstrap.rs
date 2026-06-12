@@ -210,10 +210,28 @@ async fn bootstrap_inner(config: Config, listener: Option<TcpListener>) -> Resul
     process::init_admission(config.max_concurrent_processes);
 
     for cfg in config.models.iter() {
+        // KV capacity (tokens) = min device total_pages * kv_page_size
+        // (caps-reported, so post-backoff). Saturate into the u32 WIT type.
+        let kv_capacity_tokens = cfg
+            .devices
+            .iter()
+            .map(|d| (d.total_pages as u64).saturating_mul(cfg.kv_page_size as u64))
+            .min()
+            .unwrap_or(0)
+            .min(u32::MAX as u64) as u32;
+        // Scheduler compute cap (total tokens / process). When set it is
+        // the per-request output ceiling the inferlet follows; saturate
+        // into u32 for the WIT surface.
+        let default_token_limit = cfg
+            .scheduler
+            .default_token_limit
+            .map(|n| n.min(u32::MAX as usize) as u32);
         model::register(
             cfg.name.clone(),
             &cfg.arch_name,
             cfg.kv_page_size as u32,
+            kv_capacity_tokens,
+            default_token_limit,
             cfg.tokenizer_path.clone(),
         )?;
 

@@ -86,13 +86,29 @@ pub async fn submit(
     physical_page_ids: Vec<PhysicalPageId>,
     last_page_len: u32,
 ) -> Result<ForwardPassOutput> {
+    let rx = submit_nowait(model_idx, request, device_idx, physical_page_ids, last_page_len)?;
+    Ok(rx.await.map_err(|_| anyhow::anyhow!(
+        "inference submit: scheduler dropped response channel"
+    ))?)
+}
+
+/// Like `submit`, but returns the response receiver immediately without
+/// awaiting device completion. Lets the caller hand the receiver to a
+/// WIT-level FutureOutput resource so multiple sibling forward passes
+/// from a single inferlet can pipe into the scheduler in the same
+/// accumulate window (instead of serializing one-at-a-time).
+pub fn submit_nowait(
+    model_idx: usize,
+    request: ForwardPassRequest,
+    device_idx: usize,
+    physical_page_ids: Vec<PhysicalPageId>,
+    last_page_len: u32,
+) -> Result<oneshot::Receiver<ForwardPassOutput>> {
     let (tx, rx) = oneshot::channel();
     SERVICES.send(model_idx, Message::Submit {
         request, device_idx, physical_page_ids, last_page_len, response: tx,
     })?;
-    Ok(rx.await.map_err(|_| anyhow::anyhow!(
-        "inference submit: scheduler dropped response channel"
-    ))?)
+    Ok(rx)
 }
 
 /// Returns aggregated inference stats for a model (lock-free, non-blocking).
