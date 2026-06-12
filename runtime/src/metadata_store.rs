@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::sync::{LazyLock, RwLock};
 
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 
 pub const MAX_NAMESPACE_BYTES: usize = 256;
 pub const MAX_KEY_BYTES: usize = 256;
