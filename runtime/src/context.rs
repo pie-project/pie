@@ -104,6 +104,70 @@ use sched::{AuctionResult, ProcessEntry, PendingAlloc};
 
 pub type ContextId = u64;
 
+#[derive(Debug, Clone, Copy)]
+pub struct SnapshotRetentionBudget {
+    pub kv_pages_used: u32,
+    pub kv_pages_total: u32,
+    pub soft_percent: u8,
+    pub evict_percent: u8,
+    pub hard_percent: u8,
+}
+
+impl SnapshotRetentionBudget {
+    pub(crate) fn coherent(&self) -> bool {
+        self.kv_pages_total > 0
+            && self.kv_pages_used <= self.kv_pages_total
+            && self.soft_percent <= 100
+            && self.evict_percent <= 100
+            && self.hard_percent <= 100
+            && self.soft_percent <= self.evict_percent
+            && self.evict_percent <= self.hard_percent
+    }
+
+    pub(crate) fn threshold_pages(&self, percent: u8) -> u32 {
+        ((self.kv_pages_total as u64 * percent as u64) / 100) as u32
+    }
+
+    pub(crate) fn soft_pages(&self) -> u32 { self.threshold_pages(self.soft_percent) }
+    pub(crate) fn evict_pages(&self) -> u32 { self.threshold_pages(self.evict_percent) }
+    pub(crate) fn hard_pages(&self) -> u32 { self.threshold_pages(self.hard_percent) }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SnapshotRetentionReason {
+    RetainedBelowSoftLimit,
+    RetainedBelowEvictionLimit,
+    EvictedPressure,
+    HardCapStillExceeded,
+    RetentionDeleteFailed,
+    ProtectedActive,
+    NoInactiveSnapshots,
+    SkippedUncertainAccounting,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SnapshotRetentionReport {
+    pub evicted_names: Vec<String>,
+    pub pages_reclaimed: u32,
+    pub protected_active_pages: u32,
+    pub retained_snapshot_count: u32,
+    pub delete_failed_count: u32,
+    pub reason: SnapshotRetentionReason,
+}
+
+impl Default for SnapshotRetentionReport {
+    fn default() -> Self {
+        Self {
+            evicted_names: Vec::new(),
+            pages_reclaimed: 0,
+            protected_active_pages: 0,
+            retained_snapshot_count: 0,
+            delete_failed_count: 0,
+            reason: SnapshotRetentionReason::RetainedBelowSoftLimit,
+        }
+    }
+}
+
 /// Entry in the restore priority queue (BinaryHeap).
 ///
 /// Ordering: non-defaulted before defaulted, then highest bid first.
@@ -297,6 +361,46 @@ pub async fn delete(model_idx: usize, username: String, name: String) -> Result<
     let (tx, rx) = oneshot::channel();
     SERVICES.send(model_idx, Message::Delete { username, name, response: tx })?;
     rx.await.context("context::delete: actor dropped response")?
+}
+
+pub async fn retain_snapshot(
+    model_idx: usize,
+    username: String,
+    name: String,
+    owner: ProcessId,
+) -> Result<()> {
+    let (tx, rx) = oneshot::channel();
+    SERVICES.send(model_idx, Message::RetainSnapshot { username, name, owner, response: tx })?;
+    rx.await.context("context::retain_snapshot: actor dropped response")?
+}
+
+pub async fn release_snapshot(
+    model_idx: usize,
+    username: String,
+    name: String,
+    owner: ProcessId,
+) -> Result<()> {
+    let (tx, rx) = oneshot::channel();
+    SERVICES.send(model_idx, Message::ReleaseSnapshot { username, name, owner, response: tx })?;
+    rx.await.context("context::release_snapshot: actor dropped response")?
+}
+
+pub async fn enforce_retention(
+    model_idx: usize,
+    username: String,
+    name_prefix: String,
+    current_name: String,
+    budget: SnapshotRetentionBudget,
+) -> Result<SnapshotRetentionReport> {
+    let (tx, rx) = oneshot::channel();
+    SERVICES.send(model_idx, Message::EnforceRetention {
+        username,
+        name_prefix,
+        current_name,
+        budget,
+        response: tx,
+    })?;
+    Ok(rx.await.context("context::enforce_retention: actor dropped response")?)
 }
 
 pub async fn destroy(model_idx: usize, id: ContextId) -> Result<()> {
@@ -807,6 +911,10 @@ pub(crate) struct ContextManager {
     pub(crate) model_idx: usize,
     /// Named snapshots: (username, name) → snapshot context ID.
     pub(crate) snapshots: HashMap<(String, String), ContextId>,
+    /// Host-persistent active snapshot protections. Unlike guest statics,
+    /// this survives per-request WASM instantiation and spans concurrent
+    /// daemon requests for the same model.
+    pub(crate) active_snapshots: HashMap<(String, String, ProcessId), u32>,
     /// Monotonically increasing context ID generator.
     next_id: u64,
     /// Per-process state: credit balance, endowment, owned context IDs.
@@ -864,7 +972,9 @@ impl ContextManager {
             .collect();
         ContextManager {
             gpu_stores, cpu_stores, page_size, model_idx,
-            snapshots: HashMap::new(), next_id: 1,
+            snapshots: HashMap::new(),
+            active_snapshots: HashMap::new(),
+            next_id: 1,
             processes: HashMap::new(),
             contexts: HashMap::new(),
             alloc_queue: VecDeque::new(),
@@ -1481,6 +1591,15 @@ pub(crate) enum Message {
     Create { owner: ProcessId, response: oneshot::Sender<Result<ContextId>> },
     Save { id: ContextId, username: String, name: Option<String>, response: oneshot::Sender<Result<Option<String>>> },
     Delete { username: String, name: String, response: oneshot::Sender<Result<()>> },
+    RetainSnapshot { username: String, name: String, owner: ProcessId, response: oneshot::Sender<Result<()>> },
+    ReleaseSnapshot { username: String, name: String, owner: ProcessId, response: oneshot::Sender<Result<()>> },
+    EnforceRetention {
+        username: String,
+        name_prefix: String,
+        current_name: String,
+        budget: SnapshotRetentionBudget,
+        response: oneshot::Sender<SnapshotRetentionReport>,
+    },
     Destroy { id: ContextId, response: oneshot::Sender<Result<()>> },
     Fork { id: ContextId, owner: ProcessId, response: oneshot::Sender<Result<ContextId>> },
     Take { username: String, name: String, owner: ProcessId, response: oneshot::Sender<Result<ContextId>> },
@@ -1526,9 +1645,15 @@ impl ServiceHandler for ContextManager {
         let _t = Instant::now();
         match msg {
             Message::Lookup { username, name, response } => {
-                let result = self.snapshots.get(&(username, name))
-                    .copied()
-                    .ok_or_else(|| anyhow::anyhow!("Snapshot not found"));
+                let result = match self.snapshots.get(&(username, name)).copied() {
+                    Some(id) => {
+                        if let Some(ctx) = self.contexts.get_mut(&id) {
+                            ctx.last_access = Instant::now();
+                        }
+                        Ok(id)
+                    }
+                    None => Err(anyhow::anyhow!("Snapshot not found")),
+                };
                 let _ = response.send(result);
             }
             Message::Take { username, name, owner, response } => {
@@ -1542,6 +1667,20 @@ impl ServiceHandler for ContextManager {
             }
             Message::Delete { username, name, response } => {
                 let _ = response.send(self.delete(username, name));
+            }
+            Message::RetainSnapshot { username, name, owner, response } => {
+                let _ = response.send(self.retain_snapshot(username, name, owner));
+            }
+            Message::ReleaseSnapshot { username, name, owner, response } => {
+                let _ = response.send(self.release_snapshot(username, name, owner));
+            }
+            Message::EnforceRetention { username, name_prefix, current_name, budget, response } => {
+                let _ = response.send(self.enforce_snapshot_retention(
+                    username,
+                    name_prefix,
+                    current_name,
+                    budget,
+                ));
             }
             Message::Destroy { id, response } => {
                 let t0 = Instant::now();

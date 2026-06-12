@@ -6,6 +6,35 @@ interface context {
 
     type page-id = u32;
 
+
+    record retention-budget {
+        kv-pages-used: u32,
+        kv-pages-total: u32,
+        soft-percent: u8,
+        evict-percent: u8,
+        hard-percent: u8,
+    }
+
+    enum retention-reason {
+        retained-below-soft-limit,
+        retained-below-eviction-limit,
+        evicted-pressure,
+        hard-cap-still-exceeded,
+        retention-delete-failed,
+        protected-active,
+        no-inactive-snapshots,
+        skipped-uncertain-accounting,
+    }
+
+    record retention-report {
+        evicted-names: list<string>,
+        pages-reclaimed: u32,
+        protected-active-pages: u32,
+        retained-snapshot-count: u32,
+        delete-failed-count: u32,
+        reason: retention-reason,
+    }
+
     resource context {
 
         // Creates a fresh empty context
@@ -19,6 +48,16 @@ interface context {
 
         // Deletes a saved snapshot by name
         delete: static func(model: borrow<model>, name: string) -> result<_, error>;
+
+
+        // Marks a saved snapshot as protected by an in-flight request.
+        retain-snapshot: static func(model: borrow<model>, name: string) -> result<_, error>;
+
+        // Releases a prior retain-snapshot mark. Best-effort; missing retains are ignored.
+        release-snapshot: static func(model: borrow<model>, name: string);
+
+        // Host-persistent smart retention over saved snapshots whose names start with name-prefix.
+        enforce-retention: static func(model: borrow<model>, name-prefix: string, current-name: string, budget: retention-budget) -> result<retention-report, error>;
 
         // Forks into a new anonymous context (working pages are copied via GPU D2D or CPU H2D)
         fork: func() -> result<context, error>;
