@@ -56,6 +56,10 @@ fn build_portable() {
     println!("cargo:rerun-if-env-changed=PIE_PORTABLE_CUDA");
     println!("cargo:rerun-if-env-changed=PIE_PORTABLE_VULKAN");
     println!("cargo:rerun-if-env-changed=PIE_PORTABLE_METAL");
+    println!(
+        "cargo:rustc-env=PIE_COMPILED_PORTABLE_METAL={}",
+        if metal_enabled { "1" } else { "0" }
+    );
 
     if metal_enabled && target_os != "macos" {
         panic!("PIE_PORTABLE_METAL is only valid on macOS (got target_os={target_os:?})");

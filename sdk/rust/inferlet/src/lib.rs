@@ -44,6 +44,7 @@ mod context;
 
 pub use context::{
     Context, RawContext,
+    RetentionBudget, RetentionReason, RetentionReport,
     Constrain, GrammarConstraint, Schema,
     AnyJson, Ebnf, JsonSchema, Regex,
 };

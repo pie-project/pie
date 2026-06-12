@@ -27,6 +27,22 @@ class TestModel:
 
 
 # =============================================================================
+# Runtime
+# =============================================================================
+
+
+class TestRuntime:
+    def test_metadata_wrappers_round_trip_bytes(self):
+        from inferlet import runtime
+
+        assert runtime.metadata_get("thread", "sidecar") is None
+        runtime.metadata_put("thread", "sidecar", b"state")
+        assert runtime.metadata_get("thread", "sidecar") == b"state"
+        assert runtime.metadata_delete("thread", "sidecar") is True
+        assert runtime.metadata_delete("thread", "sidecar") is False
+
+
+# =============================================================================
 # Sampler — token-producing
 # =============================================================================
 

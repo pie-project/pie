@@ -5,6 +5,8 @@ members = [
     "context",
     "error",
     "generate",
+    "metadata",
+    "metadata-peer",
 ]
 
 [workspace.dependencies]

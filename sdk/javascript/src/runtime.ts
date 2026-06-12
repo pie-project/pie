@@ -21,3 +21,18 @@ export function username(): string {
 export function models(): string[] {
   return _rt.models();
 }
+
+/** Store or overwrite engine-lifetime metadata for this caller. */
+export function metadataPut(namespace: string, key: string, value: Uint8Array): void {
+  _rt.metadataPut(namespace, key, value);
+}
+
+/** Retrieve engine-lifetime metadata for this caller, if present. */
+export function metadataGet(namespace: string, key: string): Uint8Array | undefined {
+  return _rt.metadataGet(namespace, key);
+}
+
+/** Delete engine-lifetime metadata for this caller. */
+export function metadataDelete(namespace: string, key: string): boolean {
+  return _rt.metadataDelete(namespace, key);
+}

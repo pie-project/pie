@@ -241,6 +241,7 @@ impl ContextManager {
 
         // Single pass: remove all snapshot entries pointing to this process's contexts.
         self.snapshots.retain(|_, v| !ctx_ids.contains(v));
+        self.active_snapshots.retain(|(_, _, active_pid), _| active_pid != &pid);
 
         let t_destroy = t_start.elapsed();
 

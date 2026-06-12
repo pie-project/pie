@@ -1296,8 +1296,7 @@ pub(crate) async fn snapshot_from_bytes(
     dep_components: Vec<Component>,
 ) -> Result<Vec<u8>> {
     let mut linker = Linker::<InstanceState>::new(engine);
-    wasmtime_wasi::p2::add_to_linker_async(&mut linker)
-        .expect("Failed to link WASI");
+    wasmtime_wasi::p2::add_to_linker_async(&mut linker).expect("Failed to link WASI");
     wasmtime_wasi_http::add_only_http_to_linker_async(&mut linker)
         .expect("Failed to link WASI HTTP");
     api::add_to_linker(&mut linker)?;
@@ -1317,11 +1316,13 @@ pub(crate) async fn snapshot_from_bytes(
     let inst_state = InstanceState::new(
         uuid::Uuid::new_v4(),
         "snapshot".to_string(),
+        "snapshot".to_string(),
         OutputMode::Discard, // snapshot init only — guest output is noise
         &snapshot_policy,    // deny fs + deny network — snapshot init only
         None,                // token_budget
         py_runtime::dir(),
-    ).await?;
+    )
+    .await?;
     let mut store = Store::new(engine, inst_state);
 
     if !dep_components.is_empty() {

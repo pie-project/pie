@@ -27,3 +27,18 @@ def username() -> str:
 def models() -> list[str]:
     """Get names of all available models."""
     return list(_runtime.models())
+
+
+def metadata_put(namespace: str, key: str, value: bytes) -> None:
+    """Store or overwrite engine-lifetime metadata for this caller."""
+    _runtime.metadata_put(namespace, key, value)
+
+
+def metadata_get(namespace: str, key: str) -> bytes | None:
+    """Retrieve engine-lifetime metadata for this caller, if present."""
+    return _runtime.metadata_get(namespace, key)
+
+
+def metadata_delete(namespace: str, key: str) -> bool:
+    """Delete engine-lifetime metadata for this caller."""
+    return _runtime.metadata_delete(namespace, key)

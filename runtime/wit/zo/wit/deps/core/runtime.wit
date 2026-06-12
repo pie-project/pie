@@ -1,6 +1,6 @@
 interface runtime {
 
-    use types.{error};
+    use types.{blob, error};
 
     // Returns the runtime version string
     version: func() -> string;
@@ -19,5 +19,14 @@ interface runtime {
     // scheduler default_token_limit capped by raw engine KV capacity
     // when set, otherwise raw engine KV capacity.
     max-output-tokens: func() -> u32;
+
+    // Store or overwrite engine-lifetime inferlet metadata under a namespace.
+    metadata-put: func(namespace: string, key: string, value: blob) -> result<_, error>;
+
+    // Retrieve engine-lifetime inferlet metadata from a namespace.
+    metadata-get: func(namespace: string, key: string) -> result<option<blob>, error>;
+
+    // Delete engine-lifetime inferlet metadata from a namespace.
+    metadata-delete: func(namespace: string, key: string) -> result<bool, error>;
 
 }

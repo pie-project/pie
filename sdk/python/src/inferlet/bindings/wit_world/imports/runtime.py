@@ -31,3 +31,24 @@ def models() -> List[str]:
     Get a list of all available model names
     """
     raise NotImplementedError
+def metadata_put(namespace: str, key: str, value: bytes) -> None:
+    """
+    Store or overwrite engine-lifetime inferlet metadata under a namespace.
+    
+    Raises: `wit_world.types.Err(wit_world.imports.str)`
+    """
+    raise NotImplementedError
+def metadata_get(namespace: str, key: str) -> Optional[bytes]:
+    """
+    Retrieve engine-lifetime inferlet metadata from a namespace.
+    
+    Raises: `wit_world.types.Err(wit_world.imports.str)`
+    """
+    raise NotImplementedError
+def metadata_delete(namespace: str, key: str) -> bool:
+    """
+    Delete engine-lifetime inferlet metadata from a namespace.
+    
+    Raises: `wit_world.types.Err(wit_world.imports.str)`
+    """
+    raise NotImplementedError
