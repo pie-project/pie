@@ -1533,13 +1533,44 @@ impl ContextManager {
     }
 
     pub(crate) fn truncate_working_page_tokens(&mut self, id: ContextId, count: u32) -> Result<()> {
-        let ctx = self.contexts.get_mut(&id)
-            .ok_or_else(|| anyhow::anyhow!("Context not found"))?;
-        let max = ctx.working_page_tokens.len();
-        if count as usize > max {
-            anyhow::bail!("truncate count {} out of range 0..={}", count, max);
+        let page_size = self.page_size;
+        let mut freed: Option<(usize, Vec<PhysicalPageId>)> = None;
+        {
+            let ctx = self.contexts.get_mut(&id)
+                .ok_or_else(|| anyhow::anyhow!("Context not found"))?;
+            let max = ctx.working_page_tokens.len();
+            if count as usize > max {
+                anyhow::bail!("truncate count {} out of range 0..={}", count, max);
+            }
+            ctx.working_page_tokens.truncate(count as usize);
+
+            // Keep the working-page reservation count consistent with the
+            // remaining token metadata. Speculative verification reserves
+            // for proposed drafts before it knows which suffix will be
+            // rejected; if rollback drops below a page boundary, leaving the
+            // now-empty reserved page attached makes the next pin report a
+            // longer KV span than actually exists.
+            let needed_pages = if page_size == 0 {
+                0
+            } else {
+                (ctx.working_page_tokens.len() + page_size - 1) / page_size
+            };
+            if ctx.is_off_gpu() {
+                ctx.suspended_working_count = ctx.suspended_working_count.min(needed_pages);
+            } else if ctx.working_pages.len() > needed_pages {
+                let dev_idx = ctx.device.unwrap_or(0) as usize;
+                let to_free: Vec<_> = ctx.working_pages.drain(needed_pages..).collect();
+                freed = Some((dev_idx, to_free));
+            }
         }
-        ctx.working_page_tokens.truncate(count as usize);
+
+        if let Some((dev_idx, pages)) = freed {
+            if !pages.is_empty() {
+                self.gpu_stores[dev_idx].free(&pages);
+                self.drain_queues();
+            }
+        }
+        self.publish_context_counts(id);
         Ok(())
     }
 

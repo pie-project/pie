@@ -594,6 +594,12 @@ impl<'g, 'ctx> GenStep<'g, 'ctx> {
             let n_rejected = n_drafted.saturating_sub(n_verified);
             if n_rejected > 0 {
                 parent.ctx.inner.truncate_working_page_tokens(n_rejected);
+                // The host may release now-empty reserved pages after the
+                // rejected suffix is removed. Resync the page-reservation
+                // count, but keep `working_tokens`/`seq_len` at their
+                // pre-pass values: the commit block below advances them
+                // exactly once for the pending token plus accepted drafts.
+                parent.ctx.working_pages = parent.ctx.inner.working_page_count();
             }
             // Roll back custom speculator's own state too.
             if let SpecMode::Custom(s) = &mut parent.speculation {
