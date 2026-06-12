@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use criterion::{Criterion, criterion_group, criterion_main};
 
-use common::{create_mock_env, MockEnv, mock_device::EchoBehavior, inferlets};
+use common::{MockEnv, create_mock_env, inferlets, mock_device::EchoBehavior};
 use pie::process;
 use pie::program::ProgramName;
 
@@ -51,10 +51,12 @@ fn spawn_and_wait_all(s: &BenchState, count: usize) {
                 process::spawn(
                     "bench-user".into(),
                     program_name(),
-                    vec![format!("{i}")],
-                    None,
+                    format!(r#"{{"message":"{i}"}}"#),
                     None,
                     false,
+                    None,
+                    None,
+                    None,
                 )
                 .expect("spawn")
             })
