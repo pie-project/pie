@@ -71,6 +71,10 @@ xz2 = "0.1"
 # pairing; nvml-wrapper feeds the GPU panel from libnvidia-ml.so when
 # present (gracefully absent on macOS / non-NVIDIA hosts).
 ratatui = "0.30"
+# ratatui-widgets 0.3.1 requires time >=0.3.47 but fails to compile with
+# time 0.3.48 on the current Rust toolchain due to overlapping From impls. Keep
+# resolution on the lowest compatible patch until ratatui-widgets fixes it.
+time = "=0.3.47"
 crossterm = "0.29"
 nvml-wrapper = "0.12"
 
