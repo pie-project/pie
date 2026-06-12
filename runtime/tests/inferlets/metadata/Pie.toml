@@ -1,0 +1,4 @@
+[package]
+name = "metadata"
+version = "0.1.0"
+description = "Test inferlet: exercises engine-lifetime metadata KV host APIs"

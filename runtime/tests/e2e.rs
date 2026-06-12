@@ -8,10 +8,11 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 mod common;
-use common::{create_mock_env, MockEnv, mock_device::EchoBehavior, inferlets};
+use common::{MockEnv, create_mock_env, inferlets, mock_device::EchoBehavior};
 
 use pie::process;
 use pie::program::ProgramName;
+use tokio::sync::oneshot;
 
 /// Timeout for a single process to complete.
 const PROCESS_TIMEOUT: Duration = Duration::from_secs(10);
@@ -45,11 +46,7 @@ fn program_name(name: &str) -> ProgramName {
 
 /// Spawn a process within the tokio runtime and wait for it to complete.
 /// Returns true if the process exited within the timeout.
-fn spawn_and_wait(
-    s: &TestState,
-    name: &str,
-    input: String,
-) -> bool {
+fn spawn_and_wait(s: &TestState, name: &str, input: String) -> bool {
     let pid = s.rt.block_on(async {
         inferlets::add_and_install(name).await;
         process::spawn(
@@ -77,6 +74,30 @@ fn spawn_and_wait(
         })
         .await
         .is_ok()
+    })
+}
+
+/// Spawn a process and return its result payload.
+fn spawn_and_result(s: &TestState, name: &str, input: String) -> Result<String, String> {
+    s.rt.block_on(async {
+        inferlets::add_and_install(name).await;
+        let (tx, rx) = oneshot::channel();
+        process::spawn(
+            "test-user".into(),
+            program_name(name),
+            input,
+            None,
+            false,
+            Some(tx),
+            None, // no workflow
+            None, // token_budget
+        )
+        .expect("spawn");
+
+        tokio::time::timeout(PROCESS_TIMEOUT, rx)
+            .await
+            .expect("process result timed out")
+            .expect("process result sender dropped")
     })
 }
 
@@ -120,6 +141,29 @@ fn generate_inferlet_exercises_forward_pass() {
     );
 }
 
+#[test]
+fn metadata_store_survives_across_request_instances() {
+    let s = state();
+    let namespace = format!("test-thread-{}", uuid::Uuid::new_v4());
+
+    assert_eq!(
+        spawn_and_result(s, "metadata", format!("put:{namespace}:sidecar:alpha")).unwrap(),
+        "put"
+    );
+    assert_eq!(
+        spawn_and_result(s, "metadata", format!("get:{namespace}:sidecar")).unwrap(),
+        "alpha"
+    );
+    assert_eq!(
+        spawn_and_result(s, "metadata", format!("delete:{namespace}:sidecar")).unwrap(),
+        "deleted:true"
+    );
+    assert_eq!(
+        spawn_and_result(s, "metadata", format!("get:{namespace}:sidecar")).unwrap(),
+        "missing"
+    );
+}
+
 // =============================================================================
 // Stress & Concurrency
 // =============================================================================
@@ -141,7 +185,7 @@ fn concurrent_spawns() {
                     false,
                     None,
                     None, // no workflow
-            None, // token_budget
+                    None, // token_budget
                 )
                 .unwrap_or_else(|e| panic!("spawn {i} failed: {e}"));
                 pid
@@ -159,7 +203,10 @@ fn concurrent_spawns() {
             })
             .await
             .is_ok();
-            assert!(completed, "concurrent echo {i} (pid {pid}) did not complete");
+            assert!(
+                completed,
+                "concurrent echo {i} (pid {pid}) did not complete"
+            );
         }
     });
 }
@@ -179,7 +226,7 @@ fn rapid_sequential_spawns() {
                 false,
                 None,
                 None, // no workflow
-            None, // token_budget
+                None, // token_budget
             )
             .unwrap_or_else(|e| panic!("sequential spawn {i} failed: {e}"));
 
@@ -193,12 +240,18 @@ fn rapid_sequential_spawns() {
             })
             .await
             .is_ok();
-            assert!(completed, "sequential echo {i} (pid {pid}) did not complete");
+            assert!(
+                completed,
+                "sequential echo {i} (pid {pid}) did not complete"
+            );
         }
 
         // After all processes finish, the process list should not grow unboundedly
         let remaining = process::list().len();
-        assert!(remaining < 5, "expected few residual processes, got {remaining}");
+        assert!(
+            remaining < 5,
+            "expected few residual processes, got {remaining}"
+        );
     });
 }
 
@@ -224,7 +277,7 @@ fn mixed_success_and_error() {
                 false,
                 None,
                 None, // no workflow
-            None, // token_budget
+                None, // token_budget
             )
             .unwrap_or_else(|e| panic!("mixed spawn {i} ({name}) failed: {e}"));
             pids.push((i, name, pid));
@@ -302,6 +355,9 @@ fn spawn_after_termination() {
         })
         .await
         .is_ok();
-        assert!(completed, "process spawned after termination should complete normally");
+        assert!(
+            completed,
+            "process spawned after termination should complete normally"
+        );
     });
 }

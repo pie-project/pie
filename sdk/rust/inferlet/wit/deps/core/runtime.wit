@@ -1,6 +1,6 @@
 interface runtime {
 
-    use types.{error};
+    use types.{blob, error};
 
     // Returns the runtime version string
     version: func() -> string;
@@ -13,5 +13,14 @@ interface runtime {
 
     // Get a list of all available model names
     models: func() -> list<string>;
+
+    // Store or overwrite engine-lifetime inferlet metadata under a namespace.
+    metadata-put: func(namespace: string, key: string, value: blob) -> result<_, error>;
+
+    // Retrieve engine-lifetime inferlet metadata from a namespace.
+    metadata-get: func(namespace: string, key: string) -> result<option<blob>, error>;
+
+    // Delete engine-lifetime inferlet metadata from a namespace.
+    metadata-delete: func(namespace: string, key: string) -> result<bool, error>;
 
 }

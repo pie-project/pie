@@ -10,6 +10,7 @@ pub mod bootstrap;
 pub mod inference;
 pub mod instance;
 pub mod messaging;
+pub mod metadata_store;
 pub mod model;
 pub mod path;
 pub mod policy;

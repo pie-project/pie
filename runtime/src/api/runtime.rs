@@ -2,6 +2,7 @@
 
 use crate::api::pie;
 use crate::instance::InstanceState;
+use crate::metadata_store;
 use crate::model;
 
 use anyhow::Result;
@@ -21,5 +22,30 @@ impl pie::core::runtime::Host for InstanceState {
 
     async fn models(&mut self) -> Result<Vec<String>> {
         Ok(model::models())
+    }
+
+    async fn metadata_put(
+        &mut self,
+        namespace: String,
+        key: String,
+        value: Vec<u8>,
+    ) -> Result<Result<(), String>> {
+        Ok(metadata_store::put(&namespace, &key, value).map_err(|e| e.to_string()))
+    }
+
+    async fn metadata_get(
+        &mut self,
+        namespace: String,
+        key: String,
+    ) -> Result<Result<Option<Vec<u8>>, String>> {
+        Ok(metadata_store::get(&namespace, &key).map_err(|e| e.to_string()))
+    }
+
+    async fn metadata_delete(
+        &mut self,
+        namespace: String,
+        key: String,
+    ) -> Result<Result<bool, String>> {
+        Ok(metadata_store::delete(&namespace, &key).map_err(|e| e.to_string()))
     }
 }

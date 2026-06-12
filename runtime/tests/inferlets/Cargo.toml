@@ -5,6 +5,7 @@ members = [
     "context",
     "error",
     "generate",
+    "metadata",
 ]
 
 [workspace.dependencies]
