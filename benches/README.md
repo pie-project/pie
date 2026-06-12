@@ -73,6 +73,33 @@ python benches/llamacpp_bench.py tput \
 
 Use `--json-out <path>` to save machine-readable results.
 
+## Reasoning-pattern benchmark
+
+`reasoning_bench.py` compares Direct, Best-of-N, Tree-of-Thought, and
+Graph-of-Thought through one benchmark-specific inferlet. Reference answers
+remain in the Python harness and are never sent to the model.
+
+Build the inferlet:
+
+```bash
+cargo build --manifest-path inferlets/reasoning-benchmark/Cargo.toml \
+  --target wasm32-wasip2 --release
+```
+
+Run the bundled smoke problems:
+
+```bash
+uv --project sdk/python-server run python benches/reasoning_bench.py \
+  --driver cuda_native \
+  --model Qwen/Qwen3-0.6B \
+  --pattern all \
+  --json-out .tmp/reasoning-smoke.json
+```
+
+For GSM8K, pass a JSONL file containing the official `question` and `answer`
+fields. The harness extracts the numeric reference after GSM8K's `####`
+delimiter.
+
 ## Fairness defaults
 
 - vLLM prefix caching is disabled.
