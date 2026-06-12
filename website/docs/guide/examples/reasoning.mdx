@@ -10,11 +10,17 @@ Inferlets that fan out reasoning across multiple branches and aggregate the resu
 
 | Inferlet | What it shows |
 |---|---|
-| [`tree-of-thought`](https://github.com/pie-project/pie/tree/main/inferlets/tree-of-thought) | Multi-branch reasoning (Propose, Execute, Reflect). |
+| [`tree-of-thought`](https://github.com/pie-project/pie/tree/main/inferlets/tree-of-thought) | Level-wise beam search: generate 3 candidates, score all 3, keep the top 2 globally for the level, then expand only those survivors. |
 | [`graph-of-thought`](https://github.com/pie-project/pie/tree/main/inferlets/graph-of-thought) | Hierarchical aggregation of multiple proposals. |
 | [`skeleton-of-thought`](https://github.com/pie-project/pie/tree/main/inferlets/skeleton-of-thought) | Parallel elaboration of key points. |
 | [`recursion-of-thought`](https://github.com/pie-project/pie/tree/main/inferlets/recursion-of-thought) | Divide-and-conquer problem solving. |
 | [`knowledge-graph`](https://github.com/pie-project/pie/tree/main/inferlets/knowledge-graph) | Knowledge-graph extraction and traversal with `petgraph`. |
+
+## Tree-of-Thought beam semantics
+
+The `tree-of-thought` example is a bounded, level-wise beam search rather than an exhaustive full-tree walk. With the defaults, level 1 generates 3 candidate plans from the shared question prefix, scores all 3, keeps the top 2, and commits the next frontier only after all candidates in that level have been scored. Level 2 repeats from those two survivors: each survivor generates 3 more candidates, all 6 are scored together, and only the top 2 become the next frontier.
+
+If a UI streams candidate scores as they arrive, any highlighted winner is provisional. The committed beam is not final for that level until every candidate at that level has a score, because a late candidate can still enter the top 2. Treat the score table as optional inspection or debug context; the normal inferlet result is the selected direct answer.
 
 ## Related guide
 
