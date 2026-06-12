@@ -6,6 +6,7 @@ members = [
     "error",
     "generate",
     "metadata",
+    "metadata-peer",
 ]
 
 [workspace.dependencies]

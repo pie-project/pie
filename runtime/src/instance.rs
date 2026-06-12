@@ -16,6 +16,7 @@ use self::output::LogStream;
 
 use crate::context;
 use crate::linker::InstancePolicy;
+use crate::metadata_store::MetadataOwner;
 use crate::process::ProcessId;
 
 /// Where an instance's stdout/stderr are routed.
@@ -35,6 +36,7 @@ pub struct InstanceState {
     // Wasm states
     id: ProcessId,
     username: String,
+    program: String,
 
     // WASI states
     wasi_ctx: WasiCtx,
@@ -84,6 +86,7 @@ impl InstanceState {
     pub async fn new(
         id: ProcessId,
         username: String,
+        program: String,
         output: OutputMode,
         policy: &InstancePolicy,
         token_budget: Option<usize>,
@@ -177,6 +180,7 @@ impl InstanceState {
         Ok(InstanceState {
             id,
             username,
+            program,
             wasi_ctx: builder.build(),
             resource_table: ResourceTable::new(),
             http_ctx: WasiHttpCtx::new(),
@@ -194,6 +198,10 @@ impl InstanceState {
 
     pub fn get_username(&self) -> String {
         self.username.clone()
+    }
+
+    pub fn metadata_owner(&self) -> anyhow::Result<MetadataOwner> {
+        MetadataOwner::new(self.username.clone(), self.program.clone())
     }
 
     // ========================================================================

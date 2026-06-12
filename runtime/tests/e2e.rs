@@ -79,11 +79,21 @@ fn spawn_and_wait(s: &TestState, name: &str, input: String) -> bool {
 
 /// Spawn a process and return its result payload.
 fn spawn_and_result(s: &TestState, name: &str, input: String) -> Result<String, String> {
+    spawn_and_result_as(s, "test-user", name, input)
+}
+
+/// Spawn a process as a specific user and return its result payload.
+fn spawn_and_result_as(
+    s: &TestState,
+    username: &str,
+    name: &str,
+    input: String,
+) -> Result<String, String> {
     s.rt.block_on(async {
         inferlets::add_and_install(name).await;
         let (tx, rx) = oneshot::channel();
         process::spawn(
-            "test-user".into(),
+            username.into(),
             program_name(name),
             input,
             None,
@@ -161,6 +171,68 @@ fn metadata_store_survives_across_request_instances() {
     assert_eq!(
         spawn_and_result(s, "metadata", format!("get:{namespace}:sidecar")).unwrap(),
         "missing"
+    );
+}
+
+#[test]
+fn metadata_store_is_scoped_to_user_and_program() {
+    let s = state();
+    let namespace = format!("test-thread-{}", uuid::Uuid::new_v4());
+
+    assert_eq!(
+        spawn_and_result_as(
+            s,
+            "alice",
+            "metadata",
+            format!("put:{namespace}:sidecar:alice")
+        )
+        .unwrap(),
+        "put"
+    );
+    assert_eq!(
+        spawn_and_result_as(s, "bob", "metadata", format!("get:{namespace}:sidecar")).unwrap(),
+        "missing"
+    );
+    assert_eq!(
+        spawn_and_result_as(
+            s,
+            "alice",
+            "metadata-peer",
+            format!("get:{namespace}:sidecar")
+        )
+        .unwrap(),
+        "missing"
+    );
+
+    assert_eq!(
+        spawn_and_result_as(s, "bob", "metadata", format!("delete:{namespace}:sidecar")).unwrap(),
+        "deleted:false"
+    );
+    assert_eq!(
+        spawn_and_result_as(
+            s,
+            "alice",
+            "metadata-peer",
+            format!("delete:{namespace}:sidecar")
+        )
+        .unwrap(),
+        "deleted:false"
+    );
+    assert_eq!(
+        spawn_and_result_as(s, "alice", "metadata", format!("get:{namespace}:sidecar")).unwrap(),
+        "alice"
+    );
+}
+
+#[test]
+fn metadata_store_returns_observable_errors_for_oversized_values() {
+    let s = state();
+    let namespace = format!("test-thread-{}", uuid::Uuid::new_v4());
+
+    let result = spawn_and_result(s, "metadata", format!("put-big:{namespace}:sidecar")).unwrap();
+    assert!(
+        result.contains("metadata value"),
+        "expected metadata error, got {result}"
     );
 }
 

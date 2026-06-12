@@ -140,6 +140,7 @@ impl Linker {
         let inst_state = InstanceState::new(
             process_id,
             username,
+            program_name.to_string(),
             output,
             &self.policy,
             token_budget,

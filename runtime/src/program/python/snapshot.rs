@@ -1317,6 +1317,7 @@ pub(crate) async fn snapshot_from_bytes(
     let inst_state = InstanceState::new(
         uuid::Uuid::new_v4(),
         "snapshot".to_string(),
+        "snapshot".to_string(),
         OutputMode::Discard, // snapshot init only — guest output is noise
         &snapshot_policy,    // deny fs + deny network — snapshot init only
         None,                // token_budget

@@ -501,11 +501,19 @@ def _build_mock_modules():
 
     # runtime
     runtime_mod = types.ModuleType("wit_world.imports.runtime")
+    metadata_store: dict[tuple[str, str], bytes] = {}
     runtime_mod.version = lambda: "0.1.0-mock"
     runtime_mod.instance_id = lambda: "mock-instance-001"
     runtime_mod.username = lambda: "test-user"
     runtime_mod.models = lambda: ["mock-model"]
     runtime_mod.spawn = lambda pkg, args: FakeFutureString("spawned")
+    runtime_mod.metadata_put = lambda namespace, key, value: metadata_store.__setitem__(
+        (namespace, key), bytes(value)
+    )
+    runtime_mod.metadata_get = lambda namespace, key: metadata_store.get((namespace, key))
+    runtime_mod.metadata_delete = lambda namespace, key: metadata_store.pop(
+        (namespace, key), None
+    ) is not None
 
     # messaging
     messaging_mod = types.ModuleType("wit_world.imports.messaging")

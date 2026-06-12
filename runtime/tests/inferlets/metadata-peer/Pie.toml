@@ -1,0 +1,4 @@
+[package]
+name = "metadata-peer"
+version = "0.1.0"
+description = "Test inferlet peer: exercises metadata store program scoping"
