@@ -34,10 +34,7 @@ impl pie::core::runtime::Host for InstanceState {
         key: String,
         value: Vec<u8>,
     ) -> Result<Result<(), String>> {
-        let owner = match self.metadata_owner() {
-            Ok(owner) => owner,
-            Err(e) => return Ok(Err(e.to_string())),
-        };
+        let owner = self.metadata_owner();
         Ok(metadata_store::put(&owner, &namespace, &key, value).map_err(|e| e.to_string()))
     }
 
@@ -46,10 +43,7 @@ impl pie::core::runtime::Host for InstanceState {
         namespace: String,
         key: String,
     ) -> Result<Result<Option<Vec<u8>>, String>> {
-        let owner = match self.metadata_owner() {
-            Ok(owner) => owner,
-            Err(e) => return Ok(Err(e.to_string())),
-        };
+        let owner = self.metadata_owner();
         Ok(metadata_store::get(&owner, &namespace, &key).map_err(|e| e.to_string()))
     }
 
@@ -58,10 +52,7 @@ impl pie::core::runtime::Host for InstanceState {
         namespace: String,
         key: String,
     ) -> Result<Result<bool, String>> {
-        let owner = match self.metadata_owner() {
-            Ok(owner) => owner,
-            Err(e) => return Ok(Err(e.to_string())),
-        };
+        let owner = self.metadata_owner();
         Ok(metadata_store::delete(&owner, &namespace, &key).map_err(|e| e.to_string()))
     }
 }

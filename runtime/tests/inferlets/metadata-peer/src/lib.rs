@@ -1,5 +1,3 @@
-//! Metadata test inferlet — exercises engine-lifetime metadata KV host APIs.
-
 use inferlet::{Result, runtime};
 
 #[inferlet::main]

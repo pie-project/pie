@@ -1,29 +1,13 @@
-//! Engine-lifetime metadata key-value store for inferlets.
-//!
-//! The store is intentionally narrow: it is an in-memory, namespaced byte
-//! hashmap for runtime metadata that should survive across inferlet request
-//! instances but may be lost when the engine process exits.
-
 use std::collections::HashMap;
 use std::sync::{LazyLock, RwLock};
 
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 
-/// Maximum caller-supplied namespace length in bytes.
 pub const MAX_NAMESPACE_BYTES: usize = 256;
-/// Maximum caller-supplied key length in bytes.
 pub const MAX_KEY_BYTES: usize = 256;
-/// Maximum stored value length in bytes.
 pub const MAX_VALUE_BYTES: usize = 1024 * 1024;
-/// Maximum number of stored metadata entries for this process.
 pub const MAX_ENTRIES: usize = 4096;
-/// Maximum aggregate stored metadata bytes for this process.
-///
-/// This counts host-owned owner identity, namespace, key, and value bytes for
-/// each entry. `MAX_ENTRIES` separately bounds per-entry map overhead.
 pub const MAX_TOTAL_BYTES: usize = 16 * 1024 * 1024;
-
-const MAX_OWNER_PART_BYTES: usize = 256;
 
 static STORE: LazyLock<RwLock<Store>> = LazyLock::new(|| RwLock::new(Store::default()));
 
@@ -33,11 +17,6 @@ struct Store {
     total_metadata_bytes: usize,
 }
 
-/// Host-derived metadata owner identity.
-///
-/// Guests control `namespace` and `key`, but not this owner. The runtime builds
-/// it from the current `InstanceState`, so separate users/programs cannot
-/// collide by choosing the same namespace/key strings.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct MetadataOwner {
     username: String,
@@ -45,12 +24,11 @@ pub struct MetadataOwner {
 }
 
 impl MetadataOwner {
-    pub fn new(username: impl Into<String>, program: impl Into<String>) -> Result<Self> {
-        let username = username.into();
-        let program = program.into();
-        validate_part("owner username", &username, MAX_OWNER_PART_BYTES)?;
-        validate_part("owner program", &program, MAX_OWNER_PART_BYTES)?;
-        Ok(Self { username, program })
+    pub fn new(username: impl Into<String>, program: impl Into<String>) -> Self {
+        Self {
+            username: username.into(),
+            program: program.into(),
+        }
     }
 
     fn stored_bytes(&self) -> usize {
@@ -100,7 +78,6 @@ fn validate_part(label: &str, value: &str, max_bytes: usize) -> Result<()> {
     Ok(())
 }
 
-/// Store or overwrite a metadata value.
 pub fn put(owner: &MetadataOwner, namespace: &str, key: &str, value: Vec<u8>) -> Result<()> {
     let metadata_key = MetadataKey::new(owner, namespace, key)?;
     if value.len() > MAX_VALUE_BYTES {
@@ -142,7 +119,6 @@ pub fn put(owner: &MetadataOwner, namespace: &str, key: &str, value: Vec<u8>) ->
     Ok(())
 }
 
-/// Retrieve a metadata value, if present.
 pub fn get(owner: &MetadataOwner, namespace: &str, key: &str) -> Result<Option<Vec<u8>>> {
     let metadata_key = MetadataKey::new(owner, namespace, key)?;
     let store = STORE
@@ -151,7 +127,6 @@ pub fn get(owner: &MetadataOwner, namespace: &str, key: &str) -> Result<Option<V
     Ok(store.entries.get(&metadata_key).cloned())
 }
 
-/// Delete a metadata value. Returns whether an entry existed.
 pub fn delete(owner: &MetadataOwner, namespace: &str, key: &str) -> Result<bool> {
     let metadata_key = MetadataKey::new(owner, namespace, key)?;
     let mut store = STORE

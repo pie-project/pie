@@ -196,7 +196,7 @@ impl InstanceState {
         self.username.clone()
     }
 
-    pub fn metadata_owner(&self) -> anyhow::Result<MetadataOwner> {
+    pub fn metadata_owner(&self) -> MetadataOwner {
         MetadataOwner::new(self.username.clone(), self.program.clone())
     }
 
