@@ -47,7 +47,7 @@ tracing = "0.1"
 # HuggingFace snapshot resolver. Same `~/.cache/huggingface/hub/` layout
 # the Python `huggingface_hub` package uses, so models downloaded by
 # either path are interchangeable.
-hf-hub = "1.0.0-rc.0"
+hf-hub = "=1.0.0-rc.0"
 # `shm_unlink` for the hard-kill cleanup path; see serve.rs's shutdown
 # branch. Drivers normally clean up on graceful exit, but a SIGKILL
 # leaves the POSIX shmem region behind — we call shm_unlink directly
