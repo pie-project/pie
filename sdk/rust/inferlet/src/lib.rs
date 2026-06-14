@@ -94,6 +94,10 @@ pub mod runtime {
     pub use crate::pie::core::runtime::*;
 }
 
+pub mod blob_store {
+    pub use crate::pie::core::blob_store::*;
+}
+
 pub mod scheduling {
     pub use crate::pie::core::scheduling::*;
 }

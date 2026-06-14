@@ -145,6 +145,41 @@ fn working_page_token_ops() {
 }
 
 #[test]
+fn truncate_working_page_tokens_releases_empty_reserved_pages() {
+    let s = state();
+    s.rt.block_on(async {
+        let pid = registered_pid().await;
+        let id = pie::context::create(MODEL, pid).await.unwrap();
+
+        pie::context::reserve_working_pages(MODEL, id, 2).await.unwrap();
+        pie::context::append_working_page_tokens(
+            MODEL,
+            id,
+            (0..17).collect(),
+            (0..17).collect(),
+            vec![],
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(pie::context::working_page_count(MODEL, id), 2);
+
+        pie::context::truncate_working_page_tokens(MODEL, id, 15).await.unwrap();
+
+        assert_eq!(pie::context::working_page_token_count(MODEL, id), 15);
+        assert_eq!(
+            pie::context::working_page_count(MODEL, id),
+            1,
+            "truncating below a page boundary must release now-empty reserved pages"
+        );
+
+        pie::context::unregister_process(pid);
+    });
+}
+
+#[test]
 fn fork_context() {
     let s = state();
     s.rt.block_on(async {
