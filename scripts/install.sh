@@ -8,6 +8,8 @@
 # Environment overrides:
 #   PIE_VERSION       Release tag (default: 0.4.0).
 #   PIE_FLAVOR        portable | cuda{12.8,13.0}. Auto-detected when unset.
+#   PIE_CC            GPU compute capability for CUDA flavors, e.g. 90, 100
+#                     (auto-detected via nvidia-smi; selects the per-CC binary).
 #   PIE_INSTALL_DIR   Install location for the `pie` binary (default: ~/.local/bin).
 #   PIE_REPO          GitHub owner/name (default: pie-project/pie).
 #   PIE_DOWNLOAD_BASE Override the asset base URL (default: GitHub releases).
@@ -125,8 +127,20 @@ detect_cuda_flavor() {
   fi
 }
 
+# Compute capability of the first GPU, normalized to the SM string used in the
+# per-CC asset names ("9.0" -> "90", "12.0" -> "120"). Override with PIE_CC.
+detect_cuda_cc() {
+  command -v nvidia-smi >/dev/null 2>&1 || return 0
+  local cap
+  cap="$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -1 | tr -d ' .' || true)"
+  case "$cap" in
+    *[!0-9]*|"") return 0 ;;
+  esac
+  PIE_DETECTED_CC="$cap"
+}
+
 if [ -z "${PIE_FLAVOR:-}" ]; then
-  if [ "$os" = linux ] && [ "$arch" = x86_64 ]; then
+  if [ "$os" = linux ] && { [ "$arch" = x86_64 ] || [ "$arch" = aarch64 ]; }; then
     detect_cuda_flavor || true
     PIE_FLAVOR="${PIE_DETECTED_FLAVOR:-portable}"
   else
@@ -134,25 +148,39 @@ if [ -z "${PIE_FLAVOR:-}" ]; then
   fi
 fi
 
+# Detect the GPU compute capability so CUDA flavors can pick the per-CC binary.
+if [ -z "${PIE_CC:-}" ]; then
+  detect_cuda_cc || true
+  PIE_CC="${PIE_DETECTED_CC:-}"
+fi
+
 # Map (os, arch, flavor) -> one or more candidate release asset names, in
 # preference order (mirrors what .github/workflows/build.yml uploads). CUDA
-# flavors prefer the GH-hosted manylinux_2_28 build (broad glibc compat) and
-# fall back to the native linux-x64 build from the self-hosted GPU runners.
+# flavors prefer the GH-hosted manylinux_2_28 build for the detected compute
+# capability (broad glibc compat, small), then fall back to the all-arch
+# native linux-x64 fatbin from the self-hosted GPU runner.
 assets_for() {
   case "$os/$arch/$1" in
     linux/x86_64/portable)            echo "pie-x86_64-linux-vulkan.tar.gz" ;;
     linux/aarch64/portable)           echo "pie-aarch64-linux-vulkan.tar.gz" ;;
     darwin/aarch64/portable)          echo "pie-aarch64-darwin.tar.gz" ;;
-    linux/x86_64/cuda12.8 \
-    | linux/x86_64/cuda13.0)
-      echo "pie-x86_64-manylinux_2_28-${1}.tar.gz"
-      echo "pie-x86_64-linux-${1}.tar.gz" ;;
+    linux/x86_64/cuda12.8 | linux/x86_64/cuda13.0 \
+    | linux/aarch64/cuda12.8 | linux/aarch64/cuda13.0)
+      # Per-compute-capability binary first (small, arch-matched) when the CC
+      # was detected; then the all-arch fatbin fallback (self-hosted, x86_64).
+      if [ -n "${PIE_CC:-}" ]; then
+        echo "pie-${arch}-manylinux_2_28-${1}-sm${PIE_CC}.tar.gz"
+      fi
+      if [ "$arch" = x86_64 ]; then
+        echo "pie-x86_64-linux-${1}.tar.gz"
+      fi
+      ;;
     *) return 1 ;;
   esac
 }
 
 candidates="$(assets_for "$PIE_FLAVOR")" || err \
-  "no '$PIE_FLAVOR' build for $os/$arch. Valid flavors: portable; or (Linux x86_64 only) cuda12.8, cuda13.0."
+  "no '$PIE_FLAVOR' build for $os/$arch. Valid flavors: portable; or (Linux) cuda12.8, cuda13.0."
 
 heading "Installing Pie"
 detail "Version:  ${PIE_VERSION}"

@@ -538,41 +538,53 @@ jobs:
           make_latest: false
 
   # =========================================================================
-  # CUDA matrix on GH-hosted runners with manylinux_2_28 base — produces
-  # binaries with glibc 2.28 floor (RHEL 8 / Ubuntu 20.04 / Debian 11).
+  # Per-compute-capability CUDA matrix on GH-hosted larger runners with a
+  # manylinux_2_28 base — binaries with a glibc 2.28 floor (RHEL 8 / Ubuntu
+  # 20.04 / Debian 11).
   #
-  # Built inside `nvidia/cuda:X.Y-devel-rockylinux8` containers; matrix
-  # entries run in parallel across GH-hosted ubuntu runners. Slower per
-  # job than the self-hosted matrix (no GPU, 4 vCPUs) but the
-  # parallelism evens it out — wall-clock comparable to the self-hosted
-  # serial matrix. Opt-in via the `cuda_manylinux` workflow input.
+  # Matrix = compute-capability × CUDA-version × os-arch; each leg builds a
+  # SINGLE SM, so the build parallelizes (wall-clock ~= one arch, not a
+  # 6-arch fatbin) and each binary is small. The installer detects the GPU's
+  # compute capability and picks the matching asset. Built inside
+  # nvidia/cuda:X.Y-devel-rockylinux8 containers on ubuntu-large-{x64,arm64}.
+  # Opt-in via the `cuda_manylinux` workflow input.
   # =========================================================================
   cuda-manylinux:
     if: inputs.cuda_manylinux
     needs: prepare-release
-    name: cuda / x86_64-manylinux_2_28 / ${{ matrix.flavor.id }}-${{ matrix.cuda.short }}
-    # Set the repo variable CUDA_MANYLINUX_RUNNER to a larger runner label
-    # (e.g. a GitHub larger runner) to speed up the 6-arch CUDA build; falls
-    # back to the standard GH-hosted runner when unset.
-    runs-on: ${{ vars.CUDA_MANYLINUX_RUNNER || 'ubuntu-22.04' }}
-    # 240m is a safety net for the slow default GH runner; set the
-    # CUDA_MANYLINUX_RUNNER repo variable to a larger runner and (with the
-    # sccache warm cache) this finishes in a small fraction of that.
-    timeout-minutes: 240
+    name: cuda / ${{ matrix.target.os_arch }}-sm${{ matrix.target.cc }} / cuda-${{ matrix.cuda.short }}
+    runs-on: ${{ matrix.target.runner }}
+    # One compute-capability per job (not a 6-arch fatbin), so each leg is
+    # quick and the legs run in parallel across the larger runners. Keep a
+    # generous net for cold caches.
+    timeout-minutes: 120
     strategy:
       fail-fast: false
       matrix:
+        # Per-compute-capability: CC × CUDA-version × os-arch. Each entry
+        # builds ONE arch. The installer detects the GPU's compute capability
+        # and picks the matching asset; the self-hosted `cuda` job's all-arch
+        # fatbin is the fallback.
         cuda:
-          - { version: "12.8.1", short: "12.8", arch: "80;86;89;90;100;120" }
-          - { version: "13.0.0", short: "13.0", arch: "80;86;89;90;100;120" }
-        flavor:
-          - { id: "cuda",          features: "driver-portable,driver-cuda,driver-dummy" }
+          - { version: "12.8.1", short: "12.8" }
+          - { version: "13.0.0", short: "13.0" }
+        target:
+          # x86_64: Ampere (80/86), Ada (89), Hopper (90), Blackwell DC (100) + consumer (120).
+          - { os_arch: x86_64,  cc: "80",  runner: ubuntu-large-x64,   triple: x86_64-unknown-linux-gnu }
+          - { os_arch: x86_64,  cc: "86",  runner: ubuntu-large-x64,   triple: x86_64-unknown-linux-gnu }
+          - { os_arch: x86_64,  cc: "89",  runner: ubuntu-large-x64,   triple: x86_64-unknown-linux-gnu }
+          - { os_arch: x86_64,  cc: "90",  runner: ubuntu-large-x64,   triple: x86_64-unknown-linux-gnu }
+          - { os_arch: x86_64,  cc: "100", runner: ubuntu-large-x64,   triple: x86_64-unknown-linux-gnu }
+          - { os_arch: x86_64,  cc: "120", runner: ubuntu-large-x64,   triple: x86_64-unknown-linux-gnu }
+          # aarch64: Grace-Hopper (90), Grace-Blackwell (100).
+          - { os_arch: aarch64, cc: "90",  runner: ubuntu-large-arm64, triple: aarch64-unknown-linux-gnu }
+          - { os_arch: aarch64, cc: "100", runner: ubuntu-large-arm64, triple: aarch64-unknown-linux-gnu }
     container: nvidia/cuda:${{ matrix.cuda.version }}-devel-rockylinux8
     env:
-      ARTIFACT_NAME: pie-x86_64-manylinux_2_28-${{ matrix.flavor.id }}${{ matrix.cuda.short }}.tar.gz
+      ARTIFACT_NAME: pie-${{ matrix.target.os_arch }}-manylinux_2_28-cuda${{ matrix.cuda.short }}-sm${{ matrix.target.cc }}.tar.gz
       PIE_PORTABLE_CUDA: "1"
-      PIE_PORTABLE_CUDA_ARCH: ${{ matrix.cuda.arch }}
-      CMAKE_CUDA_ARCHITECTURES: ${{ matrix.cuda.arch }}
+      PIE_PORTABLE_CUDA_ARCH: ${{ matrix.target.cc }}
+      CMAKE_CUDA_ARCHITECTURES: ${{ matrix.target.cc }}
       CMAKE_CUDA_RUNTIME_LIBRARY: Shared
       CARGO_INCREMENTAL: "0"
     steps:
@@ -612,7 +624,9 @@ jobs:
             # symbols (std::filesystem, std::__throw_bad_array_new_length) the
             # C++ drivers use. The stock /usr/bin/cc (gcc-8.5) links the old
             # system libstdc++ and fails the link with undefined symbols.
-            echo "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=/opt/rh/gcc-toolset-12/root/usr/bin/gcc"
+            # The linker env var is per-target-triple; derive its name from the
+            # triple so this one bootstrap works for both x86_64 and aarch64.
+            echo "CARGO_TARGET_$(echo '${{ matrix.target.triple }}' | tr 'a-z-' 'A-Z_')_LINKER=/opt/rh/gcc-toolset-12/root/usr/bin/gcc"
           } >> "$GITHUB_ENV"
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
             sh -s -- -y --profile minimal --default-toolchain stable
@@ -625,8 +639,8 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: build-cuda-manylinux-${{ matrix.cuda.short }}-${{ matrix.flavor.id }}-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: build-cuda-manylinux-${{ matrix.cuda.short }}-${{ matrix.flavor.id }}-
+          key: build-cuda-${{ matrix.target.os_arch }}-sm${{ matrix.target.cc }}-${{ matrix.cuda.short }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: build-cuda-${{ matrix.target.os_arch }}-sm${{ matrix.target.cc }}-${{ matrix.cuda.short }}-
 
       - name: cargo build (release-min)
         shell: bash
@@ -635,130 +649,16 @@ jobs:
           # `release-min`: thin LTO, panic=abort, strip=symbols.
           # Defined in workspace Cargo.toml.
           cargo build --profile release-min \
-            --target x86_64-unknown-linux-gnu \
+            --target ${{ matrix.target.triple }} \
             -p pie-server \
-            --features ${{ matrix.flavor.features }}
+            --features driver-portable,driver-cuda,driver-dummy
 
       - name: Package
         shell: bash
         run: |
           set -euxo pipefail
           mkdir -p dist
-          BIN_DIR="target/x86_64-unknown-linux-gnu/release-min"
-          tar -C "${BIN_DIR}" -czf "dist/${ARTIFACT_NAME}" pie
-          ls -la dist/
-
-      - name: Upload to release
-        uses: softprops/action-gh-release@v3
-        with:
-          tag_name: ${{ inputs.tag }}
-          files: dist/${{ env.ARTIFACT_NAME }}
-          fail_on_unmatched_files: true
-          make_latest: false
-
-  # =========================================================================
-  # Refresh the release notes once after all builds finish.
-  # =========================================================================
-  cuda-manylinux-arm64:
-    if: inputs.cuda_manylinux
-    needs: prepare-release
-    name: cuda / aarch64-manylinux_2_28 / ${{ matrix.flavor.id }}-${{ matrix.cuda.short }}
-    # Set the repo variable CUDA_MANYLINUX_RUNNER to a larger runner label
-    # (e.g. a GitHub larger runner) to speed up the 6-arch CUDA build; falls
-    # back to the standard GH-hosted runner when unset.
-    # Native arm64 large runner (GH200/GB200-class CUDA). Falls back?
-    # No — arm64 needs an arm64 runner; this label is org-managed.
-    runs-on: ubuntu-large-arm64
-    # 240m is a safety net for the slow default GH runner; set the
-    # CUDA_MANYLINUX_RUNNER repo variable to a larger runner and (with the
-    # sccache warm cache) this finishes in a small fraction of that.
-    timeout-minutes: 240
-    strategy:
-      fail-fast: false
-      matrix:
-        cuda:
-          - { version: "12.8.1", short: "12.8", arch: "90;100" }
-          - { version: "13.0.0", short: "13.0", arch: "90;100" }
-        flavor:
-          - { id: "cuda",          features: "driver-portable,driver-cuda,driver-dummy" }
-    container: nvidia/cuda:${{ matrix.cuda.version }}-devel-rockylinux8
-    env:
-      ARTIFACT_NAME: pie-aarch64-manylinux_2_28-${{ matrix.flavor.id }}${{ matrix.cuda.short }}.tar.gz
-      PIE_PORTABLE_CUDA: "1"
-      PIE_PORTABLE_CUDA_ARCH: ${{ matrix.cuda.arch }}
-      CMAKE_CUDA_ARCHITECTURES: ${{ matrix.cuda.arch }}
-      CMAKE_CUDA_RUNTIME_LIBRARY: Shared
-      CARGO_INCREMENTAL: "0"
-    steps:
-      - uses: actions/checkout@v6
-
-      - name: Bootstrap container
-        shell: bash
-        run: |
-          set -euxo pipefail
-          # `ninja-build` lives in the PowerTools repo on Rocky 8;
-          # EPEL covers extras. `patch` for the vendored llama.cpp
-          # patches; `git` for CPM's git fetches. NCCL ships in
-          # NVIDIA's cuda repo (already configured by the base image)
-          # as `libnccl-devel`; pulls `libnccl` runtime in via deps.
-          dnf install -y epel-release dnf-plugins-core
-          dnf config-manager --set-enabled powertools
-          dnf install -y --setopt=install_weak_deps=False \
-            openssl-devel pkg-config perl git patch \
-            cmake ninja-build \
-            gcc-toolset-12-gcc gcc-toolset-12-gcc-c++ \
-            libnccl libnccl-devel
-          # Pin compiler explicitly: `source enable` only adjusts PATH —
-          # cmake-rs probes CC/CXX env vars and otherwise picks
-          # `/usr/bin/cc` (gcc-8.5, no <span> / C++20). Same nvcc
-          # host-compiler issue applies via CUDAHOSTCXX (nvcc
-          # auto-picks gcc-8.5 and silently drops `-std=c++20`).
-          {
-            echo "CC=/opt/rh/gcc-toolset-12/root/usr/bin/gcc"
-            echo "CXX=/opt/rh/gcc-toolset-12/root/usr/bin/g++"
-            echo "AR=/opt/rh/gcc-toolset-12/root/usr/bin/ar"
-            echo "CUDAHOSTCXX=/opt/rh/gcc-toolset-12/root/usr/bin/g++"
-            echo "PATH=/opt/rh/gcc-toolset-12/root/usr/bin:${PATH}"
-            echo "LD_LIBRARY_PATH=/opt/rh/gcc-toolset-12/root/usr/lib64:/opt/rh/gcc-toolset-12/root/usr/lib"
-            echo "PKG_CONFIG_PATH=/opt/rh/gcc-toolset-12/root/usr/lib64/pkgconfig"
-            # rustc's final link must go through the gcc-toolset-12 gcc driver
-            # so libstdc++_nonshared.a is pulled in for the C++17/20 libstdc++
-            # symbols (std::filesystem, std::__throw_bad_array_new_length) the
-            # C++ drivers use. The stock /usr/bin/cc (gcc-8.5) links the old
-            # system libstdc++ and fails the link with undefined symbols.
-            echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=/opt/rh/gcc-toolset-12/root/usr/bin/gcc"
-          } >> "$GITHUB_ENV"
-          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
-            sh -s -- -y --profile minimal --default-toolchain stable
-          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
-
-      - name: Cache cargo
-        uses: actions/cache@v5
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: build-cuda-manylinux-arm64-${{ matrix.cuda.short }}-${{ matrix.flavor.id }}-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: build-cuda-manylinux-arm64-${{ matrix.cuda.short }}-${{ matrix.flavor.id }}-
-
-      - name: cargo build (release-min)
-        shell: bash
-        run: |
-          set -euxo pipefail
-          # `release-min`: thin LTO, panic=abort, strip=symbols.
-          # Defined in workspace Cargo.toml.
-          cargo build --profile release-min \
-            --target aarch64-unknown-linux-gnu \
-            -p pie-server \
-            --features ${{ matrix.flavor.features }}
-
-      - name: Package
-        shell: bash
-        run: |
-          set -euxo pipefail
-          mkdir -p dist
-          BIN_DIR="target/aarch64-unknown-linux-gnu/release-min"
+          BIN_DIR="target/${{ matrix.target.triple }}/release-min"
           tar -C "${BIN_DIR}" -czf "dist/${ARTIFACT_NAME}" pie
           ls -la dist/
 
@@ -775,7 +675,7 @@ jobs:
   # =========================================================================
   refresh-notes:
     if: always() && (inputs.portable || inputs.cuda || inputs.cuda_manylinux)
-    needs: [portable, cuda, cuda-manylinux, cuda-manylinux-arm64]
+    needs: [portable, cuda, cuda-manylinux]
     runs-on: ubuntu-latest
     permissions:
       contents: write
