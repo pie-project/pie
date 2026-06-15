@@ -358,33 +358,14 @@ target_include_directories(pie_driver_cuda_lib
     ${flashinfer_SOURCE_DIR}/3rdparty/cutlass/tools/util/include
     ${flashinfer_SOURCE_DIR}/3rdparty/spdlog/include)
 
-# FlashInfer's CUTLASS MoE path expects generated launcher instantiations
-# beside the static csrc files. Generate only the SM80 grouped-GEMM launchers
-# needed by the SM89/Ada BF16 MoE path instead of pulling in the entire TVM
-# extension module.
-list(GET CMAKE_CUDA_ARCHITECTURES 0 PIE_FLASHINFER_MOE_ARCH)
-string(REGEX REPLACE "[^0-9].*$" "" PIE_FLASHINFER_MOE_ARCH_NUMBER
-  "${PIE_FLASHINFER_MOE_ARCH}")
+# Pre-generated FlashInfer CUTLASS grouped-GEMM MoE launchers, vendored under
+# third_party/flashinfer_generated/ (the SM80 set; byte-identical for SM80/86/89
+# and the only set the build globs). This removes the build-time Python codegen
+# and its incidental tvm_ffi / pynvml / tqdm imports -- no external Python deps.
+# Refresh after bumping the vendored FlashInfer revision with:
+#   FLASHINFER_SRC=<src> driver/cuda/third_party/flashinfer_generated/regenerate.sh
 set(PIE_FLASHINFER_MOE_GEN_DIR
-  "${CMAKE_BINARY_DIR}/flashinfer_generated/cutlass_instantiations/${PIE_FLASHINFER_MOE_ARCH_NUMBER}")
-file(MAKE_DIRECTORY "${PIE_FLASHINFER_MOE_GEN_DIR}")
-# FlashInfer's code-gen script imports tvm_ffi, pynvml, tqdm at the
-# top level.  These must be available to the Python interpreter cmake
-# finds.  When building inside a venv that has them (e.g. the SGLang
-# or vLLM venv) they resolve naturally; on a bare system install add
-# them via `pip install apache-tvm-ffi pynvml tqdm`.
-execute_process(
-  COMMAND ${CMAKE_COMMAND} -E env
-          FLASHINFER_DISABLE_VERSION_CHECK=1
-          PYTHONPATH=${flashinfer_SOURCE_DIR}
-          ${Python3_EXECUTABLE} -c
-          "from pathlib import Path; from flashinfer.jit.gemm.cutlass.generate_kernels import generate_gemm_operations; generate_gemm_operations(Path(r'${PIE_FLASHINFER_MOE_GEN_DIR}'), '${PIE_FLASHINFER_MOE_ARCH_NUMBER};${PIE_FLASHINFER_MOE_ARCH_NUMBER}-real')"
-  RESULT_VARIABLE PIE_FLASHINFER_MOE_GEN_RESULT)
-if(NOT PIE_FLASHINFER_MOE_GEN_RESULT EQUAL 0)
-  message(FATAL_ERROR
-    "Failed to generate FlashInfer CUTLASS MoE launchers.  "
-    "Ensure the Python interpreter has tvm_ffi, pynvml, and tqdm installed.")
-endif()
+  "${CMAKE_CURRENT_SOURCE_DIR}/third_party/flashinfer_generated")
 file(GLOB PIE_FLASHINFER_MOE_GENERATED_SOURCES CONFIGURE_DEPENDS
   "${PIE_FLASHINFER_MOE_GEN_DIR}/gemm_grouped/80/*.generated.cu")
 list(LENGTH PIE_FLASHINFER_MOE_GENERATED_SOURCES PIE_FLASHINFER_MOE_GENERATED_COUNT)
