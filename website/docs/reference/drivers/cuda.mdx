@@ -49,11 +49,17 @@ shutdown_timeout_s   = 5.0
 | `kv_cache_dtype` | `"auto"` | KV cache format: `auto`, `bf16`, `bfloat16`, `fp8_e4m3`, `fp8_e5m2`, `int8_per_token_head`, `fp8_per_token_head`, `fp4_e2m1`, or `nvfp4`. |
 | `swap_pool_size` | `0` | Pinned host KV-page count for swap-out. `0` disables swap. |
 | `weight_dtype` | `"bfloat16"` | Weight precision. |
-| `runtime_quant` | `""` | Empty disables runtime quantization; `"fp8"` enables the current FP8 path where supported. |
+| `runtime_quant` | `""` | Per-channel symmetric quantization of projection weights: `""` (off), `"fp8"` (FP8 E4M3), or `"int8"`. Norms, embeddings, and the LM head stay in `weight_dtype`. |
+| `mxfp4_moe` | `"auto"` | GPT-OSS MXFP4 expert policy: `"auto"`, `"routed_dequant"`/`"packed"`, or `"bf16"`/`"dequant"`. `"auto"` runs native packed MXFP4 GEMM on Blackwell and routed dequant elsewhere. |
+| `enable_system_speculation` | `false` | Opt in to native MTP speculative decoding (off by default; see [Speculative decoding](../../guide/forward/speculation)). |
+| `mtp_num_drafts` | `3` | Max MTP draft tokens per speculation step (0–32). |
+| `mtp_assistant_snapshot_dir` | `""` | Optional Gemma-4 MTP assistant checkpoint path; auto-discovered from the HF cache when empty. |
 | `ready_timeout_s` | `600.0` | Seconds to wait for driver readiness. |
 | `shutdown_timeout_s` | `5.0` | Seconds to wait for graceful shutdown. |
 
 `cuda_native` accepts only planner inputs for GPU memory sizing. The driver reports derived forward limits, KV page size, KV pages, arena size, and Qwen3.5 state slots at startup.
+
+CUDA-graph capture of the decode path is available (experimental); it engages automatically for graph-safe architectures running a native BF16 KV cache.
 
 ## Supported architectures
 
@@ -64,15 +70,20 @@ shutdown_timeout_s   = 5.0
 | Llama 3.x / Mistral-compatible | `llama` | Instruct and base checkpoints. |
 | Qwen 2.x | `qwen2` | Qwen2 and Qwen2.5. |
 | Qwen 3.x | `qwen3` | Includes the default `Qwen/Qwen3-0.6B`. |
-| Qwen 3.5 | `qwen3_5` | Supported where the selected CUDA path has the graph implemented. |
+| Qwen 3.5 / 3.5-MoE | `qwen3_5`, `qwen3_5_moe` | Hybrid GDN linear attention; native MTP speculation. |
+| Qwen3-VL | `qwen3_vl` | **Multimodal** — vision input. |
 | Phi-3 | `phi3` | Microsoft Phi-3 family. |
 | Mixtral | `mixtral` | MoE path. |
-| Gemma 2 / 3 / 4 | `gemma2`, `gemma3_text`, `gemma4_text`, `gemma4` | Text checkpoints. |
+| GPT-OSS | `gptoss`, `gpt_oss` | MoE; MXFP4 experts (see `mxfp4_moe`). |
+| Gemma 2 / 3 / 4 | `gemma2`, `gemma3_text`, `gemma3n`, `gemma4_text`, `gemma4` | Gemma-4 adds **multimodal** (vision + audio in) and native MTP. |
 | Mistral 3 | `mistral3` | Ministral-class checkpoints. |
 | OLMo 3 | `olmo3` | AI2 OLMo 3. |
-| GPT-OSS | `gptoss`, `gpt_oss` | Community GPT-OSS variants. |
+| GLM-5.1 | `glm_moe_dsa` | MLA attention, DSA MoE; FP4 expert quantization. |
+| Nemotron-H | `nemotron_h` | Hybrid Mamba/attention. |
+| Kimi / DeepSeek | `kimi_k2`, `deepseek_v2`, `deepseek_v3`, `deepseek_v4` | MLA-based MoE. |
+| CSM | `csm` | **Multimodal** — audio output (text-to-speech). |
 
-Run `pie model list` to see whether cached HuggingFace repos are compatible with your installed drivers.
+Run `pie model list` to see whether cached HuggingFace repos are compatible with your installed drivers. For the multimodal models (Qwen3-VL, Gemma-4, CSM), see [Multimodal generation](../../guide/model/multimodal).
 
 ## Quantization
 
@@ -81,4 +92,4 @@ The default `auto` preserves the native BF16 cache. Set it explicitly to opt int
 `fp8_e4m3`, `fp8_e5m2`, `int8_per_token_head`, `fp8_per_token_head`,
 `fp4_e2m1`, or `nvfp4`.
 
-For `cuda_native`, `weight_dtype = "bfloat16"` is the default and `runtime_quant = "fp8"` enables the current runtime quantization path where supported.
+Weight quantization is separate: `weight_dtype = "bfloat16"` is the default, and `runtime_quant` quantizes projection weights to `"fp8"` or `"int8"`. GPT-OSS experts use MXFP4 via `mxfp4_moe`, and GLM-5.1 routed experts support FP4. Quantization support varies by architecture.

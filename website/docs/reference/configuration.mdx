@@ -65,7 +65,7 @@ gpu_mem_utilization = 0.90
 memory_profile = "auto"
 ```
 
-`[model.driver].type` is a discriminator. Embedded drivers (`portable`, `cuda_native`, `dummy`) run inside the `pie` process. Python drivers (`dev`, `vllm`, `sglang`, `tensorrt_llm`) run as supervised subprocesses. Driver-specific knobs live in `[model.driver.options]`; see the per-driver pages ([CUDA](./drivers/cuda), [Portable](./drivers/portable), [vLLM](./drivers/vllm), [SGLang](./drivers/sglang), [TensorRT-LLM](./drivers/tensorrt-llm)) for what each backend accepts.
+`[model.driver].type` is a discriminator. Embedded drivers (`portable`, `cuda_native`, `dummy`) run inside the `pie` process. Python drivers (`vllm`, `sglang`, `tensorrt_llm`) run as supervised subprocesses. Driver-specific knobs live in `[model.driver.options]`; see the per-driver pages ([CUDA](./drivers/cuda), [Portable](./drivers/portable), [vLLM](./drivers/vllm), [SGLang](./drivers/sglang), [TensorRT-LLM](./drivers/tensorrt-llm)) for what each backend accepts.
 
 To add a second model, append another `[[model]]` block with a unique `name` and a `device` list that does not overlap any other model's.
 
@@ -141,7 +141,7 @@ Driver discriminator + universal driver fields:
 
 | Key | Default | Description |
 |-----|---------|-------------|
-| `type` | required | Driver name. One of `portable`, `cuda_native`, `dummy`, `dev`, `vllm`, `sglang`, `tensorrt_llm`. See the per-driver reference pages. |
+| `type` | required | Driver name. One of `portable`, `cuda_native`, `dummy`, `vllm`, `sglang`, `tensorrt_llm`. See the per-driver reference pages. |
 | `device` | required | Device list for this model. A single string is accepted and normalized to a one-element list. The list across all `[[model]]` entries must be disjoint. |
 | `tensor_parallel_size` | `1` | TP world size. |
 | `activation_dtype` | `"bfloat16"` | Activation dtype for forward passes. |

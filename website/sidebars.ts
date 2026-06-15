@@ -55,6 +55,7 @@ const sidebars: SidebarsConfig = {
       items: [
         'guide/model/loading',
         'guide/model/tokenizer',
+        'guide/model/multimodal',
       ],
     },
     {
