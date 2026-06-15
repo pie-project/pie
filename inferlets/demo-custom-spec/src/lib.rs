@@ -244,7 +244,7 @@ async fn run_speculated(model: &Model, model_name: &str, input: &Input) -> Resul
     // numerical differences between "prefill alone" and "prefill +
     // multi-position samplers" kernel shapes, and on cuda 0.1.0 the
     // fused shape produces logits that drift off the greedy trajectory.
-    // The split-pass pattern matches inferlets/cacheback-decoding.
+    // The split-pass pattern matches inferlets/draft-model-decoding.
     ctx.flush().await?;
 
     let tokenizer = model.tokenizer();

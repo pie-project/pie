@@ -9,7 +9,7 @@ core = "^0.2.0"
 mcp = "^0.2.0"
 
 [parameters]
-prompt = {type = "string", optional = true, description = "The prompt to send to the model (default: 'Explain LLM decoding process in ELI5.')"}
+prompt = {type = "string", optional = true, description = "The prompt to send to the model (default: 'Tell me a long story about a cat.')"}
 max_tokens = {type = "int", optional = true, description = "Maximum number of new tokens to generate (default: 512)"}
-sink_size = {type = "int", optional = true, description = "Initial size of the attention sink (default: 64)"}
-window_size = {type = "int", optional = true, description = "Sliding window size for the attention sink (default: 32)"}
+sink_size = {type = "int", optional = true, description = "Initial size of the attention sink (default: 4)"}
+window_size = {type = "int", optional = true, description = "Sliding window size for the attention sink (default: 64)"}

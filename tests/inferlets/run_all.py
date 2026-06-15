@@ -24,7 +24,7 @@ from test_constrained_decoding import test_constrained_decoding
 from test_watermarking import test_watermarking
 from test_windowed_attention import test_windowed_attention
 from test_attention_sink import test_attention_sink
-from test_cacheback_decoding import test_cacheback_decoding
+from test_draft_model_decoding import test_draft_model_decoding
 from test_jacobi_decoding import test_jacobi_decoding
 from test_best_of_n import test_best_of_n
 from test_json_schema_validation import test_json_schema_validation
@@ -65,7 +65,7 @@ ALL_TESTS = [
     test_watermarking,
     test_windowed_attention,
     test_attention_sink,
-    test_cacheback_decoding,
+    test_draft_model_decoding,
     # Tier 4: JS/Python SDK
     test_js_example,
     test_js_concurrency,

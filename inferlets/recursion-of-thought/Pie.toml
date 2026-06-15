@@ -9,7 +9,7 @@ core = "^0.2.0"
 mcp = "^0.2.0"
 
 [parameters]
-question = {type = "string", optional = true, description = "The initial question to solve (default: 'Please calculate the expression (42 + 3) * 5 / 15.')"}
-max_depth = {type = "int", optional = true, description = "Maximum recursion depth (default: 5)"}
-max_tokens = {type = "int", optional = true, description = "Max tokens to generate at each step (default: 128)"}
+question = {type = "string", optional = true, description = "The initial question to solve (default: 'Compute the sum 1 + 2 + 3 + 4 + 5 + 6 + 7 + 8.')"}
+max_depth = {type = "int", optional = true, description = "Maximum recursion depth (default: 2)"}
+max_tokens = {type = "int", optional = true, description = "Max tokens to generate at each step (default: 256)"}
 verbose = {type = "bool", optional = true, description = "Print intermediate messages during recursion"}

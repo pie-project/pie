@@ -9,5 +9,6 @@ core = "^0.2.0"
 mcp = "^0.2.0"
 
 [parameters]
-num_function_calls = {type = "int", optional = true, description = "Number of sequential Thought/Action/Observation cycles (default: 5)"}
-tokens_between_calls = {type = "int", optional = true, description = "Max tokens for each Thought/Action step (default: 512)"}
+max_steps = {type = "int", optional = true, description = "Number of sequential Thought/Action/Observation cycles (default: 5)"}
+max_tokens = {type = "int", optional = true, description = "Max tokens for each Thought/Action step (default: 256)"}
+question = {type = "string", optional = true, description = "The question to answer (default: 'What is 17 multiplied by 24, plus 13?')"}

@@ -150,8 +150,11 @@ async fn main(input: Input) -> Result<String> {
         pass.input(&pending);
         let last_idx = (pending.len() - 1) as u32;
         // `k = 0` returns the full vocabulary so the watermark can bias
-        // every token, not just the top-k.
-        let h = pass.probe(last_idx, Distribution { temperature: 0.0, k: 0 });
+        // every token, not just the top-k. `temperature = 1.0` keeps the
+        // model's natural softmax — `0.0` would collapse the host
+        // distribution to a one-hot argmax, leaving the green-list bias
+        // nothing to reweight (the watermark would be a no-op).
+        let h = pass.probe(last_idx, Distribution { temperature: 1.0, k: 0 });
         let out = pass.execute().await?;
 
         let (ids, probs) = match out.distribution(h) {

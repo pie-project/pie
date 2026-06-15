@@ -1,7 +1,7 @@
 [package]
 name = "tree-of-thought"
 version = "0.1.0"
-description = "Tree-of-Thought for multi-branch reasoning (Propose, Execute, Reflect)"
+description = "Tree-of-Thought as level-wise beam search: generate candidates per frontier item, score them, keep the global top-k, expand only survivors"
 authors = ["Pie Team"]
 
 [runtime]
@@ -10,5 +10,8 @@ mcp = "^0.2.0"
 
 [parameters]
 question = {type = "string", optional = true, description = "The question to solve (default: 'Calculate (42 + 3) * 5 / 15.')"}
-num_branches = {type = "int", optional = true, description = "Number of branches at each level of the tree (default: 2)"}
-max_tokens = {type = "int", optional = true, description = "Max new tokens to generate at each step (default: 512)"}
+breadth = {type = "int", optional = true, description = "Candidates generated per frontier item at each level (default: 3)"}
+beam_width = {type = "int", optional = true, description = "Global top-k survivors kept and expanded at each level (default: 2)"}
+levels = {type = "int", optional = true, description = "Number of search levels (default: 2)"}
+max_tokens = {type = "int", optional = true, description = "Max new tokens to generate at each step (default: 384)"}
+show_search = {type = "bool", optional = true, description = "Emit per-level search debug output (default: false)"}
