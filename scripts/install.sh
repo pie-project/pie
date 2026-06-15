@@ -135,9 +135,11 @@ if [ -z "${PIE_FLAVOR:-}" ]; then
   fi
 fi
 
-# Map (os, arch, flavor) -> release asset name. Names mirror what
-# .github/workflows/build.yml uploads.
-asset_for() {
+# Map (os, arch, flavor) -> one or more candidate release asset names, in
+# preference order (mirrors what .github/workflows/build.yml uploads). CUDA
+# flavors prefer the GH-hosted manylinux_2_28 build (broad glibc compat) and
+# fall back to the native linux-x64 build from the self-hosted GPU runners.
+assets_for() {
   case "$os/$arch/$1" in
     linux/x86_64/portable)            echo "pie-x86_64-manylinux_2_28.tar.gz" ;;
     linux/aarch64/portable)           echo "pie-aarch64-manylinux_2_28.tar.gz" ;;
@@ -148,22 +150,21 @@ asset_for() {
     | linux/x86_64/portable-cuda12.6 \
     | linux/x86_64/portable-cuda12.8 \
     | linux/x86_64/portable-cuda13.0)
+      echo "pie-x86_64-manylinux_2_28-${1}.tar.gz"
       echo "pie-x86_64-linux-${1}.tar.gz" ;;
     *) return 1 ;;
   esac
 }
 
-asset="$(asset_for "$PIE_FLAVOR")" || err \
+candidates="$(assets_for "$PIE_FLAVOR")" || err \
   "no '$PIE_FLAVOR' build for $os/$arch. Valid flavors: portable; or (Linux x86_64 only) cuda12.6, cuda12.8, cuda13.0, portable-cuda12.6, portable-cuda12.8, portable-cuda13.0."
 
-url="${PIE_DOWNLOAD_BASE}/${asset}"
 heading "Installing Pie"
 detail "Version:  ${PIE_VERSION}"
 detail "Platform: ${os}/${arch}"
 detail "Flavor:   ${PIE_FLAVOR}"
 [ -n "$PIE_FLAVOR_REASON" ] && detail "Reason:   ${PIE_FLAVOR_REASON}"
 detail "Target:   ${PIE_INSTALL_DIR}/pie"
-debug "Asset:    ${url}"
 
 # ---------------------------------------------------------------------------
 # Download + install
@@ -173,9 +174,19 @@ tmp="$(mktemp -d -t pie-install.XXXXXX)"
 trap 'rm -rf "$tmp"' EXIT
 
 step "Downloading release archive"
-if ! fetch "$url" "${tmp}/${asset}"; then
-  err "download failed for ${url}. Check PIE_VERSION=${PIE_VERSION} and PIE_FLAVOR=${PIE_FLAVOR}, then try again."
+asset=""
+url=""
+for cand in $candidates; do
+  cand_url="${PIE_DOWNLOAD_BASE}/${cand}"
+  debug "Trying:   ${cand_url}"
+  if fetch "$cand_url" "${tmp}/${cand}"; then
+    asset="$cand"; url="$cand_url"; break
+  fi
+done
+if [ -z "$asset" ]; then
+  err "download failed for flavor '${PIE_FLAVOR}' (tried: ${candidates}) under ${PIE_DOWNLOAD_BASE}. Check PIE_VERSION=${PIE_VERSION} and PIE_FLAVOR=${PIE_FLAVOR}, then try again."
 fi
+debug "Asset:    ${url}"
 
 step "Verifying archive"
 if ! tar -tzf "${tmp}/${asset}" >/dev/null; then
