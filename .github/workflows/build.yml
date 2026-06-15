@@ -579,6 +579,15 @@ jobs:
           # aarch64: Grace-Hopper (90), Grace-Blackwell (100).
           - { os_arch: aarch64, cc: "90",  runner: ubuntu-large-arm64, triple: aarch64-unknown-linux-gnu }
           - { os_arch: aarch64, cc: "100", runner: ubuntu-large-arm64, triple: aarch64-unknown-linux-gnu }
+        exclude:
+          # Blackwell consumer (RTX 50) shipped in the CUDA-13/driver-580 era —
+          # no one pairs sm120 with a CUDA 12.8 runtime.
+          - cuda: { version: "12.8.1", short: "12.8" }
+            target: { os_arch: x86_64, cc: "120", runner: ubuntu-large-x64, triple: x86_64-unknown-linux-gnu }
+          # Grace-Blackwell (GB200) is a 2025/CUDA-13 platform — the
+          # arm64 × Blackwell × CUDA-12.8 intersection is empty.
+          - cuda: { version: "12.8.1", short: "12.8" }
+            target: { os_arch: aarch64, cc: "100", runner: ubuntu-large-arm64, triple: aarch64-unknown-linux-gnu }
     container: nvidia/cuda:${{ matrix.cuda.version }}-devel-rockylinux8
     env:
       ARTIFACT_NAME: pie-${{ matrix.target.os_arch }}-manylinux_2_28-cuda${{ matrix.cuda.short }}-sm${{ matrix.target.cc }}.tar.gz
