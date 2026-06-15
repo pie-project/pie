@@ -362,7 +362,9 @@ jobs:
         # doesn't have. The portable-cuda flavor (no driver-cuda /
         # flashinfer) covers Turing users.
         cuda:
-          - { version: "12.8.1", short: "12.8", path: "/usr/local/cuda-12.8", arch: "80;86;89;90;100;120" }
+          # Self-hosted runner (Workstation-cuda) currently provides only the
+          # 13.0 toolkit; re-add 12.8 here once /usr/local/cuda-12.8 exists.
+          # (12.8 broad-compat artifacts come from the cuda-manylinux job.)
           - { version: "13.0.0", short: "13.0", path: "/usr/local/cuda-13.0", arch: "80;86;89;90;100;120" }
         flavor:
           - { id: "cuda",          features: "driver-portable,driver-cuda,driver-dummy" }
