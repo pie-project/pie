@@ -24,7 +24,9 @@ from common import (
     finish,
     hf_chat_token_ids_and_counts,
     make_prompts,
+    maybe_set_cpu_affinity,
     summarize,
+    visible_cuda_devices,
 )
 
 SERVER_SDK = ROOT / "sdk" / "python-server" / "python"
@@ -414,6 +416,10 @@ def pie_client(args: argparse.Namespace):
 async def run(args: argparse.Namespace):
     from pie_client import Event
 
+    # Pin to GPU-local CPUs before the server spawns so the pie serve
+    # subprocess inherits the affinity mask (mirrors vllm/sglang benches).
+    cpu_affinity = maybe_set_cpu_affinity(args, visible_cuda_devices(args.tp_size))
+
     n = args.requests if args.mode == "latency" else args.num_requests
     prompts = make_prompts(args, n + args.warmup)
     prompt_token_ids: list[list[int]] | None = None
@@ -760,6 +766,7 @@ async def run(args: argparse.Namespace):
             "ignore_eos": args.ignore_eos,
             "unique_prompts": args.unique_prompts,
             "cuda profiler capture": args.cuda_profiler_capture,
+            "cpu affinity": cpu_affinity,
             **engine_config,
         },
     )

@@ -397,7 +397,7 @@ def gpu_local_cpu_affinity(gpu_ids: list[int]) -> set[int]:
     if not lines:
         return set()
     header = lines[0].split()
-    gpu_cols = sum(1 for tok in header if re.fullmatch(r"GPU\d+", tok))
+    gpu_cols = sum(1 for tok in header if re.fullmatch(r"(?:GPU|NIC)\d+", tok))
     affinity_by_gpu: dict[int, set[int]] = {}
     for line in lines[1:]:
         toks = line.split()
