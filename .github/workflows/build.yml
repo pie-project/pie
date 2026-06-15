@@ -493,7 +493,10 @@ jobs:
     if: inputs.cuda_manylinux
     needs: prepare-release
     name: cuda / x86_64-manylinux_2_28 / ${{ matrix.flavor.id }}-${{ matrix.cuda.short }}
-    runs-on: ubuntu-22.04
+    # Set the repo variable CUDA_MANYLINUX_RUNNER to a larger runner label
+    # (e.g. a GitHub larger runner) to speed up the 6-arch CUDA build; falls
+    # back to the standard GH-hosted runner when unset.
+    runs-on: ${{ vars.CUDA_MANYLINUX_RUNNER || 'ubuntu-22.04' }}
     timeout-minutes: 120
     strategy:
       fail-fast: false
@@ -512,8 +515,15 @@ jobs:
       CMAKE_CUDA_ARCHITECTURES: ${{ matrix.cuda.arch }}
       CMAKE_CUDA_RUNTIME_LIBRARY: Shared
       CARGO_INCREMENTAL: "0"
+      # Cache C++/CUDA (build.rs wires sccache as the cmake compiler launcher)
+      # and Rust compiles across runs via sccache's GitHub Actions backend.
+      RUSTC_WRAPPER: sccache
+      SCCACHE_GHA_ENABLED: "true"
     steps:
       - uses: actions/checkout@v6
+
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@v0.0.6
 
       - name: Bootstrap container
         shell: bash
