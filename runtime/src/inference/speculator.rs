@@ -80,6 +80,19 @@ pub(crate) fn entry_matches_request(
     entry: &StagedEntry,
     request: &pie_bridge::ForwardRequest,
 ) -> bool {
+    // The chain extender only ever stages single-token decode passes
+    // (`build_next_request` emits `token_ids = [sampled_token]`,
+    // `qo_indptr = [0, 1]`, `single_token_mode = true`). The anchor match
+    // below compares only the *first* token/position, so a manual
+    // multi-token forward pass (e.g. speculative-decoding verification that
+    // submits `[anchor, draft0, draft1, ...]`) whose leading token happens
+    // to equal the staged anchor would otherwise wrongly claim a staged
+    // single-token result — silently discarding the extra query positions
+    // and returning the wrong tokens. Require the incoming request to have
+    // the same single-token shape the extender staged.
+    if request.token_ids.len() != 1 {
+        return false;
+    }
     let base = Some(entry.anchor_token) == request.token_ids.first().copied()
         && Some(entry.anchor_pos) == request.position_ids.first().copied()
         && entry.spec_token_ids == request.spec_token_ids

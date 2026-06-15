@@ -121,6 +121,14 @@ pub struct Forward<'ctx> {
     /// Audio clips spliced at the given anchor positions, in declaration
     /// order. Emitted as `input-audio` calls at execute time.
     audios: Vec<(&'ctx crate::media::Audio, u32)>,
+    /// When true, `execute` reserves pages and runs the pass but does NOT
+    /// commit the newly-filled working pages. Used by manual speculative
+    /// loops that must keep all written tokens in *working* pages so a
+    /// follow-up [`Context::truncate`] can roll back the rejected suffix —
+    /// committing first (the default) would lock unverified drafts into
+    /// committed KV that `truncate` cannot reach. The caller commits the
+    /// verified prefix itself once acceptance is known.
+    defer_commit: bool,
 }
 
 impl<'ctx> Forward<'ctx> {
@@ -153,7 +161,28 @@ impl<'ctx> Forward<'ctx> {
             zo_seed: None,
             images: Vec::new(),
             audios: Vec::new(),
+            defer_commit: false,
         }
+    }
+
+    /// Skip the post-execute page commit, keeping every written token in
+    /// *working* pages. The pass still reserves pages and writes KV, and the
+    /// context's `seq_len` / `working_tokens` advance, but no working page is
+    /// committed.
+    ///
+    /// Required for correct manual speculative decoding (draft + verify +
+    /// truncate). The default auto-commit promotes full working pages into
+    /// committed KV as soon as they fill — but a speculative verify pass
+    /// writes anchor + draft tokens whose acceptance is not yet known. A
+    /// committed page can no longer be rolled back by [`Context::truncate`],
+    /// and committing pages mid-speculation also perturbs the KV the
+    /// remaining decode attends to. Keeping the verified prefix in working
+    /// pages (and letting `truncate` drop the rejected suffix) is what makes
+    /// the generated sequence independent of the draft length, as lossless
+    /// speculative decoding requires.
+    pub fn defer_commit(&mut self) -> &mut Self {
+        self.defer_commit = true;
+        self
     }
 
     // ── Inputs ─────────────────────────────────────────────────────────
@@ -280,6 +309,7 @@ impl<'ctx> Forward<'ctx> {
             zo_seed,
             images,
             audios,
+            defer_commit,
         } = self;
 
         let n_auto = auto_inputs.len() as u32;
@@ -348,10 +378,18 @@ impl<'ctx> Forward<'ctx> {
             .await
             .map_err(|e| format!("Forward::execute: forward pass failed: {e}"))?;
 
-        // Commit any pages that auto-input tokens fully filled.
+        // Account for the newly-written KV. By default we also commit any
+        // pages the auto-input tokens fully filled. When `defer_commit` is
+        // set (manual speculation), we keep every written token in *working*
+        // pages so a later `truncate` can roll back rejected drafts — the
+        // caller commits the verified prefix afterwards.
         if n_auto > 0 {
             let new_working = ctx.working_tokens + n_auto;
-            let to_commit = new_working / ctx.page_size;
+            let to_commit = if defer_commit {
+                0
+            } else {
+                new_working / ctx.page_size
+            };
             if to_commit > 0 {
                 ctx.inner
                     .commit_working_pages(to_commit)
@@ -359,7 +397,7 @@ impl<'ctx> Forward<'ctx> {
             }
             ctx.committed_pages += to_commit;
             ctx.working_pages -= to_commit;
-            ctx.working_tokens = new_working % ctx.page_size;
+            ctx.working_tokens = new_working - to_commit * ctx.page_size;
             ctx.seq_len += n_auto;
         }
 
