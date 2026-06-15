@@ -499,7 +499,10 @@ jobs:
     # (e.g. a GitHub larger runner) to speed up the 6-arch CUDA build; falls
     # back to the standard GH-hosted runner when unset.
     runs-on: ${{ vars.CUDA_MANYLINUX_RUNNER || 'ubuntu-22.04' }}
-    timeout-minutes: 120
+    # 240m is a safety net for the slow default GH runner; set the
+    # CUDA_MANYLINUX_RUNNER repo variable to a larger runner and (with the
+    # sccache warm cache) this finishes in a small fraction of that.
+    timeout-minutes: 240
     strategy:
       fail-fast: false
       matrix:
