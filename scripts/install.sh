@@ -7,8 +7,8 @@
 #
 # Environment overrides:
 #   PIE_VERSION       Release tag (default: 0.4.0).
-#   PIE_FLAVOR        portable | cuda{12.6,12.8,13.0}
-#                     | portable-cuda{12.6,12.8,13.0}. Auto-detected when unset.
+#   PIE_FLAVOR        portable | cuda{12.8,13.0}
+#                     | portable-cuda{12.8,13.0}. Auto-detected when unset.
 #   PIE_INSTALL_DIR   Install location for the `pie` binary (default: ~/.local/bin).
 #   PIE_REPO          GitHub owner/name (default: pie-project/pie).
 #   PIE_DOWNLOAD_BASE Override the asset base URL (default: GitHub releases).

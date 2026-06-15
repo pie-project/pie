@@ -43,7 +43,7 @@ The CUDA flavors require a matching NVIDIA driver, the CUDA toolkit runtime libr
 sudo apt install libnccl2 libnccl-dev
 ```
 
-If `pie doctor` reports missing libraries on a CUDA build, install the runtime that matches the flavor (CUDA 12.x for `cuda12.6` / `cuda12.8`, CUDA 13.x for `cuda13.0`).
+If `pie doctor` reports missing libraries on a CUDA build, install the runtime that matches the flavor (CUDA 12.x for `cuda12.8`, CUDA 13.x for `cuda13.0`).
 
 ## Verify
 
@@ -101,7 +101,7 @@ $env:PIE_FLAVOR = "portable-cuda"; irm https://pie-project.org/install.ps1 | iex
 
 | Platform | Available flavors |
 |---|---|
-| Linux x86_64 | `portable`, `cuda12.6`, `cuda12.8`, `cuda13.0`, `portable-cuda12.6`, `portable-cuda12.8`, `portable-cuda13.0` |
+| Linux x86_64 | `portable`, `cuda12.8`, `cuda13.0`, `portable-cuda12.8`, `portable-cuda13.0` |
 | Linux aarch64 | `portable` |
 | macOS Apple Silicon | `portable` |
 | Windows x86_64 | `portable-vulkan`, `portable-cuda` |

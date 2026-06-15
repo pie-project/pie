@@ -20,7 +20,7 @@ on:
         type: boolean
         default: true
       cuda:
-        description: "Build CUDA matrix on self-hosted GPU runner (cuda 12.6/12.8/13.0 × {cuda, portable-cuda})"
+        description: "Build CUDA matrix on self-hosted GPU runner (cuda 12.8/13.0 × {cuda, portable-cuda})"
         type: boolean
         default: true
       cuda_manylinux:
