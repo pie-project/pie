@@ -101,14 +101,14 @@ $env:PIE_FLAVOR = "portable-cuda"; irm https://pie-project.org/install.ps1 | iex
 
 | Platform | Available flavors |
 |---|---|
-| Linux x86_64 | `portable`, `cuda12.8`, `cuda13.0`, `portable-cuda12.8`, `portable-cuda13.0` |
+| Linux x86_64 | `portable`, `cuda12.8`, `cuda13.0` |
 | Linux aarch64 | `portable` |
 | macOS Apple Silicon | `portable` |
 | Windows x86_64 | `portable-vulkan`, `portable-cuda` |
 
 Intel Macs are not supported.
 
-The bare `cuda*` flavors include only the embedded `cuda_native` driver. The `portable-cuda*` flavors include both `cuda_native` and `portable`, useful for hosts that need both code paths in one binary.
+The `cuda*` flavors bundle the embedded `cuda_native` driver (the recommended CUDA path on Linux). Windows CUDA uses `portable-cuda` (the portable driver with a CUDA backend), as there is no native Windows driver.
 
 ### Override the install directory
 

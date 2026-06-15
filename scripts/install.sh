@@ -7,8 +7,7 @@
 #
 # Environment overrides:
 #   PIE_VERSION       Release tag (default: 0.4.0).
-#   PIE_FLAVOR        portable | cuda{12.8,13.0}
-#                     | portable-cuda{12.8,13.0}. Auto-detected when unset.
+#   PIE_FLAVOR        portable | cuda{12.8,13.0}. Auto-detected when unset.
 #   PIE_INSTALL_DIR   Install location for the `pie` binary (default: ~/.local/bin).
 #   PIE_REPO          GitHub owner/name (default: pie-project/pie).
 #   PIE_DOWNLOAD_BASE Override the asset base URL (default: GitHub releases).
@@ -145,9 +144,7 @@ assets_for() {
     linux/aarch64/portable)           echo "pie-aarch64-manylinux_2_28.tar.gz" ;;
     darwin/aarch64/portable)          echo "pie-aarch64-darwin.tar.gz" ;;
     linux/x86_64/cuda12.8 \
-    | linux/x86_64/cuda13.0 \
-    | linux/x86_64/portable-cuda12.8 \
-    | linux/x86_64/portable-cuda13.0)
+    | linux/x86_64/cuda13.0)
       echo "pie-x86_64-manylinux_2_28-${1}.tar.gz"
       echo "pie-x86_64-linux-${1}.tar.gz" ;;
     *) return 1 ;;
@@ -155,7 +152,7 @@ assets_for() {
 }
 
 candidates="$(assets_for "$PIE_FLAVOR")" || err \
-  "no '$PIE_FLAVOR' build for $os/$arch. Valid flavors: portable; or (Linux x86_64 only) cuda12.8, cuda13.0, portable-cuda12.8, portable-cuda13.0."
+  "no '$PIE_FLAVOR' build for $os/$arch. Valid flavors: portable; or (Linux x86_64 only) cuda12.8, cuda13.0."
 
 heading "Installing Pie"
 detail "Version:  ${PIE_VERSION}"

@@ -368,7 +368,6 @@ jobs:
           - { version: "13.0.0", short: "13.0", path: "/usr/local/cuda-13.0", arch: "80;86;89;90;100;120" }
         flavor:
           - { id: "cuda",          features: "driver-portable,driver-cuda,driver-dummy" }
-          - { id: "portable-cuda", features: "driver-portable,driver-dummy" }
     env:
       ARTIFACT_NAME: pie-x86_64-linux-${{ matrix.flavor.id }}${{ matrix.cuda.short }}.tar.gz
       PIE_PORTABLE_CUDA: "1"
@@ -511,7 +510,6 @@ jobs:
           - { version: "13.0.0", short: "13.0", arch: "80;86;89;90;100;120" }
         flavor:
           - { id: "cuda",          features: "driver-portable,driver-cuda,driver-dummy" }
-          - { id: "portable-cuda", features: "driver-portable,driver-dummy" }
     container: nvidia/cuda:${{ matrix.cuda.version }}-devel-rockylinux8
     env:
       ARTIFACT_NAME: pie-x86_64-manylinux_2_28-${{ matrix.flavor.id }}${{ matrix.cuda.short }}.tar.gz
