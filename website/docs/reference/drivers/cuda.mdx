@@ -16,7 +16,7 @@ Install a CUDA-flavored `pie` binary:
 curl -fsSL https://pie-project.org/install.sh | PIE_FLAVOR=cuda12.8 bash
 ```
 
-Auto-detection chooses `cuda13.0` for NVIDIA driver `>= 580`, `cuda12.8` for driver `>= 525`, and `portable` otherwise. Valid CUDA flavors are `cuda12.6`, `cuda12.8`, `cuda13.0`, and the matching `portable-cuda*` variants.
+Auto-detection chooses `cuda13.0` for NVIDIA driver `>= 580`, `cuda12.8` for driver `>= 525`, and `portable` otherwise. Valid CUDA flavors are `cuda12.8`, `cuda13.0`, and the matching `portable-cuda*` variants. CUDA **12.8 is the minimum** toolkit (the FlashInfer Hopper/Mamba-SSU and FP4 kernels require 12.8+).
 
 
 ## `cuda_native` configuration

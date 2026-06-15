@@ -94,7 +94,8 @@ loader**, and a broad set of **new model architectures**.
 #### Build & packaging
 - **Vendored FlashInfer CUTLASS MoE launchers**, removing the build-time Python
   codegen and its incidental `tvm_ffi` / `pynvml` / `tqdm` dependencies.
-- **CUDA 12 / 13 dual-build** support and `sm120` builds.
+- **CUDA 12.8 / 13 dual-build** support and `sm120` builds. **CUDA 12.8 is the
+  minimum toolkit** — FlashInfer's Hopper (Mamba SSU) and FP4 kernels require 12.8+.
 - Slim CUDA Docker image for `pie-server` (driver-cuda).
 - Version bumped to **0.4.0** across all crates, packages, and install scripts.
 

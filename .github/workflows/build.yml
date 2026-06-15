@@ -362,7 +362,6 @@ jobs:
         # doesn't have. The portable-cuda flavor (no driver-cuda /
         # flashinfer) covers Turing users.
         cuda:
-          - { version: "12.6.3", short: "12.6", path: "/usr/local/cuda-12.6", arch: "80;86;89;90" }
           - { version: "12.8.1", short: "12.8", path: "/usr/local/cuda-12.8", arch: "80;86;89;90;100;120" }
           - { version: "13.0.0", short: "13.0", path: "/usr/local/cuda-13.0", arch: "80;86;89;90;100;120" }
         flavor:
@@ -500,7 +499,6 @@ jobs:
       fail-fast: false
       matrix:
         cuda:
-          - { version: "12.6.3", short: "12.6", arch: "80;86;89;90" }
           - { version: "12.8.1", short: "12.8", arch: "80;86;89;90;100;120" }
           - { version: "13.0.0", short: "13.0", arch: "80;86;89;90;100;120" }
         flavor:
