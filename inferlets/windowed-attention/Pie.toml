@@ -9,6 +9,6 @@ core = "^0.2.0"
 mcp = "^0.2.0"
 
 [parameters]
-prompt = {type = "string", optional = true, description = "The prompt to send to the model (default: 'Explain LLM decoding process in ELI5.')"}
+prompt = {type = "string", optional = true, description = "The prompt to send to the model (default: 'Tell me a long story about a cat.')"}
 max_tokens = {type = "int", optional = true, description = "Maximum number of new tokens to generate (default: 512)"}
-window_size = {type = "int", optional = true, description = "Sliding window size for KV cache (default: 32)"}
+window_size = {type = "int", optional = true, description = "Sliding window size for KV cache (default: 64)"}

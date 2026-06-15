@@ -1,7 +1,7 @@
 [package]
 name = "constrained-decoding"
 version = "0.1.0"
-description = "Grammar-constrained decoding using Lark grammar for structured outputs"
+description = "Grammar-constrained decoding using an EBNF grammar for structured outputs"
 authors = ["Pie Team"]
 
 [runtime]

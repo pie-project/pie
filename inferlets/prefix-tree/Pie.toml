@@ -1,7 +1,7 @@
 [package]
 name = "prefix-tree"
 version = "0.1.0"
-description = "Prefix tree caching with concurrent generation from shared context"
+description = "Prefix tree caching with sequential generation from a shared context"
 authors = ["Pie Team"]
 
 [runtime]

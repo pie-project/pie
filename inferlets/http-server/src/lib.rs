@@ -11,6 +11,7 @@
 //! - `/echo` - Echoes back the request body
 //! - `/echo-headers` - Echoes back the request headers
 //! - `/info` - Returns server and request information as JSON
+//! - `/sse` - Streams a few Server-Sent Events (text/event-stream)
 //!
 //! ## Running
 //!
@@ -59,7 +60,8 @@ async fn home(_req: Request<IncomingBody>, res: Responder) -> Finished {
                   /wait   - Async sleep demo (sleeps for 1 second)\n\
                   /echo   - Echo back the request body\n\
                   /echo-headers - Echo back request headers\n\
-                  /info   - Server and request information\n"
+                  /info   - Server and request information\n\
+                  /sse    - Stream Server-Sent Events\n"
         .into_body();
 
     res.respond(Response::new(body)).await

@@ -9,4 +9,4 @@ core = "^0.2.0"
 mcp = "^0.2.0"
 
 [parameters]
-prompt = {type = "string", description = "User prompt"}
+prompt = {type = "string", optional = true, description = "Unused — the smoke test drives a fixed tool-call prompt"}

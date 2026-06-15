@@ -1,12 +1,12 @@
-"""E2E test for cacheback-decoding inferlet."""
+"""E2E test for draft-model-decoding inferlet."""
 import re
 
 from conftest import run_inferlet, run_tests
 
 
-async def test_cacheback_decoding(client, args):
+async def test_draft_model_decoding(client, args):
     output = await run_inferlet(
-        client, "cacheback-decoding",
+        client, "draft-model-decoding",
         {"max_tokens": 64},
         timeout=args.timeout,
     )
@@ -18,4 +18,4 @@ async def test_cacheback_decoding(client, args):
 
 
 if __name__ == "__main__":
-    run_tests([test_cacheback_decoding])
+    run_tests([test_draft_model_decoding])

@@ -1,5 +1,5 @@
-//! Demonstrates CacheBack speculative decoding — a manual loop with a
-//! cached draft model.
+//! Demonstrates draft-model speculative decoding — a manual loop with a
+//! separate greedy draft model.
 //!
 //! A separate "drafter" context generates candidate tokens; the main
 //! context verifies them in a single forward pass. Accepted tokens commit;
@@ -181,7 +181,7 @@ async fn main(input: Input) -> Result<String> {
 
     let text = tokenizer.decode(&all_generated)?;
     println!(
-        "--- CacheBack Decoding (draft_length={}, steps={}) ---",
+        "--- Draft-Model Decoding (draft_length={}, steps={}) ---",
         draft_length, total_steps
     );
     println!("Generated in {:?}", start.elapsed());
