@@ -546,6 +546,12 @@ jobs:
             echo "PATH=/opt/rh/gcc-toolset-12/root/usr/bin:${PATH}"
             echo "LD_LIBRARY_PATH=/opt/rh/gcc-toolset-12/root/usr/lib64:/opt/rh/gcc-toolset-12/root/usr/lib"
             echo "PKG_CONFIG_PATH=/opt/rh/gcc-toolset-12/root/usr/lib64/pkgconfig"
+            # rustc's final link must go through the gcc-toolset-12 gcc driver
+            # so libstdc++_nonshared.a is pulled in for the C++17/20 libstdc++
+            # symbols (std::filesystem, std::__throw_bad_array_new_length) the
+            # C++ drivers use. The stock /usr/bin/cc (gcc-8.5) links the old
+            # system libstdc++ and fails the link with undefined symbols.
+            echo "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=/opt/rh/gcc-toolset-12/root/usr/bin/gcc"
           } >> "$GITHUB_ENV"
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
             sh -s -- -y --profile minimal --default-toolchain stable

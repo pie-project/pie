@@ -272,15 +272,8 @@ fn build_cuda() {
         .define("PIE_BRIDGE_INCLUDE_DIR", pie_bridge_include_dir());
     enable_position_independent_archives(&mut cfg);
 
-    // Force CMake to use the system Python for the FlashInfer kernel generator.
-    // Maturin/uv build envs put a minimal venv Python first in PATH; that venv
-    // lacks filelock/tvm_ffi which the generator needs.
-    for candidate in ["/usr/bin/python3", "/usr/local/bin/python3"] {
-        if std::path::Path::new(candidate).exists() {
-            cfg.define("Python3_EXECUTABLE", candidate);
-            break;
-        }
-    }
+    // (The CUDA driver build no longer invokes Python: FlashInfer MoE
+    // launchers are vendored, so no kernel generator runs at build time.)
 
     println!("cargo:rerun-if-env-changed=CPM_SOURCE_CACHE");
     if let Ok(cache) = std::env::var("CPM_SOURCE_CACHE") {

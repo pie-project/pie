@@ -21,7 +21,11 @@ set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib)
 
 find_package(CUDAToolkit REQUIRED)
 find_package(Threads REQUIRED)
-find_package(Python3 COMPONENTS Interpreter REQUIRED)
+# No Python interpreter is required to build the CUDA driver: the
+# FlashInfer CUTLASS MoE launchers are vendored (third_party/
+# flashinfer_generated) and flashinfer itself is fetched DOWNLOAD_ONLY
+# for headers. (Removed find_package(Python3 ... REQUIRED), which aborted
+# configure in minimal containers e.g. nvidia/cuda:*-rockylinux8.)
 
 # CUDA 13+ ships libcudacxx/CUB/Thrust under a `cccl/` prefix in the
 # toolkit include tree.  CUTLASS (and vendored Marlin) still includes
@@ -65,7 +69,8 @@ if(DEFINED ENV{CPM_SOURCE_CACHE} AND NOT CPM_SOURCE_CACHE)
 endif()
 
 # NOTE: flashinfer dropped its top-level CMakeLists.txt after v0.2.7. From
-# v0.3.0+ the build is Python-driven (per-arch JIT cubins via build_backend.py).
+# v0.3.0+ flashinfer ships no top-level CMakeLists; we fetch it
+# DOWNLOAD_ONLY for headers/csrc and compile the launchers we need.
 # We still fetch the source tree for headers and `csrc/`. Kernel integration
 # at M1.2 will either (a) compile the csrc TUs we need into our binary
 # directly, or (b) consume the precompiled `flashinfer-cubin` artifacts via
