@@ -113,7 +113,7 @@ use {
 };
 
 use crate::api;
-use crate::instance::InstanceState;
+use crate::instance::{InstanceState, OutputMode};
 use crate::linker::dynamic_linking;
 
 use super::runtime as py_runtime;
@@ -1316,8 +1316,8 @@ pub(crate) async fn snapshot_from_bytes(
     let inst_state = InstanceState::new(
         uuid::Uuid::new_v4(),
         "snapshot".to_string(),
-        false,            // capture_outputs
-        &snapshot_policy, // deny fs + deny network — snapshot init only
+        OutputMode::Discard, // snapshot init only — guest output is noise
+        &snapshot_policy,    // deny fs + deny network — snapshot init only
         py_runtime::dir(),
     )
     .await?;

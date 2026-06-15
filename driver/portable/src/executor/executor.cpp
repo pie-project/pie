@@ -55,6 +55,14 @@ struct Executor::GraphCache {
     // n_request + max_n_kv).
     std::vector<std::int32_t> n_tokens_pad_per_req;
     std::vector<std::int32_t> n_kv_per_req;
+    // Pure-decode paged-attn only: total KV pages across the batch. The
+    // `page_indices` tensor is allocated to this exact size, but unlike
+    // page_indptr/last_page_lens (sized purely from n_request) it can
+    // change between batches that otherwise share the same signature
+    // (e.g. a request's KV usage crosses a page boundary without moving
+    // max_n_kv). Must invalidate the cache on change, else upload_graph_inputs
+    // writes a larger plan.page_indices_i32 into the smaller cached tensor.
+    std::int32_t total_pages_in_batch = 0;
     // State-bearing archs (Qwen 3.5) bake the per-request state_slot
     // offset into the graph view. The cache must invalidate when slots
     // change, even if everything else matches.
@@ -75,6 +83,10 @@ struct Executor::GraphCache {
         if (uniform_top_sample != plan.uniform_top_sample) return false;
         if (uniform_top_k != plan.uniform_top_k) return false;
         if (adapter != plan.active_adapter) return false;
+        if (plan.pure_decode) {
+            if (total_pages_in_batch !=
+                static_cast<std::int32_t>(plan.page_indices_i32.size())) return false;
+        }
         if (!plan.pure_decode) {
             // Slow path: per-request shapes must match exactly.
             if (n_tokens_pad_per_req.size() != plan.reqs.size()) return false;
@@ -107,6 +119,7 @@ struct Executor::GraphCache {
         if (plan.pure_decode) {
             n_tokens_pad_per_req.clear();
             n_kv_per_req.clear();
+            total_pages_in_batch = static_cast<std::int32_t>(plan.page_indices_i32.size());
         } else {
             n_tokens_pad_per_req.resize(plan.reqs.size());
             n_kv_per_req.resize(plan.reqs.size());

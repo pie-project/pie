@@ -1,10 +1,12 @@
 //! HuggingFace snapshot resolver.
 //!
-//! `[[model]].hf_repo` accepts either a local snapshot directory or a
-//! HuggingFace repo ID (`owner/name`). [`resolve_or_download`] returns
-//! a usable on-disk path either way:
+//! `[[model]].hf_repo` accepts a local snapshot directory, a local single
+//! `.gguf` file, or a HuggingFace repo ID (`owner/name`).
+//! [`resolve_or_download`] returns a usable on-disk path in all cases:
 //!
-//!   * Local path → returned as-is.
+//!   * Local directory → returned as-is (HF safetensors snapshot).
+//!   * Local `.gguf` file → returned as-is (portable driver loads it
+//!     directly; see `driver/portable/src/model.cpp::Model`).
 //!   * Repo ID → resolved against the HF cache (`~/.cache/huggingface/hub/`,
 //!     overridable via `$HF_HOME`); downloaded if missing.
 //!
@@ -53,6 +55,14 @@ pub async fn resolve_or_download(repo_id_or_path: &str) -> Result<PathBuf> {
     if p.is_dir() {
         return Ok(p.to_path_buf());
     }
+    // Single .gguf file is also a valid resolved target: the portable
+    // driver accepts either an HF safetensors directory OR a single
+    // .gguf file (see driver/portable/src/model.cpp::Model). Treat the
+    // path as pre-resolved so quantized weights can be wired through
+    // `hf_repo` without a multi-file snapshot directory.
+    if p.is_file() && p.extension().is_some_and(|e| e == "gguf") {
+        return Ok(p.to_path_buf());
+    }
 
     // Looks-like-a-path heuristic: if the user typed an absolute path,
     // a `./`/`../` prefix, or anything with backslashes, they meant a
@@ -66,7 +76,7 @@ pub async fn resolve_or_download(repo_id_or_path: &str) -> Result<PathBuf> {
     {
         bail!(
             "hf_repo {repo_id_or_path:?} looks like a local path but does not \
-             exist or is not a directory"
+             exist, or is not a directory or .gguf file"
         );
     }
 
@@ -168,6 +178,15 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resolved, tmp.path());
+    }
+
+    #[tokio::test]
+    async fn local_gguf_file_short_circuits() {
+        let tmp = tempfile::tempdir().unwrap();
+        let gguf = tmp.path().join("model.gguf");
+        std::fs::write(&gguf, b"dummy").unwrap();
+        let resolved = resolve_or_download(gguf.to_str().unwrap()).await.unwrap();
+        assert_eq!(resolved, gguf);
     }
 
     #[tokio::test]

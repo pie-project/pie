@@ -1,6 +1,7 @@
 #include "gguf_archive.hpp"
 
 #include <fstream>
+#include <iostream>
 #include <stdexcept>
 #ifndef _WIN32
 #include <fcntl.h>
@@ -210,6 +211,18 @@ GGUFArchive::GGUFArchive(const std::filesystem::path& gguf_file) {
         meta_.general_name = it->second.str_value;
     }
 
+    // Capture the tokens-array length for vocab_size fallback. Most GGUFs
+    // omit `<arch>.vocab_size` but always store `tokenizer.ggml.tokens`.
+    {
+        const std::int64_t tok_id =
+            gguf_find_key(gctx_, "tokenizer.ggml.tokens");
+        if (tok_id >= 0 &&
+            gguf_get_kv_type(gctx_, tok_id) == GGUF_TYPE_ARRAY &&
+            gguf_get_arr_type(gctx_, tok_id) == GGUF_TYPE_STRING) {
+            meta_.tokens_count = gguf_get_arr_n(gctx_, tok_id);
+        }
+    }
+
     // ---- Build the StTensor table keyed by HF canonical name -----------
     const std::int64_t n_tensors = gguf_get_n_tensors(gctx_);
     raw_names_.reserve(static_cast<std::size_t>(n_tensors));
@@ -327,6 +340,149 @@ const StTensor& GGUFArchive::at(const std::string& name) const {
     const auto* t = find(name);
     if (!t) throw std::runtime_error("gguf: missing tensor '" + name + "'");
     return *t;
+}
+
+// ---------------------------------------------------------------------------
+// GGUFArchive::open_sharded — multi-file / split GGUF loader
+// ---------------------------------------------------------------------------
+// Discovers sibling shards from the first shard path using the canonical
+// *-NNNNN-of-MMMMM.gguf naming scheme produced by llama.cpp's gguf-split.
+// Reads split.count from the first shard's KV metadata to know how many
+// siblings to expect, resolves their paths, constructs a GGUFArchive for
+// each, and merges all tensors into the first archive.  Falls back to a
+// plain single-file open when split.count is absent or equals 1.
+
+namespace {
+
+// Given a shard filename like "model-00001-of-00003.gguf", return the
+// stem prefix ("model-"), the total shard count (3), and the zero-based
+// index of this shard (0).  Returns false when the filename doesn't match
+// the pattern.
+bool parse_shard_filename(const std::filesystem::path& p,
+                          std::string& prefix_out,
+                          int& index_out,
+                          int& total_out) {
+    const std::string stem = p.stem().string();  // e.g. "model-00001-of-00003"
+    // Pattern: <prefix>-<NNNNN>-of-<MMMMM>
+    const std::string of_marker = "-of-";
+    const auto of_pos = stem.rfind(of_marker);
+    if (of_pos == std::string::npos) return false;
+
+    const std::string total_str = stem.substr(of_pos + of_marker.size());
+    // Find the index field: last '-' before of_pos
+    const auto dash_pos = stem.rfind('-', of_pos - 1);
+    if (dash_pos == std::string::npos) return false;
+
+    const std::string index_str = stem.substr(dash_pos + 1, of_pos - dash_pos - 1);
+    prefix_out = stem.substr(0, dash_pos + 1);  // includes trailing '-'
+
+    try {
+        index_out = std::stoi(index_str) - 1;  // 1-based → 0-based
+        total_out = std::stoi(total_str);
+    } catch (...) {
+        return false;
+    }
+    return total_out > 0 && index_out >= 0 && index_out < total_out;
+}
+
+// Build the Nth shard path (1-based n) given the directory, prefix, total,
+// and extension.  Pads to 5 digits matching llama.cpp convention.
+std::filesystem::path shard_path(const std::filesystem::path& dir,
+                                 const std::string& prefix,
+                                 int n, int total,
+                                 const std::string& ext) {
+    char buf[32];
+    std::snprintf(buf, sizeof(buf), "%05d-of-%05d", n, total);
+    return dir / (prefix + buf + ext);
+}
+
+}  // namespace
+
+std::unique_ptr<GGUFArchive>
+GGUFArchive::open_sharded(const std::filesystem::path& first_shard) {
+    // Always open the given file first.
+    auto primary = std::make_unique<GGUFArchive>(first_shard);
+
+    // Check for split.count in KV metadata.
+    int n_shards = 1;
+    if (auto it = primary->meta_.kv.find("split.count"); it != primary->meta_.kv.end()) {
+        n_shards = static_cast<int>(it->second.num_value);
+    }
+
+    if (n_shards <= 1) {
+        // Single file or metadata says only one shard — nothing to merge.
+        return primary;
+    }
+
+    // Parse the filename to discover sibling paths.
+    std::string prefix;
+    int this_index = 0, total_from_name = 0;
+    const bool parsed = parse_shard_filename(first_shard, prefix,
+                                             this_index, total_from_name);
+    if (parsed && this_index != 0) {
+        throw std::runtime_error(
+            "gguf: open_sharded() requires the first shard (got shard " +
+            std::to_string(this_index + 1) + " of " +
+            std::to_string(total_from_name) + ")");
+    }
+
+    if (!parsed) {
+        // Filename doesn't match the pattern but split.count > 1 — warn and
+        // return what we have; callers will get a missing-tensor error later
+        // which is more informative than a hard crash here.
+        std::cerr << "[gguf] warning: split.count=" << n_shards
+                  << " but filename '" << first_shard.filename().string()
+                  << "' doesn't match *-NNNNN-of-MMMMM.gguf — "
+                     "loading first shard only\n";
+        return primary;
+    }
+
+    if (total_from_name != n_shards) {
+        std::cerr << "[gguf] warning: split.count=" << n_shards
+                  << " but filename implies " << total_from_name
+                  << " shards — trusting filename\n";
+        n_shards = total_from_name;
+    }
+
+    const auto dir = first_shard.parent_path();
+    const std::string ext = first_shard.extension().string();  // ".gguf"
+
+    // Load and merge shards 2..N into the primary archive.
+    for (int i = 2; i <= n_shards; ++i) {
+        const auto path = shard_path(dir, prefix, i, n_shards, ext);
+        if (!std::filesystem::is_regular_file(path)) {
+            throw std::runtime_error(
+                "gguf: shard " + std::to_string(i) + "/" +
+                std::to_string(n_shards) + " not found: " + path.string());
+        }
+
+        auto shard = std::make_unique<GGUFArchive>(path);
+
+        // Merge tensors — move each StTensor entry into the primary map.
+        // The shard's mmap must remain alive as long as we use its data
+        // pointers, so we adopt ownership of its mmap region.
+        for (auto& [name, st] : shard->tensors_) {
+            if (primary->tensors_.count(name)) {
+                throw std::runtime_error(
+                    "gguf: duplicate tensor '" + name +
+                    "' found in shard " + std::to_string(i));
+            }
+            primary->tensors_.emplace(name, st);
+        }
+        // Transfer raw names for diagnostics.
+        for (auto& rn : shard->raw_names_) {
+            primary->raw_names_.push_back(std::move(rn));
+        }
+        // Transfer dequant buffers ownership so their data pointers stay valid.
+        for (auto& buf : shard->dequant_buffers_) {
+            primary->dequant_buffers_.push_back(std::move(buf));
+        }
+        // Adopt mmap ownership: move shard's owned_data / mmap pointers into
+        // extra_mmaps_ so they stay alive for the lifetime of the primary.
+        primary->extra_mmaps_.push_back(std::move(shard));
+    }
+
+    return primary;
 }
 
 }  // namespace pie_portable_driver

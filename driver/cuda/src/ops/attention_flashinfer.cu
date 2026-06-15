@@ -1,5 +1,6 @@
 #include "ops/attention_flashinfer.hpp"
 
+#include <algorithm>
 #include <type_traits>
 
 #include <algorithm>
@@ -150,6 +151,27 @@ struct DecodeWorkEstimator {
         if constexpr (!head_dim_supports_cascade_merge(HEAD_DIM)) {
             split_kv = false;
             new_batch_size = batch_size;
+
+            // With split_kv forced false, DecodePlan sets padded_batch_size =
+            // batch_size, but DecodeSplitKVIndptr still tiles each request's
+            // KV pages into ceil_div(pages_i, max_num_pages_per_batch) work
+            // items using the chunk size the (split-kv) estimator chose
+            // above. If any request has more pages than that chunk size,
+            // DecodeSplitKVIndptr emits more than `batch_size` (request,
+            // tile) entries, overflowing the request_indices/kv_tile_indices/
+            // o_indptr buffers (sized for padded_batch_size = batch_size) and
+            // mapping multiple grid blocks onto the same request — clobbering
+            // other requests' output rows. Bump the chunk size to the largest
+            // per-request page count so every request maps to exactly one
+            // tile, keeping request_indices_vec.size() == batch_size ==
+            // padded_batch_size. (kv_chunk_size_ptr is otherwise unused when
+            // partition_kv == false.)
+            uint32_t max_pages_per_req = 1;
+            for (uint32_t i = 0; i < batch_size; ++i) {
+                uint32_t pages_i = static_cast<uint32_t>(kv_indptr_h[i + 1] - kv_indptr_h[i]);
+                max_pages_per_req = std::max(max_pages_per_req, pages_i);
+            }
+            max_num_pages_per_batch = std::max(max_num_pages_per_batch, max_pages_per_req);
         }
         if (!force_split_kv_small_enabled() &&
             current_device_major() >= 8 && batch_size <= 512) {
@@ -497,7 +519,7 @@ void plan_attention_flashinfer_decode_bf16(
             throw std::runtime_error(
                 "flashinfer decode: unsupported head_dim " +
                 std::to_string(head_dim) +
-                " (instantiated: 64, 128, 256, 512)");
+                " (instantiated: 64, 96, 128, 256, 512)");
     }
     CUDA_CHECK(status);
 
@@ -755,6 +777,10 @@ void dispatch_attention_flashinfer_decode_bf16(
     switch (cache.head_dim) {
         case 64:
             status = dispatch_decode_for_head_dim<64>(cache, q, k_pages, v_pages, o,
+                kv_page_indices_d, kv_page_indptr_d, kv_last_page_lens_d, workspace, stream, window_left, logits_soft_cap, sm_scale, lse_out);
+            break;
+        case 96:
+            status = dispatch_decode_for_head_dim<96>(cache, q, k_pages, v_pages, o,
                 kv_page_indices_d, kv_page_indptr_d, kv_last_page_lens_d, workspace, stream, window_left, logits_soft_cap, sm_scale, lse_out);
             break;
         case 128:

@@ -19,6 +19,7 @@ use uuid::Uuid;
 type SharedResultTx = Arc<Mutex<Option<oneshot::Sender<Result<String, String>>>>>;
 
 use crate::context;
+use crate::instance::OutputMode;
 use crate::linker;
 use crate::program::ProgramName;
 use crate::server::{self, ClientId};
@@ -451,11 +452,12 @@ impl Process {
         let mut wasm_run_us = 0u64;
         let result: Result<String, String> = async {
             let instantiate_start = Instant::now();
+            let output = if capture_outputs { OutputMode::Stream } else { OutputMode::Discard };
             let (mut store, instance) = linker::instantiate(
                 process_id,
                 username,
                 &program,
-                capture_outputs,
+                output,
                 token_budget,
             )
             .await

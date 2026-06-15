@@ -98,11 +98,15 @@ Hparams parse_gguf_hparams(const GgufMeta& meta) {
     h.tie_word_embeddings = !meta.has_output_weight;
 
     // Vocab size: GGUF doesn't always store it explicitly either. The
-    // tokenizer.ggml.tokens array length is the canonical source, but
-    // hparams's vocab_size is also implied by tok_embd's outer dim.
-    // Most converters DO write `<arch>.vocab_size`; fall back to 0 (the
-    // model loader will sanity-check against the embed tensor shape).
+    // tokenizer.ggml.tokens array length is the canonical source, and
+    // most converters DO write `<arch>.vocab_size`. Take the explicit
+    // arch key when present, otherwise fall back to the tokens-array
+    // length captured at archive construction (Qwen3-MoE GGUFs in the
+    // wild omit the arch key).
     h.vocab_size = static_cast<std::int32_t>(get_num(meta, a, "vocab_size", 0));
+    if (h.vocab_size == 0) {
+        h.vocab_size = static_cast<std::int32_t>(meta.tokens_count);
+    }
 
     // ---- MoE -----------------------------------------------------------
     h.num_experts         = static_cast<std::int32_t>(get_num(meta, a, "expert_count",        0));

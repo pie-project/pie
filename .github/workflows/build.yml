@@ -404,7 +404,7 @@ jobs:
       CMAKE_CUDA_COMPILER_LAUNCHER: env
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           # Workspace persists between jobs on bare-metal; clean to keep
           # builds reproducible. The big caches live outside the
@@ -473,7 +473,7 @@ jobs:
         # Pure-JS action — no `gh` install required on the bare-metal
         # runner. Existing assets with the same name are replaced
         # (same effect as `gh release upload --clobber`).
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ inputs.tag }}
           files: dist/${{ env.ARTIFACT_NAME }}
@@ -515,7 +515,7 @@ jobs:
       CMAKE_CUDA_RUNTIME_LIBRARY: Shared
       CARGO_INCREMENTAL: "0"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Bootstrap container
         shell: bash
@@ -582,7 +582,7 @@ jobs:
           ls -la dist/
 
       - name: Upload to release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ inputs.tag }}
           files: dist/${{ env.ARTIFACT_NAME }}

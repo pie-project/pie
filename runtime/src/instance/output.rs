@@ -1,11 +1,14 @@
 //! Output streaming for WASM instance stdout/stderr.
 //!
-//! Provides `LogStream` — a WASI-compatible stream that routes output
-//! through the process actor via `process::stdout` / `process::stderr`.
+//! Provides `LogStream` — a WASI-compatible stream that routes output either
+//! through the process actor (`process::stdout` / `process::stderr`, read by an
+//! attached client) or to pie-server's own `tracing` log (daemon request path,
+//! which has no attached client — see `daemon::Daemon::handle_request`).
 
 use bytes::Bytes;
 use std::io;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::{Context, Poll};
 use tokio::io::AsyncWrite;
 use wasmtime_wasi::async_trait;
@@ -17,38 +20,68 @@ use crate::process;
 
 use crate::process::ProcessId;
 
-/// A WASI-compatible output stream that routes to the process actor.
+/// Where a `LogStream`'s bytes are routed.
+#[derive(Clone)]
+enum Dest {
+    /// Per-process actor channel, drained by an attached client.
+    Process(ProcessId),
+    /// pie-server's `tracing` log, tagged with the program name for triage.
+    /// Used by daemon components, which have no attached client.
+    Log(Arc<str>),
+}
+
+/// A WASI-compatible output stream that routes guest stdout/stderr.
 #[derive(Clone)]
 pub struct LogStream {
-    process_id: ProcessId,
+    dest: Dest,
     is_stderr: bool,
 }
 
 impl LogStream {
     pub fn new_stdout(process_id: ProcessId) -> Self {
-        LogStream {
-            process_id,
-            is_stderr: false,
-        }
+        LogStream { dest: Dest::Process(process_id), is_stderr: false }
     }
 
     pub fn new_stderr(process_id: ProcessId) -> Self {
-        LogStream {
-            process_id,
-            is_stderr: true,
-        }
+        LogStream { dest: Dest::Process(process_id), is_stderr: true }
     }
 
-    /// Dispatch output to the process actor.
+    pub fn new_server_stdout(program: Arc<str>) -> Self {
+        LogStream { dest: Dest::Log(program), is_stderr: false }
+    }
+
+    pub fn new_server_stderr(program: Arc<str>) -> Self {
+        LogStream { dest: Dest::Log(program), is_stderr: true }
+    }
+
+    /// Dispatch output to its destination.
     fn write_bytes(&self, bytes: &[u8]) {
         if bytes.is_empty() {
             return;
         }
-        let content = String::from_utf8_lossy(bytes).to_string();
-        if self.is_stderr {
-            process::stderr(self.process_id, content);
-        } else {
-            process::stdout(self.process_id, content);
+        match &self.dest {
+            Dest::Process(process_id) => {
+                let content = String::from_utf8_lossy(bytes).to_string();
+                if self.is_stderr {
+                    process::stderr(*process_id, content);
+                } else {
+                    process::stdout(*process_id, content);
+                }
+            }
+            Dest::Log(program) => {
+                // Strip the trailing newline so each `eprintln!`/`println!`
+                // becomes one clean tracing event rather than an empty extra line.
+                let content = String::from_utf8_lossy(bytes);
+                let text = content.trim_end_matches(['\n', '\r']);
+                if text.is_empty() {
+                    return;
+                }
+                if self.is_stderr {
+                    tracing::warn!(target: "pie::daemon::guest", program = %program, "{text}");
+                } else {
+                    tracing::info!(target: "pie::daemon::guest", program = %program, "{text}");
+                }
+            }
         }
     }
 }

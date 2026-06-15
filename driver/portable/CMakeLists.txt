@@ -83,6 +83,7 @@ add_library(pie_driver_portable_lib STATIC
   src/hf_config.cpp
   src/gguf_archive.cpp
   src/gguf_hparams.cpp
+  src/gguf_tokenizer.cpp
   src/model.cpp
   src/rust_loader.cpp
   src/kv_cache.cpp
