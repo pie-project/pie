@@ -353,7 +353,7 @@ wheels = [
 
 [[package]]
 name = "pie-client"
-version = "0.3.0"
+version = \"0.4.0\"
 source = { editable = "../../client/python" }
 dependencies = [
     { name = "blake3" },
@@ -376,7 +376,7 @@ requires-dist = [
 
 [[package]]
 name = "pie-server"
-version = "0.3.0"
+version = \"0.4.0\"
 source = { editable = "." }
 dependencies = [
     { name = "pie-client" },

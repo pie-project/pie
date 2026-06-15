@@ -1,6 +1,6 @@
 {
   "name": "@pie-project/inferlet",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "JavaScript library for writing Pie inferlets",
   "type": "module",
   "main": "dist/index.js",

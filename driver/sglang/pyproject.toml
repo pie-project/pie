@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pie-driver-sglang"
-version = "0.3.0"
+version = "0.4.0"
 description = "Pie driver — SGLang backend. Uses sglang's model definitions, attention kernels, and KV cache plumbing under pie's RPC surface."
 readme = "README.md"
 requires-python = ">=3.11,<3.13"

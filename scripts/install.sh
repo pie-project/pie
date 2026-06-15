@@ -3,10 +3,10 @@
 #
 #   curl -fsSL https://pie-project.org/install.sh | bash
 #   curl -fsSL https://pie-project.org/install.sh | PIE_FLAVOR=cuda12.8 bash
-#   curl -fsSL https://pie-project.org/install.sh | PIE_VERSION=0.3.0 bash
+#   curl -fsSL https://pie-project.org/install.sh | PIE_VERSION=0.4.0 bash
 #
 # Environment overrides:
-#   PIE_VERSION       Release tag (default: 0.3.0).
+#   PIE_VERSION       Release tag (default: 0.4.0).
 #   PIE_FLAVOR        portable | cuda{12.6,12.8,13.0}
 #                     | portable-cuda{12.6,12.8,13.0}. Auto-detected when unset.
 #   PIE_INSTALL_DIR   Install location for the `pie` binary (default: ~/.local/bin).
@@ -16,7 +16,7 @@
 set -euo pipefail
 
 PIE_REPO="${PIE_REPO:-pie-project/pie}"
-PIE_VERSION="${PIE_VERSION:-0.3.0}"
+PIE_VERSION="${PIE_VERSION:-0.4.0}"
 PIE_INSTALL_DIR="${PIE_INSTALL_DIR:-${HOME}/.local/bin}"
 PIE_DOWNLOAD_BASE="${PIE_DOWNLOAD_BASE:-https://github.com/${PIE_REPO}/releases/download/${PIE_VERSION}}"
 PIE_DETECTED_FLAVOR=""
