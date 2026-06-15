@@ -471,7 +471,12 @@ fn instrument(component_bytes: &[u8]) -> Result<(Vec<u8>, Instrumentation)> {
                                             global_count += 1;
                                         }
                                     }
-                                    Imports::Compact1 { .. } | Imports::Compact2 { .. } => todo!(),
+                                    Imports::Compact1 { .. } | Imports::Compact2 { .. } => bail!(
+                                        "snapshot instrumentation does not support compact \
+                                         wasm import sections; rebuild the inferlet with a \
+                                         wasm-tools that emits single imports, or set \
+                                         python_snapshot = false"
+                                    ),
                                 }
                             }
                             copy_module_section(section, component_bytes, &mut instrumented_module);
