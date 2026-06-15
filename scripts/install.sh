@@ -140,8 +140,8 @@ fi
 # fall back to the native linux-x64 build from the self-hosted GPU runners.
 assets_for() {
   case "$os/$arch/$1" in
-    linux/x86_64/portable)            echo "pie-x86_64-manylinux_2_28.tar.gz" ;;
-    linux/aarch64/portable)           echo "pie-aarch64-manylinux_2_28.tar.gz" ;;
+    linux/x86_64/portable)            echo "pie-x86_64-linux-vulkan.tar.gz" ;;
+    linux/aarch64/portable)           echo "pie-aarch64-linux-vulkan.tar.gz" ;;
     darwin/aarch64/portable)          echo "pie-aarch64-darwin.tar.gz" ;;
     linux/x86_64/cuda12.8 \
     | linux/x86_64/cuda13.0)

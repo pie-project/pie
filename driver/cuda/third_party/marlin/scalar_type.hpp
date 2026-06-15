@@ -7,6 +7,8 @@
 #include <cstdint>
 #include <stdexcept>
 #include <string>
+#include <tuple>
+#include <utility>
 #include <variant>
 
 #ifndef PIE_MARLIN_CHECK

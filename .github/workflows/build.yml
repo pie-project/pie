@@ -20,7 +20,7 @@ on:
         type: boolean
         default: true
       cuda:
-        description: "Build CUDA matrix on self-hosted GPU runner (cuda 12.8/13.0 × {cuda, portable-cuda})"
+        description: "Build native cuda_native on the self-hosted GPU runner (cuda 13.0, sm 80-120)"
         type: boolean
         default: true
       cuda_manylinux:
@@ -78,7 +78,8 @@ jobs:
           fi
 
   # =========================================================================
-  # Portable matrix — CPU/Metal/Vulkan plus Windows portable CUDA.
+  # Portable matrix — Linux/Windows Vulkan, macOS Metal, plus Windows
+  # portable CUDA. Runs on the larger org runners wherever they exist.
   # =========================================================================
   portable:
     if: inputs.portable
@@ -88,22 +89,29 @@ jobs:
       fail-fast: false
       matrix:
         target:
-          - label: x86_64-manylinux_2_28
-            runner: ubuntu-22.04
-            container: quay.io/pypa/manylinux_2_28_x86_64
+          # Linux portable artifacts ship the Vulkan ggml backend (works on
+          # NVIDIA/AMD/Intel GPUs). Built directly on the larger Ubuntu
+          # runners — NOT in a manylinux container — because ggml-vulkan
+          # hard-requires `glslc` (find_package(Vulkan COMPONENTS glslc)),
+          # which Rocky 8 / manylinux_2_28 doesn't package but Ubuntu 24.04+
+          # does. glibc floor is therefore the runner's Ubuntu (>= 2.39),
+          # acceptable for a GPU artifact.
+          - label: x86_64-linux-vulkan
+            runner: ubuntu-large-x64
+            container: ""
             platform: linux
             triple: x86_64-unknown-linux-gnu
             archive: tar.gz
-            backend: cpu
-            backend_env: ""
-          - label: aarch64-manylinux_2_28
-            runner: ubuntu-22.04-arm
-            container: quay.io/pypa/manylinux_2_28_aarch64
+            backend: vulkan
+            backend_env: "PIE_PORTABLE_VULKAN=1"
+          - label: aarch64-linux-vulkan
+            runner: ubuntu-large-arm64
+            container: ""
             platform: linux
             triple: aarch64-unknown-linux-gnu
             archive: tar.gz
-            backend: cpu
-            backend_env: ""
+            backend: vulkan
+            backend_env: "PIE_PORTABLE_VULKAN=1"
           - label: aarch64-darwin
             # macos-15 gets Xcode 16 with libc++ 17, which has
             # `std::atomic_ref` (C++20). macos-14's Xcode 15.4 ships
@@ -116,7 +124,7 @@ jobs:
             backend: metal
             backend_env: "PIE_PORTABLE_METAL=1"
           - label: x86_64-windows-portable-vulkan
-            runner: windows-latest
+            runner: windows-large-x64
             container: ""
             platform: windows
             triple: x86_64-pc-windows-msvc
@@ -124,18 +132,16 @@ jobs:
             backend: vulkan
             backend_env: "PIE_PORTABLE_VULKAN=1"
           - label: x86_64-windows-portable-cuda
-            runner: windows-latest
+            runner: windows-large-x64
             container: ""
             platform: windows
             triple: x86_64-pc-windows-msvc
             archive: zip
             backend: cuda
             backend_env: "PIE_PORTABLE_CUDA=1"
-            # Windows MSBuild + nvcc compiles ggml-cuda template instances
-            # very slowly on GitHub-hosted runners. Build one real+PTX arch
-            # for now; the PTX keeps the artifact forward-JIT-able on newer
-            # NVIDIA GPUs while keeping this target inside a practical CI
-            # budget.
+            # ggml-cuda compiles many template instances slowly with nvcc.
+            # Build one real+PTX arch; the PTX keeps the artifact
+            # forward-JIT-able on newer NVIDIA GPUs.
             cuda_arch: "75"
     runs-on: ${{ matrix.target.runner }}
     container: ${{ matrix.target.container || '' }}
@@ -198,6 +204,26 @@ jobs:
         with:
           targets: ${{ matrix.target.triple }}
 
+      - name: Install Vulkan toolchain + build deps (linux only)
+        if: matrix.target.platform == 'linux' && matrix.target.backend == 'vulkan'
+        shell: bash
+        run: |
+          set -euxo pipefail
+          # No manylinux container on this leg: ggml-vulkan hard-requires
+          # `glslc` (find_package(Vulkan COMPONENTS glslc REQUIRED)), which
+          # Rocky 8 / manylinux_2_28 doesn't package but Ubuntu 24.04+ does.
+          # Install the Vulkan headers/loader/compiler plus the C/C++ build
+          # toolchain that the cmake-rs driver build and openssl-sys need.
+          export DEBIAN_FRONTEND=noninteractive
+          sudo apt-get update
+          # spirv-headers provides <spirv/unified1/spirv.hpp> (namespace spv),
+          # which ggml-vulkan.cpp includes for SPIR-V reflection — not pulled
+          # in by libvulkan-dev/glslc alone.
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake ninja-build pkg-config \
+            glslc libvulkan-dev spirv-headers libssl-dev
+          glslc --version
+
       - name: Install Vulkan SDK (windows only)
         if: matrix.target.platform == 'windows' && matrix.target.backend == 'vulkan'
         uses: humbletim/install-vulkan-sdk@v1.2
@@ -239,6 +265,16 @@ jobs:
           nvcc --version
           test -n "${CUDA_PATH:-${CUDA_HOME:-}}"
 
+      - name: Set up MSVC environment (windows cuda only)
+        # ggml-cuda's enable_language(CUDA) under CMake's Visual Studio
+        # generator needs the CUDA MSBuild toolset integration, which the
+        # toolkit installer doesn't reliably register on the hosted image
+        # ("No CUDA toolset found"). We build with the Ninja generator
+        # instead (set in the cargo step); sourcing the MSVC dev environment
+        # here puts cl.exe on PATH so nvcc/CMake can use it as host compiler.
+        if: matrix.target.platform == 'windows' && matrix.target.backend == 'cuda'
+        uses: ilammy/msvc-dev-cmd@v1
+
       - name: Cache cargo
         uses: actions/cache@v4
         with:
@@ -262,22 +298,25 @@ jobs:
           if [[ "${{ matrix.target.platform }}" == "windows" ]]; then
             # ggml-vulkan nests a shader-generator CMake build under Cargo's
             # OUT_DIR, and ggml-cuda produces many long object paths. Keep the
-            # target root short enough for MSBuild's legacy 260-character path
-            # limit on Windows, and isolate backend flavors from each other.
+            # target root short enough for the legacy 260-character path limit
+            # on Windows, and isolate backend flavors from each other.
             export CARGO_TARGET_DIR="C:/t/pie-${{ matrix.target.backend }}"
-            # Keep MSBuild/ggml from saturating smaller Windows hosts.
-            export CMAKE_BUILD_PARALLEL_LEVEL=4
-          fi
-          cargo_parallel_args=""
-          if [[ "${{ matrix.target.platform }}" == "windows" ]]; then
-            cargo_parallel_args="-j 4"
+            # 32-core windows-large runner: parallelize the native ggml build
+            # fully (was capped at 4 for the old small hosted runners).
+            export CMAKE_BUILD_PARALLEL_LEVEL="$(nproc 2>/dev/null || echo 8)"
+            if [[ "${{ matrix.target.backend }}" == "cuda" ]]; then
+              # Drive nvcc via Ninja — the VS generator can't find the CUDA
+              # toolset on the hosted image. cl.exe is on PATH from the
+              # preceding msvc-dev-cmd step.
+              export CMAKE_GENERATOR=Ninja
+              ninja --version
+            fi
           fi
           # `release-min`: thin LTO, panic=abort, strip=symbols.
           # Defined in workspace Cargo.toml. Smaller + faster than
           # plain `release` (no LTO at all by default), without fat
           # LTO's many-hour link cost. Distribution profile.
           cargo build --profile release-min \
-            ${cargo_parallel_args} \
             --target ${{ matrix.target.triple }} \
             -p pie-server \
             --features driver-portable,driver-dummy
