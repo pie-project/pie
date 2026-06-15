@@ -310,6 +310,13 @@ jobs:
               # preceding msvc-dev-cmd step.
               export CMAKE_GENERATOR=Ninja
               ninja --version
+              # Git Bash ships /usr/bin/link.exe (GNU coreutils `link`), which
+              # shadows MSVC's link.exe for rustc once msvc-dev-cmd activates the
+              # MSVC env (rustc then resolves the linker via PATH and picks the
+              # GNU one -> "extra operand" link errors). Drop it so `link`
+              # resolves to MSVC's linker. (Only needed on the cuda leg, which is
+              # the only one that runs msvc-dev-cmd.)
+              rm -f /usr/bin/link /usr/bin/link.exe || true
             fi
           fi
           # `release-min`: thin LTO, panic=abort, strip=symbols.
@@ -345,7 +352,18 @@ jobs:
         shell: bash
         run: |
           set -euxo pipefail
-          gh release upload "${{ inputs.tag }}" "dist/${ARTIFACT_NAME}" --clobber --repo "${{ github.repository }}"
+          # Many matrix legs --clobber the same rolling release concurrently;
+          # GitHub's asset API intermittently 5xx/422s under that contention.
+          # Retry a few times before failing the leg.
+          for attempt in 1 2 3 4 5; do
+            if gh release upload "${{ inputs.tag }}" "dist/${ARTIFACT_NAME}" --clobber --repo "${{ github.repository }}"; then
+              exit 0
+            fi
+            echo "upload attempt ${attempt} failed; retrying in $((attempt * 10))s" >&2
+            sleep $((attempt * 10))
+          done
+          echo "upload failed after retries" >&2
+          exit 1
 
   # =========================================================================
   # CUDA matrix — runs on the project's self-hosted GPU runner.
