@@ -41,7 +41,20 @@
 #include "service/inproc_service.hpp"
 
 #include <filesystem>
+#ifdef _WIN32
+#include <process.h>
+#else
 #include <unistd.h>
+#endif
+
+// getpid() is POSIX; on MSVC the spelling is _getpid() in <process.h>.
+static inline int pie_current_pid() {
+#ifdef _WIN32
+    return ::_getpid();
+#else
+    return ::getpid();
+#endif
+}
 
 namespace {
 
@@ -296,7 +309,7 @@ int run_impl(int argc,
         const std::filesystem::path src(cfg.model.hf_path);
         if (std::filesystem::is_regular_file(src) && src.extension() == ".gguf") {
             const auto tmpdir = std::filesystem::temp_directory_path() /
-                ("pie-gguf-tokenizer-" + std::to_string(::getpid()));
+                ("pie-gguf-tokenizer-" + std::to_string(pie_current_pid()));
             std::filesystem::create_directories(tmpdir);
             pie_portable_driver::emit_tokenizer_files(src, tmpdir);
             effective_snapshot_dir = tmpdir.string();
