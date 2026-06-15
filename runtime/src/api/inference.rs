@@ -232,14 +232,23 @@ impl FutureOutput {
     fn finish_ok(&mut self, output: ForwardOutput) {
         if self.spec_tokens_for_fill.is_empty() {
             if let ForwardOutput::Tokens(tokens) = &output {
-                if tokens.len() > 1 {
+                // System speculation rides accepted draft tokens in the
+                // `tokens` array on top of the requested sampler slots, so
+                // anything *beyond* the sampler count is speculative fill
+                // that must be written into the KV. When the inferlet
+                // simply samples at several positions (e.g. cacheback
+                // verification), tokens.len() == samplers.len() and there
+                // is no fill — treating those sampler results as spec fill
+                // would over-grow the working tail past its reserved pages.
+                let n_samplers = self.samplers.len();
+                if tokens.len() > n_samplers {
                     let start = self
                         .fill_positions
                         .last()
                         .copied()
                         .map(|pos| pos + 1)
                         .unwrap_or(0);
-                    let extra = tokens.len() - 1;
+                    let extra = tokens.len() - n_samplers;
                     self.spec_tokens_for_fill
                         .extend_from_slice(&tokens[..extra]);
                     self.spec_positions_for_fill

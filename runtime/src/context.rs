@@ -1680,11 +1680,17 @@ impl ContextManager {
         let start = ctx.working_pages.len() - num_pages;
         let to_free: Vec<_> = ctx.working_pages.drain(start..).collect();
 
-        // Truncate working page tokens
-        let tokens_to_remove = num_pages * self.page_size;
-        let len = ctx.working_page_tokens.len();
-        ctx.working_page_tokens
-            .truncate(len.saturating_sub(tokens_to_remove));
+        // Drop only the token metadata that lives in the released pages.
+        // `working_page_tokens` holds *real* appended tokens only; reserved-
+        // but-unfilled pages contribute no entries. Released pages are the
+        // trailing ones, so the tokens to keep are exactly those covered by
+        // the pages still held (`working_pages.len()` after the drain). Using
+        // `num_pages * page_size` as the removal count would, for a non-page-
+        // aligned working tail, discard real tokens in a kept page.
+        let keep = ctx.working_pages.len() * self.page_size;
+        if ctx.working_page_tokens.len() > keep {
+            ctx.working_page_tokens.truncate(keep);
+        }
         ctx.driver_repaired_spec_tail = 0;
 
         if !ctx.is_off_gpu() {
