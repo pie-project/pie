@@ -121,6 +121,56 @@ Hparams parse_gguf_hparams(const GgufMeta& meta) {
         h.sliding_window = v;
     }
 
+    // ---- Qwen 3.5 / 3.6 hybrid (gated-delta-rule linear attn + GQA) -----
+    // The safetensors path fills these from config.json (hf_config.cpp);
+    // for a GGUF the same facts live under the `qwen35.*` kv namespace.
+    // Without them `model.cpp::build_qwen3_5_` throws "layer_types missing".
+    if (h.arch == PieArch::Qwen3_5) {
+        // Linear-attention dims. The GGUF `ssm.*` keys carry the same
+        // quantities the HF config exposes as `linear_*`:
+        //   group_count    -> num K heads        (ssm_n_group)
+        //   time_step_rank -> num V heads         (ssm_dt_rank)
+        //   state_size     -> K and V head dim    (ssm_d_state)
+        //   conv_kernel    -> depthwise conv width
+        // Verified against real blobs by the identity
+        //   ssm.inner_size == num_v_heads * v_head_dim
+        // (0.8B: 16*128=2048; 27B: 48*128=6144).
+        h.qwen35_linear_num_k_heads =
+            static_cast<std::int32_t>(get_num(meta, a, "ssm.group_count", 0));
+        h.qwen35_linear_num_v_heads =
+            static_cast<std::int32_t>(get_num(meta, a, "ssm.time_step_rank", 0));
+        h.qwen35_linear_k_head_dim =
+            static_cast<std::int32_t>(get_num(meta, a, "ssm.state_size", 0));
+        h.qwen35_linear_v_head_dim = h.qwen35_linear_k_head_dim;
+        h.qwen35_linear_conv_kernel =
+            static_cast<std::int32_t>(get_num(meta, a, "ssm.conv_kernel", 4));
+
+        // Per-layer attention type. The GGUF stores only the stride
+        // `full_attention_interval`; llama.cpp derives the pattern as
+        // "layer i is full attention iff (i+1) % interval == 0, else
+        // linear" (every interval-th layer, last of each group). pie
+        // encodes full='g', linear='l' in `layer_types`.
+        const std::int32_t interval = static_cast<std::int32_t>(
+            get_num(meta, a, "full_attention_interval", 4));
+        h.qwen35_full_attn_interval = interval;
+        if (interval > 0 && h.num_hidden_layers > 0) {
+            h.layer_types.assign(static_cast<std::size_t>(h.num_hidden_layers), 'l');
+            for (std::int32_t i = 0; i < h.num_hidden_layers; ++i) {
+                if (((i + 1) % interval) == 0) {
+                    h.layer_types[static_cast<std::size_t>(i)] = 'g';
+                }
+            }
+        }
+
+        // Qwen 3.5 / 3.6 full-attention layers always carry an output gate
+        // FUSED into a double-wide `q_proj` (out = 2 * n_heads * head_dim:
+        // half query, half gate), so there is no separate gate tensor in
+        // the GGUF. `graph_qwen3_5.cpp` splits it when this flag is set;
+        // leaving it false reshapes the double-wide Q to the single-width
+        // head layout and aborts (ggml_nelements mismatch).
+        h.qwen35_attn_output_gate = true;
+    }
+
     return h;
 }
 
