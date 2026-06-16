@@ -136,6 +136,85 @@ fn direct_copy_lowers_to_identity_extent_write() {
     assert_eq!(program.memory.persistent_bytes, 8);
 }
 
+// A persistent direct copy lowers to a per-buffer `ExtentWrite`, which the
+// arena-coalescing pass rewrites into an arena-addressed `BulkExtentWrite`.
+// That form is only serviceable by an executor with a flat device arena
+// (CUDA). The portable direct/cast executor is per-buffer and silently drops
+// arena writes, so the planner must NOT emit them for the portable backend —
+// every persistent write stays an `ExtentWrite`. Regression guard for the
+// portable garbage-weights bug.
+#[test]
+fn portable_backend_keeps_per_buffer_extent_writes() {
+    fn write_kinds(backend: BackendKind) -> (usize, usize, usize) {
+        let mut plan = LayoutPlan::new();
+        let runtime_decl = decl(7, "runtime.weight", &[2, 2], Encoding::Raw(DType::BF16));
+        let source_decl = decl(0, "checkpoint.weight", &[2, 2], Encoding::Raw(DType::BF16));
+        let source = plan.push(LayoutExpr::Source {
+            tensor: TensorId(6),
+            decl: source_decl,
+        });
+        let realized = plan.push(LayoutExpr::Realize {
+            input: source,
+            runtime_name: "runtime.weight".to_string(),
+            decl: runtime_decl,
+        });
+        plan.outputs.push(realized);
+
+        let metadata = CheckpointMetadata {
+            files: vec![CheckpointFile {
+                id: FileId(0),
+                path: "model.safetensors".to_string(),
+                size_bytes: 1024,
+                format: CheckpointFormat::Safetensors,
+            }],
+            tensors: vec![RawTensor {
+                id: TensorId(6),
+                name: "checkpoint.weight".to_string(),
+                file_id: FileId(0),
+                file_offset: 512,
+                span_bytes: 8,
+                shape: vec![2, 2],
+                encoding: Encoding::Raw(DType::BF16),
+                layout: Layout::dense(1),
+            }],
+        };
+
+        let program = lower_layout_plan(
+            &metadata,
+            &plan,
+            StorageTarget {
+                backend,
+                ..StorageTarget::default()
+            },
+        )
+        .unwrap();
+        let mut extent = 0;
+        let mut bulk = 0;
+        let mut slab = 0;
+        for instr in &program.instrs {
+            match instr {
+                StorageInstr::ExtentWrite { .. } => extent += 1,
+                StorageInstr::BulkExtentWrite { .. } => bulk += 1,
+                StorageInstr::SlabScatter { .. } => slab += 1,
+                _ => {}
+            }
+        }
+        (extent, bulk, slab)
+    }
+
+    // Portable: the write stays per-buffer; no arena forms are emitted.
+    let (p_extent, p_bulk, p_slab) = write_kinds(BackendKind::Portable);
+    assert_eq!(p_extent, 1, "portable must keep the per-buffer ExtentWrite");
+    assert_eq!(p_bulk, 0, "portable must not emit BulkExtentWrite");
+    assert_eq!(p_slab, 0, "portable must not emit SlabScatter");
+
+    // CUDA: the same plan IS coalesced to the arena form — proves the gate is
+    // backend-specific, not a no-op that happens to never trigger.
+    let (c_extent, c_bulk, _c_slab) = write_kinds(BackendKind::Cuda);
+    assert_eq!(c_extent, 0, "cuda coalesces the write into the arena form");
+    assert_eq!(c_bulk, 1, "cuda emits the arena BulkExtentWrite");
+}
+
 #[test]
 fn packed_quant_row_select_uses_byte_exact_offsets() {
     let mut plan = LayoutPlan::new();

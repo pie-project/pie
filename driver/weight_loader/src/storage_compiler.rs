@@ -1165,6 +1165,17 @@ fn validate_persistent_layout(program: &StorageProgram) -> Result<(), CompileErr
 }
 
 fn coalesce_persistent_arena_writes(program: &mut StorageProgram) -> Result<(), CompileError> {
+    // The persistent-arena bulk-write form (`BulkExtentWrite`) is consumed
+    // only by executors that own a flat device arena addressed by absolute
+    // offset — i.e. the CUDA storage executor. The portable direct/cast
+    // executor models each tensor as its own ggml buffer and has no arena
+    // base to write into, so it never services an arena-offset write.
+    // Coalescing for that target emits instructions its executor cannot run,
+    // silently leaving the affected weight tensors uninitialized. Keep the
+    // per-buffer `ExtentWrite`s intact for the portable backend.
+    if program.target.backend == BackendKind::Portable {
+        return Ok(());
+    }
     if program.schedule.is_empty() {
         return Ok(());
     }
@@ -1314,6 +1325,14 @@ struct SlabConfig {
 }
 
 fn build_slab_scatter_writes(program: &mut StorageProgram) -> Result<(), CompileError> {
+    // `SlabScatter` is the same persistent-arena class as `BulkExtentWrite`
+    // (scatter a coalesced source read into packed arena slots) and is only
+    // serviceable by the CUDA arena executor. The portable backend writes
+    // stacked-expert members through per-buffer copy contracts instead, so
+    // skip slab coalescing for it. See `coalesce_persistent_arena_writes`.
+    if program.target.backend == BackendKind::Portable {
+        return Ok(());
+    }
     if program.schedule.len() < 2 {
         return Ok(());
     }

@@ -814,6 +814,17 @@ public:
                     throw std::runtime_error(
                         "portable rust loader: instruction is not executable in "
                         "the portable direct/cast path");
+                // BulkExtentWrite / SlabScatter are persistent-arena forms the
+                // CUDA executor consumes; the portable direct/cast executor is
+                // per-buffer and the planner is gated not to emit them for the
+                // portable backend. The default arm below guarantees that if
+                // one ever reaches here it fails loud instead of silently
+                // leaving a destination tensor uninitialized (which surfaces
+                // as garbage weights, not an error).
+                default:
+                    throw std::runtime_error(
+                        "portable rust loader: unhandled storage instruction kind " +
+                        std::to_string(static_cast<int>(instr.kind)));
             }
         }
     }
@@ -1316,6 +1327,10 @@ const char* storage_instr_kind_name(
             return "Allocate";
         case pie_weight_loader::PieLoaderStorageInstrKind::ExtentWrite:
             return "ExtentWrite";
+        case pie_weight_loader::PieLoaderStorageInstrKind::BulkExtentWrite:
+            return "BulkExtentWrite";
+        case pie_weight_loader::PieLoaderStorageInstrKind::SlabScatter:
+            return "SlabScatter";
         case pie_weight_loader::PieLoaderStorageInstrKind::TileMap:
             return "TileMap";
         case pie_weight_loader::PieLoaderStorageInstrKind::CreateView:
