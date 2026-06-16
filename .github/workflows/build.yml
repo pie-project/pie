@@ -230,16 +230,18 @@ jobs:
         with:
           cache: true
 
-      - name: Export VULKAN_SDK (windows only)
+      - name: Verify Vulkan SDK (windows only)
         if: matrix.target.platform == 'windows' && matrix.target.backend == 'vulkan'
         shell: bash
         run: |
           set -euxo pipefail
-          # cmake-rs / build.rs read the VULKAN_SDK env var; surface jakoch's
-          # output to the environment and sanity-check the files ggml needs.
-          echo "VULKAN_SDK=${{ steps.vulkan_sdk.outputs.VULKAN_SDK }}" >> "$GITHUB_ENV"
-          test -f "${{ steps.vulkan_sdk.outputs.VULKAN_SDK }}/Include/vulkan/vulkan.h"
-          test -f "${{ steps.vulkan_sdk.outputs.VULKAN_SDK }}/Lib/vulkan-1.lib"
+          # cmake-rs / build.rs read the VULKAN_SDK env var. The jakoch action
+          # already exports it to the environment (its step *output* of the same
+          # name is empty), so just sanity-check the files ggml's vulkan backend
+          # needs against $VULKAN_SDK.
+          echo "VULKAN_SDK=$VULKAN_SDK"
+          test -f "$VULKAN_SDK/Include/vulkan/vulkan.h"
+          test -f "$VULKAN_SDK/Lib/vulkan-1.lib"
 
       - name: Install CUDA toolkit (windows portable cuda only)
         if: matrix.target.platform == 'windows' && matrix.target.backend == 'cuda'
