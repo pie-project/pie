@@ -23,24 +23,34 @@
 // driver thread. So a fatal signal delivered while executing *on the
 // driver thread* is always a real native driver fault, never a wasm trap.
 //
-// We therefore gate the diagnostic on a thread-local "this is a driver
-// thread" marker:
-//   * On a driver thread  -> emit the cause, then chain to the previously
-//     installed disposition so the process still dies with the right
-//     signal status.
-//   * On any other thread -> emit nothing and chain straight through to
-//     wasmtime's handler, so guard-page recovery (Linux) is byte-for-byte
-//     untouched.
+// We therefore gate the *diagnostic* (never the chain) on whether the
+// faulting thread could plausibly be carrying an expected wasm trap:
 //
-// Platform notes (both handled by the single mechanism above):
-//   * macOS: wasmtime uses Mach exception ports for guard pages, so a
-//     POSIX sigaction handler never even sees an expected wasm trap; the
-//     saved previous disposition for SIGSEGV/SIGBUS is just SIG_DFL.
-//   * Linux: wasmtime installs POSIX handlers. We save them and, when
-//     chaining, invoke `prev.sa_sigaction(sig, info, ctx)` with the *same*
-//     `ucontext` the kernel will use for `sigreturn`, so wasmtime's
-//     in-handler recovery (it rewrites `ctx` to resume) takes effect when
-//     our handler returns.
+//   * macOS: wasmtime uses Mach exception ports for guard pages, so an
+//     expected wasm trap is intercepted and recovered out-of-band and
+//     NEVER delivered as a BSD signal to a sigaction handler. Hence *any*
+//     signal that reaches this handler is already a genuine fatal fault —
+//     on the main driver thread, a ggml compute worker, or a Metal
+//     completion thread. We emit for all of them (the saved previous
+//     disposition is just SIG_DFL, so we restore it and re-raise to die).
+//     This is what surfaces an inference-time fault on a ggml worker
+//     thread that entry.cpp never marked.
+//   * Linux: wasmtime installs POSIX SIGSEGV/SIGBUS handlers, so an
+//     expected wasm guard-page trap DOES reach a sigaction handler on a
+//     host worker thread. There we must stay silent on any thread we did
+//     not explicitly mark, and chain straight through to wasmtime's saved
+//     handler — invoking `prev.sa_sigaction(sig, info, ctx)` with the
+//     *same* `ucontext` the kernel will `sigreturn` into, so wasmtime's
+//     in-handler recovery takes effect when we return. On Linux only the
+//     thread that called `mark_driver_thread()` emits; ggml compute
+//     workers are spawned inside ggml's default pthread pool (no pie-owned
+//     init hook), so surfacing their faults there needs a ggml
+//     worker-entry hook — deferred with the cuda/Linux follow-up.
+//
+// So the emit gate is: `t_on_driver_thread || !wasm traps can reach here`.
+// `g_wasm_traps_reach_sigaction` defaults to the platform value above and
+// is overridable so the hermetic test can exercise both regimes on one
+// host.
 //
 // Everything that runs inside the signal handler is async-signal-safe:
 // only `write(2)` of pre-sized buffers, `sigaction`, and `raise`. The
@@ -85,6 +95,20 @@ inline std::size_t g_model_len = 0;
 // load, no __tls_get_addr call).
 inline thread_local bool t_on_driver_thread = false;
 
+// Whether an expected wasm guard-page trap can be delivered to this POSIX
+// sigaction handler. False on Apple (wasmtime uses Mach exception ports),
+// so any signal reaching us is a genuine fault on any thread — including
+// unmarked ggml compute workers. True on Linux, where we must stay silent
+// on unmarked threads to avoid emitting on recoverable wasm traps. A plain
+// bool read in the handler is async-signal-safe; the test overrides it to
+// exercise both regimes on one host.
+#if defined(__APPLE__)
+inline constexpr bool kWasmTrapsReachSigactionDefault = false;
+#else
+inline constexpr bool kWasmTrapsReachSigactionDefault = true;
+#endif
+inline bool g_wasm_traps_reach_sigaction = kWasmTrapsReachSigactionDefault;
+
 // Write a string literal without strlen (async-signal-safe, length known
 // at compile time). `s` must be a char array literal.
 #define PIE_BACKSTOP_WLIT(s)                                        \
@@ -119,7 +143,10 @@ inline int fatal_index(int sig) {
 }
 
 inline void fatal_handler(int sig, siginfo_t* info, void* ctx) {
-    if (t_on_driver_thread) {
+    // Emit on a marked driver thread, or — where wasm traps cannot reach a
+    // sigaction handler (macOS Mach ports) — on any thread, since the
+    // signal is then necessarily a genuine fault (e.g. a ggml worker).
+    if (t_on_driver_thread || !g_wasm_traps_reach_sigaction) {
         // Format: "[pie-driver-<flavor>] fatal: caught <SIG> (model=<path>)"
         PIE_BACKSTOP_WLIT("[pie-driver-");
         write_buf(g_flavor, g_flavor_len);

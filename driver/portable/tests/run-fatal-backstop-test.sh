@@ -28,6 +28,10 @@ bad()  { fail=$((fail + 1)); printf 'FAIL: %s\n' "$*"; }
 
 DIAG_RE='\[pie-driver-portable\] fatal: caught'
 
+# Existing cases run under Linux semantics (wasm traps reach the handler):
+# that is the regime where the thread-local gate matters.
+export PIE_BACKSTOP_FORCE_WASM_TRAPS=1
+
 # marked: diagnostic present + terminated by the raised signal.
 test_marked() {
     local signame="$1"
@@ -95,6 +99,32 @@ test_marked_recover() {
     ok "marked_recover $signame: diagnostic emitted AND chained to prev"
 }
 
+# worker: an unmarked compute-worker thread under Apple/Mach semantics
+# (wasm traps cannot reach the handler) -> diagnostic still emitted +
+# terminated by the signal. This is the inference-time ggml-worker fault
+# F2 is about. Runs in a subshell so the FORCE override is local.
+test_worker() {
+    local signame="$1"
+    local signum; signum="$("$bin" signum "$signame")"
+    local err; err="$(mktemp)"
+    set +e
+    ( PIE_BACKSTOP_FORCE_WASM_TRAPS=0 "$bin" worker "$signame" ) 2>"$err"
+    local rc=$?
+    set -e
+    local body; body="$(cat "$err")"; rm -f "$err"
+
+    if [[ $rc -le 128 ]]; then
+        bad "worker $signame: expected death-by-signal (rc>128), got rc=$rc"; return
+    fi
+    if [[ $((rc - 128)) -ne $signum ]]; then
+        bad "worker $signame: died by $((rc - 128)), expected $signum"; return
+    fi
+    if ! grep -Eq "$DIAG_RE $signame \(model=/test/model.gguf\)" <<<"$body"; then
+        bad "worker $signame: diagnostic missing on unmarked worker (Mach): [$body]"; return
+    fi
+    ok "worker $signame: unmarked worker fault surfaced + died by $signame (rc=$rc)"
+}
+
 for s in SIGSEGV SIGBUS SIGILL SIGFPE SIGABRT; do
     test_marked "$s"
 done
@@ -103,6 +133,10 @@ done
 for s in SIGSEGV SIGBUS; do
     test_unmarked "$s"
     test_marked_recover "$s"
+done
+# Inference-time worker-thread coverage on Mach-port platforms (#691 F2).
+for s in SIGSEGV SIGBUS; do
+    test_worker "$s"
 done
 
 echo

@@ -21,7 +21,9 @@
 #include <csetjmp>
 #include <csignal>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <thread>
 
 static sigjmp_buf g_jmp;
 static volatile sig_atomic_t g_prev_ran = 0;
@@ -56,9 +58,29 @@ int main(int argc, char** argv) {
         return 64;
     }
 
+    // Force the platform regime so both can be exercised on one host:
+    //   PIE_BACKSTOP_FORCE_WASM_TRAPS=1 -> Linux semantics (wasm traps
+    //     reach the sigaction handler; unmarked threads stay silent).
+    //   PIE_BACKSTOP_FORCE_WASM_TRAPS=0 -> Apple/Mach semantics (any signal
+    //     here is a genuine fault; emit on any thread).
+    if (const char* f = std::getenv("PIE_BACKSTOP_FORCE_WASM_TRAPS")) {
+        pie_driver_backstop::g_wasm_traps_reach_sigaction = (f[0] == '1');
+    }
+
     if (std::strcmp(mode, "signum") == 0) {
         std::printf("%d\n", sig);
         return 0;
+    }
+
+    if (std::strcmp(mode, "worker") == 0) {
+        // Model an inference-time fault on a ggml compute worker: a thread
+        // that never called mark_driver_thread(). Under Apple/Mach
+        // semantics (FORCE=0) the backstop must still emit and die by the
+        // signal — the coverage F2 is about.
+        pie_driver_backstop::install("portable", "/test/model.gguf");
+        std::thread([sig] { ::raise(sig); }).join();
+        std::fprintf(stderr, "ERROR: survived raise() on worker thread\n");
+        return 1;  // unreachable: the chain to SIG_DFL must terminate us
     }
 
     if (std::strcmp(mode, "marked") == 0) {
