@@ -33,6 +33,7 @@
 #include "host_swap_pool.hpp"
 #include "config.hpp"
 #include "executor/executor.hpp"
+#include "fatal_backstop.hpp"
 #include "gguf_tokenizer.hpp"
 #include "hf_config.hpp"
 #include <pie_bridge/inproc_server.hpp>
@@ -267,6 +268,15 @@ int run_impl(int argc,
     if (!cfg.runtime.verbose) {
         ggml_log_set(quiet_ggml_log, nullptr);
     }
+
+    // Install the fatal-signal backstop before any model work so an
+    // uncatchable native fault during load (e.g. a wild read past a
+    // truncated mmap — the #688 SIGBUS) surfaces its cause to stderr
+    // instead of killing the host process silently. Marking this thread
+    // is per-thread; installing the handlers is process-once. See
+    // fatal_backstop.hpp for the wasmtime-coexistence reasoning.
+    pie_driver_backstop::mark_driver_thread();
+    pie_driver_backstop::install("portable", cfg.model.hf_path.c_str());
 
     // Informational logs go to stderr — stdout is reserved for the READY
     // handshake line consumed by the host process.
