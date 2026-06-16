@@ -16,8 +16,7 @@ We're rethinking Pie as a distributed system, with three big changes:
 - **A controller.** A new layer above the runtime that manages the driver fabric and decides where each inferlet runs.
 - **One inferlet model.** We're committing to "inferlet as a unit of inference" over "inferlet as a full agent." You can still build agents, but side effects shrink and the cross-inferlet and MCP APIs get simpler, heading toward **durable inferlets** that migrate freely across runtimes.
 
-## Planned
-
+In addition to these, we are working on the following features:
 - API for linear models
 - Diffusion model support
 - Inferlet profiler 
