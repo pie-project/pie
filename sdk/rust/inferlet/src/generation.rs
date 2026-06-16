@@ -34,6 +34,32 @@ use std::collections::VecDeque;
 
 const GENERATION_RESERVATION_WINDOW_TOKENS: u32 = 512;
 
+/// Diagnostic returned by the `collect_*` sugars when a generation step
+/// comes back with no sampled token — see [`forward_pass_starved`].
+const STARVED_MESSAGE: &str =
+    "forward_pass_starved: engine produced no tokens for a decode step \
+     (device failure, per-batch timeout, or KV eviction); generation cannot continue";
+
+/// True when a generation step came back with **no sampled token**: the
+/// host returned zero `Token` slots for a decode that had the auto-sampler
+/// attached.
+///
+/// pie's scheduler folds a forward-pass failure / per-batch timeout /
+/// mid-stream KV eviction into an empty `Output` (`Ok`, **not** `Err`).
+/// The `collect_*` loops fold that as "0 tokens accepted", which never
+/// advances `tokens_generated` and never errors — so the loop neither hits
+/// `max_tokens` nor a stop token. It spins, and the next step issues an
+/// empty-input forward pass that hangs the driver (the tree-of-thought
+/// daemon crash in #679; the same class the chat-completions loop guards
+/// against in #439). A natural stop is NOT starvation: the host still
+/// samples and returns `Token(stop)`, so a `Token` slot is present and this
+/// returns `false` (the SDK truncates that stop token out of
+/// `Output::tokens` afterward — which is why this inspects the raw slots,
+/// not `out.tokens`).
+fn forward_pass_starved(slots: &[SlotOutput]) -> bool {
+    !slots.iter().any(|s| matches!(s, SlotOutput::Token(_)))
+}
+
 // Re-export so callers don't have to pull from `context` directly.
 pub use crate::context::{Constrain, GrammarConstraint, Schema};
 
@@ -368,10 +394,16 @@ impl<'ctx> Generator<'ctx> {
     // ── Terminal sugar ─────────────────────────────────────────────────
 
     /// Run to completion; return the full token stream.
+    ///
+    /// Terminates with [`STARVED_MESSAGE`] if a forward pass comes back with
+    /// no sampled token (see [`forward_pass_starved`]).
     pub async fn collect_tokens(mut self) -> Result<Vec<u32>> {
         let mut all = Vec::new();
         while let Some(step) = self.next()? {
             let out = step.execute().await?;
+            if forward_pass_starved(&out.raw().slots) {
+                return Err(STARVED_MESSAGE.to_string());
+            }
             all.extend(out.tokens);
         }
         Ok(all)
@@ -384,6 +416,9 @@ impl<'ctx> Generator<'ctx> {
         let mut text = String::new();
         while let Some(step) = self.next()? {
             let out = step.execute().await?;
+            if forward_pass_starved(&out.raw().slots) {
+                return Err(STARVED_MESSAGE.to_string());
+            }
             match decoder.feed(&out.tokens)? {
                 chat::Event::Delta(s) => text.push_str(&s),
                 chat::Event::Done(s) => return Ok(s),
@@ -818,5 +853,42 @@ impl<'g, 'ctx> GenStep<'g, 'ctx> {
             Some(SampleHandle::new(0, 1))
         };
         Ok(crate::forward::Output::from_generator(raw, tokens, auto))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::forward_pass_starved;
+    use crate::pie::core::inference::SlotOutput;
+
+    // The starvation predicate the `collect_*` sugars use to break the
+    // hang-on-eviction loop (#679 / #439). Mirrors the chat-completions
+    // guard so the tree-of-thought generation path is protected too.
+
+    #[test]
+    fn starved_when_no_slots() {
+        // pie's scheduler hands back an empty Output (Ok, not Err) on a
+        // device failure / per-batch timeout / mid-stream KV eviction.
+        assert!(forward_pass_starved(&[]));
+    }
+
+    #[test]
+    fn not_starved_when_a_token_was_sampled() {
+        assert!(!forward_pass_starved(&[SlotOutput::Token(5)]));
+    }
+
+    #[test]
+    fn not_starved_when_a_token_rides_with_probe_slots() {
+        // A stop step still samples Token(stop) (later truncated out of
+        // Output::tokens), so a Token slot is present → not starved.
+        assert!(!forward_pass_starved(&[
+            SlotOutput::Token(2),
+            SlotOutput::Entropy(0.5),
+        ]));
+    }
+
+    #[test]
+    fn starved_when_only_non_token_slots() {
+        assert!(forward_pass_starved(&[SlotOutput::Entropy(0.5)]));
     }
 }
