@@ -221,31 +221,25 @@ jobs:
           glslc --version
 
       - name: Install Vulkan SDK (windows only)
+        id: vulkan_sdk
         if: matrix.target.platform == 'windows' && matrix.target.backend == 'vulkan'
-        uses: humbletim/install-vulkan-sdk@v1.2
+        # node24 action that installs the full SDK (headers + import libs).
+        # Replaces humbletim/install-vulkan-sdk (node20 + a transitive
+        # actions/cache@v4) which warns under the Node-20 deprecation.
+        uses: jakoch/install-vulkan-sdk-action@v1.5.5
         with:
-          version: latest
           cache: true
 
-      - name: Install Vulkan SDK development files (windows only)
+      - name: Export VULKAN_SDK (windows only)
         if: matrix.target.platform == 'windows' && matrix.target.backend == 'vulkan'
         shell: bash
         run: |
           set -euxo pipefail
-          # humbletim/install-vulkan-sdk extracts the SDK tools directly from
-          # the Windows installer, but CMake's FindVulkan also needs the
-          # headers and import library. Run the official unattended installer
-          # into the same VULKAN_SDK root and verify the files ggml needs.
-          rm -rf "$VULKAN_SDK"
-          mkdir -p "$VULKAN_SDK"
-          ./vulkan_sdk.exe \
-            --root "$VULKAN_SDK" \
-            --accept-licenses \
-            --default-answer \
-            --confirm-command install \
-            copy_only=1
-          test -f "$VULKAN_SDK/Include/vulkan/vulkan.h"
-          test -f "$VULKAN_SDK/Lib/vulkan-1.lib"
+          # cmake-rs / build.rs read the VULKAN_SDK env var; surface jakoch's
+          # output to the environment and sanity-check the files ggml needs.
+          echo "VULKAN_SDK=${{ steps.vulkan_sdk.outputs.VULKAN_SDK }}" >> "$GITHUB_ENV"
+          test -f "${{ steps.vulkan_sdk.outputs.VULKAN_SDK }}/Include/vulkan/vulkan.h"
+          test -f "${{ steps.vulkan_sdk.outputs.VULKAN_SDK }}/Lib/vulkan-1.lib"
 
       - name: Install CUDA toolkit (windows portable cuda only)
         if: matrix.target.platform == 'windows' && matrix.target.backend == 'cuda'
@@ -269,7 +263,12 @@ jobs:
         # instead (set in the cargo step); sourcing the MSVC dev environment
         # here puts cl.exe on PATH so nvcc/CMake can use it as host compiler.
         if: matrix.target.platform == 'windows' && matrix.target.backend == 'cuda'
-        uses: ilammy/msvc-dev-cmd@v1
+        # node24 equivalent of ilammy/msvc-dev-cmd (which is node20-only and
+        # warns under the Node-20 deprecation). Sets up vcvars so cl.exe is on
+        # PATH for the Ninja CUDA build.
+        uses: TheMrMilchmann/setup-msvc-dev@v4.0.0
+        with:
+          arch: x64
 
       - name: Cache cargo
         uses: actions/cache@v5
