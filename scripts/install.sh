@@ -154,25 +154,20 @@ if [ -z "${PIE_CC:-}" ]; then
   PIE_CC="${PIE_DETECTED_CC:-}"
 fi
 
-# Map (os, arch, flavor) -> one or more candidate release asset names, in
-# preference order (mirrors what .github/workflows/build.yml uploads). CUDA
-# flavors prefer the GH-hosted manylinux_2_28 build for the detected compute
-# capability (broad glibc compat, small), then fall back to the all-arch
-# native linux-x64 fatbin from the self-hosted GPU runner.
+# Map (os, arch, flavor) -> a candidate release asset name (mirrors what
+# .github/workflows/build.yml uploads). CUDA flavors select the per-compute-
+# capability build (glibc 2.28 floor) for the detected (or PIE_CC) capability.
 assets_for() {
   case "$os/$arch/$1" in
     linux/x86_64/portable)            echo "pie-x86_64-linux-vulkan.tar.gz" ;;
     linux/aarch64/portable)           echo "pie-aarch64-linux-vulkan.tar.gz" ;;
-    darwin/aarch64/portable)          echo "pie-aarch64-darwin.tar.gz" ;;
+    darwin/aarch64/portable)          echo "pie-aarch64-macos-metal.tar.gz" ;;
     linux/x86_64/cuda12.8 | linux/x86_64/cuda13.0 \
     | linux/aarch64/cuda12.8 | linux/aarch64/cuda13.0)
-      # Per-compute-capability binary first (small, arch-matched) when the CC
-      # was detected; then the all-arch fatbin fallback (self-hosted, x86_64).
+      # Per-compute-capability binary, selected from the detected (or
+      # PIE_CC-overridden) compute capability.
       if [ -n "${PIE_CC:-}" ]; then
-        echo "pie-${arch}-manylinux_2_28-${1}-sm${PIE_CC}.tar.gz"
-      fi
-      if [ "$arch" = x86_64 ]; then
-        echo "pie-x86_64-linux-${1}.tar.gz"
+        echo "pie-${arch}-linux-${1}-sm${PIE_CC}.tar.gz"
       fi
       ;;
     *) return 1 ;;
@@ -181,6 +176,16 @@ assets_for() {
 
 candidates="$(assets_for "$PIE_FLAVOR")" || err \
   "no '$PIE_FLAVOR' build for $os/$arch. Valid flavors: portable; or (Linux) cuda12.8, cuda13.0."
+
+# CUDA flavors select per-compute-capability binaries; without a CC we have
+# nothing to download. Guide the user to set PIE_CC.
+case "$PIE_FLAVOR" in
+  cuda*)
+    [ -n "${PIE_CC:-}" ] || err \
+      "CUDA flavor '${PIE_FLAVOR}' needs a GPU compute capability, but none was detected. \
+Set PIE_CC explicitly, e.g. PIE_CC=90 (H100), 100 (B200), 89 (L40/RTX40), 86 (A10), 80 (A100)."
+    ;;
+esac
 
 heading "Installing Pie"
 detail "Version:  ${PIE_VERSION}"

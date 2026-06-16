@@ -24,10 +24,9 @@ irm https://pie-project.org/install.ps1 | iex
 
 The installer downloads a release archive and installs `pie` into `~/.local/bin` on Unix or `%LOCALAPPDATA%\Pie\bin` on Windows. It picks a build for your platform automatically:
 
-- Linux x86_64 with NVIDIA driver 580 or newer: `cuda13.0`.
-- Linux x86_64 with NVIDIA driver 525 or newer: `cuda12.8`.
-- Other Linux, macOS Apple Silicon: `portable`. Runs on CPU; uses the GPU through Vulkan or Metal where available.
-- Windows: `portable-vulkan`. Runs on CPU and any Vulkan-capable GPU.
+- Linux (x86_64 or arm64) with an NVIDIA GPU: `cuda13.0` (driver 580+) or `cuda12.8` (driver 525+). The installer also reads your GPU's compute capability (`nvidia-smi`) and downloads the matching **per-compute-capability** binary — e.g. `sm90` for H100, `sm100` for B200/GB200, `sm120` for RTX 50 — so the download is small and architecture-optimal. It falls back to an all-architecture build if your exact capability isn't published.
+- Other Linux, macOS Apple Silicon: `portable`. GPU via Vulkan (Linux) or Metal (macOS), with a built-in CPU fallback.
+- Windows: `vulkan` (CPU + any Vulkan-capable GPU), or `cuda` for NVIDIA.
 
 If `pie` is not on your `PATH`, add the install directory:
 
@@ -86,29 +85,31 @@ Most users do not need anything in this section.
 
 ### Choose a build manually
 
-Override the auto-picked flavor with `PIE_FLAVOR`:
+Override the auto-picked flavor with `PIE_FLAVOR`, and (for CUDA) the compute capability with `PIE_CC`:
 
 ```bash
 curl -fsSL https://pie-project.org/install.sh | PIE_FLAVOR=portable bash
 curl -fsSL https://pie-project.org/install.sh | PIE_FLAVOR=cuda12.8 bash
+# Force a specific compute capability (e.g. on a build host without the GPU):
+curl -fsSL https://pie-project.org/install.sh | PIE_FLAVOR=cuda13.0 PIE_CC=90 bash
 ```
 
 On Windows:
 
 ```powershell
-$env:PIE_FLAVOR = "portable-cuda"; irm https://pie-project.org/install.ps1 | iex
+$env:PIE_FLAVOR = "cuda"; irm https://pie-project.org/install.ps1 | iex
 ```
 
 | Platform | Available flavors |
 |---|---|
-| Linux x86_64 | `portable`, `cuda12.8`, `cuda13.0` |
-| Linux aarch64 | `portable` |
+| Linux x86_64 | `portable`, `cuda12.8`, `cuda13.0` (per-CC: sm80/86/89/90/100/120) |
+| Linux aarch64 | `portable`, `cuda12.8`, `cuda13.0` (per-CC: sm90/100) |
 | macOS Apple Silicon | `portable` |
-| Windows x86_64 | `portable-vulkan`, `portable-cuda` |
+| Windows x86_64 | `vulkan`, `cuda` |
 
 Intel Macs are not supported.
 
-The `cuda*` flavors bundle the embedded `cuda_native` driver (the recommended CUDA path on Linux). Windows CUDA uses `portable-cuda` (the portable driver with a CUDA backend), as there is no native Windows driver.
+The Linux `cuda*` flavors bundle the embedded `cuda_native` driver (the recommended CUDA path on Linux). Windows `cuda` uses the portable driver with a CUDA backend, as there is no native Windows driver.
 
 ### Override the install directory
 
