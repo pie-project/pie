@@ -810,6 +810,19 @@ public:
                 case pie_weight_loader::PieLoaderStorageInstrKind::CreateView:
                     create_view(program, instr);
                     break;
+                case pie_weight_loader::PieLoaderStorageInstrKind::BulkExtentWrite:
+                case pie_weight_loader::PieLoaderStorageInstrKind::SlabScatter:
+                    // Arena-relative batched copies. The compiler only emits
+                    // these for backends with a single persistent device arena
+                    // (see BackendKind::uses_persistent_arena); the portable
+                    // backend uses per-tensor buffers and must never receive
+                    // them. Fail loudly rather than silently skip — an
+                    // unwritten weight buffer produces zero tensors and
+                    // gibberish output that is very hard to trace back here.
+                    throw std::runtime_error(
+                        "portable rust loader: BulkExtentWrite/SlabScatter are "
+                        "not executable on the portable per-tensor path (the "
+                        "loader must emit plain ExtentWrites for this backend)");
                 case pie_weight_loader::PieLoaderStorageInstrKind::Attach:
                     throw std::runtime_error(
                         "portable rust loader: instruction is not executable in "
@@ -1316,6 +1329,10 @@ const char* storage_instr_kind_name(
             return "Allocate";
         case pie_weight_loader::PieLoaderStorageInstrKind::ExtentWrite:
             return "ExtentWrite";
+        case pie_weight_loader::PieLoaderStorageInstrKind::BulkExtentWrite:
+            return "BulkExtentWrite";
+        case pie_weight_loader::PieLoaderStorageInstrKind::SlabScatter:
+            return "SlabScatter";
         case pie_weight_loader::PieLoaderStorageInstrKind::TileMap:
             return "TileMap";
         case pie_weight_loader::PieLoaderStorageInstrKind::CreateView:
