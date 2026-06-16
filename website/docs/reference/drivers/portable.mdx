@@ -24,7 +24,7 @@ To force the portable build:
 curl -fsSL https://pie-project.org/install.sh | PIE_FLAVOR=portable bash
 ```
 
-From source, `cargo install --path server` builds `pie` with `driver-portable` enabled by default. CUDA-capable portable release artifacts are named `portable-cuda12.6`, `portable-cuda12.8`, and `portable-cuda13.0`.
+From source, `cargo install --path server` builds `pie` with `driver-portable` enabled by default. On Linux, prefer the native `cuda_native` driver (`cuda*` artifacts) for GPU; the portable+CUDA build remains the CUDA path on Windows (`portable-cuda`).
 
 ## Configuration
 
@@ -35,10 +35,11 @@ device = ["auto"]                 # logical local replica name
 activation_dtype = "bfloat16"
 
 [model.driver.options]
+kv_cache_dtype       = "auto"
 kv_page_size         = 32
-max_num_kv_pages     = 1024
-max_batch_tokens     = 10240
-max_batch_size       = 512
+total_pages          = 1024
+max_forward_tokens   = 10240
+max_forward_requests = 512
 cpu_pages            = 0
 ready_timeout_s      = 120.0
 shutdown_timeout_s   = 5.0
@@ -48,12 +49,17 @@ shutdown_timeout_s   = 5.0
 |---|---|---|
 | `binary_path` | `""` | Accepted for older config compatibility, ignored by standalone `pie`; the driver is embedded. |
 | `kv_page_size` | `32` | KV cache page size in tokens. |
-| `max_num_kv_pages` | `1024` | KV pool size. KV memory scales linearly. |
-| `max_batch_tokens` | `10240` | Cap on tokens per fire_batch. |
-| `max_batch_size` | `512` | Cap on sequences per fire_batch. |
+| `total_pages` | `1024` | KV pool size. KV memory scales linearly. |
+| `max_forward_tokens` | `10240` | Cap on tokens per fire_batch. |
+| `max_forward_requests` | `512` | Cap on sequences per fire_batch. |
+| `kv_cache_dtype` | `"auto"` | KV cache quantization fallback format. Non-native modes keep native F16 pages and qdq newly written rows after compute: `auto`, `bf16`, `bfloat16`, `fp8_e4m3`, `fp8_e5m2`, `int8_per_token_head`, `fp8_per_token_head`, `fp4_e2m1`, or `nvfp4`. |
 | `cpu_pages` | `0` | Host-side swap pool capacity. `0` = no swap. |
 | `ready_timeout_s` | `120.0` | Seconds to wait for `READY` on stdout. |
 | `shutdown_timeout_s` | `5.0` | Seconds to wait for graceful shutdown after SIGTERM. |
+
+The portable driver reports its configured KV page count, page size, swap pool
+size, forward limits, and recurrent-state cache slots in `DriverCapabilities`
+during startup.
 
 ## Supported architectures
 
@@ -86,4 +92,6 @@ Architectures listed as **stable** have produced canonical outputs on instruct-t
 
 ## Quantization
 
-Not configurable via Pie. The portable driver loads weights at their stored dtype directly from safetensors; only `activation_dtype` (one level up under `[model.driver]`) is configurable. For weight-side quantization, use the [CUDA driver](./cuda#quantization).
+Weight quantization is not configurable via Pie. The portable driver loads weights at their stored dtype directly from safetensors; only `activation_dtype` (one level up under `[model.driver]`) is configurable. For weight-side quantization, use the [CUDA driver](./cuda#quantization).
+
+KV cache quantization is controlled separately by `kv_cache_dtype` under `[model.driver.options]`. On portable backends, non-native modes use the correctness fallback: newly written cache rows are quantized and immediately dequantized back into the native cache layout, so existing attention kernels continue to run.

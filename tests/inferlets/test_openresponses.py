@@ -107,7 +107,7 @@ async def test_openresponses(client, args):
         })
         assert resp.status_code == 200, f"response structure: status {resp.status_code}"
         body = resp.json()
-        assert body.get("type") == "response", f"type != response"
+        assert body.get("object") == "response", f"object != response"
         assert body.get("status") in ("completed", "incomplete")
         assert isinstance(body.get("output"), list) and len(body["output"]) > 0
         item = body["output"][0]

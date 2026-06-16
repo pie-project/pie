@@ -1,0 +1,17 @@
+[package]
+name = "video-qa"
+version = "0.1.0"
+description = "Video question-answering (multimodal) — sample frames of a clip and answer a question about it"
+authors = ["Pie Team"]
+
+[runtime]
+core = "^0.2.0"
+mcp = "^0.2.0"
+
+[parameters]
+video_url = {type = "string", optional = true, description = "URL of an animated GIF to ask about"}
+question = {type = "string", optional = true, description = "Question to ask about the video"}
+max_frames = {type = "int", optional = true, description = "Max frames to sample (default: 8)"}
+system = {type = "string", optional = true, description = "System prompt"}
+max_tokens = {type = "int", optional = true, description = "Max tokens to generate (default: 128)"}
+temperature = {type = "float", optional = true, description = "Sampling temperature (default: 0.7)"}

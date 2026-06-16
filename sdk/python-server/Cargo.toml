@@ -1,6 +1,6 @@
 [package]
 name = "pie-server-py"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 authors = ["In Gim <in.gim@icloud.com>"]
 description = "Python bindings for the pie engine — embed `pie serve` inside a Python script via `pie.server.Server`."

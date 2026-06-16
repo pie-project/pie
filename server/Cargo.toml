@@ -1,6 +1,6 @@
 [package]
 name = "pie-server"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 authors = ["In Gim <in.gim@icloud.com>"]
 description = "Standalone Pie server (no Python). Embeds a native driver in-process."
@@ -27,22 +27,32 @@ path = "src/main.rs"
 # kept as a compatibility no-op for older build commands; the dummy
 # Rust driver is no longer gated.
 default = ["driver-portable"]
-driver-portable = []
-driver-cuda = []
+driver-portable = ["dep:pie-weight-loader"]
+driver-cuda = ["dep:pie-weight-loader"]
 driver-dummy = []
+
+# Per-domain probe passthroughs. Each forwards to the runtime crate's
+# corresponding flag. See `pie/src/probe/` for the catalog of domains.
+profile-fire = ["pie/profile-fire"]
+profile-driver-cuda = ["pie/profile-driver-cuda"]
+profile-hot-path = ["pie/profile-hot-path"]
+profile-all = ["pie/profile-all"]
 
 [dependencies]
 # `pie` is the runtime crate. After Phase 8 deleted the legacy
 # `pie._runtime` maturin module, runtime has no `python` feature to
-# disable — pyo3 only lives in `sdk/python-rpc/` (the `pie-rpc` wheel)
-# now, not in the runtime crate itself.
+# disable — pyo3 only lives in `driver/bridge_py/` (the Rust extension
+# bundled into the `pie-driver-bridge` wheel via maturin), not in the
+# runtime crate itself.
 pie = { path = "../runtime" }
+pie-bridge = { path = "../driver/bridge" }
 anyhow = "1.0"
 rmp-serde = "1.3"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 toml = "0.9"
-tokio = { version = "1.38", features = ["full"] }
+tokio = { version = "1.52", features = ["full"] }
+mimalloc = "0.1"
 tracing = "0.1"
 # HuggingFace snapshot resolver. Same `~/.cache/huggingface/hub/` layout
 # the Python `huggingface_hub` package uses, so models downloaded by
@@ -80,6 +90,7 @@ nvml-wrapper = "0.12"
 
 # Always-linked Rust dummy driver — random tokens, no model load.
 pie-driver-dummy = { path = "../driver/dummy" }
+pie-weight-loader = { path = "../driver/weight_loader", optional = true }
 
 # Pie websocket client — used by `pie run` to drive an inferlet against
 # the engine subprocess we boot. Same crate the dummy_roundtrip example

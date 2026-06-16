@@ -4,10 +4,10 @@
 //! Delegates to the model's `Instruct` implementation.
 
 use crate::api::pie;
-use crate::instance::InstanceState;
-use crate::model::instruct::{ToolDecoder, ToolEvent};
 use crate::inference::structured::compiled_grammar::CompiledGrammar;
 use crate::inference::structured::matcher::GrammarMatcher;
+use crate::instance::InstanceState;
+use crate::model::instruct::{ToolDecoder, ToolEvent};
 use anyhow::Result;
 use wasmtime::component::Resource;
 use wasmtime_wasi::WasiView;
@@ -80,8 +80,9 @@ impl pie::instruct::tool_use::Host for InstanceState {
         let tok = model_res.model.tokenizer().clone();
         let stop_tokens = instruct.seal();
 
-        let tg = instruct.tool_call_grammar(&tools)
-            .ok_or_else(|| anyhow::anyhow!("model does not support constrained tool-call generation"))?;
+        let tg = instruct.tool_call_grammar(&tools).ok_or_else(|| {
+            anyhow::anyhow!("model does not support constrained tool-call generation")
+        })?;
 
         let compiled = CompiledGrammar::get_or_compile(&tg.source, &tg.grammar, &tok);
         let inner = GrammarMatcher::with_compiled(compiled, tok, stop_tokens, 10);

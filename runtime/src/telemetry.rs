@@ -3,13 +3,13 @@
 //! This module provides OTLP tracing and metrics export to SigNoz.
 //! Telemetry is controlled via the `[telemetry]` section in pie config.
 
+use opentelemetry::KeyValue;
 use opentelemetry::metrics::{Counter, Gauge, Histogram, Meter, MeterProvider};
 use opentelemetry::trace::TracerProvider as _;
-use opentelemetry::KeyValue;
 use opentelemetry_otlp::WithExportConfig;
 use opentelemetry_sdk::metrics::{PeriodicReader, SdkMeterProvider};
 use opentelemetry_sdk::trace::TracerProvider;
-use opentelemetry_sdk::{runtime, Resource};
+use opentelemetry_sdk::{Resource, runtime};
 use std::sync::OnceLock;
 
 /// Global metrics holder
@@ -152,7 +152,7 @@ where
     };
 
     let reader = PeriodicReader::builder(metrics_exporter, runtime::Tokio).build();
-    
+
     let meter_provider = SdkMeterProvider::builder()
         .with_resource(resource.clone())
         .with_reader(reader)

@@ -9,7 +9,7 @@ import TabItem from '@theme/TabItem';
 
 # Speculative decoding
 
-Speculative decoding accelerates autoregressive generation by drafting multiple tokens cheaply and verifying them in a single forward pass. Pie supports two paths: a runtime-driven n-gram drafter (system speculation) and an arbitrary `Speculator` you write yourself. Both are off by default; you opt in per `Generator`. Read this after [Constrained generation](./constrained).
+Speculative decoding accelerates autoregressive generation by drafting multiple tokens cheaply and verifying them in a single forward pass. Pie supports two paths: runtime-driven **system speculation** (a built-in n-gram drafter, or a model's native MTP head) and an arbitrary `Speculator` you write yourself. Both are off by default; you opt in per `Generator`. Read this after [Constrained generation](./constrained).
 
 :::note[Running on the dummy driver?]
 The dummy driver samples a fresh random token for every slot, including the verifier's, so every draft is rejected and the loop runs in 1-token-per-step fallback — no speedup is observable.
@@ -60,6 +60,23 @@ The system speculator is a runtime-managed n-gram drafter. It looks at the recen
 To run the non-speculative path (the default), simply omit the flag.
 
 `system_speculation` and a custom `speculator` (below) are mutually exclusive — passing both is an error.
+
+### Native MTP drafters
+
+Some models ship a native multi-token-prediction (MTP) head that drafts far more accurately than the n-gram drafter. When the bound model has one **and** the operator opts in, `system_speculation()` uses it automatically — the inferlet code is unchanged.
+
+Models with native MTP: **Gemma-4**, **Qwen3.5**, and **Qwen3.5-MoE**.
+
+The operator enables it in the model's `cuda_native` driver options:
+
+```toml
+[model.driver.options]
+enable_system_speculation = true   # off by default
+mtp_num_drafts = 3                 # draft tokens per step (0-32)
+# mtp_assistant_snapshot_dir = "" # optional; auto-discovered from the HF cache
+```
+
+Like all speculation, native MTP is a latency-regime win — it helps at low batch sizes and costs throughput once the GPU is compute-saturated, which is why it is off by default (matching vLLM/SGLang). See the [CUDA driver reference](../../reference/drivers/cuda) for the options.
 
 ## Custom speculators (Rust)
 

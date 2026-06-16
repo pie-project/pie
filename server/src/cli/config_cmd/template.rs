@@ -70,6 +70,14 @@ request_timeout_secs = 120
 default_endowment_pages = 64
 admission_oversubscription_factor = 4.0
 restore_pause_at_utilization = 0.85
+# Per-context depth of pass-level speculative execution. `0`
+# disables speculation entirely (every submit goes through the
+# cold path — useful for A/B benchmarking). `1` is piggyback
+# (one staged pass per real pass; the steady-state default).
+# Higher values let chain firing overlap with the inferlet's
+# WASM time, but won't help workloads where WASM ≈ 0 (e.g.
+# text completion). Range 0..=64.
+speculation_depth = 1
 "#;
 
 #[cfg(feature = "driver-portable")]
@@ -77,10 +85,12 @@ const PORTABLE_DRIVER_BLOCK: &str = r#"
 [model.driver]
 type = "portable"
 device = ["auto"]
+ipc_profile = "balanced" # "latency", "balanced", or "power"
 
 [model.driver.options]
-max_batch_tokens = 10240
-max_batch_size = 512
+max_forward_tokens = 10240
+max_forward_requests = 512
+kv_cache_dtype = "auto"
 "#;
 
 #[cfg(feature = "driver-cuda")]
@@ -90,11 +100,18 @@ type = "cuda_native"
 device = ["cuda:0"]
 tensor_parallel_size = 1
 activation_dtype = "bfloat16"
+# ipc_profile omitted: cuda_native defaults to "latency".
+# Set "power" to minimize idle CPU.
 
 [model.driver.options]
-gpu_mem_utilization = 0.85
-max_batch_tokens = 10240
-max_batch_size = 512
+gpu_mem_utilization = 0.90
+memory_profile = "auto"
+kv_cache_dtype = "auto"
+# Optional Gemma4 native MTP drafter for `.system_speculation()`.
+# If omitted, cuda_native auto-discovers a paired HF cache
+# `-assistant` checkpoint when one is available.
+# mtp_assistant_snapshot_dir = "/path/to/gemma4_assistant"
+mtp_num_drafts = 3
 "#;
 
 const DUMMY_DRIVER_BLOCK: &str = r#"
@@ -102,6 +119,7 @@ const DUMMY_DRIVER_BLOCK: &str = r#"
 type = "dummy"
 device = ["cpu"]
 activation_dtype = "bfloat16"
+ipc_profile = "balanced" # "latency", "balanced", or "power"
 
 [model.driver.options]
 vocab_size = 151936

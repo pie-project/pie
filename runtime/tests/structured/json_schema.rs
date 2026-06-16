@@ -5,7 +5,9 @@
 use std::sync::Arc;
 
 use pie::inference::structured::grammar::Grammar;
-use pie::inference::structured::json_schema::{builtin_json_grammar, json_schema_to_grammar, JsonSchemaOptions};
+use pie::inference::structured::json_schema::{
+    JsonSchemaOptions, builtin_json_grammar, json_schema_to_grammar,
+};
 use pie::inference::structured::matcher::GrammarMatcher;
 use pie::model::tokenizer::Tokenizer;
 
@@ -65,20 +67,14 @@ fn test_builtin_json_accepts_arrays() {
 
     assert!(is_grammar_accept_string_g(&g, "[]"));
     assert!(is_grammar_accept_string_g(&g, "[1, 2, 3]"));
-    assert!(is_grammar_accept_string_g(
-        &g,
-        r#"[1, "two", true, null]"#
-    ));
+    assert!(is_grammar_accept_string_g(&g, r#"[1, "two", true, null]"#));
 }
 
 #[test]
 fn test_builtin_json_nested() {
     let g = builtin_json_grammar().unwrap();
 
-    assert!(is_grammar_accept_string_g(
-        &g,
-        r#"{"a": {"b": [1, 2]}}"#
-    ));
+    assert!(is_grammar_accept_string_g(&g, r#"{"a": {"b": [1, 2]}}"#));
 }
 
 #[test]
@@ -585,7 +581,7 @@ fn test_string_format_date() {
     assert!(!is_grammar_accept_string_g(&g, r#""2024-00-01""#)); // month 00
     assert!(!is_grammar_accept_string_g(&g, r#""2024-01-32""#)); // day 32
     assert!(!is_grammar_accept_string_g(&g, r#""2024-01-00""#)); // day 00
-    assert!(!is_grammar_accept_string_g(&g, r#""24-01-01""#));   // 2-digit year
+    assert!(!is_grammar_accept_string_g(&g, r#""24-01-01""#)); // 2-digit year
     assert!(!is_grammar_accept_string_g(&g, r#""not-a-date""#));
 }
 
@@ -604,7 +600,7 @@ fn test_string_format_time() {
     // Invalid times
     assert!(!is_grammar_accept_string_g(&g, r#""24:00:00Z""#)); // hour 24
     assert!(!is_grammar_accept_string_g(&g, r#""00:60:00Z""#)); // minute 60
-    assert!(!is_grammar_accept_string_g(&g, r#""12:00:00""#));  // no timezone
+    assert!(!is_grammar_accept_string_g(&g, r#""12:00:00""#)); // no timezone
 }
 
 #[test]
@@ -613,8 +609,14 @@ fn test_string_format_datetime() {
     let g = json_schema_to_grammar(schema, &default_opts()).unwrap();
 
     assert!(is_grammar_accept_string_g(&g, r#""2024-01-15T14:30:00Z""#));
-    assert!(is_grammar_accept_string_g(&g, r#""2019-11-30T08:15:27+05:30""#));
-    assert!(is_grammar_accept_string_g(&g, r#""2021-07-04T00:00:00.123456Z""#));
+    assert!(is_grammar_accept_string_g(
+        &g,
+        r#""2019-11-30T08:15:27+05:30""#
+    ));
+    assert!(is_grammar_accept_string_g(
+        &g,
+        r#""2021-07-04T00:00:00.123456Z""#
+    ));
     // Invalid
     assert!(!is_grammar_accept_string_g(&g, r#""2024-13-01T00:00:00Z""#)); // month 13
     assert!(!is_grammar_accept_string_g(&g, r#""2024-01-15T24:00:00Z""#)); // hour 24
@@ -630,8 +632,8 @@ fn test_string_format_email() {
     assert!(is_grammar_accept_string_g(&g, r#""x@y.z""#));
     assert!(is_grammar_accept_string_g(&g, r#""test+tag@gmail.com""#));
     // Invalid
-    assert!(!is_grammar_accept_string_g(&g, r#""invalid.email""#));     // no @
-    assert!(!is_grammar_accept_string_g(&g, r#""@example.com""#));      // no local part
+    assert!(!is_grammar_accept_string_g(&g, r#""invalid.email""#)); // no @
+    assert!(!is_grammar_accept_string_g(&g, r#""@example.com""#)); // no local part
 }
 
 #[test]
@@ -639,11 +641,20 @@ fn test_string_format_uuid() {
     let schema = r#"{"type": "string", "format": "uuid"}"#;
     let g = json_schema_to_grammar(schema, &default_opts()).unwrap();
 
-    assert!(is_grammar_accept_string_g(&g, r#""550e8400-e29b-41d4-a716-446655440000""#));
-    assert!(is_grammar_accept_string_g(&g, r#""123e4567-e89b-12d3-a456-426614174000""#));
+    assert!(is_grammar_accept_string_g(
+        &g,
+        r#""550e8400-e29b-41d4-a716-446655440000""#
+    ));
+    assert!(is_grammar_accept_string_g(
+        &g,
+        r#""123e4567-e89b-12d3-a456-426614174000""#
+    ));
     // Invalid
     assert!(!is_grammar_accept_string_g(&g, r#""not-a-uuid""#));
-    assert!(!is_grammar_accept_string_g(&g, r#""550e8400e29b41d4a716446655440000""#)); // no dashes
+    assert!(!is_grammar_accept_string_g(
+        &g,
+        r#""550e8400e29b41d4a716446655440000""#
+    )); // no dashes
 }
 
 #[test]
@@ -681,7 +692,7 @@ fn test_array_prefix_items_tuple_exact() {
     let g = json_schema_to_grammar(schema, &default_opts()).unwrap();
 
     assert!(is_grammar_accept_string_g(&g, r#"["hello",42]"#));
-    assert!(!is_grammar_accept_string_g(&g, r#"["hello"]"#));           // too few
+    assert!(!is_grammar_accept_string_g(&g, r#"["hello"]"#)); // too few
     assert!(!is_grammar_accept_string_g(&g, r#"["hello",42,"extra"]"#)); // too many
 }
 
@@ -712,11 +723,11 @@ fn test_array_prefix_items_with_min_max() {
     }"#;
     let g = json_schema_to_grammar(schema, &default_opts()).unwrap();
 
-    assert!(!is_grammar_accept_string_g(&g, r#"["hello"]"#));            // below minItems
-    assert!(is_grammar_accept_string_g(&g, r#"["hello",1]"#));           // 2 items
-    assert!(is_grammar_accept_string_g(&g, r#"["hello",1,2]"#));         // 3 items
-    assert!(is_grammar_accept_string_g(&g, r#"["hello",1,2,3]"#));       // 4 items (max)
-    assert!(!is_grammar_accept_string_g(&g, r#"["hello",1,2,3,4]"#));    // above maxItems
+    assert!(!is_grammar_accept_string_g(&g, r#"["hello"]"#)); // below minItems
+    assert!(is_grammar_accept_string_g(&g, r#"["hello",1]"#)); // 2 items
+    assert!(is_grammar_accept_string_g(&g, r#"["hello",1,2]"#)); // 3 items
+    assert!(is_grammar_accept_string_g(&g, r#"["hello",1,2,3]"#)); // 4 items (max)
+    assert!(!is_grammar_accept_string_g(&g, r#"["hello",1,2,3,4]"#)); // above maxItems
 }
 
 #[test]
@@ -734,8 +745,8 @@ fn test_array_prefix_items_no_additional() {
     let g = json_schema_to_grammar(schema, &default_opts()).unwrap();
 
     assert!(is_grammar_accept_string_g(&g, r#"[true,"hello",42]"#));
-    assert!(!is_grammar_accept_string_g(&g, r#"[true,"hello"]"#));       // too few
-    assert!(!is_grammar_accept_string_g(&g, r#"[true,"hello",42,1]"#));  // too many
+    assert!(!is_grammar_accept_string_g(&g, r#"[true,"hello"]"#)); // too few
+    assert!(!is_grammar_accept_string_g(&g, r#"[true,"hello",42,1]"#)); // too many
 }
 
 #[test]
@@ -765,7 +776,11 @@ fn test_array_prefix_items_nested_objects() {
 #[test]
 fn test_object_additional_properties_string_schema() {
     let schema = r#"{"type": "object", "additionalProperties": {"type": "string"}}"#;
-    let opts = JsonSchemaOptions { strict_mode: false, any_whitespace: false, ..Default::default() };
+    let opts = JsonSchemaOptions {
+        strict_mode: false,
+        any_whitespace: false,
+        ..Default::default()
+    };
     let g = json_schema_to_grammar(schema, &opts).unwrap();
 
     assert!(is_grammar_accept_string_g(&g, r#"{}"#));
@@ -778,7 +793,11 @@ fn test_object_additional_properties_string_schema() {
 #[test]
 fn test_object_additional_properties_integer_schema() {
     let schema = r#"{"type": "object", "additionalProperties": {"type": "integer"}}"#;
-    let opts = JsonSchemaOptions { strict_mode: false, any_whitespace: false, ..Default::default() };
+    let opts = JsonSchemaOptions {
+        strict_mode: false,
+        any_whitespace: false,
+        ..Default::default()
+    };
     let g = json_schema_to_grammar(schema, &opts).unwrap();
 
     assert!(is_grammar_accept_string_g(&g, r#"{}"#));
@@ -794,19 +813,32 @@ fn test_object_required_props_with_additional_schema() {
         "required": ["name"],
         "additionalProperties": {"type": "integer"}
     }"#;
-    let opts = JsonSchemaOptions { any_whitespace: false, ..Default::default() };
+    let opts = JsonSchemaOptions {
+        any_whitespace: false,
+        ..Default::default()
+    };
     let g = json_schema_to_grammar(schema, &opts).unwrap();
 
     assert!(is_grammar_accept_string_g(&g, r#"{"name":"John"}"#));
-    assert!(is_grammar_accept_string_g(&g, r#"{"name":"John","age":30}"#));
-    assert!(is_grammar_accept_string_g(&g, r#"{"name":"John","age":30,"score":100}"#));
+    assert!(is_grammar_accept_string_g(
+        &g,
+        r#"{"name":"John","age":30}"#
+    ));
+    assert!(is_grammar_accept_string_g(
+        &g,
+        r#"{"name":"John","age":30,"score":100}"#
+    ));
 }
 
 #[test]
 fn test_object_additional_properties_boolean_true() {
     // additionalProperties: true should allow any value
     let schema = r#"{"type": "object", "additionalProperties": true}"#;
-    let opts = JsonSchemaOptions { strict_mode: false, any_whitespace: false, ..Default::default() };
+    let opts = JsonSchemaOptions {
+        strict_mode: false,
+        any_whitespace: false,
+        ..Default::default()
+    };
     let g = json_schema_to_grammar(schema, &opts).unwrap();
 
     assert!(is_grammar_accept_string_g(&g, r#"{}"#));
@@ -823,11 +855,17 @@ fn test_object_additional_properties_boolean_false() {
         "required": ["name"],
         "additionalProperties": false
     }"#;
-    let opts = JsonSchemaOptions { any_whitespace: false, ..Default::default() };
+    let opts = JsonSchemaOptions {
+        any_whitespace: false,
+        ..Default::default()
+    };
     let g = json_schema_to_grammar(schema, &opts).unwrap();
 
     assert!(is_grammar_accept_string_g(&g, r#"{"name":"John"}"#));
-    assert!(!is_grammar_accept_string_g(&g, r#"{"name":"John","extra":1}"#));
+    assert!(!is_grammar_accept_string_g(
+        &g,
+        r#"{"name":"John","extra":1}"#
+    ));
 }
 
 // ---------------------------------------------------------------------------
@@ -838,7 +876,11 @@ fn test_object_additional_properties_boolean_false() {
 fn test_object_max_properties_zero() {
     // maxProperties: 0 → only empty object allowed
     let schema = r#"{"type": "object", "maxProperties": 0, "additionalProperties": true}"#;
-    let opts = JsonSchemaOptions { strict_mode: false, any_whitespace: false, ..Default::default() };
+    let opts = JsonSchemaOptions {
+        strict_mode: false,
+        any_whitespace: false,
+        ..Default::default()
+    };
     let g = json_schema_to_grammar(schema, &opts).unwrap();
 
     assert!(is_grammar_accept_string_g(&g, r#"{}"#));
@@ -849,20 +891,31 @@ fn test_object_max_properties_zero() {
 fn test_object_max_properties_limit() {
     // maxProperties: 2 → accept up to 2 properties
     let schema = r#"{"type": "object", "maxProperties": 2, "additionalProperties": true}"#;
-    let opts = JsonSchemaOptions { strict_mode: false, any_whitespace: false, ..Default::default() };
+    let opts = JsonSchemaOptions {
+        strict_mode: false,
+        any_whitespace: false,
+        ..Default::default()
+    };
     let g = json_schema_to_grammar(schema, &opts).unwrap();
 
     assert!(is_grammar_accept_string_g(&g, r#"{}"#));
     assert!(is_grammar_accept_string_g(&g, r#"{"a":"b"}"#));
     assert!(is_grammar_accept_string_g(&g, r#"{"a":"b","c":"d"}"#));
-    assert!(!is_grammar_accept_string_g(&g, r#"{"a":"b","c":"d","e":"f"}"#));
+    assert!(!is_grammar_accept_string_g(
+        &g,
+        r#"{"a":"b","c":"d","e":"f"}"#
+    ));
 }
 
 #[test]
 fn test_object_min_properties() {
     // minProperties: 1 → reject empty objects
     let schema = r#"{"type": "object", "minProperties": 1, "additionalProperties": true}"#;
-    let opts = JsonSchemaOptions { strict_mode: false, any_whitespace: false, ..Default::default() };
+    let opts = JsonSchemaOptions {
+        strict_mode: false,
+        any_whitespace: false,
+        ..Default::default()
+    };
     let g = json_schema_to_grammar(schema, &opts).unwrap();
 
     assert!(!is_grammar_accept_string_g(&g, r#"{}"#));
@@ -874,14 +927,24 @@ fn test_object_min_properties() {
 fn test_object_min_max_properties() {
     // minProperties: 2, maxProperties: 3
     let schema = r#"{"type": "object", "minProperties": 2, "maxProperties": 3, "additionalProperties": true}"#;
-    let opts = JsonSchemaOptions { strict_mode: false, any_whitespace: false, ..Default::default() };
+    let opts = JsonSchemaOptions {
+        strict_mode: false,
+        any_whitespace: false,
+        ..Default::default()
+    };
     let g = json_schema_to_grammar(schema, &opts).unwrap();
 
     assert!(!is_grammar_accept_string_g(&g, r#"{}"#));
     assert!(!is_grammar_accept_string_g(&g, r#"{"a":"b"}"#));
     assert!(is_grammar_accept_string_g(&g, r#"{"a":"b","c":"d"}"#));
-    assert!(is_grammar_accept_string_g(&g, r#"{"a":"b","c":"d","e":"f"}"#));
-    assert!(!is_grammar_accept_string_g(&g, r#"{"a":"b","c":"d","e":"f","g":"h"}"#));
+    assert!(is_grammar_accept_string_g(
+        &g,
+        r#"{"a":"b","c":"d","e":"f"}"#
+    ));
+    assert!(!is_grammar_accept_string_g(
+        &g,
+        r#"{"a":"b","c":"d","e":"f","g":"h"}"#
+    ));
 }
 
 #[test]
@@ -894,19 +957,35 @@ fn test_object_required_props_with_max_properties() {
         "additionalProperties": true,
         "maxProperties": 3
     }"#;
-    let opts = JsonSchemaOptions { any_whitespace: false, ..Default::default() };
+    let opts = JsonSchemaOptions {
+        any_whitespace: false,
+        ..Default::default()
+    };
     let g = json_schema_to_grammar(schema, &opts).unwrap();
 
-    assert!(is_grammar_accept_string_g(&g, r#"{"name":"John","age":30}"#));
-    assert!(is_grammar_accept_string_g(&g, r#"{"name":"John","age":30,"extra":"val"}"#));
-    assert!(!is_grammar_accept_string_g(&g, r#"{"name":"John","age":30,"a":"b","c":"d"}"#));
+    assert!(is_grammar_accept_string_g(
+        &g,
+        r#"{"name":"John","age":30}"#
+    ));
+    assert!(is_grammar_accept_string_g(
+        &g,
+        r#"{"name":"John","age":30,"extra":"val"}"#
+    ));
+    assert!(!is_grammar_accept_string_g(
+        &g,
+        r#"{"name":"John","age":30,"a":"b","c":"d"}"#
+    ));
 }
 
 #[test]
 fn test_object_min_properties_exactly_one() {
     // minProperties: 1, maxProperties: 1 → exactly one property
     let schema = r#"{"type": "object", "minProperties": 1, "maxProperties": 1, "additionalProperties": true}"#;
-    let opts = JsonSchemaOptions { strict_mode: false, any_whitespace: false, ..Default::default() };
+    let opts = JsonSchemaOptions {
+        strict_mode: false,
+        any_whitespace: false,
+        ..Default::default()
+    };
     let g = json_schema_to_grammar(schema, &opts).unwrap();
 
     assert!(!is_grammar_accept_string_g(&g, r#"{}"#));
@@ -918,7 +997,11 @@ fn test_object_min_properties_exactly_one() {
 fn test_object_min_properties_type_inference() {
     // Schema with minProperties but no explicit type should infer object
     let schema = r#"{"minProperties": 1, "additionalProperties": true}"#;
-    let opts = JsonSchemaOptions { strict_mode: false, any_whitespace: false, ..Default::default() };
+    let opts = JsonSchemaOptions {
+        strict_mode: false,
+        any_whitespace: false,
+        ..Default::default()
+    };
     let g = json_schema_to_grammar(schema, &opts).unwrap();
 
     assert!(!is_grammar_accept_string_g(&g, r#"{}"#));
@@ -929,11 +1012,19 @@ fn test_object_min_properties_type_inference() {
 fn test_object_min_gt_max_properties_error() {
     // minProperties > maxProperties → should error
     let schema = r#"{"type": "object", "minProperties": 5, "maxProperties": 2}"#;
-    let opts = JsonSchemaOptions { strict_mode: false, any_whitespace: false, ..Default::default() };
+    let opts = JsonSchemaOptions {
+        strict_mode: false,
+        any_whitespace: false,
+        ..Default::default()
+    };
     let result = json_schema_to_grammar(schema, &opts);
     assert!(result.is_err());
     let msg = result.unwrap_err().to_string();
-    assert!(msg.contains("minProperties") && msg.contains("maxProperties"), "unexpected error: {}", msg);
+    assert!(
+        msg.contains("minProperties") && msg.contains("maxProperties"),
+        "unexpected error: {}",
+        msg
+    );
 }
 
 #[test]
@@ -945,9 +1036,16 @@ fn test_object_required_exceeds_max_properties_error() {
         "required": ["a", "b", "c"],
         "maxProperties": 2
     }"#;
-    let opts = JsonSchemaOptions { any_whitespace: false, ..Default::default() };
+    let opts = JsonSchemaOptions {
+        any_whitespace: false,
+        ..Default::default()
+    };
     let result = json_schema_to_grammar(schema, &opts);
     assert!(result.is_err());
     let msg = result.unwrap_err().to_string();
-    assert!(msg.contains("required") && msg.contains("maxProperties"), "unexpected error: {}", msg);
+    assert!(
+        msg.contains("required") && msg.contains("maxProperties"),
+        "unexpected error: {}",
+        msg
+    );
 }

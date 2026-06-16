@@ -83,15 +83,9 @@ fn test_json_boolean_null() {
 
 #[test]
 fn test_json_string_escapes() {
-    assert!(is_grammar_accept_string(
-        JSON_GRAMMAR,
-        r#""hello\nworld""#
-    ));
+    assert!(is_grammar_accept_string(JSON_GRAMMAR, r#""hello\nworld""#));
     assert!(is_grammar_accept_string(JSON_GRAMMAR, r#""tab\there""#));
-    assert!(is_grammar_accept_string(
-        JSON_GRAMMAR,
-        r#""unicode\u0041""#
-    ));
+    assert!(is_grammar_accept_string(JSON_GRAMMAR, r#""unicode\u0041""#));
 }
 
 #[test]
@@ -195,18 +189,10 @@ fn test_right_recursion() {
     let reject = ["", "1", "a1", "ab1", "abc1"];
 
     for s in &accept {
-        assert!(
-            is_grammar_accept_string_g(&g, s),
-            "should accept {:?}",
-            s
-        );
+        assert!(is_grammar_accept_string_g(&g, s), "should accept {:?}", s);
     }
     for s in &reject {
-        assert!(
-            !is_grammar_accept_string_g(&g, s),
-            "should reject {:?}",
-            s
-        );
+        assert!(!is_grammar_accept_string_g(&g, s), "should reject {:?}", s);
     }
 }
 
@@ -222,18 +208,10 @@ fn test_balanced_braces() {
     let reject = ["{", "{}{}", "{{{{}", "{{}}}", "{{{{{}}}}}}"];
 
     for s in &accept {
-        assert!(
-            is_grammar_accept_string_g(&g, s),
-            "should accept {:?}",
-            s
-        );
+        assert!(is_grammar_accept_string_g(&g, s), "should accept {:?}", s);
     }
     for s in &reject {
-        assert!(
-            !is_grammar_accept_string_g(&g, s),
-            "should reject {:?}",
-            s
-        );
+        assert!(!is_grammar_accept_string_g(&g, s), "should reject {:?}", s);
     }
 }
 
@@ -419,10 +397,7 @@ fn test_single_utf8_char_class() {
     let g = Grammar::from_ebnf(&grammar, "root").unwrap();
 
     assert!(is_grammar_accept_string_g(&g, "\u{0430}")); // а
-    assert!(is_grammar_accept_string_g(
-        &g,
-        "\u{0430}\u{0430}\u{0430}"
-    )); // ааа
+    assert!(is_grammar_accept_string_g(&g, "\u{0430}\u{0430}\u{0430}")); // ааа
     assert!(!is_grammar_accept_string_g(&g, "\u{0431}")); // б
     assert!(!is_grammar_accept_string_g(&g, "a")); // ASCII 'a' != Cyrillic 'а'
 
@@ -686,9 +661,9 @@ rule ::= ("a" | [bc] {4,}) | ""
     assert!(is_grammar_accept_string_g(&g, "bcbcbcbcbc"));
     assert!(is_grammar_accept_string_g(&g, "bcbcbcbcbcbcbcb"));
     assert!(!is_grammar_accept_string_g(&g, "aaaa")); // 4 non-empty > max 3
-    assert!(is_grammar_accept_string_g(&g, ""));       // all empty
-    assert!(is_grammar_accept_string_g(&g, "a"));      // 1 non-empty + empties
-    assert!(is_grammar_accept_string_g(&g, "d"));       // all empty + "d"?
+    assert!(is_grammar_accept_string_g(&g, "")); // all empty
+    assert!(is_grammar_accept_string_g(&g, "a")); // 1 non-empty + empties
+    assert!(is_grammar_accept_string_g(&g, "d")); // all empty + "d"?
 }
 
 // ---------------------------------------------------------------------------
@@ -727,10 +702,10 @@ fn test_json_refuse_invalid() {
     let g = Grammar::from_ebnf(JSON_GRAMMAR, "root").unwrap();
 
     let cases = [
-        r#"{ name: "John" }"#,                    // unquoted key
-        r#"{ "name": "John", "age": 30, }"#,      // trailing comma
-        r#"{ "name": "John", "age": 30.5.7 }"#,   // invalid number
-        r#"{ "name": "John, "age": 30 }"#,         // unclosed string
+        r#"{ name: "John" }"#,                  // unquoted key
+        r#"{ "name": "John", "age": 30, }"#,    // trailing comma
+        r#"{ "name": "John", "age": 30.5.7 }"#, // invalid number
+        r#"{ "name": "John, "age": 30 }"#,      // unclosed string
     ];
 
     for case in &cases {
@@ -795,8 +770,5 @@ ws ::= [ \n\t]*
     let g = Grammar::from_ebnf(grammar, "basic_string").unwrap();
     assert!(is_grammar_accept_string_g(&g, r#""abc\r\n""#));
     // An object should not match basic_string
-    assert!(!is_grammar_accept_string_g(
-        &g,
-        r#"{"name": "John" }"#
-    ));
+    assert!(!is_grammar_accept_string_g(&g, r#"{"name": "John" }"#));
 }

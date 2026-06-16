@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <iostream>
 #include <stdexcept>
@@ -10,9 +11,11 @@
 #include <thread>
 
 #include <ggml-cpu.h>
+#include <pie_driver_common/tensor_names.hpp>
 
 #include "gguf_archive.hpp"
 #include "gguf_hparams.hpp"
+#include "rust_loader.hpp"
 
 namespace pie_portable_driver {
 
@@ -51,12 +54,8 @@ bool is_small_weight_for_upcast(const std::string& hf_name) {
     //   `*.bias`       — any attention / projection bias
     static constexpr std::string_view kNormSuffix = "norm.weight";
     static constexpr std::string_view kBiasSuffix = ".bias";
-    auto ends_with = [&](std::string_view suf) {
-        return hf_name.size() >= suf.size() &&
-               hf_name.compare(hf_name.size() - suf.size(),
-                               suf.size(), suf) == 0;
-    };
-    return ends_with(kNormSuffix) || ends_with(kBiasSuffix);
+    return pie_driver_common::ends_with(hf_name, kNormSuffix) ||
+           pie_driver_common::ends_with(hf_name, kBiasSuffix);
 }
 
 ggml_type st_to_ggml_dtype(StDtype dt, const std::string& tensor_name) {
@@ -221,14 +220,23 @@ Model::Model(const std::filesystem::path& snapshot_dir,
         throw std::runtime_error("model: backend init failed");
     }
 
-    // Pin the CPU backend to all available HW threads. ggml's default is
-    // 4 (sometimes 1 depending on backend init path), which leaves a
-    // 13900K idling. The static-lib build path in particular gets
-    // initialized from a Rust-spawned thread that may not inherit the
-    // process-level OpenMP affinity, so be explicit.
+    // Pin the CPU backend to a reasonable number of HW threads. ggml's
+    // default is 4 (sometimes 1 depending on backend init path), which
+    // leaves a 13900K idling. The static-lib build path in particular
+    // gets initialized from a Rust-spawned thread that may not inherit
+    // the process-level OpenMP affinity, so be explicit. Cap at 32 —
+    // beyond that ggml's per-op fork/join sync overhead dominates and
+    // throughput drops (observed on a 255-logical-CPU EPYC). Respect
+    // GGML_N_THREADS env override when the user wants something else.
     auto pin_cpu_threads = [](ggml_backend_t b) {
-        unsigned n = std::thread::hardware_concurrency();
-        if (n == 0) n = 4;
+        unsigned n = 0;
+        if (const char* env = std::getenv("GGML_N_THREADS")) {
+            n = std::strtoul(env, nullptr, 10);
+        }
+        if (n == 0) {
+            const unsigned hw = std::thread::hardware_concurrency();
+            n = hw == 0 ? 4 : std::min<unsigned>(hw, 32);
+        }
         ggml_backend_cpu_set_n_threads(b, static_cast<int>(n));
         return n;
     };
@@ -240,7 +248,7 @@ Model::Model(const std::filesystem::path& snapshot_dir,
         }
     } else {
         // Primary is a GPU backend. Set up a CPU companion so the
-        // ForwardEngine's `ggml_backend_sched` has somewhere to route
+        // Executor's `ggml_backend_sched` has somewhere to route
         // ops the GPU can't handle. Cost is minimal: the CPU backend
         // doesn't allocate anything until sched actually splits work
         // to it. With Part A's norm-weight upcast, the steady-state
@@ -266,7 +274,7 @@ Model::Model(const std::filesystem::path& snapshot_dir,
         // Probe: can the primary backend run argsort on a vocab-sized
         // input? ggml-vulkan caps at 1024 cols (max_argsort_cols), so
         // Qwen3 (152k vocab) etc. fail. When this returns false the
-        // ForwardEngine forces the `slow_only` sampling path: download
+        // Executor forces the `slow_only` sampling path: download
         // raw logits, sample host-side, no in-graph `ggml_top_k`. This
         // keeps Vulkan steady-state decode at GPU speed instead of
         // round-tripping each token through CPU for the argsort.
@@ -402,6 +410,9 @@ Model::Model(const std::filesystem::path& snapshot_dir,
             case PieArch::Qwen3_5:
                 build_qwen3_5_();
                 break;
+            case PieArch::GlmMoeDsa:
+                build_glm_moe_dsa_();
+                break;
             default:
                 throw std::runtime_error(
                     "model: arch '" + std::string(pie_arch_name(hparams_.arch)) +
@@ -438,13 +449,7 @@ Model::~Model() {
 }
 
 std::string Model::tname_(const std::string& name) const {
-    if (tensor_prefix_.empty()) return name;
-    constexpr std::string_view kModelPrefix = "model.";
-    if (name.size() >= kModelPrefix.size() &&
-        std::string_view(name).substr(0, kModelPrefix.size()) == kModelPrefix) {
-        return tensor_prefix_ + std::string(name.substr(kModelPrefix.size()));
-    }
-    return tensor_prefix_ + name;
+    return pie_driver_common::apply_tensor_prefix(name, tensor_prefix_);
 }
 
 void Model::resolve_tensor_prefix_() {
@@ -493,26 +498,26 @@ ggml_tensor* Model::declare_(const std::string& hf_name) {
     // Norm-style weights stored in bf16 get promoted to f32 here. The
     // tensor we hand back to the graph builder is typed F32, so the
     // implicit `ggml_cast` in `norm_scale` becomes a no-op. The actual
-    // bf16 → f32 byte conversion happens in load_into_backend_().
-    //
-    // GGUF tensors carry their ggml type in `ggml_type_override` and
-    // leave `dtype` as a placeholder F32 (see gguf_archive). The cast
-    // logic below is keyed off `dtype` and would mistrigger on every
-    // GGUF tensor, so we only apply it on the safetensors path.
-    const bool is_safetensors = t.ggml_type_override < 0;
-    const bool upcast = is_safetensors
+    // bf16 -> f32 byte conversion is a Rust storage-program TileMap.
+    const bool gguf_typed = t.ggml_type_override >= 0;
+    const bool upcast = !gguf_typed
                      && t.dtype == StDtype::BF16
                      && is_small_weight_for_upcast(hf_name);
     // Some HF releases (notably Gemma-2-2b) store weights as F32. The F32
     // mul_mat path is ~2x slower than BF16 on tensor-core hardware and
     // doubles VRAM. Downcast large matmul weights at load time, matching
     // llama.cpp's GGUF default. Norms / biases stay F32 (precision).
-    const bool downcast = is_safetensors
+    const bool downcast = !gguf_typed
                        && t.dtype == StDtype::F32
                        && !is_small_weight_for_upcast(hf_name);
+    const bool fp8_decode = !gguf_typed && t.dtype == StDtype::F8_E4M3;
+    if (!gguf_typed && t.dtype == StDtype::F8_E5M2) {
+        throw std::runtime_error(
+            "model: FP8_E5M2 safetensors are not supported for '" + hf_name + "'");
+    }
 
     ggml_tensor* tensor;
-    if (upcast || downcast) {
+    if (upcast || downcast || fp8_decode) {
         // Build the target tensor manually with the same shape as the
         // safetensor (HF dim order reversed for ggml). Type differs
         // from the source.
@@ -525,7 +530,7 @@ ggml_tensor* Model::declare_(const std::string& hf_name) {
         if (!tensor) {
             throw std::runtime_error(
                 std::string("model: ggml_new_tensor_4d (")
-                + (upcast ? "upcast" : "downcast")
+                + (upcast ? "upcast" : (fp8_decode ? "fp8-decode" : "downcast"))
                 + ") failed for '" + hf_name + "'");
         }
         ggml_set_name(tensor, hf_name.c_str());
@@ -538,6 +543,16 @@ ggml_tensor* Model::declare_(const std::string& hf_name) {
     d.tensor               = tensor;
     d.upcast_bf16_to_f32   = upcast;
     d.downcast_f32_to_bf16 = downcast;
+    d.decode_fp8_to_bf16   = fp8_decode;
+    if (fp8_decode) {
+        const std::string scale_inv = hf_name + "_scale_inv";
+        const std::string scale = hf_name + "_scale";
+        if (archive_->find(scale_inv) != nullptr) {
+            d.fp8_scale_hf_name = scale_inv;
+        } else if (archive_->find(scale) != nullptr) {
+            d.fp8_scale_hf_name = scale;
+        }
+    }
     declared_.push_back(std::move(d));
     return tensor;
 }
@@ -616,63 +631,7 @@ void Model::load_into_backend_() {
             "model: ggml_backend_alloc_ctx_tensors failed (out of memory?)");
     }
 
-    for (const auto& d : declared_) {
-        const auto& src = archive_->at(d.hf_name);
-        if (d.upcast_bf16_to_f32) {
-            // Promote bf16 source bytes to f32 in a temp buffer, then
-            // upload. ggml provides `ggml_bf16_to_fp32_row` for this.
-            // Norm weights are small enough that the temp allocation
-            // is irrelevant (a few KB per call).
-            const std::size_t n = static_cast<std::size_t>(ggml_nelements(d.tensor));
-            if (src.nbytes != n * sizeof(ggml_bf16_t)) {
-                throw std::runtime_error(
-                    "model: bf16 upcast size mismatch for '" + d.hf_name +
-                    "': expected=" + std::to_string(n * sizeof(ggml_bf16_t)) +
-                    " safetensors=" + std::to_string(src.nbytes));
-            }
-            std::vector<float> tmp(n);
-            ggml_bf16_to_fp32_row(
-                reinterpret_cast<const ggml_bf16_t*>(src.data),
-                tmp.data(), n);
-            ggml_backend_tensor_set(d.tensor, tmp.data(), 0,
-                                    n * sizeof(float));
-        } else if (d.downcast_f32_to_bf16) {
-            // Demote f32 source bytes to bf16 in a temp buffer, then
-            // upload. Matmul weights only — norms & biases keep F32 via
-            // is_small_weight_for_upcast().
-            const std::size_t n = static_cast<std::size_t>(ggml_nelements(d.tensor));
-            if (src.nbytes != n * sizeof(float)) {
-                throw std::runtime_error(
-                    "model: f32 downcast size mismatch for '" + d.hf_name +
-                    "': expected=" + std::to_string(n * sizeof(float)) +
-                    " safetensors=" + std::to_string(src.nbytes));
-            }
-            std::vector<ggml_bf16_t> tmp(n);
-            ggml_fp32_to_bf16_row(
-                reinterpret_cast<const float*>(src.data),
-                tmp.data(), n);
-            ggml_backend_tensor_set(d.tensor, tmp.data(), 0,
-                                    n * sizeof(ggml_bf16_t));
-        } else if (d.copy_bytes > 0) {
-            // Sliced load (phi3 fused QKV / gate_up) OR stacked-expert
-            // load (one source written into a 3D dest at dst_offset).
-            ggml_backend_tensor_set(d.tensor,
-                                    src.data + d.src_offset_bytes,
-                                    d.dst_offset_bytes,
-                                    d.copy_bytes);
-        } else {
-            const std::size_t need = ggml_nbytes(d.tensor);
-            if (need != src.nbytes) {
-                throw std::runtime_error(
-                    "model: byte-size mismatch for '" + d.hf_name + "': ggml=" +
-                    std::to_string(need) + " safetensors=" + std::to_string(src.nbytes));
-            }
-            ggml_backend_tensor_set(d.tensor, src.data, 0, src.nbytes);
-        }
-    }
-    for (const auto& s : synth_) {
-        ggml_backend_tensor_set(s.tensor, s.data.data(), 0, s.data.size());
-    }
+    load_with_rust_storage_program(*this);
 }
 
 std::size_t Model::buffer_size() const noexcept {
@@ -719,10 +678,7 @@ void Model::load_top_level_() {
     // the actual safetensors index and override the hparam to match.
     constexpr std::string_view kModelSuffix = "model.";
     std::string wrapper = tensor_prefix_;
-    if (wrapper.size() >= kModelSuffix.size() &&
-        std::string_view(wrapper).substr(wrapper.size() - kModelSuffix.size()) == kModelSuffix) {
-        wrapper = wrapper.substr(0, wrapper.size() - kModelSuffix.size());
-    }
+    wrapper = pie_driver_common::strip_suffix(wrapper, kModelSuffix);
     const std::string lm_wrapped = wrapper + "lm_head.weight";
     const std::string lm_plain   = "lm_head.weight";
     const std::string* found = nullptr;
@@ -1977,6 +1933,12 @@ void Model::build_qwen3_5_() {
                 std::string(1, kind) + "' at layer " + std::to_string(i));
         }
     }
+}
+
+void Model::build_glm_moe_dsa_() {
+    throw std::runtime_error(
+        "model: glm_moe_dsa (GLM-5.1) uses MLA attention and requires the "
+        "CUDA driver — the portable/ggml backend does not support it");
 }
 
 }  // namespace pie_portable_driver

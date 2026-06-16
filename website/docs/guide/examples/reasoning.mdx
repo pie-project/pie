@@ -1,12 +1,12 @@
 ---
 title: Reasoning patterns
-description: Tree, graph, and recursion of thought
+description: Tree, graph, recursion, and reflection patterns
 sidebar_position: 7
 ---
 
 # Reasoning patterns
 
-Inferlets that fan out reasoning across multiple branches and aggregate the results. All of them lean on the KV cache's copy-on-write fork to keep memory and compute proportional to the divergent tokens.
+Inferlets that branch, decompose, or iteratively improve reasoning. Branching patterns use the KV cache's copy-on-write fork to keep memory and compute proportional to divergent tokens.
 
 | Inferlet | What it shows |
 |---|---|
@@ -14,6 +14,7 @@ Inferlets that fan out reasoning across multiple branches and aggregate the resu
 | [`graph-of-thought`](https://github.com/pie-project/pie/tree/main/inferlets/graph-of-thought) | Hierarchical aggregation of multiple proposals. |
 | [`skeleton-of-thought`](https://github.com/pie-project/pie/tree/main/inferlets/skeleton-of-thought) | Parallel elaboration of key points. |
 | [`recursion-of-thought`](https://github.com/pie-project/pie/tree/main/inferlets/recursion-of-thought) | Divide-and-conquer problem solving. |
+| [`reflexion`](https://github.com/pie-project/pie/tree/main/inferlets/reflexion) | Feedback-driven retry with deterministic evaluation and verbal reflection memory. |
 | [`knowledge-graph`](https://github.com/pie-project/pie/tree/main/inferlets/knowledge-graph) | Knowledge-graph extraction and traversal with `petgraph`. |
 
 ## Tree-of-Thought beam semantics
@@ -24,6 +25,6 @@ If a UI streams candidate scores as they arrive, any highlighted winner is provi
 
 ## Related guide
 
-- [Forking and saving](../context/sharing): the `fork()` primitive every branching pattern starts from.
+- [Forking and saving](../context/sharing): the `fork()` primitive used by branching and retry patterns.
 - [Generator](../decoder/generator): per-step control for evaluator/scorer steps.
 - [Constrained generation](../forward/constrained): structured planning output (lists of subgoals, JSON proposals).

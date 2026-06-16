@@ -6,9 +6,9 @@
 //!
 //! Reference: Qwen2.5 Jinja chat template.
 
-use std::sync::Arc;
-use crate::model::instruct::qwen3::{QwenInstruct, ChatMLConfig};
+use crate::model::instruct::qwen3::{ChatMLConfig, QwenInstruct};
 use crate::model::tokenizer::Tokenizer;
+use std::sync::Arc;
 
 static TEMPLATE: &str = r#"
 {%- if tools %}
@@ -67,16 +67,19 @@ static TEMPLATE: &str = r#"
 {%- endif %}
 "#;
 
-
 /// Create a Qwen2.5 instruct implementation.
 ///
 /// Uses the same ChatML base as Qwen3 but with:
 /// - No thinking/reasoning support
 /// - Tools enabled (same format as Qwen3)
 pub fn new(tokenizer: Arc<Tokenizer>) -> QwenInstruct {
-    QwenInstruct::new(tokenizer, ChatMLConfig {
-        has_thinking: false,
-        has_tools: true,
-        stop_tokens: &["<|im_end|>", "<|endoftext|>"],
-    })
+    QwenInstruct::new(
+        tokenizer,
+        ChatMLConfig {
+            has_thinking: false,
+            has_tools: true,
+            generation_suffix: "",
+            stop_tokens: &["<|im_end|>", "<|endoftext|>"],
+        },
+    )
 }

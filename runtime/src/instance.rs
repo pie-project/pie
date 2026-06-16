@@ -89,15 +89,8 @@ impl InstanceState {
         program: String,
         output: OutputMode,
         policy: &InstancePolicy,
-        token_budget: Option<usize>,
         py_runtime_dir: Option<&Path>,
     ) -> anyhow::Result<Self> {
-        // Register the process with all model context managers. Fails if the
-        // admission gate (Σ endowment ≤ capacity × overbook) refuses.
-        // Partial failures are rolled back inside register_process, so Drop
-        // does not need to care about double-unregistration.
-        context::register_process(id, token_budget).await?;
-
         let mut builder = WasiCtx::builder();
 
         // Network capability. `inherit_network` exposes the host network;

@@ -1,4 +1,4 @@
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, ensure};
 
 use std::fs;
 use std::path::PathBuf;
@@ -10,7 +10,7 @@ use tracing_subscriber::util::SubscriberInitExt;
 use crate::adapter;
 use crate::auth;
 use crate::context;
-use crate::device;
+use crate::driver;
 use crate::inference;
 use crate::linker;
 use crate::messaging;
@@ -98,17 +98,27 @@ pub struct ModelConfig {
     pub arch_name: String,
     pub kv_page_size: usize,
     pub tokenizer_path: PathBuf,
-    pub devices: Vec<DeviceConfig>,
+    /// True when every driver group wired a system drafter (the capability
+    /// signal). Manual/user drafts require this; auto-drafting additionally
+    /// requires `enable_system_speculation`.
+    pub system_speculation_supported: bool,
+    /// Operator opt-in for system speculation (deployment config, default
+    /// false). The runtime drives system drafts only when this is true AND the
+    /// model supports it; manual/user-supplied drafts are honored regardless.
+    pub enable_system_speculation: bool,
+    pub drivers: Vec<DriverConfig>,
     pub scheduler: SchedulerConfig,
 }
 
 #[derive(Debug, Clone)]
-pub struct DeviceConfig {
-    pub hostname: String,
+pub struct DriverConfig {
     pub total_pages: usize,
     pub cpu_pages: usize,
-    pub max_batch_tokens: usize,
-    pub max_batch_size: usize,
+    pub rs_cache_required: bool,
+    pub rs_cache_slots: usize,
+    pub rs_cache_slot_bytes: u64,
+    pub rs_cache_spec_rollback: bool,
+    pub limits: crate::driver::SchedulerLimits,
 }
 
 #[derive(Debug, Clone)]
@@ -132,9 +142,15 @@ pub struct SchedulerConfig {
     /// capacity, betting on non-peak duty cycles (like a typical airline).
     pub admission_oversubscription_factor: f64,
     /// Hard admission gate for the restore loop: pause restoring suspended
-    /// contexts when any device's GPU page utilization exceeds this fraction.
+    /// contexts when any driver's GPU page utilization exceeds this fraction.
     /// Prevents the evict→restore→re-evict thrash cascade. Range: (0.0, 1.0].
     pub restore_pause_at_utilization: f64,
+    /// Per-context depth of pass-level speculative execution.
+    /// `0` disables speculation entirely; every submit goes
+    /// through the cold path. `1` is piggyback (one staged pass
+    /// per real pass); higher values let chain firing overlap
+    /// with the inferlet's WASM time. Range: 0..=64.
+    pub speculation_depth: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -213,7 +229,7 @@ async fn bootstrap_inner(config: Config, listener: Option<TcpListener>) -> Resul
         // KV capacity (tokens) = min device total_pages * kv_page_size
         // (caps-reported, so post-backoff). Saturate into the u32 WIT type.
         let kv_capacity_tokens = cfg
-            .devices
+            .drivers
             .iter()
             .map(|d| (d.total_pages as u64).saturating_mul(cfg.kv_page_size as u64))
             .min()
@@ -233,41 +249,57 @@ async fn bootstrap_inner(config: Config, listener: Option<TcpListener>) -> Resul
             kv_capacity_tokens,
             default_token_limit,
             cfg.tokenizer_path.clone(),
+            cfg.system_speculation_supported,
+            cfg.enable_system_speculation,
         )?;
 
-        let devices: Vec<usize> = cfg
-            .devices
+        let drivers: Vec<usize> = cfg
+            .drivers
             .iter()
             .map(|d| {
-                device::spawn(
-                    &d.hostname,
-                    d.total_pages,
-                    d.max_batch_size,
-                    d.max_batch_tokens,
-                )
+                driver::register_driver(driver::DriverSpec {
+                    num_kv_pages: d.total_pages,
+                    limits: d.limits,
+                })
             })
             .collect();
 
-        let num_gpu_pages: Vec<usize> = cfg.devices.iter().map(|d| d.total_pages).collect();
-        let num_cpu_pages: Vec<usize> = cfg.devices.iter().map(|d| d.cpu_pages).collect();
+        let num_gpu_pages: Vec<usize> = cfg.drivers.iter().map(|d| d.total_pages).collect();
+        let num_cpu_pages: Vec<usize> = cfg.drivers.iter().map(|d| d.cpu_pages).collect();
+        let max_forward_requests: usize = cfg
+            .drivers
+            .iter()
+            .map(|d| d.limits.max_forward_requests)
+            .sum();
+        let num_rs_slots: Vec<usize> = cfg.drivers.iter().map(|d| d.rs_cache_slots).collect();
+        let rs_cache_spec_rollback: Vec<bool> = cfg
+            .drivers
+            .iter()
+            .map(|d| d.rs_cache_spec_rollback)
+            .collect();
+        let speculation_depth = cfg.scheduler.speculation_depth;
 
         context::spawn(
             cfg.kv_page_size,
             num_gpu_pages,
             num_cpu_pages,
+            max_forward_requests,
+            num_rs_slots,
+            rs_cache_spec_rollback,
             cfg.scheduler.default_endowment_pages.max(1),
             cfg.scheduler.default_token_limit,
             cfg.scheduler.admission_oversubscription_factor,
             cfg.scheduler.restore_pause_at_utilization,
         );
         inference::spawn(
-            &devices,
+            &drivers,
             cfg.kv_page_size as u32,
             cfg.scheduler.request_timeout_secs,
             cfg.scheduler.batch_policy.clone(),
+            speculation_depth,
         )
         .await;
-        adapter::spawn(&devices);
+        adapter::spawn(&drivers);
     }
 
     Ok(BootstrapHandle {
@@ -278,7 +310,7 @@ async fn bootstrap_inner(config: Config, listener: Option<TcpListener>) -> Resul
 
 /// Boot-time checks for the values pie's Python layer cannot validate
 /// itself: filesystem-side effects (cache/auth dirs) and worker-handshake
-/// outputs (tokenizer file, device capability numbers). Field-level
+/// outputs (tokenizer file, driver capability numbers). Field-level
 /// validation of user-supplied scalars (`batch_policy`, timeouts, market
 /// knobs, etc.) happens in `pie.config.*.__post_init__` — by the time
 /// they reach Rust they're already known-good.
@@ -302,20 +334,25 @@ fn verify_config(config: &Config) -> Result<()> {
             model.name,
             model.tokenizer_path
         );
-        for (i, dev) in model.devices.iter().enumerate() {
+        for (i, dev) in model.drivers.iter().enumerate() {
             ensure!(
                 dev.total_pages > 0,
-                "Model {:?} device {i}: total_pages must be > 0",
+                "Model {:?} driver {i}: total_pages must be > 0",
                 model.name
             );
             ensure!(
-                dev.max_batch_size > 0,
-                "Model {:?} device {i}: max_batch_size must be > 0",
+                dev.limits.max_forward_tokens > 0,
+                "Model {:?} driver {i}: max_forward_tokens must be > 0",
                 model.name
             );
             ensure!(
-                dev.max_batch_tokens > 0,
-                "Model {:?} device {i}: max_batch_tokens must be > 0",
+                dev.limits.max_forward_requests > 0,
+                "Model {:?} driver {i}: max_forward_requests must be > 0",
+                model.name
+            );
+            ensure!(
+                dev.limits.max_page_refs > 0,
+                "Model {:?} driver {i}: max_page_refs must be > 0",
                 model.name
             );
         }

@@ -121,7 +121,7 @@ Workspace& workspace() {
 // device→host copy. Set by `pie_paged_attn_set_host_indptr()`, called
 // from `upload_graph_inputs` immediately before the graph compute.
 //
-// thread_local because Pie may have multiple ForwardEngines (one per
+// thread_local because Pie may have multiple Executors (one per
 // device) running on separate threads; each gets its own snapshot.
 thread_local std::vector<IdType> g_host_indptr;
 

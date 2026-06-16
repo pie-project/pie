@@ -1,6 +1,6 @@
 """Adapter that exposes an SGLang ModelRunner under pie_driver's ForwardPass contract.
 
-`pie_driver_dev.engine.Engine` calls three methods on its `forward_pass` object:
+The `Engine` calls three methods on its `forward_pass` object:
 `embed_inputs(inputs) -> hidden`, `transform(...) -> hidden`, and
 `sample(hidden, sampling_metadata) -> dict`. We delegate the actual compute
 to SGLang's ModelRunner.
@@ -12,7 +12,7 @@ extend-token. To preserve pie's contract we replace the model's
 LogitsProcessor with `_HiddenCapture`, which stashes the full per-token
 hidden state tensor; `sample()` then applies pie's per-output
 `indices_for_logits` gather + the LM head + sampling itself via
-`pie_driver_dev.model.common.sample_common`.
+`.common.sample_common`.
 
 Custom attention masks: this bridge runs SGLang's standard causal attention
 and silently drops any user-supplied mask. The driver advertises that
@@ -26,8 +26,8 @@ from typing import Any
 
 import torch
 
-from pie_driver_dev.config import RuntimeConfig
-from pie_driver_dev.model.common import sample_common
+from ._bridge.config import RuntimeConfig
+from .common import sample_common
 
 from .forward_batch import build_sglang_forward_batch
 
@@ -50,7 +50,11 @@ class _HiddenCapture(torch.nn.Module):
     def forward(self, input_ids, hidden_states, lm_head, forward_batch, aux=None):
         from sglang.srt.layers.logits_processor import LogitsProcessorOutput
         self.captured = hidden_states
-        return LogitsProcessorOutput(next_token_logits=None, hidden_states=hidden_states)
+        placeholder_logits = hidden_states.new_empty((hidden_states.shape[0], 0))
+        return LogitsProcessorOutput(
+            next_token_logits=placeholder_logits,
+            hidden_states=hidden_states,
+        )
 
 
 class SGLangForwardPass:
@@ -75,6 +79,10 @@ class SGLangForwardPass:
         self.runtime_config = runtime_config
         self.page_size = page_size
         self.device = torch.device(runtime_config.device)
+        # `runtime_config.activation_dtype` is a string (bridge stays
+        # torch-free); resolve once here so the sampling hot path doesn't
+        # do a getattr per call.
+        self.activation_dtype = getattr(torch, runtime_config.activation_dtype)
 
         # One-shot install: hidden-state capture replaces the LogitsProcessor.
         # User-supplied attention masks are silently dropped — the driver runs
@@ -113,20 +121,29 @@ class SGLangForwardPass:
                 "kv_page_indices": kv_page_indices,
                 "kv_page_indptr": kv_page_indptr,
                 "kv_last_page_lens": kv_last_page_lens,
+                "custom_mask": input_embeds.get("custom_mask"),
+                "single_token_inference_mode": input_embeds.get(
+                    "single_token_inference_mode", False
+                ),
             },
             page_size=self.page_size,
             device=self.device,
         )
 
         self._capture.captured = None
-        self.runner.forward(fb)
+        output = self.runner.forward(fb)
 
-        if self._capture.captured is None:
+        logits_output = getattr(output, "logits_output", None)
+        hidden_states = getattr(logits_output, "hidden_states", None)
+        if hidden_states is None:
+            hidden_states = self._capture.captured
+
+        if hidden_states is None:
             raise RuntimeError(
                 "pie_driver_sglang: hidden states were not captured. The "
                 "model didn't call its logits_processor (unexpected forward path)."
             )
-        return self._capture.captured
+        return hidden_states
 
     # ------------------------------------------------------------------
     # Sampling
@@ -147,5 +164,5 @@ class SGLangForwardPass:
             sampling_metadata=sampling_metadata,
             lm_head_fn=self._lm_head_fn,
             device=self.device,
-            dtype=self.runtime_config.activation_dtype,
+            dtype=self.activation_dtype,
         )

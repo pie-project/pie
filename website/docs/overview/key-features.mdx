@@ -23,7 +23,7 @@ let out = fwd.execute().await?;
 A primitive at this level is enough to express decoding strategies that other serving systems either hardcode or do not support at all. Each of the following is a library on top of `forward()`, not an engine feature:
 
 - **Constrained decoding.** Mask logits against a grammar or JSON schema before sampling. See [Structured generation](../guide/forward/constrained).
-- **Speculative decoding.** Run a drafter, verify with the target model, accept or reject. Pie ships an n-gram speculator, a draft-model speculator, and a Jacobi decoder, and you can write your own. See the `text-completion-spec`, `draft-model-decoding`, and `jacobi-decoding` inferlets.
+- **Speculative decoding.** Run a drafter, verify with the target model, accept or reject. Pie ships an n-gram speculator, a Jacobi decoder, and **native MTP drafters** for models with an MTP head (Gemma-4, Qwen3.5), and you can write your own. See [Speculative decoding](../guide/forward/speculation) and the `text-completion-spec`, `cacheback-decoding`, and `jacobi-decoding` inferlets.
 - **Custom samplers and raw logits.** Score candidate strings, compute entropy, or pull the full distribution back into your inferlet. See the `sampler-suite` and `output-validation` inferlets.
 - **Custom attention masks.** Sliding window, attention sink, hierarchical masks, anything that can be expressed as a per-token mask. See [Customize generation](../guide/forward/overview).
 - **LoRA adapters.** Attach an adapter for a single forward pass or for every step of a generation loop.
@@ -70,3 +70,10 @@ These surfaces enable patterns that are awkward when application logic runs outs
 - **HTTP servers as inferlets.** An inferlet can implement `wasi:http/incoming-handler` and serve requests directly. See the `openresponses` inferlet, which exposes the OpenAI Responses API.
 
 I/O happens on the inferlet's own time, on a worker thread the engine manages. The model's forward passes do not stall waiting for HTTP.
+
+## Multimodal and quantization
+
+Beyond text, Pie serves multimodal models and quantized weights:
+
+- **Multimodal I/O.** Vision, video, and audio input, plus audio output, through a model-agnostic API: your inferlet hands the host raw bytes and gets soft tokens back. See [Multimodal generation](../guide/model/multimodal).
+- **Quantization.** FP8/INT8 weight quantization, MXFP4 MoE experts, and FP8/FP4 KV-cache formats on `cuda_native`. See the [CUDA driver reference](../reference/drivers/cuda).

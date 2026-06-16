@@ -12,7 +12,7 @@
 use anyhow::{Result, bail};
 
 use super::builder::GrammarBuilder;
-use super::{Grammar, Expr, ExprId, RuleId};
+use super::{Expr, ExprId, Grammar, RuleId};
 
 // ─── UTF-8 / Escape helpers ──────────────────────────────────────────
 
@@ -223,7 +223,12 @@ impl<'a> Lexer<'a> {
     }
 
     fn err(&self, msg: &str) -> anyhow::Error {
-        anyhow::anyhow!("EBNF lexer error at line {}, column {}: {}", self.line, self.col, msg)
+        anyhow::anyhow!(
+            "EBNF lexer error at line {}, column {}: {}",
+            self.line,
+            self.col,
+            msg
+        )
     }
 
     fn is_name_char(c: u8, is_first: bool) -> bool {
@@ -294,23 +299,43 @@ impl<'a> Lexer<'a> {
 
         let line = self.line;
         let col = self.col;
-        tokens.push(Token { ty: TokenType::LBracket, value: String::new(), line, col });
+        tokens.push(Token {
+            ty: TokenType::LBracket,
+            value: String::new(),
+            line,
+            col,
+        });
         self.advance(); // skip [
 
         if self.peek() == Some(b'^') {
             let line = self.line;
             let col = self.col;
-            tokens.push(Token { ty: TokenType::Caret, value: String::new(), line, col });
+            tokens.push(Token {
+                ty: TokenType::Caret,
+                value: String::new(),
+                line,
+                col,
+            });
             self.advance();
         }
 
         // Extra escape chars inside character classes
         let char_class_escapes: &[(u8, u32)] = &[
-            (b'^', b'^' as u32), (b'$', b'$' as u32), (b'\\', b'\\' as u32),
-            (b'.', b'.' as u32), (b'*', b'*' as u32), (b'+', b'+' as u32),
-            (b'?', b'?' as u32), (b'(', b'(' as u32), (b')', b')' as u32),
-            (b'[', b'[' as u32), (b']', b']' as u32), (b'{', b'{' as u32),
-            (b'}', b'}' as u32), (b'|', b'|' as u32), (b'/', b'/' as u32),
+            (b'^', b'^' as u32),
+            (b'$', b'$' as u32),
+            (b'\\', b'\\' as u32),
+            (b'.', b'.' as u32),
+            (b'*', b'*' as u32),
+            (b'+', b'+' as u32),
+            (b'?', b'?' as u32),
+            (b'(', b'(' as u32),
+            (b')', b')' as u32),
+            (b'[', b'[' as u32),
+            (b']', b']' as u32),
+            (b'{', b'{' as u32),
+            (b'}', b'}' as u32),
+            (b'|', b'|' as u32),
+            (b'/', b'/' as u32),
             (b'-', b'-' as u32),
         ];
 
@@ -322,7 +347,12 @@ impl<'a> Lexer<'a> {
                     return Err(self.err("character class should not contain newline"));
                 }
                 b'-' => {
-                    tokens.push(Token { ty: TokenType::Dash, value: String::new(), line, col });
+                    tokens.push(Token {
+                        ty: TokenType::Dash,
+                        value: String::new(),
+                        line,
+                        col,
+                    });
                     self.advance();
                 }
                 _ => {
@@ -346,7 +376,12 @@ impl<'a> Lexer<'a> {
 
         let line = self.line;
         let col = self.col;
-        tokens.push(Token { ty: TokenType::RBracket, value: String::new(), line, col });
+        tokens.push(Token {
+            ty: TokenType::RBracket,
+            value: String::new(),
+            line,
+            col,
+        });
         self.advance(); // skip ]
 
         Ok(tokens)
@@ -403,7 +438,12 @@ impl<'a> Lexer<'a> {
 
             match self.peek() {
                 None => {
-                    tokens.push(Token { ty: TokenType::EndOfFile, value: String::new(), line, col });
+                    tokens.push(Token {
+                        ty: TokenType::EndOfFile,
+                        value: String::new(),
+                        line,
+                        col,
+                    });
                     break;
                 }
                 Some(b'(') => {
@@ -417,45 +457,95 @@ impl<'a> Lexer<'a> {
                         });
                     } else {
                         self.advance();
-                        tokens.push(Token { ty: TokenType::LParen, value: String::new(), line, col });
+                        tokens.push(Token {
+                            ty: TokenType::LParen,
+                            value: String::new(),
+                            line,
+                            col,
+                        });
                     }
                 }
                 Some(b')') => {
                     self.advance();
-                    tokens.push(Token { ty: TokenType::RParen, value: String::new(), line, col });
+                    tokens.push(Token {
+                        ty: TokenType::RParen,
+                        value: String::new(),
+                        line,
+                        col,
+                    });
                 }
                 Some(b'{') => {
                     self.advance();
-                    tokens.push(Token { ty: TokenType::LBrace, value: String::new(), line, col });
+                    tokens.push(Token {
+                        ty: TokenType::LBrace,
+                        value: String::new(),
+                        line,
+                        col,
+                    });
                 }
                 Some(b'}') => {
                     self.advance();
-                    tokens.push(Token { ty: TokenType::RBrace, value: String::new(), line, col });
+                    tokens.push(Token {
+                        ty: TokenType::RBrace,
+                        value: String::new(),
+                        line,
+                        col,
+                    });
                 }
                 Some(b'|') => {
                     self.advance();
-                    tokens.push(Token { ty: TokenType::Pipe, value: String::new(), line, col });
+                    tokens.push(Token {
+                        ty: TokenType::Pipe,
+                        value: String::new(),
+                        line,
+                        col,
+                    });
                 }
                 Some(b',') => {
                     self.advance();
-                    tokens.push(Token { ty: TokenType::Comma, value: String::new(), line, col });
+                    tokens.push(Token {
+                        ty: TokenType::Comma,
+                        value: String::new(),
+                        line,
+                        col,
+                    });
                 }
                 Some(b'*') => {
                     self.advance();
-                    tokens.push(Token { ty: TokenType::Star, value: String::new(), line, col });
+                    tokens.push(Token {
+                        ty: TokenType::Star,
+                        value: String::new(),
+                        line,
+                        col,
+                    });
                 }
                 Some(b'+') => {
                     self.advance();
-                    tokens.push(Token { ty: TokenType::Plus, value: String::new(), line, col });
+                    tokens.push(Token {
+                        ty: TokenType::Plus,
+                        value: String::new(),
+                        line,
+                        col,
+                    });
                 }
                 Some(b'?') => {
                     self.advance();
-                    tokens.push(Token { ty: TokenType::Question, value: String::new(), line, col });
+                    tokens.push(Token {
+                        ty: TokenType::Question,
+                        value: String::new(),
+                        line,
+                        col,
+                    });
                 }
                 Some(b':') => {
                     if self.peek_at(1) == Some(b':') && self.peek_at(2) == Some(b'=') {
                         self.advance_n(3);
-                        tokens.push(Token { ty: TokenType::Assign, value: String::new(), line, col });
+                        tokens.push(Token {
+                            ty: TokenType::Assign,
+                            value: String::new(),
+                            line,
+                            col,
+                        });
                     } else {
                         return Err(self.err("unexpected character ':'"));
                     }
@@ -468,7 +558,12 @@ impl<'a> Lexer<'a> {
                 }
                 Some(c) if Self::is_name_char(c, true) => {
                     let name = self.lex_identifier();
-                    tokens.push(Token { ty: TokenType::Identifier, value: name, line, col });
+                    tokens.push(Token {
+                        ty: TokenType::Identifier,
+                        value: name,
+                        line,
+                        col,
+                    });
                 }
                 Some(c) if c.is_ascii_digit() => {
                     tokens.push(self.lex_integer()?);
@@ -492,20 +587,23 @@ fn convert_identifiers_to_rule_names(tokens: &mut [Token]) -> Result<()> {
             if i == 0 {
                 bail!(
                     "EBNF parser error at line {}, column {}: ::= should not be the first token",
-                    tokens[i].line, tokens[i].col
+                    tokens[i].line,
+                    tokens[i].col
                 );
             }
             if tokens[i - 1].ty != TokenType::Identifier {
                 bail!(
                     "EBNF parser error at line {}, column {}: ::= should be preceded by an identifier",
-                    tokens[i - 1].line, tokens[i - 1].col
+                    tokens[i - 1].line,
+                    tokens[i - 1].col
                 );
             }
             // Check rule name is at start of line
             if i >= 2 && tokens[i - 2].line == tokens[i - 1].line {
                 bail!(
                     "EBNF parser error at line {}, column {}: rule name should be at the beginning of the line",
-                    tokens[i - 1].line, tokens[i - 1].col
+                    tokens[i - 1].line,
+                    tokens[i - 1].col
                 );
             }
             tokens[i - 1].ty = TokenType::RuleName;
@@ -555,7 +653,9 @@ impl Parser {
         let tok = self.peek();
         anyhow::anyhow!(
             "EBNF parser error at line {}, column {}: {}",
-            tok.line, tok.col, msg
+            tok.line,
+            tok.col,
+            msg
         )
     }
 
@@ -572,14 +672,19 @@ impl Parser {
                 if self.builder.find_rule(&tok.value).is_some() {
                     bail!(
                         "EBNF parser error at line {}, column {}: rule \"{}\" defined multiple times",
-                        tok.line, tok.col, tok.value
+                        tok.line,
+                        tok.col,
+                        tok.value
                     );
                 }
                 self.builder.add_rule(&tok.value);
             }
         }
         if self.builder.find_rule(root_rule_name).is_none() {
-            bail!("EBNF parser error: root rule \"{}\" not found", root_rule_name);
+            bail!(
+                "EBNF parser error: root rule \"{}\" not found",
+                root_rule_name
+            );
         }
         Ok(())
     }
@@ -621,7 +726,9 @@ impl Parser {
                     };
                     self.consume();
                     if cp > cp2 {
-                        return Err(self.parse_error("invalid character class: lower bound > upper bound"));
+                        return Err(
+                            self.parse_error("invalid character class: lower bound > upper bound")
+                        );
                     }
                     ranges.push((cp, cp2));
                 } else {
@@ -678,10 +785,7 @@ impl Parser {
             TokenType::LBracket => self.parse_char_class(),
             TokenType::StringLiteral => self.parse_string(),
             TokenType::Identifier => self.parse_rule_ref(),
-            _ => Err(self.parse_error(&format!(
-                "expected element, got {:?}",
-                self.peek().ty
-            ))),
+            _ => Err(self.parse_error(&format!("expected element, got {:?}", self.peek().ty))),
         }
     }
 
@@ -872,7 +976,10 @@ impl Parser {
 
 /// A borrowed view of an expression, for optimization checks in the parser.
 pub(crate) enum BorrowedExpr {
-    CharacterClass { negated: bool, ranges: Vec<(u32, u32)> },
+    CharacterClass {
+        negated: bool,
+        ranges: Vec<(u32, u32)>,
+    },
     RuleRef(RuleId),
     Other,
 }
@@ -1031,26 +1138,20 @@ mod tests {
     fn test_unicode_string() {
         let g = Grammar::from_ebnf(r#"root ::= "\u0041\u0042""#, "root").unwrap();
         match g.get_expr(g.root().body) {
-            Expr::Choices(choices) => {
-                match g.get_expr(choices[0]) {
-                    Expr::Sequence(seq) => {
-                        match g.get_expr(seq[0]) {
-                            Expr::ByteString(bytes) => assert_eq!(bytes, b"AB"),
-                            other => panic!("expected ByteString, got {:?}", other),
-                        }
-                    }
-                    other => panic!("expected Sequence, got {:?}", other),
-                }
-            }
+            Expr::Choices(choices) => match g.get_expr(choices[0]) {
+                Expr::Sequence(seq) => match g.get_expr(seq[0]) {
+                    Expr::ByteString(bytes) => assert_eq!(bytes, b"AB"),
+                    other => panic!("expected ByteString, got {:?}", other),
+                },
+                other => panic!("expected Sequence, got {:?}", other),
+            },
             other => panic!("expected Choices, got {:?}", other),
         }
     }
 
     #[test]
     fn test_multiple_rules() {
-        let g = parse_and_display(
-            "root ::= item+\nitem ::= [a-z] | [0-9]"
-        );
+        let g = parse_and_display("root ::= item+\nitem ::= [a-z] | [0-9]");
         assert!(g.contains("root ::= ((item{1,}))"));
         assert!(g.contains("item ::= (([a-z]) | ([0-9]))"));
     }

@@ -1,7 +1,7 @@
 """SGLang-backed inference engine.
 
-Mirrors `pie_driver_dev.engine.Engine`'s public surface so pie's worker
-(`pie_driver_dev.worker.run_worker`) can drive native, vllm, and sglang
+Mirrors the shared `Engine` public surface so pie's worker
+(`._bridge.worker.run_worker`) can drive native, vllm, and sglang
 interchangeably. The model and kernels come from SGLang; pie owns the
 RPC, batching, telemetry, and dispatch around it.
 """
@@ -13,16 +13,18 @@ import random
 import numpy as np
 import torch
 
-from pie_driver_dev.config import RuntimeConfig
-from pie_driver_dev import telemetry
+from ._bridge.config import RuntimeConfig
+from ._bridge.batching import Batch
+from ._bridge import telemetry
 
 from . import _require_sglang
+from . import batch_tensors
 from .config import SGLangDriverConfig
 
 
 class SGLangEngine:
     """Inference engine that delegates the forward pass to an SGLang
-    ModelRunner. Public surface matches `pie_driver_dev.engine.Engine`."""
+    ModelRunner. Public surface matches the shared `Engine` contract."""
 
     config: RuntimeConfig
     driver_config: SGLangDriverConfig
@@ -55,7 +57,7 @@ class SGLangEngine:
         self.swap_pool_size = swap_pool_size
         self.arch_type = arch_type
         self.snapshot_dir = snapshot_dir
-        # Always-empty registry so `pie_driver_dev.worker._run_fire_batch_inner`
+        # Always-empty registry so `._bridge.worker._run_fire_batch_inner`
         # (which passes `engine.adapters` to Batch) finds the attribute.
         # init_adapter / load_adapter raise NotImplementedError on this
         # driver, so nothing ever populates it.
@@ -112,7 +114,7 @@ class SGLangEngine:
         # swap RPC handlers see the canonical (num_blocks, 2, page_size,
         # h, d) layout.
         kv_cache_at_layer, num_blocks = _rebind_pool_buffers(loaded, config)
-        config.max_num_kv_pages = num_blocks
+        config.total_pages = num_blocks
 
         forward_pass = SGLangForwardPass(
             runner=loaded.runner,
@@ -271,7 +273,87 @@ class SGLangEngine:
         for sid in session_ids:
             self._ngram_history.pop(sid, None)
 
+    # ------------------------------------------------------------------
+    # KV swap — page copies. Bridge stays torch-free; the index_copy_
+    # calls live here next to the engine's KV tensors.
+    # ------------------------------------------------------------------
+
+    def kv_copy_d2h(self, phys_ids: list[int], slots: list[int]) -> None:
+        gpu_kv = self.kv_cache_at_layer
+        host_kv = self.kv_cache_at_layer_host
+        max_gpu = gpu_kv[0].shape[0]
+        max_cpu = host_kv[0].shape[0] if host_kv else 0
+        for p in phys_ids:
+            if p < 0 or p >= max_gpu:
+                raise ValueError(f"swap_out: GPU phys_id {p} out of bounds [0, {max_gpu})")
+        for s in slots:
+            if s < 0 or s >= max_cpu:
+                raise ValueError(f"swap_out: CPU slot {s} out of bounds [0, {max_cpu})")
+        src = torch.tensor(phys_ids, dtype=torch.long, device=gpu_kv[0].device)
+        dst = torch.tensor(slots, dtype=torch.long)
+        for layer_idx in range(len(gpu_kv)):
+            host_kv[layer_idx].index_copy_(0, dst, gpu_kv[layer_idx][src].cpu())
+
+    def kv_copy_h2d(self, phys_ids: list[int], slots: list[int]) -> None:
+        gpu_kv = self.kv_cache_at_layer
+        host_kv = self.kv_cache_at_layer_host
+        max_gpu = gpu_kv[0].shape[0]
+        max_cpu = host_kv[0].shape[0] if host_kv else 0
+        for p in phys_ids:
+            if p < 0 or p >= max_gpu:
+                raise ValueError(f"swap_in: GPU phys_id {p} out of bounds [0, {max_gpu})")
+        for s in slots:
+            if s < 0 or s >= max_cpu:
+                raise ValueError(f"swap_in: CPU slot {s} out of bounds [0, {max_cpu})")
+        dst = torch.tensor(phys_ids, dtype=torch.long, device=gpu_kv[0].device)
+        src = torch.tensor(slots, dtype=torch.long)
+        for layer_idx in range(len(gpu_kv)):
+            gpu_kv[layer_idx].index_copy_(0, dst, host_kv[layer_idx][src].to(gpu_kv[layer_idx].device))
+
+    def kv_copy_d2d(self, src_phys_ids: list[int], dst_phys_ids: list[int]) -> None:
+        gpu_kv = self.kv_cache_at_layer
+        max_gpu = gpu_kv[0].shape[0]
+        for p in src_phys_ids:
+            if p < 0 or p >= max_gpu:
+                raise ValueError(f"copy_d2d: src phys_id {p} out of bounds [0, {max_gpu})")
+        for p in dst_phys_ids:
+            if p < 0 or p >= max_gpu:
+                raise ValueError(f"copy_d2d: dst phys_id {p} out of bounds [0, {max_gpu})")
+        src = torch.tensor(src_phys_ids, dtype=torch.long, device=gpu_kv[0].device)
+        dst = torch.tensor(dst_phys_ids, dtype=torch.long, device=gpu_kv[0].device)
+        for layer_idx in range(len(gpu_kv)):
+            gpu_kv[layer_idx].index_copy_(0, dst, gpu_kv[layer_idx][src])
+
+    def kv_copy_h2h(self, src_slots: list[int], dst_slots: list[int]) -> None:
+        host_kv = self.kv_cache_at_layer_host
+        max_cpu = host_kv[0].shape[0] if host_kv else 0
+        for s in src_slots:
+            if s < 0 or s >= max_cpu:
+                raise ValueError(f"copy_h2h: src slot {s} out of bounds [0, {max_cpu})")
+        for s in dst_slots:
+            if s < 0 or s >= max_cpu:
+                raise ValueError(f"copy_h2h: dst slot {s} out of bounds [0, {max_cpu})")
+        src = torch.tensor(src_slots, dtype=torch.long)
+        dst = torch.tensor(dst_slots, dtype=torch.long)
+        for layer_idx in range(len(host_kv)):
+            host_kv[layer_idx].index_copy_(0, dst, host_kv[layer_idx][src])
+
     @torch.inference_mode()
+    def build_model_inputs(self, batch: Batch) -> dict:
+        device = torch.device(self.config.device)
+        if batch.has_speculative_inputs:
+            return batch_tensors.build_spec_expanded_model_inputs(batch, device)
+        return batch_tensors.build_model_inputs(batch, device)
+
+    def build_sampling_metadata(self, batch: Batch) -> dict:
+        device = torch.device(self.config.device)
+        dtype = getattr(torch, self.config.activation_dtype)
+        if batch.has_speculative_inputs:
+            return batch_tensors.build_spec_expanded_sampling_metadata(
+                batch, device, dtype
+            )
+        return batch_tensors.build_sampling_metadata(batch, device, dtype)
+
     def fire_batch(self, inputs: dict, sampling_metadata: dict) -> dict:
         passthrough = self.forward_pass.embed_inputs(inputs)
 
@@ -322,32 +404,42 @@ class SGLangEngine:
         kernel actually supports (page_size in particular may differ from
         what was requested via `[model.driver.options]`).
         """
-        from pie_driver_dev.capabilities import DriverCapabilities
+        from ._bridge.capabilities import DriverCapabilities
 
         runner = self.forward_pass.runner
         sglang_mc = runner.model_config
 
-        if self.config.max_num_kv_pages is None:
+        if self.config.total_pages is None:
             raise RuntimeError(
-                "config.max_num_kv_pages was not set by the loader — KV cache "
+                "config.total_pages was not set by the loader — KV cache "
                 "rebind must run before capabilities() is called."
             )
         if not self.snapshot_dir:
             raise RuntimeError("snapshot_dir is empty; loader did not resolve it.")
 
+        max_forward_tokens = int(runner.max_total_num_tokens)
+        max_forward_requests = int(runner.max_running_requests)
+        unconstrained = (1 << 32) - 1
+
         return DriverCapabilities(
-            total_pages=int(self.config.max_num_kv_pages),
+            total_pages=int(self.config.total_pages),
             kv_page_size=int(runner.page_size),
             swap_pool_size=int(self.swap_pool_size),
-            # sglang sets these on `ModelRunner` after `init_memory_pool` —
-            # they're load-bearing for pie's scheduler so fail loudly if
-            # they're missing rather than defaulting silently.
-            max_batch_tokens=int(runner.max_total_num_tokens),
-            max_batch_size=int(runner.max_running_requests),
+            # sglang sets these on `ModelRunner` after `init_memory_pool`.
+            # They are load-bearing for pie's scheduler, so fail loudly if
+            # they are missing rather than defaulting silently.
+            max_forward_tokens=max_forward_tokens,
+            max_forward_requests=max_forward_requests,
+            max_page_refs=int(self.config.total_pages),
+            max_logit_rows=unconstrained,
+            max_prob_rows=unconstrained,
+            max_custom_mask_bytes=unconstrained,
+            max_sampler_rows=unconstrained,
+            max_logprob_labels=unconstrained,
             arch_name=self.arch_type,
             vocab_size=int(sglang_mc.vocab_size),
             max_model_len=int(sglang_mc.context_len),
-            activation_dtype=str(self.config.activation_dtype).removeprefix("torch."),
+            activation_dtype=self.config.activation_dtype,
             # sglang's attention path is causal-only from pie's perspective;
             # user-supplied masks are silently dropped. Inferlets that need
             # non-causal patterns must run on `native`.

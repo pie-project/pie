@@ -123,8 +123,14 @@ async fn main(input: Input) -> Result<String> {
         verify_input.extend_from_slice(&draft_tokens);
         let input_count = verify_input.len();
 
+        // Run the verify pass with the page commit DEFERRED: all
+        // `input_count` tokens (anchor + every draft) stay in *working*
+        // pages so the rejected suffix can be truncated below. Committing
+        // here (the `Forward` default) would lock unverified drafts into
+        // committed KV that `truncate` cannot reach, corrupting the cache.
         let mut pass = ctx.forward();
         pass.input(&verify_input);
+        pass.defer_commit();
         let sample_indices: Vec<u32> = (0..input_count as u32).collect();
         let h = pass.sample(&sample_indices, Sampler::Argmax);
         let out = pass.execute().await?;
@@ -149,9 +155,12 @@ async fn main(input: Input) -> Result<String> {
 
         let newly_accepted: Vec<u32> = verified[..accepted_count.min(verified.len())].to_vec();
 
-        // Step 4: truncate rejected tokens off the verifier context.
-        // Pass committed all `input_count` tokens; only the accepted prefix
-        // should remain. The rest of the page state re-syncs in `truncate`.
+        // Step 4: truncate the rejected tokens off the verifier context.
+        // The verify pass left all `input_count` tokens in *working* pages
+        // (commit was deferred), so dropping the last `n_rejected` removes
+        // exactly the rejected suffix and leaves the accepted prefix as
+        // working KV for the next step. Keeping the prefix uncommitted is
+        // what makes the output independent of `draft_length`.
         let n_rejected = (input_count as u32) - (accepted_count as u32);
         ctx.truncate(n_rejected);
 

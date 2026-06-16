@@ -22,10 +22,11 @@
 // to Qwen3_5LayerWeights keeps each arch's invariants local.
 
 #include <cstdint>
+#include <optional>
 #include <vector>
 
 #include "device_buffer.hpp"
-#include "engine.hpp"
+#include "model/loaded_model.hpp"
 #include "tensor.hpp"
 
 namespace pie_cuda_driver::model {
@@ -43,6 +44,8 @@ struct Qwen3_5MoeLayerWeights {
     const DeviceTensor* la_in_proj_z   = nullptr;
     const DeviceTensor* la_in_proj_b   = nullptr;
     const DeviceTensor* la_in_proj_a   = nullptr;
+    const DeviceTensor* la_in_proj_qkvz = nullptr;
+    const DeviceTensor* la_in_proj_ba   = nullptr;
     const DeviceTensor* la_conv1d_w    = nullptr;
     const DeviceTensor* la_conv1d_b    = nullptr;
     const DeviceTensor* la_dt_bias     = nullptr;
@@ -71,8 +74,21 @@ struct Qwen3_5MoeLayerWeights {
     // Shared expert (standard SwiGLU MLP, intermediate = shared_I)
     const DeviceTensor* shared_gate_proj  = nullptr;  // [I_shared, H]
     const DeviceTensor* shared_up_proj    = nullptr;  // [I_shared, H]
+    const DeviceTensor* shared_gate_up_proj = nullptr;  // [2*I_shared, H]
+    const DeviceTensor* shared_gate_up_gate_proj = nullptr;  // [2*I_shared + 1, H]
     const DeviceTensor* shared_down_proj  = nullptr;  // [H, I_shared]
     const DeviceTensor* shared_gate       = nullptr;  // [1, H]
+
+    // Optional QuantMeta companions for runtime-quantized 2-D projections.
+    // Routed experts are fused 3-D tables and stay bf16 on this path.
+    std::optional<QuantMeta> fa_q_proj_quant;
+    std::optional<QuantMeta> fa_k_proj_quant;
+    std::optional<QuantMeta> fa_v_proj_quant;
+    std::optional<QuantMeta> fa_o_proj_quant;
+    std::optional<QuantMeta> shared_gate_proj_quant;
+    std::optional<QuantMeta> shared_up_proj_quant;
+    std::optional<QuantMeta> shared_down_proj_quant;
+    std::optional<QuantMeta> shared_gate_quant;
 
     int kv_layer = -1;  // -1 on linear-attn layers
 };
@@ -94,8 +110,18 @@ struct Qwen3_5MoeWeights {
     // tensors have block / fused layouts that don't shard cleanly under
     // uniform axis-0 partitioning, so we slice them by hand at bind time.
     std::vector<DeviceTensor> owned_bf16_buffers;
+
+    struct MtpWeights {
+        const DeviceTensor* pre_fc_norm_embedding = nullptr;
+        const DeviceTensor* pre_fc_norm_hidden = nullptr;
+        const DeviceTensor* fc = nullptr;
+        const DeviceTensor* norm = nullptr;
+        const DeviceTensor* embed = nullptr;
+        Qwen3_5MoeLayerWeights layer;
+    };
+    std::optional<MtpWeights> mtp;
 };
 
-Qwen3_5MoeWeights bind_qwen3_5_moe(Engine& engine);
+Qwen3_5MoeWeights bind_qwen3_5_moe(const LoadedModel& engine);
 
 }  // namespace pie_cuda_driver::model

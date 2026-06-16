@@ -14,7 +14,7 @@ from rich.panel import Panel
 from .console import console
 import typer
 
-INFERLET_VERSION = "0.3.0"
+INFERLET_VERSION = "0.4.0"
 
 
 def get_template(name: str) -> Template:

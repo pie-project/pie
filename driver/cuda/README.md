@@ -34,11 +34,13 @@ tensor_parallel_size = 1
 activation_dtype = "bfloat16"
 
 [model.driver.options]
-gpu_mem_utilization = 0.85
-max_batch_tokens = 10240
-max_batch_size = 512
-max_num_kv_pages = 1024
+gpu_mem_utilization = 0.90
+memory_profile = "auto"
 ```
+
+`memory_profile` may be `auto`, `latency`, `balanced`, `throughput`, or `capacity`.
+The driver derives forward capacity, Qwen3.5 state slots, and KV pages after
+weights load.
 
 Run `pie driver cuda-native doctor` to confirm the installed `pie` binary has
 the driver compiled in and can see the GPU.

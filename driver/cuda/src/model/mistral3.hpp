@@ -18,7 +18,7 @@
 // the existing GEMM path uniform; large checkpoints can swap to fused
 // FP8 by adding a `gemm_act_x_wt_fp8` overload alongside the bf16 one.
 
-#include "engine.hpp"
+#include "model/loaded_model.hpp"
 #include "model/qwen3.hpp"
 
 namespace pie_cuda_driver::model {
@@ -27,6 +27,6 @@ namespace pie_cuda_driver::model {
 // place (registering bf16 views under the un-suffixed names), and then
 // returns a `Qwen3Weights` ready for `llama_like_forward_paged`. The
 // FP8 source tensors stay in the engine but are unreferenced.
-Qwen3Weights bind_mistral3(Engine& engine);
+Qwen3Weights bind_mistral3(const LoadedModel& engine);
 
 }  // namespace pie_cuda_driver::model

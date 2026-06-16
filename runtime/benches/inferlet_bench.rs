@@ -6,12 +6,12 @@
 #[path = "../tests/common/mod.rs"]
 mod common;
 
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use criterion::{Criterion, criterion_group, criterion_main};
 
-use common::{MockEnv, create_mock_env, inferlets};
+use common::{MockEnv, create_mock_env, inferlets, mock_device::EchoBehavior};
 use pie::process;
 use pie::program::ProgramName;
 
@@ -29,7 +29,7 @@ fn state() -> &'static BenchState {
         inferlets::build_inferlets();
 
         let rt = tokio::runtime::Runtime::new().unwrap();
-        let env = create_mock_env("bench-model", 1, 16);
+        let env = create_mock_env("bench-model", 1, 16, Arc::new(EchoBehavior(42)));
         let config = env.config();
         rt.block_on(async {
             pie::bootstrap::bootstrap(config).await.unwrap();
@@ -51,12 +51,10 @@ fn spawn_and_wait_all(s: &BenchState, count: usize) {
                 process::spawn(
                     "bench-user".into(),
                     program_name(),
-                    format!(r#"{{"message":"{i}"}}"#),
+                    vec![format!("{i}")],
+                    None,
                     None,
                     false,
-                    None,
-                    None,
-                    None,
                 )
                 .expect("spawn")
             })

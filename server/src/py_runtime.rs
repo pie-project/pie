@@ -50,8 +50,7 @@ pub fn ensure_installed(quiet: bool) -> Result<PathBuf> {
     }
 
     let pie_home = pie::path::get_pie_home();
-    std::fs::create_dir_all(&pie_home)
-        .map_err(|e| anyhow!("create {pie_home:?}: {e}"))?;
+    std::fs::create_dir_all(&pie_home).map_err(|e| anyhow!("create {pie_home:?}: {e}"))?;
 
     if !quiet {
         eprintln!("Downloading Python WASM runtime from {RUNTIME_URL}…");

@@ -11,7 +11,7 @@
 //!
 //! Diagnostics (standalone-specific):
 //!   pie check   <toml> [--debug] Validate a config TOML.
-//!   pie smoke   [--rpc]    FFI / RpcServer smoke test.
+//!   pie smoke              FFI smoke test (drives a driver's --help).
 //! ```
 //!
 //! Authoring (`pie new`, `pie build`) forwards to the Bakery tooling so
@@ -107,9 +107,11 @@ pub enum Command {
         debug: bool,
     },
 
-    /// FFI / RpcServer smoke test for diagnostics.
+    /// FFI smoke test — invokes a driver's `--help` and reports its
+    /// exit code. Used to verify the driver lib is linked correctly.
     Smoke {
-        /// Run the RpcServer smoke instead of the FFI smoke.
+        /// Accepted for backwards compatibility; no-op since the
+        /// cold-path RpcServer has been retired.
         #[arg(long)]
         rpc: bool,
         /// Which compiled driver flavor to invoke

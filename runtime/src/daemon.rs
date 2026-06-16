@@ -267,10 +267,29 @@ impl Daemon {
             let output = OutputMode::Log {
                 program: program.to_string(),
             };
+            // Fresh process id for this request. Register it with the context
+            // manager *before* instantiating so any context operation the guest
+            // makes (context.create -> ContextManager::create) finds a registered
+            // process entry. One-shot Processes do this in `process::run`; the
+            // daemon request path must do the same or `process_entry` panics on
+            // an unregistered pid. Cleanup happens automatically when `store`
+            // (and its InstanceState) is dropped at the end of the request, via
+            // InstanceState::drop -> context::unregister_process.
+            let process_id = uuid::Uuid::new_v4();
+            crate::context::register_process(process_id, None)
+                .await
+                .map_err(|e| (FaultClass::HostSetup, "register-process-failed", e))?;
             let (mut store, instance) =
-                linker::instantiate(uuid::Uuid::new_v4(), username, &program, output, None)
-                    .await
-                    .map_err(|e| (FaultClass::HostSetup, "instantiate-failed", e))?;
+                match linker::instantiate(process_id, username, &program, output, None).await {
+                    Ok(pair) => pair,
+                    Err(e) => {
+                        // No InstanceState was created, so its Drop won't run the
+                        // automatic cleanup -- unregister the process explicitly to
+                        // avoid leaking the registration.
+                        crate::context::unregister_process(process_id);
+                        return Err((FaultClass::HostSetup, "instantiate-failed", e));
+                    }
+                };
 
             // Convert the hyper request into WASI HTTP resources
             let (sender, receiver) = oneshot::channel();

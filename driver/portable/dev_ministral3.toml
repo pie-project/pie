@@ -9,8 +9,3 @@ spin_us = 0
 [model]
 hf_path = "/root/.cache/huggingface/hub/models--mistralai--Ministral-3-3B-Base-2512/snapshots/6f9c4b12a95b139af68670a6713616b757923735"
 
-[batching]
-kv_page_size = 32
-max_num_kv_pages = 256
-max_batch_tokens = 4096
-max_batch_size = 64

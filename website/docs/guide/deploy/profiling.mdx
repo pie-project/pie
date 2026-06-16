@@ -46,19 +46,19 @@ The repo's [`benches/`](https://github.com/pie-project/pie/tree/main/benches) di
 ```bash
 # Pie cuda_native latency
 uv --project sdk/python-server run python benches/pie_bench.py latency \
-  --driver cuda_native --model Qwen/Qwen2-0.5B --device cuda:0
+  --driver cuda_native --model Qwen/Qwen3-0.6B --device cuda:0
 
 # Pie cuda_native throughput
 uv --project sdk/python-server run python benches/pie_bench.py tput \
-  --driver cuda_native --model Qwen/Qwen2-0.5B --device cuda:0
+  --driver cuda_native --model Qwen/Qwen3-0.6B --device cuda:0
 
 # vLLM, same workload shape
 python benches/vllm_bench.py tput \
-  --model Qwen/Qwen2-0.5B
+  --model Qwen/Qwen3-0.6B
 
 # SGLang, same workload shape
 python benches/sglang_bench.py tput \
-  --model Qwen/Qwen2-0.5B
+  --model Qwen/Qwen3-0.6B
 ```
 
 Each script prints a summary and writes JSON when `--json-out` is set. See `benches/README.md` for environment setup and fairness defaults.

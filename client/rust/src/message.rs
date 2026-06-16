@@ -56,6 +56,25 @@ pub enum ClientMessage {
         token_budget: Option<usize>,
     },
 
+    #[serde(rename = "launch_processes")]
+    LaunchProcesses {
+        corr_id: u32,
+        inferlet: String,
+        inputs: Vec<String>,
+        capture_outputs: bool,
+        #[serde(default)]
+        token_budgets: Option<Vec<Option<usize>>>,
+    },
+
+    #[serde(rename = "run_processes")]
+    RunProcesses {
+        corr_id: u32,
+        inferlet: String,
+        inputs: Vec<String>,
+        #[serde(default)]
+        token_budgets: Option<Vec<Option<usize>>>,
+    },
+
     #[serde(rename = "launch_daemon")]
     LaunchDaemon {
         corr_id: u32,
@@ -73,10 +92,7 @@ pub enum ClientMessage {
     TerminateProcess { corr_id: u32, process_id: String },
 
     #[serde(rename = "signal_process")]
-    SignalProcess {
-        process_id: String,
-        message: String,
-    },
+    SignalProcess { process_id: String, message: String },
 
     #[serde(rename = "transfer_file")]
     TransferFile {
@@ -115,16 +131,10 @@ pub enum ClientMessage {
     },
 
     #[serde(rename = "submit_workflow")]
-    SubmitWorkflow {
-        corr_id: u32,
-        json: String,
-    },
+    SubmitWorkflow { corr_id: u32, json: String },
 
     #[serde(rename = "cancel_workflow")]
-    CancelWorkflow {
-        corr_id: u32,
-        workflow_id: String,
-    },
+    CancelWorkflow { corr_id: u32, workflow_id: String },
 
     #[serde(rename = "attach_workflow")]
     AttachWorkflow { corr_id: u32, workflow_id: String },

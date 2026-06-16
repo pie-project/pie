@@ -9,7 +9,7 @@
 
 #include <ggml.h>
 
-#include "forward.hpp"
+#include "executor/executor.hpp"
 #include "graph_common.hpp"
 #include "kv_cache.hpp"
 #include "model.hpp"
@@ -19,6 +19,6 @@ namespace pie_portable_driver {
 GraphResult build_qwen3_graph(ggml_context* ctx,
                               const Model& model,
                               KvCachePaged& kv,
-                              const ForwardEngine::BatchPlan& plan);
+                              const Executor::BatchPlan& plan);
 
 }  // namespace pie_portable_driver

@@ -16,15 +16,20 @@ use super::manifest::{Manifest, manifest_url};
 // Repository Types
 // =============================================================================
 
-
 /// Get the WASM file path for a program.
 fn wasm_path(cache_dir: &Path, name: &ProgramName) -> PathBuf {
-    cache_dir.join("programs").join(&name.name).join(format!("{}.wasm", name.version))
+    cache_dir
+        .join("programs")
+        .join(&name.name)
+        .join(format!("{}.wasm", name.version))
 }
 
 /// Get the manifest file path for a program.
 fn manifest_path(cache_dir: &Path, name: &ProgramName) -> PathBuf {
-    cache_dir.join("programs").join(&name.name).join(format!("{}.toml", name.version))
+    cache_dir
+        .join("programs")
+        .join(&name.name)
+        .join(format!("{}.toml", name.version))
 }
 
 /// Build WASM download URL for a program from registry.
@@ -65,7 +70,6 @@ impl Repository {
         self.index.get(name).cloned()
     }
 
-
     /// Fetch WASM bytes for a program (consuming from preloaded_binaries or loading from disk).
     pub async fn fetch_wasm_binary(&mut self, name: &ProgramName) -> Result<Vec<u8>> {
         // Consume from preloaded_binaries if present (e.g., user-registered program)
@@ -85,14 +89,17 @@ impl Repository {
         bail!("Program not found: {}", name)
     }
 
-
     /// Check if program is cached in repository.
     pub fn exists(&self, name: &ProgramName) -> bool {
         self.index.contains_key(name)
     }
 
     /// Add a program by name (downloads from registry).
-    pub async fn add_from_registry(&mut self, name: &ProgramName, force_overwrite: bool) -> Result<()> {
+    pub async fn add_from_registry(
+        &mut self,
+        name: &ProgramName,
+        force_overwrite: bool,
+    ) -> Result<()> {
         // Check if already exists (unless force_overwrite)
         if !force_overwrite && self.index.contains_key(name) {
             return Ok(()); // Already added
@@ -100,27 +107,41 @@ impl Repository {
 
         // Download manifest
         let url = manifest_url(&self.registry_url, name);
-        let manifest_response = reqwest::get(&url).await
+        let manifest_response = reqwest::get(&url)
+            .await
             .map_err(|e| anyhow!("Failed to download manifest from {}: {}", url, e))?;
 
         if !manifest_response.status().is_success() {
-            bail!("Failed to download manifest: {} returned {}", url, manifest_response.status());
+            bail!(
+                "Failed to download manifest: {} returned {}",
+                url,
+                manifest_response.status()
+            );
         }
 
-        let manifest_content = manifest_response.text().await
+        let manifest_content = manifest_response
+            .text()
+            .await
             .map_err(|e| anyhow!("Failed to read manifest response: {}", e))?;
         let manifest = Manifest::parse(&manifest_content)?;
 
         // Download WASM
         let url = wasm_url(&self.registry_url, name);
-        let wasm_response = reqwest::get(&url).await
+        let wasm_response = reqwest::get(&url)
+            .await
             .map_err(|e| anyhow!("Failed to download WASM from {}: {}", url, e))?;
 
         if !wasm_response.status().is_success() {
-            bail!("Failed to download WASM: {} returned {}", url, wasm_response.status());
+            bail!(
+                "Failed to download WASM: {} returned {}",
+                url,
+                wasm_response.status()
+            );
         }
 
-        let wasm_binary = wasm_response.bytes().await
+        let wasm_binary = wasm_response
+            .bytes()
+            .await
             .map_err(|e| anyhow!("Failed to read WASM response: {}", e))?
             .to_vec();
 
@@ -222,11 +243,7 @@ impl Repository {
     }
 
     /// Save program to disk and update index.
-    async fn store_program_cache(
-        &mut self,
-        wasm_binary: &[u8],
-        manifest: Manifest,
-    ) -> Result<()> {
+    async fn store_program_cache(&mut self, wasm_binary: &[u8], manifest: Manifest) -> Result<()> {
         let name = manifest.program_name();
         let dir = self.cache_dir.join("programs").join(&name.name);
         let wasm = wasm_path(&self.cache_dir, &name);
@@ -259,4 +276,3 @@ impl std::fmt::Debug for Repository {
             .finish()
     }
 }
-

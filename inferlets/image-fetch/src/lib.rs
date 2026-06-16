@@ -1,11 +1,9 @@
 //! Demonstrates fetching images over HTTP.
 //!
-//! This example shows how to use the HTTP client to fetch an image from a URL
-//! and decode it using the `image` crate.
+//! This example fetches an image from a URL with `inferlet::http::fetch` (which
+//! follows redirects) and decodes it with the `image` crate.
 
 use image::{DynamicImage, load_from_memory};
-use inferlet::wstd::http::{Client, Method, Request};
-use inferlet::wstd::io::{AsyncRead, empty};
 use inferlet::Result;
 use serde::Deserialize;
 
@@ -17,25 +15,10 @@ struct Input {
 
 fn default_url() -> String { "https://www.ilankelman.org/stopsigns/australia.jpg".to_string() }
 
-/// Asynchronously fetches an image from the given URL.
+/// Asynchronously fetches an image from the given URL and decodes it.
 pub async fn fetch_image(url: &str) -> Result<DynamicImage> {
-    let client = Client::new();
-
-    let request = Request::builder()
-        .uri(url)
-        .method(Method::GET)
-        .body(empty())
-        .map_err(|e| e.to_string())?;
-
-    let response = client.send(request).await.map_err(|e| e.to_string())?;
-
-    let mut body = response.into_body();
-    let mut buf = Vec::new();
-    body.read_to_end(&mut buf).await.map_err(|e| e.to_string())?;
-
-    let img = load_from_memory(&buf).map_err(|e| e.to_string())?;
-
-    Ok(img)
+    let bytes = inferlet::http::fetch(url).await?;
+    load_from_memory(&bytes).map_err(|e| e.to_string())
 }
 
 #[inferlet::main]

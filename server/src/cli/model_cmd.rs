@@ -14,12 +14,21 @@ use anyhow::{Result, anyhow, bail};
 use clap::Subcommand;
 use hf_hub::progress::{DownloadEvent, ProgressEvent, ProgressHandler};
 
+use crate::hf::runtime_snapshot_allow_patterns;
+
 #[derive(Subcommand, Debug)]
 pub enum ModelCmd {
     /// List repo IDs already in the local HF cache.
     List,
     /// Download a model snapshot by HuggingFace repo ID.
-    Download { repo_id: String },
+    Download {
+        repo_id: String,
+        /// Download the complete HF snapshot, including alternate weight
+        /// formats Pie does not use. By default, Pie downloads only runtime
+        /// artifacts: config/tokenizer files and model*.safetensors.
+        #[arg(long)]
+        all: bool,
+    },
     /// Remove a cached model by HuggingFace repo ID. Prompts for
     /// confirmation; `--yes` skips the prompt.
     Remove {
@@ -32,7 +41,7 @@ pub enum ModelCmd {
 pub fn run(cmd: ModelCmd) -> Result<()> {
     match cmd {
         ModelCmd::List => list(),
-        ModelCmd::Download { repo_id } => download(repo_id),
+        ModelCmd::Download { repo_id, all } => download(repo_id, all),
         ModelCmd::Remove { repo_id, yes } => remove(repo_id, yes),
     }
 }
@@ -42,8 +51,7 @@ fn hub_dir() -> std::path::PathBuf {
     hf_hub::resolve_cache_dir()
 }
 
-/// Convert `models--org--name` ↔ `org/name`. Mirrors
-/// `pie_driver_dev.hf_utils.parse_repo_id_from_dirname`.
+/// Convert `models--org--name` ↔ `org/name`.
 fn dirname_to_repo_id(dir: &str) -> Option<String> {
     let stripped = dir.strip_prefix("models--")?;
     let parts: Vec<&str> = stripped.split("--").collect();
@@ -63,7 +71,6 @@ fn repo_id_to_dirname(repo_id: &str) -> String {
 // -----------------------------------------------------------------------------
 
 /// HuggingFace `model_type` → PIE arch name. Kept in sync with
-/// `driver/dev/src/pie_driver_dev/model/__init__.py`'s `register(...)` calls and
 /// the model_type strings the C++ drivers (`driver/cuda/src/loader/`,
 /// `driver/portable/src/`) recognise. Architectures supported by *any*
 /// of the standalone-linked drivers belong here.
@@ -75,6 +82,8 @@ const HF_TO_PIE_ARCH: &[(&str, &str)] = &[
     ("qwen3_moe", "qwen3_moe"),
     ("qwen3_5_moe", "qwen3_5_moe"),
     ("qwen3_5_moe_text", "qwen3_5_moe"),
+    ("qwen3_vl", "qwen3_vl"),
+    ("qwen3_vl_text", "qwen3_vl"),
     ("phi3", "phi3"),
     ("mixtral", "mixtral"),
     ("gemma2", "gemma2"),
@@ -85,6 +94,7 @@ const HF_TO_PIE_ARCH: &[(&str, &str)] = &[
     ("olmo3", "olmo3"),
     ("gptoss", "gptoss"),
     ("gpt_oss", "gptoss"),
+    ("nemotron_h", "nemotron_h"),
 ];
 
 /// Read `<repo_dir>/snapshots/<latest>/config.json` and look up its
@@ -109,12 +119,14 @@ fn check_pie_compatibility(repo_dir: &Path) -> (bool, String) {
     let Ok(text) = std::fs::read_to_string(&cfg_path) else {
         return (false, "no config".to_string());
     };
-    let Ok(json): serde_json::Result<serde_json::Value> = serde_json::from_str(&text)
-    else {
+    let Ok(json): serde_json::Result<serde_json::Value> = serde_json::from_str(&text) else {
         return (false, "no config".to_string());
     };
     let model_type = json
-        .get("model_type")
+        .get("text_config")
+        .or_else(|| json.get("llm_config"))
+        .and_then(|v| v.get("model_type"))
+        .or_else(|| json.get("model_type"))
         .and_then(|v| v.as_str())
         .unwrap_or("");
     if model_type.is_empty() {
@@ -179,22 +191,31 @@ fn list() -> Result<()> {
 // download
 // -----------------------------------------------------------------------------
 
-fn download(repo_id: String) -> Result<()> {
+fn download(repo_id: String, all: bool) -> Result<()> {
     let (owner, name) = parse_repo_id(&repo_id)?;
 
-    println!("Downloading: {repo_id}");
+    if all {
+        println!("Downloading full snapshot: {repo_id}");
+    } else {
+        println!("Downloading runtime artifacts: {repo_id}");
+    }
 
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
     let label = repo_id.clone();
     let snapshot_path = runtime.block_on(async move {
-        let client = hf_hub::HFClient::new()
-            .map_err(|e| anyhow!("init HF client: {e}"))?;
+        let client = hf_hub::HFClient::new().map_err(|e| anyhow!("init HF client: {e}"))?;
         let repo = client.model(owner, name);
         let progress = ProgressBar::new();
+        let allow_patterns = if all {
+            None
+        } else {
+            Some(runtime_snapshot_allow_patterns())
+        };
         let result = repo
             .snapshot_download()
+            .maybe_allow_patterns(allow_patterns)
             .progress(progress.clone())
             .send()
             .await
@@ -309,7 +330,10 @@ impl ProgressBar {
         }
         let done = self.inner.bytes_done.load(Ordering::Relaxed);
         let total = self.inner.total_bytes.load(Ordering::Relaxed);
-        let elapsed = now.duration_since(self.inner.started).as_secs_f64().max(0.001);
+        let elapsed = now
+            .duration_since(self.inner.started)
+            .as_secs_f64()
+            .max(0.001);
         let rate = done as f64 / elapsed;
         let pct = if total > 0 {
             (done as f64 / total as f64).clamp(0.0, 1.0)
@@ -338,11 +362,16 @@ impl ProgressHandler for ProgressBar {
             return;
         };
         match ev {
-            DownloadEvent::Start { total_files, total_bytes } => {
+            DownloadEvent::Start {
+                total_files,
+                total_bytes,
+            } => {
                 self.inner
                     .total_files
                     .store(*total_files as u64, Ordering::Relaxed);
-                self.inner.total_bytes.store(*total_bytes, Ordering::Relaxed);
+                self.inner
+                    .total_bytes
+                    .store(*total_bytes, Ordering::Relaxed);
             }
             DownloadEvent::Progress { files } => {
                 // Per-file deltas: keep a running max per filename and
@@ -361,12 +390,20 @@ impl ProgressHandler for ProgressBar {
                 }
                 self.draw();
             }
-            DownloadEvent::AggregateProgress { bytes_completed, total_bytes, .. } => {
+            DownloadEvent::AggregateProgress {
+                bytes_completed,
+                total_bytes,
+                ..
+            } => {
                 // xet batch: bytes_completed is monotonic per batch.
                 // Treat it as authoritative — overwrite, don't accumulate.
-                self.inner.bytes_done.store(*bytes_completed, Ordering::Relaxed);
+                self.inner
+                    .bytes_done
+                    .store(*bytes_completed, Ordering::Relaxed);
                 if *total_bytes > self.inner.total_bytes.load(Ordering::Relaxed) {
-                    self.inner.total_bytes.store(*total_bytes, Ordering::Relaxed);
+                    self.inner
+                        .total_bytes
+                        .store(*total_bytes, Ordering::Relaxed);
                 }
                 self.draw();
             }
@@ -400,7 +437,10 @@ fn remove(repo_id: String, skip_confirm: bool) -> Result<()> {
     let hub = hub_dir();
     let model_dir = hub.join(repo_id_to_dirname(&repo_id));
     if !model_dir.exists() {
-        bail!("model {repo_id:?} not found in cache ({})", model_dir.display());
+        bail!(
+            "model {repo_id:?} not found in cache ({})",
+            model_dir.display()
+        );
     }
 
     // Use hf-hub's scanner so the size we report dedups blobs shared
@@ -411,9 +451,7 @@ fn remove(repo_id: String, skip_confirm: bool) -> Result<()> {
 
     if !skip_confirm {
         if !std::io::stdin().is_terminal() {
-            bail!(
-                "remove requires confirmation; rerun with `pie model remove {repo_id} --yes`"
-            );
+            bail!("remove requires confirmation; rerun with `pie model remove {repo_id} --yes`");
         }
         eprint!("Remove {repo_id} ({mb:.1} MiB)? [y/N] ");
         let _ = std::io::stderr().flush();
@@ -435,8 +473,7 @@ fn remove(repo_id: String, skip_confirm: bool) -> Result<()> {
     // `huggingface_hub.scan_cache_dir.delete_revisions`; that API is
     // moot here because the cross-repo blob sharing it accounts for
     // doesn't exist in the on-disk layout.
-    std::fs::remove_dir_all(&model_dir)
-        .map_err(|e| anyhow!("remove {model_dir:?}: {e}"))?;
+    std::fs::remove_dir_all(&model_dir).map_err(|e| anyhow!("remove {model_dir:?}: {e}"))?;
     println!("✓ Removed");
     Ok(())
 }
@@ -493,8 +530,14 @@ mod tests {
         assert_eq!(dirname_to_repo_id("not-a-model"), None);
         assert_eq!(dirname_to_repo_id("models--a--b--c"), None);
 
-        assert_eq!(repo_id_to_dirname("Qwen/Qwen3-0.6B"), "models--Qwen--Qwen3-0.6B");
-        assert_eq!(repo_id_to_dirname("bert-base-uncased"), "models--bert-base-uncased");
+        assert_eq!(
+            repo_id_to_dirname("Qwen/Qwen3-0.6B"),
+            "models--Qwen--Qwen3-0.6B"
+        );
+        assert_eq!(
+            repo_id_to_dirname("bert-base-uncased"),
+            "models--bert-base-uncased"
+        );
     }
 
     #[test]

@@ -50,18 +50,19 @@ fn check_summary(path: &Path, cfg: &config::Config) -> String {
     )
 }
 
-/// `pie smoke [--rpc] [--flavor <name>]` — exercise the FFI / RPC
-/// plumbing without a real model load. `rpc=false` invokes the
-/// requested driver's entry with `--help` and reports its rc;
-/// `rpc=true` constructs an `RpcServer` and confirms it can be opened
-/// + closed.
+/// `pie smoke [--flavor <name>]` — exercise the FFI plumbing without a
+/// real model load. Invokes the requested driver's entry with `--help`
+/// and reports its rc.
+///
+/// `rpc` is accepted for backwards compatibility with older invocation
+/// scripts but is now a no-op — the cold-path RPC infrastructure has
+/// been retired in favor of the unified DriverChannel.
 pub fn smoke(rpc: bool, flavor_name: Option<&str>) -> Result<()> {
     if rpc {
-        smoke_rpc()
-    } else {
-        let flavor = pick_smoke_flavor(flavor_name)?;
-        smoke_ffi(flavor)
+        eprintln!("[smoke] --rpc is a no-op; cold-path RpcServer has been retired");
     }
+    let flavor = pick_smoke_flavor(flavor_name)?;
+    smoke_ffi(flavor)
 }
 
 fn pick_smoke_flavor(name: Option<&str>) -> Result<Flavor> {
@@ -93,15 +94,6 @@ unsafe extern "C" fn smoke_ready_cb(caps_json: *const c_char, _ctx: *mut c_void)
     println!("[smoke] ready_cb fired with {json}");
 }
 
-// Fatal callback for the smoke probe — echoes the reason the driver reported
-// before returning nonzero.
-unsafe extern "C" fn smoke_fatal_cb(reason: *const c_char, _ctx: *mut c_void) {
-    let reason = unsafe { CStr::from_ptr(reason) }
-        .to_string_lossy()
-        .into_owned();
-    println!("[smoke] fatal_cb fired with {reason}");
-}
-
 fn smoke_ffi(flavor: Flavor) -> Result<()> {
     println!(
         "[smoke] invoking pie_driver_{}_run(--help)…\n",
@@ -123,29 +115,8 @@ fn smoke_ffi(flavor: Flavor) -> Result<()> {
             0,
             smoke_ready_cb,
             std::ptr::null_mut(),
-            smoke_fatal_cb,
-            std::ptr::null_mut(),
         )
     };
     println!("\n[smoke] driver entry returned rc={rc}");
     Ok(())
-}
-
-fn smoke_rpc() -> Result<()> {
-    use pie::device::RpcServer;
-    match RpcServer::create() {
-        Ok(server) => {
-            println!(
-                "[smoke-rpc] RpcServer ready, server_name={}",
-                server.server_name()
-            );
-            server.close();
-            println!("[smoke-rpc] closed cleanly");
-            Ok(())
-        }
-        Err(e) => {
-            eprintln!("[smoke-rpc] RpcServer::create failed: {e}");
-            std::process::exit(1);
-        }
-    }
 }

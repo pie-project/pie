@@ -9,14 +9,39 @@
 // → output column-major [N, M] which is the same memory as row-major [M, N].
 
 #include <cstddef>
+#include <cstdint>
 #include <cublas_v2.h>
 #include <cuda_runtime.h>
 #include <memory>
 
-#include "engine.hpp"
+#include "model/loaded_model.hpp"
 #include "tensor.hpp"
 
 namespace pie_cuda_driver::ops {
+
+struct RuntimeQuantScratchSpec {
+    std::size_t max_tokens = 0;
+    std::size_t max_weight_rows = 0;  // GEMM N
+    std::size_t max_weight_cols = 0;  // GEMM K
+    bool has_fp8 = false;
+    bool has_int8 = false;
+
+    bool empty() const noexcept {
+        return max_tokens == 0 ||
+               max_weight_rows == 0 ||
+               max_weight_cols == 0 ||
+               (!has_fp8 && !has_int8);
+    }
+};
+
+std::size_t runtime_quant_scratch_bytes(const RuntimeQuantScratchSpec& spec);
+
+// Preallocate the runtime-quant GEMM scratch described by `spec`. When
+// `seal_after_reserve` is true, any later attempt to grow those buffers throws
+// instead of reallocating, preserving CUDA graph pointer stability.
+void reserve_runtime_quant_scratch(
+    const RuntimeQuantScratchSpec& spec,
+    bool seal_after_reserve);
 
 // Lightweight reference to a weight tensor + (optional) quantization
 // metadata, threaded through the GEMM dispatcher. The bf16 path takes the
@@ -29,12 +54,14 @@ namespace pie_cuda_driver::ops {
 struct WeightView {
     const void* data = nullptr;
     DType       dtype = DType::BF16;
+    std::size_t nbytes = 0;
 
     // Quant metadata. `scale_data == nullptr` means "no quant — bf16 path".
     // For per-channel / per-group quant the dispatcher reads the layout
     // hints from `kind`, `group_size`, `channel_axis`.
     const void*       scale_data = nullptr;
     DType             scale_dtype = DType::FP32;
+    std::size_t       scale_numel = 0;
     QuantMeta::Kind   quant_kind = QuantMeta::Kind::PerTensor;
     const void*       zero_point_data = nullptr;
     int               group_size = 0;
@@ -44,7 +71,8 @@ struct WeightView {
 
     // Implicit conversion from a plain DeviceTensor — preserves call-site
     // terseness for the unquantized path (the 99% case in M0).
-    WeightView(const DeviceTensor& t) : data(t.data()), dtype(t.dtype()) {}
+    WeightView(const DeviceTensor& t)
+        : data(t.data()), dtype(t.dtype()), nbytes(t.nbytes()) {}
 
     // Raw pointer + dtype, for buffers without a DeviceTensor handle
     // (deinterleaved MoE scratch, expert pointer arrays).
@@ -53,17 +81,36 @@ struct WeightView {
     }
 
     // Quantized weight: ties together a weight DeviceTensor and a
-    // `QuantMeta` snapshot pulled from `Engine::quant_meta`.
+    // `QuantMeta` snapshot pulled from `LoadedModel::quant_meta`.
     static WeightView quantized(const DeviceTensor& weight, const QuantMeta& meta) {
         WeightView v;
         v.data = weight.data();
         v.dtype = weight.dtype();
+        v.nbytes = weight.nbytes();
         v.scale_data = meta.scale ? meta.scale->data() : nullptr;
         v.scale_dtype = meta.scale ? meta.scale->dtype() : DType::FP32;
+        v.scale_numel = meta.scale ? meta.scale->numel() : 0;
         v.quant_kind = meta.kind;
         v.zero_point_data = meta.zero_point ? meta.zero_point->data() : nullptr;
         v.group_size = meta.group_size;
         v.channel_axis = meta.channel_axis;
+        return v;
+    }
+
+    static WeightView mxfp4_marlin(
+        const DeviceTensor& weight,
+        const DeviceTensor& scale)
+    {
+        WeightView v;
+        v.data = weight.data();
+        v.dtype = DType::MXFP4_PACKED;
+        v.nbytes = weight.nbytes();
+        v.scale_data = scale.data();
+        v.scale_dtype = DType::UINT8;
+        v.scale_numel = scale.numel();
+        v.quant_kind = QuantMeta::Kind::PerGroup;
+        v.group_size = 32;
+        v.channel_axis = 0;
         return v;
     }
 };
@@ -78,6 +125,11 @@ public:
 
     cublasHandle_t handle() const noexcept { return h_; }
     void set_stream(cudaStream_t s);
+    // Stream currently bound to the cublas handle. Used by per-arch
+    // forward bodies so their loose `<<<grid, block, 0, s>>>` kernel
+    // launches stay on the same stream as cublas — required for CUDA
+    // graph capture to record every kernel.
+    cudaStream_t stream() const noexcept;
 
 private:
     cublasHandle_t h_ = nullptr;
@@ -131,6 +183,20 @@ void gemm_batched_act_x_w(
     DType w_dtype = DType::BF16,
     DType y_dtype = DType::BF16);
 
+// Grouped variant for sparse-MoE expert buckets. Each group has one GEMM
+// with a shared output width `N` and reduction dim `K`, but its own row count
+// `M_array[group]`.
+void gemm_grouped_act_x_wt_bf16(
+    cublasHandle_t handle,
+    const void* const* act_ptrs_host,
+    const void* const* W_ptrs_host,
+    void* const*       y_ptrs_host,
+    const int*         M_array_host,
+    int group_count,
+    int N,
+    int K,
+    float beta = 0.f);
+
 // ── Legacy bf16-only entry points ─────────────────────────────────────
 // Thin wrappers around the dispatchers above. Kept as the primary entry
 // point for archs whose forward functions haven't been migrated to
@@ -148,6 +214,26 @@ inline void gemm_act_x_wt_bf16(
                  y, M, N, K, beta);
 }
 
+// Same storage convention as `gemm_act_x_wt_bf16`, but materialises the
+// output as fp32. Used by routers that are specified to compute logits in
+// fp32 before top-k selection.
+void gemm_act_x_wt_bf16_out_fp32(
+    cublasHandle_t handle,
+    const void* act,
+    const void* W,
+    float* y,
+    int M,
+    int N,
+    int K);
+
+// Same math as `gemm_act_x_wt_bf16`, but bypasses the cuBLASLt BF16
+// dispatcher. This is useful for a few skinny-M packed projections where
+// Lt's heuristic is slower than cuBLAS GEMMEx.
+void gemm_act_x_wt_bf16_cublas(
+    cublasHandle_t handle,
+    const void* act, const void* W, void* y,
+    int M, int N, int K, float beta = 0.f);
+
 inline void gemm_batched_act_x_wt_bf16(
     cublasHandle_t handle,
     const void* const* act_ptrs_dev,
@@ -159,5 +245,14 @@ inline void gemm_batched_act_x_wt_bf16(
                          act_ptrs_dev, W_ptrs_dev, y_ptrs_dev,
                          M, N, K, batch_count, beta);
 }
+
+// One-shot benchmark of cuBLASLt heuristics + GEMMEx for a given shape.
+// Prints per-algo latencies to stderr. Enabled by PIE_BENCH_LM_HEAD_ALGOS=1.
+// Runs at most once per process. Safe to call on every MTP step — the second
+// and subsequent calls are no-ops.
+void maybe_bench_lm_head_algos(
+    cublasHandle_t handle,
+    const void* act, const void* W, void* y,
+    int M, int N, int K);
 
 }  // namespace pie_cuda_driver::ops

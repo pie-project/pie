@@ -8,7 +8,7 @@ namespace pie_cuda_driver::brle {
 namespace {
 
 // Per-request KV length: (num_pages - 1) * page_size + last_page_len.
-// Returns the *post-write* length (matches BPIQ semantics).
+// Returns the *post-write* length (matches wire semantics).
 int kv_len_for(
     int r, int page_size,
     std::span<const std::uint32_t> kv_page_indptr_h,
@@ -19,6 +19,49 @@ int kv_len_for(
     if (num_pages <= 0) return 0;
     return (num_pages - 1) * page_size +
            static_cast<int>(kv_last_page_lens_h[r]);
+}
+
+bool has_valid_layout(
+    std::span<const std::uint32_t> flattened_masks,
+    std::span<const std::uint32_t> mask_indptr,
+    std::span<const std::uint32_t> qo_indptr_h,
+    std::span<const std::uint32_t> kv_page_indptr_h,
+    std::span<const std::uint32_t> kv_last_page_lens_h)
+{
+    if (qo_indptr_h.empty()) return false;
+    const int R = static_cast<int>(qo_indptr_h.size()) - 1;
+    if (R <= 0) return true;
+    if (kv_page_indptr_h.size() < static_cast<std::size_t>(R + 1))
+        return false;
+    if (kv_last_page_lens_h.size() < static_cast<std::size_t>(R)) return false;
+
+    const std::uint32_t total_rows = qo_indptr_h.back();
+    if (mask_indptr.size() < static_cast<std::size_t>(total_rows) + 1)
+        return false;
+
+    for (int r = 0; r < R; ++r) {
+        if (qo_indptr_h[r] > qo_indptr_h[r + 1]) return false;
+        if (kv_page_indptr_h[r] > kv_page_indptr_h[r + 1]) return false;
+    }
+    for (std::size_t row = 0; row < static_cast<std::size_t>(total_rows);
+         ++row) {
+        if (mask_indptr[row] > mask_indptr[row + 1]) return false;
+        if (mask_indptr[row + 1] > flattened_masks.size()) return false;
+    }
+    return true;
+}
+
+void require_valid_layout(
+    std::span<const std::uint32_t> flattened_masks,
+    std::span<const std::uint32_t> mask_indptr,
+    std::span<const std::uint32_t> qo_indptr_h,
+    std::span<const std::uint32_t> kv_page_indptr_h,
+    std::span<const std::uint32_t> kv_last_page_lens_h)
+{
+    if (!has_valid_layout(flattened_masks, mask_indptr, qo_indptr_h,
+                          kv_page_indptr_h, kv_last_page_lens_h)) {
+        throw std::runtime_error("brle::decode: malformed mask layout");
+    }
 }
 
 }  // namespace
@@ -33,6 +76,10 @@ bool is_pure_causal(
 {
     const int R = static_cast<int>(qo_indptr_h.size()) - 1;
     if (R <= 0) return true;
+    if (!has_valid_layout(flattened_masks, mask_indptr, qo_indptr_h,
+                          kv_page_indptr_h, kv_last_page_lens_h)) {
+        return false;
+    }
 
     for (int r = 0; r < R; ++r) {
         const int kv_len = kv_len_for(r, page_size,
@@ -73,6 +120,8 @@ DecodedMasks decode(
         out.mask_indptr = {0};
         return out;
     }
+    require_valid_layout(flattened_masks, mask_indptr, qo_indptr_h,
+                         kv_page_indptr_h, kv_last_page_lens_h);
 
     out.mask_indptr.resize(R + 1);
     out.mask_indptr[0] = 0;

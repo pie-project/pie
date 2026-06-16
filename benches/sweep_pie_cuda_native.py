@@ -105,14 +105,6 @@ def run_case(args: argparse.Namespace, model: dict[str, Any], topo: dict[str, An
         str(args.warmup),
         "--max-tokens",
         str(args.max_tokens),
-        "--max-model-len",
-        str(args.max_model_len),
-        "--kv-pages",
-        str(args.kv_pages),
-        "--max-batch-size",
-        str(args.max_batch_size),
-        "--max-batch-tokens",
-        str(args.max_batch_tokens),
         "--default-token-limit",
         str(args.default_token_limit),
         "--default-endowment-pages",
@@ -189,10 +181,6 @@ def main() -> None:
     p.add_argument("--requests", type=int, default=1)
     p.add_argument("--warmup", type=int, default=0)
     p.add_argument("--max-tokens", type=int, default=1)
-    p.add_argument("--max-model-len", type=int, default=512)
-    p.add_argument("--kv-pages", type=int, default=128)
-    p.add_argument("--max-batch-size", type=int, default=8)
-    p.add_argument("--max-batch-tokens", type=int, default=512)
     p.add_argument("--default-token-limit", type=int, default=64)
     p.add_argument("--default-endowment-pages", type=int, default=8)
     p.add_argument("--server-startup-timeout", type=float, default=900.0)

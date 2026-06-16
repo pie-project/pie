@@ -11,4 +11,6 @@ world imports {
     import blob-store;
     import inference;
     import scheduling;
+    import media;
+    import audio-out;
 }

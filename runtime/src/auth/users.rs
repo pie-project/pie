@@ -49,22 +49,20 @@ impl AuthorizedUsers {
             check_file_permissions(auth_path)?;
         }
 
-        let content = toml::to_string_pretty(self)
-            .context("Failed to serialize authorized users to TOML")?;
+        let content =
+            toml::to_string_pretty(self).context("Failed to serialize authorized users to TOML")?;
 
         // Atomic save: write to temp file, then rename
         let tmp_path = auth_path.with_extension("tmp");
-        fs::write(&tmp_path, &content).with_context(|| {
-            format!("Failed to write temp file at '{}'", tmp_path.display())
-        })?;
+        fs::write(&tmp_path, &content)
+            .with_context(|| format!("Failed to write temp file at '{}'", tmp_path.display()))?;
 
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&tmp_path, std::fs::Permissions::from_mode(0o600))
-                .with_context(|| {
-                    format!("Failed to set permissions on '{}'", tmp_path.display())
-                })?;
+            fs::set_permissions(&tmp_path, std::fs::Permissions::from_mode(0o600)).with_context(
+                || format!("Failed to set permissions on '{}'", tmp_path.display()),
+            )?;
         }
 
         fs::rename(&tmp_path, auth_path).with_context(|| {
@@ -215,10 +213,7 @@ impl TryFrom<&UserKeys> for UserKeysRaw {
         let keys: Result<HashMap<String, String>> = user_keys
             .keys
             .iter()
-            .map(|(name, key)| {
-                key.to_ssh_public_key_string()
-                    .map(|s| (name.clone(), s))
-            })
+            .map(|(name, key)| key.to_ssh_public_key_string().map(|s| (name.clone(), s)))
             .collect();
         Ok(Self { keys: keys? })
     }
@@ -286,8 +281,7 @@ mod tests {
         let signing_key = ed25519_dalek::SigningKey::from_bytes(&secret);
         let verifying_key = signing_key.verifying_key();
         let ssh_ed25519 =
-            ssh_key::public::Ed25519PublicKey::try_from(verifying_key.as_bytes().as_ref())
-                .unwrap();
+            ssh_key::public::Ed25519PublicKey::try_from(verifying_key.as_bytes().as_ref()).unwrap();
         let ssh_pub = ssh_key::PublicKey::from(ssh_ed25519);
         let openssh = ssh_pub.to_openssh().unwrap();
         let key = PublicKey::parse(&openssh).unwrap();
@@ -374,7 +368,8 @@ mod tests {
         let mut au = AuthorizedUsers::default();
         au.insert_user("alice").unwrap();
         let (key, _) = gen_ed25519_key();
-        au.insert_key_for_user("alice", "laptop".into(), key).unwrap();
+        au.insert_key_for_user("alice", "laptop".into(), key)
+            .unwrap();
         let user_keys = au.get("alice").unwrap();
         assert!(user_keys.has_key_name("laptop"));
     }
@@ -383,7 +378,10 @@ mod tests {
     fn insert_key_for_nonexistent_user_fails() {
         let mut au = AuthorizedUsers::default();
         let (key, _) = gen_ed25519_key();
-        assert!(au.insert_key_for_user("ghost", "laptop".into(), key).is_err());
+        assert!(
+            au.insert_key_for_user("ghost", "laptop".into(), key)
+                .is_err()
+        );
     }
 
     #[test]
@@ -392,8 +390,12 @@ mod tests {
         au.insert_user("alice").unwrap();
         let (k1, _) = gen_ed25519_key();
         let (k2, _) = gen_ed25519_key();
-        au.insert_key_for_user("alice", "laptop".into(), k1).unwrap();
-        assert!(au.insert_key_for_user("alice", "laptop".into(), k2).is_err());
+        au.insert_key_for_user("alice", "laptop".into(), k1)
+            .unwrap();
+        assert!(
+            au.insert_key_for_user("alice", "laptop".into(), k2)
+                .is_err()
+        );
     }
 
     #[test]
@@ -401,7 +403,8 @@ mod tests {
         let mut au = AuthorizedUsers::default();
         au.insert_user("alice").unwrap();
         let (key, _) = gen_ed25519_key();
-        au.insert_key_for_user("alice", "laptop".into(), key).unwrap();
+        au.insert_key_for_user("alice", "laptop".into(), key)
+            .unwrap();
         au.remove_key("alice", "laptop").unwrap();
         assert!(!au.get("alice").unwrap().has_key_name("laptop"));
     }
@@ -453,7 +456,8 @@ mod tests {
         let mut au = AuthorizedUsers::default();
         au.insert_user("alice").unwrap();
         let (key, _) = gen_ed25519_key();
-        au.insert_key_for_user("alice", "laptop".into(), key).unwrap();
+        au.insert_key_for_user("alice", "laptop".into(), key)
+            .unwrap();
 
         let toml_str = toml::to_string_pretty(&au).unwrap();
         // Must be valid TOML

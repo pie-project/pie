@@ -22,13 +22,18 @@ pub struct Session {
 
 impl pie::mcp::client::Host for InstanceState {
     async fn available_servers(&mut self) -> Result<Vec<String>> {
-        let client_id = process::get_client_id(self.id()).await?
+        let client_id = process::get_client_id(self.id())
+            .await?
             .ok_or_else(|| anyhow!("No client session for process {}", self.id()))?;
         Ok(server::get_mcp_servers(client_id))
     }
 
-    async fn connect(&mut self, server_name: String) -> Result<Result<Resource<Session>, pie::mcp::types::Error>> {
-        let client_id = process::get_client_id(self.id()).await?
+    async fn connect(
+        &mut self,
+        server_name: String,
+    ) -> Result<Result<Resource<Session>, pie::mcp::types::Error>> {
+        let client_id = process::get_client_id(self.id())
+            .await?
             .ok_or_else(|| anyhow!("No client session for process {}", self.id()))?;
 
         let servers = server::get_mcp_servers(client_id);
@@ -50,7 +55,10 @@ impl pie::mcp::client::Host for InstanceState {
 }
 
 impl pie::mcp::client::HostSession for InstanceState {
-    async fn list_tools(&mut self, this: Resource<Session>) -> Result<Result<String, pie::mcp::types::Error>> {
+    async fn list_tools(
+        &mut self,
+        this: Resource<Session>,
+    ) -> Result<Result<String, pie::mcp::types::Error>> {
         let session = self.ctx().table.get(&this)?;
         relay(session, "tools/list", "{}").await
     }
@@ -70,7 +78,10 @@ impl pie::mcp::client::HostSession for InstanceState {
         relay(session, "tools/call", &params).await
     }
 
-    async fn list_resources(&mut self, this: Resource<Session>) -> Result<Result<String, pie::mcp::types::Error>> {
+    async fn list_resources(
+        &mut self,
+        this: Resource<Session>,
+    ) -> Result<Result<String, pie::mcp::types::Error>> {
         let session = self.ctx().table.get(&this)?;
         relay(session, "resources/list", "{}").await
     }
@@ -85,7 +96,10 @@ impl pie::mcp::client::HostSession for InstanceState {
         relay(session, "resources/read", &params).await
     }
 
-    async fn list_prompts(&mut self, this: Resource<Session>) -> Result<Result<String, pie::mcp::types::Error>> {
+    async fn list_prompts(
+        &mut self,
+        this: Resource<Session>,
+    ) -> Result<Result<String, pie::mcp::types::Error>> {
         let session = self.ctx().table.get(&this)?;
         relay(session, "prompts/list", "{}").await
     }
@@ -164,7 +178,11 @@ fn decode_error_payload(payload: &str) -> pie::mcp::types::Error {
             .unwrap_or(payload)
             .to_string();
         let data = map.get("data").map(|v| v.to_string());
-        return pie::mcp::types::Error { code, message, data };
+        return pie::mcp::types::Error {
+            code,
+            message,
+            data,
+        };
     }
     pie::mcp::types::Error {
         code: -32000,

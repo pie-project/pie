@@ -17,8 +17,8 @@ use crate::ForwardPassExt;
 use crate::Result;
 use crate::adapter::Adapter;
 use crate::context::Context;
-use crate::pie::core::inference::{ForwardPass, SlotOutput};
 use crate::pie::core::inference::Output as RawOutput;
+use crate::pie::core::inference::{ForwardPass, SlotOutput};
 use crate::sample::{self, Probe, Sampler};
 
 // =============================================================================
@@ -61,12 +61,17 @@ pub struct ProbeHandle<P> {
 // impls so handles are always `Copy`.
 impl<P> Copy for ProbeHandle<P> {}
 impl<P> Clone for ProbeHandle<P> {
-    fn clone(&self) -> Self { *self }
+    fn clone(&self) -> Self {
+        *self
+    }
 }
 
 impl<P> ProbeHandle<P> {
     pub(crate) fn new(slot: u32) -> Self {
-        Self { slot, _kind: PhantomData }
+        Self {
+            slot,
+            _kind: PhantomData,
+        }
     }
     pub(crate) fn slot(&self) -> u32 {
         self.slot
@@ -110,6 +115,20 @@ pub struct Forward<'ctx> {
     attn_mask: Option<Vec<Vec<u32>>>,
     adapter: Option<&'ctx Adapter>,
     zo_seed: Option<i64>,
+    /// Visual spans spliced at the given anchor positions, in declaration
+    /// order. Emitted as `input-image` calls at execute time.
+    images: Vec<(&'ctx crate::media::Image, u32)>,
+    /// Audio clips spliced at the given anchor positions, in declaration
+    /// order. Emitted as `input-audio` calls at execute time.
+    audios: Vec<(&'ctx crate::media::Audio, u32)>,
+    /// When true, `execute` reserves pages and runs the pass but does NOT
+    /// commit the newly-filled working pages. Used by manual speculative
+    /// loops that must keep all written tokens in *working* pages so a
+    /// follow-up [`Context::truncate`] can roll back the rejected suffix —
+    /// committing first (the default) would lock unverified drafts into
+    /// committed KV that `truncate` cannot reach. The caller commits the
+    /// verified prefix itself once acceptance is known.
+    defer_commit: bool,
 }
 
 impl<'ctx> Forward<'ctx> {
@@ -140,7 +159,30 @@ impl<'ctx> Forward<'ctx> {
             attn_mask: None,
             adapter: None,
             zo_seed: None,
+            images: Vec::new(),
+            audios: Vec::new(),
+            defer_commit: false,
         }
+    }
+
+    /// Skip the post-execute page commit, keeping every written token in
+    /// *working* pages. The pass still reserves pages and writes KV, and the
+    /// context's `seq_len` / `working_tokens` advance, but no working page is
+    /// committed.
+    ///
+    /// Required for correct manual speculative decoding (draft + verify +
+    /// truncate). The default auto-commit promotes full working pages into
+    /// committed KV as soon as they fill — but a speculative verify pass
+    /// writes anchor + draft tokens whose acceptance is not yet known. A
+    /// committed page can no longer be rolled back by [`Context::truncate`],
+    /// and committing pages mid-speculation also perturbs the KV the
+    /// remaining decode attends to. Keeping the verified prefix in working
+    /// pages (and letting `truncate` drop the rejected suffix) is what makes
+    /// the generated sequence independent of the draft length, as lossless
+    /// speculative decoding requires.
+    pub fn defer_commit(&mut self) -> &mut Self {
+        self.defer_commit = true;
+        self
     }
 
     // ── Inputs ─────────────────────────────────────────────────────────
@@ -225,6 +267,24 @@ impl<'ctx> Forward<'ctx> {
         self
     }
 
+    /// Splice an encoded visual span (image or video clip) at sequence
+    /// position `anchor`. The driver runs the vision encoder and scatters the
+    /// projected rows into the hidden state. Advance your position cursor by
+    /// `image.position_span()` for any tokens that follow. See MULTIMODAL.md.
+    pub fn input_image(&mut self, image: &'ctx crate::media::Image, anchor: u32) -> &mut Self {
+        self.images.push((image, anchor));
+        self
+    }
+
+    /// Splice an encoded audio clip at sequence position `anchor`. The driver
+    /// runs the gemma4_audio encoder and scatters the projected rows into the
+    /// hidden state. Advance your position cursor by `audio.position_span()`
+    /// for any tokens that follow. See audio_frontend.md.
+    pub fn input_audio(&mut self, audio: &'ctx crate::media::Audio, anchor: u32) -> &mut Self {
+        self.audios.push((audio, anchor));
+        self
+    }
+
     /// Set a `zo` (Evolution Strategies) seed for this forward pass.
     pub fn zo_seed(&mut self, seed: i64) -> &mut Self {
         self.zo_seed = Some(seed);
@@ -247,6 +307,9 @@ impl<'ctx> Forward<'ctx> {
             attn_mask,
             adapter,
             zo_seed,
+            images,
+            audios,
+            defer_commit,
         } = self;
 
         let n_auto = auto_inputs.len() as u32;
@@ -268,6 +331,13 @@ impl<'ctx> Forward<'ctx> {
 
         let pass = ForwardPass::new(&ctx.model);
         pass.context(&ctx.inner);
+
+        for (image, anchor) in images {
+            pass.input_image(image, anchor);
+        }
+        for (audio, anchor) in audios {
+            pass.input_audio(audio, anchor);
+        }
 
         if let Some(a) = adapter {
             pass.adapter(a);
@@ -308,10 +378,18 @@ impl<'ctx> Forward<'ctx> {
             .await
             .map_err(|e| format!("Forward::execute: forward pass failed: {e}"))?;
 
-        // Commit any pages that auto-input tokens fully filled.
+        // Account for the newly-written KV. By default we also commit any
+        // pages the auto-input tokens fully filled. When `defer_commit` is
+        // set (manual speculation), we keep every written token in *working*
+        // pages so a later `truncate` can roll back rejected drafts — the
+        // caller commits the verified prefix afterwards.
         if n_auto > 0 {
             let new_working = ctx.working_tokens + n_auto;
-            let to_commit = new_working / ctx.page_size;
+            let to_commit = if defer_commit {
+                0
+            } else {
+                new_working / ctx.page_size
+            };
             if to_commit > 0 {
                 ctx.inner
                     .commit_working_pages(to_commit)
@@ -319,7 +397,7 @@ impl<'ctx> Forward<'ctx> {
             }
             ctx.committed_pages += to_commit;
             ctx.working_pages -= to_commit;
-            ctx.working_tokens = new_working % ctx.page_size;
+            ctx.working_tokens = new_working - to_commit * ctx.page_size;
             ctx.seq_len += n_auto;
         }
 
@@ -372,7 +450,11 @@ impl Output {
         tokens: Vec<u32>,
         auto_sampler: Option<SampleHandle>,
     ) -> Self {
-        Self { raw, tokens, auto_sampler }
+        Self {
+            raw,
+            tokens,
+            auto_sampler,
+        }
     }
 
     /// Underlying WIT output, for callers who need the raw slot list or the
@@ -414,10 +496,7 @@ impl Output {
     }
 
     /// Distribution as `(ids, probs)` for a [`Distribution`](sample::Distribution) probe.
-    pub fn distribution(
-        &self,
-        h: ProbeHandle<sample::Distribution>,
-    ) -> Option<(&[u32], &[f32])> {
+    pub fn distribution(&self, h: ProbeHandle<sample::Distribution>) -> Option<(&[u32], &[f32])> {
         match self.raw.slots.get(h.slot() as usize)? {
             SlotOutput::Distribution((ids, ps)) => Some((ids.as_slice(), ps.as_slice())),
             _ => None,

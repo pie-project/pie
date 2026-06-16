@@ -6,6 +6,7 @@ interface model {
     resource model {
         load: static func(name: string) -> result<model, error>;
         tokenizer: func() -> tokenizer;
+        default-system-speculation: func() -> bool;
     }
 
     // Tokenizer resource for encoding and decoding text

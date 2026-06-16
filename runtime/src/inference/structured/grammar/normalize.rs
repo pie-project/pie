@@ -32,7 +32,9 @@ pub fn normalize_grammar(grammar: &Grammar) -> Grammar {
         }
     }
 
-    builder.build(&grammar.get_rule(grammar.root_rule()).name).unwrap()
+    builder
+        .build(&grammar.get_rule(grammar.root_rule()).name)
+        .unwrap()
 }
 
 /// Normalize an expression. If it's a Sequence, ensure all elements are leaves.

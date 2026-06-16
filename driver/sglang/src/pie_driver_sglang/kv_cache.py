@@ -4,7 +4,7 @@ SGLang allocates `MHATokenToKVPool.k_buffer[layer]` and `.v_buffer[layer]`
 during ModelRunner construction — each shape `(num_blocks*page_size, h, d)`,
 flat token-slot indexed.
 
-Pie's swap RPCs in `pie_driver_dev.worker._handle_copy_*` operate on
+Pie's swap RPCs in `._bridge.worker._handle_copy_*` operate on
 `engine.kv_cache_at_layer[layer]` indexed by *block ID*, expecting each
 layer's tensor to look like `(num_blocks, 2, page_size, h, d)`.
 
@@ -25,7 +25,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from pie_driver_dev.config import RuntimeConfig
+from ._bridge.config import RuntimeConfig
 
 if TYPE_CHECKING:
     from .loader import LoadedModel

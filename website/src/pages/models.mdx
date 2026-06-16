@@ -285,7 +285,8 @@ driver Pie routes inference through, and the precision and parallelism that
 driver supports for that architecture. This page is the at-a-glance matrix.
 For configuration and supported architectures of each driver, see
 [CUDA](/docs/reference/drivers/cuda), [Portable](/docs/reference/drivers/portable),
-[vLLM](/docs/reference/drivers/vllm), and [SGLang](/docs/reference/drivers/sglang).
+[vLLM](/docs/reference/drivers/vllm), [SGLang](/docs/reference/drivers/sglang),
+and [TensorRT-LLM](/docs/reference/drivers/tensorrt-llm).
 
 ## Drivers
 
@@ -510,7 +511,7 @@ For configuration and supported architectures of each driver, see
         <span className="m-arch-name">Qwen 3 MoE</span>
         <span className="m-arch-sub">qwen3_moe</span>
       </td>
-      <td className="c"><span className="m-pill no">—</span></td>
+      <td className="c"><span className="m-pill partial">preview</span></td>
       <td className="c"><span className="m-pill partial">preview</span></td>
       <td className="c"><span className="m-pill up">upstream</span></td>
       <td className="c"><span className="m-pill up">upstream</span></td>
@@ -584,6 +585,22 @@ For configuration and supported architectures of each driver, see
       <td>
         <div className="m-sizes">
           <a className="m-size" href="https://huggingface.co/Qwen/Qwen3.6-35B-A3B">35B-A3B</a>
+        </div>
+      </td>
+    </tr>
+
+    <tr>
+      <td>
+        <span className="m-arch-name">Qwen3-VL</span>
+        <span className="m-arch-sub">qwen3_vl</span>
+      </td>
+      <td className="c"><span className="m-pill yes">stable</span></td>
+      <td className="c"><span className="m-pill no">—</span></td>
+      <td className="c"><span className="m-pill up">upstream</span></td>
+      <td className="c"><span className="m-pill up">upstream</span></td>
+      <td>
+        <div className="m-sizes">
+          <a className="m-size" href="https://huggingface.co/Qwen/Qwen3-VL-2B-Instruct">2B</a>
         </div>
       </td>
     </tr>
@@ -917,8 +934,106 @@ For configuration and supported architectures of each driver, see
       </td>
     </tr>
 
+
+    <tr className="m-group"><td colSpan={6}>GLM</td></tr>
+
+    <tr>
+      <td>
+        <span className="m-arch-name">GLM 4.5 / 4.7</span>
+        <span className="m-arch-sub">glm_moe_dsa</span>
+      </td>
+      <td className="c"><span className="m-pill partial">preview</span></td>
+      <td className="c"><span className="m-pill no">—</span></td>
+      <td className="c"><span className="m-pill up">upstream</span></td>
+      <td className="c"><span className="m-pill up">upstream</span></td>
+      <td>
+        <div className="m-sizes">
+          <a className="m-size" href="https://huggingface.co/zai-org/GLM-4.5-Air">4.5-Air</a>
+          <a className="m-size" href="https://huggingface.co/zai-org/GLM-4.5">4.5</a>
+          <a className="m-size" href="https://huggingface.co/zai-org/GLM-4.7-Flash">4.7-Flash</a>
+        </div>
+      </td>
+    </tr>
+
+    <tr className="m-group"><td colSpan={6}>Nemotron</td></tr>
+
+    <tr>
+      <td>
+        <span className="m-arch-name">Nemotron-H</span>
+        <span className="m-arch-sub">nemotron_h</span>
+      </td>
+      <td className="c"><span className="m-pill yes">stable</span></td>
+      <td className="c"><span className="m-pill no">—</span></td>
+      <td className="c"><span className="m-pill no">—</span></td>
+      <td className="c"><span className="m-pill no">—</span></td>
+      <td>
+        <div className="m-sizes">
+          <a className="m-size" href="https://huggingface.co/nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16">30B-A3B</a>
+          <a className="m-size" href="https://huggingface.co/nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-BF16">Omni-30B-A3B</a>
+        </div>
+      </td>
+    </tr>
+
+    <tr className="m-group"><td colSpan={6}>DeepSeek / Kimi</td></tr>
+
+    <tr>
+      <td>
+        <span className="m-arch-name">DeepSeek V3</span>
+        <span className="m-arch-sub">deepseek_v3</span>
+      </td>
+      <td className="c"><span className="m-pill partial">preview</span></td>
+      <td className="c"><span className="m-pill no">—</span></td>
+      <td className="c"><span className="m-pill up">upstream</span></td>
+      <td className="c"><span className="m-pill up">upstream</span></td>
+      <td>
+        <div className="m-sizes">
+          <a className="m-size" href="https://huggingface.co/deepseek-ai/DeepSeek-V3">V3</a>
+          <a className="m-size" href="https://huggingface.co/deepseek-ai/DeepSeek-V3.1">V3.1</a>
+          <a className="m-size" href="https://huggingface.co/deepseek-ai/DeepSeek-V3.2-Exp">V3.2-Exp</a>
+        </div>
+      </td>
+    </tr>
+
+    <tr>
+      <td>
+        <span className="m-arch-name">Kimi K2</span>
+        <span className="m-arch-sub">kimi_k2</span>
+      </td>
+      <td className="c"><span className="m-pill partial">preview</span></td>
+      <td className="c"><span className="m-pill no">—</span></td>
+      <td className="c"><span className="m-pill up">upstream</span></td>
+      <td className="c"><span className="m-pill up">upstream</span></td>
+      <td>
+        <div className="m-sizes">
+          <a className="m-size" href="https://huggingface.co/moonshotai/Kimi-K2-Base">Base</a>
+          <a className="m-size" href="https://huggingface.co/moonshotai/Kimi-K2-Instruct">Instruct</a>
+        </div>
+      </td>
+    </tr>
+
+    <tr className="m-group"><td colSpan={6}>Sesame</td></tr>
+
+    <tr>
+      <td>
+        <span className="m-arch-name">CSM</span>
+        <span className="m-arch-sub">csm</span>
+      </td>
+      <td className="c"><span className="m-pill partial">preview</span></td>
+      <td className="c"><span className="m-pill no">—</span></td>
+      <td className="c"><span className="m-pill no">—</span></td>
+      <td className="c"><span className="m-pill no">—</span></td>
+      <td>
+        <div className="m-sizes">
+          <a className="m-size" href="https://huggingface.co/eustlb/csm-1b">1B</a>
+        </div>
+      </td>
+    </tr>
+
 </tbody>
 </table>
 </div>
 
 </div>
+
+**Multimodal models.** `Qwen3-VL` (vision), `Gemma 4` (vision + audio), `Nemotron-3 Omni` (vision + audio), and `CSM` (audio output) accept or produce non-text modalities. See [Multimodal generation](/docs/guide/model/multimodal).
+

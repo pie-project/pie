@@ -47,29 +47,30 @@ pub struct BridgeRegistry {
 impl std::fmt::Debug for BridgeRegistry {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let names: Vec<String> = self.servers.iter().map(|r| r.key().clone()).collect();
-        f.debug_struct("BridgeRegistry").field("servers", &names).finish()
+        f.debug_struct("BridgeRegistry")
+            .field("servers", &names)
+            .finish()
     }
 }
 
 impl BridgeRegistry {
     pub fn new() -> Self {
-        Self { servers: DashMap::new() }
+        Self {
+            servers: DashMap::new(),
+        }
     }
 
     /// Spawn a stdio MCP server, complete the `initialize` handshake, and
     /// publish it under `name`. Fails if `name` is already registered or if
     /// the handshake doesn't succeed.
-    pub async fn register_stdio(
-        &self,
-        name: &str,
-        command: &str,
-        args: &[String],
-    ) -> Result<()> {
+    pub async fn register_stdio(&self, name: &str, command: &str, args: &[String]) -> Result<()> {
         if self.servers.contains_key(name) {
             bail!("MCP server '{}' already registered", name);
         }
         let server = StdioServer::spawn(name, command, args).await?;
-        server.handshake().await
+        server
+            .handshake()
+            .await
             .with_context(|| format!("MCP handshake with '{}' failed", name))?;
         self.servers.insert(name.to_string(), Arc::new(server));
         Ok(())
@@ -81,7 +82,9 @@ impl BridgeRegistry {
 }
 
 impl Default for BridgeRegistry {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 // =============================================================================
@@ -101,7 +104,11 @@ struct StdioInner {
 /// outer handle so that dropping the registry entry tears down the child
 /// without leaking tasks.
 struct AbortOnDrop(JoinHandle<()>);
-impl Drop for AbortOnDrop { fn drop(&mut self) { self.0.abort(); } }
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
 
 /// A connection to a single stdio MCP server. Cheap to clone (`Arc`), all
 /// methods route through the multiplexed JSON-RPC channel.
@@ -144,9 +151,15 @@ impl StdioServer {
         let writer = tokio::spawn(async move {
             let mut stdin = stdin;
             while let Some(line) = line_rx.recv().await {
-                if stdin.write_all(line.as_bytes()).await.is_err() { break; }
-                if stdin.write_all(b"\n").await.is_err() { break; }
-                if stdin.flush().await.is_err() { break; }
+                if stdin.write_all(line.as_bytes()).await.is_err() {
+                    break;
+                }
+                if stdin.write_all(b"\n").await.is_err() {
+                    break;
+                }
+                if stdin.flush().await.is_err() {
+                    break;
+                }
             }
         });
 
@@ -162,11 +175,16 @@ impl StdioServer {
                     Ok(_) => {}
                 }
                 let trimmed = line.trim();
-                if trimmed.is_empty() { continue; }
+                if trimmed.is_empty() {
+                    continue;
+                }
                 let v: Value = match serde_json::from_str(trimmed) {
                     Ok(v) => v,
                     Err(e) => {
-                        eprintln!("[mcp:{}] non-JSON line ({}): {}", reader_inner.name, e, trimmed);
+                        eprintln!(
+                            "[mcp:{}] non-JSON line ({}): {}",
+                            reader_inner.name, e, trimmed
+                        );
                         continue;
                     }
                 };
@@ -179,10 +197,17 @@ impl StdioServer {
                 if let Some((_, sender)) = reader_inner.pending.remove(&id) {
                     let outcome = if let Some(err) = v.get("error") {
                         let code = err.get("code").and_then(Value::as_i64).unwrap_or(-32000);
-                        let message = err.get("message").and_then(Value::as_str)
-                            .unwrap_or("MCP error").to_string();
+                        let message = err
+                            .get("message")
+                            .and_then(Value::as_str)
+                            .unwrap_or("MCP error")
+                            .to_string();
                         let data = err.get("data").cloned();
-                        Err(JsonRpcError { code, message, data })
+                        Err(JsonRpcError {
+                            code,
+                            message,
+                            data,
+                        })
                     } else {
                         Ok(v.get("result").cloned().unwrap_or(Value::Null))
                     };
@@ -236,7 +261,8 @@ impl StdioServer {
                 "version": env!("CARGO_PKG_VERSION"),
             },
         });
-        self.call("initialize", init_params).await
+        self.call("initialize", init_params)
+            .await
             .map_err(|e| anyhow!("{}", e))?;
         // Notification — no response expected.
         self.notify("notifications/initialized", json!({}))?;
@@ -293,7 +319,9 @@ impl StdioServer {
             "method": method,
             "params": params,
         });
-        self.inner.stdin_tx.send(req.to_string())
+        self.inner
+            .stdin_tx
+            .send(req.to_string())
             .map_err(|_| anyhow!("MCP server '{}' input closed", self.inner.name))?;
         Ok(())
     }

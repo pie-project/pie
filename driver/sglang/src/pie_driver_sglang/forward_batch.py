@@ -73,6 +73,7 @@ def build_sglang_forward_batch(
 ) -> Any:
     """Build a `ForwardBatch` from pie's `inputs` dict."""
     from sglang.srt.model_executor.forward_batch_info import (
+        CaptureHiddenMode,
         ForwardBatch,
         ForwardMode,
     )
@@ -91,6 +92,11 @@ def build_sglang_forward_batch(
     seq_lens_np = ((pages_per_req - 1) * page_size + kv_last_np).astype(np.int32)
     extend_seq_lens_np = (qo_indptr_np[1:] - qo_indptr_np[:-1]).astype(np.int32)
     extend_prefix_lens_np = (seq_lens_np - extend_seq_lens_np).astype(np.int32)
+    use_decode_mode = (
+        bool(inputs.get("single_token_inference_mode"))
+        and inputs.get("custom_mask") is None
+        and bool(np.all(extend_seq_lens_np == 1))
+    )
 
     # ---- req_to_token rows + out_cache_loc, built in one numba pass ----
     # We claim the first `batch_size` slots in sglang's req_to_token_pool;
@@ -122,18 +128,10 @@ def build_sglang_forward_batch(
     extend_prefix_lens_t = torch.from_numpy(extend_prefix_lens_np).to(device, non_blocking=True)
     positions = inputs["position_ids"].to(device=device, dtype=torch.int64, non_blocking=True)
 
-    # We always use EXTEND. SGLang's decode kernel doesn't accept custom_mask
-    # nor pie's caller-supplied positions; the extend kernel handles
-    # query_len=1 fine via per-request `extend_seq_lens=1, prefix_lens=N`.
-    #
-    # NOTE: this means sglang's CUDA graphs (captured for the DECODE kernel)
-    # can't be used at high concurrency — pie throughput on sglang plateaus
-    # around 100 req/s on c=256 workloads on a 4090 because every step runs
-    # the prefill kernel. Proper fix requires routing single-token-no-mask
-    # batches through ForwardMode.DECODE plus the missing graph-runner
-    # plumbing (`capture_hidden_mode`, etc.) — out of scope for now.
+    forward_mode = ForwardMode.DECODE if use_decode_mode else ForwardMode.EXTEND
+
     fb = ForwardBatch(
-        forward_mode=ForwardMode.EXTEND,
+        forward_mode=forward_mode,
         batch_size=batch_size,
         input_ids=inputs["token_ids"].to(device=device, dtype=torch.int32, non_blocking=True),
         req_pool_indices=req_pool_indices_t,
@@ -142,13 +140,14 @@ def build_sglang_forward_batch(
         seq_lens_sum=int(seq_lens_np.sum()),
         seq_lens_cpu=seq_lens_cpu_t,
         positions=positions,
-        extend_num_tokens=int(extend_seq_lens_np.sum()),
-        extend_seq_lens=extend_seq_lens_t,
-        extend_prefix_lens=extend_prefix_lens_t,
-        extend_prefix_lens_cpu=extend_prefix_lens_np.tolist(),
-        extend_seq_lens_cpu=extend_seq_lens_np.tolist(),
+        extend_num_tokens=None if use_decode_mode else int(extend_seq_lens_np.sum()),
+        extend_seq_lens=None if use_decode_mode else extend_seq_lens_t,
+        extend_prefix_lens=None if use_decode_mode else extend_prefix_lens_t,
+        extend_prefix_lens_cpu=None if use_decode_mode else extend_prefix_lens_np.tolist(),
+        extend_seq_lens_cpu=None if use_decode_mode else extend_seq_lens_np.tolist(),
         req_to_token_pool=runner.req_to_token_pool,
         token_to_kv_pool=runner.token_to_kv_pool,
         attn_backend=runner.attn_backend,
+        capture_hidden_mode=CaptureHiddenMode.NULL,
     )
     return fb

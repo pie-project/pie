@@ -20,7 +20,7 @@ on:
         type: boolean
         default: true
       cuda:
-        description: "Build CUDA matrix on self-hosted GPU runner (cuda 12.6/12.8/13.0 × {cuda, portable-cuda})"
+        description: "Build CUDA matrix on self-hosted GPU runner (cuda 12.8/13.0 × {cuda, portable-cuda})"
         type: boolean
         default: true
       cuda_manylinux:
@@ -362,12 +362,12 @@ jobs:
         # doesn't have. The portable-cuda flavor (no driver-cuda /
         # flashinfer) covers Turing users.
         cuda:
-          - { version: "12.6.3", short: "12.6", path: "/usr/local/cuda-12.6", arch: "80;86;89;90" }
-          - { version: "12.8.1", short: "12.8", path: "/usr/local/cuda-12.8", arch: "80;86;89;90;100;120" }
+          # Self-hosted runner (Workstation-cuda) currently provides only the
+          # 13.0 toolkit; re-add 12.8 here once /usr/local/cuda-12.8 exists.
+          # (12.8 broad-compat artifacts come from the cuda-manylinux job.)
           - { version: "13.0.0", short: "13.0", path: "/usr/local/cuda-13.0", arch: "80;86;89;90;100;120" }
         flavor:
           - { id: "cuda",          features: "driver-portable,driver-cuda,driver-dummy" }
-          - { id: "portable-cuda", features: "driver-portable,driver-dummy" }
     env:
       ARTIFACT_NAME: pie-x86_64-linux-${{ matrix.flavor.id }}${{ matrix.cuda.short }}.tar.gz
       PIE_PORTABLE_CUDA: "1"
@@ -404,7 +404,7 @@ jobs:
       CMAKE_CUDA_COMPILER_LAUNCHER: env
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           # Workspace persists between jobs on bare-metal; clean to keep
           # builds reproducible. The big caches live outside the
@@ -473,7 +473,7 @@ jobs:
         # Pure-JS action — no `gh` install required on the bare-metal
         # runner. Existing assets with the same name are replaced
         # (same effect as `gh release upload --clobber`).
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ inputs.tag }}
           files: dist/${{ env.ARTIFACT_NAME }}
@@ -494,18 +494,22 @@ jobs:
     if: inputs.cuda_manylinux
     needs: prepare-release
     name: cuda / x86_64-manylinux_2_28 / ${{ matrix.flavor.id }}-${{ matrix.cuda.short }}
-    runs-on: ubuntu-22.04
-    timeout-minutes: 120
+    # Set the repo variable CUDA_MANYLINUX_RUNNER to a larger runner label
+    # (e.g. a GitHub larger runner) to speed up the 6-arch CUDA build; falls
+    # back to the standard GH-hosted runner when unset.
+    runs-on: ${{ vars.CUDA_MANYLINUX_RUNNER || 'ubuntu-22.04' }}
+    # 240m is a safety net for the slow default GH runner; set the
+    # CUDA_MANYLINUX_RUNNER repo variable to a larger runner and (with the
+    # sccache warm cache) this finishes in a small fraction of that.
+    timeout-minutes: 240
     strategy:
       fail-fast: false
       matrix:
         cuda:
-          - { version: "12.6.3", short: "12.6", arch: "80;86;89;90" }
           - { version: "12.8.1", short: "12.8", arch: "80;86;89;90;100;120" }
           - { version: "13.0.0", short: "13.0", arch: "80;86;89;90;100;120" }
         flavor:
           - { id: "cuda",          features: "driver-portable,driver-cuda,driver-dummy" }
-          - { id: "portable-cuda", features: "driver-portable,driver-dummy" }
     container: nvidia/cuda:${{ matrix.cuda.version }}-devel-rockylinux8
     env:
       ARTIFACT_NAME: pie-x86_64-manylinux_2_28-${{ matrix.flavor.id }}${{ matrix.cuda.short }}.tar.gz
@@ -515,7 +519,7 @@ jobs:
       CMAKE_CUDA_RUNTIME_LIBRARY: Shared
       CARGO_INCREMENTAL: "0"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Bootstrap container
         shell: bash
@@ -546,6 +550,12 @@ jobs:
             echo "PATH=/opt/rh/gcc-toolset-12/root/usr/bin:${PATH}"
             echo "LD_LIBRARY_PATH=/opt/rh/gcc-toolset-12/root/usr/lib64:/opt/rh/gcc-toolset-12/root/usr/lib"
             echo "PKG_CONFIG_PATH=/opt/rh/gcc-toolset-12/root/usr/lib64/pkgconfig"
+            # rustc's final link must go through the gcc-toolset-12 gcc driver
+            # so libstdc++_nonshared.a is pulled in for the C++17/20 libstdc++
+            # symbols (std::filesystem, std::__throw_bad_array_new_length) the
+            # C++ drivers use. The stock /usr/bin/cc (gcc-8.5) links the old
+            # system libstdc++ and fails the link with undefined symbols.
+            echo "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=/opt/rh/gcc-toolset-12/root/usr/bin/gcc"
           } >> "$GITHUB_ENV"
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
             sh -s -- -y --profile minimal --default-toolchain stable
@@ -582,7 +592,7 @@ jobs:
           ls -la dist/
 
       - name: Upload to release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ inputs.tag }}
           files: dist/${{ env.ARTIFACT_NAME }}

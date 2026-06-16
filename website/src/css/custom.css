@@ -346,7 +346,7 @@ table tbody tr:hover {
 .navbar__search-input:focus {
   outline: none;
   border-color: var(--ifm-color-primary);
-  background: var(--pie-bg-elev);
+  background-color: var(--pie-bg-elev);
   width: 16rem;
 }
 
