@@ -111,6 +111,11 @@ public:
     virtual const StTensor* find(const std::string& name) const noexcept = 0;
     virtual const StTensor& at(const std::string& name) const = 0;
     virtual std::size_t num_tensors() const noexcept = 0;
+    // True when the weights came from a GGUF file. Per-arch loaders use
+    // this to invert convert-time value transforms (e.g. the Qwen 3.5
+    // A_log = -exp and folded-norm +1) that a safetensors source does not
+    // carry. Defaults false; only `GGUFArchive` overrides it.
+    virtual bool is_gguf() const noexcept { return false; }
 };
 
 // Top-level safetensors archive: handles single-file or sharded models.

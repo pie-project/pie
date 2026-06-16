@@ -385,6 +385,16 @@ private:
                                          std::int32_t conv_dim,
                                          std::int32_t conv_kernel);
 
+    // Qwen 3.5 / 3.6 GGUF value-transform inverses. A GGUF produced by
+    // llama.cpp's qwen35 converter pre-applies two transforms our
+    // safetensors-shaped graph does not expect: `A_log` is stored as
+    // `-exp(A_log)`, and every `*norm.weight` except `linear_attn.norm`
+    // is folded `+1`. These synth the inverse (raw `A_log = log(-x)`;
+    // raw norm `w = x - 1`) at load so the shared graph is unchanged.
+    // No-op passthrough to `declare_` for a safetensors source.
+    ggml_tensor* declare_qwen3_5_a_log_(const std::string& hf_name);
+    ggml_tensor* declare_qwen3_5_folded_norm_(const std::string& hf_name);
+
     // Load tok_embd / output_norm / (optional) output_head and resize the
     // per-layer vector. Common to all archs.
     void load_top_level_();
