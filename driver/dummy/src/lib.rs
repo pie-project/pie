@@ -182,9 +182,17 @@ fn run_impl(
                     ArchivedRequestPayload::Health => {
                         let _ = lease.commit_status(0);
                     }
-                    _ => {
-                        eprintln!("[pie-driver-dummy] unsupported payload variant");
-                        let _ = lease.commit_status(-1);
+                    // The dummy has no real KV/recurrent state and no adapter
+                    // weights, so a page Copy or adapter Load has nothing to
+                    // move — and since token generation is random (independent
+                    // of cache contents), acking these as vacuous no-ops is the
+                    // faithful no-compute behavior. The runtime forks contexts
+                    // via Copy for prefix sharing / grammar-constrained
+                    // sub-generation; erroring here would break those paths and
+                    // silently drop the logit-mask constraint.
+                    ArchivedRequestPayload::Copy(_)
+                    | ArchivedRequestPayload::Adapter(_) => {
+                        let _ = lease.commit_status(0);
                     }
                 }
             }
