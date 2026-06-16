@@ -27,6 +27,9 @@
 
 namespace pie_portable_driver {
 
+class Model;
+void load_with_rust_storage_program(Model& model);
+
 // Per-layer weights, raw split-projection layout (matches HF; no QKV/MLP
 // fusion). The graph builder is free to fuse on the fly. Optional tensors
 // (biases, QK-norm) are nullptr when the architecture doesn't use them.
@@ -233,7 +236,7 @@ public:
     ggml_backend_t       backend() const noexcept { return backend_; }
     std::string          backend_name() const noexcept;
 
-    // CPU-side companion backend, used by `ForwardEngine`'s
+    // CPU-side companion backend, used by `Executor`'s
     // `ggml_backend_sched` as the fallback when the primary backend
     // (e.g. ggml-vulkan, ggml-metal) doesn't implement an op the graph
     // requires. Returns null when the primary backend already IS the
@@ -243,7 +246,7 @@ public:
     // True iff the primary backend can run `ggml_argsort` on the full
     // vocab. ggml-vulkan caps argsort at 1024 cols which is far below
     // any modern LLM vocab (Qwen3 = 152k). When this returns false,
-    // ForwardEngine should drive the slow-only path that downloads
+    // Executor should drive the slow-only path that downloads
     // raw logits and samples host-side, avoiding `ggml_top_k` in the
     // graph entirely. Probed once at model load time. Returns true on
     // CPU/CUDA/Metal (full coverage) and on Vulkan only for tiny
@@ -269,6 +272,8 @@ public:
     std::string activation_dtype_str() const;
 
 private:
+    friend void load_with_rust_storage_program(Model& model);
+
     // Per-arch loader description. Captures the structural variations across
     // archs (extra norms, fused/biased QKV, MoE naming) so a single set of
     // loader helpers can drive all of them. Specialized cases that don't fit
@@ -367,6 +372,7 @@ private:
     // by CUDA kernels asserting / preferring F32 (gpt-oss attn_sinks,
     // gemma4 layer_scalar). Avoids a per-batch in-graph ggml_cast.
     ggml_tensor* declare_synth_f32_from_bf16_(const std::string& hf_name);
+    void build_glm_moe_dsa_(); // GLM-5.1 (MLA + MoE, CUDA-only)
     void build_qwen3_moe_();   // qwen3-moe family
     void build_mixtral_();
     void build_qwen3_5_();     // Qwen 3.5 / 3.6 hybrid (gated delta + GQA)
@@ -456,7 +462,7 @@ private:
     ggml_backend_t        backend_     = nullptr;
     // CPU companion for the multi-backend scheduler. Created only when
     // `backend_` is a non-CPU backend (i.e. GPU). Null otherwise. The
-    // scheduler in `ForwardEngine` uses it to absorb ops the GPU
+    // scheduler in `Executor` uses it to absorb ops the GPU
     // backend can't dispatch (e.g. ggml-vulkan's missing CPY pipelines
     // for some bf16 source types). For Qwen3 family + Part A (norm
     // weights upcast to f32), no actual fallback fires in steady state
@@ -464,7 +470,7 @@ private:
     // hard-abort the runtime.
     ggml_backend_t        cpu_fallback_ = nullptr;
     // Probed in the constructor once the primary backend exists. Drives
-    // the slow_only sampling path in ForwardEngine when false.
+    // the slow_only sampling path in Executor when false.
     bool                  supports_in_graph_topk_ = true;
     // Probed alongside `supports_in_graph_topk_`. False until at least one
     // backend ships a `ggml_paged_attn_ext` implementation.
@@ -473,7 +479,7 @@ private:
     ggml_context*         ctx_         = nullptr;
     ggml_backend_buffer_t buf_         = nullptr;
 
-    // Each entry tells `load_into_backend_` where to copy data from.
+    // Each entry tells the Rust storage compiler where to copy data from.
     // `src_offset_bytes` and `copy_bytes` are 0 for full-tensor loads;
     // non-zero `copy_bytes` indicates a sliced load from a fused
     // safetensor (phi3 qkv_proj / gate_up_proj).
@@ -486,12 +492,12 @@ private:
         std::size_t  src_offset_bytes = 0;
         std::size_t  copy_bytes       = 0;
         std::size_t  dst_offset_bytes = 0;
-        // When set, `load_into_backend_` materializes the source bf16
-        // bytes into a temporary f32 buffer before uploading. Used for
-        // small parameters (norm scales, projection biases) that we
-        // promote to f32 at load time so backends that lack a bf16→f32
+        // When set, the Rust storage program materializes the source
+        // bf16 bytes into a temporary f32 buffer before uploading. Used
+        // for small parameters (norm scales, projection biases) that we
+        // promote to f32 at load time so backends that lack a bf16->f32
         // CPY kernel (notably ggml-vulkan, b6993) don't see an implicit
-        // cast in the graph. Memory cost is trivial — norm + bias
+        // cast in the graph. Memory cost is trivial: norm + bias
         // weights together are <1 MB on a 1.7 B model. See
         // `is_small_weight_for_upcast()` in model.cpp for the predicate.
         bool         upcast_bf16_to_f32 = false;
@@ -502,6 +508,11 @@ private:
         // mantissa bits. See `is_small_weight_for_upcast()` for the
         // norms/biases that stay F32.
         bool         downcast_f32_to_bf16 = false;
+        // FP8 checkpoints store projection weights as raw E4M3 bytes plus
+        // a scalar or per-row scale tensor. Runtime ggml matmuls consume
+        // BF16 here, so the loader lowers this as Decode(FP8, scale).
+        bool         decode_fp8_to_bf16 = false;
+        std::string  fp8_scale_hf_name;
     };
     std::vector<DeclaredTensor> declared_;
 

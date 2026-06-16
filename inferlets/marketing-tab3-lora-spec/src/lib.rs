@@ -4,8 +4,6 @@ use inferlet::{
     model::Model,
     runtime,
     sample::Sampler,
-    wstd::http::{Client, Method, Request},
-    wstd::io::{AsyncRead, empty},
 };
 use std::collections::HashMap;
 
@@ -13,7 +11,7 @@ use std::collections::HashMap;
 async fn main(prompt: String) -> Result<String> {
     let model = Model::load(runtime::models().first().unwrap())?;
 
-    let bytes = http_get("https://example.com/loras/math-tutor.safetensors").await?;
+    let bytes = inferlet::http::fetch("https://example.com/loras/math-tutor.safetensors").await?;
     std::fs::write("/scratch/lora.safetensors", &bytes).map_err(|e| e.to_string())?;
     let lora = Adapter::create(&model, "math-tutor")?;
     lora.load("/scratch/lora.safetensors")?;
@@ -28,15 +26,6 @@ async fn main(prompt: String) -> Result<String> {
         .speculator(speculator)
         .max_tokens(512)
         .collect_text().await?)
-}
-
-async fn http_get(url: &str) -> Result<Vec<u8>> {
-    let req = Request::builder().uri(url).method(Method::GET).body(empty())
-        .map_err(|e| e.to_string())?;
-    let mut body = Client::new().send(req).await.map_err(|e| e.to_string())?.into_body();
-    let mut buf = Vec::new();
-    body.read_to_end(&mut buf).await.map_err(|e| e.to_string())?;
-    Ok(buf)
 }
 
 struct NGram { cursor: u32, history: Vec<u32>, table: HashMap<u32, u32> }

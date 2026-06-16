@@ -18,6 +18,12 @@
 //!
 //! All of the work happens in `pie_server::cli::dispatch`.
 
+// mimalloc as the global allocator: thread-cached, low contention,
+// good performance for the burst-allocation pattern the scheduler +
+// chain-extender pool produce.
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 #[cfg(windows)]
 fn main() {
     let handle = std::thread::Builder::new()

@@ -12,7 +12,7 @@ extern "C" {
 #endif
 
 // Capability handshake callback. Fires once after the model loads and
-// the shmem server is open, before the driver enters `serve_forever`.
+// the driver's server is ready, before it enters `serve_forever`.
 // `caps_json` is owned by the lib and only valid for the duration of
 // the callback.
 typedef void (*pie_driver_cuda_ready_cb)(const char* caps_json, void* ctx);
@@ -25,9 +25,9 @@ typedef void (*pie_driver_cuda_fatal_cb)(const char* reason, void* ctx);
 
 // Run the driver with the given argv. Returns a process-style exit code.
 //
-// `install_signal_handlers != 0` installs SIGINT/SIGTERM handlers
-// stopping the shmem server. Library callers (e.g. server/standalone)
-// pass 0 — the host owns signal handling.
+// `install_signal_handlers != 0` installs SIGINT/SIGTERM handlers that
+// stop the driver. Library callers (e.g. server/standalone) pass 0 —
+// the host owns signal handling.
 //
 // `ready_cb` must be non-NULL. The standalone executable provides a
 // default callback that writes `READY <json>` to stdout (preserving
@@ -43,8 +43,13 @@ int pie_driver_cuda_run(int argc,
                         pie_driver_cuda_fatal_cb fatal_cb,
                         void* fatal_ctx);
 
-// Signal the running driver's shmem-serve loop to exit. Idempotent;
-// safe to call from any thread; no-op until the serve loop is reached.
+// An in-process variant (`pie_driver_cuda_run_inproc`) is also exported
+// from entry.cpp; its signature uses a C++-namespaced vtable type
+// (`pie_cuda_driver::PieInProcVTable`) so we keep its declaration out
+// of this C-style header. See `inproc_server.hpp`.
+
+// Signal the running driver's serve loop to exit. Idempotent; safe to
+// call from any thread; no-op until the serve loop is reached.
 // Single-instance only — see driver/portable/src/entry.hpp for the
 // same caveat.
 void pie_driver_cuda_request_stop(void);

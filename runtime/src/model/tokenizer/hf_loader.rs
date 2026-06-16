@@ -45,13 +45,11 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 
 use super::bpe::BpeTable;
-use super::{
-    AddedToken, DecodeStep, NormStep, SplitStep, Tokenizer, VocabType,
-};
+use super::{AddedToken, DecodeStep, NormStep, SplitStep, Tokenizer, VocabType};
 
 /// The classic GPT-2 regex.
 ///
@@ -59,8 +57,7 @@ use super::{
 /// Note: the HF version has an extra `(?!\S)` lookahead on the trailing `\s+`
 /// group. We omit it — the difference is negligible for most inputs and
 /// `fancy_regex` handles `\s+` without the lookahead.
-const GPT2_REGEX: &str =
-    r"'s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+";
+const GPT2_REGEX: &str = r"'s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+";
 
 // ---------------------------------------------------------------------------
 // HuggingFace JSON schema (typed deserialization)
@@ -180,11 +177,7 @@ fn from_hf(hf: HfTokenizerJson) -> Result<Tokenizer> {
         merge_pairs.push(parse_merge_entry(merge_val)?);
     }
 
-    let continuing_subword_prefix = hf
-        .model
-        .continuing_subword_prefix
-        .as_deref()
-        .unwrap_or("");
+    let continuing_subword_prefix = hf.model.continuing_subword_prefix.as_deref().unwrap_or("");
 
     let pre_tokenizer_val = hf
         .pre_tokenizer
@@ -327,8 +320,8 @@ fn build_pipeline(
                 }
 
                 if use_regex {
-                    let re = fancy_regex::Regex::new(GPT2_REGEX)
-                        .context("compiling GPT-2 regex")?;
+                    let re =
+                        fancy_regex::Regex::new(GPT2_REGEX).context("compiling GPT-2 regex")?;
                     split_step = SplitStep::Gpt2RegexSplit(re);
                 }
             }
@@ -365,10 +358,7 @@ fn build_pipeline(
                         }
                     };
 
-                let split = node
-                    .get("split")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(true);
+                let split = node.get("split").and_then(|v| v.as_bool()).unwrap_or(true);
 
                 split_step = SplitStep::MetaspaceSplit {
                     replacement,
@@ -410,7 +400,11 @@ fn build_pipeline(
         split_step = SplitStep::MetaspaceSplit {
             replacement: '▁',
             replacement_str: "▁".to_string(),
-            prepend: if normalizer_prepend { Some(false) } else { None },
+            prepend: if normalizer_prepend {
+                Some(false)
+            } else {
+                None
+            },
             split: false,
         };
     }
@@ -492,10 +486,7 @@ fn build_decode_steps(decoder: &serde_json::Value) -> Result<Vec<DecodeStep>> {
                     .get("pattern")
                     .and_then(|p| p.get("String").and_then(|s| s.as_str()))
                     .unwrap_or("");
-                let content = node
-                    .get("content")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
+                let content = node.get("content").and_then(|v| v.as_str()).unwrap_or("");
 
                 if !pattern.is_empty() {
                     steps.push(DecodeStep::Replace {
@@ -510,18 +501,9 @@ fn build_decode_steps(decoder: &serde_json::Value) -> Result<Vec<DecodeStep>> {
             // Strips up to `start` occurrences of `content` from the
             // beginning and `stop` occurrences from the end of each token.
             "Strip" => {
-                let content = node
-                    .get("content")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or(" ");
-                let start = node
-                    .get("start")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0) as usize;
-                let stop = node
-                    .get("stop")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0) as usize;
+                let content = node.get("content").and_then(|v| v.as_str()).unwrap_or(" ");
+                let start = node.get("start").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                let stop = node.get("stop").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
 
                 steps.push(DecodeStep::Strip {
                     content: content.as_bytes().to_vec(),
@@ -641,10 +623,7 @@ fn collect_norm_replacements(normalizer: &serde_json::Value) -> Vec<(String, Str
                 .get("pattern")
                 .and_then(|p| p.get("String").and_then(|s| s.as_str()))
                 .unwrap_or("");
-            let content = node
-                .get("content")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
+            let content = node.get("content").and_then(|v| v.as_str()).unwrap_or("");
             if pattern.is_empty() {
                 None
             } else {

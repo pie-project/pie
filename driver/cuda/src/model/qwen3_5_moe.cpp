@@ -1,6 +1,7 @@
 #include "model/qwen3_5_moe.hpp"
 
 #include <algorithm>
+#include <cstdlib>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -14,15 +15,31 @@ namespace pie_cuda_driver::model {
 
 namespace {
 
-const DeviceTensor& must(const Engine& e, const std::string& name) {
+const DeviceTensor& must(const LoadedModel& e, const std::string& name) {
     if (!e.has(name)) {
         throw std::runtime_error("qwen3_5_moe: missing weight '" + name + "'");
     }
     return e.get(name);
 }
 
-const DeviceTensor* maybe(const Engine& e, const std::string& name) {
+const DeviceTensor* maybe(const LoadedModel& e, const std::string& name) {
     return e.has(name) ? &e.get(name) : nullptr;
+}
+
+bool fused_gdn_projection_weights_enabled() {
+    static const bool enabled = [] {
+        const char* v = std::getenv("PIE_QWEN35_FUSED_GDN_PROJ");
+        return v != nullptr && v[0] != '\0' && v[0] != '0';
+    }();
+    return enabled;
+}
+
+bool fused_shared_scalar_gate_enabled() {
+    static const bool enabled = [] {
+        const char* v = std::getenv("PIE_QWEN35_FUSED_SHARED_SCALAR_GATE");
+        return v != nullptr && v[0] != '\0' && v[0] != '0';
+    }();
+    return enabled;
 }
 
 // Materialise an owned fp32 copy of `t`. If `t` is already fp32 we still
@@ -49,7 +66,7 @@ DeviceBuffer<float> to_fp32(const DeviceTensor& t) {
 // weights live under `model.language_model.…`. Qwen3-MoE (Qwen3-30B-A3B)
 // is a pure text model and uses `model.…` directly. Pick the prefix from
 // what the engine actually loaded so a single bind covers both.
-const char* select_prefix(const Engine& e) {
+const char* select_prefix(const LoadedModel& e) {
     if (e.has("model.language_model.embed_tokens.weight")) {
         return "model.language_model.";
     }
@@ -107,9 +124,74 @@ DeviceTensor slice_la_kkv_blocked(
     return sliced;
 }
 
+DeviceTensor concat_axis0_bf16(
+    const DeviceTensor& first,
+    const DeviceTensor& second,
+    const char* what)
+{
+    if (first.dtype() != DType::BF16 || second.dtype() != DType::BF16) {
+        throw std::runtime_error(std::string(what) + ": expected bf16 tensors");
+    }
+    if (first.shape().empty() || first.shape().size() != second.shape().size()) {
+        throw std::runtime_error(std::string(what) + ": rank mismatch");
+    }
+    for (std::size_t i = 1; i < first.shape().size(); ++i) {
+        if (first.shape()[i] != second.shape()[i]) {
+            throw std::runtime_error(std::string(what) + ": trailing shape mismatch");
+        }
+    }
+
+    std::vector<std::int64_t> shape = first.shape();
+    shape[0] += second.shape()[0];
+    auto fused = DeviceTensor::allocate(DType::BF16, shape);
+    auto* dst = static_cast<std::uint8_t*>(fused.data());
+    CUDA_CHECK(cudaMemcpy(
+        dst, first.data(), first.nbytes(), cudaMemcpyDeviceToDevice));
+    CUDA_CHECK(cudaMemcpy(
+        dst + first.nbytes(), second.data(), second.nbytes(),
+        cudaMemcpyDeviceToDevice));
+    return fused;
+}
+
+DeviceTensor concat_axis0_bf16(
+    const DeviceTensor& first,
+    const DeviceTensor& second,
+    const DeviceTensor& third,
+    const char* what)
+{
+    if (first.dtype() != DType::BF16 || second.dtype() != DType::BF16 ||
+        third.dtype() != DType::BF16) {
+        throw std::runtime_error(std::string(what) + ": expected bf16 tensors");
+    }
+    if (first.shape().empty() || first.shape().size() != second.shape().size() ||
+        first.shape().size() != third.shape().size()) {
+        throw std::runtime_error(std::string(what) + ": rank mismatch");
+    }
+    for (std::size_t i = 1; i < first.shape().size(); ++i) {
+        if (first.shape()[i] != second.shape()[i] ||
+            first.shape()[i] != third.shape()[i]) {
+            throw std::runtime_error(std::string(what) + ": trailing shape mismatch");
+        }
+    }
+
+    std::vector<std::int64_t> shape = first.shape();
+    shape[0] += second.shape()[0] + third.shape()[0];
+    auto fused = DeviceTensor::allocate(DType::BF16, shape);
+    auto* dst = static_cast<std::uint8_t*>(fused.data());
+    CUDA_CHECK(cudaMemcpy(
+        dst, first.data(), first.nbytes(), cudaMemcpyDeviceToDevice));
+    CUDA_CHECK(cudaMemcpy(
+        dst + first.nbytes(), second.data(), second.nbytes(),
+        cudaMemcpyDeviceToDevice));
+    CUDA_CHECK(cudaMemcpy(
+        dst + first.nbytes() + second.nbytes(), third.data(), third.nbytes(),
+        cudaMemcpyDeviceToDevice));
+    return fused;
+}
+
 }  // namespace
 
-Qwen3_5MoeWeights bind_qwen3_5_moe(Engine& engine) {
+Qwen3_5MoeWeights bind_qwen3_5_moe(const LoadedModel& engine) {
     const auto& cfg = engine.hf_config();
     const int L = cfg.num_hidden_layers;
     // Qwen3-MoE (Qwen3-30B-A3B) is full-attention only — its config has
@@ -161,9 +243,10 @@ Qwen3_5MoeWeights bind_qwen3_5_moe(Engine& engine) {
                        : &must(engine, "lm_head.weight");
 
     // Stable storage for sliced linear-attn + routed-expert tensors.
-    // Per layer we may push: 3 linear-attn slices (qkv, conv_w, conv_b) +
-    // 2 MoE expert slices (gate_up, down) = 5 tensors at most.
-    w.owned_bf16_buffers.reserve(static_cast<std::size_t>(L) * 5);
+    // Per layer we may push: 3 linear-attn slices (qkv, conv_w, conv_b),
+    // 2 fused linear-attn projection tensors, and a fused shared-expert
+    // gate/up tensor.
+    w.owned_bf16_buffers.reserve(static_cast<std::size_t>(L) * 8);
 
     const int T = std::max(1, engine.distributed().tp_size);
     const int rank = engine.distributed().tp_rank;
@@ -180,8 +263,8 @@ Qwen3_5MoeWeights bind_qwen3_5_moe(Engine& engine) {
         if (kind == "linear_attention") {
             Lw.kind = Qwen3_5MoeLayerWeights::Kind::LinearAttn;
             const std::string la = lp + "linear_attn.";
-            const auto& full_qkv = must(engine, la + "in_proj_qkv.weight");
-            const auto& full_conv_w = must(engine, la + "conv1d.weight");
+            const auto* full_qkv = &must(engine, la + "in_proj_qkv.weight");
+            const auto* full_conv_w = &must(engine, la + "conv1d.weight");
             const auto* full_conv_b = maybe(engine, la + "conv1d.bias");
             // Linear-attn fused QKV / conv1d use the [K1 | K2 | V] block
             // layout — same custom slicing as Qwen3_5 dense.
@@ -189,10 +272,10 @@ Qwen3_5MoeWeights bind_qwen3_5_moe(Engine& engine) {
             const int V_dim = cfg.linear_num_value_heads * cfg.linear_value_head_dim;
             if (T > 1) {
                 w.owned_bf16_buffers.push_back(
-                    slice_la_kkv_blocked(full_qkv, K_dim, V_dim, rank, T));
+                    slice_la_kkv_blocked(*full_qkv, K_dim, V_dim, rank, T));
                 Lw.la_in_proj_qkv = &w.owned_bf16_buffers.back();
                 w.owned_bf16_buffers.push_back(
-                    slice_la_kkv_blocked(full_conv_w, K_dim, V_dim, rank, T));
+                    slice_la_kkv_blocked(*full_conv_w, K_dim, V_dim, rank, T));
                 Lw.la_conv1d_w = &w.owned_bf16_buffers.back();
                 if (full_conv_b) {
                     w.owned_bf16_buffers.push_back(
@@ -202,13 +285,23 @@ Qwen3_5MoeWeights bind_qwen3_5_moe(Engine& engine) {
                     Lw.la_conv1d_b = nullptr;
                 }
             } else {
-                Lw.la_in_proj_qkv = &full_qkv;
-                Lw.la_conv1d_w    = &full_conv_w;
+                Lw.la_in_proj_qkv = full_qkv;
+                Lw.la_conv1d_w    = full_conv_w;
                 Lw.la_conv1d_b    = full_conv_b;
             }
             Lw.la_in_proj_z   = &must(engine, la + "in_proj_z.weight");
             Lw.la_in_proj_b   = &must(engine, la + "in_proj_b.weight");
             Lw.la_in_proj_a   = &must(engine, la + "in_proj_a.weight");
+            if (fused_gdn_projection_weights_enabled()) {
+                w.owned_bf16_buffers.push_back(concat_axis0_bf16(
+                    *Lw.la_in_proj_qkv, *Lw.la_in_proj_z,
+                    "qwen3_5_moe: fuse linear_attn.in_proj_qkvz"));
+                Lw.la_in_proj_qkvz = &w.owned_bf16_buffers.back();
+                w.owned_bf16_buffers.push_back(concat_axis0_bf16(
+                    *Lw.la_in_proj_b, *Lw.la_in_proj_a,
+                    "qwen3_5_moe: fuse linear_attn.in_proj_ba"));
+                Lw.la_in_proj_ba = &w.owned_bf16_buffers.back();
+            }
             Lw.la_dt_bias     = &must(engine, la + "dt_bias");
             // Materialise fp32 copies of A_log + RMSNormGated weight so
             // the kernel signature stays uniform across Qwen3.5 (fp32 on
@@ -228,6 +321,10 @@ Qwen3_5MoeWeights bind_qwen3_5_moe(Engine& engine) {
             Lw.fa_o_proj = &must(engine, fa + "o_proj.weight");
             Lw.fa_q_norm = &must(engine, fa + "q_norm.weight");
             Lw.fa_k_norm = &must(engine, fa + "k_norm.weight");
+            Lw.fa_q_proj_quant = engine.quant_meta(fa + "q_proj.weight");
+            Lw.fa_k_proj_quant = engine.quant_meta(fa + "k_proj.weight");
+            Lw.fa_v_proj_quant = engine.quant_meta(fa + "v_proj.weight");
+            Lw.fa_o_proj_quant = engine.quant_meta(fa + "o_proj.weight");
             Lw.kv_layer = kv_slot++;
         } else {
             throw std::runtime_error(
@@ -252,7 +349,100 @@ Qwen3_5MoeWeights bind_qwen3_5_moe(Engine& engine) {
             Lw.shared_up_proj   = &must(engine, lp + "mlp.shared_expert.up_proj.weight");
             Lw.shared_down_proj = &must(engine, lp + "mlp.shared_expert.down_proj.weight");
             Lw.shared_gate      = &must(engine, lp + "mlp.shared_expert_gate.weight");
+            Lw.shared_gate_proj_quant =
+                engine.quant_meta(lp + "mlp.shared_expert.gate_proj.weight");
+            Lw.shared_up_proj_quant =
+                engine.quant_meta(lp + "mlp.shared_expert.up_proj.weight");
+            Lw.shared_down_proj_quant =
+                engine.quant_meta(lp + "mlp.shared_expert.down_proj.weight");
+            Lw.shared_gate_quant =
+                engine.quant_meta(lp + "mlp.shared_expert_gate.weight");
+            if (!Lw.shared_gate_proj_quant.has_value() &&
+                !Lw.shared_up_proj_quant.has_value() &&
+                Lw.shared_gate_proj->dtype() == DType::BF16 &&
+                Lw.shared_up_proj->dtype() == DType::BF16) {
+                if (fused_shared_scalar_gate_enabled() &&
+                    !Lw.shared_gate_quant.has_value() &&
+                    Lw.shared_gate != nullptr &&
+                    Lw.shared_gate->dtype() == DType::BF16) {
+                    w.owned_bf16_buffers.push_back(concat_axis0_bf16(
+                        *Lw.shared_gate_proj, *Lw.shared_up_proj, *Lw.shared_gate,
+                        "qwen3_5_moe: fuse mlp.shared_expert.gate_up_gate_proj"));
+                    Lw.shared_gate_up_gate_proj = &w.owned_bf16_buffers.back();
+                } else {
+                    w.owned_bf16_buffers.push_back(concat_axis0_bf16(
+                        *Lw.shared_gate_proj, *Lw.shared_up_proj,
+                        "qwen3_5_moe: fuse mlp.shared_expert.gate_up_proj"));
+                    Lw.shared_gate_up_proj = &w.owned_bf16_buffers.back();
+                }
+            }
         }
+    }
+
+    if (cfg.mtp_num_hidden_layers > 0 && engine.has("mtp.fc.weight")) {
+        Qwen3_5MoeWeights::MtpWeights mtp;
+        mtp.pre_fc_norm_embedding = &must(engine, "mtp.pre_fc_norm_embedding.weight");
+        mtp.pre_fc_norm_hidden = &must(engine, "mtp.pre_fc_norm_hidden.weight");
+        mtp.fc = &must(engine, "mtp.fc.weight");
+        mtp.norm = &must(engine, "mtp.norm.weight");
+        mtp.embed = cfg.mtp_use_dedicated_embeddings
+            ? &must(engine, "mtp.embed_tokens.weight")
+            : w.embed;
+
+        const std::string lp = "mtp.layers.0.";
+        auto& Lw = mtp.layer;
+        Lw.kind = Qwen3_5MoeLayerWeights::Kind::FullAttn;
+        Lw.attn_norm_pre = &must(engine, lp + "input_layernorm.weight");
+        Lw.mlp_norm_pre = &must(engine, lp + "post_attention_layernorm.weight");
+        const std::string fa = lp + "self_attn.";
+        Lw.fa_q_proj = &must(engine, fa + "q_proj.weight");
+        Lw.fa_k_proj = &must(engine, fa + "k_proj.weight");
+        Lw.fa_v_proj = &must(engine, fa + "v_proj.weight");
+        Lw.fa_o_proj = &must(engine, fa + "o_proj.weight");
+        Lw.fa_q_norm = &must(engine, fa + "q_norm.weight");
+        Lw.fa_k_norm = &must(engine, fa + "k_norm.weight");
+        Lw.fa_q_proj_quant = engine.quant_meta(fa + "q_proj.weight");
+        Lw.fa_k_proj_quant = engine.quant_meta(fa + "k_proj.weight");
+        Lw.fa_v_proj_quant = engine.quant_meta(fa + "v_proj.weight");
+        Lw.fa_o_proj_quant = engine.quant_meta(fa + "o_proj.weight");
+        Lw.moe_router = &must(engine, lp + "mlp.gate.weight");
+        Lw.moe_gate_up_proj = &must(engine, lp + "mlp.experts.gate_up_proj");
+        Lw.moe_down_proj = &must(engine, lp + "mlp.experts.down_proj");
+        if (has_shared_expert) {
+            Lw.shared_gate_proj = &must(engine, lp + "mlp.shared_expert.gate_proj.weight");
+            Lw.shared_up_proj = &must(engine, lp + "mlp.shared_expert.up_proj.weight");
+            Lw.shared_down_proj = &must(engine, lp + "mlp.shared_expert.down_proj.weight");
+            Lw.shared_gate = &must(engine, lp + "mlp.shared_expert_gate.weight");
+            Lw.shared_gate_proj_quant =
+                engine.quant_meta(lp + "mlp.shared_expert.gate_proj.weight");
+            Lw.shared_up_proj_quant =
+                engine.quant_meta(lp + "mlp.shared_expert.up_proj.weight");
+            Lw.shared_down_proj_quant =
+                engine.quant_meta(lp + "mlp.shared_expert.down_proj.weight");
+            Lw.shared_gate_quant =
+                engine.quant_meta(lp + "mlp.shared_expert_gate.weight");
+            if (!Lw.shared_gate_proj_quant.has_value() &&
+                !Lw.shared_up_proj_quant.has_value() &&
+                Lw.shared_gate_proj->dtype() == DType::BF16 &&
+                Lw.shared_up_proj->dtype() == DType::BF16) {
+                if (fused_shared_scalar_gate_enabled() &&
+                    !Lw.shared_gate_quant.has_value() &&
+                    Lw.shared_gate != nullptr &&
+                    Lw.shared_gate->dtype() == DType::BF16) {
+                    w.owned_bf16_buffers.push_back(concat_axis0_bf16(
+                        *Lw.shared_gate_proj, *Lw.shared_up_proj, *Lw.shared_gate,
+                        "qwen3_5_moe: fuse mtp.shared_expert.gate_up_gate_proj"));
+                    Lw.shared_gate_up_gate_proj = &w.owned_bf16_buffers.back();
+                } else {
+                    w.owned_bf16_buffers.push_back(concat_axis0_bf16(
+                        *Lw.shared_gate_proj, *Lw.shared_up_proj,
+                        "qwen3_5_moe: fuse mtp.shared_expert.gate_up_proj"));
+                    Lw.shared_gate_up_proj = &w.owned_bf16_buffers.back();
+                }
+            }
+        }
+        Lw.kv_layer = kv_slot++;
+        w.mtp = mtp;
     }
 
     return w;

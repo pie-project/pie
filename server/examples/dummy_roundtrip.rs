@@ -279,13 +279,8 @@ type = "dummy"
 device = ["cpu"]
 
 [model.driver.options]
-kv_page_size = 16
-max_num_kv_pages = 256
-max_batch_tokens = 4096
-max_batch_size = 128
 vocab_size = 151936
 arch_name = "qwen3"
-max_model_len = 4096
 "#
     )
 }

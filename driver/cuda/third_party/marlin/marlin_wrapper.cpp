@@ -118,6 +118,73 @@ void launch_gptq_gemm_w4a16_bf16(
         /*is_zp_float=*/    false);
 }
 
+void launch_mxfp4_gemm_w4a16_bf16(
+    const void* act_bf16,
+    const void* w_mxfp4_packed,
+    const void* scales_e8m0,
+    void*       out_bf16,
+    void*       reduce_scratch,
+    void*       workspace,
+    int         M,
+    int         N,
+    int         K,
+    cudaStream_t stream)
+{
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess) {
+        throw std::runtime_error("marlin: cudaGetDevice failed");
+    }
+    int sms = 0;
+    if (cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev)
+            != cudaSuccess) {
+        throw std::runtime_error("marlin: failed to query SM count");
+    }
+
+    const auto a_type = vllm::kBFloat16;
+    const auto b_type = vllm::kFE2M1f;
+    const auto c_type = vllm::kBFloat16;
+    const auto s_type = vllm::kFE8M0fnu;
+    constexpr int group_size = 32;
+    if (K % group_size != 0) {
+        throw std::runtime_error("marlin: MXFP4 K must be divisible by 32");
+    }
+    const int num_groups = K / group_size;
+
+    ::marlin::marlin_mm(
+        /*A=*/         act_bf16,
+        /*B=*/         w_mxfp4_packed,
+        /*C=*/         out_bf16,
+        /*C_tmp=*/     reduce_scratch,
+        /*b_bias=*/    nullptr,
+        /*a_s=*/       nullptr,
+        /*b_s=*/       const_cast<void*>(scales_e8m0),
+        /*g_s=*/       nullptr,
+        /*zp=*/        nullptr,
+        /*g_idx=*/     nullptr,
+        /*perm=*/      nullptr,
+        /*a_tmp=*/     nullptr,
+        /*prob_m=*/    M,
+        /*prob_n=*/    N,
+        /*prob_k=*/    K,
+        /*lda=*/       K,
+        /*workspace=*/ workspace,
+        a_type, b_type, c_type, s_type,
+        /*has_bias=*/      false,
+        /*has_act_order=*/ false,
+        /*is_k_full=*/     true,
+        /*has_zp=*/        false,
+        num_groups,
+        group_size,
+        dev,
+        stream,
+        /*thread_k_init=*/ -1,
+        /*thread_n_init=*/ -1,
+        sms,
+        /*use_atomic_add=*/ false,
+        /*use_fp32_reduce=*/ reduce_scratch != nullptr,
+        /*is_zp_float=*/    false);
+}
+
 void launch_gptq_repack_w4_no_perm(
     const void*  qweight_in,
     void*        repacked_out,

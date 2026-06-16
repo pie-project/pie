@@ -5,10 +5,142 @@
 // new architectures land.
 
 #include <filesystem>
+#include <optional>
 #include <string>
 #include <vector>
 
 namespace pie_cuda_driver {
+
+// Gemma-4 vision encoder (`vision_config`, model_type "gemma4_vision").
+// A Gemma-style ViT — sandwich RMSNorms, encoder RoPE, gated gelu-tanh MLP,
+// clipped-linear quantized projections — NOT vanilla SigLIP. See MULTIMODAL.md
+// §6.1. Confirmed against the shipped `google/gemma-4-E4B` config.
+struct GemmaVisionConfig {
+    int hidden_size = 768;
+    int intermediate_size = 3072;
+    int num_hidden_layers = 16;
+    int num_attention_heads = 12;
+    int num_key_value_heads = 12;
+    int head_dim = 64;
+    int patch_size = 16;
+    float rms_norm_eps = 1e-6f;
+    float rope_theta = 100.0f;
+    // Avg-pool kernel applied to the patch grid before projection.
+    int pooling_kernel_size = 3;
+    // Soft tokens emitted per image (top-level `vision_soft_tokens_per_image`).
+    int soft_tokens_per_image = 280;
+    // `use_clipped_linears`: each linear ships per-tensor input/output clip
+    // ranges (input_min/max, output_min/max) for dequantization.
+    bool use_clipped_linears = true;
+};
+
+// Gemma-4 audio encoder (`audio_config`, model_type "gemma4_audio").
+// A USM/Conformer encoder: SSCP subsampling conv stack → 12 Conformer blocks
+// (macaron FFN, chunked-local self-attention, light depthwise-conv module) →
+// output projection → shared `embed_audio` projector into the text hidden
+// space. Clipped-linear quantized projections. Confirmed against the shipped
+// `google/gemma-4-E4B` `audio_config`. See MULTIMODAL.md / audio_frontend.md.
+struct GemmaAudioConfig {
+    int hidden_size = 1024;
+    int num_attention_heads = 8;
+    int num_hidden_layers = 12;
+    int conv_kernel_size = 5;
+    int subsampling_conv_channels0 = 128;  // subsampling_conv_channels[0]
+    int subsampling_conv_channels1 = 32;   // subsampling_conv_channels[1]
+    int output_proj_dims = 1536;
+    int attention_chunk_size = 12;
+    int attention_context_left = 13;
+    int attention_context_right = 0;
+    int feature_size = 128;          // mel bins (SSCP input freq)
+    float attention_logit_cap = 50.0f;
+    float residual_weight = 0.5f;
+    float rms_norm_eps = 1e-6f;
+    // `use_clipped_linears`: linears ship per-tensor input/output clip ranges.
+    bool use_clipped_linears = true;
+};
+
+// CSM-1B native audio OUTPUT (`model_type == "csm"`). The backbone is a stock
+// Llama-3.2-1B whose hyperparameters live at the TOP level of config.json — so
+// `parse_hf_config` reads them into the main HfConfig fields directly (hidden
+// 2048, 16 layers, 32q/8kv, head_dim 64, llama3 rope). Two extra pieces are
+// nested: the depth decoder (`depth_decoder_config`, a 4-layer/1024 Llama that
+// samples codebooks 1..31 of one frame) and the Mimi codec (`codec_config`,
+// codes → waveform). These two structs mirror the cuda-only RawWeights configs
+// in csm_depth_decoder_forward.hpp / mimi_decoder_forward.hpp. See AUDIO_OUTPUT.md.
+struct CsmDepthDecoderConfig {
+    int hidden_size = 1024;
+    int backbone_hidden_size = 2048;
+    int num_hidden_layers = 4;
+    int num_attention_heads = 8;
+    int num_key_value_heads = 2;
+    int head_dim = 128;
+    int intermediate_size = 8192;
+    int num_codebooks = 32;
+    int vocab_size = 2051;
+    int max_position_embeddings = 33;
+    float rms_norm_eps = 1e-5f;
+    float rope_theta = 500000.0f;
+    // llama3 rope_scaling (orig_max_pos 16 for the depth decoder).
+    float rope_factor = 32.0f;
+    float rope_low_freq_factor = 0.001953125f;
+    float rope_high_freq_factor = 0.0078125f;
+    int rope_original_max_position = 16;
+};
+
+struct MimiCodecConfig {
+    int hidden_size = 512;
+    int codebook_dim = 256;          // vector_quantization_hidden_dimension
+    int codebook_size = 2048;
+    int num_quantizers = 32;
+    int num_semantic_quantizers = 1;
+    int num_filters = 64;
+    std::vector<int> upsampling_ratios{8, 6, 5, 4};
+    int xf_num_attention_heads = 8;
+    int xf_num_key_value_heads = 8;
+    int xf_head_dim = 64;
+    int xf_intermediate_size = 2048;
+    int xf_num_hidden_layers = 8;
+    int xf_sliding_window = 250;
+    float xf_rope_theta = 10000.0f;
+    float norm_eps = 1e-5f;
+    int sampling_rate = 24000;
+    bool use_causal_conv = true;
+    int upsample_groups = 512;
+    int residual_kernel_size = 3;
+    int kernel_size = 7;
+    int last_kernel_size = 3;
+};
+
+struct CsmConfig {
+    // Backbone-side ids needed by the generation loop. The backbone Llama dims
+    // come from the top-level HfConfig fields.
+    int text_vocab_size = 128256;     // embed_text_tokens rows
+    int audio_vocab_size = 2051;      // per-codebook vocab (== top-level vocab_size)
+    int num_codebooks = 32;
+    int codebook_eos_token_id = 0;    // all-EOS frame == stop
+    int audio_eos_token_id = 128003;
+    int audio_token_id = 128002;
+    CsmDepthDecoderConfig depth;
+    MimiCodecConfig codec;
+};
+
+// Qwen3-VL vision encoder (`vision_config`, model_type "qwen3_vl").
+// A pre-norm ViT (LayerNorm gamma+beta, 2D-RoPE, gelu-tanh MLP) with a 2×2
+// spatial-merge merger to the text hidden space + 3 DeepStack mergers.
+// Confirmed against `Qwen/Qwen3-VL-2B-Instruct` config.json.
+struct Qwen3VLVisionConfig {
+    int hidden_size = 1024;
+    int intermediate_size = 4096;
+    int depth = 24;                  // num_hidden_layers
+    int num_heads = 16;
+    int patch_size = 16;
+    int temporal_patch_size = 2;
+    int spatial_merge_size = 2;      // 2×2 → 4 patches/token
+    int in_channels = 3;
+    int out_hidden_size = 2048;      // = text hidden
+    int num_position_embeddings = 2304;  // 48×48 learned abs pos-embed
+    std::vector<int> deepstack_visual_indexes = {5, 11, 17};
+};
 
 struct HfConfig {
     // Architecture discriminator (e.g. "Qwen3ForCausalLM"). The first entry
@@ -41,6 +173,7 @@ struct HfConfig {
     // ── Norm / activation ─────────────────────────────────────────────
     float rms_norm_eps;
     std::string hidden_act;    // "silu" — only one supported for now.
+    std::string mlp_hidden_act; // Nemotron-H uses "relu2".
 
     // ── RoPE ──────────────────────────────────────────────────────────
     float rope_theta;
@@ -142,6 +275,9 @@ struct HfConfig {
     // source layer of the same `layer_types[i]`.
     int gemma_hidden_size_per_layer_input;
     int num_kv_shared_layers;
+    bool gemma4_use_ordered_embeddings = false;
+    int gemma4_num_centroids = 0;
+    int gemma4_centroid_intermediate_top_k = 0;
 
     // Gemma-4 per-layer rope_theta (HF nests under `rope_parameters`),
     // including `partial_rotary_factor` for full-attention layers
@@ -156,6 +292,48 @@ struct HfConfig {
     // is the (always-on) shared expert's MLP width.
     int moe_intermediate_size;
     int shared_expert_intermediate_size;
+    float routed_scaling_factor = 1.f;
+    int n_group = 1;
+    int topk_group = 1;
+    bool norm_topk_prob = true;
+
+    // ── Nemotron-H hybrid Mamba2/attention/MoE ─────────────────────
+    // `layer_types` stores "mamba", "attention", or "moe" for this
+    // architecture. These dimensions are zero on non-Nemotron models.
+    int mamba_num_heads = 0;
+    int mamba_head_dim = 0;
+    int mamba_state_size = 0;
+    int mamba_n_groups = 0;
+    int mamba_conv_kernel = 0;
+    int mamba_chunk_size = 0;
+    float mamba_time_step_min = 0.f;
+
+    // ── DeepSeek/Kimi MLA + MoE specific ────────────────────────────
+    // Kimi K2.6 exposes the language tower as `model_type=kimi_k2` inside
+    // a `kimi_k25` wrapper and uses DeepSeek-V3-style MLA attention.
+    // These are zero/inert for standard MHA/GQA models.
+    int q_lora_rank = 0;
+    int kv_lora_rank = 0;
+    int qk_nope_head_dim = 0;
+    int qk_rope_head_dim = 0;
+    int v_head_dim = 0;
+    int first_k_dense_replace = 0;
+    int n_shared_experts = 0;
+
+    // ── DeepSeek V4 specific ────────────────────────────────────────
+    int dsv4_o_lora_rank = 0;
+    int dsv4_o_groups = 0;
+    int dsv4_index_head_dim = 0;
+    int dsv4_index_n_heads = 0;
+    int dsv4_index_topk = 0;
+    int dsv4_hc_mult = 0;
+    int dsv4_num_hash_layers = 0;
+    int dsv4_sliding_window = 0;
+    float dsv4_hc_eps = 1e-6f;
+    float dsv4_compress_rope_theta = 0.f;
+    std::vector<int> dsv4_compress_ratios;
+    std::string dsv4_scoring_func;
+    std::string dsv4_expert_dtype;
 
     // ── Qwen3.5 hybrid (linear-attention SSM + full attention) ──────
     // Per-layer attention type is in `layer_types` (values
@@ -176,6 +354,10 @@ struct HfConfig {
     // Partial RoPE: only the first `partial_rotary_factor * head_dim`
     // dimensions are rotated. Defaults to 1.0 (full rotation).
     float partial_rotary_factor;
+
+    // Qwen3.5 / Qwen3.6 MTP (multi-token prediction) auxiliary head.
+    int  mtp_num_hidden_layers = 0;
+    bool mtp_use_dedicated_embeddings = false;
 
     // Gemma-3n (E2B / E4B "Nano") additions on top of Gemma-4.
     // Gemma-3n is a *different* architecture from Gemma-4 (despite the
@@ -206,6 +388,16 @@ struct HfConfig {
     float gemma3n_rope_local_base_freq; // sliding-layer rope theta
     std::vector<int>   gemma3n_per_layer_intermediate;
     std::vector<float> gemma3n_activation_sparsity;
+
+    // ── GLM-5.1 DSA (Differential Sparse Attention) indexer ────────
+    // Per-layer indexer selects top-k tokens for sparse attention.
+    // Zero/empty on non-GLM models.
+    int index_topk = 0;         // 2048 on GLM-5.1
+    int index_head_dim = 0;     // 128 on GLM-5.1
+    int index_n_heads = 0;      // 32 on GLM-5.1
+    // Per-layer indexer type: "full" (computes indices from scratch)
+    // or "shared" (reuses previous layer's indices). Empty on non-GLM.
+    std::vector<std::string> indexer_types;
 
     // ── Storage dtype as declared on disk (for the safetensors loader).
     std::string torch_dtype;   // "bfloat16", "float16", "float32".
@@ -248,6 +440,37 @@ struct HfConfig {
     // `mm_skip_prefixes`. Empty for text-only checkpoints.
     std::string mm_lm_strip_prefix;
     std::vector<std::string> mm_skip_prefixes;
+
+    // Vision encoder config, present for multimodal Gemma-4 checkpoints
+    // (`vision_config` + `vision_soft_tokens_per_image`). Parsed but not yet
+    // consumed — the encoder graph (MULTIMODAL.md Phase 2.2) reads this.
+    std::optional<GemmaVisionConfig> gemma_vision;
+
+    // Audio encoder config, present for multimodal Gemma-4 checkpoints
+    // (`audio_config.model_type == "gemma4_audio"`). The gemma4 audio encoder
+    // consumes this to bind + run the audio tower. See audio_frontend.md.
+    std::optional<GemmaAudioConfig> gemma_audio;
+
+    // Vision encoder config, present for multimodal Qwen3-VL checkpoints
+    // (`vision_config.model_type == "qwen3_vl"`). The Qwen3-VL model consumes
+    // this to bind + run the vision tower.
+    std::optional<Qwen3VLVisionConfig> qwen3_vl_vision;
+
+    // CSM native-audio-output config, present iff `model_type == "csm"`.
+    // Carries the depth decoder + Mimi codec sub-configs; the backbone Llama
+    // dims are the top-level HfConfig fields. See AUDIO_OUTPUT.md.
+    std::optional<CsmConfig> csm;
+
+    // ── Qwen3-VL M-RoPE (multimodal RoPE) ─────────────────────────────
+    // Text tower uses interleaved 3-axis (t,h,w) RoPE. `mrope_section`
+    // partitions head_dim/2 across the three axes (e.g. [24,20,20] for
+    // head_dim 128). Empty / false on non-Qwen3-VL models.
+    std::vector<int> qwen3_vl_mrope_section;
+    bool qwen3_vl_mrope_interleaved = false;
+    // Image / vision delimiter token ids (top-level config fields).
+    int qwen3_vl_image_token_id = -1;
+    int qwen3_vl_vision_start_token_id = -1;
+    int qwen3_vl_vision_end_token_id = -1;
 };
 
 // Parse `<snapshot_dir>/config.json`. Throws on missing required fields.

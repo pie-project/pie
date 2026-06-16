@@ -1024,16 +1024,14 @@ fn register_component_exports(
                     ComponentItem::Resource(rt) => {
                         resource_types_by_name.insert(name.to_string(), rt);
                     }
-                    ComponentItem::ComponentFunc(_) => {
-                        match FuncCategory::from_name(&name) {
-                            FuncCategory::Constructor { resource_name }
-                            | FuncCategory::Method { resource_name }
-                            | FuncCategory::StaticMethod { resource_name } => {
-                                defined_names.insert(resource_name);
-                            }
-                            FuncCategory::FreeFunction => {}
+                    ComponentItem::ComponentFunc(_) => match FuncCategory::from_name(&name) {
+                        FuncCategory::Constructor { resource_name }
+                        | FuncCategory::Method { resource_name }
+                        | FuncCategory::StaticMethod { resource_name } => {
+                            defined_names.insert(resource_name);
                         }
-                    }
+                        FuncCategory::FreeFunction => {}
+                    },
                     _ => {}
                 }
             }

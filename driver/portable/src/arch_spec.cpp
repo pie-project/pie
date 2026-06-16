@@ -224,6 +224,12 @@ ArchSpec arch_spec_for(PieArch a, const Hparams& h) {
             // parts of the engine see a consistent picture.
             s.has_qk_norm = false;  // q/k_norm tensors only on full_attention layers
             break;
+        case PieArch::GlmMoeDsa:
+            // GLM-5.1: MLA attention (handled by CUDA driver) + MoE.
+            // Portable driver doesn't implement MLA; set MoE flags for
+            // the parts of the engine that inspect ArchSpec generically.
+            apply_moe_flags_(s, h);
+            break;
         case PieArch::Olmo3:
             // Post-norm-only (input/pre-FFN norms absent — `attn_norm` /
             // `ffn_norm` are null at load time and skipped at graph time).

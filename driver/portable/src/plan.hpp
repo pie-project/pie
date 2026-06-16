@@ -1,9 +1,9 @@
 #pragma once
 
-// Plan: BPIQ wire payload → BatchPlan.
+// Plan: wire payload → BatchPlan.
 //
-// Splits the work of `ForwardEngine::plan_` into composable phases:
-//   1. extract_plan_arrays:   pull all 23+ typed views from the BPIQ wire blob
+// Splits the work of `Executor::plan_` into composable phases:
+//   1. extract_plan_arrays:   pull all 23+ typed views from the wire blob
 //   2. validate_plan_top_level: check the top-level invariants (batch shape)
 //   3. resolve_active_adapter_id: enforce single-adapter-per-batch (v1)
 //   4. plan_single_request:   build one ReqPlan + per-token positions/kv idxs
@@ -18,8 +18,8 @@
 #include <vector>
 
 #include "arch_spec.hpp"
-#include "forward.hpp"
-#include "shmem_schema.hpp"
+#include "executor/executor.hpp"
+#include <pie_bridge/inproc_server.hpp>   // pie_driver::PieForwardRequestView
 
 namespace pie_portable_driver {
 
@@ -76,7 +76,7 @@ void build_causal_mask_f16(std::vector<std::uint16_t>& dst,
                            std::int32_t n_tokens_pad,
                            const std::int32_t* positions);
 
-// Typed views into the BPIQ wire payload. Shapes are validated by
+// Typed views into the wire payload. Shapes are validated by
 // `validate_plan_top_level` and the per-request planner.
 struct PlanArrays {
     std::span<const std::uint64_t> context_ids;
@@ -89,6 +89,8 @@ struct PlanArrays {
     std::span<const std::uint32_t> kv_page_indices;
     std::span<const std::uint32_t> kv_page_indptr;
     std::span<const std::uint32_t> kv_last_lens;
+    std::span<const std::uint32_t> rs_slot_ids;
+    std::span<const std::uint8_t>  rs_slot_flags;
     std::span<const std::uint32_t> sampler_types;
     std::span<const float>         sampler_temps;
     std::span<const std::uint32_t> sampler_top_k;
@@ -112,7 +114,7 @@ struct PlanArrays {
     bool         batch_has_attn_masks = false;
 };
 
-PlanArrays extract_plan_arrays(const schema::DecodedRequest& req);
+PlanArrays extract_plan_arrays(const pie_driver::PieForwardRequestView& req);
 void validate_plan_top_level(const PlanArrays& a);
 
 // Returns the active adapter id (-1 if no request set one). Throws if
@@ -125,7 +127,7 @@ void plan_single_request(const PlanArrays& a,
                          std::int32_t page_size,
                          std::int32_t total_pages,
                          const ArchSpec& spec,
-                         ForwardEngine::BatchPlan& plan);
+                         Executor::BatchPlan& plan);
 
 // M11 packed-decode fast path. Caller has already verified every request
 // has n_tokens == 1 and there are no custom attention masks, so the whole
@@ -139,7 +141,7 @@ void plan_single_request(const PlanArrays& a,
 // builds an additional mask in `packed_mask_full_f16` with NO sliding
 // clip. Used by archs with mixed sliding+full layer patterns (Gemma 4)
 // so the full-attention layers can attend the entire context.
-void build_pure_decode_packing(ForwardEngine::BatchPlan& plan,
+void build_pure_decode_packing(Executor::BatchPlan& plan,
                                std::int32_t n_request,
                                std::int32_t page_size,
                                std::int32_t sliding_window,

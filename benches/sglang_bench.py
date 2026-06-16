@@ -10,26 +10,41 @@ from common import (
     finish,
     hf_chat_prompts_and_counts,
     make_prompts,
+    maybe_set_cpu_affinity,
     summarize,
+    visible_cuda_devices,
 )
 
 
 def run(args: argparse.Namespace):
     import sglang as sgl
 
+    cpu_affinity = maybe_set_cpu_affinity(args, visible_cuda_devices(args.tp_size))
     n = args.requests if args.mode == "latency" else args.num_requests
     prompts, prompt_counts = hf_chat_prompts_and_counts(
         args.model, args.system, make_prompts(args, n + args.warmup)
     )
-    engine = sgl.Engine(
-        model_path=args.model,
-        mem_fraction_static=args.gpu_mem_util,
-        disable_cuda_graph=True,
-        disable_radix_cache=True,
-        max_running_requests=args.concurrency if args.mode == "tput" else 1,
-        tp_size=args.tp_size,
-        context_length=args.max_model_len,
-    )
+    if args.mode == "latency":
+        max_running_requests = 1
+    elif args.concurrency == 0:
+        max_running_requests = max(1, args.num_requests)
+    else:
+        max_running_requests = args.concurrency
+    engine_kwargs = {
+        "model_path": args.model,
+        "mem_fraction_static": args.gpu_mem_util,
+        "disable_cuda_graph": args.sglang_disable_cuda_graph,
+        "disable_piecewise_cuda_graph": args.sglang_disable_piecewise_cuda_graph,
+        "disable_radix_cache": True,
+        "max_running_requests": max_running_requests,
+        "tp_size": args.tp_size,
+        "context_length": args.max_model_len,
+    }
+    if args.sglang_attention_backend:
+        engine_kwargs["attention_backend"] = args.sglang_attention_backend
+    if args.sglang_sampling_backend:
+        engine_kwargs["sampling_backend"] = args.sglang_sampling_backend
+    engine = sgl.Engine(**engine_kwargs)
     sampling = {
         "temperature": args.temperature,
         "top_p": args.top_p,
@@ -38,7 +53,13 @@ def run(args: argparse.Namespace):
     }
     try:
         if args.warmup:
-            engine.generate(prompts[: args.warmup], sampling)
+            warmup_sampling = sampling
+            if args.warmup_max_tokens is not None:
+                warmup_sampling = {
+                    **sampling,
+                    "max_new_tokens": args.warmup_max_tokens,
+                }
+            engine.generate(prompts[: args.warmup], warmup_sampling)
         run_prompts = prompts[args.warmup:]
         run_prompt_counts = prompt_counts[args.warmup:]
         results: list[RequestResult] = []
@@ -79,13 +100,18 @@ def run(args: argparse.Namespace):
         results=results,
         wall_s=wall,
         config={
-            "disable_cuda_graph": True,
+            "disable_cuda_graph": args.sglang_disable_cuda_graph,
+            "disable_piecewise_cuda_graph": args.sglang_disable_piecewise_cuda_graph,
             "disable_radix_cache": True,
-            "max_running_requests": args.concurrency if args.mode == "tput" else 1,
+            "attention_backend": args.sglang_attention_backend,
+            "sampling_backend": args.sglang_sampling_backend,
+            "max_running_requests": max_running_requests,
             "temperature": args.temperature,
             "top_p": args.top_p,
             "ignore_eos": args.ignore_eos,
             "unique_prompts": args.unique_prompts,
+            "cpu affinity": cpu_affinity,
+            "warmup max tokens": args.warmup_max_tokens,
         },
     )
     return summary, results

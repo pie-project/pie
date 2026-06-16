@@ -55,6 +55,17 @@ if TYPE_CHECKING:
     from .spec import Speculator
 
 
+def _sampler_is_argmax(sampler: Any) -> bool:
+    variant = getattr(sampler, "_variant", None)
+    if type(variant).__name__ != "Sampler_TopP":
+        return False
+    value = getattr(variant, "value", None)
+    if not isinstance(value, tuple) or len(value) != 2:
+        return False
+    temperature, _ = value
+    return float(temperature) == 0.0
+
+
 # =============================================================================
 # Internal: static-mask constraint (used by `logit_mask=` kwarg)
 # =============================================================================
@@ -114,7 +125,7 @@ class Generator:
         constrain: Schema | Constraint | list[Schema | Constraint] | None = None,
         logit_mask: list[int] | None = None,
         speculator: Speculator | None = None,
-        system_speculation: bool = False,
+        system_speculation: bool | None = None,
         adapter: Adapter | None = None,
         zo_seed: int | None = None,
         horizon: int | None = None,
@@ -141,12 +152,18 @@ class Generator:
             self._constraints.append(_StaticMaskConstraint(list(logit_mask)))
 
         # Speculation — system-driven OR custom drafter (or neither).
-        if system_speculation and speculator is not None:
+        if system_speculation is True and speculator is not None:
             raise ValueError(
                 "speculator and system_speculation are mutually exclusive"
             )
         self._speculator: Speculator | None = speculator
-        self._use_system_spec: bool = system_speculation
+        self._use_system_spec: bool = (
+            system_speculation
+            if system_speculation is not None
+            else speculator is None
+            and _sampler_is_argmax(sampler)
+            and ctx._model.default_system_speculation()
+        )
         # Cache for next-iter system drafts (populated each step from
         # the WIT output's spec channel when system speculation is on).
         self._spec_drafts: tuple[list[int], list[int]] = ([], [])
@@ -177,6 +194,12 @@ class Generator:
     def add_stop(self, tokens: Iterable[int]) -> Generator:
         """Append to the stop set."""
         self._stop.extend(tokens)
+        return self
+
+    def disable_system_speculation(self) -> Generator:
+        """Opt out of the default system drafter for this generator."""
+        self._use_system_spec = False
+        self._spec_drafts = ([], [])
         return self
 
     def constrain(self, c: Schema | Constraint) -> Generator:
@@ -457,7 +480,12 @@ class GenStep:
             fwd.input_tokens(self._pending, positions)
         if self._drafts:
             fwd.input_speculative_tokens(self._drafts, self._draft_positions)
-        if gen._use_system_spec:
+        remaining = (
+            None
+            if gen._max_tokens is None
+            else gen._max_tokens - gen._tokens_generated
+        )
+        if gen._use_system_spec and (remaining is None or remaining > 1):
             fwd.output_speculative_tokens(True)
 
         # Sampler at last input position (or 0 if drafts only / no input).

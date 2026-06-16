@@ -3,10 +3,10 @@
 //! These tests exercise the program management lifecycle using real WASM
 //! inferlet components built from sources in `tests/inferlets/`.
 
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 mod common;
-use common::{create_mock_env, MockEnv, inferlets};
+use common::{MockEnv, create_mock_env, inferlets, mock_device::EchoBehavior};
 
 use pie::program::{self, ProgramName};
 
@@ -25,7 +25,7 @@ fn state() -> &'static TestState {
         inferlets::build_inferlets();
 
         let rt = tokio::runtime::Runtime::new().unwrap();
-        let env = create_mock_env("test-model", 1, 16);
+        let env = create_mock_env("test-model", 1, 16, Arc::new(EchoBehavior(42)));
         let config = env.config();
         rt.block_on(async {
             pie::bootstrap::bootstrap(config).await.unwrap();
@@ -52,7 +52,10 @@ fn add_and_register() {
 
     s.rt.block_on(async {
         program::add(wasm, manifest, false).await.unwrap();
-        assert!(program::is_registered(&name).await, "program should be registered after add");
+        assert!(
+            program::is_registered(&name).await,
+            "program should be registered after add"
+        );
     });
 }
 
@@ -66,7 +69,10 @@ fn install_and_query() {
     s.rt.block_on(async {
         program::add(wasm, manifest, true).await.unwrap();
         program::install(&name).await.unwrap();
-        assert!(program::is_installed(&name).await, "program should be installed after install");
+        assert!(
+            program::is_installed(&name).await,
+            "program should be installed after install"
+        );
     });
 }
 
@@ -80,7 +86,10 @@ fn fetch_manifest_after_add() {
     s.rt.block_on(async {
         program::add(wasm, manifest.clone(), true).await.unwrap();
         let fetched = program::fetch_manifest(&name).await;
-        assert!(fetched.is_some(), "manifest should be retrievable after add");
+        assert!(
+            fetched.is_some(),
+            "manifest should be retrievable after add"
+        );
         let fetched = fetched.unwrap();
         assert_eq!(fetched.package.name, "error");
     });
@@ -100,9 +109,15 @@ fn uninstall_removes_program() {
 
         let removed = program::uninstall(&name).await;
         assert!(removed, "uninstall should return true");
-        assert!(!program::is_installed(&name).await, "program should no longer be installed");
+        assert!(
+            !program::is_installed(&name).await,
+            "program should no longer be installed"
+        );
         // But it should still be registered (uninstall doesn't remove from cache)
-        assert!(program::is_registered(&name).await, "program should still be registered");
+        assert!(
+            program::is_registered(&name).await,
+            "program should still be registered"
+        );
     });
 }
 

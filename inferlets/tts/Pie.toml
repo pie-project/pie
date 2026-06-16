@@ -1,0 +1,14 @@
+[package]
+name = "tts"
+version = "0.1.0"
+description = "Text-to-speech (native audio OUTPUT) — CSM-1B + Mimi: text -> generated speech waveform (WAV)"
+authors = ["Pie Team"]
+
+[runtime]
+core = "^0.2.0"
+mcp = "^0.2.0"
+
+[parameters]
+text = {type = "string", optional = true, description = "Text to speak"}
+speaker = {type = "int", optional = true, description = "Speaker id (default: 0)"}
+max_seconds = {type = "int", optional = true, description = "Cap generated audio length in seconds (default: 20; stops early at end-of-speech)"}

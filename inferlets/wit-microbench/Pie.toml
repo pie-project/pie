@@ -1,0 +1,10 @@
+[package]
+name = "wit-microbench"
+version = "0.1.0"
+description = "Microbench for WIT call overhead and resource lifecycle"
+authors = ["Pie Team"]
+
+[runtime]
+core = "^0.2.0"
+
+[parameters]

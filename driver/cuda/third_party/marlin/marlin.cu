@@ -35,6 +35,36 @@
                     std::is_same<scalar_t, nv_bfloat16>::value, \
                 "only float16 and bfloat16 is supported");
 
+// CUDA 13 generates __global__ template explicit-instantiation stubs with
+// static linkage (_ZL…), making cross-TU references from kernel_selector.h
+// unresolvable.  Include the sm80_kernel_*.cu files directly so the
+// instantiations and the selector share a single translation unit.
+// Each file opens/closes its own `namespace MARLIN_NAMESPACE_NAME`, so
+// they must appear before our `namespace marlin {` below.
+//
+// Only the shapes pie's driver actually dispatches are compiled.  The
+// runtime uses bf16 activations (launch_gptq_gemm_w4a16_bf16 and
+// launch_mxfp4_gemm_w4a16_bf16), so only bf16 × {u4, u4b8, fe2m1f}
+// kernel files are needed.  The remaining dtype combos (fp16, int8,
+// u8b128, fe4m3fn) are dead code that would add ~5 min of cicc time.
+// Define PIE_MARLIN_ALL_SHAPES=1 to compile every combo.
+#include "sm80_kernel_bfloat16_u4_bfloat16.cu"
+#include "sm80_kernel_bfloat16_u4b8_bfloat16.cu"
+#include "sm80_kernel_bfloat16_fe2m1f_bfloat16.cu"
+#if defined(PIE_MARLIN_ALL_SHAPES)
+#include "sm80_kernel_bfloat16_fe4m3fn_bfloat16.cu"
+#include "sm80_kernel_bfloat16_u8b128_bfloat16.cu"
+#include "sm80_kernel_float16_u4_float16.cu"
+#include "sm80_kernel_float16_u4b8_float16.cu"
+#include "sm80_kernel_float16_fe2m1f_float16.cu"
+#include "sm80_kernel_float16_fe4m3fn_float16.cu"
+#include "sm80_kernel_float16_u8b128_float16.cu"
+#include "sm80_kernel_s8_u4_bfloat16.cu"
+#include "sm80_kernel_s8_u4b8_bfloat16.cu"
+#include "sm80_kernel_s8_u4_float16.cu"
+#include "sm80_kernel_s8_u4b8_float16.cu"
+#endif
+
 namespace marlin {
 
 __global__ void MarlinDefault(MARLIN_KERNEL_PARAMS){};

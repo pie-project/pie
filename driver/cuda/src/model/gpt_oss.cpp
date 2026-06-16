@@ -1,64 +1,76 @@
 #include "model/gpt_oss.hpp"
 
+#include <algorithm>
 #include <cstdint>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include <cuda_runtime.h>
 
 #include "cuda_check.hpp"
 #include "kernels/deinterleave.hpp"
-#include "kernels/dequant_fp4.hpp"
 
 namespace pie_cuda_driver::model {
 
 namespace {
 
-const DeviceTensor& must(const Engine& e, const std::string& name) {
+const DeviceTensor& must(const LoadedModel& e, const std::string& name) {
     if (!e.has(name)) {
         throw std::runtime_error("gpt_oss: missing weight '" + name + "'");
     }
     return e.get(name);
 }
 
-// Owning + view tensors per expert: w_gate, w_up, w_down (owning bf16
-// from MXFP4 dequant + deinterleave) and b_gate, b_up (owning bf16 from
-// bias-deinterleave). b_down is a non-owning view into the
-// `down_proj_bias` tensor that the safetensors loader already owns.
-constexpr int kTensorsPerExpert = 6;
+DeviceTensor tensor_view(
+    const DeviceTensor& backing,
+    std::size_t byte_offset,
+    std::vector<std::int64_t> shape)
+{
+    auto* base = const_cast<std::uint8_t*>(
+        static_cast<const std::uint8_t*>(backing.data()));
+    return DeviceTensor::view(
+        base + byte_offset,
+        backing.dtype(),
+        std::move(shape));
+}
+
+constexpr int kViewsPerExpert = 8;
+constexpr int kNativeMxfp4HandlesPerExpert = 9;
+
+int align_up_int(int value, int alignment) {
+    return ((value + alignment - 1) / alignment) * alignment;
+}
 
 }  // namespace
 
-MixtralWeights bind_gpt_oss(Engine& engine) {
+MixtralWeights bind_gpt_oss(const LoadedModel& engine) {
     const auto& cfg = engine.hf_config();
     const int E = cfg.num_experts;
     if (E <= 0) {
         throw std::runtime_error(
             "gpt_oss: hf_config.num_experts must be > 0; check the loader");
     }
-    // Tensor-parallel state. The FP4 packed expert tensors are loaded
-    // replicated on every rank; this bind dequantises a per-rank slice
-    // of each expert into bf16 so the per-rank workspace stays
-    // proportional to 1/T like every other arch.
+
     const int T = std::max(1, engine.distributed().tp_size);
-    const int rank = engine.distributed().tp_rank;
     const int H = cfg.hidden_size;
     const int I_full = cfg.intermediate_size;
+    if (I_full % T != 0) {
+        throw std::runtime_error(
+            "gpt_oss: intermediate_size must be divisible by tp_size");
+    }
     const int I = I_full / T;
+    const bool native_mxfp4 =
+        engine.mxfp4_moe_lowering() == Mxfp4MoeLowering::NativeGemm;
+    const int I_native = native_mxfp4 ? align_up_int(I, 128) : I;
     const int L = cfg.num_hidden_layers;
     const int Hq = (cfg.num_attention_heads * cfg.head_dim) / T;
     const int Hk = (cfg.num_key_value_heads * cfg.head_dim) / T;
     const int sinks_local = cfg.num_attention_heads / T;
 
-    if (H % 32 != 0 || I % 32 != 0) {
-        throw std::runtime_error(
-            "gpt_oss: hidden_size and intermediate_size must be multiples of 32 "
-            "for MXFP4 dequant; got hidden=" + std::to_string(H) +
-            ", intermediate=" + std::to_string(I));
-    }
-
     MixtralWeights w;
+    w.mxfp4_intermediate_padded = native_mxfp4 ? I_native : 0;
     w.embed      = &must(engine, "model.embed_tokens.weight");
     w.final_norm = &must(engine, "model.norm.weight");
     if (engine.has("lm_head.weight")) {
@@ -70,31 +82,89 @@ MixtralWeights bind_gpt_oss(Engine& engine) {
             "gpt_oss: lm_head missing and tie_word_embeddings=false");
     }
 
-    w.owned_expert_buffers.reserve(static_cast<std::size_t>(L) * E * kTensorsPerExpert);
+    w.owned_expert_buffers.reserve(
+        static_cast<std::size_t>(L) * E *
+        static_cast<std::size_t>(
+            native_mxfp4 ? kNativeMxfp4HandlesPerExpert : kViewsPerExpert));
     w.layers.resize(static_cast<std::size_t>(L));
 
-    cudaStream_t stream = nullptr;
-
-    // Scratch: dequantized fused gate_up bf16 of shape [2*I_full, H]. Sized
-    // for the unsharded width because dequant + deinterleave operate on
-    // the full per-expert buffer; we slice into per-rank tensors below.
-    // Reused for every expert across every layer.
-    auto fused_gu = DeviceTensor::allocate(DType::BF16, {2 * I_full, H});
-    // Under TP, full-width bf16 scratches we slice from on every expert.
-    DeviceTensor full_gate, full_up, full_down, full_b_gate, full_b_up;
-    if (T > 1) {
-        full_gate = DeviceTensor::allocate(DType::BF16, {I_full, H});
-        full_up   = DeviceTensor::allocate(DType::BF16, {I_full, H});
-        full_down = DeviceTensor::allocate(DType::BF16, {H, I_full});
-        full_b_gate = DeviceTensor::allocate(DType::BF16, {I_full});
-        full_b_up   = DeviceTensor::allocate(DType::BF16, {I_full});
+    const bool has_routed_mxfp4_experts =
+        engine.has("model.layers.0.mlp.experts.gate_up_proj.weight");
+    const bool has_native_mxfp4_experts =
+        engine.has("model.layers.0.mlp.experts.gate_proj.weight") &&
+        engine.has("model.layers.0.mlp.experts.up_proj.weight") &&
+        engine.has("model.layers.0.mlp.experts.down_proj.weight");
+    if (native_mxfp4 && !has_native_mxfp4_experts) {
+        throw std::runtime_error(
+            "gpt_oss: native MXFP4 selected, but loader did not finalize "
+            "native gate/up/down expert tensors");
     }
+    if (!native_mxfp4 && has_native_mxfp4_experts) {
+        throw std::runtime_error(
+            "gpt_oss: native MXFP4 tensors were loaded, but runtime lowering "
+            "did not select native MXFP4");
+    }
+    const bool use_mxfp4_packed_experts =
+        has_routed_mxfp4_experts || has_native_mxfp4_experts;
+    if (use_mxfp4_packed_experts) {
+        if (H % 32 != 0 || I % 32 != 0) {
+            throw std::runtime_error(
+                "gpt_oss: packed MXFP4 expert backend requires hidden and "
+                "tp-local intermediate dimensions divisible by 32");
+        }
+        if (has_native_mxfp4_experts) {
+            if (H % 64 != 0 || I_native % 64 != 0) {
+                throw std::runtime_error(
+                    "gpt_oss: native MXFP4/Marlin expert backend requires "
+                    "hidden and padded tp-local intermediate dimensions "
+                    "divisible by 64");
+            }
+        } else {
+            w.mxfp4_gate_up_bf16_scratch =
+                DeviceTensor::allocate(DType::BF16, {2 * I, H});
+            w.mxfp4_gate_bf16_scratch =
+                DeviceTensor::allocate(DType::BF16, {I, H});
+            w.mxfp4_up_bf16_scratch =
+                DeviceTensor::allocate(DType::BF16, {I, H});
+            w.mxfp4_down_bf16_scratch =
+                DeviceTensor::allocate(DType::BF16, {H, I});
+        }
+    }
+
+    const std::size_t bf16 = 2;
+    const std::size_t gate_up_expert_bytes =
+        static_cast<std::size_t>(I) * H * bf16;
+    const std::size_t down_expert_bytes =
+        static_cast<std::size_t>(H) * I * bf16;
+    const std::size_t gate_up_bias_expert_bytes =
+        static_cast<std::size_t>(I) * bf16;
+    const std::size_t down_bias_expert_bytes =
+        static_cast<std::size_t>(H) * bf16;
+    const std::size_t mxfp4_gate_up_expert_bytes =
+        static_cast<std::size_t>(2 * I) *
+        static_cast<std::size_t>(H / 32) * 16;
+    const std::size_t mxfp4_gate_up_scale_expert_bytes =
+        static_cast<std::size_t>(2 * I) * static_cast<std::size_t>(H / 32);
+    const std::size_t mxfp4_down_expert_bytes =
+        static_cast<std::size_t>(H) *
+        static_cast<std::size_t>(I / 32) * 16;
+    const std::size_t mxfp4_down_scale_expert_bytes =
+        static_cast<std::size_t>(H) * static_cast<std::size_t>(I / 32);
+    const std::size_t mxfp4_gate_up_bias_expert_bytes =
+        static_cast<std::size_t>(2 * I) * bf16;
+    const std::size_t native_gate_expert_bytes =
+        (static_cast<std::size_t>(I_native) * static_cast<std::size_t>(H)) / 2;
+    const std::size_t native_gate_scale_expert_bytes =
+        static_cast<std::size_t>(I_native) * static_cast<std::size_t>(H / 32);
+    const std::size_t native_down_expert_bytes =
+        (static_cast<std::size_t>(H) * static_cast<std::size_t>(I_native)) / 2;
+    const std::size_t native_down_scale_expert_bytes =
+        static_cast<std::size_t>(H) * static_cast<std::size_t>(I_native / 32);
 
     for (int li = 0; li < L; ++li) {
         const std::string p = "model.layers." + std::to_string(li) + ".";
         auto& Lw = w.layers[li];
 
-        // ── Attention ──
         Lw.attn_norm = &must(engine, p + "input_layernorm.weight");
         Lw.mlp_norm  = &must(engine, p + "post_attention_layernorm.weight");
         Lw.q_proj    = &must(engine, p + "self_attn.q_proj.weight");
@@ -118,196 +188,309 @@ MixtralWeights bind_gpt_oss(Engine& engine) {
         if (Lw.attn_sinks->numel() != static_cast<std::size_t>(sinks_local)) {
             throw std::runtime_error(
                 "gpt_oss: attn_sinks shape mismatch at layer " +
-                std::to_string(li) + ": expected " +
-                std::to_string(sinks_local) + " (tp_size=" +
-                std::to_string(T) + "), got " +
-                std::to_string(Lw.attn_sinks->numel()));
+                std::to_string(li));
         }
 
-        // ── Router ──
         Lw.router      = &must(engine, p + "mlp.router.weight");
         Lw.router_bias = &must(engine, p + "mlp.router.bias");
 
-        // ── MXFP4 expert weights → bf16 ──
-        // Real on-disk shapes (gpt-oss-20b safetensors):
-        //   gate_up_proj_blocks : [E, 2*I, H/32, 16] uint8  (16 bytes per
-        //                          32-element block, 2 nibbles per byte)
-        //   gate_up_proj_scales : [E, 2*I, H/32]   uint8  (E8M0)
-        //   gate_up_proj_bias   : [E, 2*I]         bf16
-        //   down_proj_blocks    : [E, H, I/32, 16] uint8
-        //   down_proj_scales    : [E, H, I/32]     uint8
-        //   down_proj_bias      : [E, H]           bf16
-        //
-        // The output axis (2*I or H) is the *second*; flattened, each
-        // expert's blocks slab is `[out_dim, in_dim/2]` bytes. The dequant
-        // kernel takes that flat layout and writes bf16 `[out_dim, in_dim]`.
-        //
-        // For gate_up the LAST axis is interleaved per HF's
-        // `gate = gate_up[..., ::2], up = gate_up[..., 1::2]` — but the
-        // MXFP4 storage is the transpose, so post-dequant the *rows*
-        // (output axis) are interleaved instead: row 2k is gate channel
-        // k, row 2k+1 is up channel k. We dequant the full 2*I rows once
-        // and split into per-expert gate/up bf16 tensors with a separate
-        // deinterleave kernel.
-        const auto& gu_blocks = must(engine, p + "mlp.experts.gate_up_proj_blocks");
-        const auto& gu_scales = must(engine, p + "mlp.experts.gate_up_proj_scales");
-        const auto& gu_bias   = must(engine, p + "mlp.experts.gate_up_proj_bias");
-        const auto& dn_blocks = must(engine, p + "mlp.experts.down_proj_blocks");
-        const auto& dn_scales = must(engine, p + "mlp.experts.down_proj_scales");
-        const auto& dn_bias   = must(engine, p + "mlp.experts.down_proj_bias");
-
-        auto is_u8   = [](const DeviceTensor& t) { return t.dtype() == DType::UINT8; };
-        auto is_bf16 = [](const DeviceTensor& t) { return t.dtype() == DType::BF16; };
-        if (!is_u8(gu_blocks) || !is_u8(gu_scales) ||
-            !is_u8(dn_blocks) || !is_u8(dn_scales)) {
-            throw std::runtime_error(
-                "gpt_oss layer " + std::to_string(li) +
-                ": expected MXFP4 packed weights as uint8 byte storage");
-        }
-        if (!is_bf16(gu_bias) || !is_bf16(dn_bias)) {
-            throw std::runtime_error(
-                "gpt_oss layer " + std::to_string(li) +
-                ": expected expert biases as bf16");
-        }
-
-        // Per-expert byte strides into the fused storage. Sized at the
-        // unsharded I_full because the FP4 packed weights are loaded
-        // replicated; we shard at dequant time.
-        const std::size_t gu_blocks_per_expert =
-            static_cast<std::size_t>(2) * I_full * (H / 2);     // 16 × H/32 = H/2 bytes
-        const std::size_t gu_scales_per_expert =
-            static_cast<std::size_t>(2) * I_full * (H / 32);
-        const std::size_t dn_blocks_per_expert =
-            static_cast<std::size_t>(H) * (I_full / 2);
-        const std::size_t dn_scales_per_expert =
-            static_cast<std::size_t>(H) * (I_full / 32);
-        const std::size_t bias_bf16_bytes = 2;
-        const std::size_t gu_bias_per_expert = static_cast<std::size_t>(2) * I_full;
-        const std::size_t dn_bias_per_expert = static_cast<std::size_t>(H);
-
         Lw.experts.resize(static_cast<std::size_t>(E));
-        std::uint8_t* gu_blocks_base = const_cast<std::uint8_t*>(
-            static_cast<const std::uint8_t*>(gu_blocks.data()));
-        std::uint8_t* gu_scales_base = const_cast<std::uint8_t*>(
-            static_cast<const std::uint8_t*>(gu_scales.data()));
-        std::uint8_t* dn_blocks_base = const_cast<std::uint8_t*>(
-            static_cast<const std::uint8_t*>(dn_blocks.data()));
-        std::uint8_t* dn_scales_base = const_cast<std::uint8_t*>(
-            static_cast<const std::uint8_t*>(dn_scales.data()));
-        std::uint8_t* gu_bias_base = const_cast<std::uint8_t*>(
-            static_cast<const std::uint8_t*>(gu_bias.data()));
-        std::uint8_t* dn_bias_base = const_cast<std::uint8_t*>(
-            static_cast<const std::uint8_t*>(dn_bias.data()));
+        if (use_mxfp4_packed_experts) {
+            if (has_native_mxfp4_experts) {
+                const std::string gate_name =
+                    p + "mlp.experts.gate_proj.weight";
+                const std::string up_name =
+                    p + "mlp.experts.up_proj.weight";
+                const std::string down_name =
+                    p + "mlp.experts.down_proj.weight";
+                const std::string gate_scale_name =
+                    p + "mlp.experts.gate_proj.weight_scale";
+                const std::string up_scale_name =
+                    p + "mlp.experts.up_proj.weight_scale";
+                const std::string down_scale_name =
+                    p + "mlp.experts.down_proj.weight_scale";
+                const std::string gate_bias_name =
+                    p + "mlp.experts.gate_proj.bias";
+                const std::string up_bias_name =
+                    p + "mlp.experts.up_proj.bias";
+                const std::string down_bias_name =
+                    p + "mlp.experts.down_proj.bias";
+                const auto& gate_all = must(engine, gate_name);
+                const auto& up_all = must(engine, up_name);
+                const auto& down_all = must(engine, down_name);
+                const auto& gate_scale_all = must(engine, gate_scale_name);
+                const auto& up_scale_all = must(engine, up_scale_name);
+                const auto& down_scale_all = must(engine, down_scale_name);
+                const auto& b_gate_all = must(engine, gate_bias_name);
+                const auto& b_up_all = must(engine, up_bias_name);
+                const auto& b_down_all = must(engine, down_bias_name);
 
-        for (int e = 0; e < E; ++e) {
-            auto& Ew = Lw.experts[e];
+                const std::vector<std::int64_t> gate_scale_shape =
+                    {E, I_native, H / 32};
+                const std::vector<std::int64_t> down_scale_shape =
+                    {E, H, I_native / 32};
+                const std::vector<std::int64_t> gate_bias_shape = {E, I};
+                const std::vector<std::int64_t> down_bias_shape = {E, H};
+                if (gate_all.dtype() != DType::UINT8 ||
+                    up_all.dtype() != DType::UINT8 ||
+                    down_all.dtype() != DType::UINT8 ||
+                    gate_scale_all.dtype() != DType::UINT8 ||
+                    up_scale_all.dtype() != DType::UINT8 ||
+                    down_scale_all.dtype() != DType::UINT8 ||
+                    b_gate_all.dtype() != DType::BF16 ||
+                    b_up_all.dtype() != DType::BF16 ||
+                    b_down_all.dtype() != DType::BF16 ||
+                    gate_all.nbytes() != static_cast<std::size_t>(E) * native_gate_expert_bytes ||
+                    up_all.nbytes() != static_cast<std::size_t>(E) * native_gate_expert_bytes ||
+                    down_all.nbytes() != static_cast<std::size_t>(E) * native_down_expert_bytes ||
+                    gate_scale_all.shape() != gate_scale_shape ||
+                    up_scale_all.shape() != gate_scale_shape ||
+                    down_scale_all.shape() != down_scale_shape ||
+                    b_gate_all.shape() != gate_bias_shape ||
+                    b_up_all.shape() != gate_bias_shape ||
+                    b_down_all.shape() != down_bias_shape) {
+                    throw std::runtime_error(
+                        "gpt_oss: native MXFP4 expert tensor shape mismatch at "
+                        "layer " + std::to_string(li));
+                }
+                for (int e = 0; e < E; ++e) {
+                    auto& Ew = Lw.experts[e];
+                    const auto expert_idx = static_cast<std::size_t>(e);
+                    Ew.format = MixtralExpertWeightFormat::Mxfp4NativeGemm;
 
-            // 1. Dequant fused gate_up MXFP4 → bf16 [2*I_full, H].
-            kernels::launch_dequant_mxfp4_to_bf16(
-                gu_blocks_base + static_cast<std::size_t>(e) * gu_blocks_per_expert,
-                gu_scales_base + static_cast<std::size_t>(e) * gu_scales_per_expert,
-                fused_gu.data(), 2 * I_full, H, stream);
+                    w.owned_expert_buffers.push_back(tensor_view(
+                        gate_all,
+                        expert_idx * native_gate_expert_bytes,
+                        {I_native, H / 2}));
+                    Ew.w_gate_mxfp4 = &w.owned_expert_buffers.back();
+                    w.owned_expert_buffers.push_back(tensor_view(
+                        gate_scale_all,
+                        expert_idx * native_gate_scale_expert_bytes,
+                        {I_native, H / 32}));
+                    Ew.w_gate_mxfp4_scale = &w.owned_expert_buffers.back();
 
-            // 2. Split fused [2*I_full, H] into gate / up [I_full, H]. Under
-            //    TP we deinterleave into the full-width scratch first, then
-            //    slice rank-r's I rows into the per-rank tensor.
-            DeviceTensor w_gate = DeviceTensor::allocate(DType::BF16, {I, H});
-            DeviceTensor w_up   = DeviceTensor::allocate(DType::BF16, {I, H});
-            if (T == 1) {
-                kernels::launch_deinterleave_rows_bf16(
-                    fused_gu.data(), w_gate.data(), w_up.data(), I, H, stream);
+                    w.owned_expert_buffers.push_back(tensor_view(
+                        up_all,
+                        expert_idx * native_gate_expert_bytes,
+                        {I_native, H / 2}));
+                    Ew.w_up_mxfp4 = &w.owned_expert_buffers.back();
+                    w.owned_expert_buffers.push_back(tensor_view(
+                        up_scale_all,
+                        expert_idx * native_gate_scale_expert_bytes,
+                        {I_native, H / 32}));
+                    Ew.w_up_mxfp4_scale = &w.owned_expert_buffers.back();
+
+                    w.owned_expert_buffers.push_back(tensor_view(
+                        down_all,
+                        expert_idx * native_down_expert_bytes,
+                        {H, I_native / 2}));
+                    Ew.w_down_mxfp4 = &w.owned_expert_buffers.back();
+                    w.owned_expert_buffers.push_back(tensor_view(
+                        down_scale_all,
+                        expert_idx * native_down_scale_expert_bytes,
+                        {H, I_native / 32}));
+                    Ew.w_down_mxfp4_scale = &w.owned_expert_buffers.back();
+
+                    w.owned_expert_buffers.push_back(tensor_view(
+                        b_gate_all,
+                        expert_idx * gate_up_bias_expert_bytes,
+                        {I}));
+                    Ew.b_gate = &w.owned_expert_buffers.back();
+                    w.owned_expert_buffers.push_back(tensor_view(
+                        b_up_all,
+                        expert_idx * gate_up_bias_expert_bytes,
+                        {I}));
+                    Ew.b_up = &w.owned_expert_buffers.back();
+                    w.owned_expert_buffers.push_back(tensor_view(
+                        b_down_all,
+                        expert_idx * down_bias_expert_bytes,
+                        {H}));
+                    Ew.b_down = &w.owned_expert_buffers.back();
+                }
             } else {
-                kernels::launch_deinterleave_rows_bf16(
-                    fused_gu.data(), full_gate.data(), full_up.data(),
-                    I_full, H, stream);
-                const std::size_t per_rank_bytes =
-                    static_cast<std::size_t>(I) * H * 2;
-                CUDA_CHECK(cudaMemcpyAsync(
-                    w_gate.data(),
-                    static_cast<std::uint8_t*>(full_gate.data()) +
-                        per_rank_bytes * rank,
-                    per_rank_bytes, cudaMemcpyDeviceToDevice, stream));
-                CUDA_CHECK(cudaMemcpyAsync(
-                    w_up.data(),
-                    static_cast<std::uint8_t*>(full_up.data()) +
-                        per_rank_bytes * rank,
-                    per_rank_bytes, cudaMemcpyDeviceToDevice, stream));
-            }
-            w.owned_expert_buffers.push_back(std::move(w_gate));
-            Ew.w_gate = &w.owned_expert_buffers.back();
-            w.owned_expert_buffers.push_back(std::move(w_up));
-            Ew.w_up = &w.owned_expert_buffers.back();
+                const std::string gate_up_name =
+                    p + "mlp.experts.gate_up_proj.weight";
+                const std::string down_name =
+                    p + "mlp.experts.down_proj.weight";
+                const std::string gate_up_bias_name =
+                    p + "mlp.experts.gate_up_proj.bias";
+                const std::string down_bias_name =
+                    p + "mlp.experts.down_proj.bias";
+                const auto& gate_up_all = must(engine, gate_up_name);
+                const auto& down_all = must(engine, down_name);
+                const auto gate_up_meta = engine.quant_meta(gate_up_name);
+                const auto down_meta = engine.quant_meta(down_name);
+                if (!gate_up_meta.has_value() || !gate_up_meta->scale ||
+                    !down_meta.has_value() || !down_meta->scale) {
+                    throw std::runtime_error(
+                        "gpt_oss: packed MXFP4 expert tensors are missing "
+                        "quant metadata at layer " + std::to_string(li));
+                }
+                const auto& gate_up_scale_all = *gate_up_meta->scale;
+                const auto& down_scale_all = *down_meta->scale;
+                const auto& b_gate_up_all = must(engine, gate_up_bias_name);
+                const auto& b_down_all = must(engine, down_bias_name);
 
-            // 3. Dequant down [H, I_full] → bf16, then column-band slice
-            //    down to [H, I] for row-parallel TP. cudaMemcpy2D gives us
-            //    the strided slice in one shot.
-            DeviceTensor w_down = DeviceTensor::allocate(DType::BF16, {H, I});
-            if (T == 1) {
-                kernels::launch_dequant_mxfp4_to_bf16(
-                    dn_blocks_base + static_cast<std::size_t>(e) * dn_blocks_per_expert,
-                    dn_scales_base + static_cast<std::size_t>(e) * dn_scales_per_expert,
-                    w_down.data(), H, I, stream);
-            } else {
-                kernels::launch_dequant_mxfp4_to_bf16(
-                    dn_blocks_base + static_cast<std::size_t>(e) * dn_blocks_per_expert,
-                    dn_scales_base + static_cast<std::size_t>(e) * dn_scales_per_expert,
-                    full_down.data(), H, I_full, stream);
-                CUDA_CHECK(cudaMemcpy2DAsync(
-                    w_down.data(), static_cast<std::size_t>(I) * 2,
-                    static_cast<std::uint8_t*>(full_down.data()) +
-                        static_cast<std::size_t>(rank) * I * 2,
-                    static_cast<std::size_t>(I_full) * 2,
-                    static_cast<std::size_t>(I) * 2,
-                    static_cast<std::size_t>(H),
-                    cudaMemcpyDeviceToDevice, stream));
-            }
-            w.owned_expert_buffers.push_back(std::move(w_down));
-            Ew.w_down = &w.owned_expert_buffers.back();
+                const std::vector<std::int64_t> gate_up_shape =
+                    {E, 2 * I, H / 32, 16};
+                const std::vector<std::int64_t> gate_up_scale_shape =
+                    {E, 2 * I, H / 32};
+                const std::vector<std::int64_t> down_shape =
+                    {E, H, I / 32, 16};
+                const std::vector<std::int64_t> down_scale_shape =
+                    {E, H, I / 32};
+                const std::vector<std::int64_t> gate_up_bias_shape = {E, 2 * I};
+                const std::vector<std::int64_t> down_bias_shape = {E, H};
+                if (gate_up_all.dtype() != DType::UINT8 ||
+                    down_all.dtype() != DType::UINT8 ||
+                    gate_up_scale_all.dtype() != DType::UINT8 ||
+                    down_scale_all.dtype() != DType::UINT8 ||
+                    b_gate_up_all.dtype() != DType::BF16 ||
+                    b_down_all.dtype() != DType::BF16 ||
+                    gate_up_all.shape() != gate_up_shape ||
+                    gate_up_scale_all.shape() != gate_up_scale_shape ||
+                    down_all.shape() != down_shape ||
+                    down_scale_all.shape() != down_scale_shape ||
+                    b_gate_up_all.shape() != gate_up_bias_shape ||
+                    b_down_all.shape() != down_bias_shape) {
+                    throw std::runtime_error(
+                        "gpt_oss: packed MXFP4 expert tensor shape mismatch at "
+                        "layer " + std::to_string(li));
+                }
+                for (int e = 0; e < E; ++e) {
+                    auto& Ew = Lw.experts[e];
+                    const auto expert_idx = static_cast<std::size_t>(e);
+                    Ew.format = MixtralExpertWeightFormat::Mxfp4RoutedDequant;
 
-            // 4. Deinterleave gate_up_bias [2*I_full] → b_gate [I_full],
-            //    b_up [I_full]. Slice down to [I] under TP.
-            std::uint8_t* gu_bias_e = gu_bias_base +
-                static_cast<std::size_t>(e) * gu_bias_per_expert * bias_bf16_bytes;
-            DeviceTensor b_gate = DeviceTensor::allocate(DType::BF16, {I});
-            DeviceTensor b_up   = DeviceTensor::allocate(DType::BF16, {I});
-            if (T == 1) {
-                kernels::launch_deinterleave_vec_bf16(
-                    gu_bias_e, b_gate.data(), b_up.data(), I, stream);
-            } else {
-                kernels::launch_deinterleave_vec_bf16(
-                    gu_bias_e, full_b_gate.data(), full_b_up.data(),
-                    I_full, stream);
-                const std::size_t per_rank_bytes = static_cast<std::size_t>(I) * 2;
-                CUDA_CHECK(cudaMemcpyAsync(
-                    b_gate.data(),
-                    static_cast<std::uint8_t*>(full_b_gate.data()) +
-                        per_rank_bytes * rank,
-                    per_rank_bytes, cudaMemcpyDeviceToDevice, stream));
-                CUDA_CHECK(cudaMemcpyAsync(
-                    b_up.data(),
-                    static_cast<std::uint8_t*>(full_b_up.data()) +
-                        per_rank_bytes * rank,
-                    per_rank_bytes, cudaMemcpyDeviceToDevice, stream));
-            }
-            w.owned_expert_buffers.push_back(std::move(b_gate));
-            Ew.b_gate = &w.owned_expert_buffers.back();
-            w.owned_expert_buffers.push_back(std::move(b_up));
-            Ew.b_up = &w.owned_expert_buffers.back();
+                    w.owned_expert_buffers.push_back(tensor_view(
+                        gate_up_all,
+                        expert_idx * mxfp4_gate_up_expert_bytes,
+                        {2 * I, H / 32, 16}));
+                    Ew.w_gate_up = &w.owned_expert_buffers.back();
 
-            // 5. b_down stays replicated — only the leader applies it
-            //    inside `mixtral_forward_paged` so the all-reduce sums it
-            //    exactly once. Non-owning view into the loader bias.
-            std::uint8_t* dn_bias_e = dn_bias_base +
-                static_cast<std::size_t>(e) * dn_bias_per_expert * bias_bf16_bytes;
-            DeviceTensor b_down = DeviceTensor::view(
-                dn_bias_e, DType::BF16, {H});
-            w.owned_expert_buffers.push_back(std::move(b_down));
-            Ew.b_down = &w.owned_expert_buffers.back();
+                    w.owned_expert_buffers.push_back(tensor_view(
+                        gate_up_scale_all,
+                        expert_idx * mxfp4_gate_up_scale_expert_bytes,
+                        {2 * I, H / 32}));
+                    Ew.w_gate_up_scale = &w.owned_expert_buffers.back();
+
+                    w.owned_expert_buffers.push_back(tensor_view(
+                        down_all,
+                        expert_idx * mxfp4_down_expert_bytes,
+                        {H, I / 32, 16}));
+                    Ew.w_down_packed = &w.owned_expert_buffers.back();
+
+                    w.owned_expert_buffers.push_back(tensor_view(
+                        down_scale_all,
+                        expert_idx * mxfp4_down_scale_expert_bytes,
+                        {H, I / 32}));
+                    Ew.w_down_scale = &w.owned_expert_buffers.back();
+
+                    auto gate_bias = DeviceTensor::allocate(DType::BF16, {I});
+                    auto up_bias = DeviceTensor::allocate(DType::BF16, {I});
+                    kernels::launch_deinterleave_vec_bf16(
+                        static_cast<const std::uint8_t*>(b_gate_up_all.data()) +
+                            expert_idx * mxfp4_gate_up_bias_expert_bytes,
+                        gate_bias.data(), up_bias.data(), I, /*stream=*/0);
+                    w.owned_expert_buffers.push_back(std::move(gate_bias));
+                    Ew.b_gate = &w.owned_expert_buffers.back();
+                    w.owned_expert_buffers.push_back(std::move(up_bias));
+                    Ew.b_up = &w.owned_expert_buffers.back();
+
+                    w.owned_expert_buffers.push_back(tensor_view(
+                        b_down_all,
+                        expert_idx * down_bias_expert_bytes,
+                        {H}));
+                    Ew.b_down = &w.owned_expert_buffers.back();
+                }
+            }
+        } else {
+            const std::string gate_name =
+                p + "mlp.experts.gate_proj.weight";
+            const std::string up_name =
+                p + "mlp.experts.up_proj.weight";
+            const std::string down_weight_name =
+                p + "mlp.experts.down_proj.weight";
+            const std::string gate_bias_name =
+                p + "mlp.experts.gate_proj.bias";
+            const std::string up_bias_name =
+                p + "mlp.experts.up_proj.bias";
+            const std::string down_bias_name =
+                p + "mlp.experts.down_proj.bias";
+            const auto& gate_all = must(engine, gate_name);
+            const auto& up_all = must(engine, up_name);
+            const auto& down_all = must(engine, down_weight_name);
+            const auto& b_gate_all = must(engine, gate_bias_name);
+            const auto& b_up_all = must(engine, up_bias_name);
+            const auto& b_down_all = must(engine, down_bias_name);
+
+            const std::vector<std::int64_t> gate_shape = {E, I, H};
+            const std::vector<std::int64_t> down_shape = {E, H, I};
+            const std::vector<std::int64_t> gate_bias_shape = {E, I};
+            const std::vector<std::int64_t> down_bias_shape = {E, H};
+            if (gate_all.dtype() != DType::BF16 ||
+                up_all.dtype() != DType::BF16 ||
+                down_all.dtype() != DType::BF16 ||
+                b_gate_all.dtype() != DType::BF16 ||
+                b_up_all.dtype() != DType::BF16 ||
+                b_down_all.dtype() != DType::BF16 ||
+                gate_all.shape() != gate_shape ||
+                up_all.shape() != gate_shape ||
+                down_all.shape() != down_shape ||
+                b_gate_all.shape() != gate_bias_shape ||
+                b_up_all.shape() != gate_bias_shape ||
+                b_down_all.shape() != down_bias_shape) {
+                throw std::runtime_error(
+                    "gpt_oss: materialized expert tensor shape mismatch at "
+                    "layer " + std::to_string(li));
+            }
+
+            for (int e = 0; e < E; ++e) {
+                auto& Ew = Lw.experts[e];
+
+                w.owned_expert_buffers.push_back(tensor_view(
+                    gate_all,
+                    static_cast<std::size_t>(e) * gate_up_expert_bytes,
+                    {I, H}));
+                Ew.w_gate = &w.owned_expert_buffers.back();
+
+                w.owned_expert_buffers.push_back(tensor_view(
+                    up_all,
+                    static_cast<std::size_t>(e) * gate_up_expert_bytes,
+                    {I, H}));
+                Ew.w_up = &w.owned_expert_buffers.back();
+
+                w.owned_expert_buffers.push_back(tensor_view(
+                    down_all,
+                    static_cast<std::size_t>(e) * down_expert_bytes,
+                    {H, I}));
+                Ew.w_down = &w.owned_expert_buffers.back();
+
+                w.owned_expert_buffers.push_back(tensor_view(
+                    b_gate_all,
+                    static_cast<std::size_t>(e) * gate_up_bias_expert_bytes,
+                    {I}));
+                Ew.b_gate = &w.owned_expert_buffers.back();
+
+                w.owned_expert_buffers.push_back(tensor_view(
+                    b_up_all,
+                    static_cast<std::size_t>(e) * gate_up_bias_expert_bytes,
+                    {I}));
+                Ew.b_up = &w.owned_expert_buffers.back();
+
+                w.owned_expert_buffers.push_back(tensor_view(
+                    b_down_all,
+                    static_cast<std::size_t>(e) * down_bias_expert_bytes,
+                    {H}));
+                Ew.b_down = &w.owned_expert_buffers.back();
+            }
         }
     }
-    // Sync stream once at the end so weights are resident before bind returns.
-    CUDA_CHECK(cudaStreamSynchronize(stream));
 
+    if (use_mxfp4_packed_experts) {
+        CUDA_CHECK(cudaGetLastError());
+        CUDA_CHECK(cudaDeviceSynchronize());
+    }
     return w;
 }
 

@@ -49,6 +49,12 @@ enum class PieArch {
     Phi3_5Moe,   // Phi-3.5-MoE (microsoft); HF model_type "phimoe". Mixtral-
                  // style sparse MoE (per-expert w1/w2/w3) with LayerNorm-
                  // with-bias norms, Q/K/V/O biases, lm_head bias.
+    GlmMoeDsa,   // GLM-5.1 (zai-org); HF model_type "glm_moe_dsa".
+                 // DeepSeek-V3/Kimi-style MLA attention with LoRA-compressed
+                 // Q/KV projections. MoE with 256 routed experts + 1 shared
+                 // expert; first 3 layers are dense. Sigmoid routing with
+                 // routed_scaling_factor. v1 skips the DSA (Differential
+                 // Sparse Attention) indexer.
 };
 
 const char* pie_arch_name(PieArch a);

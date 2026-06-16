@@ -13,7 +13,9 @@ interface chat {
 
     /// Fill roles for history replay
     system: func(model: borrow<model>, message: string) -> list<u32>;
+    first-user: func(model: borrow<model>, message: string) -> list<u32>;
     user: func(model: borrow<model>, message: string) -> list<u32>;
+    system-user: func(model: borrow<model>, system: string, user: string) -> list<u32>;
     assistant: func(model: borrow<model>, message: string) -> list<u32>;
 
     /// Cue the model to generate (fills generation header)

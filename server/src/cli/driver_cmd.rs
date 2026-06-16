@@ -16,7 +16,7 @@
 //! pie driver <embedded-type> doctor   (cuda_native | portable | dummy)
 //! ```
 //!
-//! Subprocess types are `dev` / `vllm` / `sglang`. Their commands all
+//! Subprocess types are `dev` / `vllm` / `sglang` / `tensorrt_llm`. Their commands all
 //! flow through [`crate::python_resolve`] for venv resolution, and
 //! `set` / `unset` edit `~/.pie/drivers.toml` in place.
 //!
@@ -44,11 +44,6 @@ pub enum DriverCmd {
     /// List known driver types and which appear in the loaded config.
     List(ListArgs),
 
-    /// `pie driver dev <action>` — reference Python driver.
-    Dev {
-        #[command(subcommand)]
-        action: PerDriverCmd,
-    },
     /// `pie driver vllm <action>` — vLLM-backed driver.
     Vllm {
         #[command(subcommand)]
@@ -56,6 +51,12 @@ pub enum DriverCmd {
     },
     /// `pie driver sglang <action>` — SGLang-backed driver.
     Sglang {
+        #[command(subcommand)]
+        action: PerDriverCmd,
+    },
+    /// `pie driver tensorrt-llm <action>` — TensorRT-LLM-backed driver.
+    #[command(name = "tensorrt-llm", alias = "tensorrt_llm", alias = "trtllm")]
+    TensorRtLlm {
         #[command(subcommand)]
         action: PerDriverCmd,
     },
@@ -147,9 +148,9 @@ pub fn run(cmd: DriverCmd) -> Result<()> {
     match cmd {
         DriverCmd::List(args) => list(args),
 
-        DriverCmd::Dev { action } => run_subprocess(SubprocessFlavor::Dev, action),
         DriverCmd::Vllm { action } => run_subprocess(SubprocessFlavor::Vllm, action),
         DriverCmd::Sglang { action } => run_subprocess(SubprocessFlavor::Sglang, action),
+        DriverCmd::TensorRtLlm { action } => run_subprocess(SubprocessFlavor::TensorRtLlm, action),
 
         DriverCmd::Portable { action } => run_embedded("portable", action),
         DriverCmd::CudaNative { action } => run_embedded("cuda_native", action),
@@ -164,11 +165,11 @@ pub fn run(cmd: DriverCmd) -> Result<()> {
 fn list(args: ListArgs) -> Result<()> {
     println!("Subprocess drivers (Python wheels):");
     for f in [
-        SubprocessFlavor::Dev,
         SubprocessFlavor::Vllm,
         SubprocessFlavor::Sglang,
+        SubprocessFlavor::TensorRtLlm,
     ] {
-        println!("  {:<8}  python -m {}", f.as_str(), f.module_name());
+        println!("  {:<14}  python -m {}", f.as_str(), f.module_name());
     }
     println!();
     println!("Embedded drivers (compiled into this binary by feature):");
@@ -218,23 +219,20 @@ fn run_subprocess(flavor: SubprocessFlavor, action: PerDriverCmd) -> Result<()> 
 
 fn install(flavor: SubprocessFlavor, path: Option<PathBuf>, run: bool) -> Result<()> {
     #[cfg(windows)]
-    if matches!(
-        flavor,
-        SubprocessFlavor::Dev | SubprocessFlavor::Vllm | SubprocessFlavor::Sglang
-    ) {
+    if matches!(flavor, SubprocessFlavor::Vllm | SubprocessFlavor::Sglang) {
         bail!(
-            "{} driver is not supported on Windows. Please use the portable driver on Windows, or use WSL/Linux for dev, vllm, or sglang drivers.",
+            "{} driver is not supported on Windows. Please use the portable driver on Windows, or use WSL/Linux for vllm or sglang drivers.",
             flavor.as_str()
         );
     }
-
+    
     let venv = path.unwrap_or_else(|| crate::paths::pie_home().join("venvs").join(flavor.as_str()));
     let python_bin = venv.join("bin").join("python");
 
     let wheel_extras = match flavor {
-        SubprocessFlavor::Dev => "pie-driver-dev[cu128]",
         SubprocessFlavor::Vllm => "pie-driver-vllm",
         SubprocessFlavor::Sglang => "pie-driver-sglang",
+        SubprocessFlavor::TensorRtLlm => "pie-driver-tensorrt-llm",
     };
 
     // The recipe.
@@ -257,6 +255,11 @@ fn install(flavor: SubprocessFlavor, path: Option<PathBuf>, run: bool) -> Result
     if !run {
         // Print mode — copy-pasteable shell.
         println!("# Recipe for {} driver:", flavor.as_str());
+        if flavor == SubprocessFlavor::TensorRtLlm {
+            println!(
+                "# Requires a system MPI runtime, for example: apt-get install -y libopenmpi-dev openmpi-bin"
+            );
+        }
         println!("{}", display_cmd(&create_cmd));
         println!("{}", display_cmd(&install_cmd));
         println!();
@@ -293,6 +296,12 @@ fn install(flavor: SubprocessFlavor, path: Option<PathBuf>, run: bool) -> Result
         flavor.as_str(),
         venv.display(),
     );
+    if flavor == SubprocessFlavor::TensorRtLlm {
+        println!(
+            "TensorRT-LLM also needs a system MPI runtime visible to mpi4py \
+             (for example: apt-get install -y libopenmpi-dev openmpi-bin)."
+        );
+    }
     Ok(())
 }
 
@@ -325,6 +334,23 @@ fn doctor_subprocess(flavor: SubprocessFlavor) -> Result<()> {
     ) {
         Ok(out) => println!("  import {module}: {}", out.trim()),
         Err(e) => println!("  import {module}: FAIL ({e})"),
+    }
+
+    if flavor == SubprocessFlavor::TensorRtLlm {
+        match capture(
+            &resolved.path,
+            &["-m", "pie_driver_tensorrt_llm._trt_probe"],
+        ) {
+            Ok(out) => println!("  import tensorrt_llm: {}", out.trim()),
+            Err(e) => {
+                println!("  import tensorrt_llm: FAIL ({e})");
+                println!(
+                    "  hint: TensorRT-LLM imports mpi4py; install a system MPI runtime \
+                     such as libopenmpi-dev/openmpi-bin, or run from NVIDIA's \
+                     TensorRT-LLM container."
+                );
+            }
+        }
     }
 
     // 3. Optional torch.cuda visibility — informational, never fails

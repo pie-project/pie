@@ -122,7 +122,7 @@ class PieClient:
         ):
             pass
         finally:
-            self._fail_pending_requests(ConnectionError("WebSocket connection closed"))
+            self._fail_connection_waiters(ConnectionError("WebSocket connection closed"))
 
     async def _process_server_message(self, message: dict):
         """Route incoming server messages based on their type."""
@@ -208,7 +208,12 @@ class PieClient:
                 await self.listener_task
             except asyncio.CancelledError:
                 pass
-        self._fail_pending_requests(ConnectionError("WebSocket connection closed"))
+        self._fail_connection_waiters(ConnectionError("WebSocket connection closed"))
+
+    def _fail_connection_waiters(self, exc: Exception):
+        """Reject all waiters that depend on the websocket staying open."""
+        self._fail_pending_requests(exc)
+        self._fail_process_event_queues(exc)
 
     def _fail_pending_requests(self, exc: Exception):
         """Reject all requests still waiting for a server response."""
@@ -217,6 +222,14 @@ class PieClient:
         for _, future in pending:
             if not future.done():
                 future.set_exception(exc)
+
+    def _fail_process_event_queues(self, exc: Exception):
+        """Wake process recv() waiters when the connection goes away."""
+        message = str(exc) or exc.__class__.__name__
+        queues = list(self.process_event_queues.items())
+        self.process_event_queues.clear()
+        for _, queue in queues:
+            queue.put_nowait((Event.Error.value, message))
 
     def _get_next_corr_id(self):
         """Generate a unique correlation ID for a request."""
@@ -504,6 +517,59 @@ class PieClient:
                 await queue.put(event_tuple)
 
         return Process(self, process_id)
+
+    async def launch_processes(
+        self,
+        inferlet: str,
+        inputs: list[dict | list | None],
+        capture_outputs: bool = True,
+        token_budgets: list[int | None] | None = None,
+    ) -> list[Process]:
+        """Launch several processes with one control-plane request."""
+        msg = {
+            "type": "launch_processes",
+            "inferlet": inferlet,
+            "inputs": [json.dumps(inp if inp is not None else {}) for inp in inputs],
+            "capture_outputs": capture_outputs,
+        }
+        if token_budgets is not None:
+            msg["token_budgets"] = token_budgets
+        ok, result = await self._send_msg_and_wait(msg)
+
+        if not ok:
+            raise Exception(f"Failed to launch processes: {result}")
+
+        process_ids = json.loads(result)
+        processes: list[Process] = []
+        for process_id in process_ids:
+            queue = asyncio.Queue()
+            self.process_event_queues[process_id] = queue
+            if process_id in self.orphan_events:
+                for event_tuple in self.orphan_events.pop(process_id):
+                    await queue.put(event_tuple)
+            processes.append(Process(self, process_id))
+        return processes
+
+    async def run_processes(
+        self,
+        inferlet: str,
+        inputs: list[dict | list | None],
+        token_budgets: list[int | None] | None = None,
+    ) -> list[str]:
+        """Run several processes and collect their return payloads in one response."""
+        msg = {
+            "type": "run_processes",
+            "inferlet": inferlet,
+            "inputs": [json.dumps(inp if inp is not None else {}) for inp in inputs],
+        }
+        if token_budgets is not None:
+            msg["token_budgets"] = token_budgets
+        ok, result = await self._send_msg_and_wait(msg)
+
+        if not ok:
+            raise Exception(f"Failed to run processes: {result}")
+
+        return json.loads(result)
 
     async def attach_process(self, process_id: str) -> Process:
         """Attach to an existing process.

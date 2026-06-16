@@ -1,23 +1,21 @@
 [package]
 name = "pie"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
-authors = ["In Gim <in.gim@icloud.com>"]
+authors = ["In Gim <in.gim@yale.edu>"]
 description = "Programmable Inference Engine (Pie)"
 license = "Apache-2.0"
 repository = "https://github.com/pie-project/pie"
 
 [lib]
 name = "pie"
-# After Phase 8 the runtime is consumed only as an `rlib` by Rust
-# binaries (`server`, `pie-rpc`); the maturin `cdylib` for
-# `pie._runtime` is gone with the rest of the legacy Python server.
 crate-type = ["rlib"]
 path = "src/lib.rs"
 
 [dependencies]
+pie-bridge = { path = "../driver/bridge" }
 pie-client = { path = "../client/rust" }
-tokio = { version = "1.38", features = ["full"] }
+tokio = { version = "1.52", features = ["full"] }
 tokio-util = "0.7"
 anyhow = "1.0"
 futures-util = { version = "0.3", features = ["sink"] }
@@ -78,11 +76,26 @@ unicode-normalization = "0.1"
 smallvec = "1"
 lru = "0.16.3"
 ahash = "0.8.12"
-libc = "0.2"
 ipnet = "2"
+# Host-side media decode for the model-agnostic multimodal API: the inferlet
+# hands raw encoded bytes (PNG/JPEG still, animated GIF) and the host decodes
+# them here, then resizes/patchifies per the bound model. Lean feature set —
+# WAV is parsed by hand in `multimodal::audio` (no extra crate).
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif"] }
 
-[target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Memory"] }
+[features]
+default = []
+# Host-side performance probes. Each scenario is a separate flag so you
+# only pay for the probes you ask for — different domains have different
+# sample rates and different audiences. The `probe_<domain>!` macros in
+# `src/probe/` expand to zero code when their feature is off.
+#
+# Adding a new domain: define `src/probe/<domain>.rs` with its probe-holder
+# struct + `probe_<domain>!` macro pair, then add a feature flag here.
+profile-fire = []          # per-fire scheduler lifecycle (90×/sec at conc=256)
+profile-driver-cuda = []   # driver_fire phase breakdown (Rust IPC + C++ host)
+profile-hot-path = ["profile-fire", "profile-driver-cuda"]  # convenience bundle
+profile-all = ["profile-fire", "profile-driver-cuda"]       # everything
 
 [dev-dependencies]
 tempfile = "3"
@@ -103,6 +116,10 @@ harness = false
 
 [[bench]]
 name = "page_trim_bench"
+harness = false
+
+[[bench]]
+name = "driver_channel"
 harness = false
 
 #[profile.release]

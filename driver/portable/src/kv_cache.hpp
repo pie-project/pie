@@ -23,11 +23,14 @@
 // fit in `total_pages * page_size` token slots can coexist.
 
 #include <cstdint>
+#include <string_view>
 #include <vector>
 
 #include <ggml.h>
 #include <ggml-alloc.h>
 #include <ggml-backend.h>
+
+#include "kv_cache_quant.hpp"
 
 namespace pie_portable_driver {
 
@@ -40,7 +43,8 @@ public:
                  std::int32_t head_dim,
                  std::int32_t total_pages,
                  std::int32_t page_size,
-                 ggml_type    dtype);
+                 ggml_type    dtype,
+                 KvCacheQuantFormat quant_format = {});
     // Per-layer: each layer carries its own head_dim. Used by Gemma 4
     // where sliding layers store [head_dim] and full layers [head_dim_global]
     // KV. `per_layer_head_dim.size()` must equal `n_layers`.
@@ -49,7 +53,8 @@ public:
                  std::vector<std::int32_t> per_layer_head_dim,
                  std::int32_t total_pages,
                  std::int32_t page_size,
-                 ggml_type    dtype);
+                 ggml_type    dtype,
+                 KvCacheQuantFormat quant_format = {});
     // Per-layer kv_heads AND head_dim. Used by Gemma 4 31B / 26B-A4B
     // alternative attention (full_attention layers carry fewer kv_heads
     // than sliding layers). Both vectors must have size == n_layers.
@@ -58,7 +63,8 @@ public:
                  std::vector<std::int32_t> per_layer_head_dim,
                  std::int32_t total_pages,
                  std::int32_t page_size,
-                 ggml_type    dtype);
+                 ggml_type    dtype,
+                 KvCacheQuantFormat quant_format = {});
     ~KvCachePaged();
 
     KvCachePaged(const KvCachePaged&) = delete;
@@ -85,12 +91,17 @@ public:
         return n_kv_heads_ * per_layer_head_dim_[0];
     }
     std::int32_t n_embd_gqa_at(std::int32_t layer) const noexcept {
-        return n_kv_heads_ * per_layer_head_dim_[layer];
+        return n_kv_heads_at(layer) * per_layer_head_dim_[layer];
     }
     std::int32_t total_pages() const noexcept { return total_pages_; }
     std::int32_t page_size()   const noexcept { return page_size_; }
     std::int32_t total_slots() const noexcept { return total_pages_ * page_size_; }
     std::size_t  buffer_size() const noexcept;
+    const KvCacheQuantFormat& quant_format() const noexcept { return quant_format_; }
+
+    ggml_tensor* qdq_for_append(ggml_context* ctx,
+                                std::int32_t layer,
+                                ggml_tensor* tensor) const;
 
 private:
     void allocate_();
@@ -105,6 +116,7 @@ private:
     std::int32_t          total_pages_;
     std::int32_t          page_size_;
     ggml_type             dtype_;
+    KvCacheQuantFormat    quant_format_;
 
     ggml_context*         ctx_ = nullptr;
     ggml_backend_buffer_t buf_ = nullptr;

@@ -20,7 +20,7 @@ namespace pie_cuda_driver::model {
 
 namespace {
 
-const DeviceTensor& must(const Engine& e, const std::string& name) {
+const DeviceTensor& must(const LoadedModel& e, const std::string& name) {
     if (!e.has(name)) {
         throw std::runtime_error("gemma2: missing weight '" + name + "'");
     }
@@ -29,7 +29,7 @@ const DeviceTensor& must(const Engine& e, const std::string& name) {
 
 }  // namespace
 
-Gemma2Weights bind_gemma2(const Engine& engine) {
+Gemma2Weights bind_gemma2(const LoadedModel& engine) {
     const auto& cfg = engine.hf_config();
     Gemma2Weights w;
     w.embed      = &must(engine, "model.embed_tokens.weight");
@@ -63,7 +63,7 @@ Gemma2Weights bind_gemma2(const Engine& engine) {
     return w;
 }
 
-Gemma2Weights bind_gemma3(const Engine& engine) {
+Gemma2Weights bind_gemma3(const LoadedModel& engine) {
     // Gemma-3 ships the same weight schema as Gemma-2 plus per-head
     // q_norm / k_norm. We delegate the bulk of binding and just patch
     // the qk-norm fields layer-by-layer.
@@ -126,10 +126,13 @@ void gemma2_forward_paged(
     ops::DecodePlanCachePtr decode_plan;
     if (use_decode_path) {
         decode_plan = ops::make_decode_plan();
-        ops::plan_attention_flashinfer_decode_bf16(
+        ops::plan_attention_flashinfer_decode(
             *decode_plan, kv_page_indptr_h, R,
             num_q_heads_local, num_kv_heads_local, d,
-            cache.page_size(), attn_ws, stream);
+            cache.page_size(), attn_ws, stream,
+            /*enable_cuda_graph=*/true,
+            /*full_attention_variant=*/false,
+            cache.hnd_layout());
     }
 
     // flashinfer's attention applies `q * 1/sqrt(head_dim)` internally.
@@ -191,10 +194,11 @@ void gemma2_forward_paged(
             N, num_q_heads_local, num_kv_heads_local, d,
             layer_rope_theta, stream);
 
-        kernels::launch_write_kv_to_pages_bf16(
-            cache.k(L), cache.v(L), ws.k.data(), ws.v.data(),
+        auto kv_view = cache.layer_view(L);
+        kernels::launch_write_kv_to_pages(
+            kv_view, ws.k.data(), ws.v.data(),
             qo_indptr, kv_page_indices, kv_page_indptr, kv_last_page_lens,
-            N, R, cache.page_size(), num_kv_heads_local, d, stream);
+            N, R, stream);
 
         const int layer_window_left =
             (!fwd_cfg.per_layer_window_left.empty() &&
@@ -203,26 +207,24 @@ void gemma2_forward_paged(
                 : -1;
 
         if (use_decode_path) {
-            ops::dispatch_attention_flashinfer_decode_bf16(
+            ops::dispatch_attention_flashinfer_decode(
                 *decode_plan,
-                ws.q.data(), cache.k(L), cache.v(L), ws.attn_out.data(),
+                ws.q.data(), kv_view, ws.attn_out.data(),
                 kv_page_indices, kv_page_indptr, kv_last_page_lens,
                 attn_ws, stream, layer_window_left, fwd_cfg.attn_logit_softcap);
         } else if (custom_mask_d) {
-            ops::launch_attention_flashinfer_prefill_custom_bf16(
-                ws.q.data(), cache.k(L), cache.v(L), ws.attn_out.data(),
+            ops::launch_attention_flashinfer_prefill_custom(
+                ws.q.data(), kv_view, ws.attn_out.data(),
                 qo_indptr, kv_page_indices, kv_page_indptr, kv_last_page_lens,
                 custom_mask_d, custom_mask_indptr_d,
                 qo_indptr_h, kv_page_indptr_h,
-                N, R, num_q_heads_local, num_kv_heads_local, d,
-                cache.page_size(), attn_ws, stream);
+                N, R, num_q_heads_local, attn_ws, stream);
         } else {
-            ops::launch_attention_flashinfer_prefill_bf16(
-                ws.q.data(), cache.k(L), cache.v(L), ws.attn_out.data(),
+            ops::launch_attention_flashinfer_prefill(
+                ws.q.data(), kv_view, ws.attn_out.data(),
                 qo_indptr, kv_page_indices, kv_page_indptr, kv_last_page_lens,
                 qo_indptr_h, kv_page_indptr_h,
-                N, R, num_q_heads_local, num_kv_heads_local, d,
-                cache.page_size(), attn_ws, stream,
+                N, R, num_q_heads_local, attn_ws, stream,
                 layer_window_left, fwd_cfg.attn_logit_softcap);
         }
 

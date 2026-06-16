@@ -206,7 +206,7 @@ Saved contexts (see [Forking and saving](./sharing)) persist past inferlet exit 
 
 ## Page size and prompt length
 
-Pages cap how finely you can slice a prefix. A 1000-token prompt with `page_size = 16` lives in 62 full pages plus a 8-token working page. If you save this context as a snapshot and fork from it, every fork shares those 62 committed pages and gets its own copy of the working page.
+Pages cap how finely you can slice a prefix. A 1000-token prompt with 16-token pages lives in 62 full pages plus an 8-token working page. If you save this context as a snapshot and fork from it, every fork shares those 62 committed pages and gets its own copy of the working page.
 
 This means the unit of "prefix shared across requests" is page-aligned. Prefixes that end mid-page incur a one-page copy on fork. For best-of-N over a 100-character prompt this is invisible; for prefix caching of a 32K-token system prompt it does not matter either. The pathological case is repeatedly forking after small numbers of new tokens, which forces a working-page copy each time.
 

@@ -7,7 +7,7 @@
 // (`pie_driver_cuda_native/worker.py`) generates the unique-id, passes it
 // to all ranks via the startup TOML, and only rank 0 of each group exposes
 // a shmem server to the runtime. Followers consume their inputs by NCCL
-// broadcast from rank 0 — see request_handler for the broadcast plumbing.
+// broadcast from rank 0 — see executor for the broadcast plumbing.
 
 #include <cstddef>
 #include <cstdint>
@@ -29,6 +29,19 @@ class CustomAllReduce;  // see custom_all_reduce.hpp
             throw std::runtime_error(std::string("NCCL error: ") +             \
                                      ncclGetErrorString(_r));                  \
         }                                                                      \
+    } while (0)
+
+void nccl_check_async(ncclResult_t result,
+                      ncclComm_t comm,
+                      const char* expr,
+                      const char* file,
+                      int line);
+
+#define NCCL_CHECK_ASYNC(expr, comm)                                           \
+    do {                                                                       \
+        ncclResult_t _r = (expr);                                              \
+        ::pie_cuda_driver::nccl_check_async(                                   \
+            _r, (comm), #expr, __FILE__, __LINE__);                            \
     } while (0)
 
 // Hex-encode / decode an `ncclUniqueId`. The wrapper passes the id to the
@@ -58,6 +71,11 @@ public:
     // bf16 in-place all-reduce. `count` is element count.
     void all_reduce_bf16(void* sendrecv, std::size_t count, ncclRedOp_t op,
                          cudaStream_t stream);
+
+    // bf16 out-of-place all-reduce. Used by TP hot paths that can consume the
+    // reduced value from a separate scratch buffer.
+    void all_reduce_bf16_out(const void* send, void* recv, std::size_t count,
+                             ncclRedOp_t op, cudaStream_t stream);
 
     // fp32 in-place all-reduce. Used by the runtime-quant absmax MAX
     // reduction (row-parallel weights need cross-rank absmax to compute

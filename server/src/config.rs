@@ -2,8 +2,8 @@
 //!
 //! Same TOML the legacy Python server consumed. Both embedded
 //! ([`DriverKind::Portable`] / [`DriverKind::CudaNative`] / [`DriverKind::Dummy`])
-//! and subprocess-hosted ([`DriverKind::Dev`] / [`DriverKind::Vllm`] /
-//! [`DriverKind::Sglang`]) drivers are valid; the dispatch happens in
+//! and subprocess-hosted ([`DriverKind::Vllm`] /
+//! [`DriverKind::Sglang`] / [`DriverKind::TensorRtLlm`]) drivers are valid; the dispatch happens in
 //! [`crate::serve::start_engine`] via [`crate::serve::topology::resolve_flavor`].
 //! Python-only fields are absent from validation here (e.g. nothing
 //! checks `huggingface_hub`-resolved paths until the driver actually
@@ -255,8 +255,15 @@ impl RuntimeConfig {
 }
 
 fn default_worker_threads() -> usize {
+    // Cap at 64 — pie's scheduler + chain-ext pool produces ~20-30
+    // active tokio tasks at conc=256. Beyond ~64 workers the runtime's
+    // scheduling overhead (queue management, wake propagation) starts
+    // adding variance without adding parallelism. Measured on AMD EPYC
+    // 7773X (256 threads visible): tok/s mean +0.5%, stdev cut to ~1/3
+    // by capping. Users with heavier non-inference work in the same
+    // process can override via `[runtime] worker_threads = ...`.
     std::thread::available_parallelism()
-        .map(|n| n.get())
+        .map(|n| n.get().min(64))
         .unwrap_or(4)
 }
 fn default_wasm_max_instances() -> u32 {
@@ -323,6 +330,20 @@ pub struct SchedulerConfig {
     pub admission_oversubscription_factor: f64,
     #[serde(default = "default_restore_pause_at_utilization")]
     pub restore_pause_at_utilization: f64,
+    /// Per-context depth of pass-level speculative execution.
+    /// `0` disables speculation entirely (every submit goes
+    /// through the cold path). `1` is the piggyback path —
+    /// one staged pass pre-fired per real pass. Higher values
+    /// let chain firing overlap with the inferlet's WASM time
+    /// (see SPECULATIVE_EXECUTION_DESIGN.md phase B4b.3). The
+    /// eventual ceiling is page-boundary-limited. Valid range:
+    /// 0..=64. Default 1.
+    #[serde(default = "default_speculation_depth")]
+    pub speculation_depth: u32,
+}
+
+fn default_speculation_depth() -> u32 {
+    1
 }
 
 impl Default for SchedulerConfig {
@@ -334,6 +355,7 @@ impl Default for SchedulerConfig {
             default_endowment_pages: default_endowment_pages(),
             admission_oversubscription_factor: default_oversubscription_factor(),
             restore_pause_at_utilization: default_restore_pause_at_utilization(),
+            speculation_depth: default_speculation_depth(),
         }
     }
 }
@@ -364,6 +386,11 @@ impl SchedulerConfig {
         ensure!(
             self.restore_pause_at_utilization > 0.0 && self.restore_pause_at_utilization <= 1.0,
             "scheduler.restore_pause_at_utilization must be in (0.0, 1.0]"
+        );
+        ensure!(
+            self.speculation_depth <= 64,
+            "scheduler.speculation_depth must be in 0..=64 (got {}); 0 disables speculation",
+            self.speculation_depth
         );
         Ok(())
     }
@@ -408,6 +435,17 @@ pub struct DriverConfig {
     pub activation_dtype: String,
     #[serde(default = "default_random_seed")]
     pub random_seed: u64,
+    /// IPC wait profile. When omitted, CUDA defaults to `latency`;
+    /// other drivers default to the hybrid `balanced` path.
+    /// `power` parks immediately whenever no work is ready.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ipc_profile: Option<IpcProfile>,
+    /// Expert override for the profile's busy-spin window, in µs.
+    ///
+    /// Leave unset for the profile default. `0` parks immediately;
+    /// larger values trade CPU for lower wake latency.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spin_budget_us: Option<u64>,
     /// Driver-specific knobs. Embedded drivers parse this into typed
     /// option structs; Python drivers receive the raw table after
     /// standalone-only `venv` / `python` keys are stripped.
@@ -416,17 +454,33 @@ pub struct DriverConfig {
 }
 
 impl DriverConfig {
+    pub fn effective_ipc_profile(&self) -> IpcProfile {
+        self.ipc_profile.unwrap_or(match self.kind {
+            DriverKind::CudaNative => IpcProfile::Latency,
+            _ => IpcProfile::Balanced,
+        })
+    }
+
+    pub fn effective_spin_budget_us(&self) -> u64 {
+        self.spin_budget_us
+            .unwrap_or_else(|| self.effective_ipc_profile().default_spin_budget_us())
+    }
+
+    pub fn use_inproc_polling_channel(&self) -> bool {
+        self.effective_ipc_profile() == IpcProfile::Latency
+    }
+
     fn validate(&self) -> Result<()> {
         ensure!(
             !self.device.is_empty(),
             "model.driver.device must be non-empty"
         );
         // All `DriverKind`s are valid here: embedded flavors run in-process
-        // through static libs, while dev/vllm/sglang are supervised through
-        // `crate::subprocess_driver`.
+        // through static libs, while vllm/sglang/tensorrt_llm are supervised
+        // through `crate::subprocess_driver`.
         match self.kind {
             DriverKind::Portable => {
-                let _: PortableDriverOptions = toml::Value::Table(self.options.clone())
+                let opts: PortableDriverOptions = toml::Value::Table(self.options.clone())
                     .try_into()
                     .map_err(|e| {
                         anyhow::anyhow!(
@@ -434,9 +488,10 @@ impl DriverConfig {
                             self.kind,
                         )
                     })?;
+                validate_kv_cache_dtype(&opts.kv_cache_dtype)?;
             }
             DriverKind::CudaNative => {
-                let _: CudaNativeDriverOptions = toml::Value::Table(self.options.clone())
+                let opts: CudaNativeDriverOptions = toml::Value::Table(self.options.clone())
                     .try_into()
                     .map_err(|e| {
                         anyhow::anyhow!(
@@ -444,6 +499,8 @@ impl DriverConfig {
                             self.kind,
                         )
                     })?;
+                opts.validate()?;
+                validate_kv_cache_dtype(&opts.kv_cache_dtype)?;
             }
             DriverKind::Dummy => {
                 let _: DummyDriverOptions = toml::Value::Table(self.options.clone())
@@ -455,15 +512,71 @@ impl DriverConfig {
                         )
                     })?;
             }
-            DriverKind::Dev | DriverKind::Vllm | DriverKind::Sglang => {
+            DriverKind::Vllm | DriverKind::Sglang | DriverKind::TensorRtLlm => {
                 validate_subprocess_driver_options(&self.options, self.kind)?;
+                if matches!(self.kind, DriverKind::TensorRtLlm) {
+                    ensure!(
+                        self.tensor_parallel_size == 1,
+                        "driver type {:?} currently supports tensor_parallel_size = 1",
+                        self.kind,
+                    );
+                }
             }
         }
         Ok(())
     }
 }
 
+fn validate_kv_cache_dtype(value: &str) -> Result<()> {
+    const VALID: &[&str] = &[
+        "auto",
+        "bf16",
+        "bfloat16",
+        "fp8_e4m3",
+        "fp8_e5m2",
+        "int8_per_token_head",
+        "fp8_per_token_head",
+        "fp4_e2m1",
+        "nvfp4",
+    ];
+    ensure!(
+        VALID.contains(&value),
+        "invalid kv_cache_dtype {:?}; expected one of: {}",
+        value,
+        VALID.join(", ")
+    );
+    Ok(())
+}
+
 fn validate_subprocess_driver_options(options: &toml::Table, kind: DriverKind) -> Result<()> {
+    for key in [
+        "max_num_kv_pages",
+        "max_batch_tokens",
+        "max_batch_size",
+        "linear_attn_max_slots",
+        "total_pages",
+        "cpu_pages",
+        "max_forward_tokens",
+        "max_forward_requests",
+        "max_num_seqs",
+        "max_num_batched_tokens",
+        "max_running_requests",
+        "max_total_tokens",
+    ] {
+        if kind == DriverKind::TensorRtLlm && key == "max_batch_size" {
+            continue;
+        }
+        if kind == DriverKind::Vllm && (key == "max_num_seqs" || key == "max_num_batched_tokens") {
+            continue;
+        }
+        ensure!(
+            !options.contains_key(key),
+            "invalid [model.driver.options] for driver type {:?}: \
+             `{key}` is not accepted; drivers compute KV pages and scheduling \
+             capacity in capabilities",
+            kind,
+        );
+    }
     for key in ["venv", "python"] {
         if let Some(value) = options.get(key) {
             ensure!(
@@ -474,6 +587,30 @@ fn validate_subprocess_driver_options(options: &toml::Table, kind: DriverKind) -
         }
     }
     Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum IpcProfile {
+    /// Lowest wake latency. Uses the polling in-process channel for
+    /// embedded drivers and unbounded busy-spin for shmem drivers
+    /// unless `spin_budget_us` overrides it.
+    Latency,
+    /// Hybrid spin-then-park path. Good default for GPU-bound work.
+    #[default]
+    Balanced,
+    /// Park immediately after an empty poll. Minimizes idle CPU.
+    Power,
+}
+
+impl IpcProfile {
+    pub fn default_spin_budget_us(self) -> u64 {
+        match self {
+            Self::Latency => u64::MAX,
+            Self::Balanced => default_spin_budget_us(),
+            Self::Power => 0,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
@@ -487,13 +624,13 @@ pub enum DriverKind {
     /// Rust dummy driver — random tokens, no model load. Always
     /// embedded in `pie-server`.
     Dummy,
-    /// Torch-backed reference Python driver (`pie_driver_dev`). Hosted
-    /// out-of-process by [`crate::subprocess_driver::SubprocessDriver`].
-    Dev,
     /// vLLM-backed Python driver. Subprocess-hosted.
     Vllm,
     /// SGLang-backed Python driver. Subprocess-hosted.
     Sglang,
+    /// TensorRT-LLM-backed Python driver. Subprocess-hosted.
+    #[serde(rename = "tensorrt_llm", alias = "tensorrt-llm", alias = "trtllm")]
+    TensorRtLlm,
 }
 
 impl DriverKind {
@@ -502,9 +639,9 @@ impl DriverKind {
             DriverKind::Portable => "portable",
             DriverKind::CudaNative => "cuda_native",
             DriverKind::Dummy => "dummy",
-            DriverKind::Dev => "dev",
             DriverKind::Vllm => "vllm",
             DriverKind::Sglang => "sglang",
+            DriverKind::TensorRtLlm => "tensorrt_llm",
         }
     }
 }
@@ -517,6 +654,11 @@ fn default_activation_dtype() -> String {
 }
 fn default_random_seed() -> u64 {
     42
+}
+/// Default busy-spin budget (µs) before the driver-side channel falls
+/// back to parking. Matches `pie::driver::InProcChannel::new()`.
+fn default_spin_budget_us() -> u64 {
+    1_000
 }
 
 /// Accept either a single string or a list of strings, matching
@@ -561,10 +703,11 @@ where
 #[serde(default, deny_unknown_fields)]
 pub struct PortableDriverOptions {
     pub kv_page_size: u32,
-    pub max_num_kv_pages: u32,
-    pub max_batch_tokens: u32,
-    pub max_batch_size: u32,
+    pub total_pages: u32,
+    pub max_forward_tokens: u32,
+    pub max_forward_requests: u32,
     pub cpu_pages: u32,
+    pub kv_cache_dtype: String,
     #[serde(skip)]
     pub device: String,
     #[serde(skip)]
@@ -580,10 +723,11 @@ impl Default for PortableDriverOptions {
     fn default() -> Self {
         Self {
             kv_page_size: 32,
-            max_num_kv_pages: 1024,
-            max_batch_tokens: 10240,
-            max_batch_size: 512,
+            total_pages: 1024,
+            max_forward_tokens: 10240,
+            max_forward_requests: 512,
             cpu_pages: 0,
+            kv_cache_dtype: "auto".to_string(),
             device: "auto".to_string(),
             verbose: false,
             ready_timeout_s: 120.0,
@@ -596,7 +740,8 @@ impl Default for PortableDriverOptions {
 /// `[model.driver.options]` for `type = "dummy"`. The dummy driver
 /// fabricates everything the portable driver would otherwise read from
 /// model weights — `vocab_size` and `arch_name` are required because no
-/// safe default exists. Page geometry and timeouts have generic defaults.
+/// safe default exists. Page geometry and timeouts have generic defaults;
+/// the driver derives its synthetic KV page pool from these limits.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct DummyDriverOptions {
@@ -613,35 +758,10 @@ pub struct DummyDriverOptions {
     #[serde(default)]
     pub arch_name: Option<String>,
 
-    #[serde(default = "default_kv_page_size")]
-    pub kv_page_size: u32,
-    #[serde(default = "default_max_num_kv_pages")]
-    pub max_num_kv_pages: u32,
-    #[serde(default = "default_max_batch_tokens")]
-    pub max_batch_tokens: u32,
-    #[serde(default = "default_max_batch_size")]
-    pub max_batch_size: u32,
-    #[serde(default = "default_max_model_len")]
-    pub max_model_len: u32,
     #[serde(default = "default_dummy_ready_timeout_s")]
     pub ready_timeout_s: f64,
 }
 
-fn default_kv_page_size() -> u32 {
-    16
-}
-fn default_max_num_kv_pages() -> u32 {
-    256
-}
-fn default_max_batch_tokens() -> u32 {
-    4096
-}
-fn default_max_batch_size() -> u32 {
-    128
-}
-fn default_max_model_len() -> u32 {
-    4096
-}
 fn default_dummy_ready_timeout_s() -> f64 {
     5.0
 }
@@ -658,40 +778,110 @@ pub struct CudaNativeDriverOptions {
     pub binary_path: String,
 
     pub gpu_mem_utilization: f64,
+    pub memory_profile: CudaMemoryProfile,
     pub kv_page_size: u32,
-    pub max_batch_tokens: u32,
-    pub max_batch_size: u32,
-    pub max_num_kv_pages: u32,
+    pub kv_cache_dtype: String,
     pub swap_pool_size: u32,
     pub weight_dtype: String,
+    /// CUDA device string, e.g. `"cuda:0"`. Populated by the caller
+    /// from `model.driver.device`; set on the C++ side via
+    /// `cudaSetDevice` (see `driver/cuda/src/engine.cpp`).
+    #[serde(skip)]
+    pub device: String,
     #[serde(skip)]
     pub verbose: bool,
-    /// Runtime quantization mode applied after weight load. Empty = none;
-    /// `"fp8"` enables per-tensor symmetric FP8_E4M3 on every llama-like
-    /// projection weight. Currently only honored for model_type=qwen3 by
-    /// the C++ side.
+    /// Runtime quantization mode applied during CUDA layout-plan
+    /// materialization. Empty = none; `"fp8"` and `"int8"` enable
+    /// per-channel symmetric quantization for supported projection weights.
     pub runtime_quant: String,
+    /// GPT-OSS MXFP4 MoE policy. `"auto"` selects native packed MXFP4 GEMM
+    /// on supported Blackwell-class GPUs/builds and routed dequant on legacy
+    /// GPUs; `"routed_dequant"`/`"packed"` force the packed-weight
+    /// BF16-scratch fallback; `"bf16"`/`"dequant"` eagerly materialize BF16
+    /// experts; `"native"` requires true MXFP4 GEMM kernels.
+    pub mxfp4_moe: String,
+    /// Optional Gemma-4 native MTP assistant checkpoint used by
+    /// `.system_speculation()` on cuda_native. If omitted, the CUDA
+    /// driver auto-discovers the paired `-assistant` checkpoint from
+    /// the Hugging Face cache when available.
+    pub mtp_assistant_snapshot_dir: String,
+    /// Maximum number of MTP draft tokens returned per system-spec step.
+    pub mtp_num_drafts: u32,
+    /// Operator opt-in for system speculation (MTP). Default false: the runtime
+    /// drives the auto-drafter only when this is true. Speculation is a
+    /// latency-regime win (helps at low batch, costs at compute saturation), so
+    /// it's off unless explicitly enabled — matching vLLM/SGLang convention.
+    pub enable_system_speculation: bool,
 
     pub ready_timeout_s: f64,
     pub shutdown_timeout_s: f64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum CudaMemoryProfile {
+    #[default]
+    Auto,
+    Latency,
+    Balanced,
+    Throughput,
+    Capacity,
 }
 
 impl Default for CudaNativeDriverOptions {
     fn default() -> Self {
         Self {
             binary_path: String::new(),
-            gpu_mem_utilization: 0.85,
+            gpu_mem_utilization: 0.90,
+            memory_profile: CudaMemoryProfile::Auto,
             kv_page_size: 32,
-            max_batch_tokens: 10240,
-            max_batch_size: 512,
-            max_num_kv_pages: 1024,
+            kv_cache_dtype: "auto".to_string(),
             swap_pool_size: 0,
             weight_dtype: "bfloat16".to_string(),
+            device: String::new(),
             verbose: false,
             runtime_quant: String::new(),
+            mxfp4_moe: "auto".to_string(),
+            mtp_assistant_snapshot_dir: String::new(),
+            mtp_num_drafts: 3,
+            enable_system_speculation: false,
             ready_timeout_s: 600.0,
             shutdown_timeout_s: 5.0,
         }
+    }
+}
+
+impl CudaNativeDriverOptions {
+    fn validate(&self) -> Result<()> {
+        ensure!(
+            self.gpu_mem_utilization.is_finite()
+                && self.gpu_mem_utilization > 0.0
+                && self.gpu_mem_utilization <= 1.0,
+            "model.driver.options.gpu_mem_utilization must be finite and in (0.0, 1.0]"
+        );
+        ensure!(
+            self.kv_page_size > 0,
+            "model.driver.options.kv_page_size must be > 0"
+        );
+        const MXFP4: &[&str] = &[
+            "auto",
+            "routed_dequant",
+            "packed",
+            "bf16",
+            "dequant",
+            "eager_bf16",
+            "native",
+        ];
+        ensure!(
+            self.mxfp4_moe.is_empty() || MXFP4.contains(&self.mxfp4_moe.as_str()),
+            "model.driver.options.mxfp4_moe must be one of {:?}",
+            MXFP4
+        );
+        ensure!(
+            self.mtp_num_drafts <= 32,
+            "model.driver.options.mtp_num_drafts must be in 0..=32"
+        );
+        Ok(())
     }
 }
 
@@ -716,7 +906,251 @@ device = ["cpu"]
         assert_eq!(cfg.models.len(), 1);
         assert_eq!(cfg.models[0].driver.kind, DriverKind::Portable);
         assert_eq!(cfg.models[0].driver.device, vec!["cpu".to_string()]);
+        assert_eq!(
+            cfg.models[0].driver.effective_ipc_profile(),
+            IpcProfile::Balanced
+        );
+        assert_eq!(cfg.models[0].driver.effective_spin_budget_us(), 1_000);
         assert_eq!(cfg.server.port, 8080);
+    }
+
+    #[test]
+    fn cuda_tp_defaults_to_latency_ipc() {
+        let text = r#"
+[[model]]
+name = "default"
+hf_repo = "Qwen/Qwen3-0.6B"
+
+[model.driver]
+type = "cuda_native"
+device = ["cuda:0"]
+tensor_parallel_size = 2
+
+[model.driver.options]
+gpu_mem_utilization = 0.90
+memory_profile = "balanced"
+"#;
+        let cfg: Config = toml::from_str(text).unwrap();
+        cfg.validate().unwrap();
+        assert_eq!(
+            cfg.models[0].driver.effective_ipc_profile(),
+            IpcProfile::Latency
+        );
+        assert!(cfg.models[0].driver.use_inproc_polling_channel());
+    }
+
+    #[test]
+    fn cuda_single_rank_defaults_to_latency_ipc() {
+        let text = r#"
+[[model]]
+name = "default"
+hf_repo = "Qwen/Qwen3-0.6B"
+
+[model.driver]
+type = "cuda_native"
+device = ["cuda:0"]
+
+[model.driver.options]
+gpu_mem_utilization = 0.90
+memory_profile = "balanced"
+"#;
+        let cfg: Config = toml::from_str(text).unwrap();
+        cfg.validate().unwrap();
+        assert_eq!(
+            cfg.models[0].driver.effective_ipc_profile(),
+            IpcProfile::Latency
+        );
+        assert!(cfg.models[0].driver.use_inproc_polling_channel());
+    }
+
+    #[test]
+    fn cuda_latency_profile_defaults_to_latency_ipc() {
+        let text = r#"
+[[model]]
+name = "default"
+hf_repo = "Qwen/Qwen3-0.6B"
+
+[model.driver]
+type = "cuda_native"
+device = ["cuda:0"]
+
+[model.driver.options]
+gpu_mem_utilization = 0.90
+memory_profile = "latency"
+"#;
+        let cfg: Config = toml::from_str(text).unwrap();
+        cfg.validate().unwrap();
+        assert_eq!(
+            cfg.models[0].driver.effective_ipc_profile(),
+            IpcProfile::Latency
+        );
+        assert!(cfg.models[0].driver.use_inproc_polling_channel());
+    }
+
+    #[test]
+    fn rejects_legacy_portable_kv_page_knob() {
+        let stale = r#"
+[[model]]
+name = "default"
+hf_repo = "Qwen/Qwen3-0.6B"
+
+[model.driver]
+type = "portable"
+device = ["cpu"]
+
+[model.driver.options]
+max_num_kv_pages = 1024
+"#;
+        let cfg: Config = toml::from_str(stale).unwrap();
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("max_num_kv_pages"), "got: {err}");
+    }
+
+    #[test]
+    fn rejects_legacy_dummy_kv_page_knob() {
+        let stale = r#"
+[[model]]
+name = "default"
+hf_repo = "Qwen/Qwen3-0.6B"
+
+[model.driver]
+type = "dummy"
+device = ["cpu"]
+
+[model.driver.options]
+vocab_size = 151936
+arch_name = "qwen3"
+max_num_kv_pages = 1024
+"#;
+        let cfg: Config = toml::from_str(stale).unwrap();
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("max_num_kv_pages"), "got: {err}");
+    }
+
+    #[test]
+    fn rejects_legacy_subprocess_kv_page_knob() {
+        let stale = r#"
+[[model]]
+name = "default"
+hf_repo = "Qwen/Qwen3-0.6B"
+
+[model.driver]
+type = "vllm"
+device = ["cuda:0"]
+
+[model.driver.options]
+max_num_kv_pages = 1024
+"#;
+        let cfg: Config = toml::from_str(stale).unwrap();
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("max_num_kv_pages"), "got: {err}");
+        assert!(err.contains("capabilities"), "got: {err}");
+    }
+
+    #[test]
+    fn rejects_public_driver_capacity_knobs() {
+        for (ty, key) in [
+            ("portable", "total_pages"),
+            ("portable", "cpu_pages"),
+            ("portable", "max_forward_tokens"),
+            ("portable", "max_forward_requests"),
+            ("dummy", "max_forward_tokens"),
+            ("dummy", "max_forward_requests"),
+            ("dummy", "max_model_len"),
+            ("sglang", "max_running_requests"),
+            ("sglang", "max_total_tokens"),
+        ] {
+            let mut options = String::new();
+            if ty == "dummy" {
+                options.push_str("vocab_size = 151936\narch_name = \"qwen3\"\n");
+            }
+            options.push_str(&format!("{key} = 1\n"));
+            let text = format!(
+                "[[model]]\nname = \"m\"\nhf_repo = \"x\"\n[model.driver]\n\
+                 type = \"{ty}\"\ndevice = [\"cpu\"]\n[model.driver.options]\n{options}"
+            );
+            let cfg: Config = toml::from_str(&text).unwrap();
+            let err = match cfg.validate() {
+                Ok(()) => panic!("type={ty} key={key} unexpectedly accepted"),
+                Err(err) => err.to_string(),
+            };
+            assert!(err.contains(key), "type={ty} key={key} got: {err}");
+        }
+    }
+
+    #[test]
+    fn accepts_vllm_max_num_seqs() {
+        let text = r#"
+[[model]]
+name = "m"
+hf_repo = "x"
+[model.driver]
+type = "vllm"
+device = ["cpu"]
+[model.driver.options]
+max_num_seqs = 64
+"#;
+        let cfg: Config = toml::from_str(text).unwrap();
+        cfg.validate().unwrap();
+    }
+
+    #[test]
+    fn accepts_vllm_max_num_batched_tokens() {
+        let text = r#"
+[[model]]
+name = "m"
+hf_repo = "x"
+[model.driver]
+type = "vllm"
+device = ["cpu"]
+[model.driver.options]
+max_num_batched_tokens = 8192
+"#;
+        let cfg: Config = toml::from_str(text).unwrap();
+        cfg.validate().unwrap();
+    }
+
+    #[test]
+    fn parses_ipc_profiles_and_spin_override() {
+        let latency = r#"
+[[model]]
+name = "m"
+hf_repo = "x"
+[model.driver]
+type = "portable"
+device = "cpu"
+ipc_profile = "latency"
+"#;
+        let cfg: Config = toml::from_str(latency).unwrap();
+        assert_eq!(cfg.models[0].driver.ipc_profile, Some(IpcProfile::Latency));
+        assert!(cfg.models[0].driver.use_inproc_polling_channel());
+        assert_eq!(cfg.models[0].driver.effective_spin_budget_us(), u64::MAX);
+
+        let power = r#"
+[[model]]
+name = "m"
+hf_repo = "x"
+[model.driver]
+type = "portable"
+device = "cpu"
+ipc_profile = "power"
+"#;
+        let cfg: Config = toml::from_str(power).unwrap();
+        assert_eq!(cfg.models[0].driver.ipc_profile, Some(IpcProfile::Power));
+        assert_eq!(cfg.models[0].driver.effective_spin_budget_us(), 0);
+
+        let override_spin = r#"
+[[model]]
+name = "m"
+hf_repo = "x"
+[model.driver]
+type = "portable"
+device = "cpu"
+ipc_profile = "latency"
+spin_budget_us = 25
+"#;
+        let cfg: Config = toml::from_str(override_spin).unwrap();
+        assert_eq!(cfg.models[0].driver.effective_spin_budget_us(), 25);
     }
 
     #[test]
@@ -735,9 +1169,9 @@ device = "cuda:0"
 
     #[test]
     fn accepts_subprocess_drivers() {
-        // dev/vllm/sglang are hosted out-of-process by
+        // vllm/sglang/tensorrt_llm are hosted out-of-process by
         // `crate::subprocess_driver::SubprocessDriver`.
-        for ty in ["dev", "vllm", "sglang"] {
+        for ty in ["vllm", "sglang", "tensorrt_llm"] {
             let toml_text = format!(
                 "[[model]]\nname = \"m\"\nhf_repo = \"x\"\n[model.driver]\n\
                  type = \"{ty}\"\ndevice = [\"cuda:0\"]\n"
@@ -745,6 +1179,35 @@ device = "cuda:0"
             let cfg: Config = toml::from_str(&toml_text).unwrap();
             cfg.validate().unwrap_or_else(|e| panic!("type={ty}: {e}"));
         }
+    }
+
+    #[test]
+    fn rejects_tensorrt_llm_capacity_knobs() {
+        for key in ["max_forward_requests", "max_num_kv_pages"] {
+            let text = format!(
+                "[[model]]\nname = \"m\"\nhf_repo = \"x\"\n[model.driver]\n\
+                 type = \"tensorrt_llm\"\ndevice = [\"cuda:0\"]\n[model.driver.options]\n{key} = 1\n"
+            );
+            let cfg: Config = toml::from_str(&text).unwrap();
+            let err = cfg.validate().unwrap_err().to_string();
+            assert!(err.contains(key), "key={key} got: {err}");
+        }
+    }
+
+    #[test]
+    fn allows_tensorrt_llm_runtime_max_batch_size() {
+        let text = r#"
+[[model]]
+name = "m"
+hf_repo = "x"
+[model.driver]
+type = "tensorrt_llm"
+device = ["cuda:0"]
+[model.driver.options]
+max_batch_size = 8
+"#;
+        let cfg: Config = toml::from_str(text).unwrap();
+        cfg.validate().unwrap();
     }
 
     #[test]
@@ -796,18 +1259,27 @@ type = "cuda_native"
 device = ["cuda:0"]
 
 [model.driver.options]
-max_num_kv_pages = 2048
+gpu_mem_utilization = 0.90
+memory_profile = "balanced"
 runtime_quant = "fp8"
+mxfp4_moe = "routed_dequant"
+mtp_assistant_snapshot_dir = "/models/gemma4-mtp"
+mtp_num_drafts = 6
 "#;
         let cfg: Config = toml::from_str(cuda).unwrap();
         cfg.validate().unwrap();
         assert_eq!(cfg.models[0].driver.kind, DriverKind::CudaNative);
         let opts: CudaNativeDriverOptions =
             cfg.models[0].driver.options.clone().try_into().unwrap();
-        assert_eq!(opts.max_num_kv_pages, 2048);
+        assert_eq!(opts.gpu_mem_utilization, 0.90);
+        assert_eq!(opts.memory_profile, CudaMemoryProfile::Balanced);
         assert_eq!(opts.runtime_quant, "fp8");
+        assert_eq!(opts.mxfp4_moe, "routed_dequant");
+        assert_eq!(opts.mtp_assistant_snapshot_dir, "/models/gemma4-mtp");
+        assert_eq!(opts.mtp_num_drafts, 6);
         assert_eq!(opts.weight_dtype, "bfloat16"); // default
         assert_eq!(opts.kv_page_size, 32); // default
+        assert_eq!(opts.kv_cache_dtype, "auto"); // default
     }
 
     #[test]
@@ -825,11 +1297,93 @@ device = ["cuda:0"]
         cfg.validate().unwrap();
         let opts: CudaNativeDriverOptions =
             cfg.models[0].driver.options.clone().try_into().unwrap();
-        // Defaults match pie_driver_cuda_native/config.py.
-        assert_eq!(opts.max_num_kv_pages, 1024);
         assert_eq!(opts.swap_pool_size, 0);
-        assert_eq!(opts.gpu_mem_utilization, 0.85);
+        assert_eq!(opts.gpu_mem_utilization, 0.90);
+        assert_eq!(opts.memory_profile, CudaMemoryProfile::Auto);
+        assert_eq!(opts.mxfp4_moe, "auto");
+        assert!(opts.mtp_assistant_snapshot_dir.is_empty());
+        assert_eq!(opts.mtp_num_drafts, 3);
         assert_eq!(opts.ready_timeout_s, 600.0);
+        assert_eq!(opts.kv_cache_dtype, "auto");
+    }
+
+    #[test]
+    fn rejects_invalid_embedded_kv_cache_dtype() {
+        let bad = r#"
+[[model]]
+name = "default"
+hf_repo = "Qwen/Qwen3-0.6B"
+
+[model.driver]
+type = "cuda_native"
+device = ["cuda:0"]
+
+[model.driver.options]
+kv_cache_dtype = "turboquant"
+"#;
+        let cfg: Config = toml::from_str(bad).unwrap();
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("kv_cache_dtype"), "got: {err}");
+        assert!(err.contains("fp8_e4m3"), "got: {err}");
+        assert!(err.contains("nvfp4"), "got: {err}");
+    }
+
+    #[test]
+    fn rejects_invalid_cuda_memory_profile() {
+        let cuda = r#"
+[[model]]
+name = "default"
+hf_repo = "Qwen/Qwen3-0.6B"
+
+[model.driver]
+type = "cuda_native"
+device = ["cuda:0"]
+
+[model.driver.options]
+memory_profile = "aggressive"
+"#;
+        let cfg: Config = toml::from_str(cuda).unwrap();
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("memory_profile"), "got: {err}");
+        assert!(err.contains("aggressive"), "got: {err}");
+    }
+
+    #[test]
+    fn rejects_unknown_cuda_option() {
+        let cuda = r#"
+[[model]]
+name = "default"
+hf_repo = "Qwen/Qwen3-0.6B"
+
+[model.driver]
+type = "cuda_native"
+device = ["cuda:0"]
+
+[model.driver.options]
+manual_capacity = 1
+"#;
+        let cfg: Config = toml::from_str(cuda).unwrap();
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("manual_capacity"), "got: {err}");
+    }
+
+    #[test]
+    fn rejects_invalid_cuda_mxfp4_policy() {
+        let cuda = r#"
+[[model]]
+name = "default"
+hf_repo = "openai/gpt-oss-20b"
+
+[model.driver]
+type = "cuda_native"
+device = ["cuda:0"]
+
+[model.driver.options]
+mxfp4_moe = "mystery"
+"#;
+        let cfg: Config = toml::from_str(cuda).unwrap();
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("mxfp4_moe"), "got: {err}");
     }
 
     #[test]

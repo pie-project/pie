@@ -8,9 +8,9 @@
 //! Constraints compose — every applied constraint contributes a mask,
 //! and the masks are AND-ed before each forward pass.
 
+use crate::Result;
 use crate::inference::Grammar;
 use crate::model::Model;
-use crate::Result;
 use crate::pie::core::inference::Matcher;
 
 /// Token sampling constraint.
@@ -119,7 +119,10 @@ pub struct GrammarConstraint {
 impl GrammarConstraint {
     /// Wrap an existing [`Matcher`].
     pub fn new(matcher: Matcher) -> Self {
-        Self { matcher, cached_mask: Vec::new() }
+        Self {
+            matcher,
+            cached_mask: Vec::new(),
+        }
     }
 
     /// Build from a pre-compiled grammar (compile once, reuse across contexts).

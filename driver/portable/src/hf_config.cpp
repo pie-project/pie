@@ -5,6 +5,7 @@
 #include <string>
 
 #include <nlohmann/json.hpp>
+#include <pie_driver_common/hf_config_json.hpp>
 
 namespace pie_portable_driver {
 
@@ -26,6 +27,7 @@ const char* pie_arch_name(PieArch a) {
         case PieArch::Qwen3_5:  return "qwen3_5";
         case PieArch::Phi3Small: return "phi3small";
         case PieArch::Phi3_5Moe: return "phi3_5moe";
+        case PieArch::GlmMoeDsa: return "glm_moe_dsa";
     }
     return "?";
 }
@@ -58,6 +60,7 @@ PieArch hf_model_type_to_pie_arch(const std::string& hf_model_type) {
         hf_model_type == "qwen3_5_text" ||
         hf_model_type == "qwen3_5_moe" ||
         hf_model_type == "qwen3_5_moe_text") return PieArch::Qwen3_5;
+    if (hf_model_type == "glm_moe_dsa") return PieArch::GlmMoeDsa;
     throw std::runtime_error(
         "hf_config: unsupported model_type '" + hf_model_type + "'");
 }
@@ -66,16 +69,12 @@ namespace {
 
 template <typename T>
 std::optional<T> get_opt(const nlohmann::json& j, const char* key) {
-    auto it = j.find(key);
-    if (it == j.end() || it->is_null()) return std::nullopt;
-    return it->get<T>();
+    return pie_driver_common::json_get_opt<T>(j, key);
 }
 
 template <typename T>
 T get_or(const nlohmann::json& j, const char* key, T def) {
-    auto it = j.find(key);
-    if (it == j.end() || it->is_null()) return def;
-    return it->get<T>();
+    return pie_driver_common::json_get_or<T>(j, key, def);
 }
 
 }  // namespace
@@ -103,23 +102,14 @@ Hparams parse_hf_config(const std::filesystem::path& config_json_path) {
     // this function reads from the unwrapped JSON. We still derive `arch`
     // from the *outer* model_type because the runtime catalogue keys on
     // it (e.g. "gemma4" → Gemma4ForConditionalGeneration wraps gemma4_text).
-    const std::string outer_model_type =
-        j.contains("model_type") && !j["model_type"].is_null()
-            ? j["model_type"].get<std::string>() : std::string();
-    nlohmann::json text = j;
-    if (j.contains("text_config") && j["text_config"].is_object()) {
-        text = j["text_config"];
-    }
+    const auto view = pie_driver_common::hf_config_json_view(j);
+    nlohmann::json text = view.text;
 
-    h.hf_model_type =
-        text.contains("model_type") && !text["model_type"].is_null()
-            ? text["model_type"].get<std::string>()
-            : outer_model_type;
+    h.hf_model_type = view.text_or_outer_model_type();
     // Use the outer wrapper's model_type for arch dispatch when present;
     // it's how the wrapper architecture is declared. For Ministral 3 the
     // outer says "mistral3" which is the registered HF type.
-    h.arch = hf_model_type_to_pie_arch(
-        !outer_model_type.empty() ? outer_model_type : h.hf_model_type);
+    h.arch = hf_model_type_to_pie_arch(view.outer_or_text_model_type());
     h.torch_dtype =
         get_or<std::string>(text, "torch_dtype",
             get_or<std::string>(j, "torch_dtype",
@@ -269,20 +259,8 @@ Hparams parse_hf_config(const std::filesystem::path& config_json_path) {
     //   - `rope_parameters` (newer; ministral3) — when a single dict, same
     //     shape as `rope_scaling`. Gemma4 uses a per-attention-type dict-of-
     //     dicts and is parsed in build_gemma4_().
-    const nlohmann::json* rs_ptr = nullptr;
-    auto rs_it = text.find("rope_scaling");
-    if (rs_it != text.end() && !rs_it->is_null()) rs_ptr = &(*rs_it);
-    if (!rs_ptr) {
-        auto rp_it = text.find("rope_parameters");
-        if (rp_it != text.end() && rp_it->is_object()) {
-            // Skip per-attention-type dicts (gemma4-style); only consume a
-            // flat dict.
-            const auto& rp = *rp_it;
-            const bool nested = !rp.empty() && rp.begin().value().is_object()
-                && rp.begin().value().contains("rope_type");
-            if (!nested) rs_ptr = &rp;
-        }
-    }
+    const nlohmann::json* rs_ptr =
+        pie_driver_common::flat_rope_config_view(text);
     if (rs_ptr) {
         h.has_rope_scaling = true;
         const auto& rs = *rs_ptr;

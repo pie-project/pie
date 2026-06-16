@@ -1,7 +1,9 @@
 #include "model/mixtral.hpp"
 
 #include <algorithm>
+#include <cstdint>
 #include <stdexcept>
+#include <string>
 #include <vector>
 
 #include <cuda_runtime.h>
@@ -10,6 +12,8 @@
 #include "device_buffer.hpp"
 #include "kernels/add_bias.hpp"
 #include "kernels/attn_sink.hpp"
+#include "kernels/dequant_fp4.hpp"
+#include "kernels/deinterleave.hpp"
 #include "kernels/embed.hpp"
 #include "kernels/gather_rows.hpp"
 #include "kernels/residual_add.hpp"
@@ -26,7 +30,7 @@ namespace pie_cuda_driver::model {
 
 namespace {
 
-const DeviceTensor& must(const Engine& e, const std::string& name) {
+const DeviceTensor& must(const LoadedModel& e, const std::string& name) {
     if (!e.has(name)) {
         throw std::runtime_error("mixtral: missing weight '" + name + "'");
     }
@@ -35,7 +39,7 @@ const DeviceTensor& must(const Engine& e, const std::string& name) {
 
 }  // namespace
 
-MixtralWeights bind_mixtral(const Engine& engine) {
+MixtralWeights bind_mixtral(const LoadedModel& engine) {
     const auto& cfg = engine.hf_config();
     const int E = cfg.num_experts;
     if (E <= 0) {
@@ -145,6 +149,9 @@ void mixtral_forward_paged(
     const int Hq = (cfg.num_attention_heads * cfg.head_dim) / T;
     const int Hk = (cfg.num_key_value_heads * cfg.head_dim) / T;
     const int I  = cfg.intermediate_size / T;
+    const int Ip = (w.mxfp4_intermediate_padded > I)
+        ? w.mxfp4_intermediate_padded
+        : I;
     const int num_q_heads_local  = cfg.num_attention_heads / T;
     const int num_kv_heads_local = cfg.num_key_value_heads / T;
     const int V  = cfg.vocab_size;
@@ -179,10 +186,13 @@ void mixtral_forward_paged(
     ops::DecodePlanCachePtr decode_plan;
     if (use_decode_path) {
         decode_plan = ops::make_decode_plan();
-        ops::plan_attention_flashinfer_decode_bf16(
+        ops::plan_attention_flashinfer_decode(
             *decode_plan, kv_page_indptr_h, R,
             num_q_heads_local, num_kv_heads_local, d,
-            cache.page_size(), attn_ws, stream);
+            cache.page_size(), attn_ws, stream,
+            /*enable_cuda_graph=*/true,
+            /*full_attention_variant=*/false,
+            cache.hnd_layout());
     }
 
     // Per-fire scratch for MoE routing. Sized for the worst case (N
@@ -200,8 +210,8 @@ void mixtral_forward_paged(
     // that bound to avoid re-allocating inside the layer loop.
     const std::size_t max_routed = static_cast<std::size_t>(N) * top_k;
     auto d_expert_in    = DeviceBuffer<std::uint16_t>::alloc(max_routed * H);
-    auto d_expert_gate  = DeviceBuffer<std::uint16_t>::alloc(max_routed * I);
-    auto d_expert_up    = DeviceBuffer<std::uint16_t>::alloc(max_routed * I);
+    auto d_expert_gate  = DeviceBuffer<std::uint16_t>::alloc(max_routed * Ip);
+    auto d_expert_up    = DeviceBuffer<std::uint16_t>::alloc(max_routed * Ip);
     auto d_expert_out   = DeviceBuffer<std::uint16_t>::alloc(max_routed * H);
     auto d_expert_idx   = DeviceBuffer<std::int32_t>::alloc(max_routed);
     auto d_expert_w     = DeviceBuffer<float>::alloc(max_routed);
@@ -238,10 +248,11 @@ void mixtral_forward_paged(
             N, num_q_heads_local, num_kv_heads_local, d,
             cfg.rope_theta, stream);
 
-        kernels::launch_write_kv_to_pages_bf16(
-            cache.k(L), cache.v(L), ws.k.data(), ws.v.data(),
+        auto kv_view = cache.layer_view(L);
+        kernels::launch_write_kv_to_pages(
+            kv_view, ws.k.data(), ws.v.data(),
             qo_indptr, kv_page_indices, kv_page_indptr, kv_last_page_lens,
-            N, R, cache.page_size(), num_kv_heads_local, d, stream);
+            N, R, stream);
 
         // Only ask flashinfer for lse on layers that actually use sinks.
         // Saves a per-layer kernel write on plain Mixtral, and on
@@ -249,9 +260,9 @@ void mixtral_forward_paged(
         float* layer_lse = (layer.attn_sinks != nullptr) ? lse_ptr : nullptr;
 
         if (use_decode_path) {
-            ops::dispatch_attention_flashinfer_decode_bf16(
+            ops::dispatch_attention_flashinfer_decode(
                 *decode_plan,
-                ws.q.data(), cache.k(L), cache.v(L), ws.attn_out.data(),
+                ws.q.data(), kv_view, ws.attn_out.data(),
                 kv_page_indices, kv_page_indptr, kv_last_page_lens,
                 attn_ws, stream,
                 /*window_left=*/layer_window,
@@ -259,23 +270,21 @@ void mixtral_forward_paged(
                 /*sm_scale=*/-1.f,
                 layer_lse);
         } else if (custom_mask_d) {
-            ops::launch_attention_flashinfer_prefill_custom_bf16(
-                ws.q.data(), cache.k(L), cache.v(L), ws.attn_out.data(),
+            ops::launch_attention_flashinfer_prefill_custom(
+                ws.q.data(), kv_view, ws.attn_out.data(),
                 qo_indptr, kv_page_indices, kv_page_indptr, kv_last_page_lens,
                 custom_mask_d, custom_mask_indptr_d,
                 qo_indptr_h, kv_page_indptr_h,
-                N, R, num_q_heads_local, num_kv_heads_local, d,
-                cache.page_size(), attn_ws, stream,
+                N, R, num_q_heads_local, attn_ws, stream,
                 /*window_left=*/-1,
                 /*logits_soft_cap=*/0.f, /*sm_scale=*/-1.f,
                 layer_lse);
         } else {
-            ops::launch_attention_flashinfer_prefill_bf16(
-                ws.q.data(), cache.k(L), cache.v(L), ws.attn_out.data(),
+            ops::launch_attention_flashinfer_prefill(
+                ws.q.data(), kv_view, ws.attn_out.data(),
                 qo_indptr, kv_page_indices, kv_page_indptr, kv_last_page_lens,
                 qo_indptr_h, kv_page_indptr_h,
-                N, R, num_q_heads_local, num_kv_heads_local, d,
-                cache.page_size(), attn_ws, stream,
+                N, R, num_q_heads_local, attn_ws, stream,
                 /*window_left=*/layer_window,
                 /*logits_soft_cap=*/0.f,
                 /*sm_scale=*/-1.f,
@@ -384,11 +393,98 @@ void mixtral_forward_paged(
 
             // SwiGLU MLP.
             const auto& expert = layer.experts[e];
+            const void* gate_w = nullptr;
+            const void* up_w = nullptr;
+            const void* down_w = nullptr;
+            if (expert.format == MixtralExpertWeightFormat::Mxfp4NativeGemm) {
+                if (!expert.w_gate_mxfp4 || !expert.w_gate_mxfp4_scale ||
+                    !expert.w_up_mxfp4 || !expert.w_up_mxfp4_scale ||
+                    !expert.w_down_mxfp4 || !expert.w_down_mxfp4_scale) {
+                    throw std::runtime_error(
+                        "mixtral/gpt_oss: incomplete native MXFP4 expert backend");
+                }
+                ops::gemm_act_x_w(cublas.handle(),
+                    d_expert_in.data(),
+                    ops::WeightView::mxfp4_marlin(
+                        *expert.w_gate_mxfp4, *expert.w_gate_mxfp4_scale),
+                    d_expert_gate.data(), Ne, Ip, H);
+                ops::gemm_act_x_w(cublas.handle(),
+                    d_expert_in.data(),
+                    ops::WeightView::mxfp4_marlin(
+                        *expert.w_up_mxfp4, *expert.w_up_mxfp4_scale),
+                    d_expert_up.data(), Ne, Ip, H);
+                if (expert.b_gate) kernels::launch_add_bias_bf16_strided(
+                    d_expert_gate.data(), expert.b_gate->data(), Ne, I, Ip,
+                    stream);
+                if (expert.b_up) kernels::launch_add_bias_bf16_strided(
+                    d_expert_up.data(), expert.b_up->data(), Ne, I, Ip,
+                    stream);
+                if (cfg.swiglu_limit > 0.f) {
+                    kernels::launch_gpt_oss_glu_bf16(
+                        d_expert_gate.data(), d_expert_up.data(),
+                        d_expert_gate.data(),
+                        static_cast<int>(static_cast<std::size_t>(Ne) * Ip), stream,
+                        /*limit=*/cfg.swiglu_limit);
+                } else {
+                    kernels::launch_swiglu_bf16(
+                        d_expert_gate.data(), d_expert_up.data(),
+                        d_expert_gate.data(),
+                        static_cast<std::size_t>(Ne) * Ip, stream);
+                }
+                ops::gemm_act_x_w(cublas.handle(),
+                    d_expert_gate.data(),
+                    ops::WeightView::mxfp4_marlin(
+                        *expert.w_down_mxfp4, *expert.w_down_mxfp4_scale),
+                    d_expert_out.data(), Ne, H, Ip);
+                if (expert.b_down && tp_is_leader) kernels::launch_add_bias_bf16(
+                    d_expert_out.data(), expert.b_down->data(), Ne, H, stream);
+                kernels::launch_scatter_add_weighted_bf16(
+                    moe_target, d_expert_out.data(),
+                    d_expert_idx.data(), d_expert_w.data(),
+                    Ne, H, stream);
+                continue;
+            }
+            if (expert.format == MixtralExpertWeightFormat::Mxfp4RoutedDequant) {
+                if (!expert.w_gate_up || !expert.w_gate_up_scale ||
+                    !expert.w_down_packed || !expert.w_down_scale ||
+                    w.mxfp4_gate_up_bf16_scratch.empty() ||
+                    w.mxfp4_gate_bf16_scratch.empty() ||
+                    w.mxfp4_up_bf16_scratch.empty() ||
+                    w.mxfp4_down_bf16_scratch.empty()) {
+                    throw std::runtime_error(
+                        "mixtral/gpt_oss: incomplete MXFP4 expert backend");
+                }
+                kernels::launch_dequant_mxfp4_to_bf16(
+                    static_cast<const std::uint8_t*>(expert.w_gate_up->data()),
+                    static_cast<const std::uint8_t*>(
+                        expert.w_gate_up_scale->data()),
+                    w.mxfp4_gate_up_bf16_scratch.data(),
+                    2 * I, H, stream);
+                kernels::launch_dequant_mxfp4_to_bf16(
+                    static_cast<const std::uint8_t*>(
+                        expert.w_down_packed->data()),
+                    static_cast<const std::uint8_t*>(
+                        expert.w_down_scale->data()),
+                    w.mxfp4_down_bf16_scratch.data(),
+                    H, I, stream);
+                kernels::launch_deinterleave_rows_bf16(
+                    w.mxfp4_gate_up_bf16_scratch.data(),
+                    w.mxfp4_gate_bf16_scratch.data(),
+                    w.mxfp4_up_bf16_scratch.data(),
+                    I, H, stream);
+                gate_w = w.mxfp4_gate_bf16_scratch.data();
+                up_w = w.mxfp4_up_bf16_scratch.data();
+                down_w = w.mxfp4_down_bf16_scratch.data();
+            } else {
+                gate_w = expert.w_gate->data();
+                up_w = expert.w_up->data();
+                down_w = expert.w_down->data();
+            }
             ops::gemm_act_x_wt_bf16(cublas.handle(),
-                d_expert_in.data(), expert.w_gate->data(),
+                d_expert_in.data(), gate_w,
                 d_expert_gate.data(), Ne, I, H);
             ops::gemm_act_x_wt_bf16(cublas.handle(),
-                d_expert_in.data(), expert.w_up->data(),
+                d_expert_in.data(), up_w,
                 d_expert_up.data(), Ne, I, H);
             if (expert.b_gate) kernels::launch_add_bias_bf16(
                 d_expert_gate.data(), expert.b_gate->data(), Ne, I, stream);
@@ -407,7 +503,7 @@ void mixtral_forward_paged(
                     static_cast<std::size_t>(Ne) * I, stream);
             }
             ops::gemm_act_x_wt_bf16(cublas.handle(),
-                d_expert_gate.data(), expert.w_down->data(),
+                d_expert_gate.data(), down_w,
                 d_expert_out.data(), Ne, H, I);
             // b_down is replicated across ranks; only the leader applies
             // it so the all-reduce sums it once. Plain Mixtral has no

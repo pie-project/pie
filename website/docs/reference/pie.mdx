@@ -308,16 +308,16 @@ Inspect embedded drivers and manage subprocess-driver Python environments.
 
 ```text
 pie driver list [-c <CONFIG>]
-pie driver <dev|vllm|sglang> install [PATH] [--run]
-pie driver <dev|vllm|sglang> set venv <PATH>
-pie driver <dev|vllm|sglang> set python <PATH>
-pie driver <dev|vllm|sglang> show
-pie driver <dev|vllm|sglang> doctor
+pie driver <dev|vllm|sglang|tensorrt-llm> install [PATH] [--run]
+pie driver <dev|vllm|sglang|tensorrt-llm> set venv <PATH>
+pie driver <dev|vllm|sglang|tensorrt-llm> set python <PATH>
+pie driver <dev|vllm|sglang|tensorrt-llm> show
+pie driver <dev|vllm|sglang|tensorrt-llm> doctor
 pie driver <portable|cuda-native|dummy> doctor
 ```
 
 `portable`, `cuda_native`, and `dummy` are embedded in the `pie` binary when
-compiled into that build. `dev`, `vllm`, and `sglang` run out-of-process via
+compiled into that build. `dev`, `vllm`, `sglang`, and `tensorrt_llm` run out-of-process via
 `python -m pie_driver_<type>`.
 
 Example:

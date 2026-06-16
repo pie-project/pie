@@ -1,3 +1,4 @@
+#pragma once
 /*
 Fast Dequantization (Converting INT4/INT8/FP4/FP8 to FP16/BF16)
 

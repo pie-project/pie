@@ -27,7 +27,7 @@ extern "C" void pie_paged_attn_set_host_indptr(
 namespace pie_portable_driver {
 
 GraphInputs declare_graph_inputs(ggml_context* ctx,
-                                 const ForwardEngine::BatchPlan& plan,
+                                 const Executor::BatchPlan& plan,
                                  std::int32_t n_total,
                                  std::int32_t n_req,
                                  bool         supports_paged_attn_ext) {
@@ -352,7 +352,7 @@ ggml_tensor* apply_lora_delta(ggml_context* ctx,
 }
 
 void upload_graph_inputs(const GraphResult& g,
-                         const ForwardEngine::BatchPlan& plan) {
+                         const Executor::BatchPlan& plan) {
     ggml_backend_tensor_set(g.in.tok_input, plan.tokens_i32.data(), 0,
                             plan.tokens_i32.size() * sizeof(std::int32_t));
     // Qwen 3.5 / 3.6 use mrope: ggml_rope_multi expects 4 positions per

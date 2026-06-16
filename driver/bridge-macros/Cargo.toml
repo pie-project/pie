@@ -1,0 +1,15 @@
+[package]
+name = "pie-bridge-macros"
+version = "0.1.0"
+edition = "2024"
+authors = ["In Gim <in.gim@yale.edu>"]
+description = "Derive macros for pie-bridge: generates the C-ABI accessor surface from the schema."
+license = "Apache-2.0"
+
+[lib]
+proc-macro = true
+
+[dependencies]
+syn = { version = "2", features = ["full"] }
+quote = "1"
+proc-macro2 = "1"

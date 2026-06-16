@@ -31,7 +31,7 @@ For interested readers, the motivation is described in depth in [Pie: a programm
 
 ## Pie serves programs, not prompts
 
-Pie's primitive is the *inferlet*: a small program you write in Rust, Python, or TypeScript that compiles to WebAssembly and runs inside the engine. The inferlet has direct access to the KV cache, the token stream, and the forward pass. The client launches an inferlet by name; the inferlet runs to completion; tokens and events stream back through it.
+Pie's primitive is the *inferlet*: a small program you write in Rust, Python, or TypeScript that compiles to WebAssembly and runs inside the engine. The inferlet has direct access to the KV cache, the token stream, and the forward pass — including multimodal inputs (vision, video, audio) and audio output. The client launches an inferlet by name; the inferlet runs to completion; tokens and events stream back through it.
 
 Below are three short inferlets. The [Examples](../guide/examples/overview) page lists more inferlets.
 

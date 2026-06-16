@@ -8,6 +8,10 @@ sidebar_position: 2
 
 A forward pass takes a list of input positions, the token IDs at those positions, and an optional attention mask. This page covers the three input modalities. Read this after [The forward pass](./overview).
 
+:::note Non-text inputs
+This page covers token inputs. For image, video, and audio inputs (and audio output), see [Multimodal generation](../model/multimodal).
+:::
+
 The Forward builder is available in all three SDKs. The Rust examples below are canonical; the Python and JavaScript shapes mirror them with `snake_case` and `camelCase` respectively. The page-level operations at the bottom of this page reach into `ctx.inner()` and are Rust-only — the Python and JavaScript SDKs do not surface the inner handle.
 
 ## Tokens with auto-positions

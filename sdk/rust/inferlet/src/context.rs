@@ -8,10 +8,10 @@ mod constraint;
 // Re-export submodule public types.
 pub use constraint::*;
 
-use crate::inference::ForwardPass;
-use crate::model::Model;
 use crate::ForwardPassExt;
 use crate::Result;
+use crate::inference::ForwardPass;
+use crate::model::Model;
 use crate::sample::Sampler;
 use serde_json;
 
@@ -50,12 +50,21 @@ use crate::pie::instruct::chat;
 /// make-cost term: forward-pass compute is billed against the token
 /// wallet, not the credit wallet.
 pub(crate) fn compute_bid(
-    balance: f64, pages: f64, mu: f64, cv2: f64, page_size: f64, dividend: f64,
+    balance: f64,
+    pages: f64,
+    mu: f64,
+    cv2: f64,
+    page_size: f64,
+    dividend: f64,
 ) -> f64 {
     let mu = mu.max(1.0);
     let numerator = balance / mu + dividend;
     let denominator = pages + mu * (1.0 + cv2) / (2.0 * page_size);
-    if denominator > 0.0 { numerator / denominator } else { numerator }
+    if denominator > 0.0 {
+        numerator / denominator
+    } else {
+        numerator
+    }
 }
 
 // =============================================================================
@@ -77,6 +86,9 @@ pub struct Context {
     pub(crate) page_size: u32,
     /// SDK-side token buffer filled by instruct operations.
     pub(crate) buffer: Vec<u32>,
+    /// Deferred system text, so model templates that fold system into the
+    /// first user turn can render the pair correctly.
+    pending_system: Option<String>,
     /// Total tokens in committed + working pages (tracked locally).
     pub(crate) seq_len: u32,
     /// Number of committed pages (tracked locally).
@@ -146,6 +158,7 @@ impl Context {
             model,
             page_size,
             buffer: Vec::new(),
+            pending_system: None,
             seq_len,
             committed_pages,
             working_pages,
@@ -166,6 +179,7 @@ impl Context {
             model,
             page_size: self.page_size,
             buffer: self.buffer.clone(),
+            pending_system: self.pending_system.clone(),
             seq_len: self.seq_len,
             committed_pages: self.committed_pages,
             working_pages: self.working_pages,
@@ -284,22 +298,38 @@ impl Context {
     // model for template lookup / tokenization) and appends the resulting
     // tokens to the local buffer.
 
+    fn flush_pending_system(&mut self) {
+        if let Some(system) = self.pending_system.take() {
+            let tokens = chat::system(&self.model, &system);
+            self.buffer.extend(tokens);
+        }
+    }
+
+    fn is_first_chat_fill(&self) -> bool {
+        self.seq_len == 0 && self.buffer.is_empty()
+    }
+
     /// Fill a system message; tokens are buffered for the next `flush()`.
     pub fn system(&mut self, message: &str) -> &mut Self {
-        let tokens = chat::system(&self.model, message);
-        self.buffer.extend(tokens);
+        self.flush_pending_system();
+        self.pending_system = Some(message.to_string());
         self
     }
 
     /// Fill a user message.
     pub fn user(&mut self, message: &str) -> &mut Self {
-        let tokens = chat::user(&self.model, message);
+        let tokens = match self.pending_system.take() {
+            Some(system) => chat::system_user(&self.model, &system, message),
+            None if self.is_first_chat_fill() => chat::first_user(&self.model, message),
+            None => chat::user(&self.model, message),
+        };
         self.buffer.extend(tokens);
         self
     }
 
     /// Fill an assistant message (for history replay).
     pub fn assistant(&mut self, message: &str) -> &mut Self {
+        self.flush_pending_system();
         let tokens = chat::assistant(&self.model, message);
         self.buffer.extend(tokens);
         self
@@ -307,6 +337,7 @@ impl Context {
 
     /// Cue the model to generate (fills the generation header).
     pub fn cue(&mut self) -> &mut Self {
+        self.flush_pending_system();
         let tokens = chat::cue(&self.model);
         self.buffer.extend(tokens);
         self
@@ -314,6 +345,7 @@ impl Context {
 
     /// Seal the current turn (insert stop token).
     pub fn seal(&mut self) -> &mut Self {
+        self.flush_pending_system();
         let tokens = chat::seal(&self.model);
         self.buffer.extend(tokens);
         self
@@ -321,6 +353,7 @@ impl Context {
 
     /// Append raw tokens to the buffer directly.
     pub fn append(&mut self, tokens: &[u32]) -> &mut Self {
+        self.flush_pending_system();
         self.buffer.extend_from_slice(tokens);
         self
     }
@@ -339,6 +372,7 @@ impl Context {
     /// tool's `schema()` is not valid JSON, or if the model has no tool
     /// template.
     pub fn equip(&mut self, tools: &[&dyn crate::tools::Tool]) -> Result<&mut Self> {
+        self.flush_pending_system();
         let envelopes: Vec<String> = tools
             .iter()
             .map(|t| {
@@ -367,7 +401,16 @@ impl Context {
         if n == 0 {
             return;
         }
-        self.inner.truncate_working_page_tokens(n);
+        // `truncate_working_page_tokens` REMOVES the last N working tokens
+        // (see context.wit): its argument is the count to drop, not the
+        // count to keep. Pass `n` straight through — clamped to the working
+        // length so an over-large request can't underflow into the runtime's
+        // range check.
+        let removable = self.inner.working_page_token_count().min(n);
+        if removable == 0 {
+            return;
+        }
+        self.inner.truncate_working_page_tokens(removable);
         // Re-sync from the host: truncation can release pages, and the
         // safe thing is to read the authoritative counts back.
         self.committed_pages = self.inner.committed_page_count();
@@ -383,6 +426,7 @@ impl Context {
     /// After flush, the buffer is empty and `seq_len` reflects all
     /// consumed tokens.
     pub async fn flush(&mut self) -> Result<()> {
+        self.flush_pending_system();
         if self.buffer.is_empty() {
             return Ok(());
         }
@@ -430,6 +474,166 @@ impl Context {
         Ok(())
     }
 
+    /// Splice an encoded image (or video clip) into the context. Runs the
+    /// vision encoder driver-side and commits the resulting soft-token KV pages,
+    /// exactly like [`flush`] does for text. The image's `token_count()` soft
+    /// tokens occupy KV slots; the sequence cursor advances by
+    /// `position_span()` (equal for Gemma's 1-D positions). See MULTIMODAL.md.
+    ///
+    /// Any buffered text is flushed first so ordering (text → image → text) is
+    /// preserved in the KV cache.
+    pub async fn append_image(&mut self, image: &crate::media::Image) -> Result<()> {
+        // The model's own span delimiters (host-provided; empty for models that
+        // need none) are applied here so the inferlet stays model-agnostic — it
+        // never names `<|vision_start|>` etc.
+        let prefix = image.prefix_tokens();
+        let suffix = image.suffix_tokens();
+        if !prefix.is_empty() {
+            self.append(&prefix);
+        }
+        self.flush().await?; // commit any pending text + the span prefix
+
+        let num_tokens = image.token_count();
+        if num_tokens == 0 {
+            if !suffix.is_empty() {
+                self.append(&suffix);
+            }
+            return Ok(());
+        }
+        let span = image.position_span();
+
+        let total_tokens_after = self.working_tokens + num_tokens;
+        let pages_needed = (total_tokens_after + self.page_size - 1) / self.page_size;
+        let additional = pages_needed.saturating_sub(self.working_pages);
+        if additional > 0 {
+            self.inner
+                .reserve_working_pages(additional)
+                .map_err(|e| format!("append_image: reserve pages: {}", e))?;
+            self.working_pages = pages_needed;
+        }
+
+        let pass = ForwardPass::new(&self.model);
+        pass.context(&self.inner);
+        pass.input_image(image, self.seq_len);
+        pass.execute_async()
+            .await
+            .map_err(|e| format!("append_image: forward pass: {}", e))?;
+
+        let new_working = self.working_tokens + num_tokens;
+        let pages_to_commit = new_working / self.page_size;
+        if pages_to_commit > 0 {
+            self.inner
+                .commit_working_pages(pages_to_commit)
+                .map_err(|e| format!("append_image: commit pages: {}", e))?;
+        }
+        self.committed_pages += pages_to_commit;
+        self.working_pages -= pages_to_commit;
+        self.working_tokens = new_working % self.page_size;
+        // The image occupies `num_tokens` physical KV rows whose 1-D
+        // bookkeeping positions are `anchor..anchor+num_tokens`. Advance the
+        // sequence cursor past them so the next text token's position is
+        // strictly greater than every committed image-row position (the KV
+        // commit enforces strict monotonicity). M-RoPE attention positions for
+        // the image rows themselves are carried on the dedicated 3-axis
+        // side-channel (`image_mrope_positions`), so the encoder/attention use
+        // the correct (t,h,w) span regardless of this 1-D advance.
+        let _ = span;
+        self.seq_len += num_tokens;
+
+        // Span suffix delimiter (buffered; flushed with the next fill).
+        if !suffix.is_empty() {
+            self.append(&suffix);
+        }
+        Ok(())
+    }
+
+    /// Splice an encoded audio clip into the context. Runs the gemma4_audio
+    /// encoder driver-side and commits the resulting soft-token KV pages,
+    /// exactly like [`append_image`](Self::append_image) does for vision. The
+    /// clip's `token_count()` soft tokens occupy KV slots; the sequence cursor
+    /// advances past them. See audio_frontend.md.
+    ///
+    /// Any buffered text is flushed first so ordering (text → audio → text) is
+    /// preserved in the KV cache.
+    pub async fn append_audio(&mut self, audio: &crate::media::Audio) -> Result<()> {
+        // Host-provided span delimiters (e.g. Gemma `<|audio>` / `<audio|>`),
+        // applied here so the inferlet never names them.
+        let prefix = audio.prefix_tokens();
+        let suffix = audio.suffix_tokens();
+        if !prefix.is_empty() {
+            self.append(&prefix);
+        }
+        self.flush().await?; // commit any pending text + the span prefix
+
+        let num_tokens = audio.token_count();
+        if num_tokens == 0 {
+            if !suffix.is_empty() {
+                self.append(&suffix);
+            }
+            return Ok(());
+        }
+
+        let total_tokens_after = self.working_tokens + num_tokens;
+        let pages_needed = (total_tokens_after + self.page_size - 1) / self.page_size;
+        let additional = pages_needed.saturating_sub(self.working_pages);
+        if additional > 0 {
+            self.inner
+                .reserve_working_pages(additional)
+                .map_err(|e| format!("append_audio: reserve pages: {}", e))?;
+            self.working_pages = pages_needed;
+        }
+
+        let pass = ForwardPass::new(&self.model);
+        pass.context(&self.inner);
+        pass.input_audio(audio, self.seq_len);
+        pass.execute_async()
+            .await
+            .map_err(|e| format!("append_audio: forward pass: {}", e))?;
+
+        let new_working = self.working_tokens + num_tokens;
+        let pages_to_commit = new_working / self.page_size;
+        if pages_to_commit > 0 {
+            self.inner
+                .commit_working_pages(pages_to_commit)
+                .map_err(|e| format!("append_audio: commit pages: {}", e))?;
+        }
+        self.committed_pages += pages_to_commit;
+        self.working_pages -= pages_to_commit;
+        self.working_tokens = new_working % self.page_size;
+        self.seq_len += num_tokens;
+
+        // Span suffix delimiter (buffered; flushed with the next fill).
+        if !suffix.is_empty() {
+            self.append(&suffix);
+        }
+        Ok(())
+    }
+
+    /// Splice a decoded video clip ([`crate::media::Video`]) into the context.
+    ///
+    /// The host already demuxed + uniformly sampled the clip and preprocessed
+    /// each frame per the bound model (see [`crate::media::Video::from_bytes`]).
+    /// This injects each frame's soft tokens via [`append_image`], preceded by a
+    /// short generic `mm:ss` timestamp text marker (plain tokens, encoded by
+    /// whatever tokenizer — not model-specific). Each frame becomes committed KV
+    /// exactly like an image, so fork / snapshot / prefix-cache apply. The
+    /// per-frame soft-token budget and any span delimiters are the host's job, so
+    /// this is identical across models. See MULTIMODAL.md §8.
+    pub async fn append_video(&mut self, video: &crate::media::Video) -> Result<()> {
+        let n = video.frame_count();
+        for i in 0..n {
+            let secs = video.timestamp(i).max(0.0) as u32;
+            let marker = format!(" {:02}:{:02} ", secs / 60, secs % 60);
+            let toks = self.model.tokenizer().encode(&marker);
+            self.append(&toks);
+            let frame = video
+                .frame(i)
+                .map_err(|e| format!("append_video: frame {i}: {e}"))?;
+            self.append_image(&frame).await?;
+        }
+        Ok(())
+    }
+
     // ── Pass ────────────────────────────────────────────────────────
 
     /// Build a single [`Forward`](crate::forward::Forward) — a forward pass with
@@ -437,6 +641,7 @@ impl Context {
     /// commit. Use for prefill, scoring, custom decode loops, and anywhere
     /// the [`generate`](Self::generate) loop is too high-level.
     pub fn forward(&mut self) -> crate::forward::Forward<'_> {
+        self.flush_pending_system();
         crate::forward::Forward::new(self)
     }
 
@@ -447,9 +652,9 @@ impl Context {
     /// the buffer (from `system / user / cue / …`) are drained on the
     /// first step.
     pub fn generate(&mut self, sampler: Sampler) -> crate::generation::Generator<'_> {
+        self.flush_pending_system();
         crate::generation::Generator::new(self, sampler)
     }
-
 }
 
 // =============================================================================

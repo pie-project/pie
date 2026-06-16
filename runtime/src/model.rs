@@ -15,8 +15,7 @@ use instruct::Instruct;
 use tokenizer::Tokenizer;
 
 /// Global cache for models (keyed by ModelId).
-static MODELS: LazyLock<boxcar::Vec<Arc<Model>>> =
-    LazyLock::new(|| boxcar::Vec::new());
+static MODELS: LazyLock<boxcar::Vec<Arc<Model>>> = LazyLock::new(|| boxcar::Vec::new());
 
 /// Type alias for model identifiers.
 pub type ModelId = usize;
@@ -38,17 +37,22 @@ pub fn register(
     kv_capacity_tokens: u32,
     default_token_limit: Option<u32>,
     tokenizer_path: PathBuf,
+    system_speculation_supported: bool,
+    enable_system_speculation: bool,
 ) -> Result<()> {
     let tokenizer = Arc::new(Tokenizer::from_file(&tokenizer_path)?);
     let instruct = instruct::create(arch_name, tokenizer.clone());
 
     let model = Arc::new(Model {
         name,
+        arch_name: arch_name.to_string(),
         instruct,
         kv_page_size,
         kv_capacity_tokens,
         default_token_limit,
         tokenizer,
+        system_speculation_supported,
+        enable_system_speculation,
     });
     MODELS.push(model);
     Ok(())
@@ -56,7 +60,10 @@ pub fn register(
 
 /// Returns a list of all registered model names.
 pub fn models() -> Vec<String> {
-    MODELS.iter().map(|(_, model)| model.name().to_string()).collect()
+    MODELS
+        .iter()
+        .map(|(_, model)| model.name().to_string())
+        .collect()
 }
 
 /// Minimum per-request output-token ceiling across registered models;
@@ -103,18 +110,21 @@ pub fn get_model(model_id: ModelId) -> Option<&'static Arc<Model>> {
 
 pub struct Model {
     name: String,
+    /// Architecture identifier supplied at registration (e.g. "gemma4",
+    /// "qwen3_6"). Used to select the multimodal processor / vision front-end.
+    arch_name: String,
     instruct: Arc<dyn Instruct>,
     kv_page_size: u32,
     kv_capacity_tokens: u32,
     default_token_limit: Option<u32>,
     tokenizer: Arc<Tokenizer>,
+    system_speculation_supported: bool,
+    enable_system_speculation: bool,
 }
 
 impl std::fmt::Debug for Model {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Model")
-            .field("name", &self.name)
-            .finish()
+        f.debug_struct("Model").field("name", &self.name).finish()
     }
 }
 
@@ -122,6 +132,11 @@ impl Model {
     /// Gets the model name.
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    /// Gets the architecture identifier (e.g. "gemma4", "qwen3_6").
+    pub fn arch_name(&self) -> &str {
+        &self.arch_name
     }
 
     /// Gets the instruct implementation for this model.
@@ -176,5 +191,19 @@ impl Model {
     /// Gets the engine KV-cache capacity for this model in tokens.
     pub fn kv_capacity_tokens(&self) -> u32 {
         self.kv_capacity_tokens
+    }
+
+    /// Whether the driver wired a system drafter for this model (capability).
+    /// Required to verify manual drafts; auto-drafting additionally requires
+    /// [`Self::enable_system_speculation`].
+    pub fn system_speculation_supported(&self) -> bool {
+        self.system_speculation_supported
+    }
+
+    /// Operator opt-in for system speculation (deployment config, default
+    /// false). The runtime drives system drafts only when this is true; manual
+    /// (user-supplied) drafts are honored regardless of this flag.
+    pub fn enable_system_speculation(&self) -> bool {
+        self.enable_system_speculation
     }
 }

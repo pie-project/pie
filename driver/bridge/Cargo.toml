@@ -1,0 +1,73 @@
+[package]
+name = "pie-bridge"
+version = "0.1.0"
+edition = "2024"
+authors = ["In Gim <in.gim@yale.edu>"]
+description = "Canonical wire schema (rkyv) + IPC for pie."
+license = "Apache-2.0"
+repository = "https://github.com/pie-project/pie"
+
+# `links = "pie_bridge"` lets downstream crates discover the crate via
+# `DEP_PIE_BRIDGE_*` env vars (build script ↔ build script handoff).
+links = "pie_bridge"
+
+[lib]
+name = "pie_bridge"
+crate-type = ["cdylib", "rlib"]
+path = "src/lib.rs"
+
+[features]
+default = ["ipc", "cabi"]
+ipc = []
+# C-ABI surface for non-Rust drivers (cuda/portable C++, Python via ctypes).
+# Exposes `extern "C"` accessors over the rkyv-archived layouts so the
+# schema in `src/schema.rs` stays single-source.
+cabi = []
+python = ["dep:pyo3"]
+
+[dependencies]
+anyhow = "1.0"
+bytemuck = { version = "1.21", features = ["derive"] }
+thiserror = "1.0"
+# `DriverCapabilities` is JSON over a side channel (driver→runtime
+# handshake at startup), not part of the rkyv wire schema.
+serde = { version = "1.0", features = ["derive"] }
+# Derive macro that generates C-ABI accessors (and PyO3 wrappers when
+# the `python` feature is enabled) from schema struct definitions.
+pie-bridge-macros = { path = "../bridge-macros" }
+# Canonical schema serialization. Zero-copy reads via `rkyv::access`,
+# owned reads via `rkyv::deserialize`.
+rkyv = { version = "0.8", default-features = false, features = [
+    "std",
+    "alloc",
+    "bytecheck",
+] }
+libc = "0.2"
+pyo3 = { version = "0.23", features = ["extension-module", "multiple-pymethods"], optional = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_System_Memory",
+] }
+
+[build-dependencies]
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+
+[dev-dependencies]
+criterion = { version = "0.5", default-features = false }
+
+[[bench]]
+name = "wire"
+harness = false
+required-features = ["cabi"]
+
+[[bench]]
+name = "direct_ffi"
+harness = false
+required-features = ["cabi"]
+
+[[bench]]
+name = "shmem"
+harness = false
+required-features = ["cabi", "ipc"]

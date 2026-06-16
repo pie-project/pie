@@ -13,10 +13,11 @@
 //! Own test binary so the runtime's `PIE_ACQUIRE_TIMEOUT_S` LazyLock is read
 //! fresh (set before bootstrap, below) without racing other test files.
 
+use std::sync::Arc;
 use std::sync::OnceLock;
 
 mod common;
-use common::{create_mock_env, MockEnv};
+use common::{create_mock_env, mock_device::EchoBehavior, MockEnv};
 
 struct TestState {
     #[allow(dead_code)]
@@ -37,7 +38,7 @@ fn state() -> &'static TestState {
 
         let rt = tokio::runtime::Runtime::new().unwrap();
         // 1 device × 8 pages × 16 tokens = 128 tokens of KV capacity.
-        let env = create_mock_env("acquire-timeout", 1, 8);
+        let env = create_mock_env("acquire-timeout", 1, 8, Arc::new(EchoBehavior(42)));
         let config = env.config();
         rt.block_on(async {
             pie::bootstrap::bootstrap(config).await.unwrap();

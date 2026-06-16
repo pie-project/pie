@@ -27,7 +27,7 @@ namespace pie_cuda_driver::model {
 
 namespace {
 
-const DeviceTensor& must(const Engine& e, const std::string& name) {
+const DeviceTensor& must(const LoadedModel& e, const std::string& name) {
     if (!e.has(name)) {
         throw std::runtime_error("gemma3n: missing weight '" + name + "'");
     }
@@ -41,7 +41,7 @@ constexpr const char* kPrefix = "model.language_model.";
 
 }  // namespace
 
-Gemma3nWeights bind_gemma3n(Engine& engine) {
+Gemma3nWeights bind_gemma3n(const LoadedModel& engine) {
     const auto& cfg = engine.hf_config();
     const int L = cfg.num_hidden_layers;
 
@@ -414,10 +414,13 @@ void gemma3n_forward_paged(
     ops::DecodePlanCachePtr decode_plan;
     if (use_decode_path) {
         decode_plan = ops::make_decode_plan();
-        ops::plan_attention_flashinfer_decode_bf16(
+        ops::plan_attention_flashinfer_decode(
             *decode_plan, kv_page_indptr_h, R,
             num_q_heads_local, num_kv_heads_local, d,
-            cache.page_size(), attn_ws, stream);
+            cache.page_size(), attn_ws, stream,
+            /*enable_cuda_graph=*/true,
+            /*full_attention_variant=*/false,
+            cache.hnd_layout());
     }
 
     const float router_scale = 1.f / static_cast<float>(H);
@@ -523,11 +526,13 @@ void gemma3n_forward_paged(
                 ws.q.data(), ws.k.data(), positions,
                 N, num_q_heads_local, num_kv_heads_local, d,
                 layer_rope_theta, stream);
-            kernels::launch_write_kv_to_pages_bf16(
-                cache.k(L), cache.v(L), ws.k.data(), ws.v.data(),
+            auto kv_view_for_write = cache.layer_view(kv_layer);
+            kernels::launch_write_kv_to_pages(
+                kv_view_for_write, ws.k.data(), ws.v.data(),
                 qo_indptr, kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                N, R, cache.page_size(), num_kv_heads_local, d, stream);
+                N, R, stream);
         }
+        auto kv_view = cache.layer_view(kv_layer);
 
         const int layer_window = w.per_layer_window_left[L];
 
@@ -536,28 +541,26 @@ void gemma3n_forward_paged(
         // flashinfer's default `1/sqrt(d)`.
         constexpr float gemma3n_sm_scale = 1.0f;
         if (use_decode_path) {
-            ops::dispatch_attention_flashinfer_decode_bf16(
+            ops::dispatch_attention_flashinfer_decode(
                 *decode_plan,
-                ws.q.data(), cache.k(kv_layer), cache.v(kv_layer), ws.attn_out.data(),
+                ws.q.data(), kv_view, ws.attn_out.data(),
                 kv_page_indices, kv_page_indptr, kv_last_page_lens,
                 attn_ws, stream, layer_window,
                 /*logits_soft_cap=*/0.f, gemma3n_sm_scale);
         } else if (custom_mask_d) {
-            ops::launch_attention_flashinfer_prefill_custom_bf16(
-                ws.q.data(), cache.k(kv_layer), cache.v(kv_layer), ws.attn_out.data(),
+            ops::launch_attention_flashinfer_prefill_custom(
+                ws.q.data(), kv_view, ws.attn_out.data(),
                 qo_indptr, kv_page_indices, kv_page_indptr, kv_last_page_lens,
                 custom_mask_d, custom_mask_indptr_d,
                 qo_indptr_h, kv_page_indptr_h,
-                N, R, num_q_heads_local, num_kv_heads_local, d,
-                cache.page_size(), attn_ws, stream,
+                N, R, num_q_heads_local, attn_ws, stream,
                 /*window_left=*/-1, /*logits_soft_cap=*/0.f, gemma3n_sm_scale);
         } else {
-            ops::launch_attention_flashinfer_prefill_bf16(
-                ws.q.data(), cache.k(kv_layer), cache.v(kv_layer), ws.attn_out.data(),
+            ops::launch_attention_flashinfer_prefill(
+                ws.q.data(), kv_view, ws.attn_out.data(),
                 qo_indptr, kv_page_indices, kv_page_indptr, kv_last_page_lens,
                 qo_indptr_h, kv_page_indptr_h,
-                N, R, num_q_heads_local, num_kv_heads_local, d,
-                cache.page_size(), attn_ws, stream, layer_window,
+                N, R, num_q_heads_local, attn_ws, stream, layer_window,
                 /*logits_soft_cap=*/0.f, gemma3n_sm_scale);
         }
 

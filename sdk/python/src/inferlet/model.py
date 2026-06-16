@@ -59,7 +59,10 @@ class Model:
         """Get the tokenizer for this model."""
         return Tokenizer(self._handle.tokenizer())
 
+    def default_system_speculation(self) -> bool:
+        """Whether greedy generation should use the system drafter by default."""
+        return self._handle.default_system_speculation()
+
     def __repr__(self) -> str:
         return f"Model({id(self._handle):#x})"
-
 

@@ -3,9 +3,9 @@
 //! All tests share a single bootstrap (global statics are per-process).
 //! The tokio runtime is kept alive for the duration of the test process.
 
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 mod common;
-use common::{create_mock_env, MockEnv};
+use common::{MockEnv, create_mock_env, mock_device::EchoBehavior};
 
 /// Shared state: MockEnv + tokio runtime (must outlive the process).
 struct TestState {
@@ -18,7 +18,7 @@ static STATE: OnceLock<TestState> = OnceLock::new();
 fn state() -> &'static TestState {
     STATE.get_or_init(|| {
         let rt = tokio::runtime::Runtime::new().unwrap();
-        let env = create_mock_env("test-model", 4, 64);
+        let env = create_mock_env("test-model", 4, 64, Arc::new(EchoBehavior(42)));
         let config = env.config();
         rt.block_on(async {
             pie::bootstrap::bootstrap(config).await.unwrap();
@@ -44,9 +44,9 @@ fn all_devices_reachable() {
     let s = state();
     s.rt.block_on(async {
         for i in 0..4 {
-            let spec = pie::device::get_spec(i).await.unwrap();
+            let spec = pie::driver::get_spec(i).await.unwrap();
             assert_eq!(spec.num_kv_pages, 64);
-            assert_eq!(spec.max_batch_size, 32);
+            assert_eq!(spec.limits.max_forward_requests, 32);
         }
     });
 }

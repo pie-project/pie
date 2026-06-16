@@ -117,10 +117,16 @@ mod tests {
     #[test]
     fn within_cap_completes() {
         let mut u = upload(2, 1024);
-        assert!(matches!(u.process_chunk(0, 2, vec![0u8; 400]), ChunkResult::InProgress));
+        assert!(matches!(
+            u.process_chunk(0, 2, vec![0u8; 400]),
+            ChunkResult::InProgress
+        ));
         match u.process_chunk(1, 2, vec![0u8; 400]) {
             ChunkResult::Complete { buffer, .. } => assert_eq!(buffer.len(), 800),
-            other => panic!("expected Complete, got {:?}", std::mem::discriminant(&other)),
+            other => panic!(
+                "expected Complete, got {:?}",
+                std::mem::discriminant(&other)
+            ),
         }
     }
 
@@ -137,8 +143,14 @@ mod tests {
     fn running_total_breach_mid_stream_rejected() {
         let mut u = upload(3, 1000);
         // 400 + 400 = 800 OK; +300 = 1100 > 1000.
-        assert!(matches!(u.process_chunk(0, 3, vec![0u8; 400]), ChunkResult::InProgress));
-        assert!(matches!(u.process_chunk(1, 3, vec![0u8; 400]), ChunkResult::InProgress));
+        assert!(matches!(
+            u.process_chunk(0, 3, vec![0u8; 400]),
+            ChunkResult::InProgress
+        ));
+        assert!(matches!(
+            u.process_chunk(1, 3, vec![0u8; 400]),
+            ChunkResult::InProgress
+        ));
         match u.process_chunk(2, 3, vec![0u8; 300]) {
             ChunkResult::Error(msg) => assert!(msg.contains("max_upload_mb cap")),
             _ => panic!("expected cap error"),
