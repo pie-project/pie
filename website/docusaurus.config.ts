@@ -134,7 +134,19 @@ const config: Config = {
         gtag: process.env.PIE_ENABLE_GTAG === '1'
           ? { trackingID: 'G-D42BHFT9XK', anonymizeIP: false }
           : undefined,
-        blog: false,
+        blog: {
+          blogTitle: 'Pie blog',
+          blogDescription: 'Releases and updates from the Pie project.',
+          blogSidebarTitle: 'All posts',
+          blogSidebarCount: 'ALL',
+          showReadingTime: true,
+          feedOptions: {
+            type: ['rss', 'atom'],
+            title: 'Pie blog',
+            description: 'Releases and updates from the Pie project.',
+            copyright: 'Pie ♥ Open Source',
+          },
+        },
         theme: {
           // theme.css holds the color palette (single source of truth);
           // custom.css consumes its tokens for component styling.
@@ -151,6 +163,13 @@ const config: Config = {
       defaultMode: 'light',
       disableSwitch: false,
       respectPrefersColorScheme: true,
+    },
+    announcementBar: {
+      id: 'pie-0-4-0',
+      content: 'Pie 0.4.0 is out. <a href="/blog/pie-0-4-0">Read the blog article</a>',
+      backgroundColor: '#c96442',
+      textColor: '#fdfbf3',
+      isCloseable: true,
     },
     navbar: {
       title: 'Pie',
@@ -181,6 +200,11 @@ const config: Config = {
         {
           to: 'models',
           label: 'Models',
+          position: 'left',
+        },
+        {
+          to: 'blog',
+          label: 'Blog',
           position: 'left',
         },
         {

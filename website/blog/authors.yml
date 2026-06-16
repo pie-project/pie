@@ -1,0 +1,10 @@
+pie:
+  name: The Pie Team
+  title: Maintainers of Pie
+  url: https://github.com/pie-project
+  image_url: https://github.com/pie-project.png
+  page: false
+
+"In Gim":
+  name: In Gim
+  page: false

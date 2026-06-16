@@ -1,0 +1,92 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 720 322" width="720" height="322" role="img" aria-labelledby="spec-title spec-desc">
+  <title id="spec-title">The speculator stages the next pass ahead of the call</title>
+  <desc id="spec-desc">The same three lanes: Inferlet, Runtime, and Driver. A speculator at the end of the Runtime lane keeps the batch scheduler, driver IPC, GPU launch, and event dispatcher looping continuously, staging the next forward pass while the GPU is busy. When the inferlet's execute() call arrives and the staged pass is ready, it returns in about 10 microseconds instead of paying the full 320 microsecond pipeline. A miss falls back to the normal path.</desc>
+
+  <defs>
+    <marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 Z" fill="#54473b"/>
+    </marker>
+    <marker id="aa" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 Z" fill="#c96442"/>
+    </marker>
+  </defs>
+
+  <style>
+    text  { font-family: 'IBM Plex Serif', Charter, Georgia, serif; font-size: 13px; }
+    .mono { font-family: 'IBM Plex Mono', ui-monospace, SFMono-Regular, Menlo, monospace; }
+    .ink   { fill: #2c2722; }
+    .sub   { fill: #54473b; }
+    .muted { fill: #7a6a55; font-style: italic; }
+    .acc   { fill: #8f442d; }
+  </style>
+
+  <!-- Title -->
+  <text class="ink"   x="24" y="24">The speculator runs the next pass ahead of the call</text>
+  <text class="muted" x="24" y="42">on a hit the inferlet resumes in 10 µs, not 320 µs</text>
+
+  <!-- Swimlanes -->
+  <rect x="24" y="58" width="672" height="210" rx="10" ry="10" fill="none" stroke="#54473b" stroke-width="1.5"/>
+  <line x1="24"  y1="128" x2="696" y2="128" stroke="#c9bca6" stroke-width="1"/>
+  <line x1="24"  y1="198" x2="696" y2="198" stroke="#c9bca6" stroke-width="1"/>
+  <line x1="116" y1="58"  x2="116" y2="268" stroke="#c9bca6" stroke-width="1"/>
+  <text class="ink" x="70" y="167" text-anchor="middle">Runtime</text>
+  <text class="ink" x="70" y="237" text-anchor="middle">Driver</text>
+  <text class="ink" x="70" y="97"  text-anchor="middle">Inferlet</text>
+
+  <!-- Early return (accent) -->
+  <path d="M 384 138 C 330 96, 272 92, 226 96" fill="none" stroke="#c96442" stroke-width="1.5" stroke-linecap="round" marker-end="url(#aa)"/>
+  <text class="acc" x="300" y="84" text-anchor="middle">cache hit: 10 µs</text>
+
+  <!-- Loop-back (dashed accent) -->
+  <path d="M 636 138 C 636 116, 412 116, 410 138" fill="none" stroke="#c96442" stroke-width="1.5" stroke-dasharray="6 4" stroke-linecap="round" marker-end="url(#aa)"/>
+  <text class="muted" x="524" y="112" text-anchor="middle">loops continuously</text>
+
+  <!-- Inferlet lane -->
+  <rect x="128" y="70" width="96" height="46" rx="8" ry="8" fill="#fdfbf3" stroke="#54473b" stroke-width="1.5"/>
+  <text class="mono ink" x="176" y="92"  text-anchor="middle">execute()</text>
+  <text class="mono sub" x="176" y="108" text-anchor="middle">0.05 µs</text>
+
+  <!-- Runtime lane -->
+  <rect x="128" y="140" width="96" height="46" rx="8" ry="8" fill="#fdfbf3" stroke="#54473b" stroke-width="1.5"/>
+  <text class="mono ink" x="176" y="162" text-anchor="middle">WASI</text>
+  <text class="mono sub" x="176" y="178" text-anchor="middle">40 µs</text>
+
+  <rect x="244" y="140" width="96" height="46" rx="8" ry="8" fill="#fdfbf3" stroke="#54473b" stroke-width="1.5"/>
+  <text class="mono ink" x="292" y="162" text-anchor="middle">Actor q</text>
+  <text class="mono sub" x="292" y="178" text-anchor="middle">150 µs</text>
+
+  <rect x="360" y="140" width="96" height="46" rx="8" ry="8" fill="#fdfbf3" stroke="#54473b" stroke-width="1.5"/>
+  <text class="mono ink" x="408" y="162" text-anchor="middle">Batch</text>
+  <text class="mono sub" x="408" y="178" text-anchor="middle">50 µs</text>
+
+  <rect x="476" y="140" width="96" height="46" rx="8" ry="8" fill="#fdfbf3" stroke="#54473b" stroke-width="1.5"/>
+  <text class="mono ink" x="524" y="162" text-anchor="middle">Event</text>
+  <text class="mono sub" x="524" y="178" text-anchor="middle">40 µs</text>
+
+  <rect x="592" y="140" width="96" height="46" rx="8" ry="8" fill="#f7e3d7" stroke="#c96442" stroke-width="2"/>
+  <text class="mono acc" x="640" y="162" text-anchor="middle">Speculator</text>
+  <text class="mono acc" x="640" y="178" text-anchor="middle">stages next</text>
+
+  <!-- Driver lane -->
+  <rect x="360" y="210" width="96" height="46" rx="8" ry="8" fill="#fdfbf3" stroke="#54473b" stroke-width="1.5"/>
+  <text class="mono ink" x="408" y="232" text-anchor="middle">Driver IPC</text>
+  <text class="mono sub" x="408" y="248" text-anchor="middle">40 µs</text>
+
+  <rect x="476" y="210" width="96" height="46" rx="8" ry="8" fill="#fdfbf3" stroke="#54473b" stroke-width="2.5"/>
+  <text class="mono ink" x="524" y="232" text-anchor="middle">GPU exec</text>
+  <text class="mono sub" x="524" y="248" text-anchor="middle">5–8 ms</text>
+
+  <!-- Cold path (brown) -->
+  <line x1="176" y1="118" x2="176" y2="138" stroke="#54473b" stroke-width="1.5" stroke-linecap="round" marker-end="url(#ah)"/>
+  <line x1="226" y1="163" x2="242" y2="163" stroke="#54473b" stroke-width="1.5" stroke-linecap="round" marker-end="url(#ah)"/>
+  <line x1="342" y1="163" x2="358" y2="163" stroke="#54473b" stroke-width="1.5" stroke-linecap="round" marker-end="url(#ah)"/>
+
+  <!-- Loop (accent) -->
+  <line x1="408" y1="188" x2="408" y2="208" stroke="#c96442" stroke-width="1.5" stroke-linecap="round" marker-end="url(#aa)"/>
+  <line x1="458" y1="233" x2="474" y2="233" stroke="#c96442" stroke-width="1.5" stroke-linecap="round" marker-end="url(#aa)"/>
+  <line x1="524" y1="208" x2="524" y2="188" stroke="#c96442" stroke-width="1.5" stroke-linecap="round" marker-end="url(#aa)"/>
+  <line x1="574" y1="163" x2="590" y2="163" stroke="#c96442" stroke-width="1.5" stroke-linecap="round" marker-end="url(#aa)"/>
+
+  <!-- Caption -->
+  <text class="muted" x="360" y="302" text-anchor="middle">the staged pass overlaps the GPU, so the tax leaves the critical path</text>
+</svg>

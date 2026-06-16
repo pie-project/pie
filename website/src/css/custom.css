@@ -1056,3 +1056,206 @@ body.whypieagent-dark .footer__title {
 body.whypieagent-dark .footer__copyright {
   color: #808090;
 }
+
+/* =====================================================================
+   Blog — list and post pages.
+   The classic theme ships its own blog CSS modules (3rem titles, link-
+   colored headings, heavy author block) that ignore the site type scale.
+   Re-skin them with the same tokens the docs use. Selectors lean on stable
+   hooks (blog-wrapper / blog-list-page / blog-post-page on <html>, Infima
+   avatar classes, semantic rel/aria attributes) so they survive the hashed
+   module class names changing between builds.
+   ===================================================================== */
+
+/* List page: dividers between posts, not a heavy bottom margin on each. */
+.blog-list-page article {
+  margin-bottom: 0;
+  padding-bottom: 2.25rem;
+}
+.blog-list-page article:not(:last-of-type) {
+  margin-bottom: 2.25rem;
+  border-bottom: 1px solid var(--pie-border);
+}
+
+/* Titles: site scale, ink color, primary on hover (not a bare orange link).
+   List entries are h2; the post page is h1. */
+.blog-list-page article header h2 {
+  font-size: var(--pie-text-2xl);   /* 26 — was 3rem */
+  line-height: 1.25;
+  letter-spacing: -0.018em;
+  margin: 0 0 0.4rem;
+}
+.blog-post-page article header h1 {
+  font-size: var(--pie-text-3xl);   /* 32 — matches doc page titles */
+  line-height: 1.2;
+  letter-spacing: -0.02em;
+  margin-bottom: 0.5rem;
+}
+.blog-wrapper article header h1 a,
+.blog-wrapper article header h2 a {
+  color: var(--pie-ink);
+  text-decoration: none;
+  transition: color 120ms ease;
+}
+.blog-wrapper article header h1 a:hover,
+.blog-wrapper article header h2 a:hover {
+  color: var(--ifm-color-primary);
+  text-decoration: none;
+}
+
+/* List entries: reorder the header into a compact card. The date and reading
+   time become an eyebrow above the title; the per-item author is dropped (the
+   byline belongs on the post page, not on every index row). */
+.blog-list-page article header {
+  display: flex;
+  flex-direction: column;
+}
+.blog-list-page article header > div:first-of-type {
+  order: -1;
+  margin: 0 0 0.45rem;
+  font-size: var(--pie-text-micro);
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--pie-ink-muted);
+}
+.blog-list-page article header > div:has(.avatar) {
+  display: none;
+}
+
+/* List excerpt: a two-line teaser faded at the cut. Multiple intro paragraphs
+   flow into one clamped block; the full read is the post page. */
+.blog-list-page article .markdown {
+  position: relative;
+  max-height: 3.3em;                  /* ~2 lines at the body line-height */
+  margin-top: 0.1rem;
+  overflow: hidden;
+  color: var(--pie-ink-soft);
+  font-size: var(--pie-text-base);
+}
+.blog-list-page article .markdown > :first-child {
+  margin-top: 0;
+}
+.blog-list-page article .markdown::after {
+  content: "";
+  position: absolute;
+  inset-inline: 0;
+  bottom: 0;
+  height: 1.4em;
+  background: linear-gradient(to bottom, transparent, var(--pie-bg));
+}
+
+/* Post page meta line (date · reading time): muted, sits under the title. */
+.blog-post-page article header > div:first-of-type {
+  color: var(--pie-ink-muted);
+  font-size: var(--pie-text-sm);
+  margin: 0.25rem 0 0;
+}
+
+/* Post-page author block: compact, muted, serif — no oversized avatar. */
+.blog-post-page article header .avatar {
+  margin-top: 0.85rem;
+}
+.blog-wrapper .avatar__photo {
+  width: 2rem;
+  height: 2rem;
+}
+.blog-wrapper .avatar__name {
+  font-size: var(--pie-text-sm);
+  font-weight: 600;
+  color: var(--pie-ink-soft);
+}
+.blog-wrapper .avatar__name a {
+  color: inherit;
+  text-decoration: none;
+}
+.blog-wrapper .avatar__name a:hover {
+  color: var(--ifm-color-primary);
+}
+.blog-wrapper .avatar__intro small {
+  color: var(--pie-ink-muted);
+  font-size: var(--pie-text-micro);
+  font-weight: 400;
+}
+
+/* Footer: pill tags and a primary "Read more". The "Tags:" label reads as an
+   eyebrow on the post page and is dropped on the compact index. */
+.blog-wrapper article footer {
+  margin-top: 1.75rem;
+}
+.blog-list-page article footer {
+  margin-top: 1rem;
+}
+.blog-wrapper article footer .col > b {
+  font-size: var(--pie-text-micro);
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--pie-ink-muted);
+}
+.blog-list-page article footer .col > b {
+  display: none;
+}
+.blog-wrapper a[rel="tag"] {
+  font-family: var(--pie-font-sans);
+  font-size: var(--pie-text-micro);
+  font-weight: 600;
+  letter-spacing: 0.01em;
+  padding: 0.1rem 0.55rem;
+  border-radius: 999px;
+  border: 1px solid var(--pie-border-strong);
+  background: var(--pie-bg-sunken);
+  color: var(--pie-ink-soft);
+  text-decoration: none;
+  transition: color 120ms ease, border-color 120ms ease, background 120ms ease;
+}
+.blog-wrapper a[rel="tag"]:hover {
+  color: var(--ifm-color-primary);
+  border-color: var(--ifm-color-primary);
+  background: transparent;
+}
+.blog-wrapper a[aria-label^="Read more"] {
+  color: var(--ifm-color-primary);
+  font-size: var(--pie-text-sm);
+  white-space: nowrap;
+}
+.blog-wrapper a[aria-label^="Read more"]::after {
+  content: " \2192";
+}
+
+/* Recent-posts sidebar: eyebrow title, small serif links to match the docs. */
+.blog-wrapper nav[aria-label="Blog recent posts navigation"] {
+  font-family: var(--pie-font-serif);
+}
+.blog-wrapper nav[aria-label="Blog recent posts navigation"] > div:first-child {
+  font-size: var(--pie-text-micro);
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--pie-ink-muted);
+}
+.blog-wrapper nav[aria-label="Blog recent posts navigation"] h3 {
+  font-size: var(--pie-text-sm);
+  font-weight: 600;
+  color: var(--pie-ink-soft);
+  margin: 1.1rem 0 0.4rem;
+}
+.blog-wrapper nav[aria-label="Blog recent posts navigation"] a {
+  color: var(--pie-ink-muted);
+  font-size: var(--pie-text-xs);
+  line-height: 1.45;
+  transition: color 120ms ease;
+}
+.blog-wrapper nav[aria-label="Blog recent posts navigation"] a:hover,
+.blog-wrapper nav[aria-label="Blog recent posts navigation"] a[aria-current="page"] {
+  color: var(--ifm-color-primary);
+  text-decoration: none;
+}
+
+/* Post body figures: center and fit the column. */
+.blog-post-page .markdown img {
+  display: block;
+  margin: 1.75rem auto;
+  max-width: 100%;
+  height: auto;
+}
