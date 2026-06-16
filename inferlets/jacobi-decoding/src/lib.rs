@@ -85,8 +85,13 @@ async fn main(input: Input) -> Result<String> {
         input_all.extend_from_slice(&window);
         let input_count = input_all.len();
 
+        // Defer the page commit: keep anchor + all window guesses in
+        // *working* pages so the rejected suffix can be truncated below.
+        // Committing here would lock unconverged guesses into committed KV
+        // that `truncate` cannot reach, corrupting the cache.
         let mut pass = ctx.forward();
         pass.input(&input_all);
+        pass.defer_commit();
         let sample_indices: Vec<u32> = (0..input_count as u32).collect();
         let h = pass.sample(&sample_indices, Sampler::Argmax);
         let out = pass.execute().await?;
@@ -122,7 +127,12 @@ async fn main(input: Input) -> Result<String> {
         all_generated.extend_from_slice(final_accepted);
         total_accepted += final_accepted.len();
 
-        // Truncate the unaccepted suffix from KV.
+        // Truncate the unconverged suffix from KV. The verify pass left all
+        // `input_count` tokens in *working* pages (commit deferred), so this
+        // drops exactly the rejected guesses and leaves anchor + the
+        // converged prefix as working KV for the next iteration. Keeping the
+        // prefix uncommitted is what makes the output independent of the
+        // window size.
         let speculative_count = (input_count as u32) - (1 + final_accepted.len() as u32);
         if speculative_count > 0 {
             ctx.truncate(speculative_count);

@@ -5,22 +5,31 @@ description: Directional view of what we're building in Pie. Timelines and scope
 
 # Roadmap 
 
-We welcome proposals — open a [GitHub issue](https://github.com/pie-project/pie/issues) with your use case or RFC.
+We welcome proposals: open a [GitHub issue](https://github.com/pie-project/pie/issues) with your use case or RFC.
 
+
+## Next up: v0.5.0
+
+We're rethinking Pie as a distributed system, with three big changes:
+
+- **Disaggregated backend.** The single driver splits into independent ones (prefill, decode, image embedding, video, audio output) that can each run on its own node. Runtimes talk only to the decode driver; the rest become stateless and connect over a memory-transfer fabric chosen automatically for your hardware.
+- **A controller.** A new layer above the runtime that manages the driver fabric and decides where each inferlet runs.
+- **One inferlet model.** We're committing to "inferlet as a unit of inference" over "inferlet as a full agent." You can still build agents, but side effects shrink and the cross-inferlet and MCP APIs get simpler, heading toward **durable inferlets** that migrate freely across runtimes.
 
 ## Planned
 
 - API for linear models
 - Diffusion model support
-- API for multimodal models
 - Inferlet profiler 
 
 ---
 
 ## Previous Releases
 
-**v0.3.0** (2026-05-05) — Native C++ driver implementations, PEFT adapters API, market-based contention management, API redesign, and Bakery for inferlet distribution.
+**v0.4.0** (2026-06-15): Multimodal input and output (vision, video, audio), native MTP speculative decoding, expanded quantization (FP8 / INT8 / MXFP4 / FP4 weights + KV-cache formats), new architectures (GLM-5.1, Nemotron-H, Kimi / DeepSeek, Qwen3.5 / 3.6, Gemma-4), a TensorRT-LLM driver, and a scheduler/throughput rewrite.
 
-**v0.2.0** (2026-01-20) — Multi-GPU serving (DP + TP), Apple Metal backend, weight quantization (float8 / int8 / int4), and new model support.
+**v0.3.0** (2026-05-05): Native C++ driver implementations, PEFT adapters API, market-based contention management, API redesign, and Bakery for inferlet distribution.
 
-**v0.1.0** (2025-10-13) — First public release. Paper artifact at SOSP '25.
+**v0.2.0** (2026-01-20): Multi-GPU serving (DP + TP), Apple Metal backend, weight quantization (float8 / int8 / int4), and new model support.
+
+**v0.1.0** (2025-10-13): First public release. Paper artifact at SOSP '25.

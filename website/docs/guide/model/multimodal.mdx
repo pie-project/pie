@@ -1,0 +1,115 @@
+---
+title: Multimodal generation
+description: Vision, video, and audio input, plus audio output, from an inferlet
+sidebar_position: 3
+---
+
+import Tabs from '@theme/Tabs';
+import TabItem from '@theme/TabItem';
+
+# Multimodal generation
+
+Pie can take **images, video, and audio as input** and produce **audio as output**, alongside ordinary text. The API is **model-agnostic**: your inferlet hands the host raw encoded bytes (PNG/JPEG, WAV, GIF) and the engine runs all model-specific preprocessing — decode, resize/patchify, vision/audio encode, and the span delimiters each model expects. The inferlet never branches on the model or hardcodes model constants, so the same code serves any multimodal model the engine has loaded.
+
+## Supported models
+
+| Model | Vision in | Audio in | Audio out |
+|---|:---:|:---:|:---:|
+| `Qwen3-VL-2B` | ✓ | | |
+| `Gemma-4-E4B` | ✓ | ✓ | |
+| `CSM-1B` | | | ✓ |
+
+A multimodal request fails if the bound model lacks the corresponding tower. See [Loading and selecting models](./loading) for how the engine exposes loaded models.
+
+## Image input
+
+Fetch the bytes (over HTTP or from the [filesystem](../io/filesystem)), build an `Image`, and splice it into the context. `Context::append_image` runs the vision encoder driver-side and commits the resulting soft-token KV pages; generation afterward is ordinary text decoding.
+
+```rust
+use inferlet::media::Image;
+use inferlet::{Context, Result, chat, model::Model, runtime, sample::Sampler};
+
+#[inferlet::main]
+async fn main(input: Input) -> Result<String> {
+    let model = Model::load(runtime::models().first().ok_or("no models")?)?;
+
+    // Hand the host raw image bytes; it decodes + resizes + patchifies per the
+    // bound model and wraps the span in that model's delimiters.
+    let bytes = inferlet::http::fetch(&input.image_url).await?;
+    let image = Image::from_bytes(&model, &bytes).map_err(|e| e.to_string())?;
+    println!("{} soft tokens (grid {:?})", image.token_count(), image.grid());
+
+    let mut ctx = Context::new(&model)?;
+    ctx.system("You are a helpful visual assistant.").user("Here is an image:");
+    ctx.append_image(&image).await?;        // encode + commit KV
+    ctx.user(&input.question).cue();
+
+    let answer = ctx
+        .generate(Sampler::TopP { temperature: 0.7, p: 0.95 })
+        .max_tokens(128)
+        .stop(&chat::stop_tokens(&model))
+        .collect_text()
+        .await?;
+    Ok(answer)
+}
+```
+
+`Image::from_bytes` decodes synchronously and exposes metadata before any forward pass: `token_count()` (soft tokens the image will occupy) and `grid()` (the `(t, h, w)` merged-token layout). See the [`image-qa`](https://github.com/pie-project/pie/tree/main/inferlets/image-qa) inferlet for the full example.
+
+## Audio input
+
+Identical shape — `Audio::from_bytes` then `Context::append_audio`. The host computes the model's audio frontend (e.g. a 16 kHz log-mel pipeline) and runs the audio encoder:
+
+```rust
+use inferlet::media::Audio;
+
+let bytes = inferlet::http::fetch(&input.audio_url).await?;
+let clip = Audio::from_bytes(&model, &bytes).map_err(|e| e.to_string())?;
+ctx.append_audio(&clip).await?;
+ctx.user("Transcribe this clip.").cue();
+```
+
+See the [`audio-qa`](https://github.com/pie-project/pie/tree/main/inferlets/audio-qa) inferlet.
+
+## Video input
+
+`Video::from_bytes` takes a `max_frames` budget; the host demuxes and uniformly samples up to that many frames, preprocesses each as an image, and `append_video` splices them in (each preceded by a generic `mm:ss` timestamp marker). `max_frames` is your KV-budget knob — each frame costs tens of soft tokens.
+
+```rust
+use inferlet::media::Video;
+
+let bytes = inferlet::http::fetch(&input.video_url).await?;
+let video = Video::from_bytes(&model, &bytes, input.max_frames).map_err(|e| e.to_string())?;
+ctx.append_video(&video).await?;
+```
+
+See the [`video-qa`](https://github.com/pie-project/pie/tree/main/inferlets/video-qa) inferlet.
+
+## Audio output (text-to-speech)
+
+Express intent — `model.speak(text)` with a voice — and the host applies the bound model's prompt framing, runs the frame-stepped synthesis loop, and returns a **self-describing** `Speech` clip (carries its own `sample_rate` and `channels`, so you never hardcode an audio constant).
+
+```rust
+use inferlet::{model::Model, Result};
+use std::time::Duration;
+
+let speech = model
+    .speak(&input.text)
+    .speaker(input.speaker)                       // voice selector
+    .max_duration(Duration::from_secs(20))        // stops early at EOS
+    .generate()
+    .await?;
+
+println!("{:.2}s @ {} Hz", speech.duration().as_secs_f32(), speech.sample_rate());
+let wav: Vec<u8> = speech.to_wav();               // ready to return or save
+```
+
+See the [`tts`](https://github.com/pie-project/pie/tree/main/inferlets/tts) inferlet.
+
+## Other SDKs
+
+The Python and JavaScript SDKs expose the same `media` types (`Image`, `Audio`, `Video`) and the same `Context` methods through generated bindings, so the flow above translates directly: `Image.from_bytes(model, bytes)` → `ctx.append_image(image)` → `ctx.generate(...)`.
+
+## Low-level forward pass
+
+When you build a [forward pass](../forward/overview) directly rather than using `Context`, attach media by anchor position with `fwd.input_image(&image, anchor)` and `fwd.input_audio(&audio, anchor)` — see [Media (multimodal)](../forward/media) for the forward-pass-level API. `Context::append_*` is the high-level wrapper most inferlets should use.

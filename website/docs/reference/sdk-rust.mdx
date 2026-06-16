@@ -128,6 +128,20 @@ Saved snapshots persist across inferlet runs as long as the engine is up.
 | `ctx.flush() -> impl Future<Output = Result<()>>` | Run prefill on buffered tokens; commit pages. |
 | `ctx.truncate(n: u32) -> Result<()>` | Drop the trailing `n` working-page tokens (rollback primitive). Pages already committed cannot be truncated through this API — go through `ctx.inner()` if you need to. |
 
+### Media (multimodal)
+
+Vision/video/audio input and audio output. See [Multimodal generation](../guide/model/multimodal) for the full guide and examples.
+
+| Method | Description |
+|---|---|
+| `Image::from_bytes(&model, &bytes) -> Result<Image>` | Decode image bytes. `image.token_count()` / `image.grid()` expose the soft-token layout. |
+| `Audio::from_bytes(&model, &bytes) -> Result<Audio>` | Decode an audio clip. |
+| `Video::from_bytes(&model, &bytes, max_frames) -> Result<Video>` | Demux and uniformly sample up to `max_frames` frames. |
+| `ctx.append_image(&image).await -> Result<()>` | Run the vision encoder and commit soft-token KV pages. |
+| `ctx.append_audio(&clip).await -> Result<()>` | Run the audio encoder and commit. |
+| `ctx.append_video(&video).await -> Result<()>` | Commit the sampled frames. |
+| `model.speak(text).speaker(id).max_duration(d).generate().await -> Result<Speech>` | Text-to-speech. `Speech::to_wav()`, `sample_rate()`, `channels()`. |
+
 ### Inspection
 
 | Method | Description |

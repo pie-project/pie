@@ -380,8 +380,16 @@ impl Context {
         if n == 0 {
             return;
         }
-        let keep = self.inner.working_page_token_count().saturating_sub(n);
-        self.inner.truncate_working_page_tokens(keep);
+        // `truncate_working_page_tokens` REMOVES the last N working tokens
+        // (see context.wit): its argument is the count to drop, not the
+        // count to keep. Pass `n` straight through — clamped to the working
+        // length so an over-large request can't underflow into the runtime's
+        // range check.
+        let removable = self.inner.working_page_token_count().min(n);
+        if removable == 0 {
+            return;
+        }
+        self.inner.truncate_working_page_tokens(removable);
         // Re-sync from the host: truncation can release pages, and the
         // safe thing is to read the authoritative counts back.
         self.committed_pages = self.inner.committed_page_count();

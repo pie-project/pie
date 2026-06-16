@@ -16,7 +16,7 @@ Pie targets a different workload. The engine's primitive is a running program. T
 
 For workloads that are a sequence of stateless prompts, Pie is not a good choice, since its per-token overhead ([1% to 15% depending on the model size](benchmarks)) outweighs the benefit of custom optimizations.
 
-For infrastructures that already use vLLM or SGLang, Pie has experimental support for running them as *drivers* (backend engines), so Pie piggybacks on their kernel implementations. This can give better performance in some environments than the default driver, at the cost of a few missing features (e.g., custom attention masks). See the [vLLM](../reference/drivers/vllm) and [SGLang](../reference/drivers/sglang) reference pages for the configuration details.
+For infrastructures that already use vLLM, SGLang, or TensorRT-LLM, Pie has experimental support for running them as *drivers* (backend engines), so Pie piggybacks on their kernel implementations. This can give better performance in some environments than the default driver, at the cost of a few missing features (e.g., custom attention masks). See the [vLLM](../reference/drivers/vllm), [SGLang](../reference/drivers/sglang), and [TensorRT-LLM](../reference/drivers/tensorrt-llm) reference pages for the configuration details.
 
 
 ## llama.cpp

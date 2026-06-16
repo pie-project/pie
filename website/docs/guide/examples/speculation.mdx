@@ -6,7 +6,7 @@ sidebar_position: 6
 
 # Speculative decoding
 
-Inferlets that implement custom draft strategies on top of Pie's `Speculator` trait. For the runtime-managed n-gram path, see `text-completion-spec` under [Chat and generation](./chat).
+Inferlets that implement custom draft strategies on top of Pie's `Speculator` trait. For the runtime-managed paths — the built-in n-gram drafter and a model's [native MTP head](../forward/speculation#native-mtp-drafters) — see [System speculation](../forward/speculation#system-speculation); the `text-completion-spec` inferlet under [Chat and generation](./chat) shows the n-gram path.
 
 :::note[Running on the dummy driver?]
 The dummy driver samples a fresh random token for every slot, so every draft is rejected and these inferlets run in 1-token-per-step fallback — they complete correctly but no speedup is observable.

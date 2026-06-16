@@ -12,7 +12,7 @@ The full inferlet SDK API for JavaScript and TypeScript. The [Guide](../guide/in
 The JavaScript inferlet SDK is published on npm as [`@pie-project/inferlet`](https://www.npmjs.com/package/@pie-project/inferlet).
 
 ```bash
-npm install @pie-project/inferlet@0.3.0
+npm install @pie-project/inferlet@0.4.0
 ```
 
 ## Inferlet entry point
@@ -112,6 +112,10 @@ using ctx = new Context(model);
 | `ctx.append(tokens): this` | Append raw token IDs. |
 | `ctx.appendText(text): this` | Tokenize and append text. |
 | `await ctx.flush()` | Run prefill on buffered tokens; commit pages. |
+
+### Media (multimodal)
+
+Multimodal media input (image/audio/video) and audio output (text-to-speech) are available through the generated `media` bindings, mirroring the Rust SDK. See [Multimodal generation](../guide/model/multimodal) for the API and examples.
 
 ### Inspection
 

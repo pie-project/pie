@@ -3,12 +3,13 @@
 #
 #   curl -fsSL https://pie-project.org/install.sh | bash
 #   curl -fsSL https://pie-project.org/install.sh | PIE_FLAVOR=cuda12.8 bash
-#   curl -fsSL https://pie-project.org/install.sh | PIE_VERSION=0.3.0 bash
+#   curl -fsSL https://pie-project.org/install.sh | PIE_VERSION=0.4.0 bash
 #
 # Environment overrides:
-#   PIE_VERSION       Release tag (default: 0.3.0).
-#   PIE_FLAVOR        portable | cuda{12.6,12.8,13.0}
-#                     | portable-cuda{12.6,12.8,13.0}. Auto-detected when unset.
+#   PIE_VERSION       Release tag (default: 0.4.0).
+#   PIE_FLAVOR        portable | cuda{12.8,13.0}. Auto-detected when unset.
+#   PIE_CC            GPU compute capability for CUDA flavors, e.g. 90, 100
+#                     (auto-detected via nvidia-smi; selects the per-CC binary).
 #   PIE_INSTALL_DIR   Install location for the `pie` binary (default: ~/.local/bin).
 #   PIE_REPO          GitHub owner/name (default: pie-project/pie).
 #   PIE_DOWNLOAD_BASE Override the asset base URL (default: GitHub releases).
@@ -16,7 +17,7 @@
 set -euo pipefail
 
 PIE_REPO="${PIE_REPO:-pie-project/pie}"
-PIE_VERSION="${PIE_VERSION:-0.3.0}"
+PIE_VERSION="${PIE_VERSION:-0.4.0}"
 PIE_INSTALL_DIR="${PIE_INSTALL_DIR:-${HOME}/.local/bin}"
 PIE_DOWNLOAD_BASE="${PIE_DOWNLOAD_BASE:-https://github.com/${PIE_REPO}/releases/download/${PIE_VERSION}}"
 PIE_DETECTED_FLAVOR=""
@@ -126,8 +127,20 @@ detect_cuda_flavor() {
   fi
 }
 
+# Compute capability of the first GPU, normalized to the SM string used in the
+# per-CC asset names ("9.0" -> "90", "12.0" -> "120"). Override with PIE_CC.
+detect_cuda_cc() {
+  command -v nvidia-smi >/dev/null 2>&1 || return 0
+  local cap
+  cap="$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -1 | tr -d ' .' || true)"
+  case "$cap" in
+    *[!0-9]*|"") return 0 ;;
+  esac
+  PIE_DETECTED_CC="$cap"
+}
+
 if [ -z "${PIE_FLAVOR:-}" ]; then
-  if [ "$os" = linux ] && [ "$arch" = x86_64 ]; then
+  if [ "$os" = linux ] && { [ "$arch" = x86_64 ] || [ "$arch" = aarch64 ]; }; then
     detect_cuda_flavor || true
     PIE_FLAVOR="${PIE_DETECTED_FLAVOR:-portable}"
   else
@@ -135,35 +148,51 @@ if [ -z "${PIE_FLAVOR:-}" ]; then
   fi
 fi
 
-# Map (os, arch, flavor) -> release asset name. Names mirror what
-# .github/workflows/build.yml uploads.
-asset_for() {
+# Detect the GPU compute capability so CUDA flavors can pick the per-CC binary.
+if [ -z "${PIE_CC:-}" ]; then
+  detect_cuda_cc || true
+  PIE_CC="${PIE_DETECTED_CC:-}"
+fi
+
+# Map (os, arch, flavor) -> a candidate release asset name (mirrors what
+# .github/workflows/build.yml uploads). CUDA flavors select the per-compute-
+# capability build (glibc 2.28 floor) for the detected (or PIE_CC) capability.
+assets_for() {
   case "$os/$arch/$1" in
-    linux/x86_64/portable)            echo "pie-x86_64-manylinux_2_28.tar.gz" ;;
-    linux/aarch64/portable)           echo "pie-aarch64-manylinux_2_28.tar.gz" ;;
-    darwin/aarch64/portable)          echo "pie-aarch64-darwin.tar.gz" ;;
-    linux/x86_64/cuda12.6 \
-    | linux/x86_64/cuda12.8 \
-    | linux/x86_64/cuda13.0 \
-    | linux/x86_64/portable-cuda12.6 \
-    | linux/x86_64/portable-cuda12.8 \
-    | linux/x86_64/portable-cuda13.0)
-      echo "pie-x86_64-linux-${1}.tar.gz" ;;
+    linux/x86_64/portable)            echo "pie-x86_64-linux-vulkan.tar.gz" ;;
+    linux/aarch64/portable)           echo "pie-aarch64-linux-vulkan.tar.gz" ;;
+    darwin/aarch64/portable)          echo "pie-aarch64-macos-metal.tar.gz" ;;
+    linux/x86_64/cuda12.8 | linux/x86_64/cuda13.0 \
+    | linux/aarch64/cuda12.8 | linux/aarch64/cuda13.0)
+      # Per-compute-capability binary, selected from the detected (or
+      # PIE_CC-overridden) compute capability.
+      if [ -n "${PIE_CC:-}" ]; then
+        echo "pie-${arch}-linux-${1}-sm${PIE_CC}.tar.gz"
+      fi
+      ;;
     *) return 1 ;;
   esac
 }
 
-asset="$(asset_for "$PIE_FLAVOR")" || err \
-  "no '$PIE_FLAVOR' build for $os/$arch. Valid flavors: portable; or (Linux x86_64 only) cuda12.6, cuda12.8, cuda13.0, portable-cuda12.6, portable-cuda12.8, portable-cuda13.0."
+candidates="$(assets_for "$PIE_FLAVOR")" || err \
+  "no '$PIE_FLAVOR' build for $os/$arch. Valid flavors: portable; or (Linux) cuda12.8, cuda13.0."
 
-url="${PIE_DOWNLOAD_BASE}/${asset}"
+# CUDA flavors select per-compute-capability binaries; without a CC we have
+# nothing to download. Guide the user to set PIE_CC.
+case "$PIE_FLAVOR" in
+  cuda*)
+    [ -n "${PIE_CC:-}" ] || err \
+      "CUDA flavor '${PIE_FLAVOR}' needs a GPU compute capability, but none was detected. \
+Set PIE_CC explicitly, e.g. PIE_CC=90 (H100), 100 (B200), 89 (L40/RTX40), 86 (A10), 80 (A100)."
+    ;;
+esac
+
 heading "Installing Pie"
 detail "Version:  ${PIE_VERSION}"
 detail "Platform: ${os}/${arch}"
 detail "Flavor:   ${PIE_FLAVOR}"
 [ -n "$PIE_FLAVOR_REASON" ] && detail "Reason:   ${PIE_FLAVOR_REASON}"
 detail "Target:   ${PIE_INSTALL_DIR}/pie"
-debug "Asset:    ${url}"
 
 # ---------------------------------------------------------------------------
 # Download + install
@@ -173,9 +202,19 @@ tmp="$(mktemp -d -t pie-install.XXXXXX)"
 trap 'rm -rf "$tmp"' EXIT
 
 step "Downloading release archive"
-if ! fetch "$url" "${tmp}/${asset}"; then
-  err "download failed for ${url}. Check PIE_VERSION=${PIE_VERSION} and PIE_FLAVOR=${PIE_FLAVOR}, then try again."
+asset=""
+url=""
+for cand in $candidates; do
+  cand_url="${PIE_DOWNLOAD_BASE}/${cand}"
+  debug "Trying:   ${cand_url}"
+  if fetch "$cand_url" "${tmp}/${cand}"; then
+    asset="$cand"; url="$cand_url"; break
+  fi
+done
+if [ -z "$asset" ]; then
+  err "download failed for flavor '${PIE_FLAVOR}' (tried: ${candidates}) under ${PIE_DOWNLOAD_BASE}. Check PIE_VERSION=${PIE_VERSION} and PIE_FLAVOR=${PIE_FLAVOR}, then try again."
 fi
+debug "Asset:    ${url}"
 
 step "Verifying archive"
 if ! tar -tzf "${tmp}/${asset}" >/dev/null; then

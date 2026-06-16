@@ -55,6 +55,7 @@ const sidebars: SidebarsConfig = {
       items: [
         'guide/model/loading',
         'guide/model/tokenizer',
+        'guide/model/multimodal',
       ],
     },
     {
@@ -75,6 +76,7 @@ const sidebars: SidebarsConfig = {
       items: [
         'guide/forward/overview',
         'guide/forward/inputs',
+        'guide/forward/media',
         'guide/forward/samplers',
         'guide/forward/constrained',
         'guide/forward/speculation',
@@ -161,6 +163,7 @@ const sidebars: SidebarsConfig = {
         'reference/drivers/portable',
         {type: 'doc', id: 'reference/drivers/vllm', className: 'sidebar-experimental'},
         {type: 'doc', id: 'reference/drivers/sglang', className: 'sidebar-experimental'},
+        {type: 'doc', id: 'reference/drivers/tensorrt-llm', className: 'sidebar-experimental'},
       ],
     },
     {
