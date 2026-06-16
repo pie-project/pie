@@ -227,6 +227,28 @@ GGUFArchive::GGUFArchive(const std::filesystem::path& gguf_file) {
     const std::int64_t n_tensors = gguf_get_n_tensors(gctx_);
     raw_names_.reserve(static_cast<std::size_t>(n_tensors));
 
+    // gguf_init_from_file (no_alloc=true) validates only the header, so a
+    // tensor extent past EOF passes init then SIGBUSes on first read.
+    for (std::int64_t i = 0; i < n_tensors; ++i) {
+        const std::size_t local_offset = gguf_get_tensor_offset(gctx_, i);
+        const std::size_t nbytes       = gguf_get_tensor_size(gctx_, i);
+        // Overflow-safe form of: data_offset + local_offset + nbytes > mmap_size_
+        if (data_offset > mmap_size_ ||
+            local_offset > mmap_size_ - data_offset ||
+            nbytes > mmap_size_ - data_offset - local_offset) {
+            const std::string nm = gguf_get_tensor_name(gctx_, i);
+            close_mmap_();
+            gguf_free(gctx_); gctx_ = nullptr;
+            throw std::runtime_error(
+                "gguf: tensor '" + nm + "' (data_offset=" +
+                std::to_string(data_offset) + " + offset=" +
+                std::to_string(local_offset) + " + size=" +
+                std::to_string(nbytes) + ") extends past mapped file size " +
+                std::to_string(mmap_size_) +
+                " — GGUF is truncated or corrupt: " + gguf_file.string());
+        }
+    }
+
     // We need tensor shapes (ne[]) and the public gguf API doesn't
     // expose them directly (only type, offset, size). Workaround: pass
     // ctx=&meta_ggml_ctx to gguf_init_from_file with no_alloc=true and
