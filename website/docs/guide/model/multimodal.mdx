@@ -112,4 +112,4 @@ The Python and JavaScript SDKs expose the same `media` types (`Image`, `Audio`, 
 
 ## Low-level forward pass
 
-When you build a [forward pass](../forward/overview) directly rather than using `Context`, attach media by anchor position with `pass.input_image(&image, anchor)` and `pass.input_audio(&audio, anchor)`. `Context::append_*` is the high-level wrapper most inferlets should use.
+When you build a [forward pass](../forward/overview) directly rather than using `Context`, attach media by anchor position with `fwd.input_image(&image, anchor)` and `fwd.input_audio(&audio, anchor)` — see [Media (multimodal)](../forward/media) for the forward-pass-level API. `Context::append_*` is the high-level wrapper most inferlets should use.

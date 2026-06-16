@@ -420,6 +420,36 @@ and [TensorRT-LLM](/docs/reference/drivers/tensorrt-llm).
     </div>
   </div>
 
+  <div className="m-card delegate">
+
+    <h3 className="m-card-name">tensorrt-llm@1.2.1</h3>
+    <div className="m-card-desc">
+      Delegates forward pass execution to TensorRT-LLM. Check the Inferlet API <a href="/docs/reference/drivers/tensorrt-llm">capability</a>.
+    </div>
+    <div className="m-spec">
+      <div className="m-spec-row">
+        <span className="m-spec-label">Hardware</span>
+        <div className="m-chips">
+          <span className="m-chip">CUDA</span>
+        </div>
+      </div>
+      <div className="m-spec-row">
+        <span className="m-spec-label">Weights</span>
+        <div className="m-chips">
+          <span className="m-chip up">upstream</span>
+        </div>
+      </div>
+      <div className="m-spec-row">
+        <span className="m-spec-label">Parallel</span>
+        <div className="m-chips">
+          <span className="m-chip off">TP</span>
+          <span className="m-chip">DP</span>
+          <span className="m-chip off">PP</span>
+        </div>
+      </div>
+    </div>
+  </div>
+
 </div>
 
 ## Architecture support
@@ -939,7 +969,7 @@ and [TensorRT-LLM](/docs/reference/drivers/tensorrt-llm).
 
     <tr>
       <td>
-        <span className="m-arch-name">GLM 4.5 / 4.7</span>
+        <span className="m-arch-name">GLM-5.1</span>
         <span className="m-arch-sub">glm_moe_dsa</span>
       </td>
       <td className="c"><span className="m-pill partial">preview</span></td>
@@ -948,9 +978,7 @@ and [TensorRT-LLM](/docs/reference/drivers/tensorrt-llm).
       <td className="c"><span className="m-pill up">upstream</span></td>
       <td>
         <div className="m-sizes">
-          <a className="m-size" href="https://huggingface.co/zai-org/GLM-4.5-Air">4.5-Air</a>
-          <a className="m-size" href="https://huggingface.co/zai-org/GLM-4.5">4.5</a>
-          <a className="m-size" href="https://huggingface.co/zai-org/GLM-4.7-Flash">4.7-Flash</a>
+          <a className="m-size" href="https://huggingface.co/zai-org/GLM-5.1-FP8">5.1-FP8</a>
         </div>
       </td>
     </tr>
