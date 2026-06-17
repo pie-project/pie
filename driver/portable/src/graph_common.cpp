@@ -447,4 +447,58 @@ void upload_graph_inputs(const GraphResult& g,
     }
 }
 
+void build_sampling_outputs(ggml_context* ctx,
+                            ggml_cgraph*  gf,
+                            ggml_tensor*  logits,
+                            const Executor::BatchPlan& plan,
+                            GraphResult&  res) {
+    if (plan.all_greedy) {
+        // GPU-greedy fast path: argmax along the vocab axis on-device. The
+        // caller downloads only n_slots i32 ids; the F32 logits block
+        // never becomes a graph output, so gallocr skips its backing
+        // buffer.
+        ggml_tensor* tokens_out = ggml_argmax(ctx, logits);
+        ggml_set_name(tokens_out, "tokens_out");
+        ggml_set_output(tokens_out);
+        ggml_build_forward_expand(gf, tokens_out);
+        res.tokens_out = tokens_out;
+    } else if (plan.uniform_top_sample) {
+        // GPU non-greedy fast path: temperature-scaled softmax → probs,
+        // take top-K indices, gather the K matching probs. The caller
+        // downloads only K * n_slots * 8 bytes and finalizes per-slot
+        // top-p / min-p / sample host-side.
+        const float inv_t = 1.0f / plan.reqs[0].sampler.temperature;
+        ggml_tensor* probs = ggml_soft_max_ext(ctx, logits, /*mask=*/nullptr,
+                                               /*scale=*/inv_t,
+                                               /*max_bias=*/0.0f);
+        // probs is [vocab, n_slots]; ggml_top_k yields indices [K, n_slots]
+        // sorted descending. Reshape probs to [1, vocab, n_slots] so
+        // get_rows gathers along ne[1] → [1, K, n_slots], then flatten to
+        // [K, n_slots]. Both reshapes key on the slot count probs->ne[1],
+        // which is >= n_req under speculation (see header).
+        const std::int64_t vocab   = probs->ne[0];
+        const std::int64_t n_slots = probs->ne[1];
+        ggml_tensor* top_k_idx = ggml_top_k(ctx, probs, plan.uniform_top_k);
+        ggml_tensor* probs_3d  = ggml_reshape_3d(ctx, probs, 1, vocab, n_slots);
+        ggml_tensor* gathered  = ggml_get_rows(ctx, probs_3d, top_k_idx);
+        ggml_tensor* top_k_probs =
+            ggml_reshape_2d(ctx, gathered, plan.uniform_top_k, n_slots);
+        ggml_set_name(top_k_idx,   "top_k_idx");
+        ggml_set_name(top_k_probs, "top_k_probs");
+        ggml_set_output(top_k_idx);
+        ggml_set_output(top_k_probs);
+        ggml_build_forward_expand(gf, top_k_idx);
+        ggml_build_forward_expand(gf, top_k_probs);
+        res.top_k_idx   = top_k_idx;
+        res.top_k_probs = top_k_probs;
+    } else {
+        // Slow path: materialize the full [vocab, n_slots] logits block;
+        // the host sampler handles every per-slot cut and the draw.
+        ggml_set_name(logits, "logits");
+        ggml_set_output(logits);
+        ggml_build_forward_expand(gf, logits);
+        res.logits = logits;
+    }
+}
+
 }  // namespace pie_portable_driver

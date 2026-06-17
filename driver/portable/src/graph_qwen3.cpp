@@ -819,71 +819,14 @@ GraphResult build_qwen3_graph(ggml_context* ctx,
         logits = ggml_scale(ctx, logits, spec.final_softcap);
     }
 
-    ggml_tensor* tokens_out  = nullptr;
-    ggml_tensor* top_k_idx   = nullptr;
-    ggml_tensor* top_k_probs = nullptr;
-    if (plan.all_greedy) {
-        // Greedy fast path: argmax along vocab axis on the GPU. Caller
-        // downloads only n_slots i32 ids; the F32 logits buffer never
-        // needs to be a graph output, so gallocr can avoid the
-        // ~vocab*n_slots*4-byte materialization. (CPU argmax in our
-        // host sampler uses first-wins-on-tie; the CUDA reduction picks
-        // a different tied index in rare exact-tie cases — both are
-        // valid greedy choices.)
-        tokens_out = ggml_argmax(ctx, logits);
-        ggml_set_name(tokens_out, "tokens_out");
-        ggml_set_output(tokens_out);
-        ggml_build_forward_expand(gf, tokens_out);
-    } else if (plan.uniform_top_sample) {
-        // Non-greedy uniform fast path: temperature-scale + softmax →
-        // probs, take top-K indices, gather K probs. Caller downloads
-        // only K * n_slots * 8 bytes (vs vocab * n_slots * 4 bytes for
-        // the slow path) and finalizes per-slot top-p / min-p / sample
-        // host-side.
-        const float inv_t = 1.0f / plan.reqs[0].sampler.temperature;
-        ggml_tensor* probs = ggml_soft_max_ext(ctx, logits, /*mask=*/ nullptr,
-                                               /*scale=*/ inv_t, /*max_bias=*/ 0.0f);
-        // ggml_top_k returns indices [K, n_slots] sorted descending.
-        top_k_idx = ggml_top_k(ctx, probs, plan.uniform_top_k);
-
-        // Gather the K probabilities matching those indices, mirroring
-        // the get_rows trick used by the MoE router (build_moe_ffn).
-        // probs reshaped to [1, vocab, n_slots]; get_rows along ne[1]
-        // with index [K, n_slots] yields [1, K, n_slots] → reshape.
-        // n_slots (sampled rows), not n_req: speculation samples >1 slot
-        // per request, so n_slots >= n_req.
-        const std::int64_t n_slots = probs->ne[1];
-        ggml_tensor* probs_3d = ggml_reshape_3d(
-            ctx, probs, 1, h.vocab_size, n_slots);
-        ggml_tensor* gathered = ggml_get_rows(ctx, probs_3d, top_k_idx);
-        top_k_probs = ggml_reshape_2d(ctx, gathered, plan.uniform_top_k, n_slots);
-
-        ggml_set_name(top_k_idx, "top_k_idx");
-        ggml_set_name(top_k_probs, "top_k_probs");
-        ggml_set_output(top_k_idx);
-        ggml_set_output(top_k_probs);
-        ggml_build_forward_expand(gf, top_k_idx);
-        ggml_build_forward_expand(gf, top_k_probs);
-    } else {
-        ggml_set_name(logits, "logits");
-        ggml_set_output(logits);
-        ggml_build_forward_expand(gf, logits);
-    }
-
+    // Emit the chosen sampling-stage output(s). Only one of tokens_out /
+    // top_k_{idx,probs} / logits is materialized; the others stay null and
+    // gallocr skips their backing buffers (most importantly the
+    // [vocab, n_slots] F32 logits block). Shared across all arch builders.
     GraphResult res{};
     res.gf = gf;
-    // Only one output is materialized depending on the chosen sampling
-    // path. The other two stay null and gallocr skips their backing
-    // buffers (most importantly the [vocab, n_slots] F32 logits block).
-    if (plan.all_greedy) {
-        res.tokens_out = tokens_out;
-    } else if (plan.uniform_top_sample) {
-        res.top_k_idx   = top_k_idx;
-        res.top_k_probs = top_k_probs;
-    } else {
-        res.logits = logits;
-    }
     res.in = std::move(in);
+    build_sampling_outputs(ctx, gf, logits, plan, res);
     return res;
 }
 

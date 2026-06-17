@@ -102,6 +102,10 @@ add_library(pie_driver_portable_lib STATIC
   src/sampler.cpp
   src/host_swap_pool.cpp
   src/adapter.cpp
+  # Test-only entry exercising build_sampling_outputs() from a pie-server
+  # #[cfg(test)] Rust test (driver/portable ctest never runs in CI). The
+  # symbol is GC'd out of release builds — no Rust code references it there.
+  src/graph_sampling_testhook.cpp
 )
 
 target_compile_options(pie_driver_portable_lib PRIVATE
