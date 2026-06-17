@@ -230,6 +230,9 @@ impl Ord for RestoreEntry {
 
 pub(crate) static SERVICES: LazyLock<ServiceArray<Message>> = LazyLock::new(ServiceArray::new);
 static PAGE_SIZES: LazyLock<boxcar::Vec<usize>> = LazyLock::new(boxcar::Vec::new);
+/// Per-model `total_pages`, indexed by `model_idx` then driver ordinal.
+/// Pushed once at `spawn`; read lock-free by `budget_page_count`.
+static GPU_PAGE_BUDGETS: LazyLock<boxcar::Vec<Vec<usize>>> = LazyLock::new(boxcar::Vec::new);
 
 // ---------------------------------------------------------------------------
 // Lock-free read caches — written by the actor, read directly by callers.
@@ -350,6 +353,7 @@ pub fn spawn(
 ) -> usize {
     let model_idx = SERVICES.len();
     PAGE_SIZES.push(page_size);
+    GPU_PAGE_BUDGETS.push(num_gpu_pages.clone());
     MARKET.push(Market::new(default_endowment_pages));
     SERVICES
         .spawn(move || {
@@ -820,6 +824,20 @@ pub fn committed_page_count(model_idx: usize, id: ContextId) -> u32 {
     CACHED_CONTEXT_INFO
         .get(&(model_idx, id))
         .map(|v| v.committed_pages)
+        .unwrap_or(0)
+}
+
+/// Per-driver KV-page budget (`total_pages`) for this context; window in
+/// tokens = `budget_page_count * tokens_per_page`. 0 until the driver is cached.
+pub fn budget_page_count(model_idx: usize, id: ContextId) -> u32 {
+    let driver = match CACHED_CONTEXT_INFO.get(&(model_idx, id)) {
+        Some(v) => v.driver,
+        None => return 0,
+    };
+    GPU_PAGE_BUDGETS
+        .get(model_idx)
+        .and_then(|budgets| budgets.get(driver))
+        .map(|&n| n as u32)
         .unwrap_or(0)
 }
 
