@@ -79,6 +79,9 @@ interface context {
         // Number of committed KV pages in the context
         committed-page-count: func() -> u32;
 
+        // Total KV-page budget (total_pages) for this context's driver; window in tokens = budget-page-count * tokens-per-page.
+        budget-page-count: func() -> u32;
+
         // Number of uncommitted KV pages (based on buffered tokens in the resource handle)
         working-page-count: func() -> u32;
 

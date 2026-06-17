@@ -219,6 +219,12 @@ fn full_page_lifecycle() {
             .unwrap();
 
         assert_eq!(pie::context::committed_page_count(MODEL, id), 1);
+        // budget == the mock env's per-driver total_pages (64); a page op
+        // above has cached the driver so the lock-free read resolves.
+        assert_eq!(
+            pie::context::budget_page_count(MODEL, id), 64,
+            "budget_page_count should report the driver total_pages"
+        );
         // 16 filled tokens remain (second page's worth)
         assert_eq!(
             pie::context::working_page_token_count(MODEL, id),

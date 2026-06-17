@@ -282,6 +282,18 @@ impl Context {
         self.seq_len
     }
 
+    /// Per-driver KV-page budget (`total_pages`); read live, since a context
+    /// can migrate drivers. 0 before the host has cached this context.
+    pub fn budget_pages(&self) -> u32 {
+        self.inner.budget_page_count()
+    }
+
+    /// Context window in tokens (`budget_pages * page_size`) — the
+    /// ceiling `seq_len` can grow to before KV pages are exhausted.
+    pub fn max_tokens(&self) -> u32 {
+        self.budget_pages().saturating_mul(self.page_size)
+    }
+
     /// Pending (buffered but not yet flushed) tokens.
     pub fn buffer(&self) -> &[u32] {
         &self.buffer

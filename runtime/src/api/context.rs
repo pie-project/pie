@@ -287,6 +287,11 @@ impl pie::core::context::HostContext for InstanceState {
         Ok(context::committed_page_count(ctx.model_id, ctx.context_id))
     }
 
+    async fn budget_page_count(&mut self, this: Resource<Context>) -> Result<u32> {
+        let ctx = self.ctx().table.get(&this)?;
+        Ok(context::budget_page_count(ctx.model_id, ctx.context_id))
+    }
+
     async fn working_page_count(&mut self, this: Resource<Context>) -> Result<u32> {
         let ctx = self.ctx().table.get(&this)?;
         Ok(context::working_page_count(ctx.model_id, ctx.context_id))
