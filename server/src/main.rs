@@ -216,3 +216,86 @@ mod portable_gguf_tokenizer_tests {
                 "Prepend must precede Replace so the leading metaspace is added first: {j}");
     }
 }
+
+// #712 hardening guards for the gemma4 GGUF load path. That path is otherwise
+// guarded only by a real 12B boot (#705); these turn two formerly-silent
+// mis-derivations into cheap unit failures, in the `pie` bin because CI runs
+// `cargo test -p pie-server --bin pie` and driver/portable ctest never runs in
+// CI. Test-only C entries live in `gemma4_hparams_testhook.cpp`.
+#[cfg(all(test, feature = "driver-portable"))]
+mod portable_gemma4_hardening_tests {
+    use std::os::raw::c_int;
+
+    unsafe extern "C" {
+        fn pie_portable_test_gemma4_head_count_kv_status(mode: c_int) -> c_int;
+        fn pie_portable_test_gemma4_parsed_kv_heads(which: c_int) -> c_int;
+        fn pie_portable_test_gemma4_rope_freqs_status(
+            has_full_layer: c_int,
+            present: c_int,
+        ) -> c_int;
+    }
+
+    // A well-formed per-layer head_count_kv array (consistent within each
+    // attention type) parses, and reduces to the two scalars the attention
+    // path uses: sliding -> num_key_value_heads (8), full -> global (1).
+    #[test]
+    fn head_count_kv_valid_reduces_to_dual_scalars() {
+        assert_eq!(
+            unsafe { pie_portable_test_gemma4_head_count_kv_status(0) }, 0,
+            "valid head_count_kv array must parse"
+        );
+        assert_eq!(
+            unsafe { pie_portable_test_gemma4_parsed_kv_heads(0) }, 8,
+            "sliding layers -> num_key_value_heads"
+        );
+        assert_eq!(
+            unsafe { pie_portable_test_gemma4_parsed_kv_heads(1) }, 1,
+            "full layers -> num_global_key_value_heads"
+        );
+    }
+
+    // A head_count_kv array whose length does not match the layer count used
+    // to be silently skipped (kv-head counts left at generic defaults). It
+    // must now throw.
+    #[test]
+    fn head_count_kv_wrong_length_throws() {
+        assert_eq!(
+            unsafe { pie_portable_test_gemma4_head_count_kv_status(1) }, 1,
+            "length-mismatched head_count_kv must fail loudly"
+        );
+    }
+
+    // Differing counts within one attention type break the two-scalar
+    // reduction; the last value used to win silently. It must now throw.
+    #[test]
+    fn head_count_kv_inconsistent_within_type_throws() {
+        assert_eq!(
+            unsafe { pie_portable_test_gemma4_head_count_kv_status(2) }, 1,
+            "within-type-inconsistent head_count_kv must fail loudly"
+        );
+    }
+
+    // rope_freqs.weight is required whenever the model has a full-attention
+    // layer (the GGUF carries the proportional-RoPE factors only there); a
+    // missing tensor used to fall back silently to a full rotation.
+    #[test]
+    fn rope_freqs_missing_with_full_layer_throws() {
+        assert_eq!(
+            unsafe { pie_portable_test_gemma4_rope_freqs_status(1, 0) }, 1,
+            "full layer + absent rope_freqs.weight must fail loudly"
+        );
+    }
+
+    // Present tensor, or a model with no full-attention layer, is accepted.
+    #[test]
+    fn rope_freqs_present_or_no_full_layer_ok() {
+        assert_eq!(
+            unsafe { pie_portable_test_gemma4_rope_freqs_status(1, 1) }, 0,
+            "full layer + present rope_freqs.weight is fine"
+        );
+        assert_eq!(
+            unsafe { pie_portable_test_gemma4_rope_freqs_status(0, 0) }, 0,
+            "no full layer => rope_freqs.weight not required"
+        );
+    }
+}
