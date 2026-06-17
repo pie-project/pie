@@ -350,11 +350,24 @@ private:
             const std::size_t total = batched_dsts_.size();
             for (std::size_t off = 0; off < total; off += kChunk) {
                 const std::size_t n = std::min(kChunk, total - off);
+                // cudaMemcpyBatchAsync's signature changed between CUDA 12.8
+                // (preview: non-const ptrs + a trailing `size_t* failIdx`
+                // out-param, 9 args) and CUDA 13.0 (final: const-qualified
+                // ptrs, no failIdx, 8 args). Pick the call shape per toolkit.
+#if CUDART_VERSION >= 13000
                 const cudaError_t err = ::cudaMemcpyBatchAsync(
                     batched_dsts_.data() + off,
                     const_cast<const void**>(batched_srcs_.data() + off),
                     batched_sizes_.data() + off,
                     n, &attr, &attrs_idx, /*numAttrs=*/1, stream);
+#else
+                std::size_t fail_idx = 0;
+                const cudaError_t err = ::cudaMemcpyBatchAsync(
+                    batched_dsts_.data() + off,
+                    batched_srcs_.data() + off,
+                    batched_sizes_.data() + off,
+                    n, &attr, &attrs_idx, /*numAttrs=*/1, &fail_idx, stream);
+#endif
                 if (err != cudaSuccess) {
                     throw std::runtime_error(
                         std::string("cudaMemcpyBatchAsync failed: ") +

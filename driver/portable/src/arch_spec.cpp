@@ -98,6 +98,9 @@ ArchSpec arch_spec_for(PieArch a, const Hparams& h) {
     ArchSpec s;
     switch (a) {
         case PieArch::Qwen3:
+        case PieArch::Qwen3VL:
+            // Qwen3-VL's text decoder is plain Qwen3 (q/k norm). The vision
+            // tower is handled separately (load_vision_tower_qwen3vl_).
             s.has_qk_norm = true;
             break;
         case PieArch::Qwen2:

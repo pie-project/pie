@@ -51,6 +51,79 @@ GraphInputs declare_graph_inputs(ggml_context* ctx,
     ggml_set_name(in.out_idx, "out_idx");
     ggml_set_input(in.out_idx);
 
+    // Vision (multimodal) side-inputs. Dims derive from the host-computed
+    // BatchPlan arrays (hidden/head_dim recovered from their lengths).
+    if (plan.has_images && plan.vis_n_patch > 0) {
+        const std::int64_t np = plan.vis_n_patch;
+        const std::int64_t hidden =
+            np > 0 ? static_cast<std::int64_t>(plan.vis_pos_embed.size()) / np : 0;
+        const std::int64_t hd =
+            np > 0 ? static_cast<std::int64_t>(plan.vis_rope_cos.size()) / np : 0;
+        in.vis_pixels = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, plan.vis_patch_dim, np);
+        ggml_set_name(in.vis_pixels, "vis_pixels");
+        ggml_set_input(in.vis_pixels);
+        in.vis_pos_embed = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hidden, np);
+        ggml_set_name(in.vis_pos_embed, "vis_pos_embed");
+        ggml_set_input(in.vis_pos_embed);
+        in.vis_rope_cos = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hd, np);
+        ggml_set_name(in.vis_rope_cos, "vis_rope_cos");
+        ggml_set_input(in.vis_rope_cos);
+        in.vis_rope_sin = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hd, np);
+        ggml_set_name(in.vis_rope_sin, "vis_rope_sin");
+        ggml_set_input(in.vis_rope_sin);
+        in.vis_img_rows = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, plan.vis_n_token);
+        ggml_set_name(in.vis_img_rows, "vis_img_rows");
+        ggml_set_input(in.vis_img_rows);
+        // vis_img_rows_i32 is consumed only by Qwen3-VL deepstack get_rows.
+        // The Gemma-4 path (pool matrix present) never reads it, and allocating
+        // an unused input leaves it bufferless -> upload asserts. So gate it.
+        if (plan.vis_pool_matrix.empty()) {
+            in.vis_img_rows_i32 = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, plan.vis_n_token);
+            ggml_set_name(in.vis_img_rows_i32, "vis_img_rows_i32");
+            ggml_set_input(in.vis_img_rows_i32);
+        }
+        if (!plan.vis_pool_matrix.empty()) {  // Gemma-4 group-mean pool
+            in.vis_pool_matrix = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, np,
+                                                    plan.vis_n_token);
+            ggml_set_name(in.vis_pool_matrix, "vis_pool_matrix");
+            ggml_set_input(in.vis_pool_matrix);
+        }
+        if (!plan.vis_attn_mask.empty()) {  // multi-image block-diagonal mask
+            in.vis_attn_mask = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, np, np);
+            ggml_set_name(in.vis_attn_mask, "vis_attn_mask");
+            ggml_set_input(in.vis_attn_mask);
+        }
+    }
+
+    // Audio (Gemma-4 Conformer) side-inputs. One encoder per clip; the
+    // sinusoidal rel-pos encoding `aud_pe` is shared across clips.
+    if (plan.has_audio && !plan.aud_clips.empty()) {
+        const std::int64_t P = plan.aud_dwin + 1;  // pe rows (= context_left)
+        const std::int64_t hidden =
+            P == 0 ? 0 : static_cast<std::int64_t>(plan.aud_pe.size()) / P;
+        in.aud_pe = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hidden, P);
+        ggml_set_name(in.aud_pe, "aud_pe");
+        ggml_set_input(in.aud_pe);
+        for (std::size_t c = 0; c < plan.aud_clips.size(); ++c) {
+            const auto& clip = plan.aud_clips[c];
+            const std::string sfx = std::to_string(c);
+            ggml_tensor* feat = ggml_new_tensor_2d(ctx, GGML_TYPE_F32,
+                                                   plan.aud_n_mel, clip.n_frame);
+            ggml_set_name(feat, ("aud_features" + sfx).c_str());
+            ggml_set_input(feat);
+            in.aud_features.push_back(feat);
+            ggml_tensor* wm = ggml_new_tensor_2d(ctx, GGML_TYPE_F32,
+                                                 plan.aud_dwin, clip.n_token);
+            ggml_set_name(wm, ("aud_win_mask" + sfx).c_str());
+            ggml_set_input(wm);
+            in.aud_win_mask.push_back(wm);
+            ggml_tensor* rows = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, clip.n_token);
+            ggml_set_name(rows, ("aud_rows" + sfx).c_str());
+            ggml_set_input(rows);
+            in.aud_rows.push_back(rows);
+        }
+    }
+
     if (plan.pure_decode) {
         // Either paged-attn inputs (page_indices/indptr/last_page_lens)
         // or the materialize path's packed_gather — never both. The
@@ -355,16 +428,78 @@ void upload_graph_inputs(const GraphResult& g,
                          const Executor::BatchPlan& plan) {
     ggml_backend_tensor_set(g.in.tok_input, plan.tokens_i32.data(), 0,
                             plan.tokens_i32.size() * sizeof(std::int32_t));
-    // Qwen 3.5 / 3.6 use mrope: ggml_rope_multi expects 4 positions per
-    // token (t, h, w, +1). The per-request slicing in graph_qwen3_5.cpp
-    // takes a contiguous slice [qo_start*4 .. qo_start*4 + n_tokens*4],
-    // so the layout must be PER-REQUEST axis-major (not batch-axis-major):
-    //   request r contributes [t_0..t_{n-1}, h_0..h_{n-1},
-    //                          w_0..w_{n-1}, e_0..e_{n-1}].
-    // For text-only inference all 4 axes equal the token's text position.
+
+    // Vision side-inputs (multimodal). The vis_* tensors exist only when the
+    // batch carried image spans (declare_graph_inputs allocated them).
+    if (g.in.vis_pixels) {
+        ggml_backend_tensor_set(g.in.vis_pixels, plan.vis_pixels.data(), 0,
+                                plan.vis_pixels.size() * sizeof(float));
+        ggml_backend_tensor_set(g.in.vis_pos_embed, plan.vis_pos_embed.data(), 0,
+                                plan.vis_pos_embed.size() * sizeof(float));
+        ggml_backend_tensor_set(g.in.vis_rope_cos, plan.vis_rope_cos.data(), 0,
+                                plan.vis_rope_cos.size() * sizeof(float));
+        ggml_backend_tensor_set(g.in.vis_rope_sin, plan.vis_rope_sin.data(), 0,
+                                plan.vis_rope_sin.size() * sizeof(float));
+        ggml_backend_tensor_set(g.in.vis_img_rows, plan.vis_img_rows.data(), 0,
+                                plan.vis_img_rows.size() * sizeof(std::int64_t));
+        if (g.in.vis_img_rows_i32) {
+            std::vector<std::int32_t> rows32(plan.vis_img_rows.size());
+            for (std::size_t i = 0; i < rows32.size(); ++i)
+                rows32[i] = static_cast<std::int32_t>(plan.vis_img_rows[i]);
+            ggml_backend_tensor_set(g.in.vis_img_rows_i32, rows32.data(), 0,
+                                    rows32.size() * sizeof(std::int32_t));
+        }
+        if (g.in.vis_pool_matrix && !plan.vis_pool_matrix.empty()) {
+            ggml_backend_tensor_set(g.in.vis_pool_matrix, plan.vis_pool_matrix.data(),
+                                    0, plan.vis_pool_matrix.size() * sizeof(float));
+        }
+        if (g.in.vis_attn_mask && !plan.vis_attn_mask.empty()) {
+            ggml_backend_tensor_set(g.in.vis_attn_mask, plan.vis_attn_mask.data(),
+                                    0, plan.vis_attn_mask.size() * sizeof(float));
+        }
+    }
+
+    // Audio side-inputs (Gemma-4 Conformer). One encoder per clip; aud_pe shared.
+    if (g.in.aud_pe && !plan.aud_clips.empty()) {
+        ggml_backend_tensor_set(g.in.aud_pe, plan.aud_pe.data(), 0,
+                                plan.aud_pe.size() * sizeof(float));
+        for (std::size_t c = 0; c < plan.aud_clips.size(); ++c) {
+            const auto& clip = plan.aud_clips[c];
+            ggml_backend_tensor_set(g.in.aud_features[c], clip.features.data(), 0,
+                                    clip.features.size() * sizeof(float));
+            ggml_backend_tensor_set(g.in.aud_win_mask[c], clip.win_mask.data(), 0,
+                                    clip.win_mask.size() * sizeof(float));
+            ggml_backend_tensor_set(g.in.aud_rows[c], clip.rows.data(), 0,
+                                    clip.rows.size() * sizeof(std::int64_t));
+        }
+    }
+
+    // mrope pos_input layouts (both are 4× wide). ggml_rope_multi reads, for a
+    // token i and axis-section s, pos[s * ne2 + i] where ne2 is the rope op's
+    // token count. Two consumers differ in that count:
+    //   * Qwen3-VL (graph_qwen3.cpp) ropes the WHOLE batch at once (ne2 = N), so
+    //     the layout is GLOBAL axis-major: [all t | all h | all w | all e]. The
+    //     per-token [t,h,w] come from plan.mrope_positions_i32 (image/video rows
+    //     carry spatial/temporal positions; text rows are [p,p,p]); the unused
+    //     4th axis (section 0) gets the 1-D position.
+    //   * Qwen 3.5/3.6 (graph_qwen3_5.cpp) ropes PER REQUEST (ne2 = n_tokens) on
+    //     a slice at qo_start*4, so the layout is PER-REQUEST axis-major and all
+    //     4 axes equal the token's text position (no spatial mrope).
     const std::int64_t pos_n_expected =
         static_cast<std::int64_t>(plan.positions_i32.size());
-    if (g.in.pos_input->ne[0] == pos_n_expected * 4) {
+    if (!plan.mrope_positions_i32.empty() &&
+        g.in.pos_input->ne[0] == pos_n_expected * 4) {
+        const std::size_t N = static_cast<std::size_t>(pos_n_expected);
+        std::vector<std::int32_t> mrope_pos(N * 4);
+        for (std::size_t i = 0; i < N; ++i) {
+            mrope_pos[0 * N + i] = plan.mrope_positions_i32[3 * i + 0];  // t
+            mrope_pos[1 * N + i] = plan.mrope_positions_i32[3 * i + 1];  // h
+            mrope_pos[2 * N + i] = plan.mrope_positions_i32[3 * i + 2];  // w
+            mrope_pos[3 * N + i] = plan.positions_i32[i];                // unused
+        }
+        ggml_backend_tensor_set(g.in.pos_input, mrope_pos.data(), 0,
+                                mrope_pos.size() * sizeof(std::int32_t));
+    } else if (g.in.pos_input->ne[0] == pos_n_expected * 4) {
         std::vector<std::int32_t> mrope_pos(
             static_cast<std::size_t>(pos_n_expected) * 4);
         std::size_t out_off = 0;

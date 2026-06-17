@@ -1,0 +1,65 @@
+---
+title: Media (multimodal)
+description: Splicing image, video, and audio spans into a forward pass
+sidebar_position: 3
+---
+
+# Media (multimodal)
+
+A forward pass accepts **encoded media spans** (images, video frames, audio clips) alongside ordinary tokens. The inferlet hands the host raw encoded bytes; the driver decodes them, runs the model's vision/audio encoder, and **scatters the projected embedding rows into the hidden state** at the positions you choose. Surrounding text attends to the span through the normal causal mask, so generation after a media span is ordinary text decoding. The API is **model-agnostic**: no model constants leak into inferlet code.
+
+Two layers sit over this, mirroring tokens vs. `Forward`:
+
+- **`Context::append_*`**: the high-level wrapper that splices a span at the context's current position and advances the cursor for you. Most inferlets use this; see [Multimodal generation](../model/multimodal) for the full guide and the supported-model matrix.
+- **`Forward::input_*`**: the per-pass builder, covered here. You pick the anchor position. Reach for it when you build passes directly: custom masks, scoring, or a hand-written decoder.
+
+## Encoding media
+
+Fetch the bytes and build a media handle. Decoding is synchronous and exposes layout metadata *before* any forward pass:
+
+```rust
+use inferlet::media::{Image, Audio, Video};
+
+let bytes = inferlet::http::fetch(&url).await?;
+let image = Image::from_bytes(&model, &bytes).map_err(|e| e.to_string())?;
+
+image.token_count();      // soft tokens the span occupies in the sequence
+image.grid();             // (t, h, w) merged-token layout
+image.position_span();    // sequence positions to advance past the span
+```
+
+`Audio::from_bytes(&model, &bytes)` and `Video::from_bytes(&model, &bytes, max_frames)` follow the same shape. For video, `max_frames` is your KV-budget knob: the host demuxes and uniformly samples up to that many frames, preprocessing each as an image span.
+
+## Splicing into a forward pass
+
+`Forward::input_image` / `input_audio` attach an encoded span at sequence position `anchor`. At `execute()`, the driver runs the encoder and overwrites `hidden[anchor .. anchor + token_count]` with the projected rows. Advance your position cursor by `position_span()` for whatever follows.
+
+| Method | What it does |
+|---|---|
+| `fwd.input_image(&image, anchor)` | Splice a visual span (image or video frame) at `anchor`. |
+| `fwd.input_audio(&audio, anchor)` | Splice an audio clip at `anchor`. |
+
+```rust
+let mut fwd = ctx.forward();
+let anchor = fwd.start_position();        // first free sequence position
+fwd.input_image(&image, anchor);          // driver encodes + scatters rows at execute()
+let out = fwd.execute().await?;
+```
+
+Spans are attached by reference and emitted in declaration order, so several can be spliced into one pass. The positions a span occupies are reserved like any other input; `Context::append_image` (below) does that bookkeeping for you, and at the raw level you manage pages through `ctx.inner()`.
+
+## The high-level wrapper
+
+`Context::append_image` is exactly `input_image` at the context's own position, plus the bookkeeping to reserve the span's pages and advance the cursor:
+
+```rust
+ctx.append_image(&image).await?;   // input_image(&image, ctx.seq_len), reserve, advance
+ctx.append_audio(&clip).await?;
+ctx.append_video(&video).await?;
+```
+
+Use these unless you specifically need to control the anchor.
+
+## Audio output
+
+Audio **output** (text-to-speech) is a separate generation path via `model.speak(text).speaker(id).generate()`, not a forward-pass input. See [Multimodal generation](../model/multimodal#audio-output-text-to-speech).

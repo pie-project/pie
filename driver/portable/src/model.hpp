@@ -22,6 +22,10 @@
 #include <ggml-alloc.h>
 #include <ggml-backend.h>
 
+#include "graph_vision_gemma4.hpp"
+#include "graph_audio_gemma4.hpp"
+#include "graph_csm.hpp"
+#include "graph_vision_qwen3vl.hpp"
 #include "hf_config.hpp"
 #include "safetensors.hpp"
 
@@ -183,6 +187,17 @@ struct ModelWeights {
     // for models that use plain θ-only RoPE.
     ggml_tensor* freq_factors = nullptr;
 
+    // ── Vision tower (multimodal; Qwen3-VL) ──
+    // `vision.present == false` for text-only models. Loaded by
+    // load_vision_tower_qwen3vl_() into the same ggml context.
+    Qwen3VLVisionWeights vision;
+    // ── Vision tower (multimodal; Gemma-4) ── loaded by load_vision_tower_gemma4_.
+    Gemma4VisionWeights gemma4_vision;
+    // ── Audio tower (multimodal; Gemma-4 Conformer) ── load_audio_tower_gemma4_.
+    Gemma4AudioWeights gemma4_audio;
+    // ── CSM-1B audio OUTPUT (TTS) ── loaded by build_csm_.
+    CsmWeights csm;
+
     // ── Gemma 4 ──
     // Proportional-RoPE freq_factors for full-attention layers. Shape
     // [head_dim_global/2] F32. Null on archs without proportional RoPE.
@@ -320,6 +335,18 @@ private:
     void build_dense_(LoaderSpec spec);
 
     void build_qwen3_();
+    void build_qwen3vl_();
+    // Declares the Qwen3-VL `model.visual.*` tower tensors into weights_.vision.
+    void load_vision_tower_qwen3vl_();
+    // Declares the Gemma-4 `model.vision_tower.*` tensors into
+    // weights_.gemma4_vision (+ reads the clipped-linear scalar bounds).
+    void load_vision_tower_gemma4_();
+    // Declares the Gemma-4 `model.audio_tower.*` Conformer tensors into
+    // weights_.gemma4_audio (+ reads the clipped-linear scalar bounds).
+    void load_audio_tower_gemma4_();
+    // Declares all CSM-1B tensors (backbone + depth decoder + Mimi codec) into
+    // weights_.csm. CSM has no text forward; it is driven via generate_audio.
+    void build_csm_();
     void build_qwen2_();
     void build_llama3_();
     void build_mistral3_();

@@ -420,6 +420,36 @@ and [TensorRT-LLM](/docs/reference/drivers/tensorrt-llm).
     </div>
   </div>
 
+  <div className="m-card delegate">
+
+    <h3 className="m-card-name">tensorrt-llm@1.2.1</h3>
+    <div className="m-card-desc">
+      Delegates forward pass execution to TensorRT-LLM. Check the Inferlet API <a href="/docs/reference/drivers/tensorrt-llm">capability</a>.
+    </div>
+    <div className="m-spec">
+      <div className="m-spec-row">
+        <span className="m-spec-label">Hardware</span>
+        <div className="m-chips">
+          <span className="m-chip">CUDA</span>
+        </div>
+      </div>
+      <div className="m-spec-row">
+        <span className="m-spec-label">Weights</span>
+        <div className="m-chips">
+          <span className="m-chip up">upstream</span>
+        </div>
+      </div>
+      <div className="m-spec-row">
+        <span className="m-spec-label">Parallel</span>
+        <div className="m-chips">
+          <span className="m-chip off">TP</span>
+          <span className="m-chip">DP</span>
+          <span className="m-chip off">PP</span>
+        </div>
+      </div>
+    </div>
+  </div>
+
 </div>
 
 ## Architecture support
@@ -440,12 +470,13 @@ and [TensorRT-LLM](/docs/reference/drivers/tensorrt-llm).
       <th className="c">portable</th>
       <th className="c">vllm</th>
       <th className="c">sglang</th>
+      <th className="c">trtllm</th>
       <th>Checkpoints</th>
     </tr>
   </thead>
   <tbody>
 
-    <tr className="m-group"><td colSpan={6}>Qwen</td></tr>
+    <tr className="m-group"><td colSpan={7}>Qwen</td></tr>
 
     <tr>
       <td>
@@ -456,6 +487,7 @@ and [TensorRT-LLM](/docs/reference/drivers/tensorrt-llm).
       <td className="c"><span className="m-pill yes">stable</span></td>
       <td className="c"><span className="m-pill up">upstream</span></td>
       <td className="c"><span className="m-pill up">upstream</span></td>
+      <td className="c"><span className="m-pill no">—</span></td>
       <td>
         <div className="m-sizes">
           <a className="m-size" href="https://huggingface.co/Qwen/Qwen2-0.5B">0.5B</a>
@@ -474,6 +506,7 @@ and [TensorRT-LLM](/docs/reference/drivers/tensorrt-llm).
       <td className="c"><span className="m-pill yes">stable</span></td>
       <td className="c"><span className="m-pill up">upstream</span></td>
       <td className="c"><span className="m-pill up">upstream</span></td>
+      <td className="c"><span className="m-pill no">—</span></td>
       <td>
         <div className="m-sizes">
           <a className="m-size" href="https://huggingface.co/Qwen/Qwen2.5-0.5B">0.5B</a>
@@ -493,6 +526,7 @@ and [TensorRT-LLM](/docs/reference/drivers/tensorrt-llm).
       </td>
       <td className="c"><span className="m-pill yes">stable</span></td>
       <td className="c"><span className="m-pill yes">stable</span></td>
+      <td className="c"><span className="m-pill up">upstream</span></td>
       <td className="c"><span className="m-pill up">upstream</span></td>
       <td className="c"><span className="m-pill up">upstream</span></td>
       <td>
@@ -515,6 +549,7 @@ and [TensorRT-LLM](/docs/reference/drivers/tensorrt-llm).
       <td className="c"><span className="m-pill partial">preview</span></td>
       <td className="c"><span className="m-pill up">upstream</span></td>
       <td className="c"><span className="m-pill up">upstream</span></td>
+      <td className="c"><span className="m-pill no">—</span></td>
       <td>
         <div className="m-sizes">
           <a className="m-size" href="https://huggingface.co/Qwen/Qwen3-30B-A3B-Base">30B-A3B</a>
@@ -530,6 +565,7 @@ and [TensorRT-LLM](/docs/reference/drivers/tensorrt-llm).
       <td className="c"><span className="m-pill yes">stable</span></td>
       <td className="c"><span className="m-pill partial">preview</span></td>
       <td className="c"><span className="m-pill no">—</span></td>
+      <td className="c"><span className="m-pill up">upstream</span></td>
       <td className="c"><span className="m-pill up">upstream</span></td>
       <td>
         <div className="m-sizes">
@@ -550,6 +586,7 @@ and [TensorRT-LLM](/docs/reference/drivers/tensorrt-llm).
       <td className="c"><span className="m-pill partial">preview</span></td>
       <td className="c"><span className="m-pill no">—</span></td>
       <td className="c"><span className="m-pill up">upstream</span></td>
+      <td className="c"><span className="m-pill no">—</span></td>
       <td>
         <div className="m-sizes">
           <a className="m-size" href="https://huggingface.co/Qwen/Qwen3.5-35B-A3B-Base">35B-A3B</a>
@@ -567,6 +604,7 @@ and [TensorRT-LLM](/docs/reference/drivers/tensorrt-llm).
       <td className="c"><span className="m-pill partial">preview</span></td>
       <td className="c"><span className="m-pill no">—</span></td>
       <td className="c"><span className="m-pill up">upstream</span></td>
+      <td className="c"><span className="m-pill up">upstream</span></td>
       <td>
         <div className="m-sizes">
           <a className="m-size" href="https://huggingface.co/Qwen/Qwen3.6-27B">27B</a>
@@ -582,6 +620,7 @@ and [TensorRT-LLM](/docs/reference/drivers/tensorrt-llm).
       <td className="c"><span className="m-pill partial">preview</span></td>
       <td className="c"><span className="m-pill no">—</span></td>
       <td className="c"><span className="m-pill up">upstream</span></td>
+      <td className="c"><span className="m-pill no">—</span></td>
       <td>
         <div className="m-sizes">
           <a className="m-size" href="https://huggingface.co/Qwen/Qwen3.6-35B-A3B">35B-A3B</a>
@@ -598,6 +637,7 @@ and [TensorRT-LLM](/docs/reference/drivers/tensorrt-llm).
       <td className="c"><span className="m-pill no">—</span></td>
       <td className="c"><span className="m-pill up">upstream</span></td>
       <td className="c"><span className="m-pill up">upstream</span></td>
+      <td className="c"><span className="m-pill no">—</span></td>
       <td>
         <div className="m-sizes">
           <a className="m-size" href="https://huggingface.co/Qwen/Qwen3-VL-2B-Instruct">2B</a>
@@ -605,7 +645,7 @@ and [TensorRT-LLM](/docs/reference/drivers/tensorrt-llm).
       </td>
     </tr>
 
-    <tr className="m-group"><td colSpan={6}>Llama</td></tr>
+    <tr className="m-group"><td colSpan={7}>Llama</td></tr>
 
     <tr>
       <td>
@@ -616,6 +656,7 @@ and [TensorRT-LLM](/docs/reference/drivers/tensorrt-llm).
       <td className="c"><span className="m-pill yes">stable</span></td>
       <td className="c"><span className="m-pill up">upstream</span></td>
       <td className="c"><span className="m-pill up">upstream</span></td>
+      <td className="c"><span className="m-pill no">—</span></td>
       <td>
         <div className="m-sizes">
           <a className="m-size" href="https://huggingface.co/meta-llama/Meta-Llama-3-8B">8B</a>
@@ -632,6 +673,7 @@ and [TensorRT-LLM](/docs/reference/drivers/tensorrt-llm).
       <td className="c"><span className="m-pill yes">stable</span></td>
       <td className="c"><span className="m-pill up">upstream</span></td>
       <td className="c"><span className="m-pill up">upstream</span></td>
+      <td className="c"><span className="m-pill no">—</span></td>
       <td>
         <div className="m-sizes">
           <a className="m-size" href="https://huggingface.co/meta-llama/Llama-3.1-8B">8B</a>
@@ -649,6 +691,7 @@ and [TensorRT-LLM](/docs/reference/drivers/tensorrt-llm).
       <td className="c"><span className="m-pill yes">stable</span></td>
       <td className="c"><span className="m-pill up">upstream</span></td>
       <td className="c"><span className="m-pill up">upstream</span></td>
+      <td className="c"><span className="m-pill no">—</span></td>
       <td>
         <div className="m-sizes">
           <a className="m-size" href="https://huggingface.co/meta-llama/Llama-3.2-1B">1B</a>
@@ -657,7 +700,7 @@ and [TensorRT-LLM](/docs/reference/drivers/tensorrt-llm).
       </td>
     </tr>
 
-    <tr className="m-group"><td colSpan={6}>Gemma</td></tr>
+    <tr className="m-group"><td colSpan={7}>Gemma</td></tr>
 
     <tr>
       <td>
@@ -668,6 +711,7 @@ and [TensorRT-LLM](/docs/reference/drivers/tensorrt-llm).
       <td className="c"><span className="m-pill yes">stable</span></td>
       <td className="c"><span className="m-pill up">upstream</span></td>
       <td className="c"><span className="m-pill up">upstream</span></td>
+      <td className="c"><span className="m-pill no">—</span></td>
       <td>
         <div className="m-sizes">
           <a className="m-size" href="https://huggingface.co/google/gemma-2-2b">2B</a>
@@ -685,6 +729,7 @@ and [TensorRT-LLM](/docs/reference/drivers/tensorrt-llm).
       <td className="c"><span className="m-pill yes">stable</span></td>
       <td className="c"><span className="m-pill up">upstream</span></td>
       <td className="c"><span className="m-pill up">upstream</span></td>
+      <td className="c"><span className="m-pill no">—</span></td>
       <td>
         <div className="m-sizes">
           <a className="m-size" href="https://huggingface.co/google/gemma-3-270m">270M</a>
@@ -704,6 +749,7 @@ and [TensorRT-LLM](/docs/reference/drivers/tensorrt-llm).
       <td className="c"><span className="m-pill yes">stable</span></td>
       <td className="c"><span className="m-pill up">upstream</span></td>
       <td className="c"><span className="m-pill up">upstream</span></td>
+      <td className="c"><span className="m-pill no">—</span></td>
       <td>
         <div className="m-sizes">
           <a className="m-size" href="https://huggingface.co/google/gemma-3n-E2B-it">E2B</a>
@@ -720,6 +766,7 @@ and [TensorRT-LLM](/docs/reference/drivers/tensorrt-llm).
       <td className="c"><span className="m-pill yes">stable</span></td>
       <td className="c"><span className="m-pill no">—</span></td>
       <td className="c"><span className="m-pill no">—</span></td>
+      <td className="c"><span className="m-pill up">upstream</span></td>
       <td>
         <div className="m-sizes">
           <a className="m-size" href="https://huggingface.co/google/gemma-4-31B">31B</a>
@@ -737,6 +784,7 @@ and [TensorRT-LLM](/docs/reference/drivers/tensorrt-llm).
       <td className="c"><span className="m-pill partial">preview</span></td>
       <td className="c"><span className="m-pill no">—</span></td>
       <td className="c"><span className="m-pill no">—</span></td>
+      <td className="c"><span className="m-pill no">—</span></td>
       <td>
         <div className="m-sizes">
           <a className="m-size" href="https://huggingface.co/google/gemma-4-26B-A4B">26B-A4B</a>
@@ -744,7 +792,7 @@ and [TensorRT-LLM](/docs/reference/drivers/tensorrt-llm).
       </td>
     </tr>
 
-    <tr className="m-group"><td colSpan={6}>GPT-OSS</td></tr>
+    <tr className="m-group"><td colSpan={7}>GPT-OSS</td></tr>
 
     <tr>
       <td>
@@ -755,6 +803,7 @@ and [TensorRT-LLM](/docs/reference/drivers/tensorrt-llm).
       <td className="c"><span className="m-pill partial">preview</span></td>
       <td className="c"><span className="m-pill up">upstream</span></td>
       <td className="c"><span className="m-pill up">upstream</span></td>
+      <td className="c"><span className="m-pill no">—</span></td>
       <td>
         <div className="m-sizes">
           <a className="m-size" href="https://huggingface.co/openai/gpt-oss-20b">20B</a>
@@ -763,7 +812,7 @@ and [TensorRT-LLM](/docs/reference/drivers/tensorrt-llm).
       </td>
     </tr>
 
-      <tr className="m-group"><td colSpan={6}>Mistral</td></tr>
+      <tr className="m-group"><td colSpan={7}>Mistral</td></tr>
 
     <tr>
       <td>
@@ -774,6 +823,7 @@ and [TensorRT-LLM](/docs/reference/drivers/tensorrt-llm).
       <td className="c"><span className="m-pill yes">stable</span></td>
       <td className="c"><span className="m-pill up">upstream</span></td>
       <td className="c"><span className="m-pill up">upstream</span></td>
+      <td className="c"><span className="m-pill no">—</span></td>
       <td>
         <div className="m-sizes">
           <a className="m-size" href="https://huggingface.co/mistralai/Mistral-7B-v0.3">7B v0.3</a>
@@ -789,6 +839,7 @@ and [TensorRT-LLM](/docs/reference/drivers/tensorrt-llm).
       <td className="c"><span className="m-pill yes">stable</span></td>
       <td className="c"><span className="m-pill no">—</span></td>
       <td className="c"><span className="m-pill up">upstream</span></td>
+      <td className="c"><span className="m-pill no">—</span></td>
       <td>
         <div className="m-sizes">
           <a className="m-size" href="https://huggingface.co/mistralai/Ministral-3-3B-Base-2512">3B</a>
@@ -806,6 +857,7 @@ and [TensorRT-LLM](/docs/reference/drivers/tensorrt-llm).
       <td className="c"><span className="m-pill yes">stable</span></td>
       <td className="c"><span className="m-pill up">upstream</span></td>
       <td className="c"><span className="m-pill up">upstream</span></td>
+      <td className="c"><span className="m-pill no">—</span></td>
       <td>
         <div className="m-sizes">
           <a className="m-size" href="https://huggingface.co/mistralai/Mistral-Small-24B-Base-2501">24B</a>
@@ -822,6 +874,7 @@ and [TensorRT-LLM](/docs/reference/drivers/tensorrt-llm).
       <td className="c"><span className="m-pill partial">preview</span></td>
       <td className="c"><span className="m-pill up">upstream</span></td>
       <td className="c"><span className="m-pill up">upstream</span></td>
+      <td className="c"><span className="m-pill no">—</span></td>
       <td>
         <div className="m-sizes">
           <a className="m-size" href="https://huggingface.co/mistralai/Mixtral-8x7B-v0.1">8x7B</a>
@@ -830,7 +883,7 @@ and [TensorRT-LLM](/docs/reference/drivers/tensorrt-llm).
       </td>
     </tr>
 
-    <tr className="m-group"><td colSpan={6}>Phi</td></tr>
+    <tr className="m-group"><td colSpan={7}>Phi</td></tr>
 
     <tr>
       <td>
@@ -841,6 +894,7 @@ and [TensorRT-LLM](/docs/reference/drivers/tensorrt-llm).
       <td className="c"><span className="m-pill yes">stable</span></td>
       <td className="c"><span className="m-pill up">upstream</span></td>
       <td className="c"><span className="m-pill up">upstream</span></td>
+      <td className="c"><span className="m-pill no">—</span></td>
       <td>
         <div className="m-sizes">
           <a className="m-size" href="https://huggingface.co/microsoft/Phi-3-mini-4k-instruct">mini 3.8B</a>
@@ -857,6 +911,7 @@ and [TensorRT-LLM](/docs/reference/drivers/tensorrt-llm).
       <td className="c"><span className="m-pill partial">preview</span></td>
       <td className="c"><span className="m-pill up">upstream</span></td>
       <td className="c"><span className="m-pill up">upstream</span></td>
+      <td className="c"><span className="m-pill no">—</span></td>
       <td>
         <div className="m-sizes">
           <a className="m-size" href="https://huggingface.co/microsoft/Phi-3-small-8k-instruct">small 7B</a>
@@ -872,6 +927,7 @@ and [TensorRT-LLM](/docs/reference/drivers/tensorrt-llm).
       <td className="c"><span className="m-pill yes">stable</span></td>
       <td className="c"><span className="m-pill up">upstream</span></td>
       <td className="c"><span className="m-pill up">upstream</span></td>
+      <td className="c"><span className="m-pill no">—</span></td>
       <td>
         <div className="m-sizes">
           <a className="m-size" href="https://huggingface.co/microsoft/Phi-3.5-mini-instruct">3.5 mini</a>
@@ -890,6 +946,7 @@ and [TensorRT-LLM](/docs/reference/drivers/tensorrt-llm).
       <td className="c"><span className="m-pill yes">stable</span></td>
       <td className="c"><span className="m-pill up">upstream</span></td>
       <td className="c"><span className="m-pill up">upstream</span></td>
+      <td className="c"><span className="m-pill no">—</span></td>
       <td>
         <div className="m-sizes">
           <a className="m-size" href="https://huggingface.co/microsoft/Phi-3.5-MoE-instruct">42B-A6.6B</a>
@@ -897,7 +954,7 @@ and [TensorRT-LLM](/docs/reference/drivers/tensorrt-llm).
       </td>
     </tr>
 
-    <tr className="m-group"><td colSpan={6}>OLMo</td></tr>
+    <tr className="m-group"><td colSpan={7}>OLMo</td></tr>
 
     <tr>
       <td>
@@ -908,6 +965,7 @@ and [TensorRT-LLM](/docs/reference/drivers/tensorrt-llm).
       <td className="c"><span className="m-pill yes">stable</span></td>
       <td className="c"><span className="m-pill up">upstream</span></td>
       <td className="c"><span className="m-pill up">upstream</span></td>
+      <td className="c"><span className="m-pill no">—</span></td>
       <td>
         <div className="m-sizes">
           <a className="m-size" href="https://huggingface.co/allenai/OLMo-2-0425-1B">1B</a>
@@ -926,6 +984,7 @@ and [TensorRT-LLM](/docs/reference/drivers/tensorrt-llm).
       <td className="c"><span className="m-pill yes">stable</span></td>
       <td className="c"><span className="m-pill up">upstream</span></td>
       <td className="c"><span className="m-pill up">upstream</span></td>
+      <td className="c"><span className="m-pill no">—</span></td>
       <td>
         <div className="m-sizes">
           <a className="m-size" href="https://huggingface.co/allenai/Olmo-3-1025-7B">7B</a>
@@ -935,27 +994,26 @@ and [TensorRT-LLM](/docs/reference/drivers/tensorrt-llm).
     </tr>
 
 
-    <tr className="m-group"><td colSpan={6}>GLM</td></tr>
+    <tr className="m-group"><td colSpan={7}>GLM</td></tr>
 
     <tr>
       <td>
-        <span className="m-arch-name">GLM 4.5 / 4.7</span>
+        <span className="m-arch-name">GLM-5.1</span>
         <span className="m-arch-sub">glm_moe_dsa</span>
       </td>
       <td className="c"><span className="m-pill partial">preview</span></td>
       <td className="c"><span className="m-pill no">—</span></td>
       <td className="c"><span className="m-pill up">upstream</span></td>
       <td className="c"><span className="m-pill up">upstream</span></td>
+      <td className="c"><span className="m-pill no">—</span></td>
       <td>
         <div className="m-sizes">
-          <a className="m-size" href="https://huggingface.co/zai-org/GLM-4.5-Air">4.5-Air</a>
-          <a className="m-size" href="https://huggingface.co/zai-org/GLM-4.5">4.5</a>
-          <a className="m-size" href="https://huggingface.co/zai-org/GLM-4.7-Flash">4.7-Flash</a>
+          <a className="m-size" href="https://huggingface.co/zai-org/GLM-5.1-FP8">5.1-FP8</a>
         </div>
       </td>
     </tr>
 
-    <tr className="m-group"><td colSpan={6}>Nemotron</td></tr>
+    <tr className="m-group"><td colSpan={7}>Nemotron</td></tr>
 
     <tr>
       <td>
@@ -963,6 +1021,7 @@ and [TensorRT-LLM](/docs/reference/drivers/tensorrt-llm).
         <span className="m-arch-sub">nemotron_h</span>
       </td>
       <td className="c"><span className="m-pill yes">stable</span></td>
+      <td className="c"><span className="m-pill no">—</span></td>
       <td className="c"><span className="m-pill no">—</span></td>
       <td className="c"><span className="m-pill no">—</span></td>
       <td className="c"><span className="m-pill no">—</span></td>
@@ -974,7 +1033,7 @@ and [TensorRT-LLM](/docs/reference/drivers/tensorrt-llm).
       </td>
     </tr>
 
-    <tr className="m-group"><td colSpan={6}>DeepSeek / Kimi</td></tr>
+    <tr className="m-group"><td colSpan={7}>DeepSeek / Kimi</td></tr>
 
     <tr>
       <td>
@@ -985,6 +1044,7 @@ and [TensorRT-LLM](/docs/reference/drivers/tensorrt-llm).
       <td className="c"><span className="m-pill no">—</span></td>
       <td className="c"><span className="m-pill up">upstream</span></td>
       <td className="c"><span className="m-pill up">upstream</span></td>
+      <td className="c"><span className="m-pill no">—</span></td>
       <td>
         <div className="m-sizes">
           <a className="m-size" href="https://huggingface.co/deepseek-ai/DeepSeek-V3">V3</a>
@@ -1003,6 +1063,7 @@ and [TensorRT-LLM](/docs/reference/drivers/tensorrt-llm).
       <td className="c"><span className="m-pill no">—</span></td>
       <td className="c"><span className="m-pill up">upstream</span></td>
       <td className="c"><span className="m-pill up">upstream</span></td>
+      <td className="c"><span className="m-pill no">—</span></td>
       <td>
         <div className="m-sizes">
           <a className="m-size" href="https://huggingface.co/moonshotai/Kimi-K2-Base">Base</a>
@@ -1011,7 +1072,7 @@ and [TensorRT-LLM](/docs/reference/drivers/tensorrt-llm).
       </td>
     </tr>
 
-    <tr className="m-group"><td colSpan={6}>Sesame</td></tr>
+    <tr className="m-group"><td colSpan={7}>Sesame</td></tr>
 
     <tr>
       <td>
@@ -1019,6 +1080,7 @@ and [TensorRT-LLM](/docs/reference/drivers/tensorrt-llm).
         <span className="m-arch-sub">csm</span>
       </td>
       <td className="c"><span className="m-pill partial">preview</span></td>
+      <td className="c"><span className="m-pill no">—</span></td>
       <td className="c"><span className="m-pill no">—</span></td>
       <td className="c"><span className="m-pill no">—</span></td>
       <td className="c"><span className="m-pill no">—</span></td>

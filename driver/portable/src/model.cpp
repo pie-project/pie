@@ -219,6 +219,12 @@ Model::Model(const std::filesystem::path& snapshot_dir,
     if (!backend_) {
         throw std::runtime_error("model: backend init failed");
     }
+    // Always announce the selected compute backend. If this says "CPU" on a
+    // machine with a GPU, the GPU backend failed to register (e.g. a static-lib
+    // build dead-stripped it) — surfacing it keeps "no silent CPU" honest.
+    std::cerr << "[model] compute backend: " << ggml_backend_name(backend_)
+              << (ggml_backend_is_cpu(backend_) ? "  (!! no GPU backend active)" : "")
+              << "\n";
 
     // Pin the CPU backend to a reasonable number of HW threads. ggml's
     // default is 4 (sometimes 1 depending on backend init path), which
@@ -365,6 +371,9 @@ Model::Model(const std::filesystem::path& snapshot_dir,
             case PieArch::Qwen3:
                 build_qwen3_();
                 break;
+            case PieArch::Qwen3VL:
+                build_qwen3vl_();
+                break;
             case PieArch::Qwen2:
                 build_qwen2_();
                 break;
@@ -413,6 +422,9 @@ Model::Model(const std::filesystem::path& snapshot_dir,
             case PieArch::GlmMoeDsa:
                 build_glm_moe_dsa_();
                 break;
+            case PieArch::Csm:
+                build_csm_();
+                break;
             default:
                 throw std::runtime_error(
                     "model: arch '" + std::string(pie_arch_name(hparams_.arch)) +
@@ -420,6 +432,28 @@ Model::Model(const std::filesystem::path& snapshot_dir,
         }
 
         load_into_backend_();
+
+        // Multimodal paths (Qwen3-VL / Gemma-4 vision, Gemma-4 audio input, CSM
+        // TTS) are validated on Metal and CPU only. They run on whatever backend
+        // ggml selects, but other GPU backends (notably Vulkan) have op-coverage
+        // gaps that surface as an opaque GGML_ABORT mid-encode rather than a
+        // clean error. Warn loudly so that failure mode is legible.
+        {
+            const bool is_multimodal = hparams_.vision_hidden_size > 0 ||
+                                       hparams_.audio_hidden_size > 0 ||
+                                       hparams_.arch == PieArch::Csm;
+            // ggml names the Metal backend "MTL0" (device id), not "Metal".
+            const std::string bname = ggml_backend_name(backend_);
+            const bool is_metal = bname.find("Metal") != std::string::npos ||
+                                  bname.find("MTL") != std::string::npos;
+            const bool metal_or_cpu = ggml_backend_is_cpu(backend_) || is_metal;
+            if (is_multimodal && !metal_or_cpu) {
+                std::cerr << "[model] WARNING: multimodal (vision/audio) on "
+                             "backend '" << bname << "' is unvalidated — only "
+                             "Metal and CPU are tested. Unsupported-op aborts are "
+                             "possible on this backend.\n";
+            }
+        }
     } catch (...) {
         if (buf_) {
             ggml_backend_buffer_free(buf_);
@@ -460,14 +494,16 @@ void Model::resolve_tensor_prefix_() {
         case PieArch::Gemma4:
         case PieArch::Gemma3n:
         case PieArch::Qwen3_5:
-            // Gemma 4 / 3n and Qwen 3.5 / 3.6 ship as multimodal
+        case PieArch::Qwen3VL:
+            // Gemma 4 / 3n, Qwen 3.5 / 3.6, and Qwen3-VL ship as multimodal
             // ForConditionalGeneration wrappers whose safetensors nest the
-            // text decoder under `model.language_model.`. A GGUF, however,
-            // is always the flattened text model (llama.cpp drops the
-            // wrapper, e.g. `token_embd` -> `model.embed_tokens.weight`), so
-            // only apply the wrapper prefix when the canonical name is
-            // absent and the wrapped name is present — same archive-driven
-            // detection the Gemma 3 / Mistral 3 cases use below.
+            // text decoder under `model.language_model.` (vision tower under
+            // `model.visual.`). A GGUF, however, is always the flattened text
+            // model (llama.cpp drops the wrapper, e.g. `token_embd` ->
+            // `model.embed_tokens.weight`), so only apply the wrapper prefix
+            // when the canonical name is absent and the wrapped name is
+            // present — same archive-driven detection the Gemma 3 / Mistral 3
+            // cases use below.
             if (archive_->find("model.embed_tokens.weight") == nullptr &&
                 archive_->find("model.language_model.embed_tokens.weight") != nullptr) {
                 tensor_prefix_ = "model.language_model.";
@@ -515,9 +551,22 @@ ggml_tensor* Model::declare_(const std::string& hf_name) {
     // mul_mat path is ~2x slower than BF16 on tensor-core hardware and
     // doubles VRAM. Downcast large matmul weights at load time, matching
     // llama.cpp's GGUF default. Norms / biases stay F32 (precision).
+    // PIE_PORTABLE_KEEP_F32 keeps F32 source weights in F32 (no bf16 downcast).
+    // CSM keeps F32 unconditionally: its 31-step sequential RVQ depth decode is
+    // precision-critical — bf16 weights flip near-tie argmaxes and the error
+    // compounds, drifting the audio codes off the reference. The model is tiny,
+    // so the f32 memory/compute cost is negligible. With f32 the codes are
+    // bit-exact vs the HF reference (and CUDA).
+    // CSM keeps the WHOLE model in f32 (not just the depth decoder): the bf16
+    // backbone's KV-cache rounding error accumulates across frames and eventually
+    // perturbs `bbh`/cb0, flipping a depth-codebook argmax by frame ~2 — measured.
+    // Depth-only f32 holds for frames 0-1 then drifts; full f32 is bit-exact.
+    static const bool keep_f32_env = std::getenv("PIE_PORTABLE_KEEP_F32") != nullptr;
+    const bool keep_f32 = keep_f32_env || hparams_.arch == PieArch::Csm;
     const bool downcast = !gguf_typed
                        && t.dtype == StDtype::F32
-                       && !is_small_weight_for_upcast(hf_name);
+                       && !is_small_weight_for_upcast(hf_name)
+                       && !keep_f32;
     const bool fp8_decode = !gguf_typed && t.dtype == StDtype::F8_E4M3;
     if (!gguf_typed && t.dtype == StDtype::F8_E5M2) {
         throw std::runtime_error(
@@ -960,6 +1009,323 @@ void Model::build_dense_(LoaderSpec spec) {
 }
 
 void Model::build_qwen3_() { build_dense_({.has_qk_norm = true}); }
+
+void Model::build_qwen3vl_() {
+    // Text decoder is plain Qwen3 (q/k norm), loaded under the
+    // `model.language_model.` prefix set in resolve_tensor_prefix_().
+    build_dense_({.has_qk_norm = true});
+    // Vision tower (`model.visual.*`), gated on the parsed vision_config.
+    if (hparams_.vision_hidden_size > 0) {
+        load_vision_tower_qwen3vl_();
+    }
+}
+
+void Model::load_vision_tower_qwen3vl_() {
+    auto& V = weights_.vision;
+    const auto& h = hparams_;
+    const std::int32_t hidden = h.vision_hidden_size;
+    // Conv3d patch front-end flattened to a matmul:
+    //   in = in_channels * temporal_patch * patch * patch  (= 3*2*16*16 = 1536)
+    const std::int32_t patch_dim = h.vision_in_channels *
+        h.vision_temporal_patch_size * h.vision_patch_size * h.vision_patch_size;
+    auto dec = [&](const std::string& name) { return declare_(name); };
+
+    // patch_embed.proj is stored 5-D [out, in_ch, t, p, p]; declare it as the
+    // equivalent 2-D matmul [patch_dim, hidden] (byte-identical, row-major).
+    V.patch.w = declare_slice_("model.visual.patch_embed.proj.weight",
+                               "vis.patch_embed.proj.w", patch_dim, hidden, 0,
+                               GGML_TYPE_BF16);
+    V.patch.b = dec("model.visual.patch_embed.proj.bias");
+    V.pos_embed = dec("model.visual.pos_embed.weight");  // ggml [hidden, num_pos]
+
+    V.blocks.resize(static_cast<std::size_t>(h.vision_num_layers));
+    for (std::int32_t i = 0; i < h.vision_num_layers; ++i) {
+        const std::string p = "model.visual.blocks." + std::to_string(i) + ".";
+        auto& b = V.blocks[static_cast<std::size_t>(i)];
+        b.norm1.g = dec(p + "norm1.weight"); b.norm1.b = dec(p + "norm1.bias");
+        b.norm2.g = dec(p + "norm2.weight"); b.norm2.b = dec(p + "norm2.bias");
+        b.qkv.w   = dec(p + "attn.qkv.weight");  b.qkv.b = dec(p + "attn.qkv.bias");
+        b.o.w     = dec(p + "attn.proj.weight"); b.o.b   = dec(p + "attn.proj.bias");
+        b.fc1.w   = dec(p + "mlp.linear_fc1.weight"); b.fc1.b = dec(p + "mlp.linear_fc1.bias");
+        b.fc2.w   = dec(p + "mlp.linear_fc2.weight"); b.fc2.b = dec(p + "mlp.linear_fc2.bias");
+    }
+
+    // Main merger: norm over hidden (pre-shuffle).
+    V.merger.is_postshuffle = false;
+    V.merger.norm.g = dec("model.visual.merger.norm.weight");
+    V.merger.norm.b = dec("model.visual.merger.norm.bias");
+    V.merger.fc1.w  = dec("model.visual.merger.linear_fc1.weight");
+    V.merger.fc1.b  = dec("model.visual.merger.linear_fc1.bias");
+    V.merger.fc2.w  = dec("model.visual.merger.linear_fc2.weight");
+    V.merger.fc2.b  = dec("model.visual.merger.linear_fc2.bias");
+
+    // Deepstack mergers: norm over 4*hidden (post-shuffle).
+    V.deepstack.resize(static_cast<std::size_t>(h.vision_num_deepstack));
+    for (std::int32_t k = 0; k < h.vision_num_deepstack; ++k) {
+        const std::string p =
+            "model.visual.deepstack_merger_list." + std::to_string(k) + ".";
+        auto& m = V.deepstack[static_cast<std::size_t>(k)];
+        m.is_postshuffle = true;
+        m.norm.g = dec(p + "norm.weight"); m.norm.b = dec(p + "norm.bias");
+        m.fc1.w  = dec(p + "linear_fc1.weight"); m.fc1.b = dec(p + "linear_fc1.bias");
+        m.fc2.w  = dec(p + "linear_fc2.weight"); m.fc2.b = dec(p + "linear_fc2.bias");
+    }
+    V.present = true;
+}
+
+void Model::load_vision_tower_gemma4_() {
+    auto& V = weights_.gemma4_vision;
+    const auto& h = hparams_;
+    auto dec = [&](const std::string& n) { return declare_(n); };
+
+    // Read a scalar (`[]`-shape) clip bound from the archive as a float.
+    auto read_scalar = [&](const std::string& n) -> std::optional<float> {
+        const StTensor* t = archive_->find(n);
+        if (t == nullptr || t->data == nullptr || t->nbytes == 0) return std::nullopt;
+        switch (t->dtype) {
+            case StDtype::F32:
+                return *reinterpret_cast<const float*>(t->data);
+            case StDtype::F16:
+                return ggml_fp16_to_fp32(
+                    *reinterpret_cast<const std::uint16_t*>(t->data));
+            case StDtype::BF16:
+                return ggml_bf16_to_fp32(
+                    *reinterpret_cast<const ggml_bf16_t*>(t->data));
+            default:
+                return std::nullopt;
+        }
+    };
+    // Declare `<base>.linear.weight` and fold its clamp bounds into `cl`.
+    auto clip = [&](G4VisClipLinear& cl, const std::string& base) {
+        cl.w = dec(base + ".linear.weight");
+        auto imin = read_scalar(base + ".input_min");
+        auto imax = read_scalar(base + ".input_max");
+        auto omin = read_scalar(base + ".output_min");
+        auto omax = read_scalar(base + ".output_max");
+        if (imin && imax) { cl.imin = *imin; cl.imax = *imax; cl.has_in = true; }
+        if (omin && omax) { cl.omin = *omin; cl.omax = *omax; cl.has_out = true; }
+    };
+
+    V.patch_w   = dec("model.vision_tower.patch_embedder.input_proj.weight");
+    V.pos_table = dec("model.vision_tower.patch_embedder.position_embedding_table");
+    V.embed_proj = dec("model.embed_vision.embedding_projection.weight");
+
+    V.layers.resize(static_cast<std::size_t>(h.vision_num_layers));
+    for (std::int32_t i = 0; i < h.vision_num_layers; ++i) {
+        const std::string p =
+            "model.vision_tower.encoder.layers." + std::to_string(i) + ".";
+        auto& L = V.layers[static_cast<std::size_t>(i)];
+        L.in_ln        = dec(p + "input_layernorm.weight");
+        L.post_attn_ln = dec(p + "post_attention_layernorm.weight");
+        L.pre_ff_ln    = dec(p + "pre_feedforward_layernorm.weight");
+        L.post_ff_ln   = dec(p + "post_feedforward_layernorm.weight");
+        // Clipped (QK-clip) linears: weight + scalar clamp bounds. The clamps
+        // are load-bearing on Gemma-4 vision (they keep bf16 activations from
+        // overflowing); disabling them garbles the encoder output.
+        clip(L.q, p + "self_attn.q_proj");
+        clip(L.k, p + "self_attn.k_proj");
+        clip(L.v, p + "self_attn.v_proj");
+        clip(L.o, p + "self_attn.o_proj");
+        L.q_norm = dec(p + "self_attn.q_norm.weight");
+        L.k_norm = dec(p + "self_attn.k_norm.weight");
+        clip(L.gate, p + "mlp.gate_proj");
+        clip(L.up,   p + "mlp.up_proj");
+        clip(L.down, p + "mlp.down_proj");
+    }
+    V.present = true;
+}
+
+void Model::load_audio_tower_gemma4_() {
+    auto& A = weights_.gemma4_audio;
+    const auto& h = hparams_;
+    auto dec = [&](const std::string& n) { return declare_(n); };
+
+    // Read a scalar (`[]`-shape) clip bound from the archive as a float.
+    auto read_scalar = [&](const std::string& n) -> std::optional<float> {
+        const StTensor* t = archive_->find(n);
+        if (t == nullptr || t->data == nullptr || t->nbytes == 0) return std::nullopt;
+        switch (t->dtype) {
+            case StDtype::F32:
+                return *reinterpret_cast<const float*>(t->data);
+            case StDtype::F16:
+                return ggml_fp16_to_fp32(
+                    *reinterpret_cast<const std::uint16_t*>(t->data));
+            case StDtype::BF16:
+                return ggml_bf16_to_fp32(
+                    *reinterpret_cast<const ggml_bf16_t*>(t->data));
+            default:
+                return std::nullopt;
+        }
+    };
+    auto clip = [&](G4AudClipLinear& cl, const std::string& base) {
+        cl.w = dec(base + ".linear.weight");
+        auto imin = read_scalar(base + ".input_min");
+        auto imax = read_scalar(base + ".input_max");
+        auto omin = read_scalar(base + ".output_min");
+        auto omax = read_scalar(base + ".output_max");
+        if (imin && imax) { cl.imin = *imin; cl.imax = *imax; cl.has_in = true; }
+        if (omin && omax) { cl.omin = *omin; cl.omax = *omax; cl.has_out = true; }
+    };
+
+    const std::string ap = "model.audio_tower.";
+    A.sscp0_conv = dec(ap + "subsample_conv_projection.layer0.conv.weight");
+    A.sscp0_norm = dec(ap + "subsample_conv_projection.layer0.norm.weight");
+    A.sscp1_conv = dec(ap + "subsample_conv_projection.layer1.conv.weight");
+    A.sscp1_norm = dec(ap + "subsample_conv_projection.layer1.norm.weight");
+    A.sscp_input_proj = dec(ap + "subsample_conv_projection.input_proj_linear.weight");
+    A.output_proj_w = dec(ap + "output_proj.weight");
+    A.output_proj_b = dec(ap + "output_proj.bias");
+    A.embed_proj    = dec("model.embed_audio.embedding_projection.weight");
+
+    auto ffn = [&](G4AudFfn& f, const std::string& base) {
+        f.pre_ln  = dec(base + ".pre_layer_norm.weight");
+        f.post_ln = dec(base + ".post_layer_norm.weight");
+        clip(f.fc1, base + ".ffw_layer_1");
+        clip(f.fc2, base + ".ffw_layer_2");
+    };
+
+    A.layers.resize(static_cast<std::size_t>(h.audio_num_layers));
+    for (std::int32_t i = 0; i < h.audio_num_layers; ++i) {
+        const std::string p = ap + "layers." + std::to_string(i) + ".";
+        auto& L = A.layers[static_cast<std::size_t>(i)];
+        ffn(L.ff1, p + "feed_forward1");
+        ffn(L.ff2, p + "feed_forward2");
+        L.norm_pre_attn  = dec(p + "norm_pre_attn.weight");
+        L.norm_post_attn = dec(p + "norm_post_attn.weight");
+        L.norm_out       = dec(p + "norm_out.weight");
+        clip(L.q,    p + "self_attn.q_proj");
+        clip(L.k,    p + "self_attn.k_proj");
+        clip(L.v,    p + "self_attn.v_proj");
+        clip(L.post, p + "self_attn.post");
+        L.relative_k    = dec(p + "self_attn.relative_k_proj.weight");
+        L.per_dim_scale = dec(p + "self_attn.per_dim_scale");
+        L.lconv_pre_ln   = dec(p + "lconv1d.pre_layer_norm.weight");
+        L.lconv_conv_norm = dec(p + "lconv1d.conv_norm.weight");
+        clip(L.lconv_start, p + "lconv1d.linear_start");
+        clip(L.lconv_end,   p + "lconv1d.linear_end");
+        L.depthwise_conv = dec(p + "lconv1d.depthwise_conv1d.weight");
+    }
+    A.present = true;
+}
+
+void Model::build_csm_() {
+    // Declare-only loader for CSM-1B (root-level tensor names, no prefix). The
+    // generation loop (P4.3+) reads these structs; there is no text forward.
+    auto& C = weights_.csm;
+    const auto& h = hparams_;
+    if (!h.csm.has_value()) {
+        throw std::runtime_error("build_csm_: hparams.csm not populated");
+    }
+    const auto& cc = *h.csm;
+    auto dec = [&](const std::string& n) { return declare_(n); };
+    auto dec_layer = [&](CsmDecLayer& L, const std::string& p) {
+        L.in_ln   = dec(p + "input_layernorm.weight");
+        L.post_ln = dec(p + "post_attention_layernorm.weight");
+        L.q = dec(p + "self_attn.q_proj.weight");
+        L.k = dec(p + "self_attn.k_proj.weight");
+        L.v = dec(p + "self_attn.v_proj.weight");
+        L.o = dec(p + "self_attn.o_proj.weight");
+        L.gate = dec(p + "mlp.gate_proj.weight");
+        L.up   = dec(p + "mlp.up_proj.weight");
+        L.down = dec(p + "mlp.down_proj.weight");
+    };
+
+    // ── Backbone (Llama-3.2-1B) ──
+    C.embed_text  = dec("embed_text_tokens.weight");
+    C.embed_audio = dec("backbone_model.embed_tokens.embed_audio_tokens.weight");
+    C.bb_norm     = dec("backbone_model.norm.weight");
+    C.lm_head     = dec("lm_head.weight");
+    C.backbone_layers.resize(static_cast<std::size_t>(h.num_hidden_layers));
+    for (std::int32_t i = 0; i < h.num_hidden_layers; ++i) {
+        dec_layer(C.backbone_layers[static_cast<std::size_t>(i)],
+                  "backbone_model.layers." + std::to_string(i) + ".");
+    }
+
+    // ── Depth decoder ──
+    C.depth_embed_tokens = dec("depth_decoder.model.embed_tokens.weight");
+    C.depth_inputs_proj  = dec("depth_decoder.model.inputs_embeds_projector.weight");
+    C.depth_norm         = dec("depth_decoder.model.norm.weight");
+    C.depth_codebooks_head = dec("depth_decoder.codebooks_head.weight");
+    C.depth_layers.resize(static_cast<std::size_t>(cc.depth.num_hidden_layers));
+    for (std::int32_t i = 0; i < cc.depth.num_hidden_layers; ++i) {
+        dec_layer(C.depth_layers[static_cast<std::size_t>(i)],
+                  "depth_decoder.model.layers." + std::to_string(i) + ".");
+    }
+
+    // ── Mimi codec ──
+    auto conv = [&](CsmConv& cw, const std::string& base, int stride, int dil,
+                    int groups) {
+        cw.weight = dec(base + ".weight");
+        cw.bias   = dec(base + ".bias");
+        cw.stride = stride; cw.dilation = dil; cw.groups = groups;
+    };
+
+    // RVQ codebooks: declare embed_sum + cluster_usage per quantizer (resolved
+    // to embeddings at graph time). Index 0 = semantic, 1.. = acoustic.
+    const std::int32_t NCB = cc.codec.num_quantizers;
+    C.codebook_embed_sum.resize(static_cast<std::size_t>(NCB));
+    C.codebook_cluster_usage.resize(static_cast<std::size_t>(NCB));
+    auto rvq = [&](std::int32_t i, const std::string& base) {
+        C.codebook_embed_sum[static_cast<std::size_t>(i)]    = dec(base + ".embed_sum");
+        C.codebook_cluster_usage[static_cast<std::size_t>(i)] = dec(base + ".cluster_usage");
+    };
+    rvq(0, "codec_model.quantizer.semantic_residual_vector_quantizer.layers.0.codebook");
+    for (std::int32_t i = 1; i < NCB; ++i) {
+        rvq(i, "codec_model.quantizer.acoustic_residual_vector_quantizer.layers." +
+                   std::to_string(i - 1) + ".codebook");
+    }
+    C.semantic_output_proj =
+        dec("codec_model.quantizer.semantic_residual_vector_quantizer.output_proj.weight");
+    C.acoustic_output_proj =
+        dec("codec_model.quantizer.acoustic_residual_vector_quantizer.output_proj.weight");
+
+    // upsample ConvTranspose1d (groups = upsample_groups, stride 2, no bias).
+    C.upsample.weight = dec("codec_model.upsample.conv.weight");
+    C.upsample.bias   = nullptr;
+    C.upsample.stride = 2;
+    C.upsample.groups = cc.codec.upsample_groups;
+
+    // decoder_transformer (8 layers).
+    C.xf_layers.resize(static_cast<std::size_t>(cc.codec.xf_num_hidden_layers));
+    for (std::int32_t l = 0; l < cc.codec.xf_num_hidden_layers; ++l) {
+        const std::string p =
+            "codec_model.decoder_transformer.layers." + std::to_string(l) + ".";
+        auto& L = C.xf_layers[static_cast<std::size_t>(l)];
+        L.in_ln_w = dec(p + "input_layernorm.weight");
+        L.in_ln_b = dec(p + "input_layernorm.bias");
+        L.q = dec(p + "self_attn.q_proj.weight");
+        L.k = dec(p + "self_attn.k_proj.weight");
+        L.v = dec(p + "self_attn.v_proj.weight");
+        L.o = dec(p + "self_attn.o_proj.weight");
+        L.attn_scale = dec(p + "self_attn_layer_scale.scale");
+        L.post_ln_w = dec(p + "post_attention_layernorm.weight");
+        L.post_ln_b = dec(p + "post_attention_layernorm.bias");
+        L.fc1 = dec(p + "mlp.fc1.weight");
+        L.fc2 = dec(p + "mlp.fc2.weight");
+        L.mlp_scale = dec(p + "mlp_layer_scale.scale");
+    }
+
+    // SEANet decoder. layer indices in codec_model.decoder.layers:
+    //   0: Conv1d k7 512->1024; {2,5,8,11}: ConvTranspose1d upsamplers;
+    //   {3,6,9,12}: Resnet blocks; 14: Conv1d k3 64->1.
+    conv(C.seanet_in, "codec_model.decoder.layers.0.conv", 1, 1, 1);
+    const int stage_idx[4] = {2, 5, 8, 11};
+    C.seanet_stages.resize(4);
+    for (int si = 0; si < 4; ++si) {
+        auto& st = C.seanet_stages[static_cast<std::size_t>(si)];
+        const int idx = stage_idx[si];
+        st.convtr.weight = dec("codec_model.decoder.layers." + std::to_string(idx) + ".conv.weight");
+        st.convtr.bias   = dec("codec_model.decoder.layers." + std::to_string(idx) + ".conv.bias");
+        st.convtr.stride = cc.codec.upsampling_ratios[static_cast<std::size_t>(si)];
+        st.convtr.groups = 1;
+        const int rb = idx + 1;  // resnet block layer index
+        conv(st.resnet_conv1, "codec_model.decoder.layers." + std::to_string(rb) + ".block.1.conv", 1, 1, 1);
+        conv(st.resnet_conv2, "codec_model.decoder.layers." + std::to_string(rb) + ".block.3.conv", 1, 1, 1);
+    }
+    conv(C.seanet_out, "codec_model.decoder.layers.14.conv", 1, 1, 1);
+
+    C.present = true;
+}
 
 void Model::build_qwen2_() { build_dense_({.has_qkv_bias = true}); }
 
@@ -1456,6 +1822,24 @@ void Model::build_gemma4_() {
     }
     // tensor_prefix_ ("model.language_model.") is set up in
     // resolve_tensor_prefix_().
+
+    // Multimodal: Gemma-4 vision tower (`model.vision_tower.*`), gated on the
+    // parsed vision_config. Declared alongside the text decoder; the loader
+    // maps by name so declare order is irrelevant.
+    if (h.vision_hidden_size > 0 &&
+        archive_->find("model.vision_tower.patch_embedder.input_proj.weight")
+            != nullptr) {
+        load_vision_tower_gemma4_();
+    }
+
+    // Multimodal: Gemma-4 audio tower (`model.audio_tower.*`), gated on the
+    // parsed audio_config. Same name-mapped declare-only loading as vision.
+    if (h.audio_hidden_size > 0 &&
+        archive_->find(
+            "model.audio_tower.subsample_conv_projection.layer0.conv.weight")
+            != nullptr) {
+        load_audio_tower_gemma4_();
+    }
 
     // ----- proportional-RoPE freq_factors (full layers only) -----
     // partial_factor < 1 means proportional RoPE: rotate first

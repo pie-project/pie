@@ -47,7 +47,19 @@ fn lower_contract(
     let (mut current, mut current_decl) =
         lower_contract_source(metadata, graph, contract, plan, contract_values, output_id)?;
     let metadata_values = lower_metadata_sources(metadata, contract, plan)?;
-    if current_decl.shape != contract.shape {
+    // Shapes must match for an identity load. Leading singleton dims are a
+    // no-op for the byte layout (same numel, same row-major order), but ggml's
+    // ne array can't preserve a leading-1 source dim (it becomes a trailing ggml
+    // dim and is trimmed) — e.g. a Conv1d weight [1, C, K] (out_channels=1)
+    // declares as runtime shape [C, K]. Treat shapes equal-after-stripping-
+    // leading-ones as a match so such conv weights load.
+    let strip_leading_ones = |s: &[i64]| -> Vec<i64> {
+        let first = s.iter().position(|&d| d != 1).unwrap_or(s.len());
+        s[first..].to_vec()
+    };
+    if current_decl.shape != contract.shape
+        && strip_leading_ones(&current_decl.shape) != strip_leading_ones(&contract.shape)
+    {
         return Err(CompileError::InvalidInput(format!(
             "runtime tensor '{}' shape {:?} does not match source shape {:?}",
             contract.output_name, contract.shape, current_decl.shape

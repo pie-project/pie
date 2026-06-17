@@ -112,13 +112,13 @@ function Save-Url($Url, $OutFile) {
 function Get-AssetName($Flavor) {
     switch ($Flavor.ToLowerInvariant()) {
         { $_ -in @("portable", "vulkan", "portable-vulkan") } {
-            return "pie-x86_64-windows-portable-vulkan.zip"
+            return "pie-x86_64-windows-vulkan.zip"
         }
         { $_ -in @("cuda", "portable-cuda") } {
-            return "pie-x86_64-windows-portable-cuda.zip"
+            return "pie-x86_64-windows-cuda.zip"
         }
         default {
-            Stop-WithError "no '$Flavor' build for windows/x86_64. Valid flavors: portable-vulkan, portable-cuda."
+            Stop-WithError "no '$Flavor' build for windows/x86_64. Valid flavors: vulkan, cuda."
         }
     }
 }

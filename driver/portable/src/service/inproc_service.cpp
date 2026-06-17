@@ -9,12 +9,16 @@
 #include <string>
 #include <vector>
 
+#include <fstream>
+
 #include <ggml.h>
 #include <ggml-backend.h>
+#include <nlohmann/json.hpp>
 #include <pie_bridge/inproc_server.hpp>
 
 #include "adapter.hpp"
 #include "executor/executor.hpp"
+#include "graph_csm_gen.hpp"
 #include "host_swap_pool.hpp"
 #include "kv_cache.hpp"
 #include "model.hpp"
@@ -256,6 +260,57 @@ void InProcService::serve_forever(pie_driver::InProcServer& server) {
                     // training are not implemented in portable.
                     out.status = 0;
                     break;
+                case pie_driver::PIE_METHOD_GENERATE_AUDIO: {
+                    // CSM native audio output (pie:core/audio-out). adapter_path
+                    // carries JSON {prompt:[u32...], max_frames, out_path}; run
+                    // the full CSM generation, write raw little-endian f32 PCM to
+                    // out_path, and return status = n_frames (or -1 on error).
+                    try {
+                        if (!model_.weights().csm.present) {
+                            std::cerr << "[pie-driver-portable] generate_audio: "
+                                         "model is not CSM (no audio output)\n";
+                            out.status = -1;
+                            break;
+                        }
+                        const auto bytes = req.adapter_path.as<char>();
+                        auto j = nlohmann::json::parse(
+                            std::string(bytes.data(), bytes.size()));
+                        std::vector<std::int32_t> prompt;
+                        for (const auto& t : j.at("prompt")) {
+                            prompt.push_back(static_cast<std::int32_t>(
+                                t.get<std::int64_t>()));
+                        }
+                        const int max_frames = j.value("max_frames", 256);
+                        const std::string out_path =
+                            j.at("out_path").get<std::string>();
+
+                        std::vector<float> pcm;
+                        const int n_frames = csm_generate_audio(
+                            model_, prompt.data(),
+                            static_cast<int>(prompt.size()), max_frames, pcm,
+                            nullptr);
+
+                        std::ofstream f(out_path,
+                                        std::ios::binary | std::ios::trunc);
+                        if (!f) {
+                            std::cerr << "[pie-driver-portable] generate_audio: "
+                                         "cannot open out_path '" << out_path
+                                      << "'\n";
+                            out.status = -1;
+                            break;
+                        }
+                        f.write(reinterpret_cast<const char*>(pcm.data()),
+                                static_cast<std::streamsize>(pcm.size() *
+                                                             sizeof(float)));
+                        f.close();
+                        out.status = n_frames;
+                    } catch (const std::exception& e) {
+                        std::cerr << "[pie-driver-portable] generate_audio: "
+                                  << e.what() << "\n";
+                        out.status = -1;
+                    }
+                    break;
+                }
                 default:
                     std::cerr << "[pie-driver-portable] unknown method "
                               << req.method << "\n";

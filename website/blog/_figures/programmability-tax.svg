@@ -1,0 +1,81 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 720 322" width="720" height="322" role="img" aria-labelledby="ptax-title ptax-desc">
+  <title id="ptax-title">Anatomy of the programmability tax</title>
+  <desc id="ptax-desc">A swimlane diagram with three lanes: Inferlet, Runtime, and Driver. The inferlet's execute() call drops into the Runtime lane and flows through a WASI check (40 microseconds), the inference actor queue (150 microseconds, the dominant cost), and the batch scheduler (50 microseconds). The batch scheduler drops into the Driver lane for driver IPC (40 microseconds), which runs the GPU forward pass. The GPU execution then returns up to the event dispatcher (40 microseconds), which delivers the output back to the original execute() call along a curved path. The five overhead stages are about 320 microseconds of tax. The GPU forward pass is the real work and runs 5 to 8 milliseconds.</desc>
+
+  <defs>
+    <marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 Z" fill="#54473b"/>
+    </marker>
+  </defs>
+
+  <style>
+    text  { font-family: 'IBM Plex Serif', Charter, Georgia, serif; font-size: 13px; }
+    .mono { font-family: 'IBM Plex Mono', ui-monospace, SFMono-Regular, Menlo, monospace; }
+    .ink   { fill: #2c2722; }
+    .sub   { fill: #54473b; }
+    .muted { fill: #7a6a55; font-style: italic; }
+    .acc   { fill: #8f442d; }
+  </style>
+
+  <!-- Title -->
+  <text class="ink"   x="24" y="24">Anatomy of the programmability tax</text>
+  <text class="muted" x="24" y="42">under load: 512 concurrent inferlets</text>
+
+  <!-- Curvy return: event delivers output back to execute() -->
+  <path d="M 588 138 C 588 84, 300 72, 234 92" fill="none" stroke="#54473b" stroke-width="1.5" stroke-linecap="round" marker-end="url(#ah)"/>
+  <text class="muted" x="404" y="75" text-anchor="middle">delivers output</text>
+
+  <!-- Swimlanes -->
+  <rect x="24" y="58" width="672" height="210" rx="10" ry="10" fill="none" stroke="#54473b" stroke-width="1.5"/>
+  <line x1="24"  y1="128" x2="696" y2="128" stroke="#c9bca6" stroke-width="1"/>
+  <line x1="24"  y1="198" x2="696" y2="198" stroke="#c9bca6" stroke-width="1"/>
+  <line x1="116" y1="58"  x2="116" y2="268" stroke="#c9bca6" stroke-width="1"/>
+  <text class="ink" x="70" y="97"  text-anchor="middle">Inferlet</text>
+  <text class="ink" x="70" y="167" text-anchor="middle">Runtime</text>
+  <text class="ink" x="70" y="237" text-anchor="middle">Driver</text>
+
+  <!-- Inferlet lane -->
+  <rect x="128" y="70" width="104" height="46" rx="8" ry="8" fill="#fdfbf3" stroke="#54473b" stroke-width="1.5"/>
+  <text class="mono ink" x="180" y="92"  text-anchor="middle">execute()</text>
+  <text class="mono sub" x="180" y="108" text-anchor="middle">0.05 µs</text>
+
+  <!-- Runtime lane -->
+  <rect x="128" y="140" width="104" height="46" rx="8" ry="8" fill="#fdfbf3" stroke="#54473b" stroke-width="1.5"/>
+  <text class="mono ink" x="180" y="162" text-anchor="middle">WASI</text>
+  <text class="mono sub" x="180" y="178" text-anchor="middle">40 µs</text>
+
+  <rect x="264" y="140" width="104" height="46" rx="8" ry="8" fill="#f7e3d7" stroke="#c96442" stroke-width="2"/>
+  <text class="mono acc" x="316" y="162" text-anchor="middle">Actor q</text>
+  <text class="mono acc" x="316" y="178" text-anchor="middle">150 µs</text>
+
+  <rect x="400" y="140" width="104" height="46" rx="8" ry="8" fill="#fdfbf3" stroke="#54473b" stroke-width="1.5"/>
+  <text class="mono ink" x="452" y="162" text-anchor="middle">Batch</text>
+  <text class="mono sub" x="452" y="178" text-anchor="middle">50 µs</text>
+
+  <rect x="536" y="140" width="104" height="46" rx="8" ry="8" fill="#fdfbf3" stroke="#54473b" stroke-width="1.5"/>
+  <text class="mono ink" x="588" y="162" text-anchor="middle">Event</text>
+  <text class="mono sub" x="588" y="178" text-anchor="middle">40 µs</text>
+
+  <!-- Driver lane -->
+  <rect x="400" y="210" width="104" height="46" rx="8" ry="8" fill="#fdfbf3" stroke="#54473b" stroke-width="1.5"/>
+  <text class="mono ink" x="452" y="232" text-anchor="middle">Driver IPC</text>
+  <text class="mono sub" x="452" y="248" text-anchor="middle">40 µs</text>
+
+  <rect x="536" y="210" width="104" height="46" rx="8" ry="8" fill="#fdfbf3" stroke="#54473b" stroke-width="2.5"/>
+  <text class="mono ink" x="588" y="232" text-anchor="middle">GPU exec</text>
+  <text class="mono sub" x="588" y="248" text-anchor="middle">5–8 ms</text>
+
+  <!-- Flow -->
+  <line x1="180" y1="118" x2="180" y2="138" stroke="#54473b" stroke-width="1.5" stroke-linecap="round" marker-end="url(#ah)"/>
+  <line x1="234" y1="163" x2="262" y2="163" stroke="#54473b" stroke-width="1.5" stroke-linecap="round" marker-end="url(#ah)"/>
+  <line x1="370" y1="163" x2="398" y2="163" stroke="#54473b" stroke-width="1.5" stroke-linecap="round" marker-end="url(#ah)"/>
+  <line x1="452" y1="188" x2="452" y2="208" stroke="#54473b" stroke-width="1.5" stroke-linecap="round" marker-end="url(#ah)"/>
+  <line x1="506" y1="233" x2="534" y2="233" stroke="#54473b" stroke-width="1.5" stroke-linecap="round" marker-end="url(#ah)"/>
+  <line x1="588" y1="208" x2="588" y2="188" stroke="#54473b" stroke-width="1.5" stroke-linecap="round" marker-end="url(#ah)"/>
+
+  <!-- Tax bracket (overhead only, excludes GPU exec) -->
+  <path d="M 128 282 L 128 288 M 128 282 L 504 282 M 504 282 L 504 288 M 316 282 L 316 290"
+        fill="none" stroke="#54473b" stroke-width="1.5" stroke-linecap="round"/>
+  <text class="acc"   x="316" y="306" text-anchor="middle">pipeline tax &#8776; 320 µs</text>
+  <text class="muted" x="588" y="300" text-anchor="middle">the forward pass</text>
+</svg>

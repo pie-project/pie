@@ -11,7 +11,6 @@ on:
           - pie-client (client/python/)
           - pie-bakery (sdk/tools/bakery/)
           - inferlet (sdk/python/)
-          - pie-rpc (sdk/python-rpc/)
       dry_run:
         description: 'Dry run (build and validate but do not publish)'
         required: false
@@ -43,10 +42,6 @@ jobs:
             "inferlet (sdk/python/)")
               echo "path=sdk/python" >> "$GITHUB_OUTPUT"
               echo "backend=python" >> "$GITHUB_OUTPUT"
-              ;;
-            "pie-rpc (sdk/python-rpc/)")
-              echo "path=sdk/python-rpc" >> "$GITHUB_OUTPUT"
-              echo "backend=maturin" >> "$GITHUB_OUTPUT"
               ;;
           esac
 
@@ -115,7 +110,10 @@ jobs:
               "$RUNNER_TEMP/smoke/bin/bakery" --help >/dev/null
               ;;
             "sdk/python")
-              "$RUNNER_TEMP/smoke/bin/python" -c "import inferlet"
+              # `import inferlet` needs the WIT-generated `wit_world`, which only
+              # exists inside a componentize-py build, not a plain venv. Verify
+              # the wheel installed and is registered instead.
+              "$RUNNER_TEMP/smoke/bin/python" -m pip show inferlet >/dev/null
               ;;
           esac
 

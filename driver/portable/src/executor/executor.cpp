@@ -3,11 +3,14 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <limits>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <iomanip>
 #include <iostream>
+#include <map>
+#include <sstream>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -648,7 +651,375 @@ Executor::BatchPlan Executor::plan_(const pie_driver::PieForwardRequestView& req
                       << " not in pool — running without adapter\n";
         }
     }
+
+    // Multimodal: compute the vision encoder side-inputs (no-op for text).
+    plan_vision_(req, plan);
+    // Multimodal: compute the Gemma-4 audio encoder side-inputs (no-op for text).
+    plan_audio_gemma4_(req, plan);
+    // Qwen3-VL M-RoPE: per-token [t,h,w] positions (no-op for non-mrope models).
+    build_mrope_positions_(req, plan);
+
     return plan;
+}
+
+void Executor::build_mrope_positions_(const pie_driver::PieForwardRequestView& req,
+                                      BatchPlan& plan) {
+    const auto& h = model_.hparams();
+    if (!h.use_mrope) return;
+    const int N = plan.total_n_tokens;
+    if (N <= 0) return;
+    // Text default: every row gets (p,p,p) from the 1-D positions.
+    plan.mrope_positions_i32.assign(static_cast<std::size_t>(N) * 3, 0);
+    for (int t = 0; t < N; ++t) {
+        const std::int32_t p =
+            t < static_cast<int>(plan.positions_i32.size()) ? plan.positions_i32[t] : 0;
+        plan.mrope_positions_i32[static_cast<std::size_t>(3 * t) + 0] = p;
+        plan.mrope_positions_i32[static_cast<std::size_t>(3 * t) + 1] = p;
+        plan.mrope_positions_i32[static_cast<std::size_t>(3 * t) + 2] = p;
+    }
+    // Overwrite image/video soft-token rows with their staged [t,h,w] positions
+    // (mirrors the CUDA driver's merge). image_mrope_indptr is a per-image CSR in
+    // element units (3 per token); image i's rows start at batch row anchors[i].
+    const int num_img = static_cast<int>(req.num_images());
+    if (num_img == 0 || req.image_mrope_positions.empty() ||
+        req.image_mrope_indptr.size() < static_cast<std::size_t>(num_img) + 1 ||
+        req.image_anchor_rows.size() < static_cast<std::size_t>(num_img)) {
+        return;
+    }
+    const std::uint32_t* mpos    = req.image_mrope_positions.data();
+    const std::uint32_t* mindptr = req.image_mrope_indptr.data();
+    const std::uint32_t* anchors = req.image_anchor_rows.data();
+    const std::size_t mpos_len   = req.image_mrope_positions.size();
+    for (int im = 0; im < num_img; ++im) {
+        const std::uint32_t anchor_row = anchors[im];
+        const std::uint32_t lo = mindptr[im];
+        const std::uint32_t hi = mindptr[im + 1];
+        if (hi < lo || hi > mpos_len) continue;
+        const std::uint32_t n_tok = (hi - lo) / 3u;
+        for (std::uint32_t j = 0; j < n_tok; ++j) {
+            const int row = static_cast<int>(anchor_row + j);
+            if (row < 0 || row >= N) continue;
+            plan.mrope_positions_i32[static_cast<std::size_t>(3 * row) + 0] =
+                static_cast<std::int32_t>(mpos[lo + 3 * j + 0]);
+            plan.mrope_positions_i32[static_cast<std::size_t>(3 * row) + 1] =
+                static_cast<std::int32_t>(mpos[lo + 3 * j + 1]);
+            plan.mrope_positions_i32[static_cast<std::size_t>(3 * row) + 2] =
+                static_cast<std::int32_t>(mpos[lo + 3 * j + 2]);
+        }
+    }
+}
+
+void Executor::plan_vision_(const pie_driver::PieForwardRequestView& req,
+                            BatchPlan& plan) {
+    const auto& h = model_.hparams();
+    if (req.num_images() == 0) return;
+    if (h.arch == PieArch::Gemma4 && model_.weights().gemma4_vision.present) {
+        plan_vision_gemma4_(req, plan);
+        return;
+    }
+    if (h.arch != PieArch::Qwen3VL) return;
+    const auto& V = model_.weights().vision;
+    if (!V.present || !V.pos_embed) return;
+    const std::int32_t num_img = static_cast<std::int32_t>(req.num_images());
+
+    const std::int32_t merge   = h.vision_spatial_merge_size;
+    const std::int32_t hidden  = h.vision_hidden_size;
+    const std::int32_t heads   = h.vision_num_heads;
+    const std::int32_t head_dim = h.vision_head_dim > 0 ? h.vision_head_dim
+                                                        : hidden / heads;
+    const std::int32_t patch_dim = h.vision_in_channels *
+        h.vision_temporal_patch_size * h.vision_patch_size * h.vision_patch_size;
+
+    // Learned abs pos-embed table -> f32 (read once, shared across images).
+    const std::int32_t num_pos = static_cast<std::int32_t>(V.pos_embed->ne[1]);
+    const std::int32_t side =
+        static_cast<std::int32_t>(0.5 + std::sqrt(static_cast<double>(num_pos)));
+    std::vector<float> table(static_cast<std::size_t>(num_pos) * hidden);
+    {
+        const std::size_t n = table.size();
+        if (V.pos_embed->type == GGML_TYPE_F32) {
+            ggml_backend_tensor_get(V.pos_embed, table.data(), 0, n * sizeof(float));
+        } else if (V.pos_embed->type == GGML_TYPE_F16) {
+            std::vector<ggml_fp16_t> tmp(n);
+            ggml_backend_tensor_get(V.pos_embed, tmp.data(), 0, n * sizeof(ggml_fp16_t));
+            for (std::size_t i = 0; i < n; ++i) table[i] = ggml_fp16_to_fp32(tmp[i]);
+        } else {  // BF16
+            std::vector<ggml_bf16_t> tmp(n);
+            ggml_backend_tensor_get(V.pos_embed, tmp.data(), 0, n * sizeof(ggml_bf16_t));
+            for (std::size_t i = 0; i < n; ++i) table[i] = ggml_bf16_to_fp32(tmp[i]);
+        }
+    }
+
+    const std::uint32_t* grids = req.image_grids.data();
+    const std::uint8_t* px_bytes = req.image_pixels.data();
+    const std::uint32_t* pix_indptr = req.image_pixel_indptr.size() >=
+        static_cast<std::size_t>(num_img) + 1 ? req.image_pixel_indptr.data() : nullptr;
+    const std::uint32_t* anchors = req.image_anchor_rows.data();
+
+    // First pass: per-image n_patch / n_token from the grid.
+    struct ImgGeom { std::int32_t gt, gh, gw, n_patch, n_token, patch_off; std::int64_t anchor; };
+    std::vector<ImgGeom> imgs;
+    std::int32_t total_patch = 0, total_token = 0, patch_cursor = 0;
+    for (std::int32_t im = 0; im < num_img; ++im) {
+        const std::int32_t gt = static_cast<std::int32_t>(grids[3 * im + 0]);
+        const std::int32_t gh = static_cast<std::int32_t>(grids[3 * im + 1]);
+        const std::int32_t gw = static_cast<std::int32_t>(grids[3 * im + 2]);
+        const std::int32_t np = gt * gh * gw;
+        if (np <= 0 || (np % (merge * merge)) != 0) return;
+        imgs.push_back({gt, gh, gw, np, np / (merge * merge), patch_cursor,
+                        static_cast<std::int64_t>(anchors[im])});
+        total_patch += np; total_token += np / (merge * merge); patch_cursor += np;
+    }
+
+    plan.vis_pixels.resize(static_cast<std::size_t>(total_patch) * patch_dim);
+    plan.vis_pos_embed.resize(static_cast<std::size_t>(total_patch) * hidden);
+    plan.vis_rope_cos.resize(static_cast<std::size_t>(total_patch) * head_dim);
+    plan.vis_rope_sin.resize(static_cast<std::size_t>(total_patch) * head_dim);
+    plan.vis_img_rows.resize(static_cast<std::size_t>(total_token));
+
+    // Second pass: fill combined buffers (concatenated per image).
+    std::int32_t tok_off = 0;
+    for (std::int32_t im = 0; im < num_img; ++im) {
+        const ImgGeom& g = imgs[static_cast<std::size_t>(im)];
+        const std::int32_t np = g.n_patch, po = g.patch_off;
+        // pixels.
+        const std::size_t need = static_cast<std::size_t>(np) * patch_dim;
+        const std::uint8_t* src = pix_indptr ? px_bytes + pix_indptr[im] : px_bytes;
+        std::memcpy(plan.vis_pixels.data() + static_cast<std::size_t>(po) * patch_dim,
+                    src, need * sizeof(float));
+        // positions -> pos-embed (bilinear) + 2D-RoPE.
+        std::vector<std::int32_t> pos = qwen3vl_vision_positions(g.gt, g.gh, g.gw, merge);
+        std::vector<float> pe = qwen3vl_pos_embed_interp(table.data(), side, hidden,
+                                                         pos.data(), np, g.gh, g.gw);
+        std::copy(pe.begin(), pe.end(),
+                  plan.vis_pos_embed.begin() + static_cast<std::ptrdiff_t>(po) * hidden);
+        std::vector<float> rc, rs;
+        qwen3vl_rope_cos_sin(pos.data(), np, head_dim, h.vision_rope_theta, rc, rs);
+        std::copy(rc.begin(), rc.end(),
+                  plan.vis_rope_cos.begin() + static_cast<std::ptrdiff_t>(po) * head_dim);
+        std::copy(rs.begin(), rs.end(),
+                  plan.vis_rope_sin.begin() + static_cast<std::ptrdiff_t>(po) * head_dim);
+        // scatter rows.
+        for (std::int32_t i = 0; i < g.n_token; ++i)
+            plan.vis_img_rows[static_cast<std::size_t>(tok_off + i)] = g.anchor + i;
+        tok_off += g.n_token;
+    }
+
+    // Block-diagonal attention mask (only when >1 image; single -> null).
+    if (num_img > 1) {
+        const float ninf = -std::numeric_limits<float>::infinity();
+        plan.vis_attn_mask.assign(
+            static_cast<std::size_t>(total_patch) * total_patch, 0.0f);
+        std::vector<std::int32_t> img_of(static_cast<std::size_t>(total_patch));
+        for (std::int32_t im = 0; im < num_img; ++im)
+            for (std::int32_t i = 0; i < imgs[static_cast<std::size_t>(im)].n_patch; ++i)
+                img_of[static_cast<std::size_t>(imgs[static_cast<std::size_t>(im)].patch_off + i)] = im;
+        for (std::int32_t qi = 0; qi < total_patch; ++qi)
+            for (std::int32_t kj = 0; kj < total_patch; ++kj)
+                if (img_of[static_cast<std::size_t>(qi)] != img_of[static_cast<std::size_t>(kj)])
+                    plan.vis_attn_mask[static_cast<std::size_t>(qi) * total_patch + kj] = ninf;
+    }
+
+    plan.vis_patch_dim = patch_dim;
+    plan.vis_n_patch   = total_patch;
+    plan.vis_n_token   = total_token;
+    plan.has_images    = true;
+}
+
+void Executor::plan_vision_gemma4_(const pie_driver::PieForwardRequestView& req,
+                                   BatchPlan& plan) {
+    const auto& h = model_.hparams();
+    const auto& V = model_.weights().gemma4_vision;
+    if (!V.present || !V.patch_w || !V.pos_table) return;
+    const std::int32_t num_img = static_cast<std::int32_t>(req.num_images());
+    if (num_img == 0) return;
+    const std::int32_t hidden  = h.vision_hidden_size;
+    const std::int32_t heads   = h.vision_num_heads;
+    const std::int32_t head_dim = h.vision_head_dim > 0 ? h.vision_head_dim
+                                                        : hidden / heads;
+    const std::int32_t pool_k = h.vision_pool_kernel > 0 ? h.vision_pool_kernel : 1;
+    const std::int32_t patch_dim = static_cast<std::int32_t>(V.patch_w->ne[0]);
+
+    // Factored pos-embed table [2,P,hidden] -> f32 (read once, shared).
+    const std::int32_t P = static_cast<std::int32_t>(V.pos_table->ne[1]);
+    std::vector<float> table(static_cast<std::size_t>(2) * P * hidden);
+    {
+        const std::size_t n = table.size();
+        if (V.pos_table->type == GGML_TYPE_F32) {
+            ggml_backend_tensor_get(V.pos_table, table.data(), 0, n * sizeof(float));
+        } else if (V.pos_table->type == GGML_TYPE_F16) {
+            std::vector<ggml_fp16_t> tmp(n);
+            ggml_backend_tensor_get(V.pos_table, tmp.data(), 0, n * sizeof(ggml_fp16_t));
+            for (std::size_t i = 0; i < n; ++i) table[i] = ggml_fp16_to_fp32(tmp[i]);
+        } else {
+            std::vector<ggml_bf16_t> tmp(n);
+            ggml_backend_tensor_get(V.pos_table, tmp.data(), 0, n * sizeof(ggml_bf16_t));
+            for (std::size_t i = 0; i < n; ++i) table[i] = ggml_bf16_to_fp32(tmp[i]);
+        }
+    }
+
+    // Per-image pixel byte ranges. image_pixel_indptr is [0, end0, end1, ...]
+    // (num_img+1, bytes); fall back to "all pixels = image 0" if absent.
+    const std::uint32_t* pix_indptr = req.image_pixel_indptr.size() >=
+        static_cast<std::size_t>(num_img) + 1 ? req.image_pixel_indptr.data() : nullptr;
+    const float* px_all = reinterpret_cast<const float*>(req.image_pixels.data());
+    const std::uint32_t* pp_all = req.image_patch_positions.data();
+    const std::uint32_t* anchors = req.image_anchor_rows.data();
+
+    // First pass: per-image geometry (n_patch / grid / n_token).
+    struct ImgGeom { std::int32_t n_patch, n_token, gw, gh, patch_off; std::int64_t anchor; };
+    std::vector<ImgGeom> imgs;
+    imgs.reserve(static_cast<std::size_t>(num_img));
+    std::int32_t total_patch = 0, total_token = 0, patch_cursor = 0;
+    for (std::int32_t im = 0; im < num_img; ++im) {
+        std::int32_t n_patch_im;
+        if (pix_indptr) {
+            const std::size_t b0 = pix_indptr[im], b1 = pix_indptr[im + 1];
+            n_patch_im = static_cast<std::int32_t>((b1 - b0) / sizeof(float) / patch_dim);
+        } else {
+            n_patch_im = static_cast<std::int32_t>(req.image_patch_positions.size() / 2);
+        }
+        if (n_patch_im <= 0) return;
+        std::int32_t maxx = 0, maxy = 0;
+        for (std::int32_t i = 0; i < n_patch_im; ++i) {
+            const std::int32_t x = static_cast<std::int32_t>(pp_all[2 * (patch_cursor + i)]);
+            const std::int32_t y = static_cast<std::int32_t>(pp_all[2 * (patch_cursor + i) + 1]);
+            maxx = std::max(maxx, x); maxy = std::max(maxy, y);
+        }
+        const std::int32_t gw = maxx + 1, gh = maxy + 1;
+        const std::int32_t n_token_im = (gw / pool_k) * (gh / pool_k);
+        imgs.push_back({n_patch_im, n_token_im, gw, gh, patch_cursor,
+                        static_cast<std::int64_t>(anchors[im])});
+        total_patch += n_patch_im; total_token += n_token_im;
+        patch_cursor += n_patch_im;
+    }
+
+    // Allocate combined buffers.
+    plan.vis_pixels.resize(static_cast<std::size_t>(total_patch) * patch_dim);
+    plan.vis_pos_embed.resize(static_cast<std::size_t>(total_patch) * hidden);
+    plan.vis_rope_cos.resize(static_cast<std::size_t>(total_patch) * head_dim);
+    plan.vis_rope_sin.resize(static_cast<std::size_t>(total_patch) * head_dim);
+    plan.vis_pool_matrix.assign(
+        static_cast<std::size_t>(total_token) * total_patch, 0.0f);
+    plan.vis_img_rows.resize(static_cast<std::size_t>(total_token));
+
+    // Second pass: fill per-image data into the combined buffers (block-diagonal
+    // pool), and stage pixels (pre-scaled 2x-1).
+    std::int32_t tok_off = 0;
+    for (std::int32_t im = 0; im < num_img; ++im) {
+        const ImgGeom& g = imgs[static_cast<std::size_t>(im)];
+        const std::int32_t np = g.n_patch, po = g.patch_off;
+        std::vector<std::int32_t> pos(static_cast<std::size_t>(np) * 2);
+        for (std::int32_t i = 0; i < np; ++i) {
+            pos[2 * i]     = static_cast<std::int32_t>(pp_all[2 * (po + i)]);
+            pos[2 * i + 1] = static_cast<std::int32_t>(pp_all[2 * (po + i) + 1]);
+        }
+        // pixels (2x-1).
+        const float* src = pix_indptr ? px_all + pix_indptr[im] / sizeof(float) : px_all;
+        const std::size_t pbytes = static_cast<std::size_t>(np) * patch_dim;
+        for (std::size_t i = 0; i < pbytes; ++i)
+            plan.vis_pixels[static_cast<std::size_t>(po) * patch_dim + i] =
+                2.0f * src[i] - 1.0f;
+        // pos-embed.
+        std::vector<float> pe = gemma4_vision_pos_embed(table.data(), P, hidden,
+                                                        pos.data(), np);
+        std::copy(pe.begin(), pe.end(),
+                  plan.vis_pos_embed.begin() + static_cast<std::ptrdiff_t>(po) * hidden);
+        // rope.
+        std::vector<float> rc, rs;
+        gemma4_vision_rope_cos_sin(pos.data(), np, head_dim, h.vision_rope_theta, rc, rs);
+        std::copy(rc.begin(), rc.end(),
+                  plan.vis_rope_cos.begin() + static_cast<std::ptrdiff_t>(po) * head_dim);
+        std::copy(rs.begin(), rs.end(),
+                  plan.vis_rope_sin.begin() + static_cast<std::ptrdiff_t>(po) * head_dim);
+        // pool block (token-major [n_token_im, np]) -> combined block-diagonal.
+        std::int32_t nt = 0;
+        std::vector<float> pm = gemma4_vision_pool_matrix(pos.data(), np, g.gw, g.gh,
+                                                          pool_k, hidden, nt);
+        for (std::int32_t t = 0; t < nt; ++t)
+            for (std::int32_t p = 0; p < np; ++p)
+                plan.vis_pool_matrix[static_cast<std::size_t>(tok_off + t) * total_patch +
+                                     (po + p)] = pm[static_cast<std::size_t>(t) * np + p];
+        // scatter rows.
+        for (std::int32_t t = 0; t < nt; ++t)
+            plan.vis_img_rows[static_cast<std::size_t>(tok_off + t)] = g.anchor + t;
+        tok_off += nt;
+    }
+
+    // Block-diagonal attention mask (only when >1 image; single image -> null).
+    if (num_img > 1) {
+        const float ninf = -std::numeric_limits<float>::infinity();
+        plan.vis_attn_mask.assign(
+            static_cast<std::size_t>(total_patch) * total_patch, 0.0f);
+        std::vector<std::int32_t> img_of(static_cast<std::size_t>(total_patch));
+        for (std::int32_t im = 0; im < num_img; ++im)
+            for (std::int32_t i = 0; i < imgs[static_cast<std::size_t>(im)].n_patch; ++i)
+                img_of[static_cast<std::size_t>(imgs[static_cast<std::size_t>(im)].patch_off + i)] = im;
+        for (std::int32_t qi = 0; qi < total_patch; ++qi)
+            for (std::int32_t kj = 0; kj < total_patch; ++kj)
+                if (img_of[static_cast<std::size_t>(qi)] != img_of[static_cast<std::size_t>(kj)])
+                    plan.vis_attn_mask[static_cast<std::size_t>(qi) * total_patch + kj] = ninf;
+    }
+
+    if (std::getenv("PIE_PORTABLE_DUMP_TOKENS")) {
+        std::cerr << "[g4vis] num_img=" << num_img << " total_patch=" << total_patch
+                  << " total_token=" << total_token << " patch_dim=" << patch_dim << "\n";
+    }
+
+    plan.vis_patch_dim = patch_dim;
+    plan.vis_n_patch   = total_patch;
+    plan.vis_n_token   = total_token;
+    plan.has_images    = true;
+}
+
+void Executor::plan_audio_gemma4_(const pie_driver::PieForwardRequestView& req,
+                                  BatchPlan& plan) {
+    const auto& h = model_.hparams();
+    const auto& A = model_.weights().gemma4_audio;
+    if (!A.present || h.audio_hidden_size <= 0) return;
+    const std::int32_t num_clip = static_cast<std::int32_t>(req.num_clips());
+    if (num_clip == 0) return;
+    const std::int32_t hidden = h.audio_hidden_size;
+    const std::int32_t n_mel  = h.audio_feature_size;
+    const std::int32_t P      = h.audio_context_left;
+    const std::int32_t Dwin   = P - 1;
+
+    plan.aud_pe = gemma4_audio_rel_pos_enc(P, hidden);
+    plan.aud_n_mel = n_mel;
+    plan.aud_dwin  = Dwin;
+
+    // Each clip is encoded independently (N-separate-encodes; the SSCP/depthwise
+    // convs mix across time, so clips can't be stacked like vision images).
+    const std::uint32_t* fp = req.audio_feature_indptr.data();
+    const std::uint32_t* anchors = req.audio_anchor_rows.data();
+    for (std::int32_t ci = 0; ci < num_clip; ++ci) {
+        const std::size_t blo = fp[ci], bhi = fp[ci + 1];
+        if (bhi <= blo) return;
+        const std::int32_t n_frame =
+            static_cast<std::int32_t>((bhi - blo) / sizeof(float)) / n_mel;
+        if (n_frame <= 0) return;
+        const std::int32_t n_token = gemma4_audio_subsampled_len(n_frame);
+        if (n_token <= 0) return;
+
+        BatchPlan::AudClip clip;
+        clip.n_frame = n_frame;
+        clip.n_token = n_token;
+        const float* src =
+            reinterpret_cast<const float*>(req.audio_features.data() + blo);
+        clip.features.assign(src, src + static_cast<std::size_t>(n_frame) * n_mel);
+        clip.win_mask = gemma4_audio_window_mask(Dwin, n_token);
+        const std::int64_t anchor = static_cast<std::int64_t>(anchors[ci]);
+        clip.rows.resize(static_cast<std::size_t>(n_token));
+        for (std::int32_t i = 0; i < n_token; ++i)
+            clip.rows[static_cast<std::size_t>(i)] = anchor + i;
+        plan.aud_clips.push_back(std::move(clip));
+
+        if (std::getenv("PIE_PORTABLE_DUMP_TOKENS")) {
+            std::cerr << "[g4aud] clip " << ci << " n_frame=" << n_frame
+                      << " n_token=" << n_token << " dwin=" << Dwin << "\n";
+        }
+    }
+    plan.has_audio = true;
 }
 
 
@@ -816,6 +1187,50 @@ std::vector<SamplerOutput> Executor::compute_(const BatchPlan& plan) {
                 throw std::runtime_error("compute: sched_alloc_graph failed");
             }
             take_us(timings_.graph_alloc_us);
+
+            // No silent CPU fallback: after the scheduler assigns backends, flag
+            // any compute node placed on the CPU fallback instead of the primary
+            // (Metal/GPU) backend. A missing Metal kernel silently routing a hot
+            // op to CPU is a performance trap (it can peg a core); surface it so
+            // it's never silent. Runs only on cache-miss (new graph topology).
+            // PIE_PORTABLE_STRICT_METAL=1 turns the warning into a hard error.
+            if (ggml_backend_t cpu_fb = model_.cpu_fallback()) {
+                ggml_cgraph* g = cache_->result.gf;
+                std::map<std::string, int> cpu_ops;
+                int cpu_nodes = 0;
+                const int nn = ggml_graph_n_nodes(g);
+                for (int i = 0; i < nn; ++i) {
+                    ggml_tensor* node = ggml_graph_node(g, i);
+                    // No-op metadata ops (view/reshape/permute/transpose) carry no
+                    // kernel and compute nothing — the scheduler may place them on
+                    // any backend at zero cost, so they are not real fallbacks.
+                    switch (node->op) {
+                        case GGML_OP_NONE:
+                        case GGML_OP_VIEW:
+                        case GGML_OP_RESHAPE:
+                        case GGML_OP_PERMUTE:
+                        case GGML_OP_TRANSPOSE:
+                            continue;
+                        default: break;
+                    }
+                    if (ggml_backend_sched_get_tensor_backend(sched_, node) == cpu_fb) {
+                        ++cpu_nodes;
+                        cpu_ops[ggml_op_name(node->op)]++;
+                    }
+                }
+                if (cpu_nodes > 0) {
+                    std::ostringstream msg;
+                    msg << cpu_nodes << " graph node(s) fell back to CPU (no Metal "
+                           "kernel):";
+                    for (const auto& [op, n] : cpu_ops) msg << " " << op << "x" << n;
+                    if (std::getenv("PIE_PORTABLE_STRICT_METAL")) {
+                        throw std::runtime_error("compute: CPU fallback forbidden: " +
+                                                 msg.str());
+                    }
+                    std::cerr << "[pie-driver-portable] WARNING: " << msg.str()
+                              << " (set PIE_PORTABLE_STRICT_METAL=1 to forbid)\n";
+                }
+            }
         } catch (...) {
             cache_->release();
             throw;
@@ -1132,6 +1547,20 @@ std::vector<std::vector<std::uint32_t>> Executor::generate_multi(
             rp.sampler.temperature = 0.0f;  // greedy for the test harness
             rp.samplers.assign(1, rp.sampler);
             plan.reqs.push_back(std::move(rp));
+        }
+
+        // Qwen3-VL (use_mrope) widens pos_input to 4×; keep the invariant that
+        // mrope_positions_i32 is populated. No images in this decode harness, so
+        // every axis is the 1-D position.
+        if (model_.hparams().use_mrope) {
+            const int Nt = plan.total_n_tokens;
+            plan.mrope_positions_i32.resize(static_cast<std::size_t>(Nt) * 3);
+            for (int t = 0; t < Nt; ++t) {
+                const std::int32_t p = plan.positions_i32[static_cast<std::size_t>(t)];
+                plan.mrope_positions_i32[static_cast<std::size_t>(3 * t) + 0] = p;
+                plan.mrope_positions_i32[static_cast<std::size_t>(3 * t) + 1] = p;
+                plan.mrope_positions_i32[static_cast<std::size_t>(3 * t) + 2] = p;
+            }
         }
 
         // Activate the M11 packed-decode fast path for this multi-context

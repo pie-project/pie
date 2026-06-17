@@ -7,6 +7,9 @@ drivers.
 Use this driver for CPU inference, local development, or non-NVIDIA backends
 supported by ggml.
 
+Multimodal support (Qwen3-VL / Gemma-4 vision, Gemma-4 audio input, CSM-1B TTS)
+is documented in [MULTIMODAL.md](MULTIMODAL.md).
+
 ## Build
 
 The normal path is through the `pie` binary:

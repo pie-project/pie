@@ -63,11 +63,39 @@ GraphResult build_gemma4_graph(ggml_context* ctx,
                                           model.supports_paged_attn_ext());
 
     // ---- Embed -----------------------------------------------------------
-    auto* embd = ggml_get_rows(ctx, w.tok_embd, in.tok_input);
-    auto* inpL = embd;
+    auto* inpL = ggml_get_rows(ctx, w.tok_embd, in.tok_input);
     if (spec.scale_embed_by_sqrt_d) {
         inpL = ggml_scale(ctx, inpL,
                           std::sqrt(static_cast<float>(h.hidden_size)));
+    }
+
+    // Multimodal (Gemma-4): run the SigLIP vision encoder and splice its
+    // soft-token embeddings into the image rows. HF masked_scatter happens
+    // AFTER the sqrt(hidden) embed scaling, so the projected vision features
+    // are NOT scaled (they replace the placeholder rows). Gated on has_images.
+    if (plan.has_images && w.gemma4_vision.present && in.vis_pixels &&
+        in.vis_pool_matrix) {
+        ggml_tensor* vemb = build_gemma4_vision_graph(
+            ctx, w.gemma4_vision, h, in.vis_pixels, in.vis_pos_embed,
+            in.vis_rope_cos, in.vis_rope_sin, in.vis_pool_matrix,
+            in.vis_attn_mask, plan.vis_n_patch, plan.vis_n_token);
+        vemb = ggml_cast(ctx, vemb, inpL->type);
+        inpL = ggml_set_rows(ctx, inpL, vemb, in.vis_img_rows);
+    }
+
+    // Multimodal (Gemma-4): run the Conformer audio encoder and splice its
+    // soft-token embeddings into the audio rows (same post-embed-scale scatter
+    // as vision). Gated on has_audio.
+    if (plan.has_audio && w.gemma4_audio.present && in.aud_pe &&
+        !in.aud_features.empty()) {
+        for (std::size_t c = 0; c < plan.aud_clips.size(); ++c) {
+            const auto& clip = plan.aud_clips[c];
+            ggml_tensor* aemb = build_gemma4_audio_graph(
+                ctx, w.gemma4_audio, h, in.aud_features[c], in.aud_pe,
+                in.aud_win_mask[c], clip.n_frame, clip.n_token);
+            aemb = ggml_cast(ctx, aemb, inpL->type);
+            inpL = ggml_set_rows(ctx, inpL, aemb, in.aud_rows[c]);
+        }
     }
 
     // Per-layer post-write KV cache handles. Shared layers read from the
