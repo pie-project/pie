@@ -106,6 +106,11 @@ add_library(pie_driver_portable_lib STATIC
   # #[cfg(test)] Rust test (driver/portable ctest never runs in CI). The
   # symbol is GC'd out of release builds — no Rust code references it there.
   src/graph_sampling_testhook.cpp
+  # Test-only entries exercising gguf_to_hf_name + parse_gguf_hparams for the
+  # qwen35 hybrid arch from pie-server #[cfg(test)] Rust tests (driver/portable
+  # ctest never runs in CI). The symbols are GC'd out of release builds — no
+  # Rust code references them there.
+  src/qwen35_mapping_testhook.cpp
 )
 
 target_compile_options(pie_driver_portable_lib PRIVATE

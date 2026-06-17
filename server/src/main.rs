@@ -91,3 +91,65 @@ mod portable_graph_sampling_tests {
         assert_eq!(slot_dim(3, 3, 4, 32), 3);
     }
 }
+
+// Mapper-coverage + hparams regression tests for the hybrid Qwen 3.5 / 3.6
+// ("qwen35" / "qwen35moe") load path. The qwen35 GGUF loader is otherwise
+// guarded only by real 27B/35B model boots (#694); these assert the two pure
+// pieces it depends on — `gguf_to_hf_name` covering the qwen35-UNIQUE tensors
+// (gated-delta-rule linear attention + shared expert; the shared arms are
+// covered broadly by other arches' loads), and `parse_gguf_hparams` deriving
+// `layer_types` + linear-attn dims — without a model load. Test-only C entries
+// live in the portable driver (`qwen35_mapping_testhook.cpp`); they are
+// exercised here, in the `pie` bin, because CI runs `cargo test -p pie-server
+// --bin pie` and the driver/portable ctest targets never run in CI.
+#[cfg(all(test, feature = "driver-portable"))]
+mod portable_qwen35_mapping_tests {
+    use std::os::raw::c_int;
+
+    unsafe extern "C" {
+        fn pie_portable_test_qwen35_mapper_missing_count() -> c_int;
+        fn pie_portable_test_qwen35_layer_type_at(
+            interval: c_int,
+            num_layers: c_int,
+            idx: c_int,
+        ) -> c_int;
+        fn pie_portable_test_qwen35_parsed_linear_dim(which: c_int) -> c_int;
+    }
+
+    // Every qwen35-UNIQUE HF tensor name `build_qwen3_5_` /
+    // `load_qwen3_5_moe_layer_` look up must be producible by
+    // `gguf_to_hf_name`. Dropping a linear-attn (`ssm_*`/`attn_qkv`/`attn_gate`)
+    // or shared-expert (`*_shexp`) mapper arm makes this nonzero.
+    #[test]
+    fn mapper_covers_qwen35_unique_loader_tensors() {
+        let missing = unsafe { pie_portable_test_qwen35_mapper_missing_count() };
+        assert_eq!(
+            missing, 0,
+            "{missing} qwen35 loader tensor(s) have no gguf_to_hf_name mapping \
+             (see stderr for names)"
+        );
+    }
+
+    // layer_types: layer i is full attention ('g') iff (i+1) % interval == 0,
+    // else linear ('l'). For interval=4, num_layers=6 → "lllgll".
+    #[test]
+    fn layer_types_follow_full_attention_interval() {
+        let at = |i| unsafe { pie_portable_test_qwen35_layer_type_at(4, 6, i) };
+        let g = i32::from(b'g');
+        let l = i32::from(b'l');
+        let pattern: Vec<i32> = (0..6).map(at).collect();
+        assert_eq!(pattern, vec![l, l, l, g, l, l]);
+    }
+
+    // Linear-attention + shared-expert dims read from the ssm.* / expert_*
+    // GGUF keys must land in the matching Hparams fields.
+    #[test]
+    fn linear_attn_dims_parse_from_ssm_keys() {
+        let dim = |w| unsafe { pie_portable_test_qwen35_parsed_linear_dim(w) };
+        assert_eq!(dim(0), 2, "num K heads (ssm.group_count)");
+        assert_eq!(dim(1), 16, "num V heads (ssm.time_step_rank)");
+        assert_eq!(dim(2), 128, "K/V head dim (ssm.state_size)");
+        assert_eq!(dim(3), 4, "conv kernel (ssm.conv_kernel)");
+        assert_eq!(dim(4), 512, "shared-expert intermediate size");
+    }
+}
