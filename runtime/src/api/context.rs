@@ -233,18 +233,31 @@ impl pie::core::context::HostContext for InstanceState {
     }
 
     async fn drop(&mut self, this: Resource<Context>) -> Result<()> {
-        // Pull ctx + model identifiers BEFORE we release the table
-        // entry — the resource handle is invalid after delete.
+        // Free the context's KV pages when the guest drops the handle — each
+        // WIT Context resource maps 1:1 to a ContextId, so a dropped handle
+        // means the guest is done with that context. A whole-instance
+        // DestroyAll still runs on instance teardown for anything still live,
+        // but deferring ALL cleanup to teardown leaks every intermediate
+        // context for the lifetime of a long-lived daemon inferlet (chat-apc
+        // serves every request on ONE instance). The tree-of-thought search
+        // forks many transient contexts per request — children, per-node
+        // value-scoring forks, pruned beam losers — and relied on this drop
+        // to reclaim them; without eager freeing the KV pool is exhausted and
+        // the engine wedges (#679). Named snapshots are unaffected:
+        // `save`/`snapshot` persist a SEPARATE `owner: None` context id, so
+        // destroying the live owned context here never touches them.
+        //
+        // Pull ctx + model identifiers BEFORE we release the table entry —
+        // the resource handle is invalid after delete. Drop the speculation
+        // chain while the ctx still exists so any in-flight BatchComplete
+        // handler that races us sees a coherent state (chain gone → output
+        // silently discarded). Idempotent if no chain exists.
         let (model_id, context_id) = {
             let ctx = self.ctx().table.get(&this)?;
             (ctx.model_id, ctx.context_id)
         };
-        // Drop the speculation chain associated with this ctx. The
-        // ctx itself stays alive for the process's wider cleanup
-        // path (InstanceState::drop → unregister_process); only the
-        // speculative state attached to it goes away here. Idempotent
-        // if no chain exists.
         crate::inference::invalidate_speculation_for_ctx(model_id, context_id);
+        let _ = context::destroy(model_id, context_id).await;
         self.ctx().table.delete(this)?;
         Ok(())
     }
