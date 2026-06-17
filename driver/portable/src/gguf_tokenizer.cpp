@@ -401,13 +401,20 @@ void emit_tokenizer_files(const std::filesystem::path& gguf_file,
 
     // -- Required scalars ------------------------------------------------
     const std::string model_type = get_str(ctx, "tokenizer.ggml.model");
-    if (model_type != "gpt2") {
+    // "gpt2" is byte-level BPE. "gemma4" is SentencePiece-style BPE
+    // (▁-metaspace + byte_fallback): same BPE vocab/merges, different
+    // normalizer / pre-tokenizer / decoder (handled below via `is_spm`).
+    const bool is_spm = (model_type == "gemma4");
+    if (model_type != "gpt2" && !is_spm) {
         throw std::runtime_error(
             "gguf_tokenizer: tokenizer.ggml.model='" + model_type +
-            "' not supported (need 'gpt2'; SPM/WordPiece/Unigram are TODO).");
+            "' not supported (need 'gpt2' or 'gemma4'; WordPiece/Unigram "
+            "are TODO).");
     }
     const std::string pre = get_str_or(ctx, "tokenizer.ggml.pre", "default");
-    const PreSpec pre_spec = resolve_pre_spec(pre);
+    // SPM builds its pre-tokenizer directly; the byte-level regex table
+    // does not apply.
+    const PreSpec pre_spec = is_spm ? PreSpec{} : resolve_pre_spec(pre);
 
     const std::vector<std::string> tokens =
         get_str_array(ctx, "tokenizer.ggml.tokens");
@@ -479,41 +486,14 @@ void emit_tokenizer_files(const std::filesystem::path& gguf_file,
     push_canonical(unk_id);
     push_canonical(sep_id);
 
-    // -- Pre-tokenizer ----------------------------------------------------
-    json pre_tokenizers = json::array();
-    for (const auto& re : pre_spec.regex_exprs) {
-        pre_tokenizers.push_back({
-            {"type",     "Split"},
-            {"pattern",  {{"Regex", re}}},
-            {"behavior", "Isolated"},
-            {"invert",   false},
-        });
-    }
-    pre_tokenizers.push_back({
-        {"type",            "ByteLevel"},
-        {"add_prefix_space", false},
-        {"trim_offsets",     false},
-        {"use_regex",        false},
-    });
+    // ▁ (U+2581, "lower one eighth block") is SentencePiece's metaspace
+    // marker — the byte sequence E2 96 81.
+    const std::string kMetaspace = "\xe2\x96\x81";
 
-    json pre_tokenizer = {
-        {"type",          "Sequence"},
-        {"pretokenizers", pre_tokenizers},
-    };
-
-    // -- Normalizer -------------------------------------------------------
     json normalizer = nullptr;
-    if (pre_spec.needs_nfc_normalizer) {
-        normalizer = {{"type", "NFC"}};
-    }
-
-    json byte_level_pp = {
-        {"type",             "ByteLevel"},
-        {"add_prefix_space", false},
-        {"trim_offsets",     false},
-        {"use_regex",        false},
-    };
-
+    json pre_tokenizer;
+    json post_processor;
+    json decoder;
     json model_body = {
         {"type",                      "BPE"},
         {"dropout",                   nullptr},
@@ -527,6 +507,75 @@ void emit_tokenizer_files(const std::filesystem::path& gguf_file,
         {"merges",                    merges_arr},
     };
 
+    if (is_spm) {
+        // SentencePiece (gemma): spaces are normalized to ▁, the decoder
+        // maps ▁ back to a space and resolves <0xNN> byte tokens via
+        // byte_fallback. Mirrors google/gemma-4 tokenizer.json.
+        normalizer = {
+            {"type", "Replace"},
+            {"pattern", {{"String", " "}}},
+            {"content", kMetaspace},
+        };
+        pre_tokenizer = {
+            {"type",     "Split"},
+            {"pattern",  {{"String", " "}}},
+            {"behavior", "MergedWithPrevious"},
+            {"invert",   false},
+        };
+        post_processor = {
+            {"type", "TemplateProcessing"},
+            {"single", json::array({ {{"Sequence", {{"id", "A"}, {"type_id", 0}}}} })},
+            {"pair",   json::array({ {{"Sequence", {{"id", "A"}, {"type_id", 0}}}},
+                                     {{"Sequence", {{"id", "B"}, {"type_id", 1}}}} })},
+            {"special_tokens", json::object()},
+        };
+        decoder = {
+            {"type", "Sequence"},
+            {"decoders", json::array({
+                json{{"type", "Replace"}, {"pattern", {{"String", kMetaspace}}}, {"content", " "}},
+                json{{"type", "ByteFallback"}},
+                json{{"type", "Fuse"}},
+            })},
+        };
+        model_body["fuse_unk"] = true;
+        model_body["byte_fallback"] = true;
+        if (unk_id >= 0 && static_cast<std::size_t>(unk_id) < tokens.size()) {
+            model_body["unk_token"] = tokens[static_cast<std::size_t>(unk_id)];
+        }
+    } else {
+        // -- Byte-level (gpt2) pre-tokenizer ------------------------------
+        json pre_tokenizers = json::array();
+        for (const auto& re : pre_spec.regex_exprs) {
+            pre_tokenizers.push_back({
+                {"type",     "Split"},
+                {"pattern",  {{"Regex", re}}},
+                {"behavior", "Isolated"},
+                {"invert",   false},
+            });
+        }
+        pre_tokenizers.push_back({
+            {"type",            "ByteLevel"},
+            {"add_prefix_space", false},
+            {"trim_offsets",     false},
+            {"use_regex",        false},
+        });
+        pre_tokenizer = {
+            {"type",          "Sequence"},
+            {"pretokenizers", pre_tokenizers},
+        };
+        if (pre_spec.needs_nfc_normalizer) {
+            normalizer = {{"type", "NFC"}};
+        }
+        json byte_level_pp = {
+            {"type",             "ByteLevel"},
+            {"add_prefix_space", false},
+            {"trim_offsets",     false},
+            {"use_regex",        false},
+        };
+        post_processor = byte_level_pp;
+        decoder = byte_level_pp;
+    }
+
     // -- tokenizer.json ---------------------------------------------------
     json tok = {
         {"version",        "1.0"},
@@ -535,8 +584,8 @@ void emit_tokenizer_files(const std::filesystem::path& gguf_file,
         {"added_tokens",   added_tokens},
         {"normalizer",     normalizer},
         {"pre_tokenizer",  pre_tokenizer},
-        {"post_processor", byte_level_pp},
-        {"decoder",        byte_level_pp},
+        {"post_processor", post_processor},
+        {"decoder",        decoder},
         {"model",          model_body},
     };
 
