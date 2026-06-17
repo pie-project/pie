@@ -144,6 +144,15 @@ Hparams parse_gguf_hparams(const GgufMeta& meta) {
         h.qwen35_linear_v_head_dim = h.qwen35_linear_k_head_dim;
         h.qwen35_linear_conv_kernel =
             static_cast<std::int32_t>(get_num(meta, a, "ssm.conv_kernel", 4));
+        // A GGUF always carries the converter's tiled V-head order; the
+        // graph must expand Q/K with a tiled broadcast to match.
+        h.qwen35_linear_v_tiled = true;
+
+        // qwen35moe shared expert (always-active dense path alongside the
+        // routed experts). The generic MoE block above already read
+        // expert_count / expert_used_count / expert_feed_forward_length.
+        h.shared_expert_intermediate_size = static_cast<std::int32_t>(
+            get_num(meta, a, "expert_shared_feed_forward_length", 0));
 
         // Per-layer attention type. The GGUF stores only the stride
         // `full_attention_interval`; llama.cpp derives the pattern as

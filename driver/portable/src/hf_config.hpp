@@ -202,6 +202,13 @@ struct Hparams {
     // mrope + output gate. Vision tower + multi-token-prediction head
     // are present in checkpoints but ignored by the driver.
     bool         qwen35_attn_output_gate     = false;
+    // GGUF stores the linear-attention V heads in *tiled* order (the
+    // llama.cpp qwen35 converter permutes grouped->tiled when
+    // num_v_heads != num_k_heads so ggml's tiled broadcast aligns); HF
+    // safetensors keep the original grouped order. The graph expands Q/K
+    // to match V using a tiled `ggml_repeat` when set, else a grouped
+    // `repeat_interleave`.
+    bool         qwen35_linear_v_tiled       = false;
     std::int32_t qwen35_full_attn_interval   = 0;
     std::int32_t qwen35_linear_num_k_heads   = 0;
     std::int32_t qwen35_linear_num_v_heads   = 0;
