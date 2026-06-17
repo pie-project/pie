@@ -509,43 +509,10 @@ GraphResult build_gemma4_graph(ggml_context* ctx,
     }
 
     // GPU-side sampler fast paths (mirror graph_qwen3 / graph_qwen3_5).
-    ggml_tensor* tokens_out  = nullptr;
-    ggml_tensor* top_k_idx   = nullptr;
-    ggml_tensor* top_k_probs = nullptr;
-    if (plan.all_greedy) {
-        tokens_out = ggml_argmax(ctx, logits);
-        ggml_set_name(tokens_out, "tokens_out");
-        ggml_set_output(tokens_out);
-        ggml_build_forward_expand(gf, tokens_out);
-    } else if (plan.uniform_top_sample) {
-        const float inv_t = 1.0f / plan.reqs[0].sampler.temperature;
-        ggml_tensor* probs = ggml_soft_max_ext(ctx, logits, /*mask=*/nullptr,
-                                                /*scale=*/inv_t, /*max_bias=*/0.0f);
-        top_k_idx = ggml_top_k(ctx, probs, plan.uniform_top_k);
-        // n_slots (sampled rows), not n_req: speculation samples >1 slot
-        // per request, so n_slots >= n_req.
-        const std::int64_t n_slots = probs->ne[1];
-        ggml_tensor* probs_3d = ggml_reshape_3d(ctx, probs, 1, h.vocab_size, n_slots);
-        ggml_tensor* gathered = ggml_get_rows(ctx, probs_3d, top_k_idx);
-        top_k_probs = ggml_reshape_2d(ctx, gathered, plan.uniform_top_k, n_slots);
-        ggml_set_name(top_k_idx,   "top_k_idx");
-        ggml_set_name(top_k_probs, "top_k_probs");
-        ggml_set_output(top_k_idx);
-        ggml_set_output(top_k_probs);
-        ggml_build_forward_expand(gf, top_k_idx);
-        ggml_build_forward_expand(gf, top_k_probs);
-    } else {
-        ggml_set_name(logits, "logits");
-        ggml_set_output(logits);
-        ggml_build_forward_expand(gf, logits);
-    }
-
     GraphResult res{};
     res.gf = gf;
-    if (plan.all_greedy)              res.tokens_out = tokens_out;
-    else if (plan.uniform_top_sample) { res.top_k_idx = top_k_idx; res.top_k_probs = top_k_probs; }
-    else                               res.logits = logits;
     res.in = in;
+    build_sampling_outputs(ctx, gf, logits, plan, res);
     return res;
 }
 

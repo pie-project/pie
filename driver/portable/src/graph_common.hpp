@@ -141,6 +141,25 @@ struct GraphResult {
 void upload_graph_inputs(const GraphResult& g,
                          const Executor::BatchPlan& plan);
 
+// Build the GPU-side sampling output tensors from the final `logits` and
+// attach them to the graph, then record them on `res`. This is the shared
+// tail of every per-arch graph builder. Exactly one path fires, matched
+// against the BatchPlan sampler flags:
+//   all_greedy        → res.tokens_out  (on-device ggml_argmax)
+//   uniform_top_sample → res.top_k_idx + res.top_k_probs (top-K + gather)
+//   else              → res.logits      (raw block; host samples)
+//
+// The uniform-top-K gather reshapes key on the slot count `probs->ne[1]`
+// (= n_slots), NOT the request count: pass-level speculation samples more
+// than one slot per request (draft verification), so n_slots >= n_req.
+// Keying on n_req trips GGML's `nelements == ne0*ne1*ne2` assert once
+// speculation widens the batch.
+void build_sampling_outputs(ggml_context* ctx,
+                            ggml_cgraph*  gf,
+                            ggml_tensor*  logits,
+                            const Executor::BatchPlan& plan,
+                            GraphResult&  res);
+
 // Allocate the standard set of per-batch graph input tensors
 // (`tok_input`, `pos_input`, `kv_idxs`, `out_idx`) plus either the
 // packed-decode pair (`packed_gather` + `packed_mask`) or per-request
