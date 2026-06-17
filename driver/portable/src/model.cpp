@@ -1460,7 +1460,17 @@ void Model::build_gemma4_() {
     // ----- proportional-RoPE freq_factors (full layers only) -----
     // partial_factor < 1 means proportional RoPE: rotate first
     // (head_dim_global * partial)/2 dim-pairs, leaving the rest untouched.
-    if (h.gemma4_rope_partial_factor_full < 1.0f
+    if (archive_->is_gguf()) {
+        // GGUF gemma4 ships the full-layer proportional-RoPE freq factors as a
+        // root-level `rope_freqs.weight` tensor ([head_dim_global/2] F32: 1.0
+        // for rotated dim-pairs, 1e30 for the unrotated tail — identical to
+        // what synth_proportional_rope_factors_ builds). Load it directly so
+        // we honour whatever partial-rotary factor the converter encoded
+        // (it is not stored as a scalar KV).
+        if (archive_->find("rope_freqs.weight") != nullptr) {
+            weights_.gemma4_rope_full_factors = declare_("rope_freqs.weight");
+        }
+    } else if (h.gemma4_rope_partial_factor_full < 1.0f
         && h.gemma4_rope_partial_factor_full > 0.0f) {
         const std::int32_t hd = h.gemma4_head_dim_global > 0
             ? h.gemma4_head_dim_global : h.head_dim;
@@ -1505,7 +1515,13 @@ void Model::build_gemma4_() {
         // Per-layer scalar (BF16 [1] in checkpoint; converted to F32 at
         // load time so the per-batch elementwise mul against an F32
         // residual stream skips the in-graph cast).
-        L.layer_scalar = declare_synth_f32_from_bf16_(p + "layer_scalar");
+        // Per-layer residual scalar. The safetensors checkpoint stores it
+        // BF16 [1] (converted to F32 at load); the GGUF (llama.cpp
+        // `layer_output_scale.weight`) already carries it as F32 [1], so
+        // load it directly.
+        L.layer_scalar = archive_->is_gguf()
+            ? declare_(p + "layer_scalar")
+            : declare_synth_f32_from_bf16_(p + "layer_scalar");
 
         // Q always exists. Per-layer head_dim is encoded in the tensor's
         // shape via num_attention_heads × (head_dim or global_head_dim).

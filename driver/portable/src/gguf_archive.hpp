@@ -40,7 +40,11 @@ struct GgufMeta {
     // All KV pairs as (key, type-erased) — used by the hparams parser.
     // Type is one of gguf_type's underlying values.
     struct KV { std::string key; std::int32_t type; std::string str_value;
-                double num_value = 0.0; bool bool_value = false; };
+                double num_value = 0.0; bool bool_value = false;
+                // Integer/bool ARRAY payload (e.g. gemma4 per-layer
+                // head_count_kv / sliding_window_pattern). Empty for
+                // scalar or string/float-array KVs.
+                std::vector<std::int64_t> arr_int; };
     std::unordered_map<std::string, KV> kv;
 };
 

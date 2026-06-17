@@ -59,6 +59,16 @@ bool get_bool(const GgufMeta& m, const std::string& arch, const char* key,
     return kv ? kv->bool_value : dflt;
 }
 
+// Integer/bool ARRAY payload captured during archive construction (e.g.
+// gemma4 per-layer head_count_kv / sliding_window_pattern). Empty when the
+// key is absent or not an integer array.
+const std::vector<std::int64_t>& get_int_array(
+        const GgufMeta& m, const std::string& arch, const char* key) {
+    static const std::vector<std::int64_t> kEmpty;
+    const auto* kv = find_kv(m, arch, key);
+    return kv ? kv->arr_int : kEmpty;
+}
+
 }  // namespace
 
 Hparams parse_gguf_hparams(const GgufMeta& meta) {
@@ -178,6 +188,76 @@ Hparams parse_gguf_hparams(const GgufMeta& meta) {
         // leaving it false reshapes the double-wide Q to the single-width
         // head layout and aborts (ggml_nelements mismatch).
         h.qwen35_attn_output_gate = true;
+    }
+
+    // ---- Gemma 4 (alternating sliding/full attention + proportional RoPE) ---
+    // The safetensors path fills these from config.json (hf_config.cpp); for a
+    // GGUF the same facts live under the `gemma4.*` kv namespace. Without
+    // `layer_types` `model.cpp::build_gemma4_` throws "layer_types missing".
+    if (h.arch == PieArch::Gemma4) {
+        // Per-layer attention type from the sliding_window_pattern array.
+        // llama.cpp Gemma4Model writes swa_layers[i] = (layer_types[i] ==
+        // "sliding_attention"): 1 => sliding ('s'), 0 => full/global ('g').
+        const auto& pattern =
+            get_int_array(meta, a, "attention.sliding_window_pattern");
+        if (!pattern.empty()) {
+            h.layer_types.assign(pattern.size(), 's');
+            for (std::size_t i = 0; i < pattern.size(); ++i) {
+                if (pattern[i] == 0) h.layer_types[i] = 'g';
+            }
+        }
+
+        // Dual head_dim: full-attention layers use key_length, sliding layers
+        // use key_length_swa. The graph keeps the sliding dim in `head_dim`
+        // and the full dim in `gemma4_head_dim_global` (the generic block
+        // above set head_dim to key_length, i.e. the full dim — override).
+        const std::int32_t kl_full = static_cast<std::int32_t>(
+            get_num(meta, a, "attention.key_length", h.head_dim));
+        const std::int32_t kl_swa = static_cast<std::int32_t>(
+            get_num(meta, a, "attention.key_length_swa", kl_full));
+        h.gemma4_head_dim_global = kl_full;
+        h.head_dim = kl_swa;
+
+        // Dual kv-head count: head_count_kv is a per-layer array (sliding and
+        // full layers carry different counts). Reduce to the two scalars the
+        // attention path uses: num_key_value_heads (sliding) and
+        // num_global_key_value_heads (full).
+        const auto& kvh = get_int_array(meta, a, "attention.head_count_kv");
+        if (!kvh.empty() && kvh.size() == h.layer_types.size()) {
+            for (std::size_t i = 0; i < kvh.size(); ++i) {
+                if (h.layer_types[i] == 'g')
+                    h.num_global_key_value_heads =
+                        static_cast<std::int32_t>(kvh[i]);
+                else
+                    h.num_key_value_heads = static_cast<std::int32_t>(kvh[i]);
+            }
+        }
+
+        // Per-attention-type RoPE base. Full layers additionally use a
+        // proportional RoPE whose freq_factors come from the GGUF
+        // `rope_freqs.weight` tensor (loaded in build_gemma4_); no scalar
+        // partial-rotary factor is stored.
+        h.gemma4_rope_theta_full = static_cast<float>(
+            get_num(meta, a, "rope.freq_base", 1e6));
+        h.gemma4_rope_theta_sliding = static_cast<float>(
+            get_num(meta, a, "rope.freq_base_swa", 1e4));
+
+        // Final-logit softcapping (gemma4 caps logits; gemma4 omits the
+        // gemma2-era attention softcapping).
+        if (const auto* kv = find_kv(meta, a, "final_logit_softcapping")) {
+            h.final_logit_softcapping = static_cast<float>(kv->num_value);
+        }
+
+        // KV-cache sharing / PLE / MoE. The dense single-file text builds set
+        // these to 0 / off; larger variants populate them.
+        h.gemma4_num_kv_shared_layers = static_cast<std::int32_t>(
+            get_num(meta, a, "attention.shared_kv_layers", 0));
+        h.gemma4_ple_dim = static_cast<std::int32_t>(
+            get_num(meta, a, "embedding_length_per_layer_input", 0));
+        h.gemma4_enable_moe = h.num_experts > 0;
+        if (h.gemma4_enable_moe) {
+            h.gemma4_moe_intermediate_size = h.moe_intermediate_size;
+        }
     }
 
     return h;

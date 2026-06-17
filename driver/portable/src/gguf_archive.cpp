@@ -66,7 +66,7 @@ bool get_rows_supports(ggml_type t) {
 // when a tensor has no canonical mapping (the caller keeps the raw
 // name; per-arch loaders that look up by HF name will simply not find
 // it, which is what we want for unknown-but-harmless extras).
-std::string gguf_to_hf_name(const std::string& g) {
+std::string gguf_to_hf_name(const std::string& g, bool gemma_norm_layout) {
     // Top-level tensors.
     if (g == "token_embd.weight")  return "model.embed_tokens.weight";
     if (g == "output_norm.weight") return "model.norm.weight";
@@ -83,9 +83,18 @@ std::string gguf_to_hf_name(const std::string& g) {
 
     // Norms.
     if (suffix == "attn_norm.weight")        return layer + "input_layernorm.weight";
-    if (suffix == "ffn_norm.weight")         return layer + "post_attention_layernorm.weight";
+    // `ffn_norm` is the pre-MLP norm. In the Llama family it is the only
+    // post-attention norm, so it maps to `post_attention_layernorm`. The
+    // Gemma family instead carries BOTH a distinct `post_attention_norm`
+    // (the post-attention norm) AND `ffn_norm` (the PRE-feedforward norm),
+    // so for gemma `ffn_norm` is the pre-feedforward layernorm.
+    if (suffix == "ffn_norm.weight")
+        return layer + (gemma_norm_layout ? "pre_feedforward_layernorm.weight"
+                                          : "post_attention_layernorm.weight");
     if (suffix == "post_attention_norm.weight") return layer + "post_attention_layernorm.weight";
     if (suffix == "post_ffw_norm.weight")    return layer + "post_feedforward_layernorm.weight";
+    // Gemma 4 per-layer residual scalar (HF `layer_scalar`).
+    if (suffix == "layer_output_scale.weight") return layer + "layer_scalar";
     // Attention projections.
     if (suffix == "attn_q.weight")           return layer + "self_attn.q_proj.weight";
     if (suffix == "attn_k.weight")           return layer + "self_attn.k_proj.weight";
@@ -223,7 +232,47 @@ GGUFArchive::GGUFArchive(const std::filesystem::path& gguf_file) {
             case GGUF_TYPE_FLOAT64: kv.num_value = gguf_get_val_f64(gctx_, i); break;
             case GGUF_TYPE_BOOL:    kv.bool_value = gguf_get_val_bool(gctx_, i); break;
             case GGUF_TYPE_STRING:  kv.str_value = gguf_get_val_str(gctx_, i); break;
-            case GGUF_TYPE_ARRAY:   /* arrays handled on demand (tokens, etc.) */ break;
+            case GGUF_TYPE_ARRAY: {
+                // String / float arrays (tokens, scores) are handled on
+                // demand elsewhere. Capture small integer/bool arrays here:
+                // gemma4 stores per-layer hparams (head_count_kv,
+                // sliding_window_pattern) as integer/bool arrays the hparams
+                // parser needs.
+                const auto et = gguf_get_arr_type(gctx_, i);
+                // String / float arrays are skipped: gguf_get_arr_data aborts
+                // on a string-element array, and floats aren't per-layer
+                // hparams. Only fetch the contiguous data block for the
+                // integer/bool element types we capture.
+                const bool is_int_arr =
+                    et == GGUF_TYPE_UINT8  || et == GGUF_TYPE_INT8  ||
+                    et == GGUF_TYPE_UINT16 || et == GGUF_TYPE_INT16 ||
+                    et == GGUF_TYPE_UINT32 || et == GGUF_TYPE_INT32 ||
+                    et == GGUF_TYPE_UINT64 || et == GGUF_TYPE_INT64 ||
+                    et == GGUF_TYPE_BOOL;
+                if (!is_int_arr) break;
+                const std::size_t n = gguf_get_arr_n(gctx_, i);
+                const void* d = gguf_get_arr_data(gctx_, i);
+                auto take = [&](auto* typed) {
+                    kv.arr_int.reserve(n);
+                    for (std::size_t j = 0; j < n; ++j) {
+                        kv.arr_int.push_back(
+                            static_cast<std::int64_t>(typed[j]));
+                    }
+                };
+                switch (et) {
+                    case GGUF_TYPE_UINT8:
+                    case GGUF_TYPE_BOOL:  take(static_cast<const std::uint8_t*>(d));  break;
+                    case GGUF_TYPE_INT8:  take(static_cast<const std::int8_t*>(d));   break;
+                    case GGUF_TYPE_UINT16: take(static_cast<const std::uint16_t*>(d)); break;
+                    case GGUF_TYPE_INT16: take(static_cast<const std::int16_t*>(d));  break;
+                    case GGUF_TYPE_UINT32: take(static_cast<const std::uint32_t*>(d)); break;
+                    case GGUF_TYPE_INT32: take(static_cast<const std::int32_t*>(d));  break;
+                    case GGUF_TYPE_UINT64: take(static_cast<const std::uint64_t*>(d)); break;
+                    case GGUF_TYPE_INT64: take(static_cast<const std::int64_t*>(d));  break;
+                    default: break;  // string / float arrays: leave empty
+                }
+                break;
+            }
             default: break;
         }
         meta_.kv.emplace(key, std::move(kv));
@@ -358,7 +407,11 @@ GGUFArchive::GGUFArchive(const std::filesystem::path& gguf_file) {
             st.ggml_type_override = static_cast<std::int32_t>(GGML_TYPE_F16);
         }
 
-        std::string canonical = gguf_to_hf_name(raw);
+        // Gemma uses a distinct pre/post-feedforward norm layout that
+        // re-tasks `ffn_norm`; key the mapping on the file's arch.
+        const bool gemma_norm_layout =
+            meta_.general_architecture.rfind("gemma", 0) == 0;
+        std::string canonical = gguf_to_hf_name(raw, gemma_norm_layout);
         if (canonical.empty()) {
             // Unmapped tensor — keep under the raw name so callers that
             // know about it can still find it (e.g. arch-specific
