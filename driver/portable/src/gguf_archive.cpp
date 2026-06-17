@@ -60,94 +60,14 @@ bool get_rows_supports(ggml_type t) {
     }
 }
 
-// GGUF tensor name → HF-canonical name. Currently covers the
-// Llama-family layout used by qwen3 / qwen2 / llama3 / mistral3 / olmo3
-// and Qwen3-MoE / Mixtral / gpt-oss MoE variants. Returns empty string
-// when a tensor has no canonical mapping (the caller keeps the raw
-// name; per-arch loaders that look up by HF name will simply not find
-// it, which is what we want for unknown-but-harmless extras).
-std::string gguf_to_hf_name(const std::string& g, bool gemma_norm_layout) {
-    // Top-level tensors.
-    if (g == "token_embd.weight")  return "model.embed_tokens.weight";
-    if (g == "output_norm.weight") return "model.norm.weight";
-    if (g == "output.weight")      return "lm_head.weight";
-
-    // Per-block: `blk.{N}.<part>` → `model.layers.{N}.<...>`.
-    const std::string blk = "blk.";
-    if (g.compare(0, blk.size(), blk) != 0) return {};
-    auto dot = g.find('.', blk.size());
-    if (dot == std::string::npos) return {};
-    const std::string n = g.substr(blk.size(), dot - blk.size());
-    const std::string suffix = g.substr(dot + 1);
-    const std::string layer = "model.layers." + n + ".";
-
-    // Norms.
-    if (suffix == "attn_norm.weight")        return layer + "input_layernorm.weight";
-    // `ffn_norm` is the pre-MLP norm. In the Llama family it is the only
-    // post-attention norm, so it maps to `post_attention_layernorm`. The
-    // Gemma family instead carries BOTH a distinct `post_attention_norm`
-    // (the post-attention norm) AND `ffn_norm` (the PRE-feedforward norm),
-    // so for gemma `ffn_norm` is the pre-feedforward layernorm.
-    if (suffix == "ffn_norm.weight")
-        return layer + (gemma_norm_layout ? "pre_feedforward_layernorm.weight"
-                                          : "post_attention_layernorm.weight");
-    if (suffix == "post_attention_norm.weight") return layer + "post_attention_layernorm.weight";
-    if (suffix == "post_ffw_norm.weight")    return layer + "post_feedforward_layernorm.weight";
-    // Gemma 4 per-layer residual scalar (HF `layer_scalar`).
-    if (suffix == "layer_output_scale.weight") return layer + "layer_scalar";
-    // Attention projections.
-    if (suffix == "attn_q.weight")           return layer + "self_attn.q_proj.weight";
-    if (suffix == "attn_k.weight")           return layer + "self_attn.k_proj.weight";
-    if (suffix == "attn_v.weight")           return layer + "self_attn.v_proj.weight";
-    if (suffix == "attn_output.weight")      return layer + "self_attn.o_proj.weight";
-    if (suffix == "attn_q.bias")             return layer + "self_attn.q_proj.bias";
-    if (suffix == "attn_k.bias")             return layer + "self_attn.k_proj.bias";
-    if (suffix == "attn_v.bias")             return layer + "self_attn.v_proj.bias";
-    if (suffix == "attn_output.bias")        return layer + "self_attn.o_proj.bias";
-    // Per-head q/k norms (Qwen 3, Olmo 3, Gemma 3).
-    if (suffix == "attn_q_norm.weight")      return layer + "self_attn.q_norm.weight";
-    if (suffix == "attn_k_norm.weight")      return layer + "self_attn.k_norm.weight";
-    // Dense FFN.
-    if (suffix == "ffn_gate.weight")         return layer + "mlp.gate_proj.weight";
-    if (suffix == "ffn_up.weight")           return layer + "mlp.up_proj.weight";
-    if (suffix == "ffn_down.weight")         return layer + "mlp.down_proj.weight";
-    // MoE: stacked-expert tensors land directly on the same canonical
-    // names our existing model.cpp uses for `moe_gate_exps` etc. We
-    // include both the qwen3_moe / mixtral / gpt-oss style stacked
-    // tensors and the legacy per-expert form (some converters still
-    // emit `blk.N.ffn_gate.E.weight`).
-    if (suffix == "ffn_gate_inp.weight")     return layer + "mlp.gate.weight";
-    if (suffix == "ffn_gate_exps.weight")    return layer + "mlp.experts.gate_proj.weight";
-    if (suffix == "ffn_up_exps.weight")      return layer + "mlp.experts.up_proj.weight";
-    if (suffix == "ffn_down_exps.weight")    return layer + "mlp.experts.down_proj.weight";
-    // Qwen 3.5 / 3.6 shared expert (qwen35moe). `ffn_gate_inp_shexp` is the
-    // 1-D sigmoid gate over the shared expert (HF `mlp.shared_expert_gate`),
-    // distinct from the per-token router `ffn_gate_inp`.
-    if (suffix == "ffn_gate_shexp.weight")     return layer + "mlp.shared_expert.gate_proj.weight";
-    if (suffix == "ffn_up_shexp.weight")       return layer + "mlp.shared_expert.up_proj.weight";
-    if (suffix == "ffn_down_shexp.weight")     return layer + "mlp.shared_expert.down_proj.weight";
-    if (suffix == "ffn_gate_inp_shexp.weight") return layer + "mlp.shared_expert_gate.weight";
-    // Qwen 3.5 / 3.6 hybrid gated-delta-rule linear attention. The GGUF
-    // (llama.cpp qwen35 convention) packs the linear-attn input projection
-    // as `attn_qkv` (the fused q/k/v of the delta net) + `attn_gate` (the
-    // output Z gate), and the gated-delta params as `ssm_*`. These names
-    // only ever appear on the *linear* layers; full-attention layers carry
-    // the ordinary `attn_q/k/v` handled above. The convert-time value
-    // transforms (A_log = -exp(raw); folded norm.weight +1) are inverted at
-    // load in `model.cpp::build_qwen3_5_`, not here.
-    if (suffix == "attn_qkv.weight")         return layer + "linear_attn.in_proj_qkv.weight";
-    if (suffix == "attn_gate.weight")        return layer + "linear_attn.in_proj_z.weight";
-    if (suffix == "ssm_alpha.weight")        return layer + "linear_attn.in_proj_a.weight";
-    if (suffix == "ssm_beta.weight")         return layer + "linear_attn.in_proj_b.weight";
-    if (suffix == "ssm_a")                   return layer + "linear_attn.A_log";
-    if (suffix == "ssm_dt.bias")             return layer + "linear_attn.dt_bias";
-    if (suffix == "ssm_conv1d.weight")       return layer + "linear_attn.conv1d.weight";
-    if (suffix == "ssm_norm.weight")         return layer + "linear_attn.norm.weight";
-    if (suffix == "ssm_out.weight")          return layer + "linear_attn.out_proj.weight";
-    return {};
-}
-
 }  // namespace
+
+// `gguf_to_hf_name` is defined `inline` in gguf_archive.hpp so the
+// qwen35 mapper-coverage testhook (a separate TU) carries its own copy and
+// does not depend on this object being pulled into the test binary's link
+// (the dummy/portable `--bin pie` test never instantiates GGUFArchive, so
+// gc-sections would otherwise drop the definition and leave the testhook's
+// reference undefined).
 
 void GGUFArchive::close_mmap_() noexcept {
 #ifdef _WIN32
