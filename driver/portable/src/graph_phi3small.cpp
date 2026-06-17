@@ -219,10 +219,13 @@ GraphResult build_phi3small_graph(ggml_context* ctx,
         auto* probs = ggml_soft_max_ext(ctx, logits, /*mask=*/nullptr,
                                         /*scale=*/inv_t, /*max_bias=*/0.0f);
         auto* top_k_idx = ggml_top_k(ctx, probs, plan.uniform_top_k);
-        auto* probs_3d  = ggml_reshape_3d(ctx, probs, 1, h.vocab_size, n_req);
+        // n_slots (sampled rows), not n_req: speculation samples >1 slot
+        // per request, so n_slots >= n_req.
+        const std::int64_t n_slots = probs->ne[1];
+        auto* probs_3d  = ggml_reshape_3d(ctx, probs, 1, h.vocab_size, n_slots);
         auto* gathered  = ggml_get_rows(ctx, probs_3d, top_k_idx);
         auto* top_k_probs = ggml_reshape_2d(
-            ctx, gathered, plan.uniform_top_k, n_req);
+            ctx, gathered, plan.uniform_top_k, n_slots);
         ggml_set_name(top_k_idx, "top_k_idx");
         ggml_set_name(top_k_probs, "top_k_probs");
         ggml_set_output(top_k_idx);
