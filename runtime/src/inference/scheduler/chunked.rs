@@ -96,8 +96,21 @@ impl PendingRequest {
             physical_page_ids,
             last_page_len,
         } = self;
-        let Completion::Direct(response_tx) = completion else {
-            unreachable!("chunk continuations returned above");
+        // Cold submits are always first-fired as `Completion::Chain`
+        // (see `speculator::start_chain`), regardless of the configured
+        // `speculation_depth` — that setting only bounds how many further
+        // stages get pre-fired after this one, not whether the first fire
+        // itself is chain-tagged. So an oversized prompt needing chunking
+        // can arrive as either `Direct` or `Chain`; only `Chunk` (handled
+        // above) is excluded. `ChainState::response` carries the same
+        // sender type as `Direct`, so we can degrade a chain's first fire
+        // to a plain chunked response — the speculative pre-fire chain
+        // can't be continued across chunk boundaries anyway, so dropping
+        // the rest of `state` here is correct, not a shortcut.
+        let response_tx = match completion {
+            Completion::Direct(response_tx) => response_tx,
+            Completion::Chain { state } => state.response,
+            Completion::Chunk { .. } => unreachable!("chunk continuations returned above"),
         };
         let response_accumulator = ChunkResponseAccumulator::new(request.samplers.len());
 
