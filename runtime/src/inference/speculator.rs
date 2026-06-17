@@ -93,6 +93,15 @@ pub(crate) fn entry_matches_request(
     if request.token_ids.len() != 1 {
         return false;
     }
+    // A staged fire is pre-built with an empty constraint surface
+    // (logit_masks = [], fully causal): the next position's grammar /
+    // attention mask isn't known yet. So a request carrying a logit mask
+    // (grammar / schema / forced-tool) or a custom attention mask must
+    // miss and take the cold path where the mask is applied. Mirrors the
+    // producer skip set in `evaluate_request_shape`; keep them symmetric.
+    if !request.logit_masks.is_empty() || request.has_user_mask {
+        return false;
+    }
     let base = Some(entry.anchor_token) == request.token_ids.first().copied()
         && Some(entry.anchor_pos) == request.position_ids.first().copied()
         && entry.spec_token_ids == request.spec_token_ids
@@ -842,6 +851,67 @@ mod tests {
         assert_eq!(next.output_spec_flags, vec![true]);
         assert_eq!(next.rs_slot_ids, vec![7]);
         assert_eq!(next.rs_slot_flags, vec![0]);
+    }
+
+    fn staged_entry(anchor_token: u32, anchor_pos: u32) -> StagedEntry {
+        let (_tx, rx) = oneshot::channel();
+        StagedEntry {
+            anchor_token,
+            anchor_pos,
+            spec_token_ids: Vec::new(),
+            spec_position_ids: Vec::new(),
+            output_spec_flags: vec![false],
+            uses_rs_cache: false,
+            allow_extend: Arc::new(AtomicBool::new(true)),
+            output_rx: rx,
+        }
+    }
+
+    /// A logit-masked request (grammar / schema / forced-tool) must miss a
+    /// staged fire, which carries no mask, and take the cold path.
+    #[test]
+    fn entry_match_rejects_logit_masked_request() {
+        // Same single-token anchor the extender would have staged.
+        let mut req = req_with(vec![11], vec![0], vec![argmax()]);
+        req.token_ids = vec![42];
+        let entry = staged_entry(42, 11);
+
+        // Unconstrained decode at this anchor: a hit is correct.
+        assert!(entry_matches_request(&entry, &req));
+
+        // Attach a non-empty logit mask (BRLE: forbid id 0, allow the
+        // rest). Now the same anchor must NOT match — the staged fire
+        // never saw this constraint.
+        req.logit_masks = vec![pie_bridge::Brle::from_vec(vec![1, u32::MAX])];
+        req.logit_mask_indptr = vec![0, 1];
+        assert!(
+            !entry_matches_request(&entry, &req),
+            "constrained request must not be served from an unconstrained staged fire"
+        );
+    }
+
+    /// Twin of the logit-mask guard: a custom attention mask (windowed /
+    /// sink / hierarchical) must miss the fully-causal staged fire.
+    #[test]
+    fn entry_match_rejects_user_masked_request() {
+        // Same single-token anchor the extender would have staged.
+        let mut req = req_with(vec![11], vec![0], vec![argmax()]);
+        req.token_ids = vec![42];
+        let entry = staged_entry(42, 11);
+
+        // Unconstrained, fully-causal decode at this anchor: a hit is
+        // correct.
+        assert!(entry_matches_request(&entry, &req));
+
+        // Supply a custom attention mask (as windowed-attention does once
+        // the sequence exceeds the window). The same anchor must NOT match —
+        // the staged fire was computed fully-causal.
+        req.masks = vec![pie_bridge::Brle::from_vec(vec![0, u32::MAX])];
+        req.has_user_mask = true;
+        assert!(
+            !entry_matches_request(&entry, &req),
+            "attention-masked request must not be served from a fully-causal staged fire"
+        );
     }
 
     #[test]
