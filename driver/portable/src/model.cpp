@@ -961,6 +961,23 @@ void Model::load_qwen3_5_moe_layer_(std::int32_t i, const std::string& p) {
     // Router: HF naming `mlp.gate.weight`, shape [num_experts, hidden].
     L.moe_router = declare_(p + "mlp.gate.weight");
 
+    // GGUF path: llama.cpp stores the experts as three SEPARATE stacked
+    // tensors (`ffn_gate_exps` / `ffn_up_exps` / `ffn_down_exps`, mapped to
+    // `mlp.experts.{gate,up,down}_proj`) already in ggml's mul_mat_id
+    // layout, so declare each directly — no fused gate_up split.
+    if (archive_->is_gguf()) {
+        L.moe_gate_exps = declare_(p + "mlp.experts.gate_proj.weight");
+        L.moe_up_exps   = declare_(p + "mlp.experts.up_proj.weight");
+        L.moe_down_exps = declare_(p + "mlp.experts.down_proj.weight");
+        if (h.shared_expert_intermediate_size > 0) {
+            L.moe_shared_gate_proj = declare_(p + "mlp.shared_expert.gate_proj.weight");
+            L.moe_shared_up_proj   = declare_(p + "mlp.shared_expert.up_proj.weight");
+            L.moe_shared_down_proj = declare_(p + "mlp.shared_expert.down_proj.weight");
+            L.moe_shared_gate      = declare_(p + "mlp.shared_expert_gate.weight");
+        }
+        return;
+    }
+
     // Fused experts. Source `mlp.experts.gate_up_proj` is one 3D safetensor
     // [n_exp, 2*ff, hidden]; we split into separate stacked gate / up
     // tensors at load time so the existing build_moe_ffn helper applies.
