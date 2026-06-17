@@ -119,7 +119,8 @@ pub struct LlamaInstruct {
 impl LlamaInstruct {
     pub fn new(tokenizer: Arc<Tokenizer>) -> Self {
         let encode = |s: &str| tokenizer.encode(s);
-        let stop_strs = ["<|eot_id|>", "<|end_of_text|>"];
+        // <|eom_id|> ends a tool/ipython message turn (Llama 3.1+).
+        let stop_strs = ["<|eot_id|>", "<|eom_id|>", "<|end_of_text|>"];
         let stop_ids: Vec<u32> = stop_strs
             .iter()
             .filter_map(|s| tokenizer.token_to_id(s))
@@ -328,6 +329,7 @@ mod tests {
             "<|start_header_id|>",
             "<|end_header_id|>",
             "<|eot_id|>",
+            "<|eom_id|>",
             "<|end_of_text|>",
             "system",
             "user",
@@ -373,7 +375,7 @@ mod tests {
     fn has_correct_stop_tokens() {
         let inst = llama3();
         let stop = inst.seal();
-        assert_eq!(stop.len(), 2);
+        assert_eq!(stop.len(), 3);
     }
 
     #[test]
