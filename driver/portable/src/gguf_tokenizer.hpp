@@ -7,8 +7,15 @@
 // and reports that dir as the snapshot_dir in its capabilities.
 
 #include <filesystem>
+#include <string>
 
 namespace pie_portable_driver {
+
+// The SentencePiece (gemma) normalizer node as a serialized `tokenizers`
+// JSON string. `add_space_prefix` (SentencePiece add_dummy_prefix /
+// GGUF tokenizer.ggml.add_space_prefix) selects the leading-metaspace
+// Prepend. Exposed for the bin-level normalizer-shape regression test.
+std::string spm_normalizer_json(bool add_space_prefix);
 
 // Read the tokenizer KVs from `gguf_file` and write `tokenizer.json` and
 // `tokenizer_config.json` into `target_dir` (must exist). Throws on:

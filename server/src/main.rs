@@ -153,3 +153,66 @@ mod portable_qwen35_mapping_tests {
         assert_eq!(dim(4), 512, "shared-expert intermediate size");
     }
 }
+
+// F3 regression guard: the GGUF tokenizer minter must emit the leading
+// metaspace Prepend in the gemma SPM normalizer exactly when
+// tokenizer.ggml.add_space_prefix is set. Without the Prepend a
+// non-space-leading input loses its leading ▁ and its first piece
+// tokenizes to different IDs than the reference gemma tokenizer. A
+// test-only C entry returns the serialized normalizer node for a given
+// flag. Lives in the `pie` bin because CI runs `cargo test -p pie-server
+// --bin pie`; driver/portable ctest never runs in CI.
+#[cfg(all(test, feature = "driver-portable"))]
+mod portable_gguf_tokenizer_tests {
+    use std::os::raw::{c_char, c_int};
+
+    unsafe extern "C" {
+        fn pie_portable_test_spm_normalizer_json(
+            add_space_prefix: c_int,
+            out: *mut c_char,
+            cap: c_int,
+        ) -> c_int;
+    }
+
+    fn normalizer_json(add_space_prefix: bool) -> String {
+        let mut buf = vec![0u8; 512];
+        let n = unsafe {
+            pie_portable_test_spm_normalizer_json(
+                add_space_prefix as c_int,
+                buf.as_mut_ptr() as *mut c_char,
+                buf.len() as c_int,
+            )
+        };
+        assert!(n > 0, "normalizer testhook returned {n}");
+        String::from_utf8(buf[..n as usize].to_vec()).unwrap()
+    }
+
+    // ▁ = U+2581, the SentencePiece metaspace marker.
+    const META: &str = "\u{2581}";
+
+    // gemma-4 ships add_space_prefix=false → bare Replace (matches
+    // google/gemma-4 tokenizer.json); NO Prepend, NO Sequence.
+    #[test]
+    fn no_space_prefix_emits_bare_replace() {
+        let j = normalizer_json(false);
+        assert!(j.contains("\"Replace\""), "{j}");
+        assert!(j.contains(META), "{j}");
+        assert!(!j.contains("Prepend"), "bare normalizer must not Prepend: {j}");
+        assert!(!j.contains("Sequence"), "bare normalizer must not be a Sequence: {j}");
+    }
+
+    // add_space_prefix=true → Sequence[Prepend ▁, Replace], Prepend FIRST so
+    // a non-space-leading input keeps its leading metaspace.
+    #[test]
+    fn space_prefix_prepends_metaspace_before_replace() {
+        let j = normalizer_json(true);
+        assert!(j.contains("Sequence"), "{j}");
+        assert!(j.contains("Prepend"), "{j}");
+        assert!(j.contains("\"Replace\""), "{j}");
+        assert!(j.contains(META), "{j}");
+        let prepend_at = j.find("Prepend").unwrap();
+        let replace_at = j.find("Replace").unwrap();
+        assert!(prepend_at < replace_at,
+                "Prepend must precede Replace so the leading metaspace is added first: {j}");
+    }
+}

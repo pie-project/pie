@@ -67,6 +67,13 @@ std::int64_t get_int_or(gguf_context* ctx, const char* k, std::int64_t fb) {
     }
 }
 
+bool get_bool_or(gguf_context* ctx, const char* k, bool fb) {
+    const std::int64_t id = gguf_find_key(ctx, k);
+    if (id < 0) return fb;
+    if (gguf_get_kv_type(ctx, id) != GGUF_TYPE_BOOL) return fb;
+    return gguf_get_val_bool(ctx, id);
+}
+
 std::vector<std::string> get_str_array(gguf_context* ctx, const char* k) {
     const std::int64_t id = gguf_find_key(ctx, k);
     if (id < 0) {
@@ -388,6 +395,33 @@ std::pair<std::string, std::string> split_merge(const std::string& m) {
 
 }  // namespace
 
+// SentencePiece (gemma) normalizer as a `tokenizers` JSON node. Spaces are
+// always replaced by the ▁ metaspace marker; when `add_space_prefix` is set
+// (SentencePiece add_dummy_prefix / GGUF tokenizer.ggml.add_space_prefix —
+// the SentencePiece default), a leading ▁ is prepended FIRST so a
+// non-space-leading input still gets a leading metaspace and its first
+// piece tokenizes to the same IDs as the reference. gemma-4 ships
+// add_space_prefix=false → bare Replace, matching google/gemma-4
+// tokenizer.json. Exposed (and de-anonymized) for the bin-level
+// normalizer-shape test.
+std::string spm_normalizer_json(bool add_space_prefix) {
+    const std::string kMetaspace = "\xe2\x96\x81";
+    nlohmann::json replace = {
+        {"type", "Replace"},
+        {"pattern", {{"String", " "}}},
+        {"content", kMetaspace},
+    };
+    if (!add_space_prefix) return replace.dump();
+    nlohmann::json seq = {
+        {"type", "Sequence"},
+        {"normalizers", nlohmann::json::array({
+            nlohmann::json{{"type", "Prepend"}, {"prepend", kMetaspace}},
+            replace,
+        })},
+    };
+    return seq.dump();
+}
+
 void emit_tokenizer_files(const std::filesystem::path& gguf_file,
                           const std::filesystem::path& target_dir) {
     if (!std::filesystem::is_directory(target_dir)) {
@@ -510,12 +544,13 @@ void emit_tokenizer_files(const std::filesystem::path& gguf_file,
     if (is_spm) {
         // SentencePiece (gemma): spaces are normalized to ▁, the decoder
         // maps ▁ back to a space and resolves <0xNN> byte tokens via
-        // byte_fallback. Mirrors google/gemma-4 tokenizer.json.
-        normalizer = {
-            {"type", "Replace"},
-            {"pattern", {{"String", " "}}},
-            {"content", kMetaspace},
-        };
+        // byte_fallback. Mirrors google/gemma-4 tokenizer.json. The
+        // normalizer honours tokenizer.ggml.add_space_prefix (SentencePiece
+        // add_dummy_prefix; default true) so the leading-metaspace prepend
+        // is emitted exactly when the reference applies it.
+        const bool add_space_prefix =
+            get_bool_or(ctx, "tokenizer.ggml.add_space_prefix", true);
+        normalizer = json::parse(spm_normalizer_json(add_space_prefix));
         pre_tokenizer = {
             {"type",     "Split"},
             {"pattern",  {{"String", " "}}},
