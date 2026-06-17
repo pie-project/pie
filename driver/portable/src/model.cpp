@@ -1851,7 +1851,10 @@ void Model::build_gemma4_() {
         // what synth_proportional_rope_factors_ builds). Load it directly so
         // we honour whatever partial-rotary factor the converter encoded
         // (it is not stored as a scalar KV).
-        if (archive_->find("rope_freqs.weight") != nullptr) {
+        const bool rope_freqs_present =
+            archive_->find("rope_freqs.weight") != nullptr;
+        validate_gemma4_rope_freqs(h.layer_types, rope_freqs_present);
+        if (rope_freqs_present) {
             weights_.gemma4_rope_full_factors = declare_("rope_freqs.weight");
         }
     } else if (h.gemma4_rope_partial_factor_full < 1.0f

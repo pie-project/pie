@@ -119,6 +119,10 @@ add_library(pie_driver_portable_lib STATIC
   # Test-only entry exposing the gemma SPM normalizer node for a pie-server
   # #[cfg(test)] Rust test (F3 leading-metaspace fidelity). GC'd in release.
   src/gguf_tokenizer_testhook.cpp
+  # Test-only entries exercising the gemma4 GGUF load-path hardening guards
+  # (#712): head_count_kv reduction + rope_freqs.weight requirement, from
+  # pie-server #[cfg(test)] Rust tests. GC'd in release.
+  src/gemma4_hparams_testhook.cpp
 )
 
 target_compile_options(pie_driver_portable_lib PRIVATE

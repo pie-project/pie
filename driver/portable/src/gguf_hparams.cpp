@@ -1,6 +1,7 @@
 #include "gguf_hparams.hpp"
 #include "gguf_archive.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <stdexcept>
 
@@ -223,14 +224,39 @@ Hparams parse_gguf_hparams(const GgufMeta& meta) {
         // attention path uses: num_key_value_heads (sliding) and
         // num_global_key_value_heads (full).
         const auto& kvh = get_int_array(meta, a, "attention.head_count_kv");
-        if (!kvh.empty() && kvh.size() == h.layer_types.size()) {
-            for (std::size_t i = 0; i < kvh.size(); ++i) {
-                if (h.layer_types[i] == 'g')
-                    h.num_global_key_value_heads =
-                        static_cast<std::int32_t>(kvh[i]);
-                else
-                    h.num_key_value_heads = static_cast<std::int32_t>(kvh[i]);
+        if (!kvh.empty()) {
+            // A per-layer array MUST cover every layer: a short/long array
+            // silently drops the reduction and leaves the kv-head counts at
+            // their generic-block defaults, mis-sizing attention. Fail loudly.
+            if (kvh.size() != h.layer_types.size()) {
+                throw std::runtime_error(
+                    "gguf gemma4: attention.head_count_kv length (" +
+                    std::to_string(kvh.size()) +
+                    ") does not match layer count (" +
+                    std::to_string(h.layer_types.size()) + ")");
             }
+            // Reduce the per-layer array to the two scalars the attention path
+            // uses (sliding -> num_key_value_heads, full -> num_global_*). The
+            // reduction assumes each attention type carries ONE consistent
+            // count; a within-type disagreement means our two-scalar model is
+            // wrong for this checkpoint, so refuse it rather than silently
+            // keeping whichever value happened to come last.
+            std::int32_t sliding = -1;
+            std::int32_t global  = -1;
+            for (std::size_t i = 0; i < kvh.size(); ++i) {
+                const std::int32_t n = static_cast<std::int32_t>(kvh[i]);
+                std::int32_t& slot = (h.layer_types[i] == 'g') ? global : sliding;
+                if (slot >= 0 && slot != n) {
+                    throw std::runtime_error(
+                        "gguf gemma4: inconsistent attention.head_count_kv "
+                        "within a single attention type (saw " +
+                        std::to_string(slot) + " and " + std::to_string(n) +
+                        ")");
+                }
+                slot = n;
+            }
+            if (sliding >= 0) h.num_key_value_heads        = sliding;
+            if (global  >= 0) h.num_global_key_value_heads = global;
         }
 
         // Per-attention-type RoPE base. Full layers additionally use a
@@ -261,6 +287,21 @@ Hparams parse_gguf_hparams(const GgufMeta& meta) {
     }
 
     return h;
+}
+
+void validate_gemma4_rope_freqs(const std::vector<char>& layer_types,
+                                bool rope_freqs_present) {
+    if (rope_freqs_present) return;
+    const bool has_full_layer =
+        std::find(layer_types.begin(), layer_types.end(), 'g')
+            != layer_types.end();
+    if (has_full_layer) {
+        throw std::runtime_error(
+            "gguf gemma4: required tensor 'rope_freqs.weight' is missing; "
+            "full-attention layers need the proportional-RoPE frequency "
+            "factors (the GGUF is truncated or was converted by a tool that "
+            "dropped it)");
+    }
 }
 
 }  // namespace pie_portable_driver
