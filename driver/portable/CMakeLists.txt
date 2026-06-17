@@ -93,6 +93,11 @@ add_library(pie_driver_portable_lib STATIC
   src/plan.cpp
   src/graph_common.cpp
   src/graph_qwen3.cpp
+  src/graph_vision_qwen3vl.cpp
+  src/graph_vision_gemma4.cpp
+  src/graph_audio_gemma4.cpp
+  src/graph_csm_gen.cpp
+  src/graph_csm_mimi.cpp
   src/graph_gemma4.cpp
   src/graph_qwen3_5.cpp
   src/graph_phi3small.cpp

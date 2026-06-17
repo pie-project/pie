@@ -55,6 +55,74 @@ enum class PieArch {
                  // expert; first 3 layers are dense. Sigmoid routing with
                  // routed_scaling_factor. v1 skips the DSA (Differential
                  // Sparse Attention) indexer.
+    Qwen3VL,     // Qwen3-VL (Qwen/Qwen3-VL-2B-Instruct); HF model_type
+                 // "qwen3_vl". Qwen3 text decoder + a ViT vision tower
+                 // (2D-RoPE, learned abs pos-embed, 2x2 spatial merge) plus
+                 // 3 deepstack mergers injected into LLM layers 0/1/2 on image
+                 // rows. The `vision_*` Hparams fields below describe the tower.
+    Csm,         // CSM-1B (sesame/csm-1b); HF model_type "csm". Native audio
+                 // OUTPUT (TTS): Llama-3.2-1B backbone + a 4-layer depth decoder
+                 // (RVQ codebooks) + a Mimi codec vocoder. Driven via
+                 // pie:core/audio-out (GENERATE_AUDIO), not a text forward.
+};
+
+// ── CSM-1B sub-configs (model_type "csm") ─────────────────────────────────────
+// The backbone Llama-3.2-1B hparams live at the top level of config.json (parsed
+// into the main Hparams fields). These two nested pieces describe the depth
+// decoder (samples RVQ codebooks 1..31 of a frame) and the Mimi codec (codes ->
+// 24 kHz waveform). Mirrors the CUDA loader's CsmDepthDecoderConfig / MimiCodecConfig.
+struct CsmDepthDecoderConfig {
+    int hidden_size = 1024;
+    int backbone_hidden_size = 2048;
+    int num_hidden_layers = 4;
+    int num_attention_heads = 8;
+    int num_key_value_heads = 2;
+    int head_dim = 128;
+    int intermediate_size = 8192;
+    int num_codebooks = 32;
+    int vocab_size = 2051;
+    int max_position_embeddings = 33;
+    float rms_norm_eps = 1e-5f;
+    float rope_theta = 500000.0f;
+    float rope_factor = 32.0f;
+    float rope_low_freq_factor = 0.001953125f;
+    float rope_high_freq_factor = 0.0078125f;
+    int rope_original_max_position = 16;
+};
+
+struct MimiCodecConfig {
+    int hidden_size = 512;
+    int codebook_dim = 256;          // vector_quantization_hidden_dimension
+    int codebook_size = 2048;
+    int num_quantizers = 32;
+    int num_semantic_quantizers = 1;
+    int num_filters = 64;
+    std::vector<int> upsampling_ratios{8, 6, 5, 4};
+    int xf_num_attention_heads = 8;
+    int xf_num_key_value_heads = 8;
+    int xf_head_dim = 64;
+    int xf_intermediate_size = 2048;
+    int xf_num_hidden_layers = 8;
+    int xf_sliding_window = 250;
+    float xf_rope_theta = 10000.0f;
+    float norm_eps = 1e-5f;
+    int sampling_rate = 24000;
+    bool use_causal_conv = true;
+    int upsample_groups = 512;
+    int residual_kernel_size = 3;
+    int kernel_size = 7;
+    int last_kernel_size = 3;
+};
+
+struct CsmConfig {
+    int text_vocab_size = 128256;     // embed_text_tokens rows
+    int audio_vocab_size = 2051;      // per-codebook vocab (== top-level vocab_size)
+    int num_codebooks = 32;
+    int codebook_eos_token_id = 0;    // all-EOS frame == stop
+    int audio_eos_token_id = 128003;
+    int audio_token_id = 128002;
+    CsmDepthDecoderConfig depth;
+    MimiCodecConfig codec;
 };
 
 const char* pie_arch_name(PieArch a);
@@ -211,6 +279,62 @@ struct Hparams {
     bool         qwen35_mrope_interleaved    = false;
     std::int32_t qwen35_mrope_section[3]     = {0, 0, 0};
     float        qwen35_partial_rotary_factor = 1.0f;
+    // When true, the dense Qwen graph applies multimodal RoPE (ggml_rope_multi)
+    // over a 4×-wide pos_input carrying per-token [t,h,w] axes (image/video
+    // tokens get spatial/temporal positions; text tokens get [p,p,p], which
+    // reduces mrope to plain RoPE). Set for Qwen3-VL. The reusable mrope fields
+    // above (section/interleaved) drive it.
+    bool         use_mrope                   = false;
+
+    // ---- Vision tower (multimodal) -------------------------------------
+    // Populated from the checkpoint's `vision_config` sub-dict when present.
+    // `vision_hidden_size == 0` means "no vision tower" (text-only); every
+    // vision code path is gated on it so text models are unaffected. Defaults
+    // match Qwen3-VL-2B; other vision archs override via vision_config.
+    std::int32_t vision_hidden_size        = 0;   // 0 = no tower
+    std::int32_t vision_num_layers         = 0;
+    std::int32_t vision_num_heads          = 0;
+    std::int32_t vision_head_dim           = 0;   // hidden/heads if 0
+    std::int32_t vision_intermediate_size  = 0;
+    std::int32_t vision_patch_size         = 16;
+    std::int32_t vision_temporal_patch_size = 2;
+    std::int32_t vision_spatial_merge_size  = 2;  // 2x2 -> 4 patches/token
+    std::int32_t vision_in_channels        = 3;
+    std::int32_t vision_out_hidden         = 0;   // projector out dim (= text hidden)
+    std::int32_t vision_num_pos_embed      = 0;   // learned abs pos-embed table rows
+    float        vision_rope_theta         = 10000.0f;
+    float        vision_ln_eps             = 1e-6f;
+    // Deepstack merger source layers (Qwen3-VL: {5,11,17}); injected into the
+    // text decoder at LLM layers 0..n-1 on image rows. -1 = unused slot.
+    std::int32_t vision_deepstack_layers[3] = {-1, -1, -1};
+    std::int32_t vision_num_deepstack       = 0;
+    // Gemma-4 vision: 2D average-pool kernel applied to the patch grid (the
+    // SigLIP merger). 0 for archs (Qwen3-VL) that use a 2x2 token-merge merger.
+    std::int32_t vision_pool_kernel         = 0;
+    bool         vision_clipped_linears     = false;  // Gemma-4 QK-clip linears
+
+    // ── Audio tower (Gemma-4 Conformer encoder) ───────────────────────────────
+    // Populated from the checkpoint's `audio_config` sub-dict when present.
+    // `audio_hidden_size == 0` means "no audio tower". Defaults match
+    // google/gemma-4-E2B/E4B `audio_config`.
+    std::int32_t audio_hidden_size          = 0;     // 0 = no tower
+    std::int32_t audio_num_layers           = 0;     // Conformer blocks
+    std::int32_t audio_num_heads            = 0;
+    std::int32_t audio_conv_kernel          = 5;     // depthwise causal conv1d
+    std::int32_t audio_sscp_channels0       = 128;   // subsampling_conv_channels[0]
+    std::int32_t audio_sscp_channels1       = 32;    // subsampling_conv_channels[1]
+    std::int32_t audio_out_proj_dims        = 1536;  // output_proj out dim
+    std::int32_t audio_feature_size         = 128;   // mel bins (SSCP input freq)
+    std::int32_t audio_chunk_size           = 12;    // attention_chunk_size
+    std::int32_t audio_context_left         = 13;    // attention_context_left
+    std::int32_t audio_context_right        = 0;     // attention_context_right
+    float        audio_logit_cap            = 50.0f; // attention_logit_cap
+    float        audio_residual_weight      = 0.5f;
+    float        audio_ln_eps               = 1e-6f;
+
+    // ── CSM-1B audio output (model_type "csm") ────────────────────────────────
+    // Present only for CSM; the backbone Llama hparams use the main fields above.
+    std::optional<CsmConfig> csm;
 };
 
 Hparams parse_hf_config(const std::filesystem::path& config_json_path);

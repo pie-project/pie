@@ -71,8 +71,38 @@ GraphResult build_qwen3_graph(ggml_context* ctx,
     GraphInputs in = declare_graph_inputs(ctx, plan, n_total, n_req,
                                           model.supports_paged_attn_ext());
 
+    // Qwen3-VL M-RoPE: widen pos_input to 4× so ggml_rope_multi reads 4 position
+    // axes per token (t,h,w + unused 4th). graph_common fills it global
+    // axis-major from plan.mrope_positions_i32 (image/video tokens carry [t,h,w];
+    // text tokens [p,p,p], which reduces mrope to plain RoPE). See graph_qwen3_5.
+    if (h.use_mrope) {
+        in.pos_input = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_total * 4);
+        ggml_set_name(in.pos_input, "inp_pos_mrope");
+        ggml_set_input(in.pos_input);
+    }
+
     // ---- Embed ---------------------------------------------------------------
     auto* embd = ggml_get_rows(ctx, w.tok_embd, in.tok_input);
+
+    // Multimodal (Qwen3-VL): run the vision encoder over the image patches and
+    // splice its soft-token embeddings into the token-embedding rows. Gated so
+    // text-only models / batches never build the vision subgraph. The deepstack
+    // merger outputs are kept for per-layer injection in the decoder loop.
+    std::vector<ggml_tensor*> deepstack_inject;  // [k] added after decoder layer k
+    if (plan.has_images && w.vision.present && in.vis_pixels) {
+        VisionEncodeResult vres = build_qwen3vl_vision_graph(
+            ctx, w.vision, h, in.vis_pixels, in.vis_pos_embed,
+            in.vis_rope_cos, in.vis_rope_sin, in.vis_attn_mask, plan.vis_n_patch);
+        // embd row width is `hidden`; the merger output is out_hidden (== hidden
+        // for Qwen3-VL). Cast f32 encoder output to the embedding dtype, then
+        // overwrite the placeholder rows at vis_img_rows.
+        ggml_tensor* emb_rows = ggml_cast(ctx, vres.embeddings, embd->type);
+        embd = ggml_set_rows(ctx, embd, emb_rows, in.vis_img_rows);
+        // Keep the raw (f32) deepstack outputs; cast to the residual-stream
+        // dtype at injection time (it differs from the embedding dtype).
+        deepstack_inject.assign(vres.deepstack.begin(), vres.deepstack.end());
+    }
+
     auto* inpL = embd;
 
     // Gemma family: multiply the embedding by sqrt(hidden_size) before
@@ -353,17 +383,41 @@ GraphResult build_qwen3_graph(ggml_context* ctx,
             yarn_on ? spec.yarn_beta_fast   : 32.0f;
         const float rope_beta_slow =
             yarn_on ? spec.yarn_beta_slow   : 1.0f;
-        Q = ggml_rope_ext(ctx, Q, in.pos_input, c_rope,
-                          head_dim, GGML_ROPE_TYPE_NEOX, rope_n_ctx_orig,
-                          layer_rope_theta, rope_freq_scale,
-                          rope_ext_factor, rope_attn_factor,
-                          rope_beta_fast, rope_beta_slow);
-        if (!is_shared) {
-            K = ggml_rope_ext(ctx, K, in.pos_input, c_rope,
+        if (h.use_mrope) {
+            // Qwen3-VL M-RoPE: sectioned multi-axis rope over the 4×-wide
+            // pos_input. Sections [t,h,w,0] sum to head_dim/2; IMROPE when the
+            // config sets mrope_interleaved. For text rows (t=h=w=p) this is
+            // identical to the plain-RoPE branch below.
+            int mrope_sections[4] = {
+                h.qwen35_mrope_section[0], h.qwen35_mrope_section[1],
+                h.qwen35_mrope_section[2], 0};
+            const int mrope_mode = h.qwen35_mrope_interleaved
+                ? GGML_ROPE_TYPE_IMROPE : GGML_ROPE_TYPE_MROPE;
+            Q = ggml_rope_multi(ctx, Q, in.pos_input, c_rope,
+                                head_dim, mrope_sections, mrope_mode,
+                                rope_n_ctx_orig, layer_rope_theta, rope_freq_scale,
+                                rope_ext_factor, rope_attn_factor,
+                                rope_beta_fast, rope_beta_slow);
+            if (!is_shared) {
+                K = ggml_rope_multi(ctx, K, in.pos_input, c_rope,
+                                    head_dim, mrope_sections, mrope_mode,
+                                    rope_n_ctx_orig, layer_rope_theta, rope_freq_scale,
+                                    rope_ext_factor, rope_attn_factor,
+                                    rope_beta_fast, rope_beta_slow);
+            }
+        } else {
+            Q = ggml_rope_ext(ctx, Q, in.pos_input, c_rope,
                               head_dim, GGML_ROPE_TYPE_NEOX, rope_n_ctx_orig,
                               layer_rope_theta, rope_freq_scale,
                               rope_ext_factor, rope_attn_factor,
                               rope_beta_fast, rope_beta_slow);
+            if (!is_shared) {
+                K = ggml_rope_ext(ctx, K, in.pos_input, c_rope,
+                                  head_dim, GGML_ROPE_TYPE_NEOX, rope_n_ctx_orig,
+                                  layer_rope_theta, rope_freq_scale,
+                                  rope_ext_factor, rope_attn_factor,
+                                  rope_beta_fast, rope_beta_slow);
+            }
         }
 
         // ---- KV pool write (set_rows scatters by physical row index) -------
@@ -663,6 +717,18 @@ GraphResult build_qwen3_graph(ggml_context* ctx,
         }
 
         inpL = ggml_add(ctx, ffn_out, ffn_in);
+
+        // Qwen3-VL deepstack: after decoder layers 0..K-1, add the matching
+        // deepstack merger output to the hidden state on the image rows
+        // (HF Qwen3VLTextModel._deepstack_process).
+        if (static_cast<std::size_t>(il) < deepstack_inject.size() &&
+            in.vis_img_rows_i32) {
+            ggml_tensor* g = ggml_get_rows(ctx, inpL, in.vis_img_rows_i32);
+            ggml_tensor* d = deepstack_inject[static_cast<std::size_t>(il)];
+            if (d->type != g->type) d = ggml_cast(ctx, d, g->type);
+            g = ggml_add(ctx, g, d);
+            inpL = ggml_set_rows(ctx, inpL, g, in.vis_img_rows);
+        }
 
         // ── Gemma 3n: AltUp correct ──
         // Given the activated active stream (the layer's output before any

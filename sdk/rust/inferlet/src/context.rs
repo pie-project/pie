@@ -526,6 +526,66 @@ impl Context {
         Ok(())
     }
 
+    /// Splice several adjacent images into a SINGLE forward pass — the driver
+    /// encodes all of them (block-diagonal attention so they don't cross-attend)
+    /// and scatters each at its own anchor. This is the multi-image-per-forward
+    /// path (the analog of CUDA's per-image scatter loop). Requires the model's
+    /// image span to carry no text delimiters (Gemma-4); if any image needs
+    /// delimiters, or there's a single image, it falls back to sequential
+    /// `append_image`. Images are placed back-to-back with no text between them.
+    pub async fn append_images(&mut self, images: &[&crate::media::Image]) -> Result<()> {
+        if images.is_empty() {
+            return Ok(());
+        }
+        let needs_delims = images
+            .iter()
+            .any(|im| !im.prefix_tokens().is_empty() || !im.suffix_tokens().is_empty());
+        if needs_delims || images.len() == 1 {
+            for im in images {
+                self.append_image(im).await?;
+            }
+            return Ok(());
+        }
+        self.flush().await?;
+        let total_tokens: u32 = images.iter().map(|im| im.token_count()).sum();
+        if total_tokens == 0 {
+            return Ok(());
+        }
+        let total_after = self.working_tokens + total_tokens;
+        let pages_needed = (total_after + self.page_size - 1) / self.page_size;
+        let additional = pages_needed.saturating_sub(self.working_pages);
+        if additional > 0 {
+            self.inner
+                .reserve_working_pages(additional)
+                .map_err(|e| format!("append_images: reserve pages: {}", e))?;
+            self.working_pages = pages_needed;
+        }
+
+        let pass = ForwardPass::new(&self.model);
+        pass.context(&self.inner);
+        let mut anchor = self.seq_len;
+        for im in images {
+            pass.input_image(im, anchor);
+            anchor += im.token_count();
+        }
+        pass.execute_async()
+            .await
+            .map_err(|e| format!("append_images: forward pass: {}", e))?;
+
+        let new_working = self.working_tokens + total_tokens;
+        let pages_to_commit = new_working / self.page_size;
+        if pages_to_commit > 0 {
+            self.inner
+                .commit_working_pages(pages_to_commit)
+                .map_err(|e| format!("append_images: commit pages: {}", e))?;
+        }
+        self.committed_pages += pages_to_commit;
+        self.working_pages -= pages_to_commit;
+        self.working_tokens = new_working % self.page_size;
+        self.seq_len += total_tokens;
+        Ok(())
+    }
+
     /// Splice an encoded audio clip into the context. Runs the gemma4_audio
     /// encoder driver-side and commits the resulting soft-token KV pages,
     /// exactly like [`append_image`](Self::append_image) does for vision. The
@@ -582,6 +642,73 @@ impl Context {
         self.seq_len += num_tokens;
 
         // Span suffix delimiter (buffered; flushed with the next fill).
+        if !suffix.is_empty() {
+            self.append(&suffix);
+        }
+        Ok(())
+    }
+
+    /// Splice several audio clips into a SINGLE forward pass — the driver runs
+    /// the Conformer encoder once per clip (N-separate-encodes) and scatters each
+    /// at its own anchor. This is the multi-clip-per-forward path (the analog of
+    /// CUDA's per-clip `scatter_gemma4_audio` loop). The clips' soft tokens go
+    /// back-to-back inside one span: the first clip's prefix delimiter is emitted
+    /// before the group and the last clip's suffix after it (no text between
+    /// clips, since committed text would force separate forwards). Falls back to
+    /// sequential `append_audio` for a single clip.
+    pub async fn append_audios(&mut self, audios: &[&crate::media::Audio]) -> Result<()> {
+        if audios.is_empty() {
+            return Ok(());
+        }
+        if audios.len() == 1 {
+            return self.append_audio(audios[0]).await;
+        }
+        let prefix = audios[0].prefix_tokens();
+        let suffix = audios[audios.len() - 1].suffix_tokens();
+        if !prefix.is_empty() {
+            self.append(&prefix);
+        }
+        self.flush().await?;
+        let total_tokens: u32 = audios.iter().map(|a| a.token_count()).sum();
+        if total_tokens == 0 {
+            if !suffix.is_empty() {
+                self.append(&suffix);
+            }
+            return Ok(());
+        }
+        let total_after = self.working_tokens + total_tokens;
+        let pages_needed = (total_after + self.page_size - 1) / self.page_size;
+        let additional = pages_needed.saturating_sub(self.working_pages);
+        if additional > 0 {
+            self.inner
+                .reserve_working_pages(additional)
+                .map_err(|e| format!("append_audios: reserve pages: {}", e))?;
+            self.working_pages = pages_needed;
+        }
+
+        let pass = ForwardPass::new(&self.model);
+        pass.context(&self.inner);
+        let mut anchor = self.seq_len;
+        for audio in audios {
+            pass.input_audio(audio, anchor);
+            anchor += audio.token_count();
+        }
+        pass.execute_async()
+            .await
+            .map_err(|e| format!("append_audios: forward pass: {}", e))?;
+
+        let new_working = self.working_tokens + total_tokens;
+        let pages_to_commit = new_working / self.page_size;
+        if pages_to_commit > 0 {
+            self.inner
+                .commit_working_pages(pages_to_commit)
+                .map_err(|e| format!("append_audios: commit pages: {}", e))?;
+        }
+        self.committed_pages += pages_to_commit;
+        self.working_pages -= pages_to_commit;
+        self.working_tokens = new_working % self.page_size;
+        self.seq_len += total_tokens;
+
         if !suffix.is_empty() {
             self.append(&suffix);
         }

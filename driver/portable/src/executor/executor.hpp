@@ -127,6 +127,11 @@ public:
         std::int32_t                total_n_tokens = 0;     // includes drafts
         std::vector<std::int32_t>   tokens_i32;       // [total]
         std::vector<std::int32_t>   positions_i32;    // [total]
+        // Qwen3-VL M-RoPE only: per-token [t,h,w] positions, token-major
+        // (3*total). Text rows are [p,p,p]; image/video rows carry the wire's
+        // image_mrope_positions. Empty for non-mrope models -> graph_common
+        // falls back to the plain/replicated pos_input fill.
+        std::vector<std::int32_t>   mrope_positions_i32;  // [3*total] or empty
         std::vector<std::int64_t>   kv_idxs_i64;      // [total] write idxs
         // Flat list across all requests' sampler slots — size matches
         // the graph's `out_idx` input.
@@ -184,6 +189,43 @@ public:
         // top_k, clamped against vocab_size; default 256 if no slot
         // specifies a top_k).
         std::int32_t                uniform_top_k = 0;
+
+        // ── Vision (multimodal) side-inputs, computed host-side in plan_()
+        // when the request carries image spans. `has_images` gates the
+        // whole vision path; all arrays are flat and uploaded into the
+        // GraphInputs vis_* tensors. v1 supports one image per batch.
+        bool                        has_images   = false;
+        std::int32_t                vis_patch_dim = 0;   // 3*tpatch*p*p
+        std::int32_t                vis_n_patch   = 0;
+        std::int32_t                vis_n_token   = 0;   // n_patch / merge^2
+        std::vector<float>          vis_pixels;          // [n_patch*patch_dim]
+        std::vector<float>          vis_pos_embed;       // [n_patch*hidden]
+        std::vector<float>          vis_rope_cos;        // [n_patch*head_dim]
+        std::vector<float>          vis_rope_sin;        // [n_patch*head_dim]
+        std::vector<std::int64_t>   vis_img_rows;        // [n_token] scatter rows
+        // Gemma-4 vision only: group-mean pooling matrix [n_token*n_patch]
+        // (token-major). Empty for Qwen3-VL (which uses a 2x2 token merge).
+        std::vector<float>          vis_pool_matrix;
+        // Block-diagonal attention mask [n_patch*n_patch] (key-major), -inf
+        // across images, 0 within. Non-empty only for multi-image batches.
+        std::vector<float>          vis_attn_mask;
+
+        // ── Audio (multimodal; Gemma-4 Conformer) side-inputs ──
+        // `has_audio` gates the audio encode path. Multiple clips per forward are
+        // encoded independently (N-separate-encodes; the SSCP/depthwise convs mix
+        // across time so clips can't be stacked like vision images).
+        bool                        has_audio    = false;
+        std::int32_t                aud_n_mel    = 0;
+        std::int32_t                aud_dwin     = 0;    // attention window width
+        std::vector<float>          aud_pe;              // [P*hidden] rel-pos enc (shared)
+        struct AudClip {
+            std::int32_t              n_frame = 0;       // mel frames
+            std::int32_t              n_token = 0;       // subsampled frames
+            std::vector<float>        features;          // [n_frame*n_mel] log-mel
+            std::vector<float>        win_mask;          // [dwin*n_token]
+            std::vector<std::int64_t> rows;              // [n_token] scatter rows
+        };
+        std::vector<AudClip>        aud_clips;
     };
 
     // Per-stage timing accumulators. Used both for offline benchmarks
@@ -208,6 +250,24 @@ public:
 
 private:
     BatchPlan plan_(const pie_driver::PieForwardRequestView& req);
+    // Computes the Qwen3-VL vision side-inputs (pixels, interpolated pos-embed,
+    // 2D-RoPE cos/sin, scatter rows) into `plan` when `req` carries image spans.
+    // No-op for text-only batches or non-Qwen3-VL models.
+    void plan_vision_(const pie_driver::PieForwardRequestView& req, BatchPlan& plan);
+    void plan_vision_gemma4_(const pie_driver::PieForwardRequestView& req,
+                             BatchPlan& plan);
+    // Qwen3-VL M-RoPE: build per-token [t,h,w] positions (plan.mrope_positions_i32)
+    // by merging the 1-D positions (text rows -> [p,p,p]) with the wire's
+    // image_mrope_positions (image/video rows -> [t,h,w]). No-op unless the model
+    // sets hparams.use_mrope. Always runs for Qwen3-VL (even text-only / decode)
+    // so graph_common consistently uses the global axis-major mrope fill.
+    void build_mrope_positions_(const pie_driver::PieForwardRequestView& req,
+                                BatchPlan& plan);
+    // Computes the Gemma-4 audio Conformer side-inputs (log-mel features,
+    // sinusoidal rel-pos encoding, window mask, scatter rows) into `plan` when
+    // `req` carries audio spans. No-op for non-audio batches.
+    void plan_audio_gemma4_(const pie_driver::PieForwardRequestView& req,
+                            BatchPlan& plan);
     BatchPlan plan_test_simple_(std::span<const std::uint32_t> token_ids,
                                 std::span<const std::uint32_t> position_ids,
                                 std::int32_t sampling_pos,

@@ -118,6 +118,28 @@ struct GraphInputs {
     ggml_tensor*              page_indices   = nullptr;  // I32 [total_pages_in_batch]
     ggml_tensor*              page_indptr    = nullptr;  // I32 [n_req + 1]
     ggml_tensor*              last_page_lens = nullptr;  // I32 [n_req]
+
+    // ── Vision (multimodal) side-inputs. Allocated only when the batch
+    // carries image spans (plan.has_images); null for text-only passes.
+    // Filled host-side by upload_graph_inputs from the BatchPlan's vis_*
+    // arrays. The per-arch builder runs the vision encoder over these and
+    // scatters the result into the token-embedding rows at vis_img_rows.
+    ggml_tensor*              vis_pixels    = nullptr;  // F32 [patch_dim, n_patch]
+    ggml_tensor*              vis_pos_embed = nullptr;  // F32 [hidden, n_patch]
+    ggml_tensor*              vis_rope_cos  = nullptr;  // F32 [head_dim, n_patch]
+    ggml_tensor*              vis_rope_sin  = nullptr;  // F32 [head_dim, n_patch]
+    ggml_tensor*              vis_img_rows  = nullptr;  // I64 [n_token] scatter rows
+    ggml_tensor*              vis_img_rows_i32 = nullptr;  // I32 [n_token] (get_rows)
+    ggml_tensor*              vis_pool_matrix = nullptr;  // F32 [n_patch, n_token] (Gemma-4)
+    ggml_tensor*              vis_attn_mask   = nullptr;  // F32 [n_patch, n_patch] block-diagonal (multi-image)
+
+    // Audio (Gemma-4 Conformer) side-inputs; filled from the BatchPlan aud_*
+    // arrays. The encoder runs over these and scatters into aud_rows.
+    // Per-clip (multiple audio clips per forward are encoded independently).
+    ggml_tensor*              aud_pe       = nullptr;  // F32 [hidden, P] (shared)
+    std::vector<ggml_tensor*> aud_features;            // per clip F32 [n_mel, n_frame]
+    std::vector<ggml_tensor*> aud_win_mask;            // per clip F32 [dwin, n_token]
+    std::vector<ggml_tensor*> aud_rows;                // per clip I64 [n_token]
 };
 
 // Per-arch graph builders return one of these. Exactly one of the three

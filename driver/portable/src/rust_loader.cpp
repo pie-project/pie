@@ -16,6 +16,7 @@
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -567,12 +568,31 @@ CompileResult compile_from_candidates(
         return id;
     };
 
+    // Group candidates by their TARGET tensor (pointer), assigning each distinct
+    // target a unique output string. The output id prefers the ggml tensor name
+    // (preserves behavior for the common case), but ggml caps names at
+    // GGML_MAX_NAME (64) so very long HF names (e.g. CSM's codec_model.* tensors)
+    // truncate and collide — distinct targets would otherwise share an output
+    // string and only one would be covered. On collision fall back to the full
+    // (untruncated) hf_name, which is unique. Candidates sharing a target (fused
+    // QKV slices etc.) still land in one group via the pointer key.
+    std::unordered_map<const ggml_tensor*, std::string> target_output;
+    std::unordered_set<std::string> used_outputs;
     std::unordered_map<std::string, std::vector<const ContractCandidate*>> groups;
     std::vector<std::string> group_order;
     for (const auto& d : candidates) {
         if (d.tensor == nullptr) continue;
-        const auto output = tensor_name(d.tensor, d.hf_name);
-        if (!groups.contains(output)) group_order.push_back(output);
+        std::string output;
+        if (auto it = target_output.find(d.tensor); it != target_output.end()) {
+            output = it->second;
+        } else {
+            output = tensor_name(d.tensor, d.hf_name);
+            if (used_outputs.contains(output)) output = d.hf_name;
+            while (used_outputs.contains(output)) output += "#";
+            target_output.emplace(d.tensor, output);
+            used_outputs.insert(output);
+            group_order.push_back(output);
+        }
         groups[output].push_back(&d);
     }
 
@@ -695,6 +715,14 @@ CompileResult compile_from_candidates(
         input.add_byte_span_contract(output, std::move(spans), output_dtype, output_shape);
         targets.emplace(output, target);
         ++emitted;
+    }
+
+    if (emitted != group_order.size()) {
+        for (const auto& output : group_order) {
+            if (!targets.contains(output)) {
+                std::cerr << "[rust_loader] UNCOVERED contract: " << output << "\n";
+            }
+        }
     }
 
     CompileResult result{

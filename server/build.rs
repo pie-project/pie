@@ -71,8 +71,13 @@ fn build_portable() {
     let driver_dir = PathBuf::from("../driver/portable");
     let cuda_enabled = std::env::var("PIE_PORTABLE_CUDA").is_ok();
     let vulkan_enabled = std::env::var("PIE_PORTABLE_VULKAN").is_ok();
-    let metal_enabled = std::env::var("PIE_PORTABLE_METAL").is_ok();
     let target_os = target_os();
+    // Metal defaults ON on macOS ("always use Metal whenever possible"). Opt out
+    // for a deterministic CPU build with PIE_PORTABLE_METAL=0 (or OFF/false).
+    let metal_enabled = match std::env::var("PIE_PORTABLE_METAL") {
+        Ok(v) => !matches!(v.to_ascii_lowercase().as_str(), "0" | "off" | "false" | "no"),
+        Err(_) => target_os == "macos",
+    };
     println!("cargo:rerun-if-env-changed=PIE_PORTABLE_CUDA");
     println!("cargo:rerun-if-env-changed=PIE_PORTABLE_VULKAN");
     println!("cargo:rerun-if-env-changed=PIE_PORTABLE_METAL");

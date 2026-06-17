@@ -1,0 +1,14 @@
+[package]
+name = "multi-audio-test"
+version = "0.1.0"
+description = "Multi-clip-per-forward audio test"
+authors = ["test"]
+
+[runtime]
+core = "^0.2.0"
+mcp = "^0.2.0"
+
+[parameters]
+audio_url = {type = "string", optional = true}
+count = {type = "int", optional = true}
+max_tokens = {type = "int", optional = true}

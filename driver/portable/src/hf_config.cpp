@@ -28,6 +28,8 @@ const char* pie_arch_name(PieArch a) {
         case PieArch::Phi3Small: return "phi3small";
         case PieArch::Phi3_5Moe: return "phi3_5moe";
         case PieArch::GlmMoeDsa: return "glm_moe_dsa";
+        case PieArch::Qwen3VL:   return "qwen3_vl";
+        case PieArch::Csm:       return "csm";
     }
     return "?";
 }
@@ -61,6 +63,9 @@ PieArch hf_model_type_to_pie_arch(const std::string& hf_model_type) {
         hf_model_type == "qwen3_5_moe" ||
         hf_model_type == "qwen3_5_moe_text") return PieArch::Qwen3_5;
     if (hf_model_type == "glm_moe_dsa") return PieArch::GlmMoeDsa;
+    if (hf_model_type == "qwen3_vl" ||
+        hf_model_type == "qwen3_vl_text") return PieArch::Qwen3VL;
+    if (hf_model_type == "csm")         return PieArch::Csm;
     throw std::runtime_error(
         "hf_config: unsupported model_type '" + hf_model_type + "'");
 }
@@ -286,6 +291,24 @@ Hparams parse_hf_config(const std::filesystem::path& config_json_path) {
             get_or<float>(rs, "attention_factor", 0.0f);
         h.rope_yarn_beta_fast = get_or<float>(rs, "beta_fast", 32.0f);
         h.rope_yarn_beta_slow = get_or<float>(rs, "beta_slow", 1.0f);
+
+        // Qwen3-VL M-RoPE: rope_scaling carries `mrope_section` [t,h,w] and
+        // `mrope_interleaved`. Enables the dense graph's ggml_rope_multi path
+        // so image/video tokens get their per-token [t,h,w] positions (matching
+        // HF/CUDA); text tokens degenerate to plain RoPE. Reuses the shared
+        // qwen35_mrope_* fields.
+        if (h.arch == PieArch::Qwen3VL) {
+            if (auto sec_it = rs.find("mrope_section");
+                sec_it != rs.end() && sec_it->is_array() &&
+                sec_it->size() == 3) {
+                for (std::size_t i = 0; i < 3; ++i)
+                    h.qwen35_mrope_section[i] = (*sec_it)[i].get<std::int32_t>();
+                h.qwen35_mrope_interleaved =
+                    get_or<bool>(rs, "mrope_interleaved", false);
+                h.qwen35_partial_rotary_factor = 1.0f;
+                h.use_mrope = true;
+            }
+        }
     }
 
     // ── Gemma 4 specifics ──
@@ -431,6 +454,152 @@ Hparams parse_hf_config(const std::filesystem::path& config_json_path) {
                 }
             }
         }
+    }
+
+    // ---- Vision tower (multimodal) -------------------------------------
+    // Parsed from the OUTER config's `vision_config` (the text decoder lives
+    // in `text_config`, already consumed above). Presence of this sub-dict is
+    // what enables the vision tower; absent => vision_hidden_size stays 0.
+    if (j.contains("vision_config") && j["vision_config"].is_object()) {
+        const auto& v = j["vision_config"];
+        h.vision_hidden_size       = get_or<std::int32_t>(v, "hidden_size", 0);
+        h.vision_num_layers        = get_or<std::int32_t>(v, "depth",
+                                       get_or<std::int32_t>(v, "num_hidden_layers", 0));
+        h.vision_num_heads         = get_or<std::int32_t>(v, "num_heads",
+                                       get_or<std::int32_t>(v, "num_attention_heads", 0));
+        h.vision_intermediate_size = get_or<std::int32_t>(v, "intermediate_size", 0);
+        h.vision_patch_size        = get_or<std::int32_t>(v, "patch_size", 16);
+        h.vision_temporal_patch_size = get_or<std::int32_t>(v, "temporal_patch_size", 2);
+        h.vision_spatial_merge_size  = get_or<std::int32_t>(v, "spatial_merge_size", 2);
+        h.vision_in_channels       = get_or<std::int32_t>(v, "in_channels",
+                                       get_or<std::int32_t>(v, "in_chans", 3));
+        h.vision_out_hidden        = get_or<std::int32_t>(v, "out_hidden_size",
+                                       get_or<std::int32_t>(v, "hidden_size", 0));
+        h.vision_num_pos_embed     = get_or<std::int32_t>(v, "num_position_embeddings", 0);
+        h.vision_rope_theta        = get_or<float>(v, "rope_theta", 10000.0f);
+        h.vision_ln_eps            = get_or<float>(v, "rms_norm_eps",
+                                       get_or<float>(v, "layer_norm_eps", 1e-6f));
+        // Gemma-4 vision specifics (SigLIP-style): 3x3 average-pool merger and
+        // clamped ("clipped") linear projections. rope_theta defaults differ
+        // (Gemma-4 vision uses 100), so honor rope_parameters.rope_theta too.
+        h.vision_pool_kernel       = get_or<std::int32_t>(v, "pooling_kernel_size", 0);
+        h.vision_clipped_linears   = get_or<bool>(v, "use_clipped_linears", false);
+        if (auto rp = v.find("rope_parameters");
+            rp != v.end() && rp->is_object()) {
+            h.vision_rope_theta = get_or<float>(*rp, "rope_theta", h.vision_rope_theta);
+        }
+        if (h.vision_num_pos_embed == 0) {
+            h.vision_num_pos_embed = get_or<std::int32_t>(v, "position_embedding_size", 0);
+        }
+        if (h.vision_num_heads > 0) {
+            h.vision_head_dim = get_or<std::int32_t>(v, "head_dim",
+                                  h.vision_hidden_size / h.vision_num_heads);
+        }
+        // Deepstack merger source layers (Qwen3-VL: [5, 11, 17]).
+        if (auto it = v.find("deepstack_visual_indexes");
+            it != v.end() && it->is_array()) {
+            std::int32_t n = 0;
+            for (const auto& idx : *it) {
+                if (n >= 3) break;
+                h.vision_deepstack_layers[n++] = idx.get<std::int32_t>();
+            }
+            h.vision_num_deepstack = n;
+        }
+    }
+
+    // ── Audio tower (Gemma-4 Conformer / USM encoder) ─────────────────────────
+    // Parsed from the OUTER config's `audio_config`. Presence enables the audio
+    // tower; absent => audio_hidden_size stays 0.
+    if (j.contains("audio_config") && j["audio_config"].is_object()) {
+        const auto& a = j["audio_config"];
+        h.audio_hidden_size   = get_or<std::int32_t>(a, "hidden_size", 0);
+        h.audio_num_layers    = get_or<std::int32_t>(a, "num_hidden_layers", 0);
+        h.audio_num_heads     = get_or<std::int32_t>(a, "num_attention_heads", 0);
+        h.audio_conv_kernel   = get_or<std::int32_t>(a, "conv_kernel_size", 5);
+        h.audio_out_proj_dims = get_or<std::int32_t>(a, "output_proj_dims", 1536);
+        h.audio_feature_size  = get_or<std::int32_t>(a, "feature_size", 128);
+        h.audio_chunk_size    = get_or<std::int32_t>(a, "attention_chunk_size", 12);
+        h.audio_context_left  = get_or<std::int32_t>(a, "attention_context_left", 13);
+        h.audio_context_right = get_or<std::int32_t>(a, "attention_context_right", 0);
+        h.audio_logit_cap     = get_or<float>(a, "attention_logit_cap", 50.0f);
+        h.audio_residual_weight = get_or<float>(a, "residual_weight", 0.5f);
+        h.audio_ln_eps        = get_or<float>(a, "rms_norm_eps", 1e-6f);
+        // subsampling_conv_channels is a 2-element array [c0, c1].
+        if (auto it = a.find("subsampling_conv_channels");
+            it != a.end() && it->is_array() && it->size() >= 2) {
+            h.audio_sscp_channels0 = (*it)[0].get<std::int32_t>();
+            h.audio_sscp_channels1 = (*it)[1].get<std::int32_t>();
+        }
+    }
+
+    // ── CSM-1B audio output (model_type "csm") ────────────────────────────────
+    // The backbone Llama-3.2-1B hparams are already parsed from the top level.
+    // Lift the two nested pieces: depth_decoder_config + codec_config (Mimi).
+    if (h.arch == PieArch::Csm) {
+        CsmConfig csm;
+        csm.text_vocab_size = get_or<std::int32_t>(j, "text_vocab_size", csm.text_vocab_size);
+        csm.audio_vocab_size = get_or<std::int32_t>(j, "vocab_size", csm.audio_vocab_size);
+        csm.num_codebooks = get_or<std::int32_t>(j, "num_codebooks", csm.num_codebooks);
+        csm.codebook_eos_token_id =
+            get_or<std::int32_t>(j, "codebook_eos_token_id", csm.codebook_eos_token_id);
+        csm.audio_eos_token_id =
+            get_or<std::int32_t>(j, "audio_eos_token_id", csm.audio_eos_token_id);
+        csm.audio_token_id = get_or<std::int32_t>(j, "audio_token_id", csm.audio_token_id);
+
+        if (auto it = j.find("depth_decoder_config");
+            it != j.end() && it->is_object()) {
+            const auto& d = *it;
+            auto& dd = csm.depth;
+            dd.hidden_size          = get_or<std::int32_t>(d, "hidden_size", dd.hidden_size);
+            dd.backbone_hidden_size = get_or<std::int32_t>(d, "backbone_hidden_size", dd.backbone_hidden_size);
+            dd.num_hidden_layers    = get_or<std::int32_t>(d, "num_hidden_layers", dd.num_hidden_layers);
+            dd.num_attention_heads  = get_or<std::int32_t>(d, "num_attention_heads", dd.num_attention_heads);
+            dd.num_key_value_heads  = get_or<std::int32_t>(d, "num_key_value_heads", dd.num_key_value_heads);
+            dd.head_dim             = get_or<std::int32_t>(d, "head_dim", dd.head_dim);
+            dd.intermediate_size    = get_or<std::int32_t>(d, "intermediate_size", dd.intermediate_size);
+            dd.num_codebooks        = get_or<std::int32_t>(d, "num_codebooks", dd.num_codebooks);
+            dd.vocab_size           = get_or<std::int32_t>(d, "vocab_size", dd.vocab_size);
+            dd.max_position_embeddings = get_or<std::int32_t>(d, "max_position_embeddings", dd.max_position_embeddings);
+            dd.rms_norm_eps         = get_or<float>(d, "rms_norm_eps", dd.rms_norm_eps);
+            dd.rope_theta           = get_or<float>(d, "rope_theta", dd.rope_theta);
+            if (auto s = d.find("rope_scaling"); s != d.end() && s->is_object()) {
+                dd.rope_factor              = get_or<float>(*s, "factor", dd.rope_factor);
+                dd.rope_low_freq_factor     = get_or<float>(*s, "low_freq_factor", dd.rope_low_freq_factor);
+                dd.rope_high_freq_factor    = get_or<float>(*s, "high_freq_factor", dd.rope_high_freq_factor);
+                dd.rope_original_max_position = get_or<std::int32_t>(*s, "original_max_position_embeddings", dd.rope_original_max_position);
+            }
+        }
+
+        if (auto it = j.find("codec_config"); it != j.end() && it->is_object()) {
+            const auto& c = *it;
+            auto& mc = csm.codec;
+            mc.hidden_size            = get_or<std::int32_t>(c, "hidden_size", mc.hidden_size);
+            mc.codebook_dim           = get_or<std::int32_t>(c, "vector_quantization_hidden_dimension",
+                                          get_or<std::int32_t>(c, "codebook_dim", mc.codebook_dim));
+            mc.codebook_size          = get_or<std::int32_t>(c, "codebook_size", mc.codebook_size);
+            mc.num_quantizers         = get_or<std::int32_t>(c, "num_quantizers", mc.num_quantizers);
+            mc.num_semantic_quantizers = get_or<std::int32_t>(c, "num_semantic_quantizers", mc.num_semantic_quantizers);
+            mc.num_filters            = get_or<std::int32_t>(c, "num_filters", mc.num_filters);
+            mc.xf_num_attention_heads = get_or<std::int32_t>(c, "num_attention_heads", mc.xf_num_attention_heads);
+            mc.xf_num_key_value_heads = get_or<std::int32_t>(c, "num_key_value_heads", mc.xf_num_key_value_heads);
+            mc.xf_head_dim            = get_or<std::int32_t>(c, "head_dim", mc.xf_head_dim);
+            mc.xf_intermediate_size   = get_or<std::int32_t>(c, "intermediate_size", mc.xf_intermediate_size);
+            mc.xf_num_hidden_layers   = get_or<std::int32_t>(c, "num_hidden_layers", mc.xf_num_hidden_layers);
+            mc.xf_sliding_window      = get_or<std::int32_t>(c, "sliding_window", mc.xf_sliding_window);
+            mc.xf_rope_theta          = get_or<float>(c, "rope_theta", mc.xf_rope_theta);
+            mc.norm_eps               = get_or<float>(c, "norm_eps", mc.norm_eps);
+            mc.sampling_rate          = get_or<std::int32_t>(c, "sampling_rate", mc.sampling_rate);
+            mc.use_causal_conv        = get_or<bool>(c, "use_causal_conv", mc.use_causal_conv);
+            mc.upsample_groups        = get_or<std::int32_t>(c, "upsample_groups", mc.upsample_groups);
+            mc.residual_kernel_size   = get_or<std::int32_t>(c, "residual_kernel_size", mc.residual_kernel_size);
+            mc.kernel_size            = get_or<std::int32_t>(c, "kernel_size", mc.kernel_size);
+            mc.last_kernel_size       = get_or<std::int32_t>(c, "last_kernel_size", mc.last_kernel_size);
+            if (auto r = c.find("upsampling_ratios"); r != c.end() && r->is_array()) {
+                mc.upsampling_ratios.clear();
+                for (const auto& v : *r) mc.upsampling_ratios.push_back(v.get<int>());
+            }
+        }
+        h.csm = csm;
     }
 
     return h;
