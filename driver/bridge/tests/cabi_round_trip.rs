@@ -452,6 +452,12 @@ fn empty_forward_request_desc() -> PieForwardRequestDesc {
         audio_anchor_rows_len: 0,
         audio_indptr_ptr: ptr::null(),
         audio_indptr_len: 0,
+        logit_bias_tokens_ptr: ptr::null(),
+        logit_bias_tokens_len: 0,
+        logit_bias_values_ptr: ptr::null(),
+        logit_bias_values_len: 0,
+        logit_bias_indptr_ptr: ptr::null(),
+        logit_bias_indptr_len: 0,
     }
 }
 

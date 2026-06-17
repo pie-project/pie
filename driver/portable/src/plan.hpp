@@ -101,6 +101,10 @@ struct PlanArrays {
     std::span<const std::uint32_t> sampler_label_indptr;
     std::span<const std::uint32_t> logit_masks;
     std::span<const std::uint32_t> logit_mask_indptr;
+    // Per-request logit bias: (token, bias) pairs + per-request CSR.
+    std::span<const std::uint32_t> logit_bias_tokens;
+    std::span<const float>         logit_bias_values;
+    std::span<const std::uint32_t> logit_bias_indptr;
     std::span<const std::uint32_t> flat_attn_masks;
     std::span<const std::uint32_t> attn_mask_indptr;
     std::span<const std::int64_t>  adapter_indices;

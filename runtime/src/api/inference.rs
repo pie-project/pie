@@ -724,6 +724,20 @@ impl pie::core::inference::HostForwardPass for InstanceState {
         Ok(())
     }
 
+    /// Per-token additive logit bias applied to next-token logits before
+    /// sampling (after any logit mask). Each `(token, bias)` pair nudges that
+    /// token's logit. Replaces any previously-set bias on this pass.
+    async fn logit_bias(
+        &mut self,
+        this: Resource<ForwardPass>,
+        bias: Vec<(u32, f32)>,
+    ) -> Result<()> {
+        let pass = self.ctx().table.get_mut(&this)?;
+        pass.req.logit_bias_tokens = bias.iter().map(|&(t, _)| t).collect();
+        pass.req.logit_bias_values = bias.iter().map(|&(_, b)| b).collect();
+        Ok(())
+    }
+
     async fn sampler(
         &mut self,
         this: Resource<ForwardPass>,
@@ -844,9 +858,11 @@ impl pie::core::inference::HostForwardPass for InstanceState {
             let n_sampling = req.sampling_indices.len() as u32;
             let n_samplers = req.samplers.len() as u32;
             let n_spec = req.spec_token_ids.len() as u32;
+            let n_bias = req.logit_bias_tokens.len() as u32;
             req.qo_indptr = vec![0, n_tokens];
             req.mask_indptr = vec![0, n_masks];
             req.logit_mask_indptr = vec![0, n_logit];
+            req.logit_bias_indptr = vec![0, n_bias];
             req.sampling_indptr = vec![0, n_sampling];
             req.sampler_indptr = vec![0, n_samplers];
             req.spec_indptr = vec![0, n_spec];

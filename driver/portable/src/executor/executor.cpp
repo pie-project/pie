@@ -185,6 +185,14 @@ std::vector<SlotOutput> sample_request_slots(const Executor::ReqPlan& rp,
                                   rp.logit_mask_runs.data(),
                                   rp.logit_mask_runs.size());
         }
+        // Per-token additive logit bias: applied after the mask, before
+        // sampling. Out-of-range token ids are ignored.
+        for (std::size_t b = 0; b < rp.logit_bias_tokens.size(); ++b) {
+            const std::uint32_t tok = rp.logit_bias_tokens[b];
+            if (tok < static_cast<std::uint32_t>(vocab_size)) {
+                row[tok] += rp.logit_bias_values[b];
+            }
+        }
         const SamplerParams& sp =
             s < static_cast<std::int32_t>(rp.samplers.size())
                 ? rp.samplers[static_cast<std::size_t>(s)]

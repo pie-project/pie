@@ -182,6 +182,14 @@ pub struct ForwardRequest {
     /// Per-request CSR: `audio_indptr[r..r+1]` is the half-open range of clips
     /// belonging to request `r` (one extra leading 0, like `image_indptr`).
     pub audio_indptr: Vec<u32>,
+
+    /// Per-request additive logit bias applied before sampling.
+    /// `(logit_bias_tokens[i], logit_bias_values[i])` is one (token_id, bias) pair.
+    pub logit_bias_tokens: Vec<u32>,
+    pub logit_bias_values: Vec<f32>,
+    /// Per-request CSR: `logit_bias_indptr[r..r+1]` is the half-open range of
+    /// pairs belonging to request `r` (one extra leading 0, like `mask_indptr`).
+    pub logit_bias_indptr: Vec<u32>,
 }
 
 /// Sampler configuration. Variants align with the kernel-dispatch types
