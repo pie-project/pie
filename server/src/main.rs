@@ -299,3 +299,78 @@ mod portable_gemma4_hardening_tests {
         );
     }
 }
+
+// Bug-B regression guard: the KV-swap / ToT-fork page-copy loop in
+// service/inproc_service.cpp sizes and offsets every per-layer page copy with
+// `KvCachePaged::page_bytes(layer)`. Gemma 4's alternating attention gives
+// sliding layers (8 kv-heads × 256 head_dim) MORE bytes per page than full
+// layers (1 kv-head × 512 head_dim), so a single uniform page-bytes value
+// (layer 0) over-reads the smaller layers and trips ggml's
+// `offset + size <= nbytes` abort under multi-request host-swap or deep-tree
+// fork. A test-only C entry builds a CPU-backend non-uniform cache and reports
+// each layer's page bytes + tensor nbytes. Lives in the `pie` bin because CI
+// runs `cargo test -p pie-server --bin pie`; driver/portable ctest never runs
+// in CI.
+#[cfg(all(test, feature = "driver-portable"))]
+mod portable_kv_swap_tests {
+    use std::os::raw::c_int;
+
+    unsafe extern "C" {
+        fn pie_portable_test_kv_page_bytes(layer: c_int) -> i64;
+        fn pie_portable_test_kv_layer_nbytes(layer: c_int) -> i64;
+        fn pie_portable_test_kv_total_pages() -> c_int;
+    }
+
+    fn page_bytes(layer: i32) -> i64 {
+        unsafe { pie_portable_test_kv_page_bytes(layer) }
+    }
+    fn layer_nbytes(layer: i32) -> i64 {
+        unsafe { pie_portable_test_kv_layer_nbytes(layer) }
+    }
+    fn total_pages() -> i64 {
+        i64::from(unsafe { pie_portable_test_kv_total_pages() })
+    }
+
+    // page_bytes MUST be per-layer. If a regression keys it on layer 0 (the
+    // old uniform `page_bytes_of`), the sliding and full layers report the
+    // same value and this fails.
+    #[test]
+    fn page_bytes_is_per_layer_not_uniform() {
+        let pb_sliding = page_bytes(0); // 8 kv-heads × 256 × 16 × 2 = 65536
+        let pb_full = page_bytes(1); //    1 kv-head  × 512 × 16 × 2 = 16384
+        assert!(pb_sliding > 0 && pb_full > 0, "construction failed");
+        assert_ne!(
+            pb_sliding, pb_full,
+            "page_bytes must reflect each layer's own geometry, not layer 0"
+        );
+        assert!(
+            pb_sliding > pb_full,
+            "sliding layer (more kv-heads) holds more bytes per page"
+        );
+    }
+
+    // The bound that the crash violated: every page of every layer must fit in
+    // that layer's tensor. The uniform value (layer 0's) over-runs the smaller
+    // full-attention layer's last page; the per-layer value fits exactly.
+    #[test]
+    fn per_layer_page_bytes_keeps_every_page_in_bounds() {
+        let pages = total_pages();
+        let pb_uniform = page_bytes(0); // what the old uniform code used everywhere
+        let pb_full = page_bytes(1);
+        let nbytes_full = layer_nbytes(1);
+        assert!(pages > 0 && nbytes_full > 0, "construction failed");
+
+        // Per-layer: the whole layer is exactly tiled by its own pages.
+        assert_eq!(
+            pages * pb_full,
+            nbytes_full,
+            "per-layer page bytes must tile the full-attention layer exactly"
+        );
+        // Uniform: the last page's read [off, off+size) runs past the tensor.
+        let last_off = (pages - 1) * pb_uniform;
+        assert!(
+            last_off + pb_uniform > nbytes_full,
+            "uniform page bytes must over-read the smaller layer (this was the abort)"
+        );
+    }
+}

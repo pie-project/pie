@@ -96,6 +96,16 @@ public:
     std::int32_t total_pages() const noexcept { return total_pages_; }
     std::int32_t page_size()   const noexcept { return page_size_; }
     std::int32_t total_slots() const noexcept { return total_pages_ * page_size_; }
+    // Bytes occupied by one page of layer `layer`'s K (or V) buffer. Derived
+    // from the layer's own tensor, so it is exact for any dtype (incl.
+    // quantized) AND honors Gemma 4's per-layer geometry — sliding layers
+    // (more kv-heads, smaller head_dim) and full layers differ in page bytes.
+    // The KV-swap / fork copy paths MUST size and offset per layer with this
+    // (a single uniform value over-reads the smaller layers → ggml bounds abort).
+    std::size_t page_bytes(std::int32_t layer) const noexcept {
+        return ggml_nbytes(k_layers_[layer]) /
+               static_cast<std::size_t>(total_pages_);
+    }
     std::size_t  buffer_size() const noexcept;
     const KvCacheQuantFormat& quant_format() const noexcept { return quant_format_; }
 

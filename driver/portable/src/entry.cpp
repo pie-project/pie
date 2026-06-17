@@ -376,21 +376,21 @@ int run_impl(int argc,
     const std::int32_t cpu_pages =
         static_cast<std::int32_t>(cfg.batching.cpu_pages);
     if (cpu_pages > 0) {
-        const auto& hp = model.hparams();
+        // Size the host mirror from the device KV cache's own per-layer page
+        // bytes (Gemma 4's sliding/full layers differ) so D2H/H2D copies are
+        // byte-for-byte; a uniform value mis-sizes the smaller layers.
+        auto& kv = executor.kv();
+        std::vector<std::size_t> per_layer_page_bytes(kv.n_layers());
+        for (std::int32_t il = 0; il < kv.n_layers(); ++il) {
+            per_layer_page_bytes[il] = kv.page_bytes(il);
+        }
         swap_pool = std::make_unique<pie_portable_driver::HostSwapPool>(
-            hp.num_hidden_layers,
-            hp.num_key_value_heads,
-            hp.head_dim,
-            cpu_pages,
-            page_size,
-            ggml_type_size(GGML_TYPE_F16));
+            std::move(per_layer_page_bytes), cpu_pages, page_size);
         if (cfg.runtime.verbose) {
             std::cerr << "[pie-driver-portable] host swap pool: "
                       << cpu_pages << " pages × "
-                      << (swap_pool->page_bytes() / 1024.0) << " KiB/layer × "
-                      << hp.num_hidden_layers << " layers × 2 (K+V) = "
-                      << (cpu_pages * swap_pool->page_bytes() *
-                          hp.num_hidden_layers * 2 / (1024.0 * 1024.0))
+                      << kv.n_layers() << " layers × 2 (K+V) = "
+                      << (swap_pool->total_bytes() / (1024.0 * 1024.0))
                       << " MiB\n";
         }
     }

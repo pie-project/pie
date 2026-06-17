@@ -25,15 +25,6 @@
 
 namespace pie_portable_driver::service {
 
-namespace {
-
-std::size_t page_bytes_of(KvCachePaged& kv) {
-    return static_cast<std::size_t>(kv.n_embd_gqa()) * kv.page_size()
-           * ggml_type_size(kv.k(0)->type);
-}
-
-}  // namespace
-
 InProcService::InProcService(Executor& executor,
                              Model& model,
                              HostSwapPool* swap_pool,
@@ -90,7 +81,10 @@ void InProcService::serve_forever(pie_driver::InProcServer& server) {
                         break;
                     }
                     auto& kv = executor_.kv();
-                    const std::size_t per_page = page_bytes_of(kv);
+                    // Page bytes are per layer: Gemma 4's sliding and full
+                    // attention layers differ in geometry, so each layer's
+                    // page is sized/offset with kv.page_bytes(il). A single
+                    // uniform value over-reads the smaller layers and aborts.
                     const int total_dev = kv.total_pages();
                     const int total_host =
                         swap_pool_ ? swap_pool_->cpu_pages() : 0;
@@ -111,16 +105,17 @@ void InProcService::serve_forever(pie_driver::InProcServer& server) {
                                     ok = false;
                                     break;
                                 }
-                                const std::size_t off =
-                                    static_cast<std::size_t>(s) * per_page;
                                 for (std::int32_t il = 0; il < kv.n_layers();
                                      ++il) {
+                                    const std::size_t pb = kv.page_bytes(il);
+                                    const std::size_t off =
+                                        static_cast<std::size_t>(s) * pb;
                                     ggml_backend_tensor_get(
                                         kv.k(il), swap_pool_->k_slot(il, d),
-                                        off, per_page);
+                                        off, pb);
                                     ggml_backend_tensor_get(
                                         kv.v(il), swap_pool_->v_slot(il, d),
-                                        off, per_page);
+                                        off, pb);
                                 }
                             } else if (req.method ==
                                        pie_driver::PIE_METHOD_COPY_H2D) {
@@ -135,16 +130,17 @@ void InProcService::serve_forever(pie_driver::InProcServer& server) {
                                     ok = false;
                                     break;
                                 }
-                                const std::size_t off =
-                                    static_cast<std::size_t>(d) * per_page;
                                 for (std::int32_t il = 0; il < kv.n_layers();
                                      ++il) {
+                                    const std::size_t pb = kv.page_bytes(il);
+                                    const std::size_t off =
+                                        static_cast<std::size_t>(d) * pb;
                                     ggml_backend_tensor_set(
                                         kv.k(il), swap_pool_->k_slot(il, s),
-                                        off, per_page);
+                                        off, pb);
                                     ggml_backend_tensor_set(
                                         kv.v(il), swap_pool_->v_slot(il, s),
-                                        off, per_page);
+                                        off, pb);
                                 }
                             } else if (req.method ==
                                        pie_driver::PIE_METHOD_COPY_D2D) {
@@ -154,21 +150,23 @@ void InProcService::serve_forever(pie_driver::InProcServer& server) {
                                     ok = false;
                                     break;
                                 }
-                                std::vector<std::uint8_t> tmp(per_page);
-                                const std::size_t soff =
-                                    static_cast<std::size_t>(s) * per_page;
-                                const std::size_t doff =
-                                    static_cast<std::size_t>(d) * per_page;
+                                std::vector<std::uint8_t> tmp;
                                 for (std::int32_t il = 0; il < kv.n_layers();
                                      ++il) {
+                                    const std::size_t pb = kv.page_bytes(il);
+                                    const std::size_t soff =
+                                        static_cast<std::size_t>(s) * pb;
+                                    const std::size_t doff =
+                                        static_cast<std::size_t>(d) * pb;
+                                    tmp.resize(pb);
                                     ggml_backend_tensor_get(
-                                        kv.k(il), tmp.data(), soff, per_page);
+                                        kv.k(il), tmp.data(), soff, pb);
                                     ggml_backend_tensor_set(
-                                        kv.k(il), tmp.data(), doff, per_page);
+                                        kv.k(il), tmp.data(), doff, pb);
                                     ggml_backend_tensor_get(
-                                        kv.v(il), tmp.data(), soff, per_page);
+                                        kv.v(il), tmp.data(), soff, pb);
                                     ggml_backend_tensor_set(
-                                        kv.v(il), tmp.data(), doff, per_page);
+                                        kv.v(il), tmp.data(), doff, pb);
                                 }
                             } else {
                                 if (!swap_pool_) {
@@ -184,12 +182,13 @@ void InProcService::serve_forever(pie_driver::InProcServer& server) {
                                 }
                                 for (std::int32_t il = 0; il < kv.n_layers();
                                      ++il) {
+                                    const std::size_t pb = kv.page_bytes(il);
                                     std::memcpy(
                                         swap_pool_->k_slot(il, d),
-                                        swap_pool_->k_slot(il, s), per_page);
+                                        swap_pool_->k_slot(il, s), pb);
                                     std::memcpy(
                                         swap_pool_->v_slot(il, d),
-                                        swap_pool_->v_slot(il, s), per_page);
+                                        swap_pool_->v_slot(il, s), pb);
                                 }
                             }
                         }

@@ -123,6 +123,10 @@ add_library(pie_driver_portable_lib STATIC
   # (#712): head_count_kv reduction + rope_freqs.weight requirement, from
   # pie-server #[cfg(test)] Rust tests. GC'd in release.
   src/gemma4_hparams_testhook.cpp
+  # Test-only entry exposing KvCachePaged::page_bytes() on a non-uniform
+  # (Gemma 4 alternating-attention) cache for a pie-server #[cfg(test)] Rust
+  # test (per-layer KV-swap/fork page sizing). GC'd in release.
+  src/kv_swap_testhook.cpp
 )
 
 target_compile_options(pie_driver_portable_lib PRIVATE
