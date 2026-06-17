@@ -1138,11 +1138,66 @@ std::int32_t masked_argmax_bf16(
     return best_idx;
 }
 
+// Argmax over a row with an optional BRLE allow-mask and an optional additive
+// per-token bias (`bias` maps token id -> logit bias). Empty `mask_runs` =
+// every token eligible. Cold host-override analog of the portable bias apply;
+// like the existing cuda mask override it reduces to argmax (full sampled-bias
+// support would need a pre-sampler GPU kernel).
+std::int32_t biased_constrained_argmax_bf16(
+    const std::uint16_t* row,
+    int vocab_size,
+    std::span<const std::uint32_t> mask_runs,
+    const std::unordered_map<std::uint32_t, float>& bias)
+{
+    auto biased = [&](std::int32_t idx) -> float {
+        float val = bf16_to_float(row[idx]);
+        const auto it = bias.find(static_cast<std::uint32_t>(idx));
+        if (it != bias.end()) val += it->second;
+        return val;
+    };
+    float best_val = -std::numeric_limits<float>::infinity();
+    std::int32_t best_idx = -1;
+    if (mask_runs.empty()) {
+        for (std::int32_t idx = 0; idx < vocab_size; ++idx) {
+            const float val = biased(idx);
+            if (val > best_val || (val == best_val && idx < best_idx)) {
+                best_val = val;
+                best_idx = idx;
+            }
+        }
+        return best_idx;
+    }
+    bool allow = false;
+    std::uint64_t pos = 0;
+    for (std::size_t i = 0; i < mask_runs.size() && pos < static_cast<std::uint64_t>(vocab_size);
+         ++i) {
+        const std::uint64_t run_len = mask_runs[i];
+        const std::uint64_t end =
+            std::min<std::uint64_t>(pos + run_len, static_cast<std::uint64_t>(vocab_size));
+        if (allow) {
+            for (std::uint64_t j = pos; j < end; ++j) {
+                const auto idx = static_cast<std::int32_t>(j);
+                const float val = biased(idx);
+                if (val > best_val || (val == best_val && idx < best_idx)) {
+                    best_val = val;
+                    best_idx = idx;
+                }
+            }
+        }
+        pos = end;
+        allow = !allow;
+    }
+    return best_idx;
+}
+
 void apply_logit_mask_overrides(
     model::Qwen3Workspace& ws,
     std::vector<std::int32_t>& all_sampled,
     std::span<const std::uint32_t> logit_masks,
     std::span<const std::uint32_t> logit_mask_indptr,
+    std::span<const std::uint32_t> logit_bias_tokens,
+    std::span<const float> logit_bias_values,
+    std::span<const std::uint32_t> logit_bias_indptr,
     std::span<const std::uint32_t> qo_indptr,
     std::span<const std::uint32_t> sampling_indptr,
     std::span<const std::uint32_t> sampling_indices,
@@ -1151,8 +1206,11 @@ void apply_logit_mask_overrides(
     int N,
     int vocab_size)
 {
-    if (logit_masks.empty()) return;
-    if (logit_mask_indptr.size() < static_cast<std::size_t>(R + 1)) return;
+    const bool have_mask = !logit_masks.empty() &&
+                           logit_mask_indptr.size() >= static_cast<std::size_t>(R + 1);
+    const bool have_bias = !logit_bias_tokens.empty() &&
+                           logit_bias_indptr.size() >= static_cast<std::size_t>(R + 1);
+    if (!have_mask && !have_bias) return;
     if (qo_indptr.size() < static_cast<std::size_t>(R + 1)) return;
     if (sampling_indptr.size() < static_cast<std::size_t>(R + 1)) return;
 
@@ -1160,11 +1218,30 @@ void apply_logit_mask_overrides(
     std::vector<std::uint16_t> row_bf16(static_cast<std::size_t>(vocab_size));
 
     for (int r = 0; r < R; ++r) {
-        const std::uint32_t mask_lo = logit_mask_indptr[r];
-        const std::uint32_t mask_hi = logit_mask_indptr[r + 1];
-        if (mask_hi <= mask_lo || mask_hi > logit_masks.size()) continue;
+        // Per-request BRLE allow-mask (optional).
+        std::span<const std::uint32_t> runs;
+        if (have_mask) {
+            const std::uint32_t mask_lo = logit_mask_indptr[r];
+            const std::uint32_t mask_hi = logit_mask_indptr[r + 1];
+            if (mask_hi > mask_lo && mask_hi <= logit_masks.size()) {
+                runs = logit_masks.subspan(mask_lo, mask_hi - mask_lo);
+            }
+        }
+        // Per-request additive bias map (optional).
+        std::unordered_map<std::uint32_t, float> bias;
+        if (have_bias) {
+            const std::uint32_t lo = logit_bias_indptr[r];
+            const std::uint32_t hi = logit_bias_indptr[r + 1];
+            if (hi > lo && hi <= logit_bias_tokens.size() && hi <= logit_bias_values.size()) {
+                bias.reserve(hi - lo);
+                for (std::uint32_t i = lo; i < hi; ++i) {
+                    bias[logit_bias_tokens[i]] += logit_bias_values[i];
+                }
+            }
+        }
+        // Nothing to apply for this request.
+        if (runs.empty() && bias.empty()) continue;
 
-        const auto runs = logit_masks.subspan(mask_lo, mask_hi - mask_lo);
         const std::uint32_t qo_lo = qo_indptr[r];
         for (std::uint32_t k = sampling_indptr[r]; k < sampling_indptr[r + 1]; ++k) {
             if (k >= per_slot_type.size() || !is_token_sampler(per_slot_type[k])) continue;
@@ -1175,10 +1252,12 @@ void apply_logit_mask_overrides(
                                   logits_u16 + static_cast<long long>(row) * vocab_size,
                                   sizeof(std::uint16_t) * static_cast<std::size_t>(vocab_size),
                                   cudaMemcpyDeviceToHost));
-            const std::int32_t masked = masked_argmax_bf16(
-                row_bf16.data(), vocab_size, runs);
-            if (masked >= 0) {
-                all_sampled[row] = masked;
+            const std::int32_t picked =
+                bias.empty()
+                    ? masked_argmax_bf16(row_bf16.data(), vocab_size, runs)
+                    : biased_constrained_argmax_bf16(row_bf16.data(), vocab_size, runs, bias);
+            if (picked >= 0) {
+                all_sampled[row] = picked;
             }
         }
     }
@@ -2227,6 +2306,10 @@ void handle_fire_batch(
         const auto rns_view_orig   = view.request_num_samplers.as<std::uint32_t>();
         const auto logit_masks_view = view.logit_masks.as<std::uint32_t>();
         const auto logit_mask_indptr_view = view.logit_mask_indptr.as<std::uint32_t>();
+        // Per-token additive logit bias.
+        const auto logit_bias_tokens_view = view.logit_bias_tokens.as<std::uint32_t>();
+        const auto logit_bias_values_view = view.logit_bias_values.as<float>();
+        const auto logit_bias_indptr_view = view.logit_bias_indptr.as<std::uint32_t>();
 
         // Spec-decoding fields. When non-empty for some request, splice
         // drafts into the forward and append a verification block to
@@ -2758,10 +2841,11 @@ void handle_fire_batch(
         // and benchmark traffic keep the GPU sampler result.
         const std::int32_t* all_sampled = sampled_host;
         std::vector<std::int32_t> sampled_override;
-        if (!logit_masks_view.empty()) {
+        if (!logit_masks_view.empty() || !logit_bias_tokens_view.empty()) {
             sampled_override.assign(sampled_host, sampled_host + N);
             apply_logit_mask_overrides(
                 ws, sampled_override, logit_masks_view, logit_mask_indptr_view,
+                logit_bias_tokens_view, logit_bias_values_view, logit_bias_indptr_view,
                 qo_view, sptr_view, sidx_view, std::span<const std::uint32_t>(per_slot_type),
                 R, N, engine.hf_config().vocab_size);
             all_sampled = sampled_override.data();

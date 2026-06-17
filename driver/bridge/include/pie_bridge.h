@@ -195,6 +195,13 @@ void pie_forward_request_audio_feature_indptr   (const PieForwardRequest*, const
 void pie_forward_request_audio_anchor_rows      (const PieForwardRequest*, const uint32_t**, size_t*);
 void pie_forward_request_audio_indptr           (const PieForwardRequest*, const uint32_t**, size_t*);
 
+/* Per-request additive logit bias applied before sampling.
+ * `(logit_bias_tokens[i], logit_bias_values[i])` is one (token_id, bias) pair;
+ * `logit_bias_indptr` is per-request CSR (pairs per request). Empty = no bias. */
+void pie_forward_request_logit_bias_tokens      (const PieForwardRequest*, const uint32_t**, size_t*);
+void pie_forward_request_logit_bias_values      (const PieForwardRequest*, const float**,    size_t*);
+void pie_forward_request_logit_bias_indptr      (const PieForwardRequest*, const uint32_t**, size_t*);
+
 /* AdapterBinding fields — `-1` means unbound for both. */
 int64_t pie_adapter_binding_adapter_id(const PieAdapterBinding*);
 int64_t pie_adapter_binding_seed      (const PieAdapterBinding*);
@@ -314,6 +321,10 @@ typedef struct PieForwardRequestDesc {
     const uint32_t* audio_feature_indptr_ptr;     size_t audio_feature_indptr_len;
     const uint32_t* audio_anchor_rows_ptr;        size_t audio_anchor_rows_len;
     const uint32_t* audio_indptr_ptr;             size_t audio_indptr_len;
+    /* Per-request logit bias (appended; struct order matches schema.rs). */
+    const uint32_t* logit_bias_tokens_ptr;        size_t logit_bias_tokens_len;
+    const float*    logit_bias_values_ptr;        size_t logit_bias_values_len;
+    const uint32_t* logit_bias_indptr_ptr;        size_t logit_bias_indptr_len;
 } PieForwardRequestDesc;
 
 typedef struct PieForwardResponseDesc {

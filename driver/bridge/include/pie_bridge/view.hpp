@@ -197,6 +197,12 @@ struct PieForwardRequestView {
     PieSlice<std::uint32_t> audio_anchor_rows;       // batch row offset per clip
     PieSlice<std::uint32_t> audio_indptr;            // per-request CSR
 
+    // Per-request logit bias: (token_id, bias) pairs added to next-token
+    // logits before sampling; `logit_bias_indptr` is per-request CSR. Empty = no bias.
+    PieSlice<std::uint32_t> logit_bias_tokens;
+    PieSlice<float>         logit_bias_values;
+    PieSlice<std::uint32_t> logit_bias_indptr;
+
     std::uint32_t driver_id;
     std::uint8_t  single_token_mode;
     std::uint8_t  has_user_mask;
@@ -438,6 +444,11 @@ inline void fill_forward_view(const PieForwardRequestDesc& f,
     out.audio_feature_indptr   = slice_from(f.audio_feature_indptr_ptr, f.audio_feature_indptr_len);
     out.audio_anchor_rows      = slice_from(f.audio_anchor_rows_ptr, f.audio_anchor_rows_len);
     out.audio_indptr           = slice_from(f.audio_indptr_ptr, f.audio_indptr_len);
+
+    // Per-request logit bias — pass-through slices into the archive.
+    out.logit_bias_tokens      = slice_from(f.logit_bias_tokens_ptr, f.logit_bias_tokens_len);
+    out.logit_bias_values      = slice_from(f.logit_bias_values_ptr, f.logit_bias_values_len);
+    out.logit_bias_indptr      = slice_from(f.logit_bias_indptr_ptr, f.logit_bias_indptr_len);
 
     // Demultiplex AoS samplers into SoA arenas. The driver handler reads
     // one entry per sampler from each per-attribute array. For sampler

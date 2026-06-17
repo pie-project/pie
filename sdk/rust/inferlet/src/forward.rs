@@ -112,6 +112,9 @@ pub struct Forward<'ctx> {
     slots: Vec<SlotSpec>,
     next_slot: u32,
     mask: Option<Vec<u32>>,
+    /// Per-token additive logit bias `(token_id, bias)` applied before
+    /// sampling (after any `mask`). See [`Forward::logit_bias`].
+    logit_bias: Option<Vec<(u32, f32)>>,
     attn_mask: Option<Vec<Vec<u32>>>,
     adapter: Option<&'ctx Adapter>,
     zo_seed: Option<i64>,
@@ -156,6 +159,7 @@ impl<'ctx> Forward<'ctx> {
             slots: Vec::new(),
             next_slot: 0,
             mask: None,
+            logit_bias: None,
             attn_mask: None,
             adapter: None,
             zo_seed: None,
@@ -253,6 +257,22 @@ impl<'ctx> Forward<'ctx> {
         self
     }
 
+    /// Set a per-token additive logit bias: each `(token_id, bias)` pair is
+    /// added to that token's next-token logit before sampling (after any
+    /// [`mask`](Self::mask)). Empty input clears the bias.
+    ///
+    /// Caveat: CUDA's fast samplers ignore the bias (applied only via the cold
+    /// argmax host-override, like the BRLE mask); portable/Metal applies it on
+    /// every sampled request.
+    pub fn logit_bias(&mut self, bias: &[(u32, f32)]) -> &mut Self {
+        self.logit_bias = if bias.is_empty() {
+            None
+        } else {
+            Some(bias.to_vec())
+        };
+        self
+    }
+
     /// Set per-query-position attention masks. Length must match the total
     /// number of query positions across all `input` / `input_at` calls.
     /// If unset, the runtime synthesizes a causal mask.
@@ -304,6 +324,7 @@ impl<'ctx> Forward<'ctx> {
             slots,
             next_slot: _,
             mask,
+            logit_bias,
             attn_mask,
             adapter,
             zo_seed,
@@ -368,6 +389,9 @@ impl<'ctx> Forward<'ctx> {
 
         if let Some(m) = mask {
             pass.logit_mask(&m);
+        }
+        if let Some(b) = logit_bias {
+            pass.logit_bias(&b);
         }
         if let Some(m) = attn_mask {
             pass.attention_mask(&m);

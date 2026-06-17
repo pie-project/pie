@@ -69,6 +69,11 @@ fn frame_forward_round_trip() {
         audio_feature_indptr: vec![0, 8],
         audio_anchor_rows: vec![3],
         audio_indptr: vec![0, 1],
+        // Per-token logit bias: two (token, bias) pairs for the one request —
+        // exercises the appended fields over the real rkyv wire.
+        logit_bias_tokens: vec![7, 42],
+        logit_bias_values: vec![-1.5, -0.25],
+        logit_bias_indptr: vec![0, 2],
         ..Default::default()
     };
     let f = Frame {
@@ -103,6 +108,10 @@ fn frame_forward_round_trip() {
     assert_eq!(arch_req.audio_feature_indptr.as_slice(), &[0u32, 8]);
     assert_eq!(arch_req.audio_anchor_rows.as_slice(), &[3u32]);
     assert_eq!(arch_req.audio_indptr.as_slice(), &[0u32, 1]);
+    // Logit-bias side-channel survives the rkyv round-trip intact.
+    assert_eq!(arch_req.logit_bias_tokens.as_slice(), &[7u32, 42]);
+    assert_eq!(arch_req.logit_bias_values.as_slice(), &[-1.5f32, -0.25]);
+    assert_eq!(arch_req.logit_bias_indptr.as_slice(), &[0u32, 2]);
 }
 
 #[test]

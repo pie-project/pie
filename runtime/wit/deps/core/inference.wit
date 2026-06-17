@@ -61,6 +61,17 @@ interface inference {
             mask: brle,
         );
 
+        // Per-token additive logit bias. Each (token-id, bias) pair is added
+        // to that token's next-token logit before sampling (after any
+        // logit-mask). If not provided, no bias is applied.
+        //
+        // Caveat: CUDA's fast samplers ignore the bias (applied only via the
+        // cold argmax host-override, like the BRLE mask); portable/Metal
+        // applies it on every sampled request.
+        logit-bias: func(
+            bias: list<tuple<u32, f32>>,
+        );
+
         sampler: func(
             indices: list<u32>,
             sampler: sampler,

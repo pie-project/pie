@@ -125,6 +125,9 @@ PlanArrays extract_plan_arrays(const pie_driver::PieForwardRequestView& req) {
     a.sampler_label_indptr = req.sampler_label_indptr.as<std::uint32_t>();
     a.logit_masks          = req.logit_masks.as<std::uint32_t>();
     a.logit_mask_indptr    = req.logit_mask_indptr.as<std::uint32_t>();
+    a.logit_bias_tokens    = req.logit_bias_tokens.as<std::uint32_t>();
+    a.logit_bias_values    = req.logit_bias_values.as<float>();
+    a.logit_bias_indptr    = req.logit_bias_indptr.as<std::uint32_t>();
     a.flat_attn_masks      = req.flattened_masks.as<std::uint32_t>();
     a.attn_mask_indptr     = req.mask_indptr.as<std::uint32_t>();
     a.adapter_indices      = req.adapter_indices.as<std::int64_t>();
@@ -463,6 +466,23 @@ void plan_single_request(const PlanArrays& a,
             rp.logit_mask_runs.assign(
                 a.logit_masks.data() + lm_start,
                 a.logit_masks.data() + lm_end);
+        }
+    }
+
+    // Per-request logit bias (optional — empty = no bias). Tokens and values
+    // are parallel arrays partitioned per request by the same CSR.
+    if (a.logit_bias_indptr.size() == static_cast<std::size_t>(a.n_request) + 1) {
+        const std::int32_t lb_start = static_cast<std::int32_t>(a.logit_bias_indptr[r]);
+        const std::int32_t lb_end   = static_cast<std::int32_t>(a.logit_bias_indptr[r + 1]);
+        if (lb_end > lb_start &&
+            static_cast<std::size_t>(lb_end) <= a.logit_bias_tokens.size() &&
+            static_cast<std::size_t>(lb_end) <= a.logit_bias_values.size()) {
+            rp.logit_bias_tokens.assign(
+                a.logit_bias_tokens.data() + lb_start,
+                a.logit_bias_tokens.data() + lb_end);
+            rp.logit_bias_values.assign(
+                a.logit_bias_values.data() + lb_start,
+                a.logit_bias_values.data() + lb_end);
         }
     }
 

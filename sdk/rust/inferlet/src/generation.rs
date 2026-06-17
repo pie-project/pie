@@ -85,6 +85,10 @@ pub struct Generator<'ctx> {
     ctx: &'ctx mut Context,
     pass: ForwardPass,
     wit_sampler: WitSampler,
+    /// Per-token additive logit bias `(token_id, bias)` applied on every
+    /// forward pass before sampling (after any constraint mask). See
+    /// [`Generator::logit_bias`].
+    logit_bias: Vec<(u32, f32)>,
     stop: Vec<u32>,
     max_tokens: Option<usize>,
     horizon: Option<usize>,
@@ -138,6 +142,7 @@ impl<'ctx> Generator<'ctx> {
             ctx,
             pass,
             wit_sampler,
+            logit_bias: Vec::new(),
             stop: Vec::new(),
             max_tokens: None,
             horizon: None,
@@ -223,6 +228,18 @@ impl<'ctx> Generator<'ctx> {
     /// Apply an adapter (LoRA etc.) on every forward pass.
     pub fn adapter(mut self, a: &'ctx Adapter) -> Self {
         self.adapter = Some(a);
+        self
+    }
+
+    /// Set a per-token additive logit bias: each `(token_id, bias)` pair is
+    /// added to that token's logit on every forward pass, before sampling and
+    /// after any constraint mask. Replaces any previously-set bias.
+    ///
+    /// Caveat: CUDA's fast samplers ignore the bias (applied only via the cold
+    /// argmax host-override, like the BRLE mask); portable/Metal applies it on
+    /// every sampled request.
+    pub fn logit_bias(mut self, bias: &[(u32, f32)]) -> Self {
+        self.logit_bias = bias.to_vec();
         self
     }
 
@@ -678,6 +695,9 @@ impl<'g, 'ctx> GenStep<'g, 'ctx> {
 
         if let Some(m) = &mask {
             pass.logit_mask(m);
+        }
+        if !parent.logit_bias.is_empty() {
+            pass.logit_bias(&parent.logit_bias);
         }
 
         let raw = pass

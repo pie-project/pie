@@ -109,6 +109,11 @@ public:
         // so the graph never sees mixed temperatures.
         SamplerParams sampler;
         std::vector<std::uint32_t> logit_mask_runs;  // BRLE; empty = no mask
+        // Per-token additive logit bias: parallel token-id / value arrays
+        // applied to next-token logits before sampling (after the mask).
+        // Empty = no bias.
+        std::vector<std::uint32_t> logit_bias_tokens;
+        std::vector<float>         logit_bias_values;
 
         // Per-slot sampling positions (offsets into the expanded batch).
         // Length 1 for plain sampling. For M8 spec decode: length = 1 +
