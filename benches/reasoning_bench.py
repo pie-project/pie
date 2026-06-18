@@ -188,6 +188,7 @@ def payload_for(problem: Problem, pattern: str, args: argparse.Namespace) -> dic
         "score_tokens": args.score_tokens,
         "temperature": args.temperature,
         "top_p": args.top_p,
+        "thinking": args.thinking,
     }
 
 
@@ -440,6 +441,20 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--score-tokens", type=int, default=16)
     p.add_argument("--temperature", type=float, default=0.7)
     p.add_argument("--top-p", type=float, default=0.95)
+    thinking = p.add_mutually_exclusive_group()
+    thinking.add_argument(
+        "--thinking",
+        dest="thinking",
+        action="store_true",
+        help="Allow model thinking blocks.",
+    )
+    thinking.add_argument(
+        "--no-thinking",
+        dest="thinking",
+        action="store_false",
+        help="Use the model/template no-thinking path. This is the default.",
+    )
+    p.set_defaults(thinking=False)
     p.add_argument("--timeout", type=float, default=300.0)
     p.add_argument("--kv-pages", type=int, default=2048)
     p.add_argument("--portable-n-gpu-layers", type=int, default=None)

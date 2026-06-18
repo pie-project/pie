@@ -44,6 +44,8 @@ struct Input {
     temperature: f32,
     #[serde(default = "default_top_p")]
     top_p: f32,
+    #[serde(default)]
+    thinking: bool,
 }
 
 fn default_pattern() -> String {
@@ -187,6 +189,7 @@ async fn run_direct(input: &Input, model: &Model, root: &Context) -> Result<Outp
         input.max_tokens,
         input.temperature,
         input.top_p,
+        input.thinking,
         None,
     )
     .await?;
@@ -256,6 +259,7 @@ async fn run_tree_of_thought(
 
     score_candidates(
         &input.question,
+        input.thinking,
         input.score_tokens,
         model,
         score_root,
@@ -283,6 +287,7 @@ async fn run_tree_of_thought(
                 input.max_tokens,
                 input.temperature,
                 input.top_p,
+                input.thinking,
                 Some(&prompt),
             )
             .await
@@ -302,6 +307,7 @@ async fn run_tree_of_thought(
     }
     score_candidates(
         &input.question,
+        input.thinking,
         input.score_tokens,
         model,
         score_root,
@@ -362,6 +368,7 @@ async fn run_graph_of_thought(
         input.max_tokens,
         0.0,
         1.0,
+        input.thinking,
         Some(&prompt),
     )
     .await?;
@@ -399,6 +406,7 @@ async fn generate_candidates(
             input.max_tokens,
             input.temperature,
             input.top_p,
+            input.thinking,
             prompt,
         )
     });
@@ -410,20 +418,24 @@ async fn generate_candidates(
 
 async fn score_candidates(
     question: &str,
+    thinking: bool,
     max_tokens: usize,
     model: &Model,
     root: &Context,
     candidates: &mut [Candidate],
     stats: &mut ExecutionStats,
 ) -> Result<()> {
-    let futures = candidates.iter().map(|candidate| {
-        let prompt = format!(
-            "Problem:\n{question}\n\nCandidate solution:\n{}\n\nScore:",
-            candidate.response
-        );
-        let ctx = root.fork();
-        async move { generate_answer(ctx?, model, max_tokens, 0.0, 1.0, Some(&prompt)).await }
-    });
+    let futures =
+        candidates.iter().map(|candidate| {
+            let prompt = format!(
+                "Problem:\n{question}\n\nCandidate solution:\n{}\n\nScore:",
+                candidate.response
+            );
+            let ctx = root.fork();
+            async move {
+                generate_answer(ctx?, model, max_tokens, 0.0, 1.0, thinking, Some(&prompt)).await
+            }
+        });
     let scores = future::join_all(futures)
         .await
         .into_iter()
@@ -442,12 +454,16 @@ async fn generate_answer(
     max_tokens: usize,
     temperature: f32,
     top_p: f32,
+    thinking: bool,
     prompt: Option<&str>,
 ) -> Result<Generated> {
     if let Some(prompt) = prompt {
         ctx.user(prompt);
     }
     ctx.cue();
+    if !thinking {
+        ctx.append(&model.tokenizer().encode("<think>\n\n</think>\n\n"));
+    }
     let sampler = if temperature <= 0.0 {
         Sampler::Argmax
     } else {
@@ -522,12 +538,9 @@ fn majority_vote_index(candidates: &[Candidate]) -> Option<usize> {
 
 fn extract_final_answer(text: &str) -> Option<String> {
     let lower = text.to_ascii_lowercase();
-    let marker = "final answer";
-    let tail = lower
-        .rfind(marker)
-        .map(|pos| &text[pos + marker.len()..])
-        .unwrap_or(text);
-    let tail = tail.find(':').map(|pos| &tail[pos + 1..]).unwrap_or(tail);
+    let marker = "final answer:";
+    let pos = lower.rfind(marker)?;
+    let tail = &text[pos + marker.len()..];
     extract_last_number(tail)
 }
 
@@ -579,6 +592,16 @@ mod tests {
             extract_final_answer("Work.\nFinal Answer: $1,234.0"),
             Some("1234".into())
         );
+    }
+
+    #[test]
+    fn rejects_unmarked_numeric_answer() {
+        assert_eq!(extract_final_answer("Work.\nThe answer is 1234."), None);
+    }
+
+    #[test]
+    fn rejects_final_answer_without_colon() {
+        assert_eq!(extract_final_answer("Work.\nFinal Answer is 1234."), None);
     }
 
     #[test]

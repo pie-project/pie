@@ -4,7 +4,15 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from benches.reasoning_bench import load_problems, normalize_number, reference_answer
+from argparse import Namespace
+
+from benches.reasoning_bench import (
+    Problem,
+    load_problems,
+    normalize_number,
+    payload_for,
+    reference_answer,
+)
 
 
 class ReasoningBenchTests(unittest.TestCase):
@@ -18,6 +26,32 @@ class ReasoningBenchTests(unittest.TestCase):
             reference_answer("Reasoning with intermediate numbers.\n#### 1,250"),
             "1250",
         )
+
+    def test_payload_disables_thinking_by_default(self):
+        args = Namespace(
+            num_candidates=4,
+            beam_width=2,
+            max_tokens=256,
+            score_tokens=16,
+            temperature=0.7,
+            top_p=0.95,
+            thinking=False,
+        )
+        payload = payload_for(Problem("p1", "How many?", "42"), "direct", args)
+        self.assertIs(payload["thinking"], False)
+
+    def test_payload_can_enable_thinking(self):
+        args = Namespace(
+            num_candidates=4,
+            beam_width=2,
+            max_tokens=256,
+            score_tokens=16,
+            temperature=0.7,
+            top_p=0.95,
+            thinking=True,
+        )
+        payload = payload_for(Problem("p1", "How many?", "42"), "direct", args)
+        self.assertIs(payload["thinking"], True)
 
     def test_loads_official_gsm8k_shape(self):
         with tempfile.TemporaryDirectory() as directory:
