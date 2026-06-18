@@ -13,6 +13,7 @@ import json
 import math
 import re
 import statistics
+import subprocess
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -177,7 +178,135 @@ def stats_delta(before: dict[str, int], after: dict[str, int]) -> dict[str, int]
     }
 
 
-async def run(args: argparse.Namespace) -> list[RunResult]:
+def payload_for(problem: Problem, pattern: str, args: argparse.Namespace) -> dict[str, Any]:
+    return {
+        "pattern": pattern,
+        "question": problem.question,
+        "num_candidates": args.num_candidates,
+        "beam_width": args.beam_width,
+        "max_tokens": args.max_tokens,
+        "score_tokens": args.score_tokens,
+        "temperature": args.temperature,
+        "top_p": args.top_p,
+    }
+
+
+def result_for(
+    problem: Problem,
+    pattern: str,
+    repetition: int,
+    latency_s: float,
+    output: dict[str, Any] | None,
+    engine_stats_delta: dict[str, int],
+    error: str | None,
+) -> RunResult:
+    predicted = normalize_number(output.get("final_answer") if output else None)
+    candidate_answers = [
+        normalize_number(candidate.get("answer"))
+        for candidate in (output or {}).get("candidates", [])
+    ]
+    correct_candidates = sum(answer == problem.answer for answer in candidate_answers)
+    return RunResult(
+        problem_id=problem.id,
+        pattern=pattern,
+        repetition=repetition,
+        correct=predicted == problem.answer,
+        oracle_correct=correct_candidates > 0,
+        correct_candidates=correct_candidates,
+        expected_answer=problem.answer,
+        predicted_answer=predicted,
+        latency_s=latency_s,
+        output=output,
+        engine_stats_delta=engine_stats_delta,
+        error=error,
+    )
+
+
+def print_result(result: RunResult) -> None:
+    status = "correct" if result.correct else "wrong"
+    if result.error:
+        status = "error"
+    print(
+        f"{result.problem_id:18} {result.pattern:18} rep={result.repetition} "
+        f"{status:7} answer={result.predicted_answer!r} "
+        f"latency={result.latency_s:.2f}s",
+        flush=True,
+    )
+
+
+def parse_pie_run_output(stdout: str) -> dict[str, Any]:
+    for line in reversed(stdout.splitlines()):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            output = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(output, dict):
+            return output
+    raise ValueError("pie run did not emit a JSON object on stdout")
+
+
+def run_cli(args: argparse.Namespace) -> list[RunResult]:
+    if not args.config:
+        raise ValueError("--config is required when --execution-mode=cli")
+
+    problems = load_problems(Path(args.dataset), args.max_problems)
+    wasm, manifest, _package = inferlet_paths()
+    patterns = PATTERNS if args.pattern == "all" else (args.pattern,)
+    results: list[RunResult] = []
+
+    pie_bin = Path(args.pie_bin)
+    config = Path(args.config)
+    for problem in problems:
+        for pattern in patterns:
+            for repetition in range(args.repetitions):
+                payload = payload_for(problem, pattern, args)
+                cmd = [
+                    str(pie_bin),
+                    "run",
+                    "--path",
+                    str(wasm),
+                    "--manifest",
+                    str(manifest),
+                    "--config",
+                    str(config),
+                    "--quiet",
+                    "--input",
+                    json.dumps(payload, separators=(",", ":")),
+                ]
+                started = time.perf_counter()
+                output = None
+                error = None
+                try:
+                    completed = subprocess.run(
+                        cmd,
+                        cwd=ROOT,
+                        check=True,
+                        capture_output=True,
+                        text=True,
+                        timeout=args.timeout,
+                    )
+                    output = parse_pie_run_output(completed.stdout)
+                except Exception as exc:  # keep the full experiment running
+                    error = f"{type(exc).__name__}: {exc}"
+                latency_s = time.perf_counter() - started
+                result = result_for(
+                    problem,
+                    pattern,
+                    repetition,
+                    latency_s,
+                    output,
+                    {},
+                    error,
+                )
+                results.append(result)
+                print_result(result)
+    return results
+
+
+async def run_embedded(args: argparse.Namespace) -> list[RunResult]:
     from pie.server import Server
     from pie_client import Event
 
@@ -193,16 +322,7 @@ async def run(args: argparse.Namespace) -> list[RunResult]:
         for problem in problems:
             for pattern in patterns:
                 for repetition in range(args.repetitions):
-                    payload = {
-                        "pattern": pattern,
-                        "question": problem.question,
-                        "num_candidates": args.num_candidates,
-                        "beam_width": args.beam_width,
-                        "max_tokens": args.max_tokens,
-                        "score_tokens": args.score_tokens,
-                        "temperature": args.temperature,
-                        "top_p": args.top_p,
-                    }
+                    payload = payload_for(problem, pattern, args)
                     before = await model_stats(client)
                     started = time.perf_counter()
                     output = None
@@ -220,42 +340,26 @@ async def run(args: argparse.Namespace) -> list[RunResult]:
                                 raise RuntimeError(str(message))
                     except Exception as exc:  # keep the full experiment running
                         error = f"{type(exc).__name__}: {exc}"
-                    latency = time.perf_counter() - started
+                    latency_s = time.perf_counter() - started
                     after = await model_stats(client)
-                    predicted = normalize_number(
-                        output.get("final_answer") if output else None
-                    )
-                    candidate_answers = [
-                        normalize_number(candidate.get("answer"))
-                        for candidate in (output or {}).get("candidates", [])
-                    ]
-                    correct_candidates = sum(
-                        answer == problem.answer for answer in candidate_answers
-                    )
-                    result = RunResult(
-                        problem_id=problem.id,
-                        pattern=pattern,
-                        repetition=repetition,
-                        correct=predicted == problem.answer,
-                        oracle_correct=correct_candidates > 0,
-                        correct_candidates=correct_candidates,
-                        expected_answer=problem.answer,
-                        predicted_answer=predicted,
-                        latency_s=latency,
-                        output=output,
-                        engine_stats_delta=stats_delta(before, after),
-                        error=error,
+                    result = result_for(
+                        problem,
+                        pattern,
+                        repetition,
+                        latency_s,
+                        output,
+                        stats_delta(before, after),
+                        error,
                     )
                     results.append(result)
-                    status = "correct" if result.correct else "wrong"
-                    if error:
-                        status = "error"
-                    print(
-                        f"{problem.id:18} {pattern:18} rep={repetition} "
-                        f"{status:7} answer={predicted!r} latency={latency:.2f}s",
-                        flush=True,
-                    )
+                    print_result(result)
     return results
+
+
+async def run(args: argparse.Namespace) -> list[RunResult]:
+    if args.execution_mode == "cli":
+        return run_cli(args)
+    return await run_embedded(args)
 
 
 def summarize(results: list[RunResult]) -> dict[str, Any]:
@@ -303,6 +407,22 @@ def write_results(path: Path, args: argparse.Namespace, results: list[RunResult]
 
 def parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Pie reasoning-pattern benchmark")
+    p.add_argument(
+        "--execution-mode",
+        choices=("embedded", "cli"),
+        default="embedded",
+        help="Use embedded pie.server or shell out to `pie run`.",
+    )
+    p.add_argument(
+        "--pie-bin",
+        default="./target/release/pie",
+        help="Pie binary to use when --execution-mode=cli.",
+    )
+    p.add_argument(
+        "--config",
+        default=None,
+        help="Pie config TOML. Required when --execution-mode=cli.",
+    )
     p.add_argument("--dataset", default=str(ROOT / "benches" / "reasoning_smoke.jsonl"))
     p.add_argument("--pattern", choices=("all", *PATTERNS), default="all")
     p.add_argument("--model", default="Qwen/Qwen3-0.6B")
