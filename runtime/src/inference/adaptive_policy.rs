@@ -32,8 +32,8 @@ use super::scheduler::{Decision, SchedulingPolicy};
 //   1. `B >= max_forward_requests`  — structural driver limit.
 //   2. `fired_high_water == 0`      — no historical fire yet; fire
 //                                     whatever we have (cold start).
-//   3. `B >= fired_high_water`      — we've matched the largest cohort
-//                                     ever fired; firing more won't
+//   3. `B >= fired_high_water`      — we've matched the recent cohort
+//                                     high-water; firing more won't
 //                                     produce a bigger batch from
 //                                     existing peers.
 //   4. `elapsed >= last_latency`    — deadlock watchdog: the cohort
@@ -52,11 +52,44 @@ use super::scheduler::{Decision, SchedulingPolicy};
 // `fired_high_water` is the only firing-rule concept; `last_latency`
 // is a watchdog to prevent indefinite parking, not a steady-state
 // trigger.
+//
+// `fired_high_water` tracks the *recent* cohort high-water, not an
+// all-time maximum: it ratchets up immediately when a fire meets or
+// exceeds it, and relaxes by one on any below-watermark fire (see
+// `relax_high_water`). A monotonic, never-decaying watermark is a bug:
+// once a transient burst lifts it (e.g. a one-off larger cohort, or
+// pass-level speculation inflating a batch), every later steady-state
+// cohort that lands below the peak fails rule 3 and needlessly waits
+// out the rule-4 watchdog. Relaxing the watermark lets it follow the
+// live cohort back down so those fires go out immediately.
+
+/// Evolve `fired_high_water` after a fire of `fired_size`.
+///
+/// Ratchets up immediately when the fire meets or exceeds the current
+/// watermark; otherwise relaxes by exactly one toward the live cohort.
+/// Stepping down by one (rather than snapping straight to `fired_size`)
+/// is deliberate: it ignores a single anomalously small fire but tracks
+/// a sustained drop within a couple of fires, which matches observed
+/// cohort dynamics (concurrency rarely falls by more than one between
+/// consecutive fires).
+///
+/// Free function (not a method) so the firing-rule arithmetic is unit
+/// testable in isolation.
+#[inline]
+fn relax_high_water(current: usize, fired_size: usize) -> usize {
+    if fired_size >= current {
+        fired_size
+    } else {
+        current.saturating_sub(1)
+    }
+}
 
 pub(super) struct AdaptivePolicy {
     max_forward_requests: usize,
-    /// Largest batch size that has fired. Monotonic; only ratchets
-    /// upward. The single firing-rule concept.
+    /// Recent cohort high-water — the single firing-rule concept.
+    /// Ratchets up on a meet-or-exceed fire and relaxes by one on a
+    /// below-watermark fire (see `relax_high_water`), so it tracks the
+    /// current steady-state cohort rather than an all-time peak.
     fired_high_water: usize,
     /// Previous fire's compute time, in seconds. Used solely as the
     /// deadlock watchdog (rule 4). Zero until the second fire
@@ -97,9 +130,7 @@ impl SchedulingPolicy for AdaptivePolicy {
 
     fn on_fired(&mut self, fired_size: usize) {
         self.batch_start_time = None;
-        if fired_size > self.fired_high_water {
-            self.fired_high_water = fired_size;
-        }
+        self.fired_high_water = relax_high_water(self.fired_high_water, fired_size);
     }
 
     fn decide(&mut self, current_forward_requests: usize) -> Decision {
@@ -333,12 +364,53 @@ mod tests {
     }
 
     #[test]
-    fn adaptive_fired_high_water_ratchets_only_upward() {
+    fn adaptive_fired_high_water_ratchets_up_immediately() {
+        // A larger cohort lifts the watermark on the very next fire.
         let mut policy = AdaptivePolicy::new(512, 0);
         policy.on_fired(40);
+        assert_eq!(policy.fired_high_water, 40);
         policy.on_fired(80);
-        policy.on_fired(60); // smaller — must not pull the watermark down
         assert_eq!(policy.fired_high_water, 80);
+    }
+
+    #[test]
+    fn adaptive_fired_high_water_relaxes_after_transient_burst() {
+        // A transient burst lifts the watermark, then a sustained drop
+        // to a smaller steady-state cohort relaxes it by one per fire —
+        // so the smaller cohort stops failing rule 3 and waiting out
+        // the watchdog. A monotonic watermark would stay pinned at 7.
+        let mut policy = AdaptivePolicy::new(512, 0);
+        for s in [4, 4, 7, 7] {
+            policy.on_fired(s);
+        }
+        assert_eq!(policy.fired_high_water, 7);
+        policy.on_fired(5);
+        assert_eq!(policy.fired_high_water, 6);
+        policy.on_fired(5);
+        assert_eq!(policy.fired_high_water, 5);
+        policy.on_fired(5);
+        assert_eq!(policy.fired_high_water, 5); // settled at the live cohort
+    }
+
+    #[test]
+    fn adaptive_fired_high_water_steady_cohort_is_stable() {
+        // A uniform cohort keeps the watermark exactly at the cohort
+        // size — never inflated, never relaxed below it — so every fire
+        // satisfies rule 3 and goes out immediately.
+        let mut policy = AdaptivePolicy::new(512, 0);
+        for _ in 0..1000 {
+            policy.on_fired(4);
+        }
+        assert_eq!(policy.fired_high_water, 4);
+    }
+
+    #[test]
+    fn relax_high_water_steps_down_by_one() {
+        assert_eq!(relax_high_water(8, 8), 8); // meet -> hold
+        assert_eq!(relax_high_water(8, 9), 9); // exceed -> ratchet up
+        assert_eq!(relax_high_water(8, 7), 7); // below -> decay by one
+        assert_eq!(relax_high_water(8, 3), 7); // far below -> still only one step
+        assert_eq!(relax_high_water(0, 0), 0); // cold start, no underflow
     }
 
     // ---- EagerPolicy --------------------------------------------------------
