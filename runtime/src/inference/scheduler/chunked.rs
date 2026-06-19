@@ -96,8 +96,21 @@ impl PendingRequest {
             physical_page_ids,
             last_page_len,
         } = self;
-        let Completion::Direct(response_tx) = completion else {
-            unreachable!("chunk continuations returned above");
+        // Cold submits are always first-fired as `Completion::Chain`
+        // (see `speculator::start_chain`), regardless of the configured
+        // `speculation_depth` — that setting only bounds how many further
+        // stages get pre-fired after this one, not whether the first fire
+        // itself is chain-tagged. So an oversized prompt needing chunking
+        // can arrive as either `Direct` or `Chain`; only `Chunk` (handled
+        // above) is excluded. `ChainState::response` carries the same
+        // sender type as `Direct`, so we can degrade a chain's first fire
+        // to a plain chunked response — the speculative pre-fire chain
+        // can't be continued across chunk boundaries anyway, so dropping
+        // the rest of `state` here is correct, not a shortcut.
+        let response_tx = match completion {
+            Completion::Direct(response_tx) => response_tx,
+            Completion::Chain { state } => state.response,
+            Completion::Chunk { .. } => unreachable!("chunk continuations returned above"),
         };
         let response_accumulator = ChunkResponseAccumulator::new(request.samplers.len());
 
@@ -1272,6 +1285,69 @@ mod tests {
     #[test]
     fn oversized_prefill_starts_chunking() {
         let pending = positioned_pending(10, 4);
+        let chunked = match pending.maybe_start_chunking(limits(8, 4, 100), 4) {
+            Ok(p) => p,
+            Err((_, msg)) => panic!("{msg}"),
+        };
+
+        assert_eq!(chunked.request.token_ids, vec![0, 1, 2, 3]);
+        assert_eq!(chunked.request.position_ids, vec![0, 1, 2, 3]);
+        assert_eq!(chunked.request.qo_indptr, vec![0, 4]);
+        assert_eq!(chunked.physical_page_ids, vec![100]);
+        assert_eq!(chunked.last_page_len, 4);
+
+        match chunked.completion {
+            Completion::Chunk {
+                continuation: cont, ..
+            } => {
+                assert_eq!(cont.chunk_end, 4);
+                assert_eq!(cont.chunk_size, 4);
+                assert_eq!(cont.physical_page_ids, vec![100, 101, 102]);
+                assert_eq!(cont.final_last_page_len, 2);
+            }
+            Completion::Direct(_) | Completion::Chain { .. } => panic!("expected chunk continuation"),
+        }
+    }
+
+    #[test]
+    fn oversized_prefill_with_chain_completion_degrades_to_chunk() {
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicBool;
+
+        use dashmap::DashMap;
+
+        use super::super::super::speculator::ChainState;
+
+        // Cold submits are always first-fired as `Completion::Chain` (see
+        // `speculator::start_chain`), regardless of `speculation_depth` — so
+        // an oversized prompt needing chunking can arrive chain-tagged, not
+        // just `Direct`. This mirrors `oversized_prefill_starts_chunking`
+        // but wraps the same request/pages/last_page_len in
+        // `Completion::Chain` to confirm the degrade-to-`Chunk` path no
+        // longer hits the `unreachable!()`.
+        let direct_pending = positioned_pending(10, 4);
+        let (response_tx, _response_rx) = oneshot::channel();
+        let state = Box::new(ChainState {
+            response: response_tx,
+            scheduler_handle: super::super::SchedulerHandle {
+                tx: crossbeam::channel::unbounded().0,
+            },
+            staged_batch_arc: Arc::new(DashMap::new()),
+            prev_request: direct_pending.request.clone(),
+            all_pages: direct_pending.physical_page_ids.clone(),
+            cur_page_idx: 0,
+            cur_last_page_len: direct_pending.last_page_len,
+            max_queue_depth: 0,
+            allow_extend: Arc::new(AtomicBool::new(true)),
+            page_size: 4,
+        });
+        let pending = PendingRequest {
+            request: direct_pending.request,
+            completion: Completion::Chain { state },
+            physical_page_ids: direct_pending.physical_page_ids,
+            last_page_len: direct_pending.last_page_len,
+        };
+
         let chunked = match pending.maybe_start_chunking(limits(8, 4, 100), 4) {
             Ok(p) => p,
             Err((_, msg)) => panic!("{msg}"),
