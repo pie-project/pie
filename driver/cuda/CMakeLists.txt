@@ -119,6 +119,8 @@ endif()
 
 set(PIE_CUDA_FLASHINFER_HOPPER_SOURCE src/ops/attention_flashinfer_hopper_stub.cpp)
 set(PIE_CUDA_FLASHINFER_MAMBA_SM90 OFF)
+set(_PIE_CUDA_HAS_SM90PLUS OFF)
+set(_PIE_CUDA_HAS_PRE_SM90 OFF)
 foreach(PIE_CUDA_ARCH IN LISTS CMAKE_CUDA_ARCHITECTURES)
   string(REGEX REPLACE "[^0-9].*$" "" PIE_CUDA_ARCH_NUMBER "${PIE_CUDA_ARCH}")
   if(PIE_CUDA_ARCH_NUMBER STREQUAL "90")
@@ -126,17 +128,19 @@ foreach(PIE_CUDA_ARCH IN LISTS CMAKE_CUDA_ARCHITECTURES)
       src/ops/attention_flashinfer_hopper.cu
       src/ops/attention_xqa_gqa8_sm90.cu
     )
-    set(PIE_CUDA_FLASHINFER_MAMBA_SM90 ON)
   endif()
-  # FlashInfer's Mamba SSU vertical/horizontal kernels use TMA +
-  # memcpy_async_tx, which Blackwell also supports. The runtime
-  # algorithm auto-selector in selective_state_update prefers the
-  # horizontal kernel for sm >= 10 with bf16/fp16 state — so the same
-  # FLASHINFER_MAMBA_ENABLE_SM90 compile gate should be on for sm_100.
-  if(PIE_CUDA_ARCH_NUMBER STREQUAL "100")
-    set(PIE_CUDA_FLASHINFER_MAMBA_SM90 ON)
+  if(PIE_CUDA_ARCH_NUMBER GREATER_EQUAL 90)
+    set(_PIE_CUDA_HAS_SM90PLUS ON)
+  else()
+    set(_PIE_CUDA_HAS_PRE_SM90 ON)
   endif()
 endforeach()
+# SM90 SSU uses CCCL TMA intrinsics that compile only when __CUDA_MINIMUM_ARCH__
+# >= 900 — i.e. the whole arch list is sm_90+. Enable the gate only for pure
+# sm_90+ builds; mixed builds fall back to the simple SSU algo (kAuto picks kSimple).
+if(_PIE_CUDA_HAS_SM90PLUS AND NOT _PIE_CUDA_HAS_PRE_SM90)
+  set(PIE_CUDA_FLASHINFER_MAMBA_SM90 ON)
+endif()
 if(PIE_CUDA_FLASHINFER_HOPPER_SOURCE MATCHES "stub")
   message(STATUS "Disabling FlashInfer Hopper/FA3 attention for CUDA architecture ${CMAKE_CUDA_ARCHITECTURES}")
 else()
