@@ -144,7 +144,7 @@ struct BatchExecutionTiming {
 
 /// A forward pass request bundled with its response channel and physical pages.
 struct PendingRequest {
-    request: pie_bridge::ForwardRequest,
+    request: pie_schema::ForwardRequest,
     completion: Completion,
     physical_page_ids: Vec<PhysicalPageId>,
     last_page_len: u32,
@@ -168,7 +168,7 @@ enum Completion {
 
 impl PendingRequest {
     fn direct(
-        request: pie_bridge::ForwardRequest,
+        request: pie_schema::ForwardRequest,
         response_tx: oneshot::Sender<Result<ForwardOutput>>,
         physical_page_ids: Vec<PhysicalPageId>,
         last_page_len: u32,
@@ -209,11 +209,12 @@ fn request_capacity_usage(req: &PendingRequest, page_size: u32) -> RequestCapaci
     }
     let mut all_samplers_token = true;
     let mut has_prob_sampling = false;
-    for sampler in &req.request.samplers {
-        if !is_token_sampler(sampler) {
+    for i in 0..req.request.n_samplers() {
+        let sampler = req.request.sampler_at(i).expect("slot in range");
+        if !is_token_sampler(&sampler) {
             all_samplers_token = false;
         }
-        if sampler_needs_prob_rows(sampler) {
+        if sampler_needs_prob_rows(&sampler) {
             has_prob_sampling = true;
         }
     }
@@ -251,22 +252,22 @@ fn request_capacity_usage(req: &PendingRequest, page_size: u32) -> RequestCapaci
     }
 }
 
-fn is_token_sampler(sampler: &pie_bridge::Sampler) -> bool {
+fn is_token_sampler(sampler: &pie_schema::Sampler) -> bool {
     matches!(
         sampler,
-        pie_bridge::Sampler::Multinomial { .. }
-            | pie_bridge::Sampler::TopK { .. }
-            | pie_bridge::Sampler::TopP { .. }
-            | pie_bridge::Sampler::MinP { .. }
-            | pie_bridge::Sampler::TopKTopP { .. }
+        pie_schema::Sampler::Multinomial { .. }
+            | pie_schema::Sampler::TopK { .. }
+            | pie_schema::Sampler::TopP { .. }
+            | pie_schema::Sampler::MinP { .. }
+            | pie_schema::Sampler::TopKTopP { .. }
     )
 }
 
-fn sampler_needs_prob_rows(sampler: &pie_bridge::Sampler) -> bool {
+fn sampler_needs_prob_rows(sampler: &pie_schema::Sampler) -> bool {
     match sampler {
-        pie_bridge::Sampler::TopK { temperature, k } => *temperature > 0.0 && *k > 0,
-        pie_bridge::Sampler::TopP { temperature, p } => *temperature > 0.0 && *p < 1.0,
-        pie_bridge::Sampler::TopKTopP { temperature, k, p } => {
+        pie_schema::Sampler::TopK { temperature, k } => *temperature > 0.0 && *k > 0,
+        pie_schema::Sampler::TopP { temperature, p } => *temperature > 0.0 && *p < 1.0,
+        pie_schema::Sampler::TopKTopP { temperature, k, p } => {
             *temperature > 0.0 && (*k > 0 || *p < 1.0)
         }
         _ => false,
@@ -289,12 +290,14 @@ fn packed_mask_bytes(
     query_tokens.saturating_mul(kv_len).saturating_add(7) / 8
 }
 
-fn request_logprob_labels(req: &pie_bridge::ForwardRequest) -> usize {
-    req.samplers
-        .iter()
-        .map(|s| match s {
-            pie_bridge::Sampler::Logprob { .. } => 1,
-            pie_bridge::Sampler::Logprobs { token_ids } => token_ids.len(),
+fn request_logprob_labels(req: &pie_schema::ForwardRequest) -> usize {
+    // Logprob → 1 label, Logprobs → its token_ids count (from the CSR), else 0.
+    (0..req.n_samplers())
+        .map(|s| match req.sampler_kinds[s] {
+            pie_schema::PIE_SAMPLER_LOGPROB => 1,
+            pie_schema::PIE_SAMPLER_LOGPROBS => (req.sampler_token_ids_indptr[s + 1]
+                - req.sampler_token_ids_indptr[s])
+                as usize,
             _ => 0,
         })
         .sum()
@@ -745,7 +748,7 @@ mod tests {
     fn pending(tokens: usize, page_refs: usize) -> PendingRequest {
         let (tx, _rx) = oneshot::channel();
         PendingRequest::direct(
-            pie_bridge::ForwardRequest {
+            pie_schema::ForwardRequest {
                 token_ids: vec![0; tokens],
                 ..Default::default()
             },
@@ -770,10 +773,10 @@ mod tests {
     fn with_samplers(
         mut req: PendingRequest,
         indices: Vec<u32>,
-        samplers: Vec<pie_bridge::Sampler>,
+        samplers: Vec<pie_schema::Sampler>,
     ) -> PendingRequest {
         req.request.sampling_indices = indices;
-        req.request.samplers = samplers;
+        req.request.set_samplers(&samplers);
         req
     }
 
@@ -889,9 +892,9 @@ mod tests {
         capped.max_logprob_labels = 2;
         let batch = BatchAccumulator::new(capped, 16);
         let mut req = pending(1, 1);
-        req.request.samplers = vec![pie_bridge::Sampler::Logprobs {
+        req.request.set_samplers(&[pie_schema::Sampler::Logprobs {
             token_ids: vec![1, 2, 3],
-        }];
+        }]);
         assert!(batch.single_request_limit_error(&req).is_some());
     }
 
@@ -903,7 +906,7 @@ mod tests {
         let req = with_samplers(
             pending(4, 1),
             vec![3],
-            vec![pie_bridge::Sampler::TopP {
+            vec![pie_schema::Sampler::TopP {
                 temperature: 0.0,
                 p: 1.0,
             }],
@@ -920,7 +923,7 @@ mod tests {
             with_samplers(
                 pending(4, 1),
                 vec![3],
-                vec![pie_bridge::Sampler::TopP {
+                vec![pie_schema::Sampler::TopP {
                     temperature: 0.0,
                     p: 1.0,
                 }],
@@ -937,7 +940,7 @@ mod tests {
         let mut capped = limits(8, 100, 100);
         capped.max_logit_rows = 3;
         let batch = BatchAccumulator::new(capped, 16);
-        let req = with_samplers(pending(4, 1), vec![3], vec![pie_bridge::Sampler::RawLogits]);
+        let req = with_samplers(pending(4, 1), vec![3], vec![pie_schema::Sampler::RawLogits]);
         assert!(batch.single_request_limit_error(&req).is_some());
     }
 
@@ -950,7 +953,7 @@ mod tests {
         let req = with_samplers(
             pending(4, 1),
             vec![3],
-            vec![pie_bridge::Sampler::TopP {
+            vec![pie_schema::Sampler::TopP {
                 temperature: 1.0,
                 p: 0.9,
             }],
@@ -991,7 +994,7 @@ pub(crate) struct SchedulerHandle {
 impl SchedulerHandle {
     pub fn submit(
         &self,
-        request: pie_bridge::ForwardRequest,
+        request: pie_schema::ForwardRequest,
         response_tx: oneshot::Sender<Result<ForwardOutput>>,
         physical_page_ids: Vec<PhysicalPageId>,
         last_page_len: u32,
@@ -1012,7 +1015,7 @@ impl SchedulerHandle {
     /// instead of waking a dedicated chain-extender task.
     pub fn submit_chain(
         &self,
-        request: pie_bridge::ForwardRequest,
+        request: pie_schema::ForwardRequest,
         state: Box<super::speculator::ChainState>,
         physical_page_ids: Vec<PhysicalPageId>,
         last_page_len: u32,
@@ -1140,7 +1143,7 @@ impl BatchScheduler {
     /// Submit a pre-translated forward pass request.
     pub fn submit(
         &self,
-        request: pie_bridge::ForwardRequest,
+        request: pie_schema::ForwardRequest,
         response_tx: oneshot::Sender<Result<ForwardOutput>>,
         physical_page_ids: Vec<PhysicalPageId>,
         last_page_len: u32,
@@ -1580,7 +1583,7 @@ impl BatchScheduler {
             }
         }
 
-        // Build batched request — a single `pie_bridge::ForwardRequest`
+        // Build batched request — a single `pie_schema::ForwardRequest`
         // populated by folding each per-request shape into the batch.
         let elide_decode_masks = requests.iter().all(|req| {
             req.request.single_token_mode
@@ -1701,7 +1704,7 @@ impl BatchScheduler {
                     // inline pushes the 256th chain extender's wake
                     // out by ~1.2 ms — directly extending the gap.
                     let mut deferred_drop: Vec<(
-                        pie_bridge::ForwardRequest,
+                        pie_schema::ForwardRequest,
                         Vec<PhysicalPageId>,
                     )> = Vec::with_capacity(n_results);
                     if token_payload_only {

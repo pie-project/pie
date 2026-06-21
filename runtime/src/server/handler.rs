@@ -7,7 +7,6 @@ use bytes::Bytes;
 use pie_client::message::ServerMessage;
 
 use crate::context;
-use crate::daemon;
 use crate::inference;
 use crate::messaging;
 use crate::model;
@@ -654,40 +653,6 @@ impl Session {
         }
     }
 
-    pub(super) async fn handle_launch_daemon(
-        &mut self,
-        corr_id: u32,
-        port: u32,
-        inferlet: String,
-        input: String,
-    ) {
-        let program_name = match ProgramName::parse(&inferlet) {
-            Ok(p) => p,
-            Err(e) => {
-                self.send_response(corr_id, false, e.to_string()).await;
-                return;
-            }
-        };
-
-        // Install program and dependencies (handles both uploaded and registry)
-        if !self.installed_programs.contains(&program_name) {
-            if let Err(e) = program::install(&program_name).await {
-                self.send_response(corr_id, false, e.to_string()).await;
-                return;
-            }
-            self.installed_programs.insert(program_name.clone());
-        }
-
-        match daemon::spawn(self.username.clone(), program_name, port as u16, input) {
-            Ok(_daemon_id) => {
-                self.send_response(corr_id, true, "server launched".to_string())
-                    .await;
-            }
-            Err(e) => {
-                self.send_response(corr_id, false, e.to_string()).await;
-            }
-        }
-    }
 }
 
 // =============================================================================

@@ -23,30 +23,30 @@ use pie::driver::{
 // =============================================================================
 
 /// How the mock device handles a forward batch. The behavior receives
-/// the batched [`pie_bridge::ForwardRequest`] (with indptrs delimiting
+/// the batched [`pie_schema::ForwardRequest`] (with indptrs delimiting
 /// each per-request slice) and returns a batched
-/// [`pie_bridge::ForwardResponse`] keyed by the same indptrs.
+/// [`pie_schema::ForwardResponse`] keyed by the same indptrs.
 pub trait Behavior: Send + Sync + 'static {
-    fn handle_fire_batch(&self, req: &pie_bridge::ForwardRequest) -> pie_bridge::ForwardResponse;
+    fn handle_fire_batch(&self, req: &pie_schema::ForwardRequest) -> pie_schema::ForwardResponse;
 }
 
 /// Helper: derive the request count from `qo_indptr`. The batched
 /// shape stores `num_requests + 1` entries (one indptr per request +
 /// the trailing total).
-fn num_requests(req: &pie_bridge::ForwardRequest) -> u32 {
+fn num_requests(req: &pie_schema::ForwardRequest) -> u32 {
     req.qo_indptr.len().saturating_sub(1) as u32
 }
 
-fn total_tokens(req: &pie_bridge::ForwardRequest) -> usize {
+fn total_tokens(req: &pie_schema::ForwardRequest) -> usize {
     req.token_ids.len()
 }
 
 /// Build a `ForwardResponse` that emits exactly one token per request
 /// — the common case for both `Echo` and `Counter` behaviors.
-fn build_token_response(tokens: Vec<u32>) -> pie_bridge::ForwardResponse {
+fn build_token_response(tokens: Vec<u32>) -> pie_schema::ForwardResponse {
     let n = tokens.len() as u32;
     let tokens_indptr: Vec<u32> = (0..=n).collect();
-    pie_bridge::ForwardResponse {
+    pie_schema::ForwardResponse {
         num_requests: n,
         tokens_indptr,
         tokens,
@@ -74,7 +74,7 @@ fn build_token_response(tokens: Vec<u32>) -> pie_bridge::ForwardResponse {
 pub struct EchoBehavior(pub u32);
 
 impl Behavior for EchoBehavior {
-    fn handle_fire_batch(&self, req: &pie_bridge::ForwardRequest) -> pie_bridge::ForwardResponse {
+    fn handle_fire_batch(&self, req: &pie_schema::ForwardRequest) -> pie_schema::ForwardResponse {
         let n = num_requests(req) as usize;
         build_token_response(vec![self.0; n])
     }
@@ -94,7 +94,7 @@ impl CounterBehavior {
 }
 
 impl Behavior for CounterBehavior {
-    fn handle_fire_batch(&self, req: &pie_bridge::ForwardRequest) -> pie_bridge::ForwardResponse {
+    fn handle_fire_batch(&self, req: &pie_schema::ForwardRequest) -> pie_schema::ForwardResponse {
         let n = num_requests(req) as usize;
         let tokens: Vec<u32> = (0..n)
             .map(|_| self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
@@ -110,7 +110,7 @@ pub struct DelayedBehavior<B: Behavior> {
 }
 
 impl<B: Behavior> Behavior for DelayedBehavior<B> {
-    fn handle_fire_batch(&self, req: &pie_bridge::ForwardRequest) -> pie_bridge::ForwardResponse {
+    fn handle_fire_batch(&self, req: &pie_schema::ForwardRequest) -> pie_schema::ForwardResponse {
         std::thread::sleep(self.latency);
         self.inner.handle_fire_batch(req)
     }
@@ -132,7 +132,7 @@ impl<B: Behavior> FailAfterBehavior<B> {
 }
 
 impl<B: Behavior> Behavior for FailAfterBehavior<B> {
-    fn handle_fire_batch(&self, req: &pie_bridge::ForwardRequest) -> pie_bridge::ForwardResponse {
+    fn handle_fire_batch(&self, req: &pie_schema::ForwardRequest) -> pie_schema::ForwardResponse {
         if self
             .remaining
             .fetch_sub(1, std::sync::atomic::Ordering::Relaxed)
@@ -140,7 +140,7 @@ impl<B: Behavior> Behavior for FailAfterBehavior<B> {
         {
             // Empty response to simulate failure: zero tokens, no
             // dists/logits/etc.
-            pie_bridge::ForwardResponse {
+            pie_schema::ForwardResponse {
                 num_requests: 0,
                 tokens_indptr: vec![0],
                 ..Default::default()
@@ -214,7 +214,7 @@ struct MockChannel {
 fn status_response(status: i32) -> DriverResponse {
     DriverResponse {
         aborted: false,
-        payload: pie_bridge::ResponsePayload::Status(pie_bridge::StatusResponse { status }),
+        payload: pie_schema::ResponsePayload::Status(pie_schema::StatusResponse { status }),
     }
 }
 
@@ -224,7 +224,7 @@ impl MockChannel {
             anyhow::bail!("mock channel {}: aborted", self.device_idx);
         }
         match req.payload {
-            pie_bridge::RequestPayload::Forward(fwd) => {
+            pie_schema::RequestPayload::Forward(fwd) => {
                 self.recorder.record(RecordedCall {
                     device_idx: self.device_idx,
                     method: "fire_batch",
@@ -235,12 +235,12 @@ impl MockChannel {
                 let resp = self.behavior.handle_fire_batch(&fwd);
                 Ok(DriverResponse {
                     aborted: false,
-                    payload: pie_bridge::ResponsePayload::Forward(resp),
+                    payload: pie_schema::ResponsePayload::Forward(resp),
                 })
             }
-            pie_bridge::RequestPayload::Copy(_)
-            | pie_bridge::RequestPayload::Adapter(_)
-            | pie_bridge::RequestPayload::Health => Ok(status_response(0)),
+            pie_schema::RequestPayload::Copy(_)
+            | pie_schema::RequestPayload::Adapter(_)
+            | pie_schema::RequestPayload::Health => Ok(status_response(0)),
         }
     }
 }

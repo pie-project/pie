@@ -1,0 +1,59 @@
+[package]
+name = "pie-gateway"
+version = "0.1.0"
+edition = "2024"
+authors = ["In Gim <in.gim@icloud.com>"]
+description = "Client-facing edge plane for Pie: terminates client WebSockets and routes sessions to workers"
+license = "Apache-2.0"
+repository = "https://github.com/pie-project/pie"
+
+[lib]
+name = "pie_gateway"
+path = "src/lib.rs"
+crate-type = ["rlib"]
+
+# The standalone binary is auto-detected from `src/main.rs` and named after the
+# package (`pie-gateway`); no explicit `[[bin]]` needed.
+
+[dependencies]
+# Control plane: the gateway is a `pie_control::ControlClient` of the controller
+# — it registers, heartbeats, and long-polls the routing table, then selects a
+# worker locally per session (no per-request controller RPC).
+pie-control = { path = "../protocol/control" }
+# Data plane: the gateway SERVES `GatewayInbound` and is a client of
+# `WorkerControl` over one worker-dialed-in connection (split with `spawn_twoway`
+# via the typed `accept_gateway_link`). Workers dial IN (M3 inversion).
+pie-dispatch = { path = "../protocol/dispatch" }
+# Shared data vocabulary (wire structs) — the pure-struct floor, no RPC.
+pie-schema = { path = "../protocol/schema", default-features = false }
+serde = { version = "1.0", features = ["derive"] }
+# Dyn-safe async traits: charlie's `TurnRouter` seam + bravo's `BlobStore`.
+async-trait = "0.1"
+# `serde-transport-bincode` = control-plane codec (pie-control client). The
+# data-plane codec is single-sourced in `pie-dispatch` (`dispatch_codec`,
+# MessagePack), so no `serde-transport-json` here.
+tarpc = { version = "0.35", features = [
+    "serde-transport",
+    "serde-transport-bincode",
+    "tcp",
+    "unix",
+    "tokio1",
+] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync"] }
+# Client-facing HTTP/WS edge: ingress + blob route-providers merge onto the one
+# `axum::serve` this crate owns. `ws` for the multi-turn WebSocket adapter.
+axum = { version = "0.7", features = ["ws"] }
+# JSON wire for the REST/SSE + WS ingress adapters.
+serde_json = "1"
+# WebSocket edge — versions matched to the runtime so there's one shared build.
+futures = "0.3.31"
+# Content-addressed blob store (bravo): blake3 addressing over axum byte bodies.
+bytes = "1"
+blake3 = "1"
+anyhow = "1"
+tracing = "0.1"
+clap = { version = "4.5", features = ["derive"] }
+
+[dev-dependencies]
+# Blob route `oneshot` tests (bravo's `blob.rs`).
+tower = { version = "0.5", features = ["util"] }

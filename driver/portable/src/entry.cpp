@@ -3,7 +3,7 @@
 // Body of what used to be `main()`, lifted into a C-callable function so
 // it can be invoked from either the standalone executable shim
 // (driver/portable/src/main.cpp) or a host process that links
-// `pie_driver_portable_lib` directly (e.g. server/standalone).
+// `pie_driver_portable_lib` directly (e.g. worker/standalone).
 
 #include "entry.hpp"
 
@@ -35,7 +35,7 @@
 #include "executor/executor.hpp"
 #include "gguf_tokenizer.hpp"
 #include "hf_config.hpp"
-#include <pie_bridge/inproc_server.hpp>
+#include <pie_ipc/inproc_server.hpp>
 #include "kv_cache.hpp"
 #include "model.hpp"
 #include "service/inproc_service.hpp"

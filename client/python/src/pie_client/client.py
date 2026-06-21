@@ -628,23 +628,6 @@ class PieClient:
         if not ok:
             raise Exception(f"Failed to terminate process: {result}")
 
-    async def launch_daemon(
-        self,
-        inferlet: str,
-        port: int,
-        input: dict | None = None,
-    ) -> None:
-        """Launch a daemon inferlet that listens on a specific port."""
-        msg = {
-            "type": "launch_daemon",
-            "port": port,
-            "inferlet": inferlet,
-            "input": json.dumps(input or {}),
-        }
-        ok, result = await self._send_msg_and_wait(msg)
-        if not ok:
-            raise Exception(f"Failed to launch daemon: {result}")
-
     # =========================================================================
     # MCP
     # =========================================================================

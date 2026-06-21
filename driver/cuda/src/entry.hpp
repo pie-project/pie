@@ -4,7 +4,7 @@
 // translation units back both the standalone executable
 // (`pie_driver_cuda`, used by the Python subprocess path) and the
 // in-process static library (`pie_driver_cuda_lib`, linked into
-// `server/standalone`'s Rust binary when `--features driver-cuda`).
+// `worker/standalone`'s Rust binary when `--features driver-cuda`).
 #pragma once
 
 #ifdef __cplusplus
@@ -20,7 +20,7 @@ typedef void (*pie_driver_cuda_ready_cb)(const char* caps_json, void* ctx);
 // Run the driver with the given argv. Returns a process-style exit code.
 //
 // `install_signal_handlers != 0` installs SIGINT/SIGTERM handlers that
-// stop the driver. Library callers (e.g. server/standalone) pass 0 —
+// stop the driver. Library callers (e.g. worker/standalone) pass 0 —
 // the host owns signal handling.
 //
 // `ready_cb` must be non-NULL. The standalone executable provides a
@@ -34,7 +34,7 @@ int pie_driver_cuda_run(int argc,
 
 // An in-process variant (`pie_driver_cuda_run_inproc`) is also exported
 // from entry.cpp; its signature uses a C++-namespaced vtable type
-// (`pie_cuda_driver::PieInProcVTable`) so we keep its declaration out
+// (`pie_driver::PieInProcVTable`) so we keep its declaration out
 // of this C-style header. See `inproc_server.hpp`.
 
 // Signal the running driver's serve loop to exit. Idempotent; safe to

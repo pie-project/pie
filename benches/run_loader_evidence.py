@@ -367,7 +367,7 @@ def main() -> None:
                 "cargo",
                 "test",
                 "--manifest-path",
-                str(ROOT / "driver" / "weight_loader" / "Cargo.toml"),
+                str(ROOT / "driver" / "weight-loader" / "Cargo.toml"),
             ],
             "weight-loader-tests.log",
         ),

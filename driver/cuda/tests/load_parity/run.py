@@ -203,7 +203,7 @@ def main() -> int:
     args = ap.parse_args()
 
     if not PIE_BIN.exists():
-        sys.stderr.write(f"missing {PIE_BIN}; build with: cargo build -p pie-server "
+        sys.stderr.write(f"missing {PIE_BIN}; build with: cargo build -p pie-worker "
                          "--release --no-default-features --features driver-cuda\n")
         return 2
 

@@ -16,10 +16,10 @@
 
 #include "distributed.hpp"
 #include "executor/forward_graph.hpp"
-#include <pie_bridge/view.hpp>
+#include <pie_schema/view.hpp>
 #include "model/llama_like.hpp"
 #include "executor/persistent_inputs.hpp"
-#include <pie_bridge/response_builder.hpp>
+#include <pie_schema/response_builder.hpp>
 
 namespace pie_cuda_driver {
 

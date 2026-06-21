@@ -7,7 +7,7 @@
 #include <utility>
 #include <vector>
 
-#include "../../../weight_loader/include/weight_loader.h"
+#include "../../../weight-loader/include/weight_loader.h"
 #include "loader/backend_target.hpp"
 #include "loader/checkpoint_source.hpp"
 #include "loader/hf_config.hpp"

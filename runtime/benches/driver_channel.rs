@@ -13,7 +13,7 @@
 //!   `pie::driver::InProcPollingChannel::submit`, the same FFI callbacks,
 //!   and fixed preallocated slots with polling/yield waits.
 //! - `shmem_channel/*` uses `pie::driver::ShmemChannel::submit` and a
-//!   real `pie_bridge::ipc::ShmemServer`. The fake Python worker copies
+//!   real `pie_ipc::ipc::ShmemServer`. The fake Python worker copies
 //!   the shmem payload to bytes, parses/touches it, builds a small
 //!   `ForwardResponse`, and commits it.
 //!
@@ -34,16 +34,15 @@ use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
 use pie::driver::{
     DriverChannel, DriverRequest, InProcChannel, InProcPollingChannel, InProcVTable, ShmemChannel,
 };
-use pie_bridge::ipc::ShmemServer;
-use pie_bridge::schema::{
+use pie_ipc::ipc::ShmemServer;
+use pie_schema::schema::{
     __pie_response_frame_from_desc, PIE_REQUEST_PAYLOAD_ADAPTER, PIE_REQUEST_PAYLOAD_COPY,
     PIE_REQUEST_PAYLOAD_FORWARD, PIE_REQUEST_PAYLOAD_HEALTH, PIE_RESPONSE_PAYLOAD_FORWARD,
-    PIE_RESPONSE_PAYLOAD_STATUS, PieAdapterBindingDesc, PieForwardRequestDesc,
-    PieForwardResponseDesc, PieFrameDesc, PieResponseFrameDesc, PieResponsePayloadDesc,
-    PieSamplerDesc, PieStatusResponseDesc, pie_frame_view,
+    PIE_RESPONSE_PAYLOAD_STATUS, PieForwardRequestDesc, PieForwardResponseDesc, PieFrameDesc,
+    PieResponseFrameDesc, PieResponsePayloadDesc, StatusResponse, pie_frame_view,
 };
-use pie_bridge::wire::{encode_response, parse_request};
-use pie_bridge::{
+use pie_ipc::wire::{encode_response, parse_request};
+use pie_schema::{
     AdapterBinding, ForwardRequest, ForwardResponse, Frame, RequestPayload, ResponseFrame,
     ResponsePayload, SCHEMA_HASH, Sampler,
 };
@@ -67,18 +66,13 @@ fn make_frame(n_tokens: usize) -> Frame {
 }
 
 fn make_forward_request(n_tokens: usize) -> ForwardRequest {
-    ForwardRequest {
+    let mut req = ForwardRequest {
         token_ids: (0..n_tokens).map(|i| i as u32).collect(),
         position_ids: (0..n_tokens).map(|i| i as u32).collect(),
         qo_indptr: vec![0, n_tokens as u32],
         kv_page_indptr: vec![0, 1],
         kv_page_indices: vec![0],
         kv_last_page_lens: vec![n_tokens.min(128) as u32],
-        samplers: vec![Sampler::TopKTopP {
-            temperature: 0.7,
-            k: 50,
-            p: 0.9,
-        }],
         sampler_indptr: vec![0, 1],
         adapter_bindings: vec![AdapterBinding {
             adapter_id: -1,
@@ -87,7 +81,13 @@ fn make_forward_request(n_tokens: usize) -> ForwardRequest {
         single_token_mode: false,
         has_user_mask: false,
         ..Default::default()
-    }
+    };
+    req.set_samplers(&[Sampler::TopKTopP {
+        temperature: 0.7,
+        k: 50,
+        p: 0.9,
+    }]);
+    req
 }
 
 // ---------------------------------------------------------------------------
@@ -160,7 +160,7 @@ fn slice_from_raw<'a, T>(ptr: *const T, len: usize) -> &'a [T] {
     }
 }
 
-fn touch_adapter_bindings(items: &[PieAdapterBindingDesc], scratch: &mut LegacyScratch) {
+fn touch_adapter_bindings(items: &[AdapterBinding], scratch: &mut LegacyScratch) {
     scratch.adapter_indices.resize(items.len(), 0);
     scratch.adapter_seeds.resize(items.len(), 0);
     for (i, item) in items.iter().enumerate() {
@@ -169,38 +169,55 @@ fn touch_adapter_bindings(items: &[PieAdapterBindingDesc], scratch: &mut LegacyS
     }
 }
 
-fn touch_samplers(items: &[PieSamplerDesc], sampler_indptr: &[u32], scratch: &mut LegacyScratch) {
-    scratch.sampler_types.resize(items.len(), 0);
-    scratch.sampler_temperatures.resize(items.len(), 0.0);
-    scratch.sampler_top_k.resize(items.len(), 0);
-    scratch.sampler_top_p.resize(items.len(), 0.0);
-    scratch.sampler_min_p.resize(items.len(), 0.0);
-    scratch.sampler_seeds.resize(items.len(), 0);
-    scratch.sampler_label_indptr.reserve(items.len() + 1);
+// Mirrors view.hpp's surviving sampler fold over the raw SoA Descs (kind remap
+// + Dist `num_tokens`→top_k + `p`→top_p/min_p routing with 1.0/0.0 defaults +
+// unified label CSR). The bulk AoS-walk demux is gone — the producer emits the
+// flat parallel arrays this reads directly.
+fn touch_samplers(f: &PieForwardRequestDesc, scratch: &mut LegacyScratch) {
+    let kinds = slice_from_raw::<u8>(f.sampler_kinds_ptr, f.sampler_kinds_len);
+    let temperatures =
+        slice_from_raw::<f32>(f.sampler_temperatures_ptr, f.sampler_temperatures_len);
+    let top_k = slice_from_raw::<u32>(f.sampler_top_k_ptr, f.sampler_top_k_len);
+    let p = slice_from_raw::<f32>(f.sampler_p_ptr, f.sampler_p_len);
+    let seeds = slice_from_raw::<u32>(f.sampler_seeds_ptr, f.sampler_seeds_len);
+    let num_tokens = slice_from_raw::<u32>(f.sampler_num_tokens_ptr, f.sampler_num_tokens_len);
+    let label_ids = slice_from_raw::<u32>(f.sampler_token_ids_ptr, f.sampler_token_ids_len);
+    let label_indptr =
+        slice_from_raw::<u32>(f.sampler_token_ids_indptr_ptr, f.sampler_token_ids_indptr_len);
+    let sampler_indptr = slice_from_raw::<u32>(f.sampler_indptr_ptr, f.sampler_indptr_len);
+
+    let n = kinds.len();
+    scratch.sampler_types.resize(n, 0);
+    scratch.sampler_temperatures.resize(n, 0.0);
+    scratch.sampler_top_k.resize(n, 0);
+    scratch.sampler_top_p.resize(n, 0.0);
+    scratch.sampler_min_p.resize(n, 0.0);
+    scratch.sampler_seeds.resize(n, 0);
+    scratch.sampler_label_indptr.reserve(n + 1);
     scratch.sampler_label_indptr.push(0);
 
-    for (i, s) in items.iter().enumerate() {
-        scratch.sampler_types[i] = new_to_old_sampler_kind(s.kind);
-        scratch.sampler_temperatures[i] = s.temperature;
-        scratch.sampler_top_p[i] = 1.0;
-        match s.kind {
-            1 => scratch.sampler_top_k[i] = s.k,
-            2 => scratch.sampler_top_p[i] = s.p,
-            3 => scratch.sampler_min_p[i] = s.p,
+    for i in 0..n {
+        let kind = kinds[i];
+        scratch.sampler_types[i] = new_to_old_sampler_kind(kind);
+        scratch.sampler_temperatures[i] = temperatures[i];
+        scratch.sampler_top_p[i] = 1.0; // semantic default; routed below by kind
+        match kind {
+            1 => scratch.sampler_top_k[i] = top_k[i],
+            2 => scratch.sampler_top_p[i] = p[i],
+            3 => scratch.sampler_min_p[i] = p[i],
             4 => {
-                scratch.sampler_top_k[i] = s.k;
-                scratch.sampler_top_p[i] = s.p;
+                scratch.sampler_top_k[i] = top_k[i];
+                scratch.sampler_top_p[i] = p[i];
             }
-            6 => scratch.sampler_top_k[i] = s.num_tokens,
+            6 => scratch.sampler_top_k[i] = num_tokens[i],
             _ => {}
         }
-        scratch.sampler_seeds[i] = s.seed;
-        if s.kind == 8 {
-            scratch.sampler_label_ids.push(s.token_id);
-        } else if s.kind == 9 {
-            scratch
-                .sampler_label_ids
-                .extend_from_slice(slice_from_raw(s.token_ids_ptr, s.token_ids_len));
+        scratch.sampler_seeds[i] = seeds[i];
+        // Logprob (8) / Logprobs (9) labels are unified in the CSR.
+        if kind == 8 || kind == 9 {
+            let lo = label_indptr[i] as usize;
+            let hi = label_indptr[i + 1] as usize;
+            scratch.sampler_label_ids.extend_from_slice(&label_ids[lo..hi]);
         }
         scratch
             .sampler_label_indptr
@@ -257,9 +274,7 @@ fn touch_forward_desc(f: &PieForwardRequestDesc, scratch: &mut LegacyScratch) {
             .push(scratch.logit_masks_flat.len() as u32);
     }
 
-    let samplers = slice_from_raw(f.samplers_ptr, f.samplers_len);
-    let sampler_indptr = slice_from_raw::<u32>(f.sampler_indptr_ptr, f.sampler_indptr_len);
-    touch_samplers(samplers, sampler_indptr, scratch);
+    touch_samplers(f, scratch);
     touch_adapter_bindings(
         slice_from_raw(f.adapter_bindings_ptr, f.adapter_bindings_len),
         scratch,
@@ -333,7 +348,7 @@ fn send_forward_response(
         payload: PieResponsePayloadDesc {
             kind: PIE_RESPONSE_PAYLOAD_FORWARD,
             forward: fwd,
-            status: PieStatusResponseDesc { status: 0 },
+            status: StatusResponse { status: 0 },
         },
     };
     // SAFETY: response desc and stack arrays live through the
@@ -353,7 +368,7 @@ fn send_status_response(
         payload: PieResponsePayloadDesc {
             kind: PIE_RESPONSE_PAYLOAD_STATUS,
             forward: PieForwardResponseDesc::default(),
-            status: PieStatusResponseDesc { status: 0 },
+            status: StatusResponse { status: 0 },
         },
     };
     // SAFETY: response desc lives through the synchronous callback.
@@ -597,7 +612,7 @@ fn bench_inproc_local_costs(c: &mut Criterion) {
                 payload: PieResponsePayloadDesc {
                     kind: PIE_RESPONSE_PAYLOAD_STATUS,
                     forward: PieForwardResponseDesc::default(),
-                    status: PieStatusResponseDesc { status: 0 },
+                    status: StatusResponse { status: 0 },
                 },
             };
             let owned = __pie_response_frame_from_desc(black_box(&desc));
@@ -622,7 +637,7 @@ fn bench_inproc_local_costs(c: &mut Criterion) {
                         tokens_len: tokens.len(),
                         ..Default::default()
                     },
-                    status: PieStatusResponseDesc { status: 0 },
+                    status: StatusResponse { status: 0 },
                 },
             };
             let owned = __pie_response_frame_from_desc(black_box(&desc));
@@ -682,27 +697,17 @@ fn unique_name(suffix: &str) -> String {
 fn touch_archived_frame(bytes: &[u8]) -> u32 {
     let frame = parse_request(bytes).expect("parse request");
     let mut acc = u32::from(frame.driver_id);
-    if let pie_bridge::ArchivedRequestPayload::Forward(fr) = &frame.payload {
+    if let pie_schema::ArchivedRequestPayload::Forward(fr) = &frame.payload {
         acc = acc.wrapping_add(fr.token_ids.len() as u32);
         acc = acc.wrapping_add(fr.position_ids.len() as u32);
         acc = acc.wrapping_add(fr.qo_indptr.len() as u32);
-        acc = acc.wrapping_add(fr.samplers.len() as u32);
+        acc = acc.wrapping_add(fr.sampler_kinds.len() as u32);
         acc = acc.wrapping_add(fr.adapter_bindings.len() as u32);
-        for sampler in fr.samplers.iter() {
-            acc = acc.wrapping_add(match sampler {
-                pie_bridge::ArchivedSampler::Multinomial { .. } => 1,
-                pie_bridge::ArchivedSampler::TopK { .. } => 2,
-                pie_bridge::ArchivedSampler::TopP { .. } => 3,
-                pie_bridge::ArchivedSampler::MinP { .. } => 4,
-                pie_bridge::ArchivedSampler::TopKTopP { .. } => 5,
-                pie_bridge::ArchivedSampler::Embedding => 6,
-                pie_bridge::ArchivedSampler::Dist { .. } => 7,
-                pie_bridge::ArchivedSampler::RawLogits => 8,
-                pie_bridge::ArchivedSampler::Logprob { .. } => 9,
-                pie_bridge::ArchivedSampler::Logprobs { token_ids } => 10 + token_ids.len() as u32,
-                pie_bridge::ArchivedSampler::Entropy => 11,
-            });
+        // Touch the flattened sampler SoA (wire discriminants + unified labels).
+        for &kind in fr.sampler_kinds.iter() {
+            acc = acc.wrapping_add(u32::from(kind) + 1);
         }
+        acc = acc.wrapping_add(fr.sampler_token_ids.len() as u32);
     }
     black_box(acc)
 }

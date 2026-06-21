@@ -161,9 +161,6 @@ const sidebars: SidebarsConfig = {
       items: [
         'reference/drivers/cuda',
         'reference/drivers/portable',
-        {type: 'doc', id: 'reference/drivers/vllm', className: 'sidebar-experimental'},
-        {type: 'doc', id: 'reference/drivers/sglang', className: 'sidebar-experimental'},
-        {type: 'doc', id: 'reference/drivers/tensorrt-llm', className: 'sidebar-experimental'},
       ],
     },
     {

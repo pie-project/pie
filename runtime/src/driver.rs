@@ -5,14 +5,14 @@
 //! all share the transport; there is no separate "cold path."
 //!
 //! Requests and responses are the wire-canonical
-//! [`pie_bridge::RequestPayload`] / [`pie_bridge::ResponsePayload`]
+//! [`pie_schema::RequestPayload`] / [`pie_schema::ResponsePayload`]
 //! enums directly — no pie-internal mirror. The runtime pairs each
 //! payload with a routing [`DriverId`] (the same value the wire
-//! [`pie_bridge::Frame`] carries at its top level) to pick a channel.
+//! [`pie_schema::Frame`] carries at its top level) to pick a channel.
 //!
 //! [`DriverChannel`] has two implementations:
 //!   - [`InProcChannel`] — embedded drivers (cuda + portable + dummy
-//!     linked into `pie-server`). Heap-backed queue + condvar wakeup;
+//!     linked into `pie-worker`). Heap-backed queue + condvar wakeup;
 //!     the FFI hands the C++ driver a typed view of the request data.
 //!   - [`InProcPollingChannel`] — low-latency embedded-driver channel
 //!     with the same FFI surface but fixed slots and polling waits
@@ -63,9 +63,9 @@ impl DriverSpec {
 }
 
 /// Driver-bound request. The payload is the wire-canonical
-/// [`pie_bridge::RequestPayload`] (Forward / Copy / Adapter / Health),
+/// [`pie_schema::RequestPayload`] (Forward / Copy / Adapter / Health),
 /// with `driver_id` paired alongside for routing (the on-wire frame
-/// carries it at the top level via [`pie_bridge::Frame.driver_id`]).
+/// carries it at the top level via [`pie_schema::Frame.driver_id`]).
 ///
 /// The Save / ZoInitialize / ZoUpdate adapter ops are wired end-to-end
 /// but the per-driver dispatchers treat them as no-ops returning
@@ -75,7 +75,7 @@ impl DriverSpec {
 #[derive(Debug)]
 pub struct DriverRequest {
     pub driver_id: DriverId,
-    pub payload: pie_bridge::RequestPayload,
+    pub payload: pie_schema::RequestPayload,
 }
 
 #[cfg(test)]
@@ -110,13 +110,13 @@ mod tests {
 }
 
 /// Driver response. The payload is the wire-canonical
-/// [`pie_bridge::ResponsePayload`] (Forward or Status); `aborted`
-/// mirrors the same flag on [`pie_bridge::ResponseFrame`] (set by the
+/// [`pie_schema::ResponsePayload`] (Forward or Status); `aborted`
+/// mirrors the same flag on [`pie_schema::ResponseFrame`] (set by the
 /// driver on transport-level failures).
 #[derive(Debug)]
 pub struct DriverResponse {
     pub aborted: bool,
-    pub payload: pie_bridge::ResponsePayload,
+    pub payload: pie_schema::ResponsePayload,
 }
 
 #[async_trait]

@@ -284,9 +284,7 @@ What you can run on Pie depends on three choices: the model architecture, the
 driver Pie routes inference through, and the precision and parallelism that
 driver supports for that architecture. This page is the at-a-glance matrix.
 For configuration and supported architectures of each driver, see
-[CUDA](/docs/reference/drivers/cuda), [Portable](/docs/reference/drivers/portable),
-[vLLM](/docs/reference/drivers/vllm), [SGLang](/docs/reference/drivers/sglang),
-and [TensorRT-LLM](/docs/reference/drivers/tensorrt-llm).
+[CUDA](/docs/reference/drivers/cuda) and [Portable](/docs/reference/drivers/portable).
 
 ## Drivers
 
@@ -345,98 +343,6 @@ and [TensorRT-LLM](/docs/reference/drivers/tensorrt-llm).
           <span className="m-chip">bf16</span>
           <span className="m-chip">int8</span>
           <span className="m-chip">int4</span>
-        </div>
-      </div>
-      <div className="m-spec-row">
-        <span className="m-spec-label">Parallel</span>
-        <div className="m-chips">
-          <span className="m-chip off">TP</span>
-          <span className="m-chip">DP</span>
-          <span className="m-chip off">PP</span>
-        </div>
-      </div>
-    </div>
-  </div>
-
-  <div className="m-card delegate">
-
-    <h3 className="m-card-name">vllm@0.16.0</h3>
-    <div className="m-card-desc">
-        Delegates forward pass execution to vLLM. Check the Inferlet API <a href="/docs/reference/drivers/vllm">capability</a>.
-    </div>
-    <div className="m-spec">
-      <div className="m-spec-row">
-        <span className="m-spec-label">Hardware</span>
-        <div className="m-chips">
-          <span className="m-chip">CUDA</span>
-          <span className="m-chip">ROCm</span>
-        </div>
-      </div>
-      <div className="m-spec-row">
-        <span className="m-spec-label">Weights</span>
-        <div className="m-chips">
-          <span className="m-chip up">upstream</span>
-        </div>
-      </div>
-      <div className="m-spec-row">
-        <span className="m-spec-label">Parallel</span>
-        <div className="m-chips">
-          <span className="m-chip">TP</span>
-          <span className="m-chip">DP</span>
-          <span className="m-chip">PP</span>
-        </div>
-      </div>
-    </div>
-  </div>
-
-  <div className="m-card delegate">
-
-    <h3 className="m-card-name">sglang@0.5.9</h3>
-    <div className="m-card-desc">
-      Delegates forward pass execution to SGLang. Check the Inferlet API <a href="/docs/reference/drivers/sglang">capability</a>.
-    </div>
-    <div className="m-spec">
-      <div className="m-spec-row">
-        <span className="m-spec-label">Hardware</span>
-        <div className="m-chips">
-          <span className="m-chip">CUDA</span>
-          <span className="m-chip">ROCm</span>
-        </div>
-      </div>
-      <div className="m-spec-row">
-        <span className="m-spec-label">Weights</span>
-        <div className="m-chips">
-          <span className="m-chip up">upstream</span>
-        </div>
-      </div>
-      <div className="m-spec-row">
-        <span className="m-spec-label">Parallel</span>
-        <div className="m-chips">
-          <span className="m-chip">TP</span>
-          <span className="m-chip">DP</span>
-          <span className="m-chip off">PP</span>
-        </div>
-      </div>
-    </div>
-  </div>
-
-  <div className="m-card delegate">
-
-    <h3 className="m-card-name">tensorrt-llm@1.2.1</h3>
-    <div className="m-card-desc">
-      Delegates forward pass execution to TensorRT-LLM. Check the Inferlet API <a href="/docs/reference/drivers/tensorrt-llm">capability</a>.
-    </div>
-    <div className="m-spec">
-      <div className="m-spec-row">
-        <span className="m-spec-label">Hardware</span>
-        <div className="m-chips">
-          <span className="m-chip">CUDA</span>
-        </div>
-      </div>
-      <div className="m-spec-row">
-        <span className="m-spec-label">Weights</span>
-        <div className="m-chips">
-          <span className="m-chip up">upstream</span>
         </div>
       </div>
       <div className="m-spec-row">

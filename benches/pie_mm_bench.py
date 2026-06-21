@@ -157,7 +157,7 @@ async def launch_server(args: argparse.Namespace):
     pie_bin = Path(args.pie_bin)
     if not pie_bin.exists():
         raise FileNotFoundError(
-            f"missing {pie_bin}; build with: cargo build -p pie-server --release "
+            f"missing {pie_bin}; build with: cargo build -p pie-worker --release "
             "--no-default-features --features driver-cuda"
         )
 

@@ -1,6 +1,6 @@
 """Config dataclasses for the embedded `pie.server.Server`.
 
-These mirror the Rust `crate::config::*` types in `server/src/config.rs`
+These mirror the Rust `crate::config::*` types in `worker/src/config.rs`
 field-for-field. Each dataclass serializes itself to TOML (via
 `Config.to_toml()`); the resulting string is what the pyo3 layer
 hands to `serve::start_engine`. The same TOML the `pie serve --config`

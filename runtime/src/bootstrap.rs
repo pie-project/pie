@@ -2,7 +2,6 @@ use anyhow::{Context, Result, ensure};
 
 use std::fs;
 use std::path::PathBuf;
-use tokio::net::TcpListener;
 
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
@@ -173,17 +172,19 @@ pub struct BootstrapHandle {
 }
 
 pub async fn bootstrap(config: Config) -> Result<BootstrapHandle> {
-    bootstrap_inner(config, None).await
+    bootstrap_inner(config).await
 }
 
 pub async fn bootstrap_with_listener(
     config: Config,
-    listener: TcpListener,
+    _listener: tokio::net::TcpListener,
 ) -> Result<BootstrapHandle> {
-    bootstrap_inner(config, Some(listener)).await
+    // WebSocket listeners are no longer used; keep this shim so older callers
+    // compile while migrating to edge-rpc.
+    bootstrap_inner(config).await
 }
 
-async fn bootstrap_inner(config: Config, listener: Option<TcpListener>) -> Result<BootstrapHandle> {
+async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
     verify_config(&config)?;
 
     if !config.skip_tracing {
@@ -218,10 +219,8 @@ async fn bootstrap_inner(config: Config, listener: Option<TcpListener>) -> Resul
 
     linker::spawn(&wasm_engine, fs_policy, network_policy);
     let max_upload_bytes = config.runtime.max_upload_mb.saturating_mul(1024 * 1024);
-    let bound_port = match listener {
-        Some(listener) => server::spawn_listener(listener, max_upload_bytes)?,
-        None => server::spawn(&config.host, config.port, max_upload_bytes).await?,
-    };
+    server::init(max_upload_bytes);
+    let bound_port = config.port;
     messaging::spawn();
     process::init_admission(config.max_concurrent_processes);
 

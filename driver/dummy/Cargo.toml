@@ -3,7 +3,7 @@ name = "pie-driver-dummy"
 version = "0.1.0"
 edition = "2024"
 authors = ["In Gim <in.gim@icloud.com>"]
-description = "Dummy driver — random tokens, no model load. Linked into pie-server for tests."
+description = "Dummy driver — random tokens, no model load. Linked into pie-worker for tests."
 license = "Apache-2.0"
 repository = "https://github.com/pie-project/pie"
 
@@ -12,7 +12,8 @@ name = "pie_driver_dummy_lib"
 crate-type = ["staticlib", "rlib"]
 
 [dependencies]
-pie-bridge = { path = "../bridge" }
+pie-ipc = { path = "../ipc" }
+pie-schema = { path = "../../protocol/schema" }
 anyhow = "1.0"
 bytemuck = "1.16"
 rand = { version = "0.8", features = ["small_rng"] }

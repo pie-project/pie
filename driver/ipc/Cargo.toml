@@ -1,0 +1,59 @@
+[package]
+name = "pie-ipc"
+version = "0.1.0"
+edition = "2024"
+authors = ["In Gim <in.gim@yale.edu>"]
+description = "In-proc IPC mechanism (shmem ring + vtable + wire helpers) over the pie wire schema."
+license = "Apache-2.0"
+repository = "https://github.com/pie-project/pie"
+
+# `links = "pie_ipc"` lets downstream crates (e.g. `pie-worker`'s
+# build.rs) discover the ipc C header directory via the
+# `DEP_PIE_IPC_INCLUDE` env var (build script ↔ build script handoff).
+links = "pie_ipc"
+
+[lib]
+name = "pie_ipc"
+crate-type = ["rlib"]
+path = "src/lib.rs"
+
+[features]
+default = ["ipc"]
+ipc = []
+
+[dependencies]
+anyhow = "1.0"
+thiserror = "1.0"
+# Canonical wire schema vocabulary — the dependency floor. Re-exported
+# at this crate's root for source compatibility.
+pie-schema = { path = "../../protocol/schema" }
+# Canonical schema serialization. Zero-copy reads via `rkyv::access`,
+# owned reads via `rkyv::deserialize`.
+rkyv = { version = "0.8", default-features = false, features = [
+    "std",
+    "alloc",
+    "bytecheck",
+] }
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_System_Memory",
+] }
+
+[dev-dependencies]
+criterion = { version = "0.5", default-features = false }
+
+[[bench]]
+name = "wire"
+harness = false
+
+[[bench]]
+name = "direct_ffi"
+harness = false
+
+[[bench]]
+name = "shmem"
+harness = false
+required-features = ["ipc"]
