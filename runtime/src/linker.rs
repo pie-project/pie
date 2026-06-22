@@ -159,13 +159,10 @@ impl Linker {
 
         wasmtime_wasi::p2::add_to_linker_async(&mut linker).expect("Failed to link WASI");
 
-        // wasi:http operates above wasi:sockets and bypasses the per-socket
-        // policy hook (it uses the host's hyper stack with its own DNS).
-        // Drop the binding entirely when the network is disabled so the
-        // policy is honored end-to-end. With allow_network=true the hook
-        // is wired; the allowlist still applies to wasi:sockets but
-        // wasi:http is unrestricted (pre-DNS hostname allowlisting would
-        // require a DNS shim — not in v1).
+        // Drop the wasi:http binding entirely when the network is disabled.
+        // When enabled, InstanceState::send_request applies the same network
+        // policy used by wasi:sockets before forwarding through Wasmtime's
+        // default HTTP client.
         if self.policy.network.allow {
             wasmtime_wasi_http::add_only_http_to_linker_async(&mut linker)
                 .expect("Failed to link WASI HTTP");

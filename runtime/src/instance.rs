@@ -10,12 +10,18 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use wasmtime::component::{ResourceAny, ResourceTable};
 use wasmtime_wasi::{DirPerms, FilePerms, WasiCtx, WasiCtxView, WasiView};
+use wasmtime_wasi_http::bindings::http::types::ErrorCode as HttpErrorCode;
+use wasmtime_wasi_http::body::HyperOutgoingBody;
+use wasmtime_wasi_http::types::{
+    HostFutureIncomingResponse, OutgoingRequestConfig, default_send_request,
+};
 use wasmtime_wasi_http::{WasiHttpCtx, WasiHttpView};
 
 use self::output::LogStream;
 
 use crate::context;
 use crate::linker::InstancePolicy;
+use crate::policy::NetworkPolicy;
 use crate::process::ProcessId;
 
 /// Where an instance's stdout/stderr are routed.
@@ -40,6 +46,7 @@ pub struct InstanceState {
     wasi_ctx: WasiCtx,
     resource_table: ResourceTable,
     http_ctx: WasiHttpCtx,
+    network_policy: NetworkPolicy,
 
     /// Per-instance scratch directory, deleted on Drop.
     scratch_dir: PathBuf,
@@ -77,6 +84,43 @@ impl WasiHttpView for InstanceState {
 
     fn table(&mut self) -> &mut ResourceTable {
         &mut self.resource_table
+    }
+
+    fn send_request(
+        &mut self,
+        request: hyper::Request<HyperOutgoingBody>,
+        config: OutgoingRequestConfig,
+    ) -> wasmtime_wasi_http::HttpResult<HostFutureIncomingResponse> {
+        let default_port = if config.use_tls { 443 } else { 80 };
+        let target = request.uri().authority().map(|authority| {
+            (
+                authority.host().to_owned(),
+                authority.port_u16().unwrap_or(default_port),
+            )
+        });
+
+        let allowed = target
+            .as_ref()
+            .map_or(false, |(host, port)| {
+                self.network_policy.check_http_authority(host, *port)
+            });
+        if !allowed {
+            let (host, port) = target
+                .as_ref()
+                .map(|(host, port)| (host.as_str(), *port))
+                .unwrap_or(("<missing>", default_port));
+            tracing::warn!(
+                scheme = request.uri().scheme_str().unwrap_or("<none>"),
+                host = %host,
+                port = port,
+                "[runtime] denied wasi:http outbound request by network policy"
+            );
+            return Ok(HostFutureIncomingResponse::ready(Ok(Err(
+                HttpErrorCode::ConnectionRefused,
+            ))));
+        }
+
+        Ok(default_send_request(request, config))
     }
 }
 
@@ -169,6 +213,7 @@ impl InstanceState {
             wasi_ctx: builder.build(),
             resource_table: ResourceTable::new(),
             http_ctx: WasiHttpCtx::new(),
+            network_policy: policy.network.clone(),
             scratch_dir,
             // Dynamic linking support
             dynamic_resource_map: HashMap::new(),
