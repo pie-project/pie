@@ -16,13 +16,13 @@ void copy_u32(const Slice& s, std::vector<int>& dst) {
     for (std::size_t i = 0; i < s.size(); ++i) dst[i] = static_cast<int>(p[i]);
 }
 
-// Wrap a persistent host int32 buffer as a 1-D MLX array WITHOUT copying.
-// The buffer must outlive every use of the returned array (it does — the
-// Staging buffers live for the whole run_forward, through graph eval).
+// Wrap a host int32 buffer as a 1-D MLX array. Copies the (small) index data
+// into MLX, so the staging buffer need not outlive the array. Portable across
+// MLX 0.29/0.32 (the zero-copy void* ctor is version-specific; these arrays are
+// tiny so the copy is negligible).
 Tensor i32_view(std::vector<int>& buf) {
-    return mx::array(static_cast<void*>(buf.data()),
-                     mx::Shape{static_cast<int>(buf.size())}, mx::int32,
-                     [](void*) {});
+    return mx::array(buf.data(), mx::Shape{static_cast<int>(buf.size())},
+                     mx::int32);
 }
 
 }  // namespace

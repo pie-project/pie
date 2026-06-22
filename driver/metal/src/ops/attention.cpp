@@ -40,7 +40,8 @@ Tensor sdpa_contiguous(const Tensor& q, const Tensor& k, const Tensor& v,
     Tensor v4 = mx::expand_dims(mx::transpose(v, {1, 0, 2}), 0);
 
     Tensor o4 = mx::fast::scaled_dot_product_attention(
-        q4, k4, v4, scale, mask_mode, mask);
+        q4, k4, v4, scale, mask_mode,
+        mask.has_value() ? std::vector<Tensor>{*mask} : std::vector<Tensor>{});
 
     // [1, heads, L, d] -> [L, heads, d]
     return mx::transpose(mx::squeeze(o4, 0), {1, 0, 2});
