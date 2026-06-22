@@ -107,8 +107,8 @@ The `[runtime]` block tunes the tokio worker pool, the wasmtime engine pool, the
 | `wasm_warm_slots` | `100` | Number of pool slots to keep warm. Must be `>= 0`. |
 | `allow_fs` | `false` | When true, every inferlet receives a preopened scratch directory at `/scratch` mapped to a per-process subdirectory under `fs_scratch_dir`. Inferlets without this flag have no host filesystem visibility. |
 | `fs_scratch_dir` | `<tempdir>/pie` | Host root under which per-process `/scratch` directories are created when `allow_fs = true`. |
-| `allow_network` | `true` | When false, wasi:sockets is denied. Useful for tight outbound HTTP control. |
-| `network_allowed_hosts` | `["*"]` | Allowed-host filter for wasi:sockets. Supports CIDRs and host:port forms (e.g. `["10.0.0.0/8", "127.0.0.1"]`, `["10.0.0.0/8:443"]`). Filters wasi:sockets only — wasi:http bypasses the per-socket hook. |
+| `allow_network` | `true` | When false, wasi:sockets is denied and outbound wasi:http is not linked. Useful for tight outbound HTTP control. |
+| `network_allowed_hosts` | `["*"]` | Allowed-host filter for wasi:sockets and outbound wasi:http. Supports CIDRs and host:port forms (e.g. `["10.0.0.0/8", "127.0.0.1"]`, `["10.0.0.0/8:443"]`). Restricted wasi:http policies accept IP-literal authorities only; use `["*"]` for legacy unrestricted host networking. |
 | `max_upload_mb` | `256` | Maximum size of a single chunked upload accepted by the server, in MiB. Must be `> 0`. |
 
 ## Per-model keys
