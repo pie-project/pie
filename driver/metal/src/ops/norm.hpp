@@ -7,8 +7,8 @@
 
 namespace pie_metal_driver::ops {
 
-// RMSNorm over the feature axis (axis 0 of a feature-major `[features, n]`
-// tensor — see gemm.hpp layout note). `weight` is the per-feature gain.
+// RMSNorm over the feature axis (the LAST axis of a token-major
+// `[n_tokens, hidden]` tensor). `weight` is the per-feature gain.
 //
 // `plus_one` selects the Gemma convention where the effective gain is
 // `(1 + weight)` (the loader stores the raw weight; Gemma folds the +1 at

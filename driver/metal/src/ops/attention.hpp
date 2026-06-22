@@ -35,24 +35,24 @@ struct AttnParams {
 };
 
 // Dense causal SDPA for the prefill path with contiguous per-request K/V.
-//   q: [head_dim, n_heads, n_tokens]
-//   k: [head_dim, n_kv_heads, n_kv]
-//   v: [head_dim, n_kv_heads, n_kv]
-// Returns [head_dim, n_heads, n_tokens]. `mask` is an optional additive
+//   q: [n_tokens, n_heads, head_dim]      (token-major; head_dim last)
+//   k: [n_kv, n_kv_heads, head_dim]
+//   v: [n_kv, n_kv_heads, head_dim]
+// Returns [n_tokens, n_heads, head_dim]. `mask` is an optional additive
 // attention mask; when empty a causal mask is applied.
 Tensor sdpa(const Tensor& q, const Tensor& k, const Tensor& v,
             const AttnParams& params,
             const std::optional<Tensor>& mask = std::nullopt);
 
 // Paged-KV attention.
-//   q                : [head_dim, n_heads, n_total]  (feature-major)
+//   q                : [n_total, n_heads, head_dim]  (token-major)
 //   k_cache, v_cache : paged buffers [n_pages, page_size, n_kv_heads, head_dim]
 //                      (final layout converges to delta's PagedKV struct).
 //   page_table       : [total_pages_in_batch] flat physical page indices
 //   kv_page_indptr   : [n_req + 1] CSR offsets into page_table per request
 //   qo_indptr        : [n_req + 1] CSR offsets into the query token axis
 //   last_page_lens   : [n_req] slot count used in each request's last page
-// Returns the attention output [head_dim, n_heads, n_total].
+// Returns the attention output [n_total, n_heads, head_dim].
 Tensor paged_attention(const Tensor& q,
                        const Tensor& k_cache,
                        const Tensor& v_cache,
