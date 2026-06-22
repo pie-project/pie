@@ -34,10 +34,21 @@ async fn main(_input: String) -> Result<String> {
         .max_tokens(max_tokens);
 
     let mut generated = Vec::new();
+    let mut checkpointed_mid_generation = false;
     while let Some(step) = g.next()? {
         let out = step.execute().await?;
         if out.tokens.is_empty() {
             continue;
+        }
+        if !checkpointed_mid_generation {
+            let buffered_after_step = g.context().buffer().len();
+            let checkpoint = g.fork()?;
+            eprintln!(
+                "[GENERATE] forked checkpoint mid-generation with {} buffered tokens",
+                buffered_after_step
+            );
+            drop(checkpoint);
+            checkpointed_mid_generation = true;
         }
         eprintln!("[GENERATE] got tokens: {:?}", out.tokens);
         generated.extend(out.tokens.iter().copied());

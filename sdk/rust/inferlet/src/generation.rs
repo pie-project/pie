@@ -232,6 +232,47 @@ impl<'ctx> Generator<'ctx> {
         ProbeHandle::new(slot)
     }
 
+    // ── Context checkpoints ──────────────────────────────────────────
+
+    /// Borrow the underlying context without ending the generation
+    /// session. This is useful for read-only context operations such as
+    /// inspecting `buffer()`, page counts, or scheduler state while the
+    /// generator still owns the mutable borrow.
+    pub fn context(&self) -> &Context {
+        &*self.ctx
+    }
+
+    /// Fork the underlying context without ending the generation session.
+    ///
+    /// Unlike [`snapshot`](Self::snapshot), `Context::fork` also clones the
+    /// SDK-side token buffer, including any sampled token staged for the
+    /// next decode step. Prefer this for a complete in-memory checkpoint.
+    pub fn fork(&self) -> Result<Context> {
+        self.ctx.fork()
+    }
+
+    /// Save the underlying runtime context under `name` without ending the
+    /// generation session.
+    ///
+    /// This saves the host-side context state. It does not persist the
+    /// SDK-side token buffer; callers that need an exact restore point
+    /// should persist [`context().buffer()`](Context::buffer) alongside the
+    /// snapshot name, or use [`fork`](Self::fork) for an in-memory checkpoint.
+    pub fn save(&self, name: &str) -> Result<()> {
+        self.ctx.save(name)
+    }
+
+    /// Create an anonymous runtime snapshot of the underlying context
+    /// without ending the generation session.
+    ///
+    /// This saves the host-side context state. It does not persist the
+    /// SDK-side token buffer; callers that need an exact restore point
+    /// should persist [`context().buffer()`](Context::buffer) alongside the
+    /// snapshot name, or use [`fork`](Self::fork) for an in-memory checkpoint.
+    pub fn snapshot(&self) -> Result<String> {
+        self.ctx.snapshot()
+    }
+
     // ── Iteration ──────────────────────────────────────────────────────
 
     /// Whether generation has terminated (max_tokens or stop hit).
