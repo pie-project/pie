@@ -120,4 +120,15 @@ inline void eval(const Tensor& t) { mlx::core::eval(t); }
 // Force materialization of several tensors in one graph evaluation.
 inline void eval(std::vector<Tensor> ts) { mlx::core::eval(std::move(ts)); }
 
+namespace ops {
+
+// Canonical placeholder for a not-yet-bound Tensor. MLX `array` has no default
+// constructor, so structs with non-optional `Tensor` members (e.g. model
+// weights) aren't default-constructible. Use this as an in-class initializer
+// (`Tensor w = ops::empty_tensor();`) so such structs can be default-built and
+// the real value assigned later. Returns an empty [0] float32 array (no alloc).
+inline Tensor empty_tensor() { return mlx::core::zeros({0}); }
+
+}  // namespace ops
+
 }  // namespace pie_metal_driver
