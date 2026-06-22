@@ -16,12 +16,13 @@ function(pie_metal_fetch_mlx target)
   # Pin a known-good MLX release. delta may bump this; keep it on a tag so
   # the shared CPM/FetchContent cache on the build host stays warm.
   #
-  # NOTE: v0.31.2 is the latest MLX release on both GitHub tags and PyPI
-  # (there is no 0.32 — that version does not exist anywhere). beta
-  # validated ops against the newest installed headers, which resolve to
-  # 0.31.2. Keep this matched to beta's actual installed <mlx/mlx.h> so
-  # the ops type-check against the same API at real compile time.
-  set(PIE_MLX_GIT_TAG "v0.31.2" CACHE STRING "MLX git tag to fetch")
+  # Pinned to v0.29.1 by team reconcile (see #mac): there is no MLX 0.32
+  # (latest on GitHub tags AND PyPI is 0.31.2). beta re-validated the whole
+  # ops/executor/kernels stream against v0.29.1 and is green on it — the
+  # only two API deltas vs newer MLX (SDPA mask arg type; zero-copy array
+  # ctor) are handled on the 0.29.1 side. Keep this matched to beta's
+  # validated target so ops type-check against the same API at real compile.
+  set(PIE_MLX_GIT_TAG "v0.29.1" CACHE STRING "MLX git tag to fetch")
 
   # MLX builds its own Metal kernels; keep tests/examples/python off.
   set(MLX_BUILD_TESTS OFF CACHE BOOL "" FORCE)
