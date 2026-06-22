@@ -22,6 +22,7 @@ use std::path::{Path, PathBuf};
 fn main() {
     let portable = cfg!(feature = "driver-portable");
     let cuda = cfg!(feature = "driver-cuda");
+    let metal = cfg!(feature = "driver-metal");
     println!("cargo:rerun-if-changed=../driver/common/include");
     println!("cargo:rerun-if-changed=../driver/common/src");
     if cuda {
@@ -30,12 +31,20 @@ fn main() {
         println!("cargo:rerun-if-changed=../driver/cuda/include");
         println!("cargo:rerun-if-changed=../driver/cuda/src");
     }
+    if metal {
+        println!("cargo:rerun-if-changed=../driver/metal/CMakeLists.txt");
+        println!("cargo:rerun-if-changed=../driver/metal/cmake");
+        println!("cargo:rerun-if-changed=../driver/metal/src");
+    }
 
     if portable {
         build_portable();
     }
     if cuda {
         build_cuda();
+    }
+    if metal {
+        build_metal();
     }
     build_dummy();
 }
@@ -454,6 +463,75 @@ fn build_cuda() {
 
     println!(
         "cargo:rustc-env=PIE_DRIVER_CUDA_BUILD_DIR={}",
+        build_dir.display()
+    );
+    rerun_if_changed(&driver_dir);
+}
+
+// -----------------------------------------------------------------------------
+// driver/metal
+// -----------------------------------------------------------------------------
+
+fn build_metal() {
+    let target_os = target_os();
+    if target_os != "macos" {
+        panic!(
+            "--features driver-metal is macOS-only (got target_os={target_os:?}). \
+             On Linux, use `--features driver-cuda`; the metal flavor targets \
+             Apple Silicon via MLX + native Metal shaders."
+        );
+    }
+
+    let driver_dir = PathBuf::from("../driver/metal");
+    println!("cargo:rerun-if-changed=../driver/metal/CMakeLists.txt");
+    println!("cargo:rerun-if-changed=../driver/metal/src");
+
+    let mut cfg = cmake::Config::new(&driver_dir);
+    // Per-flavor out_dir keeps multi-driver builds from clobbering each
+    // other's CMake cache (see build_portable).
+    cfg.out_dir(PathBuf::from(std::env::var_os("OUT_DIR").unwrap()).join("metal"));
+    cfg.build_target("pie_driver_metal_lib")
+        .define("BUILD_SHARED_LIBS", "OFF")
+        .define("PIE_SCHEMA_INCLUDE_DIR", pie_schema_include_dir())
+        .define("PIE_IPC_INCLUDE_DIR", pie_ipc_include_dir());
+    enable_position_independent_archives(&mut cfg);
+
+    // Persistent CPM cache for the header-only deps (tomlplusplus / CLI11
+    // / nlohmann_json) and, when enabled, the MLX source tree.
+    println!("cargo:rerun-if-env-changed=CPM_SOURCE_CACHE");
+    if let Ok(cache) = std::env::var("CPM_SOURCE_CACHE") {
+        cfg.define("CPM_SOURCE_CACHE", cache);
+    }
+
+    // MLX is OFF by default so the foundation skeleton compiles/links fast
+    // without a network fetch (the GLOB'd ops/model/etc dirs stay empty
+    // until delta wires the real MLX FetchContent and flips this on via
+    // PIE_METAL_WITH_MLX=1).
+    println!("cargo:rerun-if-env-changed=PIE_METAL_WITH_MLX");
+    let mlx_on = std::env::var("PIE_METAL_WITH_MLX")
+        .map(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "on" | "true" | "yes"))
+        .unwrap_or(false);
+    cfg.define("PIE_METAL_WITH_MLX", if mlx_on { "ON" } else { "OFF" });
+
+    let dst = cfg.build();
+    let build_dir = dst.join("build");
+
+    add_link_search_paths(&build_dir);
+
+    // Driver lib. tomlplusplus / nlohmann_json / CLI11 are header-only
+    // and produce no archive; the static lib is self-contained (modulo
+    // MLX, which adds its own archives picked up by add_link_search_paths
+    // when PIE_METAL_WITH_MLX=ON).
+    println!("cargo:rustc-link-lib=static=pie_driver_metal_lib");
+
+    // Apple frameworks the metal driver + MLX pull. -framework on macOS
+    // is the moral equivalent of -l on linux. (Accelerate added on top of
+    // the Metal/MetalKit/Foundation set add_system_libs already emits.)
+    println!("cargo:rustc-link-lib=framework=Accelerate");
+    add_system_libs(/*metal=*/ true);
+
+    println!(
+        "cargo:rustc-env=PIE_DRIVER_METAL_BUILD_DIR={}",
         build_dir.display()
     );
     rerun_if_changed(&driver_dir);
