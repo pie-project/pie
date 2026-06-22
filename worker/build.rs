@@ -513,6 +513,32 @@ fn build_metal() {
         .unwrap_or(false);
     cfg.define("PIE_METAL_WITH_MLX", if mlx_on { "ON" } else { "OFF" });
 
+    // MLX provider: "fetch" (FetchContent from source, default) or "system"
+    // (link a prebuilt MLX via find_package(MLX), e.g. `brew install mlx`).
+    // The system path is the GPU build on a host with no `xcrun metal`
+    // (brew ships MLX's Metal kernels precompiled). Defaults to fetch.
+    println!("cargo:rerun-if-env-changed=PIE_METAL_MLX_PROVIDER");
+    if let Ok(provider) = std::env::var("PIE_METAL_MLX_PROVIDER") {
+        let provider = provider.to_ascii_lowercase();
+        if !matches!(provider.as_str(), "fetch" | "system") {
+            panic!(
+                "PIE_METAL_MLX_PROVIDER must be \"fetch\" or \"system\" \
+                 (got {provider:?})"
+            );
+        }
+        cfg.define("PIE_METAL_MLX_PROVIDER", provider);
+    }
+
+    // Source-fetch only: build MLX's Metal GPU backend (needs `xcrun metal`).
+    // OFF gives a CPU-only MLX that still compiles+links the whole driver
+    // against the real MLX API on a CLT-only host. Ignored by the system
+    // provider, which uses prebuilt kernels.
+    println!("cargo:rerun-if-env-changed=PIE_METAL_MLX_BUILD_METAL");
+    if let Ok(v) = std::env::var("PIE_METAL_MLX_BUILD_METAL") {
+        let on = matches!(v.to_ascii_lowercase().as_str(), "1" | "on" | "true" | "yes");
+        cfg.define("PIE_METAL_MLX_BUILD_METAL", if on { "ON" } else { "OFF" });
+    }
+
     let dst = cfg.build();
     let build_dir = dst.join("build");
 
