@@ -29,7 +29,7 @@ struct RopeParams {
 };
 
 // Apply NEOX RoPE to the first `rope_dims` channels of each head.
-//   x:         [head_dim, n_heads, n_tokens]  (feature-major)
+//   x:         [n_tokens, n_heads, head_dim]  (token-major; head_dim last)
 //   positions: [n_tokens] int32 absolute positions
 //   rope_dims: number of channels rotated (== head_dim for full RoPE,
 //              < head_dim for partial-rotary archs).
