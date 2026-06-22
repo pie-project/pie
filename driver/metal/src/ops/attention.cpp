@@ -1,6 +1,7 @@
 #include "ops/attention.hpp"
 
 #include <cmath>
+#include <limits>
 #include <vector>
 
 #include <mlx/mlx.h>
@@ -47,12 +48,71 @@ Tensor sdpa_contiguous(const Tensor& q, const Tensor& k, const Tensor& v,
     return mx::transpose(mx::squeeze(o4, 0), {1, 0, 2});
 }
 
+// Manual masked attention for the cases MLX's fused causal SDPA can't express:
+// attention-logit softcapping (Gemma2/3) and sliding-window attention (Gemma
+// local layers). Operates on contiguous single-sequence 3D operands
+//   q:[nq, H, d], k:[nkv, Hkv, d], v:[nkv, Hkv, d] -> [nq, H, d]
+// in float32 for reference-grade numerics, then casts back to q's dtype. GQA is
+// handled by repeating the kv heads to H. Causal alignment matches MLX: the nq
+// queries align to the END of the nkv keys (absolute pos = (nkv - nq) + j).
+Tensor manual_attention(const Tensor& q, const Tensor& k, const Tensor& v,
+                        float scale, float softcap, int sliding_window) {
+    const int nq = q.shape(0);
+    const int H = q.shape(1);
+    const int d = q.shape(2);
+    const int nkv = k.shape(0);
+    const int Hkv = k.shape(1);
+    const int n_rep = (Hkv > 0) ? H / Hkv : 1;
+
+    // [L, heads, d] -> [heads, L, d], GQA-expanded, float32.
+    Tensor kk = (n_rep > 1) ? mx::repeat(k, n_rep, 1) : k;
+    Tensor vv = (n_rep > 1) ? mx::repeat(v, n_rep, 1) : v;
+    Tensor qh = mx::astype(mx::transpose(q, {1, 0, 2}), mx::float32);
+    Tensor kh = mx::astype(mx::transpose(kk, {1, 0, 2}), mx::float32);
+    Tensor vh = mx::astype(mx::transpose(vv, {1, 0, 2}), mx::float32);
+
+    // scores: [H, nq, nkv] = (qh @ kh^T) * scale.
+    Tensor scores =
+        mx::multiply(mx::matmul(qh, mx::swapaxes(kh, -1, -2)), mx::array(scale));
+    if (softcap > 0.0f) {
+        scores = mx::multiply(mx::tanh(scores * (1.0f / softcap)),
+                              mx::array(softcap));
+    }
+
+    // Additive mask [nq, nkv]: causal (k_idx <= q_abs) and, for SWA, within the
+    // window (k_idx > q_abs - sliding_window).
+    const int offset = nkv - nq;
+    Tensor q_idx = mx::expand_dims(mx::arange(offset, offset + nq, mx::int32), 1);
+    Tensor k_idx = mx::expand_dims(mx::arange(0, nkv, mx::int32), 0);
+    Tensor allowed = mx::less_equal(k_idx, q_idx);  // causal
+    if (sliding_window > 0) {
+        Tensor lo = mx::subtract(q_idx, mx::array(sliding_window));
+        allowed = mx::logical_and(allowed, mx::greater(k_idx, lo));
+    }
+    const float neg_inf = -std::numeric_limits<float>::infinity();
+    Tensor mask_add = mx::where(allowed, mx::array(0.0f), mx::array(neg_inf));
+    scores = mx::add(scores, mx::expand_dims(mask_add, 0));  // broadcast over H
+
+    Tensor probs = mx::softmax(scores, -1, /*precise=*/true);
+    Tensor out = mx::matmul(probs, vh);  // [H, nq, d]
+    return mx::astype(mx::transpose(out, {1, 0, 2}), q.dtype());
+}
+
 }  // namespace
 
 Tensor sdpa(const Tensor& q, const Tensor& k, const Tensor& v,
             const AttnParams& params, const std::optional<Tensor>& mask) {
+    const float scale = resolve_scale(params);
+    // Softcap / sliding-window aren't expressible via MLX's fused causal SDPA;
+    // fall back to the manual masked path (only meaningful without an explicit
+    // mask — Gemma drives these through the causal path).
+    if (!mask.has_value() &&
+        (params.softcap > 0.0f || params.sliding_window > 0)) {
+        return manual_attention(q, k, v, scale, params.softcap,
+                                params.sliding_window);
+    }
     const std::string mode = mask.has_value() ? "" : "causal";
-    return sdpa_contiguous(q, k, v, resolve_scale(params), mode, mask);
+    return sdpa_contiguous(q, k, v, scale, mode, mask);
 }
 
 Tensor paged_attention(const Tensor& q,
@@ -108,9 +168,16 @@ Tensor paged_attention(const Tensor& q,
                                {q_end, q.shape(1), q.shape(2)});
 
         // Causal alignment: MLX aligns the nq queries to the end of the
-        // n_kv keys, so each new token attends its full history.
-        outputs.push_back(
-            sdpa_contiguous(q_r, k_r, v_r, scale, "causal", std::nullopt));
+        // n_kv keys, so each new token attends its full history. Softcap /
+        // sliding-window (Gemma) need the manual masked path.
+        if (params.softcap > 0.0f || params.sliding_window > 0) {
+            outputs.push_back(manual_attention(q_r, k_r, v_r, scale,
+                                               params.softcap,
+                                               params.sliding_window));
+        } else {
+            outputs.push_back(
+                sdpa_contiguous(q_r, k_r, v_r, scale, "causal", std::nullopt));
+        }
     }
 
     if (outputs.empty()) {
