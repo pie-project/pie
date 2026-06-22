@@ -65,20 +65,6 @@ pip install pie-bakery
 This provides the standalone `bakery` command and the Python package used by
 `pie new` / `pie build`.
 
-## Optional: Python-backed drivers
-
-The `pie` binary runs the embedded `cuda_native` and `portable` drivers without Python. Python is required only for the subprocess drivers: `vllm`, `sglang`, and `tensorrt_llm`. Install one with:
-
-> Note: The `vllm` and `sglang` drivers are currently not supported on Windows.
-> Please use the `portable` driver on Windows, or run these drivers in WSL/Linux.
-
-```bash
-pie driver vllm install ~/.pie/venvs/vllm --run
-pie driver vllm set venv ~/.pie/venvs/vllm
-```
-
-Replace `vllm` with `sglang` or `tensorrt-llm` for the other drivers. Each driver gets a Python 3.12 virtual environment with its pinned wheels. See the [driver reference](../reference/drivers/cuda) for what each driver does and when to pick it.
-
 ## Advanced installation
 
 Most users do not need anything in this section.
@@ -132,14 +118,14 @@ git clone https://github.com/pie-project/pie.git
 cd pie
 
 # Default features: embedded portable driver plus the always-linked dummy.
-cargo install --path server
+cargo install --path worker
 
 # Include the embedded CUDA driver too.
 CUDACXX=/usr/local/cuda/bin/nvcc \
-  cargo install --path server --features driver-portable,driver-cuda
+  cargo install --path worker --features driver-portable,driver-cuda
 
 # Build the release binary for Linux/macOS.
-cargo install --path server --features driver-portable
+cargo install --path worker --features driver-portable
 ```
 
 Re-run `pie doctor` after building to confirm which drivers are compiled in.

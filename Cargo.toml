@@ -9,12 +9,16 @@
 resolver = "2"
 members = [
     "runtime",
+    "controller",
+    "transport",
     "client/rust",
-    "server",
-    "driver/bridge",
-    "driver/bridge-macros",
+    "worker",
+    "protocol/schema",
+    "protocol/schema-bindgen",
+    "protocol/schema-derive",
+    "driver/ipc",
     "driver/dummy",
-    "driver/weight_loader",
+    "driver/weight-loader",
     "sdk/python-server",
 ]
 exclude = [
@@ -22,8 +26,8 @@ exclude = [
     "sdk/rust",
 ]
 
-# Distribution profile for `pie-server`. Use
-# `cargo build --profile release-min -p pie-server`. The regular
+# Distribution profile for `pie-worker`. Use
+# `cargo build --profile release-min -p pie-worker`. The regular
 # `release` profile stays as the default dev/bench path (no LTO).
 #
 # Thin LTO over fat: ~10× faster link than fat with most of the size

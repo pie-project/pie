@@ -11,7 +11,7 @@
 
 #include <ggml.h>
 #include <ggml-backend.h>
-#include <pie_bridge/inproc_server.hpp>
+#include <pie_ipc/inproc_server.hpp>
 
 #include "adapter.hpp"
 #include "executor/executor.hpp"

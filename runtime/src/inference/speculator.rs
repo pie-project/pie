@@ -78,7 +78,7 @@ pub(crate) struct StagedEntry {
 
 pub(crate) fn entry_matches_request(
     entry: &StagedEntry,
-    request: &pie_bridge::ForwardRequest,
+    request: &pie_schema::ForwardRequest,
 ) -> bool {
     // The chain extender only ever stages single-token decode passes
     // (`build_next_request` emits `token_ids = [sampled_token]`,
@@ -199,7 +199,7 @@ pub fn lookup_for_ctx(model_idx: usize, device_idx: usize) -> Option<StagedBatch
 pub fn try_hit(
     spec: &StagedBatch,
     ctx_id: ContextId,
-    request: &pie_bridge::ForwardRequest,
+    request: &pie_schema::ForwardRequest,
     allow_extend: bool,
 ) -> Option<oneshot::Receiver<Result<ForwardOutput>>> {
     let mut deque = spec.0.get_mut(&ctx_id)?;
@@ -265,7 +265,7 @@ pub(crate) struct ChainState {
     pub response: oneshot::Sender<Result<ForwardOutput>>,
     pub scheduler_handle: SchedulerHandle,
     pub staged_batch_arc: StagedBatchMap,
-    pub prev_request: pie_bridge::ForwardRequest,
+    pub prev_request: pie_schema::ForwardRequest,
     pub all_pages: Vec<PhysicalPageId>,
     pub cur_page_idx: usize,
     pub cur_last_page_len: u32,
@@ -363,7 +363,7 @@ pub(crate) fn start_chain(
     scheduler_handle: SchedulerHandle,
     staged_batch_arc: StagedBatchMap,
     model_idx: usize,
-    request: pie_bridge::ForwardRequest,
+    request: pie_schema::ForwardRequest,
     physical_page_ids: Vec<PhysicalPageId>,
     all_pages: Vec<PhysicalPageId>,
     cur_page_idx: usize,
@@ -561,12 +561,12 @@ pub enum SkipReason {
 /// Stochastic samplers (temperature > 0, no seed) are accepted: the
 /// chain's pre-fired sample is itself a draw from the requested
 /// distribution, which is exactly what the inferlet asked for.
-pub fn evaluate_request_shape(req: &pie_bridge::ForwardRequest) -> Result<(), SkipReason> {
-    use pie_bridge::Sampler;
+pub fn evaluate_request_shape(req: &pie_schema::ForwardRequest) -> Result<(), SkipReason> {
+    use pie_schema::Sampler;
 
     // Structural shape: exactly one sampling slot at the last input
     // position, with a sampler attached.
-    if req.sampling_indices.len() != 1 || req.samplers.len() != 1 {
+    if req.sampling_indices.len() != 1 || req.n_samplers() != 1 {
         return Err(SkipReason::NotDecodeShape);
     }
     let last_input_pos = req.position_ids.len().saturating_sub(1) as u32;
@@ -577,19 +577,24 @@ pub fn evaluate_request_shape(req: &pie_bridge::ForwardRequest) -> Result<(), Sk
     // Probe variants emit non-Token outputs (distributions, logits,
     // etc.), so the next pass shape doesn't match the 1-token decode
     // we'd pre-fire.
-    match &req.samplers[0] {
-        Sampler::RawLogits
-        | Sampler::Dist { .. }
-        | Sampler::Logprob { .. }
-        | Sampler::Logprobs { .. }
-        | Sampler::Entropy
-        | Sampler::Embedding => return Err(SkipReason::ProbeSampler),
+    match req.sampler_at(0) {
+        Some(
+            Sampler::RawLogits
+            | Sampler::Dist { .. }
+            | Sampler::Logprob { .. }
+            | Sampler::Logprobs { .. }
+            | Sampler::Entropy
+            | Sampler::Embedding,
+        ) => return Err(SkipReason::ProbeSampler),
 
-        Sampler::Multinomial { .. }
-        | Sampler::TopK { .. }
-        | Sampler::TopP { .. }
-        | Sampler::MinP { .. }
-        | Sampler::TopKTopP { .. } => {}
+        Some(
+            Sampler::Multinomial { .. }
+            | Sampler::TopK { .. }
+            | Sampler::TopP { .. }
+            | Sampler::MinP { .. }
+            | Sampler::TopKTopP { .. },
+        ) => {}
+        None => return Err(SkipReason::NotDecodeShape),
     }
 
     if !req.logit_masks.is_empty() {
@@ -620,9 +625,9 @@ pub fn evaluate_request_shape(req: &pie_bridge::ForwardRequest) -> Result<(), Sk
 ///     driver pass, so pass-level speculation remains orthogonal to
 ///     driver/system speculation.
 pub fn build_next_request(
-    prev_req: &pie_bridge::ForwardRequest,
+    prev_req: &pie_schema::ForwardRequest,
     prev_resp: &ForwardOutput,
-) -> Option<(pie_bridge::ForwardRequest, u32, u32)> {
+) -> Option<(pie_schema::ForwardRequest, u32, u32)> {
     if evaluate_request_shape(prev_req).is_err() {
         return None;
     }
@@ -658,7 +663,7 @@ pub fn build_next_request(
         prev_req.output_spec_flags.clone()
     };
     let rs_slot_flags = vec![0; prev_req.rs_slot_ids.len()];
-    let next_req = pie_bridge::ForwardRequest {
+    let mut next_req = pie_schema::ForwardRequest {
         token_ids: vec![sampled_token],
         position_ids: vec![next_pos],
         kv_page_indices: Vec::new(),
@@ -673,7 +678,7 @@ pub fn build_next_request(
         logit_mask_indptr: vec![0, 0],
         sampling_indices: vec![0],
         sampling_indptr: vec![0, 1],
-        samplers: prev_req.samplers.clone(),
+        // Sampler SoA filled by `set_samplers` below (the verified single slot).
         sampler_indptr: vec![0, 1],
         adapter_bindings: prev_req.adapter_bindings.clone(),
         spec_indptr: vec![0, spec_token_ids.len() as u32],
@@ -697,24 +702,29 @@ pub fn build_next_request(
         audio_feature_indptr: vec![0],
         audio_anchor_rows: Vec::new(),
         audio_indptr: vec![0, 0],
+        ..Default::default()
     };
+    // Carry over the (verified single) sampler from the previous request.
+    next_req.set_samplers(&[prev_req
+        .sampler_at(0)
+        .expect("decode shape has exactly one sampler")]);
     Some((next_req, sampled_token, next_pos))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pie_bridge::Sampler;
+    use pie_schema::Sampler;
 
     fn req_with(
         positions: Vec<u32>,
         sampling_indices: Vec<u32>,
         samplers: Vec<Sampler>,
-    ) -> pie_bridge::ForwardRequest {
+    ) -> pie_schema::ForwardRequest {
         let n = positions.len() as u32;
         let n_sampling = sampling_indices.len() as u32;
         let n_samplers = samplers.len() as u32;
-        pie_bridge::ForwardRequest {
+        let mut req = pie_schema::ForwardRequest {
             token_ids: vec![0; positions.len()],
             position_ids: positions,
             kv_page_indices: Vec::new(),
@@ -729,9 +739,8 @@ mod tests {
             logit_mask_indptr: vec![0, 0],
             sampling_indices,
             sampling_indptr: vec![0, n_sampling],
-            samplers,
             sampler_indptr: vec![0, n_samplers],
-            adapter_bindings: vec![pie_bridge::AdapterBinding {
+            adapter_bindings: vec![pie_schema::AdapterBinding {
                 adapter_id: -1,
                 seed: -1,
             }],
@@ -743,7 +752,9 @@ mod tests {
             single_token_mode: true,
             has_user_mask: false,
             ..Default::default()
-        }
+        };
+        req.set_samplers(&samplers);
+        req
     }
 
     fn argmax() -> Sampler {
@@ -822,7 +833,7 @@ mod tests {
         req.output_spec_flags = vec![true];
         req.rs_slot_ids = vec![7];
         req.rs_slot_flags = vec![1];
-        let resp = ForwardOutput::from_response(pie_bridge::ForwardResponse {
+        let resp = ForwardOutput::from_response(pie_schema::ForwardResponse {
             num_requests: 1,
             tokens: vec![42, 43, 44],
             tokens_indptr: vec![0, 3],
@@ -847,7 +858,7 @@ mod tests {
     #[test]
     fn build_next_request_none_on_empty_tokens() {
         let req = req_with(vec![10], vec![0], vec![argmax()]);
-        let resp = ForwardOutput::from_response(pie_bridge::ForwardResponse {
+        let resp = ForwardOutput::from_response(pie_schema::ForwardResponse {
             num_requests: 1,
             ..Default::default()
         });

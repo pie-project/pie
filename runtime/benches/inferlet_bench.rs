@@ -51,10 +51,12 @@ fn spawn_and_wait_all(s: &BenchState, count: usize) {
                 process::spawn(
                     "bench-user".into(),
                     program_name(),
-                    vec![format!("{i}")],
-                    None,
+                    format!("{i}"),
                     None,
                     false,
+                    None,
+                    None,
+                    None,
                 )
                 .expect("spawn")
             })

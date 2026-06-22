@@ -17,7 +17,7 @@ use crate::inference::ForwardOutput;
 use super::{Completion, PendingRequest, RequestCapacityUsage, request_capacity_usage};
 
 pub(super) struct ChunkContinuation {
-    original_request: pie_bridge::ForwardRequest,
+    original_request: pie_schema::ForwardRequest,
     response_tx: oneshot::Sender<Result<ForwardOutput>>,
     physical_page_ids: Vec<PhysicalPageId>,
     final_last_page_len: u32,
@@ -40,7 +40,7 @@ enum ChunkSlotOutput {
 }
 
 struct BuiltChunk {
-    request: pie_bridge::ForwardRequest,
+    request: pie_schema::ForwardRequest,
     physical_page_ids: Vec<PhysicalPageId>,
     last_page_len: u32,
 }
@@ -99,7 +99,7 @@ impl PendingRequest {
         let Completion::Direct(response_tx) = completion else {
             unreachable!("chunk continuations returned above");
         };
-        let response_accumulator = ChunkResponseAccumulator::new(request.samplers.len());
+        let response_accumulator = ChunkResponseAccumulator::new(request.n_samplers());
 
         Ok(PendingRequest {
             request: chunk.request,
@@ -151,7 +151,7 @@ impl PendingRequest {
             } => match result {
                 Ok(ForwardOutput::Response(resp)) => continuation.complete_chunk(
                     resp,
-                    request.samplers,
+                    request.samplers(),
                     sampler_slots,
                     submit_tx,
                     page_size,
@@ -181,8 +181,8 @@ impl PendingRequest {
 impl ChunkContinuation {
     fn complete_chunk(
         mut self,
-        resp: pie_bridge::ForwardResponse,
-        chunk_samplers: Vec<pie_bridge::Sampler>,
+        resp: pie_schema::ForwardResponse,
+        chunk_samplers: Vec<pie_schema::Sampler>,
         chunk_sampler_slots: Vec<usize>,
         submit_tx: Option<&crossbeam::channel::Sender<PendingRequest>>,
         page_size: u32,
@@ -202,7 +202,7 @@ impl ChunkContinuation {
                 response_accumulator,
                 ..
             } = self;
-            match response_accumulator.into_response(&original_request.samplers) {
+            match response_accumulator.into_response(&original_request.samplers()) {
                 Ok(resp) => {
                     response_tx.send(Ok(ForwardOutput::Response(resp))).ok();
                 }
@@ -288,11 +288,11 @@ impl ChunkResponseAccumulator {
 
     fn record_response(
         &mut self,
-        samplers: &[pie_bridge::Sampler],
+        samplers: &[pie_schema::Sampler],
         sampler_slots: &[usize],
-        resp: pie_bridge::ForwardResponse,
+        resp: pie_schema::ForwardResponse,
     ) -> std::result::Result<(), String> {
-        use pie_bridge::Sampler;
+        use pie_schema::Sampler;
 
         if samplers.len() != sampler_slots.len() {
             return Err(format!(
@@ -402,11 +402,11 @@ impl ChunkResponseAccumulator {
 
     fn into_response(
         mut self,
-        samplers: &[pie_bridge::Sampler],
-    ) -> std::result::Result<pie_bridge::ForwardResponse, String> {
-        use pie_bridge::Sampler;
+        samplers: &[pie_schema::Sampler],
+    ) -> std::result::Result<pie_schema::ForwardResponse, String> {
+        use pie_schema::Sampler;
 
-        let mut out = pie_bridge::ForwardResponse {
+        let mut out = pie_schema::ForwardResponse {
             num_requests: 1,
             tokens_indptr: vec![0],
             dists_req_indptr: vec![0],
@@ -497,7 +497,7 @@ fn slot_output_name(output: &ChunkSlotOutput) -> &'static str {
     }
 }
 
-fn response_tokens(resp: &pie_bridge::ForwardResponse) -> std::result::Result<Vec<u32>, String> {
+fn response_tokens(resp: &pie_schema::ForwardResponse) -> std::result::Result<Vec<u32>, String> {
     if resp.tokens_indptr.len() >= 2 {
         if resp.tokens_indptr[0] != 0 {
             return Err(format!(
@@ -523,7 +523,7 @@ fn response_tokens(resp: &pie_bridge::ForwardResponse) -> std::result::Result<Ve
 }
 
 fn response_dists(
-    resp: &pie_bridge::ForwardResponse,
+    resp: &pie_schema::ForwardResponse,
 ) -> std::result::Result<Vec<(Vec<u32>, Vec<f32>)>, String> {
     if resp.dists_ids.len() != resp.dists_probs.len() {
         return Err(format!(
@@ -555,7 +555,7 @@ fn response_dists(
 }
 
 fn response_logits(
-    resp: &pie_bridge::ForwardResponse,
+    resp: &pie_schema::ForwardResponse,
 ) -> std::result::Result<Vec<Vec<u8>>, String> {
     let count =
         response_nested_slot_count(&resp.logits_req_indptr, &resp.logits_byte_indptr, "logits")?;
@@ -574,7 +574,7 @@ fn response_logits(
 }
 
 fn response_logprobs(
-    resp: &pie_bridge::ForwardResponse,
+    resp: &pie_schema::ForwardResponse,
 ) -> std::result::Result<Vec<Vec<f32>>, String> {
     let count = response_nested_slot_count(
         &resp.logprobs_req_indptr,
@@ -595,7 +595,7 @@ fn response_logprobs(
     Ok(out)
 }
 
-fn response_entropies(resp: &pie_bridge::ForwardResponse) -> std::result::Result<Vec<f32>, String> {
+fn response_entropies(resp: &pie_schema::ForwardResponse) -> std::result::Result<Vec<f32>, String> {
     if resp.entropies_indptr.len() >= 2 {
         if resp.entropies_indptr[0] != 0 {
             return Err(format!(
@@ -646,7 +646,7 @@ fn response_nested_slot_count(
 }
 
 fn validate_chunkable_request(
-    req: &pie_bridge::ForwardRequest,
+    req: &pie_schema::ForwardRequest,
     max_forward_tokens: usize,
 ) -> std::result::Result<(), String> {
     if max_forward_tokens == 0 {
@@ -680,7 +680,7 @@ fn validate_chunkable_request(
 }
 
 fn validate_chunk_request_shape(
-    req: &pie_bridge::ForwardRequest,
+    req: &pie_schema::ForwardRequest,
 ) -> std::result::Result<(), String> {
     if req.position_ids.len() != req.token_ids.len() {
         return Err(format!(
@@ -696,11 +696,11 @@ fn validate_chunk_request_shape(
             req.masks.len()
         ));
     }
-    if req.sampling_indices.len() != req.samplers.len() {
+    if req.sampling_indices.len() != req.n_samplers() {
         return Err(format!(
             "chunked prefill requires one sampler per sampling index (got {} indices, {} samplers)",
             req.sampling_indices.len(),
-            req.samplers.len()
+            req.n_samplers()
         ));
     }
     Ok(())
@@ -787,7 +787,7 @@ fn chunk_limit_error(usage: RequestCapacityUsage, limits: SchedulerLimits) -> Op
 
 #[cfg(test)]
 fn build_chunk_request(
-    original: &pie_bridge::ForwardRequest,
+    original: &pie_schema::ForwardRequest,
     full_physical_page_ids: &[PhysicalPageId],
     final_last_page_len: u32,
     start: usize,
@@ -795,7 +795,7 @@ fn build_chunk_request(
     page_size: u32,
 ) -> std::result::Result<
     (
-        pie_bridge::ForwardRequest,
+        pie_schema::ForwardRequest,
         Vec<PhysicalPageId>,
         u32,
         Vec<usize>,
@@ -821,7 +821,7 @@ fn build_chunk_request(
 }
 
 fn build_chunk_request_for_slots(
-    original: &pie_bridge::ForwardRequest,
+    original: &pie_schema::ForwardRequest,
     full_physical_page_ids: &[PhysicalPageId],
     final_last_page_len: u32,
     start: usize,
@@ -857,16 +857,16 @@ fn build_chunk_request_for_slots(
                 original.sampling_indices.len()
             ));
         };
-        let Some(sampler) = original.samplers.get(slot) else {
+        let Some(sampler) = original.sampler_at(slot) else {
             return Err(format!(
                 "chunked prefill sampler slot {slot} is outside {} samplers",
-                original.samplers.len()
+                original.n_samplers()
             ));
         };
         let idx_usize = idx as usize;
         if (start..end).contains(&idx_usize) {
             sampling_indices.push((idx_usize - start) as u32);
-            samplers.push(sampler.clone());
+            samplers.push(sampler);
         } else {
             return Err(format!(
                 "chunked prefill sampler slot {slot} index {idx_usize} is outside chunk range {start}..{end}"
@@ -906,7 +906,7 @@ fn build_chunk_request_for_slots(
     };
     let sampling_len = sampling_indices.len() as u32;
     let sampler_len = samplers.len() as u32;
-    let chunk = pie_bridge::ForwardRequest {
+    let mut chunk = pie_schema::ForwardRequest {
         token_ids: original.token_ids[start..end].to_vec(),
         position_ids: original.position_ids[start..end].to_vec(),
         kv_page_indices: Vec::new(),
@@ -921,7 +921,7 @@ fn build_chunk_request_for_slots(
         logit_mask_indptr,
         sampling_indices,
         sampling_indptr: vec![0, sampling_len],
-        samplers,
+        // Sampler SoA filled by `set_samplers` below from the per-slot list.
         sampler_indptr: vec![0, sampler_len],
         adapter_bindings: original.adapter_bindings.clone(),
         spec_token_ids: Vec::new(),
@@ -947,7 +947,9 @@ fn build_chunk_request_for_slots(
         audio_feature_indptr: vec![0],
         audio_anchor_rows: Vec::new(),
         audio_indptr: vec![0, 0],
+        ..Default::default()
     };
+    chunk.set_samplers(&samplers);
 
     Ok(BuiltChunk {
         request: chunk,
@@ -957,7 +959,7 @@ fn build_chunk_request_for_slots(
 }
 
 fn chunk_capacity_usage(
-    original: &pie_bridge::ForwardRequest,
+    original: &pie_schema::ForwardRequest,
     full_physical_page_ids: &[PhysicalPageId],
     final_last_page_len: u32,
     start: usize,
@@ -981,10 +983,10 @@ fn chunk_capacity_usage(
     let chunk_len = end - start;
     let logprob_labels = sampler_slots
         .iter()
-        .filter_map(|&slot| original.samplers.get(slot))
+        .filter_map(|&slot| original.sampler_at(slot))
         .map(|sampler| match sampler {
-            pie_bridge::Sampler::Logprob { .. } => 1,
-            pie_bridge::Sampler::Logprobs { token_ids } => token_ids.len(),
+            pie_schema::Sampler::Logprob { .. } => 1,
+            pie_schema::Sampler::Logprobs { token_ids } => token_ids.len(),
             _ => 0,
         })
         .sum();
@@ -992,11 +994,11 @@ fn chunk_capacity_usage(
     let mut has_prob_sampling = false;
     let mut has_output_spec = false;
     for &slot in sampler_slots {
-        if let Some(sampler) = original.samplers.get(slot) {
-            if !super::is_token_sampler(sampler) {
+        if let Some(sampler) = original.sampler_at(slot) {
+            if !super::is_token_sampler(&sampler) {
                 all_samplers_token = false;
             }
-            if super::sampler_needs_prob_rows(sampler) {
+            if super::sampler_needs_prob_rows(&sampler) {
                 has_prob_sampling = true;
             }
         }
@@ -1046,7 +1048,7 @@ fn chunk_capacity_usage(
 }
 
 fn chunk_page_shape(
-    original: &pie_bridge::ForwardRequest,
+    original: &pie_schema::ForwardRequest,
     full_physical_page_ids: &[PhysicalPageId],
     final_last_page_len: u32,
     end: usize,
@@ -1078,7 +1080,7 @@ fn chunk_page_shape(
 }
 
 fn chunk_sampler_slots_by_chunk(
-    original: &pie_bridge::ForwardRequest,
+    original: &pie_schema::ForwardRequest,
     chunk_size: usize,
 ) -> BTreeMap<usize, Vec<usize>> {
     let mut by_chunk = BTreeMap::new();
@@ -1096,7 +1098,7 @@ fn chunk_sampler_slots_by_chunk(
 
 #[cfg(test)]
 fn collect_chunk_sampler_slots(
-    original: &pie_bridge::ForwardRequest,
+    original: &pie_schema::ForwardRequest,
     start: usize,
     end: usize,
 ) -> Vec<usize> {
@@ -1156,13 +1158,13 @@ mod tests {
         let last_page_len = compute_last_page_len(tokens as u32, pages, page_size);
         (
             PendingRequest::direct(
-                pie_bridge::ForwardRequest {
+                pie_schema::ForwardRequest {
                     token_ids: (0..tokens as u32).collect(),
                     position_ids: (0..tokens as u32).collect(),
                     qo_indptr: vec![0, tokens as u32],
                     sampling_indptr: vec![0, 0],
                     sampler_indptr: vec![0, 0],
-                    adapter_bindings: vec![pie_bridge::AdapterBinding {
+                    adapter_bindings: vec![pie_schema::AdapterBinding {
                         adapter_id: -1,
                         seed: -1,
                     }],
@@ -1192,13 +1194,13 @@ mod tests {
         let pages = total_kv.div_ceil(page_size);
         let last_page_len = compute_last_page_len(total_kv, pages, page_size);
         PendingRequest::direct(
-            pie_bridge::ForwardRequest {
+            pie_schema::ForwardRequest {
                 token_ids: (0..tokens as u32).collect(),
                 position_ids: (kv_before..kv_before + tokens as u32).collect(),
                 qo_indptr: vec![0, tokens as u32],
                 sampling_indptr: vec![0, 0],
                 sampler_indptr: vec![0, 0],
-                adapter_bindings: vec![pie_bridge::AdapterBinding {
+                adapter_bindings: vec![pie_schema::AdapterBinding {
                     adapter_id: -1,
                     seed: -1,
                 }],
@@ -1212,8 +1214,8 @@ mod tests {
         )
     }
 
-    fn token_response(token: u32) -> pie_bridge::ForwardResponse {
-        pie_bridge::ForwardResponse {
+    fn token_response(token: u32) -> pie_schema::ForwardResponse {
+        pie_schema::ForwardResponse {
             num_requests: 1,
             tokens_indptr: vec![0, 1],
             tokens: vec![token],
@@ -1221,8 +1223,8 @@ mod tests {
         }
     }
 
-    fn token_response_many(tokens: Vec<u32>) -> pie_bridge::ForwardResponse {
-        pie_bridge::ForwardResponse {
+    fn token_response_many(tokens: Vec<u32>) -> pie_schema::ForwardResponse {
+        pie_schema::ForwardResponse {
             num_requests: 1,
             tokens_indptr: vec![0, tokens.len() as u32],
             tokens,
@@ -1230,8 +1232,8 @@ mod tests {
         }
     }
 
-    fn entropy_response(entropy: f32) -> pie_bridge::ForwardResponse {
-        pie_bridge::ForwardResponse {
+    fn entropy_response(entropy: f32) -> pie_schema::ForwardResponse {
+        pie_schema::ForwardResponse {
             num_requests: 1,
             entropies_indptr: vec![0, 1],
             entropies: vec![entropy],
@@ -1239,7 +1241,7 @@ mod tests {
         }
     }
 
-    fn expect_forward_response(result: Result<ForwardOutput>) -> pie_bridge::ForwardResponse {
+    fn expect_forward_response(result: Result<ForwardOutput>) -> pie_schema::ForwardResponse {
         match result.expect("chunked response ok") {
             ForwardOutput::Response(resp) => resp,
             other => panic!("expected ForwardOutput::Response, got {other:?}"),
@@ -1253,11 +1255,11 @@ mod tests {
         req
     }
 
-    fn true_suffix_masks(tokens: usize, total_kv: u32) -> Vec<pie_bridge::Brle> {
+    fn true_suffix_masks(tokens: usize, total_kv: u32) -> Vec<pie_schema::Brle> {
         (0..tokens)
             .map(|i| {
                 let false_prefix = (i as u32).min(total_kv);
-                pie_bridge::Brle::from_vec(vec![false_prefix, total_kv - false_prefix])
+                pie_schema::Brle::from_vec(vec![false_prefix, total_kv - false_prefix])
             })
             .collect()
     }
@@ -1331,10 +1333,10 @@ mod tests {
         let mut pending = positioned_pending(10, 4);
         pending.request.sampling_indices = vec![9];
         pending.request.sampling_indptr = vec![0, 1];
-        pending.request.samplers = vec![pie_bridge::Sampler::TopK {
+        pending.request.set_samplers(&[pie_schema::Sampler::TopK {
             temperature: 0.0,
             k: 1,
-        }];
+        }]);
         pending.request.sampler_indptr = vec![0, 1];
 
         let (chunk, pages, last_page_len, sampler_slots) = build_chunk_request(
@@ -1349,7 +1351,7 @@ mod tests {
 
         assert_eq!(chunk.token_ids, vec![8, 9]);
         assert_eq!(chunk.sampling_indices, vec![1]);
-        assert_eq!(chunk.samplers.len(), 1);
+        assert_eq!(chunk.n_samplers(), 1);
         assert_eq!(chunk.sampling_indptr, vec![0, 1]);
         assert_eq!(chunk.sampler_indptr, vec![0, 1]);
         assert_eq!(chunk.output_spec_flags, vec![true]);
@@ -1363,10 +1365,10 @@ mod tests {
         let mut pending = positioned_pending(10, 4);
         pending.request.sampling_indices = vec![3];
         pending.request.sampling_indptr = vec![0, 1];
-        pending.request.samplers = vec![pie_bridge::Sampler::TopK {
+        pending.request.set_samplers(&[pie_schema::Sampler::TopK {
             temperature: 0.0,
             k: 1,
-        }];
+        }]);
         pending.request.sampler_indptr = vec![0, 1];
 
         let chunked = match pending.maybe_start_chunking(limits(8, 4, 100), 4) {
@@ -1384,17 +1386,17 @@ mod tests {
         let (mut pending, mut response_rx) = positioned_pending_with_receiver(10, 4);
         pending.request.sampling_indices = vec![9, 1, 5];
         pending.request.sampling_indptr = vec![0, 3];
-        pending.request.samplers = vec![
-            pie_bridge::Sampler::TopK {
+        pending.request.set_samplers(&[
+            pie_schema::Sampler::TopK {
                 temperature: 0.0,
                 k: 1,
             },
-            pie_bridge::Sampler::TopK {
+            pie_schema::Sampler::TopK {
                 temperature: 0.0,
                 k: 1,
             },
-            pie_bridge::Sampler::Entropy,
-        ];
+            pie_schema::Sampler::Entropy,
+        ]);
         pending.request.sampler_indptr = vec![0, 3];
 
         let first = match pending.maybe_start_chunking(limits(8, 4, 100), 4) {
@@ -1450,7 +1452,7 @@ mod tests {
         assert_reject(missing_position, 4, "one position per token");
 
         let mut bad_masks = positioned_pending(10, 4);
-        bad_masks.request.masks = vec![pie_bridge::Brle::all_true(1)];
+        bad_masks.request.masks = vec![pie_schema::Brle::all_true(1)];
         assert_reject(bad_masks, 4, "zero masks or one mask per token");
 
         let mut bad_sampler_count = positioned_pending(10, 4);
@@ -1459,10 +1461,10 @@ mod tests {
 
         let mut out_of_range_sampler = positioned_pending(10, 4);
         out_of_range_sampler.request.sampling_indices = vec![10];
-        out_of_range_sampler.request.samplers = vec![pie_bridge::Sampler::TopK {
+        out_of_range_sampler.request.set_samplers(&[pie_schema::Sampler::TopK {
             temperature: 0.0,
             k: 1,
-        }];
+        }]);
         assert_reject(out_of_range_sampler, 4, "outside the input window");
     }
 
@@ -1484,12 +1486,13 @@ mod tests {
         let mut pending = positioned_pending(10, 4);
         pending.request.sampling_indices = vec![4, 5, 6];
         pending.request.sampling_indptr = vec![0, 3];
-        pending.request.samplers = (0..3)
-            .map(|_| pie_bridge::Sampler::TopK {
+        let samplers: Vec<_> = (0..3)
+            .map(|_| pie_schema::Sampler::TopK {
                 temperature: 0.0,
                 k: 1,
             })
             .collect();
+        pending.request.set_samplers(&samplers);
         pending.request.sampler_indptr = vec![0, 3];
 
         let err = match pending.maybe_start_chunking(capped, 4) {
@@ -1748,7 +1751,7 @@ mod tests {
         let mut current = first;
         loop {
             current.send_result(
-                Ok(pie_bridge::ForwardResponse::default()),
+                Ok(pie_schema::ForwardResponse::default()),
                 Some(&weak_submit_tx),
                 4,
             );
@@ -1785,7 +1788,7 @@ mod tests {
         drop(submit_rx);
 
         chunked.send_result(
-            Ok(pie_bridge::ForwardResponse::default()),
+            Ok(pie_schema::ForwardResponse::default()),
             Some(&submit_tx),
             4,
         );
@@ -1802,7 +1805,7 @@ mod tests {
 
     #[test]
     fn chunk_response_accumulator_rejects_malformed_responses() {
-        let token_sampler = pie_bridge::Sampler::TopK {
+        let token_sampler = pie_schema::Sampler::TopK {
             temperature: 0.0,
             k: 1,
         };
@@ -1812,7 +1815,7 @@ mod tests {
             .record_response(
                 &[token_sampler.clone()],
                 &[0],
-                pie_bridge::ForwardResponse::default(),
+                pie_schema::ForwardResponse::default(),
             )
             .expect_err("missing token should fail");
         assert!(err.contains("missing token output"));
@@ -1835,12 +1838,12 @@ mod tests {
         let mut bad_nested = ChunkResponseAccumulator::new(1);
         let err = bad_nested
             .record_response(
-                &[pie_bridge::Sampler::Dist {
+                &[pie_schema::Sampler::Dist {
                     temperature: 1.0,
                     num_tokens: 2,
                 }],
                 &[0],
-                pie_bridge::ForwardResponse {
+                pie_schema::ForwardResponse {
                     num_requests: 1,
                     dists_req_indptr: vec![0, 1],
                     dists_kv_indptr: vec![0, 2],
@@ -1863,12 +1866,13 @@ mod tests {
             .map(|i| ((i * 257 + 13) % tokens) as u32)
             .collect();
         pending.request.sampling_indptr = vec![0, sample_count as u32];
-        pending.request.samplers = (0..sample_count)
-            .map(|_| pie_bridge::Sampler::TopK {
+        let samplers: Vec<_> = (0..sample_count)
+            .map(|_| pie_schema::Sampler::TopK {
                 temperature: 0.0,
                 k: 1,
             })
             .collect();
+        pending.request.set_samplers(&samplers);
         pending.request.sampler_indptr = vec![0, sample_count as u32];
 
         let first = match pending.maybe_start_chunking(limits(8, max_tokens, usize::MAX), 64) {
@@ -1906,23 +1910,23 @@ mod tests {
     #[test]
     fn chunk_response_accumulator_preserves_original_probe_sampler_order() {
         let original_samplers = vec![
-            pie_bridge::Sampler::RawLogits,
-            pie_bridge::Sampler::Dist {
+            pie_schema::Sampler::RawLogits,
+            pie_schema::Sampler::Dist {
                 temperature: 1.0,
                 num_tokens: 2,
             },
-            pie_bridge::Sampler::Logprobs {
+            pie_schema::Sampler::Logprobs {
                 token_ids: vec![7, 8],
             },
-            pie_bridge::Sampler::Logprob { token_id: 9 },
-            pie_bridge::Sampler::Entropy,
+            pie_schema::Sampler::Logprob { token_id: 9 },
+            pie_schema::Sampler::Entropy,
         ];
         let mut acc = ChunkResponseAccumulator::new(original_samplers.len());
 
         acc.record_response(
             &[original_samplers[1].clone(), original_samplers[3].clone()],
             &[1, 3],
-            pie_bridge::ForwardResponse {
+            pie_schema::ForwardResponse {
                 num_requests: 1,
                 dists_req_indptr: vec![0, 1],
                 dists_kv_indptr: vec![0, 2],
@@ -1943,7 +1947,7 @@ mod tests {
                 original_samplers[4].clone(),
             ],
             &[0, 2, 4],
-            pie_bridge::ForwardResponse {
+            pie_schema::ForwardResponse {
                 num_requests: 1,
                 logits_req_indptr: vec![0, 1],
                 logits_byte_indptr: vec![0, 4],
@@ -1979,7 +1983,7 @@ mod tests {
         let (tx, rx) = crossbeam::channel::unbounded();
         let weak_tx = tx.clone();
         chunked.send_result(
-            Ok(pie_bridge::ForwardResponse::default()),
+            Ok(pie_schema::ForwardResponse::default()),
             Some(&weak_tx),
             4,
         );

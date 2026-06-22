@@ -9,7 +9,7 @@
 #include <vector>
 
 #include <nlohmann/json.hpp>
-#include <pie_bridge/inproc_server.hpp>
+#include <pie_ipc/inproc_server.hpp>
 
 #include "executor/executor.hpp"
 #include "kv_cache.hpp"

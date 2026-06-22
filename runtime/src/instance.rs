@@ -25,7 +25,7 @@ pub enum OutputMode {
     Discard,
     /// Route to the per-process actor channel, drained by an attached client.
     Stream,
-    /// Route to pie-server's `tracing` log, tagged with `program`. Used by the
+    /// Route to pie-worker's `tracing` log, tagged with `program`. Used by the
     /// daemon request path, which serves HTTP directly and has no client to
     /// attach — without this, guest stderr falls through to the default sink.
     Log { program: String },

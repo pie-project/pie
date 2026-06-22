@@ -12,7 +12,7 @@ supported by ggml.
 The normal path is through the `pie` binary:
 
 ```bash
-cargo build -p pie-server --release
+cargo build -p pie-worker --release
 ```
 
 For driver-only development:

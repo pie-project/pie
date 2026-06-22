@@ -12,8 +12,8 @@
 #include <utility>
 #include <vector>
 
-#include "../../../weight_loader/include/weight_loader.h"
-#include "../../../weight_loader/include/weight_loader_cpp.hpp"
+#include "../../../weight-loader/include/weight_loader.h"
+#include "../../../weight-loader/include/weight_loader_cpp.hpp"
 #include "loader_config.hpp"
 #include "loader_helpers.hpp"
 #include "loader/dtype_map.hpp"

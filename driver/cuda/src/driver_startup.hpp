@@ -5,7 +5,7 @@
 //     every loaded server in the address space).
 //   - The shared `custom_all_reduce` payload sizing knob.
 //   - The TP-rank CPU rendezvous barrier — every TP rank is a thread in
-//     the same pie-server process, and they must reach the post-load
+//     the same pie-worker process, and they must reach the post-load
 //     point together before any rank publishes READY.
 
 #include <cstddef>
