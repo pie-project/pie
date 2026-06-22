@@ -6,6 +6,8 @@
 
 #include <mlx/mlx.h>
 
+#include "kv_cache.hpp"
+
 namespace pie_metal_driver::ops {
 
 namespace mx = mlx::core;
@@ -41,8 +43,7 @@ Tensor sdpa_contiguous(const Tensor& q, const Tensor& k, const Tensor& v,
     Tensor v4 = mx::expand_dims(mx::transpose(v, {1, 0, 2}), 0);
 
     Tensor o4 = mx::fast::scaled_dot_product_attention(
-        q4, k4, v4, scale, mask_mode,
-        mask.has_value() ? std::vector<Tensor>{*mask} : std::vector<Tensor>{});
+        q4, k4, v4, scale, mask_mode, mask);
 
     // [1, heads, L, d] -> [L, heads, d]
     return mx::transpose(mx::squeeze(o4, 0), {1, 0, 2});
@@ -184,6 +185,13 @@ Tensor paged_attention(const Tensor& q,
         return mx::zeros({0, q.shape(1), q.shape(2)}, q.dtype());
     }
     return mx::concatenate(outputs, 0);
+}
+
+Tensor paged_attention(const Tensor& q, const PagedKV& kv,
+                       const AttnParams& params) {
+    return paged_attention(q, kv.k_pages, kv.v_pages, kv.page_table,
+                           kv.qo_indptr, kv.kv_page_indptr, kv.last_page_lens,
+                           kv.page_size, params);
 }
 
 }  // namespace pie_metal_driver::ops
