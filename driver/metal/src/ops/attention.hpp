@@ -21,6 +21,12 @@
 
 #include "ops/tensor.hpp"
 
+namespace pie_metal_driver {
+// Defined in kv_cache.hpp (delta-owned). Forward-declared so this header stays
+// decoupled from the KV layout; the .cpp includes the full definition.
+struct PagedKV;
+}  // namespace pie_metal_driver
+
 namespace pie_metal_driver::ops {
 
 // Per-call attention parameters (beta-owned; these are op knobs, not KV
@@ -47,7 +53,7 @@ Tensor sdpa(const Tensor& q, const Tensor& k, const Tensor& v,
 // Paged-KV attention.
 //   q                : [n_total, n_heads, head_dim]  (token-major)
 //   k_cache, v_cache : paged buffers [n_pages, page_size, n_kv_heads, head_dim]
-//                      (final layout converges to delta's PagedKV struct).
+//                      (delta's PagedKV layout; see kv_cache.hpp).
 //   page_table       : [total_pages_in_batch] flat physical page indices
 //   kv_page_indptr   : [n_req + 1] CSR offsets into page_table per request
 //   qo_indptr        : [n_req + 1] CSR offsets into the query token axis
@@ -61,6 +67,12 @@ Tensor paged_attention(const Tensor& q,
                        const Tensor& kv_page_indptr,
                        const Tensor& last_page_lens,
                        int page_size,
+                       const AttnParams& params);
+
+// Convenience overload: identical op with the per-layer page buffers + CSR
+// metadata bundled in delta's `PagedKV` view (kv_cache.hpp). Forwards to the
+// explicit-tensor form above.
+Tensor paged_attention(const Tensor& q, const PagedKV& kv,
                        const AttnParams& params);
 
 }  // namespace pie_metal_driver::ops

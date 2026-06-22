@@ -19,9 +19,16 @@
 #include <optional>
 #include <vector>
 
-#include "ops/tensor.hpp"   // pie_metal_driver::Tensor = mlx::core::array (beta)
+#include "ops/tensor.hpp"   // pie_metal_driver::Tensor + ops::empty_tensor() (beta)
 
 namespace pie_metal_driver::model {
+
+// `mlx::core::array` has no default constructor, so structs holding a
+// non-optional `Tensor` aren't default-constructible — which `bind_*`'s
+// `ModelWeights w; w.layers.resize(n)` (and `std::vector` resize) require.
+// We default-init those members to beta's canonical `ops::empty_tensor()`
+// placeholder; every required tensor is overwritten by `bind_*` before any
+// forward runs.
 
 struct LayerWeights {
     // ── Norms ──
@@ -34,11 +41,13 @@ struct LayerWeights {
     std::optional<Tensor> post_attn_norm;   // Gemma2/3
     std::optional<Tensor> post_ffn_norm;    // Gemma2/3
 
-    // ── Attention projections (W[out,in], applied as W @ x) ──
-    Tensor q_proj;
-    Tensor k_proj;
-    Tensor v_proj;
-    Tensor o_proj;
+    // ── Attention projections (W[out,in]; linear(w,x) -> [n,out]) ──
+    // Default-initialized to a placeholder so the struct is default-
+    // constructible (MLX `array` has no default ctor); bind_* overwrites.
+    Tensor q_proj = ops::empty_tensor();
+    Tensor k_proj = ops::empty_tensor();
+    Tensor v_proj = ops::empty_tensor();
+    Tensor o_proj = ops::empty_tensor();
 
     // Optional additive QKV bias (Qwen2). Empty on Llama3 / Qwen3 / Mistral.
     std::optional<Tensor> q_bias;
@@ -64,8 +73,8 @@ struct LayerWeights {
 };
 
 struct ModelWeights {
-    Tensor                embed;        // [vocab, hidden]
-    Tensor                final_norm;   // [hidden]
+    Tensor                embed      = ops::empty_tensor();  // [vocab, hidden]
+    Tensor                final_norm = ops::empty_tensor();  // [hidden]
     std::optional<Tensor> lm_head;      // empty when tie_word_embeddings (use embed)
 
     // LLaMA-3.1 NTK-by-parts per-dim RoPE scaling, synthesized at load time.
