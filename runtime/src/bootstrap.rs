@@ -81,9 +81,9 @@ pub struct RuntimeConfig {
     /// linker binding is dropped entirely.
     pub allow_network: bool,
     /// Allowlist of `cidr[:port]` / `cidr:lo-hi`. `["*"]` = no
-    /// restriction. NOTE: only filters `wasi:sockets`; `wasi:http`
-    /// bypasses the per-socket hook. Set `allow_network = false` for
-    /// tight outbound HTTP control.
+    /// restriction. Applies to both `wasi:sockets` and outbound
+    /// `wasi:http`; restricted HTTP policies accept IP-literal authorities
+    /// only to avoid DNS time-of-check/time-of-use gaps.
     pub network_allowed_hosts: Vec<String>,
 
     // ── upload cap ───────────────────────────────────────────────────

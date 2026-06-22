@@ -51,9 +51,9 @@ wasm_warm_slots = 100
 # Filesystem. allow_fs = true mounts a per-process /scratch dir with full RW.
 allow_fs = false
 
-# Network. `network_allowed_hosts` filters wasi:sockets only — wasi:http
-# bypasses the per-socket hook (its host stack does its own DNS). Set
-# allow_network = false for tight outbound HTTP control.
+# Network. `network_allowed_hosts` filters wasi:sockets and outbound
+# wasi:http. Restricted HTTP policies accept IP-literal authorities only;
+# use ["*"] for legacy unrestricted host networking.
 allow_network = true
 network_allowed_hosts = ["*"]
 

@@ -146,6 +146,30 @@ impl NetworkPolicy {
             .iter()
             .any(|r| ip_in_cidr(ip, &r.cidr) && r.port.matches(port))
     }
+
+    /// Check an HTTP authority after applying the default HTTP(S) port.
+    ///
+    /// Unrestricted policies allow hostnames for legacy compatibility. Restricted
+    /// policies only accept IP-literal authorities and apply the same CIDR/port
+    /// rules used for wasi:sockets. Hostnames are denied in restricted mode to
+    /// avoid a DNS time-of-check/time-of-use gap before Wasmtime's HTTP client
+    /// opens the connection.
+    pub fn check_http_authority(&self, host: &str, port: u16) -> bool {
+        if !self.allow {
+            return false;
+        }
+        if self.unrestricted {
+            return true;
+        }
+        let host = host
+            .strip_prefix('[')
+            .and_then(|s| s.strip_suffix(']'))
+            .unwrap_or(host);
+        let Ok(ip) = host.parse::<IpAddr>() else {
+            return false;
+        };
+        self.check(&SocketAddr::new(ip, port))
+    }
 }
 
 /// `cidr` or `cidr:port` or `cidr:lo-hi`. A bare IP without `/<n>` is
@@ -237,6 +261,39 @@ mod tests {
 
     fn sa(s: &str) -> SocketAddr {
         s.parse().unwrap()
+    }
+
+    #[test]
+    fn http_authority_denied_when_disabled() {
+        let p = NetworkPolicy::parse(false, &[]).unwrap();
+        assert!(!p.check_http_authority("127.0.0.1", 80));
+    }
+
+    #[test]
+    fn http_authority_allows_unrestricted_hostname() {
+        let p = NetworkPolicy::parse(true, &["*".into()]).unwrap();
+        assert!(p.check_http_authority("example.com", 443));
+    }
+
+    #[test]
+    fn http_authority_checks_ip_literal_and_port() {
+        let p = NetworkPolicy::parse(true, &["127.0.0.1:443".into()]).unwrap();
+        assert!(p.check_http_authority("127.0.0.1", 443));
+        assert!(!p.check_http_authority("127.0.0.1", 80));
+        assert!(!p.check_http_authority("127.0.0.2", 443));
+    }
+
+    #[test]
+    fn http_authority_checks_bracketed_ipv6_literal() {
+        let p = NetworkPolicy::parse(true, &["[::1]:443".into()]).unwrap();
+        assert!(p.check_http_authority("[::1]", 443));
+        assert!(!p.check_http_authority("[::1]", 80));
+    }
+
+    #[test]
+    fn http_authority_denies_hostname_when_restricted() {
+        let p = NetworkPolicy::parse(true, &["127.0.0.1:443".into()]).unwrap();
+        assert!(!p.check_http_authority("localhost", 443));
     }
 
     #[test]
