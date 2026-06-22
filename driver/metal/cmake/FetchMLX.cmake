@@ -16,20 +16,27 @@ function(pie_metal_fetch_mlx target)
   # Pin a known-good MLX release. delta may bump this; keep it on a tag so
   # the shared CPM/FetchContent cache on the build host stays warm.
   #
-  # Pinned to v0.29.1 by team reconcile (see #mac): there is no MLX 0.32
-  # (latest on GitHub tags AND PyPI is 0.31.2). beta re-validated the whole
-  # ops/executor/kernels stream against v0.29.1 and is green on it — the
-  # only two API deltas vs newer MLX (SDPA mask arg type; zero-copy array
-  # ctor) are handled on the 0.29.1 side. Keep this matched to beta's
-  # validated target so ops type-check against the same API at real compile.
-  set(PIE_MLX_GIT_TAG "v0.29.1" CACHE STRING "MLX git tag to fetch")
+  # Pinned to v0.31.2 by @ingim ruling (see #mac): the real latest MLX
+  # (no 0.32 exists on GitHub tags or PyPI). beta/charlie/delta validate
+  # their ops against this same tag so the API matches at real compile.
+  set(PIE_MLX_GIT_TAG "v0.31.2" CACHE STRING "MLX git tag to fetch")
 
   # MLX builds its own Metal kernels; keep tests/examples/python off.
   set(MLX_BUILD_TESTS OFF CACHE BOOL "" FORCE)
   set(MLX_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
   set(MLX_BUILD_BENCHMARKS OFF CACHE BOOL "" FORCE)
   set(MLX_BUILD_PYTHON_BINDINGS OFF CACHE BOOL "" FORCE)
-  set(MLX_BUILD_METAL ON CACHE BOOL "" FORCE)
+
+  # Metal GPU backend. Compiling MLX's Metal kernels requires the `metal`
+  # shader compiler, which ships ONLY with full Xcode (or the standalone
+  # Metal Toolchain) — NOT the Command Line Tools. On a CLT-only host
+  # (`xcrun -find metal` fails), set PIE_METAL_MLX_BUILD_METAL=OFF to build
+  # MLX CPU-only (its `no_metal` backend stubs the GPU symbols so the whole
+  # driver still compiles+links against the real MLX v0.29.1 API surface —
+  # GPU execution then requires installing the Metal Toolchain). Defaults ON
+  # for real GPU builds on a fully-provisioned host.
+  option(PIE_METAL_MLX_BUILD_METAL "Build MLX's Metal GPU backend (needs xcrun metal)" ON)
+  set(MLX_BUILD_METAL ${PIE_METAL_MLX_BUILD_METAL} CACHE BOOL "" FORCE)
 
   FetchContent_Declare(
     mlx
