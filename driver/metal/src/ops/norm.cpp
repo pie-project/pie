@@ -15,7 +15,7 @@ Tensor rms_norm(const Tensor& x, const Tensor& weight, float eps,
     // (the loader stores the raw weight). When plus_one is false the weight
     // is used verbatim (Llama/Qwen).
     if (plus_one) {
-        Tensor w1 = mx::add(weight, 1.0f);
+        Tensor w1 = mx::add(weight, mx::array(1.0f));
         return mx::fast::rms_norm(x, std::optional<Tensor>(w1), eps);
     }
     return mx::fast::rms_norm(x, std::optional<Tensor>(weight), eps);

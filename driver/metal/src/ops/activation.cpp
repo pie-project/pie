@@ -18,13 +18,12 @@ Tensor gelu(const Tensor& x, bool tanh_approx) {
         // 0.5 * x * (1 + tanh( sqrt(2/pi) * (x + 0.044715 * x^3) ))
         const float k = 0.7978845608028654f;  // sqrt(2/pi)
         Tensor x3 = mx::multiply(mx::multiply(x, x), x);
-        Tensor inner = mx::multiply(mx::add(x, mx::multiply(0.044715f, x3)), k);
-        return mx::multiply(mx::multiply(0.5f, x), mx::add(1.0f, mx::tanh(inner)));
+        Tensor inner = mx::add(x, x3 * 0.044715f) * k;
+        return mx::multiply(x * 0.5f, mx::tanh(inner) + 1.0f);
     }
     // exact: 0.5 * x * (1 + erf(x / sqrt(2)))
     const float inv_sqrt2 = 0.7071067811865476f;
-    return mx::multiply(mx::multiply(0.5f, x),
-                        mx::add(1.0f, mx::erf(mx::multiply(x, inv_sqrt2))));
+    return mx::multiply(x * 0.5f, mx::erf(x * inv_sqrt2) + 1.0f);
 }
 
 Tensor swiglu(const Tensor& gate, const Tensor& up) {

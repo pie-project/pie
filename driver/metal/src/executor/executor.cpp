@@ -96,20 +96,22 @@ void Executor::run_forward(const pie_driver::PieForwardRequestView& req,
     copy_u32(req.qo_indptr, stg_.qo_indptr);
     compute_write_indices(req);
 
-    // ── stage: build the ForwardBatch ──
-    model::ForwardBatch batch;
-    batch.token_ids        = i32_view(stg_.token_ids);
-    batch.positions        = i32_view(stg_.positions);
-    batch.logit_rows       = i32_view(stg_.logit_rows);
-    batch.kv_page_indices  = i32_view(stg_.kv_page_indices);
-    batch.kv_page_indptr   = i32_view(stg_.kv_page_indptr);
-    batch.kv_last_page_lens = i32_view(stg_.kv_last_page_lens);
-    batch.qo_indptr        = i32_view(stg_.qo_indptr);
-    batch.kv_write_indices = i32_view(stg_.kv_write_indices);
-    batch.n_total      = n_total;
-    batch.n_requests   = n_req;
-    batch.n_slots      = n_slots;
-    batch.pure_decode  = req.single_token_mode != 0;
+    // ── stage: build the ForwardBatch (aggregate-init; Tensor has no
+    // default ctor so every field must be provided up front) ──
+    model::ForwardBatch batch{
+        /*token_ids=*/        i32_view(stg_.token_ids),
+        /*positions=*/        i32_view(stg_.positions),
+        /*logit_rows=*/       i32_view(stg_.logit_rows),
+        /*kv_page_indices=*/  i32_view(stg_.kv_page_indices),
+        /*kv_page_indptr=*/   i32_view(stg_.kv_page_indptr),
+        /*kv_last_page_lens=*/i32_view(stg_.kv_last_page_lens),
+        /*qo_indptr=*/        i32_view(stg_.qo_indptr),
+        /*kv_write_indices=*/ i32_view(stg_.kv_write_indices),
+        /*n_total=*/          n_total,
+        /*n_requests=*/       n_req,
+        /*n_slots=*/          n_slots,
+        /*pure_decode=*/      req.single_token_mode != 0,
+    };
 
     // ── forward + sample ──
     per_req_.assign(n_req > 0 ? n_req : 0, pie_driver::PerRequestOutput{});
