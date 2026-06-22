@@ -26,7 +26,8 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow};
 
 use crate::config::{
-    CudaMemoryProfile, CudaNativeDriverOptions, DummyDriverOptions, PortableDriverOptions,
+    CudaMemoryProfile, CudaNativeDriverOptions, DummyDriverOptions, MetalDriverOptions,
+    PortableDriverOptions,
 };
 use crate::driver_ffi::{self, Flavor};
 
@@ -78,6 +79,8 @@ pub enum DriverOptions {
     Portable(PortableDriverOptions),
     #[cfg(feature = "driver-cuda")]
     CudaNative(CudaNativeDriverOptions),
+    #[cfg(feature = "driver-metal")]
+    Metal(MetalDriverOptions),
     Dummy {
         opts: DummyDriverOptions,
         random_seed: u64,
@@ -93,6 +96,8 @@ impl DriverOptions {
             DriverOptions::Portable(_) => Flavor::Portable,
             #[cfg(feature = "driver-cuda")]
             DriverOptions::CudaNative(_) => Flavor::Cuda,
+            #[cfg(feature = "driver-metal")]
+            DriverOptions::Metal(_) => Flavor::Metal,
             DriverOptions::Dummy { .. } => Flavor::Dummy,
         }
     }
@@ -104,6 +109,8 @@ fn ready_timeout(options: &DriverOptions) -> Duration {
         DriverOptions::Portable(p) => p.ready_timeout_s,
         #[cfg(feature = "driver-cuda")]
         DriverOptions::CudaNative(opts) => opts.ready_timeout_s,
+        #[cfg(feature = "driver-metal")]
+        DriverOptions::Metal(opts) => opts.ready_timeout_s,
         DriverOptions::Dummy { opts, .. } => opts.ready_timeout_s,
     };
     Duration::from_secs_f64(ready_timeout_s.max(1.0))
@@ -357,7 +364,52 @@ pub fn write_startup_toml(
     write_toml_table(out_path, doc)
 }
 
-/// Read model facts out of `<snapshot>/config.json`.
+/// Write the metal driver's startup TOML, mirroring the portable layout
+/// (`[model]` + `[batching]` + `[runtime]`) consumed by
+/// `driver/metal/src/config.hpp`. The metal driver speaks the same
+/// embedded in-process ABI as portable, so the launch state is identical
+/// apart from the `metal:N` backend selector.
+#[cfg(feature = "driver-metal")]
+pub fn write_metal_startup_toml(
+    out_path: &Path,
+    options: &MetalDriverOptions,
+    snapshot_dir: &Path,
+    _group_id: usize,
+) -> Result<()> {
+    let mut doc = toml::Table::new();
+
+    let mut model = toml::Table::new();
+    insert_str(&mut model, "hf_path", path_string(snapshot_dir));
+    insert_str(&mut model, "backend", &options.device);
+    insert_table(&mut doc, "model", model);
+
+    let mut batching = toml::Table::new();
+    insert_int(&mut batching, "kv_page_size", options.kv_page_size);
+    insert_int(&mut batching, "total_pages", options.total_pages);
+    insert_int(
+        &mut batching,
+        "max_forward_tokens",
+        options.max_forward_tokens,
+    );
+    insert_int(
+        &mut batching,
+        "max_forward_requests",
+        options.max_forward_requests,
+    );
+    insert_int(&mut batching, "cpu_pages", options.cpu_pages);
+    insert_str(
+        &mut batching,
+        "kv_cache_dtype",
+        options.kv_cache_dtype.clone(),
+    );
+    insert_table(&mut doc, "batching", batching);
+
+    let mut runtime = toml::Table::new();
+    insert_bool(&mut runtime, "verbose", options.verbose);
+    insert_table(&mut doc, "runtime", runtime);
+
+    write_toml_table(out_path, doc)
+}
 /// Used by [`write_dummy_startup_toml`] when the user didn't explicitly
 /// specify them in `[model.driver.options]`. Mirrors the legacy Python
 /// dummy driver's `hf_utils.load_hf_config()`-based discovery.
@@ -752,6 +804,10 @@ impl EmbeddedDriver {
             DriverOptions::CudaNative(opts) => {
                 write_cuda_startup_toml(&toml_path, opts, snapshot_dir, group_id, tp.as_ref())?;
             }
+            #[cfg(feature = "driver-metal")]
+            DriverOptions::Metal(opts) => {
+                write_metal_startup_toml(&toml_path, opts, snapshot_dir, group_id)?;
+            }
             DriverOptions::Dummy {
                 opts,
                 random_seed,
@@ -803,6 +859,8 @@ impl EmbeddedDriver {
             Flavor::Cuda => true,
             #[cfg(feature = "driver-portable")]
             Flavor::Portable => true,
+            #[cfg(feature = "driver-metal")]
+            Flavor::Metal => true,
             _ => false,
         };
         if uses_inproc {

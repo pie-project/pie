@@ -503,6 +503,17 @@ impl DriverConfig {
                         )
                     })?;
             }
+            DriverKind::Metal => {
+                let opts: MetalDriverOptions = toml::Value::Table(self.options.clone())
+                    .try_into()
+                    .map_err(|e| {
+                        anyhow::anyhow!(
+                            "invalid [model.driver.options] for driver type {:?}: {e}",
+                            self.kind,
+                        )
+                    })?;
+                validate_kv_cache_dtype(&opts.kv_cache_dtype)?;
+            }
         }
         Ok(())
     }
@@ -564,6 +575,9 @@ pub enum DriverKind {
     /// Rust dummy driver — random tokens, no model load. Always
     /// embedded in `pie-worker`.
     Dummy,
+    /// Native MLX + Metal driver for Apple Silicon — embedded as a static
+    /// lib in `pie-worker` (requires `--features driver-metal`, macOS only).
+    Metal,
 }
 
 impl DriverKind {
@@ -572,6 +586,7 @@ impl DriverKind {
             DriverKind::Portable => "portable",
             DriverKind::CudaNative => "cuda_native",
             DriverKind::Dummy => "dummy",
+            DriverKind::Metal => "metal",
         }
     }
 }
@@ -659,6 +674,49 @@ impl Default for PortableDriverOptions {
             cpu_pages: 0,
             kv_cache_dtype: "auto".to_string(),
             device: "auto".to_string(),
+            verbose: false,
+            ready_timeout_s: 120.0,
+            shutdown_timeout_s: 5.0,
+            binary_path: String::new(),
+        }
+    }
+}
+
+/// `[model.driver.options]` for `type = "metal"` (Apple Silicon MLX/Metal
+/// driver). Mirrors `PortableDriverOptions` — page geometry, forward
+/// limits, and timeouts — since the metal driver speaks the same embedded
+/// in-process ABI. `device` is the `metal:N` selector filled from
+/// `model.driver.device`.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct MetalDriverOptions {
+    pub kv_page_size: u32,
+    pub total_pages: u32,
+    pub max_forward_tokens: u32,
+    pub max_forward_requests: u32,
+    pub cpu_pages: u32,
+    pub kv_cache_dtype: String,
+    #[serde(skip)]
+    pub device: String,
+    #[serde(skip)]
+    pub verbose: bool,
+    pub ready_timeout_s: f64,
+    pub shutdown_timeout_s: f64,
+    /// Accepted for config compatibility; ignored (the metal driver is a
+    /// statically-linked lib, no separate executable to discover).
+    pub binary_path: String,
+}
+
+impl Default for MetalDriverOptions {
+    fn default() -> Self {
+        Self {
+            kv_page_size: 32,
+            total_pages: 1024,
+            max_forward_tokens: 10240,
+            max_forward_requests: 512,
+            cpu_pages: 0,
+            kv_cache_dtype: "auto".to_string(),
+            device: "metal:0".to_string(),
             verbose: false,
             ready_timeout_s: 120.0,
             shutdown_timeout_s: 5.0,

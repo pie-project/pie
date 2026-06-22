@@ -14,6 +14,8 @@ pub fn default_config_content() -> String {
         Some(Flavor::Portable) => PORTABLE_DRIVER_BLOCK,
         #[cfg(feature = "driver-cuda")]
         Some(Flavor::Cuda) => CUDA_DRIVER_BLOCK,
+        #[cfg(feature = "driver-metal")]
+        Some(Flavor::Metal) => METAL_DRIVER_BLOCK,
         Some(Flavor::Dummy) => DUMMY_DRIVER_BLOCK,
         // default_flavor always returns Some because dummy is linked
         // unconditionally. Keep this fallback for exhaustiveness.
@@ -112,6 +114,20 @@ kv_cache_dtype = "auto"
 # `-assistant` checkpoint when one is available.
 # mtp_assistant_snapshot_dir = "/path/to/gemma4_assistant"
 mtp_num_drafts = 3
+"#;
+
+#[cfg(feature = "driver-metal")]
+const METAL_DRIVER_BLOCK: &str = r#"
+[model.driver]
+type = "metal"
+device = ["metal:0"]
+activation_dtype = "bfloat16"
+ipc_profile = "balanced" # "latency", "balanced", or "power"
+
+[model.driver.options]
+max_forward_tokens = 10240
+max_forward_requests = 512
+kv_cache_dtype = "auto"
 "#;
 
 const DUMMY_DRIVER_BLOCK: &str = r#"

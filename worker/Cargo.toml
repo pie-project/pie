@@ -29,6 +29,7 @@ path = "src/main.rs"
 default = ["driver-portable"]
 driver-portable = ["dep:pie-weight-loader"]
 driver-cuda = ["dep:pie-weight-loader"]
+driver-metal = ["dep:pie-weight-loader"]
 driver-dummy = []
 
 # Per-domain probe passthroughs. Each forwards to the runtime crate's
