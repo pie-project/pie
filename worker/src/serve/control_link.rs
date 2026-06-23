@@ -1,11 +1,11 @@
-//! Worker control-plane **seam**: the [`WorkerControl`] trait the worker's
+//! Worker control-plane **seam**: the [`ControlLink`] trait the worker's
 //! register + heartbeat/report/watch loops run against, plus the distributed
 //! [`pie_control::ControlClient`] implementation.
 //!
 //! The seam is what keeps `pie-worker` depending only on the *contract*
 //! (`pie-control`) and never on the controller *implementation* (`pie-controller`):
 //!
-//! - **distributed** (always linked): [`WorkerControl`] for [`ControlClient`]
+//! - **distributed** (always linked): [`ControlLink`] for [`ControlClient`]
 //!   dials the standalone controller over tarpc; [`neighbors_watch`] spawns the
 //!   `watch_worker` long-poll loop and republishes each view into a local
 //!   `watch` channel.
@@ -49,7 +49,7 @@ const WATCH_RETRY_BACKOFF: Duration = Duration::from_secs(1);
 ///
 /// Mirrors the relevant `pie_control::Control` calls minus the tarpc context.
 /// `Clone` so each of the three loops can hold its own cheap copy.
-pub trait WorkerControl: Clone + Send + Sync + 'static {
+pub trait ControlLink: Clone + Send + Sync + 'static {
     /// Register this worker; returns its controller-minted [`WorkerId`].
     fn register_worker(&self, info: WorkerInfo) -> impl Future<Output = Result<WorkerId>> + Send;
 
@@ -71,7 +71,7 @@ pub trait WorkerControl: Clone + Send + Sync + 'static {
     fn neighbors_watch(&self, id: WorkerId) -> watch::Receiver<Neighbors>;
 }
 
-impl WorkerControl for ControlClient {
+impl ControlLink for ControlClient {
     async fn register_worker(&self, info: WorkerInfo) -> Result<WorkerId> {
         // The inherent (tarpc-generated) method shadows the trait method for
         // method-call syntax, so this dispatches to the RPC, not back into us.
@@ -166,8 +166,8 @@ pub async fn dial_controller(addr: &str) -> Result<ControlClient> {
 ///   an [`Ack::ReRegister`].
 /// - **report** coarse load every [`REPORT_INTERVAL`].
 /// - **watch** the neighbor view: read-before-wait over the
-///   [`WorkerControl::neighbors_watch`] receiver (full snapshots, coalesced).
-pub fn spawn_control_tasks<C: WorkerControl>(
+///   [`ControlLink::neighbors_watch`] receiver (full snapshots, coalesced).
+pub fn spawn_control_tasks<C: ControlLink>(
     ctrl: C,
     worker_id: WorkerId,
 ) -> Vec<tokio::task::JoinHandle<()>> {

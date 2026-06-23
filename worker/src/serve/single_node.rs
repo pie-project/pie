@@ -18,7 +18,7 @@
 //!
 //! A single [`pie_controller::embed`] yields a cloneable `Handle`; the
 //! [`EmbeddedControl`] newtype wraps it and implements both the worker-side
-//! [`WorkerControl`] and the gateway-side [`pie_gateway::GatewayControl`] seams
+//! [`ControlLink`] and the gateway-side [`pie_gateway::GatewayControl`] seams
 //! against the in-proc calls (registration is infallible in-proc; watches return
 //! the controller's `watch::Receiver` directly, no epoch long-poll).
 
@@ -32,7 +32,7 @@ use pie_schema::control::{
 };
 use tokio::sync::watch;
 
-use super::control::{self, WorkerControl};
+use super::control_link::{self, ControlLink};
 use super::{ControlPlane, EdgeServer, edge_session};
 use crate::config;
 use crate::embedded_driver::DriverCapabilities;
@@ -43,7 +43,7 @@ use crate::embedded_driver::DriverCapabilities;
 #[derive(Clone)]
 struct EmbeddedControl(pie_controller::Handle);
 
-impl WorkerControl for EmbeddedControl {
+impl ControlLink for EmbeddedControl {
     async fn register_worker(&self, info: WorkerInfo) -> Result<WorkerId> {
         Ok(self.0.register_worker(info).await)
     }
@@ -122,10 +122,10 @@ pub(super) async fn assemble(
         addr: worker_addr,
         capability: caps,
     };
-    let worker_id = WorkerControl::register_worker(&embedded, info)
+    let worker_id = ControlLink::register_worker(&embedded, info)
         .await
         .context("registering worker with in-proc controller")?;
-    let control_tasks = control::spawn_control_tasks(embedded.clone(), worker_id);
+    let control_tasks = control_link::spawn_control_tasks(embedded.clone(), worker_id);
 
     // 4. Run the gateway in-proc: it serves the client WebSocket on the user's
     //    host:port and routes each session to the worker's loopback edge-rpc,

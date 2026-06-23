@@ -28,11 +28,11 @@ use crate::config;
 use crate::driver_ffi::Flavor;
 use crate::embedded_driver::{DriverCapabilities, DriverOptions, EmbeddedDriver};
 use crate::hf;
-use control::WorkerControl;
+use control_link::ControlLink;
 
 #[cfg(not(feature = "single-node"))]
 mod client_server;
-mod control;
+mod control_link;
 pub mod coordination;
 mod edge_session;
 mod lifecycle;
@@ -524,7 +524,7 @@ async fn assemble_control_and_edge(
                     .await
                     .context("starting worker edge-rpc server")?,
             );
-            let client = control::dial_controller(&controller)
+            let client = control_link::dial_controller(&controller)
                 .await
                 .with_context(|| format!("dialing controller at {controller}"))?;
             let info = WorkerInfo {
@@ -533,10 +533,10 @@ async fn assemble_control_and_edge(
                 addr: endpoint,
                 capability: caps,
             };
-            let worker_id = WorkerControl::register_worker(&client, info)
+            let worker_id = ControlLink::register_worker(&client, info)
                 .await
                 .context("registering worker with controller")?;
-            let control_tasks = control::spawn_control_tasks(client.clone(), worker_id);
+            let control_tasks = control_link::spawn_control_tasks(client.clone(), worker_id);
             let url = edge.url();
             Ok((
                 edge,
