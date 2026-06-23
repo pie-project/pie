@@ -53,6 +53,10 @@ struct ModelFacts {
     std::uint32_t vocab_size = 32000;
     std::uint32_t max_model_len = 8192;
     std::string arch_name = "llama";
+    // True for hybrid linear-attention archs (qwen3.6 / qwen3_next): they need a
+    // recurrent-state slot pool (rs_cache) advertised so the runtime allocates
+    // per-request rs_slot_ids. Detected from config.json (incl. text_config).
+    bool has_linear_attn = false;
 };
 
 ModelFacts read_model_facts(const std::string& hf_path) {
@@ -83,6 +87,26 @@ ModelFacts read_model_facts(const std::string& hf_path) {
             }
             if (!a.empty()) facts.arch_name = a;
         }
+        // Hybrid linear-attention detection (qwen3.6 / qwen3_next). Config keys
+        // live under `text_config` on multimodal-style dumps, else at the root.
+        const nlohmann::json& tc =
+            (j.contains("text_config") && j["text_config"].is_object())
+                ? j["text_config"]
+                : j;
+        if (tc.contains("linear_num_value_heads") &&
+            tc["linear_num_value_heads"].is_number_integer() &&
+            tc["linear_num_value_heads"].get<int>() > 0) {
+            facts.has_linear_attn = true;
+        }
+        if (tc.contains("layer_types") && tc["layer_types"].is_array()) {
+            for (const auto& t : tc["layer_types"]) {
+                if (t.is_string() &&
+                    t.get<std::string>() == "linear_attention") {
+                    facts.has_linear_attn = true;
+                    break;
+                }
+            }
+        }
     } catch (const std::exception& e) {
         std::cerr << "[pie-driver-metal] warning: failed to parse "
                   << cfg.string() << ": " << e.what() << "\n";
@@ -93,12 +117,25 @@ ModelFacts read_model_facts(const std::string& hf_path) {
 std::string build_caps_json(const pie_metal_driver::Config& cfg,
                             const ModelFacts& facts) {
     const std::uint32_t total_pages = cfg.batching.total_pages;
+    // Hybrid linear-attention archs (qwen3.6) need a recurrent-state slot pool:
+    // delta's LinearStateCache is sized to max_forward_requests, so advertise
+    // that many rs_cache slots and clamp max_forward_requests to it (mirrors the
+    // cuda driver). The runtime then allocates per-request rs_slot_ids in range.
+    const bool rs_cache_required = facts.has_linear_attn;
+    const std::uint32_t rs_cache_slots =
+        rs_cache_required ? cfg.batching.max_forward_requests : 0u;
+    const std::uint32_t max_forward_requests =
+        rs_cache_required
+            ? std::min(cfg.batching.max_forward_requests, rs_cache_slots)
+            : cfg.batching.max_forward_requests;
     nlohmann::json caps = {
         {"total_pages", total_pages},
         {"kv_page_size", cfg.batching.kv_page_size},
         {"swap_pool_size", cfg.batching.cpu_pages},
         {"max_forward_tokens", cfg.batching.max_forward_tokens},
-        {"max_forward_requests", cfg.batching.max_forward_requests},
+        {"max_forward_requests", max_forward_requests},
+        {"rs_cache_required", rs_cache_required},
+        {"rs_cache_slots", rs_cache_slots},
         {"max_page_refs", total_pages},
         {"max_logit_rows", UINT32_MAX},
         {"max_prob_rows", UINT32_MAX},
