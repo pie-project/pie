@@ -97,6 +97,8 @@ Where `mu` is the expected steps to finish, `cv2` is the squared coefficient of 
 
 You do not need to read this formula to use Pie. It says: bid more when you have more credit, when more dividend is coming, and when fewer pages are at stake; bid less when many pages are at stake or when the horizon is long.
 
+The SDK refreshes this bid before every decode step by default. Throughput-oriented single-tenant loops can disable that refresh with `rebid_each_step(false)` / `rebidEachStep(false)` after the initial bid has been set.
+
 ## Override the bid
 
 Two ways to influence the bid.

@@ -100,6 +100,7 @@ class FakeContext:
         self._cursor: int = 0
         self._committed_pages: int = 0
         self._tokens_per_page_val: int = 64
+        self._bid: float = 0.0
 
     @classmethod
     def create(cls, model):
@@ -151,6 +152,9 @@ class FakeContext:
 
     def truncate_working_page_tokens(self, num_tokens):
         self._cursor = max(0, self._cursor - num_tokens)
+
+    def bid(self, value):
+        self._bid = value
 
     def __enter__(self):
         return self

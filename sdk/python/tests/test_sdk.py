@@ -279,10 +279,58 @@ class TestGenerator:
             ctx.generate(Sampler.argmax(), auto_flush=False)
             .max_tokens(128)
             .horizon(256)
+            .rebid_each_step(False)
         )
         assert isinstance(g, Generator)
         assert g._max_tokens == 128
         assert g._horizon == 256
+        assert g._rebid_each_step is False
+
+    def test_generator_rebids_each_step_by_default(self):
+        import asyncio
+        from inferlet import Context, Model, Sampler
+
+        class _RecordingHandle:
+            def __init__(self, inner):
+                self._inner = inner
+                self.bids: list[float] = []
+
+            def bid(self, value: float) -> None:
+                self.bids.append(value)
+
+            def __getattr__(self, name):
+                return getattr(self._inner, name)
+
+        ctx = Context(Model.load("test-model"))
+        ctx._handle = _RecordingHandle(ctx._handle)
+        g = ctx.generate(Sampler.argmax(), auto_flush=False)
+
+        assert len(ctx._handle.bids) == 1
+        asyncio.run(g.__anext__())
+        assert len(ctx._handle.bids) == 2
+
+    def test_generator_can_disable_step_rebids(self):
+        import asyncio
+        from inferlet import Context, Model, Sampler
+
+        class _RecordingHandle:
+            def __init__(self, inner):
+                self._inner = inner
+                self.bids: list[float] = []
+
+            def bid(self, value: float) -> None:
+                self.bids.append(value)
+
+            def __getattr__(self, name):
+                return getattr(self._inner, name)
+
+        ctx = Context(Model.load("test-model"))
+        ctx._handle = _RecordingHandle(ctx._handle)
+        g = ctx.generate(Sampler.argmax(), auto_flush=False, rebid_each_step=False)
+
+        assert len(ctx._handle.bids) == 1
+        asyncio.run(g.__anext__())
+        assert len(ctx._handle.bids) == 1
 
     def test_constrain_with_schema(self):
         from inferlet import (

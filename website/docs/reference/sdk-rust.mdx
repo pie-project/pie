@@ -196,6 +196,7 @@ let g = ctx.generate(Sampler::TopP { temperature: 0.6, p: 0.95 })
 | `.adapter(&a)` | Apply a LoRA adapter. |
 | `.zo_seed(seed: i64)` | Set an Evolution Strategies seed for every step. |
 | `.horizon(n)` | Hint expected output length for bid planning. |
+| `.rebid_each_step(enabled)` | Enable or disable per-step scheduler bid refresh. |
 | `.probe_each_step(idx, p)` | Attach a probe to every step (returns a handle). |
 
 ### Inspection

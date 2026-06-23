@@ -38,6 +38,7 @@ from wit_world.imports import zo as _zo
 from wit_world.imports.inference import SlotOutput_Token
 
 from . import chat as _chat
+from . import scheduling as _sched
 from ._async import await_future
 from .forward import Output, ProbeHandle, SampleHandle, _probe_kind
 from .grammar import (
@@ -64,6 +65,21 @@ def _sampler_is_argmax(sampler: Any) -> bool:
         return False
     temperature, _ = value
     return float(temperature) == 0.0
+
+
+def _compute_bid(
+    balance: float,
+    pages: float,
+    mu: float,
+    cv2: float,
+    page_size: float,
+    dividend: float,
+) -> float:
+    """Budget-exhausting bid formula (matches Rust SDK)."""
+    mu = max(mu, 1.0)
+    numerator = balance / mu + dividend
+    denominator = pages + mu * (1.0 + cv2) / (2.0 * page_size)
+    return numerator / denominator if denominator > 0 else numerator
 
 
 # =============================================================================
@@ -112,6 +128,7 @@ class Generator:
         "_zo_seed",
         "_step_probes",
         "_tokens_generated",
+        "_rebid_each_step",
         "_done",
     )
 
@@ -129,6 +146,7 @@ class Generator:
         adapter: Adapter | None = None,
         zo_seed: int | None = None,
         horizon: int | None = None,
+        rebid_each_step: bool = True,
     ) -> None:
         self._ctx = ctx
         self._sampler = sampler
@@ -141,6 +159,7 @@ class Generator:
         self._zo_seed = zo_seed
         self._step_probes: list[tuple[int, Any]] = []  # (index, probe)
         self._tokens_generated = 0
+        self._rebid_each_step = rebid_each_step
         self._done = False
 
         # Constraints — accept Schema, Constraint, or list of either.
@@ -167,6 +186,7 @@ class Generator:
         # Cache for next-iter system drafts (populated each step from
         # the WIT output's spec channel when system speculation is on).
         self._spec_drafts: tuple[list[int], list[int]] = ([], [])
+        self._prime_bid()
 
     def _add_constraint(self, c: Schema | Constraint) -> None:
         if hasattr(c, "build_constraint"):
@@ -213,6 +233,12 @@ class Generator:
         self._horizon = n
         return self
 
+    def rebid_each_step(self, enabled: bool) -> Generator:
+        """Control whether the generator refreshes its scheduler bid before
+        every decode step."""
+        self._rebid_each_step = enabled
+        return self
+
     def adapter(self, a: Adapter) -> Generator:
         """Apply an adapter (LoRA etc.) on every forward pass."""
         self._adapter = a
@@ -253,6 +279,9 @@ class Generator:
         if self.is_done:
             raise StopAsyncIteration
 
+        if self._rebid_each_step:
+            self._recompute_bid()
+
         # Drain context buffer (filled by `system / user / cue / ...`).
         pending = self._ctx._pending_tokens
         self._ctx._pending_tokens = []
@@ -283,6 +312,36 @@ class Generator:
             list(draft_positions),
             mask,
         )
+
+    def _prime_bid(self) -> None:
+        balance = _sched.balance(self._ctx._model)
+        dividend = _sched.dividend(self._ctx._model)
+        pages = max(1.0, float(self._ctx._committed_pages + self._ctx._working_pages))
+        self._ctx.set_bid(
+            _compute_bid(
+                balance,
+                pages,
+                4096.0,
+                1.0,
+                float(self._ctx._page_size),
+                dividend,
+            )
+        )
+
+    def _recompute_bid(self) -> None:
+        balance = _sched.balance(self._ctx._model)
+        dividend = _sched.dividend(self._ctx._model)
+        pages = float(self._ctx._committed_pages + self._ctx._working_pages)
+        page_size = float(self._ctx._page_size)
+
+        if self._horizon is not None:
+            mu, cv2 = max(self._horizon - self._tokens_generated, 1), 0.0
+        elif self._max_tokens is not None:
+            mu, cv2 = max(self._max_tokens - self._tokens_generated, 1), 1.0
+        else:
+            mu, cv2 = max(self._tokens_generated, 64), 1.0
+
+        self._ctx.set_bid(_compute_bid(balance, pages, mu, cv2, page_size, dividend))
 
     # ── User-sampled mode ────────────────────────────────────────────
 

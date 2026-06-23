@@ -157,6 +157,7 @@ const g = ctx.generate(Sampler.topP(0.6, 0.95), { maxTokens: 256 });
 | `adapter` | `Adapter` | LoRA adapter to apply. |
 | `zoSeed` | `number` | Evolution Strategies seed for every forward pass. |
 | `horizon` | `number` | Hint expected output length. |
+| `rebidEachStep` | `boolean` | Refresh the scheduler bid before every decode step. Default `true`. |
 | `autoFlush` | `boolean` | When `true` (default), append `cue()` to the buffer before returning the Generator and use chat-template stop tokens by default. |
 
 `speculator` and `systemSpeculation` are mutually exclusive.
@@ -170,6 +171,7 @@ const g = ctx.generate(Sampler.topP(0.6, 0.95), { maxTokens: 256 });
 | `g.addStop(tokens): this` | Append to the stop set. |
 | `g.constrain(c): this` | Add a constraint. |
 | `g.horizon(n): this` | Hint expected output length. |
+| `g.rebidEachStep(enabled): this` | Enable or disable per-step scheduler bid refresh. |
 | `g.adapter(a): this` | Apply an adapter. |
 | `g.zoSeed(seed): this` | Set an Evolution Strategies seed for every step. |
 | `g.probeEachStep(idx, probe): ProbeHandle` | Attach a probe at `idx` on every step. |
