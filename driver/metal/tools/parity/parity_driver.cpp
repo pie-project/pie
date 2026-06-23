@@ -62,6 +62,16 @@ int main(int argc, char** argv) {
               << ", n_tokens = " << ids.size() << "\n";
 
     BatchingConfig batching;  // defaults: page=32, total_pages=1024
+    // Long-context (perplexity) windows: size one KV page to the whole sequence
+    // (the prefill/decode paths here use a single page) and shrink the pool so
+    // the larger page doesn't blow up KV memory. Only grows past the 32 default.
+    const int n_ids = static_cast<int>(ids.size());
+    if (n_ids > static_cast<int>(batching.kv_page_size)) {
+        batching.kv_page_size = static_cast<std::uint32_t>(n_ids);
+        batching.total_pages  = 8;
+        std::cerr << "[parity] long-ctx: kv_page_size=" << batching.kv_page_size
+                  << " total_pages=" << batching.total_pages << "\n";
+    }
     loader::LoadedModel model = loader::load_model(hf_path, batching);
     const auto& c = model.caps;
     std::cerr << "[parity] LOADED arch=" << c.arch_name
