@@ -45,14 +45,11 @@ struct DecodeStepPsos {
     const Pso& operator[](Kernel k) const { return by_kind[static_cast<int>(k)]; }
 };
 
-// Default launch dims for a kernel at qwen3.6 decode shapes (M=1). delta refines the
-// exact grid/tg from the MLX instantiations; GdnCore is beta-validated.
-//   out_n = the qmv output width (N) for the gemv kernels.
-Grid        default_grid(Kernel k, const DecodeGeometry& g, int out_n);
-Threadgroup default_tg(Kernel k, const DecodeGeometry& g);
-
-// Build the ordered per-token DAG (~322 dispatches) from the geometry.
-std::vector<Dispatch> build_decode_dag(const DecodeGeometry& g);
+// Build the ordered per-token DAG (~393 raw dispatches; 363 are golden-tapped) from
+// the geometry, with grid/tg filled per dispatch via delta's decode_dispatch.hpp
+// helpers (GdnCore's {32,Vd,Vh}/{32,4,1} is beta's, in gdn_core.metal). with_argmax
+// appends the optional device-argmax substrate (I3); logits are ALWAYS produced.
+std::vector<Dispatch> build_decode_dag(const DecodeGeometry& g, bool with_argmax = false);
 
 // Encode one decode step: walk the DAG, bind pso + arg table (by ordinal), dispatch+barrier.
 void encode_decode_step(StepEncoder& se,
