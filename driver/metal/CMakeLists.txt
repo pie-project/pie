@@ -160,3 +160,12 @@ target_link_libraries(pie_driver_metal PRIVATE pie_driver_metal_lib)
 
 # The `--features driver-metal` build in worker/build.rs consumes
 # `pie_driver_metal_lib` directly.
+
+# -----------------------------------------------------------------------------
+# Loader smoke test (delta-owned, off by default). Builds an end-to-end loader→
+# graph→KV→forward check; requires MLX. Enable with -DPIE_METAL_BUILD_TESTS=ON.
+# -----------------------------------------------------------------------------
+option(PIE_METAL_BUILD_TESTS "Build driver/metal loader smoke tests" OFF)
+if(PIE_METAL_BUILD_TESTS AND PIE_METAL_WITH_MLX)
+  add_subdirectory(tests)
+endif()
