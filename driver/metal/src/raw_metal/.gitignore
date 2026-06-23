@@ -1,0 +1,9 @@
+# delta owns decode_abi.hpp (committed on her branch). We include it but never commit
+# our own copy — guards against accidental `git add .` clobbering her authoritative file.
+# (gitignore does NOT untrack delta's already-tracked file once her branch merges.)
+decode_abi.hpp
+
+# local build trees
+build/
+build-*/
+*.metallib
