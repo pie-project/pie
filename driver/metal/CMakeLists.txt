@@ -184,3 +184,13 @@ option(PIE_METAL_BUILD_TESTS "Build driver/metal loader smoke tests" OFF)
 if(PIE_METAL_BUILD_TESTS AND PIE_METAL_WITH_MLX)
   add_subdirectory(tests)
 endif()
+
+# -----------------------------------------------------------------------------
+# Accuracy parity harness (alpha-owned, off by default). Builds `parity_driver`
+# (driver logits dumper) for tools/parity/parity_check.py to diff against
+# mlx-lm. Requires MLX. Enable with -DPIE_METAL_BUILD_PARITY=ON.
+# -----------------------------------------------------------------------------
+option(PIE_METAL_BUILD_PARITY "Build driver/metal accuracy parity harness" OFF)
+if(PIE_METAL_BUILD_PARITY AND PIE_METAL_WITH_MLX)
+  add_subdirectory(tools/parity)
+endif()

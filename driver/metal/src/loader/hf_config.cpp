@@ -25,6 +25,84 @@ T get_or(const json& j, const char* key, T fallback) {
     }
 }
 
+// Newer HF checkpoints nest RoPE hyperparameters (rope_theta,
+// partial_rotary_factor, ...) under a `rope_parameters` object instead of the
+// top level. Two shapes occur:
+//   * flat       (Qwen3.5 / qwen3_next): rope_parameters.rope_theta
+//   * per-type   (gemma4):               rope_parameters.full_attention.rope_theta
+//                                        rope_parameters.sliding_attention.rope_theta
+// `rope_params_primary` returns the sub-object holding the FULL-attention rope
+// params (the canonical rope_theta / partial_rotary_factor): the per-type
+// `full_attention` object when present, else the flat `rope_parameters` object.
+const json* rope_params_primary(const json& j) {
+    auto it = j.find("rope_parameters");
+    if (it == j.end() || !it->is_object()) return nullptr;
+    if (auto fit = it->find("full_attention");
+        fit != it->end() && fit->is_object()) {
+        return &(*fit);  // gemma4 per-attention-type nesting
+    }
+    return &(*it);       // flat nesting (qwen3.5)
+}
+
+// Read a RoPE param: prefer the (possibly per-type) `rope_parameters` object,
+// then the top-level key, then `fallback`.
+template <typename T>
+T get_rope_param(const json& j, const char* key, T fallback) {
+    if (const json* rp = rope_params_primary(j)) {
+        auto nit = rp->find(key);
+        if (nit != rp->end() && !nit->is_null()) {
+            try {
+                return nit->get<T>();
+            } catch (...) {
+            }
+        }
+    }
+    return get_or<T>(j, key, fallback);
+}
+
+// gemma4's sliding-attention layers use a separate rope base, nested at
+// rope_parameters.sliding_attention.rope_theta (older gemma keeps it top-level
+// as `rope_local_base_freq`). 0 = no distinct local base (graph uses rope_theta).
+float get_rope_local_base(const json& j) {
+    if (auto it = j.find("rope_parameters"); it != j.end() && it->is_object()) {
+        if (auto sit = it->find("sliding_attention");
+            sit != it->end() && sit->is_object()) {
+            auto tit = sit->find("rope_theta");
+            if (tit != sit->end() && tit->is_number()) {
+                return tit->get<float>();
+            }
+        }
+    }
+    return get_or<float>(j, "rope_local_base_freq", 0.0f);
+}
+
+// gemma4's full-attention layers use `rope_type=proportional` (mlx-lm's
+// ProportionalRoPE: rotated_dims = 0.25*head_dim but with the freq exponent
+// over head_dim, not rotated_dims) — empirically near-exact as FULL rope, not
+// the driver's standard partial rope. So only honor a nested
+// `partial_rotary_factor` when the primary rope is a STANDARD type
+// (default/linear/empty): qwen3.6 (rope_type=default) keeps 0.25; gemma4
+// (rope_type=proportional) falls back to full rope (1.0). Top-level
+// partial_rotary_factor (legacy phi-style) is always honored.
+float get_partial_rotary_factor(const json& j) {
+    if (const json* rp = rope_params_primary(j)) {
+        const std::string rt =
+            get_or<std::string>(*rp, "rope_type", get_or<std::string>(*rp, "type", ""));
+        const bool standard = rt.empty() || rt == "default" || rt == "linear";
+        if (standard) {
+            auto nit = rp->find("partial_rotary_factor");
+            if (nit != rp->end() && nit->is_number()) {
+                return nit->get<float>();
+            }
+        } else {
+            // Non-standard nested rope (gemma4 proportional) → full rope,
+            // unless a legacy top-level factor is explicitly present.
+            return get_or<float>(j, "partial_rotary_factor", 1.0f);
+        }
+    }
+    return get_or<float>(j, "partial_rotary_factor", 1.0f);
+}
+
 template <typename T>
 T require(const json& j, const char* key, const std::string& where) {
     auto it = j.find(key);
@@ -126,8 +204,8 @@ model::ModelConfig parse_doc(const json& root, const std::string& where) {
     cfg.rms_norm_eps = get_or<float>(j, "rms_norm_eps",
                                      get_or<float>(j, "layer_norm_epsilon",
                                                    get_or<float>(j, "norm_eps", 1e-5f)));
-    cfg.rope_theta          = get_or<float>(j, "rope_theta", 10000.0f);
-    cfg.rope_local_base_freq = get_or<float>(j, "rope_local_base_freq", 0.0f);
+    cfg.rope_theta          = get_rope_param<float>(j, "rope_theta", 10000.0f);
+    cfg.rope_local_base_freq = get_rope_local_base(j);
     parse_rope_scaling(j, cfg);
 
     // ── Tied embeddings (Gemma family + Qwen3 default true; Llama false) ──
@@ -165,6 +243,42 @@ model::ModelConfig parse_doc(const json& root, const std::string& where) {
     cfg.num_experts_per_tok   = get_or<int>(j, "num_experts_per_tok", 0);
     cfg.moe_intermediate_size = get_or<int>(j, "moe_intermediate_size", 0);
     cfg.norm_topk_prob        = get_or<bool>(j, "norm_topk_prob", true);
+    cfg.routed_scaling_factor = get_or<float>(j, "routed_scaling_factor", 1.0f);
+    cfg.n_shared_experts      = get_or<int>(j, "n_shared_experts", 0);
+    cfg.shared_expert_intermediate_size =
+        get_or<int>(j, "shared_expert_intermediate_size", 0);
+    cfg.n_group               = get_or<int>(j, "n_group", 0);
+    cfg.topk_group            = get_or<int>(j, "topk_group", 0);
+    cfg.first_k_dense_replace = get_or<int>(j, "first_k_dense_replace", 0);
+
+    // ── gemma4 ──
+    cfg.gemma4_enable_moe    = get_or<bool>(j, "enable_moe_block", false);
+    cfg.global_head_dim      = get_or<int>(j, "global_head_dim", 0);
+    // num_global_key_value_heads is often JSON null → treat as 0 (= fall back to
+    // num_key_value_heads). Only read when it's an actual number.
+    if (auto it = j.find("num_global_key_value_heads");
+        it != j.end() && it->is_number_integer()) {
+        cfg.num_global_kv_heads = it->get<int>();
+    }
+    // PLE feature width: HF spells it hidden_size_per_layer_input (some dumps
+    // gemma_hidden_size_per_layer_input).
+    cfg.per_layer_emb_dim    = get_or<int>(
+        j, "hidden_size_per_layer_input",
+        get_or<int>(j, "gemma_hidden_size_per_layer_input", 0));
+    cfg.num_kv_shared_layers = get_or<int>(j, "num_kv_shared_layers", 0);
+
+    // ── qwen3.6 (Qwen3.5 hybrid linear-attention) ──
+    cfg.linear_num_value_heads = get_or<int>(j, "linear_num_value_heads", 0);
+    cfg.linear_num_key_heads   = get_or<int>(j, "linear_num_key_heads", 0);
+    cfg.linear_key_head_dim    = get_or<int>(j, "linear_key_head_dim", 0);
+    cfg.linear_value_head_dim  = get_or<int>(j, "linear_value_head_dim", 0);
+    cfg.linear_conv_kernel_dim = get_or<int>(j, "linear_conv_kernel_dim", 0);
+    cfg.attn_output_gate       = get_or<bool>(j, "attn_output_gate", false);
+    cfg.partial_rotary_factor  = get_partial_rotary_factor(j);
+    if (auto it = j.find("layer_types");
+        it != j.end() && it->is_array() && cfg.layer_attn_types.empty()) {
+        for (const auto& t : *it) cfg.layer_attn_types.push_back(t.get<std::string>());
+    }
 
     return cfg;
 }

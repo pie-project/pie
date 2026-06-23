@@ -15,6 +15,8 @@
 
 #include <cstdint>
 #include <memory>
+#include <optional>
+#include <vector>
 
 #include "ops/tensor.hpp"
 #include "config.hpp"
@@ -22,6 +24,9 @@
 #include "model/model_kv.hpp"   // KvCacheView — model->KV accessor seam
 
 namespace pie_metal_driver {
+
+class LinearStateCache;  // driver/metal/src/linear_state_cache.hpp (delta-owned)
+
 namespace model {
 
 // ForwardBatch — per-fire inputs the executor stages for the graph. The
@@ -52,13 +57,29 @@ struct ForwardBatch {
     std::int32_t n_requests  = 0;
     std::int32_t n_slots     = 0;   // logit rows
     bool         pure_decode = false;
+
+    // ── qwen3.6 hybrid linear-attention (Gated DeltaNet) seam ──
+    // Populated by the executor (alpha) only for hybrid models; null/absent on
+    // every other arch (zero effect on gemma4 / qwen2 / llama). The graph owns
+    // the decoder-layer -> linear-layer-ordinal mapping (counts 'l' layers in
+    // arch_spec.layer_pattern) and passes these straight to beta's
+    // gated_delta_net.
+    //   lin_cache     : delta's per-request conv+recurrent state store (null =
+    //                   non-hybrid -> the graph never touches a linear layer).
+    //   slot_ids      : i32 [n_requests], each request's persistent state slot.
+    //   qo_indptr_host: [n_requests + 1] host CSR token spans for the varlen
+    //                   (prefill / mixed) path; empty on the pure-decode path.
+    LinearStateCache*       lin_cache = nullptr;
+    std::optional<Tensor>   slot_ids;
+    std::vector<int>        qo_indptr_host;
 };
 
 class ModelGraph {
 public:
     virtual ~ModelGraph() = default;
 
-    // Build the lazy forward graph; returns logits `[vocab, n_slots]`.
+    // Build the lazy forward graph; returns logits `[n_slots, vocab]`
+    // (token-major: one row per sampling slot; sampler does argmax over axis=1).
     virtual Tensor forward(const ForwardBatch& batch, KvCacheView& kv) = 0;
 
     virtual const ModelConfig& config() const = 0;
@@ -69,6 +90,13 @@ public:
 // Throws on PieArch::Unknown / unimplemented archs.
 std::unique_ptr<ModelGraph> make_model_graph(const ModelConfig& cfg,
                                              ModelWeights weights);
+
+// Data-driven weight binding: switches on `cfg.arch` to pick the matching
+// `bind_*` builder (bind_llama_like for llama/qwen/mistral/MoE, bind_gemma for
+// gemma2/3), resolving HF tensor names from `src` into a ModelWeights. This is
+// the single entry point the loader (delta) / runtime assembly (alpha) calls —
+// no need to branch on arch at the call site. Throws on unimplemented archs.
+ModelWeights bind_weights(const WeightSource& src, const ModelConfig& cfg);
 
 }  // namespace model
 }  // namespace pie_metal_driver

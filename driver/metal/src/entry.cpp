@@ -37,6 +37,7 @@
 
 #include "executor/executor.hpp"
 #include "kv_cache.hpp"
+#include "loader/model_loader.hpp"
 #include "model/config.hpp"
 #include "model/model_graph.hpp"
 #include "model/weights.hpp"
@@ -52,6 +53,10 @@ struct ModelFacts {
     std::uint32_t vocab_size = 32000;
     std::uint32_t max_model_len = 8192;
     std::string arch_name = "llama";
+    // True for hybrid linear-attention archs (qwen3.6 / qwen3_next): they need a
+    // recurrent-state slot pool (rs_cache) advertised so the runtime allocates
+    // per-request rs_slot_ids. Detected from config.json (incl. text_config).
+    bool has_linear_attn = false;
 };
 
 ModelFacts read_model_facts(const std::string& hf_path) {
@@ -82,6 +87,26 @@ ModelFacts read_model_facts(const std::string& hf_path) {
             }
             if (!a.empty()) facts.arch_name = a;
         }
+        // Hybrid linear-attention detection (qwen3.6 / qwen3_next). Config keys
+        // live under `text_config` on multimodal-style dumps, else at the root.
+        const nlohmann::json& tc =
+            (j.contains("text_config") && j["text_config"].is_object())
+                ? j["text_config"]
+                : j;
+        if (tc.contains("linear_num_value_heads") &&
+            tc["linear_num_value_heads"].is_number_integer() &&
+            tc["linear_num_value_heads"].get<int>() > 0) {
+            facts.has_linear_attn = true;
+        }
+        if (tc.contains("layer_types") && tc["layer_types"].is_array()) {
+            for (const auto& t : tc["layer_types"]) {
+                if (t.is_string() &&
+                    t.get<std::string>() == "linear_attention") {
+                    facts.has_linear_attn = true;
+                    break;
+                }
+            }
+        }
     } catch (const std::exception& e) {
         std::cerr << "[pie-driver-metal] warning: failed to parse "
                   << cfg.string() << ": " << e.what() << "\n";
@@ -92,12 +117,25 @@ ModelFacts read_model_facts(const std::string& hf_path) {
 std::string build_caps_json(const pie_metal_driver::Config& cfg,
                             const ModelFacts& facts) {
     const std::uint32_t total_pages = cfg.batching.total_pages;
+    // Hybrid linear-attention archs (qwen3.6) need a recurrent-state slot pool:
+    // delta's LinearStateCache is sized to max_forward_requests, so advertise
+    // that many rs_cache slots and clamp max_forward_requests to it (mirrors the
+    // cuda driver). The runtime then allocates per-request rs_slot_ids in range.
+    const bool rs_cache_required = facts.has_linear_attn;
+    const std::uint32_t rs_cache_slots =
+        rs_cache_required ? cfg.batching.max_forward_requests : 0u;
+    const std::uint32_t max_forward_requests =
+        rs_cache_required
+            ? std::min(cfg.batching.max_forward_requests, rs_cache_slots)
+            : cfg.batching.max_forward_requests;
     nlohmann::json caps = {
         {"total_pages", total_pages},
         {"kv_page_size", cfg.batching.kv_page_size},
         {"swap_pool_size", cfg.batching.cpu_pages},
         {"max_forward_tokens", cfg.batching.max_forward_tokens},
-        {"max_forward_requests", cfg.batching.max_forward_requests},
+        {"max_forward_requests", max_forward_requests},
+        {"rs_cache_required", rs_cache_required},
+        {"rs_cache_slots", rs_cache_slots},
         {"max_page_refs", total_pages},
         {"max_logit_rows", UINT32_MAX},
         {"max_prob_rows", UINT32_MAX},
@@ -123,6 +161,9 @@ namespace mx = mlx::core;
 struct ModelRuntime {
     std::unique_ptr<pie_metal_driver::model::ModelGraph> graph;
     std::unique_ptr<pie_metal_driver::PagedKvCache>      kv;
+    // Hybrid linear-attention state store (qwen3.6); null for non-hybrid archs.
+    // Declared before `executor` so it outlives the borrowing Executor.
+    std::unique_ptr<pie_metal_driver::LinearStateCache>  lin_cache;
     std::unique_ptr<pie_metal_driver::Executor>          executor;
 };
 
@@ -201,18 +242,53 @@ std::unique_ptr<ModelRuntime> build_synthetic_runtime(
 }
 
 // Construct the forward pipeline for the loaded model, or nullptr to fall back
-// to the stub Forward. Today this only builds the synthetic dev model (env-
-// gated); delta's weight_loader will populate a real ModelConfig + ModelWeights
-// from `cfg.model.hf_path` and build the runtime the same way.
+// to the stub Forward. Loads the real checkpoint at `cfg.model.hf_path` via
+// delta's loader (config.json + safetensors → graph + paged-KV); the
+// PIE_METAL_SYNTHETIC_MODEL env override swaps in a random dev model for
+// pipeline smoke-testing without a checkpoint.
 std::unique_ptr<ModelRuntime> build_model_runtime(
     const pie_metal_driver::Config& cfg, const ModelFacts& facts) {
+    using namespace pie_metal_driver;
+
     const char* synth = std::getenv("PIE_METAL_SYNTHETIC_MODEL");
     if (synth != nullptr && synth[0] != '\0' && synth[0] != '0') {
         std::cerr << "[pie-driver-metal] building SYNTHETIC dev model "
                      "(PIE_METAL_SYNTHETIC_MODEL set) — random weights\n";
         return build_synthetic_runtime(cfg, facts);
     }
-    return nullptr;
+
+    if (cfg.model.hf_path.empty()) {
+        std::cerr << "[pie-driver-metal] no model.hf_path configured — "
+                     "serving stub Forward\n";
+        return nullptr;
+    }
+
+    try {
+        // Real checkpoint: parse config.json + load/bind safetensors + build
+        // graph + allocate the paged-KV cache from model geometry (delta).
+        loader::LoadedModel lm =
+            loader::load_model(cfg.model.hf_path, cfg.batching);
+        std::cerr << "[pie-driver-metal] loaded " << lm.caps.arch_name
+                  << " (layers=" << lm.caps.num_hidden_layers
+                  << ", heads=" << lm.caps.num_attention_heads
+                  << ", kv_heads=" << lm.caps.num_key_value_heads
+                  << ", head_dim=" << lm.caps.head_dim
+                  << ", hidden=" << lm.caps.hidden_size
+                  << ", vocab=" << lm.caps.vocab_size
+                  << ", act=" << lm.caps.activation_dtype << ")\n";
+
+        auto rt = std::make_unique<ModelRuntime>();
+        rt->graph     = std::move(lm.graph);
+        rt->kv        = std::move(lm.kv);
+        rt->lin_cache = std::move(lm.lin_cache);  // null for non-hybrid archs
+        rt->executor  = std::make_unique<Executor>(*rt->graph, *rt->kv);
+        rt->executor->set_linear_state_cache(rt->lin_cache.get());
+        return rt;
+    } catch (const std::exception& e) {
+        std::cerr << "[pie-driver-metal] model load failed (" << e.what()
+                  << ") — serving stub Forward\n";
+        return nullptr;
+    }
 }
 #endif  // PIE_METAL_HAS_MLX
 

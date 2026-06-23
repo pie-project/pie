@@ -96,6 +96,16 @@ void Executor::run_forward(const pie_driver::PieForwardRequestView& req,
     copy_u32(req.qo_indptr, stg_.qo_indptr);
     compute_write_indices(req);
 
+    // Per-request linear-attention state slots (qwen3.6). Prefer the wire
+    // `rs_slot_ids`; for paths that don't carry them (e.g. single-request
+    // parity) fall back to identity slots 0..n_req-1.
+    if (req.rs_slot_ids.size() == static_cast<std::size_t>(n_req) && n_req > 0) {
+        copy_u32(req.rs_slot_ids, stg_.slot_ids);
+    } else {
+        stg_.slot_ids.resize(n_req > 0 ? n_req : 0);
+        for (int r = 0; r < n_req; ++r) stg_.slot_ids[r] = r;
+    }
+
     // ── stage: build the ForwardBatch (aggregate-init; Tensor has no
     // default ctor so every field must be provided up front) ──
     model::ForwardBatch batch{
@@ -112,6 +122,11 @@ void Executor::run_forward(const pie_driver::PieForwardRequestView& req,
         /*n_slots=*/          n_slots,
         /*pure_decode=*/      req.single_token_mode != 0,
     };
+
+    // ── hybrid linear-attention seam (qwen3.6) — null/empty for other archs ──
+    batch.lin_cache = lin_cache_;
+    if (n_req > 0) batch.slot_ids = i32_view(stg_.slot_ids);
+    batch.qo_indptr_host = stg_.qo_indptr;  // host CSR for the varlen path
 
     // ── forward + sample ──
     per_req_.assign(n_req > 0 ? n_req : 0, pie_driver::PerRequestOutput{});
