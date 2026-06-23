@@ -17,7 +17,10 @@ pub const CHUNK_SIZE_BYTES: usize = 256 * 1024; // 256 KiB
 pub const QUERY_MODEL_STATUS: &str = "model_status";
 
 /// Messages from client -> server
-#[derive(Debug, Serialize, Deserialize)]
+//
+// `Clone` so the gateway's `Request` (which carries one) is cloneable for
+// idempotent re-dispatch / retry across worker candidates (design §8).
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum ClientMessage {
     #[serde(rename = "auth_identify")]
@@ -147,7 +150,10 @@ pub enum ClientMessage {
 }
 
 /// Messages from server -> client
-#[derive(Debug, Serialize, Deserialize)]
+//
+// `Clone` so the gateway's `Tokens` chunk (which carries these) is cloneable on
+// the streaming/fan-out path.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum ServerMessage {
     #[serde(rename = "response")]
