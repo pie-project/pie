@@ -315,6 +315,18 @@ int main(int argc, char** argv) {
             mx::eval(bar);  // one barrier: next token + updated KV
             tok = static_cast<int>(next.item<std::uint32_t>());
             if (dump) dump->push_back(static_cast<std::uint32_t>(tok));
+            // ICB buffer-stability probe: log allocator steady-state. Flat
+            // active/cache/peak post-warmup ⇒ every malloc hits the cache with a
+            // deterministic (lower_bound + insertion-order) buffer ⇒ identical
+            // physical addresses token-to-token (ICB-baked pointers stay valid).
+            if (std::getenv("PIE_MEM_TRACE") &&
+                (t < 4 || t >= n_steps - 4)) {
+                std::fprintf(stderr,
+                    "[mem] step %3d  active=%6zuKB  cache=%6zuKB  peak=%6zuKB\n",
+                    t, mx::get_active_memory() / 1024,
+                    mx::get_cache_memory() / 1024,
+                    mx::get_peak_memory() / 1024);
+            }
         }
         auto t1 = std::chrono::high_resolution_clock::now();
         return n_steps / std::chrono::duration<double>(t1 - t0).count();
