@@ -14,6 +14,7 @@
 //   -> g/beta gating -> recurrent gated-delta -> RMSNormGated(out, z) -> [N,V_dim]
 
 #include <optional>
+#include <vector>
 
 #include "ops/tensor.hpp"
 
@@ -84,5 +85,43 @@ Tensor gated_delta_net(const Tensor& mixed_qkv,
                        int lin_layer,
                        const Tensor& slot_ids,
                        const GdnParams& params);
+
+// Prefill / sequential scan for a SINGLE request of T tokens (T>=1). Causal
+// conv uses `state_in.conv_state` as left context; the recurrence scans the T
+// tokens carrying `state_in.recurrent_state`. Cache-agnostic (state in ->
+// state out) so it can be unit-tested. Returns {output [T, V_dim], state}.
+//   mixed_qkv : [T, conv_dim]   z : [T, V_dim]   a, b : [T, V_h]
+GdnResult gated_delta_net_prefill(const Tensor& mixed_qkv,
+                                  const Tensor& z,
+                                  const Tensor& a,
+                                  const Tensor& b,
+                                  const Tensor& conv_w,
+                                  const std::optional<Tensor>& conv_b,
+                                  const Tensor& A_log,
+                                  const Tensor& dt_bias,
+                                  const Tensor& gate_norm_w,
+                                  const GdnState& state_in,
+                                  const GdnParams& params);
+
+// Cache-bound variable-length entry for a ragged batch (mixed prefill/decode).
+// `qo_indptr` [R+1] gives each request's token span into the packed
+// `mixed_qkv`/`z`/`a`/`b` (token-major, requests contiguous); `slot_ids` [R]
+// selects each request's cache slot. Per request: gather state -> sequential
+// scan -> scatter state back. Returns the packed layer output [N_total, V_dim]
+// in qo_indptr token order. Decode (all T==1) is the R-token special case.
+Tensor gated_delta_net_varlen(const Tensor& mixed_qkv,
+                              const Tensor& z,
+                              const Tensor& a,
+                              const Tensor& b,
+                              const Tensor& conv_w,
+                              const std::optional<Tensor>& conv_b,
+                              const Tensor& A_log,
+                              const Tensor& dt_bias,
+                              const Tensor& gate_norm_w,
+                              LinearStateCache& cache,
+                              int lin_layer,
+                              const Tensor& slot_ids,
+                              const std::vector<int>& qo_indptr,
+                              const GdnParams& params);
 
 }  // namespace pie_metal_driver::ops
