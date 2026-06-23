@@ -35,6 +35,19 @@ std::vector<Tensor> gemma4_ffn(const std::vector<Tensor>& in) {
     return { ops::residual_add(post, in[0]) };
 }
 
+// ── Compiled PLE region (gemma4): GeGLU-gate the per-layer signal back into
+// the residual stream — ple_input_gate -> geglu-tanh(·, signal) -> projection
+// -> norm -> residual, fused into one compiled kernel sequence (the per-layer
+// PLE glue, ~13% of decode). Capture-less; eps is the gemma4 config literal.
+// in = {hidden, ple_input_gate_w, ple_signal, ple_projection_w, ple_norm_w}.
+std::vector<Tensor> gemma4_ple(const std::vector<Tensor>& in) {
+    Tensor gate  = ops::linear(in[1], in[0]);
+    Tensor gated = ops::geglu(gate, in[2], /*tanh_approx=*/true);
+    Tensor ple   = ops::linear(in[3], gated);
+    ple = ops::rms_norm(ple, in[4], 1e-6f, /*plus_one=*/false);
+    return { ops::residual_add(ple, in[0]) };
+}
+
 Tensor to_heads(const Tensor& x, std::int32_t n_tokens,
                 std::int32_t n_heads, std::int32_t head_dim) {
     return mx::reshape(x, {n_tokens, n_heads, head_dim});
@@ -140,15 +153,15 @@ Tensor Gemma4Graph::decoder_layer(std::int32_t il,
          *L.post_ffn_norm},
         gemma4_ffn)[0];
 
-    // ── PLE residual: GeGLU-gate the per-layer signal back into the stream ──
-    // ple_gate = ple_input_gate(hidden); GeGLU_tanh(ple_gate, signal);
-    // project to hidden; RMSNorm; add. Then the per-layer output scalar.
+    // ── PLE residual: GeGLU-gate the per-layer signal back into the stream,
+    // fused via mx::compile (ple_input_gate -> geglu -> projection -> norm ->
+    // residual). The layer-output scalar stays separate (distinct guard). ──
     if (ple_signal && L.ple_input_gate && L.ple_projection && L.ple_norm) {
-        Tensor ple_gate  = ops::linear(*L.ple_input_gate, hidden);     // [N, ple_dim]
-        Tensor ple_gated = ops::geglu(ple_gate, *ple_signal, /*tanh_approx=*/true);
-        Tensor ple = ops::linear(*L.ple_projection, ple_gated);        // [N, hidden]
-        ple = ops::rms_norm(ple, *L.ple_norm, eps, /*plus_one=*/false);
-        hidden = ops::residual_add(ple, hidden);
+        hidden = ops::compiled(
+            "gemma4.ple",
+            {hidden, *L.ple_input_gate, *ple_signal, *L.ple_projection,
+             *L.ple_norm},
+            gemma4_ple)[0];
     }
     if (L.layer_scalar) {
         hidden = ops::mul(hidden, *L.layer_scalar);  // broadcast [1] over [N,H]
