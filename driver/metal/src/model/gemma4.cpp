@@ -1,11 +1,13 @@
 #include "model/gemma4.hpp"
 
 #include <cmath>
+#include <cstdlib>
 #include <stdexcept>
 #include <string>
 
 #include <mlx/ops.h>
 
+#include "ops/attention.hpp"
 #include "ops/compiled.hpp"
 #include "ops/ops.hpp"
 
@@ -14,6 +16,26 @@ namespace pie_metal_driver::model {
 namespace mx = mlx::core;
 
 namespace {
+
+// Route single-stream (R=1) pure_decode through the host-readback-free device
+// decode attention (no per-token `to_host_i32` sync), unblocking async_eval
+// pipelining and the whole-step compile trace. Default ON; opt out with
+// PIE_DEVICE_DECODE=0 (falls back to the host-readback paged_attention path).
+// The call site additionally guards on n_requests<=1 && softcap==0 so the
+// fast path only fires where paged_attention_decode is bit-exact.
+bool device_decode_enabled() {
+    static const bool on = [] {
+        const char* e = std::getenv("PIE_DEVICE_DECODE");
+        return !(e && e[0] == '0');  // default on; PIE_DEVICE_DECODE=0 disables
+    }();
+    return on;
+}
+
+// True when the host-readback-free decode fast path is valid for this batch.
+bool use_device_decode(const model::ForwardBatch& batch, const ops::AttnParams& ap) {
+    return device_decode_enabled() && batch.pure_decode &&
+           batch.n_requests <= 1 && ap.softcap == 0.0f;
+}
 
 std::string layer_prefix(const std::string& root, std::int32_t il) {
     return root + "layers." + std::to_string(il) + ".";
@@ -162,10 +184,15 @@ Tensor Gemma4Graph::decoder_layer(std::int32_t il,
     ap.n_kv_heads     = n_kv_heads;
     ap.head_dim       = head_dim;
 
-    Tensor attn = ops::paged_attention(
-        Q, k_pages, v_pages,
-        batch.kv_page_indices, batch.qo_indptr, batch.kv_page_indptr,
-        batch.kv_last_page_lens, kv.page_size(), ap);
+    Tensor attn = use_device_decode(batch, ap)
+        ? ops::paged_attention_decode(
+              Q, k_pages, v_pages,
+              batch.kv_page_indices, batch.kv_last_page_lens,
+              kv.page_size(), ap)
+        : ops::paged_attention(
+              Q, k_pages, v_pages,
+              batch.kv_page_indices, batch.qo_indptr, batch.kv_page_indptr,
+              batch.kv_last_page_lens, kv.page_size(), ap);
 
     attn = from_heads(attn, n_total, n_q_heads * head_dim);
     Tensor attn_out = apply_linear(L.o_proj, attn);

@@ -193,6 +193,32 @@ public:
         mlx::core::eval(std::move(all));
     }
 
+    // ── Measure-only compile-IO helpers (B2 prototype) ───────────────────
+    // Expose the own-buffer (non-shared) K/V arrays as a flat vector in a
+    // stable order [k_0,v_0,k_1,v_1,...] so the whole decode step can be wrapped
+    // in mx::compile with the cache threaded as functional inputs/outputs
+    // (captured arrays would be baked as constants and never update). `restore`
+    // rebinds them from a matching vector. Shared layers (n_pages==0) are
+    // skipped (they hold no own buffer).
+    std::vector<Tensor> snapshot() const {
+        std::vector<Tensor> out;
+        out.reserve(k_pages_.size() * 2);
+        for (std::size_t l = 0; l < specs_.size(); ++l) {
+            if (specs_[l].n_pages == 0) continue;
+            out.push_back(k_pages_[l]);
+            out.push_back(v_pages_[l]);
+        }
+        return out;
+    }
+    void restore(const std::vector<Tensor>& buf) {
+        std::size_t i = 0;
+        for (std::size_t l = 0; l < specs_.size(); ++l) {
+            if (specs_[l].n_pages == 0) continue;
+            k_pages_[l] = buf[i++];
+            v_pages_[l] = buf[i++];
+        }
+    }
+
 private:
     void allocate() {
         k_pages_.clear();
