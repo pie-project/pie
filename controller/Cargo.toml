@@ -16,19 +16,19 @@ crate-type = ["rlib"]
 # package (`pie-controller`); no explicit `[[bin]]` needed.
 
 [dependencies]
+# Wire data types (`pie_schema::control::*`) — the static-serde floor.
 pie-schema = { path = "../protocol/schema", default-features = false }
-serde = { version = "1.0", features = ["derive"] }
-# tarpc is the unified control-plane RPC: workers and the gateway both dial the
-# controller through the generated `ControlApiClient`. Bincode codec over either
-# a TCP or a Unix-domain-socket transport (see `endpoint`).
+# The `Control` tarpc service contract (trait + generated client), shared with
+# worker + gateway so neither depends on `pie-controller`.
+pie-control = { path = "../protocol/control" }
+# tarpc serves the `Control` RPC: Bincode over tarpc-native TCP or Unix sockets.
 tarpc = { version = "0.35", features = [
     "serde-transport",
     "serde-transport-bincode",
     "tcp",
     "unix",
 ] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync"] }
 futures = "0.3"
-thiserror = "2.0"
 tracing = "0.1"
 clap = { version = "4.5", features = ["derive"] }

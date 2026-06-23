@@ -1,41 +1,95 @@
-//! The tarpc control-plane service definition — the unified RPC surface.
+//! The tarpc `Control` server — the distributed RPC front door.
 //!
-//! `#[tarpc::service]` generates the [`ControlApiClient`] (dialed by the gateway
-//! and distributed workers) and the server-side `ControlApi` trait (implemented
-//! by [`crate::serve`] over the coordinator). One variant per coordinator
-//! method.
-//!
-//! Coordination errors are carried as `Result<T, String>`: [`ControllerError`]
-//! isn't `Serialize`, so the server renders it to a string and the client maps
-//! it back to [`ControllerError::Remote`]. The shared vocabulary (`WorkerId`,
-//! `WorkerInfo`, `LoadState`, `RequestMeta`, `Placement`) lives on the floor in
-//! [`pie_schema::cluster`]; this module only declares the RPC envelope.
-//!
-//! [`ControllerError`]: crate::ControllerError
-//! [`ControllerError::Remote`]: crate::ControllerError::Remote
+//! Thin by design: every state-changing call funnels a command to the
+//! single-writer actor through the shared [`Handle`]; the two `watch_*` calls are
+//! the §7 long-poll read-path (bounded by `T_HANG` so a no-change watch returns
+//! as a keepalive before the client's RPC deadline). Eviction is signalled out
+//! of band via `heartbeat`'s [`Ack::ReRegister`], so the watch calls return their
+//! view directly.
 
-use pie_schema::{LoadState, Placement, RequestId, RequestMeta, WorkerId, WorkerInfo};
+use std::io;
 
-/// Result alias for service methods — coordination errors travel as a rendered
-/// string (see module docs).
-pub type RpcResult<T> = Result<T, String>;
+use futures::{Stream, StreamExt, future};
+use tarpc::serde_transport::{tcp, unix};
+use tarpc::server::{BaseChannel, Channel};
+use tarpc::tokio_serde::formats::Bincode;
+use tokio::task::JoinHandle;
 
-#[tarpc::service]
-pub trait ControlApi {
-    /// Register a worker on boot; the controller mints and returns its
-    /// [`WorkerId`].
-    async fn register(info: WorkerInfo) -> RpcResult<WorkerId>;
+use pie_control::{Control, ControlRequest, ControlResponse};
+use pie_schema::control::{
+    Ack, GatewayId, GatewayInfo, Neighbors, NodeId, RoutingTable, WorkerId, WorkerInfo,
+    WorkerStatus,
+};
 
-    /// Push current load (doubles as the liveness heartbeat).
-    async fn report(worker: WorkerId, load: LoadState) -> RpcResult<()>;
+use crate::Handle;
 
-    /// Decide which worker should serve a request.
-    async fn route(meta: RequestMeta) -> RpcResult<Placement>;
+/// tarpc server: a cheap clone of the shared [`Handle`] per request.
+#[derive(Clone)]
+struct ControlServer {
+    handle: Handle,
+}
 
-    /// Decide the `(prefill, decode)` worker pair for a request.
-    async fn pair(req: RequestId) -> RpcResult<(WorkerId, WorkerId)>;
+impl Control for ControlServer {
+    async fn register_worker(self, _: tarpc::context::Context, info: WorkerInfo) -> WorkerId {
+        self.handle.register_worker(info).await
+    }
 
-    /// Resolve a [`WorkerId`] to its registered [`WorkerInfo`] (control address
-    /// + role) so a router can dial the placed worker.
-    async fn resolve(worker: WorkerId) -> RpcResult<WorkerInfo>;
+    async fn register_gateway(self, _: tarpc::context::Context, info: GatewayInfo) -> GatewayId {
+        self.handle.register_gateway(info).await
+    }
+
+    async fn heartbeat(self, _: tarpc::context::Context, id: NodeId) -> Ack {
+        self.handle.heartbeat(id).await
+    }
+
+    async fn report_worker(self, _: tarpc::context::Context, id: WorkerId, status: WorkerStatus) {
+        self.handle.report_worker(id, status).await;
+    }
+
+    async fn watch_worker(self, _: tarpc::context::Context, id: WorkerId, since: u64) -> Neighbors {
+        self.handle.watch_worker_poll(id, since).await
+    }
+
+    async fn watch_gateway(self, _: tarpc::context::Context, since: u64) -> RoutingTable {
+        self.handle.watch_gateway_poll(since).await
+    }
+}
+
+/// Bind the control endpoint (tcp or unix) and spawn the accept loop.
+pub(crate) async fn serve(listen_addr: &str, handle: Handle) -> io::Result<JoinHandle<()>> {
+    let server = ControlServer { handle };
+    if let Some(path) = listen_addr
+        .strip_prefix("unix://")
+        .or_else(|| listen_addr.strip_prefix("unix:"))
+    {
+        let incoming = unix::listen(path, Bincode::default).await?;
+        tracing::info!(listen = %listen_addr, "controller serving Control (tarpc/uds)");
+        Ok(tokio::spawn(serve_loop(incoming, server)))
+    } else {
+        let tcp_addr = listen_addr.strip_prefix("tcp://").unwrap_or(listen_addr);
+        let incoming = tcp::listen(tcp_addr, Bincode::default).await?;
+        tracing::info!(listen = %listen_addr, "controller serving Control (tarpc/tcp)");
+        Ok(tokio::spawn(serve_loop(incoming, server)))
+    }
+}
+
+/// Serve `Control` over any tarpc transport stream (TCP or UDS).
+async fn serve_loop<T>(incoming: impl Stream<Item = io::Result<T>>, server: ControlServer)
+where
+    T: tarpc::Transport<tarpc::Response<ControlResponse>, tarpc::ClientMessage<ControlRequest>>
+        + Send
+        + 'static,
+{
+    incoming
+        .filter_map(|conn| future::ready(conn.ok()))
+        .map(BaseChannel::with_defaults)
+        .for_each_concurrent(None, |channel| {
+            let server = server.clone();
+            channel
+                .execute(server.serve())
+                .for_each_concurrent(None, |request| async move {
+                    tokio::spawn(request);
+                })
+        })
+        .await;
 }
