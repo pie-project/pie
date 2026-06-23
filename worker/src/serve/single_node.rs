@@ -153,7 +153,7 @@ pub(super) async fn assemble(
 
     let url = format!("ws://{listen}");
     Ok((
-        EdgeServer::Distributed(edge),
+        EdgeServer::WorkerListener(edge),
         control_tasks,
         ControlPlane::Embedded {
             _handle: handle,

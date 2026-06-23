@@ -51,6 +51,13 @@ pub struct CoordinationArgs {
     /// `unix:/path/to.sock`. Requires `--role`.
     #[arg(long, requires = "role")]
     pub controller: Option<String>,
+
+    /// Gateway endpoint(s) this worker dials INTO (post-inversion data plane,
+    /// M3): `tcp://host:port`, a bare `host:port`, or `unix:/path`. Repeat or
+    /// comma-separate for full-mesh fan-in. Requires `--controller`.
+    /// (Deploy-config discovery; controller-pushed discovery is a graduation.)
+    #[arg(long, requires = "controller", value_delimiter = ',')]
+    pub gateway: Vec<String>,
 }
 
 /// Resolved control-plane topology — the input to building the coordinator.
@@ -60,7 +67,13 @@ pub enum TopologyMode {
     SingleNode,
     /// Joins a distributed cluster via a standalone controller process. The
     /// address is `tcp://host:port`, a bare `host:port`, or `unix:/path`.
-    Distributed { role: Role, controller: String },
+    Distributed {
+        role: Role,
+        controller: String,
+        /// Gateway endpoint(s) to dial INTO — the worker is the client, the
+        /// gateway the listening server (M3 inversion). Deploy-config.
+        gateways: Vec<String>,
+    },
 }
 
 /// Validate the flag combination and resolve it to a [`TopologyMode`].
@@ -75,9 +88,18 @@ pub fn resolve(args: &CoordinationArgs) -> Result<TopologyMode> {
             if !is_valid_addr(addr) {
                 bail!("--controller {addr:?}: expected host:port, tcp://host:port, or unix:/path");
             }
+            if args.gateway.is_empty() {
+                bail!("distributed mode requires at least one --gateway to dial into");
+            }
+            for gw in &args.gateway {
+                if !is_valid_addr(gw) {
+                    bail!("--gateway {gw:?}: expected host:port, tcp://host:port, or unix:/path");
+                }
+            }
             Ok(TopologyMode::Distributed {
                 role: (*role).into(),
                 controller: addr.clone(),
+                gateways: args.gateway.clone(),
             })
         }
         // `--single-node` or no topology flags → no controller, all roles.
@@ -167,14 +189,31 @@ mod tests {
             single_node: false,
             role: Some(RoleArg::Decode),
             controller: Some("127.0.0.1:7000".to_string()),
+            gateway: vec!["127.0.0.1:8000".to_string()],
         };
         match resolve(&args).unwrap() {
-            TopologyMode::Distributed { role, controller } => {
+            TopologyMode::Distributed {
+                role,
+                controller,
+                gateways,
+            } => {
                 assert_eq!(role, Role::Decode);
                 assert_eq!(controller, "127.0.0.1:7000");
+                assert_eq!(gateways, vec!["127.0.0.1:8000".to_string()]);
             }
             other => panic!("expected Distributed, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn distributed_without_gateway_errors() {
+        let args = CoordinationArgs {
+            single_node: false,
+            role: Some(RoleArg::Decode),
+            controller: Some("127.0.0.1:7000".to_string()),
+            gateway: vec![],
+        };
+        assert!(resolve(&args).is_err());
     }
 
     #[test]
@@ -183,6 +222,7 @@ mod tests {
             single_node: false,
             role: Some(RoleArg::Prefill),
             controller: Some("not-an-addr".to_string()),
+            gateway: vec!["127.0.0.1:8000".to_string()],
         };
         assert!(resolve(&args).is_err());
     }
@@ -193,6 +233,7 @@ mod tests {
             single_node: false,
             role: Some(RoleArg::Prefill),
             controller: None,
+            gateway: vec![],
         };
         assert!(resolve(&args).is_err());
     }

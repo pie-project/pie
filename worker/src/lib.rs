@@ -17,6 +17,10 @@ pub mod embedded_driver;
 pub mod hf;
 pub mod paths;
 pub mod py_runtime;
+// The worker's copy of the legacy poll-based `WorkerSessionApi` — used only by
+// the transitional single-node in-proc edge listener (`serve::edge_session`).
+// The distributed data plane now rides `pie-dispatch` (worker dials the gateway).
+#[cfg(feature = "single-node")]
 pub mod rpc;
 pub mod serve;
 

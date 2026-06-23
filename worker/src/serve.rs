@@ -34,7 +34,9 @@ use control_link::ControlLink;
 mod client_server;
 mod control_link;
 pub mod coordination;
+#[cfg(feature = "single-node")]
 mod edge_session;
+mod gateway_link;
 mod lifecycle;
 #[cfg(feature = "single-node")]
 mod single_node;
@@ -84,7 +86,14 @@ impl DriverHandle {
 enum EdgeServer {
     #[cfg(not(feature = "single-node"))]
     Standalone(client_server::ClientServerHandle),
-    Distributed(edge_session::EdgeSessionServerHandle),
+    /// Post-inversion (M3): the worker dials INTO the gateway(s); these are the
+    /// live dial-in links serving `WorkerControl`. The distributed data path.
+    GatewayLinks(Vec<gateway_link::GatewayLink>),
+    /// Transitional single-node in-proc path — the worker's inbound edge-rpc
+    /// listener the in-proc gateway dials (pre-inversion model; flips to
+    /// worker-dials-gateway once the gateway's worker-facing server lands).
+    #[cfg(feature = "single-node")]
+    WorkerListener(edge_session::EdgeSessionServerHandle),
 }
 
 impl EdgeServer {
@@ -94,7 +103,18 @@ impl EdgeServer {
         match self {
             #[cfg(not(feature = "single-node"))]
             EdgeServer::Standalone(h) => h.bound.clone(),
-            EdgeServer::Distributed(h) => h.bound.replacen("tcp://", "edge://", 1),
+            EdgeServer::GatewayLinks(links) => {
+                // The worker is not client-facing in distributed mode — the
+                // gateway is. Report the gateway endpoint(s) it dialed into.
+                if links.is_empty() {
+                    "gateway://<none>".to_string()
+                } else {
+                    let addrs: Vec<&str> = links.iter().map(|l| l.addr.as_str()).collect();
+                    format!("gateway://{}", addrs.join(","))
+                }
+            }
+            #[cfg(feature = "single-node")]
+            EdgeServer::WorkerListener(h) => h.bound.replacen("tcp://", "edge://", 1),
         }
     }
 
@@ -102,7 +122,13 @@ impl EdgeServer {
         match self {
             #[cfg(not(feature = "single-node"))]
             EdgeServer::Standalone(h) => h.task.abort(),
-            EdgeServer::Distributed(h) => h.task.abort(),
+            EdgeServer::GatewayLinks(links) => {
+                for link in links {
+                    link.abort();
+                }
+            }
+            #[cfg(feature = "single-node")]
+            EdgeServer::WorkerListener(h) => h.task.abort(),
         }
     }
 }
@@ -517,26 +543,39 @@ async fn assemble_control_and_edge(
     String,
 )> {
     match coordinator.mode {
-        TopologyMode::Distributed { role, controller } => {
-            let endpoint = coordinator.control_addr.clone();
-            let edge = EdgeServer::Distributed(
-                edge_session::spawn(&endpoint)
-                    .await
-                    .context("starting worker edge-rpc server")?,
-            );
+        TopologyMode::Distributed {
+            role,
+            controller,
+            gateways,
+        } => {
+            // Control plane: dial the controller and register BEFORE dialing the
+            // gateways, so the worker presents its controller-minted id on each
+            // gateway dial-in `register` (the join key for routing ∩ connected).
             let client = control_link::dial_controller(&controller)
                 .await
                 .with_context(|| format!("dialing controller at {controller}"))?;
             let info = WorkerInfo {
                 role,
                 model,
-                addr: endpoint,
+                addr: coordinator.control_addr.clone(),
                 capability: caps,
             };
             let worker_id = ControlLink::register_worker(&client, info)
                 .await
                 .context("registering worker with controller")?;
             let control_tasks = control_link::spawn_control_tasks(client.clone(), worker_id);
+
+            // Data plane (M3 inversion): dial INTO each configured gateway and
+            // serve `WorkerControl` over the dial-in link. Deploy-config
+            // discovery — the worker learns its gateways from `--gateway`.
+            let mut links = Vec::with_capacity(gateways.len());
+            for gw in &gateways {
+                let link = gateway_link::connect_gateway(gw, worker_id)
+                    .await
+                    .with_context(|| format!("dialing gateway at {gw}"))?;
+                links.push(link);
+            }
+            let edge = EdgeServer::GatewayLinks(links);
             let url = edge.url();
             Ok((
                 edge,
