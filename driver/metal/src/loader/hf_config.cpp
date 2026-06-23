@@ -280,6 +280,18 @@ model::ModelConfig parse_doc(const json& root, const std::string& where) {
         for (const auto& t : *it) cfg.layer_attn_types.push_back(t.get<std::string>());
     }
 
+    // ── Affine quantization (mlx-community: top-level `quantization`) ──
+    // group_size/bits drive dequant in bind_linear. Default group_size is 64
+    // (mlx-community canonical); read it explicitly so non-default groupings
+    // (e.g. group_size 32 super-block checkpoints) dequantize correctly — bits
+    // is derived per-tensor from shapes using this group_size, so a wrong
+    // group_size corrupts both group_size AND bits.
+    if (auto it = root.find("quantization");
+        it != root.end() && it->is_object()) {
+        cfg.quant_group_size = get_or<int>(*it, "group_size", cfg.quant_group_size);
+        cfg.quant_bits       = get_or<int>(*it, "bits", cfg.quant_bits);
+    }
+
     return cfg;
 }
 
