@@ -33,6 +33,9 @@ struct ModelConfig {
     std::int32_t hidden_size           = 0;
     std::int32_t intermediate_size     = 0;
     std::int32_t head_dim              = 0;   // computed (hidden/heads) if absent
+    // gemma4: full-attention layers use a wider head_dim than sliding layers.
+    std::int32_t global_head_dim       = 0;   // 0 = same as head_dim
+    std::int32_t num_global_kv_heads   = 0;   // 0 = same as num_key_value_heads
     std::int32_t vocab_size            = 0;
     std::int32_t max_position_embeddings = 0;
 

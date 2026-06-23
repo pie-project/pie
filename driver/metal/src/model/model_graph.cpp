@@ -5,6 +5,7 @@
 
 #include "model/arch.hpp"
 #include "model/gemma.hpp"
+#include "model/gemma4.hpp"
 #include "model/llama_like.hpp"
 
 namespace pie_metal_driver::model {
@@ -27,13 +28,14 @@ std::unique_ptr<ModelGraph> make_model_graph(const ModelConfig& cfg,
             return std::make_unique<GemmaGraph>(cfg, std::move(weights));
 
         case PieArch::Gemma4:
+            return std::make_unique<Gemma4Graph>(cfg, std::move(weights));
+
         case PieArch::Qwen36:
             // Recognized arch, graph body in progress (ported from
             // driver/cuda/src/model/). Throw a clear diagnostic rather than
-            // silently mis-dispatching to the gemma3/qwen3 builder, whose math
-            // differs (gemma4: PLE/KV-share/parallel-MoE; qwen3.6: gated
-            // DeltaNet linear-attn + MoE). Pending beta's moe_ffn /
-            // gated_delta_net ops + delta's linear-attn state cache.
+            // silently mis-dispatching to the qwen3 builder, whose math
+            // differs (qwen3.6: gated DeltaNet linear-attn + MoE). Pending
+            // beta's gated_delta_net op + delta's linear-attn state cache.
             throw std::runtime_error(
                 std::string("make_model_graph: architecture '") +
                 pie_arch_name(cfg.arch) +
@@ -64,6 +66,8 @@ ModelWeights bind_weights(const WeightSource& src, const ModelConfig& cfg) {
             return bind_gemma(src, cfg);
 
         case PieArch::Gemma4:
+            return bind_gemma4(src, cfg);
+
         case PieArch::Qwen36:
             throw std::runtime_error(
                 std::string("bind_weights: architecture '") +
