@@ -6,6 +6,7 @@
 
 #include <mlx/ops.h>
 
+#include "ops/compiled.hpp"
 #include "ops/ops.hpp"
 
 namespace pie_metal_driver::model {
@@ -16,6 +17,22 @@ namespace {
 
 std::string layer_prefix(const std::string& root, std::int32_t il) {
     return root + "layers." + std::to_string(il) + ".";
+}
+
+// ── Compiled FFN region (gemma4): pre-FFN norm -> gate/up -> GeGLU-tanh ->
+// down -> post-FFN norm -> residual, fused via mx::compile into one kernel
+// sequence. This collapses the loose-pointwise launch-storm (two sandwich
+// norms + geglu + residual around the GEMVs) that dominates batch=1 decode.
+// Must be a capture-less function pointer; eps is the gemma4 config literal
+// (1e-6, plain RMSNorm). in = {hidden, ffn_norm_w, gate_w, up_w, down_w,
+// post_ffn_norm_w}.
+std::vector<Tensor> gemma4_ffn(const std::vector<Tensor>& in) {
+    Tensor normed = ops::rms_norm(in[0], in[1], 1e-6f, /*plus_one=*/false);
+    Tensor gate   = ops::linear(in[2], normed);
+    Tensor up     = ops::linear(in[3], normed);
+    Tensor down   = ops::linear(in[4], ops::geglu(gate, up, /*tanh_approx=*/true));
+    Tensor post   = ops::rms_norm(down, in[5], 1e-6f, /*plus_one=*/false);
+    return { ops::residual_add(post, in[0]) };
 }
 
 Tensor to_heads(const Tensor& x, std::int32_t n_tokens,
@@ -114,15 +131,14 @@ Tensor Gemma4Graph::decoder_layer(std::int32_t il,
     attn_out = ops::rms_norm(attn_out, *L.post_attn_norm, eps, /*plus_one=*/false);
     hidden = ops::residual_add(attn_out, residual);
 
-    // ── FFN block (norm sandwich; GeGLU-tanh) ──
-    Tensor ffn_residual = hidden;
-    Tensor normed = ops::rms_norm(hidden, *L.ffn_norm, eps, /*plus_one=*/false);
-    Tensor gate = ops::linear(*L.gate_proj, normed);
-    Tensor up   = ops::linear(*L.up_proj,   normed);
-    Tensor ffn_out = ops::linear(*L.down_proj,
-                                 ops::geglu(gate, up, /*tanh_approx=*/true));
-    ffn_out = ops::rms_norm(ffn_out, *L.post_ffn_norm, eps, /*plus_one=*/false);
-    hidden = ops::residual_add(ffn_out, ffn_residual);
+    // ── FFN block (norm sandwich; GeGLU-tanh) — fused via mx::compile to
+    // collapse the loose pointwise glue (sandwich norms + geglu + residual)
+    // into one traced kernel sequence; the dominant batch=1 decode overhead. ──
+    hidden = ops::compiled(
+        "gemma4.ffn",
+        {hidden, *L.ffn_norm, *L.gate_proj, *L.up_proj, *L.down_proj,
+         *L.post_ffn_norm},
+        gemma4_ffn)[0];
 
     // ── PLE residual: GeGLU-gate the per-layer signal back into the stream ──
     // ple_gate = ple_input_gate(hidden); GeGLU_tanh(ple_gate, signal);
