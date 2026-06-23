@@ -272,6 +272,7 @@ class TestGenerator:
 
         def bid(self, value: float) -> None:
             self.bids.append(value)
+            self._inner.bid(value)
 
         def __getattr__(self, name):
             return getattr(self._inner, name)
