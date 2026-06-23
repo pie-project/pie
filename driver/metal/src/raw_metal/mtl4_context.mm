@@ -26,10 +26,10 @@ inline double nowms() {
     return std::chrono::duration<double, std::milli>(clk::now().time_since_epoch()).count();
 }
 inline size_t align_up(size_t v, size_t a) { return (v + (a - 1)) & ~(a - 1); }
-// Stable integer key for an argument-table dispatch instance.
-inline int argkey(Kernel k, int layer) {
-    return (static_cast<int>(k) << 8) | (static_cast<uint8_t>(layer + 1));
-}
+// The arg-table key is the FLAT DISPATCH ORDINAL alone (beta's DAG walker, 0..321,
+// or -1 for a singleton). Kind is decorative: within one layer Rms/Residual recur,
+// so (kind, layer) collides — the ordinal is the only unique key.
+inline int argkey(int ordinal) { return ordinal; }
 }  // namespace
 
 // ── Per-step encoder state (transient, lives across one run_step) ─────────────
@@ -58,11 +58,11 @@ struct RawMetalContext::Impl {
 
     StepState step;  // active step (during run_step)
 
-    id<MTL4ArgumentTable> argtable_for(Kernel k, int layer, bool create);
+    id<MTL4ArgumentTable> argtable_for(int ordinal, bool create);
 };
 
-id<MTL4ArgumentTable> RawMetalContext::Impl::argtable_for(Kernel k, int layer, bool create) {
-    NSNumber* key = @(argkey(k, layer));
+id<MTL4ArgumentTable> RawMetalContext::Impl::argtable_for(int ordinal, bool create) {
+    NSNumber* key = @(argkey(ordinal));
     id<MTL4ArgumentTable> t = argtables[key];
     if (t == nil && create) {
         MTL4ArgumentTableDescriptor* ad = [MTL4ArgumentTableDescriptor new];
@@ -84,12 +84,15 @@ void StepEncoder::set_pso(Pso pso) {
     auto* s = static_cast<StepState*>(impl_);
     [s->en setComputePipelineState:(__bridge id<MTLComputePipelineState>)pso.obj];
 }
-void StepEncoder::set_argtable(Kernel k, int layer) {
+void StepEncoder::set_argtable(Kernel k, int ordinal) {
+    (void)k;  // decorative tag; ordinal is the key
+    set_argtable_ordinal(ordinal);
+}
+void StepEncoder::set_argtable_ordinal(int ordinal) {
     auto* s = static_cast<StepState*>(impl_);
-    id<MTL4ArgumentTable> t = s->ctx->argtable_for(k, layer, /*create=*/false);
+    id<MTL4ArgumentTable> t = s->ctx->argtable_for(ordinal, /*create=*/false);
     if (t == nil) {
-        fprintf(stderr, "[raw_metal] no argument table bound for kernel=%d layer=%d\n",
-                static_cast<int>(k), layer);
+        fprintf(stderr, "[raw_metal] no argument table bound for ordinal=%d\n", ordinal);
         return;
     }
     [s->en setArgumentTable:t];
@@ -192,10 +195,16 @@ void RawMetalContext::make_resident() {
     [I.rs requestResidency];
 }
 
-void RawMetalContext::arg_bind(Kernel k, int layer, uint8_t bind_index, SlotHandle slot,
+void RawMetalContext::arg_bind(Kernel k, int ordinal, uint8_t bind_index, SlotHandle slot,
                                size_t offset) {
+    (void)k;  // decorative tag; ordinal is the key
+    arg_bind_ordinal(ordinal, bind_index, slot, offset);
+}
+
+void RawMetalContext::arg_bind_ordinal(int ordinal, uint8_t bind_index, SlotHandle slot,
+                                       size_t offset) {
     auto& I = *impl_;
-    id<MTL4ArgumentTable> t = I.argtable_for(k, layer, /*create=*/true);
+    id<MTL4ArgumentTable> t = I.argtable_for(ordinal, /*create=*/true);
     if (t == nil) return;
     [t setAddress:(slot.gpu_address + offset) atIndex:bind_index];
 }

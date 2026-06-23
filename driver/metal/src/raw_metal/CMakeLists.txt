@@ -35,6 +35,14 @@ target_link_libraries(raw_metal_harness PRIVATE
   "-framework Metal"
   "-framework Foundation")
 
+# nlohmann/json for the safetensors header parse (reuse the driver's fetched copy).
+find_path(NLOHMANN_JSON_INCLUDE nlohmann/json.hpp
+  PATHS
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../build-gpu/_deps/json-src/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../build-nomlx/_deps/json-src/include
+    /opt/homebrew/include
+  NO_DEFAULT_PATH)
+
 # Micro-bench for delta's real ported kernels (first gpu-exec-ms datapoint).
 add_executable(raw_metal_microbench
   bench_kernels.cpp
@@ -48,6 +56,16 @@ target_compile_definitions(raw_metal_microbench PRIVATE
 target_link_libraries(raw_metal_microbench PRIVATE
   "-framework Metal"
   "-framework Foundation")
+
+# Raw safetensors byte reader (MLX-free) + probe — the weight-staging handoff for
+# delta's heap_bind. Pure C++/POSIX, no Metal.
+if(NLOHMANN_JSON_INCLUDE)
+  add_executable(st_probe st_probe.cpp safetensors_view.cpp)
+  target_include_directories(st_probe PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${NLOHMANN_JSON_INCLUDE})
+else()
+  message(WARNING "nlohmann/json.hpp not found — st_probe (safetensors handoff) skipped. "
+                  "Set -DNLOHMANN_JSON_INCLUDE=<dir>.")
+endif()
 
 if(PIE_RAW_METAL_AOT)
   message(WARNING "PIE_RAW_METAL_AOT is a Phase-1 stub: requires the Metal Toolchain "
