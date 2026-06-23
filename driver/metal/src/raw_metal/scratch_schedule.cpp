@@ -47,7 +47,8 @@ constexpr uint8_t SiluGate = 0, SiluUp = 1, SiluOut = 2;  // bind::SiluMul
 }  // namespace
 
 ScratchSchedule build_scratch_schedule(const std::vector<Dispatch>& dag,
-                                       const DecodeGeometry& g) {
+                                       const DecodeGeometry& g,
+                                       bool no_recycle) {
     std::vector<Use> uses;
     int next_value = 0;
     auto fresh = [&]() { return next_value++; };
@@ -215,14 +216,20 @@ ScratchSchedule build_scratch_schedule(const std::vector<Dispatch>& dag,
 
     std::vector<int> color(nval, -1);
     std::vector<int> buf_free_at;  // buf_free_at[b] = ordinal after which buffer b is free
-    for (int v : order) {
-        int chosen = -1;
-        for (size_t b = 0; b < buf_free_at.size(); ++b) {
-            if (buf_free_at[b] < def[v]) { chosen = (int)b; break; }  // strictly before -> no overlap
+    if (no_recycle) {
+        // One buffer per value: zero reuse. Preserves every intermediate for dumping and
+        // isolates scratch-aliasing races from in-kernel races.
+        for (int v = 0; v < nval; ++v) { color[v] = v; buf_free_at.push_back(last[v]); }
+    } else {
+        for (int v : order) {
+            int chosen = -1;
+            for (size_t b = 0; b < buf_free_at.size(); ++b) {
+                if (buf_free_at[b] < def[v]) { chosen = (int)b; break; }  // strictly before -> no overlap
+            }
+            if (chosen < 0) { chosen = (int)buf_free_at.size(); buf_free_at.push_back(-1); }
+            color[v] = chosen;
+            buf_free_at[chosen] = last[v];
         }
-        if (chosen < 0) { chosen = (int)buf_free_at.size(); buf_free_at.push_back(-1); }
-        color[v] = chosen;
-        buf_free_at[chosen] = last[v];
     }
 
     ScratchSchedule sched;
