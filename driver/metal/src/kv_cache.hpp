@@ -219,6 +219,23 @@ public:
         }
     }
 
+    // Donation-preserving variant: MOVE the own-buffer arrays out (leaving the
+    // cache's slots in a moved-from state until the next `restore`), so the
+    // returned vector holds the SOLE reference to each buffer. Threaded as
+    // compile inputs this lets MLX donate the input buffer to the scattered
+    // output (in-place KV update) instead of copying the whole paged buffer
+    // every token — the copy that otherwise scales with total_pages.
+    std::vector<Tensor> snapshot_move() {
+        std::vector<Tensor> out;
+        out.reserve(k_pages_.size() * 2);
+        for (std::size_t l = 0; l < specs_.size(); ++l) {
+            if (specs_[l].n_pages == 0) continue;
+            out.push_back(std::move(k_pages_[l]));
+            out.push_back(std::move(v_pages_[l]));
+        }
+        return out;
+    }
+
 private:
     void allocate() {
         k_pages_.clear();

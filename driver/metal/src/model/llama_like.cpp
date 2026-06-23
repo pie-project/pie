@@ -1,6 +1,7 @@
 #include "model/llama_like.hpp"
 
 #include <cmath>
+#include <cstdlib>
 #include <stdexcept>
 #include <string>
 
@@ -11,6 +12,24 @@
 namespace pie_metal_driver::model {
 
 namespace {
+
+// Route single-stream (R=1) pure_decode through the host-readback-free device
+// decode attention (no per-token/per-layer `to_host_i32` sync), mirroring
+// Piece-1 already shipped for qwen36/gemma4. Default ON; PIE_DEVICE_DECODE=0
+// falls back to the host-readback paged_attention path. Gated to the cases
+// where paged_attention_decode is bit-exact (R=1, no softcap).
+bool device_decode_enabled() {
+    static const bool on = [] {
+        const char* e = std::getenv("PIE_DEVICE_DECODE");
+        return !(e && e[0] == '0');  // default on; PIE_DEVICE_DECODE=0 disables
+    }();
+    return on;
+}
+
+bool use_device_decode(const ForwardBatch& batch, const ops::AttnParams& ap) {
+    return device_decode_enabled() && batch.pure_decode &&
+           batch.n_requests <= 1 && ap.softcap == 0.0f;
+}
 
 // HF tensor-name helpers (canonical "model." namespace; multimodal prefix
 // remapping is the loader's job before binding).
@@ -130,10 +149,15 @@ Tensor LlamaLikeGraph::decoder_layer(std::int32_t il,
     ap.n_kv_heads = n_kv_heads;
     ap.head_dim   = head_dim;
 
-    Tensor attn = ops::paged_attention(
-        Q, kv.k_pages(il), kv.v_pages(il),
-        batch.kv_page_indices, batch.qo_indptr, batch.kv_page_indptr,
-        batch.kv_last_page_lens, kv.page_size(), ap);
+    Tensor attn = use_device_decode(batch, ap)
+        ? ops::paged_attention_decode(
+              Q, kv.k_pages(il), kv.v_pages(il),
+              batch.kv_page_indices, batch.kv_last_page_lens,
+              kv.page_size(), ap)
+        : ops::paged_attention(
+              Q, kv.k_pages(il), kv.v_pages(il),
+              batch.kv_page_indices, batch.qo_indptr, batch.kv_page_indptr,
+              batch.kv_last_page_lens, kv.page_size(), ap);
 
     attn = from_heads(attn, n_total, n_q_heads * head_dim);
     Tensor attn_out = apply_linear(L.o_proj, attn);
