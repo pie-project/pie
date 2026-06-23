@@ -245,4 +245,45 @@ Tensor paged_attention(const Tensor& q, const PagedKV& kv,
                            kv.page_size, params);
 }
 
+Tensor paged_attention_decode(const Tensor& q,
+                              const Tensor& k_cache,
+                              const Tensor& v_cache,
+                              const Tensor& page_table,
+                              const Tensor& last_page_len,
+                              int page_size,
+                              const AttnParams& params) {
+    const float scale = resolve_scale(params);
+    const int n_pages  = page_table.shape(0);   // trace-time shape (R=1: all pages)
+    const int kv_heads = k_cache.shape(2);
+    const int head_dim = k_cache.shape(3);
+    const int L = n_pages * page_size;           // gathered key length (trace-time)
+
+    // Device-only page gather + flatten to [L, Hkv, d]. No host readback.
+    Tensor pages  = mx::astype(page_table, mx::int32);
+    Tensor k_pg   = mx::take(k_cache, pages, 0);   // [n_pages, page_size, Hkv, d]
+    Tensor v_pg   = mx::take(v_cache, pages, 0);
+    Tensor k_flat = mx::reshape(k_pg, {L, kv_heads, head_dim});
+    Tensor v_flat = mx::reshape(v_pg, {L, kv_heads, head_dim});
+
+    // Valid length n_kv = (n_pages-1)*page_size + last_page_len  (device scalar).
+    Tensor lpl  = mx::astype(mx::reshape(last_page_len, {1}), mx::int32);
+    Tensor n_kv = mx::add(mx::array((n_pages - 1) * page_size, mx::int32), lpl);  // [1]
+
+    // Additive mask over the L gathered keys: keep idx < n_kv (drop the padding
+    // tail of the last page) and, for SWA, idx > (n_kv-1) - window. The single
+    // decode query sits at absolute position n_kv-1.
+    Tensor idx     = mx::arange(0, L, mx::int32);          // [L]
+    Tensor allowed = mx::less(idx, n_kv);                  // [L] (broadcast over [1])
+    if (params.sliding_window > 0) {
+        Tensor lo = mx::subtract(n_kv, mx::array(params.sliding_window + 1, mx::int32));
+        allowed = mx::logical_and(allowed, mx::greater(idx, lo));
+    }
+    const float neg_inf = -std::numeric_limits<float>::infinity();
+    Tensor mask_add = mx::astype(
+        mx::where(allowed, mx::array(0.0f), mx::array(neg_inf)), q.dtype());
+    Tensor mask4 = mx::reshape(mask_add, {1, 1, 1, L});  // broadcast to [1,H,1,L]
+
+    return sdpa_contiguous(q, k_flat, v_flat, scale, "", mask4);
+}
+
 }  // namespace pie_metal_driver::ops

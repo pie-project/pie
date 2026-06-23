@@ -1,11 +1,13 @@
 #include "model/gemma4.hpp"
 
 #include <cmath>
+#include <cstdlib>
 #include <stdexcept>
 #include <string>
 
 #include <mlx/ops.h>
 
+#include "ops/attention.hpp"
 #include "ops/compiled.hpp"
 #include "ops/ops.hpp"
 
@@ -14,6 +16,17 @@ namespace pie_metal_driver::model {
 namespace mx = mlx::core;
 
 namespace {
+
+// Measure-only B2 prototype switch: route single-stream (R=1) pure_decode
+// through the host-readback-free device decode attention so the whole step can
+// live inside an mx::compile trace. Off by default (production unchanged).
+bool device_decode_enabled() {
+    static const bool on = [] {
+        const char* e = std::getenv("PIE_DEVICE_DECODE");
+        return e && e[0] && e[0] != '0';
+    }();
+    return on;
+}
 
 std::string layer_prefix(const std::string& root, std::int32_t il) {
     return root + "layers." + std::to_string(il) + ".";
@@ -162,10 +175,15 @@ Tensor Gemma4Graph::decoder_layer(std::int32_t il,
     ap.n_kv_heads     = n_kv_heads;
     ap.head_dim       = head_dim;
 
-    Tensor attn = ops::paged_attention(
-        Q, k_pages, v_pages,
-        batch.kv_page_indices, batch.qo_indptr, batch.kv_page_indptr,
-        batch.kv_last_page_lens, kv.page_size(), ap);
+    Tensor attn = (device_decode_enabled() && batch.pure_decode)
+        ? ops::paged_attention_decode(
+              Q, k_pages, v_pages,
+              batch.kv_page_indices, batch.kv_last_page_lens,
+              kv.page_size(), ap)
+        : ops::paged_attention(
+              Q, k_pages, v_pages,
+              batch.kv_page_indices, batch.qo_indptr, batch.kv_page_indptr,
+              batch.kv_last_page_lens, kv.page_size(), ap);
 
     attn = from_heads(attn, n_total, n_q_heads * head_dim);
     Tensor attn_out = apply_linear(L.o_proj, attn);

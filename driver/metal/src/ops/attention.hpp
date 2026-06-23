@@ -75,4 +75,19 @@ Tensor paged_attention(const Tensor& q,
 Tensor paged_attention(const Tensor& q, const PagedKV& kv,
                        const AttnParams& params);
 
+// Host-readback-FREE single-stream (R=1) decode attention. Same paged buffers,
+// but the per-request CSR offsets stay on-device: pages are gathered with
+// `take(page_table)`, and the valid-length clip + sliding window are expressed
+// as an additive device mask derived from `last_page_len` (a device scalar) —
+// NO `to_host_i32`. This keeps the whole decode step inside an `mx::compile`
+// trace (the paged buffers are fixed-shape; the gathered length grows only per
+// page, so compile retraces once per page bucket). q must be [1, H, head_dim].
+Tensor paged_attention_decode(const Tensor& q,
+                              const Tensor& k_cache,
+                              const Tensor& v_cache,
+                              const Tensor& page_table,
+                              const Tensor& last_page_len,
+                              int page_size,
+                              const AttnParams& params);
+
 }  // namespace pie_metal_driver::ops

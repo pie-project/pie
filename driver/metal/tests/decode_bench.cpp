@@ -27,6 +27,7 @@
 #include <vector>
 
 #include <mlx/mlx.h>
+#include <mlx/compile.h>
 
 #include "loader/model_loader.hpp"
 #include "model/model_graph.hpp"
@@ -63,6 +64,27 @@ model::ForwardBatch make_batch(const std::vector<int>& toks,
     };
 }
 
+// Single-token pure_decode batch whose input token is a DEVICE array (fed back
+// from the previous step's argmax without a host readback) — for the pipelined
+// path. Position + page metadata are host-deterministic.
+model::ForwardBatch make_batch_dev(const mx::array& tok_dev, int pos, int page_size) {
+    const int n_pages = pos / page_size + 1;
+    std::vector<int> page_idx(n_pages);
+    for (int i = 0; i < n_pages; ++i) page_idx[i] = i;
+    const int last_page_len = pos % page_size + 1;
+    return model::ForwardBatch{
+        mx::astype(tok_dev, mx::int32),
+        mx::array({pos}, {1}, mx::int32),
+        mx::array({0}, {1}, mx::int32),
+        mx::array(page_idx.data(), {n_pages}, mx::int32),
+        mx::array({0, n_pages}, {2}, mx::int32),
+        mx::array({last_page_len}, {1}, mx::int32),
+        mx::array({0, 1}, {2}, mx::int32),
+        mx::array({pos}, {1}, mx::int32),
+        1, 1, 1, /*pure_decode=*/true,
+    };
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -75,6 +97,9 @@ int main(int argc, char** argv) {
     const int steps   = argc > 3 ? std::stoi(argv[3]) : 256;
 
     BatchingConfig batching;
+    if (const char* tp = std::getenv("PIE_TOTAL_PAGES")) {
+        batching.total_pages = static_cast<std::uint32_t>(std::atoi(tp));
+    }
     loader::LoadedModel model = [&] {
         try {
             return loader::load_model(hf_path, batching);
@@ -106,6 +131,8 @@ int main(int argc, char** argv) {
         return 3;
     }
 
+    std::vector<std::uint32_t>* dump = nullptr;
+    std::vector<std::uint32_t> seq;
     auto run_decode = [&](int n_steps) -> double {
         int tok = 5;
         auto t0 = std::chrono::high_resolution_clock::now();
@@ -115,14 +142,137 @@ int main(int argc, char** argv) {
             mx::array next = mx::astype(mx::argmax(logits, 1), mx::uint32);
             next.eval();  // greedy-sampler autoregressive barrier (1 eval/token)
             tok = static_cast<int>(next.item<std::uint32_t>());
+            if (dump) dump->push_back(static_cast<std::uint32_t>(tok));
         }
         auto t1 = std::chrono::high_resolution_clock::now();
         return n_steps / std::chrono::duration<double>(t1 - t0).count();
     };
 
-    run_decode(16);  // warmup
+    // ── B2 prototype: whole-step compiled decode (PIE_COMPILE_DECODE=1) ──
+    // Wraps the ENTIRE per-token forward (embedding -> layers -> lm_head) in one
+    // mx::compile trace so the per-token CPU encode is cached & replayed instead
+    // of rebuilt. The paged-KV buffers are threaded as functional inputs/outputs
+    // (captured arrays would be baked as constants and never update). Requires
+    // PIE_DEVICE_DECODE=1 so the attention op is host-readback-free; otherwise
+    // paged_attention's to_host_i32 breaks the trace. Nesting the existing
+    // ops::compiled FFN/PLE regions inside this outer compile tests charlie's
+    // open question #5 (does mx::compile compose nested compiles?).
+    const bool use_compile = [] {
+        const char* e = std::getenv("PIE_COMPILE_DECODE");
+        return e && e[0] && e[0] != '0';
+    }();
+
+    PagedKvCache* kvp = model.kv.get();
+    model::ModelGraph* g = model.graph.get();
+    auto step_fn = [g, kvp](const std::vector<mx::array>& in) -> std::vector<mx::array> {
+        // in: [token, pos, page_idx, last_page_len, write_idx, k0,v0,k1,v1,...]
+        std::vector<mx::array> kvbuf(in.begin() + 5, in.end());
+        kvp->restore(kvbuf);
+        const int n_pages = in[2].shape(0);
+        model::ForwardBatch b{
+            in[0], in[1], mx::array({0}, {1}, mx::int32),
+            in[2], mx::array({0, n_pages}, {2}, mx::int32), in[3],
+            mx::array({0, 1}, {2}, mx::int32), in[4],
+            1, 1, 1, /*pure_decode=*/true,
+        };
+        mx::array logits = g->forward(b, *kvp);  // [1, vocab]
+        std::vector<mx::array> out;
+        out.push_back(logits);
+        for (auto& t : kvp->snapshot()) out.push_back(t);
+        return out;
+    };
+    auto compiled_step = mx::compile(step_fn, /*shapeless=*/false);
+
+    auto run_decode_compiled = [&](int n_steps) -> double {
+        int tok = 5;
+        auto t0 = std::chrono::high_resolution_clock::now();
+        for (int t = 0; t < n_steps; ++t) {
+            const int pos = prefill + t;
+            const int n_pages = pos / ps + 1;
+            const int lpl = pos % ps + 1;
+            std::vector<int> page_idx(n_pages);
+            for (int i = 0; i < n_pages; ++i) page_idx[i] = i;
+            std::vector<mx::array> in;
+            in.push_back(mx::array({tok}, {1}, mx::int32));
+            in.push_back(mx::array({pos}, {1}, mx::int32));
+            in.push_back(mx::array(page_idx.data(), {n_pages}, mx::int32));
+            in.push_back(mx::array({lpl}, {1}, mx::int32));
+            in.push_back(mx::array({pos}, {1}, mx::int32));  // write_idx = pos
+            for (auto& kb : kvp->snapshot()) in.push_back(kb);
+            std::vector<mx::array> outs = compiled_step(in);
+            std::vector<mx::array> newkv(outs.begin() + 1, outs.end());
+            kvp->restore(newkv);
+            mx::array next = mx::astype(mx::argmax(outs[0], 1), mx::uint32);
+            std::vector<mx::array> bar = {next};
+            for (auto& t2 : newkv) bar.push_back(t2);
+            mx::eval(bar);  // one barrier: next token + updated KV
+            tok = static_cast<int>(next.item<std::uint32_t>());
+            if (dump) dump->push_back(static_cast<std::uint32_t>(tok));
+        }
+        auto t1 = std::chrono::high_resolution_clock::now();
+        return n_steps / std::chrono::duration<double>(t1 - t0).count();
+    };
+    std::function<double(int)> decode = [&](int n) {
+        return use_compile ? run_decode_compiled(n) : run_decode(n);
+    };
+
+    // ── Pipelined decode (PIE_PIPELINE_DECODE=1): the actual ceiling lever ──
+    // Mirrors mlx_lm's generate_step: the sampled token is kept as a DEVICE
+    // array fed straight back as the next input (positions/page metadata are
+    // host-deterministic, no readback), and each step's forward is submitted
+    // with async_eval while we block-read the PREVIOUS token. This overlaps
+    // token N+1's compute (incl. CPU encode) with token N's argmax->item sync,
+    // hiding the per-token barrier that mx::compile alone can't recover.
+    const bool use_pipeline = [] {
+        const char* e = std::getenv("PIE_PIPELINE_DECODE");
+        return e && e[0] && e[0] != '0';
+    }();
+    auto run_decode_pipelined = [&](int n_steps) -> double {
+        mx::array y = mx::array({5}, {1}, mx::int32);  // device input token
+        mx::array prev = y;
+        auto submit = [&](const mx::array& tok_dev, int pos) -> mx::array {
+            auto b = make_batch_dev(tok_dev, pos, ps);
+            mx::array logits = model.graph->forward(b, *model.kv);  // lazy
+            mx::array next = mx::astype(mx::argmax(logits, 1), mx::int32);
+            // Only async_eval `next`: its dependency forces this token's KV
+            // scatter (touched pages) while preserving in-place donation —
+            // snapshotting the full paged buffers would add references and
+            // defeat donation (the regression seen with the compiled path).
+            mx::async_eval(std::vector<mx::array>{next});  // non-blocking submit
+            return next;
+        };
+        auto t0 = std::chrono::high_resolution_clock::now();
+        for (int t = 0; t < n_steps; ++t) {
+            mx::array next = submit(y, prefill + t);
+            if (t > 0) {  // block-read the PREVIOUS step (overlaps with this GPU work)
+                int tok = static_cast<int>(prev.item<std::int32_t>());
+                if (dump) dump->push_back(static_cast<std::uint32_t>(tok));
+            }
+            prev = next;
+            y = next;
+        }
+        int last = static_cast<int>(prev.item<std::int32_t>());  // drain
+        if (dump) dump->push_back(static_cast<std::uint32_t>(last));
+        auto t1 = std::chrono::high_resolution_clock::now();
+        return n_steps / std::chrono::duration<double>(t1 - t0).count();
+    };
+    if (use_pipeline) decode = [&](int n) { return run_decode_pipelined(n); };
+
+    // Accuracy probe: BENCH_DUMP=N prints the first N greedy decode tokens
+    // (deterministic argmax) so two builds can be diffed for parity.
+    if (const char* d = std::getenv("BENCH_DUMP")) {
+        int n = std::atoi(d); if (n < 1) n = 32;
+        dump = &seq;
+        decode(n);
+        std::cerr << "[dump]";
+        for (auto v : seq) std::cerr << " " << v;
+        std::cerr << "\n";
+        return 0;
+    }
+
+    decode(16);  // warmup
     std::vector<double> tps;
-    for (int r = 0; r < 3; ++r) tps.push_back(run_decode(steps));
+    for (int r = 0; r < 3; ++r) tps.push_back(decode(steps));
     std::sort(tps.begin(), tps.end());
     std::cerr << "[bench] in-process decode tok/s (median-3): " << tps[1]
               << "  (runs: " << tps[0] << " / " << tps[1] << " / " << tps[2]
