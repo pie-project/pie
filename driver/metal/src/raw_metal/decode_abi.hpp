@@ -137,8 +137,10 @@ enum class AttnGate : uint8_t { Attn = 0, Gate = 1 };
 // single-token rope (partial + mrope): PositionPtr is IO::Position (I1).
 enum class Rope : uint8_t { Q = 0, K = 1, QOut = 2, KOut = 3, PositionPtr = 4, Theta = 5 };
 
-// embedding gather: TokenIdPtr is IO::TokenId (I1).
-enum class Embed : uint8_t { Table = 0, TokenIdPtr = 1, Out = 2 };
+// embedding gather (4-bit dequant of the shared lm_head bundle; tied). TokenId is
+// IO::TokenId (I1). Matches embed_gather.metal: W/Scales/Biases (same 4-bit packing
+// as Qmv) + token id + out + hidden. Bound to the SAME lm_head slots as QmvLmHead.
+enum class Embed : uint8_t { W = 0, Scales = 1, Biases = 2, TokenId = 3, Out = 4, Hidden = 5 };
 
 // KV append (in-place write at position): PositionPtr is IO::Position (I1).
 enum class KvAppend : uint8_t { K = 0, V = 1, KPages = 2, VPages = 3, PositionPtr = 4 };

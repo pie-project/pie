@@ -62,6 +62,11 @@ target_link_libraries(raw_metal_microbench PRIVATE
 if(NLOHMANN_JSON_INCLUDE)
   add_executable(st_probe st_probe.cpp safetensors_view.cpp)
   target_include_directories(st_probe PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${NLOHMANN_JSON_INCLUDE})
+
+  # heap_bind weight-name registry probe: verify delta's (kind,layer)->tensor mapping
+  # against a real checkpoint (presence/dtype/byte-accounting), no Metal dependency.
+  add_executable(heap_bind_probe heap_bind_probe.cpp heap_bind_names.cpp safetensors_view.cpp)
+  target_include_directories(heap_bind_probe PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${NLOHMANN_JSON_INCLUDE})
 else()
   message(WARNING "nlohmann/json.hpp not found — st_probe (safetensors handoff) skipped. "
                   "Set -DNLOHMANN_JSON_INCLUDE=<dir>.")
