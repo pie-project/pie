@@ -14,6 +14,8 @@
 
 #include <cstdint>
 #include <cstdlib>
+#include <fstream>
+#include <algorithm>
 #include <iostream>
 #include <sstream>
 #include <string>
@@ -42,6 +44,26 @@ static std::vector<int> parse_ids(const std::string& csv) {
     return ids;
 }
 
+// Token-id chunks for the perplexity sweep. If `arg` begins with '@', it is a
+// path to a file with one comma-separated chunk per line (so the model loads
+// once and we accumulate NLL over the whole wikitext stream). Otherwise it is a
+// single comma-separated chunk (the original single-prompt behaviour).
+static std::vector<std::vector<int>> read_chunks(const std::string& arg) {
+    std::vector<std::vector<int>> chunks;
+    if (!arg.empty() && arg[0] == '@') {
+        std::ifstream in(arg.substr(1));
+        std::string line;
+        while (std::getline(in, line)) {
+            std::vector<int> ids = parse_ids(line);
+            if (!ids.empty()) chunks.push_back(std::move(ids));
+        }
+    } else {
+        std::vector<int> ids = parse_ids(arg);
+        if (!ids.empty()) chunks.push_back(std::move(ids));
+    }
+    return chunks;
+}
+
 int main(int argc, char** argv) {
     if (argc < 4) {
         std::cerr << "usage: parity_driver <hf_path> <comma_token_ids> "
@@ -49,12 +71,13 @@ int main(int argc, char** argv) {
         return 2;
     }
     const std::string hf_path = argv[1];
-    const std::vector<int> ids = parse_ids(argv[2]);
+    const std::vector<std::vector<int>> chunks = read_chunks(argv[2]);
     const std::string out_npy = argv[3];
-    if (ids.empty()) {
+    if (chunks.empty() || chunks[0].empty()) {
         std::cerr << "[parity] no token ids parsed\n";
         return 2;
     }
+    const std::vector<int>& ids = chunks[0];
 
     mx::set_default_device(mx::Device::gpu);
     std::cerr << "[parity] default_device = "
@@ -62,12 +85,13 @@ int main(int argc, char** argv) {
               << ", n_tokens = " << ids.size() << "\n";
 
     BatchingConfig batching;  // defaults: page=32, total_pages=1024
-    // Long-context (perplexity) windows: size one KV page to the whole sequence
+    // Long-context (perplexity) windows: size one KV page to the longest chunk
     // (the prefill/decode paths here use a single page) and shrink the pool so
     // the larger page doesn't blow up KV memory. Only grows past the 32 default.
-    const int n_ids = static_cast<int>(ids.size());
-    if (n_ids > static_cast<int>(batching.kv_page_size)) {
-        batching.kv_page_size = static_cast<std::uint32_t>(n_ids);
+    int max_len = 0;
+    for (const auto& ch : chunks) max_len = std::max(max_len, static_cast<int>(ch.size()));
+    if (max_len > static_cast<int>(batching.kv_page_size)) {
+        batching.kv_page_size = static_cast<std::uint32_t>(max_len);
         batching.total_pages  = 8;
         std::cerr << "[parity] long-ctx: kv_page_size=" << batching.kv_page_size
                   << " total_pages=" << batching.total_pages << "\n";
@@ -117,76 +141,90 @@ int main(int argc, char** argv) {
     const char* pplenv = std::getenv("PIE_PARITY_PPL");
     const bool ppl_mode = pplenv != nullptr && pplenv[0] != '\0' && pplenv[0] != '0';
     if (ppl_mode) {
-        std::cerr << "[parity] PPL mode (" << (decode_mode ? "decode-loop" : "prefill")
-                  << ") n=" << n << " vocab=" << c.vocab_size << "\n";
-        std::vector<int> all_rows(n);
-        for (int i = 0; i < n; ++i) all_rows[i] = i;
-        mx::array all = [&] {
-            if (!decode_mode) {
-                model::ForwardBatch batch{
-                    /*token_ids=*/        mx::array(ids.data(), {n}, mx::int32),
-                    /*positions=*/        mx::array(positions.data(), {n}, mx::int32),
-                    /*logit_rows=*/       mx::array(all_rows.data(), {n}, mx::int32),
-                    /*kv_page_indices=*/  mx::array({0}, {1}, mx::int32),
-                    /*kv_page_indptr=*/   mx::array({0, 1}, {2}, mx::int32),
-                    /*kv_last_page_lens=*/mx::array({n}, {1}, mx::int32),
-                    /*qo_indptr=*/        mx::array({0, n}, {2}, mx::int32),
-                    /*kv_write_indices=*/ mx::array(write_idx.data(), {n}, mx::int32),
-                    /*n_total=*/    n,
-                    /*n_requests=*/ 1,
-                    /*n_slots=*/    1,
-                    /*pure_decode=*/false,
-                };
-                batch.lin_cache = model.lin_cache.get();
-                batch.slot_ids  = mx::array({0}, {1}, mx::int32);
-                batch.qo_indptr_host = {0, n};
-                return mx::astype(model.graph->forward(batch, *model.kv),
-                                  mx::float32);  // [n, vocab]
-            }
-            if (model.lin_cache) model.lin_cache->reset_slot(0);
-            std::vector<mx::array> rows;
-            rows.reserve(n);
-            for (int t = 0; t < n; ++t) {
-                model::ForwardBatch step{
-                    /*token_ids=*/        mx::array({ids[t]}, {1}, mx::int32),
-                    /*positions=*/        mx::array({t}, {1}, mx::int32),
-                    /*logit_rows=*/       mx::array({0}, {1}, mx::int32),
-                    /*kv_page_indices=*/  mx::array({0}, {1}, mx::int32),
-                    /*kv_page_indptr=*/   mx::array({0, 1}, {2}, mx::int32),
-                    /*kv_last_page_lens=*/mx::array({t + 1}, {1}, mx::int32),
-                    /*qo_indptr=*/        mx::array({0, 1}, {2}, mx::int32),
-                    /*kv_write_indices=*/ mx::array({t}, {1}, mx::int32),
-                    /*n_total=*/    1,
-                    /*n_requests=*/ 1,
-                    /*n_slots=*/    1,
-                    /*pure_decode=*/true,
-                };
-                step.lin_cache = model.lin_cache.get();
-                step.slot_ids  = mx::array({0}, {1}, mx::int32);
-                step.qo_indptr_host = {0, 1};
-                rows.push_back(mx::astype(
-                    mx::reshape(model.graph->forward(step, *model.kv),
-                                {1, c.vocab_size}), mx::float32));
-                mx::eval(rows.back());
-            }
-            return mx::concatenate(rows, /*axis=*/0);  // [n, vocab]
-        }();
+        // Per-chunk teacher-forced NLL (load-once; accumulate across chunks).
+        auto chunk_nll = [&](const std::vector<int>& cids) -> std::pair<double, int> {
+            const int cn = static_cast<int>(cids.size());
+            if (cn < 2) return {0.0, 0};
+            std::vector<int> pos(cn), widx(cn), rows(cn);
+            for (int i = 0; i < cn; ++i) { pos[i] = i; widx[i] = i; rows[i] = i; }
+            mx::array all = [&] {
+                if (!decode_mode) {
+                    model::ForwardBatch batch{
+                        /*token_ids=*/        mx::array(cids.data(), {cn}, mx::int32),
+                        /*positions=*/        mx::array(pos.data(), {cn}, mx::int32),
+                        /*logit_rows=*/       mx::array(rows.data(), {cn}, mx::int32),
+                        /*kv_page_indices=*/  mx::array({0}, {1}, mx::int32),
+                        /*kv_page_indptr=*/   mx::array({0, 1}, {2}, mx::int32),
+                        /*kv_last_page_lens=*/mx::array({cn}, {1}, mx::int32),
+                        /*qo_indptr=*/        mx::array({0, cn}, {2}, mx::int32),
+                        /*kv_write_indices=*/ mx::array(widx.data(), {cn}, mx::int32),
+                        /*n_total=*/    cn,
+                        /*n_requests=*/ 1,
+                        /*n_slots=*/    1,
+                        /*pure_decode=*/false,
+                    };
+                    if (model.lin_cache) model.lin_cache->reset_slot(0);
+                    batch.lin_cache = model.lin_cache.get();
+                    batch.slot_ids  = mx::array({0}, {1}, mx::int32);
+                    batch.qo_indptr_host = {0, cn};
+                    return mx::astype(model.graph->forward(batch, *model.kv),
+                                      mx::float32);  // [cn, vocab]
+                }
+                if (model.lin_cache) model.lin_cache->reset_slot(0);
+                std::vector<mx::array> rws;
+                rws.reserve(cn);
+                for (int t = 0; t < cn; ++t) {
+                    model::ForwardBatch step{
+                        /*token_ids=*/        mx::array({cids[t]}, {1}, mx::int32),
+                        /*positions=*/        mx::array({t}, {1}, mx::int32),
+                        /*logit_rows=*/       mx::array({0}, {1}, mx::int32),
+                        /*kv_page_indices=*/  mx::array({0}, {1}, mx::int32),
+                        /*kv_page_indptr=*/   mx::array({0, 1}, {2}, mx::int32),
+                        /*kv_last_page_lens=*/mx::array({t + 1}, {1}, mx::int32),
+                        /*qo_indptr=*/        mx::array({0, 1}, {2}, mx::int32),
+                        /*kv_write_indices=*/ mx::array({t}, {1}, mx::int32),
+                        /*n_total=*/    1,
+                        /*n_requests=*/ 1,
+                        /*n_slots=*/    1,
+                        /*pure_decode=*/true,
+                    };
+                    step.lin_cache = model.lin_cache.get();
+                    step.slot_ids  = mx::array({0}, {1}, mx::int32);
+                    step.qo_indptr_host = {0, 1};
+                    rws.push_back(mx::astype(
+                        mx::reshape(model.graph->forward(step, *model.kv),
+                                    {1, c.vocab_size}), mx::float32));
+                    mx::eval(rws.back());
+                }
+                return mx::concatenate(rws, /*axis=*/0);  // [cn, vocab]
+            }();
+            const int np = cn - 1;  // score all-but-first: t<n-1 predicts t+1
+            mx::array pred = mx::slice(all, {0, 0}, {np, c.vocab_size});
+            std::vector<int> tgt(np);
+            for (int t = 0; t < np; ++t) tgt[t] = cids[t + 1];
+            mx::array tcol = mx::array(tgt.data(), {np, 1}, mx::int32);
+            mx::array lse  = mx::logsumexp(pred, /*axis=*/1, /*keepdims=*/true);
+            mx::array got  = mx::take_along_axis(pred, tcol, /*axis=*/1);
+            mx::array nll  = mx::sum(mx::subtract(lse, got));
+            mx::eval(nll);
+            return {static_cast<double>(nll.item<float>()), np};
+        };
 
-        // NLL over predictions t=0..n-2 (target = next token).
-        const int np = n - 1;
-        mx::array pred = mx::slice(all, {0, 0}, {np, c.vocab_size});  // [n-1, vocab]
-        std::vector<int> tgt(np);
-        for (int t = 0; t < np; ++t) tgt[t] = ids[t + 1];
-        mx::array tcol = mx::array(tgt.data(), {np, 1}, mx::int32);
-        mx::array lse  = mx::logsumexp(pred, /*axis=*/1, /*keepdims=*/true);  // [n-1,1]
-        mx::array got  = mx::take_along_axis(pred, tcol, /*axis=*/1);          // [n-1,1]
-        mx::array nll  = mx::sum(mx::subtract(lse, got));                      // scalar
-        mx::eval(nll);
-        std::cerr.setf(std::ios::fixed);
-        std::cerr.precision(8);
-        std::cerr << "[parity] PPL_NLL total_nll=" << nll.item<float>()
-                  << " n_pred=" << np << "\n";
-        std::cout << "PPL_NLL " << nll.item<float>() << " " << np << "\n";
+        std::cerr << "[parity] PPL mode (" << (decode_mode ? "decode-loop" : "prefill")
+                  << ") chunks=" << chunks.size() << " vocab=" << c.vocab_size << "\n";
+        double tot_nll = 0.0;
+        long   tot_np  = 0;
+        for (size_t ci = 0; ci < chunks.size(); ++ci) {
+            auto [nll, np] = chunk_nll(chunks[ci]);
+            tot_nll += nll;
+            tot_np  += np;
+            if (chunks.size() > 1 && (ci % 20 == 0 || ci + 1 == chunks.size())) {
+                std::cerr << "[parity] chunk " << (ci + 1) << "/" << chunks.size()
+                          << "  cum_nll=" << tot_nll << " cum_tok=" << tot_np
+                          << " ppl=" << std::exp(tot_nll / std::max(1L, tot_np)) << "\n";
+            }
+        }
+        std::cout << "PPL_NLL " << tot_nll << " " << tot_np << "\n";
         return 0;
     }
 
