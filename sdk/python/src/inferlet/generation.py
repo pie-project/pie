@@ -204,6 +204,7 @@ class Generator:
     def max_tokens(self, n: int) -> Generator:
         """Hard cap on tokens generated across all steps."""
         self._max_tokens = n
+        self._refresh_static_bid()
         return self
 
     def stop(self, tokens: Iterable[int]) -> Generator:
@@ -231,12 +232,14 @@ class Generator:
     def horizon(self, n: int) -> Generator:
         """Hint expected output length for budget planning."""
         self._horizon = n
+        self._refresh_static_bid()
         return self
 
     def rebid_each_step(self, enabled: bool) -> Generator:
         """Control whether the generator refreshes its scheduler bid before
         every decode step."""
         self._rebid_each_step = enabled
+        self._refresh_static_bid()
         return self
 
     def adapter(self, a: Adapter) -> Generator:
@@ -317,12 +320,13 @@ class Generator:
         balance = _sched.balance(self._ctx._model)
         dividend = _sched.dividend(self._ctx._model)
         pages = max(1.0, float(self._ctx._committed_pages + self._ctx._working_pages))
+        mu, cv2 = self._bid_shape()
         self._ctx.set_bid(
             _compute_bid(
                 balance,
                 pages,
-                4096.0,
-                1.0,
+                mu,
+                cv2,
                 float(self._ctx._page_size),
                 dividend,
             )
@@ -334,14 +338,19 @@ class Generator:
         pages = float(self._ctx._committed_pages + self._ctx._working_pages)
         page_size = float(self._ctx._page_size)
 
-        if self._horizon is not None:
-            mu, cv2 = max(self._horizon - self._tokens_generated, 1), 0.0
-        elif self._max_tokens is not None:
-            mu, cv2 = max(self._max_tokens - self._tokens_generated, 1), 1.0
-        else:
-            mu, cv2 = max(self._tokens_generated, 64), 1.0
-
+        mu, cv2 = self._bid_shape()
         self._ctx.set_bid(_compute_bid(balance, pages, mu, cv2, page_size, dividend))
+
+    def _bid_shape(self) -> tuple[float, float]:
+        if self._horizon is not None:
+            return float(max(self._horizon - self._tokens_generated, 1)), 0.0
+        if self._max_tokens is not None:
+            return float(max(self._max_tokens - self._tokens_generated, 1)), 1.0
+        return float(max(self._tokens_generated, 64)), 1.0
+
+    def _refresh_static_bid(self) -> None:
+        if not self._rebid_each_step:
+            self._prime_bid()
 
     # ── User-sampled mode ────────────────────────────────────────────
 

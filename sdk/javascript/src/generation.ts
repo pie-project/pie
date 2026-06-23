@@ -190,7 +190,11 @@ export class Generator implements AsyncIterable<GenStep> {
   // ── Chain methods (alternative to options-object) ──────────────────────
 
   /** Hard cap on tokens generated. */
-  maxTokens(n: number): this { this._maxTokens = n; return this; }
+  maxTokens(n: number): this {
+    this._maxTokens = n;
+    this._refreshStaticBid();
+    return this;
+  }
 
   /** Stop tokens. */
   stop(tokens: Iterable<number>): this {
@@ -219,12 +223,17 @@ export class Generator implements AsyncIterable<GenStep> {
   }
 
   /** Hint expected output length for budget planning. */
-  horizon(n: number): this { this._horizon = n; return this; }
+  horizon(n: number): this {
+    this._horizon = n;
+    this._refreshStaticBid();
+    return this;
+  }
 
   /** Control whether the generator refreshes its scheduler bid before
    *  every decode step. */
   rebidEachStep(enabled: boolean): this {
     this._rebidEachStep = enabled;
+    this._refreshStaticBid();
     return this;
   }
 
@@ -310,14 +319,8 @@ export class Generator implements AsyncIterable<GenStep> {
     const balance = _scheduling.balance(this._ctx._model._handle);
     const dividend = _scheduling.dividend(this._ctx._model._handle);
     const pages = Math.max(1, this._ctx._committedPages + this._ctx._workingPages);
-    this._ctx.setBid(_computeBid(
-      balance,
-      pages,
-      4096.0,
-      1.0,
-      this._ctx._pageSize,
-      dividend,
-    ));
+    const [mu, cv2] = this._bidShape();
+    this._ctx.setBid(_computeBid(balance, pages, mu, cv2, this._ctx._pageSize, dividend));
   }
 
   /** @internal */
@@ -327,20 +330,24 @@ export class Generator implements AsyncIterable<GenStep> {
     const pages = this._ctx._committedPages + this._ctx._workingPages;
     const pageSize = this._ctx._pageSize;
 
-    let mu: number;
-    let cv2: number;
-    if (this._horizon !== undefined) {
-      mu = Math.max(this._horizon - this._tokensGenerated, 1);
-      cv2 = 0.0;
-    } else if (this._maxTokens !== undefined) {
-      mu = Math.max(this._maxTokens - this._tokensGenerated, 1);
-      cv2 = 1.0;
-    } else {
-      mu = Math.max(this._tokensGenerated, 64);
-      cv2 = 1.0;
-    }
-
+    const [mu, cv2] = this._bidShape();
     this._ctx.setBid(_computeBid(balance, pages, mu, cv2, pageSize, dividend));
+  }
+
+  /** @internal */
+  _bidShape(): [number, number] {
+    if (this._horizon !== undefined) {
+      return [Math.max(this._horizon - this._tokensGenerated, 1), 0.0];
+    }
+    if (this._maxTokens !== undefined) {
+      return [Math.max(this._maxTokens - this._tokensGenerated, 1), 1.0];
+    }
+    return [Math.max(this._tokensGenerated, 64), 1.0];
+  }
+
+  /** @internal */
+  _refreshStaticBid(): void {
+    if (!this._rebidEachStep) this._primeBid();
   }
 
   // ── User-sampled mode ──────────────────────────────────────────────────
