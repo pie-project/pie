@@ -30,6 +30,18 @@
 #include "driver_startup.hpp"
 #include "service/inproc_service.hpp"
 
+#if defined(PIE_METAL_HAS_MLX)
+#include <cstdlib>
+
+#include <mlx/mlx.h>
+
+#include "executor/executor.hpp"
+#include "kv_cache.hpp"
+#include "model/config.hpp"
+#include "model/model_graph.hpp"
+#include "model/weights.hpp"
+#endif
+
 namespace {
 
 // Model facts the caps handshake needs. Read best-effort from the
@@ -101,6 +113,109 @@ std::string build_caps_json(const pie_metal_driver::Config& cfg,
     return caps.dump();
 }
 
+#if defined(PIE_METAL_HAS_MLX)
+namespace mx = mlx::core;
+
+// The live forward pipeline: charlie's arch graph + delta's paged KV cache +
+// beta's executor that drives them per Forward fire. Owned by the serve loop
+// and attached to the InProcService; the Executor borrows graph + kv, so field
+// order matters (graph + kv declared before, destroyed after, the executor).
+struct ModelRuntime {
+    std::unique_ptr<pie_metal_driver::model::ModelGraph> graph;
+    std::unique_ptr<pie_metal_driver::PagedKvCache>      kv;
+    std::unique_ptr<pie_metal_driver::Executor>          executor;
+};
+
+// Random bf16 weight, scaled small to keep synthetic activations finite.
+pie_metal_driver::Tensor synth_w(std::initializer_list<int> shape,
+                                 float scale = 0.02f) {
+    mx::Shape s(shape);
+    return mx::astype(
+        mx::multiply(mx::random::normal(s, mx::float32), mx::array(scale)),
+        mx::bfloat16);
+}
+pie_metal_driver::Tensor synth_norm(int n) {
+    return mx::astype(mx::ones({n}, mx::float32), mx::bfloat16);
+}
+
+// Build a small random Llama-shaped model so the executor path can be driven
+// end-to-end on the Metal GPU before delta's weight_loader lands. Gated behind
+// PIE_METAL_SYNTHETIC_MODEL=1 — a dev/self-test affordance only. The real path
+// (delta's loader → ModelConfig + ModelWeights from the checkpoint) replaces
+// this builder; the rest of the wiring (graph + kv + executor) is identical.
+std::unique_ptr<ModelRuntime> build_synthetic_runtime(
+    const pie_metal_driver::Config& cfg, const ModelFacts& facts) {
+    using namespace pie_metal_driver;
+    using namespace pie_metal_driver::model;
+
+    model::ModelConfig mc;
+    mc.arch                    = PieArch::Llama3;
+    mc.hf_model_type           = "llama";
+    mc.num_hidden_layers       = 2;
+    mc.num_attention_heads     = 4;
+    mc.num_key_value_heads     = 2;
+    mc.head_dim                = 16;
+    mc.hidden_size             = mc.num_attention_heads * mc.head_dim;
+    mc.intermediate_size       = 128;
+    mc.vocab_size              = static_cast<std::int32_t>(facts.vocab_size);
+    mc.max_position_embeddings = static_cast<std::int32_t>(facts.max_model_len);
+    mc.rms_norm_eps            = 1e-6f;
+    mc.rope_theta              = 10000.0f;
+    mc.tie_word_embeddings     = true;
+
+    const int H   = mc.hidden_size;
+    const int qd  = mc.num_attention_heads * mc.head_dim;
+    const int kvd = mc.num_key_value_heads * mc.head_dim;
+    const int I   = mc.intermediate_size;
+    const int V   = mc.vocab_size;
+
+    ModelWeights w;
+    w.embed      = synth_w({V, H});
+    w.final_norm = synth_norm(H);
+    w.layers.resize(mc.num_hidden_layers);
+    for (auto& L : w.layers) {
+        L.attn_norm = synth_norm(H);
+        L.ffn_norm  = synth_norm(H);
+        L.q_proj    = synth_w({qd,  H});
+        L.k_proj    = synth_w({kvd, H});
+        L.v_proj    = synth_w({kvd, H});
+        L.o_proj    = synth_w({H,   qd});
+        L.gate_proj = synth_w({I,   H});
+        L.up_proj   = synth_w({I,   H});
+        L.down_proj = synth_w({H,   I});
+    }
+
+    auto rt = std::make_unique<ModelRuntime>();
+    rt->graph = make_model_graph(mc, std::move(w));
+
+    PagedKvGeometry geo;
+    geo.n_layers   = mc.num_hidden_layers;
+    geo.page_size  = static_cast<int>(cfg.batching.kv_page_size);
+    geo.n_pages    = static_cast<int>(cfg.batching.total_pages);
+    geo.n_kv_heads = mc.num_key_value_heads;
+    geo.head_dim   = mc.head_dim;
+    rt->kv = std::make_unique<PagedKvCache>(geo, DType::BF16);
+
+    rt->executor = std::make_unique<Executor>(*rt->graph, *rt->kv);
+    return rt;
+}
+
+// Construct the forward pipeline for the loaded model, or nullptr to fall back
+// to the stub Forward. Today this only builds the synthetic dev model (env-
+// gated); delta's weight_loader will populate a real ModelConfig + ModelWeights
+// from `cfg.model.hf_path` and build the runtime the same way.
+std::unique_ptr<ModelRuntime> build_model_runtime(
+    const pie_metal_driver::Config& cfg, const ModelFacts& facts) {
+    const char* synth = std::getenv("PIE_METAL_SYNTHETIC_MODEL");
+    if (synth != nullptr && synth[0] != '\0' && synth[0] != '0') {
+        std::cerr << "[pie-driver-metal] building SYNTHETIC dev model "
+                     "(PIE_METAL_SYNTHETIC_MODEL set) — random weights\n";
+        return build_synthetic_runtime(cfg, facts);
+    }
+    return nullptr;
+}
+#endif  // PIE_METAL_HAS_MLX
+
 // `vtable_opt` is non-null for the in-process serve loop; null for the
 // standalone self-check (`pie_driver_metal_run`), which emits caps and
 // returns without serving.
@@ -150,8 +265,24 @@ int run_impl(int argc,
     }
 
     pie_metal_driver::service::InProcService service(facts.vocab_size);
+#if defined(PIE_METAL_HAS_MLX)
+    std::unique_ptr<ModelRuntime> runtime = build_model_runtime(cfg, facts);
+    if (runtime) {
+        service.set_executor(runtime->executor.get());
+        std::cerr << "[pie-driver-metal] serving (arch=" << facts.arch_name
+                  << ", vocab=" << facts.vocab_size
+                  << ", MLX executor on " << (mx::default_device() == mx::Device::gpu
+                                                  ? "Metal GPU" : "CPU")
+                  << ")\n";
+    } else {
+        std::cerr << "[pie-driver-metal] serving (arch=" << facts.arch_name
+                  << ", vocab=" << facts.vocab_size
+                  << ", stub forward — no model attached)\n";
+    }
+#else
     std::cerr << "[pie-driver-metal] serving (arch=" << facts.arch_name
               << ", vocab=" << facts.vocab_size << ", stub forward)\n";
+#endif
     service.serve_forever(*server);
 
     pie_metal_driver::unregister_server(server.get());

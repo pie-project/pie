@@ -8,6 +8,7 @@
 #include "ops/elementwise.hpp"
 #include "ops/embedding.hpp"
 #include "ops/gemm.hpp"
+#include "ops/moe.hpp"
 #include "ops/norm.hpp"
 #include "ops/rope.hpp"
 #include "ops/tensor.hpp"

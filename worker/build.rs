@@ -550,6 +550,47 @@ fn build_metal() {
     // when PIE_METAL_WITH_MLX=ON).
     println!("cargo:rustc-link-lib=static=pie_driver_metal_lib");
 
+    // MLX link. The static driver lib references MLX symbols but doesn't carry
+    // them, so the final worker link must pull MLX in itself. Only when the
+    // compute layer is compiled (PIE_METAL_WITH_MLX=1); the stub skeleton has
+    // no MLX symbols.
+    if mlx_on {
+        let provider = std::env::var("PIE_METAL_MLX_PROVIDER")
+            .map(|p| p.to_ascii_lowercase())
+            .unwrap_or_else(|_| "fetch".to_string());
+        if provider == "system" {
+            // Prebuilt MLX (e.g. `brew install mlx`). Resolve the prefix the
+            // same way FetchMLX.cmake's system path does: PIE_MLX_PREFIX
+            // override → `brew --prefix mlx` → /opt/homebrew/opt/mlx.
+            let prefix = std::env::var("PIE_MLX_PREFIX")
+                .ok()
+                .filter(|s| !s.is_empty())
+                .or_else(|| {
+                    std::process::Command::new("brew")
+                        .args(["--prefix", "mlx"])
+                        .output()
+                        .ok()
+                        .filter(|o| o.status.success())
+                        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                        .filter(|s| !s.is_empty())
+                })
+                .unwrap_or_else(|| "/opt/homebrew/opt/mlx".to_string());
+            let libdir = format!("{prefix}/lib");
+            println!("cargo:rustc-link-search=native={libdir}");
+            println!("cargo:rustc-link-lib=dylib=mlx");
+            // libmlx.dylib loads @rpath/libjaccl.dylib (same dir); add an rpath
+            // so it resolves at runtime.
+            println!("cargo:rustc-link-arg=-Wl,-rpath,{libdir}");
+        } else {
+            // Source (FetchContent) build: MLX produces libmlx.a under the
+            // cmake build tree (search paths added by add_link_search_paths).
+            println!("cargo:rustc-link-lib=static=mlx");
+        }
+        // MLX additionally pulls QuartzCore (on top of the Metal / MetalKit /
+        // Foundation / Accelerate set emitted below).
+        println!("cargo:rustc-link-lib=framework=QuartzCore");
+    }
+
     // Apple frameworks the metal driver + MLX pull. -framework on macOS
     // is the moral equivalent of -l on linux. (Accelerate added on top of
     // the Metal/MetalKit/Foundation set add_system_libs already emits.)

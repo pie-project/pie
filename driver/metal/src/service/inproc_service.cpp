@@ -8,6 +8,10 @@
 #include <pie_ipc/inproc_server.hpp>
 #include <pie_schema/response_builder.hpp>
 
+#if defined(PIE_METAL_HAS_MLX)
+#include "executor/executor.hpp"
+#endif
+
 namespace pie_metal_driver::service {
 
 namespace {
@@ -85,6 +89,20 @@ void InProcService::serve_forever(pie_driver::InProcServer& server) {
                 case pie_driver::PIE_METHOD_FORWARD: {
                     ++handled_;
                     const auto& fwd = req.forward;
+#if defined(PIE_METAL_HAS_MLX)
+                    // Real compute path: delegate to the MLX executor, which
+                    // runs charlie's ModelGraph over delta's PagedKvCache on
+                    // the Metal GPU and packs the sampled tokens via beta's
+                    // sampler. Only taken once a model is loaded + attached.
+                    if (executor_ != nullptr) {
+                        executor_->run_forward(fwd, response_builder,
+                                               out.forward);
+                        out.status = 0;
+                        break;
+                    }
+#endif
+                    // Stub fallback (no-MLX skeleton, or before a model loads):
+                    // dummy tokens shaped like the per-request sampler stream.
                     const auto sampling_indptr =
                         fwd.sampling_indptr.as<std::uint32_t>();
                     const std::size_t n =

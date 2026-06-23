@@ -125,11 +125,13 @@ Tensor paged_attention(const Tensor& q,
                        const Tensor& last_page_lens,
                        int page_size,
                        const AttnParams& params) {
-    // Reference implementation: per-request page-gather + dense SDPA. Correct
-    // and end-to-end usable; the optimized fused paged-attention Metal kernel
-    // (src/kernels/paged_attention.metal) replaces this hot path once delta's
-    // PagedKV layout is published. k_cache/v_cache assumed
-    // [n_pages, page_size, n_kv_heads, head_dim].
+    // Production path: per-request page-gather + MLX fused SDPA. MLX's
+    // fast::scaled_dot_product_attention is a heavily-tuned flash-attention
+    // kernel; benchmarking showed a naive one-thread-per-(token,head) custom
+    // Metal kernel is 5-15x SLOWER than this, so we keep MLX sdpa. A custom
+    // win requires a proper split-KV flash-decoding kernel (cross-threadgroup
+    // reduction) -- tracked as future perf work. Pure MLX => also runs CPU-only.
+    // k_cache/v_cache assumed [n_pages, page_size, n_kv_heads, head_dim].
     const std::vector<int> qo   = to_host_i32(qo_indptr);
     const std::vector<int> kvp  = to_host_i32(kv_page_indptr);
     const std::vector<int> lpl  = to_host_i32(last_page_lens);
