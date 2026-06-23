@@ -77,16 +77,17 @@ pub fn run(args: ServeArgs) -> Result<()> {
         cfg.server.python_snapshot = false;
     }
 
-    // Join the control plane: embed an in-proc controller (single-node) or dial
-    // the standalone controller process (distributed), then register this worker.
+    // Connect to the control plane: no controller in single-node, or dial the
+    // standalone controller process in distributed mode. Distributed registration
+    // happens after driver capabilities are known.
     let topology = coordination::resolve(&args.coordination)?;
     let control_addr = coordination::addr_from_host_port(&cfg.server.host, cfg.server.port);
     let coordinator = coordination::connect(&topology, control_addr)?;
     tracing::info!(
-        worker = %coordinator.worker_id,
+        worker = ?coordinator.worker_id(),
         role = ?coordinator.role,
         ?topology,
-        "joined control plane",
+        "connected to control plane",
     );
 
     if args.monitor {
