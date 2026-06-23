@@ -20,6 +20,8 @@
 #include <string>
 #include <vector>
 
+#include <mlx/ops.h>        // mx::take / mx::dequantize (dequant-gather embed)
+
 #include "ops/gemm.hpp"     // ops::linear / ops::quantized_linear (beta)
 #include "ops/tensor.hpp"   // pie_metal_driver::Tensor + ops::empty_tensor() (beta)
 #include "model/config.hpp" // ModelConfig (quant_bits / quant_group_size)
@@ -56,6 +58,25 @@ inline Tensor apply_linear(const QuantLinear& w, const Tensor& x) {
                                      w.group_size, w.bits);
     }
     return ops::linear(w.weight, x);
+}
+
+// Gather input-embedding rows for `ids`. The input table is tied to the output
+// projection, so when the checkpoint drops the dense bf16 embed (the
+// "embed-drop": true-4-bit memory parity, no double-store) the bundle here IS
+// the quantized lm_head and only the rows the batch needs are dequantized on
+// the fly. Numerically identical to gathering from the fully-dequantized table
+// (dequantize is row-wise over the last-axis groups, so gather-then-dequant ==
+// dequant-then-gather). Dense weights fall back to a plain row gather
+// (== ops::embedding).
+inline Tensor apply_embedding(const QuantLinear& w, const Tensor& ids) {
+    if (w.quantized()) {
+        Tensor w_rows = mlx::core::take(w.weight, ids, /*axis=*/0);
+        Tensor s_rows = mlx::core::take(*w.scales, ids, /*axis=*/0);
+        Tensor b_rows = mlx::core::take(*w.biases, ids, /*axis=*/0);
+        return mlx::core::dequantize(w_rows, s_rows, b_rows,
+                                     w.group_size, w.bits);
+    }
+    return mlx::core::take(w.weight, ids, /*axis=*/0);
 }
 
 // `mlx::core::array` has no default constructor, so structs holding a
@@ -140,7 +161,7 @@ struct LayerWeights {
 };
 
 struct ModelWeights {
-    Tensor                embed      = ops::empty_tensor();  // [vocab, hidden]
+    QuantLinear           embed;                          // [vocab, hidden] (dense bf16, or the tied quantized lm_head reused as the input table when the dense embed is dropped)
     Tensor                final_norm = ops::empty_tensor();  // [hidden]
     std::optional<QuantLinear> lm_head;  // empty when tie_word_embeddings (use embed)
 
@@ -207,6 +228,22 @@ inline std::optional<QuantLinear> try_bind_linear(const WeightSource& src,
                                                   const ModelConfig& cfg) {
     if (!src.has(base + ".weight")) return std::nullopt;
     return bind_linear(src, base, cfg);
+}
+
+// bind_embedding — the input token table at `<base>` (e.g. "model.embed_tokens").
+// Normally a dense bf16 (or quantized) `<base>.weight`. With the "embed-drop"
+// memory optimization the dense embed is omitted entirely and the input table
+// is the tied quantized lm_head, dequant-gathered per token at runtime
+// (apply_embedding) — so when `<base>.weight` is absent we reuse the already-
+// bound quantized `lm_head` bundle. Pass the result of the lm_head bind.
+inline QuantLinear bind_embedding(const WeightSource& src,
+                                  const std::string& base,
+                                  const std::optional<QuantLinear>& lm_head,
+                                  const ModelConfig& cfg) {
+    if (!src.has(base + ".weight") && lm_head) {
+        return *lm_head;  // tied; dense embed dropped -> share the quant lm_head
+    }
+    return bind_linear(src, base, cfg);  // .get throws if the embed is missing
 }
 
 // Bind the Llama-like schema (llama3/qwen2/qwen3/mistral + qwen3-moe/mixtral).

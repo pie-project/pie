@@ -110,7 +110,7 @@ Tensor GemmaGraph::decoder_layer(std::int32_t il,
 }
 
 Tensor GemmaGraph::forward(const ForwardBatch& batch, KvCacheView& kv) {
-    Tensor hidden = ops::embedding(w_.embed, batch.token_ids);
+    Tensor hidden = apply_embedding(w_.embed, batch.token_ids);
     // Gemma scales embeddings by sqrt(hidden_size).
     hidden = ops::scale(hidden, std::sqrt(static_cast<float>(cfg_.hidden_size)));
 
@@ -125,7 +125,7 @@ Tensor GemmaGraph::forward(const ForwardBatch& batch, KvCacheView& kv) {
     // Gemma ties word embeddings.
     Tensor logits = w_.lm_head
         ? apply_linear(*w_.lm_head, sampled)   // [n_slots, vocab]
-        : ops::linear(w_.embed, sampled);      // tied, dense embed
+        : apply_linear(w_.embed, sampled);     // tied embed (dense or quant)
 
     // Gemma 2 final logit soft-cap.
     if (spec_.final_softcap > 0.0f) {
@@ -137,10 +137,12 @@ Tensor GemmaGraph::forward(const ForwardBatch& batch, KvCacheView& kv) {
 // ── Weight binding (Gemma 2 / 3) ──
 ModelWeights bind_gemma(const WeightSource& src, const ModelConfig& cfg) {
     ModelWeights w;
-    w.embed      = src.get("model.embed_tokens.weight");
     w.final_norm = src.get("model.norm.weight");
     // Prefer an explicit lm_head bundle when present; absent -> dense embed.
     w.lm_head = try_bind_linear(src, "lm_head", cfg);
+    // Input embed: dense bf16 table, or the tied quantized lm_head (dequant-
+    // gathered) when the dense embed is dropped for true-4-bit memory parity.
+    w.embed = bind_embedding(src, "model.embed_tokens", w.lm_head, cfg);
 
     w.layers.resize(cfg.num_hidden_layers);
     for (std::int32_t il = 0; il < cfg.num_hidden_layers; ++il) {
