@@ -1,1 +1,0 @@
-{"mcpServers":{"patissier":{"command":"node","args":["/tmp/patissier-mcp.mjs"],"env":{"PATISSIER_MCP_URL":"https://apps.ingim.org/patissier","PATISSIER_MCP_TOKEN":"pat2.contractor.cmqn56eer0000yczg7xdau543.cmqptpokj4dslycuwlxkiy5r7.f193ea87c8e14ff2eff10865935e34ad"}}}}
