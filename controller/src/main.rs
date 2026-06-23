@@ -1,8 +1,9 @@
 //! `pie-controller` — standalone controller process entry (`src/main.rs`).
 //!
-//! The distributed-topology deployment form: a thin argv shell over
-//! [`pie_controller::run_as_process`]. The on-device topology skips this binary
-//! entirely and links the [`pie_controller`] library in-proc instead.
+//! A thin argv shell over [`pie_controller::run_as_process`]: it binds the
+//! control endpoint and serves the control-RPC surface that the gateway and
+//! distributed workers dial. Single-node deployments run controller-free and
+//! never spawn this binary.
 
 use std::error::Error;
 

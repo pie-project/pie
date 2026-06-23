@@ -1,18 +1,16 @@
-mod controller;
+mod coordinator;
 mod error;
 mod health;
 mod pairing;
 mod role;
-mod rpc;
 mod serve;
 mod service;
 
-pub use controller::{Controller, ControllerConfig, InProcController};
+pub use coordinator::ControllerConfig;
 pub use error::{ControllerError, Result};
 pub use health::HealthChecker;
 pub use pairing::{Pair, PairId, PairingTable};
 pub use role::RoleTable;
-pub use rpc::RemoteController;
 pub use serve::{ProcessConfig, run_as_process};
 pub use service::{ControlApi, ControlApiClient};
 

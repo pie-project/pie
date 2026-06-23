@@ -1,9 +1,9 @@
 //! The tarpc control-plane service definition — the unified RPC surface.
 //!
-//! `#[tarpc::service]` generates the [`ControlApiClient`] (dialed by workers and
-//! the gateway) and the server-side `ControlApi` trait (implemented by
-//! [`crate::serve`] over an [`crate::InProcController`]). One variant per
-//! [`crate::Controller`] trait method.
+//! `#[tarpc::service]` generates the [`ControlApiClient`] (dialed by the gateway
+//! and distributed workers) and the server-side `ControlApi` trait (implemented
+//! by [`crate::serve`] over the coordinator). One variant per coordinator
+//! method.
 //!
 //! Coordination errors are carried as `Result<T, String>`: [`ControllerError`]
 //! isn't `Serialize`, so the server renders it to a string and the client maps
