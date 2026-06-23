@@ -30,7 +30,8 @@ INTRA_LAYER_ORDER = [
     "attn_norm",                                   # rms (both layer types)
     # ── GDN / linear-attention sublayer ──
     "gdn_in_qkv", "gdn_in_z", "gdn_in_a", "gdn_in_b",
-    "gdn_core",                                    # beta op output (folds gated_rms)
+    "gdn_core_pre",                                 # beta: pre-GatedRms fused core_out
+    "gdn_core",                                     # beta op output (folds gated_rms)
     "gdn_out",
     # ── full-attention sublayer ──
     "q_proj", "k_proj", "v_proj",
