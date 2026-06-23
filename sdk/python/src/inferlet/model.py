@@ -6,6 +6,8 @@ from __future__ import annotations
 
 from wit_world.imports import model as _model
 
+from .audio import SpeechBuilder
+
 
 class Tokenizer:
     """Wraps the WIT tokenizer resource."""
@@ -63,6 +65,9 @@ class Model:
         """Whether greedy generation should use the system drafter by default."""
         return self._handle.default_system_speculation()
 
+    def speak(self, text: str) -> SpeechBuilder:
+        """Begin a model-agnostic speech synthesis request."""
+        return SpeechBuilder(self, text)
+
     def __repr__(self) -> str:
         return f"Model({id(self._handle):#x})"
-

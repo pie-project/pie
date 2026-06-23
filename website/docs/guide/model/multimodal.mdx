@@ -108,7 +108,10 @@ See the [`tts`](https://github.com/pie-project/pie/tree/main/inferlets/tts) infe
 
 ## Other SDKs
 
-The Python and JavaScript SDKs expose the same `media` types (`Image`, `Audio`, `Video`) and the same `Context` methods through generated bindings, so the flow above translates directly: `Image.from_bytes(model, bytes)` → `ctx.append_image(image)` → `ctx.generate(...)`.
+The Python and JavaScript SDKs expose the same high-level flow:
+
+- Python: `Image.from_bytes(model, bytes)` → `await ctx.append_image(image)` → `ctx.generate(...)`.
+- JavaScript: `Image.fromBytes(model, bytes)` → `await ctx.appendImage(image)` → `ctx.generate(...)`.
 
 ## Low-level forward pass
 

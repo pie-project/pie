@@ -33,6 +33,7 @@ from .model import Model
 
 if TYPE_CHECKING:
     from .adapter import Adapter
+    from .media import Audio, Image, Video
     from .sample import Sampler
     from .spec import Speculator
 
@@ -251,6 +252,149 @@ class Context:
         self._working_pages -= to_commit
         self._working_tokens = new_working % self._page_size
         self._seq_len += n
+
+    # ── Multimodal spans ─────────────────────────────────────────────
+
+    async def append_image(self, image: Image) -> None:
+        """Splice an encoded image into the context and commit its
+        soft-token KV."""
+        prefix = image.prefix_tokens()
+        suffix = image.suffix_tokens()
+        if prefix:
+            self.append(prefix)
+        await self.flush()
+
+        n_tokens = image.token_count()
+        if n_tokens == 0:
+            if suffix:
+                self.append(suffix)
+            return
+
+        self._reserve_media_tokens(n_tokens, "append_image")
+        fwd = _inf.ForwardPass(self._model._handle)
+        fwd.context(self._handle)
+        fwd.input_image(image._handle, self._seq_len)
+        await await_future(fwd.execute(), "append_image: forward pass failed")
+        self._commit_media_tokens(n_tokens, "append_image")
+
+        if suffix:
+            self.append(suffix)
+
+    async def append_images(self, images: Iterable[Image]) -> None:
+        """Splice adjacent images into one forward when delimiters allow it."""
+        items = list(images)
+        if not items:
+            return
+        needs_delimiters = any(im.prefix_tokens() or im.suffix_tokens() for im in items)
+        if len(items) == 1 or needs_delimiters:
+            for image in items:
+                await self.append_image(image)
+            return
+
+        await self.flush()
+        total_tokens = sum(im.token_count() for im in items)
+        if total_tokens == 0:
+            return
+
+        self._reserve_media_tokens(total_tokens, "append_images")
+        fwd = _inf.ForwardPass(self._model._handle)
+        fwd.context(self._handle)
+        anchor = self._seq_len
+        for image in items:
+            fwd.input_image(image._handle, anchor)
+            anchor += image.token_count()
+        await await_future(fwd.execute(), "append_images: forward pass failed")
+        self._commit_media_tokens(total_tokens, "append_images")
+
+    async def append_audio(self, audio: Audio) -> None:
+        """Splice an encoded audio clip into the context and commit its
+        soft-token KV."""
+        prefix = audio.prefix_tokens()
+        suffix = audio.suffix_tokens()
+        if prefix:
+            self.append(prefix)
+        await self.flush()
+
+        n_tokens = audio.token_count()
+        if n_tokens == 0:
+            if suffix:
+                self.append(suffix)
+            return
+
+        self._reserve_media_tokens(n_tokens, "append_audio")
+        fwd = _inf.ForwardPass(self._model._handle)
+        fwd.context(self._handle)
+        fwd.input_audio(audio._handle, self._seq_len)
+        await await_future(fwd.execute(), "append_audio: forward pass failed")
+        self._commit_media_tokens(n_tokens, "append_audio")
+
+        if suffix:
+            self.append(suffix)
+
+    async def append_audios(self, audios: Iterable[Audio]) -> None:
+        """Splice adjacent audio clips into one forward when possible."""
+        items = list(audios)
+        if not items:
+            return
+        if len(items) == 1:
+            await self.append_audio(items[0])
+            return
+
+        prefix = items[0].prefix_tokens()
+        suffix = items[-1].suffix_tokens()
+        if prefix:
+            self.append(prefix)
+        await self.flush()
+
+        total_tokens = sum(audio.token_count() for audio in items)
+        if total_tokens == 0:
+            if suffix:
+                self.append(suffix)
+            return
+
+        self._reserve_media_tokens(total_tokens, "append_audios")
+        fwd = _inf.ForwardPass(self._model._handle)
+        fwd.context(self._handle)
+        anchor = self._seq_len
+        for audio in items:
+            fwd.input_audio(audio._handle, anchor)
+            anchor += audio.token_count()
+        await await_future(fwd.execute(), "append_audios: forward pass failed")
+        self._commit_media_tokens(total_tokens, "append_audios")
+
+        if suffix:
+            self.append(suffix)
+
+    async def append_video(self, video: Video) -> None:
+        """Splice each sampled video frame, preceded by a generic timestamp marker."""
+        for i in range(video.frame_count()):
+            secs = max(0, int(video.timestamp(i)))
+            self.append(self._model.tokenizer().encode(f" {secs // 60:02}:{secs % 60:02} "))
+            await self.append_image(video.frame(i))
+
+    def _reserve_media_tokens(self, num_tokens: int, label: str) -> None:
+        total_after = self._working_tokens + num_tokens
+        pages_needed = (total_after + self._page_size - 1) // self._page_size
+        additional = max(0, pages_needed - self._working_pages)
+        if additional > 0:
+            try:
+                self._handle.reserve_working_pages(additional)
+            except Exception as exc:
+                raise RuntimeError(f"{label}: reserve pages: {exc}") from exc
+            self._working_pages = pages_needed
+
+    def _commit_media_tokens(self, num_tokens: int, label: str) -> None:
+        new_working = self._working_tokens + num_tokens
+        to_commit = new_working // self._page_size
+        if to_commit > 0:
+            try:
+                self._handle.commit_working_pages(to_commit)
+            except Exception as exc:
+                raise RuntimeError(f"{label}: commit pages: {exc}") from exc
+        self._committed_pages += to_commit
+        self._working_pages -= to_commit
+        self._working_tokens = new_working % self._page_size
+        self._seq_len += num_tokens
 
     def truncate(self, n: int) -> None:
         """Drop the trailing ``n`` working-page tokens. Use after a

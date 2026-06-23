@@ -18,11 +18,14 @@
 // step the user has to remember.
 
 import { Context as _Context } from 'pie:core/context';
+import { ForwardPass as _ForwardPass } from 'pie:core/inference';
 import * as _scheduling from 'pie:core/scheduling';
 
+import { awaitFuture } from './_async.js';
 import * as _chat from './chat.js';
 import { Forward } from './forward.js';
 import { Generator, type GenerateOptions } from './generation.js';
+import type { Audio, Image, Video } from './media.js';
 import { Model } from './model.js';
 
 import type { Sampler } from './sample.js';
@@ -222,6 +225,125 @@ export class Context implements Disposable {
     await fwd.execute();
   }
 
+  // ── Multimodal spans ───────────────────────────────────────────────
+
+  /** Splice an encoded image into the context and commit its soft-token KV. */
+  async appendImage(image: Image): Promise<void> {
+    const prefix = image.prefixTokens();
+    const suffix = image.suffixTokens();
+    if (prefix.length > 0) this.append(prefix);
+    await this.flush();
+
+    const nTokens = image.tokenCount();
+    if (nTokens === 0) {
+      if (suffix.length > 0) this.append(suffix);
+      return;
+    }
+
+    this._reserveMediaTokens(nTokens, 'appendImage');
+    const fwd = new _ForwardPass(this._model._handle);
+    fwd.context(this._handle);
+    fwd.inputImage(image._handle, this._seqLen);
+    await awaitFuture(fwd.execute(), 'appendImage: forward pass failed');
+    this._commitMediaTokens(nTokens, 'appendImage');
+
+    if (suffix.length > 0) this.append(suffix);
+  }
+
+  /** Splice adjacent images into one forward when delimiters allow it. */
+  async appendImages(images: Iterable<Image>): Promise<void> {
+    const items = Array.from(images);
+    if (items.length === 0) return;
+    const needsDelimiters = items.some(im =>
+      im.prefixTokens().length > 0 || im.suffixTokens().length > 0
+    );
+    if (items.length === 1 || needsDelimiters) {
+      for (const image of items) await this.appendImage(image);
+      return;
+    }
+
+    await this.flush();
+    const totalTokens = items.reduce((n, im) => n + im.tokenCount(), 0);
+    if (totalTokens === 0) return;
+
+    this._reserveMediaTokens(totalTokens, 'appendImages');
+    const fwd = new _ForwardPass(this._model._handle);
+    fwd.context(this._handle);
+    let anchor = this._seqLen;
+    for (const image of items) {
+      fwd.inputImage(image._handle, anchor);
+      anchor += image.tokenCount();
+    }
+    await awaitFuture(fwd.execute(), 'appendImages: forward pass failed');
+    this._commitMediaTokens(totalTokens, 'appendImages');
+  }
+
+  /** Splice an encoded audio clip into the context and commit its soft-token KV. */
+  async appendAudio(audio: Audio): Promise<void> {
+    const prefix = audio.prefixTokens();
+    const suffix = audio.suffixTokens();
+    if (prefix.length > 0) this.append(prefix);
+    await this.flush();
+
+    const nTokens = audio.tokenCount();
+    if (nTokens === 0) {
+      if (suffix.length > 0) this.append(suffix);
+      return;
+    }
+
+    this._reserveMediaTokens(nTokens, 'appendAudio');
+    const fwd = new _ForwardPass(this._model._handle);
+    fwd.context(this._handle);
+    fwd.inputAudio(audio._handle, this._seqLen);
+    await awaitFuture(fwd.execute(), 'appendAudio: forward pass failed');
+    this._commitMediaTokens(nTokens, 'appendAudio');
+
+    if (suffix.length > 0) this.append(suffix);
+  }
+
+  /** Splice adjacent audio clips into one forward when possible. */
+  async appendAudios(audios: Iterable<Audio>): Promise<void> {
+    const items = Array.from(audios);
+    if (items.length === 0) return;
+    if (items.length === 1) return this.appendAudio(items[0]!);
+
+    const prefix = items[0]!.prefixTokens();
+    const suffix = items[items.length - 1]!.suffixTokens();
+    if (prefix.length > 0) this.append(prefix);
+    await this.flush();
+
+    const totalTokens = items.reduce((n, audio) => n + audio.tokenCount(), 0);
+    if (totalTokens === 0) {
+      if (suffix.length > 0) this.append(suffix);
+      return;
+    }
+
+    this._reserveMediaTokens(totalTokens, 'appendAudios');
+    const fwd = new _ForwardPass(this._model._handle);
+    fwd.context(this._handle);
+    let anchor = this._seqLen;
+    for (const audio of items) {
+      fwd.inputAudio(audio._handle, anchor);
+      anchor += audio.tokenCount();
+    }
+    await awaitFuture(fwd.execute(), 'appendAudios: forward pass failed');
+    this._commitMediaTokens(totalTokens, 'appendAudios');
+
+    if (suffix.length > 0) this.append(suffix);
+  }
+
+  /** Splice each sampled video frame, preceded by a generic timestamp marker. */
+  async appendVideo(video: Video): Promise<void> {
+    const n = video.frameCount();
+    for (let i = 0; i < n; i++) {
+      const secs = Math.max(0, Math.floor(video.timestamp(i)));
+      const marker = ` ${String(Math.floor(secs / 60)).padStart(2, '0')}:` +
+        `${String(secs % 60).padStart(2, '0')} `;
+      this.appendText(marker);
+      await this.appendImage(video.frame(i));
+    }
+  }
+
   /** Drop the trailing `n` working-page tokens. Use after a speculative
    *  pass to roll back the rejected suffix. `n` counts only working-page
    *  tokens — pages already committed cannot be truncated through this
@@ -312,5 +434,37 @@ export class Context implements Disposable {
     merged.set(this._pendingTokens);
     merged.set(tokens, this._pendingTokens.length);
     this._pendingTokens = merged;
+  }
+
+  /** @internal */
+  _reserveMediaTokens(numTokens: number, label: string): void {
+    const totalAfter = this._workingTokens + numTokens;
+    const pagesNeeded = Math.ceil(totalAfter / this._pageSize);
+    const additional = Math.max(0, pagesNeeded - this._workingPages);
+    if (additional > 0) {
+      try {
+        this._handle.reserveWorkingPages(additional);
+      } catch (e) {
+        throw new Error(`${label}: reserve pages: ${String(e)}`);
+      }
+      this._workingPages = pagesNeeded;
+    }
+  }
+
+  /** @internal */
+  _commitMediaTokens(numTokens: number, label: string): void {
+    const newWorking = this._workingTokens + numTokens;
+    const toCommit = Math.floor(newWorking / this._pageSize);
+    if (toCommit > 0) {
+      try {
+        this._handle.commitWorkingPages(toCommit);
+      } catch (e) {
+        throw new Error(`${label}: commit pages: ${String(e)}`);
+      }
+    }
+    this._committedPages += toCommit;
+    this._workingPages -= toCommit;
+    this._workingTokens = newWorking % this._pageSize;
+    this._seqLen += numTokens;
   }
 }

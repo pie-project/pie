@@ -6,6 +6,8 @@ export type Model = import('./pie-core-model.js').Model;
 export type Tokenizer = import('./pie-core-model.js').Tokenizer;
 export type Adapter = import('./pie-core-adapter.js').Adapter;
 export type PageId = import('./pie-core-context.js').PageId;
+export type Image = import('./pie-core-media.js').Image;
+export type Audio = import('./pie-core-media.js').Audio;
 /**
  * binary run-length encoding
  */
@@ -148,6 +150,8 @@ export class ForwardPass {
   constructor(model: Model)
   context(context: Context): void;
   inputTokens(tokens: Uint32Array, positions: Uint32Array): void;
+  inputImage(image: Image, anchor: number): void;
+  inputAudio(audio: Audio, anchor: number): void;
   inputSpeculativeTokens(tokens: Uint32Array, positions: Uint32Array): void;
   /**
   * enabled by default

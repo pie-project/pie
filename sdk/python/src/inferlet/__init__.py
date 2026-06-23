@@ -54,6 +54,8 @@ from .sample import (
 from .forward import Forward, Output, ProbeHandle, SampleHandle
 from .generation import GenStep, Generator
 from .context import Context
+from .media import Audio, Image, Video
+from .audio import Speech, SpeechBuilder, Voice, write_wav
 
 # --- Decoders + tools (sub-modules; users import as `inferlet.chat`, etc.) ---
 from . import chat
@@ -94,6 +96,13 @@ __all__ = [
     "Model",
     "Tokenizer",
     "Adapter",
+    "Image",
+    "Audio",
+    "Video",
+    "Speech",
+    "SpeechBuilder",
+    "Voice",
+    "write_wav",
     # Forward primitive
     "Forward",
     "Output",
