@@ -36,6 +36,22 @@ if TYPE_CHECKING:
     from pie_client import PieClient
 
 
+def _ensure_py_runtime() -> None:
+    """Best-effort install of the Python WASM runtime (componentize-py).
+
+    R3: provisioning moved out of the Rust engine into the ``pie`` CLI; the
+    canonical installer is ``bakery.py_runtime``. Failures (offline, or bakery
+    not installed in this environment) are swallowed — only Python inferlets
+    need the runtime, and non-Python inferlets still work without it.
+    """
+    try:
+        from bakery.py_runtime import ensure_installed
+
+        ensure_installed(quiet=True)
+    except Exception:
+        pass
+
+
 class Server:
     """Async context manager that owns a Pie runtime.
 
@@ -88,6 +104,11 @@ class Server:
 
     async def __aenter__(self) -> "Server":
         from pie import _engine  # the pyo3 module
+
+        # Provision the Python WASM runtime if missing (R3: the Rust engine no
+        # longer auto-installs it). Best-effort, off-thread.
+        await asyncio.to_thread(_ensure_py_runtime)
+
         toml_str = self._config.to_toml()
         self._handle = await asyncio.to_thread(_engine.bootstrap, toml_str)
         return self

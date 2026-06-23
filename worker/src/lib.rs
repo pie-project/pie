@@ -9,16 +9,27 @@
 //! the surface they need — `serve::start_engine`, `config::Config`,
 //! `embedded_driver::EmbeddedDriver`, etc.
 
-pub mod bootstrap_translate;
-pub mod cli;
 pub mod config;
 pub mod driver_ffi;
 pub mod embedded_driver;
-pub mod hf;
-pub mod paths;
-pub mod py_runtime;
+pub mod translate;
+pub mod weights;
 
-pub mod serve;
+pub mod engine;
+mod client_server;
+mod lifecycle;
+mod link;
+mod preflight;
+
+// Frozen crate-root public API (Seam 1) — these stay stable through the internal
+// §8 `serve/*`→`link/` + `engine.rs` reorg, so `bin/worker` / `bin/pie` / the
+// pyo3 wheel code against the top-level paths and the reorg moves impls
+// underneath without reworking them.
+pub use config::Config;
+pub use engine::{WorkerHandle, run, run_with};
+// The control-plane seam `run_with` is generic over — re-exported so the
+// composition root (`bin/pie`) can impl it for its `EmbeddedControl` adapter.
+pub use link::control::ControlLink;
 
 #[cfg(any(feature = "driver-cuda", feature = "driver-portable"))]
 #[used]

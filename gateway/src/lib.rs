@@ -40,8 +40,9 @@ use anyhow::{Context, Result};
 use axum::Router;
 use pie_schema::control::{GatewayInfo, WorkerId};
 use pie_schema::gateway::{ReqId, Request};
+use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
-use tokio::sync::watch;
+use tokio::sync::{Notify, watch};
 
 use crate::admission::AdmissionDecision;
 use crate::blob::{BlobStore, GatewayOriginStore};
@@ -51,19 +52,59 @@ use crate::worker::WorkerRegistry;
 
 pub use crate::controller::GatewayControl;
 
-/// Runtime configuration for the gateway process.
-#[derive(Debug, Clone)]
-pub struct GatewayConfig {
+/// Runtime configuration for the gateway. Parsed *purely* from a TOML string by
+/// [`Config::parse`]; the process skeleton (`bootstrap`) sources that string
+/// (file locate + read + env merge) and owns paths / observability / lifecycle —
+/// this crate only understands the gateway domain.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Config {
     /// Address the client-facing edge (REST/SSE + WebSocket) listens on — the
     /// gateway's public address (behind the edge proxy).
+    #[serde(default = "default_listen")]
     pub listen: SocketAddr,
     /// Address the worker-facing data plane listens on. Post-inversion (M3)
     /// workers dial IN here; for the spine workers learn it from deploy-config.
+    #[serde(default = "default_worker_listen")]
     pub worker_listen: SocketAddr,
     /// Controller's tarpc control endpoint: `tcp://host:port`, a bare
     /// `host:port`, or `unix:/path`.
+    #[serde(default = "default_controller")]
     pub controller: String,
 }
+
+fn default_listen() -> SocketAddr {
+    SocketAddr::from(([0, 0, 0, 0], 8080))
+}
+fn default_worker_listen() -> SocketAddr {
+    SocketAddr::from(([0, 0, 0, 0], 8081))
+}
+fn default_controller() -> String {
+    "127.0.0.1:7000".to_string()
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            listen: default_listen(),
+            worker_listen: default_worker_listen(),
+            controller: default_controller(),
+        }
+    }
+}
+
+impl Config {
+    /// Parse a TOML config string into a validated [`Config`]. **Pure**: no IO,
+    /// no env, no clap — `bootstrap` sources the string, all gateway config
+    /// domain lives here. An empty string yields all defaults.
+    pub fn parse(s: &str) -> Result<Config> {
+        toml::from_str(s).context("parse gateway config (TOML)")
+    }
+}
+
+/// Back-compat alias used by the in-proc launcher during the build refactor;
+/// prefer [`Config`].
+pub type GatewayConfig = Config;
 
 /// The shared, axum-`State`-injected gateway root. Cloneable; composes each
 /// plane's handle so every route-provider and the worker server target one type:
@@ -154,12 +195,76 @@ pub struct Gateway {
 impl Gateway {
     /// Serve the client-facing edge (ingress + blob routes) until the listener
     /// errors or the process exits. The worker-facing data plane is already
-    /// accepting dial-ins.
+    /// accepting dial-ins. Used by the in-proc launcher (`bin/pie`) which drives
+    /// the serve directly; the daemon path uses [`into_handle`](Gateway::into_handle).
     pub async fn serve(self) -> Result<()> {
         axum::serve(self.listener, self.app)
             .await
             .context("gateway client-facing serve")?;
         Ok(())
+    }
+
+    /// Spawn the client-facing serve onto the runtime and return a
+    /// [`GatewayHandle`] that owns it (plus the already-running worker accept
+    /// loop) for clean lifecycle control. The serve uses graceful shutdown driven
+    /// by [`GatewayHandle::shutdown`].
+    pub fn into_handle(self) -> GatewayHandle {
+        let shutdown = Arc::new(Notify::new());
+        let listen_addr = self.listen_addr;
+        let worker_addr = self.worker_addr;
+        let worker_task = self._worker_task;
+        let listener = self.listener;
+        let app = self.app;
+        let serve_shutdown = shutdown.clone();
+        let serve_task = tokio::spawn(async move {
+            let graceful = async move { serve_shutdown.notified().await };
+            if let Err(e) = axum::serve(listener, app)
+                .with_graceful_shutdown(graceful)
+                .await
+            {
+                tracing::error!(error = %e, "gateway client-facing serve ended");
+            }
+        });
+        GatewayHandle {
+            listen_addr,
+            worker_addr,
+            shutdown,
+            serve_task,
+            worker_task,
+        }
+    }
+}
+
+/// A running gateway daemon. Owns the spawned client-serve task, the worker
+/// accept loop, and a shutdown signal; [`shutdown`](GatewayHandle::shutdown)
+/// gracefully drains the client edge and stops accepting worker dial-ins. The
+/// resolved bound addresses are exposed for ephemeral `:0` binds, the in-proc
+/// launcher, and tests.
+///
+/// Dropping the handle without calling [`shutdown`](GatewayHandle::shutdown)
+/// detaches the tasks (the daemon keeps running) — shutdown is always explicit.
+pub struct GatewayHandle {
+    /// The resolved client-facing listen address.
+    pub listen_addr: SocketAddr,
+    /// The resolved worker-facing dial-in address.
+    pub worker_addr: SocketAddr,
+    shutdown: Arc<Notify>,
+    serve_task: tokio::task::JoinHandle<()>,
+    worker_task: tokio::task::JoinHandle<()>,
+}
+
+impl GatewayHandle {
+    /// Stop cleanly: signal the client edge to drain in-flight requests + stop
+    /// accepting (axum graceful shutdown), then stop accepting worker dial-ins.
+    /// Inherent `async` per the build-seam role-library boundary — no `bootstrap`
+    /// trait (Ruling R1); the `bin` adapts this into `run_until_signal`.
+    pub async fn shutdown(self) {
+        self.shutdown.notify_one();
+        let _ = self.serve_task.await;
+        // In-flight turns are not rescued across a gateway shutdown — the gateway
+        // is the session's single point (design §10).
+        self.worker_task.abort();
+        let _ = self.worker_task.await;
     }
 }
 
@@ -171,7 +276,7 @@ impl Gateway {
 /// dialed [`ControlClient`](pie_control::ControlClient) (distributed) or the
 /// in-proc embedded adapter (single-node); juliet injects a stub yielding a
 /// seeded [`RoutingTable`](pie_schema::control::RoutingTable) for the smoke.
-pub async fn bind<C: GatewayControl>(config: GatewayConfig, control: C) -> Result<Gateway> {
+pub async fn bind<C: GatewayControl>(config: Config, control: C) -> Result<Gateway> {
     // Control plane: register + heartbeat + subscribe to the routing table.
     let info = GatewayInfo {
         addr: config.listen.to_string(),
@@ -233,17 +338,55 @@ pub async fn bind<C: GatewayControl>(config: GatewayConfig, control: C) -> Resul
     })
 }
 
-/// Dial the controller and serve the edge plane over the distributed transport.
-/// A thin wrapper that constructs a tarpc [`ControlClient`](pie_control::ControlClient);
-/// the single-node launcher calls [`bind`] / [`run_with`] with the embedded adapter.
-pub async fn run(config: GatewayConfig) -> Result<()> {
+/// Dial the controller and run the gateway as a daemon, returning a
+/// [`GatewayHandle`] (the role-library `run(Config) -> Handle` boundary). A thin
+/// wrapper that constructs a tarpc [`ControlClient`](pie_control::ControlClient);
+/// the in-proc launcher (`bin/pie`) embeds via [`bind`] / [`run_with`] with the
+/// embedded adapter instead.
+pub async fn run(config: Config) -> Result<GatewayHandle> {
     let control = controller::connect_controller(&config.controller).await?;
     run_with(config, control).await
 }
 
-/// [`bind`] then [`serve`](Gateway::serve), over an injected [`GatewayControl`]
-/// backend. The single-node launcher calls this with `EmbeddedControl(handle)`;
-/// the distributed path goes through [`run`].
-pub async fn run_with<C: GatewayControl>(config: GatewayConfig, control: C) -> Result<()> {
-    bind(config, control).await?.serve().await
+/// [`bind`] then spawn the serve via [`into_handle`](Gateway::into_handle), over
+/// an injected [`GatewayControl`] backend — returns a [`GatewayHandle`]. The
+/// in-proc launcher calls this (or [`bind`] directly) with
+/// `EmbeddedControl(handle)`; the distributed daemon path goes through [`run`].
+pub async fn run_with<C: GatewayControl>(config: Config, control: C) -> Result<GatewayHandle> {
+    Ok(bind(config, control).await?.into_handle())
+}
+
+#[cfg(test)]
+mod config_tests {
+    use super::*;
+
+    #[test]
+    fn parse_empty_yields_defaults() {
+        assert_eq!(Config::parse("").unwrap(), Config::default());
+    }
+
+    #[test]
+    fn parse_overrides_only_named_fields() {
+        let cfg = Config::parse(
+            r#"
+            listen = "127.0.0.1:9000"
+            controller = "unix:/tmp/ctl.sock"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(cfg.listen, "127.0.0.1:9000".parse::<SocketAddr>().unwrap());
+        // unspecified field keeps its default
+        assert_eq!(cfg.worker_listen, default_worker_listen());
+        assert_eq!(cfg.controller, "unix:/tmp/ctl.sock");
+    }
+
+    #[test]
+    fn parse_rejects_unknown_field() {
+        assert!(Config::parse("bogus = 1").is_err());
+    }
+
+    #[test]
+    fn gateway_config_alias_is_config() {
+        let _c: GatewayConfig = Config::default();
+    }
 }

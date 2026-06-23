@@ -17,10 +17,6 @@ crate-type = ["rlib"]
 
 # Binary half — the `pie` CLI. Parses argv via clap and dispatches into
 # the lib.
-[[bin]]
-name = "pie"
-path = "src/main.rs"
-
 [features]
 # Default to portable plus the always-linked dummy driver. Enabling
 # `driver-cuda` also links the native CUDA driver. `driver-dummy` is
@@ -30,13 +26,6 @@ default = ["driver-portable"]
 driver-portable = ["dep:pie-weight-loader"]
 driver-cuda = ["dep:pie-weight-loader"]
 driver-dummy = []
-
-# Single-node in-proc cluster. Embeds the controller actor and runs the gateway
-# inside the worker process (no sockets between the three planes). This is the
-# composition root — the one place that legitimately deps both `pie-controller`
-# and `pie-gateway`. Off by default, so the distributed build never links either
-# crate and the worker stays decoupled from the controller implementation.
-single-node = ["dep:pie-controller", "dep:pie-gateway"]
 
 # Per-domain probe passthroughs. Each forwards to the runtime crate's
 # corresponding flag. See `pie/src/probe/` for the catalog of domains.
@@ -58,11 +47,7 @@ pie-control = { path = "../protocol/control" }
 # WorkerControl traits + the shared spawn_twoway link glue. The worker dials
 # INTO the gateway and serves WorkerControl over the split connection.
 pie-dispatch = { path = "../protocol/dispatch" }
-# Single-node embed only (`single-node` feature). The worker bin is the
-# composition root, so it may legitimately dep both the controller actor
-# (`embed`) and the gateway (`run_with`) to assemble the in-proc cluster.
-pie-controller = { path = "../controller", optional = true }
-pie-gateway = { path = "../gateway", optional = true }
+
 # Direct dep so this crate's build script receives `DEP_PIE_SCHEMA_INCLUDE`
 # (the C header dir) from pie-schema's `links` build-script handoff.
 pie-schema = { path = "../protocol/schema" }
@@ -92,35 +77,16 @@ tokio-tungstenite = "0.28.0"
 futures = "0.3.31"
 mimalloc = "0.1"
 tracing = "0.1"
-# HuggingFace snapshot resolver. Same `~/.cache/huggingface/hub/` layout
-# the Python `huggingface_hub` package uses, so models downloaded by
-# either path are interchangeable.
-hf-hub = "1.0.0-rc.0"
 # `shm_unlink` for the hard-kill cleanup path; see serve.rs's shutdown
 # branch. Drivers normally clean up on graceful exit, but a SIGKILL
 # leaves the POSIX shmem region behind — we call shm_unlink directly
 # so the next launch doesn't trip on a stale segment.
 libc = "0.2"
-# CLI subcommand parsing — mirrors the Python pie_cli surface.
-clap = { version = "4.5", features = ["derive"] }
-# Local-time formatter for `pie auth add`'s default key-name timestamp,
-# matching the Python wrapper's `%Y-%m-%d-%H:%M:%S` shape.
-chrono = { version = "0.4", default-features = false, features = ["clock"] }
-# Python WASM runtime install (M8). The runtime tarball at
-# `registry.pie-project.org/api/v1/runtimes/python3.14/.../download` is
-# xz-compressed tar; `xz2` decompresses, `tar` extracts. `reqwest` is
-# already in the dep tree (transitively via the runtime crate); we
-# pin it directly here to make the dep explicit and pull in `blocking`.
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "blocking", "stream"] }
-tar = "0.4"
-xz2 = "0.1"
-
-# Live TUI monitor (M10). ratatui + crossterm match the conventional
-# pairing; nvml-wrapper feeds the GPU panel from libnvidia-ml.so when
-# present (gracefully absent on macOS / non-NVIDIA hosts).
-ratatui = "0.30"
-crossterm = "0.29"
-nvml-wrapper = "0.12"
+# Async HTTP client for the data-plane blob fetch (gateway_link.rs): the
+# worker pulls `GET {origin}/blob/{hash}` for multimodal inputs during
+# inference (design §9). Provisioning downloads (weights, py-runtime) live in
+# `bin/pie`, so no `blocking` here — blob fetch is async.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
 
 # Always-linked Rust dummy driver — random tokens, no model load.
 pie-driver-dummy = { path = "../driver/dummy" }

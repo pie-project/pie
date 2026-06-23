@@ -1,0 +1,28 @@
+[package]
+name = "pie-bootstrap"
+version = "0.1.0"
+edition = "2024"
+authors = ["In Gim <in.gim@icloud.com>"]
+description = "Shared process skeleton for the pie bins: CLI flag skeleton, path/dir resolution, config sourcing to a String, tracing + a /metrics endpoint, and signal/panic/exit-code lifecycle. Depends on NO role library and never sees a typed Config — it hands the role lib a config string and a unified lifecycle (Seam 2 of the build/packaging refactor)."
+license = "Apache-2.0"
+repository = "https://github.com/pie-project/pie"
+
+# Package is `pie-bootstrap` (workspace/crates.io namespace) but the lib imports
+# as `bootstrap` — the bins write `bootstrap::init` / `bootstrap::BootSpec`.
+[lib]
+name = "bootstrap"
+path = "src/lib.rs"
+
+[dependencies]
+anyhow = "1"
+# CLI: the shared global flags as a `#[derive(clap::Args)] GlobalArgs` the bins
+# `#[command(flatten)]` into their own `Parser` (one `--help`, typed role flags).
+clap = { version = "4.5", features = ["derive"] }
+# Path/dir resolution (home dir for `$PIE_HOME` fallback).
+dirs = "6.0"
+# Observability: structured logs + env-filter level control.
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+# Signals + the hand-rolled /metrics listener. NOT a runtime — the bin owns the
+# runtime (`#[tokio::main]`); bootstrap only `spawn`s onto the ambient one.
+tokio = { version = "1", features = ["rt", "macros", "net", "signal", "io-util"] }

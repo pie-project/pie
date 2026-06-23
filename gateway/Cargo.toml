@@ -27,6 +27,9 @@ pie-dispatch = { path = "../protocol/dispatch" }
 # Shared data vocabulary (wire structs) — the pure-struct floor, no RPC.
 pie-schema = { path = "../protocol/schema", default-features = false }
 serde = { version = "1.0", features = ["derive"] }
+# Pure TOML config parsing (`Config::parse`); the `bootstrap` skeleton sources the
+# config string (file + env), this crate only parses it.
+toml = "0.9"
 # Dyn-safe async traits: charlie's `TurnRouter` seam + bravo's `BlobStore`.
 async-trait = "0.1"
 # `serde-transport-bincode` = control-plane codec (pie-control client). The

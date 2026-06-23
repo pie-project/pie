@@ -9,11 +9,15 @@
 resolver = "2"
 members = [
     "runtime",
+    # Shared process skeleton (paths, config sourcing, tracing/metrics, signals,
+    # CLI skeleton). Depends on no role lib.
+    "bootstrap",
+    # Role libraries (pure libs: run(Config) -> Handle; no bin, never dep each other).
     "controller",
     "gateway",
+    "worker",
     "driver/transport",
     "client/rust",
-    "worker",
     "protocol/schema",
     "protocol/schema-bindgen",
     "protocol/schema-derive",
@@ -23,6 +27,12 @@ members = [
     "driver/dummy",
     "driver/weight-loader",
     "sdk/python-server",
+    # Thin binary shells composing bootstrap + role lib(s). `bin/pie` is the
+    # composition root (deps all three role libs; the standalone).
+    "bin/controller",
+    "bin/gateway",
+    "bin/worker",
+    "bin/pie",
 ]
 exclude = [
     "inferlets",

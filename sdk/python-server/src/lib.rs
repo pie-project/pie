@@ -2,8 +2,8 @@
 //! `pie` CLI binary.
 //!
 //! Both surfaces drive the same library (`pie-worker`); this crate
-//! is just a pyo3 wrapper around [`pie_worker::serve::start_engine`]
-//! plus a [`pie_worker::serve::EngineHandle`] handle. Lifecycle:
+//! is just a pyo3 wrapper around [`pie_worker::engine::start_engine`]
+//! plus a [`pie_worker::engine::EngineHandle`] handle. Lifecycle:
 //! when the Python `EngineHandle` is dropped (or the user's interpreter
 //! exits), the embedded tokio runtime + every subprocess driver are
 //! torn down — combined with the `PR_SET_PDEATHSIG` hook in
@@ -16,7 +16,7 @@ use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 
 use pie_worker::config::Config as ServeConfig;
-use pie_worker::serve::{self, EngineHandle as ServeHandle};
+use pie_worker::engine::{self, EngineHandle as ServeHandle};
 
 /// Live engine returned by `bootstrap`. Holds the tokio runtime that
 /// keeps the WS scheduler + driver supervisors alive.
@@ -97,26 +97,18 @@ fn bootstrap(py: Python<'_>, toml_str: &str) -> PyResult<PyEngineHandle> {
         .map_err(|e| PyValueError::new_err(format!("validate config: {e:#}")))?;
 
     py.allow_threads(|| -> PyResult<PyEngineHandle> {
-        let runtime = serve::build_runtime(&cfg)
+        let runtime = engine::build_runtime(&cfg)
             .map_err(|e| PyRuntimeError::new_err(format!("build tokio runtime: {e:#}")))?;
         let runtime = Arc::new(runtime);
-
-        // Best-effort: install the Python WASM runtime tarball if missing,
-        // mirroring `pie serve`'s startup. Failures (offline / no registry)
-        // log + continue; only matters for Python inferlets.
-        pie_worker::py_runtime::ensure_installed_best_effort();
 
         // The embedded engine wheel is always single-node: embed an in-proc
         // controller and self-register before booting the engine.
         let control_addr = format!("{}:{}", cfg.server.host, cfg.server.port);
-        let coordinator = serve::coordination::connect(
-            &serve::TopologyMode::SingleNode,
-            control_addr,
-        )
-        .map_err(|e| PyRuntimeError::new_err(format!("join control plane: {e:#}")))?;
+        let coordinator = engine::connect(&engine::TopologyMode::SingleNode, control_addr)
+            .map_err(|e| PyRuntimeError::new_err(format!("join control plane: {e:#}")))?;
 
         let handle = runtime
-            .block_on(serve::start_engine(cfg, coordinator))
+            .block_on(engine::start_engine(cfg, coordinator))
             .map_err(|e| PyRuntimeError::new_err(format!("start_engine: {e:#}")))?;
 
         let url = handle.url.clone();

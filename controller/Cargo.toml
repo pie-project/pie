@@ -12,8 +12,9 @@ name = "pie_controller"
 path = "src/lib.rs"
 crate-type = ["rlib"]
 
-# The standalone binary is auto-detected from `src/main.rs` and named after the
-# package (`pie-controller`); no explicit `[[bin]]` needed.
+# Pure library (Seam 1): no `main.rs`, no `[[bin]]`. The standalone process lives
+# in the thin `bin/controller` shell (bootstrap + this lib); single-node embeds
+# via `embed()`.
 
 [dependencies]
 # Wire data types (`pie_schema::control::*`) — the static-serde floor.
@@ -29,6 +30,11 @@ tarpc = { version = "0.35", features = [
     "unix",
 ] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync"] }
+# CancellationToken — cooperative shutdown of the actor/reaper/serve tasks.
+tokio-util = "0.7"
 futures = "0.3"
 tracing = "0.1"
-clap = { version = "4.5", features = ["derive"] }
+anyhow = "1"
+# Config is TOML (project convention): pure `Config::parse(&str)` via serde.
+serde = { version = "1", features = ["derive"] }
+toml = "0.9"

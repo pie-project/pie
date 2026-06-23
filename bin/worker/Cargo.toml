@@ -1,0 +1,30 @@
+[package]
+name = "pie-worker-bin"
+version = "0.1.0"
+edition = "2024"
+authors = ["In Gim <in.gim@icloud.com>"]
+description = "Pie worker daemon — thin bin shell composing the `bootstrap` process skeleton with the `pie-worker` role library (Seam 3 of the build/packaging refactor)."
+license = "Apache-2.0"
+repository = "https://github.com/pie-project/pie"
+
+# Binary name is the user-facing command; the package is `pie-worker-bin` to
+# disambiguate from the `pie-worker` role library it depends on.
+[[bin]]
+name = "pie-worker"
+path = "src/main.rs"
+
+[dependencies]
+# Shared process skeleton (imports as `bootstrap`): CLI flag skeleton, config
+# sourcing → String, tracing + /metrics, signals/panic/exit-code lifecycle.
+pie-bootstrap = { path = "../../bootstrap" }
+# The worker role library: `Config::parse` + async `run` + `WorkerHandle::shutdown`.
+pie-worker = { path = "../../worker" }
+anyhow = "1"
+clap = { version = "4.5", features = ["derive"] }
+# This bin owns the runtime (Model A — bootstrap is runtime-agnostic).
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+# The worker daemon runs the inference runtime (scheduler + chain-extender pool),
+# a burst-allocation pattern that benefits from a thread-caching allocator. The
+# `#[global_allocator]` must live in the final binary crate, so it is set here
+# (preserved from the pre-refactor worker binary), not in the role library.
+mimalloc = "0.1"
