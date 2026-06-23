@@ -42,6 +42,33 @@ public:
                      pie_driver::ResponseBuilder& builder,
                      pie_driver::PieForwardResponseView& out);
 
+    // Driver-owned multi-token pipelined decode (PIE_METHOD_DECODE_N, v1).
+    //
+    // Runs the autoregressive loop *inside the driver* for a single request,
+    // keeping the sampled token DEVICE-side across steps so the per-token
+    // argmax->host readback (and the per-step IPC round-trip) never happens.
+    // Each step's forward is submitted with `mx::async_eval` while the prior
+    // step's token is read back, overlapping token N+1's compute with token N's
+    // sync — the same mechanism the decode_bench pipelined path measures at the
+    // mlx_lm ceiling. One host drain at the end reads all k tokens.
+    //
+    // v1 scope (matches the ABI sign-off): single request (`n_requests==1`),
+    // stateless samplers only (greedy/temp/top-k/top-p/min-p — every step is a
+    // pure function of that step's logits). No mid-loop stop/EOS check (that
+    // would force a host sync and defeat the pipeline); pie-core trims the
+    // returned batch at its own EOS. `max_new_tokens` is the pipeline-window
+    // size. The k produced tokens are packed into request-0's `tokens_indptr`
+    // CSR range (the existing multi-token-per-request response shape).
+    //
+    // CONTRACT: pie-core must pre-allocate enough KV pages for request 0 to
+    // cover positions [pos0 .. pos0 + max_new_tokens - 1]; the driver computes
+    // each step's physical write slot from the request's page table with the
+    // same formula as compute_write_indices.
+    void run_decode_n(const pie_driver::PieForwardRequestView& req,
+                      int max_new_tokens,
+                      pie_driver::ResponseBuilder& builder,
+                      pie_driver::PieForwardResponseView& out);
+
 private:
     // Reusable host staging buffers (refilled per fire; their storage backs
     // the no-copy MLX input arrays for the duration of one run_forward).
