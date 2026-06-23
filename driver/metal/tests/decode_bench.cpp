@@ -168,6 +168,81 @@ int main(int argc, char** argv) {
         return n_steps / std::chrono::duration<double>(t1 - t0).count();
     };
 
+    // ── PROFILE the per-token eval-sync bubble (PIE_PROFILE_DECODE=1) ──
+    // Decompose the serial per-token cost into:
+    //   build = host-CPU graph construction (make_batch + graph->forward trace +
+    //           argmax) — lazy, NO GPU work; this is the portion async_eval
+    //           overlaps with the prior token's GPU compute.
+    //   eval  = next.eval() = MLX stream-thread command-buffer encode + commit +
+    //           GPU execute + waitUntilCompleted (CPU-encode + GPU + wait mixed).
+    //   item  = next.item() readback of the 4-byte token (already evaled).
+    // Plus a pure-GPU probe: re-eval an already-resident token array (no graph
+    // build, no encode) to bound the bare commit+wait latency floor.
+    if (std::getenv("PIE_PROFILE_DECODE")) {
+        const int warm = 16;
+        const int N = steps;
+        std::vector<double> tb, te, ti;
+        tb.reserve(N); te.reserve(N); ti.reserve(N);
+        int tok = 5;
+        using clk = std::chrono::high_resolution_clock;
+        for (int t = 0; t < N; ++t) {
+            auto a0 = clk::now();
+            auto b = make_batch({tok}, {prefill + t}, 0, ps, /*pure_decode=*/true);
+            attach_hybrid(b);
+            mx::array logits = model.graph->forward(b, *model.kv);
+            mx::array next = mx::astype(mx::argmax(logits, 1), mx::uint32);
+            auto a1 = clk::now();
+            next.eval();
+            auto a2 = clk::now();
+            tok = static_cast<int>(next.item<std::uint32_t>());
+            auto a3 = clk::now();
+            tb.push_back(std::chrono::duration<double, std::milli>(a1 - a0).count());
+            te.push_back(std::chrono::duration<double, std::milli>(a2 - a1).count());
+            ti.push_back(std::chrono::duration<double, std::milli>(a3 - a2).count());
+        }
+        // Bare commit+wait floor: eval a tiny already-resident scalar repeatedly.
+        // Measures the Metal command-buffer commit + waitUntilCompleted latency
+        // with ~1 trivial op (no transformer encode) — the irreducible per-eval
+        // submission cost.
+        std::vector<double> tcw;
+        {
+            mx::array acc = mx::array({0}, {1}, mx::int32);
+            mx::eval(acc);
+            for (int t = 0; t < 200; ++t) {
+                auto c0 = clk::now();
+                mx::array x = acc + mx::array({1}, {1}, mx::int32);
+                x.eval();
+                auto c1 = clk::now();
+                tcw.push_back(std::chrono::duration<double, std::milli>(c1 - c0).count());
+            }
+        }
+        auto stats = [&](std::vector<double> v, int skip) {
+            std::vector<double> w(v.begin() + std::min<int>(skip, (int)v.size()), v.end());
+            std::sort(w.begin(), w.end());
+            double sum = 0; for (double x : w) sum += x;
+            double mean = w.empty() ? 0 : sum / w.size();
+            double med = w.empty() ? 0 : w[w.size() / 2];
+            double mn = w.empty() ? 0 : w.front();
+            return std::make_tuple(mean, med, mn);
+        };
+        auto [bm, bd, bn] = stats(tb, warm);
+        auto [em, ed, en] = stats(te, warm);
+        auto [im, id, in_] = stats(ti, warm);
+        auto [cm, cd, cn] = stats(tcw, 16);
+        std::fprintf(stderr,
+            "\n[PROFILE] per-token decomposition (ms, skip %d warmup, n=%d)\n"
+            "  build (host graph trace, lazy/no-GPU) : mean %.3f  median %.3f  min %.3f\n"
+            "  eval  (encode+commit+GPU+wait)        : mean %.3f  median %.3f  min %.3f\n"
+            "  item  (4B token readback)             : mean %.3f  median %.3f  min %.3f\n"
+            "  TOTAL per token                       : mean %.3f  median %.3f\n"
+            "  --- bare commit+wait floor (1 trivial op/eval): mean %.4f median %.4f min %.4f ms\n",
+            warm, N,
+            bm, bd, bn, em, ed, en, im, id, in_,
+            bm + em + im, bd + ed + id, cm, cd, cn);
+        std::fflush(stderr);
+        return 0;
+    }
+
     // ── B2 prototype: whole-step compiled decode (PIE_COMPILE_DECODE=1) ──
     // Wraps the ENTIRE per-token forward (embedding -> layers -> lm_head) in one
     // mx::compile trace so the per-token CPU encode is cached & replayed instead
