@@ -50,4 +50,14 @@ struct ScratchSchedule {
 ScratchSchedule build_scratch_schedule(const std::vector<Dispatch>& dag,
                                        const DecodeGeometry& g);
 
+// Bind the schedule's activation slots into the arg table by ordinal: for each dispatch's
+// ScratchBind{bind_index, buffer_id}, arg_bind_ordinal(ordinal, bind_index, pool[buffer_id]).
+// `pool` is delta's BoundDecode.scratch[] (SCRATCH_POOL slots); pool_n must be >= colors_used.
+// Call after stage/bind of delta's slots and BEFORE make_resident(). Metal (see .cpp).
+void bind_scratch(RawMetalContext& ctx,
+                  const std::vector<Dispatch>& dag,
+                  const ScratchSchedule& sched,
+                  const SlotHandle* pool,
+                  int pool_n);
+
 }  // namespace pie_metal_driver::raw_metal

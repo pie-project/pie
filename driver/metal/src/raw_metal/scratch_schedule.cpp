@@ -248,4 +248,19 @@ ScratchSchedule build_scratch_schedule(const std::vector<Dispatch>& dag,
     return sched;
 }
 
+void bind_scratch(RawMetalContext& ctx,
+                  const std::vector<Dispatch>& dag,
+                  const ScratchSchedule& sched,
+                  const SlotHandle* pool,
+                  int pool_n) {
+    (void)dag;
+    for (size_t ord = 0; ord < sched.per_dispatch.size(); ++ord) {
+        for (const ScratchBind& sb : sched.per_dispatch[ord].binds) {
+            if (sb.buffer_id < pool_n && pool[sb.buffer_id].valid()) {
+                ctx.arg_bind_ordinal((int)ord, sb.bind_index, pool[sb.buffer_id]);
+            }
+        }
+    }
+}
+
 }  // namespace pie_metal_driver::raw_metal
