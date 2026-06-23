@@ -7,6 +7,7 @@
 #include "ops/attention.hpp"
 #include "ops/elementwise.hpp"
 #include "ops/embedding.hpp"
+#include "ops/gated_delta.hpp"
 #include "ops/gemm.hpp"
 #include "ops/moe.hpp"
 #include "ops/norm.hpp"
