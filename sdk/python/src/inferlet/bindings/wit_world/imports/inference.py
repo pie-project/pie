@@ -163,6 +163,11 @@ class ForwardPass:
         enabled by default
         """
         raise NotImplementedError
+    def pass_speculation(self, flag: bool) -> None:
+        """
+        Controls runtime pass-level speculation for this execute only.
+        """
+        raise NotImplementedError
     def attention_mask(self, mask: List[List[int]]) -> None:
         """
         if not provided, fallback to causal mask
@@ -287,5 +292,4 @@ class Matcher:
         Release this resource.
         """
         raise NotImplementedError
-
 

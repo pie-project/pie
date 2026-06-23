@@ -12,12 +12,12 @@ from ..imports import model
 
 
 class Image:
-    
+
     @classmethod
     def from_bytes(cls, model: model.Model, bytes: bytes) -> Self:
         """
         Encoded still image (PNG / JPEG / ...).
-        
+
         Raises: `wit_world.types.Err(wit_world.imports.str)`
         """
         raise NotImplementedError
@@ -49,7 +49,7 @@ class Image:
     def __enter__(self) -> Self:
         """Returns self"""
         return self
-                                
+
     def __exit__(self, exc_type: type[BaseException] | None, exc_value: BaseException | None, traceback: TracebackType | None) -> bool | None:
         """
         Release this resource.
@@ -58,12 +58,12 @@ class Image:
 
 
 class Video:
-    
+
     @classmethod
     def from_bytes(cls, model: model.Model, bytes: bytes, max_frames: int) -> Self:
         """
         Encoded animated container (for example GIF).
-        
+
         Raises: `wit_world.types.Err(wit_world.imports.str)`
         """
         raise NotImplementedError
@@ -75,7 +75,7 @@ class Video:
     def frame(self, index: int) -> Image:
         """
         The `index`-th sampled frame as an owned image span.
-        
+
         Raises: `wit_world.types.Err(wit_world.imports.str)`
         """
         raise NotImplementedError
@@ -87,7 +87,7 @@ class Video:
     def __enter__(self) -> Self:
         """Returns self"""
         return self
-                                
+
     def __exit__(self, exc_type: type[BaseException] | None, exc_value: BaseException | None, traceback: TracebackType | None) -> bool | None:
         """
         Release this resource.
@@ -96,12 +96,12 @@ class Video:
 
 
 class Audio:
-    
+
     @classmethod
     def from_bytes(cls, model: model.Model, bytes: bytes) -> Self:
         """
         Encoded audio (WAV / RIFF).
-        
+
         Raises: `wit_world.types.Err(wit_world.imports.str)`
         """
         raise NotImplementedError
@@ -128,11 +128,9 @@ class Audio:
     def __enter__(self) -> Self:
         """Returns self"""
         return self
-                                
+
     def __exit__(self, exc_type: type[BaseException] | None, exc_value: BaseException | None, traceback: TracebackType | None) -> bool | None:
         """
         Release this resource.
         """
         raise NotImplementedError
-
-

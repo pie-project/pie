@@ -32,12 +32,12 @@ class SpeechRequest:
 
 
 class Speech:
-    
+
     @classmethod
     def generate(cls, model: model.Model, req: SpeechRequest) -> Self:
         """
         Synthesize speech on `model`.
-        
+
         Raises: `wit_world.types.Err(wit_world.imports.str)`
         """
         raise NotImplementedError
@@ -64,11 +64,9 @@ class Speech:
     def __enter__(self) -> Self:
         """Returns self"""
         return self
-                                
+
     def __exit__(self, exc_type: type[BaseException] | None, exc_value: BaseException | None, traceback: TracebackType | None) -> bool | None:
         """
         Release this resource.
         """
         raise NotImplementedError
-
-
