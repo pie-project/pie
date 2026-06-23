@@ -84,68 +84,72 @@ void InProcService::serve_forever(pie_driver::InProcServer& server) {
         [&](std::uint32_t req_id,
             const pie_driver::PieInProcRequestView& req,
             pie_driver::PieInProcResponseView& out) {
-            out.method = req.method;
-            switch (req.method) {
-                case pie_driver::PIE_METHOD_FORWARD: {
-                    ++handled_;
-                    const auto& fwd = req.forward;
-#if defined(PIE_METAL_HAS_MLX)
-                    // Real compute path: delegate to the MLX executor, which
-                    // runs charlie's ModelGraph over delta's PagedKvCache on
-                    // the Metal GPU and packs the sampled tokens via beta's
-                    // sampler. Only taken once a model is loaded + attached.
-                    if (executor_ != nullptr) {
-                        executor_->run_forward(fwd, response_builder,
-                                               out.forward);
-                        out.status = 0;
-                        break;
-                    }
-#endif
-                    // Stub fallback (no-MLX skeleton, or before a model loads):
-                    // dummy tokens shaped like the per-request sampler stream.
-                    const auto sampling_indptr =
-                        fwd.sampling_indptr.as<std::uint32_t>();
-                    const std::size_t n =
-                        sampling_indptr.empty() ? 0 : sampling_indptr.size() - 1;
-
-                    std::vector<pie_driver::PerRequestOutput> per_request(n);
-                    for (std::size_t r = 0; r < n; ++r) {
-                        fill_request(fwd, sampling_indptr[r],
-                                     sampling_indptr[r + 1], vocab_size_,
-                                     per_request[r]);
-                    }
-                    response_builder.build(per_request, out.forward);
-                    out.status = 0;
-                    break;
-                }
-                case pie_driver::PIE_METHOD_HEALTH:
-                    out.status = 0;
-                    break;
-                case pie_driver::PIE_METHOD_COPY_D2H:
-                case pie_driver::PIE_METHOD_COPY_H2D:
-                case pie_driver::PIE_METHOD_COPY_D2D:
-                case pie_driver::PIE_METHOD_COPY_H2H:
-                case pie_driver::PIE_METHOD_RS_COPY_D2H:
-                case pie_driver::PIE_METHOD_RS_COPY_H2D:
-                case pie_driver::PIE_METHOD_RS_COPY_D2D:
-                case pie_driver::PIE_METHOD_RS_COPY_H2H:
-                    // No KV / recurrent-state cache yet (delta wires it).
-                    out.status = 4;
-                    break;
-                case pie_driver::PIE_METHOD_LOAD_ADAPTER:
-                case pie_driver::PIE_METHOD_SAVE_ADAPTER:
-                case pie_driver::PIE_METHOD_ZO_INITIALIZE_ADAPTER:
-                case pie_driver::PIE_METHOD_ZO_UPDATE_ADAPTER:
-                    // No adapter pool yet; no-op success.
-                    out.status = 0;
-                    break;
-                default:
-                    std::cerr << "[pie-driver-metal] unknown method "
-                              << req.method << " (req_id=" << req_id << ")\n";
-                    out.status = 2;
-                    break;
-            }
+            handle_request(req_id, req, out, response_builder);
         });
+}
+
+void InProcService::handle_request(std::uint32_t req_id,
+                                   const pie_driver::PieInProcRequestView& req,
+                                   pie_driver::PieInProcResponseView& out,
+                                   pie_driver::ResponseBuilder& response_builder) {
+    out.method = req.method;
+    switch (req.method) {
+        case pie_driver::PIE_METHOD_FORWARD: {
+            ++handled_;
+            const auto& fwd = req.forward;
+#if defined(PIE_METAL_HAS_MLX)
+            // Real compute path: delegate to the MLX executor, which runs
+            // charlie's ModelGraph over delta's PagedKvCache on the Metal GPU
+            // and packs the sampled tokens via beta's sampler. Only taken
+            // once a model is loaded + attached.
+            if (executor_ != nullptr) {
+                executor_->run_forward(fwd, response_builder, out.forward);
+                out.status = 0;
+                break;
+            }
+#endif
+            // Stub fallback (no-MLX skeleton, or before a model loads): dummy
+            // tokens shaped like the per-request sampler stream.
+            const auto sampling_indptr = fwd.sampling_indptr.as<std::uint32_t>();
+            const std::size_t n =
+                sampling_indptr.empty() ? 0 : sampling_indptr.size() - 1;
+
+            std::vector<pie_driver::PerRequestOutput> per_request(n);
+            for (std::size_t r = 0; r < n; ++r) {
+                fill_request(fwd, sampling_indptr[r], sampling_indptr[r + 1],
+                             vocab_size_, per_request[r]);
+            }
+            response_builder.build(per_request, out.forward);
+            out.status = 0;
+            break;
+        }
+        case pie_driver::PIE_METHOD_HEALTH:
+            out.status = 0;
+            break;
+        case pie_driver::PIE_METHOD_COPY_D2H:
+        case pie_driver::PIE_METHOD_COPY_H2D:
+        case pie_driver::PIE_METHOD_COPY_D2D:
+        case pie_driver::PIE_METHOD_COPY_H2H:
+        case pie_driver::PIE_METHOD_RS_COPY_D2H:
+        case pie_driver::PIE_METHOD_RS_COPY_H2D:
+        case pie_driver::PIE_METHOD_RS_COPY_D2D:
+        case pie_driver::PIE_METHOD_RS_COPY_H2H:
+            // No KV / recurrent-state cache yet (delta wires it).
+            out.status = 4;
+            break;
+        case pie_driver::PIE_METHOD_LOAD_ADAPTER:
+        case pie_driver::PIE_METHOD_SAVE_ADAPTER:
+        case pie_driver::PIE_METHOD_ZO_INITIALIZE_ADAPTER:
+        case pie_driver::PIE_METHOD_ZO_UPDATE_ADAPTER:
+            // No adapter pool yet; no-op success.
+            out.status = 0;
+            break;
+        default:
+            std::cerr << "[pie-driver-metal] unknown method " << req.method
+                      << " (req_id=" << req_id << ")\n";
+            out.status = 2;
+            break;
+    }
 }
 
 }  // namespace pie_metal_driver::service
