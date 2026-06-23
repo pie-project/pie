@@ -446,6 +446,19 @@ pub async fn start_engine(
     })
 }
 
+/// Worker→controller heartbeat cadence. Matches the gateway's interval and sits
+/// well under the controller's liveness timeout (8s) → ~4× margin, so a few
+/// dropped beats never trip a false eviction.
+const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(2);
+/// Coarse-load report cadence. The controller coalesces these per epoch (only a
+/// `kv_pressure_bucket` cross advances the gateway epoch), so the exact period
+/// is a liveness floor, not a wire-churn source.
+const REPORT_INTERVAL: Duration = Duration::from_secs(2);
+/// `watch_worker` long-poll client deadline. Must exceed the controller's
+/// `T_HANG` (20s) so the server's same-epoch keepalive return always lands
+/// before we time out; on error we back off and re-poll.
+const WATCH_DEADLINE: Duration = Duration::from_secs(300);
+
 fn spawn_control_tasks(coordinator: &Coordinator) -> Vec<tokio::task::JoinHandle<()>> {
     let (Some(client), Some(worker_id)) = (coordinator.control_client(), coordinator.worker_id())
     else {
@@ -454,7 +467,7 @@ fn spawn_control_tasks(coordinator: &Coordinator) -> Vec<tokio::task::JoinHandle
 
     let heartbeat_client = client.clone();
     let heartbeat_task = tokio::spawn(async move {
-        let mut ticker = tokio::time::interval(Duration::from_secs(1));
+        let mut ticker = tokio::time::interval(HEARTBEAT_INTERVAL);
         loop {
             ticker.tick().await;
             match heartbeat_client
@@ -481,7 +494,7 @@ fn spawn_control_tasks(coordinator: &Coordinator) -> Vec<tokio::task::JoinHandle
 
     let report_client = client.clone();
     let report_task = tokio::spawn(async move {
-        let mut ticker = tokio::time::interval(Duration::from_secs(1));
+        let mut ticker = tokio::time::interval(REPORT_INTERVAL);
         loop {
             ticker.tick().await;
             let status = WorkerStatus {
@@ -505,7 +518,7 @@ fn spawn_control_tasks(coordinator: &Coordinator) -> Vec<tokio::task::JoinHandle
         let mut since = 0u64;
         loop {
             let mut ctx = tarpc::context::current();
-            ctx.deadline = Instant::now() + Duration::from_secs(40);
+            ctx.deadline = Instant::now() + WATCH_DEADLINE;
             match client.watch_worker(ctx, worker_id, since).await {
                 Ok(neighbors) => {
                     since = neighbors.epoch;
