@@ -1,403 +1,249 @@
-//! `pie-gateway` — Pie's client-facing **edge plane**.
+//! `pie-gateway` — Pie's client-facing **edge plane** (disaggregated serving).
 //!
-//! The single global host clients dial. It terminates client WebSockets, will
-//! authenticate them, and routes each session to a worker it selects locally
-//! from the controller's pushed routing table. It is the third coordination
-//! plane alongside the data plane (`pie-transport`, KV tensors) and the control
-//! plane (`pie-control`, membership + routing).
+//! The gateway terminates user protocols (REST/SSE, WebSocket), gates admission
+//! on cluster *resources*, routes each turn to a worker, and pipes the resulting
+//! token stream back. It runs behind an edge proxy, is replicated full-mesh, and
+//! is stateless except for the lifetime of an in-flight session.
 //!
-//! # Plane boundaries
+//! # Three directions (design §4)
 //!
-//! The gateway is a control-plane **client** (`pie_control::ControlClient`): it
-//! registers as a gateway, heartbeats for liveness, and long-polls
-//! `watch_gateway` for the global [`RoutingTable`]. It does **not** ask the
-//! controller per request — it caches the latest table and selects a worker
-//! locally for each session. It mediates the **client API stream**
-//! (`pie_client::message`, prompts + tokens); KV and activations never touch it —
-//! those stay worker↔worker on `pie-transport`.
+//! - **user → gateway** (server): the `ingress` adapters terminate REST/SSE +
+//!   WebSocket and converge onto charlie's one [`session::Sessions`].
+//! - **gateway ↔ worker** (server; workers dial IN, 1:N fan-in — the M3
+//!   inversion): [`worker`] serves [`GatewayInbound`](pie_dispatch::GatewayInbound)
+//!   and holds a [`WorkerControl`](pie_dispatch::WorkerControl) client per worker.
+//! - **gateway → controller** (client): [`controller`] registers, heartbeats, and
+//!   long-polls `watch_gateway` for the [`RoutingTable`](pie_schema::control::RoutingTable).
 //!
-//! # Status
+//! # Assembly
 //!
-//! Implemented. The gateway registers with the controller, runs heartbeat +
-//! routing-watch loops, terminates client WebSockets, selects a worker from the
-//! cached routing table, dials the worker's `WorkerSessionApi`, opens a session,
-//! forwards client messages with `send`, and relays worker messages back with
-//! long-poll `recv`.
+//! [`bind`] wires the four plane handles into one [`GatewayState`] (the axum
+//! `State`), binds both listeners (client-facing + worker-facing), starts the
+//! worker accept loop + the control loops, and returns a [`Gateway`] handle that
+//! exposes the bound addrs (so the single-node launcher can point its in-proc
+//! worker at `worker_addr`, and the smoke harness can dial ephemeral `:0` binds).
+//! [`run`] / [`run_with`] are the serve-forever entrypoints over it.
 
-pub mod edge_rpc;
+pub mod admission;
+pub mod blob;
+pub mod controller;
+pub mod ingress;
+pub mod route;
+pub mod session;
+pub mod worker;
 
+use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use crate::edge_rpc::{GatewayFrame, WorkerSessionApiClient};
-use anyhow::{Context, Result, anyhow};
-use futures::{SinkExt, StreamExt};
-use pie_client::message::ClientMessage;
-use pie_control::ControlClient;
-use pie_schema::control::{Ack, GatewayId, GatewayInfo, Health, NodeId, RoutableWorker, RoutingTable};
-use std::future::Future;
-use std::time::{Duration, Instant};
-use tarpc::serde_transport::{tcp, unix};
-use tarpc::tokio_serde::formats::Bincode;
-use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{Mutex as TokioMutex, watch};
-use tokio_tungstenite::accept_async;
-use tokio_tungstenite::tungstenite::Message as WsMessage;
+use anyhow::{Context, Result};
+use axum::Router;
+use pie_schema::control::{GatewayInfo, WorkerId};
+use pie_schema::gateway::{ReqId, Request};
+use tokio::net::TcpListener;
+use tokio::sync::watch;
 
-/// Max edge-RPC frame — must match the worker's `edge_session` server. A `recv`
-/// batch of up to 64 messages, each able to carry a 256 KiB session chunk, can
-/// reach ~16 MiB; 64 MiB gives headroom over tarpc's 8 MiB default.
-const EDGE_MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
+use crate::admission::AdmissionDecision;
+use crate::blob::{BlobStore, GatewayOriginStore};
+use crate::route::RoutingHandle;
+use crate::session::{AdmitReject, DispatchFail, Sessions, TurnRouter};
+use crate::worker::WorkerRegistry;
 
-/// How often the gateway heartbeats the controller. Must be comfortably shorter
-/// than the controller's liveness-timeout window so a healthy gateway is never
-/// evicted between beats.
-const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(2);
-
-/// Client deadline for the `watch_gateway` long-poll. Generous so the
-/// server-side block (until the routing epoch advances) dominates; on expiry we
-/// simply re-poll with the same `since`. Transport errors surface immediately
-/// regardless of this bound.
-const WATCH_DEADLINE: Duration = Duration::from_secs(300);
-
-/// Backoff before retrying `watch_gateway` after a transport error, so a wedged
-/// or restarting controller doesn't spin the loop.
-const WATCH_RETRY_BACKOFF: Duration = Duration::from_secs(1);
+pub use crate::controller::GatewayControl;
 
 /// Runtime configuration for the gateway process.
 #[derive(Debug, Clone)]
 pub struct GatewayConfig {
-    /// Address the client-facing WebSocket listens on (the single global host).
+    /// Address the client-facing edge (REST/SSE + WebSocket) listens on — the
+    /// gateway's public address (behind the edge proxy).
     pub listen: SocketAddr,
+    /// Address the worker-facing data plane listens on. Post-inversion (M3)
+    /// workers dial IN here; for the spine workers learn it from deploy-config.
+    pub worker_listen: SocketAddr,
     /// Controller's tarpc control endpoint: `tcp://host:port`, a bare
     /// `host:port`, or `unix:/path`.
     pub controller: String,
 }
 
-/// The control-plane backend the gateway drives. Two implementors:
-///
-/// - [`ControlClient`] (distributed, **in this crate**): tarpc RPCs;
-///   [`routing_watch`](GatewayControl::routing_watch) spawns the `watch_gateway`
-///   long-poll loop and returns its channel.
-/// - an `EmbeddedControl(Handle)` newtype at the single-node composition root
-///   (the worker binary — the only place that legitimately deps both
-///   `pie-controller` and `pie-gateway`): in-proc `Handle` calls, with
-///   `routing_watch` returning the controller's `gateway_watch()` directly.
-///
-/// Keeping the `Handle` adapter at the root (not here) is what lets `pie-gateway`
-/// stay `pie-controller`-free.
-pub trait GatewayControl: Clone + Send + Sync + 'static {
-    /// Register this gateway; returns its controller-minted [`GatewayId`].
-    fn register_gateway(
+/// The shared, axum-`State`-injected gateway root. Cloneable; composes each
+/// plane's handle so every route-provider and the worker server target one type:
+/// charlie's session registry, alpha's routing/admission, foxtrot's worker
+/// registry, bravo's blob store.
+#[derive(Clone)]
+pub struct GatewayState {
+    /// The internal session abstraction (charlie): construct / stream / lifecycle,
+    /// plus the worker-facing `feed` / `redirect` producer end.
+    pub sessions: Sessions,
+    /// Worker selection + coarse cluster admission (alpha): `RoutingTable` cache
+    /// (+ foxtrot's connected set) behind `admit` / `select_worker` /
+    /// `dispatch_with_retry`. Session-internal — ingress never touches it.
+    pub routing: RoutingHandle,
+    /// Live dialed-in worker connections (foxtrot): the `WorkerControlClient`
+    /// registry + the connected-set watch. Session-internal.
+    pub workers: WorkerRegistry,
+    /// Content-addressed blob store (bravo): gateway-origin tier behind a `dyn`
+    /// boundary so the object-store graduation is a pure impl swap.
+    pub blobs: Arc<dyn BlobStore>,
+}
+
+/// The composition-root adapter joining charlie's session-internal [`TurnRouter`]
+/// seam to alpha's [`RoutingHandle`] + foxtrot's [`WorkerRegistry`]. It lives here
+/// (the only place both are visible) so `session.rs` carries no upward edge to
+/// `route.rs` / `worker.rs`.
+struct RouteBackend {
+    routing: RoutingHandle,
+    workers: WorkerRegistry,
+}
+
+#[async_trait::async_trait]
+impl TurnRouter for RouteBackend {
+    async fn admit(&self, req: &Request) -> std::result::Result<(), AdmitReject> {
+        match self.routing.admit(req) {
+            AdmissionDecision::Admit => Ok(()),
+            AdmissionDecision::Reject(reason) => Err(AdmitReject(reason.to_string())),
+        }
+    }
+
+    async fn dispatch(
         &self,
-        info: GatewayInfo,
-    ) -> impl Future<Output = Result<GatewayId>> + Send;
-
-    /// Liveness ping. [`Ack::ReRegister`] ⇒ the gateway must re-register.
-    fn heartbeat(&self, id: NodeId) -> impl Future<Output = Result<Ack>> + Send;
-
-    /// A receiver of the latest [`RoutingTable`]. The distributed impl spawns the
-    /// long-poll loop internally and returns its channel; the in-proc impl returns
-    /// the controller's `gateway_watch()` directly (epoch-free).
-    fn routing_watch(&self) -> watch::Receiver<RoutingTable>;
-}
-
-impl GatewayControl for ControlClient {
-    async fn register_gateway(&self, info: GatewayInfo) -> Result<GatewayId> {
-        // Inherent (tarpc) method shadows the trait method on `ControlClient` for
-        // method-call syntax, so this dispatches to the RPC, not back into us.
-        self.register_gateway(tarpc::context::current(), info)
+        req: &Request,
+        affinity: Option<u64>,
+    ) -> std::result::Result<WorkerId, DispatchFail> {
+        // The session layer chose the key: `None` (Ephemeral/one-shot → alpha's
+        // load-aware power-of-two) or `Some(session)` (Sticky/WS → HRW warm-KV).
+        // The adapter is pure mechanism — forward it to the retry loop.
+        self.routing
+            .dispatch_with_retry(&self.workers, req, affinity)
             .await
-            .context("register_gateway rpc")
+            .map(|d| d.worker_id)
+            .map_err(|_| DispatchFail)
     }
 
-    async fn heartbeat(&self, id: NodeId) -> Result<Ack> {
-        self.heartbeat(tarpc::context::current(), id)
+    async fn cancel(&self, worker: WorkerId, req: ReqId) {
+        // Immediate reverse-channel abort (when the worker isn't pushing, so the
+        // piggybacked `Control::Abort` can't reach it promptly). Best-effort: a
+        // dropped worker is already gone.
+        if let Some(client) = self.workers.client(worker) {
+            let _ = client.cancel(tarpc::context::current(), req).await;
+        }
+    }
+
+    fn connected(&self) -> watch::Receiver<Arc<HashSet<WorkerId>>> {
+        self.workers.connected_watch()
+    }
+}
+
+/// A bound, assembled gateway. Holds both resolved listener addresses (so an
+/// ephemeral `:0` bind surfaces the real port — needed by the single-node
+/// launcher and the smoke harness) and the shared [`GatewayState`]. Call
+/// [`serve`](Gateway::serve) to run the client-facing edge until shutdown; the
+/// worker accept loop + control loops are already running.
+pub struct Gateway {
+    /// The resolved client-facing listen address.
+    pub listen_addr: SocketAddr,
+    /// The resolved worker-facing dial-in address (workers connect here).
+    pub worker_addr: SocketAddr,
+    /// The assembled shared state (test access to sessions / routing / workers /
+    /// blobs without a live serve).
+    pub state: GatewayState,
+    listener: TcpListener,
+    app: Router,
+    _worker_task: tokio::task::JoinHandle<()>,
+}
+
+impl Gateway {
+    /// Serve the client-facing edge (ingress + blob routes) until the listener
+    /// errors or the process exits. The worker-facing data plane is already
+    /// accepting dial-ins.
+    pub async fn serve(self) -> Result<()> {
+        axum::serve(self.listener, self.app)
             .await
-            .context("heartbeat rpc")
-    }
-
-    fn routing_watch(&self) -> watch::Receiver<RoutingTable> {
-        let (tx, rx) = watch::channel(RoutingTable {
-            epoch: 0,
-            workers: Vec::new(),
-        });
-        tokio::spawn(watch_routing_loop(self.clone(), tx));
-        rx
+            .context("gateway client-facing serve")?;
+        Ok(())
     }
 }
 
-/// Dial the controller and serve the edge plane over the distributed transport.
-/// A thin wrapper over [`run_with`] that constructs a tarpc [`ControlClient`];
-/// the single-node launcher calls [`run_with`] directly with the embedded adapter.
-pub async fn run(config: GatewayConfig) -> Result<()> {
-    let control = connect_controller(&config.controller).await?;
-    run_with(config, control).await
-}
-
-/// Register as a gateway over `control`, start the heartbeat loop, subscribe to
-/// the routing table, bind the client WebSocket, and serve until cancelled.
-/// Generic over the [`GatewayControl`] backend so the launcher can inject either
-/// the dialed [`ControlClient`] or the in-proc embedded adapter.
-pub async fn run_with<C: GatewayControl>(config: GatewayConfig, control: C) -> Result<()> {
-    // Register with the controller. `addr` is where this gateway is reachable —
-    // the client-facing listen address.
+/// Register with the controller, assemble the [`GatewayState`], bind both
+/// listeners, and start the worker accept loop + control loops — returning a
+/// [`Gateway`] handle (with the resolved bound addrs) ready to [`serve`].
+///
+/// Generic over the [`GatewayControl`] backend so the launcher injects either the
+/// dialed [`ControlClient`](pie_control::ControlClient) (distributed) or the
+/// in-proc embedded adapter (single-node); juliet injects a stub yielding a
+/// seeded [`RoutingTable`](pie_schema::control::RoutingTable) for the smoke.
+pub async fn bind<C: GatewayControl>(config: GatewayConfig, control: C) -> Result<Gateway> {
+    // Control plane: register + heartbeat + subscribe to the routing table.
     let info = GatewayInfo {
         addr: config.listen.to_string(),
     };
     let gateway_id = control
         .register_gateway(info.clone())
         .await
-        .context("register gateway")?;
+        .context("register gateway with controller")?;
     tracing::info!(%gateway_id, "gateway registered with controller");
-
-    // Latest routing table, read locally per session. The backend owns how it's
-    // fed (distributed: long-poll loop; in-proc: direct watch).
     let routing_rx = control.routing_watch();
+    tokio::spawn(controller::heartbeat_loop(control, gateway_id, info));
 
-    // Liveness + re-register on `Ack::ReRegister`.
-    tokio::spawn(heartbeat_loop(control, gateway_id, info));
+    // Assemble the four plane handles. The worker registry's connected-set watch
+    // feeds alpha's selector (`RoutingTable.healthy ∩ connected`); the
+    // `RouteBackend` adapter joins charlie's `TurnRouter` seam to routing+workers.
+    let workers = WorkerRegistry::new();
+    let routing = RoutingHandle::new(routing_rx, workers.connected_watch());
+    let sessions = Sessions::new(Arc::new(RouteBackend {
+        routing: routing.clone(),
+        workers: workers.clone(),
+    }));
+    let blobs: Arc<dyn BlobStore> =
+        Arc::new(GatewayOriginStore::new(format!("http://{}", config.listen)));
+    let state = GatewayState {
+        sessions: sessions.clone(),
+        routing,
+        workers: workers.clone(),
+        blobs: blobs.clone(),
+    };
 
+    // Data plane: bind the worker-facing listener FIRST (workers dial IN, M3) so
+    // its resolved address is known before serving — the single-node launcher
+    // points its in-proc worker here, and the smoke harness dials it.
+    let worker_server = worker::serve(config.worker_listen, sessions, workers)
+        .await
+        .context("start worker-facing data-plane server")?;
+    let worker_addr = worker_server.bound;
+    tracing::info!(%worker_addr, "gateway worker-facing listener up (workers dial in)");
+
+    // Client plane: ingress + blob route-providers merge onto the one listener.
+    let app = Router::new()
+        .merge(ingress::router(state.clone()))
+        .merge(blob::router(blobs));
     let listener = TcpListener::bind(config.listen)
         .await
-        .with_context(|| format!("bind gateway listener on {}", config.listen))?;
-    tracing::info!(
-        listen = %config.listen,
-        "pie-gateway serving edge plane",
-    );
+        .with_context(|| format!("bind client-facing listener on {}", config.listen))?;
+    let listen_addr = listener
+        .local_addr()
+        .context("client listener local_addr")?;
+    tracing::info!(%listen_addr, "pie-gateway client-facing edge up");
 
-    loop {
-        let (stream, peer) = listener
-            .accept()
-            .await
-            .context("accept client connection")?;
-        let routing_rx = routing_rx.clone();
-        tokio::spawn(async move {
-            if let Err(e) = handle_connection(stream, routing_rx).await {
-                tracing::warn!(?peer, error = %e, "gateway connection ended");
-            }
-        });
-    }
+    Ok(Gateway {
+        listen_addr,
+        worker_addr,
+        state,
+        listener,
+        app,
+        _worker_task: worker_server.task,
+    })
 }
 
-/// Heartbeat the controller on a fixed interval. On [`Ack::ReRegister`] the
-/// controller has lost our soft state (restart / timeout), so we re-register and
-/// adopt the new [`GatewayId`]. Transport errors are logged and retried next tick.
-async fn heartbeat_loop<C: GatewayControl>(control: C, mut id: GatewayId, info: GatewayInfo) {
-    let mut ticker = tokio::time::interval(HEARTBEAT_INTERVAL);
-    loop {
-        ticker.tick().await;
-        match control.heartbeat(NodeId::Gateway(id)).await {
-            Ok(Ack::Ok) => {}
-            Ok(Ack::ReRegister) => {
-                tracing::warn!(%id, "controller lost our registration; re-registering");
-                match control.register_gateway(info.clone()).await {
-                    Ok(new_id) => {
-                        id = new_id;
-                        tracing::info!(%id, "gateway re-registered");
-                    }
-                    Err(e) => {
-                        tracing::warn!(error = %e, "re-register failed; retrying next tick");
-                    }
-                }
-            }
-            Err(e) => tracing::warn!(error = %e, "heartbeat transport error"),
-        }
-    }
+/// Dial the controller and serve the edge plane over the distributed transport.
+/// A thin wrapper that constructs a tarpc [`ControlClient`](pie_control::ControlClient);
+/// the single-node launcher calls [`bind`] / [`run_with`] with the embedded adapter.
+pub async fn run(config: GatewayConfig) -> Result<()> {
+    let control = controller::connect_controller(&config.controller).await?;
+    run_with(config, control).await
 }
 
-/// Long-poll `watch_gateway`, publishing each new [`RoutingTable`] to the shared
-/// channel. The controller blocks until the routing epoch advances past `since`;
-/// we re-poll with the returned epoch. On a transport error we back off and retry.
-async fn watch_routing_loop(control: ControlClient, routing_tx: watch::Sender<RoutingTable>) {
-    let mut since: u64 = 0;
-    loop {
-        let mut ctx = tarpc::context::current();
-        ctx.deadline = Instant::now() + WATCH_DEADLINE;
-        match control.watch_gateway(ctx, since).await {
-            Ok(table) => {
-                since = table.epoch;
-                tracing::debug!(epoch = since, workers = table.workers.len(), "routing table updated");
-                // All receivers dropped → the gateway is shutting down.
-                if routing_tx.send(table).is_err() {
-                    break;
-                }
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, "watch_gateway error; retrying");
-                tokio::time::sleep(WATCH_RETRY_BACKOFF).await;
-            }
-        }
-    }
-}
-
-/// Dial the controller's tarpc endpoint and spawn the client request dispatcher.
-/// Control messages are tiny → tarpc's default frame cap is fine.
-async fn connect_controller(addr: &str) -> Result<ControlClient> {
-    let cfg = tarpc::client::Config::default();
-    if let Some(path) = addr
-        .strip_prefix("unix://")
-        .or_else(|| addr.strip_prefix("unix:"))
-    {
-        let conn = unix::connect(path, Bincode::default)
-            .await
-            .with_context(|| format!("dialing controller at {addr}"))?;
-        Ok(ControlClient::new(cfg, conn).spawn())
-    } else {
-        let tcp_addr = addr.strip_prefix("tcp://").unwrap_or(addr);
-        let conn = tcp::connect(tcp_addr, Bincode::default)
-            .await
-            .with_context(|| format!("dialing controller at {addr}"))?;
-        Ok(ControlClient::new(cfg, conn).spawn())
-    }
-}
-
-/// Dial a worker's edge-rpc endpoint. The session path proxies `chunk_data`, so
-/// the frame cap is lifted to match the worker's edge server.
-async fn connect_worker(addr: &str) -> Result<WorkerSessionApiClient> {
-    let cfg = tarpc::client::Config::default();
-    if let Some(path) = addr
-        .strip_prefix("unix://")
-        .or_else(|| addr.strip_prefix("unix:"))
-    {
-        let mut conn = unix::connect(path, Bincode::default);
-        conn.config_mut().max_frame_length(EDGE_MAX_FRAME_BYTES);
-        let conn = conn
-            .await
-            .with_context(|| format!("dialing worker edge-rpc at {addr}"))?;
-        Ok(WorkerSessionApiClient::new(cfg, conn).spawn())
-    } else {
-        let tcp_addr = addr.strip_prefix("tcp://").unwrap_or(addr);
-        let mut conn = tcp::connect(tcp_addr, Bincode::default);
-        conn.config_mut().max_frame_length(EDGE_MAX_FRAME_BYTES);
-        let conn = conn
-            .await
-            .with_context(|| format!("dialing worker edge-rpc at {addr}"))?;
-        Ok(WorkerSessionApiClient::new(cfg, conn).spawn())
-    }
-}
-
-/// Serve one client WebSocket: decode `ClientMessage` frames (msgpack — the
-/// unchanged client wire format), then proxy the session to one worker —
-/// selected locally from the latest pushed [`RoutingTable`] — over
-/// `WorkerSessionApi` (`open`/`send`/`recv`/`close`).
-async fn handle_connection(
-    stream: TcpStream,
-    routing_rx: watch::Receiver<RoutingTable>,
-) -> Result<()> {
-    let ws = accept_async(stream).await.context("websocket handshake")?;
-    let (tx, mut rx) = ws.split();
-
-    // Pick a worker locally from the cached routing table (no per-request
-    // controller RPC). Scope the borrow so it's dropped before we await.
-    let (worker_id, worker_addr) = {
-        let table = routing_rx.borrow();
-        let worker = select_worker(&table).ok_or_else(|| {
-            anyhow!(
-                "no healthy worker available in routing table (epoch {})",
-                table.epoch
-            )
-        })?;
-        (worker.id, worker.addr.clone())
-    };
-    let worker = connect_worker(&worker_addr).await?;
-    let session = worker
-        .open(tarpc::context::current())
-        .await
-        .context("worker open rpc")?
-        .map_err(|e| anyhow!("worker rejected open: {e}"))?;
-
-    tracing::debug!(
-        %worker_id,
-        worker_addr = %worker_addr,
-        session = session.0,
-        "gateway proxied session opened",
-    );
-
-    let ws_tx = Arc::new(TokioMutex::new(tx));
-    let (stop_tx, stop_rx) = watch::channel(false);
-
-    let poll_task = {
-        let worker = worker.clone();
-        let ws_tx = Arc::clone(&ws_tx);
-        tokio::spawn(async move {
-            let mut stop_rx = stop_rx;
-            loop {
-                tokio::select! {
-                    changed = stop_rx.changed() => {
-                        if changed.is_err() || *stop_rx.borrow() {
-                            break;
-                        }
-                    }
-                    poll = worker.recv(tarpc::context::current(), session, 200) => {
-                        let frames = match poll {
-                            Ok(Ok(frames)) => frames,
-                            Ok(Err(msg)) => {
-                                tracing::warn!(session = session.0, error = %msg, "worker recv rejected");
-                                break;
-                            }
-                            Err(e) => {
-                                tracing::warn!(session = session.0, error = %e, "worker recv transport error");
-                                break;
-                            }
-                        };
-
-                        for frame in frames {
-                            let encoded = match rmp_serde::to_vec_named(&frame.message) {
-                                Ok(bytes) => bytes,
-                                Err(e) => {
-                                    tracing::warn!(session = session.0, error = %e, "encode ServerMessage failed");
-                                    continue;
-                                }
-                            };
-
-                            let mut guard = ws_tx.lock().await;
-                            if guard.send(WsMessage::Binary(encoded.into())).await.is_err() {
-                                return;
-                            }
-                        }
-                    }
-                }
-            }
-        })
-    };
-
-    while let Some(frame) = rx.next().await {
-        let bytes = match frame.context("websocket read")? {
-            WsMessage::Binary(b) => b,
-            WsMessage::Close(_) => break,
-            _ => continue,
-        };
-        let msg: ClientMessage =
-            rmp_serde::from_slice(bytes.as_ref()).context("decode ClientMessage")?;
-
-        worker
-            .send(
-                tarpc::context::current(),
-                session,
-                GatewayFrame { message: msg },
-            )
-            .await
-            .context("worker send rpc")?
-            .map_err(|e| anyhow!("worker rejected send: {e}"))?;
-    }
-
-    let _ = stop_tx.send(true);
-    let _ = poll_task.await;
-    let _ = worker.close(tarpc::context::current(), session).await;
-    Ok(())
-}
-
-/// Select a worker for a new session from the cached routing table: healthy
-/// workers only, least-loaded by coarse load (KV-pressure bucket, then in-flight).
-/// Least-loaded to start; role/model filtering can be layered in once a session's
-/// target model is known (placement happens before the first client message, so
-/// only the table's coarse signals are available here). Returns `None` when no
-/// healthy worker is known yet (empty/stale table).
-fn select_worker(table: &RoutingTable) -> Option<&RoutableWorker> {
-    table
-        .workers
-        .iter()
-        .filter(|w| w.health == Health::Healthy)
-        .min_by_key(|w| (w.coarse_load.kv_pressure_bucket, w.coarse_load.inflight))
+/// [`bind`] then [`serve`](Gateway::serve), over an injected [`GatewayControl`]
+/// backend. The single-node launcher calls this with `EmbeddedControl(handle)`;
+/// the distributed path goes through [`run`].
+pub async fn run_with<C: GatewayControl>(config: GatewayConfig, control: C) -> Result<()> {
+    bind(config, control).await?.serve().await
 }
