@@ -118,12 +118,28 @@ enum class Embed : uint8_t { Table = 0, TokenIdPtr = 1, Out = 2 };
 // KV append (in-place write at position): PositionPtr is IO::Position (I1).
 enum class KvAppend : uint8_t { K = 0, V = 1, KPages = 2, VPages = 3, PositionPtr = 4 };
 
-// GDN fused core (1 dispatch — beta): folds conv1d + l2norm*2 + gating + GQA-repeat +
-// recurrent-step. Reads `mixed` + resident conv/recurrent state; writes state IN-PLACE,
-// emits core_out[gdn_v_total]. recurrent_state is NATIVE [Vh,Vd,Kd] (prong-1, no transpose).
+// GDN fused core (1 dispatch — beta): folds conv1d+silu + l2norm*2 + q-scale + gating +
+// GQA-repeat + recurrent-step. Reads `mixed` (in-proj conv input) + per-layer conv/gating
+// weights + resident conv/recurrent state; emits core_out[gdn_v_total].
+// Buffer indices below MATCH beta's gdn_core.metal [[buffer(i)]] signature exactly.
+//   * RecurrentState (2) is updated IN-PLACE (each (req,v-head,v-dim) row owned by one
+//     threadgroup -> race-free; native [Vh,Vd,Kd], prong-1, no transpose).
+//   * ConvState (1) is READ-ONLY; the shifted result is written to a PING-PONG
+//     ConvStateOut (10) and swapped per token. In-place conv_state races (convsilu reads
+//     the Kc-tap history while redundant v-dim threadgroups shift it — beta measured 5.5).
 enum class GdnCore : uint8_t {
-    Mixed = 0, ConvState = 1, RecurrentState = 2, CoreOut = 3,
-    // outputs (in-place): ConvState/RecurrentState rebound to the same heap slot.
+    Mixed        = 0,  // in-proj conv input (T)
+    ConvState    = 1,  // conv history (float, RO)
+    RecurrentState = 2,  // [Vh,Vd,Kd] (float, in/out, in-place)
+    CoreOut      = 3,  // core_out[gdn_v_total] (out, T)
+    ConvW        = 4,  // conv1d weight (T)
+    ConvB        = 5,  // conv1d bias (T)
+    ALog         = 6,  // A_log decay param (T)
+    DtBias       = 7,  // dt_bias gating param (T)
+    AGate        = 8,  // a_gate projection (T)
+    BGate        = 9,  // b_gate projection (T)
+    ConvStateOut = 10, // new_conv_state (float, out, ping-pong w/ ConvState)
+    Params       = 11, // GdnCoreParams& (constant, static geometry, I1-safe)
 };
 
 // gated rmsnorm: rms(core_out) * silu(z).

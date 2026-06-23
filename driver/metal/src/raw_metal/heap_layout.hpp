@@ -79,11 +79,15 @@ inline HeapPlan plan_heap(const DecodeGeometry& g,
 
     // ── State (GDN resident, in-place, S=1) ──
     int n_gdn = g.n_layers - n_full;
-    // conv_state [gdn_conv_dim, gdn_conv_k] + recurrent_state [Vh, Vd, Kd].
+    // conv_state [gdn_conv_dim, gdn_conv_k] is PING-PONG (RO in + new_conv_state out; beta's
+    // co-fix — in-place conv shift races the Kc-tap reads). recurrent_state [Vh,Vd,Kd] is
+    // in-place (each (v-head,v-dim) row owned by one threadgroup → race-free).
     const size_t conv_state = size_t(g.gdn_conv_dim) * g.gdn_conv_k * state_dtype_bytes;
     const size_t recur_state =
         size_t(g.gdn_v_heads) * g.gdn_v_dim * g.gdn_k_dim * state_dtype_bytes;
-    p.state_per_layer = align_up(conv_state) + align_up(recur_state);
+    p.state_per_layer =
+        2 * align_up(conv_state)   // ConvState + ConvStateOut (ping-pong)
+        + align_up(recur_state);   // RecurrentState (in-place)
     p.state_bytes = align_up(size_t(n_gdn) * p.state_per_layer);
 
     // ── Scratch (activation ping-pong pool) ──
