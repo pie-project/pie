@@ -199,8 +199,9 @@ pub struct RoutableWorker {
 }
 
 /// The gateway's global view, pushed by `watch_gateway`: the full worker roster
-/// + coarse load. `epoch` is the membership cursor the gateway re-polls with.
-/// (Every gateway gets the same global view, so `watch_gateway` takes no id.)
+/// and its coarse load. `epoch` is the membership cursor the gateway re-polls
+/// with. (Every gateway gets the same global view, so `watch_gateway` takes no
+/// id.)
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RoutingTable {
     pub epoch: u64,

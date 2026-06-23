@@ -25,6 +25,13 @@ pub mod cluster;
 // keeps the two unambiguous until the legacy control bits are removed.
 pub mod control;
 pub mod edge;
+// The gateway data-plane contract (dispatch / token-stream). Reached as
+// `pie_schema::gateway::*` (NOT flat-re-exported below): its `SessionId`
+// deliberately supersedes the legacy `edge::SessionId` from the old poll-based
+// session path, so the module path keeps the two unambiguous until that path is
+// removed. The `#[tarpc::service]` traits that carry these types live in the
+// thin `pie-dispatch` crate so this floor stays tarpc-free.
+pub mod gateway;
 pub mod kv;
 pub mod message;
 pub mod pod;
