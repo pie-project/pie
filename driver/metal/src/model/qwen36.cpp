@@ -41,6 +41,7 @@ Tensor from_heads(const Tensor& x, std::int32_t n_tokens, std::int32_t width) {
 //   layer_<il+1> = output of decoder layer `il` (HF index il+1)
 //   layer_final = post-final-norm hidden (pre-LM-head)
 void maybe_dump_hidden(std::int32_t slot, const Tensor& h) {
+#ifndef PIE_METAL_NO_LAYER_DUMP
     static const char* dir = std::getenv("PIE_METAL_DUMP_LAYERS");
     if (dir == nullptr) return;
     Tensor hf = mx::astype(h, mx::float32);
@@ -52,6 +53,14 @@ void maybe_dump_hidden(std::int32_t slot, const Tensor& h) {
         std::snprintf(name, sizeof(name), "qwen36_layer_%02d.npy", slot);
     }
     mx::save(std::string(dir) + "/" + name, hf);
+#else
+    // Pipelined/bench build (-DPIE_METAL_NO_LAYER_DUMP): the parity dump — the
+    // only mx::eval in the decode path — is compiled out, so a stray
+    // PIE_METAL_DUMP_LAYERS can't inject a per-token sync barrier and pollute
+    // the async_eval pipeline / ceiling-confirmation numbers.
+    (void)slot;
+    (void)h;
+#endif
 }
 
 }  // namespace
