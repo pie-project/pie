@@ -96,6 +96,90 @@ int main(int argc, char** argv) {
     const char* dec = std::getenv("PIE_PARITY_DECODE");
     const bool decode_mode = dec != nullptr && dec[0] != '\0' && dec[0] != '0';
 
+    // Perplexity mode (PIE_PARITY_PPL=1): teacher-forced NLL over the sequence.
+    // Emits all-position logits [n, vocab] in ONE forward, then computes
+    // NLL = Σ_{t<n-1} −log_softmax(logits[t])[ids[t+1]] on-GPU and prints
+    // "PPL_NLL <total_nll> <n_predictions>" (avoids dumping a 512×vocab npy).
+    // A host script slides wikitext at fixed ctx-stride and aggregates ->
+    // ppl = exp(ΣNLL / Σtok). Default uses the varlen prefill (one pass, fast);
+    // PIE_PARITY_DECODE=1 forces the token-by-token decode loop instead (the
+    // arch-safe cross-check for GDN/qwen3.6 — validate prefill≈decode once).
+    const char* pplenv = std::getenv("PIE_PARITY_PPL");
+    const bool ppl_mode = pplenv != nullptr && pplenv[0] != '\0' && pplenv[0] != '0';
+    if (ppl_mode) {
+        std::cerr << "[parity] PPL mode (" << (decode_mode ? "decode-loop" : "prefill")
+                  << ") n=" << n << " vocab=" << c.vocab_size << "\n";
+        std::vector<int> all_rows(n);
+        for (int i = 0; i < n; ++i) all_rows[i] = i;
+        mx::array all = [&] {
+            if (!decode_mode) {
+                model::ForwardBatch batch{
+                    /*token_ids=*/        mx::array(ids.data(), {n}, mx::int32),
+                    /*positions=*/        mx::array(positions.data(), {n}, mx::int32),
+                    /*logit_rows=*/       mx::array(all_rows.data(), {n}, mx::int32),
+                    /*kv_page_indices=*/  mx::array({0}, {1}, mx::int32),
+                    /*kv_page_indptr=*/   mx::array({0, 1}, {2}, mx::int32),
+                    /*kv_last_page_lens=*/mx::array({n}, {1}, mx::int32),
+                    /*qo_indptr=*/        mx::array({0, n}, {2}, mx::int32),
+                    /*kv_write_indices=*/ mx::array(write_idx.data(), {n}, mx::int32),
+                    /*n_total=*/    n,
+                    /*n_requests=*/ 1,
+                    /*n_slots=*/    1,
+                    /*pure_decode=*/false,
+                };
+                batch.lin_cache = model.lin_cache.get();
+                batch.slot_ids  = mx::array({0}, {1}, mx::int32);
+                batch.qo_indptr_host = {0, n};
+                return mx::astype(model.graph->forward(batch, *model.kv),
+                                  mx::float32);  // [n, vocab]
+            }
+            if (model.lin_cache) model.lin_cache->reset_slot(0);
+            std::vector<mx::array> rows;
+            rows.reserve(n);
+            for (int t = 0; t < n; ++t) {
+                model::ForwardBatch step{
+                    /*token_ids=*/        mx::array({ids[t]}, {1}, mx::int32),
+                    /*positions=*/        mx::array({t}, {1}, mx::int32),
+                    /*logit_rows=*/       mx::array({0}, {1}, mx::int32),
+                    /*kv_page_indices=*/  mx::array({0}, {1}, mx::int32),
+                    /*kv_page_indptr=*/   mx::array({0, 1}, {2}, mx::int32),
+                    /*kv_last_page_lens=*/mx::array({t + 1}, {1}, mx::int32),
+                    /*qo_indptr=*/        mx::array({0, 1}, {2}, mx::int32),
+                    /*kv_write_indices=*/ mx::array({t}, {1}, mx::int32),
+                    /*n_total=*/    1,
+                    /*n_requests=*/ 1,
+                    /*n_slots=*/    1,
+                    /*pure_decode=*/true,
+                };
+                step.lin_cache = model.lin_cache.get();
+                step.slot_ids  = mx::array({0}, {1}, mx::int32);
+                step.qo_indptr_host = {0, 1};
+                rows.push_back(mx::astype(
+                    mx::reshape(model.graph->forward(step, *model.kv),
+                                {1, c.vocab_size}), mx::float32));
+                mx::eval(rows.back());
+            }
+            return mx::concatenate(rows, /*axis=*/0);  // [n, vocab]
+        }();
+
+        // NLL over predictions t=0..n-2 (target = next token).
+        const int np = n - 1;
+        mx::array pred = mx::slice(all, {0, 0}, {np, c.vocab_size});  // [n-1, vocab]
+        std::vector<int> tgt(np);
+        for (int t = 0; t < np; ++t) tgt[t] = ids[t + 1];
+        mx::array tcol = mx::array(tgt.data(), {np, 1}, mx::int32);
+        mx::array lse  = mx::logsumexp(pred, /*axis=*/1, /*keepdims=*/true);  // [n-1,1]
+        mx::array got  = mx::take_along_axis(pred, tcol, /*axis=*/1);          // [n-1,1]
+        mx::array nll  = mx::sum(mx::subtract(lse, got));                      // scalar
+        mx::eval(nll);
+        std::cerr.setf(std::ios::fixed);
+        std::cerr.precision(8);
+        std::cerr << "[parity] PPL_NLL total_nll=" << nll.item<float>()
+                  << " n_pred=" << np << "\n";
+        std::cout << "PPL_NLL " << nll.item<float>() << " " << np << "\n";
+        return 0;
+    }
+
     mx::array logits = [&] {
         if (!decode_mode) {
             // Single varlen prefill (single request, sample the last row).
