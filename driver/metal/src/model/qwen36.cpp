@@ -54,6 +54,7 @@ Tensor from_heads(const Tensor& x, std::int32_t n_tokens, std::int32_t width) {
 //   layer_<il+1> = output of decoder layer `il` (HF index il+1)
 //   layer_final = post-final-norm hidden (pre-LM-head)
 void maybe_dump_hidden(std::int32_t slot, const Tensor& h) {
+#ifndef PIE_METAL_NO_LAYER_DUMP
     static const char* dir = std::getenv("PIE_METAL_DUMP_LAYERS");
     if (dir == nullptr) return;
     Tensor hf = mx::astype(h, mx::float32);
@@ -65,6 +66,14 @@ void maybe_dump_hidden(std::int32_t slot, const Tensor& h) {
         std::snprintf(name, sizeof(name), "qwen36_layer_%02d.npy", slot);
     }
     mx::save(std::string(dir) + "/" + name, hf);
+#else
+    // Pipelined/bench build (-DPIE_METAL_NO_LAYER_DUMP): the parity dump — the
+    // only mx::eval in the decode path — is compiled out, so a stray
+    // PIE_METAL_DUMP_LAYERS can't inject a per-token sync barrier and pollute
+    // the async_eval pipeline / ceiling-confirmation numbers.
+    (void)slot;
+    (void)h;
+#endif
 }
 
 }  // namespace
@@ -155,10 +164,10 @@ Tensor Qwen36Graph::linear_attn_layer(std::int32_t il, std::int32_t lin_ordinal,
     Tensor residual = hidden;
     Tensor cur = ops::rms_norm(hidden, *L.attn_norm, eps, /*plus_one=*/true);
 
-    Tensor mixed_qkv = ops::linear(*L.la_in_proj_qkv, cur);  // [N, conv_dim] = [q|k|v]
-    Tensor z = ops::linear(*L.la_in_proj_z, cur);            // [N, V_dim]
-    Tensor a = ops::linear(*L.la_in_proj_a, cur);            // [N, V_h]
-    Tensor b = ops::linear(*L.la_in_proj_b, cur);            // [N, V_h]
+    Tensor mixed_qkv = apply_linear(*L.la_in_proj_qkv, cur);  // [N, conv_dim] = [q|k|v]
+    Tensor z = apply_linear(*L.la_in_proj_z, cur);            // [N, V_dim]
+    Tensor a = apply_linear(*L.la_in_proj_a, cur);            // [N, V_h]
+    Tensor b = apply_linear(*L.la_in_proj_b, cur);            // [N, V_h]
 
     ops::GdnParams p;
     p.n_heads_k   = spec_.linear_num_key_heads;
@@ -185,7 +194,7 @@ Tensor Qwen36Graph::linear_attn_layer(std::int32_t il, std::int32_t lin_ordinal,
             *batch.lin_cache, lin_ordinal, *batch.slot_ids, qo, p);
     }
 
-    Tensor attn_out = ops::linear(*L.la_out_proj, out);  // [N, hidden]
+    Tensor attn_out = apply_linear(*L.la_out_proj, out);  // [N, hidden]
     return ops::residual_add(attn_out, residual);
 }
 
@@ -206,8 +215,9 @@ Tensor Qwen36Graph::forward(const ForwardBatch& batch, KvCacheView& kv) {
     const float eps = cfg_.rms_norm_eps;
     const std::int32_t Lc = cfg_.num_hidden_layers;
 
-    // Qwen does NOT scale embeddings (unlike Gemma).
-    Tensor hidden = ops::embedding(w_.embed, batch.token_ids);
+    // Qwen does NOT scale embeddings (unlike Gemma). Dequant-gathers from the
+    // tied quant lm_head when the dense embed is dropped (embed-drop).
+    Tensor hidden = apply_embedding(w_.embed, batch.token_ids);
     maybe_dump_hidden(0, hidden);  // HF output_hidden_states[0] = embeddings
 
     std::int32_t lin_ordinal = 0;
@@ -227,7 +237,7 @@ Tensor Qwen36Graph::forward(const ForwardBatch& batch, KvCacheView& kv) {
 
     return w_.lm_head
         ? apply_linear(*w_.lm_head, sampled)   // [n_slots, vocab]
-        : ops::linear(w_.embed, sampled);      // tied, dense embed
+        : apply_linear(w_.embed, sampled);     // tied embed (dense or quant)
 }
 
 // ── Weight binding (Qwen3.6 hybrid) ──
@@ -236,16 +246,19 @@ ModelWeights bind_qwen36(const WeightSource& src, const ModelConfig& cfg) {
 
     // Qwen3.5 nests the text decoder under `model.language_model.` in the
     // multimodal checkpoint; some dumps drop the `language_model.` segment.
+    // Key off the final norm (always present, unlike the droppable embed).
     std::string root = "model.language_model.";
-    if (!src.has(root + "embed_tokens.weight")) {
+    if (!src.has(root + "norm.weight")) {
         root = "model.";
     }
 
-    w.embed      = src.get(root + "embed_tokens.weight");
     w.final_norm = src.get(root + "norm.weight");
     // Prefer an explicit lm_head bundle when present (incl. a synthesized
     // quantized lm_head over a tied embed); absent -> dense embed GEMV.
     w.lm_head = try_bind_linear(src, "lm_head", cfg);
+    // Input embed: dense bf16 table, or the tied quantized lm_head (dequant-
+    // gathered) when the dense embed is dropped for true-4-bit memory parity.
+    w.embed = bind_embedding(src, root + "embed_tokens", w.lm_head, cfg);
 
     // conv1d weight is stored [conv_dim, 1, conv_K]; flatten to [conv_dim, K]
     // for beta's gated_delta_net (which expects [conv_dim, conv_K]).
@@ -265,18 +278,20 @@ ModelWeights bind_qwen36(const WeightSource& src, const ModelConfig& cfg) {
 
         const std::string la = p + "linear_attn.";
         if (src.has(la + "in_proj_qkv.weight")) {
-            // Gated-DeltaNet linear-attention layer.
-            L.la_in_proj_qkv = src.get(la + "in_proj_qkv.weight");  // [conv_dim, H]
-            L.la_in_proj_z   = src.get(la + "in_proj_z.weight");    // [V_dim, H]
-            L.la_in_proj_a   = src.get(la + "in_proj_a.weight");    // [V_h, H]
-            L.la_in_proj_b   = src.get(la + "in_proj_b.weight");    // [V_h, H]
+            // Gated-DeltaNet linear-attention layer. The in/out projections are
+            // plain matmuls (bind_linear -> 4-bit transparently when the
+            // checkpoint quantizes them); conv1d + scalars stay dense.
+            L.la_in_proj_qkv = bind_linear(src, la + "in_proj_qkv", cfg);  // [conv_dim, H]
+            L.la_in_proj_z   = bind_linear(src, la + "in_proj_z", cfg);    // [V_dim, H]
+            L.la_in_proj_a   = bind_linear(src, la + "in_proj_a", cfg);    // [V_h, H]
+            L.la_in_proj_b   = bind_linear(src, la + "in_proj_b", cfg);    // [V_h, H]
             L.la_conv1d_w    = mx::reshape(src.get(la + "conv1d.weight"),
                                            {conv_dim, conv_k});
             L.la_conv1d_b    = src.try_get(la + "conv1d.bias");
             L.la_A_log       = src.get(la + "A_log");
             L.la_dt_bias     = src.get(la + "dt_bias");
             L.la_gate_norm   = src.get(la + "norm.weight");         // [V_d]
-            L.la_out_proj    = src.get(la + "out_proj.weight");     // [H, V_dim]
+            L.la_out_proj    = bind_linear(src, la + "out_proj", cfg);     // [H, V_dim]
         } else {
             // Full-attention layer (Qwen3 + output gate; 2x-wide q_proj).
             const std::string sa = p + "self_attn.";
