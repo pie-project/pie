@@ -1,45 +1,42 @@
-//! `pie-controller` — standalone controller process entry (`src/main.rs`).
+//! `pie-controller` standalone process entry.
 //!
-//! A thin argv shell over [`pie_controller::run_as_process`]: it binds the
-//! control endpoint and serves the control-RPC surface that the gateway and
-//! distributed workers dial. Single-node deployments run controller-free and
-//! never spawn this binary.
+//! A thin argv shell over [`pie_controller::run`]: binds the `Control` endpoint
+//! and serves workers + gateways over tarpc (tcp/unix). Single-node deployments
+//! skip this binary and embed the controller in-proc via
+//! [`pie_controller::embed`].
 
 use std::error::Error;
+use std::time::Duration;
 
 use clap::Parser;
 
-use pie_controller::{ControllerConfig, ProcessConfig, run_as_process};
+use pie_controller::{Config, run};
 
-/// Pie cluster controller — control-plane coordination (pairing, role
-/// assignment, health). Never handles tensor data.
+/// Pie cluster controller — control-plane coordination (registry, neighbor
+/// assignment, routing-table push, liveness). Never handles tensor data.
 #[derive(Debug, Parser)]
 #[command(name = "pie-controller", version, about)]
 struct Cli {
-    /// Address the control endpoint listens on.
+    /// Control endpoint to bind: `tcp://host:port`, a bare `host:port`, or
+    /// `unix:/path`.
     #[arg(long, default_value = "0.0.0.0:7000")]
     listen: String,
 
-    /// Silent heartbeat ticks before a node is graded degraded.
-    #[arg(long, default_value_t = 3)]
-    degrade_after: u64,
-
-    /// Silent heartbeat ticks before a node is graded unreachable.
-    #[arg(long, default_value_t = 6)]
-    unreachable_after: u64,
+    /// Evict a member after this many seconds without a liveness signal.
+    #[arg(long, default_value_t = 15)]
+    heartbeat_timeout_secs: u64,
 }
 
-fn main() -> Result<(), Box<dyn Error>> {
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn Error>> {
     let cli = Cli::parse();
-    let config = ProcessConfig {
+    let config = Config {
         listen_addr: cli.listen,
-        controller: ControllerConfig {
-            degrade_after: cli.degrade_after,
-            unreachable_after: cli.unreachable_after,
-        },
-        ..ProcessConfig::default()
+        heartbeat_timeout: Duration::from_secs(cli.heartbeat_timeout_secs),
+        ..Config::default()
     };
 
-    run_as_process(config)?;
+    let (_handle, serve) = run(config).await?;
+    serve.await?;
     Ok(())
 }

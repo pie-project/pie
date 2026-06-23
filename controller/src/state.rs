@@ -1,92 +1,45 @@
 //! Cluster state — the single source of truth, owned **solely** by the actor
-//! ([`crate::actor`]). No locks, no sharing: every mutation happens on the actor
-//! task. These are **internal** types and never cross the wire — `service.rs`
-//! projects them to the `protocol/schema` wire views before publishing.
+//! ([`crate::actor`]). No locks, no sharing: every mutation runs on the actor
+//! task. These are **internal** types and never cross the wire — the actor
+//! publishes the `pie_schema::control` wire views ([`Neighbors`], [`RoutingTable`])
+//! derived from this state.
 //!
 //! Two independent monotonic epochs version two independent full snapshots:
-//! `worker_epoch` tags the worker-facing topology (neighbor assignments),
-//! `gateway_epoch` tags the gateway-facing routing table. Membership changes
-//! (join/leave/death) bump both; a coarse load-bucket change bumps only the
-//! gateway epoch. An epoch is a version tag on a *whole* snapshot, never a delta.
+//! `worker_epoch` tags the worker-facing topology, `gateway_epoch` the
+//! gateway-facing routing table. Membership changes bump both; a coarse
+//! load-bucket crossing bumps only the gateway epoch. An epoch is a version tag
+//! on a *whole* snapshot, never a delta. `role` is immutable once registered.
+//!
+//! [`Neighbors`]: pie_schema::control::Neighbors
+//! [`RoutingTable`]: pie_schema::control::RoutingTable
 
 use std::collections::HashMap;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
-use pie_schema::{Role, WorkerId};
+use pie_schema::control::{GatewayId, NodeId, Role, WorkerId, WorkerStatus};
 
-/// Cluster-unique gateway handle, minted by the controller at registration.
-///
-/// Internal mirror of the wire `GatewayId` (defined on the `pie-schema` floor by
-/// the contract crate); newtype so it can't be confused with a [`WorkerId`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct GatewayId(pub u64);
-
-impl std::fmt::Display for GatewayId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "gateway#{}", self.0)
-    }
-}
-
-/// A cluster member reference — the unit a heartbeat names. Internal mirror of
-/// the wire `NodeId`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum NodeId {
-    Worker(WorkerId),
-    Gateway(GatewayId),
-}
-
-/// A registered worker. `role` is **immutable** after registration — only
-/// join/leave changes the topology, never a role flip.
+/// A registered worker. `role`/`model`/`addr` are immutable after registration.
 #[derive(Debug, Clone)]
 pub struct Worker {
-    /// Inference stage this worker serves. Immutable.
     pub role: Role,
-    /// Model the worker is bound to.
     pub model: String,
-    /// Control/edge address peers reach it at.
     pub addr: String,
-    /// The peers this worker was last assigned (cached from the planner).
+    /// Peers last assigned by the planner (cached; the published topology is the
+    /// source of truth).
     pub neighbors: Vec<WorkerId>,
     /// Controller-side receipt time of the last liveness signal (no worker
     /// clocks → no skew).
     pub last_hb: Instant,
-    /// Coarse KV-pressure bucket the worker last reported. The coalescing axis:
-    /// a change here is the *only* load signal that re-versions the gateway view.
-    pub kv_pressure_bucket: u8,
-    /// In-flight request count the worker last reported (finer; rides along in
-    /// the roster but does not by itself re-version).
-    pub inflight: u32,
+    /// Latest coarse load the worker reported. `kv_pressure_bucket` is the
+    /// coalescing axis.
+    pub load: WorkerStatus,
 }
 
-/// A registered gateway. Liveness only — gateways carry no topology weight.
+/// A registered gateway. Liveness only.
 #[derive(Debug, Clone)]
 pub struct Gateway {
-    /// Address the gateway is reachable at.
     pub addr: String,
-    /// Controller-side receipt time of its last liveness signal.
     pub last_hb: Instant,
-}
-
-/// What a worker declares about itself at registration.
-#[derive(Debug, Clone)]
-pub struct WorkerSpec {
-    pub role: Role,
-    pub model: String,
-    pub addr: String,
-}
-
-/// What a gateway declares about itself at registration.
-#[derive(Debug, Clone)]
-pub struct GatewaySpec {
-    pub addr: String,
-}
-
-/// The coarse load a worker reports. Already bucketed by the worker so the
-/// controller can coalesce (bump the gateway epoch only on a bucket crossing).
-#[derive(Debug, Clone, Copy)]
-pub struct WorkerStatus {
-    pub kv_pressure_bucket: u8,
-    pub inflight: u32,
 }
 
 /// The whole cluster. Sole owner: the actor task.
@@ -108,42 +61,45 @@ impl Cluster {
         Self::default()
     }
 
-    /// Register a worker, minting and returning its [`WorkerId`]. Neighbors start
-    /// empty; the planner fills them in the same write transaction.
-    pub fn insert_worker(&mut self, spec: WorkerSpec, now: Instant) -> WorkerId {
+    /// Register a worker (fields extracted from its wire `WorkerInfo` by the
+    /// service; `capability` is not used by the trivial planner). Mints a
+    /// [`WorkerId`].
+    pub fn insert_worker(
+        &mut self,
+        role: Role,
+        model: String,
+        addr: String,
+        now: Instant,
+    ) -> WorkerId {
         let id = WorkerId(self.next_worker_id);
         self.next_worker_id += 1;
         self.workers.insert(
             id,
             Worker {
-                role: spec.role,
-                model: spec.model,
-                addr: spec.addr,
+                role,
+                model,
+                addr,
                 neighbors: Vec::new(),
                 last_hb: now,
-                kv_pressure_bucket: 0,
-                inflight: 0,
+                load: WorkerStatus {
+                    kv_pressure_bucket: 0,
+                    inflight: 0,
+                },
             },
         );
         id
     }
 
-    /// Register a gateway, minting and returning its [`GatewayId`].
-    pub fn insert_gateway(&mut self, spec: GatewaySpec, now: Instant) -> GatewayId {
+    /// Register a gateway, minting a [`GatewayId`].
+    pub fn insert_gateway(&mut self, addr: String, now: Instant) -> GatewayId {
         let id = GatewayId(self.next_gateway_id);
         self.next_gateway_id += 1;
-        self.gateways.insert(
-            id,
-            Gateway {
-                addr: spec.addr,
-                last_hb: now,
-            },
-        );
+        self.gateways.insert(id, Gateway { addr, last_hb: now });
         id
     }
 
     /// Refresh a member's liveness. Returns `false` for an unknown id (the caller
-    /// then replies `ReRegister`).
+    /// replies [`Ack::ReRegister`](pie_schema::control::Ack::ReRegister)).
     pub fn touch(&mut self, node: NodeId, now: Instant) -> bool {
         match node {
             NodeId::Worker(id) => match self.workers.get_mut(&id) {
@@ -163,24 +119,21 @@ impl Cluster {
         }
     }
 
-    /// Apply a worker load report. Refreshes liveness too (a reporting worker is
-    /// alive). Returns `Some(bucket_changed)` for a known worker, `None` if the
-    /// worker is unknown.
+    /// Apply a worker load report (also refreshes liveness — a reporting worker
+    /// is alive). Returns `Some(bucket_crossed)` for a known worker, `None` if
+    /// the worker is unknown.
     pub fn report(&mut self, id: WorkerId, status: WorkerStatus, now: Instant) -> Option<bool> {
         let w = self.workers.get_mut(&id)?;
-        let bucket_changed = w.kv_pressure_bucket != status.kv_pressure_bucket;
-        w.kv_pressure_bucket = status.kv_pressure_bucket;
-        w.inflight = status.inflight;
+        let bucket_crossed = w.load.kv_pressure_bucket != status.kv_pressure_bucket;
+        w.load = status;
         w.last_hb = now;
-        Some(bucket_changed)
+        Some(bucket_crossed)
     }
 
     /// Evict every member whose last liveness signal is older than `timeout`.
-    /// Returns `(workers_removed, gateways_removed)` counts so the caller can
-    /// decide whether to re-plan (a worker leaving changes topology).
-    pub fn evict_expired(&mut self, now: Instant, timeout: std::time::Duration) -> (usize, usize) {
-        let before_w = self.workers.len();
-        let before_g = self.gateways.len();
+    /// Returns `(workers_removed, gateways_removed)`.
+    pub fn evict_expired(&mut self, now: Instant, timeout: Duration) -> (usize, usize) {
+        let (before_w, before_g) = (self.workers.len(), self.gateways.len());
         self.workers
             .retain(|_, w| now.duration_since(w.last_hb) <= timeout);
         self.gateways
