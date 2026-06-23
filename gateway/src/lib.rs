@@ -35,6 +35,7 @@ use futures::{SinkExt, StreamExt};
 use pie_client::message::ClientMessage;
 use pie_control::ControlClient;
 use pie_schema::control::{Ack, GatewayId, GatewayInfo, Health, NodeId, RoutableWorker, RoutingTable};
+use std::future::Future;
 use std::time::{Duration, Instant};
 use tarpc::serde_transport::{tcp, unix};
 use tarpc::tokio_serde::formats::Bincode;
@@ -73,39 +74,95 @@ pub struct GatewayConfig {
     pub controller: String,
 }
 
-/// Dial the controller, register as a gateway, start the heartbeat + routing-watch
-/// loops, bind the client WebSocket, and serve until cancelled.
+/// The control-plane backend the gateway drives. Two implementors:
+///
+/// - [`ControlClient`] (distributed, **in this crate**): tarpc RPCs;
+///   [`routing_watch`](GatewayControl::routing_watch) spawns the `watch_gateway`
+///   long-poll loop and returns its channel.
+/// - an `EmbeddedControl(Handle)` newtype at the single-node composition root
+///   (the worker binary — the only place that legitimately deps both
+///   `pie-controller` and `pie-gateway`): in-proc `Handle` calls, with
+///   `routing_watch` returning the controller's `gateway_watch()` directly.
+///
+/// Keeping the `Handle` adapter at the root (not here) is what lets `pie-gateway`
+/// stay `pie-controller`-free.
+pub trait GatewayControl: Clone + Send + Sync + 'static {
+    /// Register this gateway; returns its controller-minted [`GatewayId`].
+    fn register_gateway(
+        &self,
+        info: GatewayInfo,
+    ) -> impl Future<Output = Result<GatewayId>> + Send;
+
+    /// Liveness ping. [`Ack::ReRegister`] ⇒ the gateway must re-register.
+    fn heartbeat(&self, id: NodeId) -> impl Future<Output = Result<Ack>> + Send;
+
+    /// A receiver of the latest [`RoutingTable`]. The distributed impl spawns the
+    /// long-poll loop internally and returns its channel; the in-proc impl returns
+    /// the controller's `gateway_watch()` directly (epoch-free).
+    fn routing_watch(&self) -> watch::Receiver<RoutingTable>;
+}
+
+impl GatewayControl for ControlClient {
+    async fn register_gateway(&self, info: GatewayInfo) -> Result<GatewayId> {
+        // Inherent (tarpc) method shadows the trait method on `ControlClient` for
+        // method-call syntax, so this dispatches to the RPC, not back into us.
+        self.register_gateway(tarpc::context::current(), info)
+            .await
+            .context("register_gateway rpc")
+    }
+
+    async fn heartbeat(&self, id: NodeId) -> Result<Ack> {
+        self.heartbeat(tarpc::context::current(), id)
+            .await
+            .context("heartbeat rpc")
+    }
+
+    fn routing_watch(&self) -> watch::Receiver<RoutingTable> {
+        let (tx, rx) = watch::channel(RoutingTable {
+            epoch: 0,
+            workers: Vec::new(),
+        });
+        tokio::spawn(watch_routing_loop(self.clone(), tx));
+        rx
+    }
+}
+
+/// Dial the controller and serve the edge plane over the distributed transport.
+/// A thin wrapper over [`run_with`] that constructs a tarpc [`ControlClient`];
+/// the single-node launcher calls [`run_with`] directly with the embedded adapter.
 pub async fn run(config: GatewayConfig) -> Result<()> {
     let control = connect_controller(&config.controller).await?;
+    run_with(config, control).await
+}
 
+/// Register as a gateway over `control`, start the heartbeat loop, subscribe to
+/// the routing table, bind the client WebSocket, and serve until cancelled.
+/// Generic over the [`GatewayControl`] backend so the launcher can inject either
+/// the dialed [`ControlClient`] or the in-proc embedded adapter.
+pub async fn run_with<C: GatewayControl>(config: GatewayConfig, control: C) -> Result<()> {
     // Register with the controller. `addr` is where this gateway is reachable —
     // the client-facing listen address.
     let info = GatewayInfo {
         addr: config.listen.to_string(),
     };
     let gateway_id = control
-        .register_gateway(tarpc::context::current(), info.clone())
+        .register_gateway(info.clone())
         .await
-        .context("register_gateway rpc")?;
+        .context("register gateway")?;
     tracing::info!(%gateway_id, "gateway registered with controller");
 
-    // Latest routing table, pushed by the watch loop, read locally per session.
-    let (routing_tx, routing_rx) = watch::channel(RoutingTable {
-        epoch: 0,
-        workers: Vec::new(),
-    });
+    // Latest routing table, read locally per session. The backend owns how it's
+    // fed (distributed: long-poll loop; in-proc: direct watch).
+    let routing_rx = control.routing_watch();
 
     // Liveness + re-register on `Ack::ReRegister`.
-    tokio::spawn(heartbeat_loop(control.clone(), gateway_id, info));
-    // Long-poll the global routing table; publish each update.
-    tokio::spawn(watch_routing_loop(control, routing_tx));
+    tokio::spawn(heartbeat_loop(control, gateway_id, info));
 
     let listener = TcpListener::bind(config.listen)
         .await
         .with_context(|| format!("bind gateway listener on {}", config.listen))?;
     tracing::info!(
         listen = %config.listen,
-        controller = %config.controller,
         "pie-gateway serving edge plane",
     );
 
@@ -126,21 +183,15 @@ pub async fn run(config: GatewayConfig) -> Result<()> {
 /// Heartbeat the controller on a fixed interval. On [`Ack::ReRegister`] the
 /// controller has lost our soft state (restart / timeout), so we re-register and
 /// adopt the new [`GatewayId`]. Transport errors are logged and retried next tick.
-async fn heartbeat_loop(control: ControlClient, mut id: GatewayId, info: GatewayInfo) {
+async fn heartbeat_loop<C: GatewayControl>(control: C, mut id: GatewayId, info: GatewayInfo) {
     let mut ticker = tokio::time::interval(HEARTBEAT_INTERVAL);
     loop {
         ticker.tick().await;
-        match control
-            .heartbeat(tarpc::context::current(), NodeId::Gateway(id))
-            .await
-        {
+        match control.heartbeat(NodeId::Gateway(id)).await {
             Ok(Ack::Ok) => {}
             Ok(Ack::ReRegister) => {
                 tracing::warn!(%id, "controller lost our registration; re-registering");
-                match control
-                    .register_gateway(tarpc::context::current(), info.clone())
-                    .await
-                {
+                match control.register_gateway(info.clone()).await {
                     Ok(new_id) => {
                         id = new_id;
                         tracing::info!(%id, "gateway re-registered");
