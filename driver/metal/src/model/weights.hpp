@@ -17,11 +17,46 @@
 
 #include <cstdint>
 #include <optional>
+#include <string>
 #include <vector>
 
+#include "ops/gemm.hpp"     // ops::linear / ops::quantized_linear (beta)
 #include "ops/tensor.hpp"   // pie_metal_driver::Tensor + ops::empty_tensor() (beta)
+#include "model/config.hpp" // ModelConfig (quant_bits / quant_group_size)
 
 namespace pie_metal_driver::model {
+
+// QuantLinear — a single linear projection's weight, either dense BF16 or
+// mlx-community affine-quantized. Quantized checkpoints pack each nn.Linear
+// into a uint32 `weight` + per-group `scales`/`biases`; dense weights carry no
+// scales. `quantized()` (== scales present) is the per-tensor flag the graph
+// dispatches on (see `apply_linear`): present -> ops::quantized_linear, absent
+// -> the plain BF16 ops::linear. The presence of `.scales` in the safetensors
+// index IS the quant map — no separate flag needed from the loader.
+struct QuantLinear {
+    Tensor weight = ops::empty_tensor();   // BF16 [out,in] OR uint32-packed
+    std::optional<Tensor> scales;          // present <=> affine-quantized
+    std::optional<Tensor> biases;
+    int group_size = 64;
+    int bits       = 4;
+    bool quantized() const { return scales.has_value(); }
+
+    QuantLinear() = default;
+    // A dense linear is just its weight tensor — implicit so existing call
+    // sites (and synthetic-weight harnesses) that assign a bare Tensor keep
+    // working; quantized bundles are built field-wise by bind_linear.
+    QuantLinear(Tensor w) : weight(std::move(w)) {}
+};
+
+// Dispatch a linear projection: fused dequant-in-GEMV when quantized, plain
+// matmul otherwise. Numerically identical to the eager op sequence either way.
+inline Tensor apply_linear(const QuantLinear& w, const Tensor& x) {
+    if (w.quantized()) {
+        return ops::quantized_linear(w.weight, *w.scales, *w.biases, x,
+                                     w.group_size, w.bits);
+    }
+    return ops::linear(w.weight, x);
+}
 
 // `mlx::core::array` has no default constructor, so structs holding a
 // non-optional `Tensor` aren't default-constructible — which `bind_*`'s
@@ -42,12 +77,13 @@ struct LayerWeights {
     std::optional<Tensor> post_ffn_norm;    // Gemma2/3
 
     // ── Attention projections (W[out,in]; linear(w,x) -> [n,out]) ──
-    // Default-initialized to a placeholder so the struct is default-
-    // constructible (MLX `array` has no default ctor); bind_* overwrites.
-    Tensor q_proj = ops::empty_tensor();
-    Tensor k_proj = ops::empty_tensor();
-    Tensor v_proj = ops::empty_tensor();
-    Tensor o_proj = ops::empty_tensor();
+    // QuantLinear: dense BF16 by default, or affine-quantized when the loader
+    // surfaces `.scales`/`.biases` siblings. Default-constructed (empty weight)
+    // so the struct stays default-constructible; bind_* overwrites.
+    QuantLinear q_proj;
+    QuantLinear k_proj;
+    QuantLinear v_proj;
+    QuantLinear o_proj;
 
     // Optional additive QKV bias (Qwen2). Empty on Llama3 / Qwen3 / Mistral.
     std::optional<Tensor> q_bias;
@@ -59,9 +95,9 @@ struct LayerWeights {
     std::optional<Tensor> k_norm;
 
     // ── Dense MLP (SwiGLU / GeGLU). Empty on MoE layers. ──
-    std::optional<Tensor> gate_proj;
-    std::optional<Tensor> up_proj;
-    std::optional<Tensor> down_proj;
+    std::optional<QuantLinear> gate_proj;
+    std::optional<QuantLinear> up_proj;
+    std::optional<QuantLinear> down_proj;
 
     // ── MoE (Qwen3-MoE / Mixtral). Empty on dense layers. ──
     // router      : [n_experts, hidden]
@@ -75,8 +111,8 @@ struct LayerWeights {
     // ple_input_gate : [ple_dim, hidden]  (projects residual -> ple gate)
     // ple_projection : [hidden, ple_dim]  (projects gated signal back)
     // ple_norm       : [hidden]           (post-projection RMSNorm)
-    std::optional<Tensor> ple_input_gate;
-    std::optional<Tensor> ple_projection;
+    std::optional<QuantLinear> ple_input_gate;
+    std::optional<QuantLinear> ple_projection;
     std::optional<Tensor> ple_norm;
     // Per-layer learnable output scalar (1-element). Empty = 1.0.
     std::optional<Tensor> layer_scalar;
@@ -106,7 +142,7 @@ struct LayerWeights {
 struct ModelWeights {
     Tensor                embed      = ops::empty_tensor();  // [vocab, hidden]
     Tensor                final_norm = ops::empty_tensor();  // [hidden]
-    std::optional<Tensor> lm_head;      // empty when tie_word_embeddings (use embed)
+    std::optional<QuantLinear> lm_head;  // empty when tie_word_embeddings (use embed)
 
     // LLaMA-3.1 NTK-by-parts per-dim RoPE scaling, synthesized at load time.
     // Empty for plain theta-only RoPE (qwen2/qwen3/llama3.0/gemma).
@@ -117,7 +153,7 @@ struct ModelWeights {
     // ple_model_proj  : [n_layers * ple_dim, hidden] (projects main embed)
     // ple_model_norm  : [ple_dim]                     (RMSNorm over ple_dim)
     std::optional<Tensor> embed_per_layer;
-    std::optional<Tensor> ple_model_proj;
+    std::optional<QuantLinear> ple_model_proj;
     std::optional<Tensor> ple_model_norm;
 
     std::vector<LayerWeights> layers;
@@ -138,7 +174,29 @@ public:
     virtual bool has(const std::string& hf_name) const = 0;
 };
 
-struct ModelConfig;  // fwd
+// bind_linear — resolve a linear projection's weight (required) plus the
+// optional affine-quant siblings. Quantized iff `<base>.scales` is present in
+// the source (the index-as-quant-map convention); group_size/bits come from
+// the config (mlx-community default 64/4). `base` is the HF name WITHOUT the
+// `.weight` suffix (e.g. "...self_attn.q_proj").
+inline QuantLinear bind_linear(const WeightSource& src, const std::string& base,
+                               const ModelConfig& cfg) {
+    QuantLinear q;
+    q.weight     = src.get(base + ".weight");
+    q.scales     = src.try_get(base + ".scales");
+    q.biases     = src.try_get(base + ".biases");
+    q.group_size = cfg.quant_group_size > 0 ? cfg.quant_group_size : 64;
+    q.bits       = cfg.quant_bits > 0 ? cfg.quant_bits : 4;
+    return q;
+}
+
+// try_bind_linear — std::nullopt when the projection's `.weight` is absent.
+inline std::optional<QuantLinear> try_bind_linear(const WeightSource& src,
+                                                  const std::string& base,
+                                                  const ModelConfig& cfg) {
+    if (!src.has(base + ".weight")) return std::nullopt;
+    return bind_linear(src, base, cfg);
+}
 
 // Bind the Llama-like schema (llama3/qwen2/qwen3/mistral + qwen3-moe/mixtral).
 // Reads config flags (qk-norm, qkv-bias, MoE) to decide which optional

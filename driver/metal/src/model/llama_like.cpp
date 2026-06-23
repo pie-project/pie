@@ -66,11 +66,11 @@ Tensor LlamaLikeGraph::ffn(const LayerWeights& L, Tensor x) {
     }
     // Dense gated MLP. gate/up project to intermediate, activation gates,
     // down projects back to hidden.
-    Tensor gate = ops::linear(*L.gate_proj, x);
-    Tensor up   = ops::linear(*L.up_proj,   x);
+    Tensor gate = apply_linear(*L.gate_proj, x);
+    Tensor up   = apply_linear(*L.up_proj,   x);
     Tensor act  = spec_.ffn_use_gelu ? ops::geglu(gate, up)
                                      : ops::swiglu(gate, up);
-    return ops::linear(*L.down_proj, act);
+    return apply_linear(*L.down_proj, act);
 }
 
 Tensor LlamaLikeGraph::decoder_layer(std::int32_t il,
@@ -90,9 +90,9 @@ Tensor LlamaLikeGraph::decoder_layer(std::int32_t il,
                         spec_.norm_weight_plus_one)
         : hidden;  // post-norm archs feed the residual straight in
 
-    Tensor Q = ops::linear(L.q_proj, cur);
-    Tensor K = ops::linear(L.k_proj, cur);
-    Tensor V = ops::linear(L.v_proj, cur);
+    Tensor Q = apply_linear(L.q_proj, cur);
+    Tensor K = apply_linear(L.k_proj, cur);
+    Tensor V = apply_linear(L.v_proj, cur);
 
     if (spec_.has_qkv_bias) {
         if (L.q_bias) Q = ops::add_bias(Q, *L.q_bias);
@@ -136,7 +136,7 @@ Tensor LlamaLikeGraph::decoder_layer(std::int32_t il,
         batch.kv_last_page_lens, kv.page_size(), ap);
 
     attn = from_heads(attn, n_total, n_q_heads * head_dim);
-    Tensor attn_out = ops::linear(L.o_proj, attn);
+    Tensor attn_out = apply_linear(L.o_proj, attn);
     hidden = ops::residual_add(attn_out, residual);
 
     // ── FFN block ──
@@ -162,8 +162,9 @@ Tensor LlamaLikeGraph::forward(const ForwardBatch& batch, KvCacheView& kv) {
                            spec_.norm_weight_plus_one);
     Tensor sampled = ops::gather_rows(hidden, batch.logit_rows);
 
-    const Tensor& lm_head = cfg_.tie_word_embeddings ? w_.embed : *w_.lm_head;
-    Tensor logits = ops::linear(lm_head, sampled);  // [n_slots, vocab]
+    Tensor logits = w_.lm_head
+        ? apply_linear(*w_.lm_head, sampled)      // [n_slots, vocab]
+        : ops::linear(w_.embed, sampled);         // tied, dense embed
 
     if (spec_.final_softcap > 0.0f) {
         logits = ops::softcap(logits, spec_.final_softcap);
@@ -176,10 +177,10 @@ ModelWeights bind_llama_like(const WeightSource& src, const ModelConfig& cfg) {
     ModelWeights w;
     w.embed      = src.get("model.embed_tokens.weight");
     w.final_norm = src.get("model.norm.weight");
-    if (!cfg.tie_word_embeddings) {
-        w.lm_head = src.try_get("lm_head.weight");
-        if (!w.lm_head) w.lm_head = w.embed;  // defensive fallback
-    }
+    // Prefer an explicit lm_head bundle when present (incl. a synthesized
+    // quantized lm_head over a tied embed); absent -> the graph uses the dense
+    // embed GEMV.
+    w.lm_head = try_bind_linear(src, "lm_head", cfg);
 
     w.layers.resize(cfg.num_hidden_layers);
     for (std::int32_t il = 0; il < cfg.num_hidden_layers; ++il) {
@@ -189,12 +190,12 @@ ModelWeights bind_llama_like(const WeightSource& src, const ModelConfig& cfg) {
         L.attn_norm = src.try_get(p + "input_layernorm.weight");
         L.ffn_norm  = src.try_get(p + "post_attention_layernorm.weight");
 
-        L.q_proj = src.get(p + "self_attn.q_proj.weight");
-        L.k_proj = src.get(p + "self_attn.k_proj.weight");
-        L.v_proj = src.get(p + "self_attn.v_proj.weight");
-        L.o_proj = src.get(p + "self_attn.o_proj.weight");
+        L.q_proj = bind_linear(src, p + "self_attn.q_proj", cfg);
+        L.k_proj = bind_linear(src, p + "self_attn.k_proj", cfg);
+        L.v_proj = bind_linear(src, p + "self_attn.v_proj", cfg);
+        L.o_proj = bind_linear(src, p + "self_attn.o_proj", cfg);
 
-        // Optional Qwen2 QKV bias.
+        // Optional Qwen2 QKV bias (additive `.bias`, distinct from quant `.biases`).
         L.q_bias = src.try_get(p + "self_attn.q_proj.bias");
         L.k_bias = src.try_get(p + "self_attn.k_proj.bias");
         L.v_bias = src.try_get(p + "self_attn.v_proj.bias");
@@ -204,9 +205,9 @@ ModelWeights bind_llama_like(const WeightSource& src, const ModelConfig& cfg) {
         L.k_norm = src.try_get(p + "self_attn.k_norm.weight");
 
         // Dense MLP.
-        L.gate_proj = src.try_get(p + "mlp.gate_proj.weight");
-        L.up_proj   = src.try_get(p + "mlp.up_proj.weight");
-        L.down_proj = src.try_get(p + "mlp.down_proj.weight");
+        L.gate_proj = try_bind_linear(src, p + "mlp.gate_proj", cfg);
+        L.up_proj   = try_bind_linear(src, p + "mlp.up_proj", cfg);
+        L.down_proj = try_bind_linear(src, p + "mlp.down_proj", cfg);
 
         // MoE router (experts bound by the MoE path once implemented).
         L.moe_router = src.try_get(p + "mlp.gate.weight");
