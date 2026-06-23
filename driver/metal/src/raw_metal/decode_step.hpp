@@ -52,8 +52,12 @@ struct DecodeStepPsos {
 std::vector<Dispatch> build_decode_dag(const DecodeGeometry& g, bool with_argmax = false);
 
 // Encode one decode step: walk the DAG, bind pso + arg table (by ordinal), dispatch+barrier.
+// `force_barriers` (diagnostic): emit a barrier after EVERY dispatch, disabling the ‖-pair
+// concurrency. If the non-determinism vanishes with force_barriers=true, the cause is a
+// ‖-pair concurrency/barrier issue; if it persists, the race is elsewhere (in-kernel/state).
 void encode_decode_step(StepEncoder& se,
                         const std::vector<Dispatch>& dag,
-                        const DecodeStepPsos& psos);
+                        const DecodeStepPsos& psos,
+                        bool force_barriers = false);
 
 }  // namespace pie_metal_driver::raw_metal

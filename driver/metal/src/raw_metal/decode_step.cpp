@@ -113,13 +113,14 @@ static bool barrier_after(const std::vector<Dispatch>& dag, size_t i) {
 
 void encode_decode_step(StepEncoder& se,
                         const std::vector<Dispatch>& dag,
-                        const DecodeStepPsos& psos) {
+                        const DecodeStepPsos& psos,
+                        bool force_barriers) {
     for (size_t i = 0; i < dag.size(); ++i) {
         const Dispatch& d = dag[i];
         se.set_pso(psos[d.kind]);
         se.set_argtable(d.kind, d.ordinal);  // ordinal-keyed (unique, token-stable)
         se.dispatch(d.grid, d.tg);
-        if (barrier_after(dag, i)) se.barrier();
+        if (force_barriers || barrier_after(dag, i)) se.barrier();
     }
 }
 

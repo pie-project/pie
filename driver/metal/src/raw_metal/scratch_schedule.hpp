@@ -47,8 +47,15 @@ struct ScratchSchedule {
 
 // Derive the activation dataflow from the DAG order + geometry and linear-scan color the
 // live ranges onto pool buffers (hazard-free, honoring the concurrent ‖-pairs). Pure.
+//
+// `no_recycle` (dump/diagnostic build): give every distinct activation value its OWN buffer
+// (colors_used == number of values, zero reuse). This preserves every intermediate to
+// end-of-run so all golden taps can be read post-run, AND is the scratch-aliasing-race
+// diagnostic: if the non-determinism vanishes under no_recycle, it was a coloring/‖-pair
+// aliasing race; if it persists, it is an in-kernel race or uninitialized read.
 ScratchSchedule build_scratch_schedule(const std::vector<Dispatch>& dag,
-                                       const DecodeGeometry& g);
+                                       const DecodeGeometry& g,
+                                       bool no_recycle = false);
 
 // Bind the schedule's activation slots into the arg table by ordinal: for each dispatch's
 // ScratchBind{bind_index, buffer_id}, arg_bind_ordinal(ordinal, bind_index, pool[buffer_id]).
