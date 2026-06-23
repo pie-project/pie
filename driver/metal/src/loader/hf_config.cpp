@@ -76,6 +76,33 @@ float get_rope_local_base(const json& j) {
     return get_or<float>(j, "rope_local_base_freq", 0.0f);
 }
 
+// gemma4's full-attention layers use `rope_type=proportional` (mlx-lm's
+// ProportionalRoPE: rotated_dims = 0.25*head_dim but with the freq exponent
+// over head_dim, not rotated_dims) — empirically near-exact as FULL rope, not
+// the driver's standard partial rope. So only honor a nested
+// `partial_rotary_factor` when the primary rope is a STANDARD type
+// (default/linear/empty): qwen3.6 (rope_type=default) keeps 0.25; gemma4
+// (rope_type=proportional) falls back to full rope (1.0). Top-level
+// partial_rotary_factor (legacy phi-style) is always honored.
+float get_partial_rotary_factor(const json& j) {
+    if (const json* rp = rope_params_primary(j)) {
+        const std::string rt =
+            get_or<std::string>(*rp, "rope_type", get_or<std::string>(*rp, "type", ""));
+        const bool standard = rt.empty() || rt == "default" || rt == "linear";
+        if (standard) {
+            auto nit = rp->find("partial_rotary_factor");
+            if (nit != rp->end() && nit->is_number()) {
+                return nit->get<float>();
+            }
+        } else {
+            // Non-standard nested rope (gemma4 proportional) → full rope,
+            // unless a legacy top-level factor is explicitly present.
+            return get_or<float>(j, "partial_rotary_factor", 1.0f);
+        }
+    }
+    return get_or<float>(j, "partial_rotary_factor", 1.0f);
+}
+
 template <typename T>
 T require(const json& j, const char* key, const std::string& where) {
     auto it = j.find(key);
@@ -247,7 +274,7 @@ model::ModelConfig parse_doc(const json& root, const std::string& where) {
     cfg.linear_value_head_dim  = get_or<int>(j, "linear_value_head_dim", 0);
     cfg.linear_conv_kernel_dim = get_or<int>(j, "linear_conv_kernel_dim", 0);
     cfg.attn_output_gate       = get_or<bool>(j, "attn_output_gate", false);
-    cfg.partial_rotary_factor  = get_rope_param<float>(j, "partial_rotary_factor", 1.0f);
+    cfg.partial_rotary_factor  = get_partial_rotary_factor(j);
     if (auto it = j.find("layer_types");
         it != j.end() && it->is_array() && cfg.layer_attn_types.empty()) {
         for (const auto& t : *it) cfg.layer_attn_types.push_back(t.get<std::string>());
