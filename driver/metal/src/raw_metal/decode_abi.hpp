@@ -115,6 +115,13 @@ enum class Sdpa : uint8_t {
 // rms_single_row: group=(row/N_READS), grid=(1,1,1).
 enum class Rms : uint8_t { X = 0, W = 1, Out = 2, Axis = 3, Eps = 4 };
 
+// q_gate_split: deinterleave 2x-wide q_proj output (qwen3.5 gated attn).
+// qg[n_q,2,head_dim] -> Q[n_q,head_dim] + gate[n_q,head_dim]. Internal (no golden tag).
+enum class QSplit : uint8_t { Qg = 0, QOut = 1, GateOut = 2, HeadDim = 3 };
+
+// attn_gate: attn *= sigmoid(gate) before o_proj (golden tag `attn_gated`). In-place.
+enum class AttnGate : uint8_t { Attn = 0, Gate = 1 };
+
 // single-token rope (partial + mrope): PositionPtr is IO::Position (I1).
 enum class Rope : uint8_t { Q = 0, K = 1, QOut = 2, KOut = 3, PositionPtr = 4, Theta = 5 };
 
@@ -162,7 +169,7 @@ enum class Argmax : uint8_t { Logits = 0, NextToken = 1 };
 // ICB out). Metal-4 measured encode ~0.05ms → GPU-exec is the gate; GdnCore=1 fusion the lever.
 enum class Kernel : uint8_t {
     EmbedGather, Rms, QmvIn, GdnCore, GatedRms, QmvOut, Residual,
-    QmvQ, QmvK, QmvV, QNorm, KNorm, Rope, KvAppend, Sdpa, QmvO,
+    QmvQ, QSplit, QmvK, QmvV, QNorm, KNorm, Rope, KvAppend, Sdpa, AttnGate, QmvO,
     QmvGate, QmvUp, SiluMul, QmvDown,
     FinalRms, QmvLmHead, Argmax,
 };

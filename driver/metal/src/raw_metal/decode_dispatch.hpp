@@ -67,4 +67,16 @@ inline void kv_append_dispatch(int head_dim, int n_kv_heads, Grid& g, Threadgrou
     tg = Threadgroup{uint32_t(head_dim), 1, 1};
 }
 
+// q_gate_split: deinterleave qg -> Q + gate. one thread per (channel, query head).
+inline void q_split_dispatch(int head_dim, int n_q, Grid& g, Threadgroup& tg) {
+    g  = Grid{uint32_t(head_dim), uint32_t(n_q), 1};
+    tg = Threadgroup{uint32_t(head_dim), 1, 1};
+}
+
+// attn_gate: attn *= sigmoid(gate), elementwise over n_q*head_dim (head-major).
+inline void attn_gate_dispatch(int n_q, int head_dim, Grid& g, Threadgroup& tg) {
+    g  = Grid{uint32_t(n_q) * uint32_t(head_dim), 1, 1};
+    tg = Threadgroup{256, 1, 1};
+}
+
 }  // namespace pie_metal_driver::raw_metal
