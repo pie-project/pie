@@ -148,16 +148,21 @@ struct LayerWeights {
     //   la_conv1d_w    : [conv_dim, conv_K]   la_conv1d_b: [conv_dim] (optional)
     //   la_A_log/la_dt_bias : [V_h]           la_gate_norm: [V_d]
     //   la_out_proj    : [hidden, V_dim]
-    std::optional<Tensor> la_in_proj_qkv;
-    std::optional<Tensor> la_in_proj_z;
-    std::optional<Tensor> la_in_proj_a;
-    std::optional<Tensor> la_in_proj_b;
+    // The in/out projections are plain matmuls applied in the graph (their
+    // results feed beta's gated_delta_net, which never sees these weights), so
+    // they carry QuantLinear and 4-bit transparently via apply_linear when the
+    // checkpoint quantizes them (index-as-quant-map). conv1d/A_log/dt_bias/
+    // gate_norm stay dense (conv1d feeds the GDN kernel; the rest are tiny).
+    std::optional<QuantLinear> la_in_proj_qkv;
+    std::optional<QuantLinear> la_in_proj_z;
+    std::optional<QuantLinear> la_in_proj_a;
+    std::optional<QuantLinear> la_in_proj_b;
     std::optional<Tensor> la_conv1d_w;
     std::optional<Tensor> la_conv1d_b;
     std::optional<Tensor> la_A_log;
     std::optional<Tensor> la_dt_bias;
     std::optional<Tensor> la_gate_norm;
-    std::optional<Tensor> la_out_proj;
+    std::optional<QuantLinear> la_out_proj;
 };
 
 struct ModelWeights {
@@ -170,10 +175,12 @@ struct ModelWeights {
     std::optional<Tensor> freq_factors;
 
     // ── gemma4 Per-Layer-Embedding model-level tensors. Empty otherwise. ──
-    // embed_per_layer : [vocab, n_layers * ple_dim]  (per-layer token table)
+    // embed_per_layer : [vocab, n_layers * ple_dim]  (per-layer token table;
+    //                   a gather table — carries QuantLinear so it can be 4-bit
+    //                   dequant-gathered via apply_embedding when quantized)
     // ple_model_proj  : [n_layers * ple_dim, hidden] (projects main embed)
     // ple_model_norm  : [ple_dim]                     (RMSNorm over ple_dim)
-    std::optional<Tensor> embed_per_layer;
+    std::optional<QuantLinear> embed_per_layer;
     std::optional<QuantLinear> ple_model_proj;
     std::optional<Tensor> ple_model_norm;
 
