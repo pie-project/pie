@@ -75,6 +75,16 @@ fn execute_profile_enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var_os("PIE_PROFILE_EXECUTE").is_some())
 }
 
+/// Server-side kill-switch for driver-owned multi-token decode (DECODE_N).
+/// Default ON; `PIE_DECODE_N=0` forces every pass back to legacy single-step
+/// FORWARD without rebuilding the inferlet — the instant-rollback lever.
+fn decode_n_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        !matches!(std::env::var("PIE_DECODE_N").as_deref(), Ok("0"))
+    })
+}
+
 fn elapsed_us(duration: Duration) -> u64 {
     duration.as_micros() as u64
 }
@@ -709,8 +719,10 @@ impl pie::core::inference::HostForwardPass for InstanceState {
         // PIE_METHOD_DECODE_N (in-band via the appended `max_new_tokens` field)
         // and pins KV for the window. The runtime still falls back to single
         // step if the pass is ineligible (batched / grammar / penalised sampler).
+        // `PIE_DECODE_N=0` is the server-side kill-switch (instant rollback to
+        // per-token FORWARD without rebuilding the inferlet).
         let pass = self.ctx().table.get_mut(&this)?;
-        pass.req.max_new_tokens = n;
+        pass.req.max_new_tokens = if decode_n_enabled() { n } else { 0 };
         Ok(())
     }
 

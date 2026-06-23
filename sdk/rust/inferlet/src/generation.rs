@@ -34,6 +34,11 @@ use std::collections::VecDeque;
 
 const GENERATION_RESERVATION_WINDOW_TOKENS: u32 = 512;
 
+/// Default pipeline window for driver-owned multi-token decode (DECODE_N).
+/// Past the async_eval pipeline fill (gemma4 saturates by ~16) while capping
+/// the per-call EOS overrun at `N-1`. Capped further by `remaining` tokens.
+const DECODE_N_WINDOW_TOKENS: u32 = 32;
+
 // Re-export so callers don't have to pull from `context` directly.
 pub use crate::context::{Constrain, GrammarConstraint, Schema};
 
@@ -75,6 +80,11 @@ pub struct Generator<'ctx> {
     output_buffer: VecDeque<u32>,
     tokens_generated: usize,
     rebid_each_step: bool,
+    /// When true, eligible pure-decode steps fold the autoregressive loop into
+    /// the driver via DECODE_N (one IPC round-trip per `N`-token window instead
+    /// of per token). Ineligible steps (prefill / drafts / grammar mask / custom
+    /// speculator) transparently fall back to single-step FORWARD. Default on.
+    decode_n: bool,
     done: bool,
 }
 
@@ -124,6 +134,7 @@ impl<'ctx> Generator<'ctx> {
             output_buffer: VecDeque::new(),
             tokens_generated: 0,
             rebid_each_step: true,
+            decode_n: true,
             done: false,
         }
     }
@@ -220,6 +231,17 @@ impl<'ctx> Generator<'ctx> {
     /// initial bid to avoid three host calls per generated token.
     pub fn rebid_each_step(mut self, enabled: bool) -> Self {
         self.rebid_each_step = enabled;
+        self
+    }
+
+    /// Opt out of driver-owned multi-token decode (DECODE_N). With it enabled
+    /// (the default), eligible pure-decode steps run the autoregressive window
+    /// inside the driver — keeping the sampled token device-side across steps so
+    /// `async_eval` pipelining reaches the serving path (single-stream uplift).
+    /// Disable to force classic one-token-per-IPC decode. The server-side
+    /// `PIE_DECODE_N=0` env is an orthogonal global kill-switch.
+    pub fn decode_n(mut self, enabled: bool) -> Self {
+        self.decode_n = enabled;
         self
     }
 
@@ -437,6 +459,40 @@ impl<'ctx> Generator<'ctx> {
         remaining.min(GENERATION_RESERVATION_WINDOW_TOKENS as usize) as u32
     }
 
+    /// Decide the DECODE_N pipeline window for the step about to execute, or `0`
+    /// to keep classic single-step FORWARD. Eligibility mirrors the driver's
+    /// `run_decode_n` fallback guard: a pure single-token decode step (`n_pending
+    /// == 1`), generator-owned sampling, no draft verification, no grammar/
+    /// structured logit mask, and no custom speculator. (All SDK `Sampler`s are
+    /// stateless, and a `Generator` is single-request, so those guards always
+    /// hold here.) System-mode greedy drafting is superseded by DECODE_N for the
+    /// step. The window is `min(cap, remaining)`, and we require `>= 2` for the
+    /// driver loop to be worth a method switch over a plain FORWARD.
+    fn decode_n_window(
+        &self,
+        n_pending: u32,
+        n_drafted: u32,
+        mask_present: bool,
+        user_cleared_sampler: bool,
+    ) -> u32 {
+        if !self.decode_n
+            || n_pending != 1
+            || n_drafted != 0
+            || mask_present
+            || user_cleared_sampler
+            || matches!(self.speculation, SpecMode::Custom(_))
+        {
+            return 0;
+        }
+        let window = match self.horizon.or(self.max_tokens) {
+            Some(limit) => {
+                (limit.saturating_sub(self.tokens_generated) as u32).min(DECODE_N_WINDOW_TOKENS)
+            }
+            None => DECODE_N_WINDOW_TOKENS,
+        };
+        if window < 2 { 0 } else { window }
+    }
+
     fn release_empty_working_pages(&mut self) {
         let used_pages = if self.ctx.working_tokens == 0 {
             0
@@ -538,16 +594,24 @@ impl<'g, 'ctx> GenStep<'g, 'ctx> {
             }));
         }
 
+        // Decide the DECODE_N pipeline window for this step (0 = classic
+        // single-step FORWARD). Computed before reservation so the working tail
+        // is grown to cover the whole window the driver will write.
+        let decode_n_window =
+            parent.decode_n_window(n_pending, n_drafted, mask.is_some(), user_cleared_sampler);
+
         // Reserve pages for pending (drafts share the working tail —
         // their commit/truncate happens after we know what was accepted).
         // No-input bootstrap path skips reservation: the host samples from
         // the last cached KV position without growing the working tail.
+        // DECODE_N writes a full `window` of KV in one pass, so reserve for it.
         let n_total_input = n_pending + n_drafted;
-        if n_total_input > 0 {
+        let n_reserve_input = n_total_input.max(decode_n_window);
+        if n_reserve_input > 0 {
             let total_after = parent
                 .ctx
                 .working_tokens
-                .saturating_add(n_total_input)
+                .saturating_add(n_reserve_input)
                 .saturating_add(parent.reservation_lookahead_tokens());
             let pages_needed = (total_after + parent.ctx.page_size - 1) / parent.ctx.page_size;
             let additional = pages_needed.saturating_sub(parent.ctx.working_pages);
@@ -606,10 +670,20 @@ impl<'g, 'ctx> GenStep<'g, 'ctx> {
         let max_tokens_remaining = parent
             .max_tokens
             .map(|max| max.saturating_sub(parent.tokens_generated));
-        if matches!(parent.speculation, SpecMode::System { .. })
+        // DECODE_N supersedes host system-speculation for this step: the driver
+        // runs the autoregressive window itself, so don't also request drafts.
+        if decode_n_window == 0
+            && matches!(parent.speculation, SpecMode::System { .. })
             && max_tokens_remaining.map_or(true, |remaining| remaining > 1)
         {
             pass.output_speculative_tokens(true);
+        }
+        // Request the driver-owned multi-token decode window. Routed to
+        // PIE_METHOD_DECODE_N by the host (in-band `max_new_tokens`); the host
+        // pins KV for the window and the driver keeps the sampled token
+        // device-side across the `window` steps (async_eval pipelined).
+        if decode_n_window > 0 {
+            pass.decode_n(decode_n_window);
         }
         if max_tokens_remaining
             .map_or(false, |remaining| {
@@ -752,7 +826,17 @@ impl<'g, 'ctx> GenStep<'g, 'ctx> {
         } else {
             0
         };
-        let n_kv_tokens = n_pending + n_verified_drafts;
+        // DECODE_N: the driver wrote KV for the pending token plus every
+        // returned token except the last (which is the next step's deferred
+        // input). So `k` returned tokens advanced the working tail by exactly
+        // `n_pending + (k-1)` — matching the host's finish_ok lineage fill. Use
+        // the pre-stop-truncation count so the SDK page state stays in lockstep
+        // with the runtime context even on an early-stop overrun.
+        let n_kv_tokens = if decode_n_window > 0 {
+            n_pending + (accepted_tokens.len() as u32).saturating_sub(1)
+        } else {
+            n_pending + n_verified_drafts
+        };
         if n_kv_tokens > 0 {
             let new_working = parent.ctx.working_tokens + n_kv_tokens;
             let pages_to_commit = new_working / parent.ctx.page_size;
