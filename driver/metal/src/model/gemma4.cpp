@@ -17,15 +17,24 @@ namespace mx = mlx::core;
 
 namespace {
 
-// Measure-only B2 prototype switch: route single-stream (R=1) pure_decode
-// through the host-readback-free device decode attention so the whole step can
-// live inside an mx::compile trace. Off by default (production unchanged).
+// Route single-stream (R=1) pure_decode through the host-readback-free device
+// decode attention (no per-token `to_host_i32` sync), unblocking async_eval
+// pipelining and the whole-step compile trace. Default ON; opt out with
+// PIE_DEVICE_DECODE=0 (falls back to the host-readback paged_attention path).
+// The call site additionally guards on n_requests<=1 && softcap==0 so the
+// fast path only fires where paged_attention_decode is bit-exact.
 bool device_decode_enabled() {
     static const bool on = [] {
         const char* e = std::getenv("PIE_DEVICE_DECODE");
-        return e && e[0] && e[0] != '0';
+        return !(e && e[0] == '0');  // default on; PIE_DEVICE_DECODE=0 disables
     }();
     return on;
+}
+
+// True when the host-readback-free decode fast path is valid for this batch.
+bool use_device_decode(const model::ForwardBatch& batch, const ops::AttnParams& ap) {
+    return device_decode_enabled() && batch.pure_decode &&
+           batch.n_requests <= 1 && ap.softcap == 0.0f;
 }
 
 std::string layer_prefix(const std::string& root, std::int32_t il) {
@@ -175,7 +184,7 @@ Tensor Gemma4Graph::decoder_layer(std::int32_t il,
     ap.n_kv_heads     = n_kv_heads;
     ap.head_dim       = head_dim;
 
-    Tensor attn = (device_decode_enabled() && batch.pure_decode)
+    Tensor attn = use_device_decode(batch, ap)
         ? ops::paged_attention_decode(
               Q, k_pages, v_pages,
               batch.kv_page_indices, batch.kv_last_page_lens,
