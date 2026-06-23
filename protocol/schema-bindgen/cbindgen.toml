@@ -65,4 +65,7 @@ exclude = [
   # on every edit. C++ never reads it (SCHEMA_HASH handshake is Rust↔Rust via the
   # shmem ring). Excluding keeps the committed header an ABI-only snapshot.
   "SCHEMA_HASH",
+  # Rust-only session-message chunk size (message.rs); used by the worker's edge
+  # session layer, never by C++. Exclude so the C++ header stays Desc/ABI-only.
+  "CHUNK_SIZE_BYTES",
 ]
