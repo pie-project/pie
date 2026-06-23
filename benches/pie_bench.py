@@ -38,6 +38,7 @@ BENCH_INFERLET = "text-completion-bench"
 EMBEDDED_CLI_DRIVERS: set[str] = {
     "cuda_native",
     "portable",
+    "metal",
     "dummy",
     "vllm",
     "sglang",
@@ -114,6 +115,16 @@ def build_config(args: argparse.Namespace):
         if args.enable_system_speculation:
             driver_options["enable_system_speculation"] = True
     elif args.driver == "portable":
+        driver_options = {
+            "max_forward_tokens": args.max_forward_tokens,
+            "max_forward_requests": args.max_forward_requests,
+            "total_pages": args.kv_pages,
+            "kv_cache_dtype": args.kv_cache_dtype,
+        }
+    elif args.driver == "metal":
+        # Apple Silicon MLX/Metal driver. MetalDriverOptions mirrors
+        # PortableDriverOptions (same embedded ABI + page geometry), so the
+        # apples-to-apples bench vs portable+Metal uses identical knobs.
         driver_options = {
             "max_forward_tokens": args.max_forward_tokens,
             "max_forward_requests": args.max_forward_requests,
@@ -779,7 +790,7 @@ def build_parser() -> argparse.ArgumentParser:
     for sp in p._subparsers._group_actions[0].choices.values():
         sp.add_argument("--device", default="cuda:0")
         sp.add_argument("--driver", default="cuda_native",
-                        choices=["cuda_native", "portable", "vllm", "sglang", "tensorrt_llm", "dummy"])
+                        choices=["cuda_native", "portable", "metal", "vllm", "sglang", "tensorrt_llm", "dummy"])
         sp.add_argument("--default-token-limit", type=int, default=200_000)
         sp.add_argument("--default-endowment-pages", type=int, default=64)
         sp.add_argument("--admission-oversubscription-factor", type=float, default=4.0)
