@@ -78,9 +78,10 @@ impl DriverHandle {
 /// [`EngineHandle::wait_then_shutdown`] (the `pie serve` path) or
 /// [`EngineHandle::shutdown`] (the `pie serve --monitor` path, where
 /// the TUI owns the wait loop).
-/// The client-facing server, selected by topology: a direct WebSocket terminator
-/// in single-node (gateway-free local inference), or the tarpc edge-rpc a gateway
-/// proxies in distributed mode.
+/// The worker's data-plane edge, selected by topology: a direct WebSocket
+/// terminator in the single-node default build (gateway-free local inference),
+/// or the dial-in link(s) the worker serves `WorkerControl` over after dialing
+/// INTO the gateway(s) (distributed + single-node feature; M3 inversion).
 enum EdgeServer {
     #[cfg(not(feature = "single-node"))]
     Standalone(client_server::ClientServerHandle),
@@ -91,8 +92,9 @@ enum EdgeServer {
 }
 
 impl EdgeServer {
-    /// The advertised URL: `ws://…` for the direct client server, `edge://…` for
-    /// the gateway-fronted tarpc endpoint.
+    /// The advertised URL: `ws://…` for the direct client server, or
+    /// `gateway://addr[,…]` listing the gateway endpoint(s) the worker dialed
+    /// into (the worker is not client-facing in distributed mode).
     fn url(&self) -> String {
         match self {
             #[cfg(not(feature = "single-node"))]
@@ -137,8 +139,9 @@ pub struct EngineHandle {
     /// Bootstrapped engine internal auth token.
     pub token: String,
     /// Client endpoint this worker advertises: `ws://host:port` in single-node
-    /// (direct client server, or the in-proc gateway), `edge://host:port` in
-    /// distributed (gateway-fronted).
+    /// (direct client server, or the in-proc gateway), or `gateway://addr[,…]`
+    /// in distributed (the gateway endpoint(s) the worker dialed into — clients
+    /// hit the gateway, not the worker).
     pub url: String,
 }
 
@@ -513,12 +516,13 @@ pub async fn start_engine(
 /// control-plane resources to hold for the engine's lifetime, and the URL to
 /// advertise.
 ///
-/// - **distributed:** bind the worker's edge-rpc, dial the controller, register
-///   (now that it can serve), and spawn the heartbeat/report/watch loops. A
-///   remote gateway proxies client sessions to the edge-rpc.
+/// - **distributed:** dial the controller and register, spawn the
+///   heartbeat/report/watch loops, then dial INTO each configured gateway and
+///   serve `WorkerControl` over the link (M3 — the worker is the client, the
+///   gateway the listening server).
 /// - **single-node, `single-node` feature:** delegate to [`single_node::assemble`]
-///   — embed the controller in-proc, run the gateway in this process, and bind
-///   the worker's edge-rpc on a loopback port the in-proc gateway dials.
+///   — embed the controller in-proc, bind the gateway in this process, and dial
+///   the worker INTO the gateway's loopback worker-facing socket.
 /// - **single-node, default build:** terminate client WebSockets directly; no
 ///   control plane.
 async fn assemble_control_and_edge(

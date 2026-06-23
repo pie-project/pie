@@ -7,13 +7,14 @@
 //! contract crate was carved out to forbid.
 //!
 //! [`assemble`] embeds the controller actor on the engine runtime, then wires
-//! the three planes into one process with no sockets between them:
+//! the three planes into one process over loopback:
 //!
 //! ```text
-//! client ─ws→ in-proc gateway ─edge-rpc(loopback)→ worker engine
-//!                    │                    │
-//!                    └──── embedded controller Handle ────┘
-//!                         (register / heartbeat / watch)
+//! client ─ws→ in-proc gateway ←──dial-in── worker engine
+//!                    │       (worker serves WorkerControl +     │
+//!                    │        pushes tokens back; loopback)     │
+//!                    └──── embedded controller Handle ──────────┘
+//!                          (register / heartbeat / watch)
 //! ```
 //!
 //! A single [`pie_controller::embed`] yields a cloneable `Handle`; the

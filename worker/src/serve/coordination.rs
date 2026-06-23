@@ -125,7 +125,7 @@ pub fn addr_from_host_port(host: &str, port: u16) -> String {
     }
 }
 
-/// Resolved control-plane topology plus the worker's advertised edge address.
+/// Resolved control-plane topology plus the worker's `host:port` identity.
 ///
 /// Carried from flag parsing ([`connect`]) into the engine boot path
 /// ([`super::start_engine`]), which builds the actual control connection on the
@@ -136,9 +136,11 @@ pub fn addr_from_host_port(host: &str, port: u16) -> String {
 pub struct Coordinator {
     /// The resolved topology (single-node vs distributed + role/controller).
     pub mode: TopologyMode,
-    /// Address advertised to peers / the gateway as this worker's edge-rpc
-    /// endpoint in distributed mode. Unused by the single-node embed, which
-    /// binds an ephemeral loopback port and registers that instead.
+    /// The worker's `host:port`, registered as `WorkerInfo.addr`. Post-inversion
+    /// this is vestigial for dispatch — the gateway routes via its dial-in
+    /// registry (keyed by `WorkerId`), not by dialing this address; it stays a
+    /// stable identity/display value. Unused by the single-node embed, which
+    /// uses the gateway's resolved loopback worker-facing address instead.
     pub control_addr: String,
 }
 
