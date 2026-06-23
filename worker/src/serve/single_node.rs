@@ -23,7 +23,6 @@
 //! the controller's `watch::Receiver` directly, no epoch long-poll).
 
 use std::net::{SocketAddr, ToSocketAddrs};
-use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
 use pie_schema::control::{
@@ -33,7 +32,7 @@ use pie_schema::control::{
 use tokio::sync::watch;
 
 use super::control_link::{self, ControlLink};
-use super::{ControlPlane, EdgeServer, edge_session};
+use super::{ControlPlane, EdgeServer, gateway_link};
 use crate::config;
 use crate::embedded_driver::DriverCapabilities;
 
@@ -81,13 +80,13 @@ impl pie_gateway::GatewayControl for EmbeddedControl {
 
 /// Assemble the single-node in-proc cluster on the engine runtime.
 ///
-/// Embeds the controller, binds the worker's edge-rpc on an ephemeral loopback
-/// port, registers the worker, spawns its control loops, and runs the gateway
-/// in this process (serving the client WebSocket on the user's `host:port`,
-/// routing sessions to the loopback edge-rpc). Returns the worker's edge server,
-/// its control-loop tasks, the live control-plane resources, and the advertised
-/// `ws://` URL — matching the distributed arm of
-/// [`super::assemble_control_and_edge`].
+/// Embeds the controller, binds the in-proc gateway (client-facing edge on the
+/// user's `host:port`, worker-facing data plane on a loopback ephemeral port),
+/// registers the worker, then **dials the worker INTO the gateway** (M3) and
+/// serves `WorkerControl` over that link — the in-proc mirror of the distributed
+/// path. Returns the worker's edge link(s), its control-loop tasks, the live
+/// control-plane resources, and the advertised `ws://` URL — matching the
+/// distributed arm of [`super::assemble_control_and_edge`].
 pub(super) async fn assemble(
     user_cfg: &config::Config,
     model: String,
@@ -99,61 +98,61 @@ pub(super) async fn assemble(
     String,
 )> {
     // 1. Embed the controller actor on the engine runtime (no socket). The
-    //    Handle is cheaply cloneable: one clone drives the worker loops, another
-    //    the in-proc gateway, both talking to the same single-writer actor.
+    //    Handle is cheaply cloneable: one clone backs the worker's control loops,
+    //    another the in-proc gateway, both talking to the same single-writer actor.
     let handle = pie_controller::embed(pie_controller::Config::default());
     let embedded = EmbeddedControl(handle.clone());
 
-    // 2. Bind the worker's edge-rpc on an ephemeral loopback port; the in-proc
-    //    gateway dials it. The user's `host:port` is the gateway's WS listen, so
-    //    the worker's internal endpoint must be a separate address.
-    let edge = edge_session::spawn("127.0.0.1:0")
+    // 2. Bind the in-proc gateway: the client-facing edge on the user's
+    //    `host:port` and the worker-facing data plane on an ephemeral loopback
+    //    port. `bind` registers the gateway, binds BOTH sockets, and starts the
+    //    worker accept loop before returning — so the worker can dial in
+    //    immediately (no client-listen race; register-first lands first).
+    let listen = resolve_listen(&user_cfg.server.host, user_cfg.server.port)?;
+    let gateway_config = pie_gateway::GatewayConfig {
+        listen,
+        worker_listen: SocketAddr::from(([127, 0, 0, 1], 0)),
+        controller: String::new(),
+    };
+    let gw = pie_gateway::bind(gateway_config, embedded.clone())
         .await
-        .context("starting worker edge-rpc server")?;
-    let worker_addr = edge.bound.clone(); // tcp://127.0.0.1:<port>
+        .context("binding in-proc gateway")?;
+    let worker_dial = format!("tcp://{}", gw.worker_addr);
+    let listen_addr = gw.listen_addr;
 
-    // 3. Register the worker so it appears in the gateway's routing table. A
-    //    single-node worker serves all stages; routing doesn't filter by role
-    //    yet, so the role is inert for selection — register as Decode (the
-    //    steady-state role that holds a session through generation).
+    // 3. Register the worker with the embedded controller (control plane) so it
+    //    appears Healthy in the gateway's routing table, then dial INTO the
+    //    gateway's worker-facing socket (data plane, M3) and serve
+    //    `WorkerControl`. A single-node worker serves all stages; routing doesn't
+    //    filter by role yet, so `Decode` is an inert default (echo owns the
+    //    future `Role::Monolithic`).
     let info = WorkerInfo {
         role: Role::Decode,
         model,
-        addr: worker_addr,
+        // Vestigial post-inversion: the gateway dispatches via its dial-in
+        // registry (keyed by WorkerId), not by dialing this address.
+        addr: gw.worker_addr.to_string(),
         capability: caps,
     };
     let worker_id = ControlLink::register_worker(&embedded, info)
         .await
         .context("registering worker with in-proc controller")?;
-    let control_tasks = control_link::spawn_control_tasks(embedded.clone(), worker_id);
+    let control_tasks = control_link::spawn_control_tasks(embedded, worker_id);
+    let link = gateway_link::connect_gateway(&worker_dial, worker_id)
+        .await
+        .context("dialing in-proc gateway")?;
 
-    // 4. Run the gateway in-proc: it serves the client WebSocket on the user's
-    //    host:port and routes each session to the worker's loopback edge-rpc,
-    //    reading the registered worker from the embedded controller's routing
-    //    table. `controller` is unused — `run_with` takes the adapter directly.
-    let listen = resolve_listen(&user_cfg.server.host, user_cfg.server.port)?;
-    let gateway_config = pie_gateway::GatewayConfig {
-        listen,
-        controller: String::new(),
-    };
-    let gateway_embedded = embedded;
+    // 4. Serve the gateway's client-facing edge (its worker accept loop is
+    //    already live from `bind`).
     let gateway_task = tokio::spawn(async move {
-        if let Err(e) = pie_gateway::run_with(gateway_config, gateway_embedded).await {
+        if let Err(e) = gw.serve().await {
             tracing::error!(error = %e, "in-proc gateway exited");
         }
     });
 
-    // `run_with` binds its listener asynchronously (after registering + spawning
-    // its loops), but one-shot clients (`pie run`) connect immediately once we
-    // return. Wait until the gateway is accepting so that connect doesn't race
-    // the bind.
-    wait_until_listening(listen)
-        .await
-        .context("in-proc gateway failed to start listening")?;
-
-    let url = format!("ws://{listen}");
+    let url = format!("ws://{listen_addr}");
     Ok((
-        EdgeServer::WorkerListener(edge),
+        EdgeServer::GatewayLinks(vec![link]),
         control_tasks,
         ControlPlane::Embedded {
             _handle: handle,
@@ -162,26 +161,6 @@ pub(super) async fn assemble(
         },
         url,
     ))
-}
-
-/// Poll-connect to `addr` until the in-proc gateway's listener accepts, so we
-/// only advertise its URL once it is reachable. Bounded so a gateway that fails
-/// to bind (e.g. the port is in use) surfaces as an error rather than hanging.
-async fn wait_until_listening(addr: SocketAddr) -> Result<()> {
-    const PROBE_INTERVAL: Duration = Duration::from_millis(25);
-    const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
-    let deadline = tokio::time::Instant::now() + PROBE_TIMEOUT;
-    loop {
-        match tokio::net::TcpStream::connect(addr).await {
-            Ok(_) => return Ok(()),
-            Err(e) if tokio::time::Instant::now() >= deadline => {
-                return Err(anyhow!(
-                    "gateway not listening on {addr} after {PROBE_TIMEOUT:?}: {e}"
-                ));
-            }
-            Err(_) => tokio::time::sleep(PROBE_INTERVAL).await,
-        }
-    }
 }
 
 /// Resolve a `host`/`port` config pair into a bindable [`SocketAddr`] for the

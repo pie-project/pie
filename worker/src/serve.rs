@@ -8,8 +8,8 @@
 //!      a unified `DriverChannel` (one channel per driver carries
 //!   3. Translate the resulting handshakes → [`pie::bootstrap::Config`]
 //!      and call [`pie::bootstrap::bootstrap`]. The runtime now owns
-//!      the runtime services + scheduler; the worker exposes edge-rpc
-//!      (`WorkerSessionApi`) for the gateway.
+//!      the runtime services + scheduler; the worker dials into the
+//!      gateway and serves `pie_dispatch::WorkerControl`.
 //!   4. Caller decides what to do with the [`EngineHandle`]:
 //!        * `pie serve`: [`EngineHandle::wait_then_shutdown`] blocks
 //!          on SIGINT/SIGTERM/watchdog and tears down.
@@ -34,8 +34,6 @@ use control_link::ControlLink;
 mod client_server;
 mod control_link;
 pub mod coordination;
-#[cfg(feature = "single-node")]
-mod edge_session;
 mod gateway_link;
 mod lifecycle;
 #[cfg(feature = "single-node")]
@@ -86,14 +84,10 @@ impl DriverHandle {
 enum EdgeServer {
     #[cfg(not(feature = "single-node"))]
     Standalone(client_server::ClientServerHandle),
-    /// Post-inversion (M3): the worker dials INTO the gateway(s); these are the
-    /// live dial-in links serving `WorkerControl`. The distributed data path.
+    /// Post-inversion (M3): the worker dials INTO the gateway(s) — distributed
+    /// (real gateways from `--gateway`) or single-node (the in-proc gateway).
+    /// The live dial-in links serving `WorkerControl`.
     GatewayLinks(Vec<gateway_link::GatewayLink>),
-    /// Transitional single-node in-proc path — the worker's inbound edge-rpc
-    /// listener the in-proc gateway dials (pre-inversion model; flips to
-    /// worker-dials-gateway once the gateway's worker-facing server lands).
-    #[cfg(feature = "single-node")]
-    WorkerListener(edge_session::EdgeSessionServerHandle),
 }
 
 impl EdgeServer {
@@ -113,8 +107,6 @@ impl EdgeServer {
                     format!("gateway://{}", addrs.join(","))
                 }
             }
-            #[cfg(feature = "single-node")]
-            EdgeServer::WorkerListener(h) => h.bound.replacen("tcp://", "edge://", 1),
         }
     }
 
@@ -127,8 +119,6 @@ impl EdgeServer {
                     link.abort();
                 }
             }
-            #[cfg(feature = "single-node")]
-            EdgeServer::WorkerListener(h) => h.task.abort(),
         }
     }
 }

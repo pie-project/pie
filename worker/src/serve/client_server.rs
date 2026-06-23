@@ -5,9 +5,9 @@
 //! the gateway-free local path: a client dials `ws://host:port` and talks
 //! msgpack `ClientMessage`/`ServerMessage` straight to this worker.
 //!
-//! The distributed path is different: there a separate gateway terminates the
-//! client and proxies to the worker's tarpc `WorkerSessionApi`
-//! ([`super::edge_session`]).
+//! The distributed path is different: there the worker dials INTO a separate
+//! gateway and serves `pie_dispatch::WorkerControl` ([`super::gateway_link`]),
+//! which terminates the client and dispatches turns over that link.
 
 use std::sync::Arc;
 
