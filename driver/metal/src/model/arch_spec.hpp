@@ -52,16 +52,42 @@ struct ArchSpec {
     float        yarn_beta_fast   = 32.0f;
     float        yarn_beta_slow   = 1.0f;
 
-    // ── MoE (qwen3-moe, mixtral) ──
+    // ── MoE (qwen3-moe, mixtral, gemma4, qwen3.6) ──
     std::int32_t n_experts         = 0;    // 0 = dense MLP
     std::int32_t n_experts_per_tok = 0;
     bool         moe_norm_topk     = true;
+    float        moe_routed_scale  = 1.0f; // router gain (gemma4/qwen3.6)
+    std::int32_t moe_n_group       = 0;    // grouped routing (qwen3.6); 0 = off
+    std::int32_t moe_topk_group    = 0;
+    std::int32_t n_shared_experts  = 0;    // sigmoid-gated shared expert (qwen3.6)
+    std::int32_t first_k_dense     = 0;    // layers < this stay dense
+
+    // ── gemma4 extras ──
+    bool         gemma4_parallel_moe = false;  // dense MLP + parallel MoE block
+    std::int32_t per_layer_emb_dim   = 0;      // PLE width; 0 = no PLE
+    std::int32_t num_kv_shared_layers = 0;     // cross-layer KV sharing
+
+    // ── qwen3.6 (Qwen3.5 hybrid) extras ──
+    bool  attn_output_gate     = false;  // sigmoid-gated 2x-wide q_proj
+    float partial_rotary_factor = 1.0f;  // <1 = partial RoPE
+    // Linear-attn (Gated DeltaNet) dims; >0 enables linear layers.
+    std::int32_t linear_num_value_heads = 0;
+    std::int32_t linear_num_key_heads   = 0;
+    std::int32_t linear_key_head_dim    = 0;
+    std::int32_t linear_value_head_dim  = 0;
+    std::int32_t linear_conv_kernel_dim = 0;
 
     // Helpers.
     bool is_sliding_layer(std::int32_t il) const {
         return !layer_pattern.empty()
             && static_cast<std::size_t>(il) < layer_pattern.size()
             && layer_pattern[il] == 's';
+    }
+    // 'l' marks a Gated-DeltaNet linear-attention layer (qwen3.6).
+    bool is_linear_attn_layer(std::int32_t il) const {
+        return !layer_pattern.empty()
+            && static_cast<std::size_t>(il) < layer_pattern.size()
+            && layer_pattern[il] == 'l';
     }
 };
 
