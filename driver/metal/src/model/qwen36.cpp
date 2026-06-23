@@ -188,8 +188,9 @@ Tensor Qwen36Graph::forward(const ForwardBatch& batch, KvCacheView& kv) {
     const float eps = cfg_.rms_norm_eps;
     const std::int32_t Lc = cfg_.num_hidden_layers;
 
-    // Qwen does NOT scale embeddings (unlike Gemma).
-    Tensor hidden = ops::embedding(w_.embed, batch.token_ids);
+    // Qwen does NOT scale embeddings (unlike Gemma). Dequant-gathers from the
+    // tied quant lm_head when the dense embed is dropped (embed-drop).
+    Tensor hidden = apply_embedding(w_.embed, batch.token_ids);
     maybe_dump_hidden(0, hidden);  // HF output_hidden_states[0] = embeddings
 
     std::int32_t lin_ordinal = 0;
@@ -209,7 +210,7 @@ Tensor Qwen36Graph::forward(const ForwardBatch& batch, KvCacheView& kv) {
 
     return w_.lm_head
         ? apply_linear(*w_.lm_head, sampled)   // [n_slots, vocab]
-        : ops::linear(w_.embed, sampled);      // tied, dense embed
+        : apply_linear(w_.embed, sampled);     // tied embed (dense or quant)
 }
 
 // ── Weight binding (Qwen3.6 hybrid) ──
@@ -218,16 +219,19 @@ ModelWeights bind_qwen36(const WeightSource& src, const ModelConfig& cfg) {
 
     // Qwen3.5 nests the text decoder under `model.language_model.` in the
     // multimodal checkpoint; some dumps drop the `language_model.` segment.
+    // Key off the final norm (always present, unlike the droppable embed).
     std::string root = "model.language_model.";
-    if (!src.has(root + "embed_tokens.weight")) {
+    if (!src.has(root + "norm.weight")) {
         root = "model.";
     }
 
-    w.embed      = src.get(root + "embed_tokens.weight");
     w.final_norm = src.get(root + "norm.weight");
     // Prefer an explicit lm_head bundle when present (incl. a synthesized
     // quantized lm_head over a tied embed); absent -> dense embed GEMV.
     w.lm_head = try_bind_linear(src, "lm_head", cfg);
+    // Input embed: dense bf16 table, or the tied quantized lm_head (dequant-
+    // gathered) when the dense embed is dropped for true-4-bit memory parity.
+    w.embed = bind_embedding(src, root + "embed_tokens", w.lm_head, cfg);
 
     // conv1d weight is stored [conv_dim, 1, conv_K]; flatten to [conv_dim, K]
     // for beta's gated_delta_net (which expects [conv_dim, conv_K]).

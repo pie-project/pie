@@ -150,8 +150,9 @@ Tensor LlamaLikeGraph::decoder_layer(std::int32_t il,
 }
 
 Tensor LlamaLikeGraph::forward(const ForwardBatch& batch, KvCacheView& kv) {
-    // Embed tokens -> [n_total, hidden].
-    Tensor hidden = ops::embedding(w_.embed, batch.token_ids);
+    // Embed tokens -> [n_total, hidden]. Dequant-gathers from the tied quant
+    // lm_head when the dense embed is dropped (embed-drop); plain gather else.
+    Tensor hidden = apply_embedding(w_.embed, batch.token_ids);
 
     for (std::int32_t il = 0; il < cfg_.num_hidden_layers; ++il) {
         hidden = decoder_layer(il, hidden, batch, kv);
@@ -164,7 +165,7 @@ Tensor LlamaLikeGraph::forward(const ForwardBatch& batch, KvCacheView& kv) {
 
     Tensor logits = w_.lm_head
         ? apply_linear(*w_.lm_head, sampled)      // [n_slots, vocab]
-        : ops::linear(w_.embed, sampled);         // tied, dense embed
+        : apply_linear(w_.embed, sampled);        // tied embed (dense or quant)
 
     if (spec_.final_softcap > 0.0f) {
         logits = ops::softcap(logits, spec_.final_softcap);
@@ -175,12 +176,14 @@ Tensor LlamaLikeGraph::forward(const ForwardBatch& batch, KvCacheView& kv) {
 // ── Weight binding (Llama-like family) ──
 ModelWeights bind_llama_like(const WeightSource& src, const ModelConfig& cfg) {
     ModelWeights w;
-    w.embed      = src.get("model.embed_tokens.weight");
     w.final_norm = src.get("model.norm.weight");
     // Prefer an explicit lm_head bundle when present (incl. a synthesized
     // quantized lm_head over a tied embed); absent -> the graph uses the dense
     // embed GEMV.
     w.lm_head = try_bind_linear(src, "lm_head", cfg);
+    // Input embed: dense bf16 table, or — when the checkpoint drops it for
+    // true-4-bit memory parity — the tied quantized lm_head, dequant-gathered.
+    w.embed = bind_embedding(src, "model.embed_tokens", w.lm_head, cfg);
 
     w.layers.resize(cfg.num_hidden_layers);
     for (std::int32_t il = 0; il < cfg.num_hidden_layers; ++il) {
