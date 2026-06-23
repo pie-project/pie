@@ -64,9 +64,7 @@ LoadedWeights load_weights(const std::string& hf_path) {
             "'): no metal graph builder for this checkpoint yet");
     }
     SafetensorsWeightSource src(hf_path);
-    out.weights = model::is_llama_like(out.config.arch)
-                      ? model::bind_llama_like(src, out.config)
-                      : model::bind_gemma(src, out.config);
+    out.weights = model::bind_weights(src, out.config);
     return out;
 }
 
