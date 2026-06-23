@@ -49,6 +49,50 @@ Tensor sdpa_contiguous(const Tensor& q, const Tensor& k, const Tensor& v,
     return mx::transpose(mx::squeeze(o4, 0), {1, 0, 2});
 }
 
+// Sliding-window attention via the FUSED SDPA kernel (softcap == 0 only; Gemma3
+// local layers). Avoids the un-fused manual_attention launch-storm:
+//   * decode (nq == 1): the window is a contiguous suffix of the keys, so we
+//     slice the last `window` keys and run plain causal SDPA -- no mask kernel.
+//   * prefill (nq > 1): each query has its own window, so we build an additive
+//     band mask (causal AND within window) and pass it to the fused kernel.
+// Numerically identical to manual_attention (verified bit-exact on the decode
+// path; ~2e-8 on chunked prefill from fused-vs-unfused softmax rounding).
+// Operates on contiguous single-sequence 3D operands
+//   q:[nq, H, d], k:[nkv, Hkv, d], v:[nkv, Hkv, d] -> [nq, H, d].
+Tensor windowed_sdpa(const Tensor& q, const Tensor& k, const Tensor& v,
+                     float scale, int sliding_window) {
+    const int nq = q.shape(0);
+    const int nkv = k.shape(0);
+    const int Hkv = k.shape(1);
+    const int d = k.shape(2);
+
+    if (nq == 1) {
+        // Decode: attend the last `window` keys (clipped to available), causal.
+        if (sliding_window < nkv) {
+            Tensor k_w = mx::slice(k, {nkv - sliding_window, 0, 0},
+                                   {nkv, Hkv, d});
+            Tensor v_w = mx::slice(v, {nkv - sliding_window, 0, 0},
+                                   {nkv, Hkv, d});
+            return sdpa_contiguous(q, k_w, v_w, scale, "causal", std::nullopt);
+        }
+        // Window covers all history -> plain causal.
+        return sdpa_contiguous(q, k, v, scale, "causal", std::nullopt);
+    }
+
+    // Prefill: additive band mask [nq, nkv] (broadcasts over heads), cast to q's
+    // dtype as MLX requires the mask to promote to the output type.
+    const int offset = nkv - nq;
+    Tensor q_idx = mx::expand_dims(mx::arange(offset, offset + nq, mx::int32), 1);
+    Tensor k_idx = mx::expand_dims(mx::arange(0, nkv, mx::int32), 0);
+    Tensor allowed = mx::less_equal(k_idx, q_idx);
+    Tensor lo = mx::subtract(q_idx, mx::array(sliding_window));
+    allowed = mx::logical_and(allowed, mx::greater(k_idx, lo));
+    const float neg_inf = -std::numeric_limits<float>::infinity();
+    Tensor mask_add = mx::astype(
+        mx::where(allowed, mx::array(0.0f), mx::array(neg_inf)), q.dtype());
+    return sdpa_contiguous(q, k, v, scale, "", mask_add);
+}
+
 // Manual masked attention for the cases MLX's fused causal SDPA can't express:
 // attention-logit softcapping (Gemma2/3) and sliding-window attention (Gemma
 // local layers). Operates on contiguous single-sequence 3D operands
@@ -104,13 +148,18 @@ Tensor manual_attention(const Tensor& q, const Tensor& k, const Tensor& v,
 Tensor sdpa(const Tensor& q, const Tensor& k, const Tensor& v,
             const AttnParams& params, const std::optional<Tensor>& mask) {
     const float scale = resolve_scale(params);
-    // Softcap / sliding-window aren't expressible via MLX's fused causal SDPA;
-    // fall back to the manual masked path (only meaningful without an explicit
-    // mask — Gemma drives these through the causal path).
-    if (!mask.has_value() &&
-        (params.softcap > 0.0f || params.sliding_window > 0)) {
-        return manual_attention(q, k, v, scale, params.softcap,
-                                params.sliding_window);
+    // Softcap needs the manual masked path (MLX's fused SDPA can't express
+    // logit softcapping). Sliding-window without softcap (Gemma3 local layers)
+    // routes through the fused windowed SDPA. Both only apply without an
+    // explicit mask -- Gemma drives these through the causal path.
+    if (!mask.has_value()) {
+        if (params.softcap > 0.0f) {
+            return manual_attention(q, k, v, scale, params.softcap,
+                                    params.sliding_window);
+        }
+        if (params.sliding_window > 0) {
+            return windowed_sdpa(q, k, v, scale, params.sliding_window);
+        }
     }
     const std::string mode = mask.has_value() ? "" : "causal";
     return sdpa_contiguous(q, k, v, scale, mode, mask);
