@@ -213,6 +213,15 @@ model::ModelConfig parse_doc(const json& root, const std::string& where) {
                              cfg.hf_model_type.rfind("gemma", 0) == 0;
     cfg.tie_word_embeddings = get_or<bool>(j, "tie_word_embeddings", tie_default);
 
+    // ── 4-bit affine quantization (mlx-community style) ──
+    // Top-level `quantization: {group_size, bits}`. When present, per-tensor
+    // routing is by `.scales`-sibling presence (the binder's index-as-quant-map);
+    // these scalars only carry the group_size/bits the quantized_matmul needs.
+    if (auto it = root.find("quantization"); it != root.end() && it->is_object()) {
+        cfg.quant_bits       = get_or<int>(*it, "bits", 4);
+        cfg.quant_group_size = get_or<int>(*it, "group_size", 64);
+    }
+
     // ── Sliding-window attention (present only when actually enabled) ──
     // Qwen2 ships `sliding_window` with `use_sliding_window:false` — the
     // window value is inert unless the flag (default true elsewhere) is set.
