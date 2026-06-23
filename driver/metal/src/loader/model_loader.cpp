@@ -112,6 +112,23 @@ LoadedModel load_model(const std::string& hf_path, const BatchingConfig& batchin
             specs.push_back(s);
         }
         out.kv = std::make_unique<PagedKvCache>(page_size, std::move(specs), kv_dtype);
+    } else if (spec.layer_pattern.find('l') != std::string::npos) {
+        // Hybrid linear-attention (qwen3.6): only the full-attn layers hold a
+        // paged-KV; the linear-attn layers carry their own conv/recurrent state
+        // (LinearStateCache) and never touch paged-KV. Zero-size those layers
+        // (n_pages=0) to save memory. The cache stays indexed by decoder-layer
+        // il, so the graph's append/k_pages(il) on full-attn layers is correct.
+        std::vector<PagedKvLayerSpec> specs;
+        specs.reserve(n_layers);
+        for (int il = 0; il < n_layers; ++il) {
+            const bool linear = spec.is_linear_attn_layer(il);
+            PagedKvLayerSpec s;
+            s.n_pages    = linear ? 0 : total_pages;
+            s.n_kv_heads = out.config.num_key_value_heads;
+            s.head_dim   = out.config.head_dim;
+            specs.push_back(s);
+        }
+        out.kv = std::make_unique<PagedKvCache>(page_size, std::move(specs), kv_dtype);
     } else {
         PagedKvGeometry geo;
         geo.n_layers   = n_layers;
