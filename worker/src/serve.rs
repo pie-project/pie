@@ -18,8 +18,10 @@
 
 use std::path::Path;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
+use pie_schema::control::{Ack, NodeId, WorkerStatus};
 
 use crate::bootstrap_translate::{self, GroupHandshake, ModelHandshake};
 use crate::config;
@@ -101,8 +103,8 @@ pub struct EngineHandle {
     drivers: Vec<DriverHandle>,
     shmem_names: Vec<String>,
     edge_server: EdgeServer,
-    /// Controller heartbeat task — `Some` only in distributed mode.
-    report_task: Option<tokio::task::JoinHandle<()>>,
+    /// Controller heartbeat/report/watch tasks. Empty in single-node.
+    control_tasks: Vec<tokio::task::JoinHandle<()>>,
     /// Live control-plane handle: keeps the dialed control connection
     /// (distributed) alive for the engine's lifetime, and carries this worker's
     /// assigned id + role. Inert in single-node (no controller).
@@ -134,13 +136,13 @@ impl EngineHandle {
     /// quit.
     pub fn shutdown(self) {
         self.edge_server.abort();
-        if let Some(task) = self.report_task {
+        for task in self.control_tasks {
             task.abort();
         }
         // Drop the control-plane handle so the dialed control connection is
         // closed (distributed); single-node has no controller. The controller
         // then ages this worker out of routing on the next missed report.
-        tracing::info!(worker = %self.coordinator.worker_id, "leaving control plane");
+        tracing::info!(worker = ?self.coordinator.worker_id(), "leaving control plane");
         drop(self.coordinator);
         // Signal each driver's serve loop, wake any transport-side
         // waiters/recv loops, then join the threads.
@@ -300,7 +302,7 @@ pub fn build_runtime(user_cfg: &config::Config) -> Result<tokio::runtime::Runtim
 /// off to a TUI for the monitor path).
 pub async fn start_engine(
     user_cfg: config::Config,
-    coordinator: Coordinator,
+    mut coordinator: Coordinator,
 ) -> Result<EngineHandle> {
     let mut handshakes: Vec<ModelHandshake> = Vec::with_capacity(user_cfg.models.len());
     let mut drivers: Vec<DriverHandle> = Vec::new();
@@ -374,6 +376,20 @@ pub async fn start_engine(
         });
     }
 
+    let registration_caps = handshakes
+        .first()
+        .and_then(|model| model.groups.first())
+        .map(|group| group.caps.clone())
+        .context("no driver capabilities available for control-plane registration")?;
+    let registration_model = user_cfg
+        .models
+        .first()
+        .map(|model| model.name.clone())
+        .context("no model configured for control-plane registration")?;
+    coordinator
+        .register_worker(registration_model, registration_caps)
+        .context("registering worker with controller")?;
+
     let boot_cfg = bootstrap_translate::build(&user_cfg, &handshakes)
         .context("translating to bootstrap::Config")?;
 
@@ -417,42 +433,102 @@ pub async fn start_engine(
         .filter_map(|d| d.shmem_name().map(|s| s.to_string()))
         .collect();
 
-    // Heartbeat to the controller — distributed only (single-node has none).
-    let report_task = coordinator.control_client().map(|client| {
-        let worker_id = coordinator.worker_id;
-        tokio::spawn(async move {
-            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(1));
-            loop {
-                let load = pie_schema::LoadState {
-                    active_requests: 0,
-                    kv_pages_free: 0,
-                };
-                match client
-                    .report(tarpc::context::current(), worker_id, load)
-                    .await
-                {
-                    Ok(Ok(())) => {}
-                    Ok(Err(msg)) => {
-                        tracing::warn!(worker = %worker_id, error = %msg, "controller report rejected");
-                    }
-                    Err(e) => {
-                        tracing::warn!(worker = %worker_id, error = %e, "controller report transport failed");
-                    }
-                }
-                ticker.tick().await;
-            }
-        })
-    });
+    let control_tasks = spawn_control_tasks(&coordinator);
 
     Ok(EngineHandle {
         drivers,
         shmem_names,
         url,
         edge_server,
-        report_task,
+        control_tasks,
         coordinator,
         token,
     })
+}
+
+fn spawn_control_tasks(coordinator: &Coordinator) -> Vec<tokio::task::JoinHandle<()>> {
+    let (Some(client), Some(worker_id)) = (coordinator.control_client(), coordinator.worker_id())
+    else {
+        return Vec::new();
+    };
+
+    let heartbeat_client = client.clone();
+    let heartbeat_task = tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(Duration::from_secs(1));
+        loop {
+            ticker.tick().await;
+            match heartbeat_client
+                .heartbeat(tarpc::context::current(), NodeId::Worker(worker_id))
+                .await
+            {
+                Ok(Ack::Ok) => {}
+                Ok(Ack::ReRegister) => {
+                    tracing::warn!(
+                        worker = %worker_id,
+                        "controller lost our registration; re-register needed"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        worker = %worker_id,
+                        error = %e,
+                        "controller heartbeat transport failed"
+                    );
+                }
+            }
+        }
+    });
+
+    let report_client = client.clone();
+    let report_task = tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(Duration::from_secs(1));
+        loop {
+            ticker.tick().await;
+            let status = WorkerStatus {
+                kv_pressure_bucket: 0,
+                inflight: 0,
+            };
+            if let Err(e) = report_client
+                .report_worker(tarpc::context::current(), worker_id, status)
+                .await
+            {
+                tracing::warn!(
+                    worker = %worker_id,
+                    error = %e,
+                    "controller report_worker transport failed"
+                );
+            }
+        }
+    });
+
+    let watch_task = tokio::spawn(async move {
+        let mut since = 0u64;
+        loop {
+            let mut ctx = tarpc::context::current();
+            ctx.deadline = Instant::now() + Duration::from_secs(40);
+            match client.watch_worker(ctx, worker_id, since).await {
+                Ok(neighbors) => {
+                    since = neighbors.epoch;
+                    tracing::debug!(
+                        worker = %worker_id,
+                        peers = neighbors.peers.len(),
+                        epoch = since,
+                        "neighbor view updated"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        worker = %worker_id,
+                        error = %e,
+                        "controller watch_worker transport failed"
+                    );
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                }
+            }
+        }
+    });
+
+    vec![heartbeat_task, report_task, watch_task]
 }
 
 struct StartedEmbeddedGroup {

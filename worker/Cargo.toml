@@ -45,6 +45,8 @@ profile-all = ["pie/profile-all"]
 # bundled into the `pie-driver-bridge` wheel via maturin), not in the
 # runtime crate itself.
 pie = { path = "../runtime" }
+# Shared tarpc control-plane contract.
+pie-control = { path = "../protocol/control" }
 # Direct dep so this crate's build script receives `DEP_PIE_SCHEMA_INCLUDE`
 # (the C header dir) from pie-schema's `links` build-script handoff.
 pie-schema = { path = "../protocol/schema" }

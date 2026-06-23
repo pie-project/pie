@@ -112,7 +112,7 @@ pub fn run(mut args: RunArgs) -> Result<()> {
             .map(|m| m.hf_repo.clone())
             .unwrap_or_else(|| "default".to_string());
         let status = RunStatus::start(args.quiet || args.debug, model_label);
-        // One-shot `pie run` is always single-node: embed an in-proc controller.
+        // One-shot `pie run` is always single-node: no controller.
         let control_addr =
             crate::serve::coordination::addr_from_host_port(&cfg.server.host, cfg.server.port);
         let coordinator =
