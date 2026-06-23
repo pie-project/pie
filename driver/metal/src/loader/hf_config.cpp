@@ -25,15 +25,32 @@ T get_or(const json& j, const char* key, T fallback) {
     }
 }
 
-// Qwen3.5 (qwen3_next) nests RoPE hyperparameters (rope_theta,
-// partial_rotary_factor, ...) under a `rope_parameters` object; most other
-// models keep them at the top level. Prefer the nested object, then fall back
-// to the top-level key, then to `fallback`.
+// Newer HF checkpoints nest RoPE hyperparameters (rope_theta,
+// partial_rotary_factor, ...) under a `rope_parameters` object instead of the
+// top level. Two shapes occur:
+//   * flat       (Qwen3.5 / qwen3_next): rope_parameters.rope_theta
+//   * per-type   (gemma4):               rope_parameters.full_attention.rope_theta
+//                                        rope_parameters.sliding_attention.rope_theta
+// `rope_params_primary` returns the sub-object holding the FULL-attention rope
+// params (the canonical rope_theta / partial_rotary_factor): the per-type
+// `full_attention` object when present, else the flat `rope_parameters` object.
+const json* rope_params_primary(const json& j) {
+    auto it = j.find("rope_parameters");
+    if (it == j.end() || !it->is_object()) return nullptr;
+    if (auto fit = it->find("full_attention");
+        fit != it->end() && fit->is_object()) {
+        return &(*fit);  // gemma4 per-attention-type nesting
+    }
+    return &(*it);       // flat nesting (qwen3.5)
+}
+
+// Read a RoPE param: prefer the (possibly per-type) `rope_parameters` object,
+// then the top-level key, then `fallback`.
 template <typename T>
 T get_rope_param(const json& j, const char* key, T fallback) {
-    if (auto it = j.find("rope_parameters"); it != j.end() && it->is_object()) {
-        auto nit = it->find(key);
-        if (nit != it->end() && !nit->is_null()) {
+    if (const json* rp = rope_params_primary(j)) {
+        auto nit = rp->find(key);
+        if (nit != rp->end() && !nit->is_null()) {
             try {
                 return nit->get<T>();
             } catch (...) {
@@ -41,6 +58,22 @@ T get_rope_param(const json& j, const char* key, T fallback) {
         }
     }
     return get_or<T>(j, key, fallback);
+}
+
+// gemma4's sliding-attention layers use a separate rope base, nested at
+// rope_parameters.sliding_attention.rope_theta (older gemma keeps it top-level
+// as `rope_local_base_freq`). 0 = no distinct local base (graph uses rope_theta).
+float get_rope_local_base(const json& j) {
+    if (auto it = j.find("rope_parameters"); it != j.end() && it->is_object()) {
+        if (auto sit = it->find("sliding_attention");
+            sit != it->end() && sit->is_object()) {
+            auto tit = sit->find("rope_theta");
+            if (tit != sit->end() && tit->is_number()) {
+                return tit->get<float>();
+            }
+        }
+    }
+    return get_or<float>(j, "rope_local_base_freq", 0.0f);
 }
 
 template <typename T>
@@ -145,7 +178,7 @@ model::ModelConfig parse_doc(const json& root, const std::string& where) {
                                      get_or<float>(j, "layer_norm_epsilon",
                                                    get_or<float>(j, "norm_eps", 1e-5f)));
     cfg.rope_theta          = get_rope_param<float>(j, "rope_theta", 10000.0f);
-    cfg.rope_local_base_freq = get_or<float>(j, "rope_local_base_freq", 0.0f);
+    cfg.rope_local_base_freq = get_rope_local_base(j);
     parse_rope_scaling(j, cfg);
 
     // ── Tied embeddings (Gemma family + Qwen3 default true; Llama false) ──
