@@ -31,6 +31,10 @@
 
 #include "loader/model_loader.hpp"
 #include "model/model_graph.hpp"
+#include "executor/executor.hpp"
+
+#include <pie_schema/response_builder.hpp>
+#include <pie_schema/view.hpp>
 
 namespace mx = mlx::core;
 using namespace pie_metal_driver;
@@ -274,6 +278,70 @@ int main(int argc, char** argv) {
         return n_steps / std::chrono::duration<double>(t1 - t0).count();
     };
     if (use_pipeline) decode = [&](int n) { return run_decode_pipelined(n); };
+
+    // ── DECODE_N validation (PIE_DECODE_N=N): exercise the PRODUCTIONIZED
+    //    executor multi-token pipelined loop (Executor::run_decode_n) directly
+    //    — the real serving path, not the bench lambda. Verifies (a) token
+    //    parity vs the per-token run_forward path (diff against BENCH_DUMP) and
+    //    (b) that it hits the harness pipeline tok/s through the real executor.
+    if (const char* dn = std::getenv("PIE_DECODE_N")) {
+        int N = std::atoi(dn); if (N < 1) N = 64;
+        Executor exec(*model.graph, *model.kv);
+        if (hybrid) exec.set_linear_state_cache(model.lin_cache.get());
+
+        // Single-request decode view: one seed token (5, matching the per-token
+        // and pipelined paths) at pos=prefill, identity page table covering
+        // [0 .. prefill+N), one greedy sampler.
+        const int last_pos = prefill + N - 1;
+        const int n_pages  = last_pos / ps + 1;
+        std::vector<std::uint32_t> v_tok        = {5};
+        std::vector<std::uint32_t> v_pos        = {static_cast<std::uint32_t>(prefill)};
+        std::vector<std::uint32_t> v_pageidx(n_pages);
+        for (int i = 0; i < n_pages; ++i) v_pageidx[i] = static_cast<std::uint32_t>(i);
+        std::vector<std::uint32_t> v_pageindptr = {0, static_cast<std::uint32_t>(n_pages)};
+        std::vector<std::uint32_t> v_lastlen    = {static_cast<std::uint32_t>(prefill % ps + 1)};
+        std::vector<std::uint32_t> v_qo         = {0, 1};
+        std::vector<std::uint32_t> v_sampidx    = {0};
+        std::vector<std::uint32_t> v_sampindptr = {0, 1};
+        std::vector<std::uint32_t> v_stype      = {1};      // multinomial kind…
+        std::vector<float>         v_stemp      = {0.0f};   // …temp 0 → greedy
+        std::vector<std::uint32_t> v_stopk      = {0};
+        std::vector<float>         v_stopp      = {1.0f};
+        std::vector<float>         v_sminp      = {0.0f};
+        std::vector<std::uint32_t> v_sseed      = {0};
+        std::vector<std::uint32_t> v_rsslot     = {0};
+
+        pie_driver::PieForwardRequestView req{};
+        req.token_ids            = {v_tok.data(), v_tok.size()};
+        req.position_ids         = {v_pos.data(), v_pos.size()};
+        req.kv_page_indices      = {v_pageidx.data(), v_pageidx.size()};
+        req.kv_page_indptr       = {v_pageindptr.data(), v_pageindptr.size()};
+        req.kv_last_page_lens    = {v_lastlen.data(), v_lastlen.size()};
+        req.qo_indptr            = {v_qo.data(), v_qo.size()};
+        req.sampling_indices     = {v_sampidx.data(), v_sampidx.size()};
+        req.sampling_indptr      = {v_sampindptr.data(), v_sampindptr.size()};
+        req.sampler_types        = {v_stype.data(), v_stype.size()};
+        req.sampler_temperatures = {v_stemp.data(), v_stemp.size()};
+        req.sampler_top_k        = {v_stopk.data(), v_stopk.size()};
+        req.sampler_top_p        = {v_stopp.data(), v_stopp.size()};
+        req.sampler_min_p        = {v_sminp.data(), v_sminp.size()};
+        req.sampler_seeds        = {v_sseed.data(), v_sseed.size()};
+        req.rs_slot_ids          = {v_rsslot.data(), v_rsslot.size()};
+
+        pie_driver::ResponseBuilder builder;
+        pie_driver::PieForwardResponseView out{};
+        auto t0 = std::chrono::high_resolution_clock::now();
+        exec.run_decode_n(req, N, builder, out);
+        auto t1 = std::chrono::high_resolution_clock::now();
+        const double tps = N / std::chrono::duration<double>(t1 - t0).count();
+
+        std::cerr << "[decode_n] tokens:";
+        for (std::size_t i = 0; i < out.tokens.size(); ++i)
+            std::cerr << " " << out.tokens.data()[i];
+        std::cerr << "\n[decode_n] count=" << out.tokens.size()
+                  << " tok/s=" << tps << " (N=" << N << ")\n";
+        return 0;
+    }
 
     // Accuracy probe: BENCH_DUMP=N prints the first N greedy decode tokens
     // (deterministic argmax) so two builds can be diffed for parity.
