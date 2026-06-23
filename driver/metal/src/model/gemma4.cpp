@@ -129,8 +129,8 @@ Tensor Gemma4Graph::decoder_layer(std::int32_t il,
     Tensor Q = to_heads(apply_linear(L.q_proj, cur), n_total, n_q_heads, head_dim);
     Q = ops::rms_norm(Q, *L.q_norm, eps, /*plus_one=*/false);  // per-head Q-norm
 
-    Tensor k_pages = w_.embed;  // placeholder; reassigned below
-    Tensor v_pages = w_.embed;
+    Tensor k_pages = ops::empty_tensor();  // placeholder; reassigned below
+    Tensor v_pages = ops::empty_tensor();
     if (!is_shared) {
         Tensor K = to_heads(apply_linear(L.k_proj, cur), n_total, n_kv_heads, head_dim);
         Tensor V = to_heads(apply_linear(L.v_proj, cur), n_total, n_kv_heads, head_dim);
@@ -228,7 +228,7 @@ Tensor Gemma4Graph::forward(const ForwardBatch& batch, KvCacheView& kv) {
     const std::int32_t ple_dim = spec_.per_layer_emb_dim;
     const float eps = cfg_.rms_norm_eps;
 
-    Tensor hidden = ops::embedding(w_.embed, batch.token_ids);
+    Tensor hidden = apply_embedding(w_.embed, batch.token_ids);
     hidden = ops::scale(hidden, std::sqrt(static_cast<float>(H)));
 
     // ── Per-Layer-Embedding (PLE) inputs, computed once up-front ──
@@ -270,7 +270,7 @@ Tensor Gemma4Graph::forward(const ForwardBatch& batch, KvCacheView& kv) {
     // (v1 tied) -> the dense embed GEMV.
     Tensor logits = w_.lm_head
         ? apply_linear(*w_.lm_head, sampled)      // [n_slots, vocab]
-        : ops::linear(w_.embed, sampled);
+        : apply_linear(w_.embed, sampled);        // tied embed (dense or quant)
 
     if (spec_.final_softcap > 0.0f) {
         logits = ops::softcap(logits, spec_.final_softcap);
@@ -284,19 +284,22 @@ ModelWeights bind_gemma4(const WeightSource& src, const ModelConfig& cfg) {
 
     // Gemma-4 nests the text decoder under `model.language_model.` in the
     // multimodal checkpoint; some dumps drop the `language_model.` segment.
-    // Detect the live prefix from the embedding table.
+    // Detect the live prefix from the final norm (always present — unlike the
+    // embed table, which the embed-drop optimization may omit entirely).
     std::string root = "model.language_model.";
-    if (!src.has(root + "embed_tokens.weight")) {
+    if (!src.has(root + "norm.weight")) {
         root = "model.";
     }
 
-    w.embed      = src.get(root + "embed_tokens.weight");
     w.final_norm = src.get(root + "norm.weight");
     // lm_head: prefer an explicit bundle when present — delta synthesizes a
     // (quantized) lm_head from the tied embed for the 262k-vocab BW win, so
     // check `lm_head.*` even when tie_word_embeddings=true. Absent -> the graph
     // falls back to the dense embed (tied, v1 checkpoints).
     w.lm_head = try_bind_linear(src, "lm_head", cfg);
+    // Input embed: dense bf16 table, or — when dropped for true-4-bit memory
+    // parity — the tied quantized lm_head, dequant-gathered per token.
+    w.embed = bind_embedding(src, root + "embed_tokens", w.lm_head, cfg);
 
     // PLE model-level triple (absent on the 26B-A4B variant where ple_dim==0).
     w.embed_per_layer = src.try_get(root + "embed_tokens_per_layer.weight");
