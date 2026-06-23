@@ -56,7 +56,15 @@ def main():
                     help="synthesize a quantized lm_head from the (tied) embed")
     ap.add_argument("--lm-head-bits", type=int, default=0,
                     help="bits for the synthesized lm_head (0 = same as --bits)")
+    ap.add_argument("--drop-embed", action="store_true",
+                    help="omit the dense token embed_tokens.weight (tied-reuse): "
+                    "the graph dequant-gathers input embeddings from the tied "
+                    "quant lm_head bundle. Requires --lm-head. Zero double-store, "
+                    "true-4-bit parity with llama's tied q4_K. Keeps gemma4 PLE "
+                    "(embed_tokens_per_layer) intact.")
     args = ap.parse_args()
+    if args.drop_embed and not args.lm_head:
+        sys.exit("--drop-embed requires --lm-head (the tied bundle to gather from)")
     gs, bits = args.group_size, args.bits
 
     os.makedirs(args.dst, exist_ok=True)
@@ -100,6 +108,15 @@ def main():
             nq += 1
             print(f"  synthesized {lmh_bits}-bit lm_head from {embed_name} "
                   f"{tuple(emb.shape)}")
+            if args.drop_embed:
+                out.pop(embed_name, None)
+                nd -= 1
+                print(f"  dropped dense {embed_name} (tied-reuse: graph "
+                      f"dequant-gathers from lm_head bundle)")
+        elif args.drop_embed:
+            sys.exit("--drop-embed: no tied lm_head was synthesized "
+                     f"(has_lm_head={has_lm_head}, embed_name={embed_name}); "
+                     "refusing to drop the embed with no gather source")
 
     mx.eval(list(out.values()))
     out_path = os.path.join(args.dst, "model.safetensors")
