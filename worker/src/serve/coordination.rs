@@ -13,13 +13,9 @@
 //! the actual coordinator (stub vs dial) from a `TopologyMode` is the caller's
 //! job in the engine boot path.
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Result, bail};
 use clap::{Args, ValueEnum};
-use pie_control::ControlClient;
-use pie_schema::DriverCapabilities;
-use pie_schema::control::{Role, WorkerId, WorkerInfo};
-use tarpc::serde_transport::{tcp, unix};
-use tarpc::tokio_serde::formats::Bincode;
+use pie_schema::control::Role;
 
 /// clap-parsable mirror of [`pie_schema::control::Role`] for `--role`.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
@@ -107,140 +103,50 @@ pub fn addr_from_host_port(host: &str, port: u16) -> String {
     }
 }
 
-/// A live handle to the cluster controller plus this worker's identity.
+/// Resolved control-plane topology plus the worker's advertised edge address.
 ///
-/// Held for the engine's lifetime: it keeps the dialed control connection
-/// (distributed) alive, and carries the controller-assigned [`WorkerId`] + role
-/// that later boot steps gate on. Single-node has no controller and never
-/// registers.
+/// Carried from flag parsing ([`connect`]) into the engine boot path
+/// ([`super::start_engine`]), which builds the actual control connection on the
+/// engine's async runtime — dialing the controller for distributed mode, or
+/// embedding it in-proc for single-node (`single-node` feature). Keeping the
+/// connection out of here means no second runtime and no pre-runtime dialing.
+#[derive(Debug, Clone)]
 pub struct Coordinator {
-    /// Drop order: the client (and its dispatch task) before the runtime driving
-    /// it. `None` in single-node, which has no controller.
-    client: Option<ControlClient>,
-    /// Runtime that owns/drives the tarpc client dispatch in distributed mode.
-    _rt: Option<tokio::runtime::Runtime>,
-    /// This worker's role. `None` in single-node, where the node serves all
-    /// stages.
-    pub role: Option<Role>,
-    /// Address advertised to peers through the control-plane registry.
-    control_addr: String,
-    /// Controller-minted worker id. `None` until post-driver-boot registration;
-    /// single-node leaves it unset.
-    worker_id: Option<WorkerId>,
+    /// The resolved topology (single-node vs distributed + role/controller).
+    pub mode: TopologyMode,
+    /// Address advertised to peers / the gateway as this worker's edge-rpc
+    /// endpoint in distributed mode. Unused by the single-node embed, which
+    /// binds an ephemeral loopback port and registers that instead.
+    pub control_addr: String,
 }
 
 impl Coordinator {
-    /// Register with the controller after the driver ready handshake provides
-    /// real capabilities. Single-node has no controller, so this is a no-op.
-    pub fn register_worker(&mut self, model: String, capability: DriverCapabilities) -> Result<()> {
-        let Some(client) = self.client.clone() else {
-            return Ok(());
-        };
-        let role = self.role.context("distributed coordinator missing role")?;
-        let info = WorkerInfo {
-            role,
-            model,
-            addr: self.control_addr.clone(),
-            capability,
-        };
-        let rpc = async move {
-            client
-                .register_worker(tarpc::context::current(), info)
-                .await
-        };
-        let worker_id = if tokio::runtime::Handle::try_current().is_ok() {
-            let rt = self
-                ._rt
-                .as_ref()
-                .context("distributed coordinator missing control runtime")?;
-            std::thread::scope(|scope| {
-                scope
-                    .spawn(move || rt.block_on(rpc))
-                    .join()
-                    .map_err(|_| anyhow!("controller register_worker task panicked"))
-            })?
-        } else {
-            self._rt
-                .as_ref()
-                .context("distributed coordinator missing control runtime")?
-                .block_on(rpc)
+    /// This worker's role, or `None` in single-node (serves all stages).
+    pub fn role(&self) -> Option<Role> {
+        match &self.mode {
+            TopologyMode::SingleNode => None,
+            TopologyMode::Distributed { role, .. } => Some(*role),
         }
-        .map_err(|e| anyhow!("controller register_worker transport: {e}"))?;
-        self.worker_id = Some(worker_id);
-        Ok(())
     }
 
-    /// A clone of the control-plane client for async control loops, or `None` in
-    /// single-node (no controller to report to).
-    pub fn control_client(&self) -> Option<ControlClient> {
-        self.client.clone()
-    }
-
-    /// Controller-minted worker id. `None` before registration and in
-    /// single-node.
-    pub fn worker_id(&self) -> Option<WorkerId> {
-        self.worker_id
+    /// The controller endpoint to dial in distributed mode; `None` in
+    /// single-node (embedded in-proc).
+    pub fn controller_addr(&self) -> Option<&str> {
+        match &self.mode {
+            TopologyMode::SingleNode => None,
+            TopologyMode::Distributed { controller, .. } => Some(controller),
+        }
     }
 }
 
-fn dial_controller(rt: &tokio::runtime::Runtime, addr: String) -> Result<ControlClient> {
-    rt.block_on(async move {
-        // Control messages are tiny → tarpc's default frame cap is fine.
-        let cfg = tarpc::client::Config::default();
-        let client = if let Some(path) = addr
-            .strip_prefix("unix://")
-            .or_else(|| addr.strip_prefix("unix:"))
-        {
-            let conn = unix::connect(path, Bincode::default)
-                .await
-                .context("dial controller")?;
-            ControlClient::new(cfg, conn).spawn()
-        } else {
-            let tcp_addr = addr.strip_prefix("tcp://").unwrap_or(&addr);
-            let conn = tcp::connect(tcp_addr, Bincode::default)
-                .await
-                .context("dial controller")?;
-            ControlClient::new(cfg, conn).spawn()
-        };
-        Ok::<_, anyhow::Error>(client)
-    })
-}
-
-/// Build the coordinator for `mode`; distributed mode only dials the controller.
-/// Registration waits until driver capabilities are known.
-///
-/// - **single-node:** no controller and no worker id. The worker terminates
-///   clients directly (see [`super::client_server`]); `control_addr` is kept only
-///   for structural parity.
-/// - **distributed:** dials the standalone controller process and records the
-///   requested role; `control_addr` is where peers reach this worker's edge-rpc
-///   endpoint once it registers post driver-boot.
+/// Resolve `mode` into a [`Coordinator`]. The control connection itself is built
+/// later, on the engine runtime, by [`super::start_engine`] (dial or embed) —
+/// this only carries the resolved topology + advertised address.
 pub fn connect(mode: &TopologyMode, control_addr: String) -> Result<Coordinator> {
-    match mode {
-        TopologyMode::SingleNode => Ok(Coordinator {
-            client: None,
-            _rt: None,
-            role: None,
-            control_addr,
-            worker_id: None,
-        }),
-        TopologyMode::Distributed { role, controller } => {
-            let rt = tokio::runtime::Builder::new_multi_thread()
-                .worker_threads(1)
-                .enable_all()
-                .build()
-                .context("build controller-dial runtime")?;
-            let client = dial_controller(&rt, controller.clone())
-                .map_err(|e| anyhow!("dialing controller at {controller}: {e}"))?;
-            Ok(Coordinator {
-                client: Some(client),
-                _rt: Some(rt),
-                role: Some(*role),
-                control_addr,
-                worker_id: None,
-            })
-        }
-    }
+    Ok(Coordinator {
+        mode: mode.clone(),
+        control_addr,
+    })
 }
 
 #[cfg(test)]
@@ -292,11 +198,10 @@ mod tests {
     }
 
     #[test]
-    fn connect_single_node_has_no_id() {
+    fn connect_single_node_has_no_role() {
         let coord = connect(&TopologyMode::SingleNode, "127.0.0.1:9000".to_string()).unwrap();
-        // single-node serves all roles → no specific role
-        assert_eq!(coord.role, None);
-        // single-node has no controller and does not register.
-        assert_eq!(coord.worker_id(), None);
+        // single-node serves all roles → no specific role, no controller to dial.
+        assert_eq!(coord.role(), None);
+        assert_eq!(coord.controller_addr(), None);
     }
 }

@@ -31,6 +31,13 @@ driver-portable = ["dep:pie-weight-loader"]
 driver-cuda = ["dep:pie-weight-loader"]
 driver-dummy = []
 
+# Single-node in-proc cluster. Embeds the controller actor and runs the gateway
+# inside the worker process (no sockets between the three planes). This is the
+# composition root — the one place that legitimately deps both `pie-controller`
+# and `pie-gateway`. Off by default, so the distributed build never links either
+# crate and the worker stays decoupled from the controller implementation.
+single-node = ["dep:pie-controller", "dep:pie-gateway"]
+
 # Per-domain probe passthroughs. Each forwards to the runtime crate's
 # corresponding flag. See `pie/src/probe/` for the catalog of domains.
 profile-fire = ["pie/profile-fire"]
@@ -47,6 +54,11 @@ profile-all = ["pie/profile-all"]
 pie = { path = "../runtime" }
 # Shared tarpc control-plane contract.
 pie-control = { path = "../protocol/control" }
+# Single-node embed only (`single-node` feature). The worker bin is the
+# composition root, so it may legitimately dep both the controller actor
+# (`embed`) and the gateway (`run_with`) to assemble the in-proc cluster.
+pie-controller = { path = "../controller", optional = true }
+pie-gateway = { path = "../gateway", optional = true }
 # Direct dep so this crate's build script receives `DEP_PIE_SCHEMA_INCLUDE`
 # (the C header dir) from pie-schema's `links` build-script handoff.
 pie-schema = { path = "../protocol/schema" }

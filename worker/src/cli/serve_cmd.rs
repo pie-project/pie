@@ -77,17 +77,16 @@ pub fn run(args: ServeArgs) -> Result<()> {
         cfg.server.python_snapshot = false;
     }
 
-    // Connect to the control plane: no controller in single-node, or dial the
-    // standalone controller process in distributed mode. Distributed registration
-    // happens after driver capabilities are known.
+    // Resolve the control-plane topology. The control connection itself (dial
+    // for distributed, embed for single-node) is built later on the engine
+    // runtime; registration happens after driver capabilities are known.
     let topology = coordination::resolve(&args.coordination)?;
     let control_addr = coordination::addr_from_host_port(&cfg.server.host, cfg.server.port);
     let coordinator = coordination::connect(&topology, control_addr)?;
     tracing::info!(
-        worker = ?coordinator.worker_id(),
-        role = ?coordinator.role,
+        role = ?coordinator.role(),
         ?topology,
-        "connected to control plane",
+        "control-plane topology resolved",
     );
 
     if args.monitor {

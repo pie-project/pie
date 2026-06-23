@@ -18,21 +18,26 @@
 
 use std::path::Path;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
-use pie_schema::control::{Ack, NodeId, WorkerStatus};
+use pie_control::ControlClient;
+use pie_schema::control::{WorkerId, WorkerInfo};
 
 use crate::bootstrap_translate::{self, GroupHandshake, ModelHandshake};
 use crate::config;
 use crate::driver_ffi::Flavor;
 use crate::embedded_driver::{DriverCapabilities, DriverOptions, EmbeddedDriver};
 use crate::hf;
+use control::WorkerControl;
 
+#[cfg(not(feature = "single-node"))]
 mod client_server;
+mod control;
 pub mod coordination;
 mod edge_session;
 mod lifecycle;
+#[cfg(feature = "single-node")]
+mod single_node;
 mod topology;
 
 pub use coordination::{CoordinationArgs, Coordinator, TopologyMode};
@@ -77,6 +82,7 @@ impl DriverHandle {
 /// in single-node (gateway-free local inference), or the tarpc edge-rpc a gateway
 /// proxies in distributed mode.
 enum EdgeServer {
+    #[cfg(not(feature = "single-node"))]
     Standalone(client_server::ClientServerHandle),
     Distributed(edge_session::EdgeSessionServerHandle),
 }
@@ -86,6 +92,7 @@ impl EdgeServer {
     /// the gateway-fronted tarpc endpoint.
     fn url(&self) -> String {
         match self {
+            #[cfg(not(feature = "single-node"))]
             EdgeServer::Standalone(h) => h.bound.clone(),
             EdgeServer::Distributed(h) => h.bound.replacen("tcp://", "edge://", 1),
         }
@@ -93,6 +100,7 @@ impl EdgeServer {
 
     fn abort(&self) {
         match self {
+            #[cfg(not(feature = "single-node"))]
             EdgeServer::Standalone(h) => h.task.abort(),
             EdgeServer::Distributed(h) => h.task.abort(),
         }
@@ -103,17 +111,64 @@ pub struct EngineHandle {
     drivers: Vec<DriverHandle>,
     shmem_names: Vec<String>,
     edge_server: EdgeServer,
-    /// Controller heartbeat/report/watch tasks. Empty in single-node.
+    /// Controller heartbeat/report/watch tasks. Empty when there is no control
+    /// plane (single-node without the `single-node` feature).
     control_tasks: Vec<tokio::task::JoinHandle<()>>,
-    /// Live control-plane handle: keeps the dialed control connection
-    /// (distributed) alive for the engine's lifetime, and carries this worker's
-    /// assigned id + role. Inert in single-node (no controller).
-    coordinator: Coordinator,
+    /// Live control-plane state kept alive for the engine's lifetime: the dialed
+    /// client (distributed) or the embedded controller handle + in-proc gateway
+    /// task (single-node feature). `None` in gateway-free single-node.
+    control_plane: ControlPlane,
     /// Bootstrapped engine internal auth token.
     pub token: String,
     /// Client endpoint this worker advertises: `ws://host:port` in single-node
-    /// (direct client server), `edge://host:port` in distributed (gateway-fronted).
+    /// (direct client server, or the in-proc gateway), `edge://host:port` in
+    /// distributed (gateway-fronted).
     pub url: String,
+}
+
+/// Live control-plane resources held for the engine's lifetime, by topology.
+enum ControlPlane {
+    /// No control plane (single-node, default build): the worker terminates
+    /// clients directly and never registers.
+    #[cfg(not(feature = "single-node"))]
+    None,
+    /// Distributed: the dialed control client (its dispatch task) stays alive
+    /// until shutdown, when dropping it closes the connection so the controller
+    /// ages this worker out of routing.
+    Distributed {
+        _client: ControlClient,
+        worker_id: WorkerId,
+    },
+    /// Single-node embed: the controller actor `Handle` and the in-proc gateway
+    /// task both live in this process and are torn down on shutdown.
+    #[cfg(feature = "single-node")]
+    Embedded {
+        _handle: pie_controller::Handle,
+        worker_id: WorkerId,
+        gateway_task: tokio::task::JoinHandle<()>,
+    },
+}
+
+impl ControlPlane {
+    /// The controller-minted worker id, if this worker registered.
+    fn worker_id(&self) -> Option<WorkerId> {
+        match self {
+            #[cfg(not(feature = "single-node"))]
+            ControlPlane::None => None,
+            ControlPlane::Distributed { worker_id, .. } => Some(*worker_id),
+            #[cfg(feature = "single-node")]
+            ControlPlane::Embedded { worker_id, .. } => Some(*worker_id),
+        }
+    }
+
+    /// Stop any owned background tasks (the in-proc gateway). Dropping `self`
+    /// afterwards releases the client / controller handle.
+    fn abort(&self) {
+        #[cfg(feature = "single-node")]
+        if let ControlPlane::Embedded { gateway_task, .. } = self {
+            gateway_task.abort();
+        }
+    }
 }
 
 impl EngineHandle {
@@ -139,11 +194,14 @@ impl EngineHandle {
         for task in self.control_tasks {
             task.abort();
         }
-        // Drop the control-plane handle so the dialed control connection is
-        // closed (distributed); single-node has no controller. The controller
-        // then ages this worker out of routing on the next missed report.
-        tracing::info!(worker = ?self.coordinator.worker_id(), "leaving control plane");
-        drop(self.coordinator);
+        // Stop the in-proc gateway (single-node) and drop the control-plane
+        // resources so the dialed control connection is closed (distributed) or
+        // the embedded controller handle is released (single-node). The
+        // controller then ages this worker out of routing on the next missed
+        // report.
+        tracing::info!(worker = ?self.control_plane.worker_id(), "leaving control plane");
+        self.control_plane.abort();
+        drop(self.control_plane);
         // Signal each driver's serve loop, wake any transport-side
         // waiters/recv loops, then join the threads.
         for d in &self.drivers {
@@ -302,7 +360,7 @@ pub fn build_runtime(user_cfg: &config::Config) -> Result<tokio::runtime::Runtim
 /// off to a TUI for the monitor path).
 pub async fn start_engine(
     user_cfg: config::Config,
-    mut coordinator: Coordinator,
+    coordinator: Coordinator,
 ) -> Result<EngineHandle> {
     let mut handshakes: Vec<ModelHandshake> = Vec::with_capacity(user_cfg.models.len());
     let mut drivers: Vec<DriverHandle> = Vec::new();
@@ -386,9 +444,6 @@ pub async fn start_engine(
         .first()
         .map(|model| model.name.clone())
         .context("no model configured for control-plane registration")?;
-    coordinator
-        .register_worker(registration_model, registration_caps)
-        .context("registering worker with controller")?;
 
     let boot_cfg = bootstrap_translate::build(&user_cfg, &handshakes)
         .context("translating to bootstrap::Config")?;
@@ -398,25 +453,17 @@ pub async fn start_engine(
         .map_err(|e| anyhow!("pie::bootstrap::bootstrap: {e}"))?;
     let token = boot.token;
 
-    // Single-node terminates clients directly over WebSocket (no gateway, no
-    // controller); distributed serves the tarpc edge-rpc for a gateway to proxy.
-    let edge_server = if coordinator.role.is_none() {
-        let listen = format!("{}:{}", user_cfg.server.host, user_cfg.server.port);
-        EdgeServer::Standalone(
-            client_server::spawn(&listen)
-                .await
-                .context("starting standalone client server")?,
-        )
-    } else {
-        let endpoint =
-            coordination::addr_from_host_port(&user_cfg.server.host, user_cfg.server.port);
-        EdgeServer::Distributed(
-            edge_session::spawn(&endpoint)
-                .await
-                .context("starting worker edge-rpc server")?,
-        )
-    };
-    let url = edge_server.url();
+    // Build the client-facing edge + control plane for this topology, now that
+    // the runtime is up and driver capabilities are known: dial + register
+    // (distributed), embed the controller + run the in-proc gateway (single-node
+    // feature), or terminate clients directly (single-node default build).
+    let (edge_server, control_tasks, control_plane, url) = assemble_control_and_edge(
+        coordinator,
+        &user_cfg,
+        registration_model,
+        registration_caps,
+    )
+    .await?;
 
     if user_cfg.server.verbose {
         eprintln!(
@@ -433,115 +480,96 @@ pub async fn start_engine(
         .filter_map(|d| d.shmem_name().map(|s| s.to_string()))
         .collect();
 
-    let control_tasks = spawn_control_tasks(&coordinator);
-
     Ok(EngineHandle {
         drivers,
         shmem_names,
         url,
         edge_server,
         control_tasks,
-        coordinator,
+        control_plane,
         token,
     })
 }
 
-/// Worker→controller heartbeat cadence. Matches the gateway's interval and sits
-/// well under the controller's liveness timeout (8s) → ~4× margin, so a few
-/// dropped beats never trip a false eviction.
-const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(2);
-/// Coarse-load report cadence. The controller coalesces these per epoch (only a
-/// `kv_pressure_bucket` cross advances the gateway epoch), so the exact period
-/// is a liveness floor, not a wire-churn source.
-const REPORT_INTERVAL: Duration = Duration::from_secs(2);
-/// `watch_worker` long-poll client deadline. Must exceed the controller's
-/// `T_HANG` (20s) so the server's same-epoch keepalive return always lands
-/// before we time out; on error we back off and re-poll.
-const WATCH_DEADLINE: Duration = Duration::from_secs(300);
-
-fn spawn_control_tasks(coordinator: &Coordinator) -> Vec<tokio::task::JoinHandle<()>> {
-    let (Some(client), Some(worker_id)) = (coordinator.control_client(), coordinator.worker_id())
-    else {
-        return Vec::new();
-    };
-
-    let heartbeat_client = client.clone();
-    let heartbeat_task = tokio::spawn(async move {
-        let mut ticker = tokio::time::interval(HEARTBEAT_INTERVAL);
-        loop {
-            ticker.tick().await;
-            match heartbeat_client
-                .heartbeat(tarpc::context::current(), NodeId::Worker(worker_id))
+/// Build the client-facing edge server + control plane for the resolved
+/// topology, after the runtime is bootstrapped and driver capabilities are
+/// known. Returns the edge server, the worker's control-loop tasks, the live
+/// control-plane resources to hold for the engine's lifetime, and the URL to
+/// advertise.
+///
+/// - **distributed:** bind the worker's edge-rpc, dial the controller, register
+///   (now that it can serve), and spawn the heartbeat/report/watch loops. A
+///   remote gateway proxies client sessions to the edge-rpc.
+/// - **single-node, `single-node` feature:** delegate to [`single_node::assemble`]
+///   — embed the controller in-proc, run the gateway in this process, and bind
+///   the worker's edge-rpc on a loopback port the in-proc gateway dials.
+/// - **single-node, default build:** terminate client WebSockets directly; no
+///   control plane.
+async fn assemble_control_and_edge(
+    coordinator: Coordinator,
+    user_cfg: &config::Config,
+    model: String,
+    caps: DriverCapabilities,
+) -> Result<(
+    EdgeServer,
+    Vec<tokio::task::JoinHandle<()>>,
+    ControlPlane,
+    String,
+)> {
+    match coordinator.mode {
+        TopologyMode::Distributed { role, controller } => {
+            let endpoint = coordinator.control_addr.clone();
+            let edge = EdgeServer::Distributed(
+                edge_session::spawn(&endpoint)
+                    .await
+                    .context("starting worker edge-rpc server")?,
+            );
+            let client = control::dial_controller(&controller)
                 .await
-            {
-                Ok(Ack::Ok) => {}
-                Ok(Ack::ReRegister) => {
-                    tracing::warn!(
-                        worker = %worker_id,
-                        "controller lost our registration; re-register needed"
-                    );
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        worker = %worker_id,
-                        error = %e,
-                        "controller heartbeat transport failed"
-                    );
-                }
-            }
-        }
-    });
-
-    let report_client = client.clone();
-    let report_task = tokio::spawn(async move {
-        let mut ticker = tokio::time::interval(REPORT_INTERVAL);
-        loop {
-            ticker.tick().await;
-            let status = WorkerStatus {
-                kv_pressure_bucket: 0,
-                inflight: 0,
+                .with_context(|| format!("dialing controller at {controller}"))?;
+            let info = WorkerInfo {
+                role,
+                model,
+                addr: endpoint,
+                capability: caps,
             };
-            if let Err(e) = report_client
-                .report_worker(tarpc::context::current(), worker_id, status)
+            let worker_id = WorkerControl::register_worker(&client, info)
                 .await
+                .context("registering worker with controller")?;
+            let control_tasks = control::spawn_control_tasks(client.clone(), worker_id);
+            let url = edge.url();
+            Ok((
+                edge,
+                control_tasks,
+                ControlPlane::Distributed {
+                    _client: client,
+                    worker_id,
+                },
+                url,
+            ))
+        }
+        TopologyMode::SingleNode => {
+            #[cfg(feature = "single-node")]
             {
-                tracing::warn!(
-                    worker = %worker_id,
-                    error = %e,
-                    "controller report_worker transport failed"
+                single_node::assemble(user_cfg, model, caps).await
+            }
+            #[cfg(not(feature = "single-node"))]
+            {
+                // Gateway-free local inference: the worker terminates client
+                // WebSockets itself and never registers, so the model name and
+                // capabilities have no controller to be registered with.
+                let _ = (model, caps);
+                let listen = format!("{}:{}", user_cfg.server.host, user_cfg.server.port);
+                let edge = EdgeServer::Standalone(
+                    client_server::spawn(&listen)
+                        .await
+                        .context("starting standalone client server")?,
                 );
+                let url = edge.url();
+                Ok((edge, Vec::new(), ControlPlane::None, url))
             }
         }
-    });
-
-    let watch_task = tokio::spawn(async move {
-        let mut since = 0u64;
-        loop {
-            let mut ctx = tarpc::context::current();
-            ctx.deadline = Instant::now() + WATCH_DEADLINE;
-            match client.watch_worker(ctx, worker_id, since).await {
-                Ok(neighbors) => {
-                    since = neighbors.epoch;
-                    tracing::debug!(
-                        worker = %worker_id,
-                        peers = neighbors.peers.len(),
-                        epoch = since,
-                        "neighbor view updated"
-                    );
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        worker = %worker_id,
-                        error = %e,
-                        "controller watch_worker transport failed"
-                    );
-                    tokio::time::sleep(Duration::from_secs(1)).await;
-                }
-            }
-        }
-    });
-
-    vec![heartbeat_task, report_task, watch_task]
+    }
 }
 
 struct StartedEmbeddedGroup {
