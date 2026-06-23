@@ -5,6 +5,7 @@
 #include "hf_config.hpp"
 #include "safetensors_source.hpp"
 #include "../model/arch.hpp"
+#include "../model/arch_spec.hpp"
 #include "../model/weights.hpp"
 
 namespace pie_metal_driver::loader {
@@ -89,6 +90,30 @@ LoadedModel load_model(const std::string& hf_path, const BatchingConfig& batchin
     geo.n_kv_heads = out.config.num_key_value_heads;
     geo.head_dim   = out.config.head_dim;
     out.kv = std::make_unique<PagedKvCache>(geo, kv_dtype);
+
+    // 5. Hybrid linear-attention models (qwen3.6): allocate the separate,
+    //    fixed-size-per-slot conv + recurrent Gated-DeltaNet state cache. The
+    //    number of linear layers comes from the per-layer attention schedule
+    //    ('l' entries); geometry from the config's linear_* fields.
+    const model::ArchSpec spec = model::arch_spec_for(out.config.arch, out.config);
+    int n_linear = 0;
+    for (char k : spec.layer_pattern)
+        if (k == 'l') ++n_linear;
+    if (n_linear > 0 && out.config.linear_num_value_heads > 0) {
+        const int k_heads = out.config.linear_num_key_heads;
+        const int v_heads = out.config.linear_num_value_heads;
+        const int k_hd    = out.config.linear_key_head_dim;
+        const int v_hd    = out.config.linear_value_head_dim;
+        LinearStateGeometry lg;
+        lg.n_linear_layers = n_linear;
+        lg.num_slots       = static_cast<int>(batching.max_forward_requests);
+        lg.conv_kernel     = out.config.linear_conv_kernel_dim;
+        lg.conv_dim        = 2 * k_heads * k_hd + v_heads * v_hd;
+        lg.v_heads         = v_heads;
+        lg.k_head_dim      = k_hd;
+        lg.v_head_dim      = v_hd;
+        out.lin_cache = std::make_unique<LinearStateCache>(lg);
+    }
 
     return out;
 }
