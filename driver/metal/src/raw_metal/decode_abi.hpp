@@ -36,7 +36,13 @@ struct DecodeGeometry {
     int   n_layers          = 24;
     int   vocab             = 248320;
     float eps               = 1e-6f;
-    bool  tied_embeddings   = true;   // lm_head == embed table
+    // TIED, but the CANONICAL stored side is the top-level 4-bit `lm_head.{weight,
+    // scales,biases}` (U32 [248320,128]-packed = [248320,1024] logical, group=64);
+    // `embed_tokens.weight` is ABSENT in this checkpoint (alpha's st_probe, #mac).
+    // heap_bind binds the ONE shared lm_head bundle to BOTH bind::Embed (EmbedGather
+    // dequantizes row token_id) AND QmvLmHead/Argmax — single Weights slot, no
+    // duplicate 127MB. The ported embed_gather kernel is already 4-bit dequant-gather.
+    bool  tied_embeddings   = true;   // lm_head is the stored table; embed aliases it
 
     // full-attention layers
     int   n_q_heads         = 8;
