@@ -41,6 +41,7 @@ Tensor from_heads(const Tensor& x, std::int32_t n_tokens, std::int32_t width) {
 //   layer_<il+1> = output of decoder layer `il` (HF index il+1)
 //   layer_final = post-final-norm hidden (pre-LM-head)
 void maybe_dump_hidden(std::int32_t slot, const Tensor& h) {
+#ifndef PIE_METAL_NO_LAYER_DUMP
     static const char* dir = std::getenv("PIE_METAL_DUMP_LAYERS");
     if (dir == nullptr) return;
     Tensor hf = mx::astype(h, mx::float32);
@@ -52,6 +53,14 @@ void maybe_dump_hidden(std::int32_t slot, const Tensor& h) {
         std::snprintf(name, sizeof(name), "qwen36_layer_%02d.npy", slot);
     }
     mx::save(std::string(dir) + "/" + name, hf);
+#else
+    // Pipelined/bench build (-DPIE_METAL_NO_LAYER_DUMP): the parity dump — the
+    // only mx::eval in the decode path — is compiled out, so a stray
+    // PIE_METAL_DUMP_LAYERS can't inject a per-token sync barrier and pollute
+    // the async_eval pipeline / ceiling-confirmation numbers.
+    (void)slot;
+    (void)h;
+#endif
 }
 
 }  // namespace
@@ -137,10 +146,10 @@ Tensor Qwen36Graph::linear_attn_layer(std::int32_t il, std::int32_t lin_ordinal,
     Tensor residual = hidden;
     Tensor cur = ops::rms_norm(hidden, *L.attn_norm, eps, /*plus_one=*/true);
 
-    Tensor mixed_qkv = ops::linear(*L.la_in_proj_qkv, cur);  // [N, conv_dim] = [q|k|v]
-    Tensor z = ops::linear(*L.la_in_proj_z, cur);            // [N, V_dim]
-    Tensor a = ops::linear(*L.la_in_proj_a, cur);            // [N, V_h]
-    Tensor b = ops::linear(*L.la_in_proj_b, cur);            // [N, V_h]
+    Tensor mixed_qkv = apply_linear(*L.la_in_proj_qkv, cur);  // [N, conv_dim] = [q|k|v]
+    Tensor z = apply_linear(*L.la_in_proj_z, cur);            // [N, V_dim]
+    Tensor a = apply_linear(*L.la_in_proj_a, cur);            // [N, V_h]
+    Tensor b = apply_linear(*L.la_in_proj_b, cur);            // [N, V_h]
 
     ops::GdnParams p;
     p.n_heads_k   = spec_.linear_num_key_heads;
@@ -167,7 +176,7 @@ Tensor Qwen36Graph::linear_attn_layer(std::int32_t il, std::int32_t lin_ordinal,
             *batch.lin_cache, lin_ordinal, *batch.slot_ids, qo, p);
     }
 
-    Tensor attn_out = ops::linear(*L.la_out_proj, out);  // [N, hidden]
+    Tensor attn_out = apply_linear(*L.la_out_proj, out);  // [N, hidden]
     return ops::residual_add(attn_out, residual);
 }
 
@@ -251,18 +260,20 @@ ModelWeights bind_qwen36(const WeightSource& src, const ModelConfig& cfg) {
 
         const std::string la = p + "linear_attn.";
         if (src.has(la + "in_proj_qkv.weight")) {
-            // Gated-DeltaNet linear-attention layer.
-            L.la_in_proj_qkv = src.get(la + "in_proj_qkv.weight");  // [conv_dim, H]
-            L.la_in_proj_z   = src.get(la + "in_proj_z.weight");    // [V_dim, H]
-            L.la_in_proj_a   = src.get(la + "in_proj_a.weight");    // [V_h, H]
-            L.la_in_proj_b   = src.get(la + "in_proj_b.weight");    // [V_h, H]
+            // Gated-DeltaNet linear-attention layer. The in/out projections are
+            // plain matmuls (bind_linear -> 4-bit transparently when the
+            // checkpoint quantizes them); conv1d + scalars stay dense.
+            L.la_in_proj_qkv = bind_linear(src, la + "in_proj_qkv", cfg);  // [conv_dim, H]
+            L.la_in_proj_z   = bind_linear(src, la + "in_proj_z", cfg);    // [V_dim, H]
+            L.la_in_proj_a   = bind_linear(src, la + "in_proj_a", cfg);    // [V_h, H]
+            L.la_in_proj_b   = bind_linear(src, la + "in_proj_b", cfg);    // [V_h, H]
             L.la_conv1d_w    = mx::reshape(src.get(la + "conv1d.weight"),
                                            {conv_dim, conv_k});
             L.la_conv1d_b    = src.try_get(la + "conv1d.bias");
             L.la_A_log       = src.get(la + "A_log");
             L.la_dt_bias     = src.get(la + "dt_bias");
             L.la_gate_norm   = src.get(la + "norm.weight");         // [V_d]
-            L.la_out_proj    = src.get(la + "out_proj.weight");     // [H, V_dim]
+            L.la_out_proj    = bind_linear(src, la + "out_proj", cfg);     // [H, V_dim]
         } else {
             // Full-attention layer (Qwen3 + output gate; 2x-wide q_proj).
             const std::string sa = p + "self_attn.";
