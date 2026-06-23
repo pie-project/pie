@@ -114,11 +114,26 @@ int main(int argc, char** argv) {
               << " layers=" << model.caps.num_hidden_layers
               << " page_size=" << ps << "\n";
 
+    // Hybrid (qwen3.6 gated-delta-net) staging: the executor normally supplies
+    // the linear-attn state seam (lin_cache + per-request slot_ids + host CSR).
+    // Mirror it here so the bare graph can run the recurrent layers. slot 0 for
+    // the single request; qo_indptr_host matches the batch's token span.
+    const bool hybrid = (model.lin_cache != nullptr);
+    auto attach_hybrid = [&](model::ForwardBatch& b) {
+        if (!hybrid) return;
+        b.lin_cache = model.lin_cache.get();
+        b.slot_ids  = mx::array({0}, {1}, mx::int32);
+        b.qo_indptr_host.assign({0, b.n_total});
+    };
+    if (hybrid)
+        std::cerr << "[bench] hybrid linear-attn cache staged (slot 0)\n";
+
     // Prefill to populate the KV cache.
     std::vector<int> ptoks(prefill), ppos(prefill);
     for (int i = 0; i < prefill; ++i) { ptoks[i] = 1 + (i % 100); ppos[i] = i; }
     try {
         auto b = make_batch(ptoks, ppos, prefill - 1, ps, /*pure_decode=*/false);
+        attach_hybrid(b);
         mx::array lg = model.graph->forward(b, *model.kv);
         mx::eval(lg);
         model.kv->eval();
@@ -138,6 +153,7 @@ int main(int argc, char** argv) {
         auto t0 = std::chrono::high_resolution_clock::now();
         for (int t = 0; t < n_steps; ++t) {
             auto b = make_batch({tok}, {prefill + t}, 0, ps, /*pure_decode=*/true);
+            attach_hybrid(b);
             mx::array logits = model.graph->forward(b, *model.kv);  // [1, vocab]
             mx::array next = mx::astype(mx::argmax(logits, 1), mx::uint32);
             next.eval();  // greedy-sampler autoregressive barrier (1 eval/token)
@@ -232,6 +248,7 @@ int main(int argc, char** argv) {
         mx::array prev = y;
         auto submit = [&](const mx::array& tok_dev, int pos) -> mx::array {
             auto b = make_batch_dev(tok_dev, pos, ps);
+            attach_hybrid(b);
             mx::array logits = model.graph->forward(b, *model.kv);  // lazy
             mx::array next = mx::astype(mx::argmax(logits, 1), mx::int32);
             // Only async_eval `next`: its dependency forces this token's KV

@@ -11,6 +11,7 @@
 #include <mlx/ops.h>
 #include <mlx/io.h>
 
+#include "ops/attention.hpp"
 #include "ops/ops.hpp"
 #include "linear_state_cache.hpp"  // delta-owned; complete type for gated_delta_net
 
@@ -19,6 +20,18 @@ namespace pie_metal_driver::model {
 namespace mx = mlx::core;
 
 namespace {
+
+// Measure-only prototype switch (mirrors gemma4): route single-stream (R=1)
+// pure_decode full-attn layers through the host-readback-free device decode
+// attention so the per-token forward has no internal host sync (required for
+// async_eval pipelining / whole-step compile). Off by default.
+bool device_decode_enabled() {
+    static const bool on = [] {
+        const char* e = std::getenv("PIE_DEVICE_DECODE");
+        return e && e[0] && e[0] != '0';
+    }();
+    return on;
+}
 
 std::string layer_prefix(const std::string& root, std::int32_t il) {
     return root + "layers." + std::to_string(il) + ".";
@@ -107,10 +120,15 @@ Tensor Qwen36Graph::full_attn_layer(std::int32_t il, Tensor hidden,
     ap.n_kv_heads = n_kv;
     ap.head_dim   = d;
 
-    Tensor attn = ops::paged_attention(
-        Q, kv.k_pages(il), kv.v_pages(il),
-        batch.kv_page_indices, batch.qo_indptr, batch.kv_page_indptr,
-        batch.kv_last_page_lens, kv.page_size(), ap);
+    Tensor attn = (device_decode_enabled() && batch.pure_decode)
+        ? ops::paged_attention_decode(
+              Q, kv.k_pages(il), kv.v_pages(il),
+              batch.kv_page_indices, batch.kv_last_page_lens,
+              kv.page_size(), ap)
+        : ops::paged_attention(
+              Q, kv.k_pages(il), kv.v_pages(il),
+              batch.kv_page_indices, batch.qo_indptr, batch.kv_page_indptr,
+              batch.kv_last_page_lens, kv.page_size(), ap);
 
     attn = from_heads(attn, N, n_q * d);
     // Output gate: attn *= sigmoid(gate) before o_proj.
