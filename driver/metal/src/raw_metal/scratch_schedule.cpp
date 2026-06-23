@@ -34,7 +34,7 @@ constexpr uint8_t RmsX = 0, RmsOut = 2;       // bind::Rms
 constexpr uint8_t QmvX = 3, QmvOut = 4;       // bind::Qmv
 constexpr uint8_t DenseX = 1, DenseOut = 2;   // bind::Dense
 constexpr uint8_t QSplitIn = 0, QSplitQ = 1, QSplitGate = 2;  // bind::QSplit
-constexpr uint8_t RopeQ = 0, RopeK = 1, RopeQOut = 2, RopeKOut = 3;  // bind::Rope
+constexpr uint8_t RopeX = 0;                  // bind::Rope: in-place activation (1=pos IO, 2/3/4=consts)
 constexpr uint8_t SdpaQ = 0, SdpaOut = 3;     // bind::Sdpa (K/V from KV region)
 constexpr uint8_t AttnGateAttn = 0, AttnGateGate = 1;  // bind::AttnGate (in-place)
 constexpr uint8_t KvAppendK = 0, KvAppendV = 1;        // bind::KvAppend (out -> KV pages)
@@ -126,11 +126,11 @@ ScratchSchedule build_scratch_schedule(const std::vector<Dispatch>& dag,
             case Kernel::KNorm:  // in-place on the key heads
                 rd(o, bi::RmsX, kk); wr(o, bi::RmsOut, kk);
                 break;
-            case Kernel::Rope:   // in-place on the query heads
-                rd(o, bi::RopeQ, q); wr(o, bi::RopeQOut, q);
+            case Kernel::Rope:   // in-place on the query heads (kernel buffer 0 only)
+                rd(o, bi::RopeX, q); wr(o, bi::RopeX, q);
                 break;
-            case Kernel::RopeK:  // in-place on the key heads
-                rd(o, bi::RopeK, kk); wr(o, bi::RopeKOut, kk);
+            case Kernel::RopeK:  // in-place on the key heads (kernel buffer 0 only)
+                rd(o, bi::RopeX, kk); wr(o, bi::RopeX, kk);
                 break;
             case Kernel::KvAppend:  // k/v -> KV pages (delta's); k/v read from scratch
                 rd(o, bi::KvAppendK, kk); rd(o, bi::KvAppendV, vv);
