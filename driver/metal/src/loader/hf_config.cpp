@@ -25,6 +25,24 @@ T get_or(const json& j, const char* key, T fallback) {
     }
 }
 
+// Qwen3.5 (qwen3_next) nests RoPE hyperparameters (rope_theta,
+// partial_rotary_factor, ...) under a `rope_parameters` object; most other
+// models keep them at the top level. Prefer the nested object, then fall back
+// to the top-level key, then to `fallback`.
+template <typename T>
+T get_rope_param(const json& j, const char* key, T fallback) {
+    if (auto it = j.find("rope_parameters"); it != j.end() && it->is_object()) {
+        auto nit = it->find(key);
+        if (nit != it->end() && !nit->is_null()) {
+            try {
+                return nit->get<T>();
+            } catch (...) {
+            }
+        }
+    }
+    return get_or<T>(j, key, fallback);
+}
+
 template <typename T>
 T require(const json& j, const char* key, const std::string& where) {
     auto it = j.find(key);
@@ -126,7 +144,7 @@ model::ModelConfig parse_doc(const json& root, const std::string& where) {
     cfg.rms_norm_eps = get_or<float>(j, "rms_norm_eps",
                                      get_or<float>(j, "layer_norm_epsilon",
                                                    get_or<float>(j, "norm_eps", 1e-5f)));
-    cfg.rope_theta          = get_or<float>(j, "rope_theta", 10000.0f);
+    cfg.rope_theta          = get_rope_param<float>(j, "rope_theta", 10000.0f);
     cfg.rope_local_base_freq = get_or<float>(j, "rope_local_base_freq", 0.0f);
     parse_rope_scaling(j, cfg);
 
@@ -196,7 +214,7 @@ model::ModelConfig parse_doc(const json& root, const std::string& where) {
     cfg.linear_value_head_dim  = get_or<int>(j, "linear_value_head_dim", 0);
     cfg.linear_conv_kernel_dim = get_or<int>(j, "linear_conv_kernel_dim", 0);
     cfg.attn_output_gate       = get_or<bool>(j, "attn_output_gate", false);
-    cfg.partial_rotary_factor  = get_or<float>(j, "partial_rotary_factor", 1.0f);
+    cfg.partial_rotary_factor  = get_rope_param<float>(j, "partial_rotary_factor", 1.0f);
     if (auto it = j.find("layer_types");
         it != j.end() && it->is_array() && cfg.layer_attn_types.empty()) {
         for (const auto& t : *it) cfg.layer_attn_types.push_back(t.get<std::string>());
