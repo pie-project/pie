@@ -82,6 +82,32 @@ void maybe_dump_hidden(std::int32_t slot, const Tensor& h) {
 #endif
 }
 
+// Env-gated PER-KERNEL golden dump for the raw-Metal cosine-bisection gate.
+// When PIE_METAL_GOLDEN_DIR is a directory, writes each tapped intermediate as
+// `<dir>/<layer>.<kernel>.npy` (fp32), e.g. `7.gdn_core.npy`, `3.rope_q.npy`.
+// Layer-less tensors (embed/final_norm/logits) pass layer < 0 → `<kernel>.npy`.
+// This is the sealed MLX-path golden; delta/beta emit identically-named
+// raw-Metal dumps so cosine_bisect.py localizes the FIRST diverging
+// (kernel,layer) below 0.99999 — "gdn_core layer 7", not just "logits wrong".
+// Compiled out of the bench/pipelined build (PIE_METAL_NO_LAYER_DUMP) with the
+// same discipline as maybe_dump_hidden so it can never inject a decode-path sync.
+void dump_kernel(std::int32_t layer, const char* kernel, const Tensor& t) {
+#ifndef PIE_METAL_NO_LAYER_DUMP
+    static const char* dir = std::getenv("PIE_METAL_GOLDEN_DIR");
+    if (dir == nullptr) return;
+    Tensor f = mx::astype(t, mx::float32);
+    mx::eval(f);
+    std::string name = (layer < 0)
+        ? std::string(kernel) + ".npy"
+        : std::to_string(layer) + "." + kernel + ".npy";
+    mx::save(std::string(dir) + "/" + name, f);
+#else
+    (void)layer;
+    (void)kernel;
+    (void)t;
+#endif
+}
+
 }  // namespace
 
 Qwen36Graph::Qwen36Graph(ModelConfig cfg, ModelWeights weights)
@@ -101,9 +127,11 @@ Tensor Qwen36Graph::full_attn_layer(std::int32_t il, Tensor hidden,
 
     Tensor residual = hidden;
     Tensor cur = ops::rms_norm(hidden, *L.attn_norm, eps, /*plus_one=*/true);
+    dump_kernel(il, "attn_norm", cur);
 
     // q_proj is 2x wide: per head the layout is [query(d) | gate(d)].
     Tensor qg = apply_linear(L.q_proj, cur);                // [N, n_q*2*d]
+    dump_kernel(il, "q_proj", qg);
     qg = mx::reshape(qg, {N, n_q, 2, d});
     Tensor Q    = mx::reshape(mx::slice(qg, {0, 0, 0, 0}, {N, n_q, 1, d}),
                               {N, n_q, d});
@@ -112,10 +140,14 @@ Tensor Qwen36Graph::full_attn_layer(std::int32_t il, Tensor hidden,
 
     Tensor K = to_heads(apply_linear(L.k_proj, cur), N, n_kv, d);
     Tensor V = to_heads(apply_linear(L.v_proj, cur), N, n_kv, d);
+    dump_kernel(il, "k_proj", K);
+    dump_kernel(il, "v_proj", V);
 
     // Gemma-style (1+w) per-head Q/K RMSNorm, then partial RoPE.
     Q = ops::rms_norm(Q, *L.q_norm, eps, /*plus_one=*/true);
     K = ops::rms_norm(K, *L.k_norm, eps, /*plus_one=*/true);
+    dump_kernel(il, "q_norm", Q);
+    dump_kernel(il, "k_norm", K);
 
     const float prf = cfg_.partial_rotary_factor;
     const std::int32_t rope_dims =
@@ -126,6 +158,8 @@ Tensor Qwen36Graph::full_attn_layer(std::int32_t il, Tensor hidden,
     rp.theta = cfg_.rope_theta;
     Q = ops::rope(Q, batch.positions, rope_dims, rp);
     K = ops::rope(K, batch.positions, rope_dims, rp);
+    dump_kernel(il, "rope_q", Q);
+    dump_kernel(il, "rope_k", K);
 
     kv.append(il, K, V, batch.kv_write_indices);
 
@@ -144,14 +178,19 @@ Tensor Qwen36Graph::full_attn_layer(std::int32_t il, Tensor hidden,
               Q, kv.k_pages(il), kv.v_pages(il),
               batch.kv_page_indices, batch.qo_indptr, batch.kv_page_indptr,
               batch.kv_last_page_lens, kv.page_size(), ap);
+    dump_kernel(il, "sdpa", attn);
 
     attn = from_heads(attn, N, n_q * d);
     // Output gate: attn *= sigmoid(gate) before o_proj.
     Tensor gate_flat = from_heads(gate, N, n_q * d);
     attn = ops::mul(attn, mx::sigmoid(gate_flat));
+    dump_kernel(il, "attn_gated", attn);
 
     Tensor attn_out = apply_linear(L.o_proj, attn);
-    return ops::residual_add(attn_out, residual);
+    dump_kernel(il, "o_proj", attn_out);
+    Tensor out = ops::residual_add(attn_out, residual);
+    dump_kernel(il, "attn_resid", out);
+    return out;
 }
 
 // ── Linear-attention layer: Gated DeltaNet (beta's op owns the core) ──
@@ -169,11 +208,16 @@ Tensor Qwen36Graph::linear_attn_layer(std::int32_t il, std::int32_t lin_ordinal,
 
     Tensor residual = hidden;
     Tensor cur = ops::rms_norm(hidden, *L.attn_norm, eps, /*plus_one=*/true);
+    dump_kernel(il, "attn_norm", cur);
 
     Tensor mixed_qkv = apply_linear(*L.la_in_proj_qkv, cur);  // [N, conv_dim] = [q|k|v]
     Tensor z = apply_linear(*L.la_in_proj_z, cur);            // [N, V_dim]
     Tensor a = apply_linear(*L.la_in_proj_a, cur);            // [N, V_h]
     Tensor b = apply_linear(*L.la_in_proj_b, cur);            // [N, V_h]
+    dump_kernel(il, "gdn_in_qkv", mixed_qkv);
+    dump_kernel(il, "gdn_in_z", z);
+    dump_kernel(il, "gdn_in_a", a);
+    dump_kernel(il, "gdn_in_b", b);
 
     ops::GdnParams p;
     p.n_heads_k   = spec_.linear_num_key_heads;
@@ -199,9 +243,13 @@ Tensor Qwen36Graph::linear_attn_layer(std::int32_t il, std::int32_t lin_ordinal,
             *L.la_A_log, *L.la_dt_bias, *L.la_gate_norm,
             *batch.lin_cache, lin_ordinal, *batch.slot_ids, qo, p);
     }
+    dump_kernel(il, "gdn_core", out);
 
     Tensor attn_out = apply_linear(*L.la_out_proj, out);  // [N, hidden]
-    return ops::residual_add(attn_out, residual);
+    dump_kernel(il, "gdn_out", attn_out);
+    Tensor lout = ops::residual_add(attn_out, residual);
+    dump_kernel(il, "attn_resid", lout);
+    return lout;
 }
 
 // ── Shared dense SwiGLU MLP block ──
@@ -211,10 +259,18 @@ Tensor Qwen36Graph::mlp_block(std::int32_t il, Tensor hidden) {
 
     Tensor residual = hidden;
     Tensor normed = ops::rms_norm(hidden, *L.ffn_norm, eps, /*plus_one=*/true);
+    dump_kernel(il, "ffn_norm", normed);
     Tensor gate = apply_linear(*L.gate_proj, normed);
     Tensor up   = apply_linear(*L.up_proj,   normed);
-    Tensor ffn  = apply_linear(*L.down_proj, ops::swiglu(gate, up));
-    return ops::residual_add(ffn, residual);
+    dump_kernel(il, "gate_proj", gate);
+    dump_kernel(il, "up_proj", up);
+    Tensor act  = ops::swiglu(gate, up);
+    dump_kernel(il, "swiglu", act);
+    Tensor ffn  = apply_linear(*L.down_proj, act);
+    dump_kernel(il, "down_proj", ffn);
+    Tensor mout = ops::residual_add(ffn, residual);
+    dump_kernel(il, "layer_out", mout);
+    return mout;
 }
 
 Tensor Qwen36Graph::forward(const ForwardBatch& batch, KvCacheView& kv) {
@@ -224,6 +280,7 @@ Tensor Qwen36Graph::forward(const ForwardBatch& batch, KvCacheView& kv) {
     // Qwen does NOT scale embeddings (unlike Gemma). Dequant-gathers from the
     // tied quant lm_head when the dense embed is dropped (embed-drop).
     Tensor hidden = apply_embedding(w_.embed, batch.token_ids);
+    dump_kernel(-1, "embed", hidden);
     maybe_dump_hidden(0, hidden);  // HF output_hidden_states[0] = embeddings
 
     std::int32_t lin_ordinal = 0;
@@ -238,12 +295,15 @@ Tensor Qwen36Graph::forward(const ForwardBatch& batch, KvCacheView& kv) {
     }
 
     hidden = ops::rms_norm(hidden, w_.final_norm, eps, /*plus_one=*/true);
+    dump_kernel(-1, "final_norm", hidden);
     maybe_dump_hidden(-1, hidden);  // post-final-norm (pre-LM-head)
     Tensor sampled = ops::gather_rows(hidden, batch.logit_rows);
 
-    return w_.lm_head
+    Tensor logits = w_.lm_head
         ? apply_linear(*w_.lm_head, sampled)   // [n_slots, vocab]
         : apply_linear(w_.embed, sampled);     // tied embed (dense or quant)
+    dump_kernel(-1, "logits", logits);
+    return logits;
 }
 
 // ── Weight binding (Qwen3.6 hybrid) ──
