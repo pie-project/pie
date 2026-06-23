@@ -273,13 +273,13 @@ std::vector<Tensor> gdn_decode_region(const std::vector<Tensor>& in) {
     Tensor out = mx::reshape(kout[0], {R, Vh, Vd});  // [R,Vh,Vd]
     Tensor state = mx::swapaxes(kout[1], 2, 3);      // back to [R,Vh,Kd,Vd]
 
-    // RMSNormGated(out, z).
+    // RMSNormGated(out, z) = rms_norm(out)*gate_norm_w * silu(z). The norm is a
+    // single fused MLX kernel (eps literal -- this region is qwen3.6-specific,
+    // rms_norm_eps=1e-6; capture-less regions take eps as a literal per
+    // compiled.hpp). ~2x vs the decomposed mean/rsqrt/mul chain.
     Tensor zr = mx::reshape(z, {R, Vh, Vd});
-    Tensor ms = mx::mean(mx::square(out), /*axis=*/-1, true);
-    Tensor outhat = mx::multiply(out, mx::rsqrt(mx::add(ms, eps)));
-    Tensor gnw = mx::reshape(gate_norm_w, {1, 1, Vd});
-    Tensor normed = mx::multiply(mx::multiply(outhat, gnw),
-                                 mx::multiply(zr, mx::sigmoid(zr)));
+    Tensor outhat = mx::fast::rms_norm(out, gate_norm_w, 1e-6f);  // [R,Vh,Vd]
+    Tensor normed = mx::multiply(outhat, mx::multiply(zr, mx::sigmoid(zr)));
     Tensor result = mx::reshape(normed, {R, Vh * Vd});
 
     return {result, new_cstate, state};
