@@ -59,7 +59,7 @@ template <typename T>
     device T*           core_out       [[buffer(3)]],   // [R, Hv, Vd]  pre-GatedRms output
     const device T*     conv_w         [[buffer(4)]],   // [conv_dim, Kc]
     const device T*     conv_b         [[buffer(5)]],   // [conv_dim]
-    const device T*     A_log          [[buffer(6)]],   // [Hv]
+    const device float* A_log          [[buffer(6)]],   // [Hv]  F32 in ckpt — typed float* (bit-exact decay; raw zero-copy stage)
     const device T*     dt_bias        [[buffer(7)]],   // [Hv]
     const device T*     a_gate         [[buffer(8)]],   // [R, Hv]
     const device T*     b_gate         [[buffer(9)]],   // [R, Hv]
@@ -149,7 +149,7 @@ template <typename T>
   gdn_core<itype>(                                                         \
       const device itype*, const device float*, device float*,             \
       device itype*, const device itype*, const device itype*,             \
-      const device itype*, const device itype*, const device itype*,       \
+      const device float*, const device itype*, const device itype*,       \
       const device itype*, device float*,                                  \
       constant GdnCoreParams&, uint3, uint3, uint);
 
