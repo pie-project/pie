@@ -4,6 +4,9 @@
 
 namespace pie_driver {
 class InProcServer;
+class ResponseBuilder;
+struct PieInProcRequestView;
+struct PieInProcResponseView;
 }  // namespace pie_driver
 
 #if defined(PIE_METAL_HAS_MLX)
@@ -38,6 +41,14 @@ public:
     explicit InProcService(std::uint32_t vocab_size = 1) : vocab_size_(vocab_size) {}
 
     void serve_forever(pie_driver::InProcServer& server);
+
+    // Dispatch a single in-process request (the body of the serve loop,
+    // exposed for direct/unit driving). `builder`'s scratch backs the
+    // response-view slices in `out` and must outlive the caller's use of them.
+    void handle_request(std::uint32_t req_id,
+                        const pie_driver::PieInProcRequestView& req,
+                        pie_driver::PieInProcResponseView& out,
+                        pie_driver::ResponseBuilder& builder);
 
     std::uint64_t handled() const noexcept { return handled_; }
 
