@@ -72,6 +72,16 @@ struct ForwardBatch {
     LinearStateCache*       lin_cache = nullptr;
     std::optional<Tensor>   slot_ids;
     std::vector<int>        qo_indptr_host;
+
+    // ── host-side paged-KV CSR (full-attention paged_attention) ──
+    // Same host metadata that backs the kv_page_indptr / kv_last_page_lens
+    // device tensors, kept on the host so paged_attention can read its
+    // per-request loop bounds without a mid-forward GPU->CPU readback (those
+    // .eval() syncs are pipeline bubbles at batch=1 AND block mx::compile of
+    // the decode step). Populated by the executor for every arch; empty only
+    // on paths that build ForwardBatch without paged KV.
+    std::vector<int>        kv_page_indptr_host;
+    std::vector<int>        kv_last_page_lens_host;
 };
 
 class ModelGraph {

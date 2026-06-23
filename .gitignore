@@ -251,3 +251,4 @@ pie/rollout_logs/
 
 *.csv
 .tmp/
+.mcp.json
