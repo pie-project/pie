@@ -72,18 +72,6 @@ struct ForwardBatch {
     LinearStateCache*       lin_cache = nullptr;
     std::optional<Tensor>   slot_ids;
     std::vector<int>        qo_indptr_host;
-
-    // ── Host-side paged-attention CSR loop bounds ──
-    // Host mirrors of kv_page_indptr / kv_last_page_lens, populated by the
-    // executor (alpha) when it stages the batch. These let beta's
-    // paged_attention read the per-request CSR loop bounds without a GPU->CPU
-    // readback (`.eval()`) per layer — removing ~2 syncs/layer (pipeline
-    // bubbles at batch=1) and unblocking `mx::compile` of the decode forward,
-    // which cannot host-read mid-trace. On-device slice/take/sdpa stay lazy.
-    //   kv_page_indptr_host  : [n_requests + 1]
-    //   kv_last_page_lens_host: [n_requests]
-    std::vector<int>        kv_page_indptr_host;
-    std::vector<int>        kv_last_page_lens_host;
 };
 
 class ModelGraph {
