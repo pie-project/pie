@@ -60,6 +60,19 @@ int main(int argc, char** argv) {
         /*pure_decode*/false,
     };
 
+    // Hybrid linear-attention (qwen3.6): thread delta's conv/recurrent state
+    // cache + this request's persistent slot. Null/ignored for every other arch.
+    // The 4-token prefill routes linear layers through gated_delta_net_varlen,
+    // which needs the host CSR token spans.
+    batch.lin_cache      = model.lin_cache.get();
+    batch.slot_ids       = mx::array({0}, {1}, mx::int32);
+    batch.qo_indptr_host = {0, n};
+    if (model.lin_cache) {
+        std::cerr << "[smoke] hybrid linear-attn: lin_cache slots="
+                  << model.lin_cache->num_slots()
+                  << " layers=" << model.lin_cache->n_linear_layers() << "\n";
+    }
+
     mx::array logits = model.graph->forward(batch, *model.kv);
     mx::eval(logits);
     model.kv->eval();
