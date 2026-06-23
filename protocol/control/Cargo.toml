@@ -1,0 +1,20 @@
+[package]
+name = "pie-control"
+version = "0.1.0"
+edition = "2024"
+authors = ["In Gim <in.gim@yale.edu>"]
+description = "Control-plane RPC contract: the `Control` tarpc service shared by controller (server) and worker/gateway (clients). Deps = pie-schema + tarpc only, to keep the pie-schema floor tarpc-free."
+license = "Apache-2.0"
+repository = "https://github.com/pie-project/pie"
+
+[lib]
+name = "pie_control"
+path = "src/lib.rs"
+
+[dependencies]
+# Wire data types (static serde structs on the dependency floor).
+pie-schema = { path = "../schema" }
+# The RPC mechanism. `serde1` enables the serde derives on the macro-generated
+# request/response types; transport/codec features stay with the binaries
+# (controller/worker/gateway) so the contract crate carries no transport.
+tarpc = { version = "0.35", features = ["serde1"] }
