@@ -124,6 +124,9 @@ namespace mx = mlx::core;
 struct ModelRuntime {
     std::unique_ptr<pie_metal_driver::model::ModelGraph> graph;
     std::unique_ptr<pie_metal_driver::PagedKvCache>      kv;
+    // Hybrid linear-attention state store (qwen3.6); null for non-hybrid archs.
+    // Declared before `executor` so it outlives the borrowing Executor.
+    std::unique_ptr<pie_metal_driver::LinearStateCache>  lin_cache;
     std::unique_ptr<pie_metal_driver::Executor>          executor;
 };
 
@@ -238,9 +241,11 @@ std::unique_ptr<ModelRuntime> build_model_runtime(
                   << ", act=" << lm.caps.activation_dtype << ")\n";
 
         auto rt = std::make_unique<ModelRuntime>();
-        rt->graph    = std::move(lm.graph);
-        rt->kv       = std::move(lm.kv);
-        rt->executor = std::make_unique<Executor>(*rt->graph, *rt->kv);
+        rt->graph     = std::move(lm.graph);
+        rt->kv        = std::move(lm.kv);
+        rt->lin_cache = std::move(lm.lin_cache);  // null for non-hybrid archs
+        rt->executor  = std::make_unique<Executor>(*rt->graph, *rt->kv);
+        rt->executor->set_linear_state_cache(rt->lin_cache.get());
         return rt;
     } catch (const std::exception& e) {
         std::cerr << "[pie-driver-metal] model load failed (" << e.what()

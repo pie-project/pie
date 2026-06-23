@@ -54,6 +54,7 @@ private:
         std::vector<int> kv_last_page_lens;
         std::vector<int> qo_indptr;
         std::vector<int> kv_write_indices;
+        std::vector<int> slot_ids;
     };
 
     // Derive per-token physical KV write slots from the paged page-table.
@@ -68,6 +69,18 @@ private:
     Staging            stg_;
     std::uint64_t      fire_counter_ = 0;
     std::vector<pie_driver::PerRequestOutput> per_req_;
+    // qwen3.6 hybrid linear-attention state store (delta-owned). Null for
+    // non-hybrid models; the runtime (entry.cpp) attaches it for hybrids so the
+    // graph's gated_delta_net can gather/scatter per-request conv+recurrent
+    // state. Borrowed — outlives the Executor.
+    LinearStateCache*  lin_cache_ = nullptr;
+
+public:
+    // Attach the hybrid linear-attention state cache (qwen3.6). Threaded into
+    // every ForwardBatch so the graph's linear layers can reach it.
+    void set_linear_state_cache(LinearStateCache* cache) noexcept {
+        lin_cache_ = cache;
+    }
 };
 
 }  // namespace pie_metal_driver
