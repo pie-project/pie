@@ -24,12 +24,11 @@ use std::sync::{Arc, Mutex, RwLock};
 
 use anyhow::{Context, Result};
 use futures::StreamExt;
-use pie_dispatch::{GatewayInbound, WorkerControlClient, accept_gateway_link};
+use pie_dispatch::{GatewayInbound, WorkerControlClient, accept_gateway_link, dispatch_codec};
 use pie_schema::control::{WorkerId, WorkerStatus};
 use pie_schema::gateway::{Accepted, Control, ReqId, Request, Tokens};
 use tarpc::serde_transport::tcp;
 use tarpc::server::{BaseChannel, Channel};
-use tarpc::tokio_serde::formats::Json;
 use tokio::net::ToSocketAddrs;
 use tokio::sync::watch;
 
@@ -209,13 +208,14 @@ pub async fn serve(
     sessions: Sessions,
     registry: WorkerRegistry,
 ) -> Result<WorkerServer> {
-    // Self-describing codec (JSON), NOT bincode: the data plane carries
+    // Single-sourced self-describing codec (MessagePack via
+    // `pie_dispatch::dispatch_codec`), NOT bincode: the data plane carries
     // `Request{ message: ClientMessage }` / `Tokens::Chunk(ServerMessage)`, whose
     // vocab enums are `#[serde(tag = "type")]` (internally tagged, for the
     // self-describing client wire) — bincode cannot decode them
-    // (`deserialize_any` is unsupported). The worker's dial-in side must match.
-    // (MessagePack is the tracked hot-path perf graduation, task #21.)
-    let mut incoming = tcp::listen(bind, Json::default)
+    // (`deserialize_any` is unsupported). The worker's dial-in side calls the
+    // same `dispatch_codec`, so the two ends can't diverge.
+    let mut incoming = tcp::listen(bind, dispatch_codec)
         .await
         .context("bind worker-facing listener")?;
     incoming

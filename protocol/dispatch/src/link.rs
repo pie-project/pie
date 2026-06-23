@@ -39,6 +39,7 @@ use futures::{
 };
 use serde::{Deserialize, Serialize};
 use tarpc::transport::channel::{ChannelError, UnboundedChannel};
+use tokio_serde::formats::MessagePack;
 
 use crate::{
     GatewayInboundClient, GatewayInboundRequest, GatewayInboundResponse, WorkerControlClient,
@@ -53,6 +54,24 @@ use crate::{
 pub enum TwoWayMessage<Req, Resp> {
     Request(tarpc::ClientMessage<Req>),
     Response(tarpc::Response<Resp>),
+}
+
+/// The single source of truth for the gateway↔worker data-plane codec.
+///
+/// Both ends — the gateway's `worker.rs` listener and the worker's
+/// `gateway_link.rs` dialer — pass this as their `tcp`/`unix` `codec_fn`, so the
+/// codec is *unable* to diverge per site (the same byte-identical-both-ends
+/// property that [`TwoWayMessage`] gives the frame layout). It is the codec
+/// only, never a transport, so `pie-dispatch` stays transport-free.
+///
+/// MessagePack because the data plane carries internally-tagged
+/// [`ClientMessage`](pie_schema::message::ClientMessage) /
+/// [`ServerMessage`](pie_schema::message::ServerMessage) (need a *self-describing*
+/// codec — bincode structurally can't decode `#[serde(tag)]` enums), it is
+/// compact for the token hot path, and it matches the client WS wire
+/// (`rmp_serde`) → one codec end-to-end client→gateway→worker.
+pub fn dispatch_codec<Item, SinkItem>() -> MessagePack<Item, SinkItem> {
+    MessagePack::default()
 }
 
 /// Error union for the two mux pump tasks: a closed in-proc channel half

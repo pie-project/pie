@@ -15,6 +15,14 @@
 //! Both traits live in the thin `pie-dispatch` crate so this floor stays
 //! tarpc-free; these are the shared data types those calls carry.
 //!
+//! CODEC CONSTRAINT: the gateway↔worker data plane MUST use a *self-describing*
+//! codec (MessagePack via `pie_dispatch::dispatch_codec`, NOT bincode), because
+//! [`Request`] / [`Tokens`] embed the internally-tagged
+//! [`ClientMessage`](crate::message::ClientMessage) /
+//! [`ServerMessage`](crate::message::ServerMessage) (`#[serde(tag = "type")]`),
+//! which need `deserialize_any` — bincode structurally can't decode them. The
+//! codec is single-sourced in `pie-dispatch` so the two ends can't diverge.
+//!
 //! Like [`control`](crate::control)/[`cluster`](crate::cluster)/
 //! [`message`](crate::message), this is plain serde vocabulary — deliberately
 //! NOT `#[schema]`/rkyv (it never rides the zero-copy tensor ring), so it is NOT

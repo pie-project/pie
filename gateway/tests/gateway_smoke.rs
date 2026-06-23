@@ -26,7 +26,7 @@ use anyhow::{Result, bail};
 use futures::StreamExt;
 use tokio::sync::watch;
 
-use pie_dispatch::{GatewayInboundClient, WorkerControl, connect_gateway_link};
+use pie_dispatch::{GatewayInboundClient, WorkerControl, connect_gateway_link, dispatch_codec};
 use pie_gateway::session::{Affinity, Identity, TurnInput};
 use pie_gateway::{Gateway, GatewayConfig, GatewayControl, bind};
 use pie_schema::control::{
@@ -37,7 +37,6 @@ use pie_schema::gateway::{Accepted, Control, Priority, ReqId, Request, TenantId,
 use pie_schema::message::{ClientMessage, ServerMessage};
 use tarpc::serde_transport::tcp;
 use tarpc::server::{BaseChannel, Channel};
-use tarpc::tokio_serde::formats::Json;
 
 /// How many `Tokens::Chunk`s the stub streams before the clean `Eos`.
 const TOKENS_PER_TURN: usize = 3;
@@ -134,7 +133,7 @@ async fn spawn_stub_worker(
     worker_addr: SocketAddr,
     worker_id: WorkerId,
 ) -> Result<tokio::task::JoinHandle<()>> {
-    let mut conn = tcp::connect(worker_addr, Json::default);
+    let mut conn = tcp::connect(worker_addr, dispatch_codec);
     conn.config_mut().max_frame_length(LINK_MAX_FRAME_BYTES);
     let transport = conn.await?;
     let (server_half, gateway) = connect_gateway_link(transport);

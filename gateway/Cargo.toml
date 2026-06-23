@@ -29,10 +29,12 @@ pie-schema = { path = "../protocol/schema", default-features = false }
 serde = { version = "1.0", features = ["derive"] }
 # Dyn-safe async traits: charlie's `TurnRouter` seam + bravo's `BlobStore`.
 async-trait = "0.1"
+# `serde-transport-bincode` = control-plane codec (pie-control client). The
+# data-plane codec is single-sourced in `pie-dispatch` (`dispatch_codec`,
+# MessagePack), so no `serde-transport-json` here.
 tarpc = { version = "0.35", features = [
     "serde-transport",
     "serde-transport-bincode",
-    "serde-transport-json",
     "tcp",
     "unix",
     "tokio1",

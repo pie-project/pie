@@ -28,3 +28,10 @@ futures = "0.3"                                     # Stream/Sink combinators + 
 tokio = { version = "1", features = ["rt"] }        # spawn the two pump tasks
 thiserror = "2"                                     # the mux error enum
 tracing = "0.1"                                     # warn on inbound-mux failure
+# The single-sourced data-plane codec (`dispatch_codec`). MessagePack is
+# self-describing (the data plane carries internally-tagged ClientMessage/
+# ServerMessage, which bincode can't decode) and compact, and matches the
+# client WS wire (rmp_serde) → one codec end-to-end. This is the codec only,
+# NOT a transport (no tcp/unix) — purity holds. rmp-serde is already in the
+# workspace, so this adds no new graph node.
+tokio-serde = { version = "0.9", features = ["messagepack"] }

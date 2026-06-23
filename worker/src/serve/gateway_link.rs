@@ -34,7 +34,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow, bail};
 use futures::StreamExt;
 use pie::server::ClientId;
-use pie_dispatch::{GatewayInboundClient, WorkerControl, connect_gateway_link};
+use pie_dispatch::{GatewayInboundClient, WorkerControl, connect_gateway_link, dispatch_codec};
 use pie_schema::control::WorkerId;
 use pie_schema::gateway::{
     Accepted, BlobRef, Control, Priority, ReqId, Request, SessionId, Tokens,
@@ -42,7 +42,6 @@ use pie_schema::gateway::{
 use pie_schema::message::{ClientMessage, ServerMessage};
 use tarpc::serde_transport::{tcp, unix};
 use tarpc::server::{BaseChannel, Channel};
-use tarpc::tokio_serde::formats::Json;
 use tokio::sync::{Mutex, Notify, mpsc};
 
 /// Max frame on the gateway link's read side. A `dispatch` carries one
@@ -84,7 +83,7 @@ pub async fn connect_gateway(addr: &str, worker_id: WorkerId) -> Result<GatewayL
         .strip_prefix("unix://")
         .or_else(|| addr.strip_prefix("unix:"))
     {
-        let mut conn = unix::connect(path, Json::default);
+        let mut conn = unix::connect(path, dispatch_codec);
         conn.config_mut().max_frame_length(LINK_MAX_FRAME_BYTES);
         let transport = conn
             .await
@@ -92,7 +91,7 @@ pub async fn connect_gateway(addr: &str, worker_id: WorkerId) -> Result<GatewayL
         connect_gateway_link(transport)
     } else {
         let tcp_addr = addr.strip_prefix("tcp://").unwrap_or(addr);
-        let mut conn = tcp::connect(tcp_addr, Json::default);
+        let mut conn = tcp::connect(tcp_addr, dispatch_codec);
         conn.config_mut().max_frame_length(LINK_MAX_FRAME_BYTES);
         let transport = conn
             .await

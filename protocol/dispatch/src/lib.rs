@@ -38,7 +38,8 @@ use pie_schema::gateway::{Accepted, Control, Priority, ReqId, Request, Tokens};
 
 mod link;
 pub use link::{
-    ChannelOrIoError, TwoWayMessage, accept_gateway_link, connect_gateway_link, spawn_twoway,
+    ChannelOrIoError, TwoWayMessage, accept_gateway_link, connect_gateway_link, dispatch_codec,
+    spawn_twoway,
 };
 
 /// Served by the GATEWAY, called by the worker (worker → gateway). The bulk,
