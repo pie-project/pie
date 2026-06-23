@@ -23,7 +23,7 @@ struct Cli {
     listen: String,
 
     /// Evict a member after this many seconds without a liveness signal.
-    #[arg(long, default_value_t = 15)]
+    #[arg(long, default_value_t = 8)]
     heartbeat_timeout_secs: u64,
 }
 

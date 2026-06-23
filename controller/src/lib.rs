@@ -74,8 +74,10 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             listen_addr: "0.0.0.0:7000".to_string(),
-            heartbeat_timeout: Duration::from_secs(15),
-            tick_interval: Duration::from_secs(5),
+            // ≈4× the 2s client heartbeat: tolerates a couple of missed beats
+            // (no false evictions) while detecting death in ~8–10s.
+            heartbeat_timeout: Duration::from_secs(8),
+            tick_interval: Duration::from_secs(2),
             command_buffer: 256,
         }
     }

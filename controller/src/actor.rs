@@ -63,7 +63,7 @@ pub struct ActorConfig {
 impl Default for ActorConfig {
     fn default() -> Self {
         Self {
-            heartbeat_timeout: Duration::from_secs(15),
+            heartbeat_timeout: Duration::from_secs(8),
         }
     }
 }
