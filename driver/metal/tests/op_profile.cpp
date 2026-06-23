@@ -236,6 +236,64 @@ int main() {
         add("GDN decode step [lin]", N_LIN, per);
     }
 
+    // ---- GDN decode SUB-DECOMPOSITION (where the 0.45ms/layer goes) ----
+    // Mirrors gated_delta.cpp gdn_decode_region, all fp32, decode shapes (B=1).
+    // mlx_lm fuses the recurrent step into ONE custom metal_kernel (0.0275ms);
+    // ours runs it as separate MLX reduction/elementwise kernels.
+    {
+        // (a) causal depthwise conv1d (T=1) + silu
+        Tensor conv_w = mx::astype(randf({CONV_DIM, CONVK}), mx::float32);
+        Tensor conv_b = mx::zeros({CONV_DIM}, mx::float32);
+        double per_conv = time_op(K, IT, [&](int i) {
+            Tensor cstate = mx::astype(randf({1, CONVK, CONV_DIM}), mx::float32);
+            Tensor mixed = mx::astype(randf({1, CONV_DIM}), mx::float32);
+            Tensor ns = mx::concatenate(
+                {mx::slice(cstate, {0, 1, 0}, {1, CONVK, CONV_DIM}),
+                 mx::reshape(mixed, {1, 1, CONV_DIM})}, 1);
+            Tensor wct = mx::reshape(mx::swapaxes(conv_w, 0, 1), {1, CONVK, CONV_DIM});
+            Tensor y = mx::sum(mx::multiply(ns, wct), 1, false);
+            y = mx::add(y, mx::reshape(conv_b, {1, CONV_DIM}));
+            return mx::multiply(y, mx::sigmoid(y));
+        });
+        add("  gdn.conv1d+silu", N_LIN, per_conv);
+
+        // (b) the RECURRENT STEP (4 state ops over [1,Vh,Kd,Vd] fp32 = 1MB) —
+        //     this is what mlx_lm fuses into one metal_kernel.
+        double per_rec = time_op(K, IT, [&](int i) {
+            Tensor state = mx::astype(randf({1, VH, KD, VD}), mx::float32);
+            Tensor q = mx::astype(randf({1, VH, KD}), mx::float32);
+            Tensor k = mx::astype(randf({1, VH, KD}), mx::float32);
+            Tensor v = mx::astype(randf({1, VH, VD}), mx::float32);
+            Tensor g = mx::astype(randf({1, VH}), mx::float32);
+            Tensor beta = mx::astype(randf({1, VH}), mx::float32);
+            state = mx::multiply(state, mx::reshape(mx::exp(g), {1, VH, 1, 1}));
+            Tensor k4 = mx::reshape(k, {1, VH, KD, 1});
+            Tensor q4 = mx::reshape(q, {1, VH, KD, 1});
+            Tensor kv_mem = mx::sum(mx::multiply(state, k4), 2, false);
+            Tensor delta = mx::multiply(mx::subtract(v, kv_mem),
+                                        mx::reshape(beta, {1, VH, 1}));
+            Tensor outer = mx::multiply(k4, mx::reshape(delta, {1, VH, 1, VD}));
+            state = mx::add(state, outer);
+            return mx::sum(mx::multiply(state, q4), 2, false);
+        });
+        add("  gdn.recurrent (vs mlx_lm fused 0.0275)", N_LIN, per_rec);
+
+        // (c) RMSNormGated(out, z)
+        Tensor gnw = mx::astype(randf({VD}), mx::float32);
+        double per_rms = time_op(K, IT, [&](int i) {
+            Tensor out = mx::astype(randf({1, VH, VD}), mx::float32);
+            Tensor z = mx::astype(randf({1, V_DIM}), mx::float32);
+            Tensor zr = mx::reshape(z, {1, VH, VD});
+            Tensor ms = mx::mean(mx::square(out), -1, true);
+            Tensor outhat = mx::multiply(out, mx::rsqrt(mx::add(ms, mx::array(1e-6f))));
+            Tensor g2 = mx::reshape(gnw, {1, 1, VD});
+            return mx::reshape(mx::multiply(mx::multiply(outhat, g2),
+                                            mx::multiply(zr, mx::sigmoid(zr))),
+                               {1, VH * VD});
+        });
+        add("  gdn.rmsnorm_gated", N_LIN, per_rms);
+    }
+
     // ---- embed gather (1 row, quantized table dequant) ----
     {
         QW emb = make_qw(VOCAB, H);
