@@ -71,13 +71,11 @@ Tensor sample_row(const Tensor& row, const SamplerParams& p,
 
 }  // namespace
 
-std::vector<std::uint32_t> sample_tokens(
+Tensor sample_token_device(
     const Tensor& logits,
     const std::vector<SamplerParams>& params,
     std::uint64_t base_seed) {
     const int n_slots = static_cast<int>(params.size());
-    std::vector<std::uint32_t> out(n_slots, 0);
-    if (n_slots == 0) return out;
 
     Tensor lf = mx::astype(logits, mx::float32);
 
@@ -87,14 +85,10 @@ std::vector<std::uint32_t> sample_tokens(
         if (!is_greedy(p)) { all_greedy = false; break; }
     }
     if (all_greedy) {
-        Tensor toks = mx::astype(mx::argmax(lf, /*axis=*/1), mx::uint32);
-        toks.eval();
-        const std::uint32_t* p = toks.data<std::uint32_t>();
-        for (int s = 0; s < n_slots; ++s) out[s] = p[s];
-        return out;
+        return mx::astype(mx::argmax(lf, /*axis=*/1), mx::uint32);
     }
 
-    // General path: per-slot sampling graphs, evaluated together.
+    // General path: per-slot sampling graphs stacked into one [n_slots] array.
     std::vector<Tensor> toks;
     toks.reserve(n_slots);
     for (int s = 0; s < n_slots; ++s) {
@@ -103,12 +97,25 @@ std::vector<std::uint32_t> sample_tokens(
         std::uint64_t seed = params[s].seed != 0
             ? static_cast<std::uint64_t>(params[s].seed)
             : (base_seed + static_cast<std::uint64_t>(s));
-        toks.push_back(sample_row(row, params[s], seed));
+        toks.push_back(mx::reshape(sample_row(row, params[s], seed), {1}));
     }
-    mx::eval(toks);
-    for (int s = 0; s < n_slots; ++s) {
-        out[s] = toks[s].item<std::uint32_t>();
-    }
+    return mx::concatenate(toks, /*axis=*/0);
+}
+
+std::vector<std::uint32_t> sample_tokens(
+    const Tensor& logits,
+    const std::vector<SamplerParams>& params,
+    std::uint64_t base_seed) {
+    const int n_slots = static_cast<int>(params.size());
+    std::vector<std::uint32_t> out(n_slots, 0);
+    if (n_slots == 0) return out;
+
+    // Share the exact graph with the device-returning variant so the host and
+    // pipelined decode paths are bit-identical; just drain it here.
+    Tensor toks = sample_token_device(logits, params, base_seed);
+    toks.eval();
+    const std::uint32_t* p = toks.data<std::uint32_t>();
+    for (int s = 0; s < n_slots; ++s) out[s] = p[s];
     return out;
 }
 

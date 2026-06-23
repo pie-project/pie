@@ -259,11 +259,28 @@ Tensor paged_attention_decode(const Tensor& q,
     const int L = n_pages * page_size;           // gathered key length (trace-time)
 
     // Device-only page gather + flatten to [L, Hkv, d]. No host readback.
-    Tensor pages  = mx::astype(page_table, mx::int32);
-    Tensor k_pg   = mx::take(k_cache, pages, 0);   // [n_pages, page_size, Hkv, d]
-    Tensor v_pg   = mx::take(v_cache, pages, 0);
-    Tensor k_flat = mx::reshape(k_pg, {L, kv_heads, head_dim});
-    Tensor v_flat = mx::reshape(v_pg, {L, kv_heads, head_dim});
+    // EXPERIMENT (PIE_KV_SLICE=1): for the single-stream contiguous-decode case
+    // the page table is identity (0..n_pages-1), so a leading-axis prefix slice
+    // is a no-copy view of the cache — avoiding the mx::take gather copy that
+    // doubles KV read traffic per token. Probe for the lean-KV lever (the
+    // qwen3.6 126->174 gap). Falls back to the gather when unset / non-identity.
+    static const bool kv_slice = [] {
+        const char* e = std::getenv("PIE_KV_SLICE");
+        return e && e[0] && e[0] != '0';
+    }();
+    auto flatten = [&](const Tensor& cache) -> Tensor {
+        if (kv_slice) {
+            const auto& sh = cache.shape();  // [total_pages, page_size, Hkv, d]
+            Tensor pg = mx::slice(cache, {0, 0, 0, 0},
+                                  {n_pages, sh[1], sh[2], sh[3]});
+            return mx::reshape(pg, {L, kv_heads, head_dim});
+        }
+        Tensor pages = mx::astype(page_table, mx::int32);
+        Tensor pg    = mx::take(cache, pages, 0);  // [n_pages, page_size, Hkv, d]
+        return mx::reshape(pg, {L, kv_heads, head_dim});
+    };
+    Tensor k_flat = flatten(k_cache);
+    Tensor v_flat = flatten(v_cache);
 
     // Valid length n_kv = (n_pages-1)*page_size + last_page_len  (device scalar).
     Tensor lpl  = mx::astype(mx::reshape(last_page_len, {1}), mx::int32);
