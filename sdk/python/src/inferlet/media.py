@@ -25,6 +25,14 @@ class Image:
     def __init__(self, handle: _media.Image) -> None:
         self._handle = handle
 
+    def __enter__(self) -> Image:
+        """Return this wrapper while keeping the underlying resource alive."""
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        """Release the underlying image resource."""
+        return self._handle.__exit__(exc_type, exc_value, traceback)
+
     @classmethod
     def from_bytes(
         cls,
@@ -63,6 +71,14 @@ class Video:
     def __init__(self, handle: _media.Video) -> None:
         self._handle = handle
 
+    def __enter__(self) -> Video:
+        """Return this wrapper while keeping the underlying resource alive."""
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        """Release the underlying video resource."""
+        return self._handle.__exit__(exc_type, exc_value, traceback)
+
     @classmethod
     def from_bytes(
         cls,
@@ -93,6 +109,14 @@ class Audio:
 
     def __init__(self, handle: _media.Audio) -> None:
         self._handle = handle
+
+    def __enter__(self) -> Audio:
+        """Return this wrapper while keeping the underlying resource alive."""
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        """Release the underlying audio resource."""
+        return self._handle.__exit__(exc_type, exc_value, traceback)
 
     @classmethod
     def from_bytes(

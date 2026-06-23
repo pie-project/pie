@@ -40,7 +40,7 @@ class Speech:
 
     def to_wav(self) -> bytes:
         """Encode mono f32 PCM as canonical 16-bit PCM WAV."""
-        return write_wav(self.pcm(), self.sample_rate())
+        return write_wav(self._handle.pcm(), self.sample_rate())
 
 
 class SpeechBuilder:
