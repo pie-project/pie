@@ -293,8 +293,20 @@ int main(int argc, char** argv) {
             in.push_back(mx::array(page_idx.data(), {n_pages}, mx::int32));
             in.push_back(mx::array({lpl}, {1}, mx::int32));
             in.push_back(mx::array({pos}, {1}, mx::int32));  // write_idx = pos
-            for (auto& kb : kvp->snapshot()) in.push_back(kb);
+            // Donation-preserving: MOVE the KV buffers out of the cache so `in`
+            // holds the SOLE ref (refcount==1) at the compiled call → MLX donates
+            // the input buffer to the scattered output (in-place), instead of
+            // copying the whole paged buffer per token. Gated by PIE_KV_DONATE.
+            static const bool kv_donate = [] {
+                const char* e = std::getenv("PIE_KV_DONATE");
+                return e && e[0] && e[0] != '0';
+            }();
+            if (kv_donate)
+                for (auto& kb : kvp->snapshot_move()) in.push_back(std::move(kb));
+            else
+                for (auto& kb : kvp->snapshot()) in.push_back(kb);
             std::vector<mx::array> outs = compiled_step(in);
+            in.clear();  // drop input refs so donation can reclaim them
             std::vector<mx::array> newkv(outs.begin() + 1, outs.end());
             kvp->restore(newkv);
             mx::array next = mx::astype(mx::argmax(outs[0], 1), mx::uint32);
