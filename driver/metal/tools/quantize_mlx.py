@@ -5,8 +5,10 @@ Operates directly on raw safetensors tensors by name heuristic, so it works on
 custom/future architectures (qwen3_5, gemma4) that mlx_lm / llama.cpp can't
 parse. Produces an mlx-community-style checkpoint:
   - quantized linear `weight` -> uint32 packed, plus sibling `.scales`/`.biases`
-  - everything else (norms, biases, embeddings, conv1d, GDN linear-attn,
-    vision/audio/mtp) copied through DENSE
+  - everything else (norms, biases, embeddings, conv1d, vision/audio/mtp) copied
+    through DENSE
+  - with --quant-arch, also quantizes the big arch-specific tensors (qwen3.6 GDN
+    projections + gemma4 PLE table) for a genuinely BPW-matched fair bench
   - config.json gets a top-level `quantization` block {group_size, bits}
 
 Driver consumes via index-as-quant-map (src.has(name + ".scales")). mlx_lm's
@@ -24,6 +26,22 @@ QUANT_SUFFIXES = (
     "per_layer_input_gate.weight", "per_layer_projection.weight",
     "per_layer_model_projection.weight",
 )
+# Arch-specific big tensors quantized only under --quant-arch (for genuinely
+# BPW-matched fair benchmarking vs llama, which quantizes these too):
+#   - qwen3.6 GDN linear-attention projections: in_proj_qkv (226MB) + in_proj_z
+#     (75MB) + out_proj (75MB) = 377MB / 42% of the text core. These are plain
+#     matmuls in the metal graph (the *activations*, not these weights, feed
+#     beta's GDN kernel), so they bind as QuantLinear with zero new kernel work.
+#     The tiny sensitive gate/state projections (in_proj_a/b, A_log, dt_bias) and
+#     conv1d (which DOES feed the GDN kernel) stay dense.
+#   - gemma4 PLE table embed_tokens_per_layer (4.7GB / 80% of the file): a gather,
+#     dequant-gathered by the graph's apply_embedding (same path as the tied embed).
+ARCH_QUANT_SUFFIXES = (
+    "linear_attn.in_proj_qkv.weight",
+    "linear_attn.in_proj_z.weight",
+    "linear_attn.out_proj.weight",
+    "embed_tokens_per_layer.weight",
+)
 # Never quantize anything under these (unused towers + GDN custom-kernel path +
 # embeddings + conv).
 SKIP_SUBSTR = ("visual", "vision", "audio", "mtp.", "linear_attn", "conv1d")
@@ -34,14 +52,16 @@ def is_embed(name):
         "embed_tokens_per_layer.weight")
 
 
-def should_quant(name, arr, gs):
-    if any(s in name for s in SKIP_SUBSTR):
-        return False
+def should_quant(name, arr, gs, quant_arch=False):
     if arr.ndim != 2:
         return False
-    if not name.endswith(QUANT_SUFFIXES):
-        return False
     if arr.shape[-1] % gs != 0:
+        return False
+    if quant_arch and name.endswith(ARCH_QUANT_SUFFIXES):
+        return True
+    if any(s in name for s in SKIP_SUBSTR):
+        return False
+    if not name.endswith(QUANT_SUFFIXES):
         return False
     return True
 
@@ -62,6 +82,12 @@ def main():
                     "quant lm_head bundle. Requires --lm-head. Zero double-store, "
                     "true-4-bit parity with llama's tied q4_K. Keeps gemma4 PLE "
                     "(embed_tokens_per_layer) intact.")
+    ap.add_argument("--quant-arch", action="store_true",
+                    help="also quantize arch-specific big tensors for a genuinely "
+                    "BPW-matched fair bench vs llama: qwen3.6 GDN projections "
+                    "(linear_attn.in_proj_qkv/in_proj_z/out_proj) and the gemma4 "
+                    "PLE table (embed_tokens_per_layer). conv1d + tiny gate/state "
+                    "projections (in_proj_a/b, A_log, dt_bias) stay dense.")
     args = ap.parse_args()
     if args.drop_embed and not args.lm_head:
         sys.exit("--drop-embed requires --lm-head (the tied bundle to gather from)")
@@ -83,7 +109,7 @@ def main():
         if is_embed(name) and embed_name is None and name.endswith(
                 "embed_tokens.weight"):
             embed_name = name
-        if should_quant(name, arr, gs):
+        if should_quant(name, arr, gs, args.quant_arch):
             wq, scales, biases = mx.quantize(arr, group_size=gs, bits=bits)
             base = name[: -len(".weight")]
             out[name] = wq
