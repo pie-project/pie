@@ -127,6 +127,10 @@ void Executor::run_forward(const pie_driver::PieForwardRequestView& req,
     batch.lin_cache = lin_cache_;
     if (n_req > 0) batch.slot_ids = i32_view(stg_.slot_ids);
     batch.qo_indptr_host = stg_.qo_indptr;  // host CSR for the varlen path
+    // Host paged-KV CSR so paged_attention reads its loop bounds without a
+    // per-layer GPU->CPU readback (sync barriers + mx::compile blocker).
+    batch.kv_page_indptr_host    = stg_.kv_page_indptr;
+    batch.kv_last_page_lens_host = stg_.kv_last_page_lens;
 
     // ── forward + sample ──
     per_req_.assign(n_req > 0 ? n_req : 0, pie_driver::PerRequestOutput{});
