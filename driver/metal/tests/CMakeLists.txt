@@ -7,3 +7,7 @@ target_link_libraries(smoke_load PRIVATE pie_driver_metal_lib)
 
 add_executable(kv_perlayer_test kv_perlayer_test.cpp)
 target_link_libraries(kv_perlayer_test PRIVATE pie_driver_metal_lib)
+
+# Per-op decode-forward attribution profiler (delta) — perf measure-first tool.
+add_executable(op_profile op_profile.cpp)
+target_link_libraries(op_profile PRIVATE pie_driver_metal_lib)
