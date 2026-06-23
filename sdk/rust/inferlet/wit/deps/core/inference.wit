@@ -70,17 +70,6 @@ interface inference {
             adapter: borrow<adapter>,
         );
 
-        // Driver-owned multi-token pipelined decode window. When `n > 0` the
-        // next `execute` runs an `n`-step autoregressive loop *inside the
-        // driver* (token kept device-side, async_eval pipelined) and returns up
-        // to `n` tokens as `token` slots in one call, instead of one token per
-        // IPC round-trip. v1: single-request, stateless samplers only, no
-        // grammar/logit-mask; the runtime falls back to single-step otherwise.
-        // The caller trims the returned batch at its own stop/EOS.
-        decode-n: func(
-            n: u32,
-        );
-
         execute: func() -> result<future-output, error>;
     }
 

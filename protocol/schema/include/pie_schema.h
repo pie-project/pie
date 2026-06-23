@@ -172,7 +172,6 @@ struct PieForwardRequestDesc {
   size_t audio_anchor_rows_len;
   const uint32_t *audio_indptr_ptr;
   size_t audio_indptr_len;
-  uint32_t max_new_tokens;
 };
 
 struct PieCopyRequestDesc {

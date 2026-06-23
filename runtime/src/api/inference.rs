@@ -703,17 +703,6 @@ impl pie::core::inference::HostForwardPass for InstanceState {
         Ok(())
     }
 
-    async fn decode_n(&mut self, this: Resource<ForwardPass>, n: u32) -> Result<()> {
-        // Request a driver-owned multi-token decode window. `0` (default) keeps
-        // legacy single-step semantics; `> 0` routes the next `execute` to
-        // PIE_METHOD_DECODE_N (in-band via the appended `max_new_tokens` field)
-        // and pins KV for the window. The runtime still falls back to single
-        // step if the pass is ineligible (batched / grammar / penalised sampler).
-        let pass = self.ctx().table.get_mut(&this)?;
-        pass.req.max_new_tokens = n;
-        Ok(())
-    }
-
     async fn attention_mask(
         &mut self,
         this: Resource<ForwardPass>,
@@ -800,14 +789,6 @@ impl pie::core::inference::HostForwardPass for InstanceState {
         // the response tells us how many drafts were accepted.
         let num_input_tokens = req.token_ids.len();
         let num_spec_tokens = req.spec_token_ids.len();
-        // DECODE_N window: the driver writes `max_new_tokens` KV entries across
-        // positions [pos0 .. pos0+N-1]. The first (pos0) is already counted by
-        // `num_input_tokens`, so we must reserve `N-1` *extra* writable KV slots
-        // up front. `0` (legacy single-step) reserves nothing. context::pin
-        // returns the full page list from logical page 0, so pinning the extra
-        // working tokens is sufficient — the driver derives each step's physical
-        // write slot internally (no per-step page push).
-        let decode_window_extra = (req.max_new_tokens as usize).saturating_sub(1);
         let fill_tokens = req.token_ids.clone();
         let fill_positions = req.position_ids.clone();
         let fill_masks = if has_user_mask {
@@ -878,9 +859,7 @@ impl pie::core::inference::HostForwardPass for InstanceState {
 
             // Cold path: pin, validate page capacity, submit.
             let pin_start = profiling.then(Instant::now);
-            let writable_tokens = num_input_tokens
-                .saturating_add(num_spec_tokens)
-                .saturating_add(decode_window_extra);
+            let writable_tokens = num_input_tokens.saturating_add(num_spec_tokens);
             let pinned = match context::pin(model_id, context_id, writable_tokens as u32).await {
                 Ok(p) => p,
                 Err(e) => {
