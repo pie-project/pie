@@ -340,6 +340,8 @@ mod tests {
             toml::Value::Integer(42) => {}
             v => panic!("expected int, got {v:?}"),
         }
+        // `3.14` is a deliberate toml float fixture, not an approximation of PI.
+        #[allow(clippy::approx_constant)]
         match parse_value("3.14") {
             toml::Value::Float(f) if (f - 3.14).abs() < 1e-9 => {}
             v => panic!("expected float, got {v:?}"),
