@@ -168,13 +168,16 @@ void bind_decode_dag(RawMetalContext& ctx, const BoundDecode& b,
                 const auto& kv = b.kv[L];
                 bind_slot(ctx, ord, (uint8_t)bind::Sdpa::K, kv.k_pages);
                 bind_slot(ctx, ord, (uint8_t)bind::Sdpa::V, kv.v_pages);
-                bind_slot(ctx, ord, (uint8_t)bind::Sdpa::SeqLenPtr, io(IoSlot::SeqLen));
+                bind_slot(ctx, ord, (uint8_t)bind::Sdpa::N, io(IoSlot::SeqLen));
                 break;
             }
 
             case Kernel::Rope:
             case Kernel::RopeK:
-                bind_slot(ctx, ord, (uint8_t)bind::Rope::PositionPtr, io(IoSlot::Position));
+                // rope.metal is in-place on buffer 0 (X); position is the IO scalar at
+                // buffer 1. scale/base/head_dim are consts (decode_consts). The activation
+                // (buffer 0 X) is bound by beta's scratch schedule (in-place).
+                bind_slot(ctx, ord, (uint8_t)bind::Rope::Position, io(IoSlot::Position));
                 break;
 
             case Kernel::QmvLmHead:
