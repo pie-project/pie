@@ -9,6 +9,12 @@
 //     impact on the byte-identical-CB / encode-overlap invariant (decode_abi I1).
 //   * bfloat is native on Metal 4 (macOS 26) -> MLX's bf16.h emulation is dropped.
 //   * Output is RMSNorm(x) * w, matching MLX semantics (weight always applied here).
+//   * qwen3.5/qwen36 uses the Gemma `(1 + weight)` convention for EVERY RMSNorm
+//     (attn_norm, q_norm, k_norm, ffn_norm, final_norm — all plus_one=true; see
+//     model/qwen36.cpp + ops/norm.cpp). MLX folds the +1 by materializing
+//     `mx::add(weight, 1.0f)` (float) before fast::rms_norm, so the effective gain
+//     is float (1.0f + weight); we apply it in float here when p.plus_one != 0.
+//     The gated-RMSNorm (gated_rms.metal) does NOT use +1 (raw gate_norm weight).
 
 #include <metal_stdlib>
 using namespace metal;
@@ -17,6 +23,7 @@ struct RmsParams {
   float eps;
   uint axis_size;   // feature dim (hidden), e.g. 1024
   uint w_stride;    // weight stride along axis (1 for contiguous)
+  uint plus_one;    // 1 => effective gain is (1.0f + weight) [Gemma/qwen3.5]
 };
 
 template <typename T, int N_READS>
@@ -72,12 +79,14 @@ template <typename T, int N_READS>
   out += gid * size_t(axis_size) + lid * N_READS;
   if (lid * N_READS + N_READS <= axis_size) {
     for (int i = 0; i < N_READS; i++) {
-      out[i] = w[w_stride * i] * static_cast<T>(x[i] * local_inv_mean[0]);
+      T wv = p.plus_one ? T(1.0f + float(w[w_stride * i])) : w[w_stride * i];
+      out[i] = wv * static_cast<T>(x[i] * local_inv_mean[0]);
     }
   } else {
     for (int i = 0; i < N_READS; i++) {
       if ((lid * N_READS + i) < axis_size) {
-        out[i] = w[w_stride * i] * static_cast<T>(x[i] * local_inv_mean[0]);
+        T wv = p.plus_one ? T(1.0f + float(w[w_stride * i])) : w[w_stride * i];
+        out[i] = wv * static_cast<T>(x[i] * local_inv_mean[0]);
       }
     }
   }

@@ -79,4 +79,30 @@ inline void attn_gate_dispatch(int n_q, int head_dim, Grid& g, Threadgroup& tg) 
     tg = Threadgroup{256, 1, 1};
 }
 
+// residual_add (AttnResid / LayerOut): Out = X + Residual, elementwise over hidden.
+inline void residual_dispatch(int hidden, Grid& g, Threadgroup& tg) {
+    g  = Grid{uint32_t(hidden), 1, 1};
+    tg = Threadgroup{256, 1, 1};
+}
+
+// silu_mul (Swiglu): Out = silu(gate)*up, elementwise over the MLP intermediate.
+inline void silu_mul_dispatch(int intermediate, Grid& g, Threadgroup& tg) {
+    g  = Grid{uint32_t(intermediate), 1, 1};
+    tg = Threadgroup{256, 1, 1};
+}
+
+// gated_rms (GatedRms -> golden gdn_core): one threadgroup per value-head, V_d lanes
+// cooperatively reduce. grid=(V_d, V_h, 1), tg=(V_d, 1, 1). head=tgpos.y, lane=lid.
+inline void gated_rms_dispatch(int v_heads, int v_dim, Grid& g, Threadgroup& tg) {
+    g  = Grid{uint32_t(v_dim), uint32_t(v_heads), 1};
+    tg = Threadgroup{uint32_t(v_dim), 1, 1};
+}
+
+// dense_gemv (GdnInA / GdnInB): one thread per output row. grid=(N,1,1) tg=(N,1,1).
+// N=V_h=16 (tiny); K=hidden is a bound constant. M=1 single token.
+inline void dense_gemv_dispatch(int N, Grid& g, Threadgroup& tg) {
+    g  = Grid{uint32_t(N), 1, 1};
+    tg = Threadgroup{uint32_t(N), 1, 1};
+}
+
 }  // namespace pie_metal_driver::raw_metal
