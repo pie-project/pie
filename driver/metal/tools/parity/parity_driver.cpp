@@ -103,6 +103,12 @@ int main(int argc, char** argv) {
         /*pure_decode=*/false,
     };
 
+    // Hybrid linear-attention seam (qwen3.6): single-request prefill → slot 0,
+    // varlen path (qo_indptr_host={0,n}). Null/empty for non-hybrid archs.
+    batch.lin_cache = model.lin_cache.get();
+    batch.slot_ids  = mx::array({0}, {1}, mx::int32);
+    batch.qo_indptr_host = {0, n};
+
     mx::array logits = model.graph->forward(batch, *model.kv);  // [1, vocab]
     mx::array row = mx::astype(mx::reshape(logits, {c.vocab_size}), mx::float32);
     mx::eval(row);
@@ -126,6 +132,11 @@ int main(int argc, char** argv) {
     // sampler) greedy-samples the same token as the raw-graph argmax.
     {
         Executor exec(*model.graph, *model.kv);
+        exec.set_linear_state_cache(model.lin_cache.get());  // qwen3.6 hybrid
+        // The raw-graph forward above already wrote recurrent/conv state into
+        // lin_cache slot 0; reset it so this independent re-run starts clean
+        // (delta's recycle contract).
+        if (model.lin_cache) model.lin_cache->reset_slot(0);
         service::InProcService service(
             static_cast<std::uint32_t>(c.vocab_size));
         service.set_executor(&exec);
