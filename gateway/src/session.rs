@@ -215,8 +215,11 @@ struct TurnState {
     /// The §7 routing mode for this turn (`None` = p2c, `Some(key)` = HRW),
     /// retained so a re-dispatch (redirect / worker-drop) keeps the same policy.
     affinity: Option<u64>,
-    /// Whether any token has reached the consumer (the §10 re-dispatch-vs-fail
-    /// discriminator).
+    /// Set once the first chunk is delivered to the consumer (in
+    /// [`Sessions::feed`], after the send succeeds — never for a bare `Eos`). The
+    /// §10 re-dispatch-vs-fail discriminator: unset ⇒ a worker drop can
+    /// re-dispatch this turn (no output seen yet); set ⇒ it must fail clean, since
+    /// a fresh dispatch would re-emit tokens the user already received.
     emitted: bool,
     /// Producer end of the turn's bounded pipe.
     sink: mpsc::Sender<Tokens>,
