@@ -60,22 +60,37 @@ cpmaddpackage(URI "gh:nlohmann/json@3.12.0" OPTIONS "JSON_BuildTests OFF")
 # executor, kernels, model, and loader trees — so peers add translation
 # units WITHOUT editing this file. CONFIGURE_DEPENDS re-globs on rebuild.
 # -----------------------------------------------------------------------------
+# Explicit (alpha-owned): entry, driver startup, the stub in-proc service.
+# These compile WITHOUT MLX so the foundation seam stays fast to build and the
+# default `driver-portable` worker isn't forced to fetch/link MLX.
 set(PIE_METAL_EXPLICIT_SOURCES
   src/entry.cpp
   src/driver_startup.cpp
   src/service/inproc_service.cpp)
 
-file(GLOB_RECURSE PIE_METAL_GLOB_SOURCES CONFIGURE_DEPENDS
-  ${CMAKE_CURRENT_SOURCE_DIR}/src/ops/*.cpp
-  ${CMAKE_CURRENT_SOURCE_DIR}/src/ops/*.mm
-  ${CMAKE_CURRENT_SOURCE_DIR}/src/executor/*.cpp
-  ${CMAKE_CURRENT_SOURCE_DIR}/src/executor/*.mm
-  ${CMAKE_CURRENT_SOURCE_DIR}/src/kernels/*.cpp
-  ${CMAKE_CURRENT_SOURCE_DIR}/src/kernels/*.mm
-  ${CMAKE_CURRENT_SOURCE_DIR}/src/model/*.cpp
-  ${CMAKE_CURRENT_SOURCE_DIR}/src/model/*.mm
-  ${CMAKE_CURRENT_SOURCE_DIR}/src/loader/*.cpp
-  ${CMAKE_CURRENT_SOURCE_DIR}/src/loader/*.mm)
+# GLOBbed (beta/charlie/delta-owned): every .cpp/.mm under the compute,
+# executor, kernels, model, and loader trees — so peers add translation
+# units WITHOUT editing this file. CONFIGURE_DEPENDS re-globs on rebuild.
+#
+# These TUs all `#include` MLX (via ops/tensor.hpp), so they are ONLY compiled
+# when PIE_METAL_WITH_MLX is ON. With MLX OFF the library is just the stub
+# skeleton (entry + startup + stub service) — Health + dummy Forward — which
+# compiles/links without MLX present. The InProcService/entry executor wiring
+# is `#if defined(PIE_METAL_HAS_MLX)`-gated to match.
+set(PIE_METAL_GLOB_SOURCES)
+if(PIE_METAL_WITH_MLX)
+  file(GLOB_RECURSE PIE_METAL_GLOB_SOURCES CONFIGURE_DEPENDS
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/ops/*.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/ops/*.mm
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/executor/*.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/executor/*.mm
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/kernels/*.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/kernels/*.mm
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/model/*.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/model/*.mm
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/loader/*.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/loader/*.mm)
+endif()
 
 add_library(pie_driver_metal_lib STATIC
   ${PIE_METAL_EXPLICIT_SOURCES}
