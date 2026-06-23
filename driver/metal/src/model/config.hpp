@@ -111,6 +111,16 @@ struct ModelConfig {
     // "sliding_attention". Empty = uniform full attention.
     std::vector<std::string> layer_attn_types;
 
+    // ── Weight quantization (mlx-community affine quant) ──
+    // 0 bits = unquantized (dense BF16). When >0, the loader (delta) exposes a
+    // packed `weight` (uint32) plus sibling `.scales`/`.biases` per quantized
+    // linear; the graph dispatches those to ops::quantized_linear. Detection is
+    // per-tensor (presence of `.scales`), so these are defaults/metadata only.
+    // Populated by hf_config.cpp from `quantization_config`; defaults match
+    // mlx-community (4-bit, group_size 64).
+    std::int32_t quant_bits       = 0;    // 0 = checkpoint is not quantized
+    std::int32_t quant_group_size = 64;
+
     // Convenience: KV embedding width (kv_heads * head_dim).
     std::int32_t n_embd_gqa() const { return num_key_value_heads * head_dim; }
 };

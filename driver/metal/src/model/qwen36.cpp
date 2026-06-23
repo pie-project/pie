@@ -75,15 +75,15 @@ Tensor Qwen36Graph::full_attn_layer(std::int32_t il, Tensor hidden,
     Tensor cur = ops::rms_norm(hidden, *L.attn_norm, eps, /*plus_one=*/true);
 
     // q_proj is 2x wide: per head the layout is [query(d) | gate(d)].
-    Tensor qg = ops::linear(L.q_proj, cur);                // [N, n_q*2*d]
+    Tensor qg = apply_linear(L.q_proj, cur);                // [N, n_q*2*d]
     qg = mx::reshape(qg, {N, n_q, 2, d});
     Tensor Q    = mx::reshape(mx::slice(qg, {0, 0, 0, 0}, {N, n_q, 1, d}),
                               {N, n_q, d});
     Tensor gate = mx::reshape(mx::slice(qg, {0, 0, 1, 0}, {N, n_q, 2, d}),
                               {N, n_q, d});
 
-    Tensor K = to_heads(ops::linear(L.k_proj, cur), N, n_kv, d);
-    Tensor V = to_heads(ops::linear(L.v_proj, cur), N, n_kv, d);
+    Tensor K = to_heads(apply_linear(L.k_proj, cur), N, n_kv, d);
+    Tensor V = to_heads(apply_linear(L.v_proj, cur), N, n_kv, d);
 
     // Gemma-style (1+w) per-head Q/K RMSNorm, then partial RoPE.
     Q = ops::rms_norm(Q, *L.q_norm, eps, /*plus_one=*/true);
@@ -117,7 +117,7 @@ Tensor Qwen36Graph::full_attn_layer(std::int32_t il, Tensor hidden,
     Tensor gate_flat = from_heads(gate, N, n_q * d);
     attn = ops::mul(attn, mx::sigmoid(gate_flat));
 
-    Tensor attn_out = ops::linear(L.o_proj, attn);
+    Tensor attn_out = apply_linear(L.o_proj, attn);
     return ops::residual_add(attn_out, residual);
 }
 
@@ -178,9 +178,9 @@ Tensor Qwen36Graph::mlp_block(std::int32_t il, Tensor hidden) {
 
     Tensor residual = hidden;
     Tensor normed = ops::rms_norm(hidden, *L.ffn_norm, eps, /*plus_one=*/true);
-    Tensor gate = ops::linear(*L.gate_proj, normed);
-    Tensor up   = ops::linear(*L.up_proj,   normed);
-    Tensor ffn  = ops::linear(*L.down_proj, ops::swiglu(gate, up));
+    Tensor gate = apply_linear(*L.gate_proj, normed);
+    Tensor up   = apply_linear(*L.up_proj,   normed);
+    Tensor ffn  = apply_linear(*L.down_proj, ops::swiglu(gate, up));
     return ops::residual_add(ffn, residual);
 }
 
@@ -207,8 +207,9 @@ Tensor Qwen36Graph::forward(const ForwardBatch& batch, KvCacheView& kv) {
     maybe_dump_hidden(-1, hidden);  // post-final-norm (pre-LM-head)
     Tensor sampled = ops::gather_rows(hidden, batch.logit_rows);
 
-    const Tensor& lm_head = cfg_.tie_word_embeddings ? w_.embed : *w_.lm_head;
-    return ops::linear(lm_head, sampled);  // [n_slots, vocab]
+    return w_.lm_head
+        ? apply_linear(*w_.lm_head, sampled)   // [n_slots, vocab]
+        : ops::linear(w_.embed, sampled);      // tied, dense embed
 }
 
 // ── Weight binding (Qwen3.6 hybrid) ──
@@ -224,10 +225,9 @@ ModelWeights bind_qwen36(const WeightSource& src, const ModelConfig& cfg) {
 
     w.embed      = src.get(root + "embed_tokens.weight");
     w.final_norm = src.get(root + "norm.weight");
-    if (!cfg.tie_word_embeddings) {
-        w.lm_head = src.try_get("lm_head.weight");
-        if (!w.lm_head) w.lm_head = w.embed;
-    }
+    // Prefer an explicit lm_head bundle when present (incl. a synthesized
+    // quantized lm_head over a tied embed); absent -> dense embed GEMV.
+    w.lm_head = try_bind_linear(src, "lm_head", cfg);
 
     // conv1d weight is stored [conv_dim, 1, conv_K]; flatten to [conv_dim, K]
     // for beta's gated_delta_net (which expects [conv_dim, conv_K]).
@@ -262,18 +262,18 @@ ModelWeights bind_qwen36(const WeightSource& src, const ModelConfig& cfg) {
         } else {
             // Full-attention layer (Qwen3 + output gate; 2x-wide q_proj).
             const std::string sa = p + "self_attn.";
-            L.q_proj = src.get(sa + "q_proj.weight");
-            L.k_proj = src.get(sa + "k_proj.weight");
-            L.v_proj = src.get(sa + "v_proj.weight");
-            L.o_proj = src.get(sa + "o_proj.weight");
+            L.q_proj = bind_linear(src, sa + "q_proj", cfg);
+            L.k_proj = bind_linear(src, sa + "k_proj", cfg);
+            L.v_proj = bind_linear(src, sa + "v_proj", cfg);
+            L.o_proj = bind_linear(src, sa + "o_proj", cfg);
             L.q_norm = src.get(sa + "q_norm.weight");
             L.k_norm = src.get(sa + "k_norm.weight");
         }
 
         // Dense SwiGLU MLP (both layer kinds; MoE deferred — not on the 0.8B).
-        L.gate_proj = src.get(p + "mlp.gate_proj.weight");
-        L.up_proj   = src.get(p + "mlp.up_proj.weight");
-        L.down_proj = src.get(p + "mlp.down_proj.weight");
+        L.gate_proj = bind_linear(src, p + "mlp.gate_proj", cfg);
+        L.up_proj   = bind_linear(src, p + "mlp.up_proj", cfg);
+        L.down_proj = bind_linear(src, p + "mlp.down_proj", cfg);
     }
     return w;
 }
