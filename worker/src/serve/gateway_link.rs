@@ -42,7 +42,7 @@ use pie_schema::gateway::{
 use pie_schema::message::{ClientMessage, ServerMessage};
 use tarpc::serde_transport::{tcp, unix};
 use tarpc::server::{BaseChannel, Channel};
-use tarpc::tokio_serde::formats::Bincode;
+use tarpc::tokio_serde::formats::Json;
 use tokio::sync::{Mutex, Notify, mpsc};
 
 /// Max frame on the gateway link's read side. A `dispatch` carries one
@@ -84,7 +84,7 @@ pub async fn connect_gateway(addr: &str, worker_id: WorkerId) -> Result<GatewayL
         .strip_prefix("unix://")
         .or_else(|| addr.strip_prefix("unix:"))
     {
-        let mut conn = unix::connect(path, Bincode::default);
+        let mut conn = unix::connect(path, Json::default);
         conn.config_mut().max_frame_length(LINK_MAX_FRAME_BYTES);
         let transport = conn
             .await
@@ -92,7 +92,7 @@ pub async fn connect_gateway(addr: &str, worker_id: WorkerId) -> Result<GatewayL
         connect_gateway_link(transport)
     } else {
         let tcp_addr = addr.strip_prefix("tcp://").unwrap_or(addr);
-        let mut conn = tcp::connect(tcp_addr, Bincode::default);
+        let mut conn = tcp::connect(tcp_addr, Json::default);
         conn.config_mut().max_frame_length(LINK_MAX_FRAME_BYTES);
         let transport = conn
             .await
