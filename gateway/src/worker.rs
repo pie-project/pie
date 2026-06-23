@@ -29,7 +29,7 @@ use pie_schema::control::{WorkerId, WorkerStatus};
 use pie_schema::gateway::{Accepted, Control, ReqId, Request, Tokens};
 use tarpc::serde_transport::tcp;
 use tarpc::server::{BaseChannel, Channel};
-use tarpc::tokio_serde::formats::Bincode;
+use tarpc::tokio_serde::formats::Json;
 use tokio::net::ToSocketAddrs;
 use tokio::sync::watch;
 
@@ -209,7 +209,13 @@ pub async fn serve(
     sessions: Sessions,
     registry: WorkerRegistry,
 ) -> Result<WorkerServer> {
-    let mut incoming = tcp::listen(bind, Bincode::default)
+    // Self-describing codec (JSON), NOT bincode: the data plane carries
+    // `Request{ message: ClientMessage }` / `Tokens::Chunk(ServerMessage)`, whose
+    // vocab enums are `#[serde(tag = "type")]` (internally tagged, for the
+    // self-describing client wire) — bincode cannot decode them
+    // (`deserialize_any` is unsupported). The worker's dial-in side must match.
+    // (MessagePack is the tracked hot-path perf graduation, task #21.)
+    let mut incoming = tcp::listen(bind, Json::default)
         .await
         .context("bind worker-facing listener")?;
     incoming

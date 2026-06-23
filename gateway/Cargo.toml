@@ -32,6 +32,7 @@ async-trait = "0.1"
 tarpc = { version = "0.35", features = [
     "serde-transport",
     "serde-transport-bincode",
+    "serde-transport-json",
     "tcp",
     "unix",
     "tokio1",
