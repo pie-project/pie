@@ -19,6 +19,7 @@
 #include <chrono>
 #include <cstdio>
 #include <string>
+#include <tuple>
 #include <vector>
 
 #include <mlx/mlx.h>
@@ -164,30 +165,58 @@ int main() {
         add("swiglu       [1,3584]", N_LAYERS, per);
     }
 
-    // ---- PAGING: paged_attention_decode vs contiguous sdpa (the tax) ----
-    const int n_pages = (CTX + PAGE - 1) / PAGE;
-    auto make_pages = [&]() {
-        return randf({n_pages + 2, PAGE, NKV, HD});  // physical page buffer
-    };
-    Tensor k_cache = make_pages(), v_cache = make_pages();
-    Tensor page_table = mx::arange(0, n_pages, mx::int32);
-    Tensor last_page_len = mx::array({CTX - (n_pages - 1) * PAGE}, {1}, mx::int32);
+    // ---- ATTENTION: GATHER vs COMPUTE, with O(seqlen) context scaling ----
+    // ingim's gate: isolate the mx::take paged-KV GATHER from the sdpa COMPUTE.
+    // Real production path (qwen36.cpp -> ops::paged_attention; attention.cpp:
+    //   gather pages via mx::take -> reshape -> slice -> sdpa_contiguous).
+    // mlx-lm peer = contiguous ops::sdpa (NO gather, NO page indexing).
+    // gather is O(seqlen) memory; sdpa compute is also O(seqlen) -> sweep ctx.
+    std::vector<std::tuple<int, double, double, double>> attn_scaling;  // ctx,gather,paged,sdpa
     ops::AttnParams ap; ap.scale = 0.0f; ap.n_heads = NQ; ap.n_kv_heads = NKV; ap.head_dim = HD;
+    for (int ctx : {256, 1024, 4096}) {
+        const int n_pages = (ctx + PAGE - 1) / PAGE;
+        const int last = ctx - (n_pages - 1) * PAGE;
+        Tensor k_cache = randf({n_pages + 4, PAGE, NKV, HD});  // physical page pool
+        Tensor v_cache = randf({n_pages + 4, PAGE, NKV, HD});
+        Tensor page_table = mx::arange(0, n_pages, mx::int32);
+        Tensor qo_indptr      = mx::array({0, 1}, {2}, mx::int32);
+        Tensor kv_page_indptr = mx::array({0, n_pages}, {2}, mx::int32);
+        Tensor last_lens      = mx::array({last}, {1}, mx::int32);
 
-    double per_paged = time_op(K, IT, [&](int i) {
-        Tensor q = randf({1, NQ, HD});
-        return ops::paged_attention_decode(q, k_cache, v_cache, page_table,
-                                           last_page_len, PAGE, ap);
-    });
-    add("PAGED attn_decode [full]", N_FULL, per_paged);
+        // (a) GATHER ONLY — exact ops the paged path runs before sdpa
+        //     (attention.cpp:210-217): take k+v pages -> reshape -> slice to ctx.
+        double per_gather = time_op(K, IT, [&](int i) {
+            Tensor pages = mx::astype(mx::slice(page_table, {0}, {n_pages}), mx::int32);
+            Tensor k_pg = mx::take(k_cache, pages, 0);
+            Tensor v_pg = mx::take(v_cache, pages, 0);
+            Tensor k_flat = mx::reshape(k_pg, {n_pages * PAGE, NKV, HD});
+            Tensor v_flat = mx::reshape(v_pg, {n_pages * PAGE, NKV, HD});
+            Tensor k_r = mx::slice(k_flat, {0, 0, 0}, {ctx, NKV, HD});
+            Tensor v_r = mx::slice(v_flat, {0, 0, 0}, {ctx, NKV, HD});
+            return mx::add(k_r, v_r);  // force both gathers to materialize
+        });
 
-    // contiguous SDPA baseline = what mlx-lm pays (no gather, no per-key mask).
-    Tensor kc = randf({CTX, NKV, HD}), vc = randf({CTX, NKV, HD});
-    double per_sdpa = time_op(K, IT, [&](int i) {
-        Tensor q = randf({1, NQ, HD});
-        return ops::sdpa(q, kc, vc, ap);
-    });
-    add("contig sdpa (mlx-lm peer) [full]", N_FULL, per_sdpa);
+        // (b) FULL paged path (real production: gather + per-key mask + sdpa)
+        double per_paged = time_op(K, IT, [&](int i) {
+            Tensor q = randf({1, NQ, HD});
+            return ops::paged_attention(q, k_cache, v_cache, page_table,
+                                        qo_indptr, kv_page_indptr, last_lens, PAGE, ap);
+        });
+
+        // (c) contiguous sdpa = mlx-lm peer (no gather, no page indexing)
+        Tensor kc = randf({ctx, NKV, HD}), vc = randf({ctx, NKV, HD});
+        double per_sdpa = time_op(K, IT, [&](int i) {
+            Tensor q = randf({1, NQ, HD});
+            return ops::sdpa(q, kc, vc, ap);
+        });
+
+        attn_scaling.push_back({ctx, per_gather, per_paged, per_sdpa});
+        if (ctx == CTX) {
+            add("PAGED attn (gather+sdpa) [full]", N_FULL, per_paged);
+            add("  of which GATHER (mx::take)", N_FULL, per_gather);
+            add("contig sdpa (mlx-lm peer) [full]", N_FULL, per_sdpa);
+        }
+    }
 
     // ---- GDN decode step (x18) ----
     {
@@ -236,5 +265,19 @@ int main() {
     std::printf("%-38s %6s %10s %12.4f\n", "SUM (per-op isolated)", "", "", grand);
     std::printf("\nNote: isolated per-op sums exclude kernel-launch interleave &\n"
                 "      include a per-batch floor share; treat as relative attribution.\n");
+
+    // ---- GATHER-vs-COMPUTE attention scaling (ingim's paged-direct gate) ----
+    std::printf("\nAttention gather-vs-compute scaling (per full-attn layer, N=1 query token):\n");
+    std::printf("%8s %14s %14s %14s %14s\n", "ctx", "GATHER ms", "sdpa ms", "paged ms",
+                "gather/paged");
+    std::printf("%s\n", std::string(68, '-').c_str());
+    for (auto& [ctx, g, paged, sdpa] : attn_scaling) {
+        std::printf("%8d %14.4f %14.4f %14.4f %13.0f%%\n", ctx, g, sdpa, paged,
+                    paged > 0 ? 100.0 * g / paged : 0.0);
+    }
+    std::printf("%s\n", std::string(68, '-').c_str());
+    std::printf("GATHER = mx::take paged-KV (the candidate paged-direct kernel removes this).\n"
+                "sdpa   = MLX fast::sdpa compute (paged-direct still pays this).\n"
+                "x6 full-attn layers/token; 18 GDN layers have NO paged gather.\n");
     return 0;
 }
