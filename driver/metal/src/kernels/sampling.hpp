@@ -51,11 +51,11 @@ std::vector<std::uint32_t> sample_tokens(
     std::uint64_t base_seed);
 
 // Same sampling graph as `sample_tokens`, but returns the token ids as a lazy
-// device array [n_slots] (uint32) WITHOUT a host readback. The driver-owned
-// pipelined decode loop (DECODE_N) feeds this token straight into the next
-// step's embedding so the autoregressive feedback never leaves the GPU, which
-// is what lets `mx::async_eval` hide the per-token dispatch bubble. Callers
-// that need host ids should use `sample_tokens` (which drains this).
+// device array [n_slots] (uint32) WITHOUT a host readback — the device-token
+// primitive that lets a sampled token be fed straight back into the next
+// step's embedding on-device (so `mx::async_eval` can hide the per-token
+// dispatch bubble). Callers that need host ids should use `sample_tokens`
+// (which drains this).
 Tensor sample_token_device(
     const Tensor& logits,
     const std::vector<SamplerParams>& params,
