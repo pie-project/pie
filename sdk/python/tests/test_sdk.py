@@ -318,6 +318,7 @@ class TestGenerator:
 
     def test_generator_can_disable_step_rebids(self):
         import asyncio
+        import pytest
         from inferlet import Context, Model, Sampler
 
         ctx = Context(Model.load("test-model"))
@@ -325,6 +326,7 @@ class TestGenerator:
         g = ctx.generate(Sampler.argmax(), auto_flush=False, rebid_each_step=False)
 
         assert len(ctx._handle.bids) == 1
+        assert ctx._handle.bids[-1] == pytest.approx(self._expected_bid(4096.0, 1.0))
         asyncio.run(g.__anext__())
         assert len(ctx._handle.bids) == 1
 

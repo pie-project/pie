@@ -319,7 +319,7 @@ export class Generator implements AsyncIterable<GenStep> {
     const balance = _scheduling.balance(this._ctx._model._handle);
     const dividend = _scheduling.dividend(this._ctx._model._handle);
     const pages = Math.max(1, this._ctx._committedPages + this._ctx._workingPages);
-    const [mu, cv2] = this._bidShape();
+    const [mu, cv2] = this._initialBidShape();
     this._ctx.setBid(_computeBid(balance, pages, mu, cv2, this._ctx._pageSize, dividend));
   }
 
@@ -343,6 +343,17 @@ export class Generator implements AsyncIterable<GenStep> {
       return [Math.max(this._maxTokens - this._tokensGenerated, 1), 1.0];
     }
     return [Math.max(this._tokensGenerated, 64), 1.0];
+  }
+
+  /** @internal */
+  _initialBidShape(): [number, number] {
+    if (this._horizon !== undefined) {
+      return [Math.max(this._horizon, 1), 0.0];
+    }
+    if (this._maxTokens !== undefined) {
+      return [Math.max(this._maxTokens, 1), 1.0];
+    }
+    return [4096.0, 1.0];
   }
 
   /** @internal */

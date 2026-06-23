@@ -320,7 +320,7 @@ class Generator:
         balance = _sched.balance(self._ctx._model)
         dividend = _sched.dividend(self._ctx._model)
         pages = max(1.0, float(self._ctx._committed_pages + self._ctx._working_pages))
-        mu, cv2 = self._bid_shape()
+        mu, cv2 = self._initial_bid_shape()
         self._ctx.set_bid(
             _compute_bid(
                 balance,
@@ -347,6 +347,13 @@ class Generator:
         if self._max_tokens is not None:
             return float(max(self._max_tokens - self._tokens_generated, 1)), 1.0
         return float(max(self._tokens_generated, 64)), 1.0
+
+    def _initial_bid_shape(self) -> tuple[float, float]:
+        if self._horizon is not None:
+            return float(max(self._horizon, 1)), 0.0
+        if self._max_tokens is not None:
+            return float(max(self._max_tokens, 1)), 1.0
+        return 4096.0, 1.0
 
     def _refresh_static_bid(self) -> None:
         if not self._rebid_each_step:
