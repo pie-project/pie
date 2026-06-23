@@ -70,6 +70,16 @@ struct LayerWeights {
     std::optional<Tensor> moe_gate_exps;
     std::optional<Tensor> moe_up_exps;
     std::optional<Tensor> moe_down_exps;
+
+    // ── gemma4 Per-Layer-Embedding (PLE) triple. Empty on non-gemma4. ──
+    // ple_input_gate : [ple_dim, hidden]  (projects residual -> ple gate)
+    // ple_projection : [hidden, ple_dim]  (projects gated signal back)
+    // ple_norm       : [hidden]           (post-projection RMSNorm)
+    std::optional<Tensor> ple_input_gate;
+    std::optional<Tensor> ple_projection;
+    std::optional<Tensor> ple_norm;
+    // Per-layer learnable output scalar (1-element). Empty = 1.0.
+    std::optional<Tensor> layer_scalar;
 };
 
 struct ModelWeights {
@@ -80,6 +90,14 @@ struct ModelWeights {
     // LLaMA-3.1 NTK-by-parts per-dim RoPE scaling, synthesized at load time.
     // Empty for plain theta-only RoPE (qwen2/qwen3/llama3.0/gemma).
     std::optional<Tensor> freq_factors;
+
+    // ── gemma4 Per-Layer-Embedding model-level tensors. Empty otherwise. ──
+    // embed_per_layer : [vocab, n_layers * ple_dim]  (per-layer token table)
+    // ple_model_proj  : [n_layers * ple_dim, hidden] (projects main embed)
+    // ple_model_norm  : [ple_dim]                     (RMSNorm over ple_dim)
+    std::optional<Tensor> embed_per_layer;
+    std::optional<Tensor> ple_model_proj;
+    std::optional<Tensor> ple_model_norm;
 
     std::vector<LayerWeights> layers;
 };
@@ -109,5 +127,12 @@ ModelWeights bind_llama_like(const WeightSource& src, const ModelConfig& cfg);
 // Bind the Gemma2/3 schema (the four-norm sandwich + optional qk-norm).
 // Implemented in gemma.cpp.
 ModelWeights bind_gemma(const WeightSource& src, const ModelConfig& cfg);
+
+// Bind the Gemma-4 schema (dense E2B/E4B): the four-norm sandwich + q/k-norm,
+// the PLE triple (per-layer-embedding gate/projection/norm + model-level
+// table/projection/norm) and the per-layer output scalar. Cross-layer KV-share
+// and per-layer head_dim are resolved in the graph from config. Implemented in
+// gemma4.cpp.
+ModelWeights bind_gemma4(const WeightSource& src, const ModelConfig& cfg);
 
 }  // namespace pie_metal_driver::model

@@ -112,16 +112,28 @@ ArchSpec arch_spec_for(PieArch arch, const ModelConfig& c) {
 
         case PieArch::Gemma4:
             apply_gemma_norms(s);
-            s.norm_weight_plus_one = true;
+            // Gemma-4 DROPPED the Gemma-2/3 (1 + w) RMSNorm convention: its
+            // norms apply the weight directly (`w * x_hat`), matching cuda's
+            // gemma4 path (launch_rmsnorm_bf16, WEIGHT_PLUS_ONE=false) vs
+            // gemma2's launch_rmsnorm_gemma_bf16 (=true). Plain norm here.
+            s.norm_weight_plus_one = false;
             s.has_qk_norm = true;
             if (c.query_pre_attn_scalar) s.query_pre_attn_scalar = *c.query_pre_attn_scalar;
             if (c.attn_logit_softcapping)  s.attn_softcap  = *c.attn_logit_softcapping;
             if (c.final_logit_softcapping) s.final_softcap = *c.final_logit_softcapping;
-            // Per-attn-type sliding/full schedule (same every-6 default as
-            // gemma3 unless layer_types is published). Sliding layers use the
-            // local rope base (cfg.rope_local_base_freq) in the graph.
-            if (c.sliding_window) {
-                s.sliding_window = *c.sliding_window;
+            // Per-attn-type sliding/full schedule. Prefer the published
+            // `layer_types` (E2B has 35 entries with full-attn at irregular
+            // positions); fall back to gemma3's every-6 heuristic only when
+            // absent. The schedule gates per-layer head_dim + KV-share source.
+            // Sliding layers use the local rope base (rope_local_base_freq).
+            if (c.sliding_window) s.sliding_window = *c.sliding_window;
+            if (!c.layer_attn_types.empty()) {
+                s.layer_pattern.resize(c.layer_attn_types.size());
+                for (std::size_t i = 0; i < c.layer_attn_types.size(); ++i) {
+                    s.layer_pattern[i] =
+                        (c.layer_attn_types[i] == "full_attention") ? 'g' : 's';
+                }
+            } else if (c.sliding_window) {
                 s.layer_pattern.resize(c.num_hidden_layers);
                 for (std::int32_t i = 0; i < c.num_hidden_layers; ++i) {
                     s.layer_pattern[i] = ((i + 1) % 6 == 0) ? 'g' : 's';

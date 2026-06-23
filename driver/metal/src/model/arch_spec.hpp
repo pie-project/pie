@@ -89,6 +89,30 @@ struct ArchSpec {
             && static_cast<std::size_t>(il) < layer_pattern.size()
             && layer_pattern[il] == 'l';
     }
+
+    // ── gemma4 cross-layer KV-share schedule ──────────────────────────────
+    // The last `num_kv_shared_layers` decoder layers don't compute their own
+    // K/V; they re-attend through the most-recent earlier layer of the SAME
+    // attention type (sliding vs full). These pure helpers drive both the
+    // graph (which layers skip k/v_proj + append, and which source layer to
+    // read) and delta's per-layer PagedKvCache spec (`n_pages = 0` on shared
+    // layers). `n_layers` is `cfg.num_hidden_layers`.
+    bool gemma4_is_kv_shared(std::int32_t il, std::int32_t n_layers) const {
+        return num_kv_shared_layers > 0
+            && il >= n_layers - num_kv_shared_layers;
+    }
+    // KV source layer for `il`: itself when not shared; otherwise the most
+    // recent earlier non-shared layer of the same attention type. Returns -1
+    // when none exists (caller treats as a config error).
+    std::int32_t gemma4_kv_source(std::int32_t il, std::int32_t n_layers) const {
+        if (!gemma4_is_kv_shared(il, n_layers)) return il;
+        const std::int32_t first_shared = n_layers - num_kv_shared_layers;
+        const bool want_sliding = is_sliding_layer(il);
+        for (std::int32_t j = first_shared - 1; j >= 0; --j) {
+            if (is_sliding_layer(j) == want_sliding) return j;
+        }
+        return -1;
+    }
 };
 
 ArchSpec arch_spec_for(PieArch arch, const ModelConfig& c);
