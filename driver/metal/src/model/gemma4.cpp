@@ -241,7 +241,7 @@ Tensor Gemma4Graph::forward(const ForwardBatch& batch, KvCacheView& kv) {
     const bool ple_active =
         ple_dim > 0 && w_.embed_per_layer && w_.ple_model_proj && w_.ple_model_norm;
     if (ple_active) {
-        Tensor token = ops::embedding(*w_.embed_per_layer, batch.token_ids);
+        Tensor token = apply_embedding(*w_.embed_per_layer, batch.token_ids);
         token = ops::scale(token, std::sqrt(static_cast<float>(ple_dim)));
         Tensor proj = apply_linear(*w_.ple_model_proj, hidden);
         proj = ops::scale(proj, 1.0f / std::sqrt(static_cast<float>(H)));
@@ -302,7 +302,9 @@ ModelWeights bind_gemma4(const WeightSource& src, const ModelConfig& cfg) {
     w.embed = bind_embedding(src, root + "embed_tokens", w.lm_head, cfg);
 
     // PLE model-level triple (absent on the 26B-A4B variant where ple_dim==0).
-    w.embed_per_layer = src.try_get(root + "embed_tokens_per_layer.weight");
+    // The per-layer token table is a gather — quant-aware bind so it can be
+    // 4-bit dequant-gathered (apply_embedding) when the checkpoint quantizes it.
+    w.embed_per_layer = try_bind_linear(src, root + "embed_tokens_per_layer", cfg);
     w.ple_model_proj  = try_bind_linear(src, root + "per_layer_model_projection", cfg);
     w.ple_model_norm  = src.try_get(root + "per_layer_projection_norm.weight");
 
