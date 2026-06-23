@@ -165,6 +165,42 @@ model::ModelConfig parse_doc(const json& root, const std::string& where) {
     cfg.num_experts_per_tok   = get_or<int>(j, "num_experts_per_tok", 0);
     cfg.moe_intermediate_size = get_or<int>(j, "moe_intermediate_size", 0);
     cfg.norm_topk_prob        = get_or<bool>(j, "norm_topk_prob", true);
+    cfg.routed_scaling_factor = get_or<float>(j, "routed_scaling_factor", 1.0f);
+    cfg.n_shared_experts      = get_or<int>(j, "n_shared_experts", 0);
+    cfg.shared_expert_intermediate_size =
+        get_or<int>(j, "shared_expert_intermediate_size", 0);
+    cfg.n_group               = get_or<int>(j, "n_group", 0);
+    cfg.topk_group            = get_or<int>(j, "topk_group", 0);
+    cfg.first_k_dense_replace = get_or<int>(j, "first_k_dense_replace", 0);
+
+    // ── gemma4 ──
+    cfg.gemma4_enable_moe    = get_or<bool>(j, "enable_moe_block", false);
+    cfg.global_head_dim      = get_or<int>(j, "global_head_dim", 0);
+    // num_global_key_value_heads is often JSON null → treat as 0 (= fall back to
+    // num_key_value_heads). Only read when it's an actual number.
+    if (auto it = j.find("num_global_key_value_heads");
+        it != j.end() && it->is_number_integer()) {
+        cfg.num_global_kv_heads = it->get<int>();
+    }
+    // PLE feature width: HF spells it hidden_size_per_layer_input (some dumps
+    // gemma_hidden_size_per_layer_input).
+    cfg.per_layer_emb_dim    = get_or<int>(
+        j, "hidden_size_per_layer_input",
+        get_or<int>(j, "gemma_hidden_size_per_layer_input", 0));
+    cfg.num_kv_shared_layers = get_or<int>(j, "num_kv_shared_layers", 0);
+
+    // ── qwen3.6 (Qwen3.5 hybrid linear-attention) ──
+    cfg.linear_num_value_heads = get_or<int>(j, "linear_num_value_heads", 0);
+    cfg.linear_num_key_heads   = get_or<int>(j, "linear_num_key_heads", 0);
+    cfg.linear_key_head_dim    = get_or<int>(j, "linear_key_head_dim", 0);
+    cfg.linear_value_head_dim  = get_or<int>(j, "linear_value_head_dim", 0);
+    cfg.linear_conv_kernel_dim = get_or<int>(j, "linear_conv_kernel_dim", 0);
+    cfg.attn_output_gate       = get_or<bool>(j, "attn_output_gate", false);
+    cfg.partial_rotary_factor  = get_or<float>(j, "partial_rotary_factor", 1.0f);
+    if (auto it = j.find("layer_types");
+        it != j.end() && it->is_array() && cfg.layer_attn_types.empty()) {
+        for (const auto& t : *it) cfg.layer_attn_types.push_back(t.get<std::string>());
+    }
 
     return cfg;
 }
