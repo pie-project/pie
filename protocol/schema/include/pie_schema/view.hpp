@@ -100,7 +100,12 @@ constexpr std::uint32_t PIE_METHOD_RS_COPY_H2H          = 13;
 // request's `adapter_path` carries the JSON audio-gen request. See
 // AUDIO_OUTPUT.md / inproc_service.cpp.
 constexpr std::uint32_t PIE_METHOD_GENERATE_AUDIO       = 14;
-
+// Driver-owned multi-token pipelined decode. Signaled in-band on a FORWARD
+// payload by `ForwardRequest::max_new_tokens > 0` (no new RequestPayload
+// variant). The driver runs a single-request, stateless-sampled autoregressive
+// loop and writes the produced tokens into request-0's `tokens`/`tokens_indptr`
+// CSR range. See inproc_service.cpp / executor run_decode_n.
+constexpr std::uint32_t PIE_METHOD_DECODE_N            = 15;
 // Driver-side sampler IDs (DISTRIBUTION=0, MULTINOMIAL=1, …, ENTROPY=10).
 // The wire schema orders variants differently (`Sampler::Multinomial`
 // has kind=0); [`fill_forward_view`] remaps via `kNewToOldSamplerKind`
@@ -196,6 +201,10 @@ struct PieForwardRequestView {
     std::uint32_t driver_id;
     std::uint8_t  single_token_mode;
     std::uint8_t  has_user_mask;
+
+    // Pipeline-window size for driver-owned multi-token decode. 0 = legacy
+    // single-step FORWARD; > 0 routes to PIE_METHOD_DECODE_N.
+    std::uint32_t max_new_tokens;
 
     // Number of visual spans across this (batched) request.
     constexpr std::size_t num_images() const noexcept {
@@ -354,6 +363,7 @@ inline void fill_forward_view(const PieForwardRequestDesc& f,
     out.driver_id = driver_id;
     out.single_token_mode = f.single_token_mode;
     out.has_user_mask = f.has_user_mask;
+    out.max_new_tokens = f.max_new_tokens;
 
     // Pass-through slices (same shape, just different ptr/len naming).
     out.token_ids         = slice_from(f.token_ids_ptr, f.token_ids_len);
@@ -508,7 +518,11 @@ inline void build_request_view(const PieFrameDesc& frame,
     const std::uint8_t kind = frame.payload.kind;
     switch (kind) {
         case PIE_REQUEST_PAYLOAD_FORWARD:
-            out.method = PIE_METHOD_FORWARD;
+            // DECODE_N reuses the FORWARD payload, signaled in-band by a
+            // non-zero pipeline window. No new payload variant on the wire.
+            out.method = (frame.payload.forward.max_new_tokens > 0)
+                             ? PIE_METHOD_DECODE_N
+                             : PIE_METHOD_FORWARD;
             detail::fill_forward_view(frame.payload.forward, frame.driver_id, arenas, out.forward);
             break;
         case PIE_REQUEST_PAYLOAD_COPY: {
@@ -558,7 +572,9 @@ inline void build_response_desc(std::uint32_t driver_id,
     out.driver_id = driver_id;
     out.aborted = 0;
 
-    if (view.method == PIE_METHOD_FORWARD) {
+    if (view.method == PIE_METHOD_FORWARD || view.method == PIE_METHOD_DECODE_N) {
+        // DECODE_N writes its k produced tokens into request-0's range of the
+        // same forward `tokens`/`tokens_indptr` CSR — identical response shape.
         out.payload.kind = PIE_RESPONSE_PAYLOAD_FORWARD;
         PieForwardResponseDesc& fr = out.payload.forward;
         fr.num_requests = view.forward.num_requests;

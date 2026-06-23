@@ -208,6 +208,19 @@ pub struct ForwardRequest {
     /// Per-request CSR: `audio_indptr[r..r+1]` is the half-open range of clips
     /// belonging to request `r` (one extra leading 0, like `image_indptr`).
     pub audio_indptr: Vec<u32>,
+
+    // ── Driver-owned multi-token decode (DECODE_N) ──────────────────
+    /// Pipeline-window size for the driver-internal autoregressive decode
+    /// loop. `0` (default) = legacy single-step FORWARD semantics. When
+    /// `> 0` the request is dispatched as `PIE_METHOD_DECODE_N`: the driver
+    /// runs a single-request greedy/stateless-sampled loop of up to
+    /// `max_new_tokens` steps, keeping the sampled token device-side across
+    /// steps (`async_eval` step N+1 while draining N) with one end-of-window
+    /// host sync, then writes the produced tokens into request-0's range of
+    /// the existing `tokens`/`tokens_indptr` CSR response. pie-core trims at
+    /// its own EOS on the returned batch (overruns ≤ `max_new_tokens-1`).
+    /// v1: single request, stateless samplers only.
+    pub max_new_tokens: u32,
 }
 
 /// Per-slot sampler kind discriminants. Carried on the wire as the `u8`

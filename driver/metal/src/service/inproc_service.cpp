@@ -123,6 +123,37 @@ void InProcService::handle_request(std::uint32_t req_id,
             out.status = 0;
             break;
         }
+        case pie_driver::PIE_METHOD_DECODE_N: {
+            ++handled_;
+            const auto& fwd = req.forward;
+#if defined(PIE_METAL_HAS_MLX)
+            // Driver-owned multi-token pipelined decode (beta's executor loop).
+            // Keeps the sampled token device-side across steps so the per-token
+            // host readback + IPC round-trip never happen. v1: single request,
+            // stateless-greedy (run_decode_n itself falls back to run_forward
+            // otherwise). k produced tokens land in request-0's CSR range.
+            if (executor_ != nullptr) {
+                executor_->run_decode_n(fwd, static_cast<int>(fwd.max_new_tokens),
+                                        response_builder, out.forward);
+                out.status = 0;
+                break;
+            }
+#endif
+            // Stub fallback (no-MLX skeleton, or before a model loads): emit a
+            // single dummy token per request, same shape as the FORWARD stub.
+            const auto sampling_indptr = fwd.sampling_indptr.as<std::uint32_t>();
+            const std::size_t n =
+                sampling_indptr.empty() ? 0 : sampling_indptr.size() - 1;
+
+            std::vector<pie_driver::PerRequestOutput> per_request(n);
+            for (std::size_t r = 0; r < n; ++r) {
+                fill_request(fwd, sampling_indptr[r], sampling_indptr[r + 1],
+                             vocab_size_, per_request[r]);
+            }
+            response_builder.build(per_request, out.forward);
+            out.status = 0;
+            break;
+        }
         case pie_driver::PIE_METHOD_HEALTH:
             out.status = 0;
             break;

@@ -311,6 +311,9 @@ pub fn new_batched_forward_request_with_capacity(n_requests: usize) -> pie_schem
         audio_feature_indptr: indptr(indptr_cap),
         audio_anchor_rows: Vec::new(),
         audio_indptr: indptr(indptr_cap),
+        // Legacy single-step FORWARD semantics; pie-core sets > 0 only when
+        // dispatching a driver-owned multi-token DECODE_N window.
+        max_new_tokens: 0,
     }
 }
 
