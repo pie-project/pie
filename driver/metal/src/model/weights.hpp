@@ -186,7 +186,18 @@ inline QuantLinear bind_linear(const WeightSource& src, const std::string& base,
     q.scales     = src.try_get(base + ".scales");
     q.biases     = src.try_get(base + ".biases");
     q.group_size = cfg.quant_group_size > 0 ? cfg.quant_group_size : 64;
-    q.bits       = cfg.quant_bits > 0 ? cfg.quant_bits : 4;
+    if (q.scales) {
+        // Derive bits per-tensor from the packed/scales shapes so mixed-
+        // precision checkpoints work (e.g. 4-bit body + Q8 lm_head, matching
+        // llama.cpp's Q8_0 token_embd). With a uniform group_size:
+        //   packed_cols = in*bits/32 ; scale_cols = in/group_size
+        //   => bits = packed_cols*32 / (scale_cols*group_size)
+        const int packed_cols = static_cast<int>(q.weight.shape(-1));
+        const int scale_cols  = static_cast<int>(q.scales->shape(-1));
+        q.bits = (packed_cols * 32) / (scale_cols * q.group_size);
+    } else {
+        q.bits = cfg.quant_bits > 0 ? cfg.quant_bits : 4;
+    }
     return q;
 }
 
