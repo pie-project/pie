@@ -2,7 +2,7 @@
 
 #include <cstdint>
 
-#include <pie_bridge/response_builder.hpp>
+#include <pie_schema/response_builder.hpp>
 
 namespace pie_driver {
 class InProcServer;

@@ -1,0 +1,41 @@
+[package]
+name = "pie-gateway"
+version = "0.1.0"
+edition = "2024"
+authors = ["In Gim <in.gim@icloud.com>"]
+description = "Client-facing edge plane for Pie: terminates client WebSockets and routes sessions to workers"
+license = "Apache-2.0"
+repository = "https://github.com/pie-project/pie"
+
+[lib]
+name = "pie_gateway"
+path = "src/lib.rs"
+crate-type = ["rlib"]
+
+# The standalone binary is auto-detected from `src/main.rs` and named after the
+# package (`pie-gateway`); no explicit `[[bin]]` needed.
+
+[dependencies]
+# Control plane: the gateway is a client of the controller's tarpc `ControlApi`
+# (route / resolve), reusing the same generated client workers use.
+pie-controller = { path = "../controller" }
+# Shared data vocabulary (wire structs) — the pure-struct floor, no RPC.
+pie-schema = { path = "../protocol/schema", default-features = false }
+# Client wire vocabulary (ClientMessage / ServerMessage) the gateway terminates
+# and (Phase 3) relays to workers.
+pie-client = { path = "../client/rust" }
+serde = { version = "1.0", features = ["derive"] }
+tarpc = { version = "0.35", features = [
+    "serde-transport",
+    "serde-transport-bincode",
+    "tcp",
+    "unix",
+] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time"] }
+# WebSocket edge — versions matched to the runtime so there's one shared build.
+tokio-tungstenite = "0.28.0"
+futures = "0.3.31"
+rmp-serde = "1.3.0"
+anyhow = "1"
+tracing = "0.1"
+clap = { version = "4.5", features = ["derive"] }

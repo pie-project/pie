@@ -1,0 +1,19 @@
+[package]
+name = "pie-schema-bindgen"
+version = "0.1.0"
+edition = "2024"
+authors = ["In Gim <in.gim@yale.edu>"]
+description = "Decoupled generator: emits the committed C++ header (pie_schema.h) from pie-schema's repr(C) POD + cabi surface via cbindgen. Not in any build graph; run on demand + in CI."
+license = "Apache-2.0"
+repository = "https://github.com/pie-project/pie"
+
+# Binary tool only. Deliberately NOT a dependency of any crate so the
+# C++/nvcc build never needs cbindgen — the header it emits is committed.
+[[bin]]
+name = "pie-schema-bindgen"
+path = "src/main.rs"
+
+[dependencies]
+# >= 0.29 is REQUIRED: 0.27 (the weight-loader pin) silently drops every
+# Rust-2024 `#[unsafe(no_mangle)]` extern fn. Validated on pie-schema.
+cbindgen = "0.29"

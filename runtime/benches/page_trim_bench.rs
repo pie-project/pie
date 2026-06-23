@@ -1,7 +1,7 @@
 //! Page-trim benchmark.
 //!
-//! Measures the per-request cost of `BatchedForwardPassRequest::add_request`
-//! across the patterns we care about:
+//! Measures the per-request cost of `append_request` (the batched
+//! forward-request folder) across the patterns we care about:
 //!
 //! 1. Causal (no trim, fast path) — must stay at parity with pre-change.
 //! 2. Attention sink + window (heavy trim) — both decode and prefill.
@@ -9,16 +9,18 @@
 //! 4. Multi-row disagree (early-exit case).
 //!
 //! For each scenario we report per-call wall time plus the resulting wire
-//! size — pages emitted to `kv_page_indices` and bytes emitted to
-//! `flattened_masks` — so we can verify the trim is doing real work.
+//! size — pages emitted to `kv_page_indices` and bytes emitted to the BRLE
+//! `masks` buffers — so we can verify the trim is doing real work.
 //!
 //! Usage:
 //!   cargo bench --bench page_trim_bench
 
 use std::time::Instant;
 
-use pie::inference::brle::Brle;
-use pie::inference::request::{BatchedForwardPassRequest, ForwardPassRequest};
+use pie::inference::request::{
+    append_request, new_batched_forward_request_with_capacity, new_per_request,
+};
+use pie_schema::Brle;
 
 const PAGE_SIZE: u32 = 16;
 
@@ -48,26 +50,25 @@ fn fmt_time(ns: u64) -> String {
     }
 }
 
-fn make_request(masks: Vec<Brle>, num_input: u32, kv_before: u32) -> ForwardPassRequest {
+fn make_request(masks: Vec<Brle>, num_input: u32, kv_before: u32) -> pie_schema::ForwardRequest {
     let positions: Vec<u32> = (kv_before..kv_before + num_input).collect();
     let tokens: Vec<u32> = vec![0; num_input as usize];
     let has_user_mask = !masks.is_empty();
-    ForwardPassRequest {
-        context_id: 0,
+    new_per_request(
+        0,
         tokens,
         positions,
-        speculative_tokens: vec![],
-        speculative_positions: vec![],
-        output_speculative_tokens: false,
         masks,
         has_user_mask,
-        logit_mask: None,
-        sampling_indices: vec![],
-        samplers: vec![],
-        adapter_id: None,
-        adapter_seed: None,
-        arrival_time: None,
-    }
+        None,
+        vec![],
+        vec![],
+        vec![],
+        vec![],
+        false,
+        None,
+        None,
+    )
 }
 
 fn last_page_len(total_kv: u32) -> u32 {
@@ -102,36 +103,36 @@ fn window_row(seq_len: u32, window: u32) -> Brle {
     }
 }
 
-/// Run a scenario: build a fresh `BatchedForwardPassRequest`, add the same
-/// request `batch_size` times, time the loop, and return wire-size stats from
-/// one iteration plus per-call wall time.
+/// Run a scenario: build a fresh batched `ForwardRequest`, fold the per-request
+/// form in once, time the loop, and return wire-size stats from one iteration
+/// plus per-call wall time.
 struct ScenarioResult {
-    /// Average time per `add_request` call.
+    /// Average time per `append_request` call.
     per_call_ns: u64,
     /// Pages emitted to kv_page_indices for one request after trim.
     pages_after_trim: usize,
-    /// Bytes emitted to flattened_masks for one request after trim.
+    /// Bytes emitted to the BRLE `masks` buffers for one request after trim.
     mask_bytes_after_trim: usize,
 }
 
 fn run_scenario(
-    req: &ForwardPassRequest,
+    req: &pie_schema::ForwardRequest,
     pages: &[u32],
     last_page_len: u32,
     iters: u32,
 ) -> ScenarioResult {
     // Single-call wire stats (build once, inspect what got emitted).
-    let mut probe = BatchedForwardPassRequest::new(0);
-    probe.add_request(req, pages, last_page_len, PAGE_SIZE);
-    let pages_after = probe.kv_page_indices.0.len();
-    let mask_words = probe.flattened_masks.0.len();
+    let mut probe = new_batched_forward_request_with_capacity(1);
+    append_request(&mut probe, req, pages, last_page_len, PAGE_SIZE);
+    let pages_after = probe.kv_page_indices.len();
+    let mask_words: usize = probe.masks.iter().map(|m| m.buffer.len()).sum();
 
-    // Time the call: each iteration constructs a fresh batch and adds one
+    // Time the call: each iteration constructs a fresh batch and folds one
     // request. We pay an alloc per iter (for the fresh batch), but it's
     // identical across scenarios so the relative numbers are still meaningful.
     let per_call_ns = time_ns(iters, || {
-        let mut batch = BatchedForwardPassRequest::new(0);
-        batch.add_request(req, pages, last_page_len, PAGE_SIZE);
+        let mut batch = new_batched_forward_request_with_capacity(1);
+        append_request(&mut batch, req, pages, last_page_len, PAGE_SIZE);
         std::hint::black_box(&batch);
     });
 

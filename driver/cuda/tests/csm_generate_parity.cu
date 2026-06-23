@@ -7,7 +7,7 @@
 // weights).
 //
 //   nvcc -O2 -arch=sm_89 -std=c++17 -diag-suppress 550 -I driver/cuda/src \
-//        -I driver/common/include driver/cuda/tests/csm_generate_parity.cu \
+//        driver/cuda/tests/csm_generate_parity.cu \
 //        driver/cuda/src/model/csm_depth_decoder_forward.cu \
 //        driver/cuda/src/model/mimi_decoder_forward.cu -o /tmp/cgp
 //   /tmp/cgp

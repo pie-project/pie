@@ -30,9 +30,9 @@ jobs:
             ${{ runner.os }}-cargo-
 
       # Cheap structural check: every workspace member compiles. Skips
-      # the cmake-driven C++ build by checking pie-server with
+      # the cmake-driven C++ build by checking pie-worker with
       # `--no-default-features` (the default features pull in ggml).
-      - name: cargo check (runtime, client, no-driver pie-server)
+      - name: cargo check (runtime, client, no-driver pie-worker)
         run: |
           cargo check -p pie
           cargo check -p pie --no-default-features
@@ -43,8 +43,23 @@ jobs:
           cargo test -p pie --lib
           cargo test -p pie-client --lib
 
-  pie-server-portable:
-    name: pie-server (driver-portable)
+  # Full-workspace verification — the guardrail + anti-bitrot net. Closes the
+  # gap that let the runtime benches rot unseen: the dedicated jobs only build a
+  # curated subset, so new crates (`pie-transport`) and the benches were
+  # compiled by nothing. This job compiles EVERY target and runs the workspace
+  # test set.
+  #
+  #   --exclude pie-server-py : links driver-cuda (needs nvcc) → cuda job only.
+  #   --exclude pie-worker (test step only): pie-worker is exercised by the four
+  #     dedicated jobs below via `--bin pie`. Its *library* tests carry two
+  #     PRE-EXISTING failures (identical to the former `server` crate on main,
+  #     never run because CI only tests `--bin pie`): `config::rejects_public_
+  #     driver_capacity_knobs` and `bootstrap_translate::translates_minimal_
+  #     config` (the latter is filesystem-coupled). They are tracked for a
+  #     follow-up; the build step below still compiles all of pie-worker's
+  #     targets for bitrot coverage.
+  workspace-verify:
+    name: workspace verify (all crates + all targets)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -66,13 +81,87 @@ jobs:
             ~/.cargo/git
             ~/.cache/ccache
             target
-          key: ${{ runner.os }}-pie-server-portable-${{ hashFiles('**/Cargo.lock', 'driver/portable/CMakeLists.txt') }}
+          key: ${{ runner.os }}-workspace-verify-${{ hashFiles('**/Cargo.lock', 'driver/portable/CMakeLists.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-workspace-verify-
+
+      # Compile every target — including benches and the not-yet-consumed
+      # data-plane crate `pie-transport` — so they cannot silently bitrot.
+      - name: cargo build (workspace, all targets)
+        run: cargo build --workspace --all-targets --exclude pie-server-py
+
+      # Run the workspace test set (benches are compiled above, not executed).
+      - name: cargo test (workspace)
+        run: cargo test --workspace --exclude pie-server-py --exclude pie-worker
+
+  # Drift guard for the committed C++ schema header: regenerate it with
+  # pie-schema-bindgen (cbindgen over pie-schema's repr(C)/cabi surface) and
+  # fail if it differs from the committed copy. Complements the runtime
+  # SCHEMA_HASH handshake. Toolchain is PINNED (not @stable) because cbindgen's
+  # parse.expand output is toolchain-dependent — pinning keeps the diff stable.
+  schema-header-drift:
+    name: schema header drift (cbindgen regen)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust toolchain (pinned for deterministic expansion)
+        uses: dtolnay/rust-toolchain@1.91.1
+
+      - name: Cache cargo
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-schema-bindgen-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-schema-bindgen-
+
+      - name: Regenerate committed schema header
+        # RUSTC_BOOTSTRAP=1 is set inside the generator; cbindgen is a dep of
+        # pie-schema-bindgen, so no separate install is needed.
+        run: cargo run -p pie-schema-bindgen
+
+      - name: Fail if committed pie_schema.h is stale
+        run: |
+          if ! git diff --exit-code -- protocol/schema/include/pie_schema.h; then
+            echo "::error::protocol/schema/include/pie_schema.h is out of date."
+            echo "Regenerate with: cargo run -p pie-schema-bindgen   (then commit)"
+            exit 1
+          fi
+
+  pie-worker-portable:
+    name: pie-worker (driver-portable)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake ninja-build ccache
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo + cmake build
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ~/.cache/ccache
+            target
+          key: ${{ runner.os }}-pie-worker-portable-${{ hashFiles('**/Cargo.lock', 'driver/portable/CMakeLists.txt') }}
 
       - name: cargo build (default = driver-portable)
-        run: cargo build -p pie-server
+        run: cargo build -p pie-worker
 
-      - name: cargo test (pie-server)
-        run: cargo test -p pie-server --bin pie
+      - name: cargo test (pie-worker)
+        run: cargo test -p pie-worker --bin pie
 
       - name: Verify single-binary linkage
         run: |
@@ -86,8 +175,8 @@ jobs:
   # Dummy driver — pure Rust, builds on every OS we support. Cheapest
   # gate for "did the standalone wiring break end to end". Runs the
   # full unit-test suite too since dummy doesn't pull in cmake.
-  pie-server-dummy:
-    name: pie-server (driver-dummy)
+  pie-worker-dummy:
+    name: pie-worker (driver-dummy)
     strategy:
       fail-fast: false
       matrix:
@@ -106,24 +195,24 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-pie-server-dummy-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-pie-worker-dummy-${{ hashFiles('**/Cargo.lock') }}
 
       - name: cargo build (driver-dummy)
         run: |
-          cargo build -p pie-server \
+          cargo build -p pie-worker \
             --no-default-features --features driver-dummy
 
-      - name: cargo test (pie-server, dummy)
+      - name: cargo test (pie-worker, dummy)
         run: |
-          cargo test -p pie-server --bin pie \
+          cargo test -p pie-worker --bin pie \
             --no-default-features --features driver-dummy
 
   # macOS portable build with Metal backend. Verifies build.rs's
   # macOS branch + libomp link path. Doesn't run tests against a
   # real model — just exercises the cmake + link path so PRs that
   # touch driver/portable or build.rs fail fast on macOS.
-  pie-server-portable-metal:
-    name: pie-server (driver-portable + metal)
+  pie-worker-portable-metal:
+    name: pie-worker (driver-portable + metal)
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v6
@@ -144,25 +233,25 @@ jobs:
             ~/.cargo/git
             ~/Library/Caches/ccache
             target
-          key: ${{ runner.os }}-pie-server-portable-metal-${{ hashFiles('**/Cargo.lock', 'driver/portable/CMakeLists.txt') }}
+          key: ${{ runner.os }}-pie-worker-portable-metal-${{ hashFiles('**/Cargo.lock', 'driver/portable/CMakeLists.txt') }}
 
       - name: cargo build (driver-portable + metal)
         env:
           PIE_PORTABLE_METAL: "1"
-        run: cargo build -p pie-server
+        run: cargo build -p pie-worker
 
-      - name: cargo test (pie-server)
+      - name: cargo test (pie-worker)
         env:
           PIE_PORTABLE_METAL: "1"
-        run: cargo test -p pie-server --bin pie
+        run: cargo test -p pie-worker --bin pie
 
   # Cuda build — runs only when an opt-in label or schedule fires
   # (no CUDA on the default GH-hosted runners). Add a self-hosted
   # runner with a CUDA toolkit to enable this. Until then, M3's
   # static-link spike + manual M4 verification are the canonical
   # checkpoints.
-  pie-server-cuda:
-    name: pie-server (driver-cuda)
+  pie-worker-cuda:
+    name: pie-worker (driver-cuda)
     runs-on: [self-hosted, cuda]
     if: contains(github.event.pull_request.labels.*.name, 'ci-cuda')
     steps:
@@ -173,7 +262,7 @@ jobs:
 
       - name: cargo build (driver-cuda)
         run: |
-          cargo build -p pie-server \
+          cargo build -p pie-worker \
             --no-default-features --features driver-cuda
 
       - name: Verify no CUDA shared deps

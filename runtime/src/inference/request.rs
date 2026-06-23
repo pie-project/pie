@@ -1,8 +1,8 @@
 //! Per-request and batched forward-pass helpers built on the canonical
 //! schema types.
 //!
-//! The wire schema lives in `pie_bridge` (rkyv-derived Rust structs).
-//! Pie reuses [`pie_bridge::ForwardRequest`] and [`pie_bridge::ForwardResponse`]
+//! The wire schema lives in `pie_schema` (rkyv-derived Rust structs).
+//! Pie reuses [`pie_schema::ForwardRequest`] and [`pie_schema::ForwardResponse`]
 //! directly at every stage:
 //!
 //! - [`new_per_request`] builds a single-request `ForwardRequest`
@@ -19,9 +19,9 @@ use crate::adapter::AdapterId;
 use crate::context::ContextId;
 use crate::context::pagestore::PhysicalPageId;
 use crate::driver::DriverId;
-use pie_bridge::Brle;
+use pie_schema::Brle;
 
-/// Build a per-request [`pie_bridge::ForwardRequest`].
+/// Build a per-request [`pie_schema::ForwardRequest`].
 ///
 /// `kv_page_indices` and `kv_last_page_lens` are left empty — the
 /// scheduler fills them in during batching from the physical page list
@@ -37,13 +37,13 @@ pub fn new_per_request(
     has_user_mask: bool,
     logit_mask: Option<Brle>,
     sampling_indices: Vec<u32>,
-    samplers: Vec<pie_bridge::Sampler>,
+    samplers: Vec<pie_schema::Sampler>,
     speculative_tokens: Vec<u32>,
     speculative_positions: Vec<u32>,
     output_speculative_tokens: bool,
     adapter_id: Option<AdapterId>,
     adapter_seed: Option<i64>,
-) -> pie_bridge::ForwardRequest {
+) -> pie_schema::ForwardRequest {
     let n_tokens = tokens.len() as u32;
     let n_masks = masks.len() as u32;
     let n_sampling = sampling_indices.len() as u32;
@@ -53,7 +53,7 @@ pub fn new_per_request(
     let n_logit = logit_masks.len() as u32;
     let single_token_mode = !has_user_mask && n_tokens <= 1;
 
-    pie_bridge::ForwardRequest {
+    let mut fr = pie_schema::ForwardRequest {
         token_ids: tokens,
         position_ids: positions,
         kv_page_indices: Vec::new(),
@@ -68,9 +68,9 @@ pub fn new_per_request(
         logit_mask_indptr: vec![0, n_logit],
         sampling_indices,
         sampling_indptr: vec![0, n_sampling],
-        samplers,
+        // Sampler SoA filled by `set_samplers` below (Default leaves them empty).
         sampler_indptr: vec![0, n_samplers],
-        adapter_bindings: vec![pie_bridge::AdapterBinding {
+        adapter_bindings: vec![pie_schema::AdapterBinding {
             adapter_id: adapter_id.map(|id| id as i64).unwrap_or(-1),
             seed: adapter_seed.unwrap_or(-1),
         }],
@@ -97,7 +97,10 @@ pub fn new_per_request(
         audio_feature_indptr: vec![0],
         audio_anchor_rows: Vec::new(),
         audio_indptr: vec![0, 0],
-    }
+        ..Default::default()
+    };
+    fr.set_samplers(&samplers);
+    fr
 }
 
 /// Inline storage for the page-trim bitmap. Sized to cover up to 1024 pages
@@ -176,7 +179,7 @@ impl TrimPlan {
         // writeable-window mask. SmallVec keeps both bitmaps inline on the
         // stack for typical `num_pages <= TRIM_INLINE_WORDS * 64` (1024).
         let mut eligible: TrimBits = smallvec![0u64; num_words];
-        pie_bridge::brle::set_bits(&mut eligible, 0, first_writeable_page);
+        pie_schema::brle::set_bits(&mut eligible, 0, first_writeable_page);
 
         let mut row_bits: TrimBits = smallvec![0u64; num_words];
         for mask in masks {
@@ -229,14 +232,14 @@ impl TrimPlan {
 }
 
 // =============================================================================
-// Batched-request accumulator (free functions on pie_bridge::ForwardRequest)
+// Batched-request accumulator (free functions on pie_schema::ForwardRequest)
 // =============================================================================
 
-/// Initialize a `pie_bridge::ForwardRequest` for the empty-batch state:
+/// Initialize a `pie_schema::ForwardRequest` for the empty-batch state:
 /// indptrs seeded with `[0]` so subsequent `append_request` calls can
 /// push the rolling totals. `single_token_mode` starts at `true`; the
 /// first per-request append that needs `custom_mask` flips it to false.
-pub fn new_batched_forward_request() -> pie_bridge::ForwardRequest {
+pub fn new_batched_forward_request() -> pie_schema::ForwardRequest {
     new_batched_forward_request_with_capacity(0)
 }
 
@@ -244,7 +247,7 @@ pub fn new_batched_forward_request() -> pie_bridge::ForwardRequest {
 /// capacities based on an expected request count, eliminating
 /// per-append reallocations during `batch_build_us`. Pass 0 if you
 /// don't know.
-pub fn new_batched_forward_request_with_capacity(n_requests: usize) -> pie_bridge::ForwardRequest {
+pub fn new_batched_forward_request_with_capacity(n_requests: usize) -> pie_schema::ForwardRequest {
     // Per-request indptrs grow by exactly 1 entry. Pages, tokens,
     // samplers grow by at most a small multiple per request; the
     // estimates here are upper bounds for typical decode/prefill
@@ -258,7 +261,7 @@ pub fn new_batched_forward_request_with_capacity(n_requests: usize) -> pie_bridg
         v.push(0);
         v
     };
-    pie_bridge::ForwardRequest {
+    pie_schema::ForwardRequest {
         token_ids: Vec::with_capacity(token_cap),
         position_ids: Vec::with_capacity(token_cap),
         kv_page_indices: Vec::with_capacity(page_cap),
@@ -273,7 +276,15 @@ pub fn new_batched_forward_request_with_capacity(n_requests: usize) -> pie_bridg
         logit_mask_indptr: indptr(indptr_cap),
         sampling_indices: Vec::with_capacity(req_cap),
         sampling_indptr: indptr(indptr_cap),
-        samplers: Vec::with_capacity(req_cap),
+        // Sampler SoA — one entry per slot, grown by `extend_samplers_from`.
+        sampler_kinds: Vec::with_capacity(req_cap),
+        sampler_temperatures: Vec::with_capacity(req_cap),
+        sampler_top_k: Vec::with_capacity(req_cap),
+        sampler_p: Vec::with_capacity(req_cap),
+        sampler_seeds: Vec::with_capacity(req_cap),
+        sampler_num_tokens: Vec::with_capacity(req_cap),
+        sampler_token_ids: Vec::new(),
+        sampler_token_ids_indptr: indptr(req_cap + 1),
         sampler_indptr: indptr(indptr_cap),
         adapter_bindings: Vec::with_capacity(req_cap),
         spec_token_ids: Vec::new(),
@@ -303,18 +314,18 @@ pub fn new_batched_forward_request_with_capacity(n_requests: usize) -> pie_bridg
     }
 }
 
-/// Wrap a batched [`pie_bridge::ForwardRequest`] in a routable Frame.
-pub fn forward_frame(driver_id: DriverId, req: pie_bridge::ForwardRequest) -> pie_bridge::Frame {
-    pie_bridge::Frame {
+/// Wrap a batched [`pie_schema::ForwardRequest`] in a routable Frame.
+pub fn forward_frame(driver_id: DriverId, req: pie_schema::ForwardRequest) -> pie_schema::Frame {
+    pie_schema::Frame {
         driver_id: driver_id as u32,
-        payload: pie_bridge::RequestPayload::Forward(req),
+        payload: pie_schema::RequestPayload::Forward(req),
     }
 }
 
 /// Append the request's physical page IDs to `kv_page_indices`,
 /// honoring the trim plan if present.
 fn emit_kv_pages(
-    batch: &mut pie_bridge::ForwardRequest,
+    batch: &mut pie_schema::ForwardRequest,
     physical_page_ids: &[PhysicalPageId],
     trim: Option<&TrimPlan>,
 ) {
@@ -335,7 +346,7 @@ fn emit_kv_pages(
 /// pushed at the end), so each request contributes `masks.len()` Brle
 /// rows.
 fn emit_attention_masks(
-    batch: &mut pie_bridge::ForwardRequest,
+    batch: &mut pie_schema::ForwardRequest,
     masks: &[Brle],
     trim: Option<&TrimPlan>,
 ) {
@@ -357,15 +368,15 @@ fn emit_attention_masks(
     batch.mask_indptr.push(batch.masks.len() as u32);
 }
 
-/// Append a per-request [`pie_bridge::ForwardRequest`] into the batched form.
+/// Append a per-request [`pie_schema::ForwardRequest`] into the batched form.
 /// `req` is the single-element shape produced by [`new_per_request`]
 /// (indptrs `[0, N]`, empty kv pages). The scheduler resolved
 /// `physical_page_ids` and `last_page_len` out-of-band; this call
 /// folds them in along with the page-trim plan derived from
 /// `req.masks`. See the file-level docs for trim criteria.
 pub fn append_request(
-    batch: &mut pie_bridge::ForwardRequest,
-    req: &pie_bridge::ForwardRequest,
+    batch: &mut pie_schema::ForwardRequest,
+    req: &pie_schema::ForwardRequest,
     physical_page_ids: &[PhysicalPageId],
     last_page_len: u32,
     page_size: u32,
@@ -380,13 +391,13 @@ pub fn append_request(
     );
 }
 
-/// Append a per-request [`pie_bridge::ForwardRequest`] with caller-selected
+/// Append a per-request [`pie_schema::ForwardRequest`] with caller-selected
 /// decode mask elision. `elide_decode_masks` is only valid when the entire
 /// batch is pure single-token decode; mixed prefill/decode batches need one
 /// flattened mask row per query row for the bridge's custom-mask view.
 pub fn append_request_with_options(
-    batch: &mut pie_bridge::ForwardRequest,
-    req: &pie_bridge::ForwardRequest,
+    batch: &mut pie_schema::ForwardRequest,
+    req: &pie_schema::ForwardRequest,
     physical_page_ids: &[PhysicalPageId],
     last_page_len: u32,
     page_size: u32,
@@ -465,9 +476,10 @@ pub fn append_request_with_options(
         .sampling_indptr
         .push(batch.sampling_indices.len() as u32);
 
-    // Samplers: variants flow through directly.
-    batch.samplers.extend(req.samplers.iter().cloned());
-    batch.sampler_indptr.push(batch.samplers.len() as u32);
+    // Samplers (SoA): concat the per-slot arrays (offsetting the token_ids CSR),
+    // then push this request's cumulative slot boundary.
+    batch.extend_samplers_from(req);
+    batch.sampler_indptr.push(batch.n_samplers() as u32);
 
     // Adapter binding (per-request has exactly one).
     batch
@@ -543,15 +555,15 @@ pub fn append_request_with_options(
 // Per-request response extraction
 // =============================================================================
 
-/// Extract request `r`'s slice from a batched `pie_bridge::ForwardResponse`
+/// Extract request `r`'s slice from a batched `pie_schema::ForwardResponse`
 /// into a single-request `ForwardResponse` (with `num_requests = 1` and
 /// indptrs offset to zero). This is the "scatter" step that lets each
 /// inferlet's response future see only its own request's data.
 pub fn extract_per_request(
-    fr: &pie_bridge::ForwardResponse,
+    fr: &pie_schema::ForwardResponse,
     r: usize,
-) -> pie_bridge::ForwardResponse {
-    let mut out = pie_bridge::ForwardResponse {
+) -> pie_schema::ForwardResponse {
+    let mut out = pie_schema::ForwardResponse {
         num_requests: 1,
         ..Default::default()
     };
@@ -664,7 +676,7 @@ mod tests {
         tokens: Vec<u32>,
         positions: Vec<u32>,
         masks: Vec<Brle>,
-    ) -> pie_bridge::ForwardRequest {
+    ) -> pie_schema::ForwardRequest {
         let has_user_mask = !masks.is_empty();
         new_per_request(
             0,
@@ -688,12 +700,12 @@ mod tests {
     /// entry onto each per-image indptr (unconditionally, even when there are
     /// no mrope positions) so every image contributes one CSR slot.
     fn with_image(
-        mut req: pie_bridge::ForwardRequest,
+        mut req: pie_schema::ForwardRequest,
         grid: [u32; 3],
         anchor: u32,
         pixels: &[u8],
         mrope: &[u32],
-    ) -> pie_bridge::ForwardRequest {
+    ) -> pie_schema::ForwardRequest {
         req.image_grids.extend_from_slice(&grid);
         req.image_anchor_positions.push(anchor);
         req.image_pixels.extend_from_slice(pixels);
@@ -747,10 +759,10 @@ mod tests {
     /// Attach one audio clip to `req`, mirroring the `input_audio` host handler:
     /// append the row anchor + feature bytes, then push one feature-CSR slot.
     fn with_audio(
-        mut req: pie_bridge::ForwardRequest,
+        mut req: pie_schema::ForwardRequest,
         anchor_row: u32,
         features: &[u8],
-    ) -> pie_bridge::ForwardRequest {
+    ) -> pie_schema::ForwardRequest {
         req.audio_anchor_rows.push(anchor_row);
         req.audio_features.extend_from_slice(features);
         req.audio_feature_indptr

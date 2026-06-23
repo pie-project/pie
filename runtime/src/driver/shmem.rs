@@ -1,9 +1,9 @@
 //! `DriverChannel` over POSIX shared memory.
 //!
 //! Transport mechanics (mmap, ring, busy-spin polling, RAII Lease,
-//! schema_hash handshake) live in `pie_bridge::ipc::ShmemClient`. This
-//! module wraps each `DriverRequest` in a `pie_bridge::Frame`, encodes
-//! and ships the bytes, then unwraps the `pie_bridge::ResponseFrame`
+//! schema_hash handshake) live in `pie_ipc::ipc::ShmemClient`. This
+//! module wraps each `DriverRequest` in a `pie_schema::Frame`, encodes
+//! and ships the bytes, then unwraps the `pie_schema::ResponseFrame`
 //! on receive — no pie-internal mirror types.
 
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -11,9 +11,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 
-use pie_bridge::ipc::ShmemClient;
-use pie_bridge::wire::{deserialize_response, encode_request, parse_response};
-use pie_bridge::{Frame, SCHEMA_HASH};
+use pie_ipc::ipc::ShmemClient;
+use pie_ipc::wire::{deserialize_response, encode_request, parse_response};
+use pie_schema::{Frame, SCHEMA_HASH};
 
 use super::{DriverChannel, DriverRequest, DriverResponse};
 
@@ -120,7 +120,7 @@ fn decode_fast_token_response_inner(bytes: &[u8]) -> Result<DriverResponse> {
         ));
     }
 
-    let payload = pie_bridge::ResponsePayload::Forward(pie_bridge::ForwardResponse {
+    let payload = pie_schema::ResponsePayload::Forward(pie_schema::ForwardResponse {
         num_requests,
         tokens_indptr: (0..=num_requests).collect(),
         tokens,

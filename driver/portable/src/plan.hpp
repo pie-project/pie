@@ -19,7 +19,7 @@
 
 #include "arch_spec.hpp"
 #include "executor/executor.hpp"
-#include <pie_bridge/inproc_server.hpp>   // pie_driver::PieForwardRequestView
+#include <pie_ipc/inproc_server.hpp>   // pie_driver::PieForwardRequestView
 
 namespace pie_portable_driver {
 

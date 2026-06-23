@@ -21,24 +21,20 @@ pub use data_transfer::InFlightUpload;
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Arc, LazyLock};
+use std::sync::{Arc, LazyLock, OnceLock};
+use std::time::Duration;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Result, anyhow, bail};
 use base64::Engine as Base64Engine;
 use bytes::Bytes;
 use dashmap::DashMap;
-use futures::{SinkExt, StreamExt};
 use pie_client::message::{ClientMessage, ServerMessage as WireServerMessage};
-use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::mpsc;
-use tokio::task::{self, JoinHandle};
-use tokio_tungstenite::accept_async;
-use tungstenite::Message as WsMessage;
+use tokio::sync::{Mutex as TokioMutex, mpsc};
 
 use crate::auth;
 use crate::process::{self, ProcessEvent, ProcessId};
 use crate::program::ProgramName;
-use crate::service::{Service, ServiceHandler, ServiceMap};
+use crate::service::{ServiceHandler, ServiceMap};
 use crate::workflow::{self, WorkflowId};
 
 /// Unique identifier for a connected client.
@@ -48,37 +44,110 @@ pub type ClientId = u32;
 // Server Public API
 // =============================================================================
 
-static SERVICE: LazyLock<Service<ServerMessage>> = LazyLock::new(Service::new);
+static STATE: OnceLock<Arc<ServerState>> = OnceLock::new();
+static SESSION_OUTBOX: LazyLock<DashMap<ClientId, Arc<TokioMutex<mpsc::Receiver<WireServerMessage>>>>> =
+    LazyLock::new(DashMap::new);
 
-/// Binds the websocket listener. Callers that have expensive startup work can
-/// bind first, then pass the listener to [`spawn_listener`] after startup.
-pub async fn bind(host: &str, port: u16) -> Result<TcpListener> {
-    let addr = format!("{}:{}", host, port);
-    TcpListener::bind(&addr)
-        .await
-        .with_context(|| format!("bind websocket listener on {addr}"))
+fn install_state(max_upload_bytes: usize) -> Arc<ServerState> {
+    if let Some(state) = STATE.get() {
+        return Arc::clone(state);
+    }
+
+    let state = Arc::new(ServerState {
+        next_client_id: AtomicU32::new(1),
+        max_upload_bytes,
+    });
+    let _ = STATE.set(Arc::clone(&state));
+    STATE.get().cloned().unwrap_or(state)
 }
 
-/// Starts the server on a pre-bound listener. `max_upload_bytes` caps
-/// per-upload buffer growth (program installs + blob transfers).
+fn get_state() -> Result<Arc<ServerState>> {
+    STATE
+        .get()
+        .cloned()
+        .ok_or_else(|| anyhow!("server not initialized; call server::init first"))
+}
+
+/// Initialize the runtime session broker used by worker tarpc sessions.
 ///
-/// Returns the actual bound port. This matters when the listener was bound to
-/// port `0`, where the OS picks an available ephemeral port.
-pub fn spawn_listener(listener: TcpListener, max_upload_bytes: usize) -> Result<u16> {
-    let bound_port = listener
-        .local_addr()
-        .context("read websocket listener local_addr")?
-        .port();
-    SERVICE
-        .spawn::<Server, _>(move || Server::new(listener, max_upload_bytes))
-        .context("spawn websocket server actor")?;
-    Ok(bound_port)
+/// Idempotent: the first call installs the upload cap; subsequent calls keep
+/// the original state.
+pub fn init(max_upload_bytes: usize) {
+    let _ = install_state(max_upload_bytes);
 }
 
-/// Starts the server on the given address.
-pub async fn spawn(host: &str, port: u16, max_upload_bytes: usize) -> Result<u16> {
-    let listener = bind(host, port).await?;
-    spawn_listener(listener, max_upload_bytes)
+/// Open a new in-process session for the worker edge-rpc service.
+pub fn open_session() -> Result<ClientId> {
+    let state = get_state()?;
+    let id = state.next_client_id.fetch_add(1, Ordering::Relaxed);
+
+    let (out_tx, out_rx) = mpsc::channel(1000);
+    SESSION_OUTBOX.insert(id, Arc::new(TokioMutex::new(out_rx)));
+
+    let session = Session::new_inproc(id, state, out_tx);
+    CLIENT_SERVICES.spawn(id, || session)?;
+    Ok(id)
+}
+
+/// Close an in-process session and release its resources.
+pub fn close_session(client_id: ClientId) {
+    SESSION_OUTBOX.remove(&client_id);
+    CLIENT_SERVICES.remove(&client_id);
+    tracing::debug!(client_id, "session closed");
+}
+
+/// Submit one client message to a live in-process session.
+pub fn send_client_message(client_id: ClientId, msg: ClientMessage) -> Result<()> {
+    CLIENT_SERVICES.send(&client_id, SessionMessage::ClientRequest(msg))
+}
+
+/// Long-poll outgoing server messages for a session.
+///
+/// Waits up to `max_wait_ms` for the first message, then drains up to
+/// `max_messages` immediately available messages.
+pub async fn recv_messages(
+    client_id: ClientId,
+    max_wait_ms: u64,
+    max_messages: usize,
+) -> Result<Vec<WireServerMessage>> {
+    let outbox = SESSION_OUTBOX
+        .get(&client_id)
+        .map(|entry| Arc::clone(entry.value()))
+        .ok_or_else(|| anyhow!("unknown session {client_id}"))?;
+
+    let mut receiver = outbox.lock().await;
+    let mut out = Vec::new();
+
+    if max_messages == 0 {
+        return Ok(out);
+    }
+
+    if max_wait_ms == 0 {
+        while out.len() < max_messages {
+            match receiver.try_recv() {
+                Ok(msg) => out.push(msg),
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
+                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => break,
+            }
+        }
+        return Ok(out);
+    }
+
+    match tokio::time::timeout(Duration::from_millis(max_wait_ms), receiver.recv()).await {
+        Ok(Some(first)) => out.push(first),
+        Ok(None) => return Ok(out),
+        Err(_) => return Ok(out),
+    }
+
+    while out.len() < max_messages {
+        match receiver.try_recv() {
+            Ok(msg) => out.push(msg),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
+            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => break,
+        }
+    }
+
+    Ok(out)
 }
 
 // =============================================================================
@@ -159,13 +228,6 @@ pub async fn send_mcp_request(
     Ok(if ok { Ok(result) } else { Err(result) })
 }
 
-/// Spawns a new session actor for the given TCP connection.
-async fn spawn_session(id: ClientId, tcp_stream: TcpStream, state: Arc<ServerState>) -> Result<()> {
-    let session = Session::new(id, tcp_stream, state).await?;
-    CLIENT_SERVICES.spawn(id, || session)?;
-    Ok(())
-}
-
 // =============================================================================
 // Shared State
 // =============================================================================
@@ -174,80 +236,8 @@ async fn spawn_session(id: ClientId, tcp_stream: TcpStream, state: Arc<ServerSta
 struct ServerState {
     /// Counter for generating unique client IDs.
     next_client_id: AtomicU32,
-    /// Active client sessions (for graceful shutdown).
-    clients: DashMap<ClientId, JoinHandle<()>>,
     /// Per-upload byte cap (program installs + blob transfers).
     pub(super) max_upload_bytes: usize,
-}
-
-// =============================================================================
-// Server Implementation
-// =============================================================================
-
-/// The Server actor manages the TCP listener.
-struct Server {
-    state: Arc<ServerState>,
-}
-
-impl Server {
-    fn new(listener: TcpListener, max_upload_bytes: usize) -> Self {
-        let state = Arc::new(ServerState {
-            next_client_id: AtomicU32::new(1),
-            clients: DashMap::new(),
-            max_upload_bytes,
-        });
-
-        task::spawn(Self::listener_loop(listener, state.clone()));
-
-        Server { state }
-    }
-
-    /// Accepts incoming connections and spawns session actors.
-    async fn listener_loop(listener: TcpListener, state: Arc<ServerState>) {
-        while let Ok((stream, _addr)) = listener.accept().await {
-            // Disable Nagle's algorithm so small RPC messages don't sit waiting
-            // for delayed-ACKs — without this, concurrent client requests see
-            // ~40 ms tail latency on Linux (one outlier per batch).
-            if let Err(e) = stream.set_nodelay(true) {
-                tracing::warn!("set_nodelay failed: {}", e);
-            }
-            let id = state.next_client_id.fetch_add(1, Ordering::Relaxed);
-
-            match spawn_session(id, stream, state.clone()).await {
-                Ok(()) => tracing::info!("Client {} connected", id),
-                Err(e) => tracing::error!("Failed to create session for client {}: {}", id, e),
-            }
-        }
-    }
-}
-
-// =============================================================================
-// Server Messages
-// =============================================================================
-
-/// Messages handled by the Server actor.
-/// Currently only used for lifecycle events — all routing uses lock-free DashMaps.
-#[derive(Debug)]
-enum ServerMessage {
-    /// Clean up after a client disconnects.
-    SessionTerminated { client_id: ClientId },
-}
-
-impl ServiceHandler for Server {
-    type Message = ServerMessage;
-
-    async fn handle(&mut self, msg: ServerMessage) {
-        match msg {
-            ServerMessage::SessionTerminated { client_id } => {
-                tracing::info!("Client {} disconnected", client_id);
-            }
-        }
-    }
-}
-
-/// Cleans up after a client disconnects.
-fn session_terminated(client_id: ClientId) -> Result<()> {
-    SERVICE.send(ServerMessage::SessionTerminated { client_id })
 }
 
 // =============================================================================
@@ -317,9 +307,7 @@ struct Session {
     pub(super) installed_programs: HashSet<ProgramName>,
     /// Per-process file delivery waiters (client → process).
     pub(super) file_waiters: HashMap<ProcessId, tokio::sync::oneshot::Sender<Bytes>>,
-    ws_msg_tx: mpsc::Sender<WsMessage>,
-    send_pump: JoinHandle<()>,
-    recv_pump: JoinHandle<()>,
+    out_tx: mpsc::Sender<WireServerMessage>,
     authenticated: bool,
     pending_auth: Option<PendingAuth>,
     /// Pending MCP relay requests awaiting client response.
@@ -329,73 +317,28 @@ struct Session {
 }
 
 impl Session {
-    /// Creates a new Session, accepting the TCP connection and spawning WS pumps.
-    async fn new(id: ClientId, tcp_stream: TcpStream, state: Arc<ServerState>) -> Result<Self> {
-        let (ws_msg_tx, mut ws_msg_rx) = mpsc::channel(1000);
-
-        let ws_stream = accept_async(tcp_stream).await?;
-        let (mut ws_writer, mut ws_reader) = ws_stream.split();
-
-        // WebSocket send pump
-        let send_pump = task::spawn(async move {
-            while let Some(message) = ws_msg_rx.recv().await {
-                if let Err(e) = ws_writer.send(message).await {
-                    tracing::error!("Error writing to ws stream: {:?}", e);
-                    break;
-                }
-            }
-            let _ = ws_writer.close().await;
-        });
-
-        // WebSocket receive pump - forwards to session actor
-        let recv_pump = {
-            let client_id = id;
-            task::spawn(async move {
-                while let Some(Ok(ws_msg)) = ws_reader.next().await {
-                    let bytes = match ws_msg {
-                        WsMessage::Binary(bytes) => bytes,
-                        WsMessage::Close(_) => break,
-                        _ => continue,
-                    };
-
-                    let client_msg = match rmp_serde::decode::from_slice::<ClientMessage>(&bytes) {
-                        Ok(msg) => msg,
-                        Err(e) => {
-                            tracing::error!("Failed to decode client msgpack: {:?}", e);
-                            continue;
-                        }
-                    };
-
-                    // Send directly to session actor
-                    if CLIENT_SERVICES
-                        .send(&client_id, SessionMessage::ClientRequest(client_msg))
-                        .is_err()
-                    {
-                        break;
-                    }
-                }
-                // Session disconnected - trigger cleanup
-                session_terminated(client_id).ok();
-            })
-        };
-
-        Ok(Session {
+    /// Create a headless session served over worker edge-rpc.
+    fn new_inproc(
+        id: ClientId,
+        state: Arc<ServerState>,
+        out_tx: mpsc::Sender<WireServerMessage>,
+    ) -> Self {
+        Session {
             id,
-            username: String::new(),
+            // Gateway is the trusted edge; worker sessions start authenticated.
+            username: "internal".to_string(),
             state,
             inflight_uploads: DashMap::new(),
             attached_processes: Vec::new(),
             attached_workflows: Vec::new(),
             installed_programs: HashSet::new(),
             file_waiters: HashMap::new(),
-            ws_msg_tx,
-            send_pump,
-            recv_pump,
-            authenticated: false,
+            out_tx,
+            authenticated: true,
             pending_auth: None,
             pending_mcp: HashMap::new(),
             mcp_corr_id: 1,
-        })
+        }
     }
 
     /// Cleanup when session is terminated.
@@ -407,8 +350,7 @@ impl Session {
             workflow::detach(&wf_id);
         }
 
-        self.recv_pump.abort();
-        self.state.clients.remove(&self.id);
+        SESSION_OUTBOX.remove(&self.id);
         CLIENT_SERVICES.remove(&self.id);
         MCP_REGISTRATIONS.remove(&self.id);
     }
@@ -595,15 +537,8 @@ impl Session {
 
 impl Session {
     async fn send(&self, msg: WireServerMessage) {
-        if let Ok(encoded) = rmp_serde::to_vec_named(&msg) {
-            if self
-                .ws_msg_tx
-                .send(WsMessage::Binary(encoded.into()))
-                .await
-                .is_err()
-            {
-                tracing::error!("WS write error for client {}", self.id);
-            }
+        if self.out_tx.send(msg).await.is_err() {
+            tracing::error!("inproc session sink closed for client {}", self.id);
         }
     }
 
@@ -742,16 +677,6 @@ impl Session {
                 token_budgets,
             } => {
                 self.handle_run_processes(corr_id, inferlet, inputs, token_budgets)
-                    .await
-            }
-
-            ClientMessage::LaunchDaemon {
-                corr_id,
-                port,
-                inferlet,
-                input,
-            } => {
-                self.handle_launch_daemon(corr_id, port, inferlet, input)
                     .await
             }
 
