@@ -63,14 +63,19 @@ struct StepTiming {
 class StepEncoder {
   public:
     void set_pso(Pso pso);
-    // Bind the prebuilt argument table for a (kernel, layer) dispatch instance.
-    void set_argtable(Kernel k, int layer = -1);
+    // Bind the prebuilt argument table for a dispatch instance, keyed by its FLAT
+    // ORDINAL (beta's DAG walker: 0..321, unique + stable token-to-token since the CB
+    // is byte-identical). `k` is a decorative tag (charlie's dump naming) — the ordinal
+    // alone is the key, because within one layer Rms/Residual recur (so (kind,layer) is
+    // NOT unique). Prefer set_argtable_ordinal; this overload forwards `layer` as ordinal.
+    void set_argtable(Kernel k, int ordinal = -1);
+    void set_argtable_ordinal(int ordinal);
     void dispatch(Grid grid, Threadgroup tg);
     void barrier();  // device-visibility barrier between dependent dispatches
 
-    // convenience: one fused call per dispatch
-    void encode(Pso pso, Kernel k, int layer, Grid grid, Threadgroup tg) {
-        set_pso(pso); set_argtable(k, layer); dispatch(grid, tg); barrier();
+    // convenience: one fused call per dispatch (ordinal-keyed)
+    void encode(Pso pso, Kernel k, int ordinal, Grid grid, Threadgroup tg) {
+        set_pso(pso); set_argtable_ordinal(ordinal); dispatch(grid, tg); barrier();
     }
 
   private:
@@ -101,12 +106,17 @@ class RawMetalContext {
     void make_resident();
 
     // ── (2) Argument-table bind, keyed by delta's bind:: enums (built once, I2) ──
-    // `layer` disambiguates per-layer dispatch instances of the same Kernel kind
-    // (e.g. QmvIn recurs across all GDN layers with distinct weight slots).
-    // Use layer = -1 for singleton kernels (EmbedGather / FinalRms / Argmax).
-    void arg_bind(Kernel k, int layer, uint8_t bind_index, SlotHandle slot,
+    // The arg-table key is the FLAT DISPATCH ORDINAL (beta's DAG walker, 0..321):
+    // unique + stable token-to-token. `layer`/`k` are decorative (charlie's dump
+    // naming) — they DON'T disambiguate, because within one layer-cycle Rms and
+    // Residual each recur, so (kind, layer) collides. Pass the dispatch ordinal as
+    // the int param; delta + beta share the same ordinal space.
+    void arg_bind(Kernel k, int ordinal, uint8_t bind_index, SlotHandle slot,
                   size_t offset = 0);
-    // delta's exact 1-arg-less form for singleton kernels (layer = -1).
+    // Explicit ordinal-keyed form (kind elided — the ordinal is the only key).
+    void arg_bind_ordinal(int ordinal, uint8_t bind_index, SlotHandle slot,
+                          size_t offset = 0);
+    // delta's exact 1-arg-less form for singleton kernels (ordinal = -1).
     void arg_bind(Kernel k, uint8_t bind_index, SlotHandle slot, size_t offset = 0) {
         arg_bind(k, -1, bind_index, slot, offset);
     }

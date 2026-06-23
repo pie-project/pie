@@ -36,7 +36,13 @@ struct DecodeGeometry {
     int   n_layers          = 24;
     int   vocab             = 248320;
     float eps               = 1e-6f;
-    bool  tied_embeddings   = true;   // lm_head == embed table
+    // TIED, but the CANONICAL stored side is the top-level 4-bit `lm_head.{weight,
+    // scales,biases}` (U32 [248320,128]-packed = [248320,1024] logical, group=64);
+    // `embed_tokens.weight` is ABSENT in this checkpoint (alpha's st_probe, #mac).
+    // heap_bind binds the ONE shared lm_head bundle to BOTH bind::Embed (EmbedGather
+    // dequantizes row token_id) AND QmvLmHead/Argmax — single Weights slot, no
+    // duplicate 127MB. The ported embed_gather kernel is already 4-bit dequant-gather.
+    bool  tied_embeddings   = true;   // lm_head is the stored table; embed aliases it
 
     // full-attention layers
     int   n_q_heads         = 8;
@@ -106,42 +112,94 @@ enum class Sdpa : uint8_t {
     KHeadStride = 6, VHeadStride = 7,
 };
 
-// rms_single_row: group=(row/N_READS), grid=(1,1,1).
-enum class Rms : uint8_t { X = 0, W = 1, Out = 2, Axis = 3, Eps = 4 };
+// rms_single_row: group=(row/N_READS), grid=(1,1,1). Buffer 3 is a packed
+// RmsParams{eps, axis_size, w_stride, plus_one}. qwen3.5 sets plus_one=1 for ALL
+// norms (attn_norm/q_norm/k_norm/ffn_norm/final_norm) → effective gain (1+weight).
+enum class Rms : uint8_t { X = 0, W = 1, Out = 2, Params = 3 };
+
+// residual add (golden `attn_resid`, `layer_out`): Out = X + Residual, elementwise.
+enum class Residual : uint8_t { X = 0, Residual = 1, Out = 2 };
+
+// SwiGLU (golden `swiglu`): Out = silu(Gate) * Up, elementwise over intermediate.
+enum class SiluMul : uint8_t { Gate = 0, Up = 1, Out = 2 };
+
+// dense bf16 GEMV (M=1) for GDN `gdn_in_a`/`gdn_in_b` (in_proj_a/b stored DENSE
+// bf16 [V_h,hidden], NOT 4-bit). Out[N] = sum_k W[N,K]*X[K], float accum.
+enum class Dense : uint8_t { W = 0, X = 1, Out = 2, K = 3, N = 4 };
+
+// q_gate_split: deinterleave 2x-wide q_proj output (qwen3.5 gated attn).
+// qg[n_q,2,head_dim] -> Q[n_q,head_dim] + gate[n_q,head_dim]. Internal (no golden tag).
+enum class QSplit : uint8_t { Qg = 0, QOut = 1, GateOut = 2, HeadDim = 3 };
+
+// attn_gate: attn *= sigmoid(gate) before o_proj (golden tag `attn_gated`). In-place.
+enum class AttnGate : uint8_t { Attn = 0, Gate = 1 };
 
 // single-token rope (partial + mrope): PositionPtr is IO::Position (I1).
 enum class Rope : uint8_t { Q = 0, K = 1, QOut = 2, KOut = 3, PositionPtr = 4, Theta = 5 };
 
-// embedding gather: TokenIdPtr is IO::TokenId (I1).
-enum class Embed : uint8_t { Table = 0, TokenIdPtr = 1, Out = 2 };
+// embedding gather (4-bit dequant of the shared lm_head bundle; tied). TokenId is
+// IO::TokenId (I1). Matches embed_gather.metal: W/Scales/Biases (same 4-bit packing
+// as Qmv) + token id + out + hidden. Bound to the SAME lm_head slots as QmvLmHead.
+enum class Embed : uint8_t { W = 0, Scales = 1, Biases = 2, TokenId = 3, Out = 4, Hidden = 5 };
 
 // KV append (in-place write at position): PositionPtr is IO::Position (I1).
 enum class KvAppend : uint8_t { K = 0, V = 1, KPages = 2, VPages = 3, PositionPtr = 4 };
 
-// GDN fused core (1 dispatch — beta): folds conv1d + l2norm*2 + gating + GQA-repeat +
-// recurrent-step. Reads `mixed` + resident conv/recurrent state; writes state IN-PLACE,
-// emits core_out[gdn_v_total]. recurrent_state is NATIVE [Vh,Vd,Kd] (prong-1, no transpose).
+// GDN fused core (1 dispatch — beta): folds conv1d+silu + l2norm*2 + q-scale + gating +
+// GQA-repeat + recurrent-step. Reads `mixed` (in-proj conv input) + per-layer conv/gating
+// weights + resident conv/recurrent state; emits core_out[gdn_v_total].
+// Buffer indices below MATCH beta's gdn_core.metal [[buffer(i)]] signature exactly.
+//   * RecurrentState (2) is updated IN-PLACE (each (req,v-head,v-dim) row owned by one
+//     threadgroup -> race-free; native [Vh,Vd,Kd], prong-1, no transpose).
+//   * ConvState (1) is READ-ONLY; the shifted result is written to a PING-PONG
+//     ConvStateOut (10) and swapped per token. In-place conv_state races (convsilu reads
+//     the Kc-tap history while redundant v-dim threadgroups shift it — beta measured 5.5).
 enum class GdnCore : uint8_t {
-    Mixed = 0, ConvState = 1, RecurrentState = 2, CoreOut = 3,
-    // outputs (in-place): ConvState/RecurrentState rebound to the same heap slot.
+    Mixed        = 0,  // in-proj conv input (T)
+    ConvState    = 1,  // conv history (float, RO)
+    RecurrentState = 2,  // [Vh,Vd,Kd] (float, in/out, in-place)
+    CoreOut      = 3,  // core_out[gdn_v_total] (out, T)
+    ConvW        = 4,  // conv1d weight (T)
+    ConvB        = 5,  // conv1d bias (T)
+    ALog         = 6,  // A_log decay param (T)
+    DtBias       = 7,  // dt_bias gating param (T)
+    AGate        = 8,  // a_gate projection (T)
+    BGate        = 9,  // b_gate projection (T)
+    ConvStateOut = 10, // new_conv_state (float, out, ping-pong w/ ConvState)
+    Params       = 11, // GdnCoreParams& (constant, static geometry, I1-safe)
 };
 
-// gated rmsnorm: rms(core_out) * silu(z).
-enum class GatedRms : uint8_t { X = 0, Z = 1, W = 2, Out = 3, Eps = 4 };
+// gated RMSNorm (GDN; golden `gdn_core` = post-norm): Out = (1+0)·rmsnorm(X)·silu(Z)
+// over V_d per V_head. W = gate_norm_w (RAW, F32, NO +1). Buffer 4 = GatedRmsParams
+// {eps, vd}. Gates against golden `gdn_core` (gated-RMSNorm folded in).
+enum class GatedRms : uint8_t { X = 0, Z = 1, W = 2, Out = 3, Params = 4 };
 
 // device argmax (optional substrate, I3): Logits → NextToken.
 enum class Argmax : uint8_t { Logits = 0, NextToken = 1 };
 
 }  // namespace bind
 
-// ── Dispatch DAG kernel kinds (per-step encode order; see wiki mac-raw-metal-decode-dag) ──
-// Counts (locked): GDN layer = 6 dispatches (GdnCore=1), full-attn = 11, mlp = 6.
-// Total ≈ 1 + 18*6 + 6*11 + 24*6 + 3 ≈ 322 dispatches; barriers ≈ 250 (re-encode path,
-// ICB out). Metal-4 measured encode ~0.05ms → GPU-exec is the gate; GdnCore=1 fusion the lever.
+// ── Dispatch DAG kernel kinds (per-step encode order) ──
+// Surface locked vs charlie's authoritative golden tag set (wiki mac-golden-kernel-surface).
+// Every golden tag maps 1:1 to a Kernel kind below; kinds sharing a .metal/PSO differ only
+// by dispatch dims + golden tag (e.g. all Qmv* -> affine_qmv; Rms/FfnRms/QNorm/KNorm/FinalRms
+// -> rms_single_row; RopeQ/RopeK -> rope; AttnResid/LayerOut -> residual_add). Internal
+// (untapped) kinds: QSplit, KvAppend, GdnCore-pre (beta's pre-GatedRms core_out).
+//
+// Counts (qwen3.5, 6 full-attn + 18 GDN + 24 mlp): full-attn layer = 20 dispatches
+// (18 golden taps + QSplit + KvAppend), GDN layer = 15 (14 taps; `gdn_core` tap covers
+// GdnCore+GatedRms = 2 dispatches), layer-less = 3 (embed/final_norm/logits).
+// Total ≈ 3 + 6*20 + 18*15 = 393 dispatches / 363 golden taps. Argmax = optional I3
+// substrate (no golden tag). Metal-4 encode ~0.05ms → GPU-exec is the gate; GdnCore=1 the lever.
 enum class Kernel : uint8_t {
-    EmbedGather, Rms, QmvIn, GdnCore, GatedRms, QmvOut, Residual,
-    QmvQ, QmvK, QmvV, QNorm, KNorm, Rope, KvAppend, Sdpa, QmvO,
-    QmvGate, QmvUp, SiluMul, QmvDown,
+    EmbedGather,
+    // GDN in-projection (4 separate projections: qkv/z 4-bit, a/b DENSE bf16):
+    Rms, QmvIn, QmvInZ, GdnInA, GdnInB, GdnCore, GatedRms, QmvOut, Residual,
+    // Full-attention block:
+    QmvQ, QSplit, QmvK, QmvV, QNorm, KNorm, Rope, RopeK, KvAppend, Sdpa, AttnGate, QmvO,
+    // Shared SwiGLU MLP block:
+    FfnRms, QmvGate, QmvUp, SiluMul, QmvDown, LayerOut,
+    // Layer-less tail:
     FinalRms, QmvLmHead, Argmax,
 };
 

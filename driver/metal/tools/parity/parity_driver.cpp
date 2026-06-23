@@ -300,7 +300,13 @@ int main(int argc, char** argv) {
 
     // Cross-check: the real driver Forward path (InProcService -> Executor ->
     // sampler) greedy-samples the same token as the raw-graph argmax.
-    {
+    //
+    // SKIP during golden capture (PIE_METAL_GOLDEN_DIR set): this cross-check
+    // runs an N=8 *prefill* Forward, whose per-kernel dump_kernel() taps would
+    // overwrite the decode-loop's N=1 step dumps (last-write-wins) — corrupting
+    // the M=1 decode golden the raw-Metal port is gated against. The sampler==
+    // argmax assertion isn't needed for the golden, so we skip it here.
+    if (std::getenv("PIE_METAL_GOLDEN_DIR") == nullptr) {
         Executor exec(*model.graph, *model.kv);
         exec.set_linear_state_cache(model.lin_cache.get());  // qwen3.6 hybrid
         // The raw-graph forward above already wrote recurrent/conv state into
