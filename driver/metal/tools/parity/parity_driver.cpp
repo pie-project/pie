@@ -86,30 +86,68 @@ int main(int argc, char** argv) {
         write_idx[i] = i;  // single page 0, contiguous
     }
 
-    // Stage the prefill ForwardBatch exactly like Executor::run_forward does
-    // (single request, sample the last token row).
-    model::ForwardBatch batch{
-        /*token_ids=*/        mx::array(ids.data(), {n}, mx::int32),
-        /*positions=*/        mx::array(positions.data(), {n}, mx::int32),
-        /*logit_rows=*/       mx::array({n - 1}, {1}, mx::int32),
-        /*kv_page_indices=*/  mx::array({0}, {1}, mx::int32),
-        /*kv_page_indptr=*/   mx::array({0, 1}, {2}, mx::int32),
-        /*kv_last_page_lens=*/mx::array({n}, {1}, mx::int32),
-        /*qo_indptr=*/        mx::array({0, n}, {2}, mx::int32),
-        /*kv_write_indices=*/ mx::array(write_idx.data(), {n}, mx::int32),
-        /*n_total=*/    n,
-        /*n_requests=*/ 1,
-        /*n_slots=*/    1,
-        /*pure_decode=*/false,
-    };
+    // Isolation mode (PIE_PARITY_DECODE=1): feed the prompt one token at a time
+    // through the *decode* path (linear-attn T=1 recurrence carried in
+    // lin_cache, full-attn KV grown per step) instead of the single varlen
+    // prefill. Decisive for localizing the qwen3.6 length-dependent drift: if
+    // decode-loop matches mlx-lm but varlen-prefill doesn't, the bug is in
+    // gated_delta_net_varlen; if both drift equally, it's a formula diff vs the
+    // reference (decode and varlen share identical per-step prep + recurrence).
+    const char* dec = std::getenv("PIE_PARITY_DECODE");
+    const bool decode_mode = dec != nullptr && dec[0] != '\0' && dec[0] != '0';
 
-    // Hybrid linear-attention seam (qwen3.6): single-request prefill → slot 0,
-    // varlen path (qo_indptr_host={0,n}). Null/empty for non-hybrid archs.
-    batch.lin_cache = model.lin_cache.get();
-    batch.slot_ids  = mx::array({0}, {1}, mx::int32);
-    batch.qo_indptr_host = {0, n};
+    mx::array logits = [&] {
+        if (!decode_mode) {
+            // Single varlen prefill (single request, sample the last row).
+            model::ForwardBatch batch{
+                /*token_ids=*/        mx::array(ids.data(), {n}, mx::int32),
+                /*positions=*/        mx::array(positions.data(), {n}, mx::int32),
+                /*logit_rows=*/       mx::array({n - 1}, {1}, mx::int32),
+                /*kv_page_indices=*/  mx::array({0}, {1}, mx::int32),
+                /*kv_page_indptr=*/   mx::array({0, 1}, {2}, mx::int32),
+                /*kv_last_page_lens=*/mx::array({n}, {1}, mx::int32),
+                /*qo_indptr=*/        mx::array({0, n}, {2}, mx::int32),
+                /*kv_write_indices=*/ mx::array(write_idx.data(), {n}, mx::int32),
+                /*n_total=*/    n,
+                /*n_requests=*/ 1,
+                /*n_slots=*/    1,
+                /*pure_decode=*/false,
+            };
+            batch.lin_cache = model.lin_cache.get();
+            batch.slot_ids  = mx::array({0}, {1}, mx::int32);
+            batch.qo_indptr_host = {0, n};
+            return model.graph->forward(batch, *model.kv);  // [1, vocab]
+        }
 
-    mx::array logits = model.graph->forward(batch, *model.kv);  // [1, vocab]
+        // Decode loop: one token per step, state carried across steps.
+        std::cerr << "[parity] DECODE-loop isolation (token-by-token)\n";
+        if (model.lin_cache) model.lin_cache->reset_slot(0);
+        mx::array last = mx::zeros({1, c.vocab_size}, mx::float32);
+        for (int t = 0; t < n; ++t) {
+            model::ForwardBatch step{
+                /*token_ids=*/        mx::array({ids[t]}, {1}, mx::int32),
+                /*positions=*/        mx::array({t}, {1}, mx::int32),
+                /*logit_rows=*/       mx::array({0}, {1}, mx::int32),
+                /*kv_page_indices=*/  mx::array({0}, {1}, mx::int32),
+                /*kv_page_indptr=*/   mx::array({0, 1}, {2}, mx::int32),
+                /*kv_last_page_lens=*/mx::array({t + 1}, {1}, mx::int32),
+                /*qo_indptr=*/        mx::array({0, 1}, {2}, mx::int32),
+                /*kv_write_indices=*/ mx::array({t}, {1}, mx::int32),
+                /*n_total=*/    1,
+                /*n_requests=*/ 1,
+                /*n_slots=*/    1,
+                /*pure_decode=*/true,
+            };
+            step.lin_cache = model.lin_cache.get();
+            step.slot_ids  = mx::array({0}, {1}, mx::int32);
+            step.qo_indptr_host = {0, 1};
+            last = model.graph->forward(step, *model.kv);  // [1, vocab]
+            mx::eval(last);  // force state writes before the next step
+        }
+        return last;
+    }();
+
+
     mx::array row = mx::astype(mx::reshape(logits, {c.vocab_size}), mx::float32);
     mx::eval(row);
 
