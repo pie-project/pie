@@ -1,6 +1,7 @@
 #include "model_loader.hpp"
 
 #include <stdexcept>
+#include <vector>
 
 #include "hf_config.hpp"
 #include "safetensors_source.hpp"
@@ -83,19 +84,48 @@ LoadedModel load_model(const std::string& hf_path, const BatchingConfig& batchin
     // 4. Allocate the paged-KV cache from the real model geometry.
     const DType activation = dtype_from_torch(out.config.torch_dtype);
     const DType kv_dtype = resolve_kv_dtype(batching.kv_cache_dtype, activation);
-    PagedKvGeometry geo;
-    geo.n_layers   = out.config.num_hidden_layers;
-    geo.n_pages    = static_cast<int>(batching.total_pages);
-    geo.page_size  = static_cast<int>(batching.kv_page_size);
-    geo.n_kv_heads = out.config.num_key_value_heads;
-    geo.head_dim   = out.config.head_dim;
-    out.kv = std::make_unique<PagedKvCache>(geo, kv_dtype);
+    const model::ArchSpec spec = model::arch_spec_for(out.config.arch, out.config);
+    const int n_layers   = out.config.num_hidden_layers;
+    const int total_pages = static_cast<int>(batching.total_pages);
+    const int page_size   = static_cast<int>(batching.kv_page_size);
+
+    if (out.config.arch == model::PieArch::Gemma4) {
+        // gemma4: per-layer KV geometry. Sliding layers use head_dim, full-attn
+        // layers use global_head_dim, and the trailing num_kv_shared_layers
+        // re-attend through an earlier same-type layer (n_pages=0 = no buffer;
+        // the graph reads k_pages(kv_source) and skips append on those layers).
+        const int global_hd = out.config.global_head_dim > 0
+                                  ? out.config.global_head_dim
+                                  : out.config.head_dim;
+        const int global_kv_heads = out.config.num_global_kv_heads > 0
+                                        ? out.config.num_global_kv_heads
+                                        : out.config.num_key_value_heads;
+        std::vector<PagedKvLayerSpec> specs;
+        specs.reserve(n_layers);
+        for (int il = 0; il < n_layers; ++il) {
+            const bool sliding = spec.is_sliding_layer(il);
+            const bool shared  = spec.gemma4_is_kv_shared(il, n_layers);
+            PagedKvLayerSpec s;
+            s.n_pages    = shared ? 0 : total_pages;
+            s.n_kv_heads = sliding ? out.config.num_key_value_heads : global_kv_heads;
+            s.head_dim   = sliding ? out.config.head_dim : global_hd;
+            specs.push_back(s);
+        }
+        out.kv = std::make_unique<PagedKvCache>(page_size, std::move(specs), kv_dtype);
+    } else {
+        PagedKvGeometry geo;
+        geo.n_layers   = n_layers;
+        geo.n_pages    = total_pages;
+        geo.page_size  = page_size;
+        geo.n_kv_heads = out.config.num_key_value_heads;
+        geo.head_dim   = out.config.head_dim;
+        out.kv = std::make_unique<PagedKvCache>(geo, kv_dtype);
+    }
 
     // 5. Hybrid linear-attention models (qwen3.6): allocate the separate,
     //    fixed-size-per-slot conv + recurrent Gated-DeltaNet state cache. The
     //    number of linear layers comes from the per-layer attention schedule
     //    ('l' entries); geometry from the config's linear_* fields.
-    const model::ArchSpec spec = model::arch_spec_for(out.config.arch, out.config);
     int n_linear = 0;
     for (char k : spec.layer_pattern)
         if (k == 'l') ++n_linear;

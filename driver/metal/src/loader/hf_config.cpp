@@ -175,6 +175,13 @@ model::ModelConfig parse_doc(const json& root, const std::string& where) {
 
     // ── gemma4 ──
     cfg.gemma4_enable_moe    = get_or<bool>(j, "enable_moe_block", false);
+    cfg.global_head_dim      = get_or<int>(j, "global_head_dim", 0);
+    // num_global_key_value_heads is often JSON null → treat as 0 (= fall back to
+    // num_key_value_heads). Only read when it's an actual number.
+    if (auto it = j.find("num_global_key_value_heads");
+        it != j.end() && it->is_number_integer()) {
+        cfg.num_global_kv_heads = it->get<int>();
+    }
     // PLE feature width: HF spells it hidden_size_per_layer_input (some dumps
     // gemma_hidden_size_per_layer_input).
     cfg.per_layer_emb_dim    = get_or<int>(
