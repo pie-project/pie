@@ -12,6 +12,8 @@ const char* pie_arch_name(PieArch a) {
         case PieArch::Mixtral:   return "mixtral";
         case PieArch::Gemma2:    return "gemma2";
         case PieArch::Gemma3:    return "gemma3";
+        case PieArch::Gemma4:    return "gemma4";
+        case PieArch::Qwen36:    return "qwen3.6";
         case PieArch::Unknown:   return "unknown";
     }
     return "unknown";
@@ -33,6 +35,16 @@ PieArch hf_model_type_to_pie_arch(const std::string& t) {
     if (t == "gemma2")     return PieArch::Gemma2;
     if (t == "gemma3" ||
         t == "gemma3_text") return PieArch::Gemma3;
+    if (t == "gemma4" ||
+        t == "gemma4_text") return PieArch::Gemma4;
+
+    // Qwen3.6 (Qwen3.5 hybrid linear-attn family). The cuda reference handles
+    // this family under the qwen3_5* model_type; the published checkpoint may
+    // also carry the literal "qwen3_6"/"qwen3.6". Accept all spellings.
+    if (t == "qwen3_5" || t == "qwen3_5_text" ||
+        t == "qwen3_5_moe" || t == "qwen3_5_moe_text" ||
+        t == "qwen3_6" || t == "qwen3.6" || t == "qwen3_6_moe")
+        return PieArch::Qwen36;
 
     return PieArch::Unknown;
 }

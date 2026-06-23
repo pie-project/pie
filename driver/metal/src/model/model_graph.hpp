@@ -58,7 +58,8 @@ class ModelGraph {
 public:
     virtual ~ModelGraph() = default;
 
-    // Build the lazy forward graph; returns logits `[vocab, n_slots]`.
+    // Build the lazy forward graph; returns logits `[n_slots, vocab]`
+    // (token-major: one row per sampling slot; sampler does argmax over axis=1).
     virtual Tensor forward(const ForwardBatch& batch, KvCacheView& kv) = 0;
 
     virtual const ModelConfig& config() const = 0;
@@ -69,6 +70,13 @@ public:
 // Throws on PieArch::Unknown / unimplemented archs.
 std::unique_ptr<ModelGraph> make_model_graph(const ModelConfig& cfg,
                                              ModelWeights weights);
+
+// Data-driven weight binding: switches on `cfg.arch` to pick the matching
+// `bind_*` builder (bind_llama_like for llama/qwen/mistral/MoE, bind_gemma for
+// gemma2/3), resolving HF tensor names from `src` into a ModelWeights. This is
+// the single entry point the loader (delta) / runtime assembly (alpha) calls —
+// no need to branch on arch at the call site. Throws on unimplemented archs.
+ModelWeights bind_weights(const WeightSource& src, const ModelConfig& cfg);
 
 }  // namespace model
 }  // namespace pie_metal_driver

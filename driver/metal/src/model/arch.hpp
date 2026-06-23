@@ -30,6 +30,12 @@ enum class PieArch {
     // ── Gemma dense family (separate builder) ──
     Gemma2,     // HF "gemma2" — softcaps, alternating SWA
     Gemma3,     // HF "gemma3" / "gemma3_text" — per-head qk-norm, every-6 SWA
+    Gemma4,     // HF "gemma4" / "gemma4_text" — PLE, KV-share, parallel MoE,
+                // per-attn-type rope, per-layer scalar
+
+    // ── Qwen3.6 (Qwen3.5 hybrid family) — own builder ──
+    Qwen36,     // HF "qwen3_5"/"qwen3_5_moe"/"qwen3_6"/"qwen3.6" — gated
+                // DeltaNet linear-attn + full-attn, output-gate, partial rope, MoE
 
     Unknown,
 };

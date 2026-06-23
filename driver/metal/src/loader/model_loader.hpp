@@ -12,6 +12,7 @@
 
 #include "../config.hpp"            // BatchingConfig
 #include "../kv_cache.hpp"          // PagedKvCache
+#include "../linear_state_cache.hpp" // LinearStateCache (qwen3.6 linear-attn)
 #include "../model/config.hpp"      // model::ModelConfig
 #include "../model/model_graph.hpp" // model::ModelGraph
 #include "../ops/tensor.hpp"        // DType
@@ -53,6 +54,10 @@ struct LoadedModel {
     ModelCapabilities                 caps;
     std::unique_ptr<model::ModelGraph> graph;
     std::unique_ptr<PagedKvCache>      kv;
+    // Present only for hybrid linear-attention models (qwen3.6); null otherwise.
+    // Holds the per-slot conv + recurrent Gated-DeltaNet state, allocated from
+    // the model's linear_* geometry and driven alongside the paged-KV cache.
+    std::unique_ptr<LinearStateCache>  lin_cache;
 };
 
 // Load the model snapshot at `hf_path` and allocate its paged-KV cache using
