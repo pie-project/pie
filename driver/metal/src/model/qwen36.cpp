@@ -2,11 +2,14 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <stdexcept>
 #include <string>
 #include <vector>
 
 #include <mlx/ops.h>
+#include <mlx/io.h>
 
 #include "ops/ops.hpp"
 #include "linear_state_cache.hpp"  // delta-owned; complete type for gated_delta_net
@@ -28,6 +31,27 @@ Tensor to_heads(const Tensor& x, std::int32_t n_tokens,
 
 Tensor from_heads(const Tensor& x, std::int32_t n_tokens, std::int32_t width) {
     return mx::reshape(x, {n_tokens, width});
+}
+
+// Env-gated per-decoder-layer hidden-state dump for parity bisection.
+// When PIE_METAL_DUMP_LAYERS is set to a directory, writes the residual-stream
+// hidden state ([n_tokens, hidden], fp32) after each decoder layer as
+// `<dir>/qwen36_layer_<NN>.npy`, mirroring HF `output_hidden_states`:
+//   layer_00 = token embeddings (HF index 0)
+//   layer_<il+1> = output of decoder layer `il` (HF index il+1)
+//   layer_final = post-final-norm hidden (pre-LM-head)
+void maybe_dump_hidden(std::int32_t slot, const Tensor& h) {
+    static const char* dir = std::getenv("PIE_METAL_DUMP_LAYERS");
+    if (dir == nullptr) return;
+    Tensor hf = mx::astype(h, mx::float32);
+    mx::eval(hf);
+    char name[32];
+    if (slot < 0) {
+        std::snprintf(name, sizeof(name), "qwen36_layer_final.npy");
+    } else {
+        std::snprintf(name, sizeof(name), "qwen36_layer_%02d.npy", slot);
+    }
+    mx::save(std::string(dir) + "/" + name, hf);
 }
 
 }  // namespace
@@ -166,6 +190,7 @@ Tensor Qwen36Graph::forward(const ForwardBatch& batch, KvCacheView& kv) {
 
     // Qwen does NOT scale embeddings (unlike Gemma).
     Tensor hidden = ops::embedding(w_.embed, batch.token_ids);
+    maybe_dump_hidden(0, hidden);  // HF output_hidden_states[0] = embeddings
 
     std::int32_t lin_ordinal = 0;
     for (std::int32_t il = 0; il < Lc; ++il) {
@@ -175,9 +200,11 @@ Tensor Qwen36Graph::forward(const ForwardBatch& batch, KvCacheView& kv) {
             hidden = full_attn_layer(il, hidden, batch, kv);
         }
         hidden = mlp_block(il, hidden);
+        maybe_dump_hidden(il + 1, hidden);  // HF output_hidden_states[il+1]
     }
 
     hidden = ops::rms_norm(hidden, w_.final_norm, eps, /*plus_one=*/true);
+    maybe_dump_hidden(-1, hidden);  // post-final-norm (pre-LM-head)
     Tensor sampled = ops::gather_rows(hidden, batch.logit_rows);
 
     const Tensor& lm_head = cfg_.tie_word_embeddings ? w_.embed : *w_.lm_head;
