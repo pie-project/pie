@@ -46,9 +46,9 @@ Tensor GemmaGraph::decoder_layer(std::int32_t il,
     Tensor residual = hidden;
     Tensor cur = ops::rms_norm(hidden, *L.attn_norm, cfg_.rms_norm_eps, plus_one);
 
-    Tensor Q = ops::linear(L.q_proj, cur);
-    Tensor K = ops::linear(L.k_proj, cur);
-    Tensor V = ops::linear(L.v_proj, cur);
+    Tensor Q = apply_linear(L.q_proj, cur);
+    Tensor K = apply_linear(L.k_proj, cur);
+    Tensor V = apply_linear(L.v_proj, cur);
 
     Q = to_heads(Q, n_total, n_q_heads,  head_dim);
     K = to_heads(K, n_total, n_kv_heads, head_dim);
@@ -87,7 +87,7 @@ Tensor GemmaGraph::decoder_layer(std::int32_t il,
         batch.kv_last_page_lens, kv.page_size(), ap);
 
     attn = from_heads(attn, n_total, n_q_heads * head_dim);
-    Tensor attn_out = ops::linear(L.o_proj, attn);
+    Tensor attn_out = apply_linear(L.o_proj, attn);
     // Post-attention norm applied to the sub-layer output before the residual.
     if (L.post_attn_norm) {
         attn_out = ops::rms_norm(attn_out, *L.post_attn_norm,
@@ -98,10 +98,10 @@ Tensor GemmaGraph::decoder_layer(std::int32_t il,
     // ── FFN block (norm sandwich) ──
     Tensor ffn_residual = hidden;
     Tensor normed = ops::rms_norm(hidden, *L.ffn_norm, cfg_.rms_norm_eps, plus_one);
-    Tensor gate = ops::linear(*L.gate_proj, normed);
-    Tensor up   = ops::linear(*L.up_proj,   normed);
-    Tensor ffn_out = ops::linear(*L.down_proj,
-                                 ops::geglu(gate, up, /*tanh_approx=*/true));
+    Tensor gate = apply_linear(*L.gate_proj, normed);
+    Tensor up   = apply_linear(*L.up_proj,   normed);
+    Tensor ffn_out = apply_linear(*L.down_proj,
+                                  ops::geglu(gate, up, /*tanh_approx=*/true));
     if (L.post_ffn_norm) {
         ffn_out = ops::rms_norm(ffn_out, *L.post_ffn_norm,
                                 cfg_.rms_norm_eps, plus_one);
@@ -123,8 +123,9 @@ Tensor GemmaGraph::forward(const ForwardBatch& batch, KvCacheView& kv) {
     Tensor sampled = ops::gather_rows(hidden, batch.logit_rows);
 
     // Gemma ties word embeddings.
-    const Tensor& lm_head = cfg_.tie_word_embeddings ? w_.embed : *w_.lm_head;
-    Tensor logits = ops::linear(lm_head, sampled);  // [n_slots, vocab]
+    Tensor logits = w_.lm_head
+        ? apply_linear(*w_.lm_head, sampled)   // [n_slots, vocab]
+        : ops::linear(w_.embed, sampled);      // tied, dense embed
 
     // Gemma 2 final logit soft-cap.
     if (spec_.final_softcap > 0.0f) {
@@ -138,10 +139,8 @@ ModelWeights bind_gemma(const WeightSource& src, const ModelConfig& cfg) {
     ModelWeights w;
     w.embed      = src.get("model.embed_tokens.weight");
     w.final_norm = src.get("model.norm.weight");
-    if (!cfg.tie_word_embeddings) {
-        w.lm_head = src.try_get("lm_head.weight");
-        if (!w.lm_head) w.lm_head = w.embed;
-    }
+    // Prefer an explicit lm_head bundle when present; absent -> dense embed.
+    w.lm_head = try_bind_linear(src, "lm_head", cfg);
 
     w.layers.resize(cfg.num_hidden_layers);
     for (std::int32_t il = 0; il < cfg.num_hidden_layers; ++il) {
@@ -154,18 +153,18 @@ ModelWeights bind_gemma(const WeightSource& src, const ModelConfig& cfg) {
         L.ffn_norm       = src.get(p + "pre_feedforward_layernorm.weight");
         L.post_ffn_norm  = src.get(p + "post_feedforward_layernorm.weight");
 
-        L.q_proj = src.get(p + "self_attn.q_proj.weight");
-        L.k_proj = src.get(p + "self_attn.k_proj.weight");
-        L.v_proj = src.get(p + "self_attn.v_proj.weight");
-        L.o_proj = src.get(p + "self_attn.o_proj.weight");
+        L.q_proj = bind_linear(src, p + "self_attn.q_proj", cfg);
+        L.k_proj = bind_linear(src, p + "self_attn.k_proj", cfg);
+        L.v_proj = bind_linear(src, p + "self_attn.v_proj", cfg);
+        L.o_proj = bind_linear(src, p + "self_attn.o_proj", cfg);
 
         // Gemma 3 per-head Q/K norm (absent on Gemma 2).
         L.q_norm = src.try_get(p + "self_attn.q_norm.weight");
         L.k_norm = src.try_get(p + "self_attn.k_norm.weight");
 
-        L.gate_proj = src.get(p + "mlp.gate_proj.weight");
-        L.up_proj   = src.get(p + "mlp.up_proj.weight");
-        L.down_proj = src.get(p + "mlp.down_proj.weight");
+        L.gate_proj = bind_linear(src, p + "mlp.gate_proj", cfg);
+        L.up_proj   = bind_linear(src, p + "mlp.up_proj", cfg);
+        L.down_proj = bind_linear(src, p + "mlp.down_proj", cfg);
     }
     return w;
 }

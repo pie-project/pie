@@ -48,6 +48,34 @@ std::vector<Tensor> gemma4_ple(const std::vector<Tensor>& in) {
     return { ops::residual_add(ple, in[0]) };
 }
 
+// ── Quantized (4-bit) variants of the FFN/PLE regions. Same op sequence with
+// the GEMVs as fused dequant-in-GEMV `quantized_linear`. A separate fn = a
+// separate compiled identity (the harness contract: distinct op sequence ->
+// distinct cache instance). Quant params are the mlx-community gemma4 constants
+// (4-bit / group_size 64), baked as literals into the function identity exactly
+// like eps — these regions only run on a 4-bit checkpoint with those params.
+// in = {hidden, ffn_norm_w, gate_w,gate_s,gate_b, up_w,up_s,up_b,
+//       down_w,down_s,down_b, post_ffn_norm_w}.
+std::vector<Tensor> gemma4_ffn_q4(const std::vector<Tensor>& in) {
+    Tensor normed = ops::rms_norm(in[0], in[1], 1e-6f, /*plus_one=*/false);
+    Tensor gate   = ops::quantized_linear(in[2], in[3], in[4], normed, 64, 4);
+    Tensor up     = ops::quantized_linear(in[5], in[6], in[7], normed, 64, 4);
+    Tensor down   = ops::quantized_linear(
+        in[8], in[9], in[10], ops::geglu(gate, up, /*tanh_approx=*/true), 64, 4);
+    Tensor post   = ops::rms_norm(down, in[11], 1e-6f, /*plus_one=*/false);
+    return { ops::residual_add(post, in[0]) };
+}
+
+// in = {hidden, gate_w,gate_s,gate_b, ple_signal, proj_w,proj_s,proj_b,
+//       ple_norm_w}.
+std::vector<Tensor> gemma4_ple_q4(const std::vector<Tensor>& in) {
+    Tensor gate  = ops::quantized_linear(in[1], in[2], in[3], in[0], 64, 4);
+    Tensor gated = ops::geglu(gate, in[4], /*tanh_approx=*/true);
+    Tensor ple   = ops::quantized_linear(in[5], in[6], in[7], gated, 64, 4);
+    ple = ops::rms_norm(ple, in[8], 1e-6f, /*plus_one=*/false);
+    return { ops::residual_add(ple, in[0]) };
+}
+
 Tensor to_heads(const Tensor& x, std::int32_t n_tokens,
                 std::int32_t n_heads, std::int32_t head_dim) {
     return mx::reshape(x, {n_tokens, n_heads, head_dim});
@@ -98,14 +126,14 @@ Tensor Gemma4Graph::decoder_layer(std::int32_t il,
     Tensor residual = hidden;
     Tensor cur = ops::rms_norm(hidden, *L.attn_norm, eps, /*plus_one=*/false);
 
-    Tensor Q = to_heads(ops::linear(L.q_proj, cur), n_total, n_q_heads, head_dim);
+    Tensor Q = to_heads(apply_linear(L.q_proj, cur), n_total, n_q_heads, head_dim);
     Q = ops::rms_norm(Q, *L.q_norm, eps, /*plus_one=*/false);  // per-head Q-norm
 
     Tensor k_pages = w_.embed;  // placeholder; reassigned below
     Tensor v_pages = w_.embed;
     if (!is_shared) {
-        Tensor K = to_heads(ops::linear(L.k_proj, cur), n_total, n_kv_heads, head_dim);
-        Tensor V = to_heads(ops::linear(L.v_proj, cur), n_total, n_kv_heads, head_dim);
+        Tensor K = to_heads(apply_linear(L.k_proj, cur), n_total, n_kv_heads, head_dim);
+        Tensor V = to_heads(apply_linear(L.v_proj, cur), n_total, n_kv_heads, head_dim);
         K = ops::rms_norm(K, *L.k_norm, eps, /*plus_one=*/false);  // per-head K-norm
         V = ops::rms_norm(V, eps);  // weightless V-norm before the KV write
         // RoPE (Gemma-4 rotates after qk-norm). Shared layers only rotate Q.
@@ -140,28 +168,52 @@ Tensor Gemma4Graph::decoder_layer(std::int32_t il,
         batch.kv_last_page_lens, kv.page_size(), ap);
 
     attn = from_heads(attn, n_total, n_q_heads * head_dim);
-    Tensor attn_out = ops::linear(L.o_proj, attn);
+    Tensor attn_out = apply_linear(L.o_proj, attn);
     attn_out = ops::rms_norm(attn_out, *L.post_attn_norm, eps, /*plus_one=*/false);
     hidden = ops::residual_add(attn_out, residual);
 
     // ── FFN block (norm sandwich; GeGLU-tanh) — fused via mx::compile to
     // collapse the loose pointwise glue (sandwich norms + geglu + residual)
-    // into one traced kernel sequence; the dominant batch=1 decode overhead. ──
-    hidden = ops::compiled(
-        "gemma4.ffn",
-        {hidden, *L.ffn_norm, *L.gate_proj, *L.up_proj, *L.down_proj,
-         *L.post_ffn_norm},
-        gemma4_ffn)[0];
+    // into one traced kernel sequence; the dominant batch=1 decode overhead.
+    // On a 4-bit checkpoint the three GEMVs become fused dequant-in-GEMV via a
+    // separate compiled identity (gemma4_ffn_q4). ──
+    if (L.gate_proj->quantized()) {
+        hidden = ops::compiled(
+            "gemma4.ffn.q4",
+            {hidden, *L.ffn_norm,
+             L.gate_proj->weight, *L.gate_proj->scales, *L.gate_proj->biases,
+             L.up_proj->weight,   *L.up_proj->scales,   *L.up_proj->biases,
+             L.down_proj->weight, *L.down_proj->scales, *L.down_proj->biases,
+             *L.post_ffn_norm},
+            gemma4_ffn_q4)[0];
+    } else {
+        hidden = ops::compiled(
+            "gemma4.ffn",
+            {hidden, *L.ffn_norm, L.gate_proj->weight, L.up_proj->weight,
+             L.down_proj->weight, *L.post_ffn_norm},
+            gemma4_ffn)[0];
+    }
 
     // ── PLE residual: GeGLU-gate the per-layer signal back into the stream,
     // fused via mx::compile (ple_input_gate -> geglu -> projection -> norm ->
     // residual). The layer-output scalar stays separate (distinct guard). ──
     if (ple_signal && L.ple_input_gate && L.ple_projection && L.ple_norm) {
-        hidden = ops::compiled(
-            "gemma4.ple",
-            {hidden, *L.ple_input_gate, *ple_signal, *L.ple_projection,
-             *L.ple_norm},
-            gemma4_ple)[0];
+        if (L.ple_input_gate->quantized()) {
+            hidden = ops::compiled(
+                "gemma4.ple.q4",
+                {hidden,
+                 L.ple_input_gate->weight, *L.ple_input_gate->scales,
+                 *L.ple_input_gate->biases, *ple_signal,
+                 L.ple_projection->weight, *L.ple_projection->scales,
+                 *L.ple_projection->biases, *L.ple_norm},
+                gemma4_ple_q4)[0];
+        } else {
+            hidden = ops::compiled(
+                "gemma4.ple",
+                {hidden, L.ple_input_gate->weight, *ple_signal,
+                 L.ple_projection->weight, *L.ple_norm},
+                gemma4_ple)[0];
+        }
     }
     if (L.layer_scalar) {
         hidden = ops::mul(hidden, *L.layer_scalar);  // broadcast [1] over [N,H]
@@ -191,7 +243,7 @@ Tensor Gemma4Graph::forward(const ForwardBatch& batch, KvCacheView& kv) {
     if (ple_active) {
         Tensor token = ops::embedding(*w_.embed_per_layer, batch.token_ids);
         token = ops::scale(token, std::sqrt(static_cast<float>(ple_dim)));
-        Tensor proj = ops::linear(*w_.ple_model_proj, hidden);
+        Tensor proj = apply_linear(*w_.ple_model_proj, hidden);
         proj = ops::scale(proj, 1.0f / std::sqrt(static_cast<float>(H)));
         // RMSNorm over each ple_dim row: reshape to [N*L, ple_dim].
         proj = mx::reshape(proj, {N * Lc, ple_dim});
@@ -213,8 +265,12 @@ Tensor Gemma4Graph::forward(const ForwardBatch& batch, KvCacheView& kv) {
     hidden = ops::rms_norm(hidden, w_.final_norm, eps, /*plus_one=*/false);
     Tensor sampled = ops::gather_rows(hidden, batch.logit_rows);
 
-    const Tensor& lm_head = cfg_.tie_word_embeddings ? w_.embed : *w_.lm_head;
-    Tensor logits = ops::linear(lm_head, sampled);  // [n_slots, vocab]
+    // lm_head: an explicit (possibly quantized) bundle wins — delta synthesizes
+    // a quantized lm_head from the tied embed for the 262k-vocab BW win. Absent
+    // (v1 tied) -> the dense embed GEMV.
+    Tensor logits = w_.lm_head
+        ? apply_linear(*w_.lm_head, sampled)      // [n_slots, vocab]
+        : ops::linear(w_.embed, sampled);
 
     if (spec_.final_softcap > 0.0f) {
         logits = ops::softcap(logits, spec_.final_softcap);
@@ -236,14 +292,15 @@ ModelWeights bind_gemma4(const WeightSource& src, const ModelConfig& cfg) {
 
     w.embed      = src.get(root + "embed_tokens.weight");
     w.final_norm = src.get(root + "norm.weight");
-    if (!cfg.tie_word_embeddings) {
-        w.lm_head = src.try_get("lm_head.weight");
-        if (!w.lm_head) w.lm_head = w.embed;
-    }
+    // lm_head: prefer an explicit bundle when present — delta synthesizes a
+    // (quantized) lm_head from the tied embed for the 262k-vocab BW win, so
+    // check `lm_head.*` even when tie_word_embeddings=true. Absent -> the graph
+    // falls back to the dense embed (tied, v1 checkpoints).
+    w.lm_head = try_bind_linear(src, "lm_head", cfg);
 
     // PLE model-level triple (absent on the 26B-A4B variant where ple_dim==0).
     w.embed_per_layer = src.try_get(root + "embed_tokens_per_layer.weight");
-    w.ple_model_proj  = src.try_get(root + "per_layer_model_projection.weight");
+    w.ple_model_proj  = try_bind_linear(src, root + "per_layer_model_projection", cfg);
     w.ple_model_norm  = src.try_get(root + "per_layer_projection_norm.weight");
 
     w.layers.resize(cfg.num_hidden_layers);
@@ -258,24 +315,26 @@ ModelWeights bind_gemma4(const WeightSource& src, const ModelConfig& cfg) {
         L.post_ffn_norm  = src.get(p + "post_feedforward_layernorm.weight");
 
         // Q always present; per-head Q/K-norm always present on Gemma-4.
-        L.q_proj = src.get(p + "self_attn.q_proj.weight");
+        L.q_proj = bind_linear(src, p + "self_attn.q_proj", cfg);
         L.q_norm = src.get(p + "self_attn.q_norm.weight");
         // K/V/k_norm: present on non-shared layers (HF keeps them on shared
         // layers too in some dumps — bind when present, the graph only reads
         // them on non-shared layers).
-        if (auto k = src.try_get(p + "self_attn.k_proj.weight")) L.k_proj = *k;
-        if (auto v = src.try_get(p + "self_attn.v_proj.weight")) L.v_proj = *v;
+        if (src.has(p + "self_attn.k_proj.weight"))
+            L.k_proj = bind_linear(src, p + "self_attn.k_proj", cfg);
+        if (src.has(p + "self_attn.v_proj.weight"))
+            L.v_proj = bind_linear(src, p + "self_attn.v_proj", cfg);
         L.k_norm = src.try_get(p + "self_attn.k_norm.weight");
-        L.o_proj = src.get(p + "self_attn.o_proj.weight");
+        L.o_proj = bind_linear(src, p + "self_attn.o_proj", cfg);
 
         // Dense MLP (GeGLU).
-        L.gate_proj = src.get(p + "mlp.gate_proj.weight");
-        L.up_proj   = src.get(p + "mlp.up_proj.weight");
-        L.down_proj = src.get(p + "mlp.down_proj.weight");
+        L.gate_proj = bind_linear(src, p + "mlp.gate_proj", cfg);
+        L.up_proj   = bind_linear(src, p + "mlp.up_proj", cfg);
+        L.down_proj = bind_linear(src, p + "mlp.down_proj", cfg);
 
         // PLE per-layer triple + optional learnable output scalar.
-        L.ple_input_gate = src.try_get(p + "per_layer_input_gate.weight");
-        L.ple_projection = src.try_get(p + "per_layer_projection.weight");
+        L.ple_input_gate = try_bind_linear(src, p + "per_layer_input_gate", cfg);
+        L.ple_projection = try_bind_linear(src, p + "per_layer_projection", cfg);
         L.ple_norm       = src.try_get(p + "post_per_layer_input_norm.weight");
         L.layer_scalar   = src.try_get(p + "layer_scalar");
     }
