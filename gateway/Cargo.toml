@@ -16,9 +16,10 @@ crate-type = ["rlib"]
 # package (`pie-gateway`); no explicit `[[bin]]` needed.
 
 [dependencies]
-# Control plane: the gateway is a client of the controller's tarpc `ControlApi`
-# (route / resolve), reusing the same generated client workers use.
-pie-controller = { path = "../controller" }
+# Control plane: the gateway is a `pie_control::ControlClient` of the controller
+# — it registers, heartbeats, and long-polls the routing table, then selects a
+# worker locally per session (no per-request controller RPC).
+pie-control = { path = "../protocol/control" }
 # Shared data vocabulary (wire structs) — the pure-struct floor, no RPC.
 pie-schema = { path = "../protocol/schema", default-features = false }
 # Client wire vocabulary (ClientMessage / ServerMessage) the gateway terminates
