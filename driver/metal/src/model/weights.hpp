@@ -80,6 +80,27 @@ struct LayerWeights {
     std::optional<Tensor> ple_norm;
     // Per-layer learnable output scalar (1-element). Empty = 1.0.
     std::optional<Tensor> layer_scalar;
+
+    // ── qwen3.6 Gated-DeltaNet linear-attention. Empty on full-attn layers. ──
+    // De-interleaved at bind time from HF's per-head-group `in_proj_qkvz` /
+    // `in_proj_ba` into contiguous tensors matching beta's gated_delta_net:
+    //   la_in_proj_qkv : [conv_dim, hidden]   (conv_dim = 2*K_h*K_d + V_h*V_d,
+    //                     row-contiguous [q | k | v])
+    //   la_in_proj_z   : [V_dim, hidden]      (gate for RMSNormGated)
+    //   la_in_proj_a/b : [V_h, hidden]        (g / beta sources)
+    //   la_conv1d_w    : [conv_dim, conv_K]   la_conv1d_b: [conv_dim] (optional)
+    //   la_A_log/la_dt_bias : [V_h]           la_gate_norm: [V_d]
+    //   la_out_proj    : [hidden, V_dim]
+    std::optional<Tensor> la_in_proj_qkv;
+    std::optional<Tensor> la_in_proj_z;
+    std::optional<Tensor> la_in_proj_a;
+    std::optional<Tensor> la_in_proj_b;
+    std::optional<Tensor> la_conv1d_w;
+    std::optional<Tensor> la_conv1d_b;
+    std::optional<Tensor> la_A_log;
+    std::optional<Tensor> la_dt_bias;
+    std::optional<Tensor> la_gate_norm;
+    std::optional<Tensor> la_out_proj;
 };
 
 struct ModelWeights {
@@ -134,5 +155,13 @@ ModelWeights bind_gemma(const WeightSource& src, const ModelConfig& cfg);
 // and per-layer head_dim are resolved in the graph from config. Implemented in
 // gemma4.cpp.
 ModelWeights bind_gemma4(const WeightSource& src, const ModelConfig& cfg);
+
+// Bind the Qwen3.6 (Qwen3-Next "qwen3_5" family) hybrid schema. Full-attn
+// layers reuse the Llama-like q/k/v/o (q_proj is 2x wide: per-head [q|gate]) +
+// gemma-style q/k RMSNorm. Linear-attn layers de-interleave HF's per-head-group
+// `in_proj_qkvz` / `in_proj_ba` into the contiguous tensors beta's
+// gated_delta_net consumes, plus conv1d / A_log / dt_bias / gate-norm / out_proj.
+// Both kinds carry a dense SwiGLU MLP. Implemented in qwen36.cpp.
+ModelWeights bind_qwen36(const WeightSource& src, const ModelConfig& cfg);
 
 }  // namespace pie_metal_driver::model
