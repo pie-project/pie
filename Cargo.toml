@@ -17,6 +17,7 @@ members = [
     "protocol/schema",
     "protocol/schema-bindgen",
     "protocol/schema-derive",
+    "protocol/control",
     "driver/ipc",
     "driver/dummy",
     "driver/weight-loader",

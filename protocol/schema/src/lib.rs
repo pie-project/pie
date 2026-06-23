@@ -19,6 +19,11 @@
 pub mod brle;
 pub mod capabilities;
 pub mod cluster;
+// The disaggregated-serving control contract. Reached as `pie_schema::control::*`
+// (NOT flat-re-exported below): its `WorkerId`/`WorkerInfo`/`Role` deliberately
+// shadow the legacy `cluster` names this redesign supersedes, so the module path
+// keeps the two unambiguous until the legacy control bits are removed.
+pub mod control;
 pub mod edge;
 pub mod kv;
 pub mod message;
