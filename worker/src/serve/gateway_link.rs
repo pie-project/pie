@@ -28,7 +28,7 @@
 //! the pump and backpressures generation (design §6).
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -232,7 +232,7 @@ impl WorkerControlServer {
             self.gateway.clone(),
             turns_rx,
             cancel.clone(),
-            self.sessions.clone(),
+            Arc::downgrade(&self.sessions),
         ));
         map.insert(
             session,
@@ -258,27 +258,39 @@ enum TurnEnd {
 /// One logical session's driver: owns the runtime session and serializes its
 /// turns. Each turn feeds the runtime then pumps `ServerMessage`s back to the
 /// gateway until the turn terminates. Exits (closing the runtime session) when
-/// the connection's server drops the turn sender or the link dies.
+/// the connection's server drops the turn sender (link gone) or a push fails.
+///
+/// Holds the registry by [`Weak`] so an idle driver never keeps the registry
+/// (and thus its own turn-sender) alive: when the connection's server drops,
+/// the registry — and the sender in it — drop, unblocking `turns.recv()`.
 async fn session_driver(
     session: SessionId,
     client_id: ClientId,
     gateway: GatewayInboundClient,
     mut turns: mpsc::Receiver<Request>,
     cancel: Arc<Notify>,
-    registry: Arc<SessionRegistry>,
+    registry: Weak<SessionRegistry>,
 ) {
     while let Some(req) = turns.recv().await {
         let req_id = req.req_id;
-        registry.active.lock().await.insert(req_id, session);
+        if let Some(reg) = registry.upgrade() {
+            reg.active.lock().await.insert(req_id, session);
+        }
         let outcome = run_turn(client_id, &gateway, &cancel, req).await;
-        registry.active.lock().await.remove(&req_id);
+        if let Some(reg) = registry.upgrade() {
+            reg.active.lock().await.remove(&req_id);
+        }
         if let TurnEnd::LinkGone = outcome {
             tracing::debug!(%session, "gateway link gone; ending session");
             break;
         }
     }
     pie::server::close_session(client_id);
-    registry.sessions.lock().await.remove(&session);
+    // Best-effort removal; if the registry is already gone (the connection's
+    // server dropped) the stale entry died with it.
+    if let Some(reg) = registry.upgrade() {
+        reg.sessions.lock().await.remove(&session);
+    }
     tracing::debug!(%session, "session driver exited");
 }
 
