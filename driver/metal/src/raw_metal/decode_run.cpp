@@ -213,12 +213,16 @@ int main(int argc, char** argv) {
     const HeapPlan plan = plan_heap(g, weights_bytes, max_ctx);
 
     const bool fuse_residual = std::getenv("PIE_FUSE_RESIDUAL") != nullptr;
-    const bool gdn_prep = std::getenv("PIE_GDN_PREP") != nullptr;
+    // GdnCore prep-dispatch split is ON by default (4.03ms exclusive, ~1.7% beat vs mlx_lm,
+    // bit-exact argmax 264). Set PIE_GDN_PREP=0 to A/B back to the in-kernel-share path.
+    const char* gdn_prep_env = std::getenv("PIE_GDN_PREP");
+    const bool gdn_prep = gdn_prep_env ? (std::atoi(gdn_prep_env) != 0) : true;
     const std::vector<Dispatch> dag = build_decode_dag(g, /*with_argmax=*/false, fuse_residual, gdn_prep);
     if (fuse_residual)
         std::printf("[decode_run] PIE_FUSE_RESIDUAL: residual folded into QmvO/QmvOut/QmvDown epilogue\n");
-    if (gdn_prep)
-        std::printf("[decode_run] PIE_GDN_PREP: GdnCore split into GdnPrep (once/head) + recurrent (128x->1x q/k)\n");
+    std::printf("[decode_run] GdnCore prep-dispatch: %s%s\n",
+                gdn_prep ? "ON (GdnPrep once/head + recurrent 128x->1x q/k)" : "OFF (in-kernel share)",
+                gdn_prep_env ? " [PIE_GDN_PREP override]" : " [default]");
 
     if (std::getenv("PIE_DAG_DUMP")) {
         for (const auto& d : dag)
