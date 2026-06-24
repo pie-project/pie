@@ -84,6 +84,17 @@ struct DecodeGeometry {
     // These size the variable-length IO / KV / recurrent-state regions. pie-core's
     // batch limits set them at construction; defaults of 1 preserve the sealed
     // single-stream allocation exactly (every relaxation below is a no-op at these).
+    //
+    // SOURCE OF TRUTH (alpha plumbs at construction; the executor flips these from
+    // DecodeGeometry{} defaults=1 → these values ONLY when the M>1 path is green, so
+    // the sealed 264 heap stays byte-identical until then):
+    //   max_tokens   ← cfg.batching.max_forward_tokens      (config.hpp:31, e.g. 10240)
+    //   max_requests ← cfg.batching.max_forward_requests    (config.hpp:32, e.g. 512)
+    //   max_slots    ← rs_cache_slots = max_forward_requests (entry.cpp:127-128; the GDN
+    //                  recurrent-state slot pool; 0 for non-hybrid archs)
+    //   kv_page_size ← cfg.batching.kv_page_size            (config.hpp:28, 32)
+    //   (paged-KV total_pages ← cfg.batching.total_pages, e.g. 1024 — the KV region)
+    // delta's build_bound_decode sizes GDN conv/recurrent slabs × max_slots, IO × max_tokens.
     int   max_tokens        = 1;    // N cap — batch token dim (total_tokens across reqs)
     int   max_requests      = 1;    // R cap — concurrent sequences in a fire
     int   max_slots         = 1;    // S cap — recurrent-state (GDN) slots
