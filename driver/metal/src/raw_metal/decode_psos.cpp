@@ -24,7 +24,7 @@ const std::vector<PsoSpec>& specs() {
             {Kernel::QmvIn, Kernel::QmvInZ, Kernel::QmvOut, Kernel::QmvQ, Kernel::QmvK,
              Kernel::QmvV, Kernel::QmvO, Kernel::QmvGate, Kernel::QmvUp, Kernel::QmvDown,
              Kernel::QmvLmHead}},
-        {"dense_gemv.metal",   "dense_gemv_bfloat16",   {Kernel::GdnInA, Kernel::GdnInB}},
+        {"dense_gemv.metal",   "dense_gemv_coop_bfloat16",   {Kernel::GdnInA, Kernel::GdnInB}},
         {"gdn_core.metal",     "gdn_core_bfloat16",     {Kernel::GdnCore}},
         {"gated_rms.metal",    "gated_rms_bfloat16",    {Kernel::GatedRms}},
         {"residual_add.metal", "residual_add_bfloat16", {Kernel::Residual, Kernel::LayerOut}},

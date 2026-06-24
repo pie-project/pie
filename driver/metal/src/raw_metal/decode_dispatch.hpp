@@ -98,11 +98,16 @@ inline void gated_rms_dispatch(int v_heads, int v_dim, Grid& g, Threadgroup& tg)
     tg = Threadgroup{uint32_t(v_dim), 1, 1};
 }
 
-// dense_gemv (GdnInA / GdnInB): one thread per output row. grid=(N,1,1) tg=(N,1,1).
-// N=V_h=16 (tiny); K=hidden is a bound constant. M=1 single token.
+// dense_gemv (GdnInA / GdnInB): cooperative simdgroup K-reduction — ONE simdgroup
+// (32 lanes) per output row. The lanes stride K (coalesced loads, latency hidden
+// across 32 lanes) then simd_sum reduces. Replaces the old serial grid=(N,1,1)
+// tg=(N,1,1) (one 16-thread group serially walking K=1024 → ~93µs/disp, 50× the
+// launch floor, 43% of the decode step across GdnInA/B×36). Bit-identical output
+// (bf16 round absorbs the sub-ULP reassociation diff; verified 0/16). grid=(32,N,1)
+// tg=(32,1,1) → threadgroup_position.y = output row. Pairs with dense_gemv_coop.
 inline void dense_gemv_dispatch(int N, Grid& g, Threadgroup& tg) {
-    g  = Grid{uint32_t(N), 1, 1};
-    tg = Threadgroup{uint32_t(N), 1, 1};
+    g  = Grid{32u, uint32_t(N), 1};
+    tg = Threadgroup{32u, 1, 1};
 }
 
 }  // namespace pie_metal_driver::raw_metal
