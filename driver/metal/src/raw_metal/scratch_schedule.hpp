@@ -27,6 +27,27 @@
 
 namespace pie_metal_driver::raw_metal {
 
+// Per-scratch-slot element count (M=1 footprint = widest ping-ponged activation row).
+// The Scratch region must size each of `colors_used` slots to hold this many act-dtype
+// elements. For M>1 each slot holds N rows → multiply by max_tokens (see scratch_slot_elems).
+// Mirrors heap_layout.hpp's `widest` so both agree; keep in sync if geometry changes.
+inline int scratch_widest_elems(const DecodeGeometry& g) {
+    int widest = g.intermediate;                                   // MLP gate/up out
+    widest = widest > g.gdn_conv_dim ? widest : g.gdn_conv_dim;    // GDN in-proj out
+    const int q = g.n_q_heads * g.head_dim;                        // packed q projection
+    widest = widest > q ? widest : q;
+    return widest;
+}
+
+// M>1 scratch-slot footprint: the coloring (colors_used / per_dispatch binds / hazard_free)
+// is N-INVARIANT — it derives from the fixed DAG dataflow, identical at any N. ONLY the slot
+// byte-footprint scales: each ping-pong buffer holds [max_tokens, widest] token-major. So the
+// heap's scratch_slot_bytes = scratch_slot_elems(g, caps.max_tokens) * act_dtype_bytes; the
+// schedule itself is reused unchanged for M=1 and M>1.
+inline size_t scratch_slot_elems(const DecodeGeometry& g, int max_tokens = 1) {
+    return size_t(scratch_widest_elems(g)) * size_t(max_tokens < 1 ? 1 : max_tokens);
+}
+
 // One scratch activation slot a dispatch binds: bind_index <- pool buffer `buffer_id`.
 struct ScratchBind {
     uint8_t bind_index;  // bind::<Kind> activation slot (X / Out / Gate / ...)
