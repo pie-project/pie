@@ -25,6 +25,7 @@
 #include "decode_consts.hpp"
 #include "decode_psos.hpp"
 #include "decode_step.hpp"
+#include "decode_timing.hpp"
 #include "heap_bind.hpp"
 #include "heap_bind_metal.hpp"
 #include "heap_layout.hpp"
@@ -433,7 +434,47 @@ int main(int argc, char** argv) {
         return 0;
     }
 
-    // ── Optional full 363-tap dump (PIE_DUMP_TAPS=<dir>): after the last decode step, with
+    // ── Optional PER-DISPATCH attribution (PIE_ATTRIB_TS=1): in-stream GPU timestamps
+    //    (alpha's seam) mark every dispatch boundary on a single full-DAG pass; diffing
+    //    consecutive resolved ticks gives each dispatch's gpu-exec ms (precise granularity
+    //    — Relaxed snaps to encoder boundaries → delta=0). Min over reps per dispatch for a
+    //    clean floor, then rank by kind (fusion targets) + per-layer + top-N hottest. This
+    //    is the within-layer instrument: which dispatches are launch-floor (fuse) vs above
+    //    BW-floor (kernel-opt). State intact from the decode loop (representative M=1 cost). ──
+    if (std::getenv("PIE_ATTRIB_TS")) {
+        const uint32_t nb = uint32_t(dag.size() + 1);
+        void* tsh = ctx->create_timestamp_heap(nb);
+        const int reps = std::getenv("PIE_ATTRIB_TS_REPS")
+                             ? std::atoi(std::getenv("PIE_ATTRIB_TS_REPS")) : 8;
+        std::vector<uint64_t> ts(nb);
+        std::vector<double> minms(dag.size(), 1e30);
+        for (int r = 0; r < reps; ++r) {
+            ctx->run_step([&](StepEncoder& se) {
+                StepTimingHook h{[&](int idx) { se.mark_timestamp(tsh, uint32_t(idx), /*precise=*/true); }};
+                encode_decode_step(se, dag, psos, force_barriers, &h);
+            }, 0);
+            ctx->resolve_timestamps(tsh, nb, ts.data());
+            StepAttribution a = attribute_step(dag, ts.data(), ts.size(), /*ns_per_tick=*/1.0);
+            if (!a.valid) continue;
+            for (size_t k = 0; k < dag.size() && k < a.per_dispatch.size(); ++k)
+                minms[k] = std::min(minms[k], a.per_dispatch[k].gpu_ms);
+        }
+        // Aggregate the per-dispatch minima into a StepAttribution for ranked reporting.
+        StepAttribution agg;
+        agg.valid = true;
+        agg.per_dispatch.resize(dag.size());
+        for (size_t k = 0; k < dag.size(); ++k) {
+            const double ms = (minms[k] < 1e29) ? minms[k] : 0.0;
+            agg.per_dispatch[k] = {dag[k].ordinal, dag[k].kind, dag[k].layer, ms};
+            const int ki = static_cast<int>(dag[k].kind);
+            agg.by_kind[ki] += ms;
+            agg.count_kind[ki] += 1;
+            agg.total_gpu_ms += ms;
+        }
+        print_attribution(agg, "qwen3.6 decode-step per-dispatch (min over reps)", 24);
+        return 0;
+    }
+
     //    no_recycle every value is preserved in its own pool buffer → emit each dispatch's
     //    output as <layer>.<tag>.npy for charlie's cosine_bisect vs the pos-7 golden. ──
     if (dump_dir) {
