@@ -48,11 +48,14 @@ template <typename T, int N_READS>
   }
 
   acc = simd_sum(acc);
+  if (simd_group_id == 0) {
+    local_sums[simd_lane_id] = 0;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
   if (simd_lane_id == 0) local_sums[simd_group_id] = acc;
   threadgroup_barrier(mem_flags::mem_threadgroup);
   if (simd_group_id == 0) {
-    acc = (simd_lane_id < (SIMD_SIZE)) ? local_sums[simd_lane_id] : 0;
-    acc = simd_sum(acc);
+    acc = simd_sum(local_sums[simd_lane_id]);
     if (simd_lane_id == 0) {
       local_inv_rms[0] = precise::rsqrt(acc / float(axis_size) + p.eps);
     }
