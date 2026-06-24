@@ -83,8 +83,13 @@ bool load_decode_psos(RawMetalContext& ctx,
         out[Kernel::GdnCore] = rec;  // override the in-kernel-share gdn_core PSO
     }
     if (with_argmax) {
-        // Argmax is an optional I3 substrate; its kernel is not yet ported. When it lands,
-        // compile it here and assign out[Kernel::Argmax].
+        // Device argmax + EOS-compare (I3 sampling substrate). bf16 logits = lm_head out.
+        Pso am = ctx.compile_pso_from_file(dir + "argmax.metal", "argmax_logits_bfloat16");
+        if (!am.valid()) {
+            if (err) *err = "argmax_logits_bfloat16 (argmax.metal)";
+            return false;
+        }
+        out[Kernel::Argmax] = am;
     }
     return true;
 }
