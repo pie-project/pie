@@ -81,7 +81,11 @@ class StepEncoder {
     void set_argtable(Kernel k, int ordinal = -1);
     void set_argtable_ordinal(int ordinal);
     void dispatch(Grid grid, Threadgroup tg);
-    void barrier(BarrierVisibility vis = BarrierVisibility::Device);  // intra-encoder compute->compute hazard
+    // Intra-encoder compute->compute hazard. Default ExecutionOnly: proven correct (argmax
+    // 264 holds) AND free (delta+beta sweeps: device-flush within noise) on M1 Max UMA —
+    // the placement heap is L2-coherent intra-encoder without an explicit flush. Pass
+    // Device for an explicit cache flush; PIE_BARRIER_VIS env overrides all calls.
+    void barrier(BarrierVisibility vis = BarrierVisibility::ExecutionOnly);
 
     // Write a GPU timestamp into `heap` at `idx` (beta's per-dispatch attribution). `heap`
     // is an opaque MTL4CounterHeap from RawMetalContext::create_timestamp_heap. Relaxed
