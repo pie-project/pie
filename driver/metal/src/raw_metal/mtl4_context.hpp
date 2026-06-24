@@ -161,6 +161,18 @@ class RawMetalContext {
     // encode(N+1) with GPU(N). Returns the encode/GPU split for THIS step.
     StepTiming run_step(const std::function<void(StepEncoder&)>& encode_fn, int ab = 0);
 
+    // ── Continuous-async GPU keepalive (downclock proof-of-ceiling) ──
+    // Spawns a background thread on a SEPARATE MTL4 command queue that commits a tunable
+    // compute-spin dispatch back-to-back with a bounded in-flight depth (no per-CB host
+    // wait) so the GPU clock domain never gates between the main loop's per-token drains.
+    // This is the EXPERIMENT that proves the gap is 100% DVFS downclock (does gpu_exec
+    // reach the 3.78ms hot floor?) — NOT a shippable fix (the resident loop is). Tunables:
+    //   spin_iters  — inner loop count per thread (GPU duty per dispatch)
+    //   threadgroups — grid width (occupancy)
+    //   depth       — max in-flight command buffers (>=2 keeps overlap, never fully drains)
+    void start_keepalive(uint32_t spin_iters, uint32_t threadgroups, uint32_t depth);
+    void stop_keepalive();
+
   private:
     RawMetalContext();
     std::unique_ptr<Impl> impl_;

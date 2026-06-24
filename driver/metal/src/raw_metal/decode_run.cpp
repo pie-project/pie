@@ -403,6 +403,21 @@ int main(int argc, char** argv) {
     // keeping the GPU non-idle holds the DVFS clock -> a keep-warm fix is viable.
     const long keepalive_us =
         std::getenv("PIE_KEEPALIVE_US") ? std::atol(std::getenv("PIE_KEEPALIVE_US")) : 0;
+    // PIE_KEEPALIVE_ASYNC=<spin_iters>: spin up a CONTINUOUS background GPU stream (separate
+    // queue, bounded in-flight, no per-CB wait) that keeps the GPU clock domain warm across
+    // the main loop's per-token drains. Combined with PIE_STEP_SLEEP_US (mimics the e2e host
+    // gap), this is the proof-of-ceiling: does gpu_exec reach the 3.78ms hot floor?
+    const long ka_async =
+        std::getenv("PIE_KEEPALIVE_ASYNC") ? std::atol(std::getenv("PIE_KEEPALIVE_ASYNC")) : 0;
+    const uint32_t ka_tg =
+        std::getenv("PIE_KEEPALIVE_TG") ? (uint32_t)std::atol(std::getenv("PIE_KEEPALIVE_TG")) : 8;
+    const uint32_t ka_depth =
+        std::getenv("PIE_KEEPALIVE_DEPTH") ? (uint32_t)std::atol(std::getenv("PIE_KEEPALIVE_DEPTH")) : 3;
+    if (ka_async > 0) {
+        std::printf("[decode_run] async keepalive ON: iters=%ld tg=%u depth=%u\n",
+                    ka_async, ka_tg, ka_depth);
+        ctx->start_keepalive((uint32_t)ka_async, ka_tg, ka_depth);
+    }
     for (size_t i = 0; i < ids.size(); ++i) {
         write_u32(b.io[int(IoSlot::TokenId)], ids[i]);
         write_u32(b.io[int(IoSlot::Position)], uint32_t(i));
@@ -455,6 +470,7 @@ int main(int argc, char** argv) {
     }
     std::printf("[decode_run] HEADLINE last-step: encode_ms=%.4f gpu_exec_ms=%.4f total_ms=%.4f\n",
                 last.encode_ms, last.gpu_exec_ms, last.total_ms());
+    if (ka_async > 0) ctx->stop_keepalive();
 
     // ── Optional COARSE per-phase attribution (PIE_ATTRIB=1): re-time cumulative DAG
     //    prefixes [0..N) at phase boundaries (embed, each layer end, final_norm, lm_head),

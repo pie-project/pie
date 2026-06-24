@@ -21,6 +21,8 @@
 #include <cstring>
 #include <strings.h>
 #include <algorithm>
+#include <atomic>
+#include <thread>
 
 namespace pie_metal_driver::raw_metal {
 
@@ -61,6 +63,17 @@ struct RawMetalContext::Impl {
     NSMutableDictionary*      argtables = nil;  // NSNumber(argkey) -> id<MTL4ArgumentTable>
 
     StepState step;  // active step (during run_step)
+
+    // ── Continuous-async keepalive (separate queue + background thread) ──
+    id<MTL4CommandQueue>     ka_queue = nil;
+    id<MTL4CommandAllocator> ka_alloc = nil;
+    id<MTLComputePipelineState> ka_pso = nil;
+    id<MTLBuffer>            ka_sink  = nil;   // dummy device sink (atomic, never read)
+    id<MTLBuffer>            ka_iters = nil;   // constant spin count
+    id<MTL4ArgumentTable>    ka_at4   = nil;
+    id<MTLSharedEvent>       ka_event = nil;
+    std::atomic<bool>        ka_run{false};
+    std::thread              ka_thread;
 
     id<MTL4ArgumentTable> argtable_for(int ordinal, bool create);
 };
@@ -353,6 +366,97 @@ StepTiming RawMetalContext::run_step(const std::function<void(StepEncoder&)>& en
     tm.encode_ms   = t1 - t0;
     tm.gpu_exec_ms = t2 - t1;
     return tm;
+}
+
+// ── Continuous-async keepalive ───────────────────────────────────────────────
+void RawMetalContext::start_keepalive(uint32_t spin_iters, uint32_t threadgroups,
+                                      uint32_t depth) {
+    auto& I = *impl_;
+    if (I.ka_run.load()) return;
+    if (depth < 2) depth = 2;
+    if (threadgroups < 1) threadgroups = 1;
+
+    // Lazily build the keepalive queue + spin PSO on first use.
+    if (I.ka_queue == nil) {
+        I.ka_queue = [I.dev newMTL4CommandQueue];
+        I.ka_alloc = [I.dev newCommandAllocator];
+        I.ka_event = [I.dev newSharedEvent];
+
+        const char* src = R"(
+#include <metal_stdlib>
+using namespace metal;
+kernel void ka_spin(device atomic_uint* sink   [[buffer(0)]],
+                    constant uint&      iters  [[buffer(1)]],
+                    uint                tid    [[thread_position_in_grid]]) {
+    uint acc = tid * 2654435761u + 1u;
+    for (uint i = 0; i < iters; ++i) acc = acc * 1664525u + 1013904223u;
+    if (acc == 0xFFFFFFFFu)  // never true in practice; defeats dead-code elimination
+        atomic_fetch_add_explicit(sink, acc, memory_order_relaxed);
+}
+)";
+        Pso p = compile_pso(src, "ka_spin", nullptr);
+        if (!p.valid()) { fprintf(stderr, "[raw_metal] keepalive PSO compile failed\n"); return; }
+        I.ka_pso = (__bridge id<MTLComputePipelineState>)p.obj;
+
+        I.ka_sink  = [I.dev newBufferWithLength:sizeof(uint32_t)
+                                        options:MTLResourceStorageModeShared];
+        I.ka_iters = [I.dev newBufferWithLength:sizeof(uint32_t)
+                                        options:MTLResourceStorageModeShared];
+        *static_cast<uint32_t*>(I.ka_iters.contents) = spin_iters;
+
+        MTL4ArgumentTableDescriptor* ad = [MTL4ArgumentTableDescriptor new];
+        ad.maxBufferBindCount = 2;
+        NSError* e = nil;
+        I.ka_at4 = [I.dev newArgumentTableWithDescriptor:ad error:&e];
+        if (I.ka_at4 == nil) { fprintf(stderr, "[raw_metal] keepalive argtable failed\n"); return; }
+        [I.ka_at4 setAddress:I.ka_sink.gpuAddress  atIndex:0];
+        [I.ka_at4 setAddress:I.ka_iters.gpuAddress atIndex:1];
+    } else {
+        *static_cast<uint32_t*>(I.ka_iters.contents) = spin_iters;
+    }
+
+    // A keepalive-local residency set covering the sink/iters buffers.
+    NSError* e = nil;
+    MTLResidencySetDescriptor* rsd = [MTLResidencySetDescriptor new];
+    id<MTLResidencySet> ka_rs = [I.dev newResidencySetWithDescriptor:rsd error:&e];
+    [ka_rs addAllocation:I.ka_sink];
+    [ka_rs addAllocation:I.ka_iters];
+    [ka_rs commit];
+
+    I.ka_run.store(true);
+    const uint32_t tg = threadgroups;
+    const uint32_t inflight = depth;
+    I.ka_thread = std::thread([&I, ka_rs, tg, inflight]() {
+        uint64_t committed = 0;
+        const MTLSize grid = MTLSizeMake(tg * 64, 1, 1);     // 64 threads/threadgroup
+        const MTLSize tgsz = MTLSizeMake(64, 1, 1);
+        while (I.ka_run.load(std::memory_order_relaxed)) {
+            // Bound in-flight to `inflight` without ever fully draining (keeps overlap).
+            if (committed >= inflight)
+                [I.ka_event waitUntilSignaledValue:(committed - inflight + 1) timeoutMS:5000];
+            [I.ka_alloc reset];
+            id<MTL4CommandBuffer> cb = [I.dev newCommandBuffer];
+            [cb beginCommandBufferWithAllocator:I.ka_alloc];
+            [cb useResidencySet:ka_rs];
+            id<MTL4ComputeCommandEncoder> en = [cb computeCommandEncoder];
+            [en setComputePipelineState:I.ka_pso];
+            [en setArgumentTable:I.ka_at4];
+            [en dispatchThreads:grid threadsPerThreadgroup:tgsz];
+            [en endEncoding];
+            [cb endCommandBuffer];
+            [I.ka_queue commit:&cb count:1];
+            [I.ka_queue signalEvent:I.ka_event value:++committed];
+        }
+        // Drain remaining in-flight before returning.
+        [I.ka_event waitUntilSignaledValue:committed timeoutMS:5000];
+    });
+}
+
+void RawMetalContext::stop_keepalive() {
+    auto& I = *impl_;
+    if (!I.ka_run.load()) return;
+    I.ka_run.store(false);
+    if (I.ka_thread.joinable()) I.ka_thread.join();
 }
 
 }  // namespace pie_metal_driver::raw_metal
