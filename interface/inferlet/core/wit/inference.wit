@@ -34,8 +34,7 @@ interface inference {
 
         // Splice an encoded audio clip at sequence position `anchor`. The
         // driver runs the gemma4_audio encoder and scatters the projected
-        // soft-token rows into the hidden state for this clip. Direct analog
-        // of input-image. See audio_frontend.md.
+        // soft-token rows into the hidden state. See audio_frontend.md.
         input-audio: func(
             audio: borrow<audio>,
             anchor: u32,
