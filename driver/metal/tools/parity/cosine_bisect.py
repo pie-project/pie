@@ -145,7 +145,13 @@ def main():
                     help="cosine gate (default 0.99999)")
     ap.add_argument("-v", "--verbose", action="store_true",
                     help="print every tensor, not just the divergence")
+    ap.add_argument("--skip", default="",
+                    help="comma-separated kernel tags to exclude from the walk "
+                         "(e.g. q_norm,k_norm when a candidate taps them post "
+                         "in-place rope). Still loaded, just not gated.")
     args = ap.parse_args()
+
+    skip = {s.strip() for s in args.skip.split(",") if s.strip()}
 
     golden = load_dir(args.golden)
     cand = load_dir(args.candidate)
@@ -154,11 +160,14 @@ def main():
         return 2
 
     arch = select_order(golden)
-    print(f"arch: {arch} ({len(golden)} golden tensors)")
+    print(f"arch: {arch} ({len(golden)} golden tensors)"
+          + (f"; skipping {sorted(skip)}" if skip else ""))
     keys = sorted(golden, key=lambda k: exec_key(*k))
     first_bad = None
     rows = []
     for layer, kernel in keys:
+        if kernel in skip:
+            continue
         g = np.load(golden[(layer, kernel)])
         if (layer, kernel) not in cand:
             rows.append((layer, kernel, None, "MISSING in candidate"))
@@ -167,8 +176,21 @@ def main():
             continue
         c = np.load(cand[(layer, kernel)])
         if g.shape != c.shape:
+            if g.size == c.size:
+                # Same elements, different tap annotation (e.g. golden stores
+                # q/k_norm flat [h*d]; a candidate may emit [h, d]). Ravel-compare
+                # rather than bailing the walk.
+                cos = cosine(g, c)
+                mae = float(np.max(np.abs(g.astype(np.float64).ravel()
+                                          - c.astype(np.float64).ravel())))
+                note = "" if cos >= args.threshold else "  <-- BELOW GATE"
+                rows.append((layer, kernel, cos,
+                             f"maxabs={mae:.3e} (reshaped {g.shape}->{c.shape}){note}"))
+                if cos < args.threshold and first_bad is None:
+                    first_bad = (layer, kernel, cos)
+                continue
             rows.append((layer, kernel, None,
-                         f"SHAPE {g.shape} vs {c.shape}"))
+                         f"SIZE {g.size} vs {c.size}"))
             if first_bad is None:
                 first_bad = (layer, kernel, "shape")
             continue
