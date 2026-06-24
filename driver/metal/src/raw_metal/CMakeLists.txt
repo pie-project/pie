@@ -94,6 +94,7 @@ if(NLOHMANN_JSON_INCLUDE)
     heap_bind_names.cpp
     decode_consts.cpp
     decode_step.cpp
+    decode_timing.cpp
     decode_psos.cpp
     scratch_schedule.cpp
     safetensors_view.cpp
