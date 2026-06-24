@@ -114,14 +114,17 @@ static bool barrier_after(const std::vector<Dispatch>& dag, size_t i) {
 void encode_decode_step(StepEncoder& se,
                         const std::vector<Dispatch>& dag,
                         const DecodeStepPsos& psos,
-                        bool force_barriers) {
+                        bool force_barriers,
+                        const StepTimingHook* timing) {
     for (size_t i = 0; i < dag.size(); ++i) {
         const Dispatch& d = dag[i];
+        if (timing && timing->mark) timing->mark(static_cast<int>(i));  // boundary i
         se.set_pso(psos[d.kind]);
         se.set_argtable(d.kind, d.ordinal);  // ordinal-keyed (unique, token-stable)
         se.dispatch(d.grid, d.tg);
         if (force_barriers || barrier_after(dag, i)) se.barrier();
     }
+    if (timing && timing->mark) timing->mark(static_cast<int>(dag.size()));  // final boundary
 }
 
 }  // namespace pie_metal_driver::raw_metal
