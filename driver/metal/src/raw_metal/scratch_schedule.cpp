@@ -232,7 +232,9 @@ ScratchSchedule build_scratch_schedule(const std::vector<Dispatch>& dag,
         if (a.layer != b.layer) return false;
         return (a.kind == Kernel::QmvK && b.kind == Kernel::QmvV) ||
                (a.kind == Kernel::QNorm && b.kind == Kernel::KNorm) ||
-               (a.kind == Kernel::QmvGate && b.kind == Kernel::QmvUp);
+               (a.kind == Kernel::QmvGate && b.kind == Kernel::QmvUp) ||
+               (a.kind == Kernel::QmvIn && b.kind == Kernel::QmvInZ) ||
+               (a.kind == Kernel::GdnInA && b.kind == Kernel::GdnInB);
     };
 
     // Live intervals per value.
