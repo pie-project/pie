@@ -93,12 +93,15 @@ struct DecodeGeometry {
     //   max_slots    ← rs_cache_slots = max_forward_requests (entry.cpp:127-128; the GDN
     //                  recurrent-state slot pool; 0 for non-hybrid archs)
     //   kv_page_size ← cfg.batching.kv_page_size            (config.hpp:28, 32)
-    //   (paged-KV total_pages ← cfg.batching.total_pages, e.g. 1024 — the KV region)
+    //   total_pages  ← cfg.batching.total_pages             (config.hpp:29, e.g. 1024 — the
+    //                  paged-KV pool; sizes KvPageIndices[total_pages] + the KV page region)
     // delta's build_bound_decode sizes GDN conv/recurrent slabs × max_slots, IO × max_tokens.
     int   max_tokens        = 1;    // N cap — batch token dim (total_tokens across reqs)
     int   max_requests      = 1;    // R cap — concurrent sequences in a fire
     int   max_slots         = 1;    // S cap — recurrent-state (GDN) slots
     int   kv_page_size      = 32;   // paged-KV page granularity (config kv_page_size)
+    int   total_pages       = 1;    // paged-KV pool capacity (config total_pages); sizes
+                                    // KvPageIndices[total_pages] + the KV page region (delta)
 
     // Layer schedule: full-attention at layers {3,7,11,15,19,23}; GDN otherwise.
     static constexpr int full_attn_interval = 4;
