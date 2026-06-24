@@ -23,6 +23,17 @@
 //       token; self-feeding N steps is HARNESS-ONLY, never a driver decode loop.
 //   I4. Single-stream S=1: GDN recurrent/conv state is RESIDENT and updated in-place at a
 //       fixed heap address each token (no take/scatter). KV is append-only.
+//
+// ── Multi-batch relaxations (Phase-1; ALL no-ops at M=1, append-only, sealed M=1 path
+//    unchanged — see mac-multibatch-gap-analysis) ──────────────────────────────
+//   R1 (I1'): IO scalar slots widen to variable-length u32[max_tokens]; M=1 writes [0].
+//             New batch-CSR IoSlots (QoIndptr/KvPage*/RsSlot*) carry per-request structure.
+//   R2 (I4'): GDN state relaxes to slot-indexed base+stride (bind::GdnCore{SlotIds,
+//             SlotStride}); slot 0 at S=1.
+//   R3:       byte-identical-CB → byte-identical *within a shape bucket* (ForwardGraphKey).
+//   R4:       add batched bind::Qmm (M>1 GEMM) beside bind::Qmv (M=1 GEMV fast path).
+//   Geometry max_tokens/max_requests/max_slots/kv_page_size default to 1/1/1/32 → the
+//   M=1 region sizing is byte-identical; pie-core sets the caps for an M>1 fire.
 
 #include <cstddef>
 #include <cstdint>
@@ -69,6 +80,15 @@ struct DecodeGeometry {
     int   q_group           = 64;
     int   q_bits            = 4;
 
+    // ── Multi-batch caps (Phase-1; M=1 leaves all at 1 → byte-identical M=1 sizing) ──
+    // These size the variable-length IO / KV / recurrent-state regions. pie-core's
+    // batch limits set them at construction; defaults of 1 preserve the sealed
+    // single-stream allocation exactly (every relaxation below is a no-op at these).
+    int   max_tokens        = 1;    // N cap — batch token dim (total_tokens across reqs)
+    int   max_requests      = 1;    // R cap — concurrent sequences in a fire
+    int   max_slots         = 1;    // S cap — recurrent-state (GDN) slots
+    int   kv_page_size      = 32;   // paged-KV page granularity (config kv_page_size)
+
     // Layer schedule: full-attention at layers {3,7,11,15,19,23}; GDN otherwise.
     static constexpr int full_attn_interval = 4;
     static constexpr bool is_full_attn(int layer) {
@@ -89,12 +109,25 @@ enum class Region : uint8_t {
 inline constexpr int SCRATCH_POOL = 6;
 
 // ── IO region slots (I1: all GPU-read buffers, never setBytes) ───────────────
+// M=1: scalars are written at [0] only (the sealed single-stream path is unchanged).
+// M>1 (Phase-1, no-op at M=1): the scalar slots widen to variable-length [max_tokens]
+// and the batch CSR slots below carry the per-request structure. Enum values are
+// APPEND-ONLY (existing M=1 ordinals 0-4 are frozen) so delta's M=1 kernels never move.
 enum class IoSlot : uint8_t {
-    TokenId   = 0,  // u32[1]  — pie-core writes after sampling step N
-    Position  = 1,  // u32[1]  — rope/kv_append read this
-    SeqLen    = 2,  // u32[1]  — sdpa KV extent
-    Logits    = 3,  // f32[vocab] OUT — ALWAYS produced (I3)
-    NextToken = 4,  // u32[1]  — OPTIONAL device-argmax substrate (I3)
+    TokenId   = 0,  // u32[max_tokens] — M=1 writes [0]; M>1 = per-token ids [N]
+    Position  = 1,  // u32[max_tokens] — absolute positions [N] (rope/kv_append read)
+    SeqLen    = 2,  // u32[max_tokens] — per-token kv extent (M=1: [0]; sdpa reads)
+    Logits    = 3,  // f32[vocab] OUT (M=1) — ALWAYS produced (I3); M>1 packs sampled rows
+    NextToken = 4,  // u32[max_tokens] — OPTIONAL device-argmax substrate (I3)
+    // ── Multi-batch CSR slots (Phase-1; bound only at M>1, absent at M=1 = no-op) ──
+    // Canonical schema names (view.hpp / model_graph.hpp), marshaled by alpha from
+    // PieForwardRequestView. r = request index; per-token request via qo_indptr search.
+    QoIndptr       = 5,  // u32[R+1] — per-request token spans [qo_indptr[r]..r+1)
+    KvPageIndptr   = 6,  // u32[R+1] — page-list base per req (pages_first = [r])
+    KvPageIndices  = 7,  // u32[total_pages] — flat physical page ids
+    KvLastPageLens = 8,  // u32[R] — fill count of each request's last page
+    RsSlotIds      = 9,  // u32[R] — recurrent-state (GDN) slot per request
+    RsSlotFlags    = 10, // u8[R]  — per-slot NEW(reset)/CONTINUE flag
 };
 
 // ── Per-kernel binding indices (arg order the encoder binds into MTL4ArgumentTable) ──
@@ -104,6 +137,14 @@ namespace bind {
 // affine 4-bit GEMV (M=1): qmv_fast / qmv_quad. group=(32,2,1)/(32,1,1),
 // grid=(1, ceil(N/bn), 1). Shapes baked as constants (contiguous, fixed).
 enum class Qmv : uint8_t { W = 0, Scales = 1, Biases = 2, X = 3, Out = 4, K = 5, N = 6 };
+
+// affine 4-bit GEMM (M>1 prefill/batch) — Phase-1 reservation, no-op at M=1.
+// C[M,N] = X[M,K] · dequant(W[N,K]); M = total batch rows (= N tokens in the fire).
+// bind::Qmv (GEMV) stays the M=1 / single-decode-row FAST PATH; the dispatch selects
+// the qmm PSO only when M>1 (mirrors CUDA's decode-GEMV vs prefill-GEMM split). Same
+// W/Scales/Biases ordinals as Qmv so the weight binds are shared; X/Out widen to [M,*]
+// and M is appended (ordinal 7) — Qmv ordinals 0-6 are frozen.
+enum class Qmm : uint8_t { W = 0, Scales = 1, Biases = 2, X = 3, Out = 4, K = 5, N = 6, M = 7 };
 
 // sdpa_vector (decode, single-pass): group=(1024,1,1), grid=(n_q_heads, 1, 1).
 // Matches sdpa_vector.metal exactly. N (buffer 5) is the per-token kv_len, bound to
@@ -177,6 +218,13 @@ enum class GdnCore : uint8_t {
     BGate        = 9,  // b_gate projection (T)
     ConvStateOut = 10, // new_conv_state (float, out, ping-pong w/ ConvState)
     Params       = 11, // GdnCoreParams& (constant, static geometry, I1-safe)
+    // ── Slot-indexed state (I4 relaxation, S>1) — Phase-1, no-op at S=1 ──
+    // At S=1 these are UNBOUND (state lives at slot 0, in-place — the sealed path).
+    // At S>1 the kernel indexes ConvState/RecurrentState/ConvStateOut by
+    // rs_slot_ids[r]*slot_stride; per-(req,v-head,v-dim) threadgroup ownership keeps
+    // the recurrent RMW race-free (direct template of CUDA slot_ids_d launches).
+    SlotIds      = 12, // u32[R] — IO::RsSlotIds (per-request recurrent-state slot)
+    SlotStride   = 13, // u32    — element stride between adjacent slots (= per-slot size)
 };
 
 // ── GdnCore prep-dispatch split (PIE_GDN_PREP, A/B behind the flag) ──────────
@@ -257,5 +305,28 @@ enum class Kernel : uint8_t {
     // Layer-less tail:
     FinalRms, QmvLmHead, Argmax,
 };
+
+// ── Bucketed command-buffer key (relaxes "byte-identical CB" → "byte-identical
+// within a shape bucket", Phase-1; M=1 decode = a single stable bucket) ──────
+// Grid dims change with N/R, so the encoded CB is no longer byte-identical across
+// fires of different shapes. Mirror CUDA `forward_graph.hpp` ForwardGraphKey: cache
+// encoded CBs keyed by this; reuse on a hit, re-encode + cache on a miss. The
+// double-buffered allocator is preserved. M=1 single-stream is the {R=1,N=1, one
+// page bucket, pure-decode} key — stable every token, so encode(N+1)∥GPU(N) holds.
+struct ForwardGraphKey {
+    uint32_t n_requests   = 1;      // R
+    uint32_t n_tokens     = 1;      // N = total_tokens across the batch
+    uint32_t page_bucket  = 0;      // ceil(max_pages_in_batch / PAGE_BUCKET_GRAN)
+    bool     is_pure_decode = true; // derived: every request has exactly 1 token (M=R)
+    bool operator==(const ForwardGraphKey& o) const {
+        return n_requests == o.n_requests && n_tokens == o.n_tokens &&
+               page_bucket == o.page_bucket && is_pure_decode == o.is_pure_decode;
+    }
+    bool operator!=(const ForwardGraphKey& o) const { return !(*this == o); }
+};
+
+// Page-count bucketing granularity for ForwardGraphKey (coarsen num_pages so the CB
+// cache doesn't thrash on every +1 page). Tune in Phase-1; CUDA buckets similarly.
+inline constexpr uint32_t PAGE_BUCKET_GRAN = 8;
 
 }  // namespace pie_metal_driver::raw_metal
