@@ -15,7 +15,7 @@
     "build": "tsc",
     "test": "vitest run src/__tests__",
     "test:watch": "vitest",
-    "generate-bindings": "jco types ../../runtime/wit -o src/bindings --world-name inferlet"
+    "generate-bindings": "jco types ../../interface/inferlet -o src/bindings --world-name inferlet"
   },
   "devDependencies": {
     "@bytecodealliance/jco": "^1.15.4",

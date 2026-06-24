@@ -17,7 +17,7 @@ pub mod zo;
 use wasmtime::component::HasSelf;
 
 wasmtime::component::bindgen!({
-    path: "wit",
+    path: "../interface/inferlet",
     world: "inferlet",
     with: {
         "wasi:io/poll": wasmtime_wasi::p2::bindings::io::poll,

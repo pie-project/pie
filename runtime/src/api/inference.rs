@@ -493,7 +493,7 @@ fn build_wit_output_from_response(
 }
 
 /// Translate the WIT-defined [`pie::core::inference::Sampler`] (which
-/// uses anonymous tuple variants — see `runtime/wit/core/wit/
+/// uses anonymous tuple variants — see `interface/inferlet/core/wit/
 /// inference.wit`) to the canonical [`pie_driver_abi::Sampler`] enum
 /// (re-export of [`pie_driver_abi::Sampler`]). The variant set matches
 /// 1:1; this is just rearranging field names.
