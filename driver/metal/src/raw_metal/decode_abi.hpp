@@ -194,6 +194,16 @@ enum class Embed : uint8_t { W = 0, Scales = 1, Biases = 2, TokenId = 3, Out = 4
 enum class KvAppend : uint8_t {
     K = 0, V = 1, KPages = 2, VPages = 3, PositionPtr = 4,
     HeadDim = 5, KHeadStride = 6, KSeqStride = 7,
+    // ── Paged scatter (M>1, delta's mac-paged-kv-bridge) — Phase-1, no-op at M=1 ──
+    // M=1 keeps the contiguous-ring scatter (dst via PositionPtr + *Stride above).
+    // M>1 replaces dst with phys_slot = kv_page_indices[kv_page_indptr[r] + pos/PageSize]
+    // *PageSize + pos%PageSize, NHD page row (slot*NKvHeads + h)*head_dim + d. Honors the
+    // page table (no contiguity assumption); reduces to the single scatter at N=1.
+    KvPageIndices = 8,  // u32[total_pages] — IO::KvPageIndices
+    KvPageIndptr  = 9,  // u32[R+1]         — IO::KvPageIndptr (page_base[r])
+    PageSize      = 10, // u32              — kv_page_size (geometry const, default 32)
+    ReqOfToken    = 11, // u32[N]           — per-token request id (derived from qo_indptr)
+    NKvHeads      = 12, // u32              — n_kv_heads (page-row stride const)
 };
 
 // GDN fused core (1 dispatch — beta): folds conv1d+silu + l2norm*2 + q-scale + gating +
