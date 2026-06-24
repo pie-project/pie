@@ -130,16 +130,21 @@ template <typename T>
   // --- conv_state writeback (shift + append) to a SEPARATE ping-pong slot. ---
   // Reading conv_state (read-only) and writing new_conv_state avoids the
   // read/write race the redundant v-dim threadgroups would hit if in-place.
-  // Idempotent across redundant lanes (all write identical values from stable input).
+  // q/k channels depend only on (hv,dk) — identical across all Vd threadgroups of
+  // a head — so only dv_idx==0 writes them (was Vd=128-fold redundant write
+  // traffic, ~8MB/token). The v channel is unique per (hv,dv): every dv writes its
+  // own. Full coverage, each channel written exactly once. Output bit-identical.
   auto wb = [&](int c) {
     for (int j = 0; j < Kc - 1; ++j)
       new_conv_state[(b_idx * Kc + j) * CDIM + c] = conv_state[(b_idx * Kc + (j + 1)) * CDIM + c];
     new_conv_state[(b_idx * Kc + (Kc - 1)) * CDIM + c] = float(mixed[b_idx * CDIM + c]);
   };
-  for (int i = 0; i < n_per_t; ++i) {
-    int d = n_per_t * dk_idx + i;
-    wb(q_off + hv_idx * Dk + d);
-    wb(k_off + hv_idx * Dk + d);
+  if (dv_idx == 0) {
+    for (int i = 0; i < n_per_t; ++i) {
+      int d = n_per_t * dk_idx + i;
+      wb(q_off + hv_idx * Dk + d);
+      wb(k_off + hv_idx * Dk + d);
+    }
   }
   wb(v_off + hv_idx * Dv + dv_idx);
 }
