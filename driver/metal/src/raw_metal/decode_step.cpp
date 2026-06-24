@@ -115,6 +115,8 @@ static bool barrier_after(const std::vector<Dispatch>& dag, size_t i) {
     if (a.kind == Kernel::QmvK    && b.kind == Kernel::QmvV) return false;  // k_proj ‖ v_proj
     if (a.kind == Kernel::QNorm   && b.kind == Kernel::KNorm) return false; // q_norm ‖ k_norm
     if (a.kind == Kernel::QmvGate && b.kind == Kernel::QmvUp) return false; // gate_proj ‖ up_proj
+    if (a.kind == Kernel::QmvIn   && b.kind == Kernel::QmvInZ) return false; // gdn_in_qkv ‖ gdn_in_z
+    if (a.kind == Kernel::GdnInA  && b.kind == Kernel::GdnInB) return false; // gdn_in_a ‖ gdn_in_b
     return true;
 }
 
