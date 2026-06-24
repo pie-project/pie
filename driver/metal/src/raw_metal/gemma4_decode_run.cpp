@@ -281,8 +281,8 @@ int run_main(int argc, char** argv) {
     }
     const std::string ckpt_dir = argv[1];
     const std::string kernels_dir = argv[2];
-    // Default = gemma4 golden prompt (pos 7). BOS(2)-led — gemma is BOS-critical.
-    std::string ids_csv = (argc > 3) ? argv[3] : "2,651,2793,576,496,2756,576,3000";
+    // Default = gemma4 pos-7 golden prompt (charlie's capture, ~/parity-golden/gemma4-4bit-pos7).
+    std::string ids_csv = (argc > 3) ? argv[3] : "818,5279,529,7001,563,9079,236764,506";
     std::vector<uint32_t> ids;
     for (size_t p = 0; p < ids_csv.size();) {
         size_t c = ids_csv.find(',', p);
