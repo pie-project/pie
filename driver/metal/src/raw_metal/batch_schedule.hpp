@@ -47,6 +47,12 @@ struct BatchSchedule {
     std::vector<RequestSpan> spans;        // size R
     std::vector<uint32_t>    req_of_token; // size N: owning request r per token (== bind::ReqOfToken;
                                            // alpha's entry marshals this straight into IO::ReqOfToken)
+    std::vector<uint32_t>    slot_of_token; // size N: per-token GDN recurrent-state slot =
+                                           // rs_slot_ids[req_of_token[t]]. This is what gdn_core_slotted
+                                           // binds (it indexes slot_ids[b_idx] by TOKEN row [N], not the
+                                           // raw per-request [R] RsSlotIds). For pure-decode (N==R) it
+                                           // equals RsSlotIds[R] elementwise (alpha may bind RsSlotIds
+                                           // directly); for mixed/prefill (N>R) it's the derived expansion.
 
     bool m1() const { return N == 1 && R == 1; }  // the shipped single-stream fast path
 };
@@ -94,6 +100,12 @@ inline BatchSchedule build_batch_schedule(
     for (int r = 0, t = 0; r < s.R; ++r)
         for (uint32_t e = s.spans[r].qo_hi; t < int(e) && t < s.N; ++t)
             s.req_of_token[t] = uint32_t(r);
+
+    // slot_of_token: per-token GDN slot expansion = rs_slot_ids[req_of_token[t]]. gdn_core_slotted
+    // reads this by token row [N]. Equals RsSlotIds[R] elementwise when pure-decode (N==R).
+    s.slot_of_token.resize(s.N, 0);
+    for (int t = 0; t < s.N; ++t)
+        s.slot_of_token[t] = s.spans[s.req_of_token[t]].rs_slot;
 
     return s;
 }
