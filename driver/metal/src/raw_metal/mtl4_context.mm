@@ -368,6 +368,47 @@ StepTiming RawMetalContext::run_step(const std::function<void(StepEncoder&)>& en
     return tm;
 }
 
+uint64_t RawMetalContext::commit_step_async(const std::function<void(StepEncoder&)>& encode_fn,
+                                            int ab) {
+    return commit_step_async_dep(encode_fn, ab, 0);
+}
+
+uint64_t RawMetalContext::commit_step_async_dep(const std::function<void(StepEncoder&)>& encode_fn,
+                                                int ab, uint64_t wait_value) {
+    auto& I = *impl_;
+    ab &= 1;
+    // Caller guarantees the allocator for `ab` is free (its prior step completed) via
+    // sync_event() before reuse — depth-2 pipelining over the two double-buffered allocators.
+    [I.alloc[ab] reset];
+    id<MTL4CommandBuffer> cb = [I.dev newCommandBuffer];
+    [cb beginCommandBufferWithAllocator:I.alloc[ab]];
+    [cb useResidencySet:I.rs];
+    id<MTL4ComputeCommandEncoder> en = [cb computeCommandEncoder];
+    I.step.en  = en;
+    I.step.ctx = &I;
+    StepEncoder se(&I.step);
+    encode_fn(se);
+    [en endEncoding];
+    [cb endCommandBuffer];
+    // GPU-side serialization: make this CB wait for `wait_value` (the prior step's completion)
+    // on the queue timeline before executing. This enforces the autoregressive token dependency
+    // (single-stream steps CANNOT overlap on the GPU) while keeping the HOST non-blocking, so
+    // the host CB-build for step i+1 overlaps GPU(i) and step i+1 starts the instant i finishes
+    // (zero host gap -> holds the clock). Without it the GPU overlaps independent CBs = the
+    // throughput regime, not single-stream.
+    if (wait_value > 0) [I.queue waitForEvent:I.event value:wait_value];
+    [I.queue commit:&cb count:1];
+    [I.queue signalEvent:I.event value:++I.ev_val];
+    I.step.en = nil;
+    return I.ev_val;
+}
+
+void RawMetalContext::sync_event(uint64_t value) {
+    [impl_->event waitUntilSignaledValue:value timeoutMS:5000];
+}
+
+uint64_t RawMetalContext::last_event() const { return impl_->ev_val; }
+
 // ── Continuous-async keepalive ───────────────────────────────────────────────
 void RawMetalContext::start_keepalive(uint32_t spin_iters, uint32_t threadgroups,
                                       uint32_t depth) {

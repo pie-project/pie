@@ -465,6 +465,74 @@ int main(int argc, char** argv) {
     const size_t warm = std::getenv("PIE_AMORT_WARM")
                             ? (size_t)std::atol(std::getenv("PIE_AMORT_WARM")) : 32;
     double amort_gpu_sum = 0.0; size_t amort_steps = 0, amort_syncs = 0;
+    // PIE_PIPELINE_DEPTH=2: the downclock-CEILING prototype. Instead of the synchronous
+    // commit->wait per step (which leaves a ~0.19ms host CB-build gap that sags the clock to a
+    // mild downclock, p50 4.35 vs 3.90 floor), commit steps back-to-back with bounded in-flight
+    // over the two double-buffered allocators (no per-step host wait) so the GPU never drains.
+    // Binds are held CONSTANT (no per-step GDN/scalar mutation) -> timing-only (tokens are
+    // garbage) but GPU work is identical -> the clock measurement is valid. Sync only every
+    // PIE_RESIDENT_SYNC_N steps (control point). Reports wall/step = sustained per-token at the
+    // held clock. If it reaches ~3.90, the floor IS the ceiling and pipelined commits are the
+    // production lever. Requires resident (with_argmax) so the encoded CB matches the real path.
+    if (const char* pd = std::getenv("PIE_PIPELINE_DEPTH")) {
+        (void)pd;
+        const int depth = 2;  // two double-buffered allocators -> in-flight depth 2
+        const long psync = sync_n > 0 ? sync_n : (long)ids.size();
+        std::printf("[decode_run] PIPELINE mode: depth=%d sync_N=%ld (timing-only, constant binds)\n",
+                    depth, psync);
+        // One-time bind of the per-step-varying state to a FIXED choice (even-step GDN ping-pong).
+        for (const auto& gd : gdn_disp) {
+            const SlotHandle& A = b.gdn[gd.layer].conv_state;
+            const SlotHandle& C = b.gdn[gd.layer].conv_state_out;
+            uint8_t cs, cso;
+            if (gd.kind == Kernel::GdnPrep) { cs=(uint8_t)bind::GdnPrep::ConvState; cso=(uint8_t)bind::GdnPrep::ConvStateOut; }
+            else if (gdn_prep)             { cs=(uint8_t)bind::GdnCoreRecurrent::ConvState; cso=(uint8_t)bind::GdnCoreRecurrent::ConvStateOut; }
+            else                           { cs=(uint8_t)bind::GdnCore::ConvState; cso=(uint8_t)bind::GdnCore::ConvStateOut; }
+            ctx->arg_bind_ordinal(gd.ord, cs, A);
+            ctx->arg_bind_ordinal(gd.ord, cso, C);
+        }
+        write_u32(b.io[int(IoSlot::Position)], 0u);
+        write_u32(b.io[int(IoSlot::SeqLen)],  1u);
+        std::vector<uint64_t> vals(depth, 0);
+        // PIE_PIPELINE_SERIAL=1 (default): enforce the autoregressive dependency (GPU runs steps
+        // in order, no overlap) = the honest single-stream ceiling. =0: let independent CBs
+        // overlap = the throughput regime (faster, but NOT achievable single-stream).
+        const bool serial = !std::getenv("PIE_PIPELINE_SERIAL")
+                                || std::atoi(std::getenv("PIE_PIPELINE_SERIAL")) != 0;
+        uint64_t prev_v = 0;
+        std::chrono::steady_clock::time_point wall_warm{};
+        for (size_t i = 0; i < ids.size(); ++i) {
+            const int ab = int(i & 1);
+            if (i >= (size_t)depth) ctx->sync_event(vals[i % depth]);  // free the reused allocator
+            write_u32(b.io[int(IoSlot::Position)], uint32_t(i));
+            write_u32(b.io[int(IoSlot::SeqLen)],  uint32_t(i + 1));
+            if (i == warm) wall_warm = std::chrono::steady_clock::now();
+            uint64_t v = ctx->commit_step_async_dep(
+                [&](StepEncoder& se){ encode_decode_step(se, dag, psos, force_barriers); }, ab,
+                serial ? prev_v : 0);
+            prev_v = v;
+            vals[i % depth] = v;
+            if (psync > 0 && ((i + 1) % (size_t)psync) == 0) {  // control-point drain + bounce
+                ctx->sync_event(v);
+                if (step_sleep_us > 0) {
+                    if (i >= warm) ++amort_syncs;
+                    std::this_thread::sleep_for(std::chrono::microseconds(step_sleep_us));
+                }
+            }
+            if (i >= warm) ++amort_steps;
+        }
+        ctx->sync_event(ctx->last_event());  // final drain
+        const double total_after_warm =
+            std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-wall_warm).count();
+        const double per_tok = amort_steps > 0 ? total_after_warm / double(amort_steps) : 0.0;
+        const double bounce = (step_sleep_us>0 && amort_steps>0)
+            ? double(amort_syncs)*double(step_sleep_us)/1000.0/double(amort_steps) : 0.0;
+        std::printf("[decode_run] PIPELINE RESULT (steady-state, warm=%zu, %zu steps): "
+                    "wall/tok=%.4f ms  (incl bounce/tok=%.4f)  => %.2f tok/s  [floor=~3.90, mlx-lm=4.056]\n",
+                    warm, amort_steps, per_tok, bounce, 1000.0/per_tok);
+        if (ka_async > 0) ctx->stop_keepalive();
+        return 0;
+    }
     for (size_t i = 0; i < ids.size(); ++i) {
         if (!resident) write_u32(b.io[int(IoSlot::TokenId)], ids[i]);  // device-fed in resident
         write_u32(b.io[int(IoSlot::Position)], uint32_t(i));

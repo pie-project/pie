@@ -161,6 +161,22 @@ class RawMetalContext {
     // encode(N+1) with GPU(N). Returns the encode/GPU split for THIS step.
     StepTiming run_step(const std::function<void(StepEncoder&)>& encode_fn, int ab = 0);
 
+    // ── Pipelined async commit (downclock-ceiling prototype) ──
+    // Encode+commit a step WITHOUT waiting for completion (returns the signalled event value),
+    // so the next step's commit follows back-to-back and the GPU never drains between steps.
+    // The device-fed NextToken removes the host dependency, making this safe in principle; the
+    // caller is responsible for the WAR hazard on per-step-mutated argtables/IO (the prototype
+    // keeps binds constant = timing-only, valid for the clock question since GPU work is
+    // identical regardless of data). Pair with sync_event() to bound in-flight / drain.
+    uint64_t commit_step_async(const std::function<void(StepEncoder&)>& encode_fn, int ab = 0);
+    // As above, but the committed CB waits for `wait_value` on the queue timeline before it
+    // executes (GPU-side serialization for the autoregressive single-stream dependency).
+    uint64_t commit_step_async_dep(const std::function<void(StepEncoder&)>& encode_fn, int ab,
+                                   uint64_t wait_value);
+    // Wait until the queue has signalled >= value (bounds in-flight to `depth` and final drain).
+    void     sync_event(uint64_t value);
+    uint64_t last_event() const;
+
     // ── Continuous-async GPU keepalive (downclock proof-of-ceiling) ──
     // Spawns a background thread on a SEPARATE MTL4 command queue that commits a tunable
     // compute-spin dispatch back-to-back with a bounded in-flight depth (no per-CB host
