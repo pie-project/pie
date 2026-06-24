@@ -19,8 +19,21 @@ Two candidate layouts (the M>1 executor picks one; this gate supports both):
   --layout subdir     batched dump writes <batched>/seq<i>/<layer>.<kernel>.npy
                       (one standard single-seq dump dir per sequence).
 
-Golden mapping: --golden i=<dir> ...  (dir = a sealed M=1 dump for prompt i,
-exactly what cosine_bisect.py gates against today).
+Golden mapping: --golden i=<dir> ...  (dir = an M=1 dump for prompt i).
+
+  Preferred (same-binary, batching-isolated): produce each golden from the SAME
+  M>1 harness run with a SINGLE prompt (M=1). It emits the same [N_seq, ...]
+  rowslice taps + qo_indptr.npy = [0, N_seq]; the gate slices the seq's span and
+  compares its decision row (or the full span under --full-span) to the candidate
+  the same way. Same binary lineage as the M=4 candidate => the gate isolates
+  BATCHING ONLY, with zero cross-binary confound. No standalone decode_run needed.
+
+  Legacy (back-compat): a single-position golden dir (taps already single-row, no
+  qo_indptr.npy, e.g. ~/parity-golden/qwen36-pos7) is loaded as-is.
+
+--full-span compares each seq's whole qo-span (golden and candidate both), which
+catches MID-PROMPT contamination in ragged prefill; the default decision-row mode
+compares only the last/decision row (the token that feeds the next decode).
 
 Exit 0 = every sequence passes its gate; 1 = at least one seq diverged.
 """
@@ -35,10 +48,35 @@ import numpy as np
 import cosine_bisect as cb
 
 
-def load_golden_arrays(d):
-    """(layer,kernel) -> ndarray for a sealed single-seq golden dir."""
+def load_golden_arrays(d, full_span=False):
+    """(layer,kernel) -> ndarray for a single-seq golden dir.
+
+    Two golden flavours, auto-detected, handled symmetrically with the candidate:
+      * rowslice golden (the same-binary M>1 harness run at M=1): per-kernel taps
+        are [N_seq, ...] with a qo_indptr.npy = [0, N_seq]. We slice the (single)
+        seq's span and, by default, keep its LAST/decision row so it lines up with
+        the candidate's decision row; with full_span keep the whole [N_seq, ...].
+      * legacy single-position golden (e.g. ~/parity-golden/qwen36-pos7): no
+        qo_indptr.npy, taps already single-row -> loaded as-is (back-compat).
+    """
     paths = cb.load_dir(d)
-    return {k: np.load(v) for k, v in paths.items()}
+    qo_path = os.path.join(d, "qo_indptr.npy")
+    qo = np.load(qo_path).astype(np.int64).ravel() if os.path.exists(qo_path) else None
+    out = {}
+    for k, v in paths.items():
+        if k == (None, "qo_indptr"):
+            continue
+        a = np.load(v)
+        if qo is None or len(qo) < 2:                 # legacy single-position golden
+            out[k] = a
+            continue
+        lo, hi = int(qo[0]), int(qo[-1])              # the single seq's full span
+        if not a.shape or a.shape[0] < hi:            # unbatched/global tap (shared const)
+            out[k] = a
+            continue
+        span = a[lo:hi]
+        out[k] = span if full_span else span[-1]      # decision row by default
+    return out
 
 
 def load_candidate_subdir(batched, i):
@@ -56,7 +94,7 @@ def load_qo_indptr(batched, explicit):
     return np.load(path).astype(np.int64).ravel()
 
 
-def load_candidate_rowslice(batched, i, qo, golden, full_span):
+def load_candidate_rowslice(batched, i, qo, full_span):
     """Slice seq i's qo-span out of every [N, ...] batched tap (beta's contract).
 
     seq i owns rows [qo[i], qo[i+1]). The sealed M=1 goldens are single-position
@@ -76,9 +114,9 @@ def load_candidate_rowslice(batched, i, qo, golden, full_span):
             out[k] = a
             continue
         span = a[lo:hi]                            # [span_len, ...]
-        g = golden.get(k)
-        want_full = (full_span and g is not None
-                     and g.shape and g.shape[0] == span_len and g.ndim >= 2)
+        # golden is now span-extracted symmetrically (decision row, or full span
+        # under --full-span), so the flag alone decides — no golden-shape probe.
+        want_full = full_span and a.ndim >= 2 and span_len >= 1
         out[k] = span if want_full else span[-1]   # decision row by default
     return out
 
@@ -173,11 +211,11 @@ def main():
 
     all_pass = True
     for i in sorted(gmap):
-        golden = load_golden_arrays(gmap[i])
+        golden = load_golden_arrays(gmap[i], args.full_span)
         if args.layout == "subdir":
             cand = load_candidate_subdir(args.batched, i)
         else:
-            cand = load_candidate_rowslice(args.batched, i, qo, golden, args.full_span)
+            cand = load_candidate_rowslice(args.batched, i, qo, args.full_span)
         if not cand:
             print(f"seq{i}: ✗ NO CANDIDATE TAPS (layout={args.layout})")
             all_pass = False

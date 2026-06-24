@@ -22,9 +22,9 @@ the batch, Pie's token-major activation buffer — zero-copy row emission), plus
 - **Pure decode** (N==R, 1 tok/seq): seq `i` = row `i`.
 - **Ragged prefill** (the mbatch set, lengths 8/16/30/54): seq `i` owns its qo-span; the
   gate compares the seq's **decision row** (last of the span — the token that feeds the next
-  decode) to its single-position M=1 golden, or the **full span** with `--full-span` + a
-  full-span golden (catches mid-prompt contamination). No padding — qo_indptr-sliced,
-  matching delta's paged-KV `qo_indptr` walk 1:1.
+  decode) to the golden's decision row, or the **full span** with `--full-span` (golden and
+  candidate both span-sliced symmetrically — catches mid-prompt contamination). No padding —
+  qo_indptr-sliced, matching delta's paged-KV `qo_indptr` walk 1:1.
 
 Alternative `subdir` layout (`<dump>/seq<i>/<layer>.<kernel>.npy`, one vanilla dump dir per
 seq) is also supported via `--layout subdir`.
@@ -51,15 +51,19 @@ The length spread forces ragged batching: per-seq positions, `qo_indptr` spans, 
   the secondary cross-engine anchor each batched seq must hit.
 - `token_ids.json` + `ids_<model>_seq<i>.csv` — pre-tokenized prompt ids (per model) for the
   golden producer below (BOS-prepended for gemma).
-- `m1/<model>/seq<i>/` — the sealed **M=1 raw-Metal per-kernel goldens** (the primary gate
-  target). Produced per prompt by the raw-Metal decode harness — same kernels the M>1 path
-  slices, so the gate isolates *batching only*:
+- `m1/<model>/seq<i>/` — the **M=1 raw-Metal per-kernel goldens** (the primary gate target).
+  **Produced by the SAME M>1 harness run with a SINGLE prompt** (M=1) — emits the same
+  `[N_seq, ...]` rowslice taps + `qo_indptr.npy` = `[0, N_seq]` the gate already consumes.
+  Same binary lineage as the M=4 candidate ⇒ the gate isolates **batching only**, zero
+  cross-binary confound, leaning on the sealed *N=1-reduces-to-M=1* property. No standalone
+  `decode_run` / separate CMake path needed:
   ```
-  PIE_DUMP_TAPS=~/parity-golden/mbatch/m1/qwen3.6/seq0 \
-    build-gpu/bin/decode_run <ckpt_dir> <kernels_dir> "$(cat ~/parity-golden/mbatch/ids_qwen3.6_seq0.csv)"
+  # golden: one prompt alone (M=1)            # candidate: all four batched (M=4)
+  <m>1-harness --prompts $(cat ids_qwen3.6_seq0.csv) --dump m1/qwen3.6/seq0
+  <m>1-harness --prompts <four-prompts>       --dump batched/
   ```
-  decode_run taps the final (decision) decode step — matching the gate's per-seq decision-row
-  comparison. [pending box + the M>1 build, run alongside the first M>1 batched dump]
+  Legacy single-position goldens (e.g. `~/parity-golden/qwen36-pos7`, no `qo_indptr.npy`) are
+  loaded as-is for back-compat. [pending the M>1 harness — beta wires it w/ the first dump]
 
 ## Usage
 
