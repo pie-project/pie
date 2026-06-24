@@ -44,8 +44,9 @@ struct BatchSchedule {
     int  R = 0;                       // number of requests
     bool is_pure_decode = false;      // N==R && every span==1 → decode fast path
     int  page_size = 32;              // runtime kv_page_size (default 32)
-    std::vector<RequestSpan> spans;   // size R
-    std::vector<int>         tok_req; // size N: tok_req[t] = owning request r (find_request)
+    std::vector<RequestSpan> spans;        // size R
+    std::vector<uint32_t>    req_of_token; // size N: owning request r per token (== bind::ReqOfToken;
+                                           // alpha's entry marshals this straight into IO::ReqOfToken)
 
     bool m1() const { return N == 1 && R == 1; }  // the shipped single-stream fast path
 };
@@ -87,12 +88,12 @@ inline BatchSchedule build_batch_schedule(
     }
     s.is_pure_decode = pure;
 
-    // tok_req: owning request per token (linear scan — CUDA find_request equivalent; spans
-    // are contiguous + ascending so this is O(N)).
-    s.tok_req.resize(s.N, 0);
+    // req_of_token: owning request per token (CUDA find_request equivalent; spans are
+    // contiguous + ascending so this is O(N)). Populated into IO::ReqOfToken by alpha's entry.
+    s.req_of_token.resize(s.N, 0);
     for (int r = 0, t = 0; r < s.R; ++r)
         for (uint32_t e = s.spans[r].qo_hi; t < int(e) && t < s.N; ++t)
-            s.tok_req[t] = r;
+            s.req_of_token[t] = uint32_t(r);
 
     return s;
 }
