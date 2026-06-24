@@ -77,17 +77,21 @@ inline HeapPlan plan_heap(const DecodeGeometry& g,
     p.kv_per_layer = size_t(2) * g.n_kv_heads * max_ctx * g.head_dim * act_dtype_bytes;
     p.kv_bytes = align_up(size_t(n_full) * p.kv_per_layer);
 
-    // ── State (GDN resident, in-place, S=1) ──
+    // ── State (GDN resident; per-slot slabs, S = g.max_slots; in-place at S=1) ──
     int n_gdn = g.n_layers - n_full;
     // conv_state [gdn_conv_dim, gdn_conv_k] is PING-PONG (RO in + new_conv_state out; beta's
     // co-fix — in-place conv shift races the Kc-tap reads). recurrent_state [Vh,Vd,Kd] is
     // in-place (each (v-head,v-dim) row owned by one threadgroup → race-free).
+    // S>1: each slot's state is packed at the NATURAL (unpadded) per-slot stride so beta's
+    // gdn_core_slotted indexes slot*(Kc*CDIM)/(Hv*Vd*Dk); only the whole slab is align_up'd.
+    // At max_slots=1 this is byte-identical to the sealed single-slot layout.
     const size_t conv_state = size_t(g.gdn_conv_dim) * g.gdn_conv_k * state_dtype_bytes;
     const size_t recur_state =
         size_t(g.gdn_v_heads) * g.gdn_v_dim * g.gdn_k_dim * state_dtype_bytes;
+    const size_t slots = size_t(g.max_slots);
     p.state_per_layer =
-        2 * align_up(conv_state)   // ConvState + ConvStateOut (ping-pong)
-        + align_up(recur_state);   // RecurrentState (in-place)
+        2 * align_up(slots * conv_state)   // ConvState + ConvStateOut (ping-pong), S slots each
+        + align_up(slots * recur_state);   // RecurrentState (in-place), S slots
     p.state_bytes = align_up(size_t(n_gdn) * p.state_per_layer);
 
     // ── Scratch (activation ping-pong pool) ──
@@ -100,9 +104,10 @@ inline HeapPlan plan_heap(const DecodeGeometry& g,
     p.scratch_slot_bytes = align_up(size_t(widest) * act_dtype_bytes);
     p.scratch_bytes = align_up(size_t(SCRATCH_POOL) * p.scratch_slot_bytes);
 
-    // ── IO (per-token scalars + logits) ──
-    // TokenId/Position/SeqLen/NextToken: u32 each (slot-aligned). Logits: f32[vocab].
-    const size_t scalars = 4 * align_up(4);
+    // ── IO (per-token scalars + logits; scalars widen to max_tokens at M>1) ──
+    // TokenId/Position/SeqLen/NextToken: u32[max_tokens] each (slot-aligned). Logits: f32[vocab].
+    // At max_tokens=1 each scalar is align_up(4) — byte-identical to the sealed single-token IO.
+    const size_t scalars = 4 * align_up(size_t(4) * g.max_tokens);
     const size_t logits = align_up(size_t(g.vocab) * 4);
     p.io_bytes = align_up(scalars + logits);
 

@@ -72,8 +72,12 @@ BoundDecode stage_decode_weights(RawMetalContext& ctx, const SafetensorsView& vi
     }
 
     // ── State region: GDN conv (ping-pong) + recurrent (in-place) + zeroed conv-bias ──
-    const size_t conv_state = size_t(g.gdn_conv_dim) * g.gdn_conv_k * 4;       // f32
-    const size_t recur_state = size_t(g.gdn_v_heads) * g.gdn_v_dim * g.gdn_k_dim * 4;
+    // S>1: conv/recurrent slabs hold g.max_slots slots packed at the natural per-slot stride
+    // (beta's gdn_core_slotted indexes slot*(Kc*CDIM) / slot*(Hv*Vd*Dk)). conv_bias is a
+    // shared zeroed slot (slot-independent). At max_slots=1 every alloc is byte-identical.
+    const size_t slots = size_t(g.max_slots);
+    const size_t conv_state = size_t(g.gdn_conv_dim) * g.gdn_conv_k * 4 * slots;       // f32
+    const size_t recur_state = size_t(g.gdn_v_heads) * g.gdn_v_dim * g.gdn_k_dim * 4 * slots;
     const size_t conv_bias = size_t(g.gdn_conv_dim) * 2;                       // bf16, all-zero
     for (int L = 0; L < g.n_layers; ++L) {
         if (DecodeGeometry::is_full_attn(L)) continue;
@@ -88,11 +92,13 @@ BoundDecode stage_decode_weights(RawMetalContext& ctx, const SafetensorsView& vi
         b.scratch[i] = ctx.heap_alloc(plan.scratch_slot_bytes);
 
     // ── IO region (I1 per-token scalars + I3 logits) ──
-    b.io[static_cast<int>(IoSlot::TokenId)]   = alloc_zeroed(ctx, 4);
-    b.io[static_cast<int>(IoSlot::Position)]  = alloc_zeroed(ctx, 4);
-    b.io[static_cast<int>(IoSlot::SeqLen)]    = alloc_zeroed(ctx, 4);
+    // M>1: scalar slots widen to u32[max_tokens]; logits stays f32[vocab]. Byte-identical at M=1.
+    const size_t tok = 4 * size_t(g.max_tokens);
+    b.io[static_cast<int>(IoSlot::TokenId)]   = alloc_zeroed(ctx, tok);
+    b.io[static_cast<int>(IoSlot::Position)]  = alloc_zeroed(ctx, tok);
+    b.io[static_cast<int>(IoSlot::SeqLen)]    = alloc_zeroed(ctx, tok);
     b.io[static_cast<int>(IoSlot::Logits)]    = alloc_zeroed(ctx, size_t(g.vocab) * 4);
-    b.io[static_cast<int>(IoSlot::NextToken)] = alloc_zeroed(ctx, 4);
+    b.io[static_cast<int>(IoSlot::NextToken)] = alloc_zeroed(ctx, tok);
     return b;
 }
 
