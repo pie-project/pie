@@ -43,10 +43,10 @@ inline void elementwise_mb_dispatch(int width, int N, Grid& g, Threadgroup& tg) 
     tg = Threadgroup{256, 1, 1};
 }
 
-// embed_gather over N tokens: one thread per (token, hidden channel). Token m reads
-// token_ids[m] (per-row IO read — the M>1 kernel relaxation; M=1 reads token_ids[0]).
+// embed_gather_mb over N tokens: thread (channel k, token m). Token m gathers id[m].
+// out token-major [N, hidden]. grid=(hidden, N, 1), tg=(256,1,1).
 inline void embed_mb_dispatch(int hidden, int N, Grid& g, Threadgroup& tg) {
-    g  = Grid{uint32_t(hidden) * uint32_t(N), 1, 1};
+    g  = Grid{uint32_t(hidden), uint32_t(N), 1};
     tg = Threadgroup{256, 1, 1};
 }
 
