@@ -1,6 +1,8 @@
 #include "raw_metal/raw_metal_executor.hpp"
 
+#include <chrono>
 #include <cstdint>
+#include <cstdlib>
 #include <iostream>
 #include <stdexcept>
 #include <utility>
@@ -67,10 +69,45 @@ void RawMetalExecutor::run_forward(const pie_driver::PieForwardRequestView& req,
         if (row < static_cast<std::uint32_t>(n_total)) is_sampled[row] = 1;
     }
 
+    // Per-token e2e latency attribution (env PIE_PROF_FWD=1). Splits the executor's
+    // own cost into encode(build CB) / gpu_exec(commit->completion sync) / argmax
+    // (host scan) / pack, accumulated across run_forward calls and dumped every 64
+    // sampled tokens. Isolates the executor share of the ~2ms e2e-minus-kernel gap;
+    // gpu_exec is the per-token commit->completion boundary (manager's prime suspect
+    // for the cadence stall). Zero overhead when unset (steady_clock reads are ~ns).
+    static const bool prof = [] {
+        const char* e = std::getenv("PIE_PROF_FWD");
+        return e && e[0] && e[0] != '0';
+    }();
+    static double acc_encode = 0, acc_gpu = 0, acc_argmax = 0, acc_pack = 0,
+                  acc_step_wall = 0;
+    static long prof_tokens = 0;
+    using clk = std::chrono::steady_clock;
+    auto ms = [](clk::duration d) {
+        return std::chrono::duration<double, std::milli>(d).count();
+    };
+
     for (int i = 0; i < n_total; ++i) {
-        impl_->decoder.step(token_ids[i], position_ids[i]);
-        if (is_sampled[i]) argmax_at[i] = impl_->decoder.argmax();
+        if (prof) {
+            auto s0 = clk::now();
+            StepTiming st = impl_->decoder.step(token_ids[i], position_ids[i]);
+            auto s1 = clk::now();
+            acc_step_wall += ms(s1 - s0);
+            acc_encode += st.encode_ms;
+            acc_gpu += st.gpu_exec_ms;
+            if (is_sampled[i]) {
+                auto a0 = clk::now();
+                argmax_at[i] = impl_->decoder.argmax();
+                acc_argmax += ms(clk::now() - a0);
+                ++prof_tokens;
+            }
+        } else {
+            impl_->decoder.step(token_ids[i], position_ids[i]);
+            if (is_sampled[i]) argmax_at[i] = impl_->decoder.argmax();
+        }
     }
+
+    auto pack_t0 = prof ? clk::now() : clk::time_point{};
 
     // Pack: group sampled tokens per request via the sampling CSR.
     std::vector<pie_driver::PerRequestOutput> per_req(n_req > 0 ? n_req : 0);
@@ -87,6 +124,22 @@ void RawMetalExecutor::run_forward(const pie_driver::PieForwardRequestView& req,
 
     builder.build(per_req, out);
     out.num_requests = static_cast<std::uint32_t>(n_req);
+
+    if (prof) {
+        acc_pack += ms(clk::now() - pack_t0);
+        if (prof_tokens >= 64) {
+            const double n = double(prof_tokens);
+            std::cerr << "[PIE_PROF_FWD] per-sampled-token avg (us):"
+                      << " step_wall=" << acc_step_wall / n * 1e3
+                      << " encode=" << acc_encode / n * 1e3
+                      << " gpu_exec=" << acc_gpu / n * 1e3
+                      << " argmax=" << acc_argmax / n * 1e3
+                      << " pack=" << acc_pack / n * 1e3 << "  (n=" << prof_tokens
+                      << ")\n";
+            acc_encode = acc_gpu = acc_argmax = acc_pack = acc_step_wall = 0;
+            prof_tokens = 0;
+        }
+    }
 }
 
 std::unique_ptr<RawMetalExecutor> make_raw_metal_executor(

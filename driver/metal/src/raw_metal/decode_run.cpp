@@ -17,10 +17,13 @@
 #include <cmath>
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "decode_abi.hpp"
@@ -388,6 +391,11 @@ int main(int argc, char** argv) {
             gdn_disp.push_back({d.ordinal, d.layer, d.kind});
 
     StepTiming last{};
+    // PIE_STEP_SLEEP_US: idle the CPU (GPU goes quiescent) between steps to mimic the
+    // e2e per-token gap (host argmax + wasm-inferlet roundtrip). If gpu_exec inflates
+    // with sleep, the e2e>back-to-back inflation is GPU-idle downclock, not commit cost.
+    const long step_sleep_us =
+        std::getenv("PIE_STEP_SLEEP_US") ? std::atol(std::getenv("PIE_STEP_SLEEP_US")) : 0;
     for (size_t i = 0; i < ids.size(); ++i) {
         write_u32(b.io[int(IoSlot::TokenId)], ids[i]);
         write_u32(b.io[int(IoSlot::Position)], uint32_t(i));
@@ -424,6 +432,8 @@ int main(int argc, char** argv) {
         }
         std::printf("[decode_run] step %zu (id=%u pos=%zu): encode_ms=%.4f gpu_exec_ms=%.4f\n",
                     i, ids[i], i, last.encode_ms, last.gpu_exec_ms);
+        if (step_sleep_us > 0)
+            std::this_thread::sleep_for(std::chrono::microseconds(step_sleep_us));
     }
     std::printf("[decode_run] HEADLINE last-step: encode_ms=%.4f gpu_exec_ms=%.4f total_ms=%.4f\n",
                 last.encode_ms, last.gpu_exec_ms, last.total_ms());
