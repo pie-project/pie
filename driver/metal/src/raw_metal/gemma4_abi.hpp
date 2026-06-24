@@ -114,10 +114,11 @@ struct Gemma4Geometry {
     }
     int q_dim_at(int layer)  const { return n_q_heads  * head_dim_at(layer); }   // 2048 / 4096
     int kv_dim_at(int layer) const { return n_kv_heads * head_dim_at(layer); }   // 256  / 512
-    // rotary span: full layers rotate partial_rotary_factor*head_dim (0.25*512=128);
-    // sliding layers rotate the full head_dim (256, rope_type "default").
+    // rotary span: gemma4's nested "proportional" rope (full layers) maps to FULL
+    // rotation (prf=1.0), NOT the config's partial_rotary_factor=0.25. Confirmed against
+    // charlie's golden: all head_dim dims rotate (512 full / 256 sliding), per-type theta.
     int rotary_at(int layer) const {
-        return is_full_attn(layer) ? int(full_partial_rotary * global_head_dim) : head_dim;
+        return head_dim_at(layer);
     }
     float rope_theta_at(int layer) const {
         return is_full_attn(layer) ? rope_theta_global : rope_theta_local;
