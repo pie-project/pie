@@ -14,10 +14,13 @@ thiserror = "1.0"
 # control-plane vocab (`cluster`/`kv`).
 serde = { version = "1.0", features = ["derive"] }
 
-# KV layout + handle vocabulary live in `pie-schema` (the dependency floor):
-# `pie_schema::kv::{KvLayout, KvDtype, KvLayoutKind, KvHandle, KvRegion,
-# MemoryDomain}` — pure-Rust types (pie-schema is Python-free, no features).
-pie-schema = { path = "../../protocol/schema", default-features = false }
+# KV layout + handle vocabulary live in `pie-driver-abi` (the dependency floor):
+# `pie_driver_abi::kv::{KvLayout, KvDtype, KvLayoutKind, KvHandle, KvRegion,
+# MemoryDomain}` — pure-Rust types (pie-driver-abi is Python-free, no features).
+pie-driver-abi = { path = "../../interface/driver", default-features = false }
+# `WorkerId` now lives on the interface leaf (`pie-ids`); transport names a
+# transfer's src/dst by it. Plain serde, no internal deps.
+pie-ids = { path = "../../interface/ids" }
 
 [features]
 # Cross-node RDMA/TCP/NVMe path via NIXL. Off by default: the on-device build

@@ -23,7 +23,7 @@
 #include <pie_ipc/inproc_server.hpp>      // pie_driver::PieForwardRequestView / ResponseView
 #include "kv_cache.hpp"
 #include "model.hpp"
-#include <pie_schema/response_builder.hpp>   // pie_driver::ResponseBuilder
+#include <pie_driver_abi/response_builder.hpp>   // pie_driver::ResponseBuilder
 #include "sampler.hpp"
 #include "state_cache.hpp"
 

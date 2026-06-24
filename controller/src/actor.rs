@@ -21,7 +21,8 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::{mpsc, oneshot, watch};
 
-use pie_schema::control::{Ack, GatewayId, NodeId, Role, RoutingTable, WorkerId, WorkerStatus};
+use pie_controller_rpc::{Ack, Role, RoutingTable, WorkerStatus};
+use pie_ids::{GatewayId, NodeId, WorkerId};
 
 use crate::state::Cluster;
 use crate::topology::{Topology, reassign, routing_only};

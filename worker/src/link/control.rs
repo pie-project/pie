@@ -1,9 +1,9 @@
 //! Worker control-plane **seam**: the [`ControlLink`] trait the worker's
 //! register + heartbeat/report/watch loops run against, plus the distributed
-//! [`pie_control::ControlClient`] implementation.
+//! [`pie_controller_rpc::ControlClient`] implementation.
 //!
 //! The seam is what keeps `pie-worker` depending only on the *contract*
-//! (`pie-control`) and never on the controller *implementation* (`pie-controller`):
+//! (`pie-controller-rpc`) and never on the controller *implementation* (`pie-controller`):
 //!
 //! - **distributed** (always linked): [`ControlLink`] for [`ControlClient`]
 //!   dials the standalone controller over tarpc; [`neighbors_watch`] spawns the
@@ -22,8 +22,8 @@ use std::future::Future;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use pie_control::ControlClient;
-use pie_schema::control::{Ack, Neighbors, NodeId, WorkerId, WorkerInfo, WorkerStatus};
+use pie_controller_rpc::{Ack, ControlClient, Neighbors, WorkerInfo, WorkerStatus};
+use pie_ids::{NodeId, WorkerId};
 use tarpc::serde_transport::{tcp, unix};
 use tarpc::tokio_serde::formats::Bincode;
 use tokio::sync::watch;
@@ -47,7 +47,7 @@ const WATCH_RETRY_BACKOFF: Duration = Duration::from_secs(1);
 /// The control-plane operations the worker's loops need, abstracted over the
 /// transport (distributed tarpc client vs in-proc controller handle).
 ///
-/// Mirrors the relevant `pie_control::Control` calls minus the tarpc context.
+/// Mirrors the relevant `pie_controller_rpc::Control` calls minus the tarpc context.
 /// `Clone` so each of the three loops can hold its own cheap copy.
 pub trait ControlLink: Clone + Send + Sync + 'static {
     /// Register this worker; returns its controller-minted [`WorkerId`].

@@ -9,13 +9,12 @@
 //! the internal [`Topology`] holds every worker's wire-ready peer list keyed by
 //! id; the service projects one [`Neighbors`] from it per `watch_worker`.
 //!
-//! [`Neighbors`]: pie_schema::control::Neighbors
+//! [`Neighbors`]: pie_controller_rpc::Neighbors
 
 use std::collections::HashMap;
 
-use pie_schema::control::{
-    Health, NeighborPeer, Neighbors, RoutableWorker, RoutingTable, WorkerId,
-};
+use pie_controller_rpc::{Health, NeighborPeer, Neighbors, RoutableWorker, RoutingTable};
+use pie_ids::WorkerId;
 
 use crate::state::Cluster;
 

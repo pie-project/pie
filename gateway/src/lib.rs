@@ -10,10 +10,10 @@
 //! - **user → gateway** (server): the `ingress` adapters terminate REST/SSE +
 //!   WebSocket and converge onto charlie's one [`session::Sessions`].
 //! - **gateway ↔ worker** (server; workers dial IN, 1:N fan-in — the M3
-//!   inversion): [`worker`] serves [`GatewayInbound`](pie_dispatch::GatewayInbound)
-//!   and holds a [`WorkerControl`](pie_dispatch::WorkerControl) client per worker.
+//!   inversion): [`worker`] serves [`GatewayInbound`](pie_worker_rpc::GatewayInbound)
+//!   and holds a [`WorkerControl`](pie_worker_rpc::WorkerControl) client per worker.
 //! - **gateway → controller** (client): [`controller`] registers, heartbeats, and
-//!   long-polls `watch_gateway` for the [`RoutingTable`](pie_schema::control::RoutingTable).
+//!   long-polls `watch_gateway` for the [`RoutingTable`](pie_controller_rpc::RoutingTable).
 //!
 //! # Assembly
 //!
@@ -38,8 +38,9 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use axum::Router;
-use pie_schema::control::{GatewayInfo, WorkerId};
-use pie_schema::gateway::{ReqId, Request};
+use pie_controller_rpc::GatewayInfo;
+use pie_ids::{ReqId, WorkerId};
+use pie_worker_rpc::Request;
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
 use tokio::sync::{Notify, watch};
@@ -273,9 +274,9 @@ impl GatewayHandle {
 /// [`Gateway`] handle (with the resolved bound addrs) ready to [`serve`].
 ///
 /// Generic over the [`GatewayControl`] backend so the launcher injects either the
-/// dialed [`ControlClient`](pie_control::ControlClient) (distributed) or the
+/// dialed [`ControlClient`](pie_controller_rpc::ControlClient) (distributed) or the
 /// in-proc embedded adapter (single-node); juliet injects a stub yielding a
-/// seeded [`RoutingTable`](pie_schema::control::RoutingTable) for the smoke.
+/// seeded [`RoutingTable`](pie_controller_rpc::RoutingTable) for the smoke.
 pub async fn bind<C: GatewayControl>(config: Config, control: C) -> Result<Gateway> {
     // Control plane: register + heartbeat + subscribe to the routing table.
     let info = GatewayInfo {
@@ -340,7 +341,7 @@ pub async fn bind<C: GatewayControl>(config: Config, control: C) -> Result<Gatew
 
 /// Dial the controller and run the gateway as a daemon, returning a
 /// [`GatewayHandle`] (the role-library `run(Config) -> Handle` boundary). A thin
-/// wrapper that constructs a tarpc [`ControlClient`](pie_control::ControlClient);
+/// wrapper that constructs a tarpc [`ControlClient`](pie_controller_rpc::ControlClient);
 /// the in-proc launcher (`bin/pie`) embeds via [`bind`] / [`run_with`] with the
 /// embedded adapter instead.
 pub async fn run(config: Config) -> Result<GatewayHandle> {

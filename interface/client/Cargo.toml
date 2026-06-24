@@ -1,0 +1,24 @@
+[package]
+name = "pie-client-api"
+version = "0.1.0"
+edition = "2024"
+authors = ["In Gim <in.gim@yale.edu>"]
+description = "Public client↔server message vocabulary + edge-session frames for pie: the only public, versioned interface."
+license = "Apache-2.0"
+repository = "https://github.com/pie-project/pie"
+
+[lib]
+name = "pie_client_api"
+crate-type = ["rlib"]
+path = "src/lib.rs"
+
+[dependencies]
+# Plain serde edge vocabulary (NOT rkyv): the client/server message envelope
+# and the edge-session frames that wrap it. True leaf — message.rs and the two
+# edge frames reference no id atom (SessionId moved to pie-ids; the frames carry
+# only ClientMessage/ServerMessage), so this crate deps neither pie-ids nor any
+# sibling. serde + serde_bytes only.
+serde = { version = "1.0", features = ["derive"] }
+# Byte-slice serde adapter for the `chunk_data` fields of the client/server
+# messages (a leaf serde helper — no machinery).
+serde_bytes = "0.11"

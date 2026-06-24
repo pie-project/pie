@@ -35,14 +35,14 @@ use pie::driver::{
     DriverChannel, DriverRequest, InProcChannel, InProcPollingChannel, InProcVTable, ShmemChannel,
 };
 use pie_ipc::ipc::ShmemServer;
-use pie_schema::schema::{
+use pie_driver_abi::schema::{
     __pie_response_frame_from_desc, PIE_REQUEST_PAYLOAD_ADAPTER, PIE_REQUEST_PAYLOAD_COPY,
     PIE_REQUEST_PAYLOAD_FORWARD, PIE_REQUEST_PAYLOAD_HEALTH, PIE_RESPONSE_PAYLOAD_FORWARD,
     PIE_RESPONSE_PAYLOAD_STATUS, PieForwardRequestDesc, PieForwardResponseDesc, PieFrameDesc,
     PieResponseFrameDesc, PieResponsePayloadDesc, StatusResponse, pie_frame_view,
 };
 use pie_ipc::wire::{encode_response, parse_request};
-use pie_schema::{
+use pie_driver_abi::{
     AdapterBinding, ForwardRequest, ForwardResponse, Frame, RequestPayload, ResponseFrame,
     ResponsePayload, SCHEMA_HASH, Sampler,
 };
@@ -697,7 +697,7 @@ fn unique_name(suffix: &str) -> String {
 fn touch_archived_frame(bytes: &[u8]) -> u32 {
     let frame = parse_request(bytes).expect("parse request");
     let mut acc = u32::from(frame.driver_id);
-    if let pie_schema::ArchivedRequestPayload::Forward(fr) = &frame.payload {
+    if let pie_driver_abi::ArchivedRequestPayload::Forward(fr) = &frame.payload {
         acc = acc.wrapping_add(fr.token_ids.len() as u32);
         acc = acc.wrapping_add(fr.position_ids.len() as u32);
         acc = acc.wrapping_add(fr.qo_indptr.len() as u32);

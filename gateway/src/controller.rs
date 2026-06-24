@@ -1,4 +1,4 @@
-//! Gateway control-plane **client** (`pie_control::ControlClient`).
+//! Gateway control-plane **client** (`pie_controller_rpc::ControlClient`).
 //!
 //! The gateway registers as a gateway, heartbeats for liveness, and long-polls
 //! `watch_gateway` for the global [`RoutingTable`] — it never asks the controller
@@ -14,8 +14,8 @@ use std::future::Future;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use pie_control::ControlClient;
-use pie_schema::control::{Ack, GatewayId, GatewayInfo, NodeId, RoutingTable};
+use pie_controller_rpc::{Ack, ControlClient, GatewayInfo, RoutingTable};
+use pie_ids::{GatewayId, NodeId};
 use tarpc::serde_transport::{tcp, unix};
 use tarpc::tokio_serde::formats::Bincode;
 use tokio::sync::watch;

@@ -33,8 +33,11 @@ pie-controller = { path = "../../controller" }
 pie-gateway = { path = "../../gateway" }
 pie-worker = { path = "../../worker", default-features = false }
 pie = { path = "../../runtime" }  # program/manifest types for `pie inferlet`
-# Wire vocabulary — golf's overlaid compose.rs names pie_schema::control types.
-pie-schema = { path = "../../protocol/schema" }
+# Wire vocabulary — compose.rs names control-plane types (RoutingTable, Ack,
+# GatewayInfo, WorkerInfo, Neighbors, WorkerStatus) from pie-controller-rpc and
+# the id atoms (WorkerId/GatewayId/NodeId) from pie-ids.
+pie-ids = { path = "../../interface/ids" }
+pie-controller-rpc = { path = "../../interface/controller" }
 
 anyhow = "1.0"
 clap = { version = "4.5", features = ["derive"] }

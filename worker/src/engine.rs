@@ -9,7 +9,7 @@
 //!   3. Translate the resulting handshakes → [`pie::bootstrap::Config`]
 //!      and call [`pie::bootstrap::bootstrap`]. The runtime now owns
 //!      the runtime services + scheduler; the worker dials into the
-//!      gateway and serves `pie_dispatch::WorkerControl`.
+//!      gateway and serves `pie_worker_rpc::WorkerControl`.
 //!   4. Caller decides what to do with the [`EngineHandle`]:
 //!        * `pie serve`: [`EngineHandle::wait_then_shutdown`] blocks
 //!          on SIGINT/SIGTERM/watchdog and tears down.
@@ -20,8 +20,8 @@ use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow, bail};
-use pie_control::ControlClient;
-use pie_schema::control::{Role, WorkerId, WorkerInfo};
+use pie_controller_rpc::{ControlClient, Role, WorkerInfo};
+use pie_ids::WorkerId;
 
 use crate::config;
 use crate::driver_ffi::Flavor;

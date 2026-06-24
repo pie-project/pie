@@ -14,7 +14,7 @@ path = "src/lib.rs"
 
 [dependencies]
 pie-ipc = { path = "../driver/ipc" }
-pie-schema = { path = "../protocol/schema" }
+pie-driver-abi = { path = "../interface/driver" }
 pie-client = { path = "../client/rust" }
 tokio = { version = "1.52", features = ["full"] }
 tokio-util = "0.7"

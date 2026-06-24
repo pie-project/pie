@@ -9,7 +9,7 @@
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use pie_schema::gateway::BlobRef;
+use pie_worker_rpc::BlobRef;
 
 /// Fetch a blob's bytes out-of-band (`GET {origin}/blob/{hash}`) and verify
 /// integrity (content-addressed, §9): size pre-check then `blake3(body) == hash`.

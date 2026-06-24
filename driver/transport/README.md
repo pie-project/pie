@@ -32,10 +32,10 @@ Linux-only).
 
 | edge | contract |
 | --- | --- |
-| **↔driver** | driver pins KV buffers + exports a `pie_schema::kv::KvHandle`; transport consumes it without owning/interpreting bytes. The per-backend registration shim lives on the driver's export surface. Transport never imports the driver — they meet only through the handle type. |
+| **↔driver** | driver pins KV buffers + exports a `pie_driver_abi::kv::KvHandle`; transport consumes it without owning/interpreting bytes. The per-backend registration shim lives on the driver's export surface. Transport never imports the driver — they meet only through the handle type. |
 | **↔controller** | receives a pairing decision and *executes* it. No routing/scheduling here. |
 | **↔runtime** | transfers are async — transport exposes the start + a completion signal; *when* to await is the scheduler's job. |
-| **↔protocol/schema** | the KV layout + handle type live in `pie_schema::kv`, shared by driver / transport / runtime / controller. |
+| **↔interface/driver** | the KV layout + handle type live in `pie_driver_abi::kv`, shared by driver / transport / runtime / controller. |
 
 ## Engine seam
 
@@ -84,4 +84,4 @@ VRAM/GPUDirect is deferred.
 `core` + `local` are the working baseline; `nixl` is a real engine behind
 `--features nixl` (proven with a verified UCX `shm,tcp` DRAM transfer). The
 registry mints globally-unique [`TransferId`]s across engines. `WorkerId` is
-`pie_schema::cluster::WorkerId` (the shared floor vocab).
+`pie_ids::WorkerId` (the shared floor vocab).

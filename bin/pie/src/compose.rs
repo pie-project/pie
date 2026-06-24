@@ -12,10 +12,8 @@
 use std::net::{Ipv4Addr, SocketAddr};
 
 use anyhow::{Context, Result};
-use pie_schema::control::{
-    Ack, GatewayId, GatewayInfo, Neighbors, NodeId, RoutingTable, WorkerId, WorkerInfo,
-    WorkerStatus,
-};
+use pie_controller_rpc::{Ack, GatewayInfo, Neighbors, RoutingTable, WorkerInfo, WorkerStatus};
+use pie_ids::{GatewayId, NodeId, WorkerId};
 use pie_worker::ControlLink;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;

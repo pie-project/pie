@@ -27,8 +27,8 @@
 //! The gateway's pick is a *hint*; the worker has final admission. So
 //! [`dispatch_with_retry`](RoutingHandle::dispatch_with_retry) walks the ordered
 //! candidates, dispatching the turn until one accepts. A worker may
-//! [`Reject`](pie_schema::gateway::Accepted::Reject) /
-//! [`Redirect`](pie_schema::gateway::Accepted::Redirect) (advance to the next
+//! [`Reject`](pie_worker_rpc::Accepted::Reject) /
+//! [`Redirect`](pie_worker_rpc::Accepted::Redirect) (advance to the next
 //! candidate), or the dispatch may fail at the registry/transport layer
 //! (not-connected / no-ack — also advance, the idempotent re-route of §8). The
 //! turn's `ReqId` is minted once by the session *before* this loop, so re-routing
@@ -38,8 +38,9 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use pie_schema::control::{Health, RoutableWorker, RoutingTable, WorkerId};
-use pie_schema::gateway::{Accepted, Request};
+use pie_controller_rpc::{Health, RoutableWorker, RoutingTable};
+use pie_ids::WorkerId;
+use pie_worker_rpc::{Accepted, Request};
 use tokio::sync::watch;
 
 use crate::admission::{AdmissionConfig, AdmissionDecision, admit};
@@ -58,7 +59,7 @@ const MAX_DISPATCH_ATTEMPTS: usize = 8;
 /// `worker.rs`): dispatch one turn to a specific, currently-connected worker.
 ///
 /// Kept as a one-method seam (the registry implements it) so `route` depends only
-/// on the `pie-schema` floor and compiles / tests in isolation, independent of
+/// on the interface data floor and compiles / tests in isolation, independent of
 /// the connection-registry mechanism. The associated [`Err`](WorkerDispatch::Err)
 /// lets the registry keep its own error type; `route` only needs it to be
 /// loggable, since *any* `Err` means the same thing — advance to the next
@@ -81,8 +82,8 @@ pub trait WorkerDispatch {
 /// session can target [`cancel`]/[`set_priority`] at it) plus the worker's
 /// `Accepted` answer.
 ///
-/// [`cancel`]: pie_dispatch::WorkerControl::cancel
-/// [`set_priority`]: pie_dispatch::WorkerControl::set_priority
+/// [`cancel`]: pie_worker_rpc::WorkerControl::cancel
+/// [`set_priority`]: pie_worker_rpc::WorkerControl::set_priority
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Dispatched {
     /// The worker the turn is now bound to.
@@ -361,9 +362,10 @@ fn p2c_pick(eligible: &[&RoutableWorker], rng: &mut dyn FnMut() -> u64) -> usize
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pie_schema::control::{Role, WorkerStatus};
-    use pie_schema::gateway::{Priority, ReqId, SessionId, TenantId};
-    use pie_schema::message::ClientMessage;
+    use pie_client_api::ClientMessage;
+    use pie_controller_rpc::{Role, WorkerStatus};
+    use pie_ids::{ReqId, SessionId, TenantId};
+    use pie_worker_rpc::Priority;
     use std::sync::Mutex;
 
     // ── fixtures ──

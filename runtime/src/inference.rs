@@ -186,7 +186,7 @@ pub async fn spawn(
 /// speculation is disabled or the caller has no extra pages.
 pub async fn submit(
     model_idx: usize,
-    request: pie_schema::ForwardRequest,
+    request: pie_driver_abi::ForwardRequest,
     driver_idx: usize,
     physical_page_ids: Vec<PhysicalPageId>,
     extra_pages: Vec<PhysicalPageId>,
@@ -208,7 +208,7 @@ pub async fn submit(
 
 pub fn submit_async(
     model_idx: usize,
-    request: pie_schema::ForwardRequest,
+    request: pie_driver_abi::ForwardRequest,
     driver_idx: usize,
     physical_page_ids: Vec<PhysicalPageId>,
     extra_pages: Vec<PhysicalPageId>,
@@ -240,7 +240,7 @@ pub fn submit_async(
 pub enum ForwardOutput {
     Token(u32),
     Tokens(Vec<u32>),
-    Response(pie_schema::ForwardResponse),
+    Response(pie_driver_abi::ForwardResponse),
 }
 
 impl ForwardOutput {
@@ -253,13 +253,13 @@ impl ForwardOutput {
     }
 
     #[cfg(test)]
-    pub(crate) fn from_response(resp: pie_schema::ForwardResponse) -> Self {
+    pub(crate) fn from_response(resp: pie_driver_abi::ForwardResponse) -> Self {
         Self::Response(resp)
     }
 }
 
-impl From<pie_schema::ForwardResponse> for ForwardOutput {
-    fn from(resp: pie_schema::ForwardResponse) -> Self {
+impl From<pie_driver_abi::ForwardResponse> for ForwardOutput {
+    fn from(resp: pie_driver_abi::ForwardResponse) -> Self {
         Self::Response(resp)
     }
 }
@@ -528,7 +528,7 @@ enum Message {
     /// Submit a pre-resolved forward pass to the scheduler.
     /// All context operations must be done by the caller before sending this.
     Submit {
-        request: pie_schema::ForwardRequest,
+        request: pie_driver_abi::ForwardRequest,
         driver_idx: usize,
         physical_page_ids: Vec<PhysicalPageId>,
         /// Pages the ctx has reserved beyond the active prefix.

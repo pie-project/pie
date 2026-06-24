@@ -6,7 +6,7 @@
 //! traffic flows worker→gateway on the plain client→server direction
 //! ([`GatewayInbound::push_tokens`]), and the latency-sensitive commands flow
 //! reverse ([`WorkerControl`]) over the SAME connection, split at accept time by
-//! [`accept_gateway_link`] (the `spawn_twoway` mux, isolated in `pie-dispatch`).
+//! [`accept_gateway_link`] (the `spawn_twoway` mux, isolated in `pie-worker-rpc`).
 //!
 //! This module owns:
 //! - [`WorkerRegistry`] — the live `WorkerId → WorkerControlClient` map plus a
@@ -24,9 +24,12 @@ use std::sync::{Arc, Mutex, RwLock};
 
 use anyhow::{Context, Result};
 use futures::StreamExt;
-use pie_dispatch::{GatewayInbound, WorkerControlClient, accept_gateway_link, dispatch_codec};
-use pie_schema::control::{WorkerId, WorkerStatus};
-use pie_schema::gateway::{Accepted, Control, ReqId, Request, Tokens};
+use pie_controller_rpc::WorkerStatus;
+use pie_ids::{ReqId, WorkerId};
+use pie_worker_rpc::{
+    Accepted, Control, GatewayInbound, Request, Tokens, WorkerControlClient, accept_gateway_link,
+    dispatch_codec,
+};
 use tarpc::serde_transport::tcp;
 use tarpc::server::{BaseChannel, Channel};
 use tokio::net::ToSocketAddrs;
@@ -176,7 +179,7 @@ impl Default for WorkerRegistry {
 
 /// The registry is the [`WorkerDispatch`](crate::route::WorkerDispatch) backend
 /// alpha's `dispatch_with_retry` is generic over — so `route` depends only on the
-/// `pie-schema` floor, not the connection-registry mechanism.
+/// the interface data floor, not the connection-registry mechanism.
 impl crate::route::WorkerDispatch for WorkerRegistry {
     type Err = DispatchErr;
 
@@ -209,7 +212,7 @@ pub async fn serve(
     registry: WorkerRegistry,
 ) -> Result<WorkerServer> {
     // Single-sourced self-describing codec (MessagePack via
-    // `pie_dispatch::dispatch_codec`), NOT bincode: the data plane carries
+    // `pie_worker_rpc::dispatch_codec`), NOT bincode: the data plane carries
     // `Request{ message: ClientMessage }` / `Tokens::Chunk(ServerMessage)`, whose
     // vocab enums are `#[serde(tag = "type")]` (internally tagged, for the
     // self-describing client wire) — bincode cannot decode them

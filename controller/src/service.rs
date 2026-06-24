@@ -16,11 +16,11 @@ use tarpc::tokio_serde::formats::Bincode;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-use pie_control::{Control, ControlRequest, ControlResponse};
-use pie_schema::control::{
-    Ack, GatewayId, GatewayInfo, Neighbors, NodeId, RoutingTable, WorkerId, WorkerInfo,
-    WorkerStatus,
+use pie_controller_rpc::{
+    Ack, Control, ControlRequest, ControlResponse, GatewayInfo, Neighbors, RoutingTable,
+    WorkerInfo, WorkerStatus,
 };
+use pie_ids::{GatewayId, NodeId, WorkerId};
 
 use crate::Handle;
 

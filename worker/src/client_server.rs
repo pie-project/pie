@@ -6,7 +6,7 @@
 //! msgpack `ClientMessage`/`ServerMessage` straight to this worker.
 //!
 //! The distributed path is different: there the worker dials INTO a separate
-//! gateway and serves `pie_dispatch::WorkerControl` ([`super::gateway_link`]),
+//! gateway and serves `pie_worker_rpc::WorkerControl` ([`super::gateway_link`]),
 //! which terminates the client and dispatches turns over that link.
 
 use std::sync::Arc;

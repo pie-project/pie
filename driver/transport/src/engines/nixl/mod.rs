@@ -42,7 +42,7 @@ use crate::core::{
 };
 use crate::error::{Result, TransportError};
 use ffi::*;
-use pie_schema::kv::{KvHandle, MemoryDomain};
+use pie_driver_abi::kv::{KvHandle, MemoryDomain};
 
 const OK: nixl_capi_status_t = nixl_capi_status_t_NIXL_CAPI_SUCCESS;
 const INPROG: nixl_capi_status_t = nixl_capi_status_t_NIXL_CAPI_IN_PROG;
@@ -358,7 +358,7 @@ impl Drop for NixlEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pie_schema::kv::{KvDtype, KvLayout, KvLayoutKind};
+    use pie_driver_abi::kv::{KvDtype, KvLayout, KvLayoutKind};
 
     fn layout() -> KvLayout {
         // 1 layer · KvSeparate(2 planes) · 1 head · head_dim 64 · page_size 16 ·
@@ -375,7 +375,7 @@ mod tests {
 
     fn host_handle(buf: &[u8]) -> KvHandle {
         KvHandle {
-            regions: vec![pie_schema::kv::KvRegion {
+            regions: vec![pie_driver_abi::kv::KvRegion {
                 base: buf.as_ptr() as u64,
                 len: buf.len() as u64,
                 domain: MemoryDomain::HostPinned,

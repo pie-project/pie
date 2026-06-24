@@ -4,9 +4,9 @@
 //! session stream (`WorkerSessionApi::recv` long-poll). Post-inversion the
 //! topology flips: the **gateway is the listening server** (1:N fan-in) and the
 //! worker **dials in**. One worker-initiated connection carries both data-plane
-//! services, split with [`pie_dispatch::connect_gateway_link`]:
+//! services, split with [`pie_worker_rpc::connect_gateway_link`]:
 //!
-//! - the worker **serves** [`pie_dispatch::WorkerControl`] (the gateway calls
+//! - the worker **serves** [`pie_worker_rpc::WorkerControl`] (the gateway calls
 //!   `dispatch`/`cancel`/`set_priority`/`drain`), and
 //! - the worker **holds** a [`GatewayInboundClient`] to push the token stream
 //!   back (`push_tokens`), announce itself (`register`), and bounce turns
@@ -34,10 +34,12 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow};
 use futures::StreamExt;
 use pie::server::ClientId;
-use pie_dispatch::{GatewayInboundClient, WorkerControl, connect_gateway_link, dispatch_codec};
-use pie_schema::control::WorkerId;
-use pie_schema::gateway::{Accepted, Control, Priority, ReqId, Request, SessionId, Tokens};
-use pie_schema::message::{ClientMessage, ServerMessage};
+use pie_client_api::{ClientMessage, ServerMessage};
+use pie_ids::{ReqId, SessionId, WorkerId};
+use pie_worker_rpc::{
+    Accepted, Control, GatewayInboundClient, Priority, Request, Tokens, WorkerControl,
+    connect_gateway_link, dispatch_codec,
+};
 use tarpc::serde_transport::{tcp, unix};
 use tarpc::server::{BaseChannel, Channel};
 use tokio::sync::{Mutex, Notify, mpsc};

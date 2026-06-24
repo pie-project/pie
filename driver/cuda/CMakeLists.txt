@@ -44,7 +44,7 @@ if(CUDAToolkit_INCLUDE_DIRS)
 endif()
 
 if(NOT PIE_SCHEMA_INCLUDE_DIR)
-  set(PIE_SCHEMA_INCLUDE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../protocol/schema/include")
+  set(PIE_SCHEMA_INCLUDE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../interface/driver/include")
 endif()
 if(NOT PIE_IPC_INCLUDE_DIR)
   set(PIE_IPC_INCLUDE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../ipc/include")

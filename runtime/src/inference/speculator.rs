@@ -78,7 +78,7 @@ pub(crate) struct StagedEntry {
 
 pub(crate) fn entry_matches_request(
     entry: &StagedEntry,
-    request: &pie_schema::ForwardRequest,
+    request: &pie_driver_abi::ForwardRequest,
 ) -> bool {
     // The chain extender only ever stages single-token decode passes
     // (`build_next_request` emits `token_ids = [sampled_token]`,
@@ -199,7 +199,7 @@ pub fn lookup_for_ctx(model_idx: usize, device_idx: usize) -> Option<StagedBatch
 pub fn try_hit(
     spec: &StagedBatch,
     ctx_id: ContextId,
-    request: &pie_schema::ForwardRequest,
+    request: &pie_driver_abi::ForwardRequest,
     allow_extend: bool,
 ) -> Option<oneshot::Receiver<Result<ForwardOutput>>> {
     let mut deque = spec.0.get_mut(&ctx_id)?;
@@ -265,7 +265,7 @@ pub(crate) struct ChainState {
     pub response: oneshot::Sender<Result<ForwardOutput>>,
     pub scheduler_handle: SchedulerHandle,
     pub staged_batch_arc: StagedBatchMap,
-    pub prev_request: pie_schema::ForwardRequest,
+    pub prev_request: pie_driver_abi::ForwardRequest,
     pub all_pages: Vec<PhysicalPageId>,
     pub cur_page_idx: usize,
     pub cur_last_page_len: u32,
@@ -363,7 +363,7 @@ pub(crate) fn start_chain(
     scheduler_handle: SchedulerHandle,
     staged_batch_arc: StagedBatchMap,
     model_idx: usize,
-    request: pie_schema::ForwardRequest,
+    request: pie_driver_abi::ForwardRequest,
     physical_page_ids: Vec<PhysicalPageId>,
     all_pages: Vec<PhysicalPageId>,
     cur_page_idx: usize,
@@ -561,8 +561,8 @@ pub enum SkipReason {
 /// Stochastic samplers (temperature > 0, no seed) are accepted: the
 /// chain's pre-fired sample is itself a draw from the requested
 /// distribution, which is exactly what the inferlet asked for.
-pub fn evaluate_request_shape(req: &pie_schema::ForwardRequest) -> Result<(), SkipReason> {
-    use pie_schema::Sampler;
+pub fn evaluate_request_shape(req: &pie_driver_abi::ForwardRequest) -> Result<(), SkipReason> {
+    use pie_driver_abi::Sampler;
 
     // Structural shape: exactly one sampling slot at the last input
     // position, with a sampler attached.
@@ -625,9 +625,9 @@ pub fn evaluate_request_shape(req: &pie_schema::ForwardRequest) -> Result<(), Sk
 ///     driver pass, so pass-level speculation remains orthogonal to
 ///     driver/system speculation.
 pub fn build_next_request(
-    prev_req: &pie_schema::ForwardRequest,
+    prev_req: &pie_driver_abi::ForwardRequest,
     prev_resp: &ForwardOutput,
-) -> Option<(pie_schema::ForwardRequest, u32, u32)> {
+) -> Option<(pie_driver_abi::ForwardRequest, u32, u32)> {
     if evaluate_request_shape(prev_req).is_err() {
         return None;
     }
@@ -663,7 +663,7 @@ pub fn build_next_request(
         prev_req.output_spec_flags.clone()
     };
     let rs_slot_flags = vec![0; prev_req.rs_slot_ids.len()];
-    let mut next_req = pie_schema::ForwardRequest {
+    let mut next_req = pie_driver_abi::ForwardRequest {
         token_ids: vec![sampled_token],
         position_ids: vec![next_pos],
         kv_page_indices: Vec::new(),
@@ -714,17 +714,17 @@ pub fn build_next_request(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pie_schema::Sampler;
+    use pie_driver_abi::Sampler;
 
     fn req_with(
         positions: Vec<u32>,
         sampling_indices: Vec<u32>,
         samplers: Vec<Sampler>,
-    ) -> pie_schema::ForwardRequest {
+    ) -> pie_driver_abi::ForwardRequest {
         let n = positions.len() as u32;
         let n_sampling = sampling_indices.len() as u32;
         let n_samplers = samplers.len() as u32;
-        let mut req = pie_schema::ForwardRequest {
+        let mut req = pie_driver_abi::ForwardRequest {
             token_ids: vec![0; positions.len()],
             position_ids: positions,
             kv_page_indices: Vec::new(),
@@ -740,7 +740,7 @@ mod tests {
             sampling_indices,
             sampling_indptr: vec![0, n_sampling],
             sampler_indptr: vec![0, n_samplers],
-            adapter_bindings: vec![pie_schema::AdapterBinding {
+            adapter_bindings: vec![pie_driver_abi::AdapterBinding {
                 adapter_id: -1,
                 seed: -1,
             }],
@@ -833,7 +833,7 @@ mod tests {
         req.output_spec_flags = vec![true];
         req.rs_slot_ids = vec![7];
         req.rs_slot_flags = vec![1];
-        let resp = ForwardOutput::from_response(pie_schema::ForwardResponse {
+        let resp = ForwardOutput::from_response(pie_driver_abi::ForwardResponse {
             num_requests: 1,
             tokens: vec![42, 43, 44],
             tokens_indptr: vec![0, 3],
@@ -858,7 +858,7 @@ mod tests {
     #[test]
     fn build_next_request_none_on_empty_tokens() {
         let req = req_with(vec![10], vec![0], vec![argmax()]);
-        let resp = ForwardOutput::from_response(pie_schema::ForwardResponse {
+        let resp = ForwardOutput::from_response(pie_driver_abi::ForwardResponse {
             num_requests: 1,
             ..Default::default()
         });

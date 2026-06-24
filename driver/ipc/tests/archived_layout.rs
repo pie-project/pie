@@ -1,5 +1,5 @@
 //! Asserts the archived in-buffer layout so cross-language readers
-//! (`include/pie_schema.h`, Python ctypes) can rely on it.
+//! (`include/pie_driver_abi.h`, Python ctypes) can rely on it.
 //!
 //! rkyv 0.8 generates archived types as `#[repr(C)]` by default; this
 //! test pins the actual sizes/alignments/offsets we care about.

@@ -38,15 +38,18 @@ fn main() {
     build_dummy();
 }
 
-/// Read `DEP_PIE_SCHEMA_INCLUDE` — the directory where `pie-schema`'s
-/// build.rs publishes the schema C header (`pie_schema.h` + the
-/// `pie_schema/` view/response_builder helpers). Pass-through to CMake
-/// via `-DPIE_SCHEMA_INCLUDE_DIR=...` so each C++ driver backend can pick
-/// the headers up with `target_include_directories`.
-fn pie_schema_include_dir() -> PathBuf {
-    let dir = std::env::var("DEP_PIE_SCHEMA_INCLUDE").expect(
-        "pie-schema's build.rs did not emit cargo:include — \
-                 check that `links = \"pie_schema\"` is set in protocol/schema/Cargo.toml",
+/// Read `DEP_PIE_DRIVER_ABI_INCLUDE` — the directory where `pie-driver-abi`'s
+/// build.rs publishes the driver-ABI C header (`pie_driver_abi.h` + the
+/// `pie_driver_abi/` view/response_builder helpers). Pass-through to CMake via
+/// `-DPIE_SCHEMA_INCLUDE_DIR=...` — the CMake var name is deliberately kept (it
+/// is the contract with `driver/*/CMakeLists.txt`'s `if(NOT PIE_SCHEMA_INCLUDE_DIR)`
+/// fallback; renaming it would have to happen on both sides at once for zero gain)
+/// — so each C++ driver backend can pick the headers up with
+/// `target_include_directories`.
+fn pie_driver_abi_include_dir() -> PathBuf {
+    let dir = std::env::var("DEP_PIE_DRIVER_ABI_INCLUDE").expect(
+        "pie-driver-abi's build.rs did not emit cargo:include — \
+                 check that `links = \"pie_driver_abi\"` is set in interface/driver/Cargo.toml",
     );
     PathBuf::from(dir)
 }
@@ -54,7 +57,7 @@ fn pie_schema_include_dir() -> PathBuf {
 /// Read `DEP_PIE_IPC_INCLUDE` — the directory where `pie-ipc`'s build.rs
 /// publishes the in-proc mechanism C headers (`pie_ipc.h` vtable +
 /// `pie_ipc/inproc_server.hpp`). Pass-through to CMake via
-/// `-DPIE_IPC_INCLUDE_DIR=...`. These headers `#include <pie_schema.h>`,
+/// `-DPIE_IPC_INCLUDE_DIR=...`. These headers `#include <pie_driver_abi.h>`,
 /// so both include dirs are added to the C++ targets.
 fn pie_ipc_include_dir() -> PathBuf {
     let dir = std::env::var("DEP_PIE_IPC_INCLUDE").expect(
@@ -129,7 +132,7 @@ fn build_portable() {
     cfg.out_dir(portable_out_dir);
     cfg.build_target("pie_driver_portable_lib")
         .define("BUILD_SHARED_LIBS", "OFF")
-        .define("PIE_SCHEMA_INCLUDE_DIR", pie_schema_include_dir())
+        .define("PIE_SCHEMA_INCLUDE_DIR", pie_driver_abi_include_dir())
         .define("PIE_IPC_INCLUDE_DIR", pie_ipc_include_dir());
     enable_position_independent_archives(&mut cfg);
     // CMake caches option values under OUT_DIR. Define every backend flag
@@ -282,7 +285,7 @@ fn build_cuda() {
     cfg.out_dir(std::path::PathBuf::from(std::env::var_os("OUT_DIR").unwrap()).join("cuda"));
     cfg.build_target("pie_driver_cuda_lib")
         .define("BUILD_SHARED_LIBS", "OFF")
-        .define("PIE_SCHEMA_INCLUDE_DIR", pie_schema_include_dir())
+        .define("PIE_SCHEMA_INCLUDE_DIR", pie_driver_abi_include_dir())
         .define("PIE_IPC_INCLUDE_DIR", pie_ipc_include_dir());
     enable_position_independent_archives(&mut cfg);
 

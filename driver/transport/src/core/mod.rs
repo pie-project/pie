@@ -6,18 +6,18 @@
 //! driver-exported handle to one and dispatches.
 //!
 //! The KV handle the data plane consumes lives on the schema floor
-//! ([`pie_schema::kv::KvHandle`]) — transport never owns or interprets the
+//! ([`pie_driver_abi::kv::KvHandle`]) — transport never owns or interprets the
 //! bytes, it only moves pages between workers.
 
 use crate::error::Result;
-use pie_schema::kv::KvHandle;
+use pie_driver_abi::kv::KvHandle;
 
-/// Worker identity on the data plane — re-exported from the schema floor.
+/// Worker identity on the data plane — re-exported from the interface leaf.
 ///
 /// The controller assigns ids and decides pairings; transport only names a
 /// transfer's `src`/`dst` and reports completion. Single-source vocab: this is
-/// `pie_schema::cluster::WorkerId`, shared with the controller and worker.
-pub use pie_schema::cluster::WorkerId;
+/// `pie_ids::WorkerId`, shared with the controller and worker.
+pub use pie_ids::WorkerId;
 
 /// The KV pages to move within a handle, at whole-page granularity. Page
 /// indices address the paged KV arena described by the handle's layout.

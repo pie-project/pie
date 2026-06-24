@@ -10,7 +10,7 @@
 //! **Not implemented.** Stub + docs only — the actor does not call it yet. The
 //! default [`SoftState`] is the explicit "persist nothing" choice.
 
-use pie_schema::control::{GatewayId, WorkerId};
+use pie_ids::{GatewayId, WorkerId};
 
 use crate::state::{Gateway, Worker};
 

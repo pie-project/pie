@@ -2,8 +2,8 @@
 //! transport KV-transfer handshake.
 //!
 //! A backend that can expose its KV cache for remote transfer produces a
-//! [`pie_schema::kv::KvHandle`]: the [`KvRegion`]s backing the cache plus the
-//! paged [`pie_schema::kv::KvLayout`]. Transport's `Engine::register` consumes
+//! [`pie_driver_abi::kv::KvHandle`]: the [`KvRegion`]s backing the cache plus the
+//! paged [`pie_driver_abi::kv::KvLayout`]. Transport's `Engine::register` consumes
 //! that value by move — the two sides meet only at `KvHandle`, with no trait or
 //! import spanning the driver and transport crates. Remote-access credentials
 //! are mechanism-specific and opaque (e.g. a NIXL agent's metadata blob),
@@ -17,7 +17,7 @@
 //! to export (e.g. metal/vulkan) decline by returning `None`. Real per-backend
 //! device-memory export + RDMA registration is deferred.
 
-use pie_schema::kv::{KvDtype, KvHandle, KvLayout, KvLayoutKind, KvRegion, MemoryDomain};
+use pie_driver_abi::kv::{KvDtype, KvHandle, KvLayout, KvLayoutKind, KvRegion, MemoryDomain};
 
 /// Producer half of the KV-export seam. A backend returns `Some(handle)` to
 /// expose its KV cache to the transport layer, or `None` to decline (single-node

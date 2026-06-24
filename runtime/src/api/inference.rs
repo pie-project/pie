@@ -15,7 +15,7 @@ use crate::inference::structured::regex::regex_to_grammar;
 use crate::instance::InstanceState;
 use crate::{context, inference};
 use anyhow::Result;
-use pie_schema::Brle;
+use pie_driver_abi::Brle;
 use std::mem::take;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -147,7 +147,7 @@ fn record_execute_profile(sample: ExecuteProfileSample, total_us: u64) {
 }
 
 /// WASM-facing forward-pass accumulator. The WIT methods append/set
-/// into `req: pie_schema::ForwardRequest` directly — at `execute()`
+/// into `req: pie_driver_abi::ForwardRequest` directly — at `execute()`
 /// we just finalize the per-request indptrs and submit. `model_id`
 /// is WASM-side routing info (not on the wire) and `adapter_seed`
 /// is stored separately because it doesn't have its own WIT setter
@@ -163,7 +163,7 @@ pub struct ForwardPass {
     spec: Option<inference::StagedBatch>,
     pub adapter_seed: Option<i64>,
     allow_pass_speculation: bool,
-    req: pie_schema::ForwardRequest,
+    req: pie_driver_abi::ForwardRequest,
 }
 
 #[derive(Debug)]
@@ -173,7 +173,7 @@ pub struct FutureOutput {
     /// Samplers from the originating request — cloned before draining
     /// `pass.req` at execute() time so we can reconstruct the WIT
     /// per-slot output list against this slot order.
-    samplers: Vec<pie_schema::Sampler>,
+    samplers: Vec<pie_driver_abi::Sampler>,
     done: bool,
     model_id: usize,
     context_id: Option<crate::context::ContextId>,
@@ -272,9 +272,9 @@ impl FutureOutput {
     }
 }
 
-fn empty_forward_request() -> pie_schema::ForwardRequest {
-    pie_schema::ForwardRequest {
-        adapter_bindings: vec![pie_schema::AdapterBinding {
+fn empty_forward_request() -> pie_driver_abi::ForwardRequest {
+    pie_driver_abi::ForwardRequest {
+        adapter_bindings: vec![pie_driver_abi::AdapterBinding {
             adapter_id: -1,
             seed: -1,
         }],
@@ -320,7 +320,7 @@ impl Pollable for FutureOutput {
 }
 
 /// Build the WIT-shaped per-slot output from a per-request
-/// [`pie_schema::ForwardResponse`] (single-request shape: `num_requests = 1`,
+/// [`pie_driver_abi::ForwardResponse`] (single-request shape: `num_requests = 1`,
 /// indptrs `[0, N]`) plus the original sampler list. Walks samplers in
 /// slot order, pulling one item from the matching response field per
 /// slot — preserving the 1:1 mapping between `pass.sampler(...)` calls
@@ -332,7 +332,7 @@ impl Pollable for FutureOutput {
 /// `Token` entries.
 fn build_wit_output(
     output: ForwardOutput,
-    samplers: &[pie_schema::Sampler],
+    samplers: &[pie_driver_abi::Sampler],
 ) -> pie::core::inference::Output {
     use pie::core::inference::SlotOutput as WitSlot;
 
@@ -357,11 +357,11 @@ fn build_wit_output(
 }
 
 fn build_wit_output_from_response(
-    resp: pie_schema::ForwardResponse,
-    samplers: &[pie_schema::Sampler],
+    resp: pie_driver_abi::ForwardResponse,
+    samplers: &[pie_driver_abi::Sampler],
 ) -> pie::core::inference::Output {
     use pie::core::inference::SlotOutput as WitSlot;
-    use pie_schema::Sampler;
+    use pie_driver_abi::Sampler;
 
     let (spec_tokens, spec_positions): (Vec<u32>, Vec<u32>) = if resp.spec_indptr.len() >= 2 {
         let lo = resp.spec_indptr[0] as usize;
@@ -494,28 +494,28 @@ fn build_wit_output_from_response(
 
 /// Translate the WIT-defined [`pie::core::inference::Sampler`] (which
 /// uses anonymous tuple variants — see `runtime/wit/core/wit/
-/// inference.wit`) to the canonical [`pie_schema::Sampler`] enum
-/// (re-export of [`pie_schema::Sampler`]). The variant set matches
+/// inference.wit`) to the canonical [`pie_driver_abi::Sampler`] enum
+/// (re-export of [`pie_driver_abi::Sampler`]). The variant set matches
 /// 1:1; this is just rearranging field names.
-fn wit_to_bridge_sampler(s: pie::core::inference::Sampler) -> pie_schema::Sampler {
+fn wit_to_bridge_sampler(s: pie::core::inference::Sampler) -> pie_driver_abi::Sampler {
     use pie::core::inference::Sampler as Wit;
     match s {
         Wit::Multinomial((temperature, seed)) => {
-            pie_schema::Sampler::Multinomial { temperature, seed }
+            pie_driver_abi::Sampler::Multinomial { temperature, seed }
         }
-        Wit::TopK((temperature, k)) => pie_schema::Sampler::TopK { temperature, k },
-        Wit::TopP((temperature, p)) => pie_schema::Sampler::TopP { temperature, p },
-        Wit::MinP((temperature, p)) => pie_schema::Sampler::MinP { temperature, p },
-        Wit::TopKTopP((temperature, k, p)) => pie_schema::Sampler::TopKTopP { temperature, k, p },
-        Wit::Embedding => pie_schema::Sampler::Embedding,
-        Wit::Dist((temperature, num_tokens)) => pie_schema::Sampler::Dist {
+        Wit::TopK((temperature, k)) => pie_driver_abi::Sampler::TopK { temperature, k },
+        Wit::TopP((temperature, p)) => pie_driver_abi::Sampler::TopP { temperature, p },
+        Wit::MinP((temperature, p)) => pie_driver_abi::Sampler::MinP { temperature, p },
+        Wit::TopKTopP((temperature, k, p)) => pie_driver_abi::Sampler::TopKTopP { temperature, k, p },
+        Wit::Embedding => pie_driver_abi::Sampler::Embedding,
+        Wit::Dist((temperature, num_tokens)) => pie_driver_abi::Sampler::Dist {
             temperature,
             num_tokens,
         },
-        Wit::RawLogits => pie_schema::Sampler::RawLogits,
-        Wit::Logprob(token_id) => pie_schema::Sampler::Logprob { token_id },
-        Wit::Logprobs(token_ids) => pie_schema::Sampler::Logprobs { token_ids },
-        Wit::Entropy => pie_schema::Sampler::Entropy,
+        Wit::RawLogits => pie_driver_abi::Sampler::RawLogits,
+        Wit::Logprob(token_id) => pie_driver_abi::Sampler::Logprob { token_id },
+        Wit::Logprobs(token_ids) => pie_driver_abi::Sampler::Logprobs { token_ids },
+        Wit::Entropy => pie_driver_abi::Sampler::Entropy,
     }
 }
 

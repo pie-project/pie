@@ -17,7 +17,7 @@
 //! job ([`super::start_engine`]).
 
 use anyhow::{Result, bail};
-use pie_schema::control::Role;
+use pie_controller_rpc::Role;
 
 /// Resolved control-plane topology — the input to building the coordinator.
 #[derive(Debug, Clone, PartialEq, Eq)]

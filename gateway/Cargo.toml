@@ -16,24 +16,28 @@ crate-type = ["rlib"]
 # package (`pie-gateway`); no explicit `[[bin]]` needed.
 
 [dependencies]
-# Control plane: the gateway is a `pie_control::ControlClient` of the controller
-# — it registers, heartbeats, and long-polls the routing table, then selects a
-# worker locally per session (no per-request controller RPC).
-pie-control = { path = "../protocol/control" }
+# Id atoms (WorkerId/GatewayId/NodeId/ReqId/SessionId/TenantId).
+pie-ids = { path = "../interface/ids" }
+# Control plane: the gateway is a `pie_controller_rpc::ControlClient` of the
+# controller — it registers, heartbeats, and long-polls the routing table, then
+# selects a worker locally per session (no per-request controller RPC). Also the
+# control data vocabulary (RoutingTable, RoutableWorker, Health, Role, ...).
+pie-controller-rpc = { path = "../interface/controller" }
 # Data plane: the gateway SERVES `GatewayInbound` and is a client of
 # `WorkerControl` over one worker-dialed-in connection (split with `spawn_twoway`
-# via the typed `accept_gateway_link`). Workers dial IN (M3 inversion).
-pie-dispatch = { path = "../protocol/dispatch" }
-# Shared data vocabulary (wire structs) — the pure-struct floor, no RPC.
-pie-schema = { path = "../protocol/schema", default-features = false }
+# via the typed `accept_gateway_link`). Workers dial IN (M3 inversion). Also the
+# gateway data vocabulary (Request, Accepted, Tokens, BlobRef, Priority, Control).
+pie-worker-rpc = { path = "../interface/worker" }
+# Client-facing edge payloads (`ClientMessage`/`ServerMessage`).
+pie-client-api = { path = "../interface/client" }
 serde = { version = "1.0", features = ["derive"] }
 # Pure TOML config parsing (`Config::parse`); the `bootstrap` skeleton sources the
 # config string (file + env), this crate only parses it.
 toml = "0.9"
 # Dyn-safe async traits: charlie's `TurnRouter` seam + bravo's `BlobStore`.
 async-trait = "0.1"
-# `serde-transport-bincode` = control-plane codec (pie-control client). The
-# data-plane codec is single-sourced in `pie-dispatch` (`dispatch_codec`,
+# `serde-transport-bincode` = control-plane codec (pie-controller-rpc client). The
+# data-plane codec is single-sourced in `pie-worker-rpc` (`dispatch_codec`,
 # MessagePack), so no `serde-transport-json` here.
 tarpc = { version = "0.35", features = [
     "serde-transport",

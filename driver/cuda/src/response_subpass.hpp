@@ -16,7 +16,7 @@
 #include <span>
 #include <vector>
 
-#include <pie_schema/response_builder.hpp>
+#include <pie_driver_abi/response_builder.hpp>
 
 namespace pie_cuda_driver::model { struct Qwen3Workspace; }
 

@@ -1,0 +1,35 @@
+[package]
+name = "pie-driver-abi"
+version = "0.1.0"
+edition = "2024"
+authors = ["In Gim <in.gim@yale.edu>"]
+description = "Canonical runtime↔driver ABI vocabulary for pie: the rkyv wire ring (schema/pod/brle), the repr(C) POD descriptors + generated C header, the DriverCapabilities handshake, and the KV layout/handle types."
+license = "Apache-2.0"
+repository = "https://github.com/pie-project/pie"
+
+# `links = "pie_driver_abi"` lets downstream crates (e.g. `pie-worker`'s
+# build.rs) discover the generated C header directory via the
+# `DEP_PIE_DRIVER_ABI_INCLUDE` env var (build script ↔ build script handoff).
+links = "pie_driver_abi"
+
+[lib]
+name = "pie_driver_abi"
+crate-type = ["rlib"]
+path = "src/lib.rs"
+
+[dependencies]
+# `DriverCapabilities` (JSON handshake) + the KV layout types are plain serde.
+serde = { version = "1.0", features = ["derive"] }
+# Derive macro: emits the `repr(C) Pie<T>Desc` + `as_desc`/`from_desc`
+# (in-proc Rust↔C++ surface) + the rkyv derive, from each schema type.
+pie-driver-abi-derive = { path = "derive" }
+# Canonical schema serialization. Zero-copy reads via `rkyv::access`,
+# owned reads via `rkyv::deserialize`.
+rkyv = { version = "0.8", default-features = false, features = [
+    "std",
+    "alloc",
+    "bytecheck",
+] }
+
+[build-dependencies]
+xxhash-rust = { version = "0.8", features = ["xxh3"] }

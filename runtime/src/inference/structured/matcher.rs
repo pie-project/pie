@@ -17,7 +17,7 @@ use crate::inference::structured::compiled_grammar::CompiledGrammar;
 use crate::inference::structured::fsm::{FsmEdge, StateId};
 use crate::inference::structured::grammar::Grammar;
 use crate::model::tokenizer::Tokenizer;
-use pie_schema::Brle;
+use pie_driver_abi::Brle;
 
 use single_dfa::SingleDfaEngine;
 use stack_parser::{SmallDedup, StackParser, StackState};

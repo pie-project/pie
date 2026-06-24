@@ -47,10 +47,8 @@ use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-use pie_schema::control::{
-    Ack, GatewayId, GatewayInfo, Neighbors, NodeId, RoutingTable, WorkerId, WorkerInfo,
-    WorkerStatus,
-};
+use pie_controller_rpc::{Ack, GatewayInfo, Neighbors, RoutingTable, WorkerInfo, WorkerStatus};
+use pie_ids::{GatewayId, NodeId, WorkerId};
 
 use actor::{Actor, ActorConfig, Command};
 use topology::{Topology, empty_routing, project};

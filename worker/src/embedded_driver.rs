@@ -289,11 +289,11 @@ pub fn launch_state_dir() -> PathBuf {
         .join(std::process::id().to_string())
 }
 
-// `DriverCapabilities` is owned by `pie-schema` (single source of truth
+// `DriverCapabilities` is owned by `pie-driver-abi` (single source of truth
 // for the driver ↔ runtime interface). Re-exported here so existing call
 // sites in pie-worker keep working through the
 // `embedded_driver::DriverCapabilities` path.
-pub use pie_schema::DriverCapabilities;
+pub use pie_driver_abi::DriverCapabilities;
 
 /// Parse a caps blob the C entry emits via `ready_cb` into the bridge's
 /// struct. Lives in pie-worker (not bridge) so bridge can stay free of a

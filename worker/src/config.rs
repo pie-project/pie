@@ -12,7 +12,7 @@
 use std::path::PathBuf;
 
 use anyhow::{Result, bail, ensure};
-use pie_schema::control::Role;
+use pie_controller_rpc::Role;
 use serde::{Deserialize, Serialize};
 
 // -----------------------------------------------------------------------------

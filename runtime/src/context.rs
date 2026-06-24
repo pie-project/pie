@@ -93,7 +93,7 @@ use crate::adapter::AdapterId;
 use crate::driver::DriverId;
 use crate::process::ProcessId;
 use crate::service::{ServiceArray, ServiceHandler};
-use pie_schema::Brle;
+use pie_driver_abi::Brle;
 
 use pagestore::{FlatPageStore, PageHash, PageStore, PhysicalPageId};
 use rs_cache::{RS_FLAG_RESET, RsSlotId, RsState, RsStore};

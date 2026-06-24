@@ -22,8 +22,8 @@ use futures::{SinkExt, StreamExt};
 use crate::GatewayState;
 use crate::ingress::identity;
 use crate::session::{Affinity, Identity, TokenRx, TurnInput};
-use pie_schema::gateway::{Priority, Tokens};
-use pie_schema::message::ClientMessage;
+use pie_client_api::ClientMessage;
+use pie_worker_rpc::{Priority, Tokens};
 
 /// `GET /v1/ws` — upgrade to a multi-turn session. Identity is extracted from the
 /// edge headers *before* the upgrade (a bad edge never gets a socket).
@@ -183,7 +183,7 @@ fn into_turn(payload: ClientMessage) -> TurnInput {
     }
 }
 
-fn encode(msg: &pie_schema::message::ServerMessage) -> String {
+fn encode(msg: &pie_client_api::ServerMessage) -> String {
     serde_json::to_string(msg).unwrap_or_else(|e| error_json(&e.to_string()))
 }
 

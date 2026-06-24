@@ -19,9 +19,9 @@
 #include <functional>
 #include <iostream>
 
-#include <pie_schema.h>
+#include <pie_driver_abi.h>
 
-#include <pie_schema/view.hpp>
+#include <pie_driver_abi/view.hpp>
 
 // The in-process vtable mechanism types (`PieInProcVTable`,
 // `PieRecvResult`) live in the ipc header, separate from the schema.
