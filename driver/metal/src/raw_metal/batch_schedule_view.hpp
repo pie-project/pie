@@ -13,7 +13,7 @@
 namespace pie_metal_driver::raw_metal {
 
 // Interpret the marshaled CSR view into the batch plan. page_size = runtime kv_page_size (32).
-inline BatchSchedule build_batch_schedule(const PieForwardRequestView& v, int page_size) {
+inline BatchSchedule build_batch_schedule(const pie_driver::PieForwardRequestView& v, int page_size) {
     return build_batch_schedule(
         v.token_ids.data(),         int(v.token_ids.size()),
         v.qo_indptr.data(),
