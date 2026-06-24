@@ -15,7 +15,9 @@
 //   + final logit softcap 30*tanh(x/30), embed * sqrt(hidden), weightless v_norm,
 //     per-layer layer_scalar mul.
 //   + RMSNorm WEIGHT_PLUS_ONE=false (plain rms; opposite of qwen3.6) — same kernel.
-//   + TIED with embed_tokens CANONICAL (no lm_head; logits = embed^T).
+//   + TIED embeddings (logits = embed^T). PRIMARY target is a synthesized 4-bit
+//     gemma4 (charlie's tied-embed synth, qwen-`4bit-tied` recipe) -> reuse delta's
+//     affine_qmv + 4-bit embed_gather + tied lm_head. bf16 E2B is the fallback.
 //   - Dropped: all GDN/linear-attn, QSplit, AttnGate, 2x-wide q_proj.
 
 #include <cstdint>
@@ -62,9 +64,14 @@ struct Gemma4Geometry {
     // final logit softcap: out = cap * tanh(logits / cap). 0 = none.
     float final_softcap   = 30.0f;
 
-    // quantization (only when the target checkpoint is 4-bit; bf16 E2B leaves bits=0).
+    // quantization. PRIMARY target = synthesized 4-bit (charlie's tied-embed synth
+    // from gemma-4-E2B-it, same recipe as qwen `4bit-tied`) -> reuse delta's proven
+    // `affine_qmv` for every linear + 4-bit dequant `embed_gather` + tied lm_head,
+    // exactly like qwen3.6. FALLBACK = native bf16 (set q_bits=0 -> `bf16_gemv.metal`
+    // + bind::Gemv) if 4-bit measurably hurts gemma4 quality (manager's accuracy
+    // guard: cosine >= 0.99999 vs golden, no material degrade vs bf16/HF).
     int   q_group         = 64;
-    int   q_bits          = 0;       // 0 = bf16 dense GEMV; 4 = affine_qmv
+    int   q_bits          = 4;       // 4 = affine_qmv (primary); 0 = bf16 GEMV (fallback)
 
     // ── Per-layer attention-type schedule ────────────────────────────────────
     // full-attention every `full_attn_interval`-th layer: (il+1) % 5 == 0.
