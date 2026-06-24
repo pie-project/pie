@@ -128,6 +128,9 @@ enum class IoSlot : uint8_t {
     KvLastPageLens = 8,  // u32[R] — fill count of each request's last page
     RsSlotIds      = 9,  // u32[R] — recurrent-state (GDN) slot per request
     RsSlotFlags    = 10, // u8[R]  — per-slot NEW(reset)/CONTINUE flag
+    ReqOfToken     = 11, // u32[N] — per-token request id; ENTRY populates from beta's
+                         // batch_schedule::tok_req (= qo_indptr expansion). Read by
+                         // bind::KvAppend::ReqOfToken + bind::SdpaPaged::ReqOfToken.
 };
 
 // ── Per-kernel binding indices (arg order the encoder binds into MTL4ArgumentTable) ──
@@ -154,6 +157,22 @@ enum class Qmm : uint8_t { W = 0, Scales = 1, Biases = 2, X = 3, Out = 4, K = 5,
 enum class Sdpa : uint8_t {
     Q = 0, K = 1, V = 2, Out = 3, GqaFactor = 4, N = 5,
     KHeadStride = 6, KSeqStride = 7, VHeadStride = 8, VSeqStride = 9, Scale = 10,
+};
+
+// batched paged-attention READ (M>1, beta's sdpa_paged.metal) — Phase-1, no-op at
+// M=1 (M=1 uses bind::Sdpa over the contiguous ring). Gathers K/V from the paged
+// cache via delta's phys_slot: kv_page_indices[kv_page_indptr[r] + kp/PageSize]
+// *PageSize + kp%PageSize, element (slot*NKvHeads + h)*head_dim + d. Causal bound =
+// PositionIds[row] (query attends kv [0..pos]); seqlen falls out of position, so NO
+// KvLastPageLens read. ReqOfToken = IoSlot::ReqOfToken (beta's batch_schedule::tok_req).
+// gemma4: per-layer head_dim (256/512) + kv_source redirect threaded host-side.
+enum class SdpaPaged : uint8_t {
+    Q = 0, KPages = 1, VPages = 2, Out = 3, GqaFactor = 4,
+    PositionIds = 5,     // IoSlot::Position widened [N] — per-query causal bound
+    ReqOfToken = 6,      // IoSlot::ReqOfToken [N]
+    KvPageIndices = 7,   // IoSlot::KvPageIndices
+    KvPageIndptr = 8,    // IoSlot::KvPageIndptr
+    PageSize = 9, NKvHeads = 10, Scale = 11,
 };
 
 // rms_single_row: group=(row/N_READS), grid=(1,1,1). Buffer 3 is a packed
