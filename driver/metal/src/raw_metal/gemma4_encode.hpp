@@ -66,6 +66,7 @@ void encode_gemma4_step(StepEncoder& se,
                         const Gemma4StepPsos& psos,
                         const Gemma4Geometry& geom,
                         bool force_barriers = false,
-                        BarrierVisibility vis = BarrierVisibility::ExecutionOnly);
+                        BarrierVisibility vis = BarrierVisibility::ExecutionOnly,
+                        int concur = 0);
 
 }  // namespace pie_metal_driver::raw_metal::gemma4

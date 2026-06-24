@@ -165,22 +165,47 @@ void gemma4_launch_dims(Kernel kind, int layer, const Gemma4Geometry& g,
     }
 }
 
+// Concurrency policy: should a barrier follow dispatch `dag[i]`? gemma4 scratch is NO-RECYCLE
+// (one buffer per ordinal) so there are no WAR/WAW hazards — only RAW. A barrier between
+// dispatch i and i+1 is therefore unnecessary when i+1 does not read i's output (per beta:
+// no `concurrent_after`/coloring needed, unlike qwen's recycling allocator — pure predicate).
+//   • Gate‖Up — drop the barrier ONLY when dag[i]=QmvGate is immediately followed by
+//     dag[i+1]=QmvUp of the SAME layer (the build_gemma4_dag L73-75 invariant: QmvGate, QmvUp,
+//     GegluTanh). QmvUp reads FfnNorm (not gate); GegluTanh reads both and still barriers after
+//     QmvUp. The explicit next-kind + same-layer guard (beta's pattern) makes it robust to any
+//     future DAG reordering — it never drops a barrier across a layer/PLE boundary.
+// concur: 0 = barrier after every dispatch (correct default); 1 = +Gate‖Up;
+//        -1 = drop ALL barriers (TIMING-ONLY perf ceiling — produces WRONG argmax, never shipped).
+// (Q‖K‖V needs a DAG reorder — QNorm sits between QmvQ and QmvK with a RAW dep on QmvQ — so it
+//  is NOT in this predicate yet; defer until the reorder lands.)
+static bool gemma4_barrier_after(const std::vector<Gemma4Dispatch>& dag, size_t i, int concur) {
+    if (concur < 0) return false;                  // ceiling: no barriers at all
+    if (i + 1 >= dag.size()) return true;
+    const Gemma4Dispatch& a = dag[i];
+    const Gemma4Dispatch& b = dag[i + 1];
+    if (concur >= 1 && a.kind == Kernel::QmvGate && b.kind == Kernel::QmvUp && a.layer == b.layer)
+        return false;
+    return true;
+}
+
 void encode_gemma4_step(StepEncoder& se,
                         const std::vector<Gemma4Dispatch>& dag,
                         const Gemma4StepPsos& psos,
                         const Gemma4Geometry& geom,
                         bool force_barriers,
-                        BarrierVisibility vis) {
-    (void)force_barriers;  // gemma4 has no ‖-pair concurrency model yet → barrier after each.
+                        BarrierVisibility vis,
+                        int concur) {
+    (void)force_barriers;
     Grid grid; Threadgroup tg;
-    for (const Gemma4Dispatch& d : dag) {
+    for (size_t i = 0; i < dag.size(); ++i) {
+        const Gemma4Dispatch& d = dag[i];
         const Pso& pso = (d.kind == Kernel::Sdpa && Gemma4Geometry::is_full_attn(d.layer))
                              ? psos.sdpa_full : psos[d.kind];
         se.set_pso(pso);
         se.set_argtable_ordinal(d.ordinal);   // flat-ordinal key (ratified)
         gemma4_launch_dims(d.kind, d.layer, geom, grid, tg);
         se.dispatch(grid, tg);
-        se.barrier(vis);
+        if (gemma4_barrier_after(dag, i, concur)) se.barrier(vis);
     }
 }
 

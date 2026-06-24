@@ -94,6 +94,49 @@ const char* golden_tag(Kernel k) {
     }
 }
 
+// Full per-kind name (every Kernel, incl. untapped) for ablation/attribution reporting.
+const char* kind_name(Kernel k) {
+    switch (k) {
+        case Kernel::EmbedGather:      return "EmbedGather";
+        case Kernel::PleTokenGather:   return "PleTokenGather";
+        case Kernel::PleProjGemv:      return "PleProjGemv";
+        case Kernel::PleProjNorm:      return "PleProjNorm";
+        case Kernel::PleCombine:       return "PleCombine";
+        case Kernel::AttnNorm:         return "AttnNorm";
+        case Kernel::QmvQ:             return "QmvQ";
+        case Kernel::QmvK:             return "QmvK";
+        case Kernel::QmvV:             return "QmvV";
+        case Kernel::QNorm:            return "QNorm";
+        case Kernel::KNorm:            return "KNorm";
+        case Kernel::VNorm:            return "VNorm";
+        case Kernel::RopeQ:            return "RopeQ";
+        case Kernel::RopeK:            return "RopeK";
+        case Kernel::KvAppend:         return "KvAppend";
+        case Kernel::Sdpa:             return "Sdpa";
+        case Kernel::QmvO:             return "QmvO";
+        case Kernel::PostAttnNorm:     return "PostAttnNorm";
+        case Kernel::AttnResidual:     return "AttnResidual";
+        case Kernel::FfnNorm:          return "FfnNorm";
+        case Kernel::QmvGate:          return "QmvGate";
+        case Kernel::QmvUp:            return "QmvUp";
+        case Kernel::GegluTanh:        return "GegluTanh";
+        case Kernel::QmvDown:          return "QmvDown";
+        case Kernel::PostFfnNorm:      return "PostFfnNorm";
+        case Kernel::FfnResidual:      return "FfnResidual";
+        case Kernel::PleGateGemv:      return "PleGateGemv";
+        case Kernel::PleGeglu:         return "PleGeglu";
+        case Kernel::PleProjLayerGemv: return "PleProjLayerGemv";
+        case Kernel::PleNorm:          return "PleNorm";
+        case Kernel::PleResidual:      return "PleResidual";
+        case Kernel::LayerScalar:      return "LayerScalar";
+        case Kernel::FinalRms:         return "FinalRms";
+        case Kernel::LmHead:           return "LmHead";
+        case Kernel::FinalSoftcap:     return "FinalSoftcap";
+        case Kernel::Argmax:           return "Argmax";
+        default:                       return "?";
+    }
+}
+
 // Valid flat element count per tapped kind (matches the golden tensor's flattened shape).
 size_t golden_len(Kernel k, int L, const Gemma4Geometry& g) {
     switch (k) {
@@ -358,18 +401,129 @@ int run_main(int argc, char** argv) {
     ctx->make_resident();
 
     // ── Decode loop: feed each prompt id as an M=1 step (KV append-only across steps) ──
+    // PIE_CONCUR selects the encoder concurrency policy (0=barrier-after-each default,
+    // 1=Gate‖Up overlap). Set it for dump+gate runs to validate a concurrency mode bit-exact.
+    const int concur = std::getenv("PIE_CONCUR") ? std::atoi(std::getenv("PIE_CONCUR")) : 0;
     StepTiming last{};
     for (size_t i = 0; i < ids.size(); ++i) {
         write_u32(b.io_token,    ids[i]);
         write_u32(b.io_position, uint32_t(i));
         write_u32(b.io_seqlen,   uint32_t(i + 1));
-        last = ctx->run_step([&](StepEncoder& se) { encode_gemma4_step(se, dag, psos, g); },
-                             int(i & 1));
+        last = ctx->run_step(
+            [&](StepEncoder& se) { encode_gemma4_step(se, dag, psos, g, false,
+                                                      BarrierVisibility::ExecutionOnly, concur); },
+            int(i & 1));
         std::printf("[gemma4_decode_run] step %zu (id=%u pos=%zu): encode_ms=%.4f gpu_exec_ms=%.4f\n",
                     i, ids[i], i, last.encode_ms, last.gpu_exec_ms);
     }
     std::printf("[gemma4_decode_run] HEADLINE last-step: encode_ms=%.4f gpu_exec_ms=%.4f total_ms=%.4f\n",
                 last.encode_ms, last.gpu_exec_ms, last.total_ms());
+
+    // ── Optional CONCURRENCY A/B (PIE_CONCUR_AB=1): min-floor of barrier-after-each (concur=0)
+    //    vs Gate‖Up overlap (concur=1) vs the all-drop ceiling (concur=-1). Answers manager's
+    //    measure-first gate: does dropping the barrier on the 2.15ms Gate‖Up pair move gemma4's
+    //    number, or is it ~0 like qwen's already-overlapped pairs? ──
+    if (std::getenv("PIE_CONCUR_AB")) {
+        const int reps = std::getenv("PIE_CONCUR_REPS") ? std::atoi(std::getenv("PIE_CONCUR_REPS")) : 30;
+        auto timed = [&](int cc) {
+            double best = 1e9;
+            for (int r = 0; r < reps; ++r) {
+                StepTiming t = ctx->run_step(
+                    [&](StepEncoder& se) { encode_gemma4_step(se, dag, psos, g, false,
+                                                              BarrierVisibility::ExecutionOnly, cc); }, 0);
+                if (r > 0) best = std::min(best, t.gpu_exec_ms);
+            }
+            return best;
+        };
+        const double b0 = timed(0), b1 = timed(1), bc = timed(-1);
+        std::printf("\n==== gemma4 CONCURRENCY A/B (min-floor over %d reps) ====\n", reps);
+        std::printf("  concur=0  barrier-after-each   = %.4f ms\n", b0);
+        std::printf("  concur=1  Gate‖Up overlap      = %.4f ms  (Δ %.4f, %.1f%%)\n",
+                    b1, b0 - b1, 100.0 * (b0 - b1) / b0);
+        std::printf("  concur=-1 ALL-drop ceiling     = %.4f ms  (Δ %.4f, %.1f%% — max upside)\n",
+                    bc, b0 - bc, 100.0 * (b0 - bc) / b0);
+        return 0;
+    }
+
+    // ── Optional per-kind ABLATION ranking (PIE_ABLATE_RANK=1): for every Kernel kind present
+    //    in the DAG, time the full DAG vs the DAG with that kind's dispatches removed; Δ = the
+    //    aggregate gpu-exec cost of that kind (differencing-free — kernels still execute, only
+    //    downstream reads garbage, but gpu_exec is valid). Ranks the hot kernels for the perf
+    //    pass (delta's qwen3.6 method). State is intact from the decode loop. ──
+    if (std::getenv("PIE_ABLATE_RANK")) {
+        const int reps = std::getenv("PIE_ABLATE_REPS") ? std::atoi(std::getenv("PIE_ABLATE_REPS")) : 30;
+        auto timed = [&](const std::vector<Gemma4Dispatch>& d) {
+            double best = 1e9;  // min-floor over reps (thermal-robust)
+            for (int r = 0; r < reps; ++r) {
+                StepTiming t = ctx->run_step(
+                    [&](StepEncoder& se) { encode_gemma4_step(se, d, psos, g); }, 0);
+                if (r > 0) best = std::min(best, t.gpu_exec_ms);
+            }
+            return best;
+        };
+        const double full = timed(dag);
+        // Collect distinct kinds in DAG order, with dispatch counts.
+        std::vector<Kernel> order; std::vector<int> counts;
+        for (const auto& d : dag) {
+            auto it = std::find(order.begin(), order.end(), d.kind);
+            if (it == order.end()) { order.push_back(d.kind); counts.push_back(1); }
+            else counts[it - order.begin()]++;
+        }
+        struct Row { const char* name; int n; double dms; };
+        std::vector<Row> rows;
+        for (size_t i = 0; i < order.size(); ++i) {
+            std::vector<Gemma4Dispatch> ablated;
+            for (const auto& d : dag) if (d.kind != order[i]) ablated.push_back(d);
+            const double abl = timed(ablated);
+            rows.push_back({kind_name(order[i]), counts[i], full - abl});
+        }
+        std::sort(rows.begin(), rows.end(), [](const Row& a, const Row& b){ return a.dms > b.dms; });
+        std::printf("\n==== gemma4 per-kind ABLATION RANK (full=%.4f ms, min-floor over %d reps) ====\n",
+                    full, reps);
+        std::printf("  %-18s %5s %10s %9s %12s\n", "kind", "#disp", "Δms", "%step", "Δms/disp");
+        for (const auto& r : rows)
+            std::printf("  %-18s %5d %10.4f %8.1f%% %12.5f\n",
+                        r.name, r.n, r.dms, 100.0 * r.dms / full, r.n ? r.dms / r.n : 0.0);
+        return 0;
+    }
+
+    // ── Optional targeted kind ABLATE (PIE_ABLATE=QmvGate,QmvUp,...): same as one rank row,
+    //    for A/B-ing a specific fusion/coop experiment. ──
+    if (const char* abl = std::getenv("PIE_ABLATE")) {
+        const int reps = std::getenv("PIE_ABLATE_REPS") ? std::atoi(std::getenv("PIE_ABLATE_REPS")) : 30;
+        std::string want = abl;
+        auto in_set = [&](Kernel k) {
+            const std::string n = kind_name(k);
+            size_t p = 0;
+            while (p <= want.size()) {
+                size_t c = want.find(',', p);
+                std::string tok = want.substr(p, c == std::string::npos ? std::string::npos : c - p);
+                if (tok == n) return true;
+                if (c == std::string::npos) break;
+                p = c + 1;
+            }
+            return false;
+        };
+        auto timed = [&](const std::vector<Gemma4Dispatch>& d) {
+            double best = 1e9;
+            for (int r = 0; r < reps; ++r) {
+                StepTiming t = ctx->run_step(
+                    [&](StepEncoder& se) { encode_gemma4_step(se, d, psos, g); }, 0);
+                if (r > 0) best = std::min(best, t.gpu_exec_ms);
+            }
+            return best;
+        };
+        std::vector<Gemma4Dispatch> ablated; int removed = 0;
+        for (const auto& d : dag) { if (in_set(d.kind)) ++removed; else ablated.push_back(d); }
+        const double full = timed(dag), abl_ms = timed(ablated);
+        std::printf("[gemma4_decode_run] ABLATE '%s' (min-floor over %d reps)\n", abl, reps);
+        std::printf("  full DAG    (%3zu disp) = %.4f ms\n", dag.size(), full);
+        std::printf("  ablated DAG (%3zu disp) = %.4f ms  (removed %d)\n", ablated.size(), abl_ms, removed);
+        std::printf("  Δ (cost of '%s') = %.4f ms  (%.1f%% of step, %.5f ms/disp)\n",
+                    abl, full - abl_ms, 100.0 * (full - abl_ms) / full,
+                    removed ? (full - abl_ms) / removed : 0.0);
+        return 0;
+    }
 
     // ── Optional golden-tap dump (cosine_bisect vs charlie's pos-7 golden) ──
     if (const char* dump_dir = std::getenv("PIE_DUMP_TAPS")) {
