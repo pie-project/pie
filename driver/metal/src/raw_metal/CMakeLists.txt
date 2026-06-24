@@ -57,6 +57,22 @@ target_link_libraries(raw_metal_microbench PRIVATE
   "-framework Metal"
   "-framework Foundation")
 
+# gemma4_encode_probe — non-GPU-exclusive verification of alpha's gemma4 executor:
+# build_gemma4_dag + load_gemma4_psos (runtime-compile every gemma4 kernel) + walk the
+# DAG asserting each dispatch has a valid PSO + sane launch dims. The bit-exact parity
+# gate vs charlie's golden is the separate GPU integration step (gemma4_decode_run, TBD).
+add_executable(gemma4_encode_probe
+  gemma4_encode_probe.cpp
+  gemma4_encode.cpp
+  mtl4_context.mm)
+set_source_files_properties(mtl4_context.mm PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
+target_include_directories(gemma4_encode_probe PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_compile_definitions(gemma4_encode_probe PRIVATE
+  RAW_METAL_KERNELS_DIR="${CMAKE_CURRENT_SOURCE_DIR}/kernels")
+target_link_libraries(gemma4_encode_probe PRIVATE
+  "-framework Metal"
+  "-framework Foundation")
+
 # Raw safetensors byte reader (MLX-free) + probe — the weight-staging handoff for
 # delta's heap_bind. Pure C++/POSIX, no Metal.
 if(NLOHMANN_JSON_INCLUDE)
