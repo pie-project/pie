@@ -51,37 +51,50 @@ struct GdnCoreParams {
 };
 
 // T  = core_out dtype (bf16/half/float); recurrent state is always fp32.
-template <typename T>
-[[kernel]] void gdn_core(
-    const device T*     mixed          [[buffer(0)]],   // [R, conv_dim]  this token's in-proj mixed_qkv
-    const device float* conv_state     [[buffer(1)]],   // [R, Kc, conv_dim]  READ-ONLY conv history
-    device float*       rstate         [[buffer(2)]],   // [R, Hv, Vd, Dk]  in-place native recurrent state
-    device T*           core_out       [[buffer(3)]],   // [R, Hv, Vd]  pre-GatedRms output
-    const device T*     conv_w         [[buffer(4)]],   // [conv_dim, Kc]
-    const device T*     conv_b         [[buffer(5)]],   // [conv_dim]
-    const device float* A_log          [[buffer(6)]],   // [Hv]  F32 in ckpt — typed float* (bit-exact decay; raw zero-copy stage)
-    const device T*     dt_bias        [[buffer(7)]],   // [Hv]
-    const device T*     a_gate         [[buffer(8)]],   // [R, Hv]
-    const device T*     b_gate         [[buffer(9)]],   // [R, Hv]
-    device float*       new_conv_state [[buffer(10)]],  // [R, Kc, conv_dim]  shifted history (ping-pong, != conv_state)
-    constant GdnCoreParams& p          [[buffer(11)]],
-    uint3 tpig                         [[thread_position_in_grid]],
-    uint3 tpit                         [[thread_position_in_threadgroup]],
-    uint  simd_lane                    [[thread_index_in_simdgroup]]) {
+// ── M>1 slot-indexed state seam (delta's GDN bridge, ckpt 030) ───────────────
+// For S>1 the conv/recurrent state slabs are keyed by rs_slot_ids[r], NOT by the
+// token's contiguous row. ONLY state accesses remap b_idx→slot; activations
+// (mixed/core_out/a_gate/b_gate) stay token-major b_idx. `SLOTTED` selects:
+//   false  →  slot = b_idx  (the sealed M=1 path; slot_ids never read → byte-identical 264).
+//   true   →  slot = slot_ids[b_idx]  (S>1; state slabs sized max_slots, delta owns host side).
+// Both slab strides derive from GdnCoreParams (Hv/Dv/Dk/Kc/CDIM) — slot_ids alone suffices.
+template <typename T, bool SLOTTED>
+METAL_FUNC void gdn_core_body(
+    const device T*     mixed,          // [N, conv_dim]  this token's in-proj mixed_qkv
+    const device float* conv_state,     // [max_slots, Kc, conv_dim]  READ-ONLY conv history
+    device float*       rstate,         // [max_slots, Hv, Vd, Dk]  in-place native recurrent state
+    device T*           core_out,       // [N, Hv, Vd]  pre-GatedRms output
+    const device T*     conv_w,         // [conv_dim, Kc]
+    const device T*     conv_b,         // [conv_dim]
+    const device float* A_log,          // [Hv]  F32 in ckpt
+    const device T*     dt_bias,        // [Hv]
+    const device T*     a_gate,         // [N, Hv]
+    const device T*     b_gate,         // [N, Hv]
+    device float*       new_conv_state, // [max_slots, Kc, conv_dim]  shifted history (ping-pong)
+    constant GdnCoreParams& p,
+    const device uint*  slot_ids,       // [N]  rs_slot per token row (read only when SLOTTED)
+    threadgroup float*  sh_q,           // [Dk]  shared normalized+prescaled q (tg-allocated by wrapper)
+    threadgroup float*  sh_k,           // [Dk]  shared normalized k
+    threadgroup float*  sh_decay,       // [1]   shared per-head decay
+    threadgroup float*  sh_beta,        // [1]   shared per-head beta
+    uint3 tpig, uint3 tpit, uint simd_lane) {
   const int Dk = p.Dk, Dv = p.Dv, Hv = p.Hv, CDIM = p.conv_dim, Kc = p.Kc;
-  const int n        = int(tpig.z);          // 0 .. R*Hv-1
-  const int b_idx    = n / Hv;
+  const int n        = int(tpig.z);          // 0 .. N*Hv-1
+  const int b_idx    = n / Hv;               // token row (activation index)
   const int hv_idx   = n % Hv;
   const int dk_idx   = int(tpit.x);          // 0..31
   const int dv_idx   = int(tpig.y);          // 0..Vd-1
   const int n_per_t  = Dk / 32;              // 4
   const int q_off = p.q_off, k_off = p.k_off, v_off = p.v_off;
+  // STATE slab index: remapped to the request's persistent slot when SLOTTED.
+  const int slot = SLOTTED ? int(slot_ids[b_idx]) : b_idx;
 
   // --- conv1d(+silu) over a channel's Kc-tap window (history + this token) ---
+  // history reads from the SLOT's conv slab; the new token (`mixed`) is the token row.
   auto convsilu = [&](int c) -> float {
     float acc = float(conv_b[c]);
     for (int j = 0; j < Kc - 1; ++j)
-      acc += conv_state[(b_idx * Kc + (j + 1)) * CDIM + c] * float(conv_w[c * Kc + j]);
+      acc += conv_state[(slot * Kc + (j + 1)) * CDIM + c] * float(conv_w[c * Kc + j]);
     acc += float(mixed[b_idx * CDIM + c]) * float(conv_w[c * Kc + (Kc - 1)]);
     return acc / (1.0f + exp(-acc));          // silu
   };
@@ -93,10 +106,9 @@ template <typename T>
   // threadgroups). The threadgroup spans a tile of dv (tg.y simdgroups) so this
   // dedups tg.y× while keeping full occupancy. Bit-identical: same simd_sum
   // reduction, same values, just computed once and broadcast.
-  threadgroup float sh_q[256];     // [Dk] normalized + 1/sqrt(Dk)-prescaled q
-  threadgroup float sh_k[256];     // [Dk] normalized k
-  threadgroup float sh_decay;      // exp gate decay (per head)
-  threadgroup float sh_beta;       // sigmoid beta   (per head)
+  // The shared q/k/gating threadgroup buffers (sh_q/sh_k/sh_decay/sh_beta) are
+  // declared in the [[kernel]] wrapper and passed in (Metal forbids threadgroup
+  // address-space decls inside a non-kernel helper).
   if (tpit.y == 0) {
     float qraw[8], kraw[8];                    // n_per_t<=8
     for (int i = 0; i < n_per_t; ++i) {
@@ -118,8 +130,8 @@ template <typename T>
       // gating: g = -exp(A_log)*softplus(a+dt_bias); decay = exp(g); beta = sigmoid(b)
       float ad = float(a_gate[b_idx * Hv + hv_idx]) + float(dt_bias[hv_idx]);
       float sp = max(ad, 0.0f) + log(1.0f + exp(-fabs(ad)));   // softplus
-      sh_decay = exp(-exp(float(A_log[hv_idx])) * sp);
-      sh_beta  = 1.0f / (1.0f + exp(-float(b_gate[b_idx * Hv + hv_idx])));
+      sh_decay[0] = exp(-exp(float(A_log[hv_idx])) * sp);
+      sh_beta[0]  = 1.0f / (1.0f + exp(-float(b_gate[b_idx * Hv + hv_idx])));
     }
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -128,10 +140,11 @@ template <typename T>
   float vval = convsilu(v_off + hv_idx * Dv + dv_idx);
   float q[8], k[8];
   for (int i = 0; i < n_per_t; ++i) { int d = n_per_t * dk_idx + i; q[i] = sh_q[d]; k[i] = sh_k[d]; }
-  float gdecay = sh_decay, beta = sh_beta;
+  float gdecay = sh_decay[0], beta = sh_beta[0];
 
   // --- recurrent step (register state + simd_sum), native [Hv,Vd,Dk] ---
-  device float* i_state = rstate + (size_t(n * Dv + dv_idx) * Dk);
+  // State row is keyed by SLOT (persistent per-request slab), not the token row.
+  device float* i_state = rstate + (size_t((slot * Hv + hv_idx) * Dv + dv_idx) * Dk);
   float st[8];
   for (int i = 0; i < n_per_t; ++i) st[i] = i_state[n_per_t * dk_idx + i];
 
@@ -155,8 +168,8 @@ template <typename T>
   // own. Full coverage, each channel written exactly once. Output bit-identical.
   auto wb = [&](int c) {
     for (int j = 0; j < Kc - 1; ++j)
-      new_conv_state[(b_idx * Kc + j) * CDIM + c] = conv_state[(b_idx * Kc + (j + 1)) * CDIM + c];
-    new_conv_state[(b_idx * Kc + (Kc - 1)) * CDIM + c] = float(mixed[b_idx * CDIM + c]);
+      new_conv_state[(slot * Kc + j) * CDIM + c] = conv_state[(slot * Kc + (j + 1)) * CDIM + c];
+    new_conv_state[(slot * Kc + (Kc - 1)) * CDIM + c] = float(mixed[b_idx * CDIM + c]);
   };
   if (dv_idx == 0) {
     for (int i = 0; i < n_per_t; ++i) {
@@ -168,6 +181,57 @@ template <typename T>
   wb(v_off + hv_idx * Dv + dv_idx);
 }
 
+// ── M=1 sealed entry: 12 buffers, NO slot_ids — byte-identical PSO (264 holds). ──
+template <typename T>
+[[kernel]] void gdn_core(
+    const device T*     mixed          [[buffer(0)]],
+    const device float* conv_state     [[buffer(1)]],
+    device float*       rstate         [[buffer(2)]],
+    device T*           core_out       [[buffer(3)]],
+    const device T*     conv_w         [[buffer(4)]],
+    const device T*     conv_b         [[buffer(5)]],
+    const device float* A_log          [[buffer(6)]],
+    const device T*     dt_bias        [[buffer(7)]],
+    const device T*     a_gate         [[buffer(8)]],
+    const device T*     b_gate         [[buffer(9)]],
+    device float*       new_conv_state [[buffer(10)]],
+    constant GdnCoreParams& p          [[buffer(11)]],
+    uint3 tpig                         [[thread_position_in_grid]],
+    uint3 tpit                         [[thread_position_in_threadgroup]],
+    uint  simd_lane                    [[thread_index_in_simdgroup]]) {
+  threadgroup float sh_q[256], sh_k[256], sh_decay[1], sh_beta[1];
+  gdn_core_body<T, false>(mixed, conv_state, rstate, core_out, conv_w, conv_b,
+                          A_log, dt_bias, a_gate, b_gate, new_conv_state, p,
+                          (const device uint*)nullptr,
+                          sh_q, sh_k, sh_decay, sh_beta, tpig, tpit, simd_lane);
+}
+
+// ── M>1 slotted entry: +slot_ids[buffer(12)] (alpha GdnCore::SlotIds=12). ──
+template <typename T>
+[[kernel]] void gdn_core_slotted(
+    const device T*     mixed          [[buffer(0)]],
+    const device float* conv_state     [[buffer(1)]],
+    device float*       rstate         [[buffer(2)]],
+    device T*           core_out       [[buffer(3)]],
+    const device T*     conv_w         [[buffer(4)]],
+    const device T*     conv_b         [[buffer(5)]],
+    const device float* A_log          [[buffer(6)]],
+    const device T*     dt_bias        [[buffer(7)]],
+    const device T*     a_gate         [[buffer(8)]],
+    const device T*     b_gate         [[buffer(9)]],
+    device float*       new_conv_state [[buffer(10)]],
+    constant GdnCoreParams& p          [[buffer(11)]],
+    const device uint*  slot_ids       [[buffer(12)]],
+    uint3 tpig                         [[thread_position_in_grid]],
+    uint3 tpit                         [[thread_position_in_threadgroup]],
+    uint  simd_lane                    [[thread_index_in_simdgroup]]) {
+  threadgroup float sh_q[256], sh_k[256], sh_decay[1], sh_beta[1];
+  gdn_core_body<T, true>(mixed, conv_state, rstate, core_out, conv_w, conv_b,
+                         A_log, dt_bias, a_gate, b_gate, new_conv_state, p,
+                         slot_ids,
+                         sh_q, sh_k, sh_decay, sh_beta, tpig, tpit, simd_lane);
+}
+
 #define instantiate_gdn_core(name, itype)                                  \
   template [[host_name("gdn_core_" #name)]] [[kernel]] void                \
   gdn_core<itype>(                                                         \
@@ -175,7 +239,14 @@ template <typename T>
       device itype*, const device itype*, const device itype*,             \
       const device float*, const device itype*, const device itype*,       \
       const device itype*, device float*,                                  \
-      constant GdnCoreParams&, uint3, uint3, uint);
+      constant GdnCoreParams&, uint3, uint3, uint);                        \
+  template [[host_name("gdn_core_slotted_" #name)]] [[kernel]] void        \
+  gdn_core_slotted<itype>(                                                 \
+      const device itype*, const device float*, device float*,             \
+      device itype*, const device itype*, const device itype*,             \
+      const device float*, const device itype*, const device itype*,       \
+      const device itype*, device float*,                                  \
+      constant GdnCoreParams&, const device uint*, uint3, uint3, uint);
 
 instantiate_gdn_core(float32, float)
 instantiate_gdn_core(float16, half)
