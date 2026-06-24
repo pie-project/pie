@@ -396,6 +396,13 @@ int main(int argc, char** argv) {
     // with sleep, the e2e>back-to-back inflation is GPU-idle downclock, not commit cost.
     const long step_sleep_us =
         std::getenv("PIE_STEP_SLEEP_US") ? std::atol(std::getenv("PIE_STEP_SLEEP_US")) : 0;
+    // PIE_KEEPALIVE_US: instead of idling, keep the GPU busy for ~this long between steps
+    // by committing a cheap heartbeat dispatch (dag[0]=EmbedGather into recycled scratch,
+    // harmless to KV/state) in a tight loop. Directional probe: if the next real step's
+    // gpu_exec stays near the 3.78ms hot floor (vs ~6.4ms under PIE_STEP_SLEEP_US), then
+    // keeping the GPU non-idle holds the DVFS clock -> a keep-warm fix is viable.
+    const long keepalive_us =
+        std::getenv("PIE_KEEPALIVE_US") ? std::atol(std::getenv("PIE_KEEPALIVE_US")) : 0;
     for (size_t i = 0; i < ids.size(); ++i) {
         write_u32(b.io[int(IoSlot::TokenId)], ids[i]);
         write_u32(b.io[int(IoSlot::Position)], uint32_t(i));
@@ -434,6 +441,17 @@ int main(int argc, char** argv) {
                     i, ids[i], i, last.encode_ms, last.gpu_exec_ms);
         if (step_sleep_us > 0)
             std::this_thread::sleep_for(std::chrono::microseconds(step_sleep_us));
+        if (keepalive_us > 0 && dag[0].kind == Kernel::EmbedGather) {
+            auto ka0 = std::chrono::steady_clock::now();
+            while (std::chrono::duration_cast<std::chrono::microseconds>(
+                       std::chrono::steady_clock::now() - ka0).count() < keepalive_us) {
+                ctx->run_step([&](StepEncoder& se) {
+                    se.set_pso(psos[dag[0].kind]);
+                    se.set_argtable_ordinal(dag[0].ordinal);
+                    se.dispatch(dag[0].grid, dag[0].tg);
+                });
+            }
+        }
     }
     std::printf("[decode_run] HEADLINE last-step: encode_ms=%.4f gpu_exec_ms=%.4f total_ms=%.4f\n",
                 last.encode_ms, last.gpu_exec_ms, last.total_ms());
