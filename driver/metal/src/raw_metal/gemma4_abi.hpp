@@ -21,6 +21,7 @@
 //   - Dropped: all GDN/linear-attn, QSplit, AttnGate, 2x-wide q_proj.
 
 #include <cstdint>
+#include <cmath>
 
 #include "decode_abi.hpp"  // shared Region / IoSlot / bind::{Rms,Rope,Sdpa,Embed,KvAppend,Qmv,Argmax}
 
@@ -36,12 +37,16 @@ struct Gemma4Geometry {
     bool  tied_embeddings = true;    // embed_tokens is canonical; logits = embed^T
     bool  norm_plus_one   = false;   // gemma4 stores plain-rms weights (NOT 1+w)
 
-    // attention
+    // attention — head_dim is PER ATTENTION TYPE (verified vs the E2B checkpoint):
+    //   sliding layers: head_dim=256 (q_proj 2048, k/v_proj 256, q/k_norm 256, full rope)
+    //   full layers:    head_dim=512 (q_proj 4096, k/v_proj 512, q/k_norm 512, partial 0.25 rope)
+    // n_q_heads/n_kv_heads are the same for both (8/1, GQA=8); only head_dim changes.
     int   n_q_heads       = 8;
     int   n_kv_heads      = 1;       // GQA factor = n_q/n_kv = 8
-    int   head_dim        = 256;     // q_dim = 2048, kv_dim = 256
-    int   rotary_dims     = 256;     // partial_rotary_factor = 1.0 -> full rotation
-    float attn_scale      = 1.0f;    // Q/K-norm absorbs 1/sqrt(d)
+    int   head_dim        = 256;     // SLIDING head_dim (config head_dim)
+    int   global_head_dim = 512;     // FULL-attn head_dim (config global_head_dim)
+    // partial_rotary_factor: 0.25 on full layers (rotary=128), 1.0 on sliding (rotary=head_dim).
+    float full_partial_rotary = 0.25f;
 
     // RoPE: per-attention-type base frequency
     float rope_theta_global = 1.0e6f;   // full-attn layers (config rope_theta)
@@ -50,8 +55,10 @@ struct Gemma4Geometry {
     // sliding-window attention
     int   sliding_window  = 512;     // sliding layers attend the last 512 positions
 
-    // mlp (GeGLU-tanh)
+    // mlp (GeGLU-tanh). DOUBLE-WIDE on the KV-shared range (layers >= first_kv_shared):
+    // intermediate doubles to 2*intermediate (E2B: 6144 for L<15, 12288 for L>=15).
     int   intermediate    = 6144;
+    bool  double_wide_mlp = true;    // config use_double_wide_mlp
 
     // PLE (Per-Layer Embeddings)
     int   per_layer_emb_dim = 256;   // hidden_size_per_layer_input; ple table width = n_layers*this
@@ -100,6 +107,28 @@ struct Gemma4Geometry {
         for (int L = 0; L < n_layers; ++L) n += is_full_attn(L) ? 1 : 0;
         return n;
     }
+
+    // ── Per-layer geometry (head_dim + MLP width vary by layer; verified vs E2B) ──
+    int head_dim_at(int layer) const {
+        return is_full_attn(layer) ? global_head_dim : head_dim;
+    }
+    int q_dim_at(int layer)  const { return n_q_heads  * head_dim_at(layer); }   // 2048 / 4096
+    int kv_dim_at(int layer) const { return n_kv_heads * head_dim_at(layer); }   // 256  / 512
+    // rotary span: full layers rotate partial_rotary_factor*head_dim (0.25*512=128);
+    // sliding layers rotate the full head_dim (256, rope_type "default").
+    int rotary_at(int layer) const {
+        return is_full_attn(layer) ? int(full_partial_rotary * global_head_dim) : head_dim;
+    }
+    float rope_theta_at(int layer) const {
+        return is_full_attn(layer) ? rope_theta_global : rope_theta_local;
+    }
+    // MLP intermediate doubles on the KV-shared range (double-wide MLP).
+    int intermediate_at(int layer) const {
+        return (double_wide_mlp && layer >= first_kv_shared()) ? 2 * intermediate : intermediate;
+    }
+    // SDPA softmax scale. Gemma4 sets scale=1.0 (Q/K-norm absorbs 1/sqrt(d)) — verified
+    // vs the reference forward (gemma4.cpp: `ap.scale = 1.0f`). NOT 1/sqrt(head_dim).
+    float attn_scale_at(int /*layer*/) const { return 1.0f; }
 };
 
 // ── gemma4-specific per-kernel binding indices ───────────────────────────────
@@ -130,6 +159,12 @@ enum class Softcap : uint8_t { Logits = 0, Out = 1, Cap = 2, N = 3 };
 
 // layer_scalar broadcast multiply: hidden *= scalar[0]  (over [hidden]).
 enum class LayerScalar : uint8_t { X = 0, Scalar = 1, Out = 2, N = 3 };
+
+// Scaled 4-bit embed gather (gemma4): bind::Embed (W/Scales/Biases/TokenId/Out/Hidden)
+// + a const Scale at buffer 6 (embed_tokens: sqrt(hidden); per-layer: sqrt(ple_dim)).
+enum class EmbedScaled : uint8_t {
+    W = 0, Scales = 1, Biases = 2, TokenId = 3, Out = 4, Hidden = 5, Scale = 6
+};
 
 }  // namespace bind
 

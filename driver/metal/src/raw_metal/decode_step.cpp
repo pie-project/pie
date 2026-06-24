@@ -24,8 +24,11 @@ namespace {
 struct LD { Grid grid; Threadgroup tg; };
 
 // GdnCore launch lives with beta's kernel (dispatchThreads = total threads).
+// tg spans a TILE of dv (32 simdgroups) so the q/k prologue is computed once per
+// threadgroup (tpit.y==0) + shared via threadgroup memory — kills the Vd-fold
+// redundancy while keeping full occupancy. grid {32,Vd,Hv} / tg {32,32,1}.
 LD gdncore_ld(const DecodeGeometry& g) {
-    return { Grid{32, uint32_t(g.gdn_v_dim), uint32_t(g.gdn_v_heads)}, Threadgroup{32, 4, 1} };
+    return { Grid{32, uint32_t(g.gdn_v_dim), uint32_t(g.gdn_v_heads)}, Threadgroup{32, 32, 1} };
 }
 
 }  // namespace
