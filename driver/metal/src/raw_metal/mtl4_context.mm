@@ -20,6 +20,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <strings.h>
+#include <algorithm>
 
 namespace pie_metal_driver::raw_metal {
 
@@ -134,6 +135,14 @@ void StepEncoder::barrier(BarrierVisibility vis) {
     [s->en barrierAfterEncoderStages:MTLStageDispatch
                    beforeEncoderStages:MTLStageDispatch
                      visibilityOptions:resolve_barrier_vis(vis)];
+}
+void StepEncoder::mark_timestamp(void* heap, uint32_t idx, bool precise) {
+    if (heap == nullptr) return;
+    auto* s = static_cast<StepState*>(impl_);
+    [s->en writeTimestampWithGranularity:(precise ? MTL4TimestampGranularityPrecise
+                                                  : MTL4TimestampGranularityRelaxed)
+                                intoHeap:(__bridge id<MTL4CounterHeap>)heap
+                                 atIndex:idx];
 }
 
 // ── RawMetalContext ───────────────────────────────────────────────────────────
@@ -278,6 +287,39 @@ Pso RawMetalContext::compile_pso_from_file(const std::string& path, const std::s
         return Pso{};
     }
     return compile_pso(src.UTF8String, fn, error);
+}
+
+void* RawMetalContext::create_timestamp_heap(uint32_t count) {
+    auto& I = *impl_;
+    if (count == 0) return nullptr;
+    MTL4CounterHeapDescriptor* d = [MTL4CounterHeapDescriptor new];
+    d.type  = MTL4CounterHeapTypeTimestamp;
+    d.count = count;
+    NSError* e = nil;
+    id<MTL4CounterHeap> h = [I.dev newCounterHeapWithDescriptor:d error:&e];
+    if (h == nil) {
+        fprintf(stderr, "[raw_metal] timestamp heap create failed (%u): %s\n",
+                count, e.localizedDescription.UTF8String);
+        return nullptr;
+    }
+    [I.retained addObject:h];  // context-owned until destruction
+    return (__bridge void*)h;
+}
+
+void RawMetalContext::resolve_timestamps(void* heap, uint32_t count, uint64_t* out) {
+    if (heap == nullptr || out == nullptr || count == 0) return;
+    // CPU-timeline resolve: valid because run_step already waited the shared event, so all
+    // timestamp writes have completed. Entries are tightly-packed MTL4TimestampHeapEntry
+    // (a single uint64_t each) -> copy the nanosecond ticks straight out.
+    id<MTL4CounterHeap> h = (__bridge id<MTL4CounterHeap>)heap;
+    NSData* data = [h resolveCounterRange:NSMakeRange(0, count)];
+    if (data == nil) {
+        fprintf(stderr, "[raw_metal] timestamp resolve returned nil (count=%u)\n", count);
+        return;
+    }
+    const auto* entries = static_cast<const MTL4TimestampHeapEntry*>(data.bytes);
+    const uint32_t n = std::min<uint32_t>(count, uint32_t(data.length / sizeof(MTL4TimestampHeapEntry)));
+    for (uint32_t i = 0; i < n; ++i) out[i] = entries[i].timestamp;
 }
 
 StepTiming RawMetalContext::run_step(const std::function<void(StepEncoder&)>& encode_fn,
