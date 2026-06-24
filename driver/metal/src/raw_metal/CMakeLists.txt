@@ -67,6 +67,28 @@ if(NLOHMANN_JSON_INCLUDE)
   # against a real checkpoint (presence/dtype/byte-accounting), no Metal dependency.
   add_executable(heap_bind_probe heap_bind_probe.cpp heap_bind_names.cpp safetensors_view.cpp)
   target_include_directories(heap_bind_probe PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${NLOHMANN_JSON_INCLUDE})
+
+  # decode_run — the headline integration driver: stage weights + bind (heap_bind) +
+  # const params (decode_consts) + beta's scratch schedule + PSO loader + encode_decode_step
+  # -> RawMetalContext::run_step. Reports the encode-ms/gpu-exec-ms split + argmax. Links
+  # every lane (alpha context, beta dag/scratch/psos, delta staging/consts/io) + Metal.
+  add_executable(decode_run
+    decode_run.cpp
+    heap_bind.cpp
+    heap_bind_names.cpp
+    decode_consts.cpp
+    decode_step.cpp
+    decode_psos.cpp
+    scratch_schedule.cpp
+    safetensors_view.cpp
+    mtl4_context.mm)
+  set_source_files_properties(mtl4_context.mm PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
+  target_include_directories(decode_run PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${NLOHMANN_JSON_INCLUDE})
+  target_compile_definitions(decode_run PRIVATE
+    RAW_METAL_KERNELS_DIR="${CMAKE_CURRENT_SOURCE_DIR}/kernels")
+  target_link_libraries(decode_run PRIVATE
+    "-framework Metal"
+    "-framework Foundation")
 else()
   message(WARNING "nlohmann/json.hpp not found — st_probe (safetensors handoff) skipped. "
                   "Set -DNLOHMANN_JSON_INCLUDE=<dir>.")

@@ -6,6 +6,7 @@
 #include <string>
 
 #include <mlx/ops.h>
+#include <mlx/io.h>
 
 #include "ops/attention.hpp"
 #include "ops/compiled.hpp"
@@ -16,6 +17,38 @@ namespace pie_metal_driver::model {
 namespace mx = mlx::core;
 
 namespace {
+
+// ── Golden parity taps (sealed MLX reference) ──────────────────────────────
+// When PIE_METAL_GOLDEN_DIR is set, write each tapped intermediate as
+// `<dir>/<layer>.<kernel>.npy` (fp32); layer<0 -> `<kernel>.npy`. Mirrors the
+// qwen3.6 harness (driver/metal/src/model/qwen36.cpp) so cosine_bisect.py
+// localizes the FIRST diverging (kernel,layer). Compiled out of the bench build
+// (PIE_METAL_NO_LAYER_DUMP) so it can never inject a decode-path sync. `dumping()`
+// additionally swaps the fused FFN/PLE compiled regions for an eager,
+// per-op-tapped path that is numerically identical to the compiled identity.
+bool dumping() {
+#ifndef PIE_METAL_NO_LAYER_DUMP
+    static const bool on = std::getenv("PIE_METAL_GOLDEN_DIR") != nullptr;
+    return on;
+#else
+    return false;
+#endif
+}
+
+void dump_kernel(std::int32_t layer, const char* kernel, const Tensor& t) {
+#ifndef PIE_METAL_NO_LAYER_DUMP
+    static const char* dir = std::getenv("PIE_METAL_GOLDEN_DIR");
+    if (dir == nullptr) return;
+    Tensor f = mx::astype(t, mx::float32);
+    mx::eval(f);
+    std::string name = (layer < 0)
+        ? std::string(kernel) + ".npy"
+        : std::to_string(layer) + "." + kernel + ".npy";
+    mx::save(std::string(dir) + "/" + name, f);
+#else
+    (void)layer; (void)kernel; (void)t;
+#endif
+}
 
 // Route single-stream (R=1) pure_decode through the host-readback-free device
 // decode attention (no per-token `to_host_i32` sync), unblocking async_eval
@@ -147,25 +180,38 @@ Tensor Gemma4Graph::decoder_layer(std::int32_t il,
     // ── Attention block (norm sandwich; PLAIN RMSNorm, no +1) ──
     Tensor residual = hidden;
     Tensor cur = ops::rms_norm(hidden, *L.attn_norm, eps, /*plus_one=*/false);
+    dump_kernel(il, "attn_norm", cur);
 
-    Tensor Q = to_heads(apply_linear(L.q_proj, cur), n_total, n_q_heads, head_dim);
+    Tensor q_lin = apply_linear(L.q_proj, cur);
+    dump_kernel(il, "q_proj", q_lin);
+    Tensor Q = to_heads(q_lin, n_total, n_q_heads, head_dim);
     Q = ops::rms_norm(Q, *L.q_norm, eps, /*plus_one=*/false);  // per-head Q-norm
+    dump_kernel(il, "q_norm", Q);
 
     Tensor k_pages = ops::empty_tensor();  // placeholder; reassigned below
     Tensor v_pages = ops::empty_tensor();
     if (!is_shared) {
-        Tensor K = to_heads(apply_linear(L.k_proj, cur), n_total, n_kv_heads, head_dim);
-        Tensor V = to_heads(apply_linear(L.v_proj, cur), n_total, n_kv_heads, head_dim);
+        Tensor k_lin = apply_linear(L.k_proj, cur);
+        dump_kernel(il, "k_proj", k_lin);
+        Tensor v_lin = apply_linear(L.v_proj, cur);
+        dump_kernel(il, "v_proj", v_lin);
+        Tensor K = to_heads(k_lin, n_total, n_kv_heads, head_dim);
+        Tensor V = to_heads(v_lin, n_total, n_kv_heads, head_dim);
         K = ops::rms_norm(K, *L.k_norm, eps, /*plus_one=*/false);  // per-head K-norm
+        dump_kernel(il, "k_norm", K);
         V = ops::rms_norm(V, eps);  // weightless V-norm before the KV write
+        dump_kernel(il, "v_norm", V);
         // RoPE (Gemma-4 rotates after qk-norm). Shared layers only rotate Q.
         K = ops::rope(K, batch.positions, rope_dims, rp);
+        dump_kernel(il, "rope_k", K);
         Q = ops::rope(Q, batch.positions, rope_dims, rp);
+        dump_kernel(il, "rope_q", Q);
         kv.append(il, K, V, batch.kv_write_indices);
         k_pages = kv.k_pages(il);
         v_pages = kv.v_pages(il);
     } else {
         Q = ops::rope(Q, batch.positions, rope_dims, rp);
+        dump_kernel(il, "rope_q", Q);
         const std::int32_t src = spec_.gemma4_kv_source(il, n_layers);
         if (src < 0) {
             throw std::runtime_error(
@@ -195,16 +241,36 @@ Tensor Gemma4Graph::decoder_layer(std::int32_t il,
               batch.kv_last_page_lens, kv.page_size(), ap);
 
     attn = from_heads(attn, n_total, n_q_heads * head_dim);
+    dump_kernel(il, "sdpa", attn);
     Tensor attn_out = apply_linear(L.o_proj, attn);
+    dump_kernel(il, "o_proj", attn_out);
     attn_out = ops::rms_norm(attn_out, *L.post_attn_norm, eps, /*plus_one=*/false);
+    dump_kernel(il, "post_attn_norm", attn_out);
     hidden = ops::residual_add(attn_out, residual);
+    dump_kernel(il, "attn_resid", hidden);
 
     // ── FFN block (norm sandwich; GeGLU-tanh) — fused via mx::compile to
     // collapse the loose pointwise glue (sandwich norms + geglu + residual)
     // into one traced kernel sequence; the dominant batch=1 decode overhead.
     // On a 4-bit checkpoint the three GEMVs become fused dequant-in-GEMV via a
     // separate compiled identity (gemma4_ffn_q4). ──
-    if (L.gate_proj->quantized()) {
+    if (dumping()) {
+        Tensor pre = hidden;
+        Tensor normed = ops::rms_norm(hidden, *L.ffn_norm, eps, /*plus_one=*/false);
+        dump_kernel(il, "ffn_norm", normed);
+        Tensor gate = apply_linear(*L.gate_proj, normed);
+        dump_kernel(il, "gate_proj", gate);
+        Tensor up = apply_linear(*L.up_proj, normed);
+        dump_kernel(il, "up_proj", up);
+        Tensor g = ops::geglu(gate, up, /*tanh_approx=*/true);
+        dump_kernel(il, "geglu", g);
+        Tensor down = apply_linear(*L.down_proj, g);
+        dump_kernel(il, "down_proj", down);
+        Tensor post = ops::rms_norm(down, *L.post_ffn_norm, eps, /*plus_one=*/false);
+        dump_kernel(il, "post_ffn_norm", post);
+        hidden = ops::residual_add(post, pre);
+        dump_kernel(il, "ffn_resid", hidden);
+    } else if (L.gate_proj->quantized()) {
         hidden = ops::compiled(
             "gemma4.ffn.q4",
             {hidden, *L.ffn_norm,
@@ -225,7 +291,19 @@ Tensor Gemma4Graph::decoder_layer(std::int32_t il,
     // fused via mx::compile (ple_input_gate -> geglu -> projection -> norm ->
     // residual). The layer-output scalar stays separate (distinct guard). ──
     if (ple_signal && L.ple_input_gate && L.ple_projection && L.ple_norm) {
-        if (L.ple_input_gate->quantized()) {
+        if (dumping()) {
+            Tensor pre = hidden;
+            Tensor gate = apply_linear(*L.ple_input_gate, hidden);
+            dump_kernel(il, "ple_gate", gate);
+            Tensor gated = ops::geglu(gate, *ple_signal, /*tanh_approx=*/true);
+            dump_kernel(il, "ple_gated", gated);
+            Tensor ple = apply_linear(*L.ple_projection, gated);
+            dump_kernel(il, "ple_proj", ple);
+            ple = ops::rms_norm(ple, *L.ple_norm, eps, /*plus_one=*/false);
+            dump_kernel(il, "ple_norm", ple);
+            hidden = ops::residual_add(ple, pre);
+            dump_kernel(il, "ple_resid", hidden);
+        } else if (L.ple_input_gate->quantized()) {
             hidden = ops::compiled(
                 "gemma4.ple.q4",
                 {hidden,
@@ -245,6 +323,7 @@ Tensor Gemma4Graph::decoder_layer(std::int32_t il,
     if (L.layer_scalar) {
         hidden = ops::mul(hidden, *L.layer_scalar);  // broadcast [1] over [N,H]
     }
+    dump_kernel(il, "layer_out", hidden);
     return hidden;
 }
 
@@ -257,6 +336,7 @@ Tensor Gemma4Graph::forward(const ForwardBatch& batch, KvCacheView& kv) {
 
     Tensor hidden = apply_embedding(w_.embed, batch.token_ids);
     hidden = ops::scale(hidden, std::sqrt(static_cast<float>(H)));
+    dump_kernel(-1, "embed", hidden);
 
     // ── Per-Layer-Embedding (PLE) inputs, computed once up-front ──
     //   token = embed_per_layer[ids] * sqrt(ple_dim)            [N, L*ple_dim]
@@ -277,6 +357,7 @@ Tensor Gemma4Graph::forward(const ForwardBatch& batch, KvCacheView& kv) {
         proj = ops::rms_norm(proj, *w_.ple_model_norm, eps, /*plus_one=*/false);
         proj = mx::reshape(proj, {N, Lc * ple_dim});
         ple_inputs = ops::scale(ops::add(proj, token), 1.0f / std::sqrt(2.0f));
+        dump_kernel(-1, "ple_input", *ple_inputs);
     }
 
     for (std::int32_t il = 0; il < Lc; ++il) {
@@ -290,6 +371,7 @@ Tensor Gemma4Graph::forward(const ForwardBatch& batch, KvCacheView& kv) {
     }
 
     hidden = ops::rms_norm(hidden, w_.final_norm, eps, /*plus_one=*/false);
+    dump_kernel(-1, "final_norm", hidden);
     Tensor sampled = ops::gather_rows(hidden, batch.logit_rows);
 
     // lm_head: an explicit (possibly quantized) bundle wins — delta synthesizes
@@ -298,9 +380,11 @@ Tensor Gemma4Graph::forward(const ForwardBatch& batch, KvCacheView& kv) {
     Tensor logits = w_.lm_head
         ? apply_linear(*w_.lm_head, sampled)      // [n_slots, vocab]
         : apply_linear(w_.embed, sampled);        // tied embed (dense or quant)
+    dump_kernel(-1, "logits", logits);
 
     if (spec_.final_softcap > 0.0f) {
         logits = ops::softcap(logits, spec_.final_softcap);
+        dump_kernel(-1, "logits_softcap", logits);
     }
     return logits;
 }

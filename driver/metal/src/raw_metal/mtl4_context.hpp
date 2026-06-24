@@ -50,6 +50,16 @@ struct Pso { void* obj = nullptr; bool valid() const { return obj != nullptr; } 
 struct Grid { uint32_t x = 1, y = 1, z = 1; };
 struct Threadgroup { uint32_t x = 1, y = 1, z = 1; };
 
+// Barrier cache-visibility for the intra-encoder compute->compute hazard. Pure-C++
+// mirror of MTL4VisibilityOptions (no Obj-C in this header); mapped in mtl4_context.mm.
+//   * Device        — flush caches to the GPU (device) coherence point. Correct for a
+//                     real RAW where the consumer reads the producer's heap write.
+//   * ExecutionOnly — order execution only, NO cache flush (MTL4VisibilityOptionNone).
+//                     Cheaper; valid where ordering alone suffices / UMA L2-coherent.
+// A `PIE_BARRIER_VIS=none|device` env var overrides ALL barriers at runtime (delta's
+// global visibility sweep) regardless of the per-call argument; absent => per-call arg.
+enum class BarrierVisibility : uint8_t { ExecutionOnly = 0, Device = 1 };
+
 // Per-step timing split (manager wants BOTH reported separately).
 struct StepTiming {
     double encode_ms   = 0.0;  // begin_step -> end_step (CPU command-buffer build)
@@ -71,7 +81,13 @@ class StepEncoder {
     void set_argtable(Kernel k, int ordinal = -1);
     void set_argtable_ordinal(int ordinal);
     void dispatch(Grid grid, Threadgroup tg);
-    void barrier();  // device-visibility barrier between dependent dispatches
+    void barrier(BarrierVisibility vis = BarrierVisibility::Device);  // intra-encoder compute->compute hazard
+
+    // Write a GPU timestamp into `heap` at `idx` (beta's per-dispatch attribution). `heap`
+    // is an opaque MTL4CounterHeap from RawMetalContext::create_timestamp_heap. Relaxed
+    // granularity (lowest overhead, no encoder split — preserves the single-CB model);
+    // pass precise=true only for boundary-accurate sampling (may split the encoder).
+    void mark_timestamp(void* heap, uint32_t idx, bool precise = false);
 
     // convenience: one fused call per dispatch (ordinal-keyed)
     void encode(Pso pso, Kernel k, int ordinal, Grid grid, Threadgroup tg) {
@@ -126,6 +142,15 @@ class RawMetalContext {
                     std::string* error = nullptr);
     Pso compile_pso_from_file(const std::string& metal_path, const std::string& fn_name,
                               std::string* error = nullptr);
+
+    // ── GPU timestamp attribution (beta's per-dispatch / per-phase timing) ──
+    // Allocate an opaque MTL4CounterHeap of `count` timestamp entries (owned by the
+    // context; lives until destruction). During encode, StepEncoder::mark_timestamp
+    // writes a timestamp at an index; AFTER run_step (GPU complete — the event is
+    // already waited) resolve_timestamps copies the `count` resolved GPU timestamps
+    // (nanoseconds on this device) into `out`. Returns nullptr on failure.
+    void* create_timestamp_heap(uint32_t count);
+    void  resolve_timestamps(void* heap, uint32_t count, uint64_t* out);
 
     // ── Encode one decode step. `encode_fn` issues the DAG via StepEncoder ──
     // Uses the double-buffered allocator (ab = 0/1) so the harness can overlap

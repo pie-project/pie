@@ -16,6 +16,7 @@
 // every token, so the CB stays byte-identical — only the I1 IO buffer CONTENTS change).
 
 #include "heap_bind.hpp"
+#include "heap_bind_metal.hpp"
 
 #include <cstring>
 #include <stdexcept>
@@ -27,28 +28,6 @@
 #include "safetensors_view.hpp"
 
 namespace pie_metal_driver::raw_metal {
-
-// ── Staging result: every slot delta allocates, for the bind pass + beta handoff ──
-struct BoundDecode {
-    HeapPlan plan;
-
-    // load-once weights, keyed by HF tensor name (tied lm_head appears once).
-    std::unordered_map<std::string, SlotHandle> weights;
-
-    // GDN persistent state, per layer (only GDN layers populated).
-    struct GdnState { SlotHandle conv_state, conv_state_out, recurrent_state, conv_bias_zero; };
-    std::vector<GdnState> gdn;        // size n_layers; full-attn entries unused
-
-    // paged KV, per layer (only full-attn layers populated).
-    struct KvSlots { SlotHandle k_pages, v_pages; };
-    std::vector<KvSlots> kv;          // size n_layers; GDN entries unused
-
-    // IO region (I1 per-token buffers + I3 logits). Indexed by IoSlot.
-    SlotHandle io[5];
-
-    // activation ping-pong pool handed to beta (he assigns X/Out per dispatch).
-    SlotHandle scratch[SCRATCH_POOL];
-};
 
 namespace {
 
@@ -168,13 +147,16 @@ void bind_decode_dag(RawMetalContext& ctx, const BoundDecode& b,
                 const auto& kv = b.kv[L];
                 bind_slot(ctx, ord, (uint8_t)bind::Sdpa::K, kv.k_pages);
                 bind_slot(ctx, ord, (uint8_t)bind::Sdpa::V, kv.v_pages);
-                bind_slot(ctx, ord, (uint8_t)bind::Sdpa::SeqLenPtr, io(IoSlot::SeqLen));
+                bind_slot(ctx, ord, (uint8_t)bind::Sdpa::N, io(IoSlot::SeqLen));
                 break;
             }
 
             case Kernel::Rope:
             case Kernel::RopeK:
-                bind_slot(ctx, ord, (uint8_t)bind::Rope::PositionPtr, io(IoSlot::Position));
+                // rope.metal is in-place on buffer 0 (X); position is the IO scalar at
+                // buffer 1. scale/base/head_dim are consts (decode_consts). The activation
+                // (buffer 0 X) is bound by beta's scratch schedule (in-place).
+                bind_slot(ctx, ord, (uint8_t)bind::Rope::Position, io(IoSlot::Position));
                 break;
 
             case Kernel::QmvLmHead:

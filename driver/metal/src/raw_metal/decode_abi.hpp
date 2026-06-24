@@ -106,10 +106,13 @@ namespace bind {
 enum class Qmv : uint8_t { W = 0, Scales = 1, Biases = 2, X = 3, Out = 4, K = 5, N = 6 };
 
 // sdpa_vector (decode, single-pass): group=(1024,1,1), grid=(n_q_heads, 1, 1).
-// SeqLenPtr is the IO::SeqLen buffer (I1), gqa_factor = n_q/n_kv = 4.
+// Matches sdpa_vector.metal exactly. N (buffer 5) is the per-token kv_len, bound to
+// the IO::SeqLen buffer (I1, setAddress); gqa_factor = n_q/n_kv = 4; strides + scale
+// are geometry consts (decode_consts). k/v cache layout [n_kv_heads, max_ctx, head_dim]:
+//   *_head_stride = max_ctx*head_dim, *_seq_stride = head_dim. scale = 1/sqrt(head_dim).
 enum class Sdpa : uint8_t {
-    Q = 0, K = 1, V = 2, Out = 3, GqaFactor = 4, SeqLenPtr = 5,
-    KHeadStride = 6, VHeadStride = 7,
+    Q = 0, K = 1, V = 2, Out = 3, GqaFactor = 4, N = 5,
+    KHeadStride = 6, KSeqStride = 7, VHeadStride = 8, VSeqStride = 9, Scale = 10,
 };
 
 // rms_single_row: group=(row/N_READS), grid=(1,1,1). Buffer 3 is a packed
@@ -134,16 +137,23 @@ enum class QSplit : uint8_t { Qg = 0, QOut = 1, GateOut = 2, HeadDim = 3 };
 // attn_gate: attn *= sigmoid(gate) before o_proj (golden tag `attn_gated`). In-place.
 enum class AttnGate : uint8_t { Attn = 0, Gate = 1 };
 
-// single-token rope (partial + mrope): PositionPtr is IO::Position (I1).
-enum class Rope : uint8_t { Q = 0, K = 1, QOut = 2, KOut = 3, PositionPtr = 4, Theta = 5 };
+// single-token rope (NeoX, partial). In-place on buffer 0; matches rope.metal exactly:
+//   0=x (activation, in/out), 1=position (IO::Position, I1), 2=scale, 3=base=log2(theta),
+//   4=head_dim (row stride; rope_dims/2 comes from grid.x). scale/base/head_dim = consts.
+enum class Rope : uint8_t { X = 0, Position = 1, Scale = 2, Base = 3, HeadDim = 4 };
 
 // embedding gather (4-bit dequant of the shared lm_head bundle; tied). TokenId is
 // IO::TokenId (I1). Matches embed_gather.metal: W/Scales/Biases (same 4-bit packing
 // as Qmv) + token id + out + hidden. Bound to the SAME lm_head slots as QmvLmHead.
 enum class Embed : uint8_t { W = 0, Scales = 1, Biases = 2, TokenId = 3, Out = 4, Hidden = 5 };
 
-// KV append (in-place write at position): PositionPtr is IO::Position (I1).
-enum class KvAppend : uint8_t { K = 0, V = 1, KPages = 2, VPages = 3, PositionPtr = 4 };
+// KV append (in-place write at position): Pos is IO::Position (I1). Matches kv_append.metal:
+//   0=k_new, 1=v_new, 2=k_cache, 3=v_cache, 4=pos(IO), 5=head_dim, 6=k_head_stride
+//   (=max_ctx*head_dim), 7=k_seq_stride (=head_dim). head_dim/strides = consts.
+enum class KvAppend : uint8_t {
+    K = 0, V = 1, KPages = 2, VPages = 3, PositionPtr = 4,
+    HeadDim = 5, KHeadStride = 6, KSeqStride = 7,
+};
 
 // GDN fused core (1 dispatch — beta): folds conv1d+silu + l2norm*2 + q-scale + gating +
 // GQA-repeat + recurrent-step. Reads `mixed` (in-proj conv input) + per-layer conv/gating
