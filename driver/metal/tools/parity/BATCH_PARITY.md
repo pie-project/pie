@@ -13,15 +13,21 @@ paged-KV indexing, (c) ragged (mixed-length) prompts that don't perturb each oth
 taps through the **same per-kernel `cosine_bisect` comparison** against that prompt's
 sealed **M=1 golden**, AND checks the seq-`i` logits argmax matches the golden argmax.
 
-## Tap-emission contract (M>1 executor — pick ONE layout)
+## Tap-emission contract (M>1 executor → LOCKED with beta)
 
-The gate supports both; tell charlie which the executor emits.
+Each tap is ONE file `<layer>.<kernel>.npy` shaped **`[N, ...]`** (N = total tokens in
+the batch, Pie's token-major activation buffer — zero-copy row emission), plus
+**`qo_indptr.npy`** `[R+1]` emitted alongside. Sequence `i` owns activation rows
+**`[qo_indptr[i], qo_indptr[i+1])`**:
+- **Pure decode** (N==R, 1 tok/seq): seq `i` = row `i`.
+- **Ragged prefill** (the mbatch set, lengths 8/16/30/54): seq `i` owns its qo-span; the
+  gate compares the seq's **decision row** (last of the span — the token that feeds the next
+  decode) to its single-position M=1 golden, or the **full span** with `--full-span` + a
+  full-span golden (catches mid-prompt contamination). No padding — qo_indptr-sliced,
+  matching delta's paged-KV `qo_indptr` walk 1:1.
 
-- **`rowslice`** (recommended for decode): each tap is ONE file `<layer>.<kernel>.npy`
-  shaped `[M, ...]` (the natural decode-step buffer — M seqs x 1 token). seq `i` = row `i`
-  of dim 0. Singleton dim-0 taps (shared consts tapped once) are broadcast.
-- **`subdir`**: `<dump>/seq<i>/<layer>.<kernel>.npy` — one standard single-seq dump dir
-  per sequence (each is a vanilla `cosine_bisect` dir).
+Alternative `subdir` layout (`<dump>/seq<i>/<layer>.<kernel>.npy`, one vanilla dump dir per
+seq) is also supported via `--layout subdir`.
 
 Tap names + per-kernel execution order are IDENTICAL to the M=1 golden (see
 `cosine_bisect.py` `QWEN36_INTRA_ORDER` / `GEMMA4_INTRA_ORDER`). Same `--skip q_norm,k_norm`
@@ -52,6 +58,6 @@ The length spread forces ragged batching: per-seq positions, `qo_indptr` spans, 
 python batch_parity.py --batched <M>1-dump> \
   --golden 0=~/parity-golden/mbatch/m1/qwen3.6/seq0 \
            1=~/parity-golden/mbatch/m1/qwen3.6/seq1 ... \
-  --layout rowslice --threshold 0.999 [--skip q_norm,k_norm]
+  --layout rowslice --threshold 0.999 [--qo-indptr <dump>/qo_indptr.npy] [--full-span] [--skip q_norm,k_norm]
 ```
 Exit 0 = every seq matches its M=1 golden (cosine >= 0.999 + argmax exact); 1 = a seq diverged.

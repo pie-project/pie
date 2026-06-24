@@ -48,18 +48,40 @@ def load_candidate_subdir(batched, i):
     return {k: np.load(v) for k, v in cb.load_dir(d).items()}
 
 
-def load_candidate_rowslice(batched, i, m):
-    """Slice row i (dim 0) out of every [M, ...] batched tap."""
+def load_qo_indptr(batched, explicit):
+    """qo_indptr [R+1]: seq i owns activation rows [qo_indptr[i], qo_indptr[i+1])."""
+    path = explicit or os.path.join(batched, "qo_indptr.npy")
+    if not os.path.exists(path):
+        return None
+    return np.load(path).astype(np.int64).ravel()
+
+
+def load_candidate_rowslice(batched, i, qo, golden, full_span):
+    """Slice seq i's qo-span out of every [N, ...] batched tap (beta's contract).
+
+    seq i owns rows [qo[i], qo[i+1]). The sealed M=1 goldens are single-position
+    (the decode/decision row), so by default we compare the seq's LAST span row
+    (the token that feeds the next decode) against the golden. With full_span and
+    a multi-row golden of matching span length, compare the whole span (catches
+    mid-prompt contamination in ragged prefill).
+    """
+    lo, hi = int(qo[i]), int(qo[i + 1])
+    span_len = hi - lo
     out = {}
     for k, v in cb.load_dir(batched).items():
+        if k == (None, "qo_indptr"):
+            continue
         a = np.load(v)
-        if a.shape and a.shape[0] == m:
-            out[k] = a[i]
-        elif a.shape and a.shape[0] == 1:
-            out[k] = a[0]            # broadcast singletons (shared consts tapped once)
-        else:
-            out[k] = a               # unbatched tap (e.g. a global) — compare as-is
+        if not a.shape or a.shape[0] < hi:        # unbatched/global tap (shared const) — as-is
+            out[k] = a
+            continue
+        span = a[lo:hi]                            # [span_len, ...]
+        g = golden.get(k)
+        want_full = (full_span and g is not None
+                     and g.shape and g.shape[0] == span_len and g.ndim >= 2)
+        out[k] = span if want_full else span[-1]   # decision row by default
     return out
+
 
 
 def gate_one_seq(golden, cand, threshold, skip):
@@ -109,6 +131,11 @@ def main():
     ap.add_argument("--golden", nargs="+", required=True,
                     help="per-seq goldens: i=<dir> (i = batch slot index)")
     ap.add_argument("--layout", choices=["rowslice", "subdir"], default="rowslice")
+    ap.add_argument("--qo-indptr", default="",
+                    help="qo_indptr .npy [R+1] (rowslice layout); default <batched>/qo_indptr.npy")
+    ap.add_argument("--full-span", action="store_true",
+                    help="compare each seq's full qo-span vs a full-span golden "
+                         "(default: last/decision row only, matching single-position goldens)")
     ap.add_argument("--threshold", type=float, default=0.999,
                     help="cosine gate (default 0.999, the operational decision gate)")
     ap.add_argument("--skip", default="",
@@ -126,7 +153,21 @@ def main():
         gmap[int(idx)] = path
     m = len(gmap)
 
+    qo = None
+    if args.layout == "rowslice":
+        qo = load_qo_indptr(args.batched, args.qo_indptr)
+        if qo is None:
+            print(f"error: rowslice layout needs qo_indptr (looked for "
+                  f"{args.qo_indptr or os.path.join(args.batched, 'qo_indptr.npy')})",
+                  file=sys.stderr)
+            return 2
+        if len(qo) != m + 1:
+            print(f"error: qo_indptr has {len(qo)} entries, expected R+1={m+1}",
+                  file=sys.stderr)
+            return 2
+
     print(f"M={m} batch-parity gate  layout={args.layout}  threshold={args.threshold}"
+          + (f"  qo_indptr={list(map(int, qo))}" if qo is not None else "")
           + (f"  skipping {sorted(skip)}" if skip else ""))
     print("=" * 72)
 
@@ -136,7 +177,7 @@ def main():
         if args.layout == "subdir":
             cand = load_candidate_subdir(args.batched, i)
         else:
-            cand = load_candidate_rowslice(args.batched, i, m)
+            cand = load_candidate_rowslice(args.batched, i, qo, golden, args.full_span)
         if not cand:
             print(f"seq{i}: ✗ NO CANDIDATE TAPS (layout={args.layout})")
             all_pass = False
