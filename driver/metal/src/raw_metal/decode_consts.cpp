@@ -4,6 +4,8 @@
 
 #include <cmath>
 #include <cstring>
+#include <cstdio>
+#include <cstdlib>
 #include <stdexcept>
 
 #include "decode_step.hpp"     // beta: Dispatch{kind,ordinal,layer,grid,tg}
@@ -36,6 +38,9 @@ inline void bind_const(RawMetalContext& ctx, int ord, uint8_t idx, const V& val,
     if (!s.valid()) throw std::runtime_error("decode_consts: heap_alloc failed (budget too small)");
     std::memcpy(s.contents(), &val, sizeof(V));
     ctx.arg_bind_ordinal(ord, idx, s);
+    if (std::getenv("PIE_CONST_DEBUG") && ord <= 1)
+        std::fprintf(stderr, "[const] ord=%d idx=%u size=%zu addr=%p\n",
+                     ord, (unsigned)idx, sizeof(V), s.contents());
     if (count) ++*count;
 }
 

@@ -151,26 +151,14 @@ int main(int argc, char** argv) {
                         d.grid.x, d.grid.y, d.grid.z, d.tg.x, d.tg.y, d.tg.z);
         return 0;
     }
-    const size_t consts_budget = decode_consts_budget(dag);
-    // Headroom over plan.total: const slots + per-alloc 256-align padding across ~700 weight/
-    // KV/state/IO allocs (plan.total aligns the SUM once; staging aligns each tensor).
-    const size_t heap_bytes = plan.total + consts_budget + (32u << 20);
+    const bool no_recycle     = std::getenv("PIE_NO_RECYCLE")     != nullptr;
+    const bool force_barriers = std::getenv("PIE_FORCE_BARRIERS") != nullptr;
 
-    std::printf("[decode_run] dag dispatches=%zu  weights=%.1f MB  heap=%.1f MB (plan %.1f + consts %.2f + pad)\n",
-                dag.size(), weights_bytes / 1048576.0, heap_bytes / 1048576.0,
-                plan.total / 1048576.0, consts_budget / 1048576.0);
-
-    auto ctx = RawMetalContext::create(heap_bytes);
-    if (!ctx) { std::fprintf(stderr, "[decode_run] context create failed\n"); return 1; }
-
-    // ── Stage weights/state/KV/IO; bind weight/state/KV/IO slots by ordinal ──
-    BoundDecode b = stage_decode_weights(*ctx, view, g, plan);
-    bind_decode_dag(*ctx, b, dag, g);
-
-    // ── beta's scratch schedule (WAR/WAW coloring) over the same ordinals ──
-    ScratchSchedule sched = build_scratch_schedule(dag, g);
-    std::printf("[decode_run] scratch: colors_used=%d hazard_free=%d\n",
-                sched.colors_used, sched.hazard_free ? 1 : 0);
+    // beta's scratch schedule (WAR/WAW coloring) over the same ordinals. no_recycle gives
+    // every value its own buffer (colors_used == #values) for the dump/aliasing diagnostic.
+    ScratchSchedule sched = build_scratch_schedule(dag, g, no_recycle);
+    std::printf("[decode_run] scratch: colors_used=%d hazard_free=%d no_recycle=%d force_barriers=%d\n",
+                sched.colors_used, sched.hazard_free ? 1 : 0, no_recycle ? 1 : 0, force_barriers ? 1 : 0);
 
     if (std::getenv("PIE_SCHED_DUMP")) {
         const int lim = std::getenv("PIE_SCHED_LIM") ? std::atoi(std::getenv("PIE_SCHED_LIM"))
@@ -184,7 +172,36 @@ int main(int argc, char** argv) {
         }
         return 0;
     }
-    bind_scratch(*ctx, dag, sched, b.scratch, SCRATCH_POOL);
+
+    const size_t consts_budget = decode_consts_budget(dag);
+    // Headroom over plan.total: the scratch pool (colors_used slots, up to 362 under
+    // no_recycle), const slots + per-alloc 256-align padding across ~700 weight/KV/state/IO
+    // allocs (plan.total aligns the SUM once; staging aligns each tensor).
+    const size_t heap_bytes = plan.total + consts_budget
+                            + size_t(sched.colors_used) * plan.scratch_slot_bytes + (32u << 20);
+
+    std::printf("[decode_run] dag dispatches=%zu  weights=%.1f MB  heap=%.1f MB (plan %.1f + consts %.2f + pad)\n",
+                dag.size(), weights_bytes / 1048576.0, heap_bytes / 1048576.0,
+                plan.total / 1048576.0, consts_budget / 1048576.0);
+
+    auto ctx = RawMetalContext::create(heap_bytes);
+    if (!ctx) { std::fprintf(stderr, "[decode_run] context create failed\n"); return 1; }
+
+    // ── Stage weights/state/KV/IO; bind weight/state/KV/IO slots by ordinal ──
+    BoundDecode b = stage_decode_weights(*ctx, view, g, plan);
+    bind_decode_dag(*ctx, b, dag, g);
+
+    // ── Allocate the scratch pool (colors_used slots) and hand to beta's bind pass.
+    //    Under no_recycle this is one buffer per value (~362); else SCRATCH_POOL=6. ──
+    std::vector<SlotHandle> pool(sched.colors_used);
+    for (int i = 0; i < sched.colors_used; ++i)
+        pool[i] = ctx->heap_alloc(plan.scratch_slot_bytes);
+    if (const char* zs = std::getenv("PIE_ZERO_SCRATCH")) {
+        const int fill = (zs[0] == 'F') ? 0x3c : 0x00;  // 'F' => 0x3c3c bf16 ~0.0114 sentinel
+        for (int i = 0; i < sched.colors_used; ++i)
+            std::memset(pool[i].contents(), fill, plan.scratch_slot_bytes);
+    }
+    bind_scratch(*ctx, dag, sched, pool.data(), int(pool.size()));
 
     // ── delta's geometry const params (the previously-unbound `constant&` args) ──
     const int n_consts = bind_decode_consts(*ctx, dag, g, max_ctx);
@@ -215,7 +232,7 @@ int main(int argc, char** argv) {
         });
         const int bid = out_buffer_id(sched, 0, uint8_t(bind::Embed::Out));
         if (bid >= 0) {
-            const uint16_t* eb = static_cast<const uint16_t*>(b.scratch[bid].contents());
+            const uint16_t* eb = static_cast<const uint16_t*>(pool[bid].contents());
             std::vector<float> e(g.hidden);
             for (int i = 0; i < g.hidden; ++i) e[i] = bf16_to_f32(eb[i]);
             write_npy_f32("/tmp/embed_ours.npy", e.data(), e.size());
@@ -237,19 +254,31 @@ int main(int argc, char** argv) {
         write_u32(b.io[int(IoSlot::TokenId)], ids[0]);
         write_u32(b.io[int(IoSlot::Position)], 0u);
         write_u32(b.io[int(IoSlot::SeqLen)],  1u);
-        ctx->run_step([&](StepEncoder& se) {
+        const bool perstep = std::getenv("PIE_TAP_PERSTEP") != nullptr;
+        if (perstep) {
             for (int i = 0; i <= O && i < int(dag.size()); ++i) {
-                se.set_pso(psos[dag[i].kind]);
-                se.set_argtable_ordinal(dag[i].ordinal);
-                se.dispatch(dag[i].grid, dag[i].tg);
-                se.barrier();
+                ctx->run_step([&](StepEncoder& se) {
+                    se.set_pso(psos[dag[i].kind]);
+                    se.set_argtable_ordinal(dag[i].ordinal);
+                    se.dispatch(dag[i].grid, dag[i].tg);
+                });
             }
-        });
+        } else {
+            ctx->run_step([&](StepEncoder& se) {
+                for (int i = 0; i <= O && i < int(dag.size()); ++i) {
+                    se.set_pso(psos[dag[i].kind]);
+                    se.set_argtable_ordinal(dag[i].ordinal);
+                    se.dispatch(dag[i].grid, dag[i].tg);
+                    se.barrier();
+                }
+            });
+        }
         const int obi = output_bind_index(dag[O].kind);
-        const int bid = (obi >= 0) ? out_buffer_id(sched, O, uint8_t(obi)) : -1;
+        int bid = (obi >= 0) ? out_buffer_id(sched, O, uint8_t(obi)) : -1;
+        if (const char* tb = std::getenv("PIE_TAP_BUF")) bid = std::atoi(tb);  // read raw pool[N]
         const size_t n = plan.scratch_slot_bytes / 2;  // bf16 elems in a scratch slot
         if (bid >= 0) {
-            const uint16_t* ob = static_cast<const uint16_t*>(b.scratch[bid].contents());
+            const uint16_t* ob = static_cast<const uint16_t*>(pool[bid].contents());
             std::vector<float> v(n);
             for (size_t i = 0; i < n; ++i) v[i] = bf16_to_f32(ob[i]);
             write_npy_f32(out_path, v.data(), n);
@@ -264,13 +293,24 @@ int main(int argc, char** argv) {
 
     // ── Decode loop: feed each prompt id as an M=1 step, accumulating KV + GDN conv/
     //    recurrent state in-place (I4). Mirrors the golden's PIE_PARITY_DECODE capture. ──
+    const bool perstep = std::getenv("PIE_PERSTEP") != nullptr;
     StepTiming last{};
     for (size_t i = 0; i < ids.size(); ++i) {
         write_u32(b.io[int(IoSlot::TokenId)], ids[i]);
         write_u32(b.io[int(IoSlot::Position)], uint32_t(i));
         write_u32(b.io[int(IoSlot::SeqLen)],  uint32_t(i + 1));
-        last = ctx->run_step(
-            [&](StepEncoder& se) { encode_decode_step(se, dag, psos); }, int(i & 1));
+        if (perstep) {
+            for (const auto& d : dag) {
+                ctx->run_step([&](StepEncoder& se) {
+                    se.set_pso(psos[d.kind]);
+                    se.set_argtable_ordinal(d.ordinal);
+                    se.dispatch(d.grid, d.tg);
+                });
+            }
+        } else {
+            last = ctx->run_step(
+                [&](StepEncoder& se) { encode_decode_step(se, dag, psos, force_barriers); }, int(i & 1));
+        }
         std::printf("[decode_run] step %zu (id=%u pos=%zu): encode_ms=%.4f gpu_exec_ms=%.4f\n",
                     i, ids[i], i, last.encode_ms, last.gpu_exec_ms);
     }

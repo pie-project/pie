@@ -104,9 +104,13 @@ void StepEncoder::dispatch(Grid grid, Threadgroup tg) {
 }
 void StepEncoder::barrier() {
     auto* s = static_cast<StepState*>(impl_);
-    [s->en barrierAfterQueueStages:MTLStageDispatch
-                      beforeStages:MTLStageDispatch
-                 visibilityOptions:MTL4VisibilityOptionDevice];
+    // Intra-encoder (intra-pass) dispatch→dispatch RAW/WAR hazard ordering. MUST be the
+    // *EncoderStages* variant — barrierAfterQueueStages is a cross-command-buffer/queue
+    // barrier and does NOT order dispatches within the same compute encoder (verified:
+    // queue-stage barrier let layer-0 RMSNorm read stale embed → non-deterministic garbage).
+    [s->en barrierAfterEncoderStages:MTLStageDispatch
+                   beforeEncoderStages:MTLStageDispatch
+                     visibilityOptions:MTL4VisibilityOptionDevice];
 }
 
 // ── RawMetalContext ───────────────────────────────────────────────────────────
