@@ -107,6 +107,28 @@ if(NLOHMANN_JSON_INCLUDE)
     "-framework Metal"
     "-framework Foundation")
 
+  # decoder_smoke — correctness gate for RawMetalDecoder (the e2e seam body that alpha's
+  # RawMetalExecutor wraps): setup() once + step() the golden prompt → assert argmax==264.
+  add_executable(decoder_smoke
+    decoder_smoke.cpp
+    decoder.cpp
+    heap_bind.cpp
+    heap_bind_names.cpp
+    decode_consts.cpp
+    decode_step.cpp
+    decode_timing.cpp
+    decode_psos.cpp
+    scratch_schedule.cpp
+    safetensors_view.cpp
+    mtl4_context.mm)
+  set_source_files_properties(mtl4_context.mm PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
+  target_include_directories(decoder_smoke PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${NLOHMANN_JSON_INCLUDE})
+  target_compile_definitions(decoder_smoke PRIVATE
+    RAW_METAL_KERNELS_DIR="${CMAKE_CURRENT_SOURCE_DIR}/kernels")
+  target_link_libraries(decoder_smoke PRIVATE
+    "-framework Metal"
+    "-framework Foundation")
+
   # gemma4_decode_run — the gemma4 integration driver (alpha): stage weights + bind
   # (gemma4_heap_bind) + const params (gemma4_consts) + no_recycle activation dataflow +
   # PSO loader + encode_gemma4_step -> RawMetalContext::run_step. Reports encode/gpu-exec
