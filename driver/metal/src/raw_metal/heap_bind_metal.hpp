@@ -37,6 +37,12 @@ struct BoundDecode {
     // IO region (I1 per-token buffers + I3 logits). Indexed by IoSlot.
     SlotHandle io[5];
 
+    // device-argmax substrate (I3; allocated always, bound + read only when with_argmax):
+    // argmax_params = ArgmaxParams const (vocab + inline EOS ids; Shared, runtime-writable),
+    // eos_flag = u32[max_tokens] OUT (1 if NextToken[r] ∈ eos_ids). Inert at M=1/no-argmax.
+    SlotHandle argmax_params;
+    SlotHandle eos_flag;
+
     // activation ping-pong pool handed to beta (he assigns X/Out per dispatch).
     SlotHandle scratch[SCRATCH_POOL];
 };

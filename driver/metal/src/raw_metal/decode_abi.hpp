@@ -320,10 +320,22 @@ enum class GdnCoreRecurrent : uint8_t {
 // {eps, vd}. Gates against golden `gdn_core` (gated-RMSNorm folded in).
 enum class GatedRms : uint8_t { X = 0, Z = 1, W = 2, Out = 3, Params = 4 };
 
-// device argmax (optional substrate, I3): Logits → NextToken.
-enum class Argmax : uint8_t { Logits = 0, NextToken = 1 };
+// device argmax (optional substrate, I3): Logits → NextToken (+ EOS-compare).
+// Bit-exact to host RawMetalDecoder::argmax(); grid.y = request row (M=1 → row 0).
+// Locked 2-buffer bind (Logits=0/NextToken=1) unchanged; Params/EosFlag ADD-ONLY,
+// inert until the resident-loop / M>1 wiring binds them.
+enum class Argmax : uint8_t { Logits = 0, NextToken = 1, Params = 2, EosFlag = 3 };
 
 }  // namespace bind
+
+// Argmax kernel constant (argmax.metal:struct ArgmaxParams) — replicated EXACTLY.
+// EOS ids ride inline (≤8); n_eos=0 ⇒ EosFlag always 0. The slot is Shared storage, so
+// the resident loop / executor can rewrite vocab+eos per generation without a rebind.
+struct ArgmaxParams {
+    uint32_t vocab;        // logits row width
+    uint32_t n_eos;        // count of valid stop-token ids in eos_ids[]
+    uint32_t eos_ids[8];   // stop-token ids; NextToken compared against these → EosFlag
+};
 
 // ── Dispatch DAG kernel kinds (per-step encode order) ──
 // Surface locked vs charlie's authoritative golden tag set (wiki mac-golden-kernel-surface).

@@ -99,6 +99,15 @@ BoundDecode stage_decode_weights(RawMetalContext& ctx, const SafetensorsView& vi
     b.io[static_cast<int>(IoSlot::SeqLen)]    = alloc_zeroed(ctx, tok);
     b.io[static_cast<int>(IoSlot::Logits)]    = alloc_zeroed(ctx, size_t(g.vocab) * 4);
     b.io[static_cast<int>(IoSlot::NextToken)] = alloc_zeroed(ctx, tok);
+
+    // device-argmax substrate (inert unless with_argmax): ArgmaxParams const + EosFlag out.
+    b.argmax_params = alloc_zeroed(ctx, sizeof(ArgmaxParams));
+    b.eos_flag      = alloc_zeroed(ctx, tok);
+    {
+        auto* p = static_cast<ArgmaxParams*>(b.argmax_params.contents());
+        p->vocab = static_cast<uint32_t>(g.vocab);
+        p->n_eos = 0;  // executor/resident loop rewrites vocab+eos per generation
+    }
     return b;
 }
 
@@ -189,6 +198,8 @@ void bind_decode_dag(RawMetalContext& ctx, const BoundDecode& b,
             case Kernel::Argmax:
                 bind_slot(ctx, ord, (uint8_t)bind::Argmax::Logits, io(IoSlot::Logits));
                 bind_slot(ctx, ord, (uint8_t)bind::Argmax::NextToken, io(IoSlot::NextToken));
+                bind_slot(ctx, ord, (uint8_t)bind::Argmax::Params, b.argmax_params);
+                bind_slot(ctx, ord, (uint8_t)bind::Argmax::EosFlag, b.eos_flag);
                 break;
 
             default:

@@ -46,6 +46,12 @@ void write_u32(const SlotHandle& s, uint32_t v) {
     std::memcpy(s.contents(), &v, sizeof(v));
 }
 
+uint32_t read_u32(const SlotHandle& s) {
+    uint32_t v = 0;
+    std::memcpy(&v, s.contents(), sizeof(v));
+    return v;
+}
+
 // bf16 (upper 16 bits of f32) -> float.
 inline float bf16_to_f32(uint16_t h) {
     uint32_t bits = uint32_t(h) << 16;
@@ -220,7 +226,14 @@ int main(int argc, char** argv) {
     // bit-exact argmax 264). Set PIE_GDN_PREP=0 to A/B back to the in-kernel-share path.
     const char* gdn_prep_env = std::getenv("PIE_GDN_PREP");
     const bool gdn_prep = gdn_prep_env ? (std::atoi(gdn_prep_env) != 0) : true;
-    const std::vector<Dispatch> dag = build_decode_dag(g, /*with_argmax=*/false, fuse_residual, gdn_prep);
+    // PIE_RESIDENT: GPU-resident greedy loop — the device argmax (Kernel::Argmax, last DAG
+    // node) runs IN THE SAME command buffer as the forward, writing NextToken; EmbedGather's
+    // token input is rebound to NextToken so step i+1 reads step i's argmax with ZERO host
+    // readback. No host argmax = no per-token GPU drain → holds the hot clock (vs the host-
+    // sample path that idles the GPU every token → downclock). Generates autoregressively.
+    const bool resident = std::getenv("PIE_RESIDENT") != nullptr;
+    const std::vector<Dispatch> dag =
+        build_decode_dag(g, /*with_argmax=*/resident, fuse_residual, gdn_prep);
     if (fuse_residual)
         std::printf("[decode_run] PIE_FUSE_RESIDUAL: residual folded into QmvO/QmvOut/QmvDown epilogue\n");
     std::printf("[decode_run] GdnCore prep-dispatch: %s%s\n",
@@ -295,7 +308,7 @@ int main(int argc, char** argv) {
     // ── Compile the kernel PSOs ──
     DecodeStepPsos psos;
     std::string err;
-    if (!load_decode_psos(*ctx, kernels_dir, psos, /*with_argmax=*/false, &err, fuse_residual, gdn_prep)) {
+    if (!load_decode_psos(*ctx, kernels_dir, psos, /*with_argmax=*/resident, &err, fuse_residual, gdn_prep)) {
         std::fprintf(stderr, "[decode_run] PSO load failed: %s\n", err.c_str());
         return 1;
     }
@@ -303,6 +316,16 @@ int main(int argc, char** argv) {
 
     // ── Residency (I2): one set, after all binds ──
     ctx->make_resident();
+
+    // ── Resident-loop device token-feed: rebind EmbedGather's token input from TokenId to
+    //    NextToken, so step i+1's embed reads step i's GPU argmax with zero host readback. ──
+    if (resident) {
+        for (const auto& d : dag)
+            if (d.kind == Kernel::EmbedGather)
+                ctx->arg_bind_ordinal(d.ordinal, (uint8_t)bind::Embed::TokenId,
+                                      b.io[int(IoSlot::NextToken)]);
+        std::printf("[decode_run] RESIDENT mode: device argmax→NextToken→embed feed (zero host readback)\n");
+    }
 
     // ── Optional embed tap (state-independent first-divergence check): encode ONLY the
     //    EmbedGather dispatch for the last prompt token and dump its output. ──
@@ -418,8 +441,11 @@ int main(int argc, char** argv) {
                     ka_async, ka_tg, ka_depth);
         ctx->start_keepalive((uint32_t)ka_async, ka_tg, ka_depth);
     }
+    if (resident) write_u32(b.io[int(IoSlot::NextToken)], ids[0]);  // seed the first token
+    const bool check_argmax = std::getenv("PIE_RESIDENT_CHECK") != nullptr;
+    int resident_argmax_mismatch = 0;
     for (size_t i = 0; i < ids.size(); ++i) {
-        write_u32(b.io[int(IoSlot::TokenId)], ids[i]);
+        if (!resident) write_u32(b.io[int(IoSlot::TokenId)], ids[i]);  // device-fed in resident
         write_u32(b.io[int(IoSlot::Position)], uint32_t(i));
         write_u32(b.io[int(IoSlot::SeqLen)],  uint32_t(i + 1));
         for (const auto& gd : gdn_disp) {                // even step: read A→write B; odd: B→A
@@ -454,6 +480,24 @@ int main(int argc, char** argv) {
         }
         std::printf("[decode_run] step %zu (id=%u pos=%zu): encode_ms=%.4f gpu_exec_ms=%.4f\n",
                     i, ids[i], i, last.encode_ms, last.gpu_exec_ms);
+        if (resident) {
+            // Generated token = GPU argmax output (now in NextToken, device-fed to next embed).
+            const uint32_t gpu_tok = read_u32(b.io[int(IoSlot::NextToken)]);
+            // Bit-exactness check (PIE_RESIDENT_CHECK): host argmax over the same bf16 logits
+            // must match the GPU's. SKIPPED by default — the host vocab scan is ~335us of
+            // GPU-idle that would itself downclock and contaminate the resident timing.
+            if (check_argmax) {
+                const uint16_t* lb = static_cast<const uint16_t*>(b.io[int(IoSlot::Logits)].contents());
+                uint32_t host_tok = 0; float bv = bf16_to_f32(lb[0]);
+                for (int v = 1; v < g.vocab; ++v) { float x = bf16_to_f32(lb[v]); if (x > bv) { bv = x; host_tok = uint32_t(v); } }
+                if (gpu_tok != host_tok) {
+                    ++resident_argmax_mismatch;
+                    std::printf("[decode_run]   RESIDENT MISMATCH step %zu: gpu=%u host=%u\n", i, gpu_tok, host_tok);
+                } else {
+                    std::printf("[decode_run]   resident gen tok=%u (host-argmax match)\n", gpu_tok);
+                }
+            }
+        }
         if (step_sleep_us > 0)
             std::this_thread::sleep_for(std::chrono::microseconds(step_sleep_us));
         if (keepalive_us > 0 && dag[0].kind == Kernel::EmbedGather) {
@@ -471,6 +515,9 @@ int main(int argc, char** argv) {
     std::printf("[decode_run] HEADLINE last-step: encode_ms=%.4f gpu_exec_ms=%.4f total_ms=%.4f\n",
                 last.encode_ms, last.gpu_exec_ms, last.total_ms());
     if (ka_async > 0) ctx->stop_keepalive();
+    if (resident)
+        std::printf("[decode_run] RESIDENT: %zu steps generated, argmax mismatches=%d (0=GPU argmax bit-exact)\n",
+                    ids.size(), resident_argmax_mismatch);
 
     // ── Optional COARSE per-phase attribution (PIE_ATTRIB=1): re-time cumulative DAG
     //    prefixes [0..N) at phase boundaries (embed, each layer end, final_norm, lm_head),
