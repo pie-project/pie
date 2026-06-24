@@ -33,6 +33,7 @@ from ._async import await_future
 if TYPE_CHECKING:
     from .adapter import Adapter
     from .context import Context
+    from .media import Audio, Image
     from .sample import Sampler
 
 
@@ -117,6 +118,8 @@ class Forward:
         "_attn_mask",
         "_adapter",
         "_zo_seed",
+        "_images",
+        "_audios",
     )
 
     def __init__(self, ctx: Context) -> None:
@@ -129,6 +132,8 @@ class Forward:
         self._attn_mask: list[list[int]] | None = None
         self._adapter: Adapter | None = None
         self._zo_seed: int | None = None
+        self._images: list[tuple[Image, int]] = []
+        self._audios: list[tuple[Audio, int]] = []
 
     # ── Position accessors ────────────────────────────────────────────
 
@@ -158,6 +163,20 @@ class Forward:
         if len(tokens) != len(positions):
             raise ValueError("tokens and positions must be the same length")
         self._explicit_inputs.append((list(tokens), list(positions)))
+        return self
+
+    def input_image(self, image: Image, anchor: int) -> Forward:
+        """Splice an encoded image span at absolute sequence position
+        ``anchor``. Caller manages page reservation / commit when using raw
+        :class:`Forward`."""
+        self._images.append((image, anchor))
+        return self
+
+    def input_audio(self, audio: Audio, anchor: int) -> Forward:
+        """Splice an encoded audio span at absolute sequence position
+        ``anchor``. Caller manages page reservation / commit when using raw
+        :class:`Forward`."""
+        self._audios.append((audio, anchor))
         return self
 
     # ── Slot attach ───────────────────────────────────────────────────
@@ -225,7 +244,7 @@ class Forward:
         n_auto = len(self._auto_inputs)
         n_total = n_auto + sum(len(t) for t, _ in self._explicit_inputs)
 
-        if n_total == 0 and not self._slots:
+        if n_total == 0 and not self._slots and not self._images and not self._audios:
             raise ValueError(
                 "Forward.execute() called with no inputs and no slots. "
                 "Attach at least one input (`forward.input(...)`) or "
@@ -247,6 +266,10 @@ class Forward:
         # Build forward pass.
         fwd = _inf.ForwardPass(ctx._model._handle)
         fwd.context(ctx._handle)
+        for image, anchor in self._images:
+            fwd.input_image(image._handle, anchor)
+        for audio, anchor in self._audios:
+            fwd.input_audio(audio._handle, anchor)
         if self._adapter is not None:
             fwd.adapter(self._adapter._handle)
         if self._zo_seed is not None:

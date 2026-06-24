@@ -25,6 +25,7 @@ import type {
 import { awaitFuture } from './_async.js';
 import type { Adapter } from './adapter.js';
 import type { Context } from './context.js';
+import type { Audio, Image } from './media.js';
 import {
   type Probe,
   type ProbeKind,
@@ -91,6 +92,8 @@ export class Forward {
   #attnMask: Brle[] | undefined;
   #adapter: Adapter | undefined;
   #zoSeed: number | undefined;
+  #images: Array<[Image, number]> = [];
+  #audios: Array<[Audio, number]> = [];
 
   constructor(ctx: Context) {
     this.#ctx = ctx;
@@ -125,6 +128,20 @@ export class Forward {
       throw new Error('tokens and positions must be the same length');
     }
     this.#explicitInputs.push([tokens, positions]);
+    return this;
+  }
+
+  /** Splice an encoded image span at absolute sequence position `anchor`.
+   *  Caller manages page reservation / commit when using raw `Forward`. */
+  inputImage(image: Image, anchor: number): this {
+    this.#images.push([image, anchor]);
+    return this;
+  }
+
+  /** Splice an encoded audio span at absolute sequence position `anchor`.
+   *  Caller manages page reservation / commit when using raw `Forward`. */
+  inputAudio(audio: Audio, anchor: number): this {
+    this.#audios.push([audio, anchor]);
     return this;
   }
 
@@ -203,7 +220,12 @@ export class Forward {
     const nExplicit = this.#explicitInputs.reduce((a, [t]) => a + t.length, 0);
     const nTotal = nAuto + nExplicit;
 
-    if (nTotal === 0 && this.#slots.length === 0) {
+    if (
+      nTotal === 0 &&
+      this.#slots.length === 0 &&
+      this.#images.length === 0 &&
+      this.#audios.length === 0
+    ) {
       throw new Error(
         'Forward.execute() called with no inputs and no slots. ' +
           'Attach at least one input (`forward.input(...)`) or slot ' +
@@ -226,6 +248,12 @@ export class Forward {
     // Build forward pass.
     const fwd = new _ForwardPass(ctx._handle.model());
     fwd.context(ctx._handle);
+    for (const [image, anchor] of this.#images) {
+      fwd.inputImage(image._handle, anchor);
+    }
+    for (const [audio, anchor] of this.#audios) {
+      fwd.inputAudio(audio._handle, anchor);
+    }
     if (this.#adapter !== undefined) {
       fwd.adapter(this.#adapter._handle);
     }

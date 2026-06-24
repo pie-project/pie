@@ -24,6 +24,12 @@
       "pie:core/inference": [
         "./src/bindings/interfaces/pie-core-inference.js"
       ],
+      "pie:core/media": [
+        "./src/bindings/interfaces/pie-core-media.js"
+      ],
+      "pie:core/audio-out": [
+        "./src/bindings/interfaces/pie-core-audio-out.js"
+      ],
       "pie:core/runtime": [
         "./src/bindings/interfaces/pie-core-runtime.js"
       ],

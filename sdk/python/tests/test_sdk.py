@@ -8,6 +8,40 @@ import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 
+def run_wasi(coro):
+    """Run SDK coroutines that wait through the mocked WASI waker list."""
+    import asyncio
+
+    async def main():
+        task = asyncio.create_task(coro)
+        wake = asyncio.create_task(pump_wakers(task))
+        try:
+            return await task
+        finally:
+            wake.cancel()
+            try:
+                await wake
+            except asyncio.CancelledError:
+                pass
+
+    async def pump_wakers(task):
+        while not task.done():
+            await asyncio.sleep(0)
+            loop = asyncio.get_running_loop()
+            for _, waker in list(loop.wakers):
+                if not waker.done():
+                    waker.set_result(None)
+
+    loop = asyncio.new_event_loop()
+    loop.wakers = []
+    try:
+        asyncio.set_event_loop(loop)
+        return loop.run_until_complete(main())
+    finally:
+        asyncio.set_event_loop(None)
+        loop.close()
+
+
 # =============================================================================
 # Model
 # =============================================================================
@@ -190,6 +224,63 @@ class TestContext:
         # On exit a non-zero bid is restored (saved bid >= 0).
         assert len(ctx._handle.bids) == 2
         assert ctx._handle.bids[-1] >= 0.0
+
+    def test_append_image_commits_media_and_leaves_suffix_buffered(self):
+        from inferlet import Context, Image, Model
+
+        model = Model.load("test-model")
+        ctx = Context(model)
+        image = Image.from_bytes(model, b"abcd")
+        run_wasi(ctx.append_image(image))
+
+        # Prefix token was flushed before the image; image soft tokens advance seq_len.
+        assert ctx.seq_len == 1 + image.token_count()
+        assert ctx.buffer() == image.suffix_tokens()
+
+    def test_append_audio_commits_media_and_leaves_suffix_buffered(self):
+        from inferlet import Audio, Context, Model
+
+        model = Model.load("test-model")
+        ctx = Context(model)
+        clip = Audio.from_bytes(model, b"abcdef")
+        run_wasi(ctx.append_audio(clip))
+
+        assert ctx.seq_len == 1 + clip.token_count()
+        assert ctx.buffer() == clip.suffix_tokens()
+
+    def test_append_video_adds_timestamped_frames(self):
+        from inferlet import Context, Model, Video
+
+        model = Model.load("test-model")
+        ctx = Context(model)
+        video = Video.from_bytes(model, b"gif", max_frames=2)
+        run_wasi(ctx.append_video(video))
+
+        # Each frame has no delimiters in the fake binding. The timestamp
+        # marker is flushed before the frame and therefore contributes to seq_len.
+        assert video.frame_count() == 2
+        assert ctx.seq_len > 2 * video.frame(0).token_count()
+
+
+class TestMultimodalAudioOutput:
+    def test_model_speak_generates_self_describing_speech(self):
+        import asyncio
+        from inferlet import Model
+
+        speech = asyncio.run(
+            Model.load("test-model")
+            .speak("hello")
+            .speaker(1)
+            .max_duration_seconds(1.0)
+            .generate()
+        )
+
+        assert speech.sample_rate() == 24_000
+        assert speech.channels() == 1
+        assert speech.duration_ms() == 80
+        wav = speech.to_wav()
+        assert wav[:4] == b"RIFF"
+        assert wav[8:12] == b"WAVE"
 
 
 # =============================================================================

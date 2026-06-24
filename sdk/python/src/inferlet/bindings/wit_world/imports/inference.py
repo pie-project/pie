@@ -10,6 +10,7 @@ import weakref
 from componentize_py_types import Result, Ok, Err, Some
 from ..imports import adapter
 from ..imports import context
+from ..imports import media
 from ..imports import model
 from ..imports import poll
 
@@ -151,11 +152,20 @@ class ForwardPass:
         raise NotImplementedError
     def input_tokens(self, tokens: List[int], positions: List[int]) -> None:
         raise NotImplementedError
+    def input_image(self, image: media.Image, anchor: int) -> None:
+        raise NotImplementedError
+    def input_audio(self, audio: media.Audio, anchor: int) -> None:
+        raise NotImplementedError
     def input_speculative_tokens(self, tokens: List[int], positions: List[int]) -> None:
         raise NotImplementedError
     def output_speculative_tokens(self, flag: bool) -> None:
         """
         enabled by default
+        """
+        raise NotImplementedError
+    def pass_speculation(self, flag: bool) -> None:
+        """
+        Controls runtime pass-level speculation for this execute only.
         """
         raise NotImplementedError
     def attention_mask(self, mask: List[List[int]]) -> None:
@@ -282,6 +292,4 @@ class Matcher:
         Release this resource.
         """
         raise NotImplementedError
-
-
 

@@ -5,6 +5,8 @@ import {
   Tokenizer as _Tokenizer,
 } from 'pie:core/model';
 
+import { SpeechBuilder } from './audio.js';
+
 /**
  * A loaded model instance.
  *
@@ -31,6 +33,11 @@ export class Model {
   /** Whether greedy generation should use the system drafter by default. */
   defaultSystemSpeculation(): boolean {
     return this._handle.defaultSystemSpeculation();
+  }
+
+  /** Begin a model-agnostic speech synthesis request. */
+  speak(text: string): SpeechBuilder {
+    return new SpeechBuilder(this, text);
   }
 }
 

@@ -42,6 +42,9 @@
 export { Model, Tokenizer } from './model.js';
 export { Adapter } from './adapter.js';
 export { Context } from './context.js';
+export { Image, Audio, Video } from './media.js';
+export { Speech, SpeechBuilder, writeWav } from './audio.js';
+export type { Voice } from './audio.js';
 
 // ── Forward primitive ────────────────────────────────────────────────
 export { Forward, Output } from './forward.js';

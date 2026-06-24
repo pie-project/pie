@@ -98,7 +98,19 @@ ctx = Context(model)
 
 ### Media (multimodal)
 
-Multimodal media input (image/audio/video) and audio output (text-to-speech) are available through the generated `media` bindings, mirroring the Rust SDK. See [Multimodal generation](../guide/model/multimodal) for the API and examples.
+Multimodal media input (image/audio/video) and audio output (text-to-speech). See [Multimodal generation](../guide/model/multimodal) for the full guide and examples.
+
+| Method | Description |
+|---|---|
+| `Image.from_bytes(model, bytes) -> Image` | Decode image bytes. `image.token_count()` / `image.grid()` expose the soft-token layout. |
+| `Audio.from_bytes(model, bytes) -> Audio` | Decode an audio clip. |
+| `Video.from_bytes(model, bytes, max_frames) -> Video` | Demux and uniformly sample up to `max_frames` frames. |
+| `await ctx.append_image(image)` | Run the vision encoder and commit soft-token KV pages. |
+| `await ctx.append_images(images)` | Splice adjacent images in one forward when delimiters allow it. |
+| `await ctx.append_audio(clip)` | Run the audio encoder and commit. |
+| `await ctx.append_audios(clips)` | Splice adjacent audio clips in one forward when possible. |
+| `await ctx.append_video(video)` | Commit the sampled frames. |
+| `await model.speak(text).speaker(id).max_duration_seconds(s).generate()` | Text-to-speech. `speech.to_wav()`, `sample_rate()`, `channels()`. |
 
 ### Inspection
 
