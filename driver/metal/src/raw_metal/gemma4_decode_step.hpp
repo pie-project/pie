@@ -46,7 +46,9 @@ inline std::vector<Gemma4Dispatch> build_gemma4_dag(const Gemma4Geometry& g) {
         const bool sliding = Gemma4Geometry::is_sliding(L);
         const bool shared  = g.is_kv_shared(L);
 
-        // attention (norm sandwich; qk-norm; sliding/full; kv-share)
+        // attention (norm sandwich; qk-norm; sliding/full; kv-share). Order matches the
+        // gemma4 reference (gemma4.cpp): q_proj,q_norm, k_proj,v_proj,k_norm,v_norm,
+        // rope_k,rope_q, kv_append, sdpa. Shared layers rotate Q only + reuse source KV.
         emit(Kernel::AttnNorm, L, sliding);
         emit(Kernel::QmvQ,     L, sliding);
         emit(Kernel::QNorm,    L, sliding);
@@ -54,11 +56,11 @@ inline std::vector<Gemma4Dispatch> build_gemma4_dag(const Gemma4Geometry& g) {
             emit(Kernel::QmvK,  L, sliding);
             emit(Kernel::QmvV,  L, sliding);
             emit(Kernel::KNorm, L, sliding);
-            emit(Kernel::VNorm, L, sliding);   // weightless V-norm before KV write
+            emit(Kernel::VNorm, L, sliding);   // weightless V-norm before the KV write
+            emit(Kernel::RopeK, L, sliding);   // rope_k precedes rope_q (reference order)
         }
         emit(Kernel::RopeQ, L, sliding);
         if (!shared) {
-            emit(Kernel::RopeK,    L, sliding);
             emit(Kernel::KvAppend, L, sliding);
         }
         emit(Kernel::Sdpa,         L, sliding);  // shared layers read source-layer pages

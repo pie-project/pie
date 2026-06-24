@@ -126,8 +126,9 @@ struct Gemma4Geometry {
     int intermediate_at(int layer) const {
         return (double_wide_mlp && layer >= first_kv_shared()) ? 2 * intermediate : intermediate;
     }
-    // SDPA softmax scale = 1/sqrt(head_dim_at) (Q/K-norm does NOT absorb it for gemma4).
-    float attn_scale_at(int layer) const { return 1.0f / std::sqrt(float(head_dim_at(layer))); }
+    // SDPA softmax scale. Gemma4 sets scale=1.0 (Q/K-norm absorbs 1/sqrt(d)) — verified
+    // vs the reference forward (gemma4.cpp: `ap.scale = 1.0f`). NOT 1/sqrt(head_dim).
+    float attn_scale_at(int /*layer*/) const { return 1.0f; }
 };
 
 // ── gemma4-specific per-kernel binding indices ───────────────────────────────
