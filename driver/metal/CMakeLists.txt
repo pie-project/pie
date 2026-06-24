@@ -203,6 +203,23 @@ target_link_libraries(pie_driver_metal PRIVATE pie_driver_metal_lib)
 # `pie_driver_metal_lib` directly.
 
 # -----------------------------------------------------------------------------
+# RawMetalExecutor marshaling gate (alpha-owned, off by default). Drives the
+# golden qwen3.6 prompt through RawMetalExecutor::run_forward via the real
+# PieForwardRequestView/ResponseBuilder types and asserts argmax==264 — the
+# runtime-ABI-marshaling half of the e2e correctness gate (delta's
+# decoder_smoke gates the decoder body). Reuses pie_driver_metal_lib (which
+# carries RawMetalExecutor + the raw_metal TUs + schema includes). Requires a
+# GPU. Enable with -DPIE_METAL_BUILD_RAWSMOKE=ON.
+# -----------------------------------------------------------------------------
+option(PIE_METAL_BUILD_RAWSMOKE
+  "Build the RawMetalExecutor marshaling smoke (argmax-264 gate)" OFF)
+if(PIE_METAL_BUILD_RAWSMOKE)
+  add_executable(raw_metal_executor_smoke
+    src/raw_metal/raw_metal_executor_smoke.cpp)
+  target_link_libraries(raw_metal_executor_smoke PRIVATE pie_driver_metal_lib)
+endif()
+
+# -----------------------------------------------------------------------------
 # Loader smoke test (delta-owned, off by default). Builds an end-to-end loader→
 # graph→KV→forward check; requires MLX. Enable with -DPIE_METAL_BUILD_TESTS=ON.
 # -----------------------------------------------------------------------------
