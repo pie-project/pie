@@ -22,6 +22,14 @@ int main() {
     printf("[gemma4] DAG dispatches=%d  shared_layers=%d  full_attn=%d sliding=%d  gemv=%d\n",
            st.total, st.n_shared_layers, st.n_full_attn, st.n_sliding_attn, st.n_gemv);
 
+    // Concurrency pre-flight (pure, no GPU): barriers emitted per policy vs barrier-each.
+    const int b_each   = gemma4_plan_barrier_count(dag, g, 0);
+    const int b_gateup = gemma4_plan_barrier_count(dag, g, 1);
+    const int b_greedy = gemma4_plan_barrier_count(dag, g, 2);
+    printf("[gemma4] barriers: each=%d  +gate||up=%d  greedy=%d  (greedy drops %d, %.1f%%)\n",
+           b_each, b_gateup, b_greedy, b_each - b_greedy,
+           b_each ? 100.0 * (b_each - b_greedy) / b_each : 0.0);
+
     auto ctx = RawMetalContext::create(1u << 20);
     if (!ctx) { printf("FAIL: no Metal context\n"); return 1; }
 

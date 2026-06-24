@@ -69,4 +69,10 @@ void encode_gemma4_step(StepEncoder& se,
                         BarrierVisibility vis = BarrierVisibility::ExecutionOnly,
                         int concur = 0);
 
+// Barriers emitted by the `concur` policy vs the barrier-each baseline (== dag.size()). Pure
+// (no GPU) — a cheap pre-flight signal of how many barriers the greedy predicate drops.
+//   concur: 0 = barrier-each, 1 = +Gate‖Up, 2 = greedy RAW predicate, -1 = drop-all (ceiling).
+int gemma4_plan_barrier_count(const std::vector<Gemma4Dispatch>& dag,
+                              const Gemma4Geometry& g, int concur);
+
 }  // namespace pie_metal_driver::raw_metal::gemma4

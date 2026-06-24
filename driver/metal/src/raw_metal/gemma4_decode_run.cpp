@@ -435,11 +435,16 @@ int run_main(int argc, char** argv) {
             }
             return best;
         };
-        const double b0 = timed(0), b1 = timed(1), bc = timed(-1);
+        const double b0 = timed(0), b1 = timed(1), b2 = timed(2), bc = timed(-1);
         std::printf("\n==== gemma4 CONCURRENCY A/B (min-floor over %d reps) ====\n", reps);
+        std::printf("  barriers: each=%d  +gate||up=%d  greedy=%d\n",
+                    gemma4_plan_barrier_count(dag, g, 0), gemma4_plan_barrier_count(dag, g, 1),
+                    gemma4_plan_barrier_count(dag, g, 2));
         std::printf("  concur=0  barrier-after-each   = %.4f ms\n", b0);
         std::printf("  concur=1  Gate‖Up overlap      = %.4f ms  (Δ %.4f, %.1f%%)\n",
                     b1, b0 - b1, 100.0 * (b0 - b1) / b0);
+        std::printf("  concur=2  greedy RAW predicate = %.4f ms  (Δ %.4f, %.1f%%)\n",
+                    b2, b0 - b2, 100.0 * (b0 - b2) / b0);
         std::printf("  concur=-1 ALL-drop ceiling     = %.4f ms  (Δ %.4f, %.1f%% — max upside)\n",
                     bc, b0 - bc, 100.0 * (b0 - bc) / b0);
         return 0;

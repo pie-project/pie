@@ -13,6 +13,8 @@
 
 #include "gemma4_encode.hpp"
 
+#include <set>
+
 #include "decode_dispatch.hpp"  // shared raw_metal:: launch helpers (qmv/rms/rope/sdpa/...)
 
 namespace pie_metal_driver::raw_metal::gemma4 {
@@ -165,27 +167,135 @@ void gemma4_launch_dims(Kernel kind, int layer, const Gemma4Geometry& g,
     }
 }
 
-// Concurrency policy: should a barrier follow dispatch `dag[i]`? gemma4 scratch is NO-RECYCLE
-// (one buffer per ordinal) so there are no WAR/WAW hazards — only RAW. A barrier between
-// dispatch i and i+1 is therefore unnecessary when i+1 does not read i's output (per beta:
-// no `concurrent_after`/coloring needed, unlike qwen's recycling allocator — pure predicate).
-//   • Gate‖Up — drop the barrier ONLY when dag[i]=QmvGate is immediately followed by
-//     dag[i+1]=QmvUp of the SAME layer (the build_gemma4_dag L73-75 invariant: QmvGate, QmvUp,
-//     GegluTanh). QmvUp reads FfnNorm (not gate); GegluTanh reads both and still barriers after
-//     QmvUp. The explicit next-kind + same-layer guard (beta's pattern) makes it robust to any
-//     future DAG reordering — it never drops a barrier across a layer/PLE boundary.
-// concur: 0 = barrier after every dispatch (correct default); 1 = +Gate‖Up;
-//        -1 = drop ALL barriers (TIMING-ONLY perf ceiling — produces WRONG argmax, never shipped).
-// (Q‖K‖V needs a DAG reorder — QNorm sits between QmvQ and QmvK with a RAW dep on QmvQ — so it
-//  is NOT in this predicate yet; defer until the reorder lands.)
-static bool gemma4_barrier_after(const std::vector<Gemma4Dispatch>& dag, size_t i, int concur) {
-    if (concur < 0) return false;                  // ceiling: no barriers at all
-    if (i + 1 >= dag.size()) return true;
-    const Gemma4Dispatch& a = dag[i];
-    const Gemma4Dispatch& b = dag[i + 1];
-    if (concur >= 1 && a.kind == Kernel::QmvGate && b.kind == Kernel::QmvUp && a.layer == b.layer)
-        return false;
-    return true;
+// ── Concurrency: the general dependency-driven RAW-barrier predicate (alpha deps + beta algo) ──
+// gemma4 scratch is NO-RECYCLE (one fresh buffer per ordinal, never reused) ⇒ no WAR/WAW
+// hazards, ONLY RAW. A `se.barrier()` is global (drains all in-flight). So the minimal correct
+// schedule is greedy: emit a barrier before dispatch i IFF i reads any buffer written since the
+// last barrier (an un-drained RAW). This auto-captures Gate‖Up + the Q/K/V attention cluster +
+// every independent norm/rope/elementwise pair — no hand-picked pairs, can't forget one, and
+// (unlike qwen's recycler) zero `concurrent_after`/coloring.
+//
+// `gemma4_build_io` is alpha's half: the per-dispatch activation read/write buffer-id sets,
+// mirroring wire_dataflow's register tracking. Buffer-ids:
+//   • activation pool slot   → the producing dispatch's ordinal (no_recycle ⇒ one writer/slot,
+//                               EXCEPT in-place RoPE which re-writes qn/kn → the id is reused,
+//                               which the set-based predicate handles correctly).
+//   • KV[layer]              → kKvBase+layer.  KvAppend(L) WRITES it; Sdpa(L) READS kv_source(L).
+//                               This is a LIVE intra-step RAW (Sdpa attends the just-appended
+//                               current token) — modeling it keeps the critical KvAppend→Sdpa
+//                               barrier. (Shared L15-34 read an earlier, already-drained append
+//                               ⇒ correct-by-construction, costs no barrier.)
+//   • logits / logits_capped → kLogits/kCapped, so FinalSoftcap can't race the LmHead matmul.
+// Only true read-only operands (weights, scales, consts, pages, pos) are excluded.
+struct DispatchIO { std::vector<int> reads, writes; };
+
+std::vector<DispatchIO> gemma4_build_io(const std::vector<Gemma4Dispatch>& dag,
+                                        const Gemma4Geometry& g) {
+    constexpr int kKvBase = 1 << 20, kLogits = (2 << 20), kCapped = (2 << 20) + 1;
+    std::vector<DispatchIO> io(dag.size());
+    // buffer-id currently held by each logical register (-1 = a read-only source ⇒ no RAW)
+    int hidden = -1, embed = -1, ple_token = -1, ple_proj = -1, ple_projn = -1, ple_input = -1;
+    int normed = -1, q = -1, qn = -1, k = -1, v = -1, kn = -1, vn = -1, sdpa_o = -1, o = -1;
+    int fn = -1, gate = -1, up = -1, geglu = -1, down = -1;
+    int plegate = -1, plegated = -1, pleproj = -1, finalnorm = -1, post_tmp = -1, logits = -1;
+    std::vector<int> kv_producer(g.n_layers, -1);
+    for (size_t i = 0; i < dag.size(); ++i) {
+        const Gemma4Dispatch& d = dag[i];
+        const int id = d.ordinal;          // == i; the pool slot this dispatch allocates
+        const int L  = d.layer;
+        std::vector<int>& R = io[i].reads;
+        std::vector<int>& W = io[i].writes;
+        auto rd = [&](int p) { if (p >= 0) R.push_back(p); };
+        switch (d.kind) {
+            case Kernel::EmbedGather:    embed = hidden = id; W = {id}; break;
+            case Kernel::PleTokenGather: ple_token = id; W = {id}; break;
+            case Kernel::PleProjGemv:    rd(embed); ple_proj = id; W = {id}; break;
+            case Kernel::PleProjNorm:    rd(ple_proj); ple_projn = id; W = {id}; break;
+            case Kernel::PleCombine:     rd(ple_projn); rd(ple_token); ple_input = id; W = {id}; break;
+            case Kernel::AttnNorm:       rd(hidden); normed = id; W = {id}; break;
+            case Kernel::QmvQ:           rd(normed); q = id; W = {id}; break;
+            case Kernel::QNorm:          rd(q); qn = id; W = {id}; break;
+            case Kernel::QmvK:           rd(normed); k = id; W = {id}; break;
+            case Kernel::QmvV:           rd(normed); v = id; W = {id}; break;
+            case Kernel::KNorm:          rd(k); kn = id; W = {id}; break;
+            case Kernel::VNorm:          rd(v); vn = id; W = {id}; break;
+            case Kernel::RopeK:          rd(kn); W = {kn}; break;   // in-place: re-writes kn
+            case Kernel::RopeQ:          rd(qn); W = {qn}; break;   // in-place: re-writes qn
+            case Kernel::KvAppend:       rd(kn); rd(vn); kv_producer[L] = kKvBase + L;
+                                         W = {kKvBase + L}; break;
+            case Kernel::Sdpa:           rd(qn); rd(kv_producer[g.kv_source(L)]);
+                                         sdpa_o = id; W = {id}; break;
+            case Kernel::QmvO:           rd(sdpa_o); o = id; W = {id}; break;
+            case Kernel::PostAttnNorm:   rd(o); post_tmp = id; W = {id}; break;
+            case Kernel::AttnResidual:   rd(post_tmp); rd(hidden); hidden = id; W = {id}; break;
+            case Kernel::FfnNorm:        rd(hidden); fn = id; W = {id}; break;
+            case Kernel::QmvGate:        rd(fn); gate = id; W = {id}; break;
+            case Kernel::QmvUp:          rd(fn); up = id; W = {id}; break;
+            case Kernel::GegluTanh:      rd(gate); rd(up); geglu = id; W = {id}; break;
+            case Kernel::QmvDown:        rd(geglu); down = id; W = {id}; break;
+            case Kernel::PostFfnNorm:    rd(down); post_tmp = id; W = {id}; break;
+            case Kernel::FfnResidual:    rd(post_tmp); rd(hidden); hidden = id; W = {id}; break;
+            case Kernel::PleGateGemv:    rd(hidden); plegate = id; W = {id}; break;
+            case Kernel::PleGeglu:       rd(plegate); rd(ple_input); plegated = id; W = {id}; break;
+            case Kernel::PleProjLayerGemv: rd(plegated); pleproj = id; W = {id}; break;
+            case Kernel::PleNorm:        rd(pleproj); post_tmp = id; W = {id}; break;
+            case Kernel::PleResidual:    rd(post_tmp); rd(hidden); hidden = id; W = {id}; break;
+            case Kernel::LayerScalar:    rd(hidden); hidden = id; W = {id}; break;
+            case Kernel::FinalRms:       rd(hidden); finalnorm = id; W = {id}; break;
+            case Kernel::LmHead:         rd(finalnorm); logits = kLogits; W = {kLogits}; break;
+            case Kernel::FinalSoftcap:   rd(logits); W = {kCapped}; break;
+            case Kernel::Argmax:         break;
+        }
+    }
+    return io;
+}
+
+// beta's greedy algorithm (local mirror of gemma4_barrier_plan.hpp `plan_barriers`, pending the
+// beta-rawmetal merge — swap to the shared header then). Returns barrier_BEFORE[i].
+std::vector<char> plan_barriers_greedy(const std::vector<DispatchIO>& io) {
+    const size_t N = io.size();
+    std::vector<char> before(N, 0);
+    std::set<int> inflight;                       // buffer-ids written since the last barrier
+    for (size_t i = 0; i < N; ++i) {
+        bool hazard = false;
+        for (int r : io[i].reads)
+            if (inflight.count(r)) { hazard = true; break; }
+        if (hazard) { before[i] = 1; inflight.clear(); }
+        for (int w : io[i].writes) inflight.insert(w);
+    }
+    return before;
+}
+
+// Resolve the per-dispatch barrier_AFTER plan for the encode loop.
+// concur:  0 = barrier after every dispatch (proven baseline);
+//          1 = +Gate‖Up only (the hand-picked safe pair, kept for A/B);
+//          2 = general greedy RAW predicate (auto-captures all independent clusters);
+//         -1 = drop ALL barriers (TIMING-ONLY ceiling — WRONG argmax, never shipped).
+std::vector<char> gemma4_barrier_plan(const std::vector<Gemma4Dispatch>& dag,
+                                      const Gemma4Geometry& g, int concur) {
+    const size_t N = dag.size();
+    if (concur < 0) return std::vector<char>(N, 0);             // ceiling
+    if (concur == 0) return std::vector<char>(N, 1);            // barrier-each
+    if (concur == 1) {                                          // Gate‖Up
+        std::vector<char> after(N, 1);
+        for (size_t i = 0; i + 1 < N; ++i)
+            if (dag[i].kind == Kernel::QmvGate && dag[i + 1].kind == Kernel::QmvUp &&
+                dag[i].layer == dag[i + 1].layer)
+                after[i] = 0;
+        return after;
+    }
+    // concur >= 2: greedy. Map barrier_before → barrier_after (after[i] == before[i+1]); the
+    // trailing write needs no barrier (cmd-buffer completion drains it before the host read).
+    std::vector<char> before = plan_barriers_greedy(gemma4_build_io(dag, g));
+    std::vector<char> after(N, 0);
+    for (size_t i = 0; i + 1 < N; ++i) after[i] = before[i + 1];
+    return after;
+}
+
+int gemma4_count_barriers(const std::vector<char>& plan) {
+    int n = 0;
+    for (char c : plan) n += (c != 0);
+    return n;
 }
 
 void encode_gemma4_step(StepEncoder& se,
@@ -196,6 +306,7 @@ void encode_gemma4_step(StepEncoder& se,
                         BarrierVisibility vis,
                         int concur) {
     (void)force_barriers;
+    const std::vector<char> barrier_after = gemma4_barrier_plan(dag, geom, concur);
     Grid grid; Threadgroup tg;
     for (size_t i = 0; i < dag.size(); ++i) {
         const Gemma4Dispatch& d = dag[i];
@@ -205,8 +316,14 @@ void encode_gemma4_step(StepEncoder& se,
         se.set_argtable_ordinal(d.ordinal);   // flat-ordinal key (ratified)
         gemma4_launch_dims(d.kind, d.layer, geom, grid, tg);
         se.dispatch(grid, tg);
-        if (gemma4_barrier_after(dag, i, concur)) se.barrier(vis);
+        if (barrier_after[i]) se.barrier(vis);
     }
+}
+
+// Public banner helper: barriers emitted by `concur` vs the barrier-each baseline (dag.size()).
+int gemma4_plan_barrier_count(const std::vector<Gemma4Dispatch>& dag,
+                              const Gemma4Geometry& g, int concur) {
+    return gemma4_count_barriers(gemma4_barrier_plan(dag, g, concur));
 }
 
 }  // namespace pie_metal_driver::raw_metal::gemma4
