@@ -50,6 +50,16 @@ struct Pso { void* obj = nullptr; bool valid() const { return obj != nullptr; } 
 struct Grid { uint32_t x = 1, y = 1, z = 1; };
 struct Threadgroup { uint32_t x = 1, y = 1, z = 1; };
 
+// Barrier cache-visibility for the intra-encoder compute->compute hazard. Pure-C++
+// mirror of MTL4VisibilityOptions (no Obj-C in this header); mapped in mtl4_context.mm.
+//   * Device        — flush caches to the GPU (device) coherence point. Correct for a
+//                     real RAW where the consumer reads the producer's heap write.
+//   * ExecutionOnly — order execution only, NO cache flush (MTL4VisibilityOptionNone).
+//                     Cheaper; valid where ordering alone suffices / UMA L2-coherent.
+// A `PIE_BARRIER_VIS=none|device` env var overrides ALL barriers at runtime (delta's
+// global visibility sweep) regardless of the per-call argument; absent => per-call arg.
+enum class BarrierVisibility : uint8_t { ExecutionOnly = 0, Device = 1 };
+
 // Per-step timing split (manager wants BOTH reported separately).
 struct StepTiming {
     double encode_ms   = 0.0;  // begin_step -> end_step (CPU command-buffer build)
@@ -71,7 +81,7 @@ class StepEncoder {
     void set_argtable(Kernel k, int ordinal = -1);
     void set_argtable_ordinal(int ordinal);
     void dispatch(Grid grid, Threadgroup tg);
-    void barrier();  // device-visibility barrier between dependent dispatches
+    void barrier(BarrierVisibility vis = BarrierVisibility::Device);  // intra-encoder compute->compute hazard
 
     // convenience: one fused call per dispatch (ordinal-keyed)
     void encode(Pso pso, Kernel k, int ordinal, Grid grid, Threadgroup tg) {

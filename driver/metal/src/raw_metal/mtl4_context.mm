@@ -17,6 +17,9 @@
 
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <strings.h>
 
 namespace pie_metal_driver::raw_metal {
 
@@ -102,15 +105,35 @@ void StepEncoder::dispatch(Grid grid, Threadgroup tg) {
     [s->en dispatchThreads:MTLSizeMake(grid.x, grid.y, grid.z)
         threadsPerThreadgroup:MTLSizeMake(tg.x, tg.y, tg.z)];
 }
-void StepEncoder::barrier() {
+// Map the pure-C++ BarrierVisibility to MTL4VisibilityOptions, honoring a one-shot
+// `PIE_BARRIER_VIS=none|device` global override (delta's visibility sweep): when set it
+// forces ALL barriers regardless of the per-call argument; when absent the per-call arg
+// wins (beta's per-edge hazard model: Device for true heap-RAW, None for ordering-only).
+static MTL4VisibilityOptions resolve_barrier_vis(BarrierVisibility req) {
+    static const int override_mode = [] {
+        const char* e = getenv("PIE_BARRIER_VIS");
+        if (!e) return -1;
+        if (strcasecmp(e, "none") == 0 || strcmp(e, "0") == 0) return 0;
+        if (strcasecmp(e, "device") == 0 || strcmp(e, "1") == 0) return 1;
+        return -1;
+    }();
+    const int mode = override_mode >= 0
+                         ? override_mode
+                         : (req == BarrierVisibility::Device ? 1 : 0);
+    return mode == 1 ? MTL4VisibilityOptionDevice : MTL4VisibilityOptionNone;
+}
+void StepEncoder::barrier(BarrierVisibility vis) {
     auto* s = static_cast<StepState*>(impl_);
     // Intra-encoder (intra-pass) dispatch→dispatch RAW/WAR hazard ordering. MUST be the
     // *EncoderStages* variant — barrierAfterQueueStages is a cross-command-buffer/queue
     // barrier and does NOT order dispatches within the same compute encoder (verified:
     // queue-stage barrier let layer-0 RMSNorm read stale embed → non-deterministic garbage).
+    // visibilityOptions selects the cache behavior: Device flushes to the GPU coherence
+    // point (correct for a real heap RAW); ExecutionOnly (None) orders without a flush
+    // (cheaper; valid for ordering-only edges / UMA L2-coherent reads). See resolve_*.
     [s->en barrierAfterEncoderStages:MTLStageDispatch
                    beforeEncoderStages:MTLStageDispatch
-                     visibilityOptions:MTL4VisibilityOptionDevice];
+                     visibilityOptions:resolve_barrier_vis(vis)];
 }
 
 // ── RawMetalContext ───────────────────────────────────────────────────────────
