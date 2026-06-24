@@ -103,7 +103,7 @@ file(GLOB PIE_METAL_RAW_SOURCES CONFIGURE_DEPENDS
   ${CMAKE_CURRENT_SOURCE_DIR}/src/raw_metal/*.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/src/raw_metal/*.mm)
 list(FILTER PIE_METAL_RAW_SOURCES EXCLUDE REGEX
-  "/(.*_run|.*_probe|harness.*|bench_.*)\\.cpp$")
+  "/(.*_run|.*_probe|.*_smoke|harness.*|bench_.*)\\.cpp$")
 
 add_library(pie_driver_metal_lib STATIC
   ${PIE_METAL_EXPLICIT_SOURCES}
