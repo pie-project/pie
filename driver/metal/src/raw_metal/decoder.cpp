@@ -30,6 +30,12 @@ void zero_slot(const SlotHandle& s) {
     if (s.contents() && s.size) std::memset(s.contents(), 0, s.size);
 }
 
+// Zero one [off, off+len) byte window of a slot (a single slot's GDN-state slab region).
+void zero_slot_region(const SlotHandle& s, size_t off, size_t len) {
+    if (s.contents() && off + len <= s.size)
+        std::memset(static_cast<char*>(s.contents()) + off, 0, len);
+}
+
 }  // namespace
 
 bool RawMetalDecoder::setup(const std::string& ckpt_dir, const std::string& kernels_dir,
@@ -107,6 +113,23 @@ void RawMetalDecoder::reset_state() {
         zero_slot(ks.v_pages);
     }
     step_count_ = 0;
+}
+
+// Zero only `slot`'s GDN conv/recurrent region within each layer's slab (the per-slot stride
+// laid out by build_bound_decode: conv = gdn_conv_dim*gdn_conv_k, recurrent =
+// gdn_v_heads*gdn_v_dim*gdn_k_dim, f32). KV is paged per-request → reset via the runtime's
+// page table (kv_last_page_lens=0 for a NEW request), not by zeroing the shared pool here.
+// At max_slots=1, slot=0, off=0 → equivalent to the GDN half of reset_state().
+void RawMetalDecoder::reset_state(uint32_t slot) {
+    const size_t conv_stride  = size_t(g_.gdn_conv_dim) * g_.gdn_conv_k * 4;
+    const size_t recur_stride = size_t(g_.gdn_v_heads) * g_.gdn_v_dim * g_.gdn_k_dim * 4;
+    const size_t conv_off  = size_t(slot) * conv_stride;
+    const size_t recur_off = size_t(slot) * recur_stride;
+    for (auto& gs : b_.gdn) {
+        zero_slot_region(gs.conv_state, conv_off, conv_stride);
+        zero_slot_region(gs.conv_state_out, conv_off, conv_stride);
+        zero_slot_region(gs.recurrent_state, recur_off, recur_stride);
+    }
 }
 
 StepTiming RawMetalDecoder::step(uint32_t token_id, uint32_t position) {

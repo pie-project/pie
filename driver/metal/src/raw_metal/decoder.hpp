@@ -53,6 +53,11 @@ public:
     // fresh sequence — call when the runtime marks the rs_slot NEW (or position 0 prefill).
     void reset_state();
 
+    // S>1: zero only `slot`'s GDN conv/recurrent slab region (no-op-equivalent to the GDN half
+    // of reset_state() at slot=0). Call per NEW request (RsSlotFlags) under multi-batch; KV is
+    // reset via the runtime's paged page-table, not here.
+    void reset_state(uint32_t slot);
+
     // Process ONE M=1 token at absolute `position`: writes IO {TokenId, Position, SeqLen=
     // position+1}, advances the GDN conv-state ping-pong by (position % 2), then encodes the
     // full decode DAG (one run_step). Logits for this token land in the IO logits buffer;
