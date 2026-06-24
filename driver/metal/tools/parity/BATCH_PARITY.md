@@ -49,8 +49,17 @@ The length spread forces ragged batching: per-seq positions, `qo_indptr` spans, 
 
 - `reference_argmax.json` — cross-engine (mlx-lm) first-decode argmax per (model, slot):
   the secondary cross-engine anchor each batched seq must hit.
-- `m1/<model>/seq<i>/` — the sealed **M=1 raw-Metal per-kernel goldens** (produced by the
-  decode harness with `PIE_METAL_GOLDEN_DIR` per prompt; primary gate target). [pending box+M>1 build]
+- `token_ids.json` + `ids_<model>_seq<i>.csv` — pre-tokenized prompt ids (per model) for the
+  golden producer below (BOS-prepended for gemma).
+- `m1/<model>/seq<i>/` — the sealed **M=1 raw-Metal per-kernel goldens** (the primary gate
+  target). Produced per prompt by the raw-Metal decode harness — same kernels the M>1 path
+  slices, so the gate isolates *batching only*:
+  ```
+  PIE_DUMP_TAPS=~/parity-golden/mbatch/m1/qwen3.6/seq0 \
+    build-gpu/bin/decode_run <ckpt_dir> <kernels_dir> "$(cat ~/parity-golden/mbatch/ids_qwen3.6_seq0.csv)"
+  ```
+  decode_run taps the final (decision) decode step — matching the gate's per-seq decision-row
+  comparison. [pending box + the M>1 build, run alongside the first M>1 batched dump]
 
 ## Usage
 
