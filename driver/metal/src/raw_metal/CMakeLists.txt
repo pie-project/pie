@@ -57,6 +57,15 @@ target_link_libraries(raw_metal_microbench PRIVATE
   "-framework Metal"
   "-framework Foundation")
 
+# dvfs_probe — DVFS clock-domain isolation diagnostic (core vs memory). Self-contained
+# (Metal+Foundation only, no project deps). Proves the idle downclock is the GPU CORE clock
+# (pure-ALU inflates 2.0x = 1296->648MHz) while memory bandwidth is immune. See file header.
+add_executable(dvfs_probe dvfs_probe.mm)
+set_source_files_properties(dvfs_probe.mm PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
+target_link_libraries(dvfs_probe PRIVATE
+  "-framework Metal"
+  "-framework Foundation")
+
 # gemma4_encode_probe — non-GPU-exclusive verification of alpha's gemma4 executor:
 # build_gemma4_dag + load_gemma4_psos (runtime-compile every gemma4 kernel) + walk the
 # DAG asserting each dispatch has a valid PSO + sane launch dims. The bit-exact parity
