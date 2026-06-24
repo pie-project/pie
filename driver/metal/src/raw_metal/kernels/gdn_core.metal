@@ -86,30 +86,49 @@ template <typename T>
     return acc / (1.0f + exp(-acc));          // silu
   };
 
-  // this lane owns dk channels [n_per_t*dk_idx, +n_per_t) of head hv_idx (q and k),
-  // and the single v channel (hv_idx, dv_idx).
-  float qraw[8], kraw[8];                      // n_per_t<=8
-  for (int i = 0; i < n_per_t; ++i) {
-    int d = n_per_t * dk_idx + i;              // 0..Dk-1
-    qraw[i] = convsilu(q_off + hv_idx * Dk + d);
-    kraw[i] = convsilu(k_off + hv_idx * Dk + d);
+  // --- q/k conv/silu + l2norm + gating: depend only on (hv,dk), NOT dv ---------
+  // Identical for every dv of the head, so compute ONCE per threadgroup (the
+  // simdgroup tpit.y==0) into threadgroup memory and share across the tile's dv
+  // simdgroups — kills the Vd-fold redundancy (was recomputed in all 128 dv
+  // threadgroups). The threadgroup spans a tile of dv (tg.y simdgroups) so this
+  // dedups tg.y× while keeping full occupancy. Bit-identical: same simd_sum
+  // reduction, same values, just computed once and broadcast.
+  threadgroup float sh_q[256];     // [Dk] normalized + 1/sqrt(Dk)-prescaled q
+  threadgroup float sh_k[256];     // [Dk] normalized k
+  threadgroup float sh_decay;      // exp gate decay (per head)
+  threadgroup float sh_beta;       // sigmoid beta   (per head)
+  if (tpit.y == 0) {
+    float qraw[8], kraw[8];                    // n_per_t<=8
+    for (int i = 0; i < n_per_t; ++i) {
+      int d = n_per_t * dk_idx + i;            // 0..Dk-1
+      qraw[i] = convsilu(q_off + hv_idx * Dk + d);
+      kraw[i] = convsilu(k_off + hv_idx * Dk + d);
+    }
+    float qsq = 0.0f, ksq = 0.0f;
+    for (int i = 0; i < n_per_t; ++i) { qsq += qraw[i] * qraw[i]; ksq += kraw[i] * kraw[i]; }
+    qsq = simd_sum(qsq); ksq = simd_sum(ksq);
+    float qinv = p.inv_sqrt_dk / sqrt(qsq + p.eps);   // q also pre-scaled 1/sqrt(Dk)
+    float kinv = 1.0f / sqrt(ksq + p.eps);
+    for (int i = 0; i < n_per_t; ++i) {
+      int d = n_per_t * dk_idx + i;
+      sh_q[d] = qraw[i] * qinv;
+      sh_k[d] = kraw[i] * kinv;
+    }
+    if (dk_idx == 0) {
+      // gating: g = -exp(A_log)*softplus(a+dt_bias); decay = exp(g); beta = sigmoid(b)
+      float ad = float(a_gate[b_idx * Hv + hv_idx]) + float(dt_bias[hv_idx]);
+      float sp = max(ad, 0.0f) + log(1.0f + exp(-fabs(ad)));   // softplus
+      sh_decay = exp(-exp(float(A_log[hv_idx])) * sp);
+      sh_beta  = 1.0f / (1.0f + exp(-float(b_gate[b_idx * Hv + hv_idx])));
+    }
   }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+
+  // this lane's v channel (unique per dv) + read the shared q/k/gating.
   float vval = convsilu(v_off + hv_idx * Dv + dv_idx);
-
-  // --- l2norm(q,k) over the head's Dk dims (simd_sum across the 32 dk-lanes) ---
-  float qsq = 0.0f, ksq = 0.0f;
-  for (int i = 0; i < n_per_t; ++i) { qsq += qraw[i] * qraw[i]; ksq += kraw[i] * kraw[i]; }
-  qsq = simd_sum(qsq); ksq = simd_sum(ksq);
-  float qinv = p.inv_sqrt_dk / sqrt(qsq + p.eps);   // q also pre-scaled 1/sqrt(Dk)
-  float kinv = 1.0f / sqrt(ksq + p.eps);
   float q[8], k[8];
-  for (int i = 0; i < n_per_t; ++i) { q[i] = qraw[i] * qinv; k[i] = kraw[i] * kinv; }
-
-  // --- gating: g = -exp(A_log)*softplus(a+dt_bias); decay = exp(g); beta = sigmoid(b) ---
-  float ad = float(a_gate[b_idx * Hv + hv_idx]) + float(dt_bias[hv_idx]);
-  float sp = max(ad, 0.0f) + log(1.0f + exp(-fabs(ad)));   // softplus
-  float gdecay = exp(-exp(float(A_log[hv_idx])) * sp);
-  float beta = 1.0f / (1.0f + exp(-float(b_gate[b_idx * Hv + hv_idx])));
+  for (int i = 0; i < n_per_t; ++i) { int d = n_per_t * dk_idx + i; q[i] = sh_q[d]; k[i] = sh_k[d]; }
+  float gdecay = sh_decay, beta = sh_beta;
 
   // --- recurrent step (register state + simd_sum), native [Hv,Vd,Dk] ---
   device float* i_state = rstate + (size_t(n * Dv + dv_idx) * Dk);
@@ -130,16 +149,21 @@ template <typename T>
   // --- conv_state writeback (shift + append) to a SEPARATE ping-pong slot. ---
   // Reading conv_state (read-only) and writing new_conv_state avoids the
   // read/write race the redundant v-dim threadgroups would hit if in-place.
-  // Idempotent across redundant lanes (all write identical values from stable input).
+  // q/k channels depend only on (hv,dk) — identical across all Vd threadgroups of
+  // a head — so only dv_idx==0 writes them (was Vd=128-fold redundant write
+  // traffic, ~8MB/token). The v channel is unique per (hv,dv): every dv writes its
+  // own. Full coverage, each channel written exactly once. Output bit-identical.
   auto wb = [&](int c) {
     for (int j = 0; j < Kc - 1; ++j)
       new_conv_state[(b_idx * Kc + j) * CDIM + c] = conv_state[(b_idx * Kc + (j + 1)) * CDIM + c];
     new_conv_state[(b_idx * Kc + (Kc - 1)) * CDIM + c] = float(mixed[b_idx * CDIM + c]);
   };
-  for (int i = 0; i < n_per_t; ++i) {
-    int d = n_per_t * dk_idx + i;
-    wb(q_off + hv_idx * Dk + d);
-    wb(k_off + hv_idx * Dk + d);
+  if (dv_idx == 0) {
+    for (int i = 0; i < n_per_t; ++i) {
+      int d = n_per_t * dk_idx + i;
+      wb(q_off + hv_idx * Dk + d);
+      wb(k_off + hv_idx * Dk + d);
+    }
   }
   wb(v_off + hv_idx * Dv + dv_idx);
 }

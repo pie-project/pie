@@ -15,6 +15,8 @@
 // full forward runs fault-free and returns timing + a sampled token.)
 
 #include <cmath>
+#include <algorithm>
+#include <array>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -210,7 +212,10 @@ int main(int argc, char** argv) {
         weights_bytes += view.get(name).nbytes;
     const HeapPlan plan = plan_heap(g, weights_bytes, max_ctx);
 
-    const std::vector<Dispatch> dag = build_decode_dag(g, /*with_argmax=*/false);
+    const bool fuse_residual = std::getenv("PIE_FUSE_RESIDUAL") != nullptr;
+    const std::vector<Dispatch> dag = build_decode_dag(g, /*with_argmax=*/false, fuse_residual);
+    if (fuse_residual)
+        std::printf("[decode_run] PIE_FUSE_RESIDUAL: residual folded into QmvO/QmvOut/QmvDown epilogue\n");
 
     if (std::getenv("PIE_DAG_DUMP")) {
         for (const auto& d : dag)
@@ -280,7 +285,7 @@ int main(int argc, char** argv) {
     // ── Compile the kernel PSOs ──
     DecodeStepPsos psos;
     std::string err;
-    if (!load_decode_psos(*ctx, kernels_dir, psos, /*with_argmax=*/false, &err)) {
+    if (!load_decode_psos(*ctx, kernels_dir, psos, /*with_argmax=*/false, &err, fuse_residual)) {
         std::fprintf(stderr, "[decode_run] PSO load failed: %s\n", err.c_str());
         return 1;
     }
@@ -434,6 +439,7 @@ int main(int argc, char** argv) {
         return 0;
     }
 
+
     // ── Optional ABLATION timing (PIE_ATTRIB_ABLATE=GdnInA,GdnInB,...): the decisive,
     //    differencing-free cost measurement. Time the full DAG, then time the DAG with all
     //    dispatches of the named kinds REMOVED (timing-only — downstream reads garbage, but
@@ -543,47 +549,74 @@ int main(int argc, char** argv) {
         return 0;
     }
 
-    // ── Optional PER-DISPATCH attribution (PIE_ATTRIB_TS=1): in-stream GPU timestamps
-    //    (alpha's seam) mark every dispatch boundary on a single full-DAG pass; diffing
-    //    consecutive resolved ticks gives each dispatch's gpu-exec ms (precise granularity
-    //    — Relaxed snaps to encoder boundaries → delta=0). Min over reps per dispatch for a
-    //    clean floor, then rank by kind (fusion targets) + per-layer + top-N hottest. This
-    //    is the within-layer instrument: which dispatches are launch-floor (fuse) vs above
-    //    BW-floor (kernel-opt). State intact from the decode loop (representative M=1 cost). ──
+    // ── PER-DISPATCH attribution (PIE_ATTRIB_TS=1) — cumulative-prefix wall-clock + robust
+    //    median-per-kind. Why this and not timestamps: alpha's precise MTL4 timestamp write
+    //    is NOT gated by the compute barrier (verified — exec-only AND Device-flush both give
+    //    a ~0.3ms issue-cadence sum, not the real 7.6ms; lm_head an impossible 11µs/127MB).
+    //    So we use delta's trustworthy `gpu_exec_ms` (GPU-event domain) at per-dispatch cuts:
+    //    cum(k) = min-over-reps gpu_exec of prefix [0..k); marginal(i)=cum(i+1)-cum(i). A raw
+    //    per-dispatch marginal carries a per-cut "drain" artifact (the prefix's last dispatch
+    //    is fully drained instead of overlapped — gave multi-ms single-cut spikes), so we
+    //    aggregate each KIND by the MEDIAN of its marginals (robust to the few bad cuts) and
+    //    report median ms/disp × count. This is the within-layer fuse/kernel-opt ranking. ──
     if (std::getenv("PIE_ATTRIB_TS")) {
-        const uint32_t nb = uint32_t(dag.size() + 1);
-        void* tsh = ctx->create_timestamp_heap(nb);
-        const int reps = std::getenv("PIE_ATTRIB_TS_REPS")
-                             ? std::atoi(std::getenv("PIE_ATTRIB_TS_REPS")) : 8;
-        std::vector<uint64_t> ts(nb);
-        std::vector<double> minms(dag.size(), 1e30);
-        for (int r = 0; r < reps; ++r) {
-            ctx->run_step([&](StepEncoder& se) {
-                StepTimingHook h{[&](int idx) { se.mark_timestamp(tsh, uint32_t(idx), /*precise=*/true); }};
-                encode_decode_step(se, dag, psos, force_barriers, &h);
-            }, 0);
-            ctx->resolve_timestamps(tsh, nb, ts.data());
-            StepAttribution a = attribute_step(dag, ts.data(), ts.size(), /*ns_per_tick=*/1.0);
-            if (!a.valid) continue;
-            for (size_t k = 0; k < dag.size() && k < a.per_dispatch.size(); ++k)
-                minms[k] = std::min(minms[k], a.per_dispatch[k].gpu_ms);
+        const int    reps = std::getenv("PIE_ATTRIB_TS_REPS")
+                                ? std::atoi(std::getenv("PIE_ATTRIB_TS_REPS")) : 6;
+        const size_t N    = dag.size();
+        std::vector<double> cum_ms(N + 1, 0.0);
+        for (size_t k = 1; k <= N; ++k) {
+            std::vector<Dispatch> sub(dag.begin(), dag.begin() + k);
+            double best = 1e30;
+            for (int r = 0; r < reps; ++r) {
+                StepTiming t = ctx->run_step(
+                    [&](StepEncoder& se) { encode_decode_step(se, sub, psos, force_barriers); }, 0);
+                best = std::min(best, t.gpu_exec_ms);
+            }
+            cum_ms[k] = best;
         }
-        // Aggregate the per-dispatch minima into a StepAttribution for ranked reporting.
-        StepAttribution agg;
-        agg.valid = true;
-        agg.per_dispatch.resize(dag.size());
-        for (size_t k = 0; k < dag.size(); ++k) {
-            const double ms = (minms[k] < 1e29) ? minms[k] : 0.0;
-            agg.per_dispatch[k] = {dag[k].ordinal, dag[k].kind, dag[k].layer, ms};
-            const int ki = static_cast<int>(dag[k].kind);
-            agg.by_kind[ki] += ms;
-            agg.count_kind[ki] += 1;
-            agg.total_gpu_ms += ms;
+        for (size_t k = 1; k <= N; ++k)
+            if (cum_ms[k] < cum_ms[k - 1]) cum_ms[k] = cum_ms[k - 1];  // enforce monotone
+
+        // Group marginals by kind; median ms/disp per kind is the robust per-dispatch cost.
+        std::array<std::vector<double>, kKernelKindCount> by_kind_marg;
+        for (size_t i = 0; i < N; ++i)
+            by_kind_marg[static_cast<int>(dag[i].kind)].push_back(cum_ms[i + 1] - cum_ms[i]);
+        auto median = [](std::vector<double> v) -> double {
+            if (v.empty()) return 0.0;
+            std::sort(v.begin(), v.end());
+            const size_t m = v.size() / 2;
+            return (v.size() & 1) ? v[m] : 0.5 * (v[m - 1] + v[m]);
+        };
+        struct Row { Kernel k; int n; double med; double total; };
+        std::vector<Row> rows;
+        double step_total = 0.0;
+        for (int ki = 0; ki < kKernelKindCount; ++ki) {
+            const auto& v = by_kind_marg[ki];
+            if (v.empty()) continue;
+            const double med = median(v);
+            const double tot = med * double(v.size());
+            rows.push_back({static_cast<Kernel>(ki), int(v.size()), med, tot});
+            step_total += tot;
         }
-        print_attribution(agg, "qwen3.6 decode-step per-dispatch (min over reps)", 24);
+        std::sort(rows.begin(), rows.end(),
+                  [](const Row& a, const Row& b) { return a.total > b.total; });
+        std::printf("\n==== per-dispatch attribution (cumulative-prefix, median/kind, reps=%d) ====\n", reps);
+        std::printf("full-DAG gpu_exec = %.4f ms ; sum-of-median-kind = %.4f ms\n", cum_ms[N], step_total);
+        std::printf("  %-14s %4s  %9s  %10s  %6s\n", "kind", "n", "med_ms/d", "total_ms", "%step");
+        for (const auto& r : rows)
+            std::printf("  %-14s %4d  %9.5f  %10.4f  %5.1f%%\n",
+                        kernel_name(r.k), r.n, r.med, r.total,
+                        step_total > 0 ? 100.0 * r.total / step_total : 0.0);
+        std::printf("==== end attribution ====\n");
+        std::printf("note: unresolved = %.4f ms (full-DAG %.4f − sum-of-median %.4f) is distributed\n"
+                    "      across sub-noise-floor dispatches: a single M=1 dispatch (~5-20us) is below\n"
+                    "      the gpu_exec event noise, so only individually-large kernels resolve above it\n"
+                    "      (gdn_core/lm_head/embed). The rest = launch-floor → FUSION targets.\n",
+                    cum_ms[N] - step_total, cum_ms[N], step_total);
         return 0;
     }
 
+    // ── Optional full 363-tap dump (PIE_DUMP_TAPS=<dir>): after the last decode step, with
     //    no_recycle every value is preserved in its own pool buffer → emit each dispatch's
     //    output as <layer>.<tag>.npy for charlie's cosine_bisect vs the pos-7 golden. ──
     if (dump_dir) {

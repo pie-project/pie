@@ -24,13 +24,17 @@ namespace {
 struct LD { Grid grid; Threadgroup tg; };
 
 // GdnCore launch lives with beta's kernel (dispatchThreads = total threads).
+// tg spans a TILE of dv (32 simdgroups) so the q/k prologue is computed once per
+// threadgroup (tpit.y==0) + shared via threadgroup memory — kills the Vd-fold
+// redundancy while keeping full occupancy. grid {32,Vd,Hv} / tg {32,32,1}.
 LD gdncore_ld(const DecodeGeometry& g) {
-    return { Grid{32, uint32_t(g.gdn_v_dim), uint32_t(g.gdn_v_heads)}, Threadgroup{32, 4, 1} };
+    return { Grid{32, uint32_t(g.gdn_v_dim), uint32_t(g.gdn_v_heads)}, Threadgroup{32, 32, 1} };
 }
 
 }  // namespace
 
-std::vector<Dispatch> build_decode_dag(const DecodeGeometry& g, bool with_argmax) {
+std::vector<Dispatch> build_decode_dag(const DecodeGeometry& g, bool with_argmax,
+                                       bool fuse_residual) {
     const int q_dim  = g.n_q_heads * g.head_dim;   // 2048 (post-split query)
     const int qg_dim = 2 * q_dim;                  // 4096 (q_proj is 2×-wide [query|gate])
     const int kv_dim = g.n_kv_heads * g.head_dim;  // 512
@@ -66,7 +70,8 @@ std::vector<Dispatch> build_decode_dag(const DecodeGeometry& g, bool with_argmax
             { LD l; sdpa_dispatch(g.n_q_heads, l.grid, l.tg); emit(Kernel::Sdpa, L, l); }
             { LD l; attn_gate_dispatch(g.n_q_heads, g.head_dim, l.grid, l.tg); emit(Kernel::AttnGate, L, l); }
             emit(Kernel::QmvO,   L, qmv(g.hidden));
-            emit(Kernel::Residual, L, resid());
+            if (fuse_residual) dag.back().fuse_residual = true;
+            else emit(Kernel::Residual, L, resid());
         } else {
             // GDN (15): attn_norm, gdn_in_qkv(6144), gdn_in_z(2048), gdn_in_a, gdn_in_b,
             // gdn_core, gated_rms, gdn_out, attn_resid + MLP(6).
@@ -78,7 +83,8 @@ std::vector<Dispatch> build_decode_dag(const DecodeGeometry& g, bool with_argmax
             emit(Kernel::GdnCore, L, gdncore_ld(g));                   // beta's fused 1-dispatch core
             { LD l; gated_rms_dispatch(g.gdn_v_heads, g.gdn_v_dim, l.grid, l.tg); emit(Kernel::GatedRms, L, l); }
             emit(Kernel::QmvOut,  L, qmv(g.hidden));                   // gdn_out
-            emit(Kernel::Residual, L, resid());
+            if (fuse_residual) dag.back().fuse_residual = true;
+            else emit(Kernel::Residual, L, resid());
         }
         // SwiGLU MLP (6, every layer): ffn_norm, gate_proj, up_proj, swiglu, down_proj, layer_out.
         emit(Kernel::FfnRms,   L, rms(g.hidden, 1));
@@ -86,7 +92,8 @@ std::vector<Dispatch> build_decode_dag(const DecodeGeometry& g, bool with_argmax
         emit(Kernel::QmvUp,    L, qmv(g.intermediate));
         { LD l; silu_mul_dispatch(g.intermediate, l.grid, l.tg); emit(Kernel::SiluMul, L, l); }
         emit(Kernel::QmvDown,  L, qmv(g.hidden));
-        emit(Kernel::LayerOut, L, resid());
+        if (fuse_residual) dag.back().fuse_residual = true;
+        else emit(Kernel::LayerOut, L, resid());
     }
 
     // TAIL: final_norm, lm_head (logits ALWAYS produced, I3), [optional] device argmax.
@@ -119,7 +126,7 @@ void encode_decode_step(StepEncoder& se,
     for (size_t i = 0; i < dag.size(); ++i) {
         const Dispatch& d = dag[i];
         if (timing && timing->mark) timing->mark(static_cast<int>(i));  // boundary i
-        se.set_pso(psos[d.kind]);
+        se.set_pso(d.fuse_residual ? psos.qmv_residual : psos[d.kind]);
         se.set_argtable(d.kind, d.ordinal);  // ordinal-keyed (unique, token-stable)
         se.dispatch(d.grid, d.tg);
         if (force_barriers || barrier_after(dag, i)) se.barrier();
