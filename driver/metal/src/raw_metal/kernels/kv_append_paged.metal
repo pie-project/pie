@@ -32,13 +32,13 @@ template <typename T>
     const device T* v_new   [[buffer(1)]],   // V
     device T* k_pages       [[buffer(2)]],   // KPages: [num_pages*page_size, n_kv_heads, head_dim]
     device T* v_pages       [[buffer(3)]],   // VPages
-    const device int* position_ids       [[buffer(4)]],   // PositionPtr: [N] absolute positions (IO)
+    const device uint* position_ids      [[buffer(4)]],   // PositionPtr: [N] absolute positions (IO, u32)
     const constant int& head_dim         [[buffer(5)]],   // HeadDim
     // buffers 6 (KHeadStride) + 7 (KSeqStride) = M=1 ring strides — bound, unused here.
-    const device int* kv_page_indices    [[buffer(8)]],   // KvPageIndices: [total_pages_in_batch]
-    const device int* kv_page_indptr     [[buffer(9)]],   // KvPageIndptr:  [n_requests+1]
+    const device uint* kv_page_indices   [[buffer(8)]],   // KvPageIndices: [total_pages_in_batch] (u32)
+    const device uint* kv_page_indptr    [[buffer(9)]],   // KvPageIndptr:  [n_requests+1] (u32)
     const constant int& page_size        [[buffer(10)]],  // PageSize
-    const device int* req_of_token       [[buffer(11)]],  // ReqOfToken: [N] request id per token (IO)
+    const device uint* req_of_token      [[buffer(11)]],  // ReqOfToken: [N] request id per token (IO, u32)
     const constant int& n_kv_heads       [[buffer(12)]],  // NKvHeads
     uint3 tid [[thread_position_in_grid]]) {
   const int d = int(tid.x);   // channel within head_dim
@@ -46,10 +46,10 @@ template <typename T>
   const int i = int(tid.z);   // token within the batch [0, N)
   if (d >= head_dim) return;
 
-  const int r = req_of_token[i];
-  const int p = position_ids[i];
-  const int page = kv_page_indices[kv_page_indptr[r] + p / page_size];
-  const size_t slot = size_t(page) * size_t(page_size) + size_t(p % page_size);
+  const uint r = req_of_token[i];
+  const uint p = position_ids[i];
+  const uint page = kv_page_indices[kv_page_indptr[r] + p / uint(page_size)];
+  const size_t slot = size_t(page) * size_t(page_size) + size_t(p % uint(page_size));
 
   const size_t row_stride = size_t(n_kv_heads) * size_t(head_dim);  // NHD page row
   const size_t dst = slot * row_stride + size_t(h) * size_t(head_dim) + size_t(d);
@@ -63,9 +63,9 @@ template <typename T>
   template [[host_name("kv_append_paged_" #name)]]                \
   [[kernel]] void kv_append_paged<itype>(                         \
       const device itype*, const device itype*, device itype*,    \
-      device itype*, const device int*, const constant int&,      \
-      const device int*, const device int*, const constant int&,  \
-      const device int*, const constant int&, uint3);
+      device itype*, const device uint*, const constant int&,     \
+      const device uint*, const device uint*, const constant int&,\
+      const device uint*, const constant int&, uint3);
 
 instantiate_kv_append_paged(float32, float)
 instantiate_kv_append_paged(float16, half)
