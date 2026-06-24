@@ -402,6 +402,37 @@ int main(int argc, char** argv) {
     std::printf("[decode_run] HEADLINE last-step: encode_ms=%.4f gpu_exec_ms=%.4f total_ms=%.4f\n",
                 last.encode_ms, last.gpu_exec_ms, last.total_ms());
 
+    // ── Optional COARSE per-phase attribution (PIE_ATTRIB=1): re-time cumulative DAG
+    //    prefixes [0..N) at phase boundaries (embed, each layer end, final_norm, lm_head),
+    //    min over repeats. Marginal(boundary) = cum(N_i) - cum(N_{i-1}) localizes the real
+    //    gpu-exec ms per phase (complements beta's per-dispatch timestamp tool). State is
+    //    intact from the 8-step loop; truncated re-runs measure representative kernel cost. ──
+    if (std::getenv("PIE_ATTRIB")) {
+        std::vector<std::pair<int, std::string>> cuts;   // (N = #dispatches, label)
+        cuts.emplace_back(1, "embed");
+        for (size_t k = 0; k < dag.size(); ++k)
+            if (dag[k].kind == Kernel::LayerOut)
+                cuts.emplace_back(int(k + 1), "L" + std::to_string(dag[k].layer));
+            else if (dag[k].kind == Kernel::FinalRms)
+                cuts.emplace_back(int(k + 1), "final_norm");
+        cuts.emplace_back(int(dag.size()), "lm_head");
+        const int reps = std::getenv("PIE_ATTRIB_REPS") ? std::atoi(std::getenv("PIE_ATTRIB_REPS")) : 8;
+        std::printf("[decode_run] ATTRIB (min gpu_exec_ms over %d reps; marginal = phase cost):\n", reps);
+        double prev = 0.0;
+        for (auto& [N, label] : cuts) {
+            std::vector<Dispatch> sub(dag.begin(), dag.begin() + N);
+            double best = 1e9;
+            for (int r = 0; r < reps; ++r) {
+                StepTiming t = ctx->run_step(
+                    [&](StepEncoder& se) { encode_decode_step(se, sub, psos, force_barriers); }, 0);
+                best = std::min(best, t.gpu_exec_ms);
+            }
+            std::printf("  %-11s N=%3d  cum=%.4f  marginal=%.4f\n", label.c_str(), N, best, best - prev);
+            prev = best;
+        }
+        return 0;
+    }
+
     // ── Optional full 363-tap dump (PIE_DUMP_TAPS=<dir>): after the last decode step, with
     //    no_recycle every value is preserved in its own pool buffer → emit each dispatch's
     //    output as <layer>.<tag>.npy for charlie's cosine_bisect vs the pos-7 golden. ──
