@@ -20,6 +20,7 @@
 // byte-identical every token (I1). delta binds arg tables by the SAME ordinal.
 // The Kernel `kind` + `layer` are retained only for charlie's <layer>.<tag>.npy dumps.
 
+#include <functional>
 #include <vector>
 #include "decode_abi.hpp"
 #include "mtl4_context.hpp"
@@ -51,13 +52,25 @@ struct DecodeStepPsos {
 // appends the optional device-argmax substrate (I3); logits are ALWAYS produced.
 std::vector<Dispatch> build_decode_dag(const DecodeGeometry& g, bool with_argmax = false);
 
+// ── GPU-exec attribution hook (optimization-phase prep; off by default) ───────
+// When provided to encode_decode_step, the walker emits a timestamp mark at boundary i
+// (BEFORE dispatch i) and one final mark after the last dispatch — so diffing the
+// resolved timestamps attributes gpu-exec-ms per dispatch (see decode_timing.hpp). The
+// `mark` callback is wired by the integration to alpha's StepEncoder timestamp seam;
+// null on the production path => zero marks, zero perturbation.
+struct StepTimingHook {
+    std::function<void(int boundary_index)> mark;
+};
+
 // Encode one decode step: walk the DAG, bind pso + arg table (by ordinal), dispatch+barrier.
 // `force_barriers` (diagnostic): emit a barrier after EVERY dispatch, disabling the ‖-pair
 // concurrency. If the non-determinism vanishes with force_barriers=true, the cause is a
 // ‖-pair concurrency/barrier issue; if it persists, the race is elsewhere (in-kernel/state).
+// `timing` (optional): when non-null, emit per-boundary timestamp marks for attribution.
 void encode_decode_step(StepEncoder& se,
                         const std::vector<Dispatch>& dag,
                         const DecodeStepPsos& psos,
-                        bool force_barriers = false);
+                        bool force_barriers = false,
+                        const StepTimingHook* timing = nullptr);
 
 }  // namespace pie_metal_driver::raw_metal
