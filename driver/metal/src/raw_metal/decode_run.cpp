@@ -204,6 +204,14 @@ int main(int argc, char** argv) {
         ids.push_back(uint32_t(std::stoul(ids_csv.substr(p, c - p))));
         p = c + 1;
     }
+    // PIE_STEPS: pad the step count for amortization sweeps. In resident mode the token
+    // values after ids[0] are device-fed (ignored), so padding with the seed just extends
+    // the autoregressive run to enough steps for steady-state per-token statistics.
+    if (const char* ps = std::getenv("PIE_STEPS")) {
+        const size_t want = (size_t)std::atol(ps);
+        const uint32_t pad = ids.empty() ? 0u : ids[0];
+        while (ids.size() < want) ids.push_back(pad);
+    }
     const int max_ctx = 4096;
 
     DecodeGeometry g;  // defaults match Qwen3.5-0.8B (qwen3.6)
@@ -444,6 +452,19 @@ int main(int argc, char** argv) {
     if (resident) write_u32(b.io[int(IoSlot::NextToken)], ids[0]);  // seed the first token
     const bool check_argmax = std::getenv("PIE_RESIDENT_CHECK") != nullptr;
     int resident_argmax_mismatch = 0;
+    // PIE_RESIDENT_SYNC_N=N: emulate the e2e control-point sync. In the resident loop the
+    // GPU runs back-to-back (hot) within a burst; every N steps we drain + idle the host for
+    // PIE_STEP_SLEEP_US (the measured ~800us wasm/forward-dispatch bounce). This measures the
+    // REAL DVFS response to the per-N sync cadence (the cold-start ramp after each sync), so
+    // the amortized per-token = mean(gpu_exec) + bounce/N is honestly measured, not modeled.
+    // N=1 reproduces today's per-token drain; large N approaches the pure resident floor.
+    const long sync_n =
+        std::getenv("PIE_RESIDENT_SYNC_N") ? std::atol(std::getenv("PIE_RESIDENT_SYNC_N")) : 0;
+    // Steady-state amortization accumulators (skip warmup steps so the clock has settled into
+    // its periodic burst pattern). warm default = max(32, 2 bursts).
+    const size_t warm = std::getenv("PIE_AMORT_WARM")
+                            ? (size_t)std::atol(std::getenv("PIE_AMORT_WARM")) : 32;
+    double amort_gpu_sum = 0.0; size_t amort_steps = 0, amort_syncs = 0;
     for (size_t i = 0; i < ids.size(); ++i) {
         if (!resident) write_u32(b.io[int(IoSlot::TokenId)], ids[i]);  // device-fed in resident
         write_u32(b.io[int(IoSlot::Position)], uint32_t(i));
@@ -478,8 +499,10 @@ int main(int argc, char** argv) {
             last = ctx->run_step(
                 [&](StepEncoder& se) { encode_decode_step(se, dag, psos, force_barriers); }, int(i & 1));
         }
-        std::printf("[decode_run] step %zu (id=%u pos=%zu): encode_ms=%.4f gpu_exec_ms=%.4f\n",
-                    i, ids[i], i, last.encode_ms, last.gpu_exec_ms);
+        const bool verbose_step = ids.size() <= 32 || std::getenv("PIE_VERBOSE");
+        if (verbose_step)
+            std::printf("[decode_run] step %zu (id=%u pos=%zu): encode_ms=%.4f gpu_exec_ms=%.4f\n",
+                        i, ids[i], i, last.encode_ms, last.gpu_exec_ms);
         if (resident) {
             // Generated token = GPU argmax output (now in NextToken, device-fed to next embed).
             const uint32_t gpu_tok = read_u32(b.io[int(IoSlot::NextToken)]);
@@ -498,8 +521,16 @@ int main(int argc, char** argv) {
                 }
             }
         }
-        if (step_sleep_us > 0)
+        // Steady-state amortization: accumulate gpu_exec per token + count control-point syncs.
+        if (i >= warm) { amort_gpu_sum += last.gpu_exec_ms; ++amort_steps; }
+        // Control-point sync: with PIE_RESIDENT_SYNC_N the host bounce (PIE_STEP_SLEEP_US) is
+        // paid once every N steps (the resident burst stays hot in between); otherwise it is
+        // paid every step (today's per-token drain).
+        const bool at_sync = (sync_n > 0) ? (((i + 1) % (size_t)sync_n) == 0) : true;
+        if (step_sleep_us > 0 && at_sync) {
+            if (i >= warm) ++amort_syncs;
             std::this_thread::sleep_for(std::chrono::microseconds(step_sleep_us));
+        }
         if (keepalive_us > 0 && dag[0].kind == Kernel::EmbedGather) {
             auto ka0 = std::chrono::steady_clock::now();
             while (std::chrono::duration_cast<std::chrono::microseconds>(
@@ -518,6 +549,22 @@ int main(int argc, char** argv) {
     if (resident)
         std::printf("[decode_run] RESIDENT: %zu steps generated, argmax mismatches=%d (0=GPU argmax bit-exact)\n",
                     ids.size(), resident_argmax_mismatch);
+    // Amortized per-token e2e at the chosen sync cadence: mean steady-state gpu_exec plus the
+    // host bounce (PIE_STEP_SLEEP_US) amortized over the sync interval. This is the seam-
+    // deciding number — the resident win net of the control-point sync overhead, vs mlx-lm.
+    if (amort_steps > 0) {
+        const double mean_gpu = amort_gpu_sum / double(amort_steps);
+        const double bounce_per_tok_ms =
+            (step_sleep_us > 0) ? (double(amort_syncs) * double(step_sleep_us) / 1000.0)
+                                      / double(amort_steps)
+                                : 0.0;
+        const double amort_e2e = mean_gpu + bounce_per_tok_ms;
+        std::printf("[decode_run] AMORT (steady-state, warm=%zu, sync_N=%ld, bounce_us=%ld):\n"
+                    "             mean_gpu_exec=%.4f ms  bounce/tok=%.4f ms  AMORT_E2E=%.4f ms/tok"
+                    "  (%.2f tok/s)\n",
+                    warm, sync_n, step_sleep_us, mean_gpu, bounce_per_tok_ms, amort_e2e,
+                    1000.0 / amort_e2e);
+    }
 
     // ── Optional COARSE per-phase attribution (PIE_ATTRIB=1): re-time cumulative DAG
     //    prefixes [0..N) at phase boundaries (embed, each layer end, final_norm, lm_head),
