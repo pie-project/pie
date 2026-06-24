@@ -434,6 +434,115 @@ int main(int argc, char** argv) {
         return 0;
     }
 
+    // ── Optional ABLATION timing (PIE_ATTRIB_ABLATE=GdnInA,GdnInB,...): the decisive,
+    //    differencing-free cost measurement. Time the full DAG, then time the DAG with all
+    //    dispatches of the named kinds REMOVED (timing-only — downstream reads garbage, but
+    //    gpu_exec is valid since the kernels still execute). delta = the true aggregate cost of
+    //    those dispatches, free of prefix-diff adjacent-smearing. Answers: is a kind launch-
+    //    floor (small delta) or real compute/BW (large delta)? ──
+    if (const char* abl = std::getenv("PIE_ATTRIB_ABLATE")) {
+        const int reps = std::getenv("PIE_ATTRIB_ABLATE_REPS")
+                             ? std::atoi(std::getenv("PIE_ATTRIB_ABLATE_REPS")) : 30;
+        std::string want = abl;
+        auto in_set = [&](Kernel k) {
+            std::string n = kind_name(k);
+            size_t p = 0;
+            while (p < want.size()) {
+                size_t c = want.find(',', p);
+                std::string tok = want.substr(p, c == std::string::npos ? c : c - p);
+                if (tok == n) return true;
+                if (c == std::string::npos) break;
+                p = c + 1;
+            }
+            return false;
+        };
+        auto timed = [&](const std::vector<Dispatch>& d) {
+            double sum = 0.0; int used = 0;
+            for (int r = 0; r < reps; ++r) {
+                StepTiming t = ctx->run_step(
+                    [&](StepEncoder& se) { encode_decode_step(se, d, psos, force_barriers); }, 0);
+                if (r > 0) { sum += t.gpu_exec_ms; ++used; }
+            }
+            return used ? sum / used : 0.0;
+        };
+        std::vector<Dispatch> ablated;
+        int removed = 0;
+        for (auto& d : dag) { if (in_set(d.kind)) ++removed; else ablated.push_back(d); }
+        double full = timed(dag);
+        double abl_ms = timed(ablated);
+        std::printf("[decode_run] ABLATE '%s' (mean over %d reps)\n", abl, reps);
+        std::printf("  full DAG       (%3zu disp) = %.4f ms\n", dag.size(), full);
+        std::printf("  ablated DAG    (%3zu disp) = %.4f ms  (removed %d dispatches)\n",
+                    ablated.size(), abl_ms, removed);
+        std::printf("  Δ (cost of removed kinds) = %.4f ms  (%.1f%% of step, %.5f ms/disp)\n",
+                    full - abl_ms, 100.0 * (full - abl_ms) / full,
+                    removed ? (full - abl_ms) / removed : 0.0);
+        return 0;
+    }
+
+    // ── Optional RELIABLE per-dispatch attribution (PIE_ATTRIB_PERDISP=1): the same
+    //    prefix-truncation method as PIE_ATTRIB (which reconciles exactly to the real 7.56ms),
+    //    but cut at EVERY ordinal. marginal[N] = cum[N+1] - cum[N] cancels the fixed CB
+    //    submit floor; aggregating each kind's marginal across all its 24/18/6 layer-instances
+    //    denoises (independent-pass min noise averages out). This is the within-layer launch-
+    //    vs-compute split WITHOUT the broken in-encoder timestamps: the min marginal across all
+    //    kinds ≈ the pure per-dispatch launch floor; kinds near it are fusion targets, kinds
+    //    well above it are kernel-efficiency (BW) targets. ──
+    if (std::getenv("PIE_ATTRIB_PERDISP")) {
+        const int reps = std::getenv("PIE_ATTRIB_PERDISP_REPS")
+                             ? std::atoi(std::getenv("PIE_ATTRIB_PERDISP_REPS")) : 20;
+        const int nN = int(dag.size());
+        std::vector<double> cum(nN + 1, 0.0);   // cum[N] = mean gpu_exec of prefix [0..N)
+        for (int N = 0; N <= nN; ++N) {
+            std::vector<Dispatch> sub(dag.begin(), dag.begin() + N);
+            double sum = 0.0; int used = 0;
+            for (int r = 0; r < reps; ++r) {
+                StepTiming t = ctx->run_step(
+                    [&](StepEncoder& se) { encode_decode_step(se, sub, psos, force_barriers); }, 0);
+                // discard the first (warm-up) rep; mean over the rest is monotonic in prefix
+                // length (longer = more work), so marginals don't go spuriously negative.
+                if (r > 0) { sum += t.gpu_exec_ms; ++used; }
+            }
+            cum[N] = used ? sum / used : 0.0;
+        }
+        std::printf("[decode_run] PERDISP (reliable prefix-diff, mean over %d reps)\n", reps);
+        std::printf("  CB submit floor (N=0) = %.4f ms\n", cum[0]);
+        // Per-kind aggregation of marginals.
+        std::vector<double> by_kind(64, 0.0);
+        std::vector<int>    cnt_kind(64, 0);
+        std::vector<double> marg(nN, 0.0);
+        double tot = 0.0;
+        for (int o = 0; o < nN; ++o) {
+            double m = cum[o + 1] - cum[o];   // marginal cost of dispatch o
+            marg[o] = m;
+            int ki = int(dag[o].kind);
+            by_kind[ki] += m;
+            cnt_kind[ki] += 1;
+            tot += m;
+        }
+        std::printf("  Σ marginals = %.4f ms (reconciles to full-DAG cum = %.4f)\n", tot, cum[nN]);
+        // Sort kinds by total marginal (the fusion/kernel-opt ranking).
+        std::vector<int> order;
+        for (int ki = 0; ki < 64; ++ki) if (cnt_kind[ki] > 0) order.push_back(ki);
+        std::sort(order.begin(), order.end(),
+                  [&](int a, int b) { return by_kind[a] > by_kind[b]; });
+        // Pure-launch-floor estimate = the smallest mean-per-dispatch across kinds.
+        double floor_ms = 1e30;
+        for (int ki : order) floor_ms = std::min(floor_ms, by_kind[ki] / cnt_kind[ki]);
+        std::printf("  est. launch floor ≈ %.5f ms/disp (cheapest kind's mean)\n", floor_ms);
+        std::printf("  %-12s %8s %4s %9s %8s %7s  %s\n",
+                    "kind", "total_ms", "n", "ms/disp", "%step", "×floor", "verdict");
+        for (int ki : order) {
+            double per = by_kind[ki] / cnt_kind[ki];
+            double xf  = per / floor_ms;
+            const char* v = (xf < 1.6) ? "FUSE(launch)" : "KERNEL-OPT(BW)";
+            std::printf("  %-12s %8.4f %4d %9.5f %7.1f%% %6.1f×  %s\n",
+                        kind_name(Kernel(ki)), by_kind[ki], cnt_kind[ki], per,
+                        100.0 * by_kind[ki] / tot, xf, v);
+        }
+        return 0;
+    }
+
     // ── Optional PER-DISPATCH attribution (PIE_ATTRIB_TS=1): in-stream GPU timestamps
     //    (alpha's seam) mark every dispatch boundary on a single full-DAG pass; diffing
     //    consecutive resolved ticks gives each dispatch's gpu-exec ms (precise granularity
