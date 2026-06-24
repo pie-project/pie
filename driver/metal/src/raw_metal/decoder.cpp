@@ -144,16 +144,23 @@ StepTiming RawMetalDecoder::step(uint32_t token_id, uint32_t position) {
     return t;
 }
 
-const float* RawMetalDecoder::logits() const {
-    return static_cast<const float*>(b_.io[int(IoSlot::Logits)].contents());
+const uint16_t* RawMetalDecoder::logits_bf16() const {
+    return static_cast<const uint16_t*>(b_.io[int(IoSlot::Logits)].contents());
+}
+
+void RawMetalDecoder::copy_logits_f32(float* out) const {
+    const uint16_t* lb = logits_bf16();
+    for (int i = 0; i < g_.vocab; ++i) out[i] = bf16_to_f32(lb[i]);
 }
 
 uint32_t RawMetalDecoder::argmax() const {
-    const float* lo = logits();
+    const uint16_t* lb = logits_bf16();   // lm_head writes bf16, not f32
     uint32_t best = 0;
-    float bv = lo[0];
-    for (int i = 1; i < g_.vocab; ++i)
-        if (lo[i] > bv) { bv = lo[i]; best = uint32_t(i); }
+    float bv = bf16_to_f32(lb[0]);
+    for (int i = 1; i < g_.vocab; ++i) {
+        float v = bf16_to_f32(lb[i]);
+        if (v > bv) { bv = v; best = uint32_t(i); }
+    }
     return best;
 }
 

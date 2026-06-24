@@ -59,11 +59,17 @@ public:
     // read them via logits()/argmax(). State accumulates in-place. Returns the step timing.
     StepTiming step(uint32_t token_id, uint32_t position);
 
-    // Borrowed pointer to the current IO logits (f32[vocab]) produced by the last step().
-    const float* logits() const;
+    // Borrowed pointer to the current IO logits produced by the last step(). The lm_head
+    // (affine_qmv_*_bfloat16) writes BF16 (raw uint16_t bit patterns) — NOT f32, despite the
+    // IoSlot::Logits doc tag. Use copy_logits_f32() to materialize f32 for sample_tokens.
+    const uint16_t* logits_bf16() const;
 
-    // Greedy/argmax over the current logits (the deterministic bench sampler). qwen3.6 golden
-    // pos-7 cross-check = 264.
+    // Convert the current bf16 logits → f32 into `out` (must hold vocab() floats). For the
+    // runtime's sample_tokens path; greedy callers can use argmax() directly.
+    void copy_logits_f32(float* out) const;
+
+    // Greedy/argmax over the current bf16 logits (the deterministic bench sampler). qwen3.6
+    // golden pos-7 cross-check = 264.
     uint32_t argmax() const;
 
     const DecodeGeometry& geometry() const { return g_; }
