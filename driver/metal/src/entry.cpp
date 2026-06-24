@@ -16,6 +16,7 @@
 #include <cctype>
 #include <csignal>
 #include <cstdint>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -28,6 +29,7 @@
 
 #include "config.hpp"
 #include "driver_startup.hpp"
+#include "raw_metal/raw_metal_executor.hpp"
 #include "service/inproc_service.hpp"
 
 #if defined(PIE_METAL_HAS_MLX)
@@ -292,6 +294,35 @@ std::unique_ptr<ModelRuntime> build_model_runtime(
 }
 #endif  // PIE_METAL_HAS_MLX
 
+// Resolve the directory holding the raw-Metal .metal kernel sources for runtime
+// PSO compilation: PIE_METAL_KERNELS_DIR env override, else the compiled-in
+// source-tree default (packaging an installed kernels dir is a follow-up).
+std::string resolve_kernels_dir() {
+    if (const char* env = std::getenv("PIE_METAL_KERNELS_DIR");
+        env != nullptr && env[0] != '\0') {
+        return env;
+    }
+#ifdef PIE_METAL_KERNELS_DIR_DEFAULT
+    return PIE_METAL_KERNELS_DIR_DEFAULT;
+#else
+    return "";
+#endif
+}
+
+// Build the default (MLX-free) raw-Metal forward executor for the configured
+// checkpoint, or nullptr to fall back to the stub Forward.
+std::unique_ptr<pie_metal_driver::raw_metal::RawMetalExecutor>
+build_raw_executor(const pie_metal_driver::Config& cfg, const ModelFacts& facts) {
+    if (cfg.model.hf_path.empty()) {
+        std::cerr << "[pie-driver-metal] no model.hf_path configured — "
+                     "serving stub Forward\n";
+        return nullptr;
+    }
+    const std::string kernels_dir = resolve_kernels_dir();
+    return pie_metal_driver::raw_metal::make_raw_metal_executor(
+        cfg.model.hf_path, kernels_dir, facts.vocab_size);
+}
+
 // `vtable_opt` is non-null for the in-process serve loop; null for the
 // standalone self-check (`pie_driver_metal_run`), which emits caps and
 // returns without serving.
@@ -341,24 +372,46 @@ int run_impl(int argc,
     }
 
     pie_metal_driver::service::InProcService service(facts.vocab_size);
+
+    // Default compute backend: the MLX-free raw-Metal pipeline. Held here so it
+    // outlives the serve loop. The optional MLX `ModelGraph` executor is built
+    // only on explicit opt-in (PIE_METAL_USE_MLX_EXECUTOR) when compiled in.
+    std::unique_ptr<pie_metal_driver::raw_metal::RawMetalExecutor> raw_exec;
+    bool attached = false;
 #if defined(PIE_METAL_HAS_MLX)
-    std::unique_ptr<ModelRuntime> runtime = build_model_runtime(cfg, facts);
-    if (runtime) {
-        service.set_executor(runtime->executor.get());
-        std::cerr << "[pie-driver-metal] serving (arch=" << facts.arch_name
-                  << ", vocab=" << facts.vocab_size
-                  << ", MLX executor on " << (mx::default_device() == mx::Device::gpu
-                                                  ? "Metal GPU" : "CPU")
-                  << ")\n";
-    } else {
+    std::unique_ptr<ModelRuntime> runtime;
+    const char* use_mlx = std::getenv("PIE_METAL_USE_MLX_EXECUTOR");
+    const bool prefer_mlx = use_mlx != nullptr && use_mlx[0] != '\0' &&
+                            use_mlx[0] != '0';
+    if (prefer_mlx) {
+        runtime = build_model_runtime(cfg, facts);
+        if (runtime) {
+            service.set_executor(runtime->executor.get());
+            attached = true;
+            std::cerr << "[pie-driver-metal] serving (arch=" << facts.arch_name
+                      << ", vocab=" << facts.vocab_size
+                      << ", MLX executor on "
+                      << (mx::default_device() == mx::Device::gpu ? "Metal GPU"
+                                                                  : "CPU")
+                      << ")\n";
+        }
+    }
+#endif
+    if (!attached) {
+        raw_exec = build_raw_executor(cfg, facts);
+        if (raw_exec) {
+            service.set_executor(raw_exec.get());
+            attached = true;
+            std::cerr << "[pie-driver-metal] serving (arch=" << facts.arch_name
+                      << ", vocab=" << facts.vocab_size
+                      << ", raw-Metal executor)\n";
+        }
+    }
+    if (!attached) {
         std::cerr << "[pie-driver-metal] serving (arch=" << facts.arch_name
                   << ", vocab=" << facts.vocab_size
                   << ", stub forward — no model attached)\n";
     }
-#else
-    std::cerr << "[pie-driver-metal] serving (arch=" << facts.arch_name
-              << ", vocab=" << facts.vocab_size << ", stub forward)\n";
-#endif
     service.serve_forever(*server);
 
     pie_metal_driver::unregister_server(server.get());

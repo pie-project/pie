@@ -9,11 +9,9 @@ struct PieInProcRequestView;
 struct PieInProcResponseView;
 }  // namespace pie_driver
 
-#if defined(PIE_METAL_HAS_MLX)
 namespace pie_metal_driver {
-class Executor;
+class IForwardExecutor;
 }  // namespace pie_metal_driver
-#endif
 
 namespace pie_metal_driver::service {
 
@@ -22,14 +20,13 @@ namespace pie_metal_driver::service {
 // Handles the driver ABI for `pie_driver::InProcServer`:
 //
 //   * Health         → status 0.
-//   * Forward        → when an `Executor` is attached (`set_executor`, the
-//                      real MLX compute path), delegates to it: charlie's
-//                      `ModelGraph` + delta's `PagedKvCache` run on the Metal
-//                      GPU and beta's sampler packs the response. With no
-//                      executor (the fast no-MLX skeleton, or before a model
-//                      is loaded), falls back to dummy tokens / zeroed
-//                      distributions shaped exactly like the per-request
-//                      sampler stream (mirrors driver/dummy).
+//   * Forward        → when an executor is attached (`set_executor`, the real
+//                      compute path — the default MLX-free raw-Metal pipeline,
+//                      or the optional MLX `ModelGraph`), delegates to it.
+//                      With no executor (before a model is loaded), falls back
+//                      to dummy tokens / zeroed distributions shaped exactly
+//                      like the per-request sampler stream (mirrors
+//                      driver/dummy).
 //   * Copy / KV / RS → not-supported status (no KV cache yet — delta wires it).
 //   * Adapter        → no-op success.
 //
@@ -52,18 +49,14 @@ public:
 
     std::uint64_t handled() const noexcept { return handled_; }
 
-#if defined(PIE_METAL_HAS_MLX)
     // Attach the live forward pipeline. When set, the Forward arm delegates to
     // `exec->run_forward`; the pointee must outlive the serve loop.
-    void set_executor(Executor* exec) noexcept { executor_ = exec; }
-#endif
+    void set_executor(IForwardExecutor* exec) noexcept { executor_ = exec; }
 
 private:
     std::uint32_t vocab_size_;
     std::uint64_t handled_ = 0;
-#if defined(PIE_METAL_HAS_MLX)
-    Executor* executor_ = nullptr;
-#endif
+    IForwardExecutor* executor_ = nullptr;
 };
 
 }  // namespace pie_metal_driver::service

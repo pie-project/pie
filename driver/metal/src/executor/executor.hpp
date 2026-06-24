@@ -22,6 +22,7 @@
 #include <pie_schema/response_builder.hpp>
 #include <pie_schema/view.hpp>
 
+#include "forward_executor.hpp"
 #include "kernels/sampling.hpp"
 #include "model/model_graph.hpp"
 #include "model/model_kv.hpp"
@@ -29,7 +30,7 @@
 
 namespace pie_metal_driver {
 
-class Executor {
+class Executor : public IForwardExecutor {
 public:
     Executor(model::ModelGraph& graph, KvCacheView& kv);
 
@@ -40,7 +41,7 @@ public:
     // scratch backs the response slices until the next build()).
     void run_forward(const pie_driver::PieForwardRequestView& req,
                      pie_driver::ResponseBuilder& builder,
-                     pie_driver::PieForwardResponseView& out);
+                     pie_driver::PieForwardResponseView& out) override;
 
 private:
     // Reusable host staging buffers (refilled per fire; their storage backs

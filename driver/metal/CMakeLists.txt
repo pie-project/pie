@@ -92,13 +92,33 @@ if(PIE_METAL_WITH_MLX)
     ${CMAKE_CURRENT_SOURCE_DIR}/src/loader/*.mm)
 endif()
 
+# raw_metal (alpha/beta/charlie/delta-owned): the MLX-free raw Metal-4 compute
+# pipeline — the DEFAULT forward backend baked into the worker-embedded lib.
+# GLOB the compute TUs so peers add .cpp/.mm WITHOUT editing this file, then
+# EXCLUDE the standalone driver/bench/probe mains (each carries its own
+# `int main()` and must not link into the lib). Convention: any new standalone
+# executable TU must match the exclude regex below (`*_run.cpp`, `*_probe.cpp`,
+# `harness*.cpp`, `bench_*.cpp`).
+file(GLOB PIE_METAL_RAW_SOURCES CONFIGURE_DEPENDS
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/raw_metal/*.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/raw_metal/*.mm)
+list(FILTER PIE_METAL_RAW_SOURCES EXCLUDE REGEX
+  "/(.*_run|.*_probe|harness.*|bench_.*)\\.cpp$")
+
 add_library(pie_driver_metal_lib STATIC
   ${PIE_METAL_EXPLICIT_SOURCES}
-  ${PIE_METAL_GLOB_SOURCES})
+  ${PIE_METAL_GLOB_SOURCES}
+  ${PIE_METAL_RAW_SOURCES})
+
+# raw_metal's Objective-C++ TU (mtl4_context.mm) needs ARC.
+set_source_files_properties(
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/raw_metal/mtl4_context.mm
+  PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
 
 target_include_directories(pie_driver_metal_lib
   PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/raw_metal
     ${CMAKE_CURRENT_SOURCE_DIR}/../common/include
     ${PIE_SCHEMA_INCLUDE_DIR}
     ${PIE_IPC_INCLUDE_DIR})
@@ -106,6 +126,12 @@ target_include_directories(pie_driver_metal_lib
 target_compile_options(pie_driver_metal_lib PRIVATE
   $<$<COMPILE_LANGUAGE:CXX>:-Wall -Wextra -Wno-unused-parameter>
   $<$<COMPILE_LANGUAGE:OBJCXX>:-Wall -Wextra -Wno-unused-parameter>)
+
+# Compiled-in fallback for the raw-Metal .metal kernel sources (runtime PSO
+# compilation). Overridable at run time via PIE_METAL_KERNELS_DIR. Installed
+# packaging of the kernels dir is a follow-up.
+target_compile_definitions(pie_driver_metal_lib PRIVATE
+  PIE_METAL_KERNELS_DIR_DEFAULT="${CMAKE_CURRENT_SOURCE_DIR}/src/raw_metal/kernels")
 
 target_link_libraries(pie_driver_metal_lib PUBLIC
   CLI11::CLI11
