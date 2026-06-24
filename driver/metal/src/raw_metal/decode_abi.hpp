@@ -179,6 +179,51 @@ enum class GdnCore : uint8_t {
     Params       = 11, // GdnCoreParams& (constant, static geometry, I1-safe)
 };
 
+// ── GdnCore prep-dispatch split (PIE_GDN_PREP, A/B behind the flag) ──────────
+// Kills the in-kernel share's residual 4× redundancy (Vd/32 tiles) by hoisting the
+// dv-INDEPENDENT q/k path out of the per-dv recurrent kernel into a single prologue
+// dispatch computed ONCE per (req, v-head) — full 128×→1× elimination.
+//   GdnPrep   : q/k conv1d+silu, l2norm, q-prescale, gating(decay,beta) → fp32 scratch
+//               + q/k conv_state writeback. grid {32,1,R·Hv} tg {32,1,1}
+//               (one simdgroup/head; 32 lanes × n_per_t=4 cover Dk=128).
+//   GdnCoreRec: slimmed recurrent step — reads PreQ/PreK/PreGate from scratch (no
+//               recompute), owns the per-dv v convsilu + recurrent RMW + v conv_state
+//               writeback. grid {32,Vd,R·Hv} tg {32,4,1} (no dv-tile share needed).
+// Bit-exact vs the in-kernel share: fp32 scratch preserves the exact `sh_q/sh_k` float
+// values, same 32-lane Dk=128 simd_sum geometry. new_conv_state coverage invariant
+// preserved: prep writes q/k channels once/head, rec writes v per-dv → each once.
+enum class GdnPrep : uint8_t {
+    Mixed        = 0,  // in-proj conv input (T)
+    ConvState    = 1,  // conv history (float, RO)
+    ConvW        = 2,  // conv1d weight (T)
+    ConvB        = 3,  // conv1d bias (T)
+    ALog         = 4,  // A_log decay param (float)
+    DtBias       = 5,  // dt_bias gating param (T)
+    AGate        = 6,  // a_gate projection (T)
+    BGate        = 7,  // b_gate projection (T)
+    PreQ         = 8,  // out: gdn_pre_q[R,Hv,Dk] fp32 (normalized + 1/sqrt(Dk)-prescaled q)
+    PreK         = 9,  // out: gdn_pre_k[R,Hv,Dk] fp32 (normalized k)
+    PreGate      = 10, // out: gdn_pre_gate[R,Hv,2] fp32 (decay, beta)
+    ConvStateOut = 11, // new_conv_state q/k channels (float, out)
+    Params       = 12, // GdnCoreParams& (constant)
+};
+
+// Slimmed recurrent core (prep-path). Buffers 0-5 MATCH bind::GdnCore (minimal
+// heap_bind churn); old ALog/DtBias/AGate/BGate fold into PreGate; Params 11→10.
+enum class GdnCoreRecurrent : uint8_t {
+    Mixed        = 0,  // in-proj conv input (v channels) (T)
+    ConvState    = 1,  // conv history (float, RO) — v
+    RecurrentState = 2,  // [Vh,Vd,Kd] (float, in/out, in-place)
+    CoreOut      = 3,  // core_out[gdn_v_total] (out, T)
+    ConvW        = 4,  // conv1d weight (for v convsilu) (T)
+    ConvB        = 5,  // conv1d bias (T)
+    PreQ         = 6,  // in: gdn_pre_q from GdnPrep (fp32)
+    PreK         = 7,  // in: gdn_pre_k (fp32)
+    PreGate      = 8,  // in: gdn_pre_gate (fp32)
+    ConvStateOut = 9,  // new_conv_state v channels (float, out)
+    Params       = 10, // GdnCoreParams& (constant)
+};
+
 // gated RMSNorm (GDN; golden `gdn_core` = post-norm): Out = (1+0)·rmsnorm(X)·silu(Z)
 // over V_d per V_head. W = gate_norm_w (RAW, F32, NO +1). Buffer 4 = GatedRmsParams
 // {eps, vd}. Gates against golden `gdn_core` (gated-RMSNorm folded in).
@@ -204,7 +249,7 @@ enum class Argmax : uint8_t { Logits = 0, NextToken = 1 };
 enum class Kernel : uint8_t {
     EmbedGather,
     // GDN in-projection (4 separate projections: qkv/z 4-bit, a/b DENSE bf16):
-    Rms, QmvIn, QmvInZ, GdnInA, GdnInB, GdnCore, GatedRms, QmvOut, Residual,
+    Rms, QmvIn, QmvInZ, GdnInA, GdnInB, GdnPrep, GdnCore, GatedRms, QmvOut, Residual,
     // Full-attention block:
     QmvQ, QSplit, QmvK, QmvV, QNorm, KNorm, Rope, RopeK, KvAppend, Sdpa, AttnGate, QmvO,
     // Shared SwiGLU MLP block:

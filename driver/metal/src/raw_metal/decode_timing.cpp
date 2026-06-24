@@ -16,6 +16,7 @@ const char* kernel_name(Kernel k) {
         case Kernel::QmvInZ:      return "qmv_in_z";
         case Kernel::GdnInA:      return "gdn_in_a";
         case Kernel::GdnInB:      return "gdn_in_b";
+        case Kernel::GdnPrep:     return "gdn_prep";
         case Kernel::GdnCore:     return "gdn_core";
         case Kernel::GatedRms:    return "gated_rms";
         case Kernel::QmvOut:      return "qmv_out";

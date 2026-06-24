@@ -45,7 +45,8 @@ bool load_decode_psos(RawMetalContext& ctx,
                       DecodeStepPsos& out,
                       bool with_argmax,
                       std::string* err,
-                      bool fuse_residual) {
+                      bool fuse_residual,
+                      bool gdn_prep) {
     const std::string dir = kernels_dir.empty() || kernels_dir.back() == '/'
                                 ? kernels_dir : kernels_dir + "/";
     for (const PsoSpec& spec : specs()) {
@@ -64,6 +65,22 @@ bool load_decode_psos(RawMetalContext& ctx,
             if (err) *err = "affine_qmv_fast_residual_bfloat16_gs_64_b_4 (quantized_qmv.metal)";
             return false;
         }
+    }
+    if (gdn_prep) {
+        // Prep-dispatch split (PIE_GDN_PREP): GdnPrep computes the q/k path once/head;
+        // GdnCore is replaced by the slimmed recurrent kernel reading prep scratch.
+        Pso prep = ctx.compile_pso_from_file(dir + "gdn_prep.metal", "gdn_prep_bfloat16");
+        if (!prep.valid()) {
+            if (err) *err = "gdn_prep_bfloat16 (gdn_prep.metal)";
+            return false;
+        }
+        Pso rec = ctx.compile_pso_from_file(dir + "gdn_prep.metal", "gdn_core_recurrent_bfloat16");
+        if (!rec.valid()) {
+            if (err) *err = "gdn_core_recurrent_bfloat16 (gdn_prep.metal)";
+            return false;
+        }
+        out[Kernel::GdnPrep] = prep;
+        out[Kernel::GdnCore] = rec;  // override the in-kernel-share gdn_core PSO
     }
     if (with_argmax) {
         // Argmax is an optional I3 substrate; its kernel is not yet ported. When it lands,

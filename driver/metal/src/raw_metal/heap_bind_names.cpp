@@ -31,7 +31,8 @@ void push_quant(std::vector<WeightBind>& out, const std::string& base) {
 
 }  // namespace
 
-std::vector<WeightBind> weight_binds(Kernel kind, int layer, const DecodeGeometry& g) {
+std::vector<WeightBind> weight_binds(Kernel kind, int layer, const DecodeGeometry& g,
+                                     bool gdn_prep) {
     (void)g;
     std::vector<WeightBind> w;
     const std::string p = layer >= 0 ? layer_prefix(layer) : std::string();
@@ -84,13 +85,27 @@ std::vector<WeightBind> weight_binds(Kernel kind, int layer, const DecodeGeometr
             w.push_back({static_cast<uint8_t>(bind::Dense::W), p + "linear_attn.in_proj_b.weight"});
             break;
 
+        // ── GDN prep-dispatch split (PIE_GDN_PREP) ──
+        //   GdnPrep: conv1d.weight(2) + A_log(4) + dt_bias(5) load-once weights.
+        //   GdnCore-recurrent: ONLY conv1d.weight(4) — A_log/dt_bias fold into PreGate scratch.
+        case Kernel::GdnPrep:
+            w.push_back({static_cast<uint8_t>(bind::GdnPrep::ConvW),  p + "linear_attn.conv1d.weight"});
+            w.push_back({static_cast<uint8_t>(bind::GdnPrep::ALog),   p + "linear_attn.A_log"});
+            w.push_back({static_cast<uint8_t>(bind::GdnPrep::DtBias), p + "linear_attn.dt_bias"});
+            break;
+
         // ── GDN fused core: conv1d.weight + A_log + dt_bias are load-once weights.
         //    ConvB has NO checkpoint tensor (conv1d is bias-less) -> zeroed slot (bound in
         //    bind_decode_dag). ConvState/RecurrentState/ConvStateOut are persistent STATE.
         case Kernel::GdnCore:
-            w.push_back({static_cast<uint8_t>(bind::GdnCore::ConvW), p + "linear_attn.conv1d.weight"});
-            w.push_back({static_cast<uint8_t>(bind::GdnCore::ALog),  p + "linear_attn.A_log"});
-            w.push_back({static_cast<uint8_t>(bind::GdnCore::DtBias), p + "linear_attn.dt_bias"});
+            if (gdn_prep) {  // recurrent variant: conv1d.weight only (at slimmed buffer 4)
+                w.push_back({static_cast<uint8_t>(bind::GdnCoreRecurrent::ConvW),
+                             p + "linear_attn.conv1d.weight"});
+            } else {
+                w.push_back({static_cast<uint8_t>(bind::GdnCore::ConvW), p + "linear_attn.conv1d.weight"});
+                w.push_back({static_cast<uint8_t>(bind::GdnCore::ALog),  p + "linear_attn.A_log"});
+                w.push_back({static_cast<uint8_t>(bind::GdnCore::DtBias), p + "linear_attn.dt_bias"});
+            }
             break;
 
         // ── GDN gated-RMSNorm gate weight (bind::GatedRms W=2 = linear_attn.norm) ──

@@ -39,6 +39,11 @@ constexpr uint8_t SdpaQ = 0, SdpaOut = 3;     // bind::Sdpa (K/V from KV region)
 constexpr uint8_t AttnGateAttn = 0, AttnGateGate = 1;  // bind::AttnGate (in-place)
 constexpr uint8_t KvAppendK = 0, KvAppendV = 1;        // bind::KvAppend (out -> KV pages)
 constexpr uint8_t GdnMixed = 0, GdnCoreOut = 3, GdnAGate = 8, GdnBGate = 9;  // bind::GdnCore
+// Prep-dispatch split (PIE_GDN_PREP): GdnPrep scratch binds + GdnCore-recurrent scratch binds.
+constexpr uint8_t GdnPrepMixed = 0, GdnPrepAGate = 6, GdnPrepBGate = 7,
+                  GdnPrepPreQ = 8, GdnPrepPreK = 9, GdnPrepPreGate = 10;     // bind::GdnPrep
+constexpr uint8_t GdnRecMixed = 0, GdnRecCoreOut = 3,
+                  GdnRecPreQ = 6, GdnRecPreK = 7, GdnRecPreGate = 8;         // bind::GdnCoreRecurrent
 constexpr uint8_t GatedRmsX = 0, GatedRmsZ = 1, GatedRmsOut = 3;  // bind::GatedRms
 constexpr uint8_t ResidX = 0, ResidR = 1, ResidOut = 2;  // bind::Residual
 constexpr uint8_t SiluGate = 0, SiluUp = 1, SiluOut = 2;  // bind::SiluMul
@@ -58,6 +63,8 @@ ScratchSchedule build_scratch_schedule(const std::vector<Dispatch>& dag,
     int normed = -1;    // last Rms/FfnRms/FinalRms output feeding projections
     int q = -1, gate = -1, kk = -1, vv = -1, attn = -1;        // attn temporaries
     int mixed = -1, zg = -1, ag = -1, bg = -1, core = -1, gnorm = -1, gdnout = -1;  // GDN
+    int pq = -1, pk = -1, pg = -1;          // GDN prep-dispatch scratch (PIE_GDN_PREP)
+    bool prep_pending = false;              // a GdnPrep preceded this layer's GdnCore
     int gp = -1, up = -1, hh = -1, dn = -1;                    // mlp temporaries
 
     auto rd = [&](int ord, uint8_t b, int val) { uses.push_back({ord, b, val, false}); };
@@ -92,10 +99,23 @@ ScratchSchedule build_scratch_schedule(const std::vector<Dispatch>& dag,
             case Kernel::GdnInB:
                 bg = fresh(); rd(o, bi::DenseX, normed); wr(o, bi::DenseOut, bg);
                 break;
+            case Kernel::GdnPrep:  // dv-independent q/k path → fp32 scratch (once/head)
+                pq = fresh(); pk = fresh(); pg = fresh();
+                rd(o, bi::GdnPrepMixed, mixed); rd(o, bi::GdnPrepAGate, ag); rd(o, bi::GdnPrepBGate, bg);
+                wr(o, bi::GdnPrepPreQ, pq); wr(o, bi::GdnPrepPreK, pk); wr(o, bi::GdnPrepPreGate, pg);
+                prep_pending = true;
+                break;
             case Kernel::GdnCore:
                 core = fresh();
-                rd(o, bi::GdnMixed, mixed); rd(o, bi::GdnAGate, ag); rd(o, bi::GdnBGate, bg);
-                wr(o, bi::GdnCoreOut, core);
+                if (prep_pending) {  // recurrent variant: reads prep's pre_q/k/gate scratch
+                    rd(o, bi::GdnRecMixed, mixed);
+                    rd(o, bi::GdnRecPreQ, pq); rd(o, bi::GdnRecPreK, pk); rd(o, bi::GdnRecPreGate, pg);
+                    wr(o, bi::GdnRecCoreOut, core);
+                    prep_pending = false;
+                } else {
+                    rd(o, bi::GdnMixed, mixed); rd(o, bi::GdnAGate, ag); rd(o, bi::GdnBGate, bg);
+                    wr(o, bi::GdnCoreOut, core);
+                }
                 break;
             case Kernel::GatedRms:
                 gnorm = fresh();

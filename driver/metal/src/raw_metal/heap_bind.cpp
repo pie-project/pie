@@ -105,7 +105,8 @@ inline void bind_slot(RawMetalContext& ctx, int ord, uint8_t idx, const SlotHand
 // Walk beta's DAG; bind delta's weight/state/KV/IO slots for each dispatch by ordinal.
 // (Robust to beta's ordering — reacts to each dispatch's kind+layer, not a fixed sequence.)
 void bind_decode_dag(RawMetalContext& ctx, const BoundDecode& b,
-                     const std::vector<Dispatch>& dag, const DecodeGeometry& g) {
+                     const std::vector<Dispatch>& dag, const DecodeGeometry& g,
+                     bool gdn_prep) {
     auto io = [&](IoSlot s) -> const SlotHandle& { return b.io[static_cast<int>(s)]; };
 
     for (const auto& d : dag) {
@@ -113,7 +114,7 @@ void bind_decode_dag(RawMetalContext& ctx, const BoundDecode& b,
         const int L = d.layer;
 
         // (a) load-once weights for this dispatch.
-        for (const auto& wb : weight_binds(d.kind, L, g)) {
+        for (const auto& wb : weight_binds(d.kind, L, g, gdn_prep)) {
             auto it = b.weights.find(wb.tensor);
             if (it == b.weights.end())
                 throw std::runtime_error("bind: unstaged weight " + wb.tensor);
@@ -126,12 +127,27 @@ void bind_decode_dag(RawMetalContext& ctx, const BoundDecode& b,
                 bind_slot(ctx, ord, (uint8_t)bind::Embed::TokenId, io(IoSlot::TokenId));
                 break;
 
+            case Kernel::GdnPrep: {  // prep-dispatch (PIE_GDN_PREP): q/k path + q/k conv_state writeback
+                const auto& s = b.gdn[L];
+                bind_slot(ctx, ord, (uint8_t)bind::GdnPrep::ConvState,    s.conv_state);
+                bind_slot(ctx, ord, (uint8_t)bind::GdnPrep::ConvStateOut, s.conv_state_out);
+                bind_slot(ctx, ord, (uint8_t)bind::GdnPrep::ConvB,        s.conv_bias_zero);
+                break;
+            }
+
             case Kernel::GdnCore: {
                 const auto& s = b.gdn[L];
-                bind_slot(ctx, ord, (uint8_t)bind::GdnCore::ConvState,    s.conv_state);
-                bind_slot(ctx, ord, (uint8_t)bind::GdnCore::RecurrentState, s.recurrent_state);
-                bind_slot(ctx, ord, (uint8_t)bind::GdnCore::ConvStateOut, s.conv_state_out);
-                bind_slot(ctx, ord, (uint8_t)bind::GdnCore::ConvB,        s.conv_bias_zero);
+                if (gdn_prep) {  // slimmed recurrent: ConvStateOut at 9, no ALog/DtBias/AGate/BGate
+                    bind_slot(ctx, ord, (uint8_t)bind::GdnCoreRecurrent::ConvState,      s.conv_state);
+                    bind_slot(ctx, ord, (uint8_t)bind::GdnCoreRecurrent::RecurrentState, s.recurrent_state);
+                    bind_slot(ctx, ord, (uint8_t)bind::GdnCoreRecurrent::ConvStateOut,   s.conv_state_out);
+                    bind_slot(ctx, ord, (uint8_t)bind::GdnCoreRecurrent::ConvB,          s.conv_bias_zero);
+                } else {
+                    bind_slot(ctx, ord, (uint8_t)bind::GdnCore::ConvState,    s.conv_state);
+                    bind_slot(ctx, ord, (uint8_t)bind::GdnCore::RecurrentState, s.recurrent_state);
+                    bind_slot(ctx, ord, (uint8_t)bind::GdnCore::ConvStateOut, s.conv_state_out);
+                    bind_slot(ctx, ord, (uint8_t)bind::GdnCore::ConvB,        s.conv_bias_zero);
+                }
                 break;
             }
 

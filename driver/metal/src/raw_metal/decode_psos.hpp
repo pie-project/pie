@@ -25,6 +25,7 @@ bool load_decode_psos(RawMetalContext& ctx,
                       DecodeStepPsos& out,
                       bool with_argmax = false,
                       std::string* err = nullptr,
-                      bool fuse_residual = false);
+                      bool fuse_residual = false,
+                      bool gdn_prep = false);
 
 }  // namespace pie_metal_driver::raw_metal

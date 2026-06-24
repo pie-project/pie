@@ -72,7 +72,7 @@ bool is_qmv(Kernel k) { return qmv_kn(k, DecodeGeometry{}).N != 0; }
 }  // namespace
 
 int bind_decode_consts(RawMetalContext& ctx, const std::vector<Dispatch>& dag,
-                       const DecodeGeometry& g, int max_ctx) {
+                       const DecodeGeometry& g, int max_ctx, bool gdn_prep) {
     int count = 0;
 
     // rope: x[h*head_dim + i], rotary half from grid.x. scale=1.0 (qwen3.6 default mrope),
@@ -122,14 +122,27 @@ int bind_decode_consts(RawMetalContext& ctx, const std::vector<Dispatch>& dag,
                 bind_const<uint32_t>(ctx, ord, (uint8_t)bind::Dense::N, (uint32_t)g.gdn_v_heads, &count);
                 break;
 
-            case Kernel::GdnCore:
-                bind_const<GdnCoreParams>(ctx, ord, (uint8_t)bind::GdnCore::Params,
-                    GdnCoreParams{g.gdn_k_dim, g.gdn_v_dim, g.gdn_k_heads, g.gdn_v_heads,
-                                  g.gdn_conv_dim, g.gdn_conv_k,
-                                  /*q_off*/0, /*k_off*/g.gdn_k_heads * g.gdn_k_dim,
-                                  /*v_off*/2 * g.gdn_k_heads * g.gdn_k_dim,
-                                  g.eps, 1.0f / std::sqrt(float(g.gdn_k_dim))}, &count);
+            case Kernel::GdnPrep: {
+                const GdnCoreParams gp{g.gdn_k_dim, g.gdn_v_dim, g.gdn_k_heads, g.gdn_v_heads,
+                                       g.gdn_conv_dim, g.gdn_conv_k,
+                                       /*q_off*/0, /*k_off*/g.gdn_k_heads * g.gdn_k_dim,
+                                       /*v_off*/2 * g.gdn_k_heads * g.gdn_k_dim,
+                                       g.eps, 1.0f / std::sqrt(float(g.gdn_k_dim))};
+                bind_const<GdnCoreParams>(ctx, ord, (uint8_t)bind::GdnPrep::Params, gp, &count);
                 break;
+            }
+
+            case Kernel::GdnCore: {
+                const GdnCoreParams gp{g.gdn_k_dim, g.gdn_v_dim, g.gdn_k_heads, g.gdn_v_heads,
+                                       g.gdn_conv_dim, g.gdn_conv_k,
+                                       /*q_off*/0, /*k_off*/g.gdn_k_heads * g.gdn_k_dim,
+                                       /*v_off*/2 * g.gdn_k_heads * g.gdn_k_dim,
+                                       g.eps, 1.0f / std::sqrt(float(g.gdn_k_dim))};
+                const uint8_t pbuf = gdn_prep ? (uint8_t)bind::GdnCoreRecurrent::Params
+                                              : (uint8_t)bind::GdnCore::Params;
+                bind_const<GdnCoreParams>(ctx, ord, pbuf, gp, &count);
+                break;
+            }
 
             case Kernel::GatedRms:
                 bind_const<GatedRmsParams>(ctx, ord, (uint8_t)bind::GatedRms::Params,

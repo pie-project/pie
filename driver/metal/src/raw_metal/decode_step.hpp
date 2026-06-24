@@ -55,7 +55,7 @@ struct DecodeStepPsos {
 // helpers (GdnCore's {32,Vd,Vh}/{32,4,1} is beta's, in gdn_core.metal). with_argmax
 // appends the optional device-argmax substrate (I3); logits are ALWAYS produced.
 std::vector<Dispatch> build_decode_dag(const DecodeGeometry& g, bool with_argmax = false,
-                                       bool fuse_residual = false);
+                                       bool fuse_residual = false, bool gdn_prep = false);
 
 // ── GPU-exec attribution hook (optimization-phase prep; off by default) ───────
 // When provided to encode_decode_step, the walker emits a timestamp mark at boundary i

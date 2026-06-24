@@ -31,10 +31,21 @@ LD gdncore_ld(const DecodeGeometry& g) {
     return { Grid{32, uint32_t(g.gdn_v_dim), uint32_t(g.gdn_v_heads)}, Threadgroup{32, 32, 1} };
 }
 
+// Prep-dispatch split (PIE_GDN_PREP): GdnPrep computes the dv-INDEPENDENT q/k path
+// ONCE per (req,v-head) — one simdgroup/head (32 lanes × n_per_t=4 cover Dk=128).
+LD gdn_prep_ld(const DecodeGeometry& g) {
+    return { Grid{32, 1, uint32_t(g.gdn_v_heads)}, Threadgroup{32, 1, 1} };
+}
+// Slimmed recurrent core (PIE_GDN_PREP): per-(req,v-head,v-dim) RMW reading the prep
+// scratch — no dv-tile share needed, so tg drops back to {32,4,1}.
+LD gdncore_rec_ld(const DecodeGeometry& g) {
+    return { Grid{32, uint32_t(g.gdn_v_dim), uint32_t(g.gdn_v_heads)}, Threadgroup{32, 4, 1} };
+}
+
 }  // namespace
 
 std::vector<Dispatch> build_decode_dag(const DecodeGeometry& g, bool with_argmax,
-                                       bool fuse_residual) {
+                                       bool fuse_residual, bool gdn_prep) {
     const int q_dim  = g.n_q_heads * g.head_dim;   // 2048 (post-split query)
     const int qg_dim = 2 * q_dim;                  // 4096 (q_proj is 2×-wide [query|gate])
     const int kv_dim = g.n_kv_heads * g.head_dim;  // 512
@@ -80,7 +91,14 @@ std::vector<Dispatch> build_decode_dag(const DecodeGeometry& g, bool with_argmax
             emit(Kernel::QmvInZ,  L, qmv(g.gdn_v_total));              // 2048, 4-bit (gate z)
             { LD l; dense_gemv_dispatch(g.gdn_v_heads, l.grid, l.tg); emit(Kernel::GdnInA, L, l); }  // dense bf16 [16,1024]
             { LD l; dense_gemv_dispatch(g.gdn_v_heads, l.grid, l.tg); emit(Kernel::GdnInB, L, l); }
-            emit(Kernel::GdnCore, L, gdncore_ld(g));                   // beta's fused 1-dispatch core
+            if (gdn_prep) {
+                // Prep-dispatch split: dv-independent q/k path hoisted to GdnPrep (once/head),
+                // then the slimmed recurrent core reads its fp32 scratch (full 128×→1×).
+                emit(Kernel::GdnPrep, L, gdn_prep_ld(g));
+                emit(Kernel::GdnCore, L, gdncore_rec_ld(g));           // gdn_core_recurrent
+            } else {
+                emit(Kernel::GdnCore, L, gdncore_ld(g));               // beta's fused 1-dispatch core
+            }
             { LD l; gated_rms_dispatch(g.gdn_v_heads, g.gdn_v_dim, l.grid, l.tg); emit(Kernel::GatedRms, L, l); }
             emit(Kernel::QmvOut,  L, qmv(g.hidden));                   // gdn_out
             if (fuse_residual) dag.back().fuse_residual = true;

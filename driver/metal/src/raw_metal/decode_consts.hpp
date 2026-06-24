@@ -32,7 +32,7 @@ struct Dispatch;  // beta: decode_step.hpp
 // ordinal. `max_ctx` MUST match the value passed to plan_heap (KV cache stride basis).
 // Returns the number of const slots allocated (for accounting / the heap budget check).
 int bind_decode_consts(RawMetalContext& ctx, const std::vector<Dispatch>& dag,
-                       const DecodeGeometry& g, int max_ctx);
+                       const DecodeGeometry& g, int max_ctx, bool gdn_prep = false);
 
 // Heap headroom (bytes) the const region needs on top of plan_heap().total. Conservative
 // upper bound (one 256-aligned slot per possible const buffer across the whole DAG).

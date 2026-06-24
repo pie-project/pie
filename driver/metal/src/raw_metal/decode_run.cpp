@@ -80,7 +80,7 @@ int out_buffer_id(const ScratchSchedule& sched, int ordinal, uint8_t out_bind_in
 }
 
 const char* kind_name(Kernel k) {
-    static const char* n[] = {"EmbedGather","Rms","QmvIn","QmvInZ","GdnInA","GdnInB","GdnCore",
+    static const char* n[] = {"EmbedGather","Rms","QmvIn","QmvInZ","GdnInA","GdnInB","GdnPrep","GdnCore",
         "GatedRms","QmvOut","Residual","QmvQ","QSplit","QmvK","QmvV","QNorm","KNorm","Rope",
         "RopeK","KvAppend","Sdpa","AttnGate","QmvO","FfnRms","QmvGate","QmvUp","SiluMul",
         "QmvDown","LayerOut","FinalRms","QmvLmHead","Argmax"};
@@ -213,9 +213,12 @@ int main(int argc, char** argv) {
     const HeapPlan plan = plan_heap(g, weights_bytes, max_ctx);
 
     const bool fuse_residual = std::getenv("PIE_FUSE_RESIDUAL") != nullptr;
-    const std::vector<Dispatch> dag = build_decode_dag(g, /*with_argmax=*/false, fuse_residual);
+    const bool gdn_prep = std::getenv("PIE_GDN_PREP") != nullptr;
+    const std::vector<Dispatch> dag = build_decode_dag(g, /*with_argmax=*/false, fuse_residual, gdn_prep);
     if (fuse_residual)
         std::printf("[decode_run] PIE_FUSE_RESIDUAL: residual folded into QmvO/QmvOut/QmvDown epilogue\n");
+    if (gdn_prep)
+        std::printf("[decode_run] PIE_GDN_PREP: GdnCore split into GdnPrep (once/head) + recurrent (128x->1x q/k)\n");
 
     if (std::getenv("PIE_DAG_DUMP")) {
         for (const auto& d : dag)
@@ -264,7 +267,7 @@ int main(int argc, char** argv) {
 
     // ── Stage weights/state/KV/IO; bind weight/state/KV/IO slots by ordinal ──
     BoundDecode b = stage_decode_weights(*ctx, view, g, plan);
-    bind_decode_dag(*ctx, b, dag, g);
+    bind_decode_dag(*ctx, b, dag, g, gdn_prep);
 
     // ── Allocate the scratch pool (colors_used slots) and hand to beta's bind pass.
     //    Under no_recycle this is one buffer per value (~362); else SCRATCH_POOL=6. ──
@@ -279,13 +282,13 @@ int main(int argc, char** argv) {
     bind_scratch(*ctx, dag, sched, pool.data(), int(pool.size()));
 
     // ── delta's geometry const params (the previously-unbound `constant&` args) ──
-    const int n_consts = bind_decode_consts(*ctx, dag, g, max_ctx);
+    const int n_consts = bind_decode_consts(*ctx, dag, g, max_ctx, gdn_prep);
     std::printf("[decode_run] bound %d const-param slots\n", n_consts);
 
     // ── Compile the kernel PSOs ──
     DecodeStepPsos psos;
     std::string err;
-    if (!load_decode_psos(*ctx, kernels_dir, psos, /*with_argmax=*/false, &err, fuse_residual)) {
+    if (!load_decode_psos(*ctx, kernels_dir, psos, /*with_argmax=*/false, &err, fuse_residual, gdn_prep)) {
         std::fprintf(stderr, "[decode_run] PSO load failed: %s\n", err.c_str());
         return 1;
     }
@@ -374,21 +377,34 @@ int main(int argc, char** argv) {
     // buffers, so the conv history must be advanced token-to-token by swapping their bind
     // each step (step i reads what step i-1 wrote). Bound once = stale zeros every step =
     // wrong GDN output at pos>0. recurrent_state is in-place RMW (auto-accumulates).
-    std::vector<std::pair<int, int>> gdn_disp;  // (ordinal, layer)
+    struct GdnDisp { int ord; int layer; Kernel kind; };
+    std::vector<GdnDisp> gdn_disp;  // GdnCore (+ GdnPrep when split): both touch conv_state
     for (const auto& d : dag)
-        if (d.kind == Kernel::GdnCore) gdn_disp.emplace_back(d.ordinal, d.layer);
+        if (d.kind == Kernel::GdnCore || d.kind == Kernel::GdnPrep)
+            gdn_disp.push_back({d.ordinal, d.layer, d.kind});
 
     StepTiming last{};
     for (size_t i = 0; i < ids.size(); ++i) {
         write_u32(b.io[int(IoSlot::TokenId)], ids[i]);
         write_u32(b.io[int(IoSlot::Position)], uint32_t(i));
         write_u32(b.io[int(IoSlot::SeqLen)],  uint32_t(i + 1));
-        for (auto [ord, L] : gdn_disp) {                 // even step: read A→write B; odd: B→A
+        for (const auto& gd : gdn_disp) {                // even step: read A→write B; odd: B→A
             const bool even = (i % 2 == 0);
-            const SlotHandle& A = b.gdn[L].conv_state;
-            const SlotHandle& C = b.gdn[L].conv_state_out;
-            ctx->arg_bind_ordinal(ord, (uint8_t)bind::GdnCore::ConvState,    even ? A : C);
-            ctx->arg_bind_ordinal(ord, (uint8_t)bind::GdnCore::ConvStateOut, even ? C : A);
+            const SlotHandle& A = b.gdn[gd.layer].conv_state;
+            const SlotHandle& C = b.gdn[gd.layer].conv_state_out;
+            uint8_t cs_bind, cso_bind;
+            if (gd.kind == Kernel::GdnPrep) {            // prep writes q/k conv_state channels
+                cs_bind  = (uint8_t)bind::GdnPrep::ConvState;
+                cso_bind = (uint8_t)bind::GdnPrep::ConvStateOut;
+            } else if (gdn_prep) {                       // recurrent writes v conv_state channels
+                cs_bind  = (uint8_t)bind::GdnCoreRecurrent::ConvState;
+                cso_bind = (uint8_t)bind::GdnCoreRecurrent::ConvStateOut;
+            } else {                                     // in-kernel-share GdnCore (production)
+                cs_bind  = (uint8_t)bind::GdnCore::ConvState;
+                cso_bind = (uint8_t)bind::GdnCore::ConvStateOut;
+            }
+            ctx->arg_bind_ordinal(gd.ord, cs_bind,  even ? A : C);
+            ctx->arg_bind_ordinal(gd.ord, cso_bind, even ? C : A);
         }
         if (perstep) {
             for (const auto& d : dag) {

@@ -55,7 +55,8 @@ struct WeightBind {
 // kinds (QSplit/Rope/RopeK/Sdpa-Q/AttnGate/SiluMul/Residual/KvAppend/Argmax) — their
 // non-weight slots (scratch X/Out, KV pages, IO scalars, const params) are bound
 // elsewhere (beta's scratch; delta's KV/IO in bind_decode_dag).
-std::vector<WeightBind> weight_binds(Kernel kind, int layer, const DecodeGeometry& g);
+std::vector<WeightBind> weight_binds(Kernel kind, int layer, const DecodeGeometry& g,
+                                     bool gdn_prep = false);
 
 // Complete ordered list of UNIQUE weight tensors to stage for text decode (tied lm_head
 // once; skips visual/mtp). Order: lm_head bundle, final norm, then per layer in model

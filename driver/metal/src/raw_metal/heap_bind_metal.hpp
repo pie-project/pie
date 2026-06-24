@@ -48,6 +48,7 @@ BoundDecode stage_decode_weights(RawMetalContext& ctx, const SafetensorsView& vi
 
 // Walk beta's DAG; bind delta's weight/state/KV/IO slots for each dispatch by ordinal.
 void bind_decode_dag(RawMetalContext& ctx, const BoundDecode& b,
-                     const std::vector<Dispatch>& dag, const DecodeGeometry& g);
+                     const std::vector<Dispatch>& dag, const DecodeGeometry& g,
+                     bool gdn_prep = false);
 
 }  // namespace pie_metal_driver::raw_metal
