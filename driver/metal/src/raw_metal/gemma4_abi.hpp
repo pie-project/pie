@@ -159,6 +159,12 @@ enum class Softcap : uint8_t { Logits = 0, Out = 1, Cap = 2, N = 3 };
 // layer_scalar broadcast multiply: hidden *= scalar[0]  (over [hidden]).
 enum class LayerScalar : uint8_t { X = 0, Scalar = 1, Out = 2, N = 3 };
 
+// Scaled 4-bit embed gather (gemma4): bind::Embed (W/Scales/Biases/TokenId/Out/Hidden)
+// + a const Scale at buffer 6 (embed_tokens: sqrt(hidden); per-layer: sqrt(ple_dim)).
+enum class EmbedScaled : uint8_t {
+    W = 0, Scales = 1, Biases = 2, TokenId = 3, Out = 4, Hidden = 5, Scale = 6
+};
+
 }  // namespace bind
 
 // ── gemma4 dispatch-DAG kernel kinds (per-step encode order) ──────────────────

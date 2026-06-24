@@ -30,9 +30,10 @@ struct PsoSpec {
 // g64-b4 weight instantiations, head_dim 256 sdpa.
 std::vector<PsoSpec> specs_4bit() {
     return {
-        // 4-bit dequant gather: tied embed_tokens (== lm_head bundle) + the per-layer
-        // embed table. Same kernel as qwen3.6's 4-bit tied embed.
-        {"embed_gather.metal", "embed_gather_4bit_bfloat16_gs_64_b_4",
+        // 4-bit dequant gather, SCALED (gemma4): tied embed_tokens (== lm_head bundle,
+        // *sqrt(hidden)) + the per-layer embed table (*sqrt(ple_dim)). The scale (buffer 6)
+        // is bound per-dispatch at the consts stage; qwen's unscaled embed_gather is untouched.
+        {"embed_gather.metal", "embed_gather_scaled_4bit_bfloat16_gs_64_b_4",
             {Kernel::EmbedGather, Kernel::PleTokenGather}},
         // rms_single_row serves every (plain-rms, plus_one bound false) norm.
         {"rms_norm.metal", "rms_single_row_bfloat16",
