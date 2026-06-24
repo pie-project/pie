@@ -31,7 +31,7 @@ struct Use {
 namespace bi {
 constexpr uint8_t EmbedOut   = 4;             // bind::Embed::Out
 constexpr uint8_t RmsX = 0, RmsOut = 2;       // bind::Rms
-constexpr uint8_t QmvX = 3, QmvOut = 4;       // bind::Qmv
+constexpr uint8_t QmvX = 3, QmvOut = 4, QmvResidual = 7;  // bind::Qmv (Residual = fused epilogue)
 constexpr uint8_t DenseX = 1, DenseOut = 2;   // bind::Dense
 constexpr uint8_t QSplitIn = 0, QSplitQ = 1, QSplitGate = 2;  // bind::QSplit
 constexpr uint8_t RopeX = 0;                  // bind::Rope: in-place activation (1=pos IO, 2/3/4=consts)
@@ -102,7 +102,13 @@ ScratchSchedule build_scratch_schedule(const std::vector<Dispatch>& dag,
                 rd(o, bi::GatedRmsX, core); rd(o, bi::GatedRmsZ, zg); wr(o, bi::GatedRmsOut, gnorm);
                 break;
             case Kernel::QmvOut:
-                gdnout = fresh(); rd(o, bi::QmvX, gnorm); wr(o, bi::QmvOut, gdnout);
+                if (d.fuse_residual) {  // gdn_out + block residual → new resid (drops Residual)
+                    int nr = fresh();
+                    rd(o, bi::QmvX, gnorm); rd(o, bi::QmvResidual, resid); wr(o, bi::QmvOut, nr);
+                    resid = nr;
+                } else {
+                    gdnout = fresh(); rd(o, bi::QmvX, gnorm); wr(o, bi::QmvOut, gdnout);
+                }
                 break;
 
             // ── Full-attn block ──
@@ -144,7 +150,13 @@ ScratchSchedule build_scratch_schedule(const std::vector<Dispatch>& dag,
                 wr(o, bi::AttnGateAttn, attn);
                 break;
             case Kernel::QmvO:
-                gdnout = fresh(); rd(o, bi::QmvX, attn); wr(o, bi::QmvOut, gdnout);
+                if (d.fuse_residual) {  // o_proj + block residual → new resid (drops Residual)
+                    int nr = fresh();
+                    rd(o, bi::QmvX, attn); rd(o, bi::QmvResidual, resid); wr(o, bi::QmvOut, nr);
+                    resid = nr;
+                } else {
+                    gdnout = fresh(); rd(o, bi::QmvX, attn); wr(o, bi::QmvOut, gdnout);
+                }
                 break;
 
             // attn/gdn epilogue + mlp epilogue both fold into Residual.
@@ -166,7 +178,13 @@ ScratchSchedule build_scratch_schedule(const std::vector<Dispatch>& dag,
                 hh = fresh(); rd(o, bi::SiluGate, gp); rd(o, bi::SiluUp, up); wr(o, bi::SiluOut, hh);
                 break;
             case Kernel::QmvDown:
-                dn = fresh(); rd(o, bi::QmvX, hh); wr(o, bi::QmvOut, dn);
+                if (d.fuse_residual) {  // down_proj + block residual → new resid (drops LayerOut)
+                    int nr = fresh();
+                    rd(o, bi::QmvX, hh); rd(o, bi::QmvResidual, resid); wr(o, bi::QmvOut, nr);
+                    resid = nr;
+                } else {
+                    dn = fresh(); rd(o, bi::QmvX, hh); wr(o, bi::QmvOut, dn);
+                }
                 break;
             case Kernel::LayerOut: {
                 int nr = fresh();

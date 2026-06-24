@@ -44,7 +44,8 @@ bool load_decode_psos(RawMetalContext& ctx,
                       const std::string& kernels_dir,
                       DecodeStepPsos& out,
                       bool with_argmax,
-                      std::string* err) {
+                      std::string* err,
+                      bool fuse_residual) {
     const std::string dir = kernels_dir.empty() || kernels_dir.back() == '/'
                                 ? kernels_dir : kernels_dir + "/";
     for (const PsoSpec& spec : specs()) {
@@ -54,6 +55,15 @@ bool load_decode_psos(RawMetalContext& ctx,
             return false;
         }
         for (Kernel k : spec.kinds) out[k] = pso;
+    }
+    if (fuse_residual) {
+        // Residual-epilogue GEMV variant for QmvO/QmvOut/QmvDown (adds buffer(7) residual).
+        out.qmv_residual = ctx.compile_pso_from_file(
+            dir + "quantized_qmv.metal", "affine_qmv_fast_residual_bfloat16_gs_64_b_4");
+        if (!out.qmv_residual.valid()) {
+            if (err) *err = "affine_qmv_fast_residual_bfloat16_gs_64_b_4 (quantized_qmv.metal)";
+            return false;
+        }
     }
     if (with_argmax) {
         // Argmax is an optional I3 substrate; its kernel is not yet ported. When it lands,

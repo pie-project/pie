@@ -37,11 +37,15 @@ struct Dispatch {
     int         layer;       // model layer (-1 for singletons) — for <layer>.<tag> dumps
     Grid        grid;        // launch geometry (TODO(delta): confirm exact dims)
     Threadgroup tg;
+    bool        fuse_residual = false;  // QmvO/QmvOut/QmvDown: add the block residual in the
+                                        // GEMV epilogue (buffer 7) → drops the following
+                                        // Residual/LayerOut dispatch. PIE_FUSE_RESIDUAL.
 };
 
 // PSOs compiled once (from delta's raw_metal/kernels/*.metal), indexed by Kernel kind.
 struct DecodeStepPsos {
     Pso by_kind[kKernelKindCount]{};
+    Pso qmv_residual{};      // affine_qmv_fast_residual — used for fuse_residual dispatches.
     Pso&       operator[](Kernel k)       { return by_kind[static_cast<int>(k)]; }
     const Pso& operator[](Kernel k) const { return by_kind[static_cast<int>(k)]; }
 };
@@ -50,7 +54,8 @@ struct DecodeStepPsos {
 // the geometry, with grid/tg filled per dispatch via delta's decode_dispatch.hpp
 // helpers (GdnCore's {32,Vd,Vh}/{32,4,1} is beta's, in gdn_core.metal). with_argmax
 // appends the optional device-argmax substrate (I3); logits are ALWAYS produced.
-std::vector<Dispatch> build_decode_dag(const DecodeGeometry& g, bool with_argmax = false);
+std::vector<Dispatch> build_decode_dag(const DecodeGeometry& g, bool with_argmax = false,
+                                       bool fuse_residual = false);
 
 // ── GPU-exec attribution hook (optimization-phase prep; off by default) ───────
 // When provided to encode_decode_step, the walker emits a timestamp mark at boundary i

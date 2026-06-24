@@ -212,7 +212,10 @@ int main(int argc, char** argv) {
         weights_bytes += view.get(name).nbytes;
     const HeapPlan plan = plan_heap(g, weights_bytes, max_ctx);
 
-    const std::vector<Dispatch> dag = build_decode_dag(g, /*with_argmax=*/false);
+    const bool fuse_residual = std::getenv("PIE_FUSE_RESIDUAL") != nullptr;
+    const std::vector<Dispatch> dag = build_decode_dag(g, /*with_argmax=*/false, fuse_residual);
+    if (fuse_residual)
+        std::printf("[decode_run] PIE_FUSE_RESIDUAL: residual folded into QmvO/QmvOut/QmvDown epilogue\n");
 
     if (std::getenv("PIE_DAG_DUMP")) {
         for (const auto& d : dag)
@@ -282,7 +285,7 @@ int main(int argc, char** argv) {
     // ── Compile the kernel PSOs ──
     DecodeStepPsos psos;
     std::string err;
-    if (!load_decode_psos(*ctx, kernels_dir, psos, /*with_argmax=*/false, &err)) {
+    if (!load_decode_psos(*ctx, kernels_dir, psos, /*with_argmax=*/false, &err, fuse_residual)) {
         std::fprintf(stderr, "[decode_run] PSO load failed: %s\n", err.c_str());
         return 1;
     }
