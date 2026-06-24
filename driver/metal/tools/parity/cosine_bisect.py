@@ -22,11 +22,13 @@ import sys
 
 import numpy as np
 
-# Per-kernel execution rank WITHIN a decoder layer. Both layer types share the
-# same residual-stream order; absent tags are simply skipped. Ranks need only be
-# monotonic in dispatch order (gaps are fine). Mirrors qwen36.cpp + delta's
-# decode_abi.hpp `Kernel` enum / DAG (mac-raw-metal-decode-dag).
-INTRA_LAYER_ORDER = [
+# Per-kernel execution rank WITHIN a decoder layer. Ranks need only be monotonic
+# in dispatch order (gaps are fine); absent tags are simply skipped. The two
+# architectures have structurally different residual streams, so each gets its
+# own order (auto-selected per golden dir from marker tags below).
+#   qwen3.6  -> qwen36.cpp + delta's decode_abi.hpp `Kernel` enum (GDN + full-attn)
+#   gemma4   -> gemma4.cpp dump taps (PLE block, 4-norm sandwich, geglu, no GDN)
+QWEN36_INTRA_ORDER = [
     "attn_norm",                                   # rms (both layer types)
     # ── GDN / linear-attention sublayer ──
     "gdn_in_qkv", "gdn_in_z", "gdn_in_a", "gdn_in_b",
@@ -43,11 +45,49 @@ INTRA_LAYER_ORDER = [
     "ffn_norm", "gate_proj", "up_proj", "swiglu", "down_proj",
     "layer_out",
 ]
+
+GEMMA4_INTRA_ORDER = [
+    "attn_norm",                                   # input_layernorm (plus_one=false)
+    # ── attention sublayer (q/k-norm + weightless v_norm, gemma rope order) ──
+    "q_proj", "q_norm", "k_proj", "v_proj", "k_norm", "v_norm",
+    "rope_k", "rope_q",
+    "sdpa", "o_proj",
+    "post_attn_norm", "attn_resid",                # post-attention norm + residual
+    # ── MLP (geglu-tanh, not swiglu) + post-ffn norm ──
+    "ffn_norm", "gate_proj", "up_proj", "geglu", "down_proj",
+    "post_ffn_norm", "ffn_resid",
+    # ── Per-Layer-Embedding block (gemma4-specific) ──
+    "ple_gate", "ple_gated", "ple_proj", "ple_norm", "ple_resid",
+    "layer_out",
+]
+
+# Default to qwen3.6; main() re-selects per golden dir via select_order().
+INTRA_LAYER_ORDER = QWEN36_INTRA_ORDER
 _INTRA_RANK = {name: i for i, name in enumerate(INTRA_LAYER_ORDER)}
 
-# Layer-less tags pinned to the start / end of the global sequence.
-HEAD_TAGS = {"embed": -1}
-TAIL_TAGS = {"final_norm": 10**6, "logits": 10**6 + 1}
+# Layer-less tags pinned to the start / end of the global sequence. `ple_input`
+# (gemma4 PLE precompute) runs after embed but before layer 0.
+HEAD_TAGS = {"embed": -2, "ple_input": -1}
+TAIL_TAGS = {"final_norm": 10**6, "logits": 10**6 + 1, "logits_softcap": 10**6 + 2}
+
+
+def select_order(tags):
+    """Pick the per-layer order from marker tags present in a golden dir.
+
+    gemma4 emits `ple_*`/`post_attn_norm`/`geglu`/`v_norm`; qwen3.6 emits
+    `gdn_*`/`attn_gated`. Falls back to qwen3.6 if no marker is seen.
+    """
+    global INTRA_LAYER_ORDER, _INTRA_RANK
+    kernels = {k for (_layer, k) in tags}
+    gemma_markers = {"ple_gate", "ple_proj", "post_attn_norm", "geglu", "v_norm"}
+    if kernels & gemma_markers:
+        INTRA_LAYER_ORDER = GEMMA4_INTRA_ORDER
+        arch = "gemma4"
+    else:
+        INTRA_LAYER_ORDER = QWEN36_INTRA_ORDER
+        arch = "qwen3.6"
+    _INTRA_RANK = {name: i for i, name in enumerate(INTRA_LAYER_ORDER)}
+    return arch
 
 
 def parse_tag(fname):
@@ -113,6 +153,8 @@ def main():
         print(f"error: no .npy golden tensors in {args.golden}", file=sys.stderr)
         return 2
 
+    arch = select_order(golden)
+    print(f"arch: {arch} ({len(golden)} golden tensors)")
     keys = sorted(golden, key=lambda k: exec_key(*k))
     first_bad = None
     rows = []
