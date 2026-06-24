@@ -84,6 +84,19 @@ bool load_gemma4_psos(RawMetalContext& ctx,
         }
         for (Kernel k : spec.kinds) out[k] = pso;
     }
+    // Full-attention layers (head_dim 512) need the d_512 SDPA instantiation; by_kind[Sdpa]
+    // (d_256) serves the sliding layers. The encode_fn picks per-layer via is_full_attn().
+    {
+        std::string e;
+        Pso pso = ctx.compile_pso_from_file(
+            dir + "sdpa_sliding.metal", "sdpa_vector_decode_swa_bfloat16_d_512", &e);
+        if (!pso.valid()) {
+            if (err) *err = std::string("sdpa_vector_decode_swa_bfloat16_d_512 "
+                                        "(sdpa_sliding.metal): ") + e;
+            return false;
+        }
+        out.sdpa_full = pso;
+    }
     if (with_argmax) {
         // Argmax is the optional I3 device-argmax substrate; kernel not yet ported.
         // When it lands, compile + assign out[Kernel::Argmax] here.
@@ -161,7 +174,9 @@ void encode_gemma4_step(StepEncoder& se,
     (void)force_barriers;  // gemma4 has no ‖-pair concurrency model yet → barrier after each.
     Grid grid; Threadgroup tg;
     for (const Gemma4Dispatch& d : dag) {
-        se.set_pso(psos[d.kind]);
+        const Pso& pso = (d.kind == Kernel::Sdpa && Gemma4Geometry::is_full_attn(d.layer))
+                             ? psos.sdpa_full : psos[d.kind];
+        se.set_pso(pso);
         se.set_argtable_ordinal(d.ordinal);   // flat-ordinal key (ratified)
         gemma4_launch_dims(d.kind, d.layer, geom, grid, tg);
         se.dispatch(grid, tg);

@@ -34,6 +34,7 @@ inline constexpr int kGemma4KernelKindCount = static_cast<int>(Kernel::Argmax) +
 // PSOs compiled once (from raw_metal/kernels/*.metal), indexed by gemma4 Kernel kind.
 struct Gemma4StepPsos {
     Pso by_kind[kGemma4KernelKindCount]{};
+    Pso sdpa_full{};  // head_dim-512 SDPA for the full-attention layers (by_kind[Sdpa] is d_256).
     Pso&       operator[](Kernel k)       { return by_kind[static_cast<int>(k)]; }
     const Pso& operator[](Kernel k) const { return by_kind[static_cast<int>(k)]; }
 };

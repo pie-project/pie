@@ -153,3 +153,10 @@ template <typename T, int D, int V = D>
 instantiate_sdpa_swa(float32, float, 256, 256)
 instantiate_sdpa_swa(float16, half, 256, 256)
 instantiate_sdpa_swa(bfloat16, bfloat, 256, 256)
+
+// gemma4 full-attention layers {4,9,14,19,24,29,34} use head_dim 512 (theta 1e6,
+// full rotation). The kernel is compile-time templated on D, so a distinct PSO is
+// required; the encode_fn selects it per-layer for is_full_attn() dispatches.
+instantiate_sdpa_swa(float32, float, 512, 512)
+instantiate_sdpa_swa(float16, half, 512, 512)
+instantiate_sdpa_swa(bfloat16, bfloat, 512, 512)
