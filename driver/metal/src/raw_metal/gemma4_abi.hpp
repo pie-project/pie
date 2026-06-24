@@ -135,6 +135,17 @@ struct Gemma4Geometry {
 // (Shared kernels reuse decode_abi.hpp's bind:: enums verbatim — same layouts.)
 namespace bind {
 
+// Re-export the shared per-kernel bind enums (defined in decode_abi.hpp's raw_metal::bind)
+// so gemma4 code can refer to them as bind::Rms / bind::Qmv / ... alongside the gemma4
+// additions below, without ambiguity against the reopened gemma4::bind namespace.
+using raw_metal::bind::Rms;
+using raw_metal::bind::Rope;
+using raw_metal::bind::Sdpa;
+using raw_metal::bind::Embed;
+using raw_metal::bind::KvAppend;
+using raw_metal::bind::Qmv;
+using raw_metal::bind::Argmax;
+
 // Dense bf16 GEMV (M=1 decode matvec): out[N] = W[N,K] @ x[K].  The gemma4 linear
 // kernel (q/k/v/o/gate/up/down + tied embed^T logits) — no dequant (cf. qwen3.6's
 // affine_qmv). group=(32,2,1), grid=(1, ceil(N/8), 1); float accumulation.

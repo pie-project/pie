@@ -106,6 +106,25 @@ if(NLOHMANN_JSON_INCLUDE)
   target_link_libraries(decode_run PRIVATE
     "-framework Metal"
     "-framework Foundation")
+
+  # gemma4_decode_run — the gemma4 integration driver (alpha): stage weights + bind
+  # (gemma4_heap_bind) + const params (gemma4_consts) + no_recycle activation dataflow +
+  # PSO loader + encode_gemma4_step -> RawMetalContext::run_step. Reports encode/gpu-exec
+  # split + argmax; PIE_DUMP_TAPS dumps every golden tap for the bit-exact gate vs
+  # charlie's ~/parity-golden/gemma4-4bit-pos7.
+  add_executable(gemma4_decode_run
+    gemma4_decode_run.cpp
+    gemma4_encode.cpp
+    gemma4_heap_bind.cpp
+    gemma4_consts.cpp
+    safetensors_view.cpp
+    mtl4_context.mm)
+  target_include_directories(gemma4_decode_run PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${NLOHMANN_JSON_INCLUDE})
+  target_compile_definitions(gemma4_decode_run PRIVATE
+    RAW_METAL_KERNELS_DIR="${CMAKE_CURRENT_SOURCE_DIR}/kernels")
+  target_link_libraries(gemma4_decode_run PRIVATE
+    "-framework Metal"
+    "-framework Foundation")
 else()
   message(WARNING "nlohmann/json.hpp not found — st_probe (safetensors handoff) skipped. "
                   "Set -DNLOHMANN_JSON_INCLUDE=<dir>.")
