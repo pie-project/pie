@@ -356,6 +356,25 @@ class TestForward:
 
 
 class TestGenerator:
+    class _RecordingHandle:
+        def __init__(self, inner):
+            self._inner = inner
+            self.bids: list[float] = []
+
+        def bid(self, value: float) -> None:
+            self.bids.append(value)
+            self._inner.bid(value)
+
+        def __getattr__(self, name):
+            return getattr(self._inner, name)
+
+    @staticmethod
+    def _expected_bid(mu: float, cv2: float) -> float:
+        balance = 1000.0
+        pages = 1.0
+        page_size = 64.0
+        return (balance / mu) / (pages + mu * (1.0 + cv2) / (2.0 * page_size))
+
     def test_generate_returns_generator(self):
         from inferlet import Context, Generator, Model, Sampler
         ctx = Context(Model.load("test-model"))
@@ -370,10 +389,72 @@ class TestGenerator:
             ctx.generate(Sampler.argmax(), auto_flush=False)
             .max_tokens(128)
             .horizon(256)
+            .rebid_each_step(False)
         )
         assert isinstance(g, Generator)
         assert g._max_tokens == 128
         assert g._horizon == 256
+        assert g._rebid_each_step is False
+
+    def test_generator_rebids_each_step_by_default(self):
+        import asyncio
+        from inferlet import Context, Model, Sampler
+
+        ctx = Context(Model.load("test-model"))
+        ctx._handle = self._RecordingHandle(ctx._handle)
+        g = ctx.generate(Sampler.argmax(), auto_flush=False)
+
+        assert len(ctx._handle.bids) == 1
+        asyncio.run(g.__anext__())
+        assert len(ctx._handle.bids) == 2
+
+    def test_generator_can_disable_step_rebids(self):
+        import asyncio
+        import pytest
+        from inferlet import Context, Model, Sampler
+
+        ctx = Context(Model.load("test-model"))
+        ctx._handle = self._RecordingHandle(ctx._handle)
+        g = ctx.generate(Sampler.argmax(), auto_flush=False, rebid_each_step=False)
+
+        assert len(ctx._handle.bids) == 1
+        assert ctx._handle.bids[-1] == pytest.approx(self._expected_bid(4096.0, 1.0))
+        asyncio.run(g.__anext__())
+        assert len(ctx._handle.bids) == 1
+
+    def test_disabled_step_rebid_primes_from_options(self):
+        import pytest
+        from inferlet import Context, Model, Sampler
+
+        ctx = Context(Model.load("test-model"))
+        ctx._handle = self._RecordingHandle(ctx._handle)
+        ctx.generate(
+            Sampler.argmax(),
+            max_tokens=16,
+            horizon=32,
+            rebid_each_step=False,
+            auto_flush=False,
+        )
+
+        assert len(ctx._handle.bids) == 1
+        assert ctx._handle.bids[-1] == pytest.approx(self._expected_bid(32.0, 0.0))
+
+    def test_disabling_step_rebid_reprimes_after_chain_methods(self):
+        import pytest
+        from inferlet import Context, Model, Sampler
+
+        mu = 16.0
+
+        ctx = Context(Model.load("test-model"))
+        ctx._handle = self._RecordingHandle(ctx._handle)
+        (
+            ctx.generate(Sampler.argmax(), auto_flush=False)
+            .max_tokens(int(mu))
+            .rebid_each_step(False)
+        )
+
+        assert len(ctx._handle.bids) == 2
+        assert ctx._handle.bids[-1] == pytest.approx(self._expected_bid(mu, 1.0))
 
     def test_constrain_with_schema(self):
         from inferlet import (

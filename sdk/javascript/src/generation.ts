@@ -29,6 +29,7 @@ import {
   type Output as WitOutput,
   type Brle,
 } from 'pie:core/inference';
+import * as _scheduling from 'pie:core/scheduling';
 
 import { awaitFuture } from './_async.js';
 import * as _chat from './chat.js';
@@ -56,6 +57,20 @@ import type { Speculator } from './spec.js';
 function _samplerIsArgmax(sampler: Sampler): boolean {
   const variant = sampler._variant;
   return variant.tag === 'top-p' && variant.val[0] === 0.0;
+}
+
+function _computeBid(
+  balance: number,
+  pages: number,
+  mu: number,
+  cv2: number,
+  pageSize: number,
+  dividend: number,
+): number {
+  mu = Math.max(mu, 1.0);
+  const numerator = balance / mu + dividend;
+  const denominator = pages + (mu * (1.0 + cv2)) / (2.0 * pageSize);
+  return denominator > 0 ? numerator / denominator : numerator;
 }
 
 // =============================================================================
@@ -86,6 +101,8 @@ export interface GenerateOptions {
   zoSeed?: number;
   /** Expected output length for budget planning. */
   horizon?: number;
+  /** Refresh the scheduler bid before every decode step. Defaults to true. */
+  rebidEachStep?: boolean;
 }
 
 // =============================================================================
@@ -113,6 +130,7 @@ export class Generator implements AsyncIterable<GenStep> {
   /** @internal */ _zoSeed: number | undefined;
   /** @internal */ _stepProbes: Array<[number, Probe]> = [];
   /** @internal */ _tokensGenerated = 0;
+  /** @internal */ _rebidEachStep: boolean;
   /** @internal */ _done = false;
 
   constructor(
@@ -127,6 +145,7 @@ export class Generator implements AsyncIterable<GenStep> {
     this._horizon = options.horizon;
     this._adapter = options.adapter;
     this._zoSeed = options.zoSeed;
+    this._rebidEachStep = options.rebidEachStep ?? true;
 
     // Constraints — accept Schema, Constraint, or array.
     if (options.constrain !== undefined) {
@@ -150,6 +169,8 @@ export class Generator implements AsyncIterable<GenStep> {
       (options.speculator === undefined &&
         _samplerIsArgmax(sampler) &&
         ctx._model.defaultSystemSpeculation());
+
+    this._primeBid();
   }
 
   /** @internal */
@@ -169,7 +190,11 @@ export class Generator implements AsyncIterable<GenStep> {
   // ── Chain methods (alternative to options-object) ──────────────────────
 
   /** Hard cap on tokens generated. */
-  maxTokens(n: number): this { this._maxTokens = n; return this; }
+  maxTokens(n: number): this {
+    this._maxTokens = n;
+    this._refreshStaticBid();
+    return this;
+  }
 
   /** Stop tokens. */
   stop(tokens: Iterable<number>): this {
@@ -198,7 +223,19 @@ export class Generator implements AsyncIterable<GenStep> {
   }
 
   /** Hint expected output length for budget planning. */
-  horizon(n: number): this { this._horizon = n; return this; }
+  horizon(n: number): this {
+    this._horizon = n;
+    this._refreshStaticBid();
+    return this;
+  }
+
+  /** Control whether the generator refreshes its scheduler bid before
+   *  every decode step. */
+  rebidEachStep(enabled: boolean): this {
+    this._rebidEachStep = enabled;
+    this._refreshStaticBid();
+    return this;
+  }
 
   /** Apply an adapter on every forward pass. */
   adapter(a: Adapter): this { this._adapter = a; return this; }
@@ -244,6 +281,8 @@ export class Generator implements AsyncIterable<GenStep> {
 
   /** @internal */
   _buildStep(): GenStep {
+    if (this._rebidEachStep) this._recomputeBid();
+
     // Drain context buffer (filled by `system / user / cue / ...`).
     const pending = this._ctx._pendingTokens;
     this._ctx._pendingTokens = new Uint32Array();
@@ -273,6 +312,53 @@ export class Generator implements AsyncIterable<GenStep> {
     }
 
     return new GenStep(this, pending, drafts, draftPositions, mask);
+  }
+
+  /** @internal */
+  _primeBid(): void {
+    const balance = _scheduling.balance(this._ctx._model._handle);
+    const dividend = _scheduling.dividend(this._ctx._model._handle);
+    const pages = Math.max(1, this._ctx._committedPages + this._ctx._workingPages);
+    const [mu, cv2] = this._initialBidShape();
+    this._ctx.setBid(_computeBid(balance, pages, mu, cv2, this._ctx._pageSize, dividend));
+  }
+
+  /** @internal */
+  _recomputeBid(): void {
+    const balance = _scheduling.balance(this._ctx._model._handle);
+    const dividend = _scheduling.dividend(this._ctx._model._handle);
+    const pages = this._ctx._committedPages + this._ctx._workingPages;
+    const pageSize = this._ctx._pageSize;
+
+    const [mu, cv2] = this._bidShape();
+    this._ctx.setBid(_computeBid(balance, pages, mu, cv2, pageSize, dividend));
+  }
+
+  /** @internal */
+  _bidShape(): [number, number] {
+    if (this._horizon !== undefined) {
+      return [Math.max(this._horizon - this._tokensGenerated, 1), 0.0];
+    }
+    if (this._maxTokens !== undefined) {
+      return [Math.max(this._maxTokens - this._tokensGenerated, 1), 1.0];
+    }
+    return [Math.max(this._tokensGenerated, 64), 1.0];
+  }
+
+  /** @internal */
+  _initialBidShape(): [number, number] {
+    if (this._horizon !== undefined) {
+      return [Math.max(this._horizon, 1), 0.0];
+    }
+    if (this._maxTokens !== undefined) {
+      return [Math.max(this._maxTokens, 1), 1.0];
+    }
+    return [4096.0, 1.0];
+  }
+
+  /** @internal */
+  _refreshStaticBid(): void {
+    if (!this._rebidEachStep) this._primeBid();
   }
 
   // ── User-sampled mode ──────────────────────────────────────────────────

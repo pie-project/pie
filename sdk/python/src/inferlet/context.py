@@ -432,6 +432,7 @@ class Context:
         adapter: Adapter | None = None,
         zo_seed: int | None = None,
         horizon: int | None = None,
+        rebid_each_step: bool = True,
         auto_flush: bool = True,
     ) -> Generator:
         """Build a :class:`Generator` for token generation.
@@ -463,6 +464,7 @@ class Context:
             adapter: Adapter to apply on every forward pass.
             zo_seed: Evolution Strategies seed for every forward pass.
             horizon: Expected output length for budget planning.
+            rebid_each_step: Refresh the scheduler bid before every decode step.
             auto_flush: Append ``cue()`` and use chat stop tokens by default.
         """
         if auto_flush:
@@ -482,6 +484,7 @@ class Context:
             adapter=adapter,
             zo_seed=zo_seed,
             horizon=horizon,
+            rebid_each_step=rebid_each_step,
         )
 
     # ── Bidding / scheduling ─────────────────────────────────────────
