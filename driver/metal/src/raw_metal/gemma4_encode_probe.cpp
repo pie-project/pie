@@ -44,7 +44,7 @@ int main() {
             ++bad; continue;
         }
         Grid grid; Threadgroup tg;
-        gemma4_launch_dims(d.kind, g, grid, tg);
+        gemma4_launch_dims(d.kind, d.layer, g, grid, tg);
         const bool dims_ok = grid.x >= 1 && grid.y >= 1 && grid.z >= 1 &&
                              tg.x >= 1 && tg.y >= 1 && tg.z >= 1 &&
                              tg.x * tg.y * tg.z <= 1024;
@@ -55,6 +55,25 @@ int main() {
         }
     }
     if (bad) { printf("GEMMA4_ENCODE_FAIL %d\n", bad); return 1; }
-    printf("GEMMA4_ENCODE_OK (every dispatch: valid PSO + sane launch dims)\n");
+
+    // Per-layer-type dim spot-checks (catch a regression to uniform geometry): full-attn
+    // layers must launch wider q/o (head_dim 512) than sliding (256), and the double-wide
+    // MLP range (>=first_kv_shared) must launch 2x the gate/up width.
+    auto qmv_grid = [&](gemma4::Kernel k, int L) {
+        Grid gr; Threadgroup t; gemma4_launch_dims(k, L, g, gr, t);
+        return gr.y;  // qmv grid = (1, ceil(N/bn), 1)
+    };
+    const uint32_t q_full = qmv_grid(gemma4::Kernel::QmvQ, 4);   // head_dim 512 -> q 4096
+    const uint32_t q_slide = qmv_grid(gemma4::Kernel::QmvQ, 0);  // head_dim 256 -> q 2048
+    const uint32_t mlp_wide = qmv_grid(gemma4::Kernel::QmvGate, 15);  // double-wide 12288
+    const uint32_t mlp_narrow = qmv_grid(gemma4::Kernel::QmvGate, 0); // 6144
+    printf("[gemma4] per-layer dims: q_full.y=%u q_slide.y=%u (expect 2x); "
+           "mlp_wide.y=%u mlp_narrow.y=%u (expect 2x)\n",
+           q_full, q_slide, mlp_wide, mlp_narrow);
+    if (q_full != 2 * q_slide || mlp_wide != 2 * mlp_narrow) {
+        printf("GEMMA4_ENCODE_FAIL per-layer dims not differentiated\n");
+        return 1;
+    }
+    printf("GEMMA4_ENCODE_OK (every dispatch: valid PSO + sane launch dims; per-layer dims OK)\n");
     return 0;
 }

@@ -90,10 +90,14 @@ bool load_gemma4_psos(RawMetalContext& ctx,
     return true;
 }
 
-void gemma4_launch_dims(Kernel kind, const Gemma4Geometry& g, Grid& grid, Threadgroup& tg) {
-    const int q_dim  = g.n_q_heads * g.head_dim;        // 2048
-    const int kv_dim = g.n_kv_heads * g.head_dim;       // 256
-    const int ple_w  = g.n_layers * g.per_layer_emb_dim; // 8960 (PLE table row width)
+void gemma4_launch_dims(Kernel kind, int layer, const Gemma4Geometry& g,
+                        Grid& grid, Threadgroup& tg) {
+    const int hd      = g.head_dim_at(layer);            // 256 sliding / 512 full
+    const int q_dim   = g.q_dim_at(layer);               // 2048 / 4096
+    const int kv_dim  = g.kv_dim_at(layer);              // 256  / 512
+    const int rotary  = g.rotary_at(layer);              // 256  / 128
+    const int interm  = g.intermediate_at(layer);        // 6144 / 12288
+    const int ple_w   = g.n_layers * g.per_layer_emb_dim; // 8960 (PLE table row width)
 
     // Elementwise pointwise: one thread per output element, 256-wide threadgroups.
     auto pointwise = [&](int n) { grid = Grid{uint32_t(n), 1, 1}; tg = Threadgroup{256, 1, 1}; };
@@ -106,36 +110,36 @@ void gemma4_launch_dims(Kernel kind, const Gemma4Geometry& g, Grid& grid, Thread
         case Kernel::PleProjNorm:    rms_dispatch(g.per_layer_emb_dim, g.n_layers, grid, tg); break;
         case Kernel::PleCombine:     pointwise(ple_w); break;
 
-        // ── attention ──
+        // ── attention (head_dim per layer type) ──
         case Kernel::AttnNorm:     rms_dispatch(g.hidden, 1, grid, tg); break;
         case Kernel::QmvQ:         qmv_dispatch(q_dim, grid, tg); break;
         case Kernel::QmvK:         qmv_dispatch(kv_dim, grid, tg); break;
         case Kernel::QmvV:         qmv_dispatch(kv_dim, grid, tg); break;
-        case Kernel::QNorm:        rms_dispatch(g.head_dim, g.n_q_heads, grid, tg); break;
-        case Kernel::KNorm:        rms_dispatch(g.head_dim, g.n_kv_heads, grid, tg); break;
-        case Kernel::VNorm:        rms_dispatch(g.head_dim, g.n_kv_heads, grid, tg); break;  // vnorm == rms launch
-        case Kernel::RopeQ:        rope_dispatch(g.rotary_dims, g.n_q_heads, grid, tg); break;
-        case Kernel::RopeK:        rope_dispatch(g.rotary_dims, g.n_kv_heads, grid, tg); break;
-        case Kernel::KvAppend:     kv_append_dispatch(g.head_dim, g.n_kv_heads, grid, tg); break;
+        case Kernel::QNorm:        rms_dispatch(hd, g.n_q_heads, grid, tg); break;
+        case Kernel::KNorm:        rms_dispatch(hd, g.n_kv_heads, grid, tg); break;
+        case Kernel::VNorm:        rms_dispatch(hd, g.n_kv_heads, grid, tg); break;  // vnorm == rms launch
+        case Kernel::RopeQ:        rope_dispatch(rotary, g.n_q_heads, grid, tg); break;
+        case Kernel::RopeK:        rope_dispatch(rotary, g.n_kv_heads, grid, tg); break;
+        case Kernel::KvAppend:     kv_append_dispatch(hd, g.n_kv_heads, grid, tg); break;
         case Kernel::Sdpa:         sdpa_dispatch(g.n_q_heads, grid, tg); break;       // sliding via window bind
         case Kernel::QmvO:         qmv_dispatch(g.hidden, grid, tg); break;
         case Kernel::PostAttnNorm: rms_dispatch(g.hidden, 1, grid, tg); break;
         case Kernel::AttnResidual: residual_dispatch(g.hidden, grid, tg); break;
 
-        // ── FFN (GeGLU-tanh) ──
+        // ── FFN (GeGLU-tanh; double-wide on shared layers) ──
         case Kernel::FfnNorm:     rms_dispatch(g.hidden, 1, grid, tg); break;
-        case Kernel::QmvGate:     qmv_dispatch(g.intermediate, grid, tg); break;
-        case Kernel::QmvUp:       qmv_dispatch(g.intermediate, grid, tg); break;
-        case Kernel::GegluTanh:   pointwise(g.intermediate); break;
+        case Kernel::QmvGate:     qmv_dispatch(interm, grid, tg); break;
+        case Kernel::QmvUp:       qmv_dispatch(interm, grid, tg); break;
+        case Kernel::GegluTanh:   pointwise(interm); break;
         case Kernel::QmvDown:     qmv_dispatch(g.hidden, grid, tg); break;
         case Kernel::PostFfnNorm: rms_dispatch(g.hidden, 1, grid, tg); break;
         case Kernel::FfnResidual: residual_dispatch(g.hidden, grid, tg); break;
 
         // ── PLE residual + layer scalar ──
-        case Kernel::PleGateGemv:      qmv_dispatch(g.per_layer_emb_dim, grid, tg); break;
+        case Kernel::PleGateGemv:      qmv_dispatch(g.per_layer_emb_dim, grid, tg); break; // [hidden]->[ple]
         case Kernel::PleGeglu:         pointwise(g.per_layer_emb_dim); break;
         case Kernel::PleProjLayerGemv: qmv_dispatch(g.hidden, grid, tg); break;       // [ple]->[hidden]
-        case Kernel::PleNorm:          rms_dispatch(g.per_layer_emb_dim, 1, grid, tg); break;
+        case Kernel::PleNorm:          rms_dispatch(g.hidden, 1, grid, tg); break;    // post_per_layer_input_norm: [hidden]
         case Kernel::PleResidual:      residual_dispatch(g.hidden, grid, tg); break;
         case Kernel::LayerScalar:      pointwise(g.hidden); break;
 
@@ -158,7 +162,7 @@ void encode_gemma4_step(StepEncoder& se,
     for (const Gemma4Dispatch& d : dag) {
         se.set_pso(psos[d.kind]);
         se.set_argtable_ordinal(d.ordinal);   // flat-ordinal key (ratified)
-        gemma4_launch_dims(d.kind, geom, grid, tg);
+        gemma4_launch_dims(d.kind, d.layer, geom, grid, tg);
         se.dispatch(grid, tg);
         se.barrier(vis);
     }

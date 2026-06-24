@@ -51,7 +51,10 @@ bool load_gemma4_psos(RawMetalContext& ctx,
                       std::string* err = nullptr);
 
 // Resolve the launch geometry (total-threads Grid + Threadgroup) for one dispatch.
-void gemma4_launch_dims(Kernel kind, const Gemma4Geometry& g, Grid& grid, Threadgroup& tg);
+// `layer` selects the per-layer-type dims (head_dim 256/512, double-wide MLP); pass the
+// dispatch's layer (-1 for layer-less kinds, which ignore it).
+void gemma4_launch_dims(Kernel kind, int layer, const Gemma4Geometry& g,
+                        Grid& grid, Threadgroup& tg);
 
 // Encode one gemma4 decode step: walk the DAG, bind pso + arg table (by ordinal) +
 // launch dims, dispatch + barrier. `force_barriers` emits a barrier after every
