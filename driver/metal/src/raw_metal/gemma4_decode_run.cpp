@@ -401,9 +401,9 @@ int run_main(int argc, char** argv) {
     ctx->make_resident();
 
     // ── Decode loop: feed each prompt id as an M=1 step (KV append-only across steps) ──
-    // PIE_CONCUR selects the encoder concurrency policy (0=barrier-after-each default,
-    // 1=Gate‖Up overlap). Set it for dump+gate runs to validate a concurrency mode bit-exact.
-    const int concur = std::getenv("PIE_CONCUR") ? std::atoi(std::getenv("PIE_CONCUR")) : 0;
+    // PIE_CONCUR selects the encoder concurrency policy (default 2 = greedy RAW predicate,
+    // the shipped bit-exact concurrency; 0=barrier-after-each, 1=Gate‖Up, -1=ceiling).
+    const int concur = std::getenv("PIE_CONCUR") ? std::atoi(std::getenv("PIE_CONCUR")) : 2;
     StepTiming last{};
     for (size_t i = 0; i < ids.size(); ++i) {
         write_u32(b.io_token,    ids[i]);

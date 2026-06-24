@@ -60,14 +60,17 @@ void gemma4_launch_dims(Kernel kind, int layer, const Gemma4Geometry& g,
 // Encode one gemma4 decode step: walk the DAG, bind pso + arg table (by ordinal) +
 // launch dims, dispatch + barrier. `force_barriers` emits a barrier after every
 // dispatch (diagnostic); `vis` is the barrier cache-visibility (ExecutionOnly is the
-// proven-correct + free default established on the qwen3.6 lane).
+// proven-correct + free default established on the qwen3.6 lane). `concur` selects the
+// barrier policy — default 2 = the general greedy RAW predicate (bit-exact, ~5.3% faster
+// than barrier-each; gated argmax-5279 + 815-tap). 0 = barrier-each, 1 = Gate‖Up only,
+// -1 = drop-all timing ceiling (WRONG argmax, never shipped).
 void encode_gemma4_step(StepEncoder& se,
                         const std::vector<Gemma4Dispatch>& dag,
                         const Gemma4StepPsos& psos,
                         const Gemma4Geometry& geom,
                         bool force_barriers = false,
                         BarrierVisibility vis = BarrierVisibility::ExecutionOnly,
-                        int concur = 0);
+                        int concur = 2);
 
 // Barriers emitted by the `concur` policy vs the barrier-each baseline (== dag.size()). Pure
 // (no GPU) — a cheap pre-flight signal of how many barriers the greedy predicate drops.
