@@ -503,6 +503,7 @@ int main(int argc, char** argv) {
         return 0;
     }
 
+    // ── Optional full 363-tap dump (PIE_DUMP_TAPS=<dir>): after the last decode step, with
     //    no_recycle every value is preserved in its own pool buffer → emit each dispatch's
     //    output as <layer>.<tag>.npy for charlie's cosine_bisect vs the pos-7 golden. ──
     if (dump_dir) {
