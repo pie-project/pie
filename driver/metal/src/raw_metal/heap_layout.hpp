@@ -109,7 +109,20 @@ inline HeapPlan plan_heap(const DecodeGeometry& g,
     // At max_tokens=1 each scalar is align_up(4) — byte-identical to the sealed single-token IO.
     const size_t scalars = 4 * align_up(size_t(4) * g.max_tokens);
     const size_t logits = align_up(size_t(g.vocab) * 4);
-    p.io_bytes = align_up(scalars + logits);
+    size_t csr = 0;
+    if (g.max_requests > 1 || g.max_tokens > 1) {
+        // Batch CSR slots (IoSlot 5-11), each 256-aligned. Reserved ONLY at caps>1 so the M=1
+        // io_bytes is unchanged (byte-identical sealed layout).
+        const size_t R = size_t(g.max_requests), N = size_t(g.max_tokens), TP = size_t(g.total_pages);
+        csr = align_up(4 * (R + 1))      // QoIndptr
+            + align_up(4 * (R + 1))      // KvPageIndptr
+            + align_up(4 * TP)           // KvPageIndices
+            + align_up(4 * R)            // KvLastPageLens
+            + align_up(4 * R)            // RsSlotIds
+            + align_up(R)                // RsSlotFlags (u8)
+            + align_up(4 * N);           // ReqOfToken
+    }
+    p.io_bytes = align_up(scalars + logits + csr);
 
     // ── Lay out regions back-to-back, each 256-aligned ──
     size_t off = 0;

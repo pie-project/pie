@@ -34,8 +34,10 @@ struct BoundDecode {
     struct KvSlots { SlotHandle k_pages, v_pages; };
     std::vector<KvSlots> kv;          // size n_layers; GDN entries unused
 
-    // IO region (I1 per-token buffers + I3 logits). Indexed by IoSlot.
-    SlotHandle io[5];
+    // IO region (I1 per-token buffers + I3 logits). Indexed by IoSlot (0..11). Slots 0-4 are
+    // the sealed M=1 scalars+logits; slots 5-11 (QoIndptr..ReqOfToken) are the Phase-1 batch
+    // CSR buffers, allocated ONLY when caps>1 (absent at M=1 → sealed heap byte-identical).
+    SlotHandle io[12];
 
     // device-argmax substrate (I3; allocated always, bound + read only when with_argmax):
     // argmax_params = ArgmaxParams const (vocab + inline EOS ids; Shared, runtime-writable),

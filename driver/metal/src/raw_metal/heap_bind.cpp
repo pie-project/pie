@@ -100,6 +100,22 @@ BoundDecode stage_decode_weights(RawMetalContext& ctx, const SafetensorsView& vi
     b.io[static_cast<int>(IoSlot::Logits)]    = alloc_zeroed(ctx, size_t(g.vocab) * 4);
     b.io[static_cast<int>(IoSlot::NextToken)] = alloc_zeroed(ctx, tok);
 
+    // ── Multi-batch CSR IO slots (IoSlot 5-11), allocated ONLY at caps>1 so the sealed M=1
+    //    heap stays byte-identical. delta ALLOCATEs (sized by DecodeGeometry caps); alpha FILLs
+    //    the contents per fire from beta's BatchSchedule; beta BINDs at the published ordinals.
+    if (g.max_requests > 1 || g.max_tokens > 1) {
+        const size_t R  = size_t(g.max_requests);
+        const size_t N  = size_t(g.max_tokens);
+        const size_t TP = size_t(g.total_pages);
+        b.io[static_cast<int>(IoSlot::QoIndptr)]       = alloc_zeroed(ctx, 4 * (R + 1));
+        b.io[static_cast<int>(IoSlot::KvPageIndptr)]   = alloc_zeroed(ctx, 4 * (R + 1));
+        b.io[static_cast<int>(IoSlot::KvPageIndices)]  = alloc_zeroed(ctx, 4 * TP);
+        b.io[static_cast<int>(IoSlot::KvLastPageLens)] = alloc_zeroed(ctx, 4 * R);
+        b.io[static_cast<int>(IoSlot::RsSlotIds)]      = alloc_zeroed(ctx, 4 * R);
+        b.io[static_cast<int>(IoSlot::RsSlotFlags)]    = alloc_zeroed(ctx, R);       // u8[R]
+        b.io[static_cast<int>(IoSlot::ReqOfToken)]     = alloc_zeroed(ctx, 4 * N);
+    }
+
     // device-argmax substrate (inert unless with_argmax): ArgmaxParams const + EosFlag out.
     b.argmax_params = alloc_zeroed(ctx, sizeof(ArgmaxParams));
     b.eos_flag      = alloc_zeroed(ctx, tok);
