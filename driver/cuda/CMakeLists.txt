@@ -43,8 +43,11 @@ if(CUDAToolkit_INCLUDE_DIRS)
   endif()
 endif()
 
-if(NOT PIE_BRIDGE_INCLUDE_DIR)
-  set(PIE_BRIDGE_INCLUDE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../bridge/include")
+if(NOT PIE_SCHEMA_INCLUDE_DIR)
+  set(PIE_SCHEMA_INCLUDE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../protocol/schema/include")
+endif()
+if(NOT PIE_IPC_INCLUDE_DIR)
+  set(PIE_IPC_INCLUDE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../ipc/include")
 endif()
 
 # NCCL for tensor-parallel collectives. Single-GPU runs never load it (the
@@ -150,7 +153,7 @@ endif()
 
 # pie_driver_cuda — native CUDA backend. Built two ways from the same
 # translation units:
-#   - `pie_driver_cuda_lib` (STATIC): linked in-process by server/standalone
+#   - `pie_driver_cuda_lib` (STATIC): linked in-process by worker/standalone
 #     when the `driver-cuda` Cargo feature is on, so the all-Rust binary
 #     contains the driver. Per the M3 static-link spike below, this works
 #     with `cublas_static + cublasLt_static + cudart_static + culibos +
@@ -297,7 +300,7 @@ add_library(pie_driver_cuda_lib STATIC
 find_program(CARGO_EXECUTABLE cargo REQUIRED)
 set(PIE_WORKSPACE_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../..")
 set(PIE_WEIGHT_LOADER_MANIFEST
-    "${PIE_WORKSPACE_ROOT}/driver/weight_loader/Cargo.toml")
+    "${PIE_WORKSPACE_ROOT}/driver/weight-loader/Cargo.toml")
 set(PIE_WEIGHT_LOADER_STATICLIB_PATH
     "${PIE_WORKSPACE_ROOT}/target/release/libpie_weight_loader.a")
 add_custom_target(pie_weight_loader_staticlib
@@ -354,7 +357,8 @@ target_include_directories(pie_driver_cuda_lib
   PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/src
     ${CMAKE_CURRENT_SOURCE_DIR}/../common/include
-    ${PIE_BRIDGE_INCLUDE_DIR}
+    ${PIE_SCHEMA_INCLUDE_DIR}
+    ${PIE_IPC_INCLUDE_DIR}
     ${NCCL_INCLUDE_DIR}
     ${PIE_CCCL_INCLUDE_DIRS}
     ${flashinfer_SOURCE_DIR}/include
@@ -575,7 +579,7 @@ target_link_libraries(pie_driver_cuda_lib PUBLIC
 # M3 static-link spike notes: a hello-world calling cublasCreate/Destroy
 # links cleanly with `-lcublas_static -lcublasLt_static -lcudart_static
 # -lculibos -lpthread -lrt -ldl`, runs at runtime, and yields `ldd`
-# output with zero non-system shared libs. M4 wires server/standalone's
+# output with zero non-system shared libs. M4 wires worker/standalone's
 # `--features driver-cuda` build.rs to consume `pie_driver_cuda_lib`
 # with those static link flags (mirror the portable side's `BUILD_SHARED_LIBS=OFF`
 # trick, plus explicit `-l:libcublas_static.a` group).

@@ -10,7 +10,7 @@ Common questions about Pie's status, scope, and design choices. If you cannot fi
 
 ## Is Pie production ready?
 
-No. Pie is a research prototype under active development. APIs change between releases without deprecation cycles. The supported model families and drivers are listed on each driver's reference page ([CUDA](../reference/drivers/cuda#supported-architectures), [Portable](../reference/drivers/portable#supported-architectures), [vLLM](../reference/drivers/vllm), [SGLang](../reference/drivers/sglang)). Anything outside those lists is not guaranteed to work. Use Pie for research, prototyping, and internal deployments where you can update with the project.
+No. Pie is a research prototype under active development. APIs change between releases without deprecation cycles. The supported model families and drivers are listed on each driver's reference page ([CUDA](../reference/drivers/cuda#supported-architectures), [Portable](../reference/drivers/portable#supported-architectures)). Anything outside those lists is not guaranteed to work. Use Pie for research, prototyping, and internal deployments where you can update with the project.
 
 ## Do I have to write Rust?
 
@@ -39,7 +39,6 @@ Pie supports tensor-parallel and data-parallel inference across multiple GPUs on
 
 Pie is compatible with HuggingFace models.
 If your model is one of the supported architectures, point the model block at its HuggingFace repo. `pie model download <repo>` pulls the weights; `pie model list` reports compatibility.
-If you use vLLM/SGLang as driver, then you can use any model supported by those frameworks.
 
 ## Why WebAssembly?
 

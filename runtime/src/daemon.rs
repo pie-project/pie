@@ -198,7 +198,7 @@ impl Daemon {
 
         // Instantiate a fresh WASM component (store + instance) per request.
         // Daemons serve HTTP responses directly, so there is no client to attach
-        // their stdout/stderr to. Route guest output to pie-server's tracing log
+        // their stdout/stderr to. Route guest output to pie-worker's tracing log
         // (tagged with the program name) so inferlet diagnostics stay visible to
         // operators instead of falling through to wasmtime's default sink.
         let output = OutputMode::Log { program: program.to_string() };

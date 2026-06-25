@@ -17,8 +17,11 @@ set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib)
 set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib)
 
-if(NOT PIE_BRIDGE_INCLUDE_DIR)
-  set(PIE_BRIDGE_INCLUDE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../bridge/include")
+if(NOT PIE_SCHEMA_INCLUDE_DIR)
+  set(PIE_SCHEMA_INCLUDE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../protocol/schema/include")
+endif()
+if(NOT PIE_IPC_INCLUDE_DIR)
+  set(PIE_IPC_INCLUDE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../ipc/include")
 endif()
 
 include(cmake/CPM.cmake)
@@ -73,7 +76,7 @@ cpmaddpackage(URI "gh:nlohmann/json@3.12.0" OPTIONS "JSON_BuildTests OFF")
 
 # pie_driver_portable — portable ggml backend, sibling to ../cuda (native
 # CUDA + flashinfer) and ../../runtime (Rust). Embedded-only: linked
-# in-process by `server/standalone` and invoked via the FFI vtable the
+# in-process by `worker/standalone` and invoked via the FFI vtable the
 # Rust runtime's `InProcChannel` hands in. Loads HuggingFace safetensors
 # directly (no GGUF conversion).
 add_library(pie_driver_portable_lib STATIC
@@ -113,8 +116,9 @@ target_include_directories(pie_driver_portable_lib
   PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/src
     ${CMAKE_CURRENT_SOURCE_DIR}/../common/include
-    ${CMAKE_CURRENT_SOURCE_DIR}/../weight_loader/include
-    ${PIE_BRIDGE_INCLUDE_DIR})
+    ${CMAKE_CURRENT_SOURCE_DIR}/../weight-loader/include
+    ${PIE_SCHEMA_INCLUDE_DIR}
+    ${PIE_IPC_INCLUDE_DIR})
 
 target_link_libraries(pie_driver_portable_lib PUBLIC
   CLI11::CLI11

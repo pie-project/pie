@@ -1,0 +1,36 @@
+[package]
+name = "pie-schema"
+version = "0.1.0"
+edition = "2024"
+authors = ["In Gim <in.gim@yale.edu>"]
+description = "Canonical wire schema (rkyv) vocabulary for pie: the dependency floor shared by ipc, transport, runtime, and drivers."
+license = "Apache-2.0"
+repository = "https://github.com/pie-project/pie"
+
+# `links = "pie_schema"` lets downstream crates (e.g. `pie-worker`'s
+# build.rs) discover the generated C header directory via the
+# `DEP_PIE_SCHEMA_INCLUDE` env var (build script ↔ build script handoff).
+links = "pie_schema"
+
+[lib]
+name = "pie_schema"
+crate-type = ["rlib"]
+path = "src/lib.rs"
+
+[dependencies]
+# `DriverCapabilities` is JSON over a side channel (driver→runtime
+# handshake at startup), not part of the rkyv wire schema.
+serde = { version = "1.0", features = ["derive"] }
+# Derive macro: emits the `repr(C) Pie<T>Desc` + `as_desc`/`from_desc`
+# (in-proc Rust↔C++ surface) + the rkyv derive, from each schema type.
+pie-schema-derive = { path = "../schema-derive" }
+# Canonical schema serialization. Zero-copy reads via `rkyv::access`,
+# owned reads via `rkyv::deserialize`.
+rkyv = { version = "0.8", default-features = false, features = [
+    "std",
+    "alloc",
+    "bytecheck",
+] }
+
+[build-dependencies]
+xxhash-rust = { version = "0.8", features = ["xxh3"] }

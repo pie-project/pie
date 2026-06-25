@@ -1,7 +1,7 @@
 # pie-server
 
 Python wrapper for embedding the Pie engine in tests, notebooks, or scripts.
-For normal use, prefer the `pie` CLI from `server/`.
+For normal use, prefer the `pie` CLI from `worker/`.
 
 ```python
 import asyncio

@@ -10,7 +10,7 @@ Normally this driver is built into `pie`:
 
 ```bash
 CUDACXX=/usr/local/cuda/bin/nvcc \
-  cargo build -p pie-server --release --features driver-portable,driver-cuda
+  cargo build -p pie-worker --release --features driver-portable,driver-cuda
 ```
 
 For driver-only development:

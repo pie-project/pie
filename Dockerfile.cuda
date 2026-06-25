@@ -25,7 +25,7 @@ COPY . .
 ARG CMAKE_CUDA_ARCHITECTURES="80;86;89;90"
 ENV CMAKE_CUDA_ARCHITECTURES=${CMAKE_CUDA_ARCHITECTURES}
 
-RUN cargo install --path server --root /usr/local \
+RUN cargo install --path worker --root /usr/local \
         --no-default-features --features driver-cuda
 
 # Bake a Docker-tuned config. The stub libcuda symlink lets `pie config init`

@@ -55,12 +55,15 @@ pie run text-completion -- --prompt "The capital of France is"
 
 | Directory | Description |
 |---|---|
+| `worker/` | The `pie` CLI and standalone engine — the invariant entry point |
 | `runtime/` | Inferlet runtime |
-| `server/` | CLI |
+| `controller/` | Cluster-coordination control plane (pairing · roles · health) |
+| `transport/` | Worker↔worker P2P KV-tensor data plane |
+| `driver/` | Backend drivers (portable · CUDA) + runtime↔driver IPC |
+| `protocol/` | Shared wire schema (`schema` · `schema-derive` · `schema-bindgen`) — the dependency floor |
 | `inferlets/` | Example inferlets |
 | `sdk/` | Inferlet SDKs (Rust · Python · JavaScript) |
 | `client/` | Client libraries (Rust · Python · JavaScript) |
-| `driver/` | Pie drivers (portable / CUDA / vLLM / SGLang) |
 | `website/` | [pie-project.org](https://pie-project.org) docs site |
 
 ## Getting Help

@@ -25,12 +25,9 @@ use once_cell::sync::Lazy;
 use tokio::runtime::RuntimeFlavor;
 
 use super::{DriverChannel, DriverRequest, DriverResponse};
-use pie_bridge::schema::{
-    __pie_response_frame_from_desc, PieFrameDesc, PieFrameView, PieResponseFrameDesc,
-    pie_frame_view,
-};
+use pie_schema::schema::{PieFrameDesc, PieFrameView, PieResponseFrameDesc};
 
-pub use pie_bridge::ffi::InProcVTable;
+pub use pie_ipc::ffi::InProcVTable;
 
 // ---------------------------------------------------------------------------
 // Pending entry
@@ -46,7 +43,7 @@ struct PendingEntry {
     // `frame`'s heap) is dropped before the frame whose heap they
     // point into. Reordering these fields is a soundness break.
     view: Option<PieFrameView<'static>>,
-    frame: Box<pie_bridge::Frame>,
+    frame: Box<pie_schema::Frame>,
     slot: Option<Arc<ResponseSlot>>,
 }
 
@@ -230,7 +227,7 @@ impl InProcChannel {
         let submit_start = std::time::Instant::now();
         let req_id = state.next_id.fetch_add(1, Ordering::Relaxed);
         let slot = Arc::new(ResponseSlot::new());
-        let frame = Box::new(pie_bridge::Frame {
+        let frame = Box::new(pie_schema::Frame {
             driver_id: req.driver_id as u32,
             payload: req.payload,
         });
@@ -302,7 +299,7 @@ impl DriverChannel for InProcChannel {
             return Err(anyhow!("InProcChannel aborted"));
         }
         let req_id = self.state.next_id.fetch_add(1, Ordering::Relaxed);
-        let frame = Box::new(pie_bridge::Frame {
+        let frame = Box::new(pie_schema::Frame {
             driver_id: req.driver_id as u32,
             payload: req.payload,
         });
@@ -449,7 +446,7 @@ unsafe extern "C" fn vt_recv(
         };
         // SAFETY: `entry.frame` is a Box; its heap is stable. The
         // returned view holds raw pointers into that heap.
-        let view = pie_frame_view(&*entry.frame);
+        let view = (*entry.frame).as_desc();
         // SAFETY: extend lifetime — view dies before frame (see
         // `PendingEntry` field order doc).
         let view_static: PieFrameView<'static> = unsafe { std::mem::transmute(view) };
@@ -475,16 +472,16 @@ unsafe extern "C" fn vt_recv(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pie_bridge::schema::{
+    use pie_schema::schema::{
         PIE_REQUEST_PAYLOAD_ADAPTER, PIE_RESPONSE_PAYLOAD_STATUS, PieResponsePayloadDesc,
-        PieStatusResponseDesc,
+        StatusResponse,
     };
 
     fn save_adapter_req(driver_id: usize, adapter_id: u64) -> DriverRequest {
         DriverRequest {
             driver_id,
-            payload: pie_bridge::RequestPayload::Adapter(pie_bridge::AdapterRequest {
-                op: pie_bridge::AdapterOp::Save,
+            payload: pie_schema::RequestPayload::Adapter(pie_schema::AdapterRequest {
+                op: pie_schema::AdapterOp::Save,
                 adapter_id,
                 path: String::new(),
             }),
@@ -494,8 +491,8 @@ mod tests {
     fn zo_init_req(driver_id: usize, adapter_id: u64) -> DriverRequest {
         DriverRequest {
             driver_id,
-            payload: pie_bridge::RequestPayload::Adapter(pie_bridge::AdapterRequest {
-                op: pie_bridge::AdapterOp::ZoInit,
+            payload: pie_schema::RequestPayload::Adapter(pie_schema::AdapterRequest {
+                op: pie_schema::AdapterOp::ZoInit,
                 adapter_id,
                 path: String::new(),
             }),
@@ -504,7 +501,7 @@ mod tests {
 
     fn status_code(resp: &DriverResponse) -> Option<i32> {
         match &resp.payload {
-            pie_bridge::ResponsePayload::Status(s) => Some(s.status),
+            pie_schema::ResponsePayload::Status(s) => Some(s.status),
             _ => None,
         }
     }
@@ -557,7 +554,7 @@ mod tests {
             resp.payload = PieResponsePayloadDesc {
                 kind: PIE_RESPONSE_PAYLOAD_STATUS,
                 forward: Default::default(),
-                status: PieStatusResponseDesc { status: 0 },
+                status: StatusResponse { status: 0 },
             };
             unsafe { send(vt_ctx, req_id, &resp as *const _) };
         });
@@ -637,7 +634,7 @@ mod tests {
                 resp.payload = PieResponsePayloadDesc {
                     kind: PIE_RESPONSE_PAYLOAD_STATUS,
                     forward: Default::default(),
-                    status: PieStatusResponseDesc {
+                    status: StatusResponse {
                         status: req_id as i32,
                     },
                 };
@@ -806,7 +803,7 @@ unsafe extern "C" fn vt_send_response(
         Err(anyhow!("InProcChannel: null response desc"))
     } else {
         let desc_ref: &PieResponseFrameDesc = unsafe { &*response };
-        let owned = __pie_response_frame_from_desc(desc_ref);
+        let owned = pie_schema::ResponseFrame::from_desc(desc_ref);
         Ok(DriverResponse {
             aborted: owned.aborted,
             payload: owned.payload,

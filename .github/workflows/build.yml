@@ -322,7 +322,7 @@ jobs:
           # LTO's many-hour link cost. Distribution profile.
           cargo build --profile release-min \
             --target ${{ matrix.target.triple }} \
-            -p pie-server \
+            -p pie-worker \
             --features driver-portable,driver-dummy
 
       - name: Package
@@ -483,7 +483,7 @@ jobs:
           # Defined in workspace Cargo.toml.
           cargo build --profile release-min \
             --target ${{ matrix.target.triple }} \
-            -p pie-server \
+            -p pie-worker \
             --features driver-portable,driver-cuda,driver-dummy
 
       - name: Package

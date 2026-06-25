@@ -5,7 +5,7 @@
 //! subprocess drivers fall through to lazy shmem attach on first
 //! request. The same channel carries every wire payload kind (Forward,
 //! Copy, Adapter, Health) — the driver-side handler dispatches on the
-//! [`pie_bridge::RequestPayload`] variant.
+//! [`pie_schema::RequestPayload`] variant.
 
 use std::sync::Arc;
 use std::sync::LazyLock;
@@ -15,7 +15,7 @@ use anyhow::{Result, anyhow};
 use dashmap::DashMap;
 
 use super::{DriverChannel, DriverId, DriverRequest, DriverSpec, ShmemChannel};
-use pie_bridge::{ForwardResponse, RequestPayload, ResponsePayload};
+use pie_schema::{ForwardResponse, RequestPayload, ResponsePayload};
 
 fn shmem_name(driver_idx: usize) -> String {
     format!("/pie_shmem_g{driver_idx}")
@@ -89,11 +89,11 @@ where
 }
 
 /// Fire a batched forward pass. Wraps the request as a
-/// [`pie_bridge::RequestPayload::Forward`] and unwraps the matching
-/// [`pie_bridge::ResponsePayload::Forward`].
+/// [`pie_schema::RequestPayload::Forward`] and unwraps the matching
+/// [`pie_schema::ResponsePayload::Forward`].
 pub async fn fire_batch(
     driver_idx: DriverId,
-    req: pie_bridge::ForwardRequest,
+    req: pie_schema::ForwardRequest,
 ) -> Result<ForwardResponse> {
     let ch = get_channel(driver_idx)?;
     let resp = ch
@@ -118,7 +118,7 @@ pub async fn fire_batch(
 /// routes through the trait's `submit_sync`.
 pub fn fire_batch_sync(
     driver_idx: DriverId,
-    req: pie_bridge::ForwardRequest,
+    req: pie_schema::ForwardRequest,
 ) -> Result<ForwardResponse> {
     let ch = get_channel(driver_idx)?;
     let resp = ch.submit_sync(DriverRequest {

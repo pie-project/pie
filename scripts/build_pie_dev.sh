@@ -19,7 +19,7 @@ TARGET="${1:-all}"
 
 build_cli() {
   echo "▶ building pie CLI (--no-default-features --features $FEATURES)"
-  cargo build --release -p pie-server --bin pie \
+  cargo build --release -p pie-worker --bin pie \
     --no-default-features --features "$FEATURES"
 }
 

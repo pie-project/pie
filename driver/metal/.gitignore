@@ -1,0 +1,10 @@
+/build*/
+/out/
+/.cache/
+/.vscode/
+/.ccls-cache/
+/.clangd/
+/compile_commands.json
+.DS_Store
+*.o
+*.obj

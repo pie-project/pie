@@ -1,0 +1,29 @@
+# Sample driver/metal config. Pass via `pie_driver_metal --config dev.toml`.
+
+# Shmem IPC channel. Geometry is owned by the driver: the values written
+# here go straight into the shmem header, and the Rust runtime reads them
+# at attach time (runtime/src/shmem_ipc.rs). Only `name` is shared by
+# convention with the runtime side. (The embedded in-proc path ignores
+# the shmem geometry; these are kept for standalone parity with the cuda
+# and portable drivers.)
+[shmem]
+name = "/pie_shmem"
+num_slots = 8
+req_buf = 4194304   # 4 MiB
+resp_buf = 1048576  # 1 MiB
+spin_us = 0         # 0 = pure busy spin
+
+[model]
+hf_path = ""
+backend = "metal:0"
+
+# Memory planner. Page/KV sizing is derived at startup after weights load.
+[batching]
+kv_page_size = 32
+total_pages = 1024
+max_forward_tokens = 10240
+max_forward_requests = 512
+kv_cache_dtype = "auto"
+
+[runtime]
+verbose = false
