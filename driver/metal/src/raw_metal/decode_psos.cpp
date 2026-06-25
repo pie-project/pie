@@ -106,6 +106,7 @@ bool load_multibatch_psos(RawMetalContext& ctx,
         {"embed_gather.metal", "embed_gather_mb_4bit_bfloat16_gs_64_b_4", &out.embed_mb,        true},
         {"rope.metal",         "rope_neox_mb_bfloat16",                   &out.rope_mb,         true},
         {"gdn_core.metal",     "gdn_core_slotted_bfloat16",               &out.gdn_slotted,     true},
+        {"kv_append_paged.metal", "kv_append_paged_bfloat16",             &out.kv_append_paged, true},
         {"sdpa_paged.metal",   "sdpa_paged_decode_bfloat16_d_256",        &out.sdpa_paged,      true},
         {"sdpa_paged.metal",   "sdpa_paged_decode_bfloat16_d_512",        &out.sdpa_paged_d512, false},
     };
