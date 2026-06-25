@@ -5,7 +5,6 @@ pub mod api;
 pub mod auth;
 pub mod bootstrap;
 pub mod context;
-pub mod daemon;
 pub mod driver;
 pub mod inference;
 pub mod instance;

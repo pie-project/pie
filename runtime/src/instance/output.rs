@@ -2,8 +2,8 @@
 //!
 //! Provides `LogStream` — a WASI-compatible stream that routes output either
 //! through the process actor (`process::stdout` / `process::stderr`, read by an
-//! attached client) or to pie-worker's own `tracing` log (daemon request path,
-//! which has no attached client — see `daemon::Daemon::handle_request`).
+//! attached client) or to pie-worker's own `tracing` log when no client is
+//! attached.
 
 use bytes::Bytes;
 use std::io;
@@ -26,7 +26,7 @@ enum Dest {
     /// Per-process actor channel, drained by an attached client.
     Process(ProcessId),
     /// pie-worker's `tracing` log, tagged with the program name for triage.
-    /// Used by daemon components, which have no attached client.
+    /// Used when no client session is attached.
     Log(Arc<str>),
 }
 
@@ -77,9 +77,9 @@ impl LogStream {
                     return;
                 }
                 if self.is_stderr {
-                    tracing::warn!(target: "pie::daemon::guest", program = %program, "{text}");
+                    tracing::warn!(target: "pie::guest", program = %program, "{text}");
                 } else {
-                    tracing::info!(target: "pie::daemon::guest", program = %program, "{text}");
+                    tracing::info!(target: "pie::guest", program = %program, "{text}");
                 }
             }
         }

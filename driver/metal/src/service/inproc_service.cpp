@@ -6,7 +6,7 @@
 #include <vector>
 
 #include <pie_ipc/inproc_server.hpp>
-#include <pie_schema/response_builder.hpp>
+#include <pie_driver_abi/response_builder.hpp>
 
 #include "forward_executor.hpp"
 

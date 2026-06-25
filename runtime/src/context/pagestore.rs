@@ -19,7 +19,7 @@ use std::hash::{Hash, Hasher};
 use ahash::AHasher;
 use rustc_hash::FxHashMap;
 
-use pie_schema::Brle;
+use pie_driver_abi::Brle;
 
 // =============================================================================
 // Types

@@ -24,7 +24,7 @@ use tokio::runtime::RuntimeFlavor;
 
 use super::{DriverChannel, DriverRequest, DriverResponse};
 use pie_ipc::ffi::InProcVTable;
-use pie_schema::schema::{PieFrameDesc, PieFrameView, PieResponseFrameDesc};
+use pie_driver_abi::schema::{PieFrameDesc, PieFrameView, PieResponseFrameDesc};
 
 const SLOT_BITS: u32 = 16;
 const SLOT_MASK: u32 = (1 << SLOT_BITS) - 1;
@@ -51,7 +51,7 @@ struct PollingSlot {
     // Drop order matters: view must disappear before the frame whose
     // buffers it points into.
     view: UnsafeCell<Option<PieFrameView<'static>>>,
-    frame: UnsafeCell<Option<pie_schema::Frame>>,
+    frame: UnsafeCell<Option<pie_driver_abi::Frame>>,
     result: UnsafeCell<Option<Result<DriverResponse>>>,
 }
 
@@ -260,7 +260,7 @@ impl InProcPollingState {
         unsafe { slot.reset_for_reuse() };
         slot.wants_response.store(wants_response, Ordering::Release);
         unsafe {
-            *slot.frame.get() = Some(pie_schema::Frame {
+            *slot.frame.get() = Some(pie_driver_abi::Frame {
                 driver_id: req.driver_id as u32,
                 payload: req.payload,
             });
@@ -651,7 +651,7 @@ unsafe extern "C" fn vt_send_response(
             Err(anyhow!("InProcPollingChannel: null response desc"))
         } else {
             let desc_ref: &PieResponseFrameDesc = unsafe { &*response };
-            let owned = pie_schema::ResponseFrame::from_desc(desc_ref);
+            let owned = pie_driver_abi::ResponseFrame::from_desc(desc_ref);
             Ok(DriverResponse {
                 aborted: owned.aborted,
                 payload: owned.payload,
@@ -694,7 +694,7 @@ mod tests {
     use std::sync::mpsc;
 
     use super::*;
-    use pie_schema::schema::{
+    use pie_driver_abi::schema::{
         PIE_REQUEST_PAYLOAD_HEALTH, PIE_RESPONSE_PAYLOAD_STATUS, PieResponsePayloadDesc,
         StatusResponse,
     };
@@ -702,13 +702,13 @@ mod tests {
     fn health_request(driver_id: usize) -> DriverRequest {
         DriverRequest {
             driver_id,
-            payload: pie_schema::RequestPayload::Health,
+            payload: pie_driver_abi::RequestPayload::Health,
         }
     }
 
     fn status_code(resp: &DriverResponse) -> i32 {
         match &resp.payload {
-            pie_schema::ResponsePayload::Status(s) => s.status,
+            pie_driver_abi::ResponsePayload::Status(s) => s.status,
             _ => panic!("expected status response"),
         }
     }
@@ -862,7 +862,7 @@ mod tests {
 
         let response = channel.submit(health_request(7)).await.expect("submit");
         match response.payload {
-            pie_schema::ResponsePayload::Status(s) => assert_eq!(s.status, 0),
+            pie_driver_abi::ResponsePayload::Status(s) => assert_eq!(s.status, 0),
             _ => panic!("expected status response"),
         }
         driver.join().unwrap();
@@ -885,7 +885,7 @@ mod tests {
             tasks.push(tokio::spawn(async move {
                 let response = channel.submit(health_request(i)).await.expect("submit");
                 match response.payload {
-                    pie_schema::ResponsePayload::Status(s) => assert_eq!(s.status, 0),
+                    pie_driver_abi::ResponsePayload::Status(s) => assert_eq!(s.status, 0),
                     _ => panic!("expected status response"),
                 }
                 completed.fetch_add(1, Ordering::Relaxed);

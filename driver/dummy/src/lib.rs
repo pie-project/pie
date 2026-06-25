@@ -24,8 +24,8 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow};
 
 use crate::handler::Handler;
-use pie_schema::ArchivedRequestPayload;
-use pie_schema::SCHEMA_HASH;
+use pie_driver_abi::ArchivedRequestPayload;
+use pie_driver_abi::SCHEMA_HASH;
 use pie_ipc::ipc::ShmemServer;
 use pie_ipc::wire::parse_request;
 

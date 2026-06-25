@@ -20,7 +20,7 @@ use std::time::Instant;
 use pie::inference::request::{
     append_request, new_batched_forward_request_with_capacity, new_per_request,
 };
-use pie_schema::Brle;
+use pie_driver_abi::Brle;
 
 const PAGE_SIZE: u32 = 16;
 
@@ -50,7 +50,7 @@ fn fmt_time(ns: u64) -> String {
     }
 }
 
-fn make_request(masks: Vec<Brle>, num_input: u32, kv_before: u32) -> pie_schema::ForwardRequest {
+fn make_request(masks: Vec<Brle>, num_input: u32, kv_before: u32) -> pie_driver_abi::ForwardRequest {
     let positions: Vec<u32> = (kv_before..kv_before + num_input).collect();
     let tokens: Vec<u32> = vec![0; num_input as usize];
     let has_user_mask = !masks.is_empty();
@@ -116,7 +116,7 @@ struct ScenarioResult {
 }
 
 fn run_scenario(
-    req: &pie_schema::ForwardRequest,
+    req: &pie_driver_abi::ForwardRequest,
     pages: &[u32],
     last_page_len: u32,
     iters: u32,

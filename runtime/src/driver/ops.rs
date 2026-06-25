@@ -1,5 +1,5 @@
 //! Cold-path method wrappers built directly on the wire schema. Each
-//! function constructs a `pie_schema::RequestPayload` (Copy or Adapter),
+//! function constructs a `pie_driver_abi::RequestPayload` (Copy or Adapter),
 //! wraps it in a `DriverRequest` with the target driver_id, and ships
 //! it through the unified channel — no pie-internal mirror enum.
 
@@ -7,7 +7,7 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 
-use pie_schema::{
+use pie_driver_abi::{
     AdapterOp, AdapterRequest, CopyDir, CopyRequest, CopyResource, RequestPayload, ResponsePayload,
 };
 

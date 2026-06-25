@@ -10,7 +10,7 @@ use rand::rngs::SmallRng;
 use rand::{RngCore, SeedableRng};
 
 use pie_ipc::wire::encode_response;
-use pie_schema::{
+use pie_driver_abi::{
     ArchivedForwardRequest, ForwardResponse, ResponseFrame, ResponsePayload, PIE_SAMPLER_DIST,
     PIE_SAMPLER_EMBEDDING, PIE_SAMPLER_ENTROPY, PIE_SAMPLER_LOGPROB, PIE_SAMPLER_LOGPROBS,
     PIE_SAMPLER_RAW_LOGITS,

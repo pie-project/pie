@@ -7,11 +7,12 @@
 //!
 //! The Rust [`Config`] type below is the user-facing TOML schema; the
 //! conversion to `pie::bootstrap::Config` (the runtime's own config)
-//! happens in [`crate::bootstrap_translate`].
+//! happens in [`crate::translate`].
 
 use std::path::PathBuf;
 
 use anyhow::{Result, bail, ensure};
+use pie_controller_rpc::Role;
 use serde::{Deserialize, Serialize};
 
 // -----------------------------------------------------------------------------
@@ -29,6 +30,10 @@ pub struct Config {
     pub telemetry: TelemetryConfig,
     #[serde(default)]
     pub runtime: RuntimeConfig,
+    /// Distributed-cluster topology (controller + role + gateways). Absent, or
+    /// `controller` unset ⇒ single-node (gateway-free local inference).
+    #[serde(default)]
+    pub cluster: ClusterConfig,
     /// `[[model]]` array — at least one entry required. The first entry
     /// is the implicit default for inferlets that don't pin a model.
     #[serde(default, rename = "model")]
@@ -36,11 +41,12 @@ pub struct Config {
 }
 
 impl Config {
-    pub fn from_toml_file(path: &std::path::Path) -> Result<Self> {
-        let text =
-            std::fs::read_to_string(path).map_err(|e| anyhow::anyhow!("read {path:?}: {e}"))?;
-        let cfg: Config =
-            toml::from_str(&text).map_err(|e| anyhow::anyhow!("parse {path:?}: {e}"))?;
+    /// Parse a TOML config string into a validated [`Config`]. **Pure**: no file
+    /// IO, no env, no clap — sourcing the string (file locate/read + env merge)
+    /// is the bootstrap/bin layer's job (Seam 2). The role lib owns only the
+    /// domain parse + validation.
+    pub fn parse(s: &str) -> Result<Self> {
+        let cfg: Config = toml::from_str(s).map_err(|e| anyhow::anyhow!("parse config: {e}"))?;
         cfg.validate()?;
         Ok(cfg)
     }
@@ -76,6 +82,40 @@ impl Config {
 
         self.server.validate()?;
         self.runtime.validate()?;
+        self.cluster.validate()?;
+        Ok(())
+    }
+}
+
+// -----------------------------------------------------------------------------
+// [cluster]
+// -----------------------------------------------------------------------------
+
+/// Distributed-cluster topology. Absent, or `controller` unset ⇒ single-node
+/// (the worker terminates clients directly; no controller/gateway).
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClusterConfig {
+    /// Controller endpoint (`tcp://host:port`, a bare `host:port`, or
+    /// `unix:/path`); set ⇒ this worker joins a distributed cluster.
+    #[serde(default)]
+    pub controller: Option<String>,
+    /// This worker's role (required when `controller` is set).
+    #[serde(default)]
+    pub role: Option<Role>,
+    /// Gateway endpoint(s) this worker dials INTO (M3 inversion; distributed).
+    #[serde(default)]
+    pub gateways: Vec<String>,
+}
+
+impl ClusterConfig {
+    fn validate(&self) -> Result<()> {
+        if self.controller.is_some() {
+            ensure!(
+                self.role.is_some(),
+                "[cluster] role is required when controller is set"
+            );
+        }
         Ok(())
     }
 }

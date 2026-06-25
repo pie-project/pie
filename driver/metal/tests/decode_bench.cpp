@@ -33,8 +33,8 @@
 #include "model/model_graph.hpp"
 #include "executor/executor.hpp"
 
-#include <pie_schema/response_builder.hpp>
-#include <pie_schema/view.hpp>
+#include <pie_driver_abi/response_builder.hpp>
+#include <pie_driver_abi/view.hpp>
 
 namespace mx = mlx::core;
 using namespace pie_metal_driver;

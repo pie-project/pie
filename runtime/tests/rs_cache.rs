@@ -12,7 +12,7 @@ mod common;
 use common::mock_device::{Behavior, MockBackend};
 
 struct RecordingBehavior {
-    forwards: Mutex<Vec<pie_schema::ForwardRequest>>,
+    forwards: Mutex<Vec<pie_driver_abi::ForwardRequest>>,
 }
 
 impl RecordingBehavior {
@@ -26,16 +26,16 @@ impl RecordingBehavior {
         self.forwards.lock().unwrap().clear();
     }
 
-    fn forwards(&self) -> Vec<pie_schema::ForwardRequest> {
+    fn forwards(&self) -> Vec<pie_driver_abi::ForwardRequest> {
         self.forwards.lock().unwrap().clone()
     }
 }
 
 impl Behavior for RecordingBehavior {
-    fn handle_fire_batch(&self, req: &pie_schema::ForwardRequest) -> pie_schema::ForwardResponse {
+    fn handle_fire_batch(&self, req: &pie_driver_abi::ForwardRequest) -> pie_driver_abi::ForwardResponse {
         self.forwards.lock().unwrap().push(req.clone());
         let n = req.qo_indptr.len().saturating_sub(1) as u32;
-        pie_schema::ForwardResponse {
+        pie_driver_abi::ForwardResponse {
             num_requests: n,
             tokens_indptr: (0..=n).collect(),
             tokens: vec![7; n as usize],

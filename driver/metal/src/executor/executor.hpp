@@ -19,8 +19,8 @@
 #include <cstdint>
 #include <vector>
 
-#include <pie_schema/response_builder.hpp>
-#include <pie_schema/view.hpp>
+#include <pie_driver_abi/response_builder.hpp>
+#include <pie_driver_abi/view.hpp>
 
 #include "forward_executor.hpp"
 #include "kernels/sampling.hpp"

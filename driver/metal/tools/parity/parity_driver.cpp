@@ -23,8 +23,8 @@
 
 #include <mlx/mlx.h>
 
-#include <pie_schema/response_builder.hpp>
-#include <pie_schema/view.hpp>
+#include <pie_driver_abi/response_builder.hpp>
+#include <pie_driver_abi/view.hpp>
 
 #include "executor/executor.hpp"
 #include "loader/model_loader.hpp"

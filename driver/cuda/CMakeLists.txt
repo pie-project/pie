@@ -44,7 +44,7 @@ if(CUDAToolkit_INCLUDE_DIRS)
 endif()
 
 if(NOT PIE_SCHEMA_INCLUDE_DIR)
-  set(PIE_SCHEMA_INCLUDE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../protocol/schema/include")
+  set(PIE_SCHEMA_INCLUDE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../interface/driver/include")
 endif()
 if(NOT PIE_IPC_INCLUDE_DIR)
   set(PIE_IPC_INCLUDE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../ipc/include")
@@ -174,7 +174,7 @@ add_library(pie_driver_cuda_lib STATIC
   src/mla_cache.cpp
   src/model/loaded_model.cpp
   src/model/bound_model.cpp
-  ../common/src/safetensors_manifest.cpp
+  src/loader/safetensors_manifest.cpp
   src/loader/gguf_source.cpp
   src/loader/hf_config.cpp
   src/loader/safetensors.cpp
@@ -356,7 +356,6 @@ target_compile_options(pie_driver_cuda PRIVATE
 target_include_directories(pie_driver_cuda_lib
   PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/src
-    ${CMAKE_CURRENT_SOURCE_DIR}/../common/include
     ${PIE_SCHEMA_INCLUDE_DIR}
     ${PIE_IPC_INCLUDE_DIR}
     ${NCCL_INCLUDE_DIR}
@@ -499,10 +498,10 @@ add_executable(test_brle tests/test_brle.cpp src/brle.cpp)
 target_include_directories(test_brle PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 
 add_executable(test_driver_common
-  ../common/tests/test_common.cpp
-  ../common/src/safetensors_manifest.cpp)
+  tests/test_common.cpp
+  src/loader/safetensors_manifest.cpp)
 target_include_directories(test_driver_common PRIVATE
-  ${CMAKE_CURRENT_SOURCE_DIR}/../common/include)
+  ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(test_driver_common PRIVATE nlohmann_json::nlohmann_json)
 
 add_executable(test_kv_cache_format

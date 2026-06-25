@@ -3,38 +3,37 @@ name = "pie-controller"
 version = "0.1.0"
 edition = "2024"
 authors = ["In Gim <in.gim@icloud.com>"]
-description = "Cluster-coordination control plane for Pie — node pairing, role assignment, health. Control messages only; never touches tensor bytes."
+description = "Distributed control plane for Pie"
 license = "Apache-2.0"
 repository = "https://github.com/pie-project/pie"
 
-# Library half — the embeddable in-proc coordination API. The worker links
-# this directly when run on-device (`--standalone`), so the controller lives
-# in the worker's address space with no network hop.
 [lib]
 name = "pie_controller"
 path = "src/lib.rs"
 crate-type = ["rlib"]
 
-# Binary half — the standalone controller process. Used in the distributed
-# topology, where workers reach it over the network (`--controller=addr`).
-# Same coordination library, different deployment form.
-[[bin]]
-name = "pie-controller"
-path = "src/bin/pie-controller.rs"
+# Pure library (Seam 1): no `main.rs`, no `[[bin]]`. The standalone process lives
+# in the thin `bin/controller` shell (bootstrap + this lib); single-node embeds
+# via `embed()`.
 
 [dependencies]
-# `pie-schema` carries the control-message vocabulary — `WorkerId`, `Role`,
-# `WorkerInfo`, `HealthStatus` (re-exported from `pie_schema::cluster`).
-# Dependency edges point DOWNWARD only — the controller depends on schema,
-# never on runtime/transport/driver. `default-features = false` keeps the
-# control plane out of the `cabi`/`python` surfaces.
-pie-schema = { path = "../protocol/schema", default-features = false }
-serde = { version = "1.0", features = ["derive"] }
-# Length-prefixed MessagePack framing for the control-RPC (distributed mode).
-# Matches the repo's existing wire-serialization choice.
-rmp-serde = "1.3"
-thiserror = "2.0"
+# Control-plane data types + the `Control` tarpc service (unified).
+pie-controller-rpc = { path = "../interface/controller" }
+# Cross-node id atoms (`WorkerId`/`GatewayId`/`NodeId`).
+pie-ids = { path = "../interface/ids" }
+# tarpc serves the `Control` RPC: Bincode over tarpc-native TCP or Unix sockets.
+tarpc = { version = "0.35", features = [
+    "serde-transport",
+    "serde-transport-bincode",
+    "tcp",
+    "unix",
+] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync"] }
+# CancellationToken — cooperative shutdown of the actor/reaper/serve tasks.
+tokio-util = "0.7"
+futures = "0.3"
 tracing = "0.1"
-# Argv parsing for the standalone process entry, matching the `clap` derive
-# style used by `pie-server`.
-clap = { version = "4.5", features = ["derive"] }
+anyhow = "1"
+# Config is TOML (project convention): pure `Config::parse(&str)` via serde.
+serde = { version = "1", features = ["derive"] }
+toml = "0.9"

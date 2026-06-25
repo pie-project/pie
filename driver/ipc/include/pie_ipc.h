@@ -2,7 +2,7 @@
  * between the Rust runtime and a same-process C++ driver).
  *
  * The wire-schema descriptor types (PieFrameDesc / PieResponseFrameDesc
- * and friends) and the cabi accessors live in `pie_schema.h`; this header
+ * and friends) and the cabi accessors live in `pie_driver_abi.h`; this header
  * carries only the mechanism — the direct-FFI vtable. It is intentionally
  * separate so the schema header stays mechanism-free.
  *
@@ -10,7 +10,7 @@
  * same-process C++ driver. Exchanges PieFrameDesc / PieResponseFrameDesc
  * pointers directly; no rkyv encode/decode on this path. The shmem path
  * (used by Python drivers) goes through pie_parse_<t> / pie_build_<t>
- * with rkyv bytes (see pie_schema.h).
+ * with rkyv bytes (see pie_driver_abi.h).
  *
  * Lifetime contract:
  *   - `recv` writes *out_request pointing to a PieFrameDesc that remains
@@ -29,7 +29,7 @@
 #include <stdint.h>
 
 /* PieFrameDesc / PieResponseFrameDesc come from the schema header. */
-#include <pie_schema.h>
+#include <pie_driver_abi.h>
 
 #ifdef __cplusplus
 extern "C" {

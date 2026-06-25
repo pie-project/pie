@@ -8,7 +8,7 @@
 // in #mac: beta owns CSR interpretation, alpha owns IO-buffer population + decoder feed).
 
 #include "batch_schedule.hpp"
-#include "pie_schema/view.hpp"
+#include "pie_driver_abi/view.hpp"
 
 namespace pie_metal_driver::raw_metal {
 

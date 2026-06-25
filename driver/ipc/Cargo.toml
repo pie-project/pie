@@ -26,7 +26,7 @@ anyhow = "1.0"
 thiserror = "1.0"
 # Canonical wire schema vocabulary — the dependency floor. Re-exported
 # at this crate's root for source compatibility.
-pie-schema = { path = "../../protocol/schema" }
+pie-driver-abi = { path = "../../interface/driver" }
 # Canonical schema serialization. Zero-copy reads via `rkyv::access`,
 # owned reads via `rkyv::deserialize`.
 rkyv = { version = "0.8", default-features = false, features = [

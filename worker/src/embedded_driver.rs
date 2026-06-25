@@ -296,11 +296,11 @@ pub fn launch_state_dir() -> PathBuf {
         .join(std::process::id().to_string())
 }
 
-// `DriverCapabilities` is owned by `pie-schema` (single source of truth
+// `DriverCapabilities` is owned by `pie-driver-abi` (single source of truth
 // for the driver ↔ runtime interface). Re-exported here so existing call
 // sites in pie-worker keep working through the
 // `embedded_driver::DriverCapabilities` path.
-pub use pie_schema::DriverCapabilities;
+pub use pie_driver_abi::DriverCapabilities;
 
 /// Parse a caps blob the C entry emits via `ready_cb` into the bridge's
 /// struct. Lives in pie-worker (not bridge) so bridge can stay free of a
@@ -364,52 +364,7 @@ pub fn write_startup_toml(
     write_toml_table(out_path, doc)
 }
 
-/// Write the metal driver's startup TOML, mirroring the portable layout
-/// (`[model]` + `[batching]` + `[runtime]`) consumed by
-/// `driver/metal/src/config.hpp`. The metal driver speaks the same
-/// embedded in-process ABI as portable, so the launch state is identical
-/// apart from the `metal:N` backend selector.
-#[cfg(feature = "driver-metal")]
-pub fn write_metal_startup_toml(
-    out_path: &Path,
-    options: &MetalDriverOptions,
-    snapshot_dir: &Path,
-    _group_id: usize,
-) -> Result<()> {
-    let mut doc = toml::Table::new();
-
-    let mut model = toml::Table::new();
-    insert_str(&mut model, "hf_path", path_string(snapshot_dir));
-    insert_str(&mut model, "backend", &options.device);
-    insert_table(&mut doc, "model", model);
-
-    let mut batching = toml::Table::new();
-    insert_int(&mut batching, "kv_page_size", options.kv_page_size);
-    insert_int(&mut batching, "total_pages", options.total_pages);
-    insert_int(
-        &mut batching,
-        "max_forward_tokens",
-        options.max_forward_tokens,
-    );
-    insert_int(
-        &mut batching,
-        "max_forward_requests",
-        options.max_forward_requests,
-    );
-    insert_int(&mut batching, "cpu_pages", options.cpu_pages);
-    insert_str(
-        &mut batching,
-        "kv_cache_dtype",
-        options.kv_cache_dtype.clone(),
-    );
-    insert_table(&mut doc, "batching", batching);
-
-    let mut runtime = toml::Table::new();
-    insert_bool(&mut runtime, "verbose", options.verbose);
-    insert_table(&mut doc, "runtime", runtime);
-
-    write_toml_table(out_path, doc)
-}
+/// Read model facts out of `<snapshot>/config.json`.
 /// Used by [`write_dummy_startup_toml`] when the user didn't explicitly
 /// specify them in `[model.driver.options]`. Mirrors the legacy Python
 /// dummy driver's `hf_utils.load_hf_config()`-based discovery.
@@ -512,6 +467,52 @@ pub fn write_dummy_startup_toml(
 /// `driver/cuda/src/config.hpp`: `[model]` with
 /// `hf_repo`/`snapshot_dir`/`device`/`dtype`/optional load policy knobs,
 /// `[batching]` with KV-page geometry plus `swap_pool_size`, and `[runtime]`
+/// Emit the metal driver's startup TOML — same `[model]` + `[batching]` +
+/// `[runtime]` layout consumed by `driver/metal/src/config.hpp`. The metal
+/// driver speaks the same embedded in-process ABI as portable, so the
+/// launch state is identical apart from the `metal:N` backend selector.
+#[cfg(feature = "driver-metal")]
+pub fn write_metal_startup_toml(
+    out_path: &Path,
+    options: &MetalDriverOptions,
+    snapshot_dir: &Path,
+    _group_id: usize,
+) -> Result<()> {
+    let mut doc = toml::Table::new();
+
+    let mut model = toml::Table::new();
+    insert_str(&mut model, "hf_path", path_string(snapshot_dir));
+    insert_str(&mut model, "backend", &options.device);
+    insert_table(&mut doc, "model", model);
+
+    let mut batching = toml::Table::new();
+    insert_int(&mut batching, "kv_page_size", options.kv_page_size);
+    insert_int(&mut batching, "total_pages", options.total_pages);
+    insert_int(
+        &mut batching,
+        "max_forward_tokens",
+        options.max_forward_tokens,
+    );
+    insert_int(
+        &mut batching,
+        "max_forward_requests",
+        options.max_forward_requests,
+    );
+    insert_int(&mut batching, "cpu_pages", options.cpu_pages);
+    insert_str(
+        &mut batching,
+        "kv_cache_dtype",
+        options.kv_cache_dtype.clone(),
+    );
+    insert_table(&mut doc, "batching", batching);
+
+    let mut runtime = toml::Table::new();
+    insert_bool(&mut runtime, "verbose", options.verbose);
+    insert_table(&mut doc, "runtime", runtime);
+
+    write_toml_table(out_path, doc)
+}
+
 /// with the server verbosity flag.
 ///
 /// `[distributed]` is emitted only for TP launches; single-rank uses the

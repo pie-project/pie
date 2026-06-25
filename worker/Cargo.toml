@@ -17,10 +17,6 @@ crate-type = ["rlib"]
 
 # Binary half — the `pie` CLI. Parses argv via clap and dispatches into
 # the lib.
-[[bin]]
-name = "pie"
-path = "src/main.rs"
-
 [features]
 # Default to portable plus the always-linked dummy driver. Enabling
 # `driver-cuda` also links the native CUDA driver. `driver-dummy` is
@@ -46,53 +42,56 @@ profile-all = ["pie/profile-all"]
 # bundled into the `pie-driver-bridge` wheel via maturin), not in the
 # runtime crate itself.
 pie = { path = "../runtime" }
-# Direct dep so this crate's build script receives `DEP_PIE_SCHEMA_INCLUDE`
-# (the C header dir) from pie-schema's `links` build-script handoff.
-pie-schema = { path = "../protocol/schema" }
+# Shared tarpc control-plane contract.
+pie-controller-rpc = { path = "../interface/controller" }
+# Gateway data-plane RPC contract (post-inversion M3): GatewayInbound +
+# WorkerControl traits + the shared spawn_twoway link glue. The worker dials
+# INTO the gateway and serves WorkerControl over the split connection.
+pie-worker-rpc = { path = "../interface/worker" }
+
+# Direct dep so this crate's build script receives `DEP_PIE_DRIVER_ABI_INCLUDE`
+# (the C header dir) from pie-driver-abi's `links` build-script handoff.
+pie-driver-abi = { path = "../interface/driver" }
+# Shared id atoms (WorkerId / NodeId / ReqId / SessionId) and the client wire
+# vocabulary (ClientMessage / ServerMessage) the gateway data plane carries.
+pie-ids = { path = "../interface/ids" }
+pie-client-api = { path = "../interface/client" }
 # Direct dep for the parallel `DEP_PIE_IPC_INCLUDE` handoff (the in-proc
 # vtable header `pie_ipc.h` + `pie_ipc/inproc_server.hpp`).
 pie-ipc = { path = "../driver/ipc" }
-# Control-plane coordinator. The worker embeds it in-proc (`--single-node`) or
-# dials a standalone controller process (`--role/--controller`). Worker is the
-# assembly layer, so depending on the controller here is the intended direction.
-pie-controller = { path = "../controller" }
 anyhow = "1.0"
 rmp-serde = "1.3"
+# Verify content-addressed blob fetches (design §9): blake3(body) == BlobRef.hash.
+blake3 = "1"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 toml = "0.9"
 tokio = { version = "1.52", features = ["full"] }
+# `serde-transport-bincode` = control-plane codec (pie-controller-rpc client). The
+# data-plane codec is single-sourced in `pie-worker-rpc` (`dispatch_codec`,
+# MessagePack), so no `serde-transport-json` here.
+tarpc = { version = "0.35", features = [
+	"serde-transport",
+	"serde-transport-bincode",
+	"tcp",
+	"unix",
+] }
+# The WebSocket the standalone client server terminates (client wire vocabulary
+# comes from `pie-client`, already a dependency below).
+tokio-tungstenite = "0.28.0"
+futures = "0.3.31"
 mimalloc = "0.1"
 tracing = "0.1"
-# HuggingFace snapshot resolver. Same `~/.cache/huggingface/hub/` layout
-# the Python `huggingface_hub` package uses, so models downloaded by
-# either path are interchangeable.
-hf-hub = "1.0.0-rc.0"
 # `shm_unlink` for the hard-kill cleanup path; see serve.rs's shutdown
 # branch. Drivers normally clean up on graceful exit, but a SIGKILL
 # leaves the POSIX shmem region behind — we call shm_unlink directly
 # so the next launch doesn't trip on a stale segment.
 libc = "0.2"
-# CLI subcommand parsing — mirrors the Python pie_cli surface.
-clap = { version = "4.5", features = ["derive"] }
-# Local-time formatter for `pie auth add`'s default key-name timestamp,
-# matching the Python wrapper's `%Y-%m-%d-%H:%M:%S` shape.
-chrono = { version = "0.4", default-features = false, features = ["clock"] }
-# Python WASM runtime install (M8). The runtime tarball at
-# `registry.pie-project.org/api/v1/runtimes/python3.14/.../download` is
-# xz-compressed tar; `xz2` decompresses, `tar` extracts. `reqwest` is
-# already in the dep tree (transitively via the runtime crate); we
-# pin it directly here to make the dep explicit and pull in `blocking`.
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "blocking", "stream"] }
-tar = "0.4"
-xz2 = "0.1"
-
-# Live TUI monitor (M10). ratatui + crossterm match the conventional
-# pairing; nvml-wrapper feeds the GPU panel from libnvidia-ml.so when
-# present (gracefully absent on macOS / non-NVIDIA hosts).
-ratatui = "0.30"
-crossterm = "0.29"
-nvml-wrapper = "0.12"
+# Async HTTP client for the data-plane blob fetch (gateway_link.rs): the
+# worker pulls `GET {origin}/blob/{hash}` for multimodal inputs during
+# inference (design §9). Provisioning downloads (weights, py-runtime) live in
+# `bin/pie`, so no `blocking` here — blob fetch is async.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
 
 # Always-linked Rust dummy driver — random tokens, no model load.
 pie-driver-dummy = { path = "../driver/dummy" }

@@ -43,10 +43,11 @@ jobs:
           cargo test -p pie --lib
           cargo test -p pie-client --lib
 
-  # Full-workspace verification — the anti-bitrot net. Closes the gap that let
-  # the runtime benches rot unseen: the dedicated jobs only build a curated
-  # subset, so new crates (e.g. `pie-transport`) and the benches were compiled
-  # by nothing. This job compiles EVERY target and runs the workspace test set.
+  # Full-workspace verification — the guardrail + anti-bitrot net. Closes the
+  # gap that let the runtime benches rot unseen: the dedicated jobs only build a
+  # curated subset, so new crates (`pie-transport`) and the benches were
+  # compiled by nothing. This job compiles EVERY target and runs the workspace
+  # test set.
   #
   #   --exclude pie-server-py : links driver-cuda (needs nvcc) → cuda job only.
   #   --exclude pie-worker (test step only): pie-worker is exercised by the four

@@ -18,7 +18,7 @@ set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib)
 set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib)
 
 if(NOT PIE_SCHEMA_INCLUDE_DIR)
-  set(PIE_SCHEMA_INCLUDE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../protocol/schema/include")
+  set(PIE_SCHEMA_INCLUDE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../interface/driver/include")
 endif()
 if(NOT PIE_IPC_INCLUDE_DIR)
   set(PIE_IPC_INCLUDE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../ipc/include")
@@ -81,7 +81,7 @@ cpmaddpackage(URI "gh:nlohmann/json@3.12.0" OPTIONS "JSON_BuildTests OFF")
 # directly (no GGUF conversion).
 add_library(pie_driver_portable_lib STATIC
   src/entry.cpp
-  ../common/src/safetensors_manifest.cpp
+  src/safetensors_manifest.cpp
   src/safetensors.cpp
   src/hf_config.cpp
   src/gguf_archive.cpp
@@ -115,7 +115,6 @@ target_compile_options(pie_driver_portable_lib PRIVATE
 target_include_directories(pie_driver_portable_lib
   PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/src
-    ${CMAKE_CURRENT_SOURCE_DIR}/../common/include
     ${CMAKE_CURRENT_SOURCE_DIR}/../weight-loader/include
     ${PIE_SCHEMA_INCLUDE_DIR}
     ${PIE_IPC_INCLUDE_DIR})

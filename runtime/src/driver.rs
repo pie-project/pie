@@ -5,10 +5,10 @@
 //! all share the transport; there is no separate "cold path."
 //!
 //! Requests and responses are the wire-canonical
-//! [`pie_schema::RequestPayload`] / [`pie_schema::ResponsePayload`]
+//! [`pie_driver_abi::RequestPayload`] / [`pie_driver_abi::ResponsePayload`]
 //! enums directly — no pie-internal mirror. The runtime pairs each
 //! payload with a routing [`DriverId`] (the same value the wire
-//! [`pie_schema::Frame`] carries at its top level) to pick a channel.
+//! [`pie_driver_abi::Frame`] carries at its top level) to pick a channel.
 //!
 //! [`DriverChannel`] has two implementations:
 //!   - [`InProcChannel`] — embedded drivers (cuda + portable + dummy
@@ -63,9 +63,9 @@ impl DriverSpec {
 }
 
 /// Driver-bound request. The payload is the wire-canonical
-/// [`pie_schema::RequestPayload`] (Forward / Copy / Adapter / Health),
+/// [`pie_driver_abi::RequestPayload`] (Forward / Copy / Adapter / Health),
 /// with `driver_id` paired alongside for routing (the on-wire frame
-/// carries it at the top level via [`pie_schema::Frame.driver_id`]).
+/// carries it at the top level via [`pie_driver_abi::Frame.driver_id`]).
 ///
 /// The Save / ZoInitialize / ZoUpdate adapter ops are wired end-to-end
 /// but the per-driver dispatchers treat them as no-ops returning
@@ -75,7 +75,7 @@ impl DriverSpec {
 #[derive(Debug)]
 pub struct DriverRequest {
     pub driver_id: DriverId,
-    pub payload: pie_schema::RequestPayload,
+    pub payload: pie_driver_abi::RequestPayload,
 }
 
 #[cfg(test)]
@@ -110,13 +110,13 @@ mod tests {
 }
 
 /// Driver response. The payload is the wire-canonical
-/// [`pie_schema::ResponsePayload`] (Forward or Status); `aborted`
-/// mirrors the same flag on [`pie_schema::ResponseFrame`] (set by the
+/// [`pie_driver_abi::ResponsePayload`] (Forward or Status); `aborted`
+/// mirrors the same flag on [`pie_driver_abi::ResponseFrame`] (set by the
 /// driver on transport-level failures).
 #[derive(Debug)]
 pub struct DriverResponse {
     pub aborted: bool,
-    pub payload: pie_schema::ResponsePayload,
+    pub payload: pie_driver_abi::ResponsePayload,
 }
 
 #[async_trait]

@@ -588,25 +588,6 @@ export class PieClient {
         }
     }
 
-    /**
-     * Launches a daemon inferlet on a specific port.
-     * @param {string} inferlet The inferlet name.
-     * @param {number} port The TCP port.
-     * @param {Object} [input={}] Input parameters object, serialized to JSON.
-     */
-    async launchDaemon(inferlet, port, input = {}) {
-        const msg = {
-            type: "launch_daemon",
-            port,
-            inferlet,
-            input: JSON.stringify(input),
-        };
-        const { ok, result } = await this._sendMsgAndWait(msg);
-        if (!ok) {
-            throw new Error(`Failed to launch daemon: ${result}`);
-        }
-    }
-
     // =========================================================================
     // MCP
     // =========================================================================

@@ -1,0 +1,40 @@
+[package]
+name = "pie-worker-rpc"
+version = "0.1.0"
+edition = "2024"
+authors = ["In Gim <in.gim@icloud.com>"]
+description = "Gateway↔worker data-plane RPC interface: the `GatewayInbound` (gateway-served) + `WorkerControl` (worker-served) tarpc services that ride one worker→gateway connection, the shared two-way mux glue that splits that one connection into both, the single-sourced MessagePack data-plane codec, and the turn vocabulary those calls carry (Request/Accepted/Tokens/BlobRef/Priority/Control). Final DAG: deps pie-ids (atoms), pie-client-api (ClientMessage/ServerMessage), pie-controller-rpc (WorkerStatus), plus tarpc and its transitive foundations."
+license = "Apache-2.0"
+repository = "https://github.com/pie-project/pie"
+
+[lib]
+name = "pie_worker_rpc"
+path = "src/lib.rs"
+
+[dependencies]
+# Shared id atoms (WorkerId / ReqId / SessionId / TenantId) — REAL dep (the atoms
+# genuinely move to pie-ids in step 1, so they come from here even in Wave A).
+pie-ids = { path = "../ids" }
+# The FOREIGN non-atom types this crate embeds but does not define:
+# `ClientMessage`/`ServerMessage` (in Request/Tokens) live in pie-client-api;
+# `WorkerStatus` (in GatewayInbound::report) lives in pie-controller-rpc.
+pie-client-api = { path = "../client" }
+pie-controller-rpc = { path = "../controller" }
+# The RPC mechanism. `serde1` enables the serde derives on the macro-generated
+# request/response types; `tokio1` enables `NewClient::spawn` (just `tokio/rt`,
+# used by the typed link constructors). Transport/codec features (serde-transport
+# /tcp/unix) stay with the binaries (gateway/worker) so the contract crate
+# carries no transport.
+tarpc = { version = "0.35", features = ["serde1", "tokio1"] }
+# Foundations for the shared two-way mux glue (`spawn_twoway` + the typed link
+# constructors) and the serde derives on the data types + `TwoWayMessage`.
+serde = { version = "1.0", features = ["derive"] }
+futures = "0.3"                                     # Stream/Sink combinators + Abortable
+tokio = { version = "1", features = ["rt"] }        # spawn the two pump tasks
+thiserror = "2"                                     # the mux error enum
+tracing = "0.1"                                     # warn on inbound-mux failure
+# The single-sourced data-plane codec (`dispatch_codec`). MessagePack is
+# self-describing (the data plane carries internally-tagged ClientMessage/
+# ServerMessage, which bincode can't decode) and compact, and matches the
+# client WS wire (rmp_serde) → one codec end-to-end. Codec only, NOT a transport.
+tokio-serde = { version = "0.9", features = ["messagepack"] }

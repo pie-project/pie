@@ -1,0 +1,29 @@
+[package]
+name = "pie-controller-rpc"
+version = "0.1.0"
+edition = "2024"
+authors = ["In Gim <in.gim@yale.edu>"]
+description = "Controller control-plane RPC contract: the `Control` tarpc service plus its registry/liveness/routing data types, shared by the controller (server) and worker/gateway (clients)."
+license = "Apache-2.0"
+repository = "https://github.com/pie-project/pie"
+
+[lib]
+name = "pie_controller_rpc"
+path = "src/lib.rs"
+
+[dependencies]
+# Cross-node id atoms (`WorkerId`/`GatewayId`/`NodeId`) — the leaf id crate.
+pie-ids = { path = "../ids" }
+# `WorkerInfo.capability` carries `DriverCapabilities`, which lives in
+# `pie-driver-abi` (`capabilities.rs`).
+pie-driver-abi = { path = "../driver" }
+# Plain serde — control vocabulary travels as serde over the control channel,
+# never on the rkyv tensor ring (so it is NOT part of `SCHEMA_HASH`).
+serde = { version = "1.0", features = ["derive"] }
+# The RPC mechanism. `serde1` enables the serde derives on the macro-generated
+# request/response types; transport/codec features stay with the binaries.
+tarpc = { version = "0.35", features = ["serde1"] }
+
+[dev-dependencies]
+# Round-trips the serde control types in the unit tests.
+serde_json = "1.0"

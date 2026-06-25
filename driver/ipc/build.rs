@@ -6,7 +6,7 @@
 //! the C++ driver backends (cuda/portable) can `#include <pie_ipc.h>`
 //! (the in-proc vtable mechanism) and `<pie_ipc/inproc_server.hpp>`.
 //! The schema descriptor types those headers reference come from
-//! `pie-schema`'s parallel `DEP_PIE_SCHEMA_INCLUDE` handoff.
+//! `pie-driver-abi`'s parallel `DEP_PIE_DRIVER_ABI_INCLUDE` handoff.
 
 use std::path::PathBuf;
 

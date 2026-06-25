@@ -19,8 +19,8 @@
 #include <string>
 #include <vector>
 
-#include <pie_schema/response_builder.hpp>
-#include <pie_schema/view.hpp>
+#include <pie_driver_abi/response_builder.hpp>
+#include <pie_driver_abi/view.hpp>
 
 #include "raw_metal/raw_metal_executor.hpp"
 

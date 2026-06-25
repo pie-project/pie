@@ -9,17 +9,35 @@
 resolver = "2"
 members = [
     "runtime",
+    # Shared process skeleton (paths, config sourcing, tracing/metrics, signals,
+    # CLI skeleton). Depends on no role lib.
+    "bootstrap",
+    # Role libraries (pure libs: run(Config) -> Handle; no bin, never dep each other).
     "controller",
-    "transport",
-    "client/rust",
+    "gateway",
     "worker",
-    "protocol/schema",
-    "protocol/schema-bindgen",
-    "protocol/schema-derive",
+    "driver/transport",
+    "client/rust",
+    # Interface crates — boundary-named contracts (see designs/design-interface-restructure).
+    # ids: deduped id atoms (plain serde leaf). driver: rkyv ring + POD + capabilities + kv,
+    # with its 2 codegen tools. controller/worker/client: control-plane, data-plane, public-edge.
+    "interface/ids",
+    "interface/driver",
+    "interface/driver/derive",
+    "interface/driver/cbindgen",
+    "interface/controller",
+    "interface/worker",
+    "interface/client",
     "driver/ipc",
     "driver/dummy",
     "driver/weight-loader",
     "sdk/python-server",
+    # Thin binary shells composing bootstrap + role lib(s). `bin/pie` is the
+    # composition root (deps all three role libs; the standalone).
+    "bin/controller",
+    "bin/gateway",
+    "bin/worker",
+    "bin/pie",
 ]
 exclude = [
     "inferlets",

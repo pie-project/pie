@@ -32,7 +32,7 @@ def main() -> int:
     output_path.mkdir(parents=True, exist_ok=True)
 
     # Generate bindings using componentize-py
-    # The world is "inferlet" as defined in runtime/wit/world.wit
+    # The world is "inferlet" as defined in interface/inferlet/world.wit
     cmd = [
         "componentize-py",
         "-d",

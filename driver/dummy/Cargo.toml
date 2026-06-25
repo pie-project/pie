@@ -13,7 +13,7 @@ crate-type = ["staticlib", "rlib"]
 
 [dependencies]
 pie-ipc = { path = "../ipc" }
-pie-schema = { path = "../../protocol/schema" }
+pie-driver-abi = { path = "../../interface/driver" }
 anyhow = "1.0"
 bytemuck = "1.16"
 rand = { version = "0.8", features = ["small_rng"] }

@@ -12,11 +12,11 @@
 //   * Executor         (PIE_METAL_HAS_MLX)  — the MLX `ModelGraph` path, kept
 //     as an optional comparison backend.
 //
-// The interface references only MLX-free pie_schema types, so it compiles in
+// The interface references only MLX-free pie_driver_abi types, so it compiles in
 // both the default (no-MLX) and MLX-on builds.
 
-#include <pie_schema/response_builder.hpp>
-#include <pie_schema/view.hpp>
+#include <pie_driver_abi/response_builder.hpp>
+#include <pie_driver_abi/view.hpp>
 
 namespace pie_metal_driver {
 

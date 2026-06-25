@@ -332,7 +332,7 @@ impl ContextManager {
         struct ReplayToken {
             token: u32,
             position: u32,
-            mask: pie_schema::Brle,
+            mask: pie_driver_abi::Brle,
             adapter: Option<AdapterId>,
             adapter_seed: Option<i64>,
             forward_id: u64,
@@ -363,7 +363,7 @@ impl ContextManager {
                             mask: mask
                                 .get(i)
                                 .cloned()
-                                .unwrap_or_else(|| pie_schema::Brle::new(0)),
+                                .unwrap_or_else(|| pie_driver_abi::Brle::new(0)),
                             adapter: *adapter,
                             adapter_seed: *adapter_seed,
                             forward_id: *forward_id,
@@ -381,7 +381,7 @@ impl ContextManager {
             forward_id: info.forward_id,
         }));
 
-        let mut requests: Vec<(pie_schema::ForwardRequest, Vec<PhysicalPageId>, u32)> = Vec::new();
+        let mut requests: Vec<(pie_driver_abi::ForwardRequest, Vec<PhysicalPageId>, u32)> = Vec::new();
         let mut kv_so_far = 0usize;
         let mut first = true;
         let mut start = 0usize;
@@ -539,7 +539,7 @@ impl ContextManager {
         let committed_tokens = committed_len * page_size;
         let mut kv_so_far = prefix_tokens as u32;
 
-        let mut requests: Vec<(pie_schema::ForwardRequest, Vec<PhysicalPageId>, u32)> = Vec::new();
+        let mut requests: Vec<(pie_driver_abi::ForwardRequest, Vec<PhysicalPageId>, u32)> = Vec::new();
         let mut token_offset = 0usize;
         let mut pages_emitted = prefix_len;
 

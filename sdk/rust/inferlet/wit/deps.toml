@@ -1,3 +1,4 @@
-core = "../../../../runtime/wit/core/wit"
-zo = "../../../../runtime/wit/zo/wit"
-mcp = "../../../../runtime/wit/mcp/wit"
+core = "../../../../interface/inferlet/core/wit"
+zo = "../../../../interface/inferlet/zo/wit"
+mcp = "../../../../interface/inferlet/mcp/wit"
+instruct = "../../../../interface/inferlet/instruct/wit"

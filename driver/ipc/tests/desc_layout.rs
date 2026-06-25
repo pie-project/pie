@@ -2,7 +2,7 @@
 //!
 //! The F1 compatibility shim in `driver/{portable,cuda}/src/_bridge/`
 //! relies on the Rust `#[repr(C)] Pie<T>Desc` field order, sizes, and
-//! offsets matching the C struct declarations in `include/pie_schema.h`
+//! offsets matching the C struct declarations in `include/pie_driver_abi.h`
 //! byte-for-byte. If the macro changes how it emits Desc fields
 //! (rename, reorder, add padding), both sides silently corrupt the
 //! wire — there's no compile-time check.

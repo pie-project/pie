@@ -23,8 +23,6 @@ fn main() {
     let portable = cfg!(feature = "driver-portable");
     let cuda = cfg!(feature = "driver-cuda");
     let metal = cfg!(feature = "driver-metal");
-    println!("cargo:rerun-if-changed=../driver/common/include");
-    println!("cargo:rerun-if-changed=../driver/common/src");
     if cuda {
         println!("cargo:rerun-if-changed=../driver/cuda/CMakeLists.txt");
         println!("cargo:rerun-if-changed=../driver/cuda/cmake");
@@ -49,15 +47,18 @@ fn main() {
     build_dummy();
 }
 
-/// Read `DEP_PIE_SCHEMA_INCLUDE` — the directory where `pie-schema`'s
-/// build.rs publishes the schema C header (`pie_schema.h` + the
-/// `pie_schema/` view/response_builder helpers). Pass-through to CMake
-/// via `-DPIE_SCHEMA_INCLUDE_DIR=...` so each C++ driver backend can pick
-/// the headers up with `target_include_directories`.
-fn pie_schema_include_dir() -> PathBuf {
-    let dir = std::env::var("DEP_PIE_SCHEMA_INCLUDE").expect(
-        "pie-schema's build.rs did not emit cargo:include — \
-                 check that `links = \"pie_schema\"` is set in protocol/schema/Cargo.toml",
+/// Read `DEP_PIE_DRIVER_ABI_INCLUDE` — the directory where `pie-driver-abi`'s
+/// build.rs publishes the driver-ABI C header (`pie_driver_abi.h` + the
+/// `pie_driver_abi/` view/response_builder helpers). Pass-through to CMake via
+/// `-DPIE_SCHEMA_INCLUDE_DIR=...` — the CMake var name is deliberately kept (it
+/// is the contract with `driver/*/CMakeLists.txt`'s `if(NOT PIE_SCHEMA_INCLUDE_DIR)`
+/// fallback; renaming it would have to happen on both sides at once for zero gain)
+/// — so each C++ driver backend can pick the headers up with
+/// `target_include_directories`.
+fn pie_driver_abi_include_dir() -> PathBuf {
+    let dir = std::env::var("DEP_PIE_DRIVER_ABI_INCLUDE").expect(
+        "pie-driver-abi's build.rs did not emit cargo:include — \
+                 check that `links = \"pie_driver_abi\"` is set in interface/driver/Cargo.toml",
     );
     PathBuf::from(dir)
 }
@@ -65,7 +66,7 @@ fn pie_schema_include_dir() -> PathBuf {
 /// Read `DEP_PIE_IPC_INCLUDE` — the directory where `pie-ipc`'s build.rs
 /// publishes the in-proc mechanism C headers (`pie_ipc.h` vtable +
 /// `pie_ipc/inproc_server.hpp`). Pass-through to CMake via
-/// `-DPIE_IPC_INCLUDE_DIR=...`. These headers `#include <pie_schema.h>`,
+/// `-DPIE_IPC_INCLUDE_DIR=...`. These headers `#include <pie_driver_abi.h>`,
 /// so both include dirs are added to the C++ targets.
 fn pie_ipc_include_dir() -> PathBuf {
     let dir = std::env::var("DEP_PIE_IPC_INCLUDE").expect(
@@ -73,6 +74,122 @@ fn pie_ipc_include_dir() -> PathBuf {
                  check that `links = \"pie_ipc\"` is set in driver/ipc/Cargo.toml",
     );
     PathBuf::from(dir)
+}
+
+// -----------------------------------------------------------------------------
+// driver/metal — MLX-free raw-Metal driver (Apple Silicon, macOS-only)
+// -----------------------------------------------------------------------------
+
+fn build_metal() {
+    let target_os = target_os();
+    if target_os != "macos" {
+        panic!(
+            "--features driver-metal is macOS-only (got target_os={target_os:?}). \
+             On Linux, use `--features driver-cuda`; the metal flavor targets \
+             Apple Silicon via MLX + native Metal shaders."
+        );
+    }
+
+    let driver_dir = PathBuf::from("../driver/metal");
+    println!("cargo:rerun-if-changed=../driver/metal/CMakeLists.txt");
+    println!("cargo:rerun-if-changed=../driver/metal/src");
+
+    let mut cfg = cmake::Config::new(&driver_dir);
+    // Per-flavor out_dir keeps multi-driver builds from clobbering each
+    // other's CMake cache (see build_portable).
+    cfg.out_dir(PathBuf::from(std::env::var_os("OUT_DIR").unwrap()).join("metal"));
+    cfg.build_target("pie_driver_metal_lib")
+        .define("BUILD_SHARED_LIBS", "OFF")
+        .define("PIE_SCHEMA_INCLUDE_DIR", pie_driver_abi_include_dir())
+        .define("PIE_IPC_INCLUDE_DIR", pie_ipc_include_dir());
+    enable_position_independent_archives(&mut cfg);
+
+    // Persistent CPM cache for the header-only deps (tomlplusplus / CLI11
+    // / nlohmann_json) and, when enabled, the MLX source tree.
+    println!("cargo:rerun-if-env-changed=CPM_SOURCE_CACHE");
+    if let Ok(cache) = std::env::var("CPM_SOURCE_CACHE") {
+        cfg.define("CPM_SOURCE_CACHE", cache);
+    }
+
+    // MLX is OFF by default — the raw-Metal driver is MLX-free. Left as an
+    // opt-in (PIE_METAL_WITH_MLX=1) for the legacy MLX executor path.
+    println!("cargo:rerun-if-env-changed=PIE_METAL_WITH_MLX");
+    let mlx_on = std::env::var("PIE_METAL_WITH_MLX")
+        .map(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "on" | "true" | "yes"))
+        .unwrap_or(false);
+    cfg.define("PIE_METAL_WITH_MLX", if mlx_on { "ON" } else { "OFF" });
+
+    // MLX provider: "fetch" (FetchContent from source, default) or "system"
+    // (link a prebuilt MLX via find_package(MLX), e.g. `brew install mlx`).
+    println!("cargo:rerun-if-env-changed=PIE_METAL_MLX_PROVIDER");
+    if let Ok(provider) = std::env::var("PIE_METAL_MLX_PROVIDER") {
+        let provider = provider.to_ascii_lowercase();
+        if !matches!(provider.as_str(), "fetch" | "system") {
+            panic!(
+                "PIE_METAL_MLX_PROVIDER must be \"fetch\" or \"system\" \
+                 (got {provider:?})"
+            );
+        }
+        cfg.define("PIE_METAL_MLX_PROVIDER", provider);
+    }
+
+    // Source-fetch only: build MLX's Metal GPU backend (needs `xcrun metal`).
+    println!("cargo:rerun-if-env-changed=PIE_METAL_MLX_BUILD_METAL");
+    if let Ok(v) = std::env::var("PIE_METAL_MLX_BUILD_METAL") {
+        let on = matches!(v.to_ascii_lowercase().as_str(), "1" | "on" | "true" | "yes");
+        cfg.define("PIE_METAL_MLX_BUILD_METAL", if on { "ON" } else { "OFF" });
+    }
+
+    let dst = cfg.build();
+    let build_dir = dst.join("build");
+
+    add_link_search_paths(&build_dir);
+
+    // Driver lib. tomlplusplus / nlohmann_json / CLI11 are header-only
+    // and produce no archive; the static lib is self-contained (modulo
+    // MLX, which adds its own archives picked up by add_link_search_paths
+    // when PIE_METAL_WITH_MLX=ON).
+    println!("cargo:rustc-link-lib=static=pie_driver_metal_lib");
+
+    // MLX link (opt-in legacy path only).
+    if mlx_on {
+        let provider = std::env::var("PIE_METAL_MLX_PROVIDER")
+            .map(|p| p.to_ascii_lowercase())
+            .unwrap_or_else(|_| "fetch".to_string());
+        if provider == "system" {
+            let prefix = std::env::var("PIE_MLX_PREFIX")
+                .ok()
+                .filter(|s| !s.is_empty())
+                .or_else(|| {
+                    std::process::Command::new("brew")
+                        .args(["--prefix", "mlx"])
+                        .output()
+                        .ok()
+                        .filter(|o| o.status.success())
+                        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                        .filter(|s| !s.is_empty())
+                })
+                .unwrap_or_else(|| "/opt/homebrew/opt/mlx".to_string());
+            let libdir = format!("{prefix}/lib");
+            println!("cargo:rustc-link-search=native={libdir}");
+            println!("cargo:rustc-link-lib=dylib=mlx");
+            println!("cargo:rustc-link-arg=-Wl,-rpath,{libdir}");
+        } else {
+            println!("cargo:rustc-link-lib=static=mlx");
+        }
+        println!("cargo:rustc-link-lib=framework=QuartzCore");
+    }
+
+    // Apple frameworks the metal driver pulls. -framework on macOS is the
+    // moral equivalent of -l on linux.
+    println!("cargo:rustc-link-lib=framework=Accelerate");
+    add_system_libs(/*metal=*/ true);
+
+    println!(
+        "cargo:rustc-env=PIE_DRIVER_METAL_BUILD_DIR={}",
+        build_dir.display()
+    );
+    rerun_if_changed(&driver_dir);
 }
 
 // -----------------------------------------------------------------------------
@@ -140,7 +257,7 @@ fn build_portable() {
     cfg.out_dir(portable_out_dir);
     cfg.build_target("pie_driver_portable_lib")
         .define("BUILD_SHARED_LIBS", "OFF")
-        .define("PIE_SCHEMA_INCLUDE_DIR", pie_schema_include_dir())
+        .define("PIE_SCHEMA_INCLUDE_DIR", pie_driver_abi_include_dir())
         .define("PIE_IPC_INCLUDE_DIR", pie_ipc_include_dir());
     enable_position_independent_archives(&mut cfg);
     // CMake caches option values under OUT_DIR. Define every backend flag
@@ -293,7 +410,7 @@ fn build_cuda() {
     cfg.out_dir(std::path::PathBuf::from(std::env::var_os("OUT_DIR").unwrap()).join("cuda"));
     cfg.build_target("pie_driver_cuda_lib")
         .define("BUILD_SHARED_LIBS", "OFF")
-        .define("PIE_SCHEMA_INCLUDE_DIR", pie_schema_include_dir())
+        .define("PIE_SCHEMA_INCLUDE_DIR", pie_driver_abi_include_dir())
         .define("PIE_IPC_INCLUDE_DIR", pie_ipc_include_dir());
     enable_position_independent_archives(&mut cfg);
 
@@ -463,142 +580,6 @@ fn build_cuda() {
 
     println!(
         "cargo:rustc-env=PIE_DRIVER_CUDA_BUILD_DIR={}",
-        build_dir.display()
-    );
-    rerun_if_changed(&driver_dir);
-}
-
-// -----------------------------------------------------------------------------
-// driver/metal
-// -----------------------------------------------------------------------------
-
-fn build_metal() {
-    let target_os = target_os();
-    if target_os != "macos" {
-        panic!(
-            "--features driver-metal is macOS-only (got target_os={target_os:?}). \
-             On Linux, use `--features driver-cuda`; the metal flavor targets \
-             Apple Silicon via MLX + native Metal shaders."
-        );
-    }
-
-    let driver_dir = PathBuf::from("../driver/metal");
-    println!("cargo:rerun-if-changed=../driver/metal/CMakeLists.txt");
-    println!("cargo:rerun-if-changed=../driver/metal/src");
-
-    let mut cfg = cmake::Config::new(&driver_dir);
-    // Per-flavor out_dir keeps multi-driver builds from clobbering each
-    // other's CMake cache (see build_portable).
-    cfg.out_dir(PathBuf::from(std::env::var_os("OUT_DIR").unwrap()).join("metal"));
-    cfg.build_target("pie_driver_metal_lib")
-        .define("BUILD_SHARED_LIBS", "OFF")
-        .define("PIE_SCHEMA_INCLUDE_DIR", pie_schema_include_dir())
-        .define("PIE_IPC_INCLUDE_DIR", pie_ipc_include_dir());
-    enable_position_independent_archives(&mut cfg);
-
-    // Persistent CPM cache for the header-only deps (tomlplusplus / CLI11
-    // / nlohmann_json) and, when enabled, the MLX source tree.
-    println!("cargo:rerun-if-env-changed=CPM_SOURCE_CACHE");
-    if let Ok(cache) = std::env::var("CPM_SOURCE_CACHE") {
-        cfg.define("CPM_SOURCE_CACHE", cache);
-    }
-
-    // MLX is OFF by default so the foundation skeleton compiles/links fast
-    // without a network fetch (the GLOB'd ops/model/etc dirs stay empty
-    // until delta wires the real MLX FetchContent and flips this on via
-    // PIE_METAL_WITH_MLX=1).
-    println!("cargo:rerun-if-env-changed=PIE_METAL_WITH_MLX");
-    let mlx_on = std::env::var("PIE_METAL_WITH_MLX")
-        .map(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "on" | "true" | "yes"))
-        .unwrap_or(false);
-    cfg.define("PIE_METAL_WITH_MLX", if mlx_on { "ON" } else { "OFF" });
-
-    // MLX provider: "fetch" (FetchContent from source, default) or "system"
-    // (link a prebuilt MLX via find_package(MLX), e.g. `brew install mlx`).
-    // The system path is the GPU build on a host with no `xcrun metal`
-    // (brew ships MLX's Metal kernels precompiled). Defaults to fetch.
-    println!("cargo:rerun-if-env-changed=PIE_METAL_MLX_PROVIDER");
-    if let Ok(provider) = std::env::var("PIE_METAL_MLX_PROVIDER") {
-        let provider = provider.to_ascii_lowercase();
-        if !matches!(provider.as_str(), "fetch" | "system") {
-            panic!(
-                "PIE_METAL_MLX_PROVIDER must be \"fetch\" or \"system\" \
-                 (got {provider:?})"
-            );
-        }
-        cfg.define("PIE_METAL_MLX_PROVIDER", provider);
-    }
-
-    // Source-fetch only: build MLX's Metal GPU backend (needs `xcrun metal`).
-    // OFF gives a CPU-only MLX that still compiles+links the whole driver
-    // against the real MLX API on a CLT-only host. Ignored by the system
-    // provider, which uses prebuilt kernels.
-    println!("cargo:rerun-if-env-changed=PIE_METAL_MLX_BUILD_METAL");
-    if let Ok(v) = std::env::var("PIE_METAL_MLX_BUILD_METAL") {
-        let on = matches!(v.to_ascii_lowercase().as_str(), "1" | "on" | "true" | "yes");
-        cfg.define("PIE_METAL_MLX_BUILD_METAL", if on { "ON" } else { "OFF" });
-    }
-
-    let dst = cfg.build();
-    let build_dir = dst.join("build");
-
-    add_link_search_paths(&build_dir);
-
-    // Driver lib. tomlplusplus / nlohmann_json / CLI11 are header-only
-    // and produce no archive; the static lib is self-contained (modulo
-    // MLX, which adds its own archives picked up by add_link_search_paths
-    // when PIE_METAL_WITH_MLX=ON).
-    println!("cargo:rustc-link-lib=static=pie_driver_metal_lib");
-
-    // MLX link. The static driver lib references MLX symbols but doesn't carry
-    // them, so the final worker link must pull MLX in itself. Only when the
-    // compute layer is compiled (PIE_METAL_WITH_MLX=1); the stub skeleton has
-    // no MLX symbols.
-    if mlx_on {
-        let provider = std::env::var("PIE_METAL_MLX_PROVIDER")
-            .map(|p| p.to_ascii_lowercase())
-            .unwrap_or_else(|_| "fetch".to_string());
-        if provider == "system" {
-            // Prebuilt MLX (e.g. `brew install mlx`). Resolve the prefix the
-            // same way FetchMLX.cmake's system path does: PIE_MLX_PREFIX
-            // override → `brew --prefix mlx` → /opt/homebrew/opt/mlx.
-            let prefix = std::env::var("PIE_MLX_PREFIX")
-                .ok()
-                .filter(|s| !s.is_empty())
-                .or_else(|| {
-                    std::process::Command::new("brew")
-                        .args(["--prefix", "mlx"])
-                        .output()
-                        .ok()
-                        .filter(|o| o.status.success())
-                        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-                        .filter(|s| !s.is_empty())
-                })
-                .unwrap_or_else(|| "/opt/homebrew/opt/mlx".to_string());
-            let libdir = format!("{prefix}/lib");
-            println!("cargo:rustc-link-search=native={libdir}");
-            println!("cargo:rustc-link-lib=dylib=mlx");
-            // libmlx.dylib loads @rpath/libjaccl.dylib (same dir); add an rpath
-            // so it resolves at runtime.
-            println!("cargo:rustc-link-arg=-Wl,-rpath,{libdir}");
-        } else {
-            // Source (FetchContent) build: MLX produces libmlx.a under the
-            // cmake build tree (search paths added by add_link_search_paths).
-            println!("cargo:rustc-link-lib=static=mlx");
-        }
-        // MLX additionally pulls QuartzCore (on top of the Metal / MetalKit /
-        // Foundation / Accelerate set emitted below).
-        println!("cargo:rustc-link-lib=framework=QuartzCore");
-    }
-
-    // Apple frameworks the metal driver + MLX pull. -framework on macOS
-    // is the moral equivalent of -l on linux. (Accelerate added on top of
-    // the Metal/MetalKit/Foundation set add_system_libs already emits.)
-    println!("cargo:rustc-link-lib=framework=Accelerate");
-    add_system_libs(/*metal=*/ true);
-
-    println!(
-        "cargo:rustc-env=PIE_DRIVER_METAL_BUILD_DIR={}",
         build_dir.display()
     );
     rerun_if_changed(&driver_dir);
