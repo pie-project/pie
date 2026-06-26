@@ -18,12 +18,12 @@ crate-type = ["rlib"]
 # Binary half — the `pie` CLI. Parses argv via clap and dispatches into
 # the lib.
 [features]
-# Default to portable plus the always-linked dummy driver. Enabling
-# `driver-cuda` also links the native CUDA driver. `driver-dummy` is
+# Default = no embedded backend feature; the always-linked dummy driver is
+# selected at runtime. Enable `driver-cuda` (Linux/NVIDIA) or `driver-metal`
+# (macOS) for real inference. `driver-dummy` is
 # kept as a compatibility no-op for older build commands; the dummy
 # Rust driver is no longer gated.
-default = ["driver-portable"]
-driver-portable = ["dep:pie-weight-loader"]
+default = []
 driver-cuda = ["dep:pie-weight-loader"]
 driver-metal = ["dep:pie-weight-loader"]
 driver-dummy = []

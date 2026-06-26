@@ -1,6 +1,6 @@
 // pie_driver_cuda — library entry point.
 //
-// Same shape as driver/portable/src/entry.hpp — exposed so the same
+// Same shape as driver/metal/src/entry.hpp — exposed so the same
 // translation units back both the standalone executable
 // (`pie_driver_cuda`, used by the Python subprocess path) and the
 // in-process static library (`pie_driver_cuda_lib`, linked into
@@ -39,8 +39,7 @@ int pie_driver_cuda_run(int argc,
 
 // Signal the running driver's serve loop to exit. Idempotent; safe to
 // call from any thread; no-op until the serve loop is reached.
-// Single-instance only — see driver/portable/src/entry.hpp for the
-// same caveat.
+// Single-instance only — same caveat as the other embedded drivers.
 void pie_driver_cuda_request_stop(void);
 
 #ifdef __cplusplus

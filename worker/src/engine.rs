@@ -40,7 +40,7 @@ pub struct DriverHandle(EmbeddedDriver);
 
 impl DriverHandle {
     /// Returns the driver's shmem region name, if any. `None` for
-    /// embedded cuda/portable drivers (no shmem region opened).
+    /// embedded cuda/metal/dummy drivers (no shmem region opened).
     pub fn shmem_name(&self) -> Option<&str> {
         self.0.shmem_name.as_deref()
     }
@@ -736,17 +736,11 @@ fn start_embedded_drivers(
 }
 
 fn embedded_opts_for_device(base_opts: &DriverOptions, device: String) -> DriverOptions {
-    #[cfg(not(any(feature = "driver-portable", feature = "driver-cuda")))]
+    #[cfg(not(feature = "driver-cuda"))]
     let _ = &device;
 
     #[allow(unreachable_patterns)]
     match base_opts {
-        #[cfg(feature = "driver-portable")]
-        DriverOptions::Portable(opts) => {
-            let mut opts = opts.clone();
-            opts.device = device;
-            DriverOptions::Portable(opts)
-        }
         #[cfg(feature = "driver-cuda")]
         DriverOptions::CudaNative(opts) => {
             let mut opts = opts.clone();
@@ -758,11 +752,6 @@ fn embedded_opts_for_device(base_opts: &DriverOptions, device: String) -> Driver
 }
 
 fn apply_embedded_verbose(options: &mut DriverOptions, verbose: bool) {
-    #[cfg(feature = "driver-portable")]
-    if let DriverOptions::Portable(p) = options {
-        p.verbose = verbose;
-    }
-
     #[cfg(feature = "driver-cuda")]
     if let DriverOptions::CudaNative(opts) = options {
         opts.verbose = verbose;
@@ -773,7 +762,7 @@ fn apply_embedded_verbose(options: &mut DriverOptions, verbose: bool) {
         opts.verbose = verbose;
     }
 
-    #[cfg(not(any(feature = "driver-portable", feature = "driver-cuda")))]
+    #[cfg(not(any(feature = "driver-cuda", feature = "driver-metal")))]
     let _ = (options, verbose);
 }
 
@@ -822,7 +811,7 @@ mod tests {
     fn startup_banner_render_includes_public_startup_fields_only() {
         let banner = StartupBanner {
             model: "default (Qwen/Qwen3-0.6B)".to_string(),
-            driver: "portable".to_string(),
+            driver: "dummy".to_string(),
             device: "cpu".to_string(),
         };
 

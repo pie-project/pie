@@ -7,7 +7,7 @@
 // on-device. A fused custom Metal kernel (`fast::metal_kernel`) can replace
 // the hot path later; the MLX path is the correctness reference.
 //
-// Wire-format sampler type IDs mirror driver/portable/src/sampler.hpp and
+// Wire-format sampler type IDs mirror the C++ driver sampler ABI and
 // runtime/src/inference/request.rs.
 
 #include <cstdint>

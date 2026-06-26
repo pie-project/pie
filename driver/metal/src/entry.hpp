@@ -1,6 +1,6 @@
 // pie_driver_metal — library entry point.
 //
-// Same shape as driver/cuda/src/entry.hpp and driver/portable/src/entry.hpp:
+// Same shape as driver/cuda/src/entry.hpp:
 // the translation units here back both the standalone executable
 // (`pie_driver_metal`) and the in-process static library
 // (`pie_driver_metal_lib`), which `pie-worker` links when built with

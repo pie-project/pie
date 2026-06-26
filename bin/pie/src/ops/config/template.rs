@@ -1,5 +1,5 @@
 //! Default `config.toml` template emitted by `pie config init`. The
-//! highest-priority compiled flavor (cuda → portable → dummy) picks
+//! highest-priority compiled flavor (cuda → metal → dummy) picks
 //! which `[model.driver]` block to splice in, so the generated config
 //! "just works" without a follow-up edit. Multi-flavor builds always
 //! pick the most capable backend.
@@ -13,8 +13,6 @@ use pie_worker::driver_ffi::{self, Flavor};
 /// binds an ephemeral worker port at boot).
 pub fn default_config_content() -> String {
     let driver_block = match driver_ffi::default_flavor() {
-        #[cfg(feature = "driver-portable")]
-        Some(Flavor::Portable) => PORTABLE_DRIVER_BLOCK,
         #[cfg(feature = "driver-cuda")]
         Some(Flavor::Cuda) => CUDA_DRIVER_BLOCK,
         Some(Flavor::Dummy) => DUMMY_DRIVER_BLOCK,
@@ -104,19 +102,6 @@ restore_pause_at_utilization = 0.85
 # WASM time, but won't help workloads where WASM ≈ 0 (e.g.
 # text completion). Range 0..=64.
 speculation_depth = 1
-"#;
-
-#[cfg(feature = "driver-portable")]
-const PORTABLE_DRIVER_BLOCK: &str = r#"
-[model.driver]
-type = "portable"
-device = ["auto"]
-ipc_profile = "balanced" # "latency", "balanced", or "power"
-
-[model.driver.options]
-max_forward_tokens = 10240
-max_forward_requests = 512
-kv_cache_dtype = "auto"
 "#;
 
 #[cfg(feature = "driver-cuda")]

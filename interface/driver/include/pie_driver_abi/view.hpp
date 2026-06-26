@@ -1,6 +1,6 @@
 // pie_driver_abi/view.hpp — driver-side SoA view + AoS→SoA demux.
 //
-// Compatibility adapter for the C++ backends (cuda + portable). The
+// Compatibility adapter for the C++ backends (cuda + metal). The
 // wire schema in pie_driver_abi.h gives you `Pie*Desc` POD structs that
 // mirror the rkyv archive field-for-field. The C++ handler code
 // (`forward.cpp`, `plan.cpp`, sampler dispatch) wants flat SoA arrays
@@ -9,8 +9,8 @@
 // arenas. The arenas live in [`RequestArenas`] and are reset+refilled
 // per call.
 //
-// Header-only: shared between cuda and portable. Both
-// `driver/cuda/CMakeLists.txt` and `driver/portable/CMakeLists.txt`
+// Header-only: shared between cuda and metal. Both
+// `driver/cuda/CMakeLists.txt` and `driver/metal/CMakeLists.txt`
 // add `${PIE_SCHEMA_INCLUDE_DIR}` to their include path — the
 // declarations and `inline` definitions below resolve automatically.
 
@@ -156,8 +156,8 @@ struct PieForwardRequestView {
     PieSlice<std::uint32_t> sampler_label_indptr;  // CSR into sampler_label_ids
     PieSlice<std::uint32_t> request_num_samplers;  // per-request count
 
-    // Adapter bindings (Vec<AdapterBinding> → flat lists). Portable
-    // reinterprets these as int64 (`adapter_indices.as<int64_t>()`).
+    // Adapter bindings (Vec<AdapterBinding> → flat lists). C++ drivers
+    // reinterpret these as int64 (`adapter_indices.as<int64_t>()`).
     PieSlice<std::int64_t> adapter_indices;       // -1 sentinel for None
     PieSlice<std::int64_t> adapter_seeds;         // -1 sentinel for None
 
@@ -293,7 +293,7 @@ struct RequestArenas {
     std::vector<std::uint32_t> request_num_samplers;
 
     // Adapter binding flat lists (-1 sentinel for None). Both i64
-    // because portable reinterprets via `.as<int64_t>()`.
+    // because the C++ drivers reinterpret via `.as<int64_t>()`.
     std::vector<std::int64_t> adapter_indices;
     std::vector<std::int64_t> adapter_seeds;
 
@@ -464,7 +464,7 @@ inline void fill_forward_view(const PieForwardRequestDesc& f,
 
     // Adapter bindings → two parallel flat lists. The wire format
     // already uses i64 with -1 sentinels for both fields, matching what
-    // portable consumes via `.as<int64_t>()` — this is a pure
+    // the C++ drivers consume via `.as<int64_t>()` — this is a pure
     // demultiplex, no value conversion.
     const std::size_t b = f.adapter_bindings_len;
     arenas.adapter_indices.resize(b);

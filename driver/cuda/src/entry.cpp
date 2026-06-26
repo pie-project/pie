@@ -4,8 +4,7 @@
 // All meaningful logic lives in `run_impl`; the `extern "C"` wrapper
 // at the bottom catches any escaping C++ exception so we never
 // propagate across the FFI boundary (which would be UB). Mirrors
-// driver/portable/src/entry.cpp's shape — see that file for the
-// invariants.
+// the shared embedded-driver entry shape and invariants.
 
 #include "entry.hpp"
 

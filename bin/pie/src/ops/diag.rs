@@ -71,12 +71,12 @@ fn pick_smoke_flavor(name: Option<&str>) -> Result<Flavor> {
     if let Some(n) = name {
         // Reuse the TOML kind parser for symmetry: same string set.
         let kind: DriverKind = match n {
-            "portable" => DriverKind::Portable,
             "cuda" | "cuda_native" => DriverKind::CudaNative,
+            "metal" => DriverKind::Metal,
             "dummy" => DriverKind::Dummy,
             other => {
                 return Err(anyhow!(
-                    "--flavor must be one of \"portable\" | \"cuda\" | \"dummy\" \
+                    "--flavor must be one of \"cuda\" | \"metal\" | \"dummy\" \
                      (got {other:?}). Compiled flavors: {compiled}.",
                     compiled = driver_ffi::compiled_summary(),
                 ));

@@ -5,11 +5,9 @@
 //! dummy driver is always linked; the resulting binary dispatches at
 //! runtime via `[model].driver.type` in the config TOML. The drivers
 //! expose distinctly-named C entry points
-//! (`pie_driver_{portable,cuda,dummy}_run` / `_request_stop`) so their
+//! (`pie_driver_{cuda,metal,dummy}_run` / `_request_stop`) so their
 //! static archives can coexist in one binary without symbol collisions.
 //!
-//!   - `driver-portable` (default): ggml-backed CPU/CUDA/Metal/Vulkan
-//!     driver. Static libs come from llama.cpp's CPM-vendored ggml.
 //!   - `driver-cuda`: native CUDA driver with flashinfer kernels.
 //!     Statically links the per-toolkit CUDA libs from `$CUDA_HOME`
 //!     (or `/usr/local/cuda`) so the resulting binary has zero CUDA
@@ -20,7 +18,6 @@
 use std::path::{Path, PathBuf};
 
 fn main() {
-    let portable = cfg!(feature = "driver-portable");
     let cuda = cfg!(feature = "driver-cuda");
     let metal = cfg!(feature = "driver-metal");
     if cuda {
@@ -35,9 +32,6 @@ fn main() {
         println!("cargo:rerun-if-changed=../driver/metal/src");
     }
 
-    if portable {
-        build_portable();
-    }
     if cuda {
         build_cuda();
     }
@@ -96,7 +90,7 @@ fn build_metal() {
 
     let mut cfg = cmake::Config::new(&driver_dir);
     // Per-flavor out_dir keeps multi-driver builds from clobbering each
-    // other's CMake cache (see build_portable).
+    // other's CMake cache.
     cfg.out_dir(PathBuf::from(std::env::var_os("OUT_DIR").unwrap()).join("metal"));
     cfg.build_target("pie_driver_metal_lib")
         .define("BUILD_SHARED_LIBS", "OFF")
@@ -204,189 +198,6 @@ fn build_dummy() {
 }
 
 // -----------------------------------------------------------------------------
-// driver/portable
-// -----------------------------------------------------------------------------
-
-fn build_portable() {
-    let driver_dir = PathBuf::from("../driver/portable");
-    let cuda_enabled = std::env::var("PIE_PORTABLE_CUDA").is_ok();
-    let vulkan_enabled = std::env::var("PIE_PORTABLE_VULKAN").is_ok();
-    let metal_enabled = std::env::var("PIE_PORTABLE_METAL").is_ok();
-    let target_os = target_os();
-    println!("cargo:rerun-if-env-changed=PIE_PORTABLE_CUDA");
-    println!("cargo:rerun-if-env-changed=PIE_PORTABLE_VULKAN");
-    println!("cargo:rerun-if-env-changed=PIE_PORTABLE_METAL");
-
-    if metal_enabled && target_os != "macos" {
-        panic!("PIE_PORTABLE_METAL is only valid on macOS (got target_os={target_os:?})");
-    }
-    if cuda_enabled && target_os == "macos" {
-        panic!(
-            "PIE_PORTABLE_CUDA is not supported on macOS — use \
-             PIE_PORTABLE_METAL instead, or build the cuda flavor on Linux."
-        );
-    }
-
-    let mut cfg = cmake::Config::new(&driver_dir);
-    // Per-flavor `out_dir` so multi-driver builds (e.g.
-    // --features driver-portable,driver-cuda) don't clobber each
-    // other's CMake cache. Without this, the second cmake::Config
-    // invocation overwrites the first's `build/` and reconfigures
-    // it for the wrong project.
-    let portable_out_dir = if target_os == "windows" {
-        // ggml-vulkan creates a nested shader-generator CMake project.
-        // Keeping this out of Cargo's hashed OUT_DIR avoids MSBuild's legacy
-        // 260-character path limit on Windows.
-        let target_root = std::env::var_os("CARGO_TARGET_DIR")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from(std::env::var_os("OUT_DIR").unwrap()));
-        let mut flavor = String::from("portable");
-        if cuda_enabled {
-            flavor.push_str("-cuda");
-        }
-        if vulkan_enabled {
-            flavor.push_str("-vulkan");
-        }
-        if metal_enabled {
-            flavor.push_str("-metal");
-        }
-        target_root.join("cmake").join(flavor)
-    } else {
-        PathBuf::from(std::env::var_os("OUT_DIR").unwrap()).join("portable")
-    };
-    cfg.out_dir(portable_out_dir);
-    cfg.build_target("pie_driver_portable_lib")
-        .define("BUILD_SHARED_LIBS", "OFF")
-        .define("PIE_SCHEMA_INCLUDE_DIR", pie_driver_abi_include_dir())
-        .define("PIE_IPC_INCLUDE_DIR", pie_ipc_include_dir());
-    enable_position_independent_archives(&mut cfg);
-    // CMake caches option values under OUT_DIR. Define every backend flag
-    // explicitly so flipping PIE_PORTABLE_* between builds cannot leave stale
-    // CUDA/Vulkan/Metal sources compiled into the portable archive.
-    cfg.define("GGML_CUDA", if cuda_enabled { "ON" } else { "OFF" })
-        .define("GGML_VULKAN", if vulkan_enabled { "ON" } else { "OFF" })
-        .define("GGML_METAL", if metal_enabled { "ON" } else { "OFF" });
-    if cuda_enabled {
-        cfg
-            // ggml's CUDA-graph capture/replay is OFF by default at the ggml-
-            // subproject level; llama.cpp's parent CMakeLists.txt flips it
-            // ON. Embedding ggml directly (as we do here) misses that override
-            // and ends up issuing ~30 kernel launches per decode step, which
-            // costs ~1 ms vs ~0.3 ms with capture. Enable explicitly.
-            .define("GGML_CUDA_GRAPHS", "ON")
-            .define("GGML_STATIC", "ON")
-            // llama.cpp b8994 added a multi-GPU NCCL allreduce path inside
-            // ggml-cuda (`GGML_CUDA_NCCL`, default ON when NCCL is present
-            // on the host). When set, libggml-cuda.a references nccl
-            // symbols that the portable-cuda flavor (no driver-cuda) can't
-            // satisfy at link time. We have our own NCCL-backed
-            // tensor-parallel path in driver-cuda, so the ggml-cuda one
-            // is unused either way — disable to keep the libggml-cuda.a
-            // self-contained.
-            .define("GGML_CUDA_NCCL", "OFF");
-        let arch = std::env::var("PIE_PORTABLE_CUDA_ARCH").unwrap_or_else(|_| "native".to_string());
-        cfg.define("CMAKE_CUDA_ARCHITECTURES", arch);
-    }
-    if vulkan_enabled {
-        println!("cargo:rerun-if-env-changed=VULKAN_SDK");
-        define_vulkan_sdk_paths(&mut cfg, &target_os);
-        cfg.define("GGML_STATIC", "ON");
-    }
-    if metal_enabled {
-        // ggml-metal links against Apple's MetalKit / Foundation. The
-        // C++ side handles those via xcrun; we just need to flip the
-        // ggml flag and add the framework links below.
-        cfg.define("GGML_STATIC", "ON")
-            .define("GGML_METAL_EMBED_LIBRARY", "ON");
-    }
-    // Disable ggml-cpu's OpenMP unconditionally. macOS's Apple clang
-    // doesn't ship libomp; on Linux, `-Wl,--as-needed -lgomp` is
-    // ordered before `-Wl,--start-group … libggml-cpu.a` and the
-    // linker discards libgomp before ggml-cpu.a's GOMP_* symbols
-    // are seen, leading to `undefined reference to GOMP_barrier`.
-    // Cost: multi-thread CPU inference on the portable backend; not
-    // relevant for CI artifacts where the GPU backends (Metal / CUDA
-    // / Vulkan) are the hot path. The portable driver no longer uses
-    // OpenMP itself.
-    cfg.define("GGML_OPENMP", "OFF");
-    let dst = cfg.build();
-    let build_dir = dst.join("build");
-
-    add_link_search_paths(&build_dir);
-
-    println!("cargo:rustc-link-lib=static=pie_driver_portable_lib");
-    println!("cargo:rustc-link-lib=static=ggml");
-    println!("cargo:rustc-link-lib=static=ggml-cpu");
-    if cuda_enabled {
-        println!("cargo:rustc-link-lib=static=ggml-cuda");
-    }
-    if vulkan_enabled {
-        println!("cargo:rustc-link-lib=static=ggml-vulkan");
-    }
-    if metal_enabled {
-        println!("cargo:rustc-link-lib=static=ggml-metal");
-    }
-    // ggml-cpu's macOS build pulls in the BLAS backend (calls
-    // `_ggml_backend_blas_reg`); ggml-cpu uses Apple's Accelerate
-    // framework for vDSP. Both need explicit links on macOS.
-    if target_os == "macos" {
-        println!("cargo:rustc-link-lib=static=ggml-blas");
-        println!("cargo:rustc-link-arg=-framework");
-        println!("cargo:rustc-link-arg=Accelerate");
-        if metal_enabled {
-            for fw in ["Foundation", "Metal", "MetalKit", "MetalPerformanceShaders"] {
-                println!("cargo:rustc-link-arg=-framework");
-                println!("cargo:rustc-link-arg={fw}");
-            }
-        }
-    }
-    println!("cargo:rustc-link-lib=static=ggml-base");
-
-    if cuda_enabled {
-        // ggml-cuda calls `cublasGemmEx` (libcublas), nothing in
-        // libcublasLt directly. Dynamic-link cudart + cublas; let
-        // libcublas.so resolve its own libcublasLt.so transitively
-        // at load time. Runtime contract: CUDA toolkit installed on
-        // the host (which always ships libcublasLt next to libcublas).
-        link_cuda_toolkit_dynamic(&["cudart", "cublas"]);
-        link_cuda_driver_stub();
-    }
-    if vulkan_enabled {
-        // libvulkan.so is the standard system name on Linux. If
-        // VULKAN_SDK is set, prefer its lib dir (so a project-vendored
-        // SDK works without sudo apt install libvulkan-dev). The
-        // Windows SDK uses `Lib`, while Unix installs normally use `lib`.
-        if let Ok(sdk) = std::env::var("VULKAN_SDK") {
-            let lib_dirs: &[&str] = if target_os == "windows" {
-                &["Lib", "lib"]
-            } else {
-                &["lib", "Lib"]
-            };
-            for lib_dir in lib_dirs {
-                let sdk_lib = Path::new(&sdk).join(lib_dir);
-                if sdk_lib.is_dir() {
-                    println!("cargo:rustc-link-search=native={}", sdk_lib.display());
-                }
-            }
-        }
-        let vulkan_lib = if target_os == "windows" {
-            "vulkan-1"
-        } else {
-            "vulkan"
-        };
-        println!("cargo:rustc-link-lib={vulkan_lib}");
-    }
-
-    add_system_libs(metal_enabled);
-
-    println!(
-        "cargo:rustc-env=PIE_DRIVER_PORTABLE_BUILD_DIR={}",
-        build_dir.display()
-    );
-    rerun_if_changed(&driver_dir);
-}
-
-// -----------------------------------------------------------------------------
 // driver/cuda
 // -----------------------------------------------------------------------------
 
@@ -395,7 +206,7 @@ fn build_cuda() {
     if target_os != "linux" {
         panic!(
             "--features driver-cuda is Linux-only (got target_os={target_os:?}). \
-             On macOS, use `--features driver-portable` with PIE_PORTABLE_METAL=1; \
+             On macOS, use `--features driver-metal`; \
              on Windows, the cuda flavor is not supported."
         );
     }
@@ -405,8 +216,8 @@ fn build_cuda() {
     println!("cargo:rerun-if-changed=../driver/cuda/src");
 
     let mut cfg = cmake::Config::new(&driver_dir);
-    // See `build_portable` — per-flavor out_dir keeps the two CMake
-    // configurations from clobbering each other in multi-driver builds.
+    // Per-flavor out_dir keeps the CMake configurations from clobbering each
+    // other in multi-driver builds.
     cfg.out_dir(std::path::PathBuf::from(std::env::var_os("OUT_DIR").unwrap()).join("cuda"));
     cfg.build_target("pie_driver_cuda_lib")
         .define("BUILD_SHARED_LIBS", "OFF")

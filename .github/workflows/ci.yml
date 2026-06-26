@@ -87,7 +87,7 @@ jobs:
             ~/.cargo/git
             ~/.cache/ccache
             target
-          key: ${{ runner.os }}-workspace-verify-${{ hashFiles('**/Cargo.lock', 'driver/portable/CMakeLists.txt') }}
+          key: ${{ runner.os }}-workspace-verify-${{ hashFiles('**/Cargo.lock', 'driver/**/CMakeLists.txt') }}
           restore-keys: |
             ${{ runner.os }}-workspace-verify-
 
@@ -143,46 +143,6 @@ jobs:
             exit 1
           fi
 
-  pie-worker-portable:
-    name: pie-worker (driver-portable)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v6
-
-      - name: Install build dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            build-essential cmake ninja-build ccache
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache cargo + cmake build
-        uses: actions/cache@v5
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            ~/.cache/ccache
-            target
-          key: ${{ runner.os }}-pie-worker-portable-${{ hashFiles('**/Cargo.lock', 'driver/portable/CMakeLists.txt') }}
-
-      - name: cargo build (default = driver-portable)
-        run: cargo build -p pie-worker
-
-      - name: cargo test (pie-worker)
-        run: cargo test -p pie-worker --bin pie
-
-      - name: Verify single-binary linkage
-        run: |
-          file target/debug/pie
-          ldd target/debug/pie
-          # No ggml shared libs should be in the dep tree.
-          ldd target/debug/pie | grep -E "libggml|libllama" \
-            && { echo "FAIL: ggml shared lib leaked into binary"; exit 1; } \
-            || echo "OK: no ggml shared deps"
-
   # Dummy driver — pure Rust, builds on every OS we support. Cheapest
   # gate for "did the standalone wiring break end to end". Runs the
   # full unit-test suite too since dummy doesn't pull in cmake.
@@ -218,12 +178,12 @@ jobs:
           cargo test -p pie-worker --bin pie \
             --no-default-features --features driver-dummy
 
-  # macOS portable build with Metal backend. Verifies build.rs's
-  # macOS branch + libomp link path. Doesn't run tests against a
-  # real model — just exercises the cmake + link path so PRs that
-  # touch driver/portable or build.rs fail fast on macOS.
-  pie-worker-portable-metal:
-    name: pie-worker (driver-portable + metal)
+  # macOS Metal driver build. Verifies driver/metal's cmake + link
+  # path (libomp) so PRs that touch driver/metal or build.rs fail fast
+  # on macOS. Doesn't run against a real model — just exercises the
+  # cmake + link path.
+  pie-worker-metal:
+    name: pie-worker (driver-metal)
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v6
@@ -244,17 +204,13 @@ jobs:
             ~/.cargo/git
             ~/Library/Caches/ccache
             target
-          key: ${{ runner.os }}-pie-worker-portable-metal-${{ hashFiles('**/Cargo.lock', 'driver/portable/CMakeLists.txt') }}
+          key: ${{ runner.os }}-pie-worker-metal-${{ hashFiles('**/Cargo.lock', 'driver/metal/CMakeLists.txt') }}
 
-      - name: cargo build (driver-portable + metal)
-        env:
-          PIE_PORTABLE_METAL: "1"
-        run: cargo build -p pie-worker
+      - name: cargo build (driver-metal)
+        run: cargo build -p pie-worker --no-default-features --features driver-metal
 
       - name: cargo test (pie-worker)
-        env:
-          PIE_PORTABLE_METAL: "1"
-        run: cargo test -p pie-worker --bin pie
+        run: cargo test -p pie-worker --bin pie --no-default-features --features driver-metal
 
   # Cuda build — runs only when an opt-in label or schedule fires
   # (no CUDA on the default GH-hosted runners). Add a self-hosted

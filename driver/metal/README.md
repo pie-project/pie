@@ -5,9 +5,7 @@ Embedded C++ driver for Pie targeting Apple Silicon (macOS, arm64). It uses
 where MLX lacks coverage, and runs through the same shared-memory driver ABI as
 the CUDA and dummy drivers.
 
-This driver replaces `driver/portable` (ggml-backed) as the high-performance
-backend on macOS. The portable driver remains the default cross-platform
-fallback.
+This is the macOS backend for Apple Silicon systems.
 
 ## Status
 

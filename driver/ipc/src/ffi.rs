@@ -1,4 +1,4 @@
-//! C ABI surface — in-process vtable for cuda / portable / dummy.
+//! C ABI surface — in-process vtable for cuda / metal / dummy.
 //!
 //! The vtable passes `Pie*Desc` POD pointers directly (no rkyv encode/
 //! decode on the in-process path). The shmem path (Python downstream)

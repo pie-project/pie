@@ -472,7 +472,7 @@ impl<'g, 'ctx> GenStep<'g, 'ctx> {
             // sampler to land on. Firing in this state would produce a
             // wire request with `qo_indptr=[0,0]` plus a sampler slot
             // pointing at a non-existent query position; the driver
-            // would either crash (portable's old behavior) or return
+            // would either crash (the old driver behavior) or return
             // an empty response (cuda's short-circuit), and the SDK
             // loop would just call us again with the same empty state.
             //

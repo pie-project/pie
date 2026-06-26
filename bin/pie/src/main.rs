@@ -92,7 +92,7 @@ enum Command {
         /// Accepted for backwards compatibility; no-op.
         #[arg(long)]
         rpc: bool,
-        /// Which compiled driver flavor to invoke (`portable`/`cuda`/`dummy`).
+        /// Which compiled driver flavor to invoke (`cuda`/`metal`/`dummy`).
         #[arg(long)]
         flavor: Option<String>,
     },

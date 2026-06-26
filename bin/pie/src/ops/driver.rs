@@ -5,10 +5,10 @@
 //! ```text
 //! pie driver list                    [-c <serve-toml>]
 //!
-//! pie driver <embedded-type> doctor   (cuda_native | portable | dummy)
+//! pie driver <embedded-type> doctor   (cuda_native | metal | dummy)
 //! ```
 //!
-//! Embedded types are `portable` / `cuda_native` / `dummy`.
+//! Embedded types are `cuda_native` / `metal` / `dummy`.
 
 use std::path::PathBuf;
 use std::process::Command;
@@ -22,14 +22,14 @@ pub enum DriverCmd {
     /// List known driver types and which appear in the loaded config.
     List(ListArgs),
 
-    /// `pie driver portable <action>` — embedded ggml driver.
-    Portable {
-        #[command(subcommand)]
-        action: EmbeddedCmd,
-    },
     /// `pie driver cuda-native <action>` — embedded CUDA driver.
     #[command(name = "cuda-native")]
     CudaNative {
+        #[command(subcommand)]
+        action: EmbeddedCmd,
+    },
+    /// `pie driver metal <action>` — embedded Apple Silicon Metal driver.
+    Metal {
         #[command(subcommand)]
         action: EmbeddedCmd,
     },
@@ -59,8 +59,8 @@ pub fn run(cmd: DriverCmd) -> Result<()> {
     match cmd {
         DriverCmd::List(args) => list(args),
 
-        DriverCmd::Portable { action } => run_embedded("portable", action),
         DriverCmd::CudaNative { action } => run_embedded("cuda_native", action),
+        DriverCmd::Metal { action } => run_embedded("metal", action),
         DriverCmd::Dummy { action } => run_embedded("dummy", action),
     }
 }
@@ -120,7 +120,7 @@ fn doctor_embedded(name: &str) -> Result<()> {
     if !compiled {
         println!(
             "  rebuild with `cargo install pie-worker --features driver-{}` \
-             (or `--features driver-portable,driver-cuda` to keep both).",
+             (or `--features driver-cuda,driver-metal` to keep both).",
             name.replace('_', "-"),
         );
     }

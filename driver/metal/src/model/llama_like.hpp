@@ -6,8 +6,8 @@
 // quirks (Qwen2 QKV bias, Qwen3 per-head QK-norm, Mistral SWA, YaRN, MoE)
 // are driven entirely by `ArchSpec` flags — no compile-time arch coupling.
 //
-// Mirrors driver/portable's `build_qwen3_graph` and driver/cuda's
-// `llama_like_forward`, expressed against the metal driver's MLX `ops::`
+// Mirrors driver/cuda's `llama_like_forward`, expressed against the metal
+// driver's MLX `ops::`
 // seam in the locked token-major layout.
 //
 // Out of scope (own builders): Gemma (four-norm sandwich, softcaps, GeGLU,

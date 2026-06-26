@@ -37,7 +37,6 @@ if str(SERVER_SDK) not in sys.path:
 BENCH_INFERLET = "text-completion-bench"
 EMBEDDED_CLI_DRIVERS: set[str] = {
     "cuda_native",
-    "portable",
     "dummy",
     "vllm",
     "sglang",
@@ -113,13 +112,6 @@ def build_config(args: argparse.Namespace):
             driver_options["mtp_num_drafts"] = args.mtp_num_drafts
         if args.enable_system_speculation:
             driver_options["enable_system_speculation"] = True
-    elif args.driver == "portable":
-        driver_options = {
-            "max_forward_tokens": args.max_forward_tokens,
-            "max_forward_requests": args.max_forward_requests,
-            "total_pages": args.kv_pages,
-            "kv_cache_dtype": args.kv_cache_dtype,
-        }
     elif args.driver == "vllm":
         driver_options = {
             "gpu_memory_utilization": args.gpu_mem_util,
@@ -762,7 +754,7 @@ def build_parser() -> argparse.ArgumentParser:
     for sp in p._subparsers._group_actions[0].choices.values():
         sp.add_argument("--device", default="cuda:0")
         sp.add_argument("--driver", default="cuda_native",
-                        choices=["cuda_native", "portable", "vllm", "sglang", "tensorrt_llm", "dummy"])
+                        choices=["cuda_native", "vllm", "sglang", "tensorrt_llm", "dummy"])
         sp.add_argument("--default-token-limit", type=int, default=200_000)
         sp.add_argument("--default-endowment-pages", type=int, default=64)
         sp.add_argument("--admission-oversubscription-factor", type=float, default=4.0)
@@ -782,7 +774,6 @@ def build_parser() -> argparse.ArgumentParser:
             choices=["auto", "routed_dequant", "packed", "bf16", "dequant", "eager_bf16", "native"],
             default=None,
         )
-        sp.add_argument("--portable-n-gpu-layers", type=int, default=-1)
         sp.add_argument("--worker-threads", type=int, default=None)
         sp.add_argument(
             "--speculation-depth",

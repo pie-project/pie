@@ -2,15 +2,15 @@
 
 // PieArch — the set of model architectures the metal driver understands,
 // plus the data-driven mapping from an HF `config.json` `model_type` string
-// onto one of them. Mirrors driver/portable's hf_config PieArch enum and
-// driver/cuda's arch-detect chain, pared down to the architectures the
+// onto one of them. Mirrors driver/cuda's arch-detect chain, pared down
+// to the architectures the
 // metal driver implements first (Llama-like + Qwen3, then Gemma2/3).
 //
 // Arch selection is purely data-driven: the loader parses `model_type`
 // (and, for multimodal wrappers, the inner text_config.model_type) and
 // calls `hf_model_type_to_pie_arch`. Nothing downstream branches on a
 // compile-time arch constant — the graph dispatcher (model_graph.cpp)
-// switches on this enum at runtime, exactly like portable's compute_().
+// switches on this enum at runtime.
 
 #include <string>
 

@@ -12,7 +12,7 @@
 //   4. sample — evaluate + sample one token per slot (kernels/sampling).
 //   5. pack   — group tokens per request into the `ResponseBuilder`.
 //
-// Mirrors driver/cuda/src/executor + driver/portable/src/executor, adapted to
+// Mirrors driver/cuda/src/executor, adapted to
 // MLX's lazy-array model. alpha's InProcService constructs one Executor and
 // calls `run_forward` from the server loop's Forward arm.
 

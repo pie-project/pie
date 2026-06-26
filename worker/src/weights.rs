@@ -2,8 +2,8 @@
 //!
 //! R3: the worker daemon never downloads. `[model].hf_repo` must point at a
 //! LOCAL snapshot the worker can load at boot — an HF safetensors directory, or
-//! a single `.gguf` file (the portable driver loads either; see
-//! `driver/portable/src/model.cpp::Model`). A bare `owner/name` repo ID is NOT
+//! a single `.gguf` file (the metal driver loads either; see
+//! `driver/metal/src/model.cpp::Model`). A bare `owner/name` repo ID is NOT
 //! resolved here (that would mean downloading / cache provisioning); resolve it
 //! ahead of time with `pie model pull` (the `bin/pie` op that owns `hf-hub`)
 //! and configure the resulting local path.

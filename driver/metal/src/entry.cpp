@@ -4,7 +4,7 @@
 // All meaningful logic lives in `run_impl`; the `extern "C"` wrappers at
 // the bottom catch any escaping C++ exception so we never propagate across
 // the FFI boundary (which would be UB). Mirrors the shape of
-// driver/cuda/src/entry.cpp and driver/portable/src/entry.cpp.
+// driver/cuda/src/entry.cpp.
 //
 // This is the seam beta/charlie/delta build on: the stub `InProcService`
 // answers Health + Forward (dummy tokens) so the driver compiles, links,

@@ -49,6 +49,3 @@ uv pip install --python /tmp/pie-python-server-venv/bin/python -e sdk/python-ser
 CUDACXX=/usr/local/cuda/bin/nvcc \
   uv --project sdk/python-server sync --reinstall-package pie-server
 ```
-
-Set `PIE_PORTABLE_CUDA=1` to include ggml CUDA support in the embedded
-portable driver.

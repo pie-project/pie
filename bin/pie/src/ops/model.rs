@@ -72,7 +72,7 @@ fn repo_id_to_dirname(repo_id: &str) -> String {
 
 /// HuggingFace `model_type` → PIE arch name. Kept in sync with
 /// the model_type strings the C++ drivers (`driver/cuda/src/loader/`,
-/// `driver/portable/src/`) recognise. Architectures supported by *any*
+/// `driver/metal/src/`) recognise. Architectures supported by *any*
 /// of the standalone-linked drivers belong here.
 const HF_TO_PIE_ARCH: &[(&str, &str)] = &[
     ("llama", "llama3"),

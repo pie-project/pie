@@ -1,7 +1,7 @@
 //! Pie standalone server config — TOML schema mirror of `pie.config`.
 //!
 //! Same TOML the legacy Python server consumed. Embedded drivers
-//! ([`DriverKind::Portable`] / [`DriverKind::CudaNative`] / [`DriverKind::Dummy`])
+//! ([`DriverKind::CudaNative`] / [`DriverKind::Metal`] / [`DriverKind::Dummy`])
 //! are dispatched in [`crate::serve::start_engine`] via
 //! [`crate::serve::topology::resolve_flavor`].
 //!
@@ -400,8 +400,8 @@ fn default_restore_pause_at_utilization() -> f64 {
 #[allow(dead_code)] // forwarded to the embedded driver via TOML; not all
 // fields are read on the Rust side yet.
 pub struct DriverConfig {
-    /// Driver discriminator. Embedded drivers (`portable`,
-    /// `cuda_native`, `dummy`) run in-process.
+    /// Driver discriminator. Embedded drivers (`cuda_native`,
+    /// `metal`, `dummy`) run in-process.
     #[serde(rename = "type")]
     pub kind: DriverKind,
     /// Single string or list of strings — both accepted on input.
@@ -453,17 +453,6 @@ impl DriverConfig {
             "model.driver.device must be non-empty"
         );
         match self.kind {
-            DriverKind::Portable => {
-                let opts: PortableDriverOptions = toml::Value::Table(self.options.clone())
-                    .try_into()
-                    .map_err(|e| {
-                        anyhow::anyhow!(
-                            "invalid [model.driver.options] for driver type {:?}: {e}",
-                            self.kind,
-                        )
-                    })?;
-                validate_kv_cache_dtype(&opts.kv_cache_dtype)?;
-            }
             DriverKind::CudaNative => {
                 let opts: CudaNativeDriverOptions = toml::Value::Table(self.options.clone())
                     .try_into()
@@ -550,8 +539,6 @@ impl IpcProfile {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DriverKind {
-    /// Portable ggml driver — embedded as a static lib in `pie-worker`.
-    Portable,
     /// Native CUDA driver — embedded as a static lib in `pie-worker`
     /// (requires `--features driver-cuda`).
     CudaNative,
@@ -566,7 +553,6 @@ pub enum DriverKind {
 impl DriverKind {
     pub fn as_str(self) -> &'static str {
         match self {
-            DriverKind::Portable => "portable",
             DriverKind::CudaNative => "cuda_native",
             DriverKind::Dummy => "dummy",
             DriverKind::Metal => "metal",
@@ -625,51 +611,10 @@ where
 // Driver-specific options (typed views over `DriverConfig::options`)
 // -----------------------------------------------------------------------------
 
-/// `[model.driver.options]` for `type = "portable"`.
-/// Mirrors `pie/src/pie_driver_portable/config.py::PortableDriverConfig`.
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct PortableDriverOptions {
-    pub kv_page_size: u32,
-    pub total_pages: u32,
-    pub max_forward_tokens: u32,
-    pub max_forward_requests: u32,
-    pub cpu_pages: u32,
-    pub kv_cache_dtype: String,
-    #[serde(skip)]
-    pub device: String,
-    #[serde(skip)]
-    pub verbose: bool,
-    pub ready_timeout_s: f64,
-    pub shutdown_timeout_s: f64,
-    /// Ignored in standalone (binary is statically linked); accepted
-    /// for config compatibility with the Python wrapper path.
-    pub binary_path: String,
-}
-
-impl Default for PortableDriverOptions {
-    fn default() -> Self {
-        Self {
-            kv_page_size: 32,
-            total_pages: 1024,
-            max_forward_tokens: 10240,
-            max_forward_requests: 512,
-            cpu_pages: 0,
-            kv_cache_dtype: "auto".to_string(),
-            device: "auto".to_string(),
-            verbose: false,
-            ready_timeout_s: 120.0,
-            shutdown_timeout_s: 5.0,
-            binary_path: String::new(),
-        }
-    }
-}
-
 /// `[model.driver.options]` for `type = "metal"` (Apple Silicon MLX/Metal
-/// driver). Mirrors `PortableDriverOptions` — page geometry, forward
-/// limits, and timeouts — since the metal driver speaks the same embedded
-/// in-process ABI. `device` is the `metal:N` selector filled from
-/// `model.driver.device`.
+/// driver) — page geometry, forward limits, and timeouts; the metal driver
+/// speaks the embedded in-process ABI. `device` is the `metal:N` selector
+/// filled from `model.driver.device`.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct MetalDriverOptions {
@@ -709,7 +654,7 @@ impl Default for MetalDriverOptions {
 }
 
 /// `[model.driver.options]` for `type = "dummy"`. The dummy driver
-/// fabricates everything the portable driver would otherwise read from
+/// fabricates everything a real driver would otherwise read from
 /// model weights — `vocab_size` and `arch_name` are required because no
 /// safe default exists. Page geometry and timeouts have generic defaults;
 /// the driver derives its synthetic KV page pool from these limits.
@@ -860,21 +805,21 @@ impl CudaNativeDriverOptions {
 mod tests {
     use super::*;
 
-    const MINIMAL_PORTABLE: &str = r#"
+    const MINIMAL_METAL: &str = r#"
 [model]
 name = "default"
 hf_repo = "Qwen/Qwen3-0.6B"
 
 [model.driver]
-type = "portable"
+type = "metal"
 device = ["cpu"]
 "#;
 
     #[test]
-    fn parses_minimal_portable_config() {
-        let cfg: Config = toml::from_str(MINIMAL_PORTABLE).unwrap();
+    fn parses_minimal_metal_config() {
+        let cfg: Config = toml::from_str(MINIMAL_METAL).unwrap();
         cfg.validate().unwrap();
-        assert_eq!(cfg.model.driver.kind, DriverKind::Portable);
+        assert_eq!(cfg.model.driver.kind, DriverKind::Metal);
         assert_eq!(cfg.model.driver.device, vec!["cpu".to_string()]);
         assert_eq!(
             cfg.model.driver.effective_ipc_profile(),
@@ -958,14 +903,14 @@ memory_profile = "latency"
     }
 
     #[test]
-    fn rejects_legacy_portable_kv_page_knob() {
+    fn rejects_legacy_metal_kv_page_knob() {
         let stale = r#"
 [model]
 name = "default"
 hf_repo = "Qwen/Qwen3-0.6B"
 
 [model.driver]
-type = "portable"
+type = "metal"
 device = ["cpu"]
 
 [model.driver.options]
@@ -1000,10 +945,6 @@ max_num_kv_pages = 1024
     #[test]
     fn rejects_public_driver_capacity_knobs() {
         for (ty, key) in [
-            ("portable", "total_pages"),
-            ("portable", "cpu_pages"),
-            ("portable", "max_forward_tokens"),
-            ("portable", "max_forward_requests"),
             ("dummy", "max_forward_tokens"),
             ("dummy", "max_forward_requests"),
             ("dummy", "max_model_len"),
@@ -1033,7 +974,7 @@ max_num_kv_pages = 1024
 name = "m"
 hf_repo = "x"
 [model.driver]
-type = "portable"
+type = "metal"
 device = "cpu"
 ipc_profile = "latency"
 "#;
@@ -1047,7 +988,7 @@ ipc_profile = "latency"
 name = "m"
 hf_repo = "x"
 [model.driver]
-type = "portable"
+type = "metal"
 device = "cpu"
 ipc_profile = "power"
 "#;
@@ -1060,7 +1001,7 @@ ipc_profile = "power"
 name = "m"
 hf_repo = "x"
 [model.driver]
-type = "portable"
+type = "metal"
 device = "cpu"
 ipc_profile = "latency"
 spin_budget_us = 25
@@ -1076,7 +1017,7 @@ spin_budget_us = 25
 name = "m"
 hf_repo = "x"
 [model.driver]
-type = "portable"
+type = "metal"
 device = "cuda:0"
 "#;
         let cfg: Config = toml::from_str(one).unwrap();
@@ -1093,14 +1034,14 @@ device = "cuda:0"
 name = "a"
 hf_repo = "x"
 [model.driver]
-type = "portable"
+type = "metal"
 device = ["cuda:0"]
 
 [[model]]
 name = "b"
 hf_repo = "y"
 [model.driver]
-type = "portable"
+type = "metal"
 device = ["cuda:1"]
 "#;
         let err = Config::parse(legacy).unwrap_err().to_string();
@@ -1119,7 +1060,7 @@ nonsense = true
 name = "m"
 hf_repo = "x"
 [model.driver]
-type = "portable"
+type = "metal"
 device = ["cpu"]
 "#;
         assert!(toml::from_str::<Config>(bad).is_err());

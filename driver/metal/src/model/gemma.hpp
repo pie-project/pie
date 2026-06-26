@@ -15,7 +15,7 @@
 //     with a separate RoPE base on sliding layers (Gemma 3 rope_local_base_freq);
 //   * Gemma 3 per-head Q/K RMSNorm.
 //
-// Mirrors driver/portable's Gemma path; expressed against the metal driver's
+// Mirrors the cuda driver's Gemma path, expressed against the metal driver's
 // MLX `ops::` seam in the locked token-major layout.
 
 #include "ops/tensor.hpp"

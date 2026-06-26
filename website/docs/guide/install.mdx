@@ -25,8 +25,10 @@ irm https://pie-project.org/install.ps1 | iex
 The installer downloads a release archive and installs `pie` into `~/.local/bin` on Unix or `%LOCALAPPDATA%\Pie\bin` on Windows. It picks a build for your platform automatically:
 
 - Linux (x86_64 or arm64) with an NVIDIA GPU: `cuda13.0` (driver 580+) or `cuda12.8` (driver 525+). The installer also reads your GPU's compute capability (`nvidia-smi`) and downloads the matching **per-compute-capability** binary — e.g. `sm90` for H100, `sm100` for B200/GB200, `sm120` for RTX 50 — so the download is small and architecture-optimal. It falls back to an all-architecture build if your exact capability isn't published.
-- Other Linux, macOS Apple Silicon: `portable`. GPU via Vulkan (Linux) or Metal (macOS), with a built-in CPU fallback.
-- Windows: `vulkan` (CPU + any Vulkan-capable GPU), or `cuda` for NVIDIA.
+- macOS Apple Silicon: `metal` (Apple GPU via Metal).
+- Windows (x86_64) with an NVIDIA GPU: `cuda`.
+
+Hosts without a supported GPU (non-NVIDIA Linux/Windows, Intel Macs) have no prebuilt binary — build from source (below); the default build links the `dummy` (mock) driver.
 
 If `pie` is not on your `PATH`, add the install directory:
 
@@ -74,7 +76,7 @@ Most users do not need anything in this section.
 Override the auto-picked flavor with `PIE_FLAVOR`, and (for CUDA) the compute capability with `PIE_CC`:
 
 ```bash
-curl -fsSL https://pie-project.org/install.sh | PIE_FLAVOR=portable bash
+curl -fsSL https://pie-project.org/install.sh | PIE_FLAVOR=metal bash      # macOS Apple Silicon
 curl -fsSL https://pie-project.org/install.sh | PIE_FLAVOR=cuda12.8 bash
 # Force a specific compute capability (e.g. on a build host without the GPU):
 curl -fsSL https://pie-project.org/install.sh | PIE_FLAVOR=cuda13.0 PIE_CC=90 bash
@@ -88,14 +90,14 @@ $env:PIE_FLAVOR = "cuda"; irm https://pie-project.org/install.ps1 | iex
 
 | Platform | Available flavors |
 |---|---|
-| Linux x86_64 | `portable`, `cuda12.8`, `cuda13.0` (per-CC: sm80/86/89/90/100/120) |
-| Linux aarch64 | `portable`, `cuda12.8`, `cuda13.0` (per-CC: sm90/100) |
-| macOS Apple Silicon | `portable` |
-| Windows x86_64 | `vulkan`, `cuda` |
+| Linux x86_64 | `cuda12.8`, `cuda13.0` (per-CC: sm80/86/89/90/100/120) |
+| Linux aarch64 | `cuda12.8`, `cuda13.0` (per-CC: sm90/100) |
+| macOS Apple Silicon | `metal` |
+| Windows x86_64 | `cuda` |
 
 Intel Macs are not supported.
 
-The Linux `cuda*` flavors bundle the embedded `cuda_native` driver (the recommended CUDA path on Linux). Windows `cuda` uses the portable driver with a CUDA backend, as there is no native Windows driver.
+The `cuda*` flavors (Linux and Windows) bundle the native `cuda_native` driver — the recommended path on NVIDIA GPUs. macOS `metal` bundles the `metal` driver for Apple Silicon. There is no CPU or Vulkan build.
 
 ### Override the install directory
 
@@ -117,15 +119,15 @@ For development:
 git clone https://github.com/pie-project/pie.git
 cd pie
 
-# Default features: embedded portable driver plus the always-linked dummy.
+# Default build: no real backend feature → the always-linked `dummy` (mock) driver.
 cargo install --path worker
 
-# Include the embedded CUDA driver too.
+# Include the embedded CUDA driver (Linux/Windows, NVIDIA).
 CUDACXX=/usr/local/cuda/bin/nvcc \
-  cargo install --path worker --features driver-portable,driver-cuda
+  cargo install --path worker --features driver-cuda
 
-# Build the release binary for Linux/macOS.
-cargo install --path worker --features driver-portable
+# Include the embedded Metal driver (macOS Apple Silicon).
+cargo install --path worker --features driver-metal
 ```
 
 Re-run `pie doctor` after building to confirm which drivers are compiled in.

@@ -1,7 +1,7 @@
 #pragma once
 
 // ArchSpec — per-arch structural feature switches read by the graph builders.
-// Mirrors driver/portable's arch_spec.hpp, pared to the flags the metal
+// Mirrors the C++ drivers' arch-spec shape, pared to the flags the metal
 // driver's first wave of architectures (Llama-like + Qwen3, Gemma2/3) needs.
 //
 // Built once per forward from `arch_spec_for(arch, config)`. The shared

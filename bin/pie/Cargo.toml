@@ -19,9 +19,9 @@ path = "src/main.rs"
 
 [features]
 # bin/pie is the composition root that selects the driver backend; forward the
-# driver flavors to the embedded worker. Default = portable (matches bin/worker).
-default = ["driver-portable"]
-driver-portable = ["pie-worker/driver-portable"]
+# driver flavors to the embedded worker. Default = none (dummy fallback);
+# enable driver-cuda for real inference.
+default = []
 driver-cuda = ["pie-worker/driver-cuda"]
 driver-dummy = ["pie-worker/driver-dummy"]
 

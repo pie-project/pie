@@ -159,7 +159,6 @@ const sidebars: SidebarsConfig = {
       collapsed: false,
       items: [
         'reference/drivers/cuda',
-        'reference/drivers/portable',
       ],
     },
     {

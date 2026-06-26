@@ -3,8 +3,8 @@
 // ModelGraph — the polymorphic per-architecture forward interface, plus the
 // data-driven factory that selects the concrete builder from `ModelConfig`.
 //
-// Mirrors the cuda driver's `IModel` (model/imodel.hpp) and portable's
-// `compute_()` graph dispatch: one runtime switch on `PieArch` picks the
+// Mirrors the cuda driver's `IModel` (model/imodel.hpp) graph dispatch:
+// one runtime switch on `PieArch` picks the
 // shared Llama-like builder or the Gemma builder. Adding an arch is a
 // directory-local change here — no compile-time coupling elsewhere.
 //

@@ -31,7 +31,7 @@ pub use engine::{WorkerHandle, run, run_with};
 // composition root (`bin/pie`) can impl it for its `EmbeddedControl` adapter.
 pub use link::control::ControlLink;
 
-#[cfg(any(feature = "driver-cuda", feature = "driver-portable"))]
+#[cfg(any(feature = "driver-cuda", feature = "driver-metal"))]
 #[used]
 static PIE_WEIGHT_LOADER_LINK_ANCHOR: unsafe extern "C" fn(
     *const pie_weight_loader::PieLoaderCompileInput,

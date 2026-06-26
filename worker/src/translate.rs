@@ -191,8 +191,12 @@ name = "default"
 hf_repo = "Qwen/Qwen3-0.6B"
 
 [model.driver]
-type = "portable"
+type = "dummy"
 device = ["cpu"]
+
+[model.driver.options]
+vocab_size = 151936
+arch_name = "qwen3"
 "#;
         let user: config::Config = toml::from_str(toml_text).unwrap();
         user.validate().unwrap();
@@ -227,8 +231,12 @@ name = "default"
 hf_repo = "Qwen/Qwen3-0.6B"
 
 [model.driver]
-type = "portable"
+type = "dummy"
 device = ["cuda:0", "cuda:1"]
+
+[model.driver.options]
+vocab_size = 151936
+arch_name = "qwen3"
 "#;
         let user: config::Config = toml::from_str(toml_text).unwrap();
         user.validate().unwrap();
@@ -262,7 +270,7 @@ device = ["cuda:0", "cuda:1"]
 name = "a"
 hf_repo = "x"
 [model.driver]
-type = "portable"
+type = "dummy"
 device = ["cpu"]
 "#,
         )
@@ -282,7 +290,7 @@ device = ["cpu"]
 name = "a"
 hf_repo = "x"
 [model.driver]
-type = "portable"
+type = "dummy"
 device = ["cpu"]
 "#,
         )

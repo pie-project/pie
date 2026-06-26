@@ -5,7 +5,7 @@
 # at attach time (runtime/src/shmem_ipc.rs). Only `name` is shared by
 # convention with the runtime side. (The embedded in-proc path ignores
 # the shmem geometry; these are kept for standalone parity with the cuda
-# and portable drivers.)
+# and the cuda driver.)
 [shmem]
 name = "/pie_shmem"
 num_slots = 8

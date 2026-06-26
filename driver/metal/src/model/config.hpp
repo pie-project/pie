@@ -1,7 +1,7 @@
 #pragma once
 
 // ModelConfig — the subset of an HF `config.json` the metal driver's graph
-// builders read. Mirrors driver/portable's `Hparams`, pared to the fields the
+// builders read. Mirrors the C++ drivers' hparams shape, pared to the fields the
 // Llama-like + Qwen3 + Gemma2/3 forward passes actually consume. Optional
 // fields use std::optional so a builder can branch on presence (e.g. SWA,
 // softcaps, query_pre_attn_scalar).

@@ -62,7 +62,7 @@ cpmaddpackage(URI "gh:nlohmann/json@3.12.0" OPTIONS "JSON_BuildTests OFF")
 # -----------------------------------------------------------------------------
 # Explicit (alpha-owned): entry, driver startup, the stub in-proc service.
 # These compile WITHOUT MLX so the foundation seam stays fast to build and the
-# default `driver-portable` worker isn't forced to fetch/link MLX.
+# default worker (no driver feature) isn't forced to fetch/link MLX.
 set(PIE_METAL_EXPLICIT_SOURCES
   src/entry.cpp
   src/driver_startup.cpp
