@@ -7,12 +7,11 @@
 
 use anyhow::Result;
 use std::collections::HashMap;
-use std::sync::LazyLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::oneshot;
 
 use crate::driver;
-use crate::service::{ServiceArray, ServiceHandler};
+use crate::service::{Service, ServiceHandler};
 
 /// Stable per-adapter identifier. Issued by the runtime when a LoRA-style
 /// adapter is loaded; preserved across forward passes that target the same
@@ -24,86 +23,74 @@ pub type AdapterId = u64;
 // Public API
 // =============================================================================
 
-static SERVICES: LazyLock<ServiceArray<Message>> = LazyLock::new(ServiceArray::new);
+static SERVICE: Service<Message> = Service::new();
 
-/// Spawns a new adapter service for a model.
-pub(crate) fn spawn(drivers: &[usize]) -> usize {
+/// Spawns the adapter service for the single model.
+pub(crate) fn spawn(drivers: &[usize]) {
     let drivers = drivers.to_vec();
-    SERVICES
+    SERVICE
         .spawn(move || AdapterService::new(drivers))
         .expect("Failed to spawn adapter service")
 }
 
 /// Creates a new adapter with the given name.
-pub async fn create(model_idx: usize, name: String) -> Result<AdapterId> {
+pub async fn create(name: String) -> Result<AdapterId> {
     let (tx, rx) = oneshot::channel();
-    SERVICES.send(model_idx, Message::Create { name, response: tx })?;
+    SERVICE.send(Message::Create { name, response: tx })?;
     rx.await?
 }
 
 /// Destroys an adapter.
-pub async fn destroy(model_idx: usize, id: AdapterId) -> Result<()> {
+pub async fn destroy(id: AdapterId) -> Result<()> {
     let (tx, rx) = oneshot::channel();
-    SERVICES.send(model_idx, Message::Destroy { id, response: tx })?;
+    SERVICE.send(Message::Destroy { id, response: tx })?;
     rx.await?
 }
 
 /// Retrieves an existing adapter by name.
-pub async fn open(model_idx: usize, name: String) -> Option<AdapterId> {
+pub async fn open(name: String) -> Option<AdapterId> {
     let (tx, rx) = oneshot::channel();
-    SERVICES
-        .send(model_idx, Message::Open { name, response: tx })
-        .ok()?;
+    SERVICE.send(Message::Open { name, response: tx }).ok()?;
     rx.await.ok()?
 }
 
 /// Forks an adapter with a new name.
-pub async fn fork(model_idx: usize, id: AdapterId, new_name: String) -> Option<AdapterId> {
+pub async fn fork(id: AdapterId, new_name: String) -> Option<AdapterId> {
     let (tx, rx) = oneshot::channel();
-    SERVICES
-        .send(
-            model_idx,
-            Message::Fork {
-                id,
-                new_name,
-                response: tx,
-            },
-        )
+    SERVICE
+        .send(Message::Fork {
+            id,
+            new_name,
+            response: tx,
+        })
         .ok()?;
     rx.await.ok()?
 }
 
 /// Loads adapter weights from a path via driver RPC.
-pub async fn load(model_idx: usize, id: AdapterId, path: String) -> Result<()> {
+pub async fn load(id: AdapterId, path: String) -> Result<()> {
     let (tx, rx) = oneshot::channel();
-    SERVICES.send(
-        model_idx,
-        Message::Load {
-            id,
-            path,
-            response: tx,
-        },
-    )?;
+    SERVICE.send(Message::Load {
+        id,
+        path,
+        response: tx,
+    })?;
     rx.await?
 }
 
 /// Saves adapter weights to a path via driver RPC.
-pub async fn save(model_idx: usize, id: AdapterId, path: String) -> Result<()> {
+pub async fn save(id: AdapterId, path: String) -> Result<()> {
     let (tx, rx) = oneshot::channel();
-    SERVICES.send(
-        model_idx,
-        Message::Save {
-            id,
-            path,
-            response: tx,
-        },
-    )?;
+    SERVICE.send(Message::Save {
+        id,
+        path,
+        response: tx,
+    })?;
     rx.await?
 }
 
 /// Initializes a ZO (zeroth-order) optimizer for an adapter via driver RPC.
 pub async fn zo_initialize(
-    model_idx: usize,
     id: AdapterId,
     rank: u32,
     alpha: f32,
@@ -112,40 +99,33 @@ pub async fn zo_initialize(
     initial_sigma: f32,
 ) -> Result<()> {
     let (tx, rx) = oneshot::channel();
-    SERVICES.send(
-        model_idx,
-        Message::ZoInitialize {
-            id,
-            rank,
-            alpha,
-            population_size,
-            mu_fraction,
-            initial_sigma,
-            response: tx,
-        },
-    )?;
+    SERVICE.send(Message::ZoInitialize {
+        id,
+        rank,
+        alpha,
+        population_size,
+        mu_fraction,
+        initial_sigma,
+        response: tx,
+    })?;
     rx.await?
 }
 
 /// Updates a ZO optimizer for an adapter via driver RPC.
 pub async fn zo_update(
-    model_idx: usize,
     id: AdapterId,
     scores: Vec<f32>,
     seeds: Vec<i64>,
     max_sigma: f32,
 ) -> Result<()> {
     let (tx, rx) = oneshot::channel();
-    SERVICES.send(
-        model_idx,
-        Message::ZoUpdate {
-            id,
-            scores,
-            seeds,
-            max_sigma,
-            response: tx,
-        },
-    )?;
+    SERVICE.send(Message::ZoUpdate {
+        id,
+        scores,
+        seeds,
+        max_sigma,
+        response: tx,
+    })?;
     rx.await?
 }
 

@@ -8,12 +8,12 @@ from abc import abstractmethod
 import weakref
 
 from componentize_py_types import Result, Ok, Err, Some
-from ..imports import model
+
 
 class Context:
     
     @classmethod
-    def create(cls, model: model.Model) -> Self:
+    def create(cls) -> Self:
         """
         Creates a fresh empty context
         
@@ -21,7 +21,7 @@ class Context:
         """
         raise NotImplementedError
     @classmethod
-    def open(cls, model: model.Model, name: str) -> Self:
+    def open(cls, name: str) -> Self:
         """
         Opens a snapshot (implicit fork — snapshot stays immutable, working pages are copied)
         
@@ -29,7 +29,7 @@ class Context:
         """
         raise NotImplementedError
     @classmethod
-    def take(cls, model: model.Model, name: str) -> Self:
+    def take(cls, name: str) -> Self:
         """
         Takes ownership of a snapshot (snapshot is deleted, GPU pages transfer without copy)
         
@@ -37,7 +37,7 @@ class Context:
         """
         raise NotImplementedError
     @classmethod
-    def delete(cls, model: model.Model, name: str) -> None:
+    def delete(cls, name: str) -> None:
         """
         Deletes a saved snapshot by name
         
@@ -74,8 +74,6 @@ class Context:
         """
         Number of tokens per page
         """
-        raise NotImplementedError
-    def model(self) -> model.Model:
         raise NotImplementedError
     def committed_page_count(self) -> int:
         """
@@ -118,19 +116,11 @@ class Context:
         raise NotImplementedError
     def suspend(self) -> None:
         """
-        ── Market operations ──────────────────────────────────────
-        Suspend this context (release pages, stop rent).
-        Restoration is system-driven: highest-bid suspended contexts
-        are restored when memory frees up.
+        Suspend this context (release GPU pages, offload to CPU).
+        Restoration is system-driven under FCFS: suspended contexts are
+        restored oldest-launched first as memory frees up.
         
         Raises: `wit_world.types.Err(wit_world.imports.str)`
-        """
-        raise NotImplementedError
-    def bid(self, value: float) -> None:
-        """
-        Set bid: willingness to pay per page per step.
-        Drives suspension priority, restoration priority, and compute priority.
-        0.0 = use default (truthful) bidding.
         """
         raise NotImplementedError
     def __enter__(self) -> Self:

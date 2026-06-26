@@ -1,18 +1,17 @@
 // world pie:inferlet/inferlet
 export type * as PieCoreAdapter from './interfaces/pie-core-adapter.js'; // import pie:core/adapter
+export type * as PieCoreAudioOut from './interfaces/pie-core-audio-out.js'; // import pie:core/audio-out
 export type * as PieCoreContext from './interfaces/pie-core-context.js'; // import pie:core/context
 export type * as PieCoreInference from './interfaces/pie-core-inference.js'; // import pie:core/inference
+export type * as PieCoreMedia from './interfaces/pie-core-media.js'; // import pie:core/media
 export type * as PieCoreMessaging from './interfaces/pie-core-messaging.js'; // import pie:core/messaging
 export type * as PieCoreModel from './interfaces/pie-core-model.js'; // import pie:core/model
 export type * as PieCoreRuntime from './interfaces/pie-core-runtime.js'; // import pie:core/runtime
-export type * as PieCoreScheduling from './interfaces/pie-core-scheduling.js'; // import pie:core/scheduling
 export type * as PieCoreSession from './interfaces/pie-core-session.js'; // import pie:core/session
 export type * as PieCoreTypes from './interfaces/pie-core-types.js'; // import pie:core/types
 export type * as PieInstructChat from './interfaces/pie-instruct-chat.js'; // import pie:instruct/chat
 export type * as PieInstructReasoning from './interfaces/pie-instruct-reasoning.js'; // import pie:instruct/reasoning
 export type * as PieInstructToolUse from './interfaces/pie-instruct-tool-use.js'; // import pie:instruct/tool-use
-export type * as PieMcpClient from './interfaces/pie-mcp-client.js'; // import pie:mcp/client
-export type * as PieMcpTypes from './interfaces/pie-mcp-types.js'; // import pie:mcp/types
 export type * as PieZoZo from './interfaces/pie-zo-zo.js'; // import pie:zo/zo
 export type * as WasiClocksWallClock024 from './interfaces/wasi-clocks-wall-clock.js'; // import wasi:clocks/wall-clock@0.2.4
 export type * as WasiFilesystemPreopens024 from './interfaces/wasi-filesystem-preopens.js'; // import wasi:filesystem/preopens@0.2.4

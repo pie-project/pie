@@ -83,7 +83,6 @@ def main():
     p.add_argument("--portable-n-gpu-layers", type=int, default=99)
     p.add_argument("--vllm-attention-backend", default=None)
     p.add_argument("--sglang-attention-backend", default=None)
-    p.add_argument("--batch-policy", default=None)
     p.add_argument("--speculation-depth", type=int, default=None)
     p.add_argument("--request-timeout", type=float, default=300.0)
     p.add_argument("--tp-size", type=int, default=1)

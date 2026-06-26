@@ -47,7 +47,7 @@ fn standalone_toml(snapshot: &str) -> String {
          [worker.auth]\n\
          enabled = false\n\
          \n\
-         [[worker.model]]\n\
+         [worker.model]\n\
          name = \"smoke\"\n\
          hf_repo = \"{snapshot}\"\n\
          \n\

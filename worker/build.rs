@@ -3,7 +3,7 @@
 //!
 //! Selection for native C++ drivers is via Cargo features. The Rust
 //! dummy driver is always linked; the resulting binary dispatches at
-//! runtime via `[[model]].driver.type` in the config TOML. The drivers
+//! runtime via `[model].driver.type` in the config TOML. The drivers
 //! expose distinctly-named C entry points
 //! (`pie_driver_{portable,cuda,dummy}_run` / `_request_stop`) so their
 //! static archives can coexist in one binary without symbol collisions.

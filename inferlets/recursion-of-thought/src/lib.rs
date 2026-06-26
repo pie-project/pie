@@ -13,7 +13,7 @@
 
 use futures::future;
 use inferlet::{
-    Context, Result, sample::Sampler, model::Model, runtime,
+    Context, Result, sample::Sampler,
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -232,20 +232,14 @@ fn solve<'a>(
 #[inferlet::main]
 async fn main(input: Input) -> Result<String> {
     let start = Instant::now();
-    let model_name = runtime::models()
-        .first()
-        .cloned()
-        .ok_or("No models available")?;
-    let model = Model::load(&model_name)?;
-
     // One context per system prompt — the divide step and merge step want
     // different framing. Both share a clean fork point so each call gets
     // its own KV without leaking state across siblings.
-    let mut plan_root = Context::new(&model)?;
+    let mut plan_root = Context::new()?;
     plan_root.system(PLAN_SYSTEM);
     plan_root.flush().await?;
 
-    let mut merge_root = Context::new(&model)?;
+    let mut merge_root = Context::new()?;
     merge_root.system(MERGE_SYSTEM);
     merge_root.flush().await?;
 

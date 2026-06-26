@@ -12,7 +12,6 @@ use crate::messaging;
 use crate::model;
 use crate::process::{self, ProcessId};
 use crate::program::{self, Manifest, ProgramName};
-use crate::workflow::WorkflowId;
 
 use super::Session;
 use super::data_transfer::{ChunkResult, InFlightUpload};
@@ -49,9 +48,10 @@ impl Session {
             pie_client::message::QUERY_MODEL_STATUS => {
                 let mut stats = serde_json::Map::new();
 
-                for (model_idx, model_name) in model::models().iter().enumerate() {
+                {
+                    let model_name = model::model().name().to_string();
                     // KV page pool stats
-                    let kv = context::get_stats(model_idx).await;
+                    let kv = context::get_stats().await;
                     let (used, total) = kv
                         .iter()
                         .fold((0u64, 0u64), |(u, t), &(a, b)| (u + a as u64, t + b as u64));
@@ -65,7 +65,7 @@ impl Session {
                     );
 
                     // Inference stats (throughput, latency, batch count)
-                    let inf = inference::get_stats(model_idx).await;
+                    let inf = inference::get_stats().await;
                     stats.insert(
                         format!("{}.total_batches", model_name),
                         serde_json::Value::from(inf.total_batches),
@@ -445,7 +445,6 @@ impl Session {
         inferlet: String,
         input: String,
         capture_outputs: bool,
-        token_budget: Option<usize>,
     ) {
         let program_name = match ProgramName::parse(&inferlet) {
             Ok(p) => p,
@@ -475,8 +474,6 @@ impl Session {
             client_id,
             capture_outputs,
             None,
-            None, // no workflow
-            token_budget,
         ) {
             Ok(process_id) => {
                 if capture_outputs {
@@ -491,165 +488,6 @@ impl Session {
             Err(e) => {
                 self.send_response(corr_id, false, e.to_string()).await;
             }
-        }
-    }
-
-    pub(super) async fn handle_launch_processes(
-        &mut self,
-        corr_id: u32,
-        inferlet: String,
-        inputs: Vec<String>,
-        capture_outputs: bool,
-        token_budgets: Option<Vec<Option<usize>>>,
-    ) {
-        if let Some(budgets) = token_budgets.as_ref() {
-            if budgets.len() != inputs.len() {
-                self.send_response(
-                    corr_id,
-                    false,
-                    format!(
-                        "token_budgets length {} does not match inputs length {}",
-                        budgets.len(),
-                        inputs.len()
-                    ),
-                )
-                .await;
-                return;
-            }
-        }
-
-        let program_name = match ProgramName::parse(&inferlet) {
-            Ok(p) => p,
-            Err(e) => {
-                self.send_response(corr_id, false, e.to_string()).await;
-                return;
-            }
-        };
-
-        if !self.installed_programs.contains(&program_name) {
-            if let Err(e) = program::install(&program_name).await {
-                self.send_response(corr_id, false, e.to_string()).await;
-                return;
-            }
-            self.installed_programs.insert(program_name.clone());
-        }
-
-        let client_id = if capture_outputs { Some(self.id) } else { None };
-        let mut process_ids = Vec::with_capacity(inputs.len());
-        for (idx, input) in inputs.into_iter().enumerate() {
-            let token_budget = token_budgets
-                .as_ref()
-                .and_then(|budgets| budgets.get(idx).copied().flatten());
-            match process::spawn(
-                self.username.clone(),
-                program_name.clone(),
-                input,
-                client_id,
-                capture_outputs,
-                None,
-                None,
-                token_budget,
-            ) {
-                Ok(process_id) => {
-                    if capture_outputs {
-                        self.attached_processes.push(process_id);
-                    }
-                    process_ids.push(process_id.to_string());
-                }
-                Err(e) => {
-                    self.send_response(corr_id, false, e.to_string()).await;
-                    return;
-                }
-            }
-        }
-
-        match serde_json::to_string(&process_ids) {
-            Ok(json) => self.send_response(corr_id, true, json).await,
-            Err(e) => self.send_response(corr_id, false, e.to_string()).await,
-        }
-    }
-
-    pub(super) async fn handle_run_processes(
-        &mut self,
-        corr_id: u32,
-        inferlet: String,
-        inputs: Vec<String>,
-        token_budgets: Option<Vec<Option<usize>>>,
-    ) {
-        if let Some(budgets) = token_budgets.as_ref() {
-            if budgets.len() != inputs.len() {
-                self.send_response(
-                    corr_id,
-                    false,
-                    format!(
-                        "token_budgets length {} does not match inputs length {}",
-                        budgets.len(),
-                        inputs.len()
-                    ),
-                )
-                .await;
-                return;
-            }
-        }
-
-        let program_name = match ProgramName::parse(&inferlet) {
-            Ok(p) => p,
-            Err(e) => {
-                self.send_response(corr_id, false, e.to_string()).await;
-                return;
-            }
-        };
-
-        if !self.installed_programs.contains(&program_name) {
-            if let Err(e) = program::install(&program_name).await {
-                self.send_response(corr_id, false, e.to_string()).await;
-                return;
-            }
-            self.installed_programs.insert(program_name.clone());
-        }
-
-        let mut receivers = Vec::with_capacity(inputs.len());
-        for (idx, input) in inputs.into_iter().enumerate() {
-            let token_budget = token_budgets
-                .as_ref()
-                .and_then(|budgets| budgets.get(idx).copied().flatten());
-            let (tx, rx) = tokio::sync::oneshot::channel();
-            match process::spawn(
-                self.username.clone(),
-                program_name.clone(),
-                input,
-                None,
-                false,
-                Some(tx),
-                None,
-                token_budget,
-            ) {
-                Ok(_process_id) => receivers.push(rx),
-                Err(e) => {
-                    self.send_response(corr_id, false, e.to_string()).await;
-                    return;
-                }
-            }
-        }
-
-        let mut outputs = Vec::with_capacity(receivers.len());
-        for rx in receivers {
-            match rx.await {
-                Ok(Ok(output)) => outputs.push(output),
-                Ok(Err(e)) => {
-                    self.send_response(corr_id, false, e).await;
-                    return;
-                }
-                Err(e) => {
-                    self.send_response(corr_id, false, e.to_string()).await;
-                    return;
-                }
-            }
-        }
-
-        match serde_json::to_string(&outputs) {
-            Ok(json) => self.send_response(corr_id, true, json).await,
-            Err(e) => self.send_response(corr_id, false, e.to_string()).await,
         }
     }
 
@@ -843,100 +681,5 @@ impl Session {
             })
             .await;
         }
-    }
-}
-
-// =============================================================================
-// Workflow Handlers
-// =============================================================================
-
-impl Session {
-    pub(super) async fn handle_submit_workflow(&mut self, corr_id: u32, json: String) {
-        match crate::workflow::submit(&self.username, &json, Some(self.id)).await {
-            Ok((workflow_id, result_rx)) => {
-                // Drop the result receiver — clients receive events via attach.
-                // The workflow actor stores the result internally.
-                drop(result_rx);
-                self.attached_workflows.push(workflow_id);
-                self.send_response(corr_id, true, workflow_id.to_string())
-                    .await;
-            }
-            Err(e) => {
-                self.send_response(corr_id, false, e.to_string()).await;
-            }
-        }
-    }
-
-    pub(super) async fn handle_cancel_workflow(&mut self, corr_id: u32, workflow_id: String) {
-        let wf_id = match workflow_id.parse() {
-            Ok(id) => id,
-            Err(_) => {
-                self.send_response(corr_id, false, "Invalid workflow ID".to_string())
-                    .await;
-                return;
-            }
-        };
-        match crate::workflow::cancel(&wf_id) {
-            Ok(()) => {
-                self.send_response(corr_id, true, "Workflow cancelled".to_string())
-                    .await;
-            }
-            Err(e) => {
-                self.send_response(corr_id, false, e.to_string()).await;
-            }
-        }
-    }
-
-    pub(super) async fn handle_attach_workflow(&mut self, corr_id: u32, workflow_id: String) {
-        let wf_id: WorkflowId = match workflow_id.parse() {
-            Ok(id) => id,
-            Err(_) => {
-                self.send_response(corr_id, false, "Invalid workflow ID".to_string())
-                    .await;
-                return;
-            }
-        };
-
-        // Authorization: only the same user can attach
-        match crate::workflow::get_username(&wf_id).await {
-            Ok(owner) if owner != self.username => {
-                self.send_response(corr_id, false, "Permission denied".to_string())
-                    .await;
-                return;
-            }
-            Err(_) => {
-                self.send_response(corr_id, false, "Workflow not found".to_string())
-                    .await;
-                return;
-            }
-            _ => {}
-        }
-
-        match crate::workflow::attach(&wf_id, self.id).await {
-            Ok(()) => {
-                self.attached_workflows.push(wf_id);
-                self.send_response(corr_id, true, "Workflow attached".to_string())
-                    .await;
-            }
-            Err(e) => {
-                self.send_response(corr_id, false, e.to_string()).await;
-            }
-        }
-    }
-
-    pub(super) async fn handle_detach_workflow(&mut self, corr_id: u32, workflow_id: String) {
-        let wf_id: WorkflowId = match workflow_id.parse() {
-            Ok(id) => id,
-            Err(_) => {
-                self.send_response(corr_id, false, "Invalid workflow ID".to_string())
-                    .await;
-                return;
-            }
-        };
-
-        crate::workflow::detach(&wf_id);
-        self.attached_workflows.retain(|id| id != &wf_id);
-        self.send_response(corr_id, true, "Workflow detached".to_string())
-            .await;
     }
 }

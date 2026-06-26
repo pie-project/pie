@@ -8,7 +8,6 @@ from abc import abstractmethod
 import weakref
 
 from componentize_py_types import Result, Ok, Err, Some
-from ..imports import model
 from ..imports import inference
 
 
@@ -46,24 +45,30 @@ class Decoder:
 
 
 
-def equip(model: model.Model, tools: List[str]) -> List[int]:
+def equip(tools: List[str]) -> List[int]:
     """
     Register available tools (list of JSON schema strings)
     
     Raises: `wit_world.types.Err(wit_world.imports.str)`
     """
     raise NotImplementedError
-def answer(model: model.Model, name: str, value: str) -> List[int]:
+def answer(name: str, value: str) -> List[int]:
     """
     Provide a tool result (after a tool-call reply)
     """
     raise NotImplementedError
-def create_decoder(model: model.Model) -> Decoder:
+def create_decoder() -> Decoder:
     """
     Create a decoder to detect tool calls in generated tokens
     """
     raise NotImplementedError
-def create_matcher(model: model.Model, tools: List[str]) -> inference.Matcher:
+def format(tools: List[str]) -> Optional[inference.Grammar]:
+    """
+    Returns the grammar that constrains well-formed tool-call output for
+    this model and toolset, or none if the model has no enforceable format.
+    """
+    raise NotImplementedError
+def create_matcher(tools: List[str]) -> inference.Matcher:
     """
     Create a grammar matcher to force-generate tool calls
     """

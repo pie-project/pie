@@ -54,10 +54,6 @@ The cost is a per-call boundary between Wasm and the host. The [benchmarks](./be
 
 Those are application frameworks that run on top of a serving system. They orchestrate prompts, manage memory, and call tools, but they call the model through a black-box endpoint. Pie is the serving system underneath. You could in principle run a LangChain agent against a Pie endpoint and get nothing extra; the value of Pie is moving the orchestration logic *into* the engine, where it can share the KV cache and avoid client round trips. An inferlet is an alternative to that orchestration layer, not a replacement for prompt templates or document loaders.
 
-## Can I use Pie as a drop-in OpenAI-compatible endpoint?
-
-Yes, through the `openresponses` inferlet. It exposes an OpenAI Responses-compatible HTTP API on top of the engine. For OpenAI Chat Completions specifically, you write a small inferlet that translates the schema; the [examples](../guide/examples/overview) page lists relevant building blocks.
-
 ## Is Pie open source?
 
 Yes, Apache 2.0. Source on [GitHub](https://github.com/pie-project/pie). Issues and discussions are public.

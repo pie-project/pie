@@ -27,7 +27,7 @@ use std::io::{self, Write};
 use std::time::{Duration, Instant};
 
 use inferlet::{
-    Context, Result, SubscriptionExt, chat, messaging, model::Model, runtime, sample::Sampler, wstd,
+    Context, Result, chat, messaging, sample::Sampler,
 };
 use serde::Deserialize;
 
@@ -104,32 +104,28 @@ const MAGENTA: &str = "\x1b[35m";
 async fn main(input: Input) -> Result<String> {
     let mode = input.mode.to_lowercase();
 
-    let model_name = runtime::models()
-        .first()
-        .cloned()
-        .ok_or("No models available")?;
-    let model = Model::load(&model_name)?;
+    let model_name = inferlet::model::name();
 
     match mode.as_str() {
         "baseline" | "plain" => {
-            run_pipeline(&model, &model_name, &input, true).await?;
+            run_pipeline(&model_name, &input, true).await?;
         }
         "pubsub" | "smart" => {
-            run_pipeline(&model, &model_name, &input, false).await?;
+            run_pipeline(&model_name, &input, false).await?;
         }
         "idea" | "idea-generator" => {
-            run_idea_role(&model, &model_name, &input).await?;
+            run_idea_role(&model_name, &input).await?;
         }
         "plot" | "plot-developer" => {
-            run_plot_role(&model, &model_name, &input).await?;
+            run_plot_role(&model_name, &input).await?;
         }
         "dialogue" | "dialogue-writer" => {
-            run_dialogue_role(&model, &model_name, &input).await?;
+            run_dialogue_role(&model_name, &input).await?;
         }
         "both" | "" => {
-            let b = run_pipeline(&model, &model_name, &input, true).await?;
+            let b = run_pipeline(&model_name, &input, true).await?;
             println!();
-            let p = run_pipeline(&model, &model_name, &input, false).await?;
+            let p = run_pipeline(&model_name, &input, false).await?;
             println!();
             comparison(&b, &p);
         }
@@ -151,7 +147,6 @@ struct ModeResult {
 }
 
 async fn run_pipeline(
-    model: &Model,
     model_name: &str,
     input: &Input,
     simulate_rtt: bool,
@@ -178,7 +173,6 @@ async fn run_pipeline(
     // ── stage 1: idea ──
     println!("  {}{}stage 1 ▸ idea generator{}", BOLD, color, RESET);
     let idea = run_stage(
-        model,
         &input.sys_idea,
         &input.prompt,
         input.max_tokens,
@@ -198,9 +192,9 @@ async fn run_pipeline(
         // broadcast, then await the message. In a real multi-inferlet
         // pipeline the subscriber would be a separate `pie run` that
         // already subscribed before the producer broadcasts.
-        let sub = messaging::subscribe(TOPIC_IDEA_TO_PLOT);
+        let mut sub = messaging::subscribe(TOPIC_IDEA_TO_PLOT);
         messaging::broadcast(TOPIC_IDEA_TO_PLOT, &idea);
-        let received = sub.get_async().await.unwrap_or_default();
+        let received = sub.next().await.unwrap_or_default();
         println!(
             "  {}{}↪ broadcast on \"{}\" → subscriber received{}",
             DIM, color, TOPIC_IDEA_TO_PLOT, RESET
@@ -213,7 +207,6 @@ async fn run_pipeline(
     // ── stage 2: plot ──
     println!("  {}{}stage 2 ▸ plot developer{}", BOLD, color, RESET);
     let plot = run_stage(
-        model,
         &input.sys_plot,
         &format!("Concept: {}\nWrite the beats.", plot_input),
         input.max_tokens,
@@ -230,9 +223,9 @@ async fn run_pipeline(
         format!("{}\n\nPlot:\n{}", plot_input, plot)
     } else {
         let combined = format!("{}\n\nPlot:\n{}", plot_input, plot);
-        let sub = messaging::subscribe(TOPIC_PLOT_TO_DIALOGUE);
+        let mut sub = messaging::subscribe(TOPIC_PLOT_TO_DIALOGUE);
         messaging::broadcast(TOPIC_PLOT_TO_DIALOGUE, &combined);
-        let received = sub.get_async().await.unwrap_or_default();
+        let received = sub.next().await.unwrap_or_default();
         println!(
             "  {}{}↪ broadcast on \"{}\" → subscriber received{}",
             DIM, color, TOPIC_PLOT_TO_DIALOGUE, RESET
@@ -245,7 +238,6 @@ async fn run_pipeline(
     // ── stage 3: dialogue ──
     println!("  {}{}stage 3 ▸ dialogue writer{}", BOLD, color, RESET);
     let dialogue = run_stage(
-        model,
         &input.sys_dialogue,
         &format!(
             "Story so far:\n{}\nWrite ONE line of climax dialogue.",
@@ -274,7 +266,7 @@ async fn run_pipeline(
 //   pie run demo-messaging -- --mode dialogue
 //   pie run demo-messaging -- --mode plot
 //   pie run demo-messaging -- --mode idea --prompt "A park story"
-async fn run_idea_role(model: &Model, model_name: &str, input: &Input) -> Result<()> {
+async fn run_idea_role(model_name: &str, input: &Input) -> Result<()> {
     print_header(
         "IDEA",
         GREEN,
@@ -283,7 +275,6 @@ async fn run_idea_role(model: &Model, model_name: &str, input: &Input) -> Result
         &input.prompt,
     );
     let idea = run_stage(
-        model,
         &input.sys_idea,
         &input.prompt,
         input.max_tokens,
@@ -296,7 +287,7 @@ async fn run_idea_role(model: &Model, model_name: &str, input: &Input) -> Result
     Ok(())
 }
 
-async fn run_plot_role(model: &Model, model_name: &str, input: &Input) -> Result<()> {
+async fn run_plot_role(model_name: &str, input: &Input) -> Result<()> {
     print_header(
         "PLOT",
         GREEN,
@@ -305,11 +296,10 @@ async fn run_plot_role(model: &Model, model_name: &str, input: &Input) -> Result
         &input.prompt,
     );
     println!("  {}waiting on \"{}\"{}", DIM, TOPIC_IDEA_TO_PLOT, RESET);
-    let sub = messaging::subscribe(TOPIC_IDEA_TO_PLOT);
-    let idea = sub.get_async().await.unwrap_or_default();
+    let mut sub = messaging::subscribe(TOPIC_IDEA_TO_PLOT);
+    let idea = sub.next().await.unwrap_or_default();
     println!("  {}received idea: {}{}", DIM, oneline(&idea), RESET);
     let plot = run_stage(
-        model,
         &input.sys_plot,
         &format!("Concept: {}\nWrite the beats.", idea.trim()),
         input.max_tokens,
@@ -326,7 +316,7 @@ async fn run_plot_role(model: &Model, model_name: &str, input: &Input) -> Result
     Ok(())
 }
 
-async fn run_dialogue_role(model: &Model, model_name: &str, input: &Input) -> Result<()> {
+async fn run_dialogue_role(model_name: &str, input: &Input) -> Result<()> {
     print_header(
         "DIALOGUE",
         GREEN,
@@ -338,11 +328,10 @@ async fn run_dialogue_role(model: &Model, model_name: &str, input: &Input) -> Re
         "  {}waiting on \"{}\"{}",
         DIM, TOPIC_PLOT_TO_DIALOGUE, RESET
     );
-    let sub = messaging::subscribe(TOPIC_PLOT_TO_DIALOGUE);
-    let plot = sub.get_async().await.unwrap_or_default();
+    let mut sub = messaging::subscribe(TOPIC_PLOT_TO_DIALOGUE);
+    let plot = sub.next().await.unwrap_or_default();
     println!("  {}received plot context{}", DIM, RESET);
     let _dialogue = run_stage(
-        model,
         &input.sys_dialogue,
         &format!(
             "Story so far:\n{}\nWrite ONE line of climax dialogue.",
@@ -362,20 +351,19 @@ async fn relay_via_client(rtt_ms: u64, color: &str, what: &str) -> Duration {
         DIM, color, what, rtt_ms, RESET
     );
     let t = Instant::now();
-    wstd::task::sleep(wstd::time::Duration::from_millis(rtt_ms)).await;
+    inferlet::sleep(std::time::Duration::from_millis(rtt_ms)).await;
     t.elapsed()
 }
 
 // ── Run one pipeline stage ────────────────────────────────────────────
 async fn run_stage(
-    model: &Model,
     system: &str,
     user: &str,
     max_tokens: usize,
     delay_ms: u64,
     color: &str,
 ) -> Result<String> {
-    let mut ctx = Context::new(model)?;
+    let mut ctx = Context::new()?;
     ctx.system(system);
     ctx.user(&format!("{} /no_think", user.trim()));
     ctx.cue();
@@ -386,8 +374,8 @@ async fn run_stage(
     let mut g = ctx
         .generate(Sampler::Argmax)
         .max_tokens(max_tokens)
-        .stop(&chat::stop_tokens(model));
-    let mut decoder = chat::Decoder::new(model);
+        .stop(&chat::stop_tokens());
+    let mut decoder = chat::Decoder::new();
     let mut stripper = ThinkStripper::new();
     let mut text = String::new();
 
@@ -405,7 +393,7 @@ async fn run_stage(
                     print!("{}", rendered);
                     let _ = io::stdout().flush();
                     if delay_ms > 0 {
-                        wstd::task::sleep(wstd::time::Duration::from_millis(delay_ms)).await;
+                        inferlet::sleep(std::time::Duration::from_millis(delay_ms)).await;
                     }
                 }
             }

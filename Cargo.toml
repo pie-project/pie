@@ -2,7 +2,7 @@
 #
 # Members are the crates that build for the host (Linux/macOS x86_64/aarch64).
 # Wasm-target crates (`inferlets/*`, `sdk/rust/*`) are intentionally excluded —
-# they have their own Cargo.lock files and target `wasm32-wasip2`, so mixing
+# they have their own Cargo.lock files and target `wasm32-wasip3`, so mixing
 # them into this workspace's resolver would pull wasm-only deps into the host
 # build graph.
 [workspace]

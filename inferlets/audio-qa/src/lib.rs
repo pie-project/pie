@@ -11,7 +11,7 @@
 //! Requires a model with an audio front-end (e.g. `gemma-4-E4B`).
 
 use inferlet::media::Audio;
-use inferlet::{chat, model::Model, runtime, sample::Sampler, Context, Result};
+use inferlet::{chat, sample::Sampler, Context, Result};
 use serde::Deserialize;
 
 #[derive(Deserialize)]
@@ -49,14 +49,11 @@ fn default_temperature() -> f32 {
 
 #[inferlet::main]
 async fn main(input: Input) -> Result<String> {
-    let models = runtime::models();
-    let model = Model::load(models.first().ok_or("No models available")?)?;
-
     // Model-agnostic: hand the host the raw encoded audio bytes. It decodes the
     // container, resamples, computes the bound model's log-mel features, and
     // wraps the span in whatever delimiters that model needs.
     let bytes = inferlet::http::fetch(&input.audio_url).await?;
-    let clip = Audio::from_bytes(&model, &bytes).map_err(|e| e.to_string())?;
+    let clip = Audio::from_bytes(&bytes).map_err(|e| e.to_string())?;
     println!(
         "audio: {} bytes -> {} audio soft tokens",
         bytes.len(),
@@ -65,7 +62,7 @@ async fn main(input: Input) -> Result<String> {
 
     // Build the prompt: system → user(audio + question) → cue. `append_audio`
     // applies the model's own span delimiters.
-    let mut ctx = Context::new(&model)?;
+    let mut ctx = Context::new()?;
     ctx.system(&input.system).user("Here is an audio clip:");
     ctx.append_audio(&clip).await?;
     ctx.user(&input.question).cue();
@@ -76,7 +73,7 @@ async fn main(input: Input) -> Result<String> {
             p: 0.95,
         })
         .max_tokens(input.max_tokens)
-        .stop(&chat::stop_tokens(&model))
+        .stop(&chat::stop_tokens())
         .collect_text()
         .await?;
 

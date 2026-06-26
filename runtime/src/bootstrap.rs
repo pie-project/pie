@@ -30,7 +30,7 @@ pub struct Config {
     pub registry_url: String,
     pub telemetry: TelemetryConfig,
     pub runtime: RuntimeConfig,
-    pub models: Vec<ModelConfig>,
+    pub model: ModelConfig,
     /// Skip tracing initialization (for tests — can only init once per process).
     pub skip_tracing: bool,
     /// Hard cap on the number of concurrent processes.
@@ -122,24 +122,8 @@ pub struct DriverConfig {
 
 #[derive(Debug, Clone)]
 pub struct SchedulerConfig {
-    /// Batch-firing policy. Recognized: `"adaptive"`, `"eager"`, `"greedy"`.
-    pub batch_policy: String,
     /// Wall-clock cap on a single forward-pass request, in seconds.
     pub request_timeout_secs: u64,
-    /// Default compute-wallet cap for processes that do not declare an
-    /// explicit token limit at launch. `None` = unlimited (no cap).
-    /// `Some(n)` = default hard cap at `n` tokens.
-    pub default_token_limit: Option<usize>,
-    /// Default market endowment (in KV pages) for processes that do not
-    /// declare an explicit token limit. One endowment unit = one page of
-    /// long-run guaranteed GPU residency under contention.
-    pub default_endowment_pages: usize,
-    /// Admission oversubscription factor: maximum allowed ratio of
-    /// `Σ endowment / total_gpu_pages`. Must be > 0. At 1.0 the provider
-    /// guarantees every admitted process its full endowment at all times;
-    /// at higher values the provider sells more entitlement than physical
-    /// capacity, betting on non-peak duty cycles (like a typical airline).
-    pub admission_oversubscription_factor: f64,
     /// Hard admission gate for the restore loop: pause restoring suspended
     /// contexts when any driver's GPU page utilization exceeds this fraction.
     /// Prevents the evict→restore→re-evict thrash cascade. Range: (0.0, 1.0].
@@ -224,64 +208,53 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
     messaging::spawn();
     process::init_admission(config.max_concurrent_processes);
 
-    for cfg in config.models.iter() {
-        model::register(
-            cfg.name.clone(),
-            &cfg.arch_name,
-            cfg.kv_page_size as u32,
-            cfg.tokenizer_path.clone(),
-            cfg.system_speculation_supported,
-            cfg.enable_system_speculation,
-        )?;
+    let cfg = &config.model;
+    model::register(
+        cfg.name.clone(),
+        &cfg.arch_name,
+        cfg.kv_page_size as u32,
+        cfg.tokenizer_path.clone(),
+        cfg.system_speculation_supported,
+        cfg.enable_system_speculation,
+    )?;
 
-        let drivers: Vec<usize> = cfg
-            .drivers
-            .iter()
-            .map(|d| {
-                driver::register_driver(driver::DriverSpec {
-                    num_kv_pages: d.total_pages,
-                    limits: d.limits,
-                })
+    let drivers: Vec<usize> = cfg
+        .drivers
+        .iter()
+        .map(|d| {
+            driver::register_driver(driver::DriverSpec {
+                num_kv_pages: d.total_pages,
+                limits: d.limits,
             })
-            .collect();
+        })
+        .collect();
 
-        let num_gpu_pages: Vec<usize> = cfg.drivers.iter().map(|d| d.total_pages).collect();
-        let num_cpu_pages: Vec<usize> = cfg.drivers.iter().map(|d| d.cpu_pages).collect();
-        let max_forward_requests: usize = cfg
-            .drivers
-            .iter()
-            .map(|d| d.limits.max_forward_requests)
-            .sum();
-        let num_rs_slots: Vec<usize> = cfg.drivers.iter().map(|d| d.rs_cache_slots).collect();
-        let rs_cache_spec_rollback: Vec<bool> = cfg
-            .drivers
-            .iter()
-            .map(|d| d.rs_cache_spec_rollback)
-            .collect();
-        let speculation_depth = cfg.scheduler.speculation_depth;
+    let num_gpu_pages: Vec<usize> = cfg.drivers.iter().map(|d| d.total_pages).collect();
+    let num_cpu_pages: Vec<usize> = cfg.drivers.iter().map(|d| d.cpu_pages).collect();
+    let num_rs_slots: Vec<usize> = cfg.drivers.iter().map(|d| d.rs_cache_slots).collect();
+    let rs_cache_spec_rollback: Vec<bool> = cfg
+        .drivers
+        .iter()
+        .map(|d| d.rs_cache_spec_rollback)
+        .collect();
+    let speculation_depth = cfg.scheduler.speculation_depth;
 
-        context::spawn(
-            cfg.kv_page_size,
-            num_gpu_pages,
-            num_cpu_pages,
-            max_forward_requests,
-            num_rs_slots,
-            rs_cache_spec_rollback,
-            cfg.scheduler.default_endowment_pages.max(1),
-            cfg.scheduler.default_token_limit,
-            cfg.scheduler.admission_oversubscription_factor,
-            cfg.scheduler.restore_pause_at_utilization,
-        );
-        inference::spawn(
-            &drivers,
-            cfg.kv_page_size as u32,
-            cfg.scheduler.request_timeout_secs,
-            cfg.scheduler.batch_policy.clone(),
-            speculation_depth,
-        )
-        .await;
-        adapter::spawn(&drivers);
-    }
+    context::spawn(
+        cfg.kv_page_size,
+        num_gpu_pages,
+        num_cpu_pages,
+        num_rs_slots,
+        rs_cache_spec_rollback,
+        cfg.scheduler.restore_pause_at_utilization,
+    );
+    inference::spawn(
+        &drivers,
+        cfg.kv_page_size as u32,
+        cfg.scheduler.request_timeout_secs,
+        speculation_depth,
+    )
+    .await;
+    adapter::spawn(&drivers);
 
     Ok(BootstrapHandle {
         token: auth::get_internal_auth_token().await?,
@@ -292,9 +265,9 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
 /// Boot-time checks for the values pie's Python layer cannot validate
 /// itself: filesystem-side effects (cache/auth dirs) and worker-handshake
 /// outputs (tokenizer file, driver capability numbers). Field-level
-/// validation of user-supplied scalars (`batch_policy`, timeouts, market
-/// knobs, etc.) happens in `pie.config.*.__post_init__` — by the time
-/// they reach Rust they're already known-good.
+/// validation of user-supplied scalars (timeouts, etc.) happens in
+/// `pie.config.*.__post_init__` — by the time they reach Rust they're
+/// already known-good.
 fn verify_config(config: &Config) -> Result<()> {
     fs::create_dir_all(&config.cache_dir)
         .with_context(|| format!("Could not create cache dir: {:?}", config.cache_dir))?;
@@ -308,43 +281,58 @@ fn verify_config(config: &Config) -> Result<()> {
         })?;
     }
 
-    for model in &config.models {
+    let model = &config.model;
+    ensure!(
+        model.tokenizer_path.exists(),
+        "Model {:?}: tokenizer not found at {:?}",
+        model.name,
+        model.tokenizer_path
+    );
+    for (i, dev) in model.drivers.iter().enumerate() {
         ensure!(
-            model.tokenizer_path.exists(),
-            "Model {:?}: tokenizer not found at {:?}",
-            model.name,
-            model.tokenizer_path
+            dev.total_pages > 0,
+            "Model {:?} driver {i}: total_pages must be > 0",
+            model.name
         );
-        for (i, dev) in model.drivers.iter().enumerate() {
-            ensure!(
-                dev.total_pages > 0,
-                "Model {:?} driver {i}: total_pages must be > 0",
-                model.name
-            );
-            ensure!(
-                dev.limits.max_forward_tokens > 0,
-                "Model {:?} driver {i}: max_forward_tokens must be > 0",
-                model.name
-            );
-            ensure!(
-                dev.limits.max_forward_requests > 0,
-                "Model {:?} driver {i}: max_forward_requests must be > 0",
-                model.name
-            );
-            ensure!(
-                dev.limits.max_page_refs > 0,
-                "Model {:?} driver {i}: max_page_refs must be > 0",
-                model.name
-            );
-        }
+        ensure!(
+            dev.limits.max_forward_tokens > 0,
+            "Model {:?} driver {i}: max_forward_tokens must be > 0",
+            model.name
+        );
+        ensure!(
+            dev.limits.max_forward_requests > 0,
+            "Model {:?} driver {i}: max_forward_requests must be > 0",
+            model.name
+        );
+        ensure!(
+            dev.limits.max_page_refs > 0,
+            "Model {:?} driver {i}: max_page_refs must be > 0",
+            model.name
+        );
     }
+
+    // `restore_pause_at_utilization` is a GPU-utilization fraction in (0.0, 1.0]:
+    // the restore loop pauses while any driver's page utilization exceeds it.
+    // A value <= 0.0 makes the check `utilization > threshold` true even on an
+    // empty GPU (utilization == 0.0), so restore is paused forever and any
+    // suspended context's deferred page op deadlocks. Reject it fast here rather
+    // than hang at runtime.
+    ensure!(
+        model.scheduler.restore_pause_at_utilization > 0.0
+            && model.scheduler.restore_pause_at_utilization <= 1.0,
+        "Model {:?}: scheduler.restore_pause_at_utilization must be in (0.0, 1.0], got {}",
+        model.name,
+        model.scheduler.restore_pause_at_utilization
+    );
 
     Ok(())
 }
 
 fn init_wasmtime(runtime: &RuntimeConfig) -> wasmtime::Engine {
     let mut wasm_config = wasmtime::Config::default();
-    wasm_config.async_support(true);
+    // wasmtime 46: `async_support` is a deprecated no-op (async is always
+    // compiled in) and the Component Model Async feature is on by default, so
+    // no explicit flags are needed to enable async host calls / fibers.
 
     // Every wasmtime knob comes from the caller — Python is the source
     // of truth for defaults. The `wasm_max_instances` knob covers four

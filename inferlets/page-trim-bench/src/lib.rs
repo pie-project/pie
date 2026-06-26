@@ -14,8 +14,6 @@
 
 use inferlet::{
     Context, Result,
-    model::Model,
-    runtime,
     sample::Sampler,
 };
 use serde::Deserialize;
@@ -55,8 +53,7 @@ fn build_sink_mask(seq_len: u32, sink: u32, window: u32) -> Vec<u32> {
 
 #[inferlet::main]
 async fn main(input: Input) -> Result<String> {
-    let model = Model::load(runtime::models().first().ok_or("No models available")?)?;
-    let mut ctx = Context::new(&model)?;
+    let mut ctx = Context::new()?;
 
     // Synthetic prompt tokens. We avoid tokens 0..999 to dodge any reserved
     // special-token range; modulo by 30000 keeps every id well inside any

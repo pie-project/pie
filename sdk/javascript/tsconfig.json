@@ -5,7 +5,8 @@
     "moduleResolution": "bundler",
     "lib": [
       "ES2022",
-      "ESNext.Disposable"
+      "ESNext.Disposable",
+      "DOM"
     ],
     "declaration": true,
     "outDir": "dist",
@@ -50,12 +51,6 @@
       ],
       "pie:instruct/tool-use": [
         "./src/bindings/interfaces/pie-instruct-tool-use.js"
-      ],
-      "pie:mcp/client": [
-        "./src/bindings/interfaces/pie-mcp-client.js"
-      ],
-      "pie:mcp/types": [
-        "./src/bindings/interfaces/pie-mcp-types.js"
       ],
       "pie:zo/zo": [
         "./src/bindings/interfaces/pie-zo-zo.js"

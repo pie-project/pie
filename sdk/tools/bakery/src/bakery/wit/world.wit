@@ -3,7 +3,6 @@ package pie:inferlet;
 world imports {
     include pie:core/imports;
     include pie:instruct/imports;
-    include pie:mcp/imports;
     include pie:zo/imports;
     import wasi:filesystem/types@0.2.4;
     import wasi:filesystem/preopens@0.2.4;
@@ -15,7 +14,6 @@ world imports {
 world inferlet {
     include pie:core/imports;
     include pie:instruct/imports;
-    include pie:mcp/imports;
     include pie:zo/imports;
     import wasi:filesystem/types@0.2.4;
     import wasi:filesystem/preopens@0.2.4;

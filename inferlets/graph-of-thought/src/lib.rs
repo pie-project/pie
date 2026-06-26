@@ -7,10 +7,7 @@
 
 use futures::stream::FuturesUnordered;
 use futures::{StreamExt, future};
-use inferlet::{
-    Context, sample::Sampler, model::Model,
-    runtime, Result,
-};
+use inferlet::{Context, Result, sample::Sampler};
 use serde::Deserialize;
 use std::time::Instant;
 
@@ -140,11 +137,7 @@ async fn main(input: Input) -> Result<String> {
         proposal_tokens, aggregation_tokens
     );
 
-    let models = runtime::models();
-    let model_name = models.first().ok_or("No models available")?;
-    let model = Model::load(model_name)?;
-
-    let mut ctx_root = Context::new(&model)?;
+    let mut ctx_root = Context::new()?;
     ctx_root.system(SYSTEM_PROMPT);
     ctx_root.flush().await?;
 

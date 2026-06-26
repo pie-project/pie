@@ -1,24 +1,22 @@
 interface context {
 
-    use wasi:io/poll@0.2.4.{pollable};
     use types.{error};
-    use model.{model};
 
     type page-id = u32;
 
     resource context {
 
         // Creates a fresh empty context
-        create: static func(model: borrow<model>) -> result<context, error>;
+        create: static func() -> result<context, error>;
 
         // Opens a snapshot (implicit fork — snapshot stays immutable, working pages are copied)
-        open: static func(model: borrow<model>, name: string) -> result<context, error>;
+        open: static func(name: string) -> result<context, error>;
 
         // Takes ownership of a snapshot (snapshot is deleted, GPU pages transfer without copy)
-        take: static func(model: borrow<model>, name: string) -> result<context, error>;
+        take: static func(name: string) -> result<context, error>;
 
         // Deletes a saved snapshot by name
-        delete: static func(model: borrow<model>, name: string) -> result<_, error>;
+        delete: static func(name: string) -> result<_, error>;
 
         // Forks into a new anonymous context (working pages are copied via GPU D2D or CPU H2D)
         fork: func() -> result<context, error>;
@@ -35,15 +33,13 @@ interface context {
         // Number of tokens per page    
         tokens-per-page: func() -> u32;
 
-        model: func() -> model;
-
         // Number of committed KV pages in the context
         committed-page-count: func() -> u32;
 
-        // Number of uncommitted KV pages (based on buffered tokens in the resource handle)
+        // Number of working KV pages (based on buffered tokens in the resource handle)
         working-page-count: func() -> u32;
 
-        // Commit the KV pages to the context
+        // Commit working KV pages to the context
         commit-working-pages: func(num-pages: u32) -> result<_, error>;
 
         // Reserve additional working GPU pages for the context
@@ -57,6 +53,11 @@ interface context {
 
         // Remove the last N tokens from working pages (for rollback, e.g. speculative rejection)
         truncate-working-page-tokens: func(num-tokens: u32);
+
+        // Suspend this context (release GPU pages, offload to CPU).
+        // Restoration is system-driven under FCFS: suspended contexts are
+        // restored oldest-launched first as memory frees up.
+        suspend: func() -> result<_, error>;
 
     }
 

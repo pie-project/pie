@@ -43,7 +43,7 @@ pub enum DriverCmd {
 #[derive(Args, Debug)]
 pub struct ListArgs {
     /// Path to a serve config TOML. If provided, prints which driver
-    /// types each `[[model]]` uses.
+    /// type the `[model]` uses.
     #[arg(short = 'c', long)]
     pub config: Option<PathBuf>,
 }
@@ -86,13 +86,12 @@ fn list(args: ListArgs) -> Result<()> {
     if let Some(path) = args.config {
         let cfg = crate::derive::load_worker_config(&path)?;
         println!();
-        println!("[[model]] entries in {}:", path.display());
-        for m in &cfg.models {
-            println!(
-                "  {:<24}  type = {:?}, devices = {:?}",
-                m.name, m.driver.kind, m.driver.device,
-            );
-        }
+        println!("[model] in {}:", path.display());
+        let m = &cfg.model;
+        println!(
+            "  {:<24}  type = {:?}, devices = {:?}",
+            m.name, m.driver.kind, m.driver.device,
+        );
     }
     Ok(())
 }

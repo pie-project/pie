@@ -55,8 +55,6 @@ fn spawn_and_wait(s: &TestState, name: &str, input: String) -> bool {
             None,
             false,
             None,
-            None, // no workflow
-            None, // token_budget
         )
         .expect("spawn")
     });
@@ -107,16 +105,10 @@ fn context_inferlet_exercises_host_apis() {
     );
 }
 
-// The generate test inferlet currently hangs at `step.execute().await`
-// — the mock backend's `EchoBehavior` response doesn't quite match what
-// the modernized `Generator` SDK expects on the forward pass. The
-// inferlet builds (commit `2cc9c0f6` fixed that), the runtime spawns
-// it, but the WASM task blocks indefinitely on the host RPC. Diagnosis
-// needs either a new public API to read a process's accumulated stderr
-// or instrumentation at the SDK→runtime boundary; both are outside
-// spec-exec scope. Skip until the mock fixture catches up to the SDK.
+// Exercises the full flush + generate pipeline: the `generate` inferlet runs
+// fill → flush → generate(5 steps) against the mock backend and must run to
+// completion (single-model FCFS host; no forward-pass stall).
 #[test]
-#[ignore]
 fn generate_inferlet_exercises_forward_pass() {
     let s = state();
     assert!(
@@ -145,8 +137,6 @@ fn concurrent_spawns() {
                     None,
                     false,
                     None,
-                    None, // no workflow
-                    None, // token_budget
                 )
                 .unwrap_or_else(|e| panic!("spawn {i} failed: {e}"));
                 pid
@@ -186,8 +176,6 @@ fn rapid_sequential_spawns() {
                 None,
                 false,
                 None,
-                None, // no workflow
-                None, // token_budget
             )
             .unwrap_or_else(|e| panic!("sequential spawn {i} failed: {e}"));
 
@@ -237,8 +225,6 @@ fn mixed_success_and_error() {
                 None,
                 false,
                 None,
-                None, // no workflow
-                None, // token_budget
             )
             .unwrap_or_else(|e| panic!("mixed spawn {i} ({name}) failed: {e}"));
             pids.push((i, name, pid));
@@ -274,8 +260,6 @@ fn spawn_after_termination() {
             None,
             false,
             None,
-            None, // no workflow
-            None, // token_budget
         )
         .expect("spawn for termination");
 
@@ -301,8 +285,6 @@ fn spawn_after_termination() {
             None,
             false,
             None,
-            None, // no workflow
-            None, // token_budget
         )
         .expect("spawn after termination");
 

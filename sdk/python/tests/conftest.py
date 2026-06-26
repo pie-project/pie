@@ -9,10 +9,8 @@ from __future__ import annotations
 import sys
 import types
 from dataclasses import dataclass
-from typing import Optional
 
 import pytest
-
 
 # =============================================================================
 # Fake resources & types
@@ -75,24 +73,11 @@ class FakeTokenizer:
 
 
 class FakeModel:
+    """Deprecated stand-in kept only so old references don't explode; the
+    real binding now exposes global functions (see ``model_mod`` below)."""
+
     def __init__(self):
         self._tokenizer = FakeTokenizer()
-
-    @classmethod
-    def load(cls, name: str):
-        return cls()
-
-    def tokenizer(self):
-        return self._tokenizer
-
-    def default_system_speculation(self) -> bool:
-        return False
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *args):
-        pass
 
 
 class FakeContext:
@@ -102,16 +87,32 @@ class FakeContext:
         self._tokens_per_page_val: int = 64
 
     @classmethod
-    def create(cls, model):
-        ctx = cls()
-        return ctx
+    def create(cls):
+        return cls()
+
+    @classmethod
+    def open(cls, name):
+        return cls()
+
+    @classmethod
+    def take(cls, name):
+        return cls()
+
+    @classmethod
+    def delete(cls, name):
+        return None
 
     def destroy(self):
         pass
 
-    @classmethod
-    def lookup(cls, model, name):
-        return None
+    def save(self, name):
+        pass
+
+    def snapshot(self):
+        return "snap"
+
+    def suspend(self):
+        pass
 
     def fork(self):
         new = FakeContext()
@@ -127,9 +128,6 @@ class FakeContext:
 
     def tokens_per_page(self):
         return self._tokens_per_page_val
-
-    def model(self):
-        return FakeModel()
 
     def committed_page_count(self):
         return self._committed_pages
@@ -238,8 +236,8 @@ class FakeFutureOutput:
 class FakeForwardPass:
     _next_output = None
 
-    def __init__(self, model):
-        self._model = model
+    def __init__(self):
+        pass
 
     def context(self, ctx): pass
     def input_tokens(self, tokens, positions): pass
@@ -275,7 +273,7 @@ class FakeGrammar:
 
 
 class FakeMatcher:
-    def __init__(self, grammar, tokenizer):
+    def __init__(self, grammar):
         self._terminated = False
     def accept_tokens(self, token_ids): pass
     def next_token_logit_mask(self): return [1] * 256
@@ -355,42 +353,13 @@ class FakeSubscription:
     def __exit__(self, *args): pass
 
 
-# --- MCP ---
-@dataclass
-class ContentText:
-    value: str
-@dataclass
-class ContentImage:
-    value: object
-@dataclass
-class ContentEmbeddedResource:
-    value: object
-
-class FakeMcpSession:
-    def list_tools(self): return '{"tools": []}'
-    def call_tool(self, name, args): return []
-    def list_resources(self): return '{"resources": []}'
-    def read_resource(self, uri): return []
-    def list_prompts(self): return '{"prompts": []}'
-    def get_prompt(self, name, args): return "{}"
-    def __enter__(self): return self
-    def __exit__(self, *args): pass
-
-@dataclass
-class McpError:
-    code: int
-    message: str
-    data: object
-
 # --- Adapter ---
 class FakeAdapter:
     @classmethod
-    def create(cls, model, name): return cls()
+    def create(cls, name): return cls()
     @classmethod
-    def lookup(cls, model, name): return None
-    def clone(self, new_name): return FakeAdapter()
-    def acquire_lock(self): return FakeFutureBool(True)
-    def release_lock(self): pass
+    def open(cls, name): return None
+    def fork(self, new_name): return FakeAdapter()
     def load(self, path): pass
     def save(self, path): pass
     def __enter__(self): return self
@@ -427,18 +396,17 @@ def _build_mock_modules():
     core_types.FutureString = FakeFutureString
     core_types.FutureBlob = FakeFutureBlob
 
-    # pie_mcp_types
-    mcp_types = types.ModuleType("wit_world.imports.pie_mcp_types")
-    mcp_types.Content_Text = ContentText
-    mcp_types.Content_Image = ContentImage
-    mcp_types.Content_EmbeddedResource = ContentEmbeddedResource
-    mcp_types.Content = ContentText | ContentImage | ContentEmbeddedResource
-    mcp_types.Error = McpError
-
-    # model
+    # model — the engine serves one bound model; global functions only.
+    _tok = FakeTokenizer()
     model_mod = types.ModuleType("wit_world.imports.model")
-    model_mod.Tokenizer = FakeTokenizer
-    model_mod.Model = FakeModel
+    model_mod.name = lambda: "mock-model"
+    model_mod.architecture = lambda: "mock-arch"
+    model_mod.default_system_speculation = lambda: False
+    model_mod.encode = lambda text: _tok.encode(text)
+    model_mod.decode = lambda tokens: _tok.decode(tokens)
+    model_mod.vocabs = lambda: _tok.vocabs()
+    model_mod.split_regex = lambda: _tok.split_regex()
+    model_mod.special_tokens = lambda: _tok.special_tokens()
 
     # context
     context_mod = types.ModuleType("wit_world.imports.context")
@@ -476,13 +444,13 @@ def _build_mock_modules():
     chat_mod.Event_Interrupt = ChatEvent_Interrupt
     chat_mod.Event_Done = ChatEvent_Done
     chat_mod.Decoder = FakeChatDecoder
-    chat_mod.system = lambda ctx, msg: []
-    chat_mod.user = lambda ctx, msg: []
-    chat_mod.assistant = lambda ctx, msg: []
-    chat_mod.cue = lambda ctx: [65]
-    chat_mod.seal = lambda ctx: []
-    chat_mod.stop_tokens = lambda model: [2]
-    chat_mod.create_decoder = lambda model: FakeChatDecoder()
+    chat_mod.system = lambda msg: []
+    chat_mod.user = lambda msg: []
+    chat_mod.assistant = lambda msg: []
+    chat_mod.cue = lambda: [65]
+    chat_mod.seal = lambda: []
+    chat_mod.stop_tokens = lambda: [2]
+    chat_mod.create_decoder = lambda: FakeChatDecoder()
 
     # reasoning
     reasoning_mod = types.ModuleType("wit_world.imports.reasoning")
@@ -490,25 +458,24 @@ def _build_mock_modules():
     reasoning_mod.Event_Delta = ReasoningEvent_Delta
     reasoning_mod.Event_Complete = ReasoningEvent_Complete
     reasoning_mod.Decoder = FakeReasoningDecoder
-    reasoning_mod.create_decoder = lambda model: FakeReasoningDecoder()
+    reasoning_mod.create_decoder = lambda: FakeReasoningDecoder()
 
     # tool_use
     tool_mod = types.ModuleType("wit_world.imports.tool_use")
     tool_mod.Event_Start = ToolEvent_Start
     tool_mod.Event_Call = ToolEvent_Call
     tool_mod.Decoder = FakeToolDecoder
-    tool_mod.equip = lambda ctx, tools: []
-    tool_mod.answer = lambda ctx, name, value: []
-    tool_mod.create_decoder = lambda model: FakeToolDecoder()
-    tool_mod.create_matcher = lambda model, tools: FakeMatcher(None, None)
+    tool_mod.equip = lambda tools: []
+    tool_mod.answer = lambda name, value: []
+    tool_mod.create_decoder = lambda: FakeToolDecoder()
+    tool_mod.format = lambda tools: None
+    tool_mod.create_matcher = lambda tools: FakeMatcher(None)
 
     # runtime
     runtime_mod = types.ModuleType("wit_world.imports.runtime")
     runtime_mod.version = lambda: "0.1.0-mock"
     runtime_mod.instance_id = lambda: "mock-instance-001"
     runtime_mod.username = lambda: "test-user"
-    runtime_mod.models = lambda: ["mock-model"]
-    runtime_mod.spawn = lambda pkg, args: FakeFutureString("spawned")
 
     # messaging
     messaging_mod = types.ModuleType("wit_world.imports.messaging")
@@ -529,25 +496,11 @@ def _build_mock_modules():
     adapter_mod = types.ModuleType("wit_world.imports.adapter")
     adapter_mod.Adapter = FakeAdapter
 
-    # client (MCP)
-    client_mod = types.ModuleType("wit_world.imports.client")
-    client_mod.available_servers = lambda: ["mock-server"]
-    client_mod.connect = lambda name: FakeMcpSession()
-    client_mod.Session = FakeMcpSession
-
     # zo
     zo_mod = types.ModuleType("wit_world.imports.zo")
     zo_mod.adapter_seed = lambda fp, seed: None
     zo_mod.initialize = lambda adapter, rank, alpha, pop, mu, sigma: None
     zo_mod.update = lambda adapter, scores, seeds, max_sigma: None
-
-    # scheduling
-    scheduling_mod = types.ModuleType("wit_world.imports.scheduling")
-    scheduling_mod.balance = lambda model: 1000.0
-    scheduling_mod.rent = lambda ctx: 0.0
-    scheduling_mod.dividend = lambda model: 0.0
-    scheduling_mod.latency = lambda ctx: 0.01
-    scheduling_mod.price = lambda: 1.0
 
     # Install all
     modules = {
@@ -556,7 +509,6 @@ def _build_mock_modules():
         "wit_world.imports": wit_imports,
         "wit_world.imports.poll": poll_mod,
         "wit_world.imports.pie_core_types": core_types,
-        "wit_world.imports.pie_mcp_types": mcp_types,
         "wit_world.imports.model": model_mod,
         "wit_world.imports.context": context_mod,
         "wit_world.imports.inference": inf_mod,
@@ -567,18 +519,16 @@ def _build_mock_modules():
         "wit_world.imports.messaging": messaging_mod,
         "wit_world.imports.session": session_mod,
         "wit_world.imports.adapter": adapter_mod,
-        "wit_world.imports.client": client_mod,
         "wit_world.imports.zo": zo_mod,
-        "wit_world.imports.scheduling": scheduling_mod,
     }
 
     for name, mod in modules.items():
         sys.modules[name] = mod
 
     for attr in [
-        "poll", "pie_core_types", "pie_mcp_types", "model", "context",
+        "poll", "pie_core_types", "model", "context",
         "inference", "chat", "reasoning", "tool_use", "runtime",
-        "messaging", "session", "adapter", "client", "zo", "scheduling",
+        "messaging", "session", "adapter", "zo",
     ]:
         setattr(wit_imports, attr, sys.modules[f"wit_world.imports.{attr}"])
 

@@ -6,7 +6,6 @@ authors = ["Pie Team"]
 
 [runtime]
 core = "^0.2.0"
-mcp = "^0.2.0"
 
 [parameters]
 prompt_tokens = {type = "int", optional = true, description = "Length of synthetic prompt in tokens (default: 2048)"}

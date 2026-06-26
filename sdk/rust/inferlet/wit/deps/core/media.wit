@@ -9,13 +9,12 @@
 // bound model — does ALL of the model-specific work (decode, resize, patchify,
 // log-mel, video frame-sampling, and the model's own span delimiters). An
 // inferlet never branches on the model. An encoded input becomes ordinary
-// context KV, so fork / snapshot / prefix-cache / market all apply for free;
+// context KV, so fork / snapshot / prefix-cache all apply for free;
 // the inferlet only ever holds a handle (pixels/features never cross into WASM
 // linear memory, and there are no `<image>` placeholder token ids).
 interface media {
 
     use types.{error};
-    use model.{model};
 
     // A host-side handle to a preprocessed still image (also used for one
     // decoded video frame). `from-bytes` decodes + resizes + patchifies per the
@@ -27,7 +26,7 @@ interface media {
         // resizes + patchifies + normalizes exactly as the bound model's image
         // processor requires (Gemma SigLIP2 vs Qwen smart-resize, etc.). Errors
         // if the model has no vision front-end or the bytes don't decode.
-        from-bytes: static func(model: borrow<model>, bytes: list<u8>)
+        from-bytes: static func(bytes: list<u8>)
             -> result<image, error>;
 
         // Hidden-state rows / KV slots this visual span occupies.
@@ -59,8 +58,7 @@ interface media {
         // uniformly samples `<= max-frames`, and preprocesses each per the bound
         // model. Errors if the model has no vision front-end or the bytes don't
         // decode as an animation.
-        from-bytes: static func(model: borrow<model>,
-                                bytes: list<u8>,
+        from-bytes: static func(bytes: list<u8>,
                                 max-frames: u32) -> result<video, error>;
 
         // Number of sampled frames.
@@ -83,7 +81,7 @@ interface media {
         // the model's rate, and computes its log-mel features
         // (Gemma4AudioFeatureExtractor). Errors if the model has no audio
         // front-end or the bytes don't decode.
-        from-bytes: static func(model: borrow<model>, bytes: list<u8>)
+        from-bytes: static func(bytes: list<u8>)
             -> result<audio, error>;
 
         // Hidden-state rows / KV slots this clip occupies == audio soft tokens.

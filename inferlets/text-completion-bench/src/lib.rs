@@ -17,7 +17,7 @@
 //! top_p 0.95) so workload shape is otherwise identical.
 
 use inferlet::{
-    Context, FutureStringExt, Result, chat, model::Model, pie::core::session, runtime,
+    Context, Result, chat, pie::core::session,
     sample::Sampler,
 };
 use serde::{Deserialize, Serialize};
@@ -100,13 +100,10 @@ struct Output {
 
 #[inferlet::main]
 async fn main(input: Input) -> Result<Output> {
-    let models = runtime::models();
-    let model_name = models.first().ok_or("No models available")?;
-    let model = Model::load(model_name)?;
     let stop_tokens: Vec<u32> = if input.ignore_eos {
         Vec::new()
     } else {
-        chat::stop_tokens(&model)
+        chat::stop_tokens()
     };
 
     let batch_len = input.prompt_tokens_batch.len().max(input.prompts.len());
@@ -121,13 +118,13 @@ async fn main(input: Input) -> Result<Output> {
                         .get(i)
                         .map(String::as_str)
                         .unwrap_or(input.prompt.as_str());
-                    let mut ctx = Context::new(&model)?;
+                    let mut ctx = Context::new()?;
                     ctx.system(&input.system).user(prompt).cue();
                     prepared_prompt_tokens.push(ctx.buffer().to_vec());
                 }
             }
             session::send("ready");
-            let _ = session::receive().wait_async().await;
+            let _ = session::receive().await;
         }
         let mut request_prompt_tokens = Vec::with_capacity(batch_len);
         let mut request_output_tokens = Vec::with_capacity(batch_len);
@@ -150,7 +147,7 @@ async fn main(input: Input) -> Result<Output> {
                 } else {
                     input.prompt_tokens_batch.get(i).map(Vec::as_slice)
                 };
-                run_one(&model, &input, prompt, prompt_tokens, &stop_tokens, false)
+                run_one(&input, prompt, prompt_tokens, &stop_tokens, false)
             });
             for (j, result) in futures::future::join_all(futures)
                 .await
@@ -167,7 +164,7 @@ async fn main(input: Input) -> Result<Output> {
             offset = end;
         }
         let text = if input.return_text {
-            model.tokenizer().decode(&first_tokens).unwrap_or_default()
+            inferlet::model::decode(&first_tokens).unwrap_or_default()
         } else {
             String::new()
         };
@@ -182,7 +179,6 @@ async fn main(input: Input) -> Result<Output> {
     }
 
     let result = run_one(
-        &model,
         &input,
         &input.prompt,
         input.prompt_tokens.as_deref(),
@@ -191,7 +187,7 @@ async fn main(input: Input) -> Result<Output> {
     )
     .await?;
     let text = if input.return_text {
-        model.tokenizer().decode(&result.tokens).unwrap_or_default()
+        inferlet::model::decode(&result.tokens).unwrap_or_default()
     } else {
         String::new()
     };
@@ -213,14 +209,13 @@ struct RunResult {
 }
 
 async fn run_one(
-    model: &Model,
     input: &Input,
     prompt: &str,
     prompt_tokens: Option<&[u32]>,
     stop_tokens: &[u32],
     honor_wait_for_start: bool,
 ) -> Result<RunResult> {
-    let mut ctx = Context::new(model)?;
+    let mut ctx = Context::new()?;
     let num_prompt_tokens = if let Some(tokens) = prompt_tokens {
         ctx.append(tokens);
         tokens.len()
@@ -231,7 +226,7 @@ async fn run_one(
 
     if honor_wait_for_start && input.wait_for_start {
         session::send("ready");
-        let _ = session::receive().wait_async().await;
+        let _ = session::receive().await;
     }
 
     let mut all_output_tokens: Vec<u32> = Vec::with_capacity(input.max_tokens);
@@ -244,7 +239,7 @@ async fn run_one(
         }
     };
 
-    let mut g = ctx.generate(sampler).rebid_each_step(false);
+    let mut g = ctx.generate(sampler);
     if input.temperature <= 1e-5 {
         if let Some(enabled) = input.system_speculation {
             g = if enabled {

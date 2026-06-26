@@ -21,7 +21,7 @@ def main() -> int:
     sdk_root = project_root.parent
     pie_root = sdk_root.parent
 
-    wit_path = pie_root / "runtime" / "wit"
+    wit_path = pie_root / "interface" / "inferlet"
     output_path = project_root / "src" / "inferlet" / "bindings"
 
     if not wit_path.exists():

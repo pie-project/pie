@@ -9,7 +9,6 @@
 //! inferlet-side `from_pixels`/`from_mel` produced, so the bridge + driver are
 //! unchanged — only the *source* of the bytes moved host-side. See MULTIMODAL.md.
 
-use crate::api::model::Model;
 use crate::api::pie;
 use crate::instance::InstanceState;
 use crate::multimodal::{self, Processor, VisionArch};
@@ -81,11 +80,11 @@ pub struct Audio {
 }
 
 /// Encode a delimiter string with the model's tokenizer, or `[]` if empty.
-fn encode_delim(model: &Model, s: &str) -> Vec<u32> {
+fn encode_delim(s: &str) -> Vec<u32> {
     if s.is_empty() {
         Vec::new()
     } else {
-        model.model.tokenize(s)
+        crate::model::model().tokenize(s)
     }
 }
 
@@ -111,26 +110,25 @@ impl pie::core::media::HostImage for InstanceState {
     /// Decode + resize + patchify an encoded still image per the bound model.
     async fn from_bytes(
         &mut self,
-        model: Resource<Model>,
         bytes: Vec<u8>,
     ) -> Result<Result<Resource<Image>, String>> {
         let (processor, prefix, suffix) = {
-            let m = self.ctx().table.get(&model)?;
-            let arch = m.model.arch_name();
+            let m = crate::model::model();
+            let arch = m.arch_name();
             let varch = match VisionArch::from_arch_name(arch) {
                 Some(a) => a,
                 None => {
                     return Ok(Err(format!(
                         "model '{}' (arch '{arch}') has no vision front-end",
-                        m.model.name()
+                        m.name()
                     )));
                 }
             };
             let (pre, suf) = multimodal::vision_delimiters(varch);
             (
                 Processor::for_arch(varch),
-                encode_delim(m, pre),
-                encode_delim(m, suf),
+                encode_delim(pre),
+                encode_delim(suf),
             )
         };
         let processed = match processor.process_image_bytes(&bytes) {
@@ -173,19 +171,18 @@ impl pie::core::media::HostVideo for InstanceState {
     /// and preprocess each per the bound model's per-frame budget.
     async fn from_bytes(
         &mut self,
-        model: Resource<Model>,
         bytes: Vec<u8>,
         max_frames: u32,
     ) -> Result<Result<Resource<Video>, String>> {
         let (processor, prefix, suffix) = {
-            let m = self.ctx().table.get(&model)?;
-            let arch = m.model.arch_name();
+            let m = crate::model::model();
+            let arch = m.arch_name();
             let varch = match VisionArch::from_arch_name(arch) {
                 Some(a) => a,
                 None => {
                     return Ok(Err(format!(
                         "model '{}' (arch '{arch}') has no vision front-end",
-                        m.model.name()
+                        m.name()
                     )));
                 }
             };
@@ -193,8 +190,8 @@ impl pie::core::media::HostVideo for InstanceState {
             (
                 // Video frames use the per-frame budget (Gemma ≤70 tokens/frame).
                 Processor::for_arch_video(varch),
-                encode_delim(m, pre),
-                encode_delim(m, suf),
+                encode_delim(pre),
+                encode_delim(suf),
             )
         };
         let decoded = match multimodal::decode_gif_frames(&bytes) {
@@ -265,20 +262,19 @@ impl pie::core::media::HostAudio for InstanceState {
     /// model. Non-audio models return a clean error.
     async fn from_bytes(
         &mut self,
-        model: Resource<Model>,
         bytes: Vec<u8>,
     ) -> Result<Result<Resource<Audio>, String>> {
         let (prefix, suffix) = {
-            let m = self.ctx().table.get(&model)?;
-            let arch = m.model.arch_name();
+            let m = crate::model::model();
+            let arch = m.arch_name();
             if !multimodal::audio_arch_supported(arch) {
                 return Ok(Err(format!(
                     "model '{}' (arch '{arch}') has no audio front-end",
-                    m.model.name()
+                    m.name()
                 )));
             }
             let (pre, suf) = multimodal::audio_delimiters(arch);
-            (encode_delim(m, pre), encode_delim(m, suf))
+            (encode_delim(pre), encode_delim(suf))
         };
         let (mel, n_frames) = match multimodal::audio::process_wav_bytes(&bytes) {
             Ok(x) => x,

@@ -21,10 +21,9 @@
 //! `execute()` directly and use [`Generator::accept`] when sampling
 //! manually.
 
-use crate::ForwardPassExt;
 use crate::Result;
 use crate::adapter::Adapter;
-use crate::context::{Context, brle_and, compute_bid};
+use crate::context::{Context, brle_and};
 use crate::forward::{Output, ProbeHandle, SampleHandle};
 use crate::pie::core::inference::Output as RawOutput;
 use crate::pie::core::inference::{ForwardPass, Sampler as WitSampler, SlotOutput};
@@ -74,7 +73,6 @@ pub struct Generator<'ctx> {
     step_probes: Vec<(u32, WitSampler)>,
     output_buffer: VecDeque<u32>,
     tokens_generated: usize,
-    rebid_each_step: bool,
     done: bool,
 }
 
@@ -82,22 +80,11 @@ impl<'ctx> Generator<'ctx> {
     /// Construct a generator over `ctx` with the given sampler. Prefer
     /// [`Context::generate`].
     pub(crate) fn new(ctx: &'ctx mut Context, sampler: Sampler) -> Self {
-        // Prime the bid with the budget-exhausting rate (geometric prior,
-        // cv²=1) so the scheduler sees a reasonable number from the
-        // start. Re-bid each step using the horizon cascade.
-        let balance = crate::scheduling::balance(&ctx.model);
-        let dividend = crate::scheduling::dividend(&ctx.model);
-        let pages = (ctx.committed_pages + ctx.working_pages).max(1) as f64;
-        let page_size = ctx.page_size as f64;
-        ctx.set_bid(compute_bid(
-            balance, pages, 4096.0, 1.0, page_size, dividend,
-        ));
-
-        let pass = ForwardPass::new(&ctx.model);
+        let pass = ForwardPass::new();
         pass.context(&ctx.inner);
 
         let default_system_speculation =
-            sampler.is_argmax() && ctx.model.default_system_speculation();
+            sampler.is_argmax() && crate::model::default_system_speculation();
         let wit_sampler = sampler.into();
         let speculation = if default_system_speculation {
             SpecMode::System {
@@ -123,7 +110,6 @@ impl<'ctx> Generator<'ctx> {
             step_probes: Vec::new(),
             output_buffer: VecDeque::new(),
             tokens_generated: 0,
-            rebid_each_step: true,
             done: false,
         }
     }
@@ -138,7 +124,7 @@ impl<'ctx> Generator<'ctx> {
     }
 
     /// Stop tokens. Generation halts when any of these is sampled. Pass
-    /// `chat::stop_tokens(&model)` for chat-template defaults.
+    /// `chat::stop_tokens()` for chat-template defaults.
     pub fn stop(mut self, tokens: &[u32]) -> Self {
         self.stop = tokens.to_vec();
         self
@@ -161,7 +147,7 @@ impl<'ctx> Generator<'ctx> {
     /// internally. Composes with other constraints just like
     /// [`constrain`](Self::constrain).
     pub fn constrain_with<S: Schema>(mut self, schema: S) -> Result<Self> {
-        let c = schema.build_constraint(&self.ctx.model)?;
+        let c = schema.build_constraint()?;
         self.constraints.push(Box::new(c));
         Ok(self)
     }
@@ -210,16 +196,6 @@ impl<'ctx> Generator<'ctx> {
     /// `max_tokens` then a Lindy heuristic.
     pub fn horizon(mut self, n: usize) -> Self {
         self.horizon = Some(n);
-        self
-    }
-
-    /// Control whether the generator refreshes its scheduler bid before
-    /// every decode step. The default is `true`, which keeps long-running
-    /// or contended workloads responsive to balance/dividend changes.
-    /// Throughput-oriented single-tenant loops can disable this after the
-    /// initial bid to avoid three host calls per generated token.
-    pub fn rebid_each_step(mut self, enabled: bool) -> Self {
-        self.rebid_each_step = enabled;
         self
     }
 
@@ -274,11 +250,6 @@ impl<'ctx> Generator<'ctx> {
     pub fn next(&mut self) -> Result<Option<GenStep<'_, 'ctx>>> {
         if self.is_done() {
             return Ok(None);
-        }
-
-        // Re-bid using the horizon cascade.
-        if self.rebid_each_step {
-            self.recompute_bid();
         }
 
         // Drain the context's buffer (filled by `system / user / cue / …`).
@@ -380,7 +351,7 @@ impl<'ctx> Generator<'ctx> {
     /// Run to completion, decode through a chat decoder, return text.
     pub async fn collect_text(mut self) -> Result<String> {
         use crate::chat;
-        let mut decoder = chat::Decoder::new(&self.ctx.model);
+        let mut decoder = chat::Decoder::new();
         let mut text = String::new();
         while let Some(step) = self.next()? {
             let out = step.execute().await?;
@@ -402,31 +373,12 @@ impl<'ctx> Generator<'ctx> {
         let schema = schemars::schema_for!(T);
         let schema_str = serde_json::to_string(&schema)
             .map_err(|e| format!("collect_json: serialize schema: {e}"))?;
-        let constraint = GrammarConstraint::from_json_schema(&schema_str, &self.ctx.model)?;
+        let constraint = GrammarConstraint::from_json_schema(&schema_str)?;
         let text = self.constrain(constraint).collect_text().await?;
         serde_json::from_str(&text).map_err(|e| format!("collect_json: deserialize: {e}"))
     }
 
     // ── Internal helpers ───────────────────────────────────────────────
-
-    fn recompute_bid(&mut self) {
-        let balance = crate::scheduling::balance(&self.ctx.model);
-        let dividend = crate::scheduling::dividend(&self.ctx.model);
-        let pages = (self.ctx.committed_pages + self.ctx.working_pages) as f64;
-        let page_size = self.ctx.page_size as f64;
-
-        // Horizon cascade: explicit → max_tokens → Lindy.
-        let (mu, cv2) = if let Some(h) = self.horizon {
-            ((h.saturating_sub(self.tokens_generated)).max(1) as f64, 0.0)
-        } else if let Some(m) = self.max_tokens {
-            ((m.saturating_sub(self.tokens_generated)).max(1) as f64, 1.0)
-        } else {
-            (self.tokens_generated.max(64) as f64, 1.0)
-        };
-
-        self.ctx
-            .set_bid(compute_bid(balance, pages, mu, cv2, page_size, dividend));
-    }
 
     fn reservation_lookahead_tokens(&self) -> u32 {
         let remaining = self
@@ -646,7 +598,7 @@ impl<'g, 'ctx> GenStep<'g, 'ctx> {
         }
 
         let raw = pass
-            .execute_async()
+            .execute()
             .await
             .map_err(|e| format!("GenStep::execute forward: {e}"))?;
 

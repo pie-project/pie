@@ -5,7 +5,7 @@
 //! - exercises both `call(json)` and `call_typed(args)` invocation paths
 //! - prints what would be the agent-loop dispatch for a hand-crafted call
 
-use inferlet::{Context, Result, Tool, model::Model, runtime, tool};
+use inferlet::{Context, Result, Tool, tool};
 
 /// Search the web for current information.
 #[tool]
@@ -21,8 +21,7 @@ async fn add(a: i64, b: i64) -> Result<String> {
 
 #[inferlet::main]
 async fn main(_prompt: String) -> Result<String> {
-    let model = Model::load(runtime::models().first().ok_or("no models")?)?;
-    let mut ctx = Context::new(&model)?;
+    let mut ctx = Context::new()?;
 
     // ── Trait metadata ──
     let tools: &[&dyn Tool] = &[&web_search, &add];

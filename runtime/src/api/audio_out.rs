@@ -12,7 +12,6 @@
 //! The returned [`Speech`] is self-describing, so the inferlet never hardcodes a
 //! model constant.
 
-use crate::api::model::Model;
 use crate::api::pie;
 use crate::api::pie::core::audio_out::{SpeechRequest, Voice};
 use crate::instance::InstanceState;
@@ -62,16 +61,15 @@ impl pie::core::audio_out::Host for InstanceState {}
 impl pie::core::audio_out::HostSpeech for InstanceState {
     async fn generate(
         &mut self,
-        model: Resource<Model>,
         req: SpeechRequest,
     ) -> Result<Result<Resource<Speech>, String>> {
         if req.text.trim().is_empty() {
             return Ok(Err("audio-out: empty text".into()));
         }
-        // Resolve the model, gate on arch, and frame the prompt — all host-side.
-        let (model_idx, prompt) = {
-            let m = self.ctx().table.get(&model)?;
-            let arch = m.model.arch_name();
+        // Gate on arch and frame the prompt — all host-side.
+        let prompt = {
+            let m = crate::model::model();
+            let arch = m.arch_name();
             // CSM is the only audio-output arch. The driver also guards (negative
             // status when the bound model isn't CSM), but reject early here with a
             // clear message for every other arch.
@@ -79,7 +77,7 @@ impl pie::core::audio_out::HostSpeech for InstanceState {
                 return Ok(Err(format!(
                     "model '{}' (arch '{arch}') has no audio-output front-end \
                      (requires a CSM checkpoint, e.g. eustlb/csm-1b)",
-                    m.model.name()
+                    m.name()
                 )));
             }
             let speaker = match &req.voice {
@@ -87,19 +85,19 @@ impl pie::core::audio_out::HostSpeech for InstanceState {
                 Voice::Named(v) => {
                     return Ok(Err(format!(
                         "model '{}' (CSM) selects voices by integer id, not name {v:?}",
-                        m.model.name()
+                        m.name()
                     )));
                 }
             };
-            (m.model_id, csm_frame_prompt(&m.model, &req.text, speaker))
+            csm_frame_prompt(m, &req.text, speaker)
         };
         // Neutral duration -> model frame count.
         let max_frames = match req.max_duration_ms {
             Some(ms) => ms.div_ceil(CSM_MS_PER_FRAME).max(1),
             None => CSM_DEFAULT_MAX_FRAMES,
         };
-        // Default device for the model (single-driver configs use driver 0).
-        let driver_idx = crate::context::get_device(model_idx, 0);
+        // Default device for the single model (single-driver configs use driver 0).
+        let driver_idx = crate::context::get_device(0);
         match crate::driver::generate_audio(driver_idx, &prompt, max_frames).await {
             Ok(pcm) => {
                 let speech = Speech {

@@ -12,7 +12,7 @@
 //! demuxer. `max_frames` is the KV-budget knob (each frame ≈ tens of soft tokens).
 
 use inferlet::media::Video;
-use inferlet::{Context, Result, chat, model::Model, runtime, sample::Sampler};
+use inferlet::{Context, Result, chat, sample::Sampler};
 use serde::Deserialize;
 
 #[derive(Deserialize)]
@@ -55,15 +55,12 @@ fn default_temperature() -> f32 {
 
 #[inferlet::main]
 async fn main(input: Input) -> Result<String> {
-    let models = runtime::models();
-    let model = Model::load(models.first().ok_or("No models available")?)?;
-
     // Model-agnostic: hand the host the raw GIF bytes. It demuxes, uniformly
     // samples up to `max_frames`, and preprocesses each frame at the bound
     // model's per-frame budget — no decode or model-specific code here.
     let bytes = inferlet::http::fetch(&input.video_url).await?;
     let video =
-        Video::from_bytes(&model, &bytes, input.max_frames as u32).map_err(|e| e.to_string())?;
+        Video::from_bytes(&bytes, input.max_frames as u32).map_err(|e| e.to_string())?;
     let n = video.frame_count();
     if n == 0 {
         return Err("no frames sampled from video".into());
@@ -80,7 +77,7 @@ async fn main(input: Input) -> Result<String> {
     );
 
     // Prompt: system → "Here is a video:" → frames+timestamps → question → cue.
-    let mut ctx = Context::new(&model)?;
+    let mut ctx = Context::new()?;
     ctx.system(&input.system).user("Here is a video:");
     ctx.append_video(&video).await?;
     ctx.user(&input.question).cue();
@@ -91,7 +88,7 @@ async fn main(input: Input) -> Result<String> {
             p: 0.95,
         })
         .max_tokens(input.max_tokens)
-        .stop(&chat::stop_tokens(&model))
+        .stop(&chat::stop_tokens())
         .collect_text()
         .await?;
 

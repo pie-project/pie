@@ -8,8 +8,6 @@
 
 use inferlet::{
     Context, Result,
-    model::Model,
-    runtime,
     sample::Distribution,
 };
 use serde::Deserialize;
@@ -21,21 +19,19 @@ struct Input {}
 /// Calculate the normalized probability of each candidate string being
 /// generated from the given context.
 pub async fn validate_outputs(
-    model: &Model,
     base: &Context,
     candidates: &[String],
 ) -> Result<Vec<(String, f32)>> {
-    let tokenizer = model.tokenizer();
     let mut log_probs = Vec::with_capacity(candidates.len());
 
     for candidate in candidates {
         let mut ctx = base.fork()?;
-        let candidate_tokens = tokenizer.encode(candidate);
+        let candidate_tokens = inferlet::model::encode(candidate);
 
         // Bootstrap: feed an empty marker so the model produces a
         // distribution at the candidate's first token position. We use the
         // last token of the empty-string encoding as a no-op anchor.
-        let mut pending = vec![*tokenizer.encode("").last().unwrap_or(&0)];
+        let mut pending = vec![*inferlet::model::encode("").last().unwrap_or(&0)];
         let mut cumulative_log_prob = 0.0f32;
 
         for &target in &candidate_tokens {
@@ -97,10 +93,8 @@ pub async fn validate_outputs(
 #[inferlet::main]
 async fn main(_input: Input) -> Result<String> {
     let start = Instant::now();
-    let models = runtime::models();
-    let model = Model::load(models.first().ok_or("No models available")?)?;
 
-    let mut ctx = Context::new(&model)?;
+    let mut ctx = Context::new()?;
     ctx.system("You are an expert at information extraction.")
         .user(
             "From the sentence \"The financial report was prepared by David Chen.\", \
@@ -109,7 +103,7 @@ async fn main(_input: Input) -> Result<String> {
         .cue();
 
     let prompt_tail = "The name of the person in the report is ";
-    ctx.append(&model.tokenizer().encode(prompt_tail));
+    ctx.append(&inferlet::model::encode(prompt_tail));
     ctx.flush().await?;
 
     let candidates = vec![
@@ -124,7 +118,7 @@ async fn main(_input: Input) -> Result<String> {
         println!("- {}", c);
     }
 
-    let results = validate_outputs(&model, &ctx, &candidates).await?;
+    let results = validate_outputs(&ctx, &candidates).await?;
 
     println!("\n--- Validation Results ---");
     for (candidate, probability) in results {

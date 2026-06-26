@@ -26,41 +26,27 @@ impl std::fmt::Debug for Decoder {
 impl pie::instruct::tool_use::Host for InstanceState {
     async fn equip(
         &mut self,
-        model: Resource<crate::api::model::Model>,
         tools: Vec<String>,
     ) -> Result<Result<Vec<u32>, pie::core::types::Error>> {
-        let model = self.ctx().table.get(&model)?;
-        let tokens = model.model.instruct().equip(&tools);
+        let tokens = crate::model::model().instruct().equip(&tools);
         Ok(Ok(tokens))
     }
 
-    async fn answer(
-        &mut self,
-        model: Resource<crate::api::model::Model>,
-        name: String,
-        value: String,
-    ) -> Result<Vec<u32>> {
-        let model = self.ctx().table.get(&model)?;
-        Ok(model.model.instruct().answer(&name, &value))
+    async fn answer(&mut self, name: String, value: String) -> Result<Vec<u32>> {
+        Ok(crate::model::model().instruct().answer(&name, &value))
     }
 
-    async fn create_decoder(
-        &mut self,
-        model: Resource<crate::api::model::Model>,
-    ) -> Result<Resource<Decoder>> {
-        let model = self.ctx().table.get(&model)?;
-        let inner = model.model.instruct().tool_decoder();
+    async fn create_decoder(&mut self) -> Result<Resource<Decoder>> {
+        let inner = crate::model::model().instruct().tool_decoder();
         let decoder = Decoder { inner };
         Ok(self.ctx().table.push(decoder)?)
     }
 
     async fn format(
         &mut self,
-        model: Resource<crate::api::model::Model>,
         tools: Vec<String>,
     ) -> Result<Option<Resource<crate::api::inference::Grammar>>> {
-        let model_res = self.ctx().table.get(&model)?;
-        let Some(tg) = model_res.model.instruct().tool_call_grammar(&tools) else {
+        let Some(tg) = crate::model::model().instruct().tool_call_grammar(&tools) else {
             return Ok(None);
         };
         let grammar = crate::api::inference::Grammar {
@@ -72,12 +58,11 @@ impl pie::instruct::tool_use::Host for InstanceState {
 
     async fn create_matcher(
         &mut self,
-        model: Resource<crate::api::model::Model>,
         tools: Vec<String>,
     ) -> Result<Resource<crate::api::inference::Matcher>> {
-        let model_res = self.ctx().table.get(&model)?;
-        let instruct = model_res.model.instruct();
-        let tok = model_res.model.tokenizer().clone();
+        let model = crate::model::model();
+        let instruct = model.instruct();
+        let tok = model.tokenizer().clone();
         let stop_tokens = instruct.seal();
 
         let tg = instruct.tool_call_grammar(&tools).ok_or_else(|| {

@@ -11,13 +11,11 @@ from pie.server import Server
 cfg = Config(
     server=ServerConfig(port=0),
     auth=AuthConfig(enabled=False),
-    models=[
-        ModelConfig(
-            name="default",
-            hf_repo="Qwen/Qwen3-0.6B",
-            driver=DriverConfig(type="dev", device=["cuda:0"]),
-        )
-    ],
+    model=ModelConfig(
+        name="default",
+        hf_repo="Qwen/Qwen3-0.6B",
+        driver=DriverConfig(type="dev", device=["cuda:0"]),
+    ),
 )
 
 async def main():

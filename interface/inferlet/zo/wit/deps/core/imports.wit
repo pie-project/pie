@@ -9,4 +9,7 @@ world imports {
     import model;
     import runtime;
     import inference;
+    import http;
+    import media;
+    import audio-out;
 }

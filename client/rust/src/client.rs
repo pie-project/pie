@@ -1,5 +1,4 @@
 use crate::crypto::ParsedPrivateKey;
-use crate::mcp_bridge::BridgeRegistry;
 use crate::message::{CHUNK_SIZE_BYTES, ClientMessage, ServerMessage};
 use crate::utils::IdPool;
 use anyhow::{Context, Result, anyhow};
@@ -61,8 +60,6 @@ struct ClientInner {
     process_event_tx: DashMap<String, mpsc::Sender<ProcessEvent>>,
     /// In-flight file downloads (key: file_hash).
     pending_downloads: DashMap<String, Mutex<DownloadState>>,
-    /// Locally-spawned MCP servers, keyed by registered name.
-    mcp_bridge: BridgeRegistry,
 }
 
 /// Represents a running process on the server.
@@ -153,7 +150,6 @@ impl Client {
             pending_requests: DashMap::new(),
             process_event_tx: DashMap::new(),
             pending_downloads: DashMap::new(),
-            mcp_bridge: BridgeRegistry::new(),
         });
 
         let writer_handle = task::spawn(async move {
@@ -207,10 +203,7 @@ impl Client {
             | ClientMessage::Query { corr_id, .. }
             | ClientMessage::AddProgram { corr_id, .. }
             | ClientMessage::LaunchProcess { corr_id, .. }
-            | ClientMessage::LaunchProcesses { corr_id, .. }
-            | ClientMessage::RunProcesses { corr_id, .. }
             | ClientMessage::ListProcesses { corr_id }
-            | ClientMessage::RegisterMcpServer { corr_id, .. }
             | ClientMessage::Ping { corr_id } => corr_id,
             _ => anyhow::bail!("Invalid message type for this helper"),
         };
@@ -428,14 +421,12 @@ impl Client {
         inferlet: String,
         input: String,
         capture_outputs: bool,
-        token_budget: Option<usize>,
     ) -> Result<Process> {
         let msg = ClientMessage::LaunchProcess {
             corr_id: 0,
             inferlet,
             input,
             capture_outputs,
-            token_budget,
         };
         let (ok, result) = self.send_msg_and_wait(msg).await?;
 
@@ -523,58 +514,6 @@ impl Client {
             Ok(())
         } else {
             anyhow::bail!("Terminate process failed: {}", result)
-        }
-    }
-
-    /// Registers an MCP server for this session.
-    /// All inferlets launched in this session can discover and connect to it.
-    ///
-    /// For `transport = "stdio"`, this spawns the server process locally and
-    /// performs the MCP `initialize` handshake before announcing the server
-    /// to the engine. Other transports are not yet implemented.
-    pub async fn register_mcp_server(
-        &self,
-        name: &str,
-        transport: &str,
-        command: Option<&str>,
-        args: Option<Vec<String>>,
-        url: Option<&str>,
-    ) -> Result<()> {
-        // Spawn locally first so engine-side registration only succeeds if
-        // the server actually came up.
-        match transport {
-            "stdio" => {
-                let cmd = command.context("register_mcp_server(stdio): `command` is required")?;
-                let args_vec = args.clone().unwrap_or_default();
-                self.inner
-                    .mcp_bridge
-                    .register_stdio(name, cmd, &args_vec)
-                    .await
-                    .with_context(|| {
-                        format!("Local registration of MCP server '{}' failed", name)
-                    })?;
-            }
-            other => {
-                anyhow::bail!(
-                    "register_mcp_server: transport '{}' is not yet supported (only 'stdio')",
-                    other
-                );
-            }
-        }
-
-        let msg = ClientMessage::RegisterMcpServer {
-            corr_id: 0,
-            name: name.to_string(),
-            transport: transport.to_string(),
-            command: command.map(|s| s.to_string()),
-            args,
-            url: url.map(|s| s.to_string()),
-        };
-        let (ok, result) = self.send_msg_and_wait(msg).await?;
-        if ok {
-            Ok(())
-        } else {
-            anyhow::bail!("Register MCP server failed: {}", result)
         }
     }
 }
@@ -666,83 +605,7 @@ async fn handle_server_message(msg: ServerMessage, inner: &Arc<ClientInner>) {
                 }
             }
         }
-        ServerMessage::McpRequest {
-            corr_id,
-            process_id: _,
-            server_name,
-            method,
-            params,
-        } => {
-            let inner_for_task = Arc::clone(inner);
-            // Run the relay off the reader task so a slow MCP server can't
-            // block other server messages.
-            tokio::spawn(async move {
-                let (ok, result) =
-                    relay_mcp_request(&inner_for_task, server_name, method, params).await;
-                let response = ClientMessage::McpResponse {
-                    corr_id,
-                    ok,
-                    result,
-                };
-                if let Ok(encoded) = rmp_serde::encode::to_vec_named(&response) {
-                    inner_for_task
-                        .ws_writer_tx
-                        .send(Message::Binary(Bytes::from(encoded)))
-                        .ok();
-                }
-            });
-        }
     }
-}
-
-/// Forward a JSON-RPC method to the named local MCP server and return
-/// `(ok, payload)` for an `McpResponse`. On success, `payload` is the
-/// JSON-encoded `result` field of the JSON-RPC response. On failure,
-/// `payload` is a human-readable error string.
-async fn relay_mcp_request(
-    inner: &Arc<ClientInner>,
-    server_name: String,
-    method: String,
-    params: String,
-) -> (bool, String) {
-    let server = match inner.mcp_bridge.get(&server_name) {
-        Some(s) => s,
-        None => {
-            return (
-                false,
-                format!("MCP server '{}' is not registered locally", server_name),
-            );
-        }
-    };
-    // The runtime sends params as a JSON-encoded string. Parse it back so we
-    // can embed a real JSON value in the JSON-RPC envelope.
-    let params_value: serde_json::Value =
-        serde_json::from_str(&params).unwrap_or(serde_json::Value::Object(Default::default()));
-    match server.call(&method, params_value).await {
-        Ok(result_value) => match serde_json::to_string(&result_value) {
-            Ok(s) => (true, s),
-            Err(e) => (
-                false,
-                encode_error(-32603, &format!("Result serialize: {}", e), None),
-            ),
-        },
-        Err(e) => (false, encode_error(e.code, &e.message, e.data)),
-    }
-}
-
-/// Encode a JSON-RPC-style error as the JSON payload that the runtime side
-/// expects to parse on `ok=false`.
-fn encode_error(code: i64, message: &str, data: Option<serde_json::Value>) -> String {
-    let mut obj = serde_json::Map::new();
-    obj.insert("code".into(), serde_json::Value::Number(code.into()));
-    obj.insert(
-        "message".into(),
-        serde_json::Value::String(message.to_string()),
-    );
-    if let Some(d) = data {
-        obj.insert("data".into(), d);
-    }
-    serde_json::Value::Object(obj).to_string()
 }
 
 /// When the server terminates, clear all pending state.

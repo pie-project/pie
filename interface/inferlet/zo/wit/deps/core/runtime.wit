@@ -1,7 +1,5 @@
 interface runtime {
 
-    use types.{error};
-
     // Returns the runtime version string
     version: func() -> string;
 
@@ -11,7 +9,9 @@ interface runtime {
     // Returns the username of the user who invoked the inferlet
     username: func() -> string;
 
-    // Get a list of all available model names
-    models: func() -> list<string>;
+    // Suspends the calling inferlet for the given duration. A host-provided
+    // async timer: under component-model-async there is no guest-side
+    // pollable->future bridge for wasi:clocks, so timing lives host-side.
+    sleep: async func(duration-ns: u64);
 
 }

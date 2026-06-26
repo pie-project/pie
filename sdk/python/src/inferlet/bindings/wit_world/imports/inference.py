@@ -8,10 +8,10 @@ from abc import abstractmethod
 import weakref
 
 from componentize_py_types import Result, Ok, Err, Some
+from ..imports import media
 from ..imports import adapter
-from ..imports import context
-from ..imports import model
 from ..imports import poll
+from ..imports import context
 
 
 @dataclass
@@ -103,24 +103,26 @@ class SlotOutput_Embedding:
     value: bytes
 
 
-SlotOutput = Union[
-    SlotOutput_Token,
-    SlotOutput_Distribution,
-    SlotOutput_Logits,
-    SlotOutput_Logprobs,
-    SlotOutput_Entropy,
-    SlotOutput_Embedding,
-]
+SlotOutput = Union[SlotOutput_Token, SlotOutput_Distribution, SlotOutput_Logits, SlotOutput_Logprobs, SlotOutput_Entropy, SlotOutput_Embedding]
+"""
+One typed result per `forward-pass.sampler(...)` slot, in the order
+the sampler calls were attached. Lets a single forward pass mix
+arbitrary sampler kinds (e.g. multinomial AND entropy on the same
+position) without losing any output to a single-variant pick.
+"""
 
 
 @dataclass
 class Output:
-    """Result of one forward-pass.execute(): per-slot results (in slot order)
-    plus a per-request side channel for next-iteration speculative drafts."""
+    """
+    Result of one `forward-pass.execute`. `slots` mirrors the order of
+    `forward-pass.sampler` calls. `spec-tokens` / `spec-positions` are a
+    per-request side channel for the next iteration's draft tokens
+    (empty in non-speculative flows).
+    """
     slots: List[SlotOutput]
     spec_tokens: List[int]
     spec_positions: List[int]
-
 
 class FutureOutput:
     
@@ -144,18 +146,38 @@ class FutureOutput:
 
 class ForwardPass:
     
-    def __init__(self, model: model.Model) -> None:
+    def __init__(self) -> None:
         raise NotImplementedError
 
     def context(self, context: context.Context) -> None:
         raise NotImplementedError
     def input_tokens(self, tokens: List[int], positions: List[int]) -> None:
         raise NotImplementedError
+    def input_image(self, image: media.Image, anchor: int) -> None:
+        """
+        Splice an encoded visual span (image or video clip) at sequence
+        position `anchor`. The driver runs the vision encoder and scatters
+        the projected rows into the hidden state for this span. See
+        MULTIMODAL.md.
+        """
+        raise NotImplementedError
+    def input_audio(self, audio: media.Audio, anchor: int) -> None:
+        """
+        Splice an encoded audio clip at sequence position `anchor`. The
+        driver runs the gemma4_audio encoder and scatters the projected
+        soft-token rows into the hidden state. See audio_frontend.md.
+        """
+        raise NotImplementedError
     def input_speculative_tokens(self, tokens: List[int], positions: List[int]) -> None:
         raise NotImplementedError
     def output_speculative_tokens(self, flag: bool) -> None:
         """
         enabled by default
+        """
+        raise NotImplementedError
+    def pass_speculation(self, flag: bool) -> None:
+        """
+        Controls runtime pass-level speculation for this execute only.
         """
         raise NotImplementedError
     def attention_mask(self, mask: List[List[int]]) -> None:
@@ -224,6 +246,12 @@ class Grammar:
         Raises: `wit_world.types.Err(wit_world.imports.str)`
         """
         raise NotImplementedError
+    def to_string(self) -> str:
+        """
+        Debug representation of the grammar. Format is unspecified and
+        may differ across grammar kinds; do not parse.
+        """
+        raise NotImplementedError
     def __enter__(self) -> Self:
         """Returns self"""
         return self
@@ -243,9 +271,9 @@ class Matcher:
     compiled result internally.
     """
     
-    def __init__(self, grammar: Grammar, tokenizer: model.Tokenizer) -> None:
+    def __init__(self, grammar: Grammar) -> None:
         """
-        Create a new matcher from a grammar and tokenizer.
+        Create a new matcher from a grammar.
         """
         raise NotImplementedError
 

@@ -25,7 +25,7 @@ use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io::{self, Write};
 use std::time::{Duration, Instant};
 
-use inferlet::{Context, Result, chat, model::Model, runtime, sample::Distribution, wstd};
+use inferlet::{Context, Result, chat, sample::Distribution};
 use serde::Deserialize;
 
 #[derive(Deserialize)]
@@ -90,23 +90,19 @@ const RED: &str = "\x1b[31m";
 async fn main(input: Input) -> Result<String> {
     let mode = input.mode.to_lowercase();
 
-    let model_name = runtime::models()
-        .first()
-        .cloned()
-        .ok_or("No models available")?;
-    let model = Model::load(&model_name)?;
+    let model_name = inferlet::model::name();
 
     match mode.as_str() {
         "baseline" | "plain" => {
-            run_one(&model, &model_name, &input, false).await?;
+            run_one(&model_name, &input, false).await?;
         }
         "watermarked" | "smart" => {
-            run_one(&model, &model_name, &input, true).await?;
+            run_one(&model_name, &input, true).await?;
         }
         "both" | "" => {
-            let b = run_one(&model, &model_name, &input, false).await?;
+            let b = run_one(&model_name, &input, false).await?;
             println!();
-            let w = run_one(&model, &model_name, &input, true).await?;
+            let w = run_one(&model_name, &input, true).await?;
             println!();
             comparison(&b, &w);
         }
@@ -129,12 +125,7 @@ struct ModeResult {
 }
 
 // ── Run one mode (watermark on or off) ────────────────────────────────
-async fn run_one(
-    model: &Model,
-    model_name: &str,
-    input: &Input,
-    watermark_on: bool,
-) -> Result<ModeResult> {
+async fn run_one(model_name: &str, input: &Input, watermark_on: bool) -> Result<ModeResult> {
     let (label, color, tagline) = if watermark_on {
         (
             "WATERMARKED",
@@ -152,19 +143,16 @@ async fn run_one(
 
     // Build the prompt up front so the first forward pass prefills it.
     // Subsequent passes feed one chosen token at a time.
-    let mut ctx = Context::new(model)?;
+    let mut ctx = Context::new()?;
     let mut pending: Vec<u32> = Vec::new();
-    pending.extend(chat::system(model, &input.system));
-    pending.extend(chat::user(
-        model,
-        &format!("{} /no_think", input.prompt.trim()),
-    ));
-    pending.extend(chat::cue(model));
+    pending.extend(chat::system(&input.system));
+    pending.extend(chat::user(&format!("{} /no_think", input.prompt.trim())));
+    pending.extend(chat::cue());
 
-    let stop_tokens = chat::stop_tokens(model);
+    let stop_tokens = chat::stop_tokens();
     let mut watermark = WatermarkState::new(input.gamma, input.delta);
     let mut detector = Detector::new(input.gamma);
-    let mut chat_dec = chat::Decoder::new(model);
+    let mut chat_dec = chat::Decoder::new();
     let mut stripper = ThinkStripper::new();
     let mut generated: Vec<u32> = Vec::new();
 
@@ -216,7 +204,7 @@ async fn run_one(
                 print!("{}", rendered);
                 let _ = io::stdout().flush();
                 if input.delay > 0 {
-                    wstd::task::sleep(wstd::time::Duration::from_millis(input.delay)).await;
+                    inferlet::sleep(std::time::Duration::from_millis(input.delay)).await;
                 }
             }
         }

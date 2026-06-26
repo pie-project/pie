@@ -4,7 +4,7 @@
 //! token is masked to keep the output a valid sentence in the grammar.
 
 use inferlet::{
-    Context, Result, Schema, sample::Sampler, model::Model, runtime,
+    Context, Result, Schema, sample::Sampler,
 };
 use serde::Deserialize;
 
@@ -20,9 +20,6 @@ fn default_num_tokens() -> usize { 512 }
 async fn main(input: Input) -> Result<String> {
     let max_tokens = input.num_tokens;
 
-    let models = runtime::models();
-    let model = Model::load(models.first().ok_or("No models available")?)?;
-
     let grammar = r#"
 root ::= "[" person ("," person)* "]"
 person ::= "{" "\"name\"" ":" string "," "\"age\"" ":" number "}"
@@ -30,7 +27,7 @@ string ::= "\"" [^"]+ "\""
 number ::= [0-9]+
 "#;
 
-    let mut ctx = Context::new(&model)?;
+    let mut ctx = Context::new()?;
     ctx.system("You are a helpful assistant that outputs structured data in JSON format.");
     ctx.user(
         "List three famous scientists with their approximate birth years. \

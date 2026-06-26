@@ -39,21 +39,15 @@ pub fn check(path: &Path, debug: bool) -> Result<()> {
 }
 
 fn check_summary(path: &Path, cfg: &config::Config) -> String {
-    let model_count = cfg.models.len();
-    let model_word = if model_count == 1 { "model" } else { "models" };
-    let model_summary = cfg
-        .models
-        .iter()
-        .map(|m| format!("{}:{}", m.name, m.driver.kind.as_str()))
-        .collect::<Vec<_>>()
-        .join(", ");
+    let m = &cfg.model;
+    let model_summary = format!("{}:{}", m.name, m.driver.kind.as_str());
     let auth = if cfg.auth.enabled {
         "auth enabled"
     } else {
         "auth disabled"
     };
     format!(
-        "✓ {} valid: {model_count} {model_word}; {auth}; {model_summary}",
+        "✓ {} valid: 1 model; {auth}; {model_summary}",
         path.display(),
     )
 }
@@ -79,11 +73,10 @@ fn pick_smoke_flavor(name: Option<&str>) -> Result<Flavor> {
         let kind: DriverKind = match n {
             "portable" => DriverKind::Portable,
             "cuda" | "cuda_native" => DriverKind::CudaNative,
-            "metal" => DriverKind::Metal,
             "dummy" => DriverKind::Dummy,
             other => {
                 return Err(anyhow!(
-                    "--flavor must be one of \"portable\" | \"cuda\" | \"metal\" | \"dummy\" \
+                    "--flavor must be one of \"portable\" | \"cuda\" | \"dummy\" \
                      (got {other:?}). Compiled flavors: {compiled}.",
                     compiled = driver_ffi::compiled_summary(),
                 ));

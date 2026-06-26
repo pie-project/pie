@@ -24,7 +24,7 @@
 use std::io::{self, Write};
 use std::time::{Duration, Instant};
 
-use inferlet::{Context, Result, chat, model::Model, runtime, sample::Sampler, wstd};
+use inferlet::{Context, Result, chat, sample::Sampler};
 use serde::Deserialize;
 
 #[derive(Deserialize)]
@@ -86,41 +86,37 @@ const MAGENTA: &str = "\x1b[35m";
 async fn main(input: Input) -> Result<String> {
     let mode = input.mode.to_lowercase();
 
-    let model_name = runtime::models()
-        .first()
-        .cloned()
-        .ok_or("No models available")?;
-    let model = Model::load(&model_name)?;
+    let model_name = inferlet::model::name();
 
     // Best-effort: clear stale snapshots before modes that create a new one.
     if !matches!(mode.as_str(), "open" | "turn2" | "resume-turn2") {
-        let _ = Context::delete(&model, &input.snapshot);
+        let _ = Context::delete(&input.snapshot);
     }
 
     match mode.as_str() {
         "baseline" | "plain" => {
-            run_baseline(&model, &model_name, &input).await?;
+            run_baseline(&model_name, &input).await?;
         }
         "resumed" | "smart" => {
-            run_resumed(&model, &model_name, &input).await?;
-            let _ = Context::delete(&model, &input.snapshot);
+            run_resumed(&model_name, &input).await?;
+            let _ = Context::delete(&input.snapshot);
         }
         "save" | "turn1" | "save-turn1" => {
-            run_save_turn1(&model, &model_name, &input).await?;
+            run_save_turn1(&model_name, &input).await?;
         }
         "open" | "turn2" | "resume-turn2" => {
-            run_open_turn2(&model, &model_name, &input).await?;
-            let _ = Context::delete(&model, &input.snapshot);
+            run_open_turn2(&model_name, &input).await?;
+            let _ = Context::delete(&input.snapshot);
         }
         "both" | "" => {
-            let b = run_baseline(&model, &model_name, &input).await?;
+            let b = run_baseline(&model_name, &input).await?;
             println!();
             // Reset snapshot before resumed run.
-            let _ = Context::delete(&model, &input.snapshot);
-            let r = run_resumed(&model, &model_name, &input).await?;
+            let _ = Context::delete(&input.snapshot);
+            let r = run_resumed(&model_name, &input).await?;
             println!();
             comparison(&b, &r);
-            let _ = Context::delete(&model, &input.snapshot);
+            let _ = Context::delete(&input.snapshot);
         }
         other => {
             return Err(format!(
@@ -144,7 +140,7 @@ struct ModeResult {
 }
 
 // ── BASELINE: rebuild the context from scratch every turn ─────────────
-async fn run_baseline(model: &Model, model_name: &str, input: &Input) -> Result<ModeResult> {
+async fn run_baseline(model_name: &str, input: &Input) -> Result<ModeResult> {
     print_header(
         "BASELINE",
         YELLOW,
@@ -160,13 +156,13 @@ async fn run_baseline(model: &Model, model_name: &str, input: &Input) -> Result<
         RESET,
         oneline(&input.turn1)
     );
-    let mut ctx = Context::new(model)?;
+    let mut ctx = Context::new()?;
     ctx.system(&input.system);
     ctx.user(&format!("{} /no_think", input.turn1.trim()));
     ctx.cue();
     let turn1_prefill = ctx.seq_len() + ctx.buffer().len() as u32;
     let t = Instant::now();
-    let answer1 = stream_attempt(&mut ctx, model, input.max_tokens, input.delay).await?;
+    let answer1 = stream_attempt(&mut ctx, input.max_tokens, input.delay).await?;
     let turn1_elapsed = t.elapsed();
     println!(
         "  {}prefill {} tokens, decode {:?}{}",
@@ -182,7 +178,7 @@ async fn run_baseline(model: &Model, model_name: &str, input: &Input) -> Result<
         RESET,
         oneline(&input.turn2)
     );
-    let mut ctx2 = Context::new(model)?;
+    let mut ctx2 = Context::new()?;
     ctx2.system(&input.system);
     ctx2.user(&input.turn1);
     ctx2.assistant(answer1.trim());
@@ -190,7 +186,7 @@ async fn run_baseline(model: &Model, model_name: &str, input: &Input) -> Result<
     ctx2.cue();
     let turn2_prefill = ctx2.seq_len() + ctx2.buffer().len() as u32;
     let t = Instant::now();
-    let answer2 = stream_attempt(&mut ctx2, model, input.max_tokens, input.delay).await?;
+    let answer2 = stream_attempt(&mut ctx2, input.max_tokens, input.delay).await?;
     let turn2_elapsed = t.elapsed();
     println!(
         "  {}prefill {} tokens, decode {:?}{}",
@@ -216,7 +212,7 @@ async fn run_baseline(model: &Model, model_name: &str, input: &Input) -> Result<
 }
 
 // ── RESUMED: save after turn 1, open before turn 2 ────────────────────
-async fn run_resumed(model: &Model, model_name: &str, input: &Input) -> Result<ModeResult> {
+async fn run_resumed(model_name: &str, input: &Input) -> Result<ModeResult> {
     print_header(
         "RESUMED",
         GREEN,
@@ -232,13 +228,13 @@ async fn run_resumed(model: &Model, model_name: &str, input: &Input) -> Result<M
         RESET,
         oneline(&input.turn1)
     );
-    let mut ctx = Context::new(model)?;
+    let mut ctx = Context::new()?;
     ctx.system(&input.system);
     ctx.user(&format!("{} /no_think", input.turn1.trim()));
     ctx.cue();
     let turn1_prefill = ctx.seq_len() + ctx.buffer().len() as u32;
     let t = Instant::now();
-    let answer1 = stream_attempt(&mut ctx, model, input.max_tokens, input.delay).await?;
+    let answer1 = stream_attempt(&mut ctx, input.max_tokens, input.delay).await?;
     let turn1_elapsed = t.elapsed();
     // Commit any working pages before saving so the snapshot includes
     // the assistant's reply.
@@ -259,13 +255,13 @@ async fn run_resumed(model: &Model, model_name: &str, input: &Input) -> Result<M
         RESET,
         oneline(&input.turn2)
     );
-    let mut ctx2 = Context::open(model, &input.snapshot)?;
+    let mut ctx2 = Context::open(&input.snapshot)?;
     let pre_open_seq = ctx2.seq_len();
     ctx2.user(&format!("{} /no_think", input.turn2.trim()));
     ctx2.cue();
     let turn2_prefill = (ctx2.seq_len() + ctx2.buffer().len() as u32) - pre_open_seq;
     let t = Instant::now();
-    let answer2 = stream_attempt(&mut ctx2, model, input.max_tokens, input.delay).await?;
+    let answer2 = stream_attempt(&mut ctx2, input.max_tokens, input.delay).await?;
     let turn2_elapsed = t.elapsed();
     println!(
         "  {}new prefill {} tokens (history reused from snapshot), decode {:?}{}",
@@ -291,7 +287,7 @@ async fn run_resumed(model: &Model, model_name: &str, input: &Input) -> Result<M
 }
 
 // ── SAVE mode: run turn 1 and leave the snapshot for a later invocation ──
-async fn run_save_turn1(model: &Model, model_name: &str, input: &Input) -> Result<()> {
+async fn run_save_turn1(model_name: &str, input: &Input) -> Result<()> {
     print_header(
         "SAVE",
         GREEN,
@@ -306,13 +302,13 @@ async fn run_save_turn1(model: &Model, model_name: &str, input: &Input) -> Resul
         RESET,
         oneline(&input.turn1)
     );
-    let mut ctx = Context::new(model)?;
+    let mut ctx = Context::new()?;
     ctx.system(&input.system);
     ctx.user(&format!("{} /no_think", input.turn1.trim()));
     ctx.cue();
     let turn1_prefill = ctx.seq_len() + ctx.buffer().len() as u32;
     let t = Instant::now();
-    let _answer1 = stream_attempt(&mut ctx, model, input.max_tokens, input.delay).await?;
+    let _answer1 = stream_attempt(&mut ctx, input.max_tokens, input.delay).await?;
     let turn1_elapsed = t.elapsed();
     ctx.flush().await?;
     ctx.save(&input.snapshot)?;
@@ -324,7 +320,7 @@ async fn run_save_turn1(model: &Model, model_name: &str, input: &Input) -> Resul
 }
 
 // ── OPEN mode: separate invocation that resumes from SAVE mode ─────────
-async fn run_open_turn2(model: &Model, model_name: &str, input: &Input) -> Result<()> {
+async fn run_open_turn2(model_name: &str, input: &Input) -> Result<()> {
     print_header(
         "OPEN",
         GREEN,
@@ -333,7 +329,7 @@ async fn run_open_turn2(model: &Model, model_name: &str, input: &Input) -> Resul
     );
 
     println!("  {}opening snapshot {:?}{}", DIM, input.snapshot, RESET);
-    let mut ctx = Context::open(model, &input.snapshot)?;
+    let mut ctx = Context::open(&input.snapshot)?;
     let pre_open_seq = ctx.seq_len();
     println!(
         "  {}{}turn 2{}  user: {}",
@@ -346,7 +342,7 @@ async fn run_open_turn2(model: &Model, model_name: &str, input: &Input) -> Resul
     ctx.cue();
     let turn2_prefill = (ctx.seq_len() + ctx.buffer().len() as u32) - pre_open_seq;
     let t = Instant::now();
-    let _answer2 = stream_attempt(&mut ctx, model, input.max_tokens, input.delay).await?;
+    let _answer2 = stream_attempt(&mut ctx, input.max_tokens, input.delay).await?;
     let turn2_elapsed = t.elapsed();
     println!(
         "  {}new prefill {} tokens (history reused), decode {:?}{}",
@@ -358,7 +354,6 @@ async fn run_open_turn2(model: &Model, model_name: &str, input: &Input) -> Resul
 // ── Stream one turn, return the decoded text ──────────────────────────
 async fn stream_attempt(
     ctx: &mut Context,
-    model: &Model,
     max_tokens: usize,
     delay_ms: u64,
 ) -> Result<String> {
@@ -371,8 +366,8 @@ async fn stream_attempt(
             p: 0.95,
         })
         .max_tokens(max_tokens)
-        .stop(&chat::stop_tokens(model));
-    let mut decoder = chat::Decoder::new(model);
+        .stop(&chat::stop_tokens());
+    let mut decoder = chat::Decoder::new();
     let mut stripper = ThinkStripper::new();
     let mut text = String::new();
 
@@ -390,7 +385,7 @@ async fn stream_attempt(
                     print!("{}", rendered);
                     let _ = io::stdout().flush();
                     if delay_ms > 0 {
-                        wstd::task::sleep(wstd::time::Duration::from_millis(delay_ms)).await;
+                        inferlet::sleep(std::time::Duration::from_millis(delay_ms)).await;
                     }
                 }
             }

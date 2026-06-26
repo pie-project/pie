@@ -1,7 +1,5 @@
 /** @module Interface pie:core/context **/
-export type Pollable = import('./wasi-io-poll.js').Pollable;
 export type Error = import('./pie-core-types.js').Error;
-export type Model = import('./pie-core-model.js').Model;
 export type PageId = number;
 
 export class Context {
@@ -12,19 +10,19 @@ export class Context {
   /**
   * Creates a fresh empty context
   */
-  static create(model: Model): Context;
+  static create(): Context;
   /**
   * Opens a snapshot (implicit fork — snapshot stays immutable, working pages are copied)
   */
-  static open(model: Model, name: string): Context;
+  static open(name: string): Context;
   /**
   * Takes ownership of a snapshot (snapshot is deleted, GPU pages transfer without copy)
   */
-  static take(model: Model, name: string): Context;
+  static take(name: string): Context;
   /**
   * Deletes a saved snapshot by name
   */
-  static 'delete'(model: Model, name: string): void;
+  static 'delete'(name: string): void;
   /**
   * Forks into a new anonymous context (working pages are copied via GPU D2D or CPU H2D)
   */
@@ -45,7 +43,6 @@ export class Context {
   * Number of tokens per page
   */
   tokensPerPage(): number;
-  model(): Model;
   /**
   * Number of committed KV pages in the context
   */
@@ -75,16 +72,9 @@ export class Context {
   */
   truncateWorkingPageTokens(numTokens: number): void;
   /**
-  * ── Market operations ──────────────────────────────────────
-  * Suspend this context (release pages, stop rent).
-  * Restoration is system-driven: highest-bid suspended contexts
-  * are restored when memory frees up.
+  * Suspend this context (release GPU pages, offload to CPU).
+  * Restoration is system-driven under FCFS: suspended contexts are
+  * restored oldest-launched first as memory frees up.
   */
   suspend(): void;
-  /**
-  * Set bid: willingness to pay per page per step.
-  * Drives suspension priority, restoration priority, and compute priority.
-  * 0.0 = use default (truthful) bidding.
-  */
-  bid(value: number): void;
 }

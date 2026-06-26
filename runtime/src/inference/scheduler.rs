@@ -2,8 +2,8 @@
 //!
 //! Each `BatchScheduler` owns its own RPC client, scheduling policy,
 //! and tokio task. It accepts pre-translated forward pass requests,
-//! accumulates them into batches, and fires them based on adaptive
-//! scheduling decisions.
+//! accumulates them into batches, and fires them greedily (one policy
+//! under FCFS).
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
@@ -16,7 +16,7 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
 use crate::context::pagestore::PhysicalPageId;
 use crate::driver::{self, DriverId, SchedulerLimits};
 
-use super::adaptive_policy::{AdaptivePolicy, EagerPolicy, GreedyPolicy};
+use super::adaptive_policy::GreedyPolicy;
 use super::{ForwardOutput, request};
 
 mod chunked;
@@ -61,8 +61,7 @@ pub(super) trait SchedulingPolicy: Send {
     fn on_fired(&mut self, fired_size: usize);
 
     /// Decide whether to fire or wait, given the current batch size.
-    /// `&mut self` so policies can update internal state on every poll
-    /// (e.g., `EagerPolicy`'s `cohort_high_water` ratchet).
+    /// `&mut self` so policies can update internal state on every poll.
     fn decide(&mut self, current_batch_size: usize) -> Decision;
 }
 
@@ -74,7 +73,10 @@ pub(super) trait SchedulingPolicy: Send {
 pub(super) enum Decision {
     /// Fire the current batch immediately.
     Fire,
-    /// Wait for more requests, up to the given duration.
+    /// Wait for more requests, up to the given duration. Greedy-only under
+    /// FCFS never constructs this; collapsing the policy abstraction is a
+    /// deferred follow-up.
+    #[allow(dead_code)]
     Wait(Duration),
 }
 
@@ -1087,7 +1089,6 @@ impl BatchScheduler {
         page_size: u32,
         limits: SchedulerLimits,
         request_timeout_secs: u64,
-        batch_policy: String,
     ) -> Self {
         let (tx, rx) = crossbeam::channel::unbounded::<PendingRequest>();
         let submit_tx = tx.clone();
@@ -1105,7 +1106,6 @@ impl BatchScheduler {
         let rt_handle = tokio::runtime::Handle::current();
         let stats_for_loop = stats.clone();
         let chain_pool_for_loop = chain_pool.clone();
-        let batch_policy_for_loop = batch_policy.clone();
         std::thread::Builder::new()
             .name(format!("pie-sched-{driver_idx}"))
             .spawn(move || {
@@ -1117,7 +1117,6 @@ impl BatchScheduler {
                     page_size,
                     limits,
                     request_timeout_secs,
-                    batch_policy_for_loop,
                     stats_for_loop,
                     chain_pool_for_loop,
                     rt_handle,
@@ -1181,7 +1180,6 @@ impl BatchScheduler {
         page_size: u32,
         limits: SchedulerLimits,
         request_timeout_secs: u64,
-        batch_policy: String,
         stats: Arc<SchedulerStats>,
         chain_pool: Arc<super::speculator::ChainExtPool>,
         rt_handle: tokio::runtime::Handle,
@@ -1190,25 +1188,13 @@ impl BatchScheduler {
 
         // Per-driver state
         let mut batch = BatchAccumulator::new(limits, page_size);
-        // Policy selection from config — see `adaptive_policy.rs` for the
-        // design rationale. The per-model `[model.scheduler].batch_policy`
-        // setting picks one of "adaptive", "eager", "greedy".
-        let mut policy: Box<dyn SchedulingPolicy> = match batch_policy.as_str() {
-            "greedy" => Box::new(GreedyPolicy::new()),
-            "eager" => Box::new(EagerPolicy::new(limits.max_forward_requests, driver_idx)),
-            "adaptive" => Box::new(AdaptivePolicy::new(limits.max_forward_requests, driver_idx)),
-            other => panic!(
-                "Unknown scheduler.batch_policy {other:?}; expected one of \
-                'adaptive' | 'eager' | 'greedy'"
-            ),
-        };
+        // Greedy batching is the only policy under FCFS — fire as soon as
+        // there is work, no batch-policy knob.
+        let mut policy: Box<dyn SchedulingPolicy> = Box::new(GreedyPolicy::new());
         // No cross-thread in-flight gate needed: the scheduler is the
         // only firer and runs `execute_batch` synchronously, so a
         // second fire physically cannot start before the previous one
-        // completes. AdaptivePolicy still tracks its own internal
-        // `in_flight` bool (via on_fired/on_complete) for its decide()
-        // heuristics; that's a policy concern, not a scheduling-safety
-        // concern, and stays as-is.
+        // completes.
 
         // Channel for batch completion latency feedback to the policy.
         let (latency_tx, latency_rx) = crossbeam::channel::unbounded::<Duration>();
@@ -1342,14 +1328,7 @@ impl BatchScheduler {
                     let requests_to_fire = batch.take();
                     policy.on_fired(requests_to_fire.len());
 
-                    // Collect batch context IDs for accurate rent charging.
-                    // Per-request shape stores the single context_id in
-                    // `context_ids[0]`.
-                    let batch_ctx_ids: Vec<u64> = requests_to_fire
-                        .iter()
-                        .map(|r| r.request.context_ids[0])
-                        .collect();
-                    let batch_size = batch_ctx_ids.len() as u64;
+                    let batch_size = requests_to_fire.len() as u64;
                     crate::probe_fire_record!(
                         stats.fire.pre_dispatch.fire_prepare_us,
                         fire_prepare_start.elapsed()
@@ -1407,13 +1386,6 @@ impl BatchScheduler {
                     });
                     let latency = start.elapsed();
                     let _ = latency_tx.send(latency);
-
-                    // Advance market clock for this driver: prices, rent, dividends.
-                    // Pass batch context IDs so tick only charges contexts
-                    // that were in this batch (not stale pinned contexts).
-                    crate::probe_fire!(stats.fire.post_dispatch.context_tick_us, {
-                        crate::context::tick(driver_idx, latency.as_secs_f64(), batch_ctx_ids);
-                    });
 
                     // Always-on counters + spec-domain accumulation.
                     // Wrapped in stats_update_us probe so we can see how

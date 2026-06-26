@@ -13,7 +13,6 @@
 
 use std::marker::PhantomData;
 
-use crate::ForwardPassExt;
 use crate::Result;
 use crate::adapter::Adapter;
 use crate::context::Context;
@@ -329,7 +328,7 @@ impl<'ctx> Forward<'ctx> {
             }
         }
 
-        let pass = ForwardPass::new(&ctx.model);
+        let pass = ForwardPass::new();
         pass.context(&ctx.inner);
 
         for (image, anchor) in images {
@@ -374,7 +373,7 @@ impl<'ctx> Forward<'ctx> {
         }
 
         let raw = pass
-            .execute_async()
+            .execute()
             .await
             .map_err(|e| format!("Forward::execute: forward pass failed: {e}"))?;
 

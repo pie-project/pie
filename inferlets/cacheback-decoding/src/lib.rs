@@ -9,8 +9,6 @@
 
 use inferlet::{
     Context, Result,
-    model::Model,
-    runtime,
     sample::Sampler,
 };
 use serde::Deserialize;
@@ -36,8 +34,8 @@ struct GreedyDrafter {
 }
 
 impl GreedyDrafter {
-    fn new(model: &Model) -> Result<Self> {
-        Ok(Self { ctx: Context::new(model)? })
+    fn new() -> Result<Self> {
+        Ok(Self { ctx: Context::new()? })
     }
 
     /// Generate `draft_length` greedy tokens starting from `seed`.
@@ -77,12 +75,9 @@ async fn main(input: Input) -> Result<String> {
     let draft_length = input.draft_length;
 
     let start = Instant::now();
-    let models = runtime::models();
-    let model = Model::load(models.first().ok_or("No models available")?)?;
-    let tokenizer = model.tokenizer();
-    let stop_tokens = inferlet::chat::stop_tokens(&model);
+    let stop_tokens = inferlet::chat::stop_tokens();
 
-    let mut ctx = Context::new(&model)?;
+    let mut ctx = Context::new()?;
 
     // Fill prompt and flush to populate the KV cache.
     ctx.system("You are a helpful assistant.")
@@ -93,7 +88,7 @@ async fn main(input: Input) -> Result<String> {
     // Bootstrap: append the last cue token to drive a single forward pass
     // and read its next-token prediction.
     let first_token = {
-        let cue = inferlet::chat::cue(&model);
+        let cue = inferlet::chat::cue();
         let trigger = *cue.last().unwrap_or(&0);
         let mut pass = ctx.forward();
         pass.input(&[trigger]);
@@ -103,7 +98,7 @@ async fn main(input: Input) -> Result<String> {
             .ok_or("Bootstrap produced no token")?
     };
 
-    let mut drafter = GreedyDrafter::new(&model)?;
+    let mut drafter = GreedyDrafter::new()?;
 
     let mut all_generated: Vec<u32> = vec![first_token];
     let mut anchor = first_token;
@@ -188,7 +183,7 @@ async fn main(input: Input) -> Result<String> {
         total_steps += 1;
     }
 
-    let text = tokenizer.decode(&all_generated)?;
+    let text = inferlet::model::decode(&all_generated)?;
     println!(
         "--- CacheBack Decoding (draft_length={}, steps={}) ---",
         draft_length, total_steps

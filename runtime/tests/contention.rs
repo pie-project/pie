@@ -1,25 +1,38 @@
-//! E2E KV cache contention tests.
+//! E2E KV-cache contention tests.
 //!
-//! Exercises multi-GPU contention resolution using real WASM inferlets
-//! (the `generate` test inferlet) through the full workflow stack.
+//! Exercises KV page contention using real WASM inferlets (the `generate`
+//! test inferlet) driven through direct, concurrent `process::spawn`.
 //!
-//! Setup: 2 GPUs, 8 pages each, page_size=16 (128 tokens/device).
-//! The `generate` inferlet runs fill → flush → generate(5 steps),
-//! allocating KV pages. Multiple concurrent processes naturally
-//! exhaust pages and trigger eviction, wait queue, and restore paths.
+//! The workflow DSL (Fork/Pipe) is gone, so the old fork/pipe harness is
+//! re-expressed as direct process spawns: a Fork of N branches becomes N
+//! processes spawned concurrently; a Pipe becomes a serial spawn→await chain.
+//! Ordering is governed by the single-model FCFS policy — each process is
+//! tagged with a monotonic launch sequence; eviction prefers the
+//! newest-launched victim and the restore queue serves the oldest first.
+//!
+//! Setup: 2 GPUs, 8 pages each, page_size=16. The `generate` inferlet runs
+//! fill → flush → generate(5 steps), allocating KV pages. Many concurrent
+//! processes share the tight page budget, exercising eviction, the wait
+//! queue, and restore. Every process must complete (no deadlock) within the
+//! timeout — that completion is the contention-resolution assertion.
 
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
+use tokio::sync::oneshot;
+
 mod common;
 use common::{MockEnv, create_mock_env, inferlets, mock_device::EchoBehavior};
 
-use pie::workflow;
+use pie::process;
+use pie::program::ProgramName;
 
-const GENERATE: &str = "generate@0.1.0";
+/// Name of the test inferlet (installed at version 0.1.0).
+const GENERATE: &str = "generate";
 
-/// Timeout for a workflow to complete. Generous to allow contention resolution.
-const WORKFLOW_TIMEOUT: Duration = Duration::from_secs(30);
+/// Timeout for a single process to complete. Generous to allow contention
+/// resolution (eviction → wait → restore) under a tight page budget.
+const PROCESS_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Shared state: MockEnv + tokio runtime.
 struct TestState {
@@ -35,302 +48,243 @@ fn state() -> &'static TestState {
         inferlets::build_inferlets();
 
         let rt = tokio::runtime::Runtime::new().unwrap();
-        // 2 GPUs, 8 pages each — tight budget to force contention
+        // 2 GPUs, 8 pages each — tight budget to force contention.
         let env = create_mock_env("contention-model", 2, 8, Arc::new(EchoBehavior(42)));
         let config = env.config();
         rt.block_on(async {
             pie::bootstrap::bootstrap(config).await.unwrap();
-            // Pre-install the generate inferlet so tests don't race on build
-            inferlets::add_and_install("generate").await;
+            // Pre-install the generate inferlet so tests don't race on build.
+            inferlets::add_and_install(GENERATE).await;
         });
         TestState { env, rt }
     })
 }
 
-/// Submit a workflow and await its result, panicking with a descriptive message on failure.
-async fn submit_and_await(label: &str, username: &str, json: &str) -> String {
-    let (id, rx) = workflow::submit(username, json, None)
-        .await
-        .unwrap_or_else(|e| panic!("[{label}] submit failed: {e}"));
+fn program_name(name: &str) -> ProgramName {
+    ProgramName::parse(&format!("{name}@0.1.0")).unwrap()
+}
 
-    match tokio::time::timeout(WORKFLOW_TIMEOUT, rx).await {
+/// Spawn a `generate` process and return a receiver for its final result.
+/// The process begins running immediately (FCFS launch-seq is assigned at
+/// spawn); callers collect receivers to keep processes concurrent.
+fn spawn_generate(username: &str, input: &str) -> oneshot::Receiver<Result<String, String>> {
+    let (tx, rx) = oneshot::channel();
+    process::spawn(
+        username.to_string(),
+        program_name(GENERATE),
+        input.to_string(),
+        None,  // client_id
+        false, // capture_outputs (result still delivered via result_tx)
+        Some(tx),
+    )
+    .unwrap_or_else(|e| panic!("[{username}] spawn failed: {e}"));
+    rx
+}
+
+/// Await a single process result, panicking descriptively on error or timeout.
+async fn await_result(label: &str, rx: oneshot::Receiver<Result<String, String>>) -> String {
+    match tokio::time::timeout(PROCESS_TIMEOUT, rx).await {
         Ok(Ok(Ok(output))) => {
-            eprintln!("[{label}] workflow {id} completed: {output}");
+            eprintln!("[{label}] completed: {output}");
             output
         }
-        Ok(Ok(Err(e))) => panic!("[{label}] workflow {id} failed: {e}"),
-        Ok(Err(_)) => panic!("[{label}] workflow {id} channel dropped"),
-        Err(_) => panic!("[{label}] workflow {id} timed out — contention may be deadlocked"),
+        Ok(Ok(Err(e))) => panic!("[{label}] process failed: {e}"),
+        Ok(Err(_)) => panic!("[{label}] result channel dropped"),
+        Err(_) => panic!("[{label}] timed out — contention may be deadlocked"),
     }
 }
 
-/// Build a Fork JSON expression with `n` concurrent generate branches.
-fn fork_json(n: usize) -> String {
-    let branches: Vec<String> = (0..n)
-        .map(|_| format!(r#"{{"type":"process","program_name":"{GENERATE}"}}"#))
+/// Spawn `n` `generate` processes concurrently (distinct users), await all,
+/// and assert every one completes with non-empty output. Returns the outputs.
+///
+/// This is the direct-spawn replacement for a Fork of `n` branches.
+async fn fan_out(label: &str, n: usize) -> Vec<String> {
+    // Spawn all first so they run concurrently and contend for pages.
+    let receivers: Vec<_> = (0..n)
+        .map(|i| {
+            (
+                format!("{label}-{i}"),
+                spawn_generate(&format!("{label}-user-{i}"), &format!(r#"{{"branch":"{i}"}}"#)),
+            )
+        })
         .collect();
-    format!(r#"{{"type":"fork","branches":[{}]}}"#, branches.join(","))
-}
 
-/// Build a Pipe JSON expression: generate → generate (serial chain of `n` stages).
-fn pipe_json(n: usize) -> String {
-    let stages: Vec<String> = (0..n)
-        .map(|_| format!(r#"{{"type":"process","program_name":"{GENERATE}"}}"#))
-        .collect();
-    format!(r#"{{"type":"pipe","stages":[{}]}}"#, stages.join(","))
+    let mut outputs = Vec::with_capacity(n);
+    for (lbl, rx) in receivers {
+        let out = await_result(&lbl, rx).await;
+        assert!(!out.is_empty(), "[{lbl}] produced empty output");
+        outputs.push(out);
+    }
+    outputs
 }
 
 // =============================================================================
-// Test 1: Concurrent independent workflows resolve contention
+// Test 1: Two concurrent independent processes resolve contention
 // =============================================================================
 
-/// Two independent workflows, each running `generate`, submitted concurrently.
-/// Both should complete despite only 8 pages per GPU — contention is resolved
-/// via the invested-importance eviction policy and per-device wait queues.
+/// Two independent `generate` processes (different users) spawned concurrently.
+/// Both must complete despite only 8 pages per GPU — contention is resolved
+/// via FCFS eviction and per-device wait/restore queues.
 #[test]
-fn concurrent_workflows_resolve_contention() {
+fn concurrent_processes_resolve_contention() {
     let s = state();
     s.rt.block_on(async {
-        let json = format!(r#"{{"type":"process","program_name":"{GENERATE}"}}"#);
-
-        let (f1, f2) = tokio::join!(
-            submit_and_await("wf1", "user-a", &json),
-            submit_and_await("wf2", "user-b", &json),
-        );
-        assert!(!f1.is_empty());
-        assert!(!f2.is_empty());
+        let r1 = spawn_generate("user-a", r#"{"n":1}"#);
+        let r2 = spawn_generate("user-b", r#"{"n":2}"#);
+        let o1 = await_result("p1", r1).await;
+        let o2 = await_result("p2", r2).await;
+        assert!(!o1.is_empty());
+        assert!(!o2.is_empty());
     });
 }
 
 // =============================================================================
-// Test 2: Fork workflow with 3 concurrent generate branches
+// Test 2: Fan-out of 3 concurrent processes
 // =============================================================================
 
-/// A single workflow using Fork to spawn 3 concurrent `generate` branches.
-/// All branches share the same 8-page GPU budget, forcing the arbiter to
-/// serialize access via eviction and wait queue management.
-/// All 3 branches must complete — the result should be a 3-element array.
+/// Three `generate` processes spawned concurrently (replaces a Fork of 3).
+/// All share the 8-page GPU budget, forcing serialization via eviction and
+/// the wait queue. All 3 must complete.
 #[test]
-fn fork_workflow_contention() {
+fn fan_out_contention() {
     let s = state();
     s.rt.block_on(async {
-        let json = fork_json(3);
-        let output = submit_and_await("fork3", "fork-user", &json).await;
-
-        let parsed: serde_json::Value = serde_json::from_str(&output).unwrap();
-        assert!(
-            parsed.is_array(),
-            "Fork result should be an array, got: {parsed}"
-        );
-        assert_eq!(parsed.as_array().unwrap().len(), 3, "expected 3 results");
+        let outs = fan_out("fan3", 3).await;
+        assert_eq!(outs.len(), 3, "expected 3 completed processes");
     });
 }
 
 // =============================================================================
-// Test 3: Sequential workflows after cleanup
+// Test 3: Sequential processes after cleanup
 // =============================================================================
 
-/// Submit a workflow, wait for completion, then submit a second.
-/// The second workflow should reuse pages freed by the first —
-/// no contention, no stale arbiter/wait-queue state.
+/// Run one process to completion, then a second. The second should reuse
+/// pages freed by the first — no stale wait-queue / page-pool state.
 #[test]
-fn sequential_workflows_after_eviction() {
+fn sequential_processes_after_eviction() {
     let s = state();
     s.rt.block_on(async {
-        let json = format!(r#"{{"type":"process","program_name":"{GENERATE}"}}"#);
-        submit_and_await("seq1", "seq-user", &json).await;
-        submit_and_await("seq2", "seq-user", &json).await;
+        let o1 = await_result("seq1", spawn_generate("seq-user", r#"{"seq":1}"#)).await;
+        assert!(!o1.is_empty());
+        let o2 = await_result("seq2", spawn_generate("seq-user", r#"{"seq":2}"#)).await;
+        assert!(!o2.is_empty());
     });
 }
 
 // =============================================================================
-// Test 4: High fan-out fork (8 concurrent branches on 8-page GPUs)
+// Test 4: High fan-out (8 concurrent processes on 8-page GPUs)
 // =============================================================================
 
-/// 8 concurrent generate processes sharing 2 GPUs × 8 pages.
-/// This is extreme contention: each generate needs pages and all 8 compete.
-/// The arbiter must evict and rotate efficiently. All 8 must complete.
+/// Eight concurrent `generate` processes sharing 2 GPUs × 8 pages. Extreme
+/// contention: the FCFS arbiter must evict (newest-first) and restore
+/// (oldest-first) to drain all 8. All must complete.
 #[test]
-fn high_fanout_fork() {
+fn high_fanout() {
     let s = state();
     s.rt.block_on(async {
-        let json = fork_json(8);
-        let output = submit_and_await("fork8", "fanout-user", &json).await;
-
-        let parsed: serde_json::Value = serde_json::from_str(&output).unwrap();
-        assert_eq!(parsed.as_array().unwrap().len(), 8, "expected 8 results");
+        let outs = fan_out("fan8", 8).await;
+        assert_eq!(outs.len(), 8, "expected 8 completed processes");
     });
 }
 
 // =============================================================================
-// Test 5: Five independent concurrent workflows
+// Test 5: Five independent concurrent processes
 // =============================================================================
 
-/// 5 independent workflows submitted simultaneously, each running generate.
-/// Cross-workflow contention: different workflow_ids → different arbiter weights.
-/// All 5 must complete, exercising the wait queue priority ordering.
+/// Five independent `generate` processes spawned simultaneously. Exercises
+/// the wait-queue ordering across distinct launch sequences.
 #[test]
-fn five_concurrent_workflows() {
+fn five_concurrent_processes() {
     let s = state();
     s.rt.block_on(async {
-        let json = format!(r#"{{"type":"process","program_name":"{GENERATE}"}}"#);
-
-        let params: Vec<_> = (0..5)
-            .map(|i| (format!("multi{i}"), format!("user-{i}")))
-            .collect();
-        let futures: Vec<_> = params
-            .iter()
-            .map(|(label, user)| submit_and_await(label, user, &json))
-            .collect();
-
-        let results = futures::future::join_all(futures).await;
-        for (i, r) in results.iter().enumerate() {
-            assert!(!r.is_empty(), "workflow {i} produced empty output");
-        }
+        let outs = fan_out("multi", 5).await;
+        assert_eq!(outs.len(), 5);
     });
 }
 
 // =============================================================================
-// Test 6: Wave stress — 3 waves of 4 concurrent workflows
+// Test 6: Wave stress — 3 waves of 4 concurrent processes
 // =============================================================================
 
-/// Submits 3 successive waves of 4 concurrent workflows.
-/// Each wave starts after the previous wave completes.
-/// Tests that cleanup between waves is correct — no leaked arbiter nodes,
-/// no stale wait queue entries, no page pool corruption.
+/// Three successive waves of 4 concurrent processes; each wave starts after
+/// the previous completes. Tests that cleanup between waves is correct — no
+/// leaked wait-queue entries or page-pool corruption.
 #[test]
 fn wave_stress() {
     let s = state();
     s.rt.block_on(async {
-        let json = format!(r#"{{"type":"process","program_name":"{GENERATE}"}}"#);
-
         for wave in 0..3 {
-            let params: Vec<_> = (0..4)
-                .map(|i| (format!("wave{wave}_{i}"), format!("wave-{wave}-user-{i}")))
-                .collect();
-            let futures: Vec<_> = params
-                .iter()
-                .map(|(label, user)| submit_and_await(label, user, &json))
-                .collect();
-
-            let results = futures::future::join_all(futures).await;
-            for (i, r) in results.iter().enumerate() {
-                assert!(
-                    !r.is_empty(),
-                    "wave {wave} workflow {i} produced empty output"
-                );
-            }
-            eprintln!(
-                "[wave_stress] wave {wave} complete ({} workflows)",
-                results.len()
-            );
+            let outs = fan_out(&format!("wave{wave}"), 4).await;
+            assert_eq!(outs.len(), 4, "wave {wave} should complete 4 processes");
+            eprintln!("[wave_stress] wave {wave} complete (4 processes)");
         }
     });
 }
 
 // =============================================================================
-// Test 7: Two concurrent fork workflows (6 simultaneous processes)
+// Test 7: Two concurrent fan-outs (6 simultaneous processes)
 // =============================================================================
 
-/// Two workflows, each forking 3 generate branches, submitted concurrently.
-/// 6 processes total compete on 2 GPUs × 8 pages, exercising cross-workflow
-/// contention with intra-workflow Fork concurrency. Both workflows must
-/// complete with all 3 branches producing results.
+/// Six processes (two logical batches of 3) all spawned concurrently,
+/// competing on 2 GPUs × 8 pages. All must complete.
 #[test]
-fn concurrent_fork_workflows() {
+fn two_concurrent_fans() {
     let s = state();
     s.rt.block_on(async {
-        let json = fork_json(3);
-
-        let (out1, out2) = tokio::join!(
-            submit_and_await("cfork1", "user-x", &json),
-            submit_and_await("cfork2", "user-y", &json),
-        );
-
-        let p1: serde_json::Value = serde_json::from_str(&out1).unwrap();
-        let p2: serde_json::Value = serde_json::from_str(&out2).unwrap();
-        assert_eq!(
-            p1.as_array().unwrap().len(),
-            3,
-            "fork1 should have 3 results"
-        );
-        assert_eq!(
-            p2.as_array().unwrap().len(),
-            3,
-            "fork2 should have 3 results"
-        );
+        let mut receivers = Vec::new();
+        for batch in 0..2 {
+            for i in 0..3 {
+                receivers.push((
+                    format!("fan{batch}-{i}"),
+                    spawn_generate(&format!("user-{batch}-{i}"), r#"{}"#),
+                ));
+            }
+        }
+        let mut completed = 0;
+        for (label, rx) in receivers {
+            let out = await_result(&label, rx).await;
+            assert!(!out.is_empty());
+            completed += 1;
+        }
+        assert_eq!(completed, 6, "all 6 concurrent processes should complete");
     });
 }
 
 // =============================================================================
-// Test 8: Mixed pipe + fork — sequential generation feeding into fan-out
+// Test 8: Serial-then-fan — sequential process feeding into a fan-out
 // =============================================================================
 
-/// A workflow that pipes into a fork: pipe(generate, fork(generate, generate)).
-/// The first generate runs alone, then its output feeds two concurrent generates.
-/// Exercises serial-then-parallel contention patterns.
+/// Re-expresses pipe(generate, fork(generate × 3)): one process runs alone,
+/// then three run concurrently. Exercises serial-then-parallel contention.
 #[test]
-fn pipe_then_fork() {
+fn serial_then_fan() {
     let s = state();
     s.rt.block_on(async {
-        let json = format!(
-            r#"{{
-            "type": "pipe",
-            "stages": [
-                {{"type": "process", "program_name": "{GENERATE}"}},
-                {{"type": "fork", "branches": [
-                    {{"type": "process", "program_name": "{GENERATE}"}},
-                    {{"type": "process", "program_name": "{GENERATE}"}},
-                    {{"type": "process", "program_name": "{GENERATE}"}}
-                ]}}
-            ]
-        }}"#
-        );
+        let first = await_result("serial", spawn_generate("sf-user", r#"{}"#)).await;
+        assert!(!first.is_empty());
 
-        let output = submit_and_await("pipe_fork", "pf-user", &json).await;
-        let parsed: serde_json::Value = serde_json::from_str(&output).unwrap();
-        assert!(parsed.is_array(), "pipe→fork result should be an array");
-        assert_eq!(
-            parsed.as_array().unwrap().len(),
-            3,
-            "expected 3 fork results"
-        );
+        let outs = fan_out("sf-fan", 3).await;
+        assert_eq!(outs.len(), 3, "expected 3 fan-out processes");
     });
 }
 
 // =============================================================================
-// Test 9: Rapid-fire burst — 10 independent workflows as fast as possible
+// Test 9: Rapid-fire burst — 10 processes spawned as fast as possible
 // =============================================================================
 
-/// Submits 10 workflows in rapid succession without waiting between submits.
-/// All 10 must complete. Exercises the arbiter and wait queue under maximum
-/// queueing pressure from many independent workflows.
+/// Spawn 10 processes in rapid succession without waiting between spawns.
+/// All 10 must complete — maximum queueing pressure on the wait/restore path.
 #[test]
 fn rapid_fire_burst() {
     let s = state();
     s.rt.block_on(async {
-        let json = format!(r#"{{"type":"process","program_name":"{GENERATE}"}}"#);
+        let receivers: Vec<_> = (0..10)
+            .map(|i| (i, spawn_generate(&format!("burst-{i}"), r#"{}"#)))
+            .collect();
 
-        // Submit all 10 as fast as possible
-        let mut receivers = Vec::with_capacity(10);
-        for i in 0..10 {
-            let (id, rx) = workflow::submit(&format!("burst-{i}"), &json, None)
-                .await
-                .unwrap();
-            eprintln!("[burst] submitted workflow {i}: {id}");
-            receivers.push((i, id, rx));
-        }
-
-        // Now await all
-        for (i, id, rx) in receivers {
-            match tokio::time::timeout(WORKFLOW_TIMEOUT, rx).await {
-                Ok(Ok(Ok(output))) => {
-                    eprintln!("[burst] workflow {i} ({id}) completed: {output}");
-                }
-                Ok(Ok(Err(e))) => panic!("[burst] workflow {i} ({id}) failed: {e}"),
-                Ok(Err(_)) => panic!("[burst] workflow {i} ({id}) channel dropped"),
-                Err(_) => panic!("[burst] workflow {i} ({id}) timed out"),
-            }
+        for (i, rx) in receivers {
+            let out = await_result(&format!("burst-{i}"), rx).await;
+            assert!(!out.is_empty(), "burst {i} produced empty output");
         }
     });
 }

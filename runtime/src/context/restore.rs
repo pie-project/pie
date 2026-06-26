@@ -25,7 +25,7 @@
 use super::pagestore::{PhysicalPageId, compute_last_page_len};
 use super::rs_cache::RsState;
 use super::{
-    ContextId, ContextManager, Record, ReplayPageRegistration, SERVICES, State,
+    ContextId, ContextManager, Record, ReplayPageRegistration, SERVICE, State,
     materialize_lineage_mask,
 };
 use crate::adapter::AdapterId;
@@ -253,9 +253,6 @@ impl ContextManager {
             } else {
                 ctx.state = State::Active;
             }
-            // Refresh cached effective_pages now that committed chain is on GPU.
-            ctx.cached_effective_pages =
-                self.gpu_stores[driver_idx].effective_pages(&ctx.committed_hashes);
         }
 
         // If no replays needed, fire deferred ops immediately.
@@ -452,12 +449,10 @@ impl ContextManager {
             return Ok(false);
         }
 
-        let model_idx = self.model_idx;
         let driver_id = driver_idx;
         tokio::spawn(async move {
             for (fwd_req, phys_ids, last_page_len) in requests {
                 let result = inference::submit(
-                    model_idx,
                     fwd_req,
                     driver_id,
                     phys_ids,
@@ -474,8 +469,7 @@ impl ContextManager {
                     break;
                 }
             }
-            let _ = SERVICES.send(
-                model_idx,
+            let _ = SERVICE.send(
                 super::Message::ReplayComplete {
                     id: ctx_id,
                     scratch_driver: driver_id,
@@ -713,13 +707,11 @@ impl ContextManager {
 
         // Spawn a task that submits forward passes sequentially, then
         // sends ReplayComplete to unpin the context.
-        let model_idx = self.model_idx;
         let driver_id = driver_idx;
 
         tokio::spawn(async move {
             for (fwd_req, phys_ids, last_page_len) in requests {
                 let result = inference::submit(
-                    model_idx,
                     fwd_req,
                     driver_id,
                     phys_ids,
@@ -739,8 +731,7 @@ impl ContextManager {
             }
 
             // Unpin after all chunks complete (or first failure)
-            let _ = SERVICES.send(
-                model_idx,
+            let _ = SERVICE.send(
                 super::Message::ReplayComplete {
                     id: ctx_id,
                     scratch_driver: driver_id,

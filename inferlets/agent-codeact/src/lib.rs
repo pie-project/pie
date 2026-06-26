@@ -11,7 +11,7 @@
 //!     into the same continuation every step, so a small temperature is
 //!     standard for agent loops even with grammar constraints.
 
-use inferlet::{sample::Sampler, model::Model, runtime, Context, Result};
+use inferlet::{sample::Sampler, Context, Result};
 use serde::Deserialize;
 use serde_json::Value;
 
@@ -71,13 +71,7 @@ const STEP_SCHEMA: &str = r#"{
 
 #[inferlet::main]
 async fn main(input: Input) -> Result<String> {
-    let model_name = runtime::models()
-        .first()
-        .cloned()
-        .ok_or("No models available")?;
-    let model = Model::load(&model_name)?;
-
-    let mut ctx = Context::new(&model)?;
+    let mut ctx = Context::new()?;
     ctx.system(SYSTEM_PROMPT);
     ctx.user(&format!("Task: {t}\nWhat is the next step?", t = input.task));
     ctx.cue();

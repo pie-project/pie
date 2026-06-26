@@ -34,7 +34,7 @@
 //! `Context::fork()` optimization left as future work. This is a *correctness
 //! / demonstration* inferlet, not a tuned reasoning benchmark.
 
-use inferlet::{Context, Result, model::Model, runtime, sample::Sampler};
+use inferlet::{Context, Result, sample::Sampler};
 use serde::Deserialize;
 
 #[derive(Debug, Clone, Deserialize)]
@@ -308,12 +308,11 @@ fn path_block(path: &[String]) -> String {
 /// far. We sample `branch_factor` separate short completions (rather than
 /// parsing one numbered list) so each child is a clean, independent step.
 async fn expand_step(
-    model: &Model,
     problem: &str,
     path: &[String],
     rollout_tokens: usize,
 ) -> Result<String> {
-    let mut ctx = Context::new(model)?;
+    let mut ctx = Context::new()?;
     ctx.system(
         "You extend a chain of reasoning. Given a problem and the steps so far, \
          propose ONE concise next reasoning step. Output only that step.",
@@ -334,12 +333,11 @@ async fn expand_step(
 /// **Simulation / rollout** — from the current path, produce a candidate final
 /// answer in one short generation.
 async fn rollout(
-    model: &Model,
     problem: &str,
     path: &[String],
     rollout_tokens: usize,
 ) -> Result<String> {
-    let mut ctx = Context::new(model)?;
+    let mut ctx = Context::new()?;
     ctx.system(
         "You finish a partial chain of reasoning. Continue from the steps given \
          and produce a short, concrete candidate final answer.",
@@ -359,8 +357,8 @@ async fn rollout(
 
 /// **Evaluation** — score a candidate answer 0–100. Returns the normalized
 /// value in `[0,1]` (with the `0.5` fallback baked into [`parse_score`]).
-async fn evaluate(model: &Model, problem: &str, candidate: &str) -> Result<f32> {
-    let mut ctx = Context::new(model)?;
+async fn evaluate(problem: &str, candidate: &str) -> Result<f32> {
+    let mut ctx = Context::new()?;
     ctx.system(
         "You are a strict grader. Score the candidate answer from 0 to 100 for \
          correctness, completeness, and reasoning quality. Return ONLY the number.",
@@ -380,12 +378,11 @@ async fn evaluate(model: &Model, problem: &str, candidate: &str) -> Result<f32> 
 /// **Final synthesis** — write the answer the inferlet returns, conditioned on
 /// the best reasoning path MCTS found.
 async fn synthesize(
-    model: &Model,
     problem: &str,
     best_path: &[String],
     final_tokens: usize,
 ) -> Result<String> {
-    let mut ctx = Context::new(model)?;
+    let mut ctx = Context::new()?;
     ctx.system(
         "You write the final answer to a problem, guided by a vetted chain of \
          reasoning. Be clear and correct.",
@@ -409,8 +406,6 @@ async fn synthesize(
 
 #[inferlet::main]
 async fn main(input: Input) -> Result<String> {
-    let model = Model::load(runtime::models().first().ok_or("No models available")?)?;
-
     // Clamp pathological inputs so the control flow always terminates sensibly.
     let max_iterations = input.max_iterations.max(1);
     let max_depth = input.max_depth.max(1);
@@ -438,7 +433,7 @@ async fn main(input: Input) -> Result<String> {
 
         let (sim_node, expanded_children) = if can_expand {
             let path = tree.path_actions(selected);
-            let action = expand_step(&model, &input.prompt, &path, input.rollout_tokens).await?;
+            let action = expand_step(&input.prompt, &path, input.rollout_tokens).await?;
             let child = tree.add_child(selected, action, max_depth);
             (child, tree.nodes[selected].children.len())
         } else {
@@ -449,10 +444,10 @@ async fn main(input: Input) -> Result<String> {
 
         // (c) Simulation / rollout from the node we will score.
         let sim_path = tree.path_actions(sim_node);
-        let candidate = rollout(&model, &input.prompt, &sim_path, input.rollout_tokens).await?;
+        let candidate = rollout(&input.prompt, &sim_path, input.rollout_tokens).await?;
 
         // (d) Evaluation.
-        let value = evaluate(&model, &input.prompt, &candidate).await?;
+        let value = evaluate(&input.prompt, &candidate).await?;
 
         // (e) Backpropagation.
         tree.backpropagate(sim_node, value);
@@ -474,12 +469,12 @@ async fn main(input: Input) -> Result<String> {
         // No expansion happened (e.g. max_iterations far below branch_factor):
         // fall back to the best rollout candidate we saw.
         if best_candidate.is_empty() {
-            rollout(&model, &input.prompt, &[], input.final_tokens).await?
+            rollout(&input.prompt, &[], input.final_tokens).await?
         } else {
             best_candidate.clone()
         }
     } else {
-        synthesize(&model, &input.prompt, &best_path, input.final_tokens).await?
+        synthesize(&input.prompt, &best_path, input.final_tokens).await?
     };
 
     if !input.show_trace {

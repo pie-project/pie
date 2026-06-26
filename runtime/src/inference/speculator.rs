@@ -122,9 +122,9 @@ struct ModelEntry {
     devices: Vec<StagedBatchMap>,
 }
 
-/// Per-model registry. The inferlet-side `try_hit` accesses this
+/// Single-model registry. The inferlet-side `try_hit` accesses this
 /// without going through the inference actor.
-static REGISTRY: LazyLock<Mutex<Vec<ModelEntry>>> = LazyLock::new(|| Mutex::new(Vec::new()));
+static REGISTRY: LazyLock<Mutex<Option<ModelEntry>>> = LazyLock::new(|| Mutex::new(None));
 
 /// Total number of `try_hit` calls that successfully claimed a
 /// staged entry. Surfaced via `model_status.bypass_hits` for
@@ -140,26 +140,16 @@ pub static CHAIN_SUBMIT_COUNT: AtomicU64 = AtomicU64::new(0);
 /// Surfaced via `model_status.chain_drops`.
 pub static CHAIN_DROP_COUNT: AtomicU64 = AtomicU64::new(0);
 
-/// Register the staged batches for a model with the global
+/// Register the staged batches for the model with the global
 /// registry. Called once at `InferenceService::new`. The
-/// `staged_batch` slice is one entry per device on this model.
-/// `speculation_depth == 0` disables speculation for this model.
-pub(crate) fn register_model(
-    model_idx: usize,
-    staged_batch: &[StagedBatchMap],
-    speculation_depth: usize,
-) {
+/// `staged_batch` slice is one entry per device on the model.
+/// `speculation_depth == 0` disables speculation.
+pub(crate) fn register_model(staged_batch: &[StagedBatchMap], speculation_depth: usize) {
     if let Ok(mut reg) = REGISTRY.lock() {
-        while reg.len() <= model_idx {
-            reg.push(ModelEntry {
-                speculation_depth: 0,
-                devices: Vec::new(),
-            });
-        }
-        reg[model_idx] = ModelEntry {
+        *reg = Some(ModelEntry {
             speculation_depth,
             devices: staged_batch.to_vec(),
-        };
+        });
     }
 }
 
@@ -176,12 +166,12 @@ impl std::fmt::Debug for StagedBatch {
     }
 }
 
-/// Resolve the per-(model, device) staged-batch arc for a ctx.
+/// Resolve the per-device staged-batch arc for a ctx.
 /// Called once per ctx (cached by the api layer), not per execute.
-/// Returns `None` when speculation is disabled for the model.
-pub fn lookup_for_ctx(model_idx: usize, device_idx: usize) -> Option<StagedBatch> {
+/// Returns `None` when speculation is disabled.
+pub fn lookup_for_ctx(device_idx: usize) -> Option<StagedBatch> {
     let reg = REGISTRY.lock().ok()?;
-    let model = reg.get(model_idx)?;
+    let model = reg.as_ref()?;
     if model.speculation_depth == 0 {
         return None;
     }
@@ -227,11 +217,11 @@ pub fn try_hit(
 /// (writes at deterministic positions). The hard invariant: drop
 /// the staged_batch entry NOW so a later hit-check never forwards
 /// stale predictions.
-pub fn invalidate_ctx(model_idx: usize, ctx_id: ContextId) {
+pub fn invalidate_ctx(ctx_id: ContextId) {
     let Ok(reg) = REGISTRY.lock() else {
         return;
     };
-    let Some(model) = reg.get(model_idx) else {
+    let Some(model) = reg.as_ref() else {
         return;
     };
     for sb_arc in &model.devices {
@@ -362,7 +352,6 @@ pub(crate) fn start_chain(
     response: oneshot::Sender<Result<ForwardOutput>>,
     scheduler_handle: SchedulerHandle,
     staged_batch_arc: StagedBatchMap,
-    model_idx: usize,
     request: pie_driver_abi::ForwardRequest,
     physical_page_ids: Vec<PhysicalPageId>,
     all_pages: Vec<PhysicalPageId>,
@@ -371,7 +360,7 @@ pub(crate) fn start_chain(
     max_queue_depth: usize,
     allow_extend: Arc<AtomicBool>,
 ) {
-    let page_size = crate::context::tokens_per_page(model_idx);
+    let page_size = crate::context::tokens_per_page();
     let state = Box::new(ChainState {
         response,
         scheduler_handle: scheduler_handle.clone(),

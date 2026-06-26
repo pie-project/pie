@@ -2,7 +2,6 @@
 
 use crate::api::adapter::Adapter;
 use crate::api::context::Context;
-use crate::api::model::Model;
 use crate::api::pie;
 use crate::inference::ForwardOutput;
 use crate::inference::structured::compiled_grammar::CompiledGrammar;
@@ -21,11 +20,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::sync::oneshot;
-use tokio::sync::oneshot::error::TryRecvError;
 use wasmtime::component::Resource;
+use wasmtime::component::{Accessor, HasSelf};
 use wasmtime_wasi::WasiView;
-use wasmtime_wasi::async_trait;
-use wasmtime_wasi::p2::{DynPollable, Pollable, subscribe};
 
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ExecuteProfileSnapshot {
@@ -154,7 +151,6 @@ fn record_execute_profile(sample: ExecuteProfileSample, total_us: u64) {
 /// but is used at execute-time to populate the adapter binding.
 #[derive(Debug)]
 pub struct ForwardPass {
-    pub model_id: usize,
     context_id: Option<crate::context::ContextId>,
     /// Snapshot of the bound ctx's cached speculator handle. Set in
     /// `pass.context()`; `None` until then, or when speculation is
@@ -175,7 +171,6 @@ pub struct FutureOutput {
     /// per-slot output list against this slot order.
     samplers: Vec<pie_driver_abi::Sampler>,
     done: bool,
-    model_id: usize,
     context_id: Option<crate::context::ContextId>,
     was_pinned: bool,
     fill_tokens: Vec<u32>,
@@ -191,7 +186,7 @@ impl FutureOutput {
     fn release_pin(&mut self) {
         if self.was_pinned {
             if let Some(context_id) = self.context_id {
-                context::unpin(self.model_id, context_id);
+                context::unpin(context_id);
             }
             self.was_pinned = false;
         }
@@ -216,7 +211,6 @@ impl FutureOutput {
         if !all_fill_tokens.is_empty() {
             let driver_repaired_spec_tail = self.spec_tokens_for_fill.len() as u32;
             context::append_working_page_tokens_with_repaired_spec_tail(
-                self.model_id,
                 context_id,
                 all_fill_tokens,
                 all_fill_positions,
@@ -292,30 +286,28 @@ fn empty_forward_request() -> pie_driver_abi::ForwardRequest {
     }
 }
 
-#[async_trait]
-impl Pollable for FutureOutput {
-    async fn ready(&mut self) {
-        if self.done {
-            return;
-        }
-        if let Some(rx) = self.rx.as_mut() {
-            let output = rx.await;
-            self.rx = None;
-            match output {
+impl FutureOutput {
+    /// Await the inflight forward-pass result and post-process it into the WIT
+    /// `output`. Consumes self (no longer a guest-visible resource); replaces
+    /// the old pollable/get polling now that `execute` is a native async func.
+    async fn into_output(mut self) -> pie::core::inference::Output {
+        if let Some(rx) = self.rx.take() {
+            match rx.await {
                 Ok(Ok(resp)) => self.finish_ok(resp),
                 Ok(Err(e)) => {
                     tracing::warn!("future output failed: {e:#}");
                     self.finish_empty();
                 }
-                Err(_) => {
-                    self.finish_empty();
-                }
+                Err(_) => self.finish_empty(),
             }
         } else {
-            // Another readiness probe may have already drained rx and
-            // be finishing lineage/result population. Treat rx=None while
-            // done=false as in-progress rather than completing empty.
+            self.finish_empty();
         }
+        self.result.take().unwrap_or(pie::core::inference::Output {
+            slots: Vec::new(),
+            spec_tokens: Vec::new(),
+            spec_positions: Vec::new(),
+        })
     }
 }
 
@@ -522,14 +514,12 @@ fn wit_to_bridge_sampler(s: pie::core::inference::Sampler) -> pie_driver_abi::Sa
 impl pie::core::inference::Host for InstanceState {}
 
 impl pie::core::inference::HostForwardPass for InstanceState {
-    async fn new(&mut self, model: Resource<Model>) -> Result<Resource<ForwardPass>> {
-        let model = self.ctx().table.get(&model)?;
+    async fn new(&mut self) -> Result<Resource<ForwardPass>> {
         // Initialize the accumulator with the per-request invariants:
         // single adapter binding (-1 sentinels = unbound), and no
         // speculative side-channel output unless the caller explicitly
         // enables it via `output_speculative_tokens(true)`.
         let pass = ForwardPass {
-            model_id: model.model_id,
             context_id: None,
             spec: None,
             adapter_seed: None,
@@ -546,7 +536,6 @@ impl pie::core::inference::HostForwardPass for InstanceState {
     ) -> Result<()> {
         let ctx = self.ctx().table.get(&context)?;
         let context_id = ctx.context_id;
-        let model_id = ctx.model_id;
         // Initialize the ctx's speculator cache on the first call
         // for this ctx. The OnceLock makes this lock-free on every
         // subsequent `pass.context()`, eliminating REGISTRY lookups
@@ -554,8 +543,8 @@ impl pie::core::inference::HostForwardPass for InstanceState {
         let spec = ctx
             .spec
             .get_or_init(|| {
-                let device_idx = context::get_device(model_id, context_id);
-                inference::lookup_for_ctx(model_id, device_idx)
+                let device_idx = context::get_device(context_id);
+                inference::lookup_for_ctx(device_idx)
             })
             .clone();
         let pass = self.ctx().table.get_mut(&this)?;
@@ -752,28 +741,42 @@ impl pie::core::inference::HostForwardPass for InstanceState {
         Ok(())
     }
 
+    async fn drop(&mut self, this: Resource<ForwardPass>) -> Result<()> {
+        self.ctx().table.delete(this)?;
+        Ok(())
+    }
+}
+
+impl pie::core::inference::HostForwardPassWithStore<InstanceState> for HasSelf<InstanceState> {
     async fn execute(
-        &mut self,
+        accessor: &Accessor<InstanceState, Self>,
         this: Resource<ForwardPass>,
-    ) -> Result<Result<Resource<FutureOutput>, String>> {
+    ) -> Result<Result<pie::core::inference::Output, String>> {
         let profiling = execute_profile_enabled();
         let profile_start = profiling.then(Instant::now);
         let mut profile_sample = ExecuteProfileSample::default();
         let prepare_start = profiling.then(Instant::now);
-        let pass = self.ctx().table.get_mut(&this)?;
 
-        let model_id = pass.model_id;
-        let context_id = pass
-            .context_id
-            .ok_or_else(|| anyhow::anyhow!("ForwardPass requires a context"))?;
-        let adapter_seed = pass.adapter_seed;
-        let spec_handle = pass.spec.clone();
-        let allow_pass_speculation = pass.allow_pass_speculation;
-        pass.allow_pass_speculation = true;
-        // Drain the accumulator. The remaining work is to synthesize
-        // masks if absent and stamp the per-request indptrs onto the
-        // ForwardRequest, then submit.
-        let mut req = std::mem::replace(&mut pass.req, empty_forward_request());
+        // Table-prep: extract everything from the ForwardPass resource. This is
+        // the only store/table access; the rest of execute (pin/submit/await/
+        // finish) runs on locals + global context state, so it stays outside
+        // the synchronous `accessor.with` closure.
+        let (context_id, adapter_seed, spec_handle, allow_pass_speculation, mut req) = accessor
+            .with(|mut access| -> anyhow::Result<_> {
+                let pass = access.get().ctx().table.get_mut(&this)?;
+                let context_id = pass
+                    .context_id
+                    .ok_or_else(|| anyhow::anyhow!("ForwardPass requires a context"))?;
+                let adapter_seed = pass.adapter_seed;
+                let spec_handle = pass.spec.clone();
+                let allow_pass_speculation = pass.allow_pass_speculation;
+                pass.allow_pass_speculation = true;
+                // Drain the accumulator. The remaining work is to synthesize
+                // masks if absent and stamp the per-request indptrs onto the
+                // ForwardRequest, then submit.
+                let req = std::mem::replace(&mut pass.req, empty_forward_request());
+                Ok((context_id, adapter_seed, spec_handle, allow_pass_speculation, req))
+            })?;
         // Clone samplers BEFORE finalizing so we can reconstruct the
         // per-slot WIT output against the original slot order.
         let samplers_for_output = req.samplers();
@@ -815,7 +818,7 @@ impl pie::core::inference::HostForwardPass for InstanceState {
         // Try the staged hit before synthesizing default masks or pinning. On
         // hit we skip pin/unpin entirely — the staged fire runs on pages from
         // the prior cycle.
-        let driver_idx_hint = context::get_device(model_id, context_id);
+        let driver_idx_hint = context::get_device(context_id);
         let use_pass_speculation = inference::should_use_pass_speculation(driver_idx_hint);
         let try_hit_start = profiling.then(Instant::now);
         let staged_rx = spec_handle
@@ -860,7 +863,7 @@ impl pie::core::inference::HostForwardPass for InstanceState {
             // Cold path: pin, validate page capacity, submit.
             let pin_start = profiling.then(Instant::now);
             let writable_tokens = num_input_tokens.saturating_add(num_spec_tokens);
-            let pinned = match context::pin(model_id, context_id, writable_tokens as u32).await {
+            let pinned = match context::pin(context_id, writable_tokens as u32).await {
                 Ok(p) => p,
                 Err(e) => {
                     tracing::warn!("pin failed for ctx {context_id}: {e:#}");
@@ -888,15 +891,13 @@ impl pie::core::inference::HostForwardPass for InstanceState {
                 //     default off). Gates only the *auto*-drafter: when off we
                 //     don't ask the driver to draft (`output_spec_flags`), but
                 //     we still honor any manual/user-supplied draft tokens.
-                let (system_spec_supported, system_spec_enabled) =
-                    crate::model::get_model(model_id)
-                        .map(|m| {
-                            (m.system_speculation_supported(), m.enable_system_speculation())
-                        })
-                        .unwrap_or((false, false));
+                let (system_spec_supported, system_spec_enabled) = {
+                    let m = crate::model::model();
+                    (m.system_speculation_supported(), m.enable_system_speculation())
+                };
                 if !system_spec_supported {
                     if !req.spec_token_ids.is_empty() {
-                        context::unpin(model_id, context_id);
+                        context::unpin(context_id);
                         return Ok(Err(
                             "rs_cache models do not support speculative draft tokens yet"
                                 .to_string(),
@@ -913,7 +914,7 @@ impl pie::core::inference::HostForwardPass for InstanceState {
             }
 
             let num_pages = physical_page_ids.len() as u32;
-            let page_size = context::tokens_per_page(model_id);
+            let page_size = context::tokens_per_page();
             let post_input_total_kv = kv_len + num_input_tokens as u32;
             let writable_total_kv = kv_len + writable_tokens as u32;
             let last_page_len = if num_pages == 0 {
@@ -938,14 +939,13 @@ impl pie::core::inference::HostForwardPass for InstanceState {
                      phys_ids={physical_page_ids:?}"
                 );
                 eprintln!("{msg}");
-                context::unpin(model_id, context_id);
+                context::unpin(context_id);
                 return Ok(Err(msg));
             }
 
             let driver_idx = driver_id as usize;
             let submit_start = profiling.then(Instant::now);
             let result = inference::submit_async(
-                model_id,
                 req,
                 driver_idx,
                 physical_page_ids,
@@ -965,7 +965,7 @@ impl pie::core::inference::HostForwardPass for InstanceState {
             Ok(rx) => rx,
             Err(e) => {
                 if was_pinned {
-                    context::unpin(model_id, context_id);
+                    context::unpin(context_id);
                 }
                 tracing::warn!("inference::submit failed for ctx {context_id}: {e:#}");
                 return Ok(Err(e.to_string()));
@@ -977,7 +977,6 @@ impl pie::core::inference::HostForwardPass for InstanceState {
             rx: Some(rx),
             samplers: samplers_for_output,
             done: false,
-            model_id,
             context_id: Some(context_id),
             was_pinned,
             fill_tokens,
@@ -989,65 +988,14 @@ impl pie::core::inference::HostForwardPass for InstanceState {
             adapter_seed,
         };
         let postprocess_start = profiling.then(Instant::now);
-        let pushed = self.ctx().table.push(future_output)?;
+        let output = future_output.into_output().await;
         if let Some(start) = postprocess_start {
             profile_sample.postprocess_us = elapsed_us(start.elapsed());
         }
         if let Some(start) = profile_start {
             record_execute_profile(profile_sample, elapsed_us(start.elapsed()));
         }
-        Ok(Ok(pushed))
-    }
-
-    async fn drop(&mut self, this: Resource<ForwardPass>) -> Result<()> {
-        self.ctx().table.delete(this)?;
-        Ok(())
-    }
-}
-
-impl pie::core::inference::HostFutureOutput for InstanceState {
-    async fn pollable(&mut self, this: Resource<FutureOutput>) -> Result<Resource<DynPollable>> {
-        subscribe(self.ctx().table, this)
-    }
-
-    async fn get(
-        &mut self,
-        this: Resource<FutureOutput>,
-    ) -> Result<Option<pie::core::inference::Output>> {
-        let result = self.ctx().table.get_mut(&this)?;
-        if !result.done {
-            if let Some(rx) = result.rx.as_mut() {
-                match rx.try_recv() {
-                    Ok(Ok(resp)) => {
-                        result.rx = None;
-                        result.finish_ok(resp);
-                    }
-                    Ok(Err(e)) => {
-                        result.rx = None;
-                        tracing::warn!("future output failed: {e:#}");
-                        result.finish_empty();
-                    }
-                    Err(TryRecvError::Closed) => {
-                        result.rx = None;
-                        result.finish_empty();
-                    }
-                    Err(TryRecvError::Empty) => {}
-                }
-            }
-        }
-        if result.done {
-            Ok(take(&mut result.result))
-        } else {
-            Ok(None)
-        }
-    }
-
-    async fn drop(&mut self, this: Resource<FutureOutput>) -> Result<()> {
-        if let Ok(future) = self.ctx().table.get_mut(&this) {
-            future.release_pin();
-        }
-        self.ctx().table.delete(this)?;
-        Ok(())
+        Ok(Ok(output))
     }
 }
 
@@ -1146,15 +1094,14 @@ impl pie::core::inference::HostMatcher for InstanceState {
     async fn new(
         &mut self,
         grammar: Resource<Grammar>,
-        tokenizer: Resource<crate::api::model::Tokenizer>,
     ) -> Result<Resource<Matcher>> {
         let grammar_res = self.ctx().table.get(&grammar)?;
         let source = grammar_res.source.clone();
         let grammar_inner = grammar_res.inner.clone();
 
-        let tokenizer_res = self.ctx().table.get(&tokenizer)?;
-        let tok = tokenizer_res.model.tokenizer().clone();
-        let stop_tokens = tokenizer_res.model.instruct().seal();
+        let model = crate::model::model();
+        let tok = model.tokenizer().clone();
+        let stop_tokens = model.instruct().seal();
 
         let compiled = CompiledGrammar::get_or_compile(&source, &grammar_inner, &tok);
         let inner = GrammarMatcher::with_compiled(compiled, tok, stop_tokens, 10);

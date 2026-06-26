@@ -1,9 +1,0 @@
-[package]
-name = "launch-callee"
-version = "0.1.0"
-description = "Inferlet invoked by launch-caller via runtime::launch — does a tiny generation and returns the result"
-authors = ["In Gim <in.gim@yale.edu>"]
-repository = "https://github.com/pie-project/pie"
-
-[runtime]
-core = "^0.2.0"

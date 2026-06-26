@@ -6,8 +6,8 @@
 
 use futures::future;
 use inferlet::{
-    Context, sample::Sampler, model::Model,
-    runtime, Result,
+    Context, sample::Sampler,
+    Result,
 };
 use serde::Deserialize;
 use std::time::Instant;
@@ -54,11 +54,7 @@ async fn main(input: Input) -> Result<String> {
     );
     let start = Instant::now();
 
-    let models = runtime::models();
-    let model_name = models.first().ok_or("No models available")?;
-    let model = Model::load(model_name)?;
-
-    let mut ctx_root = Context::new(&model)?;
+    let mut ctx_root = Context::new()?;
     ctx_root.system(
         "You are a helpful, respectful, and honest assistant that excels at \
         mathematical reasoning. Please follow the user's instructions precisely.",

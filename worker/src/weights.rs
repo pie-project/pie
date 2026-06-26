@@ -1,6 +1,6 @@
 //! Weight snapshot resolution — **load-at-boot only**.
 //!
-//! R3: the worker daemon never downloads. `[[model]].hf_repo` must point at a
+//! R3: the worker daemon never downloads. `[model].hf_repo` must point at a
 //! LOCAL snapshot the worker can load at boot — an HF safetensors directory, or
 //! a single `.gguf` file (the portable driver loads either; see
 //! `driver/portable/src/model.cpp::Model`). A bare `owner/name` repo ID is NOT

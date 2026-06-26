@@ -4,7 +4,7 @@
 //! each failed attempt's concrete violations into a compact verbal lesson, then
 //! injects accumulated lessons into the next attempt as explicit memory.
 
-use inferlet::{Context, JsonSchema, Result, model::Model, runtime, sample::Sampler};
+use inferlet::{Context, JsonSchema, Result, sample::Sampler};
 use serde::{Deserialize, Serialize};
 
 const HORIZON_START: i32 = 9 * 60;
@@ -140,17 +140,11 @@ async fn main(input: Input) -> Result<String> {
         return Err("max_iterations must be at least 1".into());
     }
 
-    let model_name = runtime::models()
-        .first()
-        .cloned()
-        .ok_or("No models available")?;
-    let model = Model::load(&model_name)?;
-
-    let mut attempt_root = Context::new(&model)?;
+    let mut attempt_root = Context::new()?;
     attempt_root.system(SYSTEM_PROMPT);
     attempt_root.flush().await?;
 
-    let mut reflection_root = Context::new(&model)?;
+    let mut reflection_root = Context::new()?;
     reflection_root.system(
         "You are a precise scheduling critic. Given a failed schedule and deterministic \
      violations, produce one short actionable lesson for the next attempt. \

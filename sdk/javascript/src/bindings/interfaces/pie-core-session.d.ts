@@ -6,7 +6,7 @@ export function send(message: string): void;
 /**
  * Receives an incoming message from the remote user client
  */
-export function receive(): FutureString;
+export function receive(): Promise<string | undefined>;
 /**
  * Sends a file to the remote user client
  */
@@ -14,7 +14,5 @@ export function sendFile(data: Blob): void;
 /**
  * Receives an incoming file from the remote user client
  */
-export function receiveFile(): FutureBlob;
-export type FutureString = import('./pie-core-types.js').FutureString;
-export type FutureBlob = import('./pie-core-types.js').FutureBlob;
+export function receiveFile(): Promise<Blob | undefined>;
 export type Blob = import('./pie-core-types.js').Blob;

@@ -97,7 +97,7 @@ pub fn main(_attr: TokenStream, item: TokenStream) -> TokenStream {
 package pie:{package_name};
 
 interface run {{
-    run: func(input: string) -> result<string, string>;
+    run: async func(input: string) -> result<string, string>;
 }}
 
 world inferlet {{
@@ -120,7 +120,7 @@ world inferlet {{
 
     // --- Build code-gen fragments ---
 
-    // Deserialization runs in sync context (before block_on) to avoid 'static issues.
+    // Deserialize the JSON input into the user's typed parameter.
     let input_prep = if typed_input {
         quote! {
             let typed_input = ::inferlet::serde_json::from_str(&input)
@@ -160,11 +160,9 @@ world inferlet {{
         struct __PieMain;
 
         impl __pie_export::exports::pie::#package_ident::run::Guest for __PieMain {
-            fn run(input: String) -> std::result::Result<String, String> {
+            async fn run(input: String) -> std::result::Result<String, String> {
                 #input_prep
-                let result = inferlet::wstd::runtime::block_on(async {
-                    #inner_fn_name(typed_input).await
-                });
+                let result = #inner_fn_name(typed_input).await;
                 let _ = std::io::Write::flush(&mut std::io::stdout());
                 let _ = std::io::Write::flush(&mut std::io::stderr());
                 #output_transform

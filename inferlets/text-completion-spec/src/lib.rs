@@ -12,7 +12,7 @@
 //!
 //!     SPEC_STATS prompt_tokens=N generated_tokens=M elapsed_ms=T tokens_per_sec=R steps=S avg_tokens_per_step=A
 
-use inferlet::{Context, FutureStringExt, Result, model::Model, runtime, sample::Sampler, session};
+use inferlet::{Context, Result, sample::Sampler, session};
 use serde::{Deserialize, Serialize};
 use std::time::Instant;
 
@@ -81,11 +81,7 @@ struct Output {
 
 #[inferlet::main]
 async fn main(input: Input) -> Result<Output> {
-    let models = runtime::models();
-    let model_name = models.first().ok_or("No models available")?;
-    let model = Model::load(model_name)?;
-
-    let mut ctx = Context::new(&model)?;
+    let mut ctx = Context::new()?;
     ctx.system(&input.system);
     ctx.user(&input.prompt);
     ctx.cue();
@@ -106,8 +102,7 @@ async fn main(input: Input) -> Result<Output> {
 
     if input.start_signal {
         session::send("ready");
-        let fut = session::receive();
-        let _ = fut.wait_async().await;
+        let _ = session::receive().await;
     }
 
     // The first step does prefill + the first decode step in one shot —
@@ -135,7 +130,7 @@ async fn main(input: Input) -> Result<Output> {
     let elapsed = prefill_elapsed + decode_elapsed;
 
     let text = if input.decode_output {
-        model.tokenizer().decode(&all_tokens)?
+        inferlet::model::decode(&all_tokens)?
     } else {
         String::new()
     };

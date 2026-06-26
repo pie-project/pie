@@ -27,10 +27,8 @@ impl pie::zo::zo::Host for InstanceState {
     ) -> Result<Result<(), String>> {
         let adapter = self.ctx().table.get(&adapter_res)?;
         let adapter_id = adapter.adapter_id;
-        let model_idx = adapter.model_idx;
 
         match adapter::zo_initialize(
-            model_idx,
             adapter_id,
             rank,
             alpha,
@@ -54,9 +52,8 @@ impl pie::zo::zo::Host for InstanceState {
     ) -> Result<Result<(), String>> {
         let adapter = self.ctx().table.get(&adapter_res)?;
         let adapter_id = adapter.adapter_id;
-        let model_idx = adapter.model_idx;
 
-        match adapter::zo_update(model_idx, adapter_id, scores, seeds, max_sigma).await {
+        match adapter::zo_update(adapter_id, scores, seeds, max_sigma).await {
             Ok(()) => Ok(Ok(())),
             Err(e) => Ok(Err(e.to_string())),
         }

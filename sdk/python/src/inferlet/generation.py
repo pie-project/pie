@@ -38,6 +38,7 @@ from wit_world.imports import zo as _zo
 from wit_world.imports.inference import SlotOutput_Token
 
 from . import chat as _chat
+from . import model as _model
 from ._async import await_future
 from .forward import Output, ProbeHandle, SampleHandle, _probe_kind
 from .grammar import (
@@ -162,7 +163,7 @@ class Generator:
             if system_speculation is not None
             else speculator is None
             and _sampler_is_argmax(sampler)
-            and ctx._model.default_system_speculation()
+            and _model.default_system_speculation()
         )
         # Cache for next-iter system drafts (populated each step from
         # the WIT output's spec channel when system speculation is on).
@@ -170,7 +171,7 @@ class Generator:
 
     def _add_constraint(self, c: Schema | Constraint) -> None:
         if hasattr(c, "build_constraint"):
-            self._constraints.append(c.build_constraint(self._ctx._model))
+            self._constraints.append(c.build_constraint())
         elif hasattr(c, "step"):
             self._constraints.append(c)
         else:
@@ -336,7 +337,7 @@ class Generator:
         clean end-of-turn (the expected case); otherwise concatenates
         every ``Delta`` chunk. The two are equal when the host honors
         the chat-template contract (Done's text == sum of deltas)."""
-        decoder = _chat.Decoder(self._ctx._model)
+        decoder = _chat.Decoder()
         text_parts: list[str] = []
         async for step in self:
             res = await step.execute()
@@ -468,7 +469,7 @@ class GenStep:
                 ctx._working_pages = pages_needed
 
         # Build forward pass.
-        fwd = _inf.ForwardPass(ctx._model._handle)
+        fwd = _inf.ForwardPass()
         fwd.context(ctx._handle)
         if gen._adapter is not None:
             fwd.adapter(gen._adapter._handle)

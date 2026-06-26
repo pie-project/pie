@@ -245,7 +245,7 @@ class Forward:
                 ctx._working_pages = pages_needed
 
         # Build forward pass.
-        fwd = _inf.ForwardPass(ctx._model._handle)
+        fwd = _inf.ForwardPass()
         fwd.context(ctx._handle)
         if self._adapter is not None:
             fwd.adapter(self._adapter._handle)

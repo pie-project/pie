@@ -17,7 +17,7 @@
 use chrono::{NaiveDate, Utc};
 use evalexpr::eval;
 use inferlet::{
-    Context, Result, sample::Sampler, model::Model, runtime,
+    Context, Result, sample::Sampler,
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -93,13 +93,7 @@ const FINAL_SCHEMA: &str = r#"{
 
 #[inferlet::main]
 async fn main(input: Input) -> Result<String> {
-    let model_name = runtime::models()
-        .first()
-        .cloned()
-        .ok_or("No models available")?;
-    let model = Model::load(&model_name)?;
-
-    let mut ctx = Context::new(&model)?;
+    let mut ctx = Context::new()?;
     ctx.system(SYSTEM_PROMPT);
     ctx.user(&format!("Question: {q}\nWhat is the next action?", q = input.question));
     ctx.cue();

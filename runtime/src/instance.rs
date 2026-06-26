@@ -10,7 +10,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use wasmtime::component::{ResourceAny, ResourceTable};
 use wasmtime_wasi::{DirPerms, FilePerms, WasiCtx, WasiCtxView, WasiView};
-use wasmtime_wasi_http::{WasiHttpCtx, WasiHttpView};
+use wasmtime_wasi_http::WasiHttpCtx;
+use wasmtime_wasi_http::p2::{WasiHttpCtxView, WasiHttpView};
 
 use self::output::LogStream;
 
@@ -39,6 +40,10 @@ pub struct InstanceState {
     wasi_ctx: WasiCtx,
     resource_table: ResourceTable,
     http_ctx: WasiHttpCtx,
+
+    /// Whether outbound network is permitted (gates `pie:core/http.fetch`,
+    /// parity with the wasi:http linker which is only wired when allowed).
+    network_allowed: bool,
 
     /// Per-instance scratch directory, deleted on Drop.
     scratch_dir: PathBuf,
@@ -70,12 +75,12 @@ impl WasiView for InstanceState {
 }
 
 impl WasiHttpView for InstanceState {
-    fn ctx(&mut self) -> &mut WasiHttpCtx {
-        &mut self.http_ctx
-    }
-
-    fn table(&mut self) -> &mut ResourceTable {
-        &mut self.resource_table
+    fn http(&mut self) -> WasiHttpCtxView<'_> {
+        WasiHttpCtxView {
+            ctx: &mut self.http_ctx,
+            table: &mut self.resource_table,
+            hooks: Default::default(),
+        }
     }
 }
 
@@ -168,6 +173,7 @@ impl InstanceState {
             wasi_ctx: builder.build(),
             resource_table: ResourceTable::new(),
             http_ctx: WasiHttpCtx::new(),
+            network_allowed: policy.network.allow,
             scratch_dir,
             // Dynamic linking support
             dynamic_resource_map: HashMap::new(),
@@ -182,6 +188,11 @@ impl InstanceState {
 
     pub fn get_username(&self) -> String {
         self.username.clone()
+    }
+
+    /// Whether outbound network is permitted for this inferlet.
+    pub fn network_allowed(&self) -> bool {
+        self.network_allowed
     }
 
     // ========================================================================

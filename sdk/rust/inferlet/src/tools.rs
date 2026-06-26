@@ -28,7 +28,6 @@
 
 use crate::Result;
 use crate::inference::Grammar;
-use crate::model::Model;
 use crate::pie::core::inference::Matcher;
 use crate::pie::instruct::tool_use;
 
@@ -59,15 +58,15 @@ pub trait Tool {
 /// string) in the chat template. Append to your context buffer (e.g.,
 /// via [`Context::append`](crate::Context::append)) before the user
 /// message. Models without a native tool-template return an empty vec.
-pub fn equip_prefix(model: &Model, tool_schemas: &[String]) -> Result<Vec<u32>> {
-    tool_use::equip(model, tool_schemas)
+pub fn equip_prefix(tool_schemas: &[String]) -> Result<Vec<u32>> {
+    tool_use::equip(tool_schemas)
 }
 
 /// Token sequence that frames a tool result for the next turn. `name`
 /// matches the call the model made; `value` is typically a JSON-encoded
 /// result.
-pub fn answer_prefix(model: &Model, name: &str, value: &str) -> Vec<u32> {
-    tool_use::answer(model, name, value)
+pub fn answer_prefix(name: &str, value: &str) -> Vec<u32> {
+    tool_use::answer(name, value)
 }
 
 // =============================================================================
@@ -77,16 +76,16 @@ pub fn answer_prefix(model: &Model, name: &str, value: &str) -> Vec<u32> {
 /// The model's native tool-call grammar, if any. Returns `None` when the
 /// model has no enforceable format (the caller should fall through to
 /// free-form generation + their own parser).
-pub fn native_grammar(model: &Model, tool_schemas: &[String]) -> Option<Grammar> {
-    tool_use::format(model, tool_schemas)
+pub fn native_grammar(tool_schemas: &[String]) -> Option<Grammar> {
+    tool_use::format(tool_schemas)
 }
 
 /// Build a [`Matcher`] for the model's native tool-call grammar.
 /// Returns `None` when the model has no enforceable format. Pair with
 /// [`GrammarConstraint::new`](crate::GrammarConstraint::new) for
 /// constrained generation.
-pub fn native_matcher(model: &Model, tool_schemas: &[String]) -> Option<Matcher> {
-    Some(tool_use::create_matcher(model, tool_schemas))
+pub fn native_matcher(tool_schemas: &[String]) -> Option<Matcher> {
+    Some(tool_use::create_matcher(tool_schemas))
 }
 
 // =============================================================================
@@ -116,10 +115,10 @@ pub enum Event {
 }
 
 impl Decoder {
-    /// Construct a decoder for `model`'s tool-call template.
-    pub fn new(model: &Model) -> Self {
+    /// Construct a decoder for the bound model's tool-call template.
+    pub fn new() -> Self {
         Self {
-            inner: tool_use::create_decoder(model),
+            inner: tool_use::create_decoder(),
         }
     }
 
@@ -148,10 +147,9 @@ impl Decoder {
 /// completed `Call`. Useful for `collect_text()` flows that want to
 /// extract one call at the end of generation. Returns `None` when no
 /// completed call is detected.
-pub fn parse_call(model: &Model, text: &str) -> Option<(String, String)> {
-    let tokenizer = model.tokenizer();
-    let tokens = tokenizer.encode(text);
-    let mut dec = Decoder::new(model);
+pub fn parse_call(text: &str) -> Option<(String, String)> {
+    let tokens = crate::model::encode(text);
+    let mut dec = Decoder::new();
     match dec.feed(&tokens).ok()? {
         Event::Call(name, args) => Some((name, args)),
         Event::Start => None,

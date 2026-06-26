@@ -8,12 +8,12 @@ from abc import abstractmethod
 import weakref
 
 from componentize_py_types import Result, Ok, Err, Some
-from ..imports import model
+
 
 class Adapter:
     
     @classmethod
-    def create(cls, model: model.Model, name: str) -> Self:
+    def create(cls, name: str) -> Self:
         """
         Raises: `wit_world.types.Err(wit_world.imports.str)`
         """
@@ -21,7 +21,7 @@ class Adapter:
     def destroy(self) -> None:
         raise NotImplementedError
     @classmethod
-    def open(cls, model: model.Model, name: str) -> Optional[Self]:
+    def open(cls, name: str) -> Optional[Self]:
         raise NotImplementedError
     def fork(self, name: str) -> Self:
         raise NotImplementedError

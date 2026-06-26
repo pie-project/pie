@@ -1,4 +1,3 @@
 core = "./core/wit"
-mcp = "./mcp/wit"
 zo = "./zo/wit"
 instruct = "./instruct/wit"

@@ -27,7 +27,7 @@ use std::io::{self, Write};
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use inferlet::{Context, Result, chat, model::Model, runtime, sample::Sampler, wstd};
+use inferlet::{Context, Result, chat, sample::Sampler};
 use serde::Deserialize;
 
 #[derive(Deserialize)]
@@ -85,11 +85,7 @@ const MAGENTA: &str = "\x1b[35m";
 async fn main(input: Input) -> Result<String> {
     let mode = input.mode.to_lowercase();
 
-    let model_name = runtime::models()
-        .first()
-        .cloned()
-        .ok_or("No models available")?;
-    let model = Model::load(&model_name)?;
+    let model_name = inferlet::model::name();
 
     // Reset the scratch file so reruns inside the same engine don't
     // confuse the cache-miss branch.
@@ -97,17 +93,17 @@ async fn main(input: Input) -> Result<String> {
 
     match mode.as_str() {
         "baseline" | "plain" => {
-            run_baseline(&model, &model_name, &input).await?;
+            run_baseline(&model_name, &input).await?;
         }
         "cached" | "smart" => {
-            run_cached(&model, &model_name, &input).await?;
+            run_cached(&model_name, &input).await?;
         }
         "both" | "" => {
-            let b = run_baseline(&model, &model_name, &input).await?;
+            let b = run_baseline(&model_name, &input).await?;
             println!();
             // Reset cache before the cached run.
             let _ = fs::remove_file(&input.scratch_file);
-            let s = run_cached(&model, &model_name, &input).await?;
+            let s = run_cached(&model_name, &input).await?;
             println!();
             comparison(&b, &s);
         }
@@ -132,7 +128,7 @@ struct ModeResult {
 }
 
 // ── BASELINE: regenerate every call ──────────────────────────────────
-async fn run_baseline(model: &Model, model_name: &str, input: &Input) -> Result<ModeResult> {
+async fn run_baseline(model_name: &str, input: &Input) -> Result<ModeResult> {
     print_header(
         "BASELINE",
         YELLOW,
@@ -144,7 +140,7 @@ async fn run_baseline(model: &Model, model_name: &str, input: &Input) -> Result<
         BOLD, YELLOW, RESET
     );
     let t = Instant::now();
-    generate_answer(model, input).await?;
+    generate_answer(input).await?;
     let call1 = t.elapsed();
     println!(
         "  {}generated, {} ms, no persistence{}",
@@ -158,7 +154,7 @@ async fn run_baseline(model: &Model, model_name: &str, input: &Input) -> Result<
         BOLD, YELLOW, RESET
     );
     let t = Instant::now();
-    generate_answer(model, input).await?;
+    generate_answer(input).await?;
     let call2 = t.elapsed();
     println!(
         "  {}regenerated again, {} ms{}",
@@ -176,7 +172,7 @@ async fn run_baseline(model: &Model, model_name: &str, input: &Input) -> Result<
 }
 
 // ── CACHED: memoize via /scratch/answers.json ────────────────────────
-async fn run_cached(model: &Model, model_name: &str, input: &Input) -> Result<ModeResult> {
+async fn run_cached(model_name: &str, input: &Input) -> Result<ModeResult> {
     print_header(
         "CACHED",
         GREEN,
@@ -189,7 +185,7 @@ async fn run_cached(model: &Model, model_name: &str, input: &Input) -> Result<Mo
         BOLD, GREEN, RESET
     );
     let t = Instant::now();
-    let (text1, hit1) = lookup_or_generate(model, input).await?;
+    let (text1, hit1) = lookup_or_generate(input).await?;
     let call1 = t.elapsed();
     let _ = text1;
     println!(
@@ -209,7 +205,7 @@ async fn run_cached(model: &Model, model_name: &str, input: &Input) -> Result<Mo
         BOLD, GREEN, RESET
     );
     let t = Instant::now();
-    let (text2, hit2) = lookup_or_generate(model, input).await?;
+    let (text2, hit2) = lookup_or_generate(input).await?;
     let call2 = t.elapsed();
     let _ = text2;
     println!(
@@ -238,7 +234,7 @@ async fn run_cached(model: &Model, model_name: &str, input: &Input) -> Result<Mo
     })
 }
 
-async fn lookup_or_generate(model: &Model, input: &Input) -> Result<(String, bool)> {
+async fn lookup_or_generate(input: &Input) -> Result<(String, bool)> {
     let key = cache_key(&input.question);
     let cache = read_cache(&input.scratch_file);
     if let Some(text) = cache.get(&key).cloned() {
@@ -249,14 +245,14 @@ async fn lookup_or_generate(model: &Model, input: &Input) -> Result<(String, boo
             print!("{}", line);
             let _ = io::stdout().flush();
             if input.delay > 0 {
-                wstd::task::sleep(wstd::time::Duration::from_millis(input.delay)).await;
+                inferlet::sleep(std::time::Duration::from_millis(input.delay)).await;
             }
         }
         println!();
         return Ok((text, true));
     }
     // Cache miss — generate and write back.
-    let text = generate_answer(model, input).await?;
+    let text = generate_answer(input).await?;
     let mut cache = read_cache(&input.scratch_file);
     cache.insert(key, text.clone());
     write_cache(&input.scratch_file, &cache)?;
@@ -289,8 +285,8 @@ fn write_cache(path: &str, cache: &HashMap<String, String>) -> std::result::Resu
 }
 
 // ── Generate + stream the answer ──────────────────────────────────────
-async fn generate_answer(model: &Model, input: &Input) -> Result<String> {
-    let mut ctx = Context::new(model)?;
+async fn generate_answer(input: &Input) -> Result<String> {
+    let mut ctx = Context::new()?;
     ctx.system(&input.system);
     ctx.user(&format!("{} /no_think", input.question.trim()));
     ctx.cue();
@@ -301,8 +297,8 @@ async fn generate_answer(model: &Model, input: &Input) -> Result<String> {
     let mut g = ctx
         .generate(Sampler::Argmax)
         .max_tokens(input.max_tokens)
-        .stop(&chat::stop_tokens(model));
-    let mut decoder = chat::Decoder::new(model);
+        .stop(&chat::stop_tokens());
+    let mut decoder = chat::Decoder::new();
     let mut stripper = ThinkStripper::new();
     let mut text = String::new();
 
@@ -320,7 +316,7 @@ async fn generate_answer(model: &Model, input: &Input) -> Result<String> {
                     print!("{}", rendered);
                     let _ = io::stdout().flush();
                     if input.delay > 0 {
-                        wstd::task::sleep(wstd::time::Duration::from_millis(input.delay)).await;
+                        inferlet::sleep(std::time::Duration::from_millis(input.delay)).await;
                     }
                 }
             }

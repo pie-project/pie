@@ -17,8 +17,9 @@
 //!
 //! The inferlet drives the entire loop. It scans the model's token stream for
 //! CML delimiters with a small FSM parser (`Parser`), fires each `[CALL]` as a
-//! real HTTP request on the `wstd` reactor so it runs concurrently with
-//! decoding, and injects each `[INTR]` result back into the live `Generator`.
+//! real host-driven HTTP request (`inferlet::http::send`, held in a
+//! `FuturesUnordered`) so it runs concurrently with decoding, and injects each
+//! `[INTR]` result back into the live `Generator`.
 //! Five live tools are wired up: weather, stock price, currency, time, and
 //! Wikipedia summaries.
 //!
@@ -39,23 +40,23 @@
 //!     injected frame into the next decode step.
 //!   - `Constrain` with a precomputed BRLE mask that bans the token ids unique
 //!     to `[INTR]`, so the model can never forge a result frame.
-//!   - `wstd` async tasks + HTTP client, so real tool calls overlap decoding.
+//!   - `futures::FuturesUnordered` of host-driven `http::send` futures, raced
+//!     against the forward pass via `futures::select!`, so real tool calls
+//!     overlap decoding (no guest executor under component-model-async).
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::task::{Context as TaskContext, Poll, RawWaker, RawWakerVTable, Waker};
 use std::time::Instant;
 
-use inferlet::model::{Model, Tokenizer};
+use futures::stream::FuturesUnordered;
+use futures::{FutureExt, StreamExt};
+use inferlet::http::{self, Request};
 use inferlet::sample::Sampler;
 use inferlet::serde_json::Value;
-use inferlet::wstd;
-use inferlet::wstd::future::FutureExt;
-use inferlet::wstd::http::{Client, Method, Request};
-use inferlet::{Constrain, Context, Generator, Result, chat, runtime};
+use inferlet::{Constrain, Context, Generator, Result, chat};
 use serde::Deserialize;
 
 /// Gates the verbose per-token `[dbg]` diagnostics. Off by default; set in
@@ -296,9 +297,9 @@ struct CmlRegistry {
 }
 
 impl CmlRegistry {
-    fn new(tokenizer: &Tokenizer) -> Self {
-        let special_map = build_special_map(tokenizer);
-        let resolve = |s: &str| resolve_token(s, &special_map, tokenizer);
+    fn new() -> Self {
+        let special_map = build_special_map();
+        let resolve = |s: &str| resolve_token(s, &special_map);
         let require = |s: &str| {
             let ids = resolve(s);
             assert!(!ids.is_empty(), "CML token '{}' tokenized to empty", s);
@@ -311,8 +312,8 @@ impl CmlRegistry {
         let trap_ids = require("[TRAP]");
         let intr_ids = require("[INTR]");
 
-        let trap_end_ids = build_trap_end_variants(&trap_ids, &end_ids, tokenizer);
-        let close_bracket_alts = collect_close_bracket_alts(tokenizer);
+        let trap_end_ids = build_trap_end_variants(&trap_ids, &end_ids);
+        let close_bracket_alts = collect_close_bracket_alts();
         let suppressed =
             compute_intr_suppression(&call_ids, &end_ids, &head_ids, &trap_ids, &intr_ids);
 
@@ -336,26 +337,25 @@ impl CmlRegistry {
     }
 }
 
-fn build_special_map(tokenizer: &Tokenizer) -> HashMap<Vec<u8>, u32> {
-    let (special_ids, special_bytes) = tokenizer.special_tokens();
+fn build_special_map() -> HashMap<Vec<u8>, u32> {
+    let (special_ids, special_bytes) = inferlet::model::special_tokens();
     special_bytes
         .into_iter()
         .zip(special_ids.into_iter())
         .collect()
 }
 
-fn resolve_token(s: &str, special_map: &HashMap<Vec<u8>, u32>, tokenizer: &Tokenizer) -> Vec<u32> {
+fn resolve_token(s: &str, special_map: &HashMap<Vec<u8>, u32>) -> Vec<u32> {
     if let Some(&id) = special_map.get(s.as_bytes()) {
         vec![id]
     } else {
-        tokenizer.encode(s)
+        inferlet::model::encode(s)
     }
 }
 
 fn build_trap_end_variants(
     trap_ids: &[u32],
     end_ids: &[u32],
-    tokenizer: &Tokenizer,
 ) -> Vec<Vec<u32>> {
     let mut variants = vec![
         trap_ids
@@ -364,7 +364,7 @@ fn build_trap_end_variants(
             .copied()
             .collect::<Vec<u32>>(),
     ];
-    let merge = tokenizer.encode("][");
+    let merge = inferlet::model::encode("][");
     if merge.len() == 1 && !trap_ids.is_empty() && !end_ids.is_empty() {
         let mut merged: Vec<u32> = trap_ids[..trap_ids.len() - 1].to_vec();
         merged.push(merge[0]);
@@ -378,8 +378,8 @@ fn build_trap_end_variants(
 /// accepts any of these in place of the canonical `]` so BPE-fused trailing
 /// brackets (`]\n`, `][`, `] `, …) still close out a delimiter. Without
 /// this the FSM jams in InCallBody/InCallId forever — failures are silent.
-fn collect_close_bracket_alts(tokenizer: &Tokenizer) -> Vec<u32> {
-    let (vocab_ids, vocab_bytes) = tokenizer.vocabs();
+fn collect_close_bracket_alts() -> Vec<u32> {
+    let (vocab_ids, vocab_bytes) = inferlet::model::vocabs();
     vocab_ids
         .iter()
         .zip(vocab_bytes.iter())
@@ -724,22 +724,22 @@ impl Parser {
             .chain(trap_end_inner)
     }
 
-    fn detokenize_one(tokenizer: &Tokenizer, t: u32) -> String {
-        tokenizer.decode(&[t]).unwrap_or_default()
+    fn detokenize_one(t: u32) -> String {
+        inferlet::model::decode(&[t]).unwrap_or_default()
     }
 
     /// Tokens whose decoded bytes end with `[` are potential delimiter
     /// starts; if the delimiter never forms (usually because the [INTR]
     /// continuation was suppressed), we drop them rather than leak a stray
     /// `[` into passthrough.
-    fn is_partial_delim_start(t: u32, tokenizer: &Tokenizer) -> bool {
-        Self::detokenize_one(tokenizer, t).ends_with('[')
+    fn is_partial_delim_start(t: u32) -> bool {
+        Self::detokenize_one(t).ends_with('[')
     }
 
-    fn strip_trailing_bracket(tokens: &mut Vec<u32>, tokenizer: &Tokenizer) {
+    fn strip_trailing_bracket(tokens: &mut Vec<u32>) {
         if tokens
             .last()
-            .is_some_and(|&t| Self::is_partial_delim_start(t, tokenizer))
+            .is_some_and(|&t| Self::is_partial_delim_start(t))
         {
             tokens.pop();
         }
@@ -750,12 +750,11 @@ impl Parser {
     fn emit_prefix_and_consume(
         &mut self,
         dlen: usize,
-        tokenizer: &Tokenizer,
         events: &mut Vec<Event>,
     ) {
         let end = self.buf.len() - dlen;
         let mut prefix: Vec<u32> = self.buf[..end].to_vec();
-        Self::strip_trailing_bracket(&mut prefix, tokenizer);
+        Self::strip_trailing_bracket(&mut prefix);
         events.extend(prefix.into_iter().map(Event::Passthrough));
         self.buf.clear();
     }
@@ -764,14 +763,14 @@ impl Parser {
     /// Passthrough unless it's a partial-delimiter start (in which case
     /// drop it). Used to drain `buf` token-by-token while it can't be the
     /// start of any delimiter.
-    fn drain_front_as_passthrough(&mut self, tokenizer: &Tokenizer, events: &mut Vec<Event>) {
+    fn drain_front_as_passthrough(&mut self, events: &mut Vec<Event>) {
         let t = self.buf.remove(0);
-        if !Self::is_partial_delim_start(t, tokenizer) {
+        if !Self::is_partial_delim_start(t) {
             events.push(Event::Passthrough(t));
         }
     }
 
-    fn feed(&mut self, token_id: u32, tokenizer: &Tokenizer) -> Vec<Event> {
+    fn feed(&mut self, token_id: u32) -> Vec<Event> {
         let mut events = Vec::new();
 
         // Think-block bypass: while inside <think>…</think>, suspend CML
@@ -787,9 +786,9 @@ impl Parser {
 
         let prev_state = self.state;
         match self.state {
-            State::Normal => self.feed_normal(token_id, tokenizer, &mut events),
-            State::InCallId => self.feed_in_call_id(token_id, tokenizer, &mut events),
-            State::InCallBody => self.feed_in_call_body(token_id, tokenizer, &mut events),
+            State::Normal => self.feed_normal(token_id, &mut events),
+            State::InCallId => self.feed_in_call_id(token_id, &mut events),
+            State::InCallBody => self.feed_in_call_body(token_id, &mut events),
             State::InTrap => self.feed_in_trap(token_id, &mut events),
             State::InIntrId => self.feed_in_intr_id(token_id),
             State::InIntrBody => self.feed_in_intr_body(token_id),
@@ -804,31 +803,31 @@ impl Parser {
         events
     }
 
-    fn feed_normal(&mut self, token_id: u32, tokenizer: &Tokenizer, events: &mut Vec<Event>) {
+    fn feed_normal(&mut self, token_id: u32, events: &mut Vec<Event>) {
         self.buf.push(token_id);
         let (d, dlen) = self.match_full_or_normal_inner(&self.buf);
         match d {
             Delim::Call => {
-                self.emit_prefix_and_consume(dlen, tokenizer, events);
+                self.emit_prefix_and_consume(dlen, events);
                 self.id_tokens.clear();
                 self.body_tokens.clear();
                 self.state = State::InCallId;
             }
             Delim::Trap => {
-                self.emit_prefix_and_consume(dlen, tokenizer, events);
+                self.emit_prefix_and_consume(dlen, events);
                 self.state = State::InTrap;
             }
             Delim::TrapEnd => {
-                self.emit_prefix_and_consume(dlen, tokenizer, events);
+                self.emit_prefix_and_consume(dlen, events);
                 events.push(Event::Trap);
             }
             Delim::Intr => {
-                self.emit_prefix_and_consume(dlen, tokenizer, events);
+                self.emit_prefix_and_consume(dlen, events);
                 self.state = State::InIntrId;
             }
             Delim::None => {
                 while !self.buf.is_empty() && !self.is_prefix_of_any(&self.buf) {
-                    self.drain_front_as_passthrough(tokenizer, events);
+                    self.drain_front_as_passthrough(events);
                 }
             }
             // End/Head matched at top level — should not occur, but drain
@@ -836,7 +835,7 @@ impl Parser {
             _ => {
                 let drained: Vec<u32> = self.buf.drain(..).collect();
                 for t in drained {
-                    if !Self::is_partial_delim_start(t, tokenizer) {
+                    if !Self::is_partial_delim_start(t) {
                         events.push(Event::Passthrough(t));
                     }
                 }
@@ -844,7 +843,7 @@ impl Parser {
         }
     }
 
-    fn feed_in_call_id(&mut self, token_id: u32, tokenizer: &Tokenizer, events: &mut Vec<Event>) {
+    fn feed_in_call_id(&mut self, token_id: u32, events: &mut Vec<Event>) {
         self.buf.push(token_id);
         let (d, dlen) = self.match_full_or_inner(&self.buf);
         match d {
@@ -852,17 +851,16 @@ impl Parser {
                 let id_end = self.buf.len() - dlen;
                 self.id_tokens.extend_from_slice(&self.buf[..id_end]);
                 self.buf.clear();
-                Self::strip_trailing_bracket(&mut self.id_tokens, tokenizer);
+                Self::strip_trailing_bracket(&mut self.id_tokens);
                 self.state = State::InCallBody;
             }
             Delim::End => {
                 let id_end = self.buf.len() - dlen;
                 self.id_tokens.extend_from_slice(&self.buf[..id_end]);
                 self.buf.clear();
-                Self::strip_trailing_bracket(&mut self.id_tokens, tokenizer);
+                Self::strip_trailing_bracket(&mut self.id_tokens);
                 // Decode error → empty id, runtime keeps going (best-effort).
-                let id = tokenizer
-                    .decode(&self.id_tokens)
+                let id = inferlet::model::decode(&self.id_tokens)
                     .unwrap_or_default()
                     .trim()
                     .to_string();
@@ -882,7 +880,7 @@ impl Parser {
         }
     }
 
-    fn feed_in_call_body(&mut self, token_id: u32, tokenizer: &Tokenizer, events: &mut Vec<Event>) {
+    fn feed_in_call_body(&mut self, token_id: u32, events: &mut Vec<Event>) {
         self.buf.push(token_id);
         let (d, dlen) = self.match_full_or_inner(&self.buf);
         match d {
@@ -890,14 +888,12 @@ impl Parser {
                 let body_end = self.buf.len() - dlen;
                 self.body_tokens.extend_from_slice(&self.buf[..body_end]);
                 self.buf.clear();
-                Self::strip_trailing_bracket(&mut self.body_tokens, tokenizer);
-                let id = tokenizer
-                    .decode(&self.id_tokens)
+                Self::strip_trailing_bracket(&mut self.body_tokens);
+                let id = inferlet::model::decode(&self.id_tokens)
                     .unwrap_or_default()
                     .trim()
                     .to_string();
-                let code = tokenizer
-                    .decode(&self.body_tokens)
+                let code = inferlet::model::decode(&self.body_tokens)
                     .unwrap_or_default()
                     .trim()
                     .to_string();
@@ -970,39 +966,30 @@ impl Parser {
         }
     }
 
-    fn flush(&mut self, tokenizer: &Tokenizer) -> Vec<Event> {
+    fn flush(&mut self) -> Vec<Event> {
         self.buf
             .drain(..)
-            .filter(|&t| !Self::is_partial_delim_start(t, tokenizer))
+            .filter(|&t| !Self::is_partial_delim_start(t))
             .map(Event::Passthrough)
             .collect()
     }
 }
 
 // ============================================================================
-// Real async executor
+// Real async, no guest executor
 //
-// Each CML `[CALL]` becomes a live HTTP request via `wstd::http`, spawned onto
-// the wstd reactor at the dispatch site in `run_inner_session`. The reactor
-// advances in-flight requests every time the main loop awaits
-// `step.execute().await`, so tool calls genuinely overlap token decoding —
-// the core AsyncLM property, now with real tool latency instead of a
-// simulated wait.
+// Each CML `[CALL]` becomes a live HTTP request via `inferlet::http::send`,
+// pushed as a future into a `FuturesUnordered` at the dispatch site in
+// `run_inner_session`. The decode loop races the forward-pass future against
+// the pending calls with `futures::select!` — that `select!` is the yield
+// point where the host event loop advances every in-flight request, so tool
+// calls genuinely overlap token decoding (the core AsyncLM property, with real
+// tool latency). Remaining calls are drained at the `[TRAP]`.
 //
 // `execute_call` always resolves to a compact JSON string for the `[INTR]`
 // frame; any transport/parse failure is folded into an `{"error": ...}`
 // payload so the model still receives something it can read.
 // ============================================================================
-
-fn noop_waker() -> Waker {
-    const VTABLE: RawWakerVTable = RawWakerVTable::new(
-        |_| RawWaker::new(std::ptr::null(), &VTABLE),
-        |_| {},
-        |_| {},
-        |_| {},
-    );
-    unsafe { Waker::from_raw(RawWaker::new(std::ptr::null(), &VTABLE)) }
-}
 
 /// Resolve one CML call to its live API and return the `[INTR]` payload.
 async fn execute_call(code: String, emulate_unknown: bool) -> String {
@@ -1029,8 +1016,8 @@ async fn execute_call(code: String, emulate_unknown: bool) -> String {
 /// `math.pythagoras`) are not executable here. Following the AsyncLM paper's
 /// evaluation setup, we assign each function a 30-500 ms completion time and
 /// just wait, then return a result: hash the function name to a stable latency
-/// in that range (reproducible, per-function differentiated), sleep on the wstd
-/// reactor so token decoding overlaps the wait (the core async-overlap
+/// in that range (reproducible, per-function differentiated), `inferlet::sleep`
+/// for that duration so token decoding overlaps the wait (the core async-overlap
 /// property), and return a canned payload. Correctness is judged on the emitted
 /// `[CALL]` block, never on this result string.
 async fn bfcl_emulated_call(code: &str) -> std::result::Result<String, String> {
@@ -1042,43 +1029,45 @@ async fn bfcl_emulated_call(code: &str) -> std::result::Result<String, String> {
         h = h.wrapping_mul(0x100000001b3);
     }
     let latency_ms = 30 + (h % 471); // 30..=500
-    wstd::task::sleep(wstd::time::Duration::from_millis(latency_ms)).await;
+    inferlet::sleep(std::time::Duration::from_millis(latency_ms)).await;
     Ok(format!(
         "{{\"status\": \"ok\", \"function\": {name:?}, \"latency_ms\": {latency_ms}}}"
     ))
 }
 
-/// Per-request HTTP timeout. Tool calls run on the wstd reactor and are
-/// awaited at the trap, so without a bound a hung upstream would block the
-/// whole trap; on timeout the call folds into an `{"error": ...}` frame.
+/// Per-request HTTP timeout. Tool-call `http::send` futures run concurrently
+/// and are drained at the trap, so without a bound a hung upstream would block
+/// the whole trap; on timeout (`select!(send, sleep)`) the call folds into an
+/// `{"error": ...}` frame.
 const HTTP_TIMEOUT_SECS: u64 = 10;
 
 /// GET `url` and return the response body. Non-2xx and transport errors map
 /// to `Err`. A User-Agent is set because Wikipedia (and OSM) reject requests
 /// without one. Both awaits are bounded by `HTTP_TIMEOUT_SECS`.
 async fn http_get(url: &str) -> std::result::Result<String, String> {
-    let client = Client::new();
-    let req = Request::builder()
-        .uri(url)
-        .method(Method::GET)
-        .header("user-agent", "pie-asynclm/0.1 (+https://pie-project.org)")
-        .body(wstd::io::empty())
-        .map_err(|e| format!("build request {url}: {e}"))?;
-    let resp = client
-        .send(req)
-        .timeout(wstd::time::Duration::from_secs(HTTP_TIMEOUT_SECS))
-        .await
-        .map_err(|_| format!("timeout sending {url}"))?
-        .map_err(|e| format!("send {url}: {e}"))?;
-    let status = resp.status().as_u16();
-    let mut body = resp.into_body();
-    let bytes = body
-        .bytes()
-        .timeout(wstd::time::Duration::from_secs(HTTP_TIMEOUT_SECS))
-        .await
-        .map_err(|_| format!("timeout reading body {url}"))?
-        .map_err(|e| format!("read body {url}: {e}"))?;
-    let text = String::from_utf8_lossy(&bytes).into_owned();
+    let req = Request {
+        method: "GET".to_string(),
+        url: url.to_string(),
+        headers: vec![(
+            "user-agent".to_string(),
+            "pie-asynclm/0.1 (+https://pie-project.org)".to_string(),
+        )],
+        body: None,
+    };
+    // Bound the request with a guest-side timeout: race the host fetch against
+    // a sleep. If the sleep wins, dropping the `send` future cancels the host
+    // request. The host buffers the full response, so one race covers it. (The
+    // host does a single hop with no auto-redirect; the tool APIs answer 200
+    // directly, and a stray 3xx folds into the `{"error": ...}` payload.)
+    let send_fut = http::send(req).fuse();
+    let timeout_fut = inferlet::sleep(std::time::Duration::from_secs(HTTP_TIMEOUT_SECS)).fuse();
+    futures::pin_mut!(send_fut, timeout_fut);
+    let resp = futures::select! {
+        r = send_fut => r?,
+        _ = timeout_fut => return Err(format!("timeout fetching {url}")),
+    };
+    let status = resp.status;
+    let text = String::from_utf8_lossy(&resp.body).into_owned();
     if !(200..300).contains(&status) {
         let snip: String = text.chars().take(120).collect();
         return Err(format!("HTTP {status} from {url}: {snip}"));
@@ -1311,58 +1300,13 @@ fn trim_summary(text: &str, max_chars: usize) -> String {
     s
 }
 
-/// A call dispatched as a `wstd` task. The fetch runs on the reactor; the
-/// loop harvests it once `is_finished()` flips true.
-struct PendingCall {
-    id: String,
-    dispatched_at: Instant,
-    task: wstd::runtime::Task<String>,
-}
-
-/// Harvest a finished call. Returns `None` while the task is still in flight.
-/// Tasks make progress on the reactor when the main loop yields to it (see
-/// `yield_to_reactor`), not here, so this never blocks and never spins a live
-/// request.
-fn poll_once(p: &mut PendingCall) -> Option<String> {
-    if !p.task.is_finished() {
-        return None;
-    }
-    let waker = noop_waker();
-    let mut cx = TaskContext::from_waker(&waker);
-    match Pin::new(&mut p.task).poll(&mut cx) {
-        Poll::Ready(r) => Some(r),
-        Poll::Pending => None,
-    }
-}
-
-/// Yield once to the wstd executor so other ready tasks get to run.
-///
-/// This is what makes the async overlap real. `step.execute().await` (the
-/// forward pass) resolves *synchronously* — it never yields `Pending` — so
-/// between dispatching a `[CALL]` and reaching the `[TRAP]`, the main task
-/// monopolises the single-threaded executor and the spawned `execute_call`
-/// futures sit un-polled on the ready list. Their timers/sockets never advance,
-/// so every call only "starts" when the trap finally awaits it (you'd observe
-/// `ready after ≈ trap_time + latency`, and `mid_injects` stays 0).
-///
-/// Yielding here hands `block_on` a turn: it runs the freshly-spawned tasks to
-/// their first await (registering pollables) and non-block-checks the reactor's
-/// pollables, completing any whose wall-clock deadline has elapsed. Across the
-/// decode steps that span the call's latency, the result then lands in the
-/// interrupt queue *during* prose generation — the actual concurrency.
-async fn yield_to_reactor() {
-    let mut yielded = false;
-    std::future::poll_fn(move |cx| {
-        if yielded {
-            Poll::Ready(())
-        } else {
-            yielded = true;
-            cx.waker().wake_by_ref();
-            Poll::Pending
-        }
-    })
-    .await
-}
+/// An in-flight tool call as a boxed future resolving to
+/// `(id, dispatch_time, result_payload)`. Held in a `FuturesUnordered` so calls
+/// run concurrently on the host event loop and complete out of order; harvested
+/// via `futures::select!` against the decode forward-pass (the async overlap),
+/// then drained at the `[TRAP]`. Replaces the old `wstd::runtime::spawn` +
+/// reactor-poll model (no guest executor under component-model-async).
+type CallFuture = Pin<Box<dyn Future<Output = (String, Instant, String)>>>;
 
 // ============================================================================
 // Main-loop helpers
@@ -1468,36 +1412,6 @@ enum Restart {
     RestoreAndInject(Vec<String>),
 }
 
-/// Poll each pending call once. Completed calls are removed from `pending`
-/// and their result frames are queued in `interrupts`.
-fn poll_and_collect_ready(
-    pending: &mut Vec<PendingCall>,
-    interrupts: &mut InterruptManager,
-    log_each_ready: bool,
-) {
-    pending.retain_mut(|p| match poll_once(p) {
-        Some(result) => {
-            if log_each_ready {
-                println!(
-                    "[AsyncLM] id={} ready after {}ms",
-                    p.id,
-                    p.dispatched_at.elapsed().as_millis()
-                );
-                trace(
-                    "ready",
-                    &p.id,
-                    p.dispatched_at.elapsed().as_millis() as i64,
-                    -1,
-                    "overlap",
-                );
-            }
-            interrupts.enqueue(&p.id, &result);
-            false
-        }
-        None => true,
-    });
-}
-
 fn frames_to_text_with_log(frames: Vec<String>, log_label: &str) -> String {
     let mut text = String::new();
     for frame in frames {
@@ -1515,12 +1429,11 @@ fn frames_to_text_with_log(frames: Vec<String>, log_label: &str) -> String {
 
 fn stage_injection(
     generator: &mut Generator<'_>,
-    tokenizer: &Tokenizer,
     text: &str,
     next_step_flushes_injection: &mut bool,
     deferred_injected_tail: &mut Option<u32>,
 ) {
-    let injected = tokenizer.encode(text);
+    let injected = inferlet::model::encode(text);
     if injected.is_empty() {
         return;
     }
@@ -1553,7 +1466,6 @@ fn stage_injection(
 /// pairing used at every injection site (pending / keep / mid).
 fn inject_frames(
     generator: &mut Generator<'_>,
-    tokenizer: &Tokenizer,
     frames: Vec<String>,
     log_label: &str,
     next_step_flushes_injection: &mut bool,
@@ -1562,7 +1474,6 @@ fn inject_frames(
     let text = frames_to_text_with_log(frames, log_label);
     stage_injection(
         generator,
-        tokenizer,
         &text,
         next_step_flushes_injection,
         deferred_injected_tail,
@@ -1572,12 +1483,12 @@ fn inject_frames(
 async fn run_inner_session(
     generator: &mut Generator<'_>,
     parser: &mut Parser,
-    pending: &mut Vec<PendingCall>,
+    pending: &mut FuturesUnordered<CallFuture>,
+    dispatch_times: &mut Vec<Instant>,
     interrupts: &mut InterruptManager,
     checkpoint: &CheckpointManager,
     generated: &mut Vec<u32>,
     input: &Input,
-    tokenizer: &Tokenizer,
     cost: &CostModel,
     pending_inject: &mut Option<PendingInjection>,
     step_count: &mut usize,
@@ -1589,7 +1500,6 @@ async fn run_inner_session(
     if let Some(injection) = pending_inject.take() {
         inject_frames(
             generator,
-            tokenizer,
             injection.frames,
             injection.log_label,
             &mut next_step_flushes_injection,
@@ -1617,13 +1527,37 @@ async fn run_inner_session(
             step.clear_sampler();
         }
 
-        let out = step.execute().await?;
+        // Race the forward pass against the in-flight tool calls: while the
+        // pass runs on the host, completed calls are harvested concurrently
+        // (the async overlap). `select!` is the yield point — under
+        // component-model-async a bare poll never advances host-driven
+        // subtasks. The forward-pass future is the primary; pending calls
+        // resolve out of order via `select_next_some` (inert when empty).
+        // Scoped in a block so `exec` (which borrows `generator` via `step`)
+        // is dropped before the post-execute code reuses `generator`.
+        let out = {
+            let exec = step.execute().fuse();
+            futures::pin_mut!(exec);
+            loop {
+                futures::select! {
+                    out = exec => break out?,
+                    (id, at, result) = pending.select_next_some() => {
+                        if let Some(pos) = dispatch_times.iter().position(|t| *t == at) {
+                            dispatch_times.swap_remove(pos);
+                        }
+                        println!("[AsyncLM] id={} ready after {}ms", id, at.elapsed().as_millis());
+                        trace("ready", &id, at.elapsed().as_millis() as i64, -1, "overlap");
+                        interrupts.enqueue(&id, &result);
+                    }
+                }
+            }
+        };
 
         if token_trace_on() {
             let dbg_tokens: Vec<String> = out
                 .tokens
                 .iter()
-                .map(|&t| format!("{}={:?}", t, tokenizer.decode(&[t]).unwrap_or_default()))
+                .map(|&t| format!("{}={:?}", t, inferlet::model::decode(&[t]).unwrap_or_default()))
                 .collect();
             println!(
                 "[dbg] step={} ntoks={} raw_slots={} tokens={:?}",
@@ -1640,7 +1574,7 @@ async fn run_inner_session(
                     println!(
                         "[dbg] staged final injected token {}={:?} for sampled resume",
                         tail,
-                        tokenizer.decode(&[tail]).unwrap_or_default()
+                        inferlet::model::decode(&[tail]).unwrap_or_default()
                     );
                 }
                 let _ = generator.accept(&[tail]);
@@ -1648,21 +1582,12 @@ async fn run_inner_session(
             continue;
         }
 
-        // Give the executor turns so spawned execute_call tasks make progress
-        // *during* decode (timers/sockets advance, completed ones finish). The
-        // forward pass above never yields, so without this the calls stay
-        // frozen until the trap — i.e. no async overlap. See `yield_to_reactor`.
-        if !pending.is_empty() {
-            yield_to_reactor().await;
-        }
-        poll_and_collect_ready(pending, interrupts, true);
-
         // Defer any checkpoint restart until the whole `out.tokens` batch is
         // processed (see the `Event::Call` arm), so we never drop trailing
         // tokens/events from this decode step mid-iteration.
         let mut want_checkpoint = false;
         for &tok in &out.tokens {
-            for event in parser.feed(tok, tokenizer) {
+            for event in parser.feed(tok) {
                 match event {
                     Event::Passthrough(t) => generated.push(t),
                     Event::EnterCriticalSection => interrupts.set_critical(true),
@@ -1670,15 +1595,13 @@ async fn run_inner_session(
                     Event::Call { id, code } => {
                         println!("[AsyncLM] dispatching id={id} code={code}");
                         trace("dispatch", &id, -1, generated.len() as i64, "");
-                        let task = wstd::runtime::spawn(execute_call(
-                            code,
-                            input.emulate_unknown_tools,
-                        ));
-                        pending.push(PendingCall {
-                            id,
-                            dispatched_at: Instant::now(),
-                            task,
-                        });
+                        let dispatched_at = Instant::now();
+                        let emulate = input.emulate_unknown_tools;
+                        pending.push(Box::pin(async move {
+                            let result = execute_call(code, emulate).await;
+                            (id, dispatched_at, result)
+                        }));
+                        dispatch_times.push(dispatched_at);
                         interrupts.set_critical(false);
                         if !input.disable_checkpointing {
                             // Paper-faithful path: snapshot a checkpoint so a
@@ -1704,9 +1627,9 @@ async fn run_inner_session(
                         // No simulated wait any more: estimate the wait from
                         // how long the longest still-in-flight call has
                         // already been running.
-                        let wait_ms = pending
+                        let wait_ms = dispatch_times
                             .iter()
-                            .map(|p| p.dispatched_at.elapsed().as_millis() as f64)
+                            .map(|t| t.elapsed().as_millis() as f64)
                             .fold(0.0f64, f64::max);
                         let checkpoint_available = checkpoint.latest.is_some();
                         let n = checkpoint
@@ -1739,25 +1662,22 @@ async fn run_inner_session(
                         );
 
                         let trap_start = Instant::now();
-                        // Block on the remaining in-flight calls. Awaiting the
-                        // task drives the reactor so the real fetch actually
-                        // completes here — polling alone would spin forever.
-                        for p in pending.drain(..) {
-                            let PendingCall {
-                                id,
-                                dispatched_at,
-                                task,
-                            } = p;
-                            let result = task.await;
+                        // Drive the remaining in-flight calls to completion.
+                        // `pending.next().await` advances every queued future on
+                        // the host event loop, yielding each as it finishes.
+                        while let Some((id, at, result)) = pending.next().await {
+                            if let Some(pos) = dispatch_times.iter().position(|t| *t == at) {
+                                dispatch_times.swap_remove(pos);
+                            }
                             println!(
                                 "[AsyncLM] id={} ready after {}ms (trap-await)",
                                 id,
-                                dispatched_at.elapsed().as_millis()
+                                at.elapsed().as_millis()
                             );
                             trace(
                                 "ready",
                                 &id,
-                                dispatched_at.elapsed().as_millis() as i64,
+                                at.elapsed().as_millis() as i64,
                                 -1,
                                 "trap-await",
                             );
@@ -1784,7 +1704,6 @@ async fn run_inner_session(
                                 }
                                 inject_frames(
                                     generator,
-                                    tokenizer,
                                     interrupts.drain(),
                                     "keep-inject",
                                     &mut next_step_flushes_injection,
@@ -1806,7 +1725,6 @@ async fn run_inner_session(
         if input.enable_midstream && !interrupts.in_critical_section && parser.is_clean() {
             inject_frames(
                 generator,
-                tokenizer,
                 interrupts.drain(),
                 "mid-inject",
                 &mut next_step_flushes_injection,
@@ -1828,13 +1746,7 @@ async fn main(input: Input) -> Result<String> {
         .max_steps
         .map(|n| n as usize)
         .unwrap_or_else(|| input.max_tokens.saturating_mul(4));
-    let model_name = runtime::models()
-        .first()
-        .cloned()
-        .ok_or("No models available")?;
-    let model = Model::load(&model_name)?;
-    let tokenizer = model.tokenizer();
-    let registry = CmlRegistry::new(&tokenizer);
+    let registry = CmlRegistry::new();
 
     println!(
         "[AsyncLM] call={:?} head={:?} end={:?} trap={:?} intr={:?}",
@@ -1857,8 +1769,8 @@ async fn main(input: Input) -> Result<String> {
     // `<|im_end|>`, `</think>`) often live above the regular BPE vocab.
     // Truncating to `vocabs().len()` would leave the tail implicitly masked
     // and the model could never produce its stop/end tokens.
-    let (sp_ids, _) = tokenizer.special_tokens();
-    let vocab_size = tokenizer.vocabs().0.len() as u32;
+    let (sp_ids, _) = inferlet::model::special_tokens();
+    let vocab_size = inferlet::model::vocabs().0.len() as u32;
     let mask_size = sp_ids
         .iter()
         .copied()
@@ -1866,19 +1778,20 @@ async fn main(input: Input) -> Result<String> {
         .map(|m| m + 1)
         .unwrap_or(vocab_size)
         .max(vocab_size);
-    let stops = chat::stop_tokens(&model);
+    let stops = chat::stop_tokens();
     let cost = CostModel {
         alpha_ns_per_tok2: input.alpha_recompute_ns_per_tok2,
         beta_ns_per_tok: input.beta_swap_ns_per_tok,
     };
 
-    let mut current_ctx = Context::new(&model)?;
+    let mut current_ctx = Context::new()?;
     current_ctx.system(&input.system).user(&input.prompt).cue();
 
     let mut max_tokens_remaining = input.max_tokens;
     let mut parser = Parser::new(&registry);
     let mut generated: Vec<u32> = Vec::new();
-    let mut pending: Vec<PendingCall> = Vec::new();
+    let mut pending: FuturesUnordered<CallFuture> = FuturesUnordered::new();
+    let mut dispatch_times: Vec<Instant> = Vec::new();
     let mut interrupts = InterruptManager::new();
     let mut checkpoint = CheckpointManager::new();
     let mut pending_inject: Option<PendingInjection> = None;
@@ -1904,11 +1817,11 @@ async fn main(input: Input) -> Result<String> {
             &mut generator,
             &mut parser,
             &mut pending,
+            &mut dispatch_times,
             &mut interrupts,
             &checkpoint,
             &mut generated,
             &input,
-            &tokenizer,
             &cost,
             &mut pending_inject,
             &mut step_count,
@@ -1938,7 +1851,7 @@ async fn main(input: Input) -> Result<String> {
                     max_tokens_remaining,
                 });
                 if let Some(old) = previous {
-                    let _ = Context::delete(&model, &old.name);
+                    let _ = Context::delete(&old.name);
                 }
                 println!(
                     "[AsyncLM] checkpoint saved name={} tokens_at={} budget={}",
@@ -1953,9 +1866,9 @@ async fn main(input: Input) -> Result<String> {
                     .latest
                     .take()
                     .ok_or_else(|| "trap classified Recompute without checkpoint".to_string())?;
-                match Context::open(&model, &cp.name) {
+                match Context::open(&cp.name) {
                     Ok(mut restored) => {
-                        let _ = Context::delete(&model, &cp.name);
+                        let _ = Context::delete(&cp.name);
                         restored.append(&cp.buffer_tokens);
                         current_ctx = restored;
                         max_tokens_remaining = cp.max_tokens_remaining;
@@ -1997,12 +1910,12 @@ async fn main(input: Input) -> Result<String> {
         );
     }
 
-    for ev in parser.flush(&tokenizer) {
+    for ev in parser.flush() {
         if let Event::Passthrough(t) = ev {
             generated.push(t);
         }
     }
 
     trace("run_end", "", t_ms() as i64, generated.len() as i64, "");
-    Ok(tokenizer.decode(&generated).unwrap_or_default())
+    Ok(inferlet::model::decode(&generated).unwrap_or_default())
 }

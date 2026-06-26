@@ -4,9 +4,9 @@
 //! All model and tokenizer operations access the cache directly without message passing.
 
 use std::path::PathBuf;
-use std::sync::{Arc, LazyLock};
+use std::sync::{Arc, OnceLock};
 
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 
 pub mod instruct;
 pub mod tokenizer;
@@ -14,21 +14,8 @@ pub mod tokenizer;
 use instruct::Instruct;
 use tokenizer::Tokenizer;
 
-/// Global cache for models (keyed by ModelId).
-static MODELS: LazyLock<boxcar::Vec<Arc<Model>>> = LazyLock::new(|| boxcar::Vec::new());
-
-/// Type alias for model identifiers.
-pub type ModelId = usize;
-
-/// Looks up a model by name and returns its model ID.
-pub fn get_model_id(model_name: &str) -> Option<ModelId> {
-    for (model_id, model) in MODELS.iter() {
-        if model.name() == model_name {
-            return Some(model_id);
-        }
-    }
-    None
-}
+/// The single model this engine serves. Set once at bootstrap.
+static MODEL: OnceLock<Arc<Model>> = OnceLock::new();
 
 pub fn register(
     name: String,
@@ -50,21 +37,18 @@ pub fn register(
         system_speculation_supported,
         enable_system_speculation,
     });
-    MODELS.push(model);
+    MODEL
+        .set(model)
+        .map_err(|_| anyhow!("a model is already registered; the engine serves exactly one model"))?;
     Ok(())
 }
 
-/// Returns a list of all registered model names.
-pub fn models() -> Vec<String> {
-    MODELS
-        .iter()
-        .map(|(_, model)| model.name().to_string())
-        .collect()
-}
-
-/// Gets cached model by model ID.
-pub fn get_model(model_id: ModelId) -> Option<&'static Arc<Model>> {
-    MODELS.get(model_id)
+/// Returns the single registered model. Panics if called before bootstrap
+/// registers the model.
+pub fn model() -> &'static Arc<Model> {
+    MODEL
+        .get()
+        .expect("model accessed before registration")
 }
 
 // =============================================================================

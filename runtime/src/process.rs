@@ -24,7 +24,6 @@ use crate::linker;
 use crate::program::ProgramName;
 use crate::server::{self, ClientId};
 use crate::service::{ServiceHandler, ServiceMap};
-use crate::workflow::WorkflowId;
 
 // =============================================================================
 // ProcessEvent
@@ -86,6 +85,11 @@ static SERVICES: LazyLock<ServiceMap<ProcessId, Message>> = LazyLock::new(Servic
 
 /// Admission semaphore. `None` = unlimited concurrency (no gating).
 static ADMISSION: OnceLock<Option<Arc<Semaphore>>> = OnceLock::new();
+
+/// Monotonic FCFS launch sequence. Assigned at `spawn` and carried into the
+/// context scheduler so eviction targets the newest-launched process and the
+/// restore queue serves the oldest-launched first.
+static LAUNCH_SEQ: AtomicU64 = AtomicU64::new(0);
 
 static PROCESS_COMPLETED: AtomicU64 = AtomicU64::new(0);
 static PROCESS_ADMISSION_WAIT_US: AtomicU64 = AtomicU64::new(0);
@@ -198,8 +202,6 @@ pub fn spawn(
     client_id: Option<ClientId>,
     capture_outputs: bool,
     result_tx: Option<oneshot::Sender<Result<String, String>>>,
-    workflow_id: Option<WorkflowId>,
-    token_budget: Option<usize>,
 ) -> Result<ProcessId> {
     let process = Process::new(
         username,
@@ -208,8 +210,7 @@ pub fn spawn(
         client_id,
         capture_outputs,
         result_tx,
-        workflow_id,
-        token_budget,
+        LAUNCH_SEQ.fetch_add(1, Relaxed),
     );
     let id = process.process_id;
 
@@ -339,8 +340,6 @@ struct Process {
     client_id: Option<ClientId>,
     capture_outputs: bool,
     output_buffer: VecDeque<ProcessEvent>,
-    /// Optional link to the workflow that spawned this process.
-    workflow_id: Option<WorkflowId>,
     /// Shared with the WASM task. Whoever takes it first (the run loop on
     /// normal completion, or an external terminate) delivers the result.
     result_tx: SharedResultTx,
@@ -355,8 +354,7 @@ impl Process {
         client_id: Option<ClientId>,
         capture_outputs: bool,
         result_tx: Option<oneshot::Sender<Result<String, String>>>,
-        workflow_id: Option<WorkflowId>,
-        token_budget: Option<usize>,
+        launch_seq: u64,
     ) -> Self {
         let process_id = Uuid::new_v4();
         let result_tx: SharedResultTx = Arc::new(Mutex::new(result_tx));
@@ -368,7 +366,7 @@ impl Process {
             input.clone(),
             capture_outputs,
             result_tx.clone(),
-            token_budget,
+            launch_seq,
         ));
 
         Process {
@@ -381,18 +379,12 @@ impl Process {
             client_id,
             capture_outputs,
             output_buffer: VecDeque::new(),
-            workflow_id,
             result_tx,
         }
     }
 
-    /// Deliver an event to the attached client and/or the parent workflow.
+    /// Deliver an event to the attached client.
     fn deliver_event(&mut self, event: ProcessEvent) {
-        // Forward to parent workflow (if any)
-        if let Some(wf_id) = self.workflow_id {
-            let _ = crate::workflow::forward_event(wf_id, self.process_id, event.clone());
-        }
-
         // Deliver to attached client
         if let Some(client_id) = self.client_id {
             if server::send_event(client_id, self.process_id, &event).is_err() {
@@ -435,7 +427,7 @@ impl Process {
         input: String,
         capture_outputs: bool,
         result_tx: SharedResultTx,
-        token_budget: Option<usize>,
+        launch_seq: u64,
     ) {
         // Admission control: wait for a permit before instantiating.
         // The permit is held for the entire WASM execution lifetime
@@ -458,7 +450,6 @@ impl Process {
                 username,
                 &program,
                 output,
-                token_budget,
             )
             .await
             .map_err(|e| e.to_string())?;
@@ -469,7 +460,7 @@ impl Process {
             // processes. Blocking inside the linker would serialize a saturated
             // second cohort behind the first one and leave the GPU idle.
             let context_register_start = Instant::now();
-            context::register_process(process_id, token_budget)
+            context::register_process(process_id, launch_seq)
                 .await
                 .map_err(|e| e.to_string())?;
             context_register_us = duration_us(context_register_start.elapsed());
@@ -536,7 +527,7 @@ impl Process {
             let _ = tx.send(result.clone());
         }
 
-        // Notify attached client / workflow
+        // Notify attached client
         match result {
             Ok(output) => self.deliver_event(ProcessEvent::Return(output)),
             Err(msg) => self.deliver_event(ProcessEvent::Error(msg)),

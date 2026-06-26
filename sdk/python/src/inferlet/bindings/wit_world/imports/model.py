@@ -10,72 +10,48 @@ import weakref
 from componentize_py_types import Result, Ok, Err, Some
 
 
-class Tokenizer:
+
+def name() -> str:
     """
-    Tokenizer resource for encoding and decoding text
+    The engine serves exactly one model; these are global functions over
+    that single bound model (no `model`/`tokenizer` resource handles).
+    Returns the name of the bound model
     """
+    raise NotImplementedError
+def architecture() -> str:
+    """
+    Returns the model architecture identifier (e.g. "gemma4", "qwen3_6")
+    """
+    raise NotImplementedError
+def default_system_speculation() -> bool:
+    """
+    Whether the bound model enables system speculation by default
+    """
+    raise NotImplementedError
+def encode(text: str) -> List[int]:
+    """
+    Converts input text into a list of token IDs
+    """
+    raise NotImplementedError
+def decode(tokens: List[int]) -> str:
+    """
+    Converts token IDs back into a decoded string
     
-    def encode(self, text: str) -> List[int]:
-        """
-        Converts input text into a list of token IDs
-        """
-        raise NotImplementedError
-    def decode(self, tokens: List[int]) -> str:
-        """
-        Converts token IDs back into a decoded string
-        
-        Raises: `wit_world.types.Err(wit_world.imports.str)`
-        """
-        raise NotImplementedError
-    def vocabs(self) -> Tuple[List[int], List[bytes]]:
-        """
-        Returns the tokenizer's vocabulary as a list of byte sequences (tokens)
-        """
-        raise NotImplementedError
-    def split_regex(self) -> str:
-        """
-        Returns the split regular expression used by the tokenizer
-        """
-        raise NotImplementedError
-    def special_tokens(self) -> Tuple[List[int], List[bytes]]:
-        """
-        Returns the special tokens recognized by the tokenizer
-        """
-        raise NotImplementedError
-    def __enter__(self) -> Self:
-        """Returns self"""
-        return self
-                                
-    def __exit__(self, exc_type: type[BaseException] | None, exc_value: BaseException | None, traceback: TracebackType | None) -> bool | None:
-        """
-        Release this resource.
-        """
-        raise NotImplementedError
-
-
-class Model:
+    Raises: `wit_world.types.Err(wit_world.imports.str)`
     """
-    Resource representing a specific model instance
+    raise NotImplementedError
+def vocabs() -> Tuple[List[int], List[bytes]]:
     """
-    
-    @classmethod
-    def load(cls, name: str) -> Self:
-        """
-        Raises: `wit_world.types.Err(wit_world.imports.str)`
-        """
-        raise NotImplementedError
-    def tokenizer(self) -> Tokenizer:
-        raise NotImplementedError
-    def default_system_speculation(self) -> bool:
-        raise NotImplementedError
-    def __enter__(self) -> Self:
-        """Returns self"""
-        return self
-                                
-    def __exit__(self, exc_type: type[BaseException] | None, exc_value: BaseException | None, traceback: TracebackType | None) -> bool | None:
-        """
-        Release this resource.
-        """
-        raise NotImplementedError
-
-
+    Returns the model's vocabulary as a list of byte sequences (tokens)
+    """
+    raise NotImplementedError
+def split_regex() -> str:
+    """
+    Returns the split regular expression used by the tokenizer
+    """
+    raise NotImplementedError
+def special_tokens() -> Tuple[List[int], List[bytes]]:
+    """
+    Returns the special tokens recognized by the model
+    """
+    raise NotImplementedError

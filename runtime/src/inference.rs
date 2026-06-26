@@ -19,7 +19,7 @@ use tokio::sync::oneshot;
 
 use crate::context::pagestore::PhysicalPageId;
 use crate::driver::{DriverId, SchedulerLimits};
-use crate::service::{ServiceArray, ServiceHandler};
+use crate::service::{Service, ServiceHandler};
 use anyhow::Result;
 use dashmap::DashMap;
 use scheduler::BatchScheduler;
@@ -132,10 +132,9 @@ pub struct PostDispatchStats {
 // Public API
 // =============================================================================
 
-static SERVICES: std::sync::LazyLock<ServiceArray<Message>> =
-    std::sync::LazyLock::new(ServiceArray::new);
+static SERVICE: Service<Message> = Service::new();
 
-/// Spawns a new inference service for a model.
+/// Spawns the inference service for the single model.
 ///
 /// `speculation_depth` is the per-context depth of pass-level
 /// speculative execution (`scheduler.speculation_depth` in toml).
@@ -144,9 +143,8 @@ pub async fn spawn(
     driver_indices: &[usize],
     page_size: u32,
     request_timeout_secs: u64,
-    batch_policy: String,
     speculation_depth: u32,
-) -> usize {
+) {
     // Fetch driver info before entering the sync closure.
     let driver_ids: Vec<DriverId> = driver_indices.to_vec();
     let mut driver_batch_limits = Vec::with_capacity(driver_indices.len());
@@ -157,16 +155,13 @@ pub async fn spawn(
         driver_batch_limits.push(info.scheduler_limits());
     }
 
-    let model_idx = SERVICES.len();
-    SERVICES
+    SERVICE
         .spawn(move || {
             InferenceService::new(
-                model_idx,
                 driver_ids,
                 driver_batch_limits,
                 page_size,
                 request_timeout_secs,
-                batch_policy,
                 speculation_depth as usize,
             )
         })
@@ -185,7 +180,6 @@ pub async fn spawn(
 /// full reserved range without re-pinning. Pass an empty vec when
 /// speculation is disabled or the caller has no extra pages.
 pub async fn submit(
-    model_idx: usize,
     request: pie_driver_abi::ForwardRequest,
     driver_idx: usize,
     physical_page_ids: Vec<PhysicalPageId>,
@@ -193,7 +187,6 @@ pub async fn submit(
     last_page_len: u32,
 ) -> Result<ForwardOutput> {
     let rx = submit_async(
-        model_idx,
         request,
         driver_idx,
         physical_page_ids,
@@ -207,7 +200,6 @@ pub async fn submit(
 }
 
 pub fn submit_async(
-    model_idx: usize,
     request: pie_driver_abi::ForwardRequest,
     driver_idx: usize,
     physical_page_ids: Vec<PhysicalPageId>,
@@ -217,8 +209,7 @@ pub fn submit_async(
     allow_pass_speculation: bool,
 ) -> Result<oneshot::Receiver<Result<ForwardOutput>>> {
     let (tx, rx) = oneshot::channel();
-    SERVICES.send(
-        model_idx,
+    SERVICE.send(
         Message::Submit {
             request,
             driver_idx,
@@ -264,18 +255,18 @@ impl From<pie_driver_abi::ForwardResponse> for ForwardOutput {
     }
 }
 
-/// Returns aggregated inference stats for a model (lock-free, non-blocking).
-pub async fn get_stats(model_idx: usize) -> InferenceStats {
+/// Returns aggregated inference stats for the model (lock-free, non-blocking).
+pub async fn get_stats() -> InferenceStats {
     let (tx, rx) = oneshot::channel();
-    let _ = SERVICES.send(model_idx, Message::GetStats { response: tx });
+    let _ = SERVICE.send(Message::GetStats { response: tx });
     rx.await.unwrap_or_default()
 }
 
 /// Drop any outstanding speculation chain for a ctx that's about to
 /// be destroyed. Fire-and-forget: the speculator just clears its
 /// per-device deque for this ctx; callers don't need confirmation.
-pub fn invalidate_speculation_for_ctx(model_idx: usize, ctx_id: crate::context::ContextId) {
-    let _ = SERVICES.send(model_idx, Message::InvalidateSpeculationForCtx { ctx_id });
+pub fn invalidate_speculation_for_ctx(ctx_id: crate::context::ContextId) {
+    let _ = SERVICE.send(Message::InvalidateSpeculationForCtx { ctx_id });
 }
 
 // =============================================================================
@@ -287,7 +278,6 @@ pub fn invalidate_speculation_for_ctx(model_idx: usize, ctx_id: crate::context::
 /// Routes requests to the appropriate per-driver `BatchScheduler`
 /// based on physical page affinity from the context service.
 struct InferenceService {
-    model_idx: usize,
     num_drivers: usize,
     schedulers: Vec<BatchScheduler>,
     scheduler_stats: Vec<Arc<SchedulerStats>>,
@@ -312,12 +302,10 @@ impl std::fmt::Debug for InferenceService {
 
 impl InferenceService {
     fn new(
-        model_idx: usize,
         driver_ids: Vec<DriverId>,
         driver_batch_limits: Vec<SchedulerLimits>,
         page_size: u32,
         request_timeout_secs: u64,
-        batch_policy: String,
         speculation_depth: usize,
     ) -> Self {
         let num_drivers = driver_ids.len();
@@ -332,7 +320,6 @@ impl InferenceService {
                     page_size,
                     limits,
                     request_timeout_secs,
-                    batch_policy.clone(),
                 )
             })
             .collect();
@@ -342,10 +329,9 @@ impl InferenceService {
         let staged_batch: Vec<StagedBatchMap> = (0..num_drivers)
             .map(|_| Arc::new(DashMap::new()))
             .collect();
-        speculator::register_model(model_idx, &staged_batch, speculation_depth);
+        speculator::register_model(&staged_batch, speculation_depth);
 
         InferenceService {
-            model_idx,
             num_drivers,
             schedulers,
             scheduler_stats,
@@ -633,7 +619,6 @@ impl ServiceHandler for InferenceService {
                     response,
                     scheduler_handle,
                     staged_batch_arc,
-                    self.model_idx,
                     request,
                     physical_page_ids,
                     all_pages,
@@ -647,7 +632,7 @@ impl ServiceHandler for InferenceService {
                 let _ = response.send(self.aggregate_stats());
             }
             Message::InvalidateSpeculationForCtx { ctx_id } => {
-                speculator::invalidate_ctx(self.model_idx, ctx_id);
+                speculator::invalidate_ctx(ctx_id);
             }
         }
     }

@@ -38,7 +38,6 @@ BENCH_INFERLET = "text-completion-bench"
 EMBEDDED_CLI_DRIVERS: set[str] = {
     "cuda_native",
     "portable",
-    "metal",
     "dummy",
     "vllm",
     "sglang",
@@ -115,16 +114,6 @@ def build_config(args: argparse.Namespace):
         if args.enable_system_speculation:
             driver_options["enable_system_speculation"] = True
     elif args.driver == "portable":
-        driver_options = {
-            "max_forward_tokens": args.max_forward_tokens,
-            "max_forward_requests": args.max_forward_requests,
-            "total_pages": args.kv_pages,
-            "kv_cache_dtype": args.kv_cache_dtype,
-        }
-    elif args.driver == "metal":
-        # Apple Silicon MLX/Metal driver. MetalDriverOptions mirrors
-        # PortableDriverOptions (same embedded ABI + page geometry), so the
-        # apples-to-apples bench vs portable+Metal uses identical knobs.
         driver_options = {
             "max_forward_tokens": args.max_forward_tokens,
             "max_forward_requests": args.max_forward_requests,
@@ -208,9 +197,7 @@ def build_config(args: argparse.Namespace):
         max_concurrent_processes = None  # serializer drops field → unlimited
     else:
         max_concurrent_processes = args.concurrency
-    scheduler = args.batch_policy or ("greedy" if args.mode == "latency" else "adaptive")
     scheduler_kwargs = {
-        "batch_policy": scheduler,
         "default_token_limit": args.default_token_limit,
         "default_endowment_pages": args.default_endowment_pages,
         "admission_oversubscription_factor": args.admission_oversubscription_factor,
@@ -252,13 +239,8 @@ def build_config(args: argparse.Namespace):
     )
     config_blob = {
         "driver": args.driver,
-        "scheduler": scheduler,
         **driver_options,
     }
-    if args.token_budget is not None:
-        config_blob["token budget"] = args.token_budget
-    elif args.auto_token_budget:
-        config_blob["token budget"] = args.max_tokens + args.token_budget_prompt_margin
     if args.speculation_depth is not None:
         # Surface for the summary's "spec chain yield" derived stat —
         # yield = hits / (attempted × depth).
@@ -471,11 +453,7 @@ async def run(args: argparse.Namespace):
                 inp["prompt_tokens"] = prompt_token_ids[i]
             start = time.perf_counter()
             try:
-                token_budget = args.token_budget
-                if token_budget is None and args.auto_token_budget:
-                    budget_tokens = args.max_tokens if max_tokens is None else max_tokens
-                    token_budget = budget_tokens + args.token_budget_prompt_margin
-                proc = await client.launch_process(pkg, input=inp, token_budget=token_budget)
+                proc = await client.launch_process(pkg, input=inp)
                 return i, start, proc
             except Exception as e:
                 return RequestResult(False, time.perf_counter() - start, 0, error=f"{type(e).__name__}: {e}")
@@ -517,13 +495,7 @@ async def run(args: argparse.Namespace):
                 inp["prompt_tokens_batch"] = [prompt_token_ids[i] for i in indices]
             start = time.perf_counter()
             try:
-                token_budget = args.token_budget
-                if token_budget is None and args.auto_token_budget:
-                    budget_tokens = args.max_tokens if max_tokens is None else max_tokens
-                    token_budget = (
-                        budget_tokens + args.token_budget_prompt_margin
-                    ) * max(1, len(indices))
-                proc = await client.launch_process(pkg, input=inp, token_budget=token_budget)
+                proc = await client.launch_process(pkg, input=inp)
                 if args.defer_start:
                     while True:
                         ev, msg = await asyncio.wait_for(
@@ -790,7 +762,7 @@ def build_parser() -> argparse.ArgumentParser:
     for sp in p._subparsers._group_actions[0].choices.values():
         sp.add_argument("--device", default="cuda:0")
         sp.add_argument("--driver", default="cuda_native",
-                        choices=["cuda_native", "portable", "metal", "vllm", "sglang", "tensorrt_llm", "dummy"])
+                        choices=["cuda_native", "portable", "vllm", "sglang", "tensorrt_llm", "dummy"])
         sp.add_argument("--default-token-limit", type=int, default=200_000)
         sp.add_argument("--default-endowment-pages", type=int, default=64)
         sp.add_argument("--admission-oversubscription-factor", type=float, default=4.0)
@@ -812,9 +784,6 @@ def build_parser() -> argparse.ArgumentParser:
         )
         sp.add_argument("--portable-n-gpu-layers", type=int, default=-1)
         sp.add_argument("--worker-threads", type=int, default=None)
-        sp.add_argument("--token-budget", type=int, default=None)
-        sp.add_argument("--auto-token-budget", action=argparse.BooleanOptionalAction, default=False)
-        sp.add_argument("--token-budget-prompt-margin", type=int, default=64)
         sp.add_argument(
             "--speculation-depth",
             type=int,
@@ -877,13 +846,6 @@ def build_parser() -> argparse.ArgumentParser:
                  "Sets the driver config [model].enable_system_speculation; the "
                  "runtime drives the auto-drafter only when this is on. Default "
                  "off (latency-regime feature).",
-        )
-        sp.add_argument(
-            "--batch-policy",
-            default=None,
-            choices=["adaptive", "eager", "greedy"],
-            help="Override scheduler.batch_policy. Default: greedy (latency) "
-                 "or adaptive (tput).",
         )
         sp.add_argument("--vllm-attention-backend", default=None)
         sp.add_argument("--vllm-max-num-seqs", type=int, default=None)

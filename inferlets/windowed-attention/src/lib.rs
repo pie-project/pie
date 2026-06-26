@@ -10,8 +10,6 @@
 
 use inferlet::{
     Context, Result,
-    model::Model,
-    runtime,
     sample::Sampler,
 };
 use serde::Deserialize;
@@ -44,16 +42,13 @@ fn build_window_mask(seq_len: u32, window_size: u32) -> Vec<u32> {
 #[inferlet::main]
 async fn main(input: Input) -> Result<String> {
     let start = Instant::now();
-    let models = runtime::models();
-    let model = Model::load(models.first().ok_or("No models available")?)?;
-
-    let mut ctx = Context::new(&model)?;
-    let stop_tokens = inferlet::chat::stop_tokens(&model);
+    let mut ctx = Context::new()?;
+    let stop_tokens = inferlet::chat::stop_tokens();
 
     let mut prompt: Vec<u32> = Vec::new();
-    prompt.extend(inferlet::chat::system(&model, "You are a helpful assistant."));
-    prompt.extend(inferlet::chat::user(&model, &input.prompt));
-    prompt.extend(inferlet::chat::cue(&model));
+    prompt.extend(inferlet::chat::system("You are a helpful assistant."));
+    prompt.extend(inferlet::chat::user(&input.prompt));
+    prompt.extend(inferlet::chat::cue());
 
     println!(
         "--- Windowed Attention (window={} tokens, page_size={}) ---",
@@ -94,8 +89,7 @@ async fn main(input: Input) -> Result<String> {
         pending = vec![token];
     }
 
-    let tokenizer = model.tokenizer();
-    let text = tokenizer.decode(&generated_tokens)?;
+    let text = inferlet::model::decode(&generated_tokens)?;
     println!("Generated {} tokens in {:?}", generated_tokens.len(), start.elapsed());
     println!("Output:\n{}", text);
 

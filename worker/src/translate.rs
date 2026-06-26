@@ -36,21 +36,20 @@ pub fn build(
     user: &config::Config,
     handshakes: &[ModelHandshake],
 ) -> Result<pie::bootstrap::Config> {
-    if handshakes.len() != user.models.len() {
+    if handshakes.len() != 1 {
         anyhow::bail!(
-            "internal: {} models in TOML but {} handshake bundles",
-            user.models.len(),
+            "internal: expected exactly one handshake bundle for the single \
+             model, got {}",
             handshakes.len()
         );
     }
-    for (m, hs) in user.models.iter().zip(handshakes.iter()) {
-        if hs.groups.is_empty() {
-            anyhow::bail!(
-                "internal: model {:?} has zero group handshakes; \
-                 expected at least one driver per model",
-                m.name,
-            );
-        }
+    let handshake = &handshakes[0];
+    if handshake.groups.is_empty() {
+        anyhow::bail!(
+            "internal: model {:?} has zero group handshakes; \
+             expected at least one driver per model",
+            user.model.name,
+        );
     }
 
     let pie_home = pie::path::get_pie_home();
@@ -58,12 +57,7 @@ pub fn build(
     let log_dir = Some(pie_home.join("logs"));
     let auth_dir = pie_home.join("auth");
 
-    let models = user
-        .models
-        .iter()
-        .zip(handshakes.iter())
-        .map(|(m, hs)| build_model(m, hs))
-        .collect();
+    let model = build_model(&user.model, handshake);
 
     Ok(pie::bootstrap::Config {
         host: user.server.host.clone(),
@@ -93,7 +87,7 @@ pub fn build(
             network_allowed_hosts: user.runtime.network_allowed_hosts.clone(),
             max_upload_mb: user.runtime.max_upload_mb,
         },
-        models,
+        model,
         // The `bootstrap` lib (Seam 2) installs the global tracing subscriber;
         // the runtime must NOT re-init it (double global-init panics on boot).
         skip_tracing: true,
@@ -150,11 +144,7 @@ fn build_model(m: &config::ModelConfig, hs: &ModelHandshake) -> pie::bootstrap::
         enable_system_speculation: hs.groups.iter().all(|g| g.caps.enable_system_speculation),
         drivers,
         scheduler: pie::bootstrap::SchedulerConfig {
-            batch_policy: m.scheduler.batch_policy.clone(),
             request_timeout_secs: m.scheduler.request_timeout_secs,
-            default_token_limit: m.scheduler.default_token_limit,
-            default_endowment_pages: m.scheduler.default_endowment_pages,
-            admission_oversubscription_factor: m.scheduler.admission_oversubscription_factor,
             restore_pause_at_utilization: m.scheduler.restore_pause_at_utilization,
             speculation_depth: m.scheduler.speculation_depth,
         },
@@ -196,7 +186,7 @@ mod tests {
     #[test]
     fn translates_minimal_config() {
         let toml_text = r#"
-[[model]]
+[model]
 name = "default"
 hf_repo = "Qwen/Qwen3-0.6B"
 
@@ -216,8 +206,7 @@ device = ["cpu"]
         let cfg = build(&user, &handshakes).unwrap();
         assert_eq!(cfg.host, "127.0.0.1");
         assert_eq!(cfg.port, 8080);
-        assert_eq!(cfg.models.len(), 1);
-        let m = &cfg.models[0];
+        let m = &cfg.model;
         assert_eq!(m.name, "default");
         assert_eq!(m.arch_name, "qwen3");
         assert_eq!(m.kv_page_size, 32);
@@ -228,13 +217,12 @@ device = ["cpu"]
         assert_eq!(m.drivers.len(), 1);
         assert_eq!(m.drivers[0].total_pages, 1024);
         assert_eq!(m.drivers[0].limits.max_page_refs, 262144);
-        assert_eq!(m.scheduler.batch_policy, "adaptive");
     }
 
     #[test]
-    fn translates_dp_two_model() {
+    fn translates_dp_two_groups() {
         let toml_text = r#"
-[[model]]
+[model]
 name = "default"
 hf_repo = "Qwen/Qwen3-0.6B"
 
@@ -260,7 +248,7 @@ device = ["cuda:0", "cuda:1"]
         }];
 
         let cfg = build(&user, &handshakes).unwrap();
-        let m = &cfg.models[0];
+        let m = &cfg.model;
         assert_eq!(m.drivers.len(), 2);
         assert_eq!(m.drivers[0].total_pages, 1024);
         assert_eq!(m.drivers[1].total_pages, 2048);
@@ -270,7 +258,7 @@ device = ["cuda:0", "cuda:1"]
     fn handshake_count_must_match() {
         let user: config::Config = toml::from_str(
             r#"
-[[model]]
+[model]
 name = "a"
 hf_repo = "x"
 [model.driver]
@@ -280,14 +268,17 @@ device = ["cpu"]
         )
         .unwrap();
         let err = build(&user, &[]).unwrap_err().to_string();
-        assert!(err.contains("1 models in TOML but 0 handshake bundles"));
+        assert!(
+            err.contains("expected exactly one handshake bundle"),
+            "got: {err}"
+        );
     }
 
     #[test]
     fn empty_groups_rejected() {
         let user: config::Config = toml::from_str(
             r#"
-[[model]]
+[model]
 name = "a"
 hf_repo = "x"
 [model.driver]

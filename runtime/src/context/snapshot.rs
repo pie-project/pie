@@ -163,6 +163,7 @@ impl ContextManager {
                 } else {
                     None
                 };
+                let launch_seq = mgr.processes.get(&owner).map(|p| p.launch_seq).unwrap_or(0);
                 mgr.contexts.insert(
                     new_id,
                     Context {
@@ -180,12 +181,10 @@ impl ContextManager {
                         state: State::Active, // may become Pinned below
                         pending_suspend: false,
                         last_access: Instant::now(),
-                        bid: 0.0,
+                        launch_seq,
                         cpu_working_pages: Vec::new(),
                         deferred_ops: Vec::new(),
                         pending_replay: false,
-                        defaulted: false,
-                        cached_effective_pages: 0.0,
                     },
                 );
 
@@ -334,12 +333,13 @@ impl ContextManager {
                 state: snapshot_state,
                 pending_suspend: false,
                 last_access: Instant::now(),
-                bid: 0.0,
+                // Named snapshot (no owning process): lowest FCFS priority —
+                // `u64::MAX` means newest-launched, so it is the first eviction
+                // victim and never preempts a live process.
+                launch_seq: u64::MAX,
                 cpu_working_pages: Vec::new(),
                 deferred_ops: Vec::new(),
                 pending_replay: false,
-                defaulted: false,
-                cached_effective_pages: 0.0,
             },
         );
         self.snapshots.insert((username, name.clone()), snapshot_id);
@@ -573,6 +573,7 @@ impl ContextManager {
         }
 
         let new_id = self.next_id();
+        let owner_seq = self.processes.get(&owner).map(|p| p.launch_seq).unwrap_or(0);
         self.contexts.insert(
             new_id,
             Context {
@@ -590,12 +591,10 @@ impl ContextManager {
                 state: State::Active,
                 pending_suspend: false,
                 last_access: Instant::now(),
-                bid: 0.0,
+                launch_seq: owner_seq,
                 cpu_working_pages: Vec::new(),
                 deferred_ops: Vec::new(),
                 pending_replay: false,
-                defaulted: false,
-                cached_effective_pages: 0.0,
             },
         );
 

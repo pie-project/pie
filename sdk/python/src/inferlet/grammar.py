@@ -20,7 +20,7 @@ Built-in implementors:
 * :class:`Ebnf`       — custom EBNF grammar
 
 User code can implement the :class:`Schema` protocol on any class with a
-``build_constraint(model)`` method — duck-typed, no inheritance required.
+``build_constraint()`` method — duck-typed, no inheritance required.
 
 For custom logic that isn't a grammar (banned tokens, learned constraints,
 etc.), implement the :class:`Constraint` protocol and pass it directly.
@@ -33,8 +33,6 @@ from typing import Protocol, runtime_checkable
 
 from wit_world.imports.inference import Grammar as _Grammar
 from wit_world.imports.inference import Matcher as _Matcher
-
-from .model import Model, Tokenizer
 
 
 # =============================================================================
@@ -88,8 +86,8 @@ class Matcher:
 
     __slots__ = ("_handle",)
 
-    def __init__(self, grammar: Grammar, tokenizer: Tokenizer) -> None:
-        self._handle = _Matcher(grammar._handle, tokenizer._handle)
+    def __init__(self, grammar: Grammar) -> None:
+        self._handle = _Matcher(grammar._handle)
 
     @classmethod
     def _from_handle(cls, handle: _Matcher) -> Matcher:
@@ -155,29 +153,29 @@ class GrammarConstraint:
         self._matcher = matcher
 
     @classmethod
-    def from_grammar(cls, grammar: Grammar, model: Model) -> GrammarConstraint:
+    def from_grammar(cls, grammar: Grammar) -> GrammarConstraint:
         """Build from a pre-compiled grammar (compile once, reuse)."""
-        return cls(Matcher(grammar, model.tokenizer()))
+        return cls(Matcher(grammar))
 
     @classmethod
-    def from_json_schema(cls, schema: str, model: Model) -> GrammarConstraint:
+    def from_json_schema(cls, schema: str) -> GrammarConstraint:
         """Build from a JSON Schema string."""
-        return cls.from_grammar(Grammar.from_json_schema(schema), model)
+        return cls.from_grammar(Grammar.from_json_schema(schema))
 
     @classmethod
-    def json(cls, model: Model) -> GrammarConstraint:
+    def json(cls) -> GrammarConstraint:
         """Build a constraint that accepts any valid JSON."""
-        return cls.from_grammar(Grammar.json(), model)
+        return cls.from_grammar(Grammar.json())
 
     @classmethod
-    def from_regex(cls, pattern: str, model: Model) -> GrammarConstraint:
+    def from_regex(cls, pattern: str) -> GrammarConstraint:
         """Build from a regular expression pattern."""
-        return cls.from_grammar(Grammar.from_regex(pattern), model)
+        return cls.from_grammar(Grammar.from_regex(pattern))
 
     @classmethod
-    def from_ebnf(cls, ebnf: str, model: Model) -> GrammarConstraint:
+    def from_ebnf(cls, ebnf: str) -> GrammarConstraint:
         """Build from an EBNF grammar string."""
-        return cls.from_grammar(Grammar.from_ebnf(ebnf), model)
+        return cls.from_grammar(Grammar.from_ebnf(ebnf))
 
     def step(self, accepted: list[int]) -> list[int]:
         if accepted:
@@ -203,14 +201,14 @@ class Schema(Protocol):
 
         class MyLark:
             def __init__(self, source): self.source = source
-            def build_constraint(self, model):
+            def build_constraint(self):
                 g = compile_lark_to_pie_grammar(self.source)
-                return GrammarConstraint.from_grammar(g, model)
+                return GrammarConstraint.from_grammar(g)
 
         await ctx.generate(Sampler.argmax(), constrain=MyLark(grammar)).collect_text()
     """
 
-    def build_constraint(self, model: Model) -> GrammarConstraint:
+    def build_constraint(self) -> GrammarConstraint:
         """Compile this schema into a :class:`GrammarConstraint`."""
         ...
 
@@ -221,16 +219,16 @@ class JsonSchema:
 
     schema: str
 
-    def build_constraint(self, model: Model) -> GrammarConstraint:
-        return GrammarConstraint.from_json_schema(self.schema, model)
+    def build_constraint(self) -> GrammarConstraint:
+        return GrammarConstraint.from_json_schema(self.schema)
 
 
 @dataclass(frozen=True, slots=True)
 class AnyJson:
     """Any valid JSON value."""
 
-    def build_constraint(self, model: Model) -> GrammarConstraint:
-        return GrammarConstraint.json(model)
+    def build_constraint(self) -> GrammarConstraint:
+        return GrammarConstraint.json()
 
 
 @dataclass(frozen=True, slots=True)
@@ -239,8 +237,8 @@ class Regex:
 
     pattern: str
 
-    def build_constraint(self, model: Model) -> GrammarConstraint:
-        return GrammarConstraint.from_regex(self.pattern, model)
+    def build_constraint(self) -> GrammarConstraint:
+        return GrammarConstraint.from_regex(self.pattern)
 
 
 @dataclass(frozen=True, slots=True)
@@ -249,8 +247,8 @@ class Ebnf:
 
     source: str
 
-    def build_constraint(self, model: Model) -> GrammarConstraint:
-        return GrammarConstraint.from_ebnf(self.source, model)
+    def build_constraint(self) -> GrammarConstraint:
+        return GrammarConstraint.from_ebnf(self.source)
 
 
 # =============================================================================

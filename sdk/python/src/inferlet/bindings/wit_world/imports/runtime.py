@@ -26,8 +26,3 @@ def username() -> str:
     Returns the username of the user who invoked the inferlet
     """
     raise NotImplementedError
-def models() -> List[str]:
-    """
-    Get a list of all available model names
-    """
-    raise NotImplementedError

@@ -1,11 +1,10 @@
 /** @module Interface pie:core/inference **/
-export type Pollable = import('./wasi-io-poll.js').Pollable;
 export type Error = import('./pie-core-types.js').Error;
 export type Context = import('./pie-core-context.js').Context;
-export type Model = import('./pie-core-model.js').Model;
-export type Tokenizer = import('./pie-core-model.js').Tokenizer;
 export type Adapter = import('./pie-core-adapter.js').Adapter;
 export type PageId = import('./pie-core-context.js').PageId;
+export type Image = import('./pie-core-media.js').Image;
+export type Audio = import('./pie-core-media.js').Audio;
 /**
  * binary run-length encoding
  */
@@ -145,14 +144,31 @@ export interface Output {
 }
 
 export class ForwardPass {
-  constructor(model: Model)
+  constructor()
   context(context: Context): void;
   inputTokens(tokens: Uint32Array, positions: Uint32Array): void;
+  /**
+  * Splice an encoded visual span (image or video clip) at sequence
+  * position `anchor`. The driver runs the vision encoder and scatters
+  * the projected rows into the hidden state for this span. See
+  * MULTIMODAL.md.
+  */
+  inputImage(image: Image, anchor: number): void;
+  /**
+  * Splice an encoded audio clip at sequence position `anchor`. The
+  * driver runs the gemma4_audio encoder and scatters the projected
+  * soft-token rows into the hidden state. See audio_frontend.md.
+  */
+  inputAudio(audio: Audio, anchor: number): void;
   inputSpeculativeTokens(tokens: Uint32Array, positions: Uint32Array): void;
   /**
   * enabled by default
   */
   outputSpeculativeTokens(flag: boolean): void;
+  /**
+  * Controls runtime pass-level speculation for this execute only.
+  */
+  passSpeculation(flag: boolean): void;
   /**
   * if not provided, fallback to causal mask
   */
@@ -163,19 +179,7 @@ export class ForwardPass {
   logitMask(mask: Brle): void;
   sampler(indices: Uint32Array, sampler: Sampler): void;
   adapter(adapter: Adapter): void;
-  execute(): FutureOutput;
-}
-
-export class FutureOutput {
-  /**
-   * This type does not have a public constructor.
-   */
-  private constructor();
-  /**
-  * Returns a pollable object to check when the result is ready
-  */
-  pollable(): Pollable;
-  get(): Output | undefined;
+  execute(): Promise<Output>;
 }
 
 export class Grammar {
@@ -208,9 +212,9 @@ export class Grammar {
 
 export class Matcher {
   /**
-  * Create a new matcher from a grammar and tokenizer.
+  * Create a new matcher from a grammar.
   */
-  constructor(grammar: Grammar, tokenizer: Tokenizer)
+  constructor(grammar: Grammar)
   /**
   * Accept one or more decoded tokens, advancing the matcher state.
   * Returns an error if any token violates the grammar.

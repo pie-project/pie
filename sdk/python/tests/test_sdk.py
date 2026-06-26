@@ -14,16 +14,14 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 
 class TestModel:
-    def test_load(self):
-        from inferlet import Model
-        m = Model.load("test-model")
-        assert m._handle is not None
+    def test_name(self):
+        from inferlet import model
+        assert model.name() == "mock-model"
 
-    def test_tokenizer_encode_decode(self):
-        from inferlet import Model
-        tok = Model.load("test-model").tokenizer()
-        assert tok.encode("Hi") == [72, 105]
-        assert tok.decode([72, 105]) == "Hi"
+    def test_encode_decode(self):
+        from inferlet import model
+        assert model.encode("Hi") == [72, 105]
+        assert model.decode([72, 105]) == "Hi"
 
 
 # =============================================================================
@@ -71,14 +69,16 @@ class TestSampler:
 
 class TestProbes:
     def test_logits_dataclass(self):
-        from inferlet import Logits
         from wit_world.imports.inference import Sampler_RawLogits
+
+        from inferlet import Logits
         p = Logits()
         assert isinstance(p._to_wit(), Sampler_RawLogits)
 
     def test_distribution_dataclass(self):
-        from inferlet import Distribution
         from wit_world.imports.inference import Sampler_Dist
+
+        from inferlet import Distribution
         p = Distribution(temperature=1.0, k=8)
         assert p.temperature == 1.0
         assert p.k == 8
@@ -87,8 +87,9 @@ class TestProbes:
         assert wit.value == (1.0, 8)
 
     def test_logprob_dataclass(self):
-        from inferlet import Logprob
         from wit_world.imports.inference import Sampler_Logprob
+
+        from inferlet import Logprob
         p = Logprob(token=42)
         assert p.token == 42
         wit = p._to_wit()
@@ -96,8 +97,9 @@ class TestProbes:
         assert wit.value == 42
 
     def test_logprobs_dataclass(self):
-        from inferlet import Logprobs
         from wit_world.imports.inference import Sampler_Logprobs
+
+        from inferlet import Logprobs
         p = Logprobs(tokens=(7, 11, 13))
         wit = p._to_wit()
         assert isinstance(wit, Sampler_Logprobs)
@@ -116,8 +118,9 @@ class TestProbes:
         assert Logprobs().tokens == ()
 
     def test_entropy_dataclass(self):
-        from inferlet import Entropy
         from wit_world.imports.inference import Sampler_Entropy
+
+        from inferlet import Entropy
         p = Entropy()
         assert isinstance(p._to_wit(), Sampler_Entropy)
 
@@ -129,67 +132,43 @@ class TestProbes:
 
 class TestContext:
     def test_create(self):
-        from inferlet import Context, Model
-        ctx = Context(Model.load("test-model"))
+        from inferlet import Context
+        ctx = Context()
         assert ctx._handle is not None
 
     def test_chat_fillers_chain(self):
         """system / user / cue return self for chaining."""
-        from inferlet import Context, Model
-        ctx = Context(Model.load("test-model"))
+        from inferlet import Context
+        ctx = Context()
         result = ctx.system("Hello").user("World").cue()
         assert result is ctx
 
     def test_append_raw_tokens(self):
-        from inferlet import Context, Model
-        ctx = Context(Model.load("test-model"))
+        from inferlet import Context
+        ctx = Context()
         ctx.append([1, 2, 3])
         assert ctx.buffer() == [1, 2, 3]
 
     def test_fork(self):
-        from inferlet import Context, Model
-        ctx = Context(Model.load("test-model"))
+        from inferlet import Context
+        ctx = Context()
         ctx.append([1, 2, 3])
         forked = ctx.fork()
         assert forked._handle is not None
 
     def test_release_via_context_manager(self):
-        from inferlet import Context, Model
-        with Context(Model.load("test-model")) as ctx:
+        from inferlet import Context
+        with Context() as ctx:
             ctx.append([42])
             assert ctx.buffer() == [42]
 
     def test_no_equip_tools_method(self):
         """The old equip_tools / answer_tool methods are gone — tools live
         in the `inferlet.tools` module now."""
-        from inferlet import Context, Model
-        ctx = Context(Model.load("test-model"))
+        from inferlet import Context
+        ctx = Context()
         assert not hasattr(ctx, "equip_tools")
         assert not hasattr(ctx, "answer_tool")
-
-    def test_idle_context_manager(self):
-        """`with ctx.idle():` drops bid to 0, restores on exit."""
-        from inferlet import Context, Model
-
-        class _RecordingHandle:
-            """Wrap the FakeContext handle, recording bid() calls."""
-            def __init__(self, inner):
-                self._inner = inner
-                self.bids: list[float] = []
-
-            def bid(self, value: float) -> None:
-                self.bids.append(value)
-
-            def __getattr__(self, name):
-                return getattr(self._inner, name)
-
-        ctx = Context(Model.load("test-model"))
-        ctx._handle = _RecordingHandle(ctx._handle)
-        with ctx.idle():
-            assert ctx._handle.bids[-1] == 0.0
-        # On exit a non-zero bid is restored (saved bid >= 0).
-        assert len(ctx._handle.bids) == 2
-        assert ctx._handle.bids[-1] >= 0.0
 
 
 # =============================================================================
@@ -199,22 +178,22 @@ class TestContext:
 
 class TestForward:
     def test_create_via_context(self):
-        from inferlet import Context, Model
-        ctx = Context(Model.load("test-model"))
+        from inferlet import Context
+        ctx = Context()
         fwd = ctx.forward()
         assert fwd._ctx is ctx
         assert fwd.start_position() == ctx.seq_len
 
     def test_input_appends(self):
-        from inferlet import Context, Model
-        ctx = Context(Model.load("test-model"))
+        from inferlet import Context
+        ctx = Context()
         fwd = ctx.forward()
         fwd.input([1, 2, 3])
         assert fwd._auto_inputs == [1, 2, 3]
 
     def test_sample_returns_handle(self):
-        from inferlet import Context, Model, Sampler
-        ctx = Context(Model.load("test-model"))
+        from inferlet import Context, Sampler
+        ctx = Context()
         fwd = ctx.forward()
         fwd.input([1, 2, 3])
         h = fwd.sample([2], Sampler.argmax())
@@ -222,8 +201,8 @@ class TestForward:
         assert h.arity == 1
 
     def test_probe_returns_typed_handle(self):
-        from inferlet import Context, Distribution, Logits, Model
-        ctx = Context(Model.load("test-model"))
+        from inferlet import Context, Distribution, Logits
+        ctx = Context()
         fwd = ctx.forward()
         h_dist = fwd.probe(0, Distribution(temperature=1.0, k=8))
         h_logits = fwd.probe(0, Logits())
@@ -238,9 +217,11 @@ class TestForward:
         certainly a programming error — raise rather than silently
         returning an empty Output."""
         import asyncio
+
         import pytest
-        from inferlet import Context, Model
-        ctx = Context(Model.load("test-model"))
+
+        from inferlet import Context
+        ctx = Context()
         fwd = ctx.forward()
         with pytest.raises(ValueError, match="no inputs and no slots"):
             asyncio.run(fwd.execute())
@@ -248,8 +229,8 @@ class TestForward:
     def test_multi_arity_sample_advances_slot_correctly(self):
         """A multi-arity sampler attaches len(indices) Token slots, so the
         next slot index must advance by that count — not by 1."""
-        from inferlet import Context, Distribution, Model, Sampler
-        ctx = Context(Model.load("test-model"))
+        from inferlet import Context, Distribution, Sampler
+        ctx = Context()
         fwd = ctx.forward()
         h_multi = fwd.sample([0, 1, 2], Sampler.argmax())
         h_probe = fwd.probe(0, Distribution(temperature=1.0, k=0))
@@ -266,15 +247,15 @@ class TestForward:
 
 class TestGenerator:
     def test_generate_returns_generator(self):
-        from inferlet import Context, Generator, Model, Sampler
-        ctx = Context(Model.load("test-model"))
+        from inferlet import Context, Generator, Sampler
+        ctx = Context()
         ctx.user("Hi")
         g = ctx.generate(Sampler.argmax(), max_tokens=64, auto_flush=False)
         assert isinstance(g, Generator)
 
     def test_chain_method(self):
-        from inferlet import Context, Generator, Model, Sampler
-        ctx = Context(Model.load("test-model"))
+        from inferlet import Context, Generator, Sampler
+        ctx = Context()
         g = (
             ctx.generate(Sampler.argmax(), auto_flush=False)
             .max_tokens(128)
@@ -288,10 +269,9 @@ class TestGenerator:
         from inferlet import (
             Context,
             JsonSchema,
-            Model,
             Sampler,
         )
-        ctx = Context(Model.load("test-model"))
+        ctx = Context()
         g = ctx.generate(
             Sampler.argmax(),
             constrain=JsonSchema('{"type":"object"}'),
@@ -300,8 +280,8 @@ class TestGenerator:
         assert len(g._constraints) == 1
 
     def test_constrain_with_list_composes(self):
-        from inferlet import AnyJson, Context, Ebnf, Model, Sampler
-        ctx = Context(Model.load("test-model"))
+        from inferlet import AnyJson, Context, Ebnf, Sampler
+        ctx = Context()
         g = ctx.generate(
             Sampler.argmax(),
             constrain=[AnyJson(), Ebnf('root ::= "x"')],
@@ -310,9 +290,10 @@ class TestGenerator:
         assert len(g._constraints) == 2
 
     def test_speculator_and_system_are_mutually_exclusive(self):
-        from inferlet import Context, Model, Sampler
         import pytest
-        ctx = Context(Model.load("test-model"))
+
+        from inferlet import Context, Sampler
+        ctx = Context()
 
         class _Drafter:
             def draft(self): return [], []
@@ -357,17 +338,17 @@ class TestSchema:
         assert s.source == 'root ::= "x"'
 
     def test_user_schema_via_protocol(self):
-        """Any class with build_constraint(model) satisfies the Schema protocol."""
-        from inferlet import Model, Schema
+        """Any class with build_constraint() satisfies the Schema protocol."""
+        from inferlet import Schema
 
         class MyGrammar:
-            def build_constraint(self, model):
+            def build_constraint(self):
                 from inferlet import Grammar, GrammarConstraint
-                return GrammarConstraint.from_grammar(Grammar.json(), model)
+                return GrammarConstraint.from_grammar(Grammar.json())
 
         # Runtime-checkable Protocol — isinstance works.
         assert isinstance(MyGrammar(), Schema)
-        assert MyGrammar().build_constraint(Model.load("test-model")) is not None
+        assert MyGrammar().build_constraint() is not None
 
 
 # =============================================================================
@@ -377,8 +358,8 @@ class TestSchema:
 
 class TestDecoders:
     def test_chat_decoder_create(self):
-        from inferlet import Model, chat
-        d = chat.Decoder(Model.load("test-model"))
+        from inferlet import chat
+        d = chat.Decoder()
         assert d._inner is not None
 
     def test_chat_event_classes(self):
@@ -393,8 +374,8 @@ class TestDecoders:
         assert interrupt.token == 42
 
     def test_reasoning_decoder_create(self):
-        from inferlet import Model, reasoning
-        d = reasoning.Decoder(Model.load("test-model"))
+        from inferlet import reasoning
+        d = reasoning.Decoder()
         assert d._inner is not None
 
     def test_reasoning_event_classes(self):
@@ -413,18 +394,18 @@ class TestDecoders:
 
 class TestTools:
     def test_equip_prefix(self):
-        from inferlet import Model, tools
-        toks = tools.equip_prefix(Model.load("test-model"), ['{"name":"calc"}'])
+        from inferlet import tools
+        toks = tools.equip_prefix(['{"name":"calc"}'])
         assert isinstance(toks, list)
 
     def test_answer_prefix_dict(self):
-        from inferlet import Model, tools
-        toks = tools.answer_prefix(Model.load("test-model"), "calc", {"result": 42})
+        from inferlet import tools
+        toks = tools.answer_prefix("calc", {"result": 42})
         assert isinstance(toks, list)
 
     def test_decoder_create(self):
-        from inferlet import Model, tools
-        d = tools.Decoder(Model.load("test-model"))
+        from inferlet import tools
+        d = tools.Decoder()
         assert d._inner is not None
 
     def test_event_classes(self):
@@ -477,9 +458,8 @@ class TestGrammar:
         assert Grammar.from_ebnf('root ::= "x"')._handle is not None
 
     def test_matcher_create(self):
-        from inferlet import Grammar, Matcher, Model
-        m = Model.load("test-model")
-        matcher = Matcher(Grammar.json(), m.tokenizer())
+        from inferlet import Grammar, Matcher
+        matcher = Matcher(Grammar.json())
         assert not matcher.is_terminated
 
 
@@ -489,10 +469,6 @@ class TestGrammar:
 
 
 class TestRuntime:
-    def test_models(self):
-        from inferlet import runtime
-        assert runtime.models() == ["mock-model"]
-
     def test_version(self):
         from inferlet import runtime
         assert runtime.version() == "0.1.0-mock"
@@ -517,22 +493,21 @@ class TestSession:
 
 class TestAdapter:
     def test_create(self):
-        from inferlet import Adapter, Model
-        a = Adapter.create(Model.load("test-model"), "my-adapter")
+        from inferlet import Adapter
+        a = Adapter.create("my-adapter")
         assert a._handle is not None
 
 
 class TestZo:
     def test_adapter_seed(self):
-        from inferlet import Adapter, Model, zo
-        m = Model.load("test-model")
-        # accept either a Forward (SDK) or a raw WIT ForwardPass
-        fwd = m._handle  # raw handle as fallback
-        zo.adapter_seed(fwd, 42)
+        from wit_world.imports.inference import ForwardPass
+
+        from inferlet import zo
+        zo.adapter_seed(ForwardPass(), 42)
 
     def test_initialize(self):
-        from inferlet import Adapter, Model, zo
-        a = Adapter.create(Model.load("test-model"), "my-adapter")
+        from inferlet import Adapter, zo
+        a = Adapter.create("my-adapter")
         zo.initialize(
             a,
             rank=8,

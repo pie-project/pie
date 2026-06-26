@@ -17,7 +17,7 @@
 // of recomputing shared prefixes). The pure search helpers (`ucb`, `parseScore`,
 // `Tree`) are model-free.
 
-import { Context, Model, Sampler, runtime } from 'inferlet';
+import { Context, Sampler } from 'inferlet';
 
 interface Input {
     prompt?: string;
@@ -200,12 +200,11 @@ function pathBlock(path: string[]): string {
 }
 
 async function expandStep(
-    model: Model,
     problem: string,
     path: string[],
     rolloutTokens: number,
 ): Promise<string> {
-    const ctx = new Context(model);
+    const ctx = new Context();
     ctx.system(
         'You extend a chain of reasoning. Given a problem and the steps so far, ' +
             'propose ONE concise next reasoning step. Output only that step.',
@@ -219,12 +218,11 @@ async function expandStep(
 }
 
 async function rollout(
-    model: Model,
     problem: string,
     path: string[],
     rolloutTokens: number,
 ): Promise<string> {
-    const ctx = new Context(model);
+    const ctx = new Context();
     ctx.system(
         'You finish a partial chain of reasoning. Continue from the steps given ' +
             'and produce a short, concrete candidate final answer.',
@@ -239,8 +237,8 @@ async function rollout(
     return text.trim();
 }
 
-async function evaluate(model: Model, problem: string, candidate: string): Promise<number> {
-    const ctx = new Context(model);
+async function evaluate(problem: string, candidate: string): Promise<number> {
+    const ctx = new Context();
     ctx.system(
         'You are a strict grader. Score the candidate answer from 0 to 100 for ' +
             'correctness, completeness, and reasoning quality. Return ONLY the number.',
@@ -252,12 +250,11 @@ async function evaluate(model: Model, problem: string, candidate: string): Promi
 }
 
 async function synthesize(
-    model: Model,
     problem: string,
     bestPath: string[],
     finalTokens: number,
 ): Promise<string> {
-    const ctx = new Context(model);
+    const ctx = new Context();
     ctx.system(
         'You write the final answer to a problem, guided by a vetted chain of ' +
             'reasoning. Be clear and correct.',
@@ -273,8 +270,6 @@ async function synthesize(
 // =============================================================================
 
 export async function main(input: Input): Promise<string> {
-    const model = Model.load(runtime.models()[0]);
-
     const prompt =
         input.prompt ?? 'A farmer has 17 sheep and all but 9 run away. How many are left?';
     const maxIterations = Math.max(1, input.max_iterations ?? 16);
@@ -307,7 +302,7 @@ export async function main(input: Input): Promise<string> {
         let simNode: number;
         if (canExpand) {
             const path = tree.pathActions(selected);
-            const action = await expandStep(model, prompt, path, rolloutTokens);
+            const action = await expandStep(prompt, path, rolloutTokens);
             simNode = tree.addChild(selected, action, maxDepth);
         } else {
             simNode = selected;
@@ -316,10 +311,10 @@ export async function main(input: Input): Promise<string> {
 
         // (c) Simulation / rollout.
         const simPath = tree.pathActions(simNode);
-        const candidate = await rollout(model, prompt, simPath, rolloutTokens);
+        const candidate = await rollout(prompt, simPath, rolloutTokens);
 
         // (d) Evaluation.
-        const value = await evaluate(model, prompt, candidate);
+        const value = await evaluate(prompt, candidate);
 
         // (e) Backpropagation.
         tree.backpropagate(simNode, value);
@@ -338,9 +333,9 @@ export async function main(input: Input): Promise<string> {
     const bestPath = tree.bestPath();
     let finalAnswer: string;
     if (bestPath.length === 0) {
-        finalAnswer = bestCandidate || (await rollout(model, prompt, [], finalTokens));
+        finalAnswer = bestCandidate || (await rollout(prompt, [], finalTokens));
     } else {
-        finalAnswer = await synthesize(model, prompt, bestPath, finalTokens);
+        finalAnswer = await synthesize(prompt, bestPath, finalTokens);
     }
 
     if (!showTrace) {

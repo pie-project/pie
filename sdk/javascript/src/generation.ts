@@ -30,9 +30,9 @@ import {
   type Brle,
 } from 'pie:core/inference';
 
-import { awaitFuture } from './_async.js';
 import * as _chat from './chat.js';
 import { Output, type ProbeHandle, type SampleHandle } from './forward.js';
+import * as _model from './model.js';
 import {
   type Constraint,
   type Schema,
@@ -149,13 +149,13 @@ export class Generator implements AsyncIterable<GenStep> {
     this._useSystemSpec = options.systemSpeculation ??
       (options.speculator === undefined &&
         _samplerIsArgmax(sampler) &&
-        ctx._model.defaultSystemSpeculation());
+        _model.defaultSystemSpeculation());
   }
 
   /** @internal */
   _addConstraint(c: Schema | Constraint): void {
     if ('buildConstraint' in c && typeof c.buildConstraint === 'function') {
-      this._constraints.push(c.buildConstraint(this._ctx._model));
+      this._constraints.push(c.buildConstraint());
     } else if ('step' in c && typeof c.step === 'function') {
       this._constraints.push(c);
     } else {
@@ -334,7 +334,7 @@ export class Generator implements AsyncIterable<GenStep> {
    *  end-of-turn (the expected case); otherwise concatenates every
    *  `Delta` chunk. */
   async collectText(): Promise<string> {
-    const decoder = new _chat.Decoder(this._ctx._model);
+    const decoder = new _chat.Decoder();
     const parts: string[] = [];
     for await (const step of this) {
       const out = await step.execute();
@@ -449,7 +449,7 @@ export class GenStep {
     }
 
     // Build forward pass.
-    const fwd = new _ForwardPass(ctx._handle.model());
+    const fwd = new _ForwardPass();
     fwd.context(ctx._handle);
     if (gen._adapter !== undefined) fwd.adapter(gen._adapter._handle);
     if (gen._zoSeed !== undefined) {
@@ -489,7 +489,7 @@ export class GenStep {
 
     if (this.#mask !== undefined) fwd.logitMask(this.#mask);
 
-    const raw = await awaitFuture(fwd.execute(), 'GenStep.execute failed');
+    const raw = await fwd.execute();
 
     // Collect accepted tokens off slot 0 (and following Token slots in
     // spec mode — verifier produces a sequence).

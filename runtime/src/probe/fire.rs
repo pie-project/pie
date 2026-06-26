@@ -138,8 +138,8 @@ pub struct ResponseDispatchProbes {
 /// per-fire bookkeeping before looping back to accumulate.
 #[derive(Debug, Default)]
 pub struct PostDispatchProbes {
-    /// `crate::context::tick` — broadcasts batch context ids to the
-    /// market actor so per-context rent / dividends advance.
+    /// Inert probe slot — the post-dispatch hook it timed was removed under
+    /// FCFS; kept for stats-key stability.
     pub context_tick_us: AtomicU64,
     /// Cumulative-counter `fetch_add` block at the end of the fire
     /// (latency, batch_size_hist, system_spec_*).

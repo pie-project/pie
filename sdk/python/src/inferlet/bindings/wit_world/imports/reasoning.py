@@ -8,7 +8,7 @@ from abc import abstractmethod
 import weakref
 
 from componentize_py_types import Result, Ok, Err, Some
-from ..imports import model
+
 
 
 @dataclass
@@ -50,7 +50,7 @@ class Decoder:
 
 
 
-def create_decoder(model: model.Model) -> Decoder:
+def create_decoder() -> Decoder:
     """
     Create a decoder to detect reasoning blocks in generated tokens
     """

@@ -26,9 +26,10 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow};
 
 use crate::config::{
-    CudaMemoryProfile, CudaNativeDriverOptions, DummyDriverOptions, MetalDriverOptions,
-    PortableDriverOptions,
+    CudaMemoryProfile, CudaNativeDriverOptions, DummyDriverOptions, PortableDriverOptions,
 };
+#[cfg(feature = "driver-metal")]
+use crate::config::MetalDriverOptions;
 use crate::driver_ffi::{self, Flavor};
 
 #[cfg(feature = "driver-cuda")]
@@ -463,13 +464,8 @@ pub fn write_dummy_startup_toml(
     write_toml_table(out_path, doc)
 }
 
-/// Write the cuda driver's startup TOML. Schema mirrors
-/// `driver/cuda/src/config.hpp`: `[model]` with
-/// `hf_repo`/`snapshot_dir`/`device`/`dtype`/optional load policy knobs,
-/// `[batching]` with KV-page geometry plus `swap_pool_size`, and `[runtime]`
 /// Emit the metal driver's startup TOML — same `[model]` + `[batching]` +
 /// `[runtime]` layout consumed by `driver/metal/src/config.hpp`. The metal
-/// driver speaks the same embedded in-process ABI as portable, so the
 /// launch state is identical apart from the `metal:N` backend selector.
 #[cfg(feature = "driver-metal")]
 pub fn write_metal_startup_toml(
@@ -513,6 +509,10 @@ pub fn write_metal_startup_toml(
     write_toml_table(out_path, doc)
 }
 
+/// Write the cuda driver's startup TOML. Schema mirrors
+/// `driver/cuda/src/config.hpp`: `[model]` with
+/// `hf_repo`/`snapshot_dir`/`device`/`dtype`/optional load policy knobs,
+/// `[batching]` with KV-page geometry plus `swap_pool_size`, and `[runtime]`
 /// with the server verbosity flag.
 ///
 /// `[distributed]` is emitted only for TP launches; single-rank uses the
@@ -858,10 +858,10 @@ impl EmbeddedDriver {
         let uses_inproc = match flavor {
             #[cfg(feature = "driver-cuda")]
             Flavor::Cuda => true,
-            #[cfg(feature = "driver-portable")]
-            Flavor::Portable => true,
             #[cfg(feature = "driver-metal")]
             Flavor::Metal => true,
+            #[cfg(feature = "driver-portable")]
+            Flavor::Portable => true,
             _ => false,
         };
         if uses_inproc {

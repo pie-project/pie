@@ -7,7 +7,7 @@ the buffer to a :class:`Forward` / :class:`Generator`.
 
 Usage::
 
-    ctx = Context(model)
+    ctx = Context()
     ctx.system("You are helpful.")
     ctx.user("Tell me a joke.")
 
@@ -17,44 +17,21 @@ Usage::
 
 from __future__ import annotations
 
-from contextlib import contextmanager
 from typing import TYPE_CHECKING, Iterable
 
 from wit_world.imports import context as _ctx
 from wit_world.imports import inference as _inf
 
 from . import chat as _chat
-from . import scheduling as _sched
 from ._async import await_future
 from .forward import Forward
 from .generation import Generator
 from .grammar import Constraint, Schema
-from .model import Model
 
 if TYPE_CHECKING:
     from .adapter import Adapter
     from .sample import Sampler
     from .spec import Speculator
-
-
-# =============================================================================
-# Bid math (internal)
-# =============================================================================
-
-
-def _compute_bid(
-    balance: float,
-    pages: float,
-    mu: float,
-    cv2: float,
-    page_size: float,
-    dividend: float,
-) -> float:
-    """Budget-exhausting bid formula (matches Rust SDK)."""
-    mu = max(mu, 1.0)
-    numerator = balance / mu + dividend
-    denominator = pages + mu * (1.0 + cv2) / (2.0 * page_size)
-    return numerator / denominator if denominator > 0 else numerator
 
 
 # =============================================================================
@@ -65,14 +42,13 @@ def _compute_bid(
 class Context:
     """Host-managed conversation context.
 
-    Construct with a model, fill via chat methods (or :meth:`append`),
-    then either drain explicitly with :meth:`flush` or let
-    :meth:`generate` / :meth:`forward` drain on demand.
+    Construct it, fill via chat methods (or :meth:`append`), then
+    either drain explicitly with :meth:`flush` or let :meth:`generate`
+    / :meth:`forward` drain on demand.
     """
 
     __slots__ = (
         "_handle",
-        "_model",
         "_pending_tokens",
         "_page_size",
         "_seq_len",
@@ -83,9 +59,8 @@ class Context:
 
     # ── Construction / lifecycle ──────────────────────────────────────
 
-    def __init__(self, model: Model) -> None:
-        self._handle = _ctx.Context.create(model._handle)
-        self._model = model
+    def __init__(self) -> None:
+        self._handle = _ctx.Context.create()
         self._pending_tokens: list[int] = []
         self._sync_from_host()
 
@@ -99,42 +74,39 @@ class Context:
         )
 
     @classmethod
-    def open(cls, model: Model, name: str) -> Context | None:
+    def open(cls, name: str) -> Context | None:
         """Open a saved snapshot (implicit fork — snapshot stays immutable)."""
-        raw = _ctx.Context.open(model._handle, name)
+        raw = _ctx.Context.open(name)
         if raw is None:
             return None
         obj = object.__new__(cls)
         obj._handle = raw
-        obj._model = model
         obj._pending_tokens = []
         obj._sync_from_host()
         return obj
 
     @classmethod
-    def take(cls, model: Model, name: str) -> Context | None:
+    def take(cls, name: str) -> Context | None:
         """Take ownership of a snapshot (snapshot is deleted)."""
-        raw = _ctx.Context.take(model._handle, name)
+        raw = _ctx.Context.take(name)
         if raw is None:
             return None
         obj = object.__new__(cls)
         obj._handle = raw
-        obj._model = model
         obj._pending_tokens = []
         obj._sync_from_host()
         return obj
 
     @staticmethod
-    def delete(model: Model, name: str) -> None:
+    def delete(name: str) -> None:
         """Delete a saved snapshot by name."""
-        _ctx.Context.delete(model._handle, name)
+        _ctx.Context.delete(name)
 
     def fork(self) -> Context:
         """Fork into a new anonymous context (working pages copied)."""
         raw = self._handle.fork()
         obj = object.__new__(Context)
         obj._handle = raw
-        obj._model = self._model
         obj._pending_tokens = list(self._pending_tokens)
         obj._sync_from_host()
         return obj
@@ -163,10 +135,6 @@ class Context:
     # ── Accessors ────────────────────────────────────────────────────
 
     @property
-    def model(self) -> Model:
-        return self._model
-
-    @property
     def page_size(self) -> int:
         return self._page_size
 
@@ -185,27 +153,27 @@ class Context:
 
     def system(self, message: str) -> Context:
         """Fill a system-role message."""
-        self._pending_tokens.extend(_chat.system(self._model, message))
+        self._pending_tokens.extend(_chat.system(message))
         return self
 
     def user(self, message: str) -> Context:
         """Fill a user-role message."""
-        self._pending_tokens.extend(_chat.user(self._model, message))
+        self._pending_tokens.extend(_chat.user(message))
         return self
 
     def assistant(self, message: str) -> Context:
         """Fill an assistant-role message (history replay)."""
-        self._pending_tokens.extend(_chat.assistant(self._model, message))
+        self._pending_tokens.extend(_chat.assistant(message))
         return self
 
     def cue(self) -> Context:
         """Cue the model to generate (fills the generation header)."""
-        self._pending_tokens.extend(_chat.cue(self._model))
+        self._pending_tokens.extend(_chat.cue())
         return self
 
     def seal(self) -> Context:
         """Seal the current turn (insert stop token)."""
-        self._pending_tokens.extend(_chat.seal(self._model))
+        self._pending_tokens.extend(_chat.seal())
         return self
 
     def append(self, tokens: Iterable[int]) -> Context:
@@ -236,7 +204,7 @@ class Context:
             self._working_pages = pages_needed
 
         # Forward pass without sampler — just write to KV.
-        fwd = _inf.ForwardPass(self._model._handle)
+        fwd = _inf.ForwardPass()
         fwd.context(self._handle)
         positions = list(range(self._seq_len, self._seq_len + n))
         fwd.input_tokens(tokens, positions)
@@ -324,7 +292,7 @@ class Context:
         if auto_flush:
             self.cue()
             if stop is None:
-                stop = _chat.stop_tokens(self._model)
+                stop = _chat.stop_tokens()
 
         return Generator(
             self,
@@ -339,42 +307,3 @@ class Context:
             zo_seed=zo_seed,
             horizon=horizon,
         )
-
-    # ── Bidding / scheduling ─────────────────────────────────────────
-
-    def set_bid(self, value: float) -> None:
-        """Override the auto-computed bid (willingness to pay per page
-        per step). Most callers should NOT use this — the
-        :class:`Generator` auto-bids each step."""
-        self._handle.bid(value)
-
-    @contextmanager
-    def idle(self):
-        """Mark this context as idle: drop the bid to zero so other
-        contexts can take its pages under contention. Yields a context
-        manager that restores the truthful generation bid on exit::
-
-            with ctx.idle():
-                result = await http_get(url)
-            # bid restored
-
-        On an uncontended device the runtime charges zero rent anyway —
-        ``idle`` is a no-op cost-wise but still safe to call. Under
-        load, it yields priority to other workloads for the duration.
-        """
-        # Snapshot the truthful generation bid to restore on exit.
-        pages = float(self._committed_pages + self._working_pages)
-        if pages > 0.0:
-            balance = _sched.balance(self._model)
-            dividend = _sched.dividend(self._model)
-            saved = _compute_bid(
-                balance, pages, 4096.0, 1.0, float(self._page_size), dividend
-            )
-        else:
-            saved = 0.0
-
-        self._handle.bid(0.0)
-        try:
-            yield
-        finally:
-            self._handle.bid(saved)

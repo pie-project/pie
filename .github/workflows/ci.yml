@@ -73,6 +73,12 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
+      # rust-toolchain.toml pins the wasip3 nightly; this installs the Tier-3
+      # wasm32-wasip3 build prereqs (wasm32-wasip2 libc donor + linker wrapper)
+      # so the runtime integration tests can build their wasip3 inferlets.
+      - name: Set up wasm32-wasip3 toolchain
+        run: ./scripts/setup-wasip3.sh
+
       - name: Cache cargo + cmake build
         uses: actions/cache@v5
         with:
@@ -94,14 +100,19 @@ jobs:
       - name: cargo test (workspace)
         run: cargo test --workspace --exclude pie-server-py --exclude pie-worker
 
-  # Drift guard for the committed C++ schema header: regenerate it with
-  # pie-schema-bindgen (cbindgen over pie-schema's repr(C)/cabi surface) and
-  # fail if it differs from the committed copy. Complements the runtime
+  # Drift guard for the committed C++ driver ABI header: regenerate it with
+  # pie-driver-abi-cbindgen (cbindgen over pie-driver-abi's repr(C)/cabi surface)
+  # and fail if it differs from the committed copy. Complements the runtime
   # SCHEMA_HASH handshake. Toolchain is PINNED (not @stable) because cbindgen's
   # parse.expand output is toolchain-dependent — pinning keeps the diff stable.
   schema-header-drift:
     name: schema header drift (cbindgen regen)
     runs-on: ubuntu-latest
+    # Pinned to stable 1.91.1 for deterministic cbindgen parse.expand output.
+    # RUSTUP_TOOLCHAIN is forced here so the repo-wide nightly rust-toolchain.toml
+    # (wasip3 epic) does NOT override the dtolnay-installed 1.91.1 in this job.
+    env:
+      RUSTUP_TOOLCHAIN: "1.91.1"
     steps:
       - uses: actions/checkout@v6
 
@@ -119,16 +130,16 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-schema-bindgen-
 
-      - name: Regenerate committed schema header
+      - name: Regenerate committed driver ABI header
         # RUSTC_BOOTSTRAP=1 is set inside the generator; cbindgen is a dep of
-        # pie-schema-bindgen, so no separate install is needed.
-        run: cargo run -p pie-schema-bindgen
+        # pie-driver-abi-cbindgen, so no separate install is needed.
+        run: cargo run -p pie-driver-abi-cbindgen
 
-      - name: Fail if committed pie_schema.h is stale
+      - name: Fail if committed pie_driver_abi.h is stale
         run: |
-          if ! git diff --exit-code -- protocol/schema/include/pie_schema.h; then
-            echo "::error::protocol/schema/include/pie_schema.h is out of date."
-            echo "Regenerate with: cargo run -p pie-schema-bindgen   (then commit)"
+          if ! git diff --exit-code -- interface/driver/include/pie_driver_abi.h; then
+            echo "::error::interface/driver/include/pie_driver_abi.h is out of date."
+            echo "Regenerate with: cargo run -p pie-driver-abi-cbindgen   (then commit)"
             exit 1
           fi
 

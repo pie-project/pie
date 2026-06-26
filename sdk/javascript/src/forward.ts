@@ -22,7 +22,6 @@ import type {
   SlotOutput,
 } from 'pie:core/inference';
 
-import { awaitFuture } from './_async.js';
 import type { Adapter } from './adapter.js';
 import type { Context } from './context.js';
 import {
@@ -224,7 +223,7 @@ export class Forward {
     }
 
     // Build forward pass.
-    const fwd = new _ForwardPass(ctx._handle.model());
+    const fwd = new _ForwardPass();
     fwd.context(ctx._handle);
     if (this.#adapter !== undefined) {
       fwd.adapter(this.#adapter._handle);
@@ -256,7 +255,7 @@ export class Forward {
     if (this.#mask !== undefined) fwd.logitMask(this.#mask);
     if (this.#attnMask !== undefined) fwd.attentionMask(this.#attnMask);
 
-    const raw = await awaitFuture(fwd.execute(), 'Forward.execute failed');
+    const raw = await fwd.execute();
 
     // Commit pages that auto-input tokens fully filled.
     if (nAuto > 0) {

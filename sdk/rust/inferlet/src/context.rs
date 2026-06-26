@@ -8,10 +8,8 @@ mod constraint;
 // Re-export submodule public types.
 pub use constraint::*;
 
-use crate::ForwardPassExt;
 use crate::Result;
 use crate::inference::ForwardPass;
-use crate::model::Model;
 use crate::sample::Sampler;
 use serde_json;
 
@@ -20,51 +18,6 @@ pub use crate::pie::core::context::Context as RawContext;
 
 // Instruct WIT bindings.
 use crate::pie::instruct::chat;
-
-/// Budget-exhausting bid: the maximum per-page-per-step rent the process
-/// can sustain over `μ` steps of generation without going bankrupt.
-///
-/// Formula:
-///
-/// ```text
-///     bid = (B/μ + d) / (p + μ(1 + cv²) / (2s))
-/// ```
-///
-/// where:
-/// - `B` = credit balance (market wallet, unit: pages)
-/// - `μ` = expected remaining steps
-/// - `d` = endowment-weighted dividend per step
-/// - `p` = pages currently held
-/// - `s` = page_size (tokens per page)
-/// - `cv²` = squared coefficient of variation of the remaining-steps
-///   distribution (0 = deterministic, 1 = geometric/memoryless)
-///
-/// The numerator is the per-step budget available for rent (balance
-/// amortized over horizon, plus incoming dividend). The denominator is
-/// the *total* page-steps of rent exposure: current pages `p` held for
-/// `μ` steps, plus the triangular accumulation of newly created pages.
-///
-/// This is the truthful bid under critical-value payments — bidding this
-/// value exhausts the wallet exactly at the end of the horizon. No
-/// make-cost term: forward-pass compute is billed against the token
-/// wallet, not the credit wallet.
-pub(crate) fn compute_bid(
-    balance: f64,
-    pages: f64,
-    mu: f64,
-    cv2: f64,
-    page_size: f64,
-    dividend: f64,
-) -> f64 {
-    let mu = mu.max(1.0);
-    let numerator = balance / mu + dividend;
-    let denominator = pages + mu * (1.0 + cv2) / (2.0 * page_size);
-    if denominator > 0.0 {
-        numerator / denominator
-    } else {
-        numerator
-    }
-}
 
 // =============================================================================
 // Context
@@ -81,7 +34,6 @@ pub(crate) fn compute_bid(
 ///   to avoid redundant WIT host calls.
 pub struct Context {
     pub(crate) inner: RawContext,
-    pub(crate) model: Model,
     pub(crate) page_size: u32,
     /// SDK-side token buffer filled by instruct operations.
     pub(crate) buffer: Vec<u32>,
@@ -101,27 +53,27 @@ pub struct Context {
 impl Context {
     // ── Constructors ────────────────────────────────────────────────
 
-    /// Create a fresh empty context for the given model.
-    pub fn new(model: &Model) -> Result<Self> {
-        let inner = RawContext::create(model)?;
+    /// Create a fresh empty context.
+    pub fn new() -> Result<Self> {
+        let inner = RawContext::create()?;
         Ok(Self::wrap(inner))
     }
 
     /// Open a saved snapshot (implicit fork — snapshot stays immutable).
-    pub fn open(model: &Model, name: &str) -> Result<Self> {
-        let inner = RawContext::open(model, name)?;
+    pub fn open(name: &str) -> Result<Self> {
+        let inner = RawContext::open(name)?;
         Ok(Self::wrap(inner))
     }
 
     /// Take ownership of a saved snapshot (snapshot is deleted).
-    pub fn take(model: &Model, name: &str) -> Result<Self> {
-        let inner = RawContext::take(model, name)?;
+    pub fn take(name: &str) -> Result<Self> {
+        let inner = RawContext::take(name)?;
         Ok(Self::wrap(inner))
     }
 
     /// Delete a saved snapshot by name (static — no context needed).
-    pub fn delete(model: &Model, name: &str) -> Result<()> {
-        RawContext::delete(model, name)
+    pub fn delete(name: &str) -> Result<()> {
+        RawContext::delete(name)
     }
 
     /// Wrap an existing raw context, syncing cached state from the host.
@@ -131,10 +83,8 @@ impl Context {
         let working_pages = inner.working_page_count();
         let working_tokens = inner.working_page_token_count();
         let seq_len = committed_pages * page_size + working_tokens;
-        let model = inner.model();
         Self {
             inner,
-            model,
             page_size,
             buffer: Vec::new(),
             pending_system: None,
@@ -152,10 +102,8 @@ impl Context {
     /// The forked context inherits a copy of the parent's buffered tokens.
     pub fn fork(&self) -> Result<Self> {
         let forked = self.inner.fork()?;
-        let model = forked.model();
         Ok(Self {
             inner: forked,
-            model,
             page_size: self.page_size,
             buffer: self.buffer.clone(),
             pending_system: self.pending_system.clone(),
@@ -181,75 +129,16 @@ impl Context {
         self.inner.destroy()
     }
 
-    // ── Market operations ────────────────────────────────────────────
+    // ── Suspend / restore ────────────────────────────────────────────
 
-    /// Suspend this context (release pages, stop rent).
-    /// Restoration is system-driven based on bid priority.
+    /// Suspend this context (release GPU pages, offload to CPU).
+    /// Restoration is system-driven under FCFS: suspended contexts are
+    /// restored oldest-launched first as memory frees up.
     pub fn suspend(&self) -> Result<()> {
         self.inner.suspend()
     }
 
-    /// Override the auto-computed bid (willingness to pay per page per
-    /// step). Higher bid = harder to evict, restored first under
-    /// contention. Bids are bounded below by zero; the runtime refuses
-    /// negative values.
-    ///
-    /// Most callers should NOT use this — the [`Generator`] auto-bids
-    /// every step using a budget-exhausting strategy that drains the
-    /// wallet over the horizon. Reach for `set_bid` only when you have a
-    /// strategy of your own.
-    ///
-    /// Stopping forward progress when the compute budget is spent is
-    /// handled on the **token wallet**, not here — calling forward
-    /// passes after `tokens_remaining == 0` fails with an error,
-    /// independent of any bid you set. A low bid only affects admission
-    /// under contention.
-    ///
-    /// [`Generator`]: crate::generation::Generator
-    pub fn set_bid(&self, value: f64) {
-        self.inner.bid(value);
-    }
-
-    /// Mark this context as idle: drop the bid to zero so other
-    /// contexts can take its pages under contention. Returns an opaque
-    /// RAII guard; the truthful generation bid is restored on drop.
-    ///
-    /// Use across an external wait (HTTP, tool call, anything off-GPU)
-    /// where holding the bid would buy you nothing:
-    ///
-    /// ```ignore
-    /// let _idle = ctx.idle();
-    /// let result = http_get(url).await?;
-    /// // _idle dropped here → bid restored
-    /// ```
-    ///
-    /// On an uncontended device the runtime charges zero rent anyway —
-    /// `idle` is a no-op cost-wise but still safe to call. Under load,
-    /// it yields priority to other workloads for the duration of the
-    /// wait.
-    pub fn idle(&self) -> Idle<'_> {
-        // Snapshot the truthful bid to restore on drop. If pages == 0
-        // (rare), there's nothing to bid for; default to 0.0.
-        let pages = (self.committed_pages + self.working_pages) as f64;
-        let saved = if pages > 0.0 {
-            let balance = crate::scheduling::balance(&self.model);
-            let dividend = crate::scheduling::dividend(&self.model);
-            let page_size = self.page_size as f64;
-            // Conservative μ = 4096; no per-generation horizon visible here.
-            compute_bid(balance, pages, 4096.0, 1.0, page_size, dividend)
-        } else {
-            0.0
-        };
-        self.inner.bid(0.0);
-        Idle { ctx: self, saved }
-    }
-
     // ── Accessors (no WIT calls) ────────────────────────────────────
-
-    /// The model this context was created with.
-    pub fn model(&self) -> &Model {
-        &self.model
-    }
 
     /// Tokens per page.
     pub fn page_size(&self) -> u32 {
@@ -279,7 +168,7 @@ impl Context {
 
     fn flush_pending_system(&mut self) {
         if let Some(system) = self.pending_system.take() {
-            let tokens = chat::system(&self.model, &system);
+            let tokens = chat::system(&system);
             self.buffer.extend(tokens);
         }
     }
@@ -298,9 +187,9 @@ impl Context {
     /// Fill a user message.
     pub fn user(&mut self, message: &str) -> &mut Self {
         let tokens = match self.pending_system.take() {
-            Some(system) => chat::system_user(&self.model, &system, message),
-            None if self.is_first_chat_fill() => chat::first_user(&self.model, message),
-            None => chat::user(&self.model, message),
+            Some(system) => chat::system_user(&system, message),
+            None if self.is_first_chat_fill() => chat::first_user(message),
+            None => chat::user(message),
         };
         self.buffer.extend(tokens);
         self
@@ -309,7 +198,7 @@ impl Context {
     /// Fill an assistant message (for history replay).
     pub fn assistant(&mut self, message: &str) -> &mut Self {
         self.flush_pending_system();
-        let tokens = chat::assistant(&self.model, message);
+        let tokens = chat::assistant(message);
         self.buffer.extend(tokens);
         self
     }
@@ -317,7 +206,7 @@ impl Context {
     /// Cue the model to generate (fills the generation header).
     pub fn cue(&mut self) -> &mut Self {
         self.flush_pending_system();
-        let tokens = chat::cue(&self.model);
+        let tokens = chat::cue();
         self.buffer.extend(tokens);
         self
     }
@@ -325,7 +214,7 @@ impl Context {
     /// Seal the current turn (insert stop token).
     pub fn seal(&mut self) -> &mut Self {
         self.flush_pending_system();
-        let tokens = chat::seal(&self.model);
+        let tokens = chat::seal();
         self.buffer.extend(tokens);
         self
     }
@@ -365,7 +254,7 @@ impl Context {
                 .to_string())
             })
             .collect::<Result<_>>()?;
-        let prefix = crate::tools::equip_prefix(&self.model, &envelopes)?;
+        let prefix = crate::tools::equip_prefix(&envelopes)?;
         self.buffer.extend_from_slice(&prefix);
         Ok(self)
     }
@@ -425,13 +314,13 @@ impl Context {
         }
 
         // Build and execute a forward pass.
-        let pass = ForwardPass::new(&self.model);
+        let pass = ForwardPass::new();
         pass.context(&self.inner);
 
         let positions: Vec<u32> = (self.seq_len..self.seq_len + num_tokens).collect();
         pass.input_tokens(&tokens, &positions);
 
-        pass.execute_async()
+        pass.execute()
             .await
             .map_err(|e| format!("Forward pass failed: {}", e))?;
 
@@ -491,10 +380,10 @@ impl Context {
             self.working_pages = pages_needed;
         }
 
-        let pass = ForwardPass::new(&self.model);
+        let pass = ForwardPass::new();
         pass.context(&self.inner);
         pass.input_image(image, self.seq_len);
-        pass.execute_async()
+        pass.execute()
             .await
             .map_err(|e| format!("append_image: forward pass: {}", e))?;
 
@@ -562,10 +451,10 @@ impl Context {
             self.working_pages = pages_needed;
         }
 
-        let pass = ForwardPass::new(&self.model);
+        let pass = ForwardPass::new();
         pass.context(&self.inner);
         pass.input_audio(audio, self.seq_len);
-        pass.execute_async()
+        pass.execute()
             .await
             .map_err(|e| format!("append_audio: forward pass: {}", e))?;
 
@@ -603,7 +492,7 @@ impl Context {
         for i in 0..n {
             let secs = video.timestamp(i).max(0.0) as u32;
             let marker = format!(" {:02}:{:02} ", secs / 60, secs % 60);
-            let toks = self.model.tokenizer().encode(&marker);
+            let toks = crate::model::encode(&marker);
             self.append(&toks);
             let frame = video
                 .frame(i)
@@ -633,23 +522,5 @@ impl Context {
     pub fn generate(&mut self, sampler: Sampler) -> crate::generation::Generator<'_> {
         self.flush_pending_system();
         crate::generation::Generator::new(self, sampler)
-    }
-}
-
-// =============================================================================
-// Idle — RAII guard returned by Context::idle()
-// =============================================================================
-
-/// Opaque RAII guard. Created by [`Context::idle`]. Drops the bid to
-/// zero for the duration of the guard's lifetime; restores the
-/// truthful bid on drop.
-pub struct Idle<'a> {
-    ctx: &'a Context,
-    saved: f64,
-}
-
-impl<'a> Drop for Idle<'a> {
-    fn drop(&mut self) {
-        self.ctx.inner.bid(self.saved);
     }
 }

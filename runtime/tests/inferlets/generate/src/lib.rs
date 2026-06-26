@@ -3,26 +3,16 @@
 //! This inferlet tests: append → flush → generate (step loop).
 //! Skips chat template rendering to work with mock backends.
 
-use inferlet::{
-    Context,
-    model::Model,
-    runtime,
-    sample::Sampler,
-    Result,
-};
+use inferlet::{Context, model, sample::Sampler, Result};
 
 #[inferlet::main]
 async fn main(_input: String) -> Result<String> {
-    // Load the first available model
-    let models = runtime::models();
-    let model = Model::load(&models[0])?;
-    let tokenizer = model.tokenizer();
-
-    // Create a context — skip chat template, fill tokens directly
-    let mut context = Context::new(&model)?;
+    // The engine serves exactly one model — no handle to load.
+    // Create a context — skip chat template, fill tokens directly.
+    let mut context = Context::new()?;
 
     // Encode a test prompt and append it directly (no chat template).
-    let prompt_tokens = tokenizer.encode("hello world");
+    let prompt_tokens = model::encode("hello world");
     eprintln!("[GENERATE] encoded prompt: {} tokens", prompt_tokens.len());
     context.append(&prompt_tokens);
 

@@ -17,8 +17,6 @@ pub fn default_config_content() -> String {
         Some(Flavor::Portable) => PORTABLE_DRIVER_BLOCK,
         #[cfg(feature = "driver-cuda")]
         Some(Flavor::Cuda) => CUDA_DRIVER_BLOCK,
-        #[cfg(feature = "driver-metal")]
-        Some(Flavor::Metal) => METAL_DRIVER_BLOCK,
         Some(Flavor::Dummy) => DUMMY_DRIVER_BLOCK,
         // default_flavor always returns Some because dummy is linked
         // unconditionally. Keep this fallback for exhaustiveness.
@@ -31,7 +29,7 @@ pub fn default_config_content() -> String {
         .replace("[model.driver.options]", "[worker.model.driver.options]")
         .replace("[model.driver]", "[worker.model.driver]")
         .replace("[model.scheduler]", "[worker.model.scheduler]")
-        .replace("[[model]]", "[[worker.model]]")
+        .replace("[model]", "[worker.model]")
         .replace("[server]", "[worker.server]")
         .replace("[auth]", "[worker.auth]")
         .replace("[telemetry]", "[worker.telemetry]")
@@ -91,15 +89,12 @@ network_allowed_hosts = ["*"]
 # Uploads
 max_upload_mb = 256
 
-[[model]]
+[model]
 name = "default"
 hf_repo = "Qwen/Qwen3-0.6B"
 
 [model.scheduler]
-batch_policy = "adaptive"
 request_timeout_secs = 120
-default_endowment_pages = 64
-admission_oversubscription_factor = 4.0
 restore_pause_at_utilization = 0.85
 # Per-context depth of pass-level speculative execution. `0`
 # disables speculation entirely (every submit goes through the
@@ -145,20 +140,6 @@ kv_cache_dtype = "auto"
 mtp_num_drafts = 3
 "#;
 
-#[cfg(feature = "driver-metal")]
-const METAL_DRIVER_BLOCK: &str = r#"
-[model.driver]
-type = "metal"
-device = ["metal:0"]
-activation_dtype = "bfloat16"
-ipc_profile = "balanced" # "latency", "balanced", or "power"
-
-[model.driver.options]
-max_forward_tokens = 10240
-max_forward_requests = 512
-kv_cache_dtype = "auto"
-"#;
-
 const DUMMY_DRIVER_BLOCK: &str = r#"
 [model.driver]
 type = "dummy"
@@ -171,11 +152,7 @@ vocab_size = 151936
 arch_name = "qwen3"
 "#;
 
-const COMMON_SUFFIX: &str = r#"
-# To add a second model, append another [[model]] block with a unique
-# name and a non-overlapping device list. The first [[model]] is the
-# implicit default for inferlets that don't specify a model name.
-"#;
+const COMMON_SUFFIX: &str = "";
 
 #[cfg(test)]
 mod tests {
