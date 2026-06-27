@@ -29,8 +29,6 @@ from wit_world.imports.inference import (
     SlotOutput_Token,
 )
 
-from ._async import await_future
-
 if TYPE_CHECKING:
     from .adapter import Adapter
     from .context import Context
@@ -299,7 +297,7 @@ class Forward:
         if self._attn_mask is not None:
             fwd.attention_mask(self._attn_mask)
 
-        raw = await await_future(fwd.execute(), "Forward.execute failed")
+        raw = await fwd.execute()
 
         if n_write > 0 and not self._defer_commit:
             ctx._seq_len += n_write

@@ -134,7 +134,7 @@ class TestContext:
     def test_create(self):
         from inferlet import Context
         ctx = Context()
-        assert ctx._handle is not None
+        assert ctx._kv is not None
 
     def test_chat_fillers_chain(self):
         """system / user / cue return self for chaining."""
@@ -154,7 +154,7 @@ class TestContext:
         ctx = Context()
         ctx.append([1, 2, 3])
         forked = ctx.fork()
-        assert forked._handle is not None
+        assert forked._kv is not None
 
     def test_release_via_context_manager(self):
         from inferlet import Context
@@ -238,6 +238,87 @@ class TestForward:
         assert h_multi.arity == 3
         # 3 Token slots come first, so the probe lands at slot 3.
         assert h_probe.slot == 3
+
+
+# =============================================================================
+# Async forward path — P3 component-model-async `execute()`
+# =============================================================================
+
+
+class TestForwardExecuteAsync:
+    """`forward-pass.execute` is component-model-async (`async def` returning
+    `output` directly — no pollable future-output). These exercise the real
+    await path that the construction tests above don't: the gap that let a
+    stale ``await_future(fwd.execute())`` wrapper slip past the suite."""
+
+    def test_forward_execute_returns_output(self):
+        import asyncio
+
+        from inferlet import Context, Sampler
+        ctx = Context()
+        fwd = ctx.forward()
+        fwd.input([1, 2, 3])
+        h = fwd.sample([2], Sampler.argmax())
+        out = asyncio.run(fwd.execute())
+        # Default mock output is a single EOS token (id 2) in slot 0.
+        assert out.token(h) == 2
+
+    def test_context_flush_advances_seq_len(self):
+        import asyncio
+
+        from inferlet import Context
+        ctx = Context()
+        ctx.append([5, 6, 7, 8])
+        asyncio.run(ctx.flush())
+        assert ctx.seq_len == 4
+        assert ctx.buffer() == []
+
+
+class TestAsyncIO:
+    """`messaging.pull` / `session.receive*` are also P3 async imports."""
+
+    def test_messaging_pull(self):
+        import asyncio
+
+        from inferlet import messaging
+        assert asyncio.run(messaging.pull("topic")) == "pulled"
+
+    def test_session_receive(self):
+        import asyncio
+
+        from inferlet import session
+        assert asyncio.run(session.receive()) == "received"
+
+
+class TestSubscription:
+    """`messaging.subscribe` returns a P3 `stream<string>`; the `Subscription`
+    wrapper async-iterates it (read-chunk + buffer), not the old pollable."""
+
+    def test_async_iteration_drains_stream(self):
+        import asyncio
+
+        from inferlet import messaging
+
+        async def run():
+            collected = []
+            with messaging.subscribe("events") as sub:
+                async for msg in sub:
+                    collected.append(msg)
+            return collected
+
+        assert asyncio.run(run()) == ["msg1", "msg2"]
+
+    def test_next_returns_none_when_stream_closed(self):
+        import asyncio
+
+        from inferlet import messaging
+
+        async def run():
+            sub = messaging.subscribe("events")
+            return [await sub.next(), await sub.next(), await sub.next()]
+
+        # Two messages then a clean end-of-stream sentinel.
+        assert asyncio.run(run()) == ["msg1", "msg2", None]
 
 
 # =============================================================================

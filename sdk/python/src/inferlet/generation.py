@@ -39,7 +39,6 @@ from wit_world.imports.inference import SlotOutput_Token
 
 from . import chat as _chat
 from . import model as _model
-from ._async import await_future
 from .forward import Output, ProbeHandle, SampleHandle, _probe_kind
 from .grammar import (
     AnyJson,
@@ -513,7 +512,7 @@ class GenStep:
         if self._mask is not None:
             fwd.logit_mask(self._mask)
 
-        raw = await await_future(fwd.execute(), "GenStep.execute failed")
+        raw = await fwd.execute()
 
         if self._user_cleared_sampler:
             accepted: list[int] = []

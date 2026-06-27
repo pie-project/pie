@@ -11,8 +11,6 @@ from typing import Any
 
 import wit_world.imports.session as _session
 
-from ._async import await_future
-
 
 def send(message: Any) -> None:
     """Send a message to the client.
@@ -39,8 +37,10 @@ def send(message: Any) -> None:
 
 async def receive() -> str:
     """Receive a text message from the client."""
-    future = _session.receive()
-    return await await_future(future, "Session receive failed")
+    result = await _session.receive()
+    if result is None:
+        raise RuntimeError("Session receive failed")
+    return result
 
 
 def send_file(data: bytes) -> None:
@@ -50,5 +50,7 @@ def send_file(data: bytes) -> None:
 
 async def receive_file() -> bytes:
     """Receive binary file data from the client."""
-    future = _session.receive_file()
-    return await await_future(future, "Session receive_file failed")
+    result = await _session.receive_file()
+    if result is None:
+        raise RuntimeError("Session receive_file failed")
+    return result
