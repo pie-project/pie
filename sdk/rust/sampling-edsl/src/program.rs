@@ -183,3 +183,29 @@ pub fn spec_verify_lossless(vocab: u32, k: u32) -> Result<(Built, SpecLosslessKe
 pub fn target_softmax_rows(logits: &DynValue, vocab: u32) -> DynValue {
     dyn_softmax_rows(logits, vocab)
 }
+
+// ============================================================================
+// Measurement probes (Scalar-output graphs) — #15 enum->graph migration
+// ============================================================================
+
+/// **Entropy probe** — the Shannon entropy `H = -Σ p·log p` of the softmax
+/// distribution, as a `Scalar`. Migrated from the built-in `entropy` sampler-enum
+/// case to the program/graph contract (#15): a **Scalar-output measurement**
+/// program (not a token producer), routed to the measurement read-back path by
+/// its output kind. Its `canonical_kind` is `Custom` (Graph-authored — not a
+/// token-sampler dispatch kind). `outputs = [Scalar]`.
+///
+/// Computed in log-space for numerical safety — `log_p = (x - max) - logΣexp(x-max)`
+/// is always finite (no `log(0)`), and `p·log_p` with `p = exp(log_p)` underflowing
+/// to 0 stays 0, never `NaN`.
+pub fn entropy(vocab: u32) -> Result<Built, BuildError> {
+    let g = Graph::new(vocab);
+    let logits = g.intrinsic_logits_dyn();
+    let m = logits.reduce_max(); // scalar
+    let shifted = logits.sub(&m); // x - max, [vocab]
+    let lse = shifted.exp().reduce_sum().log(); // log Σ exp(x-max), scalar
+    let log_p = shifted.sub(&lse); // log_softmax, [vocab]
+    let h = log_p.exp().mul(&log_p).reduce_sum().neg(); // -Σ p·log p, scalar
+    g.output(&h, OutputKind::Scalar);
+    g.build()
+}

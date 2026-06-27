@@ -11,6 +11,7 @@ use crate::dynamic::{
     dyn_gumbel_argmax, dyn_mask_to_score, dyn_min_p_mask, dyn_softmax, dyn_temperature_scale,
     dselect,
 };
+use crate::kinds::{CanonicalKind, infer_kind};
 
 /// A legacy sampler spec (mirrors the SDK `Sampler` enum). golf translates the
 /// inferlet-facing `Sampler` into this.
@@ -24,6 +25,28 @@ pub enum SamplerSpec {
     Multinomial { temperature: f32 },
 }
 
+/// Classify a [`SamplerSpec`] to its [`CanonicalKind`] via the frozen recognizer
+/// ladder ([`infer_kind`]) — the SDK-side half of the de-hardwiring recognizer
+/// (#8). The same kind is stamped on [`build_sampler`]'s [`Built`]; a drift-guard
+/// test asserts it equals the runtime's `infer_sampler_kind` for the same params,
+/// so the SDK sugar and the host recognizer can never silently diverge.
+///
+/// `Argmax` carries no temperature (it is intrinsically greedy ≡ `T=0`), so it
+/// resolves through the `T<=0 -> Argmax` arm. The continuous params (temperature,
+/// `p`, `min_p`) are passed straight to the ladder; they ride the per-row `pi`
+/// carrier in production, so they classify the kind but never enter the tag.
+pub fn canonical_kind(spec: SamplerSpec) -> CanonicalKind {
+    let (t, k, top_p, min_p) = match spec {
+        SamplerSpec::Argmax => (0.0, 0, 1.0, 0.0),
+        SamplerSpec::Multinomial { temperature } => (temperature, 0, 1.0, 0.0),
+        SamplerSpec::TopP { temperature, p } => (temperature, 0, p, 0.0),
+        SamplerSpec::TopK { temperature, k } => (temperature, k, 1.0, 0.0),
+        SamplerSpec::MinP { temperature, p } => (temperature, 0, 1.0, p),
+        SamplerSpec::TopKTopP { temperature, k, p } => (temperature, k, p, 0.0),
+    };
+    infer_kind(t, k, top_p, min_p)
+}
+
 fn is_greedy(t: f32) -> bool {
     t <= 0.0
 }
@@ -31,6 +54,7 @@ fn is_greedy(t: f32) -> bool {
 /// Build the IR program for `spec` at runtime `vocab`. `outputs = [Token]`.
 pub fn build_sampler(spec: SamplerSpec, vocab: u32) -> Result<Built, BuildError> {
     let g = Graph::new(vocab);
+    g.set_canonical_kind(canonical_kind(spec));
     let logits = g.intrinsic_logits_dyn();
 
     let token = match spec {

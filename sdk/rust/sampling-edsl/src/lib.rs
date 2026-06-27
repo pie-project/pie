@@ -32,14 +32,16 @@ extern crate alloc;
 pub mod builder;
 pub mod dynamic;
 pub mod ir;
+pub mod kinds;
 pub mod program;
 pub mod standard;
 pub mod sugar;
 
 pub use builder::{BuildError, Built, Graph, HostInputDecl, LoweredProgram, OutputKind};
 pub use dynamic::{DynValue, dselect};
-pub use standard::{StandardSampler, StdParamKeys, build_standard};
-pub use sugar::{SamplerSpec, build_sampler, lower_sampler};
+pub use kinds::{CanonicalKind, infer_kind};
+pub use standard::{StandardSampler, StdParamKeys, build_standard, standard_program, standard_programs};
+pub use sugar::{SamplerSpec, build_sampler, canonical_kind, lower_sampler};
 
 // IR enums an author touches at the surface.
 pub use ir::{DType, Readiness};

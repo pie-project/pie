@@ -40,6 +40,21 @@ use crate::dynamic::{
     dyn_temperature_scale,
 };
 use crate::ir::{DType, Readiness, TensorKey};
+use crate::kinds::CanonicalKind;
+use alloc::vec::Vec;
+
+impl From<StandardSampler> for CanonicalKind {
+    fn from(s: StandardSampler) -> Self {
+        match s {
+            StandardSampler::Argmax => CanonicalKind::Argmax,
+            StandardSampler::Temperature => CanonicalKind::Temperature,
+            StandardSampler::MinP => CanonicalKind::MinP,
+            StandardSampler::TopK { .. } => CanonicalKind::TopK,
+            StandardSampler::TopP => CanonicalKind::TopP,
+            StandardSampler::TopKTopP { .. } => CanonicalKind::TopKTopP,
+        }
+    }
+}
 
 /// The per-row HostSubmit parameter keys a standard-sampler program declares. A
 /// field is `Some(key)` iff the program consumes that param — bind row `r`'s
@@ -104,6 +119,7 @@ pub fn build_standard(
 /// the (B) order lands it first to prove the batched bind + scatter).
 pub fn argmax(vocab: u32) -> Result<Built, BuildError> {
     let g = Graph::new(vocab);
+    g.set_canonical_kind(CanonicalKind::Argmax);
     let logits = g.intrinsic_logits_dyn(); // [vocab]
     let token = logits.argmax();
     g.output(&token, OutputKind::Token);
@@ -114,6 +130,7 @@ pub fn argmax(vocab: u32) -> Result<Built, BuildError> {
 /// scalar HostSubmit input (per-row at launch); seed is ambient batch axis.
 pub fn temperature(vocab: u32) -> Result<(Built, StdParamKeys), BuildError> {
     let g = Graph::new(vocab);
+    g.set_canonical_kind(CanonicalKind::Temperature);
     let logits = g.intrinsic_logits_dyn();
     let temp = g.host_scalar_dyn(DType::F32, Readiness::Submit);
 
@@ -134,6 +151,7 @@ pub fn temperature(vocab: u32) -> Result<(Built, StdParamKeys), BuildError> {
 /// HostSubmit inputs; seed is ambient batch axis (`stream:0`).
 pub fn min_p(vocab: u32) -> Result<(Built, StdParamKeys), BuildError> {
     let g = Graph::new(vocab);
+    g.set_canonical_kind(CanonicalKind::MinP);
     let logits = g.intrinsic_logits_dyn();
     let temp = g.host_scalar_dyn(DType::F32, Readiness::Submit);
     let minp = g.host_scalar_dyn(DType::F32, Readiness::Submit);
@@ -157,6 +175,7 @@ pub fn min_p(vocab: u32) -> Result<(Built, StdParamKeys), BuildError> {
 /// temperature is a scalar HostSubmit input; seed is ambient (`stream:0`).
 pub fn top_k(vocab: u32, k: u32) -> Result<(Built, StdParamKeys), BuildError> {
     let g = Graph::new(vocab);
+    g.set_canonical_kind(CanonicalKind::TopK);
     let logits = g.intrinsic_logits_dyn();
     let temp = g.host_scalar_dyn(DType::F32, Readiness::Submit);
 
@@ -178,6 +197,7 @@ pub fn top_k(vocab: u32, k: u32) -> Result<(Built, StdParamKeys), BuildError> {
 /// and `p` are scalar HostSubmit inputs; seed is ambient (`stream:0`).
 pub fn top_p(vocab: u32) -> Result<(Built, StdParamKeys), BuildError> {
     let g = Graph::new(vocab);
+    g.set_canonical_kind(CanonicalKind::TopP);
     let logits = g.intrinsic_logits_dyn();
     let temp = g.host_scalar_dyn(DType::F32, Readiness::Submit);
     let pv = g.host_scalar_dyn(DType::F32, Readiness::Submit);
@@ -202,6 +222,7 @@ pub fn top_p(vocab: u32) -> Result<(Built, StdParamKeys), BuildError> {
 /// and `p` are scalar HostSubmit inputs; seed is ambient (`stream:0`).
 pub fn top_k_top_p(vocab: u32, k: u32) -> Result<(Built, StdParamKeys), BuildError> {
     let g = Graph::new(vocab);
+    g.set_canonical_kind(CanonicalKind::TopKTopP);
     let logits = g.intrinsic_logits_dyn();
     let temp = g.host_scalar_dyn(DType::F32, Readiness::Submit);
     let pv = g.host_scalar_dyn(DType::F32, Readiness::Submit);
@@ -222,4 +243,40 @@ pub fn top_k_top_p(vocab: u32, k: u32) -> Result<(Built, StdParamKeys), BuildErr
         ..Default::default()
     };
     Ok((g.build()?, keys))
+}
+
+// ============================================================================
+// #12 reference set: canonical program -> kind (the hash-table source)
+// ============================================================================
+
+/// The canonical bytecode + [`CanonicalKind`] for one standard sampler — the
+/// `program → kind` reference the #12 classifier hash-matches against (alpha's
+/// table interns `program_hash(bytecode) → kind`). For a **k-bearing** kind the
+/// bytecode is k-specific (the baked `RankLe(k)` immediate); the **k-invariant**
+/// kinds (their continuous params are host-submit inputs, not baked) have a
+/// single canonical bytecode per `vocab`.
+pub fn standard_program(
+    kind: StandardSampler,
+    vocab: u32,
+) -> Result<(Vec<u8>, CanonicalKind), BuildError> {
+    let (built, _) = build_standard(kind, vocab)?;
+    Ok((built.lower().bytecode, kind.into()))
+}
+
+/// The **k-invariant** standard programs (Argmax, Temperature, MinP, TopP) for
+/// runtime `vocab` — each has a single canonical bytecode per `vocab`, so their
+/// hashes are stable reference entries for the #12 `{hash → kind}` table. The
+/// **k-bearing** kinds (TopK, TopKTopP) bake `k` into a `RankLe` immediate so
+/// their bytecode varies by `k`: obtain those per-`k` via [`standard_program`],
+/// or recognize them structurally via the op-shape matcher.
+pub fn standard_programs(vocab: u32) -> Result<Vec<(Vec<u8>, CanonicalKind)>, BuildError> {
+    [
+        StandardSampler::Argmax,
+        StandardSampler::Temperature,
+        StandardSampler::MinP,
+        StandardSampler::TopP,
+    ]
+    .into_iter()
+    .map(|k| standard_program(k, vocab))
+    .collect()
 }

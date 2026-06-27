@@ -265,6 +265,7 @@ mod supply_api_tests {
                 decl(12, Readiness::Late),
             ],
             bindings: Vec::new(),
+            canonical_kind: Default::default(),
         };
 
         assert_eq!(prog.host_inputs.len(), 3);

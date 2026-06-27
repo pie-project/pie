@@ -24,18 +24,10 @@ use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
 use lru::LruCache;
 use pie_sampling_ir::{OutputKind, SamplingProgram, ValidationError};
 
-/// FNV-1a 64-bit, byte-identical to the driver's `jit::fnv1a64` — so the host's
-/// program hash equals the driver `ProgramHandle` (one key across the boundary).
-pub fn program_hash(bytecode: &[u8]) -> u64 {
-    const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
-    const PRIME: u64 = 0x0000_0100_0000_01b3;
-    let mut h = OFFSET;
-    for &b in bytecode {
-        h ^= b as u64;
-        h = h.wrapping_mul(PRIME);
-    }
-    h
-}
+/// FNV-1a 64-bit program-identity hash — re-exported from `pie-sampling-ir` (the
+/// single canonical impl beside `encode`, byte-identical to the driver's
+/// `jit::fnv1a64` ⇒ host hash == driver `ProgramHandle`).
+pub use pie_sampling_ir::program_hash;
 
 /// The interned, immutable artifact for one distinct sampler program.
 #[derive(Debug)]
@@ -149,15 +141,6 @@ mod tests {
 
     fn enc(p: &SamplingProgram) -> Vec<u8> {
         pie_sampling_ir::encode(p)
-    }
-
-    #[test]
-    fn fnv1a64_matches_driver_vectors() {
-        // Standard FNV-1a-64 vectors == the driver's `jit::fnv1a64` (offset
-        // 0xcbf29ce484222325, prime 0x100000001b3).
-        assert_eq!(program_hash(b""), 0xcbf2_9ce4_8422_2325);
-        assert_eq!(program_hash(b"a"), 0xaf63_dc4c_8601_ec8c);
-        assert_eq!(program_hash(b"foobar"), 0x8594_4171_f739_67e8);
     }
 
     #[test]

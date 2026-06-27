@@ -83,3 +83,37 @@ pub const MAGIC: [u8; 4] = *b"PSIR";
 /// shapes as `rank:u8 | dims[]`. The structure differs from v1–v3, so a v4
 /// reader accepts only `version == 4` (older streams are rejected cleanly).
 pub const VERSION: u16 = 4;
+
+/// FNV-1a 64-bit hash of a program's canonical bytecode — the program's identity.
+///
+/// Byte-identical to the CUDA driver's `jit::fnv1a64`, so `program_hash(&encode(p))`
+/// equals the driver's `ProgramHandle` for the same program. Because [`encode`] is
+/// canonical (same program ⟺ same bytes), this is a *sound* program-identity key —
+/// the same value serves the host program cache, the driver compile cache, the
+/// cross-request group key, and the program→kind hash-match recognizer (one
+/// mechanism). It is the single FNV-1a impl: the runtime cache and the EDSL's
+/// standard-program reference set both hash through here, so they cannot drift.
+pub fn program_hash(bytecode: &[u8]) -> u64 {
+    const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+    let mut h = OFFSET;
+    for &b in bytecode {
+        h ^= b as u64;
+        h = h.wrapping_mul(PRIME);
+    }
+    h
+}
+
+#[cfg(test)]
+mod hash_tests {
+    use super::program_hash;
+
+    #[test]
+    fn program_hash_matches_driver_fnv1a64_vectors() {
+        // Standard FNV-1a-64 vectors == the driver's `jit::fnv1a64` (offset
+        // 0xcbf29ce484222325, prime 0x100000001b3).
+        assert_eq!(program_hash(b""), 0xcbf2_9ce4_8422_2325);
+        assert_eq!(program_hash(b"a"), 0xaf63_dc4c_8601_ec8c);
+        assert_eq!(program_hash(b"foobar"), 0x8594_4171_f739_67e8);
+    }
+}

@@ -264,3 +264,131 @@ fn eval_top_p_token_in_nucleus() {
         assert!(nuc.contains(&t), "seed {s}: token {t} not in top-p nucleus {nuc:?}");
     }
 }
+
+// ── canonical-kind recognizer (#8) ───────────────────────────────────────────
+
+use sampling_edsl::{CanonicalKind, SamplerSpec, build_sampler, canonical_kind, infer_kind};
+
+/// `canonical_kind` derives from the frozen ladder: for every sampler spec it
+/// equals `infer_kind(its params)` — the SDK-sugar↔recognizer drift-guard.
+#[test]
+fn canonical_kind_matches_ladder() {
+    let cases = [
+        (SamplerSpec::Argmax, CanonicalKind::Argmax),
+        (SamplerSpec::Multinomial { temperature: 0.8 }, CanonicalKind::Temperature),
+        (SamplerSpec::TopP { temperature: 0.8, p: 0.9 }, CanonicalKind::TopP),
+        (SamplerSpec::TopK { temperature: 0.8, k: 40 }, CanonicalKind::TopK),
+        (SamplerSpec::MinP { temperature: 0.8, p: 0.05 }, CanonicalKind::MinP),
+        (SamplerSpec::TopKTopP { temperature: 0.8, k: 40, p: 0.9 }, CanonicalKind::TopKTopP),
+    ];
+    for (spec, want) in cases {
+        assert_eq!(canonical_kind(spec), want, "{spec:?}");
+    }
+}
+
+/// `T<=0 -> Argmax` is unconditional (any k/p) — the greedy neutrality fix.
+#[test]
+fn greedy_collapses_to_argmax_any_filter() {
+    for spec in [
+        SamplerSpec::Multinomial { temperature: 0.0 },
+        SamplerSpec::TopK { temperature: 0.0, k: 50 },
+        SamplerSpec::TopP { temperature: -1.0, p: 0.9 },
+        SamplerSpec::TopKTopP { temperature: 0.0, k: 50, p: 0.9 },
+        SamplerSpec::MinP { temperature: 0.0, p: 0.1 },
+    ] {
+        assert_eq!(canonical_kind(spec), CanonicalKind::Argmax, "{spec:?}");
+    }
+}
+
+/// The combined `top-k && top-p` arm precedes the standalone arms (no filter
+/// dropped); degenerate filters (`p>=1`, `k=0`) fall through correctly.
+#[test]
+fn ladder_precedence_and_degenerate_filters() {
+    assert_eq!(infer_kind(0.8, 40, 0.9, 0.0), CanonicalKind::TopKTopP); // both
+    assert_eq!(infer_kind(0.8, 40, 1.0, 0.0), CanonicalKind::TopK); // p>=1 not a filter
+    assert_eq!(infer_kind(0.8, 0, 0.9, 0.0), CanonicalKind::TopP);
+    assert_eq!(infer_kind(0.8, 0, 1.0, 0.0), CanonicalKind::Temperature); // no filters
+    assert_eq!(infer_kind(0.8, 0, 1.0, 0.2), CanonicalKind::MinP);
+}
+
+/// The stamp lands on `Built`/`LoweredProgram`: sugar → its kind; `build_standard`
+/// → its kind; a `Graph`-authored program → `Custom`.
+#[test]
+fn built_carries_canonical_kind() {
+    // sugar
+    let b = build_sampler(SamplerSpec::TopK { temperature: 0.8, k: 40 }, 64).unwrap();
+    assert_eq!(b.canonical_kind, CanonicalKind::TopK);
+    assert_eq!(b.lower().canonical_kind, CanonicalKind::TopK);
+    // greedy sugar collapses to Argmax (matches the program it actually builds)
+    let g = build_sampler(SamplerSpec::TopP { temperature: 0.0, p: 0.9 }, 64).unwrap();
+    assert_eq!(g.canonical_kind, CanonicalKind::Argmax);
+    // standard
+    let (s, _) = build_standard(StandardSampler::MinP, 64).unwrap();
+    assert_eq!(s.canonical_kind, CanonicalKind::MinP);
+    // custom (Graph-authored): grammar program is not a recognized standard kind
+    let (custom, _) = sampling_edsl::program::grammar(64).unwrap();
+    assert_eq!(custom.canonical_kind, CanonicalKind::Custom);
+}
+
+/// The `top_p<=0` edge (#7 reconciliation): a degenerate nucleus mass is NOT a
+/// top-p filter — the recognizer's `0<top_p<1` correctly excludes it (the legacy
+/// bare `top_p<1` is looser; #7 aligns the agreement check to this side).
+#[test]
+fn top_p_le_zero_is_not_a_filter() {
+    assert_eq!(infer_kind(0.8, 0, 0.0, 0.0), CanonicalKind::Temperature); // T>0, no real filter
+    assert_eq!(infer_kind(0.8, 0, -0.5, 0.0), CanonicalKind::Temperature);
+    assert_eq!(infer_kind(0.8, 40, 0.0, 0.0), CanonicalKind::TopK); // top_p=0 => TopK, not TopKTopP
+    assert_eq!(infer_kind(0.8, 0, 0.0, 0.2), CanonicalKind::MinP); // falls through to min_p
+    // T<=0 still wins over everything (greedy), even with a degenerate top_p.
+    assert_eq!(infer_kind(0.0, 40, 0.0, 0.0), CanonicalKind::Argmax);
+}
+
+// ── #12 reference set + entropy probe (#15 foundations) ──────────────────────
+
+#[test]
+fn standard_programs_reference_set() {
+    use sampling_edsl::{standard_program, standard_programs};
+    let progs = standard_programs(128).unwrap();
+    // The 4 k-invariant kinds, in order, each mapped to its CanonicalKind.
+    let kinds: Vec<CanonicalKind> = progs.iter().map(|(_, k)| *k).collect();
+    assert_eq!(
+        kinds,
+        vec![
+            CanonicalKind::Argmax,
+            CanonicalKind::Temperature,
+            CanonicalKind::MinP,
+            CanonicalKind::TopP
+        ]
+    );
+    // All-distinct bytecode => distinct hashes for alpha's {hash->kind} table.
+    let set: std::collections::HashSet<&Vec<u8>> = progs.iter().map(|(b, _)| b).collect();
+    assert_eq!(set.len(), 4, "standard program bytecode must be all-distinct");
+    // k-bearing: classifies TopK; bytecode varies by k (the RankLe immediate).
+    let (b40, k40) = standard_program(StandardSampler::TopK { k: 40 }, 128).unwrap();
+    let (b50, k50) = standard_program(StandardSampler::TopK { k: 50 }, 128).unwrap();
+    assert_eq!(k40, CanonicalKind::TopK);
+    assert_eq!(k50, CanonicalKind::TopK);
+    assert_ne!(b40, b50, "k-bearing bytecode varies by k");
+}
+
+#[test]
+fn entropy_probe_structure_and_eval() {
+    use sampling_edsl::program::entropy;
+    let b = entropy(8).unwrap();
+    // Scalar-output measurement, classified Custom (not a token-sampler kind).
+    assert_eq!(b.outputs, vec![OutputKind::Scalar]);
+    assert_eq!(b.canonical_kind, CanonicalKind::Custom);
+    assert!(b.host_inputs.is_empty());
+
+    let logits = logits8();
+    let inputs = bind(&b, &logits, &[]);
+    let out = eval(&prog(&b), &InputBindings::new(&inputs, 1)).unwrap();
+    let h = match &out[0] {
+        EvalValue::F32(v) => v[0],
+        o => panic!("expected F32 scalar, got {o:?}"),
+    };
+    // Reference H = -Σ p·ln p.
+    let probs = softmax(&logits);
+    let expected: f32 = -probs.iter().map(|&p| p * p.ln()).sum::<f32>();
+    assert!((h - expected).abs() < 1e-4, "entropy {h} != reference {expected}");
+}
