@@ -58,3 +58,8 @@ xz2 = "0.1"
 
 [dev-dependencies]
 tempfile = "3"
+# Client edge for the 4090 capability harness (programmable_sampler_4090): the
+# in-process submit path (connect → add_program → launch → wait_for_return).
+pie-client = { path = "../../client/rust" }
+# Diagnostic trace subscriber for the inproc forward-path probes (RUST_LOG).
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

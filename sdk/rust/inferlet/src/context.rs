@@ -13,7 +13,6 @@ use crate::Result;
 use crate::inference::ForwardPass;
 use crate::model::Model;
 use crate::sample::Sampler;
-use serde_json;
 
 /// The raw WIT context resource, re-exported for power users.
 pub use crate::pie::core::context::Context as RawContext;
@@ -415,7 +414,7 @@ impl Context {
 
         // Reserve additional pages if we need more than currently allocated.
         let total_tokens_after = self.working_tokens + num_tokens;
-        let pages_needed = (total_tokens_after + self.page_size - 1) / self.page_size;
+        let pages_needed = total_tokens_after.div_ceil(self.page_size);
         let additional = pages_needed.saturating_sub(self.working_pages);
         if additional > 0 {
             self.inner
@@ -425,13 +424,13 @@ impl Context {
         }
 
         // Build and execute a forward pass.
-        let pass = ForwardPass::new(&self.model);
+        let pass = ForwardPass::new();
         pass.context(&self.inner);
 
         let positions: Vec<u32> = (self.seq_len..self.seq_len + num_tokens).collect();
         pass.input_tokens(&tokens, &positions);
 
-        pass.execute_async()
+        pass.execute_outputs()
             .await
             .map_err(|e| format!("Forward pass failed: {}", e))?;
 
@@ -482,7 +481,7 @@ impl Context {
         let span = image.position_span();
 
         let total_tokens_after = self.working_tokens + num_tokens;
-        let pages_needed = (total_tokens_after + self.page_size - 1) / self.page_size;
+        let pages_needed = total_tokens_after.div_ceil(self.page_size);
         let additional = pages_needed.saturating_sub(self.working_pages);
         if additional > 0 {
             self.inner
@@ -491,10 +490,10 @@ impl Context {
             self.working_pages = pages_needed;
         }
 
-        let pass = ForwardPass::new(&self.model);
+        let pass = ForwardPass::new();
         pass.context(&self.inner);
         pass.input_image(image, self.seq_len);
-        pass.execute_async()
+        pass.execute_outputs()
             .await
             .map_err(|e| format!("append_image: forward pass: {}", e))?;
 
@@ -553,7 +552,7 @@ impl Context {
         }
 
         let total_tokens_after = self.working_tokens + num_tokens;
-        let pages_needed = (total_tokens_after + self.page_size - 1) / self.page_size;
+        let pages_needed = total_tokens_after.div_ceil(self.page_size);
         let additional = pages_needed.saturating_sub(self.working_pages);
         if additional > 0 {
             self.inner
@@ -562,10 +561,10 @@ impl Context {
             self.working_pages = pages_needed;
         }
 
-        let pass = ForwardPass::new(&self.model);
+        let pass = ForwardPass::new();
         pass.context(&self.inner);
         pass.input_audio(audio, self.seq_len);
-        pass.execute_async()
+        pass.execute_outputs()
             .await
             .map_err(|e| format!("append_audio: forward pass: {}", e))?;
 

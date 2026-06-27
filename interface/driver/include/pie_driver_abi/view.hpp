@@ -144,6 +144,24 @@ struct PieForwardRequestView {
     PieSlice<std::uint32_t> sampling_indices;
     PieSlice<std::uint32_t> sampling_indptr;
 
+    // Programmable sampling (Sampling IR carrier). Empty for the legacy
+    // per-slot sampler path. The driver parses + JIT-caches the bytecode by
+    // hash; outputs surface through the existing ForwardResponse slots in the
+    // program's declared output order. See schema.rs / BYTECODE.md.
+    PieSlice<std::uint32_t> sampling_program_indptr;        // per-request program CSR
+    PieSlice<std::uint8_t>  sampling_program_bytes;         // concatenated bytecode
+    PieSlice<std::uint32_t> sampling_program_bytes_indptr;  // per-program byte CSR
+    PieSlice<std::uint8_t>  sampling_input_blob;            // submit-bound input bytes
+    PieSlice<std::uint32_t> sampling_input_keys;            // input key per entry
+    PieSlice<std::uint32_t> sampling_input_offsets;         // byte offset per entry
+    PieSlice<std::uint32_t> sampling_input_lens;            // byte length per entry
+    PieSlice<std::uint32_t> sampling_input_indptr;          // per-program input CSR
+    PieSlice<std::uint32_t> sampling_late_keys;             // declared late-bound keys
+    PieSlice<std::uint32_t> sampling_late_indptr;           // per-program late-key CSR
+    PieSlice<std::uint8_t>  sampling_late_blob;             // host-late value bytes
+    PieSlice<std::uint32_t> sampling_late_offsets;          // byte offset per late key
+    PieSlice<std::uint32_t> sampling_late_lens;             // byte length per late key
+
     // Sampler attributes (SoA — read from the wire SoA arrays; view.hpp
     // applies only the small kind-remap / top_k / top_p-min_p fold).
     PieSlice<std::uint32_t> sampler_types;
@@ -406,6 +424,32 @@ inline void fill_forward_view(const PieForwardRequestDesc& f,
     out.logit_mask_indptr = slice_from(arenas.logit_mask_byte_indptr.data(), arenas.logit_mask_byte_indptr.size());
     out.sampling_indices  = slice_from(f.sampling_indices_ptr, f.sampling_indices_len);
     out.sampling_indptr   = slice_from(f.sampling_indptr_ptr, f.sampling_indptr_len);
+    out.sampling_program_indptr =
+        slice_from(f.sampling_program_indptr_ptr, f.sampling_program_indptr_len);
+    out.sampling_program_bytes =
+        slice_from(f.sampling_program_bytes_ptr, f.sampling_program_bytes_len);
+    out.sampling_program_bytes_indptr =
+        slice_from(f.sampling_program_bytes_indptr_ptr, f.sampling_program_bytes_indptr_len);
+    out.sampling_input_blob =
+        slice_from(f.sampling_input_blob_ptr, f.sampling_input_blob_len);
+    out.sampling_input_keys =
+        slice_from(f.sampling_input_keys_ptr, f.sampling_input_keys_len);
+    out.sampling_input_offsets =
+        slice_from(f.sampling_input_offsets_ptr, f.sampling_input_offsets_len);
+    out.sampling_input_lens =
+        slice_from(f.sampling_input_lens_ptr, f.sampling_input_lens_len);
+    out.sampling_input_indptr =
+        slice_from(f.sampling_input_indptr_ptr, f.sampling_input_indptr_len);
+    out.sampling_late_keys =
+        slice_from(f.sampling_late_keys_ptr, f.sampling_late_keys_len);
+    out.sampling_late_indptr =
+        slice_from(f.sampling_late_indptr_ptr, f.sampling_late_indptr_len);
+    out.sampling_late_blob =
+        slice_from(f.sampling_late_blob_ptr, f.sampling_late_blob_len);
+    out.sampling_late_offsets =
+        slice_from(f.sampling_late_offsets_ptr, f.sampling_late_offsets_len);
+    out.sampling_late_lens =
+        slice_from(f.sampling_late_lens_ptr, f.sampling_late_lens_len);
     out.spec_token_ids    = slice_from(f.spec_token_ids_ptr, f.spec_token_ids_len);
     out.spec_position_ids = slice_from(f.spec_position_ids_ptr, f.spec_position_ids_len);
     out.spec_indptr       = slice_from(f.spec_indptr_ptr, f.spec_indptr_len);

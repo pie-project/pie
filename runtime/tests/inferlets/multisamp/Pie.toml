@@ -1,0 +1,4 @@
+[package]
+name = "multisamp"
+version = "0.1.0"
+description = "Test inferlet: generates with each standard sampler kind (top-k, top-p, min-p, top-k-top-p) in sequence — exercises the #7 per-kind dispatch coverage"

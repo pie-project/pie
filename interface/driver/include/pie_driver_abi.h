@@ -46,6 +46,12 @@ constexpr static const uint8_t PIE_SAMPLER_LOGPROBS = 9;
 
 constexpr static const uint8_t PIE_SAMPLER_ENTROPY = 10;
 
+/// Wire discriminant for a `Logits` slot.
+constexpr static const uint8_t SamplingBinding_KIND_LOGITS = 0;
+
+/// Wire discriminant for a `Tensor` slot.
+constexpr static const uint8_t SamplingBinding_KIND_TENSOR = 1;
+
 /// Copy direction for [`crate::CopyRequest`].
 enum PieCopyDir : uint8_t {
   PieCopyDir_D2H,
@@ -172,6 +178,45 @@ struct PieForwardRequestDesc {
   size_t audio_anchor_rows_len;
   const uint32_t *audio_indptr_ptr;
   size_t audio_indptr_len;
+  const uint32_t *sampling_program_indptr_ptr;
+  size_t sampling_program_indptr_len;
+  const uint8_t *sampling_program_bytes_ptr;
+  size_t sampling_program_bytes_len;
+  const uint32_t *sampling_program_bytes_indptr_ptr;
+  size_t sampling_program_bytes_indptr_len;
+  const uint8_t *sampling_input_blob_ptr;
+  size_t sampling_input_blob_len;
+  const uint32_t *sampling_input_keys_ptr;
+  size_t sampling_input_keys_len;
+  const uint32_t *sampling_input_offsets_ptr;
+  size_t sampling_input_offsets_len;
+  const uint32_t *sampling_input_lens_ptr;
+  size_t sampling_input_lens_len;
+  const uint32_t *sampling_input_indptr_ptr;
+  size_t sampling_input_indptr_len;
+  const uint32_t *sampling_late_keys_ptr;
+  size_t sampling_late_keys_len;
+  const uint32_t *sampling_late_indptr_ptr;
+  size_t sampling_late_indptr_len;
+  const uint8_t *sampling_late_blob_ptr;
+  size_t sampling_late_blob_len;
+  const uint32_t *sampling_late_offsets_ptr;
+  size_t sampling_late_offsets_len;
+  const uint32_t *sampling_late_lens_ptr;
+  size_t sampling_late_lens_len;
+  const uint8_t *sampling_binding_kind_ptr;
+  size_t sampling_binding_kind_len;
+  const uint32_t *sampling_binding_key_ptr;
+  size_t sampling_binding_key_len;
+  const uint32_t *sampling_binding_indptr_ptr;
+  size_t sampling_binding_indptr_len;
+  uint32_t pipeline_source_link;
+  const uint32_t *next_input_producer_links_ptr;
+  size_t next_input_producer_links_len;
+  const uint32_t *next_input_src_rows_ptr;
+  size_t next_input_src_rows_len;
+  const uint32_t *next_input_dest_slots_ptr;
+  size_t next_input_dest_slots_len;
 };
 
 struct PieCopyRequestDesc {

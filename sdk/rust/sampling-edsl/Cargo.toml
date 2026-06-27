@@ -1,0 +1,32 @@
+[package]
+name = "sampling-edsl"
+version = "0.1.0"
+edition = "2024"
+authors = ["In Gim <in.gim@yale.edu>"]
+description = "Typed builder EDSL (Lane L5) that lowers to the Pie Sampling IR (pie-sampling-ir)"
+license = "Apache-2.0"
+repository = "https://github.com/pie-project/pie"
+keywords = ["pie", "sampling", "edsl", "inferlet"]
+categories = ["api-bindings"]
+
+# Standalone crate (not in the host workspace, like sdk/rust/*) so it can be
+# `cargo test`ed on the host. Authors and lowers against the canonical
+# `pie-sampling-ir` (interface/sampling-ir). `no_std` + `alloc` by default-off
+# of `std`, so it can be folded into the wasm SDK / used from inferlets. No
+# proc-macros in v0.
+
+[features]
+default = ["std"]
+# Host-side: enables the `std::error::Error` impl and the IR crate's `std`.
+std = ["pie-sampling-ir/std"]
+
+[dependencies]
+pie-sampling-ir = { path = "../../../interface/sampling-ir", default-features = false }
+
+# Host-only: the CPU reference interpreter (`eval`) for numeric parity tests.
+# Dev-deps are excluded from the wasm build, so this never reaches the SDK.
+[dev-dependencies]
+pie-sampling-ir = { path = "../../../interface/sampling-ir", features = ["eval"] }
+
+[lints.rust]
+unsafe_code = "forbid"

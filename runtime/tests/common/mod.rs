@@ -6,5 +6,6 @@
 mod env;
 pub mod inferlets;
 pub mod mock_device;
+pub mod sampler_assert;
 
 pub use env::{MockEnv, create_mock_env};

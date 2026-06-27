@@ -51,9 +51,33 @@ pub use context::{
 // =============================================================================
 
 pub mod audio;
+pub mod emit;
 pub mod forward;
 pub mod http;
+pub mod program;
 pub mod sample;
+
+/// Sampling-IR EDSL — re-export of the `sampling-edsl` crate so inferlets can
+/// author programmable samplers (`Graph`, helpers like `softmax` / `top_p_mask`
+/// / `mirostat_mask` / `grammar_mask`, typed `Value` handles) with a single
+/// `inferlet` dependency. Build a program, then (Stage 2, foxtrot's guest emit)
+/// lower it to a [`tensor::Program`](crate::tensor::Program) and attach it via
+/// [`Forward::sampler`](crate::forward::Forward::sampler).
+pub mod sampling {
+    pub use sampling_edsl::*;
+}
+
+/// Device tensor + tensor-program substrate (the WIT `tensor` interface).
+///
+/// Exposes the generated `tensor::{Tensor, Program, Op, OpKind, Value, Input,
+/// Dtype, Literal, Predicate, RngKind}` bindings — the **front door** the guest
+/// emit (`SamplingProgram` → `op-kind`) and program-authoring inferlets build
+/// against. A [`Program`](tensor::Program) is binding-free and reusable;
+/// attach it (with attach-time input bindings) via
+/// [`Forward::sampler`](crate::forward::Forward::sampler).
+pub mod tensor {
+    pub use crate::pie::core::tensor::*;
+}
 
 // =============================================================================
 // Generation state machine + decoders + speculation
@@ -132,25 +156,22 @@ use wstd::io::AsyncPollable;
 
 /// Extension trait for async forward pass operations.
 pub trait ForwardPassExt {
-    /// Executes the forward pass and waits for the result asynchronously.
-    fn execute_async(&self) -> impl std::future::Future<Output = Result<inference::Output>>;
+    /// Submit the pass, then await its sampler output tensors in the program's
+    /// declared output order. A no-sampler pass (prefill / flush) returns an
+    /// empty list once the forward completes.
+    fn execute_outputs(
+        &self,
+    ) -> impl std::future::Future<Output = Result<Vec<crate::tensor::Tensor>>>;
 }
 
 impl ForwardPassExt for inference::ForwardPass {
-    async fn execute_async(&self) -> Result<inference::Output> {
-        let future_output = self.execute()?;
-        if let Some(output) = future_output.get() {
-            return Ok(output);
-        }
-        let pollable = future_output.pollable();
-        AsyncPollable::new(pollable).wait_for().await;
-        for _ in 0..256 {
-            if let Some(output) = future_output.get() {
-                return Ok(output);
-            }
-            wstd::task::sleep(wstd::time::Duration::from_micros(1)).await;
-        }
-        Err("No output available".to_string())
+    async fn execute_outputs(&self) -> Result<Vec<crate::tensor::Tensor>> {
+        // `execute()` submits; `output()` is the completion barrier and yields
+        // the sampler result tensors (host-driven async). For a flush the
+        // result is empty — callers await it purely for the completion barrier.
+        self.execute();
+        self.output()
+            .map_err(|e| format!("forward output: {e:?}"))
     }
 }
 
@@ -279,10 +300,12 @@ pub mod prelude {
     pub use crate::{Child, Context, Result, Schema, Tool, launch};
     pub use crate::{main, tool};
 
-    pub use crate::forward::{Forward, Output, ProbeHandle, SampleHandle};
+    pub use crate::forward::{Forward, Output};
     pub use crate::generation::{GenStep, Generator};
-    pub use crate::sample::{Probe, Sampler};
+    pub use crate::program::{LoweredProgramExt, ProgramHandle};
+    pub use crate::sample::Sampler;
     pub use crate::spec::Speculator;
+    pub use crate::tensor;
     pub use crate::{chat, reasoning, tools};
 
     // Extension traits

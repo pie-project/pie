@@ -8,6 +8,7 @@ world imports {
     import session;
     import model;
     import runtime;
+    import tensor;
     import inference;
     import scheduling;
     import media;

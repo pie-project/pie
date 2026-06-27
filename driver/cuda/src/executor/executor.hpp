@@ -20,6 +20,9 @@
 #include "model/llama_like.hpp"
 #include "executor/persistent_inputs.hpp"
 #include <pie_driver_abi/response_builder.hpp>
+#include <memory>
+
+#include "sampling_ir/jit_backend.hpp"
 
 namespace pie_cuda_driver {
 
@@ -340,6 +343,18 @@ struct Executor {
     // view stays valid until the next `build()` call, which is long
     // enough for the `send_response` that immediately follows.
     pie_driver::ResponseBuilder response_builder;
+
+    // Programmable sampling (Sampling IR, lane L4). The runtime owns the
+    // mode-select + input binding + skip policy and consumes the abstract
+    // `IProgramBackend`; the concrete `SamplingIrBackend` (codegen + NVRTC JIT)
+    // is constructed lazily on the first program-carrying fire — when a CUDA
+    // context is guaranteed current — and registered via `set_backend`. Null
+    // backend ⇒ `try_run` returns NoProgram ⇒ legacy sampler path.
+    sampling_ir::SamplingIrRuntime sampling_ir_runtime{};
+    std::unique_ptr<sampling_ir::SamplingIrBackend> sampling_ir_backend{};
+    // Guards one-shot lazy backend construction so a hard init failure (e.g.
+    // no NVRTC) doesn't retry + re-log every fire.
+    bool sampling_ir_init_attempted = false;
 
 };
 

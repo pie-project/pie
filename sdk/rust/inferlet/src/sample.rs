@@ -1,22 +1,16 @@
-//! Sampler and probe specifications.
+//! Sampler specifications.
 //!
-//! The host's `forward-pass.sampler` slot accepts a single WIT variant that
-//! folds two unrelated concerns together:
+//! [`Sampler`] is the ergonomic "give me a token" enum (top-p, top-k,
+//! multinomial, …). Under the program-based front door it is **sugar that
+//! lowers to a tensor program** (WS5 de-hardwiring): [`Sampler::lower`] produces
+//! a Sampling-IR program that the host runs through the IR-JIT path, replacing
+//! the retired hardwired WIT `sampler` variant.
 //!
-//! - **Sampling**: pick a token from the next-token distribution (top-p,
-//!   top-k, multinomial, …). Produces an `Output::Token` slot.
-//! - **Probing**: read out shape information without picking a token (raw
-//!   logits, distribution, logprobs, entropy). Produces an `Output::Logits` /
-//!   `Distribution` / `Logprobs` / `Entropy` slot.
-//!
-//! The SDK keeps these distinct. [`Sampler`] is for "give me a token";
-//! probes are unit-like or small structs (e.g. [`Distribution`], [`Logits`])
-//! that double as their own type-level marker so each
-//! [`ProbeHandle`](crate::forward::ProbeHandle) statically dispatches to the
-//! matching `Output::*` accessor. Both compile down to the same WIT slot,
-//! so a single forward pass can mix them freely.
-
-use crate::pie::core::inference::Sampler as WitSampler;
+//! NOTE (Stage 2): the lowering currently produces a `sampling-edsl`
+//! `LoweredProgram` (bytecode). Foxtrot's guest emit re-targets it to a
+//! [`tensor::Program`](crate::tensor::Program) so [`Forward::sampler`] can
+//! attach it directly; until then the `Sampler → program` attach seam in
+//! [`crate::forward`] is a tracked stub.
 
 // =============================================================================
 // Sampler — picks a token
@@ -71,119 +65,61 @@ impl Sampler {
     }
 }
 
-impl From<Sampler> for WitSampler {
+impl From<Sampler> for sampling_edsl::SamplerSpec {
     fn from(s: Sampler) -> Self {
+        use sampling_edsl::SamplerSpec as Spec;
         match s {
-            // The host treats `top-p` with `temperature = 0` as argmax — we
-            // reuse that path so callers don't pay for an extra variant.
-            Sampler::Argmax => WitSampler::TopP((0.0, 1.0)),
-            Sampler::TopP { temperature, p } => WitSampler::TopP((temperature, p)),
-            Sampler::TopK { temperature, k } => WitSampler::TopK((temperature, k)),
-            Sampler::MinP { temperature, p } => WitSampler::MinP((temperature, p)),
-            Sampler::TopKTopP { temperature, k, p } => WitSampler::TopKTopP((temperature, k, p)),
-            Sampler::Multinomial { temperature, draws } => {
-                WitSampler::Multinomial((temperature, draws))
-            }
+            Sampler::Argmax => Spec::Argmax,
+            Sampler::TopP { temperature, p } => Spec::TopP { temperature, p },
+            Sampler::TopK { temperature, k } => Spec::TopK { temperature, k },
+            Sampler::MinP { temperature, p } => Spec::MinP { temperature, p },
+            Sampler::TopKTopP { temperature, k, p } => Spec::TopKTopP { temperature, k, p },
+            // The IR multinomial is a single temperature-scaled draw; the
+            // legacy `draws` per-sample multiplier has no IR analog (always 1
+            // token per slot at M=1), so it is dropped.
+            Sampler::Multinomial { temperature, .. } => Spec::Multinomial { temperature },
         }
     }
 }
 
-// =============================================================================
-// Probes — distribution access
-// =============================================================================
-
-/// Probe spec. Each implementation describes a single probe and its output
-/// shape; [`Forward::probe`](crate::forward::Forward::probe) consumes a value of this
-/// trait and returns a `ProbeHandle<P::Out>` whose phantom type matches the
-/// `Output::*` accessor that decodes the result.
-///
-/// `Self::Out` is the *output marker* — usually `Self`, except for
-/// [`Logprob`] which collapses to [`Logprobs`] because both produce the same
-/// `SlotOutput::Logprobs` shape and are read by the same accessor.
-pub trait Probe: sealed::Sealed {
-    /// Output marker selecting the matching `Output::*` accessor.
-    type Out;
-    /// Lower into the WIT sampler variant.
-    fn into_wit(self) -> WitSampler;
-}
-
-mod sealed {
-    pub trait Sealed {}
-    impl Sealed for super::Logits {}
-    impl Sealed for super::Distribution {}
-    impl Sealed for super::Logprob {}
-    impl Sealed for super::Logprobs {}
-    impl Sealed for super::Entropy {}
-}
-
-// ── Markers / probe specs ─────────────────────────────────────────────
-
-/// Pre-softmax, untemperatured logits as packed native-endian f32 bytes
-/// (length = `vocab_size * 4`). Decode via `bytemuck::cast_slice` or equiv.
-#[derive(Copy, Clone, Debug)]
-pub struct Logits;
-
-/// Top-`k` token ids paired with their (post-softmax, temperature-scaled)
-/// probabilities. `k = 0` returns the full vocabulary.
-#[derive(Copy, Clone, Debug)]
-pub struct Distribution {
-    pub temperature: f32,
-    pub k: u32,
-}
-
-/// `log p(token | context)` at this position, without temperature scaling.
-/// Returned as a length-1 logprob list — read with [`Output::logprobs`].
-///
-/// [`Output::logprobs`]: crate::forward::Output::logprobs
-#[derive(Copy, Clone, Debug)]
-pub struct Logprob(pub u32);
-
-/// `log p(t | context)` for each `t` in the list, without temperature
-/// scaling. Returned as a length-K list in the order requested.
-#[derive(Clone, Debug)]
-pub struct Logprobs(pub Vec<u32>);
-
-/// Shannon entropy `H(p) = -sum(p log p)` of the unscaled distribution.
-#[derive(Copy, Clone, Debug)]
-pub struct Entropy;
-
-// ── Probe impls ───────────────────────────────────────────────────────
-
-impl Probe for Logits {
-    type Out = Logits;
-    fn into_wit(self) -> WitSampler {
-        WitSampler::RawLogits
+impl Sampler {
+    /// Lower this sampler to a Sampling-IR [`LoweredProgram`](crate::program::LoweredProgram)
+    /// for the given runtime `vocab`. The program outputs a single
+    /// [`OutputKind::Token`]. Under RNG model B the seed is **ambient** (the
+    /// runtime's per-row seed) and the stream id is static, so a lowered
+    /// sampler declares no seed host input.
+    ///
+    /// This is the WS5 de-hardwiring bridge. **Stage 2**: foxtrot's guest emit
+    /// re-targets the lowered program to a [`tensor::Program`](crate::tensor::Program)
+    /// so it attaches via [`Forward::sampler`](crate::forward::Forward::sampler).
+    pub fn lower(&self, vocab: u32) -> crate::Result<crate::program::LoweredProgram> {
+        sampling_edsl::sugar::lower_sampler(self.clone().into(), vocab)
+            .map_err(|e| format!("Sampler::lower: {e:?}"))
     }
 }
 
-impl Probe for Distribution {
-    type Out = Distribution;
-    fn into_wit(self) -> WitSampler {
-        WitSampler::Dist((self.temperature, self.k))
-    }
-}
+#[cfg(test)]
+mod ws5_sugar_tests {
+    use super::Sampler;
+    use sampling_edsl::OutputKind;
 
-impl Probe for Logprob {
-    /// Both `Logprob` and `Logprobs` collapse to the same output shape — the
-    /// host returns a length-K list per slot, with `K = 1` for the singular
-    /// case. Sharing the marker lets a single `output.logprobs(h)` accessor
-    /// serve both.
-    type Out = Logprobs;
-    fn into_wit(self) -> WitSampler {
-        WitSampler::Logprob(self.0)
-    }
-}
+    const VOCAB: u32 = 128;
 
-impl Probe for Logprobs {
-    type Out = Logprobs;
-    fn into_wit(self) -> WitSampler {
-        WitSampler::Logprobs(self.0)
-    }
-}
-
-impl Probe for Entropy {
-    type Out = Entropy;
-    fn into_wit(self) -> WitSampler {
-        WitSampler::Entropy
+    /// Every sampler variant lowers to a valid single-Token program.
+    #[test]
+    fn all_variants_lower_to_token_program() {
+        let samplers = [
+            Sampler::Argmax,
+            Sampler::TopP { temperature: 0.8, p: 0.9 },
+            Sampler::TopK { temperature: 0.8, k: 40 },
+            Sampler::MinP { temperature: 0.8, p: 0.05 },
+            Sampler::TopKTopP { temperature: 0.8, k: 40, p: 0.9 },
+            Sampler::Multinomial { temperature: 0.8, draws: 1 },
+        ];
+        for s in samplers {
+            let prog = s.lower(VOCAB).expect("lower");
+            assert_eq!(prog.outputs, vec![OutputKind::Token], "{s:?}");
+            assert!(!prog.bytecode.is_empty(), "{s:?}");
+        }
     }
 }

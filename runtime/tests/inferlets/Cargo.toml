@@ -5,6 +5,10 @@ members = [
     "context",
     "error",
     "generate",
+    "grammar",
+    "mirostat",
+    "tempgen",
+    "multisamp",
 ]
 
 [workspace.dependencies]

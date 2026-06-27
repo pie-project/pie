@@ -139,6 +139,53 @@ fn archived_adapter_request_layout() {
 // `Vec<Sampler>` was flattened to SoA), so there is no `ArchivedSampler` to
 // pin a layout for — the sampler data rides the primitive SoA Vecs above.
 
+/// The programmable-sampling carrier (lane L1) appends only `Vec<u8>`/`Vec<u32>`
+/// SoA fields, so the archived request stays all-`ArchivedVec` and 4-aligned.
+/// Pin the new fields' presence + ordering (every field sits after the audio
+/// side-channel and before the struct end) for the C++ Desc reader.
+#[test]
+fn archived_forward_request_sampling_program_carrier() {
+    let a = align_of::<ArchivedForwardRequest>();
+    assert_eq!(a, 4, "ArchivedVec keeps the request 4-aligned");
+
+    // The carrier block is appended after `audio_indptr`, in declaration order.
+    let audio = offset_of!(ArchivedForwardRequest, audio_indptr);
+    let prog_indptr = offset_of!(ArchivedForwardRequest, sampling_program_indptr);
+    let prog_bytes = offset_of!(ArchivedForwardRequest, sampling_program_bytes);
+    let prog_bytes_indptr = offset_of!(ArchivedForwardRequest, sampling_program_bytes_indptr);
+    let input_blob = offset_of!(ArchivedForwardRequest, sampling_input_blob);
+    let input_keys = offset_of!(ArchivedForwardRequest, sampling_input_keys);
+    let input_offsets = offset_of!(ArchivedForwardRequest, sampling_input_offsets);
+    let input_lens = offset_of!(ArchivedForwardRequest, sampling_input_lens);
+    let input_indptr = offset_of!(ArchivedForwardRequest, sampling_input_indptr);
+    let late_keys = offset_of!(ArchivedForwardRequest, sampling_late_keys);
+    let late_indptr = offset_of!(ArchivedForwardRequest, sampling_late_indptr);
+
+    // Strictly increasing offsets in declaration order, all after the audio
+    // block — each `ArchivedVec` is 8 bytes so the deltas are ≥ 8.
+    for (lo, hi) in [
+        (audio, prog_indptr),
+        (prog_indptr, prog_bytes),
+        (prog_bytes, prog_bytes_indptr),
+        (prog_bytes_indptr, input_blob),
+        (input_blob, input_keys),
+        (input_keys, input_offsets),
+        (input_offsets, input_lens),
+        (input_lens, input_indptr),
+        (input_indptr, late_keys),
+        (late_keys, late_indptr),
+    ] {
+        assert!(hi > lo, "carrier field out of order: {lo} !< {hi}");
+    }
+    assert!(late_indptr + 8 <= size_of::<ArchivedForwardRequest>());
+
+    eprintln!(
+        "ArchivedForwardRequest.sampling_program_indptr = {prog_indptr}\n\
+         ArchivedForwardRequest.sampling_program_bytes  = {prog_bytes}\n\
+         ArchivedForwardRequest.sampling_late_indptr    = {late_indptr}"
+    );
+}
+
 /// Print field offsets in addition to sizes for the C++ adapter author.
 #[test]
 fn dump_offsets() {

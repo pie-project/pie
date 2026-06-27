@@ -5,6 +5,8 @@ pub mod inference;
 pub mod media;
 pub mod messaging;
 pub mod model;
+pub mod program_cache;
+pub mod program_decode;
 pub mod runtime;
 pub mod scheduling;
 pub mod session;
@@ -36,9 +38,11 @@ wasmtime::component::bindgen!({
         // pie:core/model
         "pie:core/model.model": model::Model,
         "pie:core/model.tokenizer": model::Tokenizer,
+        // pie:core/tensor
+        "pie:core/tensor.tensor": inference::Tensor,
+        "pie:core/tensor.program": inference::Program,
         // pie:core/inference
         "pie:core/inference.forward-pass": inference::ForwardPass,
-        "pie:core/inference.future-output": inference::FutureOutput,
         "pie:core/inference.grammar": inference::Grammar,
         "pie:core/inference.matcher": inference::Matcher,
         // pie:core/runtime
@@ -69,6 +73,7 @@ where
     T: pie::core::types::Host
         + pie::core::context::Host
         + pie::core::model::Host
+        + pie::core::tensor::Host
         + pie::core::inference::Host
         + pie::core::messaging::Host
         + pie::core::session::Host
@@ -87,6 +92,7 @@ where
     pie::core::types::add_to_linker::<T, HasSelf<T>>(linker, |s| s)?;
     pie::core::context::add_to_linker::<T, HasSelf<T>>(linker, |s| s)?;
     pie::core::model::add_to_linker::<T, HasSelf<T>>(linker, |s| s)?;
+    pie::core::tensor::add_to_linker::<T, HasSelf<T>>(linker, |s| s)?;
     pie::core::inference::add_to_linker::<T, HasSelf<T>>(linker, |s| s)?;
     pie::core::messaging::add_to_linker::<T, HasSelf<T>>(linker, |s| s)?;
     pie::core::session::add_to_linker::<T, HasSelf<T>>(linker, |s| s)?;

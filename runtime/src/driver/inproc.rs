@@ -227,6 +227,30 @@ impl InProcChannel {
         let submit_start = std::time::Instant::now();
         let req_id = state.next_id.fetch_add(1, Ordering::Relaxed);
         let slot = Arc::new(ResponseSlot::new());
+        // Capture a lightweight descriptor before moving `payload` into the
+        // frame — used by the 4090 bring-up trace to localize a forward-path
+        // hang (see `recv_with_spin` + `slot.wait`). A forward carrying a
+        // sampling program (`n_programs > 0`, `n_samplers == 0`) is the
+        // mode-select discriminator: the worker must branch on the program
+        // carrier, not the (empty) legacy sampler count.
+        if tracing::enabled!(tracing::Level::DEBUG) {
+            if let pie_driver_abi::RequestPayload::Forward(fr) = &req.payload {
+                tracing::debug!(
+                    target: "pie::driver::inproc",
+                    req_id,
+                    n_tokens = fr.token_ids.len(),
+                    n_samplers = fr.n_samplers(),
+                    n_programs = fr.n_sampling_programs(),
+                    "inproc submit: pushing forward to inbox"
+                );
+            } else {
+                tracing::debug!(
+                    target: "pie::driver::inproc",
+                    req_id,
+                    "inproc submit: pushing non-forward request to inbox"
+                );
+            }
+        }
         let frame = Box::new(pie_driver_abi::Frame {
             driver_id: req.driver_id as u32,
             payload: req.payload,
@@ -268,9 +292,20 @@ impl InProcChannel {
         crate::probe::driver_cuda::record_ipc_submit(submit_start.elapsed());
 
         // Phase: gpu_wait + ipc_recv (slot.wait combines both)
+        tracing::debug!(
+            target: "pie::driver::inproc",
+            req_id,
+            "inproc submit: blocking on response slot (awaiting worker forward + send_response)"
+        );
         let wait_start = std::time::Instant::now();
         let result = slot.wait(state.spin_budget_us);
         crate::probe::driver_cuda::record_gpu_wait(wait_start.elapsed());
+        tracing::debug!(
+            target: "pie::driver::inproc",
+            req_id,
+            ok = result.is_ok(),
+            "inproc submit: response slot filled (worker completed)"
+        );
         result
     }
 }
@@ -434,6 +469,16 @@ unsafe extern "C" fn vt_recv(
         Some(id) => id,
         None => return -1,
     };
+    // 4090 bring-up trace: the worker poll loop drained the inbox. If this
+    // never fires while `submit` logged a push, the park is (a) — the worker
+    // recv loop isn't draining. If it fires but `slot.wait` never returns, the
+    // park is (b)/(c) — the worker's forward (JIT/dispatch) never reached
+    // `send_response`.
+    tracing::debug!(
+        target: "pie::driver::inproc",
+        req_id,
+        "inproc recv: worker drained req from inbox (vt_recv)"
+    );
 
     // Build view; park under same id for `send_response` to find.
     let desc_ptr: *const PieFrameDesc = {

@@ -1,0 +1,111 @@
+#pragma once
+
+// pie_standard_samplers.h — driver-baked standard-sampler IR programs.
+//
+// Each entry is a (v4 bytecode, binding manifest) pair generated from
+// `sampling-edsl::standard::build_standard(kind, vocab)` — the canonical EDSL
+// authoring (single source of truth; NOT the test goldens, which drift). The
+// executor's `program_for(sampler_type)` routes a legacy sampler kind to its
+// baked program; delta's backend compiles `(bytecode, manifest)` once at
+// registration (the manifest supplies the per-slot bindings the binding-free v4
+// bytecode omits).
+//
+// Programs are vocab-specific (V is baked into the shapes), so this header is the
+// **V-known fast path** baked for a fixed vocab; a per-V generator at model-init
+// is the arbitrary-V drop-in (same `build_standard` source). This first slice
+// bakes **argmax** (V=151936 / qwen3): no params, no RNG, no RowSeed — it lowers
+// + runs on the current codegen (verified on the 4090), unblocking the greedy
+// executor branch ahead of the temp/min-p RNG group.
+
+#include <cstddef>
+#include <cstdint>
+
+#include "sampling_ir/codegen.hpp"
+
+namespace pie_cuda_driver::sampling_ir {
+
+// Standard sampler kinds (mirror the bridge `Sampler` / EDSL `StandardSampler`).
+enum class StandardSamplerKind : std::uint8_t {
+    Argmax = 0,
+    Temperature = 1,
+    MinP = 2,
+    TopK = 3,
+    TopP = 4,
+    TopKTopP = 5,
+};
+
+// build_standard(Argmax, 151936) — 41 bytes. slot[0] = Logits (Intrinsic);
+// ReduceArgmax over the logits row; output Token. Binding-free v4.
+inline constexpr unsigned char kStdArgmax151936[] = {
+    0x50, 0x53, 0x49, 0x52, 0x04, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,
+    0x02, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x01, 0x80, 0x51,
+    0x02, 0x00, 0x80, 0x00, 0x00, 0x00, 0x00, 0x33, 0x00, 0x00, 0x00, 0x00,
+    0x01, 0x00, 0x00, 0x00, 0x00,
+};
+
+// build_standard(Temperature, 151936) — 82 bytes. slot[0]=Logits, slot[1]=Tensor
+// key=0 (scalar f32 T, Submit). Gumbel-max over logits*(1/T) + ambient Rng{stream:0}.
+inline constexpr unsigned char kStdTemp151936[] = {
+    0x50, 0x53, 0x49, 0x52, 0x04, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00,
+    0x07, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x01, 0x80, 0x51,
+    0x02, 0x00, 0x00, 0x00, 0x80, 0x00, 0x00, 0x00, 0x00, 0x80, 0x01, 0x00,
+    0x00, 0x00, 0x04, 0x01, 0x00, 0x00, 0x00, 0x12, 0x00, 0x00, 0x00, 0x00,
+    0x02, 0x00, 0x00, 0x00, 0x70, 0x00, 0x00, 0x00, 0x00, 0x01, 0x80, 0x51,
+    0x02, 0x00, 0x01, 0x10, 0x03, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00,
+    0x33, 0x05, 0x00, 0x00, 0x00, 0x06, 0x00, 0x00, 0x00, 0x00,
+};
+
+// build_standard(MinP, 151936) — 146 bytes. slot[0]=Logits, slot[1]=Tensor key=0
+// (T), slot[2]=Tensor key=1 (min_p). Logit-space keep ≥ max+ln(min_p), temp,
+// Gumbel-max + ambient Rng{stream:0}.
+inline constexpr unsigned char kStdMinp151936[] = {
+    0x50, 0x53, 0x49, 0x52, 0x04, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00,
+    0x0f, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x01, 0x80, 0x51,
+    0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x80, 0x00, 0x00, 0x00, 0x00, 0x80,
+    0x01, 0x00, 0x00, 0x00, 0x80, 0x02, 0x00, 0x00, 0x00, 0x04, 0x01, 0x00,
+    0x00, 0x00, 0x12, 0x00, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00, 0x31,
+    0x00, 0x00, 0x00, 0x00, 0x02, 0x02, 0x00, 0x00, 0x00, 0x10, 0x05, 0x00,
+    0x00, 0x00, 0x06, 0x00, 0x00, 0x00, 0x17, 0x00, 0x00, 0x00, 0x00, 0x07,
+    0x00, 0x00, 0x00, 0x81, 0x00, 0x00, 0x00, 0x80, 0xff, 0x38, 0x09, 0x00,
+    0x00, 0x00, 0x01, 0x80, 0x51, 0x02, 0x00, 0x20, 0x08, 0x00, 0x00, 0x00,
+    0x04, 0x00, 0x00, 0x00, 0x0a, 0x00, 0x00, 0x00, 0x70, 0x00, 0x00, 0x00,
+    0x00, 0x01, 0x80, 0x51, 0x02, 0x00, 0x01, 0x10, 0x0b, 0x00, 0x00, 0x00,
+    0x0c, 0x00, 0x00, 0x00, 0x33, 0x0d, 0x00, 0x00, 0x00, 0x0e, 0x00, 0x00,
+    0x00, 0x00,
+};
+
+// A baked program: the v4 bytecode + its attach manifest, ready for
+// `lower_bytecode_v4(bytecode, len, manifest, opts)` / `get_or_compile`.
+struct StandardSamplerProgram {
+    const std::uint8_t* bytecode = nullptr;
+    std::size_t len = 0;
+    ProgramManifest manifest;   // one InputBind per slot, slot order
+    bool valid = false;
+};
+
+// Look up the baked program for `kind` at vocab `vocab`. Returns `valid=false`
+// for kinds not yet baked (temp/min-p/top-k/top-p land with the RowSeed
+// emit-swap) or a vocab without a baked entry (use the generator path).
+inline StandardSamplerProgram standard_sampler_program(StandardSamplerKind kind,
+                                                       std::uint32_t vocab) {
+    StandardSamplerProgram p;
+    const InputBind logits{BindKind::Logits, 0, HostAvailability::SubmitBound};
+    const InputBind tparam{BindKind::HostTensor, 0, HostAvailability::SubmitBound};  // T (key 0)
+    const InputBind pparam{BindKind::HostTensor, 1, HostAvailability::SubmitBound};  // min_p (key 1)
+    if (vocab != 151936u) return p;  // only the qwen3 V is baked here; else use the generator
+    switch (kind) {
+        case StandardSamplerKind::Argmax:
+            p.bytecode = kStdArgmax151936; p.len = sizeof(kStdArgmax151936);
+            p.manifest = {logits}; p.valid = true; break;
+        case StandardSamplerKind::Temperature:
+            p.bytecode = kStdTemp151936; p.len = sizeof(kStdTemp151936);
+            p.manifest = {logits, tparam}; p.valid = true; break;
+        case StandardSamplerKind::MinP:
+            p.bytecode = kStdMinp151936; p.len = sizeof(kStdMinp151936);
+            p.manifest = {logits, tparam, pparam}; p.valid = true; break;
+        default: break;  // top-k/top-p/top-k-top-p → DedicatedKernel (FlashInfer), not baked
+    }
+    return p;
+}
+
+}  // namespace pie_cuda_driver::sampling_ir

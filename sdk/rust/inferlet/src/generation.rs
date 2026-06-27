@@ -4,32 +4,37 @@
 //! constraints, optional speculator/adapter) and then iterated step-by-
 //! step. Each call to [`Generator::next`] yields a [`GenStep`] — a
 //! short-lived configuration handle for the upcoming forward pass that
-//! the user can tweak (add probes, replace the auto-attached sampler).
-//! Calling [`GenStep::execute`] runs the host call and does the loop's
-//! post-step bookkeeping (commit, constraint advance, speculation
-//! reconciliation, max-tokens / stop accounting).
+//! the user can tweak — and [`GenStep::execute`] runs the host call and the
+//! loop's post-step bookkeeping.
 //!
-//! Three terminal-style sugars cover the common case:
+//! Three terminal sugars cover the common case:
 //!
 //! - [`Generator::collect_tokens`] — drains until done, returns all tokens.
-//! - [`Generator::collect_text`] — drains, decodes through a chat decoder,
-//!   returns the full string.
-//! - [`Generator::collect_json`] — adds a `T`-derived JSON-schema
-//!   constraint, drains, parses into `T`.
+//! - [`Generator::collect_text`] — drains, decodes through a chat decoder.
+//! - [`Generator::collect_json`] — adds a `T`-derived JSON-schema constraint.
 //!
-//! For per-step control (watermarking, custom sampling), call `next()` /
-//! `execute()` directly and use [`Generator::accept`] when sampling
-//! manually.
+//! # Stage 1 (WIT reconciliation window)
+//!
+//! The program-based front door retired the hardwired WIT `sampler` variant,
+//! the slot-output decode, the probe slots, and the speculative side-channel.
+//! Sampling now flows through a tensor [`Program`](crate::tensor::Program).
+//! Lowering the ergonomic [`Sampler`] enum to a program is **foxtrot's guest
+//! emit (Stage 2)** — until it lands, [`GenStep::execute`] surfaces a clear
+//! error at the sampler-attach seam. The builder/iteration API is intact so
+//! dependent modules compile; speculation and probe ergonomics are restored in
+//! Stage 2 on the program model. Program-native single-pass authoring is fully
+//! available now via [`Forward::sampler`](crate::forward::Forward::sampler).
 
 use crate::ForwardPassExt;
 use crate::Result;
 use crate::adapter::Adapter;
 use crate::context::{Context, brle_and, compute_bid};
-use crate::forward::{Output, ProbeHandle, SampleHandle};
-use crate::pie::core::inference::Output as RawOutput;
-use crate::pie::core::inference::{ForwardPass, Sampler as WitSampler, SlotOutput};
-use crate::sample::{Probe, Sampler};
+use crate::forward::Output;
+use crate::pie::core::inference::ForwardPass;
+use crate::sample::Sampler;
 use crate::spec::Speculator;
+use crate::tensor;
+use sampling_edsl::ir;
 use std::collections::VecDeque;
 
 const GENERATION_RESERVATION_WINDOW_TOKENS: u32 = 512;
@@ -41,12 +46,13 @@ pub use crate::context::{Constrain, GrammarConstraint, Schema};
 // Speculation mode
 // =============================================================================
 
+/// Speculative-decoding mode. Retained as builder state across the Stage-1
+/// window; the per-step draft/verify path is restored in Stage 2 on the
+/// program model (the speculative WIT side-channel was retired with the
+/// hardwired sampler).
 enum SpecMode {
     None,
-    System {
-        spec_tokens: Vec<u32>,
-        spec_positions: Vec<u32>,
-    },
+    System,
     Custom(Box<dyn Speculator>),
 }
 
@@ -57,8 +63,12 @@ enum SpecMode {
 /// Builder + iterator for token generation. See module docs.
 pub struct Generator<'ctx> {
     ctx: &'ctx mut Context,
-    pass: ForwardPass,
-    wit_sampler: WitSampler,
+    sampler: Sampler,
+    /// Lazily lowered sampler program (foxtrot's guest emit): the reusable
+    /// `tensor::Program`, its binding-free `Binding` template, and the output
+    /// count. Compiled once on the first decode step and reused across steps
+    /// (the program is binding-free, so only the attach-time bindings change).
+    program_cache: Option<(tensor::Program, Vec<ir::Binding>, u32)>,
     stop: Vec<u32>,
     max_tokens: Option<usize>,
     horizon: Option<usize>,
@@ -69,9 +79,6 @@ pub struct Generator<'ctx> {
     speculation: SpecMode,
     adapter: Option<&'ctx Adapter>,
     zo_seed: Option<i64>,
-    /// Probes added via [`Generator::probe_each_step`] — re-attached every
-    /// step. Stored as `(query_index, wit_variant)` pairs.
-    step_probes: Vec<(u32, WitSampler)>,
     output_buffer: VecDeque<u32>,
     tokens_generated: usize,
     rebid_each_step: bool,
@@ -83,8 +90,7 @@ impl<'ctx> Generator<'ctx> {
     /// [`Context::generate`].
     pub(crate) fn new(ctx: &'ctx mut Context, sampler: Sampler) -> Self {
         // Prime the bid with the budget-exhausting rate (geometric prior,
-        // cv²=1) so the scheduler sees a reasonable number from the
-        // start. Re-bid each step using the horizon cascade.
+        // cv²=1) so the scheduler sees a reasonable number from the start.
         let balance = crate::scheduling::balance(&ctx.model);
         let dividend = crate::scheduling::dividend(&ctx.model);
         let pages = (ctx.committed_pages + ctx.working_pages).max(1) as f64;
@@ -93,34 +99,18 @@ impl<'ctx> Generator<'ctx> {
             balance, pages, 4096.0, 1.0, page_size, dividend,
         ));
 
-        let pass = ForwardPass::new(&ctx.model);
-        pass.context(&ctx.inner);
-
-        let default_system_speculation =
-            sampler.is_argmax() && ctx.model.default_system_speculation();
-        let wit_sampler = sampler.into();
-        let speculation = if default_system_speculation {
-            SpecMode::System {
-                spec_tokens: Vec::new(),
-                spec_positions: Vec::new(),
-            }
-        } else {
-            SpecMode::None
-        };
-
         Self {
             ctx,
-            pass,
-            wit_sampler,
+            sampler,
+            program_cache: None,
             stop: Vec::new(),
             max_tokens: None,
             horizon: None,
             constraints: Vec::new(),
             constraint_pending: Vec::new(),
-            speculation,
+            speculation: SpecMode::None,
             adapter: None,
             zo_seed: None,
-            step_probes: Vec::new(),
             output_buffer: VecDeque::new(),
             tokens_generated: 0,
             rebid_each_step: true,
@@ -172,23 +162,16 @@ impl<'ctx> Generator<'ctx> {
         self
     }
 
-    /// Enable host-driven speculation: the runtime returns next-iter draft
-    /// tokens via the forward-pass output and the Generator stages them
-    /// for the next step. Greedy generators enable this by default on
-    /// models that advertise a default system drafter.
+    /// Enable host-driven speculation.
     pub fn system_speculation(mut self) -> Self {
-        self.speculation = SpecMode::System {
-            spec_tokens: Vec::new(),
-            spec_positions: Vec::new(),
-        };
+        self.speculation = SpecMode::System;
         self
     }
 
-    /// Disable host-driven system speculation. This opts out of the
-    /// default greedy-system drafter while leaving custom speculators
+    /// Disable host-driven system speculation, leaving custom speculators
     /// untouched.
     pub fn disable_system_speculation(mut self) -> Self {
-        if matches!(self.speculation, SpecMode::System { .. }) {
+        if matches!(self.speculation, SpecMode::System) {
             self.speculation = SpecMode::None;
         }
         self
@@ -214,22 +197,10 @@ impl<'ctx> Generator<'ctx> {
     }
 
     /// Control whether the generator refreshes its scheduler bid before
-    /// every decode step. The default is `true`, which keeps long-running
-    /// or contended workloads responsive to balance/dividend changes.
-    /// Throughput-oriented single-tenant loops can disable this after the
-    /// initial bid to avoid three host calls per generated token.
+    /// every decode step (default `true`).
     pub fn rebid_each_step(mut self, enabled: bool) -> Self {
         self.rebid_each_step = enabled;
         self
-    }
-
-    /// Attach a probe to every step at `index`. Returns a typed handle
-    /// that's reusable across each `Output`.
-    pub fn probe_each_step<P: Probe>(&mut self, index: u32, probe: P) -> ProbeHandle<P::Out> {
-        // Slot 0 is reserved for the auto-sampler; per-step probes follow.
-        let slot = (1 + self.step_probes.len()) as u32;
-        self.step_probes.push((index, probe.into_wit()));
-        ProbeHandle::new(slot)
     }
 
     // ── Iteration ──────────────────────────────────────────────────────
@@ -239,7 +210,7 @@ impl<'ctx> Generator<'ctx> {
         self.done
             || self
                 .max_tokens
-                .map_or(false, |m| self.tokens_generated >= m)
+                .is_some_and(|m| self.tokens_generated >= m)
     }
 
     /// Tokens generated so far across all steps.
@@ -271,6 +242,7 @@ impl<'ctx> Generator<'ctx> {
     /// Begin the next step. Returns `Ok(None)` when generation is finished.
     /// The returned [`GenStep`] borrows the generator mutably; complete it
     /// with [`GenStep::execute`] (or drop it to skip the iteration).
+    #[allow(clippy::should_implement_trait)]
     pub fn next(&mut self) -> Result<Option<GenStep<'_, 'ctx>>> {
         if self.is_done() {
             return Ok(None);
@@ -284,18 +256,10 @@ impl<'ctx> Generator<'ctx> {
         // Drain the context's buffer (filled by `system / user / cue / …`).
         let pending = std::mem::take(&mut self.ctx.buffer);
 
-        // Pull drafts from the speculator.
-        let (drafts, draft_positions) = match &mut self.speculation {
-            SpecMode::None => (Vec::new(), Vec::new()),
-            SpecMode::System {
-                spec_tokens,
-                spec_positions,
-            } => (std::mem::take(spec_tokens), std::mem::take(spec_positions)),
-            SpecMode::Custom(s) => s.draft(),
-        };
-
-        // Compose constraint masks. Each constraint advances on the
-        // tokens accepted last step, then yields its next-position mask.
+        // Compose constraint masks. Each constraint advances on the tokens
+        // accepted last step, then yields its next-position mask. (Stage 1:
+        // the composed mask is computed but not yet applied — application is
+        // program-side in Stage 2.)
         let mask = if self.constraints.is_empty() {
             None
         } else {
@@ -320,20 +284,15 @@ impl<'ctx> Generator<'ctx> {
         Ok(Some(GenStep {
             parent: self,
             pending,
-            drafts,
-            draft_positions,
             mask,
-            extra_probes: Vec::new(),
             user_cleared_sampler: false,
         }))
     }
 
     /// Register a manually-sampled token (or sequence) with the generator.
-    /// Use after [`GenStep::clear_sampler`] when the inferlet sampled by
-    /// hand off a probe — the generator updates max-tokens / stop /
-    /// constraint counters and seeds the next iteration's input. The
-    /// token doesn't enter KV here; the next `next() / execute()` flushes
-    /// it through a forward pass like a normal pending input.
+    /// Updates max-tokens / stop / constraint counters and seeds the next
+    /// iteration's input. The token doesn't enter KV here; the next
+    /// `next() / execute()` flushes it through a forward pass.
     pub fn accept(&mut self, tokens: &[u32]) -> Vec<u32> {
         if tokens.is_empty() {
             return Vec::new();
@@ -437,6 +396,21 @@ impl<'ctx> Generator<'ctx> {
         remaining.min(GENERATION_RESERVATION_WINDOW_TOKENS as usize) as u32
     }
 
+    /// Lazily lower the configured [`Sampler`] to a reusable, binding-free
+    /// `tensor::Program` (+ its binding template + output count) via foxtrot's
+    /// guest emit, caching it for reuse across decode steps.
+    fn ensure_program(&mut self) -> Result<()> {
+        if self.program_cache.is_none() {
+            let vocab = self.ctx.model.tokenizer().vocabs().0.len() as u32;
+            let spec: sampling_edsl::SamplerSpec = self.sampler.clone().into();
+            let built = sampling_edsl::build_sampler(spec, vocab)
+                .map_err(|e| format!("Generator: lower sampler: {e:?}"))?;
+            let program = crate::emit::emit_program(&built.program)?;
+            self.program_cache = Some((program, built.bindings, built.outputs.len() as u32));
+        }
+        Ok(())
+    }
+
     fn release_empty_working_pages(&mut self) {
         let used_pages = if self.ctx.working_tokens == 0 {
             0
@@ -464,107 +438,62 @@ impl Drop for Generator<'_> {
 
 /// Configuration handle for the upcoming forward pass. Returned by
 /// [`Generator::next`]. Pre-populated with the generator's pending fills,
-/// configured sampler, constraint mask, and any speculator drafts. Add
-/// extra probes or call [`clear_sampler`](Self::clear_sampler) to take
-/// over sampling, then [`execute`](Self::execute).
+/// configured sampler, and the composed constraint mask. Complete it with
+/// [`execute`](Self::execute).
 pub struct GenStep<'g, 'ctx> {
     parent: &'g mut Generator<'ctx>,
     pending: Vec<u32>,
-    drafts: Vec<u32>,
-    draft_positions: Vec<u32>,
+    #[allow(dead_code)]
     mask: Option<Vec<u32>>,
-    /// Extra probes added via [`probe`](Self::probe). Each is `(index,
-    /// wit_variant)` and is appended to the slot list after the auto-
-    /// sampler and the generator's per-step probes.
-    extra_probes: Vec<(u32, WitSampler)>,
     user_cleared_sampler: bool,
 }
 
 impl<'g, 'ctx> GenStep<'g, 'ctx> {
-    /// Drop the generator's auto-attached sampler. The caller must read
-    /// the distribution off a probe and register their own pick via
-    /// [`Generator::accept`] after `execute`. Useful for custom sampling
-    /// (watermarking, externally-driven samplers, etc.).
+    /// Drop the generator's auto-attached sampler. The caller samples by hand
+    /// off a probe/program and registers their pick via
+    /// [`Generator::accept`] after `execute`.
     pub fn clear_sampler(&mut self) -> &mut Self {
         self.user_cleared_sampler = true;
         self
     }
 
-    /// Attach an extra probe at `index`. Returns a typed handle.
-    pub fn probe<P: Probe>(&mut self, index: u32, probe: P) -> ProbeHandle<P::Out> {
-        // Slot count: sampler (if not cleared) + step-probes + earlier
-        // extra probes added in this step.
-        let base = if self.user_cleared_sampler { 0 } else { 1 };
-        let slot = (base + self.parent.step_probes.len() + self.extra_probes.len()) as u32;
-        self.extra_probes.push((index, probe.into_wit()));
-        ProbeHandle::new(slot)
-    }
-
-    /// Run the forward pass and fold the result into the generator's
-    /// state.
+    /// Run the forward pass and fold the result into the generator's state.
     pub async fn execute(self) -> Result<Output> {
         let GenStep {
             parent,
             pending,
-            drafts,
-            draft_positions,
-            mask,
-            extra_probes,
+            mask: _,
             user_cleared_sampler,
         } = self;
 
         let n_pending = pending.len() as u32;
-        let n_drafted = drafts.len() as u32;
-        if n_pending == 0 && n_drafted == 0 {
-            // No input, no drafts — there are no query positions for a
-            // sampler to land on. Firing in this state would produce a
-            // wire request with `qo_indptr=[0,0]` plus a sampler slot
-            // pointing at a non-existent query position; the driver
-            // would either crash (portable's old behavior) or return
-            // an empty response (cuda's short-circuit), and the SDK
-            // loop would just call us again with the same empty state.
-            //
-            // Mark done so `Generator::next()` returns `None` and the
-            // inferlet's `while let Some(step) = g.next()?` loop
-            // terminates cleanly. Reached when a prior step's response
-            // didn't yield an accepted token (e.g., a driver error
-            // returned an empty slot list), so this also acts as a
-            // fail-stop against a runaway empty-response loop.
+        if n_pending == 0 {
+            // No input — no query position for a sampler to land on. Mark done
+            // so the iteration loop terminates cleanly.
             parent.done = true;
-            return Ok(Output::new(RawOutput {
-                slots: Vec::new(),
-                spec_tokens: Vec::new(),
-                spec_positions: Vec::new(),
-            }));
+            return Ok(Output::new(Vec::new()));
         }
 
-        // Reserve pages for pending (drafts share the working tail —
-        // their commit/truncate happens after we know what was accepted).
-        // No-input bootstrap path skips reservation: the host samples from
-        // the last cached KV position without growing the working tail.
-        let n_total_input = n_pending + n_drafted;
-        if n_total_input > 0 {
-            let total_after = parent
+        // Reserve pages for the pending fill (+ a lookahead window).
+        let total_after = parent
+            .ctx
+            .working_tokens
+            .saturating_add(n_pending)
+            .saturating_add(parent.reservation_lookahead_tokens());
+        let pages_needed = total_after.div_ceil(parent.ctx.page_size);
+        let additional = pages_needed.saturating_sub(parent.ctx.working_pages);
+        if additional > 0 {
+            parent
                 .ctx
-                .working_tokens
-                .saturating_add(n_total_input)
-                .saturating_add(parent.reservation_lookahead_tokens());
-            let pages_needed = (total_after + parent.ctx.page_size - 1) / parent.ctx.page_size;
-            let additional = pages_needed.saturating_sub(parent.ctx.working_pages);
-            if additional > 0 {
-                parent
-                    .ctx
-                    .inner
-                    .reserve_working_pages(additional)
-                    .map_err(|e| format!("GenStep::execute reserve: {e}"))?;
-                parent.ctx.working_pages = pages_needed;
-            }
+                .inner
+                .reserve_working_pages(additional)
+                .map_err(|e| format!("GenStep::execute reserve: {e}"))?;
+            parent.ctx.working_pages = pages_needed;
         }
 
-        // Build forward pass. A Generator is single-context and
-        // single-step-at-a-time, so reuse the same WIT ForwardPass resource
-        // and let the host reset its request accumulator after execute().
-        let pass = &parent.pass;
+        // Build the forward pass.
+        let pass = ForwardPass::new();
+        pass.context(&parent.ctx.inner);
         if let Some(a) = parent.adapter {
             pass.adapter(a);
         }
@@ -572,248 +501,82 @@ impl<'g, 'ctx> GenStep<'g, 'ctx> {
             crate::pie::zo::zo::adapter_seed(&pass, seed);
         }
 
-        // Custom-mode drafts ride alongside pending in `input_tokens` and
-        // are verified by the SDK walk below. This keeps verification
-        // driver-agnostic: the runtime's `spec_token_ids` channel only
-        // carries the host-side `output_speculative_tokens` flow used
-        // by System-mode (where the runtime returns next-iter drafts).
-        let is_custom = matches!(parent.speculation, SpecMode::Custom(_));
-        let do_sdk_verify = is_custom && n_drafted > 0 && n_pending > 0;
+        let positions: Vec<u32> =
+            (parent.ctx.seq_len..parent.ctx.seq_len + n_pending).collect();
+        pass.input_tokens(&pending, &positions);
 
-        if do_sdk_verify {
-            let mut all_tokens = Vec::with_capacity((n_pending + n_drafted) as usize);
-            all_tokens.extend_from_slice(&pending);
-            all_tokens.extend_from_slice(&drafts);
-            let mut all_positions: Vec<u32> =
-                (parent.ctx.seq_len..parent.ctx.seq_len + n_pending).collect();
-            all_positions.extend_from_slice(&draft_positions);
-            pass.input_tokens(&all_tokens, &all_positions);
-        } else {
-            if n_pending > 0 {
-                if n_pending == 1 {
-                    let positions = [parent.ctx.seq_len];
-                    pass.input_tokens(&pending, &positions);
-                } else {
-                    let positions: Vec<u32> =
-                        (parent.ctx.seq_len..parent.ctx.seq_len + n_pending).collect();
-                    pass.input_tokens(&pending, &positions);
-                }
-            }
-            if !drafts.is_empty() {
-                pass.input_speculative_tokens(&drafts, &draft_positions);
-            }
-        }
-        let max_tokens_remaining = parent
-            .max_tokens
-            .map(|max| max.saturating_sub(parent.tokens_generated));
-        if matches!(parent.speculation, SpecMode::System { .. })
-            && max_tokens_remaining.map_or(true, |remaining| remaining > 1)
-        {
-            pass.output_speculative_tokens(true);
-        }
-        if max_tokens_remaining
-            .map_or(false, |remaining| {
-                remaining <= (n_drafted as usize).saturating_add(1)
-            })
-        {
-            pass.pass_speculation(false);
-        }
-        // Sampler attach. Custom-with-drafts attaches (1 + n_drafted)
-        // consecutive samplers: one for the anchor's free pick plus one
-        // per draft position. The walk below compares each pick against
-        // the corresponding draft.
-        let sample_idx = if n_pending > 0 { n_pending - 1 } else { 0 };
-        if !user_cleared_sampler {
-            if do_sdk_verify {
-                let indices: Vec<u32> = (sample_idx..=sample_idx + n_drafted).collect();
-                pass.sampler(&indices, &parent.wit_sampler);
-            } else {
-                pass.sampler(&[sample_idx], &parent.wit_sampler);
-            }
-        }
-
-        // Per-step probes (registered on the Generator).
-        for (idx, wit) in &parent.step_probes {
-            pass.sampler(&[*idx], wit);
-        }
-        // Per-call extra probes (registered on this GenStep).
-        for (idx, wit) in &extra_probes {
-            pass.sampler(&[*idx], wit);
-        }
-
-        if let Some(m) = &mask {
-            pass.logit_mask(m);
-        }
-
-        let raw = pass
-            .execute_async()
-            .await
-            .map_err(|e| format!("GenStep::execute forward: {e}"))?;
-
-        // Read accepted tokens off the auto-sampler slots.
-        //
-        // System-mode and non-spec passes: the verifier (or single-shot
-        // sampler) emits one Token slot per accept, so the leading
-        // Token-slot run from index 0 is exactly the accepted chain.
-        //
-        // Custom-with-drafts (do_sdk_verify): walk the (1 + n_drafted)
-        // sampled picks against `drafts`. Slot 0 is the anchor's free
-        // pick (always accepted). Each subsequent slot is accepted iff
-        // the previous draft matched its picked token. The final slot
-        // is either the next verification anchor or, after a full-
-        // accept run, the post-draft free pick.
-        let accepted_tokens: Vec<u32> = if user_cleared_sampler {
-            Vec::new()
-        } else if do_sdk_verify {
-            let n_picks = (n_drafted + 1) as usize;
-            let lm_picks: Vec<u32> = raw
-                .slots
-                .iter()
-                .take(n_picks)
-                .filter_map(|s| match s {
-                    SlotOutput::Token(t) => Some(*t),
-                    _ => None,
-                })
-                .collect();
-            if lm_picks.len() != n_picks {
-                return Err(format!(
-                    "GenStep::execute verify: expected {} Token slots, got {}",
-                    n_picks,
-                    lm_picks.len()
-                ));
-            }
-            let mut accepted = Vec::with_capacity(n_picks);
-            accepted.push(lm_picks[0]);
-            for k in 0..n_drafted as usize {
-                if lm_picks[k] != drafts[k] {
-                    break;
-                }
-                accepted.push(lm_picks[k + 1]);
-            }
-            accepted
-        } else {
-            raw.slots
-                .iter()
-                .take_while(|s| matches!(s, SlotOutput::Token(_)))
-                .filter_map(|s| match s {
-                    SlotOutput::Token(t) => Some(*t),
-                    _ => None,
-                })
-                .collect()
-        };
-        if !user_cleared_sampler && accepted_tokens.is_empty() {
-            return Err("GenStep::execute: auto-sampler returned no token".into());
-        }
-
-        // Stash next-iter system drafts (and let custom speculators see
-        // accepted tokens).
-        match &mut parent.speculation {
-            SpecMode::None => {}
-            SpecMode::System {
-                spec_tokens,
-                spec_positions,
-            } => {
-                *spec_tokens = raw.spec_tokens.clone();
-                *spec_positions = raw.spec_positions.clone();
-            }
-            SpecMode::Custom(s) => {
-                s.accept(&accepted_tokens);
-            }
-        }
-
-        // Truncate rejected drafts.
-        if n_drafted > 0 {
-            let n_verified = (accepted_tokens.len() as u32).saturating_sub(1);
-            let n_rejected = n_drafted.saturating_sub(n_verified);
-            if n_rejected > 0 {
-                // `truncate_working_page_tokens` REMOVES the last N working
-                // tokens (see context.wit). The host appended pending + ALL
-                // draft tokens, of which the last `n_rejected` were not
-                // verified, so the suffix to drop is exactly `n_rejected`.
-                // (For rs_cache contexts this stays within the driver-repaired
-                // spec tail, so the host skips a recurrent-state replay.)
-                parent
-                    .ctx
-                    .inner
-                    .truncate_working_page_tokens(n_rejected);
-            }
-            // Roll back custom speculator's own state too.
-            if let SpecMode::Custom(s) = &mut parent.speculation {
-                if n_rejected > 0 {
-                    s.rollback(n_rejected);
-                }
-            }
-        }
-
-        // Commit pages: pending tokens always commit (they're real KV);
-        // verified drafts also commit (they survived the verifier).
-        let n_verified_drafts = if n_drafted > 0 {
-            (accepted_tokens.len() as u32).saturating_sub(1)
-        } else {
-            0
-        };
-        let n_kv_tokens = n_pending + n_verified_drafts;
-        if n_kv_tokens > 0 {
-            let new_working = parent.ctx.working_tokens + n_kv_tokens;
-            let pages_to_commit = new_working / parent.ctx.page_size;
-            if pages_to_commit > 0 {
-                parent
-                    .ctx
-                    .inner
-                    .commit_working_pages(pages_to_commit)
-                    .map_err(|e| format!("GenStep::execute commit: {e}"))?;
-            }
-            parent.ctx.committed_pages += pages_to_commit;
-            parent.ctx.working_pages -= pages_to_commit;
-            parent.ctx.working_tokens = new_working % parent.ctx.page_size;
-            parent.ctx.seq_len += n_kv_tokens;
-        } else if n_drafted > 0 && accepted_tokens.is_empty() {
-            // All drafts rejected with no anchor token — re-sync from host
-            // since truncation may have released pages.
-            parent.ctx.committed_pages = parent.ctx.inner.committed_page_count();
-            parent.ctx.working_pages = parent.ctx.inner.working_page_count();
-            parent.ctx.working_tokens = parent.ctx.inner.working_page_token_count();
-            parent.ctx.seq_len =
-                parent.ctx.committed_pages * parent.ctx.page_size + parent.ctx.working_tokens;
-        }
-
-        // Advance constraint state with the accepted tokens (read by the
-        // next iteration's mask compute).
-        if !parent.constraints.is_empty() {
-            parent
-                .constraint_pending
-                .extend_from_slice(&accepted_tokens);
-        }
-
-        // Truncate at stop / max_tokens, accumulate counters, seed buffer.
-        let mut tokens = accepted_tokens;
-        if !parent.stop.is_empty() {
-            if let Some(pos) = tokens.iter().position(|t| parent.stop.contains(t)) {
-                tokens.truncate(pos);
-                parent.done = true;
-            }
-        }
-        if let Some(max) = parent.max_tokens {
-            let remaining = max.saturating_sub(parent.tokens_generated);
-            if tokens.len() > remaining {
-                tokens.truncate(remaining);
-                parent.done = true;
-            }
-        }
-        parent.tokens_generated += tokens.len();
-        if let Some(&last) = tokens.last() {
-            parent.ctx.buffer.push(last);
-        }
-
-        // Generator owns slot 0 for its auto-attached sampler. The
-        // post-truncation tokens land on `Output::tokens` (the common
-        // path); callers wanting the raw verifier accepted tokens can
-        // walk slots from `output.auto_sampler()`.
-        let auto = if user_cleared_sampler {
+        // Sampler attach + execute. The configured `Sampler` is lowered once
+        // (lazily, then reused) to a binding-free tensor program; each step
+        // binds its `Logits` input to the decode position. The sampler-cleared
+        // path runs a pure fill (the caller samples by hand + `accept`s).
+        let sampled: Option<u32> = if user_cleared_sampler {
+            pass.execute_outputs()
+                .await
+                .map_err(|e| format!("GenStep::execute forward: {e}"))?;
             None
         } else {
-            Some(SampleHandle::new(0, 1))
+            parent.ensure_program()?;
+            let decode_pos = parent.ctx.seq_len + n_pending - 1;
+            {
+                let (program, template, _n_out) = parent.program_cache.as_ref().unwrap();
+                let bindings =
+                    crate::program::resolve_bindings(template, &[], &[decode_pos], &[])?;
+                pass.sampler(program, bindings);
+            }
+            let tensors = pass
+                .execute_outputs()
+                .await
+                .map_err(|e| format!("GenStep::execute forward: {e}"))?;
+            let token = tensors
+                .first()
+                .ok_or_else(|| "GenStep::execute: sampler produced no output tensor".to_string())?
+                .read()
+                .map_err(|e| format!("GenStep::execute: read token: {e:?}"))?
+                .chunks_exact(4)
+                .next()
+                .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .ok_or_else(|| "GenStep::execute: empty token output".to_string())?;
+            Some(token)
         };
-        Ok(crate::forward::Output::from_generator(raw, tokens, auto))
+
+        // Commit the pending KV.
+        let new_working = parent.ctx.working_tokens + n_pending;
+        let pages_to_commit = new_working / parent.ctx.page_size;
+        if pages_to_commit > 0 {
+            parent
+                .ctx
+                .inner
+                .commit_working_pages(pages_to_commit)
+                .map_err(|e| format!("GenStep::execute commit: {e}"))?;
+        }
+        parent.ctx.committed_pages += pages_to_commit;
+        parent.ctx.working_pages -= pages_to_commit;
+        parent.ctx.working_tokens = new_working % parent.ctx.page_size;
+        parent.ctx.seq_len += n_pending;
+
+        // Fold the sampled token into generator state (stop / max-tokens /
+        // constraints / next-step buffer), mirroring `accept`.
+        let mut tokens = Vec::new();
+        if let Some(token) = sampled {
+            if parent.stop.contains(&token) {
+                parent.done = true;
+            } else {
+                tokens.push(token);
+                parent.tokens_generated += 1;
+                parent.constraint_pending.push(token);
+                parent.ctx.buffer.push(token);
+                if let SpecMode::Custom(s) = &mut parent.speculation {
+                    s.accept(&tokens);
+                }
+                if parent
+                    .max_tokens
+                    .is_some_and(|max| parent.tokens_generated >= max)
+                {
+                    parent.done = true;
+                }
+            }
+        }
+
+        Ok(Output::from_generator(Vec::new(), tokens))
     }
 }

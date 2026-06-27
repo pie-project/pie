@@ -311,6 +311,36 @@ pub fn new_batched_forward_request_with_capacity(n_requests: usize) -> pie_drive
         audio_feature_indptr: indptr(indptr_cap),
         audio_anchor_rows: Vec::new(),
         audio_indptr: indptr(indptr_cap),
+        // Sampling-program carrier: the per-request count CSR and the nested
+        // per-program byte / input-table / late-key CSRs each start with a
+        // leading 0 (grown by `extend_sampling_programs_from` + the per-request
+        // boundary push). All payload vecs stay empty for the legacy path.
+        sampling_program_indptr: indptr(indptr_cap),
+        sampling_program_bytes: Vec::new(),
+        sampling_program_bytes_indptr: indptr(indptr_cap),
+        sampling_input_blob: Vec::new(),
+        sampling_input_keys: Vec::new(),
+        sampling_input_offsets: Vec::new(),
+        sampling_input_lens: Vec::new(),
+        sampling_input_indptr: indptr(indptr_cap),
+        sampling_late_keys: Vec::new(),
+        sampling_late_indptr: indptr(indptr_cap),
+        sampling_late_blob: Vec::new(),
+        sampling_late_offsets: Vec::new(),
+        sampling_late_lens: Vec::new(),
+        // Per-slot binding-map: per-program CSR with a leading 0 (grown by the
+        // merge + per-request boundary); the (kind, key) payload stays empty for
+        // the legacy/no-program path.
+        sampling_binding_kind: Vec::new(),
+        sampling_binding_key: Vec::new(),
+        sampling_binding_indptr: indptr(indptr_cap),
+        // WS8 P2 device-resident next-input link: empty/0 for the host-inject
+        // (P1) and no-pipelining paths; populated by the device-pipeline emission
+        // at integration (per-row arrays + the producer source-link).
+        pipeline_source_link: 0,
+        next_input_producer_links: Vec::new(),
+        next_input_src_rows: Vec::new(),
+        next_input_dest_slots: Vec::new(),
     }
 }
 
@@ -541,6 +571,16 @@ pub fn append_request_with_options(
     batch
         .audio_indptr
         .push(batch.audio_anchor_rows.len() as u32);
+
+    // Sampling-program carrier — per-request side-channel, analogous to the
+    // image/audio merges. `extend_sampling_programs_from` concatenates this
+    // request's program bytecode, submit-bound input table, and late-key
+    // channel, offsetting every nested CSR; `sampling_program_indptr` then gets
+    // one boundary per request (cumulative program count, like `image_indptr`).
+    batch.extend_sampling_programs_from(req);
+    batch
+        .sampling_program_indptr
+        .push(batch.n_sampling_programs() as u32);
 
     // Inference hint: prefill kernel when ANY request needs `custom_mask`.
     if req.token_ids.len() > 1 || req.has_user_mask {

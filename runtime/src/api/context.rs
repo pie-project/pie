@@ -180,6 +180,11 @@ impl pie::core::context::HostContext for InstanceState {
             let ctx = self.ctx().table.get(&this)?;
             (ctx.model_id, ctx.context_id)
         };
+        // WS8: drop any stale pipeline-link entry for this context (housekeeping
+        // — the producer pass owns its own pin/output and releases on its drop;
+        // the link only references it by rep). Bounds the map during a long-lived
+        // instance running many sequences.
+        self.pipeline_links.remove(&context_id);
         // Drop the speculation chain associated with this ctx. The
         // ctx itself stays alive for the process's wider cleanup
         // path (InstanceState::drop → unregister_process); only the

@@ -192,6 +192,14 @@ impl WorkerControlServer {
     /// ensures the logical session's runtime broker + driver exist, then queues
     /// the turn. Errors map to `Accepted::Reject` (the gateway re-routes).
     async fn admit(&self, req: Request) -> Result<()> {
+        if std::env::var_os("PIE_BRIDGE_TRACE").is_some() {
+            eprintln!(
+                "[bridge] admit req_id={} session={} blobs={}",
+                req.req_id,
+                req.session,
+                req.blobs.len()
+            );
+        }
         // Blob bytes ride out-of-band over HTTP (design §9); fetch + verify here.
         // Feeding them into the runtime needs a runtime image API — a tracked
         // follow-on, so for now we verify integrity and log.
@@ -307,6 +315,31 @@ async fn run_turn(
     let proc_launch = is_process_launch(&req.message);
     let mut process_id: Option<String> = None;
 
+    let bridge_trace = std::env::var_os("PIE_BRIDGE_TRACE").is_some();
+    if bridge_trace {
+        eprintln!(
+            "[bridge] run_turn entry req_id={req_id} corr={corr:?} proc_launch={proc_launch} chunk={:?}",
+            upload_chunk_info(&req.message)
+        );
+    }
+
+    // Chunked uploads (`AddProgram`) span many messages under one `corr_id`,
+    // but only the FINAL chunk yields a `Response` — every intermediate chunk
+    // is accepted as `InProgress` with no reply. Since `session_driver` runs
+    // turns strictly sequentially, awaiting a response for a non-final chunk
+    // would block forever (the next chunk never dequeues, so the upload never
+    // completes and the client's `add_program` hangs). Feed a non-final chunk
+    // into the runtime and close its stream immediately; the final chunk takes
+    // the normal request/response turn that surfaces the install result.
+    if let Some((idx, total)) = upload_chunk_info(&req.message) {
+        if idx + 1 < total {
+            if let Err(e) = pie::server::send_client_message(client_id, req.message) {
+                tracing::warn!(%req_id, error = %e, "feeding upload chunk into runtime failed");
+            }
+            return push_eos(gateway, req_id).await;
+        }
+    }
+
     if let Err(e) = pie::server::send_client_message(client_id, req.message) {
         tracing::warn!(%req_id, error = %e, "feeding turn into runtime failed");
         return push_eos(gateway, req_id).await;
@@ -331,8 +364,14 @@ async fn run_turn(
                         return TurnEnd::Aborted;
                     }
                 };
+                if bridge_trace && !msgs.is_empty() {
+                    eprintln!("[bridge] req_id={req_id} drained {} runtime msg(s)", msgs.len());
+                }
                 for msg in msgs {
                     let terminal = turn_terminal(&msg, corr, proc_launch, &mut process_id);
+                    if bridge_trace {
+                        eprintln!("[bridge] req_id={req_id} push msg terminal={terminal}");
+                    }
                     match gateway.push_tokens(push_ctx(), req_id, Tokens::Chunk(msg)).await {
                         Ok(Control::Continue) => {}
                         Ok(Control::Abort) => {
@@ -459,4 +498,19 @@ fn is_process_launch(m: &ClientMessage) -> bool {
             | ClientMessage::RunProcesses { .. }
             | ClientMessage::AttachProcess { .. }
     )
+}
+
+/// `(chunk_index, total_chunks)` for a chunked upload message, else `None`.
+/// `AddProgram` is delivered as `total_chunks` messages sharing one `corr_id`;
+/// only the final chunk produces a `Response`, so the bridge must not await a
+/// reply for the earlier ones (see `run_turn`).
+fn upload_chunk_info(m: &ClientMessage) -> Option<(usize, usize)> {
+    match m {
+        ClientMessage::AddProgram {
+            chunk_index,
+            total_chunks,
+            ..
+        } => Some((*chunk_index, *total_chunks)),
+        _ => None,
+    }
 }

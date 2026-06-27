@@ -50,11 +50,22 @@ pub struct InstanceState {
     guest_resource_map: Vec<(ResourceAny, u32)>,
     /// Counter for allocating unique host reps
     next_dynamic_rep: u32,
+
+    /// WS8 inter-pass pipeline links (`forward-pass.next-input`): a producer
+    /// pass's resolved output keyed by context, drained by the next pass on that
+    /// context to source its input tokens host-side (no guest round-trip). P1 is
+    /// host-resolved; P2 binds the device-resident `pi.sampled` instead.
+    pub(crate) pipeline_links: HashMap<crate::context::ContextId, crate::api::inference::PipelineLink>,
 }
 
 impl Drop for InstanceState {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.scratch_dir);
+        // WS8 links reference their producer pass (which owns its pin and
+        // releases it on its own drop), so the links hold no resources — just
+        // clear the map. The producer ForwardPass resources are dropped by the
+        // store teardown, releasing any still-held pins.
+        self.pipeline_links.clear();
         // Unregister the process: destroy all contexts and remove process entries.
         context::unregister_process(self.id);
     }
@@ -173,6 +184,7 @@ impl InstanceState {
             dynamic_resource_map: HashMap::new(),
             guest_resource_map: Vec::new(),
             next_dynamic_rep: 1,
+            pipeline_links: HashMap::new(),
         })
     }
 

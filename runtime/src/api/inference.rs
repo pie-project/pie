@@ -1,8 +1,8 @@
-//! pie:core/inference - ForwardPass, FutureOutput, Sampler, Output
+//! pie:core/inference - ForwardPass + sampler programs; pie:core/tensor -
+//! Tensor + Program resources.
 
 use crate::api::adapter::Adapter;
 use crate::api::context::Context;
-use crate::api::model::Model;
 use crate::api::pie;
 use crate::inference::ForwardOutput;
 use crate::inference::structured::compiled_grammar::CompiledGrammar;
@@ -21,11 +21,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::sync::oneshot;
-use tokio::sync::oneshot::error::TryRecvError;
 use wasmtime::component::Resource;
 use wasmtime_wasi::WasiView;
-use wasmtime_wasi::async_trait;
-use wasmtime_wasi::p2::{DynPollable, Pollable, subscribe};
 
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ExecuteProfileSnapshot {
@@ -153,7 +150,32 @@ fn record_execute_profile(sample: ExecuteProfileSample, total_us: u64) {
 /// is stored separately because it doesn't have its own WIT setter
 /// but is used at execute-time to populate the adapter binding.
 #[derive(Debug)]
+/// Host backing for the WIT `tensor` resource (`pie:core/tensor.tensor`): a
+/// typed, host-resident byte buffer. Under the MVP sync interface every tensor
+/// binding is *submit* — the inferlet writes the value before `execute()` and
+/// the host gathers `data` into the sampling carrier at attach time.
+pub struct Tensor {
+    shape: Vec<u32>,
+    dtype: pie::core::tensor::Dtype,
+    data: Vec<u8>,
+}
+
+/// Host backing for the WIT `program` resource (`pie:core/tensor.program`): a
+/// compiled sampling program. Decoded once at construction (`tensor::Program →
+/// SamplingProgram`, via [`program_decode::decode_program`]) and encoded to L0
+/// bytecode for the bridge carrier. Keeps the declared output kinds (for
+/// response marshaling) and the input arity (for attach-time binding
+/// validation).
+pub struct Program {
+    /// The interned, shared `#9` cache artifact: canonical bytecode, its hash
+    /// (== the driver `ProgramHandle`), per-output marshaling kinds, and input
+    /// arity. Identical programs across requests/inferlets share one `Arc`.
+    cached: Arc<crate::api::program_cache::CachedProgram>,
+}
+
 pub struct ForwardPass {
+    /// Set when the ctx is bound via `context()` (the new WIT `forward-pass`
+    /// constructor takes no model — the context carries the model identity).
     pub model_id: usize,
     context_id: Option<crate::context::ContextId>,
     /// Snapshot of the bound ctx's cached speculator handle. Set in
@@ -164,111 +186,163 @@ pub struct ForwardPass {
     pub adapter_seed: Option<i64>,
     allow_pass_speculation: bool,
     req: pie_driver_abi::ForwardRequest,
+    /// Sampling programs attached via `sampler(...)` / `batch-sampler(...)`,
+    /// each with its attach-time binding-map and gathered submit inputs.
+    /// Empty for a pass that does no sampling (pure prefill); one entry for the
+    /// single-sampler path; many for `batch-sampler`. Flattened into the bridge
+    /// carrier at `execute()`.
+    programs: Vec<AttachedProgram>,
+    /// WS8 inter-pass pipelining (`next-input`): per source sampling row, the
+    /// destination input position its sampled token feeds in the *next* pass on
+    /// this context (`u32::MAX` = the `-1` ignore sentinel). `None` = no
+    /// feed-forward (the pass's output is read via `output()` as usual).
+    feed_forward: Option<Vec<u32>>,
+    /// In-flight driver response + reconstruction context, stashed by
+    /// `execute()` and drained by `output()`/`outputs()`. `None` until the pass
+    /// is submitted (or when the pass fed its output forward via `next-input`).
+    pending: Option<PendingOutput>,
 }
 
+/// A WS8 inter-pass pipeline link (`forward-pass.next-input`). Shared-resolution
+/// model (a): the link **references** the producer pass (by resource rep) rather
+/// than owning its output — so the producer's own `output()` still resolves
+/// (consumer B: the guest reads t's token for stop/EOS detection) while the next
+/// pass reads the **same** resolved per-row tokens for its input (consumer A).
+/// `positions[r]` is the next pass's input position fed by source sampling row
+/// `r` (`u32::MAX` = the `-1` ignore sentinel). The producer pass owns its pin
+/// (released via its `output()`/drop); the link holds no resources. P2 binds the
+/// device-resident `pi.sampled` `[N]` buffer + a stream event instead.
+pub struct PipelineLink {
+    producer_rep: u32,
+    positions: Vec<u32>,
+}
+
+/// One sampling program staged on a [`ForwardPass`] before submit: its L0
+/// bytecode, declared output kinds (for response marshaling), the attach-time
+/// [`Binding`](pie_sampling_ir::Binding) per input slot (the binding-map ridden
+/// to the carrier so the driver can wire each `Op::Input(i)`), and the
+/// submit-bound tensor values gathered from the bound `tensor` resources.
 #[derive(Debug)]
-pub struct FutureOutput {
-    result: Option<pie::core::inference::Output>,
+struct AttachedProgram {
+    bytecode: Vec<u8>,
+    output_kinds: Vec<pie_sampling_ir::OutputKind>,
+    bindings: Vec<pie_sampling_ir::Binding>,
+    submit_inputs: Vec<pie_driver_abi::SamplingInput>,
+    /// Sampling positions carried by this program's `logits` binding (the WIT
+    /// `input-binding::logits(positions)`); flattened into the request's
+    /// `sampling_indices` at `execute()`. Empty if the program reads no logits.
+    logits_positions: Vec<u32>,
+}
+
+/// Stashed on a [`ForwardPass`] by `execute()` and consumed by
+/// `output()`/`outputs()`: the in-flight driver response channel plus the
+/// bookkeeping needed to grow the KV lineage, release the pin, and marshal each
+/// attached program's declared outputs into typed `tensor` resources. The new
+/// WIT has no legacy sampler-slot path — every pass is program-driven — so the
+/// sampler-count spec-fill heuristic is gone (a program owns its output shape).
+struct PendingOutput {
     rx: Option<oneshot::Receiver<Result<ForwardOutput>>>,
-    /// Samplers from the originating request — cloned before draining
-    /// `pass.req` at execute() time so we can reconstruct the WIT
-    /// per-slot output list against this slot order.
-    samplers: Vec<pie_driver_abi::Sampler>,
-    done: bool,
+    /// Resolved-once cache (with lineage + pin release already applied): shared
+    /// by `output()` (consumer B — marshals tensors for the guest's
+    /// stop-detection read) and the WS8 link (consumer A — reads per-row tokens
+    /// for the next pass). Resolving is idempotent: whichever consumer runs
+    /// first awaits `rx`; the other reads the cache.
+    resolved: Option<Result<ForwardOutput, String>>,
+    /// Declared output kinds per attached program (attach order), driving the
+    /// per-program response→tensor reconstruction.
+    programs_output_kinds: Vec<Vec<pie_sampling_ir::OutputKind>>,
     model_id: usize,
-    context_id: Option<crate::context::ContextId>,
+    context_id: crate::context::ContextId,
     was_pinned: bool,
     fill_tokens: Vec<u32>,
     fill_positions: Vec<u32>,
     fill_masks: Vec<Brle>,
-    spec_tokens_for_fill: Vec<u32>,
-    spec_positions_for_fill: Vec<u32>,
     adapter_id: Option<crate::adapter::AdapterId>,
     adapter_seed: Option<i64>,
 }
 
-impl FutureOutput {
+impl PendingOutput {
     fn release_pin(&mut self) {
         if self.was_pinned {
-            if let Some(context_id) = self.context_id {
-                context::unpin(self.model_id, context_id);
-            }
+            context::unpin(self.model_id, self.context_id);
             self.was_pinned = false;
         }
     }
 
+    /// Grow the bound ctx's working-page lineage with this pass's input tokens
+    /// (so the next decode step sees them in the KV). Mirrors the legacy
+    /// `FutureOutput` path minus the retired draft-fill bookkeeping.
     fn append_lineage(&mut self) {
-        let Some(context_id) = self.context_id else {
-            return;
-        };
-        let mut all_fill_tokens = take(&mut self.fill_tokens);
-        let mut all_fill_positions = take(&mut self.fill_positions);
-        let mut all_fill_masks = take(&mut self.fill_masks);
-        if !self.spec_tokens_for_fill.is_empty() {
-            all_fill_tokens.extend_from_slice(&self.spec_tokens_for_fill);
-            all_fill_positions.extend_from_slice(&self.spec_positions_for_fill);
-            if !all_fill_masks.is_empty() {
-                for &pos in &self.spec_positions_for_fill {
-                    all_fill_masks.push(Brle::all_true((pos + 1) as usize));
-                }
-            }
-        }
-        if !all_fill_tokens.is_empty() {
-            let driver_repaired_spec_tail = self.spec_tokens_for_fill.len() as u32;
+        let fill_tokens = take(&mut self.fill_tokens);
+        let fill_positions = take(&mut self.fill_positions);
+        let fill_masks = take(&mut self.fill_masks);
+        if !fill_tokens.is_empty() {
             context::append_working_page_tokens_with_repaired_spec_tail(
                 self.model_id,
-                context_id,
-                all_fill_tokens,
-                all_fill_positions,
-                all_fill_masks,
+                self.context_id,
+                fill_tokens,
+                fill_positions,
+                fill_masks,
                 self.adapter_id,
                 self.adapter_seed,
-                driver_repaired_spec_tail,
+                0,
             );
         }
     }
 
-    fn finish_ok(&mut self, output: ForwardOutput) {
-        if self.spec_tokens_for_fill.is_empty() {
-            if let ForwardOutput::Tokens(tokens) = &output {
-                // System speculation rides accepted draft tokens in the
-                // `tokens` array on top of the requested sampler slots, so
-                // anything *beyond* the sampler count is speculative fill
-                // that must be written into the KV. When the inferlet
-                // simply samples at several positions (e.g. cacheback
-                // verification), tokens.len() == samplers.len() and there
-                // is no fill — treating those sampler results as spec fill
-                // would over-grow the working tail past its reserved pages.
-                let n_samplers = self.samplers.len();
-                if tokens.len() > n_samplers {
-                    let start = self
-                        .fill_positions
-                        .last()
-                        .copied()
-                        .map(|pos| pos + 1)
-                        .unwrap_or(0);
-                    let extra = tokens.len() - n_samplers;
-                    self.spec_tokens_for_fill
-                        .extend_from_slice(&tokens[..extra]);
-                    self.spec_positions_for_fill
-                        .extend((0..extra).map(|i| start + i as u32));
-                }
-            }
+    /// Resolve once — await the driver response, grow the ctx lineage, release
+    /// the pin — and cache the result in `resolved`. Idempotent: a second call
+    /// is a no-op. Shared by `output()` (consumer B) and the WS8 link (consumer
+    /// A) so a fed-forward pass's output reaches both.
+    async fn resolve(&mut self) {
+        if self.resolved.is_some() {
+            return;
         }
-        self.append_lineage();
-        self.release_pin();
-        self.result = Some(build_wit_output(output, &self.samplers));
-        self.done = true;
+        let Some(rx) = self.rx.take() else {
+            self.resolved = Some(Err("forward pass output already consumed".to_string()));
+            return;
+        };
+        self.resolved = Some(match rx.await {
+            Ok(Ok(output)) => {
+                self.append_lineage();
+                self.release_pin();
+                Ok(output)
+            }
+            Ok(Err(e)) => {
+                self.release_pin();
+                tracing::warn!("forward pass failed: {e:#}");
+                Err(format!("forward pass failed: {e}"))
+            }
+            Err(_) => {
+                self.release_pin();
+                Err("forward pass channel closed".to_string())
+            }
+        });
     }
 
-    fn finish_empty(&mut self) {
-        self.release_pin();
-        self.result = Some(pie::core::inference::Output {
-            slots: Vec::new(),
-            spec_tokens: Vec::new(),
-            spec_positions: Vec::new(),
-        });
-        self.done = true;
+    /// Per-row sampled tokens of the resolved output (consumer A, non-consuming);
+    /// empty if not yet resolved or the pass failed.
+    fn resolved_tokens(&self) -> Vec<u32> {
+        match &self.resolved {
+            Some(Ok(output)) => forward_output_tokens(output),
+            _ => Vec::new(),
+        }
+    }
+
+    /// Take the resolved output for marshaling (consumer B, consuming).
+    fn take_resolved(&mut self) -> Result<ForwardOutput, String> {
+        self.resolved
+            .take()
+            .unwrap_or_else(|| Err("forward pass output not resolved".to_string()))
+    }
+}
+
+/// The per-row sampled tokens a [`ForwardOutput`] carries (for WS8 feed-forward).
+fn forward_output_tokens(output: &ForwardOutput) -> Vec<u32> {
+    match output {
+        ForwardOutput::Token(t) => vec![*t],
+        ForwardOutput::Tokens(v) => v.clone(),
+        ForwardOutput::Response(resp) => resp.tokens.clone(),
     }
 }
 
@@ -292,153 +366,142 @@ fn empty_forward_request() -> pie_driver_abi::ForwardRequest {
     }
 }
 
-#[async_trait]
-impl Pollable for FutureOutput {
-    async fn ready(&mut self) {
-        if self.done {
-            return;
+
+impl Tensor {
+    /// An `i32` vector tensor (shape `[len]`). Token outputs use this — the
+    /// dtype⇒kind convention (a) is `int ⇒ Token`, so sampled token ids are
+    /// surfaced as `i32`.
+    fn i32_vec(vals: Vec<i32>) -> Tensor {
+        let mut data = Vec::with_capacity(vals.len() * 4);
+        for v in &vals {
+            data.extend_from_slice(&v.to_le_bytes());
         }
-        if let Some(rx) = self.rx.as_mut() {
-            let output = rx.await;
-            self.rx = None;
-            match output {
-                Ok(Ok(resp)) => self.finish_ok(resp),
-                Ok(Err(e)) => {
-                    tracing::warn!("future output failed: {e:#}");
-                    self.finish_empty();
-                }
-                Err(_) => {
-                    self.finish_empty();
-                }
-            }
-        } else {
-            // Another readiness probe may have already drained rx and
-            // be finishing lineage/result population. Treat rx=None while
-            // done=false as in-progress rather than completing empty.
+        Tensor {
+            shape: vec![vals.len() as u32],
+            dtype: pie::core::tensor::Dtype::I32,
+            data,
+        }
+    }
+
+    /// An `f32` vector tensor (shape `[len]`). Scalar / entropy / logprob /
+    /// distribution-probability outputs use this.
+    fn f32_vec(vals: Vec<f32>) -> Tensor {
+        let mut data = Vec::with_capacity(vals.len() * 4);
+        for v in &vals {
+            data.extend_from_slice(&v.to_le_bytes());
+        }
+        Tensor {
+            shape: vec![vals.len() as u32],
+            dtype: pie::core::tensor::Dtype::F32,
+            data,
+        }
+    }
+
+    /// An `f32` tensor wrapping an already-`f32`-little-endian byte blob (raw
+    /// logits), shape `[len/4]`.
+    fn f32_from_le_bytes(bytes: Vec<u8>) -> Tensor {
+        let n = (bytes.len() / 4) as u32;
+        Tensor {
+            shape: vec![n],
+            dtype: pie::core::tensor::Dtype::F32,
+            data: bytes,
         }
     }
 }
 
-/// Build the WIT-shaped per-slot output from a per-request
-/// [`pie_driver_abi::ForwardResponse`] (single-request shape: `num_requests = 1`,
-/// indptrs `[0, N]`) plus the original sampler list. Walks samplers in
-/// slot order, pulling one item from the matching response field per
-/// slot — preserving the 1:1 mapping between `pass.sampler(...)` calls
-/// and returned slots.
-///
-/// Spec-mode requests are detected via a token-count mismatch (the
-/// verifier produces a token sequence whose length is unrelated to the
-/// inferlet's sampler count); in that case all slots collapse to
-/// `Token` entries.
-fn build_wit_output(
+/// Number of bytes in one element of a `tensor` dtype.
+fn dtype_byte_size(dtype: pie::core::tensor::Dtype) -> usize {
+    use pie::core::tensor::Dtype;
+    match dtype {
+        Dtype::F32 | Dtype::I32 | Dtype::U32 => 4,
+        Dtype::Bool => 1,
+    }
+}
+
+/// Reconstruct each attached program's declared outputs as typed `tensor`
+/// payloads from a driver [`ForwardOutput`], walking the programs in attach
+/// order and, within each, its declared output kinds in slot order — the
+/// new-WIT analog of the retired `slot-output` walk. Token outputs become `i32`
+/// tensors; every other (float) kind an `f32` tensor (the dtype⇒kind
+/// convention (a), matching the decoder's inference). The outer vec mirrors the
+/// program list; each inner vec follows that program's output order.
+fn build_program_tensors(
     output: ForwardOutput,
-    samplers: &[pie_driver_abi::Sampler],
-) -> pie::core::inference::Output {
-    use pie::core::inference::SlotOutput as WitSlot;
-
+    programs_output_kinds: &[Vec<pie_sampling_ir::OutputKind>],
+) -> Vec<Vec<Tensor>> {
+    use pie_sampling_ir::OutputKind;
     match output {
-        ForwardOutput::Token(token) => {
-            return pie::core::inference::Output {
-                slots: vec![WitSlot::Token(token)],
-                spec_tokens: Vec::new(),
-                spec_positions: Vec::new(),
-            };
-        }
+        ForwardOutput::Token(token) => single_token_outputs(vec![token], programs_output_kinds),
         ForwardOutput::Tokens(tokens) => {
-            let slots = tokens.into_iter().map(WitSlot::Token).collect();
-            return pie::core::inference::Output {
-                slots,
-                spec_tokens: Vec::new(),
-                spec_positions: Vec::new(),
-            };
+            // A single program declaring a single Token output owns the whole
+            // token vector as one `[N]` tensor (the common decode shape);
+            // otherwise distribute one token per declared Token slot.
+            if programs_output_kinds.len() == 1
+                && programs_output_kinds[0].len() == 1
+                && programs_output_kinds[0][0] == OutputKind::Token
+            {
+                vec![vec![Tensor::i32_vec(
+                    tokens.into_iter().map(|t| t as i32).collect(),
+                )]]
+            } else {
+                single_token_outputs(tokens, programs_output_kinds)
+            }
         }
-        ForwardOutput::Response(resp) => build_wit_output_from_response(resp, samplers),
+        ForwardOutput::Response(resp) => {
+            build_program_tensors_from_response(resp, programs_output_kinds)
+        }
     }
 }
 
-fn build_wit_output_from_response(
-    resp: pie_driver_abi::ForwardResponse,
-    samplers: &[pie_driver_abi::Sampler],
-) -> pie::core::inference::Output {
-    use pie::core::inference::SlotOutput as WitSlot;
-    use pie_driver_abi::Sampler;
-
-    let (spec_tokens, spec_positions): (Vec<u32>, Vec<u32>) = if resp.spec_indptr.len() >= 2 {
-        let lo = resp.spec_indptr[0] as usize;
-        let hi = resp.spec_indptr[1] as usize;
-        (
-            resp.spec_tokens.get(lo..hi).unwrap_or(&[]).to_vec(),
-            resp.spec_positions.get(lo..hi).unwrap_or(&[]).to_vec(),
-        )
-    } else {
-        (resp.spec_tokens.clone(), resp.spec_positions.clone())
-    };
-
-    let token_payload_only = resp.dists_ids.is_empty()
-        && resp.dists_probs.is_empty()
-        && resp.logits_bytes.is_empty()
-        && resp.logprobs_values.is_empty()
-        && resp.entropies.is_empty();
-
-    let mut expected_token_slots = 0usize;
-    let mut all_samplers_token = true;
-    for sampler in samplers {
-        let is_token = matches!(
-            sampler,
-            Sampler::Multinomial { .. }
-                | Sampler::TopK { .. }
-                | Sampler::TopP { .. }
-                | Sampler::MinP { .. }
-                | Sampler::TopKTopP { .. }
-        );
-        if is_token {
-            expected_token_slots += 1;
-        } else {
-            all_samplers_token = false;
-        }
-    }
-
-    let tokens = resp.tokens;
-    let is_spec_walk =
-        token_payload_only && !tokens.is_empty() && tokens.len() != expected_token_slots;
-
-    if token_payload_only && (all_samplers_token || is_spec_walk) {
-        let slots = tokens.into_iter().map(WitSlot::Token).collect();
-        return pie::core::inference::Output {
-            slots,
-            spec_tokens,
-            spec_positions,
-        };
-    }
-
-    if is_spec_walk {
-        let slots = tokens.into_iter().map(WitSlot::Token).collect();
-        return pie::core::inference::Output {
-            slots,
-            spec_tokens,
-            spec_positions,
-        };
-    }
-
+/// Distribute a flat token list across each program's declared `Token` outputs
+/// (one token per Token slot, in order); non-token kinds yield no tensor on this
+/// fast path (used only when no rich `ForwardResponse` was produced).
+fn single_token_outputs(
+    tokens: Vec<u32>,
+    programs_output_kinds: &[Vec<pie_sampling_ir::OutputKind>],
+) -> Vec<Vec<Tensor>> {
+    use pie_sampling_ir::OutputKind;
     let mut tok_iter = tokens.into_iter();
-    // Dists: walk the kv_indptr ranges for request 0.
-    let mut dist_iter: Box<dyn Iterator<Item = (Vec<u32>, Vec<f32>)>> =
-        if resp.dists_kv_indptr.len() >= 2 {
-            let kvs: Vec<_> = (0..resp.dists_kv_indptr.len() - 1)
-                .map(|k| {
-                    let lo = resp.dists_kv_indptr[k] as usize;
-                    let hi = resp.dists_kv_indptr[k + 1] as usize;
-                    (
-                        resp.dists_ids[lo..hi].to_vec(),
-                        resp.dists_probs[lo..hi].to_vec(),
-                    )
+    programs_output_kinds
+        .iter()
+        .map(|kinds| {
+            kinds
+                .iter()
+                .filter_map(|k| match k {
+                    OutputKind::Token => {
+                        tok_iter.next().map(|t| Tensor::i32_vec(vec![t as i32]))
+                    }
+                    _ => None,
                 })
-                .collect();
-            Box::new(kvs.into_iter())
-        } else {
-            Box::new(std::iter::empty())
-        };
-    // Logits: walk the byte_indptr ranges for request 0.
+                .collect()
+        })
+        .collect()
+}
+
+/// Per-program tensor reconstruction over a rich [`ForwardResponse`]: the
+/// program analog of the retired `build_wit_output_from_response` walk. Program
+/// outputs reuse the existing response channels (token / distribution / logits /
+/// logprobs / entropy), pulled in attach order so each program consumes its
+/// share.
+fn build_program_tensors_from_response(
+    resp: pie_driver_abi::ForwardResponse,
+    programs_output_kinds: &[Vec<pie_sampling_ir::OutputKind>],
+) -> Vec<Vec<Tensor>> {
+    use pie_sampling_ir::OutputKind;
+
+    let mut tok_iter = resp.tokens.into_iter();
+    let mut dist_iter: Box<dyn Iterator<Item = Vec<f32>>> = if resp.dists_kv_indptr.len() >= 2 {
+        let probs: Vec<_> = (0..resp.dists_kv_indptr.len() - 1)
+            .map(|k| {
+                let lo = resp.dists_kv_indptr[k] as usize;
+                let hi = resp.dists_kv_indptr[k + 1] as usize;
+                resp.dists_probs[lo..hi].to_vec()
+            })
+            .collect();
+        Box::new(probs.into_iter())
+    } else {
+        Box::new(std::iter::empty())
+    };
     let mut logit_iter: Box<dyn Iterator<Item = Vec<u8>>> = if resp.logits_byte_indptr.len() >= 2 {
         let blobs: Vec<_> = (0..resp.logits_byte_indptr.len() - 1)
             .map(|b| {
@@ -451,7 +514,6 @@ fn build_wit_output_from_response(
     } else {
         Box::new(std::iter::empty())
     };
-    // Logprobs: walk the val_indptr ranges.
     let mut lp_iter: Box<dyn Iterator<Item = Vec<f32>>> = if resp.logprobs_val_indptr.len() >= 2 {
         let slots: Vec<_> = (0..resp.logprobs_val_indptr.len() - 1)
             .map(|s| {
@@ -464,77 +526,54 @@ fn build_wit_output_from_response(
     } else {
         Box::new(std::iter::empty())
     };
-    let mut ent_iter = resp.entropies.iter().copied();
+    let mut ent_iter = resp.entropies.into_iter();
 
-    let slots: Vec<WitSlot> = samplers
+    programs_output_kinds
         .iter()
-        .filter_map(|s| match s {
-            Sampler::Multinomial { .. }
-            | Sampler::TopK { .. }
-            | Sampler::TopP { .. }
-            | Sampler::MinP { .. }
-            | Sampler::TopKTopP { .. } => tok_iter.next().map(WitSlot::Token),
-            Sampler::Dist { .. } => dist_iter.next().map(WitSlot::Distribution),
-            Sampler::RawLogits => logit_iter.next().map(WitSlot::Logits),
-            Sampler::Logprob { .. } | Sampler::Logprobs { .. } => {
-                lp_iter.next().map(WitSlot::Logprobs)
-            }
-            Sampler::Entropy => ent_iter.next().map(WitSlot::Entropy),
-            // Embedding is reserved but not currently produced by the worker.
-            Sampler::Embedding => None,
+        .map(|kinds| {
+            kinds
+                .iter()
+                .filter_map(|kind| match kind {
+                    OutputKind::Token => {
+                        tok_iter.next().map(|t| Tensor::i32_vec(vec![t as i32]))
+                    }
+                    // Distribution exposes its probability vector as f32; the
+                    // companion ids ride the same channel for the SDK's typed
+                    // accessor (MVP tensor channel carries probs).
+                    OutputKind::Distribution => dist_iter.next().map(Tensor::f32_vec),
+                    OutputKind::Logits => logit_iter.next().map(Tensor::f32_from_le_bytes),
+                    OutputKind::Logprobs => lp_iter.next().map(Tensor::f32_vec),
+                    // Entropy and Scalar (kld / mirostat μ) share the per-slot
+                    // scalar f32 entropies channel; both surface as a 1-elem f32.
+                    OutputKind::Entropy | OutputKind::Scalar => {
+                        ent_iter.next().map(|e| Tensor::f32_vec(vec![e]))
+                    }
+                    // Embedding is reserved but not currently produced.
+                    OutputKind::Embedding => None,
+                })
+                .collect()
         })
-        .collect();
-
-    pie::core::inference::Output {
-        slots,
-        spec_tokens,
-        spec_positions,
-    }
-}
-
-/// Translate the WIT-defined [`pie::core::inference::Sampler`] (which
-/// uses anonymous tuple variants — see `interface/inferlet/core/wit/
-/// inference.wit`) to the canonical [`pie_driver_abi::Sampler`] enum
-/// (re-export of [`pie_driver_abi::Sampler`]). The variant set matches
-/// 1:1; this is just rearranging field names.
-fn wit_to_bridge_sampler(s: pie::core::inference::Sampler) -> pie_driver_abi::Sampler {
-    use pie::core::inference::Sampler as Wit;
-    match s {
-        Wit::Multinomial((temperature, seed)) => {
-            pie_driver_abi::Sampler::Multinomial { temperature, seed }
-        }
-        Wit::TopK((temperature, k)) => pie_driver_abi::Sampler::TopK { temperature, k },
-        Wit::TopP((temperature, p)) => pie_driver_abi::Sampler::TopP { temperature, p },
-        Wit::MinP((temperature, p)) => pie_driver_abi::Sampler::MinP { temperature, p },
-        Wit::TopKTopP((temperature, k, p)) => pie_driver_abi::Sampler::TopKTopP { temperature, k, p },
-        Wit::Embedding => pie_driver_abi::Sampler::Embedding,
-        Wit::Dist((temperature, num_tokens)) => pie_driver_abi::Sampler::Dist {
-            temperature,
-            num_tokens,
-        },
-        Wit::RawLogits => pie_driver_abi::Sampler::RawLogits,
-        Wit::Logprob(token_id) => pie_driver_abi::Sampler::Logprob { token_id },
-        Wit::Logprobs(token_ids) => pie_driver_abi::Sampler::Logprobs { token_ids },
-        Wit::Entropy => pie_driver_abi::Sampler::Entropy,
-    }
+        .collect()
 }
 
 impl pie::core::inference::Host for InstanceState {}
 
 impl pie::core::inference::HostForwardPass for InstanceState {
-    async fn new(&mut self, model: Resource<Model>) -> Result<Resource<ForwardPass>> {
-        let model = self.ctx().table.get(&model)?;
-        // Initialize the accumulator with the per-request invariants:
-        // single adapter binding (-1 sentinels = unbound), and no
-        // speculative side-channel output unless the caller explicitly
-        // enables it via `output_speculative_tokens(true)`.
+    async fn new(&mut self) -> Result<Resource<ForwardPass>> {
+        // Initialize the accumulator with the per-request invariants: single
+        // adapter binding (-1 sentinels = unbound). The new WIT `forward-pass`
+        // constructor takes no model — `model_id` is bound when the ctx is set
+        // via `context()` (the context carries the model identity).
         let pass = ForwardPass {
-            model_id: model.model_id,
+            model_id: 0,
             context_id: None,
             spec: None,
             adapter_seed: None,
             allow_pass_speculation: true,
             req: empty_forward_request(),
+            programs: Vec::new(),
+            feed_forward: None,
+            pending: None,
         };
         Ok(self.ctx().table.push(pass)?)
     }
@@ -560,6 +599,7 @@ impl pie::core::inference::HostForwardPass for InstanceState {
             .clone();
         let pass = self.ctx().table.get_mut(&this)?;
         pass.context_id = Some(context_id);
+        pass.model_id = model_id;
         pass.spec = spec;
         Ok(())
     }
@@ -675,34 +715,6 @@ impl pie::core::inference::HostForwardPass for InstanceState {
         Ok(())
     }
 
-    async fn input_speculative_tokens(
-        &mut self,
-        this: Resource<ForwardPass>,
-        tokens: Vec<u32>,
-        positions: Vec<u32>,
-    ) -> Result<()> {
-        let pass = self.ctx().table.get_mut(&this)?;
-        pass.req.spec_token_ids.extend(tokens);
-        pass.req.spec_position_ids.extend(positions);
-        Ok(())
-    }
-
-    async fn output_speculative_tokens(
-        &mut self,
-        this: Resource<ForwardPass>,
-        flag: bool,
-    ) -> Result<()> {
-        let pass = self.ctx().table.get_mut(&this)?;
-        pass.req.output_spec_flags = vec![flag];
-        Ok(())
-    }
-
-    async fn pass_speculation(&mut self, this: Resource<ForwardPass>, flag: bool) -> Result<()> {
-        let pass = self.ctx().table.get_mut(&this)?;
-        pass.allow_pass_speculation = flag;
-        Ok(())
-    }
-
     async fn attention_mask(
         &mut self,
         this: Resource<ForwardPass>,
@@ -715,29 +727,75 @@ impl pie::core::inference::HostForwardPass for InstanceState {
         Ok(())
     }
 
-    async fn logit_mask(&mut self, this: Resource<ForwardPass>, mask: Vec<u32>) -> Result<()> {
-        let brle = Brle::from_vec(mask);
-
-        let pass = self.ctx().table.get_mut(&this)?;
-        pass.req.logit_masks = vec![brle];
-        Ok(())
-    }
-
+    // ── Programmable sampler (Sampling IR) — L1/bravo host carrier ──────
+    //
+    // The binding-free front door: the inferlet builds a `program` resource
+    // (decoded + compiled at construction, see `HostProgram::new`) and attaches
+    // it with one `input-binding` per program input slot. `sampler`/`batch-sampler`
+    // walk the bindings positionally (`inputs[i]` ↔ `Op::Input(i)`): a `logits`
+    // binding marks the LM-head intrinsic and carries the sampling positions; a
+    // `tensor` binding is a submit-bound device value the host gathers now. The
+    // per-slot binding-map + gathered submit values ride the bridge carrier at
+    // `execute()`; the driver wires each `Op::Input(i)` from the binding-map.
     async fn sampler(
         &mut self,
         this: Resource<ForwardPass>,
-        indices: Vec<u32>,
-        sampler: pie::core::inference::Sampler,
+        program: Resource<Program>,
+        inputs: Vec<pie::core::inference::InputBinding>,
     ) -> Result<()> {
-        // Convert directly to the canonical bridge enum and replicate
-        // once per index — no stringly-typed intermediate.
-        let bridge = wit_to_bridge_sampler(sampler);
-        let n = indices.len();
+        let attached = self.attach_program(&program, inputs)?;
         let pass = self.ctx().table.get_mut(&this)?;
-        for _ in 0..n {
-            pass.req.push_sampler(&bridge);
+        pass.programs.push(attached);
+        Ok(())
+    }
+
+    async fn batch_sampler(
+        &mut self,
+        this: Resource<ForwardPass>,
+        programs: Vec<Resource<Program>>,
+        inputs: Vec<Vec<pie::core::inference::InputBinding>>,
+    ) -> Result<()> {
+        if programs.len() != inputs.len() {
+            return Err(anyhow::anyhow!(
+                "batch-sampler: {} programs but {} binding lists",
+                programs.len(),
+                inputs.len()
+            ));
         }
-        pass.req.sampling_indices.extend(indices);
+        let mut attached = Vec::with_capacity(programs.len());
+        for (program, binds) in programs.into_iter().zip(inputs) {
+            attached.push(self.attach_program(&program, binds)?);
+        }
+        let pass = self.ctx().table.get_mut(&this)?;
+        pass.programs.extend(attached);
+        Ok(())
+    }
+
+    // ── WS8 pipelining primitives ──────────────────────────────────────
+    // `next-input` declares that THIS pass's per-row sampled tokens feed the
+    // *next* pass on this context (host-resolved in P1, device-resident in P2),
+    // removing the guest output()+copy round-trip between decode steps.
+    async fn next_input(&mut self, this: Resource<ForwardPass>, positions: Vec<u32>) -> Result<()> {
+        let pass = self.ctx().table.get_mut(&this)?;
+        pass.feed_forward = Some(positions);
+        Ok(())
+    }
+
+    async fn next_attention_mask(
+        &mut self,
+        this: Resource<ForwardPass>,
+        mask: Vec<Vec<u32>>,
+    ) -> Result<()> {
+        let _ = (this, mask);
+        Ok(())
+    }
+
+    async fn next_adapter(
+        &mut self,
+        this: Resource<ForwardPass>,
+        adapter: Resource<Adapter>,
+    ) -> Result<()> {
+        let _ = (this, adapter);
         Ok(())
     }
 
@@ -752,14 +810,55 @@ impl pie::core::inference::HostForwardPass for InstanceState {
         Ok(())
     }
 
-    async fn execute(
-        &mut self,
-        this: Resource<ForwardPass>,
-    ) -> Result<Result<Resource<FutureOutput>, String>> {
+    async fn execute(&mut self, this: Resource<ForwardPass>) -> Result<()> {
         let profiling = execute_profile_enabled();
         let profile_start = profiling.then(Instant::now);
         let mut profile_sample = ExecuteProfileSample::default();
         let prepare_start = profiling.then(Instant::now);
+
+        // WS8: drain any inter-pass pipeline link feeding THIS pass — the prior
+        // pass on this context fed its per-row sampled tokens forward via
+        // `next-input`. Resolve the producer (shared, non-consuming: its own
+        // `output()` still reads it) and inject its tokens at the mapped input
+        // positions before this pass's request is finalized. Depth-1 (no
+        // `next-input`) skips this entirely.
+        let incoming_ctx = self.ctx().table.get(&this)?.context_id;
+        if let Some(ctx_id) = incoming_ctx
+            && let Some(link) = self.pipeline_links.remove(&ctx_id)
+        {
+            let producer = Resource::<ForwardPass>::new_borrow(link.producer_rep);
+            // Drain-before-producer-drop invariant: consumer A borrows the
+            // producer by rep, so the producer pass must still be alive at drain
+            // time. golf's one-ahead loop guarantees it (t+1 drains the link
+            // before the guest reads+drops t); fail loud + diagnosable if a
+            // future loop shape violates it, rather than silently feeding no
+            // tokens.
+            if self.ctx().table.get(&producer).is_err() {
+                return Err(anyhow::anyhow!(
+                    "WS8 next-input: producer pass was dropped before its successor \
+                     drained the link (drain-before-producer-drop invariant violated)"
+                ));
+            }
+            // Resolve the producer's (shared) output without consuming it.
+            self.resolve_pending(&producer).await?;
+            let toks = self
+                .ctx()
+                .table
+                .get(&producer)
+                .ok()
+                .and_then(|p| p.pending.as_ref().map(|pe| pe.resolved_tokens()))
+                .unwrap_or_default();
+            let pass = self.ctx().table.get_mut(&this)?;
+            for (row, &dest) in link.positions.iter().enumerate() {
+                if dest != u32::MAX
+                    && let Some(&tok) = toks.get(row)
+                {
+                    pass.req.token_ids.push(tok);
+                    pass.req.position_ids.push(dest);
+                }
+            }
+        }
+
         let pass = self.ctx().table.get_mut(&this)?;
 
         let model_id = pass.model_id;
@@ -770,13 +869,58 @@ impl pie::core::inference::HostForwardPass for InstanceState {
         let spec_handle = pass.spec.clone();
         let allow_pass_speculation = pass.allow_pass_speculation;
         pass.allow_pass_speculation = true;
+        // Whether this pass feeds its sampled tokens forward to the next pass.
+        let feed_forward = pass.feed_forward.take();
         // Drain the accumulator. The remaining work is to synthesize
         // masks if absent and stamp the per-request indptrs onto the
         // ForwardRequest, then submit.
         let mut req = std::mem::replace(&mut pass.req, empty_forward_request());
-        // Clone samplers BEFORE finalizing so we can reconstruct the
-        // per-slot WIT output against the original slot order.
-        let samplers_for_output = req.samplers();
+
+        // Flatten every attached sampling program into the bridge carrier and
+        // collect their declared output kinds (attach order) for response
+        // reconstruction. Each program's `logits` binding positions become the
+        // pass's sampling positions; its submit-bound tensor values ride the
+        // carrier (the per-slot binding-map likewise, so the driver can wire
+        // each `Op::Input(i)`).
+        let attached = std::mem::take(&mut pass.programs);
+        let has_programs = !attached.is_empty();
+        let mut programs_output_kinds: Vec<Vec<pie_sampling_ir::OutputKind>> =
+            Vec::with_capacity(attached.len());
+        let mut logits_positions: Vec<u32> = Vec::new();
+        for program in attached {
+            programs_output_kinds.push(program.output_kinds);
+            logits_positions.extend(program.logits_positions);
+            // Carry the per-slot binding-map so the driver can wire each
+            // `Op::Input(i)` from the binding-free bytecode (Logits intrinsic vs
+            // keyed submit tensor).
+            let bindings = program
+                .bindings
+                .iter()
+                .map(|b| match b {
+                    pie_sampling_ir::Binding::Logits => pie_driver_abi::SamplingBinding::Logits,
+                    pie_sampling_ir::Binding::Tensor { key, .. } => {
+                        pie_driver_abi::SamplingBinding::Tensor { key: *key }
+                    }
+                })
+                .collect();
+            req.push_sampling_program(&pie_driver_abi::SamplingProgramSubmission {
+                bytecode: program.bytecode,
+                inputs: program.submit_inputs,
+                bindings,
+                late_keys: Vec::new(),
+                late_inputs: Vec::new(),
+            });
+        }
+        if has_programs {
+            // The `logits` binding(s) carry the sampling positions; fall back to
+            // the single M=1 decode row (last token) when none were supplied so
+            // the LM head still runs and the program samples there.
+            if !logits_positions.is_empty() {
+                req.sampling_indices = logits_positions;
+            } else if req.sampling_indices.is_empty() && !req.token_ids.is_empty() {
+                req.sampling_indices = vec![req.token_ids.len() as u32 - 1];
+            }
+        }
 
         // Track whether the user actually supplied masks; the kernel-dispatch
         // hint downstream needs to distinguish user masks from the runtime's
@@ -784,9 +928,7 @@ impl pie::core::inference::HostForwardPass for InstanceState {
         let has_user_mask = !req.masks.is_empty();
 
         // Save data needed for context::append_working_page_tokens() before
-        // moving into request. We also clone the speculative arrays so we
-        // can append the verified-prefix to the working-page lineage once
-        // the response tells us how many drafts were accepted.
+        // moving into request.
         let num_input_tokens = req.token_ids.len();
         let num_spec_tokens = req.spec_token_ids.len();
         let fill_tokens = req.token_ids.clone();
@@ -796,8 +938,6 @@ impl pie::core::inference::HostForwardPass for InstanceState {
         } else {
             Vec::new()
         };
-        let spec_tokens_for_fill = req.spec_token_ids.clone();
-        let spec_positions_for_fill = req.spec_position_ids.clone();
         // Adapter id for context::append_working_page_tokens.
         let adapter_id: Option<crate::adapter::AdapterId> = {
             let bound = req.adapter_bindings[0].adapter_id;
@@ -821,6 +961,10 @@ impl pie::core::inference::HostForwardPass for InstanceState {
         let staged_rx = spec_handle
             .as_ref()
             .filter(|_| use_pass_speculation)
+            // A program-bearing pass must take the cold path: it finalizes the
+            // program carrier's per-request CSR and submits this request (the
+            // staged path would replay a prior, program-less batch).
+            .filter(|_| !has_programs)
             .and_then(|s| inference::try_hit(s, context_id, &req, allow_pass_speculation));
         if let Some(start) = try_hit_start {
             profile_sample.try_hit_us = elapsed_us(start.elapsed());
@@ -850,6 +994,11 @@ impl pie::core::inference::HostForwardPass for InstanceState {
             req.logit_mask_indptr = vec![0, n_logit];
             req.sampling_indptr = vec![0, n_sampling];
             req.sampler_indptr = vec![0, n_samplers];
+            // Sampling-program carrier: per-request count CSR, mirroring
+            // `sampler_indptr`. The nested per-program CSRs are already rooted
+            // by `push_sampling_program`. `n_sampling_programs()` is 0 for the
+            // legacy sampler path, giving `[0, 0]`.
+            req.sampling_program_indptr = vec![0, req.n_sampling_programs() as u32];
             req.spec_indptr = vec![0, n_spec];
             req.kv_page_indptr = vec![0];
             req.context_ids = vec![context_id];
@@ -864,7 +1013,7 @@ impl pie::core::inference::HostForwardPass for InstanceState {
                 Ok(p) => p,
                 Err(e) => {
                     tracing::warn!("pin failed for ctx {context_id}: {e:#}");
-                    return Ok(Err(e.to_string()));
+                    return Err(anyhow::anyhow!("pin failed for ctx {context_id}: {e}"));
                 }
             };
             if let Some(start) = pin_start {
@@ -897,9 +1046,8 @@ impl pie::core::inference::HostForwardPass for InstanceState {
                 if !system_spec_supported {
                     if !req.spec_token_ids.is_empty() {
                         context::unpin(model_id, context_id);
-                        return Ok(Err(
+                        return Err(anyhow::anyhow!(
                             "rs_cache models do not support speculative draft tokens yet"
-                                .to_string(),
                         ));
                     }
                     req.output_spec_flags = vec![false];
@@ -939,7 +1087,7 @@ impl pie::core::inference::HostForwardPass for InstanceState {
                 );
                 eprintln!("{msg}");
                 context::unpin(model_id, context_id);
-                return Ok(Err(msg));
+                return Err(anyhow::anyhow!(msg));
             }
 
             let driver_idx = driver_id as usize;
@@ -968,84 +1116,300 @@ impl pie::core::inference::HostForwardPass for InstanceState {
                     context::unpin(model_id, context_id);
                 }
                 tracing::warn!("inference::submit failed for ctx {context_id}: {e:#}");
-                return Ok(Err(e.to_string()));
+                return Err(anyhow::anyhow!("submit failed for ctx {context_id}: {e}"));
             }
         };
 
-        let future_output = FutureOutput {
-            result: None,
+        let pending = PendingOutput {
             rx: Some(rx),
-            samplers: samplers_for_output,
-            done: false,
+            resolved: None,
+            programs_output_kinds,
             model_id,
-            context_id: Some(context_id),
+            context_id,
             was_pinned,
             fill_tokens,
             fill_positions,
             fill_masks,
-            spec_tokens_for_fill,
-            spec_positions_for_fill,
             adapter_id,
             adapter_seed,
         };
         let postprocess_start = profiling.then(Instant::now);
-        let pushed = self.ctx().table.push(future_output)?;
+        // The pending always lives on the pass so `output()` resolves on every
+        // pass (consumer B — the guest reads t's token for stop detection).
+        self.ctx().table.get_mut(&this)?.pending = Some(pending);
+        if let Some(positions) = feed_forward {
+            // WS8: register a link REFERENCING this pass (by rep) so the next
+            // pass on this context can read its per-row sampled tokens (consumer
+            // A) without consuming the pass's output — shared resolution (a).
+            self.pipeline_links.insert(
+                context_id,
+                PipelineLink {
+                    producer_rep: this.rep(),
+                    positions,
+                },
+            );
+        }
         if let Some(start) = postprocess_start {
             profile_sample.postprocess_us = elapsed_us(start.elapsed());
         }
         if let Some(start) = profile_start {
             record_execute_profile(profile_sample, elapsed_us(start.elapsed()));
         }
-        Ok(Ok(pushed))
+        Ok(())
+    }
+
+    async fn output(
+        &mut self,
+        this: Resource<ForwardPass>,
+    ) -> Result<Result<Vec<Resource<Tensor>>, String>> {
+        match self.complete_pass(&this).await? {
+            Ok(per_program) => {
+                // Single-sampler `output()`: flatten the attached program's
+                // declared output tensors in order. A pass with no sampler
+                // yields an empty list; a batch pass should use `outputs()`.
+                let mut handles = Vec::new();
+                for program_tensors in per_program {
+                    for t in program_tensors {
+                        handles.push(self.ctx().table.push(t)?);
+                    }
+                }
+                Ok(Ok(handles))
+            }
+            Err(e) => Ok(Err(e)),
+        }
+    }
+
+    async fn outputs(
+        &mut self,
+        this: Resource<ForwardPass>,
+    ) -> Result<Result<Vec<Vec<Resource<Tensor>>>, String>> {
+        match self.complete_pass(&this).await? {
+            Ok(per_program) => {
+                let mut out = Vec::with_capacity(per_program.len());
+                for program_tensors in per_program {
+                    let mut handles = Vec::with_capacity(program_tensors.len());
+                    for t in program_tensors {
+                        handles.push(self.ctx().table.push(t)?);
+                    }
+                    out.push(handles);
+                }
+                Ok(Ok(out))
+            }
+            Err(e) => Ok(Err(e)),
+        }
     }
 
     async fn drop(&mut self, this: Resource<ForwardPass>) -> Result<()> {
+        // Release any still-held pin if the pass is dropped without `output()`.
+        if let Ok(pass) = self.ctx().table.get_mut(&this)
+            && let Some(p) = pass.pending.as_mut()
+        {
+            p.release_pin();
+        }
         self.ctx().table.delete(this)?;
         Ok(())
     }
 }
 
-impl pie::core::inference::HostFutureOutput for InstanceState {
-    async fn pollable(&mut self, this: Resource<FutureOutput>) -> Result<Resource<DynPollable>> {
-        subscribe(self.ctx().table, this)
-    }
-
-    async fn get(
+impl InstanceState {
+    /// Walk one `sampler(...)`/`batch-sampler(...)` attachment: validate the
+    /// binding arity against the program's input slots, build the per-slot
+    /// [`Binding`](pie_sampling_ir::Binding) map, and gather each submit-bound
+    /// `tensor` value into the carrier (keyed by its slot index so the driver
+    /// can wire `Op::Input(i)`). The `logits` binding's positions are captured
+    /// as the program's sampling positions.
+    fn attach_program(
         &mut self,
-        this: Resource<FutureOutput>,
-    ) -> Result<Option<pie::core::inference::Output>> {
-        let result = self.ctx().table.get_mut(&this)?;
-        if !result.done {
-            if let Some(rx) = result.rx.as_mut() {
-                match rx.try_recv() {
-                    Ok(Ok(resp)) => {
-                        result.rx = None;
-                        result.finish_ok(resp);
+        program: &Resource<Program>,
+        inputs: Vec<pie::core::inference::InputBinding>,
+    ) -> Result<AttachedProgram> {
+        use pie::core::inference::InputBinding;
+        let (bytecode, output_kinds, num_inputs) = {
+            let p = self.ctx().table.get(program)?;
+            (p.cached.bytecode.clone(), p.cached.output_kinds.clone(), p.cached.num_inputs)
+        };
+        if inputs.len() != num_inputs {
+            return Err(anyhow::anyhow!(
+                "sampler: program declares {num_inputs} input slot(s) but {} binding(s) supplied",
+                inputs.len()
+            ));
+        }
+        let mut bindings = Vec::with_capacity(inputs.len());
+        let mut submit_inputs = Vec::new();
+        let mut logits_positions: Vec<u32> = Vec::new();
+        let mut saw_logits = false;
+        for (i, binding) in inputs.into_iter().enumerate() {
+            match binding {
+                InputBinding::Logits(positions) => {
+                    if saw_logits {
+                        return Err(anyhow::anyhow!(
+                            "sampler: multiple logits bindings are not supported (MVP)"
+                        ));
                     }
-                    Ok(Err(e)) => {
-                        result.rx = None;
-                        tracing::warn!("future output failed: {e:#}");
-                        result.finish_empty();
-                    }
-                    Err(TryRecvError::Closed) => {
-                        result.rx = None;
-                        result.finish_empty();
-                    }
-                    Err(TryRecvError::Empty) => {}
+                    saw_logits = true;
+                    logits_positions = positions;
+                    bindings.push(pie_sampling_ir::Binding::Logits);
+                }
+                InputBinding::Tensor(tensor) => {
+                    // Submit binding: the value is final once the inferlet has
+                    // written it before attach, so gather its bytes now. The
+                    // slot index is the TensorKey wired to `Op::Input(i)`.
+                    let key = i as u32;
+                    let data = self.ctx().table.get(&tensor)?.data.clone();
+                    // The owned tensor handle is consumed by the binding.
+                    self.ctx().table.delete(tensor)?;
+                    bindings.push(pie_sampling_ir::Binding::Tensor {
+                        key,
+                        ready: pie_sampling_ir::Readiness::Submit,
+                    });
+                    submit_inputs.push(pie_driver_abi::SamplingInput { key, bytes: data });
                 }
             }
         }
-        if result.done {
-            Ok(take(&mut result.result))
-        } else {
-            Ok(None)
-        }
+        Ok(AttachedProgram {
+            bytecode,
+            output_kinds,
+            bindings,
+            submit_inputs,
+            logits_positions,
+        })
     }
 
-    async fn drop(&mut self, this: Resource<FutureOutput>) -> Result<()> {
-        if let Ok(future) = self.ctx().table.get_mut(&this) {
-            future.release_pin();
+    /// Resolve a submitted pass's pending output **in place** (idempotent): take
+    /// it out to await without holding the table borrow, then restore it with the
+    /// result cached — so both `output()` (consumer B) and the WS8 link (consumer
+    /// A, via the producer rep) can read the same resolution. No-op if the pass
+    /// has no pending (never executed, or already consumed).
+    async fn resolve_pending(&mut self, pass: &Resource<ForwardPass>) -> Result<()> {
+        let Some(mut pending) = self.ctx().table.get_mut(pass)?.pending.take() else {
+            return Ok(());
+        };
+        pending.resolve().await;
+        self.ctx().table.get_mut(pass)?.pending = Some(pending);
+        Ok(())
+    }
+
+    /// Drain a submitted pass for `output()`/`outputs()`: resolve it (shared with
+    /// any WS8 link), then take its cached output and reconstruct each attached
+    /// program's declared outputs as typed tensors. `Err` if the pass was never
+    /// executed or the driver pass failed.
+    async fn complete_pass(
+        &mut self,
+        this: &Resource<ForwardPass>,
+    ) -> Result<Result<Vec<Vec<Tensor>>, String>> {
+        self.resolve_pending(this).await?;
+        let pass = self.ctx().table.get_mut(this)?;
+        let Some(pending) = pass.pending.as_mut() else {
+            return Ok(Err("output() called before execute()".to_string()));
+        };
+        match pending.take_resolved() {
+            Ok(output) => Ok(Ok(build_program_tensors(
+                output,
+                &pending.programs_output_kinds,
+            ))),
+            Err(e) => Ok(Err(e)),
         }
+    }
+}
+
+// =============================================================================
+// tensor resources (pie:core/tensor) — Tensor (typed buffer) + Program
+// =============================================================================
+
+/// Expected packed byte length of a tensor with the given shape + dtype.
+fn expected_byte_len(shape: &[u32], dtype: pie::core::tensor::Dtype) -> usize {
+    let elems: usize = shape.iter().map(|&d| d as usize).product();
+    elems * dtype_byte_size(dtype)
+}
+
+impl pie::core::tensor::Host for InstanceState {}
+
+impl pie::core::tensor::HostTensor for InstanceState {
+    async fn new(
+        &mut self,
+        shape: Vec<u32>,
+        dtype: pie::core::tensor::Dtype,
+    ) -> Result<Resource<Tensor>> {
+        // Allocate a zero-filled buffer sized to shape×dtype; `write` /
+        // `from-data` populate it before `execute()`.
+        let data = vec![0u8; expected_byte_len(&shape, dtype)];
+        Ok(self.ctx().table.push(Tensor { shape, dtype, data })?)
+    }
+
+    async fn from_data(
+        &mut self,
+        shape: Vec<u32>,
+        dtype: pie::core::tensor::Dtype,
+        data: Vec<u8>,
+    ) -> Result<Result<Resource<Tensor>, String>> {
+        let expected = expected_byte_len(&shape, dtype);
+        if data.len() != expected {
+            return Ok(Err(format!(
+                "tensor data is {} bytes but shape {shape:?}/{dtype:?} needs {expected}",
+                data.len()
+            )));
+        }
+        Ok(Ok(self.ctx().table.push(Tensor { shape, dtype, data })?))
+    }
+
+    async fn shape(&mut self, this: Resource<Tensor>) -> Result<Vec<u32>> {
+        Ok(self.ctx().table.get(&this)?.shape.clone())
+    }
+
+    async fn dtype(&mut self, this: Resource<Tensor>) -> Result<pie::core::tensor::Dtype> {
+        Ok(self.ctx().table.get(&this)?.dtype)
+    }
+
+    async fn write(
+        &mut self,
+        this: Resource<Tensor>,
+        data: Vec<u8>,
+    ) -> Result<Result<(), String>> {
+        let t = self.ctx().table.get_mut(&this)?;
+        let expected = expected_byte_len(&t.shape, t.dtype);
+        if data.len() != expected {
+            return Ok(Err(format!(
+                "tensor write is {} bytes but shape needs {expected}",
+                data.len()
+            )));
+        }
+        t.data = data;
+        Ok(Ok(()))
+    }
+
+    async fn read(&mut self, this: Resource<Tensor>) -> Result<Result<Vec<u8>, String>> {
+        Ok(Ok(self.ctx().table.get(&this)?.data.clone()))
+    }
+
+    async fn drop(&mut self, this: Resource<Tensor>) -> Result<()> {
+        self.ctx().table.delete(this)?;
+        Ok(())
+    }
+}
+
+impl pie::core::tensor::HostProgram for InstanceState {
+    async fn new(
+        &mut self,
+        inputs: Vec<pie::core::tensor::Input>,
+        ops: Vec<pie::core::tensor::Op>,
+        outputs: Vec<u32>,
+    ) -> Result<Resource<Program>> {
+        // Decode + validate at construction so a malformed program is rejected
+        // here (the constructor traps) rather than at attach/submit. Untrusted
+        // inferlet input — `decode_program` is fully fallible (never panics).
+        let program = crate::api::program_decode::decode_program(inputs, ops, outputs)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let bytecode = pie_sampling_ir::encode(&program);
+        // #9: intern by the canonical bytecode hash (== the driver `ProgramHandle`).
+        // Identical programs across requests/inferlets share one cached artifact —
+        // `output_kinds` is derived once (skipped on a cache hit) — and the cache
+        // is the #10 group / #8 hash-match fast-path registry. Host-side, no GPU.
+        let cached = crate::api::program_cache::intern(&program, bytecode)
+            .map_err(|e| anyhow::anyhow!("sampling program output kinds: {e:?}"))?;
+        Ok(self.ctx().table.push(Program { cached })?)
+    }
+
+    async fn drop(&mut self, this: Resource<Program>) -> Result<()> {
         self.ctx().table.delete(this)?;
         Ok(())
     }
@@ -1197,5 +1561,173 @@ impl pie::core::inference::HostMatcher for InstanceState {
     async fn drop(&mut self, this: Resource<Matcher>) -> Result<()> {
         self.ctx().table.delete(this)?;
         Ok(())
+    }
+}
+
+
+#[cfg(test)]
+mod sampling_program_tests {
+    use super::*;
+    use crate::api::pie::core::tensor as wit;
+    use crate::api::program_decode::decode_program;
+
+    /// WIT-shaped parts for a greedy-argmax program over a `[vocab]` logits
+    /// input: `Input(0)` then `ReduceArgmax` → one `i32` (Token) output.
+    fn argmax_parts(vocab: u32) -> (Vec<wit::Input>, Vec<wit::Op>, Vec<u32>) {
+        let inputs = vec![wit::Input {
+            shape: vec![vocab],
+            dtype: wit::Dtype::F32,
+        }];
+        let ops = vec![
+            wit::Op {
+                outputs: vec![wit::Value {
+                    id: 0,
+                    shape: vec![vocab],
+                    dtype: wit::Dtype::F32,
+                }],
+                kind: wit::OpKind::Input(0),
+            },
+            wit::Op {
+                outputs: vec![wit::Value {
+                    id: 1,
+                    shape: vec![],
+                    dtype: wit::Dtype::I32,
+                }],
+                kind: wit::OpKind::ReduceArgmax(0),
+            },
+        ];
+        (inputs, ops, vec![1])
+    }
+
+    #[test]
+    fn decode_argmax_program_infers_token_output() {
+        let (inputs, ops, outs) = argmax_parts(32);
+        let program = decode_program(inputs, ops, outs).expect("valid argmax program");
+        assert_eq!(program.inputs.len(), 1);
+        let kinds = pie_sampling_ir::output_kinds(&program).expect("kinds");
+        // i32 argmax output ⇒ Token (the dtype⇒kind convention (a)).
+        assert_eq!(kinds, vec![pie_sampling_ir::OutputKind::Token]);
+        // Bytecode round-trips through the L0 codec the carrier ships.
+        let bytecode = pie_sampling_ir::encode(&program);
+        let back = pie_sampling_ir::decode(&bytecode).expect("re-decode");
+        assert_eq!(back, program);
+    }
+
+    #[test]
+    fn decode_rejects_out_of_range_output() {
+        // Output id 9 is never defined → fail loud (not a silent miscompile).
+        let (inputs, ops, _) = argmax_parts(8);
+        assert!(decode_program(inputs, ops, vec![9]).is_err());
+    }
+
+    #[test]
+    fn decode_rejects_oversized_shape() {
+        // A rank-5 input shape exceeds MAX_RANK(4) → fallible decode, never panic.
+        let inputs = vec![wit::Input {
+            shape: vec![1, 1, 1, 1, 1],
+            dtype: wit::Dtype::F32,
+        }];
+        assert!(decode_program(inputs, Vec::new(), Vec::new()).is_err());
+    }
+
+    #[test]
+    fn tensor_helpers_pack_little_endian() {
+        let t = Tensor::i32_vec(vec![7]);
+        assert_eq!(t.shape, vec![1]);
+        assert!(matches!(t.dtype, wit::Dtype::I32));
+        assert_eq!(t.data, 7i32.to_le_bytes());
+
+        let f = Tensor::f32_vec(vec![2.5]);
+        assert!(matches!(f.dtype, wit::Dtype::F32));
+        assert_eq!(f.data, 2.5f32.to_le_bytes());
+    }
+
+    #[test]
+    fn build_tensors_token_fast_path() {
+        // ForwardOutput::Token + a single Token-output program ⇒ one i32 tensor.
+        let per = build_program_tensors(
+            ForwardOutput::Token(42),
+            &[vec![pie_sampling_ir::OutputKind::Token]],
+        );
+        assert_eq!(per.len(), 1);
+        assert_eq!(per[0].len(), 1);
+        assert_eq!(per[0][0].data, 42i32.to_le_bytes());
+    }
+
+    #[test]
+    fn build_tensors_mirostat_token_scalar_shape() {
+        // The 4090 mirostat shape: a `[Token, Scalar]` program. The token rides
+        // `resp.tokens`, the scalar surprise S the `entropies` channel; the walk
+        // pulls them in declared order ⇒ [i32 token, f32 scalar].
+        use pie_sampling_ir::OutputKind;
+        let resp = pie_driver_abi::ForwardResponse {
+            tokens: vec![137],
+            entropies: vec![2.7],
+            ..Default::default()
+        };
+        let per = build_program_tensors(
+            ForwardOutput::Response(resp),
+            &[vec![OutputKind::Token, OutputKind::Scalar]],
+        );
+        assert_eq!(per.len(), 1);
+        assert_eq!(per[0].len(), 2);
+        assert!(matches!(per[0][0].dtype, wit::Dtype::I32));
+        assert_eq!(per[0][0].data, 137i32.to_le_bytes());
+        assert!(matches!(per[0][1].dtype, wit::Dtype::F32));
+        assert_eq!(per[0][1].data, 2.7f32.to_le_bytes());
+    }
+
+    #[test]
+    fn program_bytecode_roundtrips_through_carrier() {
+        // The host accumulator → bridge carrier → readback path: a program's
+        // opaque bytecode + a submit-bound input survive untouched.
+        let (inputs, ops, outs) = argmax_parts(32);
+        let bytecode = pie_sampling_ir::encode(&decode_program(inputs, ops, outs).unwrap());
+        let submission = pie_driver_abi::SamplingProgramSubmission {
+            bytecode: bytecode.clone(),
+            inputs: vec![pie_driver_abi::SamplingInput {
+                key: 0,
+                bytes: vec![1, 2, 3, 4],
+            }],
+            bindings: vec![
+                pie_driver_abi::SamplingBinding::Logits,
+                pie_driver_abi::SamplingBinding::Tensor { key: 0 },
+            ],
+            late_keys: vec![],
+            late_inputs: vec![],
+        };
+        let mut req = pie_driver_abi::ForwardRequest::default();
+        req.push_sampling_program(&submission);
+        assert_eq!(req.n_sampling_programs(), 1);
+        let back = req.sampling_program_at(0).unwrap();
+        assert_eq!(back.bytecode, bytecode);
+        // The per-slot binding-map survives the carrier round-trip.
+        assert_eq!(
+            back.bindings,
+            vec![
+                pie_driver_abi::SamplingBinding::Logits,
+                pie_driver_abi::SamplingBinding::Tensor { key: 0 },
+            ]
+        );
+    }
+
+    #[test]
+    fn feed_forward_extracts_per_row_tokens() {
+        // WS8 next-input source: a pass's per-row sampled tokens (one per
+        // sequence/row) are what feed the next pass — the N-token vector the
+        // PipelineLink scatters by `positions`.
+        assert_eq!(forward_output_tokens(&ForwardOutput::Token(7)), vec![7]);
+        assert_eq!(
+            forward_output_tokens(&ForwardOutput::Tokens(vec![3, 1, 4])),
+            vec![3, 1, 4]
+        );
+        let resp = pie_driver_abi::ForwardResponse {
+            tokens: vec![9, 8],
+            ..Default::default()
+        };
+        assert_eq!(
+            forward_output_tokens(&ForwardOutput::Response(resp)),
+            vec![9, 8]
+        );
     }
 }

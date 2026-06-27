@@ -15,6 +15,7 @@ path = "src/lib.rs"
 [dependencies]
 pie-ipc = { path = "../driver/ipc" }
 pie-driver-abi = { path = "../interface/driver" }
+pie-sampling-ir = { path = "../interface/sampling-ir" }
 pie-client = { path = "../client/rust" }
 tokio = { version = "1.52", features = ["full"] }
 tokio-util = "0.7"
@@ -99,6 +100,7 @@ profile-all = ["profile-fire", "profile-driver-cuda"]       # everything
 
 [dev-dependencies]
 tempfile = "3"
+pie-sampling-ir = { path = "../interface/sampling-ir", features = ["eval"] }
 criterion = { version = "0.5", features = ["html_reports"] }
 tokenizers = "0.21"
 

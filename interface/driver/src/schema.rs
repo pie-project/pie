@@ -208,6 +208,119 @@ pub struct ForwardRequest {
     /// Per-request CSR: `audio_indptr[r..r+1]` is the half-open range of clips
     /// belonging to request `r` (one extra leading 0, like `image_indptr`).
     pub audio_indptr: Vec<u32>,
+
+    // ── Programmable sampling (Sampling IR carrier) ─────────────────
+    // A forward pass may carry a sampling *program* — flat versioned L0
+    // bytecode (`pie-sampling-ir`) that the driver JIT-compiles and runs in
+    // place of the legacy per-slot samplers for the rows it covers. The bridge
+    // is OPAQUE to the bytecode: it carries the bytes, the submit-bound input
+    // buffers, and the declared late-bound keys; the driver parses + caches by
+    // hash. All fields empty for the legacy sampler path. A pass uses EITHER
+    // sampler slots OR a program (enforced host-side). Outputs surface through
+    // the existing `ForwardResponse` slots in the program's declared output
+    // order — the bridge stays output-agnostic.
+    //
+    // Batched like the image/audio side-channels: a per-REQUEST count CSR plus
+    // nested per-PROGRAM CSRs. MVP carries 0 or 1 program per request; the
+    // shape generalizes to per-slot programs without a wire break.
+
+    /// Per-request CSR over the program list: `sampling_program_indptr[r..r+1]`
+    /// is the half-open range of programs belonging to request `r` (leading 0,
+    /// cumulative program count — like `image_indptr`). Empty = no programs.
+    pub sampling_program_indptr: Vec<u32>,
+    /// Concatenated L0 bytecode for every program in the batch; opaque to the
+    /// bridge. `sampling_program_bytes_indptr[p..p+1]` is program `p`'s range.
+    pub sampling_program_bytes: Vec<u8>,
+    /// Per-program byte CSR partitioning `sampling_program_bytes` (leading 0).
+    pub sampling_program_bytes_indptr: Vec<u32>,
+
+    // Submit-bound host inputs: values known at submit time, bound into the
+    // program's `host{key, submit-bound}` inputs. One opaque blob + a
+    // key/offset/len index table. Refreshed each fire; no recompile.
+    /// Concatenated submit-bound input buffer bytes for every program.
+    pub sampling_input_blob: Vec<u8>,
+    /// Index table: the program input key each entry binds to.
+    pub sampling_input_keys: Vec<u32>,
+    /// Index table: each entry's byte offset into `sampling_input_blob`.
+    pub sampling_input_offsets: Vec<u32>,
+    /// Index table: each entry's byte length within `sampling_input_blob`.
+    pub sampling_input_lens: Vec<u32>,
+    /// Per-program CSR into the input index table (the `keys`/`offsets`/`lens`
+    /// arrays): `sampling_input_indptr[p..p+1]` is program `p`'s entries
+    /// (leading 0).
+    pub sampling_input_indptr: Vec<u32>,
+
+    // Late-bound channel: keys the program declared `host{key, late-bound}` —
+    // supplied after submit, before the first consuming kernel (mirostat μ,
+    // grammar mask). `sampling_late_keys` lists the declared host-late keys per
+    // program; the parallel `sampling_late_{blob,offsets,lens}` value table
+    // (mirroring `sampling_input_*`, keyed by `sampling_late_keys`) carries the
+    // host-supplied value bytes for the correctness path (value known by submit
+    // time). A key with `len == 0` has no staged host value → the driver falls
+    // to the device-resident alias (output-ref) or skips (miss policy = skip,
+    // spec §7.4). Output-ref late inputs (`Binding::Output`) are resolved
+    // device-side and carry NO host value here.
+    /// Declared host-late input keys for every program, concatenated.
+    pub sampling_late_keys: Vec<u32>,
+    /// Per-program CSR into `sampling_late_keys`:
+    /// `sampling_late_indptr[p..p+1]` is program `p`'s keys (leading 0).
+    pub sampling_late_indptr: Vec<u32>,
+    /// Concatenated host-late value bytes, parallel to `sampling_late_keys`.
+    pub sampling_late_blob: Vec<u8>,
+    /// Per-late-key byte offset into `sampling_late_blob` (parallel to
+    /// `sampling_late_keys`).
+    pub sampling_late_offsets: Vec<u32>,
+    /// Per-late-key value byte length (parallel to `sampling_late_keys`);
+    /// `0` = no host value staged for this key (device alias or skip-on-miss).
+    pub sampling_late_lens: Vec<u32>,
+
+    // Per-input-slot binding-map (the WIT `input-binding`). For each program
+    // input slot — in `Op::Input(i)` order — how it is bound: the LM-head
+    // `Logits` intrinsic (positions resolved host-side into `sampling_indices`)
+    // or a submit `Tensor` keyed into the submit-input table. The binding-free
+    // bytecode no longer carries this, so the carrier does: it lets the driver
+    // wire each `Op::Input(i)` to the logits buffer or its keyed submit value.
+    /// Per-slot binding discriminant: `0` = Logits, `1` = Tensor (see
+    /// [`SamplingBinding`]). Concatenated across programs.
+    pub sampling_binding_kind: Vec<u8>,
+    /// Per-slot TensorKey for a `Tensor` slot (`0` for a `Logits` slot), parallel
+    /// to `sampling_binding_kind`.
+    pub sampling_binding_key: Vec<u32>,
+    /// Per-program CSR into `sampling_binding_{kind,key}`:
+    /// `sampling_binding_indptr[p..p+1]` is program `p`'s slots (leading 0).
+    pub sampling_binding_indptr: Vec<u32>,
+
+    // WS8 P2 device-resident next-input link (`forward-pass.next-input`). Sources
+    // some of this request's input tokens device-side from a *prior* forward's
+    // sampled tokens (`pi.sampled`, the producer), instead of host-injecting them
+    // (P1). Per-row + mergeable: under continuous batching one (batched) request
+    // carries N sequences, and a re-formed consumer batch can have rows whose
+    // producers sit in *different* prior batches — so the link is keyed per-row by
+    // a global producer link id, never per-request.
+    //
+    // RETENTION-UNTIL-DRAIN (load-bearing): a producer's `pi.sampled` MUST be
+    // retained until *all* its consumer links drain — the device/batched analog of
+    // P1's drain-before-producer-drop, per-row and across batch re-formation. The
+    // executor / page-manager owns this lifetime (retain on `pipeline_source_link`,
+    // free on drain); the driver's inject only *reads* the resolved retained
+    // pointer. Missing it = use-after-free on a re-formed batch.
+    /// Non-zero ⇒ retain this (batched) forward's `pi.sampled[N]` as a
+    /// device-resident next-input source under this **global** link id, until all
+    /// its consumer links drain (executor/page-manager owned). `0` = not a source.
+    pub pipeline_source_link: u32,
+    /// Per fed consumer input: the global producer link id whose retained
+    /// `pi.sampled` is the source (rows may name different producers ⇒ different
+    /// ids; the executor groups by id like `partition_by_program` keyed on
+    /// producer). Parallel to `next_input_src_rows`/`next_input_dest_slots`.
+    pub next_input_producer_links: Vec<u32>,
+    /// Per fed consumer input: the source row within that producer's `pi.sampled`
+    /// — the producer sequence's `sampling_row` identity (echo's `h_sample_idx`).
+    pub next_input_src_rows: Vec<u32>,
+    /// Per fed consumer input: the destination slot in THIS request's input token
+    /// buffer (`token_ids`) that the producer's sampled token fills device-side
+    /// (`u32::MAX` = skip the lane, the `-1` sentinel). Rebased on batch merge by
+    /// the token offset (the only non-global field).
+    pub next_input_dest_slots: Vec<u32>,
 }
 
 /// Per-slot sampler kind discriminants. Carried on the wire as the `u8`
@@ -273,6 +386,85 @@ pub enum Sampler {
         token_ids: Vec<u32>,
     },
     Entropy,
+}
+
+/// One submit-bound host input buffer for a sampling program: the program input
+/// `key` it binds to and its raw little-endian bytes (dtype/shape fixed by the
+/// program's input declaration). The AoS view of one entry in the
+/// `ForwardRequest::sampling_input_*` index table; not itself a wire type.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SamplingInput {
+    pub key: u32,
+    pub bytes: Vec<u8>,
+}
+
+/// How one program input slot is bound (the WIT `input-binding`): the AoS view
+/// of one entry in `ForwardRequest::sampling_binding_*`. Not a wire type — the
+/// runtime flattens it into the SoA via [`ForwardRequest::push_sampling_program`]
+/// and the driver reads `sampling_binding_{kind,key}` to wire each `Op::Input(i)`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SamplingBinding {
+    /// The LM-head logits intrinsic (sampling positions resolved host-side into
+    /// `sampling_indices`).
+    Logits,
+    /// A submit-bound tensor value keyed into the submit-input table.
+    Tensor { key: u32 },
+}
+
+impl SamplingBinding {
+    /// Wire discriminant for a `Logits` slot.
+    pub const KIND_LOGITS: u8 = 0;
+    /// Wire discriminant for a `Tensor` slot.
+    pub const KIND_TENSOR: u8 = 1;
+
+    /// The `sampling_binding_kind` discriminant for this binding.
+    pub fn kind(self) -> u8 {
+        match self {
+            SamplingBinding::Logits => Self::KIND_LOGITS,
+            SamplingBinding::Tensor { .. } => Self::KIND_TENSOR,
+        }
+    }
+
+    /// The `sampling_binding_key` value (the TensorKey, or `0` for `Logits`).
+    pub fn key(self) -> u32 {
+        match self {
+            SamplingBinding::Logits => 0,
+            SamplingBinding::Tensor { key } => key,
+        }
+    }
+
+    /// Reconstruct from the wire `(kind, key)` pair (unknown kind ⇒ `Logits`).
+    pub fn from_parts(kind: u8, key: u32) -> SamplingBinding {
+        match kind {
+            Self::KIND_TENSOR => SamplingBinding::Tensor { key },
+            _ => SamplingBinding::Logits,
+        }
+    }
+}
+
+/// A sampling program submitted on a [`ForwardRequest`]: the opaque L0 bytecode,
+/// its submit-bound input buffers, the keys it declared host-late, and the
+/// host-late values supplied for the correctness path. This is the host-side AoS
+/// view of the per-program SoA carrier
+/// (`sampling_program_*`/`sampling_input_*`/`sampling_late_*`); like [`Sampler`]
+/// it is **not** a wire type — the runtime flattens it into a `ForwardRequest`
+/// via [`ForwardRequest::push_sampling_program`] and the driver reads the SoA
+/// arrays. Distinct from `pie_sampling_ir::SamplingProgram` (the typed IR this
+/// bytecode lowers from).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct SamplingProgramSubmission {
+    pub bytecode: Vec<u8>,
+    pub inputs: Vec<SamplingInput>,
+    /// Per-input-slot binding-map (the WIT `input-binding`), in `Op::Input(i)`
+    /// order — one entry per program input slot. Empty for a legacy/no-binding
+    /// submission; the driver then falls back to the keyed submit table.
+    pub bindings: Vec<SamplingBinding>,
+    /// Declared host-late keys (`host{late-bound}`), in declaration order.
+    pub late_keys: Vec<u32>,
+    /// Host-late values supplied for the correctness path (a subset of
+    /// `late_keys`, by key). A late key absent here has no staged host value
+    /// (device-resident output-ref alias, or skip-on-miss).
+    pub late_inputs: Vec<SamplingInput>,
 }
 
 impl ForwardRequest {
@@ -416,6 +608,237 @@ impl ForwardRequest {
         // req's CSR starts at 0; skip its leading 0, offset the rest.
         for &off in req.sampler_token_ids_indptr.iter().skip(1) {
             self.sampler_token_ids_indptr.push(tok_base + off);
+        }
+    }
+
+    // ── Sampling-program carrier helpers ─────────────────────────────
+    // Mirror the sampler SoA helpers (`push_sampler`/`n_samplers`/`sampler_at`/
+    // `extend_samplers_from`) for the programmable-sampling carrier.
+
+    /// Append one [`SamplingProgramSubmission`] onto the per-program SoA carrier,
+    /// extending the bytecode, the submit-bound input blob + index table, and
+    /// the late-bound key channel (each with its leading-0 nested CSR). The
+    /// caller pushes the per-request boundary onto `sampling_program_indptr`
+    /// once the request's program(s) are in — exactly as `push_sampler` leaves
+    /// `sampler_indptr` to the caller.
+    pub fn push_sampling_program(&mut self, program: &SamplingProgramSubmission) {
+        // Ensure the nested per-program CSRs carry their leading 0.
+        if self.sampling_program_bytes_indptr.is_empty() {
+            self.sampling_program_bytes_indptr.push(0);
+        }
+        if self.sampling_input_indptr.is_empty() {
+            self.sampling_input_indptr.push(0);
+        }
+        if self.sampling_late_indptr.is_empty() {
+            self.sampling_late_indptr.push(0);
+        }
+        if self.sampling_binding_indptr.is_empty() {
+            self.sampling_binding_indptr.push(0);
+        }
+
+        // Bytecode (opaque) + its byte-range boundary.
+        self.sampling_program_bytes
+            .extend_from_slice(&program.bytecode);
+        self.sampling_program_bytes_indptr
+            .push(self.sampling_program_bytes.len() as u32);
+
+        // Submit-bound inputs: append each buffer to the blob and record its
+        // (key, offset, len) in the index table.
+        for input in &program.inputs {
+            let offset = self.sampling_input_blob.len() as u32;
+            self.sampling_input_blob.extend_from_slice(&input.bytes);
+            self.sampling_input_keys.push(input.key);
+            self.sampling_input_offsets.push(offset);
+            self.sampling_input_lens.push(input.bytes.len() as u32);
+        }
+        self.sampling_input_indptr
+            .push(self.sampling_input_keys.len() as u32);
+
+        // Late-bound channel: the declared host-late keys plus a parallel value
+        // table — for each declared key, stage its supplied host value (if any;
+        // matched by key) or record `len == 0` (no host value → device alias /
+        // skip-on-miss).
+        for &key in &program.late_keys {
+            self.sampling_late_keys.push(key);
+            let offset = self.sampling_late_blob.len() as u32;
+            self.sampling_late_offsets.push(offset);
+            match program.late_inputs.iter().find(|i| i.key == key) {
+                Some(input) => {
+                    self.sampling_late_blob.extend_from_slice(&input.bytes);
+                    self.sampling_late_lens.push(input.bytes.len() as u32);
+                }
+                None => self.sampling_late_lens.push(0),
+            }
+        }
+        self.sampling_late_indptr
+            .push(self.sampling_late_keys.len() as u32);
+
+        // Per-slot binding-map: append each slot's (kind, key) and close the
+        // per-program boundary.
+        for binding in &program.bindings {
+            self.sampling_binding_kind.push(binding.kind());
+            self.sampling_binding_key.push(binding.key());
+        }
+        self.sampling_binding_indptr
+            .push(self.sampling_binding_kind.len() as u32);
+    }
+
+    /// Number of sampling programs carried (`= sampling_program_bytes_indptr`
+    /// boundaries minus the leading 0). Zero for the legacy sampler path.
+    #[inline]
+    pub fn n_sampling_programs(&self) -> usize {
+        self.sampling_program_bytes_indptr.len().saturating_sub(1)
+    }
+
+    /// Mark this (batched) forward as a device-resident next-input source: its
+    /// `pi.sampled[N]` is retained under the **global** link id `link` until all
+    /// its consumer links drain (executor/page-manager owned). `0` clears it.
+    #[inline]
+    pub fn set_pipeline_source_link(&mut self, link: u32) {
+        self.pipeline_source_link = link;
+    }
+
+    /// Record one per-row device-resident next-input link (WS8 P2): the producer's
+    /// sampled token at `pi.sampled[src_row]` — in the forward retained under
+    /// producer link `producer_link` — fills this request's input token slot
+    /// `dest_slot` device-side. `dest_slot == u32::MAX` skips the lane. The host
+    /// emits these instead of the P1 host inject when device pipelining is active.
+    #[inline]
+    pub fn push_next_input_link(&mut self, producer_link: u32, src_row: u32, dest_slot: u32) {
+        self.next_input_producer_links.push(producer_link);
+        self.next_input_src_rows.push(src_row);
+        self.next_input_dest_slots.push(dest_slot);
+    }
+
+    /// Number of per-row device-resident next-input links on this request.
+    #[inline]
+    pub fn n_next_input_links(&self) -> usize {
+        self.next_input_producer_links.len()
+    }
+
+    /// Reconstruct the [`SamplingProgramSubmission`] at program index `p` from
+    /// the SoA carrier — the inverse of [`push_sampling_program`]. Returns
+    /// `None` if `p` is out of range.
+    pub fn sampling_program_at(&self, p: usize) -> Option<SamplingProgramSubmission> {
+        let byte_lo = *self.sampling_program_bytes_indptr.get(p)? as usize;
+        let byte_hi = *self.sampling_program_bytes_indptr.get(p + 1)? as usize;
+        let bytecode = self.sampling_program_bytes.get(byte_lo..byte_hi)?.to_vec();
+
+        let entry_lo = self.sampling_input_indptr[p] as usize;
+        let entry_hi = self.sampling_input_indptr[p + 1] as usize;
+        let inputs = (entry_lo..entry_hi)
+            .map(|e| {
+                let off = self.sampling_input_offsets[e] as usize;
+                let len = self.sampling_input_lens[e] as usize;
+                SamplingInput {
+                    key: self.sampling_input_keys[e],
+                    bytes: self.sampling_input_blob[off..off + len].to_vec(),
+                }
+            })
+            .collect();
+
+        let late_lo = self.sampling_late_indptr[p] as usize;
+        let late_hi = self.sampling_late_indptr[p + 1] as usize;
+        let late_keys = self.sampling_late_keys[late_lo..late_hi].to_vec();
+        // Reconstruct the host-late values (those with a non-zero length).
+        let late_inputs = (late_lo..late_hi)
+            .filter_map(|e| {
+                let len = self.sampling_late_lens[e] as usize;
+                if len == 0 {
+                    return None;
+                }
+                let off = self.sampling_late_offsets[e] as usize;
+                Some(SamplingInput {
+                    key: self.sampling_late_keys[e],
+                    bytes: self.sampling_late_blob[off..off + len].to_vec(),
+                })
+            })
+            .collect();
+
+        // Reconstruct the per-slot binding-map (empty if this program carried
+        // none — e.g. a legacy submission predating the binding-map field).
+        let bindings = match (
+            self.sampling_binding_indptr.get(p),
+            self.sampling_binding_indptr.get(p + 1),
+        ) {
+            (Some(&blo), Some(&bhi)) => (blo as usize..bhi as usize)
+                .map(|s| {
+                    SamplingBinding::from_parts(
+                        self.sampling_binding_kind[s],
+                        self.sampling_binding_key[s],
+                    )
+                })
+                .collect(),
+            _ => Vec::new(),
+        };
+
+        Some(SamplingProgramSubmission {
+            bytecode,
+            inputs,
+            bindings,
+            late_keys,
+            late_inputs,
+        })
+    }
+
+    /// Append another request's sampling-program SoA slots onto this (batch)
+    /// request, offsetting every nested CSR (byte ranges, input index table,
+    /// late keys). Mirrors [`extend_samplers_from`]; the caller pushes the
+    /// per-request boundary onto `sampling_program_indptr` afterward.
+    pub fn extend_sampling_programs_from(&mut self, req: &ForwardRequest) {
+        // Bytecode: concat, offset the per-program byte CSR.
+        let byte_base = self.sampling_program_bytes.len() as u32;
+        self.sampling_program_bytes
+            .extend_from_slice(&req.sampling_program_bytes);
+        for &off in req.sampling_program_bytes_indptr.iter().skip(1) {
+            self.sampling_program_bytes_indptr.push(byte_base + off);
+        }
+
+        // Submit-bound inputs: concat blob + index table, rebasing the byte
+        // offsets by the blob base and the per-program CSR by the table base.
+        let blob_base = self.sampling_input_blob.len() as u32;
+        let entry_base = self.sampling_input_keys.len() as u32;
+        self.sampling_input_blob
+            .extend_from_slice(&req.sampling_input_blob);
+        self.sampling_input_keys
+            .extend_from_slice(&req.sampling_input_keys);
+        for &off in &req.sampling_input_offsets {
+            self.sampling_input_offsets.push(blob_base + off);
+        }
+        self.sampling_input_lens
+            .extend_from_slice(&req.sampling_input_lens);
+        for &off in req.sampling_input_indptr.iter().skip(1) {
+            self.sampling_input_indptr.push(entry_base + off);
+        }
+
+        // Late-bound channel: concat the keys + the parallel value table,
+        // rebasing the value byte-offsets by the blob base and the per-program
+        // CSR by the key base. `lens` (incl. the 0 = "no host value" sentinel)
+        // copy verbatim.
+        let late_base = self.sampling_late_keys.len() as u32;
+        let late_blob_base = self.sampling_late_blob.len() as u32;
+        self.sampling_late_keys
+            .extend_from_slice(&req.sampling_late_keys);
+        self.sampling_late_blob
+            .extend_from_slice(&req.sampling_late_blob);
+        for &off in &req.sampling_late_offsets {
+            self.sampling_late_offsets.push(late_blob_base + off);
+        }
+        self.sampling_late_lens
+            .extend_from_slice(&req.sampling_late_lens);
+        for &off in req.sampling_late_indptr.iter().skip(1) {
+            self.sampling_late_indptr.push(late_base + off);
+        }
+
+        // Per-slot binding-map: concat the (kind, key) slots and rebase the
+        // per-program CSR by the slot base.
+        let binding_base = self.sampling_binding_kind.len() as u32;
+        self.sampling_binding_kind
+            .extend_from_slice(&req.sampling_binding_kind);
+        self.sampling_binding_key
+            .extend_from_slice(&req.sampling_binding_key);
+        for &off in req.sampling_binding_indptr.iter().skip(1) {
+            self.sampling_binding_indptr.push(binding_base + off);
         }
     }
 }
