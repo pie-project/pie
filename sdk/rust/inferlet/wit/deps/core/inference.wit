@@ -110,16 +110,23 @@ interface inference {
 
         /// Run-ahead carrier (§2.1). Declares that the NEXT forward pass on
         /// this context carries THIS pass's sampled token(s) into the given
-        /// `positions` — DESTINATIONS in the next pass's coordinate space (the
-        /// decode slots the carrier overwrites pre-forward). The guest names
-        /// only destinations; everything else is host-owned:
+        /// `positions` — ROW SLOTS in the next pass's dense `pi.tokens` row
+        /// array (the decode rows the carrier overwrites pre-forward), NOT
+        /// sequence positions and NOT KV-slot indices. For single-sequence
+        /// decode this is `[0]` (row 0); for a batch of B sequences, `[0..B)`.
+        /// The guest names only these destination rows; everything else is
+        /// host-owned:
         /// - the SOURCE row in this pass is HOST-computed (prefill → last row
         ///   `n-1`, single-row decode → row 0, batched → per-sequence sampled
         ///   rows), never threaded by the guest;
         /// - the CONSUMER is IMPLICIT — the next pass submitted on this context,
-        ///   which supplies a placeholder `input-tokens([0], [pos])`; the carrier
-        ///   overwrites `pi.tokens[pos]` before that forward from this pass's
-        ///   retained sample;
+        ///   which supplies a placeholder `input-tokens([0], [pos])` at each
+        ///   destination row; the carrier overwrites `pi.tokens[row]` before
+        ///   that forward from this pass's retained sample;
+        /// - the carry is SCOPED to the PRODUCING context — a pass submitted on
+        ///   a different context drops a still-pending carry (a terminal
+        ///   producer with no consumer must not leak its retained token into
+        ///   another context's prefill);
         /// - the dependency (the consumer firing a strictly-later batch) is a
         ///   host accumulate keyed on the carrier link — no guest ordering signal.
         next-inputs: func(positions: list<u32>);

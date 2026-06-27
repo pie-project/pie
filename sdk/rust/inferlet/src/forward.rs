@@ -314,14 +314,18 @@ impl<'ctx> Forward<'ctx> {
 
     // ── Run-ahead carrier: §2.1 ────────────────────────────────────────
 
-    /// Declare the destination slots in the **NEXT** forward pass on this
-    /// context that carry **this** pass's sampled token(s) — `positions` are
-    /// destinations in the next pass's coordinate space (the decode slots the
-    /// carrier overwrites pre-forward). The guest names only destinations:
-    /// the source row in this pass is host-computed (prefill → last row,
-    /// single-row decode → row 0), and the consumer is implicit — the next pass
-    /// supplies a placeholder `input(0)` at each position that the carrier
-    /// overwrites from this pass's retained sample. Emitted after the sampler
+    /// Declare the destination **row slots** in the **NEXT** forward pass on
+    /// this context that carry **this** pass's sampled token(s). `positions` are
+    /// row indices into the next pass's dense `pi.tokens` row array (the decode
+    /// rows the carrier overwrites pre-forward) — **NOT** sequence positions and
+    /// **NOT** KV-slot indices. For single-sequence decode this is `[0]` (row
+    /// 0); for a batch of B sequences, `[0..B)`. The guest names only these
+    /// destination rows: the source row in this pass is host-computed (prefill →
+    /// last row, single-row decode → row 0), and the consumer is implicit — the
+    /// next pass supplies a placeholder `input(0)` at each destination row that
+    /// the carrier overwrites from this pass's retained sample. The carry is
+    /// scoped to this producing context (a pass on a different context drops a
+    /// still-pending carry). Emitted after the sampler
     /// (WIT `forward-pass.next-inputs`).
     pub fn next_inputs(&mut self, positions: Vec<u32>) -> &mut Self {
         self.next_inputs = positions;
