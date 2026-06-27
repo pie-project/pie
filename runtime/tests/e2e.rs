@@ -105,9 +105,10 @@ fn context_inferlet_exercises_host_apis() {
     );
 }
 
-// Exercises the full flush + generate pipeline: the `generate` inferlet runs
-// fill → flush → generate(5 steps) against the mock backend and must run to
-// completion (single-model FCFS host; no forward-pass stall).
+// The forward-pass / generate pipeline runs e2e on the mock driver: append →
+// flush → generate (step loop) over the SDK facade → kv-working-set → forward
+// descriptors → mock `EchoBehavior`. (Previously ignored under spec-exec when the
+// mock response didn't match the old Generator; the Phase-6 facade fixed it.)
 #[test]
 fn generate_inferlet_exercises_forward_pass() {
     let s = state();

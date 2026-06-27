@@ -1696,6 +1696,13 @@ struct ForwardDispatchInputs {
     const std::uint32_t* h_kvlpl_forward = nullptr;
     const std::int32_t*  slot_ids_h_data = nullptr;
     const std::uint8_t*  is_fresh_h_data = nullptr;
+    // Ph7 RS rs-output (W10): when rs_buffer_write, the linear layers scatter
+    // their in-proj [mixed_qkv|a|b] page-major into the buffered-activation pool
+    // at these per-request CSR slabs (write_state forced false). FOLD passes use
+    // the separate fold-replay dispatch instead (not this path).
+    const std::uint32_t* rs_buffer_slot_ids_h = nullptr;
+    const std::uint32_t* rs_buffer_slot_indptr_h = nullptr;
+    bool                 rs_buffer_write = false;
     // Multimodal (gemma4 vision): image side-channel, set from the view.
     const float*         image_pixels_h = nullptr;
     const std::uint32_t* image_pixel_byte_indptr_h = nullptr;
@@ -2085,6 +2092,9 @@ ForwardDispatchResult run_forward_dispatch(
         fwd_in.slot_ids_h          = in.use_slots ? in.slot_ids_h_data : nullptr;
         fwd_in.is_fresh_h          = in.use_slots ? in.is_fresh_h_data : nullptr;
         fwd_in.slot_ids_d          = in.use_slots ? pi.slot_ids.data() : nullptr;
+        fwd_in.rs_buffer_slot_ids_h    = in.rs_buffer_slot_ids_h;
+        fwd_in.rs_buffer_slot_indptr_h = in.rs_buffer_slot_indptr_h;
+        fwd_in.rs_buffer_write         = in.rs_buffer_write;
         fwd_in.logit_row_indices_d = in.compact_logit_rows ? pi.sample_idx.data() : nullptr;
         fwd_in.num_logit_rows      = in.compact_logit_rows ? in.num_sampling : 0;
         fwd_in.emit_logits         = in.num_sampling > 0;
@@ -2355,6 +2365,20 @@ void handle_fire_batch(
                 rs_flag_view.begin(), rs_flag_view.end(),
                 [](std::uint8_t v) { return (v & 1u) != 0; });
 
+        // Ph7 RS working-set buffered-activation channel. Single-role per pass
+        // (v1): a FOLD pass (FOLD-bit=2 set) gathers+replays from the buffered
+        // pool into recurrent_state (separate fold-replay dispatch below); an
+        // rs-output write pass (FOLD-bit clear + buffered slabs present)
+        // scatters in-proj [mixed_qkv|a|b] to the pool during the main forward.
+        const auto rs_fold_view = view.rs_fold_lens.as<std::uint32_t>();
+        const auto rs_buf_id_view = view.rs_buffer_slot_ids.as<std::uint32_t>();
+        const auto rs_buf_indptr_view = view.rs_buffer_slot_indptr.as<std::uint32_t>();
+        const bool rs_is_fold = use_slots && std::any_of(
+            rs_flag_view.begin(), rs_flag_view.end(),
+            [](std::uint8_t v) { return (v & 2u) != 0; });
+        const bool rs_is_write =
+            use_slots && !rs_is_fold && rs_buf_id_view.size() > 0;
+
         const GraphShapeDecision graph_shape = decide_graph_shape(
             executor, R, N, page_size,
             is_pure_decode, has_spec_drafts, has_fresh_slot,
@@ -2442,6 +2466,17 @@ void handle_fire_batch(
             pi.is_fresh.copy_from_host(std::span<const std::uint8_t>(is_fresh_h));
         }
 
+        // RS_FLAG_FOLD (bit 1) + per-request rs_fold_lens (working-set fold(n)).
+        // v1: the runtime's `inference.fold` advances the folded-state boundary
+        // host-side and the mock driver no-ops the fold compute, so there is no
+        // real CUDA fold to run here yet — and the existing `commit_len` GDN
+        // primitive folds tokens *in-forward* (the spec commit-advance path),
+        // not from the working set's separately-buffered RS slabs.
+        // Ph7 (RS-real-driver): the real buffered-then-fold needs a new
+        // fold-from-buffer kernel that reads the `rs_buffer_slot_ids` SoA
+        // (append-only ForwardRequest field, parked with this kernel) for each
+        // request flagged RS_FLAG_FOLD and folds rs_fold_lens[r] buffered tokens
+        // into the folded slot `rs_slot_ids[r]`. Lower it here.
         // Frozen-verify speculative path. The verify forward walks the GDN
         // recurrent state in registers to produce correct draft outputs but
         // persists NOTHING (every linear layer sees write_state=false), so each
@@ -2651,6 +2686,9 @@ void handle_fire_batch(
                 .h_kvlpl_forward = h_kvlpl_forward,
                 .slot_ids_h_data = slot_ids_h.data(),
                 .is_fresh_h_data = is_fresh_h.data(),
+                .rs_buffer_slot_ids_h = rs_is_write ? rs_buf_id_view.data() : nullptr,
+                .rs_buffer_slot_indptr_h = rs_is_write ? rs_buf_indptr_view.data() : nullptr,
+                .rs_buffer_write = rs_is_write,
                 .image_pixels_h = img_pixels_h,
                 .image_pixel_byte_indptr_h = img_pix_byte_indptr.data(),
                 .image_patch_positions_h = img_patch_pos.data(),
@@ -3173,6 +3211,66 @@ void handle_fire_batch(
                         reinterpret_cast<const std::int32_t*>(pi.tokens.data());
                     forward_fn.invoke_body(ws, kv_cache, attn_ws, cublas,
                                            fwd_in);
+                }
+            }
+            // Ph7 RS working-set fold-buffered (W9 piggyback): for each request
+            // flagged RS_FLAG_FOLD, replay the GDN recurrence over its first
+            // rs_fold_lens[r] BUFFERED tokens — gathered page-major from the
+            // buffered-activation pool (rs_buffer_slot_ids) rather than the
+            // verify stash — and write the advanced state into
+            // recurrent_state[rs_slot_ids[r]]. Reuses the commit-advance replay
+            // (commit_len-clamped conv+prep+fla; no in_proj/attention/MLP/lm_head),
+            // just sourced from the pool. RS_FLAG_RESET zeroes the slot first
+            // (a first fold replays from zero).
+            if (rs_is_fold) {
+                executor.rs_cache->set_verify_frozen(false);
+                std::vector<std::int32_t> fold_commit_len(
+                    static_cast<std::size_t>(R));
+                std::vector<std::int32_t> fold_slots(static_cast<std::size_t>(R));
+                std::vector<std::uint32_t> fold_qo(
+                    static_cast<std::size_t>(R) + 1);
+                fold_qo[0] = 0;
+                for (int r = 0; r < R; ++r) {
+                    const std::uint32_t n =
+                        (r < static_cast<int>(rs_fold_view.size()))
+                            ? rs_fold_view[r] : 0u;
+                    fold_commit_len[static_cast<std::size_t>(r)] =
+                        static_cast<std::int32_t>(n);
+                    fold_slots[static_cast<std::size_t>(r)] =
+                        static_cast<std::int32_t>(rs_slot_view[r]);
+                    fold_qo[static_cast<std::size_t>(r) + 1] = fold_qo[r] + n;
+                    if ((rs_flag_view[r] & 1u) != 0) {  // RS_FLAG_RESET
+                        executor.rs_cache->reset_slot(
+                            static_cast<int>(rs_slot_view[r]), cublas.stream());
+                    }
+                }
+                const int fold_N =
+                    static_cast<int>(fold_qo[static_cast<std::size_t>(R)]);
+                if (fold_N > 0) {
+                    pi.tokens.copy_from_host(std::span<const std::uint32_t>(
+                        reinterpret_cast<const std::uint32_t*>(
+                            fold_commit_len.data()),
+                        fold_commit_len.size()));
+                    pi.qo_indptr.copy_from_host(std::span<const std::uint32_t>(
+                        fold_qo.data(), fold_qo.size()));
+                    pi.slot_ids.copy_from_host(
+                        std::span<const std::int32_t>(fold_slots));
+
+                    pie_cuda_driver::ForwardFn::ForwardInputs fwd_in;
+                    fwd_in.qo_indptr_d   = pi.qo_indptr.data();
+                    fwd_in.qo_indptr_h   = fold_qo.data();
+                    fwd_in.total_tokens  = fold_N;
+                    fwd_in.num_requests  = R;
+                    fwd_in.is_pure_decode = false;
+                    fwd_in.slot_ids_h    = fold_slots.data();
+                    fwd_in.slot_ids_d    = pi.slot_ids.data();
+                    fwd_in.num_logit_rows = -1;
+                    fwd_in.commit_advance_gather_d =
+                        reinterpret_cast<const std::int32_t*>(pi.tokens.data());
+                    fwd_in.rs_buffer_fold = true;
+                    fwd_in.rs_buffer_slot_ids_h = rs_buf_id_view.data();
+                    fwd_in.rs_buffer_slot_indptr_h = rs_buf_indptr_view.data();
+                    forward_fn.invoke_body(ws, kv_cache, attn_ws, cublas, fwd_in);
                 }
             }
             executor.response_builder.build(per_req, out_resp);

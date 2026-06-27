@@ -16,8 +16,7 @@
 use smallvec::{SmallVec, smallvec};
 
 use crate::adapter::AdapterId;
-use crate::context::ContextId;
-use crate::context::pagestore::PhysicalPageId;
+use crate::arena::PhysicalPageId;
 use crate::driver::DriverId;
 use pie_driver_abi::Brle;
 
@@ -30,7 +29,7 @@ use pie_driver_abi::Brle;
 /// `ForwardRequest` on its own should anyone want to send it that way.
 #[allow(clippy::too_many_arguments)]
 pub fn new_per_request(
-    context_id: ContextId,
+    context_id: u64,
     tokens: Vec<u32>,
     positions: Vec<u32>,
     masks: Vec<Brle>,
@@ -62,6 +61,7 @@ pub fn new_per_request(
         qo_indptr: vec![0, n_tokens],
         rs_slot_ids: Vec::new(),
         rs_slot_flags: Vec::new(),
+        rs_fold_lens: Vec::new(),
         masks,
         mask_indptr: vec![0, n_masks],
         logit_masks,
@@ -270,6 +270,9 @@ pub fn new_batched_forward_request_with_capacity(n_requests: usize) -> pie_drive
         qo_indptr: indptr(indptr_cap),
         rs_slot_ids: Vec::with_capacity(req_cap),
         rs_slot_flags: Vec::with_capacity(req_cap),
+        rs_fold_lens: Vec::with_capacity(req_cap),
+        rs_buffer_slot_ids: Vec::new(),
+        rs_buffer_slot_indptr: indptr(indptr_cap),
         masks: Vec::new(),
         mask_indptr: indptr(indptr_cap),
         logit_masks: Vec::new(),
@@ -311,6 +314,12 @@ pub fn new_batched_forward_request_with_capacity(n_requests: usize) -> pie_drive
         audio_feature_indptr: indptr(indptr_cap),
         audio_anchor_rows: Vec::new(),
         audio_indptr: indptr(indptr_cap),
+        // Sampling-IR (`sampling_*`) + producer-consumer (`next_input_*`,
+        // `pipeline_source_link`) fields default to empty: the working-set
+        // forward path lowers samplers via the SoA fields above, leaving the
+        // dev Sampling-IR side channel unused (append-only schema). The merge
+        // (`append_request`) does not touch them, so empty is the wire value.
+        ..Default::default()
     }
 }
 

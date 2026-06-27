@@ -27,6 +27,35 @@ impl pie::core::model::Host for InstanceState {
         Ok(m.system_speculation_supported() && m.enable_system_speculation())
     }
 
+    // ── Working-set / arena capabilities (global over the bound model) ──────
+    //
+    // Real values come from the driver handshake `DriverCapabilities`
+    // (`rs_cache_slot_bytes` etc.), carried on the global `model::Model` via
+    // `RsCaps` (populated at registration alongside the arena `ArenaConfig`).
+
+    /// Bytes of one folded recurrent-state object (0 if the model has no RS).
+    async fn rs_state_size(&mut self) -> Result<u64> {
+        Ok(model::model().rs_caps().state_size)
+    }
+
+    /// Tokens per buffered RS page (0 if the model has no RS).
+    async fn rs_buffer_page_size(&mut self) -> Result<u32> {
+        Ok(model::model().rs_caps().buffer_page_size)
+    }
+
+    /// Fold granularity in tokens. 1 = unconstrained (token-causal: Qwen3.5 GDN,
+    /// Nemotron-H Mamba2). `forward-pass.fold-buffered(n)` requires `n` to be a
+    /// positive multiple of this.
+    async fn rs_fold_granularity(&mut self) -> Result<u32> {
+        Ok(model::model().rs_caps().fold_granularity)
+    }
+
+    /// Arena accounting block size. v1: one KV page == one arena block, so this
+    /// is the bound model's KV page size (tokens).
+    async fn arena_block_size(&mut self) -> Result<u64> {
+        Ok(crate::page_size::tokens_per_page(0) as u64)
+    }
+
     async fn encode(&mut self, text: String) -> Result<Vec<u32>> {
         Ok(model::model().tokenize(&text))
     }

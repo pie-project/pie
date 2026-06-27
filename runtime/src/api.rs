@@ -1,12 +1,13 @@
 pub mod adapter;
 pub mod audio_out;
-pub mod context;
 pub mod http;
 pub mod inference;
 pub mod media;
 pub mod messaging;
 pub mod model;
+pub mod kv_working_set;
 pub mod runtime;
+pub mod rs_working_set;
 pub mod session;
 pub mod types;
 
@@ -32,12 +33,14 @@ wasmtime::component::bindgen!({
         "wasi:random/random": wasmtime_wasi::p2::bindings::random::random,
         "wasi:random/insecure": wasmtime_wasi::p2::bindings::random::insecure,
         "wasi:random/insecure-seed": wasmtime_wasi::p2::bindings::random::insecure_seed,
-        // pie:core/context
-        "pie:core/context.context": context::Context,
+        // pie:core/working-set (kv); rs-working-set below
+        "pie:core/working-set.kv-working-set": crate::working_set::kv::KvWorkingSet,
         // pie:core/inference
         "pie:core/inference.forward-pass": inference::ForwardPass,
         "pie:core/inference.grammar": inference::Grammar,
         "pie:core/inference.matcher": inference::Matcher,
+        // pie:core/working-set (rs)
+        "pie:core/working-set.rs-working-set": crate::working_set::rs::RsWorkingSet,
         // pie:core/adapter
         "pie:core/adapter.adapter": adapter::Adapter,
         // pie:core/media
@@ -69,7 +72,7 @@ pub fn add_to_linker(
     // `HasSelf<InstanceState>`, so the linker `D` type must be concrete.
     type D = HasSelf<InstanceState>;
     pie::core::types::add_to_linker::<InstanceState, D>(linker, |s| s)?;
-    pie::core::context::add_to_linker::<InstanceState, D>(linker, |s| s)?;
+    pie::core::working_set::add_to_linker::<InstanceState, D>(linker, |s| s)?;
     pie::core::http::add_to_linker::<InstanceState, D>(linker, |s| s)?;
     pie::core::model::add_to_linker::<InstanceState, D>(linker, |s| s)?;
     pie::core::inference::add_to_linker::<InstanceState, D>(linker, |s| s)?;

@@ -24,7 +24,9 @@ from abc import abstractmethod
 import weakref
 
 from componentize_py_types import Result, Ok, Err, Some
-
+import componentize_py_async_support
+from componentize_py_async_support.streams import StreamReader, StreamWriter, ByteStreamReader, ByteStreamWriter
+from componentize_py_async_support.futures import FutureReader, FutureWriter
 
 class Image:
     """
@@ -42,7 +44,7 @@ class Image:
         processor requires (Gemma SigLIP2 vs Qwen smart-resize, etc.). Errors
         if the model has no vision front-end or the bytes don't decode.
         
-        Raises: `wit_world.types.Err(wit_world.imports.str)`
+        Raises: `componentize_py_types.Err(wit_world.imports.str)`
         """
         raise NotImplementedError
     def token_count(self) -> int:
@@ -99,7 +101,7 @@ class Video:
         model. Errors if the model has no vision front-end or the bytes don't
         decode as an animation.
         
-        Raises: `wit_world.types.Err(wit_world.imports.str)`
+        Raises: `componentize_py_types.Err(wit_world.imports.str)`
         """
         raise NotImplementedError
     def frame_count(self) -> int:
@@ -111,7 +113,7 @@ class Video:
         """
         The `index`-th sampled frame as an owned `image` span.
         
-        Raises: `wit_world.types.Err(wit_world.imports.str)`
+        Raises: `componentize_py_types.Err(wit_world.imports.str)`
         """
         raise NotImplementedError
     def timestamp(self, index: int) -> float:
@@ -146,7 +148,7 @@ class Audio:
         (Gemma4AudioFeatureExtractor). Errors if the model has no audio
         front-end or the bytes don't decode.
         
-        Raises: `wit_world.types.Err(wit_world.imports.str)`
+        Raises: `componentize_py_types.Err(wit_world.imports.str)`
         """
         raise NotImplementedError
     def token_count(self) -> int:

@@ -11,9 +11,9 @@ use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
+use tokio::sync::oneshot;
 
-use crate::context::pagestore::PhysicalPageId;
+use crate::arena::PhysicalPageId;
 use crate::driver::{self, DriverId, SchedulerLimits};
 
 use super::adaptive_policy::GreedyPolicy;
@@ -157,14 +157,6 @@ enum Completion {
     Chunk {
         continuation: ChunkContinuation,
         sampler_slots: Vec<usize>,
-    },
-    /// Self-perpetuating speculation chain. The dispatch loop routes
-    /// these to the per-driver `ChainExtPool` instead of waking 256
-    /// individual per-context tokio tasks; the pool worker then forwards
-    /// this fire's output to `state.response` and submits the next stage
-    /// (if eligible) via `state.scheduler_handle`.
-    Chain {
-        state: Box<super::speculator::ChainState>,
     },
 }
 
@@ -712,18 +704,7 @@ fn prepare_pending_with_usage(
 
 #[inline]
 fn is_pure_decode_pending(p: &PendingRequest) -> bool {
-    // Chain-ext continuations (Completion::Chain) at conc=256 hit this path
-    // 256x per fire. Their request body is structurally identical to a
-    // pure-decode Direct request — build_next_request emits 1 token,
-    // single_token_mode=true, no user mask, no logit masks, no spec drafts
-    // in the non-spec hot path. Accepting Chain here skips the redundant
-    // `request_capacity_usage` call inside `maybe_start_chunking` for every
-    // chain continuation, trimming ~100ns × 256 = ~25 µs per fire off the
-    // accum-loop critical path.
-    matches!(
-        &p.completion,
-        Completion::Direct(_) | Completion::Chain { .. }
-    ) && p.request.token_ids.len() == 1
+    matches!(&p.completion, Completion::Direct(_)) && p.request.token_ids.len() == 1
         && p.request.spec_token_ids.is_empty()
         && p.request.single_token_mode
         && !p.request.has_user_mask
@@ -980,9 +961,7 @@ mod tests {
 // SchedulerHandle
 // =============================================================================
 
-/// Cloneable submit handle. Used by the speculator's chain extender
-/// (spawned outside the scheduler's `run` loop) to resubmit
-/// pre-staged forward passes.
+/// Cloneable submit handle.
 ///
 /// Backed by a sync crossbeam_channel rather than tokio mpsc so the
 /// receiving main loop (sync OS thread) can recv with futex-level
@@ -1011,27 +990,6 @@ impl SchedulerHandle {
             .map_err(|_| anyhow::anyhow!("scheduler channel closed"))?;
         Ok(())
     }
-
-    /// Submit a forward pass that participates in a speculation chain.
-    /// The dispatch loop routes the output to the per-driver pool worker
-    /// instead of waking a dedicated chain-extender task.
-    pub fn submit_chain(
-        &self,
-        request: pie_driver_abi::ForwardRequest,
-        state: Box<super::speculator::ChainState>,
-        physical_page_ids: Vec<PhysicalPageId>,
-        last_page_len: u32,
-    ) -> Result<()> {
-        self.tx
-            .send(PendingRequest {
-                request,
-                completion: Completion::Chain { state },
-                physical_page_ids,
-                last_page_len,
-            })
-            .map_err(|_| anyhow::anyhow!("scheduler channel closed"))?;
-        Ok(())
-    }
 }
 
 // =============================================================================
@@ -1045,37 +1003,6 @@ impl SchedulerHandle {
 pub(crate) struct BatchScheduler {
     tx: crossbeam::channel::Sender<PendingRequest>,
     stats: Arc<SchedulerStats>,
-    chain_pool: Arc<super::speculator::ChainExtPool>,
-}
-
-/// Default size of the chain-extender pool per driver. Re-swept on L40
-/// (gemma-4-E4B, conc=256, n=5 trials each):
-///   pool=2:  6633 ± 14 tok/s
-///   pool=4:  6633 ± 36 tok/s  (best single run 6710)
-///   pool=6:  6613 ±  5 tok/s
-///   pool=8:  6602 ± 25 tok/s
-///   pool=16: 6597 ± 21 tok/s  (previous default)
-///   pool=32: 6590 ± 32 tok/s
-///
-/// Smaller pools win because each chain job is ~25us of cheap work;
-/// the per-task tokio wake/schedule overhead dominates over the
-/// parallelism benefit beyond ~4 workers. With 256 jobs across 4
-/// workers, each handles ~64 jobs serially in <2ms — well under the
-/// ~25ms GPU compute window of the previous fire.
-///
-/// Override via `PIE_CHAIN_EXT_POOL_SIZE` env var to sweep without
-/// rebuilding.
-const CHAIN_EXT_POOL_SIZE_DEFAULT: usize = 4;
-
-fn chain_ext_pool_size() -> usize {
-    static CACHED: OnceLock<usize> = OnceLock::new();
-    *CACHED.get_or_init(|| {
-        std::env::var("PIE_CHAIN_EXT_POOL_SIZE")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .filter(|&n: &usize| n > 0)
-            .unwrap_or(CHAIN_EXT_POOL_SIZE_DEFAULT)
-    })
 }
 
 impl BatchScheduler {
@@ -1093,7 +1020,6 @@ impl BatchScheduler {
         let (tx, rx) = crossbeam::channel::unbounded::<PendingRequest>();
         let submit_tx = tx.clone();
         let stats = Arc::new(SchedulerStats::default());
-        let chain_pool = Arc::new(super::speculator::ChainExtPool::new(chain_ext_pool_size()));
 
         // Run the main scheduling loop on a dedicated OS thread with
         // crossbeam channels. Why: tokio's mpsc/select! wake-pickup
@@ -1105,7 +1031,6 @@ impl BatchScheduler {
         // for the GPU/IPC and response dispatch.
         let rt_handle = tokio::runtime::Handle::current();
         let stats_for_loop = stats.clone();
-        let chain_pool_for_loop = chain_pool.clone();
         std::thread::Builder::new()
             .name(format!("pie-sched-{driver_idx}"))
             .spawn(move || {
@@ -1118,20 +1043,12 @@ impl BatchScheduler {
                     limits,
                     request_timeout_secs,
                     stats_for_loop,
-                    chain_pool_for_loop,
                     rt_handle,
                 );
             })
             .expect("spawn pie-sched thread");
 
-        Self { tx, stats, chain_pool }
-    }
-
-    /// Get the chain extender pool handle. Cold submits use this to
-    /// route the first fire's output through the pool instead of spawning
-    /// a per-context chain-extender task.
-    pub fn chain_pool(&self) -> Arc<super::speculator::ChainExtPool> {
-        self.chain_pool.clone()
+        Self { tx, stats }
     }
 
     /// Get a handle to the cumulative scheduler stats (lock-free).
@@ -1159,7 +1076,7 @@ impl BatchScheduler {
     }
 
     /// Cloneable handle for tasks that need to submit outside the
-    /// scheduler's `run` loop (e.g., the speculator chain extender).
+    /// scheduler's `run` loop.
     pub(crate) fn handle(&self) -> SchedulerHandle {
         SchedulerHandle {
             tx: self.tx.clone(),
@@ -1181,7 +1098,6 @@ impl BatchScheduler {
         limits: SchedulerLimits,
         request_timeout_secs: u64,
         stats: Arc<SchedulerStats>,
-        chain_pool: Arc<super::speculator::ChainExtPool>,
         rt_handle: tokio::runtime::Handle,
     ) {
         let request_timeout = Duration::from_secs(request_timeout_secs);
@@ -1381,11 +1297,12 @@ impl BatchScheduler {
                             &rt_handle,
                             Some(submit_tx.clone()),
                             &stats,
-                            Some(chain_pool.clone()),
                         )
                     });
                     let latency = start.elapsed();
                     let _ = latency_tx.send(latency);
+
+                    // (Market clock `context::tick` removed — W16, Phase 5.)
 
                     // Always-on counters + spec-domain accumulation.
                     // Wrapped in stats_update_us probe so we can see how
@@ -1500,7 +1417,6 @@ impl BatchScheduler {
                 &rt_handle,
                 None,
                 &stats,
-                None,
             );
         }
     }
@@ -1515,7 +1431,7 @@ impl BatchScheduler {
     /// `block_in_place(submit_sync_for_state)`). The only off-thread
     /// work this function still does is the `deferred_drop` punt, which
     /// `rt_handle.spawn_blocking` routes to tokio's dedicated blocking
-    /// pool so the chain-extender wake-up wave doesn't compete with it
+    /// pool so response cleanup does not compete with the scheduler thread
     /// for CPU.
     fn execute_batch(
         driver_idx: usize,
@@ -1526,7 +1442,6 @@ impl BatchScheduler {
         rt_handle: &tokio::runtime::Handle,
         submit_tx: Option<crossbeam::channel::Sender<PendingRequest>>,
         stats: &SchedulerStats,
-        chain_pool: Option<Arc<super::speculator::ChainExtPool>>,
     ) -> BatchExecutionTiming {
         // Detect if ANY request carries system spec drafts. The
         // common case (256-conc decode) has none, so we skip the
@@ -1610,8 +1525,8 @@ impl BatchScheduler {
             r
         });
 
-        // Response dispatch: per-request oneshot fires, chain-pool submits,
-        // and queueing the deferred_drop Vec. Probe scope ends at the
+        // Response dispatch: per-request oneshot fires and queueing the
+        // deferred_drop Vec. Probe scope ends at the
         // close of the `match result { ... }` block below.
         //
         // Per-completion-type counts are accumulated into these locals
@@ -1619,7 +1534,6 @@ impl BatchScheduler {
         // we don't pay a per-request atomic op on the hot path.
         let response_dispatch_start = Instant::now();
         let mut direct_count: u64 = 0;
-        let mut chain_count: u64 = 0;
         let mut chunk_count: u64 = 0;
         match result {
             Ok(batch_resp) => {
@@ -1673,8 +1587,8 @@ impl BatchScheduler {
                     // Send oneshot replies first, defer drop of the
                     // request husks. Each PendingRequest's drop is
                     // ~3-4 µs (22-Vec ForwardRequest), and doing it
-                    // inline pushes the 256th chain extender's wake
-                    // out by ~1.2 ms — directly extending the gap.
+                    // inline adds avoidable tail latency to response
+                    // dispatch for large batches.
                     let mut deferred_drop: Vec<(
                         pie_driver_abi::ForwardRequest,
                         Vec<PhysicalPageId>,
@@ -1722,19 +1636,6 @@ impl BatchScheduler {
                                     };
                                     req.send_result(Ok(output), submit_tx.as_ref(), page_size);
                                 }
-                                Completion::Chain { state } => {
-                                    chain_count += 1;
-                                    if let Some(pool) = chain_pool.as_ref() {
-                                        let ctx_id = state.prev_request.context_ids
-                                            .first().copied().unwrap_or(0);
-                                        pool.submit(ctx_id, super::speculator::ChainExtJob {
-                                            state,
-                                            output: Ok(output),
-                                            enqueued_us: super::speculator::now_micros(),
-                                        });
-                                    }
-                                    deferred_drop.push((request, physical_page_ids));
-                                }
                             }
                         }
                     } else {
@@ -1775,27 +1676,13 @@ impl BatchScheduler {
                                     };
                                     req.send_result(Ok(output), submit_tx.as_ref(), page_size);
                                 }
-                                Completion::Chain { state } => {
-                                    chain_count += 1;
-                                    if let Some(pool) = chain_pool.as_ref() {
-                                        let ctx_id = state.prev_request.context_ids
-                                            .first().copied().unwrap_or(0);
-                                        pool.submit(ctx_id, super::speculator::ChainExtJob {
-                                            state,
-                                            output: Ok(output),
-                                            enqueued_us: super::speculator::now_micros(),
-                                        });
-                                    }
-                                    deferred_drop.push((request, physical_page_ids));
-                                }
                             }
                         }
                     }
                     stats.fire.last_dispatch_end_micros.store(now_micros(), Relaxed);
                     if !deferred_drop.is_empty() {
-                        // Dedicated blocking pool so the chain-extender
-                        // wake-up wave doesn't compete with this dealloc
-                        // task for a worker thread. Use the captured
+                        // Dedicated blocking pool so this dealloc task
+                        // does not compete with response dispatch. Use the captured
                         // `rt_handle` because we're now on the scheduler
                         // OS thread, not a tokio task — `tokio::task::
                         // spawn_blocking` would panic without an ambient
@@ -1831,14 +1718,6 @@ impl BatchScheduler {
                 .response_dispatch
                 .direct_count
                 .fetch_add(direct_count, Relaxed);
-        }
-        if chain_count > 0 {
-            stats
-                .fire
-                .execute
-                .response_dispatch
-                .chain_count
-                .fetch_add(chain_count, Relaxed);
         }
         if chunk_count > 0 {
             stats

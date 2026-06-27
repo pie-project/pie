@@ -152,6 +152,30 @@ public:
     // (the [max_tokens, hidden_size] bf16 slab). Null if not configured.
     void* verify_hidden_stash_layer(int linear_idx);
 
+    // Persistent slot-indexed buffered-activation pool (Ph7 RS working-set
+    // fold-from-buffer). Mirrors the verify stash's per-token activation layout
+    // ([ mixed_qkv (conv_dim) | a (V_h) | b (V_h) ] bf16, token-major within
+    // each region) but PERSISTENT and indexed by a buffered-slab `slot`, so a
+    // forward's `rs-buffer-output` write (W10, write_state=false) can stash its
+    // in-proj activations into a buffered slab and a later `fold-buffered(n)`
+    // can gather + replay them into the folded recurrent_state — vs the verify
+    // stash, which only holds the same-pass forward's own activations.
+    // Sized [num_linear_layers, num_slots, page_tokens, hidden_size] bf16, with
+    // hidden_size = conv_dim + 2*v_heads (== the verify stash width). Runtime
+    // owns slot assignment (arena RsSlab object id = buffered-pool slot id),
+    // exactly mirroring the recurrent_state's "dumb pointer offset by slot".
+    void configure_rs_buffer_pool(int page_tokens, int hidden_size, int num_slots);
+    bool rs_buffer_pool_enabled() const noexcept {
+        return rs_buffer_page_tokens_ > 0 && rs_buffer_hidden_ > 0 &&
+               rs_buffer_num_slots_ > 0;
+    }
+    int rs_buffer_page_tokens() const noexcept { return rs_buffer_page_tokens_; }
+    int rs_buffer_hidden() const noexcept { return rs_buffer_hidden_; }
+    int rs_buffer_num_slots() const noexcept { return rs_buffer_num_slots_; }
+    // Base pointer of compact linear-layer `linear_idx`, buffered slab `slot`'s
+    // [page_tokens, hidden_size] bf16 region. Null if not configured / OOB.
+    void* rs_buffer_slab(int linear_idx, int slot);
+
     RecurrentStateCache() = default;
 
 private:
@@ -179,6 +203,13 @@ private:
     DeviceBuffer<std::uint16_t> verify_hidden_stash_;
     int verify_stash_max_tokens_ = 0;
     int verify_stash_hidden_ = 0;
+    // Persistent slot-indexed buffered-activation pool (Ph7). See
+    // configure_rs_buffer_pool. [num_linear_layers, num_slots, page_tokens,
+    // hidden_size] bf16.
+    DeviceBuffer<std::uint16_t> rs_buffer_pool_;
+    int rs_buffer_page_tokens_ = 0;
+    int rs_buffer_hidden_ = 0;
+    int rs_buffer_num_slots_ = 0;
 };
 
 }  // namespace pie_cuda_driver

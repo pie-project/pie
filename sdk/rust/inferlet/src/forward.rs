@@ -313,23 +313,30 @@ impl<'ctx> Forward<'ctx> {
 
         let n_auto = auto_inputs.len() as u32;
 
-        // Reserve working pages for auto-inputs (those occupy KV slots and
-        // commit on the way out). Explicit inputs are scoring-only — the
-        // caller manages their pages.
-        if n_auto > 0 {
-            let total_after = ctx.working_tokens + n_auto;
-            let pages_needed = (total_after + ctx.page_size - 1) / ctx.page_size;
-            let additional = pages_needed.saturating_sub(ctx.working_pages);
-            if additional > 0 {
-                ctx.inner
-                    .reserve_working_pages(additional)
-                    .map_err(|e| format!("Forward::execute: reserve_working_pages: {e}"))?;
-                ctx.working_pages = pages_needed;
-            }
+        // Soft-token KV rows contributed by image/audio spans occupy tail KV
+        // slots just like text tokens.
+        let mut soft_tokens = 0u32;
+        for (image, _) in &images {
+            soft_tokens += image.token_count();
         }
+        for (audio, _) in &audios {
+            soft_tokens += audio.token_count();
+        }
+        let n_write = n_auto + soft_tokens;
 
         let pass = ForwardPass::new();
-        pass.context(&ctx.inner);
+
+        // KV read/write descriptors. New tail tokens (auto inputs + soft
+        // image/audio rows) are written into freshly-allocated slots, with the
+        // prior full pages as read context. A pass with no new tail tokens
+        // (pure decode-from-cache / scoring) reads the whole materialized
+        // context read-only.
+        if n_write > 0 {
+            let (generation, indices, valid_lens, ctx_pages) = ctx.prepare_write(n_write)?;
+            ctx.attach_kv(&pass, generation, indices, valid_lens, ctx_pages);
+        } else {
+            ctx.attach_full_context(&pass);
+        }
 
         for (image, anchor) in images {
             pass.input_image(image, anchor);
@@ -377,27 +384,19 @@ impl<'ctx> Forward<'ctx> {
             .await
             .map_err(|e| format!("Forward::execute: forward pass failed: {e}"))?;
 
-        // Account for the newly-written KV. By default we also commit any
-        // pages the auto-input tokens fully filled. When `defer_commit` is
-        // set (manual speculation), we keep every written token in *working*
-        // pages so a later `truncate` can roll back rejected drafts — the
-        // caller commits the verified prefix afterwards.
-        if n_auto > 0 {
-            let new_working = ctx.working_tokens + n_auto;
-            let to_commit = if defer_commit {
-                0
-            } else {
-                new_working / ctx.page_size
-            };
-            if to_commit > 0 {
-                ctx.inner
-                    .commit_working_pages(to_commit)
-                    .map_err(|e| format!("Forward::execute: commit_working_pages: {e}"))?;
-            }
-            ctx.committed_pages += to_commit;
-            ctx.working_pages -= to_commit;
-            ctx.working_tokens = new_working - to_commit * ctx.page_size;
-            ctx.seq_len += n_auto;
+        // Advance the sequence cursor past the materialized tail tokens. Full
+        // pages auto-seal host-side on the forward-txn commit; there is no
+        // explicit page commit. `defer_commit` keeps the cursor where it was so
+        // a manual speculative loop can `truncate` the rejected suffix (the
+        // written KV is simply overwritten by the next pass).
+        if n_write > 0 && !defer_commit {
+            ctx.seq_len += n_write;
+            // The auto inputs are the materialized text tokens; soft image/audio
+            // rows make the context non-replayable.
+            ctx.history.extend_from_slice(&auto_inputs);
+        }
+        if soft_tokens > 0 {
+            ctx.snapshottable = false;
         }
 
         Ok(Output::new(raw))

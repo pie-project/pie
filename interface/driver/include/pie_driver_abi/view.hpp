@@ -1,6 +1,6 @@
 // pie_driver_abi/view.hpp — driver-side SoA view + AoS→SoA demux.
 //
-// Compatibility adapter for the C++ backends (cuda + metal). The
+// Compatibility adapter for the C++ backends (cuda + portable). The
 // wire schema in pie_driver_abi.h gives you `Pie*Desc` POD structs that
 // mirror the rkyv archive field-for-field. The C++ handler code
 // (`forward.cpp`, `plan.cpp`, sampler dispatch) wants flat SoA arrays
@@ -9,8 +9,8 @@
 // arenas. The arenas live in [`RequestArenas`] and are reset+refilled
 // per call.
 //
-// Header-only: shared between cuda and metal. Both
-// `driver/cuda/CMakeLists.txt` and `driver/metal/CMakeLists.txt`
+// Header-only: shared between cuda and portable. Both
+// `driver/cuda/CMakeLists.txt` and `driver/portable/CMakeLists.txt`
 // add `${PIE_SCHEMA_INCLUDE_DIR}` to their include path — the
 // declarations and `inline` definitions below resolve automatically.
 
@@ -133,6 +133,11 @@ struct PieForwardRequestView {
     PieSlice<std::uint32_t> qo_indptr;
     PieSlice<std::uint32_t> rs_slot_ids;
     PieSlice<std::uint8_t>  rs_slot_flags;
+    // Recurrent-state fold (RS_FLAG_FOLD): per-request fold token counts +
+    // the page-major buffered-slab ids (CSR) the fold-replay gathers from.
+    PieSlice<std::uint32_t> rs_fold_lens;
+    PieSlice<std::uint32_t> rs_buffer_slot_ids;
+    PieSlice<std::uint32_t> rs_buffer_slot_indptr;
 
     // Attention / logit masks
     PieSlice<std::uint32_t> flattened_masks;
@@ -143,6 +148,24 @@ struct PieForwardRequestView {
     // Sampling (CSR)
     PieSlice<std::uint32_t> sampling_indices;
     PieSlice<std::uint32_t> sampling_indptr;
+
+    // Programmable sampling (Sampling IR carrier). Empty for the legacy
+    // per-slot sampler path. The driver parses + JIT-caches the bytecode by
+    // hash; outputs surface through the existing ForwardResponse slots in the
+    // program's declared output order. See schema.rs / BYTECODE.md.
+    PieSlice<std::uint32_t> sampling_program_indptr;        // per-request program CSR
+    PieSlice<std::uint8_t>  sampling_program_bytes;         // concatenated bytecode
+    PieSlice<std::uint32_t> sampling_program_bytes_indptr;  // per-program byte CSR
+    PieSlice<std::uint8_t>  sampling_input_blob;            // submit-bound input bytes
+    PieSlice<std::uint32_t> sampling_input_keys;            // input key per entry
+    PieSlice<std::uint32_t> sampling_input_offsets;         // byte offset per entry
+    PieSlice<std::uint32_t> sampling_input_lens;            // byte length per entry
+    PieSlice<std::uint32_t> sampling_input_indptr;          // per-program input CSR
+    PieSlice<std::uint32_t> sampling_late_keys;             // declared late-bound keys
+    PieSlice<std::uint32_t> sampling_late_indptr;           // per-program late-key CSR
+    PieSlice<std::uint8_t>  sampling_late_blob;             // host-late value bytes
+    PieSlice<std::uint32_t> sampling_late_offsets;          // byte offset per late key
+    PieSlice<std::uint32_t> sampling_late_lens;             // byte length per late key
 
     // Sampler attributes (SoA — read from the wire SoA arrays; view.hpp
     // applies only the small kind-remap / top_k / top_p-min_p fold).
@@ -156,8 +179,8 @@ struct PieForwardRequestView {
     PieSlice<std::uint32_t> sampler_label_indptr;  // CSR into sampler_label_ids
     PieSlice<std::uint32_t> request_num_samplers;  // per-request count
 
-    // Adapter bindings (Vec<AdapterBinding> → flat lists). C++ drivers
-    // reinterpret these as int64 (`adapter_indices.as<int64_t>()`).
+    // Adapter bindings (Vec<AdapterBinding> → flat lists). Portable
+    // reinterprets these as int64 (`adapter_indices.as<int64_t>()`).
     PieSlice<std::int64_t> adapter_indices;       // -1 sentinel for None
     PieSlice<std::int64_t> adapter_seeds;         // -1 sentinel for None
 
@@ -293,7 +316,7 @@ struct RequestArenas {
     std::vector<std::uint32_t> request_num_samplers;
 
     // Adapter binding flat lists (-1 sentinel for None). Both i64
-    // because the C++ drivers reinterpret via `.as<int64_t>()`.
+    // because portable reinterprets via `.as<int64_t>()`.
     std::vector<std::int64_t> adapter_indices;
     std::vector<std::int64_t> adapter_seeds;
 
@@ -364,6 +387,9 @@ inline void fill_forward_view(const PieForwardRequestDesc& f,
     out.qo_indptr         = slice_from(f.qo_indptr_ptr, f.qo_indptr_len);
     out.rs_slot_ids       = slice_from(f.rs_slot_ids_ptr, f.rs_slot_ids_len);
     out.rs_slot_flags     = slice_from(f.rs_slot_flags_ptr, f.rs_slot_flags_len);
+    out.rs_fold_lens          = slice_from(f.rs_fold_lens_ptr, f.rs_fold_lens_len);
+    out.rs_buffer_slot_ids    = slice_from(f.rs_buffer_slot_ids_ptr, f.rs_buffer_slot_ids_len);
+    out.rs_buffer_slot_indptr = slice_from(f.rs_buffer_slot_indptr_ptr, f.rs_buffer_slot_indptr_len);
 
     // BRLE masks come over the wire as Vec<Brle>. The driver code path
     // wants a flat run-length buffer plus per-ROW byte offsets. Walk
@@ -406,6 +432,32 @@ inline void fill_forward_view(const PieForwardRequestDesc& f,
     out.logit_mask_indptr = slice_from(arenas.logit_mask_byte_indptr.data(), arenas.logit_mask_byte_indptr.size());
     out.sampling_indices  = slice_from(f.sampling_indices_ptr, f.sampling_indices_len);
     out.sampling_indptr   = slice_from(f.sampling_indptr_ptr, f.sampling_indptr_len);
+    out.sampling_program_indptr =
+        slice_from(f.sampling_program_indptr_ptr, f.sampling_program_indptr_len);
+    out.sampling_program_bytes =
+        slice_from(f.sampling_program_bytes_ptr, f.sampling_program_bytes_len);
+    out.sampling_program_bytes_indptr =
+        slice_from(f.sampling_program_bytes_indptr_ptr, f.sampling_program_bytes_indptr_len);
+    out.sampling_input_blob =
+        slice_from(f.sampling_input_blob_ptr, f.sampling_input_blob_len);
+    out.sampling_input_keys =
+        slice_from(f.sampling_input_keys_ptr, f.sampling_input_keys_len);
+    out.sampling_input_offsets =
+        slice_from(f.sampling_input_offsets_ptr, f.sampling_input_offsets_len);
+    out.sampling_input_lens =
+        slice_from(f.sampling_input_lens_ptr, f.sampling_input_lens_len);
+    out.sampling_input_indptr =
+        slice_from(f.sampling_input_indptr_ptr, f.sampling_input_indptr_len);
+    out.sampling_late_keys =
+        slice_from(f.sampling_late_keys_ptr, f.sampling_late_keys_len);
+    out.sampling_late_indptr =
+        slice_from(f.sampling_late_indptr_ptr, f.sampling_late_indptr_len);
+    out.sampling_late_blob =
+        slice_from(f.sampling_late_blob_ptr, f.sampling_late_blob_len);
+    out.sampling_late_offsets =
+        slice_from(f.sampling_late_offsets_ptr, f.sampling_late_offsets_len);
+    out.sampling_late_lens =
+        slice_from(f.sampling_late_lens_ptr, f.sampling_late_lens_len);
     out.spec_token_ids    = slice_from(f.spec_token_ids_ptr, f.spec_token_ids_len);
     out.spec_position_ids = slice_from(f.spec_position_ids_ptr, f.spec_position_ids_len);
     out.spec_indptr       = slice_from(f.spec_indptr_ptr, f.spec_indptr_len);
@@ -464,7 +516,7 @@ inline void fill_forward_view(const PieForwardRequestDesc& f,
 
     // Adapter bindings → two parallel flat lists. The wire format
     // already uses i64 with -1 sentinels for both fields, matching what
-    // the C++ drivers consume via `.as<int64_t>()` — this is a pure
+    // portable consumes via `.as<int64_t>()` — this is a pure
     // demultiplex, no value conversion.
     const std::size_t b = f.adapter_bindings_len;
     arenas.adapter_indices.resize(b);

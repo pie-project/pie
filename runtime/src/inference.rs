@@ -10,39 +10,22 @@
 //! by individual BatchScheduler instances (one per driver).
 
 mod adaptive_policy;
+pub mod forward_prepare;
 pub mod request;
 pub mod scheduler;
-pub mod speculator;
 pub mod structured;
 
 use tokio::sync::oneshot;
 
-use crate::context::pagestore::PhysicalPageId;
+use crate::arena::PhysicalPageId;
 use crate::driver::{DriverId, SchedulerLimits};
 use crate::service::{Service, ServiceHandler};
 use anyhow::Result;
-use dashmap::DashMap;
 use scheduler::BatchScheduler;
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering::Relaxed;
 
 pub use scheduler::{SchedulerStats, SYSTEM_SPEC_DRAFT_POS_BUCKETS};
-pub use speculator::{
-    BYPASS_HIT_COUNT, CHAIN_DROP_COUNT, CHAIN_SUBMIT_COUNT, StagedBatch, lookup_for_ctx, try_hit,
-};
-
-use speculator::StagedBatchMap;
-
-pub(crate) fn should_use_pass_speculation(driver_idx: usize) -> bool {
-    // The chain extender is already gated by scheduler.speculation_depth and
-    // request shape. If a staged entry exists, claim it even for a single
-    // resident context; otherwise the API path pays pin/actor overhead and
-    // the pre-fired chain only gets discovered later inside InferenceService.
-    let _ = driver_idx;
-    true
-}
-
 /// Aggregated inference stats for a single model (across all drivers).
 ///
 /// Always-on counters live at the top; per-domain probe averages
@@ -103,7 +86,6 @@ pub struct ExecuteStats {
 pub struct ResponseDispatchStats {
     pub avg_total_us: u64,
     pub direct_count: u64,
-    pub chain_count: u64,
     pub chunk_count: u64,
 }
 
@@ -135,15 +117,10 @@ pub struct PostDispatchStats {
 static SERVICE: Service<Message> = Service::new();
 
 /// Spawns the inference service for the single model.
-///
-/// `speculation_depth` is the per-context depth of pass-level
-/// speculative execution (`scheduler.speculation_depth` in toml).
-/// `0` disables pass-level speculation entirely.
 pub async fn spawn(
     driver_indices: &[usize],
     page_size: u32,
     request_timeout_secs: u64,
-    speculation_depth: u32,
 ) {
     // Fetch driver info before entering the sync closure.
     let driver_ids: Vec<DriverId> = driver_indices.to_vec();
@@ -162,51 +139,18 @@ pub async fn spawn(
                 driver_batch_limits,
                 page_size,
                 request_timeout_secs,
-                speculation_depth as usize,
             )
         })
         .expect("Failed to spawn inference service")
 }
 
-/// Submits a pre-resolved forward pass to the appropriate driver scheduler.
-///
-/// All context operations (ensure_resident, page resolution) must be done
-/// by the caller BEFORE calling this. The inference actor just dispatches
-/// to the batch scheduler — it never blocks on context operations.
-///
-/// `extra_pages` lists working pages the ctx has reserved beyond the
-/// active prefix in `physical_page_ids`. They are passed to the
-/// speculator's chain extender so it can extend the chain across the
-/// full reserved range without re-pinning. Pass an empty vec when
-/// speculation is disabled or the caller has no extra pages.
-pub async fn submit(
-    request: pie_driver_abi::ForwardRequest,
-    driver_idx: usize,
-    physical_page_ids: Vec<PhysicalPageId>,
-    extra_pages: Vec<PhysicalPageId>,
-    last_page_len: u32,
-) -> Result<ForwardOutput> {
-    let rx = submit_async(
-        request,
-        driver_idx,
-        physical_page_ids,
-        extra_pages,
-        last_page_len,
-        None,
-        true,
-    )?;
-    rx.await
-        .map_err(|_| anyhow::anyhow!("inference submit: scheduler dropped response channel"))?
-}
+
 
 pub fn submit_async(
     request: pie_driver_abi::ForwardRequest,
     driver_idx: usize,
     physical_page_ids: Vec<PhysicalPageId>,
-    extra_pages: Vec<PhysicalPageId>,
     last_page_len: u32,
-    active_page_idx: Option<usize>,
-    allow_pass_speculation: bool,
 ) -> Result<oneshot::Receiver<Result<ForwardOutput>>> {
     let (tx, rx) = oneshot::channel();
     SERVICE.send(
@@ -214,10 +158,7 @@ pub fn submit_async(
             request,
             driver_idx,
             physical_page_ids,
-            extra_pages,
             last_page_len,
-            active_page_idx,
-            allow_pass_speculation,
             response: tx,
         },
     )?;
@@ -262,12 +203,7 @@ pub async fn get_stats() -> InferenceStats {
     rx.await.unwrap_or_default()
 }
 
-/// Drop any outstanding speculation chain for a ctx that's about to
-/// be destroyed. Fire-and-forget: the speculator just clears its
-/// per-device deque for this ctx; callers don't need confirmation.
-pub fn invalidate_speculation_for_ctx(ctx_id: crate::context::ContextId) {
-    let _ = SERVICE.send(Message::InvalidateSpeculationForCtx { ctx_id });
-}
+
 
 // =============================================================================
 // Inference Service
@@ -281,17 +217,6 @@ struct InferenceService {
     num_drivers: usize,
     schedulers: Vec<BatchScheduler>,
     scheduler_stats: Vec<Arc<SchedulerStats>>,
-    /// Per-context depth of pass-level speculation. Each ctx can
-    /// have up to this many pre-fired stages in its deque. Sourced
-    /// from `scheduler.speculation_depth` in the toml. `0` disables
-    /// speculation: no staged entries are ever pushed and every
-    /// submit goes through the cold path.
-    speculation_depth: usize,
-    /// Per-device speculation state: a deque of pre-fired stages
-    /// per ctx_id. Inferlet `execute()` calls hit-check the front
-    /// of the deque; the chain extender pushes new entries as each
-    /// fire completes (bounded by `speculation_depth`).
-    staged_batch: Vec<StagedBatchMap>,
 }
 
 impl std::fmt::Debug for InferenceService {
@@ -306,7 +231,6 @@ impl InferenceService {
         driver_batch_limits: Vec<SchedulerLimits>,
         page_size: u32,
         request_timeout_secs: u64,
-        speculation_depth: usize,
     ) -> Self {
         let num_drivers = driver_ids.len();
         let schedulers: Vec<BatchScheduler> = driver_ids
@@ -326,17 +250,12 @@ impl InferenceService {
 
         let scheduler_stats: Vec<_> = schedulers.iter().map(|s| s.stats().clone()).collect();
 
-        let staged_batch: Vec<StagedBatchMap> = (0..num_drivers)
-            .map(|_| Arc::new(DashMap::new()))
-            .collect();
-        speculator::register_model(&staged_batch, speculation_depth);
+
 
         InferenceService {
             num_drivers,
             schedulers,
             scheduler_stats,
-            speculation_depth,
-            staged_batch,
         }
     }
 
@@ -361,7 +280,6 @@ impl InferenceService {
         let mut fire_execute_driver_fire = 0u64;
         let mut fire_execute_response_dispatch_total = 0u64;
         let mut fire_execute_response_dispatch_direct = 0u64;
-        let mut fire_execute_response_dispatch_chain = 0u64;
         let mut fire_execute_response_dispatch_chunk = 0u64;
         let mut dc_ipc_submit = 0u64;
         let mut dc_gpu_wait = 0u64;
@@ -402,7 +320,6 @@ impl InferenceService {
             fire_execute_driver_fire += f.execute.driver_fire_us.load(Relaxed);
             fire_execute_response_dispatch_total += f.execute.response_dispatch.total_us.load(Relaxed);
             fire_execute_response_dispatch_direct += f.execute.response_dispatch.direct_count.load(Relaxed);
-            fire_execute_response_dispatch_chain += f.execute.response_dispatch.chain_count.load(Relaxed);
             fire_execute_response_dispatch_chunk += f.execute.response_dispatch.chunk_count.load(Relaxed);
             let dc = &s.driver_cuda;
             dc_ipc_submit += dc.ipc_submit_us.load(Relaxed);
@@ -474,7 +391,6 @@ impl InferenceService {
                     response_dispatch: ResponseDispatchStats {
                         avg_total_us: avg(fire_execute_response_dispatch_total),
                         direct_count: fire_execute_response_dispatch_direct,
-                        chain_count: fire_execute_response_dispatch_chain,
                         chunk_count: fire_execute_response_dispatch_chunk,
                     },
                     driver_cuda: DriverCudaStats {
@@ -517,22 +433,12 @@ enum Message {
         request: pie_driver_abi::ForwardRequest,
         driver_idx: usize,
         physical_page_ids: Vec<PhysicalPageId>,
-        /// Pages the ctx has reserved beyond the active prefix.
-        /// Passed to the chain extender so it can extend across the
-        /// full reserved range without re-allocating.
-        extra_pages: Vec<PhysicalPageId>,
         last_page_len: u32,
-        active_page_idx: Option<usize>,
-        allow_pass_speculation: bool,
         response: oneshot::Sender<Result<ForwardOutput>>,
     },
     GetStats {
         response: oneshot::Sender<InferenceStats>,
     },
-    /// Drop the speculation chain for a ctx (called from
-    /// `api::context::destroy`). Empties the per-device chain
-    /// queue if present.
-    InvalidateSpeculationForCtx { ctx_id: crate::context::ContextId },
 }
 
 impl ServiceHandler for InferenceService {
@@ -544,95 +450,19 @@ impl ServiceHandler for InferenceService {
                 request,
                 driver_idx,
                 physical_page_ids,
-                extra_pages,
                 last_page_len,
-                active_page_idx,
-                allow_pass_speculation,
                 response,
             } => {
                 let idx = driver_idx.min(self.num_drivers.saturating_sub(1));
-
-                // Per-request shape stores the ctx_id in
-                // `context_ids[0]`. Default to 0 if missing — only
-                // happens for malformed requests, in which case the
-                // speculator path is a no-op.
-                let ctx_id = request.context_ids.first().copied().unwrap_or(0);
-
-                // Staged self-staging path: check staged_batch for a
-                // hit, submit cold otherwise, and chain-extend up to
-                // `speculation_depth` pre-fired stages. Inferlet-side
-                // hits typically bypass this path via
-                // `inference::try_hit` before reaching the actor.
-                // Submits reaching this actor are therefore either
-                // cold or post-miss (the api layer's try_hit
-                // returned None).
-                let staged_entry = {
-                    let mut deque = self.staged_batch[idx].get_mut(&ctx_id);
-                    deque.as_deref_mut().and_then(|deque| {
-                        if let Some(front) = deque.front() {
-                            if speculator::entry_matches_request(front, &request) {
-                                let entry = deque.pop_front();
-                                if let Some(entry) = entry.as_ref() {
-                                    if !allow_pass_speculation {
-                                        entry.allow_extend.store(false, Relaxed);
-                                    }
-                                }
-                                return entry;
-                            }
-                        }
-                        // Fingerprint mismatch — drop the entire chain.
-                        // Deeper stages were built on a now-invalid assumption.
-                        deque.clear();
-                        None
-                    })
-                };
-
-                let scheduler_handle = self.schedulers[idx].handle();
-                let staged_batch_arc = self.staged_batch[idx].clone();
-                let speculation_depth = if allow_pass_speculation {
-                    self.speculation_depth
-                } else {
-                    0
-                };
-
-                if let Some(entry) = staged_entry {
-                    // HIT: forward the staged rx; the chain
-                    // extender that pushed this entry is still
-                    // alive and will keep extending. No re-spawn
-                    // here (it would duplicate the chain).
-                    tokio::spawn(async move {
-                        if let Ok(output) = entry.output_rx.await {
-                            let _ = response.send(output);
-                        }
-                    });
-                    return;
-                }
-
-                // No hit: cold submit + start a fresh chain. The pool's
-                // dispatch-side hook will route this fire's output to a
-                // pool worker; no per-context task is spawned here.
-                let cur_page_idx =
-                    active_page_idx.unwrap_or_else(|| physical_page_ids.len().saturating_sub(1));
-                let mut all_pages = physical_page_ids.clone();
-                all_pages.extend(extra_pages);
-                speculator::start_chain(
-                    response,
-                    scheduler_handle,
-                    staged_batch_arc,
+                let _ = self.schedulers[idx].handle().submit(
                     request,
+                    response,
                     physical_page_ids,
-                    all_pages,
-                    cur_page_idx,
                     last_page_len,
-                    speculation_depth,
-                    Arc::new(AtomicBool::new(allow_pass_speculation)),
                 );
             }
             Message::GetStats { response } => {
                 let _ = response.send(self.aggregate_stats());
-            }
-            Message::InvalidateSpeculationForCtx { ctx_id } => {
-                speculator::invalidate_ctx(ctx_id);
             }
         }
     }

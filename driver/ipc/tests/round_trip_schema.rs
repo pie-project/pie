@@ -4,8 +4,8 @@
 use pie_ipc::wire::{WireError, encode_request, encode_response, parse_request, parse_response};
 use pie_ipc::{
     AdapterBinding, AdapterOp, AdapterRequest, ArchivedRequestPayload, ArchivedResponsePayload,
-    CopyDir, CopyRequest, CopyResource, ForwardRequest, ForwardResponse, Frame, RequestPayload,
-    ResponseFrame, ResponsePayload, Sampler, StatusResponse,
+    CopyDir, CopyRequest, CopyResource, ForwardRequest, ForwardResponse, Frame, RS_FLAG_FOLD,
+    RS_FLAG_RESET, RequestPayload, ResponseFrame, ResponsePayload, Sampler, StatusResponse,
 };
 
 #[test]
@@ -106,6 +106,45 @@ fn frame_forward_round_trip() {
     assert_eq!(arch_req.audio_feature_indptr.as_slice(), &[0u32, 8]);
     assert_eq!(arch_req.audio_anchor_rows.as_slice(), &[3u32]);
     assert_eq!(arch_req.audio_indptr.as_slice(), &[0u32, 1]);
+}
+
+/// Locks the RS-fold wire ABI (Lane D / Seam 3): the recurrent-state fold
+/// fields — `rs_slot_ids`, `rs_slot_flags` (`RS_FLAG_RESET` | `RS_FLAG_FOLD`),
+/// and `rs_fold_lens` — survive the rkyv round-trip as aligned parallel arrays.
+/// The base `frame_forward_round_trip` leaves these at `..Default::default()`,
+/// so this is the only coverage of the fold descriptors over the real wire.
+#[test]
+fn frame_forward_rs_fold_round_trip() {
+    // Two linear-attention requests: req0 resets its slot AND folds 2 buffered
+    // tokens; req1 folds 4 tokens without reset.
+    let req = ForwardRequest {
+        token_ids: vec![5, 6, 7, 8, 9, 10],
+        position_ids: vec![0, 1, 0, 1, 2, 3],
+        qo_indptr: vec![0, 2, 6],
+        rs_slot_ids: vec![3, 9],
+        rs_slot_flags: vec![RS_FLAG_RESET | RS_FLAG_FOLD, RS_FLAG_FOLD],
+        rs_fold_lens: vec![2, 4],
+        ..Default::default()
+    };
+    let f = Frame {
+        driver_id: 7,
+        payload: RequestPayload::Forward(req),
+    };
+
+    let bytes = encode_request(&f).unwrap();
+    let archived = parse_request(&bytes).unwrap();
+    let ArchivedRequestPayload::Forward(arch) = &archived.payload else {
+        panic!("expected Forward variant");
+    };
+
+    assert_eq!(arch.rs_slot_ids.as_slice(), &[3u32, 9]);
+    assert_eq!(arch.rs_fold_lens.as_slice(), &[2u32, 4]);
+
+    let flags = arch.rs_slot_flags.as_slice();
+    assert_eq!(flags, &[RS_FLAG_RESET | RS_FLAG_FOLD, RS_FLAG_FOLD]);
+    // Bits decode to the intended per-request semantics.
+    assert!(flags[0] & RS_FLAG_RESET != 0 && flags[0] & RS_FLAG_FOLD != 0);
+    assert!(flags[1] & RS_FLAG_RESET == 0 && flags[1] & RS_FLAG_FOLD != 0);
 }
 
 #[test]

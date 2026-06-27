@@ -97,7 +97,7 @@ impl pie::core::audio_out::HostSpeech for InstanceState {
             None => CSM_DEFAULT_MAX_FRAMES,
         };
         // Default device for the single model (single-driver configs use driver 0).
-        let driver_idx = crate::context::get_device(0);
+        let driver_idx = 0;
         match crate::driver::generate_audio(driver_idx, &prompt, max_frames).await {
             Ok(pcm) => {
                 let speech = Speech {

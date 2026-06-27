@@ -8,10 +8,69 @@ from abc import abstractmethod
 import weakref
 
 from componentize_py_types import Result, Ok, Err, Some
-from ..imports import media
 from ..imports import adapter
-from ..imports import poll
-from ..imports import context
+from ..imports import media
+from ..imports import working_set
+import componentize_py_async_support
+from componentize_py_async_support.streams import StreamReader, StreamWriter, ByteStreamReader, ByteStreamWriter
+from componentize_py_async_support.futures import FutureReader, FutureWriter
+
+@dataclass
+class KvContext:
+    """
+    ── Forward-pass memory contract (explicit read/write descriptors) ──────
+    A forward pass READS the pages/tokens designated as *context* and WRITES
+    only the indices/ranges designated as *output*. There is no ambient
+    context handle and no implicit append. Output indices/ranges must be
+    unique per pass; output may overlap context only when it is also
+    declared as output. The runtime CoWs every write target before driver
+    submission; on driver failure the output objects are left invalid /
+    private and are NOT CAS-sealed.
+    KV pages this pass reads as attention context: the half-open relative
+    span [start, start + len) of `set`, of which the first `valid-tokens`
+    tokens participate in attention (trailing reserved slots may be empty).
+    """
+    set: working_set.KvWorkingSet
+    start: int
+    len: int
+    valid_tokens: int
+
+@dataclass
+class KvOutput:
+    """
+    KV pages this pass writes: the relative `indices` of `set` that receive
+    freshly computed KV, with `per-page-valid-lens[i]` valid tokens written
+    into page `indices[i]` (the two lists are parallel). Indices must be
+    unique. `generation` is the value the caller read from
+    `set.generation()` when it captured `indices`; if `set` has since been
+    structurally mutated (alloc/free/reorder/append) the runtime rejects the
+    pass with a clean stale-generation error instead of writing stale slots.
+    """
+    set: working_set.KvWorkingSet
+    generation: int
+    indices: List[int]
+    per_page_valid_lens: List[int]
+
+@dataclass
+class RsBufferContext:
+    """
+    Buffered recurrent state this pass reads: `len-tokens` tokens starting at
+    buffered token offset `start-token` of `set`.
+    """
+    set: working_set.RsWorkingSet
+    start_token: int
+    len_tokens: int
+
+@dataclass
+class RsBufferOutput:
+    """
+    Buffered recurrent state this pass writes: `len-tokens` tokens starting
+    at `start-token` of `set`. Writing buffered RS does NOT fold it; folding
+    is the separate `fold` operation.
+    """
+    set: working_set.RsWorkingSet
+    start_token: int
+    len_tokens: int
 
 
 @dataclass
@@ -124,32 +183,45 @@ class Output:
     spec_tokens: List[int]
     spec_positions: List[int]
 
-class FutureOutput:
-    
-    def pollable(self) -> poll.Pollable:
-        """
-        Returns a pollable object to check when the result is ready
-        """
-        raise NotImplementedError
-    def get(self) -> Optional[Output]:
-        raise NotImplementedError
-    def __enter__(self) -> Self:
-        """Returns self"""
-        return self
-                                
-    def __exit__(self, exc_type: type[BaseException] | None, exc_value: BaseException | None, traceback: TracebackType | None) -> bool | None:
-        """
-        Release this resource.
-        """
-        raise NotImplementedError
-
-
 class ForwardPass:
     
     def __init__(self) -> None:
         raise NotImplementedError
 
-    def context(self, context: context.Context) -> None:
+    def kv_context(self, ctx: KvContext) -> None:
+        """
+        KV attention context this pass reads. Replaces the old opaque
+        `context` handle. For hybrid models, combine with `rs-context`.
+        """
+        raise NotImplementedError
+    def kv_output(self, out: KvOutput) -> None:
+        """
+        KV pages this pass writes.
+        """
+        raise NotImplementedError
+    def rs_context(self, ctx: RsBufferContext) -> None:
+        """
+        Buffered recurrent state this pass reads (hybrid / linear-attention).
+        """
+        raise NotImplementedError
+    def rs_output(self, out: RsBufferOutput) -> None:
+        """
+        Buffered recurrent state this pass writes.
+        """
+        raise NotImplementedError
+    def fold_buffered(self, tokens: int) -> None:
+        """
+        Fold the first `tokens` buffered recurrent-state tokens of this
+        pass's RS working set into its folded state AS PART OF this forward
+        — piggybacking on the in-forward fold the driver already does (e.g.
+        cuda GDN commit-advance), not a separate op. Rides the pass's atomic
+        txn + submit. `tokens` counts buffered tokens and must be a positive
+        multiple of the model's fold granularity (`model.rs-fold-granularity`)
+        and within the buffered suffix; the runtime rejects an invalid count
+        before submission. No rollback across a fold — fork the RS working
+        set first if you may need to revert. A pass may write buffered RS
+        (`rs-output`) without folding; folding is opt-in via this call.
+        """
         raise NotImplementedError
     def input_tokens(self, tokens: List[int], positions: List[int]) -> None:
         raise NotImplementedError
@@ -194,9 +266,9 @@ class ForwardPass:
         raise NotImplementedError
     def adapter(self, adapter: adapter.Adapter) -> None:
         raise NotImplementedError
-    def execute(self) -> FutureOutput:
+    async def execute(self) -> Output:
         """
-        Raises: `wit_world.types.Err(wit_world.imports.str)`
+        Raises: `componentize_py_types.Err(wit_world.imports.str)`
         """
         raise NotImplementedError
     def __enter__(self) -> Self:
@@ -221,7 +293,7 @@ class Grammar:
         """
         Construct from a JSON Schema string.
         
-        Raises: `wit_world.types.Err(wit_world.imports.str)`
+        Raises: `componentize_py_types.Err(wit_world.imports.str)`
         """
         raise NotImplementedError
     @classmethod
@@ -235,7 +307,7 @@ class Grammar:
         """
         Construct from a regular expression pattern.
         
-        Raises: `wit_world.types.Err(wit_world.imports.str)`
+        Raises: `componentize_py_types.Err(wit_world.imports.str)`
         """
         raise NotImplementedError
     @classmethod
@@ -243,7 +315,7 @@ class Grammar:
         """
         Construct from an EBNF grammar string.
         
-        Raises: `wit_world.types.Err(wit_world.imports.str)`
+        Raises: `componentize_py_types.Err(wit_world.imports.str)`
         """
         raise NotImplementedError
     def to_string(self) -> str:
@@ -282,7 +354,7 @@ class Matcher:
         Accept one or more decoded tokens, advancing the matcher state.
         Returns an error if any token violates the grammar.
         
-        Raises: `wit_world.types.Err(wit_world.imports.str)`
+        Raises: `componentize_py_types.Err(wit_world.imports.str)`
         """
         raise NotImplementedError
     def next_token_logit_mask(self) -> List[int]:

@@ -18,7 +18,6 @@ use uuid::Uuid;
 /// the cancellation result if the WASM task is aborted before it can send.
 type SharedResultTx = Arc<Mutex<Option<oneshot::Sender<Result<String, String>>>>>;
 
-use crate::context;
 use crate::instance::OutputMode;
 use crate::linker;
 use crate::program::ProgramName;
@@ -85,11 +84,6 @@ static SERVICES: LazyLock<ServiceMap<ProcessId, Message>> = LazyLock::new(Servic
 
 /// Admission semaphore. `None` = unlimited concurrency (no gating).
 static ADMISSION: OnceLock<Option<Arc<Semaphore>>> = OnceLock::new();
-
-/// Monotonic FCFS launch sequence. Assigned at `spawn` and carried into the
-/// context scheduler so eviction targets the newest-launched process and the
-/// restore queue serves the oldest-launched first.
-static LAUNCH_SEQ: AtomicU64 = AtomicU64::new(0);
 
 static PROCESS_COMPLETED: AtomicU64 = AtomicU64::new(0);
 static PROCESS_ADMISSION_WAIT_US: AtomicU64 = AtomicU64::new(0);
@@ -210,7 +204,6 @@ pub fn spawn(
         client_id,
         capture_outputs,
         result_tx,
-        LAUNCH_SEQ.fetch_add(1, Relaxed),
     );
     let id = process.process_id;
 
@@ -354,7 +347,6 @@ impl Process {
         client_id: Option<ClientId>,
         capture_outputs: bool,
         result_tx: Option<oneshot::Sender<Result<String, String>>>,
-        launch_seq: u64,
     ) -> Self {
         let process_id = Uuid::new_v4();
         let result_tx: SharedResultTx = Arc::new(Mutex::new(result_tx));
@@ -366,7 +358,6 @@ impl Process {
             input.clone(),
             capture_outputs,
             result_tx.clone(),
-            launch_seq,
         ));
 
         Process {
@@ -383,7 +374,7 @@ impl Process {
         }
     }
 
-    /// Deliver an event to the attached client.
+    /// Deliver an event to the attached client and/or the parent workflow.
     fn deliver_event(&mut self, event: ProcessEvent) {
         // Deliver to attached client
         if let Some(client_id) = self.client_id {
@@ -427,7 +418,6 @@ impl Process {
         input: String,
         capture_outputs: bool,
         result_tx: SharedResultTx,
-        launch_seq: u64,
     ) {
         // Admission control: wait for a permit before instantiating.
         // The permit is held for the entire WASM execution lifetime
@@ -455,15 +445,8 @@ impl Process {
             .map_err(|e| e.to_string())?;
             instantiate_us = duration_us(instantiate_start.elapsed());
 
-            // KV admission waits here, after the singleton linker has already
-            // prepared the instance and is free to instantiate other queued
-            // processes. Blocking inside the linker would serialize a saturated
-            // second cohort behind the first one and leave the GPU idle.
-            let context_register_start = Instant::now();
-            context::register_process(process_id, launch_seq)
-                .await
-                .map_err(|e| e.to_string())?;
-            context_register_us = duration_us(context_register_start.elapsed());
+            // (KV admission via the context actor removed — Phase 5; physical
+            // admission is now the unified arena's concern.)
 
             let run_interface = format!("pie:{}/run", program.name);
 
@@ -527,7 +510,7 @@ impl Process {
             let _ = tx.send(result.clone());
         }
 
-        // Notify attached client
+        // Notify attached client / workflow
         match result {
             Ok(output) => self.deliver_event(ProcessEvent::Return(output)),
             Err(msg) => self.deliver_event(ProcessEvent::Error(msg)),

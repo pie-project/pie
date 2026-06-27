@@ -15,7 +15,6 @@ use wasmtime_wasi_http::p2::{WasiHttpCtxView, WasiHttpView};
 
 use self::output::LogStream;
 
-use crate::context;
 use crate::linker::InstancePolicy;
 use crate::process::ProcessId;
 
@@ -60,8 +59,8 @@ pub struct InstanceState {
 impl Drop for InstanceState {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.scratch_dir);
-        // Unregister the process: destroy all contexts and remove process entries.
-        context::unregister_process(self.id);
+        // (Process/context unregister removed — Phase 5; working sets drop with
+        // the instance's resource table.)
     }
 }
 

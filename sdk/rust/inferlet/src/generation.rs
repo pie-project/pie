@@ -31,8 +31,6 @@ use crate::sample::{Probe, Sampler};
 use crate::spec::Speculator;
 use std::collections::VecDeque;
 
-const GENERATION_RESERVATION_WINDOW_TOKENS: u32 = 512;
-
 // Re-export so callers don't have to pull from `context` directly.
 pub use crate::context::{Constrain, GrammarConstraint, Schema};
 
@@ -56,7 +54,6 @@ enum SpecMode {
 /// Builder + iterator for token generation. See module docs.
 pub struct Generator<'ctx> {
     ctx: &'ctx mut Context,
-    pass: ForwardPass,
     wit_sampler: WitSampler,
     stop: Vec<u32>,
     max_tokens: Option<usize>,
@@ -80,9 +77,6 @@ impl<'ctx> Generator<'ctx> {
     /// Construct a generator over `ctx` with the given sampler. Prefer
     /// [`Context::generate`].
     pub(crate) fn new(ctx: &'ctx mut Context, sampler: Sampler) -> Self {
-        let pass = ForwardPass::new();
-        pass.context(&ctx.inner);
-
         let default_system_speculation =
             sampler.is_argmax() && crate::model::default_system_speculation();
         let wit_sampler = sampler.into();
@@ -97,7 +91,6 @@ impl<'ctx> Generator<'ctx> {
 
         Self {
             ctx,
-            pass,
             wit_sampler,
             stop: Vec::new(),
             max_tokens: None,
@@ -378,36 +371,6 @@ impl<'ctx> Generator<'ctx> {
         serde_json::from_str(&text).map_err(|e| format!("collect_json: deserialize: {e}"))
     }
 
-    // ── Internal helpers ───────────────────────────────────────────────
-
-    fn reservation_lookahead_tokens(&self) -> u32 {
-        let remaining = self
-            .horizon
-            .or(self.max_tokens)
-            .map(|limit| limit.saturating_sub(self.tokens_generated))
-            .unwrap_or(0);
-        remaining.min(GENERATION_RESERVATION_WINDOW_TOKENS as usize) as u32
-    }
-
-    fn release_empty_working_pages(&mut self) {
-        let used_pages = if self.ctx.working_tokens == 0 {
-            0
-        } else {
-            self.ctx.working_tokens.div_ceil(self.ctx.page_size)
-        };
-        let excess = self.ctx.working_pages.saturating_sub(used_pages);
-        if excess == 0 {
-            return;
-        }
-        self.ctx.inner.release_working_pages(excess);
-        self.ctx.working_pages -= excess;
-    }
-}
-
-impl Drop for Generator<'_> {
-    fn drop(&mut self) {
-        self.release_empty_working_pages();
-    }
 }
 
 // =============================================================================
@@ -490,47 +453,39 @@ impl<'g, 'ctx> GenStep<'g, 'ctx> {
             }));
         }
 
-        // Reserve pages for pending (drafts share the working tail —
-        // their commit/truncate happens after we know what was accepted).
-        // No-input bootstrap path skips reservation: the host samples from
-        // the last cached KV position without growing the working tail.
-        let n_total_input = n_pending + n_drafted;
-        if n_total_input > 0 {
-            let total_after = parent
-                .ctx
-                .working_tokens
-                .saturating_add(n_total_input)
-                .saturating_add(parent.reservation_lookahead_tokens());
-            let pages_needed = (total_after + parent.ctx.page_size - 1) / parent.ctx.page_size;
-            let additional = pages_needed.saturating_sub(parent.ctx.working_pages);
-            if additional > 0 {
-                parent
-                    .ctx
-                    .inner
-                    .reserve_working_pages(additional)
-                    .map_err(|e| format!("GenStep::execute reserve: {e}"))?;
-                parent.ctx.working_pages = pages_needed;
-            }
-        }
+        // Custom-mode drafts ride alongside pending in `input_tokens` (verified
+        // by the SDK walk below); System-mode drafts ride the host spec channel.
+        let is_custom = matches!(parent.speculation, SpecMode::Custom(_));
+        let do_sdk_verify = is_custom && n_drafted > 0 && n_pending > 0;
 
-        // Build forward pass. A Generator is single-context and
-        // single-step-at-a-time, so reuse the same WIT ForwardPass resource
-        // and let the host reset its request accumulator after execute().
-        let pass = &parent.pass;
+        // Tail KV rows this pass writes: pending tokens (always) plus, in
+        // SDK-verify mode, the draft tokens (fed as regular inputs). Rejected
+        // drafts' slots are simply overwritten by the next step — no explicit
+        // truncate is needed, since `seq_len` only advances past the accepted
+        // KV (and full pages auto-seal host-side on the forward-txn commit).
+        let n_write = if do_sdk_verify {
+            n_pending + n_drafted
+        } else {
+            n_pending
+        };
+
+        // Build a fresh forward pass carrying this step's KV read/write
+        // descriptors (alloc lazily reserves the slots).
+        let pass = ForwardPass::new();
+        if n_write > 0 {
+            let (generation, indices, valid_lens, ctx_pages) = parent.ctx.prepare_write(n_write)?;
+            parent
+                .ctx
+                .attach_kv(&pass, generation, indices, valid_lens, ctx_pages);
+        } else {
+            parent.ctx.attach_full_context(&pass);
+        }
         if let Some(a) = parent.adapter {
             pass.adapter(a);
         }
         if let Some(seed) = parent.zo_seed {
             crate::pie::zo::zo::adapter_seed(&pass, seed);
         }
-
-        // Custom-mode drafts ride alongside pending in `input_tokens` and
-        // are verified by the SDK walk below. This keeps verification
-        // driver-agnostic: the runtime's `spec_token_ids` channel only
-        // carries the host-side `output_speculative_tokens` flow used
-        // by System-mode (where the runtime returns next-iter drafts).
-        let is_custom = matches!(parent.speculation, SpecMode::Custom(_));
-        let do_sdk_verify = is_custom && n_drafted > 0 && n_pending > 0;
 
         if do_sdk_verify {
             let mut all_tokens = Vec::with_capacity((n_pending + n_drafted) as usize);
@@ -673,60 +628,37 @@ impl<'g, 'ctx> GenStep<'g, 'ctx> {
             }
         }
 
-        // Truncate rejected drafts.
-        if n_drafted > 0 {
-            let n_verified = (accepted_tokens.len() as u32).saturating_sub(1);
-            let n_rejected = n_drafted.saturating_sub(n_verified);
-            if n_rejected > 0 {
-                // `truncate_working_page_tokens` REMOVES the last N working
-                // tokens (see context.wit). The host appended pending + ALL
-                // draft tokens, of which the last `n_rejected` were not
-                // verified, so the suffix to drop is exactly `n_rejected`.
-                // (For rs_cache contexts this stays within the driver-repaired
-                // spec tail, so the host skips a recurrent-state replay.)
-                parent
-                    .ctx
-                    .inner
-                    .truncate_working_page_tokens(n_rejected);
-            }
-            // Roll back custom speculator's own state too.
-            if let SpecMode::Custom(s) = &mut parent.speculation {
-                if n_rejected > 0 {
-                    s.rollback(n_rejected);
-                }
-            }
-        }
-
-        // Commit pages: pending tokens always commit (they're real KV);
-        // verified drafts also commit (they survived the verifier).
+        // Advance the sequence cursor past the accepted KV: pending tokens
+        // (always real KV) plus the verified drafts. Rejected drafts wrote KV
+        // into trailing slots that the next step overwrites — no explicit
+        // truncate. Roll back the custom speculator's own state for the
+        // rejected suffix.
         let n_verified_drafts = if n_drafted > 0 {
             (accepted_tokens.len() as u32).saturating_sub(1)
         } else {
             0
         };
+        if n_drafted > 0 {
+            let n_rejected = n_drafted.saturating_sub(n_verified_drafts);
+            if n_rejected > 0 {
+                if let SpecMode::Custom(s) = &mut parent.speculation {
+                    s.rollback(n_rejected);
+                }
+            }
+        }
+
         let n_kv_tokens = n_pending + n_verified_drafts;
         if n_kv_tokens > 0 {
-            let new_working = parent.ctx.working_tokens + n_kv_tokens;
-            let pages_to_commit = new_working / parent.ctx.page_size;
-            if pages_to_commit > 0 {
+            parent.ctx.seq_len += n_kv_tokens;
+            // Record the materialized tokens in the replay log: the pending
+            // tokens (always) plus the verified draft prefix.
+            parent.ctx.history.extend_from_slice(&pending);
+            if n_verified_drafts > 0 {
                 parent
                     .ctx
-                    .inner
-                    .commit_working_pages(pages_to_commit)
-                    .map_err(|e| format!("GenStep::execute commit: {e}"))?;
+                    .history
+                    .extend_from_slice(&drafts[..n_verified_drafts as usize]);
             }
-            parent.ctx.committed_pages += pages_to_commit;
-            parent.ctx.working_pages -= pages_to_commit;
-            parent.ctx.working_tokens = new_working % parent.ctx.page_size;
-            parent.ctx.seq_len += n_kv_tokens;
-        } else if n_drafted > 0 && accepted_tokens.is_empty() {
-            // All drafts rejected with no anchor token — re-sync from host
-            // since truncation may have released pages.
-            parent.ctx.committed_pages = parent.ctx.inner.committed_page_count();
-            parent.ctx.working_pages = parent.ctx.inner.working_page_count();
-            parent.ctx.working_tokens = parent.ctx.inner.working_page_token_count();
-            parent.ctx.seq_len =
-                parent.ctx.committed_pages * parent.ctx.page_size + parent.ctx.working_tokens;
         }
 
         // Advance constraint state with the accepted tokens (read by the

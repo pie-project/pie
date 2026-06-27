@@ -6,7 +6,6 @@
 use bytes::Bytes;
 use pie_client::message::ServerMessage;
 
-use crate::context;
 use crate::inference;
 use crate::messaging;
 use crate::model;
@@ -50,11 +49,20 @@ impl Session {
 
                 {
                     let model_name = model::model().name().to_string();
-                    // KV page pool stats
-                    let kv = context::get_stats().await;
-                    let (used, total) = kv
-                        .iter()
-                        .fold((0u64, 0u64), |(u, t), &(a, b)| (u + a as u64, t + b as u64));
+                    // KV page pool stats summed across the single model's
+                    // drivers' unified arenas (replaces the retired context
+                    // page store).
+                    let (used, total) = {
+                        let (mut u, mut t) = (0u64, 0u64);
+                        let mut d = 0;
+                        while let Some(a) = crate::arena::try_get(0, d) {
+                            let arena = a.lock().unwrap();
+                            u += arena.used(crate::arena::ArenaKind::KvPage) as u64;
+                            t += arena.capacity(crate::arena::ArenaKind::KvPage) as u64;
+                            d += 1;
+                        }
+                        (u, t)
+                    };
                     stats.insert(
                         format!("{}.kv_pages_used", model_name),
                         serde_json::Value::from(used),
@@ -136,10 +144,6 @@ impl Session {
                     stats.insert(
                         format!("{}.fire.execute.response_dispatch.direct_count", model_name),
                         serde_json::Value::from(inf.fire.execute.response_dispatch.direct_count),
-                    );
-                    stats.insert(
-                        format!("{}.fire.execute.response_dispatch.chain_count", model_name),
-                        serde_json::Value::from(inf.fire.execute.response_dispatch.chain_count),
                     );
                     stats.insert(
                         format!("{}.fire.execute.response_dispatch.chunk_count", model_name),
@@ -231,47 +235,6 @@ impl Session {
                             )
                         ),
                     );
-                    // Speculation hit counters — observability for
-                    // `try_hit`/chain submissions/drops.
-                    stats.insert(
-                        format!("{}.bypass_hits", model_name),
-                        serde_json::Value::from(
-                            inference::BYPASS_HIT_COUNT.load(std::sync::atomic::Ordering::Relaxed),
-                        ),
-                    );
-                    stats.insert(
-                        format!("{}.chain_submits", model_name),
-                        serde_json::Value::from(
-                            inference::CHAIN_SUBMIT_COUNT
-                                .load(std::sync::atomic::Ordering::Relaxed),
-                        ),
-                    );
-                    stats.insert(
-                        format!("{}.chain_drops", model_name),
-                        serde_json::Value::from(
-                            inference::CHAIN_DROP_COUNT.load(std::sync::atomic::Ordering::Relaxed),
-                        ),
-                    );
-                    {
-                        let n = inference::speculator::CHAIN_EXT_JOBS_SAMPLED
-                            .load(std::sync::atomic::Ordering::Relaxed);
-                        let wake = inference::speculator::CHAIN_EXT_WAKE_LATENCY_US
-                            .load(std::sync::atomic::Ordering::Relaxed);
-                        let work = inference::speculator::CHAIN_EXT_WORK_LATENCY_US
-                            .load(std::sync::atomic::Ordering::Relaxed);
-                        stats.insert(
-                            format!("{}.chain_ext_avg_wake_us", model_name),
-                            serde_json::Value::from(if n > 0 { wake / n } else { 0 }),
-                        );
-                        stats.insert(
-                            format!("{}.chain_ext_avg_work_us", model_name),
-                            serde_json::Value::from(if n > 0 { work / n } else { 0 }),
-                        );
-                        stats.insert(
-                            format!("{}.chain_ext_jobs_sampled", model_name),
-                            serde_json::Value::from(n),
-                        );
-                    }
                     if let Some(exec) = crate::api::inference::execute_profile_snapshot() {
                         let mean_value = |total_us: u64, denom: u64| -> serde_json::Value {
                             serde_json::Value::from(if denom > 0 { total_us / denom } else { 0 })
@@ -295,10 +258,6 @@ impl Session {
                         stats.insert(
                             format!("{}.execute_profile_prepare_mean_us", model_name),
                             mean_value(exec.prepare_us, exec.calls),
-                        );
-                        stats.insert(
-                            format!("{}.execute_profile_try_hit_mean_us", model_name),
-                            mean_value(exec.try_hit_us, exec.calls),
                         );
                         stats.insert(
                             format!("{}.execute_profile_hit_wait_mean_us", model_name),

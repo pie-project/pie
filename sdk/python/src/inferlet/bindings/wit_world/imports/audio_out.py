@@ -30,7 +30,9 @@ from abc import abstractmethod
 import weakref
 
 from componentize_py_types import Result, Ok, Err, Some
-
+import componentize_py_async_support
+from componentize_py_async_support.streams import StreamReader, StreamWriter, ByteStreamReader, ByteStreamWriter
+from componentize_py_async_support.futures import FutureReader, FutureWriter
 
 
 @dataclass
@@ -77,7 +79,7 @@ class Speech:
         Synthesize `req` on the bound model. Errors if the model has no
         audio-output front-end (i.e. is not a CSM checkpoint).
         
-        Raises: `wit_world.types.Err(wit_world.imports.str)`
+        Raises: `componentize_py_types.Err(wit_world.imports.str)`
         """
         raise NotImplementedError
     def sample_rate(self) -> int:

@@ -8,7 +8,9 @@ from abc import abstractmethod
 import weakref
 
 from componentize_py_types import Result, Ok, Err, Some
-
+import componentize_py_async_support
+from componentize_py_async_support.streams import StreamReader, StreamWriter, ByteStreamReader, ByteStreamWriter
+from componentize_py_async_support.futures import FutureReader, FutureWriter
 
 
 def name() -> str:
@@ -37,7 +39,7 @@ def decode(tokens: List[int]) -> str:
     """
     Converts token IDs back into a decoded string
     
-    Raises: `wit_world.types.Err(wit_world.imports.str)`
+    Raises: `componentize_py_types.Err(wit_world.imports.str)`
     """
     raise NotImplementedError
 def vocabs() -> Tuple[List[int], List[bytes]]:
@@ -53,5 +55,34 @@ def split_regex() -> str:
 def special_tokens() -> Tuple[List[int], List[bytes]]:
     """
     Returns the special tokens recognized by the model
+    """
+    raise NotImplementedError
+def rs_state_size() -> int:
+    """
+    ── Working-set / arena capabilities (global, over the bound model) ──
+    Memory-shaping parameters of the bound model's driver, so an inferlet
+    can size working sets and validate fold lengths before allocating.
+    Size in bytes of one folded recurrent-state object. 0 if the model has
+    no recurrent state (pure attention).
+    """
+    raise NotImplementedError
+def rs_buffer_page_size() -> int:
+    """
+    Tokens per buffered RS page. 0 if the model has no recurrent state.
+    """
+    raise NotImplementedError
+def rs_fold_granularity() -> int:
+    """
+    Fold granularity in tokens: `forward-pass.fold-buffered(n)` requires `n`
+    to be a positive multiple of this value. 1 (or 0) means unconstrained;
+    0 also implies the model has no recurrent state. (Token-causal RS models
+    — Qwen3.5 GDN, Nemotron-H Mamba2 — report 1.)
+    """
+    raise NotImplementedError
+def arena_block_size() -> int:
+    """
+    Size in bytes of one unified-arena accounting block. In v1 the KV page is
+    exactly one block, so this is the byte size of one KV page; an RS slab
+    occupies an integer number of these blocks.
     """
     raise NotImplementedError

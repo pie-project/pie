@@ -20,6 +20,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 from wit_world.imports import inference as _inf
+from wit_world.imports import media as _media
 from wit_world.imports.inference import (
     SlotOutput_Distribution,
     SlotOutput_Entropy,
@@ -103,7 +104,7 @@ class Forward:
     """Single forward pass. Construct via :meth:`Context.forward`.
 
     Builder methods return ``self`` so chains compose. ``await execute()``
-    runs the host call, commits any newly-filled pages, and returns an
+    runs the host call, advances the context cursor, and returns an
     :class:`Output`.
     """
 
@@ -117,6 +118,9 @@ class Forward:
         "_attn_mask",
         "_adapter",
         "_zo_seed",
+        "_images",
+        "_audios",
+        "_defer_commit",
     )
 
     def __init__(self, ctx: Context) -> None:
@@ -129,6 +133,9 @@ class Forward:
         self._attn_mask: list[list[int]] | None = None
         self._adapter: Adapter | None = None
         self._zo_seed: int | None = None
+        self._images: list[tuple[_media.Image, int]] = []
+        self._audios: list[tuple[_media.Audio, int]] = []
+        self._defer_commit = False
 
     # ── Position accessors ────────────────────────────────────────────
 
@@ -140,6 +147,15 @@ class Forward:
         lands at ``start_position() + i``.
         """
         return self._ctx._seq_len
+
+    def page_size(self) -> int:
+        """Tokens per KV page for the owning context."""
+        return self._ctx._page_size
+
+    def defer_commit(self) -> Forward:
+        """Run the pass without advancing the context cursor afterward."""
+        self._defer_commit = True
+        return self
 
     # ── Inputs ────────────────────────────────────────────────────────
 
@@ -209,13 +225,20 @@ class Forward:
         self._zo_seed = seed
         return self
 
+    def input_image(self, image: _media.Image, anchor: int) -> Forward:
+        """Splice an encoded visual span at sequence position ``anchor``."""
+        self._images.append((image, anchor))
+        return self
+
+    def input_audio(self, audio: _media.Audio, anchor: int) -> Forward:
+        """Splice an encoded audio span at sequence position ``anchor``."""
+        self._audios.append((audio, anchor))
+        return self
+
     # ── Execute ───────────────────────────────────────────────────────
 
     async def execute(self) -> Output:
-        """Run the forward pass. Reserves working pages for any
-        auto-inputs, submits all attached inputs and slots, awaits the
-        host, commits any newly-filled pages, and updates the context's
-        cached state.
+        """Run the forward pass with explicit KV descriptors.
 
         Raises ``ValueError`` if no inputs and no slots are attached —
         a vacuous Forward almost always indicates a missed
@@ -225,7 +248,7 @@ class Forward:
         n_auto = len(self._auto_inputs)
         n_total = n_auto + sum(len(t) for t, _ in self._explicit_inputs)
 
-        if n_total == 0 and not self._slots:
+        if n_total == 0 and not self._slots and not self._images and not self._audios:
             raise ValueError(
                 "Forward.execute() called with no inputs and no slots. "
                 "Attach at least one input (`forward.input(...)`) or "
@@ -233,20 +256,23 @@ class Forward:
                 "before executing."
             )
 
-        # Reserve pages for auto-inputs (those occupy KV and commit on
-        # the way out). Explicit inputs are scoring-only — the caller
-        # manages their pages.
-        if n_auto > 0:
-            total_after = ctx._working_tokens + n_auto
-            pages_needed = (total_after + ctx._page_size - 1) // ctx._page_size
-            additional = max(0, pages_needed - ctx._working_pages)
-            if additional > 0:
-                ctx._handle.reserve_working_pages(additional)
-                ctx._working_pages = pages_needed
+        soft_tokens = sum(image.token_count() for image, _ in self._images)
+        soft_tokens += sum(audio.token_count() for audio, _ in self._audios)
+        n_write = n_auto + soft_tokens
 
         # Build forward pass.
         fwd = _inf.ForwardPass()
-        fwd.context(ctx._handle)
+        if n_write > 0:
+            generation, indices, valid_lens, ctx_pages = ctx._prepare_write(n_write)
+            ctx._attach_kv(fwd, generation, indices, valid_lens, ctx_pages)
+        else:
+            ctx._attach_full_context(fwd)
+
+        for image, anchor in self._images:
+            fwd.input_image(image, anchor)
+        for audio, anchor in self._audios:
+            fwd.input_audio(audio, anchor)
+
         if self._adapter is not None:
             fwd.adapter(self._adapter._handle)
         if self._zo_seed is not None:
@@ -275,16 +301,11 @@ class Forward:
 
         raw = await await_future(fwd.execute(), "Forward.execute failed")
 
-        # Commit pages that auto-input tokens fully filled.
-        if n_auto > 0:
-            new_working = ctx._working_tokens + n_auto
-            to_commit = new_working // ctx._page_size
-            if to_commit > 0:
-                ctx._handle.commit_working_pages(to_commit)
-            ctx._committed_pages += to_commit
-            ctx._working_pages -= to_commit
-            ctx._working_tokens = new_working % ctx._page_size
-            ctx._seq_len += n_auto
+        if n_write > 0 and not self._defer_commit:
+            ctx._seq_len += n_write
+            ctx._history.extend(self._auto_inputs)
+        if soft_tokens > 0:
+            ctx._snapshottable = False
 
         return Output(raw)
 

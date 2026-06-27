@@ -116,7 +116,7 @@ pub struct ExecuteProbes {
 /// We deliberately don't time each completion-type arm separately —
 /// each `oneshot::Sender::send` and `pool.submit` call is ~50-100 ns,
 /// and probe overhead at that granularity would dwarf the work. The
-/// counts let us reason about workload shape (`chain_count / fire =
+/// counts let us reason about workload shape (`direct_count / fire =
 /// concurrency` at steady state) without per-call probe cost.
 #[derive(Debug, Default)]
 pub struct ResponseDispatchProbes {
@@ -125,10 +125,6 @@ pub struct ResponseDispatchProbes {
     /// Number of `Completion::Direct` arms taken per fire (sum across
     /// all fires; divide by `total_batches` for per-fire mean).
     pub direct_count: AtomicU64,
-    /// Number of `Completion::Chain` arms taken (chain-extender pool
-    /// submissions). At conc=256 with chain ext active, this equals
-    /// the batch size every fire.
-    pub chain_count: AtomicU64,
     /// Number of `Completion::Chunk` arms taken (chunked-retry
     /// continuations). Rare in the hot path.
     pub chunk_count: AtomicU64,

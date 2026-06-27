@@ -14,7 +14,9 @@ from abc import abstractmethod
 import weakref
 
 from componentize_py_types import Result, Ok, Err, Some
-
+import componentize_py_async_support
+from componentize_py_async_support.streams import StreamReader, StreamWriter, ByteStreamReader, ByteStreamWriter
+from componentize_py_async_support.futures import FutureReader, FutureWriter
 
 
 def get_insecure_random_bytes(len: int) -> bytes:

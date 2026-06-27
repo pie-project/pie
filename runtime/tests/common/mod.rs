@@ -6,7 +6,5 @@
 mod env;
 pub mod inferlets;
 pub mod mock_device;
-#[allow(dead_code)]
-pub mod rs_cache_fixture;
 
 pub use env::{MockEnv, create_mock_env};

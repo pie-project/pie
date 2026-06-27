@@ -1,20 +1,90 @@
 interface inference {
 
     use types.{error};
-    use context.{context};
     use adapter.{adapter};
-    use context.{page-id};
     use media.{image, audio};
+    use working-set.{kv-working-set, rs-working-set};
 
     // binary run-length encoding
     type brle = list<u32>;
 
+    // ── Forward-pass memory contract (explicit read/write descriptors) ──────
+    // A forward pass READS the pages/tokens designated as *context* and WRITES
+    // only the indices/ranges designated as *output*. There is no ambient
+    // context handle and no implicit append. Output indices/ranges must be
+    // unique per pass; output may overlap context only when it is also
+    // declared as output. The runtime CoWs every write target before driver
+    // submission; on driver failure the output objects are left invalid /
+    // private and are NOT CAS-sealed.
+
+    // KV pages this pass reads as attention context: the half-open relative
+    // span [start, start + len) of `set`, of which the first `valid-tokens`
+    // tokens participate in attention (trailing reserved slots may be empty).
+    record kv-context {
+        set: borrow<kv-working-set>,
+        start: u32,
+        len: u32,
+        valid-tokens: u32,
+    }
+
+    // KV pages this pass writes: the relative `indices` of `set` that receive
+    // freshly computed KV, with `per-page-valid-lens[i]` valid tokens written
+    // into page `indices[i]` (the two lists are parallel). Indices must be
+    // unique. `generation` is the value the caller read from
+    // `set.generation()` when it captured `indices`; if `set` has since been
+    // structurally mutated (alloc/free/reorder/append) the runtime rejects the
+    // pass with a clean stale-generation error instead of writing stale slots.
+    record kv-output {
+        set: borrow<kv-working-set>,
+        generation: u32,
+        indices: list<u32>,
+        per-page-valid-lens: list<u32>,
+    }
+
+    // Buffered recurrent state this pass reads: `len-tokens` tokens starting at
+    // buffered token offset `start-token` of `set`.
+    record rs-buffer-context {
+        set: borrow<rs-working-set>,
+        start-token: u32,
+        len-tokens: u32,
+    }
+
+    // Buffered recurrent state this pass writes: `len-tokens` tokens starting
+    // at `start-token` of `set`. Writing buffered RS does NOT fold it; folding
+    // is the separate `fold` operation.
+    record rs-buffer-output {
+        set: borrow<rs-working-set>,
+        start-token: u32,
+        len-tokens: u32,
+    }
+
     resource forward-pass {
         constructor();
 
-        context: func(
-            context: borrow<context>,
-        );
+        // KV attention context this pass reads. Replaces the old opaque
+        // `context` handle. For hybrid models, combine with `rs-context`.
+        kv-context: func(ctx: kv-context);
+
+        // KV pages this pass writes.
+        kv-output: func(out: kv-output);
+
+        // Buffered recurrent state this pass reads (hybrid / linear-attention).
+        rs-context: func(ctx: rs-buffer-context);
+
+        // Buffered recurrent state this pass writes.
+        rs-output: func(out: rs-buffer-output);
+
+        // Fold the first `tokens` buffered recurrent-state tokens of this
+        // pass's RS working set into its folded state AS PART OF this forward
+        // — piggybacking on the in-forward fold the driver already does (e.g.
+        // cuda GDN commit-advance), not a separate op. Rides the pass's atomic
+        // txn + submit. `tokens` counts buffered tokens and must be a positive
+        // multiple of the model's fold granularity (`model.rs-fold-granularity`)
+        // and within the buffered suffix; the runtime rejects an invalid count
+        // before submission. No rollback across a fold — fork the RS working
+        // set first if you may need to revert. A pass may write buffered RS
+        // (`rs-output`) without folding; folding is opt-in via this call.
+        fold-buffered: func(tokens: u32);
 
         input-tokens: func(
             tokens: list<u32>,

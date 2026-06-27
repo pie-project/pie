@@ -118,7 +118,6 @@ pub fn create_mock_env(
             scheduler: SchedulerConfig {
                 request_timeout_secs: 30,
                 restore_pause_at_utilization: 0.85,
-                speculation_depth: 1,
             },
         },
         runtime: RuntimeConfig {

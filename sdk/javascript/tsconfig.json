@@ -19,8 +19,8 @@
       "pie:core/model": [
         "./src/bindings/interfaces/pie-core-model.js"
       ],
-      "pie:core/context": [
-        "./src/bindings/interfaces/pie-core-context.js"
+      "pie:core/working-set": [
+        "./src/bindings/interfaces/pie-core-working-set.js"
       ],
       "pie:core/inference": [
         "./src/bindings/interfaces/pie-core-inference.js"
@@ -36,9 +36,6 @@
       ],
       "pie:core/adapter": [
         "./src/bindings/interfaces/pie-core-adapter.js"
-      ],
-      "pie:core/scheduling": [
-        "./src/bindings/interfaces/pie-core-scheduling.js"
       ],
       "pie:core/types": [
         "./src/bindings/interfaces/pie-core-types.js"
@@ -57,6 +54,12 @@
       ],
       "wasi:io/poll@0.2.4": [
         "./src/bindings/interfaces/wasi-io-poll.js"
+      ],
+      "wasi:filesystem/preopens@0.2.4": [
+        "./src/bindings/interfaces/wasi-filesystem-preopens.js"
+      ],
+      "wasi:filesystem/types@0.2.4": [
+        "./src/bindings/interfaces/wasi-filesystem-types.js"
       ]
     }
   },

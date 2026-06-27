@@ -21,6 +21,7 @@ pub fn register(
     name: String,
     arch_name: &str,
     kv_page_size: u32,
+    rs: RsCaps,
     tokenizer_path: PathBuf,
     system_speculation_supported: bool,
     enable_system_speculation: bool,
@@ -33,6 +34,7 @@ pub fn register(
         arch_name: arch_name.to_string(),
         instruct,
         kv_page_size,
+        rs_caps: rs,
         tokenizer,
         system_speculation_supported,
         enable_system_speculation,
@@ -62,9 +64,27 @@ pub struct Model {
     arch_name: String,
     instruct: Arc<dyn Instruct>,
     kv_page_size: u32,
+    /// Recurrent-state (working-set) capabilities surfaced via model.wit
+    /// (`rs-state-size`/`rs-buffer-page-size`/`rs-fold-granularity`). All
+    /// 0/0/1 for pure-attention models.
+    rs_caps: RsCaps,
     tokenizer: Arc<Tokenizer>,
     system_speculation_supported: bool,
     enable_system_speculation: bool,
+}
+
+/// RS (recurrent-state) working-set capabilities surfaced to inferlets via
+/// `model.wit`. Sourced from the driver handshake `DriverCapabilities` at
+/// registration (`rs_cache_slot_bytes` etc.). All 0/0/1 for pure-attention
+/// models (no folded recurrent state).
+#[derive(Debug, Clone, Copy)]
+pub struct RsCaps {
+    /// Bytes of one folded recurrent-state object (`rs-state-size`).
+    pub state_size: u64,
+    /// Tokens per buffered RS page (`rs-buffer-page-size`; v1 = kv_page_size).
+    pub buffer_page_size: u32,
+    /// Fold granularity in tokens (`rs-fold-granularity`; 1 = token-causal).
+    pub fold_granularity: u32,
 }
 
 impl std::fmt::Debug for Model {
@@ -131,6 +151,12 @@ impl Model {
     /// Gets the KV page size.
     pub fn kv_page_size(&self) -> u32 {
         self.kv_page_size
+    }
+
+    /// RS working-set capabilities (`rs-state-size`/`rs-buffer-page-size`/
+    /// `rs-fold-granularity`). 0/0/1 for pure-attention models.
+    pub fn rs_caps(&self) -> RsCaps {
+        self.rs_caps
     }
 
     /// Whether the driver wired a system drafter for this model (capability).

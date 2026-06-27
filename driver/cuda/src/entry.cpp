@@ -646,6 +646,20 @@ int run_impl(int argc,
             const int stash_width = conv_dim + 2 * local_linear_value_heads;
             qwen3_5_state_cache.configure_verify_hidden_stash(
                 max_workspace_tokens, stash_width);
+            // Ph7 RS working-set fold-from-buffer: persistent slot-indexed
+            // buffered-activation pool. Same per-token [mixed_qkv|a|b] layout +
+            // width as the verify stash (so the fold replay's gather works), but
+            // PERSISTENT and slot-indexed. Sized to q35_alloc_slots: folded +
+            // buffered slabs draw distinct ids from one shared rs_gpu BlockPool
+            // (0..rs_blocks), so a buffered slab id can be anywhere in range.
+            // page_tokens = KV page size (rs-buffer-page-size == kv_page_size v1).
+            qwen3_5_state_cache.configure_rs_buffer_pool(
+                mem_plan.kv_page_size, stash_width, q35_alloc_slots);
+            if (verbose) {
+                std::cerr << "[pie-driver-cuda] qwen3.5 rs_buffer_pool: page_tokens="
+                          << mem_plan.kv_page_size << " width=" << stash_width
+                          << " slots=" << q35_alloc_slots << "\n";
+            }
         }
         const std::size_t recurrent_elem_bytes =
             pie_cuda_driver::RecurrentStateCache::recurrent_state_bf16_default()

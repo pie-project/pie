@@ -255,7 +255,7 @@ async fn run_resumed(model_name: &str, input: &Input) -> Result<ModeResult> {
         RESET,
         oneline(&input.turn2)
     );
-    let mut ctx2 = Context::open(&input.snapshot)?;
+    let mut ctx2 = Context::open(&input.snapshot).await?;
     let pre_open_seq = ctx2.seq_len();
     ctx2.user(&format!("{} /no_think", input.turn2.trim()));
     ctx2.cue();
@@ -329,7 +329,7 @@ async fn run_open_turn2(model_name: &str, input: &Input) -> Result<()> {
     );
 
     println!("  {}opening snapshot {:?}{}", DIM, input.snapshot, RESET);
-    let mut ctx = Context::open(&input.snapshot)?;
+    let mut ctx = Context::open(&input.snapshot).await?;
     let pre_open_seq = ctx.seq_len();
     println!(
         "  {}{}turn 2{}  user: {}",

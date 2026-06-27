@@ -7,8 +7,8 @@ use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 
 use crate::adapter;
+use crate::arena;
 use crate::auth;
-use crate::context;
 use crate::driver;
 use crate::inference;
 use crate::linker;
@@ -128,12 +128,6 @@ pub struct SchedulerConfig {
     /// contexts when any driver's GPU page utilization exceeds this fraction.
     /// Prevents the evict→restore→re-evict thrash cascade. Range: (0.0, 1.0].
     pub restore_pause_at_utilization: f64,
-    /// Per-context depth of pass-level speculative execution.
-    /// `0` disables speculation entirely; every submit goes
-    /// through the cold path. `1` is piggyback (one staged pass
-    /// per real pass); higher values let chain firing overlap
-    /// with the inferlet's WASM time. Range: 0..=64.
-    pub speculation_depth: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -209,10 +203,22 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
     process::init_admission(config.max_concurrent_processes);
 
     let cfg = &config.model;
+    // RS working-set caps from the driver handshake (uniform across a model's
+    // drivers → take [0]). bravo-authored bootstrap bundle.
+    let rs_caps = {
+        let d0 = cfg.drivers.first();
+        let is_rs = d0.map(|d| d.rs_cache_slots > 0).unwrap_or(false);
+        model::RsCaps {
+            state_size: d0.map(|d| d.rs_cache_slot_bytes).unwrap_or(0),
+            buffer_page_size: if is_rs { cfg.kv_page_size as u32 } else { 0 },
+            fold_granularity: 1, // token-causal; 0-RS models never read it
+        }
+    };
     model::register(
         cfg.name.clone(),
         &cfg.arch_name,
         cfg.kv_page_size as u32,
+        rs_caps,
         cfg.tokenizer_path.clone(),
         cfg.system_speculation_supported,
         cfg.enable_system_speculation,
@@ -229,29 +235,33 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
         })
         .collect();
 
-    let num_gpu_pages: Vec<usize> = cfg.drivers.iter().map(|d| d.total_pages).collect();
-    let num_cpu_pages: Vec<usize> = cfg.drivers.iter().map(|d| d.cpu_pages).collect();
-    let num_rs_slots: Vec<usize> = cfg.drivers.iter().map(|d| d.rs_cache_slots).collect();
-    let rs_cache_spec_rollback: Vec<bool> = cfg
-        .drivers
-        .iter()
-        .map(|d| d.rs_cache_spec_rollback)
-        .collect();
-    let speculation_depth = cfg.scheduler.speculation_depth;
-
-    context::spawn(
+    // Register this model's per-driver unified arenas in the standalone
+    // registry. Capacities are read straight from `cfg.drivers[]`. The registry
+    // is independent of the (removed) context actor and is where KV/RS working
+    // sets + the forward `execute()` prepare lock `arena::registry::get(...)`.
+    let arena_kv_pages: Vec<usize> = cfg.drivers.iter().map(|d| d.total_pages).collect();
+    let arena_cpu_pages: Vec<usize> = cfg.drivers.iter().map(|d| d.cpu_pages).collect();
+    let arena_rs_slots: Vec<usize> = cfg.drivers.iter().map(|d| d.rs_cache_slots).collect();
+    let arena_model_idx = arena::registry::register_model(
         cfg.kv_page_size,
-        num_gpu_pages,
-        num_cpu_pages,
-        num_rs_slots,
-        rs_cache_spec_rollback,
-        cfg.scheduler.restore_pause_at_utilization,
+        &arena_kv_pages,
+        &arena_cpu_pages,
+        &arena_rs_slots,
     );
+    // KvCas sibling registry: one content-addressed sharing index per driver,
+    // pushed in lock-step with the arena registry so `kv_cas::get` aligns.
+    let kv_cas_model_idx = crate::working_set::kv_cas::register_cas(cfg.drivers.len());
+    debug_assert_eq!(
+        kv_cas_model_idx, arena_model_idx,
+        "kv_cas registry desynced from arena/model index"
+    );
+
+    // (Context actor `context::spawn` removed — Phase 5. The unified arena
+    // registry above is the per-model/driver physical home now.)
     inference::spawn(
         &drivers,
         cfg.kv_page_size as u32,
         cfg.scheduler.request_timeout_secs,
-        speculation_depth,
     )
     .await;
     adapter::spawn(&drivers);

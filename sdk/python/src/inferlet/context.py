@@ -1,29 +1,30 @@
 """
-Context — host-managed conversation state.
+Context — SDK-owned facade over the runtime KV working set.
 
-Wraps ``pie:core/context``. Buffers tokens via ``system / user /
-assistant / cue / seal / append``, drains via ``flush()`` or by handing
-the buffer to a :class:`Forward` / :class:`Generator`.
+The runtime's opaque context resource has been replaced by an inferlet-owned
+``kv-working-set`` plus explicit forward-pass read/write descriptors.  This
+class owns the semantic metadata (buffer, token positions, sequence length, and
+replay history) and mirrors the Rust SDK facade.
 
-Usage::
-
-    ctx = Context()
-    ctx.system("You are helpful.")
-    ctx.user("Tell me a joke.")
-
-    # Auto-flushed by `generate(...)` — Python convention.
-    text = await ctx.generate(Sampler.top_p(0.6, 0.95), max_tokens=256).collect_text()
+Single-model runtime: the working set binds to the one bound model implicitly
+(``KvWorkingSet()`` takes no handle) and model metadata is reached through the
+global ``wit_world.imports.model`` / ``chat`` functions.
 """
 
 from __future__ import annotations
 
+import json
+import os
 from typing import TYPE_CHECKING, Iterable
 
-from wit_world.imports import context as _ctx
+from wit_world.imports import chat as _wit_chat
 from wit_world.imports import inference as _inf
+from wit_world.imports import media as _media
+from wit_world.imports import model as _model
+from wit_world.imports import runtime as _runtime
+from wit_world.imports import working_set as _ws
 
 from . import chat as _chat
-from ._async import await_future
 from .forward import Forward
 from .generation import Generator
 from .grammar import Constraint, Schema
@@ -34,94 +35,73 @@ if TYPE_CHECKING:
     from .spec import Speculator
 
 
-# =============================================================================
-# Context
-# =============================================================================
+_SNAPSHOT_VERSION = 1
+_SNAPSHOT_COUNTER = 0
+
+
+def _snapshot_path(name: str) -> str:
+    # The runtime preopens the per-instance scratch dir as `/scratch` in the
+    # guest; a relative path has no matching preopen, so blobs go there.
+    return f"/scratch/{name}.pie-snapshot"
+
+
+def _read_manifest(name: str) -> dict:
+    with open(_snapshot_path(name), encoding="utf-8") as f:
+        manifest = json.load(f)
+    version = manifest.get("version")
+    if version != _SNAPSHOT_VERSION:
+        raise RuntimeError(
+            f"snapshot '{name}': version {version} unsupported "
+            f"(expected {_SNAPSHOT_VERSION})"
+        )
+    return manifest
+
+
+def _ceil_div(n: int, d: int) -> int:
+    return (n + d - 1) // d
 
 
 class Context:
-    """Host-managed conversation context.
-
-    Construct it, fill via chat methods (or :meth:`append`), then
-    either drain explicitly with :meth:`flush` or let :meth:`generate`
-    / :meth:`forward` drain on demand.
-    """
+    """High-level inference context backed by a KV working set."""
 
     __slots__ = (
-        "_handle",
-        "_pending_tokens",
+        "_kv",
         "_page_size",
+        "_buffer",
+        "_pending_system",
         "_seq_len",
-        "_committed_pages",
-        "_working_pages",
-        "_working_tokens",
+        "_history",
+        "_snapshottable",
     )
 
     # ── Construction / lifecycle ──────────────────────────────────────
 
     def __init__(self) -> None:
-        self._handle = _ctx.Context.create()
-        self._pending_tokens: list[int] = []
-        self._sync_from_host()
-
-    def _sync_from_host(self) -> None:
-        self._page_size = self._handle.tokens_per_page()
-        self._committed_pages = self._handle.committed_page_count()
-        self._working_pages = self._handle.working_page_count()
-        self._working_tokens = self._handle.working_page_token_count()
-        self._seq_len = (
-            self._committed_pages * self._page_size + self._working_tokens
-        )
-
-    @classmethod
-    def open(cls, name: str) -> Context | None:
-        """Open a saved snapshot (implicit fork — snapshot stays immutable)."""
-        raw = _ctx.Context.open(name)
-        if raw is None:
-            return None
-        obj = object.__new__(cls)
-        obj._handle = raw
-        obj._pending_tokens = []
-        obj._sync_from_host()
-        return obj
-
-    @classmethod
-    def take(cls, name: str) -> Context | None:
-        """Take ownership of a snapshot (snapshot is deleted)."""
-        raw = _ctx.Context.take(name)
-        if raw is None:
-            return None
-        obj = object.__new__(cls)
-        obj._handle = raw
-        obj._pending_tokens = []
-        obj._sync_from_host()
-        return obj
-
-    @staticmethod
-    def delete(name: str) -> None:
-        """Delete a saved snapshot by name."""
-        _ctx.Context.delete(name)
+        kv = _ws.KvWorkingSet()
+        self._kv = kv
+        self._page_size = kv.page_size()
+        self._buffer: list[int] = []
+        self._pending_system: str | None = None
+        self._seq_len = 0
+        self._history: list[int] = []
+        self._snapshottable = True
 
     def fork(self) -> Context:
-        """Fork into a new anonymous context (working pages copied)."""
-        raw = self._handle.fork()
+        """Fork into a new anonymous context sharing KV pages by CoW."""
+        kv = self._kv.fork()
         obj = object.__new__(Context)
-        obj._handle = raw
-        obj._pending_tokens = list(self._pending_tokens)
-        obj._sync_from_host()
+        obj._kv = kv
+        obj._page_size = self._page_size
+        obj._buffer = list(self._buffer)
+        obj._pending_system = self._pending_system
+        obj._seq_len = self._seq_len
+        obj._history = list(self._history)
+        obj._snapshottable = self._snapshottable
         return obj
 
-    def save(self, name: str) -> None:
-        """Save this context with a name."""
-        self._handle.save(name)
-
-    def snapshot(self) -> str:
-        """Anonymous save — returns a runtime-generated name."""
-        return self._handle.snapshot()
-
     def release(self) -> None:
-        """Force-destroy this context immediately."""
-        self._handle.destroy()
+        """Force-release this context's working set handle."""
+        self._kv.__exit__(None, None, None)
 
     def __enter__(self) -> Context:
         return self
@@ -130,7 +110,71 @@ class Context:
         self.release()
 
     def __repr__(self) -> str:
-        return f"Context({id(self._handle):#x})"
+        return f"Context({id(self._kv):#x})"
+
+    # ── Snapshots ─────────────────────────────────────────────────────
+
+    def save(self, name: str) -> None:
+        """Save this context as a replayable CPU-resident snapshot."""
+        if not self._snapshottable:
+            raise RuntimeError(
+                "Context.save: multimodal contexts are not snapshottable in v1 "
+                "(soft-token KV cannot be replayed from a token log)"
+            )
+        manifest = {
+            "version": _SNAPSHOT_VERSION,
+            "page_size": self._page_size,
+            "seq_len": self._seq_len,
+            "tokens": list(self._history),
+            "buffer": list(self._buffer),
+            "pending_system": self._pending_system,
+            "cas_hashes": [],
+        }
+        with open(_snapshot_path(name), "w", encoding="utf-8") as f:
+            json.dump(manifest, f)
+
+    def snapshot(self) -> str:
+        """Anonymous save — returns a freshly-generated snapshot name."""
+        global _SNAPSHOT_COUNTER
+        name = f"anon-{_runtime.instance_id()}-{_SNAPSHOT_COUNTER}"
+        _SNAPSHOT_COUNTER += 1
+        self.save(name)
+        return name
+
+    @classmethod
+    async def open(cls, name: str) -> Context:
+        """Open a saved snapshot, replaying its token log into a fresh set."""
+        manifest = _read_manifest(name)
+        return await cls._from_manifest(manifest)
+
+    @classmethod
+    async def take(cls, name: str) -> Context:
+        """Open a saved snapshot and then best-effort delete it."""
+        ctx = await cls.open(name)
+        try:
+            os.remove(_snapshot_path(name))
+        except OSError:
+            pass
+        return ctx
+
+    @staticmethod
+    def delete(name: str) -> None:
+        """Delete a saved snapshot by name. Missing snapshots are ignored."""
+        try:
+            os.remove(_snapshot_path(name))
+        except OSError:
+            pass
+
+    @classmethod
+    async def _from_manifest(cls, manifest: dict) -> Context:
+        ctx = cls()
+        tokens = list(manifest.get("tokens", []))
+        if tokens:
+            ctx._buffer = tokens
+            await ctx.flush()
+        ctx._buffer = list(manifest.get("buffer", []))
+        ctx._pending_system = manifest.get("pending_system")
+        return ctx
 
     # ── Accessors ────────────────────────────────────────────────────
 
@@ -140,105 +184,223 @@ class Context:
 
     @property
     def seq_len(self) -> int:
-        """Total committed + working tokens (excludes the buffer)."""
+        """Total materialized tokens (excludes the buffer)."""
         return self._seq_len
 
     def buffer(self) -> list[int]:
         """Pending (buffered but not yet flushed) tokens."""
-        return list(self._pending_tokens)
+        return list(self._buffer)
+
+    def working_set(self) -> "_ws.KvWorkingSet":
+        """Escape hatch: the underlying KV working set (power users)."""
+        return self._kv
 
     # ── Chat fillers ─────────────────────────────────────────────────
-    #
-    # All return self for chaining: ctx.system("...").user("...")
+
+    def _flush_pending_system(self) -> None:
+        if self._pending_system is not None:
+            self._buffer.extend(_chat.system(self._pending_system))
+            self._pending_system = None
+
+    def _is_first_chat_fill(self) -> bool:
+        return self._seq_len == 0 and not self._buffer
 
     def system(self, message: str) -> Context:
         """Fill a system-role message."""
-        self._pending_tokens.extend(_chat.system(message))
+        self._flush_pending_system()
+        self._pending_system = message
         return self
 
     def user(self, message: str) -> Context:
         """Fill a user-role message."""
-        self._pending_tokens.extend(_chat.user(message))
+        if self._pending_system is not None:
+            tokens = list(_wit_chat.system_user(self._pending_system, message))
+            self._pending_system = None
+        elif self._is_first_chat_fill():
+            tokens = list(_wit_chat.first_user(message))
+        else:
+            tokens = _chat.user(message)
+        self._buffer.extend(tokens)
         return self
 
     def assistant(self, message: str) -> Context:
         """Fill an assistant-role message (history replay)."""
-        self._pending_tokens.extend(_chat.assistant(message))
+        self._flush_pending_system()
+        self._buffer.extend(_chat.assistant(message))
         return self
 
     def cue(self) -> Context:
         """Cue the model to generate (fills the generation header)."""
-        self._pending_tokens.extend(_chat.cue())
+        self._flush_pending_system()
+        self._buffer.extend(_chat.cue())
         return self
 
     def seal(self) -> Context:
         """Seal the current turn (insert stop token)."""
-        self._pending_tokens.extend(_chat.seal())
+        self._flush_pending_system()
+        self._buffer.extend(_chat.seal())
         return self
 
     def append(self, tokens: Iterable[int]) -> Context:
         """Append raw tokens to the buffer directly."""
-        self._pending_tokens.extend(tokens)
+        self._flush_pending_system()
+        self._buffer.extend(tokens)
         return self
 
-    # ── Flush / truncate ─────────────────────────────────────────────
-
-    async def flush(self) -> None:
-        """Drain buffered tokens through a forward pass and commit pages.
-
-        After flush, the buffer is empty and ``seq_len`` reflects all
-        consumed tokens.
-        """
-        if not self._pending_tokens:
-            return
-        tokens = self._pending_tokens
-        self._pending_tokens = []
-        n = len(tokens)
-
-        # Reserve pages.
-        total_after = self._working_tokens + n
-        pages_needed = (total_after + self._page_size - 1) // self._page_size
-        additional = max(0, pages_needed - self._working_pages)
-        if additional > 0:
-            self._handle.reserve_working_pages(additional)
-            self._working_pages = pages_needed
-
-        # Forward pass without sampler — just write to KV.
-        fwd = _inf.ForwardPass()
-        fwd.context(self._handle)
-        positions = list(range(self._seq_len, self._seq_len + n))
-        fwd.input_tokens(tokens, positions)
-        await await_future(fwd.execute(), "Context.flush failed")
-
-        # Commit full pages.
-        new_working = self._working_tokens + n
-        to_commit = new_working // self._page_size
-        if to_commit > 0:
-            self._handle.commit_working_pages(to_commit)
-        self._committed_pages += to_commit
-        self._working_pages -= to_commit
-        self._working_tokens = new_working % self._page_size
-        self._seq_len += n
+    # ── Sequence / page bookkeeping ──────────────────────────────────
 
     def truncate(self, n: int) -> None:
-        """Drop the trailing ``n`` working-page tokens. Use after a
-        speculative-decoding pass to roll back the rejected suffix.
-
-        ``n`` counts only working-page tokens — pages already committed
-        cannot be truncated through this API.
-        """
+        """Drop the trailing ``n`` materialized tokens and free empty slots."""
+        n = min(max(n, 0), self._seq_len)
         if n == 0:
             return
-        self._handle.truncate_working_page_tokens(n)
-        self._sync_from_host()
+        self._seq_len -= n
+        keep = max(0, len(self._history) - n)
+        del self._history[keep:]
+
+        live_pages = _ceil_div(self._seq_len, self._page_size)
+        have = self._kv.size()
+        if have > live_pages:
+            try:
+                self._kv.free(list(range(live_pages, have)))
+            except Exception:
+                pass
+
+    def _prepare_write(self, n: int) -> tuple[int, list[int], list[int], int]:
+        p = self._page_size
+        first_write_page = self._seq_len // p
+        total_after = self._seq_len + n
+        total_pages = _ceil_div(total_after, p)
+        have = self._kv.size()
+        if total_pages > have:
+            self._kv.alloc(total_pages - have)
+        generation = self._kv.generation()
+        indices = list(range(first_write_page, total_pages))
+        valid_lens = [min(total_after - pg * p, p) for pg in indices]
+        return generation, indices, valid_lens, first_write_page
+
+    def _attach_kv(
+        self,
+        fwd: _inf.ForwardPass,
+        generation: int,
+        indices: list[int],
+        valid_lens: list[int],
+        ctx_pages: int,
+    ) -> None:
+        if ctx_pages > 0:
+            fwd.kv_context(
+                _inf.KvContext(
+                    set=self._kv,
+                    start=0,
+                    len=ctx_pages,
+                    valid_tokens=ctx_pages * self._page_size,
+                )
+            )
+        fwd.kv_output(
+            _inf.KvOutput(
+                set=self._kv,
+                generation=generation,
+                indices=indices,
+                per_page_valid_lens=valid_lens,
+            )
+        )
+
+    def _attach_full_context(self, fwd: _inf.ForwardPass) -> None:
+        ctx_pages = _ceil_div(self._seq_len, self._page_size)
+        if ctx_pages > 0:
+            fwd.kv_context(
+                _inf.KvContext(
+                    set=self._kv,
+                    start=0,
+                    len=ctx_pages,
+                    valid_tokens=self._seq_len,
+                )
+            )
+
+    # ── Flush / multimodal append ────────────────────────────────────
+
+    async def flush(self) -> None:
+        """Drain buffered tokens through a forward pass into KV slots."""
+        self._flush_pending_system()
+        if not self._buffer:
+            return
+        tokens = self._buffer
+        self._buffer = []
+        n = len(tokens)
+        positions = list(range(self._seq_len, self._seq_len + n))
+        generation, indices, valid_lens, ctx_pages = self._prepare_write(n)
+
+        fwd = _inf.ForwardPass()
+        self._attach_kv(fwd, generation, indices, valid_lens, ctx_pages)
+        fwd.input_tokens(tokens, positions)
+        await fwd.execute()
+
+        self._history.extend(tokens)
+        self._seq_len += n
+
+    async def append_image(self, image: _media.Image) -> None:
+        """Splice an encoded image/video frame into the context."""
+        prefix = list(image.prefix_tokens())
+        suffix = list(image.suffix_tokens())
+        if prefix:
+            self.append(prefix)
+        await self.flush()
+
+        num_tokens = image.token_count()
+        if num_tokens == 0:
+            if suffix:
+                self.append(suffix)
+            return
+
+        generation, indices, valid_lens, ctx_pages = self._prepare_write(num_tokens)
+        fwd = _inf.ForwardPass()
+        self._attach_kv(fwd, generation, indices, valid_lens, ctx_pages)
+        fwd.input_image(image, self._seq_len)
+        await fwd.execute()
+
+        self._seq_len += num_tokens
+        self._snapshottable = False
+        if suffix:
+            self.append(suffix)
+
+    async def append_audio(self, audio: _media.Audio) -> None:
+        """Splice an encoded audio clip into the context."""
+        prefix = list(audio.prefix_tokens())
+        suffix = list(audio.suffix_tokens())
+        if prefix:
+            self.append(prefix)
+        await self.flush()
+
+        num_tokens = audio.token_count()
+        if num_tokens == 0:
+            if suffix:
+                self.append(suffix)
+            return
+
+        generation, indices, valid_lens, ctx_pages = self._prepare_write(num_tokens)
+        fwd = _inf.ForwardPass()
+        self._attach_kv(fwd, generation, indices, valid_lens, ctx_pages)
+        fwd.input_audio(audio, self._seq_len)
+        await fwd.execute()
+
+        self._seq_len += num_tokens
+        self._snapshottable = False
+        if suffix:
+            self.append(suffix)
+
+    async def append_video(self, video: _media.Video) -> None:
+        """Splice a decoded video clip into the context frame-by-frame."""
+        for i in range(video.frame_count()):
+            secs = max(video.timestamp(i), 0.0)
+            marker = f" {int(secs) // 60:02}:{int(secs) % 60:02} "
+            self.append(_model.encode(marker))
+            await self.append_image(video.frame(i))
 
     # ── Forward (single forward-pass primitive) ──────────────────────
 
     def forward(self) -> Forward:
-        """Build a single :class:`Forward` — a forward pass with auto
-        page reservation, position derivation, and post-execute commit.
-        Use for prefill, scoring, custom decode loops, and anywhere the
-        :meth:`generate` loop is too high-level."""
+        """Build a single :class:`Forward` pass."""
+        self._flush_pending_system()
         return Forward(self)
 
     # ── Generate (multi-step loop) ───────────────────────────────────
@@ -258,37 +420,7 @@ class Context:
         horizon: int | None = None,
         auto_flush: bool = True,
     ) -> Generator:
-        """Build a :class:`Generator` for token generation.
-
-        **Auto-flush**: when ``auto_flush=True`` (default), this method
-        appends ``cue()`` tokens to the buffer before returning the
-        Generator. The first ``execute()`` call drains the buffer
-        through a forward pass — no separate flush call needed. Pass
-        ``auto_flush=False`` to inspect the buffer before generation
-        starts (or call ``cue()`` yourself).
-
-        Args:
-            sampler: Token-producing sampler.
-            max_tokens: Hard cap on tokens generated.
-            stop: Stop tokens. Defaults to chat template's stop tokens
-                if ``auto_flush=True``; otherwise empty.
-            constrain: A :class:`Schema` (compiled to a stateful
-                grammar matcher), a :class:`Constraint`, or a list of
-                either. Multiple constraints compose by AND-ing their
-                per-step BRLE masks.
-            logit_mask: Static BRLE mask applied every step. Composes
-                with ``constrain`` like any other constraint.
-            speculator: Custom speculative-decoding drafter implementing
-                the :class:`Speculator` protocol.
-            system_speculation: If True, the runtime drives drafts via
-                its built-in system drafter. If omitted, argmax generation
-                enables it by default when the model advertises one.
-                Mutually exclusive with ``speculator``.
-            adapter: Adapter to apply on every forward pass.
-            zo_seed: Evolution Strategies seed for every forward pass.
-            horizon: Expected output length for budget planning.
-            auto_flush: Append ``cue()`` and use chat stop tokens by default.
-        """
+        """Build a :class:`Generator` for token generation."""
         if auto_flush:
             self.cue()
             if stop is None:

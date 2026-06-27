@@ -9,6 +9,9 @@ import weakref
 
 from componentize_py_types import Result, Ok, Err, Some
 from ..imports import inference
+import componentize_py_async_support
+from componentize_py_async_support.streams import StreamReader, StreamWriter, ByteStreamReader, ByteStreamWriter
+from componentize_py_async_support.futures import FutureReader, FutureWriter
 
 
 @dataclass
@@ -28,7 +31,7 @@ class Decoder:
     
     def feed(self, tokens: List[int]) -> Event:
         """
-        Raises: `wit_world.types.Err(wit_world.imports.str)`
+        Raises: `componentize_py_types.Err(wit_world.imports.str)`
         """
         raise NotImplementedError
     def reset(self) -> None:
@@ -49,7 +52,7 @@ def equip(tools: List[str]) -> List[int]:
     """
     Register available tools (list of JSON schema strings)
     
-    Raises: `wit_world.types.Err(wit_world.imports.str)`
+    Raises: `componentize_py_types.Err(wit_world.imports.str)`
     """
     raise NotImplementedError
 def answer(name: str, value: str) -> List[int]:

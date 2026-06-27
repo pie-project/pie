@@ -1866,7 +1866,7 @@ async fn main(input: Input) -> Result<String> {
                     .latest
                     .take()
                     .ok_or_else(|| "trap classified Recompute without checkpoint".to_string())?;
-                match Context::open(&cp.name) {
+                match Context::open(&cp.name).await {
                     Ok(mut restored) => {
                         let _ = Context::delete(&cp.name);
                         restored.append(&cp.buffer_tokens);

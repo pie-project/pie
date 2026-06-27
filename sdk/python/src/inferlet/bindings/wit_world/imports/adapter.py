@@ -8,14 +8,16 @@ from abc import abstractmethod
 import weakref
 
 from componentize_py_types import Result, Ok, Err, Some
-
+import componentize_py_async_support
+from componentize_py_async_support.streams import StreamReader, StreamWriter, ByteStreamReader, ByteStreamWriter
+from componentize_py_async_support.futures import FutureReader, FutureWriter
 
 class Adapter:
     
     @classmethod
     def create(cls, name: str) -> Self:
         """
-        Raises: `wit_world.types.Err(wit_world.imports.str)`
+        Raises: `componentize_py_types.Err(wit_world.imports.str)`
         """
         raise NotImplementedError
     def destroy(self) -> None:
@@ -27,12 +29,12 @@ class Adapter:
         raise NotImplementedError
     def load(self, path: str) -> None:
         """
-        Raises: `wit_world.types.Err(wit_world.imports.str)`
+        Raises: `componentize_py_types.Err(wit_world.imports.str)`
         """
         raise NotImplementedError
     def save(self, path: str) -> None:
         """
-        Raises: `wit_world.types.Err(wit_world.imports.str)`
+        Raises: `componentize_py_types.Err(wit_world.imports.str)`
         """
         raise NotImplementedError
     def __enter__(self) -> Self:

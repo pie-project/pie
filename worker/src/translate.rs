@@ -146,7 +146,6 @@ fn build_model(m: &config::ModelConfig, hs: &ModelHandshake) -> pie::bootstrap::
         scheduler: pie::bootstrap::SchedulerConfig {
             request_timeout_secs: m.scheduler.request_timeout_secs,
             restore_pause_at_utilization: m.scheduler.restore_pause_at_utilization,
-            speculation_depth: m.scheduler.speculation_depth,
         },
     }
 }

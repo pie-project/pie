@@ -42,8 +42,14 @@ pub use pie::zo;
 mod context;
 
 pub use context::{
-    AnyJson, Constrain, Context, Ebnf, GrammarConstraint, JsonSchema, RawContext, Regex, Schema,
+    AnyJson, Constrain, Context, Ebnf, GrammarConstraint, JsonSchema, Regex, Schema,
 };
+
+/// The runtime working-set resources (KV page-slot array + recurrent state).
+/// Most inferlets use the [`Context`] facade; reach here for direct control.
+pub mod working_set {
+    pub use crate::pie::core::working_set::*;
+}
 
 // =============================================================================
 // Sampler / Probe + Forward primitive
@@ -110,7 +116,6 @@ pub async fn sleep(duration: std::time::Duration) {
     let nanos = duration.as_nanos().min(u64::MAX as u128) as u64;
     crate::pie::core::runtime::sleep(nanos).await;
 }
-
 pub mod messaging {
     pub use crate::pie::core::messaging::*;
 }

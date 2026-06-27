@@ -21,6 +21,8 @@ def main() -> int:
     sdk_root = project_root.parent
     pie_root = sdk_root.parent
 
+    # WIT was relocated from runtime/wit to interface/inferlet (the canonical
+    # inferlet world package, with its vendored deps/).
     wit_path = pie_root / "interface" / "inferlet"
     output_path = project_root / "src" / "inferlet" / "bindings"
 

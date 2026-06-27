@@ -1,9 +1,9 @@
-//! pie:core/inference - ForwardPass, FutureOutput, Sampler, Output
+//! pie:core/inference - ForwardPass, Sampler, Output
 
 use crate::api::adapter::Adapter;
-use crate::api::context::Context;
 use crate::api::pie;
 use crate::inference::ForwardOutput;
+use crate::inference::forward_prepare;
 use crate::inference::structured::compiled_grammar::CompiledGrammar;
 use crate::inference::structured::grammar::Grammar as InternalGrammar;
 use crate::inference::structured::json_schema::{
@@ -12,14 +12,12 @@ use crate::inference::structured::json_schema::{
 use crate::inference::structured::matcher::GrammarMatcher;
 use crate::inference::structured::regex::regex_to_grammar;
 use crate::instance::InstanceState;
-use crate::{context, inference};
+use crate::inference;
 use anyhow::Result;
 use pie_driver_abi::Brle;
-use std::mem::take;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
-use std::time::{Duration, Instant};
-use tokio::sync::oneshot;
+use std::time::Duration;
 use wasmtime::component::Resource;
 use wasmtime::component::{Accessor, HasSelf};
 use wasmtime_wasi::WasiView;
@@ -31,7 +29,6 @@ pub struct ExecuteProfileSnapshot {
     pub misses: u64,
     pub total_us: u64,
     pub prepare_us: u64,
-    pub try_hit_us: u64,
     pub hit_wait_us: u64,
     pub cold_prepare_us: u64,
     pub pin_us: u64,
@@ -45,7 +42,6 @@ struct ExecuteProfileStats {
     misses: AtomicU64,
     total_us: AtomicU64,
     prepare_us: AtomicU64,
-    try_hit_us: AtomicU64,
     hit_wait_us: AtomicU64,
     cold_prepare_us: AtomicU64,
     pin_us: AtomicU64,
@@ -59,7 +55,6 @@ static EXECUTE_PROFILE: ExecuteProfileStats = ExecuteProfileStats {
     misses: AtomicU64::new(0),
     total_us: AtomicU64::new(0),
     prepare_us: AtomicU64::new(0),
-    try_hit_us: AtomicU64::new(0),
     hit_wait_us: AtomicU64::new(0),
     cold_prepare_us: AtomicU64::new(0),
     pin_us: AtomicU64::new(0),
@@ -86,7 +81,6 @@ pub fn execute_profile_snapshot() -> Option<ExecuteProfileSnapshot> {
         misses: EXECUTE_PROFILE.misses.load(Ordering::Relaxed),
         total_us: EXECUTE_PROFILE.total_us.load(Ordering::Relaxed),
         prepare_us: EXECUTE_PROFILE.prepare_us.load(Ordering::Relaxed),
-        try_hit_us: EXECUTE_PROFILE.try_hit_us.load(Ordering::Relaxed),
         hit_wait_us: EXECUTE_PROFILE.hit_wait_us.load(Ordering::Relaxed),
         cold_prepare_us: EXECUTE_PROFILE.cold_prepare_us.load(Ordering::Relaxed),
         pin_us: EXECUTE_PROFILE.pin_us.load(Ordering::Relaxed),
@@ -99,7 +93,6 @@ pub fn execute_profile_snapshot() -> Option<ExecuteProfileSnapshot> {
 struct ExecuteProfileSample {
     hit: bool,
     prepare_us: u64,
-    try_hit_us: u64,
     hit_wait_us: u64,
     cold_prepare_us: u64,
     pin_us: u64,
@@ -123,9 +116,6 @@ fn record_execute_profile(sample: ExecuteProfileSample, total_us: u64) {
     EXECUTE_PROFILE
         .prepare_us
         .fetch_add(sample.prepare_us, Ordering::Relaxed);
-    EXECUTE_PROFILE
-        .try_hit_us
-        .fetch_add(sample.try_hit_us, Ordering::Relaxed);
     EXECUTE_PROFILE
         .hit_wait_us
         .fetch_add(sample.hit_wait_us, Ordering::Relaxed);
@@ -151,120 +141,24 @@ fn record_execute_profile(sample: ExecuteProfileSample, total_us: u64) {
 /// but is used at execute-time to populate the adapter binding.
 #[derive(Debug)]
 pub struct ForwardPass {
-    context_id: Option<crate::context::ContextId>,
-    /// Snapshot of the bound ctx's cached speculator handle. Set in
-    /// `pass.context()`; `None` until then, or when speculation is
-    /// disabled for the model. Lets `execute()` call `try_hit`
-    /// without taking the global REGISTRY lock.
-    spec: Option<inference::StagedBatch>,
+    pub model_id: usize,
+    /// Explicit forward-pass memory descriptors (W5). Captured by the
+    /// kv-context / kv-output / rs-context / rs-output setters and resolved to
+    /// physical pages inside the atomic arena transaction at `execute()`.
+    /// There is no ambient context handle and no implicit append.
+    kv_context: Option<pie::core::inference::KvContext>,
+    kv_output: Option<pie::core::inference::KvOutput>,
+    rs_context: Option<pie::core::inference::RsBufferContext>,
+    rs_output: Option<pie::core::inference::RsBufferOutput>,
+    /// `fold-buffered(n)` (W9 piggyback): fold the first `n` buffered RS tokens
+    /// of this pass's RS working set into its folded state as part of this
+    /// forward. Lowered to `rs_fold_lens` + `RS_FLAG_FOLD` over the buffered
+    /// slabs (`rs_buffer_slot_ids`); the driver gathers + replays them.
+    fold_buffered_tokens: Option<u32>,
     pub adapter_seed: Option<i64>,
-    allow_pass_speculation: bool,
     req: pie_driver_abi::ForwardRequest,
 }
 
-#[derive(Debug)]
-pub struct FutureOutput {
-    result: Option<pie::core::inference::Output>,
-    rx: Option<oneshot::Receiver<Result<ForwardOutput>>>,
-    /// Samplers from the originating request — cloned before draining
-    /// `pass.req` at execute() time so we can reconstruct the WIT
-    /// per-slot output list against this slot order.
-    samplers: Vec<pie_driver_abi::Sampler>,
-    done: bool,
-    context_id: Option<crate::context::ContextId>,
-    was_pinned: bool,
-    fill_tokens: Vec<u32>,
-    fill_positions: Vec<u32>,
-    fill_masks: Vec<Brle>,
-    spec_tokens_for_fill: Vec<u32>,
-    spec_positions_for_fill: Vec<u32>,
-    adapter_id: Option<crate::adapter::AdapterId>,
-    adapter_seed: Option<i64>,
-}
-
-impl FutureOutput {
-    fn release_pin(&mut self) {
-        if self.was_pinned {
-            if let Some(context_id) = self.context_id {
-                context::unpin(context_id);
-            }
-            self.was_pinned = false;
-        }
-    }
-
-    fn append_lineage(&mut self) {
-        let Some(context_id) = self.context_id else {
-            return;
-        };
-        let mut all_fill_tokens = take(&mut self.fill_tokens);
-        let mut all_fill_positions = take(&mut self.fill_positions);
-        let mut all_fill_masks = take(&mut self.fill_masks);
-        if !self.spec_tokens_for_fill.is_empty() {
-            all_fill_tokens.extend_from_slice(&self.spec_tokens_for_fill);
-            all_fill_positions.extend_from_slice(&self.spec_positions_for_fill);
-            if !all_fill_masks.is_empty() {
-                for &pos in &self.spec_positions_for_fill {
-                    all_fill_masks.push(Brle::all_true((pos + 1) as usize));
-                }
-            }
-        }
-        if !all_fill_tokens.is_empty() {
-            let driver_repaired_spec_tail = self.spec_tokens_for_fill.len() as u32;
-            context::append_working_page_tokens_with_repaired_spec_tail(
-                context_id,
-                all_fill_tokens,
-                all_fill_positions,
-                all_fill_masks,
-                self.adapter_id,
-                self.adapter_seed,
-                driver_repaired_spec_tail,
-            );
-        }
-    }
-
-    fn finish_ok(&mut self, output: ForwardOutput) {
-        if self.spec_tokens_for_fill.is_empty() {
-            if let ForwardOutput::Tokens(tokens) = &output {
-                // System speculation rides accepted draft tokens in the
-                // `tokens` array on top of the requested sampler slots, so
-                // anything *beyond* the sampler count is speculative fill
-                // that must be written into the KV. When the inferlet
-                // simply samples at several positions (e.g. cacheback
-                // verification), tokens.len() == samplers.len() and there
-                // is no fill — treating those sampler results as spec fill
-                // would over-grow the working tail past its reserved pages.
-                let n_samplers = self.samplers.len();
-                if tokens.len() > n_samplers {
-                    let start = self
-                        .fill_positions
-                        .last()
-                        .copied()
-                        .map(|pos| pos + 1)
-                        .unwrap_or(0);
-                    let extra = tokens.len() - n_samplers;
-                    self.spec_tokens_for_fill
-                        .extend_from_slice(&tokens[..extra]);
-                    self.spec_positions_for_fill
-                        .extend((0..extra).map(|i| start + i as u32));
-                }
-            }
-        }
-        self.append_lineage();
-        self.release_pin();
-        self.result = Some(build_wit_output(output, &self.samplers));
-        self.done = true;
-    }
-
-    fn finish_empty(&mut self) {
-        self.release_pin();
-        self.result = Some(pie::core::inference::Output {
-            slots: Vec::new(),
-            spec_tokens: Vec::new(),
-            spec_positions: Vec::new(),
-        });
-        self.done = true;
-    }
-}
 
 fn empty_forward_request() -> pie_driver_abi::ForwardRequest {
     pie_driver_abi::ForwardRequest {
@@ -286,30 +180,6 @@ fn empty_forward_request() -> pie_driver_abi::ForwardRequest {
     }
 }
 
-impl FutureOutput {
-    /// Await the inflight forward-pass result and post-process it into the WIT
-    /// `output`. Consumes self (no longer a guest-visible resource); replaces
-    /// the old pollable/get polling now that `execute` is a native async func.
-    async fn into_output(mut self) -> pie::core::inference::Output {
-        if let Some(rx) = self.rx.take() {
-            match rx.await {
-                Ok(Ok(resp)) => self.finish_ok(resp),
-                Ok(Err(e)) => {
-                    tracing::warn!("future output failed: {e:#}");
-                    self.finish_empty();
-                }
-                Err(_) => self.finish_empty(),
-            }
-        } else {
-            self.finish_empty();
-        }
-        self.result.take().unwrap_or(pie::core::inference::Output {
-            slots: Vec::new(),
-            spec_tokens: Vec::new(),
-            spec_positions: Vec::new(),
-        })
-    }
-}
 
 /// Build the WIT-shaped per-slot output from a per-request
 /// [`pie_driver_abi::ForwardResponse`] (single-request shape: `num_requests = 1`,
@@ -513,43 +383,79 @@ fn wit_to_bridge_sampler(s: pie::core::inference::Sampler) -> pie_driver_abi::Sa
 
 impl pie::core::inference::Host for InstanceState {}
 
+/// Aggregate interface-level `Host` for `pie:core/working-set`, required by
+/// the generated `HostKvWorkingSet` (charlie) + `HostRsWorkingSet` (delta)
+/// resource impls. echo owns this (central bindgen) since it spans both lanes.
+impl pie::core::working_set::Host for InstanceState {}
+
 impl pie::core::inference::HostForwardPass for InstanceState {
     async fn new(&mut self) -> Result<Resource<ForwardPass>> {
         // Initialize the accumulator with the per-request invariants:
         // single adapter binding (-1 sentinels = unbound), and no
         // speculative side-channel output unless the caller explicitly
-        // enables it via `output_speculative_tokens(true)`.
+        // enables it via `output_speculative_tokens(true)`. Single-model:
+        // the bound model is index 0.
         let pass = ForwardPass {
-            context_id: None,
-            spec: None,
+            model_id: 0,
+            kv_context: None,
+            kv_output: None,
+            rs_context: None,
+            rs_output: None,
+            fold_buffered_tokens: None,
             adapter_seed: None,
-            allow_pass_speculation: true,
             req: empty_forward_request(),
         };
         Ok(self.ctx().table.push(pass)?)
     }
 
-    async fn context(
+    /// KV pages this pass reads as attention context. Replaces the old opaque
+    /// `context` handle (W5). Resolved to physical pages in the txn prepare.
+    async fn kv_context(
         &mut self,
         this: Resource<ForwardPass>,
-        context: Resource<Context>,
+        ctx: pie::core::inference::KvContext,
     ) -> Result<()> {
-        let ctx = self.ctx().table.get(&context)?;
-        let context_id = ctx.context_id;
-        // Initialize the ctx's speculator cache on the first call
-        // for this ctx. The OnceLock makes this lock-free on every
-        // subsequent `pass.context()`, eliminating REGISTRY lookups
-        // from the per-iteration hot path.
-        let spec = ctx
-            .spec
-            .get_or_init(|| {
-                let device_idx = context::get_device(context_id);
-                inference::lookup_for_ctx(device_idx)
-            })
-            .clone();
-        let pass = self.ctx().table.get_mut(&this)?;
-        pass.context_id = Some(context_id);
-        pass.spec = spec;
+        self.ctx().table.get_mut(&this)?.kv_context = Some(ctx);
+        Ok(())
+    }
+
+    /// KV pages this pass writes (with per-page valid lengths + captured
+    /// generation for stale-mutation rejection).
+    async fn kv_output(
+        &mut self,
+        this: Resource<ForwardPass>,
+        out: pie::core::inference::KvOutput,
+    ) -> Result<()> {
+        self.ctx().table.get_mut(&this)?.kv_output = Some(out);
+        Ok(())
+    }
+
+    /// Buffered recurrent state this pass reads (hybrid / linear-attention).
+    async fn rs_context(
+        &mut self,
+        this: Resource<ForwardPass>,
+        ctx: pie::core::inference::RsBufferContext,
+    ) -> Result<()> {
+        self.ctx().table.get_mut(&this)?.rs_context = Some(ctx);
+        Ok(())
+    }
+
+    /// Buffered recurrent state this pass writes (without folding; W10).
+    async fn rs_output(
+        &mut self,
+        this: Resource<ForwardPass>,
+        out: pie::core::inference::RsBufferOutput,
+    ) -> Result<()> {
+        self.ctx().table.get_mut(&this)?.rs_output = Some(out);
+        Ok(())
+    }
+
+    /// Fold the first `tokens` buffered RS tokens of this pass's RS working set
+    /// into its folded recurrent state as part of this forward (W9 piggyback).
+    /// Recorded here; `execute()` lowers it to `rs_fold_lens` + `RS_FLAG_FOLD`
+    /// over the buffered slabs so the driver gathers + replays them in-forward.
+    async fn fold_buffered(&mut self, this: Resource<ForwardPass>, tokens: u32) -> Result<()> {
+        self.ctx().table.get_mut(&this)?.fold_buffered_tokens = Some(tokens);
         Ok(())
     }
 
@@ -686,9 +592,10 @@ impl pie::core::inference::HostForwardPass for InstanceState {
         Ok(())
     }
 
-    async fn pass_speculation(&mut self, this: Resource<ForwardPass>, flag: bool) -> Result<()> {
-        let pass = self.ctx().table.get_mut(&this)?;
-        pass.allow_pass_speculation = flag;
+    async fn pass_speculation(&mut self, _this: Resource<ForwardPass>, _flag: bool) -> Result<()> {
+        // Runtime pass-level speculation chains are removed (W15); the runtime
+        // keeps no hidden speculative state in working-set semantics. Manual
+        // draft tokens still flow via `input-speculative-tokens`. Inert now.
         Ok(())
     }
 
@@ -748,254 +655,500 @@ impl pie::core::inference::HostForwardPass for InstanceState {
 }
 
 impl pie::core::inference::HostForwardPassWithStore<InstanceState> for HasSelf<InstanceState> {
+    /// Native async (WASI P3 component-model-async). There is no guest-visible
+    /// `future-output` resource anymore: `execute` runs prepare → submit →
+    /// await → finalize inline and returns the WIT `output` directly. Because
+    /// the commit/abort runs in THIS async fn (where the store is reachable via
+    /// `accessor.with`), the forward txn is finalized atomically with the pass —
+    /// the lost-KV-commit failure mode of the old pollable/get split (commit
+    /// unreachable from `&mut FutureOutput`) is structurally impossible.
     async fn execute(
         accessor: &Accessor<InstanceState, Self>,
         this: Resource<ForwardPass>,
     ) -> Result<Result<pie::core::inference::Output, String>> {
-        let profiling = execute_profile_enabled();
-        let profile_start = profiling.then(Instant::now);
-        let mut profile_sample = ExecuteProfileSample::default();
-        let prepare_start = profiling.then(Instant::now);
-
-        // Table-prep: extract everything from the ForwardPass resource. This is
-        // the only store/table access; the rest of execute (pin/submit/await/
-        // finish) runs on locals + global context state, so it stays outside
-        // the synchronous `accessor.with` closure.
-        let (context_id, adapter_seed, spec_handle, allow_pass_speculation, mut req) = accessor
-            .with(|mut access| -> anyhow::Result<_> {
-                let pass = access.get().ctx().table.get_mut(&this)?;
-                let context_id = pass
-                    .context_id
-                    .ok_or_else(|| anyhow::anyhow!("ForwardPass requires a context"))?;
-                let adapter_seed = pass.adapter_seed;
-                let spec_handle = pass.spec.clone();
-                let allow_pass_speculation = pass.allow_pass_speculation;
-                pass.allow_pass_speculation = true;
-                // Drain the accumulator. The remaining work is to synthesize
-                // masks if absent and stamp the per-request indptrs onto the
-                // ForwardRequest, then submit.
-                let req = std::mem::replace(&mut pass.req, empty_forward_request());
-                Ok((context_id, adapter_seed, spec_handle, allow_pass_speculation, req))
-            })?;
-        // Clone samplers BEFORE finalizing so we can reconstruct the
-        // per-slot WIT output against the original slot order.
+        // Drain the accumulator: the explicit memory descriptors + the staged
+        // ForwardRequest. There is no ambient context handle (W5). Every store /
+        // resource-table touch in this async func goes through `accessor.with`
+        // (P3: the host async fn has no `&mut self`).
+        let (
+            model_id,
+            adapter_seed,
+            kv_context,
+            kv_output,
+            _rs_context,
+            rs_output,
+            fold_buffered_tokens,
+            mut req,
+        ) = accessor.with(|mut access| -> Result<_> {
+            let pass = access.get().ctx().table.get_mut(&this)?;
+            Ok((
+                pass.model_id,
+                pass.adapter_seed,
+                pass.kv_context.take(),
+                pass.kv_output.take(),
+                pass.rs_context.take(),
+                pass.rs_output.take(),
+                pass.fold_buffered_tokens.take(),
+                std::mem::replace(&mut pass.req, empty_forward_request()),
+            ))
+        })?;
+        // v1: single-driver. Multi-driver binds the working set's device on
+        // first materialization (`bind_driver`), wired at consolidation.
+        let driver_idx = 0usize;
         let samplers_for_output = req.samplers();
 
-        // Track whether the user actually supplied masks; the kernel-dispatch
-        // hint downstream needs to distinguish user masks from the runtime's
-        // synthesized causal default.
-        let has_user_mask = !req.masks.is_empty();
+        // Empty-input guard: a forward must compute at least one query row.
+        // Without input rows `qo_indptr` collapses to `[0, 0]` and the pass is a
+        // no-op submit; the old context API rejected this. Image/audio spans
+        // push placeholder rows into `token_ids`, so this covers all input kinds.
+        if let Err(e) = forward_prepare::check_input_nonempty(req.token_ids.len()) {
+            return Ok(Err(format!("{e:?}")));
+        }
 
-        // Save data needed for context::append_working_page_tokens() before
-        // moving into request. We also clone the speculative arrays so we
-        // can append the verified-prefix to the working-page lineage once
-        // the response tells us how many drafts were accepted.
-        let num_input_tokens = req.token_ids.len();
-        let num_spec_tokens = req.spec_token_ids.len();
-        let fill_tokens = req.token_ids.clone();
-        let fill_positions = req.position_ids.clone();
-        let fill_masks = if has_user_mask {
-            req.masks.clone()
+        // WIT spec: "if not provided, fallback to causal mask". Then stamp the
+        // per-request indptr shape ([0, N]).
+        let has_user_mask = !req.masks.is_empty();
+        if req.masks.is_empty() && !req.position_ids.is_empty() {
+            req.masks = req
+                .position_ids
+                .iter()
+                .map(|&pos| Brle::all_true((pos + 1) as usize))
+                .collect();
+        }
+        req.has_user_mask = has_user_mask;
+        req.single_token_mode = !has_user_mask && req.token_ids.len() <= 1;
+        req.adapter_bindings[0].seed = adapter_seed.unwrap_or(-1);
+        req.qo_indptr = vec![0, req.token_ids.len() as u32];
+        req.mask_indptr = vec![0, req.masks.len() as u32];
+        req.logit_mask_indptr = vec![0, req.logit_masks.len() as u32];
+        req.sampling_indptr = vec![0, req.sampling_indices.len() as u32];
+        req.sampler_indptr = vec![0, req.n_samplers() as u32];
+        req.spec_indptr = vec![0, req.spec_token_ids.len() as u32];
+        req.kv_page_indptr = vec![0];
+        // Batch-affinity id: the KV working set's resource handle replaces the
+        // old context id (used by the scheduler for request grouping).
+        let affinity = kv_output
+            .as_ref()
+            .map(|o| o.set.rep())
+            .or_else(|| kv_context.as_ref().map(|c| c.set.rep()))
+            .unwrap_or(0);
+        req.context_ids = vec![affinity as u64];
+
+        let page_size = crate::page_size::tokens_per_page(model_id);
+
+        // ── prepare: validate descriptors; alloc/CoW + pin write targets; pin
+        //    read pages; resolve to driver physical ids — all under one txn.
+        //    The whole prepare is synchronous, so it runs inside one
+        //    `accessor.with` closure (store + arena both reachable); the owned
+        //    `txn` + projection cross back out for the async submit. ──
+        type PrepOut = (
+            forward_prepare::KvProjection,
+            crate::arena::ArenaTxn,
+            Vec<crate::arena::MovePlan>,
+        );
+        let prepared: std::result::Result<PrepOut, String> = accessor.with(|mut access| {
+            let state = access.get();
+            let arena_arc = crate::arena::get(model_id, driver_idx);
+            let mut arena = arena_arc.lock().unwrap();
+            let mut txn = arena.txn_begin();
+            let mut move_plans: Vec<crate::arena::MovePlan> = Vec::new();
+
+            type InnerOut = (
+                forward_prepare::KvProjection,
+                Vec<u32>,
+                Vec<u8>,
+                Vec<u32>,
+                Vec<u32>,
+                Vec<u32>,
+            );
+            let inner: std::result::Result<InnerOut, String> = 'prep: {
+                // KV read context → pinned physical pages. Read only the written
+                // valid-token prefix: kv-context `len` may include trailing
+                // reserved slots (the WIT permits "trailing reserved slots may be
+                // empty") that are not part of attention and may be unwritten;
+                // resolving the full `len` would reject them. `valid_pages` is the
+                // ceil of valid-tokens. Pure prefill (valid_tokens==0) reads none.
+                let (context_pages, valid_tokens) = if let Some(kc) = &kv_context {
+                    let valid_pages = kc.valid_tokens.div_ceil(page_size);
+                    let objs = if valid_pages == 0 {
+                        Vec::new()
+                    } else {
+                        match state.ctx().table.get(&kc.set) {
+                            Ok(ws) => match ws.resolve_read(kc.start, valid_pages) {
+                                Ok(o) => o,
+                                Err(e) => break 'prep Err(e.to_string()),
+                            },
+                            Err(e) => break 'prep Err(e.to_string()),
+                        }
+                    };
+                    let mut pages = Vec::with_capacity(objs.len());
+                    for obj in &objs {
+                        if let Err(e) = arena.txn_pin(&mut txn, *obj) {
+                            break 'prep Err(e.to_string());
+                        }
+                        match arena.blocks(*obj) {
+                            Ok(b) => pages.push(b[0]),
+                            Err(e) => break 'prep Err(e.to_string()),
+                        }
+                    }
+                    (pages, kc.valid_tokens)
+                } else {
+                    (Vec::new(), 0)
+                };
+
+                // KV write outputs → CoW'd + pinned physical pages.
+                let mut writes: Vec<forward_prepare::KvWrite> = Vec::new();
+                if let Some(ko) = &kv_output {
+                    if ko.indices.len() != ko.per_page_valid_lens.len() {
+                        break 'prep Err(format!(
+                            "kv-output indices ({}) and per-page-valid-lens ({}) length mismatch",
+                            ko.indices.len(),
+                            ko.per_page_valid_lens.len()
+                        ));
+                    }
+                    // Validate generation / range / uniqueness BEFORE any mutation.
+                    match state.ctx().table.get(&ko.set) {
+                        Ok(ws) => {
+                            if let Err(e) = ws.resolve_write(&ko.indices, ko.generation) {
+                                break 'prep Err(e.to_string());
+                            }
+                        }
+                        Err(e) => break 'prep Err(e.to_string()),
+                    }
+                    for (i, &idx) in ko.indices.iter().enumerate() {
+                        let cow = {
+                            let ws = match state.ctx().table.get_mut(&ko.set) {
+                                Ok(w) => w,
+                                Err(e) => break 'prep Err(e.to_string()),
+                            };
+                            ws.cow_write_slot(idx, &mut txn, &mut arena)
+                        };
+                        let (obj, move_plan) = match cow {
+                            Ok(v) => v,
+                            Err(e) => break 'prep Err(e.to_string()),
+                        };
+                        if let Some(mp) = move_plan {
+                            move_plans.push(mp);
+                        }
+                        if let Err(e) = arena.txn_pin(&mut txn, obj) {
+                            break 'prep Err(e.to_string());
+                        }
+                        let page = match arena.blocks(obj) {
+                            Ok(b) => b[0],
+                            Err(e) => break 'prep Err(e.to_string()),
+                        };
+                        writes.push(forward_prepare::KvWrite {
+                            slot_index: idx,
+                            page,
+                            valid_len: ko.per_page_valid_lens[i],
+                        });
+                    }
+                }
+
+                // Project onto the contiguous driver page run + last-page length.
+                let proj = match forward_prepare::project_kv(
+                    &context_pages,
+                    valid_tokens,
+                    &writes,
+                    page_size,
+                ) {
+                    Ok(p) => p,
+                    Err(e) => break 'prep Err(format!("{e:?}")),
+                };
+
+                // RS v1 (write + in-forward fold only; `rs-context` read deferred
+                // to v2 — the hybrid read+write case needs per-request token-range
+                // ABI). Buffered slabs ride `rs_buffer_slot_ids` (page-major CSR:
+                // slab s = tokens [s·page, (s+1)·page)); the FOLD bit disambiguates
+                // — clear = rs-output write-target (W10, write_state=false), set =
+                // fold read-source. `rs_slot_ids[r]` is the folded state slot.
+                let mut rs_slot_ids: Vec<u32> = Vec::new();
+                let mut rs_slot_flags: Vec<u8> = Vec::new();
+                let mut rs_buffer_slot_ids: Vec<u32> = Vec::new();
+                let mut rs_buffer_slot_indptr: Vec<u32> = vec![0];
+                let mut rs_fold_lens: Vec<u32> = Vec::new();
+                if let Some(ro) = &rs_output {
+                    // Materialise + pin the buffered write slabs, page-major.
+                    let cow = {
+                        let ws = match state.ctx().table.get_mut(&ro.set) {
+                            Ok(w) => w,
+                            Err(e) => break 'prep Err(e.to_string()),
+                        };
+                        ws.cow_write_buffer(ro.start_token, ro.len_tokens, &mut txn, &mut arena)
+                    };
+                    let (objs, move_plan) = match cow {
+                        Ok(v) => v,
+                        Err(e) => break 'prep Err(e.to_string()),
+                    };
+                    if let Some(mp) = move_plan {
+                        move_plans.push(mp);
+                    }
+                    for obj in &objs {
+                        if let Err(e) = arena.txn_pin(&mut txn, *obj) {
+                            break 'prep Err(e.to_string());
+                        }
+                        match arena.blocks(*obj) {
+                            Ok(b) => rs_buffer_slot_ids.push(b[0]),
+                            Err(e) => break 'prep Err(e.to_string()),
+                        }
+                    }
+                    rs_buffer_slot_indptr.push(rs_buffer_slot_ids.len() as u32);
+
+                    // The folded recurrent_state slot (driver reads/writes it).
+                    let folded = match state.ctx().table.get(&ro.set) {
+                        Ok(ws) => ws.folded_object(),
+                        Err(e) => break 'prep Err(e.to_string()),
+                    };
+                    let folded_block = match folded {
+                        Some(obj) => match arena.blocks(obj) {
+                            Ok(b) => b[0],
+                            Err(e) => break 'prep Err(e.to_string()),
+                        },
+                        None => 0,
+                    };
+                    rs_slot_ids.push(folded_block);
+
+                    // FOLD bit + `rs_fold_lens` iff this pass folds the buffered
+                    // suffix into the folded state in-forward (W9 piggyback).
+                    let mut flag = 0u8;
+                    if let Some(n) = fold_buffered_tokens {
+                        flag |= pie_driver_abi::RS_FLAG_FOLD;
+                        rs_fold_lens.push(n);
+                    } else {
+                        rs_fold_lens.push(0);
+                    }
+                    rs_slot_flags.push(flag);
+                } else if fold_buffered_tokens.is_some() {
+                    // v1: the fold rides the rs-output set; a fold-only pass with
+                    // no rs-output to carry the RS set isn't expressible yet (v2: a
+                    // fold descriptor names its own set).
+                    break 'prep Err(
+                        "fold-buffered without rs-output is unsupported in v1 (rs-output carries the RS set)"
+                            .to_string(),
+                    );
+                }
+
+                Ok((
+                    proj,
+                    rs_slot_ids,
+                    rs_slot_flags,
+                    rs_buffer_slot_ids,
+                    rs_buffer_slot_indptr,
+                    rs_fold_lens,
+                ))
+            };
+
+            // On any prepare failure: abort the txn (discard staged allocs/CoW
+            // copies, release pins) and revert any repointed KV slots; the prior
+            // mappings stay visible (W13). No driver submission happened.
+            let (proj, rs_slot_ids, rs_slot_flags, rs_buffer_slot_ids, rs_buffer_slot_indptr, rs_fold_lens) =
+                match inner {
+                    Ok(v) => v,
+                    Err(e) => {
+                        arena.txn_abort(txn);
+                        drop(arena);
+                        if let Some(ko) = &kv_output {
+                            if let Ok(ws) = state.ctx().table.get_mut(&ko.set) {
+                                ws.abort_writes();
+                            }
+                        }
+                        return Err(e);
+                    }
+                };
+
+            if !rs_slot_ids.is_empty() {
+                req.rs_slot_ids = rs_slot_ids;
+                req.rs_slot_flags = rs_slot_flags;
+                req.rs_fold_lens = rs_fold_lens;
+            }
+            if !rs_buffer_slot_ids.is_empty() {
+                req.rs_buffer_slot_ids = rs_buffer_slot_ids;
+                req.rs_buffer_slot_indptr = rs_buffer_slot_indptr;
+            }
+
+            // Release the arena lock BEFORE the async submit; the owned `txn`
+            // keeps the pins/CoW copies alive until commit/abort.
+            drop(arena);
+            Ok((proj, txn, move_plans))
+        });
+
+        let (proj, txn, move_plans) = match prepared {
+            Ok(v) => v,
+            Err(e) => return Ok(Err(e)),
+        };
+
+        // Issue the device d2d for every CoW'd write target: copy the original
+        // page content into the private copy before the driver writes into it.
+        for mp in &move_plans {
+            if let Err(e) = crate::driver::copy_d2d(driver_idx, &mp.from, &mp.to) {
+                tracing::warn!("forward CoW d2d copy failed: {e:#}");
+            }
+        }
+
+        // CAS-seal eligibility (W6/W7): host-hash the full pages this forward
+        // fills from an EMPTY context (`valid_tokens == 0`), so the forward's
+        // tokens start at a page boundary and each page's whole content is known
+        // here. Chained from prev_hash 0. Sealing onto a non-empty context needs
+        // the context tip's sealed hash (follow-up); until then those pages stay
+        // private-dirty (W7) — correct, just no dedup.
+        let seal_eligible = !proj.full_page_writes.is_empty()
+            && kv_context.as_ref().map(|c| c.valid_tokens).unwrap_or(0) == 0
+            && req.position_ids.len() == req.token_ids.len()
+            && req.masks.len() == req.token_ids.len();
+        let seal_hashes: Vec<(u32, u64)> = if seal_eligible {
+            let page_hashes = crate::page_hash::compute_page_hashes(
+                page_size as usize,
+                &req.token_ids,
+                &req.position_ids,
+                &req.masks,
+                0,
+                adapter_seed,
+            );
+            proj
+                .full_page_writes
+                .iter()
+                .filter_map(|&slot| page_hashes.get(slot as usize).map(|&h| (slot, h)))
+                .collect()
         } else {
             Vec::new()
         };
-        let spec_tokens_for_fill = req.spec_token_ids.clone();
-        let spec_positions_for_fill = req.spec_position_ids.clone();
-        // Adapter id for context::append_working_page_tokens.
-        let adapter_id: Option<crate::adapter::AdapterId> = {
-            let bound = req.adapter_bindings[0].adapter_id;
-            if bound < 0 { None } else { Some(bound as u64) }
-        };
-        req.has_user_mask = has_user_mask;
-        req.single_token_mode = !has_user_mask && req.token_ids.len() <= 1;
-        // adapter_bindings[0] already has the adapter_id set by `adapter()`;
-        // stamp the seed picked up out-of-band.
-        req.adapter_bindings[0].seed = adapter_seed.unwrap_or(-1);
-        if let Some(start) = prepare_start {
-            profile_sample.prepare_us = elapsed_us(start.elapsed());
-        }
 
-        // Try the staged hit before synthesizing default masks or pinning. On
-        // hit we skip pin/unpin entirely — the staged fire runs on pages from
-        // the prior cycle.
-        let driver_idx_hint = context::get_device(context_id);
-        let use_pass_speculation = inference::should_use_pass_speculation(driver_idx_hint);
-        let try_hit_start = profiling.then(Instant::now);
-        let staged_rx = spec_handle
+        // Carry the KV working-set handle + the txn across the async boundary;
+        // finalize (after the driver round-trip) commits (seal full pages) /
+        // aborts on them.
+        let kv_set: Option<Resource<crate::working_set::kv::KvWorkingSet>> = kv_output
             .as_ref()
-            .filter(|_| use_pass_speculation)
-            .and_then(|s| inference::try_hit(s, context_id, &req, allow_pass_speculation));
-        if let Some(start) = try_hit_start {
-            profile_sample.try_hit_us = elapsed_us(start.elapsed());
-        }
-        let (was_pinned, submit_result) = if let Some(rx) = staged_rx {
-            profile_sample.hit = true;
-            (false, Ok(rx))
-        } else {
-            let cold_prepare_start = profiling.then(Instant::now);
-            // WIT spec: "if not provided, fallback to causal mask".
-            if req.masks.is_empty() && !req.position_ids.is_empty() {
-                req.masks = req
-                    .position_ids
-                    .iter()
-                    .map(|&pos| Brle::all_true((pos + 1) as usize))
-                    .collect();
-            }
-            // Finalize per-request indptr shape ([0, N]).
-            let n_tokens = req.token_ids.len() as u32;
-            let n_masks = req.masks.len() as u32;
-            let n_logit = req.logit_masks.len() as u32;
-            let n_sampling = req.sampling_indices.len() as u32;
-            let n_samplers = req.n_samplers() as u32;
-            let n_spec = req.spec_token_ids.len() as u32;
-            req.qo_indptr = vec![0, n_tokens];
-            req.mask_indptr = vec![0, n_masks];
-            req.logit_mask_indptr = vec![0, n_logit];
-            req.sampling_indptr = vec![0, n_sampling];
-            req.sampler_indptr = vec![0, n_samplers];
-            req.spec_indptr = vec![0, n_spec];
-            req.kv_page_indptr = vec![0];
-            req.context_ids = vec![context_id];
-            if let Some(start) = cold_prepare_start {
-                profile_sample.cold_prepare_us = elapsed_us(start.elapsed());
-            }
+            .map(|ko| Resource::new_borrow(ko.set.rep()));
 
-            // Cold path: pin, validate page capacity, submit.
-            let pin_start = profiling.then(Instant::now);
-            let writable_tokens = num_input_tokens.saturating_add(num_spec_tokens);
-            let pinned = match context::pin(context_id, writable_tokens as u32).await {
-                Ok(p) => p,
-                Err(e) => {
-                    tracing::warn!("pin failed for ctx {context_id}: {e:#}");
-                    return Ok(Err(e.to_string()));
-                }
-            };
-            if let Some(start) = pin_start {
-                profile_sample.pin_us = elapsed_us(start.elapsed());
-            }
-            let kv_len = pinned.kv_len;
-            let driver_id = pinned.driver;
-            let physical_page_ids = pinned.pages;
-            let extra_pages = pinned.extra_pages;
-            if let Some(rs_slot) = pinned.rs_slot {
-                // Speculation policy for rs_cache (hybrid GDN) models. Two
-                // independent signals, both owned here by the runtime (the
-                // driver stays pure mechanism):
-                //   * `supported` — the driver wired a system drafter and the
-                //     executor can verify drafts and advance the committed
-                //     recurrent slot by exactly the accepted prefix. Without
-                //     it, an externally-supplied draft cannot be verified, so
-                //     reject it; the side channel would otherwise only force
-                //     dense-logit scheduling and fragment prompt batching.
-                //   * `enabled` — operator opt-in (`enable_system_speculation`,
-                //     default off). Gates only the *auto*-drafter: when off we
-                //     don't ask the driver to draft (`output_spec_flags`), but
-                //     we still honor any manual/user-supplied draft tokens.
-                let (system_spec_supported, system_spec_enabled) = {
-                    let m = crate::model::model();
-                    (m.system_speculation_supported(), m.enable_system_speculation())
-                };
-                if !system_spec_supported {
-                    if !req.spec_token_ids.is_empty() {
-                        context::unpin(context_id);
-                        return Ok(Err(
-                            "rs_cache models do not support speculative draft tokens yet"
-                                .to_string(),
-                        ));
-                    }
-                    req.output_spec_flags = vec![false];
-                } else if !system_spec_enabled {
-                    // Supported, but not opted in: no auto-drafting. Manual
-                    // drafts in `req.spec_token_ids` are still verified.
-                    req.output_spec_flags = vec![false];
-                }
-                req.rs_slot_ids = vec![rs_slot];
-                req.rs_slot_flags = vec![pinned.rs_flags];
-            }
-
-            let num_pages = physical_page_ids.len() as u32;
-            let page_size = context::tokens_per_page();
-            let post_input_total_kv = kv_len + num_input_tokens as u32;
-            let writable_total_kv = kv_len + writable_tokens as u32;
-            let last_page_len = if num_pages == 0 {
-                0
+        // The RS working set whose folded boundary advances on a committed
+        // fold-buffered (W9) — v1 rides the rs-output set.
+        let rs_fold_set: Option<Resource<crate::working_set::rs::RsWorkingSet>> =
+            if fold_buffered_tokens.is_some() {
+                rs_output.as_ref().map(|ro| Resource::new_borrow(ro.set.rep()))
             } else {
-                let r = post_input_total_kv % page_size;
-                if r == 0 { page_size } else { r }
+                None
             };
-            let active_page_idx = post_input_total_kv
-                .saturating_add(page_size.saturating_sub(1))
-                .checked_div(page_size)
-                .and_then(|pages| pages.checked_sub(1))
-                .map(|idx| idx as usize);
 
-            // INVARIANT: total_kv must fit within the allocated pages.
-            let page_capacity = num_pages * page_size;
-            if writable_total_kv > page_capacity || num_pages == 0 {
-                let msg = format!(
-                    "KV_INVARIANT_VIOLATION ctx={context_id} total_kv={writable_total_kv} \
-                     page_capacity={page_capacity} num_pages={num_pages} \
-                     kv_len={kv_len} num_input={num_input_tokens} num_spec={num_spec_tokens} page_size={page_size} \
-                     phys_ids={physical_page_ids:?}"
-                );
-                eprintln!("{msg}");
-                context::unpin(context_id);
-                return Ok(Err(msg));
-            }
+        // Single-model: the SERVICE routes to the bound model; no model_id arg.
+        let submit_result =
+            inference::submit_async(req, driver_idx, proj.physical_page_ids, proj.last_page_len);
 
-            let driver_idx = driver_id as usize;
-            let submit_start = profiling.then(Instant::now);
-            let result = inference::submit_async(
-                req,
-                driver_idx,
-                physical_page_ids,
-                extra_pages,
-                last_page_len,
-                active_page_idx,
-                allow_pass_speculation,
-            );
-            if let Some(start) = submit_start {
-                profile_sample.submit_wait_us = elapsed_us(start.elapsed());
-            }
-            (true, result)
-        };
-
-        // On submit failure, unpin (if we pinned) and return early.
         let rx = match submit_result {
             Ok(rx) => rx,
             Err(e) => {
-                if was_pinned {
-                    context::unpin(context_id);
-                }
-                tracing::warn!("inference::submit failed for ctx {context_id}: {e:#}");
+                // Submit never reached the driver — abort the txn + revert the
+                // repointed KV slots (W13).
+                accessor.with(|mut access| {
+                    let state = access.get();
+                    let arena_arc = crate::arena::get(model_id, driver_idx);
+                    arena_arc.lock().unwrap().txn_abort(txn);
+                    if let Some(ko) = &kv_set {
+                        if let Ok(ws) = state.ctx().table.get_mut(ko) {
+                            ws.abort_writes();
+                        }
+                    }
+                });
+                tracing::warn!("inference::submit failed: {e:#}");
                 return Ok(Err(e.to_string()));
             }
         };
 
-        let future_output = FutureOutput {
-            result: None,
-            rx: Some(rx),
-            samplers: samplers_for_output,
-            done: false,
-            context_id: Some(context_id),
-            was_pinned,
-            fill_tokens,
-            fill_positions,
-            fill_masks,
-            spec_tokens_for_fill,
-            spec_positions_for_fill,
-            adapter_id,
-            adapter_seed,
+        // Await the driver result INLINE (P3 native async), then finalize the
+        // forward txn in the same async fn (store reachable via `accessor.with`).
+        let forward_result: Option<ForwardOutput> = match rx.await {
+            Ok(Ok(resp)) => Some(resp),
+            Ok(Err(e)) => {
+                tracing::warn!("future output failed: {e:#}");
+                None
+            }
+            Err(_) => None,
         };
-        let postprocess_start = profiling.then(Instant::now);
-        let output = future_output.into_output().await;
-        if let Some(start) = postprocess_start {
-            profile_sample.postprocess_us = elapsed_us(start.elapsed());
-        }
-        if let Some(start) = profile_start {
-            record_execute_profile(profile_sample, elapsed_us(start.elapsed()));
-        }
+        let success = forward_result.is_some();
+
+        accessor.with(|mut access| {
+            access.get().finalize_forward_txn(
+                success,
+                txn,
+                kv_set,
+                seal_hashes,
+                model_id,
+                driver_idx,
+                rs_fold_set,
+                fold_buffered_tokens,
+            )
+        })?;
+
+        let output = match forward_result {
+            Some(resp) => build_wit_output(resp, &samplers_for_output),
+            None => pie::core::inference::Output {
+                slots: Vec::new(),
+                spec_tokens: Vec::new(),
+                spec_positions: Vec::new(),
+            },
+        };
         Ok(Ok(output))
+    }
+}
+
+impl InstanceState {
+    /// Commit (on driver success) or abort (on failure) the forward transaction
+    /// from `execute()`. Commit releases pins, publishes the CoW'd write targets
+    /// (`commit_writes`), and CAS-seals eligible full pages; abort discards
+    /// staged objects and reverts repointed slots.
+    #[allow(clippy::too_many_arguments)]
+    fn finalize_forward_txn(
+        &mut self,
+        success: bool,
+        txn: crate::arena::ArenaTxn,
+        kv_set: Option<Resource<crate::working_set::kv::KvWorkingSet>>,
+        seal_hashes: Vec<(u32, u64)>,
+        model_id: usize,
+        driver_idx: usize,
+        rs_fold_set: Option<Resource<crate::working_set::rs::RsWorkingSet>>,
+        fold_tokens: Option<u32>,
+    ) -> Result<()> {
+        let arena_arc = crate::arena::get(model_id, driver_idx);
+        if success {
+            // Commit, publish the repointed slots, then CAS-seal eligible full
+            // pages. Lock order is arena → kv_cas, both held sync (no await).
+            let mut arena = arena_arc.lock().unwrap();
+            arena
+                .txn_commit(txn)
+                .map_err(|e| anyhow::anyhow!("forward txn_commit failed: {e}"))?;
+            if let Some(kv_set) = &kv_set {
+                let cas_arc = crate::working_set::kv_cas::get(model_id, driver_idx);
+                let mut cas = cas_arc.lock().unwrap();
+                if let Ok(ws) = self.ctx().table.get_mut(kv_set) {
+                    ws.commit_writes();
+                    for (slot, hash) in &seal_hashes {
+                        if let Err(e) = ws.seal(*slot, *hash, &mut arena, &mut cas) {
+                            tracing::warn!("CAS seal of slot {slot} failed: {e}");
+                        }
+                    }
+                }
+            }
+            // Advance the RS folded boundary on a committed in-forward fold (W9):
+            // consume the first `n` buffered tokens into the folded state. Only
+            // on success — a fold never advances across an aborted forward.
+            if let (Some(n), Some(rs_set)) = (fold_tokens, &rs_fold_set) {
+                if let Ok(ws) = self.ctx().table.get_mut(rs_set) {
+                    if let Err(e) = ws.advance_fold(n, &mut arena) {
+                        tracing::warn!("advance_fold({n}) failed: {e:?}");
+                    }
+                }
+            }
+        } else {
+            {
+                let mut arena = arena_arc.lock().unwrap();
+                arena.txn_abort(txn);
+            }
+            if let Some(kv_set) = &kv_set {
+                if let Ok(ws) = self.ctx().table.get_mut(kv_set) {
+                    ws.abort_writes();
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -1091,14 +1244,12 @@ impl std::fmt::Debug for Matcher {
 }
 
 impl pie::core::inference::HostMatcher for InstanceState {
-    async fn new(
-        &mut self,
-        grammar: Resource<Grammar>,
-    ) -> Result<Resource<Matcher>> {
+    async fn new(&mut self, grammar: Resource<Grammar>) -> Result<Resource<Matcher>> {
         let grammar_res = self.ctx().table.get(&grammar)?;
         let source = grammar_res.source.clone();
         let grammar_inner = grammar_res.inner.clone();
 
+        // Single-model: the tokenizer comes from the global bound model.
         let model = crate::model::model();
         let tok = model.tokenizer().clone();
         let stop_tokens = model.instruct().seal();

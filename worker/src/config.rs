@@ -272,8 +272,8 @@ impl RuntimeConfig {
 }
 
 fn default_worker_threads() -> usize {
-    // Cap at 64 — pie's scheduler + chain-ext pool produces ~20-30
-    // active tokio tasks at conc=256. Beyond ~64 workers the runtime's
+    // Cap at 64 — pie's scheduler produces enough concurrent host work
+    // at high request concurrency. Beyond ~64 workers the runtime's
     // scheduling overhead (queue management, wake propagation) starts
     // adding variance without adding parallelism. Measured on AMD EPYC
     // 7773X (256 threads visible): tok/s mean +0.5%, stdev cut to ~1/3
@@ -339,20 +339,6 @@ pub struct SchedulerConfig {
     pub request_timeout_secs: u64,
     #[serde(default = "default_restore_pause_at_utilization")]
     pub restore_pause_at_utilization: f64,
-    /// Per-context depth of pass-level speculative execution.
-    /// `0` disables speculation entirely (every submit goes
-    /// through the cold path). `1` is the piggyback path —
-    /// one staged pass pre-fired per real pass. Higher values
-    /// let chain firing overlap with the inferlet's WASM time
-    /// (see SPECULATIVE_EXECUTION_DESIGN.md phase B4b.3). The
-    /// eventual ceiling is page-boundary-limited. Valid range:
-    /// 0..=64. Default 1.
-    #[serde(default = "default_speculation_depth")]
-    pub speculation_depth: u32,
-}
-
-fn default_speculation_depth() -> u32 {
-    1
 }
 
 impl Default for SchedulerConfig {
@@ -360,7 +346,6 @@ impl Default for SchedulerConfig {
         Self {
             request_timeout_secs: default_request_timeout_secs(),
             restore_pause_at_utilization: default_restore_pause_at_utilization(),
-            speculation_depth: default_speculation_depth(),
         }
     }
 }
@@ -374,11 +359,6 @@ impl SchedulerConfig {
         ensure!(
             self.restore_pause_at_utilization > 0.0 && self.restore_pause_at_utilization <= 1.0,
             "scheduler.restore_pause_at_utilization must be in (0.0, 1.0]"
-        );
-        ensure!(
-            self.speculation_depth <= 64,
-            "scheduler.speculation_depth must be in 0..=64 (got {}); 0 disables speculation",
-            self.speculation_depth
         );
         Ok(())
     }
