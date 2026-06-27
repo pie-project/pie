@@ -157,6 +157,10 @@ async fn main(input: Input) -> Result<String> {
         proposal_tokens, aggregation_tokens
     );
 
+    if proposal_tokens.len() < 4 {
+        return Err("GoT requires at least 4 proposals for two aggregation levels".to_string());
+    }
+
     let models = runtime::models();
     let model_name = models.first().ok_or("No models available")?;
     let model = Model::load(model_name)?;
