@@ -5,8 +5,8 @@
 //! Everything semantic — the token buffer, per-token positions, the sequence
 //! length, and the page layout — is **owned here in the SDK**. `Context` wraps a
 //! [`KvWorkingSet`] and exposes the same ergonomic fill / flush / generate API
-//! as before; forward passes are expressed as explicit `kv-context` (read) and
-//! `kv-output` (write) descriptors instead of an opaque context handle.
+//! as before; forward passes are expressed as explicit `kv-working-set`
+//! read+write descriptors instead of an opaque context handle.
 //!
 //! Single-model runtime: there is exactly one bound model, so the working set
 //! binds to it implicitly (`KvWorkingSet::new()` takes no handle) and model
@@ -19,7 +19,6 @@ pub use constraint::*;
 
 use crate::Result;
 use crate::inference::ForwardPass;
-use crate::pie::core::inference::{KvContext, KvOutput};
 use crate::pie::core::working_set::KvWorkingSet;
 use crate::sample::Sampler;
 use serde::{Deserialize, Serialize};
@@ -87,6 +86,27 @@ fn read_manifest(name: &str) -> Result<SnapshotManifest> {
 /// - **Sequence cursor** (`seq_len`): the number of materialized KV tokens. The
 ///   per-page valid-token lengths and the read/write page split for every
 ///   forward are derived from it.
+/// The merged `kv-working-set` read+write descriptor for a tail write,
+/// produced by [`Context::prepare_write`] and emitted by
+/// [`Context::attach_kv`]. Encodes the **Option B (disjoint)** convention: the
+/// read range covers the prior FULL pages only and the write sub-range covers
+/// the new-KV pages; the driver attends read ∪ write (the 1a-verified path,
+/// zero driver change). Units: `inp_len`/`output_*` are PAGE/slot indices;
+/// `valid_read`/`offset` are TOKEN counts.
+pub(crate) struct KvWrite {
+    /// Read page span length: `first_write_page` (prior full pages `[0, n)`).
+    inp_len: u32,
+    /// Read valid tokens: `first_write_page · page_size` (all read pages full).
+    valid_read: u32,
+    /// Write sub-range start page: `first_write_page`.
+    output_start: u32,
+    /// Write sub-range length: `total_pages − first_write_page`.
+    output_len: u32,
+    /// In-page token offset of the first NEW token in the first write page:
+    /// `seq_len % page_size` (the partial-prior prefix rides the write page).
+    offset: u32,
+}
+
 pub struct Context {
     /// The runtime KV working set: a dense ordered array of page slots.
     pub(crate) kv: KvWorkingSet,
@@ -387,7 +407,7 @@ impl Context {
     /// page_size))` (the trailing partial page, if any, is rewritten — CoW
     /// preserves its prior tokens). The fully-complete prior pages
     /// `[0 .. seq_len/page_size)` are the read context.
-    pub(crate) fn prepare_write(&mut self, n: u32) -> Result<(u32, Vec<u32>, Vec<u32>, u32)> {
+    pub(crate) fn prepare_write(&mut self, n: u32) -> Result<KvWrite> {
         let p = self.page_size;
         let first_write_page = self.seq_len / p;
         let total_after = self.seq_len + n;
@@ -398,53 +418,44 @@ impl Context {
                 .alloc(total_pages - have)
                 .map_err(|e| format!("Context::prepare_write: alloc: {e}"))?;
         }
-        let generation = self.kv.generation();
-        let indices: Vec<u32> = (first_write_page..total_pages).collect();
-        let valid_lens: Vec<u32> = indices
-            .iter()
-            .map(|&pg| (total_after - pg * p).min(p))
-            .collect();
-        Ok((generation, indices, valid_lens, first_write_page))
+        // Option B (the 1a-verified DISJOINT convention; the merged `kv-working-set`
+        // is a SYNTACTIC merge of the old kv-context(read) + kv-output(write), not a
+        // semantic re-split): read = the prior FULL pages only `[0, first_write_page)`
+        // (all full → fully valid); write = `[first_write_page, total_pages)`. The
+        // partial-prior prefix (when `seq_len` is mid-page) + the new tokens ride the
+        // write pages' per-page valid-lens, reconstructable host-side from `offset`.
+        // The driver attends read ∪ write — unchanged.
+        Ok(KvWrite {
+            inp_len: first_write_page,
+            valid_read: first_write_page * p,
+            output_start: first_write_page,
+            output_len: total_pages - first_write_page,
+            offset: self.seq_len % p,
+        })
     }
 
-    /// Attach the KV read (`kv-context`) and write (`kv-output`) descriptors
-    /// for a tail write produced by [`prepare_write`](Self::prepare_write) onto
-    /// `pass`.
-    pub(crate) fn attach_kv(
-        &self,
-        pass: &ForwardPass,
-        generation: u32,
-        indices: Vec<u32>,
-        valid_lens: Vec<u32>,
-        ctx_pages: u32,
-    ) {
-        if ctx_pages > 0 {
-            pass.kv_context(&KvContext {
-                set: &self.kv,
-                start: 0,
-                len: ctx_pages,
-                valid_tokens: ctx_pages * self.page_size,
-            });
-        }
-        pass.kv_output(&KvOutput {
-            set: &self.kv,
-            generation,
-            indices,
-            per_page_valid_lens: valid_lens,
-        });
+    /// Attach the merged `kv-working-set` read+write descriptor for a tail write
+    /// produced by [`prepare_write`](Self::prepare_write) onto `pass`.
+    pub(crate) fn attach_kv(&self, pass: &ForwardPass, w: &KvWrite) {
+        pass.kv_working_set(
+            &self.kv,
+            0,
+            w.inp_len,
+            w.valid_read,
+            w.output_start,
+            w.output_len,
+            w.offset,
+        );
     }
 
-    /// Attach a read-only `kv-context` spanning every materialized page (a pure
-    /// decode / scoring pass that writes no new tail tokens).
+    /// Attach a read-only `kv-working-set` spanning every materialized page (a
+    /// pure decode / scoring pass that writes no new tail tokens). No write
+    /// sub-range (`output-len = 0`); `valid-tokens = seq_len` (the real mid-page
+    /// count, since there is no write page to carry the tail).
     pub(crate) fn attach_full_context(&self, pass: &ForwardPass) {
-        let ctx_pages = self.seq_len.div_ceil(self.page_size);
-        if ctx_pages > 0 {
-            pass.kv_context(&KvContext {
-                set: &self.kv,
-                start: 0,
-                len: ctx_pages,
-                valid_tokens: self.seq_len,
-            });
+        let total_pages = self.seq_len.div_ceil(self.page_size);
+        if total_pages > 0 {
+            pass.kv_working_set(&self.kv, 0, total_pages, self.seq_len, 0, 0, 0);
         }
     }
 
@@ -464,14 +475,12 @@ impl Context {
         let n = tokens.len() as u32;
         let positions: Vec<u32> = (self.seq_len..self.seq_len + n).collect();
 
-        let (generation, indices, valid_lens, ctx_pages) = self.prepare_write(n)?;
+        let w = self.prepare_write(n)?;
 
         let pass = ForwardPass::new();
-        self.attach_kv(&pass, generation, indices, valid_lens, ctx_pages);
+        self.attach_kv(&pass, &w);
         pass.input_tokens(&tokens, &positions);
-        pass.execute()
-            .await
-            .map_err(|e| format!("Context::flush: forward pass failed: {e}"))?;
+        pass.execute();
 
         self.history.extend_from_slice(&tokens);
         self.seq_len += n;
@@ -504,13 +513,11 @@ impl Context {
             return Ok(());
         }
 
-        let (generation, indices, valid_lens, ctx_pages) = self.prepare_write(num_tokens)?;
+        let w = self.prepare_write(num_tokens)?;
         let pass = ForwardPass::new();
-        self.attach_kv(&pass, generation, indices, valid_lens, ctx_pages);
+        self.attach_kv(&pass, &w);
         pass.input_image(image, self.seq_len);
-        pass.execute()
-            .await
-            .map_err(|e| format!("append_image: forward pass: {e}"))?;
+        pass.execute();
 
         // The image occupies `num_tokens` physical KV rows; advance the 1-D
         // sequence cursor past them (M-RoPE attention positions for the rows
@@ -547,13 +554,11 @@ impl Context {
             return Ok(());
         }
 
-        let (generation, indices, valid_lens, ctx_pages) = self.prepare_write(num_tokens)?;
+        let w = self.prepare_write(num_tokens)?;
         let pass = ForwardPass::new();
-        self.attach_kv(&pass, generation, indices, valid_lens, ctx_pages);
+        self.attach_kv(&pass, &w);
         pass.input_audio(audio, self.seq_len);
-        pass.execute()
-            .await
-            .map_err(|e| format!("append_audio: forward pass: {e}"))?;
+        pass.execute();
 
         self.seq_len += num_tokens;
         // Soft-token KV cannot be reconstructed from the token log.

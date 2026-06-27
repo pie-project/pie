@@ -168,27 +168,71 @@ pub struct ForwardPass {
     /// Set when the ctx is bound via `context()` (the new WIT `forward-pass`
     /// constructor takes no model — the context carries the model identity).
     pub model_id: usize,
-    /// Explicit forward-pass memory descriptors (W5). Captured by the
-    /// kv-context / kv-output / rs-context / rs-output setters and resolved to
-    /// physical pages inside the atomic arena transaction at `execute()`.
-    /// There is no ambient context handle and no implicit append.
-    kv_context: Option<pie::core::inference::KvContext>,
-    kv_output: Option<pie::core::inference::KvOutput>,
-    rs_context: Option<pie::core::inference::RsBufferContext>,
-    rs_output: Option<pie::core::inference::RsBufferOutput>,
-    /// `fold-buffered(n)` (W9 piggyback): fold the first `n` buffered RS tokens
+    /// Merged kv-working-set descriptor (#21 WIT `kv-working-set`): read context
+    /// `[inp_start, inp_start+inp_len)` with `valid_tokens` prefix, write the
+    /// CONTIGUOUS slot range `[output_start, output_start+output_len)` whose first
+    /// written row sits at in-page token `offset`. Resolved to physical pages in
+    /// the atomic arena transaction at `execute()`. Replaces the split
+    /// kv-context/kv-output records (no generation/indices — the inferlet owns
+    /// working-set correctness).
+    kv_ws: Option<KvWorkingSetDesc>,
+    /// Merged rs-working-set descriptor (#21 WIT `rs-working-set`): the buffered
+    /// recurrent-state token range `[start_token, start_token+len_tokens)`.
+    rs_ws: Option<RsWorkingSetDesc>,
+    /// `rs-fold-buffered(n)` (W9 piggyback): fold the first `n` buffered RS tokens
     /// of this pass's RS working set into its folded state as part of this
     /// forward. Lowered to `rs_fold_lens` + `RS_FLAG_FOLD` over the buffered
     /// slabs (`rs_buffer_slot_ids`); the driver gathers + replays them.
     fold_buffered_tokens: Option<u32>,
     pub adapter_seed: Option<i64>,
     req: pie_driver_abi::ForwardRequest,
-    /// Sampling programs attached via `sampler(...)` / `batch-sampler(...)`,
-    /// each with its attach-time binding-map and gathered submit inputs.
-    /// Empty for a pass that does no sampling (pure prefill); one entry for the
-    /// single-sampler path; many for `batch-sampler`. Flattened into the bridge
-    /// carrier at `execute()`.
+    /// `next-inputs(positions)` (#21 run-ahead carrier, delta's L-map): the NEXT
+    /// pass's input slots the carrier fills with THIS pass's sampled token. The
+    /// host assigns the link L (`next_input_map::apply_next_input_carrier`); the
+    /// guest threads no link-ids.
+    next_input_positions: Vec<u32>,
+    /// `next-attention-mask(mask)` (#21 run-ahead): the attention-mask carrier
+    /// for the next pass (parallel to `next-inputs`). Recorded here; the carrier
+    /// wiring rides delta's next-input L-map. Empty on the greedy-decode path.
+    next_attention_mask: Vec<Brle>,
+    /// Sampling programs attached via `sampler(...)` / `samplers(...)`, each with
+    /// its attach-time binding-map and gathered submit inputs. Empty for a pass
+    /// that does no sampling (pure prefill); one entry for the single-sampler
+    /// path; many for `samplers`. Flattened into the bridge carrier at `execute()`.
     programs: Vec<AttachedProgram>,
+    /// #21 1c run-ahead: the in-flight forward state stored by the sync
+    /// `execute()` (eager-submit) and consumed by the async `output()`/`outputs()`
+    /// (await→finalize→tensor). `None` until `execute()`; the forward-pass IS the
+    /// in-flight handle (Option A).
+    pending: Option<PendingForward>,
+    /// A prepare/submit error deferred from the SYNC `execute()` (the WIT
+    /// `execute: func()` returns nothing, so a recoverable failure can't surface
+    /// there). The async `output()`/`outputs()` reports it as the WIT `error`.
+    exec_error: Option<String>,
+}
+
+/// Merged kv-working-set descriptor — see [`ForwardPass::kv_ws`].
+struct KvWorkingSetDesc {
+    set: Resource<crate::working_set::kv::KvWorkingSet>,
+    inp_start: u32,
+    /// Read-context page count `[inp_start, inp_start+inp_len)`. Retained for WIT
+    /// descriptor completeness; the host read derives the pinned page count from
+    /// `valid_tokens` (the valid attention prefix) — `inp_len`'s trailing
+    /// reserved slots may be unwritten and must not be resolved. In the disjoint
+    /// (Option-B) convention `inp_len == valid_tokens.div_ceil(page_size)`.
+    #[allow(dead_code)]
+    inp_len: u32,
+    valid_tokens: u32,
+    output_start: u32,
+    output_len: u32,
+    offset: u32,
+}
+
+/// Merged rs-working-set descriptor — see [`ForwardPass::rs_ws`].
+struct RsWorkingSetDesc {
+    set: Resource<crate::working_set::rs::RsWorkingSet>,
+    start_token: u32,
+    len_tokens: u32,
 }
 
 /// One sampling program staged on a [`ForwardPass`] before submit: its L0
@@ -237,82 +281,58 @@ fn dtype_byte_size(dtype: pie::core::tensor::Dtype) -> usize {
     }
 }
 
-/// Reconstruct each attached program's declared outputs as a flat
-/// `output.slots: list<slot-output>` from a driver [`ForwardOutput`] (SEAM-A:
-/// the host produces P3's `slot-output`). Walks the programs in attach order
-/// and, within each, its declared output kinds in slot order, so the flat slot
-/// list mirrors the SDK's `program_token`/`program_scalar` handle order. Token
-/// outputs → `slot-output::token`; Scalar/Entropy → `slot-output::entropy` (the
-/// mirostat surprise `S` / μ rides the scalar `entropy` channel — the
-/// load-bearing scalar readback). The remaining F32 measurement kinds
-/// (distribution/logits/logprobs/embedding) are tracked #18/WS5 follow-up.
-fn build_program_slots(
+/// One host `tensor` output: the program's declared output value (#21 —
+/// `output()`/`outputs()` return raw tensors directly; the `slot-output` enum
+/// dissolved). dtype/shape come from the program's declared `OutputKind` (the
+/// host already knows them from the program).
+struct OutputTensor {
+    shape: Vec<u32>,
+    dtype: pie::core::tensor::Dtype,
+    data: Vec<u8>,
+}
+
+/// Reconstruct each attached program's declared outputs as host `tensor`s, in
+/// attach order then per-program output-slot order. Token → `[1] i32`;
+/// Scalar/Entropy → `[1] f32` (mirostat S/μ); Logits/Logprobs → `[k] f32`. The
+/// bare-token fast paths are the common greedy/decode shape (one `i32` token).
+fn build_output_tensors(
     output: ForwardOutput,
     programs_output_kinds: &[Vec<pie_sampling_ir::OutputKind>],
-) -> pie::core::inference::Output {
-    use pie::core::inference::SlotOutput as WitSlot;
+) -> Vec<OutputTensor> {
+    use pie::core::tensor::Dtype;
     match output {
-        // Bare-token fast paths (no rich response): one `token` slot per sampled
-        // token, in row order — the common single-program decode shape, and the
-        // spec-verify walk (token count unrelated to the sampler count).
-        ForwardOutput::Token(token) => pie::core::inference::Output {
-            slots: vec![WitSlot::Token(token)],
-            spec_tokens: Vec::new(),
-            spec_positions: Vec::new(),
-        },
-        ForwardOutput::Tokens(tokens) => pie::core::inference::Output {
-            slots: tokens.into_iter().map(WitSlot::Token).collect(),
-            spec_tokens: Vec::new(),
-            spec_positions: Vec::new(),
-        },
+        ForwardOutput::Token(token) => vec![OutputTensor {
+            shape: vec![1],
+            dtype: Dtype::I32,
+            data: token.to_le_bytes().to_vec(),
+        }],
+        ForwardOutput::Tokens(tokens) => tokens
+            .into_iter()
+            .map(|t| OutputTensor {
+                shape: vec![1],
+                dtype: Dtype::I32,
+                data: t.to_le_bytes().to_vec(),
+            })
+            .collect(),
         ForwardOutput::Response(resp) => {
-            build_program_slots_from_response(resp, programs_output_kinds)
+            build_output_tensors_from_response(resp, programs_output_kinds)
         }
     }
 }
 
-/// Per-program flat `slot-output` reconstruction over a rich [`ForwardResponse`]
-/// (single-request shape: indptrs `[0, N]`): the program analog of P3's
-/// `build_wit_output_from_response` sampler walk. Program outputs reuse the
-/// response channels (token / distribution / logits / logprobs / entropy),
-/// pulled in attach order then output order so each program consumes its share.
-fn build_program_slots_from_response(
+/// Per-program tensor reconstruction over a rich [`ForwardResponse`] (#21:
+/// program outputs → host `tensor`s, in attach then output-slot order, pulled
+/// from the response channels). Token → `[1] i32`; Scalar/Entropy → `[1] f32`;
+/// Logits/Logprobs → `[k] f32`. Distribution (ids+probs pair) + Embedding are
+/// #18/WS5 follow-ups (not on the greedy-decode path).
+fn build_output_tensors_from_response(
     resp: pie_driver_abi::ForwardResponse,
     programs_output_kinds: &[Vec<pie_sampling_ir::OutputKind>],
-) -> pie::core::inference::Output {
-    use pie::core::inference::SlotOutput as WitSlot;
+) -> Vec<OutputTensor> {
+    use pie::core::tensor::Dtype;
     use pie_sampling_ir::OutputKind;
 
-    // Per-request spec side channel for the next iteration's draft tokens.
-    let (spec_tokens, spec_positions): (Vec<u32>, Vec<u32>) = if resp.spec_indptr.len() >= 2 {
-        let lo = resp.spec_indptr[0] as usize;
-        let hi = resp.spec_indptr[1] as usize;
-        (
-            resp.spec_tokens.get(lo..hi).unwrap_or(&[]).to_vec(),
-            resp.spec_positions.get(lo..hi).unwrap_or(&[]).to_vec(),
-        )
-    } else {
-        (resp.spec_tokens.clone(), resp.spec_positions.clone())
-    };
-
     let mut tok_iter = resp.tokens.into_iter();
-    // Distribution: (ids, probs) pairs per kv_indptr range.
-    let mut dist_iter: Box<dyn Iterator<Item = (Vec<u32>, Vec<f32>)>> =
-        if resp.dists_kv_indptr.len() >= 2 {
-            let kvs: Vec<_> = (0..resp.dists_kv_indptr.len() - 1)
-                .map(|k| {
-                    let lo = resp.dists_kv_indptr[k] as usize;
-                    let hi = resp.dists_kv_indptr[k + 1] as usize;
-                    (
-                        resp.dists_ids[lo..hi].to_vec(),
-                        resp.dists_probs[lo..hi].to_vec(),
-                    )
-                })
-                .collect();
-            Box::new(kvs.into_iter())
-        } else {
-            Box::new(std::iter::empty())
-        };
     let mut logit_iter: Box<dyn Iterator<Item = Vec<u8>>> = if resp.logits_byte_indptr.len() >= 2 {
         let blobs: Vec<_> = (0..resp.logits_byte_indptr.len() - 1)
             .map(|b| {
@@ -339,33 +359,44 @@ fn build_program_slots_from_response(
     };
     let mut ent_iter = resp.entropies.into_iter();
 
-    let mut slots: Vec<WitSlot> = Vec::new();
+    let mut tensors: Vec<OutputTensor> = Vec::new();
     for kinds in programs_output_kinds {
         for kind in kinds {
-            let slot = match kind {
-                OutputKind::Token => tok_iter.next().map(WitSlot::Token),
-                OutputKind::Distribution => dist_iter.next().map(WitSlot::Distribution),
-                OutputKind::Logits => logit_iter.next().map(WitSlot::Logits),
-                OutputKind::Logprobs => lp_iter.next().map(WitSlot::Logprobs),
+            let t = match kind {
+                OutputKind::Token => tok_iter.next().map(|tok| OutputTensor {
+                    shape: vec![1],
+                    dtype: Dtype::I32,
+                    data: tok.to_le_bytes().to_vec(),
+                }),
                 // Entropy + Scalar (mirostat μ / S = −log p) share the per-slot
-                // scalar `entropies` channel → `slot-output::entropy`.
+                // scalar `entropies` channel.
                 OutputKind::Entropy | OutputKind::Scalar => {
-                    ent_iter.next().map(WitSlot::Entropy)
+                    ent_iter.next().map(|e| OutputTensor {
+                        shape: vec![1],
+                        dtype: Dtype::F32,
+                        data: e.to_le_bytes().to_vec(),
+                    })
                 }
-                // Embedding reserved; not produced by the worker yet.
-                OutputKind::Embedding => None,
+                OutputKind::Logits => logit_iter.next().map(|bytes| OutputTensor {
+                    shape: vec![(bytes.len() / 4) as u32],
+                    dtype: Dtype::F32,
+                    data: bytes,
+                }),
+                OutputKind::Logprobs => lp_iter.next().map(|lps| OutputTensor {
+                    shape: vec![lps.len() as u32],
+                    dtype: Dtype::F32,
+                    data: bytemuck::cast_slice(&lps).to_vec(),
+                }),
+                // Distribution (ids+probs pair) + Embedding: rich-measurement
+                // tensors, #18/WS5 follow-up.
+                OutputKind::Distribution | OutputKind::Embedding => None,
             };
-            if let Some(s) = slot {
-                slots.push(s);
+            if let Some(t) = t {
+                tensors.push(t);
             }
         }
     }
-
-    pie::core::inference::Output {
-        slots,
-        spec_tokens,
-        spec_positions,
-    }
+    tensors
 }
 
 impl pie::core::inference::Host for InstanceState {}
@@ -384,106 +415,96 @@ impl pie::core::inference::HostForwardPass for InstanceState {
         // ambient context handle.
         let pass = ForwardPass {
             model_id: 0,
-            kv_context: None,
-            kv_output: None,
-            rs_context: None,
-            rs_output: None,
+            kv_ws: None,
+            rs_ws: None,
             fold_buffered_tokens: None,
             adapter_seed: None,
             req: empty_forward_request(),
+            next_input_positions: Vec::new(),
+            next_attention_mask: Vec::new(),
             programs: Vec::new(),
+            pending: None,
+            exec_error: None,
         };
         Ok(self.ctx().table.push(pass)?)
     }
 
-    /// KV pages this pass reads as attention context. Replaces the old opaque
-    /// `context` handle (W5). Resolved to physical pages in the txn prepare.
-    async fn kv_context(
+    /// Merged kv-working-set descriptor (#21 WIT `kv-working-set`): read context
+    /// = prior FULL pages `[inp_start, inp_start+inp_len)` with `valid_tokens`
+    /// prefix; write = the contiguous new-KV range `[output_start,
+    /// output_start+output_len)`; `offset` = in-page token offset of the first
+    /// written row (the first write page's partial-prior prefix → last-page
+    /// valid_len). Read ⊎ write disjoint (Option B); resolved to physical pages
+    /// in the txn prepare. The inferlet owns working-set correctness — no
+    /// generation/indices guard.
+    #[allow(clippy::too_many_arguments)]
+    async fn kv_working_set(
         &mut self,
         this: Resource<ForwardPass>,
-        ctx: pie::core::inference::KvContext,
+        set: Resource<crate::working_set::kv::KvWorkingSet>,
+        inp_start: u32,
+        inp_len: u32,
+        valid_tokens: u32,
+        output_start: u32,
+        output_len: u32,
+        offset: u32,
     ) -> Result<()> {
-        self.ctx().table.get_mut(&this)?.kv_context = Some(ctx);
+        let set = Resource::new_borrow(set.rep());
+        self.ctx().table.get_mut(&this)?.kv_ws = Some(KvWorkingSetDesc {
+            set,
+            inp_start,
+            inp_len,
+            valid_tokens,
+            output_start,
+            output_len,
+            offset,
+        });
         Ok(())
     }
 
-    /// KV pages this pass writes (with per-page valid lengths + captured
-    /// generation for stale-mutation rejection).
-    async fn kv_output(
+    // ── #21 run-ahead next-input carrier (delta's host L-map) ───────────
+    /// `next-inputs(positions)`: the NEXT pass's input slots the carrier fills
+    /// with THIS pass's sampled token. Host owns the link L (assigned at
+    /// `execute()` via [`crate::api::next_input_map::apply_next_input_carrier`]);
+    /// the guest threads no link-ids (replaces the 3 granular link setters).
+    async fn next_inputs(
         &mut self,
         this: Resource<ForwardPass>,
-        out: pie::core::inference::KvOutput,
+        positions: Vec<u32>,
     ) -> Result<()> {
-        self.ctx().table.get_mut(&this)?.kv_output = Some(out);
+        self.ctx().table.get_mut(&this)?.next_input_positions = positions;
         Ok(())
     }
 
-    // ── #6 WS8 P2 run-ahead next-input carrier (delta) ──────────────
-    /// Mark this pass as a device-resident next-input source: its `pi.sampled`
-    /// is retained under global link `link` (monotonic, nonzero) until freed.
-    async fn pipeline_source_link(
+    /// `next-attention-mask(mask)`: the attention-mask carrier for the next pass
+    /// (run-ahead mask carryover, parallel to `next-inputs`). Recorded; the
+    /// carrier wiring rides delta's L-map. Inert on the greedy-decode path.
+    async fn next_attention_mask(
         &mut self,
         this: Resource<ForwardPass>,
-        link: u32,
+        mask: Vec<Vec<u32>>,
     ) -> Result<()> {
-        self.ctx()
-            .table
-            .get_mut(&this)?
-            .req
-            .set_pipeline_source_link(link);
+        let brle_masks: Vec<Brle> = mask.into_iter().map(Brle::from_vec).collect();
+        self.ctx().table.get_mut(&this)?.next_attention_mask = brle_masks;
         Ok(())
     }
 
-    /// Source this pass's input slot `dest_slot` device-side from producer
-    /// `link`'s retained `pi.sampled[src_row]` (the carried-input carryover);
-    /// the driver injects it before the forward reads `pi.tokens`.
-    async fn next_input_link(
+    /// Merged rs-working-set descriptor (#21 WIT `rs-working-set`): the buffered
+    /// recurrent-state token range `[start_token, start_token+len_tokens)`
+    /// (read+write). Materialised + pinned in the txn prepare.
+    async fn rs_working_set(
         &mut self,
         this: Resource<ForwardPass>,
-        link: u32,
-        src_row: u32,
-        dest_slot: u32,
+        set: Resource<crate::working_set::rs::RsWorkingSet>,
+        start_token: u32,
+        len_tokens: u32,
     ) -> Result<()> {
-        self.ctx()
-            .table
-            .get_mut(&this)?
-            .req
-            .push_next_input_link(link, src_row, dest_slot);
-        Ok(())
-    }
-
-    /// Signal that producer `link`'s last consumer drains on this pass → the
-    /// driver frees its retained `pi.sampled` copy after the pass's stream sync.
-    async fn next_input_free_link(
-        &mut self,
-        this: Resource<ForwardPass>,
-        link: u32,
-    ) -> Result<()> {
-        self.ctx()
-            .table
-            .get_mut(&this)?
-            .req
-            .push_next_input_free_link(link);
-        Ok(())
-    }
-
-    /// Buffered recurrent state this pass reads (hybrid / linear-attention).
-    async fn rs_context(
-        &mut self,
-        this: Resource<ForwardPass>,
-        ctx: pie::core::inference::RsBufferContext,
-    ) -> Result<()> {
-        self.ctx().table.get_mut(&this)?.rs_context = Some(ctx);
-        Ok(())
-    }
-
-    /// Buffered recurrent state this pass writes (without folding; W10).
-    async fn rs_output(
-        &mut self,
-        this: Resource<ForwardPass>,
-        out: pie::core::inference::RsBufferOutput,
-    ) -> Result<()> {
-        self.ctx().table.get_mut(&this)?.rs_output = Some(out);
+        let set = Resource::new_borrow(set.rep());
+        self.ctx().table.get_mut(&this)?.rs_ws = Some(RsWorkingSetDesc {
+            set,
+            start_token,
+            len_tokens,
+        });
         Ok(())
     }
 
@@ -491,7 +512,7 @@ impl pie::core::inference::HostForwardPass for InstanceState {
     /// into its folded recurrent state as part of this forward (W9 piggyback).
     /// Recorded here; `execute()` lowers it to `rs_fold_lens` + `RS_FLAG_FOLD`
     /// over the buffered slabs so the driver gathers + replays them in-forward.
-    async fn fold_buffered(&mut self, this: Resource<ForwardPass>, tokens: u32) -> Result<()> {
+    async fn rs_fold_buffered(&mut self, this: Resource<ForwardPass>, tokens: u32) -> Result<()> {
         self.ctx().table.get_mut(&this)?.fold_buffered_tokens = Some(tokens);
         Ok(())
     }
@@ -607,18 +628,6 @@ impl pie::core::inference::HostForwardPass for InstanceState {
         Ok(())
     }
 
-    async fn input_speculative_tokens(
-        &mut self,
-        this: Resource<ForwardPass>,
-        tokens: Vec<u32>,
-        positions: Vec<u32>,
-    ) -> Result<()> {
-        let pass = self.ctx().table.get_mut(&this)?;
-        pass.req.spec_token_ids.extend(tokens);
-        pass.req.spec_position_ids.extend(positions);
-        Ok(())
-    }
-
     async fn output_speculative_tokens(
         &mut self,
         this: Resource<ForwardPass>,
@@ -626,13 +635,6 @@ impl pie::core::inference::HostForwardPass for InstanceState {
     ) -> Result<()> {
         let pass = self.ctx().table.get_mut(&this)?;
         pass.req.output_spec_flags = vec![flag];
-        Ok(())
-    }
-
-    async fn pass_speculation(&mut self, _this: Resource<ForwardPass>, _flag: bool) -> Result<()> {
-        // Runtime pass-level speculation chains are removed (W15); the runtime
-        // keeps no hidden speculative state in working-set semantics. Manual
-        // draft tokens still flow via `input-speculative-tokens`. Inert now.
         Ok(())
     }
 
@@ -645,15 +647,6 @@ impl pie::core::inference::HostForwardPass for InstanceState {
 
         let pass = self.ctx().table.get_mut(&this)?;
         pass.req.masks = brle_masks;
-        Ok(())
-    }
-
-    /// Per-position logit mask (`brle` = `list<u32>` run-length pairs over the
-    /// vocab). If not set, no masking. Lowered to the request's `logit_masks`.
-    async fn logit_mask(&mut self, this: Resource<ForwardPass>, mask: Vec<u32>) -> Result<()> {
-        let brle = Brle::from_vec(mask);
-        let pass = self.ctx().table.get_mut(&this)?;
-        pass.req.logit_masks = vec![brle];
         Ok(())
     }
 
@@ -679,7 +672,7 @@ impl pie::core::inference::HostForwardPass for InstanceState {
         Ok(())
     }
 
-    async fn batch_sampler(
+    async fn samplers(
         &mut self,
         this: Resource<ForwardPass>,
         programs: Vec<Resource<Program>>,
@@ -687,7 +680,7 @@ impl pie::core::inference::HostForwardPass for InstanceState {
     ) -> Result<()> {
         if programs.len() != inputs.len() {
             return Err(anyhow::anyhow!(
-                "batch-sampler: {} programs but {} binding lists",
+                "samplers: {} programs but {} binding lists",
                 programs.len(),
                 inputs.len()
             ));
@@ -718,6 +711,17 @@ impl pie::core::inference::HostForwardPass for InstanceState {
         // resource-table entry.
         self.ctx().table.delete(this)?;
         Ok(())
+    }
+
+    /// #21: SYNC eager-submit (`execute: func()` — no return). Prepares + submits
+    /// the forward and stores the in-flight [`PendingForward`] on the forward-pass
+    /// (Option A — the pass IS the in-flight handle); a recoverable prepare/submit
+    /// failure is deferred to `output()`/`outputs()` (stored as `exec_error`),
+    /// since `execute` has no `error` channel. Delegates to the free
+    /// [`execute_impl`] (the sync `HostForwardPass` trait gives `&mut self`, so no
+    /// `accessor` is threaded).
+    async fn execute(&mut self, this: Resource<ForwardPass>) -> Result<()> {
+        execute_impl(self, this).await
     }
 }
 
@@ -759,6 +763,15 @@ impl InstanceState {
                     saw_logits = true;
                     logits_positions = positions;
                     bindings.push(pie_sampling_ir::Binding::Logits);
+                }
+                InputBinding::MtpLogits => {
+                    // #21 mtp-logits (de-hardwired speculation): a second
+                    // intrinsic source-select (the speculator's draft buffer vs
+                    // `ws.logits`). Phase-2 forward-prep — echo's IntrinsicKind
+                    // source-select; not on the Phase-1a greedy-decode path.
+                    return Err(anyhow::anyhow!(
+                        "mtp-logits binding is not supported until phase-2 (echo's IntrinsicKind source-select)"
+                    ));
                 }
                 InputBinding::Tensor(tensor) => {
                     // Submit binding: the value is final once the inferlet has
@@ -889,18 +902,165 @@ impl pie::core::tensor::HostProgram for InstanceState {
     }
 }
 
+/// In-flight forward state carried from the eager submit across the async
+/// driver round-trip to the await→finalize. Phase-2
+/// ([`finalize_forward_output`]) consumes it. The owned `txn` keeps the pins /
+/// CoW copies alive until commit/abort; `rx` is the driver completion handle.
+///
+/// Today `execute` builds this then finalizes inline (single WIT method). The
+/// 1c run-ahead surface (Option A — the forward-pass IS the in-flight handle)
+/// stores it on the forward-pass so the async `output()`/`outputs()` awaits it;
+/// the eager `execute` releases its `&mut ctx` borrow at that point so the loop
+/// can hold two passes in flight (the `submit_async`→scheduler boundary).
+struct PendingForward {
+    rx: tokio::sync::oneshot::Receiver<Result<ForwardOutput>>,
+    txn: crate::arena::ArenaTxn,
+    kv_set: Option<Resource<crate::working_set::kv::KvWorkingSet>>,
+    seal_hashes: Vec<(u32, u64)>,
+    model_id: usize,
+    driver_idx: usize,
+    rs_fold_set: Option<Resource<crate::working_set::rs::RsWorkingSet>>,
+    fold_buffered_tokens: Option<u32>,
+    programs_output_kinds: Vec<Vec<pie_sampling_ir::OutputKind>>,
+    profile_start: Option<Instant>,
+}
+
+/// Phase-2 of a forward pass: await the driver round-trip, finalize the forward
+/// txn (commit/abort + seal/fold via [`InstanceState::finalize_forward_txn`],
+/// store reachable through `accessor.with`), and reconstruct the program's
+/// declared output tensors. Consumes the [`PendingForward`] stored on the
+/// forward-pass by the eager `execute`. The async `output()`/`outputs()` surface
+/// calls this after taking the stored `PendingForward`.
+async fn await_and_finalize(
+    accessor: &Accessor<InstanceState, HasSelf<InstanceState>>,
+    pending: PendingForward,
+) -> Result<Result<Vec<OutputTensor>, String>> {
+    let PendingForward {
+        rx,
+        txn,
+        kv_set,
+        seal_hashes,
+        model_id,
+        driver_idx,
+        rs_fold_set,
+        fold_buffered_tokens,
+        programs_output_kinds,
+        profile_start,
+    } = pending;
+
+    // Await the driver result (P3 native async), then finalize the forward txn
+    // (store reachable via `accessor.with`).
+    let forward_result: Option<ForwardOutput> = match rx.await {
+        Ok(Ok(resp)) => Some(resp),
+        Ok(Err(e)) => {
+            tracing::warn!("future output failed: {e:#}");
+            None
+        }
+        Err(_) => None,
+    };
+    let success = forward_result.is_some();
+
+    accessor.with(|mut access| {
+        access.get().finalize_forward_txn(
+            success,
+            txn,
+            kv_set,
+            seal_hashes,
+            model_id,
+            driver_idx,
+            rs_fold_set,
+            fold_buffered_tokens,
+        )
+    })?;
+
+    let tensors = match forward_result {
+        Some(resp) => build_output_tensors(resp, &programs_output_kinds),
+        None => Vec::new(),
+    };
+    if let Some(start) = profile_start {
+        record_execute_profile(ExecuteProfileSample::default(), elapsed_us(start.elapsed()));
+    }
+    Ok(Ok(tensors))
+}
+
 impl pie::core::inference::HostForwardPassWithStore<InstanceState> for HasSelf<InstanceState> {
-    /// Native async (WASI P3 component-model-async). There is no guest-visible
-    /// `future-output` resource anymore: `execute` runs prepare → submit →
-    /// await → finalize inline and returns the WIT `output` directly. Because
-    /// the commit/abort runs in THIS async fn (where the store is reachable via
-    /// `accessor.with`), the forward txn is finalized atomically with the pass —
-    /// the lost-KV-commit failure mode of the old pollable/get split (commit
-    /// unreachable from `&mut FutureOutput`) is structurally impossible.
-    async fn execute(
+    /// #21 `output: async func() -> result<tensor, error>`. Takes the
+    /// [`PendingForward`] stored on the forward-pass by the SYNC `execute`,
+    /// awaits + finalizes it ([`await_and_finalize`]), and returns the program's
+    /// FIRST declared output as a host `tensor`. Because the commit/abort runs in
+    /// THIS async fn (store reachable via `accessor.with`), the forward txn is
+    /// finalized atomically with the read — the lost-KV-commit failure mode of a
+    /// pollable/get split is structurally impossible.
+    async fn output(
         accessor: &Accessor<InstanceState, Self>,
         this: Resource<ForwardPass>,
-    ) -> Result<Result<pie::core::inference::Output, String>> {
+    ) -> Result<Result<Resource<Tensor>, String>> {
+        let (pending, exec_error) = accessor.with(|mut access| -> Result<_> {
+            let pass = access.get().ctx().table.get_mut(&this)?;
+            Ok((pass.pending.take(), pass.exec_error.take()))
+        })?;
+        if let Some(e) = exec_error {
+            return Ok(Err(e));
+        }
+        let Some(pending) = pending else {
+            return Ok(Err("output() called before execute() (or output already taken)".into()));
+        };
+        let tensors = match await_and_finalize(accessor, pending).await? {
+            Ok(t) => t,
+            Err(e) => return Ok(Err(e)),
+        };
+        let Some(OutputTensor { shape, dtype, data }) = tensors.into_iter().next() else {
+            return Ok(Err("forward produced no output tensor".into()));
+        };
+        let handle = accessor.with(|mut access| -> Result<_> {
+            Ok(access.get().ctx().table.push(Tensor { shape, dtype, data })?)
+        })?;
+        Ok(Ok(handle))
+    }
+
+    /// #21 `outputs: async func() -> result<list<tensor>, error>`. As [`output`]
+    /// but returns ALL of the attached programs' declared outputs (attach order
+    /// then per-program output-slot order), one host `tensor` each.
+    async fn outputs(
+        accessor: &Accessor<InstanceState, Self>,
+        this: Resource<ForwardPass>,
+    ) -> Result<Result<Vec<Resource<Tensor>>, String>> {
+        let (pending, exec_error) = accessor.with(|mut access| -> Result<_> {
+            let pass = access.get().ctx().table.get_mut(&this)?;
+            Ok((pass.pending.take(), pass.exec_error.take()))
+        })?;
+        if let Some(e) = exec_error {
+            return Ok(Err(e));
+        }
+        let Some(pending) = pending else {
+            return Ok(Err("outputs() called before execute() (or output already taken)".into()));
+        };
+        let tensors = match await_and_finalize(accessor, pending).await? {
+            Ok(t) => t,
+            Err(e) => return Ok(Err(e)),
+        };
+        let mut handles = Vec::with_capacity(tensors.len());
+        for OutputTensor { shape, dtype, data } in tensors {
+            let handle = accessor.with(|mut access| -> Result<_> {
+                Ok(access.get().ctx().table.push(Tensor { shape, dtype, data })?)
+            })?;
+            handles.push(handle);
+        }
+        Ok(Ok(handles))
+    }
+}
+
+/// #21 eager-submit (free fn so the SYNC `HostForwardPass::execute` can call it
+/// with `&mut InstanceState` — the sync trait has no `accessor`). Prepares +
+/// submits the forward and stores the in-flight [`PendingForward`] on the
+/// forward-pass; the async `output()`/`outputs()` await + finalize it. A
+/// recoverable prepare/submit failure is stored as the pass's `exec_error`
+/// (surfaced by `output()`), NOT returned here — `execute: func()` has no error
+/// channel. The outer `Result` is reserved for unrecoverable host traps.
+async fn execute_impl(
+    state: &mut InstanceState,
+    this: Resource<ForwardPass>,
+) -> Result<()> {
         let profile_start = execute_profile_enabled().then(Instant::now);
         // Drain the accumulator: the explicit memory descriptors + the staged
         // ForwardRequest. There is no ambient context handle (W5). Every store /
@@ -909,27 +1069,25 @@ impl pie::core::inference::HostForwardPassWithStore<InstanceState> for HasSelf<I
         let (
             model_id,
             adapter_seed,
-            kv_context,
-            kv_output,
-            _rs_context,
-            rs_output,
+            kv_ws,
+            rs_ws,
             fold_buffered_tokens,
             mut req,
             attached_programs,
-        ) = accessor.with(|mut access| -> Result<_> {
-            let pass = access.get().ctx().table.get_mut(&this)?;
-            Ok((
+            next_input_positions,
+        ) = {
+            let pass = state.ctx().table.get_mut(&this)?;
+            (
                 pass.model_id,
                 pass.adapter_seed,
-                pass.kv_context.take(),
-                pass.kv_output.take(),
-                pass.rs_context.take(),
-                pass.rs_output.take(),
+                pass.kv_ws.take(),
+                pass.rs_ws.take(),
                 pass.fold_buffered_tokens.take(),
                 std::mem::replace(&mut pass.req, empty_forward_request()),
                 std::mem::take(&mut pass.programs),
-            ))
-        })?;
+                std::mem::take(&mut pass.next_input_positions),
+            )
+        };
         // v1: single-driver. Multi-driver binds the working set's device on
         // first materialization (`bind_driver`), wired at consolidation.
         let driver_idx = 0usize;
@@ -991,7 +1149,9 @@ impl pie::core::inference::HostForwardPassWithStore<InstanceState> for HasSelf<I
         // no-op submit; the old context API rejected this. Image/audio spans
         // push placeholder rows into `token_ids`, so this covers all input kinds.
         if let Err(e) = forward_prepare::check_input_nonempty(req.token_ids.len()) {
-            return Ok(Err(format!("{e:?}")));
+            // Defer to `output()` — `execute: func()` has no error channel.
+            state.ctx().table.get_mut(&this)?.exec_error = Some(format!("{e:?}"));
+            return Ok(());
         }
 
         // WIT spec: "if not provided, fallback to causal mask". Then stamp the
@@ -1020,11 +1180,7 @@ impl pie::core::inference::HostForwardPassWithStore<InstanceState> for HasSelf<I
         req.kv_page_indptr = vec![0];
         // Batch-affinity id: the KV working set's resource handle replaces the
         // old context id (used by the scheduler for request grouping).
-        let affinity = kv_output
-            .as_ref()
-            .map(|o| o.set.rep())
-            .or_else(|| kv_context.as_ref().map(|c| c.set.rep()))
-            .unwrap_or(0);
+        let affinity = kv_ws.as_ref().map(|d| d.set.rep()).unwrap_or(0);
         req.context_ids = vec![affinity as u64];
 
         let page_size = crate::page_size::tokens_per_page(model_id);
@@ -1039,8 +1195,7 @@ impl pie::core::inference::HostForwardPassWithStore<InstanceState> for HasSelf<I
             crate::arena::ArenaTxn,
             Vec<crate::arena::MovePlan>,
         );
-        let prepared: std::result::Result<PrepOut, String> = accessor.with(|mut access| {
-            let state = access.get();
+        let prepared: std::result::Result<PrepOut, String> = 'prepare: {
             let arena_arc = crate::arena::get(model_id, driver_idx);
             let mut arena = arena_arc.lock().unwrap();
             let mut txn = arena.txn_begin();
@@ -1061,13 +1216,13 @@ impl pie::core::inference::HostForwardPassWithStore<InstanceState> for HasSelf<I
                 // empty") that are not part of attention and may be unwritten;
                 // resolving the full `len` would reject them. `valid_pages` is the
                 // ceil of valid-tokens. Pure prefill (valid_tokens==0) reads none.
-                let (context_pages, valid_tokens) = if let Some(kc) = &kv_context {
-                    let valid_pages = kc.valid_tokens.div_ceil(page_size);
+                let (context_pages, valid_tokens) = if let Some(d) = &kv_ws {
+                    let valid_pages = d.valid_tokens.div_ceil(page_size);
                     let objs = if valid_pages == 0 {
                         Vec::new()
                     } else {
-                        match state.ctx().table.get(&kc.set) {
-                            Ok(ws) => match ws.resolve_read(kc.start, valid_pages) {
+                        match state.ctx().table.get(&d.set) {
+                            Ok(ws) => match ws.resolve_read(d.inp_start, valid_pages) {
                                 Ok(o) => o,
                                 Err(e) => break 'prep Err(e.to_string()),
                             },
@@ -1084,33 +1239,31 @@ impl pie::core::inference::HostForwardPassWithStore<InstanceState> for HasSelf<I
                             Err(e) => break 'prep Err(e.to_string()),
                         }
                     }
-                    (pages, kc.valid_tokens)
+                    (pages, d.valid_tokens)
                 } else {
                     (Vec::new(), 0)
                 };
 
-                // KV write outputs → CoW'd + pinned physical pages.
+                // KV write outputs → CoW'd + pinned physical pages. #21 Option-B
+                // adapter: the write is the CONTIGUOUS slot range `[output_start,
+                // output_start+output_len)`. Per-page valid-len is reconstructed
+                // from `offset` (the in-page token offset of the first written
+                // row) + `n` (the input-token count): page `i` holds
+                // `clamp((offset+n) − i·page_size, 0, page_size)` valid tokens.
+                // No indices array, no generation/range guard (dropped under #21
+                // — the inferlet owns working-set correctness). `cow_write_slot`
+                // CoW-chains from the slot's existing object, preserving any
+                // in-flight producer prefix (alpha review check #1).
                 let mut writes: Vec<forward_prepare::KvWrite> = Vec::new();
-                if let Some(ko) = &kv_output {
-                    if ko.indices.len() != ko.per_page_valid_lens.len() {
-                        break 'prep Err(format!(
-                            "kv-output indices ({}) and per-page-valid-lens ({}) length mismatch",
-                            ko.indices.len(),
-                            ko.per_page_valid_lens.len()
-                        ));
-                    }
-                    // Validate generation / range / uniqueness BEFORE any mutation.
-                    match state.ctx().table.get(&ko.set) {
-                        Ok(ws) => {
-                            if let Err(e) = ws.resolve_write(&ko.indices, ko.generation) {
-                                break 'prep Err(e.to_string());
-                            }
-                        }
-                        Err(e) => break 'prep Err(e.to_string()),
-                    }
-                    for (i, &idx) in ko.indices.iter().enumerate() {
+                if let Some(d) = &kv_ws {
+                    let n = req.token_ids.len() as u32;
+                    for i in 0..d.output_len {
+                        let idx = d.output_start + i;
+                        let valid_len = (d.offset + n)
+                            .saturating_sub(i * page_size)
+                            .min(page_size);
                         let cow = {
-                            let ws = match state.ctx().table.get_mut(&ko.set) {
+                            let ws = match state.ctx().table.get_mut(&d.set) {
                                 Ok(w) => w,
                                 Err(e) => break 'prep Err(e.to_string()),
                             };
@@ -1133,7 +1286,7 @@ impl pie::core::inference::HostForwardPassWithStore<InstanceState> for HasSelf<I
                         writes.push(forward_prepare::KvWrite {
                             slot_index: idx,
                             page,
-                            valid_len: ko.per_page_valid_lens[i],
+                            valid_len,
                         });
                     }
                 }
@@ -1160,14 +1313,14 @@ impl pie::core::inference::HostForwardPassWithStore<InstanceState> for HasSelf<I
                 let mut rs_buffer_slot_ids: Vec<u32> = Vec::new();
                 let mut rs_buffer_slot_indptr: Vec<u32> = vec![0];
                 let mut rs_fold_lens: Vec<u32> = Vec::new();
-                if let Some(ro) = &rs_output {
+                if let Some(rs) = &rs_ws {
                     // Materialise + pin the buffered write slabs, page-major.
                     let cow = {
-                        let ws = match state.ctx().table.get_mut(&ro.set) {
+                        let ws = match state.ctx().table.get_mut(&rs.set) {
                             Ok(w) => w,
                             Err(e) => break 'prep Err(e.to_string()),
                         };
-                        ws.cow_write_buffer(ro.start_token, ro.len_tokens, &mut txn, &mut arena)
+                        ws.cow_write_buffer(rs.start_token, rs.len_tokens, &mut txn, &mut arena)
                     };
                     let (objs, move_plan) = match cow {
                         Ok(v) => v,
@@ -1188,7 +1341,7 @@ impl pie::core::inference::HostForwardPassWithStore<InstanceState> for HasSelf<I
                     rs_buffer_slot_indptr.push(rs_buffer_slot_ids.len() as u32);
 
                     // The folded recurrent_state slot (driver reads/writes it).
-                    let folded = match state.ctx().table.get(&ro.set) {
+                    let folded = match state.ctx().table.get(&rs.set) {
                         Ok(ws) => ws.folded_object(),
                         Err(e) => break 'prep Err(e.to_string()),
                     };
@@ -1240,12 +1393,12 @@ impl pie::core::inference::HostForwardPassWithStore<InstanceState> for HasSelf<I
                     Err(e) => {
                         arena.txn_abort(txn);
                         drop(arena);
-                        if let Some(ko) = &kv_output {
-                            if let Ok(ws) = state.ctx().table.get_mut(&ko.set) {
+                        if let Some(d) = &kv_ws {
+                            if let Ok(ws) = state.ctx().table.get_mut(&d.set) {
                                 ws.abort_writes();
                             }
                         }
-                        return Err(e);
+                        break 'prepare Err(e);
                     }
                 };
 
@@ -1263,11 +1416,17 @@ impl pie::core::inference::HostForwardPassWithStore<InstanceState> for HasSelf<I
             // keeps the pins/CoW copies alive until commit/abort.
             drop(arena);
             Ok((proj, txn, move_plans))
-        });
+        };
 
         let (proj, txn, move_plans) = match prepared {
             Ok(v) => v,
-            Err(e) => return Ok(Err(e)),
+            Err(e) => {
+                // Recoverable prepare failure — defer it to `output()` (the WIT
+                // `execute: func()` has no error channel). The txn / KV slots were
+                // already aborted/reverted in the prepare block.
+                state.ctx().table.get_mut(&this)?.exec_error = Some(e);
+                return Ok(());
+            }
         };
 
         // Issue the device d2d for every CoW'd write target: copy the original
@@ -1285,7 +1444,7 @@ impl pie::core::inference::HostForwardPassWithStore<InstanceState> for HasSelf<I
         // the context tip's sealed hash (follow-up); until then those pages stay
         // private-dirty (W7) — correct, just no dedup.
         let seal_eligible = !proj.full_page_writes.is_empty()
-            && kv_context.as_ref().map(|c| c.valid_tokens).unwrap_or(0) == 0
+            && kv_ws.as_ref().map(|d| d.valid_tokens).unwrap_or(0) == 0
             && req.position_ids.len() == req.token_ids.len()
             && req.masks.len() == req.token_ids.len();
         let seal_hashes: Vec<(u32, u64)> = if seal_eligible {
@@ -1309,18 +1468,35 @@ impl pie::core::inference::HostForwardPassWithStore<InstanceState> for HasSelf<I
         // Carry the KV working-set handle + the txn across the async boundary;
         // finalize (after the driver round-trip) commits (seal full pages) /
         // aborts on them.
-        let kv_set: Option<Resource<crate::working_set::kv::KvWorkingSet>> = kv_output
+        let kv_set: Option<Resource<crate::working_set::kv::KvWorkingSet>> = kv_ws
             .as_ref()
-            .map(|ko| Resource::new_borrow(ko.set.rep()));
+            .map(|d| Resource::new_borrow(d.set.rep()));
 
         // The RS working set whose folded boundary advances on a committed
-        // fold-buffered (W9) — v1 rides the rs-output set.
+        // fold-buffered (W9) — v1 rides the rs-working-set.
         let rs_fold_set: Option<Resource<crate::working_set::rs::RsWorkingSet>> =
             if fold_buffered_tokens.is_some() {
-                rs_output.as_ref().map(|ro| Resource::new_borrow(ro.set.rep()))
+                rs_ws.as_ref().map(|d| Resource::new_borrow(d.set.rep()))
             } else {
                 None
             };
+
+        // #21 next-inputs carrier: register this pass as a pipeline source (if it
+        // declared `next-inputs`) + inject the prior producer's retained sample
+        // into this pass. The host owns the global link id; the guest threads
+        // none. No-op when neither role applies. Must run AFTER `input-tokens` is
+        // staged (it reads `req.token_ids.len()`) and BEFORE submit. The context id
+        // (KV working-set rep) scopes the carryover to consecutive same-context
+        // passes so a terminal producer's dangling carry can't leak into the next
+        // context (0 = no-KV pass ⇒ never a carrier consumer/producer).
+        let next_input_context_id = kv_ws.as_ref().map(|d| d.set.rep()).unwrap_or(0);
+        crate::api::next_input_map::apply_next_input_carrier(
+            &mut state.pending_next_input,
+            &mut state.next_input_link_counter,
+            &mut req,
+            &next_input_positions,
+            next_input_context_id,
+        );
 
         // Single-model: the SERVICE routes to the bound model; no model_id arg.
         let submit_result =
@@ -1331,60 +1507,40 @@ impl pie::core::inference::HostForwardPassWithStore<InstanceState> for HasSelf<I
             Err(e) => {
                 // Submit never reached the driver — abort the txn + revert the
                 // repointed KV slots (W13).
-                accessor.with(|mut access| {
-                    let state = access.get();
-                    let arena_arc = crate::arena::get(model_id, driver_idx);
-                    arena_arc.lock().unwrap().txn_abort(txn);
-                    if let Some(ko) = &kv_set {
-                        if let Ok(ws) = state.ctx().table.get_mut(ko) {
-                            ws.abort_writes();
-                        }
+                let arena_arc = crate::arena::get(model_id, driver_idx);
+                arena_arc.lock().unwrap().txn_abort(txn);
+                if let Some(ko) = &kv_set {
+                    if let Ok(ws) = state.ctx().table.get_mut(ko) {
+                        ws.abort_writes();
                     }
-                });
+                }
                 tracing::warn!("inference::submit failed: {e:#}");
-                return Ok(Err(e.to_string()));
+                // Defer to `output()` — `execute: func()` has no error channel.
+                state.ctx().table.get_mut(&this)?.exec_error = Some(e.to_string());
+                return Ok(());
             }
         };
 
-        // Await the driver result INLINE (P3 native async), then finalize the
-        // forward txn in the same async fn (store reachable via `accessor.with`).
-        let forward_result: Option<ForwardOutput> = match rx.await {
-            Ok(Ok(resp)) => Some(resp),
-            Ok(Err(e)) => {
-                tracing::warn!("future output failed: {e:#}");
-                None
-            }
-            Err(_) => None,
+        // Eager-submit done; store the in-flight state on the forward-pass
+        // (Option A). Phase-2 (await → finalize → build output tensors) runs in
+        // the async `output()`/`outputs()`, which take this `PendingForward`. The
+        // `&mut state` borrow releases here so the run-ahead loop can hold two
+        // passes in flight.
+        let pending = PendingForward {
+            rx,
+            txn,
+            kv_set,
+            seal_hashes,
+            model_id,
+            driver_idx,
+            rs_fold_set,
+            fold_buffered_tokens,
+            programs_output_kinds,
+            profile_start,
         };
-        let success = forward_result.is_some();
-
-        accessor.with(|mut access| {
-            access.get().finalize_forward_txn(
-                success,
-                txn,
-                kv_set,
-                seal_hashes,
-                model_id,
-                driver_idx,
-                rs_fold_set,
-                fold_buffered_tokens,
-            )
-        })?;
-
-        let output = match forward_result {
-            Some(resp) => build_program_slots(resp, &programs_output_kinds),
-            None => pie::core::inference::Output {
-                slots: Vec::new(),
-                spec_tokens: Vec::new(),
-                spec_positions: Vec::new(),
-            },
-        };
-        if let Some(start) = profile_start {
-            record_execute_profile(ExecuteProfileSample::default(), elapsed_us(start.elapsed()));
-        }
-        Ok(Ok(output))
+        state.ctx().table.get_mut(&this)?.pending = Some(pending);
+        Ok(())
     }
-}
 
 impl InstanceState {
     /// Commit (on driver success) or abort (on failure) the forward transaction
@@ -1661,37 +1817,42 @@ mod sampling_program_tests {
     }
 
     #[test]
-    fn build_slots_token_fast_path() {
-        // ForwardOutput::Token + a single Token-output program ⇒ one `token` slot.
-        use pie::core::inference::SlotOutput;
-        let out = build_program_slots(
+    fn build_tensors_token_fast_path() {
+        // ForwardOutput::Token + a single Token-output program ⇒ one `[1] i32`
+        // tensor carrying the token (the #21 output()→tensor shape).
+        use pie::core::tensor::Dtype;
+        let out = build_output_tensors(
             ForwardOutput::Token(42),
             &[vec![pie_sampling_ir::OutputKind::Token]],
         );
-        assert_eq!(out.slots.len(), 1);
-        assert!(matches!(out.slots[0], SlotOutput::Token(42)));
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].shape, vec![1]);
+        assert!(matches!(out[0].dtype, Dtype::I32));
+        assert_eq!(out[0].data, 42i32.to_le_bytes().to_vec());
     }
 
     #[test]
-    fn build_slots_mirostat_token_entropy() {
+    fn build_tensors_mirostat_token_entropy() {
         // The 4090 mirostat shape: a `[Token, Scalar]` program. The token rides
-        // `resp.tokens` → `slot-output::token`; the scalar surprise S rides the
-        // `entropies` channel → `slot-output::entropy` (SEAM-A). The flat slot
-        // list is the program's declared outputs in order.
-        use pie::core::inference::SlotOutput;
+        // `resp.tokens` → `[1] i32`; the scalar surprise S rides the `entropies`
+        // channel → `[1] f32` (SEAM-A). Tensors are the program's declared
+        // outputs in order.
+        use pie::core::tensor::Dtype;
         use pie_sampling_ir::OutputKind;
         let resp = pie_driver_abi::ForwardResponse {
             tokens: vec![137],
             entropies: vec![2.7],
             ..Default::default()
         };
-        let out = build_program_slots(
+        let out = build_output_tensors(
             ForwardOutput::Response(resp),
             &[vec![OutputKind::Token, OutputKind::Scalar]],
         );
-        assert_eq!(out.slots.len(), 2);
-        assert!(matches!(out.slots[0], SlotOutput::Token(137)));
-        assert!(matches!(out.slots[1], SlotOutput::Entropy(s) if s == 2.7));
+        assert_eq!(out.len(), 2);
+        assert!(matches!(out[0].dtype, Dtype::I32));
+        assert_eq!(out[0].data, 137i32.to_le_bytes().to_vec());
+        assert!(matches!(out[1].dtype, Dtype::F32));
+        assert_eq!(out[1].data, 2.7f32.to_le_bytes().to_vec());
     }
 
     #[test]

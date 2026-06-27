@@ -3,8 +3,9 @@
 //! `Forward` wraps the WIT `forward-pass` resource and folds in the page math
 //! that every consumer would otherwise repeat: working-page reservation
 //! before submission, position derivation, page commit after execution.
-//! Slots are attached via [`Forward::sample`] / [`Forward::probe`] and read back
-//! through typed handles on the returned [`Output`].
+//! Samplers are attached via [`Forward::sample`] / [`Forward::sampler`] and
+//! their output tensors read back through typed handles on the returned
+//! [`Output`].
 //!
 //! For the rare case where the caller needs full WIT control (custom
 //! attention masks, manual page management for speculation rollback, etc.),
@@ -15,7 +16,7 @@
 use crate::Result;
 use crate::adapter::Adapter;
 use crate::context::Context;
-use crate::pie::core::inference::{ForwardPass, InputBinding, SlotOutput};
+use crate::pie::core::inference::{ForwardPass, InputBinding};
 use crate::program::{HostInputDecl, ProgramHandle};
 use crate::sample::Sampler;
 use crate::tensor;
@@ -39,19 +40,17 @@ pub(crate) type LoweredSampler = (
 
 /// A reference to a value produced *during* decoding and bound into a forward
 /// pass after submit rather than at build time — the §3 run-ahead carrier
-/// vocabulary. The high-level run-ahead loop translates this to the explicit
-/// carrier links ([`Forward::source_link`] / [`inject_link`](Forward::inject_link)
-/// / [`free_link`](Forward::free_link)); the host-late transform channel
-/// (grammar mask / mirostat mu) is supplied directly via `tensor.write` on a
-/// handle bound at [`Forward::sampler`].
+/// vocabulary. The high-level run-ahead loop translates this to a
+/// [`Forward::next_inputs`] carrier declaration on the producing pass; the
+/// host-late transform channel (grammar mask / mirostat mu) is supplied
+/// directly via `tensor.write` on a handle bound at [`Forward::sampler`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TokenRef {
     /// The token sampled by the *previous* forward pass. The producer pass
-    /// declares itself the source of a carrier link ([`Forward::source_link`]);
-    /// the consumer pass reserves a slot ([`Forward::carried_input`]) and the
-    /// carrier injects the producer's sampled token there pre-forward (device
-    /// path, zero host round-trip). The locked Seam-A §2.1 carrier chain
-    /// `TokenRef::PrevSample -> pipeline_source_link -> carried_input slot`.
+    /// declares the carrier destination(s) via [`Forward::next_inputs`]; the
+    /// consumer (the next pass) supplies a placeholder `input(0)` at each
+    /// destination that the carrier overwrites pre-forward from the producer's
+    /// retained sample (device path, zero host round-trip).
     PrevSample,
 }
 
@@ -93,10 +92,12 @@ enum SamplerBindings {
 
 /// One tensor-program attached as the pass's sampler, kept until `execute`.
 /// `bindings[i]` supplies the program input at index `i` at attach time
-/// (`logits(positions)` or a device `tensor`).
+/// (`logits(positions)` or a device `tensor`); `outputs` is the program's
+/// declared output-value count (single → `output()`, many → `outputs()`).
 struct SamplerAttach<'p> {
     program: AttachedProgram<'p>,
     bindings: SamplerBindings,
+    outputs: u32,
 }
 
 /// Lower the ergonomic [`Sampler`] enum to a tensor [`Program`](tensor::Program)
@@ -139,21 +140,12 @@ pub struct Forward<'ctx> {
     attn_mask: Option<Vec<Vec<u32>>>,
     adapter: Option<&'ctx Adapter>,
     zo_seed: Option<i64>,
-    /// Run-ahead carrier (Seam A §2.1): if set, this pass's sampled row is the
-    /// source for run-ahead `link` (the carrier retains it). Set via
-    /// [`Forward::source_link`]; emitted after the sampler.
-    source_link: Option<u32>,
-    /// Run-ahead carrier (Seam A §2.1): `(link, src_row, dest_slot)` injects to
-    /// fill carrier-injected input slots pre-forward. Set via
-    /// [`Forward::inject_link`].
-    inject_links: Vec<(u32, u32, u32)>,
-    /// Run-ahead carrier (Seam A §2.1): links freed after this pass drains them.
-    /// Set via [`Forward::free_link`].
-    free_links: Vec<u32>,
-    /// Carrier-injected tail slots (Seam A §2.1): KV reserved for tokens the
-    /// run-ahead carrier fills pre-forward (no `input_tokens`). Set via
-    /// [`Forward::carried_input`].
-    carried_inputs: u32,
+    /// Run-ahead carrier (§2.1): destination slots in the NEXT forward pass on
+    /// this context that carry THIS pass's sampled token(s). Emitted as a single
+    /// `next-inputs(positions)` call after the sampler; the source row is
+    /// host-computed and the consumer pass is implicit. Set via
+    /// [`Forward::next_inputs`].
+    next_inputs: Vec<u32>,
     /// Visual spans spliced at the given anchor positions, in declaration
     /// order. Emitted as `input-image` calls at execute time.
     images: Vec<(&'ctx crate::media::Image, u32)>,
@@ -196,10 +188,7 @@ impl<'ctx> Forward<'ctx> {
             attn_mask: None,
             adapter: None,
             zo_seed: None,
-            source_link: None,
-            inject_links: Vec::new(),
-            free_links: Vec::new(),
-            carried_inputs: 0,
+            next_inputs: Vec::new(),
             images: Vec::new(),
             audios: Vec::new(),
             defer_commit: false,
@@ -279,6 +268,7 @@ impl<'ctx> Forward<'ctx> {
         self.sampler = Some(SamplerAttach {
             program: AttachedProgram::Borrowed(program),
             bindings: SamplerBindings::Resolved(bindings),
+            outputs,
         });
         (0..outputs).map(ProgramHandle::new).collect()
     }
@@ -301,6 +291,7 @@ impl<'ctx> Forward<'ctx> {
                 host_inputs,
                 submit_values,
             },
+            outputs,
         });
         Ok((0..outputs).map(ProgramHandle::new).collect())
     }
@@ -321,51 +312,19 @@ impl<'ctx> Forward<'ctx> {
         self
     }
 
-    // ── Run-ahead carrier links: Seam A §2.1 ───────────────────────────
+    // ── Run-ahead carrier: §2.1 ────────────────────────────────────────
 
-    /// Declare this pass's sampled row as the **source** for run-ahead `link`
-    /// (a host-assigned id; `1`-based, `0` is the not-a-source sentinel — the
-    /// run-ahead loop owns the monotonic counter). The carrier retains the
-    /// sampled row under `link` for a later consumer pass's pre-forward inject
-    /// (WIT `forward-pass.pipeline-source-link`). Call after attaching a
-    /// sampler — the retained payload is its first output.
-    pub fn source_link(&mut self, link: u32) -> &mut Self {
-        self.source_link = Some(link);
-        self
-    }
-
-    /// Inject run-ahead `link`'s row `src_row` into this pass's input row
-    /// `dest_slot` **before** the forward — the device-ref carryover that fills
-    /// a [`carried_input`](Self::carried_input)-reserved slot (WIT
-    /// `forward-pass.next-input-link`). Single-seq one-ahead uses `src_row` = 0.
-    /// Multiple calls accumulate (one per consumed link).
-    pub fn inject_link(&mut self, link: u32, src_row: u32, dest_slot: u32) -> &mut Self {
-        self.inject_links.push((link, src_row, dest_slot));
-        self
-    }
-
-    /// Free run-ahead `link` after this pass consumes it (refcount = 1; WIT
-    /// `forward-pass.next-input-free-link`). The carrier frees post stream-sync,
-    /// hazard-free with its pre-forward inject. A consumer pass carries both the
-    /// [`inject_link`](Self::inject_link) and the free for the link it drains —
-    /// omitting it leaks the carrier's retain map.
-    pub fn free_link(&mut self, link: u32) -> &mut Self {
-        self.free_links.push(link);
-        self
-    }
-
-    /// Reserve `n` KV slots for **carrier-injected** tokens — the consumer half
-    /// of [`TokenRef::PrevSample`]. Unlike [`input`](Self::input), no token is
-    /// supplied: the run-ahead carrier fills these positions pre-forward with a
-    /// producer pass's sampled token (the producer declared itself the source
-    /// via [`source_link`](Self::source_link); this pass maps the inject via
-    /// [`inject_link`](Self::inject_link)). The slots reserve KV and advance the
-    /// context cursor like text inputs, and a sugar [`sample`](Self::sample)
-    /// decodes from the last one — but the value is bound device-side, so the
-    /// caller is responsible for recording the resolved token in history (the
-    /// run-ahead loop does this from the producer's read-back sample).
-    pub fn carried_input(&mut self, n: u32) -> &mut Self {
-        self.carried_inputs += n;
+    /// Declare the destination slots in the **NEXT** forward pass on this
+    /// context that carry **this** pass's sampled token(s) — `positions` are
+    /// destinations in the next pass's coordinate space (the decode slots the
+    /// carrier overwrites pre-forward). The guest names only destinations:
+    /// the source row in this pass is host-computed (prefill → last row,
+    /// single-row decode → row 0), and the consumer is implicit — the next pass
+    /// supplies a placeholder `input(0)` at each position that the carrier
+    /// overwrites from this pass's retained sample. Emitted after the sampler
+    /// (WIT `forward-pass.next-inputs`).
+    pub fn next_inputs(&mut self, positions: Vec<u32>) -> &mut Self {
+        self.next_inputs = positions;
         self
     }
 
@@ -407,10 +366,7 @@ impl<'ctx> Forward<'ctx> {
             attn_mask,
             adapter,
             zo_seed,
-            source_link,
-            inject_links,
-            free_links,
-            carried_inputs,
+            next_inputs,
             images,
             audios,
             defer_commit,
@@ -427,10 +383,11 @@ impl<'ctx> Forward<'ctx> {
         for (audio, _) in &audios {
             soft_tokens += audio.token_count();
         }
-        let n_write = n_auto + soft_tokens + carried_inputs;
-        // Tokens that yield a decode position: explicit text inputs plus the
-        // carrier-injected slots (a sugar sampler decodes from the last one).
-        let n_decode = n_auto + carried_inputs;
+        let n_write = n_auto + soft_tokens;
+        // Tokens that yield a decode position: the auto/explicit text inputs. A
+        // carried token rides as a placeholder `input(0)` supplied by the
+        // run-ahead loop, so it is already counted in `n_auto`.
+        let n_decode = n_auto;
 
         let pass = ForwardPass::new();
 
@@ -440,8 +397,8 @@ impl<'ctx> Forward<'ctx> {
         // (pure decode-from-cache / scoring) reads the whole materialized
         // context read-only.
         if n_write > 0 {
-            let (generation, indices, valid_lens, ctx_pages) = ctx.prepare_write(n_write)?;
-            ctx.attach_kv(&pass, generation, indices, valid_lens, ctx_pages);
+            let w = ctx.prepare_write(n_write)?;
+            ctx.attach_kv(&pass, &w);
         } else {
             ctx.attach_full_context(&pass);
         }
@@ -473,10 +430,16 @@ impl<'ctx> Forward<'ctx> {
         }
 
         // Attach the tensor-program sampler (if any). Binding `i` supplies the
-        // program input at index `i`; each program output is marshaled to a
-        // typed `slot-output` in `output.slots`, in declared output order. A
-        // no-sampler pass (prefill/flush) carries no sampler and yields no slots.
-        if let Some(SamplerAttach { program, bindings }) = sampler {
+        // program input at index `i`; each program output value comes back as a
+        // raw `tensor` via `output()` / `outputs()`, in declared output order. A
+        // no-sampler pass (prefill/flush) carries no sampler and yields none.
+        let mut sampler_outputs: Option<u32> = None;
+        if let Some(SamplerAttach {
+            program,
+            bindings,
+            outputs,
+        }) = sampler
+        {
             let resolved = match bindings {
                 SamplerBindings::Resolved(b) => b,
                 SamplerBindings::SugarTemplate {
@@ -490,8 +453,8 @@ impl<'ctx> Forward<'ctx> {
                     // resolved against `host_inputs` into submit tensors.
                     if n_decode == 0 {
                         return Err("Forward::sample: no decode position — a sampler \
-                            needs an input or carried-input token; call `input(...)` \
-                            or `carried_input(...)` before `sample(...)`."
+                            needs an input token; call `input(...)` before \
+                            `sample(...)`."
                             .to_string());
                     }
                     let decode_pos = ctx.seq_len + n_decode - 1;
@@ -504,28 +467,37 @@ impl<'ctx> Forward<'ctx> {
                 }
             };
             pass.sampler(program.get(), resolved);
+            sampler_outputs = Some(outputs);
         }
 
-        // Run-ahead carrier links (Seam A §2.1). Producer: declare this pass's
-        // sampled row as a source. Consumer: inject retained links into the
-        // carrier-injected slots pre-forward, then free the drained links.
-        // Emitted after the sampler (the source is its first output). The §2.2
-        // host-late transform channel is supplied separately by the inferlet via
-        // `tensor.write` on a bound handle, between this `execute()` and `.await`.
-        if let Some(link) = source_link {
-            pass.pipeline_source_link(link);
-        }
-        for (link, src_row, dest_slot) in &inject_links {
-            pass.next_input_link(*link, *src_row, *dest_slot);
-        }
-        for link in &free_links {
-            pass.next_input_free_link(*link);
+        // Run-ahead carrier (§2.1): declare the destination slots in the NEXT
+        // pass that carry this pass's sampled token(s). Emitted after the
+        // sampler (the source is its first output). The §2.2 host-late transform
+        // channel (grammar mask / mirostat mu) is supplied separately by the
+        // inferlet via `tensor.write` on a bound handle.
+        if !next_inputs.is_empty() {
+            pass.next_inputs(&next_inputs);
         }
 
-        let wit_out = pass
-            .execute()
-            .await
-            .map_err(|e| format!("Forward::execute: forward pass failed: {e}"))?;
+        // Eager submit (synchronous fire); the result is awaited via `output()`
+        // / `outputs()`.
+        pass.execute();
+
+        // Retrieve the sampler's declared output tensor(s): a single-output
+        // sampler uses `output()`; a multi-output program (e.g. mirostat's
+        // `[token, surprise]`) uses `outputs()`. A no-sampler pass yields none.
+        let tensors = match sampler_outputs {
+            Some(n) if n <= 1 => vec![
+                pass.output()
+                    .await
+                    .map_err(|e| format!("Forward::execute: output: {e}"))?,
+            ],
+            Some(_) => pass
+                .outputs()
+                .await
+                .map_err(|e| format!("Forward::execute: outputs: {e}"))?,
+            None => Vec::new(),
+        };
 
         // Advance the sequence cursor past the materialized tail tokens. Full
         // pages auto-seal host-side on the forward-txn commit; there is no
@@ -542,7 +514,7 @@ impl<'ctx> Forward<'ctx> {
             ctx.snapshottable = false;
         }
 
-        Ok(Output::new(wit_out.slots))
+        Ok(Output::new(tensors))
     }
 }
 
@@ -561,90 +533,89 @@ impl<'ctx> Forward<'ctx> {
 ///
 /// A no-sampler pass (prefill / flush) carries no output tensors.
 pub struct Output {
-    /// The materialized typed sampler slots (P3 `output.slots`), in the
-    /// program's declared output order. Read via the typed accessors using the
-    /// [`ProgramHandle`]s returned by [`Forward::sample`].
-    slots: Vec<SlotOutput>,
+    /// The attached sampler program's output tensors, in declared output order.
+    /// Each is a device-resident typed buffer; read via the typed accessors
+    /// using the [`ProgramHandle`]s returned by [`Forward::sample`].
+    tensors: Vec<tensor::Tensor>,
     /// Generator-accepted tokens this step, post stop / max-tokens truncation.
     /// Empty for a raw `Forward::execute` (no Generator state).
     pub tokens: Vec<u32>,
 }
 
 impl Output {
-    pub(crate) fn new(slots: Vec<SlotOutput>) -> Self {
+    pub(crate) fn new(tensors: Vec<tensor::Tensor>) -> Self {
         Self {
-            slots,
+            tensors,
             tokens: Vec::new(),
         }
     }
 
-    pub(crate) fn from_generator(slots: Vec<SlotOutput>, tokens: Vec<u32>) -> Self {
-        Self { slots, tokens }
+    pub(crate) fn from_generator(tensors: Vec<tensor::Tensor>, tokens: Vec<u32>) -> Self {
+        Self { tensors, tokens }
     }
 
-    /// Number of sampler output slots.
+    /// Number of sampler output tensors.
     pub fn len(&self) -> usize {
-        self.slots.len()
+        self.tensors.len()
     }
 
-    /// True when the pass produced no output slots (e.g. a prefill/flush).
+    /// True when the pass produced no output tensors (e.g. a prefill/flush).
     pub fn is_empty(&self) -> bool {
-        self.slots.is_empty()
+        self.tensors.is_empty()
     }
 
-    /// Borrow the typed sampler slot for a handle (declared output order), or
+    /// Borrow the output tensor for a handle (declared output order), or
     /// `None` if the index is out of range.
-    pub fn slot(&self, h: ProgramHandle) -> Option<&SlotOutput> {
-        self.slots.get(h.index() as usize)
+    pub fn tensor(&self, h: ProgramHandle) -> Option<&tensor::Tensor> {
+        self.tensors.get(h.index() as usize)
     }
 
-    /// Raw little-endian bytes of a byte-valued slot (`logits` / `embedding`).
+    /// Raw little-endian bytes of an output tensor (downloads it host-side).
     pub async fn read_bytes(&self, h: ProgramHandle) -> Result<Vec<u8>> {
-        match self.slots.get(h.index() as usize) {
-            Some(SlotOutput::Logits(b)) | Some(SlotOutput::Embedding(b)) => Ok(b.clone()),
-            Some(other) => Err(format!(
-                "Output::read_bytes: slot {} is {other:?}, not byte-valued",
-                h.index()
-            )),
-            None => Err(format!("Output::read_bytes: no slot at index {}", h.index())),
-        }
+        let t = self
+            .tensors
+            .get(h.index() as usize)
+            .ok_or_else(|| format!("Output::read_bytes: no output tensor at index {}", h.index()))?;
+        t.read()
+            .map_err(|e| format!("Output::read_bytes: tensor read failed: {e}"))
     }
 
-    /// `u32` lanes of a slot — the sampled-token case (`slot-output::token`).
+    /// `u32` lanes of an output tensor — the sampled-token / index case.
     pub async fn read_u32(&self, h: ProgramHandle) -> Result<Vec<u32>> {
-        Ok(vec![self.token(h).await?])
+        let bytes = self.read_bytes(h).await?;
+        Ok(bytes
+            .chunks_exact(4)
+            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect())
     }
 
-    /// `f32` lanes of a slot — entropy / scalar measurement.
+    /// `f32` lanes of an output tensor — scalar / distribution measurement.
     pub async fn read_f32(&self, h: ProgramHandle) -> Result<Vec<f32>> {
-        Ok(vec![self.scalar(h).await?])
+        let bytes = self.read_bytes(h).await?;
+        Ok(bytes
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect())
     }
 
-    /// Sampled token id for a handle — the common single-token case
-    /// (`slot-output::token`).
+    /// Sampled token id for a handle — the common single-token case (the first
+    /// `u32`/`i32` lane of the output tensor).
     pub async fn token(&self, h: ProgramHandle) -> Result<u32> {
-        match self.slots.get(h.index() as usize) {
-            Some(SlotOutput::Token(t)) => Ok(*t),
-            Some(other) => Err(format!(
-                "Output::token: slot {} is {other:?}, not a token",
-                h.index()
-            )),
-            None => Err(format!("Output::token: no slot at index {}", h.index())),
-        }
+        self.read_u32(h)
+            .await?
+            .into_iter()
+            .next()
+            .ok_or_else(|| format!("Output::token: output tensor at index {} is empty", h.index()))
     }
 
-    /// Scalar measurement for a handle. By the host marshaling convention an
-    /// arbitrary program scalar (e.g. mirostat surprise `S`) rides the `entropy`
-    /// slot, so a `Scalar` program output reads back here.
+    /// Scalar measurement for a handle (e.g. mirostat surprise `S`) — the first
+    /// `f32` lane of the output tensor.
     pub async fn scalar(&self, h: ProgramHandle) -> Result<f32> {
-        match self.slots.get(h.index() as usize) {
-            Some(SlotOutput::Entropy(s)) => Ok(*s),
-            Some(other) => Err(format!(
-                "Output::scalar: slot {} is {other:?}, not a scalar/entropy",
-                h.index()
-            )),
-            None => Err(format!("Output::scalar: no slot at index {}", h.index())),
-        }
+        self.read_f32(h)
+            .await?
+            .into_iter()
+            .next()
+            .ok_or_else(|| format!("Output::scalar: output tensor at index {} is empty", h.index()))
     }
 }
 

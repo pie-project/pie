@@ -2,6 +2,7 @@ pub mod adapter;
 pub mod audio_out;
 pub mod http;
 pub mod inference;
+pub mod next_input_map;
 pub mod media;
 pub mod messaging;
 pub mod model;

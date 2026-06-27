@@ -216,10 +216,18 @@ impl InProcChannel {
         CTX_REGISTRY.remove(&(ctx as usize));
     }
 
-    fn submit_sync_for_state(
+    /// Enqueue a request onto the inbox and return its response slot (plus
+    /// `req_id` for tracing). The caller blocks on [`ResponseSlot::wait`] to
+    /// get the response. Split out of [`Self::submit_sync_for_state`] so the
+    /// run-ahead scheduler can fix submission order on its own thread — the
+    /// inbox `push_back` happens here, in call order — and defer the blocking
+    /// wait off-thread. This guarantees a forward `t+1` can never reach the
+    /// worker before its token-carryover source `t` (the inbox is processed
+    /// FIFO, and two concurrent submits would otherwise race at `push_back`).
+    fn enqueue_for_state(
         state: &Arc<InProcState>,
         req: DriverRequest,
-    ) -> Result<DriverResponse> {
+    ) -> Result<(Arc<ResponseSlot>, u32)> {
         if state.aborted.load(Ordering::Acquire) {
             return Err(anyhow!("InProcChannel aborted"));
         }
@@ -290,7 +298,16 @@ impl InProcChannel {
             state.inbox_cv.notify_one();
         }
         crate::probe::driver_cuda::record_ipc_submit(submit_start.elapsed());
+        Ok((slot, req_id))
+    }
 
+    /// Enqueue and block for the response in one call (inbox push +
+    /// [`ResponseSlot::wait`]). The hot single-fire path.
+    fn submit_sync_for_state(
+        state: &Arc<InProcState>,
+        req: DriverRequest,
+    ) -> Result<DriverResponse> {
+        let (slot, req_id) = Self::enqueue_for_state(state, req)?;
         // Phase: gpu_wait + ipc_recv (slot.wait combines both)
         tracing::debug!(
             target: "pie::driver::inproc",
@@ -327,6 +344,20 @@ impl DriverChannel for InProcChannel {
 
     fn submit_sync(&self, req: DriverRequest) -> Result<DriverResponse> {
         Self::submit_sync_for_state(&self.state, req)
+    }
+
+    fn submit_deferred(&self, req: DriverRequest) -> Result<super::DeferredResponse> {
+        // Enqueue now (fixing submission order on the caller's thread), defer
+        // only the blocking wait — the run-ahead scheduler awaits this
+        // off-thread so building/enqueuing the next batch overlaps the GPU.
+        let (slot, _req_id) = Self::enqueue_for_state(&self.state, req)?;
+        let spin_budget_us = self.state.spin_budget_us;
+        Ok(Box::new(move || {
+            let wait_start = std::time::Instant::now();
+            let result = slot.wait(spin_budget_us);
+            crate::probe::driver_cuda::record_gpu_wait(wait_start.elapsed());
+            result
+        }))
     }
 
     fn notify(&self, req: DriverRequest) -> Result<()> {
@@ -607,6 +638,69 @@ mod tests {
         let resp = channel.submit(save_adapter_req(42, 0)).await;
         driver.join().unwrap();
         let r = resp.expect("submit failed");
+        assert_eq!(
+            status_code(&r),
+            Some(0),
+            "expected Status response, got {:?}",
+            r
+        );
+
+        unsafe { InProcChannel::release(vt_ctx_us as *mut c_void) };
+    }
+
+    /// Deferred round-trip: `submit_deferred` enqueues the request (so the
+    /// driver thread can recv it) and returns a closure; the closure blocks for
+    /// the response off-thread. Validates the run-ahead scheduler's submit/await
+    /// split — the enqueue is ordered at call time, the wait is deferred.
+    #[tokio::test]
+    async fn deferred_round_trip_through_inproc_vtable() {
+        let channel = InProcChannel::new();
+        let vt = channel.ffi_vtable();
+        let vt_ctx_us = vt.ctx as usize;
+        let recv_us = vt.recv as usize;
+        let send_us = vt.send_response as usize;
+
+        // Enqueue first (fixes submission order); the wait is deferred.
+        let deferred = channel
+            .submit_deferred(save_adapter_req(42, 0))
+            .expect("enqueue failed");
+
+        // "Driver thread" — pulls the already-enqueued request, replies status 0.
+        let driver = std::thread::spawn(move || {
+            type RecvFn = unsafe extern "C" fn(
+                ctx: *mut c_void,
+                out_request: *mut *const PieFrameDesc,
+                out_req_id: *mut u32,
+            ) -> c_int;
+            type SendFn = unsafe extern "C" fn(
+                ctx: *mut c_void,
+                req_id: u32,
+                response: *const PieResponseFrameDesc,
+            );
+            let vt_ctx = vt_ctx_us as *mut c_void;
+            let recv: RecvFn = unsafe { std::mem::transmute(recv_us) };
+            let send: SendFn = unsafe { std::mem::transmute(send_us) };
+
+            let mut request_ptr: *const PieFrameDesc = ::core::ptr::null();
+            let mut req_id: u32 = 0;
+            let rc = unsafe { recv(vt_ctx, &mut request_ptr, &mut req_id) };
+            assert_eq!(rc, 0);
+            assert!(!request_ptr.is_null());
+
+            let mut resp = PieResponseFrameDesc::default();
+            resp.driver_id = 42;
+            resp.aborted = 0;
+            resp.payload = PieResponsePayloadDesc {
+                kind: PIE_RESPONSE_PAYLOAD_STATUS,
+                forward: Default::default(),
+                status: StatusResponse { status: 0 },
+            };
+            unsafe { send(vt_ctx, req_id, &resp as *const _) };
+        });
+
+        // Now block for the response via the deferred closure.
+        let r = deferred().expect("deferred wait failed");
+        driver.join().unwrap();
         assert_eq!(
             status_code(&r),
             Some(0),
