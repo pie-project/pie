@@ -170,6 +170,17 @@ struct PieForwardRequestView {
     PieSlice<std::uint32_t> sampling_binding_key;           // v4 manifest: per-slot host key (Tensor only)
     PieSlice<std::uint32_t> sampling_binding_indptr;        // per-program binding CSR
 
+    // WS8 P2 device-resident next-input link (#6). `pipeline_source_link != 0`
+    // ⇒ retain this (batched) forward's `pi.sampled[N]` under that global link
+    // id; the consumer arrays source some of this fire's input tokens (`pi.tokens`)
+    // device-side from a prior producer's retained `pi.sampled`. Parallel arrays,
+    // one entry per fed consumer input. See schema.rs.
+    std::uint32_t           pipeline_source_link = 0;
+    PieSlice<std::uint32_t> next_input_producer_links;  // global producer link id per fed input
+    PieSlice<std::uint32_t> next_input_src_rows;         // src row in the producer's pi.sampled
+    PieSlice<std::uint32_t> next_input_dest_slots;       // dest position in this fire's pi.tokens
+    PieSlice<std::uint32_t> next_input_free_links;       // link ids whose last consumer drains here
+
     // Sampler attributes (SoA — read from the wire SoA arrays; view.hpp
     // applies only the small kind-remap / top_k / top_p-min_p fold).
     PieSlice<std::uint32_t> sampler_types;
@@ -467,6 +478,15 @@ inline void fill_forward_view(const PieForwardRequestDesc& f,
         slice_from(f.sampling_binding_key_ptr, f.sampling_binding_key_len);
     out.sampling_binding_indptr =
         slice_from(f.sampling_binding_indptr_ptr, f.sampling_binding_indptr_len);
+    out.pipeline_source_link = f.pipeline_source_link;
+    out.next_input_producer_links =
+        slice_from(f.next_input_producer_links_ptr, f.next_input_producer_links_len);
+    out.next_input_src_rows =
+        slice_from(f.next_input_src_rows_ptr, f.next_input_src_rows_len);
+    out.next_input_dest_slots =
+        slice_from(f.next_input_dest_slots_ptr, f.next_input_dest_slots_len);
+    out.next_input_free_links =
+        slice_from(f.next_input_free_links_ptr, f.next_input_free_links_len);
     out.spec_token_ids    = slice_from(f.spec_token_ids_ptr, f.spec_token_ids_len);
     out.spec_position_ids = slice_from(f.spec_position_ids_ptr, f.spec_position_ids_len);
     out.spec_indptr       = slice_from(f.spec_indptr_ptr, f.spec_indptr_len);

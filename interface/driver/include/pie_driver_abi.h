@@ -239,6 +239,8 @@ struct PieForwardRequestDesc {
   size_t rs_buffer_slot_ids_len;
   const uint32_t *rs_buffer_slot_indptr_ptr;
   size_t rs_buffer_slot_indptr_len;
+  const uint32_t *next_input_free_links_ptr;
+  size_t next_input_free_links_len;
 };
 
 struct PieCopyRequestDesc {

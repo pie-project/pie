@@ -351,8 +351,73 @@ impl<'ctx> Generator<'ctx> {
         serde_json::from_str(&text).map_err(|e| format!("collect_json: deserialize: {e}"))
     }
 
-    // ── Internal helpers ───────────────────────────────────────────────
+    /// One-ahead **run-ahead** decode (Seam A §2.1 carryover): instead of the
+    /// guest reading each sampled token back and re-feeding it, the device-side
+    /// carrier carries a producer pass's sampled token directly into the next
+    /// pass's input — producer [`source_link`](crate::forward::Forward::source_link)
+    /// → consumer [`carried_input`](crate::forward::Forward::carried_input) +
+    /// [`inject_link`](crate::forward::Forward::inject_link) +
+    /// [`free_link`](crate::forward::Forward::free_link).
+    ///
+    /// **1a-milestone form — sequential:** each pass is awaited before the next
+    /// is submitted, so the carrier's RETAIN (producer sample-done) strictly
+    /// precedes its INJECT (consumer pre-forward). This verifies the carryover
+    /// (`consumer input == producer sample`) on the current async `execute()`
+    /// with no host churn; the overlapping form (multiple in-flight, on the
+    /// `execute()`-sync / `output()`-async surface) lands at 1c on the
+    /// non-blocking-fire mechanism.
+    ///
+    /// Falls back to [`collect_tokens`](Self::collect_tokens) for constrained /
+    /// speculative decode, where step t+1's input depends on token t in a way
+    /// that defeats the carryover.
+    pub async fn collect_tokens_pipelined(mut self) -> Result<Vec<u32>> {
+        if !self.constraints.is_empty() || !matches!(self.speculation, SpecMode::None) {
+            return self.collect_tokens().await;
+        }
+        if self.done {
+            return Ok(Vec::new());
+        }
+        self.ensure_program()?;
 
+        // Prime producer: the pending prompt tail. Declares carrier source link
+        // 1 (`0` is the not-a-source sentinel). Its sampled token is read here
+        // and carried into the first consumer by the device carrier.
+        let pending = core::mem::take(&mut self.ctx.buffer);
+        if pending.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut link: u32 = 1;
+        let mut token = self.fire_producer(&pending, link).await?;
+        // The prime prefills the whole prompt tail, so its sampled output lives at
+        // its LAST forward row (the decode position). Decode producers are
+        // single-row, so their output is row 0. The consumer reads `src_row`.
+        let mut src_row = (pending.len() - 1) as u32;
+
+        let mut all = Vec::new();
+        loop {
+            // Fold the producer's sampled token (stop / max-tokens). A stop token
+            // is not emitted; the token that hits max still counts.
+            if self.stop.contains(&token) {
+                break;
+            }
+            all.push(token);
+            self.tokens_generated += 1;
+            if self.max_tokens.is_some_and(|m| self.tokens_generated >= m) {
+                break;
+            }
+            // Consumer: reserve the carrier-injected slot, inject + free the
+            // producer's link, and declare itself the source for the next step.
+            // The carrier injects `token` (the producer's retained sample) into
+            // the carried slot; this pass samples the next token.
+            let next_link = link + 1;
+            token = self.fire_consumer(token, link, next_link, src_row).await?;
+            link = next_link;
+            src_row = 0; // every decode producer hereafter is single-row
+        }
+        Ok(all)
+    }
+
+    // ── Internal helpers ───────────────────────────────────────────────
     // P3 is single-model FCFS — no scheduler bidding. Retained as a no-op so the
     // per-step call sites stay stable if the bid path ever returns.
     fn recompute_bid(&mut self) {}
@@ -390,6 +455,105 @@ impl<'ctx> Generator<'ctx> {
     // P3's working-set model auto-manages KV page lifetime (the working set frees
     // its own pages); the SDK no longer tracks/releases working pages here.
     fn release_empty_working_pages(&mut self) {}
+
+    // ── Run-ahead carryover helpers (Seam A §2.1) ──────────────────────
+
+    /// Build + fire the prime **producer** pass over `pending` (the prompt
+    /// tail), declaring carrier source `link`. Advances the context cursor and
+    /// returns the sampled token.
+    async fn fire_producer(&mut self, pending: &[u32], link: u32) -> Result<u32> {
+        let n = pending.len() as u32;
+        let pass = ForwardPass::new();
+        let (generation, indices, valid_lens, ctx_pages) = self.ctx.prepare_write(n)?;
+        self.ctx
+            .attach_kv(&pass, generation, indices, valid_lens, ctx_pages);
+        if let Some(a) = self.adapter {
+            pass.adapter(a);
+        }
+        if let Some(seed) = self.zo_seed {
+            crate::pie::zo::zo::adapter_seed(&pass, seed);
+        }
+        let positions: Vec<u32> = (self.ctx.seq_len..self.ctx.seq_len + n).collect();
+        pass.input_tokens(pending, &positions);
+        let decode_pos = self.ctx.seq_len + n - 1;
+        self.attach_pipelined_sampler(&pass, decode_pos)?;
+        pass.pipeline_source_link(link);
+        let wit_out = pass
+            .execute()
+            .await
+            .map_err(|e| format!("collect_tokens_pipelined producer: {e}"))?;
+        self.ctx.history.extend_from_slice(pending);
+        self.ctx.seq_len += n;
+        first_token(&wit_out.slots)
+    }
+
+    /// Build + fire a **consumer** pass: reserve one carrier-injected tail slot,
+    /// inject + free the producer's `link`, and declare carrier source
+    /// `next_link` (this pass is the next step's producer). `carried` is the
+    /// producer's sampled token — the value the carrier injects into the slot
+    /// (a placeholder `0` token is supplied so the forward request is
+    /// well-formed; the carrier overwrites `pi.tokens[dest]` pre-forward) — and
+    /// is recorded in history. Returns this pass's sampled token.
+    async fn fire_consumer(
+        &mut self,
+        carried: u32,
+        link: u32,
+        next_link: u32,
+        src_row: u32,
+    ) -> Result<u32> {
+        let pass = ForwardPass::new();
+        // Reserve ONE tail slot for the carrier-injected token.
+        let (generation, indices, valid_lens, ctx_pages) = self.ctx.prepare_write(1)?;
+        self.ctx
+            .attach_kv(&pass, generation, indices, valid_lens, ctx_pages);
+        if let Some(a) = self.adapter {
+            pass.adapter(a);
+        }
+        if let Some(seed) = self.zo_seed {
+            crate::pie::zo::zo::adapter_seed(&pass, seed);
+        }
+        // Placeholder token at the carried position; the carrier overwrites
+        // `pi.tokens[dest]` with the producer's sample before the forward reads
+        // it (single-seq one-ahead: src_row 0, dest row 0).
+        let pos = self.ctx.seq_len;
+        pass.input_tokens(&[0u32], &[pos]);
+        self.attach_pipelined_sampler(&pass, pos)?;
+        pass.next_input_link(link, src_row, 0);
+        pass.next_input_free_link(link);
+        pass.pipeline_source_link(next_link);
+        let wit_out = pass
+            .execute()
+            .await
+            .map_err(|e| format!("collect_tokens_pipelined consumer: {e}"))?;
+        self.ctx.history.push(carried);
+        self.ctx.seq_len += 1;
+        first_token(&wit_out.slots)
+    }
+
+    /// Attach the cached sampler program with its `Logits` bound to `decode_pos`
+    /// (mirrors [`GenStep::execute`]'s attach so the pipelined path is
+    /// numerically identical to the synchronous one).
+    fn attach_pipelined_sampler(&self, pass: &ForwardPass, decode_pos: u32) -> Result<()> {
+        let (program, template, host_inputs, _n_out, submit_values) = self
+            .program_cache
+            .as_ref()
+            .ok_or_else(|| "collect_tokens_pipelined: sampler program not lowered".to_string())?;
+        let bindings =
+            crate::program::resolve_bindings(template, host_inputs, &[decode_pos], submit_values)?;
+        pass.sampler(program, bindings);
+        Ok(())
+    }
+}
+
+/// Read the single sampled token from a forward pass's first output slot.
+fn first_token(slots: &[SlotOutput]) -> Result<u32> {
+    match slots.first() {
+        Some(SlotOutput::Token(t)) => Ok(*t),
+        Some(other) => Err(format!(
+            "collect_tokens_pipelined: sampler slot is {other:?}, not a token"
+        )),
+        None => Err("collect_tokens_pipelined: sampler produced no output slot".to_string()),
+    }
 }
 
 impl Drop for Generator<'_> {

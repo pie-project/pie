@@ -170,6 +170,7 @@ add_library(pie_driver_cuda_lib STATIC
   src/sampling_dispatch.cpp
   src/sampling_ir/runtime.cpp
   src/sampling_ir/reader.cpp
+  src/sampling_ir/next_input.cpp
   src/sampling_ir/codegen.cpp
   src/sampling_ir/jit.cpp
   src/sampling_ir/jit_backend.cpp

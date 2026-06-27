@@ -44,6 +44,7 @@
 #include "sampling_ir/pie_standard_samplers.h"
 #include "sampling_ir/sampler_dispatch.hpp"
 #include "sampling_ir/group.hpp"
+#include "sampling_ir/next_input.hpp"
 #include "sampling_ir/program_recognizer.hpp"
 #include "sampling_ir/param_extract.hpp"
 #include "spec_expansion.hpp"
@@ -2966,6 +2967,45 @@ void handle_fire_batch(
 
         const auto t_h2d_end = clock::now();
 
+        // ── #6 WS8 P2: device-resident next-input inject ────────────────
+        // Source some of this fire's input tokens (`pi.tokens`) device-side from a
+        // PRIOR producer forward's retained `pi.sampled` (the next-input link), in
+        // place of a host-injected token — removing the host `output()`+copy between
+        // decode passes. Runs on the forward's stream so it strictly precedes the
+        // forward's `pi.tokens` read; event-gated on each producer's sample-done so
+        // the retained copy is ready cross-pass. The carrier groups entries by
+        // producer link id; one inject per distinct producer. A producer not in the
+        // retained map (e.g. its source pass hasn't run) is skipped.
+        if (!view.next_input_producer_links.empty()) {
+            const std::uint32_t* prod = view.next_input_producer_links.data();
+            const std::uint32_t* srcs = view.next_input_src_rows.data();
+            const std::uint32_t* dsts = view.next_input_dest_slots.data();
+            const std::size_t nlinks = view.next_input_producer_links.size();
+            std::size_t i = 0;
+            while (i < nlinks) {
+                const std::uint32_t link = prod[i];
+                std::vector<sampling_ir::NextInputLink> links;
+                for (; i < nlinks && prod[i] == link; ++i)
+                    links.push_back(sampling_ir::NextInputLink{srcs[i], dsts[i]});
+                auto it = executor.retained_next_input.find(link);
+                if (it != executor.retained_next_input.end()) {
+                    sampling_ir::inject_next_input_after(
+                        it->second.copy.data(), links, pi.tokens.data(),
+                        it->second.done, cublas.stream());
+                    if (ir_trace)
+                        std::cerr << "[ir-trace] next-input INJECT link=" << link
+                                  << " rows=" << links.size() << " → pi.tokens\n";
+                } else if (ir_trace) {
+                    // A consumer references a link not in the retained map — the
+                    // use-after-free signature (freed too early, or producer pass
+                    // hasn't run). The dest stays the placeholder ⇒ token-divergence.
+                    std::cerr << "[ir-trace] next-input INJECT MISS link=" << link
+                              << " rows=" << links.size()
+                              << " (no retained source — UAF / unrun producer)\n";
+                }
+            }
+        }
+
         // ── Forward pass ────────────────────────────────────────
         // Either replay a captured CUDA graph or invoke `forward_fn.body`
         // directly — see run_forward_dispatch for the variant/key logic.
@@ -3331,6 +3371,31 @@ void handle_fire_batch(
             }
         }
 
+        // ── #6 WS8 P2: device-resident next-input retain ────────────────
+        // If this forward is a next-input source (`pipeline_source_link != 0`),
+        // preserve its `pi.sampled[N]` device-side under that global link id: a
+        // later consumer pass reads it via inject, but `pi.sampled` is alloc-once /
+        // reused, so t+1's forward would overwrite the producer. Copy (D2D) +
+        // record a sample-done event on the sampler stream; the retained entry is
+        // freed when the host signals the link via `next_input_free_links`.
+        if (view.pipeline_source_link != 0 && N > 0) {
+            Executor::RetainedSampled& r =
+                executor.retained_next_input[view.pipeline_source_link];
+            if (r.copy.size() < static_cast<std::size_t>(N))
+                r.copy = DeviceBuffer<std::int32_t>::alloc(static_cast<std::size_t>(N));
+            if (r.done == nullptr) CUDA_CHECK(cudaEventCreate(&r.done));
+            CUDA_CHECK(cudaMemcpyAsync(
+                r.copy.data(), pi.sampled.data(),
+                sizeof(std::int32_t) * static_cast<std::size_t>(N),
+                cudaMemcpyDeviceToDevice, cublas.stream()));
+            CUDA_CHECK(cudaEventRecord(r.done, cublas.stream()));
+            if (ir_trace)
+                std::cerr << "[ir-trace] next-input RETAIN link="
+                          << view.pipeline_source_link << " rows=" << N
+                          << " (rows>1 ⇒ shared batch link → refcount-N first-row-free"
+                             " probe holds; rows=1 ⇒ per-seq link)\n";
+        }
+
         // Sample plan was built above the prepare hook (hoisted so the
         // sampling uploads are ready before the forward graph launch). The host
         // variables (`need_msgpack`, `per_slot_*`, `any_topk_topp`,
@@ -3354,6 +3419,28 @@ void handle_fire_batch(
         verify_timer.finish(cublas.stream());
         CUDA_CHECK(cudaStreamSynchronize(cublas.stream()));
         const auto t_sync_end = clock::now();
+
+        // ── #6 WS8 P2: free retained next-input sources signaled this pass ──
+        // The host appends a producer link id to `next_input_free_links` once its
+        // LAST consumer drained (whose inject read the retained copy above). The
+        // stream sync just completed → that inject finished → freeing the retained
+        // buffer + its event is hazard-free, and the global id is reclaimable.
+        // Driver is count-agnostic: it frees strictly on the host signal.
+        if (!view.next_input_free_links.empty()) {
+            const std::uint32_t* freed = view.next_input_free_links.data();
+            const std::size_t nfree = view.next_input_free_links.size();
+            for (std::size_t k = 0; k < nfree; ++k) {
+                auto it = executor.retained_next_input.find(freed[k]);
+                if (it != executor.retained_next_input.end()) {
+                    if (it->second.done != nullptr)
+                        CUDA_CHECK(cudaEventDestroy(it->second.done));
+                    executor.retained_next_input.erase(it);  // DeviceBuffer dtor frees the copy
+                    if (ir_trace)
+                        std::cerr << "[ir-trace] next-input FREE link=" << freed[k]
+                                  << " (host all-consumers-drained signal)\n";
+                }
+            }
+        }
 
         // ── Sampling-IR rich / multi-output marshaling ──────────────────
         // A program that emits anything beyond a single scalar Token —

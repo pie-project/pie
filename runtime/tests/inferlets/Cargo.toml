@@ -10,6 +10,7 @@ members = [
     "tempgen",
     "multisamp",
     "isolatedtopp",
+    "runahead",
 ]
 
 [workspace.dependencies]

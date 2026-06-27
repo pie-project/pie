@@ -165,6 +165,25 @@ interface inference {
             adapter: borrow<adapter>,
         );
 
+        /// -- run-ahead carrier links: Seam A device-ref carryover (§2.1) -----
+        /// This pass's sampled row is the SOURCE for run-ahead link `link`
+        /// (host-assigned, 1-based; 0 = not-a-source). The carrier retains the
+        /// sampled row under `link` for a later consumer pass's pre-forward
+        /// inject. Each pass is the producer for the next step's input token.
+        pipeline-source-link: func(link: u32);
+
+        /// Inject run-ahead `link`'s row `src-row` into this pass's input row
+        /// `dest-slot` BEFORE the forward (the carried-input carryover). Pair
+        /// with a `carried-input`-reserved slot (no `input-tokens` there).
+        /// Single-seq one-ahead uses `src-row` = 0.
+        next-input-link: func(link: u32, src-row: u32, dest-slot: u32);
+
+        /// Free run-ahead `link` after this pass consumes it (refcount = 1; the
+        /// carrier frees post stream-sync, hazard-free with its pre-forward
+        /// inject). A consumer carries both the inject and the free for the
+        /// link it drains.
+        next-input-free-link: func(link: u32);
+
         execute: async func() -> result<output, error>;
     }
 

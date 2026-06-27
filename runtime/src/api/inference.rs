@@ -418,6 +418,55 @@ impl pie::core::inference::HostForwardPass for InstanceState {
         Ok(())
     }
 
+    // ── #6 WS8 P2 run-ahead next-input carrier (delta) ──────────────
+    /// Mark this pass as a device-resident next-input source: its `pi.sampled`
+    /// is retained under global link `link` (monotonic, nonzero) until freed.
+    async fn pipeline_source_link(
+        &mut self,
+        this: Resource<ForwardPass>,
+        link: u32,
+    ) -> Result<()> {
+        self.ctx()
+            .table
+            .get_mut(&this)?
+            .req
+            .set_pipeline_source_link(link);
+        Ok(())
+    }
+
+    /// Source this pass's input slot `dest_slot` device-side from producer
+    /// `link`'s retained `pi.sampled[src_row]` (the carried-input carryover);
+    /// the driver injects it before the forward reads `pi.tokens`.
+    async fn next_input_link(
+        &mut self,
+        this: Resource<ForwardPass>,
+        link: u32,
+        src_row: u32,
+        dest_slot: u32,
+    ) -> Result<()> {
+        self.ctx()
+            .table
+            .get_mut(&this)?
+            .req
+            .push_next_input_link(link, src_row, dest_slot);
+        Ok(())
+    }
+
+    /// Signal that producer `link`'s last consumer drains on this pass → the
+    /// driver frees its retained `pi.sampled` copy after the pass's stream sync.
+    async fn next_input_free_link(
+        &mut self,
+        this: Resource<ForwardPass>,
+        link: u32,
+    ) -> Result<()> {
+        self.ctx()
+            .table
+            .get_mut(&this)?
+            .req
+            .push_next_input_free_link(link);
+        Ok(())
+    }
+
     /// Buffered recurrent state this pass reads (hybrid / linear-attention).
     async fn rs_context(
         &mut self,

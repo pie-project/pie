@@ -588,6 +588,35 @@ pub fn append_request_with_options(
         .sampling_program_indptr
         .push(batch.n_sampling_programs() as u32);
 
+    // Run-ahead next-input carrier (WS8 P2) — per-request device-resident link
+    // fold. Each fed consumer input names a producer link id + the source row in
+    // that producer's retained `pi.sampled`, and a dest slot in THIS request's
+    // `pi.tokens`. On batch merge: producer link ids + source rows are GLOBAL (a
+    // prior fire's per-link buffer) → verbatim; dest slots index this fire's own
+    // token buffer → rebased by `row_base` (the batch token-offset). The
+    // `u32::MAX` dest sentinel (skip-lane) is preserved un-rebased.
+    for i in 0..req.n_next_input_links() {
+        let dest = req.next_input_dest_slots[i];
+        let rebased_dest = if dest == u32::MAX { u32::MAX } else { dest + row_base };
+        batch.push_next_input_link(
+            req.next_input_producer_links[i],
+            req.next_input_src_rows[i],
+            rebased_dest,
+        );
+    }
+    // All-consumers-drained free signals — global link ids, verbatim.
+    for &link in &req.next_input_free_links {
+        batch.push_next_input_free_link(link);
+    }
+    // Producer source-link: this fire retains its `pi.sampled` under one global
+    // link id covering the whole `pi.sampled[N]`. One link per batched forward; a
+    // producer request propagates its id. (One-ahead MVP: <=1 producer per batch;
+    // multi-seq producers in one fire share the batch link — link-assignment
+    // model is delta's carrier; this fold just carries the per-request value.)
+    if req.pipeline_source_link != 0 {
+        batch.set_pipeline_source_link(req.pipeline_source_link);
+    }
+
     // Inference hint: prefill kernel when ANY request needs `custom_mask`.
     if req.token_ids.len() > 1 || req.has_user_mask {
         batch.single_token_mode = false;
@@ -800,6 +829,34 @@ mod tests {
         assert_eq!(batch.image_mrope_indptr, vec![0, 6, 6]);
         // Per-request CSR: one image each.
         assert_eq!(batch.image_indptr, vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn next_input_carrier_merges_with_dest_rebase() {
+        // Run-ahead next-input carrier fold: producer link ids + source rows are
+        // global (verbatim); dest slots index each fire's own token buffer (rebased
+        // by the batch token-offset); `u32::MAX` skip-lane preserved; free-links
+        // verbatim; producer source-link propagated.
+        let mut req0 = make_request(vec![10, 11], vec![0, 1], vec![]); // 2 tokens
+        req0.set_pipeline_source_link(7);
+        req0.push_next_input_link(5, 0, 1); // dest 1 -> row_base(0)+1 = 1
+        req0.push_next_input_free_link(5);
+
+        let mut req1 = make_request(vec![12], vec![2], vec![]); // 1 token
+        req1.set_pipeline_source_link(9);
+        req1.push_next_input_link(7, 3, 0); // dest 0 -> row_base(2)+0 = 2
+        req1.push_next_input_link(7, 4, u32::MAX); // skip-lane preserved
+        req1.push_next_input_free_link(7);
+
+        let mut batch = new_batched_forward_request();
+        append_request(&mut batch, &req0, &[100], 1, 16); // row_base 0
+        append_request(&mut batch, &req1, &[200], 1, 16); // row_base 2 (req0 had 2 tokens)
+
+        assert_eq!(batch.next_input_producer_links, vec![5, 7, 7]); // global, verbatim
+        assert_eq!(batch.next_input_src_rows, vec![0, 3, 4]); // global, verbatim
+        assert_eq!(batch.next_input_dest_slots, vec![1, 2, u32::MAX]); // rebased + sentinel
+        assert_eq!(batch.next_input_free_links, vec![5, 7]); // verbatim concat
+        assert_eq!(batch.pipeline_source_link, 9); // last producer's link
     }
 
     /// Attach one audio clip to `req`, mirroring the `input_audio` host handler:

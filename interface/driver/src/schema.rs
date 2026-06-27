@@ -350,6 +350,16 @@ pub struct ForwardRequest {
     // fold-from-buffered-slabs kernel consumes them.)
     pub rs_buffer_slot_ids: Vec<u32>,
     pub rs_buffer_slot_indptr: Vec<u32>,
+
+    // ── Device-resident next-input free signal (#6 WS8 P2) ──────────
+    // Appended per the schema evolution rule (append-only). Producer link ids
+    // (`pipeline_source_link`) whose LAST consumer drains on THIS pass: after
+    // the pass's stream sync the executor frees each link's retained
+    // `pi.sampled` copy + its sample-done event (the consumer inject that read
+    // it has completed, so the free is hazard-free). Host-emitted once a link's
+    // consumer refcount reaches 0; the driver is count-agnostic and frees
+    // strictly on this signal. Empty when no retained source is released here.
+    pub next_input_free_links: Vec<u32>,
 }
 
 /// Per-slot sampler kind discriminants. Carried on the wire as the `u8`
@@ -762,6 +772,15 @@ impl ForwardRequest {
     #[inline]
     pub fn n_next_input_links(&self) -> usize {
         self.next_input_producer_links.len()
+    }
+
+    /// Signal that producer link `link`'s LAST consumer drains on this pass: the
+    /// executor frees its retained `pi.sampled` copy + sample-done event after
+    /// the pass's stream sync. The host emits this once the link's consumer
+    /// refcount reaches 0 (the driver is count-agnostic — it frees on signal).
+    #[inline]
+    pub fn push_next_input_free_link(&mut self, link: u32) {
+        self.next_input_free_links.push(link);
     }
 
     /// Reconstruct the [`SamplingProgramSubmission`] at program index `p` from

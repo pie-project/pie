@@ -13,6 +13,7 @@
 #include <type_traits>
 
 #include <atomic>
+#include <map>
 
 #include "distributed.hpp"
 #include "executor/forward_graph.hpp"
@@ -371,6 +372,30 @@ struct Executor {
     // Guards one-shot lazy backend construction so a hard init failure (e.g.
     // no NVRTC) doesn't retry + re-log every fire.
     bool sampling_ir_init_attempted = false;
+
+    // #6 WS8 P2 — device-resident next-input retention. A producer forward whose
+    // `pipeline_source_link != 0` has its `pi.sampled[N]` copied here under that
+    // global link id (the copy is READ, not consumed → fan-out safe). A later
+    // consumer's inject reads the retained copy (event-gated on `done`); the entry
+    // is freed when the host signals the link via `next_input_free_links`. The copy
+    // + event persist across fires (the Executor outlives a fire), unlike
+    // `pi.sampled` (alloc-once, reused every pass → t+1 overwrites the producer).
+    struct RetainedSampled {
+        DeviceBuffer<std::int32_t> copy;   // [N] retained producer sampled tokens
+        cudaEvent_t                done = nullptr;  // producer sample-done
+    };
+    std::map<std::uint32_t, RetainedSampled> retained_next_input;
+
+    // #6 WS8 P2 — device ptr of producer `link`'s retained token buffer: the
+    // consumer's `late_inputs` device-alias source for `TokenRef::PrevSample`
+    // (echo's seam). nullptr if the producer hasn't retained → SkippedLateBindMiss.
+    // (a)-MVP returns the D2D copy buffer; (b) the reference-slot — same call site.
+    const void* retained_token_ptr(std::uint32_t producer_link) const {
+        auto it = retained_next_input.find(producer_link);
+        return it == retained_next_input.end()
+                   ? nullptr
+                   : static_cast<const void*>(it->second.copy.data());
+    }
 
 };
 

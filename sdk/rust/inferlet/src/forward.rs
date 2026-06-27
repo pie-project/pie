@@ -34,6 +34,28 @@ pub(crate) type LoweredSampler = (
 );
 
 // =============================================================================
+// Late-bound input references (Seam A)
+// =============================================================================
+
+/// A reference to a value produced *during* decoding and bound into a forward
+/// pass after submit rather than at build time — the §3 run-ahead carrier
+/// vocabulary. The high-level run-ahead loop translates this to the explicit
+/// carrier links ([`Forward::source_link`] / [`inject_link`](Forward::inject_link)
+/// / [`free_link`](Forward::free_link)); the host-late transform channel
+/// (grammar mask / mirostat mu) is supplied directly via `tensor.write` on a
+/// handle bound at [`Forward::sampler`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TokenRef {
+    /// The token sampled by the *previous* forward pass. The producer pass
+    /// declares itself the source of a carrier link ([`Forward::source_link`]);
+    /// the consumer pass reserves a slot ([`Forward::carried_input`]) and the
+    /// carrier injects the producer's sampled token there pre-forward (device
+    /// path, zero host round-trip). The locked Seam-A §2.1 carrier chain
+    /// `TokenRef::PrevSample -> pipeline_source_link -> carried_input slot`.
+    PrevSample,
+}
+
+// =============================================================================
 // Sampler attach
 // =============================================================================
 
@@ -117,6 +139,21 @@ pub struct Forward<'ctx> {
     attn_mask: Option<Vec<Vec<u32>>>,
     adapter: Option<&'ctx Adapter>,
     zo_seed: Option<i64>,
+    /// Run-ahead carrier (Seam A §2.1): if set, this pass's sampled row is the
+    /// source for run-ahead `link` (the carrier retains it). Set via
+    /// [`Forward::source_link`]; emitted after the sampler.
+    source_link: Option<u32>,
+    /// Run-ahead carrier (Seam A §2.1): `(link, src_row, dest_slot)` injects to
+    /// fill carrier-injected input slots pre-forward. Set via
+    /// [`Forward::inject_link`].
+    inject_links: Vec<(u32, u32, u32)>,
+    /// Run-ahead carrier (Seam A §2.1): links freed after this pass drains them.
+    /// Set via [`Forward::free_link`].
+    free_links: Vec<u32>,
+    /// Carrier-injected tail slots (Seam A §2.1): KV reserved for tokens the
+    /// run-ahead carrier fills pre-forward (no `input_tokens`). Set via
+    /// [`Forward::carried_input`].
+    carried_inputs: u32,
     /// Visual spans spliced at the given anchor positions, in declaration
     /// order. Emitted as `input-image` calls at execute time.
     images: Vec<(&'ctx crate::media::Image, u32)>,
@@ -159,6 +196,10 @@ impl<'ctx> Forward<'ctx> {
             attn_mask: None,
             adapter: None,
             zo_seed: None,
+            source_link: None,
+            inject_links: Vec::new(),
+            free_links: Vec::new(),
+            carried_inputs: 0,
             images: Vec::new(),
             audios: Vec::new(),
             defer_commit: false,
@@ -280,6 +321,54 @@ impl<'ctx> Forward<'ctx> {
         self
     }
 
+    // ── Run-ahead carrier links: Seam A §2.1 ───────────────────────────
+
+    /// Declare this pass's sampled row as the **source** for run-ahead `link`
+    /// (a host-assigned id; `1`-based, `0` is the not-a-source sentinel — the
+    /// run-ahead loop owns the monotonic counter). The carrier retains the
+    /// sampled row under `link` for a later consumer pass's pre-forward inject
+    /// (WIT `forward-pass.pipeline-source-link`). Call after attaching a
+    /// sampler — the retained payload is its first output.
+    pub fn source_link(&mut self, link: u32) -> &mut Self {
+        self.source_link = Some(link);
+        self
+    }
+
+    /// Inject run-ahead `link`'s row `src_row` into this pass's input row
+    /// `dest_slot` **before** the forward — the device-ref carryover that fills
+    /// a [`carried_input`](Self::carried_input)-reserved slot (WIT
+    /// `forward-pass.next-input-link`). Single-seq one-ahead uses `src_row` = 0.
+    /// Multiple calls accumulate (one per consumed link).
+    pub fn inject_link(&mut self, link: u32, src_row: u32, dest_slot: u32) -> &mut Self {
+        self.inject_links.push((link, src_row, dest_slot));
+        self
+    }
+
+    /// Free run-ahead `link` after this pass consumes it (refcount = 1; WIT
+    /// `forward-pass.next-input-free-link`). The carrier frees post stream-sync,
+    /// hazard-free with its pre-forward inject. A consumer pass carries both the
+    /// [`inject_link`](Self::inject_link) and the free for the link it drains —
+    /// omitting it leaks the carrier's retain map.
+    pub fn free_link(&mut self, link: u32) -> &mut Self {
+        self.free_links.push(link);
+        self
+    }
+
+    /// Reserve `n` KV slots for **carrier-injected** tokens — the consumer half
+    /// of [`TokenRef::PrevSample`]. Unlike [`input`](Self::input), no token is
+    /// supplied: the run-ahead carrier fills these positions pre-forward with a
+    /// producer pass's sampled token (the producer declared itself the source
+    /// via [`source_link`](Self::source_link); this pass maps the inject via
+    /// [`inject_link`](Self::inject_link)). The slots reserve KV and advance the
+    /// context cursor like text inputs, and a sugar [`sample`](Self::sample)
+    /// decodes from the last one — but the value is bound device-side, so the
+    /// caller is responsible for recording the resolved token in history (the
+    /// run-ahead loop does this from the producer's read-back sample).
+    pub fn carried_input(&mut self, n: u32) -> &mut Self {
+        self.carried_inputs += n;
+        self
+    }
+
     /// Splice an encoded visual span (image or video clip) at sequence
     /// position `anchor`. The driver runs the vision encoder and scatters the
     /// projected rows into the hidden state. Advance your position cursor by
@@ -318,6 +407,10 @@ impl<'ctx> Forward<'ctx> {
             attn_mask,
             adapter,
             zo_seed,
+            source_link,
+            inject_links,
+            free_links,
+            carried_inputs,
             images,
             audios,
             defer_commit,
@@ -334,7 +427,10 @@ impl<'ctx> Forward<'ctx> {
         for (audio, _) in &audios {
             soft_tokens += audio.token_count();
         }
-        let n_write = n_auto + soft_tokens;
+        let n_write = n_auto + soft_tokens + carried_inputs;
+        // Tokens that yield a decode position: explicit text inputs plus the
+        // carrier-injected slots (a sugar sampler decodes from the last one).
+        let n_decode = n_auto + carried_inputs;
 
         let pass = ForwardPass::new();
 
@@ -389,15 +485,16 @@ impl<'ctx> Forward<'ctx> {
                     submit_values,
                 } => {
                     // Sugar: bind the program's `Logits` slot to the decode
-                    // position (the last auto-input token). Requires an input.
-                    // The standard-sampler params ride `submit_values`, resolved
-                    // against `host_inputs` into submit tensors.
-                    if n_auto == 0 {
-                        return Err("Forward::sample: no input tokens — a sampler \
-                            needs a decode position; call `input(...)` before `sample(...)`."
+                    // position (the last input/carried token). Requires a decode
+                    // position. The standard-sampler params ride `submit_values`,
+                    // resolved against `host_inputs` into submit tensors.
+                    if n_decode == 0 {
+                        return Err("Forward::sample: no decode position — a sampler \
+                            needs an input or carried-input token; call `input(...)` \
+                            or `carried_input(...)` before `sample(...)`."
                             .to_string());
                     }
-                    let decode_pos = ctx.seq_len + n_auto - 1;
+                    let decode_pos = ctx.seq_len + n_decode - 1;
                     crate::program::resolve_bindings(
                         &template,
                         &host_inputs,
@@ -407,6 +504,22 @@ impl<'ctx> Forward<'ctx> {
                 }
             };
             pass.sampler(program.get(), resolved);
+        }
+
+        // Run-ahead carrier links (Seam A §2.1). Producer: declare this pass's
+        // sampled row as a source. Consumer: inject retained links into the
+        // carrier-injected slots pre-forward, then free the drained links.
+        // Emitted after the sampler (the source is its first output). The §2.2
+        // host-late transform channel is supplied separately by the inferlet via
+        // `tensor.write` on a bound handle, between this `execute()` and `.await`.
+        if let Some(link) = source_link {
+            pass.pipeline_source_link(link);
+        }
+        for (link, src_row, dest_slot) in &inject_links {
+            pass.next_input_link(*link, *src_row, *dest_slot);
+        }
+        for link in &free_links {
+            pass.next_input_free_link(*link);
         }
 
         let wit_out = pass
