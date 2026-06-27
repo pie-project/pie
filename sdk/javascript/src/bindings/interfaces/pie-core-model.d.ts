@@ -33,4 +33,29 @@ export function splitRegex(): string;
  * Returns the special tokens recognized by the model
  */
 export function specialTokens(): [Uint32Array, Array<Uint8Array>];
+/**
+ * ── Working-set / arena capabilities (global, over the bound model) ──
+ * Memory-shaping parameters of the bound model's driver, so an inferlet
+ * can size working sets and validate fold lengths before allocating.
+ * Size in bytes of one folded recurrent-state object. 0 if the model has
+ * no recurrent state (pure attention).
+ */
+export function rsStateSize(): bigint;
+/**
+ * Tokens per buffered RS page. 0 if the model has no recurrent state.
+ */
+export function rsBufferPageSize(): number;
+/**
+ * Fold granularity in tokens: `forward-pass.fold-buffered(n)` requires `n`
+ * to be a positive multiple of this value. 1 (or 0) means unconstrained;
+ * 0 also implies the model has no recurrent state. (Token-causal RS models
+ * — Qwen3.5 GDN, Nemotron-H Mamba2 — report 1.)
+ */
+export function rsFoldGranularity(): number;
+/**
+ * Size in bytes of one unified-arena accounting block. In v1 the KV page is
+ * exactly one block, so this is the byte size of one KV page; an RS slab
+ * occupies an integer number of these blocks.
+ */
+export function arenaBlockSize(): bigint;
 export type Error = import('./pie-core-types.js').Error;

@@ -1,6 +1,7 @@
 // world pie:inferlet/inferlet
 export type * as PieCoreAdapter from './interfaces/pie-core-adapter.js'; // import pie:core/adapter
 export type * as PieCoreAudioOut from './interfaces/pie-core-audio-out.js'; // import pie:core/audio-out
+export type * as PieCoreHttp from './interfaces/pie-core-http.js'; // import pie:core/http
 export type * as PieCoreInference from './interfaces/pie-core-inference.js'; // import pie:core/inference
 export type * as PieCoreMedia from './interfaces/pie-core-media.js'; // import pie:core/media
 export type * as PieCoreMessaging from './interfaces/pie-core-messaging.js'; // import pie:core/messaging

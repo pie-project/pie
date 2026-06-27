@@ -16,7 +16,6 @@ import * as _chatWit from 'pie:instruct/chat';
 import * as _fsPreopens from 'wasi:filesystem/preopens@0.2.4';
 import type { Descriptor as _FsDescriptor } from 'wasi:filesystem/types@0.2.4';
 
-import { awaitFuture } from './_async.js';
 import * as _chat from './chat.js';
 import { Forward } from './forward.js';
 import { Generator, type GenerateOptions } from './generation.js';
@@ -464,7 +463,7 @@ export class Context implements Disposable {
     const pass = new _ForwardPass();
     this._attachKv(pass, write);
     pass.inputTokens(Uint32Array.from(tokens), positions);
-    await awaitFuture(pass.execute(), 'Context.flush: forward pass failed');
+    await pass.execute();
 
     this._history.push(...tokens);
     this._seqLen += n;
@@ -482,7 +481,7 @@ export class Context implements Disposable {
       const pass = new _ForwardPass();
       this._attachKv(pass, write);
       pass.inputImage(image, this._seqLen);
-      await awaitFuture(pass.execute(), 'Context.appendImage: forward pass failed');
+      await pass.execute();
       this._seqLen += numTokens;
       this._snapshottable = false;
     }
@@ -503,7 +502,7 @@ export class Context implements Disposable {
       const pass = new _ForwardPass();
       this._attachKv(pass, write);
       pass.inputAudio(audio, this._seqLen);
-      await awaitFuture(pass.execute(), 'Context.appendAudio: forward pass failed');
+      await pass.execute();
       this._seqLen += numTokens;
       this._snapshottable = false;
     }

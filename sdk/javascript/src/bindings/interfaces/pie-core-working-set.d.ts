@@ -1,6 +1,5 @@
 /** @module Interface pie:core/working-set **/
 export type Error = import('./pie-core-types.js').Error;
-export type Model = import('./pie-core-model.js').Model;
 /**
  * Shared by both working-set kinds. A contiguous, half-open span
  * [start, start + len) of relative page slots inside a working set's dense
@@ -19,9 +18,10 @@ export class KvWorkingSet {
   * unified arena). The model is captured at construction so the
   * structural mutators (`alloc`/`free`/`slice`/`append`/`fork`) can
   * resolve the arena without a forward pass; `slice`/`fork` inherit this
-  * model. In a single-model runtime every set shares the one model.
+  * model. In a single-model runtime every set binds to the single
+  * bound model.
   */
-  constructor(model: Model)
+  constructor()
   /**
   * Current number of page slots in the array.
   */
@@ -38,12 +38,6 @@ export class KvWorkingSet {
   * Tokens per KV page for this working set's model/driver.
   */
   pageSize(): number;
-  /**
-  * The model this working set is bound to (a fresh owned handle, minted
-  * from the constructor's eagerly-bound model). Lets the SDK recover the
-  * model after `fork`/`slice` without threading it separately.
-  */
-  model(): Model;
   /**
   * Append `n` fresh page slots to the end of the array; returns the
   * contiguous relative range that was added. `alloc(0)` returns an
@@ -87,9 +81,9 @@ export class RsWorkingSet {
   /**
   * Fresh, empty RS working set bound to `model` (device / arena),
   * captured at construction so `alloc-buffer`/`fork`/`fold` resolve the
-  * arena without a forward pass; `fork` inherits this model.
+  * arena without a forward pass; `fork` inherits this binding.
   */
-  constructor(model: Model)
+  constructor()
   /**
   * Size in bytes of one folded recurrent-state object for this model.
   */

@@ -1,8 +1,5 @@
 /** @module Interface pie:core/inference **/
-export type Pollable = import('./wasi-io-poll.js').Pollable;
 export type Error = import('./pie-core-types.js').Error;
-export type Model = import('./pie-core-model.js').Model;
-export type Tokenizer = import('./pie-core-model.js').Tokenizer;
 export type Adapter = import('./pie-core-adapter.js').Adapter;
 export type Image = import('./pie-core-media.js').Image;
 export type Audio = import('./pie-core-media.js').Audio;
@@ -200,7 +197,7 @@ export interface Output {
 }
 
 export class ForwardPass {
-  constructor(model: Model)
+  constructor()
   /**
   * KV attention context this pass reads. Replaces the old opaque
   * `context` handle. For hybrid models, combine with `rs-context`.
@@ -264,19 +261,7 @@ export class ForwardPass {
   logitMask(mask: Brle): void;
   sampler(indices: Uint32Array, sampler: Sampler): void;
   adapter(adapter: Adapter): void;
-  execute(): FutureOutput;
-}
-
-export class FutureOutput {
-  /**
-   * This type does not have a public constructor.
-   */
-  private constructor();
-  /**
-  * Returns a pollable object to check when the result is ready
-  */
-  pollable(): Pollable;
-  get(): Output | undefined;
+  execute(): Promise<Output>;
 }
 
 export class Grammar {
@@ -309,9 +294,9 @@ export class Grammar {
 
 export class Matcher {
   /**
-  * Create a new matcher from a grammar and tokenizer.
+  * Create a new matcher from a grammar.
   */
-  constructor(grammar: Grammar, tokenizer: Tokenizer)
+  constructor(grammar: Grammar)
   /**
   * Accept one or more decoded tokens, advancing the matcher state.
   * Returns an error if any token violates the grammar.
