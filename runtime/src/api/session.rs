@@ -1,15 +1,17 @@
-//! pie:core/session - User ↔ Process remote communication
+//! pie:core/session - User <-> Process remote communication.
+//!
+//! `receive`/`receive-file` are now native `async func`: the host awaits the
+//! next message/file directly (no fabricated future resource). Per the
+//! wasmtime-46 component-model-async model, async-func imports are generated on
+//! the `HostWithStore` trait taking an `Accessor` rather than `&mut self`.
 
 use crate::api::pie;
-use crate::api::types::FutureString;
 use crate::instance::InstanceState;
 use crate::messaging;
 use crate::process::{self, ProcessEvent};
 use crate::server;
 use anyhow::Result;
-use tokio::sync::oneshot;
-use wasmtime::component::Resource;
-use wasmtime_wasi::WasiView;
+use wasmtime::component::{Accessor, HasSelf};
 
 impl pie::core::session::Host for InstanceState {
     async fn send(&mut self, message: String) -> Result<()> {
@@ -20,18 +22,6 @@ impl pie::core::session::Host for InstanceState {
         Ok(())
     }
 
-    async fn receive(&mut self) -> Result<Resource<FutureString>> {
-        let (tx, rx) = oneshot::channel();
-        let topic = self.id().to_string();
-        tokio::spawn(async move {
-            if let Ok(msg) = messaging::pull(topic).await {
-                let _ = tx.send(msg);
-            }
-        });
-        let future_string = FutureString::new(rx);
-        Ok(self.ctx().table.push(future_string)?)
-    }
-
     async fn send_file(&mut self, data: Vec<u8>) -> Result<()> {
         let process_id = self.id();
         if let Ok(Some(client_id)) = process::get_client_id(process_id).await {
@@ -39,19 +29,26 @@ impl pie::core::session::Host for InstanceState {
         }
         Ok(())
     }
+}
 
-    async fn receive_file(&mut self) -> Result<Resource<crate::api::types::FutureBlob>> {
-        let (tx, rx) = oneshot::channel::<Vec<u8>>();
-        let process_id = self.id();
+impl pie::core::session::HostWithStore<InstanceState> for HasSelf<InstanceState> {
+    async fn receive(accessor: &Accessor<InstanceState, Self>) -> Result<Option<String>> {
+        let topic = accessor.with(|mut access| access.get().id().to_string());
+        match messaging::pull(topic).await {
+            Ok(msg) => Ok(Some(msg)),
+            Err(_) => Ok(None),
+        }
+    }
+
+    async fn receive_file(accessor: &Accessor<InstanceState, Self>) -> Result<Option<Vec<u8>>> {
+        let process_id = accessor.with(|mut access| access.get().id());
         let client_id = process::get_client_id(process_id).await.ok().flatten();
-        tokio::spawn(async move {
-            if let Some(cid) = client_id {
-                if let Ok(data) = server::receive_file(cid, process_id).await {
-                    let _ = tx.send(data.to_vec());
-                }
-            }
-        });
-        let future_blob = crate::api::types::FutureBlob::new(rx);
-        Ok(self.ctx().table.push(future_blob)?)
+        match client_id {
+            Some(cid) => match server::receive_file(cid, process_id).await {
+                Ok(data) => Ok(Some(data.to_vec())),
+                Err(_) => Ok(None),
+            },
+            None => Ok(None),
+        }
     }
 }

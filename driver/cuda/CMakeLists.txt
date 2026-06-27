@@ -926,5 +926,5 @@ target_link_libraries(pie_driver_cuda_lib PUBLIC
 # -lculibos -lpthread -lrt -ldl`, runs at runtime, and yields `ldd`
 # output with zero non-system shared libs. M4 wires worker/standalone's
 # `--features driver-cuda` build.rs to consume `pie_driver_cuda_lib`
-# with those static link flags (mirror the portable side's `BUILD_SHARED_LIBS=OFF`
+# with those static link flags (mirror the metal side's `BUILD_SHARED_LIBS=OFF`
 # trick, plus explicit `-l:libcublas_static.a` group).

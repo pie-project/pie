@@ -12,8 +12,6 @@
 
 use inferlet::{
     Context, Result,
-    model::Model,
-    runtime,
     sample::Sampler,
 };
 use serde::Deserialize;
@@ -39,12 +37,9 @@ async fn main(input: Input) -> Result<String> {
     let window_size = input.window_size;
 
     let start = Instant::now();
-    let models = runtime::models();
-    let model = Model::load(models.first().ok_or("No models available")?)?;
-    let tokenizer = model.tokenizer();
-    let stop_tokens = inferlet::chat::stop_tokens(&model);
+    let stop_tokens = inferlet::chat::stop_tokens();
 
-    let mut ctx = Context::new(&model)?;
+    let mut ctx = Context::new()?;
     ctx.system("You are a helpful assistant.")
         .user(&input.prompt)
         .cue();
@@ -60,7 +55,7 @@ async fn main(input: Input) -> Result<String> {
 
     // Bootstrap: append the last cue token to drive a single forward pass
     // and read its next-token prediction.
-    let cue = inferlet::chat::cue(&model);
+    let cue = inferlet::chat::cue();
     let trigger = *cue.last().unwrap_or(&0);
     let first_token = {
         let mut pass = ctx.forward();
@@ -159,7 +154,7 @@ async fn main(input: Input) -> Result<String> {
         };
     }
 
-    let text = tokenizer.decode(&all_generated)?;
+    let text = inferlet::model::decode(&all_generated)?;
     println!(
         "Generated {} tokens in {:?} ({:.1} tokens/s)",
         all_generated.len(),

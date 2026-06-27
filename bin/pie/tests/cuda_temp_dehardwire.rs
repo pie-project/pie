@@ -68,7 +68,7 @@ async fn temp_dehardwire_on_real_driver() -> Result<()> {
     eprintln!("[temp-dehardwire] program installed, launching tempgen…");
 
     let mut proc = client
-        .launch_process("tempgen@0.1.0".to_string(), "{}".to_string(), true, None)
+        .launch_process("tempgen@0.1.0".to_string(), "{}".to_string(), true)
         .await
         .context("launch")?;
     let json = proc.wait_for_return().await.context("wait_for_return")?;

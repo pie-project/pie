@@ -34,9 +34,12 @@ from abc import abstractmethod
 import weakref
 
 from componentize_py_types import Result, Ok, Err, Some
-from ..imports import wall_clock
-from ..imports import streams
 from ..imports import error
+from ..imports import streams
+from ..imports import wall_clock
+import componentize_py_async_support
+from componentize_py_async_support.streams import StreamReader, StreamWriter, ByteStreamReader, ByteStreamWriter
+from componentize_py_async_support.futures import FutureReader, FutureWriter
 
 class DescriptorType(Enum):
     """
@@ -199,7 +202,7 @@ class DirectoryEntryStream:
         """
         Read a single directory entry from a `directory-entry-stream`.
         
-        Raises: `wit_world.types.Err(wit_world.imports.wasi_filesystem_types.ErrorCode)`
+        Raises: `componentize_py_types.Err(wit_world.imports.wasi_filesystem_types.ErrorCode)`
         """
         raise NotImplementedError
     def __enter__(self) -> Self:
@@ -231,7 +234,7 @@ class Descriptor:
         
         Note: This allows using `read-stream`, which is similar to `read` in POSIX.
         
-        Raises: `wit_world.types.Err(wit_world.imports.wasi_filesystem_types.ErrorCode)`
+        Raises: `componentize_py_types.Err(wit_world.imports.wasi_filesystem_types.ErrorCode)`
         """
         raise NotImplementedError
     def write_via_stream(self, offset: int) -> streams.OutputStream:
@@ -243,7 +246,7 @@ class Descriptor:
         Note: This allows using `write-stream`, which is similar to `write` in
         POSIX.
         
-        Raises: `wit_world.types.Err(wit_world.imports.wasi_filesystem_types.ErrorCode)`
+        Raises: `componentize_py_types.Err(wit_world.imports.wasi_filesystem_types.ErrorCode)`
         """
         raise NotImplementedError
     def append_via_stream(self) -> streams.OutputStream:
@@ -255,7 +258,7 @@ class Descriptor:
         Note: This allows using `write-stream`, which is similar to `write` with
         `O_APPEND` in POSIX.
         
-        Raises: `wit_world.types.Err(wit_world.imports.wasi_filesystem_types.ErrorCode)`
+        Raises: `componentize_py_types.Err(wit_world.imports.wasi_filesystem_types.ErrorCode)`
         """
         raise NotImplementedError
     def advise(self, offset: int, length: int, advice: Advice) -> None:
@@ -264,7 +267,7 @@ class Descriptor:
         
         This is similar to `posix_fadvise` in POSIX.
         
-        Raises: `wit_world.types.Err(wit_world.imports.wasi_filesystem_types.ErrorCode)`
+        Raises: `componentize_py_types.Err(wit_world.imports.wasi_filesystem_types.ErrorCode)`
         """
         raise NotImplementedError
     def sync_data(self) -> None:
@@ -276,7 +279,7 @@ class Descriptor:
         
         Note: This is similar to `fdatasync` in POSIX.
         
-        Raises: `wit_world.types.Err(wit_world.imports.wasi_filesystem_types.ErrorCode)`
+        Raises: `componentize_py_types.Err(wit_world.imports.wasi_filesystem_types.ErrorCode)`
         """
         raise NotImplementedError
     def get_flags(self) -> DescriptorFlags:
@@ -288,7 +291,7 @@ class Descriptor:
         Note: This returns the value that was the `fs_flags` value returned
         from `fdstat_get` in earlier versions of WASI.
         
-        Raises: `wit_world.types.Err(wit_world.imports.wasi_filesystem_types.ErrorCode)`
+        Raises: `componentize_py_types.Err(wit_world.imports.wasi_filesystem_types.ErrorCode)`
         """
         raise NotImplementedError
     def get_type(self) -> DescriptorType:
@@ -304,7 +307,7 @@ class Descriptor:
         Note: This returns the value that was the `fs_filetype` value returned
         from `fdstat_get` in earlier versions of WASI.
         
-        Raises: `wit_world.types.Err(wit_world.imports.wasi_filesystem_types.ErrorCode)`
+        Raises: `componentize_py_types.Err(wit_world.imports.wasi_filesystem_types.ErrorCode)`
         """
         raise NotImplementedError
     def set_size(self, size: int) -> None:
@@ -314,7 +317,7 @@ class Descriptor:
         
         Note: This was called `fd_filestat_set_size` in earlier versions of WASI.
         
-        Raises: `wit_world.types.Err(wit_world.imports.wasi_filesystem_types.ErrorCode)`
+        Raises: `componentize_py_types.Err(wit_world.imports.wasi_filesystem_types.ErrorCode)`
         """
         raise NotImplementedError
     def set_times(self, data_access_timestamp: NewTimestamp, data_modification_timestamp: NewTimestamp) -> None:
@@ -325,7 +328,7 @@ class Descriptor:
         
         Note: This was called `fd_filestat_set_times` in earlier versions of WASI.
         
-        Raises: `wit_world.types.Err(wit_world.imports.wasi_filesystem_types.ErrorCode)`
+        Raises: `componentize_py_types.Err(wit_world.imports.wasi_filesystem_types.ErrorCode)`
         """
         raise NotImplementedError
     def read(self, length: int, offset: int) -> Tuple[bytes, bool]:
@@ -342,7 +345,7 @@ class Descriptor:
         
         Note: This is similar to `pread` in POSIX.
         
-        Raises: `wit_world.types.Err(wit_world.imports.wasi_filesystem_types.ErrorCode)`
+        Raises: `componentize_py_types.Err(wit_world.imports.wasi_filesystem_types.ErrorCode)`
         """
         raise NotImplementedError
     def write(self, buffer: bytes, offset: int) -> int:
@@ -357,7 +360,7 @@ class Descriptor:
         
         Note: This is similar to `pwrite` in POSIX.
         
-        Raises: `wit_world.types.Err(wit_world.imports.wasi_filesystem_types.ErrorCode)`
+        Raises: `componentize_py_types.Err(wit_world.imports.wasi_filesystem_types.ErrorCode)`
         """
         raise NotImplementedError
     def read_directory(self) -> DirectoryEntryStream:
@@ -372,7 +375,7 @@ class Descriptor:
         directory. Multiple streams may be active on the same directory, and they
         do not interfere with each other.
         
-        Raises: `wit_world.types.Err(wit_world.imports.wasi_filesystem_types.ErrorCode)`
+        Raises: `componentize_py_types.Err(wit_world.imports.wasi_filesystem_types.ErrorCode)`
         """
         raise NotImplementedError
     def sync(self) -> None:
@@ -384,7 +387,7 @@ class Descriptor:
         
         Note: This is similar to `fsync` in POSIX.
         
-        Raises: `wit_world.types.Err(wit_world.imports.wasi_filesystem_types.ErrorCode)`
+        Raises: `componentize_py_types.Err(wit_world.imports.wasi_filesystem_types.ErrorCode)`
         """
         raise NotImplementedError
     def create_directory_at(self, path: str) -> None:
@@ -393,7 +396,7 @@ class Descriptor:
         
         Note: This is similar to `mkdirat` in POSIX.
         
-        Raises: `wit_world.types.Err(wit_world.imports.wasi_filesystem_types.ErrorCode)`
+        Raises: `componentize_py_types.Err(wit_world.imports.wasi_filesystem_types.ErrorCode)`
         """
         raise NotImplementedError
     def stat(self) -> DescriptorStat:
@@ -408,7 +411,7 @@ class Descriptor:
         
         Note: This was called `fd_filestat_get` in earlier versions of WASI.
         
-        Raises: `wit_world.types.Err(wit_world.imports.wasi_filesystem_types.ErrorCode)`
+        Raises: `componentize_py_types.Err(wit_world.imports.wasi_filesystem_types.ErrorCode)`
         """
         raise NotImplementedError
     def stat_at(self, path_flags: PathFlags, path: str) -> DescriptorStat:
@@ -421,7 +424,7 @@ class Descriptor:
         
         Note: This was called `path_filestat_get` in earlier versions of WASI.
         
-        Raises: `wit_world.types.Err(wit_world.imports.wasi_filesystem_types.ErrorCode)`
+        Raises: `componentize_py_types.Err(wit_world.imports.wasi_filesystem_types.ErrorCode)`
         """
         raise NotImplementedError
     def set_times_at(self, path_flags: PathFlags, path: str, data_access_timestamp: NewTimestamp, data_modification_timestamp: NewTimestamp) -> None:
@@ -433,7 +436,7 @@ class Descriptor:
         Note: This was called `path_filestat_set_times` in earlier versions of
         WASI.
         
-        Raises: `wit_world.types.Err(wit_world.imports.wasi_filesystem_types.ErrorCode)`
+        Raises: `componentize_py_types.Err(wit_world.imports.wasi_filesystem_types.ErrorCode)`
         """
         raise NotImplementedError
     def link_at(self, old_path_flags: PathFlags, old_path: str, new_descriptor: Self, new_path: str) -> None:
@@ -446,7 +449,7 @@ class Descriptor:
         
         Note: This is similar to `linkat` in POSIX.
         
-        Raises: `wit_world.types.Err(wit_world.imports.wasi_filesystem_types.ErrorCode)`
+        Raises: `componentize_py_types.Err(wit_world.imports.wasi_filesystem_types.ErrorCode)`
         """
         raise NotImplementedError
     def open_at(self, path_flags: PathFlags, path: str, open_flags: OpenFlags, flags: DescriptorFlags) -> Self:
@@ -464,7 +467,7 @@ class Descriptor:
         
         Note: This is similar to `openat` in POSIX.
         
-        Raises: `wit_world.types.Err(wit_world.imports.wasi_filesystem_types.ErrorCode)`
+        Raises: `componentize_py_types.Err(wit_world.imports.wasi_filesystem_types.ErrorCode)`
         """
         raise NotImplementedError
     def readlink_at(self, path: str) -> str:
@@ -476,7 +479,7 @@ class Descriptor:
         
         Note: This is similar to `readlinkat` in POSIX.
         
-        Raises: `wit_world.types.Err(wit_world.imports.wasi_filesystem_types.ErrorCode)`
+        Raises: `componentize_py_types.Err(wit_world.imports.wasi_filesystem_types.ErrorCode)`
         """
         raise NotImplementedError
     def remove_directory_at(self, path: str) -> None:
@@ -487,7 +490,7 @@ class Descriptor:
         
         Note: This is similar to `unlinkat(fd, path, AT_REMOVEDIR)` in POSIX.
         
-        Raises: `wit_world.types.Err(wit_world.imports.wasi_filesystem_types.ErrorCode)`
+        Raises: `componentize_py_types.Err(wit_world.imports.wasi_filesystem_types.ErrorCode)`
         """
         raise NotImplementedError
     def rename_at(self, old_path: str, new_descriptor: Self, new_path: str) -> None:
@@ -496,7 +499,7 @@ class Descriptor:
         
         Note: This is similar to `renameat` in POSIX.
         
-        Raises: `wit_world.types.Err(wit_world.imports.wasi_filesystem_types.ErrorCode)`
+        Raises: `componentize_py_types.Err(wit_world.imports.wasi_filesystem_types.ErrorCode)`
         """
         raise NotImplementedError
     def symlink_at(self, old_path: str, new_path: str) -> None:
@@ -508,7 +511,7 @@ class Descriptor:
         
         Note: This is similar to `symlinkat` in POSIX.
         
-        Raises: `wit_world.types.Err(wit_world.imports.wasi_filesystem_types.ErrorCode)`
+        Raises: `componentize_py_types.Err(wit_world.imports.wasi_filesystem_types.ErrorCode)`
         """
         raise NotImplementedError
     def unlink_file_at(self, path: str) -> None:
@@ -518,7 +521,7 @@ class Descriptor:
         Return `error-code::is-directory` if the path refers to a directory.
         Note: This is similar to `unlinkat(fd, path, 0)` in POSIX.
         
-        Raises: `wit_world.types.Err(wit_world.imports.wasi_filesystem_types.ErrorCode)`
+        Raises: `componentize_py_types.Err(wit_world.imports.wasi_filesystem_types.ErrorCode)`
         """
         raise NotImplementedError
     def is_same_object(self, other: Self) -> bool:
@@ -553,7 +556,7 @@ class Descriptor:
         
         However, none of these is required.
         
-        Raises: `wit_world.types.Err(wit_world.imports.wasi_filesystem_types.ErrorCode)`
+        Raises: `componentize_py_types.Err(wit_world.imports.wasi_filesystem_types.ErrorCode)`
         """
         raise NotImplementedError
     def metadata_hash_at(self, path_flags: PathFlags, path: str) -> MetadataHashValue:
@@ -563,7 +566,7 @@ class Descriptor:
         
         This performs the same hash computation as `metadata-hash`.
         
-        Raises: `wit_world.types.Err(wit_world.imports.wasi_filesystem_types.ErrorCode)`
+        Raises: `componentize_py_types.Err(wit_world.imports.wasi_filesystem_types.ErrorCode)`
         """
         raise NotImplementedError
     def __enter__(self) -> Self:

@@ -23,8 +23,6 @@
 
 use inferlet::{
     Context, Result,
-    model::Model,
-    runtime,
     sample::{Distribution, Entropy, Logits, Logprob, Logprobs, Sampler},
 };
 use serde::Deserialize;
@@ -53,10 +51,7 @@ fn argmax(xs: &[f32]) -> usize {
 
 #[inferlet::main]
 async fn main(_input: Input) -> Result<String> {
-    let models = runtime::models();
-    let model = Model::load(models.first().ok_or("No models available")?)?;
-
-    let mut ctx = Context::new(&model)?;
+    let mut ctx = Context::new()?;
     ctx.system("Answer in one short word.")
         .user("What is the capital of France?")
         .cue();

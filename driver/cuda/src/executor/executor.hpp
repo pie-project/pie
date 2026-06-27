@@ -133,6 +133,22 @@ struct ForwardFn {
         // frozen verify without re-running the whole backbone.
         const std::int32_t*  commit_advance_gather_d = nullptr;
 
+        // Ph7 RS working-set fold-from-buffer. Per-request CSR of buffered-slab
+        // block ids into the recurrent_state_cache buffered-activation pool
+        // (host — the gather/scatter is a host-driven loop of per-slab d2d
+        // memcpys, page-major: slab s holds tokens [s*page, (s+1)*page)).
+        //   rs_buffer_write : after in_proj, scatter [mixed_qkv|a|b] for each
+        //     request's tokens INTO its pool slabs (rs-output W10; write_state
+        //     forced false — buffered, not folded).
+        //   rs_buffer_fold (with commit_advance_gather_d) : the replay loads each
+        //     linear layer's activations FROM the pool slabs (vs the verify
+        //     stash) and folds commit_len[r]=rs_fold_lens[r] tokens into
+        //     recurrent_state[slot_ids[r]].
+        const std::uint32_t* rs_buffer_slot_ids_h    = nullptr;  // flattened CSR
+        const std::uint32_t* rs_buffer_slot_indptr_h = nullptr;  // R+1, leading 0
+        bool                 rs_buffer_write          = false;
+        bool                 rs_buffer_fold           = false;
+
         // Multimodal (gemma4 vision, option-B pixel path) — host pointers into
         // the request view. The model encodes each image and scatters the
         // projected soft tokens into the embed output. Empty for text-only.

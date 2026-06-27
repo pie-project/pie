@@ -23,9 +23,7 @@
 
 use inferlet::{
     Context, Result,
-    model::Model,
     forward::Forward,
-    runtime,
     sample::{Logits, Sampler},
 };
 use serde::Deserialize;
@@ -101,10 +99,7 @@ enum GreedyOrLogits {
 async fn main(input: Input) -> Result<String> {
     let iters = input.iters.max(1);
 
-    let models = runtime::models();
-    let model = Model::load(models.first().ok_or("No models available")?)?;
-
-    let mut base = Context::new(&model)?;
+    let mut base = Context::new()?;
 
     // Build a small fixed prompt and prefill it once (one Pass — page math
     // and commit happen inside).

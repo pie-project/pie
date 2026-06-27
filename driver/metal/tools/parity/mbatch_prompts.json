@@ -1,0 +1,9 @@
+{
+  "_doc": "M>1 multi-batch parity prompt set. Deliberately VARIED lengths to stress ragged batching (per-seq position + paged-KV indexing). Each prompt -> a sealed M=1 golden (raw-Metal per-kernel taps) + cross-engine reference first-decode argmax. The M>1 batched run with these same prompts concurrently must reproduce each seq's M=1 golden (batch_parity.py).",
+  "prompts": [
+    {"slot": 0, "text": "The capital of France is Paris, the"},
+    {"slot": 1, "text": "Once upon a time, in a distant land far beyond the mountains, there lived"},
+    {"slot": 2, "text": "Quantum computers exploit superposition and entanglement to perform certain classes of computation that are intractable for classical machines, including integer factorization and"},
+    {"slot": 3, "text": "The history of computing spans several centuries, beginning with early mechanical calculators and evolving through punched cards, vacuum tubes, transistors, and integrated circuits. Modern processors execute billions of instructions per second, enabling advances in artificial intelligence, scientific simulation, and real-time graphics."}
+  ]
+}

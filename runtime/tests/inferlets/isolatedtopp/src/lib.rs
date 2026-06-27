@@ -11,16 +11,14 @@
 //! Run with `PIE_FIXED_SAMPLING_SEED=12345` for reproducibility (ambient seed),
 //! and `PIE_SAMPLING_IR_TRACE=1` to confirm the FlashInfer dispatch flip.
 
-use inferlet::{Context, Result, model::Model, runtime, sample::Sampler};
+use inferlet::{Context, Result, model, sample::Sampler};
 
 #[inferlet::main]
 async fn main(_input: String) -> Result<String> {
-    let models = runtime::models();
-    let model = Model::load(&models[0])?;
-    let tokenizer = model.tokenizer();
-
-    let mut context = Context::new(&model)?;
-    let prompt_tokens = tokenizer.encode("hello world");
+    // P3 single-model: the engine serves exactly one model — no handle to
+    // load; tokenizer is the global `model::*` API.
+    let mut context = Context::new()?;
+    let prompt_tokens = model::encode("hello world");
     context.append(&prompt_tokens);
 
     let mut g = context

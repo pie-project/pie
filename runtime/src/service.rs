@@ -7,23 +7,15 @@
 //!
 //! - **Handle**: Trait for implementing message handlers
 //! - **Service**: Single service address (for singletons)
-//! - **ServiceArray**: Table of service addresses indexed by usize
 //! - **ServiceMap**: Map of service addresses indexed by custom keys
 //!
 //! # Usage
 //!
 //! ## Singleton Service
 //! ```ignore
-//! static SVC: LazyLock<Service<MyMessage>> = LazyLock::new(Service::new);
+//! static SVC: Service<MyMessage> = Service::new();
 //! SVC.spawn(|| MyHandler::new());
 //! SVC.send(msg)?;
-//! ```
-//!
-//! ## Indexed Services
-//! ```ignore
-//! static SVCS: LazyLock<ServiceArray<MyMessage>> = LazyLock::new(ServiceArray::new);
-//! let idx = SVCS.spawn(|| MyHandler::new());
-//! SVCS.send(idx, msg)?;
 //! ```
 //!
 //! ## Keyed Services (for registries)
@@ -124,61 +116,6 @@ impl<Msg: Send + 'static> Service<Msg> {
     /// Returns true if the service has been spawned.
     pub fn is_spawned(&self) -> bool {
         self.tx.get().is_some()
-    }
-}
-
-// =============================================================================
-// Indexed Services
-// =============================================================================
-
-/// A table of service addresses indexed by ID.
-///
-/// Use when you need one service per model/context/etc.
-#[derive(Debug)]
-pub struct ServiceArray<Msg: Send + 'static> {
-    table: boxcar::Vec<UnboundedSender<Msg>>,
-}
-
-impl<Msg: Send + 'static> ServiceArray<Msg> {
-    /// Creates a new empty table.
-    pub const fn new() -> Self {
-        Self {
-            table: boxcar::Vec::new(),
-        }
-    }
-
-    /// Spawns a new service and returns its index.
-    pub fn spawn<H, F>(&self, factory: F) -> Result<usize>
-    where
-        H: ServiceHandler<Message = Msg>,
-        F: FnOnce() -> H,
-    {
-        let handler = factory();
-        let (tx, rx) = unbounded_channel();
-        let idx = self.table.push(tx);
-
-        let _ = run_handler(handler, rx);
-
-        Ok(idx)
-    }
-
-    /// Sends a message to a service by index.
-    pub fn send(&self, idx: usize, msg: Msg) -> Result<()> {
-        let tx = self
-            .table
-            .get(idx)
-            .ok_or_else(|| anyhow!("Invalid service index: {}", idx))?;
-        tx.send(msg).map_err(|_| anyhow!("Service channel closed"))
-    }
-
-    /// Returns the number of services.
-    pub fn len(&self) -> usize {
-        self.table.count()
-    }
-
-    /// Returns true if no services exist.
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
     }
 }
 

@@ -25,17 +25,14 @@
 //! Stage 2 on the program model. Program-native single-pass authoring is fully
 //! available now via [`Forward::sampler`](crate::forward::Forward::sampler).
 
-use crate::ForwardPassExt;
 use crate::Result;
 use crate::adapter::Adapter;
-use crate::context::{Context, brle_and, compute_bid};
+use crate::context::{Context, brle_and};
 use crate::forward::Output;
-use crate::pie::core::inference::ForwardPass;
+use crate::pie::core::inference::{ForwardPass, SlotOutput};
 use crate::sample::Sampler;
 use crate::spec::Speculator;
 use std::collections::VecDeque;
-
-const GENERATION_RESERVATION_WINDOW_TOKENS: u32 = 512;
 
 // Re-export so callers don't have to pull from `context` directly.
 pub use crate::context::{Constrain, GrammarConstraint, Schema};
@@ -87,16 +84,6 @@ impl<'ctx> Generator<'ctx> {
     /// Construct a generator over `ctx` with the given sampler. Prefer
     /// [`Context::generate`].
     pub(crate) fn new(ctx: &'ctx mut Context, sampler: Sampler) -> Self {
-        // Prime the bid with the budget-exhausting rate (geometric prior,
-        // cv²=1) so the scheduler sees a reasonable number from the start.
-        let balance = crate::scheduling::balance(&ctx.model);
-        let dividend = crate::scheduling::dividend(&ctx.model);
-        let pages = (ctx.committed_pages + ctx.working_pages).max(1) as f64;
-        let page_size = ctx.page_size as f64;
-        ctx.set_bid(compute_bid(
-            balance, pages, 4096.0, 1.0, page_size, dividend,
-        ));
-
         Self {
             ctx,
             sampler,
@@ -149,7 +136,7 @@ impl<'ctx> Generator<'ctx> {
     /// internally. Composes with other constraints just like
     /// [`constrain`](Self::constrain).
     pub fn constrain_with<S: Schema>(mut self, schema: S) -> Result<Self> {
-        let c = schema.build_constraint(&self.ctx.model)?;
+        let c = schema.build_constraint()?;
         self.constraints.push(Box::new(c));
         Ok(self)
     }
@@ -337,7 +324,7 @@ impl<'ctx> Generator<'ctx> {
     /// Run to completion, decode through a chat decoder, return text.
     pub async fn collect_text(mut self) -> Result<String> {
         use crate::chat;
-        let mut decoder = chat::Decoder::new(&self.ctx.model);
+        let mut decoder = chat::Decoder::new();
         let mut text = String::new();
         while let Some(step) = self.next()? {
             let out = step.execute().await?;
@@ -359,40 +346,16 @@ impl<'ctx> Generator<'ctx> {
         let schema = schemars::schema_for!(T);
         let schema_str = serde_json::to_string(&schema)
             .map_err(|e| format!("collect_json: serialize schema: {e}"))?;
-        let constraint = GrammarConstraint::from_json_schema(&schema_str, &self.ctx.model)?;
+        let constraint = GrammarConstraint::from_json_schema(&schema_str)?;
         let text = self.constrain(constraint).collect_text().await?;
         serde_json::from_str(&text).map_err(|e| format!("collect_json: deserialize: {e}"))
     }
 
     // ── Internal helpers ───────────────────────────────────────────────
 
-    fn recompute_bid(&mut self) {
-        let balance = crate::scheduling::balance(&self.ctx.model);
-        let dividend = crate::scheduling::dividend(&self.ctx.model);
-        let pages = (self.ctx.committed_pages + self.ctx.working_pages) as f64;
-        let page_size = self.ctx.page_size as f64;
-
-        // Horizon cascade: explicit → max_tokens → Lindy.
-        let (mu, cv2) = if let Some(h) = self.horizon {
-            ((h.saturating_sub(self.tokens_generated)).max(1) as f64, 0.0)
-        } else if let Some(m) = self.max_tokens {
-            ((m.saturating_sub(self.tokens_generated)).max(1) as f64, 1.0)
-        } else {
-            (self.tokens_generated.max(64) as f64, 1.0)
-        };
-
-        self.ctx
-            .set_bid(compute_bid(balance, pages, mu, cv2, page_size, dividend));
-    }
-
-    fn reservation_lookahead_tokens(&self) -> u32 {
-        let remaining = self
-            .horizon
-            .or(self.max_tokens)
-            .map(|limit| limit.saturating_sub(self.tokens_generated))
-            .unwrap_or(0);
-        remaining.min(GENERATION_RESERVATION_WINDOW_TOKENS as usize) as u32
-    }
+    // P3 is single-model FCFS — no scheduler bidding. Retained as a no-op so the
+    // per-step call sites stay stable if the bid path ever returns.
+    fn recompute_bid(&mut self) {}
 
     /// Lazily lower the configured [`Sampler`] to a reusable, binding-free
     /// `tensor::Program` (+ its binding template + output count) via foxtrot's
@@ -404,7 +367,7 @@ impl<'ctx> Generator<'ctx> {
             // sampler operates on logits, and the host recognizer + bake key on
             // the logits vocab. (Using tokenizer vocab mis-shapes the program
             // and misses the recognizer → CustomJIT.)
-            let vocab = self.ctx.model.output_vocab_size();
+            let vocab = crate::model::output_vocab_size();
             let spec: sampling_edsl::SamplerSpec = self.sampler.clone().into();
             // (B) de-hardwiring: emit the canonical `standard_program` (params
             // as host-submit tensors) so the host recognizer hash-matches;
@@ -424,19 +387,9 @@ impl<'ctx> Generator<'ctx> {
         Ok(())
     }
 
-    fn release_empty_working_pages(&mut self) {
-        let used_pages = if self.ctx.working_tokens == 0 {
-            0
-        } else {
-            self.ctx.working_tokens.div_ceil(self.ctx.page_size)
-        };
-        let excess = self.ctx.working_pages.saturating_sub(used_pages);
-        if excess == 0 {
-            return;
-        }
-        self.ctx.inner.release_working_pages(excess);
-        self.ctx.working_pages -= excess;
-    }
+    // P3's working-set model auto-manages KV page lifetime (the working set frees
+    // its own pages); the SDK no longer tracks/releases working pages here.
+    fn release_empty_working_pages(&mut self) {}
 }
 
 impl Drop for Generator<'_> {
@@ -487,26 +440,13 @@ impl<'g, 'ctx> GenStep<'g, 'ctx> {
             return Ok(Output::new(Vec::new()));
         }
 
-        // Reserve pages for the pending fill (+ a lookahead window).
-        let total_after = parent
-            .ctx
-            .working_tokens
-            .saturating_add(n_pending)
-            .saturating_add(parent.reservation_lookahead_tokens());
-        let pages_needed = total_after.div_ceil(parent.ctx.page_size);
-        let additional = pages_needed.saturating_sub(parent.ctx.working_pages);
-        if additional > 0 {
-            parent
-                .ctx
-                .inner
-                .reserve_working_pages(additional)
-                .map_err(|e| format!("GenStep::execute reserve: {e}"))?;
-            parent.ctx.working_pages = pages_needed;
-        }
-
-        // Build the forward pass.
+        // Build the forward pass over P3's working-set KV model: the pending
+        // fill writes fresh tail slots; prior pages are the read context.
         let pass = ForwardPass::new();
-        pass.context(&parent.ctx.inner);
+        let (generation, indices, valid_lens, ctx_pages) = parent.ctx.prepare_write(n_pending)?;
+        parent
+            .ctx
+            .attach_kv(&pass, generation, indices, valid_lens, ctx_pages);
         if let Some(a) = parent.adapter {
             pass.adapter(a);
         }
@@ -523,7 +463,7 @@ impl<'g, 'ctx> GenStep<'g, 'ctx> {
         // binds its `Logits` input to the decode position. The sampler-cleared
         // path runs a pure fill (the caller samples by hand + `accept`s).
         let sampled: Option<u32> = if user_cleared_sampler {
-            pass.execute_outputs()
+            pass.execute()
                 .await
                 .map_err(|e| format!("GenStep::execute forward: {e}"))?;
             None
@@ -541,35 +481,28 @@ impl<'g, 'ctx> GenStep<'g, 'ctx> {
                 )?;
                 pass.sampler(program, bindings);
             }
-            let tensors = pass
-                .execute_outputs()
+            let wit_out = pass
+                .execute()
                 .await
                 .map_err(|e| format!("GenStep::execute forward: {e}"))?;
-            let token = tensors
-                .first()
-                .ok_or_else(|| "GenStep::execute: sampler produced no output tensor".to_string())?
-                .read()
-                .map_err(|e| format!("GenStep::execute: read token: {e:?}"))?
-                .chunks_exact(4)
-                .next()
-                .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-                .ok_or_else(|| "GenStep::execute: empty token output".to_string())?;
+            let token = match wit_out.slots.first() {
+                Some(SlotOutput::Token(t)) => *t,
+                Some(other) => {
+                    return Err(format!(
+                        "GenStep::execute: sampler slot is {other:?}, not a token"
+                    ));
+                }
+                None => {
+                    return Err("GenStep::execute: sampler produced no output slot".to_string());
+                }
+            };
             Some(token)
         };
 
-        // Commit the pending KV.
-        let new_working = parent.ctx.working_tokens + n_pending;
-        let pages_to_commit = new_working / parent.ctx.page_size;
-        if pages_to_commit > 0 {
-            parent
-                .ctx
-                .inner
-                .commit_working_pages(pages_to_commit)
-                .map_err(|e| format!("GenStep::execute commit: {e}"))?;
-        }
-        parent.ctx.committed_pages += pages_to_commit;
-        parent.ctx.working_pages -= pages_to_commit;
-        parent.ctx.working_tokens = new_working % parent.ctx.page_size;
+        // Advance the sequence cursor past the materialized fill. Full pages
+        // auto-seal host-side on the forward-txn commit — no explicit page
+        // commit under the P3 working-set model.
+        parent.ctx.history.extend_from_slice(&pending);
         parent.ctx.seq_len += n_pending;
 
         // Fold the sampled token into generator state (stop / max-tokens /

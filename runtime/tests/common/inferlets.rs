@@ -17,7 +17,7 @@ fn inferlets_dir() -> PathBuf {
 /// Build all test inferlets. Panics on failure.
 pub fn build_inferlets() {
     let status = Command::new("cargo")
-        .args(["build", "--target", "wasm32-wasip2"])
+        .args(["build", "--target", "wasm32-wasip3"])
         .current_dir(inferlets_dir())
         .status()
         .expect("Failed to run cargo build for test inferlets");
@@ -30,7 +30,7 @@ pub fn inferlet_wasm_path(name: &str) -> PathBuf {
     // Cargo replaces hyphens with underscores in output filenames
     let filename = format!("{}.wasm", name.replace('-', "_"));
     inferlets_dir()
-        .join("target/wasm32-wasip2/debug")
+        .join("target/wasm32-wasip3/debug")
         .join(filename)
 }
 

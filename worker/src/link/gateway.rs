@@ -420,10 +420,6 @@ fn push_ctx() -> tarpc::context::Context {
 ///   `process_id` as its `result`; the turn then runs until that process emits a
 ///   terminal `ProcessEvent` (`event == "return" | "error"`).
 /// - A non-process command's single matching `Response{corr}` is itself terminal.
-///
-/// Multi-process turns (`LaunchProcesses`/`RunProcesses`) are tracked by the
-/// first process only — a known follow-on; the turn stays open (never wrongly
-/// terminates) until the gateway aborts otherwise.
 fn turn_terminal(
     msg: &ServerMessage,
     corr: Option<u32>,
@@ -472,18 +468,10 @@ fn corr_id_of(m: &ClientMessage) -> Option<u32> {
         | Query { corr_id, .. }
         | AddProgram { corr_id, .. }
         | LaunchProcess { corr_id, .. }
-        | LaunchProcesses { corr_id, .. }
-        | RunProcesses { corr_id, .. }
         | AttachProcess { corr_id, .. }
         | TerminateProcess { corr_id, .. }
         | ListProcesses { corr_id }
-        | Ping { corr_id }
-        | RegisterMcpServer { corr_id, .. }
-        | McpResponse { corr_id, .. }
-        | SubmitWorkflow { corr_id, .. }
-        | CancelWorkflow { corr_id, .. }
-        | AttachWorkflow { corr_id, .. }
-        | DetachWorkflow { corr_id, .. } => Some(*corr_id),
+        | Ping { corr_id } => Some(*corr_id),
         SignalProcess { .. } | TransferFile { .. } => None,
     }
 }
@@ -493,10 +481,7 @@ fn corr_id_of(m: &ClientMessage) -> Option<u32> {
 fn is_process_launch(m: &ClientMessage) -> bool {
     matches!(
         m,
-        ClientMessage::LaunchProcess { .. }
-            | ClientMessage::LaunchProcesses { .. }
-            | ClientMessage::RunProcesses { .. }
-            | ClientMessage::AttachProcess { .. }
+        ClientMessage::LaunchProcess { .. } | ClientMessage::AttachProcess { .. }
     )
 }
 

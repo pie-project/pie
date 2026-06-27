@@ -5,7 +5,7 @@
 //! answers and selects the most central (consensus) answer.
 
 use futures::future;
-use inferlet::{Context, Result, sample::Sampler, model::Model, runtime};
+use inferlet::{Context, Result, sample::Sampler};
 use serde::Deserialize;
 use std::time::Instant;
 
@@ -36,12 +36,8 @@ async fn main(input: Input) -> Result<String> {
 
     let start = Instant::now();
 
-    let models = runtime::models();
-    let model_name = models.first().ok_or("No models available")?;
-    let model = Model::load(model_name)?;
-
     // Build the common prefix: system + user. Fork inherits this prefix.
-    let mut base_ctx = Context::new(&model)?;
+    let mut base_ctx = Context::new()?;
     base_ctx.system(SYSTEM_PROMPT);
     base_ctx.user(&question);
     base_ctx.flush().await?;

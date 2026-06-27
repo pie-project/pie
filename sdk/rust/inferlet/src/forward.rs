@@ -11,11 +11,11 @@
 //! the underlying `forward-pass` resource is still available via
 //! `inferlet::inference::ForwardPass`.
 
-use crate::ForwardPassExt;
+
 use crate::Result;
 use crate::adapter::Adapter;
 use crate::context::Context;
-use crate::pie::core::inference::{ForwardPass, InputBinding};
+use crate::pie::core::inference::{ForwardPass, InputBinding, SlotOutput};
 use crate::program::{HostInputDecl, ProgramHandle};
 use crate::sample::Sampler;
 use crate::tensor;
@@ -250,7 +250,7 @@ impl<'ctx> Forward<'ctx> {
     /// [`input`](Self::input). Returns one [`ProgramHandle`] per output (a sugar
     /// sampler yields a single `Token`); read it with [`Output::token`].
     pub fn sample(&mut self, sampler: Sampler) -> Result<Vec<ProgramHandle>> {
-        let vocab = self.ctx.model.output_vocab_size();
+        let vocab = crate::model::output_vocab_size();
         let (program, template, host_inputs, outputs, submit_values) =
             lower_sampler_to_program(&sampler, vocab)?;
         self.sampler = Some(SamplerAttach {
@@ -325,23 +325,30 @@ impl<'ctx> Forward<'ctx> {
 
         let n_auto = auto_inputs.len() as u32;
 
-        // Reserve working pages for auto-inputs (those occupy KV slots and
-        // commit on the way out). Explicit inputs are scoring-only — the
-        // caller manages their pages.
-        if n_auto > 0 {
-            let total_after = ctx.working_tokens + n_auto;
-            let pages_needed = total_after.div_ceil(ctx.page_size);
-            let additional = pages_needed.saturating_sub(ctx.working_pages);
-            if additional > 0 {
-                ctx.inner
-                    .reserve_working_pages(additional)
-                    .map_err(|e| format!("Forward::execute: reserve_working_pages: {e}"))?;
-                ctx.working_pages = pages_needed;
-            }
+        // Soft-token KV rows contributed by image/audio spans occupy tail KV
+        // slots just like text tokens.
+        let mut soft_tokens = 0u32;
+        for (image, _) in &images {
+            soft_tokens += image.token_count();
         }
+        for (audio, _) in &audios {
+            soft_tokens += audio.token_count();
+        }
+        let n_write = n_auto + soft_tokens;
 
         let pass = ForwardPass::new();
-        pass.context(&ctx.inner);
+
+        // KV read/write descriptors. New tail tokens (auto inputs + soft
+        // image/audio rows) are written into freshly-allocated slots, with the
+        // prior full pages as read context. A pass with no new tail tokens
+        // (pure decode-from-cache / scoring) reads the whole materialized
+        // context read-only.
+        if n_write > 0 {
+            let (generation, indices, valid_lens, ctx_pages) = ctx.prepare_write(n_write)?;
+            ctx.attach_kv(&pass, generation, indices, valid_lens, ctx_pages);
+        } else {
+            ctx.attach_full_context(&pass);
+        }
 
         for (image, anchor) in images {
             pass.input_image(image, anchor);
@@ -370,9 +377,9 @@ impl<'ctx> Forward<'ctx> {
         }
 
         // Attach the tensor-program sampler (if any). Binding `i` supplies the
-        // program input at index `i`; results follow the program's declared
-        // output order. A no-sampler pass (prefill/flush) carries no sampler
-        // and `output()` returns an empty tensor list.
+        // program input at index `i`; each program output is marshaled to a
+        // typed `slot-output` in `output.slots`, in declared output order. A
+        // no-sampler pass (prefill/flush) carries no sampler and yields no slots.
         if let Some(SamplerAttach { program, bindings }) = sampler {
             let resolved = match bindings {
                 SamplerBindings::Resolved(b) => b,
@@ -402,35 +409,27 @@ impl<'ctx> Forward<'ctx> {
             pass.sampler(program.get(), resolved);
         }
 
-        let tensors = pass
-            .execute_outputs()
+        let wit_out = pass
+            .execute()
             .await
             .map_err(|e| format!("Forward::execute: forward pass failed: {e}"))?;
 
-        // Account for the newly-written KV. By default we also commit any
-        // pages the auto-input tokens fully filled. When `defer_commit` is
-        // set (manual speculation), we keep every written token in *working*
-        // pages so a later `truncate` can roll back rejected drafts — the
-        // caller commits the verified prefix afterwards.
-        if n_auto > 0 {
-            let new_working = ctx.working_tokens + n_auto;
-            let to_commit = if defer_commit {
-                0
-            } else {
-                new_working / ctx.page_size
-            };
-            if to_commit > 0 {
-                ctx.inner
-                    .commit_working_pages(to_commit)
-                    .map_err(|e| format!("Forward::execute: commit_working_pages: {e}"))?;
-            }
-            ctx.committed_pages += to_commit;
-            ctx.working_pages -= to_commit;
-            ctx.working_tokens = new_working - to_commit * ctx.page_size;
-            ctx.seq_len += n_auto;
+        // Advance the sequence cursor past the materialized tail tokens. Full
+        // pages auto-seal host-side on the forward-txn commit; there is no
+        // explicit page commit. `defer_commit` keeps the cursor where it was so
+        // a manual speculative loop can `truncate` the rejected suffix (the
+        // written KV is simply overwritten by the next pass).
+        if n_write > 0 && !defer_commit {
+            ctx.seq_len += n_write;
+            // The auto inputs are the materialized text tokens; soft image/audio
+            // rows make the context non-replayable.
+            ctx.history.extend_from_slice(&auto_inputs);
+        }
+        if soft_tokens > 0 {
+            ctx.snapshottable = false;
         }
 
-        Ok(Output::new(tensors))
+        Ok(Output::new(wit_out.slots))
     }
 }
 
@@ -449,115 +448,90 @@ impl<'ctx> Forward<'ctx> {
 ///
 /// A no-sampler pass (prefill / flush) carries no output tensors.
 pub struct Output {
-    tensors: Vec<tensor::Tensor>,
+    /// The materialized typed sampler slots (P3 `output.slots`), in the
+    /// program's declared output order. Read via the typed accessors using the
+    /// [`ProgramHandle`]s returned by [`Forward::sample`].
+    slots: Vec<SlotOutput>,
     /// Generator-accepted tokens this step, post stop / max-tokens truncation.
     /// Empty for a raw `Forward::execute` (no Generator state).
     pub tokens: Vec<u32>,
 }
 
 impl Output {
-    pub(crate) fn new(tensors: Vec<tensor::Tensor>) -> Self {
+    pub(crate) fn new(slots: Vec<SlotOutput>) -> Self {
         Self {
-            tensors,
+            slots,
             tokens: Vec::new(),
         }
     }
 
-    pub(crate) fn from_generator(tensors: Vec<tensor::Tensor>, tokens: Vec<u32>) -> Self {
-        Self { tensors, tokens }
+    pub(crate) fn from_generator(slots: Vec<SlotOutput>, tokens: Vec<u32>) -> Self {
+        Self { slots, tokens }
     }
 
-    /// Number of program output tensors.
+    /// Number of sampler output slots.
     pub fn len(&self) -> usize {
-        self.tensors.len()
+        self.slots.len()
     }
 
-    /// True when the pass produced no output tensors (e.g. a prefill/flush).
+    /// True when the pass produced no output slots (e.g. a prefill/flush).
     pub fn is_empty(&self) -> bool {
-        self.tensors.is_empty()
+        self.slots.is_empty()
     }
 
-    /// Borrow the output tensor for a handle (declared output order), or `None`
-    /// if the index is out of range.
-    pub fn tensor(&self, h: ProgramHandle) -> Option<&tensor::Tensor> {
-        self.tensors.get(h.index() as usize)
+    /// Borrow the typed sampler slot for a handle (declared output order), or
+    /// `None` if the index is out of range.
+    pub fn slot(&self, h: ProgramHandle) -> Option<&SlotOutput> {
+        self.slots.get(h.index() as usize)
     }
 
-    /// Read a program output as raw little-endian bytes.
+    /// Raw little-endian bytes of a byte-valued slot (`logits` / `embedding`).
     pub async fn read_bytes(&self, h: ProgramHandle) -> Result<Vec<u8>> {
-        let t = self
-            .tensors
-            .get(h.index() as usize)
-            .ok_or_else(|| format!("Output: no output tensor at index {}", h.index()))?;
-        t.read()
-            .map_err(|e| format!("Output::read_bytes: {e:?}"))
+        match self.slots.get(h.index() as usize) {
+            Some(SlotOutput::Logits(b)) | Some(SlotOutput::Embedding(b)) => Ok(b.clone()),
+            Some(other) => Err(format!(
+                "Output::read_bytes: slot {} is {other:?}, not byte-valued",
+                h.index()
+            )),
+            None => Err(format!("Output::read_bytes: no slot at index {}", h.index())),
+        }
     }
 
-    /// Read a `u32` program output (e.g. a sampled-token vector).
+    /// `u32` lanes of a slot — the sampled-token case (`slot-output::token`).
     pub async fn read_u32(&self, h: ProgramHandle) -> Result<Vec<u32>> {
-        Ok(cast_le_u32(&self.read_bytes(h).await?))
+        Ok(vec![self.token(h).await?])
     }
 
-    /// Read an `f32` program output (e.g. entropy, a distribution row).
+    /// `f32` lanes of a slot — entropy / scalar measurement.
     pub async fn read_f32(&self, h: ProgramHandle) -> Result<Vec<f32>> {
-        Ok(cast_le_f32(&self.read_bytes(h).await?))
+        Ok(vec![self.scalar(h).await?])
     }
 
-    /// First `u32` lane of a program output — the common single-token case.
+    /// Sampled token id for a handle — the common single-token case
+    /// (`slot-output::token`).
     pub async fn token(&self, h: ProgramHandle) -> Result<u32> {
-        self.read_u32(h)
-            .await?
-            .first()
-            .copied()
-            .ok_or_else(|| "Output::token: empty output tensor".to_string())
+        match self.slots.get(h.index() as usize) {
+            Some(SlotOutput::Token(t)) => Ok(*t),
+            Some(other) => Err(format!(
+                "Output::token: slot {} is {other:?}, not a token",
+                h.index()
+            )),
+            None => Err(format!("Output::token: no slot at index {}", h.index())),
+        }
     }
 
-    /// First `f32` lane of a program output — the common scalar case.
+    /// Scalar measurement for a handle. By the host marshaling convention an
+    /// arbitrary program scalar (e.g. mirostat surprise `S`) rides the `entropy`
+    /// slot, so a `Scalar` program output reads back here.
     pub async fn scalar(&self, h: ProgramHandle) -> Result<f32> {
-        self.read_f32(h)
-            .await?
-            .first()
-            .copied()
-            .ok_or_else(|| "Output::scalar: empty output tensor".to_string())
+        match self.slots.get(h.index() as usize) {
+            Some(SlotOutput::Entropy(s)) => Ok(*s),
+            Some(other) => Err(format!(
+                "Output::scalar: slot {} is {other:?}, not a scalar/entropy",
+                h.index()
+            )),
+            None => Err(format!("Output::scalar: no slot at index {}", h.index())),
+        }
     }
 }
 
-/// Reinterpret a little-endian byte buffer as `u32` lanes (trailing partial
-/// lane, if any, is dropped).
-fn cast_le_u32(bytes: &[u8]) -> Vec<u32> {
-    bytes
-        .chunks_exact(4)
-        .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-        .collect()
-}
-
-/// Reinterpret a little-endian byte buffer as `f32` lanes (trailing partial
-/// lane, if any, is dropped).
-fn cast_le_f32(bytes: &[u8]) -> Vec<f32> {
-    bytes
-        .chunks_exact(4)
-        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-        .collect()
-}
-
-#[cfg(test)]
-mod cast_tests {
-    use super::{cast_le_f32, cast_le_u32};
-
-    #[test]
-    fn u32_round_trips_little_endian() {
-        assert_eq!(cast_le_u32(&[1, 2, 3, 4]), vec![0x04030201]);
-        assert_eq!(cast_le_u32(&42u32.to_le_bytes()), vec![42]);
-        // Trailing partial lane dropped.
-        assert_eq!(cast_le_u32(&[1, 0, 0, 0, 9]), vec![1]);
-    }
-
-    #[test]
-    fn f32_round_trips_little_endian() {
-        let bytes: Vec<u8> = [1.0f32, -2.5]
-            .iter()
-            .flat_map(|v| v.to_le_bytes())
-            .collect();
-        assert_eq!(cast_le_f32(&bytes), vec![1.0, -2.5]);
-    }
-}

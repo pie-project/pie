@@ -1,37 +1,57 @@
-//! pie:core/messaging - Process-to-process messaging (push/pull and pub/sub)
+//! pie:core/messaging - Process-to-process messaging (push/pull and pub/sub).
+//!
+//! `pull` is a native `async func` (await the next message host-side);
+//! `subscribe` returns a native `stream<string>` backed by a host
+//! `StreamProducer` over the broadcast channel (drop the reader = unsubscribe).
+//! Both need store access, so per the wasmtime-46 component-model-async model
+//! they live on the `HostWithStore` trait taking an `Accessor`.
 
 use crate::api::pie;
-use crate::api::types::FutureString;
 use crate::instance::InstanceState;
 use crate::messaging;
 use anyhow::Result;
-use async_trait::async_trait;
-use std::mem;
-use tokio::sync::{mpsc, oneshot};
-use wasmtime::component::Resource;
-use wasmtime_wasi::WasiView;
-use wasmtime_wasi::p2::{DynPollable, Pollable, subscribe};
+use std::pin::Pin;
+use std::task::{Context as TaskContext, Poll};
+use tokio::sync::mpsc;
+use wasmtime::StoreContextMut;
+use wasmtime::component::{
+    Accessor, Destination, HasSelf, StreamProducer, StreamReader, StreamResult,
+};
 
-#[derive(Debug)]
-pub struct Subscription {
-    id: usize,
-    topic: String,
+/// Host-side producer for a `subscribe` stream: pumps the broadcast channel
+/// into the guest-readable stream. Dropping it (when the guest drops the
+/// stream reader) unsubscribes from the topic.
+struct BroadcastStream {
     receiver: mpsc::Receiver<String>,
-    result: Option<String>,
-    done: bool,
+    topic: String,
+    sub_id: usize,
 }
 
-#[async_trait]
-impl Pollable for Subscription {
-    async fn ready(&mut self) {
-        if self.done {
-            return;
-        }
-        if let Some(result) = self.receiver.recv().await {
-            self.result = Some(result);
-            self.done = true;
-        } else {
-            self.done = true;
+impl Drop for BroadcastStream {
+    fn drop(&mut self) {
+        let _ = messaging::unsubscribe(self.topic.clone(), self.sub_id);
+    }
+}
+
+impl<D> StreamProducer<D> for BroadcastStream {
+    type Item = String;
+    type Buffer = Option<String>;
+
+    fn poll_produce<'a>(
+        self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        _store: StoreContextMut<'a, D>,
+        mut dst: Destination<'a, Self::Item, Self::Buffer>,
+        _finish: bool,
+    ) -> Poll<wasmtime::Result<StreamResult>> {
+        let this = self.get_mut();
+        match this.receiver.poll_recv(cx) {
+            Poll::Ready(Some(msg)) => {
+                dst.set_buffer(Some(msg));
+                Poll::Ready(Ok(StreamResult::Completed))
+            }
+            Poll::Ready(None) => Poll::Ready(Ok(StreamResult::Dropped)),
+            Poll::Pending => Poll::Pending,
         }
     }
 }
@@ -43,59 +63,27 @@ impl pie::core::messaging::Host for InstanceState {
         Ok(())
     }
 
-    async fn pull(&mut self, topic: String) -> Result<Resource<FutureString>> {
-        let topic = format!("{}:{}", self.get_username(), topic);
-        let (tx, rx) = oneshot::channel();
-        tokio::spawn(async move {
-            if let Ok(msg) = messaging::pull(topic).await {
-                let _ = tx.send(msg);
-            }
-        });
-        let future_string = FutureString::new(rx);
-        Ok(self.ctx().table.push(future_string)?)
-    }
-
     async fn broadcast(&mut self, topic: String, message: String) -> Result<()> {
         let topic = format!("{}:{}", self.get_username(), topic);
         messaging::publish(topic, message)?;
         Ok(())
     }
-
-    async fn subscribe(&mut self, topic: String) -> Result<Resource<Subscription>> {
-        let topic = format!("{}:{}", self.get_username(), topic);
-        let (tx, rx) = mpsc::channel(64);
-        let sub_id = messaging::subscribe(topic.clone(), tx).await?;
-        let sub = Subscription {
-            id: sub_id,
-            topic,
-            receiver: rx,
-            result: None,
-            done: false,
-        };
-        Ok(self.ctx().table.push(sub)?)
-    }
 }
 
-impl pie::core::messaging::HostSubscription for InstanceState {
-    async fn pollable(&mut self, this: Resource<Subscription>) -> Result<Resource<DynPollable>> {
-        subscribe(self.ctx().table, this)
+impl pie::core::messaging::HostWithStore<InstanceState> for HasSelf<InstanceState> {
+    async fn pull(accessor: &Accessor<InstanceState, Self>, topic: String) -> Result<String> {
+        let topic = accessor.with(|mut access| format!("{}:{}", access.get().get_username(), topic));
+        messaging::pull(topic).await
     }
 
-    async fn get(&mut self, this: Resource<Subscription>) -> Result<Option<String>> {
-        Ok(mem::take(&mut self.ctx().table.get_mut(&this)?.result))
-    }
-
-    async fn unsubscribe(&mut self, this: Resource<Subscription>) -> Result<()> {
-        let sub = self.ctx().table.get_mut(&this)?;
-        sub.done = true;
-        let topic = sub.topic.clone();
-        let sub_id = sub.id;
-        messaging::unsubscribe(topic, sub_id)?;
-        Ok(())
-    }
-
-    async fn drop(&mut self, this: Resource<Subscription>) -> Result<()> {
-        self.ctx().table.delete(this)?;
-        Ok(())
+    async fn subscribe(
+        accessor: &Accessor<InstanceState, Self>,
+        topic: String,
+    ) -> Result<StreamReader<String>> {
+        let topic = accessor.with(|mut access| format!("{}:{}", access.get().get_username(), topic));
+        let (tx, rx) = mpsc::channel(64);
+        let sub_id = messaging::subscribe(topic.clone(), tx).await?;
+        let producer = BroadcastStream { receiver: rx, topic, sub_id };
+        Ok(accessor.with(|mut access| StreamReader::new(&mut access, producer))?)
     }
 }

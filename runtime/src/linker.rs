@@ -67,7 +67,6 @@ pub async fn instantiate(
     username: String,
     program_name: &ProgramName,
     output: OutputMode,
-    token_budget: Option<usize>,
 ) -> Result<(Store<InstanceState>, WasmInstance)> {
     let (tx, rx) = oneshot::channel();
     SERVICE.send(Message::Instantiate {
@@ -75,7 +74,6 @@ pub async fn instantiate(
         username,
         program_name: program_name.clone(),
         output,
-        token_budget,
         response: tx,
     })?;
     rx.await?
@@ -104,7 +102,6 @@ impl Linker {
         username: String,
         program_name: &ProgramName,
         output: OutputMode,
-        token_budget: Option<usize>,
     ) -> Result<(Store<InstanceState>, WasmInstance)> {
         // 1. Get the main component (with snapshot status + python-runtime decl)
         let main = program::get_wasm_component(program_name)
@@ -167,7 +164,7 @@ impl Linker {
         // wasi:http is unrestricted (pre-DNS hostname allowlisting would
         // require a DNS shim — not in v1).
         if self.policy.network.allow {
-            wasmtime_wasi_http::add_only_http_to_linker_async(&mut linker)
+            wasmtime_wasi_http::p2::add_only_http_to_linker_async(&mut linker)
                 .expect("Failed to link WASI HTTP");
         }
 
@@ -295,7 +292,6 @@ enum Message {
         username: String,
         program_name: ProgramName,
         output: OutputMode,
-        token_budget: Option<usize>,
         response: oneshot::Sender<Result<(Store<InstanceState>, WasmInstance)>>,
     },
 }
@@ -305,9 +301,9 @@ impl ServiceHandler for Linker {
 
     async fn handle(&mut self, msg: Message) {
         match msg {
-            Message::Instantiate { process_id, username, program_name, output, token_budget, response } => {
+            Message::Instantiate { process_id, username, program_name, output, response } => {
                 let _ = response.send(
-                    self.instantiate(process_id, username, &program_name, output, token_budget).await
+                    self.instantiate(process_id, username, &program_name, output).await
                 );
             }
         }

@@ -37,7 +37,6 @@ from wit_world.imports.tool_use import (
 )
 
 from .grammar import Matcher
-from .model import Model
 
 
 # =============================================================================
@@ -45,20 +44,20 @@ from .model import Model
 # =============================================================================
 
 
-def equip_prefix(model: Model, tools: list[str | dict]) -> list[int]:
+def equip_prefix(tools: list[str | dict]) -> list[int]:
     """Token sequence that registers ``tools`` (each a JSON Schema
     string or dict) in the chat template. Append before your user
     message via :meth:`Context.append`."""
     strs = [t if isinstance(t, str) else _json.dumps(t) for t in tools]
-    return list(_tool.equip(model._handle, strs))
+    return list(_tool.equip(strs))
 
 
-def answer_prefix(model: Model, name: str, value: str | dict | list) -> list[int]:
+def answer_prefix(name: str, value: str | dict | list) -> list[int]:
     """Token sequence that frames a tool result for the next turn.
     ``name`` matches the call the model made; ``value`` is typically a
     JSON-serializable result (dict/list auto-stringified)."""
     s = value if isinstance(value, str) else _json.dumps(value)
-    return list(_tool.answer(model._handle, name, s))
+    return list(_tool.answer(name, s))
 
 
 # =============================================================================
@@ -66,7 +65,7 @@ def answer_prefix(model: Model, name: str, value: str | dict | list) -> list[int
 # =============================================================================
 
 
-def native_matcher(model: Model, tools: list[str | dict]) -> Matcher | None:
+def native_matcher(tools: list[str | dict]) -> Matcher | None:
     """Build a grammar :class:`Matcher` that enforces the model's native
     tool-call format. Returns ``None`` if the model has no enforceable
     format — caller should fall through to free-form generation + their
@@ -75,13 +74,13 @@ def native_matcher(model: Model, tools: list[str | dict]) -> Matcher | None:
     Pair with :class:`GrammarConstraint` to pass to
     :meth:`Generator.constrain`::
 
-        matcher = tools.native_matcher(model, schemas)
+        matcher = tools.native_matcher(schemas)
         if matcher:
             gen = gen.constrain(GrammarConstraint(matcher))
     """
     strs = [t if isinstance(t, str) else _json.dumps(t) for t in tools]
     try:
-        raw = _tool.create_matcher(model._handle, strs)
+        raw = _tool.create_matcher(strs)
     except Exception:
         return None
     return Matcher._from_handle(raw)
@@ -130,8 +129,8 @@ class Decoder:
 
     __slots__ = ("_inner",)
 
-    def __init__(self, model: Model) -> None:
-        self._inner = _tool.create_decoder(model._handle)
+    def __init__(self) -> None:
+        self._inner = _tool.create_decoder()
 
     def feed(self, tokens: list[int]) -> AnyEvent:
         """Feed a token batch and get back the event that fired.

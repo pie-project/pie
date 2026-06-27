@@ -35,7 +35,6 @@ use crate::auth;
 use crate::process::{self, ProcessEvent, ProcessId};
 use crate::program::ProgramName;
 use crate::service::{ServiceHandler, ServiceMap};
-use crate::workflow::{self, WorkflowId};
 
 /// Unique identifier for a connected client.
 pub type ClientId = u32;
@@ -192,42 +191,6 @@ pub fn exists(client_id: ClientId) -> bool {
     CLIENT_SERVICES.contains(&client_id)
 }
 
-/// Returns the list of MCP server names registered for a client session.
-pub fn get_mcp_servers(client_id: ClientId) -> Vec<String> {
-    MCP_REGISTRATIONS
-        .get(&client_id)
-        .map(|r| r.value().iter().map(|e| e.name.clone()).collect())
-        .unwrap_or_default()
-}
-
-/// Sends an MCP relay request to a client and awaits the response.
-///
-/// Returns `Ok(Ok(payload))` on application success (`payload` is the
-/// JSON-encoded JSON-RPC `result` field), `Ok(Err(payload))` on application
-/// error (`payload` is the JSON-encoded JSON-RPC `error` object), or `Err`
-/// on transport / channel failure.
-pub async fn send_mcp_request(
-    client_id: ClientId,
-    process_id: ProcessId,
-    server_name: String,
-    method: String,
-    params: String,
-) -> Result<std::result::Result<String, String>> {
-    let (tx, rx) = tokio::sync::oneshot::channel();
-    CLIENT_SERVICES.send(
-        &client_id,
-        SessionMessage::McpRelay {
-            process_id,
-            server_name,
-            method,
-            params,
-            response: tx,
-        },
-    )?;
-    let (ok, result) = rx.await?;
-    Ok(if ok { Ok(result) } else { Err(result) })
-}
-
 // =============================================================================
 // Shared State
 // =============================================================================
@@ -243,20 +206,6 @@ struct ServerState {
 // =============================================================================
 // Session Messages
 // =============================================================================
-
-/// MCP server entry registered by a client session.
-#[derive(Clone, Debug)]
-struct McpServerEntry {
-    name: String,
-    transport: String,
-    command: Option<String>,
-    args: Option<Vec<String>>,
-    url: Option<String>,
-}
-
-/// Per-client MCP server registrations (shared with public API).
-static MCP_REGISTRATIONS: LazyLock<DashMap<ClientId, Vec<McpServerEntry>>> =
-    LazyLock::new(DashMap::new);
 
 /// Messages handled by Session actors.
 #[derive(Debug)]
@@ -275,14 +224,6 @@ enum SessionMessage {
     ReceiveFile {
         process_id: ProcessId,
         sender: tokio::sync::oneshot::Sender<Bytes>,
-    },
-    /// MCP relay: inferlet wants to call an MCP server through this client.
-    McpRelay {
-        process_id: ProcessId,
-        server_name: String,
-        method: String,
-        params: String,
-        response: tokio::sync::oneshot::Sender<(bool, String)>,
     },
 }
 
@@ -303,17 +244,12 @@ struct Session {
     state: Arc<ServerState>,
     pub(super) inflight_uploads: DashMap<String, InFlightUpload>,
     pub(super) attached_processes: Vec<ProcessId>,
-    pub(super) attached_workflows: Vec<WorkflowId>,
     pub(super) installed_programs: HashSet<ProgramName>,
     /// Per-process file delivery waiters (client → process).
     pub(super) file_waiters: HashMap<ProcessId, tokio::sync::oneshot::Sender<Bytes>>,
     out_tx: mpsc::Sender<WireServerMessage>,
     authenticated: bool,
     pending_auth: Option<PendingAuth>,
-    /// Pending MCP relay requests awaiting client response.
-    pending_mcp: HashMap<u32, tokio::sync::oneshot::Sender<(bool, String)>>,
-    /// Counter for server-initiated MCP correlation IDs.
-    mcp_corr_id: u32,
 }
 
 impl Session {
@@ -330,14 +266,11 @@ impl Session {
             state,
             inflight_uploads: DashMap::new(),
             attached_processes: Vec::new(),
-            attached_workflows: Vec::new(),
             installed_programs: HashSet::new(),
             file_waiters: HashMap::new(),
             out_tx,
             authenticated: true,
             pending_auth: None,
-            pending_mcp: HashMap::new(),
-            mcp_corr_id: 1,
         }
     }
 
@@ -346,13 +279,9 @@ impl Session {
         for process_id in self.attached_processes.drain(..) {
             process::detach(process_id);
         }
-        for wf_id in self.attached_workflows.drain(..) {
-            workflow::detach(&wf_id);
-        }
 
         SESSION_OUTBOX.remove(&self.id);
         CLIENT_SERVICES.remove(&self.id);
-        MCP_REGISTRATIONS.remove(&self.id);
     }
 }
 
@@ -396,19 +325,6 @@ impl ServiceHandler for Session {
             }
             SessionMessage::ReceiveFile { process_id, sender } => {
                 self.file_waiters.insert(process_id, sender);
-            }
-            SessionMessage::McpRelay {
-                process_id,
-                server_name,
-                method,
-                params,
-                response,
-            } => {
-                let corr_id = self.mcp_corr_id;
-                self.mcp_corr_id += 1;
-                self.pending_mcp.insert(corr_id, response);
-                self.send_mcp_request_ws(corr_id, process_id, server_name, method, params)
-                    .await;
             }
         }
     }
@@ -565,25 +481,6 @@ impl Session {
         })
         .await;
     }
-
-    async fn send_mcp_request_ws(
-        &self,
-        corr_id: u32,
-        process_id: ProcessId,
-        server_name: String,
-        method: String,
-        params: String,
-    ) {
-        let uuid_str = process_id.to_string();
-        self.send(WireServerMessage::McpRequest {
-            corr_id,
-            process_id: uuid_str,
-            server_name,
-            method,
-            params,
-        })
-        .await;
-    }
 }
 
 // =============================================================================
@@ -647,36 +544,8 @@ impl Session {
                 inferlet,
                 input,
                 capture_outputs,
-                token_budget,
             } => {
-                self.handle_launch_process(corr_id, inferlet, input, capture_outputs, token_budget)
-                    .await
-            }
-
-            ClientMessage::LaunchProcesses {
-                corr_id,
-                inferlet,
-                inputs,
-                capture_outputs,
-                token_budgets,
-            } => {
-                self.handle_launch_processes(
-                    corr_id,
-                    inferlet,
-                    inputs,
-                    capture_outputs,
-                    token_budgets,
-                )
-                .await
-            }
-
-            ClientMessage::RunProcesses {
-                corr_id,
-                inferlet,
-                inputs,
-                token_budgets,
-            } => {
-                self.handle_run_processes(corr_id, inferlet, inputs, token_budgets)
+                self.handle_launch_process(corr_id, inferlet, input, capture_outputs)
                     .await
             }
 
@@ -720,66 +589,6 @@ impl Session {
 
             ClientMessage::Ping { corr_id } => {
                 self.send_response(corr_id, true, "Pong".to_string()).await;
-            }
-
-            ClientMessage::RegisterMcpServer {
-                corr_id,
-                name,
-                transport,
-                command,
-                args,
-                url,
-            } => {
-                let entry = McpServerEntry {
-                    name,
-                    transport,
-                    command,
-                    args,
-                    url,
-                };
-                MCP_REGISTRATIONS
-                    .entry(self.id)
-                    .or_insert_with(Vec::new)
-                    .push(entry);
-                self.send_response(corr_id, true, "MCP server registered".to_string())
-                    .await;
-            }
-
-            ClientMessage::McpResponse {
-                corr_id,
-                ok,
-                result,
-            } => {
-                if let Some(sender) = self.pending_mcp.remove(&corr_id) {
-                    let _ = sender.send((ok, result));
-                } else {
-                    tracing::warn!("MCP response for unknown corr_id {}", corr_id);
-                }
-            }
-
-            ClientMessage::SubmitWorkflow { corr_id, json } => {
-                self.handle_submit_workflow(corr_id, json).await;
-            }
-
-            ClientMessage::CancelWorkflow {
-                corr_id,
-                workflow_id,
-            } => {
-                self.handle_cancel_workflow(corr_id, workflow_id).await;
-            }
-
-            ClientMessage::AttachWorkflow {
-                corr_id,
-                workflow_id,
-            } => {
-                self.handle_attach_workflow(corr_id, workflow_id).await;
-            }
-
-            ClientMessage::DetachWorkflow {
-                corr_id,
-                workflow_id,
-            } => {
-                self.handle_detach_workflow(corr_id, workflow_id).await;
             }
         }
     }

@@ -1,8 +1,8 @@
 //! `pie config { init | show | set }` — manage the user's config TOML.
 //!
 //! Mirrors `pie/src/pie_cli/config.py`. The dot-path setter
-//! (`pie config set model.0.hf_repo Qwen/Qwen3-1.7B`) understands
-//! TOML array-of-tables indexing, matching Python's behavior.
+//! (`pie config set model.hf_repo Qwen/Qwen3-1.7B`) walks nested
+//! TOML tables, matching Python's behavior.
 
 use std::io::IsTerminal;
 use std::path::PathBuf;
@@ -33,10 +33,9 @@ pub enum ConfigCmd {
         path: Option<PathBuf>,
     },
 
-    /// Set a config value by dot-path. Numeric segments index into
-    /// arrays-of-tables (e.g. `model.0.hf_repo`).
+    /// Set a config value by dot-path (e.g. `model.hf_repo`).
     Set {
-        /// Dot-path key (e.g. `server.port`, `model.0.hf_repo`).
+        /// Dot-path key (e.g. `server.port`, `model.hf_repo`).
         key: String,
         /// Value to set. Parsed as bool / int / float / comma-list / str
         /// in that order.
@@ -261,8 +260,7 @@ fn display_value(v: &toml::Value) -> String {
 }
 
 /// Walk a dot-path into the TOML tree, creating intermediate tables
-/// as needed and respecting numeric segments as array indices.
-/// Mirrors `pie_cli/config.py::_set_nested`.
+/// as needed. Mirrors `pie_cli/config.py::_set_nested`.
 fn set_nested(root: &mut toml::Value, key: &str, value: toml::Value) -> Result<()> {
     let parts: Vec<&str> = key.split('.').collect();
     if parts.is_empty() {
@@ -277,24 +275,10 @@ fn set_nested(root: &mut toml::Value, key: &str, value: toml::Value) -> Result<(
 
     // Set the final segment.
     let last = parts[parts.len() - 1];
-    if let Ok(idx) = last.parse::<usize>() {
-        let arr = cursor
-            .as_array_mut()
-            .ok_or_else(|| anyhow!("{} is not an array", parts.join(".")))?;
-        if idx >= arr.len() {
-            bail!(
-                "index {idx} out of range (len={}) at {}",
-                arr.len(),
-                parts.join("."),
-            );
-        }
-        arr[idx] = value;
-    } else {
-        let table = cursor
-            .as_table_mut()
-            .ok_or_else(|| anyhow!("{} is not a table", parts.join(".")))?;
-        table.insert(last.to_string(), value);
-    }
+    let table = cursor
+        .as_table_mut()
+        .ok_or_else(|| anyhow!("{} is not a table", parts.join(".")))?;
+    table.insert(last.to_string(), value);
     Ok(())
 }
 
@@ -303,19 +287,6 @@ fn step<'a>(
     part: &str,
     breadcrumb: &[&str],
 ) -> Result<&'a mut toml::Value> {
-    if let Ok(idx) = part.parse::<usize>() {
-        let arr = cursor
-            .as_array_mut()
-            .ok_or_else(|| anyhow!("{} is not an array", breadcrumb.join(".")))?;
-        if idx >= arr.len() {
-            bail!(
-                "index {idx} out of range (len={}) at {}",
-                arr.len(),
-                breadcrumb.join("."),
-            );
-        }
-        return Ok(&mut arr[idx]);
-    }
     let table = cursor
         .as_table_mut()
         .ok_or_else(|| anyhow!("{} is not a table", breadcrumb.join(".")))?;
@@ -370,10 +341,10 @@ mod tests {
     }
 
     #[test]
-    fn set_nested_array_index() {
+    fn set_nested_model_field() {
         let mut t: toml::Value = toml::from_str(
             r#"
-[[model]]
+[model]
 name = "default"
 hf_repo = "Qwen/Qwen3-0.6B"
 "#,
@@ -381,30 +352,14 @@ hf_repo = "Qwen/Qwen3-0.6B"
         .unwrap();
         set_nested(
             &mut t,
-            "model.0.hf_repo",
+            "model.hf_repo",
             toml::Value::String("meta-llama/Llama-3.2-1B".to_string()),
         )
         .unwrap();
         assert_eq!(
-            t["model"][0]["hf_repo"].as_str().unwrap(),
+            t["model"]["hf_repo"].as_str().unwrap(),
             "meta-llama/Llama-3.2-1B"
         );
-    }
-
-    #[test]
-    fn set_nested_rejects_bad_index() {
-        let mut t: toml::Value = toml::from_str(
-            r#"
-[[model]]
-name = "default"
-hf_repo = "x"
-"#,
-        )
-        .unwrap();
-        let err = set_nested(&mut t, "model.5.hf_repo", toml::Value::String("y".into()))
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("out of range"), "got: {err}");
     }
 
     #[test]
@@ -412,7 +367,7 @@ hf_repo = "x"
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("config.toml");
         let original = r#"
-[[worker.model]]
+[worker.model]
 name = "default"
 hf_repo = "Qwen/Qwen3-0.6B"
 

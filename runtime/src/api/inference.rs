@@ -2,9 +2,9 @@
 //! Tensor + Program resources.
 
 use crate::api::adapter::Adapter;
-use crate::api::context::Context;
 use crate::api::pie;
 use crate::inference::ForwardOutput;
+use crate::inference::forward_prepare;
 use crate::inference::structured::compiled_grammar::CompiledGrammar;
 use crate::inference::structured::grammar::Grammar as InternalGrammar;
 use crate::inference::structured::json_schema::{
@@ -13,15 +13,14 @@ use crate::inference::structured::json_schema::{
 use crate::inference::structured::matcher::GrammarMatcher;
 use crate::inference::structured::regex::regex_to_grammar;
 use crate::instance::InstanceState;
-use crate::{context, inference};
+use crate::inference;
 use anyhow::Result;
 use pie_driver_abi::Brle;
-use std::mem::take;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
-use tokio::sync::oneshot;
 use wasmtime::component::Resource;
+use wasmtime::component::{Accessor, HasSelf};
 use wasmtime_wasi::WasiView;
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -31,7 +30,6 @@ pub struct ExecuteProfileSnapshot {
     pub misses: u64,
     pub total_us: u64,
     pub prepare_us: u64,
-    pub try_hit_us: u64,
     pub hit_wait_us: u64,
     pub cold_prepare_us: u64,
     pub pin_us: u64,
@@ -45,7 +43,6 @@ struct ExecuteProfileStats {
     misses: AtomicU64,
     total_us: AtomicU64,
     prepare_us: AtomicU64,
-    try_hit_us: AtomicU64,
     hit_wait_us: AtomicU64,
     cold_prepare_us: AtomicU64,
     pin_us: AtomicU64,
@@ -59,7 +56,6 @@ static EXECUTE_PROFILE: ExecuteProfileStats = ExecuteProfileStats {
     misses: AtomicU64::new(0),
     total_us: AtomicU64::new(0),
     prepare_us: AtomicU64::new(0),
-    try_hit_us: AtomicU64::new(0),
     hit_wait_us: AtomicU64::new(0),
     cold_prepare_us: AtomicU64::new(0),
     pin_us: AtomicU64::new(0),
@@ -86,7 +82,6 @@ pub fn execute_profile_snapshot() -> Option<ExecuteProfileSnapshot> {
         misses: EXECUTE_PROFILE.misses.load(Ordering::Relaxed),
         total_us: EXECUTE_PROFILE.total_us.load(Ordering::Relaxed),
         prepare_us: EXECUTE_PROFILE.prepare_us.load(Ordering::Relaxed),
-        try_hit_us: EXECUTE_PROFILE.try_hit_us.load(Ordering::Relaxed),
         hit_wait_us: EXECUTE_PROFILE.hit_wait_us.load(Ordering::Relaxed),
         cold_prepare_us: EXECUTE_PROFILE.cold_prepare_us.load(Ordering::Relaxed),
         pin_us: EXECUTE_PROFILE.pin_us.load(Ordering::Relaxed),
@@ -99,7 +94,6 @@ pub fn execute_profile_snapshot() -> Option<ExecuteProfileSnapshot> {
 struct ExecuteProfileSample {
     hit: bool,
     prepare_us: u64,
-    try_hit_us: u64,
     hit_wait_us: u64,
     cold_prepare_us: u64,
     pin_us: u64,
@@ -123,9 +117,6 @@ fn record_execute_profile(sample: ExecuteProfileSample, total_us: u64) {
     EXECUTE_PROFILE
         .prepare_us
         .fetch_add(sample.prepare_us, Ordering::Relaxed);
-    EXECUTE_PROFILE
-        .try_hit_us
-        .fetch_add(sample.try_hit_us, Ordering::Relaxed);
     EXECUTE_PROFILE
         .hit_wait_us
         .fetch_add(sample.hit_wait_us, Ordering::Relaxed);
@@ -177,14 +168,20 @@ pub struct ForwardPass {
     /// Set when the ctx is bound via `context()` (the new WIT `forward-pass`
     /// constructor takes no model — the context carries the model identity).
     pub model_id: usize,
-    context_id: Option<crate::context::ContextId>,
-    /// Snapshot of the bound ctx's cached speculator handle. Set in
-    /// `pass.context()`; `None` until then, or when speculation is
-    /// disabled for the model. Lets `execute()` call `try_hit`
-    /// without taking the global REGISTRY lock.
-    spec: Option<inference::StagedBatch>,
+    /// Explicit forward-pass memory descriptors (W5). Captured by the
+    /// kv-context / kv-output / rs-context / rs-output setters and resolved to
+    /// physical pages inside the atomic arena transaction at `execute()`.
+    /// There is no ambient context handle and no implicit append.
+    kv_context: Option<pie::core::inference::KvContext>,
+    kv_output: Option<pie::core::inference::KvOutput>,
+    rs_context: Option<pie::core::inference::RsBufferContext>,
+    rs_output: Option<pie::core::inference::RsBufferOutput>,
+    /// `fold-buffered(n)` (W9 piggyback): fold the first `n` buffered RS tokens
+    /// of this pass's RS working set into its folded state as part of this
+    /// forward. Lowered to `rs_fold_lens` + `RS_FLAG_FOLD` over the buffered
+    /// slabs (`rs_buffer_slot_ids`); the driver gathers + replays them.
+    fold_buffered_tokens: Option<u32>,
     pub adapter_seed: Option<i64>,
-    allow_pass_speculation: bool,
     req: pie_driver_abi::ForwardRequest,
     /// Sampling programs attached via `sampler(...)` / `batch-sampler(...)`,
     /// each with its attach-time binding-map and gathered submit inputs.
@@ -192,29 +189,6 @@ pub struct ForwardPass {
     /// single-sampler path; many for `batch-sampler`. Flattened into the bridge
     /// carrier at `execute()`.
     programs: Vec<AttachedProgram>,
-    /// WS8 inter-pass pipelining (`next-input`): per source sampling row, the
-    /// destination input position its sampled token feeds in the *next* pass on
-    /// this context (`u32::MAX` = the `-1` ignore sentinel). `None` = no
-    /// feed-forward (the pass's output is read via `output()` as usual).
-    feed_forward: Option<Vec<u32>>,
-    /// In-flight driver response + reconstruction context, stashed by
-    /// `execute()` and drained by `output()`/`outputs()`. `None` until the pass
-    /// is submitted (or when the pass fed its output forward via `next-input`).
-    pending: Option<PendingOutput>,
-}
-
-/// A WS8 inter-pass pipeline link (`forward-pass.next-input`). Shared-resolution
-/// model (a): the link **references** the producer pass (by resource rep) rather
-/// than owning its output — so the producer's own `output()` still resolves
-/// (consumer B: the guest reads t's token for stop/EOS detection) while the next
-/// pass reads the **same** resolved per-row tokens for its input (consumer A).
-/// `positions[r]` is the next pass's input position fed by source sampling row
-/// `r` (`u32::MAX` = the `-1` ignore sentinel). The producer pass owns its pin
-/// (released via its `output()`/drop); the link holds no resources. P2 binds the
-/// device-resident `pi.sampled` `[N]` buffer + a stream event instead.
-pub struct PipelineLink {
-    producer_rep: u32,
-    positions: Vec<u32>,
 }
 
 /// One sampling program staged on a [`ForwardPass`] before submit: its L0
@@ -232,118 +206,6 @@ struct AttachedProgram {
     /// `input-binding::logits(positions)`); flattened into the request's
     /// `sampling_indices` at `execute()`. Empty if the program reads no logits.
     logits_positions: Vec<u32>,
-}
-
-/// Stashed on a [`ForwardPass`] by `execute()` and consumed by
-/// `output()`/`outputs()`: the in-flight driver response channel plus the
-/// bookkeeping needed to grow the KV lineage, release the pin, and marshal each
-/// attached program's declared outputs into typed `tensor` resources. The new
-/// WIT has no legacy sampler-slot path — every pass is program-driven — so the
-/// sampler-count spec-fill heuristic is gone (a program owns its output shape).
-struct PendingOutput {
-    rx: Option<oneshot::Receiver<Result<ForwardOutput>>>,
-    /// Resolved-once cache (with lineage + pin release already applied): shared
-    /// by `output()` (consumer B — marshals tensors for the guest's
-    /// stop-detection read) and the WS8 link (consumer A — reads per-row tokens
-    /// for the next pass). Resolving is idempotent: whichever consumer runs
-    /// first awaits `rx`; the other reads the cache.
-    resolved: Option<Result<ForwardOutput, String>>,
-    /// Declared output kinds per attached program (attach order), driving the
-    /// per-program response→tensor reconstruction.
-    programs_output_kinds: Vec<Vec<pie_sampling_ir::OutputKind>>,
-    model_id: usize,
-    context_id: crate::context::ContextId,
-    was_pinned: bool,
-    fill_tokens: Vec<u32>,
-    fill_positions: Vec<u32>,
-    fill_masks: Vec<Brle>,
-    adapter_id: Option<crate::adapter::AdapterId>,
-    adapter_seed: Option<i64>,
-}
-
-impl PendingOutput {
-    fn release_pin(&mut self) {
-        if self.was_pinned {
-            context::unpin(self.model_id, self.context_id);
-            self.was_pinned = false;
-        }
-    }
-
-    /// Grow the bound ctx's working-page lineage with this pass's input tokens
-    /// (so the next decode step sees them in the KV). Mirrors the legacy
-    /// `FutureOutput` path minus the retired draft-fill bookkeeping.
-    fn append_lineage(&mut self) {
-        let fill_tokens = take(&mut self.fill_tokens);
-        let fill_positions = take(&mut self.fill_positions);
-        let fill_masks = take(&mut self.fill_masks);
-        if !fill_tokens.is_empty() {
-            context::append_working_page_tokens_with_repaired_spec_tail(
-                self.model_id,
-                self.context_id,
-                fill_tokens,
-                fill_positions,
-                fill_masks,
-                self.adapter_id,
-                self.adapter_seed,
-                0,
-            );
-        }
-    }
-
-    /// Resolve once — await the driver response, grow the ctx lineage, release
-    /// the pin — and cache the result in `resolved`. Idempotent: a second call
-    /// is a no-op. Shared by `output()` (consumer B) and the WS8 link (consumer
-    /// A) so a fed-forward pass's output reaches both.
-    async fn resolve(&mut self) {
-        if self.resolved.is_some() {
-            return;
-        }
-        let Some(rx) = self.rx.take() else {
-            self.resolved = Some(Err("forward pass output already consumed".to_string()));
-            return;
-        };
-        self.resolved = Some(match rx.await {
-            Ok(Ok(output)) => {
-                self.append_lineage();
-                self.release_pin();
-                Ok(output)
-            }
-            Ok(Err(e)) => {
-                self.release_pin();
-                tracing::warn!("forward pass failed: {e:#}");
-                Err(format!("forward pass failed: {e}"))
-            }
-            Err(_) => {
-                self.release_pin();
-                Err("forward pass channel closed".to_string())
-            }
-        });
-    }
-
-    /// Per-row sampled tokens of the resolved output (consumer A, non-consuming);
-    /// empty if not yet resolved or the pass failed.
-    fn resolved_tokens(&self) -> Vec<u32> {
-        match &self.resolved {
-            Some(Ok(output)) => forward_output_tokens(output),
-            _ => Vec::new(),
-        }
-    }
-
-    /// Take the resolved output for marshaling (consumer B, consuming).
-    fn take_resolved(&mut self) -> Result<ForwardOutput, String> {
-        self.resolved
-            .take()
-            .unwrap_or_else(|| Err("forward pass output not resolved".to_string()))
-    }
-}
-
-/// The per-row sampled tokens a [`ForwardOutput`] carries (for WS8 feed-forward).
-fn forward_output_tokens(output: &ForwardOutput) -> Vec<u32> {
-    match output {
-        ForwardOutput::Token(t) => vec![*t],
-        ForwardOutput::Tokens(v) => v.clone(),
-        ForwardOutput::Response(resp) => resp.tokens.clone(),
-    }
 }
 
 fn empty_forward_request() -> pie_driver_abi::ForwardRequest {
@@ -366,49 +228,6 @@ fn empty_forward_request() -> pie_driver_abi::ForwardRequest {
     }
 }
 
-
-impl Tensor {
-    /// An `i32` vector tensor (shape `[len]`). Token outputs use this — the
-    /// dtype⇒kind convention (a) is `int ⇒ Token`, so sampled token ids are
-    /// surfaced as `i32`.
-    fn i32_vec(vals: Vec<i32>) -> Tensor {
-        let mut data = Vec::with_capacity(vals.len() * 4);
-        for v in &vals {
-            data.extend_from_slice(&v.to_le_bytes());
-        }
-        Tensor {
-            shape: vec![vals.len() as u32],
-            dtype: pie::core::tensor::Dtype::I32,
-            data,
-        }
-    }
-
-    /// An `f32` vector tensor (shape `[len]`). Scalar / entropy / logprob /
-    /// distribution-probability outputs use this.
-    fn f32_vec(vals: Vec<f32>) -> Tensor {
-        let mut data = Vec::with_capacity(vals.len() * 4);
-        for v in &vals {
-            data.extend_from_slice(&v.to_le_bytes());
-        }
-        Tensor {
-            shape: vec![vals.len() as u32],
-            dtype: pie::core::tensor::Dtype::F32,
-            data,
-        }
-    }
-
-    /// An `f32` tensor wrapping an already-`f32`-little-endian byte blob (raw
-    /// logits), shape `[len/4]`.
-    fn f32_from_le_bytes(bytes: Vec<u8>) -> Tensor {
-        let n = (bytes.len() / 4) as u32;
-        Tensor {
-            shape: vec![n],
-            dtype: pie::core::tensor::Dtype::F32,
-            data: bytes,
-        }
-    }
-}
-
 /// Number of bytes in one element of a `tensor` dtype.
 fn dtype_byte_size(dtype: pie::core::tensor::Dtype) -> usize {
     use pie::core::tensor::Dtype;
@@ -418,90 +237,82 @@ fn dtype_byte_size(dtype: pie::core::tensor::Dtype) -> usize {
     }
 }
 
-/// Reconstruct each attached program's declared outputs as typed `tensor`
-/// payloads from a driver [`ForwardOutput`], walking the programs in attach
-/// order and, within each, its declared output kinds in slot order — the
-/// new-WIT analog of the retired `slot-output` walk. Token outputs become `i32`
-/// tensors; every other (float) kind an `f32` tensor (the dtype⇒kind
-/// convention (a), matching the decoder's inference). The outer vec mirrors the
-/// program list; each inner vec follows that program's output order.
-fn build_program_tensors(
+/// Reconstruct each attached program's declared outputs as a flat
+/// `output.slots: list<slot-output>` from a driver [`ForwardOutput`] (SEAM-A:
+/// the host produces P3's `slot-output`). Walks the programs in attach order
+/// and, within each, its declared output kinds in slot order, so the flat slot
+/// list mirrors the SDK's `program_token`/`program_scalar` handle order. Token
+/// outputs → `slot-output::token`; Scalar/Entropy → `slot-output::entropy` (the
+/// mirostat surprise `S` / μ rides the scalar `entropy` channel — the
+/// load-bearing scalar readback). The remaining F32 measurement kinds
+/// (distribution/logits/logprobs/embedding) are tracked #18/WS5 follow-up.
+fn build_program_slots(
     output: ForwardOutput,
     programs_output_kinds: &[Vec<pie_sampling_ir::OutputKind>],
-) -> Vec<Vec<Tensor>> {
-    use pie_sampling_ir::OutputKind;
+) -> pie::core::inference::Output {
+    use pie::core::inference::SlotOutput as WitSlot;
     match output {
-        ForwardOutput::Token(token) => single_token_outputs(vec![token], programs_output_kinds),
-        ForwardOutput::Tokens(tokens) => {
-            // A single program declaring a single Token output owns the whole
-            // token vector as one `[N]` tensor (the common decode shape);
-            // otherwise distribute one token per declared Token slot.
-            if programs_output_kinds.len() == 1
-                && programs_output_kinds[0].len() == 1
-                && programs_output_kinds[0][0] == OutputKind::Token
-            {
-                vec![vec![Tensor::i32_vec(
-                    tokens.into_iter().map(|t| t as i32).collect(),
-                )]]
-            } else {
-                single_token_outputs(tokens, programs_output_kinds)
-            }
-        }
+        // Bare-token fast paths (no rich response): one `token` slot per sampled
+        // token, in row order — the common single-program decode shape, and the
+        // spec-verify walk (token count unrelated to the sampler count).
+        ForwardOutput::Token(token) => pie::core::inference::Output {
+            slots: vec![WitSlot::Token(token)],
+            spec_tokens: Vec::new(),
+            spec_positions: Vec::new(),
+        },
+        ForwardOutput::Tokens(tokens) => pie::core::inference::Output {
+            slots: tokens.into_iter().map(WitSlot::Token).collect(),
+            spec_tokens: Vec::new(),
+            spec_positions: Vec::new(),
+        },
         ForwardOutput::Response(resp) => {
-            build_program_tensors_from_response(resp, programs_output_kinds)
+            build_program_slots_from_response(resp, programs_output_kinds)
         }
     }
 }
 
-/// Distribute a flat token list across each program's declared `Token` outputs
-/// (one token per Token slot, in order); non-token kinds yield no tensor on this
-/// fast path (used only when no rich `ForwardResponse` was produced).
-fn single_token_outputs(
-    tokens: Vec<u32>,
-    programs_output_kinds: &[Vec<pie_sampling_ir::OutputKind>],
-) -> Vec<Vec<Tensor>> {
-    use pie_sampling_ir::OutputKind;
-    let mut tok_iter = tokens.into_iter();
-    programs_output_kinds
-        .iter()
-        .map(|kinds| {
-            kinds
-                .iter()
-                .filter_map(|k| match k {
-                    OutputKind::Token => {
-                        tok_iter.next().map(|t| Tensor::i32_vec(vec![t as i32]))
-                    }
-                    _ => None,
-                })
-                .collect()
-        })
-        .collect()
-}
-
-/// Per-program tensor reconstruction over a rich [`ForwardResponse`]: the
-/// program analog of the retired `build_wit_output_from_response` walk. Program
-/// outputs reuse the existing response channels (token / distribution / logits /
-/// logprobs / entropy), pulled in attach order so each program consumes its
-/// share.
-fn build_program_tensors_from_response(
+/// Per-program flat `slot-output` reconstruction over a rich [`ForwardResponse`]
+/// (single-request shape: indptrs `[0, N]`): the program analog of P3's
+/// `build_wit_output_from_response` sampler walk. Program outputs reuse the
+/// response channels (token / distribution / logits / logprobs / entropy),
+/// pulled in attach order then output order so each program consumes its share.
+fn build_program_slots_from_response(
     resp: pie_driver_abi::ForwardResponse,
     programs_output_kinds: &[Vec<pie_sampling_ir::OutputKind>],
-) -> Vec<Vec<Tensor>> {
+) -> pie::core::inference::Output {
+    use pie::core::inference::SlotOutput as WitSlot;
     use pie_sampling_ir::OutputKind;
 
-    let mut tok_iter = resp.tokens.into_iter();
-    let mut dist_iter: Box<dyn Iterator<Item = Vec<f32>>> = if resp.dists_kv_indptr.len() >= 2 {
-        let probs: Vec<_> = (0..resp.dists_kv_indptr.len() - 1)
-            .map(|k| {
-                let lo = resp.dists_kv_indptr[k] as usize;
-                let hi = resp.dists_kv_indptr[k + 1] as usize;
-                resp.dists_probs[lo..hi].to_vec()
-            })
-            .collect();
-        Box::new(probs.into_iter())
+    // Per-request spec side channel for the next iteration's draft tokens.
+    let (spec_tokens, spec_positions): (Vec<u32>, Vec<u32>) = if resp.spec_indptr.len() >= 2 {
+        let lo = resp.spec_indptr[0] as usize;
+        let hi = resp.spec_indptr[1] as usize;
+        (
+            resp.spec_tokens.get(lo..hi).unwrap_or(&[]).to_vec(),
+            resp.spec_positions.get(lo..hi).unwrap_or(&[]).to_vec(),
+        )
     } else {
-        Box::new(std::iter::empty())
+        (resp.spec_tokens.clone(), resp.spec_positions.clone())
     };
+
+    let mut tok_iter = resp.tokens.into_iter();
+    // Distribution: (ids, probs) pairs per kv_indptr range.
+    let mut dist_iter: Box<dyn Iterator<Item = (Vec<u32>, Vec<f32>)>> =
+        if resp.dists_kv_indptr.len() >= 2 {
+            let kvs: Vec<_> = (0..resp.dists_kv_indptr.len() - 1)
+                .map(|k| {
+                    let lo = resp.dists_kv_indptr[k] as usize;
+                    let hi = resp.dists_kv_indptr[k + 1] as usize;
+                    (
+                        resp.dists_ids[lo..hi].to_vec(),
+                        resp.dists_probs[lo..hi].to_vec(),
+                    )
+                })
+                .collect();
+            Box::new(kvs.into_iter())
+        } else {
+            Box::new(std::iter::empty())
+        };
     let mut logit_iter: Box<dyn Iterator<Item = Vec<u8>>> = if resp.logits_byte_indptr.len() >= 2 {
         let blobs: Vec<_> = (0..resp.logits_byte_indptr.len() - 1)
             .map(|b| {
@@ -515,92 +326,124 @@ fn build_program_tensors_from_response(
         Box::new(std::iter::empty())
     };
     let mut lp_iter: Box<dyn Iterator<Item = Vec<f32>>> = if resp.logprobs_val_indptr.len() >= 2 {
-        let slots: Vec<_> = (0..resp.logprobs_val_indptr.len() - 1)
+        let lps: Vec<_> = (0..resp.logprobs_val_indptr.len() - 1)
             .map(|s| {
                 let lo = resp.logprobs_val_indptr[s] as usize;
                 let hi = resp.logprobs_val_indptr[s + 1] as usize;
                 resp.logprobs_values[lo..hi].to_vec()
             })
             .collect();
-        Box::new(slots.into_iter())
+        Box::new(lps.into_iter())
     } else {
         Box::new(std::iter::empty())
     };
     let mut ent_iter = resp.entropies.into_iter();
 
-    programs_output_kinds
-        .iter()
-        .map(|kinds| {
-            kinds
-                .iter()
-                .filter_map(|kind| match kind {
-                    OutputKind::Token => {
-                        tok_iter.next().map(|t| Tensor::i32_vec(vec![t as i32]))
-                    }
-                    // Distribution exposes its probability vector as f32; the
-                    // companion ids ride the same channel for the SDK's typed
-                    // accessor (MVP tensor channel carries probs).
-                    OutputKind::Distribution => dist_iter.next().map(Tensor::f32_vec),
-                    OutputKind::Logits => logit_iter.next().map(Tensor::f32_from_le_bytes),
-                    OutputKind::Logprobs => lp_iter.next().map(Tensor::f32_vec),
-                    // Entropy and Scalar (kld / mirostat μ) share the per-slot
-                    // scalar f32 entropies channel; both surface as a 1-elem f32.
-                    OutputKind::Entropy | OutputKind::Scalar => {
-                        ent_iter.next().map(|e| Tensor::f32_vec(vec![e]))
-                    }
-                    // Embedding is reserved but not currently produced.
-                    OutputKind::Embedding => None,
-                })
-                .collect()
-        })
-        .collect()
+    let mut slots: Vec<WitSlot> = Vec::new();
+    for kinds in programs_output_kinds {
+        for kind in kinds {
+            let slot = match kind {
+                OutputKind::Token => tok_iter.next().map(WitSlot::Token),
+                OutputKind::Distribution => dist_iter.next().map(WitSlot::Distribution),
+                OutputKind::Logits => logit_iter.next().map(WitSlot::Logits),
+                OutputKind::Logprobs => lp_iter.next().map(WitSlot::Logprobs),
+                // Entropy + Scalar (mirostat μ / S = −log p) share the per-slot
+                // scalar `entropies` channel → `slot-output::entropy`.
+                OutputKind::Entropy | OutputKind::Scalar => {
+                    ent_iter.next().map(WitSlot::Entropy)
+                }
+                // Embedding reserved; not produced by the worker yet.
+                OutputKind::Embedding => None,
+            };
+            if let Some(s) = slot {
+                slots.push(s);
+            }
+        }
+    }
+
+    pie::core::inference::Output {
+        slots,
+        spec_tokens,
+        spec_positions,
+    }
 }
 
 impl pie::core::inference::Host for InstanceState {}
 
+/// Aggregate interface-level `Host` for `pie:core/working-set`, required by
+/// the generated `HostKvWorkingSet` (charlie) + `HostRsWorkingSet` (delta)
+/// resource impls. echo owns this (central bindgen) since it spans both lanes.
+impl pie::core::working_set::Host for InstanceState {}
+
 impl pie::core::inference::HostForwardPass for InstanceState {
     async fn new(&mut self) -> Result<Resource<ForwardPass>> {
-        // Initialize the accumulator with the per-request invariants: single
-        // adapter binding (-1 sentinels = unbound). The new WIT `forward-pass`
-        // constructor takes no model — `model_id` is bound when the ctx is set
-        // via `context()` (the context carries the model identity).
+        // Initialize the accumulator with the per-request invariants:
+        // single adapter binding (-1 sentinels = unbound). Single-model: the
+        // bound model is index 0. P3 explicit working-set descriptors
+        // (kv/rs-context, kv/rs-output) are bound by their setters; there is no
+        // ambient context handle.
         let pass = ForwardPass {
             model_id: 0,
-            context_id: None,
-            spec: None,
+            kv_context: None,
+            kv_output: None,
+            rs_context: None,
+            rs_output: None,
+            fold_buffered_tokens: None,
             adapter_seed: None,
-            allow_pass_speculation: true,
             req: empty_forward_request(),
             programs: Vec::new(),
-            feed_forward: None,
-            pending: None,
         };
         Ok(self.ctx().table.push(pass)?)
     }
 
-    async fn context(
+    /// KV pages this pass reads as attention context. Replaces the old opaque
+    /// `context` handle (W5). Resolved to physical pages in the txn prepare.
+    async fn kv_context(
         &mut self,
         this: Resource<ForwardPass>,
-        context: Resource<Context>,
+        ctx: pie::core::inference::KvContext,
     ) -> Result<()> {
-        let ctx = self.ctx().table.get(&context)?;
-        let context_id = ctx.context_id;
-        let model_id = ctx.model_id;
-        // Initialize the ctx's speculator cache on the first call
-        // for this ctx. The OnceLock makes this lock-free on every
-        // subsequent `pass.context()`, eliminating REGISTRY lookups
-        // from the per-iteration hot path.
-        let spec = ctx
-            .spec
-            .get_or_init(|| {
-                let device_idx = context::get_device(model_id, context_id);
-                inference::lookup_for_ctx(model_id, device_idx)
-            })
-            .clone();
-        let pass = self.ctx().table.get_mut(&this)?;
-        pass.context_id = Some(context_id);
-        pass.model_id = model_id;
-        pass.spec = spec;
+        self.ctx().table.get_mut(&this)?.kv_context = Some(ctx);
+        Ok(())
+    }
+
+    /// KV pages this pass writes (with per-page valid lengths + captured
+    /// generation for stale-mutation rejection).
+    async fn kv_output(
+        &mut self,
+        this: Resource<ForwardPass>,
+        out: pie::core::inference::KvOutput,
+    ) -> Result<()> {
+        self.ctx().table.get_mut(&this)?.kv_output = Some(out);
+        Ok(())
+    }
+
+    /// Buffered recurrent state this pass reads (hybrid / linear-attention).
+    async fn rs_context(
+        &mut self,
+        this: Resource<ForwardPass>,
+        ctx: pie::core::inference::RsBufferContext,
+    ) -> Result<()> {
+        self.ctx().table.get_mut(&this)?.rs_context = Some(ctx);
+        Ok(())
+    }
+
+    /// Buffered recurrent state this pass writes (without folding; W10).
+    async fn rs_output(
+        &mut self,
+        this: Resource<ForwardPass>,
+        out: pie::core::inference::RsBufferOutput,
+    ) -> Result<()> {
+        self.ctx().table.get_mut(&this)?.rs_output = Some(out);
+        Ok(())
+    }
+
+    /// Fold the first `tokens` buffered RS tokens of this pass's RS working set
+    /// into its folded recurrent state as part of this forward (W9 piggyback).
+    /// Recorded here; `execute()` lowers it to `rs_fold_lens` + `RS_FLAG_FOLD`
+    /// over the buffered slabs so the driver gathers + replays them in-forward.
+    async fn fold_buffered(&mut self, this: Resource<ForwardPass>, tokens: u32) -> Result<()> {
+        self.ctx().table.get_mut(&this)?.fold_buffered_tokens = Some(tokens);
         Ok(())
     }
 
@@ -715,6 +558,35 @@ impl pie::core::inference::HostForwardPass for InstanceState {
         Ok(())
     }
 
+    async fn input_speculative_tokens(
+        &mut self,
+        this: Resource<ForwardPass>,
+        tokens: Vec<u32>,
+        positions: Vec<u32>,
+    ) -> Result<()> {
+        let pass = self.ctx().table.get_mut(&this)?;
+        pass.req.spec_token_ids.extend(tokens);
+        pass.req.spec_position_ids.extend(positions);
+        Ok(())
+    }
+
+    async fn output_speculative_tokens(
+        &mut self,
+        this: Resource<ForwardPass>,
+        flag: bool,
+    ) -> Result<()> {
+        let pass = self.ctx().table.get_mut(&this)?;
+        pass.req.output_spec_flags = vec![flag];
+        Ok(())
+    }
+
+    async fn pass_speculation(&mut self, _this: Resource<ForwardPass>, _flag: bool) -> Result<()> {
+        // Runtime pass-level speculation chains are removed (W15); the runtime
+        // keeps no hidden speculative state in working-set semantics. Manual
+        // draft tokens still flow via `input-speculative-tokens`. Inert now.
+        Ok(())
+    }
+
     async fn attention_mask(
         &mut self,
         this: Resource<ForwardPass>,
@@ -724,6 +596,15 @@ impl pie::core::inference::HostForwardPass for InstanceState {
 
         let pass = self.ctx().table.get_mut(&this)?;
         pass.req.masks = brle_masks;
+        Ok(())
+    }
+
+    /// Per-position logit mask (`brle` = `list<u32>` run-length pairs over the
+    /// vocab). If not set, no masking. Lowered to the request's `logit_masks`.
+    async fn logit_mask(&mut self, this: Resource<ForwardPass>, mask: Vec<u32>) -> Result<()> {
+        let brle = Brle::from_vec(mask);
+        let pass = self.ctx().table.get_mut(&this)?;
+        pass.req.logit_masks = vec![brle];
         Ok(())
     }
 
@@ -771,34 +652,6 @@ impl pie::core::inference::HostForwardPass for InstanceState {
         Ok(())
     }
 
-    // ── WS8 pipelining primitives ──────────────────────────────────────
-    // `next-input` declares that THIS pass's per-row sampled tokens feed the
-    // *next* pass on this context (host-resolved in P1, device-resident in P2),
-    // removing the guest output()+copy round-trip between decode steps.
-    async fn next_input(&mut self, this: Resource<ForwardPass>, positions: Vec<u32>) -> Result<()> {
-        let pass = self.ctx().table.get_mut(&this)?;
-        pass.feed_forward = Some(positions);
-        Ok(())
-    }
-
-    async fn next_attention_mask(
-        &mut self,
-        this: Resource<ForwardPass>,
-        mask: Vec<Vec<u32>>,
-    ) -> Result<()> {
-        let _ = (this, mask);
-        Ok(())
-    }
-
-    async fn next_adapter(
-        &mut self,
-        this: Resource<ForwardPass>,
-        adapter: Resource<Adapter>,
-    ) -> Result<()> {
-        let _ = (this, adapter);
-        Ok(())
-    }
-
     async fn adapter(
         &mut self,
         this: Resource<ForwardPass>,
@@ -810,422 +663,10 @@ impl pie::core::inference::HostForwardPass for InstanceState {
         Ok(())
     }
 
-    async fn execute(&mut self, this: Resource<ForwardPass>) -> Result<()> {
-        let profiling = execute_profile_enabled();
-        let profile_start = profiling.then(Instant::now);
-        let mut profile_sample = ExecuteProfileSample::default();
-        let prepare_start = profiling.then(Instant::now);
-
-        // WS8: drain any inter-pass pipeline link feeding THIS pass — the prior
-        // pass on this context fed its per-row sampled tokens forward via
-        // `next-input`. Resolve the producer (shared, non-consuming: its own
-        // `output()` still reads it) and inject its tokens at the mapped input
-        // positions before this pass's request is finalized. Depth-1 (no
-        // `next-input`) skips this entirely.
-        let incoming_ctx = self.ctx().table.get(&this)?.context_id;
-        if let Some(ctx_id) = incoming_ctx
-            && let Some(link) = self.pipeline_links.remove(&ctx_id)
-        {
-            let producer = Resource::<ForwardPass>::new_borrow(link.producer_rep);
-            // Drain-before-producer-drop invariant: consumer A borrows the
-            // producer by rep, so the producer pass must still be alive at drain
-            // time. golf's one-ahead loop guarantees it (t+1 drains the link
-            // before the guest reads+drops t); fail loud + diagnosable if a
-            // future loop shape violates it, rather than silently feeding no
-            // tokens.
-            if self.ctx().table.get(&producer).is_err() {
-                return Err(anyhow::anyhow!(
-                    "WS8 next-input: producer pass was dropped before its successor \
-                     drained the link (drain-before-producer-drop invariant violated)"
-                ));
-            }
-            // Resolve the producer's (shared) output without consuming it.
-            self.resolve_pending(&producer).await?;
-            let toks = self
-                .ctx()
-                .table
-                .get(&producer)
-                .ok()
-                .and_then(|p| p.pending.as_ref().map(|pe| pe.resolved_tokens()))
-                .unwrap_or_default();
-            let pass = self.ctx().table.get_mut(&this)?;
-            for (row, &dest) in link.positions.iter().enumerate() {
-                if dest != u32::MAX
-                    && let Some(&tok) = toks.get(row)
-                {
-                    pass.req.token_ids.push(tok);
-                    pass.req.position_ids.push(dest);
-                }
-            }
-        }
-
-        let pass = self.ctx().table.get_mut(&this)?;
-
-        let model_id = pass.model_id;
-        let context_id = pass
-            .context_id
-            .ok_or_else(|| anyhow::anyhow!("ForwardPass requires a context"))?;
-        let adapter_seed = pass.adapter_seed;
-        let spec_handle = pass.spec.clone();
-        let allow_pass_speculation = pass.allow_pass_speculation;
-        pass.allow_pass_speculation = true;
-        // Whether this pass feeds its sampled tokens forward to the next pass.
-        let feed_forward = pass.feed_forward.take();
-        // Drain the accumulator. The remaining work is to synthesize
-        // masks if absent and stamp the per-request indptrs onto the
-        // ForwardRequest, then submit.
-        let mut req = std::mem::replace(&mut pass.req, empty_forward_request());
-
-        // Flatten every attached sampling program into the bridge carrier and
-        // collect their declared output kinds (attach order) for response
-        // reconstruction. Each program's `logits` binding positions become the
-        // pass's sampling positions; its submit-bound tensor values ride the
-        // carrier (the per-slot binding-map likewise, so the driver can wire
-        // each `Op::Input(i)`).
-        let attached = std::mem::take(&mut pass.programs);
-        let has_programs = !attached.is_empty();
-        let mut programs_output_kinds: Vec<Vec<pie_sampling_ir::OutputKind>> =
-            Vec::with_capacity(attached.len());
-        let mut logits_positions: Vec<u32> = Vec::new();
-        for program in attached {
-            programs_output_kinds.push(program.output_kinds);
-            logits_positions.extend(program.logits_positions);
-            // Carry the per-slot binding-map so the driver can wire each
-            // `Op::Input(i)` from the binding-free bytecode (Logits intrinsic vs
-            // keyed submit tensor).
-            let bindings = program
-                .bindings
-                .iter()
-                .map(|b| match b {
-                    pie_sampling_ir::Binding::Logits => pie_driver_abi::SamplingBinding::Logits,
-                    pie_sampling_ir::Binding::Tensor { key, .. } => {
-                        pie_driver_abi::SamplingBinding::Tensor { key: *key }
-                    }
-                })
-                .collect();
-            req.push_sampling_program(&pie_driver_abi::SamplingProgramSubmission {
-                bytecode: program.bytecode,
-                inputs: program.submit_inputs,
-                bindings,
-                late_keys: Vec::new(),
-                late_inputs: Vec::new(),
-            });
-        }
-        if has_programs {
-            // The `logits` binding(s) carry the sampling positions; fall back to
-            // the single M=1 decode row (last token) when none were supplied so
-            // the LM head still runs and the program samples there.
-            if !logits_positions.is_empty() {
-                // The WIT `logits(positions)` carries ABSOLUTE sequence positions
-                // (SDK: `decode_pos = seq_len + n_pending - 1`), but the executor's
-                // sampling index is a RELATIVE row into this fire's `ws.logits`
-                // block ([N,V], one row per input token in feed order). Map each
-                // absolute position to its row via `position_ids`. Absolute ==
-                // relative only when the sequence starts at 0 (the prefill), so the
-                // raw positions sampled the right row on the first fire but read an
-                // out-of-range row on every decode (seq_len > 0) → argmax over
-                // unwritten logits → token 0.
-                req.sampling_indices = logits_positions
-                    .iter()
-                    .map(|&p| {
-                        req.position_ids
-                            .iter()
-                            .position(|&pos| pos == p)
-                            .map(|i| i as u32)
-                            .unwrap_or_else(|| {
-                                (req.token_ids.len() as u32).saturating_sub(1)
-                            })
-                    })
-                    .collect();
-            } else if req.sampling_indices.is_empty() && !req.token_ids.is_empty() {
-                req.sampling_indices = vec![req.token_ids.len() as u32 - 1];
-            }
-        }
-
-        // Track whether the user actually supplied masks; the kernel-dispatch
-        // hint downstream needs to distinguish user masks from the runtime's
-        // synthesized causal default.
-        let has_user_mask = !req.masks.is_empty();
-
-        // Save data needed for context::append_working_page_tokens() before
-        // moving into request.
-        let num_input_tokens = req.token_ids.len();
-        let num_spec_tokens = req.spec_token_ids.len();
-        let fill_tokens = req.token_ids.clone();
-        let fill_positions = req.position_ids.clone();
-        let fill_masks = if has_user_mask {
-            req.masks.clone()
-        } else {
-            Vec::new()
-        };
-        // Adapter id for context::append_working_page_tokens.
-        let adapter_id: Option<crate::adapter::AdapterId> = {
-            let bound = req.adapter_bindings[0].adapter_id;
-            if bound < 0 { None } else { Some(bound as u64) }
-        };
-        req.has_user_mask = has_user_mask;
-        req.single_token_mode = !has_user_mask && req.token_ids.len() <= 1;
-        // adapter_bindings[0] already has the adapter_id set by `adapter()`;
-        // stamp the seed picked up out-of-band.
-        req.adapter_bindings[0].seed = adapter_seed.unwrap_or(-1);
-        if let Some(start) = prepare_start {
-            profile_sample.prepare_us = elapsed_us(start.elapsed());
-        }
-
-        // Try the staged hit before synthesizing default masks or pinning. On
-        // hit we skip pin/unpin entirely — the staged fire runs on pages from
-        // the prior cycle.
-        let driver_idx_hint = context::get_device(model_id, context_id);
-        let use_pass_speculation = inference::should_use_pass_speculation(driver_idx_hint);
-        let try_hit_start = profiling.then(Instant::now);
-        let staged_rx = spec_handle
-            .as_ref()
-            .filter(|_| use_pass_speculation)
-            // A program-bearing pass must take the cold path: it finalizes the
-            // program carrier's per-request CSR and submits this request (the
-            // staged path would replay a prior, program-less batch).
-            .filter(|_| !has_programs)
-            .and_then(|s| inference::try_hit(s, context_id, &req, allow_pass_speculation));
-        if let Some(start) = try_hit_start {
-            profile_sample.try_hit_us = elapsed_us(start.elapsed());
-        }
-        let (was_pinned, submit_result) = if let Some(rx) = staged_rx {
-            profile_sample.hit = true;
-            (false, Ok(rx))
-        } else {
-            let cold_prepare_start = profiling.then(Instant::now);
-            // WIT spec: "if not provided, fallback to causal mask".
-            if req.masks.is_empty() && !req.position_ids.is_empty() {
-                req.masks = req
-                    .position_ids
-                    .iter()
-                    .map(|&pos| Brle::all_true((pos + 1) as usize))
-                    .collect();
-            }
-            // Finalize per-request indptr shape ([0, N]).
-            let n_tokens = req.token_ids.len() as u32;
-            let n_masks = req.masks.len() as u32;
-            let n_logit = req.logit_masks.len() as u32;
-            let n_sampling = req.sampling_indices.len() as u32;
-            let n_samplers = req.n_samplers() as u32;
-            let n_spec = req.spec_token_ids.len() as u32;
-            req.qo_indptr = vec![0, n_tokens];
-            req.mask_indptr = vec![0, n_masks];
-            req.logit_mask_indptr = vec![0, n_logit];
-            req.sampling_indptr = vec![0, n_sampling];
-            req.sampler_indptr = vec![0, n_samplers];
-            // Sampling-program carrier: per-request count CSR, mirroring
-            // `sampler_indptr`. The nested per-program CSRs are already rooted
-            // by `push_sampling_program`. `n_sampling_programs()` is 0 for the
-            // legacy sampler path, giving `[0, 0]`.
-            req.sampling_program_indptr = vec![0, req.n_sampling_programs() as u32];
-            req.spec_indptr = vec![0, n_spec];
-            req.kv_page_indptr = vec![0];
-            req.context_ids = vec![context_id];
-            if let Some(start) = cold_prepare_start {
-                profile_sample.cold_prepare_us = elapsed_us(start.elapsed());
-            }
-
-            // Cold path: pin, validate page capacity, submit.
-            let pin_start = profiling.then(Instant::now);
-            let writable_tokens = num_input_tokens.saturating_add(num_spec_tokens);
-            let pinned = match context::pin(model_id, context_id, writable_tokens as u32).await {
-                Ok(p) => p,
-                Err(e) => {
-                    tracing::warn!("pin failed for ctx {context_id}: {e:#}");
-                    return Err(anyhow::anyhow!("pin failed for ctx {context_id}: {e}"));
-                }
-            };
-            if let Some(start) = pin_start {
-                profile_sample.pin_us = elapsed_us(start.elapsed());
-            }
-            let kv_len = pinned.kv_len;
-            let driver_id = pinned.driver;
-            let physical_page_ids = pinned.pages;
-            let extra_pages = pinned.extra_pages;
-            if let Some(rs_slot) = pinned.rs_slot {
-                // Speculation policy for rs_cache (hybrid GDN) models. Two
-                // independent signals, both owned here by the runtime (the
-                // driver stays pure mechanism):
-                //   * `supported` — the driver wired a system drafter and the
-                //     executor can verify drafts and advance the committed
-                //     recurrent slot by exactly the accepted prefix. Without
-                //     it, an externally-supplied draft cannot be verified, so
-                //     reject it; the side channel would otherwise only force
-                //     dense-logit scheduling and fragment prompt batching.
-                //   * `enabled` — operator opt-in (`enable_system_speculation`,
-                //     default off). Gates only the *auto*-drafter: when off we
-                //     don't ask the driver to draft (`output_spec_flags`), but
-                //     we still honor any manual/user-supplied draft tokens.
-                let (system_spec_supported, system_spec_enabled) =
-                    crate::model::get_model(model_id)
-                        .map(|m| {
-                            (m.system_speculation_supported(), m.enable_system_speculation())
-                        })
-                        .unwrap_or((false, false));
-                if !system_spec_supported {
-                    if !req.spec_token_ids.is_empty() {
-                        context::unpin(model_id, context_id);
-                        return Err(anyhow::anyhow!(
-                            "rs_cache models do not support speculative draft tokens yet"
-                        ));
-                    }
-                    req.output_spec_flags = vec![false];
-                } else if !system_spec_enabled {
-                    // Supported, but not opted in: no auto-drafting. Manual
-                    // drafts in `req.spec_token_ids` are still verified.
-                    req.output_spec_flags = vec![false];
-                }
-                req.rs_slot_ids = vec![rs_slot];
-                req.rs_slot_flags = vec![pinned.rs_flags];
-            }
-
-            let num_pages = physical_page_ids.len() as u32;
-            let page_size = context::tokens_per_page(model_id);
-            let post_input_total_kv = kv_len + num_input_tokens as u32;
-            let writable_total_kv = kv_len + writable_tokens as u32;
-            let last_page_len = if num_pages == 0 {
-                0
-            } else {
-                let r = post_input_total_kv % page_size;
-                if r == 0 { page_size } else { r }
-            };
-            let active_page_idx = post_input_total_kv
-                .saturating_add(page_size.saturating_sub(1))
-                .checked_div(page_size)
-                .and_then(|pages| pages.checked_sub(1))
-                .map(|idx| idx as usize);
-
-            // INVARIANT: total_kv must fit within the allocated pages.
-            let page_capacity = num_pages * page_size;
-            if writable_total_kv > page_capacity || num_pages == 0 {
-                let msg = format!(
-                    "KV_INVARIANT_VIOLATION ctx={context_id} total_kv={writable_total_kv} \
-                     page_capacity={page_capacity} num_pages={num_pages} \
-                     kv_len={kv_len} num_input={num_input_tokens} num_spec={num_spec_tokens} page_size={page_size} \
-                     phys_ids={physical_page_ids:?}"
-                );
-                eprintln!("{msg}");
-                context::unpin(model_id, context_id);
-                return Err(anyhow::anyhow!(msg));
-            }
-
-            let driver_idx = driver_id as usize;
-            let submit_start = profiling.then(Instant::now);
-            let result = inference::submit_async(
-                model_id,
-                req,
-                driver_idx,
-                physical_page_ids,
-                extra_pages,
-                last_page_len,
-                active_page_idx,
-                allow_pass_speculation,
-            );
-            if let Some(start) = submit_start {
-                profile_sample.submit_wait_us = elapsed_us(start.elapsed());
-            }
-            (true, result)
-        };
-
-        // On submit failure, unpin (if we pinned) and return early.
-        let rx = match submit_result {
-            Ok(rx) => rx,
-            Err(e) => {
-                if was_pinned {
-                    context::unpin(model_id, context_id);
-                }
-                tracing::warn!("inference::submit failed for ctx {context_id}: {e:#}");
-                return Err(anyhow::anyhow!("submit failed for ctx {context_id}: {e}"));
-            }
-        };
-
-        let pending = PendingOutput {
-            rx: Some(rx),
-            resolved: None,
-            programs_output_kinds,
-            model_id,
-            context_id,
-            was_pinned,
-            fill_tokens,
-            fill_positions,
-            fill_masks,
-            adapter_id,
-            adapter_seed,
-        };
-        let postprocess_start = profiling.then(Instant::now);
-        // The pending always lives on the pass so `output()` resolves on every
-        // pass (consumer B — the guest reads t's token for stop detection).
-        self.ctx().table.get_mut(&this)?.pending = Some(pending);
-        if let Some(positions) = feed_forward {
-            // WS8: register a link REFERENCING this pass (by rep) so the next
-            // pass on this context can read its per-row sampled tokens (consumer
-            // A) without consuming the pass's output — shared resolution (a).
-            self.pipeline_links.insert(
-                context_id,
-                PipelineLink {
-                    producer_rep: this.rep(),
-                    positions,
-                },
-            );
-        }
-        if let Some(start) = postprocess_start {
-            profile_sample.postprocess_us = elapsed_us(start.elapsed());
-        }
-        if let Some(start) = profile_start {
-            record_execute_profile(profile_sample, elapsed_us(start.elapsed()));
-        }
-        Ok(())
-    }
-
-    async fn output(
-        &mut self,
-        this: Resource<ForwardPass>,
-    ) -> Result<Result<Vec<Resource<Tensor>>, String>> {
-        match self.complete_pass(&this).await? {
-            Ok(per_program) => {
-                // Single-sampler `output()`: flatten the attached program's
-                // declared output tensors in order. A pass with no sampler
-                // yields an empty list; a batch pass should use `outputs()`.
-                let mut handles = Vec::new();
-                for program_tensors in per_program {
-                    for t in program_tensors {
-                        handles.push(self.ctx().table.push(t)?);
-                    }
-                }
-                Ok(Ok(handles))
-            }
-            Err(e) => Ok(Err(e)),
-        }
-    }
-
-    async fn outputs(
-        &mut self,
-        this: Resource<ForwardPass>,
-    ) -> Result<Result<Vec<Vec<Resource<Tensor>>>, String>> {
-        match self.complete_pass(&this).await? {
-            Ok(per_program) => {
-                let mut out = Vec::with_capacity(per_program.len());
-                for program_tensors in per_program {
-                    let mut handles = Vec::with_capacity(program_tensors.len());
-                    for t in program_tensors {
-                        handles.push(self.ctx().table.push(t)?);
-                    }
-                    out.push(handles);
-                }
-                Ok(Ok(out))
-            }
-            Err(e) => Ok(Err(e)),
-        }
-    }
-
     async fn drop(&mut self, this: Resource<ForwardPass>) -> Result<()> {
-        // Release any still-held pin if the pass is dropped without `output()`.
-        if let Ok(pass) = self.ctx().table.get_mut(&this)
-            && let Some(p) = pass.pending.as_mut()
-        {
-            p.release_pin();
-        }
+        // P3 `execute()` is inline (prepare→submit→await→finalize in one async
+        // fn), so a dropped pass holds no pending pin to release — just free the
+        // resource-table entry.
         self.ctx().table.delete(this)?;
         Ok(())
     }
@@ -1293,42 +734,6 @@ impl InstanceState {
             submit_inputs,
             logits_positions,
         })
-    }
-
-    /// Resolve a submitted pass's pending output **in place** (idempotent): take
-    /// it out to await without holding the table borrow, then restore it with the
-    /// result cached — so both `output()` (consumer B) and the WS8 link (consumer
-    /// A, via the producer rep) can read the same resolution. No-op if the pass
-    /// has no pending (never executed, or already consumed).
-    async fn resolve_pending(&mut self, pass: &Resource<ForwardPass>) -> Result<()> {
-        let Some(mut pending) = self.ctx().table.get_mut(pass)?.pending.take() else {
-            return Ok(());
-        };
-        pending.resolve().await;
-        self.ctx().table.get_mut(pass)?.pending = Some(pending);
-        Ok(())
-    }
-
-    /// Drain a submitted pass for `output()`/`outputs()`: resolve it (shared with
-    /// any WS8 link), then take its cached output and reconstruct each attached
-    /// program's declared outputs as typed tensors. `Err` if the pass was never
-    /// executed or the driver pass failed.
-    async fn complete_pass(
-        &mut self,
-        this: &Resource<ForwardPass>,
-    ) -> Result<Result<Vec<Vec<Tensor>>, String>> {
-        self.resolve_pending(this).await?;
-        let pass = self.ctx().table.get_mut(this)?;
-        let Some(pending) = pass.pending.as_mut() else {
-            return Ok(Err("output() called before execute()".to_string()));
-        };
-        match pending.take_resolved() {
-            Ok(output) => Ok(Ok(build_program_tensors(
-                output,
-                &pending.programs_output_kinds,
-            ))),
-            Err(e) => Ok(Err(e)),
-        }
     }
 }
 
@@ -1435,6 +840,565 @@ impl pie::core::tensor::HostProgram for InstanceState {
     }
 }
 
+impl pie::core::inference::HostForwardPassWithStore<InstanceState> for HasSelf<InstanceState> {
+    /// Native async (WASI P3 component-model-async). There is no guest-visible
+    /// `future-output` resource anymore: `execute` runs prepare → submit →
+    /// await → finalize inline and returns the WIT `output` directly. Because
+    /// the commit/abort runs in THIS async fn (where the store is reachable via
+    /// `accessor.with`), the forward txn is finalized atomically with the pass —
+    /// the lost-KV-commit failure mode of the old pollable/get split (commit
+    /// unreachable from `&mut FutureOutput`) is structurally impossible.
+    async fn execute(
+        accessor: &Accessor<InstanceState, Self>,
+        this: Resource<ForwardPass>,
+    ) -> Result<Result<pie::core::inference::Output, String>> {
+        let profile_start = execute_profile_enabled().then(Instant::now);
+        // Drain the accumulator: the explicit memory descriptors + the staged
+        // ForwardRequest. There is no ambient context handle (W5). Every store /
+        // resource-table touch in this async func goes through `accessor.with`
+        // (P3: the host async fn has no `&mut self`).
+        let (
+            model_id,
+            adapter_seed,
+            kv_context,
+            kv_output,
+            _rs_context,
+            rs_output,
+            fold_buffered_tokens,
+            mut req,
+            attached_programs,
+        ) = accessor.with(|mut access| -> Result<_> {
+            let pass = access.get().ctx().table.get_mut(&this)?;
+            Ok((
+                pass.model_id,
+                pass.adapter_seed,
+                pass.kv_context.take(),
+                pass.kv_output.take(),
+                pass.rs_context.take(),
+                pass.rs_output.take(),
+                pass.fold_buffered_tokens.take(),
+                std::mem::replace(&mut pass.req, empty_forward_request()),
+                std::mem::take(&mut pass.programs),
+            ))
+        })?;
+        // v1: single-driver. Multi-driver binds the working set's device on
+        // first materialization (`bind_driver`), wired at consolidation.
+        let driver_idx = 0usize;
+
+        // Flatten every attached sampling program into the bridge carrier and
+        // collect their declared output kinds (attach order) for the slot-output
+        // marshaling. Each program's `logits` binding positions become the
+        // pass's sampling positions; its submit-bound tensor values + per-slot
+        // binding-map ride the carrier so the driver wires each `Op::Input(i)`.
+        let has_programs = !attached_programs.is_empty();
+        let mut programs_output_kinds: Vec<Vec<pie_sampling_ir::OutputKind>> =
+            Vec::with_capacity(attached_programs.len());
+        let mut logits_positions: Vec<u32> = Vec::new();
+        for program in attached_programs {
+            programs_output_kinds.push(program.output_kinds);
+            logits_positions.extend(program.logits_positions);
+            let bindings = program
+                .bindings
+                .iter()
+                .map(|b| match b {
+                    pie_sampling_ir::Binding::Logits => pie_driver_abi::SamplingBinding::Logits,
+                    pie_sampling_ir::Binding::Tensor { key, .. } => {
+                        pie_driver_abi::SamplingBinding::Tensor { key: *key }
+                    }
+                })
+                .collect();
+            req.push_sampling_program(&pie_driver_abi::SamplingProgramSubmission {
+                bytecode: program.bytecode,
+                inputs: program.submit_inputs,
+                bindings,
+                late_keys: Vec::new(),
+                late_inputs: Vec::new(),
+            });
+        }
+        if has_programs {
+            // The `logits` binding(s) carry the sampling positions as ABSOLUTE
+            // sequence positions; map each to its RELATIVE row in this fire's
+            // input feed via `position_ids` (absolute==relative only at prefill).
+            // Fall back to the last input row when none were supplied so the LM
+            // head still runs and the program samples there.
+            if !logits_positions.is_empty() {
+                req.sampling_indices = logits_positions
+                    .iter()
+                    .map(|&p| {
+                        req.position_ids
+                            .iter()
+                            .position(|&pos| pos == p)
+                            .map(|i| i as u32)
+                            .unwrap_or_else(|| (req.token_ids.len() as u32).saturating_sub(1))
+                    })
+                    .collect();
+            } else if req.sampling_indices.is_empty() && !req.token_ids.is_empty() {
+                req.sampling_indices = vec![req.token_ids.len() as u32 - 1];
+            }
+        }
+
+        // Empty-input guard: a forward must compute at least one query row.
+        // Without input rows `qo_indptr` collapses to `[0, 0]` and the pass is a
+        // no-op submit; the old context API rejected this. Image/audio spans
+        // push placeholder rows into `token_ids`, so this covers all input kinds.
+        if let Err(e) = forward_prepare::check_input_nonempty(req.token_ids.len()) {
+            return Ok(Err(format!("{e:?}")));
+        }
+
+        // WIT spec: "if not provided, fallback to causal mask". Then stamp the
+        // per-request indptr shape ([0, N]).
+        let has_user_mask = !req.masks.is_empty();
+        if req.masks.is_empty() && !req.position_ids.is_empty() {
+            req.masks = req
+                .position_ids
+                .iter()
+                .map(|&pos| Brle::all_true((pos + 1) as usize))
+                .collect();
+        }
+        req.has_user_mask = has_user_mask;
+        req.single_token_mode = !has_user_mask && req.token_ids.len() <= 1;
+        req.adapter_bindings[0].seed = adapter_seed.unwrap_or(-1);
+        req.qo_indptr = vec![0, req.token_ids.len() as u32];
+        req.mask_indptr = vec![0, req.masks.len() as u32];
+        req.logit_mask_indptr = vec![0, req.logit_masks.len() as u32];
+        req.sampling_indptr = vec![0, req.sampling_indices.len() as u32];
+        req.sampler_indptr = vec![0, req.n_samplers() as u32];
+        // Sampling-program carrier: per-request count CSR, mirroring
+        // `sampler_indptr` (the nested per-program CSRs are rooted by
+        // `push_sampling_program`). `[0, 0]` when no program is attached.
+        req.sampling_program_indptr = vec![0, req.n_sampling_programs() as u32];
+        req.spec_indptr = vec![0, req.spec_token_ids.len() as u32];
+        req.kv_page_indptr = vec![0];
+        // Batch-affinity id: the KV working set's resource handle replaces the
+        // old context id (used by the scheduler for request grouping).
+        let affinity = kv_output
+            .as_ref()
+            .map(|o| o.set.rep())
+            .or_else(|| kv_context.as_ref().map(|c| c.set.rep()))
+            .unwrap_or(0);
+        req.context_ids = vec![affinity as u64];
+
+        let page_size = crate::page_size::tokens_per_page(model_id);
+
+        // ── prepare: validate descriptors; alloc/CoW + pin write targets; pin
+        //    read pages; resolve to driver physical ids — all under one txn.
+        //    The whole prepare is synchronous, so it runs inside one
+        //    `accessor.with` closure (store + arena both reachable); the owned
+        //    `txn` + projection cross back out for the async submit. ──
+        type PrepOut = (
+            forward_prepare::KvProjection,
+            crate::arena::ArenaTxn,
+            Vec<crate::arena::MovePlan>,
+        );
+        let prepared: std::result::Result<PrepOut, String> = accessor.with(|mut access| {
+            let state = access.get();
+            let arena_arc = crate::arena::get(model_id, driver_idx);
+            let mut arena = arena_arc.lock().unwrap();
+            let mut txn = arena.txn_begin();
+            let mut move_plans: Vec<crate::arena::MovePlan> = Vec::new();
+
+            type InnerOut = (
+                forward_prepare::KvProjection,
+                Vec<u32>,
+                Vec<u8>,
+                Vec<u32>,
+                Vec<u32>,
+                Vec<u32>,
+            );
+            let inner: std::result::Result<InnerOut, String> = 'prep: {
+                // KV read context → pinned physical pages. Read only the written
+                // valid-token prefix: kv-context `len` may include trailing
+                // reserved slots (the WIT permits "trailing reserved slots may be
+                // empty") that are not part of attention and may be unwritten;
+                // resolving the full `len` would reject them. `valid_pages` is the
+                // ceil of valid-tokens. Pure prefill (valid_tokens==0) reads none.
+                let (context_pages, valid_tokens) = if let Some(kc) = &kv_context {
+                    let valid_pages = kc.valid_tokens.div_ceil(page_size);
+                    let objs = if valid_pages == 0 {
+                        Vec::new()
+                    } else {
+                        match state.ctx().table.get(&kc.set) {
+                            Ok(ws) => match ws.resolve_read(kc.start, valid_pages) {
+                                Ok(o) => o,
+                                Err(e) => break 'prep Err(e.to_string()),
+                            },
+                            Err(e) => break 'prep Err(e.to_string()),
+                        }
+                    };
+                    let mut pages = Vec::with_capacity(objs.len());
+                    for obj in &objs {
+                        if let Err(e) = arena.txn_pin(&mut txn, *obj) {
+                            break 'prep Err(e.to_string());
+                        }
+                        match arena.blocks(*obj) {
+                            Ok(b) => pages.push(b[0]),
+                            Err(e) => break 'prep Err(e.to_string()),
+                        }
+                    }
+                    (pages, kc.valid_tokens)
+                } else {
+                    (Vec::new(), 0)
+                };
+
+                // KV write outputs → CoW'd + pinned physical pages.
+                let mut writes: Vec<forward_prepare::KvWrite> = Vec::new();
+                if let Some(ko) = &kv_output {
+                    if ko.indices.len() != ko.per_page_valid_lens.len() {
+                        break 'prep Err(format!(
+                            "kv-output indices ({}) and per-page-valid-lens ({}) length mismatch",
+                            ko.indices.len(),
+                            ko.per_page_valid_lens.len()
+                        ));
+                    }
+                    // Validate generation / range / uniqueness BEFORE any mutation.
+                    match state.ctx().table.get(&ko.set) {
+                        Ok(ws) => {
+                            if let Err(e) = ws.resolve_write(&ko.indices, ko.generation) {
+                                break 'prep Err(e.to_string());
+                            }
+                        }
+                        Err(e) => break 'prep Err(e.to_string()),
+                    }
+                    for (i, &idx) in ko.indices.iter().enumerate() {
+                        let cow = {
+                            let ws = match state.ctx().table.get_mut(&ko.set) {
+                                Ok(w) => w,
+                                Err(e) => break 'prep Err(e.to_string()),
+                            };
+                            ws.cow_write_slot(idx, &mut txn, &mut arena)
+                        };
+                        let (obj, move_plan) = match cow {
+                            Ok(v) => v,
+                            Err(e) => break 'prep Err(e.to_string()),
+                        };
+                        if let Some(mp) = move_plan {
+                            move_plans.push(mp);
+                        }
+                        if let Err(e) = arena.txn_pin(&mut txn, obj) {
+                            break 'prep Err(e.to_string());
+                        }
+                        let page = match arena.blocks(obj) {
+                            Ok(b) => b[0],
+                            Err(e) => break 'prep Err(e.to_string()),
+                        };
+                        writes.push(forward_prepare::KvWrite {
+                            slot_index: idx,
+                            page,
+                            valid_len: ko.per_page_valid_lens[i],
+                        });
+                    }
+                }
+
+                // Project onto the contiguous driver page run + last-page length.
+                let proj = match forward_prepare::project_kv(
+                    &context_pages,
+                    valid_tokens,
+                    &writes,
+                    page_size,
+                ) {
+                    Ok(p) => p,
+                    Err(e) => break 'prep Err(format!("{e:?}")),
+                };
+
+                // RS v1 (write + in-forward fold only; `rs-context` read deferred
+                // to v2 — the hybrid read+write case needs per-request token-range
+                // ABI). Buffered slabs ride `rs_buffer_slot_ids` (page-major CSR:
+                // slab s = tokens [s·page, (s+1)·page)); the FOLD bit disambiguates
+                // — clear = rs-output write-target (W10, write_state=false), set =
+                // fold read-source. `rs_slot_ids[r]` is the folded state slot.
+                let mut rs_slot_ids: Vec<u32> = Vec::new();
+                let mut rs_slot_flags: Vec<u8> = Vec::new();
+                let mut rs_buffer_slot_ids: Vec<u32> = Vec::new();
+                let mut rs_buffer_slot_indptr: Vec<u32> = vec![0];
+                let mut rs_fold_lens: Vec<u32> = Vec::new();
+                if let Some(ro) = &rs_output {
+                    // Materialise + pin the buffered write slabs, page-major.
+                    let cow = {
+                        let ws = match state.ctx().table.get_mut(&ro.set) {
+                            Ok(w) => w,
+                            Err(e) => break 'prep Err(e.to_string()),
+                        };
+                        ws.cow_write_buffer(ro.start_token, ro.len_tokens, &mut txn, &mut arena)
+                    };
+                    let (objs, move_plan) = match cow {
+                        Ok(v) => v,
+                        Err(e) => break 'prep Err(e.to_string()),
+                    };
+                    if let Some(mp) = move_plan {
+                        move_plans.push(mp);
+                    }
+                    for obj in &objs {
+                        if let Err(e) = arena.txn_pin(&mut txn, *obj) {
+                            break 'prep Err(e.to_string());
+                        }
+                        match arena.blocks(*obj) {
+                            Ok(b) => rs_buffer_slot_ids.push(b[0]),
+                            Err(e) => break 'prep Err(e.to_string()),
+                        }
+                    }
+                    rs_buffer_slot_indptr.push(rs_buffer_slot_ids.len() as u32);
+
+                    // The folded recurrent_state slot (driver reads/writes it).
+                    let folded = match state.ctx().table.get(&ro.set) {
+                        Ok(ws) => ws.folded_object(),
+                        Err(e) => break 'prep Err(e.to_string()),
+                    };
+                    let folded_block = match folded {
+                        Some(obj) => match arena.blocks(obj) {
+                            Ok(b) => b[0],
+                            Err(e) => break 'prep Err(e.to_string()),
+                        },
+                        None => 0,
+                    };
+                    rs_slot_ids.push(folded_block);
+
+                    // FOLD bit + `rs_fold_lens` iff this pass folds the buffered
+                    // suffix into the folded state in-forward (W9 piggyback).
+                    let mut flag = 0u8;
+                    if let Some(n) = fold_buffered_tokens {
+                        flag |= pie_driver_abi::RS_FLAG_FOLD;
+                        rs_fold_lens.push(n);
+                    } else {
+                        rs_fold_lens.push(0);
+                    }
+                    rs_slot_flags.push(flag);
+                } else if fold_buffered_tokens.is_some() {
+                    // v1: the fold rides the rs-output set; a fold-only pass with
+                    // no rs-output to carry the RS set isn't expressible yet (v2: a
+                    // fold descriptor names its own set).
+                    break 'prep Err(
+                        "fold-buffered without rs-output is unsupported in v1 (rs-output carries the RS set)"
+                            .to_string(),
+                    );
+                }
+
+                Ok((
+                    proj,
+                    rs_slot_ids,
+                    rs_slot_flags,
+                    rs_buffer_slot_ids,
+                    rs_buffer_slot_indptr,
+                    rs_fold_lens,
+                ))
+            };
+
+            // On any prepare failure: abort the txn (discard staged allocs/CoW
+            // copies, release pins) and revert any repointed KV slots; the prior
+            // mappings stay visible (W13). No driver submission happened.
+            let (proj, rs_slot_ids, rs_slot_flags, rs_buffer_slot_ids, rs_buffer_slot_indptr, rs_fold_lens) =
+                match inner {
+                    Ok(v) => v,
+                    Err(e) => {
+                        arena.txn_abort(txn);
+                        drop(arena);
+                        if let Some(ko) = &kv_output {
+                            if let Ok(ws) = state.ctx().table.get_mut(&ko.set) {
+                                ws.abort_writes();
+                            }
+                        }
+                        return Err(e);
+                    }
+                };
+
+            if !rs_slot_ids.is_empty() {
+                req.rs_slot_ids = rs_slot_ids;
+                req.rs_slot_flags = rs_slot_flags;
+                req.rs_fold_lens = rs_fold_lens;
+            }
+            if !rs_buffer_slot_ids.is_empty() {
+                req.rs_buffer_slot_ids = rs_buffer_slot_ids;
+                req.rs_buffer_slot_indptr = rs_buffer_slot_indptr;
+            }
+
+            // Release the arena lock BEFORE the async submit; the owned `txn`
+            // keeps the pins/CoW copies alive until commit/abort.
+            drop(arena);
+            Ok((proj, txn, move_plans))
+        });
+
+        let (proj, txn, move_plans) = match prepared {
+            Ok(v) => v,
+            Err(e) => return Ok(Err(e)),
+        };
+
+        // Issue the device d2d for every CoW'd write target: copy the original
+        // page content into the private copy before the driver writes into it.
+        for mp in &move_plans {
+            if let Err(e) = crate::driver::copy_d2d(driver_idx, &mp.from, &mp.to) {
+                tracing::warn!("forward CoW d2d copy failed: {e:#}");
+            }
+        }
+
+        // CAS-seal eligibility (W6/W7): host-hash the full pages this forward
+        // fills from an EMPTY context (`valid_tokens == 0`), so the forward's
+        // tokens start at a page boundary and each page's whole content is known
+        // here. Chained from prev_hash 0. Sealing onto a non-empty context needs
+        // the context tip's sealed hash (follow-up); until then those pages stay
+        // private-dirty (W7) — correct, just no dedup.
+        let seal_eligible = !proj.full_page_writes.is_empty()
+            && kv_context.as_ref().map(|c| c.valid_tokens).unwrap_or(0) == 0
+            && req.position_ids.len() == req.token_ids.len()
+            && req.masks.len() == req.token_ids.len();
+        let seal_hashes: Vec<(u32, u64)> = if seal_eligible {
+            let page_hashes = crate::page_hash::compute_page_hashes(
+                page_size as usize,
+                &req.token_ids,
+                &req.position_ids,
+                &req.masks,
+                0,
+                adapter_seed,
+            );
+            proj
+                .full_page_writes
+                .iter()
+                .filter_map(|&slot| page_hashes.get(slot as usize).map(|&h| (slot, h)))
+                .collect()
+        } else {
+            Vec::new()
+        };
+
+        // Carry the KV working-set handle + the txn across the async boundary;
+        // finalize (after the driver round-trip) commits (seal full pages) /
+        // aborts on them.
+        let kv_set: Option<Resource<crate::working_set::kv::KvWorkingSet>> = kv_output
+            .as_ref()
+            .map(|ko| Resource::new_borrow(ko.set.rep()));
+
+        // The RS working set whose folded boundary advances on a committed
+        // fold-buffered (W9) — v1 rides the rs-output set.
+        let rs_fold_set: Option<Resource<crate::working_set::rs::RsWorkingSet>> =
+            if fold_buffered_tokens.is_some() {
+                rs_output.as_ref().map(|ro| Resource::new_borrow(ro.set.rep()))
+            } else {
+                None
+            };
+
+        // Single-model: the SERVICE routes to the bound model; no model_id arg.
+        let submit_result =
+            inference::submit_async(req, driver_idx, proj.physical_page_ids, proj.last_page_len);
+
+        let rx = match submit_result {
+            Ok(rx) => rx,
+            Err(e) => {
+                // Submit never reached the driver — abort the txn + revert the
+                // repointed KV slots (W13).
+                accessor.with(|mut access| {
+                    let state = access.get();
+                    let arena_arc = crate::arena::get(model_id, driver_idx);
+                    arena_arc.lock().unwrap().txn_abort(txn);
+                    if let Some(ko) = &kv_set {
+                        if let Ok(ws) = state.ctx().table.get_mut(ko) {
+                            ws.abort_writes();
+                        }
+                    }
+                });
+                tracing::warn!("inference::submit failed: {e:#}");
+                return Ok(Err(e.to_string()));
+            }
+        };
+
+        // Await the driver result INLINE (P3 native async), then finalize the
+        // forward txn in the same async fn (store reachable via `accessor.with`).
+        let forward_result: Option<ForwardOutput> = match rx.await {
+            Ok(Ok(resp)) => Some(resp),
+            Ok(Err(e)) => {
+                tracing::warn!("future output failed: {e:#}");
+                None
+            }
+            Err(_) => None,
+        };
+        let success = forward_result.is_some();
+
+        accessor.with(|mut access| {
+            access.get().finalize_forward_txn(
+                success,
+                txn,
+                kv_set,
+                seal_hashes,
+                model_id,
+                driver_idx,
+                rs_fold_set,
+                fold_buffered_tokens,
+            )
+        })?;
+
+        let output = match forward_result {
+            Some(resp) => build_program_slots(resp, &programs_output_kinds),
+            None => pie::core::inference::Output {
+                slots: Vec::new(),
+                spec_tokens: Vec::new(),
+                spec_positions: Vec::new(),
+            },
+        };
+        if let Some(start) = profile_start {
+            record_execute_profile(ExecuteProfileSample::default(), elapsed_us(start.elapsed()));
+        }
+        Ok(Ok(output))
+    }
+}
+
+impl InstanceState {
+    /// Commit (on driver success) or abort (on failure) the forward transaction
+    /// from `execute()`. Commit releases pins, publishes the CoW'd write targets
+    /// (`commit_writes`), and CAS-seals eligible full pages; abort discards
+    /// staged objects and reverts repointed slots.
+    #[allow(clippy::too_many_arguments)]
+    fn finalize_forward_txn(
+        &mut self,
+        success: bool,
+        txn: crate::arena::ArenaTxn,
+        kv_set: Option<Resource<crate::working_set::kv::KvWorkingSet>>,
+        seal_hashes: Vec<(u32, u64)>,
+        model_id: usize,
+        driver_idx: usize,
+        rs_fold_set: Option<Resource<crate::working_set::rs::RsWorkingSet>>,
+        fold_tokens: Option<u32>,
+    ) -> Result<()> {
+        let arena_arc = crate::arena::get(model_id, driver_idx);
+        if success {
+            // Commit, publish the repointed slots, then CAS-seal eligible full
+            // pages. Lock order is arena → kv_cas, both held sync (no await).
+            let mut arena = arena_arc.lock().unwrap();
+            arena
+                .txn_commit(txn)
+                .map_err(|e| anyhow::anyhow!("forward txn_commit failed: {e}"))?;
+            if let Some(kv_set) = &kv_set {
+                let cas_arc = crate::working_set::kv_cas::get(model_id, driver_idx);
+                let mut cas = cas_arc.lock().unwrap();
+                if let Ok(ws) = self.ctx().table.get_mut(kv_set) {
+                    ws.commit_writes();
+                    for (slot, hash) in &seal_hashes {
+                        if let Err(e) = ws.seal(*slot, *hash, &mut arena, &mut cas) {
+                            tracing::warn!("CAS seal of slot {slot} failed: {e}");
+                        }
+                    }
+                }
+            }
+            // Advance the RS folded boundary on a committed in-forward fold (W9):
+            // consume the first `n` buffered tokens into the folded state. Only
+            // on success — a fold never advances across an aborted forward.
+            if let (Some(n), Some(rs_set)) = (fold_tokens, &rs_fold_set) {
+                if let Ok(ws) = self.ctx().table.get_mut(rs_set) {
+                    if let Err(e) = ws.advance_fold(n, &mut arena) {
+                        tracing::warn!("advance_fold({n}) failed: {e:?}");
+                    }
+                }
+            }
+        } else {
+            {
+                let mut arena = arena_arc.lock().unwrap();
+                arena.txn_abort(txn);
+            }
+            if let Some(kv_set) = &kv_set {
+                if let Ok(ws) = self.ctx().table.get_mut(kv_set) {
+                    ws.abort_writes();
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 // =============================================================================
 // Grammar resource
 // =============================================================================
@@ -1527,18 +1491,15 @@ impl std::fmt::Debug for Matcher {
 }
 
 impl pie::core::inference::HostMatcher for InstanceState {
-    async fn new(
-        &mut self,
-        grammar: Resource<Grammar>,
-        tokenizer: Resource<crate::api::model::Tokenizer>,
-    ) -> Result<Resource<Matcher>> {
+    async fn new(&mut self, grammar: Resource<Grammar>) -> Result<Resource<Matcher>> {
         let grammar_res = self.ctx().table.get(&grammar)?;
         let source = grammar_res.source.clone();
         let grammar_inner = grammar_res.inner.clone();
 
-        let tokenizer_res = self.ctx().table.get(&tokenizer)?;
-        let tok = tokenizer_res.model.tokenizer().clone();
-        let stop_tokens = tokenizer_res.model.instruct().seal();
+        // Single-model: the tokenizer comes from the global bound model.
+        let model = crate::model::model();
+        let tok = model.tokenizer().clone();
+        let stop_tokens = model.instruct().seal();
 
         let compiled = CompiledGrammar::get_or_compile(&source, &grammar_inner, &tok);
         let inner = GrammarMatcher::with_compiled(compiled, tok, stop_tokens, 10);
@@ -1651,50 +1612,37 @@ mod sampling_program_tests {
     }
 
     #[test]
-    fn tensor_helpers_pack_little_endian() {
-        let t = Tensor::i32_vec(vec![7]);
-        assert_eq!(t.shape, vec![1]);
-        assert!(matches!(t.dtype, wit::Dtype::I32));
-        assert_eq!(t.data, 7i32.to_le_bytes());
-
-        let f = Tensor::f32_vec(vec![2.5]);
-        assert!(matches!(f.dtype, wit::Dtype::F32));
-        assert_eq!(f.data, 2.5f32.to_le_bytes());
-    }
-
-    #[test]
-    fn build_tensors_token_fast_path() {
-        // ForwardOutput::Token + a single Token-output program ⇒ one i32 tensor.
-        let per = build_program_tensors(
+    fn build_slots_token_fast_path() {
+        // ForwardOutput::Token + a single Token-output program ⇒ one `token` slot.
+        use pie::core::inference::SlotOutput;
+        let out = build_program_slots(
             ForwardOutput::Token(42),
             &[vec![pie_sampling_ir::OutputKind::Token]],
         );
-        assert_eq!(per.len(), 1);
-        assert_eq!(per[0].len(), 1);
-        assert_eq!(per[0][0].data, 42i32.to_le_bytes());
+        assert_eq!(out.slots.len(), 1);
+        assert!(matches!(out.slots[0], SlotOutput::Token(42)));
     }
 
     #[test]
-    fn build_tensors_mirostat_token_scalar_shape() {
+    fn build_slots_mirostat_token_entropy() {
         // The 4090 mirostat shape: a `[Token, Scalar]` program. The token rides
-        // `resp.tokens`, the scalar surprise S the `entropies` channel; the walk
-        // pulls them in declared order ⇒ [i32 token, f32 scalar].
+        // `resp.tokens` → `slot-output::token`; the scalar surprise S rides the
+        // `entropies` channel → `slot-output::entropy` (SEAM-A). The flat slot
+        // list is the program's declared outputs in order.
+        use pie::core::inference::SlotOutput;
         use pie_sampling_ir::OutputKind;
         let resp = pie_driver_abi::ForwardResponse {
             tokens: vec![137],
             entropies: vec![2.7],
             ..Default::default()
         };
-        let per = build_program_tensors(
+        let out = build_program_slots(
             ForwardOutput::Response(resp),
             &[vec![OutputKind::Token, OutputKind::Scalar]],
         );
-        assert_eq!(per.len(), 1);
-        assert_eq!(per[0].len(), 2);
-        assert!(matches!(per[0][0].dtype, wit::Dtype::I32));
-        assert_eq!(per[0][0].data, 137i32.to_le_bytes());
-        assert!(matches!(per[0][1].dtype, wit::Dtype::F32));
-        assert_eq!(per[0][1].data, 2.7f32.to_le_bytes());
+        assert_eq!(out.slots.len(), 2);
+        assert!(matches!(out.slots[0], SlotOutput::Token(137)));
+        assert!(matches!(out.slots[1], SlotOutput::Entropy(s) if s == 2.7));
     }
 
     #[test]
@@ -1728,26 +1676,6 @@ mod sampling_program_tests {
                 pie_driver_abi::SamplingBinding::Logits,
                 pie_driver_abi::SamplingBinding::Tensor { key: 0 },
             ]
-        );
-    }
-
-    #[test]
-    fn feed_forward_extracts_per_row_tokens() {
-        // WS8 next-input source: a pass's per-row sampled tokens (one per
-        // sequence/row) are what feed the next pass — the N-token vector the
-        // PipelineLink scatters by `positions`.
-        assert_eq!(forward_output_tokens(&ForwardOutput::Token(7)), vec![7]);
-        assert_eq!(
-            forward_output_tokens(&ForwardOutput::Tokens(vec![3, 1, 4])),
-            vec![3, 1, 4]
-        );
-        let resp = pie_driver_abi::ForwardResponse {
-            tokens: vec![9, 8],
-            ..Default::default()
-        };
-        assert_eq!(
-            forward_output_tokens(&ForwardOutput::Response(resp)),
-            vec![9, 8]
         );
     }
 }

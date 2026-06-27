@@ -53,7 +53,7 @@ async fn isolatedtopp_on_real_driver() -> Result<()> {
     client.add_program(&wasm, &manifest, true).await.context("add_program")?;
 
     let mut proc = client
-        .launch_process("isolatedtopp@0.1.0".to_string(), "{}".to_string(), true, None)
+        .launch_process("isolatedtopp@0.1.0".to_string(), "{}".to_string(), true)
         .await
         .context("launch")?;
     let json = proc.wait_for_return().await.context("wait_for_return")?;

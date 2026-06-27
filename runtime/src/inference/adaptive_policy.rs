@@ -181,7 +181,10 @@ impl SchedulingPolicy for EagerPolicy {
         if current_forward_requests >= self.max_forward_requests {
             return Decision::Fire;
         }
-        let active = crate::context::pinned_count(self.driver_idx);
+        // Per-driver pinned-context count is gone with the context actor
+        // (Phase 5); the cohort-high-water path degrades to the latency-based
+        // decision below.
+        let active = 0;
         if active > self.cohort_high_water {
             self.cohort_high_water = active;
         }

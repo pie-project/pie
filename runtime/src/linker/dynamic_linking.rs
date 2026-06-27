@@ -189,7 +189,7 @@
 //!                                       ▼
 //!   ┌─────────────────────────────────────────────────────────────────────────────┐
 //!   │ 2. CALL CALLEE FUNCTION                                                     │
-//!   │    call_async() + post_return_async()                                       │
+//!   │    call_async()                                                             │
 //!   └─────────────────────────────────────────────────────────────────────────────┘
 //!                                       │
 //!                                       ▼
@@ -910,7 +910,6 @@ async fn forward_call(
     callee_func
         .call_async(&mut *store, &args_in_callee_view, &mut callee_returns)
         .await?;
-    callee_func.post_return_async(&mut *store).await?;
 
     for borrow in borrows_to_end {
         borrow.resource_drop_async(&mut *store).await?;
@@ -944,7 +943,7 @@ fn register_stub_component_exports(
     let component_type = linker.substituted_component_type(component)?;
 
     for (interface_name, export_item) in component_type.exports(engine) {
-        if let ComponentItem::ComponentInstance(instance_type) = export_item {
+        if let ComponentItem::ComponentInstance(instance_type) = export_item.ty {
             register_stub_interface_exports(engine, linker, &interface_name, &instance_type)?;
         }
     }
@@ -970,7 +969,7 @@ fn register_stub_interface_exports(
 
     // Register both resources and functions as stubs.
     for (export_name, export_item) in instance_type.exports(engine) {
-        match export_item {
+        match export_item.ty {
             ComponentItem::Resource(_) => {
                 inst.resource_async(
                     export_name,
@@ -1015,12 +1014,12 @@ fn register_component_exports(
     let mut component_defined_resource_types: Vec<ResourceType> = Vec::new();
 
     for (_, export_item) in component_type.exports(engine) {
-        if let ComponentItem::ComponentInstance(instance_type) = export_item {
+        if let ComponentItem::ComponentInstance(instance_type) = export_item.ty {
             let mut resource_types_by_name: HashMap<String, ResourceType> = HashMap::new();
             let mut defined_names: HashSet<String> = HashSet::new();
 
             for (name, item) in instance_type.exports(engine) {
-                match item {
+                match item.ty {
                     ComponentItem::Resource(rt) => {
                         resource_types_by_name.insert(name.to_string(), rt);
                     }
@@ -1050,7 +1049,7 @@ fn register_component_exports(
 
     // Second pass: register exports for each interface, passing the component-wide set.
     for (interface_name, export_item) in component_type.exports(engine) {
-        if let ComponentItem::ComponentInstance(instance_type) = export_item {
+        if let ComponentItem::ComponentInstance(instance_type) = export_item.ty {
             register_interface_exports(
                 engine,
                 linker,
@@ -1098,7 +1097,7 @@ fn register_interface_exports(
     let mut functions = Vec::new();
 
     for (export_name, export_item) in instance_type.exports(engine) {
-        match export_item {
+        match export_item.ty {
             ComponentItem::Resource(resource_type) => {
                 resource_type_by_name.insert(export_name.to_string(), resource_type);
             }
@@ -1222,7 +1221,6 @@ fn register_call_forwarding(
         inst.func_new_async(func_name, move |mut store, _ty, args, returns| {
             Box::new(async move {
                 func.call_async(&mut store, args, returns).await?;
-                func.post_return_async(&mut store).await?;
                 Ok(())
             })
         })

@@ -1,6 +1,6 @@
 //! Startup TOML for the dummy driver.
 //!
-//! Mirrors `driver/portable`'s startup-TOML shape where it overlaps
+//! Mirrors `driver/cuda`'s startup-TOML shape where it overlaps
 //! (`[shmem]`) and adds a `[dummy]` section for the knobs the dummy
 //! needs in lieu of model introspection. The standalone server emits
 //! this file via `embedded_driver::write_dummy_startup_toml`.

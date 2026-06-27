@@ -466,7 +466,16 @@ void linear_attn_layer_body(
     // Recurrent-only commit-advance: when non-null, request r folds only
     // commit_len[r] tokens (confirmed [input|accepted]) into the committed
     // state. Forces the FLA path (the only one threading commit_len).
-    const int* commit_len = nullptr)
+    const int* commit_len = nullptr,
+    // Ph7 RS working-set fold-from-buffer (per-request CSR of buffered-slab
+    // pool ids; host). rs_buffer_write: scatter in-proj [mixed_qkv|a|b] to the
+    // pool (rs-output, write_state forced false). rs_buffer_fold (with
+    // commit_len): replay loads activations FROM the pool slabs instead of the
+    // verify stash. See executor.hpp ForwardInputs.
+    const std::uint32_t* rs_buffer_slot_ids_h = nullptr,
+    const std::uint32_t* rs_buffer_slot_indptr_h = nullptr,
+    bool rs_buffer_write = false,
+    bool rs_buffer_fold = false)
 {
     // TP-local dims for linear-attention. tp_size == 1 keeps everything
     // unsharded. The K/V head counts must divide tp_size (checked at
@@ -491,7 +500,7 @@ void linear_attn_layer_body(
     // state as usual. Activation replay is the sole spec path now: the FLA, conv
     // and warp-tiled all honor write_state uniformly — frozen verify persists
     // nothing, the commit-advance replay (verify_frozen reset to false) writes.
-    const bool write_state = !state_cache.verify_frozen();
+    const bool write_state = !state_cache.verify_frozen() && !rs_buffer_write;
 
     // ── In-projections (or activation-replay load) ────────────────
     // Activation-replay stash layout per linear layer (bf16, max_tokens stride):
@@ -508,11 +517,62 @@ void linear_attn_layer_body(
         static_cast<std::size_t>(state_cache.verify_stash_max_tokens());
     const std::size_t stash_a_off = stash_stride * conv_dim;
     const std::size_t stash_b_off = stash_a_off + stash_stride * V_h;
-    const bool replay_load = (commit_len != nullptr) && stash != nullptr;
+    const bool replay_load =
+        (commit_len != nullptr) && (stash != nullptr || rs_buffer_fold);
     const bool stash_write =
         state_cache.verify_frozen() && stash != nullptr && commit_len == nullptr;
     profile_forward_stage_ptr(profile, &ForwardProfile::linear_proj_ms, stream, [&] {
         if (replay_load) {
+            // Ph7 fold-from-buffer: gather page-major from the persistent
+            // buffered-activation pool into the replay buffers (vs the verify
+            // stash). Request r folds its first nr = qo[r+1]-qo[r] buffered
+            // tokens across its CSR slabs; slab j holds tokens [j*page,(j+1)*page).
+            if (rs_buffer_fold && rs_buffer_slot_ids_h != nullptr &&
+                rs_buffer_slot_indptr_h != nullptr) {
+                const int page = state_cache.rs_buffer_page_tokens();
+                const std::size_t slab_a =
+                    static_cast<std::size_t>(page) * conv_dim;
+                const std::size_t slab_b =
+                    slab_a + static_cast<std::size_t>(page) * V_h;
+                for (int r = 0; r < R; ++r) {
+                    const int qo0 = static_cast<int>(qo_indptr_h[r]);
+                    const int nr  = static_cast<int>(qo_indptr_h[r + 1]) - qo0;
+                    const std::uint32_t s0 = rs_buffer_slot_indptr_h[r];
+                    const std::uint32_t s1 = rs_buffer_slot_indptr_h[r + 1];
+                    for (std::uint32_t j = 0; s0 + j < s1; ++j) {
+                        const int tok0 = static_cast<int>(j) * page;
+                        const int cnt = std::min(page, nr - tok0);
+                        if (cnt <= 0) break;
+                        auto* slab = static_cast<std::uint16_t*>(
+                            state_cache.rs_buffer_slab(
+                                linear_idx,
+                                static_cast<int>(rs_buffer_slot_ids_h[s0 + j])));
+                        if (slab == nullptr) continue;
+                        CUDA_CHECK(cudaMemcpyAsync(
+                            la.mixed_qkv.data() +
+                                static_cast<std::size_t>(qo0 + tok0) * conv_dim,
+                            slab,
+                            static_cast<std::size_t>(cnt) * conv_dim *
+                                sizeof(std::uint16_t),
+                            cudaMemcpyDeviceToDevice, stream));
+                        CUDA_CHECK(cudaMemcpyAsync(
+                            la.a.data() +
+                                static_cast<std::size_t>(qo0 + tok0) * V_h,
+                            slab + slab_a,
+                            static_cast<std::size_t>(cnt) * V_h *
+                                sizeof(std::uint16_t),
+                            cudaMemcpyDeviceToDevice, stream));
+                        CUDA_CHECK(cudaMemcpyAsync(
+                            la.b.data() +
+                                static_cast<std::size_t>(qo0 + tok0) * V_h,
+                            slab + slab_b,
+                            static_cast<std::size_t>(cnt) * V_h *
+                                sizeof(std::uint16_t),
+                            cudaMemcpyDeviceToDevice, stream));
+                    }
+                }
+                return;
+            }
             CUDA_CHECK(cudaMemcpyAsync(la.mixed_qkv.data(), stash,
                 static_cast<std::size_t>(N) * conv_dim * sizeof(std::uint16_t),
                 cudaMemcpyDeviceToDevice, stream));
@@ -563,6 +623,47 @@ void linear_attn_layer_body(
             CUDA_CHECK(cudaMemcpyAsync(stash + stash_b_off, la.b.data(),
                 static_cast<std::size_t>(N) * V_h * sizeof(std::uint16_t),
                 cudaMemcpyDeviceToDevice, stream));
+        }
+        // Ph7 rs-output (W10): scatter the in-proj [mixed_qkv|a|b] page-major
+        // into the persistent buffered-activation pool. write_state was forced
+        // false, so the recurrent_state is NOT folded — these tokens are buffered
+        // for a later fold-buffered(n). Slab j holds tokens [j*page,(j+1)*page).
+        if (rs_buffer_write && rs_buffer_slot_ids_h != nullptr &&
+            rs_buffer_slot_indptr_h != nullptr) {
+            const int page = state_cache.rs_buffer_page_tokens();
+            const std::size_t slab_a = static_cast<std::size_t>(page) * conv_dim;
+            const std::size_t slab_b =
+                slab_a + static_cast<std::size_t>(page) * V_h;
+            for (int r = 0; r < R; ++r) {
+                const int qo0 = static_cast<int>(qo_indptr_h[r]);
+                const int nr  = static_cast<int>(qo_indptr_h[r + 1]) - qo0;
+                const std::uint32_t s0 = rs_buffer_slot_indptr_h[r];
+                const std::uint32_t s1 = rs_buffer_slot_indptr_h[r + 1];
+                for (std::uint32_t j = 0; s0 + j < s1; ++j) {
+                    const int tok0 = static_cast<int>(j) * page;
+                    const int cnt = std::min(page, nr - tok0);
+                    if (cnt <= 0) break;
+                    auto* slab = static_cast<std::uint16_t*>(
+                        state_cache.rs_buffer_slab(
+                            linear_idx,
+                            static_cast<int>(rs_buffer_slot_ids_h[s0 + j])));
+                    if (slab == nullptr) continue;
+                    CUDA_CHECK(cudaMemcpyAsync(slab,
+                        la.mixed_qkv.data() +
+                            static_cast<std::size_t>(qo0 + tok0) * conv_dim,
+                        static_cast<std::size_t>(cnt) * conv_dim *
+                            sizeof(std::uint16_t),
+                        cudaMemcpyDeviceToDevice, stream));
+                    CUDA_CHECK(cudaMemcpyAsync(slab + slab_a,
+                        la.a.data() + static_cast<std::size_t>(qo0 + tok0) * V_h,
+                        static_cast<std::size_t>(cnt) * V_h * sizeof(std::uint16_t),
+                        cudaMemcpyDeviceToDevice, stream));
+                    CUDA_CHECK(cudaMemcpyAsync(slab + slab_b,
+                        la.b.data() + static_cast<std::size_t>(qo0 + tok0) * V_h,
+                        static_cast<std::size_t>(cnt) * V_h * sizeof(std::uint16_t),
+                        cudaMemcpyDeviceToDevice, stream));
+                }
+            }
         }
     });
 
@@ -1227,7 +1328,11 @@ void qwen3_5_forward_paged(
     const std::int32_t* slot_ids_d,
     const std::int32_t* logit_row_indices_d,
     int num_logit_rows,
-    const std::int32_t* commit_advance_gather)
+    const std::int32_t* commit_advance_gather,
+    const std::uint32_t* rs_buffer_slot_ids_h,
+    const std::uint32_t* rs_buffer_slot_indptr_h,
+    bool rs_buffer_write,
+    bool rs_buffer_fold)
 {
     const int H  = cfg.hidden_size;
     const int V  = cfg.vocab_size;
@@ -1306,7 +1411,9 @@ void qwen3_5_forward_paged(
                 Lw, cfg, fwd_cfg, ws, la_ws, state_cache,
                 static_cast<int>(L), linear_idx, N, R, is_pure_decode,
                 slot_ids_h, slot_ids_d, qo_indptr_h, qo_indptr,
-                cublas, stream, &profile, /*commit_len=*/commit_advance_gather);
+                cublas, stream, &profile, /*commit_len=*/commit_advance_gather,
+                rs_buffer_slot_ids_h, rs_buffer_slot_indptr_h,
+                /*rs_buffer_write=*/false, rs_buffer_fold);
             ++linear_idx;
             continue;
         }
@@ -1329,7 +1436,9 @@ void qwen3_5_forward_paged(
                     Lw, cfg, fwd_cfg, ws, la_ws, state_cache,
                     static_cast<int>(L), li, N, R, is_pure_decode,
                     slot_ids_h, slot_ids_d, qo_indptr_h, qo_indptr,
-                    cublas, stream, &profile);
+                    cublas, stream, &profile, /*commit_len=*/nullptr,
+                    rs_buffer_slot_ids_h, rs_buffer_slot_indptr_h,
+                    rs_buffer_write, /*rs_buffer_fold=*/false);
             });
         } else {
             ++profile.full_layers;

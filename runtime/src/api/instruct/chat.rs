@@ -22,73 +22,40 @@ impl std::fmt::Debug for Decoder {
 }
 
 impl pie::instruct::chat::Host for InstanceState {
-    async fn system(
-        &mut self,
-        model: Resource<crate::api::model::Model>,
-        message: String,
-    ) -> Result<Vec<u32>> {
-        let model = self.ctx().table.get(&model)?;
-        Ok(model.model.instruct().system(&message))
+    async fn system(&mut self, message: String) -> Result<Vec<u32>> {
+        Ok(crate::model::model().instruct().system(&message))
     }
 
-    async fn user(
-        &mut self,
-        model: Resource<crate::api::model::Model>,
-        message: String,
-    ) -> Result<Vec<u32>> {
-        let model = self.ctx().table.get(&model)?;
-        Ok(model.model.instruct().user(&message))
+    async fn user(&mut self, message: String) -> Result<Vec<u32>> {
+        Ok(crate::model::model().instruct().user(&message))
     }
 
-    async fn first_user(
-        &mut self,
-        model: Resource<crate::api::model::Model>,
-        message: String,
-    ) -> Result<Vec<u32>> {
-        let model = self.ctx().table.get(&model)?;
-        Ok(model.model.instruct().first_user(&message))
+    async fn first_user(&mut self, message: String) -> Result<Vec<u32>> {
+        Ok(crate::model::model().instruct().first_user(&message))
     }
 
-    async fn system_user(
-        &mut self,
-        model: Resource<crate::api::model::Model>,
-        system: String,
-        user: String,
-    ) -> Result<Vec<u32>> {
-        let model = self.ctx().table.get(&model)?;
-        Ok(model.model.instruct().system_user(&system, &user))
+    async fn system_user(&mut self, system: String, user: String) -> Result<Vec<u32>> {
+        Ok(crate::model::model().instruct().system_user(&system, &user))
     }
 
-    async fn assistant(
-        &mut self,
-        model: Resource<crate::api::model::Model>,
-        message: String,
-    ) -> Result<Vec<u32>> {
-        let model = self.ctx().table.get(&model)?;
-        Ok(model.model.instruct().assistant(&message))
+    async fn assistant(&mut self, message: String) -> Result<Vec<u32>> {
+        Ok(crate::model::model().instruct().assistant(&message))
     }
 
-    async fn cue(&mut self, model: Resource<crate::api::model::Model>) -> Result<Vec<u32>> {
-        let model = self.ctx().table.get(&model)?;
-        Ok(model.model.instruct().cue())
+    async fn cue(&mut self) -> Result<Vec<u32>> {
+        Ok(crate::model::model().instruct().cue())
     }
 
-    async fn seal(&mut self, model: Resource<crate::api::model::Model>) -> Result<Vec<u32>> {
-        let model = self.ctx().table.get(&model)?;
-        Ok(model.model.instruct().seal())
+    async fn seal(&mut self) -> Result<Vec<u32>> {
+        Ok(crate::model::model().instruct().seal())
     }
 
-    async fn stop_tokens(&mut self, model: Resource<crate::api::model::Model>) -> Result<Vec<u32>> {
-        let model = self.ctx().table.get(&model)?;
-        Ok(model.model.instruct().seal())
+    async fn stop_tokens(&mut self) -> Result<Vec<u32>> {
+        Ok(crate::model::model().instruct().seal())
     }
 
-    async fn create_decoder(
-        &mut self,
-        model: Resource<crate::api::model::Model>,
-    ) -> Result<Resource<Decoder>> {
-        let model = self.ctx().table.get(&model)?;
-        let inner = model.model.instruct().chat_decoder();
+    async fn create_decoder(&mut self) -> Result<Resource<Decoder>> {
+        let inner = crate::model::model().instruct().chat_decoder();
         let decoder = Decoder { inner };
         Ok(self.ctx().table.push(decoder)?)
     }

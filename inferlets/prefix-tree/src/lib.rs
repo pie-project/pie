@@ -16,7 +16,7 @@
 //! their common prefixes.
 
 use inferlet::{
-    Context, model::Model, runtime,
+    Context,
     Result,
     sample::Sampler,
 };
@@ -36,10 +36,7 @@ async fn main(input: Input) -> Result<String> {
 
     let start = std::time::Instant::now();
 
-    let models = runtime::models();
-    let model = Model::load(models.first().ok_or("No models available")?)?;
-
-    let mut ctx_root = Context::new(&model)?;
+    let mut ctx_root = Context::new()?;
 
     // 1. --- Root Context (Level 0) ---
     ctx_root.system(

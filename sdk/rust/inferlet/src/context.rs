@@ -1,68 +1,74 @@
-//! SDK Context — stateful wrapper over the WIT `Context` resource.
+//! SDK Context — stateful facade over the `kv-working-set` host resource.
 //!
-//! Owns the native context handle, caches page metadata, buffers instruct
-//! tokens, and exposes ergonomic fill / flush / generate methods.
+//! Post-working-set refactor, the runtime is token-agnostic (W4): it owns only
+//! physical KV page slots (a dense ordered array, addressed by relative index).
+//! Everything semantic — the token buffer, per-token positions, the sequence
+//! length, and the page layout — is **owned here in the SDK**. `Context` wraps a
+//! [`KvWorkingSet`] and exposes the same ergonomic fill / flush / generate API
+//! as before; forward passes are expressed as explicit `kv-context` (read) and
+//! `kv-output` (write) descriptors instead of an opaque context handle.
+//!
+//! Single-model runtime: there is exactly one bound model, so the working set
+//! binds to it implicitly (`KvWorkingSet::new()` takes no handle) and model
+//! metadata is reached through the global `crate::model::*` free functions.
 
 mod constraint;
 
 // Re-export submodule public types.
 pub use constraint::*;
 
-use crate::ForwardPassExt;
 use crate::Result;
 use crate::inference::ForwardPass;
-use crate::model::Model;
+use crate::pie::core::inference::{KvContext, KvOutput};
+use crate::pie::core::working_set::KvWorkingSet;
 use crate::sample::Sampler;
-
-/// The raw WIT context resource, re-exported for power users.
-pub use crate::pie::core::context::Context as RawContext;
+use serde::{Deserialize, Serialize};
+use serde_json;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 // Instruct WIT bindings.
 use crate::pie::instruct::chat;
 
-/// Budget-exhausting bid: the maximum per-page-per-step rent the process
-/// can sustain over `μ` steps of generation without going bankrupt.
-///
-/// Formula:
-///
-/// ```text
-///     bid = (B/μ + d) / (p + μ(1 + cv²) / (2s))
-/// ```
-///
-/// where:
-/// - `B` = credit balance (market wallet, unit: pages)
-/// - `μ` = expected remaining steps
-/// - `d` = endowment-weighted dividend per step
-/// - `p` = pages currently held
-/// - `s` = page_size (tokens per page)
-/// - `cv²` = squared coefficient of variation of the remaining-steps
-///   distribution (0 = deterministic, 1 = geometric/memoryless)
-///
-/// The numerator is the per-step budget available for rent (balance
-/// amortized over horizon, plus incoming dividend). The denominator is
-/// the *total* page-steps of rent exposure: current pages `p` held for
-/// `μ` steps, plus the triangular accumulation of newly created pages.
-///
-/// This is the truthful bid under critical-value payments — bidding this
-/// value exhausts the wallet exactly at the end of the horizon. No
-/// make-cost term: forward-pass compute is billed against the token
-/// wallet, not the credit wallet.
-pub(crate) fn compute_bid(
-    balance: f64,
-    pages: f64,
-    mu: f64,
-    cv2: f64,
-    page_size: f64,
-    dividend: f64,
-) -> f64 {
-    let mu = mu.max(1.0);
-    let numerator = balance / mu + dividend;
-    let denominator = pages + mu * (1.0 + cv2) / (2.0 * page_size);
-    if denominator > 0.0 {
-        numerator / denominator
-    } else {
-        numerator
+// =============================================================================
+// Snapshot blob (W14 / §7)
+// =============================================================================
+
+const SNAPSHOT_VERSION: u32 = 1;
+static SNAPSHOT_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Inferlet-owned replayable snapshot manifest, serialized to a CPU-resident
+/// blob. v1 stores the token log for replay-based restore; `cas_hashes` is
+/// reserved for the future physical-reattach path (brief §7).
+#[derive(Serialize, Deserialize)]
+struct SnapshotManifest {
+    version: u32,
+    page_size: u32,
+    seq_len: u32,
+    tokens: Vec<u32>,
+    buffer: Vec<u32>,
+    pending_system: Option<String>,
+    cas_hashes: Vec<u64>,
+}
+
+fn snapshot_path(name: &str) -> String {
+    // The runtime preopens the per-instance scratch dir as `/scratch` in the
+    // guest (runtime/src/instance.rs); a relative path has no matching preopen,
+    // so snapshot blobs must be written there.
+    format!("/scratch/{name}.pie-snapshot")
+}
+
+fn read_manifest(name: &str) -> Result<SnapshotManifest> {
+    let bytes =
+        std::fs::read(snapshot_path(name)).map_err(|e| format!("snapshot '{name}': read: {e}"))?;
+    let manifest: SnapshotManifest =
+        serde_json::from_slice(&bytes).map_err(|e| format!("snapshot '{name}': parse: {e}"))?;
+    if manifest.version != SNAPSHOT_VERSION {
+        return Err(format!(
+            "snapshot '{name}': version {} unsupported (expected {SNAPSHOT_VERSION})",
+            manifest.version
+        ));
     }
+    Ok(manifest)
 }
 
 // =============================================================================
@@ -71,191 +77,169 @@ pub(crate) fn compute_bid(
 
 /// High-level inference context.
 ///
-/// Wraps the native WIT [`RawContext`] resource and provides:
+/// Wraps a [`KvWorkingSet`] (the runtime's dense KV page-slot array) and owns
+/// all semantic metadata the token-agnostic runtime no longer tracks:
 /// - **Buffered instruct fills** (`system`, `user`, `cue`, …) that accumulate
 ///   tokens locally.
-/// - **`flush()`** to drain the buffer through a forward pass and commit pages.
-/// - **`generate()`** to create a [`Generator`](crate::generation::Generator) for token-by-token generation.
-/// - **Cached page metadata** (`seq_len`, `committed_pages`, `working_tokens`)
-///   to avoid redundant WIT host calls.
+/// - **`flush()`** drains the buffer through a forward pass that writes the new
+///   KV into freshly `alloc`'d page slots (full pages auto-seal host-side).
+/// - **`generate()`** creates a [`Generator`](crate::generation::Generator).
+/// - **Sequence cursor** (`seq_len`): the number of materialized KV tokens. The
+///   per-page valid-token lengths and the read/write page split for every
+///   forward are derived from it.
 pub struct Context {
-    pub(crate) inner: RawContext,
-    pub(crate) model: Model,
+    /// The runtime KV working set: a dense ordered array of page slots.
+    pub(crate) kv: KvWorkingSet,
     pub(crate) page_size: u32,
-    /// SDK-side token buffer filled by instruct operations.
+    /// SDK-side token buffer filled by instruct operations (not yet flushed).
     pub(crate) buffer: Vec<u32>,
     /// Deferred system text, so model templates that fold system into the
     /// first user turn can render the pair correctly.
     pending_system: Option<String>,
-    /// Total tokens in committed + working pages (tracked locally).
+    /// Materialized KV tokens (committed to page slots). The next token's
+    /// position is `seq_len`; the live page count is `ceil(seq_len/page_size)`.
     pub(crate) seq_len: u32,
-    /// Number of committed pages (tracked locally).
-    pub(crate) committed_pages: u32,
-    /// Number of currently reserved working pages (tracked locally).
-    pub(crate) working_pages: u32,
-    /// Number of tokens in working (uncommitted) pages (tracked locally).
-    pub(crate) working_tokens: u32,
+    /// Replayable token log: every materialized text token, in order (W4
+    /// replay history). Backs the SDK-blob snapshot facade — `open`/`take`
+    /// replay this through forward passes to rebuild the KV.
+    pub(crate) history: Vec<u32>,
+    /// `false` once a non-replayable span (image / audio soft tokens) is
+    /// materialized — such a context cannot be snapshotted by token replay in
+    /// v1 (the encoder inputs are not in the token log).
+    pub(crate) snapshottable: bool,
 }
 
 impl Context {
     // ── Constructors ────────────────────────────────────────────────
 
-    /// Create a fresh empty context for the given model.
-    pub fn new(model: &Model) -> Result<Self> {
-        let inner = RawContext::create(model)?;
-        Ok(Self::wrap(inner))
-    }
-
-    /// Open a saved snapshot (implicit fork — snapshot stays immutable).
-    pub fn open(model: &Model, name: &str) -> Result<Self> {
-        let inner = RawContext::open(model, name)?;
-        Ok(Self::wrap(inner))
-    }
-
-    /// Take ownership of a saved snapshot (snapshot is deleted).
-    pub fn take(model: &Model, name: &str) -> Result<Self> {
-        let inner = RawContext::take(model, name)?;
-        Ok(Self::wrap(inner))
-    }
-
-    /// Delete a saved snapshot by name (static — no context needed).
-    pub fn delete(model: &Model, name: &str) -> Result<()> {
-        RawContext::delete(model, name)
-    }
-
-    /// Wrap an existing raw context, syncing cached state from the host.
-    fn wrap(inner: RawContext) -> Self {
-        let page_size = inner.tokens_per_page();
-        let committed_pages = inner.committed_page_count();
-        let working_pages = inner.working_page_count();
-        let working_tokens = inner.working_page_token_count();
-        let seq_len = committed_pages * page_size + working_tokens;
-        let model = inner.model();
-        Self {
-            inner,
-            model,
+    /// Create a fresh empty context bound to the single runtime model.
+    pub fn new() -> Result<Self> {
+        let kv = KvWorkingSet::new();
+        let page_size = kv.page_size();
+        Ok(Self {
+            kv,
             page_size,
             buffer: Vec::new(),
             pending_system: None,
-            seq_len,
-            committed_pages,
-            working_pages,
-            working_tokens,
-        }
+            seq_len: 0,
+            history: Vec::new(),
+            snapshottable: true,
+        })
     }
 
     // ── Lifecycle ───────────────────────────────────────────────────
 
-    /// Fork into a new anonymous context (working pages are copied).
-    ///
-    /// The forked context inherits a copy of the parent's buffered tokens.
+    /// Fork into a new anonymous context. The KV page slots are shared by
+    /// reference (lazy copy-on-write; the first divergent write copies); the
+    /// forked context inherits a copy of the SDK-side metadata (buffer,
+    /// pending system, sequence cursor).
     pub fn fork(&self) -> Result<Self> {
-        let forked = self.inner.fork()?;
-        let model = forked.model();
+        let kv = self.kv.fork().map_err(|e| format!("Context::fork: {e}"))?;
         Ok(Self {
-            inner: forked,
-            model,
+            kv,
             page_size: self.page_size,
             buffer: self.buffer.clone(),
             pending_system: self.pending_system.clone(),
             seq_len: self.seq_len,
-            committed_pages: self.committed_pages,
-            working_pages: self.working_pages,
-            working_tokens: self.working_tokens,
+            history: self.history.clone(),
+            snapshottable: self.snapshottable,
         })
     }
 
-    /// Save the context under a user-chosen name.
-    pub fn save(&self, name: &str) -> Result<()> {
-        self.inner.save(name)
-    }
-
-    /// Anonymous save — returns a runtime-generated snapshot name.
-    pub fn snapshot(&self) -> Result<String> {
-        self.inner.snapshot()
-    }
-
-    /// Force-destroy the context immediately, consuming it.
+    /// Force-destroy the context immediately, consuming it. Dropping the
+    /// `KvWorkingSet` releases (decrefs) its page slots in the arena.
     pub fn destroy(self) {
-        self.inner.destroy()
+        drop(self)
     }
 
-    // ── Market operations ────────────────────────────────────────────
+    // ── Snapshots (SDK-owned CPU-resident blobs over wasi:filesystem, W14/§7) ──
+    //
+    // A snapshot is an inferlet-owned, replayable manifest: the materialized
+    // token log plus the unflushed buffer / pending-system. It is serialized to
+    // a CPU-resident file; `open`/`take` rebuild a fresh `kv-working-set` by
+    // replaying the token log through forward passes. (Physical CAS-ref reattach
+    // — reuse sealed pages by hash, skip replay — is a future perf path that
+    // needs a runtime attach-by-cas op; out of v1.)
 
-    /// Suspend this context (release pages, stop rent).
-    /// Restoration is system-driven based on bid priority.
-    pub fn suspend(&self) -> Result<()> {
-        self.inner.suspend()
-    }
-
-    /// Override the auto-computed bid (willingness to pay per page per
-    /// step). Higher bid = harder to evict, restored first under
-    /// contention. Bids are bounded below by zero; the runtime refuses
-    /// negative values.
-    ///
-    /// Most callers should NOT use this — the [`Generator`] auto-bids
-    /// every step using a budget-exhausting strategy that drains the
-    /// wallet over the horizon. Reach for `set_bid` only when you have a
-    /// strategy of your own.
-    ///
-    /// Stopping forward progress when the compute budget is spent is
-    /// handled on the **token wallet**, not here — calling forward
-    /// passes after `tokens_remaining == 0` fails with an error,
-    /// independent of any bid you set. A low bid only affects admission
-    /// under contention.
-    ///
-    /// [`Generator`]: crate::generation::Generator
-    pub fn set_bid(&self, value: f64) {
-        self.inner.bid(value);
-    }
-
-    /// Mark this context as idle: drop the bid to zero so other
-    /// contexts can take its pages under contention. Returns an opaque
-    /// RAII guard; the truthful generation bid is restored on drop.
-    ///
-    /// Use across an external wait (HTTP, tool call, anything off-GPU)
-    /// where holding the bid would buy you nothing:
-    ///
-    /// ```ignore
-    /// let _idle = ctx.idle();
-    /// let result = http_get(url).await?;
-    /// // _idle dropped here → bid restored
-    /// ```
-    ///
-    /// On an uncontended device the runtime charges zero rent anyway —
-    /// `idle` is a no-op cost-wise but still safe to call. Under load,
-    /// it yields priority to other workloads for the duration of the
-    /// wait.
-    pub fn idle(&self) -> Idle<'_> {
-        // Snapshot the truthful bid to restore on drop. If pages == 0
-        // (rare), there's nothing to bid for; default to 0.0.
-        let pages = (self.committed_pages + self.working_pages) as f64;
-        let saved = if pages > 0.0 {
-            let balance = crate::scheduling::balance(&self.model);
-            let dividend = crate::scheduling::dividend(&self.model);
-            let page_size = self.page_size as f64;
-            // Conservative μ = 4096; no per-generation horizon visible here.
-            compute_bid(balance, pages, 4096.0, 1.0, page_size, dividend)
-        } else {
-            0.0
+    /// Save the context under a user-chosen name (a CPU-resident blob).
+    pub fn save(&self, name: &str) -> Result<()> {
+        if !self.snapshottable {
+            return Err(
+                "Context::save: multimodal contexts are not snapshottable in v1 (soft-token \
+                 KV cannot be replayed from a token log)"
+                    .to_string(),
+            );
+        }
+        let manifest = SnapshotManifest {
+            version: SNAPSHOT_VERSION,
+            page_size: self.page_size,
+            seq_len: self.seq_len,
+            tokens: self.history.clone(),
+            buffer: self.buffer.clone(),
+            pending_system: self.pending_system.clone(),
+            cas_hashes: Vec::new(),
         };
-        self.inner.bid(0.0);
-        Idle { ctx: self, saved }
+        let bytes =
+            serde_json::to_vec(&manifest).map_err(|e| format!("Context::save: serialize: {e}"))?;
+        std::fs::write(snapshot_path(name), bytes)
+            .map_err(|e| format!("Context::save: write '{name}': {e}"))?;
+        Ok(())
     }
 
-    // ── Accessors (no WIT calls) ────────────────────────────────────
-
-    /// The model this context was created with.
-    pub fn model(&self) -> &Model {
-        &self.model
+    /// Anonymous save — returns a freshly-generated snapshot name.
+    pub fn snapshot(&self) -> Result<String> {
+        let name = format!(
+            "anon-{}-{}",
+            crate::runtime::instance_id(),
+            SNAPSHOT_COUNTER.fetch_add(1, Ordering::Relaxed)
+        );
+        self.save(&name)?;
+        Ok(name)
     }
 
-    /// Tokens per page.
+    /// Open a saved snapshot (the saved blob stays on disk — an implicit fork).
+    /// Async because it replays the token log through forward passes.
+    pub async fn open(name: &str) -> Result<Self> {
+        let manifest = read_manifest(name)?;
+        Self::from_manifest(manifest).await
+    }
+
+    /// Take ownership of a saved snapshot: open it, then delete the blob.
+    pub async fn take(name: &str) -> Result<Self> {
+        let ctx = Self::open(name).await?;
+        let _ = std::fs::remove_file(snapshot_path(name));
+        Ok(ctx)
+    }
+
+    /// Delete a saved snapshot by name. Missing snapshots are a no-op.
+    pub fn delete(name: &str) -> Result<()> {
+        let _ = std::fs::remove_file(snapshot_path(name));
+        Ok(())
+    }
+
+    /// Rebuild a context from a manifest by replaying its token log.
+    async fn from_manifest(manifest: SnapshotManifest) -> Result<Self> {
+        let mut ctx = Self::new()?;
+        if !manifest.tokens.is_empty() {
+            // Replay the whole materialized log in one prefill pass; `flush`
+            // re-records `history` and advances `seq_len`.
+            ctx.buffer = manifest.tokens;
+            ctx.flush().await?;
+        }
+        // Restore the unflushed tail (buffer + pending system) on top.
+        ctx.buffer = manifest.buffer;
+        ctx.pending_system = manifest.pending_system;
+        Ok(ctx)
+    }
+
+    // ── Accessors (no host calls) ───────────────────────────────────
+
+    /// Tokens per KV page.
     pub fn page_size(&self) -> u32 {
         self.page_size
     }
 
-    /// Total sequence length (committed + working tokens, excluding buffer).
+    /// Total sequence length (materialized tokens, excluding the buffer).
     pub fn seq_len(&self) -> u32 {
         self.seq_len
     }
@@ -265,9 +249,9 @@ impl Context {
         &self.buffer
     }
 
-    /// Access the underlying WIT context resource (escape hatch).
-    pub fn inner(&self) -> &RawContext {
-        &self.inner
+    /// Escape hatch: the underlying KV working set (power users).
+    pub fn working_set(&self) -> &KvWorkingSet {
+        &self.kv
     }
 
     // ── Instruct Fillers ────────────────────────────────────────────
@@ -278,7 +262,7 @@ impl Context {
 
     fn flush_pending_system(&mut self) {
         if let Some(system) = self.pending_system.take() {
-            let tokens = chat::system(&self.model, &system);
+            let tokens = chat::system(&system);
             self.buffer.extend(tokens);
         }
     }
@@ -297,9 +281,9 @@ impl Context {
     /// Fill a user message.
     pub fn user(&mut self, message: &str) -> &mut Self {
         let tokens = match self.pending_system.take() {
-            Some(system) => chat::system_user(&self.model, &system, message),
-            None if self.is_first_chat_fill() => chat::first_user(&self.model, message),
-            None => chat::user(&self.model, message),
+            Some(system) => chat::system_user(&system, message),
+            None if self.is_first_chat_fill() => chat::first_user(message),
+            None => chat::user(message),
         };
         self.buffer.extend(tokens);
         self
@@ -308,7 +292,7 @@ impl Context {
     /// Fill an assistant message (for history replay).
     pub fn assistant(&mut self, message: &str) -> &mut Self {
         self.flush_pending_system();
-        let tokens = chat::assistant(&self.model, message);
+        let tokens = chat::assistant(message);
         self.buffer.extend(tokens);
         self
     }
@@ -316,7 +300,7 @@ impl Context {
     /// Cue the model to generate (fills the generation header).
     pub fn cue(&mut self) -> &mut Self {
         self.flush_pending_system();
-        let tokens = chat::cue(&self.model);
+        let tokens = chat::cue();
         self.buffer.extend(tokens);
         self
     }
@@ -324,7 +308,7 @@ impl Context {
     /// Seal the current turn (insert stop token).
     pub fn seal(&mut self) -> &mut Self {
         self.flush_pending_system();
-        let tokens = chat::seal(&self.model);
+        let tokens = chat::seal();
         self.buffer.extend(tokens);
         self
     }
@@ -364,112 +348,153 @@ impl Context {
                 .to_string())
             })
             .collect::<Result<_>>()?;
-        let prefix = crate::tools::equip_prefix(&self.model, &envelopes)?;
+        let prefix = crate::tools::equip_prefix(&envelopes)?;
         self.buffer.extend_from_slice(&prefix);
         Ok(self)
     }
 
-    /// Drop the trailing `n` tokens from the working pages and re-sync the
-    /// cached page/seq counters from the host.
+    // ── Sequence / page bookkeeping (SDK-owned, W4) ──────────────────
+
+    /// Drop the trailing `n` materialized tokens from the sequence and free
+    /// any page slots that become empty.
     ///
-    /// Use after a forward pass that wrote speculative draft tokens, to
-    /// roll back the rejected suffix. `n` counts only working-page tokens —
-    /// pages that already committed cannot be truncated through this API.
+    /// Use after a forward pass that wrote speculative draft tokens, to roll
+    /// back the rejected suffix. `n` is clamped to `seq_len`.
     pub fn truncate(&mut self, n: u32) {
+        let n = n.min(self.seq_len);
         if n == 0 {
             return;
         }
-        // `truncate_working_page_tokens` REMOVES the last N working tokens
-        // (see context.wit): its argument is the count to drop, not the
-        // count to keep. Pass `n` straight through — clamped to the working
-        // length so an over-large request can't underflow into the runtime's
-        // range check.
-        let removable = self.inner.working_page_token_count().min(n);
-        if removable == 0 {
-            return;
+        self.seq_len -= n;
+        let keep = self.history.len().saturating_sub(n as usize);
+        self.history.truncate(keep);
+        // Free page slots that no longer hold any valid token.
+        let live_pages = self.seq_len.div_ceil(self.page_size);
+        let have = self.kv.size();
+        if have > live_pages {
+            let drop_idx: Vec<u32> = (live_pages..have).collect();
+            // Best-effort: a structural-mutation failure here is non-fatal; the
+            // stale trailing pages are simply overwritten by the next forward.
+            let _ = self.kv.free(&drop_idx);
         }
-        self.inner.truncate_working_page_tokens(removable);
-        // Re-sync from the host: truncation can release pages, and the
-        // safe thing is to read the authoritative counts back.
-        self.committed_pages = self.inner.committed_page_count();
-        self.working_pages = self.inner.working_page_count();
-        self.working_tokens = self.inner.working_page_token_count();
-        self.seq_len = self.committed_pages * self.page_size + self.working_tokens;
+    }
+
+    /// Allocate page slots to cover `seq_len + n` tokens and build the
+    /// `(generation, write indices, per-page valid lens, context page count)`
+    /// for a forward that writes `n` new tokens at the current cursor.
+    ///
+    /// The new tokens land in slots `[seq_len/page_size .. ceil((seq_len+n)/
+    /// page_size))` (the trailing partial page, if any, is rewritten — CoW
+    /// preserves its prior tokens). The fully-complete prior pages
+    /// `[0 .. seq_len/page_size)` are the read context.
+    pub(crate) fn prepare_write(&mut self, n: u32) -> Result<(u32, Vec<u32>, Vec<u32>, u32)> {
+        let p = self.page_size;
+        let first_write_page = self.seq_len / p;
+        let total_after = self.seq_len + n;
+        let total_pages = total_after.div_ceil(p);
+        let have = self.kv.size();
+        if total_pages > have {
+            self.kv
+                .alloc(total_pages - have)
+                .map_err(|e| format!("Context::prepare_write: alloc: {e}"))?;
+        }
+        let generation = self.kv.generation();
+        let indices: Vec<u32> = (first_write_page..total_pages).collect();
+        let valid_lens: Vec<u32> = indices
+            .iter()
+            .map(|&pg| (total_after - pg * p).min(p))
+            .collect();
+        Ok((generation, indices, valid_lens, first_write_page))
+    }
+
+    /// Attach the KV read (`kv-context`) and write (`kv-output`) descriptors
+    /// for a tail write produced by [`prepare_write`](Self::prepare_write) onto
+    /// `pass`.
+    pub(crate) fn attach_kv(
+        &self,
+        pass: &ForwardPass,
+        generation: u32,
+        indices: Vec<u32>,
+        valid_lens: Vec<u32>,
+        ctx_pages: u32,
+    ) {
+        if ctx_pages > 0 {
+            pass.kv_context(&KvContext {
+                set: &self.kv,
+                start: 0,
+                len: ctx_pages,
+                valid_tokens: ctx_pages * self.page_size,
+            });
+        }
+        pass.kv_output(&KvOutput {
+            set: &self.kv,
+            generation,
+            indices,
+            per_page_valid_lens: valid_lens,
+        });
+    }
+
+    /// Attach a read-only `kv-context` spanning every materialized page (a pure
+    /// decode / scoring pass that writes no new tail tokens).
+    pub(crate) fn attach_full_context(&self, pass: &ForwardPass) {
+        let ctx_pages = self.seq_len.div_ceil(self.page_size);
+        if ctx_pages > 0 {
+            pass.kv_context(&KvContext {
+                set: &self.kv,
+                start: 0,
+                len: ctx_pages,
+                valid_tokens: self.seq_len,
+            });
+        }
     }
 
     // ── Flush ───────────────────────────────────────────────────────
 
-    /// Drain the buffered tokens through a forward pass and commit pages.
+    /// Drain the buffered tokens through a forward pass and materialize their
+    /// KV into page slots.
     ///
-    /// After flush, the buffer is empty and `seq_len` reflects all
-    /// consumed tokens.
+    /// After flush, the buffer is empty and `seq_len` reflects all consumed
+    /// tokens.
     pub async fn flush(&mut self) -> Result<()> {
         self.flush_pending_system();
         if self.buffer.is_empty() {
             return Ok(());
         }
-
         let tokens = std::mem::take(&mut self.buffer);
-        let num_tokens = tokens.len() as u32;
+        let n = tokens.len() as u32;
+        let positions: Vec<u32> = (self.seq_len..self.seq_len + n).collect();
 
-        // Reserve additional pages if we need more than currently allocated.
-        let total_tokens_after = self.working_tokens + num_tokens;
-        let pages_needed = total_tokens_after.div_ceil(self.page_size);
-        let additional = pages_needed.saturating_sub(self.working_pages);
-        if additional > 0 {
-            self.inner
-                .reserve_working_pages(additional)
-                .map_err(|e| format!("Failed to reserve pages: {}", e))?;
-            self.working_pages = pages_needed;
-        }
+        let (generation, indices, valid_lens, ctx_pages) = self.prepare_write(n)?;
 
-        // Build and execute a forward pass.
         let pass = ForwardPass::new();
-        pass.context(&self.inner);
-
-        let positions: Vec<u32> = (self.seq_len..self.seq_len + num_tokens).collect();
+        self.attach_kv(&pass, generation, indices, valid_lens, ctx_pages);
         pass.input_tokens(&tokens, &positions);
-
-        pass.execute_outputs()
+        pass.execute()
             .await
-            .map_err(|e| format!("Forward pass failed: {}", e))?;
+            .map_err(|e| format!("Context::flush: forward pass failed: {e}"))?;
 
-        // Commit full pages.
-        let new_working = self.working_tokens + num_tokens;
-        let pages_to_commit = new_working / self.page_size;
-        if pages_to_commit > 0 {
-            self.inner
-                .commit_working_pages(pages_to_commit)
-                .map_err(|e| format!("Failed to commit pages: {}", e))?;
-        }
-
-        // Update cached state.
-        self.committed_pages += pages_to_commit;
-        self.working_pages -= pages_to_commit;
-        self.working_tokens = new_working % self.page_size;
-        self.seq_len += num_tokens;
-
+        self.history.extend_from_slice(&tokens);
+        self.seq_len += n;
         Ok(())
     }
 
     /// Splice an encoded image (or video clip) into the context. Runs the
-    /// vision encoder driver-side and commits the resulting soft-token KV pages,
-    /// exactly like [`flush`] does for text. The image's `token_count()` soft
-    /// tokens occupy KV slots; the sequence cursor advances by
-    /// `position_span()` (equal for Gemma's 1-D positions). See MULTIMODAL.md.
+    /// vision encoder driver-side and materializes the resulting soft-token KV
+    /// pages, exactly like [`flush`](Self::flush) does for text. The image's
+    /// `token_count()` soft tokens occupy KV slots; the sequence cursor
+    /// advances by that many. See MULTIMODAL.md.
     ///
     /// Any buffered text is flushed first so ordering (text → image → text) is
     /// preserved in the KV cache.
     pub async fn append_image(&mut self, image: &crate::media::Image) -> Result<()> {
         // The model's own span delimiters (host-provided; empty for models that
-        // need none) are applied here so the inferlet stays model-agnostic — it
-        // never names `<|vision_start|>` etc.
+        // need none) are applied here so the inferlet stays model-agnostic.
         let prefix = image.prefix_tokens();
         let suffix = image.suffix_tokens();
         if !prefix.is_empty() {
             self.append(&prefix);
         }
-        self.flush().await?; // commit any pending text + the span prefix
+        self.flush().await?; // materialize any pending text + the span prefix
 
         let num_tokens = image.token_count();
         if num_tokens == 0 {
@@ -478,47 +503,22 @@ impl Context {
             }
             return Ok(());
         }
-        let span = image.position_span();
 
-        let total_tokens_after = self.working_tokens + num_tokens;
-        let pages_needed = total_tokens_after.div_ceil(self.page_size);
-        let additional = pages_needed.saturating_sub(self.working_pages);
-        if additional > 0 {
-            self.inner
-                .reserve_working_pages(additional)
-                .map_err(|e| format!("append_image: reserve pages: {}", e))?;
-            self.working_pages = pages_needed;
-        }
-
+        let (generation, indices, valid_lens, ctx_pages) = self.prepare_write(num_tokens)?;
         let pass = ForwardPass::new();
-        pass.context(&self.inner);
+        self.attach_kv(&pass, generation, indices, valid_lens, ctx_pages);
         pass.input_image(image, self.seq_len);
-        pass.execute_outputs()
+        pass.execute()
             .await
-            .map_err(|e| format!("append_image: forward pass: {}", e))?;
+            .map_err(|e| format!("append_image: forward pass: {e}"))?;
 
-        let new_working = self.working_tokens + num_tokens;
-        let pages_to_commit = new_working / self.page_size;
-        if pages_to_commit > 0 {
-            self.inner
-                .commit_working_pages(pages_to_commit)
-                .map_err(|e| format!("append_image: commit pages: {}", e))?;
-        }
-        self.committed_pages += pages_to_commit;
-        self.working_pages -= pages_to_commit;
-        self.working_tokens = new_working % self.page_size;
-        // The image occupies `num_tokens` physical KV rows whose 1-D
-        // bookkeeping positions are `anchor..anchor+num_tokens`. Advance the
-        // sequence cursor past them so the next text token's position is
-        // strictly greater than every committed image-row position (the KV
-        // commit enforces strict monotonicity). M-RoPE attention positions for
-        // the image rows themselves are carried on the dedicated 3-axis
-        // side-channel (`image_mrope_positions`), so the encoder/attention use
-        // the correct (t,h,w) span regardless of this 1-D advance.
-        let _ = span;
+        // The image occupies `num_tokens` physical KV rows; advance the 1-D
+        // sequence cursor past them (M-RoPE attention positions for the rows
+        // themselves ride the dedicated 3-axis side channel).
         self.seq_len += num_tokens;
+        // Soft-token KV cannot be reconstructed from the token log.
+        self.snapshottable = false;
 
-        // Span suffix delimiter (buffered; flushed with the next fill).
         if !suffix.is_empty() {
             self.append(&suffix);
         }
@@ -526,22 +526,18 @@ impl Context {
     }
 
     /// Splice an encoded audio clip into the context. Runs the gemma4_audio
-    /// encoder driver-side and commits the resulting soft-token KV pages,
-    /// exactly like [`append_image`](Self::append_image) does for vision. The
-    /// clip's `token_count()` soft tokens occupy KV slots; the sequence cursor
-    /// advances past them. See audio_frontend.md.
+    /// encoder driver-side and materializes the resulting soft-token KV pages,
+    /// exactly like [`append_image`](Self::append_image) does for vision.
     ///
     /// Any buffered text is flushed first so ordering (text → audio → text) is
     /// preserved in the KV cache.
     pub async fn append_audio(&mut self, audio: &crate::media::Audio) -> Result<()> {
-        // Host-provided span delimiters (e.g. Gemma `<|audio>` / `<audio|>`),
-        // applied here so the inferlet never names them.
         let prefix = audio.prefix_tokens();
         let suffix = audio.suffix_tokens();
         if !prefix.is_empty() {
             self.append(&prefix);
         }
-        self.flush().await?; // commit any pending text + the span prefix
+        self.flush().await?; // materialize any pending text + the span prefix
 
         let num_tokens = audio.token_count();
         if num_tokens == 0 {
@@ -551,36 +547,18 @@ impl Context {
             return Ok(());
         }
 
-        let total_tokens_after = self.working_tokens + num_tokens;
-        let pages_needed = total_tokens_after.div_ceil(self.page_size);
-        let additional = pages_needed.saturating_sub(self.working_pages);
-        if additional > 0 {
-            self.inner
-                .reserve_working_pages(additional)
-                .map_err(|e| format!("append_audio: reserve pages: {}", e))?;
-            self.working_pages = pages_needed;
-        }
-
+        let (generation, indices, valid_lens, ctx_pages) = self.prepare_write(num_tokens)?;
         let pass = ForwardPass::new();
-        pass.context(&self.inner);
+        self.attach_kv(&pass, generation, indices, valid_lens, ctx_pages);
         pass.input_audio(audio, self.seq_len);
-        pass.execute_outputs()
+        pass.execute()
             .await
-            .map_err(|e| format!("append_audio: forward pass: {}", e))?;
+            .map_err(|e| format!("append_audio: forward pass: {e}"))?;
 
-        let new_working = self.working_tokens + num_tokens;
-        let pages_to_commit = new_working / self.page_size;
-        if pages_to_commit > 0 {
-            self.inner
-                .commit_working_pages(pages_to_commit)
-                .map_err(|e| format!("append_audio: commit pages: {}", e))?;
-        }
-        self.committed_pages += pages_to_commit;
-        self.working_pages -= pages_to_commit;
-        self.working_tokens = new_working % self.page_size;
         self.seq_len += num_tokens;
+        // Soft-token KV cannot be reconstructed from the token log.
+        self.snapshottable = false;
 
-        // Span suffix delimiter (buffered; flushed with the next fill).
         if !suffix.is_empty() {
             self.append(&suffix);
         }
@@ -589,20 +567,14 @@ impl Context {
 
     /// Splice a decoded video clip ([`crate::media::Video`]) into the context.
     ///
-    /// The host already demuxed + uniformly sampled the clip and preprocessed
-    /// each frame per the bound model (see [`crate::media::Video::from_bytes`]).
-    /// This injects each frame's soft tokens via [`append_image`], preceded by a
-    /// short generic `mm:ss` timestamp text marker (plain tokens, encoded by
-    /// whatever tokenizer — not model-specific). Each frame becomes committed KV
-    /// exactly like an image, so fork / snapshot / prefix-cache apply. The
-    /// per-frame soft-token budget and any span delimiters are the host's job, so
-    /// this is identical across models. See MULTIMODAL.md §8.
+    /// Injects each frame's soft tokens via [`append_image`], preceded by a
+    /// short generic `mm:ss` timestamp text marker. See MULTIMODAL.md §8.
     pub async fn append_video(&mut self, video: &crate::media::Video) -> Result<()> {
         let n = video.frame_count();
         for i in 0..n {
             let secs = video.timestamp(i).max(0.0) as u32;
             let marker = format!(" {:02}:{:02} ", secs / 60, secs % 60);
-            let toks = self.model.tokenizer().encode(&marker);
+            let toks = crate::model::encode(&marker);
             self.append(&toks);
             let frame = video
                 .frame(i)
@@ -615,8 +587,8 @@ impl Context {
     // ── Pass ────────────────────────────────────────────────────────
 
     /// Build a single [`Forward`](crate::forward::Forward) — a forward pass with
-    /// automatic page reservation, position derivation, and post-execute
-    /// commit. Use for prefill, scoring, custom decode loops, and anywhere
+    /// automatic page allocation, position derivation, and post-execute cursor
+    /// advance. Use for prefill, scoring, custom decode loops, and anywhere
     /// the [`generate`](Self::generate) loop is too high-level.
     pub fn forward(&mut self) -> crate::forward::Forward<'_> {
         self.flush_pending_system();
@@ -625,30 +597,11 @@ impl Context {
 
     // ── Generate ────────────────────────────────────────────────────
 
-    /// Build a [`Generator`](crate::generation::Generator) — the
-    /// multi-step token-generation state machine. Any tokens already in
-    /// the buffer (from `system / user / cue / …`) are drained on the
-    /// first step.
+    /// Build a [`Generator`](crate::generation::Generator) — the multi-step
+    /// token-generation state machine. Any tokens already in the buffer (from
+    /// `system / user / cue / …`) are drained on the first step.
     pub fn generate(&mut self, sampler: Sampler) -> crate::generation::Generator<'_> {
         self.flush_pending_system();
         crate::generation::Generator::new(self, sampler)
-    }
-}
-
-// =============================================================================
-// Idle — RAII guard returned by Context::idle()
-// =============================================================================
-
-/// Opaque RAII guard. Created by [`Context::idle`]. Drops the bid to
-/// zero for the duration of the guard's lifetime; restores the
-/// truthful bid on drop.
-pub struct Idle<'a> {
-    ctx: &'a Context,
-    saved: f64,
-}
-
-impl<'a> Drop for Idle<'a> {
-    fn drop(&mut self) {
-        self.ctx.inner.bid(self.saved);
     }
 }

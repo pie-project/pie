@@ -3,7 +3,7 @@
 //!
 //! `pie-worker`'s build.rs reads `DEP_PIE_IPC_INCLUDE` to locate this
 //! directory and passes it to CMake via `-DPIE_IPC_INCLUDE_DIR=...` so
-//! the C++ driver backends (cuda/portable) can `#include <pie_ipc.h>`
+//! the C++ driver backends (cuda/metal) can `#include <pie_ipc.h>`
 //! (the in-proc vtable mechanism) and `<pie_ipc/inproc_server.hpp>`.
 //! The schema descriptor types those headers reference come from
 //! `pie-driver-abi`'s parallel `DEP_PIE_DRIVER_ABI_INCLUDE` handoff.

@@ -1,5 +1,4 @@
 interface tool-use {
-    use pie:core/model.{model};
     use pie:core/inference.{grammar, matcher};
     use pie:core/types.{error};
 
@@ -11,20 +10,20 @@ interface tool-use {
     }
 
     /// Register available tools (list of JSON schema strings)
-    equip: func(model: borrow<model>, tools: list<string>) -> result<list<u32>, error>;
+    equip: func(tools: list<string>) -> result<list<u32>, error>;
 
     /// Provide a tool result (after a tool-call reply)
-    answer: func(model: borrow<model>, name: string, value: string) -> list<u32>;
+    answer: func(name: string, value: string) -> list<u32>;
 
     /// Create a decoder to detect tool calls in generated tokens
-    create-decoder: func(model: borrow<model>) -> decoder;
+    create-decoder: func() -> decoder;
 
     /// Returns the grammar that constrains well-formed tool-call output for
     /// this model and toolset, or none if the model has no enforceable format.
-    format: func(model: borrow<model>, tools: list<string>) -> option<grammar>;
+    format: func(tools: list<string>) -> option<grammar>;
 
     /// Create a grammar matcher to force-generate tool calls
-    create-matcher: func(model: borrow<model>, tools: list<string>) -> matcher;
+    create-matcher: func(tools: list<string>) -> matcher;
 
     resource decoder {
         feed: func(tokens: list<u32>) -> result<event, error>;

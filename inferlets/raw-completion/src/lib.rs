@@ -7,8 +7,6 @@
 
 use inferlet::{
     Context, Result,
-    model::Model,
-    runtime,
     sample::Sampler,
 };
 use serde::{Deserialize, Serialize};
@@ -43,14 +41,9 @@ struct Output {
 
 #[inferlet::main]
 async fn main(input: Input) -> Result<Output> {
-    let models = runtime::models();
-    let model_name = models.first().ok_or("No models available")?;
-    let model = Model::load(model_name)?;
+    let prompt_tokens = inferlet::model::encode(&input.prompt);
 
-    let tokenizer = model.tokenizer();
-    let prompt_tokens = tokenizer.encode(&input.prompt);
-
-    let mut ctx = Context::new(&model)?;
+    let mut ctx = Context::new()?;
     ctx.append(&prompt_tokens);
 
     let mut all_generated: Vec<u32> = Vec::with_capacity(input.max_tokens);
@@ -72,7 +65,7 @@ async fn main(input: Input) -> Result<Output> {
         }
     }
 
-    let text = tokenizer.decode(&all_generated)
+    let text = inferlet::model::decode(&all_generated)
         .unwrap_or_else(|_| String::from("[decode error]"));
     print!("{}", text);
 

@@ -105,7 +105,6 @@ A *process* is a running instance of a program.
 | `list_processes()` | List running processes (id, username, program, arguments, elapsed_secs). |
 | `signal_process(process_id, message)` | Fire-and-forget string message to a process. |
 | `terminate_process(process_id)` | Ask the server to stop a process. |
-| `launch_daemon(inferlet, port, input=None)` | Start a long-running daemon inferlet bound to `port`. |
 
 `launch_process` and `attach_process` return a [`Process`](#process).
 

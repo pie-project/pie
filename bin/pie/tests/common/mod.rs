@@ -80,7 +80,7 @@ pub fn cuda_standalone_toml(hf_repo: &str) -> String {
          [worker.auth]\n\
          enabled = false\n\
          \n\
-         [[worker.model]]\n\
+         [worker.model]\n\
          name = \"qwen3\"\n\
          hf_repo = \"{hf_repo}\"\n\
          \n\
@@ -119,7 +119,7 @@ pub fn dummy_standalone_toml(hf_repo: &str) -> String {
          [worker.auth]\n\
          enabled = false\n\
          \n\
-         [[worker.model]]\n\
+         [worker.model]\n\
          name = \"qwen3\"\n\
          hf_repo = \"{hf_repo}\"\n\
          \n\
@@ -207,7 +207,7 @@ pub async fn run_inferlet(
         .with_context(|| format!("add_program {program_name}"))?;
 
     let mut proc = client
-        .launch_process(program_name.to_string(), input.to_string(), true, None)
+        .launch_process(program_name.to_string(), input.to_string(), true)
         .await
         .with_context(|| format!("launch_process {program_name}"))?;
 

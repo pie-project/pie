@@ -68,7 +68,6 @@ fn mxfp4_policy(kind: crate::ffi_types::PieLoaderMxfp4MoePolicy) -> crate::types
 fn backend_kind(kind: PieLoaderBackendKind) -> BackendKind {
     match kind {
         PieLoaderBackendKind::Cuda => BackendKind::Cuda,
-        PieLoaderBackendKind::Portable => BackendKind::Portable,
         PieLoaderBackendKind::Unknown => BackendKind::Unknown,
     }
 }

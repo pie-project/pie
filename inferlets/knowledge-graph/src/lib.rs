@@ -9,7 +9,7 @@
 //! prefill is submitted asynchronously while the graph is being built on
 //! CPU, joined via `futures::join!`.
 
-use inferlet::{Context, Result, sample::Sampler, model::Model, runtime};
+use inferlet::{Context, Result, sample::Sampler};
 use petgraph::graph::{DiGraph, NodeIndex};
 use petgraph::visit::EdgeRef;
 use serde::Deserialize;
@@ -151,14 +151,10 @@ async fn main(input: Input) -> Result<String> {
     let max_tokens = input.max_tokens;
     let depth = input.depth;
 
-    let models = runtime::models();
-    let model_name = models.first().ok_or("No models available")?;
-    let model = Model::load(model_name)?;
-
     // --- Stage 1: Extract triples from the passage ---
     println!("--- Stage 1: Extracting knowledge triples ---");
 
-    let mut extraction_ctx = Context::new(&model)?;
+    let mut extraction_ctx = Context::new()?;
     extraction_ctx.system(EXTRACTION_SYSTEM_PROMPT);
     extraction_ctx.user(&format!(
         "Extract all factual triples from this passage:\n\n{}",
@@ -177,7 +173,7 @@ async fn main(input: Input) -> Result<String> {
     // Stage 2 needs the query context with the system prompt prefilled.
     // We kick off that prefill (GPU) concurrently with graph construction
     // (CPU) below, via futures::join!.
-    let mut query_ctx = Context::new(&model)?;
+    let mut query_ctx = Context::new()?;
     query_ctx.system(QUERY_SYSTEM_PROMPT);
 
     let graph_work = async {

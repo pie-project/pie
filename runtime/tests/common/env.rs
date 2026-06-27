@@ -107,7 +107,7 @@ pub fn create_mock_env(
             endpoint: String::new(),
             service_name: String::new(),
         },
-        models: vec![ModelConfig {
+        model: ModelConfig {
             name: model_name.to_string(),
             arch_name: String::new(),
             kv_page_size: 16,
@@ -116,17 +116,10 @@ pub fn create_mock_env(
             enable_system_speculation: false,
             drivers,
             scheduler: SchedulerConfig {
-                batch_policy: "adaptive".into(),
                 request_timeout_secs: 30,
-                default_token_limit: None,  // unlimited by default
-                default_endowment_pages: 4, // small endowment for mock GPUs
-                // Permissive for tests: allow up to 32× overbook so fixtures
-                // don't trip the admission gate on small-capacity mock devices.
-                admission_oversubscription_factor: 32.0,
                 restore_pause_at_utilization: 0.85,
-                speculation_depth: 1,
             },
-        }],
+        },
         runtime: RuntimeConfig {
             worker_threads: 4,
             wasm_max_instances: 1000,

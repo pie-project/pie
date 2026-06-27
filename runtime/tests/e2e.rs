@@ -55,8 +55,6 @@ fn spawn_and_wait(s: &TestState, name: &str, input: String) -> bool {
             None,
             false,
             None,
-            None, // no workflow
-            None, // token_budget
         )
         .expect("spawn")
     });
@@ -138,14 +136,12 @@ fn context_inferlet_exercises_host_apis() {
     );
 }
 
-// The `generate` inferlet runs the full append → flush → generate (step
-// loop) pipeline: each `step.execute().await` flushes pending tokens and runs
-// one forward pass against the mock device. Against `EchoBehavior(42)` every
-// step returns token 42, so 5 steps yield five 42s. (This was historically
-// `#[ignore]`d on a wasm-hang where the modernized `Generator` SDK and the
-// mock's response shape disagreed; resolved by the SDK forward/generation
-// rework. We assert the exact returned string so the test cannot silently pass
-// on an early exit/error.)
+// The forward-pass / generate pipeline runs e2e on the mock driver: append →
+// flush → generate (step loop) over the SDK facade → kv-working-set → forward
+// descriptors → mock `EchoBehavior(42)` (every step returns token 42, so 5
+// steps yield five 42s). We assert the exact returned string so the test cannot
+// silently pass on an early exit/error. (Previously ignored under spec-exec when
+// the mock response didn't match the old Generator; the Phase-6 facade fixed it.)
 #[test]
 fn generate_inferlet_exercises_forward_pass() {
     let s = state();
@@ -178,8 +174,6 @@ fn concurrent_spawns() {
                     None,
                     false,
                     None,
-                    None, // no workflow
-                    None, // token_budget
                 )
                 .unwrap_or_else(|e| panic!("spawn {i} failed: {e}"));
                 pid
@@ -219,8 +213,6 @@ fn rapid_sequential_spawns() {
                 None,
                 false,
                 None,
-                None, // no workflow
-                None, // token_budget
             )
             .unwrap_or_else(|e| panic!("sequential spawn {i} failed: {e}"));
 
@@ -270,8 +262,6 @@ fn mixed_success_and_error() {
                 None,
                 false,
                 None,
-                None, // no workflow
-                None, // token_budget
             )
             .unwrap_or_else(|e| panic!("mixed spawn {i} ({name}) failed: {e}"));
             pids.push((i, name, pid));
@@ -307,8 +297,6 @@ fn spawn_after_termination() {
             None,
             false,
             None,
-            None, // no workflow
-            None, // token_budget
         )
         .expect("spawn for termination");
 
@@ -334,8 +322,6 @@ fn spawn_after_termination() {
             None,
             false,
             None,
-            None, // no workflow
-            None, // token_budget
         )
         .expect("spawn after termination");
 

@@ -1251,14 +1251,13 @@ impl<T: Send + 'static> HostInvoker<T> {
             .ok_or_else(|| anyhow!("{name} export is not a func"))?;
         let func = func
             .typed::<(), R>(&mut self.store)
+            .map_err(anyhow::Error::from)
             .with_context(|| format!("type of {name} func"))?;
         let r = func
             .call_async(&mut self.store, ())
             .await
+            .map_err(anyhow::Error::from)
             .with_context(|| format!("executing {name}"))?;
-        func.post_return_async(&mut self.store)
-            .await
-            .with_context(|| format!("post-return {name}"))?;
         Ok(r)
     }
 }
@@ -1302,7 +1301,7 @@ pub(crate) async fn snapshot_from_bytes(
 ) -> Result<Vec<u8>> {
     let mut linker = Linker::<InstanceState>::new(engine);
     wasmtime_wasi::p2::add_to_linker_async(&mut linker).expect("Failed to link WASI");
-    wasmtime_wasi_http::add_only_http_to_linker_async(&mut linker)
+    wasmtime_wasi_http::p2::add_only_http_to_linker_async(&mut linker)
         .expect("Failed to link WASI HTTP");
     api::add_to_linker(&mut linker)?;
 
@@ -1355,12 +1354,14 @@ async fn snapshot_component<T: Send + 'static>(
         .validate_all(&instrumented_bytes)
         .context("validating instrumented component")?;
 
-    let instrumented_component =
-        Component::new(engine, &instrumented_bytes).context("compiling instrumented component")?;
+    let instrumented_component = Component::new(engine, &instrumented_bytes)
+        .map_err(anyhow::Error::from)
+        .context("compiling instrumented component")?;
 
     let instance = linker
         .instantiate_async(&mut store, &instrumented_component)
         .await
+        .map_err(anyhow::Error::from)
         .context("instantiating instrumented component")?;
 
     let export_idx = instance
@@ -1371,7 +1372,6 @@ async fn snapshot_component<T: Send + 'static>(
         .ok_or_else(|| anyhow!("prepare-snapshot export is not a func"))?;
     let typed = func.typed::<(), ()>(&mut store)?;
     typed.call_async(&mut store, ()).await?;
-    typed.post_return_async(&mut store).await?;
 
     let mut invoker: Box<dyn Invoker> = Box::new(HostInvoker { instance, store });
     let measurement = instrumentation.measure(&mut invoker).await?;

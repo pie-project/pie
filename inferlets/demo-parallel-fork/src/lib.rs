@@ -27,7 +27,7 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use futures::future;
-use inferlet::{Context, Result, chat, model::Model, runtime, sample::Sampler, wstd};
+use inferlet::{Context, Result, chat, sample::Sampler};
 use serde::Deserialize;
 
 #[derive(Deserialize)]
@@ -114,23 +114,19 @@ async fn main(input: Input) -> Result<String> {
     let mode = input.mode.to_lowercase();
     let n = input.num_forks.max(2);
 
-    let model_name = runtime::models()
-        .first()
-        .cloned()
-        .ok_or("No models available")?;
-    let model = Model::load(&model_name)?;
+    let model_name = inferlet::model::name();
 
     match mode.as_str() {
         "baseline" | "plain" => {
-            run_baseline(&model, &model_name, &input, n).await?;
+            run_baseline(&model_name, &input, n).await?;
         }
         "forked" | "smart" => {
-            run_forked(&model, &model_name, &input, n).await?;
+            run_forked(&model_name, &input, n).await?;
         }
         "both" | "" => {
-            let p = run_baseline(&model, &model_name, &input, n).await?;
+            let p = run_baseline(&model_name, &input, n).await?;
             println!();
-            let s = run_forked(&model, &model_name, &input, n).await?;
+            let s = run_forked(&model_name, &input, n).await?;
             println!();
             comparison(&p, &s, &input.expected);
         }
@@ -157,7 +153,6 @@ struct ModeResult {
 
 // ── BASELINE: N independent prefills, decoded concurrently ────────────
 async fn run_baseline(
-    model: &Model,
     model_name: &str,
     input: &Input,
     n: usize,
@@ -176,7 +171,7 @@ async fn run_baseline(
     let mut ctxs = Vec::with_capacity(n);
     let mut per_ctx_prefill: u32 = 0;
     for _ in 0..n {
-        let mut ctx = Context::new(model)?;
+        let mut ctx = Context::new()?;
         ctx.system(&input.system);
         ctx.user(&format!("{} /no_think", input.question));
         ctx.cue();
@@ -192,7 +187,7 @@ async fn run_baseline(
 
     let printer = Rc::new(RefCell::new(Printer::new(n)));
     let start = Instant::now();
-    let answers = run_streams(model, ctxs, &input, n, &printer).await?;
+    let answers = run_streams(ctxs, &input, n, &printer).await?;
     let elapsed = start.elapsed();
     let decode_tokens = printer.borrow().decode_tokens();
 
@@ -218,7 +213,6 @@ async fn run_baseline(
 
 // ── FORKED: 1 prefill, fork() ×N, decoded concurrently ────────────────
 async fn run_forked(
-    model: &Model,
     model_name: &str,
     input: &Input,
     n: usize,
@@ -237,7 +231,7 @@ async fn run_forked(
     // added per-fork so each fork has fresh tokens for its first
     // generate step (forks inherit committed KV but start with an empty
     // buffer; an empty buffer makes the first forward have zero inputs).
-    let mut base = Context::new(model)?;
+    let mut base = Context::new()?;
     base.system(&input.system);
     base.user(&format!("{} /no_think", input.question));
     let prefill = base.seq_len() + base.buffer().len() as u32;
@@ -258,7 +252,7 @@ async fn run_forked(
 
     let printer = Rc::new(RefCell::new(Printer::new(n)));
     let start = Instant::now();
-    let answers = run_streams(model, ctxs, &input, n, &printer).await?;
+    let answers = run_streams(ctxs, &input, n, &printer).await?;
     let elapsed = start.elapsed();
     let decode_tokens = printer.borrow().decode_tokens();
 
@@ -284,7 +278,6 @@ async fn run_forked(
 
 // ── Run N concurrent streams; return per-fork answers ─────────────────
 async fn run_streams(
-    model: &Model,
     ctxs: Vec<Context>,
     input: &Input,
     n: usize,
@@ -293,7 +286,7 @@ async fn run_streams(
     let temperature = input.temperature;
     let max_tokens = input.max_tokens;
     let delay = input.delay;
-    let stop = chat::stop_tokens(model);
+    let stop = chat::stop_tokens();
 
     let futs: Vec<_> = ctxs
         .into_iter()
@@ -301,7 +294,6 @@ async fn run_streams(
         .map(|(idx, mut ctx)| {
             let stop = stop.clone();
             let printer = printer.clone();
-            let model = model;
             async move {
                 let sampler = if temperature <= 0.0 {
                     Sampler::Argmax
@@ -312,7 +304,7 @@ async fn run_streams(
                     }
                 };
                 let mut g = ctx.generate(sampler).max_tokens(max_tokens).stop(&stop);
-                let mut decoder = chat::Decoder::new(model);
+                let mut decoder = chat::Decoder::new();
                 let mut text = String::new();
                 while let Some(step) = g.next()? {
                     let out = step.execute().await?;
@@ -325,7 +317,7 @@ async fn run_streams(
                             text.push_str(&s);
                             printer.borrow_mut().emit(idx, &s);
                             if delay > 0 {
-                                wstd::task::sleep(wstd::time::Duration::from_millis(delay)).await;
+                                inferlet::sleep(std::time::Duration::from_millis(delay)).await;
                             }
                         }
                         chat::Event::Done(s) => {

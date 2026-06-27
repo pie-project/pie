@@ -18,13 +18,11 @@ use uuid::Uuid;
 /// the cancellation result if the WASM task is aborted before it can send.
 type SharedResultTx = Arc<Mutex<Option<oneshot::Sender<Result<String, String>>>>>;
 
-use crate::context;
 use crate::instance::OutputMode;
 use crate::linker;
 use crate::program::ProgramName;
 use crate::server::{self, ClientId};
 use crate::service::{ServiceHandler, ServiceMap};
-use crate::workflow::WorkflowId;
 
 // =============================================================================
 // ProcessEvent
@@ -198,8 +196,6 @@ pub fn spawn(
     client_id: Option<ClientId>,
     capture_outputs: bool,
     result_tx: Option<oneshot::Sender<Result<String, String>>>,
-    workflow_id: Option<WorkflowId>,
-    token_budget: Option<usize>,
 ) -> Result<ProcessId> {
     let process = Process::new(
         username,
@@ -208,8 +204,6 @@ pub fn spawn(
         client_id,
         capture_outputs,
         result_tx,
-        workflow_id,
-        token_budget,
     );
     let id = process.process_id;
 
@@ -339,8 +333,6 @@ struct Process {
     client_id: Option<ClientId>,
     capture_outputs: bool,
     output_buffer: VecDeque<ProcessEvent>,
-    /// Optional link to the workflow that spawned this process.
-    workflow_id: Option<WorkflowId>,
     /// Shared with the WASM task. Whoever takes it first (the run loop on
     /// normal completion, or an external terminate) delivers the result.
     result_tx: SharedResultTx,
@@ -355,8 +347,6 @@ impl Process {
         client_id: Option<ClientId>,
         capture_outputs: bool,
         result_tx: Option<oneshot::Sender<Result<String, String>>>,
-        workflow_id: Option<WorkflowId>,
-        token_budget: Option<usize>,
     ) -> Self {
         let process_id = Uuid::new_v4();
         let result_tx: SharedResultTx = Arc::new(Mutex::new(result_tx));
@@ -368,7 +358,6 @@ impl Process {
             input.clone(),
             capture_outputs,
             result_tx.clone(),
-            token_budget,
         ));
 
         Process {
@@ -381,18 +370,12 @@ impl Process {
             client_id,
             capture_outputs,
             output_buffer: VecDeque::new(),
-            workflow_id,
             result_tx,
         }
     }
 
     /// Deliver an event to the attached client and/or the parent workflow.
     fn deliver_event(&mut self, event: ProcessEvent) {
-        // Forward to parent workflow (if any)
-        if let Some(wf_id) = self.workflow_id {
-            let _ = crate::workflow::forward_event(wf_id, self.process_id, event.clone());
-        }
-
         // Deliver to attached client
         if let Some(client_id) = self.client_id {
             if server::send_event(client_id, self.process_id, &event).is_err() {
@@ -435,7 +418,6 @@ impl Process {
         input: String,
         capture_outputs: bool,
         result_tx: SharedResultTx,
-        token_budget: Option<usize>,
     ) {
         // Admission control: wait for a permit before instantiating.
         // The permit is held for the entire WASM execution lifetime
@@ -458,21 +440,13 @@ impl Process {
                 username,
                 &program,
                 output,
-                token_budget,
             )
             .await
             .map_err(|e| e.to_string())?;
             instantiate_us = duration_us(instantiate_start.elapsed());
 
-            // KV admission waits here, after the singleton linker has already
-            // prepared the instance and is free to instantiate other queued
-            // processes. Blocking inside the linker would serialize a saturated
-            // second cohort behind the first one and leave the GPU idle.
-            let context_register_start = Instant::now();
-            context::register_process(process_id, token_budget)
-                .await
-                .map_err(|e| e.to_string())?;
-            context_register_us = duration_us(context_register_start.elapsed());
+            // (KV admission via the context actor removed — Phase 5; physical
+            // admission is now the unified arena's concern.)
 
             let run_interface = format!("pie:{}/run", program.name);
 

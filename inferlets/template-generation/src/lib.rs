@@ -6,7 +6,7 @@
 //! output and the renderer.
 
 use inferlet::{
-    Context, Result, Schema, sample::Sampler, model::Model, runtime,
+    Context, Result, Schema, sample::Sampler,
 };
 use minijinja::Environment;
 use serde::Deserialize;
@@ -84,10 +84,7 @@ fn render(data: &Value) -> std::result::Result<String, String> {
 
 #[inferlet::main]
 async fn main(input: Input) -> Result<String> {
-    let models = runtime::models();
-    let model = Model::load(models.first().ok_or("No models available")?)?;
-
-    let mut ctx = Context::new(&model)?;
+    let mut ctx = Context::new()?;
     ctx.system(SYSTEM_PROMPT);
     ctx.user(&format!(
         "Generate product announcement data for: {}.",

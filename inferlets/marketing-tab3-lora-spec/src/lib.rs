@@ -1,22 +1,18 @@
 use inferlet::{
     Context, Result, Speculator,
     adapter::Adapter,
-    model::Model,
-    runtime,
     sample::Sampler,
 };
 use std::collections::HashMap;
 
 #[inferlet::main]
 async fn main(prompt: String) -> Result<String> {
-    let model = Model::load(runtime::models().first().unwrap())?;
-
     let bytes = inferlet::http::fetch("https://example.com/loras/math-tutor.safetensors").await?;
     std::fs::write("/scratch/lora.safetensors", &bytes).map_err(|e| e.to_string())?;
-    let lora = Adapter::create(&model, "math-tutor")?;
+    let lora = Adapter::create("math-tutor")?;
     lora.load("/scratch/lora.safetensors")?;
 
-    let mut ctx = Context::new(&model)?;
+    let mut ctx = Context::new()?;
     ctx.system("Solve the problem step by step.").user(&prompt).cue();
     ctx.flush().await?;
 

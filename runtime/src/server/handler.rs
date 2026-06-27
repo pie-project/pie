@@ -6,13 +6,11 @@
 use bytes::Bytes;
 use pie_client::message::ServerMessage;
 
-use crate::context;
 use crate::inference;
 use crate::messaging;
 use crate::model;
 use crate::process::{self, ProcessId};
 use crate::program::{self, Manifest, ProgramName};
-use crate::workflow::WorkflowId;
 
 use super::Session;
 use super::data_transfer::{ChunkResult, InFlightUpload};
@@ -49,12 +47,22 @@ impl Session {
             pie_client::message::QUERY_MODEL_STATUS => {
                 let mut stats = serde_json::Map::new();
 
-                for (model_idx, model_name) in model::models().iter().enumerate() {
-                    // KV page pool stats
-                    let kv = context::get_stats(model_idx).await;
-                    let (used, total) = kv
-                        .iter()
-                        .fold((0u64, 0u64), |(u, t), &(a, b)| (u + a as u64, t + b as u64));
+                {
+                    let model_name = model::model().name().to_string();
+                    // KV page pool stats summed across the single model's
+                    // drivers' unified arenas (replaces the retired context
+                    // page store).
+                    let (used, total) = {
+                        let (mut u, mut t) = (0u64, 0u64);
+                        let mut d = 0;
+                        while let Some(a) = crate::arena::try_get(0, d) {
+                            let arena = a.lock().unwrap();
+                            u += arena.used(crate::arena::ArenaKind::KvPage) as u64;
+                            t += arena.capacity(crate::arena::ArenaKind::KvPage) as u64;
+                            d += 1;
+                        }
+                        (u, t)
+                    };
                     stats.insert(
                         format!("{}.kv_pages_used", model_name),
                         serde_json::Value::from(used),
@@ -65,7 +73,7 @@ impl Session {
                     );
 
                     // Inference stats (throughput, latency, batch count)
-                    let inf = inference::get_stats(model_idx).await;
+                    let inf = inference::get_stats().await;
                     stats.insert(
                         format!("{}.total_batches", model_name),
                         serde_json::Value::from(inf.total_batches),
@@ -136,10 +144,6 @@ impl Session {
                     stats.insert(
                         format!("{}.fire.execute.response_dispatch.direct_count", model_name),
                         serde_json::Value::from(inf.fire.execute.response_dispatch.direct_count),
-                    );
-                    stats.insert(
-                        format!("{}.fire.execute.response_dispatch.chain_count", model_name),
-                        serde_json::Value::from(inf.fire.execute.response_dispatch.chain_count),
                     );
                     stats.insert(
                         format!("{}.fire.execute.response_dispatch.chunk_count", model_name),
@@ -231,47 +235,6 @@ impl Session {
                             )
                         ),
                     );
-                    // Speculation hit counters — observability for
-                    // `try_hit`/chain submissions/drops.
-                    stats.insert(
-                        format!("{}.bypass_hits", model_name),
-                        serde_json::Value::from(
-                            inference::BYPASS_HIT_COUNT.load(std::sync::atomic::Ordering::Relaxed),
-                        ),
-                    );
-                    stats.insert(
-                        format!("{}.chain_submits", model_name),
-                        serde_json::Value::from(
-                            inference::CHAIN_SUBMIT_COUNT
-                                .load(std::sync::atomic::Ordering::Relaxed),
-                        ),
-                    );
-                    stats.insert(
-                        format!("{}.chain_drops", model_name),
-                        serde_json::Value::from(
-                            inference::CHAIN_DROP_COUNT.load(std::sync::atomic::Ordering::Relaxed),
-                        ),
-                    );
-                    {
-                        let n = inference::speculator::CHAIN_EXT_JOBS_SAMPLED
-                            .load(std::sync::atomic::Ordering::Relaxed);
-                        let wake = inference::speculator::CHAIN_EXT_WAKE_LATENCY_US
-                            .load(std::sync::atomic::Ordering::Relaxed);
-                        let work = inference::speculator::CHAIN_EXT_WORK_LATENCY_US
-                            .load(std::sync::atomic::Ordering::Relaxed);
-                        stats.insert(
-                            format!("{}.chain_ext_avg_wake_us", model_name),
-                            serde_json::Value::from(if n > 0 { wake / n } else { 0 }),
-                        );
-                        stats.insert(
-                            format!("{}.chain_ext_avg_work_us", model_name),
-                            serde_json::Value::from(if n > 0 { work / n } else { 0 }),
-                        );
-                        stats.insert(
-                            format!("{}.chain_ext_jobs_sampled", model_name),
-                            serde_json::Value::from(n),
-                        );
-                    }
                     if let Some(exec) = crate::api::inference::execute_profile_snapshot() {
                         let mean_value = |total_us: u64, denom: u64| -> serde_json::Value {
                             serde_json::Value::from(if denom > 0 { total_us / denom } else { 0 })
@@ -295,10 +258,6 @@ impl Session {
                         stats.insert(
                             format!("{}.execute_profile_prepare_mean_us", model_name),
                             mean_value(exec.prepare_us, exec.calls),
-                        );
-                        stats.insert(
-                            format!("{}.execute_profile_try_hit_mean_us", model_name),
-                            mean_value(exec.try_hit_us, exec.calls),
                         );
                         stats.insert(
                             format!("{}.execute_profile_hit_wait_mean_us", model_name),
@@ -445,7 +404,6 @@ impl Session {
         inferlet: String,
         input: String,
         capture_outputs: bool,
-        token_budget: Option<usize>,
     ) {
         let program_name = match ProgramName::parse(&inferlet) {
             Ok(p) => p,
@@ -475,8 +433,6 @@ impl Session {
             client_id,
             capture_outputs,
             None,
-            None, // no workflow
-            token_budget,
         ) {
             Ok(process_id) => {
                 if capture_outputs {
@@ -491,165 +447,6 @@ impl Session {
             Err(e) => {
                 self.send_response(corr_id, false, e.to_string()).await;
             }
-        }
-    }
-
-    pub(super) async fn handle_launch_processes(
-        &mut self,
-        corr_id: u32,
-        inferlet: String,
-        inputs: Vec<String>,
-        capture_outputs: bool,
-        token_budgets: Option<Vec<Option<usize>>>,
-    ) {
-        if let Some(budgets) = token_budgets.as_ref() {
-            if budgets.len() != inputs.len() {
-                self.send_response(
-                    corr_id,
-                    false,
-                    format!(
-                        "token_budgets length {} does not match inputs length {}",
-                        budgets.len(),
-                        inputs.len()
-                    ),
-                )
-                .await;
-                return;
-            }
-        }
-
-        let program_name = match ProgramName::parse(&inferlet) {
-            Ok(p) => p,
-            Err(e) => {
-                self.send_response(corr_id, false, e.to_string()).await;
-                return;
-            }
-        };
-
-        if !self.installed_programs.contains(&program_name) {
-            if let Err(e) = program::install(&program_name).await {
-                self.send_response(corr_id, false, e.to_string()).await;
-                return;
-            }
-            self.installed_programs.insert(program_name.clone());
-        }
-
-        let client_id = if capture_outputs { Some(self.id) } else { None };
-        let mut process_ids = Vec::with_capacity(inputs.len());
-        for (idx, input) in inputs.into_iter().enumerate() {
-            let token_budget = token_budgets
-                .as_ref()
-                .and_then(|budgets| budgets.get(idx).copied().flatten());
-            match process::spawn(
-                self.username.clone(),
-                program_name.clone(),
-                input,
-                client_id,
-                capture_outputs,
-                None,
-                None,
-                token_budget,
-            ) {
-                Ok(process_id) => {
-                    if capture_outputs {
-                        self.attached_processes.push(process_id);
-                    }
-                    process_ids.push(process_id.to_string());
-                }
-                Err(e) => {
-                    self.send_response(corr_id, false, e.to_string()).await;
-                    return;
-                }
-            }
-        }
-
-        match serde_json::to_string(&process_ids) {
-            Ok(json) => self.send_response(corr_id, true, json).await,
-            Err(e) => self.send_response(corr_id, false, e.to_string()).await,
-        }
-    }
-
-    pub(super) async fn handle_run_processes(
-        &mut self,
-        corr_id: u32,
-        inferlet: String,
-        inputs: Vec<String>,
-        token_budgets: Option<Vec<Option<usize>>>,
-    ) {
-        if let Some(budgets) = token_budgets.as_ref() {
-            if budgets.len() != inputs.len() {
-                self.send_response(
-                    corr_id,
-                    false,
-                    format!(
-                        "token_budgets length {} does not match inputs length {}",
-                        budgets.len(),
-                        inputs.len()
-                    ),
-                )
-                .await;
-                return;
-            }
-        }
-
-        let program_name = match ProgramName::parse(&inferlet) {
-            Ok(p) => p,
-            Err(e) => {
-                self.send_response(corr_id, false, e.to_string()).await;
-                return;
-            }
-        };
-
-        if !self.installed_programs.contains(&program_name) {
-            if let Err(e) = program::install(&program_name).await {
-                self.send_response(corr_id, false, e.to_string()).await;
-                return;
-            }
-            self.installed_programs.insert(program_name.clone());
-        }
-
-        let mut receivers = Vec::with_capacity(inputs.len());
-        for (idx, input) in inputs.into_iter().enumerate() {
-            let token_budget = token_budgets
-                .as_ref()
-                .and_then(|budgets| budgets.get(idx).copied().flatten());
-            let (tx, rx) = tokio::sync::oneshot::channel();
-            match process::spawn(
-                self.username.clone(),
-                program_name.clone(),
-                input,
-                None,
-                false,
-                Some(tx),
-                None,
-                token_budget,
-            ) {
-                Ok(_process_id) => receivers.push(rx),
-                Err(e) => {
-                    self.send_response(corr_id, false, e.to_string()).await;
-                    return;
-                }
-            }
-        }
-
-        let mut outputs = Vec::with_capacity(receivers.len());
-        for rx in receivers {
-            match rx.await {
-                Ok(Ok(output)) => outputs.push(output),
-                Ok(Err(e)) => {
-                    self.send_response(corr_id, false, e).await;
-                    return;
-                }
-                Err(e) => {
-                    self.send_response(corr_id, false, e.to_string()).await;
-                    return;
-                }
-            }
-        }
-
-        match serde_json::to_string(&outputs) {
-            Ok(json) => self.send_response(corr_id, true, json).await,
-            Err(e) => self.send_response(corr_id, false, e.to_string()).await,
         }
     }
 
@@ -843,100 +640,5 @@ impl Session {
             })
             .await;
         }
-    }
-}
-
-// =============================================================================
-// Workflow Handlers
-// =============================================================================
-
-impl Session {
-    pub(super) async fn handle_submit_workflow(&mut self, corr_id: u32, json: String) {
-        match crate::workflow::submit(&self.username, &json, Some(self.id)).await {
-            Ok((workflow_id, result_rx)) => {
-                // Drop the result receiver — clients receive events via attach.
-                // The workflow actor stores the result internally.
-                drop(result_rx);
-                self.attached_workflows.push(workflow_id);
-                self.send_response(corr_id, true, workflow_id.to_string())
-                    .await;
-            }
-            Err(e) => {
-                self.send_response(corr_id, false, e.to_string()).await;
-            }
-        }
-    }
-
-    pub(super) async fn handle_cancel_workflow(&mut self, corr_id: u32, workflow_id: String) {
-        let wf_id = match workflow_id.parse() {
-            Ok(id) => id,
-            Err(_) => {
-                self.send_response(corr_id, false, "Invalid workflow ID".to_string())
-                    .await;
-                return;
-            }
-        };
-        match crate::workflow::cancel(&wf_id) {
-            Ok(()) => {
-                self.send_response(corr_id, true, "Workflow cancelled".to_string())
-                    .await;
-            }
-            Err(e) => {
-                self.send_response(corr_id, false, e.to_string()).await;
-            }
-        }
-    }
-
-    pub(super) async fn handle_attach_workflow(&mut self, corr_id: u32, workflow_id: String) {
-        let wf_id: WorkflowId = match workflow_id.parse() {
-            Ok(id) => id,
-            Err(_) => {
-                self.send_response(corr_id, false, "Invalid workflow ID".to_string())
-                    .await;
-                return;
-            }
-        };
-
-        // Authorization: only the same user can attach
-        match crate::workflow::get_username(&wf_id).await {
-            Ok(owner) if owner != self.username => {
-                self.send_response(corr_id, false, "Permission denied".to_string())
-                    .await;
-                return;
-            }
-            Err(_) => {
-                self.send_response(corr_id, false, "Workflow not found".to_string())
-                    .await;
-                return;
-            }
-            _ => {}
-        }
-
-        match crate::workflow::attach(&wf_id, self.id).await {
-            Ok(()) => {
-                self.attached_workflows.push(wf_id);
-                self.send_response(corr_id, true, "Workflow attached".to_string())
-                    .await;
-            }
-            Err(e) => {
-                self.send_response(corr_id, false, e.to_string()).await;
-            }
-        }
-    }
-
-    pub(super) async fn handle_detach_workflow(&mut self, corr_id: u32, workflow_id: String) {
-        let wf_id: WorkflowId = match workflow_id.parse() {
-            Ok(id) => id,
-            Err(_) => {
-                self.send_response(corr_id, false, "Invalid workflow ID".to_string())
-                    .await;
-                return;
-            }
-        };
-
-        crate::workflow::detach(&wf_id);
-        self.attached_workflows.retain(|id| id != &wf_id);
-        self.send_response(corr_id, true, "Workflow detached".to_string())
-            .await;
     }
 }

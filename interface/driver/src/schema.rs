@@ -96,8 +96,10 @@ pub struct ForwardRequest {
     /// Runtime-managed recurrent-state cache slots, one per request
     /// for linear-attention models. Empty for models without rs_cache.
     pub rs_slot_ids: Vec<u32>,
-    /// Per-request rs_cache flags. Bit 0 means "reset this slot before
-    /// executing the request" (fresh context or replay-from-zero).
+    /// Per-request rs_cache flags. See `RS_FLAG_*`. Bit 0 (`RS_FLAG_RESET`)
+    /// resets the slot before executing (fresh context / replay-from-zero);
+    /// bit 1 (`RS_FLAG_FOLD`) folds buffered recurrent state into the slot's
+    /// folded state after the pass (count of tokens given by `rs_fold_lens`).
     pub rs_slot_flags: Vec<u8>,
 
     /// Per-row BRLE attention masks, flattened across the batch.
@@ -321,6 +323,33 @@ pub struct ForwardRequest {
     /// (`u32::MAX` = skip the lane, the `-1` sentinel). Rebased on batch merge by
     /// the token offset (the only non-global field).
     pub next_input_dest_slots: Vec<u32>,
+
+    // ── Recurrent-state fold (RS_FLAG_FOLD) ─────────────────────────
+    // Appended per the schema evolution rule (append-only). One entry per
+    // request, parallel to `rs_slot_ids`/`rs_slot_flags`: the number of
+    // buffered recurrent-state tokens to fold into the slot's folded state
+    // after the pass. Only meaningful where `RS_FLAG_FOLD` is set in
+    // `rs_slot_flags`; 0 elsewhere. The runtime derives this from the
+    // inferlet's explicit `inference.fold(set, n)` call; the executor lowers
+    // it onto the model's existing fold primitive (e.g. cuda GDN
+    // `commit_len`). Empty for models without rs_cache.
+    pub rs_fold_lens: Vec<u32>,
+
+    // ── Recurrent-state fold-from-buffer (RS_FLAG_FOLD, real-driver path) ──
+    // Appended per the schema evolution rule (append-only). The buffered-slab
+    // physical slot ids a fold pass folds *from*, as a CSR over the batch:
+    // `rs_buffer_slot_indptr[r..r+1]` is request `r`'s half-open range of
+    // buffered-slab ids in `rs_buffer_slot_ids` (one extra leading 0, like
+    // `kv_page_indptr`). For a request with `RS_FLAG_FOLD` set, the executor's
+    // fold-from-buffer kernel reads `rs_fold_lens[r]` tokens across those
+    // buffered slabs and folds them into the request's folded slot
+    // (`rs_slot_ids[r]`). The runtime resolves the buffered suffix's first
+    // `rs_fold_lens[r]` tokens to physical slab ids during fold-txn prepare.
+    // Both empty for non-fold passes / models without rs_cache. (v1 mock folds
+    // in-pass via `commit_len` and ignores these; the real cuda GDN
+    // fold-from-buffered-slabs kernel consumes them.)
+    pub rs_buffer_slot_ids: Vec<u32>,
+    pub rs_buffer_slot_indptr: Vec<u32>,
 }
 
 /// Per-slot sampler kind discriminants. Carried on the wire as the `u8`
@@ -341,6 +370,25 @@ pub const PIE_SAMPLER_RAW_LOGITS: u8 = 7;
 pub const PIE_SAMPLER_LOGPROB: u8 = 8;
 pub const PIE_SAMPLER_LOGPROBS: u8 = 9;
 pub const PIE_SAMPLER_ENTROPY: u8 = 10;
+
+// =============================================================================
+// Recurrent-state slot flags
+// =============================================================================
+
+/// Per-slot recurrent-state flags packed into [`ForwardRequest::rs_slot_flags`]
+/// (one `u8` per request). Bit flags — combine with bitwise OR. Kept as
+/// explicit `pub const`s (like the `PIE_SAMPLER_*` set) so cbindgen emits them
+/// verbatim as C consts for the driver's rs_cache kernels — single source of
+/// truth for the runtime producer and the driver consumer.
+///
+/// `RS_FLAG_RESET` (bit 0): reset the slot's recurrent state before executing
+/// the request (fresh context / replay-from-zero).
+pub const RS_FLAG_RESET: u8 = 1;
+/// `RS_FLAG_FOLD` (bit 1): after the pass, fold buffered recurrent state into
+/// the slot's folded state. The number of buffered tokens to fold is carried
+/// per request in [`ForwardRequest::rs_fold_lens`]. Set by the runtime in
+/// response to an explicit `inference.fold(set, n)` call.
+pub const RS_FLAG_FOLD: u8 = 2;
 
 /// Sampler configuration. As of #14 Phase 1, `Sampler` is **no longer a wire
 /// type** — `ForwardRequest` carries the flattened SoA arrays

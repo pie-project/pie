@@ -2,8 +2,8 @@
 //! runtime [`Flavor`] dispatcher.
 //!
 //! Each driver crate / static lib exports a uniquely-named C entry
-//! pair (`pie_driver_{portable,cuda,dummy}_run` / `_request_stop`).
-//! Portable and cuda are selected by Cargo features; dummy is always
+//! pair (`pie_driver_{cuda,metal,dummy}_run` / `_request_stop`).
+//! Cuda and metal are selected by Cargo features; dummy is always
 //! linked. The [`Flavor`] enum picks which one to invoke at runtime
 //! based on the model's TOML `driver.type`.
 
@@ -12,22 +12,6 @@ use std::os::raw::{c_char, c_int, c_void};
 use crate::config::DriverKind;
 
 pub type ReadyCb = unsafe extern "C" fn(caps_json: *const c_char, ctx: *mut c_void);
-
-#[cfg(feature = "driver-portable")]
-unsafe extern "C" {
-    /// In-process entry: hands the C++ driver a vtable of FFI callbacks
-    /// for receiving requests and posting responses. There is no
-    /// shmem variant — portable is embedded-only.
-    fn pie_driver_portable_run_inproc(
-        argc: c_int,
-        argv: *mut *mut c_char,
-        install_signal_handlers: c_int,
-        ready_cb: ReadyCb,
-        ready_ctx: *mut c_void,
-        vtable: pie::driver::InProcVTable,
-    ) -> c_int;
-    fn pie_driver_portable_request_stop();
-}
 
 #[cfg(feature = "driver-cuda")]
 unsafe extern "C" {
@@ -45,6 +29,22 @@ unsafe extern "C" {
     fn pie_driver_cuda_request_stop();
 }
 
+#[cfg(feature = "driver-metal")]
+unsafe extern "C" {
+    /// In-process entry: hands the C++ driver a vtable of FFI callbacks
+    /// for receiving requests and posting responses. There is no
+    /// shmem variant — metal is embedded-only.
+    fn pie_driver_metal_run_inproc(
+        argc: c_int,
+        argv: *mut *mut c_char,
+        install_signal_handlers: c_int,
+        ready_cb: ReadyCb,
+        ready_ctx: *mut c_void,
+        vtable: pie::driver::InProcVTable,
+    ) -> c_int;
+    fn pie_driver_metal_request_stop();
+}
+
 // The dummy driver is a Rust crate (rlib) in this workspace. We call
 // its `extern "C"` entries directly — no `unsafe extern { ... }`
 // declaration needed, which sidesteps the link-time symbol GC that
@@ -52,13 +52,13 @@ unsafe extern "C" {
 use pie_driver_dummy_lib::{pie_driver_dummy_request_stop, pie_driver_dummy_run};
 
 /// Which driver flavor to dispatch to at runtime. Variants are
-/// gated by Cargo features for portable/cuda; dummy is always present.
+/// gated by Cargo features for cuda/metal; dummy is always present.
 #[derive(Copy, Clone, Eq, PartialEq, Debug)]
 pub enum Flavor {
-    #[cfg(feature = "driver-portable")]
-    Portable,
     #[cfg(feature = "driver-cuda")]
     Cuda,
+    #[cfg(feature = "driver-metal")]
+    Metal,
     Dummy,
 }
 
@@ -67,10 +67,10 @@ impl Flavor {
     /// driver thread's argv\[0\].
     pub fn as_str(self) -> &'static str {
         match self {
-            #[cfg(feature = "driver-portable")]
-            Flavor::Portable => "portable",
             #[cfg(feature = "driver-cuda")]
             Flavor::Cuda => "cuda",
+            #[cfg(feature = "driver-metal")]
+            Flavor::Metal => "metal",
             Flavor::Dummy => "dummy",
         }
     }
@@ -79,10 +79,10 @@ impl Flavor {
     /// own program name for usage messages.
     pub fn argv0(self) -> &'static str {
         match self {
-            #[cfg(feature = "driver-portable")]
-            Flavor::Portable => "pie_driver_portable",
             #[cfg(feature = "driver-cuda")]
             Flavor::Cuda => "pie_driver_cuda",
+            #[cfg(feature = "driver-metal")]
+            Flavor::Metal => "pie_driver_metal",
             Flavor::Dummy => "pie_driver_dummy",
         }
     }
@@ -92,16 +92,6 @@ impl Flavor {
     /// not compiled into this binary.
     pub fn from_kind(kind: DriverKind) -> Result<Self, String> {
         match kind {
-            DriverKind::Portable => {
-                #[cfg(feature = "driver-portable")]
-                {
-                    Ok(Flavor::Portable)
-                }
-                #[cfg(not(feature = "driver-portable"))]
-                {
-                    Err(missing_feature_msg("portable", "driver-portable"))
-                }
-            }
             DriverKind::CudaNative => {
                 #[cfg(feature = "driver-cuda")]
                 {
@@ -112,12 +102,25 @@ impl Flavor {
                     Err(missing_feature_msg("cuda_native", "driver-cuda"))
                 }
             }
+            DriverKind::Metal => {
+                #[cfg(feature = "driver-metal")]
+                {
+                    Ok(Flavor::Metal)
+                }
+                #[cfg(not(feature = "driver-metal"))]
+                {
+                    Err(missing_feature_msg("metal", "driver-metal"))
+                }
+            }
             DriverKind::Dummy => Ok(Flavor::Dummy),
         }
     }
 }
 
-#[cfg(any(not(feature = "driver-portable"), not(feature = "driver-cuda"),))]
+#[cfg(any(
+    not(feature = "driver-cuda"),
+    not(feature = "driver-metal"),
+))]
 fn missing_feature_msg(toml_type: &str, feature: &str) -> String {
     format!(
         "driver type {toml_type:?} is not built into this binary. \
@@ -131,38 +134,41 @@ fn missing_feature_msg(toml_type: &str, feature: &str) -> String {
 /// build-priority order. Used by error messages and `pie doctor`.
 pub fn compiled_summary() -> String {
     let mut out = Vec::new();
-    #[cfg(feature = "driver-portable")]
-    out.push("portable");
     #[cfg(feature = "driver-cuda")]
     out.push("cuda");
+    #[cfg(feature = "driver-metal")]
+    out.push("metal");
     out.push("dummy");
     out.join(", ")
 }
 
 /// Per-flavor compiled-in status, in TOML-discriminator form
-/// (`portable` / `cuda_native` / `dummy`). Used by both `pie driver list`
-/// and `pie doctor` to render the embedded-driver section.
+/// (`cuda_native` / `metal` / `dummy`). Used by both
+/// `pie driver list` and `pie doctor` to render the embedded-driver section.
 pub fn compiled_embedded() -> [(&'static str, bool); 3] {
     [
-        ("portable", cfg!(feature = "driver-portable")),
         ("cuda_native", cfg!(feature = "driver-cuda")),
+        ("metal", cfg!(feature = "driver-metal")),
         ("dummy", true),
     ]
 }
 
 /// Pick a sensible default flavor for commands that don't specify one
 /// (e.g. `pie smoke` without `--flavor`, `pie config init`'s template).
-/// Order: cuda → portable → dummy.
+/// Order: cuda → metal → dummy.
 pub fn default_flavor() -> Option<Flavor> {
     #[cfg(feature = "driver-cuda")]
     {
         return Some(Flavor::Cuda);
     }
-    #[cfg(all(not(feature = "driver-cuda"), feature = "driver-portable"))]
+    #[cfg(all(not(feature = "driver-cuda"), feature = "driver-metal"))]
     {
-        return Some(Flavor::Portable);
+        return Some(Flavor::Metal);
     }
-    #[cfg(all(not(feature = "driver-cuda"), not(feature = "driver-portable")))]
+    #[cfg(all(
+        not(feature = "driver-cuda"),
+        not(feature = "driver-metal")
+    ))]
     {
         return Some(Flavor::Dummy);
     }
@@ -182,10 +188,10 @@ pub unsafe fn run(
     ready_ctx: *mut c_void,
 ) -> c_int {
     match flavor {
-        #[cfg(feature = "driver-portable")]
-        Flavor::Portable => panic!("portable is embedded-only; use run_inproc"),
         #[cfg(feature = "driver-cuda")]
         Flavor::Cuda => panic!("cuda_native is embedded-only; use run_inproc"),
+        #[cfg(feature = "driver-metal")]
+        Flavor::Metal => panic!("metal is embedded-only; use run_inproc"),
         Flavor::Dummy => unsafe {
             pie_driver_dummy_run(argc, argv, install_signal_handlers, ready_cb, ready_ctx)
         },
@@ -193,7 +199,7 @@ pub unsafe fn run(
 }
 
 /// In-process variant of [`run`]. The runtime hands the driver a
-/// `vtable` of FFI callbacks; both `cuda_native` and `portable` support
+/// `vtable` of FFI callbacks; both `cuda_native` and `metal` support
 /// this and use it exclusively (no shmem fallback). `dummy` doesn't
 /// have a C++ driver and isn't accepted here.
 pub unsafe fn run_inproc(
@@ -217,9 +223,9 @@ pub unsafe fn run_inproc(
                 vtable,
             )
         }),
-        #[cfg(feature = "driver-portable")]
-        Flavor::Portable => Ok(unsafe {
-            pie_driver_portable_run_inproc(
+        #[cfg(feature = "driver-metal")]
+        Flavor::Metal => Ok(unsafe {
+            pie_driver_metal_run_inproc(
                 argc,
                 argv,
                 install_signal_handlers,
@@ -238,10 +244,10 @@ pub unsafe fn run_inproc(
 /// they all exit on the next request boundary.
 pub fn request_stop(flavor: Flavor) {
     match flavor {
-        #[cfg(feature = "driver-portable")]
-        Flavor::Portable => unsafe { pie_driver_portable_request_stop() },
         #[cfg(feature = "driver-cuda")]
         Flavor::Cuda => unsafe { pie_driver_cuda_request_stop() },
+        #[cfg(feature = "driver-metal")]
+        Flavor::Metal => unsafe { pie_driver_metal_request_stop() },
         Flavor::Dummy => unsafe { pie_driver_dummy_request_stop() },
     }
 }

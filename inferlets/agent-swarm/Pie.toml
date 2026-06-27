@@ -6,7 +6,6 @@ authors = ["Pie Team"]
 
 [runtime]
 core = "^0.2.0"
-mcp = "^0.2.0"
 
 [parameters]
 role = {type = "string", description = "Agent role: idea_generator, plot_developer, character_creator, or dialogue_writer"}

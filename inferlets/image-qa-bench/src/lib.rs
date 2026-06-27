@@ -17,8 +17,7 @@
 //! `questions` arrays driven in one process (used by `--single-process-batch`).
 
 use inferlet::{
-    Context, FutureStringExt, Result, chat, media::Image, model::Model, pie::core::session,
-    runtime, sample::Sampler,
+    Context, Result, chat, media::Image, pie::core::session, sample::Sampler,
 };
 use serde::{Deserialize, Serialize};
 
@@ -122,19 +121,17 @@ fn b64_decode(s: &str) -> Result<Vec<u8>> {
 
 #[inferlet::main]
 async fn main(input: Input) -> Result<Output> {
-    let models = runtime::models();
-    let model = Model::load(models.first().ok_or("No models available")?)?;
     let stop_tokens: Vec<u32> = if input.ignore_eos {
         Vec::new()
     } else {
-        chat::stop_tokens(&model)
+        chat::stop_tokens()
     };
 
     let batch_len = input.images_b64.len().max(input.questions.len());
     if batch_len > 0 {
         if input.wait_for_start {
             session::send("ready");
-            let _ = session::receive().wait_async().await;
+            let _ = session::receive().await;
         }
         let batch_concurrency = input
             .batch_concurrency
@@ -153,7 +150,7 @@ async fn main(input: Input) -> Result<Output> {
                     .filter(|s| !s.is_empty())
                     .unwrap_or(&input.image_b64);
                 let question = input.questions.get(i).unwrap_or(&input.question);
-                run_one(&model, &input, image_b64, question, &stop_tokens, false)
+                run_one(&input, image_b64, question, &stop_tokens, false)
             });
             for (j, result) in futures::future::join_all(futures).await.into_iter().enumerate() {
                 let r = result?;
@@ -175,7 +172,6 @@ async fn main(input: Input) -> Result<Output> {
     }
 
     let r = run_one(
-        &model,
         &input,
         &input.image_b64,
         &input.question,
@@ -199,7 +195,6 @@ struct RunResult {
 }
 
 async fn run_one(
-    model: &Model,
     input: &Input,
     image_b64: &str,
     question: &str,
@@ -212,12 +207,12 @@ async fn run_one(
     let bytes = b64_decode(image_b64)?;
 
     // Host-side: decode + resize + patchify per the bound model (timed).
-    let image = Image::from_bytes(model, &bytes).map_err(|e| e.to_string())?;
+    let image = Image::from_bytes(&bytes).map_err(|e| e.to_string())?;
 
     // Build the same prompt shape as `image-qa`: system → "Here is an image:" →
     // <image span> → question → cue. `append_image` runs the vision encoder and
     // commits the soft-token KV (timed).
-    let mut ctx = Context::new(model)?;
+    let mut ctx = Context::new()?;
     ctx.system(&input.system).user("Here is an image:");
     ctx.append_image(&image).await?;
     ctx.user(question).cue();
@@ -229,7 +224,7 @@ async fn run_one(
 
     if honor_wait_for_start && input.wait_for_start {
         session::send("ready");
-        let _ = session::receive().wait_async().await;
+        let _ = session::receive().await;
     }
 
     let sampler = if input.temperature <= 0.0 {
@@ -249,7 +244,7 @@ async fn run_one(
     }
 
     let text = if input.return_text {
-        model.tokenizer().decode(&tokens).unwrap_or_default()
+        inferlet::model::decode(&tokens).unwrap_or_default()
     } else {
         String::new()
     };

@@ -30,7 +30,7 @@ use std::io::{self, Write};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use inferlet::{Context, Result, Speculator, chat, model::Model, runtime, sample::Sampler, wstd};
+use inferlet::{Context, Result, Speculator, chat, sample::Sampler};
 use serde::Deserialize;
 
 #[derive(Deserialize)]
@@ -120,23 +120,19 @@ const MAGENTA: &str = "\x1b[35m";
 async fn main(input: Input) -> Result<String> {
     let mode = input.mode.to_lowercase();
 
-    let model_name = runtime::models()
-        .first()
-        .cloned()
-        .ok_or("No models available")?;
-    let model = Model::load(&model_name)?;
+    let model_name = inferlet::model::name();
 
     match mode.as_str() {
         "baseline" | "plain" => {
-            run_baseline(&model, &model_name, &input).await?;
+            run_baseline(&model_name, &input).await?;
         }
         "speculated" | "smart" => {
-            run_speculated(&model, &model_name, &input).await?;
+            run_speculated(&model_name, &input).await?;
         }
         "both" | "" => {
-            let p = run_baseline(&model, &model_name, &input).await?;
+            let p = run_baseline(&model_name, &input).await?;
             println!();
-            let s = run_speculated(&model, &model_name, &input).await?;
+            let s = run_speculated(&model_name, &input).await?;
             println!();
             comparison(&p, &s);
         }
@@ -160,7 +156,7 @@ struct ModeResult {
 }
 
 // ── BASELINE: vanilla one-token-per-step decode ───────────────────────────
-async fn run_baseline(model: &Model, model_name: &str, input: &Input) -> Result<ModeResult> {
+async fn run_baseline(model_name: &str, input: &Input) -> Result<ModeResult> {
     print_header(
         "BASELINE",
         YELLOW,
@@ -168,7 +164,7 @@ async fn run_baseline(model: &Model, model_name: &str, input: &Input) -> Result<
         model_name,
     );
 
-    let mut ctx = Context::new(model)?;
+    let mut ctx = Context::new()?;
     ctx.system(&input.system);
     ctx.user(&input.task);
     ctx.cue();
@@ -180,8 +176,8 @@ async fn run_baseline(model: &Model, model_name: &str, input: &Input) -> Result<
     let mut g = ctx
         .generate(Sampler::Argmax)
         .max_tokens(input.max_tokens)
-        .stop(&chat::stop_tokens(model));
-    let mut decoder = chat::Decoder::new(model);
+        .stop(&chat::stop_tokens());
+    let mut decoder = chat::Decoder::new();
     let mut stripper = ThinkStripper::new();
     let mut tokens = 0usize;
 
@@ -199,7 +195,7 @@ async fn run_baseline(model: &Model, model_name: &str, input: &Input) -> Result<
                     print!("{}", rendered);
                     let _ = io::stdout().flush();
                     if input.delay > 0 {
-                        wstd::task::sleep(wstd::time::Duration::from_millis(input.delay)).await;
+                        inferlet::sleep(std::time::Duration::from_millis(input.delay)).await;
                     }
                 }
             }
@@ -220,7 +216,7 @@ async fn run_baseline(model: &Model, model_name: &str, input: &Input) -> Result<
 }
 
 // ── SPECULATED: prompt-lookup speculator via Generator::speculator ────────
-async fn run_speculated(model: &Model, model_name: &str, input: &Input) -> Result<ModeResult> {
+async fn run_speculated(model_name: &str, input: &Input) -> Result<ModeResult> {
     print_header(
         "SPECULATED",
         GREEN,
@@ -233,7 +229,7 @@ async fn run_speculated(model: &Model, model_name: &str, input: &Input) -> Resul
     );
     println!();
 
-    let mut ctx = Context::new(model)?;
+    let mut ctx = Context::new()?;
     ctx.system(&input.system);
     ctx.user(&input.task);
     ctx.cue();
@@ -247,20 +243,19 @@ async fn run_speculated(model: &Model, model_name: &str, input: &Input) -> Resul
     // The split-pass pattern matches inferlets/cacheback-decoding.
     ctx.flush().await?;
 
-    let tokenizer = model.tokenizer();
     let prompt_str = format!("{}\n{}", input.system, input.task);
     // Pool seeded from the user task tokenized stand-alone. Chat
     // template alignment isn't critical: accepted tokens grow the pool
     // as generation progresses, so n-gram suffix matches still find
     // prompt-repetition hits across both halves.
-    let prompt_tokens = tokenizer.encode(&prompt_str);
-    let stop_tokens = chat::stop_tokens(model);
+    let prompt_tokens = inferlet::model::encode(&prompt_str);
+    let stop_tokens = chat::stop_tokens();
 
     // Bootstrap: re-feed the last cue token at the next free slot and
     // sample the model's first response token. The cue is already in
     // KV from flush(); duplicating its last token kicks the decoder
     // out of prefill into a normal sampling step.
-    let cue = chat::cue(model);
+    let cue = chat::cue();
     let trigger = *cue.last().ok_or("empty cue")?;
     let first_token = {
         let mut pass = ctx.forward();
@@ -290,7 +285,7 @@ async fn run_speculated(model: &Model, model_name: &str, input: &Input) -> Resul
         Arc::clone(&stats),
     );
 
-    let mut decoder = chat::Decoder::new(model);
+    let mut decoder = chat::Decoder::new();
     let mut stripper = ThinkStripper::new();
 
     let start = Instant::now();
@@ -308,7 +303,7 @@ async fn run_speculated(model: &Model, model_name: &str, input: &Input) -> Resul
             print!("{}", rendered);
             let _ = io::stdout().flush();
             if input.delay > 0 {
-                wstd::task::sleep(wstd::time::Duration::from_millis(input.delay)).await;
+                inferlet::sleep(std::time::Duration::from_millis(input.delay)).await;
             }
         }
     }
@@ -348,7 +343,7 @@ async fn run_speculated(model: &Model, model_name: &str, input: &Input) -> Resul
                         print!("{}", RESET);
                         let _ = io::stdout().flush();
                         if input.delay > 0 {
-                            wstd::task::sleep(wstd::time::Duration::from_millis(input.delay)).await;
+                            inferlet::sleep(std::time::Duration::from_millis(input.delay)).await;
                         }
                     }
                 }

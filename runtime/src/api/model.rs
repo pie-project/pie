@@ -1,109 +1,85 @@
-//! pie:core/model - Model and Tokenizer resources
+//! pie:core/model - Model and tokenizer global functions.
+//!
+//! The engine serves exactly one model, so these are free functions over the
+//! single global [`crate::model::Model`] rather than resource methods.
 
 use crate::api::pie;
 use crate::instance::InstanceState;
 use crate::model;
 use anyhow::Result;
-use std::sync::Arc;
-use wasmtime::component::Resource;
-use wasmtime_wasi::WasiView;
 
-/// Model resource - represents a reference to a registered model.
-#[derive(Debug, Clone)]
-pub struct Model {
-    /// The model ID (for routing to the correct backend)
-    pub model_id: usize,
-    /// Cached model handle
-    pub model: Arc<model::Model>,
-}
-
-/// Tokenizer resource - for tokenization operations.
-#[derive(Debug, Clone)]
-pub struct Tokenizer {
-    /// The model handle (contains tokenizer + stop tokens)
-    pub model: Arc<model::Model>,
-}
-
-impl pie::core::model::Host for InstanceState {}
-
-impl pie::core::model::HostModel for InstanceState {
-    async fn load(&mut self, name: String) -> Result<Result<Resource<Model>, String>> {
-        if let Some(model_id) = model::get_model_id(&name) {
-            if let Some(m) = model::get_model(model_id) {
-                let model = Model {
-                    model_id,
-                    model: m.clone(),
-                };
-                return Ok(Ok(self.ctx().table.push(model)?));
-            }
-        }
-        Ok(Err(format!("Model '{}' not found", name)))
+impl pie::core::model::Host for InstanceState {
+    async fn name(&mut self) -> Result<String> {
+        Ok(model::model().name().to_string())
     }
 
-    async fn tokenizer(&mut self, this: Resource<Model>) -> Result<Resource<Tokenizer>> {
-        let model = self.ctx().table.get(&this)?;
-        let tokenizer = Tokenizer {
-            model: model.model.clone(),
-        };
-        Ok(self.ctx().table.push(tokenizer)?)
+    async fn architecture(&mut self) -> Result<String> {
+        Ok(model::model().arch_name().to_string())
     }
 
-    async fn default_system_speculation(&mut self, this: Resource<Model>) -> Result<bool> {
-        let model = self.ctx().table.get(&this)?;
+    async fn default_system_speculation(&mut self) -> Result<bool> {
         // The effective "speculate by default?" decision the SDK reflects: the
         // model must support a system drafter AND the operator must have opted
         // in (`enable_system_speculation`, default off). The runtime owns this
         // decision; the SDK only requests system drafts when both hold. (Manual
         // drafts are a separate path, gated in api/inference.rs.)
-        Ok(model.model.system_speculation_supported() && model.model.enable_system_speculation())
+        let m = model::model();
+        Ok(m.system_speculation_supported() && m.enable_system_speculation())
     }
 
-    async fn output_vocab_size(&mut self, this: Resource<Model>) -> Result<u32> {
-        let model = self.ctx().table.get(&this)?;
-        Ok(model.model.vocab_size())
+    /// LM-head output dimension = `hf_config.vocab_size` (e.g. 151936 for
+    /// qwen3), NOT the tokenizer vocab — the vocab the recognizer / program
+    /// lowering targets. Sourced from the model config, not hardcoded.
+    async fn output_vocab_size(&mut self) -> Result<u32> {
+        Ok(model::model().vocab_size())
     }
 
-    async fn drop(&mut self, this: Resource<Model>) -> Result<()> {
-        self.ctx().table.delete(this)?;
-        Ok(())
-    }
-}
+    // ── Working-set / arena capabilities (global over the bound model) ──────
+    //
+    // Real values come from the driver handshake `DriverCapabilities`
+    // (`rs_cache_slot_bytes` etc.), carried on the global `model::Model` via
+    // `RsCaps` (populated at registration alongside the arena `ArenaConfig`).
 
-impl pie::core::model::HostTokenizer for InstanceState {
-    async fn encode(&mut self, this: Resource<Tokenizer>, text: String) -> Result<Vec<u32>> {
-        let tokenizer = self.ctx().table.get(&this)?;
-        Ok(tokenizer.model.tokenize(&text))
-    }
-
-    async fn decode(
-        &mut self,
-        this: Resource<Tokenizer>,
-        tokens: Vec<u32>,
-    ) -> Result<Result<String, String>> {
-        let tokenizer = self.ctx().table.get(&this)?;
-        Ok(Ok(tokenizer.model.detokenize(&tokens)))
+    /// Bytes of one folded recurrent-state object (0 if the model has no RS).
+    async fn rs_state_size(&mut self) -> Result<u64> {
+        Ok(model::model().rs_caps().state_size)
     }
 
-    async fn vocabs(&mut self, this: Resource<Tokenizer>) -> Result<(Vec<u32>, Vec<Vec<u8>>)> {
-        let tokenizer = self.ctx().table.get(&this)?;
-        Ok(tokenizer.model.get_vocabs())
+    /// Tokens per buffered RS page (0 if the model has no RS).
+    async fn rs_buffer_page_size(&mut self) -> Result<u32> {
+        Ok(model::model().rs_caps().buffer_page_size)
     }
 
-    async fn split_regex(&mut self, this: Resource<Tokenizer>) -> Result<String> {
-        let tokenizer = self.ctx().table.get(&this)?;
-        Ok(tokenizer.model.get_split_regex())
+    /// Fold granularity in tokens. 1 = unconstrained (token-causal: Qwen3.5 GDN,
+    /// Nemotron-H Mamba2). `forward-pass.fold-buffered(n)` requires `n` to be a
+    /// positive multiple of this.
+    async fn rs_fold_granularity(&mut self) -> Result<u32> {
+        Ok(model::model().rs_caps().fold_granularity)
     }
 
-    async fn special_tokens(
-        &mut self,
-        this: Resource<Tokenizer>,
-    ) -> Result<(Vec<u32>, Vec<Vec<u8>>)> {
-        let tokenizer = self.ctx().table.get(&this)?;
-        Ok(tokenizer.model.get_special_tokens())
+    /// Arena accounting block size. v1: one KV page == one arena block, so this
+    /// is the bound model's KV page size (tokens).
+    async fn arena_block_size(&mut self) -> Result<u64> {
+        Ok(crate::page_size::tokens_per_page(0) as u64)
     }
 
-    async fn drop(&mut self, this: Resource<Tokenizer>) -> Result<()> {
-        self.ctx().table.delete(this)?;
-        Ok(())
+    async fn encode(&mut self, text: String) -> Result<Vec<u32>> {
+        Ok(model::model().tokenize(&text))
+    }
+
+    async fn decode(&mut self, tokens: Vec<u32>) -> Result<Result<String, String>> {
+        Ok(Ok(model::model().detokenize(&tokens)))
+    }
+
+    async fn vocabs(&mut self) -> Result<(Vec<u32>, Vec<Vec<u8>>)> {
+        Ok(model::model().get_vocabs())
+    }
+
+    async fn split_regex(&mut self) -> Result<String> {
+        Ok(model::model().get_split_regex())
+    }
+
+    async fn special_tokens(&mut self) -> Result<(Vec<u32>, Vec<Vec<u8>>)> {
+        Ok(model::model().get_special_tokens())
     }
 }

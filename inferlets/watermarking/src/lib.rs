@@ -8,8 +8,6 @@
 
 use inferlet::{
     Context, Result,
-    model::Model,
-    runtime,
     sample::Distribution,
 };
 use serde::Deserialize;
@@ -124,12 +122,9 @@ fn weighted_sample(probs: &[f32], seed: u64) -> usize {
 #[inferlet::main]
 async fn main(input: Input) -> Result<String> {
     let start = Instant::now();
-    let models = runtime::models();
-    let model = Model::load(models.first().ok_or("No models available")?)?;
-    let tokenizer = model.tokenizer();
-    let stop_tokens = inferlet::chat::stop_tokens(&model);
+    let stop_tokens = inferlet::chat::stop_tokens();
 
-    let mut ctx = Context::new(&model)?;
+    let mut ctx = Context::new()?;
     let mut watermark = WatermarkState::new(0.5, 2.0);
     let mut generated_tokens = Vec::new();
 
@@ -139,11 +134,10 @@ async fn main(input: Input) -> Result<String> {
     // token at a time.
     let mut pending: Vec<u32> = Vec::new();
     pending.extend(inferlet::chat::system(
-        &model,
         "You are a helpful, respectful and honest assistant.",
     ));
-    pending.extend(inferlet::chat::user(&model, &input.prompt));
-    pending.extend(inferlet::chat::cue(&model));
+    pending.extend(inferlet::chat::user(&input.prompt));
+    pending.extend(inferlet::chat::cue());
 
     for _ in 0..input.max_tokens {
         let mut pass = ctx.forward();
@@ -168,7 +162,7 @@ async fn main(input: Input) -> Result<String> {
         pending = vec![chosen];
     }
 
-    let text = tokenizer.decode(&generated_tokens)?;
+    let text = inferlet::model::decode(&generated_tokens)?;
     println!("Output: {:?} (total elapsed: {:?})", text, start.elapsed());
     if !generated_tokens.is_empty() {
         println!(

@@ -7,16 +7,14 @@
 //! 4090 executor-integration verify to prove temp fires route to the baked IR
 //! `standard_sampler_program(Temperature, V)` and produce valid tokens.
 
-use inferlet::{Context, model::Model, runtime, sample::Sampler, Result};
+use inferlet::{Context, model, sample::Sampler, Result};
 
 #[inferlet::main]
 async fn main(_input: String) -> Result<String> {
-    let models = runtime::models();
-    let model = Model::load(&models[0])?;
-    let tokenizer = model.tokenizer();
-
-    let mut context = Context::new(&model)?;
-    let prompt_tokens = tokenizer.encode("hello world");
+    // P3 single-model: the engine serves exactly one model — no handle to
+    // load; tokenizer is the global `model::*` API.
+    let mut context = Context::new()?;
+    let prompt_tokens = model::encode("hello world");
     eprintln!("[TEMPGEN] encoded prompt: {} tokens", prompt_tokens.len());
     context.append(&prompt_tokens);
 
@@ -35,7 +33,7 @@ async fn main(_input: String) -> Result<String> {
         generated.extend(out.tokens.iter().copied());
     }
 
-    let text = tokenizer.decode(&generated);
+    let text = model::decode(&generated);
     eprintln!("[TEMPGEN] generated {} tokens: {:?}", generated.len(), text);
     Ok(format!("{{\"tokens\": {generated:?}, \"text\": {text:?}}}"))
 }

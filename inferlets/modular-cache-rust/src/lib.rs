@@ -18,7 +18,7 @@
 //!   * `use_cache=false`                    -> never open a saved snapshot
 //!   * `save_cache=false`                   -> never save new snapshots
 
-use inferlet::{Context, Result, model::Model, runtime, sample::Sampler};
+use inferlet::{Context, Result, sample::Sampler};
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 
@@ -78,8 +78,6 @@ fn default_role() -> String { "user".to_string() }
 
 #[inferlet::main]
 async fn main(input: Input) -> Result<String> {
-    let model = Model::load(runtime::models().first().ok_or("No models available")?)?;
-
     // If the caller did not provide a custom module graph, build a useful default.
     let modules = if input.modules.is_empty() {
         default_modules(&input.prompt)
@@ -100,7 +98,7 @@ async fn main(input: Input) -> Result<String> {
     // stays immutable), so the context it hands back is ours to append to.
     let mut resume_index = 0usize;
     let mut ctx = if input.use_cache {
-        match open_longest_prefix(&model, &ordered) {
+        match open_longest_prefix(&ordered).await {
             Some((cached, len)) => {
                 println!("cache_hit_modules={}", len);
                 resume_index = len;
@@ -108,12 +106,12 @@ async fn main(input: Input) -> Result<String> {
             }
             None => {
                 println!("cache_miss");
-                Context::new(&model)?
+                Context::new()?
             }
         }
     } else {
         println!("cache_miss (use_cache=false)");
-        Context::new(&model)?
+        Context::new()?
     };
 
     // Append only the modules that were not already cached.
@@ -233,11 +231,11 @@ fn prefix_key(modules: &[Module]) -> String {
 
 /// Open the longest saved prefix snapshot, returning the forked context and
 /// the number of modules it covers. Returns `None` if nothing is cached.
-fn open_longest_prefix(model: &Model, modules: &[Module]) -> Option<(Context, usize)> {
+async fn open_longest_prefix(modules: &[Module]) -> Option<(Context, usize)> {
     // Longest first; open() is Err when that prefix isn't cached, so fall through.
     for len in (1..=modules.len()).rev() {
         let name = prefix_key(&modules[..len]);
-        if let Ok(ctx) = Context::open(model, &name) {
+        if let Ok(ctx) = Context::open(&name).await {
             return Some((ctx, len));
         }
     }

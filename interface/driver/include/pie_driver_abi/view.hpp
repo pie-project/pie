@@ -133,6 +133,11 @@ struct PieForwardRequestView {
     PieSlice<std::uint32_t> qo_indptr;
     PieSlice<std::uint32_t> rs_slot_ids;
     PieSlice<std::uint8_t>  rs_slot_flags;
+    // Recurrent-state fold (RS_FLAG_FOLD): per-request fold token counts +
+    // the page-major buffered-slab ids (CSR) the fold-replay gathers from.
+    PieSlice<std::uint32_t> rs_fold_lens;
+    PieSlice<std::uint32_t> rs_buffer_slot_ids;
+    PieSlice<std::uint32_t> rs_buffer_slot_indptr;
 
     // Attention / logit masks
     PieSlice<std::uint32_t> flattened_masks;
@@ -385,6 +390,9 @@ inline void fill_forward_view(const PieForwardRequestDesc& f,
     out.qo_indptr         = slice_from(f.qo_indptr_ptr, f.qo_indptr_len);
     out.rs_slot_ids       = slice_from(f.rs_slot_ids_ptr, f.rs_slot_ids_len);
     out.rs_slot_flags     = slice_from(f.rs_slot_flags_ptr, f.rs_slot_flags_len);
+    out.rs_fold_lens          = slice_from(f.rs_fold_lens_ptr, f.rs_fold_lens_len);
+    out.rs_buffer_slot_ids    = slice_from(f.rs_buffer_slot_ids_ptr, f.rs_buffer_slot_ids_len);
+    out.rs_buffer_slot_indptr = slice_from(f.rs_buffer_slot_indptr_ptr, f.rs_buffer_slot_indptr_len);
 
     // BRLE masks come over the wire as Vec<Brle>. The driver code path
     // wants a flat run-length buffer plus per-ROW byte offsets. Walk

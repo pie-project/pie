@@ -11,7 +11,7 @@
 //! [`pie_driver_abi::Frame`] carries at its top level) to pick a channel.
 //!
 //! [`DriverChannel`] has two implementations:
-//!   - [`InProcChannel`] — embedded drivers (cuda + portable + dummy
+//!   - [`InProcChannel`] — embedded drivers (cuda + metal + dummy
 //!     linked into `pie-worker`). Heap-backed queue + condvar wakeup;
 //!     the FFI hands the C++ driver a typed view of the request data.
 //!   - [`InProcPollingChannel`] — low-latency embedded-driver channel

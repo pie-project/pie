@@ -65,27 +65,6 @@ pub enum ClientMessage {
         inferlet: String,
         input: String,
         capture_outputs: bool,
-        #[serde(default)]
-        token_budget: Option<usize>,
-    },
-
-    #[serde(rename = "launch_processes")]
-    LaunchProcesses {
-        corr_id: u32,
-        inferlet: String,
-        inputs: Vec<String>,
-        capture_outputs: bool,
-        #[serde(default)]
-        token_budgets: Option<Vec<Option<usize>>>,
-    },
-
-    #[serde(rename = "run_processes")]
-    RunProcesses {
-        corr_id: u32,
-        inferlet: String,
-        inputs: Vec<String>,
-        #[serde(default)]
-        token_budgets: Option<Vec<Option<usize>>>,
     },
 
     #[serde(rename = "attach_process")]
@@ -112,38 +91,6 @@ pub enum ClientMessage {
 
     #[serde(rename = "ping")]
     Ping { corr_id: u32 },
-
-    #[serde(rename = "register_mcp_server")]
-    RegisterMcpServer {
-        corr_id: u32,
-        name: String,
-        transport: String,
-        #[serde(default)]
-        command: Option<String>,
-        #[serde(default)]
-        args: Option<Vec<String>>,
-        #[serde(default)]
-        url: Option<String>,
-    },
-
-    #[serde(rename = "mcp_response")]
-    McpResponse {
-        corr_id: u32,
-        ok: bool,
-        result: String,
-    },
-
-    #[serde(rename = "submit_workflow")]
-    SubmitWorkflow { corr_id: u32, json: String },
-
-    #[serde(rename = "cancel_workflow")]
-    CancelWorkflow { corr_id: u32, workflow_id: String },
-
-    #[serde(rename = "attach_workflow")]
-    AttachWorkflow { corr_id: u32, workflow_id: String },
-
-    #[serde(rename = "detach_workflow")]
-    DetachWorkflow { corr_id: u32, workflow_id: String },
 }
 
 /// Messages from server -> client
@@ -175,14 +122,5 @@ pub enum ServerMessage {
         total_chunks: usize,
         #[serde(with = "serde_bytes")]
         chunk_data: Vec<u8>,
-    },
-
-    #[serde(rename = "mcp_request")]
-    McpRequest {
-        corr_id: u32,
-        process_id: String,
-        server_name: String,
-        method: String,
-        params: String,
     },
 }

@@ -3,6 +3,9 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <cmath>
 #include <fstream>
 #include <iostream>
 #include <string>
@@ -332,6 +335,202 @@ int run_parity(const Config& cfg,
 
             cudaFree(d_qo); cudaFree(d_pi); cudaFree(d_pp); cudaFree(d_lpl);
         };
+
+        // ── Ph7 RS fold-from-buffer COMPUTE parity (PIE_FOLD_PARITY_N=<n>) ────
+        // Validates pieces 2+3's forward-body: R_fold (rs-output write n tokens
+        // to the buffered pool, write_state=false → fold-replay gather from the
+        // pool, write_state=true) must bit-match R_ref (a normal n-token forward),
+        // both from a zeroed slot 0. Calls qwen3_5_forward_paged directly (bypasses
+        // the executor wire), so it isolates the gather/scatter/replay math; the
+        // executor dispatch + advance_fold are validated by the inferlet e2e.
+        if (is_qwen3_5) {
+            const char* fp_env = std::getenv("PIE_FOLD_PARITY_N");
+            const int fold_n = fp_env ? std::atoi(fp_env) : 0;
+            if (fold_n > 0) {
+                const auto& cfg_q = engine.hf_config();
+                const int v_heads2 = cfg_q.linear_num_value_heads;
+                const int conv_dim2 =
+                    2 * (cfg_q.linear_num_key_heads * cfg_q.linear_key_head_dim) +
+                    (cfg_q.linear_num_value_heads * cfg_q.linear_value_head_dim);
+                const int stash_w2 = conv_dim2 + 2 * v_heads2;
+                const int page2 = 32;
+                const int nslabs = (fold_n + page2 - 1) / page2;
+                q35_state_cache.configure_rs_buffer_pool(page2, stash_w2, nslabs + 1);
+
+                std::vector<std::uint32_t> buf_ids(nslabs);
+                for (int i = 0; i < nslabs; ++i) buf_ids[i] = (std::uint32_t)i;
+                std::vector<std::uint32_t> buf_indptr = {0u, (std::uint32_t)nslabs};
+                const std::int32_t commit_len_h = fold_n;
+                std::int32_t* d_commit = nullptr;
+                CUDA_CHECK(cudaMalloc(&d_commit, sizeof(std::int32_t)));
+                CUDA_CHECK(cudaMemcpy(d_commit, &commit_len_h, sizeof(std::int32_t),
+                                      cudaMemcpyHostToDevice));
+                std::int32_t slot0 = 0;
+                std::int32_t* d_slot0 = nullptr;
+                CUDA_CHECK(cudaMalloc(&d_slot0, sizeof(std::int32_t)));
+                CUDA_CHECK(cudaMemcpy(d_slot0, &slot0, sizeof(std::int32_t),
+                                      cudaMemcpyHostToDevice));
+
+                const std::size_t per_layer_bytes =
+                    q35_state_cache.recurrent_slot_stride_bytes();
+                const int n_layers_total = q35_state_cache.num_layers();
+                // recurrent_state_raw indexes by the FULL transformer-layer index
+                // (it maps to the compact linear slot internally via
+                // linear_layer_index_), so pass L, not a compact counter.
+                auto snap = [&]() {
+                    std::vector<std::uint8_t> h;
+                    for (int L = 0; L < n_layers_total; ++L) {
+                        if (!q35_state_cache.is_linear(L)) continue;
+                        std::vector<std::uint8_t> buf(per_layer_bytes);
+                        CUDA_CHECK(cudaMemcpy(buf.data(),
+                            q35_state_cache.recurrent_state_raw(L, 0),
+                            per_layer_bytes, cudaMemcpyDeviceToHost));
+                        h.insert(h.end(), buf.begin(), buf.end());
+                    }
+                    return h;
+                };
+
+                auto fold_fwd = [&](bool fresh, bool do_write, bool do_fold) {
+                    model::Qwen3_5ForwardCfg q35_fwd{};
+                    q35_fwd.force_prefill_path = true;
+                    q35_fwd.tp_size = cfg.distributed.tp_size;
+                    q35_fwd.tp_comm = tp_comm;
+                    const int npg = (fold_n + page_size - 1) / page_size;
+                    std::vector<std::uint32_t> h_qo = {0u, (std::uint32_t)fold_n};
+                    std::vector<std::uint32_t> h_pp = {0u, (std::uint32_t)npg};
+                    std::vector<std::uint32_t> h_pi(npg);
+                    for (int i = 0; i < npg; ++i) h_pi[i] = (std::uint32_t)i;
+                    std::vector<std::uint32_t> h_lpl = {
+                        (std::uint32_t)(((fold_n - 1) % page_size) + 1)};
+                    std::uint32_t *d_qo, *d_pi, *d_pp, *d_lpl;
+                    CUDA_CHECK(cudaMalloc(&d_qo, 4 * h_qo.size()));
+                    CUDA_CHECK(cudaMalloc(&d_pi, 4 * h_pi.size()));
+                    CUDA_CHECK(cudaMalloc(&d_pp, 4 * h_pp.size()));
+                    CUDA_CHECK(cudaMalloc(&d_lpl, 4 * h_lpl.size()));
+                    CUDA_CHECK(cudaMemcpy(d_qo, h_qo.data(), 4 * h_qo.size(), cudaMemcpyHostToDevice));
+                    CUDA_CHECK(cudaMemcpy(d_pi, h_pi.data(), 4 * h_pi.size(), cudaMemcpyHostToDevice));
+                    CUDA_CHECK(cudaMemcpy(d_pp, h_pp.data(), 4 * h_pp.size(), cudaMemcpyHostToDevice));
+                    CUDA_CHECK(cudaMemcpy(d_lpl, h_lpl.data(), 4 * h_lpl.size(), cudaMemcpyHostToDevice));
+                    model::Qwen3_5PlanState q35_plan;
+                    model::prepare_qwen3_5_decode_plan(
+                        q35_plan, parity_attn_ws, cache, engine.hf_config(), q35_fwd,
+                        h_qo.data(), h_pp.data(), h_lpl.data(), fold_n, 1,
+                        /*is_decode=*/false);
+                    const std::uint8_t fr = fresh ? 1u : 0u;
+                    model::qwen3_5_forward_paged(
+                        weights_qwen3_5, engine.hf_config(), q35_fwd, q35_plan,
+                        ws, q35_la_ws, cache, q35_state_cache, parity_attn_ws, cublas,
+                        d_tokens, d_positions, d_qo, d_pi, d_pp, d_lpl,
+                        h_qo.data(), h_pp.data(), fold_n, 1, /*is_pure_decode=*/false,
+                        /*mask_d=*/nullptr, /*mask_indptr_d=*/nullptr,
+                        &slot0, &fr, d_slot0, /*logit_row=*/nullptr, /*num_logit=*/0,
+                        do_fold ? d_commit : nullptr,
+                        buf_ids.data(), buf_indptr.data(), do_write, do_fold);
+                    cudaFree(d_qo); cudaFree(d_pi); cudaFree(d_pp); cudaFree(d_lpl);
+                };
+
+                fold_fwd(/*fresh=*/true,  /*write=*/false, /*fold=*/false);
+                CUDA_CHECK(cudaDeviceSynchronize());
+                const auto R_ref = snap();
+                fold_fwd(/*fresh=*/true,  /*write=*/true,  /*fold=*/false);
+                CUDA_CHECK(cudaDeviceSynchronize());
+                const auto R_write = snap();
+                fold_fwd(/*fresh=*/false, /*write=*/false, /*fold=*/true);
+                CUDA_CHECK(cudaDeviceSynchronize());
+                const auto R_fold = snap();
+
+                std::size_t diff = 0, nz_write = 0;
+                for (std::size_t i = 0; i < R_ref.size(); ++i)
+                    if (R_ref[i] != R_fold[i]) ++diff;
+                for (std::size_t i = 0; i < R_write.size(); ++i)
+                    if (R_write[i] != 0) ++nz_write;
+                // Per-layer diff localization (warm debug): which linear layers
+                // diverge + where the first byte mismatch lands within a layer.
+                {
+                    const std::size_t lb = per_layer_bytes;
+                    int li2 = 0;
+                    for (std::size_t off = 0; off + lb <= R_ref.size();
+                         off += lb, ++li2) {
+                        std::size_t ld = 0, first = lb;
+                        for (std::size_t i = 0; i < lb; ++i)
+                            if (R_ref[off + i] != R_fold[off + i]) {
+                                if (first == lb) first = i;
+                                ++ld;
+                            }
+                        std::cerr << "[fold-parity]   layer[" << li2 << "] diff="
+                                  << ld << "/" << lb << " first_byte="
+                                  << (ld ? static_cast<long>(first) : -1L) << "\n";
+                    }
+                }
+                // Magnitude analysis. la.mixed_qkv/a/b are bf16 in BOTH the
+                // reference and the write pass (the in-proj GEMM emits bf16), so
+                // the pool round-trip itself is lossless. The residual is that
+                // R_ref and the write pass run two SEPARATE in-proj GEMM calls,
+                // and cuBLAS is not bit-deterministic across invocations
+                // (algo/split-K selection) -> the bf16 activations differ by
+                // <=1 ULP, which then amplifies through 64 gated-delta recurrence
+                // steps + the conv. So bit-exact parity is structurally
+                // unavoidable here (the reference is an INDEPENDENT GEMM, unlike
+                // commit-advance which replays the same stashed activations).
+                // Gate on delta's numeric tolerance instead.
+                double mean_abs = 0.0, frac_big = 0.0, l2rel = 0.0, maxabs = 0.0;
+                {
+                    auto bf16f = [](std::uint8_t lo, std::uint8_t hi) {
+                        std::uint32_t b =
+                            static_cast<std::uint32_t>((hi << 8) | lo) << 16;
+                        float f; std::memcpy(&f, &b, sizeof(f)); return f;
+                    };
+                    double sumabs = 0.0, sumsq_d = 0.0, sumsq_r = 0.0;
+                    std::size_t big = 0, n = 0;
+                    long firstdiff = -1;
+                    for (std::size_t i = 0; i + 1 < R_ref.size(); i += 2, ++n) {
+                        float a = bf16f(R_ref[i], R_ref[i + 1]);
+                        float b = bf16f(R_fold[i], R_fold[i + 1]);
+                        double d = std::fabs(
+                            static_cast<double>(a) - static_cast<double>(b));
+                        sumabs += d; if (d > maxabs) maxabs = d;
+                        sumsq_d += d * d;
+                        sumsq_r += static_cast<double>(a) * static_cast<double>(a);
+                        double rel = d / (std::fabs(static_cast<double>(a)) + 1e-6);
+                        if (rel > 0.05 && d > 1e-3) ++big;
+                        if (firstdiff < 0 &&
+                            (R_ref[i] != R_fold[i] || R_ref[i+1] != R_fold[i+1])) {
+                            firstdiff = static_cast<long>(i);
+                            std::cerr << "[fold-parity]   first-diff @byte" << i
+                                      << " ref=" << a << " fold=" << b << "\n";
+                        }
+                    }
+                    const std::size_t nn = std::max<std::size_t>(1, n);
+                    mean_abs = sumabs / static_cast<double>(nn);
+                    frac_big = static_cast<double>(big) / static_cast<double>(nn);
+                    l2rel = std::sqrt(sumsq_d) / (std::sqrt(sumsq_r) + 1e-12);
+                    std::cerr << "[fold-parity]   mag: max_abs=" << maxabs
+                              << " mean_abs=" << mean_abs
+                              << " l2_rel=" << l2rel
+                              << " elems_rel>5%=" << big << "/" << n
+                              << " (" << frac_big << ")\n";
+                }
+                // Tolerance gate (delta's call): bf16-precision-bounded parity. A
+                // correct gather/scatter/replay lands far under these; a structural
+                // bug (wrong slab/stride/missing tokens) blows past them. l2_rel is
+                // logged as a corroborating canonical metric.
+                const double kMeanTol = 1e-3;   // mean abs state diff
+                const double kFracTol = 0.01;    // fraction of elems with rel>5%
+                const bool pass =
+                    mean_abs < kMeanTol && frac_big < kFracTol && nz_write == 0;
+                std::cerr << "[fold-parity] N=" << fold_n << " slabs=" << nslabs
+                          << " state_bytes=" << R_ref.size()
+                          << " | bytes_differ=" << diff
+                          << " | mean_abs=" << mean_abs << " (tol " << kMeanTol << ")"
+                          << " frac_rel>5%=" << frac_big << " (tol " << kFracTol << ")"
+                          << " l2_rel=" << l2rel
+                          << " | post-write nonzero=" << nz_write
+                          << " => " << (pass ? "PASS" : "FAIL") << "\n";
+                cudaFree(d_commit);
+                cudaFree(d_slot0);
+                return pass ? 0 : 7;
+            }
+        }
 
         // Prefill on the first prefill_N tokens.
         run_call(d_tokens, d_positions, prefill_N, prefill_N, /*is_decode=*/false);

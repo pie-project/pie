@@ -9,7 +9,7 @@
 //   4. Packs the response back into a `PieResponseFrameDesc` and calls
 //      `send_response`.
 //
-// Header-only: shared between cuda and portable backends.
+// Header-only: shared between cuda and metal backends.
 
 #pragma once
 
@@ -30,7 +30,7 @@
 namespace pie_driver {
 
 // Re-export the mechanism vtable types into `pie_driver::` so consumers
-// (cuda/portable `entry.cpp`) can name them as `pie_driver::PieInProcVTable`.
+// (cuda/metal `entry.cpp`) can name them as `pie_driver::PieInProcVTable`.
 // The schema helper `view.hpp` intentionally does NOT carry these.
 using ::PieInProcVTable;
 using ::PieRecvResult;

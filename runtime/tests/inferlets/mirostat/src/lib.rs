@@ -17,7 +17,7 @@
 use inferlet::program::{encode_f32, resolve_bindings};
 use inferlet::sampling::program as edsl;
 use inferlet::serde_json;
-use inferlet::{Context, Result, model::Model, runtime};
+use inferlet::{Context, Result, model};
 
 /// Default target surprise τ (nats); override via `_input` `"tau"`.
 const TAU: f32 = 3.0;
@@ -46,15 +46,12 @@ async fn main(input: String) -> Result<String> {
     let lr = json_f32(&params, "lr", LR);
     let max_tokens = json_usize(&params, "max_tokens", MAX_TOKENS);
 
-    let models = runtime::models();
-    let model = Model::load(&models[0])?;
-    let tokenizer = model.tokenizer();
     // Logits/output vocab (= hf_config.vocab_size), not the tokenizer token
     // count: the sampler program is lowered + sampled over the logits dim.
-    let vocab = model.output_vocab_size();
+    let vocab = model::output_vocab_size();
 
-    let mut context = Context::new(&model)?;
-    let mut prompt = tokenizer.encode("hello world");
+    let mut context = Context::new()?;
+    let mut prompt = model::encode("hello world");
     if prompt.is_empty() {
         prompt.push(0);
     }

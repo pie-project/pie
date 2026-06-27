@@ -10,7 +10,6 @@
 
 use crate::Result;
 use crate::inference::Grammar;
-use crate::model::Model;
 use crate::pie::core::inference::Matcher;
 
 /// Token sampling constraint.
@@ -47,9 +46,9 @@ pub trait Constrain: Send {
 /// ```ignore
 /// struct MyGrammar(String);
 /// impl inferlet::Schema for MyGrammar {
-///     fn build_constraint(&self, model: &Model) -> Result<GrammarConstraint> {
+///     fn build_constraint(&self) -> Result<GrammarConstraint> {
 ///         let g = compile_to_pie_grammar(&self.0)?;
-///         Ok(GrammarConstraint::from_grammar(&g, model))
+///         Ok(GrammarConstraint::from_grammar(&g))
 ///     }
 /// }
 ///
@@ -58,8 +57,8 @@ pub trait Constrain: Send {
 ///     .collect_text().await?;
 /// ```
 pub trait Schema {
-    /// Compile this schema into a [`GrammarConstraint`] for `model`.
-    fn build_constraint(&self, model: &Model) -> Result<GrammarConstraint>;
+    /// Compile this schema into a [`GrammarConstraint`] for the bound model.
+    fn build_constraint(&self) -> Result<GrammarConstraint>;
 }
 
 /// JSON conforming to a JSON Schema string.
@@ -75,32 +74,32 @@ pub struct Regex<'a>(pub &'a str);
 pub struct Ebnf<'a>(pub &'a str);
 
 impl Schema for JsonSchema<'_> {
-    fn build_constraint(&self, model: &Model) -> Result<GrammarConstraint> {
-        GrammarConstraint::from_json_schema(self.0, model)
+    fn build_constraint(&self) -> Result<GrammarConstraint> {
+        GrammarConstraint::from_json_schema(self.0)
     }
 }
 
 impl Schema for AnyJson {
-    fn build_constraint(&self, model: &Model) -> Result<GrammarConstraint> {
-        Ok(GrammarConstraint::json(model))
+    fn build_constraint(&self) -> Result<GrammarConstraint> {
+        Ok(GrammarConstraint::json())
     }
 }
 
 impl Schema for Regex<'_> {
-    fn build_constraint(&self, model: &Model) -> Result<GrammarConstraint> {
-        GrammarConstraint::from_regex(self.0, model)
+    fn build_constraint(&self) -> Result<GrammarConstraint> {
+        GrammarConstraint::from_regex(self.0)
     }
 }
 
 impl Schema for Ebnf<'_> {
-    fn build_constraint(&self, model: &Model) -> Result<GrammarConstraint> {
-        GrammarConstraint::from_ebnf(self.0, model)
+    fn build_constraint(&self) -> Result<GrammarConstraint> {
+        GrammarConstraint::from_ebnf(self.0)
     }
 }
 
 impl Schema for &Grammar {
-    fn build_constraint(&self, model: &Model) -> Result<GrammarConstraint> {
-        Ok(GrammarConstraint::from_grammar(self, model))
+    fn build_constraint(&self) -> Result<GrammarConstraint> {
+        Ok(GrammarConstraint::from_grammar(self))
     }
 }
 
@@ -126,32 +125,31 @@ impl GrammarConstraint {
     }
 
     /// Build from a pre-compiled grammar (compile once, reuse across contexts).
-    pub fn from_grammar(grammar: &Grammar, model: &Model) -> Self {
-        let tokenizer = model.tokenizer();
-        Self::new(Matcher::new(grammar, &tokenizer))
+    pub fn from_grammar(grammar: &Grammar) -> Self {
+        Self::new(Matcher::new(grammar))
     }
 
     /// Build a constraint that accepts any valid JSON.
-    pub fn json(model: &Model) -> Self {
-        Self::from_grammar(&Grammar::json(), model)
+    pub fn json() -> Self {
+        Self::from_grammar(&Grammar::json())
     }
 
     /// Build from a JSON Schema string.
-    pub fn from_json_schema(schema: &str, model: &Model) -> Result<Self> {
+    pub fn from_json_schema(schema: &str) -> Result<Self> {
         let grammar = Grammar::from_json_schema(schema)?;
-        Ok(Self::from_grammar(&grammar, model))
+        Ok(Self::from_grammar(&grammar))
     }
 
     /// Build from a regular expression pattern.
-    pub fn from_regex(pattern: &str, model: &Model) -> Result<Self> {
+    pub fn from_regex(pattern: &str) -> Result<Self> {
         let grammar = Grammar::from_regex(pattern)?;
-        Ok(Self::from_grammar(&grammar, model))
+        Ok(Self::from_grammar(&grammar))
     }
 
     /// Build from an EBNF grammar string.
-    pub fn from_ebnf(ebnf: &str, model: &Model) -> Result<Self> {
+    pub fn from_ebnf(ebnf: &str) -> Result<Self> {
         let grammar = Grammar::from_ebnf(ebnf)?;
-        Ok(Self::from_grammar(&grammar, model))
+        Ok(Self::from_grammar(&grammar))
     }
 }
 

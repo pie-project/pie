@@ -15,7 +15,7 @@
 // zero-length slots in the view — fine to leave unpopulated when the
 // request didn't ask for that sampler type.
 //
-// Header-only: shared between cuda and portable backends.
+// Header-only: shared between the cuda and metal backends.
 
 #pragma once
 

@@ -11,8 +11,6 @@
 
 use inferlet::{
     Context, Result,
-    model::Model,
-    runtime,
     sample::Sampler,
 };
 use serde::Deserialize;
@@ -51,18 +49,16 @@ fn build_sink_mask(seq_len: u32, sink: u32, window: u32) -> Vec<u32> {
 #[inferlet::main]
 async fn main(input: Input) -> Result<String> {
     let start = Instant::now();
-    let models = runtime::models();
-    let model = Model::load(models.first().ok_or("No models available")?)?;
 
-    let mut ctx = Context::new(&model)?;
+    let mut ctx = Context::new()?;
     let page_size = ctx.page_size();
-    let stop_tokens = inferlet::chat::stop_tokens(&model);
+    let stop_tokens = inferlet::chat::stop_tokens();
 
     // Build the prompt and prefill in one Pass.
     let mut prompt: Vec<u32> = Vec::new();
-    prompt.extend(inferlet::chat::system(&model, "You are a helpful assistant."));
-    prompt.extend(inferlet::chat::user(&model, &input.prompt));
-    prompt.extend(inferlet::chat::cue(&model));
+    prompt.extend(inferlet::chat::system("You are a helpful assistant."));
+    prompt.extend(inferlet::chat::user(&input.prompt));
+    prompt.extend(inferlet::chat::cue());
 
     println!(
         "--- Attention Sink (sink={}, window={}, page_size={}) ---",
@@ -103,8 +99,7 @@ async fn main(input: Input) -> Result<String> {
         pending = vec![token];
     }
 
-    let tokenizer = model.tokenizer();
-    let text = tokenizer.decode(&generated_tokens)?;
+    let text = inferlet::model::decode(&generated_tokens)?;
     println!("Generated {} tokens in {:?}", generated_tokens.len(), start.elapsed());
     println!("Output:\n{}", text);
 

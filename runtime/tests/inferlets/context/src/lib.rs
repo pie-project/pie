@@ -1,24 +1,14 @@
 //! Context test inferlet — exercises model, context, and tokenizer host APIs.
 
-use inferlet::{
-    Context,
-    model::Model,
-    runtime,
-    Result,
-};
+use inferlet::{Context, model, Result};
 
 #[inferlet::main]
 async fn main(_input: String) -> Result<String> {
-    // Load the first available model
-    let models = runtime::models();
-    let model = Model::load(&models[0])?;
-
-    // Get tokenizer and encode a test string
-    let tokenizer = model.tokenizer();
-    let encoded = tokenizer.encode("hello world");
+    // The engine serves exactly one model — encode directly.
+    let encoded = model::encode("hello world");
 
     // Create a context
-    let mut ctx = Context::new(&model)?;
+    let mut ctx = Context::new()?;
 
     // Stage some buffered tokens
     ctx.append(&encoded);

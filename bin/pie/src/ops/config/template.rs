@@ -1,5 +1,5 @@
 //! Default `config.toml` template emitted by `pie config init`. The
-//! highest-priority compiled flavor (cuda → portable → dummy) picks
+//! highest-priority compiled flavor (cuda → metal → dummy) picks
 //! which `[model.driver]` block to splice in, so the generated config
 //! "just works" without a follow-up edit. Multi-flavor builds always
 //! pick the most capable backend.
@@ -13,14 +13,17 @@ use pie_worker::driver_ffi::{self, Flavor};
 /// binds an ephemeral worker port at boot).
 pub fn default_config_content() -> String {
     let driver_block = match driver_ffi::default_flavor() {
-        #[cfg(feature = "driver-portable")]
-        Some(Flavor::Portable) => PORTABLE_DRIVER_BLOCK,
         #[cfg(feature = "driver-cuda")]
         Some(Flavor::Cuda) => CUDA_DRIVER_BLOCK,
         Some(Flavor::Dummy) => DUMMY_DRIVER_BLOCK,
-        // default_flavor always returns Some because dummy is linked
-        // unconditionally. Keep this fallback for exhaustiveness.
-        None => DUMMY_DRIVER_BLOCK,
+        // Fallback for exhaustiveness: `default_flavor` always returns `Some`
+        // (dummy is linked unconditionally), and `pie-worker` may compile
+        // `Flavor::Cuda`/`Metal` while this crate's matching `driver-*` arm is
+        // cfg'd off (workspace feature-unification can desync the two) — those
+        // land here → the dummy block. Unreachable at runtime (default_flavor
+        // returns only a compiled flavor); keeps the match exhaustive across
+        // all feature sets.
+        _ => DUMMY_DRIVER_BLOCK,
     };
     // The worker config blocks were authored top-level; nest them under the
     // `[worker]` section of the standalone schema. (Longer headers first so a
@@ -29,7 +32,7 @@ pub fn default_config_content() -> String {
         .replace("[model.driver.options]", "[worker.model.driver.options]")
         .replace("[model.driver]", "[worker.model.driver]")
         .replace("[model.scheduler]", "[worker.model.scheduler]")
-        .replace("[[model]]", "[[worker.model]]")
+        .replace("[model]", "[worker.model]")
         .replace("[server]", "[worker.server]")
         .replace("[auth]", "[worker.auth]")
         .replace("[telemetry]", "[worker.telemetry]")
@@ -89,37 +92,13 @@ network_allowed_hosts = ["*"]
 # Uploads
 max_upload_mb = 256
 
-[[model]]
+[model]
 name = "default"
 hf_repo = "Qwen/Qwen3-0.6B"
 
 [model.scheduler]
-batch_policy = "adaptive"
 request_timeout_secs = 120
-default_endowment_pages = 64
-admission_oversubscription_factor = 4.0
 restore_pause_at_utilization = 0.85
-# Per-context depth of pass-level speculative execution. `0`
-# disables speculation entirely (every submit goes through the
-# cold path — useful for A/B benchmarking). `1` is piggyback
-# (one staged pass per real pass; the steady-state default).
-# Higher values let chain firing overlap with the inferlet's
-# WASM time, but won't help workloads where WASM ≈ 0 (e.g.
-# text completion). Range 0..=64.
-speculation_depth = 1
-"#;
-
-#[cfg(feature = "driver-portable")]
-const PORTABLE_DRIVER_BLOCK: &str = r#"
-[model.driver]
-type = "portable"
-device = ["auto"]
-ipc_profile = "balanced" # "latency", "balanced", or "power"
-
-[model.driver.options]
-max_forward_tokens = 10240
-max_forward_requests = 512
-kv_cache_dtype = "auto"
 "#;
 
 #[cfg(feature = "driver-cuda")]
@@ -155,11 +134,7 @@ vocab_size = 151936
 arch_name = "qwen3"
 "#;
 
-const COMMON_SUFFIX: &str = r#"
-# To add a second model, append another [[model]] block with a unique
-# name and a non-overlapping device list. The first [[model]] is the
-# implicit default for inferlets that don't specify a model name.
-"#;
+const COMMON_SUFFIX: &str = "";
 
 #[cfg(test)]
 mod tests {

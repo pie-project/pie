@@ -5,8 +5,8 @@
 //! character creator, or dialogue writer) and passes work to the next agent.
 
 use inferlet::{
-    Context, model::Model, runtime,
-    messaging, SubscriptionExt,
+    Context,
+    messaging,
     Result,
     sample::Sampler,
 };
@@ -93,15 +93,12 @@ async fn main(input: Input) -> Result<String> {
     let group_id = input.group_id;
     let tokens_per_step = input.tokens_per_step;
 
-    let models = runtime::models();
-    let model = Model::load(models.first().ok_or("No models available")?)?;
-    let tokenizer = model.tokenizer();
     let config = get_agent_config(&my_role)?;
 
     let (user_prompt, accumulated_story) = if let Some(prev_topic) = config.prev_topic {
         // Subscribe to the previous agent's topic and wait for a message
-        let subscription = messaging::subscribe(&format!("{}-{}", prev_topic, group_id));
-        let accumulated = subscription.get_async().await
+        let mut subscription = messaging::subscribe(&format!("{}-{}", prev_topic, group_id));
+        let accumulated = subscription.next().await
             .ok_or_else(|| "No message received from previous agent".to_string())?;
         let prompt = format!(
             "**Previous Story Elements:**\n---\n{}\n---\n\n**Your Specific Task:**\n{}",
@@ -112,7 +109,7 @@ async fn main(input: Input) -> Result<String> {
         (input.prompt, String::new())
     };
 
-    let mut ctx = Context::new(&model)?;
+    let mut ctx = Context::new()?;
     ctx.system(config.system_message);
     ctx.user(&format!(
         "{}\nPlease start with \"### {}\"",
@@ -127,10 +124,10 @@ async fn main(input: Input) -> Result<String> {
         .await?;
 
     // Strip any EOS token text from the contribution
-    let stop_tokens = inferlet::chat::stop_tokens(&model);
+    let stop_tokens = inferlet::chat::stop_tokens();
     let stop_text: Vec<String> = stop_tokens
         .iter()
-        .filter_map(|&t| tokenizer.decode(&[t]).ok())
+        .filter_map(|&t| inferlet::model::decode(&[t]).ok())
         .collect();
     let contribution: &str = stop_text
         .iter()

@@ -15,7 +15,7 @@
 use inferlet::program::{encode_f32, resolve_bindings};
 use inferlet::sampling::program as edsl;
 use inferlet::serde_json;
-use inferlet::{Context, Result, model::Model, runtime};
+use inferlet::{Context, Result, model};
 
 /// Constraint alphabet: the only token ids the grammar ever allows.
 const ALPHABET: [u32; 4] = [10, 11, 12, 13];
@@ -72,19 +72,16 @@ async fn main(input: String) -> Result<String> {
         .map(|x| x as usize)
         .unwrap_or(MAX_TOKENS);
 
-    let models = runtime::models();
-    let model = Model::load(&models[0])?;
-    let tokenizer = model.tokenizer();
     // Logits/output vocab (= hf_config.vocab_size), not the tokenizer token
     // count: the sampler program is lowered + sampled over the logits dim.
-    let vocab = model.output_vocab_size();
+    let vocab = model::output_vocab_size();
 
-    let mut context = Context::new(&model)?;
+    let mut context = Context::new()?;
     // Prime the sequence with a short prompt so the first fire has a query
     // position; tokens are fed directly into the forward pass (no chat
     // template). Fall back to a single seed token if the prompt encodes empty
     // (keeps the first fire's query position well-defined on any tokenizer).
-    let mut prompt = tokenizer.encode("start");
+    let mut prompt = model::encode("start");
     if prompt.is_empty() {
         prompt.push(0);
     }

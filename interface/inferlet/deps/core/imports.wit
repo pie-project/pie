@@ -3,14 +3,14 @@ package pie:core;
 world imports {
     import types;
     import adapter;
-    import context;
+    import working-set;
     import messaging;
     import session;
     import model;
     import runtime;
     import tensor;
     import inference;
-    import scheduling;
+    import http;
     import media;
     import audio-out;
 }

@@ -7,7 +7,7 @@
 //! the drivers cannot load (`.pt`/`.bin`/`.gguf`/`consolidated.safetensors`).
 
 /// Files required by Pie's runtime loaders. Broad for small metadata + tokenizer
-/// artifacts, but narrow for weights: the CUDA/portable loaders consume
+/// artifacts, but narrow for weights: the CUDA/Metal loaders consume
 /// `model.safetensors` / `model-*.safetensors` shards, not duplicate `.pt`,
 /// `.bin`, `.gguf`, or `consolidated.safetensors` artifacts. Used by
 /// `pie model pull` to restrict the HF snapshot download.

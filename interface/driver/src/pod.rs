@@ -58,7 +58,7 @@ pub enum AdapterOp {
 }
 
 /// Per-slot adapter binding. `-1` sentinels mean "unbound" — both fields
-/// are signed so the wire form matches what portable's legacy SoA path
+/// are signed so the wire form matches what cuda's legacy SoA path
 /// already consumes (`.as<int64_t>()`), no shim conversion needed.
 #[derive(Archive, Serialize, Deserialize, Debug, Clone, Copy, Default, PartialEq, Eq)]
 #[rkyv(derive(Debug))]

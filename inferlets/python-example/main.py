@@ -7,18 +7,16 @@ Demonstrates:
 - Match-case dispatch on decoder events
 """
 
-from inferlet import Context, Model, Sampler, chat, reasoning, runtime, session
+from inferlet import Context, Sampler, chat, reasoning, session
 
 
 async def main(input: dict) -> str:
-    model = Model.load(runtime.models()[0])
-
-    ctx = Context(model)
+    ctx = Context()
     ctx.system("You are a helpful assistant.")
     ctx.user("What is the capital of France? Tell me a joke.")
 
-    chat_dec = chat.Decoder(model)
-    think = reasoning.Decoder(model)
+    chat_dec = chat.Decoder()
+    think = reasoning.Decoder()
     output = ""
 
     g = ctx.generate(Sampler.top_p(0.6, 0.95), max_tokens=256)

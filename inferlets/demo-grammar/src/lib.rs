@@ -23,7 +23,7 @@
 use std::io::{self, Write};
 use std::time::{Duration, Instant};
 
-use inferlet::{Context, JsonSchema, Result, chat, model::Model, runtime, sample::Sampler, wstd};
+use inferlet::{Context, JsonSchema, Result, chat, sample::Sampler};
 use serde::Deserialize;
 
 #[derive(Deserialize)]
@@ -96,23 +96,19 @@ const RED: &str = "\x1b[31m";
 async fn main(input: Input) -> Result<String> {
     let mode = input.mode.to_lowercase();
 
-    let model_name = runtime::models()
-        .first()
-        .cloned()
-        .ok_or("No models available")?;
-    let model = Model::load(&model_name)?;
+    let model_name = inferlet::model::name();
 
     match mode.as_str() {
         "baseline" | "plain" => {
-            run_baseline(&model, &model_name, &input).await?;
+            run_baseline(&model_name, &input).await?;
         }
         "constrained" | "smart" => {
-            run_constrained(&model, &model_name, &input).await?;
+            run_constrained(&model_name, &input).await?;
         }
         "both" | "" => {
-            let p = run_baseline(&model, &model_name, &input).await?;
+            let p = run_baseline(&model_name, &input).await?;
             println!();
-            let s = run_constrained(&model, &model_name, &input).await?;
+            let s = run_constrained(&model_name, &input).await?;
             println!();
             comparison(&p, &s);
         }
@@ -137,7 +133,7 @@ struct ModeResult {
 }
 
 // ── BASELINE: free decode + serde_json::from_str + retry on failure ───
-async fn run_baseline(model: &Model, model_name: &str, input: &Input) -> Result<ModeResult> {
+async fn run_baseline(model_name: &str, input: &Input) -> Result<ModeResult> {
     print_header(
         "BASELINE",
         YELLOW,
@@ -167,7 +163,7 @@ async fn run_baseline(model: &Model, model_name: &str, input: &Input) -> Result<
             BOLD, YELLOW, attempt, temp, RESET
         );
 
-        let mut ctx = Context::new(model)?;
+        let mut ctx = Context::new()?;
         ctx.system(&input.system);
         ctx.user(&format!(
             "Extract name, email, age from this bio: {}",
@@ -175,7 +171,7 @@ async fn run_baseline(model: &Model, model_name: &str, input: &Input) -> Result<
         ));
         ctx.cue();
 
-        let text = stream_attempt(&mut ctx, model, input.max_tokens, temp, input.delay).await?;
+        let text = stream_attempt(&mut ctx, input.max_tokens, temp, input.delay).await?;
         let attempt_tokens = approximate_tokens(&text);
         total_decoded += attempt_tokens;
 
@@ -213,7 +209,7 @@ async fn run_baseline(model: &Model, model_name: &str, input: &Input) -> Result<
 }
 
 // ── CONSTRAINED: per-token logit mask from in-WASM matcher ────────────
-async fn run_constrained(model: &Model, model_name: &str, input: &Input) -> Result<ModeResult> {
+async fn run_constrained(model_name: &str, input: &Input) -> Result<ModeResult> {
     print_header(
         "CONSTRAINED",
         GREEN,
@@ -222,7 +218,7 @@ async fn run_constrained(model: &Model, model_name: &str, input: &Input) -> Resu
         &input.bio,
     );
 
-    let mut ctx = Context::new(model)?;
+    let mut ctx = Context::new()?;
     ctx.system(&input.system);
     ctx.user(&format!(
         "Extract name, email, age from this bio: {}",
@@ -238,7 +234,7 @@ async fn run_constrained(model: &Model, model_name: &str, input: &Input) -> Resu
         .generate(Sampler::Argmax)
         .max_tokens(input.max_tokens)
         .constrain_with(JsonSchema(&input.schema))?;
-    let mut decoder = chat::Decoder::new(model);
+    let mut decoder = chat::Decoder::new();
     let mut stripper = ThinkStripper::new();
     let mut text = String::new();
 
@@ -255,7 +251,7 @@ async fn run_constrained(model: &Model, model_name: &str, input: &Input) -> Resu
                     print!("{}", visible);
                     let _ = io::stdout().flush();
                     if input.delay > 0 {
-                        wstd::task::sleep(wstd::time::Duration::from_millis(input.delay)).await;
+                        inferlet::sleep(std::time::Duration::from_millis(input.delay)).await;
                     }
                 }
                 if try_parse_payload(&text).is_ok() {
@@ -286,7 +282,6 @@ async fn run_constrained(model: &Model, model_name: &str, input: &Input) -> Resu
 
 async fn stream_attempt(
     ctx: &mut Context,
-    model: &Model,
     max_tokens: usize,
     temperature: f32,
     delay_ms: u64,
@@ -305,8 +300,8 @@ async fn stream_attempt(
     let mut g = ctx
         .generate(sampler)
         .max_tokens(max_tokens)
-        .stop(&chat::stop_tokens(model));
-    let mut decoder = chat::Decoder::new(model);
+        .stop(&chat::stop_tokens());
+    let mut decoder = chat::Decoder::new();
     let mut stripper = ThinkStripper::new();
     let mut text = String::new();
 
@@ -324,7 +319,7 @@ async fn stream_attempt(
                     print!("{}", rendered);
                     let _ = io::stdout().flush();
                     if delay_ms > 0 {
-                        wstd::task::sleep(wstd::time::Duration::from_millis(delay_ms)).await;
+                        inferlet::sleep(std::time::Duration::from_millis(delay_ms)).await;
                     }
                 }
             }

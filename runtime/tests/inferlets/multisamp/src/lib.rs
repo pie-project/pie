@@ -9,16 +9,14 @@
 //! tokens. Each `generate` continues the same context, so the kinds appear as
 //! distinct decode fires.
 
-use inferlet::{Context, model::Model, runtime, sample::Sampler, Result};
+use inferlet::{Context, model, sample::Sampler, Result};
 
 #[inferlet::main]
 async fn main(_input: String) -> Result<String> {
-    let models = runtime::models();
-    let model = Model::load(&models[0])?;
-    let tokenizer = model.tokenizer();
-
-    let mut context = Context::new(&model)?;
-    let prompt_tokens = tokenizer.encode("hello world");
+    // P3 single-model: the engine serves exactly one model — no handle to
+    // load; tokenizer is the global `model::*` API.
+    let mut context = Context::new()?;
+    let prompt_tokens = model::encode("hello world");
     context.append(&prompt_tokens);
 
     let samplers: [(&str, Sampler); 4] = [

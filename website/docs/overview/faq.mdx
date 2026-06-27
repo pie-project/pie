@@ -10,7 +10,7 @@ Common questions about Pie's status, scope, and design choices. If you cannot fi
 
 ## Is Pie production ready?
 
-No. Pie is a research prototype under active development. APIs change between releases without deprecation cycles. The supported model families and drivers are listed on each driver's reference page ([CUDA](../reference/drivers/cuda#supported-architectures), [Portable](../reference/drivers/portable#supported-architectures)). Anything outside those lists is not guaranteed to work. Use Pie for research, prototyping, and internal deployments where you can update with the project.
+No. Pie is a research prototype under active development. APIs change between releases without deprecation cycles. The supported model families and drivers are listed on each driver's reference page ([CUDA](../reference/drivers/cuda#supported-architectures)). Anything outside those lists is not guaranteed to work. Use Pie for research, prototyping, and internal deployments where you can update with the project.
 
 ## Do I have to write Rust?
 
@@ -53,10 +53,6 @@ The cost is a per-call boundary between Wasm and the host. The [benchmarks](./be
 ## How does Pie relate to LangChain, LlamaIndex, or DSPy?
 
 Those are application frameworks that run on top of a serving system. They orchestrate prompts, manage memory, and call tools, but they call the model through a black-box endpoint. Pie is the serving system underneath. You could in principle run a LangChain agent against a Pie endpoint and get nothing extra; the value of Pie is moving the orchestration logic *into* the engine, where it can share the KV cache and avoid client round trips. An inferlet is an alternative to that orchestration layer, not a replacement for prompt templates or document loaders.
-
-## Can I use Pie as a drop-in OpenAI-compatible endpoint?
-
-Yes, through the `openresponses` inferlet. It exposes an OpenAI Responses-compatible HTTP API on top of the engine. For OpenAI Chat Completions specifically, you write a small inferlet that translates the schema; the [examples](../guide/examples/overview) page lists relevant building blocks.
 
 ## Is Pie open source?
 

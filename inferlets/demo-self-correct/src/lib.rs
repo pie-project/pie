@@ -23,7 +23,7 @@
 use std::io::{self, Write};
 use std::time::{Duration, Instant};
 
-use inferlet::{Context, Result, chat, model::Model, runtime, sample::Sampler, wstd};
+use inferlet::{Context, Result, chat, sample::Sampler};
 use serde::Deserialize;
 
 #[derive(Deserialize)]
@@ -94,23 +94,19 @@ const MAGENTA: &str = "\x1b[35m";
 async fn main(input: Input) -> Result<String> {
     let mode = input.mode.to_lowercase();
 
-    let model_name = runtime::models()
-        .first()
-        .cloned()
-        .ok_or("No models available")?;
-    let model = Model::load(&model_name)?;
+    let model_name = inferlet::model::name();
 
     match mode.as_str() {
         "baseline" | "plain" => {
-            run_baseline(&model, &model_name, &input).await?;
+            run_baseline(&model_name, &input).await?;
         }
         "verified" | "smart" => {
-            run_verified(&model, &model_name, &input).await?;
+            run_verified(&model_name, &input).await?;
         }
         "both" | "" => {
-            let p = run_baseline(&model, &model_name, &input).await?;
+            let p = run_baseline(&model_name, &input).await?;
             println!();
-            let s = run_verified(&model, &model_name, &input).await?;
+            let s = run_verified(&model_name, &input).await?;
             println!();
             comparison(&p, &s, &input.expected);
         }
@@ -134,7 +130,7 @@ struct ModeResult {
 }
 
 // ── BASELINE: one greedy roll-out ─────────────────────────────────────────
-async fn run_baseline(model: &Model, model_name: &str, input: &Input) -> Result<ModeResult> {
+async fn run_baseline(model_name: &str, input: &Input) -> Result<ModeResult> {
     print_header(
         "BASELINE",
         YELLOW,
@@ -143,13 +139,13 @@ async fn run_baseline(model: &Model, model_name: &str, input: &Input) -> Result<
         &input.question,
     );
 
-    let mut ctx = Context::new(model)?;
+    let mut ctx = Context::new()?;
     ctx.system(&input.system);
     ctx.user(&format!("{} /no_think", input.question));
     ctx.cue();
 
     let start = Instant::now();
-    let text = stream_attempt(&mut ctx, model, input.max_tokens, 0.0, input.delay).await?;
+    let text = stream_attempt(&mut ctx, input.max_tokens, 0.0, input.delay).await?;
     let elapsed = start.elapsed();
     let answer = extract_answer(&text);
     print_footer("BASELINE", YELLOW, &answer, elapsed, 0, 1, &input.expected);
@@ -162,7 +158,7 @@ async fn run_baseline(model: &Model, model_name: &str, input: &Input) -> Result<
 }
 
 // ── VERIFIED: full-attempt verify + fork()-based KV rewind ────────────────
-async fn run_verified(model: &Model, model_name: &str, input: &Input) -> Result<ModeResult> {
+async fn run_verified(model_name: &str, input: &Input) -> Result<ModeResult> {
     print_header(
         "VERIFIED",
         GREEN,
@@ -195,14 +191,13 @@ async fn run_verified(model: &Model, model_name: &str, input: &Input) -> Result<
     // Both are buffered (not flushed) so each fork's first generate()
     // step does the prefill in one batched forward pass — bit-for-bit
     // parity with BASELINE's path.
-    let mut ctx_base_raw = Context::new(model)?;
+    let mut ctx_base_raw = Context::new()?;
     ctx_base_raw.system(&input.system);
     ctx_base_raw.user(&format!("{} /no_think", input.question));
     ctx_base_raw.cue();
 
     let mut ctx_base_primed = ctx_base_raw.fork()?;
-    let tokenizer = model.tokenizer();
-    let prime = tokenizer.encode("\n</think>\n\n");
+    let prime = inferlet::model::encode("\n</think>\n\n");
     if !prime.is_empty() {
         ctx_base_primed.append(&prime);
     }
@@ -243,7 +238,7 @@ async fn run_verified(model: &Model, model_name: &str, input: &Input) -> Result<
             ctx_base_primed.fork()?
         };
 
-        let text = stream_attempt(&mut ctx, model, input.max_tokens, temp, input.delay).await?;
+        let text = stream_attempt(&mut ctx, input.max_tokens, temp, input.delay).await?;
         let errs = verify_attempt(&text, &input.expected);
 
         if errs.is_empty() {
@@ -319,7 +314,6 @@ async fn run_verified(model: &Model, model_name: &str, input: &Input) -> Result<
 // streaming effect readable on video.
 async fn stream_attempt(
     ctx: &mut Context,
-    model: &Model,
     max_tokens: usize,
     temperature: f32,
     delay_ms: u64,
@@ -339,8 +333,8 @@ async fn stream_attempt(
     let mut g = ctx
         .generate(sampler)
         .max_tokens(max_tokens)
-        .stop(&chat::stop_tokens(model));
-    let mut decoder = chat::Decoder::new(model);
+        .stop(&chat::stop_tokens());
+    let mut decoder = chat::Decoder::new();
     let mut stripper = ThinkStripper::new();
     let mut text = String::new();
 
@@ -358,7 +352,7 @@ async fn stream_attempt(
                     print!("{}", rendered);
                     let _ = io::stdout().flush();
                     if delay_ms > 0 {
-                        wstd::task::sleep(wstd::time::Duration::from_millis(delay_ms)).await;
+                        inferlet::sleep(std::time::Duration::from_millis(delay_ms)).await;
                     }
                 }
             }

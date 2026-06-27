@@ -46,6 +46,22 @@ constexpr static const uint8_t PIE_SAMPLER_LOGPROBS = 9;
 
 constexpr static const uint8_t PIE_SAMPLER_ENTROPY = 10;
 
+/// Per-slot recurrent-state flags packed into [`ForwardRequest::rs_slot_flags`]
+/// (one `u8` per request). Bit flags — combine with bitwise OR. Kept as
+/// explicit `pub const`s (like the `PIE_SAMPLER_*` set) so cbindgen emits them
+/// verbatim as C consts for the driver's rs_cache kernels — single source of
+/// truth for the runtime producer and the driver consumer.
+///
+/// `RS_FLAG_RESET` (bit 0): reset the slot's recurrent state before executing
+/// the request (fresh context / replay-from-zero).
+constexpr static const uint8_t RS_FLAG_RESET = 1;
+
+/// `RS_FLAG_FOLD` (bit 1): after the pass, fold buffered recurrent state into
+/// the slot's folded state. The number of buffered tokens to fold is carried
+/// per request in [`ForwardRequest::rs_fold_lens`]. Set by the runtime in
+/// response to an explicit `inference.fold(set, n)` call.
+constexpr static const uint8_t RS_FLAG_FOLD = 2;
+
 /// Wire discriminant for a `Logits` slot.
 constexpr static const uint8_t SamplingBinding_KIND_LOGITS = 0;
 
@@ -82,7 +98,7 @@ struct PieBrleDesc {
 };
 
 /// Per-slot adapter binding. `-1` sentinels mean "unbound" — both fields
-/// are signed so the wire form matches what portable's legacy SoA path
+/// are signed so the wire form matches what cuda's legacy SoA path
 /// already consumes (`.as<int64_t>()`), no shim conversion needed.
 struct PieAdapterBinding {
   /// `-1` means no adapter bound for this slot.
@@ -217,6 +233,12 @@ struct PieForwardRequestDesc {
   size_t next_input_src_rows_len;
   const uint32_t *next_input_dest_slots_ptr;
   size_t next_input_dest_slots_len;
+  const uint32_t *rs_fold_lens_ptr;
+  size_t rs_fold_lens_len;
+  const uint32_t *rs_buffer_slot_ids_ptr;
+  size_t rs_buffer_slot_ids_len;
+  const uint32_t *rs_buffer_slot_indptr_ptr;
+  size_t rs_buffer_slot_indptr_len;
 };
 
 struct PieCopyRequestDesc {

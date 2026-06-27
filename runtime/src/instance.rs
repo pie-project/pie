@@ -10,11 +10,11 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use wasmtime::component::{ResourceAny, ResourceTable};
 use wasmtime_wasi::{DirPerms, FilePerms, WasiCtx, WasiCtxView, WasiView};
-use wasmtime_wasi_http::{WasiHttpCtx, WasiHttpView};
+use wasmtime_wasi_http::WasiHttpCtx;
+use wasmtime_wasi_http::p2::{WasiHttpCtxView, WasiHttpView};
 
 use self::output::LogStream;
 
-use crate::context;
 use crate::linker::InstancePolicy;
 use crate::process::ProcessId;
 
@@ -40,6 +40,10 @@ pub struct InstanceState {
     resource_table: ResourceTable,
     http_ctx: WasiHttpCtx,
 
+    /// Whether outbound network is permitted (gates `pie:core/http.fetch`,
+    /// parity with the wasi:http linker which is only wired when allowed).
+    network_allowed: bool,
+
     /// Per-instance scratch directory, deleted on Drop.
     scratch_dir: PathBuf,
 
@@ -50,24 +54,13 @@ pub struct InstanceState {
     guest_resource_map: Vec<(ResourceAny, u32)>,
     /// Counter for allocating unique host reps
     next_dynamic_rep: u32,
-
-    /// WS8 inter-pass pipeline links (`forward-pass.next-input`): a producer
-    /// pass's resolved output keyed by context, drained by the next pass on that
-    /// context to source its input tokens host-side (no guest round-trip). P1 is
-    /// host-resolved; P2 binds the device-resident `pi.sampled` instead.
-    pub(crate) pipeline_links: HashMap<crate::context::ContextId, crate::api::inference::PipelineLink>,
 }
 
 impl Drop for InstanceState {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.scratch_dir);
-        // WS8 links reference their producer pass (which owns its pin and
-        // releases it on its own drop), so the links hold no resources — just
-        // clear the map. The producer ForwardPass resources are dropped by the
-        // store teardown, releasing any still-held pins.
-        self.pipeline_links.clear();
-        // Unregister the process: destroy all contexts and remove process entries.
-        context::unregister_process(self.id);
+        // (Process/context unregister removed — Phase 5; working sets drop with
+        // the instance's resource table.)
     }
 }
 
@@ -81,12 +74,12 @@ impl WasiView for InstanceState {
 }
 
 impl WasiHttpView for InstanceState {
-    fn ctx(&mut self) -> &mut WasiHttpCtx {
-        &mut self.http_ctx
-    }
-
-    fn table(&mut self) -> &mut ResourceTable {
-        &mut self.resource_table
+    fn http(&mut self) -> WasiHttpCtxView<'_> {
+        WasiHttpCtxView {
+            ctx: &mut self.http_ctx,
+            table: &mut self.resource_table,
+            hooks: Default::default(),
+        }
     }
 }
 
@@ -179,12 +172,12 @@ impl InstanceState {
             wasi_ctx: builder.build(),
             resource_table: ResourceTable::new(),
             http_ctx: WasiHttpCtx::new(),
+            network_allowed: policy.network.allow,
             scratch_dir,
             // Dynamic linking support
             dynamic_resource_map: HashMap::new(),
             guest_resource_map: Vec::new(),
             next_dynamic_rep: 1,
-            pipeline_links: HashMap::new(),
         })
     }
 
@@ -194,6 +187,11 @@ impl InstanceState {
 
     pub fn get_username(&self) -> String {
         self.username.clone()
+    }
+
+    /// Whether outbound network is permitted for this inferlet.
+    pub fn network_allowed(&self) -> bool {
+        self.network_allowed
     }
 
     // ========================================================================

@@ -9,9 +9,7 @@
 //! decoded text is guaranteed to parse and conform to the schema. Parsing
 //! into `serde_json::Value` is the only post-processing required.
 
-use inferlet::{
-    Context, Result, Schema, sample::Sampler, model::Model, runtime,
-};
+use inferlet::{Context, Result, sample::Sampler};
 use serde::Deserialize;
 use serde_json::Value;
 
@@ -54,10 +52,7 @@ JSON requires.";
 
 #[inferlet::main]
 async fn main(input: Input) -> Result<String> {
-    let models = runtime::models();
-    let model = Model::load(models.first().ok_or("No models available")?)?;
-
-    let mut ctx = Context::new(&model)?;
+    let mut ctx = Context::new()?;
     ctx.system(SYSTEM_PROMPT);
     ctx.user(&input.prompt);
     ctx.cue();

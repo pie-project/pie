@@ -1,8 +1,5 @@
 interface runtime {
 
-    use types.{error};
-    use wasi:io/poll@0.2.4.{pollable};
-
     // Returns the runtime version string
     version: func() -> string;
 
@@ -12,36 +9,9 @@ interface runtime {
     // Returns the username of the user who invoked the inferlet
     username: func() -> string;
 
-    // Get a list of all available model names
-    models: func() -> list<string>;
-
-    // Launches another inferlet by `name@version`. Returns a `child` handle
-    // on success. The child inherits the caller's username but is detached
-    // from the caller's client session and MCP relay.
-    //
-    // Lifecycle:
-    //   - Dropping the handle DETACHES — the child keeps running, its result
-    //     is discarded.
-    //   - `cancel()` hard-kills the child.
-    //   - `pollable()` + `get()` retrieve the child's return value.
-    launch: func(program: string, input: string) -> result<child, error>;
-
-    // Handle to a launched child inferlet.
-    resource child {
-        // Pollable that fires when the child has produced a return value
-        // (Ok, Err, or cancelled).
-        pollable: func() -> pollable;
-
-        // Outcome once the pollable is ready. Returns `none` if the child
-        // has not finished yet. After cancellation, returns `some(err(...))`.
-        get: func() -> option<result<string, error>>;
-
-        // Process id (UUID) of the child, for logs / external bookkeeping.
-        pid: func() -> string;
-
-        // Hard-kill the child if still running. Idempotent — calling cancel
-        // on an already-finished child is a no-op.
-        cancel: func();
-    }
+    // Suspends the calling inferlet for the given duration. A host-provided
+    // async timer: under component-model-async there is no guest-side
+    // pollable->future bridge for wasi:clocks, so timing lives host-side.
+    sleep: async func(duration-ns: u64);
 
 }

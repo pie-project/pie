@@ -14,7 +14,7 @@ Pie has two paths for tool use:
 1. **Hand-rolled agent loops.** Prompt the model to emit a structured action, parse the response in code, run the tool, feed the observation back. Works with any model.
 2. **Native tool-call templates.** Some models build a tool-call format into their chat template (Llama 3.1+, Qwen 2.5+ instruct, others). The `tools` module wraps the equip / answer / decode flow, and `tools::Decoder` is the stream parser that detects calls in the model's output.
 
-Read this after [Chat parser](./chat). For external tool servers, see [MCP](../io/mcp).
+Read this after [Chat parser](./chat).
 
 :::note[Running on the dummy driver?]
 The dummy driver returns uniform random tokens, so native tool-call marker sequences (Llama 3.1 / Qwen 2.5 format) almost never appear in the stream — `tools::Decoder` will run to `max_tokens` without firing a `Call` event, and the hand-rolled ReAct parser will fail to match its action format. The "forcing valid tool calls with grammar" pattern further down *does* produce parseable tool-call JSON on the dummy because constraint masks are honored; only the field values are random.
@@ -502,6 +502,5 @@ The Rust `tools::native_grammar` returns a compiled `Grammar`; the Python `tools
 
 ## Next
 
-- [MCP](../io/mcp): connect to external tool servers.
 - [Constrained generation](../forward/constrained): grammar and schema constraints in detail.
 - [Tutorial: build a parallel research agent](../tutorial/build): parallel HTTP fetches as tool calls.

@@ -35,7 +35,7 @@
 //! No speedup is claimed — masked KV pages still occupy memory; the mask only
 //! controls what the model *attends to*.
 
-use inferlet::{Context, Result, model::Model, runtime, sample::Sampler};
+use inferlet::{Context, Result, sample::Sampler};
 use serde::Deserialize;
 use std::collections::HashSet;
 
@@ -87,8 +87,7 @@ impl Range {
 
 #[inferlet::main]
 async fn main(input: Input) -> Result<String> {
-    let model = Model::load(runtime::models().first().ok_or("No models available")?)?;
-    let stop_tokens = inferlet::chat::stop_tokens(&model);
+    let stop_tokens = inferlet::chat::stop_tokens();
 
     // Minimum chunk size guards against degenerate 1-word chunks blowing up the
     // header/body bookkeeping.
@@ -104,7 +103,6 @@ async fn main(input: Input) -> Result<String> {
     let mut full_ranges: Vec<Range> = Vec::new();
 
     prompt_tokens.extend(inferlet::chat::system(
-        &model,
         "You are a concise assistant. Use the visible hierarchy: global \
          instructions, the chunk summaries, and the selected local chunk.",
     ));
@@ -116,24 +114,23 @@ async fn main(input: Input) -> Result<String> {
         // Header → keep only its first `summary_tokens_per_chunk` tokens as a
         // global summary range.
         let header_start = prompt_tokens.len() as u32;
-        prompt_tokens.extend(inferlet::chat::user(&model, &header));
+        prompt_tokens.extend(inferlet::chat::user(&header));
         let header_end = prompt_tokens.len() as u32;
         let summary_end = header_start + input.summary_tokens_per_chunk.min(header_end - header_start);
         summary_ranges.push(Range::new(header_start, summary_end));
 
         // Body → record the full range so a selected chunk can be kept whole.
         let body_start = prompt_tokens.len() as u32;
-        prompt_tokens.extend(inferlet::chat::user(&model, &body));
+        prompt_tokens.extend(inferlet::chat::user(&body));
         let body_end = prompt_tokens.len() as u32;
         full_ranges.push(Range::new(body_start, body_end));
     }
 
     prompt_tokens.extend(inferlet::chat::user(
-        &model,
         "Answer the original request using the selected local chunk(s) and the \
          global chunk summaries.",
     ));
-    prompt_tokens.extend(inferlet::chat::cue(&model));
+    prompt_tokens.extend(inferlet::chat::cue());
 
     println!("--- hierarchical-attention-rust ---");
     println!("chunks={}", chunks.len());
@@ -141,7 +138,7 @@ async fn main(input: Input) -> Result<String> {
     println!("summary_ranges={}", fmt_ranges(&summary_ranges));
     println!("full_ranges={}", fmt_ranges(&full_ranges));
 
-    let mut ctx = Context::new(&model)?;
+    let mut ctx = Context::new()?;
     let mut pending = prompt_tokens;
     let mut generated: Vec<u32> = Vec::new();
     let mut logged_mask = false;
@@ -203,7 +200,7 @@ async fn main(input: Input) -> Result<String> {
     }
 
     println!("generated_tokens={}", generated.len());
-    Ok(model.tokenizer().decode(&generated)?)
+    Ok(inferlet::model::decode(&generated)?)
 }
 
 // =============================================================================

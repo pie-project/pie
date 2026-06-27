@@ -1,4 +1,4 @@
-use inferlet::{Context, Result, model::Model, runtime, sample::Logits};
+use inferlet::{Context, Result, sample::Logits};
 use serde::Deserialize;
 
 #[derive(Deserialize)]
@@ -14,9 +14,8 @@ fn default_gamma() -> f32 { 0.5 }
 
 #[inferlet::main]
 async fn main(input: Input) -> Result<String> {
-    let model = Model::load(runtime::models().first().unwrap())?;
-    let mut ctx = Context::new(&model)?;
-    let cue = inferlet::chat::cue(&model);
+    let mut ctx = Context::new()?;
+    let cue = inferlet::chat::cue();
     ctx.user(&input.prompt).append(&cue);
     ctx.flush().await?;
 
@@ -36,7 +35,7 @@ async fn main(input: Input) -> Result<String> {
         last = argmax(&logits);
         tokens.push(last);
     }
-    Ok(model.tokenizer().decode(&tokens)?)
+    Ok(inferlet::model::decode(&tokens)?)
 }
 
 fn green_list(seed: u32, vocab: u32, gamma: f32) -> impl Iterator<Item = u32> {

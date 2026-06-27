@@ -10,10 +10,8 @@ keywords = ["wasi", "wasm", "pie", "inferlet"]
 categories = ["wasm"]
 
 [dependencies]
-wit-bindgen = "0.57.1"
-wstd = "0.5.6"
+wit-bindgen = "0.58.0"
 trait-variant = "0.1.2"
-wasi = "0.14.7"
 inferlet-macros = { version = "0.4.0", path = "../inferlet-macros" }
 futures = "0.3.31"
 serde = { version = "1.0", features = ["derive"] }
