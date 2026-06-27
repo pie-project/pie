@@ -34,17 +34,14 @@
 
 namespace pie_cuda_driver::sampling_ir {
 
-// Read a host-submit f32 by binding key; `fallback` if absent/short.
-inline float submit_param_f32(std::span<const SubmitInput> ins,
-                              std::uint32_t key, float fallback) {
-    for (const SubmitInput& si : ins) {
-        if (si.key == key && si.data != nullptr && si.len_bytes >= sizeof(float)) {
-            float v;
-            std::memcpy(&v, si.data, sizeof(float));
-            return v;
-        }
-    }
-    return fallback;
+// Read the f32 scalar carried by a submit input (host LE bytes); `fallback` if
+// the pointer is null / too short.
+inline float read_submit_f32(const SubmitInput* si, float fallback) {
+    if (si == nullptr || si->data == nullptr || si->len_bytes < sizeof(float))
+        return fallback;
+    float v;
+    std::memcpy(&v, si->data, sizeof(float));
+    return v;
 }
 
 // Dedicated-kernel params for a recognized kind. Defaults = "unset" (temp 1,
@@ -54,11 +51,16 @@ struct DedicatedParams {
     float        temp  = 1.0f;
     float        top_p = 1.0f;
     float        min_p = 0.0f;
-    std::int32_t top_k = 0;  // k-bearing → op-shape (phase-2); 0 (unset) for phase-1
+    std::int32_t top_k = 0;  // k-bearing → from op-shape (RankLe), set by the caller
 };
 
-// Extract by key for `kind`. PHASE-1 covers the k-invariant kinds; TopK/TopKTopP
-// additionally need `k` from op-shape (phase-2) written into `top_k`.
+// Extract dedicated-kernel params for `kind` by reading the host-submit scalars
+// in ASCENDING input-ordinal order — first ordinal = temperature (temp-scale
+// precedes softmax), second = filter (top_p/min_p). Reading by ORDER (not a
+// hardcoded ordinal 1/2) is immune to the logits-intrinsic offset (the two index
+// spaces — TensorKey vs ordinal — differ by exactly that, the #12 recurrence trap).
+// k (TopK/TopKTopP) is NOT a submit input — the caller sets `top_k` from the
+// op-shape RankLe immediate (`extract_rank_le_k`).
 inline DedicatedParams extract_dedicated_params(StandardSamplerKind kind,
                                                 std::span<const SubmitInput> ins) {
     DedicatedParams p;
@@ -68,16 +70,28 @@ inline DedicatedParams extract_dedicated_params(StandardSamplerKind kind,
         p.temp = 0.0f;
         return p;
     }
-    p.temp = submit_param_f32(ins, /*ordinal=*/1, /*fallback=*/1.0f);  // T (logits=ordinal0)
+    // Find the two lowest-ordinal submit scalars (temperature first, filter next).
+    const SubmitInput* first_ord = nullptr;   // lowest ordinal  → temperature
+    const SubmitInput* second_ord = nullptr;  // next ordinal    → filter
+    for (const SubmitInput& si : ins) {
+        if (si.data == nullptr || si.len_bytes < sizeof(float)) continue;
+        if (first_ord == nullptr || si.key < first_ord->key) {
+            second_ord = first_ord;
+            first_ord = &si;
+        } else if (second_ord == nullptr || si.key < second_ord->key) {
+            second_ord = &si;
+        }
+    }
+    p.temp = read_submit_f32(first_ord, 1.0f);  // temperature = first ordinal
     switch (kind) {
         case StandardSamplerKind::TopP:
         case StandardSamplerKind::TopKTopP:
-            p.top_p = submit_param_f32(ins, /*ordinal=*/2, /*fallback=*/1.0f);
+            p.top_p = read_submit_f32(second_ord, 1.0f);  // filter = second ordinal
             break;
         case StandardSamplerKind::MinP:
-            p.min_p = submit_param_f32(ins, /*ordinal=*/2, /*fallback=*/0.0f);
+            p.min_p = read_submit_f32(second_ord, 0.0f);  // filter = second ordinal
             break;
-        default:  // Temperature (T only); TopK (k via op-shape, top_p unset)
+        default:  // Temperature (T only); TopK (T only; k from op-shape, top_p unset)
             break;
     }
     return p;

@@ -45,6 +45,7 @@ pub use standard::{
     standard_program_hashes, standard_program_hashes_canonical, standard_programs,
     standard_programs_canonical,
 };
+#[allow(deprecated)] // `lower_sampler` is deprecated (#17) but the path is kept for compat.
 pub use sugar::{
     SamplerSpec, SubmitValues, build_sampler, canonical_kind, lower_sampler, lower_sampler_standard,
 };
@@ -60,5 +61,6 @@ pub mod prelude {
     pub use crate::program::{
         grammar, grammar_sampled, mirostat, spec_verify_greedy, spec_verify_lossless,
     };
+    #[allow(deprecated)] // `lower_sampler` is deprecated (#17); kept in the prelude for compat.
     pub use crate::sugar::{SamplerSpec, build_sampler, lower_sampler};
 }

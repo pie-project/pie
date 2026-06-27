@@ -35,6 +35,7 @@
 
 #include "sampling_ir/pie_standard_samplers.h"  // StandardSamplerKind, standard_sampler_program
 #include "sampling_ir/program_hash.hpp"          // jit::fnv1a64 (inline, canonical)
+#include "sampling_ir/reader.hpp"                 // canonicalize_op_shape (phase-2 op-shape)
 
 namespace pie_cuda_driver::sampling_ir {
 
@@ -66,6 +67,38 @@ recognize_standard_kind(const std::vector<StandardKindEntry>& table,
                         const std::uint8_t* bytecode, std::size_t len) {
     if (bytecode == nullptr || len == 0) return std::nullopt;
     const std::uint64_t h = jit::fnv1a64(bytecode, len);
+    for (const StandardKindEntry& e : table) {
+        if (e.hash == h) return e.kind;
+    }
+    return std::nullopt;
+}
+
+// #12 phase-2 — the CANONICAL (op-shape) table for the k-BEARING kinds (TopK,
+// TopKTopP). Their bytecode varies by the baked `RankLe(k)` immediate, so an exact
+// hash can't key them; instead each entry is the fnv1a64 of the baked CANONICAL
+// (RankLe-zeroed) program. Built once at model init alongside the exact table.
+inline std::vector<StandardKindEntry> build_canonical_kind_table(std::uint32_t vocab) {
+    std::vector<StandardKindEntry> table;
+    for (StandardSamplerKind k : {StandardSamplerKind::TopK,
+                                  StandardSamplerKind::TopKTopP}) {
+        const StandardSamplerProgram p = standard_canonical_program(k, vocab);
+        if (p.valid) table.push_back({jit::fnv1a64(p.bytecode, p.len), k});
+    }
+    return table;
+}
+
+// Recognize a k-bearing carrier program by its CANONICAL op-shape: zero the
+// `RankLe(k)` immediate (`canonicalize_op_shape`), hash, match the canonical
+// table. Any `k` → the same canonical hash → its kind. Miss → nullopt (→ CustomJIT
+// for a genuine custom). Call AFTER `recognize_standard_kind` misses (the exact
+// k-invariant kinds take precedence; their bytecode carries no RankLe so they
+// can't false-match here either).
+inline std::optional<StandardSamplerKind>
+recognize_canonical_kind(const std::vector<StandardKindEntry>& table,
+                         const std::uint8_t* bytecode, std::size_t len) {
+    if (bytecode == nullptr || len == 0) return std::nullopt;
+    const std::vector<std::uint8_t> canon = canonicalize_op_shape(bytecode, len);
+    const std::uint64_t h = jit::fnv1a64(canon.data(), canon.size());
     for (const StandardKindEntry& e : table) {
         if (e.hash == h) return e.kind;
     }

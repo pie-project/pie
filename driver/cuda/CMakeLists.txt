@@ -730,7 +730,8 @@ if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/sampling_ir/codegen.cpp"
   # consts. (Guarded with the backend block since pie_standard_samplers.h needs
   # codegen.hpp for the binding-manifest types.)
   add_executable(test_sampling_ir_recognizer
-    tests/test_sampling_ir_recognizer.cpp)
+    tests/test_sampling_ir_recognizer.cpp
+    src/sampling_ir/reader.cpp)
   target_include_directories(test_sampling_ir_recognizer PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src)
   add_test(NAME sampling_ir_recognizer COMMAND test_sampling_ir_recognizer)

@@ -92,6 +92,14 @@ impl Sampler {
     /// This is the WS5 de-hardwiring bridge. **Stage 2**: foxtrot's guest emit
     /// re-targets the lowered program to a [`tensor::Program`](crate::tensor::Program)
     /// so it attaches via [`Forward::sampler`](crate::forward::Forward::sampler).
+    #[deprecated(
+        note = "emits the param-VARIANT sugar form (bakes T/p as constant_f32 immediates → \
+                a bytecode-only program the driver recognizer can't hash-match → CustomJIT, \
+                and that drops the submit params). Attach a sampler via the canonical \
+                `Forward::sampler` path, which lowers through `lower_sampler_standard` and \
+                threads the submit values. See #17."
+    )]
+    #[allow(deprecated)]
     pub fn lower(&self, vocab: u32) -> crate::Result<crate::program::LoweredProgram> {
         sampling_edsl::sugar::lower_sampler(self.clone().into(), vocab)
             .map_err(|e| format!("Sampler::lower: {e:?}"))
@@ -99,6 +107,7 @@ impl Sampler {
 }
 
 #[cfg(test)]
+#[allow(deprecated)] // exercises the deprecated `Sampler::lower` sugar bridge (kept until removal).
 mod ws5_sugar_tests {
     use super::Sampler;
     use sampling_edsl::OutputKind;

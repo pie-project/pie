@@ -9,9 +9,9 @@
 //! p/min_p@key1). When this greens, the inferlet (once golf wires the helper in)
 //! emits exactly what delta baked.
 
-use pie_sampling_ir::program_hash;
+use pie_sampling_ir::{Binding, Readiness, program_hash};
 use sampling_edsl::builder::Built;
-use sampling_edsl::standard::{StandardSampler, standard_program};
+use sampling_edsl::standard::{StandardSampler, build_standard, standard_program};
 use sampling_edsl::sugar::{SamplerSpec, lower_sampler_standard};
 use sampling_edsl::CanonicalKind;
 
@@ -119,4 +119,52 @@ fn repoint_k_bearing_bakes_k_and_submits_continuous_params() {
         standard_program(StandardSampler::TopKTopP { k: 40 }, QWEN3_VOCAB).unwrap();
     assert_eq!(built.lower().bytecode, std_bytes);
     assert_eq!(submit, vec![(0u32, f32le(0.8)), (1u32, f32le(0.9))]);
+}
+
+/// **Binding-template ordinal pin** (guard #3 of the can't-recur trio, with the
+/// key-half pin `repoint_submit_values_are_keyed_t0_filter1` + delta's param-dump).
+///
+/// There are TWO index spaces and conflating them silently mis-feeds FlashInfer:
+/// - **TensorKey** space: `temp.input_key()=0`, `filter.input_key()=1` (the logits
+///   intrinsic uses `Binding::Logits` and consumes no key). Submit binds by key.
+/// - **ORDINAL** space (the input-descriptor slot the host `param_extract` indexes):
+///   `ordinal 0 = Logits`, `ordinal 1 = temp{key:0}`, `ordinal 2 = filter{key:1}` —
+///   the keyed inputs shifted up by one by the logits intrinsic at ordinal 0.
+///
+/// This pins the ordinal/binding-template layout; any future drift (a reordered
+/// intrinsic, a key/ordinal swap) trips here rather than diverging on hardware.
+#[test]
+fn binding_template_ordinal_layout_is_pinned() {
+    let v = QWEN3_VOCAB;
+    let temp = Binding::Tensor { key: 0, ready: Readiness::Submit };
+    let filter = Binding::Tensor { key: 1, ready: Readiness::Submit };
+
+    // TopP / MinP / TopKTopP: [Logits@0, temp{key:0}@1, filter{key:1}@2].
+    // (TopKTopP bakes k into RankLe — not a binding; temp+top_p are the submit slots.)
+    for kind in [
+        StandardSampler::TopP,
+        StandardSampler::MinP,
+        StandardSampler::TopKTopP { k: 40 },
+    ] {
+        let (built, _) = build_standard(kind, v).unwrap();
+        assert_eq!(
+            built.bindings,
+            vec![Binding::Logits, temp, filter],
+            "{kind:?} binding template (ordinal layout)"
+        );
+    }
+
+    // TopK / Temperature: [Logits@0, temp{key:0}@1] (k baked; only T is submit).
+    for kind in [StandardSampler::TopK { k: 40 }, StandardSampler::Temperature] {
+        let (built, _) = build_standard(kind, v).unwrap();
+        assert_eq!(
+            built.bindings,
+            vec![Binding::Logits, temp],
+            "{kind:?} binding template (ordinal layout)"
+        );
+    }
+
+    // Argmax: [Logits@0] only — no params, no RNG.
+    let (built, _) = build_standard(StandardSampler::Argmax, v).unwrap();
+    assert_eq!(built.bindings, vec![Binding::Logits], "Argmax binding template");
 }

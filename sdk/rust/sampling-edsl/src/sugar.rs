@@ -55,6 +55,14 @@ fn is_greedy(t: f32) -> bool {
 }
 
 /// Build the IR program for `spec` at runtime `vocab`. `outputs = [Token]`.
+///
+/// # Legacy sugar — emits the param-VARIANT form
+/// This bakes temperature / `p` as `constant_f32` **immediates**, so the bytecode
+/// varies per param value and is **not recognizable or cacheable** by the driver's
+/// hash recognizer. For a program you intend to attach + dispatch, use
+/// [`lower_sampler_standard`] (the canonical, recognizable `standard_program` +
+/// submit values). `build_sampler` remains for building/inspecting the legacy
+/// sugar graph (e.g. the eval/structure tests); do not attach its lowering. See #17.
 pub fn build_sampler(spec: SamplerSpec, vocab: u32) -> Result<Built, BuildError> {
     let g = Graph::new(vocab);
     g.set_canonical_kind(canonical_kind(spec));
@@ -136,6 +144,12 @@ pub fn build_sampler(spec: SamplerSpec, vocab: u32) -> Result<Built, BuildError>
 
 /// Convenience: build then lower in one step (the host de-hardwire entry — just
 /// the bytecode; Model B needs no seed key).
+#[deprecated(
+    note = "emits the param-VARIANT sugar form: bakes T/p as constant_f32 immediates → \
+            a bytecode-only LoweredProgram that the driver recognizer can't hash-match \
+            (→ CustomJIT) and that drops the submit params. Use `lower_sampler_standard`, \
+            which emits the canonical recognizable `standard_program` + its submit values. See #17."
+)]
 pub fn lower_sampler(spec: SamplerSpec, vocab: u32) -> Result<LoweredProgram, BuildError> {
     Ok(build_sampler(spec, vocab)?.lower())
 }

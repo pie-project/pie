@@ -96,6 +96,19 @@ inline bool is_contiguous(const ProgramGroup& g) {
 void gather_logits_bf16(const void* src_base, std::span<const std::uint32_t> rows,
                         std::uint32_t vocab, void* dst, cudaStream_t stream);
 
+// Device: gather a group's per-row SCALAR params from a scattered `[*]` source
+// into a compact `[rows.size()]` destination (one 4-byte element per row) — the
+// #10-phase-2 marshalling kit. A scattered group launched over compact `[Ng,V]`
+// logits needs its per-row params (seed/temp/top_p/min_p) gathered to the SAME
+// compact order, else compact row r reads the wrong row's param (the input half
+// of the logits gather). `gather_f32` for temp/top_p/min_p; `gather_u32` for
+// seed (and the bit-compatible i32 top_k). Async on `stream`. (FlashInfer
+// top-k/p self-gather via `sample_idx`, so they take no explicit gather.)
+void gather_f32(const void* src_base, std::span<const std::uint32_t> rows,
+                void* dst, cudaStream_t stream);
+void gather_u32(const void* src_base, std::span<const std::uint32_t> rows,
+                void* dst, cudaStream_t stream);
+
 // Device: scatter a group's compact `[rows.size()]` i32 tokens back to the
 // original rows of a `[*]` destination (e.g. `pi.sampled`). Async on `stream`.
 void scatter_tokens_i32(const void* src_compact, std::span<const std::uint32_t> rows,

@@ -2,6 +2,7 @@
 //! spec-verify greedy/lossless) and the WS5 `Sampler` sugar, on PSIR v4.
 //! Each program builds, round-trips through the canonical encoder/decoder, and
 //! passes the canonical validator.
+#![allow(deprecated)] // exercises the deprecated WS5 sugar (`lower_sampler`) until removal.
 
 use sampling_edsl::ir::{self, Op};
 use sampling_edsl::program::{

@@ -10,6 +10,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -42,5 +43,19 @@ bool decode(const std::uint8_t* data, std::size_t len, Program& out, DecodeError
 // form into the inputs-first representation the codegen consumes.
 bool decode_v4(const std::uint8_t* data, std::size_t len,
                const std::vector<Binding>& slot_bindings, Program& out, DecodeError* err = nullptr);
+
+// #12 phase-2 op-shape canonicalization. Returns a copy of the program bytecode
+// with every `PivotThreshold` `RankLe(k)` predicate immediate zeroed (RankLe(0)),
+// so the k-bearing standard samplers (top-k / top-k-top-p) — whose ONLY parametric
+// byte is the baked `k` — hash to one k-invariant value regardless of `k`. Mirrors
+// `pie_sampling_ir::canonicalize_op_shape` (zero the immediate, not re-encode —
+// equivalent because the wire is canonical `ir::encode`). The value-id predicates
+// `CummassLe`/`ProbGe` are left untouched (precise, no false-match). A non-v4 /
+// malformed buffer is returned unchanged.
+std::vector<std::uint8_t> canonicalize_op_shape(const std::uint8_t* data, std::size_t len);
+
+// Extract the baked top-k cutoff `k` (the single `RankLe` immediate) from a
+// k-bearing standard program's op-shape. `nullopt` if no `RankLe` is present.
+std::optional<std::uint32_t> extract_rank_le_k(const std::uint8_t* data, std::size_t len);
 
 }  // namespace pie_cuda_driver::sampling_ir

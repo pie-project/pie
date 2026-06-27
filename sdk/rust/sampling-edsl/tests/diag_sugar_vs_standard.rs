@@ -2,6 +2,7 @@
 //! lower_sampler, params baked as constant_f32_dyn immediates) produce the SAME
 //! bytecode + hash as standard_program (params as HostSubmit inputs, delta's
 //! recognizer reference)? If not, recognize() misses the real inferlet program.
+#![allow(deprecated)] // the whole point is to exercise the deprecated sugar `lower_sampler`.
 use pie_sampling_ir::program_hash;
 use sampling_edsl::{SamplerSpec, StandardSampler, lower_sampler, standard_program};
 

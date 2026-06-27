@@ -58,9 +58,58 @@ int main() {
     CHECK(!recognize_standard_kind(table, nullptr, 0).has_value());
     CHECK(!recognize_standard_kind(table, junk, 0).has_value());
 
+    // ── #12 phase-2: canonical (op-shape) recognition of the k-bearing kinds ──
+    const std::vector<StandardKindEntry> canon_table = build_canonical_kind_table(V);
+    CHECK(canon_table.size() == 2);  // TopK + TopKTopP baked for V=151936
+
+    // Cross-language oracle: the baked CANONICAL hashes == foxtrot's fixture rows.
+    for (const StandardKindEntry& e : canon_table) {
+        if (e.kind == StandardSamplerKind::TopK)
+            CHECK(e.hash == 0x455494d83191da69ull);
+        if (e.kind == StandardSamplerKind::TopKTopP)
+            CHECK(e.hash == 0x95f84cc8d4e175ddull);
+    }
+
+    // Round-trip + k-invariance: the canonical (k=0) program recognizes; AND a
+    // synthesized k=40 variant (patch the RankLe payload at its known offset)
+    // canonicalizes to the SAME kind — proving the RankLe-zeroing finds the right
+    // immediate — with extract_rank_le_k reading 0 / 40 respectively.
+    struct KCase { StandardSamplerKind kind; std::size_t rank_le_off; };
+    for (KCase kc : {KCase{StandardSamplerKind::TopK, 58u},
+                     KCase{StandardSamplerKind::TopKTopP, 98u}}) {
+        const StandardSamplerProgram p = standard_canonical_program(kc.kind, V);
+        CHECK(p.valid);
+        if (!p.valid) continue;
+        auto got0 = recognize_canonical_kind(canon_table, p.bytecode, p.len);
+        CHECK(got0.has_value() && got0 == kc.kind);
+        CHECK(extract_rank_le_k(p.bytecode, p.len) == std::optional<std::uint32_t>(0u));
+
+        std::vector<std::uint8_t> k40(p.bytecode, p.bytecode + p.len);
+        k40[kc.rank_le_off] = 40; k40[kc.rank_le_off + 1] = 0;
+        k40[kc.rank_le_off + 2] = 0; k40[kc.rank_le_off + 3] = 0;
+        auto got40 = recognize_canonical_kind(canon_table, k40.data(), k40.size());
+        CHECK(got40.has_value() && got40 == kc.kind);
+        CHECK(extract_rank_le_k(k40.data(), k40.size()) == std::optional<std::uint32_t>(40u));
+        // a k-bearing program never EXACT-matches (it's not in the exact table).
+        CHECK(!recognize_standard_kind(table, k40.data(), k40.size()).has_value());
+    }
+
+    // No cross-table false-match: a k-invariant exact program has no RankLe →
+    // canonicalize is a no-op → its hash ≠ the canonical table; and a canonical
+    // k-bearing program is not in the exact table.
+    {
+        const StandardSamplerProgram tp = standard_sampler_program(StandardSamplerKind::TopP, V);
+        if (tp.valid)
+            CHECK(!recognize_canonical_kind(canon_table, tp.bytecode, tp.len).has_value());
+        const StandardSamplerProgram tk = standard_canonical_program(StandardSamplerKind::TopK, V);
+        if (tk.valid)
+            CHECK(!recognize_standard_kind(table, tk.bytecode, tk.len).has_value());
+    }
+
     if (g_failures == 0) {
-        std::fprintf(stderr, "sampling_ir_recognizer: OK (%zu baked kinds)\n",
-                     table.size());
+        std::fprintf(stderr,
+                     "sampling_ir_recognizer: OK (%zu exact + %zu canonical kinds)\n",
+                     table.size(), canon_table.size());
         return 0;
     }
     std::fprintf(stderr, "sampling_ir_recognizer: %d failure(s)\n", g_failures);
