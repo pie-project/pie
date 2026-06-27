@@ -916,7 +916,27 @@ impl pie::core::inference::HostForwardPass for InstanceState {
             // the single M=1 decode row (last token) when none were supplied so
             // the LM head still runs and the program samples there.
             if !logits_positions.is_empty() {
-                req.sampling_indices = logits_positions;
+                // The WIT `logits(positions)` carries ABSOLUTE sequence positions
+                // (SDK: `decode_pos = seq_len + n_pending - 1`), but the executor's
+                // sampling index is a RELATIVE row into this fire's `ws.logits`
+                // block ([N,V], one row per input token in feed order). Map each
+                // absolute position to its row via `position_ids`. Absolute ==
+                // relative only when the sequence starts at 0 (the prefill), so the
+                // raw positions sampled the right row on the first fire but read an
+                // out-of-range row on every decode (seq_len > 0) → argmax over
+                // unwritten logits → token 0.
+                req.sampling_indices = logits_positions
+                    .iter()
+                    .map(|&p| {
+                        req.position_ids
+                            .iter()
+                            .position(|&pos| pos == p)
+                            .map(|i| i as u32)
+                            .unwrap_or_else(|| {
+                                (req.token_ids.len() as u32).saturating_sub(1)
+                            })
+                    })
+                    .collect();
             } else if req.sampling_indices.is_empty() && !req.token_ids.is_empty() {
                 req.sampling_indices = vec![req.token_ids.len() as u32 - 1];
             }

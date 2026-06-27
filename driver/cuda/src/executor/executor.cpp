@@ -2011,6 +2011,7 @@ SamplePlanResult build_sample_plan(
 
     out.compact_logit_rows =
         executor.forward_fn.supports_compact_logits &&
+        !in.has_custom_program &&  // a custom IR program reads the full [N,V] block
         !in.is_pure_decode &&
         !in.have_custom_mask &&
         !out.has_msgpack_only_slots &&
@@ -2654,11 +2655,22 @@ void handle_fire_batch(
         const bool tp_greedy_argmax      = sp.tp_greedy_argmax;
         const bool single_gpu_greedy_argmax = sp.single_gpu_greedy_argmax;
         const bool dehardwire_baked_ir   = sp.dehardwire_baked_ir;
-        // De-hardwiring: force the non-graph forward path so it emits the full
-        // [N,V] logits (the captured graph would fuse/own the sampling); the IR
-        // program then samples over the emitted logits. `graph_shape_ok` is only
-        // consumed at the forward dispatch below, so overriding it here is safe.
-        if (dehardwire_baked_ir) {
+        // A custom IR sampling program (carrier path) owns the sampling and reads
+        // `ws.logits` via `try_run` — so, exactly like de-hardwiring, the forward
+        // must emit the full [N,V] logits. Otherwise a greedy custom fire takes the
+        // fused lm_head-argmax-only path (logits never materialized) and the IR
+        // argmax samples over unwritten logits → token 0. (Argmax routes to a
+        // DedicatedKernel, so this IR output path is unexercised until a real
+        // program-path argmax runs.)
+        const bool has_custom_program =
+            view.sampling_program_bytes_indptr.size() >= 2 &&
+            !view.sampling_program_bytes.empty();
+        // De-hardwiring / custom-program: force the non-graph forward path so it
+        // emits the full [N,V] logits (the captured graph would fuse/own the
+        // sampling); the IR program then samples over the emitted logits.
+        // `graph_shape_ok` is only consumed at the forward dispatch below, so
+        // overriding it here is safe.
+        if (dehardwire_baked_ir || has_custom_program) {
             graph_shape_ok = false;
         }
         const int  logit_rows_required   = sp.logit_rows_required;
@@ -2771,7 +2783,8 @@ void handle_fire_batch(
             !any_topk_topp &&
             all_slots_token &&
             all_rows_greedy &&
-            !dehardwire_baked_ir;  // de-hardwire needs full logits, not argmax-only
+            !dehardwire_baked_ir &&  // de-hardwire needs full logits, not argmax-only
+            !has_custom_program;     // a custom IR program samples over ws.logits → emit them
         forward_fn.invoke_set_logits_argmax_only(logits_argmax_only);
         const bool forward_handles_argmax =
             forward_fn.supports_fused_lmhead_argmax &&
@@ -2919,10 +2932,40 @@ void handle_fire_batch(
                 static_cast<std::size_t>(bhi - blo)};
             ctx.submit_inputs = submit_inputs;
             ctx.late_value_inputs = late_value_inputs;
+            // v4 binding manifest for program 0: the per-slot binding-map (Logits
+            // intrinsic vs keyed HostTensor) the binding-free v4 bytecode omits.
+            // Without it, get_or_compile routes to the v3 self-binding decoder,
+            // which rejects version 4 ("decode failed: version 4").
+            sampling_ir::ProgramManifest manifest;
+            if (view.sampling_binding_indptr.size() >= 2) {
+                const std::uint32_t mlo = view.sampling_binding_indptr.data()[0];
+                const std::uint32_t mhi = view.sampling_binding_indptr.data()[1];
+                manifest.reserve(mhi - mlo);
+                for (std::uint32_t i = mlo; i < mhi; ++i) {
+                    sampling_ir::InputBind b;
+                    if (view.sampling_binding_kind.data()[i] != 0 /* KIND_TENSOR */) {
+                        b.kind = sampling_ir::BindKind::HostTensor;
+                        b.host_key = view.sampling_binding_key.data()[i];
+                        b.ready = sampling_ir::HostAvailability::SubmitBound;
+                    } else {
+                        b.kind = sampling_ir::BindKind::Logits;
+                    }
+                    manifest.push_back(b);
+                }
+            }
+            ctx.manifest = std::move(manifest);
             ctx.logits = ws.logits.data();
             ctx.pi = &pi;
             ctx.vocab_size = engine.hf_config().vocab_size;
             ctx.sample_row = sample_row;
+            // Ambient per-row RNG seed S (Model B) for custom RNG programs (e.g.
+            // mirostat's Op::Rng). The de-hardwiring/#10 path sets this at its group
+            // base; the custom-program path must too, else a sampling custom's
+            // RowSeed buffer is unbound at launch (jit_backend bind_external skips it
+            // when args.row_seeds==nullptr). sample_row indexes the [N] seed block
+            // (= the seed legacy sample_temp uses for this row). Non-RNG customs
+            // (e.g. grammar's masked-argmax) declare no RowSeed and ignore it.
+            ctx.row_seeds = pi.sample_seed.data() + sample_row;
             ctx.prng_offset = static_cast<std::uint64_t>(handled);
             ctx.stream = cublas.stream();
             ir_status = executor.sampling_ir_runtime.try_run(ctx);

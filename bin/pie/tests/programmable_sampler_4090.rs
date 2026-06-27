@@ -180,6 +180,42 @@ async fn grammar_conforms_on_4090() -> Result<()> {
     Ok(())
 }
 
+/// Greedy minimal slice (bravo's isolator): boots the 4090 with the real cuda
+/// driver, runs the `generate` inferlet (`Sampler::TopK { temperature: 0.0,
+/// k: 1 }` ⇒ argmax — single-output, no submit-input), and asserts it produced
+/// real greedy tokens. Isolates the core carrier→argmax→`pi.sampled` path from
+/// grammar's mask-apply + mirostat's multi-output (the two failing sub-paths):
+/// if greedy tokens come back non-degenerate, the core custom-IR decode path is
+/// healthy on HW and the remaining bugs are sub-path-specific.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs the 4090 + HF-cached qwen-3-0.6b + a driver-cuda build"]
+async fn generate_greedy_on_4090() -> Result<()> {
+    let pie = common::boot_4090().await?;
+
+    let json = common::run_inferlet(
+        &pie.listen_addr,
+        "generate",
+        "generate@0.1.0",
+        "\"\"",
+    )
+    .await?;
+
+    pie.shutdown().await;
+
+    // The inferlet returns "generated N tokens: [t0, t1, ...]". The core
+    // carrier→argmax→pi.sampled path is healthy iff it generated the tokens
+    // and they are not the all-zero degenerate (the failure mode under test).
+    assert!(
+        json.contains("generated 5 tokens"),
+        "expected 5 greedy tokens; got: {json}"
+    );
+    assert!(
+        !json.contains("[0, 0, 0, 0, 0]"),
+        "greedy argmax produced all-zero tokens — core carrier→argmax→pi.sampled broken: {json}"
+    );
+    Ok(())
+}
+
 // NOTE — spec-verify (WS4) is **not** in this 4090 e2e pass: there is no
 // spec-verify inferlet yet (it needs a draft model + target model wired through
 // the stack, heavier than the single-model mirostat/grammar capabilities).

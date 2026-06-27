@@ -156,14 +156,14 @@ use anyhow::Context;
 use pie_client::client::Client;
 
 /// Build the capability inferlets to `wasm32-wasip2` and return
-/// `(wasm, manifest)` for `name` ∈ {"mirostat", "grammar"}. Paths resolve from
+/// `(wasm, manifest)` for `name` ∈ {"generate", "mirostat", "grammar"}. Paths resolve from
 /// the `bin/pie` crate dir to the runtime test-inferlets workspace. Builds both
 /// (one cargo invocation) so a multi-capability harness pays the build once.
 pub fn build_inferlet(name: &str) -> (PathBuf, PathBuf) {
     let workspace =
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../../runtime/tests/inferlets");
     let ok = Command::new("cargo")
-        .args(["build", "--target", "wasm32-wasip2", "-p", "mirostat", "-p", "grammar"])
+        .args(["build", "--target", "wasm32-wasip2", "-p", "generate", "-p", "mirostat", "-p", "grammar"])
         .current_dir(&workspace)
         .status()
         .expect("spawn cargo build for capability inferlets")

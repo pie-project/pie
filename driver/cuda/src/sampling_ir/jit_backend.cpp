@@ -140,13 +140,28 @@ ProgramHandle SamplingIrBackend::get_or_compile(std::span<const std::uint8_t> by
     //    v3/v2 bytecode is self-binding (`decode`); v4 is binding-free and takes
     //    the per-slot bindings from `manifest` (`decode_v4`), which shims the v4
     //    flat/Input-op form into the same inputs-first Program the codegen consumes.
+    //
+    //    Route by the bytecode's AUTHORITATIVE PSIR version field (the "PSIR" magic
+    //    then a little-endian u16 at offset 4), NOT by `manifest.empty()`. The old
+    //    emptiness proxy mis-routed a v4 program that arrived with an empty manifest
+    //    to the v2/v3 `decode`, which rejects version 4 (`reader.cpp` BadVersion) —
+    //    the carrier→driver consolidation seam. NB: version-routing only ensures v4
+    //    reaches `decode_v4`; v4 still binds one slot per input (decode_v4 asserts
+    //    `slot_bindings.size()==n_inputs`), so a v4 program WITH inputs still needs
+    //    its manifest populated by the carrier — this is hardening, not a substitute.
+    std::uint16_t psir_version = 0;
+    if (bytecode.size() >= 6 && bytecode[0] == 'P' && bytecode[1] == 'S' &&
+        bytecode[2] == 'I' && bytecode[3] == 'R') {
+        psir_version = static_cast<std::uint16_t>(
+            bytecode[4] | (static_cast<std::uint16_t>(bytecode[5]) << 8));
+    }
     Program program;
     DecodeError derr;
     const bool decoded =
-        manifest.empty()
-            ? decode(bytecode.data(), bytecode.size(), program, &derr)
-            : decode_v4(bytecode.data(), bytecode.size(),
-                        manifest_to_slot_bindings(manifest), program, &derr);
+        psir_version >= 4
+            ? decode_v4(bytecode.data(), bytecode.size(),
+                        manifest_to_slot_bindings(manifest), program, &derr)
+            : decode(bytecode.data(), bytecode.size(), program, &derr);
     if (!decoded) {
         last_error_ = "decode failed: " + derr.detail;
         return kInvalidProgram;

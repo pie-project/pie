@@ -161,6 +161,9 @@ struct PieForwardRequestView {
     PieSlice<std::uint8_t>  sampling_late_blob;             // host-late value bytes
     PieSlice<std::uint32_t> sampling_late_offsets;          // byte offset per late key
     PieSlice<std::uint32_t> sampling_late_lens;             // byte length per late key
+    PieSlice<std::uint8_t>  sampling_binding_kind;          // v4 manifest: per-slot bind kind (0=Logits,1=Tensor)
+    PieSlice<std::uint32_t> sampling_binding_key;           // v4 manifest: per-slot host key (Tensor only)
+    PieSlice<std::uint32_t> sampling_binding_indptr;        // per-program binding CSR
 
     // Sampler attributes (SoA — read from the wire SoA arrays; view.hpp
     // applies only the small kind-remap / top_k / top_p-min_p fold).
@@ -450,6 +453,12 @@ inline void fill_forward_view(const PieForwardRequestDesc& f,
         slice_from(f.sampling_late_offsets_ptr, f.sampling_late_offsets_len);
     out.sampling_late_lens =
         slice_from(f.sampling_late_lens_ptr, f.sampling_late_lens_len);
+    out.sampling_binding_kind =
+        slice_from(f.sampling_binding_kind_ptr, f.sampling_binding_kind_len);
+    out.sampling_binding_key =
+        slice_from(f.sampling_binding_key_ptr, f.sampling_binding_key_len);
+    out.sampling_binding_indptr =
+        slice_from(f.sampling_binding_indptr_ptr, f.sampling_binding_indptr_len);
     out.spec_token_ids    = slice_from(f.spec_token_ids_ptr, f.spec_token_ids_len);
     out.spec_position_ids = slice_from(f.spec_position_ids_ptr, f.spec_position_ids_len);
     out.spec_indptr       = slice_from(f.spec_indptr_ptr, f.spec_indptr_len);
