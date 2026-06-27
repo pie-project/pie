@@ -372,6 +372,111 @@ fn standard_programs_reference_set() {
 }
 
 #[test]
+fn standard_program_hashes_table_round_trips() {
+    use sampling_edsl::{standard_program_hashes, standard_programs};
+    use std::collections::HashMap;
+    let vocab = 128;
+    // The 4 k-invariant { program_hash → kind } entries (the #12 exact-hash table).
+    let table: HashMap<u64, CanonicalKind> =
+        standard_program_hashes(vocab).unwrap().into_iter().collect();
+    // All-distinct hashes ⇒ 4 entries, no collision — the recognizer is unambiguous.
+    assert_eq!(
+        table.len(),
+        4,
+        "the 4 k-invariant program hashes must be all-distinct"
+    );
+    // Behavior-preserving proof: each standard program, hashed via the canonical
+    // `program_hash`, recognizes its OWN kind through the table (enum→graph).
+    for (bytecode, kind) in standard_programs(vocab).unwrap() {
+        let recognized = table.get(&pie_sampling_ir::program_hash(&bytecode)).copied();
+        assert_eq!(recognized, Some(kind), "program must hash-match its own kind");
+    }
+}
+
+// ── phase-2 op-shape: k-bearing canonicalization (#12) ───────────────────────
+
+/// Canonicalize a freshly-built standard program (compose alpha's
+/// `canonicalize_op_shape`) and hash it with the same FNV-1a as phase-1.
+fn canonical_hash(kind: StandardSampler, vocab: u32) -> u64 {
+    let (built, _) = build_standard(kind, vocab).unwrap();
+    let mut program = built.program.clone();
+    pie_sampling_ir::canonicalize_op_shape(&mut program);
+    pie_sampling_ir::program_hash(&pie_sampling_ir::encode(&program))
+}
+
+#[test]
+fn standard_programs_canonical_is_k_invariant() {
+    use sampling_edsl::{standard_program_hashes_canonical, standard_programs_canonical};
+    let vocab = 128;
+
+    // The canonical op-shape is k-invariant: varying `k` → one canonical bytecode
+    // (the `RankLe(k)` immediate, the sole parametric byte, is zeroed).
+    assert_eq!(
+        canonical_hash(StandardSampler::TopK { k: 40 }, vocab),
+        canonical_hash(StandardSampler::TopK { k: 50 }, vocab),
+        "canonicalize(TopK{{40}}) must hash-equal canonicalize(TopK{{50}})"
+    );
+    assert_eq!(
+        canonical_hash(StandardSampler::TopKTopP { k: 40 }, vocab),
+        canonical_hash(StandardSampler::TopKTopP { k: 1000 }, vocab),
+        "canonicalize(TopKTopP{{40}}) must hash-equal canonicalize(TopKTopP{{1000}})"
+    );
+
+    // The canonical references join the recognizer table at the canonical hash.
+    let refs = standard_programs_canonical(vocab).unwrap();
+    let kinds: Vec<CanonicalKind> = refs.iter().map(|(_, k)| *k).collect();
+    assert_eq!(kinds, vec![CanonicalKind::TopK, CanonicalKind::TopKTopP]);
+    // Each reference's bytecode hashes to the canonical-hash of any-k of its kind.
+    let table: std::collections::HashMap<u64, CanonicalKind> =
+        standard_program_hashes_canonical(vocab).unwrap().into_iter().collect();
+    assert_eq!(
+        table.get(&canonical_hash(StandardSampler::TopK { k: 7 }, vocab)).copied(),
+        Some(CanonicalKind::TopK),
+        "any-k TopK must canonical-hash-match the TopK reference"
+    );
+    assert_eq!(
+        table.get(&canonical_hash(StandardSampler::TopKTopP { k: 999 }, vocab)).copied(),
+        Some(CanonicalKind::TopKTopP),
+        "any-k TopKTopP must canonical-hash-match the TopKTopP reference"
+    );
+}
+
+#[test]
+fn canonical_hashes_distinct_and_disjoint_from_phase1() {
+    use sampling_edsl::{standard_program_hashes, standard_program_hashes_canonical};
+    let vocab = 128;
+    // The 2 canonical k-bearing hashes are distinct from each other …
+    let canon = standard_program_hashes_canonical(vocab).unwrap();
+    let cset: std::collections::HashSet<u64> = canon.iter().map(|(h, _)| *h).collect();
+    assert_eq!(cset.len(), 2, "TopK and TopKTopP canonical hashes must differ");
+    // … and disjoint from the 4 phase-1 hashes — no false-match across the table.
+    let p1: std::collections::HashSet<u64> =
+        standard_program_hashes(vocab).unwrap().into_iter().map(|(h, _)| h).collect();
+    assert!(
+        cset.is_disjoint(&p1),
+        "canonical k-bearing hashes must not collide with phase-1 hashes"
+    );
+}
+
+#[test]
+fn extract_top_k_reads_baked_immediate() {
+    use sampling_edsl::extract_top_k;
+    let vocab = 128;
+    // k-bearing kinds expose their baked `k` ("op-shape yields k").
+    for k in [1u32, 40, 1000] {
+        let (built, _) = build_standard(StandardSampler::TopK { k }, vocab).unwrap();
+        assert_eq!(extract_top_k(&built.program), Some(k));
+        let (built, _) = build_standard(StandardSampler::TopKTopP { k }, vocab).unwrap();
+        assert_eq!(extract_top_k(&built.program), Some(k));
+    }
+    // k-invariant kinds have no RankLe op → no k to extract.
+    let (built, _) = build_standard(StandardSampler::TopP, vocab).unwrap();
+    assert_eq!(extract_top_k(&built.program), None);
+    let built = argmax(vocab).unwrap();
+    assert_eq!(extract_top_k(&built.program), None);
+}
+
+#[test]
 fn entropy_probe_structure_and_eval() {
     use sampling_edsl::program::entropy;
     let b = entropy(8).unwrap();

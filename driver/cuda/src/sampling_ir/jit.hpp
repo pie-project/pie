@@ -31,6 +31,8 @@
 
 #include <cuda.h>
 
+#include "sampling_ir/program_hash.hpp"  // jit::fnv1a64 (inline, canonical)
+
 // All JIT types live in the `::jit` sub-namespace so they never collide with
 // charlie's codegen types (`sampling_ir::KernelDAG`/`BufferDecl`/`KernelArg`)
 // or echo's runtime types in the parent `sampling_ir` namespace. The
@@ -269,7 +271,7 @@ class JitEngine {
 inline constexpr std::uint32_t kParamNumRows = 0;
 inline constexpr std::uint32_t kParamVocab = 1;
 
-// FNV-1a 64-bit hash, handy for keying the program cache off raw bytecode.
-std::uint64_t fnv1a64(const void* data, std::size_t len);
+// FNV-1a 64-bit hash (`program_hash.hpp`) — the canonical program identity /
+// cache key, header-inline. Re-exported here for existing `jit::fnv1a64` callers.
 
 }  // namespace pie_cuda_driver::sampling_ir::jit

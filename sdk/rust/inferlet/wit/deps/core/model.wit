@@ -7,6 +7,12 @@ interface model {
         load: static func(name: string) -> result<model, error>;
         tokenizer: func() -> tokenizer;
         default-system-speculation: func() -> bool;
+
+        /// Logits/output dimension (= `hf_config.vocab_size`). May EXCEED the
+        /// tokenizer's `vocabs()` token count due to padding. Use THIS for
+        /// sampler-program lowering and any logits-shaped op; use
+        /// `tokenizer().vocabs()` only for token-space work.
+        output-vocab-size: func() -> u32;
     }
 
     // Tokenizer resource for encoding and decoding text

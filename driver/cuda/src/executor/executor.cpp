@@ -44,6 +44,8 @@
 #include "sampling_ir/pie_standard_samplers.h"
 #include "sampling_ir/sampler_dispatch.hpp"
 #include "sampling_ir/group.hpp"
+#include "sampling_ir/program_recognizer.hpp"
+#include "sampling_ir/param_extract.hpp"
 #include "spec_expansion.hpp"
 
 namespace pie_cuda_driver {
@@ -1660,6 +1662,20 @@ struct SamplePlanInputs {
     bool have_custom_mask = false;
     bool has_spec_drafts = false;
     bool has_custom_program = false;
+    // #12 phase-1: a standard sampler program recognized from the (migrated)
+    // program contract. When set, the program's dedicated-kernel params have been
+    // extracted into the fields below; the per-slot loop seeds `per_slot_*` from
+    // them (the program carries no legacy slot params) so the flag-set + dispatch
+    // route the fire to the SAME kernel a slot fire would (FlashInfer top-p /
+    // sample_temp min-p / greedy argmax / BakedIR temp) instead of falling through
+    // to CustomJIT. An unrecognized program keeps has_custom_program=true →
+    // CustomJIT. Seed stays ambient (`pi.sample_seed`; seed_view empty →
+    // fresh_sampling_seed, exactly as the pre-migration multisamp slot fire).
+    bool program_recognized = false;
+    float rec_temp = 1.0f;
+    float rec_top_p = 1.0f;
+    float rec_min_p = 0.0f;
+    std::int32_t rec_top_k = 0;
 };
 
 // Per-fire decisions emitted by the sample-plan phase. The spans on
@@ -1909,8 +1925,10 @@ SamplePlanResult build_sample_plan(
                 const std::uint32_t type =
                     (s_idx < in.types_view.size()) ? in.types_view[s_idx] : 1u;
                 per_slot_type[k] = type;
-                const float T = (s_idx < in.temp_view.size()) ? h_temp[s_idx] : 1.f;
-                float Tp = (s_idx < in.top_p_view.size()) ? h_top_p[s_idx] : 1.f;
+                const float T = in.program_recognized ? in.rec_temp
+                    : (s_idx < in.temp_view.size()) ? h_temp[s_idx] : 1.f;
+                float Tp = in.program_recognized ? in.rec_top_p
+                    : (s_idx < in.top_p_view.size()) ? h_top_p[s_idx] : 1.f;
                 // Defensive (#7 boundary): valid top_p ∈ (0,1]; "no top-p" = 1.0
                 // (the driver default — confirmed: a non-top-p fire reads pi.top_p
                 // = 1.0, so top_p<=0 never occurs in prod). A degenerate top_p<=0
@@ -1919,9 +1937,11 @@ SamplePlanResult build_sample_plan(
                 // holds on every input incl. hotel's boundary fires. Never fires
                 // on a real fire; the recognizer (infer_kind) is left unchanged.
                 if (Tp <= 0.f) Tp = 1.f;
-                const float Mp = (s_idx < in.min_p_view.size()) ? h_min_p[s_idx] : 0.f;
-                const std::int32_t Tk_raw = (s_idx < in.top_k_view.size())
-                    ? static_cast<std::int32_t>(h_top_k[s_idx]) : 0;
+                const float Mp = in.program_recognized ? in.rec_min_p
+                    : (s_idx < in.min_p_view.size()) ? h_min_p[s_idx] : 0.f;
+                const std::int32_t Tk_raw = in.program_recognized ? in.rec_top_k
+                    : (s_idx < in.top_k_view.size())
+                        ? static_cast<std::int32_t>(h_top_k[s_idx]) : 0;
                 const std::int32_t Tk =
                     (Tk_raw == 0) ? executor.loaded_model.hf_config().vocab_size : Tk_raw;
                 std::uint32_t s = (s_idx < in.seed_view.size()) ? h_seed[s_idx] : 0u;
@@ -2616,6 +2636,99 @@ void handle_fire_batch(
             executor.rs_cache->set_verify_frozen(rs_frozen_verify);
         }
 
+        // ── #12 phase-1: recognize a standard sampler program ───────────
+        // The contract migration (#15) moved the sampler slot→program: a fire
+        // now carries the sampler as a bytecode program (with the legacy slot
+        // params EMPTY). Hash the program against the driver's own baked
+        // standard programs (`pie_standard_samplers.h`); a match → extract its
+        // dedicated-kernel params and plan the fire as the equivalent slot fire,
+        // restoring the pre-migration dispatch (FlashInfer top-p / sample_temp
+        // min-p / greedy argmax / BakedIR temp). A miss → a genuine custom
+        // program → CustomJIT via `try_run`, unchanged. Without this, every
+        // standard program falls through to CustomJIT (SplitMix64-Gumbel) ≠ the
+        // FlashInfer the slot fire used → silent token divergence.
+        bool program_recognized = false;
+        sampling_ir::DedicatedParams rec_params;
+        const bool prog_attached =
+            view.sampling_program_bytes_indptr.size() >= 2 &&
+            !view.sampling_program_bytes.empty();
+        if (prog_attached && num_sampling > 0) {
+            const std::uint32_t vocab = static_cast<std::uint32_t>(
+                executor.loaded_model.hf_config().vocab_size);
+            // Built once per vocab (fixed per model); per-fire = O(table) hash compare.
+            static thread_local std::uint32_t recog_vocab = 0;
+            static thread_local std::vector<sampling_ir::StandardKindEntry> recog_table;
+            if (recog_table.empty() || recog_vocab != vocab) {
+                recog_table = sampling_ir::build_standard_kind_table(vocab);
+                recog_vocab = vocab;
+            }
+            const std::uint32_t blo = view.sampling_program_bytes_indptr.data()[0];
+            const std::uint32_t bhi = view.sampling_program_bytes_indptr.data()[1];
+            const auto kind_opt = sampling_ir::recognize_standard_kind(
+                recog_table, view.sampling_program_bytes.data() + blo,
+                static_cast<std::size_t>(bhi - blo));
+            if (ir_trace && !kind_opt) {
+                const std::uint64_t wh = sampling_ir::jit::fnv1a64(
+                    view.sampling_program_bytes.data() + blo,
+                    static_cast<std::size_t>(bhi - blo));
+                std::cerr << "[ir-trace] recognize MISS wire_len=" << (bhi - blo)
+                          << " wire_hash=" << std::hex << wh << std::dec
+                          << " table_size=" << recog_table.size();
+                for (const auto& e : recog_table)
+                    std::cerr << " [k" << static_cast<int>(e.kind)
+                              << "]=" << std::hex << e.hash << std::dec;
+                std::cerr << "\n";
+            }
+            if (kind_opt) {
+                // Program 0's host-submit inputs (the WS1a slice) carry T@key0 +
+                // filter@key1; extract the dedicated params from them.
+                std::vector<sampling_ir::SubmitInput> rec_submit;
+                if (view.sampling_input_indptr.size() >= 2) {
+                    const std::uint32_t ilo = view.sampling_input_indptr.data()[0];
+                    const std::uint32_t ihi = view.sampling_input_indptr.data()[1];
+                    const std::uint8_t* blob = view.sampling_input_blob.data();
+                    for (std::uint32_t i = ilo; i < ihi; ++i) {
+                        sampling_ir::SubmitInput si;
+                        si.key = view.sampling_input_keys.data()[i];
+                        si.data = blob + view.sampling_input_offsets.data()[i];
+                        si.len_bytes = view.sampling_input_lens.data()[i];
+                        rec_submit.push_back(si);
+                    }
+                }
+                rec_params =
+                    sampling_ir::extract_dedicated_params(*kind_opt, rec_submit);
+                program_recognized = true;
+                if (ir_trace) {
+                    std::cerr << "[ir-trace] program recognized kind="
+                              << static_cast<int>(*kind_opt) << " T=" << rec_params.temp
+                              << " top_p=" << rec_params.top_p
+                              << " min_p=" << rec_params.min_p
+                              << " top_k=" << rec_params.top_k
+                              << " → dedicated dispatch\n";
+                }
+                // echo's free agreement guard (#7-step-1 analog, env-gated, prod
+                // default-off): the extracted params MUST re-classify (param
+                // recognizer + #7 normalizations) to the hash kind — a mis-extract
+                // (wrong key → wrong param) is caught here, pre-HW. Under
+                // PIE_RECOGNIZER_AUDIT we ALSO dump the extracted VALUES every
+                // recognized fire (not just on disagreement) — the #12 stage-2
+                // "param-dump" gate: HW-readable proof the route AND the values are
+                // right (e.g. top_p==0.9, T==0.8), catching a wrong-VALUE extract
+                // that the kind-only agreement check can't (0.5 and 0.9 both → TopP).
+                if (std::getenv("PIE_RECOGNIZER_AUDIT")) {
+                    const bool agree = sampling_ir::extracted_params_agree(
+                        *kind_opt, rec_params,
+                        executor.loaded_model.hf_config().vocab_size);
+                    std::cerr << "[extract-audit] " << (agree ? "OK" : "DISAGREE")
+                              << " hash_kind=" << static_cast<int>(*kind_opt)
+                              << " extracted(T=" << rec_params.temp
+                              << " top_p=" << rec_params.top_p
+                              << " min_p=" << rec_params.min_p
+                              << " top_k=" << rec_params.top_k << ")\n";
+                }
+            }
+        }
+
         // ── Sample-plan construction (hoisted) ──────────────────
         // Sampling stays outside the CUDA graph because sampler/probe
         // layouts can vary even when the decode shape is identical. The
@@ -2641,9 +2754,14 @@ void handle_fire_batch(
             .is_pure_decode    = is_pure_decode,
             .have_custom_mask  = have_custom_mask,
             .has_spec_drafts   = has_spec_drafts,
-            .has_custom_program =
-                (view.sampling_program_bytes_indptr.size() >= 2 &&
-                 !view.sampling_program_bytes.empty()),
+            // A recognized standard program is planned as the equivalent slot
+            // fire (not a custom program), so the dedicated ladder runs.
+            .has_custom_program = prog_attached && !program_recognized,
+            .program_recognized = program_recognized,
+            .rec_temp           = rec_params.temp,
+            .rec_top_p          = rec_params.top_p,
+            .rec_min_p          = rec_params.min_p,
+            .rec_top_k          = rec_params.top_k,
         });
         const bool has_rich_sampler_slots = sp.has_rich_sampler_slots;
         const bool need_msgpack          = sp.need_msgpack;
@@ -2662,9 +2780,12 @@ void handle_fire_batch(
         // argmax samples over unwritten logits → token 0. (Argmax routes to a
         // DedicatedKernel, so this IR output path is unexercised until a real
         // program-path argmax runs.)
+        // #12: a RECOGNIZED standard program is NOT custom — it runs the dedicated
+        // ladder (FlashInfer/sample_temp/argmax/BakedIR), so it follows the same
+        // logits-materialization rules as the equivalent slot fire (and lets the
+        // greedy-argmax fused path stay enabled when its kind is argmax).
         const bool has_custom_program =
-            view.sampling_program_bytes_indptr.size() >= 2 &&
-            !view.sampling_program_bytes.empty();
+            prog_attached && !program_recognized;
         // De-hardwiring / custom-program: force the non-graph forward path so it
         // emits the full [N,V] logits (the captured graph would fuse/own the
         // sampling); the IR program then samples over the emitted logits.
@@ -2878,6 +2999,7 @@ void handle_fire_batch(
         if (num_sampling > 0 &&
             view.sampling_program_bytes_indptr.size() >= 2 &&
             !view.sampling_program_bytes.empty() &&
+            !program_recognized &&  // #12: recognized standard → dedicated ladder, not CustomJIT
             ensure_sampling_ir_backend(executor) != nullptr) {
             const std::uint32_t blo = view.sampling_program_bytes_indptr.data()[0];
             const std::uint32_t bhi = view.sampling_program_bytes_indptr.data()[1];

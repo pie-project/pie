@@ -49,7 +49,9 @@ async fn main(input: String) -> Result<String> {
     let models = runtime::models();
     let model = Model::load(&models[0])?;
     let tokenizer = model.tokenizer();
-    let vocab = tokenizer.vocabs().0.len() as u32;
+    // Logits/output vocab (= hf_config.vocab_size), not the tokenizer token
+    // count: the sampler program is lowered + sampled over the logits dim.
+    let vocab = model.output_vocab_size();
 
     let mut context = Context::new(&model)?;
     let mut prompt = tokenizer.encode("hello world");

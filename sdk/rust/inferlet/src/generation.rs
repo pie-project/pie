@@ -33,8 +33,6 @@ use crate::forward::Output;
 use crate::pie::core::inference::ForwardPass;
 use crate::sample::Sampler;
 use crate::spec::Speculator;
-use crate::tensor;
-use sampling_edsl::ir;
 use std::collections::VecDeque;
 
 const GENERATION_RESERVATION_WINDOW_TOKENS: u32 = 512;
@@ -68,7 +66,7 @@ pub struct Generator<'ctx> {
     /// `tensor::Program`, its binding-free `Binding` template, and the output
     /// count. Compiled once on the first decode step and reused across steps
     /// (the program is binding-free, so only the attach-time bindings change).
-    program_cache: Option<(tensor::Program, Vec<ir::Binding>, u32)>,
+    program_cache: Option<crate::forward::LoweredSampler>,
     stop: Vec<u32>,
     max_tokens: Option<usize>,
     horizon: Option<usize>,
@@ -401,12 +399,27 @@ impl<'ctx> Generator<'ctx> {
     /// guest emit, caching it for reuse across decode steps.
     fn ensure_program(&mut self) -> Result<()> {
         if self.program_cache.is_none() {
-            let vocab = self.ctx.model.tokenizer().vocabs().0.len() as u32;
+            // Lower over the model's LOGITS vocab (output-vocab-size, e.g.
+            // 151936 for qwen3-0.6b), NOT the tokenizer token count — the
+            // sampler operates on logits, and the host recognizer + bake key on
+            // the logits vocab. (Using tokenizer vocab mis-shapes the program
+            // and misses the recognizer → CustomJIT.)
+            let vocab = self.ctx.model.output_vocab_size();
             let spec: sampling_edsl::SamplerSpec = self.sampler.clone().into();
-            let built = sampling_edsl::build_sampler(spec, vocab)
+            // (B) de-hardwiring: emit the canonical `standard_program` (params
+            // as host-submit tensors) so the host recognizer hash-matches;
+            // `submit_values` carry the per-fire params (T / top-p / min-p),
+            // reused across decode steps.
+            let (built, submit_values) = sampling_edsl::lower_sampler_standard(spec, vocab)
                 .map_err(|e| format!("Generator: lower sampler: {e:?}"))?;
             let program = crate::emit::emit_program(&built.program)?;
-            self.program_cache = Some((program, built.bindings, built.outputs.len() as u32));
+            self.program_cache = Some((
+                program,
+                built.bindings,
+                built.host_inputs,
+                built.outputs.len() as u32,
+                submit_values,
+            ));
         }
         Ok(())
     }
@@ -518,9 +531,14 @@ impl<'g, 'ctx> GenStep<'g, 'ctx> {
             parent.ensure_program()?;
             let decode_pos = parent.ctx.seq_len + n_pending - 1;
             {
-                let (program, template, _n_out) = parent.program_cache.as_ref().unwrap();
-                let bindings =
-                    crate::program::resolve_bindings(template, &[], &[decode_pos], &[])?;
+                let (program, template, host_inputs, _n_out, submit_values) =
+                    parent.program_cache.as_ref().unwrap();
+                let bindings = crate::program::resolve_bindings(
+                    template,
+                    host_inputs,
+                    &[decode_pos],
+                    submit_values,
+                )?;
                 pass.sampler(program, bindings);
             }
             let tensors = pass

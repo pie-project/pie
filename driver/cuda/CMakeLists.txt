@@ -721,6 +721,20 @@ if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/sampling_ir/codegen.cpp"
     CUDA::cudart CUDA::cuda_driver CUDA::nvrtc)
   add_test(NAME sampling_ir_backend COMMAND test_sampling_ir_backend)
 
+  # #12 driver-side program->kind recognizer (delta). Host-only: hashes the
+  # driver's OWN baked standard_sampler_program(k,V) into a {hash->kind} table and
+  # matches an incoming program by program_hash. The round-trip (baked program ->
+  # recognize -> same kind) proves the enum->graph behavior-preserving property
+  # driver-internally; golf's #8 recognizer_golden.txt extends it cross-language
+  # at #12-phase-1. No CUDA: program_hash is header-inline, the programs are baked
+  # consts. (Guarded with the backend block since pie_standard_samplers.h needs
+  # codegen.hpp for the binding-manifest types.)
+  add_executable(test_sampling_ir_recognizer
+    tests/test_sampling_ir_recognizer.cpp)
+  target_include_directories(test_sampling_ir_recognizer PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  add_test(NAME sampling_ir_recognizer COMMAND test_sampling_ir_recognizer)
+
   # Driver-level parity gate (lane L4 / echo): the IR argmax program, run through
   # echo's IProgramBackend exactly as the executor invokes it, must match the
   # legacy `launch_argmax_bf16` kernel over the same bf16 logits rows.

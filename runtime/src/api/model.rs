@@ -58,6 +58,11 @@ impl pie::core::model::HostModel for InstanceState {
         Ok(model.model.system_speculation_supported() && model.model.enable_system_speculation())
     }
 
+    async fn output_vocab_size(&mut self, this: Resource<Model>) -> Result<u32> {
+        let model = self.ctx().table.get(&this)?;
+        Ok(model.model.vocab_size())
+    }
+
     async fn drop(&mut self, this: Resource<Model>) -> Result<()> {
         self.ctx().table.delete(this)?;
         Ok(())

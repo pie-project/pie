@@ -16,10 +16,22 @@ use crate::Result;
 use crate::adapter::Adapter;
 use crate::context::Context;
 use crate::pie::core::inference::{ForwardPass, InputBinding};
-use crate::program::ProgramHandle;
+use crate::program::{HostInputDecl, ProgramHandle};
 use crate::sample::Sampler;
 use crate::tensor;
 use sampling_edsl::ir;
+
+/// A lowered standard sampler ready to attach: the tensor program, its
+/// binding-free template (`ir::Binding` per input slot), the host-input decls
+/// (shape/dtype per submit slot), the output count, and the per-fire submit
+/// values (standard-sampler params — T / top-p / min-p — keyed `T@0, filter@1`).
+pub(crate) type LoweredSampler = (
+    tensor::Program,
+    Vec<ir::Binding>,
+    Vec<HostInputDecl>,
+    u32,
+    Vec<(u32, Vec<u8>)>,
+);
 
 // =============================================================================
 // Sampler attach
@@ -46,9 +58,15 @@ impl AttachedProgram<'_> {
 enum SamplerBindings {
     /// Fully resolved by the caller (program-native [`Forward::sampler`]).
     Resolved(Vec<InputBinding>),
-    /// Sugar ([`Forward::sample`]): the lowered program's binding template,
-    /// whose `Logits` slot is bound to the decode position at execute.
-    SugarTemplate(Vec<ir::Binding>),
+    /// Sugar ([`Forward::sample`]): the lowered standard program's binding
+    /// template + host-input decls + submit values (the per-fire standard-sampler
+    /// params — temperature / top-p / min-p — bound as submit tensors). The
+    /// `Logits` slot is bound to the decode position at execute.
+    SugarTemplate {
+        template: Vec<ir::Binding>,
+        host_inputs: Vec<HostInputDecl>,
+        submit_values: Vec<(u32, Vec<u8>)>,
+    },
 }
 
 /// One tensor-program attached as the pass's sampler, kept until `execute`.
@@ -60,19 +78,24 @@ struct SamplerAttach<'p> {
 }
 
 /// Lower the ergonomic [`Sampler`] enum to a tensor [`Program`](tensor::Program)
-/// plus its binding-free [`Binding`](ir::Binding) template and output count.
-/// Routes through foxtrot's guest emit ([`crate::emit::emit_program`]) over
-/// alpha's zero-drift `op-kind` oracle. A sugar sampler binds only its `Logits`
-/// input and emits a single `Token` output.
-fn lower_sampler_to_program(
-    sampler: &Sampler,
-    vocab: u32,
-) -> Result<(tensor::Program, Vec<ir::Binding>, u32)> {
+/// plus its binding-free [`Binding`](ir::Binding) template, host-input decls,
+/// output count, and per-fire submit values. Routes through the **canonical
+/// `standard_program`** lowering ([`sampling_edsl::lower_sampler_standard`]):
+/// the standard-sampler params (T / top-p / min-p) are **host-submit tensors**
+/// (`submit_values`), not baked immediates — so the bytecode is param-INVARIANT
+/// and the host recognizer hash-matches it (the #12/#15 de-hardwiring contract).
+fn lower_sampler_to_program(sampler: &Sampler, vocab: u32) -> Result<LoweredSampler> {
     let spec: sampling_edsl::SamplerSpec = sampler.clone().into();
-    let built = sampling_edsl::build_sampler(spec, vocab)
+    let (built, submit_values) = sampling_edsl::lower_sampler_standard(spec, vocab)
         .map_err(|e| format!("Forward::sample: lower sampler: {e:?}"))?;
     let program = crate::emit::emit_program(&built.program)?;
-    Ok((program, built.bindings, built.outputs.len() as u32))
+    Ok((
+        program,
+        built.bindings,
+        built.host_inputs,
+        built.outputs.len() as u32,
+        submit_values,
+    ))
 }
 
 /// Builder for a single forward pass. Construct via
@@ -219,17 +242,24 @@ impl<'ctx> Forward<'ctx> {
         (0..outputs).map(ProgramHandle::new).collect()
     }
 
-    /// Ergonomic sugar: attach the legacy [`Sampler`] enum, lowered to a tensor
-    /// program for `vocab` (foxtrot's guest emit). The program's `Logits` input
-    /// is bound to the pass's decode position (the last auto-input token), so
-    /// call after [`input`](Self::input). Returns one [`ProgramHandle`] per
-    /// output (a sugar sampler yields a single `Token`); read it with
-    /// [`Output::token`].
-    pub fn sample(&mut self, sampler: Sampler, vocab: u32) -> Result<Vec<ProgramHandle>> {
-        let (program, template, outputs) = lower_sampler_to_program(&sampler, vocab)?;
+    /// Ergonomic sugar: attach the legacy [`Sampler`] enum, lowered to the
+    /// canonical `standard_program` over the model's **output (logits) vocab**
+    /// (derived internally via `output_vocab_size()` — a caller cannot supply
+    /// the wrong vocab). The program's `Logits` input is bound to the pass's
+    /// decode position (the last auto-input token), so call after
+    /// [`input`](Self::input). Returns one [`ProgramHandle`] per output (a sugar
+    /// sampler yields a single `Token`); read it with [`Output::token`].
+    pub fn sample(&mut self, sampler: Sampler) -> Result<Vec<ProgramHandle>> {
+        let vocab = self.ctx.model.output_vocab_size();
+        let (program, template, host_inputs, outputs, submit_values) =
+            lower_sampler_to_program(&sampler, vocab)?;
         self.sampler = Some(SamplerAttach {
             program: AttachedProgram::Owned(program),
-            bindings: SamplerBindings::SugarTemplate(template),
+            bindings: SamplerBindings::SugarTemplate {
+                template,
+                host_inputs,
+                submit_values,
+            },
         });
         Ok((0..outputs).map(ProgramHandle::new).collect())
     }
@@ -346,16 +376,27 @@ impl<'ctx> Forward<'ctx> {
         if let Some(SamplerAttach { program, bindings }) = sampler {
             let resolved = match bindings {
                 SamplerBindings::Resolved(b) => b,
-                SamplerBindings::SugarTemplate(template) => {
+                SamplerBindings::SugarTemplate {
+                    template,
+                    host_inputs,
+                    submit_values,
+                } => {
                     // Sugar: bind the program's `Logits` slot to the decode
                     // position (the last auto-input token). Requires an input.
+                    // The standard-sampler params ride `submit_values`, resolved
+                    // against `host_inputs` into submit tensors.
                     if n_auto == 0 {
                         return Err("Forward::sample: no input tokens — a sampler \
                             needs a decode position; call `input(...)` before `sample(...)`."
                             .to_string());
                     }
                     let decode_pos = ctx.seq_len + n_auto - 1;
-                    crate::program::resolve_bindings(&template, &[], &[decode_pos], &[])?
+                    crate::program::resolve_bindings(
+                        &template,
+                        &host_inputs,
+                        &[decode_pos],
+                        &submit_values,
+                    )?
                 }
             };
             pass.sampler(program.get(), resolved);

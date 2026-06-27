@@ -104,6 +104,24 @@ pub fn program_hash(bytecode: &[u8]) -> u64 {
     h
 }
 
+/// Canonicalize a program's k-bearing immediate so that programs differing ONLY
+/// in a baked `RankLe(k)` (the standard top-k / top-k-top-p samplers — temperature
+/// and top-p `p` are host-submit inputs, hence k-invariant) hash to **one** value.
+///
+/// Zeroes every `Op::PivotThreshold` `Predicate::RankLe(k) → RankLe(0)` in place;
+/// all other ops, and the value-id predicates `CummassLe`/`ProbGe`, are untouched —
+/// so a *custom* program carrying a `RankLe` plus extra ops canonicalizes to a
+/// *different* bytecode and cannot false-match (precise, not over-broad). The
+/// `#12` op-shape recognizer hashes `program_hash(&encode(canonicalized))` against
+/// the canonicalized `{TopK, TopKTopP}` references → kind, for any `k`.
+pub fn canonicalize_op_shape(program: &mut SamplingProgram) {
+    for op in &mut program.ops {
+        if let Op::PivotThreshold { predicate: Predicate::RankLe(k), .. } = op {
+            *k = 0;
+        }
+    }
+}
+
 #[cfg(test)]
 mod hash_tests {
     use super::program_hash;
@@ -115,5 +133,59 @@ mod hash_tests {
         assert_eq!(program_hash(b""), 0xcbf2_9ce4_8422_2325);
         assert_eq!(program_hash(b"a"), 0xaf63_dc4c_8601_ec8c);
         assert_eq!(program_hash(b"foobar"), 0x8594_4171_f739_67e8);
+    }
+}
+
+#[cfg(test)]
+mod canon_tests {
+    use super::canonicalize_op_shape;
+    use crate::types::*;
+    use crate::{encode, program_hash};
+    use alloc::vec;
+
+    fn topk(k: u32) -> SamplingProgram {
+        SamplingProgram {
+            inputs: vec![InputDecl::new(Shape::vector(8), DType::F32)],
+            ops: vec![
+                Op::Input(0),
+                Op::PivotThreshold { input: 0, predicate: Predicate::RankLe(k) },
+                Op::ReduceArgmax(1),
+            ],
+            outputs: vec![OutputDecl::new(2, OutputKind::Token)],
+        }
+    }
+
+    #[test]
+    fn canonicalize_makes_varying_k_hash_identical() {
+        // Two top-k programs differing ONLY in the baked RankLe(k) immediate
+        // canonicalize to one bytecode ⇒ one hash ⇒ recognized as TopK for any k.
+        let (mut a, mut b) = (topk(40), topk(50));
+        assert_ne!(encode(&a), encode(&b), "differ before canonicalization");
+        canonicalize_op_shape(&mut a);
+        canonicalize_op_shape(&mut b);
+        assert_eq!(encode(&a), encode(&b), "k-invariant after canonicalization");
+        assert_eq!(program_hash(&encode(&a)), program_hash(&encode(&b)));
+        assert!(matches!(
+            a.ops[1],
+            Op::PivotThreshold { predicate: Predicate::RankLe(0), .. }
+        ));
+    }
+
+    #[test]
+    fn canonicalize_leaves_value_id_predicates_untouched() {
+        // CummassLe/ProbGe carry value-id operands (host-submit), not immediates —
+        // canonicalization must leave them (and the bytecode) unchanged.
+        let mut p = SamplingProgram {
+            inputs: vec![InputDecl::new(Shape::vector(8), DType::F32)],
+            ops: vec![
+                Op::Input(0),
+                Op::PivotThreshold { input: 0, predicate: Predicate::CummassLe(0) },
+                Op::ReduceArgmax(1),
+            ],
+            outputs: vec![OutputDecl::new(2, OutputKind::Token)],
+        };
+        let before = encode(&p);
+        canonicalize_op_shape(&mut p);
+        assert_eq!(encode(&p), before, "non-RankLe predicates unchanged");
     }
 }

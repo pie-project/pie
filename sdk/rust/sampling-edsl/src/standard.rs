@@ -280,3 +280,89 @@ pub fn standard_programs(vocab: u32) -> Result<Vec<(Vec<u8>, CanonicalKind)>, Bu
     .map(|k| standard_program(k, vocab))
     .collect()
 }
+
+/// The `{ program_hash → CanonicalKind }` reference entries for the 4 k-invariant
+/// standard kinds at `vocab` — the exact-hash half of the #12 recognizer.
+///
+/// Each hash is [`program_hash`](crate::ir::program_hash) (the single FNV-1a ==
+/// the driver `ProgramHandle`) of the canonical bytecode from [`standard_programs`].
+/// The driver self-recognizes an attached program by matching its hash against
+/// these — which equal the driver's *own* baked-program hashes by canonical
+/// encode — and routes to the kind. The k-bearing kinds (TopK/TopKTopP) bake `k`
+/// into a `RankLe` immediate so their bytecode/hash varies by `k`; they are
+/// recognized structurally (op-shape), not by these fixed entries.
+pub fn standard_program_hashes(vocab: u32) -> Result<Vec<(u64, CanonicalKind)>, BuildError> {
+    Ok(standard_programs(vocab)?
+        .into_iter()
+        .map(|(bytecode, kind)| (crate::ir::program_hash(&bytecode), kind))
+        .collect())
+}
+
+/// A representative non-zero `k` used to build the k-bearing canonical references.
+/// The choice is irrelevant: [`canonicalize_op_shape`](crate::ir::canonicalize_op_shape)
+/// zeroes the `RankLe(k)` immediate, so any `k` yields the same canonical bytecode.
+const CANONICAL_REPRESENTATIVE_K: u32 = 40;
+
+/// The **canonicalized** op-shape references for the 2 k-bearing kinds
+/// (`TopK`, `TopKTopP`) at runtime `vocab` — the phase-2 byte-level guard
+/// (the `hex` column of the canonical fixture).
+///
+/// Unlike the 4 k-invariant kinds (whose bytecode is already fixed per `vocab`),
+/// the k-bearing kinds bake `k` into a `RankLe` immediate, so their raw bytecode
+/// varies by `k`. This builds each at a representative `k` and applies alpha's
+/// [`canonicalize_op_shape`](crate::ir::canonicalize_op_shape) (which zeroes the
+/// `RankLe(k)` immediate — the *sole* parametric byte, since temperature / top-p
+/// `p` are host-submit inputs). The result is **k-invariant**: every `TopK{any k}`
+/// canonicalizes to this one bytecode. Precise, not over-broad — a custom program
+/// with an extra op canonicalizes differently → no false-match → CustomJIT.
+pub fn standard_programs_canonical(vocab: u32) -> Result<Vec<(Vec<u8>, CanonicalKind)>, BuildError> {
+    [
+        StandardSampler::TopK {
+            k: CANONICAL_REPRESENTATIVE_K,
+        },
+        StandardSampler::TopKTopP {
+            k: CANONICAL_REPRESENTATIVE_K,
+        },
+    ]
+    .into_iter()
+    .map(|kind| {
+        let (built, _) = build_standard(kind, vocab)?;
+        let mut program = built.program.clone();
+        crate::ir::canonicalize_op_shape(&mut program);
+        Ok((crate::ir::encode(&program), kind.into()))
+    })
+    .collect()
+}
+
+/// The `{ canonical program_hash → CanonicalKind }` reference entries for the 2
+/// k-bearing standard kinds at `vocab` — the phase-2 half of the #12 recognizer,
+/// mirroring [`standard_program_hashes`].
+///
+/// On a phase-1 exact-hash miss, the recognizer canonicalizes the decoded program
+/// ([`canonicalize_op_shape`](crate::ir::canonicalize_op_shape)) and hashes it with
+/// the same FNV-1a [`program_hash`](crate::ir::program_hash); a match against these
+/// entries recognizes `TopK` / `TopKTopP` for *any* `k` (the kind), and
+/// [`extract_top_k`] reads the `k` for the dedicated kernel's `per_slot_top_k`.
+pub fn standard_program_hashes_canonical(
+    vocab: u32,
+) -> Result<Vec<(u64, CanonicalKind)>, BuildError> {
+    Ok(standard_programs_canonical(vocab)?
+        .into_iter()
+        .map(|(bytecode, kind)| (crate::ir::program_hash(&bytecode), kind))
+        .collect())
+}
+
+/// Extract the top-k cutoff `k` from a recognized `TopK` / `TopKTopP` program —
+/// the baked `RankLe(k)` immediate. `None` if there is no `RankLe` op (not a
+/// k-bearing standard form). The #12 **extract** path reads this to populate the
+/// dedicated kernel's `per_slot_top_k` ("op-shape yields `k`") — the *kind* comes
+/// from the canonical hash, the `k` from here.
+pub fn extract_top_k(program: &crate::ir::SamplingProgram) -> Option<u32> {
+    program.ops.iter().find_map(|op| match op {
+        crate::ir::Op::PivotThreshold {
+            predicate: crate::ir::Predicate::RankLe(k),
+            ..
+        } => Some(*k),
+        _ => None,
+    })
+}

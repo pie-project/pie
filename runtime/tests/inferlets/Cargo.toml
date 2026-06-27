@@ -9,6 +9,7 @@ members = [
     "mirostat",
     "tempgen",
     "multisamp",
+    "isolatedtopp",
 ]
 
 [workspace.dependencies]

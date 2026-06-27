@@ -40,8 +40,14 @@ pub mod sugar;
 pub use builder::{BuildError, Built, Graph, HostInputDecl, LoweredProgram, OutputKind};
 pub use dynamic::{DynValue, dselect};
 pub use kinds::{CanonicalKind, infer_kind};
-pub use standard::{StandardSampler, StdParamKeys, build_standard, standard_program, standard_programs};
-pub use sugar::{SamplerSpec, build_sampler, canonical_kind, lower_sampler};
+pub use standard::{
+    StandardSampler, StdParamKeys, build_standard, extract_top_k, standard_program,
+    standard_program_hashes, standard_program_hashes_canonical, standard_programs,
+    standard_programs_canonical,
+};
+pub use sugar::{
+    SamplerSpec, SubmitValues, build_sampler, canonical_kind, lower_sampler, lower_sampler_standard,
+};
 
 // IR enums an author touches at the surface.
 pub use ir::{DType, Readiness};

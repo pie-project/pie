@@ -11,7 +11,10 @@ use crate::dynamic::{
     dyn_gumbel_argmax, dyn_mask_to_score, dyn_min_p_mask, dyn_softmax, dyn_temperature_scale,
     dselect,
 };
+use crate::ir::TensorKey;
 use crate::kinds::{CanonicalKind, infer_kind};
+use crate::standard::{StandardSampler, StdParamKeys, build_standard};
+use alloc::vec::Vec;
 
 /// A legacy sampler spec (mirrors the SDK `Sampler` enum). golf translates the
 /// inferlet-facing `Sampler` into this.
@@ -135,4 +138,78 @@ pub fn build_sampler(spec: SamplerSpec, vocab: u32) -> Result<Built, BuildError>
 /// the bytecode; Model B needs no seed key).
 pub fn lower_sampler(spec: SamplerSpec, vocab: u32) -> Result<LoweredProgram, BuildError> {
     Ok(build_sampler(spec, vocab)?.lower())
+}
+
+/// Per-fire **submit values** for a standard program's continuous params:
+/// `(TensorKey, f32-little-endian bytes)`, ready to pass to the inferlet's
+/// `resolve_bindings` (T@key0, p/min_p@key1). Empty for greedy/argmax.
+pub type SubmitValues = Vec<(TensorKey, Vec<u8>)>;
+
+/// Lower a [`SamplerSpec`] to the **canonical** standard-sampler program
+/// ([`build_standard`]) plus the per-fire **submit values** for its continuous
+/// params — the #15/#12 production lowering (option B).
+///
+/// Unlike [`build_sampler`], which bakes temperature / `p` as `constant_f32`
+/// IMMEDIATES (→ param-VARIANT bytecode, a different hash per `p`, un-recognizable
+/// and un-cacheable), this emits the param-INVARIANT `standard_program` the driver
+/// recognizes by hash and caches per `vocab`, returning T / `p` / `min_p` as
+/// `(key, f32-le bytes)` submit values keyed by [`StdParamKeys`]. Bind them through
+/// the inferlet's `resolve_bindings` (the slots the sugar path left empty). `k`
+/// stays a baked immediate (`RankLe`, the group key → phase-2 op-shape).
+///
+/// The `SamplerSpec → StandardSampler` map runs through [`canonical_kind`], so the
+/// greedy collapse (`T <= 0 → Argmax`, which submits no params) is preserved
+/// exactly — the emitted program is byte-identical to what the driver baked, so
+/// `recognize()` hash-hits and `extract_dedicated_params` reads these submit slots.
+pub fn lower_sampler_standard(
+    spec: SamplerSpec,
+    vocab: u32,
+) -> Result<(Built, SubmitValues), BuildError> {
+    let std_kind = match canonical_kind(spec) {
+        CanonicalKind::Argmax => StandardSampler::Argmax,
+        CanonicalKind::Temperature => StandardSampler::Temperature,
+        CanonicalKind::MinP => StandardSampler::MinP,
+        CanonicalKind::TopP => StandardSampler::TopP,
+        CanonicalKind::TopK => StandardSampler::TopK { k: spec_k(spec) },
+        CanonicalKind::TopKTopP => StandardSampler::TopKTopP { k: spec_k(spec) },
+        // SamplerSpec's variants all classify to a standard token-sampler kind;
+        // Custom is unreachable from sugar, but route it to greedy defensively.
+        CanonicalKind::Custom => StandardSampler::Argmax,
+    };
+    let (built, keys) = build_standard(std_kind, vocab)?;
+    Ok((built, collect_submit_values(spec, &keys)))
+}
+
+/// The baked top-k cutoff for a k-bearing spec; `0` otherwise (never reached for a
+/// non-k-bearing canonical kind).
+fn spec_k(spec: SamplerSpec) -> u32 {
+    match spec {
+        SamplerSpec::TopK { k, .. } | SamplerSpec::TopKTopP { k, .. } => k,
+        _ => 0,
+    }
+}
+
+/// Collect the per-fire submit values for the params the chosen standard program
+/// actually declares (i.e. has a `Some` key for). Greedy specs collapse to Argmax
+/// (all keys `None`) → no submit values.
+fn collect_submit_values(spec: SamplerSpec, keys: &StdParamKeys) -> SubmitValues {
+    let (temperature, top_p, min_p) = match spec {
+        SamplerSpec::Argmax => (0.0, 1.0, 0.0),
+        SamplerSpec::Multinomial { temperature } => (temperature, 1.0, 0.0),
+        SamplerSpec::TopP { temperature, p } => (temperature, p, 0.0),
+        SamplerSpec::TopK { temperature, .. } => (temperature, 1.0, 0.0),
+        SamplerSpec::MinP { temperature, p } => (temperature, 1.0, p),
+        SamplerSpec::TopKTopP { temperature, p, .. } => (temperature, p, 0.0),
+    };
+    let mut submit = Vec::new();
+    if let Some(key) = keys.temperature {
+        submit.push((key, temperature.to_le_bytes().to_vec()));
+    }
+    if let Some(key) = keys.top_p {
+        submit.push((key, top_p.to_le_bytes().to_vec()));
+    }
+    if let Some(key) = keys.min_p {
+        submit.push((key, min_p.to_le_bytes().to_vec()));
+    }
+    submit
 }
