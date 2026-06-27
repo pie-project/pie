@@ -77,8 +77,6 @@ fn spawn_and_capture(s: &TestState, name: &str, input: String) -> Result<String,
             None,
             false,
             Some(tx),
-            None,
-            None,
         )
         .expect("spawn");
         rx

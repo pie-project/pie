@@ -89,8 +89,6 @@ fn spawn_and_capture(s: &TestState, name: &str, input: String) -> Result<String,
             None,
             false,
             Some(tx),
-            None, // no workflow
-            None, // token_budget
         )
         .expect("spawn");
         rx
