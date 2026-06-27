@@ -66,6 +66,14 @@ struct GrammarResult {
 /// **WS2 μ-convergence gate.** Asserts the mirostat run converged: S flowed
 /// end-to-end, the tail-mean surprise tracks τ within `tol`, and the run
 /// produced the expected token count.
+///
+/// **τ must be model-achievable.** mirostat truncates to tokens with surprise
+/// `≤ μ` and samples the kept (high-prob) set, so it can only drive surprise
+/// *up to* the model's natural full-dist sampling surprise (the loosest
+/// truncation). A τ above that ceiling (e.g. 3.0 vs qwen3-0.6b's ~2.1–2.6) is
+/// structurally unreachable → μ runs away and this gate only passes when the
+/// natural surprise coincidentally lands within `tol` of τ. Pass an achievable
+/// τ below the ceiling. (hotel diagnosis, 2026-06-27.)
 fn assert_mirostat_converged(json: &str, tol: f32) -> Result<(), String> {
     let r: MirostatResult =
         serde_json::from_str(json).map_err(|e| format!("mirostat JSON parse: {e}"))?;
@@ -130,29 +138,87 @@ fn assert_grammar_conformant(json: &str, alphabet: &[u32]) -> Result<(), String>
 // 4090 capability tests (one boot per process → one `#[ignore]` test each).
 // ---------------------------------------------------------------------------
 
-/// **WS2 — mirostat μ→τ convergence on real qwen-3-0.6b logits.** Boots the
-/// real cuda driver, runs the mirostat inferlet (`{"max_tokens":48}` for a
-/// robust tail), and asserts the adaptive sampler drove the decode's surprise to
-/// the target τ within tolerance — the on-GPU proof of the programmable mirostat
-/// sampler (Token+Scalar multi-output path, the S channel feeding the μ-update).
+/// **WS2 — mirostat μ-control convergence on real qwen-3-0.6b logits.** Boots the
+/// real cuda driver, runs the mirostat inferlet at an **achievable** target
+/// `{"tau":1.5,"max_tokens":64}`, and asserts the adaptive sampler drove the
+/// decode's tail-mean surprise to τ within tolerance — the on-GPU proof that the
+/// programmable mirostat μ-control loop genuinely regulates perplexity (Token+Scalar
+/// multi-output path, the S channel feeding the μ-update). τ is chosen below the
+/// model's natural sampling-surprise ceiling so mirostat's downward truncation can
+/// actually reach it (an unreachable τ>ceiling makes μ run away and only "passes"
+/// on coincidence — see the test body).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "needs the 4090 + HF-cached qwen-3-0.6b + a driver-cuda build"]
 async fn mirostat_converges_on_4090() -> Result<()> {
     let pie = common::boot_4090().await?;
 
+    // τ=1.5 is BELOW qwen3-0.6b's natural sampling-surprise ceiling (measured
+    // ≈2.2 nats — see `mirostat_tau_sweep_on_4090`), so mirostat truncates
+    // *downward* to reach it → μ settles (no runaway) → genuine convergence.
+    // τ=3.0 (the inferlet default) is ABOVE that ceiling and structurally
+    // unreachable (mirostat can only drive surprise up to the full-dist surprise:
+    // at τ=3.0 the 4090 gives tail≈2.2, μ runs away to ≈23.8, |tail−τ|≈0.80), so
+    // the gate would only pass by coincidence when the natural surprise happens to
+    // land within tol of τ. 64 steps gives a stable tail. (Diagnosis: hotel,
+    // 2026-06-27; verified on the 4090 at dev 00db408d.)
     let json = common::run_inferlet(
         &pie.listen_addr,
         "mirostat",
         "mirostat@0.1.0",
-        r#"{"max_tokens":48}"#,
+        r#"{"tau":1.5,"max_tokens":64}"#,
     )
     .await?;
 
     pie.shutdown().await;
 
-    // τ=3.0 default; 0.6 nats tolerance on the tail-mean surprise (golf's robust
-    // 48-step tail). A real adaptive controller settles |S̄−τ| well inside this.
+    // Genuine μ-control: tail-mean surprise tracks the ACHIEVABLE τ=1.5 within tol.
+    // Measured on the 4090: |tail−τ| ≈ 0.04 over two independent runs (μ settles
+    // at ≈3.5–6.8, not the τ=3.0 runaway) — tol 0.6 leaves >10× margin while still
+    // failing the unreachable-τ runaway (|tail−τ|≈0.80 at τ=3.0).
     assert_mirostat_converged(&json, 0.6).map_err(|e| anyhow::anyhow!("mirostat: {e}\njson={json}"))?;
+    Ok(())
+}
+
+/// **WS2 — mirostat τ-sweep diagnostic (one boot).** Runs the mirostat inferlet
+/// at several targets τ ∈ {1.0, 1.5, 2.0, 3.0} against real qwen-3-0.6b logits and
+/// prints `final_mu` / `tail_mean_surprise` / `|tail−τ|` per τ. Empirically locates
+/// the model's natural sampling-surprise ceiling: at τ **below** the ceiling μ
+/// settles and `tail≈τ` (genuine downward control); at τ **above** it μ runs away
+/// (`final_mu` ≫ τ) and `tail` saturates at the ceiling (target unreachable). Not a
+/// gate — it's the data that justifies the achievable τ in `mirostat_converges_on_4090`.
+/// Run with `--nocapture` to read the table.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs the 4090 + HF-cached qwen-3-0.6b + a driver-cuda build"]
+async fn mirostat_tau_sweep_on_4090() -> Result<()> {
+    let pie = common::boot_4090().await?;
+
+    eprintln!("[MIROSTAT-SWEEP] tau | final_mu | tail_surprise | mean_surprise | |tail-tau| | settled?");
+    let mut rows: Vec<(f32, f32, f32, f32)> = Vec::new();
+    for tau in [1.0_f32, 1.5, 2.0, 3.0] {
+        let input = format!(r#"{{"tau":{tau},"max_tokens":64}}"#);
+        let json = common::run_inferlet(&pie.listen_addr, "mirostat", "mirostat@0.1.0", &input).await?;
+        let r: MirostatResult =
+            serde_json::from_str(&json).map_err(|e| anyhow::anyhow!("sweep parse: {e}\njson={json}"))?;
+        // "settled" ⇒ μ did not run away (stays within a few nats of τ, not ≫ τ).
+        let settled = r.final_mu <= tau + 3.0;
+        eprintln!(
+            "[MIROSTAT-SWEEP] {:>3.1} | {:>8.3} | {:>13.4} | {:>13.4} | {:>9.4} | {}",
+            tau,
+            r.final_mu,
+            r.tail_mean_surprise,
+            r.mean_surprise,
+            (r.tail_mean_surprise - tau).abs(),
+            if settled { "yes" } else { "RUNAWAY" },
+        );
+        assert!(r.s_flowed, "sweep τ={tau}: S channel did not flow (μ-update path broken)");
+        rows.push((tau, r.final_mu, r.tail_mean_surprise, r.mean_surprise));
+    }
+    pie.shutdown().await;
+
+    // The ceiling is ≈ the max tail-surprise reached across the sweep (the loosest
+    // truncation — what μ saturates toward when τ is unreachable).
+    let ceiling = rows.iter().map(|&(_, _, t, _)| t).fold(f32::MIN, f32::max);
+    eprintln!("[MIROSTAT-SWEEP] natural sampling-surprise ceiling ≈ {ceiling:.4} nats");
     Ok(())
 }
 

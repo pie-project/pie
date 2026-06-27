@@ -47,8 +47,17 @@ pub type Check = Result<(), String>;
 /// **WS2 μ-convergence gate.** Asserts the mirostat run converged: S flowed
 /// end-to-end, the tail-mean surprise tracks τ within `tol`, and the run
 /// produced the expected token count. This is the authoritative on-GPU proof
-/// that the programmable mirostat sampler drives the distribution to the target
-/// surprise.
+/// that the programmable mirostat μ-control loop genuinely regulates the
+/// distribution's surprise to the target τ.
+///
+/// **τ must be model-achievable.** mirostat truncates to tokens with surprise
+/// `≤ μ` and samples the kept (high-prob) set, so it can only drive surprise
+/// *up to* the model's natural full-dist sampling surprise (the loosest
+/// truncation). A τ **above** that ceiling (e.g. 3.0 vs qwen3-0.6b's ~2.1–2.6)
+/// is structurally unreachable → μ runs away and the gate only passes when the
+/// natural surprise coincidentally lands within `tol` of τ (a false-green). Pick
+/// τ below the ceiling so mirostat truncates *downward* to reach it → genuine
+/// convergence. (hotel diagnosis, 2026-06-27.)
 pub fn assert_mirostat_converged(json: &str, tol: f32) -> Check {
     let r: MirostatResult =
         serde_json::from_str(json).map_err(|e| format!("mirostat JSON parse: {e}"))?;
