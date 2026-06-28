@@ -16,6 +16,7 @@ members = [
     "specverify",
     "specgreedy",
     "grammarmb",
+    "selfspec",
 ]
 
 [workspace.dependencies]
