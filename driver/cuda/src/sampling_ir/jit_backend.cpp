@@ -123,34 +123,14 @@ ProgramHandle SamplingIrBackend::get_or_compile(std::span<const std::uint8_t> by
     const ProgramHandle handle = keyed ? keyed : 1;  // reserve 0 = kInvalidProgram
     if (programs_.find(handle) != programs_.end()) return handle;
 
-    // 1. Decode the IR (for input/output binding metadata: host keys, kinds).
-    //    v3/v2 bytecode is self-binding (`decode`); v4 is binding-free and takes
-    //    the per-slot bindings from `manifest` (`decode_v4`), which shims the v4
-    //    flat/Input-op form into the same inputs-first Program the codegen consumes.
-    //
-    //    Route by the bytecode's AUTHORITATIVE PSIR version field (the "PSIR" magic
-    //    then a little-endian u16 at offset 4), NOT by `manifest.empty()`. The old
-    //    emptiness proxy mis-routed a v4 program that arrived with an empty manifest
-    //    to the v2/v3 `decode`, which rejects version 4 (`reader.cpp` BadVersion) —
-    //    the carrier→driver consolidation seam. NB: version-routing only ensures v4
-    //    reaches `decode_v4`; v4 still binds one slot per input (decode_v4 asserts
-    //    `slot_bindings.size()==n_inputs`), so a v4 program WITH inputs still needs
-    //    its manifest populated by the carrier — this is hardening, not a substitute.
-    std::uint16_t psir_version = 0;
-    if (bytecode.size() >= 6 && bytecode[0] == 'P' && bytecode[1] == 'S' &&
-        bytecode[2] == 'I' && bytecode[3] == 'R') {
-        psir_version = static_cast<std::uint16_t>(
-            bytecode[4] | (static_cast<std::uint16_t>(bytecode[5]) << 8));
-    }
+    // 1. Decode the IR -> Program (input/output binding metadata: host keys,
+    //    kinds). The version routing (v4 binding-free via `manifest` vs v2/v3
+    //    self-binding) lives in decode_program, shared with the thread-safe
+    //    prefetch path.
     Program program;
-    DecodeError derr;
-    const bool decoded =
-        psir_version >= 4
-            ? decode_v4(bytecode.data(), bytecode.size(),
-                        manifest_to_slot_bindings(manifest), program, &derr)
-            : decode(bytecode.data(), bytecode.size(), program, &derr);
-    if (!decoded) {
-        last_error_ = "decode failed: " + derr.detail;
+    std::string derr;
+    if (!decode_program(bytecode, manifest, program, &derr)) {
+        last_error_ = derr;
         return kInvalidProgram;
     }
     return compile_decoded(program, keyed);
@@ -160,72 +140,18 @@ ProgramHandle SamplingIrBackend::compile_decoded(const Program& program,
                                                  std::uint64_t keyed) {
     const ProgramHandle handle = keyed ? keyed : 1;  // reserve 0 = kInvalidProgram
 
-    // 2. Lower IR -> fused CUDA-C kernel DAG (charlie's codegen). Batched
-    //    lowering emits one grid=num_rows kernel; the JIT supplies the dynamic
-    //    grid + capacity-sized batched buffers.
-    //
-    //    FALLBACK: the batched emit path doesn't cover every op (Gather /
-    //    GatherRow / Scatter* / SortDesc are M=1-only — e.g. mirostat's
-    //    `gather`). When batched lowering is requested but rejects such an op
-    //    (`lr.ok == false`), fall back to M=1 lowering so the program still runs
-    //    (per-row), keeping custom samplers green while standard samplers (no
-    //    such op) stay on the batched fast path. This makes "always-batched" the
-    //    production default safe for the open programmable surface.
-    bool batched_mode = batched_lowering_;
-    LowerResult lr = lower(program, LowerOptions{/*batched=*/batched_lowering_});
-    if (batched_lowering_ && !lr.ok) {
-        LowerResult m1 = lower(program, LowerOptions{/*batched=*/false});
-        if (m1.ok) {
-            lr = std::move(m1);
-            batched_mode = false;  // M=1 per-row fallback
-        }
-    }
+    // 2. Lower IR -> KernelDAG (batched with M=1 fallback) via lower_with_fallback,
+    //    shared with prefetch_compile.
+    bool batched_mode = false;
+    LowerResult lr = lower_with_fallback(program, batched_mode);
     if (!lr.ok) {
         last_error_ = "lower failed: " + lr.error;
         return kInvalidProgram;
     }
 
-    // 3. Adapt codegen KernelDAG -> jit::KernelDAG. Grid is recomputed per fire
-    //    from num_rows (Param 0) via the launch shape, so M>1 batches scale in a
-    //    single launch; vocab for grid-stride comes from the launch param table.
-    std::uint32_t vocab = 0;
-    for (const BufferDecl& b : lr.dag.buffers)
-        if (b.cls == BufferClass::IntrinsicLogits) vocab = b.elem_count;
-
-    jit::KernelDAG jdag;
-    jdag.hash = keyed;
-    jdag.buffers.reserve(lr.dag.buffers.size());
-    for (const BufferDecl& b : lr.dag.buffers) {
-        jit::BufferDecl jb;
-        jb.id = b.id;
-        jb.size_bytes = b.byte_size();  // per-row; JIT scales by num_rows if batched
-        jb.dtype = to_jit_dtype(b.dtype);
-        jb.external = (b.cls != BufferClass::Intermediate);
-        jb.batched = b.batched;  // batched lowering: per-row size, JIT scales by num_rows
-        jdag.buffers.push_back(jb);
-    }
-    jdag.kernels.reserve(lr.dag.kernels.size());
-    for (const KernelDesc& k : lr.dag.kernels) {
-        std::uint32_t len = 0;
-        if (k.shape == LaunchShape::GridStrideOverLen &&
-            k.len_buffer < lr.dag.buffers.size()) {
-            len = lr.dag.buffers[k.len_buffer].elem_count;  // per-row element count
-        }
-        // Baked dims (M=1 / Custom fallback); dynamic shapes recompute grid.x/fire.
-        const LaunchDims d = compute_launch_dims(k.shape, /*num_rows=*/1, vocab,
-                                                 len, k.custom_grid, k.custom_block);
-        jit::KernelDef jk;
-        jk.name = k.entry_name;
-        jk.source = k.source;
-        jk.grid = {d.grid_x, 1, 1};
-        jk.block = {d.block_x, 1, 1};
-        jk.shared_bytes = k.shared_bytes;
-        jk.grid_shape = to_jit_grid_shape(k.shape);
-        jk.per_row_len = len;
-        jk.args.reserve(k.args.size());
-        for (const KernelArg& a : k.args) jk.args.push_back(to_jit_arg(a));
-        jdag.kernels.push_back(std::move(jk));
-    }
+    // 3. Adapt the codegen KernelDAG -> jit::KernelDAG (shared with prefetch via
+    //    build_jdag).
+    jit::KernelDAG jdag = build_jdag(lr, keyed);
 
     // 4. NVRTC-compile + allocate via the JIT engine.
     jit::CompiledProgram* prog = nullptr;
@@ -307,6 +233,125 @@ ProgramHandle SamplingIrBackend::compile_decoded(const Program& program,
 
     programs_.emplace(handle, std::move(entry));
     return handle;
+}
+
+bool SamplingIrBackend::decode_program(std::span<const std::uint8_t> bytecode,
+                                       const ProgramManifest& manifest,
+                                       Program& out, std::string* err) const {
+    // Route by the bytecode's AUTHORITATIVE PSIR version field (the "PSIR" magic
+    // then a little-endian u16 at offset 4), NOT by `manifest.empty()`. The old
+    // emptiness proxy mis-routed a v4 program that arrived with an empty manifest
+    // to the v2/v3 `decode`, which rejects version 4 (`reader.cpp` BadVersion) —
+    // the carrier→driver consolidation seam. v3/v2 self-bind (`decode`); v4 is
+    // binding-free and takes per-slot bindings from `manifest` (`decode_v4`). NB:
+    // v4 still binds one slot per input (decode_v4 asserts size==n_inputs), so a
+    // v4 program WITH inputs still needs its manifest populated by the carrier.
+    std::uint16_t psir_version = 0;
+    if (bytecode.size() >= 6 && bytecode[0] == 'P' && bytecode[1] == 'S' &&
+        bytecode[2] == 'I' && bytecode[3] == 'R') {
+        psir_version = static_cast<std::uint16_t>(
+            bytecode[4] | (static_cast<std::uint16_t>(bytecode[5]) << 8));
+    }
+    DecodeError derr;
+    const bool decoded =
+        psir_version >= 4
+            ? decode_v4(bytecode.data(), bytecode.size(),
+                        manifest_to_slot_bindings(manifest), out, &derr)
+            : decode(bytecode.data(), bytecode.size(), out, &derr);
+    if (!decoded) {
+        if (err) *err = "decode failed: " + derr.detail;
+        return false;
+    }
+    return true;
+}
+
+LowerResult SamplingIrBackend::lower_with_fallback(const Program& program,
+                                                   bool& batched_mode) const {
+    // Batched lowering emits one grid=num_rows kernel; FALLBACK to M=1 when the
+    // batched emit rejects an op (Gather/GatherRow/Scatter*/SortDesc are M=1-only,
+    // e.g. mirostat's gather) so custom samplers stay green while standard samplers
+    // ride the batched fast path. "always-batched" is the safe production default.
+    batched_mode = batched_lowering_;
+    LowerResult lr = lower(program, LowerOptions{/*batched=*/batched_lowering_});
+    if (batched_lowering_ && !lr.ok) {
+        LowerResult m1 = lower(program, LowerOptions{/*batched=*/false});
+        if (m1.ok) {
+            lr = std::move(m1);
+            batched_mode = false;  // M=1 per-row fallback
+        }
+    }
+    return lr;
+}
+
+jit::KernelDAG SamplingIrBackend::build_jdag(const LowerResult& lr,
+                                             std::uint64_t keyed) const {
+    // Adapt codegen KernelDAG -> jit::KernelDAG. Grid is recomputed per fire from
+    // num_rows (Param 0) via the launch shape, so M>1 batches scale in a single
+    // launch; vocab for grid-stride comes from the launch param table.
+    std::uint32_t vocab = 0;
+    for (const BufferDecl& b : lr.dag.buffers)
+        if (b.cls == BufferClass::IntrinsicLogits) vocab = b.elem_count;
+
+    jit::KernelDAG jdag;
+    jdag.hash = keyed;
+    jdag.buffers.reserve(lr.dag.buffers.size());
+    for (const BufferDecl& b : lr.dag.buffers) {
+        jit::BufferDecl jb;
+        jb.id = b.id;
+        jb.size_bytes = b.byte_size();  // per-row; JIT scales by num_rows if batched
+        jb.dtype = to_jit_dtype(b.dtype);
+        jb.external = (b.cls != BufferClass::Intermediate);
+        jb.batched = b.batched;  // batched lowering: per-row size, JIT scales by num_rows
+        jdag.buffers.push_back(jb);
+    }
+    jdag.kernels.reserve(lr.dag.kernels.size());
+    for (const KernelDesc& k : lr.dag.kernels) {
+        std::uint32_t len = 0;
+        if (k.shape == LaunchShape::GridStrideOverLen &&
+            k.len_buffer < lr.dag.buffers.size()) {
+            len = lr.dag.buffers[k.len_buffer].elem_count;  // per-row element count
+        }
+        // Baked dims (M=1 / Custom fallback); dynamic shapes recompute grid.x/fire.
+        const LaunchDims d = compute_launch_dims(k.shape, /*num_rows=*/1, vocab,
+                                                 len, k.custom_grid, k.custom_block);
+        jit::KernelDef jk;
+        jk.name = k.entry_name;
+        jk.source = k.source;
+        jk.grid = {d.grid_x, 1, 1};
+        jk.block = {d.block_x, 1, 1};
+        jk.shared_bytes = k.shared_bytes;
+        jk.grid_shape = to_jit_grid_shape(k.shape);
+        jk.per_row_len = len;
+        jk.args.reserve(k.args.size());
+        for (const KernelArg& a : k.args) jk.args.push_back(to_jit_arg(a));
+        jdag.kernels.push_back(std::move(jk));
+    }
+    return jdag;
+}
+
+void SamplingIrBackend::prefetch_compile(std::span<const std::uint8_t> bytecode,
+                                         const ProgramManifest& manifest) {
+    // Fire-and-forget, ANY THREAD (called at admission, off the context thread):
+    // warm the off-context PTX cache so the later context-thread get_or_compile
+    // finds the entry Ready (cache hit) -> TTFT win. Idempotent + dedup'd by the
+    // SAME identity key as get_or_compile/#10 (engine_.prefetch_compile keys on
+    // jdag.hash). Touches NO mutable backend state (programs_/last_error_), so it
+    // races nothing: decode_program (const, errors via out-param) + lower_with_
+    // fallback (pure) + build_jdag (pure) + the mu_-guarded JitEngine. The
+    // programs_ membership check is intentionally skipped (it's not thread-safe
+    // against the context thread); a redundant prefetch re-lowers (cheap) but the
+    // engine's compile-cache dedups the expensive NVRTC step.
+    if (bytecode.empty()) return;
+    const std::uint64_t identity = program_identity_hash(bytecode, manifest);
+    const std::uint64_t keyed =
+        batched_lowering_ ? (identity ^ 0x9E3779B97F4A7C15ULL) : identity;
+    Program program;
+    if (!decode_program(bytecode, manifest, program, /*err=*/nullptr)) return;
+    bool batched_mode = false;
+    LowerResult lr = lower_with_fallback(program, batched_mode);
+    if (!lr.ok) return;
+    jit::KernelDAG jdag = build_jdag(lr, keyed);
+    engine_.prefetch_compile(jdag);
 }
 
 const ProgramInterface& SamplingIrBackend::interface(ProgramHandle program) {
@@ -394,3 +439,34 @@ bool SamplingIrBackend::program_is_batched(ProgramHandle program) const {
 }
 
 }  // namespace pie_cuda_driver::sampling_ir
+
+extern "C" void pie_sampling_ir_prefetch_trampoline(
+    void* backend_ctx, const std::uint8_t* bytecode, std::size_t bytecode_len,
+    const std::uint8_t* binds_kind, const std::uint32_t* binds_key,
+    std::size_t binds_len) {
+    using namespace pie_cuda_driver::sampling_ir;
+    auto* backend = static_cast<IProgramBackend*>(backend_ctx);
+    if (backend == nullptr || bytecode == nullptr || bytecode_len == 0) return;
+
+    // Reconstruct the manifest EXACTLY as the submit path does (executor.cpp:3239-
+    // 3250): ready = SubmitBound for every bind (default), so the identity hash
+    // matches the real fire -> cache HIT. kind 1 = host tensor (carries key); kind
+    // 0/2 = the logits intrinsic (2 = MtpLogits draft row); key/intrinsic default.
+    ProgramManifest manifest;
+    manifest.reserve(binds_len);
+    for (std::size_t i = 0; i < binds_len; ++i) {
+        InputBind b;  // defaults: Logits, host_key=0, SubmitBound, Intrinsic::Logits
+        const std::uint32_t bk = binds_kind ? binds_kind[i] : 0u;
+        if (bk == 1u) {  // KIND_TENSOR
+            b.kind = BindKind::HostTensor;
+            b.host_key = binds_key ? binds_key[i] : 0u;
+            b.ready = HostAvailability::SubmitBound;
+        } else {  // KIND_LOGITS (0) / KIND_MTP_LOGITS (2)
+            b.kind = BindKind::Logits;
+            if (bk == 2u) b.intrinsic_kind = Intrinsic::MtpLogits;
+        }
+        manifest.push_back(b);
+    }
+    backend->prefetch_compile(
+        std::span<const std::uint8_t>(bytecode, bytecode_len), manifest);
+}
