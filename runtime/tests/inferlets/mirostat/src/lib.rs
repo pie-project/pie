@@ -45,11 +45,11 @@ async fn main(input: String) -> Result<String> {
     let tau = json_f32(&params, "tau", TAU);
     let lr = json_f32(&params, "lr", LR);
     let max_tokens = json_usize(&params, "max_tokens", MAX_TOKENS);
-    // #19 fix: min-kept-set floor (k_min top-by-logit). On the real spread vocab the
-    // surprise FLOOR (~10 nats, charlie's NVRTC) is far above μ0=2τ → plain mirostat's
-    // surprise gate empties → argmax-of-all-(-inf) → token-0 → μ runaway. The rank
-    // floor keeps ≥ k_min tokens regardless of μ, so the gate is never empty. Set
-    // `{"k_min":0}` to build plain `mirostat` (the degenerate control).
+    // Min-kept-set floor knob for the RankLe `{"floor":"rank"}` path (k_min top-by-
+    // logit). On the real spread vocab the surprise FLOOR (~10 nats, charlie's NVRTC)
+    // is far above μ0=2τ → plain mirostat's surprise gate empties → argmax-of-all-
+    // (-inf) → token-0 → μ runaway; the rank floor keeps ≥ k_min tokens regardless of
+    // μ. `{"k_min":0}` builds plain `mirostat` (the degenerate control).
     let k_min = json_usize(&params, "k_min", 8) as u32;
 
     // Logits/output vocab (= hf_config.vocab_size), not the tokenizer token
@@ -65,9 +65,12 @@ async fn main(input: String) -> Result<String> {
     // Build the mirostat program once (binding-free; reusable across fires).
     // `keys.mu` is a submit-bound scalar rebound every fire. RNG is ambient
     // (model B) — no seed input. Emit the WIT `tensor::program` once.
-    // `{"floor":"argmax"}` selects the proven-ops fallback (Ge/ReduceMax/Broadcast,
-    // no RankLe) if the RankLe custom-JIT path is a residual artifact.
-    let floor = params.get("floor").and_then(|v| v.as_str()).unwrap_or("rank");
+    // Floor selection. DEFAULT = `argmax` (#19 honest close): the proven-ops floor
+    // (Ge/ReduceMax/Broadcast, no RankLe) keeps the argmax token → never empty-keep,
+    // and is robustly non-degenerate (4/4 in delta's e2e runs). The RankLe rank-floor
+    // `{"floor":"rank"}` (k_min top-by-logit) gives higher diversity when stable but is
+    // RNG-fragile (3/4 — the custom-JIT RankLe residual); `{"k_min":0}` → plain mirostat.
+    let floor = params.get("floor").and_then(|v| v.as_str()).unwrap_or("argmax");
     let (built, keys) = match floor {
         "argmax" => edsl::mirostat_argmax_floor(vocab)
             .map_err(|e| format!("mirostat_argmax_floor build: {e:?}"))?,
