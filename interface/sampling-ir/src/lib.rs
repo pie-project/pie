@@ -104,6 +104,43 @@ pub fn program_hash(bytecode: &[u8]) -> u64 {
     h
 }
 
+/// The canonical 3-consumer program **identity** hash — the single key shared by
+/// the **#10 distinct-count**, **#11 compile-dedup**, and the merged-fire
+/// grouping. Mirrors the driver's `program_identity_hash(bytecode, manifest)`
+/// (`jit_backend.cpp`): `program_hash(bytecode) ^ manifest_hash`, where the
+/// manifest contribution hashes, **per binding in slot order**, the 6 bytes
+/// `{kind:u8, ready:u8, host_key:u32-LE}` through the same FNV-1a (so the host
+/// program cache, the driver compile cache, and the cross-request group key
+/// cannot drift — cross-lang pinned against the driver's golden vectors, like
+/// [`program_hash`]).
+///
+/// Two driver-matched rules:
+/// - The **intrinsic kind is NOT distinguished**: `Logits` and `MtpLogits` both
+///   map to `(kind=0, ready=0, host_key=0)` — they compile to the same program
+///   (dedup to one), so the count matches the driver's dedup.
+/// - An empty manifest ⇒ identity is just `program_hash(bytecode)`.
+pub fn program_identity_hash(bytecode: &[u8], manifest: &[crate::types::Binding]) -> u64 {
+    use crate::types::Binding;
+    let base = program_hash(bytecode);
+    if manifest.is_empty() {
+        return base;
+    }
+    // `kind`: BindKind — intrinsic `Logits` = 0, host `Tensor` = 1.
+    // `ready`: HostAvailability — `Submit` = 0, `Late` = 1.
+    let mut buf = alloc::vec::Vec::with_capacity(manifest.len() * 6);
+    for b in manifest {
+        let (kind, ready, host_key): (u8, u8, u32) = match b {
+            Binding::Logits | Binding::MtpLogits => (0, 0, 0),
+            Binding::Tensor { key, ready } => (1, *ready as u8, *key),
+        };
+        buf.push(kind);
+        buf.push(ready);
+        buf.extend_from_slice(&host_key.to_le_bytes());
+    }
+    // `manifest_hash = fnv1a64(buf)`; `program_hash` IS that FNV-1a over bytes.
+    base ^ program_hash(&buf)
+}
+
 /// Canonicalize a program's op-shape for the `#12` recognizer.
 ///
 /// Historically this zeroed a baked `RankLe(k)` immediate so top-k programs
@@ -116,7 +153,8 @@ pub fn canonicalize_op_shape(_program: &mut SamplingProgram) {}
 
 #[cfg(test)]
 mod hash_tests {
-    use super::program_hash;
+    use super::{program_hash, program_identity_hash};
+    use crate::types::{Binding, Readiness};
 
     #[test]
     fn program_hash_matches_driver_fnv1a64_vectors() {
@@ -126,6 +164,47 @@ mod hash_tests {
         assert_eq!(program_hash(b"a"), 0xaf63_dc4c_8601_ec8c);
         assert_eq!(program_hash(b"foobar"), 0x8594_4171_f739_67e8);
     }
+
+    #[test]
+    fn identity_empty_manifest_is_program_hash() {
+        // No bindings ⇒ identity is just the bytecode hash.
+        assert_eq!(program_identity_hash(b"prog", &[]), program_hash(b"prog"));
+    }
+
+    #[test]
+    fn identity_intrinsic_kind_not_distinguished() {
+        // gotcha (a): Logits and MtpLogits compile to the same program (dedup to
+        // one) ⇒ identical identity hash.
+        let bc = b"prog";
+        assert_eq!(
+            program_identity_hash(bc, &[Binding::Logits]),
+            program_identity_hash(bc, &[Binding::MtpLogits]),
+        );
+        // ...and an intrinsic bind still differs from no bind (manifest folded in).
+        assert_ne!(
+            program_identity_hash(bc, &[Binding::Logits]),
+            program_hash(bc),
+        );
+    }
+
+    #[test]
+    fn identity_distinguishes_host_bindings() {
+        // Different bindings ⇒ different compiled program ⇒ different identity:
+        // key, readiness, and intrinsic-vs-host all participate.
+        let bc = b"prog";
+        let t_submit = Binding::Tensor { key: 7, ready: Readiness::Submit };
+        let t_late = Binding::Tensor { key: 7, ready: Readiness::Late };
+        let t_key = Binding::Tensor { key: 9, ready: Readiness::Submit };
+        assert_ne!(program_identity_hash(bc, &[t_submit]), program_identity_hash(bc, &[t_late]));
+        assert_ne!(program_identity_hash(bc, &[t_submit]), program_identity_hash(bc, &[t_key]));
+        assert_ne!(program_identity_hash(bc, &[t_submit]), program_identity_hash(bc, &[Binding::Logits]));
+    }
+
+    // TODO(#10): cross-lang PIN against charlie's driver-emitted
+    // `program_identity_hash(bytecode, manifest)` golden vectors (Path 2, the
+    // #25 `standard_program_bytecode.txt` discipline) — asserts the Rust mirror
+    // is byte-exact with the driver dedup key, no silent drift if `manifest_hash`
+    // evolves. Awaiting charlie's goldens (folded around the #19 dive).
 }
 
 #[cfg(test)]
