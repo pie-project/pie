@@ -723,6 +723,19 @@ target_include_directories(test_sampling_ir_jit PRIVATE
 target_link_libraries(test_sampling_ir_jit PRIVATE
   CUDA::cudart CUDA::cuda_driver CUDA::nvrtc)
 
+# #11 JIT compile-axis load-test (delta). Drives JitEngine directly (no codegen)
+# to quantify the compile-axis coefficients for echo's M-batch + alpha's #10
+# cost model: compile/finalize/fire µs/program, dedup (compiles_run==K), and the
+# PIE_JIT_POOL_THREADS pool-width knee. Same minimal deps as test_sampling_ir_jit.
+add_executable(jit_load_test
+  tests/jit_load_test.cpp
+  src/sampling_ir/jit.cpp)
+target_include_directories(jit_load_test PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_link_libraries(jit_load_test PRIVATE
+  CUDA::cudart CUDA::cuda_driver CUDA::nvrtc)
+add_test(NAME jit_load COMMAND jit_load_test)
+
 # Sampling-IR backend test — exercises the full facade: PSIR bytecode → decode
 # (charlie reader) → lower (charlie codegen) → NVRTC JIT (delta) → driver-API
 # launch, through echo's IProgramBackend. It needs charlie's codegen/reader and
