@@ -163,11 +163,26 @@ pub trait DriverChannel: Send + Sync {
     /// promptly with an error. Idempotent. Called by the supervisor's
     /// watchdog when it observes that the driver has exited.
     fn abort(&self);
+
+    /// Fire-and-forget JIT **prefetch** (the #11 prefetch seam): warm the
+    /// driver's compile cache for a sampling program so the later real fire
+    /// finds it `Ready` (the NVRTC compile overlaps the in-flight run-ahead
+    /// steps, off the TTFT path). The compile is keyed on
+    /// `program_identity_hash(bytecode, manifest)` — the SAME key as the #10
+    /// distinct-count / #11 compile-cache / M-batch grouping — so it dedups
+    /// against the in-flight compile pool (idempotent; duplicate or
+    /// already-compiled programs collapse). Never blocks, never reports errors.
+    ///
+    /// Default **no-op**: drivers without a JIT sampling backend, and the
+    /// out-of-proc/IPC path until its additive `DriverRequest::Prefetch` oneway
+    /// fast-follow lands. The embedded [`InProcChannel`] overrides this to drive
+    /// the C++ `IProgramBackend::prefetch_compile` over the in-proc FFI.
+    fn prefetch_compile(&self, _bytecode: &[u8], _manifest: &[pie_sampling_ir::Binding]) {}
 }
 
 pub use channel::{
     abort_all_driver_channels, fire_batch, fire_batch_deferred, fire_batch_sync, get_spec,
-    install_channel, install_spec, register_driver, FireHandle,
+    install_channel, install_spec, prefetch_compile, register_driver, FireHandle,
 };
 pub use inproc::{InProcChannel, InProcVTable};
 pub use inproc_polling::InProcPollingChannel;
