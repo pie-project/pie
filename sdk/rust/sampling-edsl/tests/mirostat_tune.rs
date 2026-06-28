@@ -27,7 +27,7 @@
 use pie_sampling_ir::eval::{InputBindings, Value as EvalValue, eval};
 use pie_sampling_ir::{Binding, SamplingProgram, decode};
 use sampling_edsl::builder::Built;
-use sampling_edsl::program::{MirostatKeys, mirostat};
+use sampling_edsl::program::{MirostatKeys, mirostat, mirostat_floor};
 
 const VOCAB: u32 = 151936; // qwen3-0.6b output vocab (the corrected vocab)
 const TARGET_NAT_SURPRISE: f32 = 2.2; // hotel's 4090-measured full-dist ceiling
@@ -141,6 +141,7 @@ fn run_trial(
     n_steps: usize,
     trial_seed: u64,
     repeat_boost: Option<f32>,
+    floor_k: u32,
 ) -> TrialOut {
     let mut mu = cfg.mu0_factor * cfg.tau;
     let mut last_token: Option<u32> = None;
@@ -166,8 +167,9 @@ fn run_trial(
             EvalValue::F32(x) => x[0],
             o => panic!("scalar: {o:?}"),
         };
-        // kept-set size = tokens with surprise ≤ μ (what the gate admits).
-        let keep = surpr.iter().filter(|&&x| x <= mu).count();
+        // kept-set size = tokens with surprise ≤ μ, floored at `floor_k` (the
+        // min-kept-set program unions the gate with the top-floor_k by logit).
+        let keep = surpr.iter().filter(|&&x| x <= mu).count().max(floor_k as usize);
 
         surprises.push(s);
         keeps.push(keep as f32);
@@ -219,6 +221,7 @@ fn run_config(
     n_steps: usize,
     n_trials: usize,
     repeat_boost: Option<f32>,
+    floor_k: u32,
 ) -> Agg {
     let mut s_sum = 0.0;
     let mut keep_sum = 0.0;
@@ -227,7 +230,7 @@ fn run_config(
     let mut reps = 0;
     for t in 0..n_trials {
         let seed = 0xBADC_0FFEE_u64.wrapping_mul(t as u64 + 1).wrapping_add(0x51ED);
-        let o = run_trial(p, b, keys, vocab, sigma, cfg, n_steps, seed, repeat_boost);
+        let o = run_trial(p, b, keys, vocab, sigma, cfg, n_steps, seed, repeat_boost, floor_k);
         s_sum += o.tail_mean_s;
         keep_sum += o.median_keep;
         max_mu = max_mu.max(o.max_mu);
@@ -265,7 +268,7 @@ fn mirostat_retuned_config_converges_without_collapse() {
     // a kept-set with diversity headroom (far from the τ=1.5 greedy basin); the
     // mandatory μ0=2τ standard init avoids the low-init μ-underflow collapse.
     let cfg = Config { tau: 2.0, lr: 0.4, mu0_factor: 2.0 };
-    let agg = run_config(&p, &b, &keys, vocab, sigma, cfg, 24, 8, None);
+    let agg = run_config(&p, &b, &keys, vocab, sigma, cfg, 24, 8, None, 0);
     eprintln!(
         "[guard] tau=2.0 lr=0.4 mu0=2.0τ → tail_S={:.3} |err|={:.3} max_mu={:.2} keep={:.1} collapse={:.0}%",
         agg.mean_tail_s, agg.abs_err, agg.max_mu, agg.mean_keep, agg.collapse_rate * 100.0
@@ -274,6 +277,43 @@ fn mirostat_retuned_config_converges_without_collapse() {
     assert!(agg.abs_err < 0.5, "tail-mean S must track τ");
     assert!(agg.mean_keep > 8.0, "kept set must hold diversity headroom (no collapse)");
     assert!(agg.collapse_rate < 0.1, "collapse rate must be low at the re-tuned config");
+}
+
+/// #19 structural fix verification: the min-kept-set floor guarantees the gate
+/// can't collapse to greedy — eliminating both the μ-underflow collapse (μ0=1τ)
+/// and the low-τ near-greedy basin — while preserving adaptive truncation above
+/// the floor (it doesn't bind when μ already admits more than k_min tokens).
+#[test]
+#[ignore = "heavy (151936-vocab μ-loop); run with --ignored --nocapture"]
+fn mirostat_floor_eliminates_collapse() {
+    let vocab = VOCAB;
+    let sigma = calibrate_sigma(vocab);
+    let (n_steps, n_trials, k_min) = (24, 16, 8u32);
+
+    let (bp, kp) = mirostat(vocab).unwrap();
+    let pp = prog(&bp);
+    let (bf, kf) = mirostat_floor(vocab, k_min).unwrap();
+    let pf = prog(&bf);
+
+    eprintln!("\n=== #19 min-kept-set floor (k_min={k_min}, vocab={vocab}) ===");
+    eprintln!("  config                program   collapse%   keep    tail_S");
+    for (tau, lr, mu0) in [(1.5f32, 0.6, 1.0), (1.5, 0.6, 2.0), (2.0, 0.4, 2.0)] {
+        let cfg = Config { tau, lr, mu0_factor: mu0 };
+        let plain = run_config(&pp, &bp, &kp, vocab, sigma, cfg, n_steps, n_trials, None, 0);
+        let floor = run_config(&pf, &bf, &kf, vocab, sigma, cfg, n_steps, n_trials, None, k_min);
+        eprintln!(
+            "  τ={tau:.1} lr={lr:.1} μ0={mu0:.1}τ  plain     {:5.0}%    {:5.1}   {:.3}",
+            plain.collapse_rate * 100.0, plain.mean_keep, plain.mean_tail_s
+        );
+        eprintln!(
+            "                        floor     {:5.0}%    {:5.1}   {:.3}",
+            floor.collapse_rate * 100.0, floor.mean_keep, floor.mean_tail_s
+        );
+        // The floor structurally guarantees kept-set ≥ k_min and no collapse.
+        assert!(floor.mean_keep >= k_min as f32, "floor kept-set must be ≥ k_min");
+        assert_eq!(floor.collapse_rate, 0.0, "floor must eliminate collapse");
+    }
+    eprintln!("\n>>> floor guarantees kept-set ≥ {k_min} regardless of μ/init → can't enter the greedy basin.");
 }
 
 /// Full (τ, lr, μ0) sweep — the #19 diagnostic. Prints a table + the re-tune
@@ -307,7 +347,7 @@ fn mirostat_retune_sweep_151936() {
         for &lr in &lrs {
             for &mu0_factor in &mu0s {
                 let cfg = Config { tau, lr, mu0_factor };
-                let a = run_config(&p, &b, &keys, VOCAB, sigma, cfg, n_steps, n_trials, None);
+                let a = run_config(&p, &b, &keys, VOCAB, sigma, cfg, n_steps, n_trials, None, 0);
                 eprintln!(
                     "  {:.2}  {:.1}  {:.1}τ    {:6.3}  {:5.3}  {:5.2}  {:5.1}   {:4.0}%",
                     tau, lr, mu0_factor, a.mean_tail_s, a.abs_err, a.max_mu, a.mean_keep,
@@ -338,7 +378,7 @@ fn mirostat_retune_sweep_151936() {
         ("τ=1.5 μ0=2.0τ + repeat Δ=4  ", Config { tau: 1.5, lr: 0.6, mu0_factor: 2.0 }, Some(4.0)),
         ("τ=2.0 μ0=2.0τ + repeat Δ=4  ", Config { tau: 2.0, lr: 0.4, mu0_factor: 2.0 }, Some(4.0)),
     ] {
-        let a = run_config(&p, &b, &keys, VOCAB, sigma, cfg, n_steps, n_trials, rb);
+        let a = run_config(&p, &b, &keys, VOCAB, sigma, cfg, n_steps, n_trials, rb, 0);
         eprintln!(
             "  {label} → collapse={:3.0}%  repeat_lock={:3.0}%  keep={:6.1}  tail_S={:.3}  max_μ={:.2}",
             a.collapse_rate * 100.0, a.repeat_rate * 100.0, a.mean_keep, a.mean_tail_s, a.max_mu

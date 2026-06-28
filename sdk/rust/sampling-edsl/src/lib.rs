@@ -58,7 +58,7 @@ pub mod prelude {
     pub use crate::dynamic::{DynValue, dselect};
     pub use crate::ir::{DType, Readiness};
     pub use crate::program::{
-        grammar, grammar_sampled, mirostat, spec_verify_greedy, spec_verify_lossless,
+        grammar, grammar_sampled, mirostat, mirostat_floor, spec_verify_greedy, spec_verify_lossless,
     };
     #[allow(deprecated)] // `lower_sampler` is deprecated (#17); kept in the prelude for compat.
     pub use crate::sugar::{SamplerSpec, build_sampler, lower_sampler};

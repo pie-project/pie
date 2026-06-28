@@ -123,6 +123,31 @@ fn eval_mirostat_small_mu_forces_argmax() {
     }
 }
 
+// ── mirostat min-kept-set floor (#19): the gate can't collapse below k_min ───-
+#[test]
+fn eval_mirostat_floor_guarantees_kept_set() {
+    use sampling_edsl::program::mirostat_floor;
+    let k_min = 3u32;
+    let (b, keys) = mirostat_floor(8, k_min).unwrap();
+    let logits = logits8();
+    // Top-k_min by logit — the floor's guaranteed kept set even when μ admits none.
+    let mut idx: Vec<usize> = (0..logits.len()).collect();
+    idx.sort_by(|&a, &c| logits[c].partial_cmp(&logits[a]).unwrap());
+    let floor_set: std::collections::HashSet<usize> =
+        idx[..k_min as usize].iter().cloned().collect();
+    // μ=0 collapses the surprise gate to empty; the floor must still keep top-k_min,
+    // so the sampled token is always one of them (vs plain mirostat → greedy argmax).
+    let tensors = [(keys.mu, EvalValue::F32(vec![0.0]))];
+    for s in [1u32, 7, 42, 1000, 65535] {
+        let out = eval(&prog(&b), &InputBindings::new(&bind(&b, &logits, &tensors), s)).unwrap();
+        let t = token_of(&out[0]) as usize;
+        assert!(
+            floor_set.contains(&t),
+            "seed {s}: token {t} not in floor top-{k_min} {floor_set:?}"
+        );
+    }
+}
+
 // ── sugar min-p: chosen token clears the logit-space threshold ──────────────-
 #[test]
 fn eval_sugar_min_p_token_in_kept_set() {

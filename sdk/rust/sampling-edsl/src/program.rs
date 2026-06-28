@@ -46,7 +46,51 @@ pub fn mirostat(vocab: u32) -> Result<(Built, MirostatKeys), BuildError> {
     Ok((g.build()?, keys))
 }
 
-/// **MTP draft sampler** (de-hardwired speculation, M=1). Greedily samples the
+/// **Mirostat v2 with a min-kept-set floor** (#19 structural repetition-attractor
+/// fix). Identical to [`mirostat`] but the surprise gate is unioned with the
+/// **top-`k_min` by logit**, so the kept set can never collapse below `k_min`
+/// tokens regardless of μ:
+///
+/// ```text
+/// keep = (surprise ≤ μ)  OR  (rank_by_logit < k_min)
+/// ```
+///
+/// This preserves mirostat's adaptive truncation *above* the floor (when μ admits
+/// more than `k_min` tokens the gate is unchanged) while guaranteeing the gate can
+/// never degenerate to greedy — the entry mechanism of the repetition-attractor
+/// (a single high-confidence token → repeat). `k_min` is baked as a `Const`
+/// value-id (so `RankLe` references it, #25-consistent — not an immediate).
+/// `outputs = [Token, Scalar]`; the host μ-update (`μ ← μ − lr·(S − τ)`) is
+/// unchanged. A small floor (e.g. `k_min = 8`) is enough to keep diversity.
+pub fn mirostat_floor(vocab: u32, k_min: u32) -> Result<(Built, MirostatKeys), BuildError> {
+    let g = Graph::new(vocab);
+    let logits = g.intrinsic_logits_dyn();
+    let mu = g.host_scalar_dyn(DType::F32, Readiness::Submit);
+
+    let probs = dyn_softmax(&logits);
+    let surprise = probs.log().neg(); // -log p, [vocab]
+
+    let keep_mu = mu.broadcast_vec(vocab).ge(&surprise); // surprise ≤ μ
+    // Min-kept-set floor: always keep the top-`k_min` by logit so the gate can
+    // never collapse below `k_min` tokens.
+    let kfloor = g.constant_i32_dyn(k_min as i32);
+    let keep_floor = logits.pivot_rank_le(&kfloor);
+    let always = g.constant_bool_dyn(true).broadcast_vec(vocab);
+    let keep = dselect(&keep_mu, &always, &keep_floor); // keep_mu OR keep_floor
+
+    let perturbed = logits.add(&g.rng_gumbel_vec(0, vocab));
+    let neg_inf = g.constant_f32_dyn(f32::NEG_INFINITY).broadcast_vec(vocab);
+    let token = dselect(&keep, &perturbed, &neg_inf).argmax();
+
+    // S = surprise[token] via a length-1 gather -> reduce.
+    let s = surprise.gather(&token.broadcast_vec(1)).reduce_sum();
+
+    g.output(&token, OutputKind::Token);
+    g.output(&s, OutputKind::Scalar);
+
+    let keys = MirostatKeys { mu: mu.input_key().expect("mu host input") };
+    Ok((g.build()?, keys))
+}
 /// speculator's draft token from the on-device **draft logits**
 /// ([`Graph::intrinsic_mtp_logits_dyn`]) — `argmax(mtp_logits)`. The binding
 /// ([`crate::ir::Binding::MtpLogits`]) source-selects the draft row of
