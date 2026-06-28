@@ -1072,6 +1072,38 @@ struct PendingForward {
     next_input_deps: crate::api::next_input_map::NextInputDeps,
 }
 
+/// #23 verify (TEST-ONLY, env-gated): force a designated *producer* pass to report
+/// failure. Evaluated at the finalize success-determination — AFTER `rx.await`
+/// resolved `Some` (the producer's forward device-succeeded and **retained** its
+/// sampled token, and in the run-ahead overlap the consumer's inject is already
+/// enqueued from that valid retained copy) — so flipping it to failure reproduces
+/// the **retain-FOUND-then-host-abort** path: the producer's drain-gated
+/// deferred-free races the in-flight inject (compute-sanitizer "free
+/// strictly-after-drain"), and the consumer cascade-aborts fail-closed
+/// (token-for-token). One mid-chain knob exercises both #23 teeth.
+///
+/// Keyed on the producer's monotonic link via `PIE_TEST_ABORT_PRODUCER_LINK`
+/// (read once). **UNSET ⇒ always `false` ⇒ ZERO production behavior** — the #19
+/// `PIE_MIROSTAT_DUMP` env-instrument pattern (test-only; flagged for the land
+/// guard). Non-producer passes (no `produced` link) are never targeted.
+fn test_force_producer_abort(deps: &crate::api::next_input_map::NextInputDeps) -> bool {
+    static ABORT_LINK: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
+    let target = *ABORT_LINK.get_or_init(|| {
+        std::env::var("PIE_TEST_ABORT_PRODUCER_LINK")
+            .ok()
+            .and_then(|s| s.trim().parse::<u32>().ok())
+    });
+    abort_target_matches(deps.produced, target)
+}
+
+/// Pure targeting predicate for [`test_force_producer_abort`] (env-free, so it is
+/// unit-testable): abort iff a target link is configured AND this pass is the
+/// producer for it. An unset target (`None`) never matches ⇒ zero production
+/// behavior; a non-producer pass (`produced = None`) is never targeted.
+fn abort_target_matches(produced: Option<u32>, target: Option<u32>) -> bool {
+    target.is_some() && produced == target
+}
+
 /// Phase-2 of a forward pass: await the driver round-trip, finalize the forward
 /// txn (commit/abort + seal/fold via [`InstanceState::finalize_forward_txn`],
 /// store reachable through `accessor.with`), and reconstruct the program's
@@ -1108,7 +1140,11 @@ async fn await_and_finalize(
         }
         Err(_) => None,
     };
-    let success = forward_result.is_some();
+    // #23 verify (A-scoped, env-gated): force a designated producer's forward to
+    // report failure AFTER it device-succeeded + retained, reproducing the
+    // retain-FOUND-then-abort UAF race for the compute-sanitizer harness. UNSET ⇒
+    // no-op (zero production behavior); see `test_force_producer_abort`.
+    let success = forward_result.is_some() && !test_force_producer_abort(&next_input_deps);
 
     // Take the txn out of its guard for the normal commit/abort. The now-empty
     // guard's `Drop` is a no-op; the leak-abort only fires if this finalize is
@@ -2042,6 +2078,18 @@ mod sampling_program_tests {
     use super::*;
     use crate::api::pie::core::tensor as wit;
     use crate::api::program_decode::decode_program;
+
+    // #23 verify seam targeting predicate (env-free core of `test_force_producer_abort`).
+    #[test]
+    fn abort_target_matches_only_configured_producer() {
+        // Unset target ⇒ never matches (ZERO production behavior when env unset).
+        assert!(!abort_target_matches(Some(2), None));
+        assert!(!abort_target_matches(None, None));
+        // Configured target ⇒ matches ONLY the producer for that exact link.
+        assert!(abort_target_matches(Some(2), Some(2)));
+        assert!(!abort_target_matches(Some(3), Some(2))); // a different producer
+        assert!(!abort_target_matches(None, Some(2))); // a non-producer pass
+    }
 
     /// WIT-shaped parts for a greedy-argmax program over a `[vocab]` logits
     /// input: `Input(0)` then `ReduceArgmax` → one `i32` (Token) output.
