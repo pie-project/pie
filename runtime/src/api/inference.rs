@@ -314,6 +314,29 @@ struct OutputTensor {
     data: Vec<u8>,
 }
 
+/// #37: true iff `bytecode` is one of the recognized de-hardwired STANDARD samplers
+/// (the driver's #8 recognizer set) — its `program_hash` (== driver `ProgramHandle`,
+/// bytecode-only, NOT the binding-XOR'd `#10 identity_hash`) is in
+/// `standard_program_hashes(vocab)`. A recognized-STANDARD attached program writes
+/// `pi.sampled` (eager-D2H-fillable → the fast-path pinned is correct); a CUSTOM
+/// program marshals `per_req` (rich, the pinned never fills → #36 carrier class).
+/// The hash set is memoized per vocab (process-stable; built once, not per-forward);
+/// on a build error → empty set → nothing recognized → conservative rich (#36 behavior).
+fn is_recognized_standard(bytecode: &[u8], vocab: u32) -> bool {
+    use std::collections::{HashMap, HashSet};
+    use std::sync::{LazyLock, Mutex};
+    static STD_HASHES: LazyLock<Mutex<HashMap<u32, HashSet<u64>>>> =
+        LazyLock::new(|| Mutex::new(HashMap::new()));
+    let hash = pie_sampling_ir::program_hash(bytecode);
+    let mut cache = STD_HASHES.lock().expect("std-hash cache poisoned");
+    let set = cache.entry(vocab).or_insert_with(|| {
+        sampling_edsl::standard_program_hashes(vocab)
+            .map(|v| v.into_iter().map(|(h, _)| h).collect())
+            .unwrap_or_default()
+    });
+    set.contains(&hash)
+}
+
 /// Reconstruct each attached program's declared outputs as host `tensor`s, in
 /// attach order then per-program output-slot order. Token → `[1] i32`;
 /// Scalar/Entropy → `[1] f32` (mirostat S/μ); Logits/Logprobs → `[k] f32`. The
@@ -1367,6 +1390,17 @@ async fn execute_impl(
         // pass's sampling positions; its submit-bound tensor values + per-slot
         // binding-map ride the carrier so the driver wires each `Op::Input(i)`.
         let has_programs = !attached_programs.is_empty();
+        // #37: a request takes the rich path iff it carries an attached CUSTOM
+        // program — one that marshals to `per_req` (so the eager-D2H pinned dst is
+        // never filled: the #19/#36 carrier class). A recognized de-hardwired
+        // STANDARD sampler writes `pi.sampled` → the pinned fast-path IS correct, so
+        // it stays eligible. Custom iff ANY attached program isn't recognized-standard.
+        let has_custom_program = has_programs && {
+            let vocab = crate::model::model().vocab_size();
+            attached_programs
+                .iter()
+                .any(|p| !is_recognized_standard(&p.bytecode, vocab))
+        };
         let mut programs_output_kinds: Vec<Vec<pie_sampling_ir::OutputKind>> =
             Vec::with_capacity(attached_programs.len());
         let mut programs_output_elem_counts: Vec<Vec<u32>> =
@@ -1829,11 +1863,11 @@ async fn execute_impl(
             &mut req,
             &programs_output_kinds,
             &programs_output_elem_counts,
-            // #36: an attached IR program marshals to the rich `per_req`, so its
-            // pinned dst is never eager-D2H-filled → must take the rich path.
-            // Conservative: ALL attached programs (`has_programs`) → rich; the
-            // recognized-STANDARD fast-path restoration is the #37 perf follow-on.
-            has_programs,
+            // #36/#37: a request takes the rich path iff it has an attached CUSTOM
+            // program (marshals to `per_req` → the eager-D2H pinned never fills). A
+            // recognized de-hardwired STANDARD sampler writes `pi.sampled`, so the
+            // pinned fast-path is correct and it keeps it (#37 restores that perf).
+            has_custom_program,
         );
 
         // Single-model: the SERVICE routes to the bound model; no model_id arg.
@@ -2132,6 +2166,29 @@ mod sampling_program_tests {
     use super::*;
     use crate::api::pie::core::tensor as wit;
     use crate::api::program_decode::decode_program;
+
+    // #37: the host-side recognizer-mirror distinguishes recognized de-hardwired
+    // STANDARD samplers (→ fast-path/pinned) from custom programs (→ rich).
+    #[test]
+    fn is_recognized_standard_matches_standard_rejects_other() {
+        let vocab = 128u32;
+        let std_progs = sampling_edsl::standard_programs(vocab).expect("standard programs");
+        assert!(!std_progs.is_empty());
+        // Every driver-recognized STANDARD sampler bytecode is recognized host-side.
+        for (bytecode, _) in &std_progs {
+            assert!(
+                is_recognized_standard(bytecode, vocab),
+                "standard sampler must be recognized"
+            );
+        }
+        // A standard bytecode for a DIFFERENT vocab is NOT recognized for `vocab`
+        // (the hash is vocab-specific) — proves it's a real membership check, not
+        // a trivially-true gate that would let custom programs through.
+        let other = sampling_edsl::standard_programs(256).expect("standard programs (other vocab)");
+        assert!(!is_recognized_standard(&other[0].0, vocab));
+        // Garbage bytecode → not recognized → conservative rich (fail-safe class).
+        assert!(!is_recognized_standard(b"not-a-program", vocab));
+    }
 
     // #23 verify seam targeting predicate (env-free core of `test_force_producer_abort`).
     #[test]

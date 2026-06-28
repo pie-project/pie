@@ -16,6 +16,7 @@ path = "src/lib.rs"
 pie-ipc = { path = "../driver/ipc" }
 pie-driver-abi = { path = "../interface/driver" }
 pie-sampling-ir = { path = "../interface/sampling-ir" }
+sampling-edsl = { path = "../sdk/rust/sampling-edsl" }
 pie-client = { path = "../client/rust" }
 tokio = { version = "1.52", features = ["full"] }
 tokio-util = "0.7"
