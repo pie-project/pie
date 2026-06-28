@@ -1286,6 +1286,16 @@ async fn execute_impl(
         // PendingForward until the fire finalizes (then freed on drop).
         let mut late_device_handles: Vec<crate::api::tensor_io::DeviceLateInput> = Vec::new();
         for program in attached_programs {
+            // #11 prefetch-seam: fire-and-forget warm of the JIT compile-cache at
+            // admission — best-effort + non-blocking (no-op until a JIT sampling
+            // backend registers; correctness never depends on it landing). The NVRTC
+            // compile overlaps the in-flight run-ahead steps so it's off TTFT, and the
+            // later submit-fire's `get_or_compile` finds it Ready ⇒ cache hit. Keyed by
+            // `program_identity_hash(bytecode, manifest)` — the SAME (kind,key) manifest
+            // the submit path reconstructs, so prefetch-hash ≡ submit-hash ≡ the #10
+            // dedup key. Merged R≥2 prefetches each program. Fires before `bytecode`/
+            // `bindings` are moved into the carrier below.
+            crate::driver::prefetch_compile(driver_idx, &program.bytecode, &program.bindings);
             program_identity_hashes.push(program.identity_hash);
             programs_output_kinds.push(program.output_kinds);
             logits_positions.extend(program.logits_positions);
