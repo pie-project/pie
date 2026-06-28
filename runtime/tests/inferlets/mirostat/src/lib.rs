@@ -45,6 +45,12 @@ async fn main(input: String) -> Result<String> {
     let tau = json_f32(&params, "tau", TAU);
     let lr = json_f32(&params, "lr", LR);
     let max_tokens = json_usize(&params, "max_tokens", MAX_TOKENS);
+    // #19 fix: min-kept-set floor (k_min top-by-logit). On the real spread vocab the
+    // surprise FLOOR (~10 nats, charlie's NVRTC) is far above μ0=2τ → plain mirostat's
+    // surprise gate empties → argmax-of-all-(-inf) → token-0 → μ runaway. The rank
+    // floor keeps ≥ k_min tokens regardless of μ, so the gate is never empty. Set
+    // `{"k_min":0}` to build plain `mirostat` (the degenerate control).
+    let k_min = json_usize(&params, "k_min", 8) as u32;
 
     // Logits/output vocab (= hf_config.vocab_size), not the tokenizer token
     // count: the sampler program is lowered + sampled over the logits dim.
@@ -59,8 +65,11 @@ async fn main(input: String) -> Result<String> {
     // Build the mirostat program once (binding-free; reusable across fires).
     // `keys.mu` is a submit-bound scalar rebound every fire. RNG is ambient
     // (model B) — no seed input. Emit the WIT `tensor::program` once.
-    let (built, keys) =
-        edsl::mirostat(vocab).map_err(|e| format!("mirostat program build: {e:?}"))?;
+    let (built, keys) = if k_min > 0 {
+        edsl::mirostat_floor(vocab, k_min).map_err(|e| format!("mirostat_floor build: {e:?}"))?
+    } else {
+        edsl::mirostat(vocab).map_err(|e| format!("mirostat program build: {e:?}"))?
+    };
     let program =
         inferlet::emit::emit_program(&built.program).map_err(|e| format!("mirostat emit: {e}"))?;
     let n_out = built.outputs.len() as u32;
