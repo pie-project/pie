@@ -1825,6 +1825,7 @@ impl BatchScheduler {
                         && batch_resp.logprobs_values.is_empty()
                         && batch_resp.entropies.is_empty()
                         && batch_resp.spec_tokens.is_empty()
+                        && batch_resp.program_tokens.is_empty()
                         && batch_resp.tokens_indptr.len() >= requests.len() + 1;
 
                     // Send oneshot replies first, defer drop of the

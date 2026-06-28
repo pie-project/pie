@@ -673,6 +673,7 @@ pub fn extract_per_request(
         && fr.logits_bytes.is_empty()
         && fr.logprobs_values.is_empty()
         && fr.entropies.is_empty()
+        && fr.program_tokens.is_empty()
         && out.spec_tokens.is_empty();
     if token_payload_only {
         if tok_hi == tok_lo + 1 {
@@ -740,6 +741,25 @@ pub fn extract_per_request(
     out.entropies = fr.entropies[ent_lo..ent_hi].to_vec();
     out.entropies_indptr = vec![0, (ent_hi - ent_lo) as u32];
 
+    // Program tokens (#32 `[k]`-Token): two-level CSR like logprobs —
+    // `program_tokens_req_indptr` partitions the per-(request,output) slot ranges,
+    // `program_tokens_indptr` partitions the values. Slice to this request's slots,
+    // resetting both indptrs to request-local offsets.
+    if fr.program_tokens_req_indptr.len() >= 2 && fr.program_tokens_indptr.len() >= 2 {
+        let slot_lo = fr.program_tokens_req_indptr[r] as usize;
+        let slot_hi = fr.program_tokens_req_indptr[r + 1] as usize;
+        let val_lo = fr.program_tokens_indptr[slot_lo] as usize;
+        let val_hi = fr.program_tokens_indptr[slot_hi] as usize;
+        out.program_tokens_req_indptr = vec![0, (slot_hi - slot_lo) as u32];
+        out.program_tokens_indptr = (slot_lo..=slot_hi)
+            .map(|s| fr.program_tokens_indptr[s] - fr.program_tokens_indptr[slot_lo])
+            .collect();
+        out.program_tokens = fr.program_tokens[val_lo..val_hi].to_vec();
+    } else {
+        out.program_tokens_req_indptr = vec![0];
+        out.program_tokens_indptr = vec![0];
+    }
+
     out
 }
 
@@ -755,6 +775,30 @@ fn indptr_range(indptr: &[u32], r: usize) -> (usize, usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn extract_per_request_slices_program_tokens_two_level_csr() {
+        // #32 two-level CSR (bravo's round-trip vectors): 2 requests, each n_out=2
+        // (output 0 single-Token/empty, output 1 a `[k]`-Token of 2).
+        // req_indptr=[0,2,4], indptr=[0,0,2,2,4], tokens=[279,280,555,556].
+        // extract_per_request slices request r to its slots, resetting both
+        // indptrs request-local so build_output_tensors walks seg=o within it.
+        let fr = pie_driver_abi::ForwardResponse {
+            num_requests: 2,
+            program_tokens_req_indptr: vec![0, 2, 4],
+            program_tokens_indptr: vec![0, 0, 2, 2, 4],
+            program_tokens: vec![279, 280, 555, 556],
+            ..Default::default()
+        };
+        // request 0: slots [0,2) → output 0 empty, output 1 = [279,280].
+        let r0 = extract_per_request(&fr, 0);
+        assert_eq!(r0.program_tokens, vec![279, 280]);
+        assert_eq!(r0.program_tokens_indptr, vec![0, 0, 2]);
+        // request 1: slots [2,4) → output 0 empty, output 1 = [555,556].
+        let r1 = extract_per_request(&fr, 1);
+        assert_eq!(r1.program_tokens, vec![555, 556]);
+        assert_eq!(r1.program_tokens_indptr, vec![0, 0, 2]);
+    }
 
     // -- Page-trim integration tests -----------------------------------------
 
