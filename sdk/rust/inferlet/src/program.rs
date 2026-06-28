@@ -57,18 +57,29 @@ pub fn resolve_bindings(
             // source-selects the draft row of `ws.logits`; no host data, like
             // `Logits`. A unit attach binding — the resolver reads the kind.
             ir::Binding::MtpLogits => Ok(InputBinding::MtpLogits),
-            ir::Binding::Tensor { key, .. } => {
+            ir::Binding::Tensor { key, ready } => {
                 let decl = host_inputs
                     .iter()
                     .find(|d| d.key == *key)
                     .ok_or_else(|| format!("resolve_bindings: no host-input decl for key {key}"))?;
-                let data = submit_values
-                    .iter()
-                    .find(|(k, _)| k == key)
-                    .map(|(_, v)| v.clone())
-                    .ok_or_else(|| {
-                        format!("resolve_bindings: no submit value bound for key {key}")
-                    })?;
+                // `SelfSpecDraftInput` (#31 self-spec verify): the `[k]` draft tokens
+                // are device-resident (`pi.tokens + sample_row + 1`), source-selected
+                // driver-side by the resolver off the manifest flag — NOT host-supplied.
+                // The runtime attach reads the slot's shape/dtype but discards the bytes
+                // (skips `upload_late_input`; see `inference.rs` SelfSpecDraftInput arm),
+                // so bind a zero-ballast tensor of the declared shape/dtype: it occupies
+                // the positional slot and carries the manifest flag without a submit value.
+                let data = if matches!(ready, ir::Readiness::SelfSpecDraftInput) {
+                    selfspec_draft_ballast(decl.shape, decl.dtype)
+                } else {
+                    submit_values
+                        .iter()
+                        .find(|(k, _)| k == key)
+                        .map(|(_, v)| v.clone())
+                        .ok_or_else(|| {
+                            format!("resolve_bindings: no submit value bound for key {key}")
+                        })?
+                };
                 let t = tensor::Tensor::from_data(
                     &crate::emit::shape_to_wit(decl.shape),
                     crate::emit::dtype_to_wit(decl.dtype),
@@ -79,6 +90,17 @@ pub fn resolve_bindings(
             }
         })
         .collect()
+}
+
+/// Zero-ballast host bytes for a `SelfSpecDraftInput` (#31) draft slot: the
+/// declared shape/dtype's worth of `0`s. The slot is driver source-selected
+/// (device-resident drafts at `pi.tokens + sample_row + 1`), so the bytes are
+/// read then discarded by the runtime attach — this just sizes the placeholder
+/// tensor that occupies the positional slot. Host layout matches the `encode_*`
+/// helpers: 4 bytes/lane for `F32`/`I32`/`U32`, 1 byte/lane for `Bool`.
+fn selfspec_draft_ballast(shape: ir::Shape, dtype: ir::DType) -> Vec<u8> {
+    let lane_bytes = if matches!(dtype, ir::DType::Bool) { 1 } else { 4 };
+    vec![0u8; shape.numel() as usize * lane_bytes]
 }
 
 /// Handle to one program output, returned by
@@ -246,6 +268,22 @@ mod supply_api_tests {
         };
         let err = resolve_bindings(&[binding], std::slice::from_ref(&decl), &[], &[]).unwrap_err();
         assert!(err.contains("key 3"), "{err}");
+    }
+
+    #[test]
+    fn selfspec_draft_ballast_sizes_by_shape_and_dtype() {
+        // #31 self-spec verify: a `[k]` i32 draft slot is driver source-selected
+        // (`pi.tokens+sample_row+1`), so its host bytes are zero ballast of the
+        // declared shape/dtype — k*4 for i32, 1 byte/lane for bool (the runtime
+        // attach reads then discards them; the resolver binds the device drafts).
+        assert_eq!(
+            selfspec_draft_ballast(Shape::new(&[4]).unwrap(), DType::I32),
+            vec![0u8; 16]
+        );
+        assert_eq!(
+            selfspec_draft_ballast(Shape::new(&[10]).unwrap(), DType::Bool),
+            vec![0u8; 10]
+        );
     }
 
     #[test]
