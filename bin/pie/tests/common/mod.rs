@@ -102,6 +102,76 @@ pub async fn boot_4090() -> Result<pie_bin::StandaloneHandle> {
     run_standalone(controller, gateway, worker, Mode::Local).await
 }
 
+/// Resolve the **gemma-4-E4B-it** snapshot — the dense (standard-attention) gemma4
+/// model whose MTP drafter head ships IN-REPO (no separate `-assistant` download).
+/// The #31 VERIFIED real-drafter gate model. Override with `PIE_CUDA_TEST_GEMMA4_SNAPSHOT`.
+pub fn resolve_gemma4_snapshot() -> Result<String> {
+    if let Ok(p) = std::env::var("PIE_CUDA_TEST_GEMMA4_SNAPSHOT") {
+        return Ok(p);
+    }
+    let hub = std::env::var("HF_HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| {
+            let home = std::env::var("HOME").unwrap_or_default();
+            std::path::PathBuf::from(home).join(".cache/huggingface")
+        })
+        .join("hub/models--google--gemma-4-E4B-it/snapshots");
+    let snap = std::fs::read_dir(&hub)
+        .with_context(|| {
+            format!(
+                "gemma-4-E4B-it not in HF cache at {} — run `hf download google/gemma-4-E4B-it`",
+                hub.display()
+            )
+        })?
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .find(|p| p.join("config.json").exists())
+        .with_context(|| format!("no complete gemma-4-E4B-it snapshot under {}", hub.display()))?;
+    Ok(snap.to_string_lossy().into_owned())
+}
+
+/// Standalone TOML for **gemma-4-E4B-it with the in-repo MTP drafter ENABLED** (#31
+/// VERIFIED self-spec). gemma4 is dense (no GDN/RS-context wall), so a plain forward
+/// works. `enable_system_speculation = true` + `mtp_num_drafts = K` wire the native
+/// drafter; `mtp_assistant_snapshot_dir` points at the snapshot itself (the MTP head
+/// ships in-repo, loaded by `load_gemma4_mtp_weights`).
+pub fn cuda_standalone_toml_gemma4_mtp(hf_repo: &str, num_drafts: u32) -> String {
+    format!(
+        "[controller]\n\
+         \n\
+         [gateway]\n\
+         listen = \"127.0.0.1:0\"\n\
+         \n\
+         [worker]\n\
+         [worker.auth]\n\
+         enabled = false\n\
+         \n\
+         [worker.model]\n\
+         name = \"gemma4\"\n\
+         hf_repo = \"{hf_repo}\"\n\
+         \n\
+         [worker.model.driver]\n\
+         type = \"cuda_native\"\n\
+         device = [\"cuda:0\"]\n\
+         \n\
+         [worker.model.driver.options]\n\
+         gpu_mem_utilization = 0.90\n\
+         enable_system_speculation = true\n\
+         mtp_num_drafts = {num_drafts}\n\
+         mtp_assistant_snapshot_dir = \"{hf_repo}\"\n"
+    )
+}
+
+/// Boot gemma-4-E4B-it on the 4090 with the in-repo MTP drafter enabled (#31
+/// VERIFIED gate). The real gemma4 `:4460` drafter fires for `pass.draft_output(k)`.
+pub async fn boot_4090_gemma4_mtp(num_drafts: u32) -> Result<pie_bin::StandaloneHandle> {
+    let snapshot = resolve_gemma4_snapshot()?;
+    let (controller, gateway, worker) =
+        derive_standalone(&cuda_standalone_toml_gemma4_mtp(&snapshot, num_drafts))?;
+    run_standalone(controller, gateway, worker, Mode::Local).await
+}
+
+
 /// Standalone TOML for the **dummy** driver: fabricates everything the portable
 /// driver reads from weights (no GPU, no 20 GB load, ~instant boot), so it
 /// exercises the *driver-agnostic* client edge (connect → add_program →
