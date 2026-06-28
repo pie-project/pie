@@ -260,23 +260,35 @@ fn fastpath_kind(kind: &OutputKind) -> Option<(Vec<u32>, Dtype, usize)> {
 /// Populate `req`'s `sampling_output_*` carrier with one pinned destination per
 /// declared output value (flattened across programs in declared output order,
 /// per-program CSR), and return the owning [`PinnedOutput`]s to stash on the
-/// in-flight pass. The pass is all-fast-path-or-all-legacy: if ANY declared
-/// output is not on the first slice (or there are no outputs), this is a no-op
-/// returning empty (legacy `ForwardResponse` path), keeping `output()` from
-/// mixing pinned + channel-marshaled tensors. No-op without `driver-cuda`.
+/// in-flight pass. The pass is all-fast-path-or-all-legacy: anything not on the
+/// driver's eager-D2H MVP slice is a no-op returning empty (legacy
+/// `ForwardResponse` path), keeping `output()` from mixing pinned +
+/// channel-marshaled tensors. No-op without `driver-cuda`.
+///
+/// MVP eligibility = a **single `Token`** output. The driver eager-D2H
+/// (`executor.cpp`, "one Token per program") only fills `sampling_output_dst_ptrs`
+/// when it holds exactly one slot and copies `pi.sampled[N-1]` (the sampled
+/// token) into it; multi-output programs (e.g. mirostat's `[Token, Scalar]`)
+/// AND single non-`Token` outputs (a lone `Scalar`/`Entropy`, which would get
+/// the token's int bits as f32) MUST fall through to the legacy rich path, which
+/// marshals every declared output from the kernel's `out_ptrs`. Over-enabling
+/// here (any-arity, any fast-kind) desyncs from the driver: the runtime
+/// short-circuits to the never-filled pinned buffers while the driver's correct
+/// rich `out_resp` is discarded → token-0 / S-0 (#19).
 #[cfg(feature = "driver-cuda")]
 pub fn populate_output_fastpath(
     req: &mut ForwardRequest,
     programs_output_kinds: &[Vec<OutputKind>],
 ) -> Vec<PinnedOutput> {
-    // Eligible iff there is ≥1 output and every output is on the first slice.
+    // Eligible iff exactly one declared output, and it is a `Token` — the only
+    // shape the driver eager-D2H MVP fills (`pi.sampled[N-1]` → the single dst).
     let total: usize = programs_output_kinds.iter().map(|p| p.len()).sum();
-    if total == 0
-        || !programs_output_kinds
+    let single_token = total == 1
+        && programs_output_kinds
             .iter()
             .flatten()
-            .all(|k| fastpath_kind(k).is_some())
-    {
+            .all(|k| matches!(k, OutputKind::Token));
+    if !single_token {
         return Vec::new();
     }
 
