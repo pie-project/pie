@@ -102,6 +102,34 @@ fn empty_request_has_no_programs() {
     assert_eq!(req.sampling_program_at(0), None);
 }
 
+#[test]
+fn mtp_logits_binding_round_trips() {
+    // #21 mtp-logits: the draft-logits intrinsic binding rides the carrier as
+    // `sampling_binding_kind == KIND_MTP_LOGITS (2)` with key 0 (payload-less),
+    // parallel to `Logits (0)` / `Tensor (1)`. A stale reader sees an unknown
+    // kind, not a mis-keyed tensor (the distinct-manifest-variant guard).
+    let prog = SamplingProgramSubmission {
+        bytecode: vec![7, 7],
+        inputs: vec![],
+        bindings: vec![SamplingBinding::MtpLogits, SamplingBinding::Logits],
+        late_keys: vec![],
+        late_inputs: vec![],
+    };
+    let mut req = ForwardRequest::default();
+    req.push_sampling_program(&prog);
+
+    // Wire encoding (the contract the driver's `InputBind` builder keys on):
+    // MtpLogits → 2, Logits → 0; both payload-less ⇒ key 0.
+    assert_eq!(req.sampling_binding_kind, vec![2, 0]);
+    assert_eq!(req.sampling_binding_key, vec![0, 0]);
+    // Full AoS round-trip reconstructs the distinct variant (not Logits).
+    assert_eq!(req.sampling_program_at(0), Some(prog));
+    assert_eq!(
+        SamplingBinding::from_parts(2, 0),
+        SamplingBinding::MtpLogits
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Batch merge: extend_sampling_programs_from
 // ---------------------------------------------------------------------------
@@ -375,6 +403,9 @@ fn batch_merge_preserves_all_sampling_carrier_fields() {
     req0.sampling_output_dst_ptrs = vec![0x1000];
     req0.sampling_output_dst_lens = vec![4];
     req0.sampling_output_indptr = vec![0, 1];
+    // #27 cut #2 device-alias late channel (parallel to p0's 1 late key).
+    req0.sampling_late_device_ptrs = vec![0xA000];
+    req0.sampling_late_device_flags = vec![0xF000];
 
     // req1: program p1 + 2 fast-path output values.
     let mut req1 = ForwardRequest::default();
@@ -382,6 +413,9 @@ fn batch_merge_preserves_all_sampling_carrier_fields() {
     req1.sampling_output_dst_ptrs = vec![0x2000, 0x3000];
     req1.sampling_output_dst_lens = vec![4, 8];
     req1.sampling_output_indptr = vec![0, 2];
+    // device-alias late channel (parallel to p1's 2 late keys).
+    req1.sampling_late_device_ptrs = vec![0xB000, 0xC000];
+    req1.sampling_late_device_flags = vec![0xF100, 0xF200];
 
     // Batch with every nested CSR rooted at a leading 0 (mirrors
     // `new_batched_forward_request_with_capacity`, incl. `sampling_output_indptr`).
@@ -419,4 +453,16 @@ fn batch_merge_preserves_all_sampling_carrier_fields() {
     );
     assert_eq!(batch.sampling_output_dst_lens, vec![4u32, 4, 8]);
     assert_eq!(batch.sampling_output_indptr, vec![0u32, 1, 3]);
+
+    // #27 cut #2: the device-alias late channel MUST survive the merge too —
+    // concatenated parallel to `sampling_late_keys` (p0's 1 + p1's 2). Guards the
+    // same silently-dropped-carrier class for the late-input direct-H2D path.
+    assert_eq!(
+        batch.sampling_late_device_ptrs,
+        vec![0xA000u64, 0xB000, 0xC000]
+    );
+    assert_eq!(
+        batch.sampling_late_device_flags,
+        vec![0xF000u64, 0xF100, 0xF200]
+    );
 }

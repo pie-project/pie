@@ -133,6 +133,7 @@ struct Codegen {
             case OpCode::Select:
             case OpCode::Broadcast: case OpCode::RowBroadcast:
             case OpCode::Rng:
+            case OpCode::MaskApply:
                 return true;
             default:
                 return false;
@@ -233,6 +234,7 @@ struct Codegen {
             case OpCode::MaxElem: case OpCode::MinElem:
             case OpCode::Gt: case OpCode::Ge: case OpCode::Eq:
             case OpCode::Gather: case OpCode::GatherRow: case OpCode::GatherCols:
+            case OpCode::MaskApply:   // (logits, mask)
                 return {op.a, op.b};
             case OpCode::PivotThreshold:
                 if (op.predicate.tag == PredTag::CummassLe || op.predicate.tag == PredTag::ProbGe)
@@ -292,6 +294,12 @@ struct Codegen {
                     vtype[r] = {broadcast(sh(op.a), sh(op.b)), dt(op.a)}; break;
                 case OpCode::Div:
                     vtype[r] = {broadcast(sh(op.a), sh(op.b)), DType::F32}; break;
+                case OpCode::MaskApply:
+                    // result ≡ logits SHAPE (op.a); mask (op.b) is [ceil(len/32)] u32,
+                    // word-indexed — NOT broadcast with logits, so it never shapes the
+                    // result. dtype = F32 (the codegen's working logit dtype; the bf16
+                    // `0xFF80` contract is the storage view on a final bf16 output write).
+                    vtype[r] = {sh(op.a), DType::F32}; break;
                 case OpCode::Gt: case OpCode::Ge: case OpCode::Eq:
                     vtype[r] = {broadcast(sh(op.a), sh(op.b)), DType::Bool}; break;
                 case OpCode::Select:
@@ -363,6 +371,9 @@ struct Codegen {
                     logits_value = i;
                     std::uint32_t ec = vi.rows * vi.len;
                     logits_raw = new_buffer(BufferClass::IntrinsicLogits, Phys::BF16, ec, i);
+                    // Carry the intrinsic kind (Logits | MtpLogits) so delta's
+                    // jit_backend wire can route MtpLogits to the draft row.
+                    buffers[logits_raw].intrinsic_kind = in.binding.intrinsic;
                     if (inline_logits_cast) {
                         // No materialized f32 — consumers read bf16 inline (cast
                         // in registers via melem_leaf's logits special-case).
@@ -630,6 +641,15 @@ struct Codegen {
                 return "((" + elem_expr(op.a) + " != 0.0f) ? " + elem_expr(op.b) + " : " + elem_expr(op.c) + ")";
             case OpCode::Broadcast:
                 return elem_expr(op.a);                       // scalar replicated
+            case OpCode::MaskApply: {
+                // out = bit_j(mask) ? logits : -inf. mask (op.b) = packed u32,
+                // word-indexed (mask[j>>5] bit j&31); logits (op.a) = f32 elem.
+                // In batched, each sequence carries its own grammar mask → r*len.
+                const VInfo& mv = vinfo[op.b];
+                std::string maskbase = "b" + std::to_string(mv.buffer);
+                if (batched) maskbase += " + r*" + std::to_string(mv.len);
+                return "pie_ir_mask_apply(" + maskbase + ", j, " + elem_expr(op.a) + ")";
+            }
             case OpCode::RowBroadcast: {
                 const VInfo& pv = vinfo[op.a];                // Vector{rows} per-row
                 if (pv.is_const) return melem_leaf(op.a);
@@ -818,6 +838,18 @@ struct Codegen {
                 s << "  for (int j = tid; j < " << L << "; j += 256) "
                   << buf_name(r) << "[j] = ((" << ref_f32(op.a, "j") << " != 0.0f) ? "
                   << ref_f32(op.b, "j") << " : " << ref_f32(op.c, "j") << ");\n"
+                  << "  __syncthreads();\n";
+                break;
+            }
+            case OpCode::MaskApply: {
+                // Materialized (M=1): out[j] = bit_j(mask) ? logits[j] : -inf. mask
+                // (op.b) packed u32 word-indexed; result F32 (downstream reads f32;
+                // -inf truncates to bf16 0xFF80 only on a final bf16 output write).
+                ValueId r = op.result_id;
+                std::uint32_t L = vinfo[r].len;
+                s << "  for (int j = tid; j < " << L << "; j += 256) "
+                  << buf_name(r) << "[j] = pie_ir_mask_apply(" << buf_name(op.b) << ", j, "
+                  << ref_f32(op.a, "j") << ");\n"
                   << "  __syncthreads();\n";
                 break;
             }
@@ -1129,7 +1161,7 @@ LowerResult lower_bytecode_v4(const std::uint8_t* data, std::size_t len,
         Binding bd;
         if (b.kind == BindKind::Logits) {
             bd.tag = BindingTag::Intrinsic;
-            bd.intrinsic = Intrinsic::Logits;
+            bd.intrinsic = b.intrinsic_kind;   // Logits | MtpLogits (manifest-only)
         } else {
             bd.tag = BindingTag::Host;
             bd.host_key = b.host_key;

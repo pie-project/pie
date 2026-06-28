@@ -56,6 +56,7 @@ pub enum OpKind {
     PivotThreshold((ValueId, Predicate)),
     Gather((ValueId, ValueId)),
     GatherRow((ValueId, ValueId)),
+    MaskApply((ValueId, ValueId)),
     ScatterAdd((ValueId, ValueId, ValueId)),
     ScatterSet((ValueId, ValueId, ValueId)),
     Rng((u32, Shape, RngKind)),
@@ -97,6 +98,7 @@ impl Op {
             }
             Op::Gather { src, idx } => OpKind::Gather((src, idx)),
             Op::GatherRow { src, idx } => OpKind::GatherRow((src, idx)),
+            Op::MaskApply { logits, mask } => OpKind::MaskApply((logits, mask)),
             Op::ScatterAdd { base, idx, vals } => OpKind::ScatterAdd((base, idx, vals)),
             Op::ScatterSet { base, idx, vals } => OpKind::ScatterSet((base, idx, vals)),
             Op::Rng { stream, shape, kind } => OpKind::Rng((stream, shape, kind)),
@@ -137,6 +139,7 @@ impl OpKind {
             OpKind::PivotThreshold((input, predicate)) => Op::PivotThreshold { input, predicate },
             OpKind::Gather((src, idx)) => Op::Gather { src, idx },
             OpKind::GatherRow((src, idx)) => Op::GatherRow { src, idx },
+            OpKind::MaskApply((logits, mask)) => Op::MaskApply { logits, mask },
             OpKind::ScatterAdd((base, idx, vals)) => Op::ScatterAdd { base, idx, vals },
             OpKind::ScatterSet((base, idx, vals)) => Op::ScatterSet { base, idx, vals },
             OpKind::Rng((stream, shape, kind)) => Op::Rng { stream, shape, kind },

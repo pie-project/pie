@@ -141,7 +141,15 @@ impl GraphInner {
     /// the `Op::Input(slot)` that materializes it as a value.
     pub(crate) fn add_input(&mut self, ty: ir::ValueType, binding: ir::Binding) -> NodeId {
         let slot = self.inputs.len() as ir::InputIndex;
-        self.inputs.push((ir::InputDecl::new(ty.shape, ty.dtype), binding));
+        // Lower the binding's readiness into the IR input decl so the host can
+        // route Late inputs (e.g. the grammar mask) to the late H2D channel.
+        // Intrinsic (`Logits`) inputs are always available → Submit.
+        let ready = match &binding {
+            ir::Binding::Tensor { ready, .. } => *ready,
+            _ => ir::Readiness::Submit,
+        };
+        self.inputs
+            .push((ir::InputDecl::with_ready(ty.shape, ty.dtype, ready), binding));
         self.push(ir::Op::Input(slot), &[ty])
     }
 
@@ -271,7 +279,8 @@ impl Graph {
                     shape: decl.shape,
                     ready: *ready,
                 }),
-                ir::Binding::Logits => None,
+                // Intrinsics (logits / draft mtp-logits) are not host inputs.
+                ir::Binding::Logits | ir::Binding::MtpLogits => None,
             })
             .collect();
         let bindings = g.inputs.iter().map(|(_, b)| *b).collect();

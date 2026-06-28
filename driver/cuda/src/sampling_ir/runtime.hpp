@@ -74,7 +74,9 @@ enum class BindingClass : std::uint8_t {
 };
 
 enum class IntrinsicKind : std::uint8_t {
-    Logits = 0,  // bf16 [vocab] row from `ws.logits`
+    Logits = 0,     // bf16 [vocab] row from `ws.logits` at `sample_row`
+    MtpLogits = 1,  // bf16 [vocab] row from `ws.logits` at the speculator DRAFT
+                    // row (`mtp_draft_row`) — the MTP head's next-token logits.
 };
 
 // One resolved per-fire binding. Produced by the runtime from the program's
@@ -285,6 +287,13 @@ struct FireContext {
     // The single logit row to sample (MVP single-row), OR the FIRST of
     // `num_rows` contiguous sampling rows for the batched de-hardwiring path.
     int                           sample_row = 0;
+    // #21 phase-2 mtp-logits: the `ws.logits` row an `IntrinsicKind::MtpLogits`
+    // binding reads — the speculator DRAFT position (MTP head output), vs
+    // `sample_row` for plain `Logits`. The MTP draft logits live in DRAFT ROWS
+    // of `ws.logits` (not a separate buffer), so this is a row-select. -1 = unset
+    // (no mtp-logits program this fire); the executor sets it from the MTP draft
+    // layout. When unset the resolver falls back to `sample_row` (safe default).
+    int                           mtp_draft_row = -1;
     // Number of contiguous sampling rows processed in one batched launch
     // (Task #4 [N,V] primitive). 1 = single-row (custom-program / MVP). The
     // bindings are base pointers (Intrinsic = block base at `sample_row`,

@@ -369,3 +369,36 @@ fn corrupt_buffer_rejected() {
     let result = parse_request(&buf);
     assert!(matches!(result.err(), Some(WireError::Verify(_))));
 }
+
+/// Locks the #27 cut #2 device-alias late channel wire ABI: the per-late-key
+/// `sampling_late_device_ptrs` (device value pointers) + `sampling_late_device_flags`
+/// (R12 self-arm flags) survive the rkyv round-trip as aligned u64 arrays parallel
+/// to `sampling_late_keys`. The base `frame_forward_round_trip` leaves these empty,
+/// so this is the only wire coverage of the direct-H2D late carrier.
+#[test]
+fn frame_forward_sampling_late_device_round_trip() {
+    let req = ForwardRequest {
+        token_ids: vec![1, 2],
+        sampling_late_keys: vec![7, 9],
+        sampling_late_device_ptrs: vec![0xDEAD_0000_0000_A000, 0xDEAD_0000_0000_B000],
+        sampling_late_device_flags: vec![0xF1A6_0000_0000_0001, 0xF1A6_0000_0000_0002],
+        ..Default::default()
+    };
+    let f = Frame {
+        driver_id: 13,
+        payload: RequestPayload::Forward(req),
+    };
+    let bytes = encode_request(&f).unwrap();
+    let archived = parse_request(&bytes).unwrap();
+    let ArchivedRequestPayload::Forward(arch) = &archived.payload else {
+        panic!("expected Forward variant");
+    };
+    assert_eq!(
+        arch.sampling_late_device_ptrs.as_slice(),
+        &[0xDEAD_0000_0000_A000u64, 0xDEAD_0000_0000_B000]
+    );
+    assert_eq!(
+        arch.sampling_late_device_flags.as_slice(),
+        &[0xF1A6_0000_0000_0001u64, 0xF1A6_0000_0000_0002]
+    );
+}

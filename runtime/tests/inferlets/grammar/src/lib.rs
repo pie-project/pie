@@ -1,29 +1,43 @@
-//! Grammar / constrained-decoding test inferlet (Phase 2, WS3).
+//! Grammar mask-apply OP verify (cut #2(a), `MASK_OP_OK`).
 //!
-//! Demonstrates the **sequential late-bind** loop for constrained decoding: a
-//! host-side matcher computes a per-step allowed-token set, lowers it to an
-//! additive logit-bias mask (`0.0` for allowed, `-inf` for disallowed), binds
-//! it as a **submit-bound** host input, and fires a Sampling-IR `grammar`
-//! program that returns `argmax(logits + mask)`. The matcher then advances on
-//! the sampled token and the loop repeats — closing the constraint loop
-//! entirely through the IR (no hardwired logit-mask path).
+//! Verifies the de-hardwired grammar-masking OP (Sampling-IR `0x65 mask-apply`)
+//! end-to-end through the SUBMIT-mask path: a host matcher computes a per-step
+//! allowed-token set, packs it into a `[ceil(vocab/32)]` u32 bitmask (bit 1 =
+//! allowed), binds it as a submit-bound program input, and fires
+//! `grammar_submit_with_logits` = `argmax(mask_apply(logits, mask))` returning
+//! `[token, raw_logits]`. Two non-degenerate asserts (the cut #1 discipline — an
+//! all-allowed no-op mask cannot pass):
+//!   1. CONFORM: every step, the device token == `apply_mask_argmax(raw_logits,
+//!      mask)` recomputed host-side with the byte-identical CPU reference
+//!      (`inferlet::mask`) — proves device mask-apply == host semantics (closes
+//!      the host<->device drift class that bit cut #1).
+//!   2. FORCED-OUT: at step 0 the raw logits ARE the unconstrained logits (the
+//!      history is the prompt only), so the natural argmax `u0` is well-defined;
+//!      assert `u0` is DISALLOWED (bit 0) in the mask AND the constrained token
+//!      != `u0` — positively proves the `-inf` fired (not passthrough). The
+//!      matcher's small alphabet disallows the model's natural (large-id) pick,
+//!      forcing the divergence; this subsumes "constrained != unconstrained".
 //!
-//! The matcher here is a tiny DFA over a fixed token alphabet that forbids
-//! immediate repeats, so the output is provably (a) always within the alphabet
-//! and (b) never twice the same token in a row — assertable end-to-end.
+//! SCOPE — op-semantics ONLY. This verifies the `0x65` mask-apply OP via the
+//! Submit supply path. It does NOT exercise the Late-channel supply path
+//! (`tensor.write` -> device-alias carrier -> `HostLate`); that production path
+//! requires its OWN GPU verify when the Late wiring lands (the cut #1
+//! host<->device supply-drift class). `MASK_OP_OK` MUST NOT stand in for the
+//! Late-supply verify.
 
-use inferlet::program::{encode_f32, resolve_bindings};
+use inferlet::mask::{all_allowed, apply_mask_argmax, bf16_hi_to_f32, bit_allowed, pack_allowed};
+use inferlet::program::{encode_u32, resolve_bindings};
 use inferlet::sampling::program as edsl;
 use inferlet::serde_json;
 use inferlet::{Context, Result, model};
 
-/// Constraint alphabet: the only token ids the grammar ever allows.
+/// Constraint alphabet: the only token ids the grammar ever allows. Small ids
+/// the model never naturally argmaxes, so the natural pick is always forced out.
 const ALPHABET: [u32; 4] = [10, 11, 12, 13];
-/// Default number of tokens to generate; override via `_input` `"max_tokens"`.
-const MAX_TOKENS: usize = 12;
+/// Default tokens to generate; override via `{"max_tokens":N}`.
+const MAX_TOKENS: usize = 8;
 
-/// Tiny DFA: allow any alphabet token except the one just emitted (no immediate
-/// repeats). `last == None` at the start allows the whole alphabet.
+/// Tiny DFA: allow any alphabet token except the one just emitted (no repeats).
 struct NoRepeatMatcher {
     last: Option<u32>,
 }
@@ -32,8 +46,6 @@ impl NoRepeatMatcher {
     fn new() -> Self {
         Self { last: None }
     }
-
-    /// Allowed token ids at the current state.
     fn allowed(&self) -> Vec<u32> {
         ALPHABET
             .iter()
@@ -41,30 +53,30 @@ impl NoRepeatMatcher {
             .filter(|&t| Some(t) != self.last)
             .collect()
     }
-
-    /// Advance on the sampled token.
     fn accept(&mut self, token: u32) {
         self.last = Some(token);
     }
 }
 
-/// Build an additive logit-bias mask: `0.0` for allowed ids, a large negative
-/// bias elsewhere (drives those logits below any real value so `argmax` never
-/// picks them).
-fn additive_mask(vocab: usize, allowed: &[u32]) -> Vec<f32> {
-    let mut mask = vec![f32::NEG_INFINITY; vocab];
-    for &id in allowed {
-        if (id as usize) < vocab {
-            mask[id as usize] = 0.0;
-        }
+/// Read a raw-logits output tensor as `f32`, converting bf16 storage exactly as
+/// the driver does (`bf16_hi_to_f32`) so the host CPU reference is byte-identical
+/// to the device's `0x65` f32-from-bf16 compute.
+fn logits_as_f32(bytes: &[u8], vocab: usize) -> Vec<f32> {
+    if bytes.len() == vocab * 2 {
+        bytes
+            .chunks_exact(2)
+            .map(|c| bf16_hi_to_f32(u16::from_le_bytes([c[0], c[1]])))
+            .collect()
+    } else {
+        bytes
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect()
     }
-    mask
 }
 
 #[inferlet::main]
 async fn main(input: String) -> Result<String> {
-    // Optional `{"max_tokens":N}` run param; defaults to the built-in so `"{}"`
-    // reproduces the standard config and lets a harness lengthen the run.
     let params: serde_json::Value = serde_json::from_str(&input).unwrap_or(serde_json::Value::Null);
     let max_tokens = params
         .get("max_tokens")
@@ -72,38 +84,35 @@ async fn main(input: String) -> Result<String> {
         .map(|x| x as usize)
         .unwrap_or(MAX_TOKENS);
 
-    // Logits/output vocab (= hf_config.vocab_size), not the tokenizer token
-    // count: the sampler program is lowered + sampled over the logits dim.
+    // Logits/output vocab (= hf_config.vocab_size); the program masks + samples
+    // over the logits dim.
     let vocab = model::output_vocab_size();
 
     let mut context = Context::new()?;
-    // Prime the sequence with a short prompt so the first fire has a query
-    // position; tokens are fed directly into the forward pass (no chat
-    // template). Fall back to a single seed token if the prompt encodes empty
-    // (keeps the first fire's query position well-defined on any tokenizer).
-    let mut prompt = model::encode("start");
+    let mut prompt = model::encode("hello world");
     if prompt.is_empty() {
         prompt.push(0);
     }
 
-    // Build the grammar program once (binding-free; reusable). `keys.mask` is
-    // the submit-bound additive-mask input refreshed every fire. Emit the WIT
-    // `tensor::program` once.
-    let (built, keys) =
-        edsl::grammar(vocab).map_err(|e| format!("grammar program build: {e:?}"))?;
+    // `grammar_submit_with_logits`: argmax(mask_apply(logits, mask)) with the
+    // packed mask submit-bound; outputs [0]=constrained token, [1]=raw logits.
+    let (built, keys) = edsl::grammar_submit_with_logits(vocab)
+        .map_err(|e| format!("grammar_submit_with_logits build: {e:?}"))?;
     let program =
         inferlet::emit::emit_program(&built.program).map_err(|e| format!("grammar emit: {e}"))?;
     let n_out = built.outputs.len() as u32;
 
     let mut matcher = NoRepeatMatcher::new();
-    let mut generated: Vec<u32> = Vec::with_capacity(max_tokens);
-    // First fire processes the prompt and samples at its last position; each
-    // later fire feeds back the single token just sampled.
+    let mut tokens: Vec<u32> = Vec::with_capacity(max_tokens);
     let mut pending: Vec<u32> = prompt;
 
-    for _ in 0..max_tokens {
+    let mut conform_ok = true;
+    let mut forced_out_ok = false;
+    let mut natural0: i64 = -1;
+
+    for step in 0..max_tokens {
         let allowed = matcher.allowed();
-        let mask = additive_mask(vocab as usize, &allowed);
+        let packed = pack_allowed(vocab as usize, &allowed);
 
         let mut pass = context.forward();
         let start = pass.start_position();
@@ -113,7 +122,7 @@ async fn main(input: String) -> Result<String> {
             &built.bindings,
             &built.host_inputs,
             &[decode_pos],
-            &[(keys.mask, encode_f32(&mask))],
+            &[(keys.mask, encode_u32(&packed))],
         )?;
         let handles = pass.sampler(&program, bindings, n_out);
         let out = pass.execute().await?;
@@ -121,30 +130,49 @@ async fn main(input: String) -> Result<String> {
         let token = out
             .token(handles[0])
             .await
-            .map_err(|e| format!("grammar: read token: {e}"))?;
+            .map_err(|e| format!("read token @{step}: {e}"))?;
+        let logit_bytes = out
+            .read_bytes(handles[1])
+            .await
+            .map_err(|e| format!("read logits @{step}: {e}"))?;
+        let logits = logits_as_f32(&logit_bytes, vocab as usize);
 
-        // Invariant checks — the IR-constrained output must obey the grammar.
-        if !ALPHABET.contains(&token) {
-            return Err(format!("grammar violated: {token} not in alphabet"));
+        // Assert #1 CONFORM: device token == host apply_mask_argmax(raw logits, mask).
+        let host_token = apply_mask_argmax(&logits, &packed);
+        if token != host_token {
+            conform_ok = false;
+            eprintln!(
+                "[GRAMMAR-OP] CONFORM mismatch @{step}: device={token} host={host_token}"
+            );
         }
-        if matcher.last == Some(token) {
-            return Err(format!("grammar violated: immediate repeat of {token}"));
+        // Grammar conformance invariant: the constrained token is in the alphabet.
+        if !ALPHABET.contains(&token) {
+            conform_ok = false;
+            eprintln!("[GRAMMAR-OP] grammar violated @{step}: {token} not in alphabet");
+        }
+
+        // Assert #2 FORCED-OUT @ step 0: the natural argmax is disallowed + forced out.
+        if step == 0 {
+            // Step-0 raw logits ARE the unconstrained logits (history = prompt only).
+            let u0 = apply_mask_argmax(&logits, &all_allowed(vocab as usize));
+            natural0 = u0 as i64;
+            let disallowed = !bit_allowed(&packed, u0 as usize);
+            forced_out_ok = disallowed && token != u0;
+            eprintln!(
+                "[GRAMMAR-OP] forced-out @0: natural={u0} disallowed={disallowed} constrained={token}"
+            );
         }
 
         matcher.accept(token);
-        generated.push(token);
+        tokens.push(token);
         pending = vec![token];
     }
 
-    // Emit a structured result so a harness can assert conformance
-    // programmatically (the per-step invariants above already hold, else we
-    // returned Err). `conformant` is always true on the success path.
-    let tokens_json = serde_json::to_string(&generated).unwrap_or_else(|_| "[]".to_string());
+    let mask_op_ok = conform_ok && forced_out_ok;
     let result = format!(
-        "{{\"sampler\":\"grammar\",\"conformant\":true,\"count\":{},\"tokens\":{}}}",
-        generated.len(),
-        tokens_json
+        "MASK_OP_OK={mask_op_ok} conform={conform_ok} forced_out={forced_out_ok} \
+         natural0={natural0} tokens={tokens:?}"
     );
-    eprintln!("[GRAMMAR] {result}");
+    eprintln!("[GRAMMAR-OP] {result}");
     Ok(result)
 }

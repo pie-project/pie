@@ -395,6 +395,30 @@ pub struct ForwardRequest {
     /// like `sampling_input_indptr`): `sampling_output_indptr[p..p+1]` is
     /// program `p`'s output values. Empty ⇒ no fast-path outputs (legacy path).
     pub sampling_output_indptr: Vec<u32>,
+
+    // ── Programmable-sampling late-input device-alias channel (#27 cut #2) ───
+    // Appended per the schema evolution rule (append-only). The input-side mirror
+    // of `sampling_output_*`: for a program input declared `host{key, late-bound}`
+    // (e.g. a grammar mask), the host pre-uploads the value DIRECTLY to a device
+    // buffer (`pie_device_alloc` + `pie_tensor_write_async`, direct-FFI from the
+    // guest's WASM-memory slice — no IPC staging, the input mirror of cut #1's
+    // output D2H) and passes the resulting DEVICE pointer here instead of staging
+    // host bytes via `sampling_late_blob`. The driver's `HostLate` resolution
+    // reads `sampling_late_device_ptrs[late_key]` → the device-resident value,
+    // gated on the R12 self-arm flag (`sampling_late_device_flags[late_key]`,
+    // set stream-ordered after the H2D). `0` ⇒ no device-alias for that late key
+    // (fall back to the staged `sampling_late_blob` path). Parallel to
+    // `sampling_late_keys` (one entry per late key, concatenated across programs).
+    // Security: the guest never sees a device pointer — it hands the host a slice,
+    // the host does the memcpy.
+    /// Per-late-key device-resident value pointer (raw device address, u64; `0` =
+    /// no device-alias, use the staged blob). Parallel to `sampling_late_keys`.
+    pub sampling_late_device_ptrs: Vec<u64>,
+    /// Per-late-key R12 self-arm flag pointer (raw device address of the
+    /// `pie_device_alloc`-co-allocated `u32` flag, set after the H2D; `0` = none).
+    /// The driver waits this flag before the consuming kernel reads the value, so
+    /// a not-yet-arrived value is a loud miss, never a stale-buffer silent read.
+    pub sampling_late_device_flags: Vec<u64>,
 }
 
 /// Per-slot sampler kind discriminants. Carried on the wire as the `u8`
@@ -500,6 +524,12 @@ pub enum SamplingBinding {
     /// The LM-head logits intrinsic (sampling positions resolved host-side into
     /// `sampling_indices`).
     Logits,
+    /// The speculator's **draft** logits intrinsic (de-hardwired speculation):
+    /// source-selects the draft rows of `ws.logits` (M=1 ⇒ row 0) rather than a
+    /// separate buffer. A distinct manifest kind (not a flag on `Logits`) so a
+    /// stale reader loud-rejects rather than misparsing — mirrors
+    /// [`Binding::MtpLogits`](pie_sampling_ir::Binding). Payload-less (key `0`).
+    MtpLogits,
     /// A submit-bound tensor value keyed into the submit-input table.
     Tensor { key: u32 },
 }
@@ -509,19 +539,23 @@ impl SamplingBinding {
     pub const KIND_LOGITS: u8 = 0;
     /// Wire discriminant for a `Tensor` slot.
     pub const KIND_TENSOR: u8 = 1;
+    /// Wire discriminant for a `MtpLogits` (draft-logits intrinsic) slot.
+    pub const KIND_MTP_LOGITS: u8 = 2;
 
     /// The `sampling_binding_kind` discriminant for this binding.
     pub fn kind(self) -> u8 {
         match self {
             SamplingBinding::Logits => Self::KIND_LOGITS,
+            SamplingBinding::MtpLogits => Self::KIND_MTP_LOGITS,
             SamplingBinding::Tensor { .. } => Self::KIND_TENSOR,
         }
     }
 
-    /// The `sampling_binding_key` value (the TensorKey, or `0` for `Logits`).
+    /// The `sampling_binding_key` value (the TensorKey, or `0` for the
+    /// payload-less `Logits`/`MtpLogits` intrinsics).
     pub fn key(self) -> u32 {
         match self {
-            SamplingBinding::Logits => 0,
+            SamplingBinding::Logits | SamplingBinding::MtpLogits => 0,
             SamplingBinding::Tensor { key } => key,
         }
     }
@@ -530,6 +564,7 @@ impl SamplingBinding {
     pub fn from_parts(kind: u8, key: u32) -> SamplingBinding {
         match kind {
             Self::KIND_TENSOR => SamplingBinding::Tensor { key },
+            Self::KIND_MTP_LOGITS => SamplingBinding::MtpLogits,
             _ => SamplingBinding::Logits,
         }
     }
@@ -931,6 +966,13 @@ impl ForwardRequest {
         for &off in req.sampling_late_indptr.iter().skip(1) {
             self.sampling_late_indptr.push(late_base + off);
         }
+        // #27 cut #2 device-alias channel: parallel to `sampling_late_keys` (one
+        // device ptr + R12 flag per late key) → concat verbatim, exactly like
+        // `sampling_late_lens`. Empty (legacy staged path) stays empty.
+        self.sampling_late_device_ptrs
+            .extend_from_slice(&req.sampling_late_device_ptrs);
+        self.sampling_late_device_flags
+            .extend_from_slice(&req.sampling_late_device_flags);
 
         // Per-slot binding-map: concat the (kind, key) slots and rebase the
         // per-program CSR by the slot base.

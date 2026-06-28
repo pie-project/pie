@@ -22,7 +22,7 @@ use std::num::NonZeroUsize;
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
 
 use lru::LruCache;
-use pie_sampling_ir::{OutputKind, SamplingProgram, ValidationError};
+use pie_sampling_ir::{OutputKind, Readiness, SamplingProgram, ValidationError};
 
 /// FNV-1a 64-bit program-identity hash — re-exported from `pie-sampling-ir` (the
 /// single canonical impl beside `encode`, byte-identical to the driver's
@@ -40,6 +40,11 @@ pub struct CachedProgram {
     pub output_kinds: Vec<OutputKind>,
     /// Declared input-slot count (binding-arity check at attach).
     pub num_inputs: usize,
+    /// Per-input-slot readiness (`Submit`/`Late`), in `Op::Input(i)` order, from
+    /// the program's `InputDecl.ready`. The host gather routes a bound `tensor`
+    /// per slot: `Submit` → `sampling_input_*` (gathered now), `Late` → the
+    /// device-alias `sampling_late_*` channel (#27 cut #2). Defaults all `Submit`.
+    pub input_readiness: Vec<Readiness>,
 }
 
 /// Default bound: high-concurrency unique-sampler churn (`#11`) must not grow the
@@ -77,6 +82,7 @@ impl ProgramCache {
             hash,
             output_kinds,
             num_inputs: program.inputs.len(),
+            input_readiness: program.inputs.iter().map(|i| i.ready).collect(),
         });
         self.inner.put(hash, entry.clone());
         Ok(entry)

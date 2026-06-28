@@ -190,9 +190,13 @@ interface inference {
         /// Returns an error if any token violates the grammar.
         accept-tokens: func(token-ids: list<u32>) -> result<_, error>;
 
-        /// Fill the next-token bitmask.  The returned BRLE encodes which
-        /// token ids in the vocabulary are allowed at the current position.
-        next-token-logit-mask: func() -> brle;
+        /// The packed allowed-token bitmask at the current position: a
+        /// `[ceil(vocab/32)]` u32 array where bit `j` (word `j/32`, bit `j%32`)
+        /// is 1 iff token `j` is allowed, 0 if disallowed. Applied in-program
+        /// by the sampler's `mask-apply` op (the de-hardwired grammar mask
+        /// channel); multiple constraints compose by word-wise bitwise-AND
+        /// host-side. Replaces the removed BRLE `next-token-logit-mask`.
+        mask: func() -> list<u32>;
 
         /// Check whether the matcher has reached a terminal state.
         is-terminated: func() -> bool;

@@ -125,11 +125,18 @@ RunStatus SamplingIrRuntime::try_run(const FireContext& ctx) {
                 break;
 
             case BindingClass::Intrinsic: {
-                // intrinsic(logits) = the LM-head output row for this fire.
-                // `ctx.logits` is the bf16 [rows, vocab] base; take sample_row.
+                // intrinsic(logits) = the LM-head output row for this fire;
+                // intrinsic(mtp-logits) = the speculator DRAFT row (the MTP head's
+                // next-token logits). Both read `ctx.logits` — the bf16
+                // [rows, vocab] base — because the MTP draft logits live in DRAFT
+                // ROWS of `ws.logits`, not a separate buffer; only the row differs.
                 const auto* base = static_cast<const __nv_bfloat16*>(ctx.logits);
+                int row = ctx.sample_row;
+                if (decl.intrinsic == IntrinsicKind::MtpLogits)
+                    row = (ctx.mtp_draft_row >= 0) ? ctx.mtp_draft_row
+                                                   : ctx.sample_row;
                 r.device_ptr =
-                    base + static_cast<std::size_t>(ctx.sample_row) *
+                    base + static_cast<std::size_t>(row) *
                                static_cast<std::size_t>(ctx.vocab_size);
                 r.elem_count = static_cast<std::size_t>(ctx.vocab_size);
                 r.present = true;
@@ -173,7 +180,11 @@ RunStatus SamplingIrRuntime::try_run(const FireContext& ctx) {
                     return RunStatus::SkippedLateBindMiss;
                 }
                 r.device_ptr = e->device_ptr;
-                r.elem_count = e->elem_count;
+                // The device-alias carrier (#27 cut #2 (B)) ships only a ptr +
+                // self-arm flag, no length — take the shape from the program's
+                // declared InputDecl (as the staged path does) when the carrier
+                // didn't supply one.
+                r.elem_count = (e->elem_count != 0) ? e->elem_count : decl.elem_count;
                 r.present = true;
                 break;
             }

@@ -3158,12 +3158,44 @@ void handle_fire_batch(
                 }
             }
 
+            // Host-late DEVICE-ALIAS inputs for program 0 (#27 cut #2 (B) direct
+            // H2D): a Late tensor (the grammar mask) is written straight to a
+            // device buffer by the host (`pie_tensor_write_async` from the guest's
+            // WASM-memory slice — @ingim's inferlet→GPU memcpy) and carried here as
+            // a device ptr in `sampling_late_device_ptrs`, NOT bytes in
+            // `sampling_late_blob`. Register one LateInput per late key whose
+            // device ptr != 0 so the runtime's HostLate device-alias branch
+            // resolves it. The host pre-syncs the (sequential) H2D before submit,
+            // so the buffer is resident this fire ("already on device" contract);
+            // the carried `sampling_late_device_flags` R12 self-arm is for the
+            // true-async follow-up. A late key with neither a staged value nor a
+            // device ptr resolves to SkippedLateBindMiss (loud, never stale).
+            std::vector<sampling_ir::LateInput> late_inputs;
+            if (view.sampling_late_indptr.size() >= 2 &&
+                !view.sampling_late_device_ptrs.empty()) {
+                const std::uint32_t llo = view.sampling_late_indptr.data()[0];
+                const std::uint32_t lhi = view.sampling_late_indptr.data()[1];
+                for (std::uint32_t i = llo; i < lhi; ++i) {
+                    if (i >= view.sampling_late_device_ptrs.size()) break;
+                    const std::uint64_t dptr =
+                        view.sampling_late_device_ptrs.data()[i];
+                    if (dptr == 0) continue;  // this key rides the staged path
+                    sampling_ir::LateInput li;
+                    li.key = view.sampling_late_keys.data()[i];
+                    li.device_ptr = reinterpret_cast<const void*>(
+                        static_cast<std::uintptr_t>(dptr));
+                    li.elem_count = 0;  // shape taken from the program's InputDecl
+                    late_inputs.push_back(li);
+                }
+            }
+
             sampling_ir::FireContext ctx;
             ctx.program_bytecode = {
                 view.sampling_program_bytes.data() + blo,
                 static_cast<std::size_t>(bhi - blo)};
             ctx.submit_inputs = submit_inputs;
             ctx.late_value_inputs = late_value_inputs;
+            ctx.late_inputs = late_inputs;
             // v4 binding manifest for program 0: the per-slot binding-map (Logits
             // intrinsic vs keyed HostTensor) the binding-free v4 bytecode omits.
             // Without it, get_or_compile routes to the v3 self-binding decoder,
@@ -3175,12 +3207,23 @@ void handle_fire_batch(
                 manifest.reserve(mhi - mlo);
                 for (std::uint32_t i = mlo; i < mhi; ++i) {
                     sampling_ir::InputBind b;
-                    if (view.sampling_binding_kind.data()[i] != 0 /* KIND_TENSOR */) {
+                    // Wire kind (bravo's carrier): 0=Logits, 1=Tensor, 2=MtpLogits.
+                    // MUST switch on the explicit kind — a `!= 0` test mis-routes
+                    // the new MtpLogits(2) into HostTensor (charlie's latent-bug
+                    // catch). MtpLogits is payload-less (binding_key=0); it stays
+                    // a Logits-class intrinsic, only stamping intrinsic_kind so the
+                    // codegen → delta's jit_backend wire → runtime resolver reads
+                    // the DRAFT row. `intrinsic_kind`/`Intrinsic::MtpLogits` come
+                    // from charlie's 970bfdcd (resolved in the consolidation fold).
+                    const std::uint32_t bk = view.sampling_binding_kind.data()[i];
+                    if (bk == 1 /* KIND_TENSOR */) {
                         b.kind = sampling_ir::BindKind::HostTensor;
                         b.host_key = view.sampling_binding_key.data()[i];
                         b.ready = sampling_ir::HostAvailability::SubmitBound;
                     } else {
                         b.kind = sampling_ir::BindKind::Logits;
+                        if (bk == 2 /* KIND_MTP_LOGITS */)
+                            b.intrinsic_kind = sampling_ir::Intrinsic::MtpLogits;
                     }
                     manifest.push_back(b);
                 }

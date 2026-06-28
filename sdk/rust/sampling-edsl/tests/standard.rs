@@ -25,7 +25,7 @@ fn bind(b: &Built, logits: &[f32], params: &[(u32, f32)]) -> Vec<EvalValue> {
     b.bindings
         .iter()
         .map(|binding| match binding {
-            Binding::Logits => EvalValue::F32(logits.to_vec()),
+            Binding::Logits | Binding::MtpLogits => EvalValue::F32(logits.to_vec()),
             Binding::Tensor { key, .. } => {
                 let v = params
                     .iter()

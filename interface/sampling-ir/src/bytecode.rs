@@ -20,6 +20,11 @@ const DT_I32: u8 = 1;
 const DT_U32: u8 = 2;
 const DT_BOOL: u8 = 3;
 
+/// `InputDecl` readiness rides bit 7 of the dtype byte (DType tags are `0..=3`,
+/// so the high bit is free). Clear ⇒ `Submit` — so v4 bytecode (which never set
+/// it) decodes additively as `Submit`; set ⇒ `Late`.
+const READY_LATE_BIT: u8 = 0x80;
+
 // -- predicate tags --
 const PR_RANKLE: u8 = 0;
 const PR_CUMMASSLE: u8 = 1;
@@ -67,6 +72,7 @@ const OP_GATHER: u8 = 0x60;
 const OP_GATHERROW: u8 = 0x61;
 const OP_SCATTERADD: u8 = 0x62;
 const OP_SCATTERSET: u8 = 0x63;
+const OP_MASKAPPLY: u8 = 0x65;
 
 const OP_RNG: u8 = 0x70;
 
@@ -84,7 +90,8 @@ pub fn encode(p: &SamplingProgram) -> Vec<u8> {
     put_u32(&mut w, p.ops.len() as u32);
     put_u32(&mut w, p.outputs.len() as u32);
     for inp in &p.inputs {
-        w.push(dtype_tag(inp.dtype));
+        let ready_bit = if inp.ready == Readiness::Late { READY_LATE_BIT } else { 0 };
+        w.push(dtype_tag(inp.dtype) | ready_bit);
         encode_shape(&mut w, inp.shape);
     }
     for op in &p.ops {
@@ -153,6 +160,7 @@ fn encode_op(w: &mut Vec<u8>, op: &Op) {
 
         Op::Gather { src, idx } => bin(w, OP_GATHER, src, idx),
         Op::GatherRow { src, idx } => bin(w, OP_GATHERROW, src, idx),
+        Op::MaskApply { logits, mask } => bin(w, OP_MASKAPPLY, logits, mask),
         Op::ScatterAdd { base, idx, vals } => {
             w.push(OP_SCATTERADD);
             put_u32(w, base);
@@ -332,9 +340,15 @@ pub fn decode(bytes: &[u8]) -> Result<SamplingProgram, DecodeError> {
 
     let mut inputs = Vec::with_capacity(n_inputs as usize);
     for _ in 0..n_inputs {
-        let dtype = decode_dtype(r.u8()?)?;
+        let raw = r.u8()?;
+        let ready = if raw & READY_LATE_BIT != 0 {
+            Readiness::Late
+        } else {
+            Readiness::Submit
+        };
+        let dtype = decode_dtype(raw & !READY_LATE_BIT)?;
         let shape = decode_shape(&mut r)?;
-        inputs.push(InputDecl::new(shape, dtype));
+        inputs.push(InputDecl::with_ready(shape, dtype, ready));
     }
     let mut ops = Vec::with_capacity(n_ops as usize);
     for _ in 0..n_ops {
@@ -435,6 +449,11 @@ fn decode_op(r: &mut Reader<'_>) -> Result<Op, DecodeError> {
             let src = r.u32()?;
             let idx = r.u32()?;
             Op::GatherRow { src, idx }
+        }
+        OP_MASKAPPLY => {
+            let logits = r.u32()?;
+            let mask = r.u32()?;
+            Op::MaskApply { logits, mask }
         }
         OP_SCATTERADD => {
             let base = r.u32()?;
@@ -538,6 +557,25 @@ mod tests {
             ],
             outputs: vec![OutputDecl::new(8, OutputKind::Token)],
         }
+    }
+
+    #[test]
+    fn input_readiness_round_trip_and_recognizer_distinct() {
+        // Slot 1 (a host mask) declared Late; slot 0 stays Submit (the default).
+        let mut late = sample_program();
+        late.inputs[1] = InputDecl::with_ready(Shape::SCALAR, DType::U32, Readiness::Late);
+        let bytes = encode(&late);
+        let back = decode(&bytes).expect("decode");
+        assert_eq!(back.inputs[1].ready, Readiness::Late); // high-bit survives
+        assert_eq!(back.inputs[1].dtype, DType::U32); // low 7 bits intact
+        assert_eq!(back.inputs[0].ready, Readiness::Submit); // Submit default round-trips
+        assert_eq!(back, late); // full identity
+        // A Late-input program hashes distinctly — readiness rides the bytecode
+        // `program_hash` hashes over, so it's a distinct recognized shape.
+        assert_ne!(
+            crate::program_hash(&bytes),
+            crate::program_hash(&encode(&sample_program()))
+        );
     }
 
     #[test]

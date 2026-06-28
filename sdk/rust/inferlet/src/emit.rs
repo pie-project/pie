@@ -51,6 +51,7 @@ pub(crate) fn lower_parts(program: &ir::SamplingProgram) -> Result<ProgramParts>
         .map(|d| tensor::Input {
             shape: shape_to_wit(d.shape),
             dtype: dtype_to_wit(d.dtype),
+            ready: readiness_to_wit(d.ready),
         })
         .collect();
 
@@ -94,6 +95,16 @@ pub(crate) fn dtype_to_wit(d: ir::DType) -> tensor::Dtype {
         ir::DType::I32 => tensor::Dtype::I32,
         ir::DType::U32 => tensor::Dtype::U32,
         ir::DType::Bool => tensor::Dtype::Bool,
+    }
+}
+
+/// WIT `readiness`: when an input-slot's binding value is ready at attach. Late
+/// inputs (e.g. the grammar mask) ride the host late H2D channel; the host
+/// reconstructs `InputDecl.ready` from this on decode (lane-3).
+fn readiness_to_wit(r: ir::Readiness) -> tensor::Readiness {
+    match r {
+        ir::Readiness::Submit => tensor::Readiness::Submit,
+        ir::Readiness::Late => tensor::Readiness::Late,
     }
 }
 
@@ -161,6 +172,7 @@ fn op_kind_to_wit(k: ir::OpKind) -> tensor::OpKind {
         ir::OpKind::PivotThreshold((v, p)) => W::PivotThreshold((v, predicate_to_wit(p))),
         ir::OpKind::Gather(t) => W::Gather(t),
         ir::OpKind::GatherRow(t) => W::GatherRow(t),
+        ir::OpKind::MaskApply(t) => W::MaskApply(t),
         ir::OpKind::ScatterAdd(t) => W::ScatterAdd(t),
         ir::OpKind::ScatterSet(t) => W::ScatterSet(t),
         ir::OpKind::Rng((stream, s, kind)) => W::Rng((stream, shape_to_wit(s), rng_kind_to_wit(kind))),
@@ -209,6 +221,7 @@ mod tests {
             }
             W::Gather(t) => ir::OpKind::Gather(t),
             W::GatherRow(t) => ir::OpKind::GatherRow(t),
+            W::MaskApply(t) => ir::OpKind::MaskApply(t),
             W::ScatterAdd(t) => ir::OpKind::ScatterAdd(t),
             W::ScatterSet(t) => ir::OpKind::ScatterSet(t),
             W::Rng((stream, ref s, k)) => {

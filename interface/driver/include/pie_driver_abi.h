@@ -68,6 +68,9 @@ constexpr static const uint8_t SamplingBinding_KIND_LOGITS = 0;
 /// Wire discriminant for a `Tensor` slot.
 constexpr static const uint8_t SamplingBinding_KIND_TENSOR = 1;
 
+/// Wire discriminant for a `MtpLogits` (draft-logits intrinsic) slot.
+constexpr static const uint8_t SamplingBinding_KIND_MTP_LOGITS = 2;
+
 /// Copy direction for [`crate::CopyRequest`].
 enum PieCopyDir : uint8_t {
   PieCopyDir_D2H,
@@ -247,6 +250,10 @@ struct PieForwardRequestDesc {
   size_t sampling_output_dst_lens_len;
   const uint32_t *sampling_output_indptr_ptr;
   size_t sampling_output_indptr_len;
+  const uint64_t *sampling_late_device_ptrs_ptr;
+  size_t sampling_late_device_ptrs_len;
+  const uint64_t *sampling_late_device_flags_ptr;
+  size_t sampling_late_device_flags_len;
 };
 
 struct PieCopyRequestDesc {

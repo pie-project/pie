@@ -187,6 +187,15 @@ struct PieForwardRequestView {
     PieSlice<std::uint32_t> sampling_output_dst_lens;    // byte capacity per dst (bounds-check)
     PieSlice<std::uint32_t> sampling_output_indptr;      // per-program CSR into the dst arrays
 
+    // #27 cut #2 (B) direct-H2D late channel: per-late-key device-resident value
+    // ptr (host `pie_device_alloc`'d, filled by `pie_tensor_write_async` straight
+    // from the guest's WASM-memory slice — @ingim's inferlet→GPU memcpy, no IPC
+    // staging) + the R12 self-arm flag ptr (set stream-ordered after the H2D).
+    // Parallel to `sampling_late_keys`; ptr==0 for a key ⇒ that key uses the
+    // staged `sampling_late_blob` path instead. The grammar mask rides this.
+    PieSlice<std::uint64_t> sampling_late_device_ptrs;   // device buf ptr per late key
+    PieSlice<std::uint64_t> sampling_late_device_flags;  // R12 self-arm flag ptr per late key
+
     // Sampler attributes (SoA — read from the wire SoA arrays; view.hpp
     // applies only the small kind-remap / top_k / top_p-min_p fold).
     PieSlice<std::uint32_t> sampler_types;
@@ -505,6 +514,10 @@ inline void fill_forward_view(const PieForwardRequestDesc& f,
         slice_from(f.sampling_output_dst_lens_ptr, f.sampling_output_dst_lens_len);
     out.sampling_output_indptr =
         slice_from(f.sampling_output_indptr_ptr, f.sampling_output_indptr_len);
+    out.sampling_late_device_ptrs =
+        slice_from(f.sampling_late_device_ptrs_ptr, f.sampling_late_device_ptrs_len);
+    out.sampling_late_device_flags =
+        slice_from(f.sampling_late_device_flags_ptr, f.sampling_late_device_flags_len);
     out.spec_token_ids    = slice_from(f.spec_token_ids_ptr, f.spec_token_ids_len);
     out.spec_position_ids = slice_from(f.spec_position_ids_ptr, f.spec_position_ids_len);
     out.spec_indptr       = slice_from(f.spec_indptr_ptr, f.spec_indptr_len);

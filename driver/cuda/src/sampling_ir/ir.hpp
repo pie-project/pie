@@ -80,6 +80,7 @@ enum class OpCode : std::uint8_t {
     PivotThreshold = 0x58,
     Gather = 0x60, GatherRow = 0x61, ScatterAdd = 0x62, ScatterSet = 0x63,
     GatherCols = 0x64,   // (v3) src Matrix{rows,len}, idx Vector{rows} → Vector{rows}: out[i]=src[i,idx[i]]
+    MaskApply = 0x65,    // (v4) mask_apply(logits, packed-mask): out[j] = bit_j(mask) ? logits[j] : -inf
     Rng = 0x70,
     RowBroadcast = 0x39,   // (v3) per_row Vector{rows} → Matrix{rows, len}
 };
@@ -122,7 +123,12 @@ inline std::uint32_t op_result_count(OpCode c) {
 }
 
 enum class BindingTag : std::uint8_t { Const = 0, Intrinsic = 1, Host = 2, Output = 3 };
-enum class Intrinsic : std::uint8_t { Logits = 0 };
+// Which `ws.logits` row an Intrinsic binding resolves to. `MtpLogits` = the
+// speculator DRAFT row (#21 phase-2): identical bytecode, manifest-only
+// (foxtrot's additive `ir::Binding::MtpLogits`) — no opcode/version bump. The
+// executor maps this to the runtime `IntrinsicKind` (Logits → the sampled row,
+// MtpLogits → `ws.logits[mtp_draft_row]`); delta bridges at jit_backend.cpp:282.
+enum class Intrinsic : std::uint8_t { Logits = 0, MtpLogits = 1 };
 enum class HostAvailability : std::uint8_t { SubmitBound = 0, LateBound = 1 };
 
 // Semantic kind of a declared slot output (PSIR v2). The host marshals each

@@ -331,6 +331,10 @@ pub fn new_batched_forward_request_with_capacity(n_requests: usize) -> pie_drive
         sampling_late_blob: Vec::new(),
         sampling_late_offsets: Vec::new(),
         sampling_late_lens: Vec::new(),
+        // #27 cut #2 device-alias late channel: parallel to sampling_late_keys
+        // (device value ptr + R12 flag per late key), grown by the batch-merge.
+        sampling_late_device_ptrs: Vec::new(),
+        sampling_late_device_flags: Vec::new(),
         // Per-slot binding-map: per-program CSR with a leading 0 (grown by the
         // merge + per-request boundary); the (kind, key) payload stays empty for
         // the legacy/no-program path.

@@ -254,6 +254,13 @@ struct AttachedProgram {
     output_kinds: Vec<pie_sampling_ir::OutputKind>,
     bindings: Vec<pie_sampling_ir::Binding>,
     submit_inputs: Vec<pie_driver_abi::SamplingInput>,
+    /// #27 cut #2 device-alias late inputs: `(late-key, DeviceLateInput)` for
+    /// each `host{key, late-bound}` tensor the host uploaded directly to device
+    /// (`upload_late_input`). At execute the keys ride `sampling_late_keys` (len-0
+    /// staged sentinel) + the device ptr/flag ride `sampling_late_device_*`; the
+    /// `DeviceLateInput` handles move to the `PendingForward` (kept resident until
+    /// the fire finalizes, then freed on drop). Empty when no late device inputs.
+    late_device_inputs: Vec<(u32, crate::api::tensor_io::DeviceLateInput)>,
     /// Sampling positions carried by this program's `logits` binding (the WIT
     /// `input-binding::logits(positions)`); flattened into the request's
     /// `sampling_indices` at `execute()`. Empty if the program reads no logits.
@@ -758,9 +765,14 @@ impl InstanceState {
         inputs: Vec<pie::core::inference::InputBinding>,
     ) -> Result<AttachedProgram> {
         use pie::core::inference::InputBinding;
-        let (bytecode, output_kinds, num_inputs) = {
+        let (bytecode, output_kinds, num_inputs, input_readiness) = {
             let p = self.ctx().table.get(program)?;
-            (p.cached.bytecode.clone(), p.cached.output_kinds.clone(), p.cached.num_inputs)
+            (
+                p.cached.bytecode.clone(),
+                p.cached.output_kinds.clone(),
+                p.cached.num_inputs,
+                p.cached.input_readiness.clone(),
+            )
         };
         if inputs.len() != num_inputs {
             return Err(anyhow::anyhow!(
@@ -770,6 +782,7 @@ impl InstanceState {
         }
         let mut bindings = Vec::with_capacity(inputs.len());
         let mut submit_inputs = Vec::new();
+        let mut late_device_inputs: Vec<(u32, crate::api::tensor_io::DeviceLateInput)> = Vec::new();
         let mut logits_positions: Vec<u32> = Vec::new();
         let mut saw_logits = false;
         for (i, binding) in inputs.into_iter().enumerate() {
@@ -785,27 +798,65 @@ impl InstanceState {
                     bindings.push(pie_sampling_ir::Binding::Logits);
                 }
                 InputBinding::MtpLogits => {
-                    // #21 mtp-logits (de-hardwired speculation): a second
-                    // intrinsic source-select (the speculator's draft buffer vs
-                    // `ws.logits`). Phase-2 forward-prep — echo's IntrinsicKind
-                    // source-select; not on the Phase-1a greedy-decode path.
-                    return Err(anyhow::anyhow!(
-                        "mtp-logits binding is not supported until phase-2 (echo's IntrinsicKind source-select)"
-                    ));
+                    // #21 mtp-logits (de-hardwired speculation): the speculator's
+                    // DRAFT logits intrinsic — source-selects the draft rows of
+                    // `ws.logits` (M=1 ⇒ row 0) rather than a separate buffer,
+                    // resolved driver-side by echo's `IntrinsicKind`. A distinct
+                    // MANIFEST binding (`Binding::MtpLogits`, not a flag on
+                    // `Logits`), carried to the driver via `SamplingBinding::
+                    // MtpLogits` (kind 2). Payload-less: the draft-row offset is
+                    // implicit (M=1), so no host-supplied positions.
+                    bindings.push(pie_sampling_ir::Binding::MtpLogits);
                 }
                 InputBinding::Tensor(tensor) => {
-                    // Submit binding: the value is final once the inferlet has
-                    // written it before attach, so gather its bytes now. The
-                    // slot index is the TensorKey wired to `Op::Input(i)`.
+                    // The slot index is the TensorKey wired to `Op::Input(i)`. The
+                    // readiness comes from the program's `InputDecl` (alpha's #27
+                    // `InputDecl.ready`): `Submit` gathers the value now into
+                    // `sampling_input_*`; `Late` uploads it DIRECTLY to a device
+                    // buffer (`upload_late_input` → `pie_tensor_write_async`, no IPC
+                    // staging) and rides the `sampling_late_device_*` carrier, for
+                    // the in-program mask-apply (#27 cut #2).
                     let key = i as u32;
                     let data = self.ctx().table.get(&tensor)?.data.clone();
                     // The owned tensor handle is consumed by the binding.
                     self.ctx().table.delete(tensor)?;
-                    bindings.push(pie_sampling_ir::Binding::Tensor {
-                        key,
-                        ready: pie_sampling_ir::Readiness::Submit,
-                    });
-                    submit_inputs.push(pie_driver_abi::SamplingInput { key, bytes: data });
+                    let ready = input_readiness
+                        .get(i)
+                        .copied()
+                        .unwrap_or(pie_sampling_ir::Readiness::Submit);
+                    match ready {
+                        pie_sampling_ir::Readiness::Late => {
+                            match crate::api::tensor_io::upload_late_input(&data) {
+                                Some(device) => {
+                                    late_device_inputs.push((key, device));
+                                    bindings.push(pie_sampling_ir::Binding::Tensor {
+                                        key,
+                                        ready: pie_sampling_ir::Readiness::Late,
+                                    });
+                                }
+                                None => {
+                                    // Host-only build / device-alloc unavailable:
+                                    // fall back to the submit-staged path (the Late
+                                    // device channel needs `driver-cuda`; never
+                                    // exercised without a GPU fire).
+                                    bindings.push(pie_sampling_ir::Binding::Tensor {
+                                        key,
+                                        ready: pie_sampling_ir::Readiness::Submit,
+                                    });
+                                    submit_inputs
+                                        .push(pie_driver_abi::SamplingInput { key, bytes: data });
+                                }
+                            }
+                        }
+                        pie_sampling_ir::Readiness::Submit => {
+                            bindings.push(pie_sampling_ir::Binding::Tensor {
+                                key,
+                                ready: pie_sampling_ir::Readiness::Submit,
+                            });
+                            submit_inputs
+                                .push(pie_driver_abi::SamplingInput { key, bytes: data });
+                        }
+                    }
                 }
             }
         }
@@ -814,6 +865,7 @@ impl InstanceState {
             output_kinds,
             bindings,
             submit_inputs,
+            late_device_inputs,
             logits_positions,
         })
     }
@@ -947,6 +999,11 @@ struct PendingForward {
     /// Filled by the time `output()` reads them — the driver defers the
     /// forward-done response until the D2H lands (the `(a2)` seam).
     pinned_outputs: Vec<crate::api::tensor_io::PinnedOutput>,
+    /// #27 cut #2: device-alias late-input upload handles, kept resident until the
+    /// fire finalizes (the mask-apply kernel reads the device buffer during the
+    /// fire). Freed on drop here, after `await_and_finalize`. Empty when no late
+    /// device inputs.
+    late_device_inputs: Vec<crate::api::tensor_io::DeviceLateInput>,
     profile_start: Option<Instant>,
 }
 
@@ -971,6 +1028,7 @@ async fn await_and_finalize(
         fold_buffered_tokens,
         programs_output_kinds,
         pinned_outputs,
+        late_device_inputs,
         profile_start,
     } = pending;
 
@@ -998,6 +1056,11 @@ async fn await_and_finalize(
             fold_buffered_tokens,
         )
     })?;
+
+    // #27 cut #2: the forward has completed (the device-resident late inputs, e.g.
+    // the packed mask, were consumed by the mask-apply during the fire). Free the
+    // device buffers now (drop runs `pie_device_free`).
+    drop(late_device_inputs);
 
     // Reconstruct the declared output tensors. Fast-path (#27 cut #1): the driver
     // eager-D2H'd each output VALUE into its pinned buffer; `rx` resolved only
@@ -1149,6 +1212,9 @@ async fn execute_impl(
         let mut programs_output_kinds: Vec<Vec<pie_sampling_ir::OutputKind>> =
             Vec::with_capacity(attached_programs.len());
         let mut logits_positions: Vec<u32> = Vec::new();
+        // #27 cut #2: the late device-alias upload handles, kept resident on the
+        // PendingForward until the fire finalizes (then freed on drop).
+        let mut late_device_handles: Vec<crate::api::tensor_io::DeviceLateInput> = Vec::new();
         for program in attached_programs {
             programs_output_kinds.push(program.output_kinds);
             logits_positions.extend(program.logits_positions);
@@ -1157,18 +1223,31 @@ async fn execute_impl(
                 .iter()
                 .map(|b| match b {
                     pie_sampling_ir::Binding::Logits => pie_driver_abi::SamplingBinding::Logits,
+                    pie_sampling_ir::Binding::MtpLogits => {
+                        pie_driver_abi::SamplingBinding::MtpLogits
+                    }
                     pie_sampling_ir::Binding::Tensor { key, .. } => {
                         pie_driver_abi::SamplingBinding::Tensor { key: *key }
                     }
                 })
                 .collect();
+            // The device-alias late inputs become declared late keys (staged value
+            // len 0 → the driver resolves the device-alias instead); their device
+            // ptr + R12 flag ride `sampling_late_device_*`, parallel to the keys.
+            let late_keys: Vec<u32> =
+                program.late_device_inputs.iter().map(|(k, _)| *k).collect();
             req.push_sampling_program(&pie_driver_abi::SamplingProgramSubmission {
                 bytecode: program.bytecode,
                 inputs: program.submit_inputs,
                 bindings,
-                late_keys: Vec::new(),
+                late_keys,
                 late_inputs: Vec::new(),
             });
+            for (_key, device) in program.late_device_inputs {
+                req.sampling_late_device_ptrs.push(device.device_ptr());
+                req.sampling_late_device_flags.push(device.flag_ptr());
+                late_device_handles.push(device);
+            }
         }
         if has_programs {
             // The `logits` binding(s) carry the sampling positions as ABSOLUTE
@@ -1608,6 +1687,7 @@ async fn execute_impl(
             fold_buffered_tokens,
             programs_output_kinds,
             pinned_outputs,
+            late_device_inputs: late_device_handles,
             profile_start,
         };
         state.ctx().table.get_mut(&this)?.pending = Some(pending);
@@ -1799,10 +1879,12 @@ impl pie::core::inference::HostMatcher for InstanceState {
         Ok(Ok(()))
     }
 
-    async fn next_token_logit_mask(&mut self, this: Resource<Matcher>) -> Result<Vec<u32>> {
+    async fn mask(&mut self, this: Resource<Matcher>) -> Result<Vec<u32>> {
         let matcher = self.ctx().table.get_mut(&this)?;
-        let brle = matcher.inner.fill_next_token_brle();
-        Ok(brle.buffer)
+        // The packed allowed-token bitmask (`[ceil(vocab/32)]` u32, bit 1 =
+        // allowed) — the `mask-apply` (0x65) mask operand. Returned directly,
+        // no BRLE round-trip.
+        Ok(matcher.inner.fill_next_token_mask())
     }
 
     async fn is_terminated(&mut self, this: Resource<Matcher>) -> Result<bool> {
@@ -1835,6 +1917,7 @@ mod sampling_program_tests {
         let inputs = vec![wit::Input {
             shape: vec![vocab],
             dtype: wit::Dtype::F32,
+            ready: wit::Readiness::Submit,
         }];
         let ops = vec![
             wit::Op {
@@ -1884,6 +1967,7 @@ mod sampling_program_tests {
         let inputs = vec![wit::Input {
             shape: vec![1, 1, 1, 1, 1],
             dtype: wit::Dtype::F32,
+            ready: wit::Readiness::Submit,
         }];
         assert!(decode_program(inputs, Vec::new(), Vec::new()).is_err());
     }

@@ -279,7 +279,13 @@ ProgramHandle SamplingIrBackend::compile_decoded(const Program& program,
                 InputDecl in;
                 in.input_id = b.input_id;
                 in.cls = to_binding_class(b.cls);
-                in.intrinsic = IntrinsicKind::Logits;
+                // Bridge the manifest intrinsic (ir::Intrinsic, stamped onto
+                // BufferDecl.intrinsic_kind from the program manifest) to the
+                // runtime IntrinsicKind echo's resolver reads: MtpLogits selects
+                // ws.logits[mtp_draft_row], Logits the sampled row.
+                in.intrinsic = (b.intrinsic_kind == Intrinsic::MtpLogits)
+                                   ? IntrinsicKind::MtpLogits
+                                   : IntrinsicKind::Logits;
                 in.host_key = (b.input_id < program.inputs.size())
                                   ? program.inputs[b.input_id].binding.host_key
                                   : 0;

@@ -139,17 +139,28 @@ impl ValueType {
     }
 }
 
-/// A typed input slot (the WIT `record input { shape, dtype }`). Binding-free;
-/// the binding is attached at forward-pass time.
+/// A typed input slot (the WIT `record input { shape, dtype, ready }`). The
+/// source binding (which slot is logits vs a host tensor) stays attach-time, but
+/// the **readiness** is a program property: a `Late` slot is injected per-fire
+/// before its first consuming op (e.g. a grammar mask computed post-logits), so
+/// a late-input program is a distinct recognized shape. Readiness is encoded
+/// additively in **bit 7 of the dtype byte**, so v4 bytecode decodes as `Submit`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct InputDecl {
     pub shape: Shape,
     pub dtype: DType,
+    pub ready: Readiness,
 }
 
 impl InputDecl {
+    /// A `Submit`-readiness input slot (the common case).
     pub const fn new(shape: Shape, dtype: DType) -> Self {
-        Self { shape, dtype }
+        Self { shape, dtype, ready: Readiness::Submit }
+    }
+    /// An input slot with explicit readiness (`Late` = injected per-fire before
+    /// its first consuming op).
+    pub const fn with_ready(shape: Shape, dtype: DType, ready: Readiness) -> Self {
+        Self { shape, dtype, ready }
     }
     pub fn ty(&self) -> ValueType {
         ValueType::new(self.shape, self.dtype)
@@ -241,6 +252,15 @@ pub enum Op {
         vals: ValueId,
     },
 
+    /// Apply a packed allowed-token bitmask to logits: `out[j] = bit_j(mask) ?
+    /// logits[j] : −∞`, where `bit_j = (mask[j>>5] >> (j&31)) & 1` (word
+    /// `j/32`, bit `j%32`). **Bit 1 = allowed → pass-through, bit 0 =
+    /// disallowed → `−∞`.** `logits` is `[n]`; `mask` is `[ceil(n/32)]` U32
+    /// (word-indexed, NOT broadcast); result ≡ `logits` (shape + dtype). The
+    /// de-hardwired grammar/constrained-decode mask channel (the matcher emits
+    /// the packed bits; this op applies them in-program).
+    MaskApply { logits: ValueId, mask: ValueId },
+
     /// Per-element noise of `shape` (F32). **No seed operand:** the per-fire seed
     /// is ambient (the runtime's per-row `sample_seed`), folded into every key by
     /// codegen. `stream` is a static per-op salt decorrelating multiple `Rng`
@@ -298,7 +318,8 @@ impl Op {
             | Op::Ge(a, b)
             | Op::Eq(a, b)
             | Op::Gather { src: a, idx: b }
-            | Op::GatherRow { src: a, idx: b } => vec![a, b],
+            | Op::GatherRow { src: a, idx: b }
+            | Op::MaskApply { logits: a, mask: b } => vec![a, b],
 
             Op::Select { cond, a, b } => vec![cond, a, b],
             Op::ScatterAdd { base, idx, vals } | Op::ScatterSet { base, idx, vals } => {
@@ -373,6 +394,13 @@ pub enum Readiness {
 pub enum Binding {
     /// The LM-head logits intrinsic (positions resolved host-side).
     Logits,
+    /// The speculator's **draft** logits intrinsic (de-hardwired speculation).
+    /// Source-selects the draft rows of `ws.logits` (M=1 ⇒ row 0) rather than a
+    /// separate buffer — host→driver as `IntrinsicKind::MtpLogits`, resolving to
+    /// a draft-row offset within `ws.logits`. A **distinct manifest variant**
+    /// (not a kind-byte on `Logits`) so a stale reader loud-rejects rather than
+    /// misparses a layout change. Manifest-only, additive — not in the bytecode.
+    MtpLogits,
     /// A host-visible `tensor` resource, keyed, ready per [`Readiness`].
     Tensor {
         key: TensorKey,

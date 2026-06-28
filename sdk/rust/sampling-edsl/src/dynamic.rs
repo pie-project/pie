@@ -197,6 +197,18 @@ impl DynValue {
         let m = self.ty.shape.dims().first().copied().unwrap_or(0);
         self.emit(ir::Op::GatherRow { src: self.id, idx: idx.id }, self.f32(ir::Shape::vector(m)))
     }
+
+    /// Apply a packed allowed-token bitmask to `self` (logits `[n]`):
+    /// `out[j] = bit_j(mask) ? self[j] : −∞`, `bit_j = (mask[j>>5] >> (j&31)) &
+    /// 1` (bit 1 = allowed → pass-through, bit 0 = disallowed → `−∞`). `mask` is
+    /// a packed `[ceil(n/32)]` u32 vector (the matcher's allowed-token bits).
+    /// Result ≡ `self` (shape + dtype). The de-hardwired grammar mask op.
+    pub fn mask_apply(&self, mask: &DynValue) -> DynValue {
+        self.emit(
+            ir::Op::MaskApply { logits: self.id, mask: mask.id },
+            ir::ValueType::new(self.ty.shape, self.ty.dtype),
+        )
+    }
 }
 
 /// Elementwise `cond ? a : b` for runtime handles.
@@ -239,6 +251,13 @@ impl Graph {
     pub fn intrinsic_logits_matrix_dyn(&self, rows: u32) -> DynValue {
         let ty = ir::ValueType::new(ir::Shape::matrix(rows, self.vocab()), ir::DType::F32);
         self.input(ty, ir::Binding::Logits)
+    }
+    /// The speculator's **draft** logits as a `[vocab]` f32 vector (de-hardwired
+    /// speculation, M=1). Binds [`ir::Binding::MtpLogits`] → the driver
+    /// source-selects the draft row of `ws.logits` (not a separate buffer). The
+    /// program treats it like any logits vector; only the binding differs.
+    pub fn intrinsic_mtp_logits_dyn(&self) -> DynValue {
+        self.input(ir::ValueType::vector(self.vocab(), ir::DType::F32), ir::Binding::MtpLogits)
     }
 
     pub fn constant_f32_dyn(&self, x: f32) -> DynValue {

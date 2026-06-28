@@ -257,6 +257,18 @@ impl GrammarMatcher {
         brle
     }
 
+    /// Fill the next-token bitmask and return it as a packed `[ceil(vocab/32)]`
+    /// `u32` allowed-token bitmask (bit `i` set ⇒ token `i` allowed) — the
+    /// de-hardwired `mask-apply` (`0x65`) mask operand. Exposes the packed bits
+    /// directly, without the `Brle` round-trip the old wire shape needed.
+    pub fn fill_next_token_mask(&mut self) -> Vec<u32> {
+        let mut scratch = std::mem::take(&mut self.bitmask_scratch);
+        self.fill_next_token_bitmask(&mut scratch);
+        let mask = scratch.clone();
+        self.bitmask_scratch = scratch;
+        mask
+    }
+
     /// Fill bitmask using the stack parser (multi-rule path).
     fn fill_bitmask_stack(&mut self, bitmask: &mut [u32]) {
         let parser = match &self.engine {

@@ -19,7 +19,7 @@
 
 use crate::api::pie::core::tensor as wit;
 use pie_sampling_ir::{
-    DType, InputDecl, Literal, Op, OpKind, Predicate, RngKind, SamplingProgram, Shape,
+    DType, InputDecl, Literal, Op, OpKind, Predicate, Readiness, RngKind, SamplingProgram, Shape,
 };
 
 /// Decode the structured `(inputs, ops, output-ids)` handed to the WIT `program`
@@ -40,7 +40,18 @@ pub fn decode_program(
 ) -> Result<SamplingProgram, String> {
     let inputs: Vec<InputDecl> = inputs
         .into_iter()
-        .map(|i| Ok(InputDecl::new(shape_from_wit(i.shape)?, dtype_from_wit(i.dtype))))
+        .map(|i| {
+            // lane-3 (#21): readiness now survives the WIT wire (golf lane-1
+            // `record input.ready` + foxtrot lane-2 emit). Carry it through so a
+            // `Late` input routes to the device-alias late channel (the gather in
+            // `attach_program`); v4 programs without it decode `Submit` (alpha's
+            // additive default — `tensor::Readiness::Submit`).
+            Ok(InputDecl::with_ready(
+                shape_from_wit(i.shape)?,
+                dtype_from_wit(i.dtype),
+                readiness_from_wit(i.ready),
+            ))
+        })
         .collect::<Result<_, String>>()?;
 
     let mut ir_ops: Vec<Op> = Vec::with_capacity(ops.len());
@@ -87,6 +98,13 @@ fn dtype_from_wit(d: wit::Dtype) -> DType {
         wit::Dtype::I32 => DType::I32,
         wit::Dtype::U32 => DType::U32,
         wit::Dtype::Bool => DType::Bool,
+    }
+}
+
+fn readiness_from_wit(r: wit::Readiness) -> Readiness {
+    match r {
+        wit::Readiness::Submit => Readiness::Submit,
+        wit::Readiness::Late => Readiness::Late,
     }
 }
 
@@ -149,6 +167,7 @@ fn op_kind_from_wit(k: wit::OpKind) -> Result<OpKind, String> {
         wit::OpKind::GatherRow((a, b)) => OpKind::GatherRow((a, b)),
         wit::OpKind::ScatterAdd((a, b, c)) => OpKind::ScatterAdd((a, b, c)),
         wit::OpKind::ScatterSet((a, b, c)) => OpKind::ScatterSet((a, b, c)),
+        wit::OpKind::MaskApply((a, b)) => OpKind::MaskApply((a, b)),
         wit::OpKind::Rng((stream, shape, kind)) => {
             OpKind::Rng((stream, shape_from_wit(shape)?, rng_kind_from_wit(kind)))
         }
@@ -203,6 +222,7 @@ mod tests {
             (wit::OpKind::GatherRow((0, 1)), OpKind::GatherRow((0, 1))),
             (wit::OpKind::ScatterAdd((0, 1, 2)), OpKind::ScatterAdd((0, 1, 2))),
             (wit::OpKind::ScatterSet((0, 1, 2)), OpKind::ScatterSet((0, 1, 2))),
+            (wit::OpKind::MaskApply((0, 1)), OpKind::MaskApply((0, 1))),
             (wit::OpKind::Rng((0, vec![4], wit::RngKind::Uniform)), OpKind::Rng((0, Shape::vector(4), RngKind::Uniform))),
             (wit::OpKind::Rng((7, vec![2, 4], wit::RngKind::Gumbel)), OpKind::Rng((7, Shape::matrix(2, 4), RngKind::Gumbel))),
         ];
@@ -212,13 +232,41 @@ mod tests {
     }
 
     fn vinput(vocab: u32) -> wit::Input {
-        wit::Input { shape: vec![vocab], dtype: wit::Dtype::F32 }
+        wit::Input { shape: vec![vocab], dtype: wit::Dtype::F32, ready: wit::Readiness::Submit }
     }
     fn op_in0(vocab: u32) -> wit::Op {
         wit::Op {
             outputs: vec![wit::Value { id: 0, shape: vec![vocab], dtype: wit::Dtype::F32 }],
             kind: wit::OpKind::Input(0),
         }
+    }
+
+    #[test]
+    fn decode_carries_input_readiness_lane3() {
+        // lane-3: the WIT `record input.ready` survives decode → `InputDecl.ready`,
+        // so a `Late` input routes to the device-alias late channel (the
+        // `attach_program` gather) instead of decoding all-`Submit`. The
+        // additive-v4 default (`Submit`) is preserved.
+        let argmax = || {
+            vec![
+                op_in0(8),
+                wit::Op {
+                    outputs: vec![wit::Value { id: 1, shape: vec![], dtype: wit::Dtype::I32 }],
+                    kind: wit::OpKind::ReduceArgmax(0),
+                },
+            ]
+        };
+        let late_in = wit::Input {
+            shape: vec![8],
+            dtype: wit::Dtype::F32,
+            ready: wit::Readiness::Late,
+        };
+        let prog = decode_program(vec![late_in], argmax(), vec![1]).expect("decodes");
+        assert_eq!(prog.inputs[0].ready, Readiness::Late);
+
+        // The `Submit` default (`vinput`) round-trips to `Submit`.
+        let prog2 = decode_program(vec![vinput(8)], argmax(), vec![1]).expect("decodes");
+        assert_eq!(prog2.inputs[0].ready, Readiness::Submit);
     }
 
     #[test]

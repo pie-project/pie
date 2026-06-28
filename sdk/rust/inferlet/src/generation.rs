@@ -27,7 +27,7 @@
 
 use crate::Result;
 use crate::adapter::Adapter;
-use crate::context::{Context, brle_and};
+use crate::context::Context;
 use crate::forward::Output;
 use crate::pie::core::inference::ForwardPass;
 use crate::sample::Sampler;
@@ -255,21 +255,22 @@ impl<'ctx> Generator<'ctx> {
             None
         } else {
             let advance = std::mem::take(&mut self.constraint_pending);
-            let masks: Vec<Vec<u32>> = self
-                .constraints
-                .iter_mut()
-                .map(|c| c.step(&advance).to_vec())
-                .filter(|m| !m.is_empty())
-                .collect();
-            match masks.len() {
-                0 => None,
-                1 => Some(masks.into_iter().next().unwrap()),
-                _ => {
-                    let mut iter = masks.into_iter();
-                    let first = iter.next().unwrap();
-                    Some(iter.fold(first, |acc, m| brle_and(&acc, &m)))
-                }
+            for c in self.constraints.iter_mut() {
+                c.advance(&advance);
             }
+            // Compose the packed allowed-token bitmasks by word-wise bitwise-AND
+            // (intersection of allowed sets); an empty mask is transparent.
+            let mut masks = self
+                .constraints
+                .iter()
+                .map(|c| c.mask())
+                .filter(|m| !m.is_empty());
+            masks.next().map(|first| {
+                masks.fold(first, |mut acc, m| {
+                    crate::mask::and_into(&mut acc, &m);
+                    acc
+                })
+            })
         };
 
         Ok(Some(GenStep {

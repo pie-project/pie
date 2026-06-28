@@ -53,6 +53,10 @@ pub fn resolve_bindings(
         .iter()
         .map(|b| match b {
             ir::Binding::Logits => Ok(InputBinding::Logits(logits_positions.to_vec())),
+            // The draft-logits intrinsic (de-hardwired speculation): driver
+            // source-selects the draft row of `ws.logits`; no host data, like
+            // `Logits`. A unit attach binding — the resolver reads the kind.
+            ir::Binding::MtpLogits => Ok(InputBinding::MtpLogits),
             ir::Binding::Tensor { key, .. } => {
                 let decl = host_inputs
                     .iter()

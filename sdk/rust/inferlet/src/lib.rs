@@ -59,6 +59,7 @@ pub mod audio;
 pub mod emit;
 pub mod forward;
 pub mod http;
+pub mod mask;
 pub mod program;
 pub mod sample;
 

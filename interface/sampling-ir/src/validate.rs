@@ -191,6 +191,19 @@ pub fn late_input_barriers(
     Ok(late_indices.iter().map(|&i| (i, input_first_use(p, i))).collect())
 }
 
+/// The input indices the program declares [`Readiness::Late`] — derived directly
+/// from each [`InputDecl::ready`] (readiness is now a program property, no longer
+/// supplied externally). The runtime injects each before its [`input_first_use`]
+/// barrier; feed the result to [`late_input_barriers`].
+pub fn late_inputs(p: &SamplingProgram) -> Vec<InputIndex> {
+    p.inputs
+        .iter()
+        .enumerate()
+        .filter(|(_, inp)| inp.ready == Readiness::Late)
+        .map(|(i, _)| i as InputIndex)
+        .collect()
+}
+
 // ===========================================================================
 // Per-op type inference
 // ===========================================================================
@@ -406,6 +419,21 @@ fn infer(
                 _ => return Err(shape_err()),
             }
             one(ValueType::vector(m, ts.dtype))
+        }
+        Op::MaskApply { logits, mask } => {
+            let (tl, tm) = (g(logits)?, g(mask)?);
+            // `mask` is a packed `[ceil(n/32)]` U32 bitmask over the `n`-length
+            // logits (word-indexed, not broadcast). Result ≡ logits.
+            let n = tl.shape.last_len().ok_or_else(shape_err)?;
+            let words = n.div_ceil(32);
+            if tm.dtype != DType::U32 {
+                return Err(dtype_err());
+            }
+            match *tm.shape.dims() {
+                [w] if w == words => {}
+                _ => return Err(shape_err()),
+            }
+            one(ValueType::new(tl.shape, tl.dtype))
         }
         Op::ScatterAdd { base, idx, vals } => one(scatter_ty(op_index, base, idx, vals, types, true)?),
         Op::ScatterSet { base, idx, vals } => one(scatter_ty(op_index, base, idx, vals, types, false)?),

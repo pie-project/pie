@@ -34,6 +34,136 @@ unsafe extern "C" {
     fn pie_pinned_alloc(n_bytes: usize) -> *mut core::ffi::c_void;
     /// Return a [`pie_pinned_alloc`] buffer to the arena's free-list.
     fn pie_pinned_free(host_ptr: *mut core::ffi::c_void);
+
+    // ── #27 cut #2 late-input device-alias channel (input H2D) ──────────
+    /// Co-allocate a device buffer (`*out_device_dst`) + its R12 self-arm `u32`
+    /// flag (`*out_device_flag`, cleared) from the driver's device tensor-I/O
+    /// arena. Freed with [`pie_device_free`].
+    fn pie_device_alloc(
+        n_bytes: usize,
+        out_device_dst: *mut *mut core::ffi::c_void,
+        out_device_flag: *mut *mut u32,
+    );
+    /// Return a [`pie_device_alloc`] buffer + flag to the arena.
+    fn pie_device_free(device_dst: *mut core::ffi::c_void, device_flag: *mut u32);
+    /// Async H2D copy `host_src[..n_bytes]` → `device_dst`, setting `device_flag`
+    /// stream-ordered AFTER the copy (the Model-A self-arm). Returns an opaque
+    /// completion event (`cudaEvent_t`) for [`pie_event_sync`].
+    fn pie_tensor_write_async(
+        device_dst: *mut core::ffi::c_void,
+        host_src: *const core::ffi::c_void,
+        n_bytes: usize,
+        device_flag: *mut u32,
+    ) -> *mut core::ffi::c_void;
+    /// Synchronize on (and reclaim) a [`pie_tensor_write_async`] event.
+    fn pie_event_sync(ev: *mut core::ffi::c_void);
+}
+
+/// One device-resident late-input value the host uploads directly (H2D) for a
+/// `host{key, late-bound}` program input (the #27 cut #2 direct mask path). Owns
+/// its [`pie_device_alloc`] buffer + R12 self-arm flag (freed on [`Drop`]); the
+/// raw device pointer + flag ride `sampling_late_device_ptrs`/`_flags` to the
+/// driver's `HostLate` resolution.
+///
+/// `Send` because it's a device handle whose H2D is ordered before the consuming
+/// kernel by the R12 flag (driver-side) + the pre-fire `pie_event_sync`.
+#[cfg(feature = "driver-cuda")]
+pub struct DeviceLateInput {
+    device_dst: *mut core::ffi::c_void,
+    device_flag: *mut u32,
+}
+
+#[cfg(feature = "driver-cuda")]
+unsafe impl Send for DeviceLateInput {}
+
+#[cfg(feature = "driver-cuda")]
+impl core::fmt::Debug for DeviceLateInput {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("DeviceLateInput")
+            .field("device_dst", &self.device_dst)
+            .field("device_flag", &self.device_flag)
+            .finish()
+    }
+}
+
+#[cfg(feature = "driver-cuda")]
+impl DeviceLateInput {
+    /// Device value pointer (rides `sampling_late_device_ptrs`).
+    pub fn device_ptr(&self) -> u64 {
+        self.device_dst as u64
+    }
+    /// R12 self-arm flag pointer (rides `sampling_late_device_flags`).
+    pub fn flag_ptr(&self) -> u64 {
+        self.device_flag as u64
+    }
+}
+
+#[cfg(feature = "driver-cuda")]
+impl Drop for DeviceLateInput {
+    fn drop(&mut self) {
+        if !self.device_dst.is_null() {
+            // SAFETY: `device_dst`/`device_flag` are a live `pie_device_alloc`
+            // pair, freed exactly once here.
+            unsafe { pie_device_free(self.device_dst, self.device_flag) };
+        }
+    }
+}
+
+/// Upload `data` directly to a fresh device buffer (H2D from the host slice, no
+/// IPC staging) for a late-bound input, ordered-complete before return (the
+/// sequential-mask MVP: `pie_event_sync` before the fire). Returns the owning
+/// [`DeviceLateInput`] whose `device_ptr`/`flag_ptr` ride the carrier. `None` on
+/// alloc failure (caller falls back to the staged path). No-op without
+/// `driver-cuda`.
+#[cfg(feature = "driver-cuda")]
+pub fn upload_late_input(data: &[u8]) -> Option<DeviceLateInput> {
+    let mut device_dst: *mut core::ffi::c_void = core::ptr::null_mut();
+    let mut device_flag: *mut u32 = core::ptr::null_mut();
+    // SAFETY: FFI to the driver's device arena; out-params populated on success.
+    unsafe { pie_device_alloc(data.len(), &mut device_dst, &mut device_flag) };
+    if device_dst.is_null() {
+        return None;
+    }
+    let handle = DeviceLateInput { device_dst, device_flag };
+    // SAFETY: `device_dst` is a live buffer of `data.len()` bytes; `host_src` is
+    // a valid host slice; the event is synced (ordered-complete) before use.
+    let ev = unsafe {
+        pie_tensor_write_async(
+            device_dst,
+            data.as_ptr() as *const core::ffi::c_void,
+            data.len(),
+            device_flag,
+        )
+    };
+    // Sequential-mask MVP: order the 19KB H2D complete before the fire reads it
+    // ("already on device this fire"); the R12 flag also gates it driver-side
+    // (load-bearing for the true-async overlap follow-up where this sync drops).
+    if !ev.is_null() {
+        // SAFETY: `ev` is a live event from `pie_tensor_write_async`.
+        unsafe { pie_event_sync(ev) };
+    }
+    Some(handle)
+}
+
+/// Host-only build: late device-alias upload is compiled out (legacy staged
+/// path). Never references the `pie_driver_cuda_lib` device symbols.
+#[cfg(not(feature = "driver-cuda"))]
+#[derive(Debug)]
+pub struct DeviceLateInput;
+
+#[cfg(not(feature = "driver-cuda"))]
+impl DeviceLateInput {
+    pub fn device_ptr(&self) -> u64 {
+        0
+    }
+    pub fn flag_ptr(&self) -> u64 {
+        0
+    }
+}
+
+#[cfg(not(feature = "driver-cuda"))]
+pub fn upload_late_input(_data: &[u8]) -> Option<DeviceLateInput> {
+    None
 }
 
 /// One host pinned-memory destination the driver eager-D2H's a single program

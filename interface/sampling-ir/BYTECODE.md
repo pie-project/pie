@@ -72,8 +72,14 @@ Reject magic ≠ `"PSIR"` or `version != 4`.
 
 ### 2.2 InputDecl record
 
-`dtype:u8 | shape:Shape` — a **typed input slot** (no binding). Slot `i` is
-referenced by `op-kind input(i)` / [`Op::Input`]`(i)`.
+`dtype:u8 | shape:Shape` — a **typed input slot**. Slot `i` is referenced by
+`op-kind input(i)` / [`Op::Input`]`(i)`. **Bit 7 of the `dtype` byte is the
+readiness flag** (DType tags are `0..=3`, so the high bit is free): clear ⇒
+`Submit`, set (`tag | 0x80`) ⇒ `Late` (the value is injected per-fire before its
+first consuming op — e.g. a grammar mask computed post-logits). **Additive:** v4
+bytecode never set the bit, so it decodes as `Submit`; a Late-input program is a
+distinct recognized shape (it rides the bytecode `program_hash` hashes over). The
+*source* binding (logits vs a host tensor) is still attach-time.
 
 ### 2.3 Op record
 

@@ -46,42 +46,101 @@ pub fn mirostat(vocab: u32) -> Result<(Built, MirostatKeys), BuildError> {
     Ok((g.build()?, keys))
 }
 
+/// **MTP draft sampler** (de-hardwired speculation, M=1). Greedily samples the
+/// speculator's draft token from the on-device **draft logits**
+/// ([`Graph::intrinsic_mtp_logits_dyn`]) — `argmax(mtp_logits)`. The binding
+/// ([`crate::ir::Binding::MtpLogits`]) source-selects the draft row of
+/// `ws.logits` (M=1 ⇒ row 0), so the bytecode is byte-identical to a plain
+/// logits `argmax` — the source is a manifest property, not bytecode.
+/// `outputs = [Token]`; no host inputs.
+pub fn mtp_argmax(vocab: u32) -> Result<Built, BuildError> {
+    let g = Graph::new(vocab);
+    let draft = g.intrinsic_mtp_logits_dyn();
+    let token = draft.argmax();
+    g.output(&token, OutputKind::Token);
+    g.build()
+}
+
 /// Host-input keys for the [`grammar`] program.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct GrammarKeys {
-    /// Submit-bound additive logit-bias mask (`[vocab]` f32): `0` allowed,
-    /// large-negative/`-inf` disallowed. Recomputed each step by the matcher.
+    /// Late-bound packed allowed-token bitmask (`[ceil(vocab/32)]` u32, bit 1 =
+    /// allowed / 0 = disallowed). Recomputed each step by the matcher and
+    /// written via `tensor.write`; applied in-program by [`Op::MaskApply`].
     pub mask: TensorKey,
 }
 
-/// **Constrained / grammar decoding** (greedy). `argmax(logits + mask)`.
+/// **Constrained / grammar decoding** (greedy). `argmax(mask_apply(logits,
+/// mask))` — the packed allowed-token bitmask sets disallowed logits to `−∞`.
 /// `outputs = [Token]`.
 pub fn grammar(vocab: u32) -> Result<(Built, GrammarKeys), BuildError> {
     let g = Graph::new(vocab);
     let logits = g.intrinsic_logits_dyn();
-    let mask = g.host_vocab_vector_dyn(DType::F32, Readiness::Submit);
+    let mask = g.host_vector_dyn(DType::U32, vocab.div_ceil(32), Readiness::Late);
 
-    let token = logits.add(&mask).argmax();
+    let token = logits.mask_apply(&mask).argmax();
     g.output(&token, OutputKind::Token);
 
     let keys = GrammarKeys { mask: mask.input_key().expect("mask host input") };
     Ok((g.build()?, keys))
 }
 
-/// Host-input keys for [`grammar_sampled`].
+/// **Constrained / grammar decoding with the raw logits** — same masked
+/// `argmax` as [`grammar`], but also emits the **unmasked** logits as a second
+/// output (`outputs = [Token, Logits]`). The test/verify path reads the raw
+/// logits at the constrained step to recompute `mask_apply` host-side (the
+/// CPU reference) and prove the device `−∞` fired. Production decode uses
+/// [`grammar`] (`[Token]` only).
+pub fn grammar_with_logits(vocab: u32) -> Result<(Built, GrammarKeys), BuildError> {
+    let g = Graph::new(vocab);
+    let logits = g.intrinsic_logits_dyn();
+    let mask = g.host_vector_dyn(DType::U32, vocab.div_ceil(32), Readiness::Late);
+
+    let token = logits.mask_apply(&mask).argmax();
+    g.output(&token, OutputKind::Token); // 0: constrained token
+    g.output(&logits, OutputKind::Logits); // 1: raw (unmasked) logits
+
+    let keys = GrammarKeys { mask: mask.input_key().expect("mask host input") };
+    Ok((g.build()?, keys))
+}
+
+/// **Constrained / grammar decoding with the raw logits — SUBMIT-mask verify
+/// variant.** Identical program shape to [`grammar_with_logits`]
+/// (`mask_apply(logits, mask).argmax()`, `outputs = [Token, Logits]`) but the
+/// packed mask is `Readiness::Submit` rather than `Late`. The sequential grammar
+/// mask is submit-known (computed from the already-accepted prior token, before
+/// the fire), so it rides the existing `resolve_bindings` Submit gather — which
+/// lets the `0x65` mask-apply OP be verified now, decoupled from the Late-channel
+/// supply path (the `0x65` op runs identically regardless of supply path). The
+/// production constrained path uses the `Late` mask ([`grammar`] /
+/// [`grammar_with_logits`]); this variant is for the op-semantics verify.
+pub fn grammar_submit_with_logits(vocab: u32) -> Result<(Built, GrammarKeys), BuildError> {
+    let g = Graph::new(vocab);
+    let logits = g.intrinsic_logits_dyn();
+    let mask = g.host_vector_dyn(DType::U32, vocab.div_ceil(32), Readiness::Submit);
+
+    let token = logits.mask_apply(&mask).argmax();
+    g.output(&token, OutputKind::Token); // 0: constrained token
+    g.output(&logits, OutputKind::Logits); // 1: raw (unmasked) logits
+
+    let keys = GrammarKeys { mask: mask.input_key().expect("mask host input") };
+    Ok((g.build()?, keys))
+}
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct GrammarSampledKeys {
     pub mask: TensorKey,
 }
 
-/// **Constrained decoding, sampled.** `argmax(logits + mask + gumbel(stream:0))`.
+/// **Constrained decoding, sampled.** `argmax(mask_apply(logits, mask) +
+/// gumbel(stream:0))` — disallowed tokens are `−∞` so the Gumbel noise can
+/// never lift them above an allowed token.
 pub fn grammar_sampled(vocab: u32) -> Result<(Built, GrammarSampledKeys), BuildError> {
     let g = Graph::new(vocab);
     let logits = g.intrinsic_logits_dyn();
-    let mask = g.host_vocab_vector_dyn(DType::F32, Readiness::Submit);
+    let mask = g.host_vector_dyn(DType::U32, vocab.div_ceil(32), Readiness::Late);
 
-    let biased = logits.add(&mask);
-    let token = biased.add(&g.rng_gumbel_vec(0, vocab)).argmax();
+    let masked = logits.mask_apply(&mask);
+    let token = masked.add(&g.rng_gumbel_vec(0, vocab)).argmax();
     g.output(&token, OutputKind::Token);
 
     let keys = GrammarSampledKeys { mask: mask.input_key().expect("mask host input") };

@@ -50,7 +50,9 @@ fn bind(b: &Built, logits: &[f32], tensors: &[(u32, EvalValue)]) -> Vec<EvalValu
     b.bindings
         .iter()
         .map(|binding| match binding {
-            pie_sampling_ir::Binding::Logits => EvalValue::F32(logits.to_vec()),
+            pie_sampling_ir::Binding::Logits | pie_sampling_ir::Binding::MtpLogits => {
+                EvalValue::F32(logits.to_vec())
+            }
             pie_sampling_ir::Binding::Tensor { key, .. } => tensors
                 .iter()
                 .find(|(k, _)| k == key)
@@ -69,18 +71,25 @@ fn eval_sugar_argmax_exact() {
     assert_eq!(token_of(&out[0]), argmax(&logits));
 }
 
-// ── greedy grammar: exact argmax(logits + mask) ──────────────────────────────
+// ── greedy grammar: exact argmax over the packed allowed-token bitmask ────────
 #[test]
 fn eval_grammar_greedy_exact() {
     let (b, keys) = grammar(8).unwrap();
     let logits = logits8();
-    let mut mask = vec![0.0f32; 8];
-    mask[5] = f32::NEG_INFINITY; // ban the natural argmax (idx 5)
-    mask[1] = f32::NEG_INFINITY; // and idx 1 -> best allowed = idx 3 (2.0)
-    let tensors = [(keys.mask, EvalValue::F32(mask.clone()))];
+    // Packed `[ceil(8/32)]` = 1 u32 bitmask: bit j = 1 allowed / 0 disallowed.
+    // Ban idx 5 (the natural argmax) and idx 1 → best allowed = idx 3 (2.0).
+    let mut word: u32 = 0xFFFF_FFFF; // all allowed
+    word &= !(1u32 << 5);
+    word &= !(1u32 << 1);
+    let tensors = [(keys.mask, EvalValue::U32(vec![word]))];
     let out = eval(&prog(&b), &InputBindings::new(&bind(&b, &logits, &tensors), 7)).unwrap();
-    let biased: Vec<f32> = logits.iter().zip(&mask).map(|(l, m)| l + m).collect();
-    assert_eq!(token_of(&out[0]), argmax(&biased));
+    // mask-apply: disallowed → −∞; argmax over the allowed tokens.
+    let masked: Vec<f32> = logits
+        .iter()
+        .enumerate()
+        .map(|(j, &l)| if (word >> j) & 1 == 1 { l } else { f32::NEG_INFINITY })
+        .collect();
+    assert_eq!(token_of(&out[0]), argmax(&masked));
     assert_eq!(token_of(&out[0]), 3);
 }
 

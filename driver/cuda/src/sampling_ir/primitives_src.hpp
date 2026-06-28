@@ -129,6 +129,28 @@ __device__ __forceinline__ float pie_ir_select(unsigned char cond, float a, floa
 }
 
 // ---------------------------------------------------------------------------
+// Grammar constraint mask (cut #2 `mask-apply`, OpKind 0x65). The mask is a
+// packed [ceil(vocab/32)] u32 bitset (a HostLate input the inferlet tensor.write
+// fills): bit j lives in word (j>>5), bit (j&31). Polarity (locked): bit 1 =
+// ALLOWED (pass the logit through), bit 0 = DISALLOWED (-inf). Tail bits >= vocab
+// are don't-care — the apply loop only iterates [0, vocab).
+// ---------------------------------------------------------------------------
+// Shared bit-extract. Used inline by the fused argmax fast-path
+// (`mask_apply(logits,mask).argmax()` → one kernel, no materialized buffer) and
+// by the materialized-arm write loop. The codegen owns the `bit ? logit : -inf`
+// conditional, so the polarity lives in exactly one place regardless of arm.
+__device__ __forceinline__ unsigned int pie_ir_mask_bit(const unsigned int* mask, int j) {
+    return (mask[j >> 5] >> (j & 31)) & 1u;
+}
+// Full apply (materialized / general arm convenience): pass `logit` through where
+// allowed, f32 -inf where disallowed. f32 -inf (0xff800000) truncates to bf16
+// 0xFF80 on the bf16 output write, so the contract's "bf16 -inf, no f32 buffer"
+// holds without a separate bf16 path.
+__device__ __forceinline__ float pie_ir_mask_apply(const unsigned int* mask, int j, float logit) {
+    return pie_ir_mask_bit(mask, j) ? logit : pie_ir_neg_inf();
+}
+
+// ---------------------------------------------------------------------------
 // Block reduction of a PER-THREAD partial (for fused map→reduce: the caller
 // computes each element's value inline in registers and accumulates a local
 // partial, then reduces it here — no materialized input buffer). Every thread

@@ -220,6 +220,7 @@ fn eval_op(
         GatherRow { src, idx } => {
             one(gather_row(get(vals, src)?, shape_of(types, src)?, get(vals, idx)?)?)
         }
+        MaskApply { logits, mask } => one(mask_apply(get(vals, logits)?, get(vals, mask)?)?),
         ScatterAdd { base, idx, vals: v } => {
             one(scatter(get(vals, base)?, get(vals, idx)?, get(vals, v)?, true)?)
         }
@@ -489,6 +490,27 @@ fn gather(src: &Value, idx: &Value) -> Result<Value, EvalError> {
     let ix = idx.int_lanes()?;
     Ok(Value::F32(
         ix.iter().map(|&i| if i >= 0 && (i as usize) < s.len() { s[i as usize] } else { 0.0 }).collect(),
+    ))
+}
+
+/// Apply a packed allowed-token bitmask ([`Op::MaskApply`]): `out[j] =
+/// bit_j(mask) ? logits[j] : −∞`, `bit_j = (mask[j>>5] >> (j&31)) & 1` (bit 1 =
+/// allowed → pass-through, bit 0 = disallowed → `−∞`). `mask` is a packed
+/// `[ceil(n/32)]` U32 vector; tail bits ≥ `n` are not read.
+fn mask_apply(logits: &Value, mask: &Value) -> Result<Value, EvalError> {
+    let l = logits.to_f32();
+    let words = match mask {
+        Value::U32(w) => w,
+        _ => return Err(EvalError::Type("mask-apply: mask must be U32".into())),
+    };
+    Ok(Value::F32(
+        l.iter()
+            .enumerate()
+            .map(|(j, &x)| {
+                let bit = words.get(j >> 5).map_or(0, |&w| (w >> (j & 31)) & 1);
+                if bit == 1 { x } else { f32::NEG_INFINITY }
+            })
+            .collect(),
     ))
 }
 

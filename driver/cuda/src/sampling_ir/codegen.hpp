@@ -79,6 +79,13 @@ struct BufferDecl {
     // for single-row (M=1) lowering, where elem_count is the whole size.
     bool batched = false;
 
+    // IntrinsicLogits buffers only: which ws.logits row the binding resolves to
+    // (Logits = the sampled row; MtpLogits = the speculator draft row, #21
+    // phase-2 mtp-logits). Manifest-only (identical bytecode for both). delta
+    // bridges this to the runtime `IntrinsicKind` at jit_backend.cpp:282
+    // (in.intrinsic), which echo's resolver reads. Ignored for non-intrinsic.
+    Intrinsic intrinsic_kind = Intrinsic::Logits;
+
     std::uint64_t byte_size() const {
         return static_cast<std::uint64_t>(elem_count) * dtype_size(dtype);
     }
@@ -236,6 +243,10 @@ struct InputBind {
     BindKind kind = BindKind::Logits;
     std::uint32_t host_key = 0;                                  // HostTensor only
     HostAvailability ready = HostAvailability::SubmitBound;      // HostTensor only
+    // Logits kind only: which ws.logits row this intrinsic resolves to. The host
+    // sets MtpLogits for foxtrot's `Binding::MtpLogits` (the speculator draft
+    // row); identical bytecode, manifest-only. Flows to BufferDecl.intrinsic_kind.
+    Intrinsic intrinsic_kind = Intrinsic::Logits;
 };
 using ProgramManifest = std::vector<InputBind>;
 

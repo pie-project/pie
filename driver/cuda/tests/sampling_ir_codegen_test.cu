@@ -947,6 +947,110 @@ void test_std_temp_minp_v4() {
     }
 }
 
+// Cut #2 — MaskApply (grammar-constrained sampling). Host-lower structural test
+// (GPU-independent: lowers + inspects the emitted DAG/source, no NVRTC/launch).
+// The token-correctness device verify (forced-out dominant token vs the CPU ref)
+// is echo's co-driven GPU slot with echo's pie_ir_mask_apply primitive merged.
+void test_grammar_maskapply_v4() {
+    std::printf("[codegen v4 MaskApply — foxtrot program::grammar host-lower (0x65 reader + fuse)]\n");
+    // slot[0]=Logits, slot[1]=mask host tensor, Readiness::Late (grammar masks
+    // attach per-fire after the recognizer step).
+    const ProgramManifest m = {{BindKind::Logits, 0, HostAvailability::SubmitBound},
+                               {BindKind::HostTensor, 0, HostAvailability::LateBound}};
+
+    auto check = [&](const unsigned char* bc, size_t n, const char* tag) {
+        // M=1 (single sequence — echo's device-verify shape).
+        LowerResult m1 = lower_bytecode_v4(bc, n, m, LowerOptions{});
+        expect(m1.ok, "grammar M=1 lowers (0x65 reader round-trip + manifest)");
+        if (!m1.ok) { std::fprintf(stderr, "  %s err: %s\n", tag, m1.error.c_str()); return; }
+        expect(m1.dag.kernels.size() == 1, "grammar M=1 = 1 fused kernel (cast+mask+argmax)");
+        // The mask must classify HostLate (Readiness::Late) so it routes to echo's
+        // late-bind path, never a stale-buffer silent pass.
+        bool mask_late = false;
+        for (const BufferDecl& b : m1.dag.buffers)
+            if (b.cls == BufferClass::HostLate) mask_late = true;
+        expect(mask_late, "grammar mask buffer classifies HostLate (Readiness::Late)");
+        // Emit calls echo's primitive with foxtrot's (a=logits, b=mask) operand order.
+        expect(m1.dag.kernels[0].source.find("pie_ir_mask_apply(") != std::string::npos,
+               "grammar M=1 emit calls pie_ir_mask_apply(mask, j, logit)");
+
+        // Batched (production): each sequence carries its own grammar mask, so the
+        // mask base is offset per-row (b? + r*len), col j stays the ABSOLUTE vocab
+        // column inside the packed primitive (mask[j>>5]). Fuses to one kernel.
+        LowerResult mb = lower_bytecode_v4(bc, n, m, LowerOptions{/*batched=*/true});
+        expect(mb.ok, "grammar batched lowers");
+        if (!mb.ok) { std::fprintf(stderr, "  %s batched err: %s\n", tag, mb.error.c_str()); return; }
+        expect(mb.dag.kernels.size() == 1, "grammar batched = 1 fused kernel");
+        const std::string& bs = mb.dag.kernels[0].source;
+        expect(bs.find("pie_ir_mask_apply(") != std::string::npos,
+               "grammar batched emit calls pie_ir_mask_apply");
+        expect(bs.find(" + r*") != std::string::npos,
+               "grammar batched offsets mask per-row (b + r*len), col j = absolute vocab");
+    };
+    check(GV_GRAMMAR32, sizeof(GV_GRAMMAR32), "V=32");
+    // Real-vocab shape: mask = [ceil(151936/32)] = [4748] u32 words, HostLate.
+    check(GV_GRAMMAR_151936, sizeof(GV_GRAMMAR_151936), "V=151936");
+
+    // Forward-compat with foxtrot's readiness lowering: once the EDSL
+    // Readiness::Late lowers into the bytecode (alpha's READY_LATE_BIT=0x80 on
+    // the mask InputDecl dtype byte), the reader must mask the bit off (dtype
+    // stays U32, never an UnknownTag reject) AND upgrade the binding to Late
+    // even if the manifest passed SubmitBound (readiness is a program property).
+    // Offset 26 = mask dtype byte (header 20 + logits InputDecl 6).
+    {
+        std::vector<unsigned char> late_bc(GV_GRAMMAR32, GV_GRAMMAR32 + sizeof(GV_GRAMMAR32));
+        expect((late_bc[26] & 0x7fu) == 0x02u, "GV_GRAMMAR32 mask dtype byte (offset 26) is U32");
+        late_bc[26] |= 0x80u;  // set READY_LATE_BIT
+        const ProgramManifest submit_m = {{BindKind::Logits, 0, HostAvailability::SubmitBound},
+                                          {BindKind::HostTensor, 0, HostAvailability::SubmitBound}};
+        LowerResult lr = lower_bytecode_v4(late_bc.data(), late_bc.size(), submit_m, LowerOptions{});
+        expect(lr.ok, "bit-7 Late mask decodes (dtype byte masked off, not rejected)");
+        if (lr.ok) {
+            bool mask_late = false;
+            for (const BufferDecl& b : lr.dag.buffers)
+                if (b.cls == BufferClass::HostLate) mask_late = true;
+            expect(mask_late, "bytecode Late bit upgrades binding to HostLate despite Submit manifest");
+        }
+    }
+}
+
+// Cut #2 mtp-logits: BufferDecl.intrinsic_kind (manifest-only). The SAME v4
+// argmax bytecode lowered with InputBind.intrinsic_kind = MtpLogits stamps the
+// IntrinsicLogits buffer MtpLogits, leaving the DAG otherwise identical to the
+// Logits lowering — foxtrot's manifest-only proof (identical bytecode, only the
+// binding differs). delta bridges the stamp to the runtime IntrinsicKind at the
+// jit_backend wire; echo's resolver routes MtpLogits to ws.logits[mtp_draft_row].
+void test_mtp_logits_intrinsic_kind_v4() {
+    std::printf("[codegen v4 mtp-logits — BufferDecl.intrinsic_kind manifest-only stamp]\n");
+    StandardSamplerProgram sp = standard_sampler_program(StandardSamplerKind::Argmax, 151936);
+    expect(sp.valid, "baked Argmax program present");
+    if (!sp.valid) return;
+
+    auto lower_with = [&](Intrinsic ik) -> LowerResult {
+        ProgramManifest m = {{BindKind::Logits, 0, HostAvailability::SubmitBound, ik}};
+        return lower_bytecode_v4(sp.bytecode, sp.len, m, LowerOptions{});
+    };
+    LowerResult lg = lower_with(Intrinsic::Logits);
+    LowerResult lm = lower_with(Intrinsic::MtpLogits);
+    expect(lg.ok && lm.ok, "argmax lowers under both Logits and MtpLogits manifests");
+    if (!lg.ok || !lm.ok) return;
+
+    auto intrinsic_kind_of = [](const LowerResult& lr) -> Intrinsic {
+        for (const BufferDecl& b : lr.dag.buffers)
+            if (b.cls == BufferClass::IntrinsicLogits) return b.intrinsic_kind;
+        return Intrinsic::Logits;
+    };
+    expect(intrinsic_kind_of(lg) == Intrinsic::Logits,
+           "Logits manifest -> IntrinsicLogits buffer intrinsic_kind=Logits");
+    expect(intrinsic_kind_of(lm) == Intrinsic::MtpLogits,
+           "MtpLogits manifest -> IntrinsicLogits buffer intrinsic_kind=MtpLogits");
+    // Manifest-only: structurally identical DAG (same buffer/kernel counts),
+    // only the intrinsic-kind tag differs — no extra op, no opcode/version bump.
+    expect(lg.dag.buffers.size() == lm.dag.buffers.size() &&
+           lg.dag.kernels.size() == lm.dag.kernels.size(),
+           "MtpLogits lowering is structurally identical (manifest-only)");
+}
+
 }  // namespace
 
 int main() {
@@ -977,6 +1081,8 @@ int main() {
     test_spec_lossless();
     test_std_argmax_v4();
     test_std_temp_minp_v4();
+    test_grammar_maskapply_v4();
+    test_mtp_logits_intrinsic_kind_v4();
 
     CU_CHECK(cuDevicePrimaryCtxRelease(dev));
     std::printf("\n%d checks, %d failures\n", g_checks, g_fail);

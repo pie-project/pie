@@ -51,17 +51,19 @@ fn mirostat_outputs_token_and_scalar() {
 
 // ── grammar ───────────────────────────────────────────────────────────────--
 #[test]
-fn grammar_greedy_additive_mask() {
+fn grammar_greedy_mask_apply() {
     let (b, keys) = grammar(VOCAB).expect("builds");
     roundtrip(&b);
     assert_eq!(b.outputs, vec![OutputKind::Token]);
     assert_eq!(b.host_inputs.len(), 1);
     let m = b.host_inputs[0];
     assert_eq!(m.key, keys.mask);
-    assert_eq!(m.dtype, ir::DType::F32);
-    assert_eq!(m.shape, ir::Shape::vector(VOCAB));
-    // argmax(Add(logits, mask)); greedy => no RNG.
-    assert!(has(&b, |o| matches!(o, Op::Add(_, _))));
+    // Packed allowed-token bitmask: [ceil(vocab/32)] u32, late-bound.
+    assert_eq!(m.dtype, ir::DType::U32);
+    assert_eq!(m.shape, ir::Shape::vector(VOCAB.div_ceil(32)));
+    assert_eq!(m.ready, ir::Readiness::Late);
+    // argmax(mask_apply(logits, mask)); greedy => no RNG.
+    assert!(has(&b, |o| matches!(o, Op::MaskApply { .. })));
     assert!(has(&b, |o| matches!(o, Op::ReduceArgmax(_))));
     assert!(!has(&b, |o| matches!(o, Op::Rng { .. })));
 }

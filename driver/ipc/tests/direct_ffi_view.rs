@@ -262,3 +262,48 @@ fn forward_request_view_sees_sampling_output_fastpath() {
     assert_eq!(fwd.sampling_output_dst_lens_len, 2);
     assert_eq!(fwd.sampling_output_indptr_len, 2);
 }
+
+/// FULL host-submit→Desc→view path for the #27 cut #2 device-alias late channel
+/// (the in-proc fire path `frame.as_desc()` → C++ `PieForwardRequestView`), NOT
+/// just rkyv. The exact regression guard for the cut #1 view-empty class, applied
+/// pre-emptively to the new late-device carrier so echo's view accessor reads a
+/// real (non-zero) Desc offset. The view's slices MUST alias the native Vecs.
+#[test]
+fn forward_request_view_sees_sampling_late_device() {
+    let req = ForwardRequest {
+        token_ids: vec![1, 2],
+        sampling_late_keys: vec![7, 9],
+        sampling_late_device_ptrs: vec![0xDEAD_0000_0000_A000, 0xDEAD_0000_0000_B000],
+        sampling_late_device_flags: vec![0xF1A6_0000_0000_0001, 0xF1A6_0000_0000_0002],
+        ..Default::default()
+    };
+    let view = pie_forward_request_view(&req);
+    assert_eq!(view.desc.sampling_late_device_ptrs_len, 2);
+    assert_eq!(
+        view.desc.sampling_late_device_ptrs_ptr,
+        req.sampling_late_device_ptrs.as_ptr()
+    );
+    assert_eq!(view.desc.sampling_late_device_flags_len, 2);
+    assert_eq!(
+        view.desc.sampling_late_device_flags_ptr,
+        req.sampling_late_device_flags.as_ptr()
+    );
+
+    // The exact in-proc production path: Frame → pie_frame_view → nested forward.
+    let frame = Frame {
+        driver_id: 1,
+        payload: RequestPayload::Forward(req),
+    };
+    let fview = pie_frame_view(&frame);
+    let fwd = &fview.desc.payload.forward;
+    let inner = match &frame.payload {
+        RequestPayload::Forward(r) => r,
+        _ => unreachable!(),
+    };
+    assert_eq!(fwd.sampling_late_device_ptrs_len, 2);
+    assert_eq!(
+        fwd.sampling_late_device_ptrs_ptr,
+        inner.sampling_late_device_ptrs.as_ptr()
+    );
+    assert_eq!(fwd.sampling_late_device_flags_len, 2);
+}
