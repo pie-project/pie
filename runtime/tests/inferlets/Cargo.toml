@@ -8,6 +8,7 @@ members = [
     "grammar",
     "grammar-late",
     "mirostat",
+    "entropycheck",
     "tempgen",
     "multisamp",
     "isolatedtopp",
