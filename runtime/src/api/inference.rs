@@ -265,6 +265,10 @@ struct AttachedProgram {
     /// `input-binding::logits(positions)`); flattened into the request's
     /// `sampling_indices` at `execute()`. Empty if the program reads no logits.
     logits_positions: Vec<u32>,
+    /// #10: the program-identity hash (alpha's distinct-count key) — computed once
+    /// at attach via `program_identity_hash(bytecode, bindings)`; threaded into the
+    /// scheduler accumulation policy so identical grammars dedup to one compile.
+    identity_hash: u64,
 }
 
 fn empty_forward_request() -> pie_driver_abi::ForwardRequest {
@@ -860,6 +864,10 @@ impl InstanceState {
                 }
             }
         }
+        // #10: program-identity hash (alpha's distinct-count key) — computed ONCE
+        // here at attach, where bytecode + bindings are structured, before any
+        // carrier encoding. Intrinsic binds (Logits/MtpLogits) dedup to one.
+        let identity_hash = pie_sampling_ir::program_identity_hash(&bytecode, &bindings);
         Ok(AttachedProgram {
             bytecode,
             output_kinds,
@@ -867,6 +875,7 @@ impl InstanceState {
             submit_inputs,
             late_device_inputs,
             logits_positions,
+            identity_hash,
         })
     }
 }
@@ -1268,11 +1277,16 @@ async fn execute_impl(
         let has_programs = !attached_programs.is_empty();
         let mut programs_output_kinds: Vec<Vec<pie_sampling_ir::OutputKind>> =
             Vec::with_capacity(attached_programs.len());
+        // #10: per-program identity hashes (distinct-count key), attach order →
+        // threaded into the scheduler accumulation policy via submit_async. Empty
+        // for plain decode (no attached programs) ⇒ policy's free-to-batch path.
+        let mut program_identity_hashes: Vec<u64> = Vec::with_capacity(attached_programs.len());
         let mut logits_positions: Vec<u32> = Vec::new();
         // #27 cut #2: the late device-alias upload handles, kept resident on the
         // PendingForward until the fire finalizes (then freed on drop).
         let mut late_device_handles: Vec<crate::api::tensor_io::DeviceLateInput> = Vec::new();
         for program in attached_programs {
+            program_identity_hashes.push(program.identity_hash);
             programs_output_kinds.push(program.output_kinds);
             logits_positions.extend(program.logits_positions);
             let bindings = program
@@ -1706,8 +1720,13 @@ async fn execute_impl(
             crate::api::tensor_io::populate_output_fastpath(&mut req, &programs_output_kinds);
 
         // Single-model: the SERVICE routes to the bound model; no model_id arg.
-        let submit_result =
-            inference::submit_async(req, driver_idx, proj.physical_page_ids, proj.last_page_len);
+        let submit_result = inference::submit_async(
+            req,
+            driver_idx,
+            proj.physical_page_ids,
+            proj.last_page_len,
+            program_identity_hashes,
+        );
 
         let rx = match submit_result {
             Ok(rx) => rx,

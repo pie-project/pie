@@ -151,6 +151,7 @@ pub fn submit_async(
     driver_idx: usize,
     physical_page_ids: Vec<PhysicalPageId>,
     last_page_len: u32,
+    program_identity_hashes: Vec<u64>,
 ) -> Result<oneshot::Receiver<Result<ForwardOutput>>> {
     let (tx, rx) = oneshot::channel();
     SERVICE.send(
@@ -159,6 +160,7 @@ pub fn submit_async(
             driver_idx,
             physical_page_ids,
             last_page_len,
+            program_identity_hashes,
             response: tx,
         },
     )?;
@@ -434,6 +436,10 @@ enum Message {
         driver_idx: usize,
         physical_page_ids: Vec<PhysicalPageId>,
         last_page_len: u32,
+        /// #10: per-program `program_identity_hash`es (distinct-count key, computed
+        /// host-side at attach). Empty ⇒ plain decode. Runtime-side only — never
+        /// placed on the wire request; reaches the policy via `submit_with_identity`.
+        program_identity_hashes: Vec<u64>,
         response: oneshot::Sender<Result<ForwardOutput>>,
     },
     GetStats {
@@ -451,14 +457,16 @@ impl ServiceHandler for InferenceService {
                 driver_idx,
                 physical_page_ids,
                 last_page_len,
+                program_identity_hashes,
                 response,
             } => {
                 let idx = driver_idx.min(self.num_drivers.saturating_sub(1));
-                let _ = self.schedulers[idx].handle().submit(
+                let _ = self.schedulers[idx].handle().submit_with_identity(
                     request,
                     response,
                     physical_page_ids,
                     last_page_len,
+                    program_identity_hashes,
                 );
             }
             Message::GetStats { response } => {
