@@ -88,13 +88,47 @@ async fn k_token_marshal_off_spec_tokens_on_real_driver() -> Result<()> {
          in FULL off `program_tokens` (len != k): truncated to [1], wrong-channel \
          via spec_tokens, or a dense-fast-path drop: {json}"
     );
-    if json.contains("MATRIX_ARGMAX_OK=false") {
-        eprintln!(
-            "[k-marshal] NOTE: marshal verified (emits all k off program_tokens), \
-             but the k>1 [k,vocab] MATRIX-LOGITS intrinsic leaves rows≥1 \
-             unmaterialized (argmax→0) — a SEPARATE pre-existing producer gap, not \
-             a marshal bug. See {json}"
-        );
-    }
+    // #35-A (matrix-logits value-exact): the [k,vocab] matrix intrinsic feeds EACH
+    // row r its own position's logits → the argmax-matrix probe == the greedy
+    // continuation g[0..k]. NOTE: this argmax-ONLY arm passes even when the full
+    // spec-verify DAG is broken (the standalone argmax launches grid=k); it is
+    // NECESSARY-not-sufficient. The load-bearing gate is REJECT_MID_OK below.
+    anyhow::ensure!(
+        json.contains("MATRIX_ARGMAX_OK=true"),
+        "[k,vocab] matrix-logits NOT value-exact (#35-A) — the per-row argmax probe \
+         diverged from the greedy continuation: the matrix grid fired < k rows: {json}"
+    );
+    // The full spec-verify DAG (argmax→eq→cumprod→select) must be value-exact. The
+    // accept-ALL arm (no reject) passes even with a per-block-collapsed cumprod, so
+    // it too is necessary-not-sufficient.
+    anyhow::ensure!(
+        json.contains("SPEC_ACCEPT_ALL_OK=true"),
+        "spec_verify_greedy(k) accept-ALL NOT value-exact (#35-A): {json}"
+    );
+    // THE NON-DEGENERATE GATE (#35-A land bar): a reject-MID draft `[1,1,0,1]` must
+    // give the cross-row accept-prefix `[g0,g1,0,0]` (0-sentinel so the marshal
+    // emits all k — `spec_verify_greedy`'s `-1` would TRUNCATE at the first reject,
+    // MASKING the bug → a false pass). A batched per-block / grid-collapsed cumprod
+    // gives `[g0,0,0,0]` (DAG collapsed to row 0) or `[g0,g1,0,g3]` (row-3 leak) —
+    // either fails this. This is the ONLY arm that exercises the cross-row scan on
+    // the real `batched=true` executor; closes charlie's land-blocking cumprod bug.
+    // Precondition for the 0-sentinel detector to be UNAMBIGUOUS (foxtrot's
+    // invariant): all drafts ∈ [1, vocab). A token-0 draft is indistinguishable
+    // from the reject→0 sentinel → re-introduces the mask. If the greedy g happens
+    // to contain a 0, the gate can't discriminate — fail loud, don't false-pass.
+    anyhow::ensure!(
+        json.contains("DRAFTS_NONZERO=true"),
+        "0-sentinel reject-MID detector is AMBIGUOUS — a draft is token-0 \
+         (indistinguishable from the reject→0 sentinel); the gate can't discriminate \
+         accept-0 from reject. Re-seed with non-zero drafts: {json}"
+    );
+    anyhow::ensure!(
+        json.contains("REJECT_MID_OK=true"),
+        "spec_verify_greedy(k) cross-row cumprod COLLAPSED (#35-A land-block) — a \
+         reject-MID draft did not yield the correct accept-prefix [g0,g1,0,0]: the \
+         batched lowering folded the matrix DAG into one per-block/grid-1 kernel \
+         (matrix rows ≠ batch axis). Needs charlie's batched-rejects-matrix → M=1 \
+         2-kernel fix: {json}"
+    );
     Ok(())
 }
