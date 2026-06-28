@@ -2320,6 +2320,23 @@ void marshal_ir_program_output(const sampling_ir::ProgramInterface* pif,
                                std::span<const std::uint32_t> group_member,
                                std::vector<pie_driver::PerRequestOutput>& per_req) {
     if (pif == nullptr) return;
+    // #34 fail-loud guard: rich outputs (Scalar/Entropy/Logits/[k]) read with a
+    // per-row stride that assumes an N-row [num_rows, elem_count] scratch, but the
+    // runtime scratch is 1-row today. Single-Token rows are dense-safe (pi.sampled
+    // [base+r]); any other output at num_rows>1 would OOB. No-op at num_rows==1
+    // (today's only path); makes a future #34 wiring fail LOUD, never silent-OOB.
+    if (num_rows > 1) {
+        bool all_single_token = true;
+        for (const auto& od : pif->outputs)
+            if (od.cls != sampling_ir::OutputClass::Token || od.elem_count > 1) {
+                all_single_token = false; break;
+            }
+        if (!all_single_token) {
+            std::fprintf(stderr, "[pie-driver-cuda] marshal num_rows=%d with a rich "
+                         "output needs the #34 N-row scratch (1-row today)\n", num_rows);
+            std::abort();  // fail-loud (assert compiles out under NDEBUG)
+        }
+    }
     const int n = num_rows > 0 ? num_rows : 1;
     for (int r = 0; r < n; ++r) {
         if (static_cast<std::size_t>(r) >= group_member.size()) break;
@@ -3230,6 +3247,252 @@ void handle_fire_batch(
             std::vector<pie_driver::PerRequestOutput> per_req(
                 static_cast<std::size_t>(R));
             bool all_handled = true;
+            // #34 M-batch (env-gated, default OFF): group contiguous identical
+            // programs and fire them as ONE num_rows=N launch (fire-axis
+            // occupancy, 10-122x per the #10 bench). Env-off takes the
+            // byte-identical per-program loop below. Only the clean case
+            // M-batches — per-row variation is the device-alias mask(s), gathered
+            // into [N, byte_len] via the carrier byte-len (sampling_late_device_lens);
+            // any per-row submit/late-value host bytes, non-contiguous, or
+            // non-dense group fires individually. Composes onto the same N-row
+            // marshal (group_member = ProgramGroup.rows), zero marshal change.
+            const bool mbatch_enabled =
+                std::getenv("PIE_SAMPLING_IR_MBATCH") != nullptr;
+            bool mbatch_dispatched = false;
+            if (mbatch_enabled) {
+                auto* irb = ensure_sampling_ir_backend(executor);
+                struct ProgData {
+                    std::span<const std::uint8_t>          bytecode;
+                    std::vector<sampling_ir::SubmitInput>  submit_inputs;
+                    std::vector<sampling_ir::SubmitInput>  late_value_inputs;
+                    std::vector<sampling_ir::LateInput>    late_inputs;
+                    std::vector<std::uint32_t>             late_byte_lens;
+                    sampling_ir::ProgramManifest           manifest;
+                    int sample_row = 0;
+                };
+                std::vector<ProgData> progs(num_programs);
+                std::vector<sampling_ir::ProgramHandle> handles(
+                    num_programs, sampling_ir::kInvalidProgram);
+                bool extract_ok = (irb != nullptr);
+                for (std::uint32_t p = 0; extract_ok && p < num_programs; ++p) {
+                    const std::uint32_t blo = view.sampling_program_bytes_indptr.data()[p];
+                    const std::uint32_t bhi = view.sampling_program_bytes_indptr.data()[p + 1];
+                    if (bhi <= blo) { extract_ok = false; break; }
+                    ProgData& pd = progs[p];
+                    pd.bytecode = {view.sampling_program_bytes.data() + blo,
+                                   static_cast<std::size_t>(bhi - blo)};
+                    pd.sample_row = static_cast<int>(h_qo[p] + h_sidx[h_sptr[p]]);
+                    if (view.sampling_input_indptr.size() > p + 1) {
+                        const std::uint32_t ilo = view.sampling_input_indptr.data()[p];
+                        const std::uint32_t ihi = view.sampling_input_indptr.data()[p + 1];
+                        const std::uint8_t* blob = view.sampling_input_blob.data();
+                        for (std::uint32_t i = ilo; i < ihi; ++i) {
+                            sampling_ir::SubmitInput si;
+                            si.key = view.sampling_input_keys.data()[i];
+                            si.data = blob + view.sampling_input_offsets.data()[i];
+                            si.len_bytes = view.sampling_input_lens.data()[i];
+                            pd.submit_inputs.push_back(si);
+                        }
+                    }
+                    if (view.sampling_late_indptr.size() > p + 1) {
+                        const std::uint32_t llo = view.sampling_late_indptr.data()[p];
+                        const std::uint32_t lhi = view.sampling_late_indptr.data()[p + 1];
+                        if (!view.sampling_late_blob.empty()) {
+                            const std::uint8_t* lblob = view.sampling_late_blob.data();
+                            for (std::uint32_t i = llo; i < lhi; ++i) {
+                                if (i >= view.sampling_late_lens.size()) break;
+                                if (view.sampling_late_lens.data()[i] == 0) continue;
+                                sampling_ir::SubmitInput li;
+                                li.key = view.sampling_late_keys.data()[i];
+                                li.data = lblob + view.sampling_late_offsets.data()[i];
+                                li.len_bytes = view.sampling_late_lens.data()[i];
+                                pd.late_value_inputs.push_back(li);
+                            }
+                        }
+                        if (!view.sampling_late_device_ptrs.empty()) {
+                            for (std::uint32_t i = llo; i < lhi; ++i) {
+                                if (i >= view.sampling_late_device_ptrs.size()) break;
+                                const std::uint64_t dptr = view.sampling_late_device_ptrs.data()[i];
+                                if (dptr == 0) continue;
+                                sampling_ir::LateInput li;
+                                li.key = view.sampling_late_keys.data()[i];
+                                li.device_ptr = reinterpret_cast<const void*>(
+                                    static_cast<std::uintptr_t>(dptr));
+                                li.elem_count = 0;
+                                pd.late_inputs.push_back(li);
+                                pd.late_byte_lens.push_back(
+                                    i < view.sampling_late_device_lens.size()
+                                        ? view.sampling_late_device_lens.data()[i] : 0u);
+                            }
+                        }
+                    }
+                    if (view.sampling_binding_indptr.size() > p + 1) {
+                        const std::uint32_t mlo = view.sampling_binding_indptr.data()[p];
+                        const std::uint32_t mhi = view.sampling_binding_indptr.data()[p + 1];
+                        pd.manifest.reserve(mhi - mlo);
+                        for (std::uint32_t i = mlo; i < mhi; ++i) {
+                            sampling_ir::InputBind b;
+                            const std::uint32_t bk = view.sampling_binding_kind.data()[i];
+                            if (bk == 1) {
+                                b.kind = sampling_ir::BindKind::HostTensor;
+                                b.host_key = view.sampling_binding_key.data()[i];
+                                b.ready = sampling_ir::HostAvailability::SubmitBound;
+                            } else {
+                                b.kind = sampling_ir::BindKind::Logits;
+                                if (bk == 2) b.intrinsic_kind = sampling_ir::Intrinsic::MtpLogits;
+                            }
+                            pd.manifest.push_back(b);
+                        }
+                    }
+                    handles[p] = irb->get_or_compile(pd.bytecode, pd.manifest);
+                    if (handles[p] == sampling_ir::kInvalidProgram) extract_ok = false;
+                }
+                if (extract_ok) {
+                    const auto groups = sampling_ir::partition_by_program(
+                        std::span<const sampling_ir::ProgramHandle>(handles));
+                    bool ok = true;
+                    bool late_miss = false;
+                    auto fire_one = [&](const ProgData& pd, std::uint32_t member) -> bool {
+                        sampling_ir::FireContext ctx;
+                        ctx.program_bytecode  = pd.bytecode;
+                        ctx.submit_inputs     = pd.submit_inputs;
+                        ctx.late_value_inputs = pd.late_value_inputs;
+                        ctx.late_inputs       = pd.late_inputs;
+                        ctx.manifest          = pd.manifest;
+                        ctx.logits            = ws.logits.data();
+                        ctx.pi                = &pi;
+                        ctx.vocab_size        = engine.hf_config().vocab_size;
+                        ctx.sample_row        = pd.sample_row;
+                        ctx.row_seeds         = pi.sample_seed.data() + pd.sample_row;
+                        ctx.prng_offset       = static_cast<std::uint64_t>(handled);
+                        ctx.stream            = cublas.stream();
+                        const sampling_ir::RunStatus st =
+                            executor.sampling_ir_runtime.try_run(ctx);
+                        if (st == sampling_ir::RunStatus::SkippedLateBindMiss) {
+                            late_miss = true; return false;
+                        }
+                        if (st != sampling_ir::RunStatus::Handled) return false;
+                        CUDA_CHECK(cudaStreamSynchronize(cublas.stream()));
+                        marshal_ir_program_output(
+                            executor.sampling_ir_runtime.last_interface(),
+                            executor.sampling_ir_runtime.last_output_ptrs(),
+                            1, std::span<const std::uint32_t>(&member, 1), per_req);
+                        return true;
+                    };
+                    for (const auto& g : groups) {
+                        if (!ok) break;
+                        const std::uint32_t n = static_cast<std::uint32_t>(g.rows.size());
+                        const ProgData& head = progs[g.rows[0]];
+                        // Eligible: contiguous program indices, ≥2 rows, per-row
+                        // variation is ONLY device-alias masks, and the sample
+                        // rows are dense (head.sample_row + r) so num_rows=n strides.
+                        bool dense = sampling_ir::is_contiguous(g) && n >= 2 &&
+                                     head.submit_inputs.empty() &&
+                                     head.late_value_inputs.empty() &&
+                                     !head.late_inputs.empty();
+                        for (std::uint32_t r = 0; dense && r < n; ++r) {
+                            if (progs[g.rows[r]].sample_row !=
+                                head.sample_row + static_cast<int>(r))
+                                dense = false;
+                        }
+                        // #34: only single-[1]-Token-output programs M-batch today
+                        // — their N tokens land dense in pi.sampled[base+r], safe
+                        // with the 1-row scratch + the marshal guard. Rich outputs
+                        // (Scalar/Entropy/Logits/[k]) need the N-row scratch first →
+                        // fire individually (num_rows=1) until that lands.
+                        if (dense) {
+                            const auto& iface = irb->interface(handles[g.rows[0]]);
+                            for (const auto& od : iface.outputs)
+                                if (od.cls != sampling_ir::OutputClass::Token ||
+                                    od.elem_count > 1) { dense = false; break; }
+                        }
+                        bool mbatched = false;
+                        if (dense) {
+                            const std::size_t num_late = head.late_inputs.size();
+                            std::vector<void*> scratch(num_late, nullptr);
+                            std::vector<sampling_ir::LateInput> gathered(num_late);
+                            bool gather_ok = true;
+                            for (std::size_t j = 0; gather_ok && j < num_late; ++j) {
+                                const std::uint32_t blen = head.late_byte_lens[j];
+                                if (blen == 0) { gather_ok = false; break; }
+                                void* buf = nullptr;
+                                if (cudaMalloc(&buf, static_cast<std::size_t>(blen) * n)
+                                        != cudaSuccess) { gather_ok = false; break; }
+                                scratch[j] = buf;
+                                for (std::uint32_t r = 0; r < n; ++r) {
+                                    const ProgData& m = progs[g.rows[r]];
+                                    if (j >= m.late_inputs.size() ||
+                                        m.late_byte_lens[j] != blen) { gather_ok = false; break; }
+                                    CUDA_CHECK(cudaMemcpyAsync(
+                                        static_cast<std::uint8_t*>(buf) +
+                                            static_cast<std::size_t>(r) * blen,
+                                        m.late_inputs[j].device_ptr, blen,
+                                        cudaMemcpyDeviceToDevice, cublas.stream()));
+                                }
+                                gathered[j].key = head.late_inputs[j].key;
+                                gathered[j].device_ptr = buf;
+                                gathered[j].elem_count = 0;  // shape from InputDecl, strides/row
+                            }
+                            if (gather_ok) {
+                                sampling_ir::FireContext ctx;
+                                ctx.program_bytecode = head.bytecode;
+                                ctx.manifest         = head.manifest;
+                                ctx.late_inputs      = gathered;
+                                ctx.logits           = ws.logits.data();
+                                ctx.pi               = &pi;
+                                ctx.vocab_size       = engine.hf_config().vocab_size;
+                                ctx.sample_row       = head.sample_row;
+                                ctx.num_rows         = static_cast<int>(n);
+                                ctx.row_seeds        = pi.sample_seed.data() + head.sample_row;
+                                ctx.prng_offset      = static_cast<std::uint64_t>(handled);
+                                ctx.stream           = cublas.stream();
+                                const sampling_ir::RunStatus st =
+                                    executor.sampling_ir_runtime.try_run(ctx);
+                                if (st == sampling_ir::RunStatus::SkippedLateBindMiss) {
+                                    late_miss = true; ok = false;
+                                } else if (st != sampling_ir::RunStatus::Handled) {
+                                    ok = false;
+                                } else {
+                                    CUDA_CHECK(cudaStreamSynchronize(cublas.stream()));
+                                    marshal_ir_program_output(
+                                        executor.sampling_ir_runtime.last_interface(),
+                                        executor.sampling_ir_runtime.last_output_ptrs(),
+                                        static_cast<int>(n),
+                                        std::span<const std::uint32_t>(g.rows.data(),
+                                                                       g.rows.size()),
+                                        per_req);
+                                    mbatched = true;
+                                    // #34 grouping witness (permanent diagnostic,
+                                    // under the ir-trace gate): proves the M-batch
+                                    // num_rows=N fire actually occupied — without it
+                                    // a silent fallback to per-row fire_one produces
+                                    // correct tokens but no occupancy (false green).
+                                    if (std::getenv("PIE_SAMPLING_IR_TRACE"))
+                                        std::cerr << "[ir-trace] mbatch group n=" << n
+                                                  << " sample_row=" << head.sample_row
+                                                  << "\n";
+                                }
+                            }
+                            for (void* b : scratch) if (b) cudaFree(b);
+                        }
+                        if (!ok) break;
+                        if (!mbatched) {
+                            for (std::uint32_t r = 0; r < n; ++r) {
+                                if (!fire_one(progs[g.rows[r]], g.rows[r])) { ok = false; break; }
+                            }
+                        }
+                    }
+                    if (late_miss) {
+                        std::cerr << "[pie-driver-cuda] sampling-ir late-bind miss "
+                                     "(mbatch), req_id=" << req_id << " — discarding fire\n";
+                        out_resp = pie_driver::PieForwardResponseView{};
+                        return;
+                    }
+                    all_handled = ok;
+                    mbatch_dispatched = true;  // M-batch owned the dispatch (no re-run)
+                }
+            }
+            if (!mbatch_dispatched)
             for (std::uint32_t p = 0; p < num_programs && all_handled; ++p) {
                 const std::uint32_t blo =
                     view.sampling_program_bytes_indptr.data()[p];
