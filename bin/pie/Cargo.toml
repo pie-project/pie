@@ -58,6 +58,11 @@ xz2 = "0.1"
 
 [dev-dependencies]
 tempfile = "3"
+# fd-level stderr capture for the gate-1 R=2 merge-witness assert (cuda_grammar_r2):
+# boot_4090 runs the engine in-process, so the scheduler/driver write their
+# `[pie-sched-trace] fire requests=N` / `[ir-trace] forward_R=N` merge witnesses
+# straight to THIS process's fd 2 — the harness dup2's it to a file to assert on.
+libc = "0.2"
 # Client edge for the 4090 capability harness (programmable_sampler_4090): the
 # in-process submit path (connect → add_program → launch → wait_for_return).
 pie-client = { path = "../../client/rust" }

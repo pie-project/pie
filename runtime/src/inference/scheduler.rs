@@ -28,6 +28,22 @@ fn scheduler_trace_enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var_os("PIE_SCHED_TRACE").is_some())
 }
 
+/// Test-only deterministic batch-accumulation hold (µs). When set, after the
+/// first request the scheduler blocks up to this long for more requests to
+/// arrive before firing, so concurrent requests reliably co-batch into one fire
+/// (a deterministic `forward_R >= 2` for the merged-path verify). Default unset
+/// → today's fire-on-arrival, zero production impact. This is the test-lever
+/// ancestor of #10's production accumulation-window admission policy.
+fn scheduler_accum_hold_us() -> Option<u64> {
+    static HOLD: OnceLock<Option<u64>> = OnceLock::new();
+    *HOLD.get_or_init(|| {
+        std::env::var("PIE_SCHED_ACCUM_HOLD_US")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|&us| us > 0)
+    })
+}
+
 fn sched_epoch() -> Instant {
     static EPOCH: OnceLock<Instant> = OnceLock::new();
     *EPOCH.get_or_init(Instant::now)
@@ -1219,13 +1235,31 @@ impl BatchScheduler {
             // before reading more; overwriting the stash would drop that
             // request's response channel.
             let accum_start = Instant::now();
+            // Test-only deterministic co-batch hold (`PIE_SCHED_ACCUM_HOLD_US`):
+            // block up to the deadline after the first request so concurrent
+            // requests land in the same drain window (deterministic
+            // `forward_R >= 2` for the merged-path verify). Unset → `None` →
+            // today's fire-on-arrival, unchanged.
+            let accum_deadline =
+                scheduler_accum_hold_us().map(|us| accum_start + Duration::from_micros(us));
             while next_pending.is_none() {
-                let pending = match req_rx.try_recv() {
-                    Ok(p) => p,
-                    Err(crossbeam::channel::TryRecvError::Empty) => break,
-                    Err(crossbeam::channel::TryRecvError::Disconnected) => {
-                        break 'run_loop;
-                    }
+                let pending = match accum_deadline
+                    .and_then(|d| d.checked_duration_since(Instant::now()))
+                {
+                    Some(remaining) => match req_rx.recv_timeout(remaining) {
+                        Ok(p) => p,
+                        Err(crossbeam::channel::RecvTimeoutError::Timeout) => break,
+                        Err(crossbeam::channel::RecvTimeoutError::Disconnected) => {
+                            break 'run_loop;
+                        }
+                    },
+                    None => match req_rx.try_recv() {
+                        Ok(p) => p,
+                        Err(crossbeam::channel::TryRecvError::Empty) => break,
+                        Err(crossbeam::channel::TryRecvError::Disconnected) => {
+                            break 'run_loop;
+                        }
+                    },
                 };
                 let Some((pending, usage)) = prepare_pending_with_usage(&batch, pending)
                 else {
