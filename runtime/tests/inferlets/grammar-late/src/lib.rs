@@ -40,23 +40,31 @@ use inferlet::sampling::program as edsl;
 use inferlet::serde_json;
 use inferlet::{Context, Result, model};
 
-/// Constraint alphabet: the only token ids the grammar ever allows. Small ids
-/// the model never naturally argmaxes, so the natural pick is always forced out.
+/// Default constraint alphabet: the only token ids the grammar ever allows. Small
+/// ids the model never naturally argmaxes, so the natural pick is always forced
+/// out. Override via `{"alphabet":[..]}` — the gate-1 R=2 barrier launches two
+/// procs with DISJOINT alphabets so their constrained tokens are distinguishable
+/// (`tok_A ∈ alphabet_A` ≠ `tok_B ∈ alphabet_B` by construction, ruling out a
+/// `per_req[0]→both` mask aliasing on the merged `forward_R=2` fire).
 const ALPHABET: [u32; 4] = [10, 11, 12, 13];
 /// Default tokens to generate; override via `{"max_tokens":N}`.
 const MAX_TOKENS: usize = 8;
 
 /// Tiny DFA: allow any alphabet token except the one just emitted (no repeats).
 struct NoRepeatMatcher {
+    alphabet: Vec<u32>,
     last: Option<u32>,
 }
 
 impl NoRepeatMatcher {
-    fn new() -> Self {
-        Self { last: None }
+    fn new(alphabet: Vec<u32>) -> Self {
+        Self {
+            alphabet,
+            last: None,
+        }
     }
     fn allowed(&self) -> Vec<u32> {
-        ALPHABET
+        self.alphabet
             .iter()
             .copied()
             .filter(|&t| Some(t) != self.last)
@@ -92,6 +100,15 @@ async fn main(input: String) -> Result<String> {
         .and_then(|x| x.as_u64())
         .map(|x| x as usize)
         .unwrap_or(MAX_TOKENS);
+    // The grammar's allowed alphabet. The gate-1 R=2 barrier passes two DISJOINT
+    // alphabets (A=[10..13], B=[20..23]) so the two procs' constrained tokens are
+    // distinguishable on the merged `forward_R=2` fire (no `per_req[0]→both` alias).
+    let alphabet: Vec<u32> = params
+        .get("alphabet")
+        .and_then(|x| x.as_array())
+        .map(|a| a.iter().filter_map(|v| v.as_u64().map(|n| n as u32)).collect())
+        .filter(|a: &Vec<u32>| !a.is_empty())
+        .unwrap_or_else(|| ALPHABET.to_vec());
 
     // Logits/output vocab (= hf_config.vocab_size); the program masks + samples
     // over the logits dim.
@@ -113,7 +130,7 @@ async fn main(input: String) -> Result<String> {
         inferlet::emit::emit_program(&built.program).map_err(|e| format!("grammar emit: {e}"))?;
     let n_out = built.outputs.len() as u32;
 
-    let mut matcher = NoRepeatMatcher::new();
+    let mut matcher = NoRepeatMatcher::new(alphabet.clone());
     let mut tokens: Vec<u32> = Vec::with_capacity(max_tokens);
     let mut pending: Vec<u32> = prompt;
 
@@ -160,7 +177,7 @@ async fn main(input: String) -> Result<String> {
             );
         }
         // Grammar conformance invariant: the constrained token is in the alphabet.
-        if !ALPHABET.contains(&token) {
+        if !alphabet.contains(&token) {
             conform_ok = false;
             eprintln!("[GRAMMAR-LATE] grammar violated @{step}: {token} not in alphabet");
         }
