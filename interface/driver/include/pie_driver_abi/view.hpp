@@ -219,6 +219,10 @@ struct PieForwardRequestView {
     PieSlice<std::uint32_t> spec_position_ids;
     PieSlice<std::uint32_t> spec_indptr;
     PieSlice<std::uint8_t>  output_spec_flags;
+    // #31 self-spec greedy-v0: per-request drafter-filled `[k]`-Token output `k`
+    // (0 = none). On the propose-forward the drafter writes `spec_tokens@922[..k]`
+    // into request r's LAST `program_tokens` slot (append-last seg). Read-only.
+    PieSlice<std::uint32_t> spec_draft_output_k;
 
     PieSlice<std::uint64_t> context_ids;
 
@@ -529,6 +533,8 @@ inline void fill_forward_view(const PieForwardRequestDesc& f,
     out.spec_position_ids = slice_from(f.spec_position_ids_ptr, f.spec_position_ids_len);
     out.spec_indptr       = slice_from(f.spec_indptr_ptr, f.spec_indptr_len);
     out.output_spec_flags = slice_from(f.output_spec_flags_ptr, f.output_spec_flags_len);
+    out.spec_draft_output_k =
+        slice_from(f.spec_draft_output_k_ptr, f.spec_draft_output_k_len);
     out.context_ids       = slice_from(f.context_ids_ptr, f.context_ids_len);
 
     // Multimodal visual spans — pass-through slices into the archive buffer.

@@ -256,6 +256,8 @@ struct PieForwardRequestDesc {
   size_t sampling_late_device_flags_len;
   const uint32_t *sampling_late_device_lens_ptr;
   size_t sampling_late_device_lens_len;
+  const uint32_t *spec_draft_output_k_ptr;
+  size_t spec_draft_output_k_len;
 };
 
 struct PieCopyRequestDesc {
