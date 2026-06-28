@@ -294,13 +294,25 @@ pub fn populate_output_fastpath(
     req: &mut ForwardRequest,
     programs_output_kinds: &[Vec<OutputKind>],
     programs_output_elem_counts: &[Vec<u32>],
+    has_custom_program: bool,
 ) -> Vec<PinnedOutput> {
     // Eligible iff exactly one declared output, a `Token`, with elem_count == 1 —
     // the only shape the driver eager-D2H MVP fills (`pi.sampled[N-1]`, a single
     // i32). A `[k]`-Token (elem_count > 1), multi-output, or non-`Token` output
     // must take the rich path, where the `r×o×k` marshal handles the shape.
+    //
+    // #36 AND no attached custom IR program: a custom program marshals its output
+    // to the rich `per_req` (`marshal_ir_program_output`) and returns BEFORE the
+    // eager-D2H, so the pinned dst is NEVER filled → `output()` mis-reads the stale
+    // pinned (the #19 carrier class, exposed by single-`[Token]` custom programs on
+    // the merged/M-batch path). Only a recognized-STANDARD sampler writes
+    // `pi.sampled` → eager-D2H fills the pinned. The runtime has no host-side
+    // standard-recognition (that's the driver's #8 recognizer), so conservatively
+    // ALL attached programs → rich; restoring the recognized-STANDARD fast-path
+    // (which IS pinned-correct) is a perf follow-on (#37).
     let total: usize = programs_output_kinds.iter().map(|p| p.len()).sum();
     let single_token = total == 1
+        && !has_custom_program
         && programs_output_kinds
             .iter()
             .flatten()
@@ -353,6 +365,7 @@ pub fn populate_output_fastpath(
     _req: &mut ForwardRequest,
     _programs_output_kinds: &[Vec<OutputKind>],
     _programs_output_elem_counts: &[Vec<u32>],
+    _has_custom_program: bool,
 ) -> Vec<PinnedOutput> {
     Vec::new()
 }
