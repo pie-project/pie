@@ -893,6 +893,28 @@ if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/sampling_ir/codegen.cpp"
   target_link_libraries(bench_sampling_ir PRIVATE
     CUDA::cudart CUDA::cuda_driver CUDA::nvrtc)
 
+  # #10 M-batch occupancy/sync micro-bench (lane L4 / echo) — the land-vs-defer
+  # measurement: the LANDED sequential scatter (N × num_rows=1 launch + N syncs)
+  # vs the M-batch (1 × num_rows=N + 1 sync) on the real argmax-over-vocab kernel
+  # (OneBlockPerRow ⇒ single-row = grid=1 block). delta's #11 C3 (trivial-kernel
+  # launch) can't show the occupancy win; this does. Manual GPU perf run (not a
+  # ctest): cmake --build build --target bench_mbatch_occupancy
+  #          ./build/bin/bench_mbatch_occupancy
+  # IR-JIT path only (no hardwired/flashinfer comparison) ⇒ just the JIT sources.
+  add_executable(bench_mbatch_occupancy
+    tests/bench_mbatch_occupancy.cu
+    src/sampling_ir/jit.cpp
+    src/sampling_ir/jit_backend.cpp
+    src/sampling_ir/codegen.cpp
+    src/sampling_ir/reader.cpp)
+  target_include_directories(bench_mbatch_occupancy PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+  target_compile_options(bench_mbatch_occupancy PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>: --extended-lambda --expt-relaxed-constexpr >)
+  target_link_libraries(bench_mbatch_occupancy PRIVATE
+    CUDA::cudart CUDA::cuda_driver CUDA::nvrtc)
+
   # WS4 part-1 test (lane L4 / echo): drive charlie's greedy spec-verify program
   # through SamplingIrRuntime::try_run — matrix Intrinsic(Logits) verify block +
   # submit-bound draft vector + multi-element Vector<k+1> Token output — vs a CPU
