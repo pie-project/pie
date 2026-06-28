@@ -14,6 +14,7 @@ members = [
     "isolatedtopp",
     "runahead",
     "specverify",
+    "grammarmb",
 ]
 
 [workspace.dependencies]
