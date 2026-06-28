@@ -186,6 +186,15 @@ RunStatus SamplingIrRuntime::try_run(const FireContext& ctx) {
                 // didn't supply one.
                 r.elem_count = (e->elem_count != 0) ? e->elem_count : decl.elem_count;
                 r.present = true;
+                // Positive device-alias-resolution probe (item-1 merged-path
+                // debug): a non-null ptr logged HERE proves the Late carrier was
+                // consumed BEFORE the consuming kernel — distinguishing a real
+                // resolve from a SkippedLateBindMiss / pre-empted abort.
+                if (std::getenv("PIE_SAMPLING_IR_TRACE")) {
+                    std::cerr << "[ir-trace]   HostLate RESOLVED device-alias key="
+                              << decl.host_key << " ptr=" << r.device_ptr
+                              << " elem_count=" << r.elem_count << "\n";
+                }
                 break;
             }
         }
