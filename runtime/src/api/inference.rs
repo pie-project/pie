@@ -252,6 +252,10 @@ struct RsWorkingSetDesc {
 struct AttachedProgram {
     bytecode: Vec<u8>,
     output_kinds: Vec<pie_sampling_ir::OutputKind>,
+    /// Per-output element count (`ValueType.shape.numel()`), declared order. `1`
+    /// for scalar/single-`Token`, `k` for a `[k]`-Token / `[k]` vector. Drives the
+    /// shape-aware marshal + the single-`[1]`-Token fast-path gate.
+    output_elem_counts: Vec<u32>,
     bindings: Vec<pie_sampling_ir::Binding>,
     submit_inputs: Vec<pie_driver_abi::SamplingInput>,
     /// #27 cut #2 device-alias late inputs: `(late-key, DeviceLateInput)` for
@@ -769,11 +773,12 @@ impl InstanceState {
         inputs: Vec<pie::core::inference::InputBinding>,
     ) -> Result<AttachedProgram> {
         use pie::core::inference::InputBinding;
-        let (bytecode, output_kinds, num_inputs, input_readiness) = {
+        let (bytecode, output_kinds, output_elem_counts, num_inputs, input_readiness) = {
             let p = self.ctx().table.get(program)?;
             (
                 p.cached.bytecode.clone(),
                 p.cached.output_kinds.clone(),
+                p.cached.output_elem_counts.clone(),
                 p.cached.num_inputs,
                 p.cached.input_readiness.clone(),
             )
@@ -871,6 +876,7 @@ impl InstanceState {
         Ok(AttachedProgram {
             bytecode,
             output_kinds,
+            output_elem_counts,
             bindings,
             submit_inputs,
             late_device_inputs,
@@ -1328,6 +1334,8 @@ async fn execute_impl(
         let has_programs = !attached_programs.is_empty();
         let mut programs_output_kinds: Vec<Vec<pie_sampling_ir::OutputKind>> =
             Vec::with_capacity(attached_programs.len());
+        let mut programs_output_elem_counts: Vec<Vec<u32>> =
+            Vec::with_capacity(attached_programs.len());
         // #10: per-program identity hashes (distinct-count key), attach order →
         // threaded into the scheduler accumulation policy via submit_async. Empty
         // for plain decode (no attached programs) ⇒ policy's free-to-batch path.
@@ -1349,6 +1357,7 @@ async fn execute_impl(
             crate::driver::prefetch_compile(driver_idx, &program.bytecode, &program.bindings);
             program_identity_hashes.push(program.identity_hash);
             programs_output_kinds.push(program.output_kinds);
+            programs_output_elem_counts.push(program.output_elem_counts);
             logits_positions.extend(program.logits_positions);
             let bindings = program
                 .bindings
@@ -1780,8 +1789,11 @@ async fn execute_impl(
         // the `ForwardResponse` marshal). Empty when not fast-path-eligible or
         // without the `driver-cuda` feature ⇒ legacy path. Must run BEFORE submit
         // (mutates `req`); the buffers are carried on the `PendingForward`.
-        let pinned_outputs =
-            crate::api::tensor_io::populate_output_fastpath(&mut req, &programs_output_kinds);
+        let pinned_outputs = crate::api::tensor_io::populate_output_fastpath(
+            &mut req,
+            &programs_output_kinds,
+            &programs_output_elem_counts,
+        );
 
         // Single-model: the SERVICE routes to the bound model; no model_id arg.
         let submit_result = inference::submit_async(

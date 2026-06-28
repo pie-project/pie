@@ -678,6 +678,14 @@ impl Output {
             .ok_or_else(|| format!("Output::token: output tensor at index {} is empty", h.index()))
     }
 
+    /// All sampled token ids for a handle — the `[k]`-Token case (a program output
+    /// declared with shape `[k]`, e.g. a draft/spec token window). Returns the `k`
+    /// tokens in declared order; for a single `Token` output this is a 1-element
+    /// vec (prefer [`Output::token`] there).
+    pub async fn tokens(&self, h: ProgramHandle) -> Result<Vec<u32>> {
+        self.read_u32(h).await
+    }
+
     /// Scalar measurement for a handle (e.g. mirostat surprise `S`) — the first
     /// `f32` lane of the output tensor.
     pub async fn scalar(&self, h: ProgramHandle) -> Result<f32> {
