@@ -117,6 +117,23 @@ impl Drop for DeviceLateInput {
 /// `driver-cuda`.
 #[cfg(feature = "driver-cuda")]
 pub fn upload_late_input(data: &[u8]) -> Option<DeviceLateInput> {
+    // Serialize the host-side Late-upload across concurrent inferlet `execute()`
+    // threads. `pie_device_alloc`/`pie_tensor_write_async`/`pie_event_sync` all
+    // drive the driver's single process-wide `TensorIoEngine` — one copy stream +
+    // device-arena + the R12-flag set/clear staging. Two WASM proc threads
+    // uploading masks simultaneously race that shared mutable state: this is the
+    // item-1 concurrent-Late crash, and it is NOT the run-ahead fire-overlap (it
+    // reproduces with `MAX_IN_FLIGHT=1`, fires serialized) — it's the two host
+    // upload threads before `submit_async`. One global lock makes each upload
+    // (alloc → H2D → self-arm → sync) atomic w.r.t. the others. The sequential-mask
+    // MVP already blocks on `pie_event_sync`, and this is a plain sync fn (no
+    // `.await` while held), so the lock adds no async-runtime hazard — it only
+    // serializes the device-arena/stream/flag access the engine isn't internally
+    // atomic over. (The true-async overlap follow-up that drops the pre-sync will
+    // move this to per-stream / per-proc arenas; for the MVP, serialize.)
+    static UPLOAD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _upload_guard = UPLOAD_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+
     let mut device_dst: *mut core::ffi::c_void = core::ptr::null_mut();
     let mut device_flag: *mut u32 = core::ptr::null_mut();
     // SAFETY: FFI to the driver's device arena; out-params populated on success.
