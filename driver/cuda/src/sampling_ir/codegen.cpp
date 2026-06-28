@@ -244,9 +244,9 @@ struct Codegen {
             case OpCode::MaskApply:   // (logits, mask)
                 return {op.a, op.b};
             case OpCode::PivotThreshold:
-                if (op.predicate.tag == PredTag::CummassLe || op.predicate.tag == PredTag::ProbGe)
-                    return {op.a, op.predicate.payload};
-                return {op.a};
+                // #25: all three predicates carry a value-id payload (RankLe `k`
+                // included — host-submit, no longer a baked immediate).
+                return {op.a, op.predicate.payload};
             case OpCode::Rng:
                 // v4 ambient (Model B): no value-id operand (seed is launch-side).
                 // v2/v3: op.a is the Host seed input.
@@ -636,7 +636,26 @@ struct Codegen {
         return e;
     }
 
-    // Per-element value expression for `id`: recursively inline elementwise
+    // Integer element access for value `id` — the analog of `melem_leaf` for an
+    // integer value (e.g. the top-k `k` predicate operand), returning the RAW
+    // integer (no float cast). A predicate `k` is a scalar (→ "0"/"r" batched) or
+    // a per-row `[rows]` vector (→ "r"); it is never per-column, so `j` is never
+    // referenced in the reduce-style (per-block) site where this is emitted.
+    std::string melem_int(ValueId id) {
+        const VInfo& vi = vinfo[id];
+        if (vi.is_const) {
+            if (vi.lit.dtype == DType::U32) return std::to_string(vi.lit.as_u32()) + "u";
+            return std::to_string(vi.lit.as_i32());
+        }
+        std::string idx;
+        if (batched) {
+            idx = vi.scalar ? "r" : ("r*" + std::to_string(vi.len) + "+j");
+        } else if (vi.scalar) idx = "0";
+        else if (vi.row_indexed) idx = "r";
+        else if (vi.rows > 1) idx = "r*" + std::to_string(vi.len) + "+j";
+        else idx = "j";
+        return "b" + std::to_string(vi.buffer) + "[" + idx + "]";
+    }
     // producers marked `inlined` (folding the map chain into the consumer's
     // loop, no global round-trip); otherwise a leaf read. For non-batched paths
     // `inlined` is all-false so this is exactly `melem_leaf`.
@@ -790,8 +809,9 @@ struct Codegen {
                 s << "  { float _t;\n";
                 switch (op.predicate.tag) {
                     case PredTag::RankLe:
+                        // #25: k is a value-id (host-submit U32), read per-row.
                         s << "    _t = pie_ir_pivot_topk_radix(" << buf_name(op.a) << " + r*" << Lin
-                          << ", " << Lin << ", " << op.predicate.payload << ");\n";
+                          << ", " << Lin << ", " << melem_int(op.predicate.payload) << ");\n";
                         break;
                     case PredTag::CummassLe:
                         s << "    _t = pie_ir_pivot_topp_radix(" << buf_name(op.a) << " + r*" << Lin
@@ -939,8 +959,9 @@ struct Codegen {
                 s << "  { float _t;\n";
                 switch (op.predicate.tag) {
                     case PredTag::RankLe:
+                        // #25: k is a value-id (host-submit U32 scalar), read [0].
                         s << "    _t = pie_ir_pivot_topk_radix(" << buf_name(op.a) << ", " << L
-                          << ", " << op.predicate.payload << ");\n";
+                          << ", " << ref_int(op.predicate.payload) << ");\n";
                         break;
                     case PredTag::CummassLe:
                         s << "    _t = pie_ir_pivot_topp_radix(" << buf_name(op.a) << ", " << L

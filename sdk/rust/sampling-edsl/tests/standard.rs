@@ -24,7 +24,8 @@ fn prog(b: &Built) -> SamplingProgram {
 fn bind(b: &Built, logits: &[f32], params: &[(u32, f32)]) -> Vec<EvalValue> {
     b.bindings
         .iter()
-        .map(|binding| match binding {
+        .zip(b.program.inputs.iter())
+        .map(|(binding, decl)| match binding {
             Binding::Logits | Binding::MtpLogits => EvalValue::F32(logits.to_vec()),
             Binding::Tensor { key, .. } => {
                 let v = params
@@ -32,7 +33,12 @@ fn bind(b: &Built, logits: &[f32], params: &[(u32, f32)]) -> Vec<EvalValue> {
                     .find(|(k, _)| k == key)
                     .map(|(_, v)| *v)
                     .unwrap_or_else(|| panic!("no value for param key {key}"));
-                EvalValue::F32(vec![v])
+                // Resolve the slot's declared dtype (#25: the top-k `k` slot is U32).
+                match decl.dtype {
+                    pie_sampling_ir::DType::U32 => EvalValue::U32(vec![v as u32]),
+                    pie_sampling_ir::DType::I32 => EvalValue::I32(vec![v as i32]),
+                    _ => EvalValue::F32(vec![v]),
+                }
             }
         })
         .collect()
@@ -190,15 +196,15 @@ fn nucleus(logits: &[f32], p: f32) -> std::collections::HashSet<usize> {
 
 #[test]
 fn top_k_structure() {
-    let (b, keys) = top_k(64, 5).unwrap();
+    let (b, keys) = top_k(64).unwrap();
     assert_eq!(b.outputs, vec![OutputKind::Token]);
-    assert_eq!(b.host_inputs.len(), 1); // temperature only; k is a baked immediate
-    assert!(keys.temperature.is_some() && keys.top_p.is_none());
+    assert_eq!(b.host_inputs.len(), 2); // temperature + k (both submit, #25)
+    assert!(keys.temperature.is_some() && keys.k.is_some() && keys.top_p.is_none());
     let p = prog(&b);
     p.validate().unwrap();
     assert!(p.ops.iter().any(|o| matches!(
         o,
-        Op::PivotThreshold { predicate: pie_sampling_ir::Predicate::RankLe(5), .. }
+        Op::PivotThreshold { predicate: pie_sampling_ir::Predicate::RankLe(_), .. }
     )));
     assert!(p.ops.iter().any(|o| matches!(o, Op::Rng { stream: 0, .. })));
 }
@@ -218,14 +224,14 @@ fn top_p_structure() {
 
 #[test]
 fn top_k_top_p_structure() {
-    let (b, keys) = top_k_top_p(64, 8).unwrap();
-    assert_eq!(b.host_inputs.len(), 2); // temperature + p; k is a baked immediate
-    assert!(keys.temperature.is_some() && keys.top_p.is_some());
+    let (b, keys) = top_k_top_p(64).unwrap();
+    assert_eq!(b.host_inputs.len(), 3); // temperature + p + k (all submit, #25)
+    assert!(keys.temperature.is_some() && keys.top_p.is_some() && keys.k.is_some());
     let p = prog(&b);
     p.validate().unwrap();
     assert!(p.ops.iter().any(|o| matches!(
         o,
-        Op::PivotThreshold { predicate: pie_sampling_ir::Predicate::RankLe(8), .. }
+        Op::PivotThreshold { predicate: pie_sampling_ir::Predicate::RankLe(_), .. }
     )));
     assert!(p.ops.iter().any(|o| matches!(
         o,
@@ -236,11 +242,15 @@ fn top_k_top_p_structure() {
 #[test]
 fn eval_top_k_token_in_top_k() {
     let k = 3u32;
-    let (b, keys) = top_k(8, k).unwrap();
+    let (b, keys) = top_k(8).unwrap();
     let logits = logits8();
     let topk = top_k_set(&logits, k as usize);
     for s in [3u32, 11, 256, 4096, 50000] {
-        let inputs = bind(&b, &logits, &[(keys.temperature.unwrap(), 1.0)]);
+        let inputs = bind(
+            &b,
+            &logits,
+            &[(keys.temperature.unwrap(), 1.0), (keys.k.unwrap(), k as f32)],
+        );
         let out = eval(&prog(&b), &InputBindings::new(&inputs, s)).unwrap();
         let t = token_of(&out[0]) as usize;
         assert!(topk.contains(&t), "seed {s}: token {t} not in top-{k}");
@@ -347,9 +357,9 @@ fn top_p_le_zero_is_not_a_filter() {
 
 #[test]
 fn standard_programs_reference_set() {
-    use sampling_edsl::{standard_program, standard_programs};
+    use sampling_edsl::standard_programs;
     let progs = standard_programs(128).unwrap();
-    // The 4 k-invariant kinds, in order, each mapped to its CanonicalKind.
+    // All 6 standard kinds, in order, each mapped to its CanonicalKind.
     let kinds: Vec<CanonicalKind> = progs.iter().map(|(_, k)| *k).collect();
     assert_eq!(
         kinds,
@@ -357,18 +367,14 @@ fn standard_programs_reference_set() {
             CanonicalKind::Argmax,
             CanonicalKind::Temperature,
             CanonicalKind::MinP,
-            CanonicalKind::TopP
+            CanonicalKind::TopP,
+            CanonicalKind::TopK,
+            CanonicalKind::TopKTopP,
         ]
     );
     // All-distinct bytecode => distinct hashes for alpha's {hash->kind} table.
     let set: std::collections::HashSet<&Vec<u8>> = progs.iter().map(|(b, _)| b).collect();
-    assert_eq!(set.len(), 4, "standard program bytecode must be all-distinct");
-    // k-bearing: classifies TopK; bytecode varies by k (the RankLe immediate).
-    let (b40, k40) = standard_program(StandardSampler::TopK { k: 40 }, 128).unwrap();
-    let (b50, k50) = standard_program(StandardSampler::TopK { k: 50 }, 128).unwrap();
-    assert_eq!(k40, CanonicalKind::TopK);
-    assert_eq!(k50, CanonicalKind::TopK);
-    assert_ne!(b40, b50, "k-bearing bytecode varies by k");
+    assert_eq!(set.len(), 6, "standard program bytecode must be all-distinct");
 }
 
 #[test]
@@ -376,14 +382,14 @@ fn standard_program_hashes_table_round_trips() {
     use sampling_edsl::{standard_program_hashes, standard_programs};
     use std::collections::HashMap;
     let vocab = 128;
-    // The 4 k-invariant { program_hash → kind } entries (the #12 exact-hash table).
+    // All { program_hash → kind } entries (the #12 exact-hash table, all 6 kinds).
     let table: HashMap<u64, CanonicalKind> =
         standard_program_hashes(vocab).unwrap().into_iter().collect();
-    // All-distinct hashes ⇒ 4 entries, no collision — the recognizer is unambiguous.
+    // All-distinct hashes ⇒ 6 entries, no collision — the recognizer is unambiguous.
     assert_eq!(
         table.len(),
-        4,
-        "the 4 k-invariant program hashes must be all-distinct"
+        6,
+        "the 6 standard program hashes must be all-distinct"
     );
     // Behavior-preserving proof: each standard program, hashed via the canonical
     // `program_hash`, recognizes its OWN kind through the table (enum→graph).
@@ -393,87 +399,32 @@ fn standard_program_hashes_table_round_trips() {
     }
 }
 
-// ── phase-2 op-shape: k-bearing canonicalization (#12) ───────────────────────
-
-/// Canonicalize a freshly-built standard program (compose alpha's
-/// `canonicalize_op_shape`) and hash it with the same FNV-1a as phase-1.
-fn canonical_hash(kind: StandardSampler, vocab: u32) -> u64 {
-    let (built, _) = build_standard(kind, vocab).unwrap();
-    let mut program = built.program.clone();
-    pie_sampling_ir::canonicalize_op_shape(&mut program);
-    pie_sampling_ir::program_hash(&pie_sampling_ir::encode(&program))
-}
+// ── #25: top-k is k-invariant (k is a submit value-id, not a baked immediate) ──
 
 #[test]
-fn standard_programs_canonical_is_k_invariant() {
-    use sampling_edsl::{standard_program_hashes_canonical, standard_programs_canonical};
+fn top_k_is_k_invariant_via_submit() {
     let vocab = 128;
-
-    // The canonical op-shape is k-invariant: varying `k` → one canonical bytecode
-    // (the `RankLe(k)` immediate, the sole parametric byte, is zeroed).
-    assert_eq!(
-        canonical_hash(StandardSampler::TopK { k: 40 }, vocab),
-        canonical_hash(StandardSampler::TopK { k: 50 }, vocab),
-        "canonicalize(TopK{{40}}) must hash-equal canonicalize(TopK{{50}})"
-    );
-    assert_eq!(
-        canonical_hash(StandardSampler::TopKTopP { k: 40 }, vocab),
-        canonical_hash(StandardSampler::TopKTopP { k: 1000 }, vocab),
-        "canonicalize(TopKTopP{{40}}) must hash-equal canonicalize(TopKTopP{{1000}})"
-    );
-
-    // The canonical references join the recognizer table at the canonical hash.
-    let refs = standard_programs_canonical(vocab).unwrap();
-    let kinds: Vec<CanonicalKind> = refs.iter().map(|(_, k)| *k).collect();
-    assert_eq!(kinds, vec![CanonicalKind::TopK, CanonicalKind::TopKTopP]);
-    // Each reference's bytecode hashes to the canonical-hash of any-k of its kind.
-    let table: std::collections::HashMap<u64, CanonicalKind> =
-        standard_program_hashes_canonical(vocab).unwrap().into_iter().collect();
-    assert_eq!(
-        table.get(&canonical_hash(StandardSampler::TopK { k: 7 }, vocab)).copied(),
-        Some(CanonicalKind::TopK),
-        "any-k TopK must canonical-hash-match the TopK reference"
-    );
-    assert_eq!(
-        table.get(&canonical_hash(StandardSampler::TopKTopP { k: 999 }, vocab)).copied(),
-        Some(CanonicalKind::TopKTopP),
-        "any-k TopKTopP must canonical-hash-match the TopKTopP reference"
-    );
-}
-
-#[test]
-fn canonical_hashes_distinct_and_disjoint_from_phase1() {
-    use sampling_edsl::{standard_program_hashes, standard_program_hashes_canonical};
-    let vocab = 128;
-    // The 2 canonical k-bearing hashes are distinct from each other …
-    let canon = standard_program_hashes_canonical(vocab).unwrap();
-    let cset: std::collections::HashSet<u64> = canon.iter().map(|(h, _)| *h).collect();
-    assert_eq!(cset.len(), 2, "TopK and TopKTopP canonical hashes must differ");
-    // … and disjoint from the 4 phase-1 hashes — no false-match across the table.
-    let p1: std::collections::HashSet<u64> =
-        standard_program_hashes(vocab).unwrap().into_iter().map(|(h, _)| h).collect();
-    assert!(
-        cset.is_disjoint(&p1),
-        "canonical k-bearing hashes must not collide with phase-1 hashes"
-    );
-}
-
-#[test]
-fn extract_top_k_reads_baked_immediate() {
-    use sampling_edsl::extract_top_k;
-    let vocab = 128;
-    // k-bearing kinds expose their baked `k` ("op-shape yields k").
-    for k in [1u32, 40, 1000] {
-        let (built, _) = build_standard(StandardSampler::TopK { k }, vocab).unwrap();
-        assert_eq!(extract_top_k(&built.program), Some(k));
-        let (built, _) = build_standard(StandardSampler::TopKTopP { k }, vocab).unwrap();
-        assert_eq!(extract_top_k(&built.program), Some(k));
+    // Both k-bearing kinds declare a U32 `Submit` input for `k`, and the `RankLe`
+    // predicate references it — so the bytecode does NOT vary with the runtime k,
+    // and the kinds recognize by exact hash (no op-shape canonicalization).
+    for kind in [StandardSampler::TopK, StandardSampler::TopKTopP] {
+        let (b, keys) = build_standard(kind, vocab).unwrap();
+        assert!(keys.k.is_some(), "{kind:?} declares a submit k key");
+        let p = prog(&b);
+        p.validate().unwrap();
+        assert!(
+            p.ops.iter().any(|o| matches!(
+                o,
+                Op::PivotThreshold { predicate: pie_sampling_ir::Predicate::RankLe(_), .. }
+            )),
+            "{kind:?} has a RankLe predicate"
+        );
+        assert!(
+            p.inputs.iter().any(|d| d.dtype == pie_sampling_ir::DType::U32
+                && d.ready == pie_sampling_ir::Readiness::Submit),
+            "{kind:?} declares a U32 submit input (the value-id k)"
+        );
     }
-    // k-invariant kinds have no RankLe op → no k to extract.
-    let (built, _) = build_standard(StandardSampler::TopP, vocab).unwrap();
-    assert_eq!(extract_top_k(&built.program), None);
-    let built = argmax(vocab).unwrap();
-    assert_eq!(extract_top_k(&built.program), None);
 }
 
 #[test]

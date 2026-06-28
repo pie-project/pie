@@ -286,8 +286,9 @@ impl Op {
     }
 
     /// The [`ValueId`]s this op reads, in a stable order. Leaves (`Input`,
-    /// `Const`) and immediates (input-index, shape, stream, predicate `k`) are
-    /// excluded; value-id predicate operands are included.
+    /// `Const`) and immediates (input-index, shape, stream) are excluded; the
+    /// value-id predicate operands (top-k `k`, top-p `p`, min-p `thr`) are
+    /// included.
     pub fn operands(&self) -> Vec<ValueId> {
         use alloc::vec;
         match *self {
@@ -327,8 +328,9 @@ impl Op {
             }
 
             Op::PivotThreshold { input, predicate } => match predicate {
-                Predicate::RankLe(_) => vec![input],
-                Predicate::CummassLe(v) | Predicate::ProbGe(v) => vec![input, v],
+                Predicate::RankLe(v) | Predicate::CummassLe(v) | Predicate::ProbGe(v) => {
+                    vec![input, v]
+                }
             },
         }
     }
@@ -337,8 +339,11 @@ impl Op {
 /// Threshold predicate for [`Op::PivotThreshold`] (top-k / top-p / min-p).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Predicate {
-    /// top-k: keep the top `k` (immediate).
-    RankLe(u32),
+    /// top-k: keep the top `k` — a value id (host-submit `U32` scalar, or a
+    /// per-row `[rows]` `U32` vector for a matrix input). De-hardwired like
+    /// top-p `p` / min-p `thr`, so the program bytecode is k-invariant (`k` is
+    /// supplied at submit, never a baked immediate).
+    RankLe(ValueId),
     /// top-p: inclusive nucleus to mass `p` (a Scalar-F32 value id).
     CummassLe(ValueId),
     /// min-p: keep `>= thr` (a Scalar-F32 value id, e.g. `p·max_prob`).

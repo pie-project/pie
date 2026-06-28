@@ -166,9 +166,12 @@ impl DynValue {
     }
 
     // -- pivot-threshold masks (f32 input) -> bool, same shape --
-    pub fn pivot_rank_le(&self, k: u32) -> DynValue {
+    /// `RankLe(k)` keeps the top-`k` by logit; since #25 `k` is an integer
+    /// value-id (a `U32`/`I32` scalar input or per-row `[rows]` vector), not a
+    /// baked immediate.
+    pub fn pivot_rank_le(&self, k: &DynValue) -> DynValue {
         self.emit(
-            ir::Op::PivotThreshold { input: self.id, predicate: ir::Predicate::RankLe(k) },
+            ir::Op::PivotThreshold { input: self.id, predicate: ir::Predicate::RankLe(k.id) },
             ir::ValueType::new(self.ty.shape, ir::DType::Bool),
         )
     }

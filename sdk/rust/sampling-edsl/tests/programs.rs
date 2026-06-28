@@ -174,7 +174,7 @@ fn sugar_min_p_is_logit_space() {
 fn sugar_top_k_top_p_has_both_predicates() {
     let b = build_sampler(SamplerSpec::TopKTopP { temperature: 0.9, k: 40, p: 0.95 }, VOCAB).unwrap();
     roundtrip(&b);
-    assert!(has(&b, |o| matches!(o, Op::PivotThreshold { predicate: ir::Predicate::RankLe(40), .. })));
+    assert!(has(&b, |o| matches!(o, Op::PivotThreshold { predicate: ir::Predicate::RankLe(_), .. })));
     assert!(has(&b, |o| matches!(o, Op::PivotThreshold { predicate: ir::Predicate::CummassLe(_), .. })));
 }
 

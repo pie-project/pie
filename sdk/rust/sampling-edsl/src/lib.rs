@@ -41,9 +41,8 @@ pub use builder::{BuildError, Built, Graph, HostInputDecl, LoweredProgram, Outpu
 pub use dynamic::{DynValue, dselect};
 pub use kinds::{CanonicalKind, infer_kind};
 pub use standard::{
-    StandardSampler, StdParamKeys, build_standard, extract_top_k, standard_program,
-    standard_program_hashes, standard_program_hashes_canonical, standard_programs,
-    standard_programs_canonical,
+    StandardSampler, StdParamKeys, build_standard, standard_program, standard_program_hashes,
+    standard_programs,
 };
 #[allow(deprecated)] // `lower_sampler` is deprecated (#17) but the path is kept for compat.
 pub use sugar::{

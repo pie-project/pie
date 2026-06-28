@@ -1,8 +1,9 @@
 //! #12 cross-language byte-parity fixture (`standard_program_bytecode.txt`).
 //!
 //! SINGLE SOURCE OF TRUTH for the standard-sampler bytecode, emitted by foxtrot's
-//! `standard_programs` (4 k-invariant, exact form) + `standard_programs_canonical`
-//! (2 k-bearing, canonicalized op-shape). Read at TEST RUNTIME (a fixture, not a
+//! `standard_programs` (all 6 kinds, exact form — k-invariant since #25, where
+//! top-k `k` is a submit value-id, not a baked immediate). Read at TEST RUNTIME (a
+//! fixture, not a
 //! build dep) by BOTH sides so the SDK emit and the driver bake are provably
 //! byte-identical:
 //!   - Rust SDK leg (this test): live emit == committed fixture.
@@ -16,7 +17,7 @@
 //!   STDPROG_FIXTURE_REGEN=1 cargo test -p sampling-edsl --test fixture
 
 use pie_sampling_ir::program_hash;
-use sampling_edsl::{CanonicalKind, standard_programs, standard_programs_canonical};
+use sampling_edsl::{CanonicalKind, standard_programs};
 
 const FIXTURE: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -54,22 +55,17 @@ fn emit() -> String {
     let mut s = String::new();
     s.push_str("# #12 standard-sampler bytecode fixture — SINGLE SOURCE for the\n");
     s.push_str("# cross-language byte-parity guard. Emitted by foxtrot's SDK:\n");
-    s.push_str("#   standard_programs(V)           -> the 4 k-invariant kinds (EXACT form)\n");
-    s.push_str("#   standard_programs_canonical(V) -> top_k / top_k_top_p (CANONICAL op-shape:\n");
-    s.push_str("#                                     the RankLe(k) immediate zeroed → k-invariant)\n");
+    s.push_str("#   standard_programs(V) -> all 6 standard kinds (k-invariant since #25:\n");
+    s.push_str("#                           top-k k is a submit value-id, not a baked immediate)\n");
     s.push_str("#\n");
     s.push_str("# Format: kind,vocab,fnv1a64,hex\n");
     s.push_str("#   fnv1a64 = pie_sampling_ir::program_hash(bytecode) == driver jit::fnv1a64.\n");
-    s.push_str("# Recognizer use: argmax/temperature/min_p/top_p match by EXACT hash; the\n");
-    s.push_str("# top_k/top_k_top_p rows are the CANONICAL form — the driver canonicalizes an\n");
-    s.push_str("# incoming program (zero RankLe) then hashes, matching these for ANY k.\n");
+    s.push_str("# Recognizer use: every kind (incl. top_k / top_k_top_p) matches by EXACT hash;\n");
+    s.push_str("# the driver reads k from the submit binding (no op-shape canonicalization).\n");
     s.push_str("# Regenerate: STDPROG_FIXTURE_REGEN=1 cargo test -p sampling-edsl --test fixture\n");
     s.push_str("kind,vocab,fnv1a64,hex\n");
     for &vocab in VOCABS {
         for (bytecode, kind) in standard_programs(vocab).unwrap() {
-            s.push_str(&row(kind, vocab, &bytecode));
-        }
-        for (bytecode, kind) in standard_programs_canonical(vocab).unwrap() {
             s.push_str(&row(kind, vocab, &bytecode));
         }
     }

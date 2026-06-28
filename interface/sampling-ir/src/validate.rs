@@ -405,7 +405,19 @@ fn infer(
                 return Err(shape_err());
             }
             match predicate {
-                Predicate::RankLe(_) => {}
+                Predicate::RankLe(k_id) => {
+                    let kt = g(k_id)?;
+                    // `k` is an integer count: a shared scalar, or — for a matrix
+                    // input — a per-row `[rows]` vector (one `k` per row).
+                    if !kt.dtype.is_int() {
+                        return Err(dtype_err());
+                    }
+                    let per_row_ok =
+                        t.shape.rank() == 2 && *kt.shape.dims() == [t.shape.rows()];
+                    if !kt.shape.is_scalar() && !per_row_ok {
+                        return Err(shape_err());
+                    }
+                }
                 Predicate::CummassLe(thr) | Predicate::ProbGe(thr) => {
                     let tt = g(thr)?;
                     if tt.dtype != DType::F32 {
@@ -653,6 +665,25 @@ mod tests {
         assert_eq!(validate(&mk(k)), Ok(()));
         // wrong-length [k+1] threshold → pivot shape mismatch
         assert_eq!(validate(&mk(k + 1)), Err(ValidationError::ShapeMismatch { op_index: 2 }));
+    }
+
+    #[test]
+    fn pivot_rank_le_k_is_a_value_id() {
+        // #25: RankLe `k` is a value-id — an integer scalar (or per-row [rows]
+        // vector), de-hardwired like top-p `p`.
+        let mk = |k_dtype: DType| SamplingProgram {
+            inputs: vec![logits(&[16]), islot(&[], k_dtype)],
+            ops: vec![
+                Op::Input(0),
+                Op::Input(1),
+                Op::PivotThreshold { input: 0, predicate: Predicate::RankLe(1) },
+            ],
+            outputs: vec![OutputDecl::new(0, OutputKind::Logits)],
+        };
+        // a U32 scalar `k` validates
+        assert_eq!(validate(&mk(DType::U32)), Ok(()));
+        // a float `k` is rejected — `k` is an integer count
+        assert_eq!(validate(&mk(DType::F32)), Err(ValidationError::DTypeMismatch { op_index: 2 }));
     }
 
     #[test]

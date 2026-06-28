@@ -14,7 +14,9 @@
 // HW-verified `extract(T=0.8, top_p=0.9)`):
 //   T (temperature)      = submit_inputs[ordinal 1]   (every RNG kind)
 //   filter (top_p/min_p) = submit_inputs[ordinal 2]
-//   k (TopK/TopKTopP)    = baked `RankLe(k)` immediate → foxtrot op-shape (PHASE-2)
+//   k (TopK/TopKTopP)    = submit_inputs[LAST ordinal] as U32 (#25: k is a host-
+//                          submit value-id like top_p/min_p, NOT a baked immediate;
+//                          TopK k @ 2nd ordinal, TopKTopP k @ 3rd ordinal)
 //   seed                 = AMBIENT (`pi.sample_seed`, per-row) — NOT a submit input;
 //                          the same seed the IR uses, so FlashInfer(philox, seed)
 //                          == pre-migration by routing-identity.
@@ -44,6 +46,16 @@ inline float read_submit_f32(const SubmitInput* si, float fallback) {
     return v;
 }
 
+// Read the u32 scalar carried by a submit input (host LE bytes); `fallback` if
+// the pointer is null / too short. The #25 top-k `k` is a U32 host-submit scalar.
+inline std::uint32_t read_submit_u32(const SubmitInput* si, std::uint32_t fallback) {
+    if (si == nullptr || si->data == nullptr || si->len_bytes < sizeof(std::uint32_t))
+        return fallback;
+    std::uint32_t v;
+    std::memcpy(&v, si->data, sizeof(std::uint32_t));
+    return v;
+}
+
 // Dedicated-kernel params for a recognized kind. Defaults = "unset" (temp 1,
 // top_p 1 = no nucleus, min_p 0 = no floor, top_k 0 = no rank cut) so a missing
 // input is inert.
@@ -51,16 +63,17 @@ struct DedicatedParams {
     float        temp  = 1.0f;
     float        top_p = 1.0f;
     float        min_p = 0.0f;
-    std::int32_t top_k = 0;  // k-bearing → from op-shape (RankLe), set by the caller
+    std::int32_t top_k = 0;  // #25: from the host-submit binding (last ordinal, U32)
 };
 
 // Extract dedicated-kernel params for `kind` by reading the host-submit scalars
 // in ASCENDING input-ordinal order — first ordinal = temperature (temp-scale
-// precedes softmax), second = filter (top_p/min_p). Reading by ORDER (not a
-// hardcoded ordinal 1/2) is immune to the logits-intrinsic offset (the two index
-// spaces — TensorKey vs ordinal — differ by exactly that, the #12 recurrence trap).
-// k (TopK/TopKTopP) is NOT a submit input — the caller sets `top_k` from the
-// op-shape RankLe immediate (`extract_rank_le_k`).
+// precedes softmax), second = filter (top_p/min_p) or k (TopK), third = k
+// (TopKTopP). Reading by ORDER (not a hardcoded ordinal 1/2/3) is immune to the
+// logits-intrinsic offset (the two index spaces — TensorKey vs ordinal — differ
+// by exactly that, the #12 recurrence trap).
+// #25: k (TopK/TopKTopP) is the LAST submit ordinal (U32), read like top_p/min_p
+// — no longer a baked op-shape immediate.
 inline DedicatedParams extract_dedicated_params(StandardSamplerKind kind,
                                                 std::span<const SubmitInput> ins) {
     DedicatedParams p;
@@ -70,28 +83,38 @@ inline DedicatedParams extract_dedicated_params(StandardSamplerKind kind,
         p.temp = 0.0f;
         return p;
     }
-    // Find the two lowest-ordinal submit scalars (temperature first, filter next).
-    const SubmitInput* first_ord = nullptr;   // lowest ordinal  → temperature
-    const SubmitInput* second_ord = nullptr;  // next ordinal    → filter
+    // Find the lowest-ordinal submit scalars in ascending key order:
+    //   ord[0] = temperature; ord[1] = filter (top_p/min_p) OR k (TopK);
+    //   ord[2] = k (TopKTopP, after top_p).
+    const SubmitInput* ord[3] = {nullptr, nullptr, nullptr};
     for (const SubmitInput& si : ins) {
-        if (si.data == nullptr || si.len_bytes < sizeof(float)) continue;
-        if (first_ord == nullptr || si.key < first_ord->key) {
-            second_ord = first_ord;
-            first_ord = &si;
-        } else if (second_ord == nullptr || si.key < second_ord->key) {
-            second_ord = &si;
+        if (si.data == nullptr || si.len_bytes < sizeof(std::uint32_t)) continue;
+        if (ord[0] == nullptr || si.key < ord[0]->key) {
+            ord[2] = ord[1]; ord[1] = ord[0]; ord[0] = &si;
+        } else if (ord[1] == nullptr || si.key < ord[1]->key) {
+            ord[2] = ord[1]; ord[1] = &si;
+        } else if (ord[2] == nullptr || si.key < ord[2]->key) {
+            ord[2] = &si;
         }
     }
-    p.temp = read_submit_f32(first_ord, 1.0f);  // temperature = first ordinal
+    p.temp = read_submit_f32(ord[0], 1.0f);  // temperature = first ordinal
     switch (kind) {
         case StandardSamplerKind::TopP:
-        case StandardSamplerKind::TopKTopP:
-            p.top_p = read_submit_f32(second_ord, 1.0f);  // filter = second ordinal
+            p.top_p = read_submit_f32(ord[1], 1.0f);  // filter @ 2nd ordinal
             break;
         case StandardSamplerKind::MinP:
-            p.min_p = read_submit_f32(second_ord, 0.0f);  // filter = second ordinal
+            p.min_p = read_submit_f32(ord[1], 0.0f);  // filter @ 2nd ordinal
             break;
-        default:  // Temperature (T only); TopK (T only; k from op-shape, top_p unset)
+        case StandardSamplerKind::TopK:
+            // #25: k @ 2nd ordinal (binding [Logits, T, k]); U32.
+            p.top_k = static_cast<std::int32_t>(read_submit_u32(ord[1], 0u));
+            break;
+        case StandardSamplerKind::TopKTopP:
+            p.top_p = read_submit_f32(ord[1], 1.0f);  // top_p @ 2nd ordinal
+            // #25: k @ 3rd ordinal (binding [Logits, T, top_p, k]); U32.
+            p.top_k = static_cast<std::int32_t>(read_submit_u32(ord[2], 0u));
+            break;
+        default:  // Temperature (T only)
             break;
     }
     return p;

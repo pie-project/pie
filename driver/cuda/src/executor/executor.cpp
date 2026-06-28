@@ -2757,37 +2757,27 @@ void handle_fire_batch(
             // Built once per vocab (fixed per model); per-fire = O(table) hash compare.
             static thread_local std::uint32_t recog_vocab = 0;
             static thread_local std::vector<sampling_ir::StandardKindEntry> recog_table;
-            static thread_local std::vector<sampling_ir::StandardKindEntry> canon_table;
             if (recog_table.empty() || recog_vocab != vocab) {
                 recog_table = sampling_ir::build_standard_kind_table(vocab);
-                canon_table = sampling_ir::build_canonical_kind_table(vocab);
                 recog_vocab = vocab;
             }
             const std::uint32_t blo = view.sampling_program_bytes_indptr.data()[0];
             const std::uint32_t bhi = view.sampling_program_bytes_indptr.data()[1];
             const std::uint8_t* const prog_bc = view.sampling_program_bytes.data() + blo;
             const std::size_t prog_len = static_cast<std::size_t>(bhi - blo);
-            // Exact hash (k-invariant kinds) first; on a miss, the op-shape
-            // (canonicalize RankLe→0)-then-hash for the k-bearing kinds (#12 phase-2).
+            // #25: ALL six standard kinds are k-invariant (top-k `k` rides a host-
+            // submit value-id) → recognized by EXACT hash, no op-shape canonicalize.
             auto kind_opt = sampling_ir::recognize_standard_kind(recog_table, prog_bc, prog_len);
-            if (!kind_opt)
-                kind_opt = sampling_ir::recognize_canonical_kind(canon_table, prog_bc, prog_len);
             if (ir_trace && !kind_opt) {
                 const std::uint64_t wh = sampling_ir::jit::fnv1a64(prog_bc, prog_len);
-                const std::vector<std::uint8_t> canon =
-                    sampling_ir::canonicalize_op_shape(prog_bc, prog_len);
-                const std::uint64_t ch =
-                    sampling_ir::jit::fnv1a64(canon.data(), canon.size());
                 std::cerr << "[ir-trace] recognize MISS wire_len=" << prog_len
-                          << " wire_hash=" << std::hex << wh
-                          << " canon_hash=" << ch << std::dec
-                          << " exact=" << recog_table.size()
-                          << " canon=" << canon_table.size() << "\n";
+                          << " wire_hash=" << std::hex << wh << std::dec
+                          << " exact=" << recog_table.size() << "\n";
             }
             if (kind_opt) {
                 // Program 0's host-submit inputs (the WS1a slice) carry T + the
-                // filter (top_p/min_p) by input ordinal; extract them. The k-bearing
-                // top-k cutoff is NOT a submit input — it lives baked in the op-shape.
+                // filter (top_p/min_p) + k (TopK/TopKTopP) by input ordinal; extract
+                // them. #25: k is the LAST submit ordinal (U32), read like top_p/min_p.
                 std::vector<sampling_ir::SubmitInput> rec_submit;
                 if (view.sampling_input_indptr.size() >= 2) {
                     const std::uint32_t ilo = view.sampling_input_indptr.data()[0];
@@ -2803,11 +2793,6 @@ void handle_fire_batch(
                 }
                 rec_params =
                     sampling_ir::extract_dedicated_params(*kind_opt, rec_submit);
-                // #12 phase-2: the baked top-k cutoff comes from the op-shape
-                // (the RankLe immediate), not a submit input. nullopt for the
-                // k-invariant kinds (no RankLe) → top_k stays unset.
-                if (auto kcut = sampling_ir::extract_rank_le_k(prog_bc, prog_len))
-                    rec_params.top_k = static_cast<std::int32_t>(*kcut);
                 program_recognized = true;
                 if (ir_trace) {
                     std::cerr << "[ir-trace] program recognized kind="

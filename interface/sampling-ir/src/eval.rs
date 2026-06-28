@@ -454,14 +454,22 @@ fn pivot_threshold(
         }
         Ok(if v.len() == rows { v[r] } else { v[0] })
     };
+    let row_int = |id: ValueId, r: usize| -> Result<i64, EvalError> {
+        let v = get(vals, id)?.int_lanes()?;
+        if v.is_empty() {
+            return Err(EvalError::Shape("pivot threshold k operand empty".into()));
+        }
+        Ok(if v.len() == rows { v[r] } else { v[0] })
+    };
     let mut keep = vec![false; x.len()];
     for r in 0..rows {
         let row = &x[r * len..(r + 1) * len];
         let k = &mut keep[r * len..(r + 1) * len];
         match predicate {
-            Predicate::RankLe(kk) => {
+            Predicate::RankLe(k_id) => {
+                let kk = row_int(k_id, r)?.clamp(0, len as i64) as usize;
                 let (_, order) = sort_desc(row);
-                for &i in order.iter().take((kk as usize).min(len)) {
+                for &i in order.iter().take(kk) {
                     k[i as usize] = true;
                 }
             }

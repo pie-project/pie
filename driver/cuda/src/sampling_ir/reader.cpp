@@ -280,8 +280,9 @@ void remap_op_v4(Op& op, const std::vector<std::uint32_t>& m) {
             break;
         case OpCode::PivotThreshold:
             op.a = r(op.a);
-            if (op.predicate.tag == PredTag::CummassLe || op.predicate.tag == PredTag::ProbGe)
-                op.predicate.payload = r(op.predicate.payload);
+            // #25: ALL three predicates carry a value-id payload (RankLe `k` /
+            // CummassLe `p` / ProbGe `thr`) — remap it through the v4→mine map.
+            op.predicate.payload = r(op.predicate.payload);
             break;
         case OpCode::Rng:   // v4: no value-id operands (ambient seed + static stream)
             break;
@@ -462,60 +463,6 @@ bool read_slot(Cursor& c, std::uint32_t n_inputs, Slot& out, DecodeError* err) {
     return true;
 }
 
-// Structural v4 walk (no binding / no SSA remap) that locates every
-// `PivotThreshold` `RankLe(k)` predicate: records the byte offset of its u32
-// payload immediate (`offsets`) and/or its value (`values`). Returns false on a
-// non-v4 / malformed buffer. ONLY `RankLe` payloads are immediates — the
-// `CummassLe`/`ProbGe` predicates carry value-ids (left untouched), so this is
-// precise, not over-broad (matches `remap_op_v4`). Used by canonicalize_op_shape
-// (k-invariance) + extract_rank_le_k (the baked top-k cutoff).
-bool scan_rank_le(const std::uint8_t* data, std::size_t len,
-                  std::vector<std::size_t>* offsets,
-                  std::vector<std::uint32_t>* values) {
-    Cursor c{data, data + len};
-    if (!c.have(4) || std::memcmp(c.p, "PSIR", 4) != 0) return false;
-    c.p += 4;
-    std::uint16_t version = c.u16();
-    (void)c.u16();  // flags
-    if (!c.ok || version < 4) return false;  // op-shape canonicalization is v4-only
-    std::uint32_t n_inputs = c.u32();
-    std::uint32_t n_ops = c.u32();
-    (void)c.u32();  // n_outputs
-    if (!c.ok) return false;
-    // InputDecl[]: dtype:u8 | shape_v4 — advance past, no binding needed.
-    for (std::uint32_t i = 0; i < n_inputs; ++i) {
-        (void)c.u8();  // dtype
-        Shape sh;
-        if (!read_shape_v4(c, sh)) return false;
-    }
-    // ops[]: classify Input(0x80)/Const(0x81)/compute, capturing RankLe payloads.
-    for (std::uint32_t i = 0; i < n_ops; ++i) {
-        std::uint8_t tag = c.u8();
-        if (!c.ok) return false;
-        if (tag == 0x80) { (void)c.u32(); continue; }                    // Input(idx)
-        if (tag == 0x81) { Literal lit; if (!read_literal(c, lit)) return false; continue; }  // Const
-        OpCode code;
-        if (!is_known_opcode(tag, code)) return false;
-        if (code == OpCode::PivotThreshold) {
-            (void)c.u32();  // a (input value-id)
-            std::uint8_t ptag = c.u8();
-            if (!c.ok || ptag > 2) return false;
-            const std::size_t payload_off = static_cast<std::size_t>(c.p - data);
-            std::uint32_t payload = c.u32();
-            if (!c.ok) return false;
-            if (ptag == static_cast<std::uint8_t>(PredTag::RankLe)) {
-                if (offsets) offsets->push_back(payload_off);
-                if (values) values->push_back(payload);
-            }
-        } else {
-            Op op;
-            DecodeError ignore;
-            if (!read_op_operands_v4(c, code, op, &ignore)) return false;
-        }
-    }
-    return c.ok;
-}
-
 }  // namespace
 
 bool decode(const std::uint8_t* data, std::size_t len, Program& out, DecodeError* err) {
@@ -568,27 +515,6 @@ bool decode_v4(const std::uint8_t* data, std::size_t len,
                const std::vector<Binding>& slot_bindings, Program& out, DecodeError* err) {
     if (err) { err->code = DecodeError::None; err->detail.clear(); }
     return read_program_v4(data, len, slot_bindings, out, err);
-}
-
-std::vector<std::uint8_t> canonicalize_op_shape(const std::uint8_t* data, std::size_t len) {
-    std::vector<std::uint8_t> out(data, data + len);
-    std::vector<std::size_t> offsets;
-    // Non-v4 / malformed → return the unchanged copy (it won't match the canonical
-    // table, so it falls through to CustomJIT — correct for a genuine custom).
-    if (!scan_rank_le(data, len, &offsets, nullptr)) return out;
-    for (std::size_t off : offsets) {
-        if (off + 4 <= out.size()) {
-            out[off] = out[off + 1] = out[off + 2] = out[off + 3] = 0;  // RankLe(k) → RankLe(0)
-        }
-    }
-    return out;
-}
-
-std::optional<std::uint32_t> extract_rank_le_k(const std::uint8_t* data, std::size_t len) {
-    std::vector<std::uint32_t> values;
-    if (!scan_rank_le(data, len, nullptr, &values) || values.empty()) return std::nullopt;
-    // TopK / TopKTopP bake exactly one RankLe (the group-uniform top-k cutoff).
-    return values.front();
 }
 
 }  // namespace pie_cuda_driver::sampling_ir

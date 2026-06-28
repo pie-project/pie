@@ -51,7 +51,7 @@ interface tensor {
     record output { id: value-id, kind: output-kind }
 
     variant literal { %f32(f32), %i32(s32), %u32(u32), %bool(bool) }
-    variant predicate { rank-le(u32), cummass-le(value-id), prob-ge(value-id) }
+    variant predicate { rank-le(value-id), cummass-le(value-id), prob-ge(value-id) }
     variant rng-kind { uniform, gumbel }
 
     variant op-kind {

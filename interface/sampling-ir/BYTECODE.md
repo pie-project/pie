@@ -124,8 +124,10 @@ two consecutive ids, value-first (`r` = sorted F32 `[n]`, `r+1` = indices U32
 | `0x62`/`0x63`| `ScatterAdd/Set` | `base:u32, idx:u32, vals:u32`   | 1 | `[base.len]`, dtype=base |
 | `0x70`| `Rng`          | `stream:u32, shape:Shape, kind:u8`    | 1 | `{shape, F32}` |
 
-`Predicate` (5 bytes): `tag:u8 | payload:u32` — RankLe `payload`=`k` immediate;
-CummassLe/ProbGe `payload`= a Scalar-F32 value id. "drop-last" = last axis removed.
+`Predicate` (5 bytes): `tag:u8 | payload:u32` — `payload` is a **value id** for all
+three: RankLe = a Scalar/`[rows]`-`U32` `k`; CummassLe/ProbGe = a Scalar/`[rows]`-F32
+threshold. (#25: `k` is host-submit like top-p `p`, so top-k bytecode is k-invariant.)
+"drop-last" = last axis removed.
 
 ---
 
@@ -135,8 +137,8 @@ CummassLe/ProbGe `payload`= a Scalar-F32 value id. "drop-last" = last axis remov
   `GatherRow` FILL-0 an out-of-range index.
 - **`CummassLe(p)`** = inclusive nucleus (keep token iff exclusive prefix mass
   `< p`); **`ProbGe`** inclusive `>=`; **`RankLe(k)`** ties → lower index. For a
-  matrix input the threshold operand may be a shared **scalar** *or* a per-row
-  **`[rows]`** vector (one threshold per row — batched top-p/min-p).
+  matrix input the `k`/threshold operand may be a shared **scalar** *or* a per-row
+  **`[rows]`** vector (one `k`/threshold per row — batched top-k/top-p/min-p).
 - **RNG (ambient seed + static stream):** no seed operand; the per-fire seed `S`
   is the runtime's per-row `sample_seed`, folded by codegen. `stream` decorrelates
   multiple `Rng` ops. `splitmix64(x): x^=x>>27; x*=0x3C79AC492BA7B653; x^=x>>33;
