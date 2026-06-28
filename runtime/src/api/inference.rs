@@ -1829,6 +1829,11 @@ async fn execute_impl(
             &mut req,
             &programs_output_kinds,
             &programs_output_elem_counts,
+            // #36: an attached IR program marshals to the rich `per_req`, so its
+            // pinned dst is never eager-D2H-filled → must take the rich path.
+            // Conservative: ALL attached programs (`has_programs`) → rich; the
+            // recognized-STANDARD fast-path restoration is the #37 perf follow-on.
+            has_programs,
         );
 
         // Single-model: the SERVICE routes to the bound model; no model_id arg.
