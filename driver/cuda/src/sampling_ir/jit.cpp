@@ -6,6 +6,7 @@
 #include <nvrtc.h>
 
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <sstream>
 #include <stdexcept>
@@ -78,6 +79,18 @@ std::string compile_to_ptx(const std::string& name, const std::string& source,
     return ptx;
 }
 
+// #11 NVRTC PTX-gen pool width. NVRTC serializes internally (~1.9x at N=2 on
+// CUDA 13.3, degrades past that), so the default is small — the pool hides
+// compile latency behind in-flight steps, it is not a throughput pool. Override
+// via `PIE_JIT_POOL_THREADS` for the load-test's pool-width sweep.
+unsigned jit_pool_threads() {
+    if (const char* env = std::getenv("PIE_JIT_POOL_THREADS")) {
+        const int n = std::atoi(env);
+        if (n >= 1 && n <= 64) return static_cast<unsigned>(n);
+    }
+    return 2;
+}
+
 }  // namespace
 
 // fnv1a64 is now header-inline in program_hash.hpp (the canonical program hash).
@@ -106,7 +119,7 @@ CUdeviceptr CompiledProgram::device_ptr(BufferId id) const {
 
 // ─────────────────────────────── JitEngine ───────────────────────────────
 
-JitEngine::JitEngine() {
+JitEngine::JitEngine() : pool_(jit_pool_threads()) {
     CUdevice dev = 0;
     CU_CHECK(cuCtxGetDevice(&dev));
     int major = 0, minor = 0;
@@ -117,7 +130,11 @@ JitEngine::JitEngine() {
     arch_ = "compute_" + std::to_string(major) + std::to_string(minor);
 }
 
-void JitEngine::compile_dag(const KernelDAG& dag, CompiledProgram& prog) {
+// #11 finalize (CONTEXT-THREAD ONLY): allocate the buffer table + load each
+// pre-built PTX into a module + resolve its CUfunction + build launch params.
+// The NVRTC PTX-gen already ran off-thread (pool); `ptx[i]` is kernel `i`'s PTX.
+void JitEngine::finalize(const KernelDAG& dag, const std::vector<std::string>& ptx,
+                         CompiledProgram& prog) {
     prog.hash_ = dag.hash;
 
     // 1. Allocate the buffer table. Non-external buffers are owned by the JIT;
@@ -149,15 +166,16 @@ void JitEngine::compile_dag(const KernelDAG& dag, CompiledProgram& prog) {
         }
     }
 
-    // 2. Compile each kernel and resolve its entry, then build the launch
+    // 2. Load each pre-built PTX + resolve its entry, then build the launch
     //    param arrays. Buffer args point into the stable buffer table; scalar
-    //    args point into per-kernel scalar backing storage.
+    //    args point into per-kernel scalar backing storage. NO NVRTC here — the
+    //    PTX was produced off-thread; this is the context-thread module load.
     prog.modules_.reserve(dag.kernels.size());
     prog.items_.reserve(dag.kernels.size());
-    for (const KernelDef& k : dag.kernels) {
-        const std::string ptx = compile_to_ptx(k.name, k.source, arch_);
+    for (std::size_t ki = 0; ki < dag.kernels.size(); ++ki) {
+        const KernelDef& k = dag.kernels[ki];
         CUmodule mod = nullptr;
-        CU_CHECK(cuModuleLoadData(&mod, ptx.c_str()));
+        CU_CHECK(cuModuleLoadData(&mod, ptx[ki].c_str()));
         prog.modules_.push_back(mod);
         CUfunction fn = nullptr;
         CU_CHECK(cuModuleGetFunction(&fn, mod, k.name.c_str()));
@@ -202,14 +220,101 @@ void JitEngine::compile_dag(const KernelDAG& dag, CompiledProgram& prog) {
     }
 }
 
-CompiledProgram& JitEngine::get_or_compile(const KernelDAG& dag) {
-    auto it = cache_.find(dag.hash);
-    if (it != cache_.end()) return *it->second;
+std::shared_future<JitEngine::PtxResult>
+JitEngine::request_compile(std::uint64_t hash, const KernelDAG& dag) {
+    std::lock_guard<std::mutex> lk(mu_);
+    auto it = cache_.find(hash);
+    if (it != cache_.end()) return it->second.ptx_fut;  // dedup: one compile per hash
 
+    // Miss: create the Compiling entry + enqueue NVRTC PTX-gen on the pool. The
+    // closure owns a shared_ptr<KernelDAG> copy (one per distinct program — not
+    // per request) + the arch string by value; it touches NO CUDA context.
+    auto dag_sp = std::make_shared<KernelDAG>(dag);
+    auto promise = std::make_shared<std::promise<PtxResult>>();
+    std::shared_future<PtxResult> fut = promise->get_future().share();
+
+    CacheEntry e;
+    e.state = CompileState::Compiling;
+    e.ptx_fut = fut;
+    cache_.emplace(hash, std::move(e));
+
+    const std::string arch = arch_;  // immutable post-init; capture by value
+    pool_.submit([this, dag_sp, promise, arch]() {
+        PtxResult r;
+        try {
+            r.ptx.reserve(dag_sp->kernels.size());
+            for (const KernelDef& k : dag_sp->kernels)
+                r.ptx.push_back(compile_to_ptx(k.name, k.source, arch));
+            r.ok = true;
+        } catch (const std::exception& ex) {
+            r.ok = false;
+            r.error = ex.what();
+        }
+        // One pool task per DISTINCT program (request_compile dedups) → this
+        // counts actual NVRTC runs (the dedup metric), success or failure.
+        compiles_run_.fetch_add(1, std::memory_order_relaxed);
+        promise->set_value(std::move(r));
+    });
+    return fut;
+}
+
+void JitEngine::prefetch_compile(const KernelDAG& dag) {
+    // Fire-and-forget: kick PTX-gen off-thread (idempotent / dedup'd by hash).
+    // NO finalize here — the module load happens lazily at first fire on the
+    // context thread. Safe from any thread (touches no CUDA context).
+    (void)request_compile(dag.hash, dag);
+}
+
+CompiledProgram& JitEngine::get_or_compile(const KernelDAG& dag) {
+    // CONTEXT-THREAD ONLY: this is the sole finalizer (cuMemAlloc/cuModuleLoadData
+    // in finalize()). The defensive Ready re-check below is belt-and-suspenders —
+    // it does NOT make a true 2-context-thread call safe (double cuModuleLoadData);
+    // the contract is that exactly one thread (the context owner) calls this.
+    // Hot path: already finalized → O(1) cache hit. `*prog` is heap-stable (the
+    // unique_ptr pointee survives a map rehash), so the returned ref is valid
+    // after the lock is released.
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        auto it = cache_.find(dag.hash);
+        if (it != cache_.end() && it->second.state == CompileState::Ready)
+            return *it->second.prog;
+    }
+
+    // Ensure PTX-gen is in flight (dedup) and wait for it. Only the first
+    // consumer truly blocks; concurrent requesters share the future.
+    std::shared_future<PtxResult> fut = request_compile(dag.hash, dag);
+    const PtxResult& r = fut.get();
+
+    if (!r.ok) {
+        // Failed: record + throw (loud, like the prior synchronous path). The
+        // entry stays Failed so repeats fast-fail (no recompile), dedup'd.
+        std::lock_guard<std::mutex> lk(mu_);
+        CacheEntry& e = cache_[dag.hash];
+        e.state = CompileState::Failed;
+        e.error = r.error;
+        throw std::runtime_error("sampling_ir::JIT compile failed: " + r.error);
+    }
+
+    // Defensive: another path may have finalized while we held no lock (only the
+    // context thread finalizes, so this is belt-and-suspenders).
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        auto it = cache_.find(dag.hash);
+        if (it != cache_.end() && it->second.state == CompileState::Ready)
+            return *it->second.prog;
+    }
+
+    // Finalize on THIS (context) thread WITHOUT holding mu_ across the cu* calls
+    // (the cache map is free for concurrent prefetch/request meanwhile).
     auto prog = std::make_unique<CompiledProgram>();
-    compile_dag(dag, *prog);
+    finalize(dag, r.ptx, *prog);  // cuMemAlloc + cuModuleLoadData — mu_ NOT held
     CompiledProgram& ref = *prog;
-    cache_.emplace(dag.hash, std::move(prog));
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        CacheEntry& e = cache_[dag.hash];
+        e.prog = std::move(prog);
+        e.state = CompileState::Ready;
+    }
     return ref;
 }
 

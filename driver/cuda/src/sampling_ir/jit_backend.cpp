@@ -8,6 +8,7 @@
 
 #include "sampling_ir/codegen.hpp"
 #include "sampling_ir/ir.hpp"
+#include "sampling_ir/program_identity.hpp"
 #include "sampling_ir/reader.hpp"
 
 namespace pie_cuda_driver::sampling_ir {
@@ -91,24 +92,6 @@ std::vector<Binding> manifest_to_slot_bindings(const ProgramManifest& manifest) 
     return slots;
 }
 
-// Fold the binding manifest into the program cache key: v4 bytecode is
-// binding-free, so two programs that share bytecode but differ in their binding
-// manifest are distinct compiled programs and must not collide in the cache.
-std::uint64_t manifest_hash(const ProgramManifest& manifest) {
-    std::vector<std::uint8_t> buf;
-    buf.reserve(manifest.size() * 6);
-    for (const InputBind& b : manifest) {
-        buf.push_back(static_cast<std::uint8_t>(b.kind));
-        buf.push_back(static_cast<std::uint8_t>(b.ready));
-        const std::uint32_t k = b.host_key;
-        buf.push_back(static_cast<std::uint8_t>(k & 0xFFu));
-        buf.push_back(static_cast<std::uint8_t>((k >> 8) & 0xFFu));
-        buf.push_back(static_cast<std::uint8_t>((k >> 16) & 0xFFu));
-        buf.push_back(static_cast<std::uint8_t>((k >> 24) & 0xFFu));
-    }
-    return jit::fnv1a64(buf.data(), buf.size());
-}
-
 }  // namespace
 
 SamplingIrBackend::SamplingIrBackend(bool batched_lowering)
@@ -126,13 +109,17 @@ ProgramHandle SamplingIrBackend::get_or_compile(std::span<const std::uint8_t> by
         return kInvalidProgram;
     }
 
-    std::uint64_t hash = jit::fnv1a64(bytecode.data(), bytecode.size());
-    // v4 bytecode is binding-free: the manifest is part of the program identity,
-    // so fold it into the key (distinct bindings ⇒ distinct compiled program).
-    if (!manifest.empty()) hash ^= manifest_hash(manifest);
-    // Distinguish M=1 vs batched lowering in the cache key so a process that
-    // uses both (e.g. the bench) never returns the wrong DAG for the same bytes.
-    const std::uint64_t keyed = batched_lowering_ ? (hash ^ 0x9E3779B97F4A7C15ULL) : hash;
+    // #11 cost contract: the program IDENTITY (== this dedup key minus the
+    // batched bit) is the single shared key for #10 distinct-count + echo's
+    // M-batch grouping + #11 compile-dedup (see program_identity.hpp). v4
+    // bytecode is binding-free, so the manifest is folded in — distinct bindings
+    // ⇒ distinct compiled program.
+    const std::uint64_t identity = program_identity_hash(bytecode, manifest);
+    // The M=1-vs-batched lowering yields distinct PTX artifacts, so fold the
+    // process-constant batched bit on top for the COMPILE cache key (NOT the
+    // shared identity, which is pre-lowering — see program_identity.hpp banner).
+    const std::uint64_t keyed =
+        batched_lowering_ ? (identity ^ 0x9E3779B97F4A7C15ULL) : identity;
     const ProgramHandle handle = keyed ? keyed : 1;  // reserve 0 = kInvalidProgram
     if (programs_.find(handle) != programs_.end()) return handle;
 

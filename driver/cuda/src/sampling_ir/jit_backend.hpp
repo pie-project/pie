@@ -19,9 +19,12 @@
 // behind this facade. The executor registers an instance via
 // `SamplingIrRuntime::set_backend(&backend)` at engine init.
 //
-// Cache: keyed by `fnv1a64(bytecode)`. A program is decoded+lowered+compiled
-// once; later fires reuse the compiled DAG and only rebind per-fire device
-// pointers + launch-context scalars.
+// Cache: keyed by the program IDENTITY `fnv1a64(bytecode) ^ manifest_hash(manifest)`
+// (v4 bytecode is binding-free, so distinct bindings ⇒ distinct program), XOR a
+// process-constant bit for M=1-vs-M-batch lowering — i.e. `program_identity_hash`
+// (program_identity.hpp) plus the batched bit. A program is
+// decoded+lowered+compiled once; later fires reuse the compiled DAG and only
+// rebind per-fire device pointers + launch-context scalars.
 //
 // MVP scope (design §3.3): single slot, single position, M=1 decode.
 
