@@ -209,6 +209,14 @@ pub struct ForwardPass {
     /// `execute: func()` returns nothing, so a recoverable failure can't surface
     /// there). The async `output()`/`outputs()` reports it as the WIT `error`.
     exec_error: Option<String>,
+    /// `fresh-generate()` (#26): this pass is the FIRST forward of a new
+    /// `generate()` on its context. The run-ahead next-input carry
+    /// (`pending_next_input`) lives per-instance, so a prior generate's terminal
+    /// producer can leave a dangling carry; this flag tells `execute()` to drop
+    /// (and free) any dangling carry for THIS context before the carrier's
+    /// consumer-inject, so the new generate's prime never injects a stale token.
+    /// The guest's `Generator` sets it once per generate.
+    fresh_generate: bool,
 }
 
 /// Merged kv-working-set descriptor — see [`ForwardPass::kv_ws`].
@@ -425,6 +433,7 @@ impl pie::core::inference::HostForwardPass for InstanceState {
             programs: Vec::new(),
             pending: None,
             exec_error: None,
+            fresh_generate: false,
         };
         Ok(self.ctx().table.push(pass)?)
     }
@@ -486,6 +495,17 @@ impl pie::core::inference::HostForwardPass for InstanceState {
     ) -> Result<()> {
         let brle_masks: Vec<Brle> = mask.into_iter().map(Brle::from_vec).collect();
         self.ctx().table.get_mut(&this)?.next_attention_mask = brle_masks;
+        Ok(())
+    }
+
+    /// #26 `fresh-generate()`: mark this pass as the first forward of a new
+    /// `generate()` so `execute()` drops any dangling next-input carry left on
+    /// this context by a prior generate's terminal producer (the stop-terminal /
+    /// explicit-restart path; golf's loop omits the carry on the predictable
+    /// max-boundary terminal). No-arg flag; the context is the pass's
+    /// kv-working-set.
+    async fn fresh_generate(&mut self, this: Resource<ForwardPass>) -> Result<()> {
+        self.ctx().table.get_mut(&this)?.fresh_generate = true;
         Ok(())
     }
 
@@ -1075,6 +1095,7 @@ async fn execute_impl(
             mut req,
             attached_programs,
             next_input_positions,
+            fresh_generate,
         ) = {
             let pass = state.ctx().table.get_mut(&this)?;
             (
@@ -1086,6 +1107,7 @@ async fn execute_impl(
                 std::mem::replace(&mut pass.req, empty_forward_request()),
                 std::mem::take(&mut pass.programs),
                 std::mem::take(&mut pass.next_input_positions),
+                pass.fresh_generate,
             )
         };
         // v1: single-driver. Multi-driver binds the working set's device on
@@ -1490,6 +1512,20 @@ async fn execute_impl(
         // passes so a terminal producer's dangling carry can't leak into the next
         // context (0 = no-KV pass ⇒ never a carrier consumer/producer).
         let next_input_context_id = kv_ws.as_ref().map(|d| d.set.rep()).unwrap_or(0);
+        // #26 fresh-generate: BEFORE the carrier's consumer-inject, drop any
+        // dangling carry left on THIS context by a prior generate's terminal
+        // producer (stop-terminal / explicit-restart). Free the stale retained
+        // device buffer on this prime's request so it doesn't leak; the prime
+        // then does NOT inject the stale token. A different context's pending is
+        // left untouched for `apply_next_input_carrier`'s own mismatch branch.
+        if fresh_generate {
+            if let Some(link) = crate::api::next_input_map::clear_pending_for_context(
+                &mut state.pending_next_input,
+                next_input_context_id,
+            ) {
+                req.push_next_input_free_link(link);
+            }
+        }
         crate::api::next_input_map::apply_next_input_carrier(
             &mut state.pending_next_input,
             &mut state.next_input_link_counter,

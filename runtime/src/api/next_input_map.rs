@@ -94,6 +94,35 @@ pub fn apply_next_input_carrier(
     }
 }
 
+/// Drop this context's dangling carrier pending at a fresh-`generate()` boundary
+/// (#26, `forward-pass.fresh-generate`).
+///
+/// When a generator starts a fresh `generate()` on a context that previously
+/// *stop*-terminated with an un-consumed carry, the terminal producer left a
+/// dangling `pending` whose intended same-context consumer never fired. The new
+/// generate's first pass must drop it so it isn't injected into the new prefill.
+/// (The count-predictable *max*-boundary terminal is handled loop-side by not
+/// emitting `next-inputs`; *cross-context* dangling is handled by
+/// [`apply_next_input_carrier`]'s mismatch branch — this closes the remaining
+/// *same-context* `generate()`-restart path.)
+///
+/// Clears only a pending that belongs to THIS `context_id` (a different context's
+/// pending is left for the cross-context drop). Returns the dropped producer's
+/// link, if any, so the caller frees its retained device buffer via
+/// `req.push_next_input_free_link(link)` (no leak) on the fresh pass — call this
+/// BEFORE [`apply_next_input_carrier`] so the fresh pass neither injects nor
+/// re-frees the stale carry.
+pub fn clear_pending_for_context(
+    pending: &mut Option<PendingNextInput>,
+    context_id: u32,
+) -> Option<u32> {
+    if pending.as_ref().is_some_and(|p| p.context_id == context_id) {
+        pending.take().map(|p| p.link)
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -181,5 +210,39 @@ mod tests {
         assert!(req.next_input_producer_links.is_empty());
         assert_eq!(pending, None);
         assert_eq!(counter, 0);
+    }
+
+    /// `fresh-generate` (#26) clears THIS context's dangling carry and returns its
+    /// link to free; a different context's pending is left for the cross-context
+    /// drop; no pending ⇒ nothing to free.
+    #[test]
+    fn clear_pending_for_context_drops_same_context_only() {
+        // Same-context dangling carry → cleared, link returned for the free.
+        let mut pending = Some(PendingNextInput {
+            link: 3,
+            positions: vec![0],
+            n_rows: 1,
+            context_id: 42,
+        });
+        assert_eq!(clear_pending_for_context(&mut pending, 42), Some(3));
+        assert_eq!(pending, None);
+
+        // Different-context pending → untouched (apply_next_input_carrier's
+        // mismatch branch handles it), nothing returned.
+        let mut pending = Some(PendingNextInput {
+            link: 5,
+            positions: vec![0],
+            n_rows: 1,
+            context_id: 10,
+        });
+        assert_eq!(clear_pending_for_context(&mut pending, 99), None);
+        assert_eq!(
+            pending,
+            Some(PendingNextInput { link: 5, positions: vec![0], n_rows: 1, context_id: 10 })
+        );
+
+        // No pending → None.
+        let mut pending: Option<PendingNextInput> = None;
+        assert_eq!(clear_pending_for_context(&mut pending, 1), None);
     }
 }

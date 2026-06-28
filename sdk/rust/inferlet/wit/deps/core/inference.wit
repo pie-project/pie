@@ -135,6 +135,17 @@ interface inference {
         /// forward, supplied ahead of this pass's sampled token.
         next-attention-mask: func(mask: list<brle>);
 
+        /// Run-ahead generate-start signal (#26). Marks this pass as the FIRST
+        /// forward of a fresh `generate()` on its context. Before this pass's
+        /// carrier inject, the host drops any carrier still PENDING on this
+        /// context from a prior generate — the stop-terminal residual the loop's
+        /// count-predictable max-boundary omit cannot foresee (a stop is known
+        /// only post-sample, after `next-inputs` was already emitted) — and frees
+        /// its retained device buffer. Fires at most once per generate; the host
+        /// derives the context from this pass's `kv-working-set`. Flag only — the
+        /// carrier destinations declared on this pass are unaffected.
+        fresh-generate: func();
+
         /// Eager submit (synchronous): enqueue this pass's forward work. Await
         /// the result via `output()` / `outputs()`.
         execute: func();

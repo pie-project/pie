@@ -78,6 +78,11 @@ pub struct Generator<'ctx> {
     tokens_generated: usize,
     rebid_each_step: bool,
     done: bool,
+    /// True until the FIRST forward pass of this generate has emitted the
+    /// run-ahead generate-start signal (`fresh-generate`, #26). Set once on the
+    /// prime/first pass so the host drops any carrier left pending on this
+    /// context by a prior generate (the stop-terminal residual).
+    fresh_generate: bool,
 }
 
 impl<'ctx> Generator<'ctx> {
@@ -100,6 +105,7 @@ impl<'ctx> Generator<'ctx> {
             tokens_generated: 0,
             rebid_each_step: true,
             done: false,
+            fresh_generate: true,
         }
     }
 
@@ -386,12 +392,15 @@ impl<'ctx> Generator<'ctx> {
         self.ensure_program()?;
 
         // Prime producer: the pending prompt tail. It carries its sampled token
-        // into the first consumer via `next-inputs`.
+        // into the first consumer via `next-inputs` — unless it is itself the
+        // terminal pass (max-tokens == 1, no stop), in which case no carry is
+        // declared (R9 / no dangling carrier link).
         let pending = core::mem::take(&mut self.ctx.buffer);
         if pending.is_empty() {
             return Ok(Vec::new());
         }
-        let mut producer = self.submit_producer(&pending)?;
+        let prime_carry = pass_carries(self.stop.is_empty(), self.max_tokens, 1);
+        let mut producer = self.submit_producer(&pending, prime_carry)?;
 
         let mut all = Vec::new();
         loop {
@@ -404,7 +413,12 @@ impl<'ctx> Generator<'ctx> {
                     .max_tokens
                     .is_none_or(|m| self.tokens_generated + 1 < m);
             let consumer = if speculate {
-                Some(self.submit_consumer()?)
+                // The speculated consumer produces token #(tokens_generated + 2);
+                // it carries only if a further successor will run (its token is not
+                // the max-tokens boundary), else no dangling carrier link.
+                let carry =
+                    pass_carries(self.stop.is_empty(), self.max_tokens, self.tokens_generated + 2);
+                Some(self.submit_consumer(carry)?)
             } else {
                 None
             };
@@ -433,8 +447,11 @@ impl<'ctx> Generator<'ctx> {
                         break;
                     }
                     // Stop configured but not hit → decode the next step
-                    // sequentially (no overlap this step).
-                    let mut c = self.submit_consumer()?;
+                    // sequentially (no overlap this step). The stop-terminal pass
+                    // isn't predictable here (only known post-sample), so it carries;
+                    // a dangling carry on the eventual stop step is closed by the
+                    // host clear-on-generate (#26).
+                    let mut c = self.submit_consumer(true)?;
                     c.history_tokens = vec![token];
                     producer = c;
                 }
@@ -484,13 +501,29 @@ impl<'ctx> Generator<'ctx> {
 
     // ── Run-ahead carryover helpers (Seam A §2.1) ──────────────────────
 
+    /// Emit the run-ahead generate-start signal (`fresh-generate`, #26) on the
+    /// FIRST forward pass of this generate. Before that pass's carrier inject,
+    /// the host drops any carrier still pending on this context from a prior
+    /// generate — the stop-terminal residual the loop's count-predictable
+    /// max-boundary omit cannot foresee — and frees its retained device buffer.
+    /// Fires at most once per `Generator`, on whichever submit path runs first.
+    fn mark_fresh_generate(&mut self, pass: &ForwardPass) {
+        if self.fresh_generate {
+            pass.fresh_generate();
+            self.fresh_generate = false;
+        }
+    }
+
     /// Eager-submit the prime **producer** pass over `pending` (the prompt tail).
     /// Declares the carrier destination (`next-inputs`) at the next slot, advances
     /// the cursor on submit, and returns the in-flight handle; the sampled token
     /// is read later by [`await_commit`](Self::await_commit).
-    fn submit_producer(&mut self, pending: &[u32]) -> Result<InflightPass> {
+    fn submit_producer(&mut self, pending: &[u32], carry: bool) -> Result<InflightPass> {
         let n = pending.len() as u32;
         let pass = ForwardPass::new();
+        // First pass of this generate: clear any carrier left pending on this
+        // context by a prior generate (#26) before this pass's carrier inject.
+        self.mark_fresh_generate(&pass);
         let w = self.ctx.prepare_write(n)?;
         self.ctx.attach_kv(&pass, &w);
         if let Some(a) = self.adapter {
@@ -503,14 +536,16 @@ impl<'ctx> Generator<'ctx> {
         pass.input_tokens(pending, &positions);
         let decode_pos = self.ctx.seq_len + n - 1;
         self.attach_pipelined_sampler(&pass, decode_pos)?;
-        // Carry this pass's sample into the next (consumer) pass's input ROW slot.
-        // The consumer is a single-token decode (`input_tokens([0], [pos])`), so its
-        // carried token lands at dense `pi.tokens` row 0 — the carrier dest is the
-        // ROW index into the consumer forward, NOT the sequence position (the driver
-        // INJECT does `pi.tokens[dest] = retained[src_row]` over the dense per-row
-        // input buffer). Batched multi-seq run-ahead → per-sequence rows [0..B);
-        // single-sequence one-ahead → row [0].
-        pass.next_inputs(&[0]);
+        // Carry this pass's sample into the next (consumer) pass's input ROW slot —
+        // but ONLY when a successor consumer will run. The dest is the ROW index
+        // into the consumer forward, NOT the sequence position (the driver INJECT
+        // does `pi.tokens[dest] = retained[src_row]` over the dense per-row input
+        // buffer): single-token decode consumer → row 0; batched multi-seq → rows
+        // [0..B). On the TERMINAL pass (`carry == false`) no carrier link is
+        // declared, so nothing is left dangling for a later same-context generate.
+        if carry {
+            pass.next_inputs(&[0]);
+        }
         pass.execute();
         // Advance the cursor on SUBMIT so an overlapped consumer reserves the
         // following slot while this pass is still in flight.
@@ -526,7 +561,7 @@ impl<'ctx> Generator<'ctx> {
     /// the carrier destination for the next step, and advance the cursor.
     /// Returns the in-flight handle; the carried token (== the producer's sample)
     /// is recorded into `history_tokens` by the loop once the producer is read.
-    fn submit_consumer(&mut self) -> Result<InflightPass> {
+    fn submit_consumer(&mut self, carry: bool) -> Result<InflightPass> {
         let pass = ForwardPass::new();
         let w = self.ctx.prepare_write(1)?;
         self.ctx.attach_kv(&pass, &w);
@@ -539,9 +574,12 @@ impl<'ctx> Generator<'ctx> {
         let pos = self.ctx.seq_len;
         pass.input_tokens(&[0u32], &[pos]);
         self.attach_pipelined_sampler(&pass, pos)?;
-        // Dest = the next consumer's input ROW slot (row 0 of its single-token
-        // decode), not the sequence position. See `submit_producer`.
-        pass.next_inputs(&[0]);
+        // Carry to the next consumer's input ROW slot (row 0), only when a successor
+        // will run (see `submit_producer`); omitted on the terminal pass so no
+        // dangling carrier link is left.
+        if carry {
+            pass.next_inputs(&[0]);
+        }
         pass.execute();
         self.ctx.seq_len += 1;
         Ok(InflightPass {
@@ -605,6 +643,47 @@ struct InflightPass {
     history_tokens: Vec<u32>,
 }
 
+/// Whether a run-ahead pass that produces the `produced_token_index`-th token
+/// (1-based) should declare a `next-inputs` carry — i.e. whether a successor
+/// consumer will run. A pass declines to carry ONLY when it is the TERMINAL pass:
+/// the max-tokens boundary with no stop configured (count-predictable at submit).
+/// A stop-terminated decode can't be predicted at submit (the stop token is only
+/// known post-sample, after `next-inputs` would already be emitted), so it carries
+/// and any dangling carry is closed by the host clear-on-generate (#26).
+fn pass_carries(stop_empty: bool, max_tokens: Option<usize>, produced_token_index: usize) -> bool {
+    !(stop_empty && max_tokens == Some(produced_token_index))
+}
+
+#[cfg(test)]
+mod runahead_carry_tests {
+    use super::pass_carries;
+
+    #[test]
+    fn terminal_max_boundary_pass_does_not_carry() {
+        // max=3, no stop: tokens #1,#2 carry; #3 (the boundary) does not.
+        assert!(pass_carries(true, Some(3), 1));
+        assert!(pass_carries(true, Some(3), 2));
+        assert!(!pass_carries(true, Some(3), 3));
+        // max=1: the prime (token #1) is itself terminal → no carry.
+        assert!(!pass_carries(true, Some(1), 1));
+    }
+
+    #[test]
+    fn unbounded_always_carries() {
+        assert!(pass_carries(true, None, 1));
+        assert!(pass_carries(true, None, 10_000));
+    }
+
+    #[test]
+    fn stop_configured_always_carries() {
+        // Stop-terminal isn't predictable at submit → carry; host clear-on-generate
+        // (#26) drops any dangling carry on the eventual stop step.
+        assert!(pass_carries(false, Some(3), 3));
+        assert!(pass_carries(false, Some(1), 1));
+        assert!(pass_carries(false, None, 5));
+    }
+}
+
 impl Drop for Generator<'_> {
     fn drop(&mut self) {
         self.release_empty_working_pages();
@@ -656,6 +735,9 @@ impl<'g, 'ctx> GenStep<'g, 'ctx> {
         // Build the forward pass over P3's working-set KV model: the pending
         // fill writes fresh tail slots; prior pages are the read context.
         let pass = ForwardPass::new();
+        // First pass of this generate: clear any carrier left pending on this
+        // context by a prior generate (#26) before this pass's carrier inject.
+        parent.mark_fresh_generate(&pass);
         let w = parent.ctx.prepare_write(n_pending)?;
         parent.ctx.attach_kv(&pass, &w);
         if let Some(a) = parent.adapter {
