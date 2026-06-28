@@ -141,7 +141,11 @@ fn literal_from_wit(l: wit::Literal) -> Literal {
 
 fn predicate_from_wit(p: wit::Predicate) -> Predicate {
     match p {
-        wit::Predicate::RankLe(k) => Predicate::RankLe(k),
+        // #25: all three predicate thresholds are now host-submit input value-ids
+        // (SSA refs resolved per-row downstream in `program_from_parts`), so top-k's
+        // `k` is de-hardwired exactly like top-p's `p` / min-p's `thr` — no baked
+        // immediate. The decode is a uniform value-id pass-through for all three.
+        wit::Predicate::RankLe(v) => Predicate::RankLe(v),
         wit::Predicate::CummassLe(v) => Predicate::CummassLe(v),
         wit::Predicate::ProbGe(v) => Predicate::ProbGe(v),
     }
