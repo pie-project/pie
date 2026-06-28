@@ -25,7 +25,7 @@
 //!   cargo test -p sampling-edsl --test mirostat_tune -- --ignored --nocapture
 
 use pie_sampling_ir::eval::{InputBindings, Value as EvalValue, eval};
-use pie_sampling_ir::{Binding, SamplingProgram, decode};
+use pie_sampling_ir::{Binding, SamplingProgram, decode, program_hash};
 use sampling_edsl::builder::Built;
 use sampling_edsl::program::{MirostatKeys, mirostat, mirostat_floor};
 
@@ -314,6 +314,49 @@ fn mirostat_floor_eliminates_collapse() {
         assert_eq!(floor.collapse_rate, 0.0, "floor must eliminate collapse");
     }
     eprintln!("\n>>> floor guarantees kept-set ≥ {k_min} regardless of μ/init → can't enter the greedy basin.");
+}
+
+/// #19-regression aid (the established sweep is a false-green on token-0/S=0): the
+/// canonical mirostat op inventory + a host-eval golden (token, S) + the per-op
+/// reference (surprise[], keep-mask) for a fixed (logits, μ). The CPU interpreter
+/// is the oracle; the GPU custom-IR path must reproduce these. mirostat uses NO
+/// `PivotThreshold`/`Predicate` (truncation is `Broadcast`+`Ge`, S is
+/// `Broadcast`+`Gather`+`ReduceSum`) → #25 is ruled out; a diverging op localizes
+/// the codegen bug. NB: `Broadcast` feeds BOTH the keep-mask (μ→[vocab]) and the
+/// S-gather (token→[1]) — a single broken `Broadcast` codegen explains BOTH
+/// token-0 (empty keep) AND S=0 (bad gather).
+#[test]
+#[ignore = "diagnostic; run with --ignored --nocapture"]
+fn mirostat_op_inventory_and_host_golden() {
+    let logits = vec![0.5f32, 3.0, -1.0, 2.0, 0.0, 4.0, 1.5, -2.0];
+    let (b, keys) = mirostat(logits.len() as u32).unwrap();
+    let bytecode = b.lower().bytecode;
+    let p = prog(&b);
+    eprintln!("\n=== mirostat IR inventory (vocab=8) ===");
+    eprintln!("program_hash = {:016x}  ops = {}  outputs = {:?}", program_hash(&bytecode), p.ops.len(), b.outputs);
+    for (i, op) in p.ops.iter().enumerate() {
+        eprintln!("  [{i:2}] {op:?}");
+    }
+
+    // Per-op reference (host): surprise = -ln softmax, keep = (surprise ≤ μ).
+    let probs = softmax(&logits);
+    let surprise: Vec<f32> = probs.iter().map(|&q| -q.ln()).collect();
+    eprintln!("\nreference surprise[] = {:?}", surprise.iter().map(|x| (x * 1e3).round() / 1e3).collect::<Vec<_>>());
+    for &mu in &[100.0f32, 1.0, 0.5] {
+        let keep: Vec<usize> = (0..8).filter(|&i| surprise[i] <= mu).collect();
+        eprintln!("  μ={mu:5.1}: keep-set (surprise≤μ) = {keep:?}  (|keep|={})", keep.len());
+    }
+
+    eprintln!("\nhost golden — GPU must reproduce (NOT token-0/S=0):");
+    for &mu in &[100.0f32, 1.0] {
+        for &seed in &[12345u32, 7, 99] {
+            let inputs = bind(&b, &logits, mu, &keys);
+            let out = eval(&p, &InputBindings::new(&inputs, seed)).unwrap();
+            let token = match &out[0] { EvalValue::I32(x) => x[0], o => panic!("{o:?}") };
+            let s = match &out[1] { EvalValue::F32(x) => x[0], o => panic!("{o:?}") };
+            eprintln!("  μ={mu:5.1} seed={seed:5} → token={token}  S={s:.4}  (−ln p[{token}]={:.4})", -probs[token as usize].ln());
+        }
+    }
 }
 
 /// Full (τ, lr, μ0) sweep — the #19 diagnostic. Prints a table + the re-tune
