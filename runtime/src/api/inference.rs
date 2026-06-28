@@ -974,6 +974,57 @@ impl pie::core::tensor::HostProgram for InstanceState {
     }
 }
 
+/// Owns the forward's arena transaction (the kv/rs working-set page pins from
+/// `resolve_read`/`cow_write_slot`) until [`await_and_finalize`] consumes it via
+/// [`take`](Self::take) for the normal commit/abort. If the [`PendingForward`] is
+/// instead dropped UN-consumed — an `output()`/`outputs()` error-return, or a
+/// proc-terminate before finalize — the guard's `Drop` ABORTS the txn, releasing
+/// the pins, rather than letting a bare `ArenaTxn` drop uncommitted and leak them
+/// (the merged/concurrent-path abort symptom: `ArenaTxn dropped without
+/// commit/abort — pins=1`). `finalize_forward_txn` (the normal path) ALWAYS
+/// commits/aborts, so this only fires when finalize is never reached. A
+/// down-payment on #23 abort-isolation: an aborted/terminated forward must
+/// release its pins.
+struct ForwardTxnGuard {
+    txn: Option<crate::arena::ArenaTxn>,
+    model_id: usize,
+    driver_idx: usize,
+}
+
+impl ForwardTxnGuard {
+    fn new(txn: crate::arena::ArenaTxn, model_id: usize, driver_idx: usize) -> Self {
+        Self {
+            txn: Some(txn),
+            model_id,
+            driver_idx,
+        }
+    }
+
+    /// Hand the txn to the normal `finalize_forward_txn` commit/abort path; the
+    /// guard is left empty so its `Drop` is a no-op.
+    fn take(&mut self) -> Option<crate::arena::ArenaTxn> {
+        self.txn.take()
+    }
+}
+
+impl Drop for ForwardTxnGuard {
+    fn drop(&mut self) {
+        if let Some(txn) = self.txn.take() {
+            // Un-finalized drop (error-return / proc-terminate before finalize):
+            // abort the txn to release the kv/rs working-set pins. The normal
+            // path already `take()`-d it, so this never double-handles (a
+            // committed/aborted txn is consumed by value). `crate::arena::get` is
+            // self-contained (no store/accessor needed), so it is safe in `Drop`;
+            // the lock is only taken here when finalize did NOT run, so it cannot
+            // deadlock against `finalize_forward_txn`.
+            let arena_arc = crate::arena::get(self.model_id, self.driver_idx);
+            if let Ok(mut arena) = arena_arc.lock() {
+                arena.txn_abort(txn);
+            }
+        }
+    }
+}
+
 /// In-flight forward state carried from the eager submit across the async
 /// driver round-trip to the await→finalize. Phase-2
 /// ([`finalize_forward_output`]) consumes it. The owned `txn` keeps the pins /
@@ -986,7 +1037,7 @@ impl pie::core::tensor::HostProgram for InstanceState {
 /// can hold two passes in flight (the `submit_async`→scheduler boundary).
 struct PendingForward {
     rx: tokio::sync::oneshot::Receiver<Result<ForwardOutput>>,
-    txn: crate::arena::ArenaTxn,
+    txn: ForwardTxnGuard,
     kv_set: Option<Resource<crate::working_set::kv::KvWorkingSet>>,
     seal_hashes: Vec<(u32, u64)>,
     model_id: usize,
@@ -1019,7 +1070,7 @@ async fn await_and_finalize(
 ) -> Result<Result<Vec<OutputTensor>, String>> {
     let PendingForward {
         rx,
-        txn,
+        mut txn,
         kv_set,
         seal_hashes,
         model_id,
@@ -1044,10 +1095,16 @@ async fn await_and_finalize(
     };
     let success = forward_result.is_some();
 
+    // Take the txn out of its guard for the normal commit/abort. The now-empty
+    // guard's `Drop` is a no-op; the leak-abort only fires if this finalize is
+    // never reached (error-return / proc-terminate).
+    let forward_txn = txn
+        .take()
+        .expect("forward txn consumed exactly once at finalize");
     accessor.with(|mut access| {
         access.get().finalize_forward_txn(
             success,
-            txn,
+            forward_txn,
             kv_set,
             seal_hashes,
             model_id,
@@ -1678,7 +1735,7 @@ async fn execute_impl(
         // passes in flight.
         let pending = PendingForward {
             rx,
-            txn,
+            txn: ForwardTxnGuard::new(txn, model_id, driver_idx),
             kv_set,
             seal_hashes,
             model_id,
