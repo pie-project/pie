@@ -156,6 +156,14 @@ pub struct Forward<'ctx> {
     /// Emitted as a `sampler(program, bindings)` call at execute time; its
     /// declared output tensors come back through [`Output`].
     sampler: Option<SamplerAttach<'ctx>>,
+    /// Optional NON-IR drafter-filled draft-output (#31 self-spec): the `k` draft
+    /// tokens the speculator's MTP drafter writes into a `[k]`-Token program-output
+    /// slot. NOT an IR program (no `sampler`/`pif`), so the propose forward flows past
+    /// the rich `:4123` return to the drafter at `:4459` (an IR `[k]`-Token sampler
+    /// would early-return and skip its own filler). Emitted as a `draft-output(k)`
+    /// call; the runtime returns the append-last output index, read via
+    /// [`Output::tokens`]. Set via [`Forward::draft_output`].
+    draft_output: Option<u32>,
     attn_mask: Option<Vec<Vec<u32>>>,
     adapter: Option<&'ctx Adapter>,
     zo_seed: Option<i64>,
@@ -204,6 +212,7 @@ impl<'ctx> Forward<'ctx> {
             auto_inputs: Vec::new(),
             explicit_inputs: Vec::new(),
             sampler: None,
+            draft_output: None,
             attn_mask: None,
             adapter: None,
             zo_seed: None,
@@ -292,7 +301,23 @@ impl<'ctx> Forward<'ctx> {
         (0..outputs).map(ProgramHandle::new).collect()
     }
 
-    /// Ergonomic sugar: attach the legacy [`Sampler`] enum, lowered to the
+    /// Attach a **non-IR drafter-filled draft-output** (#31 self-spec): declare a
+    /// `[k]`-Token output that the speculator's MTP drafter fills (the de-hardwired
+    /// draft SOURCE), NOT an IR program. It sets `output-speculative-tokens` so the
+    /// drafter fires, and — crucially — creates NO sampler program, so the propose
+    /// forward flows past the rich-IR `:4123` return to the drafter at `:4459` (an IR
+    /// `[k]`-Token sampler would early-return and skip its own filler). Returns the
+    /// [`ProgramHandle`] for the drafter-filled slot (append-last, after any sampler
+    /// outputs); read the `k` drafts via [`Output::tokens`]. v0 is single-role: a
+    /// propose forward carries the draft-output and no sampler.
+    pub fn draft_output(&mut self, k: u32) -> ProgramHandle {
+        // Append-last: the draft-output follows any sampler outputs (a v0 propose
+        // forward has none → index 0), mirroring the runtime/driver append-last seg
+        // (`program_tokens.size()`) so the handle reads the right `program_tokens` slot.
+        let idx = self.sampler.as_ref().map_or(0, |s| s.outputs);
+        self.draft_output = Some(k);
+        ProgramHandle::new(idx)
+    }
     /// canonical `standard_program` over the model's **output (logits) vocab**
     /// (derived internally via `output_vocab_size()` — a caller cannot supply
     /// the wrong vocab). The program's `Logits` input is bound to the pass's
@@ -433,6 +458,7 @@ impl<'ctx> Forward<'ctx> {
             auto_inputs,
             explicit_inputs,
             sampler,
+            draft_output,
             attn_mask,
             adapter,
             zo_seed,
@@ -538,6 +564,17 @@ impl<'ctx> Forward<'ctx> {
             };
             pass.sampler(program.get(), resolved);
             sampler_outputs = Some(outputs);
+        }
+
+        // Non-IR drafter-filled draft-output (#31 self-spec): a `[k]`-Token output the
+        // speculator's drafter fills post-`:4459`. NOT a sampler program (no `pif`), so
+        // the propose forward flows past the rich `:4123` return to the drafter that
+        // fills it. Appended after any sampler outputs — the WIT func returns the
+        // runtime-assigned append-last index; counted here so `execute` reads it back as
+        // the last output tensor (read by the inferlet via `out.tokens(draft_handle)`).
+        if let Some(k) = draft_output {
+            let _slot = pass.draft_output(k);
+            sampler_outputs = Some(sampler_outputs.unwrap_or(0) + 1);
         }
 
         // Run-ahead carrier (§2.1): declare the destination slots in the NEXT
