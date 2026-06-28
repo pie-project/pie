@@ -84,6 +84,13 @@ interface inference {
         /// enabled by default
         output-speculative-tokens: func(flag: bool);
 
+        /// #31 self-spec greedy-v0: declare a drafter-filled `[k]`-Token output
+        /// (the MTP self-spec draft) — NOT a sampler program (no IR); the driver's
+        /// system drafter fills it from its proposal. Sets `output-speculative`
+        /// (fires the drafter) and returns the runtime-assigned output index
+        /// (append-last); read the `[k]` drafts via `output()`/`outputs()` there.
+        draft-output: func(k: u32) -> u32;
+
         /// if not provided, fallback to causal mask
         attention-mask: func(
             mask: list<brle>,

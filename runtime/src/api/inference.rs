@@ -200,6 +200,12 @@ pub struct ForwardPass {
     /// that does no sampling (pure prefill); one entry for the single-sampler
     /// path; many for `samplers`. Flattened into the bridge carrier at `execute()`.
     programs: Vec<AttachedProgram>,
+    /// #31 self-spec greedy-v0: per drafter-filled `[k]`-Token output, its `k`
+    /// (attach order). Each is a NON-IR pseudo-output the driver's system drafter
+    /// fills from its proposal (`spec_tokens@922`); appended append-last to the
+    /// output table at `execute()` and carried per-request via `spec_draft_output_k`.
+    /// Empty for a non-propose forward.
+    draft_outputs: Vec<u32>,
     /// #21 1c run-ahead: the in-flight forward state stored by the sync
     /// `execute()` (eager-submit) and consumed by the async `output()`/`outputs()`
     /// (await→finalize→tensor). `None` until `execute()`; the forward-pass IS the
@@ -499,6 +505,7 @@ impl pie::core::inference::HostForwardPass for InstanceState {
             next_input_positions: Vec::new(),
             next_attention_mask: Vec::new(),
             programs: Vec::new(),
+            draft_outputs: Vec::new(),
             pending: None,
             exec_error: None,
             fresh_generate: false,
@@ -724,6 +731,27 @@ impl pie::core::inference::HostForwardPass for InstanceState {
         let pass = self.ctx().table.get_mut(&this)?;
         pass.req.output_spec_flags = vec![flag];
         Ok(())
+    }
+
+    async fn draft_output(&mut self, this: Resource<ForwardPass>, k: u32) -> Result<u32> {
+        let pass = self.ctx().table.get_mut(&this)?;
+        // #31 self-spec greedy-v0: a drafter-filled `[k]`-Token output — NOT an IR
+        // sampler program (no `pif` → the propose-forward flows past the rich-return
+        // at :4123 to the system drafter at :4459 that fills it). Returns the
+        // runtime-assigned APPEND-LAST output index (IR-program outputs + prior
+        // draft-outputs); the driver's :4459 route mirrors it (`draft_seg =
+        // program_tokens.size()`), so the read handle ≡ the write seg. Setting
+        // `output_spec_flags=true` fires the drafter AND flips `need_msgpack`
+        // (executor.cpp:1853-1854) so the forward reaches :4459 (not the fast path).
+        let seg: u32 = pass
+            .programs
+            .iter()
+            .map(|p| p.output_kinds.len() as u32)
+            .sum::<u32>()
+            + pass.draft_outputs.len() as u32;
+        pass.draft_outputs.push(k);
+        pass.req.output_spec_flags = vec![true];
+        Ok(seg)
     }
 
     async fn attention_mask(
@@ -1378,6 +1406,7 @@ async fn execute_impl(
             fold_buffered_tokens,
             mut req,
             attached_programs,
+            draft_outputs,
             next_input_positions,
             fresh_generate,
         ) = {
@@ -1390,6 +1419,7 @@ async fn execute_impl(
                 pass.fold_buffered_tokens.take(),
                 std::mem::replace(&mut pass.req, empty_forward_request()),
                 std::mem::take(&mut pass.programs),
+                std::mem::take(&mut pass.draft_outputs),
                 std::mem::take(&mut pass.next_input_positions),
                 pass.fresh_generate,
             )
@@ -1473,6 +1503,21 @@ async fn execute_impl(
                 req.sampling_late_device_lens.push(device.byte_len());
                 late_device_handles.push(device);
             }
+        }
+        // #31 self-spec greedy-v0: each drafter-filled `[k]`-Token output appends a
+        // NON-IR pseudo-output AFTER the IR-program outputs (append-last seg,
+        // mirroring the driver's `draft_seg = program_tokens.size()` at :4459) so
+        // the read handle assigned at `draft_output()` ≡ the driver's write seg. The
+        // driver fills `program_tokens[draft_seg]` from its proposal `spec_tokens@922`
+        // (echo's route); `output_spec_flags` (set at `draft_output()`) flips the
+        // forward rich + fires the drafter. v0 single-stream: the per-output `k` list
+        // IS the per-request `spec_draft_output_k` (R=1).
+        for &k in &draft_outputs {
+            programs_output_kinds.push(vec![pie_sampling_ir::OutputKind::Token]);
+            programs_output_elem_counts.push(vec![k]);
+        }
+        if !draft_outputs.is_empty() {
+            req.spec_draft_output_k = draft_outputs.clone();
         }
         if has_programs {
             // The `logits` binding(s) carry the sampling positions as ABSOLUTE
