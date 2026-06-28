@@ -321,6 +321,7 @@ struct OutputTensor {
 fn build_output_tensors(
     output: ForwardOutput,
     programs_output_kinds: &[Vec<pie_sampling_ir::OutputKind>],
+    programs_output_elem_counts: &[Vec<u32>],
 ) -> Vec<OutputTensor> {
     use pie::core::tensor::Dtype;
     match output {
@@ -338,7 +339,7 @@ fn build_output_tensors(
             })
             .collect(),
         ForwardOutput::Response(resp) => {
-            build_output_tensors_from_response(resp, programs_output_kinds)
+            build_output_tensors_from_response(resp, programs_output_kinds, programs_output_elem_counts)
         }
     }
 }
@@ -351,6 +352,7 @@ fn build_output_tensors(
 fn build_output_tensors_from_response(
     resp: pie_driver_abi::ForwardResponse,
     programs_output_kinds: &[Vec<pie_sampling_ir::OutputKind>],
+    programs_output_elem_counts: &[Vec<u32>],
 ) -> Vec<OutputTensor> {
     use pie::core::tensor::Dtype;
     use pie_sampling_ir::OutputKind;
@@ -382,10 +384,35 @@ fn build_output_tensors_from_response(
     };
     let mut ent_iter = resp.entropies.into_iter();
 
+    // #32: a `[k]`-Token output (elem_count > 1) reads its tokens from the
+    // per-(request,output) `program_tokens` CSR — this per-request `resp` carries
+    // one segment per declared output slot (empty for non-`[k]` outputs); a single
+    // Token (elem_count == 1) stays the dense `tokens` channel above.
+    let program_tokens = resp.program_tokens;
+    let program_tokens_indptr = resp.program_tokens_indptr;
+    let mut prog_tok_seg = 0usize;
+
     let mut tensors: Vec<OutputTensor> = Vec::new();
-    for kinds in programs_output_kinds {
-        for kind in kinds {
+    for (p, kinds) in programs_output_kinds.iter().enumerate() {
+        let elem_counts = programs_output_elem_counts.get(p);
+        for (o, kind) in kinds.iter().enumerate() {
+            let elem_count = elem_counts.and_then(|e| e.get(o)).copied().unwrap_or(1);
             let t = match kind {
+                // `[k]`-Token: this output slot's segment of `program_tokens`.
+                OutputKind::Token if elem_count > 1 => {
+                    let lo = program_tokens_indptr.get(prog_tok_seg).copied().unwrap_or(0) as usize;
+                    let hi = program_tokens_indptr
+                        .get(prog_tok_seg + 1)
+                        .copied()
+                        .unwrap_or(lo as u32) as usize;
+                    let slice = program_tokens.get(lo..hi).unwrap_or(&[]);
+                    let data: Vec<u8> = slice.iter().flat_map(|&t| t.to_le_bytes()).collect();
+                    Some(OutputTensor {
+                        shape: vec![slice.len() as u32],
+                        dtype: Dtype::I32,
+                        data,
+                    })
+                }
                 OutputKind::Token => tok_iter.next().map(|tok| OutputTensor {
                     shape: vec![1],
                     dtype: Dtype::I32,
@@ -414,6 +441,9 @@ fn build_output_tensors_from_response(
                 // tensors, #18/WS5 follow-up.
                 OutputKind::Distribution | OutputKind::Embedding => None,
             };
+            // Every declared output occupies one `program_tokens` slot (empty for
+            // non-`[k]`-Token outputs), so advance the segment cursor per output.
+            prog_tok_seg += 1;
             if let Some(t) = t {
                 tensors.push(t);
             }
@@ -1060,6 +1090,10 @@ struct PendingForward {
     rs_fold_set: Option<Resource<crate::working_set::rs::RsWorkingSet>>,
     fold_buffered_tokens: Option<u32>,
     programs_output_kinds: Vec<Vec<pie_sampling_ir::OutputKind>>,
+    /// #32 per-output element counts (declared order, parallel to
+    /// `programs_output_kinds`); a `[k]`-Token (`elem_count > 1`) reads its tokens
+    /// from the `program_tokens` CSR instead of the dense `tokens` channel.
+    programs_output_elem_counts: Vec<Vec<u32>>,
     /// #27 cut #1 fast-path: pinned host buffers the driver eager-D2H's each
     /// declared output VALUE into (empty ⇒ legacy `ForwardResponse` marshal).
     /// Filled by the time `output()` reads them — the driver defers the
@@ -1130,6 +1164,7 @@ async fn await_and_finalize(
         rs_fold_set,
         fold_buffered_tokens,
         programs_output_kinds,
+        programs_output_elem_counts,
         pinned_outputs,
         late_device_inputs,
         profile_start,
@@ -1202,7 +1237,7 @@ async fn await_and_finalize(
             .collect()
     } else if effective_success {
         match forward_result {
-            Some(resp) => build_output_tensors(resp, &programs_output_kinds),
+            Some(resp) => build_output_tensors(resp, &programs_output_kinds, &programs_output_elem_counts),
             None => Vec::new(),
         }
     } else {
@@ -1839,6 +1874,7 @@ async fn execute_impl(
             rs_fold_set,
             fold_buffered_tokens,
             programs_output_kinds,
+            programs_output_elem_counts,
             pinned_outputs,
             late_device_inputs: late_device_handles,
             profile_start,
@@ -2176,6 +2212,7 @@ mod sampling_program_tests {
         let out = build_output_tensors(
             ForwardOutput::Token(42),
             &[vec![pie_sampling_ir::OutputKind::Token]],
+            &[vec![1]],
         );
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].shape, vec![1]);
@@ -2199,12 +2236,39 @@ mod sampling_program_tests {
         let out = build_output_tensors(
             ForwardOutput::Response(resp),
             &[vec![OutputKind::Token, OutputKind::Scalar]],
+            &[vec![1, 1]],
         );
         assert_eq!(out.len(), 2);
         assert!(matches!(out[0].dtype, Dtype::I32));
         assert_eq!(out[0].data, 137i32.to_le_bytes().to_vec());
         assert!(matches!(out[1].dtype, Dtype::F32));
         assert_eq!(out[1].data, 2.7f32.to_le_bytes().to_vec());
+    }
+
+    #[test]
+    fn build_tensors_k_token_reads_program_tokens() {
+        // #32: a `[k]`-Token output (elem_count k>1) reads its k tokens from the
+        // per-(request,output) `program_tokens` CSR (off the dense `tokens` / spec
+        // channels) → a `[k] i32` tensor. The per-request `resp` carries one
+        // segment per output slot.
+        use pie::core::tensor::Dtype;
+        use pie_sampling_ir::OutputKind;
+        let resp = pie_driver_abi::ForwardResponse {
+            // one output slot, segment [0,3) = tokens [11, 22, 33].
+            program_tokens_indptr: vec![0, 3],
+            program_tokens: vec![11, 22, 33],
+            ..Default::default()
+        };
+        let out = build_output_tensors(
+            ForwardOutput::Response(resp),
+            &[vec![OutputKind::Token]],
+            &[vec![3]],
+        );
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].shape, vec![3]);
+        assert!(matches!(out[0].dtype, Dtype::I32));
+        let want: Vec<u8> = [11u32, 22, 33].iter().flat_map(|t| t.to_le_bytes()).collect();
+        assert_eq!(out[0].data, want);
     }
 
     #[test]
