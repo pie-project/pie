@@ -56,6 +56,20 @@ enum SpecMode {
 /// `[k, vocab]` target matrix over them. A v1 nicety makes this adaptive.
 const SPEC_DRAFT_LEN: usize = 4;
 
+/// Result of an instrumented speculative run
+/// ([`Generator::collect_tokens_speculative_instrumented`]): the token stream
+/// plus the per-block accepted-token counts (the v0 accept-rate measurement —
+/// LOG, do not gate). A low block-2+ accept rate indicates a stale drafter MTP
+/// cache (the de-hardwired loop bypasses the native `commit_verified_prefix`),
+/// quantifying the v1 cache-sync perf opportunity; the OUTPUT is token-identical
+/// to plain greedy regardless (the verify reads the main model, cache-independent).
+pub struct SpecRun {
+    /// The full generated token stream (== plain greedy — lossless).
+    pub tokens: Vec<u32>,
+    /// Accepted-token count per verify block, in order.
+    pub block_accept_lens: Vec<usize>,
+}
+
 // =============================================================================
 // Generator
 // =============================================================================
@@ -90,6 +104,13 @@ pub struct Generator<'ctx> {
     /// prime/first pass so the host drops any carrier left pending on this
     /// context by a prior generate (the stop-terminal residual).
     fresh_generate: bool,
+    /// TEST/VALIDATION hook (#31): when set, the `SpecMode::System` loop draws
+    /// each block's drafts from this closure `(anchor, tokens_generated) ->
+    /// drafts` INSTEAD of the MTP drafter (`propose_drafts`). Lets the KV/commit
+    /// choreography + losslessness be validated on a drafter-less model (e.g.
+    /// qwen3-0.6b) with host-constructed drafts — the output must stay
+    /// token-identical-to-greedy whatever the injected drafts. Unset in production.
+    spec_draft_inject: Option<Box<dyn FnMut(u32, usize) -> Vec<u32>>>,
 }
 
 impl<'ctx> Generator<'ctx> {
@@ -113,6 +134,7 @@ impl<'ctx> Generator<'ctx> {
             rebid_each_step: true,
             done: false,
             fresh_generate: true,
+            spec_draft_inject: None,
         }
     }
 
@@ -172,6 +194,18 @@ impl<'ctx> Generator<'ctx> {
         if matches!(self.speculation, SpecMode::System) {
             self.speculation = SpecMode::None;
         }
+        self
+    }
+
+    /// **TEST/VALIDATION hook (#31).** Override the `SpecMode::System` loop's
+    /// draft source: each block's drafts come from `f(anchor, tokens_generated)`
+    /// instead of the MTP drafter (`pass.draft_output`). Lets the KV/commit
+    /// choreography + losslessness be exercised on a drafter-less model (e.g.
+    /// qwen3-0.6b) with host-constructed drafts — the output MUST stay
+    /// token-identical-to-greedy whatever the injected drafts (the verify reads
+    /// the main model, so it corrects any draft). NOT for production use.
+    pub fn inject_spec_drafts<F: FnMut(u32, usize) -> Vec<u32> + 'static>(mut self, f: F) -> Self {
+        self.spec_draft_inject = Some(Box::new(f));
         self
     }
 
@@ -640,17 +674,23 @@ impl<'ctx> Generator<'ctx> {
     // `pi.tokens + sample_row + 1`, echo's resolver).
 
     /// Run host-driven greedy speculation to completion; return the full token
-    /// stream. Opt-in terminal (the caller selects it after
-    /// [`system_speculation`](Self::system_speculation)); `collect_tokens`
-    /// keeps its non-speculative behavior until the draft-output seam lands and
-    /// the dispatch is wired.
-    ///
-    /// **HELD:** [`propose_drafts`](Self::propose_drafts) is gated on the non-IR
-    /// `pass.draft_output` slot (#31 draft-output co-design); until it lands this
-    /// loop surfaces a clear error at the propose seam. The verify half
-    /// ([`verify_block`](Self::verify_block)) is complete.
-    pub async fn collect_tokens_speculative(mut self) -> Result<Vec<u32>> {
-        let mut all = Vec::new();
+    /// stream (== plain greedy — lossless). Opt-in terminal (the caller selects
+    /// it after [`system_speculation`](Self::system_speculation)); `collect_tokens`
+    /// keeps its non-speculative behavior until the default-path dispatch is wired.
+    pub async fn collect_tokens_speculative(self) -> Result<Vec<u32>> {
+        Ok(self.collect_tokens_speculative_instrumented().await?.tokens)
+    }
+
+    /// Like [`collect_tokens_speculative`](Self::collect_tokens_speculative) but
+    /// also returns the per-block accepted-token counts ([`SpecRun::block_accept_lens`])
+    /// — the v0 accept-rate INSTRUMENT (measure, do NOT gate). A low block-2+
+    /// accept rate indicates a stale drafter MTP cache (the de-hardwired loop
+    /// bypasses `commit_verified_prefix`) → quantifies the v1 cache-sync perf
+    /// opportunity; the OUTPUT stays token-identical-to-greedy regardless (the
+    /// verify reads the main model, cache-independent).
+    pub async fn collect_tokens_speculative_instrumented(mut self) -> Result<SpecRun> {
+        let mut tokens = Vec::new();
+        let mut block_accept_lens = Vec::new();
 
         // Cold-start prime: commit all but the LAST pending token; the last is the
         // first block's `anchor` (kept UNCOMMITTED, fed fresh by the first verify
@@ -659,7 +699,7 @@ impl<'ctx> Generator<'ctx> {
         // next anchor.
         let pending = std::mem::take(&mut self.ctx.buffer);
         if pending.is_empty() {
-            return Ok(Vec::new());
+            return Ok(SpecRun { tokens, block_accept_lens });
         }
         let (prime, anchor_slice) = pending.split_at(pending.len() - 1);
         let mut anchor = anchor_slice[0];
@@ -681,7 +721,8 @@ impl<'ctx> Generator<'ctx> {
             // `ctx.buffer` (the accepted drafts are already device-resident — the
             // existing `accept()` would double-feed them on the next forward).
             let kept = self.clamp_accept(&accept_set);
-            all.extend_from_slice(&kept);
+            block_accept_lens.push(kept.len());
+            tokens.extend_from_slice(&kept);
 
             // Commit only `[anchor, kept-except-last]` (= `kept.len()` rows at
             // `start..start+kept.len()`); TRUNCATE the rest — the rejected draft
@@ -706,7 +747,7 @@ impl<'ctx> Generator<'ctx> {
             anchor = *kept.last().expect("kept non-empty");
             drafts = self.propose_drafts(anchor).await?;
         }
-        Ok(all)
+        Ok(SpecRun { tokens, block_accept_lens })
     }
 
     /// Verify a block of `k` MTP drafts against the target's greedy decode in one
@@ -767,6 +808,12 @@ impl<'ctx> Generator<'ctx> {
     /// emits plain greedy via the `t_j` corrections, but exercises no real
     /// speculation (so a real-drafts e2e gate needs a drafter snapshot).
     async fn propose_drafts(&mut self, anchor: u32) -> Result<Vec<u32>> {
+        // Test/validation hook: host-supplied drafts in place of the MTP drafter
+        // (drives the KV/commit + losslessness gate on a drafter-less model).
+        let pos = self.tokens_generated;
+        if let Some(f) = self.spec_draft_inject.as_mut() {
+            return Ok(f(anchor, pos));
+        }
         let k = SPEC_DRAFT_LEN as u32;
         let mut pass = self.ctx.forward();
         pass.defer_commit(); // throwaway drafter-fire: the verify re-feeds the anchor
