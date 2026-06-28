@@ -195,6 +195,7 @@ struct PieForwardRequestView {
     // staged `sampling_late_blob` path instead. The grammar mask rides this.
     PieSlice<std::uint64_t> sampling_late_device_ptrs;   // device buf ptr per late key
     PieSlice<std::uint64_t> sampling_late_device_flags;  // R12 self-arm flag ptr per late key
+    PieSlice<std::uint32_t> sampling_late_device_lens;   // device value byte-len per late key
 
     // Sampler attributes (SoA — read from the wire SoA arrays; view.hpp
     // applies only the small kind-remap / top_k / top_p-min_p fold).
@@ -297,6 +298,10 @@ struct PieForwardResponseView {
     std::uint32_t probe_kernel_launch_us = 0;
     std::uint32_t probe_sync_us = 0;
     std::uint32_t probe_response_build_us = 0;
+
+    PieSlice<std::uint32_t> program_tokens_req_indptr; // num_requests+1, per-request → first output-slot
+    PieSlice<std::uint32_t> program_tokens_indptr;  // per-(request,output) [k]-Token CSR
+    PieSlice<std::uint32_t> program_tokens;         // [k]-Token output values, concatenated
 };
 
 // ---- Top-level request / response views -----------------------------------
@@ -518,6 +523,8 @@ inline void fill_forward_view(const PieForwardRequestDesc& f,
         slice_from(f.sampling_late_device_ptrs_ptr, f.sampling_late_device_ptrs_len);
     out.sampling_late_device_flags =
         slice_from(f.sampling_late_device_flags_ptr, f.sampling_late_device_flags_len);
+    out.sampling_late_device_lens =
+        slice_from(f.sampling_late_device_lens_ptr, f.sampling_late_device_lens_len);
     out.spec_token_ids    = slice_from(f.spec_token_ids_ptr, f.spec_token_ids_len);
     out.spec_position_ids = slice_from(f.spec_position_ids_ptr, f.spec_position_ids_len);
     out.spec_indptr       = slice_from(f.spec_indptr_ptr, f.spec_indptr_len);
@@ -721,6 +728,12 @@ inline void build_response_desc(std::uint32_t driver_id,
         fr.probe_kernel_launch_us = view.forward.probe_kernel_launch_us;
         fr.probe_sync_us          = view.forward.probe_sync_us;
         fr.probe_response_build_us = view.forward.probe_response_build_us;
+        fr.program_tokens_req_indptr_ptr = view.forward.program_tokens_req_indptr.data();
+        fr.program_tokens_req_indptr_len = view.forward.program_tokens_req_indptr.size();
+        fr.program_tokens_indptr_ptr = view.forward.program_tokens_indptr.data();
+        fr.program_tokens_indptr_len = view.forward.program_tokens_indptr.size();
+        fr.program_tokens_ptr        = view.forward.program_tokens.data();
+        fr.program_tokens_len        = view.forward.program_tokens.size();
     } else {
         // Everything else (copy / adapter / health / unknown) just
         // produces a StatusResponse with the int code.

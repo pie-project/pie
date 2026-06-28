@@ -71,6 +71,7 @@ unsafe extern "C" {
 pub struct DeviceLateInput {
     device_dst: *mut core::ffi::c_void,
     device_flag: *mut u32,
+    byte_len: usize,
 }
 
 #[cfg(feature = "driver-cuda")]
@@ -82,6 +83,7 @@ impl core::fmt::Debug for DeviceLateInput {
         f.debug_struct("DeviceLateInput")
             .field("device_dst", &self.device_dst)
             .field("device_flag", &self.device_flag)
+            .field("byte_len", &self.byte_len)
             .finish()
     }
 }
@@ -95,6 +97,11 @@ impl DeviceLateInput {
     /// R12 self-arm flag pointer (rides `sampling_late_device_flags`).
     pub fn flag_ptr(&self) -> u64 {
         self.device_flag as u64
+    }
+    /// Device value byte length (rides `sampling_late_device_lens`) — the size of
+    /// the uploaded host slice, for the merged per-row device gather (`[N, len]`).
+    pub fn byte_len(&self) -> u32 {
+        self.byte_len as u32
     }
 }
 
@@ -141,7 +148,11 @@ pub fn upload_late_input(data: &[u8]) -> Option<DeviceLateInput> {
     if device_dst.is_null() {
         return None;
     }
-    let handle = DeviceLateInput { device_dst, device_flag };
+    let handle = DeviceLateInput {
+        device_dst,
+        device_flag,
+        byte_len: data.len(),
+    };
     // SAFETY: `device_dst` is a live buffer of `data.len()` bytes; `host_src` is
     // a valid host slice; the event is synced (ordered-complete) before use.
     let ev = unsafe {
@@ -174,6 +185,9 @@ impl DeviceLateInput {
         0
     }
     pub fn flag_ptr(&self) -> u64 {
+        0
+    }
+    pub fn byte_len(&self) -> u32 {
         0
     }
 }
