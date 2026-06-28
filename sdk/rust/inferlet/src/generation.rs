@@ -701,13 +701,30 @@ impl<'ctx> Generator<'ctx> {
         if pending.is_empty() {
             return Ok(SpecRun { tokens, block_accept_lens });
         }
-        let (prime, anchor_slice) = pending.split_at(pending.len() - 1);
-        let mut anchor = anchor_slice[0];
-        if !prime.is_empty() {
+        // Cold-start: a normal AWAITED decode over the prompt → the first token
+        // `t0` (== greedy[0]), which commits the prompt AND finalizes the forward
+        // txn. A fire-and-forget no-sampler fill instead leaves the txn
+        // unfinalized (its `execute()` does not `await output()`), so the next
+        // (verify) forward on the reused ctx resolves a recycled/unsealed
+        // working-set arena object → `arena: unknown object`. Keeping the
+        // cold-start a SAMPLER forward makes the whole sequence sampler→sampler,
+        // matching the (working) plain-greedy loop. `t0` is the first block's
+        // anchor (the first output token, fed fresh by the first verify — uniform
+        // with the steady-state correction `t_j` rollover).
+        let sampler = self.sampler.clone();
+        let t0 = {
             let mut pass = self.ctx.forward();
-            pass.input(prime);
-            pass.execute().await?; // no-sampler fill: commit the prompt prefix
+            pass.input(&pending);
+            let h = pass.sample(sampler)?[0];
+            let out = pass.execute().await?;
+            out.token(h).await?
+        };
+        let kept0 = self.clamp_accept(&[t0]);
+        tokens.extend_from_slice(&kept0);
+        if kept0.is_empty() || self.is_done() {
+            return Ok(SpecRun { tokens, block_accept_lens });
         }
+        let mut anchor = t0;
         let mut drafts = self.propose_drafts(anchor).await?;
 
         while !self.is_done() {
