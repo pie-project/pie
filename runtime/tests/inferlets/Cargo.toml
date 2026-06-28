@@ -13,6 +13,7 @@ members = [
     "multisamp",
     "isolatedtopp",
     "runahead",
+    "specverify",
 ]
 
 [workspace.dependencies]
