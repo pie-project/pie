@@ -214,10 +214,10 @@ pub fn spec_verify_greedy(vocab: u32, k: u32) -> Result<(Built, SpecVerifyKeys),
 /// **Self-spec greedy-verify** (#31). The MTP head as the draft SOURCE: identical
 /// verify DAG and sentinel `[k]`-Token output as [`spec_verify_greedy`], but the
 /// draft is bound [`Readiness::SelfSpecDraftInput`] — the driver source-selects the
-/// refed draft tokens at the matrix base (`pi.tokens + sample_row`), no host upload,
-/// de-hardwiring the hardwired spec loop. The bytecode is byte-identical to a
-/// late-draft verify (the source is a manifest property, not bytecode), so the
-/// verify is source-agnostic.
+/// refed draft tokens at the verify matrix base (`pi.tokens + sample_row + 1`, the
+/// drafts start after the anchor at `sample_row`), no host upload, de-hardwiring the
+/// hardwired spec loop. The bytecode is byte-identical to a late-draft verify (the
+/// source is a manifest property, not bytecode), so the verify is source-agnostic.
 pub fn mtp_self_spec_greedy(vocab: u32, k: u32) -> Result<(Built, SpecVerifyKeys), BuildError> {
     build_spec_verify_greedy(vocab, k, Readiness::SelfSpecDraftInput, -1)
 }
