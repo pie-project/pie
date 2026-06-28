@@ -360,6 +360,41 @@ pub struct ForwardRequest {
     // consumer refcount reaches 0; the driver is count-agnostic and frees
     // strictly on this signal. Empty when no retained source is released here.
     pub next_input_free_links: Vec<u32>,
+
+    // ── Programmable-sampling output fast-path (#27 cut #1) ──────────
+    // Appended per the schema evolution rule (append-only). Per-output
+    // eager-D2H destination: the driver copies each declared program output
+    // VALUE directly into a host pinned buffer at the submit-provided pointer
+    // (skipping the `ForwardResponse` SoA channels + the host re-marshal in
+    // `build_output_tensors`). The host `pie_pinned_alloc`s one buffer per
+    // fast-path output (sizes are submit-time-known: Token/Scalar = 4 B,
+    // Logits = vocab·4, Logprobs = k·4), threads the raw host pointer here, and
+    // wraps the same buffer as the WIT `tensor` zero-copy in `output()`.
+    //
+    // IN-PROC ONLY: the pointer is a raw host address valid in the (in-proc)
+    // driver's address space; an out-of-process driver MUST fall to the legacy
+    // path. EMPTY ⇒ legacy `ForwardResponse` channels (opt-in per pass) — so
+    // this is fully back-compatible and the marshal stays the fallback for the
+    // output kinds not yet on the fast-path (Distribution/Embedding).
+    //
+    // SoA + CSR, mirroring the `sampling_input_*` index tables: the dst arrays
+    // are flattened across programs in declared output order (the program's
+    // `Op` output-slot order — the same order `build_output_tensors` walks),
+    // partitioned per-program by `sampling_output_indptr`. The driver, walking
+    // program `p`'s declared outputs, copies output `j` into
+    // `dst_ptrs[indptr[p] + j]` for `dst_lens[indptr[p] + j]` bytes on the copy
+    // stream, behind the case-(b) WAR guard. (MVP M=1: one value per output
+    // slot; batched M>1 rides a per-row stride — a follow-up.)
+    /// Host pinned-buffer destination pointer per output value (raw host
+    /// address, u64). Parallel to `sampling_output_dst_lens`.
+    pub sampling_output_dst_ptrs: Vec<u64>,
+    /// Byte capacity at each destination (the driver bounds-checks the D2H copy
+    /// against this). Parallel to `sampling_output_dst_ptrs`.
+    pub sampling_output_dst_lens: Vec<u32>,
+    /// Per-program CSR into the dst arrays (one extra leading 0, cumulative —
+    /// like `sampling_input_indptr`): `sampling_output_indptr[p..p+1]` is
+    /// program `p`'s output values. Empty ⇒ no fast-path outputs (legacy path).
+    pub sampling_output_indptr: Vec<u32>,
 }
 
 /// Per-slot sampler kind discriminants. Carried on the wire as the `u8`
@@ -906,6 +941,20 @@ impl ForwardRequest {
             .extend_from_slice(&req.sampling_binding_key);
         for &off in req.sampling_binding_indptr.iter().skip(1) {
             self.sampling_binding_indptr.push(binding_base + off);
+        }
+
+        // Output fast-path dst table (#27 cut #1): concat the per-output-value
+        // pinned dst pointers + byte capacities, rebasing the per-program CSR by
+        // the table base — exactly parallel to the `sampling_input_*` merge.
+        // Without this the batch-merge would silently drop the host-populated
+        // `sampling_output_*` → the driver's view sees an empty fast-path carrier.
+        let output_base = self.sampling_output_dst_ptrs.len() as u32;
+        self.sampling_output_dst_ptrs
+            .extend_from_slice(&req.sampling_output_dst_ptrs);
+        self.sampling_output_dst_lens
+            .extend_from_slice(&req.sampling_output_dst_lens);
+        for &off in req.sampling_output_indptr.iter().skip(1) {
+            self.sampling_output_indptr.push(output_base + off);
         }
     }
 }

@@ -349,3 +349,74 @@ fn next_input_link_helpers_and_roundtrip() {
         other => panic!("expected Forward, got {other:?}"),
     }
 }
+
+/// Durable guard for the "new carrier field silently dropped by the batch-merge"
+/// class (2nd occurrence: #6 next-input, then #27 `sampling_output_*`). Builds
+/// two per-request `req`s with the FULL sampling carrier populated — program
+/// bytecode, submit-input table, late channel, binding-map, AND the #27 cut #1
+/// `sampling_output_*` fast-path dst table — merges them via
+/// `extend_sampling_programs_from`, and asserts EVERY carrier survives with its
+/// nested CSR correctly offset. If a future field is added without wiring the
+/// merge, the corresponding assert fails.
+#[test]
+fn batch_merge_preserves_all_sampling_carrier_fields() {
+    let p0 = SamplingProgramSubmission {
+        bytecode: vec![0xAA, 0xBB],
+        inputs: vec![SamplingInput { key: 1, bytes: vec![9, 9, 9] }],
+        bindings: vec![SamplingBinding::Tensor { key: 1 }],
+        late_keys: vec![5],
+        late_inputs: vec![],
+    };
+    let p1 = sample_program();
+
+    // req0: program p0 + 1 fast-path output value (dst ptr, 4-byte cap).
+    let mut req0 = ForwardRequest::default();
+    req0.push_sampling_program(&p0);
+    req0.sampling_output_dst_ptrs = vec![0x1000];
+    req0.sampling_output_dst_lens = vec![4];
+    req0.sampling_output_indptr = vec![0, 1];
+
+    // req1: program p1 + 2 fast-path output values.
+    let mut req1 = ForwardRequest::default();
+    req1.push_sampling_program(&p1);
+    req1.sampling_output_dst_ptrs = vec![0x2000, 0x3000];
+    req1.sampling_output_dst_lens = vec![4, 8];
+    req1.sampling_output_indptr = vec![0, 2];
+
+    // Batch with every nested CSR rooted at a leading 0 (mirrors
+    // `new_batched_forward_request_with_capacity`, incl. `sampling_output_indptr`).
+    let mut batch = ForwardRequest {
+        sampling_program_indptr: vec![0],
+        sampling_program_bytes_indptr: vec![0],
+        sampling_input_indptr: vec![0],
+        sampling_late_indptr: vec![0],
+        sampling_binding_indptr: vec![0],
+        sampling_output_indptr: vec![0],
+        ..Default::default()
+    };
+    for r in [&req0, &req1] {
+        batch.extend_sampling_programs_from(r);
+        batch
+            .sampling_program_indptr
+            .push(batch.n_sampling_programs() as u32);
+    }
+
+    // Existing carriers survive (regression baseline).
+    assert_eq!(batch.sampling_program_indptr, vec![0, 1, 2]);
+    assert_eq!(batch.sampling_program_at(0), Some(p0));
+    assert_eq!(batch.sampling_program_at(1), Some(p1));
+    assert_eq!(batch.sampling_input_indptr, vec![0, 1, 3]);
+    assert_eq!(batch.sampling_late_indptr, vec![0, 1, 3]);
+    assert!(!batch.sampling_binding_kind.is_empty());
+
+    // #27 cut #1: the `sampling_output_*` fast-path dst table MUST survive the
+    // merge — concatenated payloads + the per-program CSR offset by the table
+    // base (p0's 1 output, then p1's 2 at base 1). This is the field the merge
+    // originally dropped → driver `view.sampling_output_dst_ptrs == 0` → zeros.
+    assert_eq!(
+        batch.sampling_output_dst_ptrs,
+        vec![0x1000u64, 0x2000, 0x3000]
+    );
+    assert_eq!(batch.sampling_output_dst_lens, vec![4u32, 4, 8]);
+    assert_eq!(batch.sampling_output_indptr, vec![0u32, 1, 3]);
+}

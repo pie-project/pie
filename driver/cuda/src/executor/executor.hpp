@@ -386,6 +386,20 @@ struct Executor {
     };
     std::map<std::uint32_t, RetainedSampled> retained_next_input;
 
+    // #27 cut #1 (a2) — the most recent fast-path forward's eager-D2H completion
+    // event (recorded on the tensor-I/O copy stream after that fire READ the
+    // single-buffer `pi.sampled`). delta's WAR guard waits this at the NEXT
+    // forward's sampling tail (`cudaStreamWaitEvent(forward, last_eager_d2h_done)`)
+    // so t+1's sampling WRITE to `pi.sampled` can't clobber t's still-draining D2H.
+    // nullptr until the first fast-path forward (no prior producer to gate on).
+    cudaEvent_t last_eager_d2h_done = nullptr;
+
+    // Set true by `handle_fire_batch` when it took the (a2) output→tensor
+    // fast-path (eager-D2H enqueued, forward-done deferred to the copy-stream
+    // host-func). The in-proc service reads it to set `out.deferred` so
+    // `serve_forever` skips the inline send. Reset to false at each fire's entry.
+    bool last_fire_deferred = false;
+
     // #6 WS8 P2 — device ptr of producer `link`'s retained token buffer: the
     // consumer's `late_inputs` device-alias source for `TokenRef::PrevSample`
     // (echo's seam). nullptr if the producer hasn't retained → SkippedLateBindMiss.

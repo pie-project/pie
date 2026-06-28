@@ -181,6 +181,12 @@ struct PieForwardRequestView {
     PieSlice<std::uint32_t> next_input_dest_slots;       // dest position in this fire's pi.tokens
     PieSlice<std::uint32_t> next_input_free_links;       // link ids whose last consumer drains here
 
+    // #27 cut #1 output→tensor fast-path carrier (per-output host pinned dsts,
+    // CSR per program). Empty ⇒ legacy ForwardResponse marshal.
+    PieSlice<std::uint64_t> sampling_output_dst_ptrs;    // host pinned-buf ptr per output value
+    PieSlice<std::uint32_t> sampling_output_dst_lens;    // byte capacity per dst (bounds-check)
+    PieSlice<std::uint32_t> sampling_output_indptr;      // per-program CSR into the dst arrays
+
     // Sampler attributes (SoA — read from the wire SoA arrays; view.hpp
     // applies only the small kind-remap / top_k / top_p-min_p fold).
     PieSlice<std::uint32_t> sampler_types;
@@ -312,6 +318,12 @@ struct PieInProcResponseView {
     std::uint32_t            method;
     std::int32_t             status;
     PieForwardResponseView   forward;
+    // (a2) programmable-sampling output fast-path: when set, the driver has
+    // enqueued the eager-D2H + will fire the forward-done from a copy-stream
+    // host-func once the pinned buffer is filled — `serve_forever` must NOT send
+    // inline (it hands the send to `InProcServer::defer_send_`). Default false ⇒
+    // the normal synchronous send (every legacy path + non-cuda backends).
+    bool                     deferred = false;
 };
 
 // ---- Per-batch arenas ------------------------------------------------------
@@ -487,6 +499,12 @@ inline void fill_forward_view(const PieForwardRequestDesc& f,
         slice_from(f.next_input_dest_slots_ptr, f.next_input_dest_slots_len);
     out.next_input_free_links =
         slice_from(f.next_input_free_links_ptr, f.next_input_free_links_len);
+    out.sampling_output_dst_ptrs =
+        slice_from(f.sampling_output_dst_ptrs_ptr, f.sampling_output_dst_ptrs_len);
+    out.sampling_output_dst_lens =
+        slice_from(f.sampling_output_dst_lens_ptr, f.sampling_output_dst_lens_len);
+    out.sampling_output_indptr =
+        slice_from(f.sampling_output_indptr_ptr, f.sampling_output_indptr_len);
     out.spec_token_ids    = slice_from(f.spec_token_ids_ptr, f.spec_token_ids_len);
     out.spec_position_ids = slice_from(f.spec_position_ids_ptr, f.spec_position_ids_len);
     out.spec_indptr       = slice_from(f.spec_indptr_ptr, f.spec_indptr_len);

@@ -1756,7 +1756,52 @@ impl BatchScheduler {
                         pie_driver_abi::ForwardRequest,
                         Vec<PhysicalPageId>,
                     )> = Vec::with_capacity(n_results);
-                    if token_payload_only {
+                    // #27 cut #1 eager-D2H fast-path (a2-mode): a request that set
+                    // up the `sampling_output_*` dst table had its sampled token
+                    // copied DIRECTLY to the pinned output Tensor (D2H), so the
+                    // driver response carries NO token (`tokens[]` empty). Resolve
+                    // each oneshot with success WITHOUT extracting `tokens[..]` —
+                    // the inferlet's `output()` reads the filled pinned buffer
+                    // (gated on `forward_result.is_some()`); an `Err`/drop here
+                    // would hit the abort path (txn drop + "no output tensor").
+                    // Keyed per-request on `sampling_output_*`, which
+                    // `populate_output_fastpath` sets iff it also stashed the
+                    // pinned outputs (1:1 with the host pinned-read gate, so no
+                    // skew). One-ahead MVP batches are all-or-nothing fast-path.
+                    let all_fast_path = !requests.is_empty()
+                        && requests
+                            .iter()
+                            .all(|req| !req.request.sampling_output_dst_ptrs.is_empty());
+                    if all_fast_path {
+                        for req in requests.into_iter() {
+                            // Empty `Tokens` is `Some` → the host gate passes and
+                            // reads the pinned buffer; the payload is ignored.
+                            let output = ForwardOutput::Tokens(Vec::new());
+                            let PendingRequest {
+                                request,
+                                completion,
+                                physical_page_ids,
+                                last_page_len: _,
+                            } = req;
+                            match completion {
+                                Completion::Direct(tx) => {
+                                    direct_count += 1;
+                                    tx.send(Ok(output)).ok();
+                                    deferred_drop.push((request, physical_page_ids));
+                                }
+                                Completion::Chunk { .. } => {
+                                    chunk_count += 1;
+                                    let req = PendingRequest {
+                                        request,
+                                        completion,
+                                        physical_page_ids,
+                                        last_page_len: 0,
+                                    };
+                                    req.send_result(Ok(output), submit_tx.as_ref(), page_size);
+                                }
+                            }
+                        }
+                    } else if token_payload_only {
                         for (r, req) in requests.into_iter().enumerate() {
                             let lo = batch_resp.tokens_indptr[r] as usize;
                             let hi = batch_resp.tokens_indptr[r + 1] as usize;

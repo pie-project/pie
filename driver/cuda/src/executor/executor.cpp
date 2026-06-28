@@ -45,6 +45,7 @@
 #include "sampling_ir/sampler_dispatch.hpp"
 #include "sampling_ir/group.hpp"
 #include "sampling_ir/next_input.hpp"
+#include "sampling_ir/tensor_io.hpp"
 #include "sampling_ir/program_recognizer.hpp"
 #include "sampling_ir/param_extract.hpp"
 #include "spec_expansion.hpp"
@@ -2302,6 +2303,11 @@ void handle_fire_batch(
     using clock = std::chrono::steady_clock;
     const auto t_entry = clock::now();
 
+    // #27 cut #1 (a2): cleared each fire; set only if this fire takes the
+    // output→tensor fast-path (deferred forward-done). The in-proc service reads
+    // it after the handler to drive `out.deferred`.
+    executor.last_fire_deferred = false;
+
     // Diagnostic trace (env-gated, zero-cost when unset): localizes where a
     // fire parks across the worker forward path. Pairs with the runtime-side
     // inproc submit/recv/slot-fill trace to map the a/b/c park location.
@@ -3020,6 +3026,20 @@ void handle_fire_batch(
                       << " forward_R=" << forward_R << "\n";
             std::cerr.flush();
         }
+        // ── #27 cut #1 (b): WAR guard for single-buffer pi.sampled ───────
+        // The prior fast-path fire's eager-D2H (copy stream) READS pi.sampled;
+        // this fire's forward/sampler WRITES it (alloc-once, reused). Gate this
+        // fire's cublas-stream work behind the prior fire's eager-D2H read so the
+        // in-flight copy can't be clobbered. Placed before the forward dispatch
+        // (not only the dedicated sampler tail) so it also covers the
+        // fused-lm_head-argmax / captured-graph paths that write pi.sampled
+        // DURING the forward. nullptr ⇒ first fire / no prior fast-path read ⇒
+        // no wait. Near-zero cost: the prior one-token D2H has long completed by
+        // the time this fire's matmul is enqueued (it hides under H2D + compute).
+        if (executor.last_eager_d2h_done)
+            CUDA_CHECK(cudaStreamWaitEvent(cublas.stream(),
+                                           executor.last_eager_d2h_done, 0));
+
         const ForwardDispatchResult fd = run_forward_dispatch(
             executor, ForwardDispatchInputs{
                 .R = R,
@@ -3439,6 +3459,63 @@ void handle_fire_batch(
                         std::cerr << "[ir-trace] next-input FREE link=" << freed[k]
                                   << " (host all-consumers-drained signal)\n";
                 }
+            }
+        }
+
+        // ── #27 cut #1 (a2): output→tensor fast-path ─────────────────────
+        // If the host bound per-output pinned dsts (`sampling_output_dst_ptrs`),
+        // eager-D2H each program's output VALUE into its dst on the tensor-I/O
+        // copy stream and DEFER the forward-done to a copy-stream host-func — it
+        // fires once the pinned buffer is filled (the (a2) seam; the host's
+        // output() reads the pinned bytes, not the ForwardResponse channels).
+        // MVP slice: one Token per program (the greedy `cuda_runahead` path) →
+        // device_src = pi.sampled[p]. Multi-output / rich programs fall through to
+        // the legacy marshal below (a follow-on wires last_output_ptrs()).
+        if (!view.sampling_output_dst_ptrs.empty() &&
+            view.sampling_output_indptr.size() == 2 &&
+            view.sampling_output_dst_ptrs.size() == 1 && N >= 1) {
+            const std::uint64_t dst = view.sampling_output_dst_ptrs.data()[0];
+            const std::uint32_t cap = view.sampling_output_dst_lens.data()[0];
+            if (dst != 0 && cap >= sizeof(std::int32_t)) {
+                // Single-sequence MVP: the sampled token is the LAST sampled row
+                // pi.sampled[N-1] (carrier src_row = producer n_rows-1 — the prime
+                // samples its last position; decode N=1 → row 0), NOT row p.
+                const void* src =
+                    static_cast<const void*>(pi.sampled.data() + (N - 1));
+                const std::size_t nbytes = sizeof(std::int32_t);
+                cudaEvent_t sample_done = nullptr;
+                CUDA_CHECK(cudaEventCreateWithFlags(&sample_done,
+                                                    cudaEventDisableTiming));
+                CUDA_CHECK(cudaEventRecord(sample_done, cublas.stream()));
+                cudaEvent_t t_d2h_done =
+                    sampling_ir::TensorIoEngine::instance().eager_d2h_outputs(
+                        &dst, &cap, &src, &nbytes, 1, sample_done);
+                CUDA_CHECK(cudaEventDestroy(sample_done));
+                // Persist for delta's WAR guard at the NEXT forward's sampling
+                // tail (it waits this before t+1 overwrites single-buffer
+                // pi.sampled). The previous fire's event was already consumed by
+                // this fire's guard wait, so it's safe to destroy.
+                if (executor.last_eager_d2h_done)
+                    CUDA_CHECK(cudaEventDestroy(executor.last_eager_d2h_done));
+                executor.last_eager_d2h_done = t_d2h_done;
+                executor.last_fire_deferred = true;
+                // Cut #1 (a2) deferred forward-done: count = batch_size with an
+                // EMPTY tokens[] — the sampled token rides the pinned buffer (the
+                // eager-D2H above), NOT the response. `num_requests = R` is what
+                // the scheduler counts (an empty/num_requests=0 response was the
+                // `got 0` bug); leaving tokens[] empty closes the false-pass
+                // escape hatch by construction (the gate can only pass via the
+                // pinned read). `last_fire_deferred` makes serve_forever send
+                // this response EXACTLY ONCE from the copy-stream host-func
+                // post-D2H (no early/pre-D2H send into the single-shot slot), so
+                // the host's `rx` fires only once the pinned dst is filled. The
+                // scheduler's a2-mode counts + resolves Ok(Some(success)) and
+                // skips tokens[] extraction (token is in the pinned Tensor).
+                out_resp = pie_driver::PieForwardResponseView{};
+                out_resp.num_requests = static_cast<std::uint32_t>(R);
+                write_probes(out_resp, t_entry, t_wire_parse_end, t_plan_end,
+                             t_h2d_end, t_kernel_launch_end, t_sync_end);
+                return;
             }
         }
 

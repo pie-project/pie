@@ -942,6 +942,11 @@ struct PendingForward {
     rs_fold_set: Option<Resource<crate::working_set::rs::RsWorkingSet>>,
     fold_buffered_tokens: Option<u32>,
     programs_output_kinds: Vec<Vec<pie_sampling_ir::OutputKind>>,
+    /// #27 cut #1 fast-path: pinned host buffers the driver eager-D2H's each
+    /// declared output VALUE into (empty ⇒ legacy `ForwardResponse` marshal).
+    /// Filled by the time `output()` reads them — the driver defers the
+    /// forward-done response until the D2H lands (the `(a2)` seam).
+    pinned_outputs: Vec<crate::api::tensor_io::PinnedOutput>,
     profile_start: Option<Instant>,
 }
 
@@ -965,6 +970,7 @@ async fn await_and_finalize(
         rs_fold_set,
         fold_buffered_tokens,
         programs_output_kinds,
+        pinned_outputs,
         profile_start,
     } = pending;
 
@@ -993,9 +999,29 @@ async fn await_and_finalize(
         )
     })?;
 
-    let tensors = match forward_result {
-        Some(resp) => build_output_tensors(resp, &programs_output_kinds),
-        None => Vec::new(),
+    // Reconstruct the declared output tensors. Fast-path (#27 cut #1): the driver
+    // eager-D2H'd each output VALUE into its pinned buffer; `rx` resolved only
+    // after the D2H landed (the `(a2)` deferred forward-done), so the buffers are
+    // filled — copy them out (the `ForwardResponse` output channels are
+    // success-only / empty for a fast-path pass). Legacy: marshal the response
+    // channels. Either path is gated on the forward succeeding (`forward_result`).
+    let tensors = if forward_result.is_some() && !pinned_outputs.is_empty() {
+        pinned_outputs
+            .into_iter()
+            .map(|out| {
+                let data = crate::api::tensor_io::read(&out);
+                OutputTensor {
+                    shape: out.shape.clone(),
+                    dtype: out.dtype,
+                    data,
+                }
+            })
+            .collect()
+    } else {
+        match forward_result {
+            Some(resp) => build_output_tensors(resp, &programs_output_kinds),
+            None => Vec::new(),
+        }
     };
     if let Some(start) = profile_start {
         record_execute_profile(ExecuteProfileSample::default(), elapsed_us(start.elapsed()));
@@ -1534,6 +1560,15 @@ async fn execute_impl(
             next_input_context_id,
         );
 
+        // #27 cut #1 fast-path: pre-allocate a pinned host buffer per declared
+        // output value + thread the dst pointers into `req.sampling_output_*`, so
+        // the driver eager-D2H's the sampled outputs straight into them (skipping
+        // the `ForwardResponse` marshal). Empty when not fast-path-eligible or
+        // without the `driver-cuda` feature ⇒ legacy path. Must run BEFORE submit
+        // (mutates `req`); the buffers are carried on the `PendingForward`.
+        let pinned_outputs =
+            crate::api::tensor_io::populate_output_fastpath(&mut req, &programs_output_kinds);
+
         // Single-model: the SERVICE routes to the bound model; no model_id arg.
         let submit_result =
             inference::submit_async(req, driver_idx, proj.physical_page_ids, proj.last_page_len);
@@ -1572,6 +1607,7 @@ async fn execute_impl(
             rs_fold_set,
             fold_buffered_tokens,
             programs_output_kinds,
+            pinned_outputs,
             profile_start,
         };
         state.ctx().table.get_mut(&this)?.pending = Some(pending);

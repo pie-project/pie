@@ -65,13 +65,33 @@ async fn runahead_carryover_on_real_driver() -> Result<()> {
 
     pie.shutdown().await;
 
-    // The inferlet compares the run-ahead carrier stream against the synchronous
-    // greedy stream on the same prompt and reports `MATCH=<bool>`. Greedy ⇒
-    // deterministic, so any divergence is a real carryover bug (a mis-injected or
-    // mis-timed carried token), not sampling noise.
+    // The inferlet runs two scenarios and reports `MATCH=<bool>` (Scenario A)
+    // and `CLEAR_OK=<bool>` (Scenario B). Greedy ⇒ deterministic, so any
+    // divergence is a real bug, not sampling noise.
+    //
+    // Scenario A — carrier token-exactness (1a milestone regression): the
+    // run-ahead carrier stream equals the synchronous greedy stream.
     anyhow::ensure!(
         json.contains("MATCH=true"),
         "run-ahead carryover diverged from the synchronous stream: {json}"
+    );
+    // Non-degeneracy anchor — the stream must positively equal the verified
+    // milestone tokens, not merely self-agree. Closes the blind spot where both
+    // the pipelined and sync paths read the SAME broken `output()` (e.g. a
+    // fast-path returning zeros) and FALSE-pass `pipelined == sync`.
+    anyhow::ensure!(
+        json.contains("ANCHOR_OK=true"),
+        "run-ahead output is degenerate — not the milestone tokens \
+         [198,9707,1879,374,264,4285,2025,429]; likely a broken output()/fast-path \
+         returning zeros (pipelined==sync passed but both read the broken path): {json}"
+    );
+    // Scenario B — #26 dangling-carry clear (fresh-generate host-clear): a 2nd
+    // generate on the same context after a stop-terminated pipelined generate
+    // must drop the dangling carry (no stale inject, free-link not mishandled).
+    anyhow::ensure!(
+        json.contains("CLEAR_OK=true"),
+        "#26 clear failed: 2nd generate on the same context diverged — a stale \
+         carried token was injected or the device free-link was mishandled: {json}"
     );
     Ok(())
 }

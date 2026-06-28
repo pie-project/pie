@@ -171,6 +171,7 @@ add_library(pie_driver_cuda_lib STATIC
   src/sampling_ir/runtime.cpp
   src/sampling_ir/reader.cpp
   src/sampling_ir/next_input.cpp
+  src/sampling_ir/tensor_io.cpp
   src/sampling_ir/codegen.cpp
   src/sampling_ir/jit.cpp
   src/sampling_ir/jit_backend.cpp
@@ -672,6 +673,19 @@ target_include_directories(test_next_input_device PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(test_next_input_device PRIVATE CUDA::cudart)
 add_test(NAME sampling_ir_next_input_device COMMAND test_next_input_device)
+
+# #6 WS-L4 tensor-I/O fast-path (echo) — host<->driver direct-FFI: dedicated copy
+# stream + two dedicated slab arenas (inferlet-device + sampler-output-pinned), the
+# async H2D write with Model-A self-arming R12 flag, and the eager-D2H read-cache.
+# Standalone device de-risk before composing into the executor at foxtrot's WIT
+# freeze. Needs a GPU.
+add_executable(test_tensor_io_device
+  tests/test_tensor_io_device.cpp
+  src/sampling_ir/tensor_io.cpp)
+target_include_directories(test_tensor_io_device PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_link_libraries(test_tensor_io_device PRIVATE CUDA::cudart)
+add_test(NAME sampling_ir_tensor_io_device COMMAND test_tensor_io_device)
 
 # Sampling-IR codegen (Lane L2 / charlie, W2): lowers golden PSIR programs to a
 # KernelDAG, NVRTC-compiles + launches each kernel via the driver API, and checks

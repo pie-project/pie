@@ -147,6 +147,46 @@ fn frame_forward_rs_fold_round_trip() {
     assert!(flags[1] & RS_FLAG_RESET == 0 && flags[1] & RS_FLAG_FOLD != 0);
 }
 
+/// Locks the programmable-sampling output fast-path wire ABI (#27 cut #1): the
+/// per-output eager-D2H destination fields — `sampling_output_dst_ptrs` (raw
+/// host pointers, u64), `sampling_output_dst_lens` (byte capacities), and
+/// `sampling_output_indptr` (per-program CSR) — survive the rkyv round-trip as
+/// aligned parallel arrays. The base `frame_forward_round_trip` leaves these at
+/// `..Default::default()`, so this is the only coverage of the dst descriptors
+/// over the real wire. Two programs: p0 has 2 outputs (Token + Scalar, 4 B
+/// each), p1 has 1 (Token).
+#[test]
+fn frame_forward_sampling_output_round_trip() {
+    let req = ForwardRequest {
+        token_ids: vec![1, 2],
+        position_ids: vec![0, 1],
+        qo_indptr: vec![0, 1, 2],
+        sampling_output_dst_ptrs: vec![0xDEAD_BEEF_0000_1000, 0xDEAD_BEEF_0000_2000, 0xCAFE_0000_0000_3000],
+        sampling_output_dst_lens: vec![4, 4, 4],
+        sampling_output_indptr: vec![0, 2, 3],
+        ..Default::default()
+    };
+    let f = Frame {
+        driver_id: 11,
+        payload: RequestPayload::Forward(req),
+    };
+
+    let bytes = encode_request(&f).unwrap();
+    let archived = parse_request(&bytes).unwrap();
+    let ArchivedRequestPayload::Forward(arch) = &archived.payload else {
+        panic!("expected Forward variant");
+    };
+
+    // u64 host pointers survive the wire intact (in-proc direct-FFI dst).
+    assert_eq!(
+        arch.sampling_output_dst_ptrs.as_slice(),
+        &[0xDEAD_BEEF_0000_1000u64, 0xDEAD_BEEF_0000_2000, 0xCAFE_0000_0000_3000]
+    );
+    assert_eq!(arch.sampling_output_dst_lens.as_slice(), &[4u32, 4, 4]);
+    // Per-program CSR: p0 = outputs [0,2), p1 = output [2,3).
+    assert_eq!(arch.sampling_output_indptr.as_slice(), &[0u32, 2, 3]);
+}
+
 #[test]
 fn sampler_variants_archive() {
     let samplers = vec![

@@ -337,6 +337,12 @@ pub fn new_batched_forward_request_with_capacity(n_requests: usize) -> pie_drive
         sampling_binding_kind: Vec::new(),
         sampling_binding_key: Vec::new(),
         sampling_binding_indptr: indptr(indptr_cap),
+        // #27 cut #1 output fast-path dst table: payload arrays empty, the
+        // per-program CSR seeded with a leading 0 (grown by the batch-merge in
+        // `extend_sampling_programs_from`), exactly like `sampling_input_indptr`.
+        sampling_output_dst_ptrs: Vec::new(),
+        sampling_output_dst_lens: Vec::new(),
+        sampling_output_indptr: indptr(indptr_cap),
         // WS8 P2 device-resident next-input link: empty/0 for the host-inject
         // (P1) and no-pipelining paths; populated by the device-pipeline emission
         // at integration (per-row arrays + the producer source-link).
@@ -1099,5 +1105,51 @@ mod tests {
         );
         // Per-request indptr: one request contributing 3 rows.
         assert_eq!(batch.mask_indptr, vec![0, 3]);
+    }
+
+    /// Faithful production-path durable guard for the "new carrier field silently
+    /// dropped by the batch-merge" class (2nd occurrence: #6 next-input, then #27
+    /// `sampling_output_*`). Exercises the REAL merge path —
+    /// `new_batched_forward_request` (init) + `append_request` (per-request fold)
+    /// — and asserts the #27 cut #1 `sampling_output_*` fast-path dst table
+    /// survives (the field the merge originally dropped → driver `view=0` →
+    /// zeros) ALONGSIDE `next_input_*` + `pipeline_source_link`. Catches a regress
+    /// in EITHER the init (missing leading-0 CSR) or the merge (missing concat).
+    #[test]
+    fn batch_merge_preserves_sampling_output_and_carriers() {
+        // req0: 1-token decode + 1 fast-path output + a producer source-link + a
+        // consumer next-input link.
+        let mut req0 = make_request(vec![1], vec![10], vec![]);
+        req0.sampling_output_dst_ptrs = vec![0x1000];
+        req0.sampling_output_dst_lens = vec![4];
+        req0.sampling_output_indptr = vec![0, 1];
+        req0.set_pipeline_source_link(7);
+        req0.push_next_input_link(3, 0, 0);
+
+        // req1: 1-token decode + 2 fast-path outputs.
+        let mut req1 = make_request(vec![2], vec![20], vec![]);
+        req1.sampling_output_dst_ptrs = vec![0x2000, 0x3000];
+        req1.sampling_output_dst_lens = vec![4, 8];
+        req1.sampling_output_indptr = vec![0, 2];
+
+        let mut batch = new_batched_forward_request();
+        append_request(&mut batch, &req0, &[100], 1, 16);
+        append_request(&mut batch, &req1, &[200], 1, 16);
+
+        // #27 cut #1: the fast-path dst table survives — concatenated payloads +
+        // the per-program CSR offset by the table base (p0's 1 output, p1's 2 at
+        // base 1). Before the fix this was empty → driver view=0 → all-zeros.
+        assert_eq!(
+            batch.sampling_output_dst_ptrs,
+            vec![0x1000u64, 0x2000, 0x3000]
+        );
+        assert_eq!(batch.sampling_output_dst_lens, vec![4u32, 4, 8]);
+        assert_eq!(batch.sampling_output_indptr, vec![0u32, 1, 3]);
+
+        // Other carriers survive the same merge (regression baseline).
+        assert_eq!(batch.pipeline_source_link, 7);
+        assert_eq!(batch.next_input_producer_links, vec![3]);
+        assert_eq!(batch.next_input_src_rows, vec![0]);
+        assert_eq!(batch.next_input_dest_slots, vec![0]);
     }
 }

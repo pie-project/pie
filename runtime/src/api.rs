@@ -8,6 +8,7 @@ pub mod messaging;
 pub mod model;
 pub mod kv_working_set;
 pub mod program_cache;
+pub mod tensor_io;
 pub mod program_decode;
 pub mod runtime;
 pub mod rs_working_set;

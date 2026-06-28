@@ -241,6 +241,12 @@ struct PieForwardRequestDesc {
   size_t rs_buffer_slot_indptr_len;
   const uint32_t *next_input_free_links_ptr;
   size_t next_input_free_links_len;
+  const uint64_t *sampling_output_dst_ptrs_ptr;
+  size_t sampling_output_dst_ptrs_len;
+  const uint32_t *sampling_output_dst_lens_ptr;
+  size_t sampling_output_dst_lens_len;
+  const uint32_t *sampling_output_indptr_ptr;
+  size_t sampling_output_indptr_len;
 };
 
 struct PieCopyRequestDesc {
