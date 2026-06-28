@@ -3,96 +3,141 @@
 //! `Forward` wraps the WIT `forward-pass` resource and folds in the page math
 //! that every consumer would otherwise repeat: working-page reservation
 //! before submission, position derivation, page commit after execution.
-//! Slots are attached via [`Forward::sample`] / [`Forward::probe`] and read back
-//! through typed handles on the returned [`Output`].
+//! Samplers are attached via [`Forward::sample`] / [`Forward::sampler`] and
+//! their output tensors read back through typed handles on the returned
+//! [`Output`].
 //!
 //! For the rare case where the caller needs full WIT control (custom
 //! attention masks, manual page management for speculation rollback, etc.),
 //! the underlying `forward-pass` resource is still available via
 //! `inferlet::inference::ForwardPass`.
 
-use std::marker::PhantomData;
 
 use crate::Result;
 use crate::adapter::Adapter;
 use crate::context::Context;
-use crate::pie::core::inference::Output as RawOutput;
-use crate::pie::core::inference::{ForwardPass, SlotOutput};
-use crate::sample::{self, Probe, Sampler};
+use crate::pie::core::inference::{ForwardPass, InputBinding};
+use crate::program::{HostInputDecl, ProgramHandle};
+use crate::sample::Sampler;
+use crate::tensor;
+use sampling_edsl::ir;
+
+/// A lowered standard sampler ready to attach: the tensor program, its
+/// binding-free template (`ir::Binding` per input slot), the host-input decls
+/// (shape/dtype per submit slot), the output count, and the per-fire submit
+/// values (standard-sampler params — T / top-p / min-p — keyed `T@0, filter@1`).
+pub(crate) type LoweredSampler = (
+    tensor::Program,
+    Vec<ir::Binding>,
+    Vec<HostInputDecl>,
+    u32,
+    Vec<(u32, Vec<u8>)>,
+);
 
 // =============================================================================
-// Slot handles
+// Late-bound input references (Seam A)
 // =============================================================================
 
-/// Opaque handle to a sampler slot, returned by [`Forward::sample`]. Pass to
-/// [`Output::token`] / [`Output::tokens`] to read the result.
-#[derive(Copy, Clone, Debug)]
-pub struct SampleHandle {
-    slot: u32,
-    /// Number of positions the sampler was attached to. Lets `Output::tokens`
-    /// read back the right window without separate bookkeeping.
-    arity: u32,
+/// A reference to a value produced *during* decoding and bound into a forward
+/// pass after submit rather than at build time — the §3 run-ahead carrier
+/// vocabulary. The high-level run-ahead loop translates this to a
+/// [`Forward::next_inputs`] carrier declaration on the producing pass; the
+/// host-late transform channel (grammar mask / mirostat mu) is supplied
+/// directly via `tensor.write` on a handle bound at [`Forward::sampler`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TokenRef {
+    /// The token sampled by the *previous* forward pass. The producer pass
+    /// declares the carrier destination(s) via [`Forward::next_inputs`]; the
+    /// consumer (the next pass) supplies a placeholder `input(0)` at each
+    /// destination that the carrier overwrites pre-forward from the producer's
+    /// retained sample (device path, zero host round-trip).
+    PrevSample,
 }
 
-impl SampleHandle {
-    pub(crate) fn new(slot: u32, arity: u32) -> Self {
-        Self { slot, arity }
-    }
-    pub(crate) fn slot(&self) -> u32 {
-        self.slot
-    }
-    pub(crate) fn arity(&self) -> u32 {
-        self.arity
-    }
+/// A single-channel **measurement** to attach via [`Forward::probe`] — the
+/// de-hardwiring replacement for the removed `probe(pos, kind)` wire op. Each
+/// lowers to a Graph-authored program over the model's output logits (no new
+/// wire op). The pair-shaped `(ids, values)` kinds (distribution / logprobs)
+/// are deferred to the Phase-2 tensor-shape convention.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Probe {
+    /// Raw pre-softmax logits, `[vocab]` f32 — read via [`Output::read_f32`] /
+    /// [`Output::read_bytes`].
+    Logits,
+    /// Shannon entropy of the softmax distribution, a scalar — read via
+    /// [`Output::scalar`].
+    Entropy,
+    /// The full softmax distribution over the model's vocab, `[vocab]` f32 —
+    /// read via [`Output::distribution`] (which pairs the values with the
+    /// implicit `0..vocab` token ids) or [`Output::read_f32`] (values only).
+    Distribution,
 }
 
-/// Phantom-typed handle to a probe slot, returned by [`Forward::probe`]. The
-/// type parameter selects which `Output::*` accessor compiles.
-#[derive(Debug)]
-pub struct ProbeHandle<P> {
-    slot: u32,
-    _kind: PhantomData<fn() -> P>,
+// =============================================================================
+// Sampler attach
+// =============================================================================
+
+/// The program a sampler attach references: borrowed (program-native reuse —
+/// the caller keeps the compiled program across passes) or owned (lowered from
+/// a [`Sampler`] enum, lives only for this pass).
+enum AttachedProgram<'p> {
+    Borrowed(&'p tensor::Program),
+    Owned(tensor::Program),
 }
 
-// `PhantomData<fn() -> P>` is `Copy + Clone` regardless of `P`, but the
-// auto-derive generates `where P: Copy/Clone` bounds which surprise
-// callers using probe markers like `Logprobs(Vec<u32>)`. Hand-roll the
-// impls so handles are always `Copy`.
-impl<P> Copy for ProbeHandle<P> {}
-impl<P> Clone for ProbeHandle<P> {
-    fn clone(&self) -> Self {
-        *self
-    }
-}
-
-impl<P> ProbeHandle<P> {
-    pub(crate) fn new(slot: u32) -> Self {
-        Self {
-            slot,
-            _kind: PhantomData,
+impl AttachedProgram<'_> {
+    fn get(&self) -> &tensor::Program {
+        match self {
+            AttachedProgram::Borrowed(p) => p,
+            AttachedProgram::Owned(p) => p,
         }
     }
-    pub(crate) fn slot(&self) -> u32 {
-        self.slot
-    }
 }
 
-// =============================================================================
-// Pass
-// =============================================================================
+/// How the attach's positional `input-binding` list is produced.
+enum SamplerBindings {
+    /// Fully resolved by the caller (program-native [`Forward::sampler`]).
+    Resolved(Vec<InputBinding>),
+    /// Sugar ([`Forward::sample`]): the lowered standard program's binding
+    /// template + host-input decls + submit values (the per-fire standard-sampler
+    /// params — temperature / top-p / min-p — bound as submit tensors). The
+    /// `Logits` slot is bound to the decode position at execute.
+    SugarTemplate {
+        template: Vec<ir::Binding>,
+        host_inputs: Vec<HostInputDecl>,
+        submit_values: Vec<(u32, Vec<u8>)>,
+    },
+}
 
-/// One slot attach, kept until `execute` so the WIT calls land in the same
-/// order the handles were handed out. Probes go through `into_wit()` at
-/// construction time and stash the resulting variant here.
-enum SlotSpec {
-    Sample {
-        indices: Vec<u32>,
-        sampler: Sampler,
-    },
-    Probe {
-        index: u32,
-        wit: crate::pie::core::inference::Sampler,
-    },
+/// One tensor-program attached as the pass's sampler, kept until `execute`.
+/// `bindings[i]` supplies the program input at index `i` at attach time
+/// (`logits(positions)` or a device `tensor`); `outputs` is the program's
+/// declared output-value count (single → `output()`, many → `outputs()`).
+struct SamplerAttach<'p> {
+    program: AttachedProgram<'p>,
+    bindings: SamplerBindings,
+    outputs: u32,
+}
+
+/// Lower the ergonomic [`Sampler`] enum to a tensor [`Program`](tensor::Program)
+/// plus its binding-free [`Binding`](ir::Binding) template, host-input decls,
+/// output count, and per-fire submit values. Routes through the **canonical
+/// `standard_program`** lowering ([`sampling_edsl::lower_sampler_standard`]):
+/// the standard-sampler params (T / top-p / min-p) are **host-submit tensors**
+/// (`submit_values`), not baked immediates — so the bytecode is param-INVARIANT
+/// and the host recognizer hash-matches it (the #12/#15 de-hardwiring contract).
+fn lower_sampler_to_program(sampler: &Sampler, vocab: u32) -> Result<LoweredSampler> {
+    let spec: sampling_edsl::SamplerSpec = sampler.clone().into();
+    let (built, submit_values) = sampling_edsl::lower_sampler_standard(spec, vocab)
+        .map_err(|e| format!("Forward::sample: lower sampler: {e:?}"))?;
+    let program = crate::emit::emit_program(&built.program)?;
+    Ok((
+        program,
+        built.bindings,
+        built.host_inputs,
+        built.outputs.len() as u32,
+        submit_values,
+    ))
 }
 
 /// Builder for a single forward pass. Construct via
@@ -107,13 +152,27 @@ pub struct Forward<'ctx> {
     /// Tokens fed at caller-supplied positions. Used for non-contiguous
     /// scoring (e.g. validation) where positions don't extend `seq_len`.
     explicit_inputs: Vec<(Vec<u32>, Vec<u32>)>,
-    /// Slot attachments in declaration order.
-    slots: Vec<SlotSpec>,
-    next_slot: u32,
-    mask: Option<Vec<u32>>,
+    /// Optional tensor-program sampler attached via [`Forward::sampler`].
+    /// Emitted as a `sampler(program, bindings)` call at execute time; its
+    /// declared output tensors come back through [`Output`].
+    sampler: Option<SamplerAttach<'ctx>>,
+    /// Optional NON-IR drafter-filled draft-output (#31 self-spec): the `k` draft
+    /// tokens the speculator's MTP drafter writes into a `[k]`-Token program-output
+    /// slot. NOT an IR program (no `sampler`/`pif`), so the propose forward flows past
+    /// the rich `:4123` return to the drafter at `:4459` (an IR `[k]`-Token sampler
+    /// would early-return and skip its own filler). Emitted as a `draft-output(k)`
+    /// call; the runtime returns the append-last output index, read via
+    /// [`Output::tokens`]. Set via [`Forward::draft_output`].
+    draft_output: Option<u32>,
     attn_mask: Option<Vec<Vec<u32>>>,
     adapter: Option<&'ctx Adapter>,
     zo_seed: Option<i64>,
+    /// Run-ahead carrier (§2.1): destination slots in the NEXT forward pass on
+    /// this context that carry THIS pass's sampled token(s). Emitted as a single
+    /// `next-inputs(positions)` call after the sampler; the source row is
+    /// host-computed and the consumer pass is implicit. Set via
+    /// [`Forward::next_inputs`].
+    next_inputs: Vec<u32>,
     /// Visual spans spliced at the given anchor positions, in declaration
     /// order. Emitted as `input-image` calls at execute time.
     images: Vec<(&'ctx crate::media::Image, u32)>,
@@ -135,7 +194,7 @@ impl<'ctx> Forward<'ctx> {
     /// owning context's `seq_len` at the time `pass()` was called. Useful
     /// for callers that need to derive an attention mask or condition on
     /// the upcoming position before `execute`. The sampler at index `i`
-    /// (when `pass.sample(&[i], …)`) lands at `start_position() + i`.
+    /// (when `pass.sampler(...)`) lands at `start_position() + i`.
     pub fn start_position(&self) -> u32 {
         self.ctx.seq_len()
     }
@@ -152,12 +211,12 @@ impl<'ctx> Forward<'ctx> {
             ctx,
             auto_inputs: Vec::new(),
             explicit_inputs: Vec::new(),
-            slots: Vec::new(),
-            next_slot: 0,
-            mask: None,
+            sampler: None,
+            draft_output: None,
             attn_mask: None,
             adapter: None,
             zo_seed: None,
+            next_inputs: Vec::new(),
             images: Vec::new(),
             audios: Vec::new(),
             defer_commit: false,
@@ -212,45 +271,123 @@ impl<'ctx> Forward<'ctx> {
         self
     }
 
-    // ── Slot attach ────────────────────────────────────────────────────
+    // ── Sampler attach ─────────────────────────────────────────────────
 
-    /// Attach a sampler at one or more `indices`. Indices are 0-based into
-    /// the auto-input window: `0` is the first auto-input token, `n-1` the
-    /// last. Returns a handle for reading the sampled token(s) on the
-    /// resulting [`Output`].
-    pub fn sample(&mut self, indices: &[u32], sampler: Sampler) -> SampleHandle {
-        let arity = indices.len() as u32;
-        let h = SampleHandle::new(self.next_slot, arity);
-        self.slots.push(SlotSpec::Sample {
-            indices: indices.to_vec(),
-            sampler,
+    /// Attach a tensor [`Program`](tensor::Program) as this pass's sampler.
+    /// `bindings[i]` supplies the program's input at index `i` at attach time:
+    /// [`InputBinding::Logits(positions)`](crate::pie::core::inference::InputBinding)
+    /// binds forward-pass output logits at those positions (shape `[vocab]` for
+    /// one, `[len, vocab]` for many), or [`InputBinding::Tensor`] binds a
+    /// device tensor (a per-fire value, mask, etc.).
+    ///
+    /// Returns one [`ProgramHandle`] per declared program output, in declared
+    /// order; read them off the [`Output`] with `Output::read_*`. The program
+    /// is **binding-free and reusable** — the same compiled program attaches
+    /// across passes with different bindings.
+    ///
+    /// Only one sampler per pass (single-sampler `output()`); a second call
+    /// replaces the first.
+    pub fn sampler(
+        &mut self,
+        program: &'ctx tensor::Program,
+        bindings: Vec<InputBinding>,
+        outputs: u32,
+    ) -> Vec<ProgramHandle> {
+        self.sampler = Some(SamplerAttach {
+            program: AttachedProgram::Borrowed(program),
+            bindings: SamplerBindings::Resolved(bindings),
+            outputs,
         });
-        // Multi-arity samplers produce `arity` Token slots in the output
-        // (one per index); advance the slot index by that count so any
-        // subsequent `sample` / `probe` call sees the right offset.
-        self.next_slot += arity;
-        h
+        (0..outputs).map(ProgramHandle::new).collect()
     }
 
-    /// Attach a probe at a single `index`. Returns a typed handle whose
-    /// type parameter selects which `Output::*` accessor compiles.
-    pub fn probe<P: Probe>(&mut self, index: u32, probe: P) -> ProbeHandle<P::Out> {
-        let h = ProbeHandle::new(self.next_slot);
-        self.slots.push(SlotSpec::Probe {
-            index,
-            wit: probe.into_wit(),
+    /// Attach a **non-IR drafter-filled draft-output** (#31 self-spec): declare a
+    /// `[k]`-Token output that the speculator's MTP drafter fills (the de-hardwired
+    /// draft SOURCE), NOT an IR program. It sets `output-speculative-tokens` so the
+    /// drafter fires, and — crucially — creates NO sampler program, so the propose
+    /// forward flows past the rich-IR `:4123` return to the drafter at `:4459` (an IR
+    /// `[k]`-Token sampler would early-return and skip its own filler). Returns the
+    /// [`ProgramHandle`] for the drafter-filled slot (append-last, after any sampler
+    /// outputs); read the `k` drafts via [`Output::tokens`]. v0 is single-role: a
+    /// propose forward carries the draft-output and no sampler.
+    pub fn draft_output(&mut self, k: u32) -> ProgramHandle {
+        // Append-last: the draft-output follows any sampler outputs (a v0 propose
+        // forward has none → index 0), mirroring the runtime/driver append-last seg
+        // (`program_tokens.size()`) so the handle reads the right `program_tokens` slot.
+        let idx = self.sampler.as_ref().map_or(0, |s| s.outputs);
+        self.draft_output = Some(k);
+        ProgramHandle::new(idx)
+    }
+    /// canonical `standard_program` over the model's **output (logits) vocab**
+    /// (derived internally via `output_vocab_size()` — a caller cannot supply
+    /// the wrong vocab). The program's `Logits` input is bound to the pass's
+    /// decode position (the last auto-input token), so call after
+    /// [`input`](Self::input). Returns one [`ProgramHandle`] per output (a sugar
+    /// sampler yields a single `Token`); read it with [`Output::token`].
+    pub fn sample(&mut self, sampler: Sampler) -> Result<Vec<ProgramHandle>> {
+        let vocab = crate::model::output_vocab_size();
+        let (program, template, host_inputs, outputs, submit_values) =
+            lower_sampler_to_program(&sampler, vocab)?;
+        self.sampler = Some(SamplerAttach {
+            program: AttachedProgram::Owned(program),
+            bindings: SamplerBindings::SugarTemplate {
+                template,
+                host_inputs,
+                submit_values,
+            },
+            outputs,
         });
-        self.next_slot += 1;
-        h
+        Ok((0..outputs).map(ProgramHandle::new).collect())
+    }
+
+    /// Attach a **measurement** program — the de-hardwiring replacement for the
+    /// old `probe(pos, kind)` wire op. Builds a Graph-authored measurement over
+    /// the model's output logits, lowers it, and attaches it as this pass's
+    /// sampler. Like [`sample`](Self::sample), the program's `Logits` input
+    /// binds to the decode position (the last input token), so call after
+    /// [`input`](Self::input). Returns one [`ProgramHandle`] per declared
+    /// output — read logits with [`Output::read_f32`] / [`read_bytes`](
+    /// Output::read_bytes), entropy with [`Output::scalar`].
+    ///
+    /// One sampler slot per pass: this replaces any prior `sample` / `probe`.
+    /// Only single-channel kinds are supported; the pair-shaped `(ids, values)`
+    /// kinds (distribution / logprobs) await the Phase-2 tensor-shape convention.
+    pub fn probe(&mut self, kind: Probe) -> Result<Vec<ProgramHandle>> {
+        let vocab = crate::model::output_vocab_size();
+        let built = match kind {
+            Probe::Logits => sampling_edsl::program::logits(vocab),
+            Probe::Entropy => sampling_edsl::program::entropy(vocab),
+            Probe::Distribution => sampling_edsl::program::distribution(vocab),
+        }
+        .map_err(|e| format!("Forward::probe: build measurement program: {e:?}"))?;
+        self.measure(built)
+    }
+
+    /// Attach an arbitrary Graph-authored measurement program (`Built`) as this
+    /// pass's sampler — the general form behind [`probe`](Self::probe), for
+    /// inferlets that author a **multi-output** measurement program directly
+    /// (e.g. `[Token, Logits, Entropy, Distribution, Logprobs]` in one pass). The
+    /// program's `Logits` input binds to the decode position (the last input
+    /// token), so call after [`input`](Self::input); each declared output comes
+    /// back as a tensor via `outputs()`, in declared order. Returns one
+    /// [`ProgramHandle`] per declared output. One sampler slot per pass: this
+    /// replaces any prior `sample` / `probe` / `measure`.
+    pub fn measure(&mut self, built: sampling_edsl::Built) -> Result<Vec<ProgramHandle>> {
+        let program = crate::emit::emit_program(&built.program)?;
+        let outputs = built.outputs.len() as u32;
+        self.sampler = Some(SamplerAttach {
+            program: AttachedProgram::Owned(program),
+            bindings: SamplerBindings::SugarTemplate {
+                template: built.bindings,
+                host_inputs: built.host_inputs,
+                submit_values: Vec::new(),
+            },
+            outputs,
+        });
+        Ok((0..outputs).map(ProgramHandle::new).collect())
     }
 
     // ── Decoration ─────────────────────────────────────────────────────
-
-    /// Set a static logit mask (BRLE) applied at every sampled position.
-    pub fn mask(&mut self, brle: &[u32]) -> &mut Self {
-        self.mask = Some(brle.to_vec());
-        self
-    }
 
     /// Set per-query-position attention masks. Length must match the total
     /// number of query positions across all `input` / `input_at` calls.
@@ -263,6 +400,26 @@ impl<'ctx> Forward<'ctx> {
     /// Apply an adapter (LoRA, etc.) for this forward pass.
     pub fn adapter(&mut self, adapter: &'ctx Adapter) -> &mut Self {
         self.adapter = Some(adapter);
+        self
+    }
+
+    // ── Run-ahead carrier: §2.1 ────────────────────────────────────────
+
+    /// Declare the destination **row slots** in the **NEXT** forward pass on
+    /// this context that carry **this** pass's sampled token(s). `positions` are
+    /// row indices into the next pass's dense `pi.tokens` row array (the decode
+    /// rows the carrier overwrites pre-forward) — **NOT** sequence positions and
+    /// **NOT** KV-slot indices. For single-sequence decode this is `[0]` (row
+    /// 0); for a batch of B sequences, `[0..B)`. The guest names only these
+    /// destination rows: the source row in this pass is host-computed (prefill →
+    /// last row, single-row decode → row 0), and the consumer is implicit — the
+    /// next pass supplies a placeholder `input(0)` at each destination row that
+    /// the carrier overwrites from this pass's retained sample. The carry is
+    /// scoped to this producing context (a pass on a different context drops a
+    /// still-pending carry). Emitted after the sampler
+    /// (WIT `forward-pass.next-inputs`).
+    pub fn next_inputs(&mut self, positions: Vec<u32>) -> &mut Self {
+        self.next_inputs = positions;
         self
     }
 
@@ -300,12 +457,12 @@ impl<'ctx> Forward<'ctx> {
             ctx,
             auto_inputs,
             explicit_inputs,
-            slots,
-            next_slot: _,
-            mask,
+            sampler,
+            draft_output,
             attn_mask,
             adapter,
             zo_seed,
+            next_inputs,
             images,
             audios,
             defer_commit,
@@ -323,6 +480,10 @@ impl<'ctx> Forward<'ctx> {
             soft_tokens += audio.token_count();
         }
         let n_write = n_auto + soft_tokens;
+        // Tokens that yield a decode position: the auto/explicit text inputs. A
+        // carried token rides as a placeholder `input(0)` supplied by the
+        // run-ahead loop, so it is already counted in `n_auto`.
+        let n_decode = n_auto;
 
         let pass = ForwardPass::new();
 
@@ -332,8 +493,8 @@ impl<'ctx> Forward<'ctx> {
         // (pure decode-from-cache / scoring) reads the whole materialized
         // context read-only.
         if n_write > 0 {
-            let (generation, indices, valid_lens, ctx_pages) = ctx.prepare_write(n_write)?;
-            ctx.attach_kv(&pass, generation, indices, valid_lens, ctx_pages);
+            let w = ctx.prepare_write(n_write)?;
+            ctx.attach_kv(&pass, &w);
         } else {
             ctx.attach_full_context(&pass);
         }
@@ -360,29 +521,90 @@ impl<'ctx> Forward<'ctx> {
             pass.input_tokens(toks, pos);
         }
 
-        for spec in slots {
-            match spec {
-                SlotSpec::Sample { indices, sampler } => {
-                    let wit: crate::pie::core::inference::Sampler = sampler.into();
-                    pass.sampler(&indices, &wit);
-                }
-                SlotSpec::Probe { index, wit } => {
-                    pass.sampler(&[index], &wit);
-                }
-            }
-        }
-
-        if let Some(m) = mask {
-            pass.logit_mask(&m);
-        }
         if let Some(m) = attn_mask {
             pass.attention_mask(&m);
         }
 
-        let raw = pass
-            .execute()
-            .await
-            .map_err(|e| format!("Forward::execute: forward pass failed: {e}"))?;
+        // Attach the tensor-program sampler (if any). Binding `i` supplies the
+        // program input at index `i`; each program output value comes back as a
+        // raw `tensor` via `output()` / `outputs()`, in declared output order. A
+        // no-sampler pass (prefill/flush) carries no sampler and yields none.
+        let mut sampler_outputs: Option<u32> = None;
+        if let Some(SamplerAttach {
+            program,
+            bindings,
+            outputs,
+        }) = sampler
+        {
+            let resolved = match bindings {
+                SamplerBindings::Resolved(b) => b,
+                SamplerBindings::SugarTemplate {
+                    template,
+                    host_inputs,
+                    submit_values,
+                } => {
+                    // Sugar: bind the program's `Logits` slot to the decode
+                    // position (the last input/carried token). Requires a decode
+                    // position. The standard-sampler params ride `submit_values`,
+                    // resolved against `host_inputs` into submit tensors.
+                    if n_decode == 0 {
+                        return Err("Forward::sample: no decode position — a sampler \
+                            needs an input token; call `input(...)` before \
+                            `sample(...)`."
+                            .to_string());
+                    }
+                    let decode_pos = ctx.seq_len + n_decode - 1;
+                    crate::program::resolve_bindings(
+                        &template,
+                        &host_inputs,
+                        &[decode_pos],
+                        &submit_values,
+                    )?
+                }
+            };
+            pass.sampler(program.get(), resolved);
+            sampler_outputs = Some(outputs);
+        }
+
+        // Non-IR drafter-filled draft-output (#31 self-spec): a `[k]`-Token output the
+        // speculator's drafter fills post-`:4459`. NOT a sampler program (no `pif`), so
+        // the propose forward flows past the rich `:4123` return to the drafter that
+        // fills it. Appended after any sampler outputs — the WIT func returns the
+        // runtime-assigned append-last index; counted here so `execute` reads it back as
+        // the last output tensor (read by the inferlet via `out.tokens(draft_handle)`).
+        if let Some(k) = draft_output {
+            let _slot = pass.draft_output(k);
+            sampler_outputs = Some(sampler_outputs.unwrap_or(0) + 1);
+        }
+
+        // Run-ahead carrier (§2.1): declare the destination slots in the NEXT
+        // pass that carry this pass's sampled token(s). Emitted after the
+        // sampler (the source is its first output). The §2.2 host-late transform
+        // channel (grammar mask / mirostat mu) is supplied separately by the
+        // inferlet via `tensor.write` on a bound handle.
+        if !next_inputs.is_empty() {
+            pass.next_inputs(&next_inputs);
+        }
+
+        // Eager submit (synchronous fire); the result is awaited via `output()`
+        // / `outputs()`.
+        pass.execute();
+
+        // Retrieve the sampler's declared output tensor(s): a single-output
+        // sampler uses `output()`; a multi-output program (e.g. mirostat's
+        // `[token, surprise]`) uses `outputs()`. A no-sampler pass yields none.
+        let tensors = match sampler_outputs {
+            Some(n) if n <= 1 => vec![
+                pass.output()
+                    .await
+                    .map_err(|e| format!("Forward::execute: output: {e}"))?,
+            ],
+            Some(_) => pass
+                .outputs()
+                .await
+                .map_err(|e| format!("Forward::execute: outputs: {e}"))?,
+            None => Vec::new(),
+        };
 
         // Advance the sequence cursor past the materialized tail tokens. Full
         // pages auto-seal host-side on the forward-txn commit; there is no
@@ -399,7 +621,7 @@ impl<'ctx> Forward<'ctx> {
             ctx.snapshottable = false;
         }
 
-        Ok(Output::new(raw))
+        Ok(Output::new(tensors))
     }
 }
 
@@ -410,120 +632,115 @@ impl<'ctx> Forward<'ctx> {
 /// Result of one forward-pass execution — produced by both
 /// [`Forward::execute`] and [`GenStep::execute`](crate::generation::GenStep::execute).
 ///
-/// **Common path** ([`Generator`](crate::generation::Generator)): read
-/// the [`tokens`](Self::tokens) field for the accepted tokens this step
-/// (post stop / max-tokens truncation). The auto-attached sampler's
-/// [`SampleHandle`] is also exposed via [`auto_sampler`](Self::auto_sampler)
-/// for callers that want the pre-truncation verifier output.
+/// Holds the attached sampler program's output **tensors**, in the program's
+/// declared output order (the WIT `forward-pass.output()` list). Read them with
+/// the typed `read_*` accessors using the [`ProgramHandle`]s returned by
+/// [`Forward::sampler`]; reads are async because the tensors are device-resident
+/// (`tensor.read()`).
 ///
-/// **Raw `Forward`**: read sampler slots via [`token`](Self::token) /
-/// [`tokens_at`](Self::tokens_at) using the handles returned at attach
-/// time. The [`tokens`](Self::tokens) field is empty.
-///
-/// **Probes** (both paths): [`distribution`](Self::distribution) /
-/// [`logits`](Self::logits) / [`logprobs`](Self::logprobs) /
-/// [`entropy`](Self::entropy) take a typed [`ProbeHandle`].
-///
-/// Mismatched access (reading a sampler slot through a probe handle, or
-/// vice versa) returns `None`.
+/// A no-sampler pass (prefill / flush) carries no output tensors.
 pub struct Output {
-    raw: RawOutput,
-    /// Generator-accepted tokens this step, post stop / max-tokens
-    /// truncation. Empty for raw `Forward::execute` (no Generator state).
+    /// The attached sampler program's output tensors, in declared output order.
+    /// Each is a device-resident typed buffer; read via the typed accessors
+    /// using the [`ProgramHandle`]s returned by [`Forward::sample`].
+    tensors: Vec<tensor::Tensor>,
+    /// Generator-accepted tokens this step, post stop / max-tokens truncation.
+    /// Empty for a raw `Forward::execute` (no Generator state).
     pub tokens: Vec<u32>,
-    auto_sampler: Option<SampleHandle>,
 }
 
 impl Output {
-    pub(crate) fn new(raw: RawOutput) -> Self {
+    pub(crate) fn new(tensors: Vec<tensor::Tensor>) -> Self {
         Self {
-            raw,
+            tensors,
             tokens: Vec::new(),
-            auto_sampler: None,
         }
     }
 
-    pub(crate) fn from_generator(
-        raw: RawOutput,
-        tokens: Vec<u32>,
-        auto_sampler: Option<SampleHandle>,
-    ) -> Self {
-        Self {
-            raw,
-            tokens,
-            auto_sampler,
-        }
+    pub(crate) fn from_generator(tensors: Vec<tensor::Tensor>, tokens: Vec<u32>) -> Self {
+        Self { tensors, tokens }
     }
 
-    /// Underlying WIT output, for callers who need the raw slot list or the
-    /// speculative side channel (`raw.spec_tokens`, `raw.spec_positions`).
-    pub fn raw(&self) -> &RawOutput {
-        &self.raw
+    /// Number of sampler output tensors.
+    pub fn len(&self) -> usize {
+        self.tensors.len()
     }
 
-    /// Handle for the generator's auto-attached sampler. `None` for raw
-    /// `Forward` results and for steps where
-    /// [`GenStep::clear_sampler`](crate::generation::GenStep::clear_sampler)
-    /// was called.
-    pub fn auto_sampler(&self) -> Option<SampleHandle> {
-        self.auto_sampler
+    /// True when the pass produced no output tensors (e.g. a prefill/flush).
+    pub fn is_empty(&self) -> bool {
+        self.tensors.is_empty()
     }
 
-    /// First token from a single-index sampler slot.
-    pub fn token(&self, h: SampleHandle) -> Option<u32> {
-        match self.raw.slots.get(h.slot() as usize)? {
-            SlotOutput::Token(t) => Some(*t),
-            _ => None,
-        }
+    /// Borrow the output tensor for a handle (declared output order), or
+    /// `None` if the index is out of range.
+    pub fn tensor(&self, h: ProgramHandle) -> Option<&tensor::Tensor> {
+        self.tensors.get(h.index() as usize)
     }
 
-    /// Tokens at the slot range a multi-index sampler covers. Returns one
-    /// token per index the sampler was attached to. In speculative mode
-    /// the slice may be shorter than `arity` if the verifier rejected
-    /// drafts.
-    pub fn tokens_at(&self, h: SampleHandle) -> Vec<u32> {
-        let mut out = Vec::with_capacity(h.arity() as usize);
-        let start = h.slot() as usize;
-        for i in 0..(h.arity() as usize) {
-            match self.raw.slots.get(start + i) {
-                Some(SlotOutput::Token(t)) => out.push(*t),
-                _ => break,
-            }
-        }
-        out
+    /// Raw little-endian bytes of an output tensor (downloads it host-side).
+    pub async fn read_bytes(&self, h: ProgramHandle) -> Result<Vec<u8>> {
+        let t = self
+            .tensors
+            .get(h.index() as usize)
+            .ok_or_else(|| format!("Output::read_bytes: no output tensor at index {}", h.index()))?;
+        t.read()
+            .map_err(|e| format!("Output::read_bytes: tensor read failed: {e}"))
     }
 
-    /// Distribution as `(ids, probs)` for a [`Distribution`](sample::Distribution) probe.
-    pub fn distribution(&self, h: ProbeHandle<sample::Distribution>) -> Option<(&[u32], &[f32])> {
-        match self.raw.slots.get(h.slot() as usize)? {
-            SlotOutput::Distribution((ids, ps)) => Some((ids.as_slice(), ps.as_slice())),
-            _ => None,
-        }
+    /// `u32` lanes of an output tensor — the sampled-token / index case.
+    pub async fn read_u32(&self, h: ProgramHandle) -> Result<Vec<u32>> {
+        let bytes = self.read_bytes(h).await?;
+        Ok(bytes
+            .chunks_exact(4)
+            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect())
     }
 
-    /// Raw logits bytes for a [`Logits`](sample::Logits) probe.
-    pub fn logits(&self, h: ProbeHandle<sample::Logits>) -> Option<&[u8]> {
-        match self.raw.slots.get(h.slot() as usize)? {
-            SlotOutput::Logits(b) => Some(b.as_slice()),
-            _ => None,
-        }
+    /// `f32` lanes of an output tensor — scalar / distribution measurement.
+    pub async fn read_f32(&self, h: ProgramHandle) -> Result<Vec<f32>> {
+        let bytes = self.read_bytes(h).await?;
+        Ok(bytes
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect())
     }
 
-    /// Logprob list for a [`Logprob`](sample::Logprob) or
-    /// [`Logprobs`](sample::Logprobs) probe. Length is 1 for a single-token
-    /// query, K for a list query.
-    pub fn logprobs(&self, h: ProbeHandle<sample::Logprobs>) -> Option<&[f32]> {
-        match self.raw.slots.get(h.slot() as usize)? {
-            SlotOutput::Logprobs(v) => Some(v.as_slice()),
-            _ => None,
-        }
+    /// Sampled token id for a handle — the common single-token case (the first
+    /// `u32`/`i32` lane of the output tensor).
+    pub async fn token(&self, h: ProgramHandle) -> Result<u32> {
+        self.read_u32(h)
+            .await?
+            .into_iter()
+            .next()
+            .ok_or_else(|| format!("Output::token: output tensor at index {} is empty", h.index()))
     }
 
-    /// Entropy for an [`Entropy`](sample::Entropy) probe.
-    pub fn entropy(&self, h: ProbeHandle<sample::Entropy>) -> Option<f32> {
-        match self.raw.slots.get(h.slot() as usize)? {
-            SlotOutput::Entropy(v) => Some(*v),
-            _ => None,
-        }
+    /// All sampled token ids for a handle — the `[k]`-Token case (a program output
+    /// declared with shape `[k]`, e.g. a draft/spec token window). Returns the `k`
+    /// tokens in declared order; for a single `Token` output this is a 1-element
+    /// vec (prefer [`Output::token`] there).
+    pub async fn tokens(&self, h: ProgramHandle) -> Result<Vec<u32>> {
+        self.read_u32(h).await
+    }
+
+    /// Scalar measurement for a handle (e.g. mirostat surprise `S`) — the first
+    /// `f32` lane of the output tensor.
+    pub async fn scalar(&self, h: ProgramHandle) -> Result<f32> {
+        self.read_f32(h)
+            .await?
+            .into_iter()
+            .next()
+            .ok_or_else(|| format!("Output::scalar: output tensor at index {} is empty", h.index()))
+    }
+
+    /// Full-distribution measurement for a handle ([`Probe::Distribution`]) —
+    /// the softmax `values` (`f32`, one per vocab entry) paired with their
+    /// implicit token `ids` (the vocab range `0..values.len()`). Returns
+    /// `(ids, values)`; index `i` of each corresponds to token id `i`.
+    pub async fn distribution(&self, h: ProgramHandle) -> Result<(Vec<u32>, Vec<f32>)> {
+        let values = self.read_f32(h).await?;
+        let ids = (0..values.len() as u32).collect();
+        Ok((ids, values))
     }
 }
+

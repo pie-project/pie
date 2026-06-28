@@ -72,8 +72,19 @@ async fn serve(socket: WebSocket, state: GatewayState, ident: Identity) {
         tokio::select! {
             tok = next_token(&mut cur) => match tok {
                 Some(Tokens::Chunk(msg)) => {
-                    if tx.send(Message::Text(encode(&msg))).await.is_err() {
-                        break; // user hung up
+                    // `pie-client` decodes `ServerMessage` as MessagePack over
+                    // binary frames (its reader drops Text), so the turn's
+                    // response stream must be binary msgpack — not JSON text.
+                    // On the (near-impossible) encode failure, log + drop the
+                    // frame rather than send an empty binary the client can't
+                    // decode.
+                    match encode(&msg) {
+                        Some(bytes) => {
+                            if tx.send(Message::Binary(bytes)).await.is_err() {
+                                break; // user hung up
+                            }
+                        }
+                        None => continue,
                     }
                 }
                 // Clean end-of-turn: tell the client, then park awaiting the next.
@@ -168,8 +179,11 @@ fn parse_incoming(text: &str) -> Result<Incoming, String> {
 }
 
 fn parse_incoming_bytes(bytes: &[u8]) -> Result<Incoming, String> {
+    // `pie-client` sends `ClientMessage` as MessagePack over binary frames
+    // (`rmp_serde::encode::to_vec_named`). Decode with the same codec — a JSON
+    // decode here silently fails every frame and the turn never dispatches.
     let payload: ClientMessage =
-        serde_json::from_slice(bytes).map_err(|e| format!("bad client frame: {e}"))?;
+        rmp_serde::from_slice(bytes).map_err(|e| format!("bad client frame: {e}"))?;
     Ok(Incoming::Turn(into_turn(payload)))
 }
 
@@ -183,8 +197,18 @@ fn into_turn(payload: ClientMessage) -> TurnInput {
     }
 }
 
-fn encode(msg: &pie_client_api::ServerMessage) -> String {
-    serde_json::to_string(msg).unwrap_or_else(|e| error_json(&e.to_string()))
+/// Encode a `ServerMessage` as MessagePack for a binary WS frame — the codec
+/// `pie-client`'s reader expects (`rmp_serde::decode::from_slice`). `None` on
+/// an encode failure (logged), so the caller drops the frame rather than
+/// sending an undecodable empty binary.
+fn encode(msg: &pie_client_api::ServerMessage) -> Option<Vec<u8>> {
+    match rmp_serde::to_vec_named(msg) {
+        Ok(bytes) => Some(bytes),
+        Err(e) => {
+            tracing::error!(error = %e, "ServerMessage msgpack encode failed; dropping frame");
+            None
+        }
+    }
 }
 
 fn turn_done_json() -> String {

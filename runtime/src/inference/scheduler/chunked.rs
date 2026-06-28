@@ -96,6 +96,7 @@ impl PendingRequest {
             completion,
             physical_page_ids,
             last_page_len,
+            program_identity_hashes,
         } = self;
         let Completion::Direct(response_tx) = completion else {
             unreachable!("chunk continuations returned above");
@@ -119,6 +120,8 @@ impl PendingRequest {
             },
             physical_page_ids: chunk.physical_page_ids,
             last_page_len: chunk.last_page_len,
+            // Carry the original request's identity onto the first chunk.
+            program_identity_hashes,
         })
     }
 
@@ -139,6 +142,7 @@ impl PendingRequest {
             completion,
             physical_page_ids: _,
             last_page_len: _,
+            program_identity_hashes: _,
         } = self;
 
         let result = result.map(Into::into);
@@ -270,6 +274,10 @@ impl ChunkContinuation {
             },
             physical_page_ids: chunk.physical_page_ids,
             last_page_len: chunk.last_page_len,
+            // Prefill-chunk continuation: re-enters the scheduler via `submit_tx`
+            // and re-announces its identity on arrival; the per-program hashes are
+            // recomputed at the decode/sampling step, not carried on the chunk.
+            program_identity_hashes: Vec::new(),
         })
     }
 }
@@ -1170,6 +1178,7 @@ mod tests {
                 tx,
                 (0..pages).map(|p| 100 + p).collect(),
                 last_page_len,
+                Vec::new(),
             ),
             rx,
         )
@@ -1206,6 +1215,7 @@ mod tests {
             tx,
             (0..pages).map(|p| 100 + p).collect(),
             last_page_len,
+            Vec::new(),
         )
     }
 

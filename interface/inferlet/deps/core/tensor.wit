@@ -1,0 +1,102 @@
+interface tensor {
+    use types.{error};
+
+    type input-index = u32;
+    type value-id = u32;
+
+    /// Tensor dimensions. Rank is `shape.len()`: `[]` is scalar, `[n]` is a
+    /// vector, `[m, n]` is a matrix. All dimensions are static; dynamic/ragged
+    /// buffers are not represented.
+    type shape = list<u32>;
+
+    variant dtype { %f32, %i32, %u32, %bool }
+
+    /// Packed little-endian tensor payload. The runtime validates byte length
+    /// against the tensor shape/dtype.
+    type data = list<u8>;
+
+    /// Device-resident typed buffer. The inferlet can upload/download through
+    /// host calls, but never receives a raw device pointer.
+    resource tensor {
+        constructor(shape: shape, dtype: dtype);
+        from-data: static func(shape: shape, dtype: dtype, data: data) -> result<tensor, error>;
+        shape: func() -> shape;
+        dtype: func() -> dtype;
+        write: func(data: data) -> result<_, error>;
+        read: func() -> result<data, error>;
+    }
+
+    /// -- tensor-program substrate -------------------
+
+    /// When a program input's value is gathered. `submit` = present at
+    /// `execute()` (bound via `resolve-bindings`); `late` = supplied after
+    /// submit through the late channel (`tensor.write` into the device-aliased
+    /// program input — e.g. a grammar mask computed post-logits). Encoded
+    /// additively (bit 7 of the dtype byte in L0 bytecode), so v4 decodes as
+    /// `submit`. `self-spec-draft-input` is late-class but **driver-internal**
+    /// (#31 self-spec verify): the driver fills the binding from the refed draft
+    /// tokens resident at the verify matrix base (`pi.tokens + sample_row + 1`)
+    /// with NO host upload and NO late device ptr; the resolver binds it
+    /// flag-first. Rides the late bit in bytecode (degrades to `late` for a stale
+    /// reader); the structured manifest carries the precise role.
+    variant readiness { submit, late, self-spec-draft-input }
+
+    record input { shape: shape, dtype: dtype, ready: readiness }
+    record value { id: value-id, shape: shape, dtype: dtype }
+
+    /// Marshaling kind of a declared program output — how the host routes the
+    /// value into the response. Mirrors sampling-ir `OutputKind`; discriminants
+    /// are FROZEN (token=0 .. embedding=6) — do not reorder/renumber.
+    variant output-kind { token, distribution, logits, logprobs, entropy, scalar, embedding }
+
+    /// A declared program output: the SSA value id to expose plus its marshaling
+    /// kind. The kind is carried EXPLICITLY (not inferred from dtype) so the
+    /// typed float kinds — `logits`/`logprobs`/`distribution`, all `f32` — survive
+    /// the front door instead of collapsing to `scalar`.
+    record output { id: value-id, kind: output-kind }
+
+    variant literal { %f32(f32), %i32(s32), %u32(u32), %bool(bool) }
+    variant predicate { rank-le(value-id), cummass-le(value-id), prob-ge(value-id) }
+    variant rng-kind { uniform, gumbel }
+
+    variant op-kind {
+        input(input-index),
+        const(literal),
+        exp(value-id), log(value-id), neg(value-id), recip(value-id), abs(value-id), sign(value-id),
+        add(tuple<value-id, value-id>), sub(tuple<value-id, value-id>), mul(tuple<value-id, value-id>), div(tuple<value-id, value-id>),
+        max-elem(tuple<value-id, value-id>), min-elem(tuple<value-id, value-id>),
+        gt(tuple<value-id, value-id>), ge(tuple<value-id, value-id>), eq(tuple<value-id, value-id>),
+        select(tuple<value-id, value-id, value-id>),
+        reduce-sum(value-id), reduce-max(value-id), reduce-min(value-id), reduce-argmax(value-id),
+        broadcast(tuple<value-id, shape>),
+        cumsum(value-id), cumprod(value-id),
+        sort-desc(value-id),
+        pivot-threshold(tuple<value-id, predicate>),
+        gather(tuple<value-id, value-id>),
+        /// Per-row column pick: `out[i] = src[i, idx[i]]`. `src` is a matrix
+        /// `[m, n]`; `idx` a length-`m` integer vector of one column index per
+        /// row; result is length `m` of `src`'s dtype. This is NOT a whole-row
+        /// select — it is the per-row gather the lossless spec-verify accept
+        /// ratio needs (`p[i, draft[i]]`). Out-of-range index → 0 in that lane.
+        gather-row(tuple<value-id, value-id>),
+        scatter-add(tuple<value-id, value-id, value-id>), scatter-set(tuple<value-id, value-id, value-id>),
+        /// Apply a packed allowed-token bitmask to logits: `out[j] =
+        /// bit_j(mask) ? logits[j] : -inf`, `bit_j = (mask[j>>5] >> (j&31)) & 1`.
+        /// Bit 1 = allowed (pass-through), bit 0 = disallowed (-inf). `logits`
+        /// `[n]`; `mask` `[ceil(n/32)]` u32 (word-indexed, not broadcast);
+        /// result is logits' shape/dtype. The de-hardwired grammar mask op.
+        mask-apply(tuple<value-id, value-id>),
+        rng(tuple<u32, shape, rng-kind>),
+    }
+
+    /// Values defined by this op. Operand positions in `kind` reference
+    /// previously-defined SSA value ids. The validator checks output arity and
+    /// output shape/dtype for each op kind.
+    record op { outputs: list<value>, kind: op-kind }
+
+    /// Reusable compiled tensor program. Construct once, then attach by
+    /// borrowed handle from model-specific interfaces such as inference.
+    resource program {
+        constructor(inputs: list<input>, ops: list<op>, outputs: list<output>);
+    }
+}

@@ -5,6 +5,18 @@ members = [
     "context",
     "error",
     "generate",
+    "grammar",
+    "grammar-late",
+    "mirostat",
+    "entropycheck",
+    "tempgen",
+    "multisamp",
+    "isolatedtopp",
+    "runahead",
+    "specverify",
+    "specgreedy",
+    "grammarmb",
+    "selfspec",
 ]
 
 [workspace.dependencies]

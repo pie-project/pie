@@ -16,9 +16,14 @@ pub fn default_config_content() -> String {
         #[cfg(feature = "driver-cuda")]
         Some(Flavor::Cuda) => CUDA_DRIVER_BLOCK,
         Some(Flavor::Dummy) => DUMMY_DRIVER_BLOCK,
-        // default_flavor always returns Some because dummy is linked
-        // unconditionally. Keep this fallback for exhaustiveness.
-        None => DUMMY_DRIVER_BLOCK,
+        // Fallback for exhaustiveness: `default_flavor` always returns `Some`
+        // (dummy is linked unconditionally), and `pie-worker` may compile
+        // `Flavor::Cuda`/`Metal` while this crate's matching `driver-*` arm is
+        // cfg'd off (workspace feature-unification can desync the two) — those
+        // land here → the dummy block. Unreachable at runtime (default_flavor
+        // returns only a compiled flavor); keeps the match exhaustive across
+        // all feature sets.
+        _ => DUMMY_DRIVER_BLOCK,
     };
     // The worker config blocks were authored top-level; nest them under the
     // `[worker]` section of the standalone schema. (Longer headers first so a

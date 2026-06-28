@@ -1,29 +1,32 @@
 //! End-to-end exercise of the programming-model samplers.
 //!
-//! Attaches FIVE samplers/probes to the SAME forward-pass slot (the last
-//! token of a short prompt) — all in one execute() — and verifies every
-//! kind of distribution-access works:
+//! The de-hardwired multi-measurement form: instead of attaching several
+//! probes to one pass, it authors **ONE multi-output Graph program** (declared
+//! outputs `[Token, Logits, Entropy, Distribution, Logprobs]`) and attaches it
+//! via [`Forward::measure`], so the host marshals back **N tensors** through
+//! `outputs()`. This is the real validation of the per-output-value path. The
+//! program computes, all in one pass over the decode-slot logits:
 //!
-//!   1. `Sampler::Argmax`           greedy → produces a sampled token id
-//!   2. `Probe::Logits`             full vocab logits as bytes
-//!   3. `Probe::Distribution`       top-8 (id, prob) pairs
-//!   4. `Probe::Logprob(t)`         log p(t) for a chosen token
-//!   5. `Probe::Logprobs(ts)`       log p(t) for several tokens
-//!   6. `Probe::Entropy`            H(p) of the unscaled distribution
+//!   0. `Token`         greedy `argmax(logits)` → a sampled token id
+//!   1. `Logits`        full vocab logits (f32 bytes)
+//!   2. `Entropy`       `H(p) = -Σ p·log p` (scalar)
+//!   3. `Distribution`  full softmax `[vocab]` (top-8 derived guest-side)
+//!   4. `Logprobs`      full log-softmax `[vocab]` (per-candidate logprobs
+//!                      indexed guest-side)
 //!
 //! Then cross-checks the values against each other:
 //!
 //!   * argmax of decoded logits == greedy token == distribution[0].id
 //!   * logprob(greedy) ≈ ln(distribution.first_prob)
-//!   * sum(exp(logprob(t)) for t in distribution.ids) ≈ 1.0
-//!   * entropy >= 0
+//!   * the top-8 probabilities are sorted descending
+//!   * 0 <= entropy <= ln(vocab)
 //!   * logprobs(ts) values match individual logprob lookups
 //!
 //! Prints structured KEY=VALUE lines that the host-side test asserts on.
 
 use inferlet::{
     Context, Result,
-    sample::{Distribution, Entropy, Logits, Logprob, Logprobs, Sampler},
+    sampling::{Built, Graph, OutputKind},
 };
 use serde::Deserialize;
 
@@ -49,6 +52,30 @@ fn argmax(xs: &[f32]) -> usize {
     best_i
 }
 
+/// Build ONE multi-output measurement program — the de-hardwired multi-probe
+/// form. Every measurement is a declared output of a single Graph program,
+/// marshaled back as N tensors via `outputs()`. Declared output order:
+///   0 `Token` (argmax)   1 `Logits`   2 `Entropy`   3 `Distribution` (softmax)
+///   4 `Logprobs` (full log-softmax — indexed guest-side for any candidate).
+/// Top-k and per-candidate logprobs are derived guest-side from the full
+/// distribution / log-softmax outputs (no `SortDesc` / host-input candidate
+/// tensors needed).
+fn build_suite_program(vocab: u32) -> Result<Built> {
+    let g = Graph::new(vocab);
+    let logits = g.intrinsic_logits_dyn();
+    // Numerically-stable log-softmax and softmax.
+    let shifted = logits.sub(&logits.reduce_max());
+    let log_p = shifted.sub(&shifted.exp().reduce_sum().log()); // log-softmax [vocab]
+    let p = log_p.exp(); // softmax [vocab]
+    g.output(&logits.argmax(), OutputKind::Token); // 0
+    g.output(&logits, OutputKind::Logits); // 1
+    g.output(&p.mul(&log_p).reduce_sum().neg(), OutputKind::Entropy); // 2  (-Σ p·log p)
+    g.output(&p, OutputKind::Distribution); // 3
+    g.output(&log_p, OutputKind::Logprobs); // 4
+    g.build()
+        .map_err(|e| format!("sampler-suite: build program: {e:?}"))
+}
+
 #[inferlet::main]
 async fn main(_input: Input) -> Result<String> {
     let mut ctx = Context::new()?;
@@ -64,30 +91,43 @@ async fn main(_input: Input) -> Result<String> {
     let cand_c: u32 = 3000;
     let cand_list = vec![cand_a, cand_b, cand_c];
 
-    // Single forward pass with all sampler/probe kinds at the same slot.
-    // We append a placeholder token at the next position to drive a single
-    // decode step — Pass takes care of the page math and commit.
+    // ONE multi-output measurement program at the decode slot, all in one
+    // execute() — the de-hardwired replacement for attaching 6 probes.
+    let built = build_suite_program(inferlet::model::output_vocab_size())?;
+
     let mut pass = ctx.forward();
     pass.input(&[0u32]);
-
-    let h_greedy = pass.sample(&[0], Sampler::Argmax);
-    let h_logits = pass.probe(0, Logits);
-    let h_dist = pass.probe(0, Distribution { temperature: 1.0, k: 8 });
-    let h_lp_a = pass.probe(0, Logprob(cand_a));
-    let h_lp_many = pass.probe(0, Logprobs(cand_list.clone()));
-    let h_entropy = pass.probe(0, Entropy);
+    let hs = pass.measure(built)?;
 
     let output = pass.execute().await?;
 
-    let greedy_tok = output.token(h_greedy).ok_or("slot 0 not Token")?;
-    let logit_bytes = output.logits(h_logits).ok_or("slot 1 not Logits")?;
-    let (dist_ids, dist_probs) = output.distribution(h_dist).ok_or("slot 2 not Distribution")?;
-    let lp_a = output.logprobs(h_lp_a).ok_or("slot 3 not Logprobs")?;
-    let lp_many = output.logprobs(h_lp_many).ok_or("slot 4 not Logprobs")?;
-    let entropy = output.entropy(h_entropy).ok_or("slot 5 not Entropy")?;
+    let greedy_tok = output.token(hs[0]).await?;
+    let logit_bytes = output.read_bytes(hs[1]).await?;
+    let entropy = output.scalar(hs[2]).await?;
+    let probs = output.read_f32(hs[3]).await?; // full softmax [vocab]
+    let log_probs = output.read_f32(hs[4]).await?; // full log-softmax [vocab]
 
-    let logits = decode_logits_native(logit_bytes);
+    let logits = decode_logits_native(&logit_bytes);
     let vocab_size = logits.len();
+
+    // Top-8 (id, prob) pairs, derived guest-side from the full distribution.
+    let mut indexed: Vec<(u32, f32)> = probs
+        .iter()
+        .enumerate()
+        .map(|(i, &p)| (i as u32, p))
+        .collect();
+    indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    let (dist_ids, dist_probs): (Vec<u32>, Vec<f32>) = indexed.into_iter().take(8).unzip();
+
+    // Per-candidate logprobs, indexed guest-side from the full log-softmax.
+    let lp_a_value = *log_probs
+        .get(cand_a as usize)
+        .ok_or("logprob: cand_a out of range")?;
+    let lp_many: Vec<f32> = cand_list
+        .iter()
+        .map(|&c| *log_probs.get(c as usize).unwrap_or(&f32::NEG_INFINITY))
+        .collect();
+    let lp_many_a = lp_many.first().copied().ok_or("logprobs list empty")?;
 
     // Cross-checks.
     let raw_argmax = argmax(&logits) as u32;
@@ -98,8 +138,6 @@ async fn main(_input: Input) -> Result<String> {
     let dist_first_matches_greedy = dist_first_id == greedy_tok;
 
     // log p(cand_a) should match between the singular and the list query.
-    let lp_a_value = lp_a.first().copied().ok_or("logprob list empty")?;
-    let lp_many_a = lp_many.first().copied().ok_or("logprobs list empty")?;
     let logprob_consistent = (lp_a_value - lp_many_a).abs() < 1e-4;
 
     // Entropy bounds: 0 <= H <= ln(vocab_size).
@@ -111,7 +149,7 @@ async fn main(_input: Input) -> Result<String> {
     let dist_probs_sum: f32 = dist_probs.iter().sum();
 
     println!("VOCAB_SIZE={}", vocab_size);
-    println!("SLOT_COUNT={}", output.raw().slots.len());
+    println!("SLOT_COUNT={}", output.len());
     println!("GREEDY_TOKEN={}", greedy_tok);
     println!("RAW_ARGMAX_TOKEN={}", raw_argmax);
     println!("ARGMAX_MATCHES_GREEDY={}", argmax_matches_greedy);

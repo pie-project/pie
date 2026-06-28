@@ -13,6 +13,7 @@
 #include <type_traits>
 
 #include <atomic>
+#include <map>
 
 #include "distributed.hpp"
 #include "executor/forward_graph.hpp"
@@ -20,6 +21,9 @@
 #include "model/llama_like.hpp"
 #include "executor/persistent_inputs.hpp"
 #include <pie_driver_abi/response_builder.hpp>
+#include <memory>
+
+#include "sampling_ir/jit_backend.hpp"
 
 namespace pie_cuda_driver {
 
@@ -357,6 +361,56 @@ struct Executor {
     // enough for the `send_response` that immediately follows.
     pie_driver::ResponseBuilder response_builder;
 
+    // Programmable sampling (Sampling IR, lane L4). The runtime owns the
+    // mode-select + input binding + skip policy and consumes the abstract
+    // `IProgramBackend`; the concrete `SamplingIrBackend` (codegen + NVRTC JIT)
+    // is constructed lazily on the first program-carrying fire — when a CUDA
+    // context is guaranteed current — and registered via `set_backend`. Null
+    // backend ⇒ `try_run` returns NoProgram ⇒ legacy sampler path.
+    sampling_ir::SamplingIrRuntime sampling_ir_runtime{};
+    std::unique_ptr<sampling_ir::SamplingIrBackend> sampling_ir_backend{};
+    // Guards one-shot lazy backend construction so a hard init failure (e.g.
+    // no NVRTC) doesn't retry + re-log every fire.
+    bool sampling_ir_init_attempted = false;
+
+    // #6 WS8 P2 — device-resident next-input retention. A producer forward whose
+    // `pipeline_source_link != 0` has its `pi.sampled[N]` copied here under that
+    // global link id (the copy is READ, not consumed → fan-out safe). A later
+    // consumer's inject reads the retained copy (event-gated on `done`); the entry
+    // is freed when the host signals the link via `next_input_free_links`. The copy
+    // + event persist across fires (the Executor outlives a fire), unlike
+    // `pi.sampled` (alloc-once, reused every pass → t+1 overwrites the producer).
+    struct RetainedSampled {
+        DeviceBuffer<std::int32_t> copy;   // [N] retained producer sampled tokens
+        cudaEvent_t                done = nullptr;  // producer sample-done
+    };
+    std::map<std::uint32_t, RetainedSampled> retained_next_input;
+
+    // #27 cut #1 (a2) — the most recent fast-path forward's eager-D2H completion
+    // event (recorded on the tensor-I/O copy stream after that fire READ the
+    // single-buffer `pi.sampled`). delta's WAR guard waits this at the NEXT
+    // forward's sampling tail (`cudaStreamWaitEvent(forward, last_eager_d2h_done)`)
+    // so t+1's sampling WRITE to `pi.sampled` can't clobber t's still-draining D2H.
+    // nullptr until the first fast-path forward (no prior producer to gate on).
+    cudaEvent_t last_eager_d2h_done = nullptr;
+
+    // Set true by `handle_fire_batch` when it took the (a2) output→tensor
+    // fast-path (eager-D2H enqueued, forward-done deferred to the copy-stream
+    // host-func). The in-proc service reads it to set `out.deferred` so
+    // `serve_forever` skips the inline send. Reset to false at each fire's entry.
+    bool last_fire_deferred = false;
+
+    // #6 WS8 P2 — device ptr of producer `link`'s retained token buffer: the
+    // consumer's `late_inputs` device-alias source for `TokenRef::PrevSample`
+    // (echo's seam). nullptr if the producer hasn't retained → SkippedLateBindMiss.
+    // (a)-MVP returns the D2D copy buffer; (b) the reference-slot — same call site.
+    const void* retained_token_ptr(std::uint32_t producer_link) const {
+        auto it = retained_next_input.find(producer_link);
+        return it == retained_next_input.end()
+                   ? nullptr
+                   : static_cast<const void*>(it->second.copy.data());
+    }
+
 };
 
 // Run the forward pass + sampling pipeline on one forward-pass request
@@ -375,6 +429,14 @@ void handle_fire_batch(
 // Pre-capture the pure-decode CUDA graph lattice for graph-safe forwards.
 // Returns the number of graph execs inserted into `executor.graph_cache`.
 std::size_t capture_forward_graph_lattice(Executor& executor);
+
+// Lazily construct (and cache on `executor`) the Sampling-IR JIT backend — the
+// programmable-sampling compile-cache owner. Returns nullptr if NVRTC init
+// failed (programmable sampling disabled → legacy path). Must be called with a
+// current CUDA context: the JitEngine ctor resolves the device arch from it. The
+// #11 prefetch-seam registration force-creates it at backend-ready so a host-side
+// `driver::prefetch_compile` arriving before the first fire has a live cache.
+sampling_ir::SamplingIrBackend* ensure_sampling_ir_backend(Executor& executor);
 
 // TP-follower service loop. Called only on TP ranks > 0. Mirrors
 // `handle_fire_batch` minus shmem decode, sampling, and response: the

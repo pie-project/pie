@@ -1,210 +1,168 @@
 interface inference {
-
     use types.{error};
     use adapter.{adapter};
     use media.{image, audio};
     use working-set.{kv-working-set, rs-working-set};
+    use tensor.{tensor, program};
 
-    // binary run-length encoding
     type brle = list<u32>;
 
+    variant input-binding {
+        /// Forward-pass output positions whose logits are bound to this input.
+        /// Shape `[vocab]` for one position, or `[len(positions), vocab]` for
+        /// multiple. A `logits` binding's positions are the pass's sampling
+        /// positions.
+        logits(list<u32>),
+        /// Bind this input to the model's multi-token-prediction (MTP) logits
+        /// for the pass's sampling positions.
+        mtp-logits,
+        /// A device tensor bound to a program input slot (a per-fire value,
+        /// mask, etc.). Submit-bound tensors are gathered at `execute()`;
+        /// late-bound values are written via `tensor.write` before the
+        /// consuming region (the run-ahead late channel).
+        tensor(tensor),
+    }
+
     // ── Forward-pass memory contract (explicit read/write descriptors) ──────
-    // A forward pass READS the pages/tokens designated as *context* and WRITES
-    // only the indices/ranges designated as *output*. There is no ambient
-    // context handle and no implicit append. Output indices/ranges must be
-    // unique per pass; output may overlap context only when it is also
-    // declared as output. The runtime CoWs every write target before driver
-    // submission; on driver failure the output objects are left invalid /
-    // private and are NOT CAS-sealed.
-
-    // KV pages this pass reads as attention context: the half-open relative
-    // span [start, start + len) of `set`, of which the first `valid-tokens`
-    // tokens participate in attention (trailing reserved slots may be empty).
-    record kv-context {
-        set: borrow<kv-working-set>,
-        start: u32,
-        len: u32,
-        valid-tokens: u32,
-    }
-
-    // KV pages this pass writes: the relative `indices` of `set` that receive
-    // freshly computed KV, with `per-page-valid-lens[i]` valid tokens written
-    // into page `indices[i]` (the two lists are parallel). Indices must be
-    // unique. `generation` is the value the caller read from
-    // `set.generation()` when it captured `indices`; if `set` has since been
-    // structurally mutated (alloc/free/reorder/append) the runtime rejects the
-    // pass with a clean stale-generation error instead of writing stale slots.
-    record kv-output {
-        set: borrow<kv-working-set>,
-        generation: u32,
-        indices: list<u32>,
-        per-page-valid-lens: list<u32>,
-    }
-
-    // Buffered recurrent state this pass reads: `len-tokens` tokens starting at
-    // buffered token offset `start-token` of `set`.
-    record rs-buffer-context {
-        set: borrow<rs-working-set>,
-        start-token: u32,
-        len-tokens: u32,
-    }
-
-    // Buffered recurrent state this pass writes: `len-tokens` tokens starting
-    // at `start-token` of `set`. Writing buffered RS does NOT fold it; folding
-    // is the separate `fold` operation.
-    record rs-buffer-output {
-        set: borrow<rs-working-set>,
-        start-token: u32,
-        len-tokens: u32,
-    }
+    // A forward pass READS its declared context tokens and WRITES only its
+    // declared output range. No ambient context handle, no implicit append.
+    // The runtime CoWs every write target before driver submission.
 
     resource forward-pass {
         constructor();
 
-        // KV attention context this pass reads. Replaces the old opaque
-        // `context` handle. For hybrid models, combine with `rs-context`.
-        kv-context: func(ctx: kv-context);
+        /// KV working-set contract (merged read-context + write). Reads the
+        /// half-open relative span `[inp-start, inp-start + inp-len)` of `set`,
+        /// of which the first `valid-tokens` participate in attention. Writes
+        /// the contiguous relative range
+        /// `[output-start, output-start + output-len)`; `offset` is the in-page
+        /// token offset of the first written row. The inferlet owns correctness
+        /// (no generation guard — vacuous under a contiguous range).
+        kv-working-set: func(
+            set: borrow<kv-working-set>,
+            inp-start: u32,
+            inp-len: u32,
+            valid-tokens: u32,
+            output-start: u32,
+            output-len: u32,
+            offset: u32,
+        );
 
-        // KV pages this pass writes.
-        kv-output: func(out: kv-output);
+        /// RS (recurrent-state) working-set contract (merged read + write):
+        /// `len-tokens` buffered tokens starting at buffered token offset
+        /// `start-token` of `set`.
+        rs-working-set: func(
+            set: borrow<rs-working-set>,
+            start-token: u32,
+            len-tokens: u32,
+        );
 
-        // Buffered recurrent state this pass reads (hybrid / linear-attention).
-        rs-context: func(ctx: rs-buffer-context);
-
-        // Buffered recurrent state this pass writes.
-        rs-output: func(out: rs-buffer-output);
-
-        // Fold the first `tokens` buffered recurrent-state tokens of this
-        // pass's RS working set into its folded state AS PART OF this forward
-        // — piggybacking on the in-forward fold the driver already does (e.g.
-        // cuda GDN commit-advance), not a separate op. Rides the pass's atomic
-        // txn + submit. `tokens` counts buffered tokens and must be a positive
-        // multiple of the model's fold granularity (`model.rs-fold-granularity`)
-        // and within the buffered suffix; the runtime rejects an invalid count
-        // before submission. No rollback across a fold — fork the RS working
-        // set first if you may need to revert. A pass may write buffered RS
-        // (`rs-output`) without folding; folding is opt-in via this call.
-        fold-buffered: func(tokens: u32);
+        /// Fold the first `tokens` buffered recurrent-state tokens of this
+        /// pass's RS working set into its folded state as part of this forward.
+        /// `tokens` must be a positive multiple of the model's fold granularity
+        /// and within the buffered suffix. No rollback across a fold.
+        rs-fold-buffered: func(tokens: u32);
 
         input-tokens: func(
             tokens: list<u32>,
             positions: list<u32>,
         );
 
-        // Splice an encoded visual span (image or video clip) at sequence
-        // position `anchor`. The driver runs the vision encoder and scatters
-        // the projected rows into the hidden state for this span. See
-        // MULTIMODAL.md.
+        /// Splice an encoded visual span (image or video clip) at sequence
+        /// position `anchor`.
         input-image: func(
             image: borrow<image>,
             anchor: u32,
         );
 
-        // Splice an encoded audio clip at sequence position `anchor`. The
-        // driver runs the gemma4_audio encoder and scatters the projected
-        // soft-token rows into the hidden state. See audio_frontend.md.
+        /// Splice an encoded audio clip at sequence position `anchor`.
         input-audio: func(
             audio: borrow<audio>,
             anchor: u32,
         );
 
-        input-speculative-tokens: func(
-            tokens: list<u32>,
-            positions: list<u32>,
-        );
-
-        // enabled by default
+        /// enabled by default
         output-speculative-tokens: func(flag: bool);
 
-        // Controls runtime pass-level speculation for this execute only.
-        pass-speculation: func(flag: bool);
+        /// #31 self-spec greedy-v0: declare a drafter-filled `[k]`-Token output
+        /// (the MTP self-spec draft) — NOT a sampler program (no IR); the driver's
+        /// system drafter fills it from its proposal. Sets `output-speculative`
+        /// (fires the drafter) and returns the runtime-assigned output index
+        /// (append-last); read the `[k]` drafts via `output()`/`outputs()` there.
+        draft-output: func(k: u32) -> u32;
 
-        // if not provided, fallback to causal mask
+        /// if not provided, fallback to causal mask
         attention-mask: func(
             mask: list<brle>,
         );
 
-        // if not provided, fallback to all ones (no masking)
-        logit-mask: func(
-            mask: brle,
+        /// Attach one tensor program as the sampler. Binding `i` supplies the
+        /// program input at index `i`. The program's output is returned by
+        /// `output()` / `outputs()` as a raw tensor.
+        sampler: func(
+            program: borrow<program>,
+            inputs: list<input-binding>,
         );
 
-        sampler: func(
-            indices: list<u32>,
-            sampler: sampler,
+        /// Attach multiple tensor programs as samplers. `inputs[i]` supplies
+        /// the positional bindings for `programs[i]`; outputs mirror `programs`.
+        samplers: func(
+            programs: list<borrow<program>>,
+            inputs: list<list<input-binding>>,
         );
 
         adapter: func(
             adapter: borrow<adapter>,
         );
 
-        execute: async func() -> result<output, error>;
-    }
+        /// Run-ahead carrier (§2.1). Declares that the NEXT forward pass on
+        /// this context carries THIS pass's sampled token(s) into the given
+        /// `positions` — ROW SLOTS in the next pass's dense `pi.tokens` row
+        /// array (the decode rows the carrier overwrites pre-forward), NOT
+        /// sequence positions and NOT KV-slot indices. For single-sequence
+        /// decode this is `[0]` (row 0); for a batch of B sequences, `[0..B)`.
+        /// The guest names only these destination rows; everything else is
+        /// host-owned:
+        /// - the SOURCE row in this pass is HOST-computed (prefill → last row
+        ///   `n-1`, single-row decode → row 0, batched → per-sequence sampled
+        ///   rows), never threaded by the guest;
+        /// - the CONSUMER is IMPLICIT — the next pass submitted on this context,
+        ///   which supplies a placeholder `input-tokens([0], [pos])` at each
+        ///   destination row; the carrier overwrites `pi.tokens[row]` before
+        ///   that forward from this pass's retained sample;
+        /// - the carry is SCOPED to the PRODUCING context — a pass submitted on
+        ///   a different context drops a still-pending carry (a terminal
+        ///   producer with no consumer must not leak its retained token into
+        ///   another context's prefill);
+        /// - the dependency (the consumer firing a strictly-later batch) is a
+        ///   host accumulate keyed on the carrier link — no guest ordering signal.
+        next-inputs: func(positions: list<u32>);
 
-    variant sampler {
-        multinomial(tuple<f32, u32>),
-        top-k(tuple<f32, u32>),
-        top-p(tuple<f32, f32>),
-        min-p(tuple<f32, f32>),
-        top-k-top-p(tuple<f32, u32, f32>),
-        embedding,
-        dist(tuple<f32, u32>),
-        // Returns the model's raw, unscaled logits (pre-softmax) for each
-        // requested position. No sampling is performed. The host returns the
-        // logits via output.logits as a packed little-endian f32 byte buffer
-        // of length `vocab-size * 4` per requested position.
-        raw-logits,
-        // Returns log p(token | context) — the natural log of the model's
-        // probability for the given token at this position. Computed via
-        // log_softmax(logits) with NO temperature scaling. Result is a single
-        // f32 per slot, surfaced via output.logprobs as a length-1 inner list.
-        logprob(u32),
-        // Returns log p(t | context) for each `t` in the supplied list at the
-        // same position — useful for multi-candidate scoring (yes/no, A/B/C/D,
-        // reranking). One inner list per slot, one f32 per candidate, in the
-        // order the labels were provided.
-        logprobs(list<u32>),
-        // Returns the Shannon entropy H(p) = -sum(p * log p) of the
-        // (unscaled) next-token distribution at this position. One f32 per
-        // slot via output.entropies. Useful for uncertainty / confidence /
-        // adaptive-sampling decisions.
-        entropy,
-    }
+        /// Run-ahead carrier: the attention mask (BRLE per row) for the next
+        /// forward, supplied ahead of this pass's sampled token.
+        next-attention-mask: func(mask: list<brle>);
 
-    /// One typed result per `forward-pass.sampler(...)` slot, in the order
-    /// the sampler calls were attached. Lets a single forward pass mix
-    /// arbitrary sampler kinds (e.g. multinomial AND entropy on the same
-    /// position) without losing any output to a single-variant pick.
-    variant slot-output {
-        /// Sampled token id. Produced by multinomial / top-k / top-p /
-        /// min-p / top-k-top-p samplers, and by spec-mode verification.
-        token(u32),
-        /// Top-k token ids paired with their (post-softmax, temperature-
-        /// scaled) probabilities. Produced by `sampler.dist`.
-        distribution(tuple<list<u32>, list<f32>>),
-        /// Native-endian f32 bytes, length = vocab-size * 4. Produced by
-        /// `sampler.raw-logits`.
-        logits(list<u8>),
-        /// Length 1 for `sampler.logprob`; length K for `sampler.logprobs`
-        /// (parallel to the requested label list). Computed via log-softmax
-        /// with no temperature scaling.
-        logprobs(list<f32>),
-        /// Shannon entropy `H(p)` of the unscaled distribution at this
-        /// position. Produced by `sampler.entropy`.
-        entropy(f32),
-        /// Hidden-state embedding bytes for this position. Produced by
-        /// `sampler.embedding` (placeholder; not yet wired end-to-end).
-        embedding(list<u8>),
-    }
+        /// Run-ahead generate-start signal (#26). Marks this pass as the FIRST
+        /// forward of a fresh `generate()` on its context. Before this pass's
+        /// carrier inject, the host drops any carrier still PENDING on this
+        /// context from a prior generate — the stop-terminal residual the loop's
+        /// count-predictable max-boundary omit cannot foresee (a stop is known
+        /// only post-sample, after `next-inputs` was already emitted) — and frees
+        /// its retained device buffer. Fires at most once per generate; the host
+        /// derives the context from this pass's `kv-working-set`. Flag only — the
+        /// carrier destinations declared on this pass are unaffected.
+        fresh-generate: func();
 
-    /// Result of one `forward-pass.execute`. `slots` mirrors the order of
-    /// `forward-pass.sampler` calls. `spec-tokens` / `spec-positions` are a
-    /// per-request side channel for the next iteration's draft tokens
-    /// (empty in non-speculative flows).
-    record output {
-        slots: list<slot-output>,
-        spec-tokens: list<u32>,
-        spec-positions: list<u32>,
+        /// Eager submit (synchronous): enqueue this pass's forward work. Await
+        /// the result via `output()` / `outputs()`.
+        execute: func();
+
+        /// The output tensor of a single-sampler pass. Awaits the fire; the
+        /// dtype/shape follow the program's declared output value.
+        output: async func() -> result<tensor, error>;
+
+        /// The output tensors of a multi-sampler pass, in `samplers` order.
+        outputs: async func() -> result<list<tensor>, error>;
     }
 
     /// Describes the structure that the LLM output must conform to.
@@ -239,9 +197,13 @@ interface inference {
         /// Returns an error if any token violates the grammar.
         accept-tokens: func(token-ids: list<u32>) -> result<_, error>;
 
-        /// Fill the next-token bitmask.  The returned BRLE encodes which
-        /// token ids in the vocabulary are allowed at the current position.
-        next-token-logit-mask: func() -> brle;
+        /// The packed allowed-token bitmask at the current position: a
+        /// `[ceil(vocab/32)]` u32 array where bit `j` (word `j/32`, bit `j%32`)
+        /// is 1 iff token `j` is allowed, 0 if disallowed. Applied in-program
+        /// by the sampler's `mask-apply` op (the de-hardwired grammar mask
+        /// channel); multiple constraints compose by word-wise bitwise-AND
+        /// host-side. Replaces the removed BRLE `next-token-logit-mask`.
+        mask: func() -> list<u32>;
 
         /// Check whether the matcher has reached a terminal state.
         is-terminated: func() -> bool;

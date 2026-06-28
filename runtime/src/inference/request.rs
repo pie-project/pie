@@ -314,11 +314,49 @@ pub fn new_batched_forward_request_with_capacity(n_requests: usize) -> pie_drive
         audio_feature_indptr: indptr(indptr_cap),
         audio_anchor_rows: Vec::new(),
         audio_indptr: indptr(indptr_cap),
-        // Sampling-IR (`sampling_*`) + producer-consumer (`next_input_*`,
-        // `pipeline_source_link`) fields default to empty: the working-set
-        // forward path lowers samplers via the SoA fields above, leaving the
-        // dev Sampling-IR side channel unused (append-only schema). The merge
-        // (`append_request`) does not touch them, so empty is the wire value.
+        // Sampling-program carrier: the per-request count CSR and the nested
+        // per-program byte / input-table / late-key CSRs each start with a
+        // leading 0 (grown by `extend_sampling_programs_from` + the per-request
+        // boundary push). All payload vecs stay empty for the legacy path.
+        sampling_program_indptr: indptr(indptr_cap),
+        sampling_program_bytes: Vec::new(),
+        sampling_program_bytes_indptr: indptr(indptr_cap),
+        sampling_input_blob: Vec::new(),
+        sampling_input_keys: Vec::new(),
+        sampling_input_offsets: Vec::new(),
+        sampling_input_lens: Vec::new(),
+        sampling_input_indptr: indptr(indptr_cap),
+        sampling_late_keys: Vec::new(),
+        sampling_late_indptr: indptr(indptr_cap),
+        sampling_late_blob: Vec::new(),
+        sampling_late_offsets: Vec::new(),
+        sampling_late_lens: Vec::new(),
+        // #27 cut #2 device-alias late channel: parallel to sampling_late_keys
+        // (device value ptr + R12 flag per late key), grown by the batch-merge.
+        sampling_late_device_ptrs: Vec::new(),
+        sampling_late_device_flags: Vec::new(),
+        sampling_late_device_lens: Vec::new(),
+        // Per-slot binding-map: per-program CSR with a leading 0 (grown by the
+        // merge + per-request boundary); the (kind, key) payload stays empty for
+        // the legacy/no-program path.
+        sampling_binding_kind: Vec::new(),
+        sampling_binding_key: Vec::new(),
+        sampling_binding_indptr: indptr(indptr_cap),
+        // #27 cut #1 output fast-path dst table: payload arrays empty, the
+        // per-program CSR seeded with a leading 0 (grown by the batch-merge in
+        // `extend_sampling_programs_from`), exactly like `sampling_input_indptr`.
+        sampling_output_dst_ptrs: Vec::new(),
+        sampling_output_dst_lens: Vec::new(),
+        sampling_output_indptr: indptr(indptr_cap),
+        // WS8 P2 device-resident next-input link: empty/0 for the host-inject
+        // (P1) and no-pipelining paths; populated by the device-pipeline emission
+        // at integration (per-row arrays + the producer source-link).
+        pipeline_source_link: 0,
+        next_input_producer_links: Vec::new(),
+        next_input_src_rows: Vec::new(),
+        next_input_dest_slots: Vec::new(),
+        // P3 recurrent-state fold fields (rs_fold_lens / rs_buffer_slot_*)
+        // default to empty — the de-hardwiring forward path does not use them.
         ..Default::default()
     }
 }
@@ -551,6 +589,45 @@ pub fn append_request_with_options(
         .audio_indptr
         .push(batch.audio_anchor_rows.len() as u32);
 
+    // Sampling-program carrier — per-request side-channel, analogous to the
+    // image/audio merges. `extend_sampling_programs_from` concatenates this
+    // request's program bytecode, submit-bound input table, and late-key
+    // channel, offsetting every nested CSR; `sampling_program_indptr` then gets
+    // one boundary per request (cumulative program count, like `image_indptr`).
+    batch.extend_sampling_programs_from(req);
+    batch
+        .sampling_program_indptr
+        .push(batch.n_sampling_programs() as u32);
+
+    // Run-ahead next-input carrier (WS8 P2) — per-request device-resident link
+    // fold. Each fed consumer input names a producer link id + the source row in
+    // that producer's retained `pi.sampled`, and a dest slot in THIS request's
+    // `pi.tokens`. On batch merge: producer link ids + source rows are GLOBAL (a
+    // prior fire's per-link buffer) → verbatim; dest slots index this fire's own
+    // token buffer → rebased by `row_base` (the batch token-offset). The
+    // `u32::MAX` dest sentinel (skip-lane) is preserved un-rebased.
+    for i in 0..req.n_next_input_links() {
+        let dest = req.next_input_dest_slots[i];
+        let rebased_dest = if dest == u32::MAX { u32::MAX } else { dest + row_base };
+        batch.push_next_input_link(
+            req.next_input_producer_links[i],
+            req.next_input_src_rows[i],
+            rebased_dest,
+        );
+    }
+    // All-consumers-drained free signals — global link ids, verbatim.
+    for &link in &req.next_input_free_links {
+        batch.push_next_input_free_link(link);
+    }
+    // Producer source-link: this fire retains its `pi.sampled` under one global
+    // link id covering the whole `pi.sampled[N]`. One link per batched forward; a
+    // producer request propagates its id. (One-ahead MVP: <=1 producer per batch;
+    // multi-seq producers in one fire share the batch link — link-assignment
+    // model is delta's carrier; this fold just carries the per-request value.)
+    if req.pipeline_source_link != 0 {
+        batch.set_pipeline_source_link(req.pipeline_source_link);
+    }
+
     // Inference hint: prefill kernel when ANY request needs `custom_mask`.
     if req.token_ids.len() > 1 || req.has_user_mask {
         batch.single_token_mode = false;
@@ -596,6 +673,7 @@ pub fn extract_per_request(
         && fr.logits_bytes.is_empty()
         && fr.logprobs_values.is_empty()
         && fr.entropies.is_empty()
+        && fr.program_tokens.is_empty()
         && out.spec_tokens.is_empty();
     if token_payload_only {
         if tok_hi == tok_lo + 1 {
@@ -663,6 +741,25 @@ pub fn extract_per_request(
     out.entropies = fr.entropies[ent_lo..ent_hi].to_vec();
     out.entropies_indptr = vec![0, (ent_hi - ent_lo) as u32];
 
+    // Program tokens (#32 `[k]`-Token): two-level CSR like logprobs —
+    // `program_tokens_req_indptr` partitions the per-(request,output) slot ranges,
+    // `program_tokens_indptr` partitions the values. Slice to this request's slots,
+    // resetting both indptrs to request-local offsets.
+    if fr.program_tokens_req_indptr.len() >= 2 && fr.program_tokens_indptr.len() >= 2 {
+        let slot_lo = fr.program_tokens_req_indptr[r] as usize;
+        let slot_hi = fr.program_tokens_req_indptr[r + 1] as usize;
+        let val_lo = fr.program_tokens_indptr[slot_lo] as usize;
+        let val_hi = fr.program_tokens_indptr[slot_hi] as usize;
+        out.program_tokens_req_indptr = vec![0, (slot_hi - slot_lo) as u32];
+        out.program_tokens_indptr = (slot_lo..=slot_hi)
+            .map(|s| fr.program_tokens_indptr[s] - fr.program_tokens_indptr[slot_lo])
+            .collect();
+        out.program_tokens = fr.program_tokens[val_lo..val_hi].to_vec();
+    } else {
+        out.program_tokens_req_indptr = vec![0];
+        out.program_tokens_indptr = vec![0];
+    }
+
     out
 }
 
@@ -678,6 +775,30 @@ fn indptr_range(indptr: &[u32], r: usize) -> (usize, usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn extract_per_request_slices_program_tokens_two_level_csr() {
+        // #32 two-level CSR (bravo's round-trip vectors): 2 requests, each n_out=2
+        // (output 0 single-Token/empty, output 1 a `[k]`-Token of 2).
+        // req_indptr=[0,2,4], indptr=[0,0,2,2,4], tokens=[279,280,555,556].
+        // extract_per_request slices request r to its slots, resetting both
+        // indptrs request-local so build_output_tensors walks seg=o within it.
+        let fr = pie_driver_abi::ForwardResponse {
+            num_requests: 2,
+            program_tokens_req_indptr: vec![0, 2, 4],
+            program_tokens_indptr: vec![0, 0, 2, 2, 4],
+            program_tokens: vec![279, 280, 555, 556],
+            ..Default::default()
+        };
+        // request 0: slots [0,2) → output 0 empty, output 1 = [279,280].
+        let r0 = extract_per_request(&fr, 0);
+        assert_eq!(r0.program_tokens, vec![279, 280]);
+        assert_eq!(r0.program_tokens_indptr, vec![0, 0, 2]);
+        // request 1: slots [2,4) → output 0 empty, output 1 = [555,556].
+        let r1 = extract_per_request(&fr, 1);
+        assert_eq!(r1.program_tokens, vec![555, 556]);
+        assert_eq!(r1.program_tokens_indptr, vec![0, 0, 2]);
+    }
 
     // -- Page-trim integration tests -----------------------------------------
 
@@ -763,6 +884,34 @@ mod tests {
         assert_eq!(batch.image_mrope_indptr, vec![0, 6, 6]);
         // Per-request CSR: one image each.
         assert_eq!(batch.image_indptr, vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn next_input_carrier_merges_with_dest_rebase() {
+        // Run-ahead next-input carrier fold: producer link ids + source rows are
+        // global (verbatim); dest slots index each fire's own token buffer (rebased
+        // by the batch token-offset); `u32::MAX` skip-lane preserved; free-links
+        // verbatim; producer source-link propagated.
+        let mut req0 = make_request(vec![10, 11], vec![0, 1], vec![]); // 2 tokens
+        req0.set_pipeline_source_link(7);
+        req0.push_next_input_link(5, 0, 1); // dest 1 -> row_base(0)+1 = 1
+        req0.push_next_input_free_link(5);
+
+        let mut req1 = make_request(vec![12], vec![2], vec![]); // 1 token
+        req1.set_pipeline_source_link(9);
+        req1.push_next_input_link(7, 3, 0); // dest 0 -> row_base(2)+0 = 2
+        req1.push_next_input_link(7, 4, u32::MAX); // skip-lane preserved
+        req1.push_next_input_free_link(7);
+
+        let mut batch = new_batched_forward_request();
+        append_request(&mut batch, &req0, &[100], 1, 16); // row_base 0
+        append_request(&mut batch, &req1, &[200], 1, 16); // row_base 2 (req0 had 2 tokens)
+
+        assert_eq!(batch.next_input_producer_links, vec![5, 7, 7]); // global, verbatim
+        assert_eq!(batch.next_input_src_rows, vec![0, 3, 4]); // global, verbatim
+        assert_eq!(batch.next_input_dest_slots, vec![1, 2, u32::MAX]); // rebased + sentinel
+        assert_eq!(batch.next_input_free_links, vec![5, 7]); // verbatim concat
+        assert_eq!(batch.pipeline_source_link, 9); // last producer's link
     }
 
     /// Attach one audio clip to `req`, mirroring the `input_audio` host handler:
@@ -1005,5 +1154,51 @@ mod tests {
         );
         // Per-request indptr: one request contributing 3 rows.
         assert_eq!(batch.mask_indptr, vec![0, 3]);
+    }
+
+    /// Faithful production-path durable guard for the "new carrier field silently
+    /// dropped by the batch-merge" class (2nd occurrence: #6 next-input, then #27
+    /// `sampling_output_*`). Exercises the REAL merge path —
+    /// `new_batched_forward_request` (init) + `append_request` (per-request fold)
+    /// — and asserts the #27 cut #1 `sampling_output_*` fast-path dst table
+    /// survives (the field the merge originally dropped → driver `view=0` →
+    /// zeros) ALONGSIDE `next_input_*` + `pipeline_source_link`. Catches a regress
+    /// in EITHER the init (missing leading-0 CSR) or the merge (missing concat).
+    #[test]
+    fn batch_merge_preserves_sampling_output_and_carriers() {
+        // req0: 1-token decode + 1 fast-path output + a producer source-link + a
+        // consumer next-input link.
+        let mut req0 = make_request(vec![1], vec![10], vec![]);
+        req0.sampling_output_dst_ptrs = vec![0x1000];
+        req0.sampling_output_dst_lens = vec![4];
+        req0.sampling_output_indptr = vec![0, 1];
+        req0.set_pipeline_source_link(7);
+        req0.push_next_input_link(3, 0, 0);
+
+        // req1: 1-token decode + 2 fast-path outputs.
+        let mut req1 = make_request(vec![2], vec![20], vec![]);
+        req1.sampling_output_dst_ptrs = vec![0x2000, 0x3000];
+        req1.sampling_output_dst_lens = vec![4, 8];
+        req1.sampling_output_indptr = vec![0, 2];
+
+        let mut batch = new_batched_forward_request();
+        append_request(&mut batch, &req0, &[100], 1, 16);
+        append_request(&mut batch, &req1, &[200], 1, 16);
+
+        // #27 cut #1: the fast-path dst table survives — concatenated payloads +
+        // the per-program CSR offset by the table base (p0's 1 output, p1's 2 at
+        // base 1). Before the fix this was empty → driver view=0 → all-zeros.
+        assert_eq!(
+            batch.sampling_output_dst_ptrs,
+            vec![0x1000u64, 0x2000, 0x3000]
+        );
+        assert_eq!(batch.sampling_output_dst_lens, vec![4u32, 4, 8]);
+        assert_eq!(batch.sampling_output_indptr, vec![0u32, 1, 3]);
+
+        // Other carriers survive the same merge (regression baseline).
+        assert_eq!(batch.pipeline_source_link, 7);
+        assert_eq!(batch.next_input_producer_links, vec![3]);
+        assert_eq!(batch.next_input_src_rows, vec![0]);
+        assert_eq!(batch.next_input_dest_slots, vec![0]);
     }
 }

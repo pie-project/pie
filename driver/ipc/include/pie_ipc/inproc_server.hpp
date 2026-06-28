@@ -90,11 +90,29 @@ public:
             // contract guarantees synchronous consumption.
             PieResponseFrameDesc resp{};
             build_response_desc(view.driver_id, out, resp);
-            vt_.send_response(vt_.ctx, req_id, &resp);
+            if (out.deferred && defer_send_) {
+                // (a2) fast-path: the handler enqueued the eager-D2H + will fire
+                // forward-done from a copy-stream host-func once the pinned buffer
+                // is filled. Hand the (empty-success, self-contained) resp + the
+                // send capability to that hook — NO inline send, so the serve loop
+                // recvs the next request and the driver pipelines while this D2H
+                // drains under the next forward's compute.
+                defer_send_(vt_, req_id, resp);
+            } else {
+                vt_.send_response(vt_.ctx, req_id, &resp);
+            }
         }
     }
 
     void stop() noexcept { stop_.store(true, std::memory_order_relaxed); }
+
+    // Optional driver-registered hook for the (a2) deferred forward-done send.
+    // When a handler sets `out.deferred`, `serve_forever` calls this instead of
+    // the inline `send_response`; the CUDA backend's hook heap-copies `resp` and
+    // enqueues a copy-stream host-func that calls `vt.send_response` post-D2H,
+    // then frees the copy. Unset ⇒ deferral unsupported (inline send always).
+    std::function<void(PieInProcVTable, std::uint32_t,
+                       const PieResponseFrameDesc&)> defer_send_;
 
 private:
     PieInProcVTable vt_;

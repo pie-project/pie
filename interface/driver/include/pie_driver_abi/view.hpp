@@ -166,6 +166,36 @@ struct PieForwardRequestView {
     PieSlice<std::uint8_t>  sampling_late_blob;             // host-late value bytes
     PieSlice<std::uint32_t> sampling_late_offsets;          // byte offset per late key
     PieSlice<std::uint32_t> sampling_late_lens;             // byte length per late key
+    PieSlice<std::uint8_t>  sampling_binding_kind;          // v4 manifest: per-slot bind kind (0=Logits,1=Tensor)
+    PieSlice<std::uint32_t> sampling_binding_key;           // v4 manifest: per-slot host key (Tensor only)
+    PieSlice<std::uint32_t> sampling_binding_indptr;        // per-program binding CSR
+
+    // WS8 P2 device-resident next-input link (#6). `pipeline_source_link != 0`
+    // ⇒ retain this (batched) forward's `pi.sampled[N]` under that global link
+    // id; the consumer arrays source some of this fire's input tokens (`pi.tokens`)
+    // device-side from a prior producer's retained `pi.sampled`. Parallel arrays,
+    // one entry per fed consumer input. See schema.rs.
+    std::uint32_t           pipeline_source_link = 0;
+    PieSlice<std::uint32_t> next_input_producer_links;  // global producer link id per fed input
+    PieSlice<std::uint32_t> next_input_src_rows;         // src row in the producer's pi.sampled
+    PieSlice<std::uint32_t> next_input_dest_slots;       // dest position in this fire's pi.tokens
+    PieSlice<std::uint32_t> next_input_free_links;       // link ids whose last consumer drains here
+
+    // #27 cut #1 output→tensor fast-path carrier (per-output host pinned dsts,
+    // CSR per program). Empty ⇒ legacy ForwardResponse marshal.
+    PieSlice<std::uint64_t> sampling_output_dst_ptrs;    // host pinned-buf ptr per output value
+    PieSlice<std::uint32_t> sampling_output_dst_lens;    // byte capacity per dst (bounds-check)
+    PieSlice<std::uint32_t> sampling_output_indptr;      // per-program CSR into the dst arrays
+
+    // #27 cut #2 (B) direct-H2D late channel: per-late-key device-resident value
+    // ptr (host `pie_device_alloc`'d, filled by `pie_tensor_write_async` straight
+    // from the guest's WASM-memory slice — @ingim's inferlet→GPU memcpy, no IPC
+    // staging) + the R12 self-arm flag ptr (set stream-ordered after the H2D).
+    // Parallel to `sampling_late_keys`; ptr==0 for a key ⇒ that key uses the
+    // staged `sampling_late_blob` path instead. The grammar mask rides this.
+    PieSlice<std::uint64_t> sampling_late_device_ptrs;   // device buf ptr per late key
+    PieSlice<std::uint64_t> sampling_late_device_flags;  // R12 self-arm flag ptr per late key
+    PieSlice<std::uint32_t> sampling_late_device_lens;   // device value byte-len per late key
 
     // Sampler attributes (SoA — read from the wire SoA arrays; view.hpp
     // applies only the small kind-remap / top_k / top_p-min_p fold).
@@ -189,6 +219,10 @@ struct PieForwardRequestView {
     PieSlice<std::uint32_t> spec_position_ids;
     PieSlice<std::uint32_t> spec_indptr;
     PieSlice<std::uint8_t>  output_spec_flags;
+    // #31 self-spec greedy-v0: per-request drafter-filled `[k]`-Token output `k`
+    // (0 = none). On the propose-forward the drafter writes `spec_tokens@922[..k]`
+    // into request r's LAST `program_tokens` slot (append-last seg). Read-only.
+    PieSlice<std::uint32_t> spec_draft_output_k;
 
     PieSlice<std::uint64_t> context_ids;
 
@@ -268,6 +302,10 @@ struct PieForwardResponseView {
     std::uint32_t probe_kernel_launch_us = 0;
     std::uint32_t probe_sync_us = 0;
     std::uint32_t probe_response_build_us = 0;
+
+    PieSlice<std::uint32_t> program_tokens_req_indptr; // num_requests+1, per-request → first output-slot
+    PieSlice<std::uint32_t> program_tokens_indptr;  // per-(request,output) [k]-Token CSR
+    PieSlice<std::uint32_t> program_tokens;         // [k]-Token output values, concatenated
 };
 
 // ---- Top-level request / response views -----------------------------------
@@ -298,6 +336,12 @@ struct PieInProcResponseView {
     std::uint32_t            method;
     std::int32_t             status;
     PieForwardResponseView   forward;
+    // (a2) programmable-sampling output fast-path: when set, the driver has
+    // enqueued the eager-D2H + will fire the forward-done from a copy-stream
+    // host-func once the pinned buffer is filled — `serve_forever` must NOT send
+    // inline (it hands the send to `InProcServer::defer_send_`). Default false ⇒
+    // the normal synchronous send (every legacy path + non-cuda backends).
+    bool                     deferred = false;
 };
 
 // ---- Per-batch arenas ------------------------------------------------------
@@ -458,10 +502,39 @@ inline void fill_forward_view(const PieForwardRequestDesc& f,
         slice_from(f.sampling_late_offsets_ptr, f.sampling_late_offsets_len);
     out.sampling_late_lens =
         slice_from(f.sampling_late_lens_ptr, f.sampling_late_lens_len);
+    out.sampling_binding_kind =
+        slice_from(f.sampling_binding_kind_ptr, f.sampling_binding_kind_len);
+    out.sampling_binding_key =
+        slice_from(f.sampling_binding_key_ptr, f.sampling_binding_key_len);
+    out.sampling_binding_indptr =
+        slice_from(f.sampling_binding_indptr_ptr, f.sampling_binding_indptr_len);
+    out.pipeline_source_link = f.pipeline_source_link;
+    out.next_input_producer_links =
+        slice_from(f.next_input_producer_links_ptr, f.next_input_producer_links_len);
+    out.next_input_src_rows =
+        slice_from(f.next_input_src_rows_ptr, f.next_input_src_rows_len);
+    out.next_input_dest_slots =
+        slice_from(f.next_input_dest_slots_ptr, f.next_input_dest_slots_len);
+    out.next_input_free_links =
+        slice_from(f.next_input_free_links_ptr, f.next_input_free_links_len);
+    out.sampling_output_dst_ptrs =
+        slice_from(f.sampling_output_dst_ptrs_ptr, f.sampling_output_dst_ptrs_len);
+    out.sampling_output_dst_lens =
+        slice_from(f.sampling_output_dst_lens_ptr, f.sampling_output_dst_lens_len);
+    out.sampling_output_indptr =
+        slice_from(f.sampling_output_indptr_ptr, f.sampling_output_indptr_len);
+    out.sampling_late_device_ptrs =
+        slice_from(f.sampling_late_device_ptrs_ptr, f.sampling_late_device_ptrs_len);
+    out.sampling_late_device_flags =
+        slice_from(f.sampling_late_device_flags_ptr, f.sampling_late_device_flags_len);
+    out.sampling_late_device_lens =
+        slice_from(f.sampling_late_device_lens_ptr, f.sampling_late_device_lens_len);
     out.spec_token_ids    = slice_from(f.spec_token_ids_ptr, f.spec_token_ids_len);
     out.spec_position_ids = slice_from(f.spec_position_ids_ptr, f.spec_position_ids_len);
     out.spec_indptr       = slice_from(f.spec_indptr_ptr, f.spec_indptr_len);
     out.output_spec_flags = slice_from(f.output_spec_flags_ptr, f.output_spec_flags_len);
+    out.spec_draft_output_k =
+        slice_from(f.spec_draft_output_k_ptr, f.spec_draft_output_k_len);
     out.context_ids       = slice_from(f.context_ids_ptr, f.context_ids_len);
 
     // Multimodal visual spans — pass-through slices into the archive buffer.
@@ -661,6 +734,12 @@ inline void build_response_desc(std::uint32_t driver_id,
         fr.probe_kernel_launch_us = view.forward.probe_kernel_launch_us;
         fr.probe_sync_us          = view.forward.probe_sync_us;
         fr.probe_response_build_us = view.forward.probe_response_build_us;
+        fr.program_tokens_req_indptr_ptr = view.forward.program_tokens_req_indptr.data();
+        fr.program_tokens_req_indptr_len = view.forward.program_tokens_req_indptr.size();
+        fr.program_tokens_indptr_ptr = view.forward.program_tokens_indptr.data();
+        fr.program_tokens_indptr_len = view.forward.program_tokens_indptr.size();
+        fr.program_tokens_ptr        = view.forward.program_tokens.data();
+        fr.program_tokens_len        = view.forward.program_tokens.size();
     } else {
         // Everything else (copy / adapter / health / unknown) just
         // produces a StatusResponse with the int code.

@@ -8,7 +8,7 @@
 
 use inferlet::{
     Context, Result,
-    sample::Distribution,
+    forward::Probe,
 };
 use serde::Deserialize;
 use std::time::Instant;
@@ -37,16 +37,12 @@ pub async fn validate_outputs(
         for &target in &candidate_tokens {
             let mut pass = ctx.forward();
             pass.input(&pending);
-            // Probe the distribution at the LAST input position (the slot
-            // index is local to the auto-input window: `len-1`).
-            let last_idx = (pending.len() - 1) as u32;
-            // `k = 0` returns the full vocabulary so we can look up `target`.
-            let h = pass.probe(last_idx, Distribution { temperature: 1.0, k: 0 });
+            // The full softmax distribution (over all vocab) at the decode
+            // position (the last input token) so we can look up `target`.
+            let h = pass.probe(Probe::Distribution)?[0];
 
             let out = pass.execute().await?;
-            let (ids, probs) = out
-                .distribution(h)
-                .ok_or("Distribution probe missing")?;
+            let (ids, probs) = out.distribution(h).await?;
 
             let p = ids
                 .iter()

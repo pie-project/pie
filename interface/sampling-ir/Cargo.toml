@@ -1,0 +1,25 @@
+[package]
+name = "pie-sampling-ir"
+version = "0.1.0"
+edition = "2024"
+authors = ["In Gim <in.gim@yale.edu>"]
+description = "Canonical Sampling IR for Pie programmable samplers: the typed SSA IR, its validator, and the flat versioned bytecode wire format. The single cross-language seam shared by the SDK (author + lower), the host runtime (parse + validate), and the CUDA driver (decode + codegen)."
+license = "Apache-2.0"
+repository = "https://github.com/pie-project/pie"
+keywords = ["pie", "sampling", "ir", "bytecode"]
+
+[lib]
+name = "pie_sampling_ir"
+crate-type = ["rlib"]
+path = "src/lib.rs"
+
+# `std` (default) is host-side. The wasm SDK depends on this crate with
+# `default-features = false` to keep the IR core `no_std` (+ `alloc`).
+# `eval` adds the CPU reference interpreter (implies `std`); off by default so it
+# never touches the wasm SDK build graph.
+[features]
+default = ["std"]
+std = []
+eval = ["std"]
+
+[dependencies]

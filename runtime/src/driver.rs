@@ -24,6 +24,7 @@ mod channel;
 mod inproc;
 mod inproc_polling;
 mod ops;
+mod prefetch;
 mod shmem;
 
 use anyhow::Result;
@@ -119,6 +120,14 @@ pub struct DriverResponse {
     pub payload: pie_driver_abi::ResponsePayload,
 }
 
+/// A response whose submission has already been ordered (the request is
+/// enqueued) but whose blocking wait is deferred. Calling the boxed closure
+/// blocks for the driver response. The run-ahead scheduler uses this to fix
+/// fire order on its own thread (the enqueue happens at `submit_deferred` call
+/// time, in fire order) and then await the GPU off-thread, so building and
+/// enqueuing the next batch overlaps the in-flight forward.
+pub type DeferredResponse = Box<dyn FnOnce() -> Result<DriverResponse> + Send>;
+
 #[async_trait]
 pub trait DriverChannel: Send + Sync {
     /// Submit a request and resolve with the typed response.
@@ -133,6 +142,19 @@ pub trait DriverChannel: Send + Sync {
     /// entry point.
     fn submit_sync(&self, req: DriverRequest) -> Result<DriverResponse>;
 
+    /// Enqueue `req` now (fixing its submission order at the call site) and
+    /// return a closure that blocks for the response. Lets the run-ahead
+    /// scheduler enqueue fires in-order on its own thread, then await each
+    /// off-thread so the GPU wait overlaps building the next batch. The default
+    /// is fully synchronous — it submits and waits inline, returning an
+    /// already-resolved closure (correct and order-preserving, just no
+    /// overlap). [`InProcChannel`] (the embedded-driver hot path) overrides
+    /// this to defer only the response wait.
+    fn submit_deferred(&self, req: DriverRequest) -> Result<DeferredResponse> {
+        let resp = self.submit_sync(req)?;
+        Ok(Box::new(move || Ok(resp)))
+    }
+
     /// Fire-and-forget submission. The driver still processes the
     /// request; the caller doesn't wait for the response. Errors at
     /// enqueue time (channel closed) are returned synchronously.
@@ -142,11 +164,26 @@ pub trait DriverChannel: Send + Sync {
     /// promptly with an error. Idempotent. Called by the supervisor's
     /// watchdog when it observes that the driver has exited.
     fn abort(&self);
+
+    /// Fire-and-forget JIT **prefetch** (the #11 prefetch seam): warm the
+    /// driver's compile cache for a sampling program so the later real fire
+    /// finds it `Ready` (the NVRTC compile overlaps the in-flight run-ahead
+    /// steps, off the TTFT path). The compile is keyed on
+    /// `program_identity_hash(bytecode, manifest)` — the SAME key as the #10
+    /// distinct-count / #11 compile-cache / M-batch grouping — so it dedups
+    /// against the in-flight compile pool (idempotent; duplicate or
+    /// already-compiled programs collapse). Never blocks, never reports errors.
+    ///
+    /// Default **no-op**: drivers without a JIT sampling backend, and the
+    /// out-of-proc/IPC path until its additive `DriverRequest::Prefetch` oneway
+    /// fast-follow lands. The embedded [`InProcChannel`] overrides this to drive
+    /// the C++ `IProgramBackend::prefetch_compile` over the in-proc FFI.
+    fn prefetch_compile(&self, _bytecode: &[u8], _manifest: &[pie_sampling_ir::Binding]) {}
 }
 
 pub use channel::{
-    abort_all_driver_channels, fire_batch, fire_batch_sync, get_spec, install_channel,
-    install_spec, register_driver,
+    abort_all_driver_channels, fire_batch, fire_batch_deferred, fire_batch_sync, get_spec,
+    install_channel, install_spec, prefetch_compile, register_driver, FireHandle,
 };
 pub use inproc::{InProcChannel, InProcVTable};
 pub use inproc_polling::InProcPollingChannel;

@@ -15,9 +15,28 @@
 #include "kv_cache.hpp"
 #include "model/csm_model.hpp"
 #include "recurrent_state_cache.hpp"
+#include "sampling_ir/tensor_io.hpp"
 #include "swap_pool.hpp"
 
 namespace pie_cuda_driver::service {
+
+namespace {
+// (a2) deferred forward-done: the copy-stream host-func sends the (empty-success)
+// response once the eager-D2H has filled the host pinned buffer, so the host's
+// output().await sees filled Tensors. Heap-owned; freed after the send. The
+// `resp` is self-contained for a fast-path pass (empty output channels → no
+// pointers aliasing the per-iteration arena), so the copy is safe past the fire.
+struct DeferredSendCtx {
+    PieInProcVTable      vt;
+    std::uint32_t        req_id;
+    PieResponseFrameDesc resp;
+};
+void CUDART_CB deferred_send_trampoline(void* user_data) {
+    auto* ctx = static_cast<DeferredSendCtx*>(user_data);
+    ctx->vt.send_response(ctx->vt.ctx, ctx->req_id, &ctx->resp);
+    delete ctx;
+}
+}  // namespace
 
 InProcService::InProcService(Executor& executor,
                              KvCache& kv_cache,
@@ -29,6 +48,17 @@ InProcService::InProcService(Executor& executor,
       csm_model_(csm_model) {}
 
 void InProcService::serve_forever(pie_driver::InProcServer& server) {
+    // (a2) deferred-send hook: when a fast-path fire sets `out.deferred`,
+    // serve_forever hands us the (empty-success) resp + the send capability; we
+    // heap-copy it and enqueue a copy-stream host-func that fires the forward-done
+    // once the eager-D2H drains, then frees the copy. Enqueued on the same copy
+    // stream as the fire's eager-D2H, so it runs strictly after it.
+    server.defer_send_ = [](pie_driver::PieInProcVTable vt, std::uint32_t req_id,
+                            const PieResponseFrameDesc& resp) {
+        auto* ctx = new DeferredSendCtx{vt, req_id, resp};
+        sampling_ir::TensorIoEngine::instance().enqueue_completion(
+            deferred_send_trampoline, ctx);
+    };
     server.serve_forever(
         [&](std::uint32_t req_id,
             const pie_driver::PieInProcRequestView& req,
@@ -39,6 +69,11 @@ void InProcService::serve_forever(pie_driver::InProcServer& server) {
                     handle_fire_batch(
                         req_id, req.forward, out.forward, executor_, handled_);
                     out.status = 0;
+                    // (a2) fast-path: handle_fire_batch enqueued the eager-D2H +
+                    // a copy-stream host-func that will send the forward-done once
+                    // the pinned buffer is filled → serve_forever skips the inline
+                    // send for this pass.
+                    out.deferred = executor_.last_fire_deferred;
                     break;
                 }
                 case pie_driver::PIE_METHOD_COPY_D2H: {

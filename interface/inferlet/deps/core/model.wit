@@ -23,6 +23,13 @@ interface model {
     // Returns the model's vocabulary as a list of byte sequences (tokens)
     vocabs: func() -> tuple<list<u32>, list<list<u8>>>;
 
+    // Logits/output dimension (= hf_config.vocab_size). May EXCEED the
+    // tokenizer's vocabs() token count due to padding. Use THIS for
+    // sampler-program lowering and any logits-shaped op; use vocabs() only for
+    // token-space work. Sourced from the model (not hardcoded) so the
+    // inferlet's lowering vocab == the driver's logits / recognizer-table vocab.
+    output-vocab-size: func() -> u32;
+
     // Returns the split regular expression used by the tokenizer
     split-regex: func() -> string;
 

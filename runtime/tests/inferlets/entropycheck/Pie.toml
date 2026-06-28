@@ -1,0 +1,4 @@
+[package]
+name = "entropycheck"
+version = "0.1.0"
+description = "Test inferlet: a single [Entropy] (Scalar) measurement — exercises the #18-class lone-Scalar rich-path read (must NOT be mis-gated into the token-only fast-path)"
