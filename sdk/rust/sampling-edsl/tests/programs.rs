@@ -190,7 +190,7 @@ fn lower_sampler_emits_v4_bytecode() {
 
 // ── #31 self-spec verify (MTP head as draft SOURCE) ──────────────────────────
 #[test]
-fn mtp_self_spec_greedy_draft_is_self_spec_input_and_dag_matches_host() {
+fn mtp_self_spec_greedy_emits_correction_accept_set() {
     let (b, keys) = mtp_self_spec_greedy(VOCAB, 4).expect("builds");
     roundtrip(&b);
     assert_eq!(b.outputs, vec![OutputKind::Token]);
@@ -199,21 +199,26 @@ fn mtp_self_spec_greedy_draft_is_self_spec_input_and_dag_matches_host() {
     assert_eq!(b.host_inputs.len(), 1);
     assert_eq!(b.host_inputs[0].key, keys.draft);
     assert_eq!(b.host_inputs[0].ready, ir::Readiness::SelfSpecDraftInput);
-    // Source-agnostic: the verify DAG is IDENTICAL to the host-injected
-    // `spec_verify_greedy` (the source is a manifest property, not bytecode).
-    let (host, _) = spec_verify_greedy(VOCAB, 4).expect("builds");
-    assert_eq!(ops(&b), ops(&host));
-    // Greedy DAG markers: per-row argmax + prefix-AND cumprod.
+    // Core greedy DAG: per-row argmax + prefix-AND cumprod (shared with #35-A).
     assert!(has(&b, |o| matches!(o, Op::ReduceArgmax(_))));
     assert!(has(&b, |o| matches!(o, Op::CumProd(_))));
+    // A2 correction-emit: the boundary detector (`cumsum(rejects)==1`) splices the
+    // target token `t_j` at the first reject → the COMPLETE accept set, NOT the bare
+    // accept-prefix. The landed `spec_verify_greedy` (prefix detector) has NO cumsum;
+    // the #31 verify does — the correction is the de-hardwiring difference.
+    let (host, _) = spec_verify_greedy(VOCAB, 4).expect("builds");
+    assert!(!has(&host, |o| matches!(o, Op::CumSum(_))));
+    assert!(has(&b, |o| matches!(o, Op::CumSum(_))));
+    assert_ne!(ops(&b), ops(&host));
 }
 
 #[test]
 fn mtp_self_spec_greedy_observable_uses_zero_sentinel_for_harness() {
     let (obs, _) = mtp_self_spec_greedy_observable(VOCAB, 4).expect("builds");
     roundtrip(&obs);
-    // Same self-spec INPUT draft role as the production verify.
+    // Same self-spec INPUT draft role + correction-emit (cumsum boundary) as production.
     assert_eq!(obs.host_inputs[0].ready, ir::Readiness::SelfSpecDraftInput);
+    assert!(has(&obs, |o| matches!(o, Op::CumSum(_))));
     // Differs from production only in the reject-sentinel constant (0 vs -1): the
     // 0-sentinel is non-truncating so a cross-row reject/clobber stays observable.
     let (prod, _) = mtp_self_spec_greedy(VOCAB, 4).expect("builds");

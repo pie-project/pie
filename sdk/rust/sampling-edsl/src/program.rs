@@ -208,18 +208,21 @@ pub struct SpecVerifyKeys {
 /// sentinel-coded `[k]` Token: the accepted prefix, then `-1` from the first
 /// reject. Greedy DAG: `argmax -> eq -> cumprod -> select`.
 pub fn spec_verify_greedy(vocab: u32, k: u32) -> Result<(Built, SpecVerifyKeys), BuildError> {
-    build_spec_verify_greedy(vocab, k, Readiness::Submit, -1)
+    build_spec_verify_greedy(vocab, k, Readiness::Submit, -1, false)
 }
 
-/// **Self-spec greedy-verify** (#31). The MTP head as the draft SOURCE: identical
-/// verify DAG and sentinel `[k]`-Token output as [`spec_verify_greedy`], but the
-/// draft is bound [`Readiness::SelfSpecDraftInput`] — the driver source-selects the
-/// refed draft tokens at the verify matrix base (`pi.tokens + sample_row + 1`, the
-/// drafts start after the anchor at `sample_row`), no host upload, de-hardwiring the
-/// hardwired spec loop. The bytecode is byte-identical to a late-draft verify (the
-/// source is a manifest property, not bytecode), so the verify is source-agnostic.
+/// **Self-spec greedy-verify** (#31). The MTP head as the draft SOURCE, producing
+/// the COMPLETE greedy accept set. The draft is bound
+/// [`Readiness::SelfSpecDraftInput`] — the driver source-selects the refed draft
+/// tokens at the verify matrix base (`pi.tokens + sample_row + 1`, the drafts start
+/// after the anchor at `sample_row`), no host upload, de-hardwiring the hardwired
+/// spec loop. Output is a sentinel-coded `[k]` Token `[d0..d_{j-1}, t_j, -1…]`: the
+/// `j` accepted drafts PLUS the target's correction `t_j = target_argmax[j]` spliced
+/// at the first reject (so a full reject advances by 1 instead of stalling, and the
+/// set is lossless-greedy). All-accept emits all `k` drafts (bonus deferred). The
+/// loop reads the truncated output and accepts it whole.
 pub fn mtp_self_spec_greedy(vocab: u32, k: u32) -> Result<(Built, SpecVerifyKeys), BuildError> {
-    build_spec_verify_greedy(vocab, k, Readiness::SelfSpecDraftInput, -1)
+    build_spec_verify_greedy(vocab, k, Readiness::SelfSpecDraftInput, -1, true)
 }
 
 /// **Observable self-spec greedy-verify** (#31 verify harness, NOT production).
@@ -227,25 +230,31 @@ pub fn mtp_self_spec_greedy(vocab: u32, k: u32) -> Result<(Built, SpecVerifyKeys
 /// `0 >= 0` the host marshal does NOT truncate (`if (x < 0) break`), so the full
 /// `[k]` is emitted and a cross-row reject / draft-clobber is OBSERVABLE rather
 /// than masked by the `-1` compaction (delta's reject-MID detector). Test-only:
-/// the harness MUST construct drafts ∈ `[1, vocab)` (non-zero) so a `0` in the
-/// output is unambiguously a reject-sentinel, not a real token id `0`.
+/// the harness MUST construct `{d0..d_{j-1}, t_j}` all ∈ `[1, vocab)` (non-zero) so
+/// a `0` in the output is unambiguously a reject-sentinel — including the boundary
+/// correction `t_j`, else a `t_j == 0` collides with the past-boundary sentinels.
 pub fn mtp_self_spec_greedy_observable(
     vocab: u32,
     k: u32,
 ) -> Result<(Built, SpecVerifyKeys), BuildError> {
-    build_spec_verify_greedy(vocab, k, Readiness::SelfSpecDraftInput, 0)
+    build_spec_verify_greedy(vocab, k, Readiness::SelfSpecDraftInput, 0, true)
 }
 
-/// Shared greedy-verify graph builder. DAG: `argmax(target[k,vocab]) -> eq(draft)
-/// -> cumprod -> select(draft, sentinel)`. `draft_ready` picks the draft SOURCE
-/// (`Submit` = host-injected #27/#35-A; `SelfSpecDraftInput` = driver-internal MTP #31)
-/// — manifest-only, so the bytecode/DAG is identical across sources. `sentinel`
-/// codes a reject (`-1` production/truncating-to-`[j]`; `0` observable/non-truncating).
+/// Shared greedy-verify graph builder. Core DAG: `argmax(target[k,vocab]) ->
+/// eq(draft) -> cumprod -> select`. `draft_ready` picks the draft SOURCE (`Submit`
+/// = host-injected #27/#35-A; `SelfSpecDraftInput` = driver-internal MTP #31) — a
+/// manifest property, so the core DAG is identical across sources. `sentinel` codes
+/// a reject (`-1` production/truncating-to-`[j]`; `0` observable/non-truncating).
+/// `emit_correction` (#31): splice the target's greedy token `t_j` at the first
+/// reject so the output is the COMPLETE accept set `[d0..d_{j-1}, t_j]` (lossless,
+/// always advances ≥1) rather than the bare accept-prefix detector (`false` = the
+/// landed #35-A `spec_verify_greedy` shape).
 fn build_spec_verify_greedy(
     vocab: u32,
     k: u32,
     draft_ready: Readiness,
     sentinel: i32,
+    emit_correction: bool,
 ) -> Result<(Built, SpecVerifyKeys), BuildError> {
     let g = Graph::new(vocab);
     let logits = g.intrinsic_logits_matrix_dyn(k); // [k, vocab]
@@ -261,7 +270,23 @@ fn build_spec_verify_greedy(
     let keep = acc.gt(&g.constant_f32_dyn(0.5));
 
     let sentinel_v = g.constant_i32_dyn(sentinel).broadcast_vec(k);
-    let out = dselect(&keep, &draft, &sentinel_v);
+    let out = if emit_correction {
+        // A2: emit the COMPLETE greedy accept set `[d0..d_{j-1}, t_j]` — at the
+        // first reject (boundary) splice the target's own greedy token `t_j =
+        // target_argmax[j]` (the FREE correct token) instead of the sentinel, so a
+        // full reject (j=0) advances by 1 (`[t_0]`) rather than stalling, and the
+        // set is lossless-greedy. Boundary = the first reject: `c = cumsum(rejects)`
+        // increments, so `c == 1` is true only at the first rejected row (mirrors
+        // the lossless-verify boundary). All-accept (j=k) → no boundary → all drafts
+        // (the bonus token `t_k` is deferred to the next block — needs a [k+1] row).
+        let reject_f = dselect(&keep, &zeros, &ones); // 1.0 where rejected (keep=0)
+        let c = reject_f.cumsum();
+        let boundary = dyn_eq_const(&g, &c, 1.0); // first reject only
+        let inner = dselect(&boundary, &target, &sentinel_v); // t_j at boundary, else sentinel
+        dselect(&keep, &draft, &inner) // accepted draft, else (correction | sentinel)
+    } else {
+        dselect(&keep, &draft, &sentinel_v) // plain accept-prefix detector (#35-A)
+    };
     g.output(&out, OutputKind::Token);
 
     let keys = SpecVerifyKeys { draft: draft.input_key().expect("draft host input") };
