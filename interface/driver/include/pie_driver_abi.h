@@ -254,6 +254,8 @@ struct PieForwardRequestDesc {
   size_t sampling_late_device_ptrs_len;
   const uint64_t *sampling_late_device_flags_ptr;
   size_t sampling_late_device_flags_len;
+  const uint32_t *sampling_late_device_lens_ptr;
+  size_t sampling_late_device_lens_len;
 };
 
 struct PieCopyRequestDesc {
@@ -326,6 +328,12 @@ struct PieForwardResponseDesc {
   uint32_t probe_kernel_launch_us;
   uint32_t probe_sync_us;
   uint32_t probe_response_build_us;
+  const uint32_t *program_tokens_req_indptr_ptr;
+  size_t program_tokens_req_indptr_len;
+  const uint32_t *program_tokens_indptr_ptr;
+  size_t program_tokens_indptr_len;
+  const uint32_t *program_tokens_ptr;
+  size_t program_tokens_len;
 };
 
 /// Generic status response. Convention:

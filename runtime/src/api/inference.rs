@@ -1387,6 +1387,7 @@ async fn execute_impl(
             for (_key, device) in program.late_device_inputs {
                 req.sampling_late_device_ptrs.push(device.device_ptr());
                 req.sampling_late_device_flags.push(device.flag_ptr());
+                req.sampling_late_device_lens.push(device.byte_len());
                 late_device_handles.push(device);
             }
         }

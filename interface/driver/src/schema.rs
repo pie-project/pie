@@ -419,6 +419,13 @@ pub struct ForwardRequest {
     /// The driver waits this flag before the consuming kernel reads the value, so
     /// a not-yet-arrived value is a loud miss, never a stale-buffer silent read.
     pub sampling_late_device_flags: Vec<u64>,
+    /// Per-late-key device-resident value byte length (parallel to
+    /// `sampling_late_device_ptrs`; `0` when no device-alias). The staged-blob
+    /// `sampling_late_lens` records `0` for device-alias entries (no host value),
+    /// so this carries the device value's size — the executor memcpy's `len` bytes
+    /// per row for the merged per-row gather (`[N, len]`) without coupling to the
+    /// program's `InputDecl`/dtype (`elem_count` × dtype) to derive it.
+    pub sampling_late_device_lens: Vec<u32>,
 }
 
 /// Per-slot sampler kind discriminants. Carried on the wire as the `u8`
@@ -973,6 +980,8 @@ impl ForwardRequest {
             .extend_from_slice(&req.sampling_late_device_ptrs);
         self.sampling_late_device_flags
             .extend_from_slice(&req.sampling_late_device_flags);
+        self.sampling_late_device_lens
+            .extend_from_slice(&req.sampling_late_device_lens);
 
         // Per-slot binding-map: concat the (kind, key) slots and rebase the
         // per-program CSR by the slot base.
@@ -1043,6 +1052,24 @@ pub struct ForwardResponse {
     pub probe_kernel_launch_us: u32,
     pub probe_sync_us: u32,
     pub probe_response_build_us: u32,
+
+    /// #32 per-(request,output) `[k]`-Token output CSR — a **two-level CSR**
+    /// (mirrors `logprobs_req_indptr`/`logprobs_val_indptr`/`logprobs_values`), so
+    /// `extract_per_request` can slice it per request like every other channel.
+    ///
+    /// `program_tokens_req_indptr` (`num_requests + 1`) partitions the output-slot
+    /// axis by request: request `r`'s output slots are
+    /// `[program_tokens_req_indptr[r] .. program_tokens_req_indptr[r+1])`.
+    /// `program_tokens_indptr` then has one entry per (request, output) slot in
+    /// row-major (request-then-output) order, partitioning `program_tokens`:
+    /// output slot `s`'s tokens are `program_tokens[indptr[s]..indptr[s+1]]`.
+    /// Non-empty ONLY for `[k]`-Token outputs (`elem_count > 1`); single-Token /
+    /// Scalar / Logits leave an empty segment (single-Token stays the dense
+    /// `tokens` path). Routes `[k]`-Token off the spec-decode `spec_tokens` channel.
+    pub program_tokens_req_indptr: Vec<u32>,
+    pub program_tokens_indptr: Vec<u32>,
+    /// `[k]`-Token output values, concatenated in `program_tokens_indptr` order.
+    pub program_tokens: Vec<u32>,
 }
 
 // =============================================================================

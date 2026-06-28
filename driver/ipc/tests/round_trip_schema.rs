@@ -316,6 +316,13 @@ fn forward_response_round_trip() {
         spec_indptr: vec![0, 2, 3],
         spec_tokens: vec![11, 12, 21],
         spec_positions: vec![5, 6, 9],
+        // #32 per-(request,output) [k]-Token two-level CSR: 2 requests × 2 outputs
+        // each ([Token, [k]-Token]). req_indptr partitions output slots by request
+        // (r0→[0,2), r1→[2,4)); indptr partitions tokens per slot (single-Token o=0
+        // empty, [k]-Token o=1 = k=2 tokens).
+        program_tokens_req_indptr: vec![0, 2, 4],
+        program_tokens_indptr: vec![0, 0, 2, 2, 4],
+        program_tokens: vec![279, 280, 555, 556],
         ..Default::default()
     };
     let f = ResponseFrame {
@@ -334,6 +341,9 @@ fn forward_response_round_trip() {
     assert_eq!(fr.spec_indptr.as_slice(), &[0u32, 2, 3]);
     assert_eq!(fr.spec_tokens.as_slice(), &[11u32, 12, 21]);
     assert_eq!(fr.spec_positions.as_slice(), &[5u32, 6, 9]);
+    assert_eq!(fr.program_tokens_req_indptr.as_slice(), &[0u32, 2, 4]);
+    assert_eq!(fr.program_tokens_indptr.as_slice(), &[0u32, 0, 2, 2, 4]);
+    assert_eq!(fr.program_tokens.as_slice(), &[279u32, 280, 555, 556]);
 }
 
 #[test]
@@ -382,6 +392,7 @@ fn frame_forward_sampling_late_device_round_trip() {
         sampling_late_keys: vec![7, 9],
         sampling_late_device_ptrs: vec![0xDEAD_0000_0000_A000, 0xDEAD_0000_0000_B000],
         sampling_late_device_flags: vec![0xF1A6_0000_0000_0001, 0xF1A6_0000_0000_0002],
+        sampling_late_device_lens: vec![19000, 4096],
         ..Default::default()
     };
     let f = Frame {
@@ -401,4 +412,5 @@ fn frame_forward_sampling_late_device_round_trip() {
         arch.sampling_late_device_flags.as_slice(),
         &[0xF1A6_0000_0000_0001u64, 0xF1A6_0000_0000_0002]
     );
+    assert_eq!(arch.sampling_late_device_lens.as_slice(), &[19000u32, 4096]);
 }
