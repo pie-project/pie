@@ -1222,6 +1222,29 @@ LowerResult lower(const Program& program, const LowerOptions& opts) {
     cg.build_buffers();
     if (!cg.ok) { res.error = cg.err; return res; }
 
+    // Batched (M>1) lowering assumes per-batch-row INDEPENDENT work (one block per
+    // batch row, no cross-row geometry). A matrix program (a `[k, vocab]` intrinsic
+    // — spec-verify) instead carries a per-row MATRIX axis whose rows feed cross-row
+    // ops (per-row argmax → `[k]` vector → cumprod accept-scan → reduce). Folding
+    // that into one per-block batched kernel silently miscompiles the cross-row scan
+    // (each block sees only its own row). Reject matrix work here so the backend's
+    // M=1 fallback (jit_backend.cpp) re-lowers it on the correct per-row matrix path
+    // (Custom grid = k, baked from the bytecode; cross-row ops cut to their own
+    // single-block kernel). The standard batched samplers (temp/min-p/grammar/
+    // mirostat) are `[vocab]` vector programs with no matrix work — unaffected.
+    if (opts.batched) {
+        bool matrix_work = false;
+        for (const VInfo& vi : cg.vinfo)
+            if (vi.ty.shape.tag == ShapeTag::Matrix) { matrix_work = true; break; }
+        if (!matrix_work)
+            for (const Op& op : cg.slot.ops)
+                if (cg.op_is_matrix(op)) { matrix_work = true; break; }
+        if (matrix_work) {
+            res.error = "batched lowering does not support matrix (per-row) programs";
+            return res;   // ok stays false → backend re-lowers M=1
+        }
+    }
+
     auto groups = cg.partition();
 
     // The materialized logits cast goes in the first group that references logits

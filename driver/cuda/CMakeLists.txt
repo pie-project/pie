@@ -773,6 +773,22 @@ if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/sampling_ir/codegen.cpp"
     ${CMAKE_CURRENT_SOURCE_DIR}/src)
   add_test(NAME sampling_ir_recognizer COMMAND test_sampling_ir_recognizer)
 
+  # #35-A regression guard (lane L2 / charlie): batched (M>1) lowering must REJECT
+  # matrix (per-row/cross-row) programs so the backend falls back to the M=1 matrix
+  # path. Folding a `[k, vocab]` matrix program into the per-batch-row batched
+  # kernel conflates the matrix (k-draft) axis with the batch axis and miscompiles
+  # cross-row ops (spec-verify's cumprod accept-scan). Pure host (lower_bytecode +
+  # the matrix/vector goldens); no CUDA.
+  add_executable(test_sampling_ir_batched_matrix_reject
+    tests/test_sampling_ir_batched_matrix_reject.cpp
+    src/sampling_ir/codegen.cpp
+    src/sampling_ir/reader.cpp)
+  target_include_directories(test_sampling_ir_batched_matrix_reject PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+  add_test(NAME sampling_ir_batched_matrix_reject
+    COMMAND test_sampling_ir_batched_matrix_reject)
+
   # Driver-level parity gate (lane L4 / echo): the IR argmax program, run through
   # echo's IProgramBackend exactly as the executor invokes it, must match the
   # legacy `launch_argmax_bf16` kernel over the same bf16 logits rows.
