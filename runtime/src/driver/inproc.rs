@@ -15,7 +15,7 @@ use std::collections::{HashMap, VecDeque};
 use std::ffi::c_void;
 use std::os::raw::c_int;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow};
@@ -24,10 +24,11 @@ use dashmap::DashMap;
 use once_cell::sync::Lazy;
 use tokio::runtime::RuntimeFlavor;
 
+use super::prefetch::PrefetchEntry;
 use super::{DriverChannel, DriverRequest, DriverResponse};
 use pie_driver_abi::schema::{PieFrameDesc, PieFrameView, PieResponseFrameDesc};
 
-pub use pie_ipc::ffi::InProcVTable;
+pub use pie_ipc::ffi::{InProcVTable, PrefetchFn};
 
 // ---------------------------------------------------------------------------
 // Pending entry
@@ -133,6 +134,12 @@ struct InProcState {
 
     /// Pending: req_id → entry.
     pending: Mutex<HashMap<u32, PendingEntry>>,
+
+    /// #11 prefetch seam: the driver's JIT prefetch entry, registered ONCE by
+    /// the C++ backend at ready-time via `InProcVTable::register_prefetch`.
+    /// `None` until registered (and forever for non-JIT drivers) ⇒
+    /// `prefetch_compile` is a no-op. Set-once, read-many.
+    prefetch: OnceLock<PrefetchEntry>,
 }
 
 impl InProcState {
@@ -144,6 +151,7 @@ impl InProcState {
             inbox: Mutex::new(VecDeque::new()),
             inbox_cv: Condvar::new(),
             pending: Mutex::new(HashMap::new()),
+            prefetch: OnceLock::new(),
         })
     }
 
@@ -206,6 +214,7 @@ impl InProcChannel {
             recv: vt_recv,
             send_response: vt_send_response,
             ctx: ctx_ptr,
+            register_prefetch: vt_register_prefetch,
         }
     }
 
@@ -432,6 +441,15 @@ impl DriverChannel for InProcChannel {
             slot.complete(Err(anyhow!("InProcChannel aborted")));
         }
     }
+
+    fn prefetch_compile(&self, bytecode: &[u8], manifest: &[pie_sampling_ir::Binding]) {
+        // No-op until the C++ backend has registered its trampoline (and forever
+        // for non-JIT embedded drivers). Fire-and-forget; correctness never
+        // depends on the prefetch landing — the real fire compiles either way.
+        if let Some(entry) = self.state.prefetch.get() {
+            entry.invoke(bytecode, manifest);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -483,6 +501,21 @@ fn recv_with_spin(state: &InProcState) -> Option<u32> {
             return Some(id);
         }
         inbox = state.inbox_cv.wait(inbox).ok()?;
+    }
+}
+
+/// register_prefetch: the C++ backend hands Rust its JIT prefetch trampoline +
+/// backend context (the #11 prefetch seam). Called ONCE at backend-ready; stored
+/// set-once so `prefetch_compile` can invoke it. A non-JIT driver never calls
+/// this, leaving the entry unregistered (prefetch stays a no-op).
+unsafe extern "C" fn vt_register_prefetch(
+    ctx: *mut c_void,
+    prefetch: PrefetchFn,
+    backend_ctx: *mut c_void,
+) {
+    if let Some(state) = InProcState::from_ctx(ctx) {
+        // set-once: a duplicate registration (shouldn't happen) is ignored.
+        let _ = state.prefetch.set(PrefetchEntry::new(prefetch, backend_ctx));
     }
 }
 

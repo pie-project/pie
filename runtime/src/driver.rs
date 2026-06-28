@@ -24,6 +24,7 @@ mod channel;
 mod inproc;
 mod inproc_polling;
 mod ops;
+mod prefetch;
 mod shmem;
 
 use anyhow::Result;
