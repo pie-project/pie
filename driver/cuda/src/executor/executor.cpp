@@ -3047,13 +3047,26 @@ void handle_fire_batch(
                     if (ir_trace)
                         std::cerr << "[ir-trace] next-input INJECT link=" << link
                                   << " rows=" << links.size() << " → pi.tokens\n";
-                } else if (ir_trace) {
-                    // A consumer references a link not in the retained map — the
-                    // use-after-free signature (freed too early, or producer pass
-                    // hasn't run). The dest stays the placeholder ⇒ token-divergence.
-                    std::cerr << "[ir-trace] next-input INJECT MISS link=" << link
-                              << " rows=" << links.size()
-                              << " (no retained source — UAF / unrun producer)\n";
+                } else {
+                    // #23 Part B(a) fence — retain-MISS = no retained source: the
+                    // producer pass is un-run or errored, so there is no buffer to
+                    // inject from. This is NOT a use-after-free: the deferred-free
+                    // (next_input_free_links, all-consumers-drained gate ~3690) frees
+                    // the retain-FOUND buffer strictly AFTER its counted inject drains,
+                    // so a freed buffer is never injected from; here there is simply no
+                    // buffer. The conditional read skips cleanly (no copy, no stream-
+                    // point — the consumer's forward graph is the stream-point and runs
+                    // regardless). The dst keeps its valid host placeholder (a stale,
+                    // hence DIVERGENT, token), but correctness is the #23 Part A host
+                    // cascade: this consumer's `consumed_producer_link` is unresolved
+                    // ⇒ fail-closed ⇒ effective_success=false ⇒ the divergent token is
+                    // rolled back, never committed. So: clean skip + cascade-abort, no
+                    // device flag, no race.
+                    if (ir_trace)
+                        std::cerr << "[ir-trace] next-input retain-miss link=" << link
+                                  << " rows=" << links.size()
+                                  << " → clean skip (producer un-run/errored; consumer "
+                                     "cascade-aborts via Part A fail-closed, no commit)\n";
                 }
             }
         }
