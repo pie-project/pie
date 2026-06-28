@@ -2294,57 +2294,84 @@ sampling_ir::SamplingIrBackend* ensure_sampling_ir_backend(Executor& ex) {
     }
 }
 
-// Marshal one fired sampling-IR program's declared outputs (read via the
-// runtime's `last_output_ptrs()`) into a single `PerRequestOutput`. Mirrors the
-// inline rich-marshal switch in `handle_fire_batch`; factored out so the
-// merged-batch path (#10 gate-1) can scatter EACH co-batched program's output
-// into its own `per_req[p]` slot (vs the single-request MVP that filled only
-// `per_req[0]`). Token→tokens (scalar) / spec_tokens (Vector<k> accept-prefix,
-// sentinel -1 = first reject); Scalar/Entropy→entropies; Logits→raw bf16 bytes.
+// Marshal a fired sampling-IR program's declared outputs (read via the runtime's
+// `last_output_ptrs()`) into the per-request slots. This is the #32/#33/M-batch
+// unified marshal axis: it loops `r in 0..num_rows × o in 0..n_out`, reading
+// output `o`'s row `r` at `outs[o] + r*elem_count_o` and scattering it to
+// `per_req[group_member[r]]`. The three axes compose on this one read:
+//   • num_rows>1  → M-batch row-scatter (#34): one N-row fire, N requests;
+//   • n_out>1     → multi-output (#33): each program output → its own slot;
+//   • elem_count_o>1 (Token) → [k]-Token (#32, today still spec_tokens-routed).
+// `group_member[r]` is the batched row → per_req index map = `ProgramGroup.rows`
+// (partition_by_program); an individual fire passes num_rows=1 + a 1-element map
+// (the target request). Single-Token rows land dense in `pi.sampled[base+r]` (so
+// the N-row read works today); rich outputs (Scalar/Entropy/Logits/[k]) currently
+// use 1-row scratch — their N-row form needs the runtime's N-row scratch (a
+// follow-on), so today they're exercised only at num_rows==1.
+// Token→tokens (scalar) / spec_tokens (Vector<k> accept-prefix, sentinel -1 =
+// first reject); Scalar/Entropy→entropies; Logits→raw bf16 bytes.
 void marshal_ir_program_output(const sampling_ir::ProgramInterface* pif,
                                std::span<void* const> outs,
-                               pie_driver::PerRequestOutput& pr) {
+                               int num_rows,
+                               std::span<const std::uint32_t> group_member,
+                               std::vector<pie_driver::PerRequestOutput>& per_req) {
     if (pif == nullptr) return;
-    for (std::size_t i = 0; i < pif->outputs.size() && i < outs.size(); ++i) {
-        const sampling_ir::DeclaredOutput& o = pif->outputs[i];
-        if (outs[i] == nullptr) continue;
-        switch (o.cls) {
-            case sampling_ir::OutputClass::Token: {
-                if (o.elem_count <= 1) {
-                    std::int32_t t = 0;
-                    CUDA_CHECK(cudaMemcpy(&t, outs[i], sizeof(t),
-                                          cudaMemcpyDeviceToHost));
-                    pr.tokens.push_back(static_cast<std::uint32_t>(t));
-                } else {
-                    std::vector<std::int32_t> v(o.elem_count);
-                    CUDA_CHECK(cudaMemcpy(v.data(), outs[i],
-                                          sizeof(std::int32_t) * o.elem_count,
-                                          cudaMemcpyDeviceToHost));
-                    for (std::int32_t x : v) {
-                        if (x < 0) break;
-                        pr.spec_tokens.push_back(static_cast<std::uint32_t>(x));
+    const int n = num_rows > 0 ? num_rows : 1;
+    for (int r = 0; r < n; ++r) {
+        if (static_cast<std::size_t>(r) >= group_member.size()) break;
+        const std::uint32_t req = group_member[r];
+        if (static_cast<std::size_t>(req) >= per_req.size()) continue;
+        pie_driver::PerRequestOutput& pr = per_req[req];
+        for (std::size_t i = 0; i < pif->outputs.size() && i < outs.size(); ++i) {
+            const sampling_ir::DeclaredOutput& o = pif->outputs[i];
+            if (outs[i] == nullptr) continue;
+            // Per-row stride within output i's [num_rows, elem_count] block.
+            const std::size_t stride = std::max<std::size_t>(o.elem_count, 1);
+            const std::size_t row_off = static_cast<std::size_t>(r) * stride;
+            switch (o.cls) {
+                case sampling_ir::OutputClass::Token: {
+                    const auto* base =
+                        static_cast<const std::int32_t*>(outs[i]) + row_off;
+                    if (o.elem_count <= 1) {
+                        std::int32_t t = 0;
+                        CUDA_CHECK(cudaMemcpy(&t, base, sizeof(t),
+                                              cudaMemcpyDeviceToHost));
+                        pr.tokens.push_back(static_cast<std::uint32_t>(t));
+                    } else {
+                        std::vector<std::int32_t> v(o.elem_count);
+                        CUDA_CHECK(cudaMemcpy(v.data(), base,
+                                              sizeof(std::int32_t) * o.elem_count,
+                                              cudaMemcpyDeviceToHost));
+                        for (std::int32_t x : v) {
+                            if (x < 0) break;
+                            pr.spec_tokens.push_back(static_cast<std::uint32_t>(x));
+                        }
                     }
+                    break;
                 }
-                break;
+                case sampling_ir::OutputClass::Scalar:
+                case sampling_ir::OutputClass::Entropy: {
+                    const auto* base =
+                        static_cast<const float*>(outs[i]) + row_off;
+                    float s = 0.f;
+                    CUDA_CHECK(cudaMemcpy(&s, base, sizeof(s),
+                                          cudaMemcpyDeviceToHost));
+                    pr.entropies.push_back(s);
+                    break;
+                }
+                case sampling_ir::OutputClass::Logits: {
+                    const std::size_t nbytes = o.elem_count * sizeof(std::uint16_t);
+                    const auto* base =
+                        static_cast<const std::uint16_t*>(outs[i]) + row_off;
+                    std::vector<std::uint8_t> bytes(nbytes);
+                    CUDA_CHECK(cudaMemcpy(bytes.data(), base, nbytes,
+                                          cudaMemcpyDeviceToHost));
+                    pr.logits.push_back(std::move(bytes));
+                    break;
+                }
+                default:
+                    break;
             }
-            case sampling_ir::OutputClass::Scalar:
-            case sampling_ir::OutputClass::Entropy: {
-                float s = 0.f;
-                CUDA_CHECK(cudaMemcpy(&s, outs[i], sizeof(s),
-                                      cudaMemcpyDeviceToHost));
-                pr.entropies.push_back(s);
-                break;
-            }
-            case sampling_ir::OutputClass::Logits: {
-                const std::size_t nbytes = o.elem_count * sizeof(std::uint16_t);
-                std::vector<std::uint8_t> bytes(nbytes);
-                CUDA_CHECK(cudaMemcpy(bytes.data(), outs[i], nbytes,
-                                      cudaMemcpyDeviceToHost));
-                pr.logits.push_back(std::move(bytes));
-                break;
-            }
-            default:
-                break;
         }
     }
 }
@@ -3284,9 +3311,15 @@ void handle_fire_batch(
                 // Each fire reuses the runtime's out_scratch / last_output_ptrs;
                 // sync + marshal THIS program before the next fire overwrites it.
                 CUDA_CHECK(cudaStreamSynchronize(cublas.stream()));
+                // Individual fire (num_rows=1): the one row maps to per_req[p].
+                // An M-batch fire of a contiguous identical group would instead
+                // pass num_rows=N + group_member=ProgramGroup.rows here.
+                const std::uint32_t member = p;
                 marshal_ir_program_output(
                     executor.sampling_ir_runtime.last_interface(),
-                    executor.sampling_ir_runtime.last_output_ptrs(), per_req[p]);
+                    executor.sampling_ir_runtime.last_output_ptrs(),
+                    /*num_rows=*/1, std::span<const std::uint32_t>(&member, 1),
+                    per_req);
             }
             if (all_handled) {
                 if (std::getenv("PIE_SAMPLING_IR_TRACE")) {
@@ -3788,7 +3821,10 @@ void handle_fire_batch(
                     executor.sampling_ir_runtime.last_output_ptrs();
                 std::vector<pie_driver::PerRequestOutput> per_req(
                     static_cast<std::size_t>(R));
-                marshal_ir_program_output(pif, outs, per_req[0]);
+                const std::uint32_t member = 0;
+                marshal_ir_program_output(pif, outs, /*num_rows=*/1,
+                                          std::span<const std::uint32_t>(&member, 1),
+                                          per_req);
                 executor.response_builder.build(per_req, out_resp);
                 write_probes(out_resp, t_entry, t_wire_parse_end, t_plan_end,
                              t_h2d_end, t_kernel_launch_end, t_sync_end);
