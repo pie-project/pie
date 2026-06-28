@@ -580,6 +580,10 @@ impl SchedulingPolicy for RunAheadPolicy {
         self.distinct_programs.clear();
     }
 
+    fn distinct_program_count(&self) -> usize {
+        self.distinct_programs.len()
+    }
+
     fn decide(&mut self, current_forward_requests: usize) -> Decision {
         // One-step run-ahead cap (R10): at most `MAX_IN_FLIGHT` batches in flight
         // (one computing + one prefetched). At the cap the GPU pipe is full —
@@ -803,7 +807,8 @@ mod run_ahead_tests {
     fn distinct_programs_union_dedup_and_reset_on_fire() {
         // The distinct-count plumbing: `on_arrival` unions each request's
         // per-program `program_identity_hash`es into the window set (identical
-        // self-dedup), and `on_fired` resets it for the next window.
+        // self-dedup), and `on_fired` resets it for the next window. The public
+        // `distinct_program_count()` (the #10 fire-trace witness) tracks it.
         let mut p = RunAheadPolicy::new(512);
         // Two requests, same grammar (one hash each) + one request with two
         // distinct programs ⇒ 3 distinct identities total.
@@ -811,12 +816,14 @@ mod run_ahead_tests {
         p.on_arrival(&[7]); // identical ⇒ dedups
         p.on_arrival(&[8, 9]); // a 2-program pass
         assert_eq!(p.distinct_programs.len(), 3);
+        assert_eq!(p.distinct_program_count(), 3); // the witness accessor
         // Plain-decode arrival (empty) adds nothing.
         p.on_arrival(&[]);
-        assert_eq!(p.distinct_programs.len(), 3);
+        assert_eq!(p.distinct_program_count(), 3);
         // Firing the batch drains the window.
         p.on_fired(4);
         assert!(p.distinct_programs.is_empty());
+        assert_eq!(p.distinct_program_count(), 0);
     }
 }
 

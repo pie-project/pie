@@ -90,6 +90,15 @@ pub(super) trait SchedulingPolicy: Send {
     /// Decide whether to fire or wait, given the current batch size.
     /// `&mut self` so policies can update internal state on every poll.
     fn decide(&mut self, current_batch_size: usize) -> Decision;
+
+    /// The number of DISTINCT programs (`program_identity_hash`) accumulated in
+    /// the current not-yet-fired window — the #10 distinct-count witness (read at
+    /// the fire trace so the verify can assert dedup: N-same-grammar ⇒ 1, and the
+    /// distinct-burst cap: N-distinct ⇒ N). Default `0` for policies that don't
+    /// track it; the run-ahead policy returns its live set size.
+    fn distinct_program_count(&self) -> usize {
+        0
+    }
 }
 
 // =============================================================================
@@ -1388,12 +1397,13 @@ impl BatchScheduler {
                     let total_tokens = batch.total_tokens();
                     if scheduler_trace_enabled() {
                         eprintln!(
-                            "[pie-sched-trace] driver={} fire requests={} tokens={} prefill_like={} stashed={}",
+                            "[pie-sched-trace] driver={} fire requests={} tokens={} prefill_like={} stashed={} distinct_programs={}",
                             driver_idx,
                             batch.len(),
                             total_tokens,
                             batch.should_prefill_coalesce(),
                             next_pending.is_some(),
+                            policy.distinct_program_count(),
                         );
                     }
                     let requests_to_fire = batch.take();
