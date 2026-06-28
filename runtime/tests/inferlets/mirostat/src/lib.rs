@@ -74,8 +74,13 @@ async fn main(input: String) -> Result<String> {
         inferlet::emit::emit_program(&built.program).map_err(|e| format!("mirostat emit: {e}"))?;
     let n_out = built.outputs.len() as u32;
 
-    // μ starts at 2τ (standard mirostat v2 initialization), overridable.
-    let mut mu: f32 = json_f32(&params, "mu0", 2.0 * tau);
+    // μ-init re-tune (#19): the standard 2τ init is BELOW the spread-vocab surprise
+    // floor (~10 nats on 151936), which starves the gate. `ln(vocab)` is an upper
+    // bound on any distribution's min-surprise (= −log(1/vocab)), so μ0 = ln(vocab)+1
+    // guarantees a non-empty INITIAL keep regardless of the (unknown) floor; the rank
+    // floor (mirostat_floor) keeps it non-empty on every subsequent step too.
+    let mu0_default = (vocab as f32).ln() + 1.0;
+    let mut mu: f32 = json_f32(&params, "mu0", mu0_default);
     let mut surprises: Vec<f32> = Vec::with_capacity(max_tokens);
     let mut generated: Vec<u32> = Vec::with_capacity(max_tokens);
     let mut pending: Vec<u32> = prompt;
