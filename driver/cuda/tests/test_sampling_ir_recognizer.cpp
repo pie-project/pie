@@ -7,8 +7,10 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <span>
 #include <vector>
 
+#include "sampling_ir/program_identity.hpp"
 #include "sampling_ir/program_recognizer.hpp"
 
 using namespace pie_cuda_driver::sampling_ir;
@@ -86,6 +88,34 @@ int main() {
     // Empty / null → CustomJIT (no spurious match).
     CHECK(!recognize_standard_kind(table, nullptr, 0).has_value());
     CHECK(!recognize_standard_kind(table, junk, 0).has_value());
+
+    // ── #10 cross-lang PIN: program_identity_hash goldens (program_identity.hpp) ──
+    // The single-source key shared by #11 compile-dedup / echo M-batch grouping /
+    // alpha's #10 distinct-count. alpha's Rust mirror pins to these EXACT vectors
+    // (no silent C++↔Rust drift — especially the load-bearing intrinsic row).
+    {
+        const std::uint8_t bc[] = {0x50, 0x53, 0x49, 0x52, 0x04, 0x00, 0x00, 0x00,
+                                   0x01, 0x00, 0x00, 0x00, 0x33, 0x00, 0x00, 0x00};
+        std::span<const std::uint8_t> bytes(bc, sizeof(bc));
+        const InputBind logits{BindKind::Logits, 0, HostAvailability::SubmitBound};
+        InputBind mtp{BindKind::Logits, 0, HostAvailability::SubmitBound};
+        mtp.intrinsic_kind = Intrinsic::MtpLogits;
+        const InputBind ht0{BindKind::HostTensor, 0, HostAvailability::SubmitBound};
+        const InputBind ht1{BindKind::HostTensor, 1, HostAvailability::SubmitBound};
+        const InputBind ht1_late{BindKind::HostTensor, 1, HostAvailability::LateBound};
+
+        CHECK(program_identity_hash(bytes, ProgramManifest{}) == 0x28bfe0a3f1d0e019ull);
+        CHECK(program_identity_hash(bytes, ProgramManifest{logits}) == 0xff5b1c59d84d9124ull);
+        // gotcha-(a): MtpLogits ≡ Logits (intrinsic_kind NOT hashed → dedup to one).
+        CHECK(program_identity_hash(bytes, ProgramManifest{mtp}) == 0xff5b1c59d84d9124ull);
+        CHECK(program_identity_hash(bytes, ProgramManifest{logits}) ==
+              program_identity_hash(bytes, ProgramManifest{mtp}));
+        CHECK(program_identity_hash(bytes, ProgramManifest{logits, ht0}) == 0x5f6eac04dece7e45ull);
+        CHECK(program_identity_hash(bytes, ProgramManifest{logits, ht0, ht1}) ==
+              0x97ff4a9ff574943dull);
+        CHECK(program_identity_hash(bytes, ProgramManifest{logits, ht1_late}) ==
+              0xcc3a636aa7e8ac37ull);
+    }
 
     if (g_failures == 0) {
         std::fprintf(stderr,
