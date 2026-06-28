@@ -63,8 +63,12 @@ fn now_micros() -> u64 {
 /// `on_fired`) and returns a [`Decision`] when asked whether to fire
 /// the current batch.
 pub(super) trait SchedulingPolicy: Send {
-    /// A request was added to the accumulator.
-    fn on_arrival(&mut self);
+    /// A request was added to the accumulator. `program_identity_hashes` are the
+    /// per-program `program_identity_hash`es carried by this request (one per
+    /// program in its sampler pass; empty for plain decode) — run-ahead policies
+    /// union them into the window's distinct-program set to drive the #10
+    /// dedup-aware accumulation. Other policies ignore them.
+    fn on_arrival(&mut self, program_identity_hashes: &[u64]);
 
     /// A batch finished executing. `latency` is the wall-clock time
     /// the forward pass took on the driver.
@@ -183,6 +187,12 @@ struct PendingRequest {
     completion: Completion,
     physical_page_ids: Vec<PhysicalPageId>,
     last_page_len: u32,
+    /// #10: per-program `program_identity_hash` for this request (one per program
+    /// in its sampler pass; empty for plain decode). Computed once at attach
+    /// (host-side, before carrier encoding) and threaded to the policy's
+    /// distinct-program set via `on_arrival` — runtime-side only, never on the
+    /// wire `ForwardRequest`.
+    program_identity_hashes: Vec<u64>,
 }
 
 enum Completion {
@@ -199,12 +209,14 @@ impl PendingRequest {
         response_tx: oneshot::Sender<Result<ForwardOutput>>,
         physical_page_ids: Vec<PhysicalPageId>,
         last_page_len: u32,
+        program_identity_hashes: Vec<u64>,
     ) -> Self {
         Self {
             request,
             completion: Completion::Direct(response_tx),
             physical_page_ids,
             last_page_len,
+            program_identity_hashes,
         }
     }
 }
@@ -793,6 +805,7 @@ mod tests {
             tx,
             vec![0; page_refs],
             1,
+            Vec::new(),
         )
     }
 
@@ -1058,12 +1071,34 @@ impl SchedulerHandle {
         physical_page_ids: Vec<PhysicalPageId>,
         last_page_len: u32,
     ) -> Result<()> {
+        self.submit_with_identity(
+            request,
+            response_tx,
+            physical_page_ids,
+            last_page_len,
+            Vec::new(),
+        )
+    }
+
+    /// Submit carrying the request's per-program `program_identity_hash`es (the
+    /// #10 distinct-count key, computed host-side at attach). Empty ⇒ plain
+    /// decode. The hashes ride on `PendingRequest` (runtime-side only) and reach
+    /// the policy via `on_arrival`; they are never placed on the wire request.
+    pub fn submit_with_identity(
+        &self,
+        request: pie_driver_abi::ForwardRequest,
+        response_tx: oneshot::Sender<Result<ForwardOutput>>,
+        physical_page_ids: Vec<PhysicalPageId>,
+        last_page_len: u32,
+        program_identity_hashes: Vec<u64>,
+    ) -> Result<()> {
         self.tx
             .send(PendingRequest::direct(
                 request,
                 response_tx,
                 physical_page_ids,
                 last_page_len,
+                program_identity_hashes,
             ))
             .map_err(|_| anyhow::anyhow!("scheduler channel closed"))?;
         Ok(())
@@ -1148,6 +1183,7 @@ impl BatchScheduler {
                 response_tx,
                 physical_page_ids,
                 last_page_len,
+                Vec::new(),
             ))
             .map_err(|_| anyhow::anyhow!("scheduler channel closed"))?;
         Ok(())
@@ -1226,7 +1262,7 @@ impl BatchScheduler {
                 let Some(pending) = prepare_pending_for_batch(&batch, pending) else {
                     continue;
                 };
-                policy.on_arrival();
+                policy.on_arrival(&pending.program_identity_hashes);
                 batch.push(pending);
             }
 
@@ -1289,7 +1325,7 @@ impl BatchScheduler {
                     next_pending = Some(pending);
                     break;
                 }
-                policy.on_arrival();
+                policy.on_arrival(&pending.program_identity_hashes);
                 batch.push_with(pending, usage);
                 if batch.is_full() {
                     break;
@@ -1345,7 +1381,7 @@ impl BatchScheduler {
                             next_pending = Some(pending);
                             break;
                         }
-                        policy.on_arrival();
+                        policy.on_arrival(&pending.program_identity_hashes);
                         batch.push(pending);
                     }
 
@@ -1517,7 +1553,7 @@ impl BatchScheduler {
                                         next_pending = Some(pending);
                                         continue;
                                     }
-                                    policy.on_arrival();
+                                    policy.on_arrival(&pending.program_identity_hashes);
                                     batch.push(pending);
                                 }
                                 Err(_) => break 'run_loop, // channel closed
@@ -1816,6 +1852,7 @@ impl BatchScheduler {
                                 completion,
                                 physical_page_ids,
                                 last_page_len: _,
+                                program_identity_hashes,
                             } = req;
                             match completion {
                                 Completion::Direct(tx) => {
@@ -1830,6 +1867,7 @@ impl BatchScheduler {
                                         completion,
                                         physical_page_ids,
                                         last_page_len: 0,
+                                        program_identity_hashes,
                                     };
                                     req.send_result(Ok(output), submit_tx.as_ref(), page_size);
                                 }
@@ -1861,6 +1899,7 @@ impl BatchScheduler {
                                 completion,
                                 physical_page_ids,
                                 last_page_len: _,
+                                program_identity_hashes,
                             } = req;
                             match completion {
                                 Completion::Direct(tx) => {
@@ -1875,6 +1914,7 @@ impl BatchScheduler {
                                         completion,
                                         physical_page_ids,
                                         last_page_len: 0,
+                                        program_identity_hashes,
                                     };
                                     req.send_result(Ok(output), submit_tx.as_ref(), page_size);
                                 }
@@ -1901,6 +1941,7 @@ impl BatchScheduler {
                                 completion,
                                 physical_page_ids,
                                 last_page_len: _,
+                                program_identity_hashes,
                             } = req;
                             match completion {
                                 Completion::Direct(tx) => {
@@ -1915,6 +1956,7 @@ impl BatchScheduler {
                                         completion,
                                         physical_page_ids,
                                         last_page_len: 0,
+                                        program_identity_hashes,
                                     };
                                     req.send_result(Ok(output), submit_tx.as_ref(), page_size);
                                 }

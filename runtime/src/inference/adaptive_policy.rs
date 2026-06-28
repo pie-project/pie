@@ -19,7 +19,7 @@
 //! re-submits a forward-pass request after every token. The scheduler
 //! accumulates these into a batch and the policy decides when to fire.
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::time::{Duration, Instant};
 
 use super::scheduler::{Decision, SchedulingPolicy};
@@ -83,7 +83,7 @@ impl AdaptivePolicy {
 }
 
 impl SchedulingPolicy for AdaptivePolicy {
-    fn on_arrival(&mut self) {
+    fn on_arrival(&mut self, _program_identity_hashes: &[u64]) {
         if self.batch_start_time.is_none() {
             self.batch_start_time = Some(Instant::now());
         }
@@ -160,7 +160,7 @@ impl EagerPolicy {
 }
 
 impl SchedulingPolicy for EagerPolicy {
-    fn on_arrival(&mut self) {
+    fn on_arrival(&mut self, _program_identity_hashes: &[u64]) {
         if self.batch_start_time.is_none() {
             self.batch_start_time = Some(Instant::now());
         }
@@ -233,7 +233,7 @@ impl GreedyPolicy {
 }
 
 impl SchedulingPolicy for GreedyPolicy {
-    fn on_arrival(&mut self) {}
+    fn on_arrival(&mut self, _program_identity_hashes: &[u64]) {}
     fn on_complete(&mut self, _latency: Duration) {}
     fn on_fired(&mut self, _fired_size: usize) {}
 
@@ -298,11 +298,16 @@ const MIN_POLL_US: u64 = 50;
 /// real grammar/spec-verify programs compile slower, so #10-verify must use REAL
 /// grammars and the true wall is ≥ this.
 const PER_DISTINCT_FINALIZE_S: f64 = 0.005;
-/// Per-program fire (cache-hit launch) cost (s). delta C3 ~1.4µs, N-sequential —
-/// negligible vs the ms-scale compile wall (kept for completeness; does not move
-/// the decision). Real grammar-kernel fire (occupancy over vocab=151936) is
-/// higher — measured on #10-verify, not here.
-const PER_FIRE_S: f64 = 0.0000014;
+/// Per-distinct-program M-batched fire cost (s). echo's occupancy bench
+/// (`5a7e6ec9`; 4090, vocab=151936, real argmax `OneBlockPerRow`) MEASURED the
+/// single-row argmax at ~30µs of real COMPUTE (1 block reducing 151936 / ~1/128
+/// SM occupancy) — NOT delta's trivial-kernel launch-only C3 (1.4µs). The
+/// M-batch (one `num_rows=N` kernel per distinct program) collapses N sequential
+/// fires into ~30-58µs total for the identical-collapsed case. So the fire, like
+/// the compile, is **per-DISTINCT-program** (the M-batch groups identical rows);
+/// 58µs ≪ the ~5ms finalize residual ⇒ the policy stays compile-dominated
+/// (decision unchanged, coefficient corrected).
+const PER_MBATCH_FIRE_S: f64 = 0.000058;
 
 /// #10 merged-batch cost model, delta-#11-calibrated. Cost is DOMINATED by the
 /// per-DISTINCT-program compile wall; **#11 dedup (landed `50809f5d`, delta C4
@@ -317,13 +322,15 @@ const PER_FIRE_S: f64 = 0.0000014;
 struct MergedCost {
     /// Per-distinct-program finalize residual (s) — the prefetch-unhideable floor.
     per_distinct_finalize_s: f64,
-    /// Per-program fire (launch) cost (s) — negligible correction term.
-    per_fire_s: f64,
+    /// Per-distinct-program M-batched fire cost (s) — echo `5a7e6ec9`; a
+    /// negligible correction vs the per-distinct finalize residual.
+    per_mbatch_fire_s: f64,
     /// #11 dedup collapses identical programs → one compile (landed `50809f5d`),
-    /// so the compile cost is per-DISTINCT. `true` reflects the landed dedup;
-    /// leveraging it needs the distinct-`program_identity_hash` count plumbed
-    /// (follow-up) — until then `estimate_s` is called with `distinct = total`
-    /// (conservative: prices every request as distinct → never over-accumulates).
+    /// so the compile cost is per-DISTINCT. `true` reflects the landed dedup; the
+    /// distinct-`program_identity_hash` count is now plumbed through `on_arrival`
+    /// (the policy's `distinct_programs` set), so `estimate_s` prices the actual
+    /// distinct count — identical batches accumulate near-free, distinct bursts
+    /// hit the cap.
     dedup_collapses_identical: bool,
 }
 
@@ -332,22 +339,28 @@ impl MergedCost {
     const fn calibrated() -> Self {
         Self {
             per_distinct_finalize_s: PER_DISTINCT_FINALIZE_S,
-            per_fire_s: PER_FIRE_S,
+            per_mbatch_fire_s: PER_MBATCH_FIRE_S,
             dedup_collapses_identical: true,
         }
     }
 
-    /// Estimated at-fire cost (s) of a batch of `total_requests` spanning
-    /// `distinct_programs` distinct programs: each distinct program pays the
-    /// finalize residual (dedup collapses identical → 1 compile); all requests
-    /// pay the negligible per-fire launch.
+    /// Estimated at-fire **sampling-program** cost (s) of a batch of
+    /// `total_requests` spanning `distinct_programs` distinct programs. Under the
+    /// landed optimizations BOTH axes collapse per-DISTINCT: #11 dedup
+    /// (`50809f5d`) → one compile per distinct; echo's M-batch (`5a7e6ec9`) → one
+    /// `num_rows=N` fire kernel per distinct. So the cost is
+    /// `distinct × (finalize_residual + M_batched_fire)`. Plain-decode requests
+    /// carry no program ⇒ `distinct_programs = 0` ⇒ zero sampling cost (they
+    /// batch freely; their forward-pass cost is bounded by capacity, not here).
+    /// The ~5ms finalize dominates the ~58µs fire ⇒ compile-driven policy.
     fn estimate_s(&self, total_requests: usize, distinct_programs: usize) -> f64 {
-        let compiles = if self.dedup_collapses_identical {
-            distinct_programs.clamp(1, total_requests.max(1))
+        let distinct = if self.dedup_collapses_identical {
+            distinct_programs
         } else {
-            total_requests.max(1)
+            // Counterfactual (dedup off): every request is its own compile+fire.
+            total_requests
         };
-        compiles as f64 * self.per_distinct_finalize_s + total_requests as f64 * self.per_fire_s
+        distinct as f64 * (self.per_distinct_finalize_s + self.per_mbatch_fire_s)
     }
 }
 
@@ -419,6 +432,11 @@ pub(super) struct RunAheadPolicy {
     /// #10 distinct-program compile-cost ceiling — decoupled from `accum_window`
     /// (the latency cap) per echo's note.
     max_accum_cost: Duration,
+    /// #10 distinct-program identities (`program_identity_hash`) accumulated in
+    /// the current (not-yet-fired) window, unioned across all programs in all
+    /// accumulated requests. `len()` = the distinct compile+fire walls the batch
+    /// will pay (identical programs self-dedup → one entry). Reset on fire.
+    distinct_programs: HashSet<u64>,
 }
 
 #[allow(dead_code)]
@@ -436,6 +454,7 @@ impl RunAheadPolicy {
             accumulating_since: None,
             merged_cost: MergedCost::calibrated(),
             max_accum_cost: max_accum_cost_from_env(),
+            distinct_programs: HashSet::new(),
         }
     }
 
@@ -464,16 +483,17 @@ impl RunAheadPolicy {
             return Decision::Fire;
         }
         // Cost cap (DECOUPLED from the latency window per echo's note): fire once
-        // the batch's estimated distinct-program COMPILE cost reaches
-        // `max_accum_cost`. delta's #11: compile ≫ fire by ~10³–10⁴, and #11 dedup
-        // (landed) collapses identical programs → one compile — so identical
-        // batches accumulate near-free while genuine distinct-program bursts hit
-        // this wall. (Distinct-`program_identity_hash`-count plumbing is the
-        // follow-up; until then the conservative bound passes `distinct = total`,
-        // i.e. prices every request as distinct → never over-accumulates.)
+        // the batch's estimated distinct-program compile+fire cost reaches
+        // `max_accum_cost`. delta's #11: compile ≫ fire, and #11 dedup (landed)
+        // collapses identical → one compile, echo's M-batch (`5a7e6ec9`) one
+        // fire-kernel — so identical batches accumulate near-free while genuine
+        // distinct-program bursts hit this wall. The distinct count is the live
+        // `distinct_programs` set (per-program `program_identity_hash` unioned
+        // across the window via `on_arrival`); an empty set (all plain-decode, or
+        // hashes not supplied) ⇒ zero sampling cost ⇒ no cost-cap fire.
         let cost = Duration::from_secs_f64(
             self.merged_cost
-                .estimate_s(current_forward_requests, current_forward_requests),
+                .estimate_s(current_forward_requests, self.distinct_programs.len()),
         );
         if cost >= self.max_accum_cost {
             return Decision::Fire;
@@ -505,7 +525,7 @@ impl RunAheadPolicy {
 }
 
 impl SchedulingPolicy for RunAheadPolicy {
-    fn on_arrival(&mut self) {
+    fn on_arrival(&mut self, program_identity_hashes: &[u64]) {
         let now = Instant::now();
         if let Some(prev) = self.last_arrival {
             self.inter_arrival_ewma = Self::ewma(
@@ -516,6 +536,9 @@ impl SchedulingPolicy for RunAheadPolicy {
         self.last_arrival = Some(now);
         // First arrival of a fresh batch opens the accumulation window.
         self.accumulating_since.get_or_insert(now);
+        // Union this request's per-program identities into the window's distinct
+        // set (identical programs self-dedup). Empty ⇒ plain decode (no program).
+        self.distinct_programs.extend(program_identity_hashes.iter().copied());
     }
 
     fn on_complete(&mut self, latency: Duration) {
@@ -552,6 +575,9 @@ impl SchedulingPolicy for RunAheadPolicy {
         self.in_flight.push_back(est);
         // The accumulated batch fired; the next batch opens a fresh window.
         self.accumulating_since = None;
+        // The window's distinct programs went out with the fired batch; the next
+        // window re-accumulates from empty.
+        self.distinct_programs.clear();
     }
 
     fn decide(&mut self, current_forward_requests: usize) -> Decision {
@@ -677,7 +703,7 @@ mod run_ahead_tests {
         // Default (window ZERO) ⇒ no accumulation ⇒ today's fire-on-arrival.
         let mut p = RunAheadPolicy::new(512);
         p.accum_window = Duration::ZERO;
-        p.on_arrival();
+        p.on_arrival(&[]);
         assert!(matches!(p.decide(1), Decision::Fire));
     }
 
@@ -718,17 +744,32 @@ mod run_ahead_tests {
     #[test]
     fn accum_window_cost_cap_fires() {
         // Distinct-program compile-cost ceiling (DECOUPLED from the latency
-        // window): each distinct program pays the finalize residual (~5ms); fire
-        // once the batch's estimated compile cost reaches `max_accum_cost`. dedup
-        // (landed) collapses identical → 1 compile; conservative `distinct=total`
-        // until the program_identity_hash count is plumbed.
+        // window): each DISTINCT program pays the finalize residual (~5ms) + the
+        // M-batched fire (~58µs); fire once the batch's estimated distinct cost
+        // reaches `max_accum_cost`. dedup (landed) collapses identical → 1
+        // compile, so the cost keys on the distinct `program_identity_hash` count
+        // (the `distinct_programs` set), now plumbed through `on_arrival`.
         let mut p = RunAheadPolicy::new(512);
         p.accum_window = Duration::from_millis(50); // ample latency budget
-        p.max_accum_cost = Duration::from_millis(40); // / 5ms-per-distinct ⇒ 8
+        p.max_accum_cost = Duration::from_millis(40); // / ~5ms-per-distinct ⇒ 8
         p.inter_arrival_ewma = 0.0005;
         p.accumulating_since = Some(Instant::now());
-        assert!(matches!(p.decide(8), Decision::Fire)); // 8×5ms = 40ms ⇒ compile wall
-        assert!(matches!(p.decide(2), Decision::Wait(_))); // 2×5ms = 10ms ⇒ accumulate
+        // 8 DISTINCT programs ⇒ 8×~5.06ms ≈ 40.5ms ≥ cap ⇒ compile wall ⇒ fire.
+        p.on_arrival(&[1, 2, 3, 4, 5, 6, 7, 8]);
+        assert!(matches!(p.decide(8), Decision::Fire));
+
+        // Same request COUNT but all IDENTICAL (1 distinct) ⇒ dedup → 1 compile
+        // ⇒ ~5ms ≪ cap ⇒ accumulate aggressively (the dedup win the policy turns).
+        let mut q = RunAheadPolicy::new(512);
+        q.accum_window = Duration::from_millis(50);
+        q.max_accum_cost = Duration::from_millis(40);
+        q.inter_arrival_ewma = 0.0005;
+        q.accumulating_since = Some(Instant::now());
+        q.on_arrival(&[42]);
+        q.on_arrival(&[42]);
+        q.on_arrival(&[42]);
+        assert_eq!(q.distinct_programs.len(), 1);
+        assert!(matches!(q.decide(8), Decision::Wait(_)));
     }
 
     #[test]
@@ -751,8 +792,31 @@ mod run_ahead_tests {
         let identical = c.estimate_s(100, 1);
         let all_distinct = c.estimate_s(100, 100);
         assert!(all_distinct > identical);
-        // compile dominates: even the single collapsed compile dwarfs all 100 fires.
-        assert!(identical > 99.0 * c.per_fire_s);
+        // compile dominates: the per-distinct finalize residual dwarfs the
+        // (M-batched, echo `5a7e6ec9`) per-distinct fire by >10×.
+        assert!(c.per_distinct_finalize_s > 10.0 * c.per_mbatch_fire_s);
+        // plain decode (no program) ⇒ zero sampling cost.
+        assert_eq!(c.estimate_s(100, 0), 0.0);
+    }
+
+    #[test]
+    fn distinct_programs_union_dedup_and_reset_on_fire() {
+        // The distinct-count plumbing: `on_arrival` unions each request's
+        // per-program `program_identity_hash`es into the window set (identical
+        // self-dedup), and `on_fired` resets it for the next window.
+        let mut p = RunAheadPolicy::new(512);
+        // Two requests, same grammar (one hash each) + one request with two
+        // distinct programs ⇒ 3 distinct identities total.
+        p.on_arrival(&[7]);
+        p.on_arrival(&[7]); // identical ⇒ dedups
+        p.on_arrival(&[8, 9]); // a 2-program pass
+        assert_eq!(p.distinct_programs.len(), 3);
+        // Plain-decode arrival (empty) adds nothing.
+        p.on_arrival(&[]);
+        assert_eq!(p.distinct_programs.len(), 3);
+        // Firing the batch drains the window.
+        p.on_fired(4);
+        assert!(p.distinct_programs.is_empty());
     }
 }
 
@@ -786,7 +850,7 @@ mod tests {
         policy.on_complete(Duration::from_millis(500)); // skipped
         policy.on_complete(Duration::from_millis(20));
         policy.on_fired(64);
-        policy.on_arrival();
+        policy.on_arrival(&[]);
         // Matched the historical cohort size; fire.
         assert!(matches!(policy.decide(64), Decision::Fire));
     }
@@ -797,7 +861,7 @@ mod tests {
         policy.on_complete(Duration::from_millis(500)); // skipped
         policy.on_complete(Duration::from_millis(20));
         policy.on_fired(64);
-        policy.on_arrival();
+        policy.on_arrival(&[]);
         // Below the historical cohort — wait for stragglers.
         assert!(matches!(policy.decide(32), Decision::Wait(_)));
     }
@@ -808,7 +872,7 @@ mod tests {
         policy.on_complete(Duration::from_millis(500)); // skipped
         policy.on_complete(Duration::from_micros(1)); // tiny → watchdog elapses fast
         policy.on_fired(64);
-        policy.on_arrival();
+        policy.on_arrival(&[]);
         std::thread::sleep(Duration::from_millis(2));
         // last_latency was 1 µs; 2 ms has elapsed → watchdog fires
         // even though batch is below fired_high_water.
