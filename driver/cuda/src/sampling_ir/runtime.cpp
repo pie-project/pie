@@ -164,6 +164,36 @@ RunStatus SamplingIrRuntime::try_run(const FireContext& ctx) {
             }
 
             case BindingClass::HostLate: {
+                // #31 self-spec greedy-v0: a `SelfSpecDraftInput` draft binding (the
+                // verify's k draft tokens) is driver-internal & device-resident —
+                // forward-(N-1)'s drafts the host refed as THIS forward's verify
+                // INPUT, resident in `pi->tokens` at `sample_row + 1` (the anchor sits
+                // at `sample_row`; the drafts start after it — charlie executor.cpp
+                // :4245-4251). The marker survives the bytecode `0x40` → reader →
+                // host_avail → jit_backend `InputDecl.intrinsic` projection (charlie
+                // fa5b5e68); we're in the `HostLate` case, so `cls==HostLate ∧
+                // intrinsic==SelfSpecDraftInput` is the distinct flag (NOT a generic
+                // HostLate fall-through → that would be the #19 wrong-buffer bind).
+                // Bind flag-FIRST: there is NO host upload and NO late carrier, so the
+                // staged/device-alias lookups below would `SkippedLateBindMiss`.
+                // Source = `pi->tokens` (the verify input), NEVER `pi->sampled`
+                // (transient; never holds the [k] drafts — delta's witness-independence
+                // invariant). `pi->tokens` are u32 ids, read by the kernel as the [k]
+                // i32 draft operand (non-negative ids → bit-identical).
+                if (decl.intrinsic == IntrinsicKind::SelfSpecDraftInput) {
+                    if (ctx.pi == nullptr) return RunStatus::Failed;
+                    r.device_ptr = ctx.pi->tokens.data() +
+                                   static_cast<std::size_t>(ctx.sample_row + 1);
+                    r.elem_count = decl.elem_count;
+                    r.present = true;
+                    if (std::getenv("PIE_SAMPLING_IR_TRACE")) {
+                        std::cerr << "[ir-trace]   SelfSpecDraftInput RESOLVED key="
+                                  << decl.host_key << " base_row="
+                                  << (ctx.sample_row + 1) << " elem_count="
+                                  << r.elem_count << " (pi->tokens, NOT sampled)\n";
+                    }
+                    break;
+                }
                 // Late-bound, resolved in priority order (spec §7.4):
                 //   1. staged host-late VALUE bytes (WS1b correctness path);
                 //   2. a device-resident value (output-ref alias / true-async);
