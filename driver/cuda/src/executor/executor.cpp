@@ -2266,12 +2266,15 @@ inline void write_probes(pie_driver::PieForwardResponseView& out,
     out.probe_sync_us          = us_between(t4, t5);
     out.probe_response_build_us = us_between(t5, t6);
 }
+}  // namespace  (split so ensure_sampling_ir_backend has external linkage)
 
 // Lazily construct the Sampling-IR JIT backend on the first program-carrying
 // fire — the JitEngine ctor resolves the device arch from the CUDA context,
 // which is current mid-fire. One-shot: a hard init failure (e.g. no NVRTC)
 // disables programmable sampling for the process and falls back to the legacy
-// sampler rather than retrying + re-logging every fire.
+// sampler rather than retrying + re-logging every fire. External linkage
+// (declared in executor.hpp): the #11 prefetch-seam registration in entry.cpp
+// force-creates it at backend-ready so a host-side prefetch has a live cache.
 sampling_ir::SamplingIrBackend* ensure_sampling_ir_backend(Executor& ex) {
     if (ex.sampling_ir_runtime.has_backend()) {
         return ex.sampling_ir_backend.get();
@@ -2294,6 +2297,7 @@ sampling_ir::SamplingIrBackend* ensure_sampling_ir_backend(Executor& ex) {
     }
 }
 
+namespace {
 // Marshal one fired sampling-IR program's declared outputs (read via the
 // runtime's `last_output_ptrs()`) into a single `PerRequestOutput`. Mirrors the
 // inline rich-marshal switch in `handle_fire_batch`; factored out so the

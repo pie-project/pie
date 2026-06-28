@@ -430,6 +430,14 @@ void handle_fire_batch(
 // Returns the number of graph execs inserted into `executor.graph_cache`.
 std::size_t capture_forward_graph_lattice(Executor& executor);
 
+// Lazily construct (and cache on `executor`) the Sampling-IR JIT backend — the
+// programmable-sampling compile-cache owner. Returns nullptr if NVRTC init
+// failed (programmable sampling disabled → legacy path). Must be called with a
+// current CUDA context: the JitEngine ctor resolves the device arch from it. The
+// #11 prefetch-seam registration force-creates it at backend-ready so a host-side
+// `driver::prefetch_compile` arriving before the first fire has a live cache.
+sampling_ir::SamplingIrBackend* ensure_sampling_ir_backend(Executor& executor);
+
 // TP-follower service loop. Called only on TP ranks > 0. Mirrors
 // `handle_fire_batch` minus shmem decode, sampling, and response: the
 // loop blocks on `ncclBroadcast(root=0)` for each fire's header + inputs,
