@@ -1110,6 +1110,35 @@ void test_grammar_with_logits_passthrough_v4() {
     check(true, "batched");
 }
 
+// Regression (2a): spec_verify_greedy(k=1) lowered BATCHED. The per-row
+// reduce/argmax result is one value per block (row r); the result-write must use
+// the row's single slot "r", NOT mwidx's elementwise "r*len+j" (whose per-element
+// j has no loop around a single-thread reduce write → unbound j → NVRTC compile
+// failure, the 2a RED). Host-lower structural test: assert the argmax write is
+// "[r] = _res" and NO "+j] = _res" survives, M=1 and batched.
+void test_spec_greedy_batched_reduce_write_v4() {
+    std::printf("[codegen v4 spec_verify_greedy(k=1) batched — per-row reduce write index]\n");
+    const ProgramManifest m = {{BindKind::Logits, 0, HostAvailability::SubmitBound},
+                               {BindKind::HostTensor, 0, HostAvailability::SubmitBound}};
+    auto check = [&](bool batched, const char* tag) {
+        LowerResult lr = lower_bytecode_v4(GV_SPECGREEDY_K1, sizeof(GV_SPECGREEDY_K1),
+                                           m, LowerOptions{batched});
+        expect(lr.ok, "spec_verify_greedy(k=1) lowers");
+        if (!lr.ok) { std::fprintf(stderr, "  %s err: %s\n", tag, lr.error.c_str()); return; }
+        // No single-thread reduce write may carry an unbound per-element j.
+        bool has_unbound_j = false, has_argmax = false;
+        for (const KernelDesc& k : lr.dag.kernels) {
+            const std::string& s = k.source;
+            if (s.find("_block_argmax_reduce") != std::string::npos) has_argmax = true;
+            if (s.find("+j] = _res") != std::string::npos) has_unbound_j = true;
+        }
+        expect(!has_unbound_j, "reduce/argmax write has NO unbound '+j] = _res' (writes row slot 'r')");
+        if (batched) expect(has_argmax, "batched path uses the fused per-row argmax reduce");
+    };
+    check(false, "M=1");
+    check(true, "batched");
+}
+
 }  // namespace
 
 int main() {
@@ -1138,6 +1167,7 @@ int main() {
     test_batched_argmax();
     test_gathercols_codegen();
     test_spec_lossless();
+    test_spec_greedy_batched_reduce_write_v4();
     test_std_argmax_v4();
     test_std_temp_minp_v4();
     test_grammar_maskapply_v4();

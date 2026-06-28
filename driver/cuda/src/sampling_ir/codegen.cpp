@@ -740,12 +740,20 @@ struct Codegen {
         // value inline (elem_expr — folds the whole map chain, no materialized
         // input buffer) and reduce the thread-local partial.
         std::uint32_t Lin = vinfo[op.a].len;
+        // Per-row reduce/argmax write index. Each block (row r) collapses its
+        // input row to exactly ONE value, so it writes the row's single slot: "r".
+        // NOT mwidx() — that is the elementwise "r*len+j", whose per-element j has
+        // no surrounding loop in a single-thread reduce write, so emitting it
+        // yields an undefined `j` (a k=1 single-row matrix lowered batched gives
+        // "r*1+j" → NVRTC compile failure). Matrix row_indexed results already map
+        // to "r"; this makes the batched per-row reduce do the same.
+        const std::string rrow = "r";
         auto reduce_fused = [&](const char* init, const char* acc, const char* reducer) {
             s << "  { float _acc = " << init << ";\n"
               << "    for (int j = tid; j < " << Lin << "; j += 256) { float _v = " << elem_expr(op.a)
               << "; " << acc << " }\n"
               << "    float _res = " << reducer << "(_acc);\n"
-              << "    if (tid == 0) " << buf_name(r) << "[" << mwidx(r) << "] = _res; __syncthreads(); }\n";
+              << "    if (tid == 0) " << buf_name(r) << "[" << rrow << "] = _res; __syncthreads(); }\n";
         };
         switch (op.code) {
             case OpCode::Exp: case OpCode::Log: case OpCode::Neg: case OpCode::Recip:
@@ -763,7 +771,7 @@ struct Codegen {
                   << "    for (int j = tid; j < " << Lin << "; j += 256) { float _v = " << elem_expr(op.a)
                   << "; if (_v > _best || (_v == _best && j < _bi)) { _best = _v; _bi = j; } }\n"
                   << "    int _res = pie_ir_block_argmax_reduce(_best, _bi);\n"
-                  << "    if (tid == 0) " << buf_name(r) << "[" << mwidx(r) << "] = _res; __syncthreads(); }\n";
+                  << "    if (tid == 0) " << buf_name(r) << "[" << rrow << "] = _res; __syncthreads(); }\n";
                 break;
             }
             case OpCode::Broadcast: case OpCode::RowBroadcast: case OpCode::Rng:
