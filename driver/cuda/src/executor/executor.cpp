@@ -4490,6 +4490,32 @@ void handle_fire_batch(
                         per_req.data(), per_req.size()),
                     native_commit_cache);
             }
+            // #31 greedy-v0 draft-output: surface the drafter's [k] proposal through
+            // the #32 program_tokens CSR as a NON-IR drafter-filled slot — the host
+            // reads it via out.tokens(draft_handle) and refeeds it as the next
+            // forward's verify input. SOURCE = per_req[r].spec_tokens (the drafter's
+            // ACTUAL proposal written above, executor.cpp:922 / gemma4_mtp.cpp:1418),
+            // NEVER pi.tokens/pi.sampled (delta's witness-independence invariant — D
+            // from a buffer distinct from the verify's pi.tokens read). The slot is
+            // APPEND-LAST (draft_seg = program_tokens.size(), after any IR outputs) —
+            // the same host-side rule bravo's runtime pseudo-output + the SDK handle
+            // use, so read-handle == write-seg by construction (no hardcoded seg(r,0)).
+            {
+                const std::size_t draft_k_n = view.spec_draft_output_k.size();
+                for (int r = 0; r < R; ++r) {
+                    if (static_cast<std::size_t>(r) >= draft_k_n) break;
+                    const std::uint32_t k = view.spec_draft_output_k.data()[r];
+                    if (k == 0) continue;
+                    auto& pr = per_req[static_cast<std::size_t>(r)];
+                    const std::size_t draft_seg = pr.program_tokens.size();
+                    pr.program_tokens.resize(draft_seg + 1);
+                    const std::size_t n =
+                       std::min<std::size_t>(k, pr.spec_tokens.size());
+                    pr.program_tokens[draft_seg].assign(
+                       pr.spec_tokens.begin(),
+                       pr.spec_tokens.begin() + static_cast<std::ptrdiff_t>(n));
+                }
+            }
             // Advance each committed rs_cache slot from its pre-verify value
             // (the frozen verify left it untouched) to its confirmed prefix
             // [input | accepted] via ACTIVATION REPLAY: replay only the linear-
