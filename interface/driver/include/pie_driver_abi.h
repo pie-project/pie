@@ -68,6 +68,9 @@ constexpr static const uint8_t SamplingBinding_KIND_LOGITS = 0;
 /// Wire discriminant for a `Tensor` slot.
 constexpr static const uint8_t SamplingBinding_KIND_TENSOR = 1;
 
+/// Wire discriminant for a `MtpLogits` (draft-logits intrinsic) slot.
+constexpr static const uint8_t SamplingBinding_KIND_MTP_LOGITS = 2;
+
 /// Copy direction for [`crate::CopyRequest`].
 enum PieCopyDir : uint8_t {
   PieCopyDir_D2H,
@@ -98,7 +101,7 @@ struct PieBrleDesc {
 };
 
 /// Per-slot adapter binding. `-1` sentinels mean "unbound" — both fields
-/// are signed so the wire form matches what portable's legacy SoA path
+/// are signed so the wire form matches what cuda's legacy SoA path
 /// already consumes (`.as<int64_t>()`), no shim conversion needed.
 struct PieAdapterBinding {
   /// `-1` means no adapter bound for this slot.
@@ -239,6 +242,18 @@ struct PieForwardRequestDesc {
   size_t rs_buffer_slot_ids_len;
   const uint32_t *rs_buffer_slot_indptr_ptr;
   size_t rs_buffer_slot_indptr_len;
+  const uint32_t *next_input_free_links_ptr;
+  size_t next_input_free_links_len;
+  const uint64_t *sampling_output_dst_ptrs_ptr;
+  size_t sampling_output_dst_ptrs_len;
+  const uint32_t *sampling_output_dst_lens_ptr;
+  size_t sampling_output_dst_lens_len;
+  const uint32_t *sampling_output_indptr_ptr;
+  size_t sampling_output_indptr_len;
+  const uint64_t *sampling_late_device_ptrs_ptr;
+  size_t sampling_late_device_ptrs_len;
+  const uint64_t *sampling_late_device_flags_ptr;
+  size_t sampling_late_device_flags_len;
 };
 
 struct PieCopyRequestDesc {

@@ -1,0 +1,4 @@
+[package]
+name = "mirostat"
+version = "0.1.0"
+description = "Test inferlet: mirostat v2 decoding via a Sampling-IR program (WS2)"

@@ -54,6 +54,14 @@ pub struct InstanceState {
     guest_resource_map: Vec<(ResourceAny, u32)>,
     /// Counter for allocating unique host reps
     next_dynamic_rep: u32,
+
+    /// #6/#21 run-ahead next-input carry state (per-instance, single-context
+    /// MVP). `pending_next_input` holds the prior *producer* pass's pending carry
+    /// (link id + dest positions + producer row count) for the next pass (the
+    /// implicit consumer) to inject; `next_input_link_counter` is the host's
+    /// global monotonic link-id source. See [`crate::api::next_input_map`].
+    pub(crate) pending_next_input: Option<crate::api::next_input_map::PendingNextInput>,
+    pub(crate) next_input_link_counter: u32,
 }
 
 impl Drop for InstanceState {
@@ -178,6 +186,10 @@ impl InstanceState {
             dynamic_resource_map: HashMap::new(),
             guest_resource_map: Vec::new(),
             next_dynamic_rep: 1,
+            // #6/#21 run-ahead next-input carry (idle until a pass declares
+            // `next-inputs`).
+            pending_next_input: None,
+            next_input_link_counter: 0,
         })
     }
 

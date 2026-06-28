@@ -15,6 +15,7 @@ path = "src/lib.rs"
 [dependencies]
 pie-ipc = { path = "../driver/ipc" }
 pie-driver-abi = { path = "../interface/driver" }
+pie-sampling-ir = { path = "../interface/sampling-ir" }
 pie-client = { path = "../client/rust" }
 tokio = { version = "1.52", features = ["full"] }
 tokio-util = "0.7"
@@ -85,6 +86,15 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg",
 
 [features]
 default = []
+# Programmable-sampling output→tensor fast-path (#27 cut #1). Gates the host
+# eager-D2H populate: the `extern "C"` `pie_pinned_alloc`/`pie_pinned_free`
+# decls + the `sampling_output_*` carrier fill + the pinned `output()` read.
+# OFF (host-only builds / `cargo test -p pie`) ⇒ the fast-path is compiled out
+# entirely (the `pie_driver_cuda_lib` symbols are never referenced, so no
+# undefined-symbol link error), leaving the legacy `ForwardResponse` output
+# path. ON (propagated from `pie-worker`'s `driver-cuda`, which links
+# `pie_driver_cuda_lib`) ⇒ the fast-path is active and the symbols resolve.
+driver-cuda = []
 # Host-side performance probes. Each scenario is a separate flag so you
 # only pay for the probes you ask for — different domains have different
 # sample rates and different audiences. The `probe_<domain>!` macros in
@@ -99,6 +109,7 @@ profile-all = ["profile-fire", "profile-driver-cuda"]       # everything
 
 [dev-dependencies]
 tempfile = "3"
+pie-sampling-ir = { path = "../interface/sampling-ir", features = ["eval"] }
 criterion = { version = "0.5", features = ["html_reports"] }
 tokenizers = "0.21"
 

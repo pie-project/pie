@@ -205,3 +205,105 @@ fn view_pointers_stable_across_move() {
 fn _unused() {
     let _p: *const u8 = ptr::null();
 }
+
+/// FULL host-submit→Desc→view path for the #27 cut #1 `sampling_output_*`
+/// fast-path carrier (the path the live in-proc fire takes — `frame.as_desc()`
+/// → the C++ `PieForwardRequestView`), NOT just the rkyv archive round-trip
+/// (`round_trip_schema.rs`). Regression for the cut #1 false-pass where the
+/// driver's `view.sampling_output_dst_ptrs` was empty though the host populated
+/// `req`. The view's slices MUST alias the native `Vec`s.
+#[test]
+fn forward_request_view_sees_sampling_output_fastpath() {
+    let req = ForwardRequest {
+        token_ids: vec![1, 2],
+        sampling_output_dst_ptrs: vec![0xDEAD_0000_0000_1000, 0xDEAD_0000_0000_2000],
+        sampling_output_dst_lens: vec![4, 4],
+        sampling_output_indptr: vec![0, 2],
+        ..Default::default()
+    };
+    let view = pie_forward_request_view(&req);
+    assert_eq!(view.desc.sampling_output_dst_ptrs_len, 2);
+    assert_eq!(
+        view.desc.sampling_output_dst_ptrs_ptr,
+        req.sampling_output_dst_ptrs.as_ptr()
+    );
+    let ptrs = unsafe { std::slice::from_raw_parts(view.desc.sampling_output_dst_ptrs_ptr, 2) };
+    assert_eq!(ptrs, &[0xDEAD_0000_0000_1000u64, 0xDEAD_0000_0000_2000]);
+    assert_eq!(view.desc.sampling_output_dst_lens_len, 2);
+    assert_eq!(
+        view.desc.sampling_output_dst_lens_ptr,
+        req.sampling_output_dst_lens.as_ptr()
+    );
+    assert_eq!(view.desc.sampling_output_indptr_len, 2);
+    assert_eq!(
+        view.desc.sampling_output_indptr_ptr,
+        req.sampling_output_indptr.as_ptr()
+    );
+
+    // The EXACT in-proc production path: `Frame { Forward(req) }` → `pie_frame_view`
+    // (the `frame.as_desc()` the driver `recv` hands over) → the nested forward
+    // desc. This is the path the live fire takes (not the bare ForwardRequest
+    // view above), so it's the real regression guard for the cut #1 view-empty bug.
+    let frame = Frame {
+        driver_id: 1,
+        payload: RequestPayload::Forward(req),
+    };
+    let fview = pie_frame_view(&frame);
+    let fwd = &fview.desc.payload.forward;
+    assert_eq!(fwd.sampling_output_dst_ptrs_len, 2);
+    let inner = match &frame.payload {
+        RequestPayload::Forward(r) => r,
+        _ => unreachable!(),
+    };
+    assert_eq!(
+        fwd.sampling_output_dst_ptrs_ptr,
+        inner.sampling_output_dst_ptrs.as_ptr()
+    );
+    assert_eq!(fwd.sampling_output_dst_lens_len, 2);
+    assert_eq!(fwd.sampling_output_indptr_len, 2);
+}
+
+/// FULL host-submit→Desc→view path for the #27 cut #2 device-alias late channel
+/// (the in-proc fire path `frame.as_desc()` → C++ `PieForwardRequestView`), NOT
+/// just rkyv. The exact regression guard for the cut #1 view-empty class, applied
+/// pre-emptively to the new late-device carrier so echo's view accessor reads a
+/// real (non-zero) Desc offset. The view's slices MUST alias the native Vecs.
+#[test]
+fn forward_request_view_sees_sampling_late_device() {
+    let req = ForwardRequest {
+        token_ids: vec![1, 2],
+        sampling_late_keys: vec![7, 9],
+        sampling_late_device_ptrs: vec![0xDEAD_0000_0000_A000, 0xDEAD_0000_0000_B000],
+        sampling_late_device_flags: vec![0xF1A6_0000_0000_0001, 0xF1A6_0000_0000_0002],
+        ..Default::default()
+    };
+    let view = pie_forward_request_view(&req);
+    assert_eq!(view.desc.sampling_late_device_ptrs_len, 2);
+    assert_eq!(
+        view.desc.sampling_late_device_ptrs_ptr,
+        req.sampling_late_device_ptrs.as_ptr()
+    );
+    assert_eq!(view.desc.sampling_late_device_flags_len, 2);
+    assert_eq!(
+        view.desc.sampling_late_device_flags_ptr,
+        req.sampling_late_device_flags.as_ptr()
+    );
+
+    // The exact in-proc production path: Frame → pie_frame_view → nested forward.
+    let frame = Frame {
+        driver_id: 1,
+        payload: RequestPayload::Forward(req),
+    };
+    let fview = pie_frame_view(&frame);
+    let fwd = &fview.desc.payload.forward;
+    let inner = match &frame.payload {
+        RequestPayload::Forward(r) => r,
+        _ => unreachable!(),
+    };
+    assert_eq!(fwd.sampling_late_device_ptrs_len, 2);
+    assert_eq!(
+        fwd.sampling_late_device_ptrs_ptr,
+        inner.sampling_late_device_ptrs.as_ptr()
+    );
+    assert_eq!(fwd.sampling_late_device_flags_len, 2);
+}

@@ -24,7 +24,7 @@ crate-type = ["rlib"]
 # kept as a compatibility no-op for older build commands; the dummy
 # Rust driver is no longer gated.
 default = []
-driver-cuda = ["dep:pie-weight-loader"]
+driver-cuda = ["dep:pie-weight-loader", "pie/driver-cuda"]
 driver-metal = ["dep:pie-weight-loader"]
 driver-dummy = []
 

@@ -16,7 +16,7 @@ use tokio::sync::oneshot;
 use crate::arena::PhysicalPageId;
 use crate::driver::{self, DriverId, SchedulerLimits};
 
-use super::adaptive_policy::GreedyPolicy;
+use super::adaptive_policy::RunAheadPolicy;
 use super::{ForwardOutput, request};
 
 mod chunked;
@@ -59,6 +59,13 @@ pub(super) trait SchedulingPolicy: Send {
     /// state cohort size and avoid firing partial batches in the next
     /// cycle.
     fn on_fired(&mut self, fired_size: usize);
+
+    /// The current batch was submitted (enqueued). `submission_latency` is the
+    /// host-side enqueue duration; run-ahead policies EWMA it into the
+    /// `lead_time` (how far ahead of an in-flight batch's completion to fire so
+    /// the next enqueue lands just-in-time). Default no-op for non-run-ahead
+    /// policies, whose fire is synchronous (no separate submission phase).
+    fn on_submitted(&mut self, _submission_latency: Duration) {}
 
     /// Decide whether to fire or wait, given the current batch size.
     /// `&mut self` so policies can update internal state on every poll.
@@ -138,6 +145,16 @@ struct BatchExecutionTiming {
     system_spec_draft_tokens_accepted: u64,
     system_spec_draft_tokens_proposed_per_pos: [u64; SYSTEM_SPEC_DRAFT_POS_BUCKETS],
     system_spec_draft_tokens_accepted_per_pos: [u64; SYSTEM_SPEC_DRAFT_POS_BUCKETS],
+}
+
+/// Completion feedback the spawned fire task sends back to the scheduler loop
+/// so the run-ahead policy can update its timing EWMAs. `forward_latency` (the
+/// off-thread GPU/driver wait) feeds `on_complete` and pops the in-flight FIFO;
+/// `submission_latency` (the host batch-build/enqueue done on the scheduler
+/// thread) feeds `on_submitted` (the lead time the fire is brought forward by).
+struct FireCompletion {
+    forward_latency: Duration,
+    submission_latency: Duration,
 }
 
 // =============================================================================
@@ -499,6 +516,28 @@ impl BatchAccumulator {
         self.would_exceed_with(&usage)
     }
 
+    /// Run-ahead token-carryover separation (one-step #6, R10): a candidate
+    /// forward `t+1` whose `next_input_producer_links` references the
+    /// `pipeline_source_link` of a forward `t` ALREADY in this batch must NOT
+    /// co-batch with it. `t+1`'s pre-forward `next-inputs` inject reads `t`'s
+    /// sampled token (a *prior* fire's retained buffer); `t` samples
+    /// post-forward, so co-batching would read a not-yet-sampled token → `t`
+    /// and `t+1` must fire in separate, ordered batches (`t` first). This is
+    /// purely the token-carryover data-dependency — not a KV/working-set
+    /// concern. Batch-local set-membership on the link ids (`0` = not a source;
+    /// links are 1-based). Depth ≤1 makes this a simple membership check; the
+    /// parity-phase machinery (§2.3) is the deferred deeper-run-ahead path.
+    fn would_depend_on_batch(&self, req: &PendingRequest) -> bool {
+        let deps = &req.request.next_input_producer_links;
+        if deps.is_empty() || self.requests.is_empty() {
+            return false;
+        }
+        self.requests.iter().any(|in_batch| {
+            let source_link = in_batch.request.pipeline_source_link;
+            source_link != 0 && deps.contains(&source_link)
+        })
+    }
+
     fn would_exceed_with(&self, usage: &RequestCapacityUsage) -> bool {
         if self.requests.is_empty() {
             return false;
@@ -761,6 +800,29 @@ mod tests {
         req.request.sampling_indices = indices;
         req.request.set_samplers(&samplers);
         req
+    }
+
+    fn with_pipeline_source(mut req: PendingRequest, link: u32) -> PendingRequest {
+        req.request.pipeline_source_link = link;
+        req
+    }
+
+    fn with_next_input(mut req: PendingRequest, producer_link: u32) -> PendingRequest {
+        req.request.next_input_producer_links = vec![producer_link];
+        req
+    }
+
+    #[test]
+    fn accumulator_separates_run_ahead_carryover_dependency() {
+        // One-step run-ahead (R10): a forward `t` samples its token under link
+        // L=1; a forward `t+1` that injects L=1 via `next-inputs` MUST NOT
+        // co-batch with it (it would read `t`'s not-yet-sampled token). `t+1` is
+        // stashed for the next fire; an unrelated/plain request is unaffected.
+        let mut batch = BatchAccumulator::new(limits(8, 100, 100), 16);
+        batch.push(with_pipeline_source(pending(1, 1), 1));
+        assert!(batch.would_depend_on_batch(&with_next_input(pending(1, 1), 1)));
+        assert!(!batch.would_depend_on_batch(&with_next_input(pending(1, 1), 2)));
+        assert!(!batch.would_depend_on_batch(&pending(1, 1)));
     }
 
     #[test]
@@ -1100,26 +1162,37 @@ impl BatchScheduler {
         stats: Arc<SchedulerStats>,
         rt_handle: tokio::runtime::Handle,
     ) {
-        let request_timeout = Duration::from_secs(request_timeout_secs);
+        // The per-request timeout is currently unused by the run-ahead fire
+        // path (the driver wait is bounded by the channel). Kept consuming the
+        // param so the scheduler signature is stable for a future per-request
+        // deadline.
+        let _request_timeout = Duration::from_secs(request_timeout_secs);
 
         // Per-driver state
         let mut batch = BatchAccumulator::new(limits, page_size);
-        // Greedy batching is the only policy under FCFS — fire as soon as
-        // there is work, no batch-policy knob.
-        let mut policy: Box<dyn SchedulingPolicy> = Box::new(GreedyPolicy::new());
-        // No cross-thread in-flight gate needed: the scheduler is the
-        // only firer and runs `execute_batch` synchronously, so a
-        // second fire physically cannot start before the previous one
-        // completes.
+        // Run-ahead just-in-time firing (#6). Fires the next batch a lead-time
+        // before the in-flight one completes so the enqueue lands as the GPU
+        // goes idle. Degrades to greedy when nothing is in flight at decide
+        // time (the synchronous-fire fallback).
+        let mut policy: Box<dyn SchedulingPolicy> =
+            Box::new(RunAheadPolicy::new(limits.max_forward_requests));
+        // The fire is non-blocking: `execute_batch` is split into an ordered
+        // enqueue on this thread (fixing driver-inbox order == fire order) plus
+        // an off-thread wait, so building/enqueuing the next batch overlaps the
+        // in-flight GPU. The in-flight depth is bounded by the policy's FIFO
+        // cap (one-step run-ahead, R10).
 
-        // Channel for batch completion latency feedback to the policy.
-        let (latency_tx, latency_rx) = crossbeam::channel::unbounded::<Duration>();
+        // Channel for batch completion feedback to the policy. Carries the
+        // off-thread forward (GPU) latency + the on-thread submission latency.
+        let (latency_tx, latency_rx) = crossbeam::channel::unbounded::<FireCompletion>();
         let mut next_pending: Option<PendingRequest> = None;
 
         'run_loop: loop {
-            // Drain completed batch latencies (non-blocking)
-            while let Ok(latency) = latency_rx.try_recv() {
-                policy.on_complete(latency);
+            // Drain completed batch feedback (non-blocking): GPU latency →
+            // on_complete (+ FIFO pop), submission latency → on_submitted.
+            while let Ok(c) = latency_rx.try_recv() {
+                policy.on_submitted(c.submission_latency);
+                policy.on_complete(c.forward_latency);
             }
 
             // Wait for first request if batch is empty. crossbeam's
@@ -1158,6 +1231,14 @@ impl BatchScheduler {
                 else {
                     continue;
                 };
+                // Run-ahead one-step separation (R10): a forward `t+1` whose
+                // token-carryover source `t` is in this batch fires in the NEXT
+                // batch (after `t` samples its token) — co-batching would read a
+                // not-yet-sampled token.
+                if batch.would_depend_on_batch(&pending) {
+                    next_pending = Some(pending);
+                    break;
+                }
                 if batch.would_exceed_with(&usage) {
                     if scheduler_trace_enabled() {
                         let reason = batch
@@ -1210,6 +1291,10 @@ impl BatchScheduler {
                             pending.send_error(msg);
                             continue;
                         }
+                        if batch.would_depend_on_batch(&pending) {
+                            next_pending = Some(pending);
+                            break;
+                        }
                         if batch.would_exceed(&pending) {
                             if scheduler_trace_enabled() {
                                 let reason = batch
@@ -1242,8 +1327,6 @@ impl BatchScheduler {
                         );
                     }
                     let requests_to_fire = batch.take();
-                    policy.on_fired(requests_to_fire.len());
-
                     let batch_size = requests_to_fire.len() as u64;
                     crate::probe_fire_record!(
                         stats.fire.pre_dispatch.fire_prepare_us,
@@ -1273,93 +1356,103 @@ impl BatchScheduler {
                         );
                     }
 
-                    // Fire synchronously on the scheduler thread.
-                    // `execute_batch` parks on a futex inside
-                    // `fire_batch_sync` while the GPU runs (the same
-                    // wait the prior `block_in_place(submit_sync)` did
-                    // under the old `async fn`). The ~800 µs
-                    // `deferred_drop` work is still punted via
-                    // `rt_handle.spawn_blocking` inside execute_batch.
-                    //
-                    // execute.total_us probe wraps execute_batch end-to-end;
-                    // its children (batch_build, driver_fire, response_dispatch)
-                    // probe inside execute_batch and should sum to total within
-                    // a few µs.
-                    let timeout = request_timeout;
-                    let start = Instant::now();
-                    let timing = crate::probe_fire!(stats.fire.execute.total_us, {
-                        Self::execute_batch(
-                            driver_idx,
-                            requests_to_fire,
-                            driver_id,
-                            page_size,
-                            timeout,
-                            &rt_handle,
-                            Some(submit_tx.clone()),
-                            &stats,
-                        )
-                    });
-                    let latency = start.elapsed();
-                    let _ = latency_tx.send(latency);
+                    // Build the batched request on the scheduler thread (this
+                    // overlaps the GPU of any in-flight batch), ENQUEUE it in
+                    // fire-order here (fixing driver-inbox order == fire order,
+                    // so a forward `t+1` never reaches the worker before its
+                    // token-carryover source `t`), and AWAIT the response
+                    // off-thread so this thread is freed to collect/build the
+                    // next batch.
+                    let build_start = Instant::now();
+                    let batch_req =
+                        Self::build_batch_request(&requests_to_fire, page_size, &stats);
+                    let submission_latency = build_start.elapsed();
 
-                    // (Market clock `context::tick` removed — W16, Phase 5.)
+                    match driver::fire_batch_deferred(driver_idx, batch_req) {
+                        Ok(handle) => {
+                            // The batch is enqueued (its order fixed) — record it
+                            // as in-flight so the policy paces the next fire.
+                            policy.on_fired(batch_size as usize);
 
-                    // Always-on counters + spec-domain accumulation.
-                    // Wrapped in stats_update_us probe so we can see how
-                    // much the bookkeeping costs.
-                    crate::probe_fire!(stats.fire.post_dispatch.stats_update_us, {
-                        stats.total_batches.fetch_add(1, Relaxed);
-                        stats
-                            .total_tokens_processed
-                            .fetch_add(total_tokens as u64, Relaxed);
-                        stats
-                            .total_requests_processed
-                            .fetch_add(batch_size, Relaxed);
-                        stats
-                            .max_forward_requests_observed
-                            .fetch_max(batch_size, Relaxed);
-                        let bucket = match batch_size {
-                            0 | 1 => 0,
-                            2..=3 => 1,
-                            4..=7 => 2,
-                            8..=15 => 3,
-                            16..=31 => 4,
-                            32..=63 => 5,
-                            64..=127 => 6,
-                            _ => 7,
-                        };
-                        stats.batch_size_hist[bucket].fetch_add(1, Relaxed);
-                        stats
-                            .last_batch_latency_us
-                            .store(latency.as_micros() as u64, Relaxed);
-                        stats
-                            .cumulative_latency_us
-                            .fetch_add(latency.as_micros() as u64, Relaxed);
-                        stats
-                            .system_spec_draft_tokens_proposed
-                            .fetch_add(timing.system_spec_draft_tokens_proposed, Relaxed);
-                        stats
-                            .system_spec_draft_tokens_accepted
-                            .fetch_add(timing.system_spec_draft_tokens_accepted, Relaxed);
-                        for (counter, value) in stats
-                            .system_spec_draft_tokens_proposed_per_pos
-                            .iter()
-                            .zip(timing.system_spec_draft_tokens_proposed_per_pos)
-                        {
-                            if value != 0 {
-                                counter.fetch_add(value, Relaxed);
+                            let stats_spawn = Arc::clone(&stats);
+                            let rt_handle_spawn = rt_handle.clone();
+                            let submit_tx_spawn = submit_tx.clone();
+                            let latency_tx_spawn = latency_tx.clone();
+                            rt_handle.spawn_blocking(move || {
+                                // Phase: driver_fire — block off-thread for the
+                                // GPU response. (The ipc_submit probe was set on
+                                // the scheduler thread during enqueue; under
+                                // `profile-driver-cuda` it reads 0 here — the
+                                // gpu_wait probe set in this task is accurate.)
+                                let fire_start = Instant::now();
+                                let fire_result = crate::probe_fire!(
+                                    stats_spawn.fire.execute.driver_fire_us,
+                                    {
+                                        let r = handle.wait();
+                                        let ipc_submit_us =
+                                            crate::probe::driver_cuda::take_ipc_submit_us();
+                                        let gpu_wait_us =
+                                            crate::probe::driver_cuda::take_gpu_wait_us();
+                                        let ipc_recv_us =
+                                            crate::probe::driver_cuda::take_ipc_recv_us();
+                                        if ipc_submit_us > 0 {
+                                            stats_spawn
+                                                .driver_cuda
+                                                .ipc_submit_us
+                                                .fetch_add(ipc_submit_us, Relaxed);
+                                        }
+                                        if gpu_wait_us > 0 {
+                                            stats_spawn
+                                                .driver_cuda
+                                                .gpu_wait_us
+                                                .fetch_add(gpu_wait_us, Relaxed);
+                                        }
+                                        if ipc_recv_us > 0 {
+                                            stats_spawn
+                                                .driver_cuda
+                                                .ipc_recv_us
+                                                .fetch_add(ipc_recv_us, Relaxed);
+                                        }
+                                        r
+                                    }
+                                );
+                                let forward_latency = fire_start.elapsed();
+                                let timing = Self::dispatch_fired_batch(
+                                    fire_result,
+                                    requests_to_fire,
+                                    driver_id,
+                                    page_size,
+                                    &rt_handle_spawn,
+                                    Some(submit_tx_spawn),
+                                    &stats_spawn,
+                                );
+                                Self::record_fire_stats(
+                                    &stats_spawn,
+                                    &timing,
+                                    forward_latency,
+                                    batch_size,
+                                    total_tokens,
+                                );
+                                let _ = latency_tx_spawn.send(FireCompletion {
+                                    forward_latency,
+                                    submission_latency,
+                                });
+                            });
+                        }
+                        Err(e) => {
+                            // Enqueue failed (channel closed/aborted) — fail the
+                            // batch's requests; nothing went in flight.
+                            let msg =
+                                format!("fire_batch_deferred failed for driver {driver_id}: {e:#}");
+                            for req in requests_to_fire {
+                                req.send_result::<ForwardOutput>(
+                                    Err(anyhow::anyhow!(msg.clone())),
+                                    None,
+                                    page_size,
+                                );
                             }
                         }
-                        for (counter, value) in stats
-                            .system_spec_draft_tokens_accepted_per_pos
-                            .iter()
-                            .zip(timing.system_spec_draft_tokens_accepted_per_pos)
-                        {
-                            if value != 0 {
-                                counter.fetch_add(value, Relaxed);
-                            }
-                        }
-                    });
+                    }
                 }
                 Decision::Wait(wait_duration) => {
                     crossbeam::channel::select! {
@@ -1370,6 +1463,10 @@ impl BatchScheduler {
                                     else {
                                         continue;
                                     };
+                                    if batch.would_depend_on_batch(&pending) {
+                                        next_pending = Some(pending);
+                                        continue;
+                                    }
                                     if batch.would_exceed(&pending) {
                                         if scheduler_trace_enabled() {
                                             let reason = batch
@@ -1392,9 +1489,10 @@ impl BatchScheduler {
                                 Err(_) => break 'run_loop, // channel closed
                             }
                         }
-                        recv(latency_rx) -> latency => {
-                            if let Ok(l) = latency {
-                                policy.on_complete(l);
+                        recv(latency_rx) -> completion => {
+                            if let Ok(c) = completion {
+                                policy.on_submitted(c.submission_latency);
+                                policy.on_complete(c.forward_latency);
                             }
                         }
                         default(wait_duration) => {}
@@ -1408,12 +1506,11 @@ impl BatchScheduler {
         // ~10 ms of additional shutdown latency in the worst case.
         if !batch.is_empty() {
             let requests = batch.take();
-            let _ = Self::execute_batch(
+            let _ = Self::execute_batch_blocking(
                 driver_idx,
                 requests,
                 driver_id,
                 page_size,
-                request_timeout,
                 &rt_handle,
                 None,
                 &stats,
@@ -1421,24 +1518,145 @@ impl BatchScheduler {
         }
     }
 
-    /// Execute a batch of forward pass requests via the driver service.
-    ///
-    /// Runs synchronously on the caller's thread. The scheduler invokes
-    /// this directly from its OS-thread `run` loop instead of spawning
-    /// a tokio task per fire — `driver::fire_batch_sync` parks on a
-    /// futex inside the channel, which is all the "async" the prior
-    /// `async fn` ever did (the async wrappers all bottomed out in
-    /// `block_in_place(submit_sync_for_state)`). The only off-thread
-    /// work this function still does is the `deferred_drop` punt, which
-    /// `rt_handle.spawn_blocking` routes to tokio's dedicated blocking
-    /// pool so response cleanup does not compete with the scheduler thread
-    /// for CPU.
-    fn execute_batch(
+    /// Build the batched `pie_driver_abi::ForwardRequest` by folding each
+    /// per-request shape into one batch. Runs on the scheduler thread (so it
+    /// overlaps the GPU of any in-flight batch); the caller then enqueues it in
+    /// fire-order via [`driver::fire_batch_deferred`].
+    fn build_batch_request(
+        requests: &[PendingRequest],
+        page_size: u32,
+        stats: &SchedulerStats,
+    ) -> pie_driver_abi::ForwardRequest {
+        // Build batched request — a single `pie_driver_abi::ForwardRequest`
+        // populated by folding each per-request shape into the batch.
+        let elide_decode_masks = requests.iter().all(|req| {
+            req.request.single_token_mode
+                && !req.request.has_user_mask
+                && req.request.token_ids.len() <= 1
+                && req.request.spec_token_ids.is_empty()
+        });
+        crate::probe_fire!(stats.fire.execute.batch_build_us, {
+            let mut batch_req =
+                request::new_batched_forward_request_with_capacity(requests.len());
+            for req in requests {
+                request::append_request_with_options(
+                    &mut batch_req,
+                    &req.request,
+                    &req.physical_page_ids,
+                    req.last_page_len,
+                    page_size,
+                    elide_decode_masks,
+                );
+            }
+            batch_req
+        })
+    }
+
+    /// Fold a completed batch's always-on counters + spec-domain accumulators
+    /// into the shared stats. `latency` is the off-thread forward (GPU) wait —
+    /// the dominant component of the batch's wall time under the overlapped
+    /// fire (the host build/enqueue overlaps the prior in-flight batch).
+    fn record_fire_stats(
+        stats: &SchedulerStats,
+        timing: &BatchExecutionTiming,
+        latency: Duration,
+        batch_size: u64,
+        total_tokens: usize,
+    ) {
+        crate::probe_fire!(stats.fire.post_dispatch.stats_update_us, {
+            stats.total_batches.fetch_add(1, Relaxed);
+            stats
+                .total_tokens_processed
+                .fetch_add(total_tokens as u64, Relaxed);
+            stats
+                .total_requests_processed
+                .fetch_add(batch_size, Relaxed);
+            stats
+                .max_forward_requests_observed
+                .fetch_max(batch_size, Relaxed);
+            let bucket = match batch_size {
+                0 | 1 => 0,
+                2..=3 => 1,
+                4..=7 => 2,
+                8..=15 => 3,
+                16..=31 => 4,
+                32..=63 => 5,
+                64..=127 => 6,
+                _ => 7,
+            };
+            stats.batch_size_hist[bucket].fetch_add(1, Relaxed);
+            stats
+                .last_batch_latency_us
+                .store(latency.as_micros() as u64, Relaxed);
+            stats
+                .cumulative_latency_us
+                .fetch_add(latency.as_micros() as u64, Relaxed);
+            stats
+                .system_spec_draft_tokens_proposed
+                .fetch_add(timing.system_spec_draft_tokens_proposed, Relaxed);
+            stats
+                .system_spec_draft_tokens_accepted
+                .fetch_add(timing.system_spec_draft_tokens_accepted, Relaxed);
+            for (counter, value) in stats
+                .system_spec_draft_tokens_proposed_per_pos
+                .iter()
+                .zip(timing.system_spec_draft_tokens_proposed_per_pos)
+            {
+                if value != 0 {
+                    counter.fetch_add(value, Relaxed);
+                }
+            }
+            for (counter, value) in stats
+                .system_spec_draft_tokens_accepted_per_pos
+                .iter()
+                .zip(timing.system_spec_draft_tokens_accepted_per_pos)
+            {
+                if value != 0 {
+                    counter.fetch_add(value, Relaxed);
+                }
+            }
+        });
+    }
+
+    /// Build + enqueue + await + dispatch a batch synchronously on the caller's
+    /// thread. Used for the shutdown drain (no overlap needed); the hot path
+    /// instead splits these phases across the scheduler thread and a spawned
+    /// task so the GPU wait overlaps the next batch's build.
+    fn execute_batch_blocking(
         driver_idx: usize,
         requests: Vec<PendingRequest>,
         driver_id: DriverId,
         page_size: u32,
-        _timeout: Duration,
+        rt_handle: &tokio::runtime::Handle,
+        submit_tx: Option<crossbeam::channel::Sender<PendingRequest>>,
+        stats: &SchedulerStats,
+    ) -> BatchExecutionTiming {
+        let batch_req = Self::build_batch_request(&requests, page_size, stats);
+        let fire_result = match driver::fire_batch_deferred(driver_idx, batch_req) {
+            Ok(handle) => handle.wait(),
+            Err(e) => Err(e),
+        };
+        Self::dispatch_fired_batch(
+            fire_result,
+            requests,
+            driver_id,
+            page_size,
+            rt_handle,
+            submit_tx,
+            stats,
+        )
+    }
+
+    /// Dispatch a fired batch's response to the per-request oneshots and
+    /// accumulate spec-decode draft counters. `fire_result` is the awaited
+    /// forward response (the GPU wait already happened off-thread). The
+    /// `deferred_drop` punt still routes request-husk dealloc to the blocking
+    /// pool so it does not compete with response dispatch.
+    fn dispatch_fired_batch(
+        fire_result: Result<pie_driver_abi::ForwardResponse>,
+        requests: Vec<PendingRequest>,
+        driver_id: DriverId,
+        page_size: u32,
         rt_handle: &tokio::runtime::Handle,
         submit_tx: Option<crossbeam::channel::Sender<PendingRequest>>,
         stats: &SchedulerStats,
@@ -1470,64 +1688,9 @@ impl BatchScheduler {
             }
         }
 
-        // Build batched request — a single `pie_driver_abi::ForwardRequest`
-        // populated by folding each per-request shape into the batch.
-        let elide_decode_masks = requests.iter().all(|req| {
-            req.request.single_token_mode
-                && !req.request.has_user_mask
-                && req.request.token_ids.len() <= 1
-                && req.request.spec_token_ids.is_empty()
-        });
-        let batch_req = crate::probe_fire!(stats.fire.execute.batch_build_us, {
-            let mut batch_req =
-                request::new_batched_forward_request_with_capacity(requests.len());
-            for req in &requests {
-                request::append_request_with_options(
-                    &mut batch_req,
-                    &req.request,
-                    &req.physical_page_ids,
-                    req.last_page_len,
-                    page_size,
-                    elide_decode_masks,
-                );
-            }
-            batch_req
-        });
-
-        // Send via driver service (typed call handles serialization + timeout).
-        // Sync call: parks on a futex inside the channel's response
-        // slot. This is the entire reason `execute_batch` used to be
-        // `async` — the prior `fire_batch().await` bottomed out in
-        // `block_in_place(submit_sync_for_state)` with no actual
-        // suspension points. Since the scheduler is the only firer,
-        // there's also no in-flight gate to release.
-        let result = crate::probe_fire!(stats.fire.execute.driver_fire_us, {
-            let r = driver::fire_batch_sync(driver_idx, batch_req);
-            // Drain the per-call IPC-phase timings recorded by the
-            // channel into driver_cuda atomics. With `profile-driver-cuda`
-            // off, the `take_*` calls return 0 and `fetch_add(0)` is a
-            // no-op — same compiled output as if these lines weren't here.
-            let ipc_submit_us = crate::probe::driver_cuda::take_ipc_submit_us();
-            let gpu_wait_us = crate::probe::driver_cuda::take_gpu_wait_us();
-            let ipc_recv_us = crate::probe::driver_cuda::take_ipc_recv_us();
-            if ipc_submit_us > 0 {
-                stats
-                    .driver_cuda
-                    .ipc_submit_us
-                    .fetch_add(ipc_submit_us, Relaxed);
-            }
-            if gpu_wait_us > 0 {
-                stats.driver_cuda.gpu_wait_us.fetch_add(gpu_wait_us, Relaxed);
-            }
-            if ipc_recv_us > 0 {
-                stats.driver_cuda.ipc_recv_us.fetch_add(ipc_recv_us, Relaxed);
-            }
-            r
-        });
-
         // Response dispatch: per-request oneshot fires and queueing the
-        // deferred_drop Vec. Probe scope ends at the
-        // close of the `match result { ... }` block below.
+        // deferred_drop Vec. The GPU wait already happened off-thread (the
+        // caller awaited `FireHandle::wait` before handing us `fire_result`).
         //
         // Per-completion-type counts are accumulated into these locals
         // inside the match arms and fetch_add'd once after the loop, so
@@ -1535,7 +1698,7 @@ impl BatchScheduler {
         let response_dispatch_start = Instant::now();
         let mut direct_count: u64 = 0;
         let mut chunk_count: u64 = 0;
-        match result {
+        match fire_result {
             Ok(batch_resp) => {
                 let wp = batch_resp.probe_wire_parse_us as u64;
                 let pl = batch_resp.probe_plan_us as u64;
@@ -1593,7 +1756,52 @@ impl BatchScheduler {
                         pie_driver_abi::ForwardRequest,
                         Vec<PhysicalPageId>,
                     )> = Vec::with_capacity(n_results);
-                    if token_payload_only {
+                    // #27 cut #1 eager-D2H fast-path (a2-mode): a request that set
+                    // up the `sampling_output_*` dst table had its sampled token
+                    // copied DIRECTLY to the pinned output Tensor (D2H), so the
+                    // driver response carries NO token (`tokens[]` empty). Resolve
+                    // each oneshot with success WITHOUT extracting `tokens[..]` —
+                    // the inferlet's `output()` reads the filled pinned buffer
+                    // (gated on `forward_result.is_some()`); an `Err`/drop here
+                    // would hit the abort path (txn drop + "no output tensor").
+                    // Keyed per-request on `sampling_output_*`, which
+                    // `populate_output_fastpath` sets iff it also stashed the
+                    // pinned outputs (1:1 with the host pinned-read gate, so no
+                    // skew). One-ahead MVP batches are all-or-nothing fast-path.
+                    let all_fast_path = !requests.is_empty()
+                        && requests
+                            .iter()
+                            .all(|req| !req.request.sampling_output_dst_ptrs.is_empty());
+                    if all_fast_path {
+                        for req in requests.into_iter() {
+                            // Empty `Tokens` is `Some` → the host gate passes and
+                            // reads the pinned buffer; the payload is ignored.
+                            let output = ForwardOutput::Tokens(Vec::new());
+                            let PendingRequest {
+                                request,
+                                completion,
+                                physical_page_ids,
+                                last_page_len: _,
+                            } = req;
+                            match completion {
+                                Completion::Direct(tx) => {
+                                    direct_count += 1;
+                                    tx.send(Ok(output)).ok();
+                                    deferred_drop.push((request, physical_page_ids));
+                                }
+                                Completion::Chunk { .. } => {
+                                    chunk_count += 1;
+                                    let req = PendingRequest {
+                                        request,
+                                        completion,
+                                        physical_page_ids,
+                                        last_page_len: 0,
+                                    };
+                                    req.send_result(Ok(output), submit_tx.as_ref(), page_size);
+                                }
+                            }
+                        }
+                    } else if token_payload_only {
                         for (r, req) in requests.into_iter().enumerate() {
                             let lo = batch_resp.tokens_indptr[r] as usize;
                             let hi = batch_resp.tokens_indptr[r + 1] as usize;

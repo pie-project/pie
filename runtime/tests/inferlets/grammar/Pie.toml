@@ -1,0 +1,4 @@
+[package]
+name = "grammar"
+version = "0.1.0"
+description = "Test inferlet: constrained/grammar decoding via a Sampling-IR program (WS3)"

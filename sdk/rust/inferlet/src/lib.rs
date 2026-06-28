@@ -56,9 +56,34 @@ pub mod working_set {
 // =============================================================================
 
 pub mod audio;
+pub mod emit;
 pub mod forward;
 pub mod http;
+pub mod mask;
+pub mod program;
 pub mod sample;
+
+/// Sampling-IR EDSL — re-export of the `sampling-edsl` crate so inferlets can
+/// author programmable samplers (`Graph`, helpers like `softmax` / `top_p_mask`
+/// / `mirostat_mask` / `grammar_mask`, typed `Value` handles) with a single
+/// `inferlet` dependency. Build a program, then (Stage 2, foxtrot's guest emit)
+/// lower it to a [`tensor::Program`](crate::tensor::Program) and attach it via
+/// [`Forward::sampler`](crate::forward::Forward::sampler).
+pub mod sampling {
+    pub use sampling_edsl::*;
+}
+
+/// Device tensor + tensor-program substrate (the WIT `tensor` interface).
+///
+/// Exposes the generated `tensor::{Tensor, Program, Op, OpKind, Value, Input,
+/// Dtype, Literal, Predicate, RngKind}` bindings — the **front door** the guest
+/// emit (`SamplingProgram` → `op-kind`) and program-authoring inferlets build
+/// against. A [`Program`](tensor::Program) is binding-free and reusable;
+/// attach it (with attach-time input bindings) via
+/// [`Forward::sampler`](crate::forward::Forward::sampler).
+pub mod tensor {
+    pub use crate::pie::core::tensor::*;
+}
 
 // =============================================================================
 // Generation state machine + decoders + speculation
@@ -91,8 +116,8 @@ pub mod adapter {
 /// around — call `model::encode`, `model::name`, etc. directly.
 pub mod model {
     pub use crate::pie::core::model::{
-        architecture, decode, default_system_speculation, encode, name, special_tokens,
-        split_regex, vocabs,
+        architecture, decode, default_system_speculation, encode, name, output_vocab_size,
+        special_tokens, split_regex, vocabs,
     };
 }
 
@@ -176,9 +201,11 @@ pub mod prelude {
     pub use crate::{Context, Result, Schema, Tool};
     pub use crate::{main, tool};
 
-    pub use crate::forward::{Forward, Output, ProbeHandle, SampleHandle};
+    pub use crate::forward::{Forward, Output, Probe, TokenRef};
     pub use crate::generation::{GenStep, Generator};
-    pub use crate::sample::{Probe, Sampler};
+    pub use crate::program::{LoweredProgramExt, ProgramHandle};
+    pub use crate::sample::Sampler;
     pub use crate::spec::Speculator;
+    pub use crate::tensor;
     pub use crate::{chat, reasoning, tools};
 }

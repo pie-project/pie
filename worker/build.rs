@@ -351,13 +351,15 @@ fn build_cuda() {
     // and produce no archive; the static lib is self-contained.
     println!("cargo:rustc-link-lib=static=pie_driver_cuda_lib");
 
-    // CUDA toolkit: dynamic-link cudart + cublas + cublasLt.
+    // CUDA toolkit: dynamic-link cudart + cublas + cublasLt + nvrtc.
     // The cuda driver's `src/ops/gemm.cpp` directly references
     // `cublasLt*` symbols (the native FP8 W8A16 path on sm_89+),
-    // so we must satisfy them at link time. Runtime contract: the
-    // host has CUDA toolkit installed; all three .so files ship
+    // and the Sampling-IR JIT (`src/sampling_ir/jit.cpp`) calls the
+    // NVRTC runtime-compilation API (`nvrtcCreateProgram`/`…CompileProgram`/
+    // `…GetPTX`, etc.), so we must satisfy them at link time. Runtime
+    // contract: the host has CUDA toolkit installed; all `.so` files ship
     // together with the toolkit.
-    link_cuda_toolkit_dynamic(&["cudart", "cublas", "cublasLt"]);
+    link_cuda_toolkit_dynamic(&["cudart", "cublas", "cublasLt", "nvrtc"]);
     link_cuda_driver_stub();
 
     // NCCL: dynamic-linked. Two install shapes in the wild:

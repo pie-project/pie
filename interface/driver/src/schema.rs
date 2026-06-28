@@ -350,6 +350,75 @@ pub struct ForwardRequest {
     // fold-from-buffered-slabs kernel consumes them.)
     pub rs_buffer_slot_ids: Vec<u32>,
     pub rs_buffer_slot_indptr: Vec<u32>,
+
+    // ── Device-resident next-input free signal (#6 WS8 P2) ──────────
+    // Appended per the schema evolution rule (append-only). Producer link ids
+    // (`pipeline_source_link`) whose LAST consumer drains on THIS pass: after
+    // the pass's stream sync the executor frees each link's retained
+    // `pi.sampled` copy + its sample-done event (the consumer inject that read
+    // it has completed, so the free is hazard-free). Host-emitted once a link's
+    // consumer refcount reaches 0; the driver is count-agnostic and frees
+    // strictly on this signal. Empty when no retained source is released here.
+    pub next_input_free_links: Vec<u32>,
+
+    // ── Programmable-sampling output fast-path (#27 cut #1) ──────────
+    // Appended per the schema evolution rule (append-only). Per-output
+    // eager-D2H destination: the driver copies each declared program output
+    // VALUE directly into a host pinned buffer at the submit-provided pointer
+    // (skipping the `ForwardResponse` SoA channels + the host re-marshal in
+    // `build_output_tensors`). The host `pie_pinned_alloc`s one buffer per
+    // fast-path output (sizes are submit-time-known: Token/Scalar = 4 B,
+    // Logits = vocab·4, Logprobs = k·4), threads the raw host pointer here, and
+    // wraps the same buffer as the WIT `tensor` zero-copy in `output()`.
+    //
+    // IN-PROC ONLY: the pointer is a raw host address valid in the (in-proc)
+    // driver's address space; an out-of-process driver MUST fall to the legacy
+    // path. EMPTY ⇒ legacy `ForwardResponse` channels (opt-in per pass) — so
+    // this is fully back-compatible and the marshal stays the fallback for the
+    // output kinds not yet on the fast-path (Distribution/Embedding).
+    //
+    // SoA + CSR, mirroring the `sampling_input_*` index tables: the dst arrays
+    // are flattened across programs in declared output order (the program's
+    // `Op` output-slot order — the same order `build_output_tensors` walks),
+    // partitioned per-program by `sampling_output_indptr`. The driver, walking
+    // program `p`'s declared outputs, copies output `j` into
+    // `dst_ptrs[indptr[p] + j]` for `dst_lens[indptr[p] + j]` bytes on the copy
+    // stream, behind the case-(b) WAR guard. (MVP M=1: one value per output
+    // slot; batched M>1 rides a per-row stride — a follow-up.)
+    /// Host pinned-buffer destination pointer per output value (raw host
+    /// address, u64). Parallel to `sampling_output_dst_lens`.
+    pub sampling_output_dst_ptrs: Vec<u64>,
+    /// Byte capacity at each destination (the driver bounds-checks the D2H copy
+    /// against this). Parallel to `sampling_output_dst_ptrs`.
+    pub sampling_output_dst_lens: Vec<u32>,
+    /// Per-program CSR into the dst arrays (one extra leading 0, cumulative —
+    /// like `sampling_input_indptr`): `sampling_output_indptr[p..p+1]` is
+    /// program `p`'s output values. Empty ⇒ no fast-path outputs (legacy path).
+    pub sampling_output_indptr: Vec<u32>,
+
+    // ── Programmable-sampling late-input device-alias channel (#27 cut #2) ───
+    // Appended per the schema evolution rule (append-only). The input-side mirror
+    // of `sampling_output_*`: for a program input declared `host{key, late-bound}`
+    // (e.g. a grammar mask), the host pre-uploads the value DIRECTLY to a device
+    // buffer (`pie_device_alloc` + `pie_tensor_write_async`, direct-FFI from the
+    // guest's WASM-memory slice — no IPC staging, the input mirror of cut #1's
+    // output D2H) and passes the resulting DEVICE pointer here instead of staging
+    // host bytes via `sampling_late_blob`. The driver's `HostLate` resolution
+    // reads `sampling_late_device_ptrs[late_key]` → the device-resident value,
+    // gated on the R12 self-arm flag (`sampling_late_device_flags[late_key]`,
+    // set stream-ordered after the H2D). `0` ⇒ no device-alias for that late key
+    // (fall back to the staged `sampling_late_blob` path). Parallel to
+    // `sampling_late_keys` (one entry per late key, concatenated across programs).
+    // Security: the guest never sees a device pointer — it hands the host a slice,
+    // the host does the memcpy.
+    /// Per-late-key device-resident value pointer (raw device address, u64; `0` =
+    /// no device-alias, use the staged blob). Parallel to `sampling_late_keys`.
+    pub sampling_late_device_ptrs: Vec<u64>,
+    /// Per-late-key R12 self-arm flag pointer (raw device address of the
+    /// `pie_device_alloc`-co-allocated `u32` flag, set after the H2D; `0` = none).
+    /// The driver waits this flag before the consuming kernel reads the value, so
+    /// a not-yet-arrived value is a loud miss, never a stale-buffer silent read.
+    pub sampling_late_device_flags: Vec<u64>,
 }
 
 /// Per-slot sampler kind discriminants. Carried on the wire as the `u8`
@@ -455,6 +524,12 @@ pub enum SamplingBinding {
     /// The LM-head logits intrinsic (sampling positions resolved host-side into
     /// `sampling_indices`).
     Logits,
+    /// The speculator's **draft** logits intrinsic (de-hardwired speculation):
+    /// source-selects the draft rows of `ws.logits` (M=1 ⇒ row 0) rather than a
+    /// separate buffer. A distinct manifest kind (not a flag on `Logits`) so a
+    /// stale reader loud-rejects rather than misparsing — mirrors
+    /// [`Binding::MtpLogits`](pie_sampling_ir::Binding). Payload-less (key `0`).
+    MtpLogits,
     /// A submit-bound tensor value keyed into the submit-input table.
     Tensor { key: u32 },
 }
@@ -464,19 +539,23 @@ impl SamplingBinding {
     pub const KIND_LOGITS: u8 = 0;
     /// Wire discriminant for a `Tensor` slot.
     pub const KIND_TENSOR: u8 = 1;
+    /// Wire discriminant for a `MtpLogits` (draft-logits intrinsic) slot.
+    pub const KIND_MTP_LOGITS: u8 = 2;
 
     /// The `sampling_binding_kind` discriminant for this binding.
     pub fn kind(self) -> u8 {
         match self {
             SamplingBinding::Logits => Self::KIND_LOGITS,
+            SamplingBinding::MtpLogits => Self::KIND_MTP_LOGITS,
             SamplingBinding::Tensor { .. } => Self::KIND_TENSOR,
         }
     }
 
-    /// The `sampling_binding_key` value (the TensorKey, or `0` for `Logits`).
+    /// The `sampling_binding_key` value (the TensorKey, or `0` for the
+    /// payload-less `Logits`/`MtpLogits` intrinsics).
     pub fn key(self) -> u32 {
         match self {
-            SamplingBinding::Logits => 0,
+            SamplingBinding::Logits | SamplingBinding::MtpLogits => 0,
             SamplingBinding::Tensor { key } => key,
         }
     }
@@ -485,6 +564,7 @@ impl SamplingBinding {
     pub fn from_parts(kind: u8, key: u32) -> SamplingBinding {
         match kind {
             Self::KIND_TENSOR => SamplingBinding::Tensor { key },
+            Self::KIND_MTP_LOGITS => SamplingBinding::MtpLogits,
             _ => SamplingBinding::Logits,
         }
     }
@@ -764,6 +844,15 @@ impl ForwardRequest {
         self.next_input_producer_links.len()
     }
 
+    /// Signal that producer link `link`'s LAST consumer drains on this pass: the
+    /// executor frees its retained `pi.sampled` copy + sample-done event after
+    /// the pass's stream sync. The host emits this once the link's consumer
+    /// refcount reaches 0 (the driver is count-agnostic — it frees on signal).
+    #[inline]
+    pub fn push_next_input_free_link(&mut self, link: u32) {
+        self.next_input_free_links.push(link);
+    }
+
     /// Reconstruct the [`SamplingProgramSubmission`] at program index `p` from
     /// the SoA carrier — the inverse of [`push_sampling_program`]. Returns
     /// `None` if `p` is out of range.
@@ -877,6 +966,13 @@ impl ForwardRequest {
         for &off in req.sampling_late_indptr.iter().skip(1) {
             self.sampling_late_indptr.push(late_base + off);
         }
+        // #27 cut #2 device-alias channel: parallel to `sampling_late_keys` (one
+        // device ptr + R12 flag per late key) → concat verbatim, exactly like
+        // `sampling_late_lens`. Empty (legacy staged path) stays empty.
+        self.sampling_late_device_ptrs
+            .extend_from_slice(&req.sampling_late_device_ptrs);
+        self.sampling_late_device_flags
+            .extend_from_slice(&req.sampling_late_device_flags);
 
         // Per-slot binding-map: concat the (kind, key) slots and rebase the
         // per-program CSR by the slot base.
@@ -887,6 +983,20 @@ impl ForwardRequest {
             .extend_from_slice(&req.sampling_binding_key);
         for &off in req.sampling_binding_indptr.iter().skip(1) {
             self.sampling_binding_indptr.push(binding_base + off);
+        }
+
+        // Output fast-path dst table (#27 cut #1): concat the per-output-value
+        // pinned dst pointers + byte capacities, rebasing the per-program CSR by
+        // the table base — exactly parallel to the `sampling_input_*` merge.
+        // Without this the batch-merge would silently drop the host-populated
+        // `sampling_output_*` → the driver's view sees an empty fast-path carrier.
+        let output_base = self.sampling_output_dst_ptrs.len() as u32;
+        self.sampling_output_dst_ptrs
+            .extend_from_slice(&req.sampling_output_dst_ptrs);
+        self.sampling_output_dst_lens
+            .extend_from_slice(&req.sampling_output_dst_lens);
+        for &off in req.sampling_output_indptr.iter().skip(1) {
+            self.sampling_output_indptr.push(output_base + off);
         }
     }
 }

@@ -13,7 +13,10 @@ use std::sync::Arc;
 use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
 use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio::task;
-use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
+use tokio_tungstenite::{
+    connect_async,
+    tungstenite::{client::IntoClientRequest, http::HeaderValue, protocol::Message},
+};
 use uuid::Uuid;
 
 type CorrId = u32;
@@ -136,11 +139,50 @@ impl Process {
             Err(mpsc::error::TryRecvError::Disconnected) => Err(anyhow!("Event channel closed")),
         }
     }
+
+    /// Drain process events until the process returns, returning its `Return`
+    /// value (the inferlet's `Ok(String)`). `Stdout` / `Stderr` are forwarded
+    /// to the host process's stderr for live debugging; `Message` / `File`
+    /// events are ignored. Returns `Err` on a process `Error`, or if the event
+    /// channel closes before a return.
+    ///
+    /// Convenience for the common "launch and wait for the result" flow (e.g.
+    /// test harnesses that assert on a structured-JSON return value).
+    pub async fn wait_for_return(&mut self) -> Result<String> {
+        loop {
+            match self.recv().await? {
+                ProcessEvent::Return(value) => return Ok(value),
+                ProcessEvent::Error(e) => return Err(anyhow!("inferlet returned an error: {e}")),
+                ProcessEvent::Stdout(s) | ProcessEvent::Stderr(s) => eprint!("{s}"),
+                ProcessEvent::Message(_) | ProcessEvent::File(_) => {}
+            }
+        }
+    }
 }
 
 impl Client {
     pub async fn connect(ws_host: &str) -> Result<Client> {
-        let (ws_stream, _) = connect_async(ws_host).await?;
+        Self::connect_inner(connect_async(ws_host).await?.0)
+    }
+
+    /// Connect, injecting the `x-pie-identity` trust-edge header the gateway's
+    /// `/v1/ws` upgrade requires (a missing/empty header is rejected with 401
+    /// before the socket opens — see `gateway/src/ingress/identity.rs`).
+    /// Production deployments terminate identity at the edge proxy; in-process
+    /// / standalone harnesses must supply it on the client request directly.
+    pub async fn connect_with_identity(ws_host: &str, identity: &str) -> Result<Client> {
+        let mut request = ws_host.into_client_request()?;
+        request
+            .headers_mut()
+            .insert("x-pie-identity", HeaderValue::from_str(identity)?);
+        Self::connect_inner(connect_async(request).await?.0)
+    }
+
+    fn connect_inner(
+        ws_stream: tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+    ) -> Result<Client> {
         let (mut ws_write, mut ws_read) = ws_stream.split();
         let (ws_writer_tx, mut ws_writer_rx) = unbounded_channel();
 
@@ -238,8 +280,16 @@ impl Client {
             anyhow::bail!("Username '{}' rejected by engine: {}", username, result)
         }
 
-        // If the engine has disabled public key authentication, we can return early.
-        if result == "Authenticated (Engine disabled authentication)" {
+        // Early-return on a no-challenge success. The engine answers a
+        // challenge-less `AuthIdentify` in two cases the client treats as
+        // already-good: legacy key-auth disabled, or the trust-edge gateway
+        // path where the session is pre-authenticated from the verified
+        // `x-pie-identity` header (the worker session starts authenticated, so
+        // an `AuthIdentify` comes back as "Already authenticated"). Neither
+        // carries a base64 challenge, so there is nothing to sign.
+        if result == "Authenticated (Engine disabled authentication)"
+            || result == "Already authenticated"
+        {
             return Ok(());
         }
 

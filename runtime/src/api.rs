@@ -2,10 +2,14 @@ pub mod adapter;
 pub mod audio_out;
 pub mod http;
 pub mod inference;
+pub mod next_input_map;
 pub mod media;
 pub mod messaging;
 pub mod model;
 pub mod kv_working_set;
+pub mod program_cache;
+pub mod tensor_io;
+pub mod program_decode;
 pub mod runtime;
 pub mod rs_working_set;
 pub mod session;
@@ -33,6 +37,12 @@ wasmtime::component::bindgen!({
         "wasi:random/random": wasmtime_wasi::p2::bindings::random::random,
         "wasi:random/insecure": wasmtime_wasi::p2::bindings::random::insecure,
         "wasi:random/insecure-seed": wasmtime_wasi::p2::bindings::random::insecure_seed,
+        // pie:core/tensor (de-hardwiring: the `program` resource + submit-bound
+        // `tensor` inputs that `sampler(program, inputs)` reads). P3 makes model
+        // global funcs and replaces context with working-sets, so neither maps a
+        // resource here — only tensor/program stay as resources.
+        "pie:core/tensor.tensor": inference::Tensor,
+        "pie:core/tensor.program": inference::Program,
         // pie:core/working-set (kv); rs-working-set below
         "pie:core/working-set.kv-working-set": crate::working_set::kv::KvWorkingSet,
         // pie:core/inference
@@ -75,6 +85,9 @@ pub fn add_to_linker(
     pie::core::working_set::add_to_linker::<InstanceState, D>(linker, |s| s)?;
     pie::core::http::add_to_linker::<InstanceState, D>(linker, |s| s)?;
     pie::core::model::add_to_linker::<InstanceState, D>(linker, |s| s)?;
+    // pie:core/tensor (de-hardwiring: tensor + program resources read by
+    // `sampler(program, inputs)`).
+    pie::core::tensor::add_to_linker::<InstanceState, D>(linker, |s| s)?;
     pie::core::inference::add_to_linker::<InstanceState, D>(linker, |s| s)?;
     pie::core::messaging::add_to_linker::<InstanceState, D>(linker, |s| s)?;
     pie::core::session::add_to_linker::<InstanceState, D>(linker, |s| s)?;

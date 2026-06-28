@@ -19,6 +19,7 @@
 //! re-submits a forward-pass request after every token. The scheduler
 //! accumulates these into a batch and the policy decides when to fire.
 
+use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
 use super::scheduler::{Decision, SchedulingPolicy};
@@ -242,6 +243,237 @@ impl SchedulingPolicy for GreedyPolicy {
         // `max_forward_requests` upstream of the policy. So: just fire,
         // every time.
         Decision::Fire
+    }
+}
+
+// =============================================================================
+// RunAheadPolicy — #6 run-ahead just-in-time firing.
+// =============================================================================
+//
+// The run-ahead scheduler keeps the GPU pipe full by firing the next decode
+// batch *before* the in-flight batch finishes, so the enqueue lands just as the
+// GPU goes idle. The single firing rule (Oracle §4):
+//
+//   fire_at = max(in_flight_completion - lead_time, collection_complete)
+//
+//   * `in_flight_completion` — when the in-flight batch is estimated to finish
+//     on the GPU: `fire_time + EWMA(forward latency)`. `None` when nothing is in
+//     flight, so the term drops out and we fire once collected.
+//   * `lead_time` — `EWMA(submission/enqueue latency)`: how far ahead to fire so
+//     the next batch is enqueued just-in-time (fed via `on_submitted`).
+//   * `collection_complete` — when the CPU has the next batch ready. MVP: a
+//     non-empty batch is "collected" (dense rebatch is the loop's barrier job),
+//     so this is `now` whenever `decide` runs on a non-empty batch.
+//
+// GPU-bound -> the in-flight term dominates (fire one lead-time early);
+// CPU-bound -> the collection term dominates (fire as soon as ready; the GPU
+// takes a bubble, correct for that workload). MVP = one-step run-ahead (R10);
+// the run loop caps the in-flight depth.
+//
+// Degrades cleanly under the current synchronous fire path: with no batch in
+// flight at `decide` time, `in_flight_completion` is `None` -> fire-when-
+// collected (greedy). The timing rule only bites once the fire path is
+// non-blocking (the scheduler-pipelining rewire).
+
+/// EWMA smoothing factor (recent-weighted; the TCP-RTT-style 1/4).
+const RUN_AHEAD_EWMA_ALPHA: f64 = 0.25;
+
+/// One-step run-ahead (R10): at most one batch computing + one prefetched.
+const MAX_IN_FLIGHT: usize = 2;
+
+/// Floor (µs) for the cap-wait poll so an overdue estimate doesn't spin; the
+/// completion channel preempts the wait the instant a batch actually finishes.
+const MIN_POLL_US: u64 = 50;
+
+#[allow(dead_code)] // wired into `run()` when the fire path goes non-blocking.
+pub(super) struct RunAheadPolicy {
+    /// Structural cap — a full batch always fires immediately.
+    max_forward_requests: usize,
+    /// EWMA of forward (GPU) latency, in seconds. Estimates in-flight completion.
+    forward_latency: f64,
+    /// EWMA of submission (enqueue) latency, in seconds = the lead time.
+    lead_time: f64,
+    /// Estimated GPU-completion instants of in-flight batches, fire-order FIFO
+    /// (front = earliest to complete; drives `fire_at`). Bounded by
+    /// `MAX_IN_FLIGHT` (one-step run-ahead, R10).
+    in_flight: VecDeque<Instant>,
+    /// Forwards observed completing — the first latency is unrepresentative
+    /// (cold start) and is skipped from the EWMA.
+    forwards_completed: usize,
+}
+
+#[allow(dead_code)]
+impl RunAheadPolicy {
+    pub fn new(max_forward_requests: usize) -> Self {
+        Self {
+            max_forward_requests,
+            forward_latency: 0.0,
+            lead_time: 0.0,
+            in_flight: VecDeque::new(),
+            forwards_completed: 0,
+        }
+    }
+
+    /// Recent-weighted EWMA; the first non-zero sample seeds the average.
+    fn ewma(prev: f64, sample: f64) -> f64 {
+        if prev == 0.0 {
+            sample
+        } else {
+            RUN_AHEAD_EWMA_ALPHA * sample + (1.0 - RUN_AHEAD_EWMA_ALPHA) * prev
+        }
+    }
+}
+
+impl SchedulingPolicy for RunAheadPolicy {
+    fn on_arrival(&mut self) {}
+
+    fn on_complete(&mut self, latency: Duration) {
+        self.forwards_completed += 1;
+        // The first fire's latency carries cold-start costs; skip it.
+        if self.forwards_completed > 1 {
+            self.forward_latency = Self::ewma(self.forward_latency, latency.as_secs_f64());
+        }
+        // The earliest in-flight batch finished (the GPU serializes, so
+        // completions arrive in fire-order); drop it from the FIFO front.
+        self.in_flight.pop_front();
+    }
+
+    fn on_submitted(&mut self, submission_latency: Duration) {
+        self.lead_time = Self::ewma(self.lead_time, submission_latency.as_secs_f64());
+    }
+
+    fn on_fired(&mut self, _fired_size: usize) {
+        // A batch went in flight. It queues behind any in-flight batches (the GPU
+        // serializes), so it completes ~forward_latency after the latest current
+        // estimate (or now if none). Cold (no latency sample) -> ~now, so the
+        // next batch fires promptly while we gather timing.
+        let base = self
+            .in_flight
+            .back()
+            .copied()
+            .unwrap_or_else(Instant::now)
+            .max(Instant::now());
+        let est = if self.forward_latency > 0.0 {
+            base + Duration::from_secs_f64(self.forward_latency)
+        } else {
+            base
+        };
+        self.in_flight.push_back(est);
+    }
+
+    fn decide(&mut self, current_forward_requests: usize) -> Decision {
+        // One-step run-ahead cap (R10): at most `MAX_IN_FLIGHT` batches in flight
+        // (one computing + one prefetched). At the cap the GPU pipe is full —
+        // wait for the earliest to complete before firing more. The run loop also
+        // wakes on the actual completion (the completion channel), so the estimate
+        // is just a fallback poll bound.
+        if self.in_flight.len() >= MAX_IN_FLIGHT {
+            let now = Instant::now();
+            let wait = self
+                .in_flight
+                .front()
+                .map(|&f| f.saturating_duration_since(now))
+                .unwrap_or_default();
+            return Decision::Wait(wait.max(Duration::from_micros(MIN_POLL_US)));
+        }
+        // A full batch fires immediately (capacity permitting, checked above).
+        if current_forward_requests >= self.max_forward_requests {
+            return Decision::Fire;
+        }
+        // `collection_complete == now` for a non-empty batch (MVP), so
+        //   fire_at = max(earliest_in_flight_completion - lead_time, now).
+        let Some(&completion) = self.in_flight.front() else {
+            // Nothing in flight (or cold) -> the in-flight term is absent;
+            // collection dominates -> fire now.
+            return Decision::Fire;
+        };
+        let now = Instant::now();
+        let lead = Duration::from_secs_f64(self.lead_time);
+        // `lead >= remaining` (or underflow) -> fire now; else wait until one
+        // lead-time before the earliest in-flight batch completes.
+        let fire_at = completion.checked_sub(lead).unwrap_or(now);
+        if now >= fire_at {
+            Decision::Fire
+        } else {
+            Decision::Wait(fire_at - now)
+        }
+    }
+}
+
+#[cfg(test)]
+mod run_ahead_tests {
+    use super::*;
+
+    #[test]
+    fn run_ahead_cold_start_fires() {
+        // No completion observed yet -> no in-flight estimate -> fire to make
+        // progress (degrades to greedy under the synchronous fire path).
+        let mut policy = RunAheadPolicy::new(512);
+        policy.on_fired(1); // cold: forward_latency==0 -> in_flight_completion None
+        assert!(matches!(policy.decide(1), Decision::Fire));
+    }
+
+    #[test]
+    fn run_ahead_fires_at_structural_cap() {
+        let mut policy = RunAheadPolicy::new(512);
+        policy.on_complete(Duration::from_millis(500)); // skipped (cold)
+        policy.on_complete(Duration::from_millis(50));
+        policy.on_fired(64);
+        // Full batch fires unconditionally, ignoring the timing rule.
+        assert!(matches!(policy.decide(512), Decision::Fire));
+    }
+
+    #[test]
+    fn run_ahead_waits_when_in_flight_far() {
+        // Large forward latency + small lead -> fire_at is ~1s out -> Wait.
+        let mut policy = RunAheadPolicy::new(512);
+        policy.on_complete(Duration::from_millis(10)); // skipped
+        policy.on_complete(Duration::from_secs(1)); // forward_latency = 1s
+        policy.on_submitted(Duration::from_millis(5)); // lead_time = 5ms
+        policy.on_fired(1); // in_flight_completion ~= now + 1s
+        match policy.decide(1) {
+            Decision::Wait(d) => assert!(d > Duration::from_millis(800)),
+            Decision::Fire => panic!("expected Wait while the in-flight batch is ~1s out"),
+        }
+    }
+
+    #[test]
+    fn run_ahead_fires_when_lead_exceeds_remaining() {
+        // Lead time >= the in-flight batch's remaining time -> fire now to keep
+        // the pipe full (enqueue takes longer than what's left).
+        let mut policy = RunAheadPolicy::new(512);
+        policy.on_complete(Duration::from_millis(10)); // skipped
+        policy.on_complete(Duration::from_millis(10)); // forward_latency = 10ms
+        policy.on_submitted(Duration::from_secs(1)); // lead_time = 1s (>> 10ms)
+        policy.on_fired(1); // in_flight_completion ~= now + 10ms
+        assert!(matches!(policy.decide(1), Decision::Fire));
+    }
+
+    #[test]
+    fn run_ahead_fires_when_nothing_in_flight() {
+        // After a completion clears the in-flight term, the next decide fires
+        // immediately (collection dominates) — the synchronous-path behaviour.
+        let mut policy = RunAheadPolicy::new(512);
+        policy.on_complete(Duration::from_millis(10)); // skipped
+        policy.on_complete(Duration::from_secs(1)); // forward_latency = 1s
+        policy.on_fired(1); // in flight
+        policy.on_complete(Duration::from_secs(1)); // completes -> clears in_flight
+        assert!(matches!(policy.decide(1), Decision::Fire));
+    }
+
+    #[test]
+    fn run_ahead_caps_at_one_step() {
+        // Two batches in flight = the one-step cap (R10): the GPU pipe is full,
+        // so even a structurally-full batch waits until the earliest completes.
+        let mut policy = RunAheadPolicy::new(512);
+        policy.on_complete(Duration::from_millis(10)); // skipped
+        policy.on_complete(Duration::from_secs(1)); // forward_latency = 1s
+        policy.on_fired(1); // in_flight = [~now+1s]
+        policy.on_fired(1); // in_flight = [~now+1s, ~now+2s] -> at cap
+        assert!(matches!(policy.decide(512), Decision::Wait(_)));
+        policy.on_complete(Duration::from_secs(1)); // earliest completes -> pops front
+        // Capacity freed -> a full batch fires.
+        assert!(matches!(policy.decide(512), Decision::Fire));
     }
 }
 

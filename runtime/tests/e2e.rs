@@ -74,6 +74,35 @@ fn spawn_and_wait(s: &TestState, name: &str, input: String) -> bool {
     })
 }
 
+/// Spawn a process and capture its actual return value (the inferlet's
+/// `Result<String, String>`), so a test can assert the inferlet ran to a
+/// meaningful result rather than merely exiting. `Err` if the process did not
+/// terminate within the timeout (e.g. a hang on an unresolved host RPC).
+fn spawn_and_capture(s: &TestState, name: &str, input: String) -> Result<String, String> {
+    let rx = s.rt.block_on(async {
+        inferlets::add_and_install(name).await;
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        process::spawn(
+            "test-user".into(),
+            program_name(name),
+            input,
+            None,
+            false,
+            Some(tx),
+        )
+        .expect("spawn");
+        rx
+    });
+
+    s.rt.block_on(async {
+        match tokio::time::timeout(PROCESS_TIMEOUT, rx).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(_)) => Err("process result channel dropped before completion".to_string()),
+            Err(_) => Err("process did not complete within timeout (hang)".to_string()),
+        }
+    })
+}
+
 // =============================================================================
 // Basic E2E Tests
 // =============================================================================
@@ -107,14 +136,19 @@ fn context_inferlet_exercises_host_apis() {
 
 // The forward-pass / generate pipeline runs e2e on the mock driver: append →
 // flush → generate (step loop) over the SDK facade → kv-working-set → forward
-// descriptors → mock `EchoBehavior`. (Previously ignored under spec-exec when the
-// mock response didn't match the old Generator; the Phase-6 facade fixed it.)
+// descriptors → mock `EchoBehavior(42)` (every step returns token 42, so 5
+// steps yield five 42s). We assert the exact returned string so the test cannot
+// silently pass on an early exit/error. (Previously ignored under spec-exec when
+// the mock response didn't match the old Generator; the Phase-6 facade fixed it.)
 #[test]
 fn generate_inferlet_exercises_forward_pass() {
     let s = state();
-    assert!(
-        spawn_and_wait(s, "generate", "{}".into()),
-        "generate inferlet should complete (exercises flush + generate pipeline)"
+    let result = spawn_and_capture(s, "generate", "{}".into());
+    assert_eq!(
+        result.as_deref(),
+        Ok("generated 5 tokens: [42, 42, 42, 42, 42]"),
+        "generate inferlet should run the forward-pass loop end-to-end and \
+         return the mock's five echoed tokens (got {result:?})"
     );
 }
 

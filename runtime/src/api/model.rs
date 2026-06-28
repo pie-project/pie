@@ -27,6 +27,13 @@ impl pie::core::model::Host for InstanceState {
         Ok(m.system_speculation_supported() && m.enable_system_speculation())
     }
 
+    /// LM-head output dimension = `hf_config.vocab_size` (e.g. 151936 for
+    /// qwen3), NOT the tokenizer vocab — the vocab the recognizer / program
+    /// lowering targets. Sourced from the model config, not hardcoded.
+    async fn output_vocab_size(&mut self) -> Result<u32> {
+        Ok(model::model().vocab_size())
+    }
+
     // ── Working-set / arena capabilities (global over the bound model) ──────
     //
     // Real values come from the driver handshake `DriverCapabilities`

@@ -17,6 +17,17 @@ use tokenizer::Tokenizer;
 /// The single model this engine serves. Set once at bootstrap.
 static MODEL: OnceLock<Arc<Model>> = OnceLock::new();
 
+/// Read `vocab_size` (the logits/output dim) from the model snapshot's
+/// `config.json`, located beside the tokenizer. `None` if absent (e.g. mock
+/// fixtures) — callers fall back to the tokenizer vocab. Mirrors the driver's
+/// `config.json` discovery so host + driver agree on the logits dim.
+fn read_snapshot_vocab_size(tokenizer_path: &std::path::Path) -> Option<u32> {
+    let cfg = tokenizer_path.parent()?.join("config.json");
+    let text = std::fs::read_to_string(cfg).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&text).ok()?;
+    v.get("vocab_size")?.as_u64().map(|n| n as u32)
+}
+
 pub fn register(
     name: String,
     arch_name: &str,
@@ -29,6 +40,14 @@ pub fn register(
     let tokenizer = Arc::new(Tokenizer::from_file(&tokenizer_path)?);
     let instruct = instruct::create(arch_name, tokenizer.clone());
 
+    // Logits dim = the model's hf_config.vocab_size (read from the snapshot's
+    // config.json beside the tokenizer). Falls back to the tokenizer vocab for
+    // mock/fixture setups without a config.json. This is the dim the sampler
+    // operates on + the driver's recognizer table is keyed by — NOT the
+    // tokenizer token count, which may be smaller (qwen3: 151669 vs 151936).
+    let vocab_size = read_snapshot_vocab_size(&tokenizer_path)
+        .unwrap_or_else(|| tokenizer.vocab_size() as u32);
+
     let model = Arc::new(Model {
         name,
         arch_name: arch_name.to_string(),
@@ -36,6 +55,7 @@ pub fn register(
         kv_page_size,
         rs_caps: rs,
         tokenizer,
+        vocab_size,
         system_speculation_supported,
         enable_system_speculation,
     });
@@ -69,6 +89,10 @@ pub struct Model {
     /// 0/0/1 for pure-attention models.
     rs_caps: RsCaps,
     tokenizer: Arc<Tokenizer>,
+    /// Logits/output vocab dimension (= hf_config.vocab_size from the model's
+    /// config.json). May EXCEED tokenizer.vocab_size() due to padding — use
+    /// THIS for sampler lowering / logits-shaped ops, NOT the tokenizer vocab.
+    vocab_size: u32,
     system_speculation_supported: bool,
     enable_system_speculation: bool,
 }
@@ -112,6 +136,14 @@ impl Model {
     /// Gets the tokenizer.
     pub fn tokenizer(&self) -> &Arc<Tokenizer> {
         &self.tokenizer
+    }
+
+    /// Logits/output vocab dimension (= hf_config.vocab_size). The dim the
+    /// sampler operates on and the driver's recognizer table is keyed by. May
+    /// EXCEED the tokenizer's vocab (qwen3: 151936 logits vs 151669 tokens) —
+    /// use this for sampler lowering / logits-shaped ops, NOT tokenizer vocab.
+    pub fn vocab_size(&self) -> u32 {
+        self.vocab_size
     }
 
     /// Tokenizes text into token IDs.

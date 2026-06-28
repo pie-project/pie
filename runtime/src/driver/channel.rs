@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use anyhow::{Result, anyhow};
 use dashmap::DashMap;
 
-use super::{DriverChannel, DriverId, DriverRequest, DriverSpec, ShmemChannel};
+use super::{DeferredResponse, DriverChannel, DriverId, DriverRequest, DriverSpec, ShmemChannel};
 use pie_driver_abi::{ForwardResponse, RequestPayload, ResponsePayload};
 
 fn shmem_name(driver_idx: usize) -> String {
@@ -132,6 +132,48 @@ pub fn fire_batch_sync(
             s.status,
         )),
     }
+}
+
+/// A submitted-but-not-yet-awaited forward batch. The request is already
+/// enqueued (its submission order fixed at [`fire_batch_deferred`] call time);
+/// [`FireHandle::wait`] blocks for the driver response. The run-ahead
+/// scheduler enqueues fires in fire-order on its own thread, then awaits each
+/// off-thread so the GPU wait overlaps building the next batch.
+pub struct FireHandle {
+    deferred: DeferredResponse,
+}
+
+impl FireHandle {
+    /// Block for the forward response. Call this off the scheduler thread so
+    /// the GPU wait overlaps building + enqueuing the next batch.
+    pub fn wait(self) -> Result<ForwardResponse> {
+        let resp = (self.deferred)()?;
+        match resp.payload {
+            ResponsePayload::Forward(r) => Ok(r),
+            ResponsePayload::Status(s) => Err(anyhow!(
+                "fire_batch_deferred: driver returned cold-path status {} (driver bug)",
+                s.status,
+            )),
+        }
+    }
+}
+
+/// Deferred-wait sibling of [`fire_batch_sync`]. Enqueues the batch now
+/// (fixing its submission order on the caller's thread) and returns a
+/// [`FireHandle`] whose `wait` blocks for the response off-thread. The
+/// run-ahead scheduler uses this to keep driver-inbox order == fire order
+/// (so a forward `t+1` never reaches the worker before its token-carryover
+/// source `t`) while overlapping the in-flight GPU with the next batch's build.
+pub fn fire_batch_deferred(
+    driver_idx: DriverId,
+    req: pie_driver_abi::ForwardRequest,
+) -> Result<FireHandle> {
+    let ch = get_channel(driver_idx)?;
+    let deferred = ch.submit_deferred(DriverRequest {
+        driver_id: driver_idx,
+        payload: RequestPayload::Forward(req),
+    })?;
+    Ok(FireHandle { deferred })
 }
 
 /// Abort every active driver channel. Called by the supervisor when it

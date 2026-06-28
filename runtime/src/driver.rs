@@ -119,6 +119,14 @@ pub struct DriverResponse {
     pub payload: pie_driver_abi::ResponsePayload,
 }
 
+/// A response whose submission has already been ordered (the request is
+/// enqueued) but whose blocking wait is deferred. Calling the boxed closure
+/// blocks for the driver response. The run-ahead scheduler uses this to fix
+/// fire order on its own thread (the enqueue happens at `submit_deferred` call
+/// time, in fire order) and then await the GPU off-thread, so building and
+/// enqueuing the next batch overlaps the in-flight forward.
+pub type DeferredResponse = Box<dyn FnOnce() -> Result<DriverResponse> + Send>;
+
 #[async_trait]
 pub trait DriverChannel: Send + Sync {
     /// Submit a request and resolve with the typed response.
@@ -133,6 +141,19 @@ pub trait DriverChannel: Send + Sync {
     /// entry point.
     fn submit_sync(&self, req: DriverRequest) -> Result<DriverResponse>;
 
+    /// Enqueue `req` now (fixing its submission order at the call site) and
+    /// return a closure that blocks for the response. Lets the run-ahead
+    /// scheduler enqueue fires in-order on its own thread, then await each
+    /// off-thread so the GPU wait overlaps building the next batch. The default
+    /// is fully synchronous — it submits and waits inline, returning an
+    /// already-resolved closure (correct and order-preserving, just no
+    /// overlap). [`InProcChannel`] (the embedded-driver hot path) overrides
+    /// this to defer only the response wait.
+    fn submit_deferred(&self, req: DriverRequest) -> Result<DeferredResponse> {
+        let resp = self.submit_sync(req)?;
+        Ok(Box::new(move || Ok(resp)))
+    }
+
     /// Fire-and-forget submission. The driver still processes the
     /// request; the caller doesn't wait for the response. Errors at
     /// enqueue time (channel closed) are returned synchronously.
@@ -145,8 +166,8 @@ pub trait DriverChannel: Send + Sync {
 }
 
 pub use channel::{
-    abort_all_driver_channels, fire_batch, fire_batch_sync, get_spec, install_channel,
-    install_spec, register_driver,
+    abort_all_driver_channels, fire_batch, fire_batch_deferred, fire_batch_sync, get_spec,
+    install_channel, install_spec, register_driver, FireHandle,
 };
 pub use inproc::{InProcChannel, InProcVTable};
 pub use inproc_polling::InProcPollingChannel;
