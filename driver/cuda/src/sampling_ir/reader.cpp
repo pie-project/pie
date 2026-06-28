@@ -102,7 +102,7 @@ bool read_input(Cursor& c, std::uint32_t expected_id, Input& out, DecodeError* e
             out.binding.tag = BindingTag::Host;
             out.binding.host_key = c.u32();
             std::uint8_t av = c.u8();
-            if (av > 1) {
+            if (av > 2) {
                 if (err) { err->code = DecodeError::UnknownTag; err->detail = "host availability"; }
                 return false;
             }
@@ -326,10 +326,17 @@ bool read_program_v4(const std::uint8_t* data, std::size_t len,
     // pre-lowering bytecode that hasn't set the bit yet).
     std::vector<ValueType> slot_ty(n_inputs);
     std::vector<bool> slot_late(n_inputs, false);
+    // #31: bit 6 (READY_SELFSPEC_BIT=0x40) is the SelfSpecDraftInput readiness,
+    // distinct from Late (bit 7). MUST be masked off before parse_dtype (DType
+    // tags are 0..=3) and recorded so the slot's host binding is stamped
+    // SelfSpecDraftInput below — else the bit survives the mask and parse_dtype
+    // rejects it (UnknownTag), failing the whole verify-program decode.
+    std::vector<bool> slot_selfspec(n_inputs, false);
     for (std::uint32_t i = 0; i < n_inputs; ++i) {
         std::uint8_t raw = c.u8();
         slot_late[i] = (raw & 0x80u) != 0;
-        if (!parse_dtype(raw & 0x7fu, slot_ty[i].dtype)) { if (err) { err->code = DecodeError::UnknownTag; err->detail = "input dtype"; } return false; }
+        slot_selfspec[i] = (raw & 0x40u) != 0;
+        if (!parse_dtype(raw & 0x3fu, slot_ty[i].dtype)) { if (err) { err->code = DecodeError::UnknownTag; err->detail = "input dtype"; } return false; }
         if (!read_shape_v4(c, slot_ty[i].shape)) { if (err) { err->code = DecodeError::UnknownTag; err->detail = "input shape"; } return false; }
     }
 
@@ -379,6 +386,12 @@ bool read_program_v4(const std::uint8_t* data, std::size_t len,
             // host_avail intact (pre-lowering bytecode still relies on it).
             if (slot_late[p.slot_idx] && in.binding.tag == BindingTag::Host)
                 in.binding.host_avail = HostAvailability::LateBound;
+            // #31: a bytecode-declared SelfSpecDraftInput slot (bit 6) stamps the
+            // host binding's marker so build_buffers classifies it HostLate and the
+            // BufferDecl→InputDecl projection carries SelfSpecDraftInput to echo's
+            // resolver (which redirects it to pi.tokens+sample_row+1).
+            else if (slot_selfspec[p.slot_idx] && in.binding.tag == BindingTag::Host)
+                in.binding.host_avail = HostAvailability::SelfSpecDraftInput;
             out.inputs.push_back(in);
             v4_to_mine[p.v4_id] = leaf_id++;
         } else if (p.kind == 1) {

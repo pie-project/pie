@@ -129,7 +129,14 @@ enum class BindingTag : std::uint8_t { Const = 0, Intrinsic = 1, Host = 2, Outpu
 // executor maps this to the runtime `IntrinsicKind` (Logits → the sampled row,
 // MtpLogits → `ws.logits[mtp_draft_row]`); delta bridges at jit_backend.cpp:282.
 enum class Intrinsic : std::uint8_t { Logits = 0, MtpLogits = 1 };
-enum class HostAvailability : std::uint8_t { SubmitBound = 0, LateBound = 1 };
+// SelfSpecDraftInput (#31): a device-resident self-spec verify draft INPUT
+// (forward-(N-1)'s drafts refed as forward-N's verify input, resident in
+// `pi.tokens + sample_row + 1`). Encoded distinctly from Late (bytecode bit 6,
+// READY_SELFSPEC_BIT=0x40) so the marker survives to the resolver; classified
+// HostLate (device-resident) but its host_avail stays SelfSpecDraftInput so the
+// runtime InputDecl carries the marker (else it folds to a generic HostLate →
+// wrong-buffer bind, the #19/cut-#1 carrier-drop class).
+enum class HostAvailability : std::uint8_t { SubmitBound = 0, LateBound = 1, SelfSpecDraftInput = 2 };
 
 // Semantic kind of a declared slot output (PSIR v2). The host marshals each
 // output into the matching WIT slot-output variant; the driver reads it to know

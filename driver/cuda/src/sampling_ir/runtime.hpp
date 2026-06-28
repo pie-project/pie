@@ -77,6 +77,12 @@ enum class IntrinsicKind : std::uint8_t {
     Logits = 0,     // bf16 [vocab] row from `ws.logits` at `sample_row`
     MtpLogits = 1,  // bf16 [vocab] row from `ws.logits` at the speculator DRAFT
                     // row (`mtp_draft_row`) — the MTP head's next-token logits.
+    // #31 self-spec verify draft INPUT marker (NOT a ws.logits intrinsic): a
+    // HostLate `[k]` i32 draft binding the resolver redirects to the refed
+    // `pi.tokens + sample_row + 1`. Reuses this `intrinsic` field as the distinct
+    // marker (cls==HostLate && intrinsic==SelfSpecDraftInput) so it survives the
+    // BufferDecl→InputDecl projection to echo's resolver without folding to Late.
+    SelfSpecDraftInput = 2,
 };
 
 // One resolved per-fire binding. Produced by the runtime from the program's

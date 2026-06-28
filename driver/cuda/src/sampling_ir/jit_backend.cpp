@@ -199,6 +199,15 @@ ProgramHandle SamplingIrBackend::compile_decoded(const Program& program,
                 in.intrinsic = (b.intrinsic_kind == Intrinsic::MtpLogits)
                                    ? IntrinsicKind::MtpLogits
                                    : IntrinsicKind::Logits;
+                // #31: carry the SelfSpecDraftInput marker (bytecode 0x40 → reader →
+                // binding.host_avail) onto the runtime InputDecl so echo's resolver
+                // distinguishes it (cls==HostLate && intrinsic==SelfSpecDraftInput)
+                // and binds pi.tokens+sample_row+1. MUST NOT fold to a generic
+                // HostLate — that drops the marker → wrong-buffer bind (#19-class).
+                if (b.input_id < program.inputs.size() &&
+                    program.inputs[b.input_id].binding.host_avail ==
+                        HostAvailability::SelfSpecDraftInput)
+                    in.intrinsic = IntrinsicKind::SelfSpecDraftInput;
                 in.host_key = (b.input_id < program.inputs.size())
                                   ? program.inputs[b.input_id].binding.host_key
                                   : 0;

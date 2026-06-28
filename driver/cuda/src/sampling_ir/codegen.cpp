@@ -395,7 +395,13 @@ struct Codegen {
                 }
                 case BindingTag::Host: {
                     Phys ph = dtype_to_phys(in.ty.dtype);
-                    BufferClass cls = (in.binding.host_avail == HostAvailability::LateBound)
+                    // SelfSpecDraftInput (#31) is device-resident (resolver redirects
+                    // it to pi.tokens+sample_row+1) → classify HostLate like LateBound,
+                    // NOT HostSubmit (which would fail-loud on a missing host stage).
+                    // The binding's host_avail stays SelfSpecDraftInput so the
+                    // InputDecl projection carries the marker to the resolver.
+                    BufferClass cls = (in.binding.host_avail == HostAvailability::LateBound ||
+                                       in.binding.host_avail == HostAvailability::SelfSpecDraftInput)
                                           ? BufferClass::HostLate : BufferClass::HostSubmit;
                     std::uint32_t ec = in.ty.shape.tag == ShapeTag::Matrix
                                            ? in.ty.shape.a * in.ty.shape.b

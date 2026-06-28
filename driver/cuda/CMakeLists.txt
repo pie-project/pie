@@ -789,6 +789,20 @@ if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/sampling_ir/codegen.cpp"
   add_test(NAME sampling_ir_batched_matrix_reject
     COMMAND test_sampling_ir_batched_matrix_reject)
 
+  # #31 STOP-#3 boundary guard (lane L2 / charlie): the C++ v4 reader must decode
+  # the SelfSpecDraftInput readiness (bytecode bit 6, 0x40) the Rust encoder emits
+  # — a dual encoder/reader contract the Rust-only round-trip can't cover. Decodes
+  # the REAL mtp_self_spec_greedy bytecode + asserts the SelfSpecDraftInput marker
+  # survives to HostLate. Pure host; no CUDA.
+  add_executable(test_sampling_ir_selfspec_decode
+    tests/test_sampling_ir_selfspec_decode.cpp
+    src/sampling_ir/codegen.cpp
+    src/sampling_ir/reader.cpp)
+  target_include_directories(test_sampling_ir_selfspec_decode PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  add_test(NAME sampling_ir_selfspec_decode
+    COMMAND test_sampling_ir_selfspec_decode)
+
   # Driver-level parity gate (lane L4 / echo): the IR argmax program, run through
   # echo's IProgramBackend exactly as the executor invokes it, must match the
   # legacy `launch_argmax_bf16` kernel over the same bf16 logits rows.
