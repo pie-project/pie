@@ -6,7 +6,8 @@
 
 use sampling_edsl::ir::{self, Op};
 use sampling_edsl::program::{
-    grammar, grammar_sampled, mirostat, spec_verify_greedy, spec_verify_lossless,
+    grammar, grammar_sampled, mirostat, mtp_self_spec_greedy, mtp_self_spec_greedy_observable,
+    spec_verify_greedy, spec_verify_lossless,
 };
 use sampling_edsl::sugar::{SamplerSpec, build_sampler, lower_sampler};
 use sampling_edsl::{Built, OutputKind};
@@ -185,4 +186,39 @@ fn lower_sampler_emits_v4_bytecode() {
     let version = u16::from_le_bytes([lowered.bytecode[4], lowered.bytecode[5]]);
     assert_eq!(version, ir::VERSION);
     assert_eq!(lowered.outputs, vec![OutputKind::Token]);
+}
+
+// ── #31 self-spec verify (MTP head as draft SOURCE) ──────────────────────────
+#[test]
+fn mtp_self_spec_greedy_draft_is_self_spec_input_and_dag_matches_host() {
+    let (b, keys) = mtp_self_spec_greedy(VOCAB, 4).expect("builds");
+    roundtrip(&b);
+    assert_eq!(b.outputs, vec![OutputKind::Token]);
+    // The draft is the device-resident self-spec INPUT (refed `pi.tokens`), not a
+    // host upload — the #31 de-hardwiring knob (`SelfSpecDraftInput`).
+    assert_eq!(b.host_inputs.len(), 1);
+    assert_eq!(b.host_inputs[0].key, keys.draft);
+    assert_eq!(b.host_inputs[0].ready, ir::Readiness::SelfSpecDraftInput);
+    // Source-agnostic: the verify DAG is IDENTICAL to the host-injected
+    // `spec_verify_greedy` (the source is a manifest property, not bytecode).
+    let (host, _) = spec_verify_greedy(VOCAB, 4).expect("builds");
+    assert_eq!(ops(&b), ops(&host));
+    // Greedy DAG markers: per-row argmax + prefix-AND cumprod.
+    assert!(has(&b, |o| matches!(o, Op::ReduceArgmax(_))));
+    assert!(has(&b, |o| matches!(o, Op::CumProd(_))));
+}
+
+#[test]
+fn mtp_self_spec_greedy_observable_uses_zero_sentinel_for_harness() {
+    let (obs, _) = mtp_self_spec_greedy_observable(VOCAB, 4).expect("builds");
+    roundtrip(&obs);
+    // Same self-spec INPUT draft role as the production verify.
+    assert_eq!(obs.host_inputs[0].ready, ir::Readiness::SelfSpecDraftInput);
+    // Differs from production only in the reject-sentinel constant (0 vs -1): the
+    // 0-sentinel is non-truncating so a cross-row reject/clobber stays observable.
+    let (prod, _) = mtp_self_spec_greedy(VOCAB, 4).expect("builds");
+    assert_ne!(ops(&obs), ops(&prod));
+    assert!(has(&obs, |o| matches!(o, Op::Const(ir::Literal::I32(0)))));
+    assert!(!has(&obs, |o| matches!(o, Op::Const(ir::Literal::I32(-1)))));
+    assert!(has(&prod, |o| matches!(o, Op::Const(ir::Literal::I32(-1)))));
 }

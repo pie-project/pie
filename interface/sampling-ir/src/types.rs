@@ -391,6 +391,19 @@ pub enum Readiness {
     Submit = 0,
     /// Ready after submit, before its first consuming op; miss = skip.
     Late = 1,
+    /// Late-class, **driver-internal**: the verify's draft INPUT (#31 self-spec).
+    /// The verify reads forward-(N−1)'s drafts that the host refed as forward-N's
+    /// verify input, resident in the driver's token buffer at the `[k,vocab]`
+    /// matrix base (`pi.tokens + sample_row + 1`) — the drafts ARE the verify
+    /// input (populated at forward start, before the sampling-IR fires; no new
+    /// materialization). The resolver binds flag-first; NO host upload, NO
+    /// `sampling_late_device_*` ptr. Distinct from [`Late`] (#27 host-uploaded
+    /// device-alias). Late-class for barriers/codegen (`HostLate`), so it rides
+    /// `READY_LATE_BIT` in bytecode (degrades to `Late` for a stale reader); the
+    /// structured manifest carries the precise role. (The reciprocal MTP
+    /// draft-OUTPUT exposure is a drafter-populated program-output slot, NOT an
+    /// IR-read readiness — an IR program fires upstream of the drafter.)
+    SelfSpecDraftInput = 2,
 }
 
 /// How an input slot is bound at forward-pass attach time (the WIT

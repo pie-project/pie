@@ -20,10 +20,15 @@ const DT_I32: u8 = 1;
 const DT_U32: u8 = 2;
 const DT_BOOL: u8 = 3;
 
-/// `InputDecl` readiness rides bit 7 of the dtype byte (DType tags are `0..=3`,
-/// so the high bit is free). Clear ⇒ `Submit` — so v4 bytecode (which never set
-/// it) decodes additively as `Submit`; set ⇒ `Late`.
+/// `InputDecl` readiness rides the high bits of the dtype byte (DType tags are
+/// `0..=3`, so bits 2..=7 are free). Clear ⇒ `Submit` — so v4 bytecode (which
+/// never set these) decodes additively as `Submit`. Bit 7 ⇒ `Late`; bit 6 ⇒
+/// `SelfSpecDraftInput` (#31 self-spec verify draft — a distinct device-resident
+/// late role). Existing `Submit`/`Late` encodings are unchanged (additive).
 const READY_LATE_BIT: u8 = 0x80;
+/// Bit 6 of the dtype byte: `Readiness::SelfSpecDraftInput` (#31). Distinct from
+/// `READY_LATE_BIT` so the role round-trips losslessly; checked first on decode.
+const READY_SELFSPEC_BIT: u8 = 0x40;
 
 // -- predicate tags --
 const PR_RANKLE: u8 = 0;
@@ -90,7 +95,15 @@ pub fn encode(p: &SamplingProgram) -> Vec<u8> {
     put_u32(&mut w, p.ops.len() as u32);
     put_u32(&mut w, p.outputs.len() as u32);
     for inp in &p.inputs {
-        let ready_bit = if inp.ready == Readiness::Late { READY_LATE_BIT } else { 0 };
+        // Readiness rides the high tag bits (additive): `SelfSpecDraftInput` (#31
+        // self-spec verify draft, device-resident) gets its own bit so it round-trips
+        // losslessly; `Late` keeps bit 7. The structured manifest is the source of
+        // truth for the role; the bytecode bit mirrors it.
+        let ready_bit = match inp.ready {
+            Readiness::SelfSpecDraftInput => READY_SELFSPEC_BIT,
+            Readiness::Late => READY_LATE_BIT,
+            Readiness::Submit => 0,
+        };
         w.push(dtype_tag(inp.dtype) | ready_bit);
         encode_shape(&mut w, inp.shape);
     }
@@ -341,12 +354,15 @@ pub fn decode(bytes: &[u8]) -> Result<SamplingProgram, DecodeError> {
     let mut inputs = Vec::with_capacity(n_inputs as usize);
     for _ in 0..n_inputs {
         let raw = r.u8()?;
-        let ready = if raw & READY_LATE_BIT != 0 {
+        // Check the self-spec bit first (distinct role), then the late bit.
+        let ready = if raw & READY_SELFSPEC_BIT != 0 {
+            Readiness::SelfSpecDraftInput
+        } else if raw & READY_LATE_BIT != 0 {
             Readiness::Late
         } else {
             Readiness::Submit
         };
-        let dtype = decode_dtype(raw & !READY_LATE_BIT)?;
+        let dtype = decode_dtype(raw & !(READY_LATE_BIT | READY_SELFSPEC_BIT))?;
         let shape = decode_shape(&mut r)?;
         inputs.push(InputDecl::with_ready(shape, dtype, ready));
     }

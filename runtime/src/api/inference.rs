@@ -918,6 +918,20 @@ impl InstanceState {
                             submit_inputs
                                 .push(pie_driver_abi::SamplingInput { key, bytes: data });
                         }
+                        pie_sampling_ir::Readiness::SelfSpecDraftInput => {
+                            // #31 self-spec verify draft INPUT (driver-internal,
+                            // device-resident): forward-(N−1)'s drafts refed as forward-N's
+                            // verify input, resident in `pi.tokens + sample_row + 1`, filled
+                            // driver-side by the resolver — NOT host-uploaded. Preserve the
+                            // `SelfSpecDraftInput` flag in the manifest binding (the resolver
+                            // binds flag-FIRST in the `HostLate` branch — never downgrade to
+                            // Late/Submit or the flag silently drops) and skip the host upload
+                            // entirely (no submit stage, no `late_device_inputs`).
+                            // TODO(#31 runtime/driver): the no-upload carrier threading (key +
+                            // 0-ptr ballast) lives in the trigger lane; the resolver binds
+                            // `ctx.pi->tokens + sample_row + 1` off this manifest flag.
+                            bindings.push(pie_sampling_ir::Binding::Tensor { key, ready });
+                        }
                     }
                 }
             }

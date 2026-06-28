@@ -34,7 +34,7 @@ interface tensor {
     /// program input — e.g. a grammar mask computed post-logits). Encoded
     /// additively (bit 7 of the dtype byte in L0 bytecode), so v4 decodes as
     /// `submit`.
-    variant readiness { submit, late }
+    variant readiness { submit, late, self-spec-draft-input }
 
     record input { shape: shape, dtype: dtype, ready: readiness }
     record value { id: value-id, shape: shape, dtype: dtype }

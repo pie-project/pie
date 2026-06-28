@@ -228,7 +228,7 @@ pub fn late_inputs(p: &SamplingProgram) -> Vec<InputIndex> {
     p.inputs
         .iter()
         .enumerate()
-        .filter(|(_, inp)| inp.ready == Readiness::Late)
+        .filter(|(_, inp)| matches!(inp.ready, Readiness::Late | Readiness::SelfSpecDraftInput))
         .map(|(i, _)| i as InputIndex)
         .collect()
 }

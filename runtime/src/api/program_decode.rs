@@ -127,6 +127,7 @@ fn readiness_from_wit(r: wit::Readiness) -> Readiness {
     match r {
         wit::Readiness::Submit => Readiness::Submit,
         wit::Readiness::Late => Readiness::Late,
+        wit::Readiness::SelfSpecDraftInput => Readiness::SelfSpecDraftInput,
     }
 }
 

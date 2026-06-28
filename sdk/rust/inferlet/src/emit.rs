@@ -112,6 +112,7 @@ fn readiness_to_wit(r: ir::Readiness) -> tensor::Readiness {
     match r {
         ir::Readiness::Submit => tensor::Readiness::Submit,
         ir::Readiness::Late => tensor::Readiness::Late,
+        ir::Readiness::SelfSpecDraftInput => tensor::Readiness::SelfSpecDraftInput,
     }
 }
 

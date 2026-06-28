@@ -208,9 +208,48 @@ pub struct SpecVerifyKeys {
 /// sentinel-coded `[k]` Token: the accepted prefix, then `-1` from the first
 /// reject. Greedy DAG: `argmax -> eq -> cumprod -> select`.
 pub fn spec_verify_greedy(vocab: u32, k: u32) -> Result<(Built, SpecVerifyKeys), BuildError> {
+    build_spec_verify_greedy(vocab, k, Readiness::Submit, -1)
+}
+
+/// **Self-spec greedy-verify** (#31). The MTP head as the draft SOURCE: identical
+/// verify DAG and sentinel `[k]`-Token output as [`spec_verify_greedy`], but the
+/// draft is bound [`Readiness::SelfSpecDraftInput`] — the driver source-selects the
+/// refed draft tokens at the matrix base (`pi.tokens + sample_row`), no host upload,
+/// de-hardwiring the hardwired spec loop. The bytecode is byte-identical to a
+/// late-draft verify (the source is a manifest property, not bytecode), so the
+/// verify is source-agnostic.
+pub fn mtp_self_spec_greedy(vocab: u32, k: u32) -> Result<(Built, SpecVerifyKeys), BuildError> {
+    build_spec_verify_greedy(vocab, k, Readiness::SelfSpecDraftInput, -1)
+}
+
+/// **Observable self-spec greedy-verify** (#31 verify harness, NOT production).
+/// [`mtp_self_spec_greedy`] but with a `0` reject-sentinel instead of `-1`: since
+/// `0 >= 0` the host marshal does NOT truncate (`if (x < 0) break`), so the full
+/// `[k]` is emitted and a cross-row reject / draft-clobber is OBSERVABLE rather
+/// than masked by the `-1` compaction (delta's reject-MID detector). Test-only:
+/// the harness MUST construct drafts ∈ `[1, vocab)` (non-zero) so a `0` in the
+/// output is unambiguously a reject-sentinel, not a real token id `0`.
+pub fn mtp_self_spec_greedy_observable(
+    vocab: u32,
+    k: u32,
+) -> Result<(Built, SpecVerifyKeys), BuildError> {
+    build_spec_verify_greedy(vocab, k, Readiness::SelfSpecDraftInput, 0)
+}
+
+/// Shared greedy-verify graph builder. DAG: `argmax(target[k,vocab]) -> eq(draft)
+/// -> cumprod -> select(draft, sentinel)`. `draft_ready` picks the draft SOURCE
+/// (`Submit` = host-injected #27/#35-A; `SelfSpecDraftInput` = driver-internal MTP #31)
+/// — manifest-only, so the bytecode/DAG is identical across sources. `sentinel`
+/// codes a reject (`-1` production/truncating-to-`[j]`; `0` observable/non-truncating).
+fn build_spec_verify_greedy(
+    vocab: u32,
+    k: u32,
+    draft_ready: Readiness,
+    sentinel: i32,
+) -> Result<(Built, SpecVerifyKeys), BuildError> {
     let g = Graph::new(vocab);
     let logits = g.intrinsic_logits_matrix_dyn(k); // [k, vocab]
-    let draft = g.host_vector_dyn(DType::I32, k, Readiness::Submit);
+    let draft = g.host_vector_dyn(DType::I32, k, draft_ready);
 
     let target = logits.argmax(); // [k] i32 per-row greedy
     let matched = target.eq(&draft); // [k] bool
@@ -221,8 +260,8 @@ pub fn spec_verify_greedy(vocab: u32, k: u32) -> Result<(Built, SpecVerifyKeys),
     let acc = dselect(&matched, &ones, &zeros).cumprod();
     let keep = acc.gt(&g.constant_f32_dyn(0.5));
 
-    let neg1 = g.constant_i32_dyn(-1).broadcast_vec(k);
-    let out = dselect(&keep, &draft, &neg1);
+    let sentinel_v = g.constant_i32_dyn(sentinel).broadcast_vec(k);
+    let out = dselect(&keep, &draft, &sentinel_v);
     g.output(&out, OutputKind::Token);
 
     let keys = SpecVerifyKeys { draft: draft.input_key().expect("draft host input") };

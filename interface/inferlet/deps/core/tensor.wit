@@ -33,8 +33,13 @@ interface tensor {
     /// submit through the late channel (`tensor.write` into the device-aliased
     /// program input — e.g. a grammar mask computed post-logits). Encoded
     /// additively (bit 7 of the dtype byte in L0 bytecode), so v4 decodes as
-    /// `submit`.
-    variant readiness { submit, late }
+    /// `submit`. `self-spec-draft-input` is late-class but **driver-internal**
+    /// (#31 self-spec verify): the driver fills the binding from the refed draft
+    /// tokens resident at the verify matrix base (`pi.tokens + sample_row + 1`)
+    /// with NO host upload and NO late device ptr; the resolver binds it
+    /// flag-first. Rides the late bit in bytecode (degrades to `late` for a stale
+    /// reader); the structured manifest carries the precise role.
+    variant readiness { submit, late, self-spec-draft-input }
 
     record input { shape: shape, dtype: dtype, ready: readiness }
     record value { id: value-id, shape: shape, dtype: dtype }
