@@ -285,49 +285,89 @@ const MAX_IN_FLIGHT: usize = 2;
 /// completion channel preempts the wait the instant a batch actually finishes.
 const MIN_POLL_US: u64 = 50;
 
-/// Default per-fire cost estimate (seconds) for the #10 accumulation cost model
-/// — a conservative placeholder until delta's #11 3-regime load-test quantifies
-/// it (compile µs/program, fire µs/program, dedup/M-batch collapse). ~0.5 ms.
-const DEFAULT_PER_FIRE_S: f64 = 0.0005;
+/// #10 cost-model coefficients, calibrated from delta's #11 load-test on
+/// `50809f5d` (RTX 4090). Load-bearing finding: **compile ≫ fire by ~10³–10⁴** —
+/// the per-DISTINCT-program compile wall dominates; per-fire launch is a
+/// negligible correction. The accumulation decision keys on the distinct-program
+/// compile cost, not batch size.
+///
+/// **Per-distinct finalize residual** (delta C2): the on-context
+/// `cuModuleLoadData` PTX→SASS that **prefetch CANNOT hide** (the ~11ms NVRTC,
+/// C1−C2, IS prefetch-hidden). Bimodal ~0.3–13ms (driver-SASS-cache-hit vs cold).
+/// Conservative midpoint; **delta C1 is a LOWER BOUND** (trivial add-kernel) —
+/// real grammar/spec-verify programs compile slower, so #10-verify must use REAL
+/// grammars and the true wall is ≥ this.
+const PER_DISTINCT_FINALIZE_S: f64 = 0.005;
+/// Per-program fire (cache-hit launch) cost (s). delta C3 ~1.4µs, N-sequential —
+/// negligible vs the ms-scale compile wall (kept for completeness; does not move
+/// the decision). Real grammar-kernel fire (occupancy over vocab=151936) is
+/// higher — measured on #10-verify, not here.
+const PER_FIRE_S: f64 = 0.0000014;
 
-/// Pluggable merged-fire cost model for the #10 accumulation decision (the
-/// uniqueness-aware coalescing price). echo's merged scatter fires once per
-/// program; #11 dedup collapses the *compile* and echo's identical-bytecode
-/// M-batch collapses the *fire*. So **post-{dedup ∧ M-batch}** the cost is
-/// `O(distinct programs)`, but the **landed** scatter is still `O(total
-/// requests)` (identical programs fire sequentially). The policy keys
-/// accumulation on this so it never blindly accumulates unique programs into the
-/// `O(R)` fire wall, yet accumulates identical programs near-free once they
-/// collapse. Coefficients calibrate from delta's load-test post-#11.
+/// #10 merged-batch cost model, delta-#11-calibrated. Cost is DOMINATED by the
+/// per-DISTINCT-program compile wall; **#11 dedup (landed `50809f5d`, delta C4
+/// exact: K identical → 1 compile) is the scaling win** — it collapses the ~11ms
+/// compile for identical programs, so a batch's compile cost is
+/// `distinct_programs`, not `total_requests`. echo's identical-bytecode M-batch
+/// (the FIRE-axis collapse) is a ~0.01% secondary correction, DECOUPLED from the
+/// policy (measure-first, land-vs-defer). So the policy accumulates IDENTICAL
+/// programs near-free (dedup) and CAPS DISTINCT programs (each a compile wall) —
+/// driven by `distinct_program_count` (the dedup key), not the M-batch.
 #[derive(Clone, Copy, Debug)]
-struct MergedFireCost {
-    /// Per-fire cost (seconds). Placeholder; calibrated from delta's #11 regimes.
+struct MergedCost {
+    /// Per-distinct-program finalize residual (s) — the prefetch-unhideable floor.
+    per_distinct_finalize_s: f64,
+    /// Per-program fire (launch) cost (s) — negligible correction term.
     per_fire_s: f64,
-    /// Whether identical-bytecode programs collapse to one fire (echo's M-batch +
-    /// #11 dedup). `false` today (landed scatter fires `R_total` sequentially) ⇒
-    /// cost is uniqueness-BLIND; `true` post-M-batch ⇒ cost is per-DISTINCT.
-    coalesces_identical: bool,
+    /// #11 dedup collapses identical programs → one compile (landed `50809f5d`),
+    /// so the compile cost is per-DISTINCT. `true` reflects the landed dedup;
+    /// leveraging it needs the distinct-`program_identity_hash` count plumbed
+    /// (follow-up) — until then `estimate_s` is called with `distinct = total`
+    /// (conservative: prices every request as distinct → never over-accumulates).
+    dedup_collapses_identical: bool,
 }
 
-impl MergedFireCost {
-    /// Conservative placeholder matching the LANDED scatter: uniqueness-blind,
-    /// `O(total requests)` fires. Flips `coalesces_identical = true` once echo's
-    /// M-batch + #11 dedup land and delta's load-test calibrates `per_fire_s`.
-    const fn placeholder() -> Self {
-        Self { per_fire_s: DEFAULT_PER_FIRE_S, coalesces_identical: false }
+impl MergedCost {
+    /// Calibrated from delta's #11 load-test; dedup landed on `50809f5d`.
+    const fn calibrated() -> Self {
+        Self {
+            per_distinct_finalize_s: PER_DISTINCT_FINALIZE_S,
+            per_fire_s: PER_FIRE_S,
+            dedup_collapses_identical: true,
+        }
     }
 
-    /// Estimated number of GPU fires a batch of `total_requests` spanning
-    /// `distinct_programs` distinct sampler programs costs. (Distinct-program
-    /// count plumbing into the policy is a follow-up that lands with echo's
-    /// M-batch; until then the conservative path uses `total_requests`.)
-    fn fire_count(&self, total_requests: usize, distinct_programs: usize) -> usize {
-        if self.coalesces_identical {
+    /// Estimated at-fire cost (s) of a batch of `total_requests` spanning
+    /// `distinct_programs` distinct programs: each distinct program pays the
+    /// finalize residual (dedup collapses identical → 1 compile); all requests
+    /// pay the negligible per-fire launch.
+    fn estimate_s(&self, total_requests: usize, distinct_programs: usize) -> f64 {
+        let compiles = if self.dedup_collapses_identical {
             distinct_programs.clamp(1, total_requests.max(1))
         } else {
             total_requests.max(1)
-        }
+        };
+        compiles as f64 * self.per_distinct_finalize_s + total_requests as f64 * self.per_fire_s
     }
+}
+
+/// The #10 distinct-program compile-cost ceiling (s), read once from
+/// `PIE_SCHED_MAX_ACCUM_COST_US`. DECOUPLED from the latency window (echo's note):
+/// `accum_window` caps how long we WAIT; this caps how much distinct-program
+/// COMPILE cost a batch absorbs before firing (the burst-of-distinct wall).
+/// Default = the budget below (~40ms ≈ 8 distinct programs at the finalize
+/// residual). dedup makes identical programs free, so this only bites genuine
+/// distinct-program bursts.
+fn max_accum_cost_from_env() -> Duration {
+    use std::sync::OnceLock;
+    static MAX: OnceLock<Duration> = OnceLock::new();
+    *MAX.get_or_init(|| {
+        std::env::var("PIE_SCHED_MAX_ACCUM_COST_US")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .map(Duration::from_micros)
+            .unwrap_or(Duration::from_millis(40))
+    })
 }
 
 /// The #10 adaptive accumulation window (the hard p99 latency cap on how long the
@@ -374,8 +414,11 @@ pub(super) struct RunAheadPolicy {
     /// When the current (not-yet-fired) batch began accumulating — bounds the
     /// accumulation wait to `accum_window`. Reset on fire.
     accumulating_since: Option<Instant>,
-    /// Pluggable merged-fire cost model (uniqueness-aware coalescing price).
-    fire_cost: MergedFireCost,
+    /// #10 merged-batch cost model (delta-calibrated, dedup-driven).
+    merged_cost: MergedCost,
+    /// #10 distinct-program compile-cost ceiling — decoupled from `accum_window`
+    /// (the latency cap) per echo's note.
+    max_accum_cost: Duration,
 }
 
 #[allow(dead_code)]
@@ -391,7 +434,8 @@ impl RunAheadPolicy {
             last_arrival: None,
             inter_arrival_ewma: 0.0,
             accumulating_since: None,
-            fire_cost: MergedFireCost::placeholder(),
+            merged_cost: MergedCost::calibrated(),
+            max_accum_cost: max_accum_cost_from_env(),
         }
     }
 
@@ -419,16 +463,19 @@ impl RunAheadPolicy {
         if current_forward_requests >= self.max_forward_requests {
             return Decision::Fire;
         }
-        // Cost cap: stop once the batch's estimated fire cost would itself exceed
-        // the window budget. With the conservative placeholder (uniqueness-blind,
-        // `O(total)`) this caps blind accumulation of unique programs at the fire
-        // wall; post-M-batch (per-distinct) identical programs accumulate near-free.
-        // (Distinct-program-count plumbing lands with echo's M-batch; today the
-        // conservative bound uses `current_forward_requests` for both.)
-        let fires = self
-            .fire_cost
-            .fire_count(current_forward_requests, current_forward_requests);
-        if Duration::from_secs_f64(fires as f64 * self.fire_cost.per_fire_s) >= self.accum_window {
+        // Cost cap (DECOUPLED from the latency window per echo's note): fire once
+        // the batch's estimated distinct-program COMPILE cost reaches
+        // `max_accum_cost`. delta's #11: compile ≫ fire by ~10³–10⁴, and #11 dedup
+        // (landed) collapses identical programs → one compile — so identical
+        // batches accumulate near-free while genuine distinct-program bursts hit
+        // this wall. (Distinct-`program_identity_hash`-count plumbing is the
+        // follow-up; until then the conservative bound passes `distinct = total`,
+        // i.e. prices every request as distinct → never over-accumulates.)
+        let cost = Duration::from_secs_f64(
+            self.merged_cost
+                .estimate_s(current_forward_requests, current_forward_requests),
+        );
+        if cost >= self.max_accum_cost {
             return Decision::Fire;
         }
         let now = Instant::now();
@@ -670,14 +717,18 @@ mod run_ahead_tests {
 
     #[test]
     fn accum_window_cost_cap_fires() {
-        // Conservative (uniqueness-blind) fire cost caps blind accumulation: once
-        // total_requests × per_fire ≥ window, fire (don't pay the O(R) fire wall).
+        // Distinct-program compile-cost ceiling (DECOUPLED from the latency
+        // window): each distinct program pays the finalize residual (~5ms); fire
+        // once the batch's estimated compile cost reaches `max_accum_cost`. dedup
+        // (landed) collapses identical → 1 compile; conservative `distinct=total`
+        // until the program_identity_hash count is plumbed.
         let mut p = RunAheadPolicy::new(512);
-        p.accum_window = Duration::from_millis(5); // 5ms / 0.5ms-per-fire ⇒ 10
+        p.accum_window = Duration::from_millis(50); // ample latency budget
+        p.max_accum_cost = Duration::from_millis(40); // / 5ms-per-distinct ⇒ 8
         p.inter_arrival_ewma = 0.0005;
         p.accumulating_since = Some(Instant::now());
-        assert!(matches!(p.decide(10), Decision::Fire)); // at the cost wall
-        assert!(matches!(p.decide(2), Decision::Wait(_))); // below it ⇒ accumulate
+        assert!(matches!(p.decide(8), Decision::Fire)); // 8×5ms = 40ms ⇒ compile wall
+        assert!(matches!(p.decide(2), Decision::Wait(_))); // 2×5ms = 10ms ⇒ accumulate
     }
 
     #[test]
@@ -688,6 +739,20 @@ mod run_ahead_tests {
         p.inter_arrival_ewma = 0.0005;
         p.accumulating_since = Instant::now().checked_sub(Duration::from_millis(20));
         assert!(matches!(p.decide(2), Decision::Fire));
+    }
+
+    #[test]
+    fn merged_cost_compile_dominated_and_dedup_collapses() {
+        // delta #11 calibration: compile ≫ fire, and dedup (landed) collapses
+        // identical programs to per-DISTINCT compile cost.
+        let c = MergedCost::calibrated();
+        // 100 requests, 1 distinct program (all identical) ⇒ ~1 compile (dedup),
+        // far cheaper than 100 distinct programs ⇒ 100 compiles.
+        let identical = c.estimate_s(100, 1);
+        let all_distinct = c.estimate_s(100, 100);
+        assert!(all_distinct > identical);
+        // compile dominates: even the single collapsed compile dwarfs all 100 fires.
+        assert!(identical > 99.0 * c.per_fire_s);
     }
 }
 
