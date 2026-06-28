@@ -1065,6 +1065,11 @@ struct PendingForward {
     /// device inputs.
     late_device_inputs: Vec<crate::api::tensor_io::DeviceLateInput>,
     profile_start: Option<Instant>,
+    /// #23 overlap abort-isolation: the producer link this pass produced and the
+    /// prior producer link it consumed (injected from). At finalize the write-log
+    /// uses these to cascade-abort the consumer if its producer aborted, and to
+    /// publish this pass's own outcome for its consumer.
+    next_input_deps: crate::api::next_input_map::NextInputDeps,
 }
 
 /// Phase-2 of a forward pass: await the driver round-trip, finalize the forward
@@ -1090,6 +1095,7 @@ async fn await_and_finalize(
         pinned_outputs,
         late_device_inputs,
         profile_start,
+        next_input_deps,
     } = pending;
 
     // Await the driver result (P3 native async), then finalize the forward txn
@@ -1110,7 +1116,10 @@ async fn await_and_finalize(
     let forward_txn = txn
         .take()
         .expect("forward txn consumed exactly once at finalize");
-    accessor.with(|mut access| {
+    // #23: finalize resolves the overlap cascade and returns the EFFECTIVE success
+    // — a consumer whose producer aborted (or is unresolved, fail-closed) is forced
+    // to abort even on driver success, so its poisoned output never surfaces.
+    let effective_success = accessor.with(|mut access| {
         access.get().finalize_forward_txn(
             success,
             forward_txn,
@@ -1120,6 +1129,7 @@ async fn await_and_finalize(
             driver_idx,
             rs_fold_set,
             fold_buffered_tokens,
+            next_input_deps,
         )
     })?;
 
@@ -1133,8 +1143,10 @@ async fn await_and_finalize(
     // after the D2H landed (the `(a2)` deferred forward-done), so the buffers are
     // filled — copy them out (the `ForwardResponse` output channels are
     // success-only / empty for a fast-path pass). Legacy: marshal the response
-    // channels. Either path is gated on the forward succeeding (`forward_result`).
-    let tensors = if forward_result.is_some() && !pinned_outputs.is_empty() {
+    // channels. Both paths are gated on the EFFECTIVE success (#23): a cascade-
+    // aborted consumer (driver-ok but its producer aborted) yields NO output, so
+    // `output()` surfaces the abort instead of a poisoned tensor.
+    let tensors = if effective_success && !pinned_outputs.is_empty() {
         pinned_outputs
             .into_iter()
             .map(|out| {
@@ -1146,11 +1158,14 @@ async fn await_and_finalize(
                 }
             })
             .collect()
-    } else {
+    } else if effective_success {
         match forward_result {
             Some(resp) => build_output_tensors(resp, &programs_output_kinds),
             None => Vec::new(),
         }
+    } else {
+        // Driver failure OR overlap cascade-abort ⇒ no output tensor.
+        Vec::new()
     };
     if let Some(start) = profile_start {
         record_execute_profile(ExecuteProfileSample::default(), elapsed_us(start.elapsed()));
@@ -1711,8 +1726,11 @@ async fn execute_impl(
             ) {
                 req.push_next_input_free_link(link);
             }
+            // #23: a fresh generate starts a clean dependency chain — drop any
+            // lingering terminal-producer link from the prior generation.
+            state.overlap_links.clear();
         }
-        crate::api::next_input_map::apply_next_input_carrier(
+        let next_input_deps = crate::api::next_input_map::apply_next_input_carrier(
             &mut state.pending_next_input,
             &mut state.next_input_link_counter,
             &mut req,
@@ -1775,6 +1793,7 @@ async fn execute_impl(
             pinned_outputs,
             late_device_inputs: late_device_handles,
             profile_start,
+            next_input_deps,
         };
         state.ctx().table.get_mut(&this)?.pending = Some(pending);
         Ok(())
@@ -1796,7 +1815,34 @@ impl InstanceState {
         driver_idx: usize,
         rs_fold_set: Option<Resource<crate::working_set::rs::RsWorkingSet>>,
         fold_tokens: Option<u32>,
-    ) -> Result<()> {
+        next_input_deps: crate::api::next_input_map::NextInputDeps,
+    ) -> Result<bool> {
+        // #23 overlap abort-isolation: resolve the cascade. A consumer that
+        // injected from a producer link that did NOT explicitly commit (aborted OR
+        // unresolved — fail-closed) is forced to abort even on driver success, so a
+        // poisoned generation never commits its txn/KV. The write-log also records
+        // THIS pass's (effective) outcome under its produced link, chaining the
+        // poison downstream. This is device-drain-neutral (host txn/KV only — it
+        // never touches the device `retained_next_input` consumer count).
+        let success = self.overlap_links.finalize(success, next_input_deps);
+
+        // Carry rollback: a terminal producer that aborted with its carry still
+        // pending (no consumer took it in the overlap) leaves a dangling carry —
+        // clear it so a later same-context pass doesn't inject the aborted sample.
+        // (The consumed case is already covered: the consumer emitted the
+        // drain-gated free-link at inject; here we only catch the un-consumed
+        // terminal.) The device retained buffer is freed by the next pass's
+        // `clear_pending_for_context` (no leak).
+        let terminal_dangling = !success
+            && next_input_deps.produced.is_some_and(|prod| {
+                self.pending_next_input
+                    .as_ref()
+                    .is_some_and(|p| p.link == prod)
+            });
+        if terminal_dangling {
+            self.pending_next_input = None;
+        }
+
         let arena_arc = crate::arena::get(model_id, driver_idx);
         if success {
             // Commit, publish the repointed slots, then CAS-seal eligible full
@@ -1838,7 +1884,7 @@ impl InstanceState {
                 }
             }
         }
-        Ok(())
+        Ok(success)
     }
 }
 

@@ -15,6 +15,86 @@
 
 use pie_driver_abi::ForwardRequest;
 
+/// The link dependencies a pass established at submit (the #23 overlap write-log
+/// inputs): the link it PRODUCED (if it declared `next-inputs`) and the prior
+/// producer link it CONSUMED (injected from — same-context only). Threaded onto
+/// the pass's in-flight handle so its finalize can resolve the overlap cascade
+/// (a consumer aborts if the producer it injected from aborted) and publish its
+/// own outcome for its consumer.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct NextInputDeps {
+    /// The link this pass produced for the next pass (`None` = not a producer).
+    pub produced: Option<u32>,
+    /// The producer link this pass injected from (`None` = not a real consumer;
+    /// a context-mismatch drop is NOT a dependency — it injects nothing).
+    pub consumed: Option<u32>,
+}
+
+/// Resolved outcome of a producer pass, published at its finalize for its
+/// consumer's #23 cascade check.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LinkOutcome {
+    Committed,
+    Aborted,
+}
+
+/// #23 abort-isolation write-log: tracks each in-flight producer link's resolved
+/// outcome so a consumer's finalize can cascade-abort if the producer it injected
+/// from aborted — preventing a poisoned generation (the consumer ran on the
+/// producer's invalid sampled token) from committing.
+///
+/// **FAIL-CLOSED (LOCK 1):** an unresolved consumed link (absent from the map) is
+/// treated as `Aborted` — only an explicit `Committed` clears the cascade, so a
+/// finalize-ordering violation can never silently commit a poisoned generation.
+///
+/// Bounded: a consumer removes the link it reads; the only lingering entry is a
+/// terminal producer's (no consumer), cleared at the next `generate()` boundary
+/// via [`clear`](Self::clear).
+#[derive(Debug, Default)]
+pub struct OverlapLinkLog {
+    status: std::collections::HashMap<u32, LinkOutcome>,
+}
+
+impl OverlapLinkLog {
+    /// Resolve a pass's finalize against the overlap links and return the
+    /// **effective** success the caller commits/aborts on.
+    ///
+    /// 1. Consumer cascade (fail-closed): if this pass injected from a producer
+    ///    link that is not explicitly `Committed` (aborted OR unresolved), force
+    ///    `effective = false` — the consumer's txn + KV must roll back.
+    /// 2. Producer record: publish this pass's *effective* outcome under its
+    ///    produced link, so its consumer sees it — chaining the cascade downstream
+    ///    (a poisoned pass poisons the whole dependent run until a fresh prime).
+    pub fn finalize(&mut self, driver_success: bool, deps: NextInputDeps) -> bool {
+        let producer_poisoned = deps
+            .consumed
+            .is_some_and(|l| self.status.remove(&l) != Some(LinkOutcome::Committed));
+        let effective = driver_success && !producer_poisoned;
+        if let Some(prod) = deps.produced {
+            self.status.insert(
+                prod,
+                if effective {
+                    LinkOutcome::Committed
+                } else {
+                    LinkOutcome::Aborted
+                },
+            );
+        }
+        effective
+    }
+
+    /// Drop all tracked links — a fresh `generate()` starts clean (also clears
+    /// any lingering terminal-producer entry so the map stays bounded).
+    pub fn clear(&mut self) {
+        self.status.clear();
+    }
+
+    #[cfg(test)]
+    fn is_empty(&self) -> bool {
+        self.status.is_empty()
+    }
+}
+
 /// The pending carry from the prior producer pass, applied to the next pass (the
 /// implicit consumer) on the same context.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -50,7 +130,8 @@ pub fn apply_next_input_carrier(
     req: &mut ForwardRequest,
     positions: &[u32],
     context_id: u32,
-) {
+) -> NextInputDeps {
+    let mut deps = NextInputDeps::default();
     // ── CONSUMER role ───────────────────────────────────────────────
     // Inject the prior producer's retained sample into this pass's declared dest
     // slots. `src_row = n_rows - 1` is the producer's last forward row (the decode
@@ -66,12 +147,17 @@ pub fn apply_next_input_carrier(
                 req.push_next_input_link(p.link, src_row, pos);
             }
             req.push_next_input_free_link(p.link);
+            // #23: a real cross-pass dependency — record the producer link this
+            // pass injected from so its finalize can cascade-abort if the producer
+            // aborted (and so the free above rides the drain-gated deferred-free).
+            deps.consumed = Some(p.link);
         } else {
             // Stale carry from a DIFFERENT context: the producer's intended
             // (immediate-next, same-context) consumer never fired — this terminal
             // producer's carry would otherwise leak into a new context's prefill.
             // Don't inject; free the retained buffer (global, keyed by link) so it
-            // doesn't leak. `pending.take()` already cleared the carry.
+            // doesn't leak. `pending.take()` already cleared the carry. NOT a real
+            // dependency (no inject) ⇒ `deps.consumed` stays `None`.
             req.push_next_input_free_link(p.link);
         }
     }
@@ -85,6 +171,7 @@ pub fn apply_next_input_carrier(
         let link = *counter;
         req.set_pipeline_source_link(link);
         let n_rows = req.token_ids.len() as u32;
+        deps.produced = Some(link);
         *pending = Some(PendingNextInput {
             link,
             positions: positions.to_vec(),
@@ -92,6 +179,7 @@ pub fn apply_next_input_carrier(
             context_id,
         });
     }
+    deps
 }
 
 /// Drop this context's dangling carrier pending at a fresh-`generate()` boundary
@@ -244,5 +332,106 @@ mod tests {
         // No pending → None.
         let mut pending: Option<PendingNextInput> = None;
         assert_eq!(clear_pending_for_context(&mut pending, 1), None);
+    }
+
+    // ── #23 overlap abort-isolation write-log ───────────────────────────────
+
+    fn dep(produced: Option<u32>, consumed: Option<u32>) -> NextInputDeps {
+        NextInputDeps { produced, consumed }
+    }
+
+    #[test]
+    fn overlap_log_happy_path_commits() {
+        // Producer t (link 1) commits, then consumer t+1 (consumed 1) commits.
+        let mut log = OverlapLinkLog::default();
+        assert!(log.finalize(true, dep(Some(1), None))); // producer succeeds → link 1 Committed
+        assert!(log.finalize(true, dep(None, Some(1)))); // consumer: producer committed → success
+        assert!(log.is_empty()); // consumer removed link 1; nothing lingers
+    }
+
+    #[test]
+    fn overlap_log_cascade_aborts_consumer() {
+        // Producer t aborts → consumer t+1 (driver-success!) cascade-aborts.
+        let mut log = OverlapLinkLog::default();
+        assert!(!log.finalize(false, dep(Some(1), None))); // producer aborts → link 1 Aborted
+        assert!(
+            !log.finalize(true, dep(None, Some(1))),
+            "consumer must cascade-abort despite driver success — poisoned input"
+        );
+    }
+
+    #[test]
+    fn overlap_log_fail_closed_on_unresolved_link() {
+        // LOCK 1: a consumed link never recorded (ordering violation) ⇒ treated as
+        // Aborted (fail-closed), NOT fail-open.
+        let mut log = OverlapLinkLog::default();
+        assert!(
+            !log.finalize(true, dep(None, Some(42))),
+            "unresolved producer link must fail CLOSED (cascade-abort), never commit"
+        );
+    }
+
+    #[test]
+    fn overlap_log_chained_cascade_propagates_whole_run() {
+        // The realistic multi-step overlap: t aborts → t+1 cascade-aborts → its
+        // produced link is Aborted → t+2 cascade-aborts → … the poison propagates
+        // the WHOLE dependent chain (delta's ≥3-in-flight gate), no hop stops short.
+        let mut log = OverlapLinkLog::default();
+        assert!(!log.finalize(false, dep(Some(1), None))); // t aborts (link 1)
+        // t+1: consumes 1 (poisoned) AND produces 2 → cascades, publishes 2=Aborted.
+        assert!(!log.finalize(true, dep(Some(2), Some(1))));
+        // t+2: consumes 2 (poisoned) AND produces 3 → cascades, publishes 3=Aborted.
+        assert!(!log.finalize(true, dep(Some(3), Some(2))));
+        // t+3: consumes 3 (poisoned) → still cascades. The whole chain is poisoned.
+        assert!(!log.finalize(true, dep(None, Some(3))));
+        assert!(log.is_empty());
+    }
+
+    #[test]
+    fn overlap_log_independent_passes_commit() {
+        // A pass that is neither producer nor consumer is unaffected.
+        let mut log = OverlapLinkLog::default();
+        assert!(log.finalize(true, dep(None, None)));
+        // A driver-failed pass with no overlap deps still reports its own failure.
+        assert!(!log.finalize(false, dep(None, None)));
+    }
+
+    #[test]
+    fn overlap_log_clear_drops_terminal_entry() {
+        // A terminal producer (no consumer) lingers until `clear()` (fresh generate).
+        let mut log = OverlapLinkLog::default();
+        assert!(log.finalize(true, dep(Some(9), None))); // terminal producer, link 9
+        assert!(!log.is_empty());
+        log.clear();
+        assert!(log.is_empty());
+    }
+
+    #[test]
+    fn apply_carrier_reports_produced_and_consumed_links() {
+        // The deps the write-log consumes: producer role → `produced`, matching
+        // consumer → `consumed`, context-mismatch → NOT consumed (no dependency).
+        let mut pending: Option<PendingNextInput> = None;
+        let mut counter: u32 = 0;
+        const CTX: u32 = 7;
+
+        // Pass t: pure producer (no prior carry) → produced=Some(1), consumed=None.
+        let mut req_t = ForwardRequest::default();
+        req_t.token_ids = vec![1, 2];
+        let d_t = apply_next_input_carrier(&mut pending, &mut counter, &mut req_t, &[5], CTX);
+        assert_eq!(d_t, dep(Some(1), None));
+
+        // Pass t+1: consumes t's carry (same ctx) AND produces → consumed=Some(1),
+        // produced=Some(2).
+        let mut req_t1 = ForwardRequest::default();
+        req_t1.token_ids = vec![3];
+        let d_t1 = apply_next_input_carrier(&mut pending, &mut counter, &mut req_t1, &[0], CTX);
+        assert_eq!(d_t1, dep(Some(2), Some(1)));
+
+        // Pass on a DIFFERENT context: the carry is dropped (freed, not injected) →
+        // NOT a dependency (consumed stays None).
+        let mut req_x = ForwardRequest::default();
+        req_x.token_ids = vec![9];
+        let d_x = apply_next_input_carrier(&mut pending, &mut counter, &mut req_x, &[], 999);
+        assert_eq!(d_x, dep(None, None));
     }
 }

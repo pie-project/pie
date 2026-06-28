@@ -62,6 +62,11 @@ pub struct InstanceState {
     /// global monotonic link-id source. See [`crate::api::next_input_map`].
     pub(crate) pending_next_input: Option<crate::api::next_input_map::PendingNextInput>,
     pub(crate) next_input_link_counter: u32,
+    /// #23 overlap abort-isolation write-log: tracks each in-flight producer
+    /// link's resolved outcome so a consumer's finalize cascade-aborts if the
+    /// producer it injected from aborted (fail-closed on unresolved). Cleared at
+    /// each fresh `generate()` boundary.
+    pub(crate) overlap_links: crate::api::next_input_map::OverlapLinkLog,
 }
 
 impl Drop for InstanceState {
@@ -190,6 +195,8 @@ impl InstanceState {
             // `next-inputs`).
             pending_next_input: None,
             next_input_link_counter: 0,
+            // #23 overlap abort-isolation write-log (empty until a producer pass).
+            overlap_links: crate::api::next_input_map::OverlapLinkLog::default(),
         })
     }
 
