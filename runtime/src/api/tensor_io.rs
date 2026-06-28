@@ -279,15 +279,19 @@ fn fastpath_kind(kind: &OutputKind) -> Option<(Vec<u32>, Dtype, usize)> {
 pub fn populate_output_fastpath(
     req: &mut ForwardRequest,
     programs_output_kinds: &[Vec<OutputKind>],
+    programs_output_elem_counts: &[Vec<u32>],
 ) -> Vec<PinnedOutput> {
-    // Eligible iff exactly one declared output, and it is a `Token` — the only
-    // shape the driver eager-D2H MVP fills (`pi.sampled[N-1]` → the single dst).
+    // Eligible iff exactly one declared output, a `Token`, with elem_count == 1 —
+    // the only shape the driver eager-D2H MVP fills (`pi.sampled[N-1]`, a single
+    // i32). A `[k]`-Token (elem_count > 1), multi-output, or non-`Token` output
+    // must take the rich path, where the `r×o×k` marshal handles the shape.
     let total: usize = programs_output_kinds.iter().map(|p| p.len()).sum();
     let single_token = total == 1
         && programs_output_kinds
             .iter()
             .flatten()
-            .all(|k| matches!(k, OutputKind::Token));
+            .all(|k| matches!(k, OutputKind::Token))
+        && programs_output_elem_counts.iter().flatten().all(|&n| n == 1);
     if !single_token {
         return Vec::new();
     }
@@ -334,6 +338,7 @@ pub fn populate_output_fastpath(
 pub fn populate_output_fastpath(
     _req: &mut ForwardRequest,
     _programs_output_kinds: &[Vec<OutputKind>],
+    _programs_output_elem_counts: &[Vec<u32>],
 ) -> Vec<PinnedOutput> {
     Vec::new()
 }

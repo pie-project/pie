@@ -38,6 +38,11 @@ pub struct CachedProgram {
     pub hash: u64,
     /// Per-output marshaling kinds, in declared order (host response routing).
     pub output_kinds: Vec<OutputKind>,
+    /// Per-output element count (`ValueType.shape.numel()`), in declared order.
+    /// `1` for a scalar/single-`Token`, `k` for a `[k]`-Token / `[k]` vector
+    /// output. Drives the shape-aware marshal (`[k]`-Token routing) and the
+    /// fast-path eligibility gate (single-`[1]`-Token only).
+    pub output_elem_counts: Vec<u32>,
     /// Declared input-slot count (binding-arity check at attach).
     pub num_inputs: usize,
     /// Per-input-slot readiness (`Submit`/`Late`), in `Op::Input(i)` order, from
@@ -77,10 +82,15 @@ impl ProgramCache {
         // Cold path only: derive the per-output marshaling kinds (re-validates,
         // but `program` is already decode-validated so this cannot fail here).
         let output_kinds = pie_sampling_ir::output_kinds(program)?;
+        let output_elem_counts = pie_sampling_ir::output_types(program)?
+            .iter()
+            .map(|t| t.shape.numel() as u32)
+            .collect();
         let entry = Arc::new(CachedProgram {
             bytecode,
             hash,
             output_kinds,
+            output_elem_counts,
             num_inputs: program.inputs.len(),
             input_readiness: program.inputs.iter().map(|i| i.ready).collect(),
         });
