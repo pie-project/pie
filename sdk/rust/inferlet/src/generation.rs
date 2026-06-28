@@ -51,6 +51,25 @@ enum SpecMode {
     Custom(Box<dyn Speculator>),
 }
 
+/// Draft block size for `SpecMode::System` greedy speculation (v0). The MTP
+/// drafter proposes this many tokens per propose-forward; the verify reads a
+/// `[k, vocab]` target matrix over them. A v1 nicety makes this adaptive.
+const SPEC_DRAFT_LEN: usize = 4;
+
+/// Result of an instrumented speculative run
+/// ([`Generator::collect_tokens_speculative_instrumented`]): the token stream
+/// plus the per-block accepted-token counts (the v0 accept-rate measurement —
+/// LOG, do not gate). A low block-2+ accept rate indicates a stale drafter MTP
+/// cache (the de-hardwired loop bypasses the native `commit_verified_prefix`),
+/// quantifying the v1 cache-sync perf opportunity; the OUTPUT is token-identical
+/// to plain greedy regardless (the verify reads the main model, cache-independent).
+pub struct SpecRun {
+    /// The full generated token stream (== plain greedy — lossless).
+    pub tokens: Vec<u32>,
+    /// Accepted-token count per verify block, in order.
+    pub block_accept_lens: Vec<usize>,
+}
+
 // =============================================================================
 // Generator
 // =============================================================================
@@ -85,6 +104,13 @@ pub struct Generator<'ctx> {
     /// prime/first pass so the host drops any carrier left pending on this
     /// context by a prior generate (the stop-terminal residual).
     fresh_generate: bool,
+    /// TEST/VALIDATION hook (#31): when set, the `SpecMode::System` loop draws
+    /// each block's drafts from this closure `(anchor, tokens_generated) ->
+    /// drafts` INSTEAD of the MTP drafter (`propose_drafts`). Lets the KV/commit
+    /// choreography + losslessness be validated on a drafter-less model (e.g.
+    /// qwen3-0.6b) with host-constructed drafts — the output must stay
+    /// token-identical-to-greedy whatever the injected drafts. Unset in production.
+    spec_draft_inject: Option<Box<dyn FnMut(u32, usize) -> Vec<u32>>>,
 }
 
 impl<'ctx> Generator<'ctx> {
@@ -108,6 +134,7 @@ impl<'ctx> Generator<'ctx> {
             rebid_each_step: true,
             done: false,
             fresh_generate: true,
+            spec_draft_inject: None,
         }
     }
 
@@ -167,6 +194,18 @@ impl<'ctx> Generator<'ctx> {
         if matches!(self.speculation, SpecMode::System) {
             self.speculation = SpecMode::None;
         }
+        self
+    }
+
+    /// **TEST/VALIDATION hook (#31).** Override the `SpecMode::System` loop's
+    /// draft source: each block's drafts come from `f(anchor, tokens_generated)`
+    /// instead of the MTP drafter (`pass.draft_output`). Lets the KV/commit
+    /// choreography + losslessness be exercised on a drafter-less model (e.g.
+    /// qwen3-0.6b) with host-constructed drafts — the output MUST stay
+    /// token-identical-to-greedy whatever the injected drafts (the verify reads
+    /// the main model, so it corrects any draft). NOT for production use.
+    pub fn inject_spec_drafts<F: FnMut(u32, usize) -> Vec<u32> + 'static>(mut self, f: F) -> Self {
+        self.spec_draft_inject = Some(Box::new(f));
         self
     }
 
@@ -620,6 +659,191 @@ impl<'ctx> Generator<'ctx> {
             crate::program::resolve_bindings(template, host_inputs, &[decode_pos], submit_values)?;
         pass.sampler(program, bindings);
         Ok(())
+    }
+
+    // ── Host-driven greedy speculation (`SpecMode::System`, #31) ─────────
+    //
+    // Single-role ALTERNATING loop: a propose-forward (the MTP drafter fires,
+    // its `[k]` drafts read host-side via the non-IR draft-output slot) then a
+    // verify-forward (`mtp_self_spec_greedy` over the refed drafts → the accepted
+    // set incl. the target correction). They cannot share a forward — the IR
+    // verify rich-returns at the executor's `:4123` before the drafter at
+    // `:4459` (the v1 fused 1-forward path conditions that return). v0 is
+    // host-mediated: forward-(N−1)'s drafts reach forward-N's `pi.tokens` via the
+    // host refeed, and the verify binds them device-side (`SelfSpecDraftInput` →
+    // `pi.tokens + sample_row + 1`, echo's resolver).
+
+    /// Run host-driven greedy speculation to completion; return the full token
+    /// stream (== plain greedy — lossless). Opt-in terminal (the caller selects
+    /// it after [`system_speculation`](Self::system_speculation)); `collect_tokens`
+    /// keeps its non-speculative behavior until the default-path dispatch is wired.
+    pub async fn collect_tokens_speculative(self) -> Result<Vec<u32>> {
+        Ok(self.collect_tokens_speculative_instrumented().await?.tokens)
+    }
+
+    /// Like [`collect_tokens_speculative`](Self::collect_tokens_speculative) but
+    /// also returns the per-block accepted-token counts ([`SpecRun::block_accept_lens`])
+    /// — the v0 accept-rate INSTRUMENT (measure, do NOT gate). A low block-2+
+    /// accept rate indicates a stale drafter MTP cache (the de-hardwired loop
+    /// bypasses `commit_verified_prefix`) → quantifies the v1 cache-sync perf
+    /// opportunity; the OUTPUT stays token-identical-to-greedy regardless (the
+    /// verify reads the main model, cache-independent).
+    pub async fn collect_tokens_speculative_instrumented(mut self) -> Result<SpecRun> {
+        let mut tokens = Vec::new();
+        let mut block_accept_lens = Vec::new();
+
+        // Cold-start prime: commit all but the LAST pending token; the last is the
+        // first block's `anchor` (kept UNCOMMITTED, fed fresh by the first verify
+        // as its query-0 — echo's `sample_row`). This makes cold-start uniform with
+        // the steady state, where the correction `t_j` likewise rolls over as the
+        // next anchor.
+        let pending = std::mem::take(&mut self.ctx.buffer);
+        if pending.is_empty() {
+            return Ok(SpecRun { tokens, block_accept_lens });
+        }
+        let (prime, anchor_slice) = pending.split_at(pending.len() - 1);
+        let mut anchor = anchor_slice[0];
+        if !prime.is_empty() {
+            let mut pass = self.ctx.forward();
+            pass.input(prime);
+            pass.execute().await?; // no-sampler fill: commit the prompt prefix
+        }
+        let mut drafts = self.propose_drafts(anchor).await?;
+
+        while !self.is_done() {
+            let start = self.ctx.seq_len();
+            // Verify the proposed block. `verify_block` feeds `[anchor, d0..d_{k-1}]`
+            // (AUTO, page-reserving) and commits all k+1; the accept set is the
+            // matching draft prefix PLUS the target correction `t_j` at the reject
+            // boundary (A2), or all k drafts on all-accept. Always ≥1 → never stalls.
+            let accept_set = self.verify_block(anchor, &drafts).await?;
+            // Apply stop / max-tokens and advance counters WITHOUT re-staging into
+            // `ctx.buffer` (the accepted drafts are already device-resident — the
+            // existing `accept()` would double-feed them on the next forward).
+            let kept = self.clamp_accept(&accept_set);
+            block_accept_lens.push(kept.len());
+            tokens.extend_from_slice(&kept);
+
+            // Commit only `[anchor, kept-except-last]` (= `kept.len()` rows at
+            // `start..start+kept.len()`); TRUNCATE the rest — the rejected draft
+            // suffix AND the last kept token, which is the next anchor (the
+            // correction `t_j` on a reject — NOT in this verify's KV — or the last
+            // draft on all-accept), re-fed fresh by the next verify. This rollback
+            // is what makes the committed sequence draft-length-independent
+            // (lossless-spec invariant).
+            let keep_to = start + kept.len() as u32;
+            let cur = self.ctx.seq_len(); // start + (k+1)
+            if cur > keep_to {
+                self.ctx.truncate(cur - keep_to);
+            }
+
+            // Drain (R9): a terminating step proposes no successor; the unverified
+            // trailing drafts are already truncated, any pending carrier closed
+            // host-side (#23/#26).
+            if kept.is_empty() || self.is_done() {
+                break;
+            }
+
+            anchor = *kept.last().expect("kept non-empty");
+            drafts = self.propose_drafts(anchor).await?;
+        }
+        Ok(SpecRun { tokens, block_accept_lens })
+    }
+
+    /// Verify a block of `k` MTP drafts against the target's greedy decode in one
+    /// matrix pass ([`mtp_self_spec_greedy`]): feed `[anchor, d0..d_{k-1}]` as
+    /// AUTO inputs (page-reserving), attach the verify program (the draft slot
+    /// auto-binds `SelfSpecDraftInput` → the resolver source-selects
+    /// `pi.tokens + sample_row + 1`, no host upload — the ballast fills the
+    /// positional slot), and return the **accept set** (the sentinel-truncated
+    /// `[k]`-Token output: accepted drafts + the boundary correction `t_j`, A2).
+    ///
+    /// Commits all `k+1` written tokens; the caller commits only `[anchor,
+    /// accepted-prefix]` and `truncate`s the rest (the lossless-spec invariant).
+    async fn verify_block(&mut self, anchor: u32, drafts: &[u32]) -> Result<Vec<u32>> {
+        let k = drafts.len() as u32;
+        let vocab = crate::model::output_vocab_size();
+        let (built, _keys) = sampling_edsl::program::mtp_self_spec_greedy(vocab, k)
+            .map_err(|e| format!("verify_block: build mtp_self_spec_greedy: {e:?}"))?;
+        let program = crate::emit::emit_program(&built.program)
+            .map_err(|e| format!("verify_block: emit: {e}"))?;
+
+        let mut pass = self.ctx.forward();
+        let start = pass.start_position(); // = seq_len (the anchor's fresh row)
+        // Feed [anchor, d0..d_{k-1}] as AUTO so `prepare_write(k+1)` RESERVES KV
+        // pages — `input_at` does NOT (`n_write` counts only auto inputs,
+        // forward.rs:456). The anchor is query 0 → echo's DYNAMIC `sample_row =
+        // h_qo[0]+h_sidx[0] = start`; the resolver binds the draft at
+        // `pi.tokens + sample_row + 1` = `start+1..=start+k` (the k drafts). The k
+        // matrix logit rows are the first k queries `start..=start+k-1` (anchor +
+        // first k-1 drafts); their per-row argmax predicts d0..d_{k-1}, compared
+        // device-side to the aliased draft.
+        let mut inp = Vec::with_capacity(drafts.len() + 1);
+        inp.push(anchor);
+        inp.extend_from_slice(drafts);
+        pass.input(&inp);
+        let positions: Vec<u32> = (0..k).map(|i| start + i).collect();
+        let bindings =
+            crate::program::resolve_bindings(&built.bindings, &built.host_inputs, &positions, &[])?;
+        let handles = pass.sampler(&program, bindings, built.outputs.len() as u32);
+        let out = pass.execute().await?;
+        // A2: the whole sentinel-truncated output IS the accept set (accepted
+        // drafts + the boundary correction `t_j` on a reject, or all k drafts on
+        // all-accept).
+        out.tokens(handles[0])
+            .await
+            .map_err(|e| format!("verify_block: read accept set: {e}").into())
+    }
+
+    /// Propose the next `SPEC_DRAFT_LEN` drafts from `anchor`: feed it as a
+    /// NON-advancing drafter-fire (`defer_commit` — the verify re-feeds + commits
+    /// the anchor as its query-0), fire the MTP drafter via the non-IR
+    /// `pass.draft_output(k)` slot (NO sampler → the propose forward flows past
+    /// the rich `:4123` return to the drafter at `:4459`), and read its `[k]`
+    /// drafts host-side.
+    ///
+    /// Requires a drafter-capable model (gemma4-MTP / qwen3.5) — the milestone's
+    /// core claim is "the MTP head is the draft source". On a NULL-drafter model
+    /// the slot yields zeros: the loop then full-rejects every block and still
+    /// emits plain greedy via the `t_j` corrections, but exercises no real
+    /// speculation (so a real-drafts e2e gate needs a drafter snapshot).
+    async fn propose_drafts(&mut self, anchor: u32) -> Result<Vec<u32>> {
+        // Test/validation hook: host-supplied drafts in place of the MTP drafter
+        // (drives the KV/commit + losslessness gate on a drafter-less model).
+        let pos = self.tokens_generated;
+        if let Some(f) = self.spec_draft_inject.as_mut() {
+            return Ok(f(anchor, pos));
+        }
+        let k = SPEC_DRAFT_LEN as u32;
+        let mut pass = self.ctx.forward();
+        pass.defer_commit(); // throwaway drafter-fire: the verify re-feeds the anchor
+        pass.input(&[anchor]);
+        let h = pass.draft_output(k);
+        let out = pass.execute().await?;
+        out.tokens(h).await
+    }
+
+    /// Apply stop-token / max-tokens truncation to a speculative accept set and
+    /// advance the generator's counters, WITHOUT staging into `ctx.buffer` — the
+    /// accepted drafts are already device-resident (committed by the verify
+    /// forward) and the next anchor is fed explicitly, so re-staging would
+    /// double-feed them. Returns the kept prefix (this block's output tokens).
+    fn clamp_accept(&mut self, accept_set: &[u32]) -> Vec<u32> {
+        let mut kept = accept_set.to_vec();
+        if let Some(pos) = kept.iter().position(|t| self.stop.contains(t)) {
+            kept.truncate(pos);
+            self.done = true;
+        }
+        if let Some(max) = self.max_tokens {
+            let remaining = max.saturating_sub(self.tokens_generated);
+            if kept.len() > remaining {
+                kept.truncate(remaining);
+                self.done = true;
+            }
+        }
+        self.tokens_generated += kept.len();
+        self.constraint_pending.extend_from_slice(&kept);
+        kept
     }
 }
 

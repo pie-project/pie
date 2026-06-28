@@ -426,6 +426,20 @@ pub struct ForwardRequest {
     /// per row for the merged per-row gather (`[N, len]`) without coupling to the
     /// program's `InputDecl`/dtype (`elem_count` × dtype) to derive it.
     pub sampling_late_device_lens: Vec<u32>,
+
+    /// #31 self-spec greedy-v0: per-request **drafter-filled `[k]`-Token output**
+    /// declaration. `spec_draft_output_k[r] = k` ⇒ request `r` carries one
+    /// drafter-populated `[k]`-Token output (the MTP self-spec draft, NOT an IR
+    /// program — `0` ⇒ none). On the propose-forward (`output_spec_flags[r]` ⇒
+    /// `need_msgpack`), the driver appends this output **LAST** to request `r`'s
+    /// `program_tokens` (`draft_seg = program_tokens.size()`, after any IR-program
+    /// outputs, mirrored by the runtime's pseudo-output append for seg-consistency)
+    /// and fills it from the drafter's proposal `spec_tokens@922[..k]` — NEVER
+    /// `pi.tokens`/`pi.sampled` (delta's witness-independence: the draft `D` must be
+    /// a buffer distinct from the verify-forward's `pi.tokens` read). The inferlet
+    /// reads it via `out.tokens(draft_handle)` (the landed #32 `program_tokens`
+    /// CSR). Parallel to `output_spec_flags` (one entry per request).
+    pub spec_draft_output_k: Vec<u32>,
 }
 
 /// Per-slot sampler kind discriminants. Carried on the wire as the `u8`
