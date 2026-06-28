@@ -285,6 +285,70 @@ const MAX_IN_FLIGHT: usize = 2;
 /// completion channel preempts the wait the instant a batch actually finishes.
 const MIN_POLL_US: u64 = 50;
 
+/// Default per-fire cost estimate (seconds) for the #10 accumulation cost model
+/// — a conservative placeholder until delta's #11 3-regime load-test quantifies
+/// it (compile µs/program, fire µs/program, dedup/M-batch collapse). ~0.5 ms.
+const DEFAULT_PER_FIRE_S: f64 = 0.0005;
+
+/// Pluggable merged-fire cost model for the #10 accumulation decision (the
+/// uniqueness-aware coalescing price). echo's merged scatter fires once per
+/// program; #11 dedup collapses the *compile* and echo's identical-bytecode
+/// M-batch collapses the *fire*. So **post-{dedup ∧ M-batch}** the cost is
+/// `O(distinct programs)`, but the **landed** scatter is still `O(total
+/// requests)` (identical programs fire sequentially). The policy keys
+/// accumulation on this so it never blindly accumulates unique programs into the
+/// `O(R)` fire wall, yet accumulates identical programs near-free once they
+/// collapse. Coefficients calibrate from delta's load-test post-#11.
+#[derive(Clone, Copy, Debug)]
+struct MergedFireCost {
+    /// Per-fire cost (seconds). Placeholder; calibrated from delta's #11 regimes.
+    per_fire_s: f64,
+    /// Whether identical-bytecode programs collapse to one fire (echo's M-batch +
+    /// #11 dedup). `false` today (landed scatter fires `R_total` sequentially) ⇒
+    /// cost is uniqueness-BLIND; `true` post-M-batch ⇒ cost is per-DISTINCT.
+    coalesces_identical: bool,
+}
+
+impl MergedFireCost {
+    /// Conservative placeholder matching the LANDED scatter: uniqueness-blind,
+    /// `O(total requests)` fires. Flips `coalesces_identical = true` once echo's
+    /// M-batch + #11 dedup land and delta's load-test calibrates `per_fire_s`.
+    const fn placeholder() -> Self {
+        Self { per_fire_s: DEFAULT_PER_FIRE_S, coalesces_identical: false }
+    }
+
+    /// Estimated number of GPU fires a batch of `total_requests` spanning
+    /// `distinct_programs` distinct sampler programs costs. (Distinct-program
+    /// count plumbing into the policy is a follow-up that lands with echo's
+    /// M-batch; until then the conservative path uses `total_requests`.)
+    fn fire_count(&self, total_requests: usize, distinct_programs: usize) -> usize {
+        if self.coalesces_identical {
+            distinct_programs.clamp(1, total_requests.max(1))
+        } else {
+            total_requests.max(1)
+        }
+    }
+}
+
+/// The #10 adaptive accumulation window (the hard p99 latency cap on how long the
+/// cold/idle path waits to co-batch concurrent requests), read once from
+/// `PIE_SCHED_ACCUM_WINDOW_US`. Default unset → `ZERO` → today's fire-on-arrival
+/// (no production behavior change until enabled + #10-verify proves no
+/// common-path regression). Distinct from the FIXED test env-hold
+/// `PIE_SCHED_ACCUM_HOLD_US` (run-loop, blind wait) — this one is ADAPTIVE: it
+/// fires immediately under low arrival rate.
+fn accum_window_from_env() -> Duration {
+    use std::sync::OnceLock;
+    static WINDOW: OnceLock<Duration> = OnceLock::new();
+    *WINDOW.get_or_init(|| {
+        std::env::var("PIE_SCHED_ACCUM_WINDOW_US")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .map(Duration::from_micros)
+            .unwrap_or(Duration::ZERO)
+    })
+}
+
 #[allow(dead_code)] // wired into `run()` when the fire path goes non-blocking.
 pub(super) struct RunAheadPolicy {
     /// Structural cap — a full batch always fires immediately.
@@ -300,6 +364,18 @@ pub(super) struct RunAheadPolicy {
     /// Forwards observed completing — the first latency is unrepresentative
     /// (cold start) and is skipped from the EWMA.
     forwards_completed: usize,
+    /// #10 adaptive accumulation window (p99 latency cap). `ZERO` ⇒ fire-on-arrival.
+    accum_window: Duration,
+    /// Last request arrival instant — feeds the inter-arrival EWMA.
+    last_arrival: Option<Instant>,
+    /// EWMA of inter-arrival time (seconds). Short (high arrival rate) ⇒ co-batch;
+    /// long/sparse ⇒ fire immediately (the low-concurrency no-regression path).
+    inter_arrival_ewma: f64,
+    /// When the current (not-yet-fired) batch began accumulating — bounds the
+    /// accumulation wait to `accum_window`. Reset on fire.
+    accumulating_since: Option<Instant>,
+    /// Pluggable merged-fire cost model (uniqueness-aware coalescing price).
+    fire_cost: MergedFireCost,
 }
 
 #[allow(dead_code)]
@@ -311,6 +387,11 @@ impl RunAheadPolicy {
             lead_time: 0.0,
             in_flight: VecDeque::new(),
             forwards_completed: 0,
+            accum_window: accum_window_from_env(),
+            last_arrival: None,
+            inter_arrival_ewma: 0.0,
+            accumulating_since: None,
+            fire_cost: MergedFireCost::placeholder(),
         }
     }
 
@@ -322,10 +403,73 @@ impl RunAheadPolicy {
             RUN_AHEAD_EWMA_ALPHA * sample + (1.0 - RUN_AHEAD_EWMA_ALPHA) * prev
         }
     }
+
+    /// #10 adaptive accumulation window (the cold/idle path, where no in-flight
+    /// batch provides a natural overlap window). Returns `Wait` ONLY when the EWMA
+    /// arrival rate predicts another request within the remaining latency budget
+    /// AND the merged-fire cost still justifies a larger batch; otherwise `Fire`.
+    /// Low concurrency / sparse arrivals fire immediately — the common-path
+    /// no-latency-regression guarantee (the #10-verify bar).
+    fn accumulation_decision(&self, current_forward_requests: usize) -> Decision {
+        // Disabled (default, env unset) ⇒ today's fire-on-arrival, byte-for-byte.
+        if self.accum_window.is_zero() {
+            return Decision::Fire;
+        }
+        // Capacity cap — a full batch fires now.
+        if current_forward_requests >= self.max_forward_requests {
+            return Decision::Fire;
+        }
+        // Cost cap: stop once the batch's estimated fire cost would itself exceed
+        // the window budget. With the conservative placeholder (uniqueness-blind,
+        // `O(total)`) this caps blind accumulation of unique programs at the fire
+        // wall; post-M-batch (per-distinct) identical programs accumulate near-free.
+        // (Distinct-program-count plumbing lands with echo's M-batch; today the
+        // conservative bound uses `current_forward_requests` for both.)
+        let fires = self
+            .fire_cost
+            .fire_count(current_forward_requests, current_forward_requests);
+        if Duration::from_secs_f64(fires as f64 * self.fire_cost.per_fire_s) >= self.accum_window {
+            return Decision::Fire;
+        }
+        let now = Instant::now();
+        let elapsed = self
+            .accumulating_since
+            .map(|s| now.saturating_duration_since(s))
+            .unwrap_or_default();
+        // p99 latency cap reached ⇒ fire.
+        if elapsed >= self.accum_window {
+            return Decision::Fire;
+        }
+        // No arrival-rate estimate yet (cold / first request) ⇒ fire (no regression).
+        if self.inter_arrival_ewma <= 0.0 {
+            return Decision::Fire;
+        }
+        let remaining = self.accum_window - elapsed;
+        let next_eta = Duration::from_secs_f64(self.inter_arrival_ewma);
+        // Sparse: the next request won't arrive within the budget ⇒ no batching
+        // benefit ⇒ fire now (the low-concurrency common path).
+        if next_eta >= remaining {
+            return Decision::Fire;
+        }
+        // Benefit: another request likely arrives within the window ⇒ accumulate,
+        // waking at the predicted arrival (bounded by the remaining window).
+        Decision::Wait(next_eta.min(remaining).max(Duration::from_micros(MIN_POLL_US)))
+    }
 }
 
 impl SchedulingPolicy for RunAheadPolicy {
-    fn on_arrival(&mut self) {}
+    fn on_arrival(&mut self) {
+        let now = Instant::now();
+        if let Some(prev) = self.last_arrival {
+            self.inter_arrival_ewma = Self::ewma(
+                self.inter_arrival_ewma,
+                now.saturating_duration_since(prev).as_secs_f64(),
+            );
+        }
+        self.last_arrival = Some(now);
+        // First arrival of a fresh batch opens the accumulation window.
+        self.accumulating_since.get_or_insert(now);
+    }
 
     fn on_complete(&mut self, latency: Duration) {
         self.forwards_completed += 1;
@@ -359,6 +503,8 @@ impl SchedulingPolicy for RunAheadPolicy {
             base
         };
         self.in_flight.push_back(est);
+        // The accumulated batch fired; the next batch opens a fresh window.
+        self.accumulating_since = None;
     }
 
     fn decide(&mut self, current_forward_requests: usize) -> Decision {
@@ -383,9 +529,10 @@ impl SchedulingPolicy for RunAheadPolicy {
         // `collection_complete == now` for a non-empty batch (MVP), so
         //   fire_at = max(earliest_in_flight_completion - lead_time, now).
         let Some(&completion) = self.in_flight.front() else {
-            // Nothing in flight (or cold) -> the in-flight term is absent;
-            // collection dominates -> fire now.
-            return Decision::Fire;
+            // Nothing in flight: the run-ahead overlap term is absent. Rather than
+            // fire-on-arrival (which splits concurrent requests into R=1), apply the
+            // #10 adaptive accumulation window (cold/idle path).
+            return self.accumulation_decision(current_forward_requests);
         };
         let now = Instant::now();
         let lead = Duration::from_secs_f64(self.lead_time);
@@ -474,6 +621,73 @@ mod run_ahead_tests {
         policy.on_complete(Duration::from_secs(1)); // earliest completes -> pops front
         // Capacity freed -> a full batch fires.
         assert!(matches!(policy.decide(512), Decision::Fire));
+    }
+
+    // ── #10 adaptive accumulation window ────────────────────────────────────
+
+    #[test]
+    fn accum_window_disabled_fires_on_arrival() {
+        // Default (window ZERO) ⇒ no accumulation ⇒ today's fire-on-arrival.
+        let mut p = RunAheadPolicy::new(512);
+        p.accum_window = Duration::ZERO;
+        p.on_arrival();
+        assert!(matches!(p.decide(1), Decision::Fire));
+    }
+
+    #[test]
+    fn accum_window_low_concurrency_fires_immediately() {
+        // The common-path no-regression guarantee: cold (no estimate) and sparse
+        // (inter-arrival >> window) both fire immediately, no added latency.
+        let mut p = RunAheadPolicy::new(512);
+        p.accum_window = Duration::from_millis(5);
+        p.accumulating_since = Some(Instant::now());
+        // cold: no arrival-rate estimate yet ⇒ fire
+        assert!(matches!(p.decide(1), Decision::Fire));
+        // sparse: 1s inter-arrival ⇒ no request within the 5ms budget ⇒ fire
+        p.inter_arrival_ewma = 1.0;
+        assert!(matches!(p.decide(1), Decision::Fire));
+    }
+
+    #[test]
+    fn accum_window_high_concurrency_accumulates() {
+        // Dense arrivals (inter-arrival << window) + window open ⇒ Wait to co-batch.
+        let mut p = RunAheadPolicy::new(512);
+        p.accum_window = Duration::from_millis(50);
+        p.inter_arrival_ewma = 0.0005; // 0.5ms << 50ms window
+        p.accumulating_since = Some(Instant::now());
+        assert!(matches!(p.decide(2), Decision::Wait(_)));
+    }
+
+    #[test]
+    fn accum_window_capacity_cap_fires() {
+        // A full batch fires immediately despite dense arrivals.
+        let mut p = RunAheadPolicy::new(4);
+        p.accum_window = Duration::from_millis(50);
+        p.inter_arrival_ewma = 0.0005;
+        p.accumulating_since = Some(Instant::now());
+        assert!(matches!(p.decide(4), Decision::Fire));
+    }
+
+    #[test]
+    fn accum_window_cost_cap_fires() {
+        // Conservative (uniqueness-blind) fire cost caps blind accumulation: once
+        // total_requests × per_fire ≥ window, fire (don't pay the O(R) fire wall).
+        let mut p = RunAheadPolicy::new(512);
+        p.accum_window = Duration::from_millis(5); // 5ms / 0.5ms-per-fire ⇒ 10
+        p.inter_arrival_ewma = 0.0005;
+        p.accumulating_since = Some(Instant::now());
+        assert!(matches!(p.decide(10), Decision::Fire)); // at the cost wall
+        assert!(matches!(p.decide(2), Decision::Wait(_))); // below it ⇒ accumulate
+    }
+
+    #[test]
+    fn accum_window_p99_cap_fires() {
+        // Window (p99 latency) budget exhausted ⇒ fire even under dense arrivals.
+        let mut p = RunAheadPolicy::new(512);
+        p.accum_window = Duration::from_millis(5);
+        p.inter_arrival_ewma = 0.0005;
+        p.accumulating_since = Instant::now().checked_sub(Duration::from_millis(20));
+        assert!(matches!(p.decide(2), Decision::Fire));
     }
 }
 
