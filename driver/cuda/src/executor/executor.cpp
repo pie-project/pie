@@ -1,4 +1,5 @@
 #include "executor/executor.hpp"
+#include "executor/graph_variant.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -197,6 +198,10 @@ int greedy_argmax_parts(int vocab) {
     }
     return vocab >= 131072 ? 8 : 1;
 }
+
+// #24 graph-variant bitfield helper: `make_graph_variant()` + the named flag
+// constants + the boundary static_asserts now live in
+// "executor/graph_variant.hpp" (so they're unit-testable host-side).
 
 int mtp_argmax_parts(int vocab) {
     static const int forced = [] {
@@ -1588,10 +1593,10 @@ std::size_t capture_forward_graph_lattice(Executor& executor) {
         const std::uint32_t graph_layout =
             executor.forward_fn.invoke_graph_layout();
         const std::uint32_t graph_variant =
-            (tp_greedy_argmax ? 1u : 0u) |
-            (single_gpu_graph_argmax ? 2u : 0u) |
-            (fwd_handles_argmax_precapture ? 4u : 0u) |
-            (graph_layout << 3);
+            make_graph_variant(tp_greedy_argmax, single_gpu_graph_argmax,
+                               fwd_handles_argmax_precapture,
+                               /*small_spec=*/false, /*rs_verify=*/false,
+                               graph_layout);
         const ForwardGraphKey key{R, N, graph_variant};
         if (executor.graph_cache->get(key) != nullptr) continue;
 
@@ -2158,16 +2163,13 @@ ForwardDispatchResult run_forward_dispatch(
         graph_single_gpu_argmax_enabled();
     const bool rs_verify_frozen =
         executor.rs_cache != nullptr && executor.rs_cache->verify_frozen();
-    const std::uint32_t graph_variant =
-        (in.tp_greedy_argmax ? 1u : 0u) |
-        (out.graph_captures_single_gpu_argmax ? 2u : 0u) |
-        (in.forward_handles_argmax ? 4u : 0u) |
-        (out.graph_layout << 3) |
-        (in.small_spec_graph_shape ? 0x200u : 0u) |
+    const std::uint32_t graph_variant = make_graph_variant(
+        in.tp_greedy_argmax, out.graph_captures_single_gpu_argmax,
+        in.forward_handles_argmax, in.small_spec_graph_shape,
         // Frozen verify skips the GDN state writeback, baked into the captured
         // kernel — must not share a graph with a normal-writeback forward of
         // the same shape.
-        (rs_verify_frozen ? 0x400u : 0u);
+        rs_verify_frozen, out.graph_layout);
 
     if (try_graphs) {
         const ForwardGraphKey key{in.forward_R, in.forward_N, graph_variant};
@@ -4388,8 +4390,9 @@ void tp_follower_serve(Executor& executor, std::atomic<bool>& stop) {
         const std::uint32_t graph_layout =
             executor.forward_fn.invoke_graph_layout();
         const std::uint32_t graph_variant =
-            (tp_greedy_argmax ? 1u : 0u) |
-            (graph_layout << 3);
+            make_graph_variant(tp_greedy_argmax, /*single_gpu=*/false,
+                               /*fwd_handles=*/false, /*small_spec=*/false,
+                               /*rs_verify=*/false, graph_layout);
         if (try_graphs) {
             const ForwardGraphKey key{R, N, graph_variant};
             cudaGraphExec_t exec = executor.graph_cache->get(key);

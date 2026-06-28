@@ -642,6 +642,15 @@ target_include_directories(test_sampling_ir_reader PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/src
   ${CMAKE_CURRENT_SOURCE_DIR}/tests)
 
+# #24 graph_variant bitfield collision — pure-host boundary unit test. Proves the
+# latent collision was real at graph_layout=64 (OLD encoding aliased small_spec)
+# and the new make_graph_variant keeps them distinct. No GPU, no CUDA.
+add_executable(test_graph_variant
+  tests/graph_variant_test.cpp)
+target_include_directories(test_graph_variant PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/src)
+add_test(NAME graph_variant COMMAND test_graph_variant)
+
 # Cross-request batching (#10 / delta) — CPU unit test for the grouping partition
 # (group fire rows by program handle = the canonical bytecode-hash). Pure host
 # logic, no GPU; group.hpp pulls runtime.hpp (cuda_runtime.h) so link cudart for
