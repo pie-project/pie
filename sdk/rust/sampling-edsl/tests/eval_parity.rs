@@ -148,6 +148,21 @@ fn eval_mirostat_floor_guarantees_kept_set() {
     }
 }
 
+// ── #19 argmax-floor fallback (proven Ge/ReduceMax/Broadcast ops, no RankLe) ──-
+#[test]
+fn eval_mirostat_argmax_floor_keeps_argmax() {
+    use sampling_edsl::program::mirostat_argmax_floor;
+    let (b, keys) = mirostat_argmax_floor(8).unwrap();
+    let logits = logits8();
+    // μ=0 collapses the surprise gate; the argmax floor must still keep the argmax
+    // (→ never token-0), using only ops proven in charlie's NVRTC mirostat kernel.
+    let tensors = [(keys.mu, EvalValue::F32(vec![0.0]))];
+    for s in [1u32, 7, 42, 1000, 65535] {
+        let out = eval(&prog(&b), &InputBindings::new(&bind(&b, &logits, &tensors), s)).unwrap();
+        assert_eq!(token_of(&out[0]), argmax(&logits), "seed {s}: argmax floor keeps argmax");
+    }
+}
+
 // ── sugar min-p: chosen token clears the logit-space threshold ──────────────-
 #[test]
 fn eval_sugar_min_p_token_in_kept_set() {

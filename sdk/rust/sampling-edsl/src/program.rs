@@ -342,3 +342,45 @@ pub fn distribution(vocab: u32) -> Result<Built, BuildError> {
     g.output(&probs, OutputKind::Distribution);
     g.build()
 }
+
+/// **Mirostat v2 with an ARGMAX floor** (#19 fallback — proven-ops only). Same as
+/// [`mirostat_floor`] but the rank floor is replaced by an **argmax floor** built
+/// from `Ge`/`ReduceMax`/`Broadcast` only (all proven in the NVRTC mirostat kernel),
+/// avoiding the custom-JIT `RankLe` (`PR_RANKLE`) path:
+///
+/// ```text
+/// keep = (surprise ≤ μ)  OR  (logits ≥ max(logits))   // the max-logit token
+/// ```
+///
+/// `logits ≥ max(logits)` is true only for the argmax, so the kept set is never
+/// empty (≥1 token) → no `keep_count==0` → no token-0 → no μ runaway, robust to any
+/// surprise floor. It is a `k=1` floor (greedy when μ is below the floor), so
+/// [`mirostat_floor`] (k_min≥1 diversity) is preferred when `RankLe` is confirmed on
+/// the custom-JIT path; this is the zero-codegen-risk fallback. `outputs = [Token, Scalar]`.
+pub fn mirostat_argmax_floor(vocab: u32) -> Result<(Built, MirostatKeys), BuildError> {
+    let g = Graph::new(vocab);
+    let logits = g.intrinsic_logits_dyn();
+    let mu = g.host_scalar_dyn(DType::F32, Readiness::Submit);
+
+    let probs = dyn_softmax(&logits);
+    let surprise = probs.log().neg(); // -log p, [vocab]
+
+    let keep_mu = mu.broadcast_vec(vocab).ge(&surprise); // surprise ≤ μ
+    // Argmax floor: keep the max-logit token (`logits ≥ max ⟺ argmax`).
+    let max_logit = logits.reduce_max().broadcast_vec(vocab);
+    let keep_argmax = logits.ge(&max_logit);
+    let always = g.constant_bool_dyn(true).broadcast_vec(vocab);
+    let keep = dselect(&keep_mu, &always, &keep_argmax); // keep_mu OR keep_argmax
+
+    let perturbed = logits.add(&g.rng_gumbel_vec(0, vocab));
+    let neg_inf = g.constant_f32_dyn(f32::NEG_INFINITY).broadcast_vec(vocab);
+    let token = dselect(&keep, &perturbed, &neg_inf).argmax();
+
+    let s = surprise.gather(&token.broadcast_vec(1)).reduce_sum();
+
+    g.output(&token, OutputKind::Token);
+    g.output(&s, OutputKind::Scalar);
+
+    let keys = MirostatKeys { mu: mu.input_key().expect("mu host input") };
+    Ok((g.build()?, keys))
+}

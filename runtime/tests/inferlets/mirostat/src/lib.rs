@@ -65,10 +65,16 @@ async fn main(input: String) -> Result<String> {
     // Build the mirostat program once (binding-free; reusable across fires).
     // `keys.mu` is a submit-bound scalar rebound every fire. RNG is ambient
     // (model B) — no seed input. Emit the WIT `tensor::program` once.
-    let (built, keys) = if k_min > 0 {
-        edsl::mirostat_floor(vocab, k_min).map_err(|e| format!("mirostat_floor build: {e:?}"))?
-    } else {
-        edsl::mirostat(vocab).map_err(|e| format!("mirostat program build: {e:?}"))?
+    // `{"floor":"argmax"}` selects the proven-ops fallback (Ge/ReduceMax/Broadcast,
+    // no RankLe) if the RankLe custom-JIT path is a residual artifact.
+    let floor = params.get("floor").and_then(|v| v.as_str()).unwrap_or("rank");
+    let (built, keys) = match floor {
+        "argmax" => edsl::mirostat_argmax_floor(vocab)
+            .map_err(|e| format!("mirostat_argmax_floor build: {e:?}"))?,
+        _ if k_min > 0 => {
+            edsl::mirostat_floor(vocab, k_min).map_err(|e| format!("mirostat_floor build: {e:?}"))?
+        }
+        _ => edsl::mirostat(vocab).map_err(|e| format!("mirostat program build: {e:?}"))?,
     };
     let program =
         inferlet::emit::emit_program(&built.program).map_err(|e| format!("mirostat emit: {e}"))?;
