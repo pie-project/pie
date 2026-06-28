@@ -2326,6 +2326,12 @@ void marshal_ir_program_output(const sampling_ir::ProgramInterface* pif,
         const std::uint32_t req = group_member[r];
         if (static_cast<std::size_t>(req) >= per_req.size()) continue;
         pie_driver::PerRequestOutput& pr = per_req[req];
+        // #32: size this request's program_tokens to n_out so every declared
+        // output owns a CSR segment (empty for non-[k]) — keeps seg(r,o) =
+        // (Σ_{r'<r} n_out_{r'}) + o consistent with the runtime's output_types.
+        if (pr.program_tokens.size() < pif->outputs.size()) {
+            pr.program_tokens.resize(pif->outputs.size());
+        }
         for (std::size_t i = 0; i < pif->outputs.size() && i < outs.size(); ++i) {
             const sampling_ir::DeclaredOutput& o = pif->outputs[i];
             if (outs[i] == nullptr) continue;
@@ -2342,13 +2348,19 @@ void marshal_ir_program_output(const sampling_ir::ProgramInterface* pif,
                                               cudaMemcpyDeviceToHost));
                         pr.tokens.push_back(static_cast<std::uint32_t>(t));
                     } else {
+                        // #32 [k]-Token (elem_count>1) → the per-(request,output)
+                        // program_tokens CSR (output i's segment), OFF spec_tokens
+                        // (the system-drafter channel it was mis-routed to). The
+                        // -1 sentinel still truncates a spec-verify accept-prefix;
+                        // a plain [k] output has no -1 so all k tokens emit.
                         std::vector<std::int32_t> v(o.elem_count);
                         CUDA_CHECK(cudaMemcpy(v.data(), base,
                                               sizeof(std::int32_t) * o.elem_count,
                                               cudaMemcpyDeviceToHost));
                         for (std::int32_t x : v) {
                             if (x < 0) break;
-                            pr.spec_tokens.push_back(static_cast<std::uint32_t>(x));
+                            pr.program_tokens[i].push_back(
+                                static_cast<std::uint32_t>(x));
                         }
                     }
                     break;
