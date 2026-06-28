@@ -1,0 +1,4 @@
+[package]
+name = "grammar-late"
+version = "0.1.0"
+description = "Test inferlet: Late-channel grammar masking verify — the production device-alias mask supply (cut #2 Late path) on the merged run-ahead path"

@@ -6,6 +6,7 @@ members = [
     "error",
     "generate",
     "grammar",
+    "grammar-late",
     "mirostat",
     "tempgen",
     "multisamp",
