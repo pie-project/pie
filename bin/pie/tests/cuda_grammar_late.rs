@@ -11,17 +11,21 @@
 //! It closes the cut-#1 host↔device supply-drift class on the **real** production
 //! carrier.
 //!
-//! TWO inferlets are launched CONCURRENTLY so their forward passes batch in the
-//! FCFS scheduler — the late carriers ride the **batch-merged** request
-//! (`extend_sampling_programs_from` concat, the exact cut #1 drop site, now with
-//! bravo's durable carrier-preservation guard). The grammar mask is sequential
-//! (`mask[N]` needs `token[N-1]`, computed host-side) so a single inferlet cannot
-//! self-run-ahead; concurrent procs are how the masked path rides the merge.
+//! `N_CONCURRENT` inferlets run CONCURRENTLY, each on its OWN session, each a
+//! single-request (R=1) sequential grammar decode supplying its grammar mask via
+//! the device-alias Late carrier every step. This verifies the de-hardwired
+//! masking MECHANISM under CONCURRENCY — distinct Late device buffers, distinct
+//! `HostLate` resolutions, no aliasing, no device-arena race (bravo's host-upload
+//! serialization). NOTE: concurrent procs do NOT co-batch (run-ahead serializes
+//! fires per-driver → R=1 each); the merged-path (`forward_R≥2`, the cut-#1
+//! supply-drift survival across the batch-merge) is the separate gate-1 deliverable
+//! (a DISTINGUISHABLE R=2 barrier harness + echo's rich-marshal scatter + #10
+//! same-window batching), not this concurrency verify.
 //!
 //! Non-degeneracy (the cut #1 discipline; delta drives + confirms the trace):
-//!   - MERGED path: the batch-merge fires (not a single-req path).
-//!   - DEVICE-ALIAS branch: `sampling_late_device_ptrs[k] != 0` (not the staged
-//!     blob fallback) — a staged mask would test the wrong channel.
+//!   - DEVICE-ALIAS branch: `HostLate RESOLVED` with `sampling_late_device_ptrs[k]
+//!     != 0` per proc (not the staged-blob fallback) — a staged mask would test the
+//!     wrong channel.
 //!   - HONEST gate (in the inferlet): conform vs byte-identical CPU ref ∧
 //!     constrained ≠ unconstrained natural argmax ∧ forced-out. A dropped carrier
 //!     ⇒ `SkippedLateBindMiss` ⇒ constrained == natural ⇒ assert #2 fails loud; a
@@ -38,8 +42,10 @@ use std::process::Command;
 use anyhow::{Context, Result};
 use pie_client::client::Client;
 
-/// Concurrent grammar-late inferlets — ≥2 so their passes batch-merge the late
-/// carriers. Bump to widen the merge if the scheduler doesn't co-batch at 2.
+/// Concurrent grammar-late inferlets, each on its own session (R=1 each). Verifies
+/// the masking mechanism under concurrency (distinct Late buffers, no device-arena
+/// race); they do NOT co-batch — merged-path `forward_R≥2` is the separate gate-1
+/// barrier harness.
 const N_CONCURRENT: usize = 2;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -60,33 +66,50 @@ async fn grammar_late_supply_on_real_driver() -> Result<()> {
     let wasm = ws.join("target/wasm32-wasip2/debug/grammar_late.wasm");
     let manifest = ws.join("grammar-late/Pie.toml");
 
-    let client =
+    // Install the program once (one setup session).
+    let setup =
         Client::connect_with_identity(&format!("ws://{}/v1/ws", pie.listen_addr), "test-user")
             .await
             .context("connect")?;
-    client
+    setup
         .authenticate("test-user", &None)
         .await
         .context("auth")?;
-    client
+    setup
         .add_program(&wasm, &manifest, true)
         .await
         .context("add_program")?;
     eprintln!(
-        "[grammar-late] program installed, launching {N_CONCURRENT} concurrent constrained decodes (merged late carrier)…"
+        "[grammar-late] program installed, launching {N_CONCURRENT} concurrent constrained decodes on SEPARATE sessions…"
     );
 
-    // Launch all procs FIRST (no await between) so they run concurrently and the
-    // scheduler co-batches their forward passes → the late carrier rides the
-    // merged request.
+    // Launch each proc on its OWN client session. The gateway's `session_driver`
+    // (gateway.rs) runs turns STRICTLY SEQUENTIALLY per session, so two open-ended
+    // `proc_launch` turns on one session can't truly run concurrently — one gets
+    // `Control::Abort`-closed mid-decode (the worker-bridge plumbing, a layer ABOVE
+    // the Late carrier). Separate sessions give genuine concurrency. The masking
+    // concurrency under verify (the device-arena/HostLate Late-carrier path) is
+    // independent of the bridge session — each proc still uploads its grammar mask
+    // concurrently. Keep the clients alive until their procs return (a dropped
+    // client closes its websocket → its process events stop).
+    let mut clients = Vec::with_capacity(N_CONCURRENT);
     let mut procs = Vec::with_capacity(N_CONCURRENT);
     for _ in 0..N_CONCURRENT {
-        procs.push(
-            client
-                .launch_process("grammar-late@0.1.0".to_string(), "{}".to_string(), true)
-                .await
-                .context("launch")?,
-        );
+        let c = Client::connect_with_identity(
+            &format!("ws://{}/v1/ws", pie.listen_addr),
+            "test-user",
+        )
+        .await
+        .context("connect proc session")?;
+        c.authenticate("test-user", &None)
+            .await
+            .context("auth proc session")?;
+        let p = c
+            .launch_process("grammar-late@0.1.0".to_string(), "{}".to_string(), true)
+            .await
+            .context("launch")?;
+        procs.push(p);
+        clients.push(c);
     }
 
     let mut results = Vec::with_capacity(N_CONCURRENT);
@@ -98,6 +121,7 @@ async fn grammar_late_supply_on_real_driver() -> Result<()> {
         eprintln!("[grammar-late] proc {i} returned: {json}");
         results.push(json);
     }
+    drop(clients);
 
     pie.shutdown().await;
 
