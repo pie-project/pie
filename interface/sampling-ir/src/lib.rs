@@ -200,11 +200,44 @@ mod hash_tests {
         assert_ne!(program_identity_hash(bc, &[t_submit]), program_identity_hash(bc, &[Binding::Logits]));
     }
 
-    // TODO(#10): cross-lang PIN against charlie's driver-emitted
-    // `program_identity_hash(bytecode, manifest)` golden vectors (Path 2, the
-    // #25 `standard_program_bytecode.txt` discipline) — asserts the Rust mirror
-    // is byte-exact with the driver dedup key, no silent drift if `manifest_hash`
-    // evolves. Awaiting charlie's goldens (folded around the #19 dive).
+    #[test]
+    fn identity_matches_driver_goldens() {
+        // Cross-lang PIN (Path 2): charlie's C++ driver-emitted
+        // `program_identity_hash(bytecode, manifest)` goldens (driver
+        // `program_identity.hpp`). Asserts the Rust mirror is byte-exact with the
+        // #11 driver dedup key / #10 distinct-count key — no silent drift if
+        // `manifest_hash` ever evolves. Same discipline as the #25
+        // `program_hash_matches_driver_fnv1a64_vectors` pin above.
+        //
+        // Bytecode = "PSIR" magic | version=4 | 1 op | tag 0x33 (16 bytes).
+        const BYTECODE: [u8; 16] = [
+            0x50, 0x53, 0x49, 0x52, 0x04, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x33, 0x00,
+            0x00, 0x00,
+        ];
+        // The bytecode hash itself (== the empty-manifest identity).
+        assert_eq!(program_hash(&BYTECODE), 0x28bf_e0a3_f1d0_e019);
+
+        let ht = |key, ready| Binding::Tensor { key, ready };
+        let cases: &[(&[Binding], u64)] = &[
+            (&[], 0x28bf_e0a3_f1d0_e019),
+            // Intrinsic ⇒ serializes (0,0,0); Logits ≡ MtpLogits (row 2 ≡ row 3).
+            (&[Binding::Logits], 0xff5b_1c59_d84d_9124),
+            (&[Binding::MtpLogits], 0xff5b_1c59_d84d_9124),
+            (&[Binding::Logits, ht(0, Readiness::Submit)], 0x5f6e_ac04_dece_7e45),
+            (
+                &[Binding::Logits, ht(0, Readiness::Submit), ht(1, Readiness::Submit)],
+                0x97ff_4a9f_f574_943d,
+            ),
+            (&[Binding::Logits, ht(1, Readiness::Late)], 0xcc3a_636a_a7e8_ac37),
+        ];
+        for (manifest, expected) in cases {
+            assert_eq!(
+                program_identity_hash(&BYTECODE, manifest),
+                *expected,
+                "identity hash mismatch for manifest {manifest:?}",
+            );
+        }
+    }
 }
 
 #[cfg(test)]
