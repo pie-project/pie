@@ -193,6 +193,20 @@ public:
         return get_or_compile(bytecode);
     }
 
+    // Fire-and-forget prefetch (#11 TTFT): kick off the async NVRTC compile for
+    // `bytecode` + `manifest` at admission — before the consuming fire — so the
+    // PTX-gen overlaps the in-flight run-ahead steps off the critical path. The
+    // consuming `get_or_compile` then finds it Ready (or waits on the in-flight
+    // `shared_future`). Idempotent: dedup'd downstream by the program-cache key
+    // (`program_identity_hash(bytecode, manifest)`), the SAME key as the compile
+    // cache and #10's distinct-count, so prefetch ≡ compile ≡ dedup — no
+    // divergence. Default no-op: backends without async compile (mocks) inherit
+    // it unchanged; delta's `SamplingIrBackend` overrides it →
+    // `JitEngine::prefetch_compile`. `bytecode + manifest` in / nothing out keeps
+    // `IProgramBackend` backend-agnostic (no jit types leak).
+    virtual void prefetch_compile(std::span<const std::uint8_t> /*bytecode*/,
+                                  const ProgramManifest& /*manifest*/) {}
+
     // The program's declared input/output interface (from codegen).
     virtual const ProgramInterface& interface(ProgramHandle program) = 0;
 
