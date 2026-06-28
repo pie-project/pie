@@ -1,16 +1,19 @@
-//! #19 mirostat ARBITER (lane L3 / delta) — the e2e verify that closes #19 or
-//! names the remaining layer. Boots the real 4090 + qwen-3-0.6b, fires the
-//! `mirostat` inferlet (foxtrot's fix: rank floor k_min=8 + μ-init ln(vocab)+1)
-//! across the locked isolation knobs, and asserts the DEFAULT is non-degenerate.
-//! This ASSERTING harness replaces the false-green `mirostat_tau_sweep` (which
-//! passed on token-0/S=0).
+//! #19 mirostat ARBITER (lane L3 / delta) — the e2e verify that closes #19. Boots
+//! the real 4090 + qwen-3-0.6b, fires the `mirostat` inferlet across configs, and
+//! asserts the PRODUCTION DEFAULT is non-degenerate DIRECTLY. Replaces the
+//! false-green `mirostat_tau_sweep` (which passed on token-0/S=0).
 //!
-//! Verdict (manager-locked):
-//!   - Default (k_min=8, mu0=13) non-degenerate (S>0, μ settles, diverse) → #19 DONE.
-//!   - Default degenerate ∧ init-only (k_min=0,mu0=13, NO RankLe) non-degenerate
-//!     → the RankLe-custom-JIT floor is the next artifact → foxtrot argmax-floor fallback.
-//!   - init-only ALSO degenerate (non-empty keep but token/S wrong) → downstream
-//!     entropies→WIT→SDK S-plumbing (charlie's driver trace ruled out kernel/marshal).
+//! #19 was a fast-path carrier-select bug: the runtime over-enabled the output
+//! fast-path for multi-output programs, so mirostat's `[Token, Scalar]` read
+//! never-filled pinned buffers (token-0/S=0/μ-runaway) instead of the correct rich
+//! response. foxtrot's single-Token fast-path gate routes it to the rich path; the
+//! production default floor is the proven-ops argmax-floor (Ge/ReduceMax/Broadcast),
+//! robustly non-degenerate (the RankLe floor is the known RNG-fragile residual).
+//!
+//! Gate (manager-locked, honest close): the production DEFAULT (config[0] =
+//! argmax-floor, no override) MUST be non-degenerate — NOT a `default OR fallback`
+//! disjunction. The RankLe-floor config is a non-gating diagnostic. Plus the
+//! `entropycheck` #18-class lock (a lone `[Scalar]`/`[Entropy]` takes the rich path).
 //!
 //! One boot per process (a 2nd in-process boot panics): all configs in ONE boot
 //! via repeated run_inferlet.
@@ -100,12 +103,17 @@ async fn mirostat19_arbiter_on_4090() -> Result<()> {
 
     // (label, input). Default = both fixes (k_min=8 RankLe floor + mu0=ln(vocab)+1).
     // floor-argmax = foxtrot's proven-ops fallback (Ge/ReduceMax/Broadcast, NO RankLe).
-    let configs: [(&str, String); 5] = [
-        ("DEFAULT both        ", format!(r#"{{"max_tokens":{MAX_TOKENS}}}"#)),
-        ("init-only(noRankLe) ", format!(r#"{{"k_min":0,"mu0":13,"max_tokens":{MAX_TOKENS}}}"#)),
-        ("floor-RankLe(k8)    ", format!(r#"{{"k_min":8,"mu0":3,"max_tokens":{MAX_TOKENS}}}"#)),
-        ("floor-argmax(proven)", format!(r#"{{"floor":"argmax","mu0":3,"max_tokens":{MAX_TOKENS}}}"#)),
-        ("degenerate control  ", format!(r#"{{"k_min":0,"mu0":3,"max_tokens":{MAX_TOKENS}}}"#)),
+    // Post-flip (a0c48d25): the PRODUCTION default floor is argmax (proven-ops:
+    // Ge/ReduceMax/Broadcast, no RankLe — robust). config[0] is the production
+    // default (no floor override → argmax-floor + k_min=8 + mu0=ln(vocab)+1) and is
+    // the SOLE asserted config. The rest are NON-GATING diagnostics: the RankLe
+    // floor (the known RNG-fragile residual, now opt-in via {"floor":"rank"}) and
+    // the plain no-floor degenerate control.
+    let configs: [(&str, String); 4] = [
+        ("DEFAULT(argmax-floor) ", format!(r#"{{"max_tokens":{MAX_TOKENS}}}"#)),
+        ("argmax-floor mu0=3    ", format!(r#"{{"mu0":3,"max_tokens":{MAX_TOKENS}}}"#)),
+        ("RankLe-floor(diag)    ", format!(r#"{{"floor":"rank","k_min":8,"mu0":13,"max_tokens":{MAX_TOKENS}}}"#)),
+        ("plain no-floor(degen) ", format!(r#"{{"floor":"rank","k_min":0,"mu0":3,"max_tokens":{MAX_TOKENS}}}"#)),
     ];
 
     eprintln!("[MIRO19] config              | final_mu  tail_S | distinct%  win{WIN}% | s_flowed | non-degenerate");
@@ -156,27 +164,22 @@ async fn mirostat19_arbiter_on_4090() -> Result<()> {
     pie.shutdown().await;
 
     let default_nd = results[0].2;
-    let init_only_nd = results[1].2;
-    let floor_argmax_nd = results[3].2;
 
-    // Verdict.
+    // Verdict — the production default (argmax-floor) asserted DIRECTLY.
     let verdict = if default_nd {
-        "✅ #19 CLOSED — DEFAULT (k_min=8 RankLe floor + mu0=ln(vocab)+1) is NON-DEGENERATE (S>0, μ settled, diverse tokens). The algorithm (empty-keep) was the sole cause; the RankLe floor + μ-init fix it e2e. cuda_mirostat19 now ASSERTS non-degeneracy (replaces the false-green sweep)."
-    } else if floor_argmax_nd {
-        "✅ #19 CLOSED via PROVEN-OPS FALLBACK — DEFAULT (RankLe floor) degenerate BUT floor-argmax (Ge/ReduceMax/Broadcast, NO RankLe) is NON-DEGENERATE ⟹ the RankLe-custom-JIT floor is the residual artifact (codegen-unit≠e2e class); foxtrot's argmax-floor is the permanent fix → make `{floor:argmax}` the inferlet default. charlie chases the RankLe-JIT codegen separately (non-blocking)."
-    } else if init_only_nd {
-        "🔴 FLOOR-MECHANISM/DOWNSTREAM — DEFAULT + floor-argmax degenerate BUT init-only (μ-init alone, no floor) non-degenerate ⟹ the μ-init keeps step-1 non-empty but BOTH floor paths (RankLe + argmax) degenerate → the floor's keep/sample or the entropies→WIT→SDK S-plumbing. charlie+foxtrot+golf/echo trace."
+        "✅ #19 CLOSED — the PRODUCTION DEFAULT (argmax-floor: proven Ge/ReduceMax/Broadcast ops + k_min=8 + mu0=ln(vocab)+1) is NON-DEGENERATE (real diverse tokens, S>0, μ settles). The carrier-select fix delivers the token+S e2e, and the argmax-floor default is robustly non-degenerate. The RankLe-floor diagnostic is the known RNG-fragile residual (now opt-in via {floor:rank}, NON-GATING). Arbiter asserts the production default DIRECTLY (no disjunction)."
     } else {
-        "🔴 DOWNSTREAM S-PLUMBING — all fix configs degenerate. If keep is non-empty (real token) but S=0, the bug is downstream of pr.entropies (entropies→WIT→SDK→inferlet) — charlie's driver trace ruled out kernel/marshal. → foxtrot+golf/echo trace the WIT/SDK Scalar read."
+        "🔴 #19 RED — the PRODUCTION DEFAULT (argmax-floor) is DEGENERATE. Either the carrier-select fix regressed (token-0/S=0) or the argmax-floor itself collapses — inspect the per-config table (RankLe-floor diag + plain control) + the entropycheck #18 lock."
     };
     eprintln!("[MIRO19] VERDICT: {verdict}");
     eprintln!("[MIRO19] MIRO19_DONE");
 
-    // The asserting gate: at least one FLOOR config (RankLe default OR proven-ops
-    // argmax) MUST be non-degenerate — i.e. #19 has a working e2e fix.
+    // The asserting gate: the PRODUCTION DEFAULT (config[0] = argmax-floor) MUST be
+    // non-degenerate directly — NOT "some config greened" (the old disjunction). The
+    // RankLe-floor diagnostic is intentionally non-gating (known RNG-fragile residual).
     anyhow::ensure!(
-        default_nd || floor_argmax_nd,
-        "MIRO19 RED: neither the RankLe-floor default nor the argmax-floor fallback is non-degenerate — {}",
+        default_nd,
+        "MIRO19 RED: the production default (argmax-floor) is not non-degenerate — {}",
         verdict
     );
 
