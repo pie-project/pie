@@ -23,8 +23,8 @@
 
 use inferlet::{
     Context, Result,
-    forward::Forward,
-    sample::{Logits, Sampler},
+    forward::{Forward, Probe},
+    sample::Sampler,
 };
 use serde::Deserialize;
 use std::time::Instant;
@@ -72,19 +72,19 @@ async fn timed_step(base: &Context, mode: Mode) -> Result<(f64, GreedyOrLogits)>
 
     match mode {
         Mode::Greedy => {
-            let h = pass.sample(&[0], Sampler::Argmax);
+            let h = pass.sample(Sampler::Argmax)?[0];
             let t0 = Instant::now();
             let out = pass.execute().await?;
             let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
-            let token = out.token(h).ok_or("greedy: no token slot")?;
+            let token = out.token(h).await?;
             Ok((elapsed_ms, GreedyOrLogits::Greedy(token)))
         }
         Mode::RawLogits => {
-            let h = pass.probe(0, Logits);
+            let h = pass.probe(Probe::Logits)?[0];
             let t0 = Instant::now();
             let out = pass.execute().await?;
             let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
-            let bytes = out.logits(h).ok_or("raw: no logits slot")?.to_vec();
+            let bytes = out.read_bytes(h).await?;
             Ok((elapsed_ms, GreedyOrLogits::Logits(bytes)))
         }
     }

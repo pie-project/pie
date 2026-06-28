@@ -209,3 +209,33 @@ pub fn entropy(vocab: u32) -> Result<Built, BuildError> {
     g.output(&h, OutputKind::Scalar);
     g.build()
 }
+
+/// **Raw logits** — the model's pre-softmax logit vector, passed through
+/// unchanged. The program's single input (the intrinsic logits, `[vocab]`) is
+/// its single output, declared [`OutputKind::Logits`]; `outputs = [Logits]`.
+/// `canonical_kind` is `Custom` (Graph-authored — not a token-sampler dispatch
+/// kind). Read back as native-endian `f32` bytes via `Output::read_bytes` /
+/// `read_f32`.
+pub fn logits(vocab: u32) -> Result<Built, BuildError> {
+    let g = Graph::new(vocab);
+    let logits = g.intrinsic_logits_dyn();
+    g.output(&logits, OutputKind::Logits);
+    g.build()
+}
+
+/// **Full distribution** — the softmax over the model's entire output vocab,
+/// `[vocab]` f32, declared [`OutputKind::Distribution`]; `outputs =
+/// [Distribution]`. The companion token ids are the implicit vocab range
+/// `0..vocab` (synthesized guest-side by [`Output::distribution`]), so this is a
+/// values-only program — the explicit `(ids, values)` two-tensor form is for the
+/// top-k case where the ids are a non-trivial selection. `canonical_kind` is
+/// `Custom`. Computed with the standard max-shift for numerical stability.
+pub fn distribution(vocab: u32) -> Result<Built, BuildError> {
+    let g = Graph::new(vocab);
+    let logits = g.intrinsic_logits_dyn();
+    let m = logits.reduce_max(); // scalar
+    let exp = logits.sub(&m).exp(); // exp(x - max), [vocab]
+    let probs = exp.div(&exp.reduce_sum()); // softmax, [vocab]
+    g.output(&probs, OutputKind::Distribution);
+    g.build()
+}

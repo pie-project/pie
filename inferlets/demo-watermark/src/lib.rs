@@ -25,7 +25,7 @@ use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io::{self, Write};
 use std::time::{Duration, Instant};
 
-use inferlet::{Context, Result, chat, sample::Distribution};
+use inferlet::{Context, Result, chat, forward::Probe};
 use serde::Deserialize;
 
 #[derive(Deserialize)]
@@ -163,33 +163,22 @@ async fn run_one(model_name: &str, input: &Input, watermark_on: bool) -> Result<
     for _ in 0..input.max_tokens {
         let mut pass = ctx.forward();
         pass.input(&pending);
-        let last_idx = (pending.len() - 1) as u32;
-        // temperature=1.0 returns the model's natural softmax (not a
-        // one-hot) so that adding +delta to green-list log-probs can
-        // actually change which token wins on the biased argmax.
-        // k=0 returns the full vocabulary.
-        let h = pass.probe(
-            last_idx,
-            Distribution {
-                temperature: 1.0,
-                k: 0,
-            },
-        );
+        // The model's natural full softmax (over all vocab) at the decode
+        // position, so adding +delta to green-list log-probs can change which
+        // token wins on the biased argmax.
+        let h = pass.probe(Probe::Distribution)?[0];
         let out = pass.execute().await?;
-        let (ids, probs) = match out.distribution(h) {
-            Some(d) => d,
-            None => break,
-        };
+        let (ids, probs) = out.distribution(h).await?;
 
         let chosen = if watermark_on {
-            watermark.sample_biased(ids, probs)
+            watermark.sample_biased(&ids, &probs)
         } else {
-            argmax_unbiased(ids, probs)
+            argmax_unbiased(&ids, &probs)
         };
 
         // Detector counts green-list hits using the same seeding rule.
         // It runs in either mode — for BASELINE we expect z ≈ 0.
-        detector.feed(chosen, ids);
+        detector.feed(chosen, &ids);
 
         if stop_tokens.contains(&chosen) {
             break;

@@ -8,7 +8,7 @@
 
 use inferlet::{
     Context, Result,
-    sample::Distribution,
+    forward::Probe,
 };
 use serde::Deserialize;
 use std::hash::{DefaultHasher, Hash, Hasher};
@@ -142,18 +142,14 @@ async fn main(input: Input) -> Result<String> {
     for _ in 0..input.max_tokens {
         let mut pass = ctx.forward();
         pass.input(&pending);
-        let last_idx = (pending.len() - 1) as u32;
-        // `k = 0` returns the full vocabulary so the watermark can bias
-        // every token, not just the top-k.
-        let h = pass.probe(last_idx, Distribution { temperature: 0.0, k: 0 });
+        // The full softmax distribution (over all vocab) so the watermark can
+        // bias every token, not just the top-k.
+        let h = pass.probe(Probe::Distribution)?[0];
         let out = pass.execute().await?;
 
-        let (ids, probs) = match out.distribution(h) {
-            Some(d) => d,
-            None => break,
-        };
+        let (ids, probs) = out.distribution(h).await?;
 
-        let chosen = watermark.sample(ids, probs);
+        let chosen = watermark.sample(&ids, &probs);
         if stop_tokens.contains(&chosen) {
             break;
         }

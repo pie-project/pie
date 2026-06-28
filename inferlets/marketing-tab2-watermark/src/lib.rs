@@ -1,4 +1,4 @@
-use inferlet::{Context, Result, sample::Logits};
+use inferlet::{Context, Result, forward::Probe};
 use serde::Deserialize;
 
 #[derive(Deserialize)]
@@ -25,11 +25,10 @@ async fn main(input: Input) -> Result<String> {
     for _ in 0..input.max_tokens {
         let mut pass = ctx.forward();
         pass.input(&[last]);
-        let p = pass.probe(0, Logits);
+        let p = pass.probe(Probe::Logits)?[0];
         let out = pass.execute().await?;
 
-        let mut logits: Vec<f32> = out.logits(p).unwrap()
-            .chunks_exact(4).map(|c| f32::from_ne_bytes(c.try_into().unwrap())).collect();
+        let mut logits: Vec<f32> = out.read_f32(p).await?;
         let vocab = logits.len() as u32;
         for t in green_list(last, vocab, input.gamma) { logits[t as usize] += input.delta; }
         last = argmax(&logits);

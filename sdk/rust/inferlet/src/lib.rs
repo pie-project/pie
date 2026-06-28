@@ -200,7 +200,7 @@ pub mod prelude {
     pub use crate::{Context, Result, Schema, Tool};
     pub use crate::{main, tool};
 
-    pub use crate::forward::{Forward, Output, TokenRef};
+    pub use crate::forward::{Forward, Output, Probe, TokenRef};
     pub use crate::generation::{GenStep, Generator};
     pub use crate::program::{LoweredProgramExt, ProgramHandle};
     pub use crate::sample::Sampler;

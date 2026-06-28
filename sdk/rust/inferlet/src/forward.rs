@@ -54,6 +54,25 @@ pub enum TokenRef {
     PrevSample,
 }
 
+/// A single-channel **measurement** to attach via [`Forward::probe`] — the
+/// de-hardwiring replacement for the removed `probe(pos, kind)` wire op. Each
+/// lowers to a Graph-authored program over the model's output logits (no new
+/// wire op). The pair-shaped `(ids, values)` kinds (distribution / logprobs)
+/// are deferred to the Phase-2 tensor-shape convention.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Probe {
+    /// Raw pre-softmax logits, `[vocab]` f32 — read via [`Output::read_f32`] /
+    /// [`Output::read_bytes`].
+    Logits,
+    /// Shannon entropy of the softmax distribution, a scalar — read via
+    /// [`Output::scalar`].
+    Entropy,
+    /// The full softmax distribution over the model's vocab, `[vocab]` f32 —
+    /// read via [`Output::distribution`] (which pairs the values with the
+    /// implicit `0..vocab` token ids) or [`Output::read_f32`] (values only).
+    Distribution,
+}
+
 // =============================================================================
 // Sampler attach
 // =============================================================================
@@ -290,6 +309,53 @@ impl<'ctx> Forward<'ctx> {
                 template,
                 host_inputs,
                 submit_values,
+            },
+            outputs,
+        });
+        Ok((0..outputs).map(ProgramHandle::new).collect())
+    }
+
+    /// Attach a **measurement** program — the de-hardwiring replacement for the
+    /// old `probe(pos, kind)` wire op. Builds a Graph-authored measurement over
+    /// the model's output logits, lowers it, and attaches it as this pass's
+    /// sampler. Like [`sample`](Self::sample), the program's `Logits` input
+    /// binds to the decode position (the last input token), so call after
+    /// [`input`](Self::input). Returns one [`ProgramHandle`] per declared
+    /// output — read logits with [`Output::read_f32`] / [`read_bytes`](
+    /// Output::read_bytes), entropy with [`Output::scalar`].
+    ///
+    /// One sampler slot per pass: this replaces any prior `sample` / `probe`.
+    /// Only single-channel kinds are supported; the pair-shaped `(ids, values)`
+    /// kinds (distribution / logprobs) await the Phase-2 tensor-shape convention.
+    pub fn probe(&mut self, kind: Probe) -> Result<Vec<ProgramHandle>> {
+        let vocab = crate::model::output_vocab_size();
+        let built = match kind {
+            Probe::Logits => sampling_edsl::program::logits(vocab),
+            Probe::Entropy => sampling_edsl::program::entropy(vocab),
+            Probe::Distribution => sampling_edsl::program::distribution(vocab),
+        }
+        .map_err(|e| format!("Forward::probe: build measurement program: {e:?}"))?;
+        self.measure(built)
+    }
+
+    /// Attach an arbitrary Graph-authored measurement program (`Built`) as this
+    /// pass's sampler — the general form behind [`probe`](Self::probe), for
+    /// inferlets that author a **multi-output** measurement program directly
+    /// (e.g. `[Token, Logits, Entropy, Distribution, Logprobs]` in one pass). The
+    /// program's `Logits` input binds to the decode position (the last input
+    /// token), so call after [`input`](Self::input); each declared output comes
+    /// back as a tensor via `outputs()`, in declared order. Returns one
+    /// [`ProgramHandle`] per declared output. One sampler slot per pass: this
+    /// replaces any prior `sample` / `probe` / `measure`.
+    pub fn measure(&mut self, built: sampling_edsl::Built) -> Result<Vec<ProgramHandle>> {
+        let program = crate::emit::emit_program(&built.program)?;
+        let outputs = built.outputs.len() as u32;
+        self.sampler = Some(SamplerAttach {
+            program: AttachedProgram::Owned(program),
+            bindings: SamplerBindings::SugarTemplate {
+                template: built.bindings,
+                host_inputs: built.host_inputs,
+                submit_values: Vec::new(),
             },
             outputs,
         });
@@ -620,6 +686,16 @@ impl Output {
             .into_iter()
             .next()
             .ok_or_else(|| format!("Output::scalar: output tensor at index {} is empty", h.index()))
+    }
+
+    /// Full-distribution measurement for a handle ([`Probe::Distribution`]) —
+    /// the softmax `values` (`f32`, one per vocab entry) paired with their
+    /// implicit token `ids` (the vocab range `0..values.len()`). Returns
+    /// `(ids, values)`; index `i` of each corresponds to token id `i`.
+    pub async fn distribution(&self, h: ProgramHandle) -> Result<(Vec<u32>, Vec<f32>)> {
+        let values = self.read_f32(h).await?;
+        let ids = (0..values.len() as u32).collect();
+        Ok((ids, values))
     }
 }
 
