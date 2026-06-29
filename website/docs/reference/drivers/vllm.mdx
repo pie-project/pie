@@ -47,7 +47,7 @@ activation_dtype = "bfloat16"
 venv = "/home/me/.pie/venvs/vllm"
 attention_backend       = "FLASHINFER"   # FLASH_ATTN / TRITON_ATTN / FLEX_ATTENTION / …
 gpu_memory_utilization  = 0.9
-enforce_eager           = false          # disable CUDA graphs
+enforce_eager           = true          # disable CUDA graphs
 max_num_seqs            = 256            # optional active sequence cap
 max_num_batched_tokens  = 8192           # optional vLLM per-step token budget
 max_model_len           = 2048           # optional context length cap
@@ -63,7 +63,7 @@ spec_ngram_max_n        = 4
 |---|---|---|
 | `attention_backend` | unset | `FLASHINFER` / `FLASH_ATTN` / `TRITON_ATTN` / `FLEX_ATTENTION` / etc. Unset lets vLLM auto-pick per platform. |
 | `gpu_memory_utilization` | `0.9` | Fraction of free GPU memory for KV cache + activations. |
-| `enforce_eager` | `false` | Disable `torch.compile` and CUDA graphs. |
+| `enforce_eager` | `true` | Disable `torch.compile` and CUDA graphs. |
 | `max_num_seqs` | unset | Optional active sequence cap passed through to vLLM. |
 | `max_num_batched_tokens` | unset | Optional per-step token budget passed through to vLLM. |
 | `max_model_len` | unset | Optional context length cap passed through to vLLM. |
