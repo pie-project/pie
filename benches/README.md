@@ -76,14 +76,19 @@ Use `--json-out <path>` to save machine-readable results.
 ## Reasoning-pattern benchmark
 
 `reasoning_bench.py` compares Direct, Best-of-N, Tree-of-Thought, and
-Graph-of-Thought through one benchmark-specific inferlet. Reference answers
-remain in the Python harness and are never sent to the model.
+Graph-of-Thought through method-specific benchmark inferlets by default.
+Reference answers remain in the Python harness and are never sent to the
+model. The older `reasoning-benchmark` inferlet remains available as a
+prototype/reference with `--inferlet-mode prototype`.
 
-Build the inferlet:
+Build the base and method-specific inferlets:
 
 ```bash
-cargo build --manifest-path inferlets/reasoning-benchmark/Cargo.toml \
-  --target wasm32-wasip2 --release
+cargo build --manifest-path inferlets/reasoning-base/Cargo.toml --target wasm32-wasip2 --release
+cargo build --manifest-path inferlets/reasoning-direct/Cargo.toml --target wasm32-wasip2 --release
+cargo build --manifest-path inferlets/reasoning-best-of-n/Cargo.toml --target wasm32-wasip2 --release
+cargo build --manifest-path inferlets/reasoning-tree-of-thought/Cargo.toml --target wasm32-wasip2 --release
+cargo build --manifest-path inferlets/reasoning-graph-of-thought/Cargo.toml --target wasm32-wasip2 --release
 ```
 
 Run the bundled smoke problems:
@@ -99,6 +104,24 @@ uv --project sdk/python-server run python benches/reasoning_bench.py \
 For GSM8K, pass a JSONL file containing the official `question` and `answer`
 fields. The harness extracts the numeric reference after GSM8K's `####`
 delimiter.
+
+`inferlets/reasoning-base` is the minimal prompt-to-completion inferlet. It
+does not extract answers, score candidates, or implement a scaling method. The
+method-specific benchmark inferlets share one internal implementation crate,
+`inferlets/reasoning-core`, so they preserve a common comparison schema:
+`pattern`, `final_response`, `final_answer`, `selected_candidate_id`,
+`candidates`, and `stats`. Use `--inferlet-dir PATTERN=PATH` to point one
+method at an external/user-submitted inferlet with the same comparison schema.
+
+RatioThink's ToT implementation is a useful reference for the next refinement
+pass. The pieces worth adopting first are explicit beam/frontier bookkeeping,
+separate `ok`/`incomplete`/`error` node states, observable scorer failures, and
+final-answer selection from the deepest surviving beam rather than blindly
+trusting the last generated level. Its source also records an important Pie
+runtime lesson: in the current host path, sibling decode from one inferlet does
+not reliably coalesce into larger GPU batches, so a memory-frugal sequential
+or coupled expansion strategy can be the right baseline until forward-pass
+deferral improves.
 
 ## Fairness defaults
 

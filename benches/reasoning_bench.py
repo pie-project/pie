@@ -21,13 +21,21 @@ from typing import Any
 
 
 ROOT = Path(__file__).resolve().parent.parent
-INFERLET = "reasoning-benchmark"
 PATTERNS = ("direct", "best_of_n", "tree_of_thought", "graph_of_thought")
+PROTOTYPE_INFERLET = "reasoning-benchmark"
+PATTERN_INFERLETS = {
+    "direct": "reasoning-direct",
+    "best_of_n": "reasoning-best-of-n",
+    "tree_of_thought": "reasoning-tree-of-thought",
+    "graph_of_thought": "reasoning-graph-of-thought",
+}
 NUMBER_RE = re.compile(r"[-+]?(?:\d[\d,]*\.?\d*|\.\d+)(?:[eE][-+]?\d+)?")
 
 
 @dataclass(frozen=True)
 class Problem:
+    """One benchmark example with a normalized reference answer."""
+
     id: str
     question: str
     answer: str
@@ -35,6 +43,8 @@ class Problem:
 
 @dataclass
 class RunResult:
+    """Per-pattern result kept in the JSON artifact for later analysis."""
+
     problem_id: str
     pattern: str
     repetition: int
@@ -50,6 +60,13 @@ class RunResult:
 
 
 def normalize_number(value: str | int | float | None) -> str | None:
+    """Return the last numeric value in a model/reference string.
+
+    The evaluator intentionally ignores formatting differences such as commas,
+    dollar signs, and integer-looking floats so runs can be scored
+    deterministically without sending the reference answer to the inferlet.
+    """
+
     if value is None:
         return None
     text = str(value).strip().replace(",", "").replace("$", "")
@@ -69,6 +86,8 @@ def normalize_number(value: str | int | float | None) -> str | None:
 
 
 def reference_answer(raw: Any) -> str:
+    """Extract a normalized numeric answer from GSM8K or simple JSONL records."""
+
     text = str(raw)
     if "####" in text:
         text = text.rsplit("####", 1)[1]
@@ -79,6 +98,8 @@ def reference_answer(raw: Any) -> str:
 
 
 def load_problems(path: Path, limit: int | None) -> list[Problem]:
+    """Load benchmark problems while validating the fields used for scoring."""
+
     problems: list[Problem] = []
     with path.open(encoding="utf-8") as handle:
         for line_number, line in enumerate(handle, 1):
@@ -102,22 +123,45 @@ def load_problems(path: Path, limit: int | None) -> list[Problem]:
     return problems
 
 
-def inferlet_paths() -> tuple[Path, Path, str]:
+def inferlet_overrides(values: list[str] | None) -> dict[str, Path]:
+    """Parse PATTERN=PATH overrides for user-submitted inferlet directories."""
+
+    overrides: dict[str, Path] = {}
+    for value in values or []:
+        if "=" not in value:
+            raise ValueError("--inferlet-dir must be formatted as pattern=path")
+        pattern, raw_path = value.split("=", 1)
+        if pattern not in PATTERNS:
+            raise ValueError(f"unknown inferlet override pattern: {pattern!r}")
+        overrides[pattern] = Path(raw_path)
+    return overrides
+
+
+def inferlet_paths(pattern: str, args: argparse.Namespace) -> tuple[Path, Path, str]:
+    """Resolve the wasm, manifest, and package id for a benchmark pattern."""
+
     try:
         import tomllib
     except ModuleNotFoundError:
         import tomli as tomllib
 
-    directory = ROOT / "inferlets" / INFERLET
+    if args.inferlet_mode == "prototype":
+        name = PROTOTYPE_INFERLET
+    else:
+        name = PATTERN_INFERLETS[pattern]
+    directory = inferlet_overrides(args.inferlet_dir).get(
+        pattern, ROOT / "inferlets" / name
+    )
+    wasm_stem = name.replace("-", "_")
     candidates = [
-        directory / "target" / "wasm32-wasip2" / "release" / "reasoning_benchmark.wasm",
-        directory / "target" / "wasm32-wasip2" / "debug" / "reasoning_benchmark.wasm",
+        directory / "target" / "wasm32-wasip2" / "release" / f"{wasm_stem}.wasm",
+        directory / "target" / "wasm32-wasip2" / "debug" / f"{wasm_stem}.wasm",
     ]
     wasm = next((path for path in candidates if path.exists()), None)
     if wasm is None:
         raise FileNotFoundError(
-            "reasoning-benchmark wasm is missing; build it with "
-            "`cargo build --manifest-path inferlets/reasoning-benchmark/Cargo.toml "
+            f"{name} wasm is missing; build it with "
+            f"`cargo build --manifest-path {directory / 'Cargo.toml'} "
             "--target wasm32-wasip2 --release`"
         )
     manifest = directory / "Pie.toml"
@@ -126,6 +170,8 @@ def inferlet_paths() -> tuple[Path, Path, str]:
 
 
 def build_config(args: argparse.Namespace):
+    """Build an embedded Pie server config for one-model benchmark runs."""
+
     from pie.config import (
         AuthConfig,
         Config,
@@ -160,6 +206,8 @@ def build_config(args: argparse.Namespace):
 
 
 async def model_stats(client) -> dict[str, int]:
+    """Fetch numeric model counters used to compute coarse engine deltas."""
+
     ok, raw = await client.query("model_status", "")
     if not ok:
         raise RuntimeError(f"model_status query failed: {raw}")
@@ -171,6 +219,8 @@ async def model_stats(client) -> dict[str, int]:
 
 
 def stats_delta(before: dict[str, int], after: dict[str, int]) -> dict[str, int]:
+    """Keep only stable token/batch counters from the model status snapshots."""
+
     return {
         key: after.get(key, 0) - before.get(key, 0)
         for key in sorted(set(before) | set(after))
@@ -179,6 +229,8 @@ def stats_delta(before: dict[str, int], after: dict[str, int]) -> dict[str, int]
 
 
 def payload_for(problem: Problem, pattern: str, args: argparse.Namespace) -> dict[str, Any]:
+    """Create the inferlet input while keeping the reference answer outside."""
+
     return {
         "pattern": pattern,
         "question": problem.question,
@@ -201,6 +253,8 @@ def result_for(
     engine_stats_delta: dict[str, int],
     error: str | None,
 ) -> RunResult:
+    """Score one inferlet output with deterministic answer and oracle metrics."""
+
     predicted = normalize_number(output.get("final_answer") if output else None)
     candidate_answers = [
         normalize_number(candidate.get("answer"))
@@ -224,6 +278,8 @@ def result_for(
 
 
 def print_result(result: RunResult) -> None:
+    """Print a compact progress line during long benchmark runs."""
+
     status = "correct" if result.correct else "wrong"
     if result.error:
         status = "error"
@@ -236,6 +292,8 @@ def print_result(result: RunResult) -> None:
 
 
 def parse_pie_run_output(stdout: str) -> dict[str, Any]:
+    """Read the final JSON object from `pie run` stdout."""
+
     for line in reversed(stdout.splitlines()):
         line = line.strip()
         if not line:
@@ -250,11 +308,12 @@ def parse_pie_run_output(stdout: str) -> dict[str, Any]:
 
 
 def run_cli(args: argparse.Namespace) -> list[RunResult]:
+    """Run each problem/pattern through `pie run` for deployment parity tests."""
+
     if not args.config:
         raise ValueError("--config is required when --execution-mode=cli")
 
     problems = load_problems(Path(args.dataset), args.max_problems)
-    wasm, manifest, _package = inferlet_paths()
     patterns = PATTERNS if args.pattern == "all" else (args.pattern,)
     results: list[RunResult] = []
 
@@ -264,6 +323,7 @@ def run_cli(args: argparse.Namespace) -> list[RunResult]:
         for pattern in patterns:
             for repetition in range(args.repetitions):
                 payload = payload_for(problem, pattern, args)
+                wasm, manifest, _package = inferlet_paths(pattern, args)
                 cmd = [
                     str(pie_bin),
                     "run",
@@ -308,17 +368,22 @@ def run_cli(args: argparse.Namespace) -> list[RunResult]:
 
 
 async def run_embedded(args: argparse.Namespace) -> list[RunResult]:
+    """Run all requested patterns against one embedded server instance."""
+
     from pie.server import Server
     from pie_client import Event
 
     problems = load_problems(Path(args.dataset), args.max_problems)
-    wasm, manifest, package = inferlet_paths()
     patterns = PATTERNS if args.pattern == "all" else (args.pattern,)
     results: list[RunResult] = []
 
     async with Server(build_config(args)) as server:
         client = await server.connect()
-        await client.install_program(wasm, manifest, force_overwrite=True)
+        packages: dict[str, str] = {}
+        for pattern in patterns:
+            wasm, manifest, package = inferlet_paths(pattern, args)
+            await client.install_program(wasm, manifest, force_overwrite=True)
+            packages[pattern] = package
 
         for problem in problems:
             for pattern in patterns:
@@ -329,7 +394,9 @@ async def run_embedded(args: argparse.Namespace) -> list[RunResult]:
                     output = None
                     error = None
                     try:
-                        process = await client.launch_process(package, input=payload)
+                        process = await client.launch_process(
+                            packages[pattern], input=payload
+                        )
                         while True:
                             event, message = await asyncio.wait_for(
                                 process.recv(), timeout=args.timeout
@@ -358,12 +425,16 @@ async def run_embedded(args: argparse.Namespace) -> list[RunResult]:
 
 
 async def run(args: argparse.Namespace) -> list[RunResult]:
+    """Dispatch to the selected execution mode."""
+
     if args.execution_mode == "cli":
         return run_cli(args)
     return await run_embedded(args)
 
 
 def summarize(results: list[RunResult]) -> dict[str, Any]:
+    """Aggregate accuracy, oracle-candidate, latency, and token metrics."""
+
     summary: dict[str, Any] = {}
     for pattern in sorted({result.pattern for result in results}):
         rows = [result for result in results if result.pattern == pattern]
@@ -397,6 +468,8 @@ def summarize(results: list[RunResult]) -> dict[str, Any]:
 
 
 def write_results(path: Path, args: argparse.Namespace, results: list[RunResult]) -> None:
+    """Persist the full run artifact including config, summary, and raw rows."""
+
     artifact = {
         "config": vars(args),
         "summary": summarize(results),
@@ -407,6 +480,8 @@ def write_results(path: Path, args: argparse.Namespace, results: list[RunResult]
 
 
 def parser() -> argparse.ArgumentParser:
+    """Define CLI options for local smoke checks and RunPod experiments."""
+
     p = argparse.ArgumentParser(description="Pie reasoning-pattern benchmark")
     p.add_argument(
         "--execution-mode",
@@ -426,6 +501,22 @@ def parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--dataset", default=str(ROOT / "benches" / "reasoning_smoke.jsonl"))
     p.add_argument("--pattern", choices=("all", *PATTERNS), default="all")
+    p.add_argument(
+        "--inferlet-mode",
+        choices=("separate", "prototype"),
+        default="separate",
+        help=(
+            "Use method-specific reasoning-* inferlets or the legacy "
+            "reasoning-benchmark pattern switch."
+        ),
+    )
+    p.add_argument(
+        "--inferlet-dir",
+        action="append",
+        default=[],
+        metavar="PATTERN=PATH",
+        help="Override a method-specific inferlet directory.",
+    )
     p.add_argument("--model", default="Qwen/Qwen3-0.6B")
     p.add_argument(
         "--driver",

@@ -1,0 +1,19 @@
+[package]
+name = "reasoning-direct"
+version = "0.1.0"
+description = "Direct text-completion baseline for reasoning benchmarks"
+authors = ["Pie Team"]
+
+[runtime]
+core = "^0.2.0"
+mcp = "^0.2.0"
+
+[parameters]
+question = {type = "string", description = "Math word problem to solve"}
+num_candidates = {type = "int", optional = true, description = "Ignored by direct mode; accepted for runner compatibility"}
+beam_width = {type = "int", optional = true, description = "Ignored by direct mode; accepted for runner compatibility"}
+max_tokens = {type = "int", optional = true, description = "Maximum answer tokens per generation (default: 256)"}
+score_tokens = {type = "int", optional = true, description = "Ignored by direct mode; accepted for runner compatibility"}
+temperature = {type = "float", optional = true, description = "Sampling temperature (default: 0.7)"}
+top_p = {type = "float", optional = true, description = "Candidate top-p value (default: 0.95)"}
+thinking = {type = "bool", optional = true, description = "Allow model thinking blocks (default: false)"}

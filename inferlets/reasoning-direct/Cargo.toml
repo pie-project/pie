@@ -1,5 +1,5 @@
 [package]
-name = "reasoning-benchmark"
+name = "reasoning-direct"
 version = "0.1.0"
 edition = "2024"
 

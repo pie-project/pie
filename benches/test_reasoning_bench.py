@@ -8,6 +8,7 @@ from argparse import Namespace
 
 from benches.reasoning_bench import (
     Problem,
+    PATTERN_INFERLETS,
     load_problems,
     normalize_number,
     payload_for,
@@ -52,6 +53,12 @@ class ReasoningBenchTests(unittest.TestCase):
         )
         payload = payload_for(Problem("p1", "How many?", "42"), "direct", args)
         self.assertIs(payload["thinking"], True)
+
+    def test_has_separate_inferlet_for_each_pattern(self):
+        self.assertEqual(
+            set(PATTERN_INFERLETS),
+            {"direct", "best_of_n", "tree_of_thought", "graph_of_thought"},
+        )
 
     def test_loads_official_gsm8k_shape(self):
         with tempfile.TemporaryDirectory() as directory:

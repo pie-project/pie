@@ -1,5 +1,5 @@
 [package]
-name = "reasoning-benchmark"
+name = "reasoning-base"
 version = "0.1.0"
 edition = "2024"
 
@@ -8,7 +8,7 @@ crate-type = ["cdylib"]
 
 [dependencies]
 inferlet = { path = "../../sdk/rust/inferlet" }
-reasoning-core = { path = "../reasoning-core" }
+serde = { version = "1.0", features = ["derive"] }
 
 [profile.release]
 lto = true
