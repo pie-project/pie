@@ -27,6 +27,20 @@ inline std::int32_t gemma4_kv_source(const std::string& pattern,
 
 }  // namespace
 
+ggml_tensor* gemma4_manual_decode_mask_view(ggml_context* ctx,
+                                            ggml_tensor* packed_mask,
+                                            std::int32_t max_n_kv,
+                                            std::int32_t n_req) {
+    // Pure-decode masks are flash-attn shaped; manual full-attention SDPA
+    // needs only the live single-query row.
+    return ggml_view_4d(ctx, packed_mask,
+                        max_n_kv, /*ne1=*/1, /*ne2=*/1, n_req,
+                        packed_mask->nb[1],
+                        packed_mask->nb[2],
+                        packed_mask->nb[3],
+                        /*offset=*/0);
+}
+
 // Gemma 4 / 3n-style graph. Differs from build_qwen3_graph in:
 //   - per-layer head_dim (sliding=head_dim, full=gemma4_head_dim_global),
 //   - per-layer-type rope_theta + proportional rotary factor,
@@ -289,31 +303,25 @@ GraphResult build_gemma4_graph(ggml_context* ctx,
                     ggml_flash_attn_ext_set_prec(attn, GGML_PREC_F32);
                 } else {
                     // Full layers (head_dim=512): manual SDPA, batched over
-                    // n_req via ne[3]. GQA expands K/V from n_kv_heads_il to
-                    // n_q_heads via repeat_4d so mul_mat lines up per head.
-                    const std::int32_t gqa_factor = n_q_heads / n_kv_heads_il;
+                    // n_req via ne[3]. Keep K/V at n_kv_heads_il; ggml_mul_mat
+                    // applies the same grouped-query broadcast as the slow path.
                     ggml_tensor* K_h = K_4d;
                     ggml_tensor* V_h = V_4d;
-                    if (gqa_factor > 1) {
-                        K_h = ggml_repeat_4d(
-                            ctx, K_4d, head_dim_il, n_q_heads,
-                            plan.max_n_kv, n_req);
-                        V_h = ggml_repeat_4d(
-                            ctx, V_4d, head_dim_il, n_q_heads,
-                            plan.max_n_kv, n_req);
-                    }
-                    // K_perm: [head_dim, max_n_kv, n_q_heads, n_req]
+                    // K_perm: [head_dim, max_n_kv, n_kv_heads_il, n_req]
                     // Q_4d  : [head_dim, 1,        n_q_heads, n_req]
                     // KQ = mul_mat(K_perm, Q_4d) → [max_n_kv, 1, n_q_heads, n_req]
                     auto* K_perm = ggml_cont(ctx, ggml_permute(ctx, K_h, 0, 2, 1, 3));
                     auto* KQ = ggml_mul_mat(ctx, K_perm, Q_4d);
                     // mask shape [max_n_kv, MASK_PAD, 1, n_req]; broadcast
                     // ne[2]=1 onto KQ's ne[2]=n_q_heads.
+                    auto* mask_one_q = gemma4_manual_decode_mask_view(
+                        ctx, mask, plan.max_n_kv, n_req);
                     auto* KQ_soft = ggml_soft_max_ext(
-                        ctx, KQ, mask,
+                        ctx, KQ, mask_one_q,
                         layer_kq_scale, /*max_bias=*/0.0f);
                     // V_T: transpose kv-axis and head-axis to feed mul_mat.
-                    // Want [max_n_kv, head_dim, n_q_heads, n_req] for V^T @ KQ_soft.
+                    // Shape is [n_kv_heads_il, max_n_kv, head_dim, n_req];
+                    // ggml applies grouped-query broadcast against KQ_soft.
                     auto* V_T = ggml_cont(
                         ctx, ggml_permute(ctx, V_h, 1, 2, 0, 3));
                     // mul_mat: [head_dim, 1, n_q_heads, n_req]
