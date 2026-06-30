@@ -300,6 +300,26 @@ mod portable_gemma4_hardening_tests {
     }
 }
 
+// Gemma4 pure-decode packs masks for flash-attn; manual full-attention SDPA
+// must view the single live query row.
+#[cfg(all(test, feature = "driver-portable"))]
+mod portable_gemma4_decode_mask_tests {
+    use std::os::raw::c_int;
+
+    unsafe extern "C" {
+        fn pie_portable_test_gemma4_manual_decode_mask_view_status() -> c_int;
+    }
+
+    #[test]
+    fn manual_full_attention_decode_uses_single_query_mask_view() {
+        assert_eq!(
+            unsafe { pie_portable_test_gemma4_manual_decode_mask_view_status() },
+            0,
+            "Gemma4 pure-decode manual SDPA must view packed masks as one query row"
+        );
+    }
+}
+
 // Bug-B regression guard: the KV-swap / ToT-fork page-copy loop in
 // service/inproc_service.cpp sizes and offsets every per-layer page copy with
 // `KvCachePaged::page_bytes(layer)`. Gemma 4's alternating attention gives
