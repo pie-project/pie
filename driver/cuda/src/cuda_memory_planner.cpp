@@ -613,10 +613,30 @@ CudaMemoryPlan plan_cuda_memory(
                               : 608.0;
             const double score_kv_horizon =
                 score_as_auto ? (low_horizon_kv_heavy ? 384.0 : 544.0) : 608.0;
-            const std::size_t min_kv_tokens = std::max<std::size_t>(
+            const std::size_t desired_kv_tokens = std::max<std::size_t>(
                 32768,
                 static_cast<std::size_t>(
                     std::ceil(static_cast<double>(R) * min_kv_horizon)));
+            // The 32768 residency floor assumes a large GPU. On small cards
+            // (e.g. a 4 GB RTX 3050) the budget cannot hold that many KV tokens
+            // for any model, so every candidate is rejected and the planner
+            // throws "no viable forward/KV layout" even though a modest,
+            // usable KV pool fits (see issue #450). Cap the floor by what this
+            // candidate's budget can actually afford for KV. The `* 7 / 8`
+            // margin absorbs page-flooring (kv_tokens is rounded down to a page
+            // multiple) so the very candidate we mean to admit is not rejected
+            // by a sub-page remainder; a small absolute floor still rejects
+            // genuinely-too-small cards. On large cards `affordable_kv_tokens`
+            // exceeds 32768, so `min_kv_tokens` stays 32768 and behavior is
+            // unchanged.
+            const std::size_t affordable_kv_tokens =
+                (budget > arena + state_bytes)
+                    ? (budget - arena - state_bytes) / per_kv_token_bytes
+                    : 0;
+            const std::size_t affordable_floor =
+                std::max<std::size_t>(2048, affordable_kv_tokens * 7 / 8);
+            const std::size_t min_kv_tokens =
+                std::min(desired_kv_tokens, affordable_floor);
             if (kv_tokens < min_kv_tokens) continue;
 
             CudaMemoryPlan p;
