@@ -1,0 +1,208 @@
+// ptir_metal_test — bit-exact parity harness for the PTIR sampling-IR
+// foundational ops on Metal.
+//
+// Each op's Metal kernel output is compared byte-for-byte (u32 bit pattern)
+// against the CPU reference (reference.hpp, a port of echo's Rust eval.rs).
+// The CPU reference is the interim cross-backend oracle; once echo's golden
+// vector files are wired in, the same reference is asserted == golden so the
+// chain Metal == CPU-ref == golden == CUDA holds.
+//
+// Usage: ptir_metal_test [kernels_dir]   (default: PTIR_KERNELS_DIR)
+
+#include <cstdint>
+#include <cstdio>
+#include <cstring>
+#include <string>
+#include <vector>
+
+#include "metal_harness.hpp"
+#include "reference.hpp"
+
+#ifndef PTIR_KERNELS_DIR
+#define PTIR_KERNELS_DIR "."
+#endif
+
+using namespace ptir_metal;
+
+namespace {
+
+int g_pass = 0, g_fail = 0;
+
+void report(const std::string& name, const std::vector<float>& got,
+            const std::vector<float>& want) {
+    long d = first_bit_diff(got, want);
+    if (d < 0) {
+        std::printf("  PASS  %s (%zu lanes bit-exact)\n", name.c_str(), want.size());
+        ++g_pass;
+    } else {
+        std::uint32_t bg = 0, bw = 0;
+        if (static_cast<std::size_t>(d) < got.size())
+            std::memcpy(&bg, &got[d], 4);
+        if (static_cast<std::size_t>(d) < want.size())
+            std::memcpy(&bw, &want[d], 4);
+        std::printf("  FAIL  %s: lane %ld got=0x%08x want=0x%08x\n", name.c_str(), d, bg, bw);
+        ++g_fail;
+    }
+}
+
+// ── mask_apply_packed (vector) ───────────────────────────────────────────────
+void test_mask_apply_packed(MetalHarness& h) {
+    const std::uint32_t n = 70;  // spans 3 mask words, tests tail bits
+    std::vector<float> logits(n);
+    for (std::uint32_t j = 0; j < n; ++j) logits[j] = static_cast<float>(j) - 12.5f;
+    // Allow every 3rd token; word-packed.
+    std::vector<std::uint32_t> mask((n + 31) / 32, 0);
+    for (std::uint32_t j = 0; j < n; ++j)
+        if (j % 3 == 0) mask[j >> 5] |= (1u << (j & 31u));
+
+    auto want = ref::mask_apply_packed(logits, mask);
+    std::vector<float> got(n, 0.0f);
+    std::vector<Arg> args = {
+        Arg::in(logits.data(), n * sizeof(float)),
+        Arg::in(mask.data(), mask.size() * sizeof(std::uint32_t)),
+        Arg::out(got.data(), n * sizeof(float)),
+        Arg::in(&n, sizeof(n)),
+    };
+    if (!h.run("mask_apply_packed", args, n)) {
+        std::printf("  FAIL  mask_apply_packed: %s\n", h.error().c_str());
+        ++g_fail;
+        return;
+    }
+    report("mask_apply_packed", got, want);
+}
+
+// ── mask_apply_packed (matrix, per-row) ──────────────────────────────────────
+void test_mask_apply_packed_matrix(MetalHarness& h) {
+    const std::uint32_t rows = 4, vocab = 40;  // k=4 (echo's matrix golden shape)
+    const std::uint32_t wpr = (vocab + 31) / 32;
+    const std::uint32_t total = rows * vocab;
+    std::vector<float> logits(total);
+    for (std::uint32_t i = 0; i < total; ++i) logits[i] = static_cast<float>(i) * 0.25f - 3.0f;
+    std::vector<std::uint32_t> mask(static_cast<std::size_t>(rows) * wpr, 0);
+    for (std::uint32_t r = 0; r < rows; ++r)
+        for (std::uint32_t c = 0; c < vocab; ++c)
+            if ((c % (r + 2)) == 0) mask[r * wpr + (c >> 5)] |= (1u << (c & 31u));
+
+    auto want = ref::mask_apply_packed_matrix(logits, mask, rows, vocab, wpr);
+    std::vector<float> got(total, 0.0f);
+    std::vector<Arg> args = {
+        Arg::in(logits.data(), total * sizeof(float)),
+        Arg::in(mask.data(), mask.size() * sizeof(std::uint32_t)),
+        Arg::out(got.data(), total * sizeof(float)),
+        Arg::in(&vocab, sizeof(vocab)),
+        Arg::in(&wpr, sizeof(wpr)),
+        Arg::in(&total, sizeof(total)),
+    };
+    if (!h.run("mask_apply_packed_matrix", args, total)) {
+        std::printf("  FAIL  mask_apply_packed_matrix: %s\n", h.error().c_str());
+        ++g_fail;
+        return;
+    }
+    report("mask_apply_packed_matrix", got, want);
+}
+
+// ── dselect (matrix keep-mask apply) ─────────────────────────────────────────
+void test_dselect(MetalHarness& h) {
+    const std::uint32_t rows = 4, vocab = 32;
+    const std::uint32_t n = rows * vocab;
+    std::vector<std::uint8_t> cond(n);
+    std::vector<float> a(n), b(n);
+    for (std::uint32_t i = 0; i < n; ++i) {
+        cond[i] = (i * 7u + 1u) % 3u == 0 ? 1 : 0;
+        a[i] = static_cast<float>(i) * 0.5f;
+        b[i] = ref::kNegInf;  // the neg-inf fill (dselect(keep, scores, neg_inf))
+    }
+    auto want = ref::dselect_f32(cond, a, b);
+    std::vector<float> got(n, 0.0f);
+    std::vector<Arg> args = {
+        Arg::in(cond.data(), n * sizeof(std::uint8_t)),
+        Arg::in(a.data(), n * sizeof(float)),
+        Arg::in(b.data(), n * sizeof(float)),
+        Arg::out(got.data(), n * sizeof(float)),
+        Arg::in(&n, sizeof(n)),
+    };
+    std::uint32_t lc = n, la = n, lb = n;
+    args.push_back(Arg::in(&lc, sizeof(lc)));
+    args.push_back(Arg::in(&la, sizeof(la)));
+    args.push_back(Arg::in(&lb, sizeof(lb)));
+    if (!h.run("dselect_f32", args, n)) {
+        std::printf("  FAIL  dselect_f32: %s\n", h.error().c_str());
+        ++g_fail;
+        return;
+    }
+    report("dselect_f32", got, want);
+}
+
+// ── broadcast_matrix (scalar neg_inf -> [k, vocab]) ──────────────────────────
+void test_broadcast_matrix(MetalHarness& h) {
+    const std::uint32_t k = 4, vocab = 40;  // echo's broadcast_matrix(neg_inf, k, vocab)
+    std::vector<float> src = {ref::kNegInf};
+    auto want = ref::broadcast_matrix_f32(src, 1, 1, k, vocab);
+    std::vector<float> got(static_cast<std::size_t>(k) * vocab, 0.0f);
+    std::uint32_t sr = 1, sc = 1, dr = k, dc = vocab;
+    std::vector<Arg> args = {
+        Arg::in(src.data(), src.size() * sizeof(float)),
+        Arg::out(got.data(), got.size() * sizeof(float)),
+        Arg::in(&sr, sizeof(sr)),
+        Arg::in(&sc, sizeof(sc)),
+        Arg::in(&dr, sizeof(dr)),
+        Arg::in(&dc, sizeof(dc)),
+    };
+    if (!h.run("broadcast_matrix_f32", args, k * vocab)) {
+        std::printf("  FAIL  broadcast_matrix_f32: %s\n", h.error().c_str());
+        ++g_fail;
+        return;
+    }
+    report("broadcast_matrix_f32", got, want);
+
+    // Also exercise per-row [m]->[m,n] (src viewed as (m,1)).
+    std::vector<float> rowsrc = {1.0f, -2.0f, 3.0f, ref::kNegInf};
+    auto want2 = ref::broadcast_matrix_f32(rowsrc, 4, 1, 4, vocab);
+    std::vector<float> got2(static_cast<std::size_t>(4) * vocab, 0.0f);
+    std::uint32_t sr2 = 4, sc2 = 1, dr2 = 4, dc2 = vocab;
+    std::vector<Arg> args2 = {
+        Arg::in(rowsrc.data(), rowsrc.size() * sizeof(float)),
+        Arg::out(got2.data(), got2.size() * sizeof(float)),
+        Arg::in(&sr2, sizeof(sr2)),
+        Arg::in(&sc2, sizeof(sc2)),
+        Arg::in(&dr2, sizeof(dr2)),
+        Arg::in(&dc2, sizeof(dc2)),
+    };
+    if (!h.run("broadcast_matrix_f32", args2, 4 * vocab)) {
+        std::printf("  FAIL  broadcast_matrix_f32 (per-row): %s\n", h.error().c_str());
+        ++g_fail;
+        return;
+    }
+    report("broadcast_matrix_f32 (per-row)", got2, want2);
+}
+
+}  // namespace
+
+int main(int argc, char** argv) {
+    std::string kernels_dir = argc > 1 ? argv[1] : PTIR_KERNELS_DIR;
+    std::string kernel_src = kernels_dir + "/sampling_ir.metal";
+
+    MetalHarness h;
+    if (!h.ok()) {
+        std::printf("PTIR_METAL_TEST_FAIL: %s\n", h.error().c_str());
+        return 2;
+    }
+    std::printf("device: %s\n", h.device_name().c_str());
+    if (!h.load_library(kernel_src)) {
+        std::printf("PTIR_METAL_TEST_FAIL: %s\n", h.error().c_str());
+        return 2;
+    }
+
+    test_mask_apply_packed(h);
+    test_mask_apply_packed_matrix(h);
+    test_dselect(h);
+    test_broadcast_matrix(h);
+
+    std::printf("\n%d passed, %d failed\n", g_pass, g_fail);
+    if (g_fail == 0) {
+        std::printf("PTIR_METAL_TEST_OK\n");
+        return 0;
+    }
+    std::printf("PTIR_METAL_TEST_FAIL\n");
+    return 1;
+}
