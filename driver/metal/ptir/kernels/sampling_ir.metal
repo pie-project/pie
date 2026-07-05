@@ -87,3 +87,139 @@ kernel void broadcast_matrix_f32(
     uint sc = (src_cols == 1u) ? 0u : c;
     out[gid] = src[sr * src_cols + sc];
 }
+
+// ── elementwise: unary + binary (scalar/len-1 broadcast) ─────────────────────
+// eval.rs: unary map_f32; binary zip_f32 with per-operand len-1 broadcast
+// (len == 1 => index 0). IEEE-exact (fast-math is disabled in the harness).
+
+kernel void neg_f32(
+    device const float* a   [[buffer(0)]],
+    device float*       out [[buffer(1)]],
+    constant uint&      n   [[buffer(2)]],
+    uint gid [[thread_position_in_grid]]) {
+    if (gid >= n) return;
+    out[gid] = -a[gid];
+}
+
+#define PTIR_BINARY(NAME, EXPR)                                            \
+kernel void NAME(                                                         \
+    device const float* a   [[buffer(0)]],                               \
+    device const float* b   [[buffer(1)]],                               \
+    device float*       out [[buffer(2)]],                               \
+    constant uint&      n   [[buffer(3)]],                               \
+    constant uint&      la  [[buffer(4)]],                               \
+    constant uint&      lb  [[buffer(5)]],                               \
+    uint gid [[thread_position_in_grid]]) {                              \
+    if (gid >= n) return;                                                 \
+    float x = a[(la == 1u) ? 0u : gid];                                  \
+    float y = b[(lb == 1u) ? 0u : gid];                                  \
+    out[gid] = (EXPR);                                                    \
+}
+PTIR_BINARY(add_f32, x + y)
+PTIR_BINARY(sub_f32, x - y)
+PTIR_BINARY(mul_f32, x * y)
+PTIR_BINARY(div_f32, x / y)
+PTIR_BINARY(max_elem_f32, fmax(x, y))
+PTIR_BINARY(min_elem_f32, fmin(x, y))
+#undef PTIR_BINARY
+
+// Comparisons → bool (uchar 0/1), same broadcast rule.
+#define PTIR_CMP(NAME, OP)                                                \
+kernel void NAME(                                                        \
+    device const float* a   [[buffer(0)]],                               \
+    device const float* b   [[buffer(1)]],                               \
+    device uchar*       out [[buffer(2)]],                               \
+    constant uint&      n   [[buffer(3)]],                               \
+    constant uint&      la  [[buffer(4)]],                               \
+    constant uint&      lb  [[buffer(5)]],                               \
+    uint gid [[thread_position_in_grid]]) {                              \
+    if (gid >= n) return;                                                 \
+    float x = a[(la == 1u) ? 0u : gid];                                  \
+    float y = b[(lb == 1u) ? 0u : gid];                                  \
+    out[gid] = (x OP y) ? 1 : 0;                                          \
+}
+PTIR_CMP(gt_f32, >)
+PTIR_CMP(ge_f32, >=)
+PTIR_CMP(eq_f32, ==)
+#undef PTIR_CMP
+
+// ── reductions over the last axis (per-row for rank >= 2) ────────────────────
+// One thread per row scans sequentially to match the Rust fold's accumulation
+// order exactly (tree reductions would reassociate and diverge). grid = rows.
+
+kernel void reduce_sum_rows(
+    device const float* in  [[buffer(0)]],
+    device float*       out [[buffer(1)]],
+    constant uint&      rows [[buffer(2)]],
+    constant uint&      len  [[buffer(3)]],
+    uint r [[thread_position_in_grid]]) {
+    if (r >= rows) return;
+    float acc = 0.0f;
+    for (uint j = 0; j < len; ++j) acc = acc + in[r * len + j];
+    out[r] = acc;
+}
+
+kernel void reduce_max_rows(
+    device const float* in  [[buffer(0)]],
+    device float*       out [[buffer(1)]],
+    constant uint&      rows [[buffer(2)]],
+    constant uint&      len  [[buffer(3)]],
+    uint r [[thread_position_in_grid]]) {
+    if (r >= rows) return;
+    float acc = -INFINITY;
+    for (uint j = 0; j < len; ++j) acc = fmax(acc, in[r * len + j]);
+    out[r] = acc;
+}
+
+kernel void reduce_min_rows(
+    device const float* in  [[buffer(0)]],
+    device float*       out [[buffer(1)]],
+    constant uint&      rows [[buffer(2)]],
+    constant uint&      len  [[buffer(3)]],
+    uint r [[thread_position_in_grid]]) {
+    if (r >= rows) return;
+    float acc = INFINITY;
+    for (uint j = 0; j < len; ++j) acc = fmin(acc, in[r * len + j]);
+    out[r] = acc;
+}
+
+// Per-row argmax -> I32 token; strict '>' with first-max-wins (init best=-inf,
+// bi=0) exactly matching eval.rs `argmax`.
+kernel void reduce_argmax_rows(
+    device const float* in  [[buffer(0)]],
+    device int*         out [[buffer(1)]],
+    constant uint&      rows [[buffer(2)]],
+    constant uint&      len  [[buffer(3)]],
+    uint r [[thread_position_in_grid]]) {
+    if (r >= rows) return;
+    float best = -INFINITY;
+    int bi = 0;
+    for (uint j = 0; j < len; ++j) {
+        float x = in[r * len + j];
+        if (x > best) { best = x; bi = (int)j; }
+    }
+    out[r] = bi;
+}
+
+// ── scans over the last axis (per-row for rank >= 2) ─────────────────────────
+kernel void cumsum_rows(
+    device const float* in  [[buffer(0)]],
+    device float*       out [[buffer(1)]],
+    constant uint&      rows [[buffer(2)]],
+    constant uint&      len  [[buffer(3)]],
+    uint r [[thread_position_in_grid]]) {
+    if (r >= rows) return;
+    float acc = 0.0f;
+    for (uint j = 0; j < len; ++j) { acc = acc + in[r * len + j]; out[r * len + j] = acc; }
+}
+
+kernel void cumprod_rows(
+    device const float* in  [[buffer(0)]],
+    device float*       out [[buffer(1)]],
+    constant uint&      rows [[buffer(2)]],
+    constant uint&      len  [[buffer(3)]],
+    uint r [[thread_position_in_grid]]) {
+    if (r >= rows) return;
+    float acc = 1.0f;
+    for (uint j = 0; j < len; ++j) { acc = acc * in[r * len + j]; out[r * len + j] = acc; }
+}

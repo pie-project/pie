@@ -32,12 +32,27 @@ compute dispatch, and Shared/UMA readback all work on Apple M1 Max.
 
 ## Ops implemented (M2)
 
-| op | Rust `Op` | semantics |
-|----|-----------|-----------|
+| op(s) | Rust `Op` | semantics |
+|-------|-----------|-----------|
 | `mask_apply_packed`        | `MaskApply` | `out[j] = bit_j(mask) ? logits[j] : -inf`, `bit_j=(mask[j>>5]>>(j&31))&1` (vector) |
-| `mask_apply_packed_matrix` | `MaskApply` | per-row packed bitmap over `[rows, vocab]` (`matrix_mask_apply_packed`) |
+| `mask_apply_packed_matrix` | `MaskApply` | ONE packed word-row `[ceil(vocab/32)]` broadcast over all rows, bit = column (pinned 0x65 contract) |
 | `dselect_f32`              | `Select`    | `out[i] = cond[i] ? a[i] : b[i]` with per-operand len-1 broadcast |
 | `broadcast_matrix_f32`     | `Broadcast` | rank≤2 left-aligned row-major broadcast (scalar→`[k,vocab]`, `[m]`→`[m,n]`) |
+| `neg_f32`                  | `Neg`       | unary negate |
+| `add/sub/mul/div_f32`      | `Add/Sub/Mul/Div` | binary elementwise, scalar/len-1 broadcast (temperature scale = `div`) |
+| `max_elem/min_elem_f32`    | `MaxElem/MinElem` | elementwise max/min |
+| `gt/ge/eq_f32`             | `Gt/Ge/Eq`  | comparison → bool bytes |
+| `reduce_sum/max/min_rows`  | `ReduceSum/Max/Min` | per-row reduction, sequential fold order |
+| `reduce_argmax_rows`       | `ReduceArgmax` | per-row argmax → I32 token (strict `>`, first-max wins) — greedy |
+| `cumsum/cumprod_rows`      | `CumSum/CumProd` | per-row scan (top-p prefix) |
+
+**Bit-exactness note:** the harness compiles kernels with **fast-math disabled**
+(`MTLMathModeSafe`), so `div`/`mul`/reductions are IEEE-correctly-rounded and
+byte-identical to the Rust reference. Reductions/scans use one thread per row
+with sequential accumulation to match the Rust fold order exactly (a tree
+reduction would reassociate float adds and diverge). Transcendentals
+(`exp`/`log`) are deferred — GPU vs host libm are not guaranteed bit-identical;
+they need the golden-output (argmax token) framing rather than raw-value parity.
 
 ## Build & run
 

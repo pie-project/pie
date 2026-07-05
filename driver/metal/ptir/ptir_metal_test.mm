@@ -12,6 +12,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -41,6 +42,21 @@ void report(const std::string& name, const std::vector<float>& got,
         if (static_cast<std::size_t>(d) < want.size())
             std::memcpy(&bw, &want[d], 4);
         std::printf("  FAIL  %s: lane %ld got=0x%08x want=0x%08x\n", name.c_str(), d, bg, bw);
+        ++g_fail;
+    }
+}
+
+// Byte-exact comparison for non-float payloads (I32 tokens, bool bytes).
+template <class T>
+void report_raw(const std::string& name, const std::vector<T>& got,
+                const std::vector<T>& want) {
+    if (got.size() == want.size() &&
+        std::memcmp(got.data(), want.data(), got.size() * sizeof(T)) == 0) {
+        std::printf("  PASS  %s (%zu lanes byte-exact)\n", name.c_str(), want.size());
+        ++g_pass;
+    } else {
+        std::printf("  FAIL  %s: byte mismatch (got %zu, want %zu lanes)\n", name.c_str(),
+                    got.size(), want.size());
         ++g_fail;
     }
 }
@@ -175,6 +191,121 @@ void test_broadcast_matrix(MetalHarness& h) {
     report("broadcast_matrix_f32 (per-row)", got2, want2);
 }
 
+// ── elementwise + reductions + scans ─────────────────────────────────────────
+void test_elementwise(MetalHarness& h) {
+    const std::uint32_t n = 33;
+    std::vector<float> a(n), b(n);
+    for (std::uint32_t i = 0; i < n; ++i) {
+        a[i] = static_cast<float>(i) * 0.5f - 4.0f;
+        b[i] = static_cast<float>((i * 3) % 7) + 0.25f;  // nonzero for div
+    }
+    std::uint32_t la = n, lb = n;
+
+    // neg
+    {
+        auto want = ref::neg_f32(a);
+        std::vector<float> got(n, 0.0f);
+        std::vector<Arg> args = {Arg::in(a.data(), n * 4), Arg::out(got.data(), n * 4),
+                                 Arg::in(&n, 4)};
+        if (h.run("neg_f32", args, n)) report("neg_f32", got, want);
+        else { std::printf("  FAIL  neg_f32: %s\n", h.error().c_str()); ++g_fail; }
+    }
+
+    struct BinOp { const char* fn; std::function<float(float, float)> f; };
+    std::vector<BinOp> bins = {
+        {"add_f32", [](float x, float y) { return x + y; }},
+        {"sub_f32", [](float x, float y) { return x - y; }},
+        {"mul_f32", [](float x, float y) { return x * y; }},
+        {"div_f32", [](float x, float y) { return x / y; }},
+        {"max_elem_f32", [](float x, float y) { return x > y ? x : (y > x ? y : x); }},
+        {"min_elem_f32", [](float x, float y) { return x < y ? x : (y < x ? y : x); }},
+    };
+    for (auto& op : bins) {
+        auto want = ref::binary_f32(a, b, op.f);
+        std::vector<float> got(n, 0.0f);
+        std::vector<Arg> args = {Arg::in(a.data(), n * 4), Arg::in(b.data(), n * 4),
+                                 Arg::out(got.data(), n * 4), Arg::in(&n, 4),
+                                 Arg::in(&la, 4), Arg::in(&lb, 4)};
+        if (h.run(op.fn, args, n)) report(op.fn, got, want);
+        else { std::printf("  FAIL  %s: %s\n", op.fn, h.error().c_str()); ++g_fail; }
+    }
+
+    // scalar (len-1) broadcast: temperature scale  logits / temp
+    {
+        std::vector<float> temp = {0.7f};
+        std::uint32_t l1 = 1;
+        auto want = ref::binary_f32(a, temp, [](float x, float y) { return x / y; });
+        std::vector<float> got(n, 0.0f);
+        std::vector<Arg> args = {Arg::in(a.data(), n * 4), Arg::in(temp.data(), 4),
+                                 Arg::out(got.data(), n * 4), Arg::in(&n, 4),
+                                 Arg::in(&la, 4), Arg::in(&l1, 4)};
+        if (h.run("div_f32", args, n)) report("div_f32 (scalar temp broadcast)", got, want);
+        else { std::printf("  FAIL  div_f32 scalar: %s\n", h.error().c_str()); ++g_fail; }
+    }
+
+    // comparison → bool bytes
+    {
+        auto want = ref::cmp_f32(a, b, [](float x, float y) { return x > y; });
+        std::vector<std::uint8_t> got(n, 0);
+        std::vector<Arg> args = {Arg::in(a.data(), n * 4), Arg::in(b.data(), n * 4),
+                                 Arg::out(got.data(), n), Arg::in(&n, 4),
+                                 Arg::in(&la, 4), Arg::in(&lb, 4)};
+        if (h.run("gt_f32", args, n)) report_raw("gt_f32", got, want);
+        else { std::printf("  FAIL  gt_f32: %s\n", h.error().c_str()); ++g_fail; }
+    }
+}
+
+void test_reductions(MetalHarness& h) {
+    const std::uint32_t rows = 3, len = 11;
+    const std::uint32_t total = rows * len;
+    std::vector<float> in(total);
+    for (std::uint32_t i = 0; i < total; ++i)
+        in[i] = static_cast<float>((i * 37) % 13) * 0.5f - 2.0f;
+
+    struct RedF { const char* fn; float init; std::function<float(float, float)> f; };
+    std::vector<RedF> reds = {
+        {"reduce_sum_rows", 0.0f, [](float a, float b) { return a + b; }},
+        {"reduce_max_rows", ref::kNegInf, [](float a, float b) { return a > b ? a : (b > a ? b : a); }},
+        {"reduce_min_rows", -ref::kNegInf, [](float a, float b) { return a < b ? a : (b < a ? b : a); }},
+    };
+    for (auto& op : reds) {
+        auto want = ref::reduce_rows(in, rows, len, op.init, op.f);
+        std::vector<float> got(rows, 0.0f);
+        std::vector<Arg> args = {Arg::in(in.data(), total * 4), Arg::out(got.data(), rows * 4),
+                                 Arg::in(&rows, 4), Arg::in(&len, 4)};
+        if (h.run(op.fn, args, rows)) report(op.fn, got, want);
+        else { std::printf("  FAIL  %s: %s\n", op.fn, h.error().c_str()); ++g_fail; }
+    }
+
+    // argmax → I32 tokens (greedy)
+    {
+        auto want = ref::argmax_rows(in, rows, len);
+        std::vector<std::int32_t> got(rows, 0);
+        std::vector<Arg> args = {Arg::in(in.data(), total * 4), Arg::out(got.data(), rows * 4),
+                                 Arg::in(&rows, 4), Arg::in(&len, 4)};
+        if (h.run("reduce_argmax_rows", args, rows)) report_raw("reduce_argmax_rows", got, want);
+        else { std::printf("  FAIL  reduce_argmax_rows: %s\n", h.error().c_str()); ++g_fail; }
+    }
+
+    // cumsum (top-p prefix)
+    {
+        auto want = ref::scan_rows(in, rows, len, 0.0f, [](float a, float b) { return a + b; });
+        std::vector<float> got(total, 0.0f);
+        std::vector<Arg> args = {Arg::in(in.data(), total * 4), Arg::out(got.data(), total * 4),
+                                 Arg::in(&rows, 4), Arg::in(&len, 4)};
+        if (h.run("cumsum_rows", args, rows)) report("cumsum_rows", got, want);
+        else { std::printf("  FAIL  cumsum_rows: %s\n", h.error().c_str()); ++g_fail; }
+    }
+    {
+        auto want = ref::scan_rows(in, rows, len, 1.0f, [](float a, float b) { return a * b; });
+        std::vector<float> got(total, 0.0f);
+        std::vector<Arg> args = {Arg::in(in.data(), total * 4), Arg::out(got.data(), total * 4),
+                                 Arg::in(&rows, 4), Arg::in(&len, 4)};
+        if (h.run("cumprod_rows", args, rows)) report("cumprod_rows", got, want);
+        else { std::printf("  FAIL  cumprod_rows: %s\n", h.error().c_str()); ++g_fail; }
+    }
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -196,6 +327,8 @@ int main(int argc, char** argv) {
     test_mask_apply_packed_matrix(h);
     test_dselect(h);
     test_broadcast_matrix(h);
+    test_elementwise(h);
+    test_reductions(h);
 
     std::printf("\n%d passed, %d failed\n", g_pass, g_fail);
     if (g_fail == 0) {

@@ -82,4 +82,74 @@ inline std::vector<float> broadcast_matrix_f32(const std::vector<float>& src,
     return out;
 }
 
+// ── elementwise + reductions + scans (bit-exact ports of eval.rs) ────────────
+
+inline std::vector<float> neg_f32(const std::vector<float>& a) {
+    std::vector<float> out(a.size());
+    for (std::size_t i = 0; i < a.size(); ++i) out[i] = -a[i];
+    return out;
+}
+
+// Binary map with per-operand len-1 broadcast (eval.rs zip_f32).
+template <class F>
+inline std::vector<float> binary_f32(const std::vector<float>& a,
+                                     const std::vector<float>& b, F f) {
+    std::size_t n = a.size() > b.size() ? a.size() : b.size();
+    auto pick = [](std::size_t l, std::size_t i) { return l == 1 ? std::size_t(0) : i; };
+    std::vector<float> out(n);
+    for (std::size_t i = 0; i < n; ++i) out[i] = f(a[pick(a.size(), i)], b[pick(b.size(), i)]);
+    return out;
+}
+
+// Comparison → bool bytes (eval.rs cmp).
+template <class F>
+inline std::vector<std::uint8_t> cmp_f32(const std::vector<float>& a,
+                                         const std::vector<float>& b, F f) {
+    std::size_t n = a.size() > b.size() ? a.size() : b.size();
+    auto pick = [](std::size_t l, std::size_t i) { return l == 1 ? std::size_t(0) : i; };
+    std::vector<std::uint8_t> out(n);
+    for (std::size_t i = 0; i < n; ++i)
+        out[i] = f(a[pick(a.size(), i)], b[pick(b.size(), i)]) ? 1 : 0;
+    return out;
+}
+
+// Per-row reduce (eval.rs reduce_rows / argmax_rows): sequential fold order.
+template <class F>
+inline std::vector<float> reduce_rows(const std::vector<float>& in, std::uint32_t rows,
+                                      std::uint32_t len, float init, F f) {
+    std::vector<float> out(rows);
+    for (std::uint32_t r = 0; r < rows; ++r) {
+        float acc = init;
+        for (std::uint32_t j = 0; j < len; ++j) acc = f(acc, in[r * len + j]);
+        out[r] = acc;
+    }
+    return out;
+}
+
+inline std::vector<std::int32_t> argmax_rows(const std::vector<float>& in,
+                                             std::uint32_t rows, std::uint32_t len) {
+    std::vector<std::int32_t> out(rows);
+    for (std::uint32_t r = 0; r < rows; ++r) {
+        float best = kNegInf;
+        std::int32_t bi = 0;
+        for (std::uint32_t j = 0; j < len; ++j) {
+            float x = in[r * len + j];
+            if (x > best) { best = x; bi = static_cast<std::int32_t>(j); }
+        }
+        out[r] = bi;
+    }
+    return out;
+}
+
+template <class F>
+inline std::vector<float> scan_rows(const std::vector<float>& in, std::uint32_t rows,
+                                    std::uint32_t len, float init, F f) {
+    std::vector<float> out(in.size());
+    for (std::uint32_t r = 0; r < rows; ++r) {
+        float acc = init;
+        for (std::uint32_t j = 0; j < len; ++j) { acc = f(acc, in[r * len + j]); out[r * len + j] = acc; }
+    }
+    return out;
+}
+
 }  // namespace ptir_metal::ref

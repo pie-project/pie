@@ -55,6 +55,15 @@ bool MetalHarness::load_library(const std::string& path) {
             return false;
         }
         MTLCompileOptions* opts = [[MTLCompileOptions alloc] init];
+        // IEEE-exact math is mandatory for bit-exact cross-backend parity: fast
+        // math would use reciprocal-approx division / reassociated adds and
+        // diverge from the Rust reference. Disable it (mathMode on macOS 15+,
+        // the deprecated fastMathEnabled otherwise).
+        if ([opts respondsToSelector:@selector(setMathMode:)]) {
+            opts.mathMode = MTLMathModeSafe;
+        } else {
+            opts.fastMathEnabled = NO;
+        }
         impl_->library = [impl_->device newLibraryWithSource:src options:opts error:&err];
         if (!impl_->library) {
             error_ = std::string("kernel compile failed: ") +
