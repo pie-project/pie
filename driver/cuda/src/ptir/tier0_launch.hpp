@@ -163,6 +163,10 @@ inline bool launch_op(const LaunchOp& o) {
                 k_cast<std::uint32_t, float><<<gs(o.numel), kTier0Block, 0, o.stream>>>((const std::uint32_t*)o.in[0], (float*)o.out, o.numel); return true; }
             if (o.elem_dtype == DType::Bool && o.out_dtype == DType::F32) {
                 k_cast<std::uint8_t, float><<<gs(o.numel), kTier0Block, 0, o.stream>>>((const std::uint8_t*)o.in[0], (float*)o.out, o.numel); return true; }
+            if (o.elem_dtype == DType::U32 && o.out_dtype == DType::I32) {
+                k_cast<std::uint32_t, std::int32_t><<<gs(o.numel), kTier0Block, 0, o.stream>>>((const std::uint32_t*)o.in[0], (std::int32_t*)o.out, o.numel); return true; }
+            if (o.elem_dtype == DType::I32 && o.out_dtype == DType::U32) {
+                k_cast<std::int32_t, std::uint32_t><<<gs(o.numel), kTier0Block, 0, o.stream>>>((const std::int32_t*)o.in[0], (std::uint32_t*)o.out, o.numel); return true; }
             return false;
         }
         // ── compare / logic ──

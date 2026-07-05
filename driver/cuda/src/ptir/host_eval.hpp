@@ -385,8 +385,7 @@ std::vector<T> broadcast_general(const std::vector<T>& src, const std::vector<st
                                  const std::vector<std::uint32_t>& tdims) {
     std::uint32_t R = (std::uint32_t)tdims.size();
     std::vector<std::uint32_t> sd(R, 1);
-    std::uint32_t off = R - (std::uint32_t)sdims.size();
-    for (std::size_t k = 0; k < sdims.size(); ++k) sd[off + k] = sdims[k];
+    for (std::size_t k = 0; k < sdims.size() && k < R; ++k) sd[k] = sdims[k];  // left-align
     std::vector<std::uint32_t> stride(R, 0);
     std::uint32_t st = 1;
     for (int d = (int)R - 1; d >= 0; --d) { stride[d] = (sd[d] == 1 && tdims[d] > 1) ? 0 : st; st *= sd[d]; }

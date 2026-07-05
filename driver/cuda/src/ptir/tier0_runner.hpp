@@ -19,6 +19,7 @@
 
 #include <cstdint>
 #include <cstring>
+#include <algorithm>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -109,6 +110,15 @@ class Tier0Runner {
 
         // ── end-of-pass predicated commit bump (pass-atomic, §7.1) ──
         if (res.ok) {
+            // Register/SPSC semantics (T4): a channel consumed by multiple ops in
+            // one pass (e.g. a descriptor port AND an epilogue take) advances its
+            // head exactly ONCE; multiple puts publish once (last wins). Dedup.
+            auto dedup = [](std::vector<std::uint32_t>& v) {
+                std::sort(v.begin(), v.end());
+                v.erase(std::unique(v.begin(), v.end()), v.end());
+            };
+            dedup(pass_taken);
+            dedup(pass_put);
             std::uint32_t *d_taken = nullptr, *d_put = nullptr;
             if (!pass_taken.empty()) { cudaMalloc(&d_taken, pass_taken.size() * 4);
                 cudaMemcpyAsync(d_taken, pass_taken.data(), pass_taken.size() * 4, cudaMemcpyHostToDevice, s); }
@@ -341,9 +351,11 @@ class Tier0Runner {
                     const Value* sv = op.args.empty() ? nullptr : trace_->value(op.args[0]);
                     std::uint32_t sd[4] = {1,1,1,1};
                     if (sv) {
+                        // LEFT-align (echo infer.rs can_broadcast_to): src dim k →
+                        // target position k; trailing positions padded with 1. So
+                        // reduce([B,V])→[B] broadcasts [B]→[B,V] as out[i,j]=src[i].
                         std::uint32_t sr = sv->type.shape.rank();
-                        std::uint32_t off = (sr <= R) ? (R - sr) : 0;
-                        for (std::uint32_t k = 0; k < sr && off + k < 4; ++k) sd[off + k] = sv->type.shape.dims[k];
+                        for (std::uint32_t k = 0; k < sr && k < 4; ++k) sd[k] = sv->type.shape.dims[k];
                     }
                     std::uint32_t st = 1;
                     for (int d = (int)R - 1; d >= 0; --d) {

@@ -21,12 +21,18 @@
 
 #include <cuda_runtime.h>
 
+#include "ptir/host_eval.hpp"
 #include "ptir/tier0_runner.hpp"
 
 using namespace pie_cuda_driver::ptir;
 
 namespace {
 int g_pass = 0, g_fail = 0;
+float* dev_ls(const std::vector<float>& h) {
+    float* d = nullptr; cudaMalloc(&d, h.size() * sizeof(float));
+    cudaMemcpy(d, h.data(), h.size() * sizeof(float), cudaMemcpyHostToDevice);
+    return d;
+}
 void expect(bool ok, const std::string& what) {
     if (ok) { ++g_pass; std::printf("  PASS  %s\n", what.c_str()); }
     else    { ++g_fail; std::printf("  FAIL  %s\n", what.c_str()); }
@@ -201,6 +207,48 @@ void test_gather_row_routing() {
     expect(ok, "gather([3,4], [2,0]) row-gathers to [[8,9,10,11],[0,1,2,3]]");
 }
 
+// ── Trace 6: log_softmax EXPANSION (reduce_max/bcast/sub/exp/reduce_sum/log/
+//    bcast/sub) over [2,8] via the runner — isolates beam's cand computation ──
+void test_log_softmax_expansion() {
+    std::printf("[log_softmax expansion]\n");
+    const std::uint32_t B = 2, V = 8;
+    Trace t;
+    Channel out; out.id = 0; out.type = {Shape::mat(B, V), DType::F32}; out.capacity = 1; out.host_visible = true;
+    t.channels = {out};
+    TensorType matt{Shape::mat(B, V), DType::F32}, vect{Shape::vec(B), DType::F32};
+    // v0 = intrinsic logits [B,V]; expansion ids v1..v8; put v8
+    Value lg = mk_value(0, matt, ValueSource::Intrinsic); lg.intrinsic = Intrinsic::Logits; t.values.push_back(lg);
+    for (ValueId id = 1; id <= 8; ++id)
+        t.values.push_back(mk_value(id, (id==1||id==5||id==6) ? vect : matt, ValueSource::OpResult));
+    Stage ep; ep.kind = StageKind::Epilogue;
+    auto op = [&](OpCode c, std::vector<ValueId> a, ValueId r, TensorType ty) { Op o; o.code=c; o.args=a; o.result_id=r; o.result_type=ty; ep.ops.push_back(o); };
+    op(OpCode::ReduceMax, {0}, 1, vect);           // m
+    op(OpCode::Broadcast, {1}, 2, matt);           // mb
+    op(OpCode::Sub, {0, 2}, 3, matt);              // c
+    op(OpCode::Exp, {3}, 4, matt);                 // e
+    op(OpCode::ReduceSum, {4}, 5, vect);           // s
+    op(OpCode::Log, {5}, 6, vect);                 // l
+    op(OpCode::Broadcast, {6}, 7, matt);           // lb
+    op(OpCode::Sub, {3, 7}, 8, matt);              // result
+    ep.puts = {{0, 8}};
+    t.stages = {ep};
+
+    std::vector<float> logits(B * V, 0.f); logits[3] = 8.f; logits[V + 5] = 7.f;
+    float* d_logits = dev_ls(logits);
+    Tier0Runner runner(t);
+    FireInputs in; in.logits = d_logits; in.vocab = V;
+    PassResult r = runner.run_pass(in);
+    std::vector<float> got(B * V); runner.arena().host_take(0, got.data(), got.size() * 4);
+    // host reference (fused log_softmax, same math)
+    std::vector<float> want = host_eval::normalize(NormKind::LogSoftmax, logits, B, V);
+    bool ok = r.ok && r.committed;
+    for (std::size_t i = 0; ok && i < got.size(); ++i)
+        ok = std::fabs(got[i] - want[i]) <= 1e-4f + 1e-4f * std::fabs(want[i]);
+    expect(ok, "log_softmax expansion matches fused (got[3]=" + std::to_string(got[3]) + " want=" + std::to_string(want[3]) + ")");
+    if (!ok) std::printf("        got: [%g %g %g %g ...] want: [%g %g %g %g ...]\n", got[0],got[1],got[2],got[3], want[0],want[1],want[2],want[3]);
+    cudaFree(d_logits);
+}
+
 }  // namespace
 
 int main() {
@@ -213,6 +261,7 @@ int main() {
     test_argmax_epilogue();
     test_backpressure();
     test_gather_row_routing();
+    test_log_softmax_expansion();
 
     std::printf("\n==== runner: %d passed, %d failed ====\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;
