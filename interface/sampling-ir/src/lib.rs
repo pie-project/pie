@@ -52,6 +52,7 @@
 extern crate alloc;
 
 pub mod bytecode;
+pub mod ptir;
 pub mod types;
 pub mod validate;
 pub mod witmap;

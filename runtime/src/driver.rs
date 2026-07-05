@@ -27,6 +27,14 @@ mod ops;
 mod prefetch;
 mod shmem;
 
+/// X0 — the tensor-waker substrate (Runtime–Driver Boundary B9–B12): the
+/// Rust-owned waker slot table + `pie_wake` FFI the direct-call transport
+/// (X1–X4) parks on. Lives in the leaf crate `pie-waker` (so the
+/// register/commit race is loom-model-checked without the runtime's
+/// dependency graph); re-exported here behind the `ptir` flag.
+#[cfg(feature = "ptir")]
+pub use pie_waker as waker;
+
 use anyhow::Result;
 use async_trait::async_trait;
 
