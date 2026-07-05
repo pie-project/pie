@@ -46,6 +46,16 @@ impl Report {
         match r {
             Ok(b) => {
                 writeln!(self.0, "verdict: OK").unwrap();
+                // The PTIB typed sidecar (PTIR-CONTAINER.md §7): per-value
+                // (shape, dtype) + readiness + channel classes — what a
+                // backend consumes instead of re-inferring (option B). The
+                // readiness/class lines below restate it human-readably.
+                writeln!(
+                    self.0,
+                    "sidecar: {}",
+                    hex(&pie_sampling_ir::ptir::sidecar::encode_bound(b))
+                )
+                .unwrap();
                 for e in &b.readiness {
                     writeln!(
                         self.0,
