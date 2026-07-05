@@ -966,6 +966,20 @@ target_compile_options(test_sampling_ir_matrix PRIVATE
 target_link_libraries(test_sampling_ir_matrix PRIVATE
   CUDA::cudart CUDA::cuda_driver CUDA::nvrtc)
 
+# PTIR tier-0 op-kernel library parity (Thrust 3 / charlie, P4.2). Runs every
+# prebuilt row-parallel tier-0 kernel (src/ptir/tier0_kernels.cuh) on the GPU
+# and diffs against the host reference evaluator (src/ptir/host_eval.hpp) — the
+# self-check gate before echo's canonical golden vectors. Standalone (no driver
+# lib); needs a GPU at runtime.
+add_executable(test_ptir_tier0
+  tests/ptir_tier0_test.cu)
+target_include_directories(test_ptir_tier0 PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_compile_options(test_ptir_tier0 PRIVATE
+  $<$<COMPILE_LANGUAGE:CUDA>: --extended-lambda --expt-relaxed-constexpr >)
+target_link_libraries(test_ptir_tier0 PRIVATE
+  CUDA::cudart)
+
 enable_testing()
 add_test(NAME brle COMMAND test_brle)
 add_test(NAME causal_conv1d COMMAND test_causal_conv1d)
@@ -981,6 +995,7 @@ add_test(NAME sampling_ir_primitives COMMAND test_sampling_ir_primitives)
 add_test(NAME sampling_ir_reader COMMAND test_sampling_ir_reader)
 add_test(NAME sampling_ir_codegen COMMAND test_sampling_ir_codegen)
 add_test(NAME sampling_ir_matrix COMMAND test_sampling_ir_matrix)
+add_test(NAME ptir_tier0 COMMAND test_ptir_tier0)
 
 target_link_libraries(pie_driver_cuda_lib PUBLIC
   CLI11::CLI11
