@@ -994,6 +994,15 @@ target_compile_options(test_ptir_runner PRIVATE
 target_link_libraries(test_ptir_runner PRIVATE
   CUDA::cudart)
 
+# PTIR container reader conformance (Thrust 3 / charlie, P2/P4). Host-only: decodes
+# echo's golden `PTIR` v1 containers (tests/golden-ptir, vendored from
+# interface/sampling-ir/tests/golden-ptir) and checks container_hash (FNV-1a64) +
+# the derived readiness table against echo's oracle byte-for-byte. No GPU.
+add_executable(test_ptir_container
+  tests/ptir_container_test.cpp)
+target_include_directories(test_ptir_container PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/src)
+
 enable_testing()
 add_test(NAME brle COMMAND test_brle)
 add_test(NAME causal_conv1d COMMAND test_causal_conv1d)
@@ -1011,6 +1020,8 @@ add_test(NAME sampling_ir_codegen COMMAND test_sampling_ir_codegen)
 add_test(NAME sampling_ir_matrix COMMAND test_sampling_ir_matrix)
 add_test(NAME ptir_tier0 COMMAND test_ptir_tier0)
 add_test(NAME ptir_runner COMMAND test_ptir_runner)
+add_test(NAME ptir_container COMMAND test_ptir_container
+  ${CMAKE_CURRENT_SOURCE_DIR}/tests/golden-ptir)
 
 target_link_libraries(pie_driver_cuda_lib PUBLIC
   CLI11::CLI11
