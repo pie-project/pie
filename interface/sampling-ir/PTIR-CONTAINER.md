@@ -85,8 +85,11 @@ channel and any stage/port consumption of a host-read channel.
   `elem` = 4 (F32/I32/U32) or 1 (Bool). Trace-known contents (e.g. a
   rectangular `indptr` folded to a constant).
 
-Consumption is fixed per port: **embed_tokens takes** (consumes); every other
-port **reads** (peeks). This feeds the descriptor row of the readiness table.
+Consumption is fixed per port (§5.1): the **token family takes** —
+`embed_tokens`, `positions`, `w_slot`, `w_off` (a token is spent by the pass
+that embeds it); geometry and masks (`pages`, indptrs, `kv_len`, `readout`,
+`attn_mask`) **read** (peek). This feeds the descriptor row of the readiness
+table.
 
 ### 2.5 StageProgram — `stage:u8 | n_ops:u32 | Op[n_ops]`
 
@@ -139,8 +142,10 @@ operands are `u32` value ids. `0x80` (v4 `input`) is reserved-unused in PTIR.
 
 ## 4. Typing rules (bind re-derives; container does not carry types)
 
-- `cast`: any → declared dtype, shape preserved. `rem`: same numeric dtype
-  (int `%`, F32 `fmod`).
+- `cast`: any → declared dtype, shape preserved. `rem`/`div`: same numeric
+  dtype (int `%` / truncating int division, 0 on divide-by-zero; F32 `fmod` /
+  division). PTIR `div` is numeric-wide — §6.2's `parent = div(i, V)` is id
+  math (PSIR v4's `div` stays F32-only).
 - `and/or/not`: Bool. Comparisons: same numeric dtype → Bool.
 - `reshape`: numel preserved. `transpose`: rank-2 `[m,n] → [n,m]`.
 - `top_k`: F32 rank 1/2, `1 ≤ k ≤ last_len`; `[n]→[k]` / `[m,n]→[m,k]`,

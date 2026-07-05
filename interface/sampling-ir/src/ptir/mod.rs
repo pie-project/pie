@@ -44,6 +44,9 @@ pub mod validate;
 #[cfg(feature = "std")]
 pub mod header;
 
+#[cfg(feature = "eval")]
+pub mod interp;
+
 /// Container magic: ASCII `"PTIR"`.
 pub const PTIR_MAGIC: [u8; 4] = *b"PTIR";
 

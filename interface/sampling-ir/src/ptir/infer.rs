@@ -197,13 +197,16 @@ fn infer(
             push(&mut out, ValueType::new(broadcast2(ta.shape, tb.shape).ok_or_else(shape_err)?, ta.dtype));
         }
         Op::Div(a, b) => {
+            // Unlike PSIR v4 (F32-only), PTIR `div` is defined on every
+            // numeric dtype: F32 division, or truncating integer division
+            // (0 on divide-by-zero) — §6.2's `parent = div(i, V)` is id math.
             let (ta, tb) = (g(a)?, g(b)?);
-            if ta.dtype != DType::F32 || tb.dtype != DType::F32 {
+            if !ta.dtype.is_numeric() || ta.dtype != tb.dtype {
                 return Err(dtype_err());
             }
             push(&mut out, ValueType::new(
                 broadcast2(ta.shape, tb.shape).ok_or_else(shape_err)?,
-                DType::F32,
+                ta.dtype,
             ));
         }
 

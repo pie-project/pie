@@ -138,9 +138,11 @@ impl Port {
         }
     }
     /// True iff a channel bound to this port is **consumed** (take) by the
-    /// pass; false = peeked (read).
+    /// pass; false = peeked (read). §5.1: the token-indexed family (embed,
+    /// positions, `w_slot`/`w_off`) consumes — a token is spent by the pass
+    /// that embeds it; geometry and masks are state, peeked.
     pub fn consumes(self) -> bool {
-        matches!(self, Port::EmbedTokens)
+        matches!(self, Port::EmbedTokens | Port::Positions | Port::WSlot | Port::WOff)
     }
 }
 
