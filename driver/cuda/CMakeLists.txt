@@ -980,6 +980,20 @@ target_compile_options(test_ptir_tier0 PRIVATE
 target_link_libraries(test_ptir_tier0 PRIVATE
   CUDA::cudart)
 
+# PTIR tier-0 stage-runner (Thrust 3 / charlie, P4.2). Drives Tier0Runner over
+# hand-built traces: loop-carried channel ping-pong, readiness-miss dummy-run +
+# recovery, argmax epilogue (logits-intrinsic bind), capacity-1 back-pressure —
+# the overview §7.1 readiness/predicated-commit/epoch-ring-bump machinery.
+# Standalone (no driver lib); needs a GPU.
+add_executable(test_ptir_runner
+  tests/ptir_runner_test.cu)
+target_include_directories(test_ptir_runner PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_compile_options(test_ptir_runner PRIVATE
+  $<$<COMPILE_LANGUAGE:CUDA>: --extended-lambda --expt-relaxed-constexpr >)
+target_link_libraries(test_ptir_runner PRIVATE
+  CUDA::cudart)
+
 enable_testing()
 add_test(NAME brle COMMAND test_brle)
 add_test(NAME causal_conv1d COMMAND test_causal_conv1d)
@@ -996,6 +1010,7 @@ add_test(NAME sampling_ir_reader COMMAND test_sampling_ir_reader)
 add_test(NAME sampling_ir_codegen COMMAND test_sampling_ir_codegen)
 add_test(NAME sampling_ir_matrix COMMAND test_sampling_ir_matrix)
 add_test(NAME ptir_tier0 COMMAND test_ptir_tier0)
+add_test(NAME ptir_runner COMMAND test_ptir_runner)
 
 target_link_libraries(pie_driver_cuda_lib PUBLIC
   CLI11::CLI11
