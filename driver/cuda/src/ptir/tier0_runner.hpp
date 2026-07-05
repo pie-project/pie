@@ -332,9 +332,29 @@ class Tier0Runner {
             }
             case OpCode::Broadcast: {
                 lo.rows = rt.shape.rows(); lo.len = rt.shape.row_len();
-                const Value* v0 = op.args.empty() ? nullptr : trace_->value(op.args[0]);
-                lo.bcast_mode = (v0 && v0->type.shape.numel() > 1) ? 1 : 0;   // per-row vs scalar
-                lo.elem_dtype = rt.dtype; break;
+                lo.elem_dtype = rt.dtype;
+                // General same-rank broadcast meta: [tdims(4), sstride(4)].
+                std::uint32_t R = rt.shape.rank();
+                if (R >= 1 && R <= 4) {
+                    std::uint32_t meta[8] = {1,1,1,1, 0,0,0,0};
+                    for (std::uint32_t d = 0; d < R; ++d) meta[d] = rt.shape.dims[d];
+                    const Value* sv = op.args.empty() ? nullptr : trace_->value(op.args[0]);
+                    std::uint32_t sd[4] = {1,1,1,1};
+                    if (sv) {
+                        std::uint32_t sr = sv->type.shape.rank();
+                        std::uint32_t off = (sr <= R) ? (R - sr) : 0;
+                        for (std::uint32_t k = 0; k < sr && off + k < 4; ++k) sd[off + k] = sv->type.shape.dims[k];
+                    }
+                    std::uint32_t st = 1;
+                    for (int d = (int)R - 1; d >= 0; --d) {
+                        meta[4 + d] = (sd[d] == 1 && meta[d] > 1) ? 0u : st;
+                        st *= sd[d];
+                    }
+                    std::uint32_t* d_meta = nullptr; cudaMalloc(&d_meta, sizeof(meta)); scratch.push_back(d_meta);
+                    cudaMemcpyAsync(d_meta, meta, sizeof(meta), cudaMemcpyHostToDevice, in.stream);
+                    lo.bcast_meta = d_meta; lo.bcast_rank = R;
+                }
+                break;
             }
             case OpCode::Transpose:
                 lo.rows = prim_shape.rows(); lo.len = prim_shape.row_len(); lo.elem_dtype = prim; break;

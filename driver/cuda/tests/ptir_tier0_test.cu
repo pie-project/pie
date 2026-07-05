@@ -400,6 +400,29 @@ void test_new_ops() {
     CUDA_OK(cudaDeviceSynchronize());
     check("rng_keyed.gumbel", to_host(drk, rn), host_eval::rng_keyed(state[0], state[1], rn, true));
 
+    // general broadcast: [1,1,4]->[2,3,4] (tiling) and [2,3,1]->[2,3,4] (last-dim)
+    {
+        std::vector<std::uint32_t> s1{10, 11, 12, 13};   // [1,1,4]
+        std::uint32_t meta1[8] = {2,3,4,1, 0,0,1,0};     // tdims, sstride (broadcast dims 0,1)
+        std::uint32_t* dm1 = dev_from(std::vector<std::uint32_t>(meta1, meta1+8));
+        std::uint32_t* ds1 = dev_from(s1);
+        std::uint32_t* dbg = dev_alloc<std::uint32_t>(24);
+        k_broadcast_general<std::uint32_t><<<GS(24), kTier0Block>>>(ds1, dbg, dm1, 3, 24);
+        CUDA_OK(cudaDeviceSynchronize());
+        check("broadcast_general[1,1,4]->[2,3,4]", to_host(dbg, 24),
+              host_eval::broadcast_general<std::uint32_t>(s1, {1,1,4}, {2,3,4}));
+        std::vector<std::uint32_t> s2{1,2,3, 4,5,6};      // [2,3,1]
+        std::uint32_t meta2[8] = {2,3,4,1, 3,1,0,0};      // sstride: dim2 broadcast
+        std::uint32_t* dm2 = dev_from(std::vector<std::uint32_t>(meta2, meta2+8));
+        std::uint32_t* ds2 = dev_from(s2);
+        k_broadcast_general<std::uint32_t><<<GS(24), kTier0Block>>>(ds2, dbg, dm2, 3, 24);
+        CUDA_OK(cudaDeviceSynchronize());
+        check("broadcast_general[2,3,1]->[2,3,4]", to_host(dbg, 24),
+              host_eval::broadcast_general<std::uint32_t>(s2, {2,3,1}, {2,3,4}));
+        CUDA_OK(cudaFree(dm1)); CUDA_OK(cudaFree(ds1)); CUDA_OK(cudaFree(dbg));
+        CUDA_OK(cudaFree(dm2)); CUDA_OK(cudaFree(ds2));
+    }
+
     CUDA_OK(cudaFree(da)); CUDA_OK(cudaFree(db)); CUDA_OK(cudaFree(dout)); CUDA_OK(cudaFree(dm));
     CUDA_OK(cudaFree(dr)); CUDA_OK(cudaFree(dsrc)); CUDA_OK(cudaFree(didx)); CUDA_OK(cudaFree(dgr));
     CUDA_OK(cudaFree(dbase)); CUDA_OK(cudaFree(dsidx)); CUDA_OK(cudaFree(dvals));

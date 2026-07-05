@@ -379,6 +379,26 @@ std::vector<T> broadcast(const std::vector<T>& src, std::uint32_t rows, std::uin
             o[(std::size_t)r * len + j] = (mode == 0) ? src[0] : src[r];
     return o;
 }
+// General same-rank broadcast: each src dim is 1 or == target dim.
+template <class T>
+std::vector<T> broadcast_general(const std::vector<T>& src, const std::vector<std::uint32_t>& sdims,
+                                 const std::vector<std::uint32_t>& tdims) {
+    std::uint32_t R = (std::uint32_t)tdims.size();
+    std::vector<std::uint32_t> sd(R, 1);
+    std::uint32_t off = R - (std::uint32_t)sdims.size();
+    for (std::size_t k = 0; k < sdims.size(); ++k) sd[off + k] = sdims[k];
+    std::vector<std::uint32_t> stride(R, 0);
+    std::uint32_t st = 1;
+    for (int d = (int)R - 1; d >= 0; --d) { stride[d] = (sd[d] == 1 && tdims[d] > 1) ? 0 : st; st *= sd[d]; }
+    std::uint64_t numel = 1; for (auto t : tdims) numel *= t;
+    std::vector<T> o(numel);
+    for (std::uint64_t i = 0; i < numel; ++i) {
+        std::uint64_t rem = i, soff = 0;
+        for (int d = (int)R - 1; d >= 0; --d) { std::uint32_t c = (std::uint32_t)(rem % tdims[d]); rem /= tdims[d]; soff += (std::uint64_t)c * stride[d]; }
+        o[i] = src[soff];
+    }
+    return o;
+}
 template <class T>
 std::vector<T> transpose(const std::vector<T>& src, std::uint32_t rows, std::uint32_t cols) {
     std::vector<T> o((std::size_t)rows * cols);

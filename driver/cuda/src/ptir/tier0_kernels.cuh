@@ -580,6 +580,29 @@ __global__ void k_broadcast(const T* __restrict__ src, T* __restrict__ out,
     }
 }
 
+// General same-rank broadcast (shape family, §appendix): each source dim is 1 or
+// equal to the target dim. `meta` = [target_dims(4), src_strides(4)] where a
+// broadcasted dim (src dim 1, target > 1) has stride 0. out[i] decomposes into
+// target coords (row-major) → source offset = Σ coord[d]·src_stride[d]. Handles
+// scalar/per-row AND tiling (e.g. [1,1,P]→[B,P,PAGE]).
+template <class T>
+__global__ void k_broadcast_general(const T* __restrict__ src, T* __restrict__ out,
+                                    const std::uint32_t* __restrict__ meta, std::uint32_t rank,
+                                    std::uint64_t numel) {
+    for (std::uint64_t i = blockIdx.x * (std::uint64_t)blockDim.x + threadIdx.x;
+         i < numel; i += (std::uint64_t)gridDim.x * blockDim.x) {
+        std::uint64_t rem = i, soff = 0;
+        // target dims are meta[0..rank) with dim 0 outermost; walk innermost→out.
+        for (int d = (int)rank - 1; d >= 0; --d) {
+            std::uint32_t td = meta[d];
+            std::uint32_t coord = (std::uint32_t)(rem % td);
+            rem /= td;
+            soff += (std::uint64_t)coord * meta[4 + d];
+        }
+        out[i] = src[soff];
+    }
+}
+
 // transpose — materialize [rows, cols] → [cols, rows].
 template <class T>
 __global__ void k_transpose(const T* __restrict__ src, T* __restrict__ out,

@@ -41,6 +41,8 @@ struct LaunchOp {
     std::uint32_t n_scatter = 0;    // scatter_set index count
     int           a_scalar = 0;     // broadcast: operand 0 is a scalar (index 0)
     int           b_scalar = 0;     // broadcast: operand 1 is a scalar (index 0)
+    const void*   bcast_meta = nullptr;  // general broadcast: [tdims(4), sstride(4)] device buf
+    std::uint32_t bcast_rank = 0;        // general broadcast: target rank
 
     cudaStream_t stream = nullptr;
 };
@@ -90,8 +92,13 @@ inline void run_scan(const LaunchOp& o, ScanKind k) {
 }
 template <class T>
 inline void run_broadcast(const LaunchOp& o) {
-    k_broadcast<T><<<gs(o.numel), kTier0Block, 0, o.stream>>>(
-        (const T*)o.in[0], (T*)o.out, o.rows, o.len, o.bcast_mode);
+    if (o.bcast_meta) {
+        k_broadcast_general<T><<<gs(o.numel), kTier0Block, 0, o.stream>>>(
+            (const T*)o.in[0], (T*)o.out, (const std::uint32_t*)o.bcast_meta, o.bcast_rank, o.numel);
+    } else {
+        k_broadcast<T><<<gs(o.numel), kTier0Block, 0, o.stream>>>(
+            (const T*)o.in[0], (T*)o.out, o.rows, o.len, o.bcast_mode);
+    }
 }
 template <class T>
 inline void run_transpose(const LaunchOp& o) {
