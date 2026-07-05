@@ -486,7 +486,7 @@ pub fn write_dummy_startup_toml(
 /// `driver/cuda/src/config.hpp`: `[model]` with
 /// `hf_repo`/`snapshot_dir`/`device`/`dtype`/optional load policy knobs,
 /// `[batching]` with KV-page geometry plus `swap_pool_size`, and `[runtime]`
-/// with the server verbosity flag.
+/// with server verbosity plus graph-capture controls.
 ///
 /// `[distributed]` is emitted only for TP launches; single-rank uses the
 /// cuda driver's default (`tp_size=1, tp_rank=0`).
@@ -547,6 +547,7 @@ pub(crate) fn write_cuda_startup_toml(
 
     let mut runtime = toml::Table::new();
     insert_bool(&mut runtime, "verbose", opts.verbose);
+    insert_bool(&mut runtime, "cuda_graphs", !opts.disable_cuda_graphs);
     insert_table(&mut doc, "runtime", runtime);
 
     if let Some(tp) = tp {
@@ -1171,6 +1172,7 @@ mod tests {
         assert_eq!(val["batching"].as_table().unwrap().len(), 5);
         assert_eq!(val["batching"]["swap_pool_size"].as_integer().unwrap(), 0);
         assert_eq!(val["runtime"]["verbose"].as_bool().unwrap(), false);
+        assert_eq!(val["runtime"]["cuda_graphs"].as_bool().unwrap(), true);
     }
 
     #[test]
@@ -1187,6 +1189,22 @@ mod tests {
         let text = std::fs::read_to_string(&out).unwrap();
         let val: toml::Value = toml::from_str(&text).unwrap();
         assert_eq!(val["runtime"]["verbose"].as_bool().unwrap(), true);
+    }
+
+    #[test]
+    fn cuda_startup_toml_disables_cuda_graphs_when_requested() {
+        let tmp = tempfile::tempdir().unwrap();
+        let out = tmp.path().join("cuda.toml");
+        let snap = tmp.path().join("snap");
+        let mut opts = CudaNativeDriverOptions::default();
+        opts.device = "cuda:0".to_string();
+        opts.disable_cuda_graphs = true;
+
+        write_cuda_startup_toml(&out, &opts, &snap, 0, None).unwrap();
+
+        let text = std::fs::read_to_string(&out).unwrap();
+        let val: toml::Value = toml::from_str(&text).unwrap();
+        assert_eq!(val["runtime"]["cuda_graphs"].as_bool().unwrap(), false);
     }
 
     #[test]

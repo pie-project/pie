@@ -142,9 +142,10 @@ int run_impl(int argc,
     // only update int_buf content (request_indices, block_valid_mask), and
     // device pointers stay stable. See `forward_fn.graph_safe = true` below.
     bool use_cuda_graphs = true;
-    app.add_flag("--cuda-graphs,!--no-cuda-graphs", use_cuda_graphs,
-                 "Capture decode forward into CUDA graphs and replay per "
-                 "shape bucket. Default on for cuda_native.");
+    auto* cuda_graphs_flag =
+        app.add_flag("--cuda-graphs,!--no-cuda-graphs", use_cuda_graphs,
+                     "Capture decode forward into CUDA graphs and replay per "
+                     "shape bucket. Default on for cuda_native.");
 
     // Tensor-parallel knobs. Override [distributed] in the TOML when
     // present so the wrapper can launch ad-hoc TP groups without
@@ -163,6 +164,9 @@ int run_impl(int argc,
     CLI11_PARSE(app, argc, argv);
 
     auto cfg = pie_cuda_driver::load_config(config_path);
+    if (cuda_graphs_flag->count() == 0) {
+        use_cuda_graphs = cfg.runtime.cuda_graphs;
+    }
     if (cli_tp_size >= 1) cfg.distributed.tp_size = cli_tp_size;
     if (cli_tp_rank >= 0) cfg.distributed.tp_rank = cli_tp_rank;
     if (!cli_nccl_unique_id_hex.empty())
