@@ -38,6 +38,9 @@ enum class T1ArgKind : std::uint8_t {
     RowSeed,    // const uint32_t* [rows]  (ambient RNG seed S per row)
     HostVec,    // const float* [rows, V] or [V]  (a per-vocab host input, e.g. bias)
     HostMaskU8, // const uint8_t* [rows, V] (unpacked bool mask for mask_apply)
+    ChanVecF32, // const float* [V]  (a per-vocab channel-take value)
+    ChanMaskU8, // const uint8_t* [V] (a bool channel-take mask, e.g. §3 grammar mask)
+    RngState,   // const uint32_t* [2] (a channel-take rng state [key,ctr] for rng_keyed)
     OutToken,   // int* [rows]   (reduce_argmax result)
     OutScalar,  // float* [rows] (reduce_sum / reduce_max result)
     Rows,       // int
@@ -46,7 +49,8 @@ enum class T1ArgKind : std::uint8_t {
 
 struct T1Arg {
     T1ArgKind kind;
-    std::uint32_t key = 0;   // HostVec/HostMask: the source host_key
+    std::uint32_t key = 0;     // HostVec/HostMask: source host_key
+    std::uint32_t channel = 0; // ChanVec/ChanMask/RngState: source channel id
 };
 
 struct T1Kernel {
@@ -74,6 +78,9 @@ __device__ __forceinline__ float t1_hash_uniform(unsigned long long se, int j){
   unsigned long long x = se + 0x9E3779B97F4A7C15ULL*(unsigned long long)(j+1); x=t1_smix(x);
   unsigned int b=(unsigned int)(x>>40); return ((float)b+0.5f)*(1.0f/16777216.0f); }
 __device__ __forceinline__ float t1_gumbel(unsigned long long se, int j){ float u=t1_hash_uniform(se,j); return -logf(-logf(u)); }
+__device__ __forceinline__ float t1_gumbel_keyed(unsigned int key, unsigned int ctr, int j){
+  unsigned long long s64 = t1_smix(((unsigned long long)key<<32) | (unsigned long long)ctr);
+  float u = t1_hash_uniform(s64, j); return -logf(-logf(u)); }
 )PIECUDA";
 }
 
@@ -113,13 +120,31 @@ inline T1Kernel emit_fused_epilogue(const Trace& trace, const Stage& stage) {
             per_vocab[v.id] = false;
             std::ostringstream s;
             if (v.type.dtype == DType::F32) {
-                // emit the exact bit pattern → identical float to tier-0 (no text
-                // round-trip drift, so tie-breaks match bit-for-bit).
                 s << "__int_as_float(0x" << std::hex << v.lit.as_u32() << std::dec << "u)";
             } else {
                 s << v.lit.as_u32() << "u";
             }
             expr[v.id] = s.str();
+        } else if (v.source == ValueSource::ChannelTake || v.source == ValueSource::ChannelRead) {
+            // A per-vocab channel value (mask/bias [V]) → a per-vocab kernel arg;
+            // a small state channel ([key,ctr]) → an rng-state arg.
+            std::uint64_t n = v.type.shape.numel();
+            if (n >= 2 && v.type.dtype == DType::U32 && n <= 4) {
+                int ai = (int)k.args.size();
+                k.args.push_back({T1ArgKind::RngState, 0, v.channel});
+                per_vocab[v.id] = false;
+                expr[v.id] = "rngstate" + std::to_string(ai);   // referenced by rng_keyed
+            } else if (v.type.dtype == DType::Bool) {
+                int ai = (int)k.args.size();
+                k.args.push_back({T1ArgKind::ChanMaskU8, 0, v.channel});
+                per_vocab[v.id] = true;
+                expr[v.id] = "chanmask" + std::to_string(ai) + "[j]";
+            } else if (v.type.dtype == DType::F32) {
+                int ai = (int)k.args.size();
+                k.args.push_back({T1ArgKind::ChanVecF32, 0, v.channel});
+                per_vocab[v.id] = true;
+                expr[v.id] = "chanvec" + std::to_string(ai) + "[j]";
+            }
         }
     }
     if (vocab == 0) return fail("could not determine vocab length from logits intrinsic");
@@ -144,6 +169,10 @@ inline T1Kernel emit_fused_epilogue(const Trace& trace, const Stage& stage) {
         std::string var = "v" + std::to_string(op.result_id);
         std::string e;
         switch (op.code) {
+            case OpCode::Reshape:   // alias: same per-vocab value, no compute
+                per_vocab[op.result_id] = a.empty() ? false : per_vocab[op.args[0]];
+                expr[op.result_id] = a.empty() ? "0.0f" : a[0];
+                continue;
             case OpCode::Add: e = "(" + a[0] + " + " + a[1] + ")"; break;
             case OpCode::Sub: e = "(" + a[0] + " - " + a[1] + ")"; break;
             case OpCode::Mul: e = "(" + a[0] + " * " + a[1] + ")"; break;
@@ -154,6 +183,19 @@ inline T1Kernel emit_fused_epilogue(const Trace& trace, const Stage& stage) {
             case OpCode::Exp: e = "expf(" + a[0] + ")"; break;
             case OpCode::Log: e = "logf(" + a[0] + ")"; break;
             case OpCode::Recip: e = "(1.0f/(" + a[0] + "))"; break;
+            case OpCode::Select:   // select(cond, a, b): cond ? a : b
+                e = "((" + a[0] + ") ? (" + a[1] + ") : (" + a[2] + "))";
+                any_pv = true;
+                break;
+            case OpCode::RngKeyed: {   // gumbel/uniform over a channel state [key,ctr]
+                std::string st = a.empty() ? "0" : a[0];
+                if (op.rng_kind == RngKind::Gumbel)
+                    e = "t1_gumbel_keyed(" + st + "[0], " + st + "[1], j)";
+                else
+                    e = "t1_hash_uniform(t1_smix(((unsigned long long)" + st + "[0]<<32)|" + st + "[1]), j)";
+                any_pv = true;
+                break;
+            }
             case OpCode::MaskApplyBool: {
                 int ai = -1;
                 const Value* mv = trace.value(op.args[1]);
@@ -204,6 +246,9 @@ inline T1Kernel emit_fused_epilogue(const Trace& trace, const Stage& stage) {
             case T1ArgKind::RowSeed:   src << "    const unsigned int* __restrict__ row_seed"; break;
             case T1ArgKind::HostVec:   src << "    const float* __restrict__ hostvec" << i; break;
             case T1ArgKind::HostMaskU8:src << "    const unsigned char* __restrict__ hostmask" << i; break;
+            case T1ArgKind::ChanVecF32:src << "    const float* __restrict__ chanvec" << i; break;
+            case T1ArgKind::ChanMaskU8:src << "    const unsigned char* __restrict__ chanmask" << i; break;
+            case T1ArgKind::RngState:  src << "    const unsigned int* __restrict__ rngstate" << i; break;
             case T1ArgKind::OutToken:  src << "    int* __restrict__ out_token"; break;
             case T1ArgKind::OutScalar: src << "    float* __restrict__ out_scalar"; break;
             case T1ArgKind::Rows:      src << "    int rows"; break;

@@ -10,6 +10,7 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -140,6 +141,85 @@ void run_case(const std::string& name, std::uint32_t V, bool gumbel, float inv_t
     cudaFree(d_logits); cudaFree(d_seed); cudaFree(d_out);
 }
 
+// §3 epilogue sampling core: argmax( select(mask, logits, -inf) + gumbel_keyed(rng) ).
+// Fuses the vocab-sized masked-Gumbel-max into ONE kernel; mask + rng arrive via
+// channels (device buffers). Gate: tier-1 == tier-0 on the same trace + channels.
+void run_masked_gumbel(const std::string& name, std::uint32_t V, std::uint32_t key, std::uint32_t ctr) {
+    Trace t;
+    Channel mask; mask.id = 0; mask.type = {Shape::vec(V), DType::Bool}; mask.capacity = 1; mask.has_seed = true;
+    Channel rng; rng.id = 1; rng.type = {Shape::vec(2), DType::U32}; rng.capacity = 1; rng.has_seed = true;
+    Channel tok; tok.id = 2; tok.type = {Shape::vec(1), DType::U32}; tok.capacity = 1; tok.host_visible = true;
+    t.channels = {mask, rng, tok};
+
+    TensorType logv{Shape::mat(1, V), DType::F32}, boolv{Shape::vec(V), DType::Bool};
+    TensorType rngt{Shape::vec(2), DType::U32}, tokt{Shape::vec(1), DType::U32}, scal{Shape::scalar(), DType::F32};
+    Value v0 = mk(0, logv, ValueSource::Intrinsic); v0.intrinsic = Intrinsic::Logits; t.values.push_back(v0);
+    Value v1 = mk(1, boolv, ValueSource::ChannelTake); v1.channel = 0; t.values.push_back(v1);
+    Value v2 = mk(2, scal, ValueSource::Const); v2.lit = Literal::f32(-std::numeric_limits<float>::infinity()); t.values.push_back(v2);
+    t.values.push_back(mk(3, logv, ValueSource::OpResult));   // masked = select(mask, logits, -inf)
+    Value v4 = mk(4, rngt, ValueSource::ChannelTake); v4.channel = 1; t.values.push_back(v4);
+    t.values.push_back(mk(5, logv, ValueSource::OpResult));   // g = rng_keyed(rng)
+    t.values.push_back(mk(6, logv, ValueSource::OpResult));   // sum
+    t.values.push_back(mk(7, tokt, ValueSource::OpResult));   // token = argmax
+
+    Stage ep; ep.kind = StageKind::Epilogue;
+    Op sel; sel.code = OpCode::Select; sel.args = {1, 0, 2}; sel.result_type = logv; sel.result_id = 3; ep.ops.push_back(sel);
+    Op rk; rk.code = OpCode::RngKeyed; rk.args = {4}; rk.result_type = logv; rk.result_id = 5; rk.rng_kind = RngKind::Gumbel; ep.ops.push_back(rk);
+    Op add; add.code = OpCode::Add; add.args = {3, 5}; add.result_type = logv; add.result_id = 6; ep.ops.push_back(add);
+    Op am; am.code = OpCode::ReduceArgmax; am.args = {6}; am.result_type = tokt; am.result_id = 7; ep.ops.push_back(am);
+    ep.puts = {{2, 7}};
+    t.stages = {ep};
+
+    // mask: allow ~2/3 of the vocab (pseudo-random) so it actually constrains.
+    std::vector<std::uint8_t> maskv(V);
+    for (std::uint32_t j = 0; j < V; ++j) maskv[j] = ((j * 2654435761u) % 3u != 0) ? 1u : 0u;
+    std::vector<float> logits(V);
+    for (std::uint32_t j = 0; j < V; ++j) logits[j] = 1.5f * cosf(0.021f * (j + 1) * (key % 7 + 1));
+    std::vector<std::uint32_t> state{key, ctr};
+
+    // ── tier-0 ──
+    Tier0Runner runner(t);
+    runner.arena().seed_cell(0, maskv.data(), maskv.size());
+    runner.arena().seed_cell(1, state.data(), state.size() * 4);
+    float* d_logits = nullptr; RT_OK(cudaMalloc(&d_logits, V * sizeof(float)));
+    RT_OK(cudaMemcpy(d_logits, logits.data(), V * sizeof(float), cudaMemcpyHostToDevice));
+    FireInputs in; in.logits = d_logits; in.vocab = V;
+    PassResult r = runner.run_pass(in);
+    std::uint32_t t0 = 0; runner.arena().host_take(2, &t0, sizeof(t0));
+    expect(r.ok && r.committed, name + ": tier-0 runs");
+
+    // ── tier-1 ──
+    T1Kernel k = emit_fused_epilogue(t, t.stages[0]);
+    expect(k.ok, name + ": tier-1 emit (" + (k.ok ? "ok" : k.error) + ")");
+    if (!k.ok) { cudaFree(d_logits); return; }
+    CUmodule mod; CUfunction fn = nvrtc_build(k.source, k.entry_name, &mod);
+    std::uint8_t* d_mask = nullptr; RT_OK(cudaMalloc(&d_mask, V));
+    RT_OK(cudaMemcpy(d_mask, maskv.data(), V, cudaMemcpyHostToDevice));
+    std::uint32_t* d_state = nullptr; RT_OK(cudaMalloc(&d_state, 2 * sizeof(std::uint32_t)));
+    RT_OK(cudaMemcpy(d_state, state.data(), 2 * sizeof(std::uint32_t), cudaMemcpyHostToDevice));
+    int* d_out = nullptr; RT_OK(cudaMalloc(&d_out, sizeof(int)));
+    int rows = 1, vocab = (int)V;
+    CUdeviceptr p_logits = (CUdeviceptr)d_logits, p_mask = (CUdeviceptr)d_mask, p_state = (CUdeviceptr)d_state, p_out = (CUdeviceptr)d_out;
+    std::vector<void*> params;
+    for (const T1Arg& a : k.args) {
+        switch (a.kind) {
+            case T1ArgKind::Logits:     params.push_back(&p_logits); break;
+            case T1ArgKind::ChanMaskU8: params.push_back(&p_mask); break;
+            case T1ArgKind::RngState:   params.push_back(&p_state); break;
+            case T1ArgKind::OutToken:   params.push_back(&p_out); break;
+            case T1ArgKind::Rows:       params.push_back(&rows); break;
+            case T1ArgKind::Vocab:      params.push_back(&vocab); break;
+            default: std::printf("unexpected arg\n"); std::exit(2);
+        }
+    }
+    CU_OK(cuLaunchKernel(fn, 1, 1, 1, 256, 1, 1, 0, nullptr, params.data(), nullptr));
+    CU_OK(cuCtxSynchronize());
+    int t1 = -1; RT_OK(cudaMemcpy(&t1, d_out, sizeof(int), cudaMemcpyDeviceToHost));
+    expect((std::uint32_t)t1 == t0, name + ": tier-1 == tier-0 token (t0=" + std::to_string(t0) + " t1=" + std::to_string(t1) + ")");
+    cuModuleUnload(mod);
+    cudaFree(d_logits); cudaFree(d_mask); cudaFree(d_state); cudaFree(d_out);
+}
+
 }  // namespace
 
 int main() {
@@ -154,6 +234,11 @@ int main() {
     run_case("temp+gumbel V=256 T=0.7 s0", 256, true, 1.0f / 0.7f, 0, 123456);
     run_case("temp+gumbel V=1024 T=1.0 s1", 1024, true, 1.0f, 1, 987654);
     run_case("temp+gumbel V=32000 T=0.8 s2", 32000, true, 1.0f / 0.8f, 2, 555);
+
+    // §3 epilogue sampling-core fusion (masked Gumbel-max), the M1 tier-1 step.
+    run_masked_gumbel("section3-core V=64", 64, 123456u, 0u);
+    run_masked_gumbel("section3-core V=4096", 4096, 777u, 3u);
+    run_masked_gumbel("section3-core V=32000", 32000, 2024u, 9u);
 
     std::printf("\n==== tier-1 gate: %d passed, %d failed ====\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;
