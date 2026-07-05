@@ -1,0 +1,4 @@
+[package]
+name = "lowlevel-chat"
+version = "0.1.0"
+description = "Low-level (raw-WIT) chat-EOS greedy generation with explicit run-ahead + EOS-rollback in the inferlet's own decode loop"

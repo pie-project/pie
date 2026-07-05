@@ -4,21 +4,28 @@
         "module": "ESNext",
         "moduleResolution": "bundler",
         "moduleDetection": "force",
+        "lib": ["ES2022", "ESNext.Disposable", "DOM"],
         "strict": true,
+        "esModuleInterop": true,
         "skipLibCheck": true,
         "noEmit": true,
-        "baseUrl": ".",
         "paths": {
-            "inferlet": [
-                "../../sdk/javascript/src/index.ts"
-            ],
-            "inferlet/*": [
-                "../../sdk/javascript/src/*"
-            ]
+            "inferlet": ["../../sdk/javascript/src/index.ts"],
+            "inferlet/*": ["../../sdk/javascript/src/*"],
+            "pie:core/model": ["../../sdk/javascript/src/bindings/interfaces/pie-core-model.js"],
+            "pie:core/context": ["../../sdk/javascript/src/bindings/interfaces/pie-core-context.js"],
+            "pie:core/inference": ["../../sdk/javascript/src/bindings/interfaces/pie-core-inference.js"],
+            "pie:core/runtime": ["../../sdk/javascript/src/bindings/interfaces/pie-core-runtime.js"],
+            "pie:core/messaging": ["../../sdk/javascript/src/bindings/interfaces/pie-core-messaging.js"],
+            "pie:core/session": ["../../sdk/javascript/src/bindings/interfaces/pie-core-session.js"],
+            "pie:core/adapter": ["../../sdk/javascript/src/bindings/interfaces/pie-core-adapter.js"],
+            "pie:core/types": ["../../sdk/javascript/src/bindings/interfaces/pie-core-types.js"],
+            "pie:instruct/chat": ["../../sdk/javascript/src/bindings/interfaces/pie-instruct-chat.js"],
+            "pie:instruct/reasoning": ["../../sdk/javascript/src/bindings/interfaces/pie-instruct-reasoning.js"],
+            "pie:instruct/tool-use": ["../../sdk/javascript/src/bindings/interfaces/pie-instruct-tool-use.js"],
+            "pie:zo/zo": ["../../sdk/javascript/src/bindings/interfaces/pie-zo-zo.js"],
+            "wasi:io/poll@0.2.4": ["../../sdk/javascript/src/bindings/interfaces/wasi-io-poll.js"]
         }
     },
-    "include": [
-        "*.ts",
-        "../../sdk/javascript/src/globals.d.ts"
-    ]
+    "include": ["*.ts"]
 }

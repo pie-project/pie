@@ -10,7 +10,7 @@
 #include <unordered_map>
 #include <vector>
 
-#include <pie_bridge/inproc_server.hpp>
+#include <pie_ipc/inproc_server.hpp>
 
 #include "config.hpp"
 

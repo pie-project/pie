@@ -20,7 +20,6 @@
 // resource shape is chosen to leave room for both without a breaking change.
 interface audio-out {
     use types.{error};
-    use model.{model};
 
     // Which voice to speak in. A neutral selector; the host maps it onto the
     // bound model's own conditioning (CSM bakes an integer speaker id into its
@@ -51,10 +50,9 @@ interface audio-out {
     // decoded PCM host-side; `pcm` materializes it on request (so a future
     // streaming form can hand back chunks without changing callers).
     resource speech {
-        // Synthesize `req` on `model`. Errors if the model has no audio-output
-        // front-end (i.e. is not a CSM checkpoint).
-        generate: static func(model: borrow<model>,
-                              req: speech-request) -> result<speech, error>;
+        // Synthesize `req` on the bound model. Errors if the model has no
+        // audio-output front-end (i.e. is not a CSM checkpoint).
+        generate: static func(req: speech-request) -> result<speech, error>;
 
         // Output sample rate in Hz (CSM: 24000).
         sample-rate: func() -> u32;

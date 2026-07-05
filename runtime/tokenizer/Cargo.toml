@@ -1,0 +1,27 @@
+[package]
+name = "pie-tokenizer"
+version = "0.4.0"
+edition = "2024"
+authors = ["In Gim <in.gim@yale.edu>"]
+description = "BPE tokenizer (encode/decode) for Pie, loaded from the HuggingFace tokenizer.json format. A leaf crate: no dependency on the rest of the runtime."
+license = "Apache-2.0"
+repository = "https://github.com/pie-project/pie"
+
+[lib]
+name = "pie_tokenizer"
+path = "src/lib.rs"
+
+[dependencies]
+anyhow = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+aho-corasick = "1"
+base64 = "0.22.1"
+unicode-normalization = "0.1"
+rustc-hash = "2.1"
+smallvec = "1"
+fancy-regex = "0.16.0"
+serde_json = { version = "1.0", features = ["preserve_order"] }
+memchr = "2"
+
+[dev-dependencies]
+tempfile = "3"

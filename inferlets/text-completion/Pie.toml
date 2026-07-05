@@ -8,7 +8,6 @@ readme = "README.md"
 
 [runtime]
 core = "^0.2.0"
-mcp = "^0.2.0"
 
 [parameters]
 prompt = {type = "string", description = "The user message to complete"}

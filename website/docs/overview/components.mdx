@@ -12,7 +12,7 @@ Pie has three parts: the **engine** that runs inferlets, the **SDKs** for writin
 
 The engine is the "operating system" for inferlets, made of three pieces:
 - **Runtime** (`runtime/`). The Rust core. Hosts the Wasmtime-based WebAssembly runtime, the inferlet scheduler, KV cache mapping, contention management, and the WebSocket protocol clients connect to.
-- **Driver** (`driver/`). The hardware layer. Pie ships a CUDA driver, and a local driver for CPU and Apple Silicon. Pie also has experimental support for vLLM, SGLang, and TensorRT-LLM as drivers.
+- **Driver** (`driver/`). The hardware layer. Pie ships a CUDA driver, and a local driver for CPU and Apple Silicon.
 - **Server**. Glues the runtime and driver together, and provide CLI to configure and start them.
 
 ## SDKs

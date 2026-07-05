@@ -1,0 +1,4 @@
+[package]
+name = "mtp-native-verify"
+version = "0.1.0"
+description = "MTP Stage 2: PTIR-native explicit draft->verify->accept — drafts from the mtp_logits intrinsic (no host draft, no native-drafter black box)"

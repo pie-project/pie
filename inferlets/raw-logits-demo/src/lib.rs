@@ -21,15 +21,35 @@
 //!   PAYLOAD_BYTES=<n>            vocab_size * 4
 //!   ARGMAX_MATCHES_GREEDY=<n>/<n>
 
-use inferlet::{
-    Context, Result,
-    model::Model,
-    forward::Forward,
-    runtime,
-    sample::{Logits, Sampler},
+use inferlet::inference::ForwardPass;
+use inferlet::sampler::{
+    probe_program, sampler_program, LoweredProbe, LoweredSampler, ProbeKind, SamplerSpec,
 };
+use inferlet::working_set::KvWorkingSet;
+use inferlet::{chat, geometry, model, prefill, Result};
 use serde::Deserialize;
 use std::time::Instant;
+
+/// Raw keep-core decode context (no `Context` facade): a KV working set +
+/// cursor, forkable with a COW-shared prefix.
+struct Ctx {
+    kv: KvWorkingSet,
+    seq_len: u32,
+}
+impl Ctx {
+    fn new() -> Self {
+        Self { kv: KvWorkingSet::new(), seq_len: 0 }
+    }
+    fn fork(&self) -> Result<Self> {
+        Ok(Self {
+            kv: self.kv.fork().map_err(|e| format!("fork: {e}"))?,
+            seq_len: self.seq_len,
+        })
+    }
+    fn prefill(&mut self, tokens: &[u32]) -> Result<()> {
+        prefill::tokens(&self.kv, &mut self.seq_len, tokens)
+    }
+}
 
 #[derive(Deserialize, Default)]
 struct Input {
@@ -67,26 +87,44 @@ enum Mode {
 /// Run a single decode step on a forked context; return (elapsed_ms,
 /// greedy_token_or_logits). The forked context already has the prompt's KV
 /// committed; we append a single placeholder token to drive one decode step.
-async fn timed_step(base: &Context, mode: Mode) -> Result<(f64, GreedyOrLogits)> {
-    let mut ctx = base.fork()?;
-    let mut pass: Forward = ctx.forward();
-    pass.input(&[0u32]);
+/// The sampler (`Argmax`) and measurement (`Logits`) programs are lowered once
+/// by the caller and attached per-fire with the fork's decode position.
+async fn timed_step(
+    base: &Ctx,
+    greedy: &LoweredSampler,
+    logits_probe: &LoweredProbe,
+    mode: Mode,
+) -> Result<(f64, GreedyOrLogits)> {
+    let ctx = base.fork()?;
+    let pass = ForwardPass::new();
+    // The fork starts a fresh generation ⇒ clear the dangling run-ahead carrier.
+    pass.fresh_generate();
+    let geom = geometry::ensure_pages(
+        &ctx.kv,
+        geometry::kv_write_geometry(ctx.seq_len, 1, ctx.kv.page_size()),
+    )?;
+    geometry::attach_kv_write(&pass, &ctx.kv, &geom);
+    pass.input_tokens(&[0u32], &[ctx.seq_len]);
+    let decode_pos = ctx.seq_len;
 
     match mode {
         Mode::Greedy => {
-            let h = pass.sample(&[0], Sampler::Argmax);
+            pass.sampler(&greedy.program, greedy.bindings(decode_pos)?);
             let t0 = Instant::now();
-            let out = pass.execute().await?;
+            pass.execute();
+            let out = pass.output().await.map_err(|e| format!("output: {e}"))?;
             let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
-            let token = out.token(h).ok_or("greedy: no token slot")?;
+            let bytes = out.read().map_err(|e| format!("read token: {e:?}"))?;
+            let token = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
             Ok((elapsed_ms, GreedyOrLogits::Greedy(token)))
         }
         Mode::RawLogits => {
-            let h = pass.probe(0, Logits);
+            pass.sampler(&logits_probe.program, logits_probe.bindings(decode_pos)?);
             let t0 = Instant::now();
-            let out = pass.execute().await?;
+            pass.execute();
+            let out = pass.output().await.map_err(|e| format!("output: {e}"))?;
             let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
-            let bytes = out.logits(h).ok_or("raw: no logits slot")?.to_vec();
+            let bytes = out.read().map_err(|e| format!("read logits: {e:?}"))?;
             Ok((elapsed_ms, GreedyOrLogits::Logits(bytes)))
         }
     }
@@ -101,24 +139,28 @@ enum GreedyOrLogits {
 async fn main(input: Input) -> Result<String> {
     let iters = input.iters.max(1);
 
-    let models = runtime::models();
-    let model = Model::load(models.first().ok_or("No models available")?)?;
-
-    let mut base = Context::new(&model)?;
+    let vocab = model::output_vocab_size();
+    let greedy = sampler_program(SamplerSpec::Argmax, vocab)
+        .map_err(|e| format!("sampler_program(Argmax): {e}"))?;
+    let logits_probe = probe_program(ProbeKind::Logits, vocab)
+        .map_err(|e| format!("probe(Logits) build: {e}"))?;
 
     // Build a small fixed prompt and prefill it once (one Pass — page math
     // and commit happen inside).
-    base.system("You complete the user's sentence with a single word.")
-        .user("The capital of France is")
-        .cue();
-    base.flush().await?;
+    let mut prompt = chat::system_user(
+        "You complete the user's sentence with a single word.",
+        "The capital of France is",
+    );
+    prompt.extend(chat::cue());
+    let mut base = Ctx::new();
+    base.prefill(&prompt)?;
 
     // Warmup. Covers JIT compile of attention / sampling / softmax kernels
     // plus first-call allocator paths. Five paired rounds is enough on
     // flashinfer/triton in our experience.
     for _ in 0..5 {
-        let _ = timed_step(&base, Mode::Greedy).await?;
-        let _ = timed_step(&base, Mode::RawLogits).await?;
+        let _ = timed_step(&base, &greedy, &logits_probe, Mode::Greedy).await?;
+        let _ = timed_step(&base, &greedy, &logits_probe, Mode::RawLogits).await?;
     }
 
     // Timed loop.
@@ -130,12 +172,12 @@ async fn main(input: Input) -> Result<String> {
     let mut vocab_size = 0usize;
 
     for i in 0..iters {
-        let (g_ms, g) = timed_step(&base, Mode::Greedy).await?;
+        let (g_ms, g) = timed_step(&base, &greedy, &logits_probe, Mode::Greedy).await?;
         let GreedyOrLogits::Greedy(greedy_token) = g else { unreachable!() };
         greedy_total += g_ms;
         if g_ms < greedy_min { greedy_min = g_ms; }
 
-        let (r_ms, r) = timed_step(&base, Mode::RawLogits).await?;
+        let (r_ms, r) = timed_step(&base, &greedy, &logits_probe, Mode::RawLogits).await?;
         let GreedyOrLogits::Logits(bytes) = r else { unreachable!() };
         let logits = decode_logits(&bytes);
         if vocab_size == 0 {

@@ -1,0 +1,76 @@
+[package]
+name = "pie-bin"
+version = "0.1.0"
+edition = "2024"
+authors = ["In Gim <in.gim@icloud.com>"]
+description = "The pie standalone composition root: multi-call CLI (local/serve + ops) composing bootstrap + the controller/gateway/worker role libs in-proc."
+license = "Apache-2.0"
+repository = "https://github.com/pie-project/pie"
+
+# Package is `pie-bin` (the runtime lib already owns `pie`); the user-facing
+# command is `pie`.
+[lib]
+name = "pie_bin"
+path = "src/lib.rs"
+
+[[bin]]
+name = "pie"
+path = "src/main.rs"
+
+[features]
+# bin/pie is the composition root that selects the driver backend; forward the
+# driver flavors to the embedded worker. Default = none (dummy fallback);
+# enable driver-cuda for real inference.
+default = []
+driver-cuda = ["pie-worker/driver-cuda"]
+driver-dummy = ["pie-worker/driver-dummy"]
+# Probe passthroughs to the embedded worker (→ runtime).
+profile-fire = ["pie-worker/profile-fire"]
+profile-driver-cuda = ["pie-worker/profile-driver-cuda"]
+
+[dependencies]
+# Shared process skeleton (CLI flags, paths, tracing, signals, /metrics, banner).
+pie-bootstrap = { path = "../../bootstrap" }
+# The three role libs — bin/pie is the ONE crate that deps all three (Seam 4).
+pie-controller = { path = "../../controller" }
+pie-gateway = { path = "../../gateway" }
+pie-worker = { path = "../../worker", default-features = false }
+pie-engine = { path = "../../runtime/engine" }  # program/manifest types for `pie inferlet`
+# Wire vocabulary — compose.rs names control-plane types (RoutingTable, Ack,
+# GatewayInfo, WorkerInfo, Neighbors, WorkerStatus) from pie-controller-rpc and
+# the id atoms (WorkerId/GatewayId/NodeId) from pie-ids.
+pie-ids = { path = "../../interface/ids" }
+pie-controller-rpc = { path = "../../interface/controller" }
+
+anyhow = "1.0"
+clap = { version = "4.5", features = ["derive"] }
+toml = "0.9"
+tokio = { version = "1.52", features = ["full"] }
+tracing = "0.1"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+
+# R3 weight/runtime provisioning downloaders — these live ONLY here (the worker
+# lib links zero provisioning machinery). `reqwest` carries `blocking` because
+# the CLI `model pull` / `runtime install` downloads are synchronous.
+hf-hub = "1.0.0-rc.0"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "blocking", "stream"] }
+tar = "0.4"
+xz2 = "0.1"
+
+[dev-dependencies]
+tempfile = "3"
+# The runtime lib (`pie`) — read `inference::get_stats()` in-process to observe
+# the scheduler's fire probes (the thrust-2 bubble/quorum gate) after a decode.
+pie-engine = { path = "../../runtime/engine" }
+# fd-level stderr capture for the gate-1 R=2 merge-witness assert (cuda_grammar_r2):
+# boot_4090 runs the engine in-process, so the scheduler/driver write their
+# `[pie-sched-trace] fire requests=N` / `[ir-trace] forward_R=N` merge witnesses
+# straight to THIS process's fd 2 — the harness dup2's it to a file to assert on.
+libc = "0.2"
+# Client edge for the 4090 capability harness (programmable_sampler_4090): the
+# in-process submit path (connect → add_program → launch → wait_for_return).
+pie-client = { path = "../../client/rust" }
+# Diagnostic trace subscriber for the inproc forward-path probes (RUST_LOG).
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

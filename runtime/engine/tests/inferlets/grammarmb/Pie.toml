@@ -1,0 +1,4 @@
+[package]
+name = "grammarmb"
+version = "0.1.0"
+description = "Test inferlet: single-[Token] late-mask grammar (M-batch eligible) for the #34 num_rows=N occupancy verify"

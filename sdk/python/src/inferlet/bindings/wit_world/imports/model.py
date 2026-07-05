@@ -8,74 +8,81 @@ from abc import abstractmethod
 import weakref
 
 from componentize_py_types import Result, Ok, Err, Some
+import componentize_py_async_support
+from componentize_py_async_support.streams import StreamReader, StreamWriter, ByteStreamReader, ByteStreamWriter
+from componentize_py_async_support.futures import FutureReader, FutureWriter
 
 
-class Tokenizer:
+def name() -> str:
     """
-    Tokenizer resource for encoding and decoding text
+    The engine serves exactly one model; these are global functions over
+    that single bound model (no `model`/`tokenizer` resource handles).
+    Returns the name of the bound model
     """
+    raise NotImplementedError
+def architecture() -> str:
+    """
+    Returns the model architecture identifier (e.g. "gemma4", "qwen3_6")
+    """
+    raise NotImplementedError
+def default_system_speculation() -> bool:
+    """
+    Whether the bound model enables system speculation by default
+    """
+    raise NotImplementedError
+def encode(text: str) -> List[int]:
+    """
+    Converts input text into a list of token IDs
+    """
+    raise NotImplementedError
+def decode(tokens: List[int]) -> str:
+    """
+    Converts token IDs back into a decoded string
     
-    def encode(self, text: str) -> List[int]:
-        """
-        Converts input text into a list of token IDs
-        """
-        raise NotImplementedError
-    def decode(self, tokens: List[int]) -> str:
-        """
-        Converts token IDs back into a decoded string
-        
-        Raises: `wit_world.types.Err(wit_world.imports.str)`
-        """
-        raise NotImplementedError
-    def vocabs(self) -> Tuple[List[int], List[bytes]]:
-        """
-        Returns the tokenizer's vocabulary as a list of byte sequences (tokens)
-        """
-        raise NotImplementedError
-    def split_regex(self) -> str:
-        """
-        Returns the split regular expression used by the tokenizer
-        """
-        raise NotImplementedError
-    def special_tokens(self) -> Tuple[List[int], List[bytes]]:
-        """
-        Returns the special tokens recognized by the tokenizer
-        """
-        raise NotImplementedError
-    def __enter__(self) -> Self:
-        """Returns self"""
-        return self
-                                
-    def __exit__(self, exc_type: type[BaseException] | None, exc_value: BaseException | None, traceback: TracebackType | None) -> bool | None:
-        """
-        Release this resource.
-        """
-        raise NotImplementedError
-
-
-class Model:
+    Raises: `componentize_py_types.Err(wit_world.imports.str)`
     """
-    Resource representing a specific model instance
+    raise NotImplementedError
+def vocabs() -> Tuple[List[int], List[bytes]]:
     """
-    
-    @classmethod
-    def load(cls, name: str) -> Self:
-        """
-        Raises: `wit_world.types.Err(wit_world.imports.str)`
-        """
-        raise NotImplementedError
-    def tokenizer(self) -> Tokenizer:
-        raise NotImplementedError
-    def default_system_speculation(self) -> bool:
-        raise NotImplementedError
-    def __enter__(self) -> Self:
-        """Returns self"""
-        return self
-                                
-    def __exit__(self, exc_type: type[BaseException] | None, exc_value: BaseException | None, traceback: TracebackType | None) -> bool | None:
-        """
-        Release this resource.
-        """
-        raise NotImplementedError
-
-
+    Returns the model's vocabulary as a list of byte sequences (tokens)
+    """
+    raise NotImplementedError
+def split_regex() -> str:
+    """
+    Returns the split regular expression used by the tokenizer
+    """
+    raise NotImplementedError
+def special_tokens() -> Tuple[List[int], List[bytes]]:
+    """
+    Returns the special tokens recognized by the model
+    """
+    raise NotImplementedError
+def rs_state_size() -> int:
+    """
+    ── Working-set / arena capabilities (global, over the bound model) ──
+    Memory-shaping parameters of the bound model's driver, so an inferlet
+    can size working sets and validate fold lengths before allocating.
+    Size in bytes of one folded recurrent-state object. 0 if the model has
+    no recurrent state (pure attention).
+    """
+    raise NotImplementedError
+def rs_buffer_page_size() -> int:
+    """
+    Tokens per buffered RS page. 0 if the model has no recurrent state.
+    """
+    raise NotImplementedError
+def rs_fold_granularity() -> int:
+    """
+    Fold granularity in tokens: `forward-pass.fold-buffered(n)` requires `n`
+    to be a positive multiple of this value. 1 (or 0) means unconstrained;
+    0 also implies the model has no recurrent state. (Token-causal RS models
+    — Qwen3.5 GDN, Nemotron-H Mamba2 — report 1.)
+    """
+    raise NotImplementedError
+def arena_block_size() -> int:
+    """
+    Size in bytes of one unified-arena accounting block. In v1 the KV page is
+    exactly one block, so this is the byte size of one KV page; an RS slab
+    occupies an integer number of these blocks.
+    """
+    raise NotImplementedError

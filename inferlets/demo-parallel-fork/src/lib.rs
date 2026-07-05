@@ -27,7 +27,10 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use futures::future;
-use inferlet::{Context, Result, chat, model::Model, runtime, sample::Sampler, wstd};
+use inferlet::inference::ForwardPass;
+use inferlet::sampler::{self, SamplerSpec};
+use inferlet::working_set::KvWorkingSet;
+use inferlet::{carrier, chat, prefill, Result};
 use serde::Deserialize;
 
 #[derive(Deserialize)]
@@ -109,28 +112,63 @@ const FORK_COLORS: &[&str] = &[
 ];
 const FORK_LABELS: &[char] = &['A', 'B', 'C', 'D', 'E', 'F'];
 
+/// A raw-WIT decode context: its own KV working set + cursor + first-pass flag.
+/// Minimal state bundle (not a facade) — the decode loop is the visible
+/// hand-written loop in `run_streams`; the only method here is the one-line
+/// COW-shared-prefix fork over the keep-core.
+struct Ctx {
+    kv: KvWorkingSet,
+    seq_len: u32,
+    fresh: bool,
+}
+
+impl Ctx {
+    fn new() -> Self {
+        Self { kv: KvWorkingSet::new(), seq_len: 0, fresh: true }
+    }
+
+    fn fork(&self) -> Result<Self> {
+        Ok(Self {
+            kv: self.kv.fork().map_err(|e| format!("fork: {e}"))?,
+            seq_len: self.seq_len,
+            fresh: true,
+        })
+    }
+
+    fn prefill(&mut self, tokens: &[u32]) -> Result<()> {
+        prefill::tokens(&self.kv, &mut self.seq_len, tokens)
+    }
+}
+
+/// Read the sampled token off a finalized pass's single-`Token` output tensor.
+async fn read_token(pass: ForwardPass) -> Result<u32> {
+    let out = pass.output().await.map_err(|e| format!("output: {e}"))?;
+    let bytes = out.read().map_err(|e| format!("tensor read: {e:?}"))?;
+    Ok(if bytes.len() >= 4 {
+        i32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as u32
+    } else {
+        0
+    })
+}
+
 #[inferlet::main]
 async fn main(input: Input) -> Result<String> {
     let mode = input.mode.to_lowercase();
     let n = input.num_forks.max(2);
 
-    let model_name = runtime::models()
-        .first()
-        .cloned()
-        .ok_or("No models available")?;
-    let model = Model::load(&model_name)?;
+    let model_name = inferlet::model::name();
 
     match mode.as_str() {
         "baseline" | "plain" => {
-            run_baseline(&model, &model_name, &input, n).await?;
+            run_baseline(&model_name, &input, n).await?;
         }
         "forked" | "smart" => {
-            run_forked(&model, &model_name, &input, n).await?;
+            run_forked(&model_name, &input, n).await?;
         }
         "both" | "" => {
-            let p = run_baseline(&model, &model_name, &input, n).await?;
+            let p = run_baseline(&model_name, &input, n).await?;
             println!();
-            let s = run_forked(&model, &model_name, &input, n).await?;
+            let s = run_forked(&model_name, &input, n).await?;
             println!();
             comparison(&p, &s, &input.expected);
         }
@@ -157,7 +195,6 @@ struct ModeResult {
 
 // ── BASELINE: N independent prefills, decoded concurrently ────────────
 async fn run_baseline(
-    model: &Model,
     model_name: &str,
     input: &Input,
     n: usize,
@@ -172,16 +209,16 @@ async fn run_baseline(
     );
 
     // Build N fully-independent contexts. Each one will prefill the full
-    // system+user+cue from scratch.
+    // system+user+cue from scratch (its prompt is the first decode pass's input,
+    // not pre-flushed — one batched prefill per context). A deferred system folds
+    // into the first user turn via `system_user` (mirrors `Context::user`).
+    let user_msg = format!("{} /no_think", input.question);
+    let mut prompt = chat::system_user(&input.system, &user_msg);
+    prompt.extend(chat::cue());
+    let per_ctx_prefill = prompt.len() as u32;
     let mut ctxs = Vec::with_capacity(n);
-    let mut per_ctx_prefill: u32 = 0;
     for _ in 0..n {
-        let mut ctx = Context::new(model)?;
-        ctx.system(&input.system);
-        ctx.user(&format!("{} /no_think", input.question));
-        ctx.cue();
-        per_ctx_prefill = ctx.seq_len() + ctx.buffer().len() as u32;
-        ctxs.push(ctx);
+        ctxs.push((Ctx::new(), prompt.clone()));
     }
     let total_prefill = per_ctx_prefill * n as u32;
     println!(
@@ -192,7 +229,7 @@ async fn run_baseline(
 
     let printer = Rc::new(RefCell::new(Printer::new(n)));
     let start = Instant::now();
-    let answers = run_streams(model, ctxs, &input, n, &printer).await?;
+    let answers = run_streams(ctxs, &input, n, &printer).await?;
     let elapsed = start.elapsed();
     let decode_tokens = printer.borrow().decode_tokens();
 
@@ -218,7 +255,6 @@ async fn run_baseline(
 
 // ── FORKED: 1 prefill, fork() ×N, decoded concurrently ────────────────
 async fn run_forked(
-    model: &Model,
     model_name: &str,
     input: &Input,
     n: usize,
@@ -237,11 +273,12 @@ async fn run_forked(
     // added per-fork so each fork has fresh tokens for its first
     // generate step (forks inherit committed KV but start with an empty
     // buffer; an empty buffer makes the first forward have zero inputs).
-    let mut base = Context::new(model)?;
-    base.system(&input.system);
-    base.user(&format!("{} /no_think", input.question));
-    let prefill = base.seq_len() + base.buffer().len() as u32;
-    base.flush().await?;
+    // A deferred system folds into the first user turn via `system_user`.
+    let user_msg = format!("{} /no_think", input.question);
+    let prompt = chat::system_user(&input.system, &user_msg);
+    let prefill = prompt.len() as u32;
+    let mut base = Ctx::new();
+    base.prefill(&prompt)?;
 
     println!(
         "  {}prefill computed: {} tokens × 1 context (shared by all forks){}",
@@ -251,14 +288,12 @@ async fn run_forked(
 
     let mut ctxs = Vec::with_capacity(n);
     for _ in 0..n {
-        let mut c = base.fork()?;
-        c.cue();
-        ctxs.push(c);
+        ctxs.push((base.fork()?, chat::cue()));
     }
 
     let printer = Rc::new(RefCell::new(Printer::new(n)));
     let start = Instant::now();
-    let answers = run_streams(model, ctxs, &input, n, &printer).await?;
+    let answers = run_streams(ctxs, &input, n, &printer).await?;
     let elapsed = start.elapsed();
     let decode_tokens = printer.borrow().decode_tokens();
 
@@ -283,9 +318,13 @@ async fn run_forked(
 }
 
 // ── Run N concurrent streams; return per-fork answers ─────────────────
+// Each stream is a depth-1 EOS-rollback pipeline (`ptir-pipelined-eos-rollback-spec`):
+// it eagerly speculates the next forward before the producer's token is known,
+// and rolls the speculation back with `discard_pass` when the token is a stop
+// (or the chat template's end-of-turn). The loop is hand-written and visible;
+// only the carrier mechanics are the thin keep-core primitives it calls.
 async fn run_streams(
-    model: &Model,
-    ctxs: Vec<Context>,
+    ctxs: Vec<(Ctx, Vec<u32>)>,
     input: &Input,
     n: usize,
     printer: &Rc<RefCell<Printer>>,
@@ -293,47 +332,77 @@ async fn run_streams(
     let temperature = input.temperature;
     let max_tokens = input.max_tokens;
     let delay = input.delay;
-    let stop = chat::stop_tokens(model);
+    let stop = chat::stop_tokens();
 
     let futs: Vec<_> = ctxs
         .into_iter()
         .enumerate()
-        .map(|(idx, mut ctx)| {
+        .map(|(idx, (mut ctx, tail))| {
             let stop = stop.clone();
             let printer = printer.clone();
-            let model = model;
             async move {
-                let sampler = if temperature <= 0.0 {
-                    Sampler::Argmax
+                let vocab = inferlet::model::output_vocab_size();
+                let spec = if temperature <= 0.0 {
+                    SamplerSpec::Argmax
                 } else {
-                    Sampler::TopP {
-                        temperature,
-                        p: 0.95,
-                    }
+                    SamplerSpec::TopP { temperature, p: 0.95 }
                 };
-                let mut g = ctx.generate(sampler).max_tokens(max_tokens).stop(&stop);
-                let mut decoder = chat::Decoder::new(model);
+                let s = sampler::sampler_program(spec, vocab)?;
+                let mut decoder = chat::Decoder::new();
                 let mut text = String::new();
-                while let Some(step) = g.next()? {
-                    let out = step.execute().await?;
-                    if out.tokens.is_empty() {
-                        continue;
-                    }
-                    printer.borrow_mut().count(idx, out.tokens.len());
-                    match decoder.feed(&out.tokens)? {
-                        chat::Event::Delta(s) => {
-                            text.push_str(&s);
-                            printer.borrow_mut().emit(idx, &s);
-                            if delay > 0 {
-                                wstd::task::sleep(wstd::time::Duration::from_millis(delay)).await;
+                if max_tokens == 0 {
+                    return Ok::<_, String>((idx, extract_answer(&text)));
+                }
+                let head = if tail.is_empty() { vec![0u32] } else { tail };
+
+                let mut producer =
+                    carrier::submit_pass(&ctx.kv, &mut ctx.seq_len, &mut ctx.fresh, &s, &head, true)?;
+                let mut generated = 0usize;
+                loop {
+                    let speculate = generated + 1 < max_tokens;
+                    let consumer = if speculate {
+                        Some(carrier::submit_pass(
+                            &ctx.kv, &mut ctx.seq_len, &mut ctx.fresh, &s, &[0u32], true,
+                        )?)
+                    } else {
+                        None
+                    };
+
+                    let token = read_token(producer).await?;
+                    let mut done = false;
+                    // Stop token → drop it (never counted, never emitted), matching
+                    // the facade's stop-truncation semantics.
+                    if stop.contains(&token) {
+                        done = true;
+                    } else {
+                        generated += 1;
+                        printer.borrow_mut().count(idx, 1);
+                        match decoder.feed(&[token])? {
+                            chat::Event::Delta(sd) => {
+                                text.push_str(&sd);
+                                printer.borrow_mut().emit(idx, &sd);
+                                if delay > 0 {
+                                    inferlet::sleep(std::time::Duration::from_millis(delay)).await;
+                                }
                             }
+                            chat::Event::Done(sd) => {
+                                text = sd;
+                                done = true;
+                            }
+                            _ => {}
                         }
-                        chat::Event::Done(s) => {
-                            text = s;
-                            break;
+                        if generated >= max_tokens {
+                            done = true;
                         }
-                        _ => {}
                     }
+
+                    if done {
+                        if let Some(c) = consumer {
+                            carrier::discard_pass(c, &mut ctx.seq_len).await;
+                        }
+                        break;
+                    }
+                    producer = consumer.expect("consumer speculated when not terminal");
                 }
                 Ok::<_, String>((idx, extract_answer(&text)))
             }

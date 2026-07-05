@@ -8,12 +8,12 @@
 // This module exposes the host's tool-template capability so callers that
 // *do* want the model's native format can reach for it explicitly:
 //
-// * `equipPrefix(model, tools)` — token sequence that registers tool
+// * `equipPrefix(tools)` — token sequence that registers tool
 //   schemas in the chat template (model-specific). Append before your
 //   user message via `ctx.append(...)`.
-// * `answerPrefix(model, name, value)` — token sequence that frames a
+// * `answerPrefix(name, value)` — token sequence that frames a
 //   tool result for the next turn.
-// * `nativeMatcher(model, tools)` — a grammar matcher that constrains
+// * `nativeMatcher(tools)` — a grammar matcher that constrains
 //   output to well-formed tool calls (or `undefined` if the model has
 //   no enforceable format). Wrap with `GrammarConstraint` and pass to
 //   `Generator.constrain(...)` to enforce well-formed output.
@@ -26,7 +26,6 @@
 import * as _tool from 'pie:instruct/tool-use';
 
 import { Matcher } from './grammar.js';
-import type { Model } from './model.js';
 
 // =============================================================================
 // Templating
@@ -35,23 +34,21 @@ import type { Model } from './model.js';
 /** Token sequence that registers `tools` (each a JSON Schema string or
  *  object) in the chat template. */
 export function equipPrefix(
-  model: Model,
   tools: Array<string | object>,
 ): Uint32Array {
   const strs = tools.map(t => typeof t === 'string' ? t : JSON.stringify(t));
-  return _tool.equip(model._handle, strs);
+  return _tool.equip(strs);
 }
 
 /** Token sequence that frames a tool result for the next turn. `name`
  *  matches the call the model made; `value` is typically a
  *  JSON-serializable result (object/array auto-stringified). */
 export function answerPrefix(
-  model: Model,
   name: string,
   value: string | object,
 ): Uint32Array {
   const s = typeof value === 'string' ? value : JSON.stringify(value);
-  return _tool.answer(model._handle, name, s);
+  return _tool.answer(name, s);
 }
 
 // =============================================================================
@@ -64,22 +61,21 @@ export function answerPrefix(
  *
  *  Pair with `GrammarConstraint` to pass to `Generator.constrain()`:
  *
- *      const matcher = tools.nativeMatcher(model, schemas);
+ *      const matcher = tools.nativeMatcher(schemas);
  *      if (matcher) {
  *        gen = gen.constrain(new GrammarConstraint(matcher));
  *      }
  */
 export function nativeMatcher(
-  model: Model,
   tools: Array<string | object>,
 ): Matcher | undefined {
   const strs = tools.map(t => typeof t === 'string' ? t : JSON.stringify(t));
   // The host's `format()` returns Grammar | undefined; pass to
   // create_matcher only if non-undefined.
-  const grammar = _tool.format(model._handle, strs);
+  const grammar = _tool.format(strs);
   if (grammar === undefined) return undefined;
   // create_matcher always succeeds when the model has a format.
-  const raw = _tool.createMatcher(model._handle, strs);
+  const raw = _tool.createMatcher(strs);
   return Matcher._fromHandle(raw);
 }
 
@@ -124,8 +120,8 @@ export const Event = {
 export class Decoder {
   readonly #inner: _tool.Decoder;
 
-  constructor(model: Model) {
-    this.#inner = _tool.createDecoder(model._handle);
+  constructor() {
+    this.#inner = _tool.createDecoder();
   }
 
   /** Feed a token batch and get back the event that fired. `Event.Start`

@@ -1,0 +1,25 @@
+name: dfa_ingraph
+hash: 0x9272a7735a220f91
+container: 50544952010000000000000004000000000000000100000003020300000008000000010000000001020118000000010000000001020101000000010000000001010101000000010000000200030f000000a00000000201000000080000009100000000910100000090020000006001000000030000008100000080ff20040000000000000005000000330600000092030000000700000081020800000012030000000800000007070000000210090000000a00000060020000000b00000092020000000c000000
+verdict: OK
+sidecar: 5054494201000000910f225a73a7729204000000000001000400000000000000030001000000030002000000030003000000030101000000030d0000000002010000000800000003020300000008000000020118000000020101000000030201000000080000000000000201000000080000000101010000000200020101000000020101000000020101000000020101000000
+readiness: chan=0 phase=0x03 dir=NeedsFull
+readiness: chan=1 phase=0x03 dir=NeedsFull
+readiness: chan=2 phase=0x03 dir=NeedsFull
+readiness: chan=3 phase=0x03 dir=NeedsEmpty
+class: chan=0 FullRing
+class: chan=1 FullRing
+class: chan=2 InPlace
+class: chan=3 FullRing
+seed chan=0 = Bool([false, true, true, false, false, false, false, false, false, false, false, true, false, false, false, false, true, false, false, false, false, false, false, false])
+seed chan=1 = U32([0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0])
+seed chan=2 = U32([0])
+inputs 0: PassInputs { logits: Some(F32([0.0, 0.0, 1.0, 0.0, 0.0, 9.0, 0.0, 0.0])), mtp_logits: None, hidden: None, value_head: None, query: [] }
+step 0: committed=true missed=None sinks=0
+take chan=3 = I32([2])
+inputs 1: PassInputs { logits: Some(F32([0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 9.0, 0.0])), mtp_logits: None, hidden: None, value_head: None, query: [] }
+step 1: committed=true missed=None sinks=0
+take chan=3 = I32([3])
+inputs 2: PassInputs { logits: Some(F32([1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 9.0])), mtp_logits: None, hidden: None, value_head: None, query: [] }
+step 2: committed=true missed=None sinks=0
+take chan=3 = I32([0])

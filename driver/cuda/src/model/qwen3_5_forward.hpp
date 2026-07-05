@@ -169,7 +169,13 @@ void qwen3_5_forward_paged(
     const std::int32_t* slot_ids_d = nullptr,
     const std::int32_t* logit_row_indices_d = nullptr,
     int num_logit_rows = 0,
-    const std::int32_t* commit_advance_gather = nullptr);
+    const std::int32_t* commit_advance_gather = nullptr,
+    // Ph7 RS working-set fold-from-buffer (see executor.hpp ForwardInputs):
+    // per-request CSR of buffered-slab pool ids + direction flags.
+    const std::uint32_t* rs_buffer_slot_ids_h = nullptr,
+    const std::uint32_t* rs_buffer_slot_indptr_h = nullptr,
+    bool rs_buffer_write = false,
+    bool rs_buffer_fold = false);
 
 void qwen3_5_mtp_process_cache(
     const Qwen3_5Weights& w,

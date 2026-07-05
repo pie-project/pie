@@ -1,0 +1,4 @@
+[package]
+name = "multisamp-pipelined"
+version = "0.1.0"
+description = "Pipelined ① copy of multisamp: run-ahead decode across all parametric sampler kinds via carrier::submit_pass_sampler"

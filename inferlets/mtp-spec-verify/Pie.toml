@@ -1,0 +1,12 @@
+[package]
+name = "mtp-spec-verify"
+version = "0.1.0"
+description = "De-hardwired speculation (MTP-logits) token-exact-vs-non-spec verify"
+authors = ["pie"]
+
+[runtime]
+core = "^0.2.0"
+
+[parameters]
+prompt = {type = "string", optional = true, description = "The user prompt (default: capital-of-France)"}
+system = {type = "string", optional = true, description = "System prompt (default: one-word answer)"}

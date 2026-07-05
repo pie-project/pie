@@ -48,6 +48,14 @@ struct PersistentInputs {
     DeviceBuffer<std::uint8_t>  custom_mask;
     DeviceBuffer<std::int32_t>  custom_mask_indptr;
 
+    // Explicit KV-write descriptor (device-geometry WSlot/WOff lowering, B2).
+    // Per-lane physical page id + offset-in-page for the single new-token K/V
+    // write, consumed by `launch_write_kv_explicit_bf16` when a device-geometry
+    // program binds the WSlot/WOff ports. Capacity = max_requests (one lane per
+    // request). Inert unless a fire resolves `has_write_desc`.
+    DeviceBuffer<std::uint32_t> w_page;
+    DeviceBuffer<std::uint32_t> w_off;
+
     // Per-request linear-attention rs_cache slot ids (Qwen3.5 / 3.6).
     // Capacity = max_requests. Inert (zero-length writes) on archs that
     // don't use rs_cache. Lives in PersistentInputs so the TP

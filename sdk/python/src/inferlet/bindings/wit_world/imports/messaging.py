@@ -8,39 +8,9 @@ from abc import abstractmethod
 import weakref
 
 from componentize_py_types import Result, Ok, Err, Some
-from ..imports import poll
-from ..imports import pie_core_types
-
-class Subscription:
-    """
-    Represents a subscription to a broadcast topic
-    """
-    
-    def pollable(self) -> poll.Pollable:
-        """
-        Pollable to check for new messages on the topic
-        """
-        raise NotImplementedError
-    def get(self) -> Optional[str]:
-        """
-        Retrieves a new message from the topic, if available
-        """
-        raise NotImplementedError
-    def unsubscribe(self) -> None:
-        """
-        Cancels the subscription
-        """
-        raise NotImplementedError
-    def __enter__(self) -> Self:
-        """Returns self"""
-        return self
-                                
-    def __exit__(self, exc_type: type[BaseException] | None, exc_value: BaseException | None, traceback: TracebackType | None) -> bool | None:
-        """
-        Release this resource.
-        """
-        raise NotImplementedError
-
+import componentize_py_async_support
+from componentize_py_async_support.streams import StreamReader, StreamWriter, ByteStreamReader, ByteStreamWriter
+from componentize_py_async_support.futures import FutureReader, FutureWriter
 
 
 def push(topic: str, message: str) -> None:
@@ -48,7 +18,7 @@ def push(topic: str, message: str) -> None:
     Pushes a message onto a topic queue
     """
     raise NotImplementedError
-def pull(topic: str) -> pie_core_types.FutureString:
+async def pull(topic: str) -> str:
     """
     Pulls the next message from a topic queue
     """
@@ -58,8 +28,9 @@ def broadcast(topic: str, message: str) -> None:
     Publishes a message to a topic (broadcast to all subscribers)
     """
     raise NotImplementedError
-def subscribe(topic: str) -> Subscription:
+def subscribe(topic: str) -> StreamReader[str]:
     """
-    Subscribes to a topic and returns a subscription handle
+    Subscribes to a topic; the returned stream yields each broadcast
+    message. Dropping the stream reader unsubscribes.
     """
     raise NotImplementedError

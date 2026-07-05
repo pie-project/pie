@@ -60,7 +60,7 @@ two-step path).
 
 ## Run
 ```bash
-cargo build -p pie-server --release --no-default-features --features driver-cuda
+cargo build -p pie-worker --release --no-default-features --features driver-cuda
 python3 driver/cuda/tests/load_parity/run.py                       # all named, all modes
 python3 driver/cuda/tests/load_parity/run.py --random 20 --seed 7  # + 20 random compositions
 python3 driver/cuda/tests/load_parity/run.py --mode tp glm_moe_dsa kimi_k2   # one mode/recipe

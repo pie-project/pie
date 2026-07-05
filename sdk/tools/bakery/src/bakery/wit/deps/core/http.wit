@@ -1,0 +1,26 @@
+interface http {
+
+    use types.{error};
+
+    // A single buffered HTTP request.
+    record request {
+        method: string,
+        url: string,
+        headers: list<tuple<string, string>>,
+        body: option<list<u8>>,
+    }
+
+    // A fully-buffered HTTP response. HTTP status (incl. 4xx/5xx) is a normal
+    // response; `error` is reserved for transport/host failures.
+    record response {
+        status: u16,
+        headers: list<tuple<string, string>>,
+        body: list<u8>,
+    }
+
+    // One HTTP request, host-side + async, response fully buffered. Does NOT
+    // follow redirects (the SDK resolves `location` and re-requests). There is
+    // no guest-side wasi:io pollable.
+    fetch: async func(request: request) -> result<response, error>;
+
+}

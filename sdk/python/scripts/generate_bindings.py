@@ -21,7 +21,9 @@ def main() -> int:
     sdk_root = project_root.parent
     pie_root = sdk_root.parent
 
-    wit_path = pie_root / "runtime" / "wit"
+    # WIT was relocated from runtime/wit to interface/inferlet (the canonical
+    # inferlet world package, with its vendored deps/).
+    wit_path = pie_root / "interface" / "inferlet"
     output_path = project_root / "src" / "inferlet" / "bindings"
 
     if not wit_path.exists():
@@ -32,7 +34,7 @@ def main() -> int:
     output_path.mkdir(parents=True, exist_ok=True)
 
     # Generate bindings using componentize-py
-    # The world is "inferlet" as defined in runtime/wit/world.wit
+    # The world is "inferlet" as defined in interface/inferlet/world.wit
     cmd = [
         "componentize-py",
         "-d",

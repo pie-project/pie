@@ -36,8 +36,6 @@ from test_js_constrained_decoding import test_js_constrained_decoding
 from test_py_concurrency import test_py_concurrency
 from test_python_example import test_python_example
 from test_python_constrained_decoding import test_python_constrained_decoding
-from test_openresponses import test_openresponses
-from test_http_server import test_http_server
 
 
 ALL_TESTS = [
@@ -75,9 +73,6 @@ ALL_TESTS = [
     test_python_constrained_decoding,
     # Run last: jacobi may trigger CUDA errors that poison subsequent tests
     test_jacobi_decoding,
-    # HTTP daemon tests (run after all process-based tests)
-    test_openresponses,
-    test_http_server,
 ]
 
 if __name__ == "__main__":

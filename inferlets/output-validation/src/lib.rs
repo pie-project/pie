@@ -6,57 +6,98 @@
 //! accumulating log probability. The cumulative log-prob sequence is then
 //! softmax-normalized across candidates.
 
-use inferlet::{
-    Context, Result,
-    model::Model,
-    runtime,
-    sample::Distribution,
-};
+use inferlet::inference::ForwardPass;
+use inferlet::sampler::{probe_program, LoweredProbe, ProbeKind};
+use inferlet::working_set::KvWorkingSet;
+use inferlet::{chat, geometry, model, prefill, Result};
 use serde::Deserialize;
 use std::time::Instant;
 
 #[derive(Deserialize)]
 struct Input {}
 
+/// Raw keep-core decode context (no `Context` facade): a KV working set +
+/// sequence cursor, forkable with a COW-shared prefix.
+struct Ctx {
+    kv: KvWorkingSet,
+    seq_len: u32,
+    fresh: bool,
+}
+impl Ctx {
+    fn new() -> Self {
+        Self { kv: KvWorkingSet::new(), seq_len: 0, fresh: true }
+    }
+    /// COW-shared-prefix fork + cursor copy; the fork's first pass is `fresh`.
+    fn fork(&self) -> Result<Self> {
+        Ok(Self {
+            kv: self.kv.fork().map_err(|e| format!("fork: {e}"))?,
+            seq_len: self.seq_len,
+            fresh: true,
+        })
+    }
+    /// Non-sampling prefill (the facade's `flush`).
+    fn prefill(&mut self, tokens: &[u32]) -> Result<()> {
+        prefill::tokens(&self.kv, &mut self.seq_len, tokens)
+    }
+    /// One measurement fire: geometry + input + probe sampler + execute.
+    fn probe_fire(&mut self, probe: &LoweredProbe, tokens: &[u32]) -> Result<ForwardPass> {
+        let n = tokens.len() as u32;
+        let pass = ForwardPass::new();
+        if self.fresh {
+            pass.fresh_generate();
+            self.fresh = false;
+        }
+        let geom = geometry::ensure_pages(
+            &self.kv,
+            geometry::kv_write_geometry(self.seq_len, n, self.kv.page_size()),
+        )?;
+        geometry::attach_kv_write(&pass, &self.kv, &geom);
+        let positions: Vec<u32> = (self.seq_len..self.seq_len + n).collect();
+        pass.input_tokens(tokens, &positions);
+        pass.sampler(&probe.program, probe.bindings(self.seq_len + n - 1)?);
+        pass.execute();
+        self.seq_len += n;
+        Ok(pass)
+    }
+}
+
+/// Read a dense `[vocab]` f32 distribution off the raw output tensor (indexed
+/// by the implicit identity ids `0..vocab`).
+async fn read_f32(pass: ForwardPass) -> Result<Vec<f32>> {
+    let out = pass.output().await.map_err(|e| format!("output: {e}"))?;
+    let bytes = out.read().map_err(|e| format!("tensor read: {e:?}"))?;
+    Ok(bytes
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect())
+}
+
 /// Calculate the normalized probability of each candidate string being
 /// generated from the given context.
-pub async fn validate_outputs(
-    model: &Model,
-    base: &Context,
+async fn validate_outputs(
+    base: &Ctx,
+    probe: &LoweredProbe,
     candidates: &[String],
 ) -> Result<Vec<(String, f32)>> {
-    let tokenizer = model.tokenizer();
     let mut log_probs = Vec::with_capacity(candidates.len());
 
     for candidate in candidates {
         let mut ctx = base.fork()?;
-        let candidate_tokens = tokenizer.encode(candidate);
+        let candidate_tokens = model::encode(candidate);
 
         // Bootstrap: feed an empty marker so the model produces a
         // distribution at the candidate's first token position. We use the
         // last token of the empty-string encoding as a no-op anchor.
-        let mut pending = vec![*tokenizer.encode("").last().unwrap_or(&0)];
+        let mut pending = vec![*model::encode("").last().unwrap_or(&0)];
         let mut cumulative_log_prob = 0.0f32;
 
         for &target in &candidate_tokens {
-            let mut pass = ctx.forward();
-            pass.input(&pending);
-            // Probe the distribution at the LAST input position (the slot
-            // index is local to the auto-input window: `len-1`).
-            let last_idx = (pending.len() - 1) as u32;
-            // `k = 0` returns the full vocabulary so we can look up `target`.
-            let h = pass.probe(last_idx, Distribution { temperature: 1.0, k: 0 });
-
-            let out = pass.execute().await?;
-            let (ids, probs) = out
-                .distribution(h)
-                .ok_or("Distribution probe missing")?;
-
-            let p = ids
-                .iter()
-                .position(|&id| id == target)
-                .map(|i| probs[i])
-                .unwrap_or(0.0);
+            // The full softmax distribution (over all vocab) at the decode
+            // position (the last input token); dense identity ids ⇒ the target's
+            // probability is `probs[target]`.
+            let pass = ctx.probe_fire(probe, &pending)?;
+            let probs = read_f32(pass).await?;
+            let p = probs.get(target as usize).copied().unwrap_or(0.0);
 
             if p > 0.0 {
                 cumulative_log_prob += p.ln();
@@ -97,20 +138,23 @@ pub async fn validate_outputs(
 #[inferlet::main]
 async fn main(_input: Input) -> Result<String> {
     let start = Instant::now();
-    let models = runtime::models();
-    let model = Model::load(models.first().ok_or("No models available")?)?;
+    let vocab = model::output_vocab_size();
+    let probe = probe_program(ProbeKind::Distribution, vocab)
+        .map_err(|e| format!("probe(Distribution) build: {e}"))?;
 
-    let mut ctx = Context::new(&model)?;
-    ctx.system("You are an expert at information extraction.")
-        .user(
-            "From the sentence \"The financial report was prepared by David Chen.\", \
-             extract the person's name.",
-        )
-        .cue();
-
+    // Prompt: system + first user turn + cue + the fixed prompt tail, prefilled
+    // in full (the flush twin).
     let prompt_tail = "The name of the person in the report is ";
-    ctx.append(&model.tokenizer().encode(prompt_tail));
-    ctx.flush().await?;
+    let mut prompt = chat::system_user(
+        "You are an expert at information extraction.",
+        "From the sentence \"The financial report was prepared by David Chen.\", \
+         extract the person's name.",
+    );
+    prompt.extend(chat::cue());
+    prompt.extend(model::encode(prompt_tail));
+
+    let mut ctx = Ctx::new();
+    ctx.prefill(&prompt)?;
 
     let candidates = vec![
         "John Smith".to_string(),
@@ -124,7 +168,7 @@ async fn main(_input: Input) -> Result<String> {
         println!("- {}", c);
     }
 
-    let results = validate_outputs(&model, &ctx, &candidates).await?;
+    let results = validate_outputs(&ctx, &probe, &candidates).await?;
 
     println!("\n--- Validation Results ---");
     for (candidate, probability) in results {

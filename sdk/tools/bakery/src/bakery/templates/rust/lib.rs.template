@@ -3,7 +3,7 @@
 //! Demonstrates chat-style generation with the explicit per-step Generator
 //! loop and `chat::Decoder`.
 
-use inferlet::{Context, Result, chat, model::Model, runtime, sample::Sampler};
+use inferlet::{Context, Result, chat, sample::Sampler};
 use serde::Deserialize;
 
 #[derive(Deserialize)]
@@ -43,14 +43,10 @@ fn default_top_p() -> f32 {
 
 #[inferlet::main]
 async fn main(input: Input) -> Result<String> {
-    let models = runtime::models();
-    let model_name = models.first().ok_or("No models available")?;
-    let model = Model::load(model_name)?;
-
-    let mut ctx = Context::new(&model)?;
+    let mut ctx = Context::new()?;
     ctx.system(&input.system).user(&input.prompt).cue();
 
-    let mut chat = chat::Decoder::new(&model);
+    let mut chat = chat::Decoder::new();
     let mut text = String::new();
 
     let mut g = ctx
@@ -59,7 +55,7 @@ async fn main(input: Input) -> Result<String> {
             p: input.top_p,
         })
         .max_tokens(input.max_tokens)
-        .stop(&chat::stop_tokens(&model));
+        .stop(&chat::stop_tokens());
 
     while let Some(step) = g.next()? {
         let out = step.execute().await?;

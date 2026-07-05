@@ -9,7 +9,7 @@
 #include <string>
 #include <vector>
 
-#include "../../../weight_loader/include/weight_loader.h"
+#include "../../../weight-loader/include/weight_loader.h"
 #include "tensor.hpp"
 #include "loader/safetensors.hpp"
 

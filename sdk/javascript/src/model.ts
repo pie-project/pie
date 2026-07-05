@@ -1,75 +1,47 @@
-// Model and Tokenizer wrappers over pie:core/model WIT resources.
+// Accessors for the single bound model.
+//
+// The engine serves exactly one model, so model and tokenizer operations
+// are module-level functions over `pie:core/model` — there is no model or
+// tokenizer handle to load or pass around.
 
-import {
-  Model as _Model,
-  Tokenizer as _Tokenizer,
-} from 'pie:core/model';
+import * as _model from 'pie:core/model';
 
-/**
- * A loaded model instance.
- *
- * Wraps the `pie:core/model.Model` WIT resource.
- */
-export class Model {
-  /** @internal */
-  readonly _handle: _Model;
-
-  private constructor(handle: _Model) {
-    this._handle = handle;
-  }
-
-  /** Load a model by name. */
-  static load(name: string): Model {
-    return new Model(_Model.load(name));
-  }
-
-  /** Get the tokenizer for this model. */
-  tokenizer(): Tokenizer {
-    return new Tokenizer(this._handle.tokenizer());
-  }
-
-  /** Whether greedy generation should use the system drafter by default. */
-  defaultSystemSpeculation(): boolean {
-    return this._handle.defaultSystemSpeculation();
-  }
+/** Name of the bound model. */
+export function name(): string {
+  return _model.name();
 }
 
-/**
- * Tokenizer for encoding and decoding text ↔ token IDs.
- *
- * Wraps the `pie:core/model.Tokenizer` WIT resource.
- */
-export class Tokenizer {
-  /** @internal */
-  readonly _handle: _Tokenizer;
+/** Model architecture identifier (e.g. "gemma4", "qwen3_6"). */
+export function architecture(): string {
+  return _model.architecture();
+}
 
-  /** @internal */
-  constructor(handle: _Tokenizer) {
-    this._handle = handle;
-  }
+/** Whether greedy generation should use the system drafter by default. */
+export function defaultSystemSpeculation(): boolean {
+  return _model.defaultSystemSpeculation();
+}
 
-  /** Encodes text into token IDs. */
-  encode(text: string): Uint32Array {
-    return this._handle.encode(text);
-  }
+/** Encodes text into token IDs. */
+export function encode(text: string): Uint32Array {
+  return _model.encode(text);
+}
 
-  /** Decodes token IDs back into text. */
-  decode(tokens: Uint32Array): string {
-    return this._handle.decode(tokens);
-  }
+/** Decodes token IDs back into text. */
+export function decode(tokens: Uint32Array): string {
+  return _model.decode(tokens);
+}
 
-  /** Returns the full vocabulary: [tokenIds, byteSequences]. */
-  vocabs(): [Uint32Array, Uint8Array[]] {
-    return this._handle.vocabs();
-  }
+/** Returns the full vocabulary: [tokenIds, byteSequences]. */
+export function vocabs(): [Uint32Array, Uint8Array[]] {
+  return _model.vocabs();
+}
 
-  /** Returns the split regex used by the tokenizer. */
-  splitRegex(): string {
-    return this._handle.splitRegex();
-  }
+/** Returns the split regex used by the tokenizer. */
+export function splitRegex(): string {
+  return _model.splitRegex();
+}
 
-  /** Returns special tokens: [tokenIds, byteSequences]. */
-  specialTokens(): [Uint32Array, Uint8Array[]] {
-    return this._handle.specialTokens();
-  }
+/** Returns special tokens: [tokenIds, byteSequences]. */
+export function specialTokens(): [Uint32Array, Uint8Array[]] {
+  return _model.specialTokens();
 }

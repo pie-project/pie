@@ -1,6 +1,0 @@
-package pie:mcp;
-
-world imports {
-    import types;
-    import client;
-}

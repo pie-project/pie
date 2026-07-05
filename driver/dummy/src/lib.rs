@@ -1,6 +1,6 @@
 //! `pie_driver_dummy` — Rust dummy driver, C ABI.
 //!
-//! Exports the same shape as `driver/portable` and `driver/cuda`:
+//! Exports the same shape as `driver/cuda`:
 //!
 //! ```c
 //! int pie_driver_dummy_run(int argc, char** argv,
@@ -13,6 +13,7 @@
 
 mod config;
 mod handler;
+pub mod kv_export;
 
 use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_int, c_void};
@@ -23,10 +24,10 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow};
 
 use crate::handler::Handler;
-use pie_bridge::ArchivedRequestPayload;
-use pie_bridge::SCHEMA_HASH;
-use pie_bridge::ipc::ShmemServer;
-use pie_bridge::wire::parse_request;
+use pie_driver_abi::ArchivedRequestPayload;
+use pie_driver_abi::SCHEMA_HASH;
+use pie_ipc::ipc::ShmemServer;
+use pie_ipc::wire::parse_request;
 
 pub type ReadyCb = unsafe extern "C" fn(caps_json: *const c_char, ctx: *mut c_void);
 

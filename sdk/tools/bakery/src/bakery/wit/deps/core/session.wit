@@ -1,17 +1,17 @@
 interface session {
 
-    use types.{future-string, future-blob, blob};
+    use types.{blob};
 
     // Sends a message to the remote user client
     send: func(message: string);
 
     // Receives an incoming message from the remote user client
-    receive: func() -> future-string;
+    receive: async func() -> option<string>;
 
     // Sends a file to the remote user client
     send-file: func(data: blob);
 
     // Receives an incoming file from the remote user client
-    receive-file: func() -> future-blob;
+    receive-file: async func() -> option<blob>;
 
 }

@@ -70,7 +70,7 @@ verbose = true
 enabled = false
 [runtime]
 wasm_max_instances = 64
-[[model]]
+[model]
 name = "default"
 hf_repo = "{snap}"
 [model.driver]
@@ -80,8 +80,6 @@ tensor_parallel_size = {tp}
 [model.driver.options]
 gpu_mem_utilization = 0.30
 {rq}ready_timeout_s = 120.0
-[model.scheduler]
-batch_policy = "adaptive"
 """
 
 
@@ -203,7 +201,7 @@ def main() -> int:
     args = ap.parse_args()
 
     if not PIE_BIN.exists():
-        sys.stderr.write(f"missing {PIE_BIN}; build with: cargo build -p pie-server "
+        sys.stderr.write(f"missing {PIE_BIN}; build with: cargo build -p pie-worker "
                          "--release --no-default-features --features driver-cuda\n")
         return 2
 

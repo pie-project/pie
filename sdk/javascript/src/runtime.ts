@@ -16,8 +16,3 @@ export function instanceId(): string {
 export function username(): string {
   return _rt.username();
 }
-
-/** Returns a list of all available model names. */
-export function models(): string[] {
-  return _rt.models();
-}

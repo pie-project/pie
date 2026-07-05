@@ -1,0 +1,4 @@
+[package]
+name = "specgreedy"
+version = "0.1.0"
+description = "Test inferlet: self-spec greedy loop (#31) — token-identical-to-greedy land gate"

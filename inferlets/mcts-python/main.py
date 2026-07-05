@@ -21,7 +21,7 @@ of recomputing shared prefixes). The pure search helpers (`ucb`, `parse_score`,
 
 import math
 
-from inferlet import Context, Model, Sampler, runtime
+from inferlet import Context, Sampler
 
 
 # =============================================================================
@@ -193,8 +193,8 @@ def path_block(path) -> str:
     return "\n".join(f"{i + 1}. {s.strip()}" for i, s in enumerate(path))
 
 
-async def expand_step(model, problem, path, rollout_tokens) -> str:
-    ctx = Context(model)
+async def expand_step(problem, path, rollout_tokens) -> str:
+    ctx = Context()
     ctx.system(
         "You extend a chain of reasoning. Given a problem and the steps so far, "
         "propose ONE concise next reasoning step. Output only that step."
@@ -207,8 +207,8 @@ async def expand_step(model, problem, path, rollout_tokens) -> str:
     return text.strip()
 
 
-async def rollout(model, problem, path, rollout_tokens) -> str:
-    ctx = Context(model)
+async def rollout(problem, path, rollout_tokens) -> str:
+    ctx = Context()
     ctx.system(
         "You finish a partial chain of reasoning. Continue from the steps given "
         "and produce a short, concrete candidate final answer."
@@ -221,8 +221,8 @@ async def rollout(model, problem, path, rollout_tokens) -> str:
     return text.strip()
 
 
-async def evaluate(model, problem, candidate) -> float:
-    ctx = Context(model)
+async def evaluate(problem, candidate) -> float:
+    ctx = Context()
     ctx.system(
         "You are a strict grader. Score the candidate answer from 0 to 100 for "
         "correctness, completeness, and reasoning quality. Return ONLY the number."
@@ -233,8 +233,8 @@ async def evaluate(model, problem, candidate) -> float:
     return parse_score(text)
 
 
-async def synthesize(model, problem, best_path, final_tokens) -> str:
-    ctx = Context(model)
+async def synthesize(problem, best_path, final_tokens) -> str:
+    ctx = Context()
     ctx.system(
         "You write the final answer to a problem, guided by a vetted chain of "
         "reasoning. Be clear and correct."
@@ -251,8 +251,6 @@ async def synthesize(model, problem, best_path, final_tokens) -> str:
 
 
 async def main(input: dict) -> str:
-    model = Model.load(runtime.models()[0])
-
     prompt = input.get(
         "prompt", "A farmer has 17 sheep and all but 9 run away. How many are left?"
     )
@@ -283,7 +281,7 @@ async def main(input: dict) -> str:
         )
         if can_expand:
             path = tree.path_actions(selected)
-            action = await expand_step(model, prompt, path, rollout_tokens)
+            action = await expand_step(prompt, path, rollout_tokens)
             sim_node = tree.add_child(selected, action, max_depth)
         else:
             sim_node = selected
@@ -291,10 +289,10 @@ async def main(input: dict) -> str:
 
         # (c) Simulation / rollout.
         sim_path = tree.path_actions(sim_node)
-        candidate = await rollout(model, prompt, sim_path, rollout_tokens)
+        candidate = await rollout(prompt, sim_path, rollout_tokens)
 
         # (d) Evaluation.
-        value = await evaluate(model, prompt, candidate)
+        value = await evaluate(prompt, candidate)
 
         # (e) Backpropagation.
         tree.backpropagate(sim_node, value)
@@ -310,9 +308,9 @@ async def main(input: dict) -> str:
 
     best_path = tree.best_path()
     if not best_path:
-        final_answer = best_candidate or await rollout(model, prompt, [], final_tokens)
+        final_answer = best_candidate or await rollout(prompt, [], final_tokens)
     else:
-        final_answer = await synthesize(model, prompt, best_path, final_tokens)
+        final_answer = await synthesize(prompt, best_path, final_tokens)
 
     if not show_trace:
         return final_answer

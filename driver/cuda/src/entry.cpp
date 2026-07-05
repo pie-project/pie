@@ -4,8 +4,7 @@
 // All meaningful logic lives in `run_impl`; the `extern "C"` wrapper
 // at the bottom catches any escaping C++ exception so we never
 // propagate across the FFI boundary (which would be UB). Mirrors
-// driver/portable/src/entry.cpp's shape — see that file for the
-// invariants.
+// the shared embedded-driver entry shape and invariants.
 
 #include "entry.hpp"
 
@@ -88,7 +87,7 @@
 #include "ops/gemm.hpp"
 #include "executor/executor.hpp"
 #include "service/inproc_service.hpp"
-#include <pie_bridge/inproc_server.hpp>
+#include <pie_ipc/inproc_server.hpp>
 
 namespace {
 
@@ -480,7 +479,20 @@ int run_impl(int argc,
     // bucket larger than the real request count; charge that implementation
     // detail to the planner's safety headroom instead of reducing the
     // advertised runtime pool.
-    const int runtime_kv_pages = mem_plan.kv_pages;
+    // KV-page cap: `PIE_KV_PAGE_CAP` env (guru-approved test override) takes
+    // precedence, else the `[batching].total_pages` config field, else derive
+    // from gpu_mem_utilization. Forces a tiny deterministic pool for the
+    // contention/preempt e2e independent of the forward-layout budget floor.
+    const long kv_page_cap = [&]() -> long {
+        if (const char* e = std::getenv("PIE_KV_PAGE_CAP")) {
+            const long v = std::atol(e);
+            if (v > 0) return v;
+        }
+        return static_cast<long>(cfg.batching.total_pages);
+    }();
+    const int runtime_kv_pages = (kv_page_cap > 0)
+        ? std::min<int>(mem_plan.kv_pages, static_cast<int>(kv_page_cap))
+        : mem_plan.kv_pages;
     const int physical_kv_pages =
         mem_plan.kv_pages > 0 ? mem_plan.kv_pages + 1 : mem_plan.kv_pages;
     const int graph_pad_page =
@@ -647,6 +659,20 @@ int run_impl(int argc,
             const int stash_width = conv_dim + 2 * local_linear_value_heads;
             qwen3_5_state_cache.configure_verify_hidden_stash(
                 max_workspace_tokens, stash_width);
+            // Ph7 RS working-set fold-from-buffer: persistent slot-indexed
+            // buffered-activation pool. Same per-token [mixed_qkv|a|b] layout +
+            // width as the verify stash (so the fold replay's gather works), but
+            // PERSISTENT and slot-indexed. Sized to q35_alloc_slots: folded +
+            // buffered slabs draw distinct ids from one shared rs_gpu BlockPool
+            // (0..rs_blocks), so a buffered slab id can be anywhere in range.
+            // page_tokens = KV page size (rs-buffer-page-size == kv_page_size v1).
+            qwen3_5_state_cache.configure_rs_buffer_pool(
+                mem_plan.kv_page_size, stash_width, q35_alloc_slots);
+            if (verbose) {
+                std::cerr << "[pie-driver-cuda] qwen3.5 rs_buffer_pool: page_tokens="
+                          << mem_plan.kv_page_size << " width=" << stash_width
+                          << " slots=" << q35_alloc_slots << "\n";
+            }
         }
         const std::size_t recurrent_elem_bytes =
             pie_cuda_driver::RecurrentStateCache::recurrent_state_bf16_default()
@@ -1386,6 +1412,12 @@ int run_impl(int argc,
             {"max_model_len",          c.max_model_len},
             {"activation_dtype",       c.activation_dtype},
             {"snapshot_dir",           c.snapshot_dir},
+            // Device storage-target hints (weight-loader Variant A).
+            {"storage_backend",        c.storage_backend},
+            {"max_tile_bytes",         c.max_tile_bytes},
+            {"preferred_alignment",    c.preferred_alignment},
+            {"mxfp4_moe_policy",       c.mxfp4_moe_policy},
+            {"native_mxfp4_moe",       c.native_mxfp4_moe},
         };
         if (verbose) {
             std::cerr << "[pie-driver-cuda] forward_limits: "

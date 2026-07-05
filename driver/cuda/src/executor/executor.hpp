@@ -13,13 +13,18 @@
 #include <type_traits>
 
 #include <atomic>
+#include <deque>
+#include <map>
 
 #include "distributed.hpp"
 #include "executor/forward_graph.hpp"
-#include <pie_bridge/view.hpp>
+#include <pie_driver_abi/view.hpp>
 #include "model/llama_like.hpp"
 #include "executor/persistent_inputs.hpp"
-#include <pie_bridge/response_builder.hpp>
+#include <pie_driver_abi/response_builder.hpp>
+#include <memory>
+
+#include "ptir/ptir_dispatch.hpp"
 
 namespace pie_cuda_driver {
 
@@ -102,6 +107,17 @@ struct ForwardFn {
         const std::uint8_t*  custom_mask_d        = nullptr;
         const std::int32_t*  custom_mask_indptr_d = nullptr;
 
+        // Optional: explicit KV-write descriptor (device-geometry WSlot/WOff,
+        // B2). When `has_write_desc`, the per-layer KV append lands each lane's
+        // new-token K/V at the EXPLICIT (physical page id `w_page_d[lane]`,
+        // offset `w_off_d[lane]`) target via `launch_write_kv_explicit_bf16`,
+        // instead of re-deriving the position from the page-table +
+        // last_page_len. Required for beam fork/freeze correctness (a frozen
+        // fork's cell must not be overwritten by the standard derivation).
+        const std::uint32_t* w_page_d             = nullptr;
+        const std::uint32_t* w_off_d              = nullptr;
+        bool                 has_write_desc       = false;
+
         // Optional: per-request rs-cache slot info
         const std::int32_t*  slot_ids_h           = nullptr;
         const std::uint8_t*  is_fresh_h           = nullptr;
@@ -129,6 +145,22 @@ struct ForwardFn {
         // and lm_head are skipped. Used to advance rs_cache state after a
         // frozen verify without re-running the whole backbone.
         const std::int32_t*  commit_advance_gather_d = nullptr;
+
+        // Ph7 RS working-set fold-from-buffer. Per-request CSR of buffered-slab
+        // block ids into the recurrent_state_cache buffered-activation pool
+        // (host — the gather/scatter is a host-driven loop of per-slab d2d
+        // memcpys, page-major: slab s holds tokens [s*page, (s+1)*page)).
+        //   rs_buffer_write : after in_proj, scatter [mixed_qkv|a|b] for each
+        //     request's tokens INTO its pool slabs (rs-output W10; write_state
+        //     forced false — buffered, not folded).
+        //   rs_buffer_fold (with commit_advance_gather_d) : the replay loads each
+        //     linear layer's activations FROM the pool slabs (vs the verify
+        //     stash) and folds commit_len[r]=rs_fold_lens[r] tokens into
+        //     recurrent_state[slot_ids[r]].
+        const std::uint32_t* rs_buffer_slot_ids_h    = nullptr;  // flattened CSR
+        const std::uint32_t* rs_buffer_slot_indptr_h = nullptr;  // R+1, leading 0
+        bool                 rs_buffer_write          = false;
+        bool                 rs_buffer_fold           = false;
 
         // Multimodal (gemma4 vision, option-B pixel path) — host pointers into
         // the request view. The model encodes each image and scatters the
@@ -340,6 +372,115 @@ struct Executor {
     // view stays valid until the next `build()` call, which is long
     // enough for the `send_response` that immediately follows.
     pie_driver::ResponseBuilder response_builder;
+
+    // (Sampling-IR programmable-sampling backend removed — ptir succeeds it.)
+
+    // PTIR (thrust-3) stage-program runtime. `ptir_cache` is the C3 hash-keyed
+    // decode cache (container+sidecar → Trace, first-fire-of-hash); `ptir_
+    // instances` are the persistent per-instance execution contexts keyed by the
+    // wire instance id (cross-fire channel state survives). The `ptir_out_*`
+    // staging Vecs back `out_resp.ptir_output_*` for the fire that produced them
+    // (valid until the next ptir dispatch, long enough for `send_response`).
+    // PTIR (thrust-3) stage-program dispatch. Opaque, CUDA-free handle (the impl
+    // + the tier-0 device kernels live behind `ptir_dispatch.cu`, so this header
+    // — included by host `.cpp` TUs — never pulls `__global__` code). Owns the C3
+    // hash-decode cache + the persistent per-instance execution contexts (keyed
+    // by the wire instance id) + the `ptir_output_*` response staging. Lazily
+    // constructed on the first ptir-carrying fire.
+    std::unique_ptr<ptir::PtirDispatch> ptir_dispatch;
+    // `ws.logits` is BF16, but the PTIR tier-0 stage-runner reads the Logits
+    // intrinsic as F32. Widen the emitted logit rows bf16→f32 into this scratch
+    // before dispatch so the stage program argmaxes correct values.
+    DeviceBuffer<float> ptir_logits_f32;
+
+    // Stage-2 MTP: scratch to save/restore `ws.logits[0]` (bf16 [vocab]) while the
+    // native MTP-head draft chain transiently writes its per-step logits into row 0
+    // before scattering them to the reserved draft rows. Row 0 is a target logit
+    // row the sampling program still reads, so it must be preserved across the chain.
+    DeviceBuffer<std::uint16_t> mtp_row0_save;
+
+
+    // #27 cut #1 (a2) — the most recent fast-path forward's eager-D2H completion
+    // event (recorded on the tensor-I/O copy stream after that fire READ the
+    // single-buffer `pi.sampled`). delta's WAR guard waits this at the NEXT
+    // forward's sampling tail (`cudaStreamWaitEvent(forward, last_eager_d2h_done)`)
+    // so t+1's sampling WRITE to `pi.sampled` can't clobber t's still-draining D2H.
+    // nullptr until the first fast-path forward (no prior producer to gate on).
+    cudaEvent_t last_eager_d2h_done = nullptr;
+
+    // Thrust-2 bubble-p50: the previous fire's kernel-retire timestamp (the
+    // steady_clock count, post final `cudaStreamSynchronize`), stamped in
+    // `write_probes`. The next fire computes the DEVICE-idle gap = its entry −
+    // this, isolating the true inter-fire GPU bubble vs the runtime's IPC-lagged
+    // host proxy. `0` until the first fire retires.
+    std::uint64_t last_fire_retire_ns = 0;
+
+    // Set true by `handle_fire_batch` when it took the (a2) output→tensor
+    // fast-path (eager-D2H enqueued, forward-done deferred to the copy-stream
+    // host-func). The in-proc service reads it to set `out.deferred` so
+    // `serve_forever` skips the inline send. Reset to false at each fire's entry.
+    bool last_fire_deferred = false;
+
+    // ── D1: deferred RICH-output forward-done ─────────────────────────────────
+    // Generalizes the (a2) single-Token deferral to multi-output / Scalar /
+    // Entropy / [k]-Token programs so `handle_fire_batch` never blocks the service
+    // thread on the rich path's `cudaStreamSynchronize` + sync marshal. The rich
+    // branch stages each output's eager-D2H into an OWNED pinned host buffer
+    // (`pinned_alloc`; `SlabArena::free` is a mutex'd free-list push — no CUDA API —
+    // so the trampoline can free it host-func-safe) and records the shape here; the
+    // in-proc service's `defer_send_` (which holds the vtable + driver_id) wraps
+    // this into a copy-stream host-func that marshals the host buffers → per_req →
+    // a ctx-OWNED `ResponseBuilder` → send, once the D2H drains (avoids the
+    // per-iteration-arena UAF that empty-a2 sidesteps). Consumed once per fire by
+    // `defer_send_`; `active` is re-armed each fire.
+    struct RichStagedOutput {
+        void*                    host = nullptr;   // pinned; trampoline frees post-send
+        std::uint32_t            cls = 0;          // (was sampling_ir::OutputClass; retired)
+        std::uint32_t            elem_count = 0;   // staged cap (Token[k]/MtpTokens: k bound)
+        std::uint32_t            req = 0;          // per_req index
+        std::uint32_t            out_idx = 0;      // declared-output index (program_tokens CSR)
+        std::uint32_t            n_out = 0;        // #declared outputs for `req`
+    };
+    struct PendingRichDefer {
+        bool                          active = false;
+        std::uint32_t                 num_requests = 0;
+        std::vector<RichStagedOutput> staged;
+    };
+    PendingRichDefer pending_rich_defer{};
+
+    // ── G3 PART-2: env-gated back-to-back launch + CUDA-event device-idle ─────
+    // `PIE_G3_BACKTOBACK` removes the per-fire compute `cudaStreamSynchronize`
+    // from the launch critical path on the (a2) single-Token fast-path, so fire
+    // N+1's forward enqueues behind N's on `cublas.stream()` (stream-ordered →
+    // the inter-fire GPU bubble drops to ~0). Default OFF: T0/T1/GDN/beam
+    // correctness runs stay on the proven synchronous path; perf is A/B'd on the
+    // homogeneous single-Token decode gate. Only the a2 fast-path goes
+    // back-to-back; non-fast-path (rich / PTIR / sampling-IR) fires still sync.
+    bool g3_backtoback = [] {
+        const char* v = std::getenv("PIE_G3_BACKTOBACK");
+        return v != nullptr && v[0] != '\0' && v[0] != '0';
+    }();
+    // The previous a2 fire's kernel-retire CUDA event (timing-enabled, recorded
+    // on `cublas.stream()` after the sampler = last compute). Paired with the
+    // next fire's first-kernel event to measure the true device-idle gap
+    // (`cudaEventElapsedTime`, 0 when back-to-back). nullptr until the first a2
+    // fire. Consumed (moved into a `G3Pending.idle_from`) by the next fire.
+    cudaEvent_t g3_prev_retire = nullptr;
+    // This fire's first-kernel event, held in executor state (not a bare local
+    // across the ~1000-line handler) so an early-return path can't leak it: the
+    // next back-to-back fire reclaims a stale one before recording its own. Moved
+    // into a `G3Pending.idle_to` when the fire takes the back-to-back a2 path.
+    cudaEvent_t g3_cur_first = nullptr;
+    // A deferred device-idle measurement, gated on the fire's first-kernel event.
+    // `idle_to` ready ⇒ `idle_from` ready too (same stream, later) ⇒
+    // `elapsed(idle_from, idle_to)` = fire k's idle gap is computable.
+    struct G3Pending {
+        cudaEvent_t idle_from = nullptr;          // retire[k-1] (a)
+        cudaEvent_t idle_to = nullptr;            // first[k]   (b)
+    };
+    std::deque<G3Pending> g3_pending;
+
+
 
 };
 

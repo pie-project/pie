@@ -1,0 +1,4 @@
+[package]
+name = "generate-gdn"
+version = "0.1.0"
+description = "Test inferlet: greedy decode on a GDN/hybrid model (KV + recurrent-state working sets) — MTP Stage 1 harness"

@@ -6,12 +6,7 @@ Supports loading, saving, cloning, and locking model adapters (e.g. LoRA).
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
-
 from wit_world.imports import adapter as _adapter
-
-if TYPE_CHECKING:
-    from .model import Model
 
 
 class Adapter:
@@ -19,7 +14,7 @@ class Adapter:
 
     Usage::
 
-        adapter = Adapter.create(model, "my-adapter")
+        adapter = Adapter.create("my-adapter")
         adapter.load("/path/to/weights")
         adapter.save("/path/to/output")
     """
@@ -30,14 +25,14 @@ class Adapter:
         self._handle = handle
 
     @staticmethod
-    def create(model: Model, name: str) -> Adapter:
-        """Create a new adapter for a model."""
-        return Adapter(_adapter.Adapter.create(model._handle, name))
+    def create(name: str) -> Adapter:
+        """Create a new adapter for the bound model."""
+        return Adapter(_adapter.Adapter.create(name))
 
     @staticmethod
-    def open(model: Model, name: str) -> Adapter | None:
+    def open(name: str) -> Adapter | None:
         """Open an existing adapter by name."""
-        raw = _adapter.Adapter.open(model._handle, name)
+        raw = _adapter.Adapter.open(name)
         if raw is None:
             return None
         return Adapter(raw)

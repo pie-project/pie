@@ -6,7 +6,6 @@ authors = ["Pie Team"]
 
 [runtime]
 core = "^0.2.0"
-mcp = "^0.2.0"
 
 [parameters]
 question = {type = "string", optional = true, description = "The question to answer (default: 'What is 17 * 24 + 13?')"}

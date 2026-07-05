@@ -42,7 +42,6 @@ A rough map of which surface fits which job:
 - **"Hand off work to a worker inferlet."** → [Messaging](./messaging): pub/sub for fan-out, queues for one-to-one dispatch.
 - **"Cache reasoning state across runs."** → [Filesystem](./filesystem): write a JSON file the next run reads.
 - **"Look up a fact from Wikipedia mid-generation."** → [HTTP](./http): `wstd::http::Client::send` (Rust today).
-- **"Call an external tool over the standard MCP protocol."** → [MCP](./mcp): the engine's MCP client.
 
 Tool calls in particular often combine two surfaces: HTTP for the actual request, plus the [tool-call parser](../decoder/tool-calling) to parse the model's structured calls.
 
@@ -63,4 +62,3 @@ These restrictions are by design: a Pie engine can run untrusted inferlets from 
 - [Inferlet and inferlet (messaging)](./messaging): pub/sub and queues across inferlets.
 - [HTTP](./http): external HTTP requests (Rust today, others pending).
 - [Filesystem](./filesystem): sandboxed FS access.
-- [MCP](./mcp): structured tool servers.

@@ -1,0 +1,10 @@
+[package]
+name = "beam-baseline"
+version = "0.1.0"
+description = "Hand-rolled beam baseline (M3-G2 ±10% reference): the same beam math host-orchestrated per step — per-beam forward → read-back logits → host top-B → merge → re-fork. The fused `beam` inferlet must be within 10% of this."
+authors = ["In Gim <in.gim@icloud.com>"]
+
+[runtime]
+core = "^0.2.0"
+
+[parameters]

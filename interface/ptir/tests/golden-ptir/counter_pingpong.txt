@@ -1,0 +1,19 @@
+name: counter_pingpong
+hash: 0xcfbf312d188d4cc9
+container: 50544952010000000000000002000000000000000100000002010100000001000000000102010100000001000000020003050000009000000000810201000000100000000001000000920000000002000000920100000002000000
+verdict: OK
+sidecar: 5054494201000000c94c8d182d31bfcf020000000100020000000000000003000100000003010100000003030000000201010000000200020101000000
+readiness: chan=0 phase=0x03 dir=NeedsFull
+readiness: chan=1 phase=0x03 dir=NeedsEmpty
+class: chan=0 InPlace
+class: chan=1 FullRing
+seed chan=0 = U32([10])
+inputs 0: PassInputs { logits: None, mtp_logits: None, hidden: None, value_head: None, query: [] }
+step 0: committed=true missed=None sinks=0
+inputs 1: PassInputs { logits: None, mtp_logits: None, hidden: None, value_head: None, query: [] }
+step 1: committed=false missed=Some((1, 3)) sinks=0
+take chan=1 = U32([11])
+inputs 2: PassInputs { logits: None, mtp_logits: None, hidden: None, value_head: None, query: [] }
+step 2: committed=true missed=None sinks=0
+take chan=1 = U32([12])
+take chan=1 = ERR WouldBlock

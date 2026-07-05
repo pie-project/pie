@@ -1,0 +1,4 @@
+[package]
+name = "selfspec"
+version = "0.1.0"
+description = "Test inferlet: #31 greedy-v0 self-spec verify e2e — device-alias draft (SelfSpecDraftInput, pi.tokens+sample_row+1) + A2 correction"

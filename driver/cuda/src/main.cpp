@@ -2,7 +2,7 @@
 //
 // All logic lives in entry.cpp / pie_driver_cuda_lib so the same
 // translation units back both this executable and the static lib that
-// `server/standalone` links into the all-Rust binary when built with
+// `worker/standalone` links into the all-Rust binary when built with
 // `--features driver-cuda`.
 
 #include <iostream>
@@ -13,7 +13,7 @@ namespace {
 
 // Default capability handshake: emit `READY <json>` on stdout so the
 // Python wrapper (`pie/src/pie_driver_cuda_native/worker.py`) can pick
-// it up via line-buffered stdout. Library callers in server/standalone
+// it up via line-buffered stdout. Library callers in worker/standalone
 // supply their own callback to receive the JSON in-process.
 void default_ready_to_stdout(const char* caps_json, void* /*ctx*/) {
     std::cout << "READY " << caps_json << std::endl;

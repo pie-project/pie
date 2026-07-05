@@ -1,0 +1,43 @@
+[package]
+name = "ptir-dsl"
+version = "0.1.0"
+edition = "2024"
+authors = ["In Gim <in.gim@icloud.com>"]
+description = "PTIR embedded DSL (Thrust 3): Tensor / Channel eDSL + the neutral trace Builder that lowers closures into a canonical PTIR trace container. Tracing is its implementation strategy, not its identity; the author-facing ForwardPass/Pipeline/WorkingSet surface lives in `inferlet`."
+license = "Apache-2.0"
+repository = "https://github.com/pie-project/pie"
+keywords = ["pie", "ptir", "tracing", "inferlet"]
+categories = ["api-bindings"]
+
+# Standalone crate (not in the host workspace, like sdk/rust/*) so it can be
+# `cargo test`ed on the host. Lowers PTIR traces to the canonical `pie-ptir`
+# primitives (Shape / DType / container encoding / FNV-1a identity hash). The
+# eDSL surface (Tensor/Channel/ops/intrinsics) + the neutral trace `Builder`
+# are the guest half of the P0 seam co-owned with echo; the authoritative
+# validator (`pie-ptir::validate::bind`) is a dev-only parity dependency (D6:
+# the guest does not bind — `forward-pass.new` is the authoritative gate).
+[lib]
+name = "ptir_dsl"
+path = "src/lib.rs"
+
+[features]
+# `std` (default, host-side) enables the thread-local trace context + the
+# `std::error::Error` impls. The crate builds + traces in a `wasm32-wasip2`
+# inferlet AS-IS (wasip2 provides std `thread_local!`): the `inferlet` crate
+# depends on `ptir-dsl`, drives the neutral `Builder`, then `traced.encode()`
+# → the WIT `forward-pass.new`/`register-program` runs it. A `no_std`
+# single-threaded context is only needed for non-wasip2 no_std targets.
+default = ["std"]
+std = ["pie-ptir/std"]
+
+[dependencies]
+pie-ptir = { path = "../../../interface/ptir", default-features = false }
+
+# Host-only: the CPU reference interpreter (`eval`/`interp`) for tier-0
+# result-parity tests. Dev-deps are excluded from the wasm build, so this never
+# reaches the SDK.
+[dev-dependencies]
+pie-ptir = { path = "../../../interface/ptir", features = ["eval"] }
+
+[lints.rust]
+unsafe_code = "forbid"

@@ -24,8 +24,6 @@ from wit_world.imports.reasoning import (
     Event_Start as _RawStart,
 )
 
-from .model import Model
-
 
 # =============================================================================
 # Events
@@ -87,8 +85,8 @@ class Decoder:
 
     __slots__ = ("_inner",)
 
-    def __init__(self, model: Model) -> None:
-        self._inner = _reasoning.create_decoder(model._handle)
+    def __init__(self) -> None:
+        self._inner = _reasoning.create_decoder()
 
     def feed(self, tokens: list[int]) -> AnyEvent:
         """Feed a token batch and get back the event that fired. Returns

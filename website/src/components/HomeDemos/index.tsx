@@ -11,7 +11,6 @@ export type DemoId =
   | 'parallel-fork'
   | 'grammar'
   | 'persistent-kv'
-  | 'mcp-tools'
   | 'filesystem'
   | 'messaging'
   | 'watermark';

@@ -14,12 +14,12 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 # Match pie-server-py's feature set so both targets share build cache.
-FEATURES="driver-cuda,driver-portable,driver-dummy"
+FEATURES="driver-cuda,driver-dummy"
 TARGET="${1:-all}"
 
 build_cli() {
   echo "▶ building pie CLI (--no-default-features --features $FEATURES)"
-  cargo build --release -p pie-server --bin pie \
+  cargo build --release -p pie-worker --bin pie \
     --no-default-features --features "$FEATURES"
 }
 

@@ -1,62 +1,87 @@
-//! Minimal HTTP fetch helper for inferlets.
+//! HTTP for inferlets — a thin async wrapper over the host `pie:core/http`
+//! interface.
 //!
-//! `wstd::http::Client` (and the underlying `wasi:http`) is one-shot: it issues
-//! a single request and hands back whatever comes — it does **not** follow
-//! redirects, and Rust `std` has no HTTP client at all. Real media hosts almost
-//! always redirect (the demo image/audio URLs 302 to a CDN, GitHub `raw` 302s)
-//! and some 403 a request without a `User-Agent` (e.g. Wikimedia). So every
-//! multimodal inferlet used to hand-roll the same redirect loop.
+//! Under component-model-async there is no guest-side bridge from a wasi:http
+//! `future-incoming-response` pollable to a Rust future — the only thing that
+//! provided one (wstd's reactor) reintroduces the duplicate `cabi_realloc`
+//! link error. So the transport is a host-provided async func,
+//! [`pie:core/http.fetch`](crate::pie::core::http::fetch): it performs **one**
+//! request host-side and buffers the full response. Redirect-following and the
+//! default `User-Agent` live here so the policy is testable and the host
+//! primitive stays a single, simple request.
 //!
-//! [`fetch`] provides it once: GET a URL, follow redirects, return the bytes.
+//! Two entry points:
+//! - [`fetch`] — high-level `GET` that follows redirects and returns the body.
+//! - [`send`] — one raw [`Request`] → [`Response`], for custom method / headers
+//!   / body and concurrent use (drive many `send(...)` futures with
+//!   `futures::stream::FuturesUnordered`; bound a single one with
+//!   `futures::select!(send(req), inferlet::sleep(timeout))`).
 
 use crate::Result;
-use wstd::http::{Client, Method, Request};
-use wstd::io::{empty, AsyncRead};
+
+/// Host HTTP request/response records, re-exported for [`send`].
+pub use crate::pie::core::http::{Request, Response};
 
 /// Maximum redirect hops before giving up.
 const MAX_REDIRECTS: usize = 8;
 
-/// `User-Agent` sent with every request. Some hosts (e.g. Wikimedia) 403 a
-/// request that lacks one.
+/// `User-Agent` sent by [`fetch`]. Some hosts (e.g. Wikimedia) 403 a request
+/// that lacks one.
 const USER_AGENT: &str = "pie-inferlet/0.1";
 
+/// Perform a single HTTP request host-side and return the buffered response.
+///
+/// The host does **not** follow redirects (a 3xx comes back as a normal
+/// [`Response`] with a `location` header). Only transport/host failures (DNS,
+/// connect, TLS, disabled network policy) surface as `Err`; any HTTP status —
+/// including 4xx/5xx — is an `Ok(Response)`.
+///
+/// Use directly for non-GET verbs, custom headers/body, or concurrency
+/// (multiple in-flight `send` futures run concurrently on the host event loop).
+pub async fn send(request: Request) -> Result<Response> {
+    crate::pie::core::http::fetch(request)
+        .await
+        .map_err(|e| e.to_string())
+}
+
 /// GET `url` and return the response body, following up to [`MAX_REDIRECTS`]
-/// redirects. The transport does not follow redirects itself, so each `Location`
-/// is resolved against the current URL via [`resolve_redirect`].
+/// redirects. Each `Location` is resolved against the current URL via
+/// [`resolve_redirect`]; a default `User-Agent` is attached.
 ///
 /// ```ignore
 /// let bytes = inferlet::http::fetch("https://example.org/cat.jpg").await?;
 /// ```
 pub async fn fetch(url: &str) -> Result<Vec<u8>> {
-    let client = Client::new();
     let mut current = url.to_string();
     for _ in 0..MAX_REDIRECTS {
-        let req = Request::builder()
-            .uri(&current)
-            .method(Method::GET)
-            .header("User-Agent", USER_AGENT)
-            .body(empty())
-            .map_err(|e| e.to_string())?;
-        let resp = client.send(req).await.map_err(|e| e.to_string())?;
-        let status = resp.status().as_u16();
+        let req = Request {
+            method: "GET".to_string(),
+            url: current.clone(),
+            headers: vec![("user-agent".to_string(), USER_AGENT.to_string())],
+            body: None,
+        };
+        let resp = send(req).await?;
+        let status = resp.status;
         if (300..400).contains(&status) {
-            let loc = resp
-                .headers()
-                .get("location")
-                .and_then(|v| v.to_str().ok())
+            let loc = header(&resp.headers, "location")
                 .ok_or_else(|| format!("redirect {status} without Location ({current})"))?;
-            current = resolve_redirect(&current, loc);
+            current = resolve_redirect(&current, &loc);
             continue;
         }
         if !(200..300).contains(&status) {
             return Err(format!("HTTP {status} fetching {current}"));
         }
-        let mut body = resp.into_body();
-        let mut buf = Vec::new();
-        body.read_to_end(&mut buf).await.map_err(|e| e.to_string())?;
-        return Ok(buf);
+        return Ok(resp.body);
     }
     Err(format!("too many redirects (>{MAX_REDIRECTS}) fetching {url}"))
+}
+
+/// Case-insensitive lookup of a response header value.
+fn header(headers: &[(String, String)], name: &str) -> Option<String> {
+    headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case(name))
+        .map(|(_, v)| v.clone())
 }
 
 /// Resolve a redirect `Location` against the request URL: absolute,

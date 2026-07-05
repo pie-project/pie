@@ -6,33 +6,13 @@ export function push(topic: string, message: string): void;
 /**
  * Pulls the next message from a topic queue
  */
-export function pull(topic: string): FutureString;
+export function pull(topic: string): Promise<string>;
 /**
  * Publishes a message to a topic (broadcast to all subscribers)
  */
 export function broadcast(topic: string, message: string): void;
 /**
- * Subscribes to a topic and returns a subscription handle
+ * Subscribes to a topic; the returned stream yields each broadcast
+ * message. Dropping the stream reader unsubscribes.
  */
-export function subscribe(topic: string): Subscription;
-export type Pollable = import('./wasi-io-poll.js').Pollable;
-export type FutureString = import('./pie-core-types.js').FutureString;
-
-export class Subscription {
-  /**
-   * This type does not have a public constructor.
-   */
-  private constructor();
-  /**
-  * Pollable to check for new messages on the topic
-  */
-  pollable(): Pollable;
-  /**
-  * Retrieves a new message from the topic, if available
-  */
-  get(): string | undefined;
-  /**
-  * Cancels the subscription
-  */
-  unsubscribe(): void;
-}
+export function subscribe(topic: string): ReadableStream<string>;

@@ -1,0 +1,137 @@
+interface working-set {
+
+    use types.{error};
+
+    // Shared by both working-set kinds. A contiguous, half-open span
+    // [start, start + len) of relative page slots inside a working set's dense
+    // ordered array. `start`/`len` are in page-slot units. The ONLY references
+    // that ever cross this API are these relative indices into the array —
+    // never physical page ids, never vpage ids.
+    record page-range {
+        start: u32,
+        len: u32,
+    }
+
+    // KV working set: a dense, ordered array of KV page slots, owned by the
+    // inferlet. Public `u32` page references are relative indices into this
+    // array (see `page-range`). Token lengths, positions, replay history, and
+    // all semantic metadata are inferlet-owned — this resource is token-
+    // agnostic. Sharing (`slice`/`append`/`fork`) is lazy copy-on-write: page
+    // objects are shared by reference and the first divergent write copies.
+    // Full-page CAS sealing happens runtime-side after a forward pass writes a
+    // page; it never mutates other working sets' mappings.
+    resource kv-working-set {
+        // Fresh, empty working set bound to `model` (and thus its device /
+        // unified arena). The model is captured at construction so the
+        // structural mutators (`alloc`/`free`/`slice`/`append`/`fork`) can
+        // resolve the arena without a forward pass; `slice`/`fork` inherit this
+        // model. In a single-model runtime every set binds to the single
+        // bound model.
+        constructor();
+
+        // Current number of page slots in the array.
+        size: func() -> u32;
+
+        // Monotonic counter bumped ONLY on `reorder`/`compact` — the operations
+        // that renumber slot ids (W8). Lets the SDK/inferlet detect that cached
+        // relative indices were invalidated by a reorder/compaction before it
+        // submits a forward pass. `alloc`/`alloc-slots`/`free`/`free-slots`/
+        // `append` do NOT bump it: slot ids are stable handles that survive
+        // `free` (survivors never renumber), so allocation/reclamation cannot
+        // invalidate a cached id. (CoW page writes do NOT bump it either.)
+        // NOTE: legacy dense-compaction builds (feature `ws-slot-ids` off) still
+        // bump on every structural mutation; the counter's meaning is strictly
+        // weaker only for cases it never actually protected (device-resident
+        // indices were never covered).
+        generation: func() -> u32;
+
+        // Tokens per KV page for this working set's model/driver.
+        page-size: func() -> u32;
+
+        // Append `n` fresh page slots to the end of the array; returns the
+        // contiguous relative range that was added. `alloc(0)` returns an
+        // empty range at the current end.
+        alloc: func(n: u32) -> result<page-range, error>;
+
+        // Remove the slots at `indices`. MIGRATION SHIM (append-only): under
+        // slot-id semantics (`ws-slot-ids`) this is `free-slots` — non-compacting
+        // tombstone; survivors keep their ids; a freed trailing run is truncated
+        // so a freed suffix leaves no hole. Legacy builds densely compact and
+        // renumber survivors. `indices` are interpreted against the array AT CALL
+        // TIME; all removals apply together. Out-of-range, already-freed, or
+        // duplicate indices return `error` (the call never traps).
+        free: func(indices: list<u32>) -> result<_, error>;
+
+        // Stable-id allocation (W1/W2): return `n` slot ids, recycling freed ids
+        // (ascending) before growing. Unlike `alloc`, the returned ids need not
+        // be contiguous. A slot id is a stable handle that never renumbers, so it
+        // stays valid until passed to `free-slots`. `alloc-slots(0)` returns the
+        // empty list.
+        alloc-slots: func(n: u32) -> result<list<u32>, error>;
+
+        // Tombstone the slots at `ids` (non-compacting): survivors keep their
+        // ids; freed ids are recycled by a later `alloc-slots`; a freed trailing
+        // run is truncated so a freed suffix leaves no hole. Out-of-range or
+        // already-freed ids return `error` (the call never traps). Precondition:
+        // the freed ids are unreachable from every in-flight forward pass (the
+        // arena recycles the page only after the grace period).
+        free-slots: func(ids: list<u32>) -> result<_, error>;
+
+        // Reorder the array by the full bijection `perm` over `0..size`: new
+        // slot `i` takes old slot `perm[i]`. `perm` must list every current
+        // index exactly once; otherwise returns `error`.
+        reorder: func(perm: list<u32>) -> result<_, error>;
+
+        // Create a new working set whose array is the slots in
+        // [start, start + len), sharing those page objects by reference (lazy
+        // CoW; first divergent write copies). Out-of-range spans return `error`.
+        slice: func(start: u32, len: u32) -> result<kv-working-set, error>;
+
+        // Append the slots of `other` onto the end of this array, sharing the
+        // page objects by reference (lazy CoW).
+        append: func(other: borrow<kv-working-set>) -> result<_, error>;
+
+        // Fork into a new working set that shares all current page objects by
+        // reference (lazy CoW; first divergent write copies).
+        fork: func() -> result<kv-working-set, error>;
+    }
+
+    // RS (recurrent-state) working set: required for hybrid / linear-attention
+    // models. Holds a folded recurrent-state object plus a mutable buffered
+    // suffix of page slots. NOT forced into the KV `list<page>` model. A
+    // forward pass may write buffered RS state WITHOUT folding it; folding is a
+    // separate, explicit operation (`inference.fold`). Fork is lazy CoW: the
+    // first fold/write on a shared folded or buffered slab copies the relevant
+    // object before mutation. RS CAS sharing is out of scope for v1.
+    resource rs-working-set {
+        // Fresh, empty RS working set bound to `model` (device / arena),
+        // captured at construction so `alloc-buffer`/`fork`/`fold` resolve the
+        // arena without a forward pass; `fork` inherits this binding.
+        constructor();
+
+        // Size in bytes of one folded recurrent-state object for this model.
+        state-size: func() -> u64;
+
+        // Current number of buffered page slots.
+        buffer-size: func() -> u32;
+
+        // Tokens per buffered RS page for this working set's model/driver.
+        buffer-page-size: func() -> u32;
+
+        // Append `n` fresh buffered page slots; returns the contiguous range.
+        alloc-buffer: func(n: u32) -> result<page-range, error>;
+
+        // Remove buffered slots at `indices` and densely compact (call-time
+        // interpretation, same rules as `kv-working-set.free`). Invalid or
+        // duplicate indices return `error`.
+        free-buffer: func(indices: list<u32>) -> result<_, error>;
+
+        // Reorder the buffered slots by the full bijection `perm`.
+        reorder-buffer: func(perm: list<u32>) -> result<_, error>;
+
+        // Fork into a new RS working set sharing the folded state and buffered
+        // slabs by reference (lazy CoW; first fold/write copies).
+        fork: func() -> result<rs-working-set, error>;
+    }
+
+}

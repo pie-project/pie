@@ -6,7 +6,7 @@
 #include <string>
 #include <vector>
 
-#include "../../../weight_loader/include/weight_loader.h"
+#include "../../../weight-loader/include/weight_loader.h"
 
 extern "C" {
 #if defined(__GNUC__) || defined(__clang__)

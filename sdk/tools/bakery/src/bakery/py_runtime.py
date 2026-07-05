@@ -8,7 +8,7 @@ so the runtime tarball must be present before any Python inferlet can
 actually run.
 
 This module is shared between bakery (which fetches at build time so
-the WASM is immediately runnable) and the pie-server engine (which
+the WASM is immediately runnable) and the pie-worker engine (which
 fetches lazily on startup). Both call paths converge on
 `ensure_installed()`.
 """
@@ -23,7 +23,7 @@ from pathlib import Path
 
 import httpx
 
-# Pinned to the version pie-server expects. Bumping this is a coordinated
+# Pinned to the version pie-worker expects. Bumping this is a coordinated
 # change with the runtime/program/python module on the Rust side.
 RUNTIME_URL = (
     "https://registry.pie-project.org/api/v1/runtimes/python3.14/0.4.0/download"
@@ -88,7 +88,7 @@ def _fetch(*, quiet: bool) -> bytes:
 
     Rich is imported lazily so the module stays importable in minimal
     environments (e.g. test harnesses) even though both bakery and
-    pie-server already depend on it.
+    pie-worker already depend on it.
     """
     if quiet:
         with httpx.stream("GET", RUNTIME_URL, follow_redirects=True) as resp:

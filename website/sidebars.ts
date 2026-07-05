@@ -105,7 +105,6 @@ const sidebars: SidebarsConfig = {
         'guide/io/messaging',
         'guide/io/http',
         'guide/io/filesystem',
-        {type: 'doc', id: 'guide/io/mcp', className: 'sidebar-experimental'},
       ],
     },
     {
@@ -160,10 +159,6 @@ const sidebars: SidebarsConfig = {
       collapsed: false,
       items: [
         'reference/drivers/cuda',
-        'reference/drivers/portable',
-        {type: 'doc', id: 'reference/drivers/vllm', className: 'sidebar-experimental'},
-        {type: 'doc', id: 'reference/drivers/sglang', className: 'sidebar-experimental'},
-        {type: 'doc', id: 'reference/drivers/tensorrt-llm', className: 'sidebar-experimental'},
       ],
     },
     {

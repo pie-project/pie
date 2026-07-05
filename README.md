@@ -55,13 +55,34 @@ pie run text-completion -- --prompt "The capital of France is"
 
 | Directory | Description |
 |---|---|
+| `worker/` | The `pie` CLI and standalone engine — the invariant entry point |
 | `runtime/` | Inferlet runtime |
-| `server/` | CLI |
+| `controller/` | Cluster-coordination control plane (pairing · roles · health) |
+| `driver/transport/` | Worker↔worker P2P KV-tensor data plane |
+| `driver/` | Backend drivers (CUDA · Metal) + runtime↔driver IPC |
+| `interface/` | Boundary contract crates (`ids` · `driver` · `controller` · `worker` · `client` · `inferlet`) — the dependency floor |
 | `inferlets/` | Example inferlets |
 | `sdk/` | Inferlet SDKs (Rust · Python · JavaScript) |
 | `client/` | Client libraries (Rust · Python · JavaScript) |
-| `driver/` | Pie drivers (portable / CUDA / vLLM / SGLang) |
 | `website/` | [pie-project.org](https://pie-project.org) docs site |
+
+## Building inferlets (wasip3 toolchain)
+
+Inferlets compile to the `wasm32-wasip3` component target (WASI 0.3 /
+Component-Model async). The pinned toolchain lives in `rust-toolchain.toml`
+(a dated nightly — `wasm32-wasip3` is Tier-3 and needs `-Zbuild-std`). Run the
+one-time setup once after cloning (or after a toolchain bump):
+
+```bash
+./scripts/setup-wasip3.sh
+```
+
+It installs the `wasm32-wasip2` std as a wasi-libc donor (`wasm32-wasip3` ships
+no bundled libc) and puts the `wasip3-link.sh` linker wrapper on your `PATH`.
+Set `WASI_SDK_PATH` to a pinned wasi-sdk to link against its wasi-sysroot libc
+instead of the donor. Inferlet guest crates pin a wit-bindgen version distinct
+from the one std's wasip3 bindings bundle (avoids a duplicate `cabi_realloc`
+symbol under `-Zbuild-std`).
 
 ## Getting Help
 
