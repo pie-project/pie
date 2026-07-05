@@ -70,11 +70,26 @@ class Tier0Runner {
         std::vector<void*> scratch;   // per-pass intermediate buffers to free
         std::vector<std::uint32_t> pass_taken, pass_put;   // channels to bump at commit
 
+        // ── descriptor phase: port consumption (§5.1). Token-family ports
+        // (embed_tokens/positions/w_slot/w_off) TAKE their channel — readiness
+        // needs it full and the commit advances its head; geometry/mask ports
+        // PEEK (need full, no advance). C2's descriptor row of the readiness table.
+        std::vector<std::uint32_t> desc_full, desc_taken;
+        for (const PortBinding& pb : trace_->ports) {
+            if (pb.is_const) continue;
+            desc_full.push_back(pb.channel);
+            if (port_consumes(pb.port)) desc_taken.push_back(pb.channel);
+        }
+        if (!desc_full.empty()) {
+            launch_readiness_channels(desc_full, {}, s);
+            for (auto c : desc_taken) pass_taken.push_back(c);
+        }
+
         for (const Stage& st : trace_->stages) {
             // ── readiness: derive this stage's channel direction requirements ──
             std::vector<std::uint32_t> need_full, need_empty, taken;
-            collect_stage_channels(st, need_full, need_empty, taken);
-            launch_readiness(st, need_full, need_empty, s);
+            collect_stage_channels(st, desc_taken, need_full, need_empty, taken);
+            launch_readiness_channels(need_full, need_empty, s);
 
             for (auto c : taken) pass_taken.push_back(c);
             for (const auto& p : st.puts) pass_put.push_back(p.channel);
@@ -119,11 +134,17 @@ class Tier0Runner {
 
   private:
     // Collect this stage's channel direction requirements from its ops + puts.
-    void collect_stage_channels(const Stage& st, std::vector<std::uint32_t>& need_full,
+    // `desc_taken` = channels already consumed by a descriptor port this pass
+    // (loop-carried): a put to such a channel reuses the vacated cell, so it is
+    // NOT a leading put and needs no empty check.
+    void collect_stage_channels(const Stage& st, const std::vector<std::uint32_t>& desc_taken,
+                                std::vector<std::uint32_t>& need_full,
                                 std::vector<std::uint32_t>& need_empty,
                                 std::vector<std::uint32_t>& taken) {
         std::vector<std::uint8_t> is_full(trace_->channels.size(), 0);
         std::vector<std::uint8_t> is_taken(trace_->channels.size(), 0);
+        std::vector<std::uint8_t> ext_taken(trace_->channels.size(), 0);
+        for (std::uint32_t c : desc_taken) if (c < ext_taken.size()) ext_taken[c] = 1;
         for (const Op& op : st.ops) {
             for (ValueId a : op.args) {
                 const Value* v = trace_->value(a);
@@ -136,13 +157,14 @@ class Tier0Runner {
             if (is_full[c]) need_full.push_back((std::uint32_t)c);
             if (is_taken[c]) taken.push_back((std::uint32_t)c);
         }
-        // A put channel that is not take/read-first needs its pending cell empty.
+        // A put channel that is not take/read-first (in-stage or via a descriptor
+        // consume) needs its pending cell empty.
         for (const ChannelPut& p : st.puts)
-            if (!is_full[p.channel]) need_empty.push_back(p.channel);
+            if (!is_full[p.channel] && !ext_taken[p.channel]) need_empty.push_back(p.channel);
     }
 
-    void launch_readiness(const Stage&, const std::vector<std::uint32_t>& need_full,
-                          const std::vector<std::uint32_t>& need_empty, cudaStream_t s) {
+    void launch_readiness_channels(const std::vector<std::uint32_t>& need_full,
+                                   const std::vector<std::uint32_t>& need_empty, cudaStream_t s) {
         std::uint32_t *d_full = nullptr, *d_empty = nullptr;
         if (!need_full.empty()) { cudaMalloc(&d_full, need_full.size() * 4);
             cudaMemcpyAsync(d_full, need_full.data(), need_full.size() * 4, cudaMemcpyHostToDevice, s); }
@@ -309,6 +331,18 @@ class Tier0Runner {
                 break;
             case OpCode::Matmul:  // rows=M, len=K, k=N encoded in imm (N)
                 lo.k = op.imm; break;
+            case OpCode::MaskApplyPacked:              // rows/len from result [rows,V]; k = mask words/row
+                lo.rows = rt.shape.rows(); lo.len = rt.shape.row_len();
+                lo.k = (lo.len + 31) / 32; lo.elem_dtype = DType::F32; break;
+            case OpCode::Rng:                          // ambient seed: stream=imm, kind→gumbel flag
+                lo.rows = rt.shape.rows(); lo.len = rt.shape.row_len();
+                lo.rng_stream = op.imm; lo.bcast_mode = (op.rng_kind == RngKind::Gumbel) ? 1 : 0;
+                lo.row_seeds = in.row_seeds; break;
+            case OpCode::RngKeyed:                     // state=in[0]; kind→gumbel flag
+                lo.bcast_mode = (op.rng_kind == RngKind::Gumbel) ? 1 : 0; break;
+            case OpCode::GumbelNoise:
+                lo.rows = rt.shape.rows(); lo.len = rt.shape.row_len();
+                lo.rng_stream = op.imm; lo.row_seeds = in.row_seeds; break;
             default: break;
         }
         if (op.code == OpCode::RankLe || op.code == OpCode::PivotThreshold)

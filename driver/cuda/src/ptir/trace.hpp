@@ -186,13 +186,30 @@ struct Channel {
     bool       host_visible = false;
 };
 
+// A descriptor-port binding: a forward-pass input port fed by a channel (C1).
+// The token family (embed_tokens/positions/w_slot/w_off) CONSUMES (takes) its
+// channel at the descriptor phase; geometry/masks PEEK (read). echo's pin §5.1.
+struct PortBinding {
+    std::uint8_t port = 0;      // PtirPort tag
+    ChannelId    channel = 0;
+    bool         is_const = false;   // const-folded port (no channel consumption)
+};
+
+// True if a port CONSUMES (takes) its channel at the descriptor phase (advances
+// the ring), vs peeks (reads). Token family takes; geometry/masks peek.
+inline bool port_consumes(std::uint8_t port) {
+    // PtirPort: 0 embed_tokens, 2 positions, 6 w_slot, 7 w_off take.
+    return port == 0 || port == 2 || port == 6 || port == 7;
+}
+
 // A full traced program: its value table, channels, and stage programs. The
 // batching identity is the tuple of stage traces (T5); program identity is a
 // hash over the canonical encoding (C3).
 struct Trace {
-    std::vector<Value>   values;    // SSA value table (indexed by ValueId)
-    std::vector<Channel> channels;
-    std::vector<Stage>   stages;    // in attachment order
+    std::vector<Value>       values;    // SSA value table (indexed by ValueId)
+    std::vector<Channel>     channels;
+    std::vector<PortBinding> ports;     // descriptor-port channel bindings
+    std::vector<Stage>       stages;    // in attachment order
 
     const Value* value(ValueId id) const {
         for (const auto& v : values) if (v.id == id) return &v;

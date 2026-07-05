@@ -55,13 +55,23 @@ struct CPort {
 };
 
 // A decoded op: its tag + the channel it touches (chan ops) + a compact operand
-// record. Enough for cursor advance, readiness derivation, and later typed lower.
+// record. Enough for cursor advance, readiness derivation, and typed lowering.
 struct COp {
     std::uint8_t  tag = 0;
     std::int64_t  chan = -1;        // chan_take/read/put target, else -1
     std::uint16_t name_idx = 0;     // kernel_call / sink_call name table index
     std::vector<std::uint32_t> args;
     std::uint32_t results = 1;      // SSA ids defined
+    // op-specific immediates (filled per tag; container_to_trace consumes them):
+    std::uint8_t  lit_dtype = 0;    // const literal dtype
+    std::uint32_t lit_bits = 0;     // const literal raw bits / cast dtype target
+    std::uint16_t intr = 0;         // intrinsic_val id
+    std::uint8_t  dtype = 0;        // intrinsic_val / cast / rng element dtype
+    CShape        shape;            // broadcast/reshape/rng/intrinsic target shape
+    std::uint32_t imm = 0;          // top_k k / iota len / rng stream
+    std::uint8_t  kind = 0;         // rng kind (0 uniform, 1 gumbel)
+    std::uint8_t  pred_tag = 0;     // pivot_threshold predicate tag
+    std::uint32_t pred_payload = 0; // pivot_threshold predicate payload (value id / imm)
 };
 
 struct CStage {
@@ -119,7 +129,7 @@ inline void decode_op(Cur& c, COp& op) {
             op.args = {c.u32()};
             op.results = (op.tag == PTIR_OP_SORT_DESC) ? 2 : 1;
             break;
-        case PTIR_OP_CAST:  op.args = {c.u32()}; c.u8(); break;                 // value, dtype
+        case PTIR_OP_CAST:  op.args = {c.u32()}; op.dtype = c.u8(); break;      // value, dtype
         // binary a,b
         case PTIR_OP_ADD: case PTIR_OP_SUB: case PTIR_OP_MUL: case PTIR_OP_DIV:
         case PTIR_OP_MAX_ELEM: case PTIR_OP_MIN_ELEM: case PTIR_OP_REM:
@@ -133,20 +143,21 @@ inline void decode_op(Cur& c, COp& op) {
             op.args = {c.u32(), c.u32(), c.u32()};
             break;
         case PTIR_OP_BROADCAST: case PTIR_OP_RESHAPE:                          // value, shape
-            op.args = {c.u32()}; c.shape(); break;
-        case PTIR_OP_TOP_K: op.args = {c.u32(), c.u32()}; op.results = 2; break;  // input, k
-        case PTIR_OP_PIVOT_THRESHOLD: op.args = {c.u32()}; c.u8(); c.u32(); break;  // input, predicate(5B)
-        case PTIR_OP_IOTA: op.args = {c.u32()}; break;                         // len (immediate)
-        case PTIR_OP_RNG:  c.u32(); c.shape(); c.u8(); break;                  // stream, shape, kind
-        case PTIR_OP_RNG_KEYED: op.args = {c.u32()}; c.shape(); c.u8(); break; // state, shape, kind
-        case PTIR_OP_CONST: c.u8(); c.u32(); break;                            // literal(5B)
+            op.args = {c.u32()}; op.shape = c.shape(); break;
+        case PTIR_OP_TOP_K: op.args = {c.u32()}; op.imm = c.u32(); op.results = 2; break;  // input, k
+        case PTIR_OP_PIVOT_THRESHOLD:                                          // input, predicate(5B)
+            op.args = {c.u32()}; op.pred_tag = c.u8(); op.pred_payload = c.u32(); break;
+        case PTIR_OP_IOTA: op.imm = c.u32(); break;                            // len (immediate)
+        case PTIR_OP_RNG:  op.imm = c.u32(); op.shape = c.shape(); op.kind = c.u8(); break;   // stream, shape, kind
+        case PTIR_OP_RNG_KEYED: op.args = {c.u32()}; op.shape = c.shape(); op.kind = c.u8(); break; // state, shape, kind
+        case PTIR_OP_CONST: op.lit_dtype = c.u8(); op.lit_bits = c.u32(); break;  // literal(5B)
         case PTIR_OP_CHAN_TAKE: case PTIR_OP_CHAN_READ:
             op.chan = c.u32(); break;
         case PTIR_OP_CHAN_PUT:
             op.chan = c.u32(); op.args = {c.u32()}; op.results = 0; break;
-        case PTIR_OP_INTRINSIC_VAL: c.u16(); c.u8(); c.shape(); break;         // intr, dtype, shape
+        case PTIR_OP_INTRINSIC_VAL: op.intr = c.u16(); op.dtype = c.u8(); op.shape = c.shape(); break;  // intr, dtype, shape
         case PTIR_OP_KERNEL_CALL: {                                            // name, dtype, shape, n_args, args
-            op.name_idx = c.u16(); c.u8(); c.shape();
+            op.name_idx = c.u16(); op.dtype = c.u8(); op.shape = c.shape();
             std::uint8_t n = c.u8();
             for (std::uint8_t k = 0; k < n; ++k) op.args.push_back(c.u32());
             break;

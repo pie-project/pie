@@ -1026,6 +1026,20 @@ target_compile_options(test_ptir_tier1 PRIVATE
 target_link_libraries(test_ptir_tier1 PRIVATE
   CUDA::cudart CUDA::cuda_driver CUDA::nvrtc)
 
+# PTIR cross-backend golden step-exec gate (Thrust 3 / charlie, P4). Decodes
+# echo's ACTUAL golden container bytes + PTIB typed sidecar (src/ptir/bound.hpp),
+# translates to an executable Trace, and runs it through the tier-0 stage-runner
+# with echo's canonical inputs/seeds — matching echo's step/take results
+# byte-for-byte (the golden-model conformance oracle). Needs a GPU.
+add_executable(test_ptir_golden_exec
+  tests/ptir_golden_exec_test.cu)
+target_include_directories(test_ptir_golden_exec PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_compile_options(test_ptir_golden_exec PRIVATE
+  $<$<COMPILE_LANGUAGE:CUDA>: --extended-lambda --expt-relaxed-constexpr >)
+target_link_libraries(test_ptir_golden_exec PRIVATE
+  CUDA::cudart)
+
 enable_testing()
 add_test(NAME brle COMMAND test_brle)
 add_test(NAME causal_conv1d COMMAND test_causal_conv1d)
@@ -1046,6 +1060,8 @@ add_test(NAME ptir_runner COMMAND test_ptir_runner)
 add_test(NAME ptir_container COMMAND test_ptir_container
   ${CMAKE_CURRENT_SOURCE_DIR}/tests/golden-ptir)
 add_test(NAME ptir_tier1 COMMAND test_ptir_tier1)
+add_test(NAME ptir_golden_exec COMMAND test_ptir_golden_exec
+  ${CMAKE_CURRENT_SOURCE_DIR}/tests/golden-ptir)
 
 target_link_libraries(pie_driver_cuda_lib PUBLIC
   CLI11::CLI11

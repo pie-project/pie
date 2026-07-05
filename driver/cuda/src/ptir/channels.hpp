@@ -230,6 +230,13 @@ class ChannelArena {
         cudaMemcpy(out, committed_cell(c), bytes, cudaMemcpyDeviceToHost);
     }
 
+    // Is channel c's committed (head) cell full? (host take would block if not.)
+    bool committed_full(ChannelId c) {
+        std::uint8_t f = 0;
+        cudaMemcpy(&f, d_full_ + (std::size_t)c * kMaxRing + host_head(c), 1, cudaMemcpyDeviceToHost);
+        return f != 0;
+    }
+
   private:
     std::uint32_t seed_tail(ChannelId c) const { return host_cap1_.empty() ? 0 : (1 % host_cap1_[c]); }
 
