@@ -4040,45 +4040,52 @@ void handle_fire_batch(
         // device_src = pi.sampled[p]. Multi-output / rich programs fall through to
         // the legacy marshal below (a follow-on wires last_output_ptrs()).
         if (!view.sampling_output_dst_ptrs.empty() &&
-            view.sampling_output_indptr.size() == 2 &&
-            view.sampling_output_dst_ptrs.size() == 1 && N >= 1) {
-            const std::uint64_t dst = view.sampling_output_dst_ptrs.data()[0];
-            const std::uint32_t cap = view.sampling_output_dst_lens.data()[0];
-            if (dst != 0 && cap >= sizeof(std::int32_t)) {
-                // Single-sequence MVP: the sampled token is the LAST sampled row
-                // pi.sampled[N-1] (carrier src_row = producer n_rows-1 — the prime
-                // samples its last position; decode N=1 → row 0), NOT row p.
-                const void* src =
-                    static_cast<const void*>(pi.sampled.data() + (N - 1));
-                const std::size_t nbytes = sizeof(std::int32_t);
+            view.sampling_output_indptr.size() == static_cast<std::size_t>(R) + 1 &&
+            view.sampling_output_dst_ptrs.size() == static_cast<std::size_t>(R) && N >= 1) {
+            // (a2) eager-D2H the sampled Token of EVERY co-batched request into its
+            // own pinned dst. Extends the single-request MVP to R>1: request r's
+            // token is pi.sampled at its last sampled input row (h_qo[r+1]-1). The
+            // runtime enables the per-request pinned-read fast-path for co-batched
+            // fires (scheduler all_fast_path), so filling only 1 dst (the old
+            // size()==1 gate) left the other R-1 requests reading an UNFILLED pinned
+            // buffer = 0 → wrong sampled token → wrong next input → garbage.
+            std::vector<std::uint64_t> dsts(static_cast<std::size_t>(R));
+            std::vector<std::uint32_t> caps(static_cast<std::size_t>(R));
+            std::vector<const void*> srcs(static_cast<std::size_t>(R));
+            std::vector<std::size_t> nbytes(static_cast<std::size_t>(R),
+                                            sizeof(std::int32_t));
+            bool all_ok = true;
+            for (int r = 0; r < R; ++r) {
+                dsts[r] = view.sampling_output_dst_ptrs.data()[r];
+                caps[r] = view.sampling_output_dst_lens.data()[r];
+                const int row = static_cast<int>(h_qo[r + 1]) - 1;  // r's last sampled row
+                if (dsts[r] == 0 || caps[r] < sizeof(std::int32_t) ||
+                    row < 0 || row >= N) {
+                    all_ok = false;
+                    break;
+                }
+                srcs[r] = static_cast<const void*>(pi.sampled.data() + row);
+            }
+            if (all_ok) {
                 cudaEvent_t sample_done = nullptr;
                 CUDA_CHECK(cudaEventCreateWithFlags(&sample_done,
                                                     cudaEventDisableTiming));
                 CUDA_CHECK(cudaEventRecord(sample_done, cublas.stream()));
                 cudaEvent_t t_d2h_done =
                     sampling_ir::TensorIoEngine::instance().eager_d2h_outputs(
-                        &dst, &cap, &src, &nbytes, 1, sample_done);
+                        dsts.data(), caps.data(), srcs.data(), nbytes.data(),
+                        static_cast<std::size_t>(R), sample_done);
                 CUDA_CHECK(cudaEventDestroy(sample_done));
-                // Persist for delta's WAR guard at the NEXT forward's sampling
-                // tail (it waits this before t+1 overwrites single-buffer
-                // pi.sampled). The previous fire's event was already consumed by
-                // this fire's guard wait, so it's safe to destroy.
+                // Persist for the WAR guard at the NEXT forward's sampling tail (it
+                // waits this before t+1 overwrites single-buffer pi.sampled).
                 if (executor.last_eager_d2h_done)
                     CUDA_CHECK(cudaEventDestroy(executor.last_eager_d2h_done));
                 executor.last_eager_d2h_done = t_d2h_done;
                 executor.last_fire_deferred = true;
-                // Cut #1 (a2) deferred forward-done: count = batch_size with an
-                // EMPTY tokens[] — the sampled token rides the pinned buffer (the
-                // eager-D2H above), NOT the response. `num_requests = R` is what
-                // the scheduler counts (an empty/num_requests=0 response was the
-                // `got 0` bug); leaving tokens[] empty closes the false-pass
-                // escape hatch by construction (the gate can only pass via the
-                // pinned read). `last_fire_deferred` makes serve_forever send
-                // this response EXACTLY ONCE from the copy-stream host-func
-                // post-D2H (no early/pre-D2H send into the single-shot slot), so
-                // the host's `rx` fires only once the pinned dst is filled. The
-                // scheduler's a2-mode counts + resolves Ok(Some(success)) and
-                // skips tokens[] extraction (token is in the pinned Tensor).
+                // Deferred forward-done: count = R with EMPTY tokens[] — the sampled
+                // tokens ride the pinned buffers; serve_forever sends this response
+                // once, from the copy-stream host-func post-D2H, so the host's rx
+                // fires only once every pinned dst is filled.
                 out_resp = pie_driver::PieForwardResponseView{};
                 out_resp.num_requests = static_cast<std::uint32_t>(R);
                 write_probes(out_resp, t_entry, t_wire_parse_end, t_plan_end,
