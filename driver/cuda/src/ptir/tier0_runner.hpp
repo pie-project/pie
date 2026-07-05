@@ -310,8 +310,20 @@ class Tier0Runner {
                 lo.rows = prim_shape.rows(); lo.len = prim_shape.row_len();
                 lo.elem_dtype = prim;
                 break;
-            case OpCode::Gather:                        // out len = index count = result numel
-                lo.elem_dtype = prim; break;
+            case OpCode::Gather: {                      // axis-0 generalized (§4)
+                // src rank-1 → element gather (out[i]=src[idx[i]]); src rank≥2 →
+                // ROW gather (out[i,:]=src[idx[i],:]). The container folds both
+                // under tag 0x60; route by the src operand's rank.
+                lo.elem_dtype = prim;
+                const Value* src = op.args.empty() ? nullptr : trace_->value(op.args[0]);
+                const Value* idx = op.args.size() < 2 ? nullptr : trace_->value(op.args[1]);
+                if (src && src->type.shape.rank() >= 2) {
+                    lo.code = OpCode::GatherRow;
+                    lo.rows = idx ? (std::uint32_t)(idx->type.shape.numel() == 0 ? 1 : idx->type.shape.numel()) : 1;
+                    lo.len = src->type.shape.row_len();   // product of src.dims[1..]
+                }
+                break;
+            }
             case OpCode::ScatterSet: {                  // copy base → out, then scatter
                 lo.n_scatter = 0;
                 if (op.args.size() >= 2) { const Value* iv = trace_->value(op.args[1]);

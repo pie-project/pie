@@ -168,6 +168,39 @@ void test_backpressure() {
     expect(r3.ok && r3.committed, "pass 2 commits after drain (back-pressure released)");
 }
 
+// ── Trace 5: rank-2 gather via the runner routes to ROW gather (§4 axis-0) ──
+void test_gather_row_routing() {
+    std::printf("[rank-2 gather → row gather]\n");
+    Trace t;
+    Channel src; src.id = 0; src.type = {Shape::mat(3, 4), DType::U32}; src.capacity = 1; src.has_seed = true;
+    Channel idx; idx.id = 1; idx.type = {Shape::vec(2), DType::U32}; idx.capacity = 1; idx.has_seed = true;
+    Channel out; out.id = 2; out.type = {Shape::mat(2, 4), DType::U32}; out.capacity = 1; out.host_visible = true;
+    t.channels = {src, idx, out};
+
+    TensorType srct{Shape::mat(3, 4), DType::U32}, idxt{Shape::vec(2), DType::U32}, outt{Shape::mat(2, 4), DType::U32};
+    Value v0 = mk_value(0, srct, ValueSource::ChannelTake); v0.channel = 0; t.values.push_back(v0);
+    Value v1 = mk_value(1, idxt, ValueSource::ChannelTake); v1.channel = 1; t.values.push_back(v1);
+    t.values.push_back(mk_value(2, outt, ValueSource::OpResult));   // v2 = gather(src, idx)
+
+    Op g; g.code = OpCode::Gather; g.args = {0, 1}; g.result_type = outt; g.result_id = 2;
+    Stage ep; ep.kind = StageKind::Epilogue; ep.ops = {g}; ep.puts = {{2, 2}};
+    t.stages = {ep};
+
+    Tier0Runner runner(t);
+    std::vector<std::uint32_t> srcv{0,1,2,3, 4,5,6,7, 8,9,10,11};
+    std::vector<std::uint32_t> idxv{2, 0};   // rows 2 then 0
+    runner.arena().seed_cell(0, srcv.data(), srcv.size() * 4);
+    runner.arena().seed_cell(1, idxv.data(), idxv.size() * 4);
+
+    FireInputs in;
+    PassResult r = runner.run_pass(in);
+    std::vector<std::uint32_t> got(8, 0);
+    runner.arena().host_take(2, got.data(), got.size() * 4);
+    std::vector<std::uint32_t> want{8,9,10,11, 0,1,2,3};
+    bool ok = r.ok && r.committed && got == want;
+    expect(ok, "gather([3,4], [2,0]) row-gathers to [[8,9,10,11],[0,1,2,3]]");
+}
+
 }  // namespace
 
 int main() {
@@ -179,6 +212,7 @@ int main() {
     test_readiness_miss();
     test_argmax_epilogue();
     test_backpressure();
+    test_gather_row_routing();
 
     std::printf("\n==== runner: %d passed, %d failed ====\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;
