@@ -651,6 +651,16 @@ target_include_directories(test_graph_variant PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/src)
 add_test(NAME graph_variant COMMAND test_graph_variant)
 
+# PTIR tier-2 graph-key extension (Thrust 3 / charlie, P6.1) — pure-host unit
+# test for the program-set hash (C3) added to ForwardGraphKey: backward-compat
+# (non-PTIR = 0), program-set distinctness, order-independent+dedup fold. No GPU.
+add_executable(test_ptir_graph_key
+  tests/ptir_graph_key_test.cpp)
+target_include_directories(test_ptir_graph_key PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_link_libraries(test_ptir_graph_key PRIVATE CUDA::cudart)
+add_test(NAME ptir_graph_key COMMAND test_ptir_graph_key)
+
 # Cross-request batching (#10 / delta) — CPU unit test for the grouping partition
 # (group fire rows by program handle = the canonical bytecode-hash). Pure host
 # logic, no GPU; group.hpp pulls runtime.hpp (cuda_runtime.h) so link cudart for
