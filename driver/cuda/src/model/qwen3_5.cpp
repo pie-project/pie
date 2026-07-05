@@ -342,7 +342,22 @@ Qwen3_5Weights bind_qwen3_5(LoadedModel& engine) {
             Lw.la_in_proj_z   = &must(engine, la + "in_proj_z.weight");
             Lw.la_in_proj_b   = &must(engine, la + "in_proj_b.weight");
             Lw.la_in_proj_a   = &must(engine, la + "in_proj_a.weight");
-            if (fused_gdn_projection_weights_enabled()) {
+            Lw.la_in_proj_qkv_quant = engine.quant_meta(la + "in_proj_qkv.weight");
+            Lw.la_in_proj_z_quant   = engine.quant_meta(la + "in_proj_z.weight");
+            Lw.la_in_proj_b_quant   = engine.quant_meta(la + "in_proj_b.weight");
+            Lw.la_in_proj_a_quant   = engine.quant_meta(la + "in_proj_a.weight");
+            if (T > 1 && Lw.la_in_proj_qkv_quant.has_value()) {
+                throw std::runtime_error(
+                    "qwen3_5: TP-sliced FP8 linear_attn.in_proj_qkv "
+                    "requires matching scale slicing");
+            }
+            const bool can_fuse_gdn_projection_weights =
+                fused_gdn_projection_weights_enabled() &&
+                !Lw.la_in_proj_qkv_quant.has_value() &&
+                !Lw.la_in_proj_z_quant.has_value() &&
+                !Lw.la_in_proj_b_quant.has_value() &&
+                !Lw.la_in_proj_a_quant.has_value();
+            if (can_fuse_gdn_projection_weights) {
                 w.owned_bf16_buffers.push_back(concat_axis0_bf16(
                     *Lw.la_in_proj_qkv, *Lw.la_in_proj_z,
                     "qwen3_5: fuse linear_attn.in_proj_qkvz"));
@@ -365,6 +380,7 @@ Qwen3_5Weights bind_qwen3_5(LoadedModel& engine) {
             w.owned_fp32_buffers.push_back(to_fp32(must(engine, la + "norm.weight")));
             Lw.la_norm_w_fp32 = w.owned_fp32_buffers.back().data();
             Lw.la_out_proj = &must(engine, la + "out_proj.weight");
+            Lw.la_out_proj_quant = engine.quant_meta(la + "out_proj.weight");
             Lw.kv_layer = -1;
         } else if (kind == "full_attention") {
             Lw.kind = Qwen3_5LayerWeights::Kind::FullAttn;
