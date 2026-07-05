@@ -28,18 +28,18 @@ inline std::vector<float> mask_apply_packed(const std::vector<float>& logits,
     return out;
 }
 
-// mask_apply_packed (matrix): per-row packed bitmap, row stride words_per_row.
+// mask_apply_packed (matrix): a SINGLE packed word-row [ceil(vocab/32)]
+// broadcast across ALL rows (pinned PTIR contract) — bit index = column, same
+// words for every row.
 inline std::vector<float> mask_apply_packed_matrix(const std::vector<float>& logits,
                                                    const std::vector<std::uint32_t>& mask,
                                                    std::uint32_t rows,
-                                                   std::uint32_t vocab,
-                                                   std::uint32_t words_per_row) {
+                                                   std::uint32_t vocab) {
     std::vector<float> out(logits.size());
     for (std::uint32_t r = 0; r < rows; ++r) {
         for (std::uint32_t c = 0; c < vocab; ++c) {
             std::size_t idx = static_cast<std::size_t>(r) * vocab + c;
-            std::size_t widx = static_cast<std::size_t>(r) * words_per_row + (c >> 5);
-            std::uint32_t word = widx < mask.size() ? mask[widx] : 0u;
+            std::uint32_t word = (c >> 5) < mask.size() ? mask[c >> 5] : 0u;
             std::uint32_t bit = (word >> (c & 31u)) & 1u;
             out[idx] = bit == 1u ? logits[idx] : kNegInf;
         }

@@ -27,22 +27,21 @@ kernel void mask_apply_packed(
     out[gid] = (bit == 1u) ? logits[gid] : -INFINITY;
 }
 
-// Matrix form: logits [rows, vocab] row-major; mask [rows, ceil(vocab/32)]
-// row-major (per-row packed bitmap, row stride = words_per_row). Applies the
-// per-row bitmask independently to each row. grid = rows * vocab.
+// Matrix form: logits [rows, vocab] row-major; mask is a SINGLE packed word-row
+// [ceil(vocab/32)] broadcast across ALL rows (the pinned PTIR op contract, tag
+// 0x65) — bit index = column (j % vocab), the SAME words for every row. (Per-row
+// DISTINCT masks are the composed bool `dselect` form, not this packed op.)
+// grid = rows * vocab.
 kernel void mask_apply_packed_matrix(
-    device const float* logits        [[buffer(0)]],
-    device const uint*  mask          [[buffer(1)]],
-    device float*       out           [[buffer(2)]],
-    constant uint&      vocab         [[buffer(3)]],
-    constant uint&      words_per_row [[buffer(4)]],
-    constant uint&      total         [[buffer(5)]],  // rows * vocab
+    device const float* logits [[buffer(0)]],
+    device const uint*  mask   [[buffer(1)]],
+    device float*       out    [[buffer(2)]],
+    constant uint&      vocab  [[buffer(3)]],
+    constant uint&      total  [[buffer(4)]],  // rows * vocab
     uint gid [[thread_position_in_grid]]) {
     if (gid >= total) return;
-    uint row = gid / vocab;
     uint col = gid % vocab;
-    device const uint* row_mask = mask + row * words_per_row;
-    uint bit = (row_mask[col >> 5] >> (col & 31u)) & 1u;
+    uint bit = (mask[col >> 5] >> (col & 31u)) & 1u;
     out[gid] = (bit == 1u) ? logits[gid] : -INFINITY;
 }
 

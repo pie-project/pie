@@ -71,26 +71,25 @@ void test_mask_apply_packed(MetalHarness& h) {
     report("mask_apply_packed", got, want);
 }
 
-// ── mask_apply_packed (matrix, per-row) ──────────────────────────────────────
+// ── mask_apply_packed (matrix, single mask broadcast over rows) ──────────────
 void test_mask_apply_packed_matrix(MetalHarness& h) {
-    const std::uint32_t rows = 4, vocab = 40;  // k=4 (echo's matrix golden shape)
+    const std::uint32_t rows = 2, vocab = 40;  // matrix_mask_apply_packed golden shape
     const std::uint32_t wpr = (vocab + 31) / 32;
     const std::uint32_t total = rows * vocab;
     std::vector<float> logits(total);
     for (std::uint32_t i = 0; i < total; ++i) logits[i] = static_cast<float>(i) * 0.25f - 3.0f;
-    std::vector<std::uint32_t> mask(static_cast<std::size_t>(rows) * wpr, 0);
-    for (std::uint32_t r = 0; r < rows; ++r)
-        for (std::uint32_t c = 0; c < vocab; ++c)
-            if ((c % (r + 2)) == 0) mask[r * wpr + (c >> 5)] |= (1u << (c & 31u));
+    // ONE packed word-row [ceil(vocab/32)] broadcast across all rows; bit=column.
+    std::vector<std::uint32_t> mask(wpr, 0);
+    for (std::uint32_t c = 0; c < vocab; ++c)
+        if (c % 5 == 0) mask[c >> 5] |= (1u << (c & 31u));
 
-    auto want = ref::mask_apply_packed_matrix(logits, mask, rows, vocab, wpr);
+    auto want = ref::mask_apply_packed_matrix(logits, mask, rows, vocab);
     std::vector<float> got(total, 0.0f);
     std::vector<Arg> args = {
         Arg::in(logits.data(), total * sizeof(float)),
         Arg::in(mask.data(), mask.size() * sizeof(std::uint32_t)),
         Arg::out(got.data(), total * sizeof(float)),
         Arg::in(&vocab, sizeof(vocab)),
-        Arg::in(&wpr, sizeof(wpr)),
         Arg::in(&total, sizeof(total)),
     };
     if (!h.run("mask_apply_packed_matrix", args, total)) {
