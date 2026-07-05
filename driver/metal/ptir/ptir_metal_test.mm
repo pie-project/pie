@@ -306,6 +306,37 @@ void test_reductions(MetalHarness& h) {
     }
 }
 
+void test_indexing(MetalHarness& h) {
+    // gather: out[j] = src[idx[j]] with some invalid indices -> 0
+    {
+        std::vector<float> src = {10.0f, 11.0f, 12.0f, 13.0f, 14.0f};
+        std::uint32_t src_len = static_cast<std::uint32_t>(src.size());
+        std::vector<std::int32_t> idx = {0, 4, 2, -1, 5, 1};  // -1 and 5 invalid
+        std::uint32_t k = static_cast<std::uint32_t>(idx.size());
+        auto want = ref::gather_f32(src, idx);
+        std::vector<float> got(k, 99.0f);
+        std::vector<Arg> args = {Arg::in(src.data(), src.size() * 4),
+                                 Arg::in(idx.data(), idx.size() * 4),
+                                 Arg::out(got.data(), k * 4), Arg::in(&src_len, 4), Arg::in(&k, 4)};
+        if (h.run("gather_f32", args, k)) report("gather_f32", got, want);
+        else { std::printf("  FAIL  gather_f32: %s\n", h.error().c_str()); ++g_fail; }
+    }
+    // gather_row: accept-ratio p[i, draft[i]] with an invalid column
+    {
+        const std::uint32_t rows = 4, n = 5;
+        std::vector<float> src(rows * n);
+        for (std::uint32_t i = 0; i < rows * n; ++i) src[i] = static_cast<float>(i) * 0.1f;
+        std::vector<std::int32_t> idx = {0, 3, 4, -1};  // last invalid -> 0
+        auto want = ref::gather_row_f32(src, idx, rows, n);
+        std::vector<float> got(rows, 99.0f);
+        std::vector<Arg> args = {Arg::in(src.data(), src.size() * 4),
+                                 Arg::in(idx.data(), idx.size() * 4),
+                                 Arg::out(got.data(), rows * 4), Arg::in(&rows, 4), Arg::in(&n, 4)};
+        if (h.run("gather_row_f32", args, rows)) report("gather_row_f32 (accept-ratio)", got, want);
+        else { std::printf("  FAIL  gather_row_f32: %s\n", h.error().c_str()); ++g_fail; }
+    }
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -329,6 +360,7 @@ int main(int argc, char** argv) {
     test_broadcast_matrix(h);
     test_elementwise(h);
     test_reductions(h);
+    test_indexing(h);
 
     std::printf("\n%d passed, %d failed\n", g_pass, g_fail);
     if (g_fail == 0) {

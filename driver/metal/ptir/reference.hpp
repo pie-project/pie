@@ -152,4 +152,29 @@ inline std::vector<float> scan_rows(const std::vector<float>& in, std::uint32_t 
     return out;
 }
 
+// Op::Gather (invalid index -> 0).
+inline std::vector<float> gather_f32(const std::vector<float>& src,
+                                     const std::vector<std::int32_t>& idx) {
+    std::vector<float> out(idx.size());
+    for (std::size_t j = 0; j < idx.size(); ++j) {
+        std::int32_t i = idx[j];
+        out[j] = (i >= 0 && static_cast<std::size_t>(i) < src.size()) ? src[i] : 0.0f;
+    }
+    return out;
+}
+
+// Op::GatherRow: out[r] = src[r, idx[r]] (invalid col -> 0). src is [rows, n].
+inline std::vector<float> gather_row_f32(const std::vector<float>& src,
+                                         const std::vector<std::int32_t>& idx,
+                                         std::uint32_t rows, std::uint32_t n) {
+    std::vector<float> out(rows);
+    for (std::uint32_t r = 0; r < rows; ++r) {
+        std::int32_t c = idx[r];
+        out[r] = (c >= 0 && static_cast<std::uint32_t>(c) < n)
+                     ? src[static_cast<std::size_t>(r) * n + c]
+                     : 0.0f;
+    }
+    return out;
+}
+
 }  // namespace ptir_metal::ref

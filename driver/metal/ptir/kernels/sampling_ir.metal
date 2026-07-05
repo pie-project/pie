@@ -223,3 +223,31 @@ kernel void cumprod_rows(
     float acc = 1.0f;
     for (uint j = 0; j < len; ++j) { acc = acc * in[r * len + j]; out[r * len + j] = acc; }
 }
+
+// ── indexing: gather / gather_row (invalid index -> fill 0) ───────────────────
+// Op::Gather: out[j] = (0 <= idx[j] < src_len) ? src[idx[j]] : 0.  grid = k.
+kernel void gather_f32(
+    device const float* src     [[buffer(0)]],
+    device const int*   idx     [[buffer(1)]],
+    device float*       out     [[buffer(2)]],
+    constant uint&      src_len [[buffer(3)]],
+    constant uint&      k       [[buffer(4)]],
+    uint gid [[thread_position_in_grid]]) {
+    if (gid >= k) return;
+    int i = idx[gid];
+    out[gid] = (i >= 0 && (uint)i < src_len) ? src[i] : 0.0f;
+}
+
+// Op::GatherRow: per-row column pick out[r] = src[r, idx[r]] (invalid col -> 0).
+// The lossless spec-verify accept-ratio p[i, draft[i]]. grid = rows.
+kernel void gather_row_f32(
+    device const float* src  [[buffer(0)]],
+    device const int*   idx  [[buffer(1)]],
+    device float*       out  [[buffer(2)]],
+    constant uint&      rows [[buffer(3)]],
+    constant uint&      n    [[buffer(4)]],
+    uint r [[thread_position_in_grid]]) {
+    if (r >= rows) return;
+    int c = idx[r];
+    out[r] = (c >= 0 && (uint)c < n) ? src[r * n + c] : 0.0f;
+}

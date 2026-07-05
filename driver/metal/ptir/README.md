@@ -45,6 +45,8 @@ compute dispatch, and Shared/UMA readback all work on Apple M1 Max.
 | `reduce_sum/max/min_rows`  | `ReduceSum/Max/Min` | per-row reduction, sequential fold order |
 | `reduce_argmax_rows`       | `ReduceArgmax` | per-row argmax → I32 token (strict `>`, first-max wins) — greedy |
 | `cumsum/cumprod_rows`      | `CumSum/CumProd` | per-row scan (top-p prefix) |
+| `gather_f32`               | `Gather`    | `out[j] = src[idx[j]]` (invalid index → 0) |
+| `gather_row_f32`           | `GatherRow` | `out[r] = src[r, idx[r]]` — spec-verify accept-ratio `p[i,draft[i]]` (invalid col → 0) |
 
 **Bit-exactness note:** the harness compiles kernels with **fast-math disabled**
 (`MTLMathModeSafe`), so `div`/`mul`/reductions are IEEE-correctly-rounded and
